@@ -6,8 +6,9 @@ use std::{
 };
 
 use super::{
-    FATAL_LINES, KEEP, LAYER_LOG_EXT, WineLauncher, binary_name, keep_layer_log, keep_stderr,
-    layer_tail, stderr_tail,
+    COMMAND_LINE_UNITS, FATAL_LINES, KEEP, LAYER_LOG_EXT, WineLauncher, argument_units,
+    binary_name, fitting_prefix, keep_layer_log, keep_stderr, layer_tail, stderr_tail,
+    test_arguments,
 };
 use crate::attribute::{BinaryOutcome, Launcher as _, Report, TestResult, run_binary};
 
@@ -172,7 +173,8 @@ fn the_layers_log_of_a_dead_process_is_moved_out_of_the_layers_retention() {
         Some(&dir),
         Duration::from_secs(1),
         Box::new(|_| {}),
-    );
+    )
+    .expect("absolute test path");
     assert!(
         launcher.keep_layer_log(4242).is_err(),
         "a process that logged nothing has no file"
@@ -229,7 +231,8 @@ fn a_clean_processes_layer_hang_stops_relaunch_and_keeps_both_accounts() {
         Some(&log_dir),
         Duration::from_secs(5),
         Box::new(|_| {}),
-    );
+    )
+    .expect("absolute test path");
     let selection = Some(vec!["a::one".to_owned(), "a::two".to_owned()]);
     let mut log = Log::default();
     let run = run_binary(&mut launcher, selection, 1, false, &mut log).expect("run fake child");
@@ -267,4 +270,150 @@ fn a_clean_processes_layer_hang_stops_relaunch_and_keeps_both_accounts() {
         std::fs::read_to_string(layer).expect("layer evidence"),
         format!("{DRIVER_HANG}\n")
     );
+}
+
+#[test]
+fn command_size_counts_windows_quoting_and_utf16_units() {
+    for (argument, encoded) in [
+        ("", r#""""#),
+        ("plain", "plain"),
+        ("a b", r#""a b""#),
+        ("a\tb", "\"a\tb\""),
+        (r#"a"b"#, r#"a\"b"#),
+        (r#"a\"b"#, r#"a\\\"b"#),
+        (r#"a\\"b"#, r#"a\\\\\"b"#),
+        (r"a b\", r#""a b\\""#),
+        (r"a b\\", r#""a b\\\\""#),
+        ("\u{1f680}", "\u{1f680}"),
+    ] {
+        assert_eq!(
+            argument_units(argument, false),
+            encoded.encode_utf16().count(),
+            "{argument:?}"
+        );
+    }
+    assert_eq!(argument_units("plain", true), 7, "argv[0] is always quoted");
+    assert_eq!(
+        argument_units(r"C:\plain\", true),
+        12,
+        "the final slash doubles inside quotes"
+    );
+}
+
+#[test]
+fn command_size_boundary_includes_path_flags_separators_and_nul() {
+    let exe = Path::new("/test path/\u{1f680}/suite.exe");
+    let image = r"\\?\unix\test path\🚀\suite.exe";
+    let fixed = image.encode_utf16().count()
+        + 2
+        + 1
+        + " --test-threads=4294967295 --nocapture --exact ".len();
+    let maximum = "x".repeat(COMMAND_LINE_UNITS - fixed);
+    assert_eq!(
+        fitting_prefix(exe, std::slice::from_ref(&maximum), u32::MAX).unwrap(),
+        1
+    );
+    assert!(fitting_prefix(exe, &[maximum + "x"], u32::MAX).is_err());
+    assert_eq!(fitting_prefix(exe, &[], u32::MAX).unwrap(), 0);
+    // A longer path consumes capacity rather than borrowing an arbitrary
+    // reserve from every selection, and a surrogate pair consumes two units.
+    let short = Path::new("/suite.exe");
+    let names = vec!["x".repeat(COMMAND_LINE_UNITS - fixed), "🚀".to_owned()];
+    assert_eq!(fitting_prefix(exe, &names, u32::MAX).unwrap(), 1);
+    assert_eq!(fitting_prefix(short, &names, u32::MAX).unwrap(), 2);
+    assert_eq!(
+        test_arguments(Some(&[]), 7),
+        ["--test-threads=7", "--nocapture", "--exact"]
+    );
+}
+
+#[test]
+fn launcher_uses_the_same_absolute_executable_for_sizing_and_launch() {
+    let relative = Path::new("tests/../suite.exe");
+    let launcher = WineLauncher::new(
+        Path::new("/bin/false"),
+        relative,
+        None,
+        Duration::from_secs(1),
+        Box::new(|_| {}),
+    )
+    .unwrap();
+    assert_eq!(launcher.exe, std::path::absolute(relative).unwrap());
+    let mut launcher = launcher;
+    let mut log = Log::default();
+    let error = run_binary(
+        &mut launcher,
+        Some(vec!["x".repeat(COMMAND_LINE_UNITS)]),
+        1,
+        false,
+        &mut log,
+    )
+    .err()
+    .expect("oversized name rejected before launch");
+    assert!(error.contains("executable-path allowance"));
+    assert!(log.results.is_empty());
+}
+
+#[test]
+fn large_recovery_launches_bounded_processes_and_keeps_the_primary_failure() {
+    let log_dir = dir("large-recovery");
+    let script = log_dir.join("suite.sh");
+    let runs = log_dir.join("runs");
+    let body = format!(
+        "joined=\"$*\"\nprintf '%s\\n' \"${{#joined}}\" >> '{}'\n\
+         count=0\n\
+         for name do\n\
+           case \"$name\" in --*) continue;; esac\n\
+           if [ \"$name\" = primary ]; then\n\
+             echo \"thread 'primary' panicked at suite.rs:1:1:\" >&2\n\
+             echo 'original failure' >&2\n\
+             exit 101\n\
+           fi\n\
+           printf 'test %s ... ok\\n' \"$name\"\n\
+           count=$((count + 1))\n\
+         done\n\
+         printf 'test result: ok. %s passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.1s\\n' \"$count\"\n",
+        runs.display()
+    );
+    std::fs::write(&script, body).unwrap();
+    let mut names = vec!["primary".to_owned()];
+    names.extend((0..570).map(|index| format!("test_{index:03}_{}", "x".repeat(60))));
+    let mut launcher = WineLauncher::new(
+        Path::new("/bin/sh"),
+        &script,
+        Some(&log_dir),
+        Duration::from_secs(5),
+        Box::new(|_| {}),
+    )
+    .unwrap();
+    let mut log = Log::default();
+    let run = run_binary(&mut launcher, Some(names.clone()), 4, false, &mut log).unwrap();
+    assert!(run.failed);
+    assert_eq!(
+        run.processes, 3,
+        "primary process, its recovery, and the deferred suffix"
+    );
+    assert_eq!(
+        log.results
+            .iter()
+            .map(|result| &result.name)
+            .collect::<Vec<_>>(),
+        names.iter().collect::<Vec<_>>()
+    );
+    assert!(
+        matches!(&log.results[0].verdict, crate::attribute::Verdict::Failed(detail) if detail.contains("original failure"))
+    );
+    assert!(
+        log.results[1..]
+            .iter()
+            .all(|result| result.verdict == crate::attribute::Verdict::Passed)
+    );
+    let lengths = std::fs::read_to_string(&runs).unwrap();
+    assert_eq!(lengths.lines().count(), 3);
+    assert!(
+        lengths
+            .lines()
+            .all(|line| line.parse::<usize>().unwrap() < COMMAND_LINE_UNITS)
+    );
+    std::fs::remove_dir_all(log_dir).unwrap();
 }

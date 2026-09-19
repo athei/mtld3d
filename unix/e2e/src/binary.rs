@@ -22,6 +22,9 @@ use crate::{
 /// How many kept files of each kind a directory holds, as many as the layer keeps logs.
 const KEEP: usize = 10;
 
+/// Windows command-line capacity in UTF-16 units, including the terminating NUL.
+const COMMAND_LINE_UNITS: usize = 32_767;
+
 /// The extension of a kept stderr: `<binary>-<pid>.stderr`.
 const STDERR_EXT: &str = "stderr";
 
@@ -77,13 +80,19 @@ impl WineLauncher {
     /// `log_dir` is where the layer writes its own per-process logs, so the
     /// two accounts of one process sit together; `None` means the layer's
     /// default, `mtld3d-logs` beside the executable.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message if the executable path cannot be made absolute.
     pub fn new(
         wine: &Path,
         exe: &Path,
         log_dir: Option<&Path>,
         timeout: Duration,
         on_line: Box<dyn FnMut(&str)>,
-    ) -> Self {
+    ) -> Result<Self, String> {
+        let exe = std::path::absolute(exe)
+            .map_err(|e| format!("could not resolve {}: {e}", exe.display()))?;
         let log_dir = log_dir.map_or_else(
             || {
                 exe.parent()
@@ -92,31 +101,28 @@ impl WineLauncher {
             },
             Path::to_path_buf,
         );
-        Self {
+        Ok(Self {
             wine: wine.to_path_buf(),
-            exe: exe.to_path_buf(),
+            exe,
             log_dir,
             timeout,
             on_line,
-        }
+        })
     }
 }
 
 impl Launcher for WineLauncher {
+    fn batch_len(&self, names: &[String], threads: u32) -> Result<usize, String> {
+        fitting_prefix(&self.exe, names, threads)
+    }
+
     fn run(
         &mut self,
         names: Option<&[String]>,
         threads: u32,
         on_event: &mut dyn FnMut(Event),
     ) -> Result<ProcessEnd, String> {
-        let mut args = vec![
-            format!("--test-threads={threads}"),
-            "--nocapture".to_owned(),
-        ];
-        if let Some(names) = names {
-            args.push("--exact".to_owned());
-            args.extend(names.iter().cloned());
-        }
+        let args = test_arguments(names, threads);
         let mut parser = Parser::default();
         let mut stdout = String::new();
         let exit = run::run(&self.wine, &self.exe, &args, self.timeout, &mut |line| {
@@ -319,6 +325,70 @@ pub fn layer_tail(log: &str) -> String {
     );
     let end = start.saturating_add(len).min(lines.len());
     lines[start..end].join("\n")
+}
+
+/// Build the arguments shared by command sizing and process launch.
+fn test_arguments(names: Option<&[String]>, threads: u32) -> Vec<String> {
+    let mut args = vec![
+        format!("--test-threads={threads}"),
+        "--nocapture".to_owned(),
+    ];
+    if let Some(names) = names {
+        args.push("--exact".to_owned());
+        args.extend(names.iter().cloned());
+    }
+    args
+}
+
+/// Fit a selection after allowing for Wine's executable-path mapping.
+fn fitting_prefix(exe: &Path, names: &[String], threads: u32) -> Result<usize, String> {
+    // Wine replaces an absolute Unix path's leading mapped directory with a
+    // drive prefix, or uses the longer \\?\unix prefix. Keeping the whole
+    // absolute path plus that eight-unit prefix bounds either spelling.
+    // argv[0] is always quoted; path separators become backslashes before
+    // quoting, so a separator before a literal quote must be counted too.
+    let image = format!(r"\\?\unix{}", exe.to_string_lossy().replace('/', "\\"));
+    let mut units = argument_units(&image, true).saturating_add(1);
+    for arg in test_arguments(Some(&[]), threads) {
+        units = units.saturating_add(1 + argument_units(&arg, false));
+    }
+    let mut count = 0;
+    for name in names {
+        let next = units.saturating_add(1 + argument_units(name, false));
+        if next > COMMAND_LINE_UNITS {
+            break;
+        }
+        units = next;
+        count += 1;
+    }
+    if count == 0 && !names.is_empty() {
+        return Err(format!(
+            "test {:?} does not fit the Windows command-line limit of {COMMAND_LINE_UNITS} \
+             UTF-16 units including flags, NUL and the executable-path allowance for {}",
+            names[0],
+            exe.display()
+        ));
+    }
+    Ok(count)
+}
+
+/// Size one argument after Wine's Windows command-line quoting.
+fn argument_units(argument: &str, force_quotes: bool) -> usize {
+    let quoted = force_quotes || argument.is_empty() || argument.contains([' ', '\t']);
+    let mut units = usize::from(quoted) * 2;
+    let mut backslashes = 0;
+    for character in argument.chars() {
+        units += character.len_utf16();
+        if character == '\\' {
+            backslashes += 1;
+        } else {
+            if character == '"' {
+                units += backslashes + 1;
+            }
+            backslashes = 0;
+        }
+    }
+    units + if quoted { backslashes } else { 0 }
 }
 
 /// Remove the oldest kept files with extension `ext` in `dir` beyond the newest `keep`.

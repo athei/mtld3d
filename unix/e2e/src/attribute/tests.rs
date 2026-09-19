@@ -33,7 +33,9 @@ use std::{
     time::Duration,
 };
 
-use super::{Launcher, ProcessEnd, Report, TestResult, Verdict, announced, run_binary};
+use super::{
+    BinaryOutcome, Launcher, ProcessEnd, Report, TestResult, Verdict, announced, run_binary,
+};
 use crate::{
     binary::{LayerLog, keep_layer_log, keep_stderr},
     libtest::Parser,
@@ -56,6 +58,8 @@ struct Script {
 }
 
 struct Scripted {
+    batch_size: usize,
+    serial_batch_size: usize,
     tests: Vec<&'static str>,
     scripts: VecDeque<Script>,
     /// `(names, threads)` of every process launched.
@@ -75,6 +79,8 @@ impl Scripted {
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
         Self {
+            batch_size: usize::MAX,
+            serial_batch_size: usize::MAX,
             tests: tests.to_vec(),
             scripts: scripts.into(),
             launched: Vec::new(),
@@ -85,12 +91,25 @@ impl Scripted {
 }
 
 impl Launcher for Scripted {
+    fn batch_len(&self, names: &[String], threads: u32) -> Result<usize, String> {
+        let limit = if threads == 1 {
+            self.batch_size.min(self.serial_batch_size)
+        } else {
+            self.batch_size
+        };
+        Ok(names.len().min(limit))
+    }
+
     fn run(
         &mut self,
         names: Option<&[String]>,
         threads: u32,
         on_event: &mut dyn FnMut(crate::libtest::Event),
     ) -> Result<ProcessEnd, String> {
+        assert!(
+            names.is_none_or(|names| names.len() <= self.batch_size),
+            "selection exceeds launch limit"
+        );
         self.launched.push((names.map(<[String]>::to_vec), threads));
         let script = self.scripts.pop_front().expect("a script per process");
         self.layer = script.layer;
@@ -731,4 +750,276 @@ fn a_result_lost_twice_fails_its_test() {
     assert!(
         matches!(&log.results[0].verdict, Verdict::Failed(r) if r.contains("never reached the runner"))
     );
+}
+
+#[test]
+fn restart_batches_keep_the_primary_failure_and_every_remaining_test() {
+    let mut launcher = Scripted::new(
+        &["a", "b", "c", "d"],
+        vec![
+            Script {
+                stdout: "running 4 tests\n",
+                stderr: "thread 'a' panicked at file.rs:1:1:\nprimary failure\n".to_owned(),
+                layer: None,
+                kind: ExitKind::Code(101),
+            },
+            Script {
+                stdout: "test b ... ok\ntest c ... ok\ntest result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.1s\n",
+                stderr: String::new(),
+                layer: None,
+                kind: ExitKind::Code(0),
+            },
+            Script {
+                stdout: "test d ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.1s\n",
+                stderr: String::new(),
+                layer: None,
+                kind: ExitKind::Code(0),
+            },
+        ],
+    );
+    launcher.batch_size = 2;
+    let mut log = Log::default();
+    let run = run_binary(&mut launcher, None, 4, false, &mut log).unwrap();
+    assert!(run.failed);
+    assert_eq!(run.processes, 3);
+    assert_eq!(
+        verdicts(&log.results),
+        [("a", "fail"), ("b", "pass"), ("c", "pass"), ("d", "pass")]
+    );
+    assert!(
+        matches!(&log.results[0].verdict, Verdict::Failed(detail) if detail.contains("primary failure"))
+    );
+    assert_eq!(
+        launcher.launched[1],
+        (Some(vec!["b".to_owned(), "c".to_owned()]), 4)
+    );
+    assert_eq!(launcher.launched[2], (Some(vec!["d".to_owned()]), 4));
+}
+
+#[test]
+fn restart_batches_fail_fast_after_a_complete_failed_batch() {
+    let mut launcher = Scripted::new(
+        &["a", "b", "c"],
+        vec![Script {
+            stdout: "test a ... FAILED\ntest b ... ok\ntest result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.1s\n",
+            stderr: String::new(),
+            layer: None,
+            kind: ExitKind::Code(101),
+        }],
+    );
+    launcher.batch_size = 2;
+    let mut log = Log::default();
+    let run = run_binary(
+        &mut launcher,
+        Some(vec!["a".to_owned(), "b".to_owned(), "c".to_owned()]),
+        4,
+        true,
+        &mut log,
+    )
+    .unwrap();
+    assert!(run.failed);
+    assert_eq!(run.processes, 1);
+    assert_eq!(
+        verdicts(&log.results),
+        [("a", "fail"), ("b", "pass"), ("c", "not run")]
+    );
+}
+
+#[test]
+fn restart_batches_keep_serial_suffixes_separate_from_tests_at_caller_width() {
+    let mut launcher = Scripted::new(
+        &["a", "b", "c", "d", "e"],
+        vec![
+            Script {
+                stdout: "",
+                stderr: "[e2e] running a\n[e2e] running b\n".to_owned(),
+                layer: None,
+                kind: ExitKind::Signal(11),
+            },
+            Script {
+                stdout: "test a ... ",
+                stderr: String::new(),
+                layer: None,
+                kind: ExitKind::Signal(11),
+            },
+            Script {
+                stdout: "test b ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.1s\n",
+                stderr: String::new(),
+                layer: None,
+                kind: ExitKind::Code(0),
+            },
+            Script {
+                stdout: "test c ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.1s\n",
+                stderr: String::new(),
+                layer: None,
+                kind: ExitKind::Code(0),
+            },
+            Script {
+                stdout: "test d ... ok\ntest e ... ok\ntest result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.1s\n",
+                stderr: String::new(),
+                layer: None,
+                kind: ExitKind::Code(0),
+            },
+        ],
+    );
+    launcher.batch_size = 3;
+    launcher.serial_batch_size = 1;
+    let selection = Some(["a", "b", "c", "d", "e"].map(str::to_owned).into());
+    let mut log = Log::default();
+    let run = run_binary(&mut launcher, selection, 4, false, &mut log).unwrap();
+    assert!(run.failed);
+    assert_eq!(run.processes, 5);
+    assert_eq!(
+        verdicts(&log.results),
+        [
+            ("a", "fail"),
+            ("b", "pass"),
+            ("c", "pass"),
+            ("d", "pass"),
+            ("e", "pass")
+        ]
+    );
+    assert_eq!(
+        launcher
+            .launched
+            .iter()
+            .map(|(_, threads)| *threads)
+            .collect::<Vec<_>>(),
+        [4, 1, 1, 4, 4]
+    );
+    assert_eq!(launcher.launched[1].0, Some(vec!["a".to_owned()]));
+    assert_eq!(launcher.launched[2].0, Some(vec!["b".to_owned()]));
+    assert_eq!(launcher.launched[3].0, Some(vec!["c".to_owned()]));
+}
+
+#[test]
+fn restart_batches_retry_a_missing_result_before_the_queued_suffix() {
+    let mut launcher = Scripted::new(
+        &["a", "b", "c", "d"],
+        vec![
+            Script {
+                stdout: "test a ... ok\ntest result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.1s\n",
+                stderr: String::new(),
+                layer: None,
+                kind: ExitKind::Code(0),
+            },
+            Script {
+                stdout: "test b ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.1s\n",
+                stderr: String::new(),
+                layer: None,
+                kind: ExitKind::Code(0),
+            },
+            Script {
+                stdout: "test c ... ok\ntest d ... ok\ntest result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.1s\n",
+                stderr: String::new(),
+                layer: None,
+                kind: ExitKind::Code(0),
+            },
+        ],
+    );
+    launcher.batch_size = 2;
+    let selection = Some(["a", "b", "c", "d"].map(str::to_owned).into());
+    let mut log = Log::default();
+    let run = run_binary(&mut launcher, selection, 4, false, &mut log).unwrap();
+    assert!(!run.failed);
+    assert_eq!(run.processes, 3);
+    assert_eq!(
+        verdicts(&log.results),
+        [("a", "pass"), ("b", "pass"), ("c", "pass"), ("d", "pass")]
+    );
+    assert_eq!(launcher.launched[1].0, Some(vec!["b".to_owned()]));
+    assert_eq!(
+        launcher.launched[2].0,
+        Some(vec!["c".to_owned(), "d".to_owned()])
+    );
+}
+
+#[test]
+fn restart_batches_attribute_a_panic_in_a_later_batch() {
+    let mut launcher = Scripted::new(
+        &["a", "b", "c", "d"],
+        vec![
+            Script {
+                stdout: "test a ... ok\ntest b ... ok\ntest result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.1s\n",
+                stderr: String::new(),
+                layer: None,
+                kind: ExitKind::Code(0),
+            },
+            Script {
+                stdout: "",
+                stderr: "thread 'c' panicked at file.rs:1:1:\nlater failure\n".to_owned(),
+                layer: None,
+                kind: ExitKind::Code(101),
+            },
+            Script {
+                stdout: "test d ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.1s\n",
+                stderr: String::new(),
+                layer: None,
+                kind: ExitKind::Code(0),
+            },
+        ],
+    );
+    launcher.batch_size = 2;
+    let selection = Some(["a", "b", "c", "d"].map(str::to_owned).into());
+    let mut log = Log::default();
+    let run = run_binary(&mut launcher, selection, 4, false, &mut log).unwrap();
+    assert!(run.failed);
+    assert_eq!(run.processes, 3);
+    assert_eq!(
+        verdicts(&log.results),
+        [("a", "pass"), ("b", "pass"), ("c", "fail"), ("d", "pass")]
+    );
+}
+
+#[test]
+fn restart_batches_stop_on_gpu_hang_without_launching_the_suffix() {
+    let mut launcher = Scripted::new(
+        &["a", "b", "c"],
+        vec![Script {
+            stdout: "",
+            stderr: "Caused GPU Hang Error (00000003:kIOAccelCommandBufferCallbackErrorHang)"
+                .to_owned(),
+            layer: None,
+            kind: ExitKind::Code(1),
+        }],
+    );
+    launcher.batch_size = 2;
+    let selection = Some(["a", "b", "c"].map(str::to_owned).into());
+    let mut log = Log::default();
+    let run = run_binary(&mut launcher, selection, 4, false, &mut log).unwrap();
+    assert_eq!(run.outcome, BinaryOutcome::GpuHang);
+    assert_eq!(run.processes, 1);
+    assert_eq!(launcher.launched.len(), 1);
+    assert!(log.results.is_empty());
+}
+
+#[test]
+fn restart_batches_stop_and_account_for_every_name_on_startup_failure() {
+    let mut launcher = Scripted::new(
+        &["a", "b", "c"],
+        vec![Script {
+            stdout: "",
+            stderr: "startup failure".to_owned(),
+            layer: None,
+            kind: ExitKind::Code(1),
+        }],
+    );
+    launcher.batch_size = 2;
+    let selection = Some(["a", "b", "c"].map(str::to_owned).into());
+    let mut log = Log::default();
+    let run = run_binary(&mut launcher, selection, 1, false, &mut log).unwrap();
+    assert!(run.failed);
+    assert_eq!(run.processes, 1);
+    assert_eq!(launcher.launched.len(), 1);
+    assert_eq!(
+        verdicts(&log.results),
+        [("a", "fail"), ("b", "fail"), ("c", "fail")]
+    );
+    for result in log.results {
+        let Verdict::Failed(detail) = result.verdict else {
+            panic!("startup failure must account for every selected name");
+        };
+        assert!(detail.contains("before running any test"));
+        assert!(detail.contains("startup failure"));
+    }
 }

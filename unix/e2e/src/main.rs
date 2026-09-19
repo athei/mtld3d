@@ -1,8 +1,9 @@
-//! End-to-end test runner for mtld3d: the suite's test binaries under Wine, one process each.
+//! End-to-end test runner for mtld3d: run and account for the suite's test binaries under Wine.
 //!
 //! Each binary the Makefile hands in runs once, all of its tests on the
-//! number of threads `--jobs` names, and only a failure, a crash or a hang
-//! costs another process (see `attribute`). Every path and knob is an
+//! number of threads `--jobs` names. Explicit selections are batched to fit
+//! Windows command lines; failures, crashes, hangs and missing results can
+//! cost further processes (see `attribute`). Every path and knob is an
 //! argument; the environment is inherited whole, so the caller owns
 //! `MTLD3D_CONFIG` and the Wine variables.
 //!
@@ -61,7 +62,7 @@ fn real_main() -> Result<ExitCode, String> {
             config.log_dir.as_deref(),
             config.timeout,
             Box::new(|_| {}),
-        );
+        )?;
         let selection = if config.filter.is_empty() {
             None
         } else {
