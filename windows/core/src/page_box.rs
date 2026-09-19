@@ -188,14 +188,13 @@ pub const SNMALLOC_LOCAL_CACHE_BYTES: usize = 2 * 1024 * 1024;
 /// Chunk size snmalloc serves a large request from.
 ///
 /// `large_size_to_chunk_size` is `bits::next_pow2` in the vendored
-/// `mem/sizeclasstable.h`, so a large request rounds up to the next
+/// `ds/sizeclasstable.h`, so a large request rounds up to the next
 /// power of two. That rounding is why the uncached band starts well
 /// below [`SNMALLOC_LOCAL_CACHE_BYTES`].
 ///
 /// Only meaningful above the small-sizeclass ceiling; below it snmalloc
-/// serves exact classes from a slab and does not round. That ceiling is
-/// 64 KiB on i686 and 512 KiB on the 64-bit targets, so callers that
-/// depend on the exact value must stay above 512 KiB.
+/// serves size classes from slabs. That ceiling is 64 KiB on every supported
+/// target, so callers that depend on the exact value must stay above 64 KiB.
 #[must_use]
 pub const fn snmalloc_chunk_size(padded: usize) -> usize {
     padded.next_power_of_two()
