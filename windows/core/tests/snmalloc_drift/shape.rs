@@ -3,12 +3,18 @@
 //! Host tests register separately. The PE caller runs them inside its decommit
 //! test so no other test can reuse an address while its state is being probed.
 
+#[cfg(target_family = "windows")]
+use std::alloc::Layout;
+#[cfg(not(target_family = "windows"))]
 use std::mem::MaybeUninit;
 
 use mtld3d_core::page_box::{
     PAGE_SIZE, PageBox, SNMALLOC_LOCAL_CACHE_BYTES, bypasses_local_cache, snmalloc_chunk_size,
 };
 use snmalloc_rs::SnMalloc;
+
+#[cfg(target_family = "windows")]
+pub mod allocation;
 
 const MIB: usize = 1024 * 1024;
 
@@ -65,7 +71,12 @@ pub fn cutoff_agrees_with_observed_chunks() {
 #[cfg_attr(not(target_family = "windows"), test)]
 pub fn large_byte_allocations_round_to_chunks() {
     for size in [64 * 1024 + 1, 128 * 1024 + 1, 256 * 1024 + 1] {
+        #[cfg(not(target_family = "windows"))]
         let bytes = vec![MaybeUninit::<u8>::uninit(); size].into_boxed_slice();
+        #[cfg(target_family = "windows")]
+        let bytes = allocation::SnmallocAllocation::new(
+            Layout::from_size_align(size, 1).expect("valid byte layout"),
+        );
         let observed = SnMalloc
             .usable_size(bytes.as_ptr().cast())
             .expect("live byte allocation");
@@ -75,7 +86,13 @@ pub fn large_byte_allocations_round_to_chunks() {
 
 /// Ask snmalloc what it actually handed out for `logical` bytes.
 fn observed_chunk(logical: usize) -> usize {
+    #[cfg(not(target_family = "windows"))]
     let pb = PageBox::new_uninit(logical);
+    #[cfg(target_family = "windows")]
+    let pb = allocation::SnmallocAllocation::new(
+        Layout::from_size_align(PageBox::padded_len(logical), PAGE_SIZE)
+            .expect("valid page-aligned layout"),
+    );
     SnMalloc
         .usable_size(pb.as_ptr())
         .expect("PageBox pointer is never null")
