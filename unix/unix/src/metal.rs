@@ -3,6 +3,7 @@ mod buffer;
 mod capture;
 mod clear_quad;
 mod command;
+pub mod depth_transfer;
 mod device;
 pub mod handle;
 mod macdrv;

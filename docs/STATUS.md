@@ -19,7 +19,9 @@ divergences from D3D9 it keeps on purpose. The tested games are in the
   YUV decoding, `GetDC`.
 - Raw sampleable depth (INTZ, DF16, DF24), hardware shadow comparisons on
   standard depth formats, depth bias, the full two-sided stencil test, and
-  GPU-only plain depth textures for RESZ destinations.
+  GPU-only plain depth textures for RESZ destinations. Dynamic DEFAULT-pool
+  D16, D24X8 and D24S8 textures support packed CPU locks, explicit mips and
+  RESZ readback.
 - Fetch4 gathers on 2D L8, L16, A8, R16F, R32F and raw-depth textures.
 - Anisotropic filtering, LOD bias, sRGB read and write, alpha test, scissor,
   separate alpha blend, blend factor, write masks, native wireframe fill.

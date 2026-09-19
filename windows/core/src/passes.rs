@@ -1675,6 +1675,12 @@ impl PassState {
         self.current_depth_texture
     }
 
+    /// Mip level of the current depth attachment.
+    #[must_use]
+    pub const fn current_depth_level(&self) -> u32 {
+        self.current_depth_level
+    }
+
     /// Extent of the bound depth attachment's mip level, `(0, 0)` when unbound.
     ///
     /// Exposed so a save/restore around a one-off pass (a scoped
@@ -2083,6 +2089,13 @@ impl PassState {
         }
     }
 
+    /// Force a later upload to version a destination written among application passes.
+    pub fn note_ordered_texture_write(&mut self, handle: MetalHandle<MTLTextureKind>) {
+        if !handle.is_null() {
+            self.frame_sampled_textures.insert(handle);
+        }
+    }
+
     /// Register a live sRGB twin view for base-handle identity resolution.
     ///
     /// Called by the encoder whenever a texture create hands back a twin;
@@ -2270,6 +2283,12 @@ impl PassState {
             return twin;
         }
         format
+    }
+
+    /// Whether preservation must follow a texture write ordered among application passes.
+    #[must_use]
+    pub fn texture_written_by_blit_this_frame(&self, handle: MetalHandle<MTLTextureKind>) -> bool {
+        self.blit_written_rts.contains(&handle)
     }
 
     /// True when `handle` was bound as a sampler input by an earlier draw this frame.
@@ -4940,6 +4959,9 @@ const fn blit_written_texture(blit: &BlitCommand) -> Option<MetalHandle<MTLTextu
     let writes_texture = match BlitCommandType::from_repr(blit.cmd) {
         Some(
             BlitCommandType::CopyBufferToTexture
+            | BlitCommandType::CopyBufferToDepth
+            | BlitCommandType::CopyBufferToStencil
+            | BlitCommandType::TransferDepth
             | BlitCommandType::CopyTextureToTexture
             | BlitCommandType::GenerateMipmaps,
         )

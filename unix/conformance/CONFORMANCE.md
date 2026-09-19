@@ -837,16 +837,22 @@ Per-subresource pixel data is correct.
 Sites: 13838=caps
 
 "Test 2D 9" creates a DEFAULT-pool, `D3DUSAGE_DYNAMIC` depth texture and
-uses the plain (usage 0) texture probe to derive the expected HRESULT. Plain
-and `D3DUSAGE_DEPTHSTENCIL` 2D depth textures are supported in DEFAULT, with
-explicit mip chains and GPU-only storage. Dynamic depth is a separate
-capability: its format query returns NOTAVAILABLE and its create returns
-INVALIDCALL. The test never queries DYNAMIC before expecting it to work.
-Supporting CPU-written packed depth would require format conversion and a
-depth-writing upload path; plain RESZ destinations do not need either.
-CPU pools, plain depth surfaces and depth cubes remain unavailable.
-AUTOGENMIPMAP queries return NOAUTOGEN and creation falls back to one level,
-without enabling automatic generation.
+uses the plain texture probe to derive the expected HRESULT. Dynamic D16,
+D24X8 and D24S8 2D textures now support packed locks and explicit mip chains.
+Dynamic D32 and legacy, lockable or vendor formats remain unavailable. Depth
+attachments with DYNAMIC, CPU pools, plain depth surfaces, depth cubes and
+volumes remain unavailable. AUTOGENMIPMAP queries return NOAUTOGEN and creation falls back
+to one level, without enabling automatic generation.
+
+RESZ into a dynamic destination copies depth and the common stencil plane,
+using sample zero for multisampled sources. A depth-only source preserves
+the destination stencil. This follows DXVK's common-aspect ResolveZ contract
+and Wine's plane copy behavior; native AMD documentation only establishes
+depth sample zero. Scaled attachments are resampled on the GPU into the
+logical-sized destination. Readback and packing wait until a preservation
+or READONLY lock needs the GPU-authoritative bytes; a whole DISCARD skips
+that readback and versions any destination still named by pending work.
+
 
 ### device.c/test_cursor_clipping
 Sites: 14930=ceiling

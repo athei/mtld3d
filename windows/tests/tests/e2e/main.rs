@@ -15,6 +15,7 @@ mod d3d9ex;
 mod d3dperf;
 mod device;
 mod draw;
+mod dynamic_depth;
 mod expand16;
 mod float_filter;
 mod implicit_surface;

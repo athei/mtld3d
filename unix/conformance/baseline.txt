@@ -81,7 +81,6 @@
   device.c:12694 count=1
   device.c:12784 count=72
   device.c:12823 count=477
-  device.c:13838 count=1
   device.c:14930 count=1
   device.c:15088 count=1
   device.c:15160 count=1
@@ -188,7 +187,6 @@
   device.c:12689 count=1
   device.c:12784 count=72
   device.c:12823 count=477
-  device.c:13838 count=1
   device.c:14930 count=1
   device.c:15088 count=1
   device.c:15160 count=1
@@ -373,7 +371,6 @@
   device.c:12694 count=1
   device.c:12784 count=72
   device.c:12823 count=477
-  device.c:13838 count=1
   device.c:15088 count=1
   device.c:15160 count=1
 [i686+scale/visual] crash=0
@@ -510,7 +507,6 @@
   device.c:12694 count=1
   device.c:12784 count=72
   device.c:12823 count=477
-  device.c:13838 count=1
   device.c:14930 count=1
   device.c:15088 count=1
   device.c:15160 count=1
@@ -615,7 +611,6 @@
   device.c:12689 count=1
   device.c:12784 count=72
   device.c:12823 count=477
-  device.c:13838 count=1
   device.c:14930 count=1
   device.c:15088 count=1
   device.c:15160 count=1
@@ -798,7 +793,6 @@
   device.c:12694 count=1
   device.c:12784 count=72
   device.c:12823 count=477
-  device.c:13838 count=1
   device.c:15088 count=1
   device.c:15160 count=1
 [x86_64+scale/visual] crash=0

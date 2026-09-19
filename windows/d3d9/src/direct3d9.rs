@@ -945,14 +945,16 @@ extern "system" fn d3d9_check_device_format(
     // automatic mip-generation path. Their shader support is fragment-only,
     // and neither sRGB conversion nor color blending applies to depth.
     if is_depth_stencil_format(check_format)
-        && usage
-            & (D3DUSAGE_DYNAMIC
-                | D3DUSAGE_RENDERTARGET
-                | D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING
-                | D3DUSAGE_QUERY_SRGBREAD
-                | D3DUSAGE_QUERY_SRGBWRITE
-                | D3DUSAGE_QUERY_VERTEXTEXTURE)
-            != 0
+        && (usage & D3DUSAGE_DYNAMIC != 0
+            && (mtld3d_core::depth_texture::PackedDepth::from_d3d(check_format).is_none()
+                || usage & D3DUSAGE_DEPTHSTENCIL != 0)
+            || usage
+                & (D3DUSAGE_RENDERTARGET
+                    | D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING
+                    | D3DUSAGE_QUERY_SRGBREAD
+                    | D3DUSAGE_QUERY_SRGBWRITE
+                    | D3DUSAGE_QUERY_VERTEXTEXTURE)
+                != 0)
     {
         trace!(target: LOG_TARGET,
             "reject CheckDeviceFormat depth format={check_format} usage={usage:#x} → NOTAVAILABLE");

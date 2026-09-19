@@ -24,12 +24,12 @@ use mtld3d_shared::{
 use objc2::{Message, rc::Retained, runtime::ProtocolObject};
 use objc2_foundation::{NSError, NSRange};
 use objc2_metal::{
-    MTLBlitCommandEncoder, MTLBuffer, MTLClearColor, MTLCommandBuffer, MTLCommandBufferStatus,
-    MTLCommandEncoder, MTLCommandQueue, MTLCullMode, MTLDevice, MTLDrawable, MTLIndexType,
-    MTLLoadAction, MTLMultisampleDepthResolveFilter, MTLOrigin, MTLPixelFormat, MTLPrimitiveType,
-    MTLRenderCommandEncoder, MTLRenderPassDescriptor, MTLResource, MTLResourceOptions,
-    MTLSamplerState, MTLScissorRect, MTLSize, MTLStoreAction, MTLTexture, MTLTextureType,
-    MTLTriangleFillMode, MTLViewport, MTLVisibilityResultMode,
+    MTLBlitCommandEncoder, MTLBlitOption, MTLBuffer, MTLClearColor, MTLCommandBuffer,
+    MTLCommandBufferStatus, MTLCommandEncoder, MTLCommandQueue, MTLCullMode, MTLDevice,
+    MTLDrawable, MTLIndexType, MTLLoadAction, MTLMultisampleDepthResolveFilter, MTLOrigin,
+    MTLPixelFormat, MTLPrimitiveType, MTLRenderCommandEncoder, MTLRenderPassDescriptor,
+    MTLResource, MTLResourceOptions, MTLSamplerState, MTLScissorRect, MTLSize, MTLStoreAction,
+    MTLTexture, MTLTextureType, MTLTriangleFillMode, MTLViewport, MTLVisibilityResultMode,
 };
 use objc2_metal_fx::MTLFXSpatialScalerColorProcessingMode;
 use objc2_quartz_core::CAMetalDrawable;
@@ -1862,7 +1862,7 @@ fn encode_leading_blits(
     // we'd have to scan the blit list to know whether to create the
     // blit encoder; the PE side already knows, so just trust the flag.
     // Pure-notify frames skip encoder creation entirely.
-    let blit = if needs_encoder {
+    let mut blit = if needs_encoder {
         if let Some(b) = cmd_buf.blitCommandEncoder() {
             let label =
                 objc2_foundation::NSString::from_str(&format!("mtld3d-leading-blits-{site}"));
@@ -1883,6 +1883,24 @@ fn encode_leading_blits(
     for (i, cmd) in blits.iter().enumerate() {
         mtld3d_shared::crumb!("blit:cmd", u64::from(cmd.cmd), i as u64);
         match BlitCommandType::from_repr(cmd.cmd) {
+            Some(BlitCommandType::TransferDepth) => {
+                if let Some(encoder) = blit.take() {
+                    encoder.endEncoding();
+                }
+                if !super::depth_transfer::encode(cmd_buf, cmd) {
+                    return false;
+                }
+                if i + 1 < blits.len() {
+                    let Some(encoder) = cmd_buf.blitCommandEncoder() else {
+                        error!(target: LOG_TARGET, "depth transfer: following blit encoder failed");
+                        return false;
+                    };
+                    encoder.setLabel(Some(&objc2_foundation::NSString::from_str(
+                        "mtld3d-depth-transfer-following-blits",
+                    )));
+                    blit = Some(encoder);
+                }
+            }
             Some(BlitCommandType::NotifyBufferDidModifyRange) => {
                 // CPU-side flag-set on `MTLBuffer`, not an encoder
                 // call. Safe to interleave with open encoder commands;
@@ -1913,7 +1931,11 @@ fn encode_leading_blits(
                     length: to_usize(cmd.byte_size),
                 });
             }
-            Some(BlitCommandType::CopyBufferToTexture) => {
+            Some(
+                kind @ (BlitCommandType::CopyBufferToTexture
+                | BlitCommandType::CopyBufferToDepth
+                | BlitCommandType::CopyBufferToStencil),
+            ) => {
                 let blit = blit.as_ref().expect("non-notify command requires encoder");
                 // SAFETY: cmd.src_handle is a previously-retained MTLBuffer address.
                 let src_buffer_handle =
@@ -1926,6 +1948,10 @@ fn encode_leading_blits(
                         target: LOG_TARGET,
                         "encode_leading_blits: upload source buffer handle is null",
                     );
+                    if kind != BlitCommandType::CopyBufferToTexture {
+                        blit.endEncoding();
+                        return false;
+                    }
                     continue;
                 };
                 // SAFETY: cmd.dst_handle is a previously-retained MTLTexture address.
@@ -1941,6 +1967,10 @@ fn encode_leading_blits(
                         target: LOG_TARGET,
                         "encode_leading_blits: upload destination texture handle is null",
                     );
+                    if kind != BlitCommandType::CopyBufferToTexture {
+                        blit.endEncoding();
+                        return false;
+                    }
                     continue;
                 };
                 let region = CopyRegion {
@@ -1965,7 +1995,40 @@ fn encode_leading_blits(
                     origin_x: cmd.origin_x as usize,
                     origin_y: cmd.origin_y as usize,
                 };
-                let block = copy_block_layout(destination.pixel_format);
+                let (block, options) = match kind {
+                    BlitCommandType::CopyBufferToDepth
+                        if matches!(
+                            destination.pixel_format,
+                            MTLPixelFormat::Depth32Float | MTLPixelFormat::Depth32Float_Stencil8
+                        ) =>
+                    {
+                        (
+                            PixelFormat::R32Float.block_layout(),
+                            if destination.pixel_format == MTLPixelFormat::Depth32Float_Stencil8 {
+                                MTLBlitOption::DepthFromDepthStencil
+                            } else {
+                                MTLBlitOption::empty()
+                            },
+                        )
+                    }
+                    BlitCommandType::CopyBufferToStencil
+                        if destination.pixel_format == MTLPixelFormat::Depth32Float_Stencil8 =>
+                    {
+                        (
+                            PixelFormat::R8Unorm.block_layout(),
+                            MTLBlitOption::StencilFromDepthStencil,
+                        )
+                    }
+                    BlitCommandType::CopyBufferToTexture => (
+                        copy_block_layout(destination.pixel_format),
+                        MTLBlitOption::empty(),
+                    ),
+                    _ => {
+                        error!(target: LOG_TARGET, "depth upload: incompatible plane and destination format");
+                        blit.endEncoding();
+                        return false;
+                    }
+                };
                 if let Some(reason) =
                     copy_buffer_to_texture_reject(&source, &destination, &region, block)
                 {
@@ -1980,6 +2043,10 @@ fn encode_leading_blits(
                          dst handle={dst_handle:#x} {destination}, \
                          region {region}"
                     );
+                    if kind != BlitCommandType::CopyBufferToTexture {
+                        blit.endEncoding();
+                        return false;
+                    }
                     continue;
                 }
                 mtld3d_shared::crumb!("blit:buf2tex", cmd.src_handle, cmd.dst_handle);
@@ -1993,7 +2060,7 @@ fn encode_leading_blits(
                 // and `texture` into the command buffer's resource set; the
                 // geometry cleared `copy_buffer_to_texture_reject` above.
                 unsafe {
-                    blit.copyFromBuffer_sourceOffset_sourceBytesPerRow_sourceBytesPerImage_sourceSize_toTexture_destinationSlice_destinationLevel_destinationOrigin(
+                    blit.copyFromBuffer_sourceOffset_sourceBytesPerRow_sourceBytesPerImage_sourceSize_toTexture_destinationSlice_destinationLevel_destinationOrigin_options(
                         buffer,
                         to_usize(cmd.src_offset),
                         to_usize(cmd.bytes_per_row),
@@ -2011,6 +2078,7 @@ fn encode_leading_blits(
                             y: cmd.origin_y as usize,
                             z: 0,
                         },
+                        options,
                     );
                 }
             }
@@ -3083,6 +3151,9 @@ fn mtl_primitive_type_or_fallback(raw: u32, site: &str) -> MTLPrimitiveType {
 /// Grouped so the function's argument list stays under the clippy
 /// threshold.
 pub struct BlitArgs {
+    pub planes: mtld3d_shared::mtl::ReadbackPlanes,
+    pub stencil_bytes_per_row: u32,
+    pub stencil_offset: u64,
     pub queue_handle: MetalHandle<MTLCommandQueueKind>,
     pub device_handle: MetalHandle<MTLDeviceKind>,
     pub tex_handle: MetalHandle<MTLTextureKind>,
@@ -3271,6 +3342,9 @@ pub fn blit_texture_to_buffer(args: &BlitArgs) -> bool {
     let to_usize =
         |v: u64| usize::try_from(v).expect("PE wire u64 fits unix host usize (unix is 64-bit)");
     let BlitArgs {
+        planes,
+        stencil_bytes_per_row,
+        stencil_offset,
         queue_handle,
         device_handle,
         tex_handle,
@@ -3387,7 +3461,50 @@ pub fn blit_texture_to_buffer(args: &BlitArgs) -> bool {
         bytes_per_row: bytes_per_row as usize,
         bytes_per_image,
     };
-    let block = copy_block_layout(src_endpoint.pixel_format);
+    let (block, options) = match planes {
+        mtld3d_shared::mtl::ReadbackPlanes::Color => (
+            copy_block_layout(src_endpoint.pixel_format),
+            MTLBlitOption::empty(),
+        ),
+        mtld3d_shared::mtl::ReadbackPlanes::Depth
+        | mtld3d_shared::mtl::ReadbackPlanes::DepthStencil => {
+            if !matches!(
+                src_endpoint.pixel_format,
+                MTLPixelFormat::Depth32Float | MTLPixelFormat::Depth32Float_Stencil8
+            ) {
+                error!(target: LOG_TARGET, "depth readback: source is not a depth format");
+                return false;
+            }
+            (
+                PixelFormat::R32Float.block_layout(),
+                if src_endpoint.pixel_format == MTLPixelFormat::Depth32Float_Stencil8 {
+                    MTLBlitOption::DepthFromDepthStencil
+                } else {
+                    MTLBlitOption::empty()
+                },
+            )
+        }
+    };
+    let stencil_destination = CopyBufferEndpoint {
+        length: dst_buffer.length(),
+        offset: to_usize(stencil_offset),
+        bytes_per_row: stencil_bytes_per_row as usize,
+        bytes_per_image: 0,
+    };
+    if planes == mtld3d_shared::mtl::ReadbackPlanes::DepthStencil
+        && (src_endpoint.pixel_format != MTLPixelFormat::Depth32Float_Stencil8
+            || stencil_destination.offset < destination.bytes_per_row * region.height
+            || copy_texture_to_buffer_reject(
+                &src_endpoint,
+                &stencil_destination,
+                &region,
+                PixelFormat::R8Unorm.block_layout(),
+            )
+            .is_some())
+    {
+        error!(target: LOG_TARGET, "depth readback: invalid stencil destination");
+        return false;
+    }
     // Checked before the encoder exists so a rejection leaves no encoder to
     // close. A declined `MetalFX` resolve lands here: the caller asked for
     // more pixels than the render-resolution source holds.
@@ -3436,7 +3553,7 @@ pub fn blit_texture_to_buffer(args: &BlitArgs) -> bool {
     // objects live for the call; the geometry cleared
     // `copy_texture_to_buffer_reject` above.
     unsafe {
-        blit.copyFromTexture_sourceSlice_sourceLevel_sourceOrigin_sourceSize_toBuffer_destinationOffset_destinationBytesPerRow_destinationBytesPerImage(
+        blit.copyFromTexture_sourceSlice_sourceLevel_sourceOrigin_sourceSize_toBuffer_destinationOffset_destinationBytesPerRow_destinationBytesPerImage_options(
             texture,
             slice as usize,
             mip_level as usize,
@@ -3454,9 +3571,23 @@ pub fn blit_texture_to_buffer(args: &BlitArgs) -> bool {
             0,
             bytes_per_row as usize,
             bytes_per_image,
+            options,
         );
-        blit.synchronizeResource(ProtocolObject::from_ref(&*dst_buffer));
     }
+    if planes == mtld3d_shared::mtl::ReadbackPlanes::DepthStencil {
+        // SAFETY: the stencil format and byte region were validated before encoding;
+        // the retained buffer and texture outlive this synchronous submission.
+        unsafe {
+            blit.copyFromTexture_sourceSlice_sourceLevel_sourceOrigin_sourceSize_toBuffer_destinationOffset_destinationBytesPerRow_destinationBytesPerImage_options(
+                texture, slice as usize, mip_level as usize,
+                MTLOrigin { x: origin_x as usize, y: origin_y as usize, z: 0 },
+                MTLSize { width: width as usize, height: height as usize, depth: 1 },
+                &dst_buffer, to_usize(stencil_offset), stencil_bytes_per_row as usize, 0,
+                MTLBlitOption::StencilFromDepthStencil,
+            );
+        }
+    }
+    blit.synchronizeResource(ProtocolObject::from_ref(&*dst_buffer));
 
     blit.endEncoding();
     cmd_buf.commit();

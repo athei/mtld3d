@@ -4585,7 +4585,8 @@ fn plain_depth_textures_preserve_the_gpu_only_resource_contract() {
             h.try_create_texture(17, 9, 2, D3DUSAGE_AUTOGENMIPMAP, format, D3DPOOL_DEFAULT);
         assert_eq!(hr, D3DERR_INVALIDCALL);
         assert!(ptr.is_null());
-        for usage in [D3DUSAGE_DYNAMIC, D3DUSAGE_RENDERTARGET] {
+        {
+            let usage = D3DUSAGE_RENDERTARGET;
             assert_eq!(
                 h.check_device_format(
                     D3DFMT_X8R8G8B8,
