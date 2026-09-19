@@ -2182,3 +2182,47 @@ fn unaligned_float_constants_survive_caller_overwrite() {
         }
     }
 }
+
+/// Vertex fetch retains signed RGB/Q before an explicit range conversion.
+#[test]
+fn q8w8v8u8_vertex_texture_preserves_signed_values() {
+    let h = Harness::new();
+    let tex = h.create_texture(1, 1, 1, 0, mtld3d_types::D3DFMT_Q8W8V8U8, D3DPOOL_MANAGED);
+    tex.lock_rect(0, 0).write_u32(&[0xf030_10e0]);
+    assert_eq!(h.set_texture(257, &tex), 0);
+    let ps = h.create_pixel_shader(&PS_COLOR_PASSTHROUGH);
+    assert_eq!(h.set_pixel_shader(&ps), 0);
+    assert_eq!(h.set_fvf(D3DFVF_XYZ), 0);
+    for (src, expected) in [(0x80e4_0000, 0x6f5f_90b0), (0x80ff_0000, 0x6f6f_6f6f)] {
+        let mut tokens = VS_FETCH.to_vec();
+        tokens.pop();
+        tokens.extend_from_slice(&[
+            0x0500_0051,
+            0xa00f_0005,
+            0x3f00_0000,
+            0x3f00_0000,
+            0x3f00_0000,
+            0x3f00_0000,
+            0x0400_0004,
+            0xe00f_0001,
+            src,
+            0xa0e4_0005,
+            0xa0e4_0005,
+            0x0000_ffff,
+        ]);
+        let vs = h.create_vertex_shader(&tokens);
+        assert_eq!(h.set_vertex_shader(&vs), 0);
+        h.render_once(0, |d| {
+            assert_eq!(
+                d.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &centered_triangle()),
+                0
+            );
+        });
+        mtld3d_tests::assert_pixel_approx(
+            h.read_pixel(320, 280),
+            expected,
+            1,
+            "signed vertex fetch",
+        );
+    }
+}

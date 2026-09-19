@@ -6,15 +6,15 @@ use mtld3d_types::{
     D3DFMT_D16, D3DFMT_D16_LOCKABLE, D3DFMT_D24FS8, D3DFMT_D24S8, D3DFMT_D24X4S4, D3DFMT_D24X8,
     D3DFMT_D32, D3DFMT_D32F_LOCKABLE, D3DFMT_DF16, D3DFMT_DF24, D3DFMT_DXT1, D3DFMT_DXT2,
     D3DFMT_DXT3, D3DFMT_DXT4, D3DFMT_DXT5, D3DFMT_G16R16, D3DFMT_G16R16F, D3DFMT_G32R32F,
-    D3DFMT_INTZ, D3DFMT_L8, D3DFMT_L16, D3DFMT_R5G6B5, D3DFMT_R8G8B8, D3DFMT_R16F, D3DFMT_R32F,
-    D3DFMT_UYVY, D3DFMT_V8U8, D3DFMT_V16U16, D3DFMT_X1R5G5B5, D3DFMT_X8B8G8R8, D3DFMT_X8R8G8B8,
-    D3DFMT_YUY2, D3DRTYPE_CUBETEXTURE, D3DRTYPE_INDEXBUFFER, D3DRTYPE_SURFACE, D3DRTYPE_TEXTURE,
-    D3DRTYPE_VERTEXBUFFER, D3DRTYPE_VOLUME, D3DRTYPE_VOLUMETEXTURE, D3DUSAGE_AUTOGENMIPMAP,
-    D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_DMAP, D3DUSAGE_DONOTCLIP, D3DUSAGE_DYNAMIC, D3DUSAGE_NPATCHES,
-    D3DUSAGE_POINTS, D3DUSAGE_QUERY_FILTER, D3DUSAGE_QUERY_LEGACYBUMPMAP,
-    D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING, D3DUSAGE_QUERY_SRGBREAD, D3DUSAGE_QUERY_SRGBWRITE,
-    D3DUSAGE_QUERY_VERTEXTEXTURE, D3DUSAGE_QUERY_WRAPANDMIP, D3DUSAGE_RENDERTARGET,
-    D3DUSAGE_RTPATCHES, D3DUSAGE_SOFTWAREPROCESSING,
+    D3DFMT_INTZ, D3DFMT_L8, D3DFMT_L16, D3DFMT_Q8W8V8U8, D3DFMT_R5G6B5, D3DFMT_R8G8B8, D3DFMT_R16F,
+    D3DFMT_R32F, D3DFMT_UYVY, D3DFMT_V8U8, D3DFMT_V16U16, D3DFMT_X1R5G5B5, D3DFMT_X8B8G8R8,
+    D3DFMT_X8R8G8B8, D3DFMT_YUY2, D3DRTYPE_CUBETEXTURE, D3DRTYPE_INDEXBUFFER, D3DRTYPE_SURFACE,
+    D3DRTYPE_TEXTURE, D3DRTYPE_VERTEXBUFFER, D3DRTYPE_VOLUME, D3DRTYPE_VOLUMETEXTURE,
+    D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_DMAP, D3DUSAGE_DONOTCLIP,
+    D3DUSAGE_DYNAMIC, D3DUSAGE_NPATCHES, D3DUSAGE_POINTS, D3DUSAGE_QUERY_FILTER,
+    D3DUSAGE_QUERY_LEGACYBUMPMAP, D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING, D3DUSAGE_QUERY_SRGBREAD,
+    D3DUSAGE_QUERY_SRGBWRITE, D3DUSAGE_QUERY_VERTEXTEXTURE, D3DUSAGE_QUERY_WRAPANDMIP,
+    D3DUSAGE_RENDERTARGET, D3DUSAGE_RTPATCHES, D3DUSAGE_SOFTWAREPROCESSING,
 };
 
 use super::LOG_TARGET;
@@ -157,6 +157,7 @@ pub const fn format_name(d3d_format: u32) -> &'static str {
         D3DFMT_ATI1 => "ATI1",
         D3DFMT_V8U8 => "V8U8",
         D3DFMT_V16U16 => "V16U16",
+        D3DFMT_Q8W8V8U8 => "Q8W8V8U8",
         D3DFMT_DXT1 => "DXT1",
         D3DFMT_DXT2 => "DXT2",
         D3DFMT_DXT3 => "DXT3",
@@ -273,21 +274,21 @@ pub const fn is_mapped_color_format(d3d_format: u32) -> bool {
 
 /// Colour formats whose creation rejects the MANAGED/DYNAMIC combination.
 ///
-/// V16U16 follows the native pool rule. Existing formats retain their legacy
-/// creation policy; this predicate does not replace other pool validation.
+/// V16U16 and Q8W8V8U8 follow the native pool rule. Existing formats retain
+/// their legacy creation policy; this does not replace other pool validation.
 #[must_use]
 pub const fn uses_strict_dynamic_pool_validation(d3d_format: u32) -> bool {
-    matches!(d3d_format, D3DFMT_V16U16)
+    matches!(d3d_format, D3DFMT_V16U16 | D3DFMT_Q8W8V8U8)
 }
 
 /// Colour formats whose AUTOGEN requests use one level without generation.
 ///
-/// V16U16 is sampleable but advertises NOAUTOGEN. Its public usage is retained,
-/// while creation suppresses the internal generation flag and hidden levels.
+/// V16U16 and Q8W8V8U8 are sampleable but advertise NOAUTOGEN. Usage is
+/// retained; creation suppresses the internal generation flag and hidden levels.
 /// Other formats keep their existing creation policy.
 #[must_use]
 pub const fn uses_noautogen_fallback(d3d_format: u32) -> bool {
-    matches!(d3d_format, D3DFMT_V16U16)
+    matches!(d3d_format, D3DFMT_V16U16 | D3DFMT_Q8W8V8U8)
 }
 
 /// True for colour formats creatable as GPU-backed volume textures.
@@ -436,15 +437,17 @@ pub const fn is_render_target_format_device(d3d_format: u32, native_packed16: bo
 /// members (R16F / G16R16F / A16B16G16R16F) filter on every family and stay
 /// advertised either way.
 ///
-/// V16U16 also rejects sRGB-write queries, including queries without a render
-/// target bit. Other usage policy stays with the caller; the float family is
+/// V16U16 and Q8W8V8U8 also reject sRGB-write queries without a render-target
+/// bit. Other usage policy stays with the caller; the float family is
 /// colour-renderable on both GPU families.
 #[must_use]
 pub const fn supports_usage_query(d3d_format: u32, usage: u32, float32_filtering: bool) -> bool {
-    // V16U16 is a signed sampling format with no sRGB write representation.
+    // These signed sampling formats have no sRGB write representation.
     // Reject this even without RENDERTARGET, before an AUTOGEN query can
     // return the successful NOAUTOGEN fallback.
-    if d3d_format == D3DFMT_V16U16 && usage & D3DUSAGE_QUERY_SRGBWRITE != 0 {
+    if matches!(d3d_format, D3DFMT_V16U16 | D3DFMT_Q8W8V8U8)
+        && usage & D3DUSAGE_QUERY_SRGBWRITE != 0
+    {
         return false;
     }
     if usage & D3DUSAGE_QUERY_FILTER == 0 {
@@ -679,6 +682,15 @@ const fn lookup_d3d_format(d3d_format: u32) -> Option<FormatMapping> {
             block_bytes: 4,
             swizzle: Some([Swizzle::Red, Swizzle::Green, Swizzle::One, Swizzle::One]),
             has_alpha: false,
+        }),
+        D3DFMT_Q8W8V8U8 => Some(FormatMapping {
+            metal_pixel_format: PixelFormat::Rgba8Snorm,
+            bytes_per_pixel: 4,
+            block_width: 1,
+            block_height: 1,
+            block_bytes: 4,
+            swizzle: None,
+            has_alpha: true,
         }),
         D3DFMT_V8U8 => Some(FormatMapping {
             // Signed two-channel (tangent-space normals etc.) — exact Metal match.

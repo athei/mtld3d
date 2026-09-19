@@ -100,6 +100,8 @@ pub enum PixelFormat {
     Rgba8Unorm = 70,
     /// sRGB-encoded twin of `Rgba8Unorm`.
     Rgba8UnormSrgb = 71,
+    /// Signed normalized 8-bit U/V/W/Q. D3D9 `D3DFMT_Q8W8V8U8`.
+    Rgba8Snorm = 72,
     Bgra8Unorm = 80,
     /// sRGB-encoded twin of `Bgra8Unorm`.
     ///
@@ -194,6 +196,7 @@ impl PixelFormat {
             | Self::Bgr5A1Unorm => BlockLayout::pixel(2),
             Self::R32Float
             | Self::Rg16Unorm
+            | Self::Rgba8Snorm
             | Self::Rg16Snorm
             | Self::Rg16Float
             | Self::Rgba8Unorm

@@ -1321,3 +1321,12 @@ byte uploads as other mapped formats. 2D and cube AUTOGEN requests answer
 D3DOK_NOAUTOGEN and create one actual level with the public usage retained;
 no mip-generation work is submitted. Render-target and sRGB queries remain
 unavailable. Other signed formats remain separate capabilities.
+
+Q8W8V8U8 textures use native RGBA8Snorm storage with four signed channels.
+The negative Q channel follows signed normalization, including a floor of
+minus one for both minimum encodings. The legacy R200 exception in Wine's
+signed-format alpha test is not an emulated target. Shader sampling needs
+no conversion or swizzle. Render-target and sRGB capabilities stay absent;
+AUTOGEN texture/cube requests preserve usage but use one actual level with
+no generated chain. The new format rejects MANAGED+DYNAMIC creation without
+changing older formats' pool policy.
