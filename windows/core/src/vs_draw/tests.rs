@@ -6,7 +6,7 @@
 //! packed from index zero (`D3DRS_CLIPPING` off drops them all). One check ties
 //! `VS_DRAW_MSL` to `VS_DRAW_BYTES` so a shifted lane cannot pass silently.
 
-use mtld3d_types::render_state_defaults;
+use mtld3d_types::{D3DRS_POINTSIZE, render_state_defaults};
 
 use super::*;
 
@@ -37,7 +37,12 @@ const NO_PLANES: [[f32; 4]; MAX_CLIP_PLANES] = [[0.0; 4]; MAX_CLIP_PLANES];
 
 #[test]
 fn defaults_pack_size_one_clamped_to_the_cap_and_identity_scale() {
-    let bytes = build_vs_draw_bytes(&render_state_defaults(), &D3DMATRIX::IDENTITY, &NO_PLANES);
+    let bytes = build_vs_draw_bytes(
+        &render_state_defaults(),
+        1.0f32.to_bits(),
+        &D3DMATRIX::IDENTITY,
+        &NO_PLANES,
+    );
     assert_eq!(lane(&bytes, 0), 1.0f32.to_bits(), "POINTSIZE");
     assert_eq!(lane(&bytes, 1), 1.0f32.to_bits(), "POINTSIZE_MIN");
     assert_eq!(
@@ -59,7 +64,12 @@ fn every_point_state_lands_in_its_lane() {
     rs[D3DRS_POINTSCALE_A as usize] = 0.5f32.to_bits();
     rs[D3DRS_POINTSCALE_B as usize] = 0.25f32.to_bits();
     rs[D3DRS_POINTSCALE_C as usize] = 0.125f32.to_bits();
-    let bytes = build_vs_draw_bytes(&rs, &D3DMATRIX::IDENTITY, &NO_PLANES);
+    let bytes = build_vs_draw_bytes(
+        &rs,
+        rs[D3DRS_POINTSIZE as usize],
+        &D3DMATRIX::IDENTITY,
+        &NO_PLANES,
+    );
     assert_eq!(
         [0, 1, 2, 4, 5, 6].map(|i| lane(&bytes, i)),
         [32.0f32, 2.0, 48.0, 0.5, 0.25, 0.125].map(f32::to_bits)
@@ -80,7 +90,12 @@ fn msl_struct_matches_the_byte_layout() {
 
 #[test]
 fn identity_view_packs_an_identity_inverse() {
-    let bytes = build_vs_draw_bytes(&render_state_defaults(), &D3DMATRIX::IDENTITY, &NO_PLANES);
+    let bytes = build_vs_draw_bytes(
+        &render_state_defaults(),
+        1.0f32.to_bits(),
+        &D3DMATRIX::IDENTITY,
+        &NO_PLANES,
+    );
     for r in 0..4 {
         let mut expect = [0.0f32; 4];
         expect[r] = 1.0;
@@ -97,7 +112,12 @@ fn inverse_view_rows_map_eye_space_back_to_world() {
     view.m[12] = 1.0;
     view.m[13] = 2.0;
     view.m[14] = 3.0;
-    let bytes = build_vs_draw_bytes(&render_state_defaults(), &view, &NO_PLANES);
+    let bytes = build_vs_draw_bytes(
+        &render_state_defaults(),
+        1.0f32.to_bits(),
+        &view,
+        &NO_PLANES,
+    );
     let pos_view = [1.0 + 10.0, 2.0 + 20.0, 3.0 + 30.0, 1.0];
     let world: Vec<u32> = (0..4)
         .map(|i| {
@@ -117,7 +137,12 @@ fn enabled_planes_pack_from_index_zero_and_clipping_off_drops_them() {
     planes[5] = [9.0; 4];
     rs[D3DRS_CLIPPLANEENABLE as usize] = (1 << 1) | (1 << 4) | (1 << 7);
     assert_eq!(clip_plane_count(&rs), 2, "bit 7 is past MaxUserClipPlanes");
-    let bytes = build_vs_draw_bytes(&rs, &D3DMATRIX::IDENTITY, &planes);
+    let bytes = build_vs_draw_bytes(
+        &rs,
+        rs[D3DRS_POINTSIZE as usize],
+        &D3DMATRIX::IDENTITY,
+        &planes,
+    );
     assert_eq!(
         row(&bytes, 6),
         bits(planes[1]),
@@ -131,6 +156,11 @@ fn enabled_planes_pack_from_index_zero_and_clipping_off_drops_them() {
     assert_eq!(row(&bytes, 8), [0; 4], "disabled plane 5 is not packed");
     rs[D3DRS_CLIPPING as usize] = 0;
     assert_eq!(clip_plane_count(&rs), 0, "CLIPPING off disables the planes");
-    let bytes = build_vs_draw_bytes(&rs, &D3DMATRIX::IDENTITY, &planes);
+    let bytes = build_vs_draw_bytes(
+        &rs,
+        rs[D3DRS_POINTSIZE as usize],
+        &D3DMATRIX::IDENTITY,
+        &planes,
+    );
     assert_eq!(row(&bytes, 6), [0; 4]);
 }

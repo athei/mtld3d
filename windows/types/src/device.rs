@@ -367,6 +367,11 @@ pub const D3DFMT_RESZ: u32 = 0x5A53_4552;
 /// Capability token for alpha-to-coverage, also written to `D3DRS_ADAPTIVETESS_Y`.
 pub const D3DFMT_ATOC: u32 = u32::from_le_bytes(*b"ATOC");
 
+/// POINTSIZE control tokens for the independent AMD alpha-to-coverage latch.
+pub const D3DFMT_A2M1: u32 = u32::from_le_bytes(*b"A2M1");
+/// Disable the AMD alpha-to-coverage latch without changing numeric point size.
+pub const D3DFMT_A2M0: u32 = u32::from_le_bytes(*b"A2M0");
+
 // ── D3D9 buffer formats (vertex-/index-buffer `Format`) ──
 
 pub const D3DFMT_VERTEXDATA: u32 = 100; // what `GetDesc` reports for VBs

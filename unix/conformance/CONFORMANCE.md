@@ -264,6 +264,33 @@ and pixel-stateblock membership (`render_state_indices`,
 suite covers rendered edges and interiors, state transitions and internal
 clear triangles; these capabilities do not imply a baseline count reduction.
 
+## Alpha-to-coverage controls
+
+The explicit ATOC and A2M controls work independently of the reported adapter
+vendor. ATOC through `ADAPTIVETESS_Y` requires `ALPHATESTENABLE`; A2M1/A2M0
+through `POINTSIZE` set and clear an independent latch. Either request enables
+coverage on multisampled RT0. Effective coverage replaces the ordinary alpha
+test; a single-sampled target restores it. Disabling one request leaves the
+other intact. A2M tokens are not advertised as resource formats.
+
+Numeric POINTSIZE writes and RESZ preserve the latch. A2M and RESZ controls
+preserve the last numeric point size, while GetRenderState retains the raw
+DWORD. ALL and VERTEX state blocks restore both hidden values; PIXEL blocks
+restore neither. Recorded blocks retain which components their writes touched
+across Capture: refreshing a raw DWORD cannot add or remove latch or numeric
+size membership. Reset restores the default numeric size and clears A2M.
+
+This is a compatibility policy for sequences on which the references differ.
+WineD3D keeps an independent latch, but retains the ordinary alpha test and
+reads control DWORDs as numeric point size. DXVK preserves numeric size for
+controls and suppresses alpha testing under coverage, but derives its request
+from raw POINTSIZE on selected invalidations. mtld3d combines independent
+latch lifetime with preserved numeric size and alpha-test suppression, avoiding
+behavior that depends on which later state update refreshed a cached request.
+Complete native AMD behavior for these mixed sequences has not been measured.
+The local sequence tests define this policy; Wine's AMD visual branch covers
+only enable, disable and VERTEX-state-block restoration.
+
 ## What the baseline records — and where classes live
 
 Each datum has exactly one authoritative home, split by who writes it:
