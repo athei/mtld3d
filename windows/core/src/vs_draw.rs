@@ -34,6 +34,86 @@ pub const VS_DRAW_BYTES: usize = 16 * (2 + 4 + MAX_CLIP_PLANES);
 /// packed from index 0 (zero past the count).
 pub const VS_DRAW_MSL: &str = "struct VsDraw {\n    float4 point;\n    float4 point_scale;\n    float4 inv_view[4];\n    float4 clip[6];\n};\n\n";
 
+/// Device-local inverse view, independent of transient draw snapshots.
+///
+/// The key is checked when packing a draw, so bulk state restoration and
+/// transform multiplication cannot leave a stale inverse behind. Point-state
+/// and plane changes reuse it, as do new frames with an unchanged view.
+pub struct VsDrawState {
+    inverse: Option<InverseView>,
+    #[cfg(test)]
+    inversions: usize,
+}
+
+impl Default for VsDrawState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl VsDrawState {
+    /// Create a device's empty inverse-view cache.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            inverse: None,
+            #[cfg(test)]
+            inversions: 0,
+        }
+    }
+
+    /// Pack draw constants, computing an inverse only for enabled clip planes.
+    ///
+    /// `point_size` is the last numeric POINTSIZE, excluding driver controls.
+    /// Unused inverse rows are identity. Active planes retain the general
+    /// inverse's arithmetic and its identity fallback for a singular view.
+    #[must_use]
+    pub fn build_bytes(
+        &mut self,
+        rs: &[u32; RENDER_STATE_COUNT],
+        point_size: u32,
+        view: &D3DMATRIX,
+        planes: &[[f32; 4]],
+    ) -> [u8; VS_DRAW_BYTES] {
+        let rows = if clip_plane_count(rs) == 0 {
+            &D3DMATRIX::IDENTITY
+        } else {
+            self.inverse_rows(view)
+        };
+        pack_bytes(rs, point_size, rows, planes)
+    }
+
+    fn inverse_rows(&mut self, view: &D3DMATRIX) -> &D3DMATRIX {
+        let view_bits = view.m.map(f32::to_bits);
+        if self
+            .inverse
+            .as_ref()
+            .is_none_or(|entry| entry.view_bits != view_bits)
+        {
+            let inverse = FfState::inverse(view).unwrap_or_else(|| {
+                mtld3d_shared::log_once_warn!(
+                    target: crate::LOG_TARGET,
+                    "D3DTS_VIEW is singular; user clip planes use the identity view"
+                );
+                D3DMATRIX::IDENTITY
+            });
+            self.inverse = Some(InverseView {
+                view_bits,
+                rows: FfState::transpose(&inverse),
+            });
+            #[cfg(test)]
+            {
+                self.inversions += 1;
+            }
+        }
+        &self
+            .inverse
+            .as_ref()
+            .expect("inverse was populated for this view")
+            .rows
+    }
+}
+
 /// Number of user clip planes a draw applies.
 ///
 /// The enabled planes among the first [`MAX_CLIP_PLANES`] of
@@ -50,21 +130,16 @@ pub fn clip_plane_count(rs: &[u32; RENDER_STATE_COUNT]) -> u8 {
     u8::try_from(mask.count_ones()).unwrap_or(6)
 }
 
-/// Serialise the point render states, the inverse view and the clip planes.
-///
-/// `point_size` is the last numeric POINTSIZE, excluding driver controls.
-/// Each point state DWORD already holds an f32 bit pattern and is copied
-/// through verbatim; the fourth lane of each row is padding. `planes` holds
-/// the application's `SetClipPlane` coefficients by index (at least
-/// [`MAX_CLIP_PLANES`] entries); only the enabled ones are packed, in index
-/// order. A singular view matrix (never produced by a real camera) falls back
-/// to the identity with a one-shot warn rather than feeding NaNs to the
-/// clipper.
-#[must_use]
-pub fn build_vs_draw_bytes(
+struct InverseView {
+    view_bits: [u32; 16],
+    rows: D3DMATRIX,
+}
+
+/// Serialise point states, transposed inverse rows and enabled planes.
+fn pack_bytes(
     rs: &[u32; RENDER_STATE_COUNT],
     point_size: u32,
-    view: &D3DMATRIX,
+    inverse_rows: &D3DMATRIX,
     planes: &[[f32; 4]],
 ) -> [u8; VS_DRAW_BYTES] {
     let mut lanes = [0u32; VS_DRAW_BYTES / 4];
@@ -74,14 +149,7 @@ pub fn build_vs_draw_bytes(
     lanes[4] = rs[D3DRS_POINTSCALE_A as usize];
     lanes[5] = rs[D3DRS_POINTSCALE_B as usize];
     lanes[6] = rs[D3DRS_POINTSCALE_C as usize];
-    let inv_view = FfState::inverse(view).unwrap_or_else(|| {
-        mtld3d_shared::log_once_warn!(
-            target: crate::LOG_TARGET,
-            "D3DTS_VIEW is singular; user clip planes use the identity view"
-        );
-        D3DMATRIX::IDENTITY
-    });
-    for (lane, v) in lanes[8..24].iter_mut().zip(FfState::transpose(&inv_view).m) {
+    for (lane, v) in lanes[8..24].iter_mut().zip(&inverse_rows.m) {
         *lane = v.to_bits();
     }
     let mut next = 24;

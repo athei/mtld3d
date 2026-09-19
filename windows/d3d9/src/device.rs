@@ -568,6 +568,7 @@ pub struct DeviceInner {
     /// we don't consume. Access via `rs_warn_fired()` / `mark_rs_warn()`.
     rs_warn_fired: [u64; RENDER_STATE_COUNT.div_ceil(64)],
     ff_state: FfState,
+    vs_draw: mtld3d_core::vs_draw::VsDrawState,
     /// Scissor rect set by `SetScissorRect`.
     ///
     /// The encoder thread reads this each draw and emits a Metal
@@ -879,7 +880,7 @@ bitflags::bitflags! {
         const VS_CONST_I  = 1 << 13;
         /// Per-draw `VsDraw` uniform bytes (point size state).
         ///
-        /// `mtld3d_core::vs_draw::build_vs_draw_bytes` over the point render
+        /// `mtld3d_core::vs_draw::VsDrawState::build_bytes` over the point render
         /// states, bound for every draw.
         const VS_DRAW     = 1 << 14;
         /// VS boolean-constant bitmask (vertex slot 26).
@@ -1025,11 +1026,6 @@ impl DeviceInner {
         let slot = (index as usize).min(CLIP_PLANE_SLOTS - 1);
         self.clip_planes[slot] = plane;
         self.mark_snapshot_dirty(SnapshotDirty::VS_DRAW);
-    }
-
-    /// Every stored user clip plane, by index.
-    pub const fn clip_planes(&self) -> &[[f32; 4]; CLIP_PLANE_SLOTS] {
-        &self.clip_planes
     }
 
     /// Read back a user clip plane for `GetClipPlane`.
@@ -2445,6 +2441,7 @@ impl DeviceInner {
         self.point_size = self.render_states[D3DRS_POINTSIZE as usize];
         self.flags.remove(DeviceFlags::A2M_ENABLED);
         self.ff_state = FfState::new();
+        self.vs_draw = mtld3d_core::vs_draw::VsDrawState::new();
         // Reset abandons any open scene; a following EndScene must fail.
         self.flags.remove(DeviceFlags::IN_SCENE);
         // Scissor defaults to the full target, like the viewport reseed below.
@@ -2955,6 +2952,7 @@ impl Direct3DDevice9 {
             render_states: info.render_states,
             rs_warn_fired: [0; RENDER_STATE_COUNT.div_ceil(64)],
             ff_state: FfState::new(),
+            vs_draw: mtld3d_core::vs_draw::VsDrawState::new(),
             // D3D9 default scissor rect covers the full backbuffer; like the
             // viewport, SetRenderTarget and Reset re-cover the new target.
             scissor_rect: [0, 0, info.backbuffer_width, info.backbuffer_height],
@@ -11544,12 +11542,8 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
             .transform(mtld3d_types::D3DTS_VIEW)
             .copied()
             .unwrap_or(D3DMATRIX::IDENTITY);
-        Some(mtld3d_core::vs_draw::build_vs_draw_bytes(
-            rs,
-            dev.point_size(),
-            &view,
-            dev.clip_planes(),
-        ))
+        let point_size = dev.point_size();
+        Some(dev.vs_draw.build_bytes(rs, point_size, &view, &dev.clip_planes))
     } else {
         None
     };

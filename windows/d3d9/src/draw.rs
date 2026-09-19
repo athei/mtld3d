@@ -34,7 +34,7 @@ use mtld3d_core::{
         bound_stream_layout, instance_count, instanced_stream_read_bytes, is_instance_data,
         layout_stride,
     },
-    vs_draw::{MAX_CLIP_PLANES, VS_DRAW_BYTES, build_vs_draw_bytes},
+    vs_draw::{MAX_CLIP_PLANES, VS_DRAW_BYTES, VsDrawState},
 };
 use mtld3d_shared::{
     Command, NullTextureKind, VertexAttrDesc,
@@ -53,7 +53,7 @@ use mtld3d_types::{
 /// The fallback bind when a snapshot reaches `emit_draw` without its own
 /// (never expected; warned once).
 static VS_DRAW_DEFAULT: std::sync::LazyLock<[u8; VS_DRAW_BYTES]> = std::sync::LazyLock::new(|| {
-    build_vs_draw_bytes(
+    VsDrawState::new().build_bytes(
         &render_state_defaults(),
         render_state_defaults()[mtld3d_types::D3DRS_POINTSIZE as usize],
         &D3DMATRIX::IDENTITY,

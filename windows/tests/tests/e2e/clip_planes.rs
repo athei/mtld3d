@@ -10,7 +10,7 @@
 use mtld3d_tests::{Harness, PosColorVertex, RhwVertex};
 use mtld3d_types::{
     D3DFVF_DIFFUSE, D3DFVF_XYZ, D3DFVF_XYZRHW, D3DPT_TRIANGLELIST, D3DRS_CLIPPING,
-    D3DRS_CLIPPLANEENABLE, D3DRS_LIGHTING, D3DSBT_ALL, D3DTS_VIEW,
+    D3DRS_CLIPPLANEENABLE, D3DRS_LIGHTING, D3DRS_POINTSIZE, D3DSBT_ALL, D3DTS_VIEW,
 };
 
 const BLACK: u32 = 0xFF00_0000;
@@ -101,6 +101,70 @@ fn fixed_function_planes_are_world_space() {
         "second quarter (world y < 0)"
     );
     assert_eq!(h.read_pixel(320, 380), BLACK, "bottom half");
+}
+
+#[test]
+fn inverse_view_follows_restores_multiplication_and_reset() {
+    let h = Harness::new();
+    arm_diffuse(&h);
+    assert_eq!(h.set_clip_plane(0, plane_y_above(0.0)), 0);
+    assert_eq!(h.set_render_state(D3DRS_CLIPPLANEENABLE, 1), 0);
+    let identity = h.create_state_block(D3DSBT_ALL);
+    let mut view = [0.0f32; 16];
+    for i in [0, 5, 10, 15] {
+        view[i] = 1.0;
+    }
+    view[13] = 0.5;
+    assert_eq!(h.multiply_transform(D3DTS_VIEW, &view), 0);
+    draw_quad(&h);
+    assert_eq!(h.read_pixel(320, 180), BLACK, "translated world plane");
+
+    // Present starts a fresh snapshot. Point-state changes rebuild the same
+    // uniform without changing the view used to clip the next draw.
+    assert_eq!(h.present(), 0);
+    assert_eq!(h.set_render_state(D3DRS_POINTSIZE, 2.0f32.to_bits()), 0);
+    draw_quad(&h);
+    assert_eq!(
+        h.read_pixel(320, 180),
+        BLACK,
+        "unchanged view in a new frame"
+    );
+    assert_eq!(identity.apply(), 0);
+    draw_quad(&h);
+    assert_eq!(h.read_pixel(320, 180), GREEN, "restored identity view");
+
+    assert_eq!(h.set_render_state(D3DRS_CLIPPING, 0), 0);
+    assert_eq!(h.set_transform(D3DTS_VIEW, &view), 0);
+    draw_quad(&h);
+    assert_eq!(
+        h.read_pixel(320, 180),
+        GREEN,
+        "clip disabled after view change"
+    );
+    assert_eq!(h.set_render_state(D3DRS_CLIPPING, 1), 0);
+    draw_quad(&h);
+    assert_eq!(
+        h.read_pixel(320, 180),
+        BLACK,
+        "clip reenabled with current view"
+    );
+
+    drop(identity);
+    assert_eq!(h.reset(640, 480), 0);
+    arm_diffuse(&h);
+    assert_eq!(h.set_clip_plane(0, plane_y_above(0.0)), 0);
+    assert_eq!(h.set_render_state(D3DRS_CLIPPLANEENABLE, 1), 0);
+    draw_quad(&h);
+    assert_eq!(
+        h.read_pixel(320, 180),
+        GREEN,
+        "reset restored identity view"
+    );
+    assert_eq!(
+        h.read_pixel(320, 380),
+        BLACK,
+        "reset still clips below plane"
+    );
 }
 
 #[test]
