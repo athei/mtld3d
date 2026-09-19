@@ -28,9 +28,9 @@ use mtld3d_types::{
     D3DTA_COMPLEMENT, D3DTA_CONSTANT, D3DTA_CURRENT, D3DTA_TEMP, D3DTOP_DISABLE, D3DTOP_LERP,
     D3DTSS_ALPHAARG1, D3DTSS_ALPHAARG2, D3DTSS_ALPHAOP, D3DTSS_BUMPENVLOFFSET,
     D3DTSS_BUMPENVLSCALE, D3DTSS_BUMPENVMAT00, D3DTSS_BUMPENVMAT01, D3DTSS_BUMPENVMAT10,
-    D3DTSS_BUMPENVMAT11, D3DTSS_COLORARG1, D3DTSS_COLORARG2, D3DTSS_COLOROP, D3DTSS_RESULTARG,
-    D3DTSS_TEXCOORDINDEX, D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_PROJECTED, RENDER_STATE_COUNT,
-    StateBlockType, TEXTURE_STAGE_STATE_COUNT, texture_stage_state_defaults,
+    D3DTSS_BUMPENVMAT11, D3DTSS_COLORARG1, D3DTSS_COLORARG2, D3DTSS_COLOROP, D3DTSS_CONSTANT,
+    D3DTSS_RESULTARG, D3DTSS_TEXCOORDINDEX, D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_PROJECTED,
+    RENDER_STATE_COUNT, StateBlockType, TEXTURE_STAGE_STATE_COUNT, texture_stage_state_defaults,
 };
 
 use crate::{
@@ -1700,6 +1700,41 @@ impl FfState {
         Some((95, rows, dst_ptr.cast::<u8>()))
     }
 
+    /// Pack a used stage-constant prefix directly into immutable frame scratch.
+    ///
+    /// Row zero is texture factor; subsequent rows are stage constants. The
+    /// caller uses this only when a shader consumes a per-stage constant, so
+    /// ordinary shaders retain the one-row builder without a wide temporary.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `rows` is outside 2..=9 (factor plus one through eight stages).
+    pub fn build_ps_stage_constants(
+        &self,
+        render_states: &[u32; RENDER_STATE_COUNT],
+        rows: u8,
+        scratch: &mut ScratchArena,
+    ) -> *mut u8 {
+        assert!(
+            (2..=9).contains(&rows),
+            "stage constant extent must be 2..=9"
+        );
+        let count = usize::from(rows);
+        let ptr = scratch.alloc_uninit_slice::<core::mem::MaybeUninit<[u8; 16]>>(count);
+        // SAFETY: scratch reserved count aligned row slots, not yet initialized.
+        let dst = unsafe { core::slice::from_raw_parts_mut(ptr, count) };
+        dst[0].write(self.build_ps_constants(render_states));
+        for (stage, slot) in dst[1..].iter_mut().enumerate() {
+            let rgba = d3dcolor_to_rgba(self.texture_stage_states[stage][D3DTSS_CONSTANT as usize]);
+            let mut bytes = [0; 16];
+            for (chunk, value) in bytes.as_chunks_mut::<4>().0.iter_mut().zip(rgba) {
+                *chunk = value.to_le_bytes();
+            }
+            slot.write(bytes);
+        }
+        ptr.cast()
+    }
+
     /// Pack FF PS constants: `ps_c[0]` = texture factor.
     ///
     /// Fog color lives in its own dedicated buffer (slot 13) so the FF and
@@ -2156,6 +2191,7 @@ const fn tss_classify(ty: u32) -> TssClass {
         | D3DTSS_ALPHAOP
         | D3DTSS_ALPHAARG1
         | D3DTSS_ALPHAARG2
+        | D3DTSS_CONSTANT
         | D3DTSS_TEXCOORDINDEX
         | D3DTSS_TEXTURETRANSFORMFLAGS
         | D3DTSS_RESULTARG => TssClass::Consumed,
