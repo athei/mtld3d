@@ -133,7 +133,16 @@ it can launch another process, and keeps both accounts of the initiating
 process. Assertions after that report are not measurements of the source: the
 later results may reflect the hosted GPU's failed state.
 
-In CI every end-to-end leg uploads all three kinds of file as its
+When every test is accounted for but the process ends abnormally, the runner
+keeps its full captured stdout, stderr and exit status together in
+`<binary>-<pid>.process-log` and names it in the note. This preserves the
+existing test verdicts and does not retry completed tests. The streams are
+captured decoded text, not a byte-exact pipe recording. A retention error is
+reported in the note without changing those verdicts. Clean successful and
+expected self-exiting processes create no such file. As with stderr, the
+newest ten bundles remain in the selected log directory.
+
+In CI every end-to-end leg uploads all four kinds of file as its
 `e2e-logs-<image>-<arch>` artifact on every run, kept fourteen days; the
 directory holds the ten newest of each, so a leg that restarted more than ten
 processes hands back its last ten. They are the layer's side of a red leg,

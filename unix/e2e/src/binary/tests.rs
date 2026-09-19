@@ -6,11 +6,14 @@ use std::{
 };
 
 use super::{
-    COMMAND_LINE_UNITS, FATAL_LINES, KEEP, LAYER_LOG_EXT, WineLauncher, argument_units,
-    binary_name, fitting_prefix, keep_layer_log, keep_stderr, layer_tail, stderr_tail,
-    test_arguments,
+    COMMAND_LINE_UNITS, FATAL_LINES, KEEP, LAYER_LOG_EXT, PROCESS_LOG_EXT, WineLauncher,
+    argument_units, binary_name, fitting_prefix, keep_layer_log, keep_process, keep_stderr,
+    layer_tail, stderr_tail, test_arguments,
 };
-use crate::attribute::{BinaryOutcome, Launcher as _, Report, TestResult, run_binary};
+use crate::{
+    attribute::{BinaryOutcome, Launcher as _, ProcessEnd, Report, TestResult, run_binary},
+    run::ExitKind,
+};
 
 const DRIVER_HANG: &str = "Caused GPU Hang Error \
     (00000003:kIOAccelCommandBufferCallbackErrorHang)";
@@ -111,6 +114,18 @@ fn the_kept_files_are_capped_per_kind_and_never_touch_the_layers_logs() {
     std::fs::write(dir.join("e2e-1.log"), "the layer's own").expect("log");
     for pid in 0..u32::try_from(KEEP).expect("small") + 5 {
         keep_stderr(&dir, "e2e", pid, "stderr").expect("kept");
+        keep_process(
+            &dir,
+            "e2e",
+            &ProcessEnd {
+                pid,
+                kind: ExitKind::Code(5),
+                stdout: "stdout".to_owned(),
+                stderr: "stderr".to_owned(),
+                gpu_hang: false,
+            },
+        )
+        .expect("process kept");
         std::fs::write(dir.join(format!("e2e-abcd-{pid}.log")), "dead").expect("layer log");
         keep_layer_log(&dir, "e2e-abcd", "e2e", pid).expect("kept");
     }
@@ -123,6 +138,7 @@ fn the_kept_files_are_capped_per_kind_and_never_touch_the_layers_logs() {
     };
     assert_eq!(kept("stderr"), KEEP);
     assert_eq!(kept(LAYER_LOG_EXT), KEEP);
+    assert_eq!(kept(PROCESS_LOG_EXT), KEEP);
     assert_eq!(kept("log"), 1, "a live process's log is not the runner's");
 }
 
@@ -416,4 +432,149 @@ fn large_recovery_launches_bounded_processes_and_keeps_the_primary_failure() {
             .all(|line| line.parse::<usize>().unwrap() < COMMAND_LINE_UNITS)
     );
     std::fs::remove_dir_all(log_dir).unwrap();
+}
+
+#[test]
+fn complete_nonzero_exit_keeps_captured_output_without_retrying() {
+    for custom_dir in [true, false] {
+        let root = dir(if custom_dir {
+            "complete-custom"
+        } else {
+            "complete-default"
+        });
+        let log_dir = root.join(if custom_dir {
+            "selected-logs"
+        } else {
+            "mtld3d-logs"
+        });
+        let script = root.join("completed-abcdef.sh");
+        let body = "printf x >> launches\nprintf '%s' \"$$\" > pid\nprintf '%s\\n' 'early stdout' 'stdout:' 'test a::one ... ok' 'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.1s' 'late stdout'\nprintf '%s' 'early stderr
+stderr:
+unterminated stderr' >&2\nexit 5\n";
+        std::fs::write(&script, body).expect("script");
+        let mut launcher = WineLauncher::new(
+            Path::new("/bin/sh"),
+            &script,
+            custom_dir.then_some(log_dir.as_path()),
+            Duration::from_secs(5),
+            Box::new(|_| {}),
+        )
+        .expect("launcher");
+        let mut log = Log::default();
+        let run = run_binary(
+            &mut launcher,
+            Some(vec!["a::one".to_owned()]),
+            1,
+            true,
+            &mut log,
+        )
+        .expect("fake process");
+        assert_eq!(run.processes, 1);
+        assert_eq!(run.outcome, BinaryOutcome::Complete);
+        assert!(!run.failed);
+        assert_eq!(std::fs::read_to_string(root.join("launches")).unwrap(), "x");
+        assert_eq!(log.results.len(), 1);
+        assert_eq!(log.results[0].name, "a::one");
+        assert_eq!(log.results[0].verdict, crate::attribute::Verdict::Passed);
+        let pid = std::fs::read_to_string(root.join("pid")).expect("pid");
+        let kept = log_dir.join(format!("completed-{pid}.process-log"));
+        let output =
+            std::fs::read_to_string(&kept).expect("abnormal completed process output retained");
+        let stdout = "early stdout\nstdout:\ntest a::one ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.1s\nlate stdout\n";
+        let stderr = "early stderr\nstderr:\nunterminated stderr";
+        assert_eq!(
+            output,
+            format!(
+                "binary: completed\npid: {pid}\nexit: exit code 5\nstdout-bytes: {}\nstderr-bytes: {}\n\nstdout:\n{stdout}\nstderr:\n{stderr}",
+                stdout.len(),
+                stderr.len(),
+            )
+        );
+        assert_eq!(log.notes.len(), 1);
+        assert!(log.notes[0].contains("exit code 5"));
+        assert!(log.notes[0].contains(kept.to_str().unwrap()));
+        std::fs::remove_dir_all(root).expect("remove fixture");
+    }
+}
+
+#[test]
+fn clean_and_declared_exits_keep_no_abnormal_bundle() {
+    for declared in [false, true] {
+        let root = dir(if declared {
+            "declared-complete"
+        } else {
+            "clean-complete"
+        });
+        let script = root.join("completed-abcdef.sh");
+        let body = if declared {
+            "echo '[e2e] test a::one ends this process with exit code 5'\nexit 5\n"
+        } else {
+            "echo 'test a::one ... ok'\necho 'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.1s'\nexit 0\n"
+        };
+        std::fs::write(&script, body).expect("script");
+        let log_dir = root.join("logs");
+        let mut launcher = WineLauncher::new(
+            Path::new("/bin/sh"),
+            &script,
+            Some(&log_dir),
+            Duration::from_secs(5),
+            Box::new(|_| {}),
+        )
+        .expect("launcher");
+        let mut log = Log::default();
+        let run = run_binary(
+            &mut launcher,
+            Some(vec!["a::one".to_owned()]),
+            1,
+            true,
+            &mut log,
+        )
+        .expect("fake child");
+        assert_eq!(run.processes, 1);
+        assert!(!run.failed);
+        assert_eq!(run.outcome, BinaryOutcome::Complete);
+        assert_eq!(log.results.len(), 1);
+        assert_eq!(log.results[0].verdict, crate::attribute::Verdict::Passed);
+        assert!(log.notes.is_empty());
+        assert!(
+            !log_dir.exists(),
+            "clean completion needs no diagnostic directory"
+        );
+        std::fs::remove_dir_all(root).expect("remove fixture");
+    }
+}
+
+#[test]
+fn completed_process_retention_error_preserves_the_verdict() {
+    let root = dir("complete-retention-error");
+    let script = root.join("completed-abcdef.sh");
+    std::fs::write(&script, "mkdir -p \"logs/completed-$$.process-log\"\necho 'test a::one ... ok'\necho 'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.1s'\nexit 5\n").expect("script");
+    let log_dir = root.join("logs");
+    let mut launcher = WineLauncher::new(
+        Path::new("/bin/sh"),
+        &script,
+        Some(&log_dir),
+        Duration::from_secs(5),
+        Box::new(|_| {}),
+    )
+    .expect("launcher");
+    let mut log = Log::default();
+    let run = run_binary(
+        &mut launcher,
+        Some(vec!["a::one".to_owned()]),
+        1,
+        true,
+        &mut log,
+    )
+    .expect("fake child");
+    assert_eq!(run.processes, 1);
+    assert!(!run.failed);
+    assert_eq!(run.outcome, BinaryOutcome::Complete);
+    assert_eq!(log.results.len(), 1);
+    assert_eq!(log.results[0].verdict, crate::attribute::Verdict::Passed);
+    assert_eq!(log.notes.len(), 1);
+    assert!(log.notes[0].contains("exit code 5"));
+    assert!(log.notes[0].contains("could not be kept"));
+    assert!(log.notes[0].contains(".process-log"));
+    std::fs::remove_dir_all(root).expect("remove fixture");
 }
