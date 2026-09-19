@@ -1018,7 +1018,7 @@ none of these fire on the Apple family, and a real Intel/AMD Mac is expected
 to read zero here.
 
 ### visual.c/add_dirty_rect_test
-Sites: 19210=bug 19217=bug 19232=bug
+Sites: 19210=real 19217=real 19232=real
 
 Managed 2D textures retain their sampled image after a NO_DIRTY_UPDATE lock
 (19210/19217) until an explicit publication. AddDirtyRect publishes its region
