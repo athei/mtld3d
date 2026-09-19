@@ -360,6 +360,9 @@ pub const D3DFMT_DF16: u32 = 0x3631_4644; // 'DF16'
 /// `MAKEFOURCC('R','E','S','Z')`: probed to detect the depth-resolve hack.
 pub const D3DFMT_RESZ: u32 = 0x5A53_4552;
 
+/// Capability token for alpha-to-coverage, also written to `D3DRS_ADAPTIVETESS_Y`.
+pub const D3DFMT_ATOC: u32 = u32::from_le_bytes(*b"ATOC");
+
 // ── D3D9 buffer formats (vertex-/index-buffer `Format`) ──
 
 pub const D3DFMT_VERTEXDATA: u32 = 100; // what `GetDesc` reports for VBs

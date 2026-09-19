@@ -23,7 +23,8 @@ divergences from D3D9 it keeps on purpose. The tested games are in the
 - Anisotropic filtering, LOD bias, sRGB read and write, alpha test, scissor,
   separate alpha blend, blend factor, write masks.
 - Four render targets with independent formats and blending.
-- Multisampling at 2x and 4x, 8x where the device offers it.
+- Multisampling at 2x and 4x, 8x where the device offers it, and the ATOC
+  alpha-to-coverage extension through `D3DRS_ADAPTIVETESS_Y`.
 - Windowed and fullscreen swap chains, mode enumeration, hardware and software
   cursors, MetalFX upscaling, HDR output.
 - `D3DCREATE_MULTITHREADED`: a device created with it, and every object it

@@ -202,5 +202,17 @@ pub const fn mask_applies(multi_sample_type: u32) -> bool {
     multi_sample_type > D3DMULTISAMPLE_NONMASKABLE
 }
 
+/// Whether the portable ATOC render-state request is enabled.
+///
+/// Coverage replaces alpha testing only on a multisampled render target;
+/// the encoder resolves that attachment-dependent half when it builds the draw.
+#[must_use]
+pub const fn alpha_to_coverage_requested(
+    render_states: &[u32; mtld3d_types::RENDER_STATE_COUNT],
+) -> bool {
+    render_states[mtld3d_types::D3DRS_ADAPTIVETESS_Y as usize] == mtld3d_types::D3DFMT_ATOC
+        && render_states[mtld3d_types::D3DRS_ALPHATESTENABLE as usize] != 0
+}
+
 #[cfg(test)]
 mod tests;

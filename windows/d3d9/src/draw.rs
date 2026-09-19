@@ -1314,6 +1314,15 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
         ),
         PsSource::FixedFunction { .. } => (variant, 1),
     };
+    // Coverage consumes the fragment alpha instead of applying ALPHAFUNC.
+    // Resolve from the current target so switching back to one sample restores
+    // alpha testing without requiring another render-state write.
+    if render_state
+        .pipeline_rs
+        .alpha_to_coverage(enc.current_color_sample_count())
+    {
+        ps_variant.alpha_func = 0;
+    }
     // Point sprites only exist on point primitives: the API thread raises the
     // flag from `D3DRS_POINTSPRITEENABLE` alone, so every other primitive
     // drops it here and keeps its non-sprite library.

@@ -386,3 +386,32 @@ fn wire_layouts_carry_used_streams_with_their_slot() {
     assert_eq!(layouts[1].step_function, VertexStepFunction::PerInstance);
     assert_eq!(layouts[1].step_rate, 3);
 }
+
+#[test]
+fn alpha_to_coverage_keys_only_multisampled_pipelines_and_reaches_wire() {
+    let mut off = base();
+    let mut on = base();
+    on.rs.flags.insert(PipelineRsFlags::ALPHA_TO_COVERAGE);
+    assert_eq!(key_from_snapshot(&on), key_from_snapshot(&off));
+    for count in [2, 4, 8] {
+        off.sample_count = count;
+        on.sample_count = count;
+        on.attach = off.attach;
+        assert_ne!(key_from_snapshot(&on), key_from_snapshot(&off));
+        for snapshot in [&off, &on] {
+            let key = key_from_snapshot(snapshot);
+            let params = params_from_snapshot(&PipelineBuildInputs {
+                snapshot,
+                vertex_attrs: &[],
+                vertex_layouts: &[],
+                device_handle: MetalHandle::NULL,
+            });
+            assert_eq!(params.alpha_to_coverage != 0, key.alpha_to_coverage);
+        }
+        on.attach.remove(PipelineAttachFlags::HAS_COLOR_OUTPUT);
+        assert!(
+            key_from_snapshot(&on).alpha_to_coverage,
+            "depth-only sibling keeps coverage"
+        );
+    }
+}

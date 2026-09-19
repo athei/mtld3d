@@ -310,7 +310,10 @@ mod source;
 ///
 /// `73` applies componentwise predicate selection to `mova` writes of the
 /// integer address register, changing programmable vertex shader MSL.
-pub const SHADER_CACHE_SCHEMA_VERSION: u32 = 73;
+///
+/// `74` keys native alpha-to-coverage in the pipeline flags and suppresses
+/// fragment alpha testing while that coverage state is active.
+pub const SHADER_CACHE_SCHEMA_VERSION: u32 = 74;
 
 /// Source-derived identity of MSL emission, independent of persistent DXSO and shader keys.
 pub const SHADER_EMITTER_VERSION: u64 = include!(concat!(env!("OUT_DIR"), "/emitter_version.rs"));

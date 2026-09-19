@@ -11,14 +11,17 @@ use mtld3d_tests::{
     Harness, HarnessConfig, Rgba8, RhwVertex, Surface, Texture, TexturedVertex, assert_pixel_eq,
 };
 use mtld3d_types::{
-    D3D_OK, D3DCLEAR_TARGET, D3DCLEAR_ZBUFFER, D3DCMP_ALWAYS, D3DCMP_LESS, D3DERR_INVALIDCALL,
-    D3DERR_NOTAVAILABLE, D3DFMT_A8R8G8B8, D3DFMT_D16, D3DFMT_D24S8, D3DFMT_DXT1, D3DFMT_INTZ,
-    D3DFMT_X8R8G8B8, D3DFVF_DIFFUSE, D3DFVF_TEX1, D3DFVF_XYZ, D3DFVF_XYZRHW, D3DLOCK_READONLY,
-    D3DMULTISAMPLE_2_SAMPLES, D3DMULTISAMPLE_4_SAMPLES, D3DMULTISAMPLE_NONE,
-    D3DMULTISAMPLE_NONMASKABLE, D3DPOOL_DEFAULT, D3DPOOL_SYSTEMMEM, D3DPT_TRIANGLELIST,
-    D3DRS_LIGHTING, D3DRS_MULTISAMPLEMASK, D3DRS_POINTSIZE, D3DRS_SRGBWRITEENABLE, D3DRS_ZENABLE,
-    D3DRS_ZFUNC, D3DRS_ZWRITEENABLE, D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_MAGFILTER,
-    D3DSAMP_MINFILTER, D3DTADDRESS_CLAMP, D3DTEXF_NONE, D3DTEXF_POINT, D3DUSAGE_DEPTHSTENCIL,
+    D3D_OK, D3DCLEAR_TARGET, D3DCLEAR_ZBUFFER, D3DCMP_ALWAYS, D3DCMP_GREATER, D3DCMP_LESS,
+    D3DERR_INVALIDCALL, D3DERR_NOTAVAILABLE, D3DFMT_A8R8G8B8, D3DFMT_ATOC, D3DFMT_D16,
+    D3DFMT_D24S8, D3DFMT_DXT1, D3DFMT_INTZ, D3DFMT_X8R8G8B8, D3DFVF_DIFFUSE, D3DFVF_TEX1,
+    D3DFVF_XYZ, D3DFVF_XYZRHW, D3DLOCK_READONLY, D3DMULTISAMPLE_2_SAMPLES,
+    D3DMULTISAMPLE_4_SAMPLES, D3DMULTISAMPLE_NONE, D3DMULTISAMPLE_NONMASKABLE, D3DPOOL_DEFAULT,
+    D3DPOOL_SYSTEMMEM, D3DPT_TRIANGLELIST, D3DRS_ADAPTIVETESS_Y, D3DRS_ALPHAFUNC, D3DRS_ALPHAREF,
+    D3DRS_ALPHATESTENABLE, D3DRS_COLORWRITEENABLE, D3DRS_LIGHTING, D3DRS_MULTISAMPLEMASK,
+    D3DRS_POINTSIZE, D3DRS_SRGBWRITEENABLE, D3DRS_ZENABLE, D3DRS_ZFUNC, D3DRS_ZWRITEENABLE,
+    D3DRTYPE_SURFACE, D3DRTYPE_TEXTURE, D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_MAGFILTER,
+    D3DSAMP_MINFILTER, D3DSBT_VERTEXSTATE, D3DTADDRESS_CLAMP, D3DTEXF_NONE, D3DTEXF_POINT,
+    D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_RENDERTARGET,
 };
 
 /// Edge of the standalone render targets, small enough to keep the readback cheap.
@@ -29,6 +32,15 @@ const RT_SIZE_F: f32 = 64.0;
 const BLACK: u32 = 0xFF00_0000;
 const WHITE: u32 = 0xFFFF_FFFF;
 const BLUE: u32 = 0xFF00_00FF;
+
+/// `ps_2_0`: `mov oC0, c0;`.
+const COVERAGE_PS: [u32; 5] = [
+    0xffff_0200,
+    0x0200_0001,
+    0x000f_0800,
+    0x20e4_0000,
+    0x0000_ffff,
+];
 
 /// A windowed device with the given swap-chain multisample type and depth format.
 fn harness(multi_sample_type: u32, depth_format: Option<u32>) -> Harness {
@@ -1201,4 +1213,240 @@ fn a_clear_before_a_stretch_rect_resolve_does_not_wipe_it() {
         WHITE,
         "the resolved image survives the clear that was ordered before it",
     );
+}
+
+fn coverage_pixel(h: &Harness, target: &Surface<'_>, resolve: &Surface<'_>, color: u32) -> u32 {
+    assert_eq!(h.set_render_target(0, target), D3D_OK);
+    assert_eq!(h.begin_scene(), D3D_OK);
+    assert_eq!(h.clear_target(BLUE), D3D_OK);
+    assert_eq!(
+        h.draw_primitive_up(
+            D3DPT_TRIANGLELIST,
+            1,
+            &diagonal(RT_SIZE_F, RT_SIZE_F, 0.5, color)
+        ),
+        D3D_OK
+    );
+    assert_eq!(h.end_scene(), D3D_OK);
+    assert_eq!(h.stretch_rect(target, resolve, D3DTEXF_NONE), D3D_OK);
+    render_target_row(h, resolve)[INSIDE_X as usize]
+}
+
+fn assert_partial_coverage(pixel: u32) {
+    let c = Rgba8::from_pixel(pixel);
+    assert!(
+        c.r > 16 && c.r < 239,
+        "fractional white coverage over blue: {pixel:#010x}"
+    );
+    assert_eq!(c.r, c.g, "white's red and green coverage agree");
+    assert_eq!(c.b, 255, "covered and uncovered samples are blue");
+}
+
+#[test]
+fn alpha_to_coverage_probe_is_not_a_resource_format() {
+    let h = Harness::new();
+    assert_eq!(
+        h.check_device_format(D3DFMT_X8R8G8B8, 0, D3DRTYPE_SURFACE, D3DFMT_ATOC),
+        D3D_OK
+    );
+    assert_eq!(
+        h.check_device_format(D3DFMT_X8R8G8B8, 0, D3DRTYPE_TEXTURE, D3DFMT_ATOC),
+        D3DERR_NOTAVAILABLE
+    );
+    assert_eq!(
+        h.check_device_format(
+            D3DFMT_X8R8G8B8,
+            D3DUSAGE_RENDERTARGET,
+            D3DRTYPE_SURFACE,
+            D3DFMT_ATOC
+        ),
+        D3DERR_NOTAVAILABLE
+    );
+    assert_ne!(
+        h.create_render_target_hr(RT_SIZE, RT_SIZE, D3DFMT_ATOC),
+        D3D_OK
+    );
+}
+
+#[test]
+fn alpha_to_coverage_replaces_alpha_test_and_tracks_target_changes() {
+    let h = Harness::new();
+    arm(&h);
+    h.select_diffuse_stage(0);
+    assert_eq!(h.set_render_state(D3DRS_ZENABLE, 0), D3D_OK);
+    let target = h.create_render_target_ms(
+        (RT_SIZE, RT_SIZE),
+        D3DFMT_A8R8G8B8,
+        (D3DMULTISAMPLE_4_SAMPLES, 0),
+    );
+    let single = h.create_render_target(RT_SIZE, RT_SIZE, D3DFMT_A8R8G8B8);
+    let resolve = h.create_render_target(RT_SIZE, RT_SIZE, D3DFMT_A8R8G8B8);
+    let ps = h.create_pixel_shader(&COVERAGE_PS);
+    for programmable in [false, true] {
+        if programmable {
+            assert_eq!(h.set_pixel_shader(&ps), D3D_OK);
+            assert_eq!(
+                h.set_pixel_shader_constant_f(0, &[1.0, 1.0, 1.0, 0.5]),
+                D3D_OK
+            );
+        }
+        assert_eq!(h.set_render_state(D3DRS_ALPHATESTENABLE, 1), D3D_OK);
+        assert_eq!(h.set_render_state(D3DRS_ALPHAFUNC, D3DCMP_GREATER), D3D_OK);
+        assert_eq!(h.set_render_state(D3DRS_ALPHAREF, 255), D3D_OK);
+        assert_eq!(
+            h.set_render_state(D3DRS_ADAPTIVETESS_Y, D3DFMT_ATOC),
+            D3D_OK
+        );
+        assert_partial_coverage(coverage_pixel(&h, &target, &resolve, 0x80ff_ffff));
+        // A single-sampled target restores the rejecting alpha test without
+        // changing a render state; returning to MSAA restores coverage.
+        assert_eq!(coverage_pixel(&h, &single, &resolve, 0x80ff_ffff), BLUE);
+        assert_partial_coverage(coverage_pixel(&h, &target, &resolve, 0x80ff_ffff));
+        assert_eq!(h.set_render_state(D3DRS_ADAPTIVETESS_Y, 0), D3D_OK);
+        assert_eq!(coverage_pixel(&h, &target, &resolve, 0x80ff_ffff), BLUE);
+        assert_eq!(
+            h.set_render_state(D3DRS_ADAPTIVETESS_Y, D3DFMT_ATOC),
+            D3D_OK
+        );
+        assert_eq!(h.set_render_state(D3DRS_ALPHATESTENABLE, 0), D3D_OK);
+        assert_pixel_eq(
+            coverage_pixel(&h, &target, &resolve, 0x80ff_ffff),
+            0x80ff_ffff,
+            "alpha test off disables coverage",
+        );
+    }
+}
+
+#[test]
+fn alpha_to_coverage_state_blocks_restore_the_extension() {
+    let h = Harness::new();
+    arm(&h);
+    h.select_diffuse_stage(0);
+    assert_eq!(h.set_render_state(D3DRS_ZENABLE, 0), D3D_OK);
+    let target = h.create_render_target_ms(
+        (RT_SIZE, RT_SIZE),
+        D3DFMT_A8R8G8B8,
+        (D3DMULTISAMPLE_4_SAMPLES, 0),
+    );
+    let resolve = h.create_render_target(RT_SIZE, RT_SIZE, D3DFMT_A8R8G8B8);
+    assert_eq!(h.set_render_state(D3DRS_ALPHATESTENABLE, 1), D3D_OK);
+    assert_eq!(h.set_render_state(D3DRS_ALPHAFUNC, D3DCMP_GREATER), D3D_OK);
+    assert_eq!(h.set_render_state(D3DRS_ALPHAREF, 255), D3D_OK);
+    assert_eq!(
+        h.set_render_state(D3DRS_ADAPTIVETESS_Y, D3DFMT_ATOC),
+        D3D_OK
+    );
+    let vertex = h.create_state_block(D3DSBT_VERTEXSTATE);
+    assert_eq!(h.set_render_state(D3DRS_ADAPTIVETESS_Y, 0), D3D_OK);
+    assert_eq!(h.begin_state_block(), D3D_OK);
+    assert_eq!(
+        h.set_render_state(D3DRS_ADAPTIVETESS_Y, D3DFMT_ATOC),
+        D3D_OK
+    );
+    let recorded = h.end_state_block();
+    assert_eq!(
+        h.render_state(D3DRS_ADAPTIVETESS_Y),
+        0,
+        "recording does not mutate live state"
+    );
+    for block in [&vertex, &recorded] {
+        assert_eq!(coverage_pixel(&h, &target, &resolve, 0x80ff_ffff), BLUE);
+        assert_eq!(block.apply(), D3D_OK);
+        assert_partial_coverage(coverage_pixel(&h, &target, &resolve, 0x80ff_ffff));
+        assert_eq!(h.set_render_state(D3DRS_ADAPTIVETESS_Y, 0), D3D_OK);
+    }
+}
+
+#[test]
+fn alpha_to_coverage_endpoints_and_sample_mask_intersect() {
+    let h = Harness::new();
+    arm(&h);
+    h.select_diffuse_stage(0);
+    assert_eq!(h.set_render_state(D3DRS_ZENABLE, 0), D3D_OK);
+    assert_eq!(h.set_render_state(D3DRS_ALPHATESTENABLE, 1), D3D_OK);
+    assert_eq!(
+        h.set_render_state(D3DRS_ADAPTIVETESS_Y, D3DFMT_ATOC),
+        D3D_OK
+    );
+    let target = h.create_render_target_ms(
+        (RT_SIZE, RT_SIZE),
+        D3DFMT_A8R8G8B8,
+        (D3DMULTISAMPLE_4_SAMPLES, 0),
+    );
+    let resolve = h.create_render_target(RT_SIZE, RT_SIZE, D3DFMT_A8R8G8B8);
+    assert_eq!(
+        coverage_pixel(&h, &target, &resolve, 0x00ff_ffff),
+        BLUE,
+        "zero alpha covers no sample"
+    );
+    assert_eq!(
+        coverage_pixel(&h, &target, &resolve, WHITE),
+        WHITE,
+        "opaque alpha covers every sample"
+    );
+    assert_eq!(h.set_render_state(D3DRS_MULTISAMPLEMASK, 0), D3D_OK);
+    assert_eq!(
+        coverage_pixel(&h, &target, &resolve, WHITE),
+        BLUE,
+        "sample mask can exclude all coverage"
+    );
+    assert_eq!(h.set_render_state(D3DRS_MULTISAMPLEMASK, 3), D3D_OK);
+    assert_partial_coverage(coverage_pixel(&h, &target, &resolve, WHITE));
+}
+
+#[test]
+fn alpha_to_coverage_gates_depth_writes_with_color_masked_out() {
+    let h = Harness::new();
+    arm(&h);
+    h.select_diffuse_stage(0);
+    let target = h.create_render_target_ms(
+        (RT_SIZE, RT_SIZE),
+        D3DFMT_A8R8G8B8,
+        (D3DMULTISAMPLE_4_SAMPLES, 0),
+    );
+    let resolve = h.create_render_target(RT_SIZE, RT_SIZE, D3DFMT_A8R8G8B8);
+    let (hr, depth) = h.create_depth_stencil_surface_ms_hr(
+        (RT_SIZE, RT_SIZE),
+        D3DFMT_D24S8,
+        (D3DMULTISAMPLE_4_SAMPLES, 0),
+    );
+    assert_eq!(hr, D3D_OK);
+    let depth = depth.expect("multisampled depth");
+    assert_eq!(h.set_depth_stencil_surface(&depth), D3D_OK);
+    assert_eq!(h.set_render_target(0, &target), D3D_OK);
+    assert_eq!(h.set_render_state(D3DRS_ZENABLE, 1), D3D_OK);
+    assert_eq!(h.set_render_state(D3DRS_ZWRITEENABLE, 1), D3D_OK);
+    assert_eq!(h.set_render_state(D3DRS_ZFUNC, D3DCMP_LESS), D3D_OK);
+    assert_eq!(h.set_render_state(D3DRS_ALPHATESTENABLE, 1), D3D_OK);
+    assert_eq!(h.set_render_state(D3DRS_ALPHAFUNC, D3DCMP_GREATER), D3D_OK);
+    assert_eq!(h.set_render_state(D3DRS_ALPHAREF, 255), D3D_OK);
+    assert_eq!(
+        h.set_render_state(D3DRS_ADAPTIVETESS_Y, D3DFMT_ATOC),
+        D3D_OK
+    );
+    assert_eq!(h.set_render_state(D3DRS_COLORWRITEENABLE, 0), D3D_OK);
+    assert_eq!(h.begin_scene(), D3D_OK);
+    assert_eq!(
+        h.clear(D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, BLUE, 1.0, 0),
+        D3D_OK
+    );
+    assert_eq!(
+        h.draw_primitive_up(
+            D3DPT_TRIANGLELIST,
+            1,
+            &diagonal(RT_SIZE_F, RT_SIZE_F, 0.25, 0x80ff_ffff)
+        ),
+        D3D_OK
+    );
+    assert_eq!(h.end_scene(), D3D_OK);
+    assert_eq!(h.stretch_rect(&target, &resolve, D3DTEXF_NONE), D3D_OK);
+    assert_eq!(
+        render_target_row(&h, &resolve)[INSIDE_X as usize],
+        BLUE,
+        "color mask keeps every color sample"
+    );
+    assert_eq!(h.set_render_state(D3DRS_COLORWRITEENABLE, 15), D3D_OK);
+    assert_eq!(h.set_render_state(D3DRS_ALPHATESTENABLE, 0), D3D_OK);
+    // Only the samples the near coverage draw left untouched pass depth.
+    assert_partial_coverage(coverage_pixel(&h, &target, &resolve, WHITE));
 }

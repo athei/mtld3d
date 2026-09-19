@@ -1048,13 +1048,12 @@ divergence itself is unchanged.
 ### visual.c/test_alpha_to_coverage
 Sites: 26538=caps
 
-`win_skip("Alpha to coverage is not supported.")`, which counts as a failure
-under Wine. Alpha to coverage is reached through a vendor pseudo-format
-(NVIDIA's `ATOC` through `D3DRS_ADAPTIVETESS_Y`, AMD's `A2M1` through
-`D3DRS_POINTSIZE`); mtld3d advertises neither, and answering NOTAVAILABLE for
-the probe is the conformant response for a device without the extension. The
-test only reaches the probe on a multisample-capable device, which is why the
-site is new.
+The `@mac2` entries retain the capability-skip pin until re-recorded on
+that GPU family. The portable `ATOC` probe and `D3DRS_ADAPTIVETESS_Y`
+control are supported; all six Apple-family legs run the pixel assertions
+and pass. `ALPHATESTENABLE` gates this control, and coverage replaces the
+alpha test only on a multisampled render target. AMD's `A2M1`/`A2M0`
+controls through `D3DRS_POINTSIZE` remain unsupported.
 
 ### visual.c/test_mipmap_upload
 Sites: 27550=expected

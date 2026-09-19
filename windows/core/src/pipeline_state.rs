@@ -26,11 +26,13 @@ bitflags::bitflags! {
     ///
     /// Shared between `PipelineSnapshot` (the pipeline cache key) and the
     /// d3d9 layer's `RenderStateSnapshot` (per-draw RS capture). Packed
-    /// into a u8; each bit mirrors a D3D9 BOOL render state.
+    /// into a u8; bits encode boolean pipeline controls derived from D3D9 RS.
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
     pub struct PipelineRsFlags: u8 {
         const BLEND_ENABLE = 1 << 0;
         const SEPARATE_ALPHA_BLEND = 1 << 1;
+        /// ATOC plus alpha test enabled; effective only on multisampled targets.
+        const ALPHA_TO_COVERAGE = 1 << 2;
     }
 }
 
@@ -67,7 +69,7 @@ bitflags::bitflags! {
 /// Shared between `PipelineSnapshot` (cache key) and the d3d9 layer's
 /// `RenderStateSnapshot` (per-draw capture). Carries only the RS that
 /// gets baked into the compiled `MTLRenderPipelineState` — blend
-/// state, color-write mask, sRGB write. NOT included: depth state
+/// state, color-write mask, alpha-to-coverage. NOT included: depth state
 /// (`MTLDepthStencilState` is a separate cache), cull / scissor /
 /// blend-factor / depth-bias (per-encoder runtime state set via Metal
 /// command API).
@@ -149,6 +151,11 @@ impl PipelineRsBits {
     }
     #[inline]
     #[must_use]
+    pub const fn alpha_to_coverage(&self, sample_count: u8) -> bool {
+        sample_count > 1 && self.flags.contains(PipelineRsFlags::ALPHA_TO_COVERAGE)
+    }
+    #[inline]
+    #[must_use]
     pub const fn separate_alpha_blend_enable(&self) -> bool {
         self.flags.contains(PipelineRsFlags::SEPARATE_ALPHA_BLEND)
     }
@@ -188,7 +195,7 @@ pub struct PipelineSnapshot {
     ///
     /// Packed instead of three bool fields.
     pub attach: PipelineAttachFlags,
-    /// Blend / color-write / sRGB RS.
+    /// Blend, color-write and alpha-to-coverage RS.
     ///
     /// The subset of D3D9 RS that affects `MTLRenderPipelineState`
     /// identity. d3d9 layer's `RenderStateSnapshot` carries an identical
@@ -327,6 +334,7 @@ pub struct PipelineKey {
     extra_formats: [PixelFormat; 3],
     extra_write_masks: [ColorWriteMask; 3],
     sample_count: u8,
+    alpha_to_coverage: bool,
 }
 
 /// Per-draw thunk-params builder input.
@@ -424,6 +432,7 @@ pub fn key_from_snapshot(s: &PipelineSnapshot) -> PipelineKey {
         extra_formats: core::array::from_fn(|i| s.extra_format(i)),
         extra_write_masks: core::array::from_fn(|i| s.extra_write_mask(i)),
         sample_count: s.sample_count.max(1),
+        alpha_to_coverage: s.rs.alpha_to_coverage(s.sample_count),
     }
 }
 
@@ -464,6 +473,7 @@ pub fn params_from_snapshot(inputs: &PipelineBuildInputs<'_>) -> CreateRenderPip
         has_color_output: u32::from(s.has_color_output()),
         extra_present_mask: u32::from(s.extra.present_mask),
         sample_count: u32::from(s.sample_count.max(1)),
+        alpha_to_coverage: u32::from(s.rs.alpha_to_coverage(s.sample_count)),
         extra: core::array::from_fn(|i| {
             let (src_blend, dst_blend, src_blend_alpha, dst_blend_alpha) = s.extra_blend_factors(i);
             ExtraColorAttachmentParams {
