@@ -245,10 +245,13 @@ uses the transformed vertex's distance from the eye when
 blending. Table fog, pretransformed supplied factors and programmable vertex
 fog do not use that switch. Ordinary vertex fog keeps its Z-based formula.
 
-Wine's range-fog visual test is gated on both `FOGRANGE` and `FOGTABLE`.
-The latter is not advertised, so the upstream test skips this capability.
-The end-to-end range-fog tests exercise it directly; no upstream failure-count
-reduction follows from this correction.
+`FOGTABLE` and `WFOG` are also advertised, so Wine's table- and range-fog
+visual cases run. Table fog evaluates LINEAR, EXP and EXP2 per pixel, using
+Z for an orthographic projection and reciprocal rasterizer W otherwise.
+It overrides vertex and range fog and preserves output alpha. SM3 shaders
+implement their own fog; their draw keys suppress the automatic fog stage.
+The end-to-end tests cover that boundary, shader rebinds and stateblocks
+without depending on Wine's capability gates.
 
 ## Fill-mode coverage
 

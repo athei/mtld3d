@@ -75,6 +75,8 @@ fn primitive_misc_caps_matches_implementation() {
 #[test]
 fn raster_caps_matches_implementation() {
     let expected = RasterCaps::ZTEST
+        | RasterCaps::FOGTABLE
+        | RasterCaps::WFOG
         | RasterCaps::FOGVERTEX
         | RasterCaps::FOGRANGE
         | RasterCaps::MIPMAPLODBIAS

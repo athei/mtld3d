@@ -141,6 +141,8 @@ const PRIMITIVE_MISC_DEFAULT: PrimitiveMiscCaps = PrimitiveMiscCaps::MASKZ
 /// selects.
 const RASTER_DEFAULT: RasterCaps = RasterCaps::ZTEST
     .union(RasterCaps::FOGVERTEX)
+    .union(RasterCaps::FOGTABLE)
+    .union(RasterCaps::WFOG)
     .union(RasterCaps::FOGRANGE)
     .union(RasterCaps::MIPMAPLODBIAS)
     .union(RasterCaps::ANISOTROPY)
