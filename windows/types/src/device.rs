@@ -1469,6 +1469,8 @@ pub struct IDirect3DSwapChain9Vtbl {
 pub const D3DQUERYTYPE_EVENT: u32 = 8;
 pub const D3DQUERYTYPE_OCCLUSION: u32 = 9;
 pub const D3DQUERYTYPE_TIMESTAMP: u32 = 10;
+pub const D3DQUERYTYPE_TIMESTAMPDISJOINT: u32 = 11;
+pub const D3DQUERYTYPE_TIMESTAMPFREQ: u32 = 12;
 
 pub const D3DISSUE_BEGIN: u32 = 1 << 1;
 pub const D3DISSUE_END: u32 = 1 << 0;

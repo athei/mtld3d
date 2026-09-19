@@ -37,8 +37,8 @@ Each fails cleanly, with an absent cap bit or a documented error return.
 
 - Non-solid fill modes: Metal has no wireframe, so the state is warned once
   and drawn solid.
-- Timestamp and other niche query types: creation reports
-  `D3DERR_NOTAVAILABLE`.
+- Timestamp, timestamp frequency, timestamp disjoint and other niche query
+  types: capability probes and creation report `D3DERR_NOTAVAILABLE`.
 - Scaled, sub-rect or converting depth-to-depth `StretchRect`: only the
   whole-surface 1:1 copy between same-format DEFAULT-pool depth surfaces
   works, multisample resolve included.
