@@ -52,6 +52,10 @@ Each fails cleanly, with an absent cap bit or a documented error return.
   single-level `D3DOK_NOAUTOGEN` fallback.
 - Timestamp, timestamp frequency, timestamp disjoint and other niche query
   types: capability probes and creation report `D3DERR_NOTAVAILABLE`.
+- DEFAULT offscreen cross-format `StretchRect` outside the narrow normalized
+  codecs and A16B16G16R16/A32B32G32R32F into A8R8G8B8 returns
+  `D3DERR_INVALIDCALL`. Wide-to-wide conversion and offscreen scaling remain
+  unsupported. Render-target conversion uses its separate GPU path.
 - Scaled, sub-rect or converting depth-to-depth `StretchRect`: only the
   whole-surface 1:1 copy between same-format DEFAULT-pool depth surfaces
   works, multisample resolve included.
