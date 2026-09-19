@@ -126,6 +126,8 @@ bitflags::bitflags! {
 /// `alpha_func` is the D3DCMP_* value for the alpha test; `fog_mode` mirrors
 /// `FfVsKey::fog_mode` and gates the PS-side fog blend (0 = no blend
 /// emitted).
+// Copy is required by the encoder's pass-specific key adjustment and cache-key probes.
+// The key contains only narrow masks and flags; no resource or heap storage is copied.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct VariantKey {
     pub alpha_func: u8,
@@ -150,13 +152,17 @@ pub struct VariantKey {
     pub depth_sampler_mask: u16,
     /// Bit `i` set ⇒ sampler slot `i` is a "readable raw depth" FOURCC texture.
     ///
-    /// INTZ/DF24/DF16 — a SUBSET of `depth_sampler_mask`. The slot still binds
-    /// as `depth2d<float>`, but is read with a plain `.sample()` returning the
-    /// RAW stored depth (broadcast to `float4`) instead of `sample_compare`,
-    /// and gets a non-comparison sampler — per D3D9, raw-depth FOURCC
-    /// formats are read as raw values rather than through a hardware shadow
-    /// comparison. Part of the PS cache key.
+    /// INTZ/DF24/DF16 are a subset of `depth_sampler_mask`. The slot still
+    /// binds as `depth2d<float>`, but reads the stored depth through `.sample()`
+    /// and a non-comparison sampler. `raw_depth_red_mask` selects the result's
+    /// channel fill. Part of the PS cache key.
     pub depth_fetch_mask: u16,
+    /// Slots using a native four-texel gather instead of a filtered sample.
+    pub fetch4_mask: u16,
+    /// Gather slots reading alpha rather than red (the A8 format).
+    pub fetch4_alpha_mask: u16,
+    /// DF16/DF24 raw samples return red with zero green/blue and alpha one.
+    pub raw_depth_red_mask: u16,
     /// Bit `i` set ⇒ sampler slot `i` is bound to a volume (3D) texture.
     ///
     /// A `CreateVolumeTexture` resource with `depth > 1`, which the unix
@@ -201,6 +207,26 @@ pub struct VariantKey {
     ///
     /// See [`VariantFlags`].
     pub flags: VariantFlags,
+}
+
+/// Emit the Fetch4 texel ordering through one native gather.
+///
+/// Fetch4 selects the point-addressed texel and its right/bottom neighbours.
+/// Fetch4 ignores texldb/texldd/texldl LOD controls and always reads the base mip.
+/// The half-texel shift converts that footprint to gather's bilinear footprint;
+/// Metal returns bottom-left, bottom-right, top-right, top-left, whereas Fetch4
+/// returns top-right, bottom-left, bottom-right, top-left in RGBA order.
+pub(super) fn fetch4_sample(slot: u16, uv: &str, depth: bool, alpha: bool) -> String {
+    let component = if depth {
+        ""
+    } else if alpha {
+        ", int2(0), component::w"
+    } else {
+        ""
+    };
+    format!(
+        "s{slot}.gather(samp{slot}, ({uv}) + 0.5 / float2(s{slot}.get_width(), s{slot}.get_height()){component}).zxyw"
+    )
 }
 
 /// Texture kind bound to each vertex-fetch sampler slot.
@@ -1315,6 +1341,9 @@ fn emit_ps_function(
         samplers: &samplers,
         depth_sampler_mask: variant.depth_sampler_mask,
         depth_fetch_mask: variant.depth_fetch_mask,
+        raw_depth_red_mask: variant.raw_depth_red_mask,
+        fetch4_mask: variant.fetch4_mask,
+        fetch4_alpha_mask: variant.fetch4_alpha_mask,
         tt_projected_mask: variant.tt_projected_mask,
         def_consts: &def_consts,
         def_int_consts: &def_int_consts,
@@ -1545,6 +1574,9 @@ struct EmitContext<'a> {
     /// INTZ/DF24/DF16: for these the sample site emits a plain `.sample()`
     /// (raw stored depth) instead of `sample_compare`.
     ps_depth_fetch_mask: u16,
+    ps_raw_depth_red_mask: u16,
+    ps_fetch4_mask: u16,
+    ps_fetch4_alpha_mask: u16,
     /// PS only: bit `i` set ⇒ stage `i` has `D3DTTFF_PROJECTED`.
     ///
     /// The SM1 (`ps_1_0`..`ps_1_3`) `tex`/`texld` emit divides the texcoord
@@ -1618,6 +1650,9 @@ struct PsInit<'a> {
     samplers: &'a BTreeMap<u16, TextureType>,
     depth_sampler_mask: u16,
     depth_fetch_mask: u16,
+    raw_depth_red_mask: u16,
+    fetch4_mask: u16,
+    fetch4_alpha_mask: u16,
     tt_projected_mask: u8,
     def_consts: &'a BTreeSet<u16>,
     def_int_consts: &'a BTreeSet<u16>,
@@ -1657,6 +1692,9 @@ impl<'a> EmitContext<'a> {
             samplers: init.samplers,
             ps_depth_sampler_mask: 0,
             ps_depth_fetch_mask: 0,
+            ps_raw_depth_red_mask: 0,
+            ps_fetch4_mask: 0,
+            ps_fetch4_alpha_mask: 0,
             ps_tt_projected_mask: 0,
             vs_output_map: init.vs_output_map,
             def_consts: init.def_consts,
@@ -1679,6 +1717,9 @@ impl<'a> EmitContext<'a> {
             samplers: Some(init.samplers),
             ps_depth_sampler_mask: init.depth_sampler_mask,
             ps_depth_fetch_mask: init.depth_fetch_mask,
+            ps_raw_depth_red_mask: init.raw_depth_red_mask,
+            ps_fetch4_mask: init.fetch4_mask,
+            ps_fetch4_alpha_mask: init.fetch4_alpha_mask,
             ps_tt_projected_mask: init.tt_projected_mask,
             vs_output_map: None,
             def_consts: init.def_consts,
@@ -3077,11 +3118,18 @@ fn sample_or_compare(
 ) -> String {
     let coord_swizzle = sampler_coord_swizzle(ctx, sampler_idx);
     let suffix_str = suffix.unwrap_or("");
+    if sampler_idx < 16 && ctx.ps_fetch4_mask & (1 << sampler_idx) != 0 {
+        return fetch4_sample(
+            sampler_idx,
+            &format!("({coord_expr}).xy"),
+            ctx.is_depth_sampler(sampler_idx),
+            ctx.ps_fetch4_alpha_mask & (1 << sampler_idx) != 0,
+        );
+    }
     if ctx.is_raw_depth_sampler(sampler_idx) {
-        // INTZ/DF24/DF16: read the RAW stored normalized depth (broadcast to
-        // float4) via a plain `.sample()` on the `depth2d<float>` binding — NOT
-        // a hardware shadow comparison (per D3D9, raw-depth FOURCC formats are
-        // excluded from shadow sampling). The projective `.q` divide, if any,
+        // INTZ/DF24/DF16 read normalized depth through `.sample()` instead of
+        // a shadow comparison. INTZ broadcasts it; DF formats fill GBA as 0,0,1.
+        // The projective `.q` divide, if any,
         // was already folded into `coord_expr` by the texldp caller. Pin
         // `level(0)` for the same no-mip / discard-derivative
         // reason as the compare path; texldl/texldd override via their suffix.
@@ -3090,8 +3138,13 @@ fn sample_or_compare(
         } else {
             suffix_str
         };
+        let fill = if ctx.ps_raw_depth_red_mask & (1 << sampler_idx) != 0 {
+            ", 0.0, 0.0, 1.0"
+        } else {
+            ""
+        };
         return format!(
-            "float4(s{sampler_idx}.sample(samp{sampler_idx}, ({coord_expr}).xy{lod_suffix}))"
+            "float4(s{sampler_idx}.sample(samp{sampler_idx}, ({coord_expr}).xy{lod_suffix}){fill})"
         );
     }
     if ctx.is_depth_sampler(sampler_idx) {

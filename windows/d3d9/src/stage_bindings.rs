@@ -46,6 +46,8 @@ bitflags::bitflags! {
         const VOLUME_CHANGED = 1 << 2;
         /// The slot's cube texture-ness flipped (drives `cube_sampler_mask`).
         const CUBE_CHANGED = 1 << 3;
+        /// The slot's specialized sampling mode changed.
+        const SAMPLING_CHANGED = 1 << 4;
     }
 }
 
@@ -84,6 +86,7 @@ pub struct StageBindings {
     cube_mask: u16,
     /// Cached [`Self::depth_fetch_mask`] value; same scheme as `depth_mask`.
     fetch_mask: u16,
+    fetch4: mtld3d_core::fetch4::Fetch4State,
 }
 
 impl StageBindings {
@@ -97,6 +100,7 @@ impl StageBindings {
             volume_mask: 0,
             cube_mask: 0,
             fetch_mask: 0,
+            fetch4: mtld3d_core::fetch4::Fetch4State::new(),
         }
     }
 
@@ -106,6 +110,14 @@ impl StageBindings {
     /// `STAGE_COUNT` slots.
     pub const fn bound_mask(&self) -> u16 {
         self.bound_mask
+    }
+
+    pub const fn fetch4(&self) -> &mtld3d_core::fetch4::Fetch4State {
+        &self.fetch4
+    }
+
+    pub const fn fetch4_mut(&mut self) -> &mut mtld3d_core::fetch4::Fetch4State {
+        &mut self.fetch4
     }
 
     pub const fn texture(&self, stage: usize) -> *mut Direct3DTexture9 {
@@ -193,6 +205,9 @@ impl StageBindings {
         stage: usize,
         tex: *mut Direct3DTexture9,
     ) -> TextureSwapDelta {
+        let old_fetch4 = self.fetch4.masks();
+        let old_raw_red = self.fetch4.raw_red_mask();
+        let old_fetch_mask = self.fetch_mask;
         // Snapshot the old slot before `adopt` drops its ref below.
         let old = &self.textures[stage];
         let old_nonnull = !old.raw().is_null();
@@ -233,7 +248,22 @@ impl StageBindings {
         self.cube_mask = with_bit(self.cube_mask, bit, new_cube);
         self.fetch_mask = with_bit(self.fetch_mask, bit, new_fetch);
 
+        self.fetch4.set_texture(
+            stage,
+            self.textures[stage]
+                .as_ref()
+                .map(Direct3DTexture9::d3d_format),
+            self.textures[stage].as_ref().is_some_and(|texture| {
+                texture.d3d_resource_type() == mtld3d_types::D3DRTYPE_TEXTURE
+            }),
+        );
         let mut delta = TextureSwapDelta::empty();
+        delta.set(
+            TextureSwapDelta::SAMPLING_CHANGED,
+            old_fetch4 != self.fetch4.masks()
+                || old_fetch_mask != self.fetch_mask
+                || old_raw_red != self.fetch4.raw_red_mask(),
+        );
         delta.set(
             TextureSwapDelta::OCCUPANCY_CHANGED,
             old_nonnull != new_nonnull,
@@ -251,6 +281,7 @@ impl StageBindings {
     pub fn set_sampler_state(&mut self, sampler: usize, type_: usize, value: u32) {
         self.warn_samp_non_default_once(sampler, type_, value);
         self.sampler_states[sampler][type_] = value;
+        self.fetch4.set_sampler(sampler, type_, value);
     }
 
     fn warn_samp_non_default_once(&mut self, sampler: usize, type_: usize, value: u32) {
@@ -316,6 +347,9 @@ impl StageBindings {
         self.volume_mask = 0;
         self.cube_mask = 0;
         self.fetch_mask = 0;
+        for stage in 0..STAGE_COUNT {
+            self.fetch4.set_texture(stage, None, false);
+        }
     }
 
     /// `IDirect3DDevice9::Reset` analog of `teardown`.
@@ -331,6 +365,7 @@ impl StageBindings {
     ) {
         self.teardown();
         self.sampler_states = *sampler_defaults;
+        self.fetch4 = mtld3d_core::fetch4::Fetch4State::new();
     }
 }
 
@@ -377,7 +412,7 @@ const fn samp_classify(type_: u32) -> SampClass {
         // LOD bias, so `sampler_state::lod_bias` decodes the slot into the
         // per-draw fragment uniform and the pixel-shader emitters put
         // `bias(...)` on every implicit-LOD sample
-        // (`VariantFlags::LOD_BIAS`).
+        // (`VariantFlags::LOD_BIAS`), or latches GET4/GET1 Fetch4 commands.
         | D3DSAMP_MIPMAPLODBIAS => SampClass::Consumed,
 
         _ => SampClass::NotImplemented,

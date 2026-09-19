@@ -1286,7 +1286,7 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
     let mut lod_bias = [0.0f32; mtld3d_core::sampler_state::LOD_BIAS_SLOTS];
     let mut any_lod_bias = false;
     for (stage_u32, b) in stage_bindings.iter() {
-        if ps_sampled_mask & (1u16 << stage_u32) == 0 {
+        if (ps_sampled_mask & !variant.fetch4_mask) & (1u16 << stage_u32) == 0 {
             continue;
         }
         let bias = mtld3d_core::sampler_state::lod_bias(&b.sampler_state) + scale_bias;

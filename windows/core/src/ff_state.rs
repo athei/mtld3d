@@ -1263,6 +1263,9 @@ impl FfState {
             // the encoder folds them in at draw time.
             depth_sampler_mask: 0,
             depth_fetch_mask: 0,
+            fetch4_mask: 0,
+            fetch4_alpha_mask: 0,
+            raw_depth_red_mask: 0,
             volume_sampler_mask: 0,
             cube_sampler_mask: 0,
             tt_projected_mask: 0,

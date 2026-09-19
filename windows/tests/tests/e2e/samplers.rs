@@ -20,6 +20,179 @@ const YELLOW: u32 = 0xFFFF_FF00;
 const PROBE_X: u32 = 400;
 const PROBE_Y: u32 = 60;
 
+#[test]
+fn fetch4_gathers_and_restores_latched_sampler_state() {
+    use mtld3d_types::{
+        D3DFMT_A8, D3DFMT_L8, D3DSBT_ALL, D3DSBT_PIXELSTATE, D3DSBT_VERTEXSTATE, FETCH4_DISABLE,
+        FETCH4_ENABLE,
+    };
+
+    let h = Harness::new();
+    let luminance = h.create_texture(2, 2, 1, 0, D3DFMT_L8, 0);
+    luminance
+        .lock_rect(0, 0)
+        .write_u8_rect(2, 2, &[0x10, 0x20, 0x30, 0x40]);
+    arm_texture(&h, &luminance, D3DTADDRESS_CLAMP, D3DTEXF_POINT);
+    let mut quad = uv_quad(1.0);
+    for vertex in &mut quad {
+        vertex.u = 0.125;
+        vertex.v = 0.125;
+    }
+    let sample = || {
+        h.render_once(BLACK, |d| {
+            assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad), 0);
+        });
+        h.read_pixel(160, 120)
+    };
+    let set_bias = |value| {
+        assert_eq!(h.set_sampler_state(0, D3DSAMP_MIPMAPLODBIAS, value), 0);
+        assert_eq!(h.sampler_state(0, D3DSAMP_MIPMAPLODBIAS), value);
+    };
+    // Paravirtual Metal omits luminance G/B replication. Ordinary controls
+    // check stored red and alpha; gather assertions still check every lane.
+    assert_eq!(sample() & 0xffff_0000, 0xff10_0000);
+    set_bias(FETCH4_ENABLE);
+    assert_eq!(sample(), 0x1020_3040, "fixed-function gather ordering");
+    let shader = h.create_pixel_shader(&PS_SAMPLE_TEXTURE);
+    assert_eq!(h.set_pixel_shader(&shader), 0);
+    assert_eq!(sample(), 0x1020_3040, "programmable gather ordering");
+    set_bias(0.0f32.to_bits());
+    assert_eq!(sample(), 0x1020_3040, "numeric bias preserves Fetch4");
+    for kind in [D3DSBT_ALL, D3DSBT_PIXELSTATE, D3DSBT_VERTEXSTATE] {
+        let block = h.create_state_block(kind);
+        set_bias(FETCH4_DISABLE);
+        assert_eq!(sample() & 0xffff_0000, 0xff10_0000);
+        assert_eq!(block.apply(), 0);
+        if kind == D3DSBT_VERTEXSTATE {
+            assert_eq!(
+                sample() & 0xffff_0000,
+                0xff10_0000,
+                "stateblock type {kind}"
+            );
+        } else {
+            assert_eq!(sample(), 0x1020_3040, "stateblock type {kind}");
+        }
+        set_bias(FETCH4_ENABLE);
+        set_bias(0.0f32.to_bits());
+    }
+    assert_eq!(h.begin_state_block(), 0);
+    assert_eq!(
+        h.set_sampler_state(0, D3DSAMP_MIPMAPLODBIAS, FETCH4_DISABLE),
+        0
+    );
+    let recorded = h.end_state_block();
+    assert_eq!(recorded.capture(), 0);
+    set_bias(FETCH4_DISABLE);
+    assert_eq!(recorded.apply(), 0);
+    assert_eq!(
+        sample(),
+        0x1020_3040,
+        "recorded Capture keeps the command latch"
+    );
+    let alpha = h.create_texture(2, 2, 1, 0, D3DFMT_A8, 0);
+    alpha
+        .lock_rect(0, 0)
+        .write_u8_rect(2, 2, &[0x10, 0x20, 0x30, 0x40]);
+    assert_eq!(h.set_texture(0, &alpha), 0);
+    assert_eq!(sample(), 0x1020_3040, "A8 gathers the stored alpha channel");
+    let colour = rgbw_2x2(&h);
+    assert_eq!(h.set_texture(0, &colour), 0);
+    assert_eq!(sample(), 0xffff_0000, "multichannel textures ignore Fetch4");
+    let mut high_slot_code = PS_SAMPLE_TEXTURE;
+    high_slot_code[3] |= 7;
+    high_slot_code[10] |= 7;
+    let high_slot_shader = h.create_pixel_shader(&high_slot_code);
+    assert_eq!(h.set_pixel_shader(&high_slot_shader), 0);
+    assert_eq!(h.set_texture(7, &alpha), 0);
+    assert_eq!(
+        h.set_sampler_state(7, D3DSAMP_MIPMAPLODBIAS, FETCH4_ENABLE),
+        0
+    );
+    assert_eq!(
+        sample(),
+        0x1020_3040,
+        "sampler seven gathers alpha independently"
+    );
+}
+
+#[test]
+fn fetch4_ignores_single_slice_volume_textures() {
+    use mtld3d_types::{D3DFMT_L16, D3DPOOL_MANAGED, FETCH4_DISABLE, FETCH4_ENABLE};
+
+    let h = Harness::new();
+    let (hr, volume) = h.try_create_volume_texture([2, 2, 1], 1, 0, D3DFMT_L16, D3DPOOL_MANAGED);
+    assert_eq!(hr, 0);
+    let volume = volume.expect("single-slice volume");
+    volume.write_u16(0, &[0x1010, 0x2020, 0x3030, 0x4040]);
+    assert_eq!(h.set_volume_texture(0, &volume), 0);
+    h.select_texture_stage(0);
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1), 0);
+    let mut quad = uv_quad(1.0);
+    for vertex in &mut quad {
+        vertex.u = 0.125;
+        vertex.v = 0.125;
+    }
+    let shader = h.create_pixel_shader(&PS_SAMPLE_TEXTURE);
+    for programmable in [false, true] {
+        if programmable {
+            assert_eq!(h.set_pixel_shader(&shader), 0);
+        }
+        for command in [FETCH4_DISABLE, FETCH4_ENABLE] {
+            assert_eq!(h.set_sampler_state(0, D3DSAMP_MIPMAPLODBIAS, command), 0);
+            h.render_once(BLACK, |d| {
+                assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad), 0);
+            });
+            // Ignore unrelated luminance G/B view swizzles. An erroneous
+            // gather changes red and alpha too: 0x10203040 masks to 0x10200000.
+            assert_eq!(
+                h.read_pixel(160, 120) & 0xffff_0000,
+                0xff10_0000,
+                "volume sampling: programmable={programmable}, command={command:#x}"
+            );
+        }
+    }
+}
+
+#[test]
+fn fetch4_depth_formats_keep_raw_and_comparison_channels_distinct() {
+    use mtld3d_types::{
+        D3DCLEAR_ZBUFFER, D3DFMT_D24S8, D3DFMT_DF16, D3DFMT_DF24, D3DFMT_INTZ, D3DPOOL_DEFAULT,
+        D3DRS_ZENABLE, D3DUSAGE_DEPTHSTENCIL, FETCH4_DISABLE, FETCH4_ENABLE,
+    };
+
+    let h = Harness::new();
+    let shader = h.create_pixel_shader(&PS_SAMPLE_TEXTURE);
+    assert_eq!(h.set_pixel_shader(&shader), 0);
+    let quad = uv_quad(1.0);
+    for (format, ordinary, gathered) in [
+        (D3DFMT_DF16, 0xff40_0000, 0x4040_4040),
+        (D3DFMT_DF24, 0xff40_0000, 0x4040_4040),
+        (D3DFMT_INTZ, 0x4040_4040, 0x4040_4040),
+        (D3DFMT_D24S8, 0xffff_ffff, 0xffff_ffff),
+    ] {
+        let texture = h.create_texture(640, 480, 1, D3DUSAGE_DEPTHSTENCIL, format, D3DPOOL_DEFAULT);
+        let surface = texture.surface_level(0);
+        assert_eq!(h.clear_texture(0), 0);
+        assert_eq!(h.set_depth_stencil_surface(&surface), 0);
+        assert_eq!(h.clear(D3DCLEAR_ZBUFFER, 0, 0.25, 0), 0);
+        assert_eq!(h.clear_depth_stencil_surface(), 0);
+        assert_eq!(h.set_render_state(D3DRS_ZENABLE, 0), 0);
+        arm_texture(&h, &texture, D3DTADDRESS_CLAMP, D3DTEXF_POINT);
+        for (command, expected) in [(FETCH4_DISABLE, ordinary), (FETCH4_ENABLE, gathered)] {
+            assert_eq!(h.set_sampler_state(0, D3DSAMP_MIPMAPLODBIAS, command), 0);
+            h.render_once(BLACK, |d| {
+                assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad), 0);
+            });
+            assert_pixel_approx(
+                h.read_pixel(160, 120),
+                expected,
+                1,
+                "depth sampling channels",
+            );
+        }
+    }
+}
+
 /// A 2×2 texture: (0,0)=red (1,0)=green (0,1)=blue (1,1)=white.
 fn rgbw_2x2(h: &Harness) -> Texture<'_> {
     let tex = h.create_texture(2, 2, 1, 0, D3DFMT_A8R8G8B8, 0);

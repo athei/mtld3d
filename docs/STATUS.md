@@ -17,9 +17,10 @@ divergences from D3D9 it keeps on purpose. The tested games are in the
 - Compressed (DXT1 to DXT5, ATI1), integer and float formats, cube and volume
   textures, auto-generated mipmaps, `StretchRect` with format conversion and
   YUV decoding, `GetDC`.
-- Sampleable depth (INTZ, DF16, DF24) with shadow compare, depth bias, the
-  full two-sided stencil test, and GPU-only plain depth textures for RESZ
-  destinations.
+- Raw sampleable depth (INTZ, DF16, DF24), hardware shadow comparisons on
+  standard depth formats, depth bias, the full two-sided stencil test, and
+  GPU-only plain depth textures for RESZ destinations.
+- Fetch4 gathers on 2D L8, L16, A8, R16F, R32F and raw-depth textures.
 - Anisotropic filtering, LOD bias, sRGB read and write, alpha test, scissor,
   separate alpha blend, blend factor, write masks, native wireframe fill.
 - Four render targets with independent formats and blending.

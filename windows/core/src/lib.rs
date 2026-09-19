@@ -24,6 +24,7 @@ pub mod dirty_range;
 pub mod dirty_rect;
 pub mod display_mode;
 pub mod dxso;
+pub mod fetch4;
 pub mod ff_state;
 pub mod format;
 pub mod format_probe;
