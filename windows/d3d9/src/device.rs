@@ -4789,6 +4789,15 @@ fn create_texture_path(info: &TextureCreateArgs) -> i32 {
         return D3DERR_INVALIDCALL;
     }
 
+    // Offscreen plain surfaces must be lockable. A GPU-only depth texture
+    // cannot provide the staging that this internal surface path requires.
+    if is_depth_fmt && offscreen_plain {
+        mtld3d_shared::log_once_warn!(target: LOG_TARGET,
+            "reject CreateOffscreenPlainSurface depth format → INVALIDCALL (no CPU staging)");
+        null_out(texture);
+        return D3DERR_INVALIDCALL;
+    }
+
     // Depth-format CreateTexture is the D3D9 sampleable-shadow-map idiom:
     // game asks for a texture in a depth format with D3DUSAGE_DEPTHSTENCIL,
     // binds its surface as the depth target during the shadow pass, and
@@ -5038,25 +5047,26 @@ struct DepthTextureCreateInfo {
 /// fail to allocate shadow maps and the lit pass samples stale texture-slot
 /// contents (visible flicker). The colour mapping table `map_d3d_format`
 /// carries no depth entries, so a depth format routes through
-/// `map_d3d_depth_format` and this path instead.
+/// `map_d3d_depth_format` and this path instead. Usage 0 creates the same
+/// GPU-only resource for sampling and RESZ destinations, while its level
+/// surfaces cannot be bound as depth attachments.
 ///
 /// Rejected with `D3DERR_INVALIDCALL`:
-/// - `usage` without `D3DUSAGE_DEPTHSTENCIL`. A depth format is creatable
-///   only as a depth attachment.
 /// - `pool` other than `D3DPOOL_DEFAULT`. Depth textures live on the GPU
 ///   only.
-/// - `D3DUSAGE_DYNAMIC`, `D3DUSAGE_RENDERTARGET`, `D3DUSAGE_AUTOGENMIPMAP`.
-///   None of the three fits a depth attachment: there is no CPU upload path,
-///   the colour and depth usages are exclusive, and Metal's `generateMipmaps`
-///   refuses depth formats.
+/// - `D3DUSAGE_DYNAMIC` and `D3DUSAGE_RENDERTARGET`: there is no CPU upload
+///   path, and the colour and depth usages are exclusive.
+/// - `D3DUSAGE_AUTOGENMIPMAP` with more than one requested level. The format
+///   probe answers `D3DOK_NOAUTOGEN`, so accepted requests receive one mip
+///   without generation, preserving the requested usage in their description.
 /// - A format with no `map_d3d_depth_format` entry.
 ///
 /// `levels` follows the colour path's rule, through the shared
 /// [`resolve_create_levels`]: 0 requests the full chain down to one texel, and
-/// any other value is the level count, capped at that chain. A mip chain on a
-/// depth texture is an engine's depth pyramid, every level rendered into
-/// through `GetSurfaceLevel(n)` bound as the depth attachment, because with
-/// `generateMipmaps` unavailable nothing else can fill one.
+/// any other value is the level count, capped at that chain. An attachment
+/// texture's depth pyramid is written through `GetSurfaceLevel(n)` bound
+/// as depth. A plain texture can receive a RESZ copy at level zero; automatic
+/// generation and CPU uploads cannot fill its remaining levels.
 ///
 /// The created texture has no PE-side staging buffer, so its per-level
 /// tracking arrays are sized from the level count rather than from the
@@ -5074,12 +5084,11 @@ fn create_depth_texture_path(info: &DepthTextureCreateInfo) -> i32 {
         texture,
     } = *info;
 
-    if usage & D3DUSAGE_DEPTHSTENCIL == 0 {
-        mtld3d_shared::log_once_warn_by!(
-            target: crate::LOG_TARGET,
-            key: u64::from(format),
-            "reject CreateTexture depth format={format} without D3DUSAGE_DEPTHSTENCIL → INVALIDCALL"
-        );
+    // Lockable and legacy depth mappings do not imply a plain-texture
+    // capability: their CPU lock contracts are not implemented here.
+    if usage & D3DUSAGE_DEPTHSTENCIL == 0 && !is_depth_stencil_format(format) {
+        mtld3d_shared::log_once_warn_by!(target: LOG_TARGET, key: u64::from(format),
+            "reject CreateTexture plain depth format={format} → INVALIDCALL (unsupported format)");
         null_out(texture);
         return D3DERR_INVALIDCALL;
     }
@@ -5092,8 +5101,7 @@ fn create_depth_texture_path(info: &DepthTextureCreateInfo) -> i32 {
         null_out(texture);
         return D3DERR_INVALIDCALL;
     }
-    let bad_usage_bits =
-        usage & (D3DUSAGE_DYNAMIC | D3DUSAGE_RENDERTARGET | D3DUSAGE_AUTOGENMIPMAP);
+    let bad_usage_bits = usage & (D3DUSAGE_DYNAMIC | D3DUSAGE_RENDERTARGET);
     if bad_usage_bits != 0 {
         mtld3d_shared::log_once_warn_by!(
             target: crate::LOG_TARGET,
@@ -5116,11 +5124,23 @@ fn create_depth_texture_path(info: &DepthTextureCreateInfo) -> i32 {
     // A mip chain on a depth texture is an engine's depth pyramid: each level
     // is rendered into through `GetSurfaceLevel(n)` bound as the depth
     // attachment and sampled back at a coarser resolution.
-    let actual_levels = resolve_create_levels(
-        "CreateTexture depth",
-        levels,
-        compute_mip_count(width, height),
-    );
+    let actual_levels = if usage & D3DUSAGE_AUTOGENMIPMAP != 0 {
+        if levels > 1 {
+            mtld3d_shared::log_once_warn!(target: LOG_TARGET,
+                "reject CreateTexture depth AUTOGENMIPMAP levels={levels} → INVALIDCALL (expected 0 or 1)");
+            null_out(texture);
+            return D3DERR_INVALIDCALL;
+        }
+        // NOAUTOGEN is a successful single-level fallback. Leave the internal
+        // AUTOGEN_MIPMAP flag unset: no path may generate depth mipmaps.
+        1
+    } else {
+        resolve_create_levels(
+            "CreateTexture depth",
+            levels,
+            compute_mip_count(width, height),
+        )
+    };
     let usage_flags = mtld3d_shared::mtl::TextureUsage::DEPTH_STENCIL
         | mtld3d_shared::mtl::TextureUsage::RENDER_TARGET;
     // The per-pixel size the mip chain is charged at against the

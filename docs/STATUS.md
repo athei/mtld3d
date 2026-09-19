@@ -18,7 +18,8 @@ divergences from D3D9 it keeps on purpose. The tested games are in the
   textures, auto-generated mipmaps, `StretchRect` with format conversion and
   YUV decoding, `GetDC`.
 - Sampleable depth (INTZ, DF16, DF24) with shadow compare, depth bias, the
-  full two-sided stencil test.
+  full two-sided stencil test, and GPU-only plain depth textures for RESZ
+  destinations.
 - Anisotropic filtering, LOD bias, sRGB read and write, alpha test, scissor,
   separate alpha blend, blend factor, write masks.
 - Four render targets with independent formats and blending.
@@ -37,6 +38,9 @@ Each fails cleanly, with an absent cap bit or a documented error return.
 
 - Non-solid fill modes: Metal has no wireframe, so the state is warned once
   and drawn solid.
+- Dynamic depth textures: packed depth uploads have no conversion path.
+  Depth textures also have no vertex sampling. Automatic mip-generation
+  requests use the single-level `D3DOK_NOAUTOGEN` fallback.
 - Timestamp, timestamp frequency, timestamp disjoint and other niche query
   types: capability probes and creation report `D3DERR_NOTAVAILABLE`.
 - Scaled, sub-rect or converting depth-to-depth `StretchRect`: only the
