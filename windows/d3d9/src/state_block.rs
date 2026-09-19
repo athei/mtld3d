@@ -66,6 +66,8 @@ pub enum StateOp {
         sampler: u32,
         type_: u32,
         value: u32,
+        // Numeric bias writes do not encode the current command latch.
+        fetch4: Option<bool>,
     },
     TextureStageState {
         stage: u32,
@@ -181,7 +183,14 @@ impl RecordingStateBlock {
                     sampler,
                     type_,
                     value,
+                    fetch4,
                 } => {
+                    if *type_ == mtld3d_types::D3DSAMP_MIPMAPLODBIAS
+                        && (*sampler as usize) < STAGE_COUNT
+                    {
+                        *fetch4 =
+                            Some(dev.stage_bindings().fetch4().enabled() & (1 << *sampler) != 0);
+                    }
                     *value = crate::device::vertex_sampler_slot(*sampler).map_or_else(
                         || {
                             dev.stage_bindings()
@@ -346,6 +355,7 @@ impl RecordingStateBlock {
                     sampler,
                     type_,
                     value,
+                    fetch4,
                 } => {
                     if let Some(slot) = crate::device::vertex_sampler_slot(*sampler) {
                         dev.set_vertex_sampler_slot_state(slot, *type_ as usize, *value);
@@ -355,6 +365,15 @@ impl RecordingStateBlock {
                             *type_ as usize,
                             *value,
                         );
+                        if let Some(enabled) = fetch4 {
+                            let state = dev.stage_bindings_mut().fetch4_mut();
+                            let bit = 1u16 << *sampler;
+                            state.restore_enabled(if *enabled {
+                                state.enabled() | bit
+                            } else {
+                                state.enabled() & !bit
+                            });
+                        }
                     }
                 }
                 StateOp::TextureStageState {
@@ -552,6 +571,7 @@ struct StateSnapshot {
     fvf: u32,
     render_states: [u32; RENDER_STATE_COUNT],
     sampler_states: [[u32; SAMPLER_STATE_COUNT]; STAGE_COUNT],
+    fetch4_enabled: u16,
     vertex_sampler_states: [[u32; SAMPLER_STATE_COUNT]; 4],
     ff: FfStateSnapshot,
     bound_textures: [CachedComPtr<Direct3DTexture9>; STAGE_COUNT],
@@ -637,6 +657,7 @@ impl StateSnapshot {
             render_states: *dev.render_states(),
             sampler_states: capture_sampler_states(dev),
             vertex_sampler_states: capture_vertex_sampler_states(dev),
+            fetch4_enabled: dev.stage_bindings().fetch4().enabled(),
             ff: FfStateSnapshot::from(dev.ff_state()),
             bound_textures,
             bound_vertex_textures,
@@ -689,6 +710,11 @@ impl StateSnapshot {
                         .set_sampler_state(stage, samp_ty as usize, val);
                 }
             }
+        }
+        if block_type.includes_sampler_state(mtld3d_types::D3DSAMP_MIPMAPLODBIAS) {
+            dev.stage_bindings_mut()
+                .fetch4_mut()
+                .restore_enabled(self.fetch4_enabled);
         }
         for (slot, states) in self.vertex_sampler_states.iter().enumerate() {
             for (samp_ty, &val) in (0u32..).zip(states.iter()) {

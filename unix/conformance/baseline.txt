@@ -97,10 +97,7 @@
   visual.c:5436 count=1
   visual.c:5454 count=1
   visual.c:12008 count=5
-  visual.c:15617 count=144
   visual.c:15668 count=17
-  visual.c:15824 count=8
-  visual.c:15829 count=12
   visual.c:16433 count=2
   visual.c:19210 count=1
   visual.c:19217 count=1
@@ -208,10 +205,7 @@
   visual.c:5436 count=1
   visual.c:5454 count=1
   visual.c:12008 count=5
-  visual.c:15617 count=144
   visual.c:15668 count=17
-  visual.c:15824 count=8
-  visual.c:15829 count=12
   visual.c:16433 count=2
   visual.c:19210 count=1
   visual.c:19217 count=1
@@ -426,10 +420,7 @@
   visual.c:14064 count=40
   visual.c:14081 count=40
   visual.c:14557 count=12
-  visual.c:15617 count=144
   visual.c:15668 count=17
-  visual.c:15824 count=8
-  visual.c:15829 count=12
   visual.c:16129 count=4
   visual.c:16131 count=4
   visual.c:16433 count=2
@@ -541,10 +532,7 @@
   visual.c:5436 count=1
   visual.c:5454 count=1
   visual.c:12008 count=5
-  visual.c:15617 count=144
   visual.c:15668 count=15
-  visual.c:15824 count=8
-  visual.c:15829 count=12
   visual.c:16433 count=2
   visual.c:19210 count=1
   visual.c:19217 count=1
@@ -650,10 +638,7 @@
   visual.c:5436 count=1
   visual.c:5454 count=1
   visual.c:12008 count=5
-  visual.c:15617 count=144
   visual.c:15668 count=15
-  visual.c:15824 count=8
-  visual.c:15829 count=12
   visual.c:16433 count=2
   visual.c:19210 count=1
   visual.c:19217 count=1
@@ -866,10 +851,7 @@
   visual.c:14064 count=40
   visual.c:14081 count=40
   visual.c:14557 count=12
-  visual.c:15617 count=144
   visual.c:15668 count=15
-  visual.c:15824 count=8
-  visual.c:15829 count=12
   visual.c:16129 count=4
   visual.c:16131 count=4
   visual.c:16433 count=2

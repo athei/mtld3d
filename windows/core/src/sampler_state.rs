@@ -262,13 +262,16 @@ pub const fn srgb_texture_enabled(ss: &[u32; SAMPLER_STATE_COUNT]) -> bool {
 
 /// `D3DSAMP_MIPMAPLODBIAS` decoded as the float a sample site applies.
 ///
-/// The state slot holds an IEEE `f32` bit pattern. NaN decodes to no bias and
-/// the magnitude is clamped to ±32. Metal samplers carry no LOD
+/// The state slot holds an IEEE `f32` bit pattern. NaN and Fetch4 commands
+/// decode to no bias; the magnitude is clamped to ±32. Metal samplers carry no LOD
 /// bias, so the value reaches the GPU as a shader uniform instead; this is the
 /// single decoder for both that uniform and the "is any stage biased"
 /// predicate, so the compiled variant and the value it reads cannot disagree.
 #[must_use]
 pub fn lod_bias(ss: &[u32; SAMPLER_STATE_COUNT]) -> f32 {
+    if crate::fetch4::command(ss[D3DSAMP_MIPMAPLODBIAS as usize]).is_some() {
+        return 0.0;
+    }
     let raw = f32::from_bits(ss[D3DSAMP_MIPMAPLODBIAS as usize]);
     if raw.is_nan() {
         return 0.0;

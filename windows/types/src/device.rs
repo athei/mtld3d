@@ -307,6 +307,10 @@ pub const D3DSAMP_MAGFILTER: u32 = 5;
 pub const D3DSAMP_MINFILTER: u32 = 6;
 pub const D3DSAMP_MIPFILTER: u32 = 7;
 pub const D3DSAMP_MIPMAPLODBIAS: u32 = 8;
+/// Vendor command written to `D3DSAMP_MIPMAPLODBIAS` to enable Fetch4.
+pub const FETCH4_ENABLE: u32 = u32::from_le_bytes(*b"GET4");
+/// Vendor command written to `D3DSAMP_MIPMAPLODBIAS` to disable Fetch4.
+pub const FETCH4_DISABLE: u32 = u32::from_le_bytes(*b"GET1");
 pub const D3DSAMP_MAXMIPLEVEL: u32 = 9;
 pub const D3DSAMP_MAXANISOTROPY: u32 = 10;
 pub const D3DSAMP_SRGBTEXTURE: u32 = 11;

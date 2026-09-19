@@ -313,7 +313,9 @@ mod source;
 ///
 /// `74` keys native alpha-to-coverage in the pipeline flags and suppresses
 /// fragment alpha testing while that coverage state is active.
-pub const SHADER_CACHE_SCHEMA_VERSION: u32 = 74;
+///
+/// `75` adds Fetch4 gather, alpha-channel and raw DF depth-channel masks.
+pub const SHADER_CACHE_SCHEMA_VERSION: u32 = 75;
 
 /// Source-derived identity of MSL emission, independent of persistent DXSO and shader keys.
 pub const SHADER_EMITTER_VERSION: u64 = include!(concat!(env!("OUT_DIR"), "/emitter_version.rs"));
@@ -323,7 +325,8 @@ pub const SHADER_EMITTER_VERSION: u64 = include!(concat!(env!("OUT_DIR"), "/emit
 /// Separate from [`SHADER_CACHE_SCHEMA_VERSION`] so a translation change can
 /// invalidate shader and pipeline identities without pretending the binary
 /// framing changed.
-pub const CACHE_FORMAT_VERSION: u32 = 19;
+/// Version 20 extends the serialized pixel-specialization recipe.
+pub const CACHE_FORMAT_VERSION: u32 = 20;
 
 /// File magic.
 ///

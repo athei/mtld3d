@@ -1494,10 +1494,7 @@ fn emit_ps(out: &mut String, ps: &FfPsKey, variant: VariantKey, entry: &str) {
             // LessEqual`); a `depth2d` texture must be read with
             // `sample_compare` (reference = the texcoord's z), matching the
             // programmable emitter's `sample_or_compare` depth branch.
-            if (variant.depth_fetch_mask & (1u16 << i)) != 0 {
-                // INTZ/DF24/DF16: read the RAW stored depth (broadcast) via a
-                // plain `.sample()` on the depth2d binding — not a shadow
-                // comparison — honouring D3DTTFF_PROJECTED like the colour path.
+            if (variant.fetch4_mask & (1u16 << i)) != 0 {
                 let uv = if (ps.tt_projected_mask & (1u8 << i)) != 0 {
                     format!(
                         "(in.texcoord{i}.w != 0.0 ? in.texcoord{i}.xy / in.texcoord{i}.w : float2(0.0))"
@@ -1505,9 +1502,32 @@ fn emit_ps(out: &mut String, ps: &FfPsKey, variant: VariantKey, entry: &str) {
                 } else {
                     format!("in.texcoord{i}.xy")
                 };
+                let sample = super::emit::fetch4_sample(
+                    u16::try_from(i).expect("eight texture stages fit u16"),
+                    &uv,
+                    variant.depth_sampler_mask & (1u16 << i) != 0,
+                    variant.fetch4_alpha_mask & (1u16 << i) != 0,
+                );
+                let _ = writeln!(out, "    float4 t{i} = {sample};");
+            } else if (variant.depth_fetch_mask & (1u16 << i)) != 0 {
+                // INTZ/DF24/DF16 read stored depth without a shadow comparison,
+                // honouring D3DTTFF_PROJECTED like the colour path. INTZ
+                // broadcasts depth; DF formats fill GBA as 0,0,1.
+                let uv = if (ps.tt_projected_mask & (1u8 << i)) != 0 {
+                    format!(
+                        "(in.texcoord{i}.w != 0.0 ? in.texcoord{i}.xy / in.texcoord{i}.w : float2(0.0))"
+                    )
+                } else {
+                    format!("in.texcoord{i}.xy")
+                };
+                let fill = if variant.raw_depth_red_mask & (1u16 << i) != 0 {
+                    ", 0.0, 0.0, 1.0"
+                } else {
+                    ""
+                };
                 let _ = writeln!(
                     out,
-                    "    float4 t{i} = float4(s{i}.sample(samp{i}, {uv}, level(0)));"
+                    "    float4 t{i} = float4(s{i}.sample(samp{i}, {uv}, level(0)){fill});"
                 );
             } else if (variant.depth_sampler_mask & (1u16 << i)) != 0 {
                 let _ = writeln!(
