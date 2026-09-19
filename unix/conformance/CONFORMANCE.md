@@ -1045,17 +1045,6 @@ with Acquire before calling, and only the unix side raises that counter
 in-place write into a needless rename but never the reverse. The kept
 divergence itself is unchanged.
 
-### visual.c/test_alpha_to_coverage
-Sites: 26538=caps
-
-`win_skip("Alpha to coverage is not supported.")`, which counts as a failure
-under Wine. Alpha to coverage is reached through a vendor pseudo-format
-(NVIDIA's `ATOC` through `D3DRS_ADAPTIVETESS_Y`, AMD's `A2M1` through
-`D3DRS_POINTSIZE`); mtld3d advertises neither, and answering NOTAVAILABLE for
-the probe is the conformant response for a device without the extension. The
-test only reaches the probe on a multisample-capable device, which is why the
-site is new.
-
 ### visual.c/test_mipmap_upload
 Sites: 27550=expected
 

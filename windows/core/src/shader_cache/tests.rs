@@ -162,6 +162,27 @@ fn pipeline_recipe_round_trips_with_stable_shader_refs() {
 }
 
 #[test]
+fn coverage_pipeline_recipe_preserves_enable_state() {
+    let mut recipe = sample_recipe();
+    recipe.snapshot.sample_count = 4;
+    recipe
+        .snapshot
+        .rs
+        .flags
+        .insert(PipelineRsFlags::ALPHA_TO_COVERAGE);
+    let mut bytes = Vec::new();
+    recipe.encode(&mut bytes);
+    let decoded = PipelineRecipe::decode(&bytes).expect("coverage recipe");
+    assert!(
+        decoded
+            .snapshot
+            .rs
+            .alpha_to_coverage(decoded.snapshot.sample_count)
+    );
+    assert!(decoded == recipe);
+}
+
+#[test]
 fn attachmentless_recipes_are_removed_without_losing_valid_records() {
     let entries = sample_entries();
     let mut empty = sample_recipe();

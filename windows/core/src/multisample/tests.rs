@@ -190,3 +190,17 @@ fn the_effective_mask_narrows_to_the_sample_count() {
         0x7F
     );
 }
+
+#[test]
+fn coverage_request_requires_both_atoc_and_alpha_test() {
+    let mut states = mtld3d_types::render_state_defaults();
+    assert!(!alpha_to_coverage_requested(&states));
+    states[mtld3d_types::D3DRS_ADAPTIVETESS_Y as usize] = mtld3d_types::D3DFMT_ATOC;
+    assert!(!alpha_to_coverage_requested(&states));
+    states[mtld3d_types::D3DRS_ALPHATESTENABLE as usize] = 1;
+    assert!(alpha_to_coverage_requested(&states));
+    states[mtld3d_types::D3DRS_ADAPTIVETESS_Y as usize] = 1.0f32.to_bits();
+    assert!(!alpha_to_coverage_requested(&states));
+    states[mtld3d_types::D3DRS_ADAPTIVETESS_Y as usize] = 0;
+    assert!(!alpha_to_coverage_requested(&states));
+}

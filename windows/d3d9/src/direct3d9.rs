@@ -909,6 +909,15 @@ extern "system" fn d3d9_check_device_format(
     if matches!(check_format, D3DFMT_DF24 | D3DFMT_DF16) && !cfg.df_formats {
         return D3DERR_NOTAVAILABLE;
     }
+    // ATOC is a capability token, not a texture or render-target format.
+    // The explicit probe and control work regardless of the adapter identity.
+    if check_format == mtld3d_types::D3DFMT_ATOC {
+        return if rtype == D3DRTYPE_SURFACE && usage == 0 {
+            D3D_OK
+        } else {
+            D3DERR_NOTAVAILABLE
+        };
+    }
     // The RESZ pseudo-format: probing it asks "is the RESZ depth resolve
     // supported" (`SetRenderState(POINTSIZE, 0x7fa05000)`, implemented in
     // the device). No surface of this format is ever created.

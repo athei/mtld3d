@@ -2277,6 +2277,7 @@ impl DeviceInner {
         }
         let class = rs_classify(
             u32::try_from(index).expect("D3DRS index fits u32 by RENDER_STATE_COUNT bound"),
+            value,
         );
         if matches!(class, RsClass::Consumed) {
             if mtld3d_core::state_trace::enabled() {
@@ -11073,6 +11074,10 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
             PipelineRsFlags::SEPARATE_ALPHA_BLEND,
             rs[D3DRS_SEPARATEALPHABLENDENABLE as usize] != 0,
         );
+        prs_flags.set(
+            PipelineRsFlags::ALPHA_TO_COVERAGE,
+            mtld3d_core::multisample::alpha_to_coverage_requested(rs),
+        );
         let pipeline_rs = PipelineRsBits {
             flags: prs_flags,
             src_blend: enum_rs(D3DRS_SRCBLEND),
@@ -13376,8 +13381,9 @@ enum RsClass {
     NotImplemented,
 }
 
-const fn rs_classify(index: u32) -> RsClass {
+const fn rs_classify(index: u32, value: u32) -> RsClass {
     match index {
+        mtld3d_types::D3DRS_ADAPTIVETESS_Y if matches!(value, 0 | mtld3d_types::D3DFMT_ATOC) => RsClass::Consumed,
         // Bucket A — consumed by mtld3d (draw-path snapshot + FF pipeline).
         D3DRS_ZENABLE
         | D3DRS_ZWRITEENABLE

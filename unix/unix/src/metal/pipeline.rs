@@ -75,6 +75,7 @@ pub fn create_render_pipeline(
     // texture of the pass the pipeline is bound in, so the PE side keys the
     // pipeline cache on it.
     desc.setRasterSampleCount(params.sample_count.max(1) as usize);
+    desc.setAlphaToCoverageEnabled(params.alpha_to_coverage != 0);
 
     // Pipeline-state label = `<vs_name> + <ps_name>`. Surfaces in Xcode's
     // Frame Capture timeline + pipeline-state list views as the per-shader

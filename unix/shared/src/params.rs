@@ -581,6 +581,8 @@ pub struct CreateRenderPipelineParams {
     /// texture of the render pass the pipeline is bound in, so it is part of
     /// the pipeline cache key on the PE side.
     pub sample_count: u32, // in
+    /// Enable Metal alpha-to-coverage for this multisampled pipeline.
+    pub alpha_to_coverage: u32, // in: non-zero = enabled
     pub extra: [ExtraColorAttachmentParams; 3], // in: colorAttachments[1..=3]
     pub pipeline_handle: MetalHandle<MTLRenderPipelineStateKind>, // out
     pub timings: super::perf::TimingOutput<super::perf::PipelineTimings>, // out: nanoseconds when PERF is enabled
