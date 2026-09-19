@@ -15,6 +15,7 @@ pub mod mtl;
 pub mod mtl_handle;
 mod params;
 pub mod perf;
+pub mod texture_views;
 pub mod trig;
 pub mod tsc;
 

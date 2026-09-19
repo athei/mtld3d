@@ -1265,18 +1265,14 @@ pub struct PassState {
     /// handle has been sampled by no earlier draw, so a rename needs no
     /// explicit clear here.
     frame_sampled_textures: FxHashSet<MetalHandle<MTLTextureKind>>,
-    /// sRGB twin view → base texture, for every live twin the encoder created.
+    /// Sampling or attachment view to resource identity, through native retirement.
     ///
-    /// A draw sampling with `D3DSAMP_SRGBTEXTURE=1` binds the twin handle,
-    /// but every identity question this module answers — "was this texture
-    /// sampled this frame" (rename-at-overlap), "does a later pass read this
-    /// attachment" (Clear coalescing, store-action Rules C/D) — is asked with
-    /// the base handle. The `emit_command` funnel resolves sampled twins to
-    /// their base for the sampled sets, and `pass_reads_texture` consults the
-    /// map for its command scans. Maintained by the encoder's texture
-    /// create / rename / destroy paths.
-    srgb_twin_to_base: FxHashMap<MetalHandle<MTLTextureKind>, MetalHandle<MTLTextureKind>>,
-    /// base texture → sRGB twin view, the inverse of `srgb_twin_to_base`.
+    /// Draw bindings use the existing single alias lookup to mark the resource
+    /// sampled. Pass scans also resolve views when deciding stores and clear
+    /// coalescing. Release and rename detach attachment selection immediately,
+    /// but retain these aliases until queued pass analysis and GPU use finish.
+    texture_view_to_base: FxHashMap<MetalHandle<MTLTextureKind>, MetalHandle<MTLTextureKind>>,
+    /// Base texture to renderable sRGB attachment, excluding sampling-only views.
     ///
     /// Read when a colour attachment is bound, to answer "does this render
     /// target have an sRGB view the pass can attach in its place". Kept by
@@ -1430,7 +1426,7 @@ impl PassState {
             backbuffer_logical_size: (0, 0),
             seen_sampled_textures: FxHashSet::with_capacity_and_hasher(8, FxBuildHasher),
             frame_sampled_textures: FxHashSet::with_capacity_and_hasher(64, FxBuildHasher),
-            srgb_twin_to_base: FxHashMap::with_capacity_and_hasher(8, FxBuildHasher),
+            texture_view_to_base: FxHashMap::with_capacity_and_hasher(8, FxBuildHasher),
             srgb_base_to_twin: FxHashMap::with_capacity_and_hasher(8, FxBuildHasher),
             srgb_write_enabled: false,
             pass_srgb_write: false,
@@ -1730,11 +1726,9 @@ impl PassState {
     /// Covers `seen_color_rts` and `seen_depth_rts` with their segment twins,
     /// `blit_written_rts`, `seen_sampled_textures`, `frame_sampled_textures`,
     /// `seen_sampleable_depth_textures`, and the two cascade-probe counters.
-    /// `srgb_twin_to_base` is not one of them: it mirrors the encoder's live
-    /// texture cache through `register_srgb_twin` / `unregister_srgb_twin`
-    /// rather than accumulating what passes did. `backbuffer_texture` and the
-    /// current-attachment handles are single bindings that every
-    /// [`Self::reset_frame`] reseeds.
+    /// View identity also lives until this retirement boundary, so released
+    /// textures remain visible to queued pass store analysis. Current attachment
+    /// handles are bindings that [`Self::reset_frame`] reseeds.
     ///
     /// The caller is the encoder's retention drain, which runs when the GPU
     /// has retired the submission that last named the handle. Pruning where
@@ -1745,6 +1739,12 @@ impl PassState {
         if texture.is_null() {
             return;
         }
+        if let Some(base) = self.texture_view_to_base.remove(&texture)
+            && self.srgb_base_to_twin.get(&base) == Some(&texture)
+        {
+            self.srgb_base_to_twin.remove(&base);
+        }
+        self.srgb_base_to_twin.remove(&texture);
         self.seen_color_rts.retain(|&(handle, _)| handle != texture);
         self.seen_color_rts_segment
             .retain(|&(handle, _)| handle != texture);
@@ -2065,10 +2065,28 @@ impl PassState {
         }
     }
 
+    /// Register sampling aliases separately from the renderable sRGB attachment.
+    pub fn register_texture_views(&mut self, views: &mtld3d_shared::texture_views::TextureViews) {
+        self.register_srgb_twin(views.srgb, views.linear);
+        self.register_texture_view(views.sample_linear, views.linear);
+        self.register_texture_view(views.sample_srgb, views.linear);
+    }
+
+    /// Preserve storage identity for a sampling view without changing attachments.
+    pub fn register_texture_view(
+        &mut self,
+        view: MetalHandle<MTLTextureKind>,
+        base: MetalHandle<MTLTextureKind>,
+    ) {
+        if !view.is_null() && !base.is_null() && view != base {
+            self.texture_view_to_base.insert(view, base);
+        }
+    }
+
     /// Register a live sRGB twin view for base-handle identity resolution.
     ///
     /// Called by the encoder whenever a texture create hands back a twin;
-    /// see the `srgb_twin_to_base` field for what the mapping protects.
+    /// see the `texture_view_to_base` field for what the mapping protects.
     pub fn register_srgb_twin(
         &mut self,
         twin: MetalHandle<MTLTextureKind>,
@@ -2079,7 +2097,9 @@ impl PassState {
         }
     }
 
-    /// Drop a twin registration when its texture is destroyed or renamed.
+    /// Detach the renderable twin when its texture is released or renamed.
+    ///
+    /// Its storage alias survives until native retirement for queued pass analysis.
     pub fn unregister_srgb_twin(&mut self, twin: MetalHandle<MTLTextureKind>) {
         if self.drop_srgb_twin(twin) {
             self.apply_srgb_write_change();
@@ -2099,7 +2119,7 @@ impl PassState {
         if twin.is_null() || base.is_null() {
             return false;
         }
-        self.srgb_twin_to_base.insert(twin, base);
+        self.texture_view_to_base.insert(twin, base);
         self.srgb_base_to_twin.insert(base, twin);
         true
     }
@@ -2109,9 +2129,12 @@ impl PassState {
         if twin.is_null() {
             return false;
         }
-        let Some(base) = self.srgb_twin_to_base.remove(&twin) else {
+        let Some(&base) = self.texture_view_to_base.get(&twin) else {
             return false;
         };
+        if self.srgb_base_to_twin.get(&base) != Some(&twin) {
+            return false;
+        }
         self.srgb_base_to_twin.remove(&base);
         true
     }
@@ -2470,7 +2493,7 @@ impl PassState {
             // An sRGB twin bind reads its base texture's storage — record the
             // base too so rename-at-overlap and the store-action rules see the
             // read under the handle they key on.
-            if let Some(&base) = self.srgb_twin_to_base.get(&tex) {
+            if let Some(&base) = self.texture_view_to_base.get(&tex) {
                 self.seen_sampled_textures.insert(base);
                 self.frame_sampled_textures.insert(base);
             }
@@ -4070,7 +4093,7 @@ impl PassState {
                         || loaded_later.contains(&tex)
                         || self.passes[i + 1..]
                             .iter()
-                            .any(|later| pass_reads_texture(later, tex, &self.srgb_twin_to_base))
+                            .any(|later| pass_reads_texture(later, tex, &self.texture_view_to_base))
                 });
                 if observed_later {
                     record_loads(&mut loaded_later);
@@ -4289,12 +4312,12 @@ impl PassState {
         for j in (start + 1)..self.passes.len() {
             let cand = &self.passes[j];
             // Intervening read on a side we care about kills the merge.
-            if needs_color && pass_reads_texture(cand, target_color, &self.srgb_twin_to_base) {
+            if needs_color && pass_reads_texture(cand, target_color, &self.texture_view_to_base) {
                 return None;
             }
             if needs_color
                 && target_extra.iter().any(|&(tex, _)| {
-                    !tex.is_null() && pass_reads_texture(cand, tex, &self.srgb_twin_to_base)
+                    !tex.is_null() && pass_reads_texture(cand, tex, &self.texture_view_to_base)
                 })
             {
                 return None;
@@ -4322,10 +4345,10 @@ impl PassState {
             // multisampled companion it reduces holds content the clear would
             // otherwise land on top of.
             if needs_color
-                && (pass_resolves_into(cand, target_color, &self.srgb_twin_to_base)
+                && (pass_resolves_into(cand, target_color, &self.texture_view_to_base)
                     || target_extra
                         .iter()
-                        .any(|&(tex, _)| pass_resolves_into(cand, tex, &self.srgb_twin_to_base)))
+                        .any(|&(tex, _)| pass_resolves_into(cand, tex, &self.texture_view_to_base)))
             {
                 return None;
             }
@@ -4359,7 +4382,7 @@ impl PassState {
                 }
             }
             if (needs_depth || needs_stencil)
-                && pass_reads_texture(cand, target_depth, &self.srgb_twin_to_base)
+                && pass_reads_texture(cand, target_depth, &self.texture_view_to_base)
             {
                 return None;
             }
@@ -4815,7 +4838,7 @@ impl PassState {
 fn pass_reads_texture(
     pass: &Pass,
     target_handle: MetalHandle<MTLTextureKind>,
-    srgb_twin_to_base: &FxHashMap<MetalHandle<MTLTextureKind>, MetalHandle<MTLTextureKind>>,
+    texture_view_to_base: &FxHashMap<MetalHandle<MTLTextureKind>, MetalHandle<MTLTextureKind>>,
 ) -> bool {
     if target_handle.is_null() {
         return false;
@@ -4829,7 +4852,8 @@ fn pass_reads_texture(
             return true;
         }
         // A bind of the target's sRGB twin view reads the same storage.
-        !srgb_twin_to_base.is_empty() && srgb_twin_to_base.get(&texture) == Some(&target_handle)
+        !texture_view_to_base.is_empty()
+            && texture_view_to_base.get(&texture) == Some(&target_handle)
     });
     if sampler_reads {
         return true;
@@ -4866,7 +4890,7 @@ const fn command_sampled_texture(command: &Command) -> Option<MetalHandle<MTLTex
 fn pass_resolves_into(
     pass: &Pass,
     target_handle: MetalHandle<MTLTextureKind>,
-    srgb_twin_to_base: &FxHashMap<MetalHandle<MTLTextureKind>, MetalHandle<MTLTextureKind>>,
+    texture_view_to_base: &FxHashMap<MetalHandle<MTLTextureKind>, MetalHandle<MTLTextureKind>>,
 ) -> bool {
     if target_handle.is_null() {
         return false;
@@ -4875,7 +4899,8 @@ fn pass_resolves_into(
         .chain(pass.extra_color.iter().map(|a| a.resolve_texture))
         .any(|view| {
             !view.is_null()
-                && (view == target_handle || srgb_twin_to_base.get(&view) == Some(&target_handle))
+                && (view == target_handle
+                    || texture_view_to_base.get(&view) == Some(&target_handle))
         })
 }
 

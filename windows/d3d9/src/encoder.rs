@@ -72,6 +72,7 @@ use mtld3d_shared::{
         MTLTextureKind, NSViewKind,
     },
     perf::{NanosSetTimer, ShaderTimings},
+    texture_views::TextureViews,
     tsc::{ns_to_cycles, rdtsc, secs_to_cycles},
 };
 use mtld3d_types::{D3DSAMP_MIPMAPLODBIAS, SAMPLER_STATE_COUNT};
@@ -558,14 +559,7 @@ struct DepthSnapshot {
 }
 
 pub struct TextureGpuState {
-    pub mtl_texture: MetalHandle<MTLTextureKind>,
-    /// Eager sRGB twin view of `mtl_texture` (NULL when the format has none).
-    ///
-    /// Bound instead of the base handle when the sampling stage has
-    /// `D3DSAMP_SRGBTEXTURE=1`, so the hardware performs the sRGB→linear
-    /// decode. Same storage as the base texture — uploads and blits keep
-    /// targeting `mtl_texture` and are visible through this view.
-    pub mtl_texture_srgb: MetalHandle<MTLTextureKind>,
+    pub views: TextureViews,
     pub mip_staging_buffers: Vec<MipStagingBuffer>,
 }
 
@@ -1691,20 +1685,14 @@ impl FrameEncoder {
 
     /// Issue one batched `CreateTexturesBatch` thunk.
     ///
-    /// Caller owns `descs`, `handles_out` and `srgb_handles_out`; all three
-    /// slices must outlive the call because the unix side dereferences
-    /// their pointers during the thunk. On success `handles_out[i]` carries
-    /// the handle for `descs[i]` and `srgb_handles_out[i]` its eager sRGB
-    /// twin view (NULL when the format has none); on per-element failure
-    /// the slots stay at their initial value (caller passes zeros).
+    /// The descriptor and view slices outlive the synchronous thunk. Each
+    /// successful slot owns one retain per distinct handle; failed slots are empty.
     fn batch_create_textures(
         &self,
         descs: &[TextureCreateDesc],
-        handles_out: &mut [MetalHandle<MTLTextureKind>],
-        srgb_handles_out: &mut [MetalHandle<MTLTextureKind>],
+        views_out: &mut [TextureViews],
     ) -> i32 {
-        debug_assert_eq!(descs.len(), handles_out.len());
-        debug_assert_eq!(descs.len(), srgb_handles_out.len());
+        debug_assert_eq!(descs.len(), views_out.len());
         if descs.is_empty() {
             return 0;
         }
@@ -1716,8 +1704,7 @@ impl FrameEncoder {
             count,
             pad0: 0,
             descs_ptr: descs.as_ptr() as u64,
-            handles_out_ptr: handles_out.as_mut_ptr() as u64,
-            srgb_handles_out_ptr: srgb_handles_out.as_mut_ptr() as u64,
+            views_out_ptr: views_out.as_mut_ptr() as u64,
         };
         unix_call(&mut params)
     }
@@ -1832,9 +1819,8 @@ impl FrameEncoder {
             .iter()
             .map(|info| self.texture_desc_from_info(info))
             .collect();
-        let mut handles = vec![MetalHandle::<MTLTextureKind>::NULL; descs.len()];
-        let mut srgb_handles = vec![MetalHandle::<MTLTextureKind>::NULL; descs.len()];
-        let status = self.batch_create_textures(&descs, &mut handles, &mut srgb_handles);
+        let mut views: Vec<_> = (0..descs.len()).map(|_| TextureViews::EMPTY).collect();
+        let status = self.batch_create_textures(&descs, &mut views);
         if status != 0 {
             error!(
                 target: LOG_TARGET,
@@ -1843,31 +1829,27 @@ impl FrameEncoder {
             );
         }
         let current_seq = self.current_submit_seq;
-        for ((info, handle), srgb_handle) in infos.into_iter().zip(handles).zip(srgb_handles) {
-            if handle.is_null() {
+        for (info, views) in infos.into_iter().zip(views) {
+            if views.linear.is_null() {
                 continue;
             }
             match self.texture_cache.entry(info.texture_id) {
                 Entry::Vacant(v) => {
+                    self.pass_state.register_texture_views(&views);
                     v.insert(TextureGpuState {
-                        mtl_texture: handle,
-                        mtl_texture_srgb: srgb_handle,
+                        views,
                         mip_staging_buffers: vec![
                             MipStagingBuffer::default();
                             Self::texture_staging_slot_count(&info)
                         ],
                     });
-                    self.pass_state.register_srgb_twin(srgb_handle, handle);
                 }
                 Entry::Occupied(_) => {
                     mtld3d_shared::log_once_warn!(
                         target: LOG_TARGET,
                         "drain_texture_warmups: cache collision for tex_id, queueing orphan handle for retire"
                     );
-                    for orphan in [handle, srgb_handle] {
-                        if orphan.is_null() {
-                            continue;
-                        }
+                    for orphan in views.owned_handles() {
                         self.pending_resource_retention
                             .push_back(PendingResourceRetention {
                                 kind: DestroyKind::Texture,
@@ -3225,10 +3207,10 @@ impl FrameEncoder {
                 swizzle_a: mtld3d_shared::mtl::Swizzle::Alpha,
                 usage_flags: TextureUsage::DEPTH_STENCIL | TextureUsage::RENDER_TARGET,
             };
-            let mut handles = [MetalHandle::<MTLTextureKind>::NULL];
-            // Depth formats never have an sRGB twin; the slot stays NULL.
-            let mut srgb_handles = [MetalHandle::<MTLTextureKind>::NULL];
-            let status = self.batch_create_textures(&[desc], &mut handles, &mut srgb_handles);
+            let mut views = [TextureViews::EMPTY];
+            let status = self.batch_create_textures(&[desc], &mut views);
+            let handles = [views[0].linear];
+            self.retire_texture_views(&views[0], handles[0]);
             if status != 0 || handles[0].is_null() {
                 mtld3d_shared::log_once_warn!(
                     target: LOG_TARGET,
@@ -3353,10 +3335,10 @@ impl FrameEncoder {
             swizzle_a: Swizzle::Alpha,
             usage_flags: TextureUsage::empty(),
         };
-        let mut handles = [MetalHandle::<MTLTextureKind>::NULL];
-        // The scratch is never sampled through an sRGB view; the slot stays NULL.
-        let mut srgb_handles = [MetalHandle::<MTLTextureKind>::NULL];
-        let status = self.batch_create_textures(&[desc], &mut handles, &mut srgb_handles);
+        let mut views = [TextureViews::EMPTY];
+        let status = self.batch_create_textures(&[desc], &mut views);
+        let handles = [views[0].linear];
+        self.retire_texture_views(&views[0], handles[0]);
         if status != 0 || handles[0].is_null() {
             mtld3d_shared::log_once_warn!(
                 target: LOG_TARGET,
@@ -6239,12 +6221,26 @@ impl FrameEncoder {
     /// `device_create_shadow_texture`, and `texture::rehydrate_for_device`.
     pub fn get_texture_handle_by_id(&self, texture_id: mtld3d_core::ids::TextureId) -> u64 {
         if let Some(state) = self.texture_cache.get(&texture_id) {
-            return state.mtl_texture.raw();
+            return state.views.linear.raw();
         }
         mtld3d_shared::log_once_warn_by!(
             target: LOG_TARGET,
             key: texture_id.raw(),
             "encoder: texture {:#x} bound but missing from cache — warmup ordering bug",
+            texture_id.raw()
+        );
+        0
+    }
+
+    /// Pre-resolved linear sampling view for a warmed texture.
+    pub fn get_texture_sample_handle_by_id(&self, texture_id: mtld3d_core::ids::TextureId) -> u64 {
+        if let Some(state) = self.texture_cache.get(&texture_id) {
+            return state.views.sample_linear.raw();
+        }
+        mtld3d_shared::log_once_warn_by!(
+            target: LOG_TARGET,
+            key: texture_id.raw(),
+            "encoder: texture {:#x} bound but missing from cache: warmup ordering bug",
             texture_id.raw()
         );
         0
@@ -6259,8 +6255,8 @@ impl FrameEncoder {
     /// once-per-texture info line so the fallback is observable.
     pub fn get_texture_handle_by_id_srgb(&self, texture_id: mtld3d_core::ids::TextureId) -> u64 {
         if let Some(state) = self.texture_cache.get(&texture_id) {
-            if !state.mtl_texture_srgb.is_null() {
-                return state.mtl_texture_srgb.raw();
+            if !state.views.sample_srgb.is_null() {
+                return state.views.sample_srgb.raw();
             }
             mtld3d_shared::log_once_info_by!(
                 target: LOG_TARGET,
@@ -6269,7 +6265,7 @@ impl FrameEncoder {
                  no sRGB twin — sampled linear (matches hardware D3D9)",
                 texture_id.raw()
             );
-            return state.mtl_texture.raw();
+            return state.views.sample_linear.raw();
         }
         mtld3d_shared::log_once_warn_by!(
             target: LOG_TARGET,
@@ -6290,30 +6286,28 @@ impl FrameEncoder {
         let texture_id = info.texture_id;
         let staging_slots = Self::texture_staging_slot_count(info);
         if let Some(state) = self.texture_cache.get(&texture_id) {
-            return state.mtl_texture.raw();
+            return state.views.linear.raw();
         }
 
         let desc = self.texture_desc_from_info(info);
-        let mut handle = MetalHandle::<MTLTextureKind>::NULL;
-        let mut srgb_handle = MetalHandle::<MTLTextureKind>::NULL;
+        let mut views = TextureViews::EMPTY;
         let status = self.batch_create_textures(
             core::slice::from_ref(&desc),
-            core::slice::from_mut(&mut handle),
-            core::slice::from_mut(&mut srgb_handle),
+            core::slice::from_mut(&mut views),
         );
+        let handle = views.linear;
         if status != 0 || handle.is_null() {
             error!(target: LOG_TARGET, "encoder: CreateTexture failed");
             return 0;
         }
+        self.pass_state.register_texture_views(&views);
         self.texture_cache.insert(
             texture_id,
             TextureGpuState {
-                mtl_texture: handle,
-                mtl_texture_srgb: srgb_handle,
+                views,
                 mip_staging_buffers: vec![MipStagingBuffer::default(); staging_slots],
             },
         );
-        self.pass_state.register_srgb_twin(srgb_handle, handle);
         handle.raw()
     }
 
@@ -6904,7 +6898,7 @@ impl FrameEncoder {
         let Some(handle) = self
             .texture_cache
             .get(&job.info.texture_id)
-            .map(|state| state.mtl_texture.raw())
+            .map(|state| state.views.linear.raw())
             .filter(|handle| *handle != 0)
         else {
             return false;
@@ -7245,13 +7239,12 @@ impl FrameEncoder {
     fn rename_sampled_texture(&mut self, job: &TextureUploadJob, old_handle: u64) -> u64 {
         let info = &job.info;
         let desc = self.texture_desc_from_info(info);
-        let mut fresh = MetalHandle::<MTLTextureKind>::NULL;
-        let mut fresh_srgb = MetalHandle::<MTLTextureKind>::NULL;
+        let mut views = TextureViews::EMPTY;
         let status = self.batch_create_textures(
             core::slice::from_ref(&desc),
-            core::slice::from_mut(&mut fresh),
-            core::slice::from_mut(&mut fresh_srgb),
+            core::slice::from_mut(&mut views),
         );
+        let fresh = views.linear;
         if status != 0 || fresh.is_null() {
             error!(
                 target: LOG_TARGET,
@@ -7260,6 +7253,15 @@ impl FrameEncoder {
             );
             return old_handle;
         }
+
+        let Some(state) = self.texture_cache.get_mut(&info.texture_id) else {
+            error!(target: LOG_TARGET, "rename_sampled_texture: missing cache entry");
+            self.retire_texture_views(&views, MetalHandle::NULL);
+            return old_handle;
+        };
+        let old_views = core::mem::replace(&mut state.views, views);
+        self.pass_state.unregister_srgb_twin(old_views.srgb);
+        self.pass_state.register_texture_views(&state.views);
 
         // A cube rename replaces every face and mip, so preserve each
         // subresource except the one this job fully rewrites. A partial
@@ -7310,35 +7312,8 @@ impl FrameEncoder {
         }
         self.flags.insert(FrameEncoderFlags::BLIT_CMDS_NEED_ENCODER);
 
-        // Later draws resolve the fresh handle; the per-mip staging
-        // wrappers key on the PE-side backing and are unaffected. The sRGB
-        // twin views the storage, so it renames in lock-step: the old twin
-        // retires with the old texture and the fresh one takes its slot.
-        let mut old_srgb = MetalHandle::<MTLTextureKind>::NULL;
-        if let Some(state) = self.texture_cache.get_mut(&info.texture_id) {
-            state.mtl_texture = fresh;
-            old_srgb = state.mtl_texture_srgb;
-            state.mtl_texture_srgb = fresh_srgb;
-        }
-        self.pass_state.unregister_srgb_twin(old_srgb);
-        self.pass_state.register_srgb_twin(fresh_srgb, fresh);
-        // The old texture (and its twin view) is read by this frame's
-        // already-emitted draws — destroy only after the frame's GPU work
-        // retires.
-        for old in [old_handle, old_srgb.raw()] {
-            if old == 0 {
-                continue;
-            }
-            self.pending_resource_retention
-                .push_back(PendingResourceRetention {
-                    kind: DestroyKind::Texture,
-                    handle: old,
-                    page_box: None,
-                    staging_arc: None,
-                    seq: self.current_submit_seq,
-                    from_texture: true,
-                });
-        }
+        // Earlier commands retain their original aliases through GPU retirement.
+        self.retire_texture_views(&old_views, MetalHandle::NULL);
         self.perf.bump_texture_gpu_rename();
         fresh.raw()
     }
@@ -7361,11 +7336,11 @@ impl FrameEncoder {
             // draw, so skipping here is fine.
             return;
         };
-        if state.mtl_texture.is_null() {
+        if state.views.linear.is_null() {
             return;
         }
         self.frame_blit_commands
-            .push(BlitCommand::generate_mipmaps(state.mtl_texture.raw()));
+            .push(BlitCommand::generate_mipmaps(state.views.linear.raw()));
         self.flags.insert(FrameEncoderFlags::BLIT_CMDS_NEED_ENCODER);
     }
 
@@ -7379,15 +7354,15 @@ impl FrameEncoder {
         let Some(state) = self.texture_cache.get(&texture_id) else {
             return;
         };
-        if state.mtl_texture.is_null() {
+        if state.views.linear.is_null() {
             return;
         }
-        let handle = state.mtl_texture.raw();
+        let handle = state.views.linear.raw();
         // A render target cleared (or drawn) without a following draw leaves the
         // clear stashed as a pending load-action; materialize it onto the (still
         // current) attachment first so the regen reads the cleared level 0.
         self.pass_state.flush_pending_clears();
-        self.pass_state.note_texture_read(state.mtl_texture);
+        self.pass_state.note_texture_read(state.views.linear);
         self.end_current_pass("autogen_rt_regen");
         self.push_stretch_rect_blit(BlitCommand::generate_mipmaps(handle));
     }
@@ -8192,29 +8167,16 @@ impl FrameEncoder {
             // on request.
             usage_flags: TextureUsage::empty(),
         };
-        let mut handle = MetalHandle::<MTLTextureKind>::NULL;
-        let mut srgb_handle = MetalHandle::<MTLTextureKind>::NULL;
+        let mut views = TextureViews::EMPTY;
         let status = self.batch_create_textures(
             core::slice::from_ref(&desc),
-            core::slice::from_mut(&mut handle),
-            core::slice::from_mut(&mut srgb_handle),
+            core::slice::from_mut(&mut views),
         );
+        let handle = views.linear;
         if status != 0 || handle.is_null() {
             return 0;
         }
-        if !srgb_handle.is_null() {
-            // The quad samples the linear view; the eager twin has no reader
-            // here, so retire it rather than leave it registered.
-            self.pending_resource_retention
-                .push_back(PendingResourceRetention {
-                    kind: DestroyKind::Texture,
-                    handle: srgb_handle.raw(),
-                    page_box: None,
-                    staging_arc: None,
-                    seq: self.current_submit_seq,
-                    from_texture: true,
-                });
-        }
+        self.retire_texture_views(&views, handle);
         if !self.dc_write_back_scratch.is_null() {
             self.pending_resource_retention
                 .push_back(PendingResourceRetention {
@@ -8231,6 +8193,21 @@ impl FrameEncoder {
         handle.raw()
     }
 
+    /// Queue each owned view once, except a handle transferred to a scratch cache.
+    fn retire_texture_views(&mut self, views: &TextureViews, keep: MetalHandle<MTLTextureKind>) {
+        for handle in views.owned_handles().filter(|&handle| handle != keep) {
+            self.pending_resource_retention
+                .push_back(PendingResourceRetention {
+                    kind: DestroyKind::Texture,
+                    handle: handle.raw(),
+                    page_box: None,
+                    staging_arc: None,
+                    seq: self.current_submit_seq,
+                    from_texture: true,
+                });
+        }
+    }
+
     /// Remove a texture from the cache and park its Metal handles on the retention queue.
     ///
     /// The `MTLTexture` + every per-mip staging `MTLBuffer` wrapper go on
@@ -8244,8 +8221,7 @@ impl FrameEncoder {
     pub fn destroy_cached_texture(&mut self, texture_id: TextureId) {
         if let Some(state) = self.texture_cache.remove(&texture_id) {
             let seq = self.current_submit_seq;
-            let mtl_texture = state.mtl_texture;
-            self.pass_state.unregister_srgb_twin(state.mtl_texture_srgb);
+            self.pass_state.unregister_srgb_twin(state.views.srgb);
             // `into_iter` so each slot's `keepalive` Arc moves into the
             // retention entry — the `MTLBuffer` wrapper must outlive
             // the page-backing it wraps via `bytesNoCopy`.
@@ -8262,28 +8238,7 @@ impl FrameEncoder {
                         });
                 }
             }
-            if !mtl_texture.is_null() {
-                self.pending_resource_retention
-                    .push_back(PendingResourceRetention {
-                        kind: DestroyKind::Texture,
-                        handle: mtl_texture.raw(),
-                        page_box: None,
-                        staging_arc: None,
-                        seq,
-                        from_texture: true,
-                    });
-            }
-            if !state.mtl_texture_srgb.is_null() {
-                self.pending_resource_retention
-                    .push_back(PendingResourceRetention {
-                        kind: DestroyKind::Texture,
-                        handle: state.mtl_texture_srgb.raw(),
-                        page_box: None,
-                        staging_arc: None,
-                        seq,
-                        from_texture: true,
-                    });
-            }
+            self.retire_texture_views(&state.views, MetalHandle::NULL);
         }
     }
 
@@ -8396,12 +8351,7 @@ impl FrameEncoder {
                     buffers.push(slot.handle.raw());
                 }
             }
-            if !state.mtl_texture.is_null() {
-                textures.push(state.mtl_texture.raw());
-            }
-            if !state.mtl_texture_srgb.is_null() {
-                textures.push(state.mtl_texture_srgb.raw());
-            }
+            textures.extend(state.views.owned_handles().map(MetalHandle::raw));
         }
 
         let pipelines: Vec<u64> = self.pipeline_cache.values().map(|h| h.raw()).collect();

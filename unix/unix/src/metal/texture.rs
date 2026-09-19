@@ -6,6 +6,7 @@ use mtld3d_shared::{
         TextureCreateFlags, TextureUsage,
     },
     mtl_handle::{MTLCommandQueueKind, MTLDepthStencilStateKind, MTLDeviceKind, MTLTextureKind},
+    texture_views::TextureViews,
 };
 use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_metal::{
@@ -153,9 +154,18 @@ fn srgb_twin_view(
     swizzle: MTLTextureSwizzleChannels,
     label: &str,
 ) -> u64 {
-    let Some(srgb_format) = format.srgb_twin() else {
-        return 0;
-    };
+    srgb_twin_view_native(texture, format, levels, slices, swizzle, label).map_or(0, mint)
+}
+
+fn srgb_twin_view_native(
+    texture: &ProtocolObject<dyn MTLTexture>,
+    format: PixelFormat,
+    levels: usize,
+    slices: usize,
+    swizzle: MTLTextureSwizzleChannels,
+    label: &str,
+) -> Option<Retained<ProtocolObject<dyn MTLTexture>>> {
+    let srgb_format = format.srgb_twin()?;
     // SAFETY: objc2 typed binding; `texture` is live and the ranges match
     // the descriptor it was created with.
     let view = unsafe {
@@ -203,11 +213,11 @@ fn srgb_twin_view(
              D3DRS_SRGBWRITEENABLE on this target encodes in the pixel shader, before the \
              blender",
         );
-        return 0;
+        return None;
     };
     let srgb_label = objc2_foundation::NSString::from_str(&format!("{label}-srgb"));
     view.setLabel(Some(&srgb_label));
-    mint(view)
+    Some(view)
 }
 
 /// The contents a fresh colour texture starts with.
@@ -683,17 +693,13 @@ pub const fn mtl_blend_factor(wire: WireBlendFactor) -> MTLBlendFactor {
 /// per element; same call shape used by both load-phase warmup batches
 /// and one-off lazy creates.
 ///
-/// Returns `(handle, srgb_handle)`: the texture (or its swizzle view) plus
-/// the eagerly-created sRGB twin view when the format has one
-/// (`PixelFormat::srgb_twin`), else 0. The draw-time bind picks the twin
-/// when the stage's sampler has `D3DSAMP_SRGBTEXTURE=1`, giving the
-/// hardware sRGB→linear decode D3D9 promises for that state, and the render
-/// pass attaches it in place of the base texture under
-/// `D3DRS_SRGBWRITEENABLE`, giving the post-blend encode.
+/// Attachment roles remain renderable; sampling roles carry the descriptor's
+/// channel swizzle. The sRGB roles share storage with their linear counterparts.
+/// Each distinct non-null returned handle owns one canonical retain.
 pub fn create_texture(
     device: &ProtocolObject<dyn MTLDevice>,
     desc: &TextureCreateDesc,
-) -> Option<(u64, u64)> {
+) -> Option<TextureViews> {
     let mtl_format = mtl_pixel_format(desc.pixel_format);
     let is_depth = is_depth_pixel_format(desc.pixel_format);
 
@@ -768,91 +774,169 @@ pub fn create_texture(
     };
     let label = objc2_foundation::NSString::from_str(&label_str);
 
-    // sRGB twin view, created eagerly for every colour format that has one so
-    // the draw-time bind can honour `D3DSAMP_SRGBTEXTURE=1` without a
-    // mid-frame crossing.
-    // The twin mirrors the base handle's swizzle (when the base is handed out
-    // as a swizzle view below) so the two views only ever differ in transfer
-    // function. A render target never takes the swizzle branch, so the twin
-    // of one carries the identity swizzle and stays legal as a colour
-    // attachment; a view inherits its base texture's usage, so the twin of a
-    // render target is render-targetable too.
-    let srgb_handle = if is_depth {
-        0
-    } else {
-        let base_is_swizzle_view =
-            !is_render_target && desc.flags.contains(TextureCreateFlags::HAS_SWIZZLE);
-        let swizzle = if base_is_swizzle_view {
-            MTLTextureSwizzleChannels {
-                red: mtl_texture_swizzle(desc.swizzle_r),
-                green: mtl_texture_swizzle(desc.swizzle_g),
-                blue: mtl_texture_swizzle(desc.swizzle_b),
-                alpha: mtl_texture_swizzle(desc.swizzle_a),
-            }
-        } else {
-            IDENTITY_SWIZZLE
-        };
-        srgb_twin_view(
-            &texture,
-            desc.pixel_format,
-            desc.levels as usize,
-            if desc.flags.contains(TextureCreateFlags::TYPE_CUBE) {
-                6
-            } else {
-                1
-            },
-            swizzle,
-            &label_str,
-        )
-    };
-
-    // Swizzle views don't apply to depth formats — depth shaders sample
-    // via the `depth2d<float>` MSL type which returns a single channel.
-    //
-    // Render targets are excluded too: Metal forbids `RenderTarget` usage on a
-    // texture view that carries a non-identity swizzle (you cannot render
-    // *through* a channel swizzle), so the view silently drops to `ShaderRead`
-    // only. Handing that view back as the texture's handle then fails render-
-    // pass validation the moment it is bound as a colour attachment (e.g. an
-    // `X8R8G8B8` `D3DUSAGE_RENDERTARGET` surface, whose swizzle just forces the
-    // X channel to read as alpha=1 when *sampled*). For a render target the
-    // base texture is bound directly; the sample-time alpha fixup is sacrificed
-    // (X8 render targets sampling their own alpha is an undefined-value corner
-    // of D3D9), which is the right trade against a hard validation/UB crash.
-    if !is_depth && !is_render_target && desc.flags.contains(TextureCreateFlags::HAS_SWIZZLE) {
-        let swizzle_channels = MTLTextureSwizzleChannels {
+    texture.setLabel(Some(&label));
+    let has_swizzle = !is_depth && desc.flags.contains(TextureCreateFlags::HAS_SWIZZLE);
+    let swizzle = if has_swizzle {
+        MTLTextureSwizzleChannels {
             red: mtl_texture_swizzle(desc.swizzle_r),
             green: mtl_texture_swizzle(desc.swizzle_g),
             blue: mtl_texture_swizzle(desc.swizzle_b),
             alpha: mtl_texture_swizzle(desc.swizzle_a),
-        };
-        // SAFETY: objc2 typed binding; `texture` is the freshly retained
-        // texture above; levels/slices ranges match its descriptor.
-        let view = unsafe {
-            texture.newTextureViewWithPixelFormat_textureType_levels_slices_swizzle(
-                mtl_format,
-                texture.textureType(),
-                objc2_foundation::NSRange::new(0, desc.levels as usize),
-                objc2_foundation::NSRange::new(
-                    0,
+        }
+    } else {
+        IDENTITY_SWIZZLE
+    };
+    assemble_texture_views(
+        texture,
+        is_render_target,
+        has_swizzle,
+        |texture, srgb| {
+            required_sample_view(
+                texture,
+                if srgb {
+                    desc.pixel_format
+                        .srgb_twin()
+                        .expect("sRGB attachment format")
+                } else {
+                    desc.pixel_format
+                },
+                swizzle,
+                &label_str,
+            )
+        },
+        |texture| {
+            if is_depth {
+                None
+            } else {
+                srgb_twin_view_native(
+                    texture,
+                    desc.pixel_format,
+                    desc.levels as usize,
                     if desc.flags.contains(TextureCreateFlags::TYPE_CUBE) {
                         6
                     } else {
                         1
                     },
-                ),
-                swizzle_channels,
-            )
-        };
-        if let Some(view) = view {
-            view.setLabel(Some(&label));
-            return Some((mint(view), srgb_handle));
+                    if is_render_target {
+                        IDENTITY_SWIZZLE
+                    } else {
+                        swizzle
+                    },
+                    &label_str,
+                )
+            }
+        },
+    )
+}
+
+/// Build all required roles before any canonical retain escapes.
+///
+/// Constructors stay at the creation boundary so failure drops every temporary
+/// owner. Optional sRGB refusal leaves a linear sampling fallback; required
+/// sampling refusal fails the whole resource.
+fn assemble_texture_views(
+    texture: Retained<ProtocolObject<dyn MTLTexture>>,
+    is_render_target: bool,
+    has_swizzle: bool,
+    mut sample_view: impl FnMut(
+        &ProtocolObject<dyn MTLTexture>,
+        bool,
+    ) -> Option<Retained<ProtocolObject<dyn MTLTexture>>>,
+    srgb_view: impl FnOnce(
+        &ProtocolObject<dyn MTLTexture>,
+    ) -> Option<Retained<ProtocolObject<dyn MTLTexture>>>,
+) -> Option<TextureViews> {
+    let sample = if has_swizzle {
+        Some(sample_view(&texture, false)?)
+    } else {
+        None
+    };
+    let srgb = srgb_view(&texture);
+    let sample_srgb = if is_render_target && has_swizzle {
+        if let Some(view) = srgb.as_ref() {
+            Some(sample_view(view, true)?)
+        } else {
+            None
         }
+    } else {
+        None
+    };
+    // Required views are created before any canonical retain escapes. Failure
+    // above drops all native owners, including an optional sRGB attachment.
+    let native = if is_render_target {
+        [Some(texture), srgb, sample, sample_srgb]
+    } else {
+        [Some(sample.unwrap_or(texture)), srgb, None, None]
+    };
+    Some(mint_texture_views(native))
+}
+
+/// Create a sampling-only view without changing the allocation's usage.
+fn required_sample_view(
+    texture: &ProtocolObject<dyn MTLTexture>,
+    format: PixelFormat,
+    swizzle: MTLTextureSwizzleChannels,
+    label: &str,
+) -> Option<Retained<ProtocolObject<dyn MTLTexture>>> {
+    let slices = if texture.textureType() == MTLTextureType::TypeCube {
+        6
+    } else {
+        1
+    };
+    // SAFETY: the retained source supplies its own level and slice extents;
+    // the compatible format and channel mapping are its creation descriptor's.
+    let view = unsafe {
+        texture.newTextureViewWithPixelFormat_textureType_levels_slices_swizzle(
+            mtl_pixel_format(format),
+            texture.textureType(),
+            objc2_foundation::NSRange::new(0, texture.mipmapLevelCount()),
+            objc2_foundation::NSRange::new(0, slices),
+            swizzle,
+        )
+    };
+    let Some(view) = view else {
+        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+            "{label}: Metal declined the required {format:?} sampling view; texture creation failed");
+        return None;
+    };
+    view.setLabel(Some(&objc2_foundation::NSString::from_str(&format!(
+        "{label}-sample"
+    ))));
+    Some(view)
+}
+
+/// Transfer one canonical retain per distinct native object.
+fn mint_texture_views(
+    native: [Option<Retained<ProtocolObject<dyn MTLTexture>>>; 4],
+) -> TextureViews {
+    let mut handles = [MetalHandle::<MTLTextureKind>::NULL; 4];
+    for (index, texture) in native.into_iter().enumerate() {
+        let Some(texture) = texture else { continue };
+        let raw = Retained::as_ptr(&texture).cast::<core::ffi::c_void>() as usize as u64;
+        handles[index] = if let Some(&existing) = handles[..index].iter().find(|h| h.raw() == raw) {
+            // The new native owner is dropped; the earlier role already owns
+            // the object's canonical retain and the ledger records it once.
+            existing
+        } else {
+            // SAFETY: mint transfers this retained MTLTexture's canonical
+            // retain to the returned bundle and records it in the ledger.
+            unsafe { MetalHandle::new(mint(texture)) }
+        };
     }
-
-    texture.setLabel(Some(&label));
-
-    Some((mint(texture), srgb_handle))
+    TextureViews {
+        linear: handles[0],
+        srgb: handles[1],
+        sample_linear: if handles[2].is_null() {
+            handles[0]
+        } else {
+            handles[2]
+        },
+        sample_srgb: if handles[3].is_null() {
+            handles[1]
+        } else {
+            handles[3]
+        },
+    }
 }
 
 /// Create a single-slice, 2D view of one array slice of a texture.

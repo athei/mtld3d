@@ -3327,10 +3327,12 @@ fn a_replaced_backbuffer_view_retires_the_old_registration() {
         replacement,
         "the fresh view takes the slot",
     );
-    assert!(
-        !s.srgb_twin_to_base.contains_key(&backbuffer_srgb()),
-        "the retired view no longer names a base",
+    assert_eq!(
+        s.texture_view_to_base.get(&backbuffer_srgb()),
+        Some(&backbuffer())
     );
+    s.unregister_texture(backbuffer_srgb());
+    assert!(!s.texture_view_to_base.contains_key(&backbuffer_srgb()));
 }
 
 /// A retired depth handle stops being sampleable, so its address can be reused.
@@ -4286,11 +4288,10 @@ fn srgb_twin_bind_marks_the_base_texture_sampled() {
             s.seen_sampled_textures.contains(&twin),
             "{stage:?}: reset_frame must preserve the session-wide view read"
         );
-        // After the twin is unregistered (texture destroyed/renamed), a stray
-        // bind of the stale handle no longer implicates the base.
+        // Detaching an attachment preserves identity for queued sampling commands.
         s.unregister_srgb_twin(twin);
         s.emit_command(stale_bind);
-        assert!(!s.texture_sampled_this_frame(base), "{stage:?}");
+        assert!(s.texture_sampled_this_frame(base), "{stage:?}");
         assert!(
             s.seen_sampled_textures.contains(&base),
             "{stage:?}: unregistering the view mapping does not retire either texture"
@@ -5503,4 +5504,82 @@ fn rule_h_keeps_fill_changes_outside_removed_color_clear() {
             TriangleFillMode::Lines as u32
         ]
     );
+}
+
+#[test]
+fn sampling_alias_never_becomes_an_srgb_attachment_and_retires_before_reuse() {
+    for (stage, bind) in sampler_binds(0x7E12) {
+        let mut s = fresh();
+        let base = tex(0x7E10);
+        let attachment = tex(0x7E11);
+        let sample = tex(0x7E12);
+        s.register_srgb_twin(attachment, base);
+        s.register_texture_view(sample, base);
+        assert_eq!(s.twin_of(base), attachment);
+        s.emit_command(bind);
+        assert!(s.texture_sampled_this_frame(base), "{stage:?}");
+        s.unregister_srgb_twin(attachment);
+        assert_eq!(s.twin_of(base), MetalHandle::NULL);
+        assert_eq!(s.texture_view_to_base.get(&sample), Some(&base));
+        s.unregister_texture(sample);
+        s.unregister_texture(attachment);
+        s.unregister_texture(base);
+        assert!(!s.texture_view_to_base.contains_key(&sample));
+        assert!(!s.texture_view_to_base.contains_key(&attachment));
+        for (_, bind) in sampler_binds(sample.raw()) {
+            s.emit_command(bind);
+        }
+        assert!(
+            !s.texture_sampled_this_frame(base),
+            "{stage:?}: address reuse"
+        );
+    }
+}
+
+#[test]
+fn released_sampling_alias_preserves_stores_and_clear_coalescing() {
+    for (stage, _) in sampler_binds(0x4002) {
+        for clear_only in [false, true] {
+            let rt = tex(0x4000);
+            let srgb = tex(0x4001);
+            let sample = tex(0x4002);
+            let mut s = fresh();
+            s.register_srgb_twin(srgb, rt);
+            s.register_texture_view(sample, rt);
+            s.set_color_render_target(rt, 256, 256, RT_FORMAT, RenderScale::IDENTITY);
+            s.clear_color(1, 2, 3, 4);
+            if !clear_only {
+                s.emit_command(dummy_draw());
+            }
+            s.set_color_render_target(tex(0x5000), 256, 256, RT_FORMAT, RenderScale::IDENTITY);
+            let bind = sampler_binds(sample.raw())
+                .into_iter()
+                .find(|(candidate, _)| *candidate == stage)
+                .expect("stage")
+                .1;
+            s.emit_command(bind);
+            s.emit_command(dummy_draw());
+            s.set_color_render_target(rt, 256, 256, RT_FORMAT, RenderScale::IDENTITY);
+            if !clear_only {
+                s.clear_color(5, 6, 7, 8);
+            }
+            s.emit_command(dummy_draw());
+            s.end_current_pass("test");
+            // Release/rename detaches attachment selection before pass finalization.
+            s.unregister_srgb_twin(srgb);
+            s.coalesce_clear_only_passes();
+            s.finalize_load_actions();
+            s.finalize_store_actions(false);
+            assert_eq!(s.passes().len(), 3, "{stage:?}, clear-only={clear_only}");
+            assert_eq!(
+                s.passes()[0].color_store(),
+                StoreAction::Store,
+                "{stage:?}, clear-only={clear_only}"
+            );
+            s.unregister_texture(sample);
+            s.unregister_texture(srgb);
+            s.unregister_texture(rt);
+            assert!(!s.texture_view_to_base.contains_key(&sample));
+        }
+    }
 }
