@@ -292,3 +292,62 @@ fn union_with_a_contained_rect_is_the_outer_one() {
     assert_eq!(outer.union(inner), outer);
     assert_eq!(inner.union(outer), outer);
 }
+
+#[test]
+fn mip_scaling_rounds_outward_before_block_alignment_and_clipping() {
+    let rect = DirtyRect {
+        x: 3,
+        y: 5,
+        w: 8,
+        h: 10,
+    };
+    let mip = rect.next_mip();
+    assert_eq!(
+        mip,
+        DirtyRect {
+            x: 1,
+            y: 2,
+            w: 5,
+            h: 6
+        }
+    );
+    assert_eq!(
+        mip.next_mip(),
+        DirtyRect {
+            x: 0,
+            y: 1,
+            w: 3,
+            h: 3
+        }
+    );
+    assert_eq!(
+        mip.clip_to_level(5, 7, 4, 4),
+        Some(DirtyRect {
+            x: 0,
+            y: 0,
+            w: 5,
+            h: 7
+        })
+    );
+    assert_eq!(
+        DirtyRect {
+            x: 64,
+            y: 0,
+            w: 1,
+            h: 1
+        }
+        .next_mip()
+        .clamp(32, 16),
+        None
+    );
+    assert_eq!(
+        DirtyRect {
+            x: 1,
+            y: 1,
+            w: 1,
+            h: 1
+        }
+        .next_mip(),
+        DirtyRect::full(1, 1)
+    );
+}

@@ -4633,3 +4633,382 @@ fn plain_depth_textures_preserve_the_gpu_only_resource_contract() {
         }
     }
 }
+
+/// Managed CPU edits without publication preserve the previously sampled image.
+#[test]
+fn managed_dirty_no_dirty_and_readonly_visibility() {
+    const RED: u32 = 0xFFFF_0000;
+    const GREEN: u32 = 0xFF00_FF00;
+    let h = Harness::new();
+    let mut observed = Vec::new();
+    for flags in [D3DLOCK_READONLY, D3DLOCK_NO_DIRTY_UPDATE] {
+        let tex = h.create_texture(64, 64, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED);
+        tex.lock_rect(0, 0).write_u32(&[RED; 64 * 64]);
+        assert_pixel_eq(sample_center(&h, &tex).to_pixel(), RED, "initialized");
+        // The previous pixel read has retired the upload. This intentionally
+        // writes through READONLY to mirror Wine's managed visibility test.
+        tex.lock_rect(0, flags).write_u32(&[GREEN; 64 * 64]);
+        let cpu = tex.lock_rect(0, D3DLOCK_READONLY).as_u32(1)[0];
+        let gpu = sample_center(&h, &tex).to_pixel();
+        observed.push((cpu, gpu));
+    }
+    assert_eq!(observed, vec![(GREEN, RED), (GREEN, RED)]);
+}
+
+/// Explicit publication after an unannounced CPU edit must narrow the upload.
+#[test]
+fn managed_dirty_add_dirty_rect_publication() {
+    const RED: u32 = 0xFFFF_0000;
+    const GREEN: u32 = 0xFF00_FF00;
+    let h = Harness::new();
+    let tex = h.create_texture(64, 64, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED);
+    tex.lock_rect(0, 0).write_u32(&[RED; 64 * 64]);
+    assert_pixel_eq(sample_center(&h, &tex).to_pixel(), RED, "initialized");
+    tex.lock_rect(0, D3DLOCK_NO_DIRTY_UPDATE)
+        .write_u32(&[GREEN; 64 * 64]);
+    assert_pixel_eq(
+        sample_center(&h, &tex).to_pixel(),
+        RED,
+        "unannounced CPU edit",
+    );
+    assert_eq!(tex.add_dirty_rect_partial(&[16, 16, 48, 48]), 0);
+    let partial = (
+        sample_center(&h, &tex).to_pixel(),
+        sample_at(&h, &tex, 40, 30).to_pixel(),
+    );
+    assert_eq!(tex.add_dirty_rect(), 0);
+    let full = (
+        sample_center(&h, &tex).to_pixel(),
+        sample_at(&h, &tex, 40, 30).to_pixel(),
+    );
+    assert_eq!((partial, full), ((GREEN, RED), (GREEN, GREEN)));
+}
+
+/// Initialization and eviction use the CPU image even without dirty updates.
+#[test]
+fn managed_dirty_initial_and_evicted_image() {
+    const RED: u32 = 0xFFFF_0000;
+    const GREEN: u32 = 0xFF00_FF00;
+    let h = Harness::new();
+    for flags in [D3DLOCK_READONLY, D3DLOCK_NO_DIRTY_UPDATE] {
+        let tex = h.create_texture(64, 64, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED);
+        tex.lock_rect(0, flags).write_u32(&[RED; 64 * 64]);
+        assert_pixel_eq(
+            sample_center(&h, &tex).to_pixel(),
+            RED,
+            "initial dirty image",
+        );
+        tex.lock_rect(0, flags).write_u32(&[GREEN; 64 * 64]);
+        assert_eq!(h.evict_managed_resources(), 0);
+        let gpu = sample_center(&h, &tex).to_pixel();
+        assert_pixel_eq(gpu, GREEN, "eviction republishes CPU image");
+    }
+}
+
+/// Independent mip pages are enough to reproduce explicit publication failure.
+#[test]
+fn managed_dirty_independent_mip_publication() {
+    const RED: u32 = 0xFFFF_0000;
+    const BLUE: u32 = 0xFF00_00FF;
+    const GREEN: u32 = 0xFF00_FF00;
+    let h = Harness::new();
+    assert_eq!(h.set_sampler_state(0, D3DSAMP_MIPFILTER, D3DTEXF_POINT), 0);
+    let tex = h.create_texture(64, 64, 2, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED);
+    tex.lock_rect(0, 0).write_u32(&[RED; 64 * 64]);
+    tex.lock_rect(1, 0).write_u32(&[BLUE; 32 * 32]);
+    for (level, expected) in [(0, RED), (1, BLUE)] {
+        assert_eq!(h.set_sampler_state(0, D3DSAMP_MAXMIPLEVEL, level), 0);
+        assert_pixel_eq(
+            sample_center(&h, &tex).to_pixel(),
+            expected,
+            "initialized mip",
+        );
+    }
+    tex.lock_rect(0, D3DLOCK_READONLY)
+        .write_u32(&[GREEN; 64 * 64]);
+    tex.lock_rect(1, D3DLOCK_READONLY)
+        .write_u32(&[GREEN; 32 * 32]);
+    assert_eq!(tex.add_dirty_rect(), 0);
+    let mut observed = Vec::new();
+    for level in 0..2 {
+        assert_eq!(h.set_sampler_state(0, D3DSAMP_MAXMIPLEVEL, level), 0);
+        observed.push(sample_center(&h, &tex).to_pixel());
+    }
+    assert_eq!(observed, vec![GREEN, GREEN]);
+}
+
+/// Draw on either side of an unannounced edit while the first upload is queued.
+fn managed_dirty_queued_edit(partial: bool, publish: bool) -> [u32; 2] {
+    const RED: u32 = 0xFFFF_0000;
+    const GREEN: u32 = 0xFF00_FF00;
+    let h = Harness::new();
+    let tex = h.create_texture(64, 64, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED);
+    tex.lock_rect(0, 0).write_u32(&[RED; 64 * 64]);
+    let mut left = bind_for_quadrant_draws(&h, &tex);
+    for vertex in &mut left {
+        vertex.x = vertex.x.midpoint(-1.0);
+        vertex.u = 0.25;
+        vertex.v = 0.5;
+    }
+    let mut right = fullscreen_quad();
+    for vertex in &mut right {
+        vertex.x = vertex.x.midpoint(1.0);
+        vertex.u = 0.25;
+        vertex.v = 0.5;
+    }
+    h.render_once(BLACK, |d| {
+        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &left), 0);
+        if partial {
+            let locked = tex.lock_rect_partial(0, &[0, 0, 32, 64], D3DLOCK_NO_DIRTY_UPDATE);
+            fill_locked_rect(&locked, 32, 64, GREEN);
+        } else {
+            tex.lock_rect(0, D3DLOCK_NO_DIRTY_UPDATE)
+                .write_u32(&[GREEN; 64 * 64]);
+        }
+        if publish {
+            assert_eq!(tex.add_dirty_rect(), 0);
+        }
+        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &right), 0);
+        assert_eq!(d.clear_texture(0), 0);
+        // Queued uploads and draw snapshots must survive the last API owner.
+        drop(tex);
+    });
+    [h.read_pixel(160, 240), h.read_pixel(480, 240)]
+}
+
+#[test]
+fn managed_dirty_queued_full_no_dirty_visibility() {
+    assert_eq!(managed_dirty_queued_edit(false, false), [0xFFFF_0000; 2]);
+}
+
+#[test]
+fn managed_dirty_queued_full_explicit_publication() {
+    assert_eq!(
+        managed_dirty_queued_edit(false, true),
+        [0xFFFF_0000, 0xFF00_FF00]
+    );
+}
+
+#[test]
+fn managed_dirty_queued_partial_kept_exception() {
+    let observed = managed_dirty_queued_edit(true, false);
+    // Current partial-lock policy intentionally aliases the earlier upload's
+    // backing. Old pixels are not a guaranteed contract for this overlap.
+    assert!(matches!(observed[0], 0xFFFF_0000 | 0xFF00_FF00));
+    assert_eq!(observed[1], 0xFF00_FF00);
+}
+
+/// A no-dirty write neither clears an older dirty region nor expands it.
+#[test]
+fn managed_dirty_preserves_pending_publication_regions() {
+    const RED: u32 = 0xFFFF_0000;
+    const GREEN: u32 = 0xFF00_FF00;
+    const BLUE: u32 = 0xFF00_00FF;
+    let h = Harness::new();
+    for whole in [false, true] {
+        let tex = h.create_texture(64, 64, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED);
+        tex.lock_rect(0, 0).write_u32(&[RED; 64 * 64]);
+        assert_pixel_eq(sample_center(&h, &tex).to_pixel(), RED, "initialized");
+        if whole {
+            tex.lock_rect(0, 0).write_u32(&[GREEN; 64 * 64]);
+        } else {
+            fill_locked_rect(&tex.lock_rect_partial(0, &[0, 0, 32, 64], 0), 32, 64, GREEN);
+        }
+        fill_locked_rect(
+            &tex.lock_rect_partial(0, &[32, 0, 64, 64], D3DLOCK_NO_DIRTY_UPDATE),
+            32,
+            64,
+            BLUE,
+        );
+        assert_pixel_eq(
+            sample_at(&h, &tex, 160, 240).to_pixel(),
+            GREEN,
+            "older dirty region",
+        );
+        assert_pixel_eq(
+            sample_at(&h, &tex, 480, 240).to_pixel(),
+            if whole { BLUE } else { RED },
+            "no-dirty keeps prior coverage",
+        );
+    }
+}
+
+/// Initial dirtiness and surface-level publication use the same managed image.
+#[test]
+fn managed_dirty_initial_partial_lock_and_surface_publication() {
+    const RED: u32 = 0xFFFF_0000;
+    const GREEN: u32 = 0xFF00_FF00;
+    let h = Harness::new();
+    let tex = h.create_texture(64, 64, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED);
+    // Initialize the full CPU image before narrowing the first no-dirty lock.
+    tex.lock_rect(0, D3DLOCK_READONLY)
+        .write_u32(&[RED; 64 * 64]);
+    fill_locked_rect(
+        &tex.lock_rect_partial(0, &[0, 0, 32, 64], D3DLOCK_NO_DIRTY_UPDATE),
+        32,
+        64,
+        GREEN,
+    );
+    assert_pixel_eq(
+        sample_at(&h, &tex, 160, 240).to_pixel(),
+        GREEN,
+        "initial edited pixels",
+    );
+    assert_pixel_eq(
+        sample_at(&h, &tex, 480, 240).to_pixel(),
+        RED,
+        "initial unedited pixels",
+    );
+    tex.surface_level(0)
+        .lock_rect(D3DLOCK_NO_DIRTY_UPDATE)
+        .write_u32(&[RED; 64 * 64]);
+    assert_pixel_eq(
+        sample_at(&h, &tex, 160, 240).to_pixel(),
+        GREEN,
+        "surface no-dirty stays CPU-side",
+    );
+    assert_eq!(tex.add_dirty_rect(), 0);
+    assert_pixel_eq(
+        sample_at(&h, &tex, 160, 240).to_pixel(),
+        RED,
+        "surface edit explicitly published",
+    );
+    assert_eq!(h.reset(640, 480), 0);
+    assert_pixel_eq(
+        sample_center(&h, &tex).to_pixel(),
+        RED,
+        "managed pixels survive reset",
+    );
+}
+
+/// Odd mip rectangles round outward without publishing unrelated pixels.
+#[test]
+fn managed_dirty_partial_publication_scales_across_independent_mips() {
+    const RED: u32 = 0xFFFF_0000;
+    const GREEN: u32 = 0xFF00_FF00;
+    let h = Harness::new();
+    let tex = h.create_texture(65, 33, 3, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED);
+    assert_eq!(h.set_sampler_state(0, D3DSAMP_MIPFILTER, D3DTEXF_POINT), 0);
+    for level in 0..3 {
+        let (w, height) = (65 >> level, 33 >> level);
+        fill_locked_rect(&tex.lock_rect(level, 0), w, height, RED);
+    }
+    assert_pixel_eq(
+        sample_center(&h, &tex).to_pixel(),
+        RED,
+        "initial chain upload",
+    );
+    for level in 0..3 {
+        fill_locked_rect(
+            &tex.lock_rect(level, D3DLOCK_NO_DIRTY_UPDATE),
+            65 >> level,
+            33 >> level,
+            GREEN,
+        );
+    }
+    assert_eq!(tex.add_dirty_rect_partial(&[17, 9, 47, 25]), 0);
+    for level in 0..3 {
+        assert_eq!(h.set_sampler_state(0, D3DSAMP_MAXMIPLEVEL, level), 0);
+        assert_pixel_eq(
+            sample_texel(&h, &tex, 0.5, 0.5),
+            GREEN,
+            "scaled published rectangle",
+        );
+        assert_pixel_eq(
+            sample_texel(&h, &tex, 0.05, 0.05),
+            RED,
+            "outside scaled rectangle",
+        );
+    }
+}
+
+/// Managed explicit publication regenerates AUTOGEN's hidden GPU levels.
+#[test]
+fn managed_dirty_autogen_rebuilds_only_after_publication() {
+    const RED: u32 = 0xFFFF_0000;
+    const GREEN: u32 = 0xFF00_FF00;
+    let h = Harness::new();
+    let tex = h.create_texture(
+        64,
+        64,
+        0,
+        D3DUSAGE_AUTOGENMIPMAP,
+        D3DFMT_A8R8G8B8,
+        D3DPOOL_MANAGED,
+    );
+    tex.lock_rect(0, 0).write_u32(&[RED; 64 * 64]);
+    assert_eq!(h.set_sampler_state(0, D3DSAMP_MIPFILTER, D3DTEXF_POINT), 0);
+    assert_eq!(h.set_sampler_state(0, D3DSAMP_MAXMIPLEVEL, 4), 0);
+    assert_pixel_eq(
+        sample_center(&h, &tex).to_pixel(),
+        RED,
+        "initial generated mip",
+    );
+    tex.lock_rect(0, D3DLOCK_NO_DIRTY_UPDATE)
+        .write_u32(&[GREEN; 64 * 64]);
+    assert_pixel_eq(
+        sample_center(&h, &tex).to_pixel(),
+        RED,
+        "hidden mip stays unchanged",
+    );
+    assert_eq!(tex.add_dirty_rect(), 0);
+    assert_pixel_eq(
+        sample_center(&h, &tex).to_pixel(),
+        GREEN,
+        "published base regenerates hidden mip",
+    );
+}
+
+/// Other pools retain their established no-dirty behavior.
+#[test]
+fn managed_dirty_change_preserves_other_pool_contracts() {
+    const RED: u32 = 0xFFFF_0000;
+    const GREEN: u32 = 0xFF00_FF00;
+    let h = Harness::new();
+    let dynamic = h.create_texture(
+        64,
+        64,
+        1,
+        D3DUSAGE_DYNAMIC,
+        D3DFMT_A8R8G8B8,
+        D3DPOOL_DEFAULT,
+    );
+    dynamic.lock_rect(0, 0).write_u32(&[RED; 64 * 64]);
+    assert_pixel_eq(
+        sample_center(&h, &dynamic).to_pixel(),
+        RED,
+        "dynamic initial",
+    );
+    dynamic
+        .lock_rect(0, D3DLOCK_NO_DIRTY_UPDATE)
+        .write_u32(&[GREEN; 64 * 64]);
+    assert_pixel_eq(
+        sample_center(&h, &dynamic).to_pixel(),
+        GREEN,
+        "dynamic no-dirty still uploads",
+    );
+    let src = h.create_texture(64, 64, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM);
+    let dst = h.create_texture(64, 64, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT);
+    src.lock_rect(0, 0).write_u32(&[RED; 64 * 64]);
+    assert_eq!(h.update_texture_hr(&src, &dst), 0);
+    assert_pixel_eq(
+        sample_center(&h, &dst).to_pixel(),
+        RED,
+        "initial source copy",
+    );
+    src.lock_rect(0, D3DLOCK_NO_DIRTY_UPDATE)
+        .write_u32(&[GREEN; 64 * 64]);
+    assert_eq!(h.update_texture_hr(&src, &dst), 0);
+    assert_pixel_eq(
+        sample_center(&h, &dst).to_pixel(),
+        RED,
+        "clean source is not recopied",
+    );
+    assert_eq!(src.add_dirty_rect(), 0);
+    assert_eq!(h.update_texture_hr(&src, &dst), 0);
+    assert_pixel_eq(
+        sample_center(&h, &dst).to_pixel(),
+        GREEN,
+        "explicit source metadata still works",
+    );
+}

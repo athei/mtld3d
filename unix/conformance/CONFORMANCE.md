@@ -1016,14 +1016,19 @@ none of these fire on the Apple family, and a real Intel/AMD Mac is expected
 to read zero here.
 
 ### visual.c/add_dirty_rect_test
-Sites: 19210=expected 19217=expected 19232=expected
+Sites: 19210=bug 19217=bug 19232=bug
 
-The surviving sites require STALE data to be shown: a NO_DIRTY_UPDATE lock
-must NOT be uploaded (19210/19217), and after AddDirtyRect only the dirty
-sub-rect may refresh (19232). Our design uploads whole mips eagerly with
-self-tracked dirtiness and treats AddDirtyRect as a no-op — we show fresher
-data than required. Deliberate; the READONLY-first-lock upload defect that
-used to live here (19156/19163) is fixed.
+Managed 2D textures retain their sampled image after a NO_DIRTY_UPDATE lock
+(19210/19217) until an explicit publication. AddDirtyRect publishes its region
+across the application mip levels (19232), using the existing partial-upload
+path. Initial contents and eviction still publish the CPU image. READONLY
+adds no publication after initialization.
+
+The earlier eager-publication rationale no longer applies to this path.
+Separate policies remain: mip staging is independently allocated, dirty
+rectangles union to one bounding box per mip, and overlapping partial locks
+may modify bytes an earlier queued upload still reads. This change neither
+adds exact disjoint-region tracking nor changes that partial-lock policy.
 
 ### visual.c/test_multisample_get_front_buffer_data
 Sites: 17167=expected 17169=expected 17179=expected 17181=expected
