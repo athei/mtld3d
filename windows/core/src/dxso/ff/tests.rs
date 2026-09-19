@@ -1841,3 +1841,134 @@ fn modulate_alpha_add_color_constant_rows_follow_effective_binary_arguments() {
         assert!(!key.stages[1].reads_argument(D3DTA_CONSTANT));
     }
 }
+
+#[test]
+fn modulate_color_add_alpha_unbound_operands_keep_ordinary_fallback_source() {
+    use mtld3d_types::{
+        D3DTA_COMPLEMENT, D3DTA_CURRENT, D3DTA_TFACTOR, D3DTOP_MODULATECOLOR_ADDALPHA,
+    };
+    for (arg1, arg2) in [
+        (D3DTA_TEXTURE, D3DTA_DIFFUSE),
+        (D3DTA_DIFFUSE, D3DTA_TEXTURE),
+        (D3DTA_TEXTURE | D3DTA_COMPLEMENT, D3DTA_DIFFUSE),
+        (D3DTA_DIFFUSE, D3DTA_TEXTURE | D3DTA_ALPHAREPLICATE),
+        (
+            D3DTA_TEXTURE | D3DTA_COMPLEMENT | D3DTA_ALPHAREPLICATE,
+            D3DTA_DIFFUSE,
+        ),
+    ] {
+        let mut key = default_ps_key();
+        key.stages[0] = FfStage {
+            color_op: narrow(D3DTOP_MODULATECOLOR_ADDALPHA),
+            color_arg1: narrow(arg1),
+            color_arg2: narrow(arg2),
+            alpha_op: narrow(D3DTOP_SELECTARG1),
+            alpha_arg1: narrow(D3DTA_TFACTOR),
+            ..FfStage::default()
+        };
+        let fallback = emit_ps_ff(&key, VariantKey::default());
+        assert!(!fallback.contains("[[texture("));
+        assert!(!fallback.contains("[[sampler("));
+        key.stages[0].color_op = narrow(D3DTOP_SELECTARG1);
+        key.stages[0].color_arg1 = narrow(D3DTA_CURRENT);
+        assert_eq!(fallback, emit_ps_ff(&key, VariantKey::default()));
+    }
+}
+
+#[test]
+fn modulate_color_add_alpha_nontexture_inputs_add_no_sampler_or_uniform() {
+    use mtld3d_types::{D3DTA_COMPLEMENT, D3DTA_CURRENT, D3DTOP_MODULATECOLOR_ADDALPHA};
+    let mut key = default_ps_key();
+    key.stages[0] = FfStage {
+        color_op: narrow(D3DTOP_MODULATECOLOR_ADDALPHA),
+        color_arg1: narrow(D3DTA_DIFFUSE | D3DTA_COMPLEMENT),
+        color_arg2: narrow(D3DTA_CURRENT),
+        alpha_op: narrow(D3DTOP_SELECTARG1),
+        alpha_arg1: narrow(D3DTA_DIFFUSE),
+        ..FfStage::default()
+    };
+    let msl = emit_ps_ff(&key, VariantKey::default());
+    assert!(!msl.contains("[[texture("));
+    assert!(!msl.contains("[[sampler("));
+    assert!(!key.reads_texture_factor());
+    assert_eq!(key.sampled_stage_mask(), 0);
+    assert!(msl.contains("saturate((1.0 - in.color0) * current + ((1.0 - in.color0)).a)"));
+}
+
+#[test]
+fn modulate_color_add_alpha_constant_rows_follow_effective_binary_arguments() {
+    use mtld3d_types::{D3DTA_CONSTANT, D3DTA_CURRENT, D3DTOP_MODULATECOLOR_ADDALPHA};
+    for (arg1, arg2) in [
+        (D3DTA_CONSTANT, D3DTA_CURRENT),
+        (D3DTA_CURRENT, D3DTA_CONSTANT),
+    ] {
+        let mut key = default_ps_key();
+        key.stages[0] = FfStage {
+            color_op: narrow(D3DTOP_SELECTARG1),
+            color_arg1: narrow(D3DTA_DIFFUSE),
+            alpha_op: narrow(D3DTOP_SELECTARG1),
+            alpha_arg1: narrow(D3DTA_DIFFUSE),
+            ..FfStage::default()
+        };
+        key.stages[1] = FfStage {
+            color_op: narrow(D3DTOP_MODULATECOLOR_ADDALPHA),
+            color_arg1: narrow(arg1),
+            color_arg2: narrow(arg2),
+            alpha_op: narrow(D3DTOP_SELECTARG1),
+            alpha_arg1: narrow(D3DTA_CURRENT),
+            ..FfStage::default()
+        };
+        assert_eq!(key.constant_rows(), 3);
+        assert!(key.stages[1].reads_argument(D3DTA_CONSTANT));
+        // Explicit missing textures short-circuit the complete color operation.
+        if arg1 == D3DTA_CONSTANT {
+            key.stages[1].color_arg2 = narrow(D3DTA_TEXTURE);
+        } else {
+            key.stages[1].color_arg1 = narrow(D3DTA_TEXTURE);
+        }
+        assert_eq!(key.constant_rows(), 0);
+        assert!(!key.stages[1].reads_argument(D3DTA_CONSTANT));
+    }
+}
+
+#[test]
+fn modulate_color_add_alpha_dependency_extent_keeps_alpha_and_factor_policy() {
+    use mtld3d_types::{D3DTA_CONSTANT, D3DTA_TFACTOR, D3DTOP_MODULATECOLOR_ADDALPHA};
+    let mut key = default_ps_key();
+    let stage = FfStage {
+        color_op: narrow(D3DTOP_MODULATECOLOR_ADDALPHA),
+        color_arg1: narrow(D3DTA_DIFFUSE),
+        color_arg2: narrow(D3DTA_CURRENT),
+        alpha_op: narrow(D3DTOP_SELECTARG1),
+        alpha_arg1: narrow(D3DTA_CURRENT),
+        ..FfStage::default()
+    };
+    key.stages[0] = stage;
+    key.stages[1] = stage;
+    assert_eq!(key.constant_rows(), 0);
+    key.stages[1].color_arg1 = narrow(D3DTA_CONSTANT);
+    assert_eq!(key.constant_rows(), 3);
+    key.stages[1].color_arg2 = narrow(D3DTA_TEXTURE);
+    assert_eq!(key.constant_rows(), 0);
+    key.stages[1].alpha_arg1 = narrow(D3DTA_CONSTANT);
+    assert_eq!(key.constant_rows(), 3, "independent alpha remains live");
+    key.stages[1].alpha_arg1 = narrow(D3DTA_TFACTOR);
+    assert_eq!(key.constant_rows(), 1);
+    key.stages[1].alpha_arg1 = narrow(D3DTA_CURRENT);
+    key.stages[1].color_arg1 = narrow(D3DTA_TFACTOR);
+    assert_eq!(
+        key.constant_rows(),
+        1,
+        "texture-factor capture stays conservative"
+    );
+    let msl = emit_ps_ff(&key, VariantKey::default());
+    assert!(
+        !msl.contains("ps_c[0]"),
+        "suppressed factor has no expression"
+    );
+    key.stages[1].color_arg2 = narrow(D3DTA_CURRENT);
+    assert_eq!(key.constant_rows(), 1, "live factor uses only row zero");
+    key.stages[1].color_arg1 = narrow(D3DTA_CONSTANT);
+    key.stages[0] = stage_disable();
+    assert_eq!(key.constant_rows(), 0, "disabled cascade ends dependencies");
+}

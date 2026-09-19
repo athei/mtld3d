@@ -259,6 +259,7 @@ const TEXOP_DEFAULT: TexOpCaps = TexOpCaps::DISABLE
     .union(TexOpCaps::MODULATE2X)
     .union(TexOpCaps::MODULATE4X)
     .union(TexOpCaps::MODULATEALPHA_ADDCOLOR)
+    .union(TexOpCaps::MODULATECOLOR_ADDALPHA)
     .union(TexOpCaps::ADD)
     .union(TexOpCaps::ADDSIGNED)
     .union(TexOpCaps::ADDSIGNED2X)

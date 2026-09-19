@@ -11,7 +11,8 @@ divergences from D3D9 it keeps on purpose. The tested games are in the
   disk by content hash.
 - The fixed-function pipeline: lighting, texture-coordinate generation, the
   texture-stage cascade (CURRENT/TEMP registers, per-stage constants,
-  DOTPRODUCT3 color and alpha, MODULATEALPHA_ADDCOLOR and premultiplied
+  DOTPRODUCT3 color and alpha, MODULATEALPHA_ADDCOLOR,
+  MODULATECOLOR_ADDALPHA and premultiplied
   texture-alpha blending), vertex blending and range-based
   vertex fog. Table fog supports Z and W sources with LINEAR,
   EXP and EXP2; SM3 shaders own their fog.
