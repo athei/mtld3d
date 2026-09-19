@@ -317,7 +317,9 @@ mod source;
 /// `75` adds Fetch4 gather, alpha-channel and raw DF depth-channel masks.
 ///
 /// `76` adds the canonical fixed-function vertex range-fog flag.
-pub const SHADER_CACHE_SCHEMA_VERSION: u32 = 76;
+///
+/// `77` adds the fixed-function TEMP register and packed result destination.
+pub const SHADER_CACHE_SCHEMA_VERSION: u32 = 77;
 
 /// Source-derived identity of MSL emission, independent of persistent DXSO and shader keys.
 pub const SHADER_EMITTER_VERSION: u64 = include!(concat!(env!("OUT_DIR"), "/emitter_version.rs"));

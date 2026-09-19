@@ -96,6 +96,8 @@ windows/core/src/dxso/emit.rs VariantKey Clone,Copy,Debug,Default,PartialEq,Eq,H
 windows/core/src/dxso/emit.rs VsSamplerKinds Clone,Copy,Debug,Default,PartialEq,Eq,Hash
 windows/core/src/dxso/ff.rs FfPsKey Clone,Debug,PartialEq,Eq,Hash
 windows/core/src/dxso/ff.rs FfStage Clone,Copy,Debug,Default,PartialEq,Eq,Hash
+windows/core/src/dxso/ff.rs FfStageFlags Clone,Copy,Debug,Default,PartialEq,Eq,Hash
+windows/core/src/dxso/ff.rs FfStageResult Clone,Copy,Debug,PartialEq,Eq
 windows/core/src/dxso/ff.rs FfVsFlags Clone,Copy,Debug,PartialEq,Eq,Hash
 windows/core/src/dxso/ff.rs FfVsKey Clone,Debug,PartialEq,Eq,Hash
 windows/core/src/dxso/ff.rs MatColorFlags Clone,Copy,Debug,Default,PartialEq,Eq

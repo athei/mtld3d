@@ -1058,3 +1058,327 @@ fn dotproduct3_signed_clamp_and_argument_modifiers() {
         }
     }
 }
+
+// TEMP is a fragment-local register shared by the fixed-function stage cascade.
+fn temp_probe_stage(h: &Harness, stage: u32, color: u32, alpha: u32, result: u32) {
+    use mtld3d_types::D3DTSS_RESULTARG;
+    for (state, value) in [
+        (D3DTSS_COLOROP, D3DTOP_SELECTARG1),
+        (D3DTSS_COLORARG1, color),
+        (D3DTSS_ALPHAOP, D3DTOP_SELECTARG1),
+        (D3DTSS_ALPHAARG1, alpha),
+        (D3DTSS_RESULTARG, result),
+    ] {
+        assert_eq!(h.set_texture_stage_state(stage, state, value), 0);
+    }
+}
+
+fn temp_probe_pixel(h: &Harness, diffuse: u32) -> u32 {
+    assert_eq!(h.set_render_state(D3DRS_LIGHTING, 0), 0);
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1), 0);
+    h.render_once(BLACK, |d| {
+        assert_eq!(
+            d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad(diffuse)),
+            0
+        );
+    });
+    h.read_pixel(320, 240) & 0x00ff_ffff
+}
+
+#[test]
+fn texture_stage_temp_zero_initialization() {
+    use mtld3d_types::{D3DTA_ALPHAREPLICATE, D3DTA_COMPLEMENT, D3DTA_CURRENT, D3DTA_TEMP};
+    let h = Harness::new();
+    temp_probe_stage(&h, 0, D3DTA_TEMP, D3DTA_TEMP, D3DTA_CURRENT);
+    assert_eq!(
+        temp_probe_pixel(&h, 0xff12_3456),
+        0,
+        "TEMP starts with zero RGB"
+    );
+    temp_probe_stage(
+        &h,
+        0,
+        D3DTA_TEMP | D3DTA_ALPHAREPLICATE | D3DTA_COMPLEMENT,
+        D3DTA_TEMP,
+        D3DTA_CURRENT,
+    );
+    assert_eq!(
+        temp_probe_pixel(&h, 0xff12_3456),
+        0x00ff_ffff,
+        "TEMP starts with zero alpha"
+    );
+}
+
+#[test]
+fn texture_stage_temp_preserves_current() {
+    use mtld3d_types::{D3DTA_CURRENT, D3DTA_TEMP};
+    let h = Harness::new();
+    assert_eq!(h.set_render_state(D3DRS_TEXTUREFACTOR, 0x2010_2030), 0);
+    temp_probe_stage(&h, 0, D3DTA_DIFFUSE, D3DTA_DIFFUSE, D3DTA_CURRENT);
+    temp_probe_stage(&h, 1, D3DTA_TFACTOR, D3DTA_TFACTOR, D3DTA_TEMP);
+    temp_probe_stage(&h, 2, D3DTA_CURRENT, D3DTA_CURRENT, D3DTA_CURRENT);
+    assert_eq!(h.set_texture_stage_state(2, D3DTSS_COLOROP, D3DTOP_ADD), 0);
+    assert_eq!(
+        h.set_texture_stage_state(2, D3DTSS_COLORARG2, D3DTA_TEMP),
+        0
+    );
+    assert_eq!(
+        temp_probe_pixel(&h, 0x4020_4060),
+        0x0030_6090,
+        "TEMP write preserves CURRENT"
+    );
+}
+
+#[test]
+fn texture_stage_temp_preserves_temp_and_resultarg_invalidation() {
+    use mtld3d_types::{D3DTA_CURRENT, D3DTA_TEMP, D3DTSS_RESULTARG};
+    let h = Harness::new();
+    assert_eq!(h.set_render_state(D3DRS_TEXTUREFACTOR, 0x2010_2030), 0);
+    temp_probe_stage(&h, 0, D3DTA_TFACTOR, D3DTA_TFACTOR, D3DTA_TEMP);
+    temp_probe_stage(&h, 1, D3DTA_DIFFUSE, D3DTA_DIFFUSE, D3DTA_CURRENT);
+    temp_probe_stage(&h, 2, D3DTA_TEMP, D3DTA_TEMP, D3DTA_CURRENT);
+    assert_eq!(
+        temp_probe_pixel(&h, 0x4020_4060),
+        0x0010_2030,
+        "CURRENT write preserves TEMP"
+    );
+    assert_eq!(
+        h.set_texture_stage_state(1, D3DTSS_RESULTARG, D3DTA_TEMP),
+        0
+    );
+    assert_eq!(
+        temp_probe_pixel(&h, 0x4020_4060),
+        0x0020_4060,
+        "RESULTARG alone selects a new shader"
+    );
+    assert_eq!(
+        h.set_texture_stage_state(1, D3DTSS_RESULTARG, D3DTA_CURRENT),
+        0
+    );
+    assert_eq!(
+        temp_probe_pixel(&h, 0x4020_4060),
+        0x0010_2030,
+        "restored destination reuses the right shader"
+    );
+    assert_eq!(h.set_texture_stage_state(1, D3DTSS_RESULTARG, 0x105), 0);
+    assert_eq!(h.texture_stage_state(1, D3DTSS_RESULTARG), 0x105);
+    assert_eq!(
+        temp_probe_pixel(&h, 0x4020_4060),
+        0x0010_2030,
+        "invalid RESULTARG keeps its raw getter value but renders the CURRENT default"
+    );
+}
+
+#[test]
+fn texture_stage_temp_same_stage_read_before_write_and_modifiers() {
+    use mtld3d_types::{D3DTA_ALPHAREPLICATE, D3DTA_COMPLEMENT, D3DTA_CURRENT, D3DTA_TEMP};
+    let h = Harness::new();
+    assert_eq!(h.set_render_state(D3DRS_TEXTUREFACTOR, 0x4020_4060), 0);
+    temp_probe_stage(&h, 0, D3DTA_TFACTOR, D3DTA_TFACTOR, D3DTA_TEMP);
+    temp_probe_stage(
+        &h,
+        1,
+        D3DTA_TEMP | D3DTA_ALPHAREPLICATE,
+        D3DTA_TEMP | D3DTA_COMPLEMENT,
+        D3DTA_TEMP,
+    );
+    temp_probe_stage(&h, 2, D3DTA_TEMP, D3DTA_TEMP, D3DTA_CURRENT);
+    assert_eq!(
+        temp_probe_pixel(&h, 0xff00_0000),
+        0x0040_4040,
+        "color reads old TEMP alpha before alpha write"
+    );
+    assert_eq!(
+        h.set_texture_stage_state(2, D3DTSS_COLORARG1, D3DTA_TEMP | D3DTA_ALPHAREPLICATE),
+        0
+    );
+    assert_eq!(
+        temp_probe_pixel(&h, 0xff00_0000),
+        0x00bf_bfbf,
+        "alpha complement writes TEMP alpha"
+    );
+}
+
+#[test]
+fn texture_stage_temp_stateblock_destinations_restore_pixels() {
+    use mtld3d_types::{
+        D3DSBT_ALL, D3DSBT_PIXELSTATE, D3DTA_CURRENT, D3DTA_TEMP, D3DTSS_RESULTARG,
+    };
+    let h = Harness::new();
+    for block_type in [D3DSBT_ALL, D3DSBT_PIXELSTATE] {
+        assert_eq!(h.set_render_state(D3DRS_TEXTUREFACTOR, 0xff10_2030), 0);
+        temp_probe_stage(&h, 0, D3DTA_TFACTOR, D3DTA_TFACTOR, D3DTA_TEMP);
+        temp_probe_stage(&h, 1, D3DTA_DIFFUSE, D3DTA_DIFFUSE, D3DTA_TEMP);
+        temp_probe_stage(&h, 2, D3DTA_TEMP, D3DTA_TEMP, D3DTA_CURRENT);
+        let block = h.create_state_block(block_type);
+        assert_eq!(temp_probe_pixel(&h, 0xff20_4060), 0x0020_4060);
+        assert_eq!(
+            h.set_texture_stage_state(1, D3DTSS_RESULTARG, D3DTA_CURRENT),
+            0
+        );
+        assert_eq!(temp_probe_pixel(&h, 0xff20_4060), 0x0010_2030);
+        assert_eq!(block.apply(), 0);
+        assert_eq!(h.texture_stage_state(1, D3DTSS_RESULTARG), D3DTA_TEMP);
+        assert_eq!(temp_probe_pixel(&h, 0xff20_4060), 0x0020_4060);
+    }
+}
+
+#[test]
+fn texture_stage_temp_recorded_destination_does_not_change_live_state() {
+    use mtld3d_types::{D3DTA_CURRENT, D3DTA_TEMP, D3DTSS_RESULTARG};
+    let h = Harness::new();
+    assert_eq!(h.set_render_state(D3DRS_TEXTUREFACTOR, 0xff10_2030), 0);
+    temp_probe_stage(&h, 0, D3DTA_TFACTOR, D3DTA_TFACTOR, D3DTA_TEMP);
+    temp_probe_stage(&h, 1, D3DTA_DIFFUSE, D3DTA_DIFFUSE, D3DTA_CURRENT);
+    temp_probe_stage(&h, 2, D3DTA_TEMP, D3DTA_TEMP, D3DTA_CURRENT);
+    assert_eq!(h.begin_state_block(), 0);
+    assert_eq!(
+        h.set_texture_stage_state(1, D3DTSS_RESULTARG, D3DTA_TEMP),
+        0
+    );
+    let block = h.end_state_block();
+    assert_eq!(h.texture_stage_state(1, D3DTSS_RESULTARG), D3DTA_CURRENT);
+    assert_eq!(temp_probe_pixel(&h, 0xff20_4060), 0x0010_2030);
+    assert_eq!(block.apply(), 0);
+    assert_eq!(h.texture_stage_state(1, D3DTSS_RESULTARG), D3DTA_TEMP);
+    assert_eq!(temp_probe_pixel(&h, 0xff20_4060), 0x0020_4060);
+}
+
+#[test]
+fn texture_stage_temp_draw_initialization_and_reset_defaults() {
+    use mtld3d_types::{D3DTA_CURRENT, D3DTA_TEMP, D3DTOP_DISABLE, D3DTSS_RESULTARG};
+    let h = Harness::new();
+    temp_probe_stage(&h, 0, D3DTA_DIFFUSE, D3DTA_DIFFUSE, D3DTA_TEMP);
+    temp_probe_stage(&h, 1, D3DTA_TEMP, D3DTA_TEMP, D3DTA_CURRENT);
+    assert_eq!(temp_probe_pixel(&h, 0xff20_4060), 0x0020_4060);
+    temp_probe_stage(&h, 0, D3DTA_TEMP, D3DTA_TEMP, D3DTA_CURRENT);
+    assert_eq!(
+        h.set_texture_stage_state(1, D3DTSS_COLOROP, D3DTOP_DISABLE),
+        0
+    );
+    assert_eq!(
+        temp_probe_pixel(&h, 0xff20_4060),
+        0,
+        "TEMP is not retained between draws"
+    );
+    assert_eq!(
+        h.set_texture_stage_state(7, D3DTSS_RESULTARG, D3DTA_TEMP),
+        0
+    );
+    assert_eq!(h.reset(640, 480), 0);
+    for stage in 0..8 {
+        assert_eq!(
+            h.texture_stage_state(stage, D3DTSS_RESULTARG),
+            D3DTA_CURRENT
+        );
+    }
+    temp_probe_stage(&h, 0, D3DTA_TEMP, D3DTA_TEMP, D3DTA_CURRENT);
+    assert_eq!(temp_probe_pixel(&h, 0xff20_4060), 0);
+}
+
+#[test]
+fn texture_stage_temp_second_arguments_and_texture_binding() {
+    use mtld3d_types::{
+        D3DTA_ALPHAREPLICATE, D3DTA_COMPLEMENT, D3DTA_CURRENT, D3DTA_TEMP, D3DTSS_ALPHAARG2,
+    };
+    let h = Harness::new();
+    let tex = solid_texture(&h, 0x4020_4060);
+    assert_eq!(h.set_texture(0, &tex), 0);
+    temp_probe_stage(&h, 0, D3DTA_TEXTURE, D3DTA_TEXTURE, D3DTA_TEMP);
+    temp_probe_stage(&h, 1, D3DTA_DIFFUSE, D3DTA_DIFFUSE, D3DTA_TEMP);
+    for (state, value) in [
+        (D3DTSS_COLOROP, D3DTOP_SELECTARG2),
+        (D3DTSS_ALPHAOP, D3DTOP_SELECTARG2),
+        (D3DTSS_COLORARG2, D3DTA_TEMP | D3DTA_COMPLEMENT),
+        (D3DTSS_ALPHAARG2, D3DTA_TEMP | D3DTA_COMPLEMENT),
+    ] {
+        assert_eq!(h.set_texture_stage_state(1, state, value), 0);
+    }
+    temp_probe_stage(&h, 2, D3DTA_TEMP, D3DTA_TEMP, D3DTA_CURRENT);
+    assert_eq!(temp_probe_pixel(&h, 0x8040_2010), 0x00df_bf9f);
+    assert_eq!(
+        h.set_texture_stage_state(2, D3DTSS_COLORARG1, D3DTA_TEMP | D3DTA_ALPHAREPLICATE),
+        0
+    );
+    assert_eq!(temp_probe_pixel(&h, 0x8040_2010), 0x00bf_bfbf);
+    assert_eq!(h.clear_texture(0), 0);
+    assert_eq!(
+        temp_probe_pixel(&h, 0x8040_2010),
+        0x007f_7f7f,
+        "unbound stage selects CURRENT before writing TEMP"
+    );
+}
+
+#[test]
+fn texture_stage_temp_dotproduct3_writes_alpha_and_preserves_current() {
+    use mtld3d_types::{D3DTA_ALPHAREPLICATE, D3DTA_CURRENT, D3DTA_TEMP, D3DTOP_DOTPRODUCT3};
+    let h = Harness::new();
+    assert_eq!(h.set_render_state(D3DRS_TEXTUREFACTOR, 0x90ff_8080), 0);
+    temp_probe_stage(&h, 0, D3DTA_DIFFUSE, D3DTA_DIFFUSE, D3DTA_TEMP);
+    temp_probe_stage(&h, 1, D3DTA_TEMP, D3DTA_DIFFUSE, D3DTA_TEMP);
+    assert_eq!(
+        h.set_texture_stage_state(1, D3DTSS_COLOROP, D3DTOP_DOTPRODUCT3),
+        0
+    );
+    assert_eq!(
+        h.set_texture_stage_state(1, D3DTSS_COLORARG2, D3DTA_TFACTOR),
+        0
+    );
+    temp_probe_stage(
+        &h,
+        2,
+        D3DTA_TEMP | D3DTA_ALPHAREPLICATE,
+        D3DTA_CURRENT,
+        D3DTA_CURRENT,
+    );
+    assert_eq!(
+        temp_probe_pixel(&h, 0x20ff_8080),
+        0x00ff_ffff,
+        "effective DOT3 writes all TEMP channels, ignoring the diffuse alpha operation"
+    );
+    assert_eq!(
+        h.set_texture_stage_state(2, D3DTSS_COLORARG1, D3DTA_CURRENT),
+        0
+    );
+    assert_eq!(
+        temp_probe_pixel(&h, 0x20ff_8080),
+        0x00ff_8080,
+        "DOT3 writing TEMP preserves CURRENT"
+    );
+}
+
+#[test]
+fn texture_stage_temp_unbound_dotproduct3_color_keeps_temp_alpha_read() {
+    use mtld3d_types::{
+        D3DTA_ALPHAREPLICATE, D3DTA_COMPLEMENT, D3DTA_CURRENT, D3DTA_TEMP, D3DTOP_DOTPRODUCT3,
+    };
+    let h = Harness::new();
+    temp_probe_stage(
+        &h,
+        0,
+        D3DTA_TEXTURE,
+        D3DTA_TEMP | D3DTA_COMPLEMENT,
+        D3DTA_CURRENT,
+    );
+    assert_eq!(
+        h.set_texture_stage_state(0, D3DTSS_COLOROP, D3DTOP_DOTPRODUCT3),
+        0
+    );
+    temp_probe_stage(
+        &h,
+        1,
+        D3DTA_CURRENT | D3DTA_ALPHAREPLICATE,
+        D3DTA_CURRENT,
+        D3DTA_CURRENT,
+    );
+    assert_eq!(
+        temp_probe_pixel(&h, 0x2040_6080),
+        0x00ff_ffff,
+        "unbound color fallback leaves the valid zero-TEMP alpha operation active"
+    );
+    assert_eq!(
+        h.set_texture_stage_state(1, D3DTSS_COLORARG1, D3DTA_CURRENT),
+        0
+    );
+    assert_eq!(temp_probe_pixel(&h, 0x2040_6080), 0x0040_6080);
+}

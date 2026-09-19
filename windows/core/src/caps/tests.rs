@@ -55,6 +55,7 @@ fn primitive_misc_caps_matches_implementation() {
         | PrimitiveMiscCaps::CULLNONE
         | PrimitiveMiscCaps::CULLCW
         | PrimitiveMiscCaps::CULLCCW
+        | PrimitiveMiscCaps::TSSARGTEMP
         | PrimitiveMiscCaps::COLORWRITEENABLE
         | PrimitiveMiscCaps::CLIPTLVERTS
         | PrimitiveMiscCaps::BLENDOP
