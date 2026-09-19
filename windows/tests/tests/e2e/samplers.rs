@@ -111,6 +111,42 @@ fn fetch4_gathers_and_restores_latched_sampler_state() {
 }
 
 #[test]
+fn fetch4_ignores_single_slice_volume_textures() {
+    use mtld3d_types::{D3DFMT_L16, D3DPOOL_MANAGED, FETCH4_DISABLE, FETCH4_ENABLE};
+
+    let h = Harness::new();
+    let (hr, volume) = h.try_create_volume_texture([2, 2, 1], 1, 0, D3DFMT_L16, D3DPOOL_MANAGED);
+    assert_eq!(hr, 0);
+    let volume = volume.expect("single-slice volume");
+    volume.write_u16(0, &[0x1010, 0x2020, 0x3030, 0x4040]);
+    assert_eq!(h.set_volume_texture(0, &volume), 0);
+    h.select_texture_stage(0);
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1), 0);
+    let mut quad = uv_quad(1.0);
+    for vertex in &mut quad {
+        vertex.u = 0.125;
+        vertex.v = 0.125;
+    }
+    let shader = h.create_pixel_shader(&PS_SAMPLE_TEXTURE);
+    for programmable in [false, true] {
+        if programmable {
+            assert_eq!(h.set_pixel_shader(&shader), 0);
+        }
+        for command in [FETCH4_DISABLE, FETCH4_ENABLE] {
+            assert_eq!(h.set_sampler_state(0, D3DSAMP_MIPMAPLODBIAS, command), 0);
+            h.render_once(BLACK, |d| {
+                assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad), 0);
+            });
+            assert_eq!(
+                h.read_pixel(160, 120),
+                0xff10_1010,
+                "volume sampling: programmable={programmable}, command={command:#x}"
+            );
+        }
+    }
+}
+
+#[test]
 fn fetch4_depth_formats_keep_raw_and_comparison_channels_distinct() {
     use mtld3d_types::{
         D3DCLEAR_ZBUFFER, D3DFMT_D24S8, D3DFMT_DF16, D3DFMT_DF24, D3DFMT_INTZ, D3DPOOL_DEFAULT,

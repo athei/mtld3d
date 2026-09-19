@@ -253,7 +253,9 @@ impl StageBindings {
             self.textures[stage]
                 .as_ref()
                 .map(Direct3DTexture9::d3d_format),
-            !new_volume && !new_cube,
+            self.textures[stage].as_ref().is_some_and(|texture| {
+                texture.d3d_resource_type() == mtld3d_types::D3DRTYPE_TEXTURE
+            }),
         );
         let mut delta = TextureSwapDelta::empty();
         delta.set(
