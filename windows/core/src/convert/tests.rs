@@ -1228,3 +1228,31 @@ fn colorfill_signed_channels_are_the_nearest_code_for_every_byte() {
         }
     }
 }
+
+#[test]
+fn colorfill_a2b10g10r10_exchanges_only_red_and_blue() {
+    for color in [
+        0,
+        0xffff_ffff,
+        0x7f2b_00ff,
+        0x3f00_ff2b,
+        0x2a2a_2a2a,
+        0x2b2b_2b2b,
+        0x7f7f_7f7f,
+        0x8080_8080,
+        0xd4d4_d4d4,
+        0xd5d5_d5d5,
+    ] {
+        let before = d3dcolor_fill_pixel_bytes(color, D3DFMT_A2R10G10B10).unwrap();
+        let word = u32::from_le_bytes(before.try_into().unwrap());
+        let expected = (word & 0xc00f_fc00) | ((word & 1023) << 20) | ((word >> 20) & 1023);
+        assert_eq!(
+            d3dcolor_fill_pixel_bytes(color, D3DFMT_A2B10G10R10).unwrap(),
+            expected.to_le_bytes()
+        );
+    }
+    assert_eq!(
+        d3dcolor_fill_pixel_bytes(0x7f2b_00ff, D3DFMT_A2B10G10R10).unwrap(),
+        ((1_u32 << 30) | (1023 << 20) | 0x00ad).to_le_bytes()
+    );
+}

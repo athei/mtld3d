@@ -1408,3 +1408,28 @@ bump-map queries are rejected. Texture and cube AUTOGEN answers NOAUTOGEN
 with one physical level and the requested usage retained. ColorFill of a
 DEFAULT offscreen plain surface encodes each channel to its nearest code;
 the rounding of a Windows driver has not been measured.
+
+### A2B10G10R10 sampled textures
+
+A2B10G10R10 textures and CPU surfaces are creatable, stored as native
+RGB10A2Unorm. D3D9 packs red in the low ten bits, then green, blue and the
+two alpha bits, which is that Metal format's layout and the mirror of
+A2R10G10B10, so locks expose the native words and sampling needs no
+conversion and no view swizzle. Every lane is stored, so nothing here depends
+on the mechanism that fails the V8U8 and V16U16 rows on the `@mac2` legs.
+
+Upstream names the format twice. test_display_modes (device.c:2620) expects
+EnumAdapterModes to answer INVALIDCALL, and it still does: the format stays
+no display, back-buffer or render-target format. test_format_conversion
+(visual.c:27957) lists it in `all_formats`, where the identity pair already
+answered S_OK and every other pair accepts either answer. Neither row creates
+a resource, so there is no skip to open and no failing site moves on any leg.
+
+The format shares the A2R10G10B10 policy: render-target, sRGB and legacy
+bump-map queries are rejected, texture and cube AUTOGEN answers NOAUTOGEN
+with one physical level, MANAGED with DYNAMIC is rejected, and ColorFill of a
+DEFAULT offscreen plain surface encodes each channel to its nearest code. The
+end-to-end suite runs the A2R10G10B10 scenarios in this lane order and adds
+two witnesses of the order itself: the same word written to both formats
+samples with red and blue exchanged, and copies between the two formats are
+rejected with the destination unchanged.

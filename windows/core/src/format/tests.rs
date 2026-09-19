@@ -1194,37 +1194,51 @@ fn q16w16v16u16_rejects_srgb_write_queries_before_autogen_fallback() {
 }
 
 #[test]
-fn a2r10g10b10_uses_native_packed_storage_without_attachment_support() {
-    let format = mtld3d_types::D3DFMT_A2R10G10B10;
-    let mapping = map_d3d_format(format).expect("packed ten-bit mapping");
-    assert_eq!(mapping.metal_pixel_format(), PixelFormat::Bgr10A2Unorm);
-    assert_eq!(mapping.bytes_per_pixel(), 4);
-    assert_eq!(mapping.block_width(), 1);
-    assert_eq!(mapping.block_height(), 1);
-    assert_eq!(mapping.block_bytes(), 4);
-    assert_eq!(mapping.swizzle(), None);
-    assert!(mapping.has_alpha());
-    assert_eq!(mapping.metal_pixel_format().srgb_twin(), None);
-    assert_eq!(super::format_name(format), "A2R10G10B10");
-    assert!(super::uses_noautogen_fallback(format));
-    assert!(super::uses_strict_dynamic_pool_validation(format));
-    assert!(super::is_volume_texture_format(format));
-    assert!(!super::is_render_target_format(format));
-    assert_eq!(PixelFormat::Bgr10A2Unorm as u32, 94);
-    for filtering in [false, true] {
-        for extra in [0, D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_QUERY_FILTER] {
-            for unsupported in [D3DUSAGE_QUERY_LEGACYBUMPMAP, D3DUSAGE_QUERY_SRGBWRITE] {
-                assert!(!super::supports_usage_query(
-                    format,
-                    extra | unsupported,
-                    filtering
-                ));
+fn ten_bit_formats_use_native_packed_storage_without_attachment_support() {
+    for (format, native, name, value) in [
+        (
+            mtld3d_types::D3DFMT_A2R10G10B10,
+            PixelFormat::Bgr10A2Unorm,
+            "A2R10G10B10",
+            94,
+        ),
+        (
+            mtld3d_types::D3DFMT_A2B10G10R10,
+            PixelFormat::Rgb10A2Unorm,
+            "A2B10G10R10",
+            90,
+        ),
+    ] {
+        let mapping = map_d3d_format(format).expect("packed ten-bit mapping");
+        assert_eq!(mapping.metal_pixel_format(), native);
+        assert_eq!(mapping.bytes_per_pixel(), 4);
+        assert_eq!(mapping.block_width(), 1);
+        assert_eq!(mapping.block_height(), 1);
+        assert_eq!(mapping.block_bytes(), 4);
+        assert_eq!(mapping.swizzle(), None);
+        assert!(mapping.has_alpha());
+        assert_eq!(mapping.metal_pixel_format().srgb_twin(), None);
+        assert_eq!(super::format_name(format), name);
+        assert!(super::uses_noautogen_fallback(format));
+        assert!(super::uses_strict_dynamic_pool_validation(format));
+        assert!(super::is_volume_texture_format(format));
+        assert!(!super::is_render_target_format(format));
+        assert_eq!(native as u32, value);
+        for filtering in [false, true] {
+            for extra in [0, D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_QUERY_FILTER] {
+                for unsupported in [D3DUSAGE_QUERY_LEGACYBUMPMAP, D3DUSAGE_QUERY_SRGBWRITE] {
+                    assert!(!super::supports_usage_query(
+                        format,
+                        extra | unsupported,
+                        filtering
+                    ));
+                }
             }
+            assert!(super::supports_usage_query(
+                format,
+                D3DUSAGE_QUERY_FILTER,
+                filtering
+            ));
         }
-        assert!(super::supports_usage_query(
-            format,
-            D3DUSAGE_QUERY_FILTER,
-            filtering
-        ));
     }
 }

@@ -270,6 +270,7 @@ pub const D3DFMT_X8R8G8B8: u32 = 22;
 pub const D3DFMT_A8B8G8R8: u32 = 32;
 pub const D3DFMT_X8B8G8R8: u32 = 33;
 pub const D3DFMT_G16R16: u32 = 34;
+pub const D3DFMT_A2B10G10R10: u32 = 31;
 pub const D3DFMT_A2R10G10B10: u32 = 35;
 pub const D3DFMT_A16B16G16R16: u32 = 36;
 pub const D3DFMT_A4R4G4B4: u32 = 26;

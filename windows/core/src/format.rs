@@ -1,21 +1,21 @@
 use log::warn;
 use mtld3d_shared::mtl::{PixelFormat, Swizzle};
 use mtld3d_types::{
-    D3DFMT_A1R5G5B5, D3DFMT_A2R10G10B10, D3DFMT_A4R4G4B4, D3DFMT_A8, D3DFMT_A8B8G8R8, D3DFMT_A8L8,
-    D3DFMT_A8R8G8B8, D3DFMT_A16B16G16R16, D3DFMT_A16B16G16R16F, D3DFMT_A32B32G32R32F, D3DFMT_ATI1,
-    D3DFMT_D15S1, D3DFMT_D16, D3DFMT_D16_LOCKABLE, D3DFMT_D24FS8, D3DFMT_D24S8, D3DFMT_D24X4S4,
-    D3DFMT_D24X8, D3DFMT_D32, D3DFMT_D32F_LOCKABLE, D3DFMT_DF16, D3DFMT_DF24, D3DFMT_DXT1,
-    D3DFMT_DXT2, D3DFMT_DXT3, D3DFMT_DXT4, D3DFMT_DXT5, D3DFMT_G16R16, D3DFMT_G16R16F,
-    D3DFMT_G32R32F, D3DFMT_INTZ, D3DFMT_L8, D3DFMT_L16, D3DFMT_NV12, D3DFMT_Q8W8V8U8,
-    D3DFMT_Q16W16V16U16, D3DFMT_R5G6B5, D3DFMT_R8G8B8, D3DFMT_R16F, D3DFMT_R32F, D3DFMT_UYVY,
-    D3DFMT_V8U8, D3DFMT_V16U16, D3DFMT_X1R5G5B5, D3DFMT_X8B8G8R8, D3DFMT_X8R8G8B8, D3DFMT_YUY2,
-    D3DFMT_YV12, D3DRTYPE_CUBETEXTURE, D3DRTYPE_INDEXBUFFER, D3DRTYPE_SURFACE, D3DRTYPE_TEXTURE,
-    D3DRTYPE_VERTEXBUFFER, D3DRTYPE_VOLUME, D3DRTYPE_VOLUMETEXTURE, D3DUSAGE_AUTOGENMIPMAP,
-    D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_DMAP, D3DUSAGE_DONOTCLIP, D3DUSAGE_DYNAMIC, D3DUSAGE_NPATCHES,
-    D3DUSAGE_POINTS, D3DUSAGE_QUERY_FILTER, D3DUSAGE_QUERY_LEGACYBUMPMAP,
-    D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING, D3DUSAGE_QUERY_SRGBREAD, D3DUSAGE_QUERY_SRGBWRITE,
-    D3DUSAGE_QUERY_VERTEXTEXTURE, D3DUSAGE_QUERY_WRAPANDMIP, D3DUSAGE_RENDERTARGET,
-    D3DUSAGE_RTPATCHES, D3DUSAGE_SOFTWAREPROCESSING,
+    D3DFMT_A1R5G5B5, D3DFMT_A2B10G10R10, D3DFMT_A2R10G10B10, D3DFMT_A4R4G4B4, D3DFMT_A8,
+    D3DFMT_A8B8G8R8, D3DFMT_A8L8, D3DFMT_A8R8G8B8, D3DFMT_A16B16G16R16, D3DFMT_A16B16G16R16F,
+    D3DFMT_A32B32G32R32F, D3DFMT_ATI1, D3DFMT_D15S1, D3DFMT_D16, D3DFMT_D16_LOCKABLE,
+    D3DFMT_D24FS8, D3DFMT_D24S8, D3DFMT_D24X4S4, D3DFMT_D24X8, D3DFMT_D32, D3DFMT_D32F_LOCKABLE,
+    D3DFMT_DF16, D3DFMT_DF24, D3DFMT_DXT1, D3DFMT_DXT2, D3DFMT_DXT3, D3DFMT_DXT4, D3DFMT_DXT5,
+    D3DFMT_G16R16, D3DFMT_G16R16F, D3DFMT_G32R32F, D3DFMT_INTZ, D3DFMT_L8, D3DFMT_L16, D3DFMT_NV12,
+    D3DFMT_Q8W8V8U8, D3DFMT_Q16W16V16U16, D3DFMT_R5G6B5, D3DFMT_R8G8B8, D3DFMT_R16F, D3DFMT_R32F,
+    D3DFMT_UYVY, D3DFMT_V8U8, D3DFMT_V16U16, D3DFMT_X1R5G5B5, D3DFMT_X8B8G8R8, D3DFMT_X8R8G8B8,
+    D3DFMT_YUY2, D3DFMT_YV12, D3DRTYPE_CUBETEXTURE, D3DRTYPE_INDEXBUFFER, D3DRTYPE_SURFACE,
+    D3DRTYPE_TEXTURE, D3DRTYPE_VERTEXBUFFER, D3DRTYPE_VOLUME, D3DRTYPE_VOLUMETEXTURE,
+    D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_DMAP, D3DUSAGE_DONOTCLIP,
+    D3DUSAGE_DYNAMIC, D3DUSAGE_NPATCHES, D3DUSAGE_POINTS, D3DUSAGE_QUERY_FILTER,
+    D3DUSAGE_QUERY_LEGACYBUMPMAP, D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING, D3DUSAGE_QUERY_SRGBREAD,
+    D3DUSAGE_QUERY_SRGBWRITE, D3DUSAGE_QUERY_VERTEXTEXTURE, D3DUSAGE_QUERY_WRAPANDMIP,
+    D3DUSAGE_RENDERTARGET, D3DUSAGE_RTPATCHES, D3DUSAGE_SOFTWAREPROCESSING,
 };
 
 use super::LOG_TARGET;
@@ -157,6 +157,7 @@ pub const fn format_name(d3d_format: u32) -> &'static str {
         D3DFMT_A32B32G32R32F => "A32B32G32R32F",
         D3DFMT_ATI1 => "ATI1",
         D3DFMT_V8U8 => "V8U8",
+        D3DFMT_A2B10G10R10 => "A2B10G10R10",
         D3DFMT_A2R10G10B10 => "A2R10G10B10",
         D3DFMT_V16U16 => "V16U16",
         D3DFMT_Q8W8V8U8 => "Q8W8V8U8",
@@ -286,7 +287,11 @@ pub const fn is_mapped_color_format(d3d_format: u32) -> bool {
 pub const fn uses_strict_dynamic_pool_validation(d3d_format: u32) -> bool {
     matches!(
         d3d_format,
-        D3DFMT_V16U16 | D3DFMT_Q8W8V8U8 | D3DFMT_Q16W16V16U16 | D3DFMT_A2R10G10B10
+        D3DFMT_V16U16
+            | D3DFMT_Q8W8V8U8
+            | D3DFMT_Q16W16V16U16
+            | D3DFMT_A2R10G10B10
+            | D3DFMT_A2B10G10R10
     )
 }
 
@@ -299,7 +304,11 @@ pub const fn uses_strict_dynamic_pool_validation(d3d_format: u32) -> bool {
 pub const fn uses_noautogen_fallback(d3d_format: u32) -> bool {
     matches!(
         d3d_format,
-        D3DFMT_V16U16 | D3DFMT_Q8W8V8U8 | D3DFMT_Q16W16V16U16 | D3DFMT_A2R10G10B10
+        D3DFMT_V16U16
+            | D3DFMT_Q8W8V8U8
+            | D3DFMT_Q16W16V16U16
+            | D3DFMT_A2R10G10B10
+            | D3DFMT_A2B10G10R10
     )
 }
 
@@ -472,9 +481,9 @@ pub const fn is_render_target_format_device(d3d_format: u32, native_packed16: bo
 /// advertised either way.
 ///
 /// V16U16, Q8W8V8U8 and Q16W16V16U16 reject sRGB-write queries even without
-/// a render-target bit. A2R10G10B10 rejects sRGB-write and legacy bump-map
-/// queries. Other usage policy stays with the caller; the float family is
-/// colour-renderable on both GPU families.
+/// a render-target bit. A2R10G10B10 and A2B10G10R10 reject sRGB-write and
+/// legacy bump-map queries. Other usage policy stays with the caller; the
+/// float family is colour-renderable on both GPU families.
 #[must_use]
 pub const fn supports_usage_query(d3d_format: u32, usage: u32, float32_filtering: bool) -> bool {
     // These signed sampling formats have no sRGB write representation.
@@ -487,9 +496,10 @@ pub const fn supports_usage_query(d3d_format: u32, usage: u32, float32_filtering
     {
         return false;
     }
-    // A2R10G10B10 has no sRGB twin and is no bump-map format, and neither
-    // answer may turn into the NOAUTOGEN success of a combined query.
-    if d3d_format == D3DFMT_A2R10G10B10
+    // The packed ten-bit formats have no sRGB twin and are no bump-map
+    // formats, and neither answer may turn into the NOAUTOGEN success of a
+    // combined query.
+    if matches!(d3d_format, D3DFMT_A2R10G10B10 | D3DFMT_A2B10G10R10)
         && usage & (D3DUSAGE_QUERY_SRGBWRITE | D3DUSAGE_QUERY_LEGACYBUMPMAP) != 0
     {
         return false;
@@ -716,6 +726,15 @@ const fn lookup_d3d_format(d3d_format: u32) -> Option<FormatMapping> {
             block_height: 1,
             block_bytes: 2,
             swizzle: Some([Swizzle::Green, Swizzle::Blue, Swizzle::Alpha, Swizzle::Red]),
+            has_alpha: true,
+        }),
+        D3DFMT_A2B10G10R10 => Some(FormatMapping {
+            metal_pixel_format: PixelFormat::Rgb10A2Unorm,
+            bytes_per_pixel: 4,
+            block_width: 1,
+            block_height: 1,
+            block_bytes: 4,
+            swizzle: None,
             has_alpha: true,
         }),
         D3DFMT_A2R10G10B10 => Some(FormatMapping {
