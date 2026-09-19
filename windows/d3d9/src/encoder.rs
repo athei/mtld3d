@@ -2508,6 +2508,8 @@ impl FrameEncoder {
         // One getrusage unix_call per 5 s window, only when the summary is
         // both enabled and about to emit; every other frame passes None.
         let task_faults = (perf_enabled() && self.perf.window_due()).then(|| {
+            #[cfg(perf_tracking)]
+            crate::page_box_pool::PAGEBOX_POOL.log_diagnostics();
             let mut p = GetTaskFaultsParams {
                 minor_faults: 0,
                 major_faults: 0,

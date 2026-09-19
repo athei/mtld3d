@@ -519,6 +519,30 @@ Counter aggregation — mixing these up misreads the log:
 
 No ANSI colour anywhere: every line goes to the process's log file, and `env_logger` is told so (`WriteStyle::Never`) rather than left to auto-detect a terminal, which under Wine would be wrong in both directions.
 
+### Buffer recycle-pool diagnostics
+
+`PERF=1` and `RUST_LOG=mtld3d::perf=info` emit a `pagebox-pool cumulative`
+line with the existing five-second performance summary. These totals cover the
+process-wide pool, including all devices, and survive device resets. Multiple
+devices can therefore report overlapping totals; do not add their reports.
+
+Subtract consecutive lines to isolate a gameplay interval. Acquire attempts are
+`hit + empty + oversize + disabled`; the enabled hit rate is
+`hit / (hit + empty + oversize)`. Recycle attempts are
+`recycle_parked + recycle_cap + recycle_oversize + recycle_disabled`.
+`empty` means no retired box of the requested padded size was parked;
+`oversize` means the request exceeded the largest pool class. `recycle_cap`
+means the byte budget rejected a retired box. The two oversize byte fields give
+cumulative requested logical bytes and the largest logical request, respectively.
+They do not measure copied bytes.
+
+All counters and their updates disappear without `PERF=1`. They share the pool's
+mutex and preserve its allocation, ownership and retirement decisions. In a
+performance build, early disabled and oversized outcomes also take that mutex
+for accounting. Hit rate alone is not a speed measurement; correlate it with
+the existing page-fault, allocation, rename, upload and frame-time rows before
+changing pool limits.
+
 ### Shader and pipeline attribution
 
 The same PERF summary appends cold-work accounting from

@@ -104,3 +104,52 @@ fn byte_accounting_across_mixed_classes() {
     let _ = pool.acquire(4 * PAGE_SIZE).expect("hit");
     assert_eq!(pool.pooled_bytes(), PAGE_SIZE);
 }
+
+#[cfg(perf_tracking)]
+#[test]
+fn diagnostics_partition_acquire_and_recycle_outcomes() {
+    let pool = PageBoxPool::new(0);
+    assert!(pool.acquire(PAGE_SIZE).is_none());
+    assert!(pool.recycle(PageBox::new_uninit(PAGE_SIZE)).is_some());
+    pool.set_cap(PAGE_SIZE);
+    assert!(pool.acquire(PAGE_SIZE).is_none());
+    let oversized = (MAX_POOL_CLASSES + 1) * PAGE_SIZE;
+    assert!(pool.acquire(oversized).is_none());
+    assert!(pool.recycle(PageBox::new_uninit(oversized)).is_some());
+    assert!(pool.recycle(PageBox::new_uninit(PAGE_SIZE)).is_none());
+    assert!(pool.recycle(PageBox::new_uninit(PAGE_SIZE)).is_some());
+    assert!(pool.acquire(PAGE_SIZE).is_some());
+    assert!(pool.acquire(PAGE_SIZE).is_none());
+    let summary = pool.inner.lock().unwrap().diagnostics.summary();
+    assert_eq!(
+        summary,
+        format!(
+            "pagebox-pool cumulative: hit=1 empty=2 oversize=1 disabled=1 \
+         oversize_requested_bytes={oversized} largest_oversize_request={oversized} \
+         recycle_parked=1 recycle_cap=1 recycle_oversize=1 recycle_disabled=1"
+        )
+    );
+}
+
+#[cfg(perf_tracking)]
+#[test]
+fn diagnostics_keep_concurrent_acquire_totals() {
+    let pool = PageBoxPool::new(PAGE_SIZE);
+    std::thread::scope(|scope| {
+        for _ in 0..4 {
+            scope.spawn(|| {
+                for _ in 0..32 {
+                    assert!(pool.acquire(PAGE_SIZE).is_none());
+                }
+            });
+        }
+    });
+    assert!(
+        pool.inner
+            .lock()
+            .unwrap()
+            .diagnostics
+            .summary()
+            .contains("hit=0 empty=128 oversize=0")
+    );
+}

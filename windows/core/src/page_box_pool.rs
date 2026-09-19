@@ -22,6 +22,9 @@ use std::sync::{
 
 use crate::page_box::{PAGE_SIZE, PageBox};
 
+#[cfg(perf_tracking)]
+mod diagnostics;
+
 /// Largest box the pool parks, in 16 KiB pages (256 pages = 4 MiB).
 ///
 /// Sized from measurement, not guesswork: the dominant renamed buffer in
@@ -46,6 +49,8 @@ struct PoolInner {
     classes: Vec<Vec<PageBox>>,
     /// Padded bytes parked across all classes.
     bytes: usize,
+    #[cfg(perf_tracking)]
+    diagnostics: diagnostics::Diagnostics,
 }
 
 /// Bounded recycle pool for retired [`PageBox`]es.
@@ -75,7 +80,12 @@ impl PageBoxPool {
     pub fn new(cap_bytes: usize) -> Self {
         let classes = (0..MAX_POOL_CLASSES).map(|_| Vec::new()).collect();
         Self {
-            inner: Mutex::new(PoolInner { classes, bytes: 0 }),
+            inner: Mutex::new(PoolInner {
+                classes,
+                bytes: 0,
+                #[cfg(perf_tracking)]
+                diagnostics: diagnostics::Diagnostics::empty(),
+            }),
             pooled_bytes: AtomicUsize::new(0),
             cap_bytes: AtomicUsize::new(cap_bytes),
         }
@@ -115,15 +125,29 @@ impl PageBoxPool {
     #[must_use]
     pub fn acquire(&self, logical_len: usize) -> Option<PageBox> {
         if !self.enabled() {
+            #[cfg(perf_tracking)]
+            self.record_acquire(diagnostics::Acquire::Disabled, logical_len);
             return None;
         }
         let class = PageBox::padded_len(logical_len) / PAGE_SIZE - 1;
         if class >= MAX_POOL_CLASSES {
+            #[cfg(perf_tracking)]
+            self.record_acquire(diagnostics::Acquire::Oversize, logical_len);
             return None;
         }
         let mut pb = {
             let mut inner = self.inner.lock().expect("PageBoxPool mutex poisoned");
-            let pb = inner.classes[class].pop()?;
+            let pb = inner.classes[class].pop();
+            #[cfg(perf_tracking)]
+            inner.diagnostics.acquire(
+                if pb.is_some() {
+                    diagnostics::Acquire::Hit
+                } else {
+                    diagnostics::Acquire::Empty
+                },
+                logical_len,
+            );
+            let pb = pb?;
             inner.bytes -= pb.len();
             self.pooled_bytes.store(inner.bytes, Ordering::Relaxed);
             pb
@@ -145,26 +169,71 @@ impl PageBoxPool {
     pub fn recycle(&self, pb: PageBox) -> Option<PageBox> {
         let cap_bytes = self.cap_bytes();
         if cap_bytes == 0 {
+            #[cfg(perf_tracking)]
+            self.record_recycle(diagnostics::Recycle::Disabled);
             return Some(pb);
         }
         let class = pb.len() / PAGE_SIZE - 1;
         if class >= MAX_POOL_CLASSES {
+            #[cfg(perf_tracking)]
+            self.record_recycle(diagnostics::Recycle::Oversize);
             return Some(pb);
         }
         let mut inner = self.inner.lock().expect("PageBoxPool mutex poisoned");
         if inner.bytes + pb.len() > cap_bytes {
+            #[cfg(perf_tracking)]
+            inner.diagnostics.recycle(diagnostics::Recycle::Full);
             return Some(pb);
         }
+        #[cfg(perf_tracking)]
+        inner.diagnostics.recycle(diagnostics::Recycle::Parked);
         inner.bytes += pb.len();
         self.pooled_bytes.store(inner.bytes, Ordering::Relaxed);
         inner.classes[class].push(pb);
         None
     }
 
+    /// Report process-pool totals on the renderer's existing performance cadence.
+    ///
+    /// Counters include every device sharing this pool and never reset at frame boundaries.
+    /// The snapshot uses the pool mutex, so each outcome partition is internally consistent.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the pool mutex was poisoned.
+    #[cfg(perf_tracking)]
+    pub fn log_diagnostics(&self) {
+        let text = self
+            .inner
+            .lock()
+            .expect("PageBoxPool mutex poisoned")
+            .diagnostics
+            .summary();
+        log::info!(target: "mtld3d::perf", "{text}");
+    }
+
     /// Padded bytes currently parked (lock-free Relaxed read).
     #[must_use]
     pub fn pooled_bytes(&self) -> usize {
         self.pooled_bytes.load(Ordering::Relaxed)
+    }
+
+    #[cfg(perf_tracking)]
+    fn record_acquire(&self, outcome: diagnostics::Acquire, logical_len: usize) {
+        self.inner
+            .lock()
+            .expect("PageBoxPool mutex poisoned")
+            .diagnostics
+            .acquire(outcome, logical_len);
+    }
+
+    #[cfg(perf_tracking)]
+    fn record_recycle(&self, outcome: diagnostics::Recycle) {
+        self.inner
+            .lock()
+            .expect("PageBoxPool mutex poisoned")
+            .diagnostics
+            .recycle(outcome);
     }
 }
 
