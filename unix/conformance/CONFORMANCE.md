@@ -1045,16 +1045,6 @@ with Acquire before calling, and only the unix side raises that counter
 in-place write into a needless rename but never the reverse. The kept
 divergence itself is unchanged.
 
-### visual.c/test_alpha_to_coverage
-Sites: 26538=caps
-
-The `@mac2` entries retain the capability-skip pin until re-recorded on
-that GPU family. The portable `ATOC` probe and `D3DRS_ADAPTIVETESS_Y`
-control are supported; all six Apple-family legs run the pixel assertions
-and pass. `ALPHATESTENABLE` gates this control, and coverage replaces the
-alpha test only on a multisampled render target. AMD's `A2M1`/`A2M0`
-controls through `D3DRS_POINTSIZE` remain unsupported.
-
 ### visual.c/test_mipmap_upload
 Sites: 27550=expected
 
