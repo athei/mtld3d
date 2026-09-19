@@ -10,7 +10,7 @@ divergences from D3D9 it keeps on purpose. The tested games are in the
 - Shader models 1.x through 3.0, translated from DXSO to MSL and cached on
   disk by content hash.
 - The fixed-function pipeline: lighting, texture-coordinate generation, the
-  texture-stage cascade, vertex blending, vertex and table fog.
+  texture-stage cascade, vertex blending, vertex and table fog, including range-based vertex fog.
 - Every draw call and primitive type, point sprites, user clip planes, all
   sixteen vertex streams, hardware instancing.
 - State blocks, occlusion and event queries.

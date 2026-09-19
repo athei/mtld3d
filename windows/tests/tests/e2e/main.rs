@@ -27,6 +27,7 @@ mod non_uma;
 mod points;
 mod present_split;
 mod query;
+mod range_fog;
 mod render_scale;
 mod render_states;
 mod render_target;

@@ -237,6 +237,19 @@ record. A knob, where one makes sense, is named with its default.
   `D3DPRASTERCAPS_MULTISAMPLE_TOGGLE` is not advertised, which is how D3D9
   says the toggle is unavailable, and the first write is logged. No knob.
 
+## Range-fog coverage
+
+`D3DPRASTERCAPS_FOGRANGE` is advertised. Fixed-function computed vertex fog
+uses the transformed vertex's distance from the eye when
+`D3DRS_RANGEFOGENABLE` is set, including sequential and indexed vertex
+blending. Table fog, pretransformed supplied factors and programmable vertex
+fog do not use that switch. Ordinary vertex fog keeps its Z-based formula.
+
+Wine's range-fog visual test is gated on both `FOGRANGE` and `FOGTABLE`.
+The latter is not advertised, so the upstream test skips this capability.
+The end-to-end range-fog tests exercise it directly; no upstream failure-count
+reduction follows from this correction.
+
 ## Fill-mode coverage
 
 `D3DFILL_WIREFRAME` uses Metal's native triangle-line fill, preserving triangle

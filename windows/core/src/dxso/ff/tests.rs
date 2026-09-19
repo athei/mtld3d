@@ -1333,3 +1333,26 @@ fn ff_ps_returns_a_bare_colour_without_a_sample_mask() {
     assert!(!msl.contains("sample_mask"), "{msl}");
     assert!(msl.contains("    return oC0;"), "{msl}");
 }
+
+#[test]
+fn range_fog_changes_only_the_vertex_distance_expression() {
+    for mode in 1..=3 {
+        for blends in [0, 2] {
+            let mut key = default_vs_key();
+            key.fog_mode = mode;
+            key.vertex_blend_count = blends;
+            key.declared_weights_count = u8::from(blends != 0);
+            let ordinary = emit_vs_ff(&key);
+            assert!(ordinary.contains("float eyeZ = abs(dot(pos, vs_c[2]));"));
+            assert!(!ordinary.contains("length(pos_view.xyz)"));
+            key.flags.insert(FfVsFlags::RANGE_FOG);
+            let range = emit_vs_ff(&key);
+            assert!(range.contains("float eyeZ = length(pos_view.xyz);"));
+            assert_eq!(
+                range.replace("length(pos_view.xyz)", "abs(dot(pos, vs_c[2]))"),
+                ordinary,
+                "ordinary fog keeps the same source and range changes only distance"
+            );
+        }
+    }
+}
