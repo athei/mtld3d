@@ -39,7 +39,7 @@ use mtld3d_types::{
     D3DTOP_BLENDFACTORALPHA, D3DTOP_BLENDTEXTUREALPHA, D3DTOP_BLENDTEXTUREALPHAPM, D3DTOP_DISABLE,
     D3DTOP_DOTPRODUCT3, D3DTOP_MODULATE, D3DTOP_MODULATE2X, D3DTOP_MODULATE4X,
     D3DTOP_MODULATEALPHA_ADDCOLOR, D3DTOP_MODULATECOLOR_ADDALPHA, D3DTOP_MODULATEINVALPHA_ADDCOLOR,
-    D3DTOP_SELECTARG1, D3DTOP_SELECTARG2, D3DTOP_SUBTRACT,
+    D3DTOP_MODULATEINVCOLOR_ADDALPHA, D3DTOP_SELECTARG1, D3DTOP_SELECTARG2, D3DTOP_SUBTRACT,
 };
 
 use super::emit::{
@@ -1846,6 +1846,7 @@ fn apply_op(op: u8, a: &str, b: &str, stage: usize, has_texture: bool) -> String
         D3DTOP_MODULATEALPHA_ADDCOLOR => format!("saturate({a} + ({a}).a * {b})"),
         D3DTOP_MODULATECOLOR_ADDALPHA => format!("saturate({a} * {b} + ({a}).a)"),
         D3DTOP_MODULATEINVALPHA_ADDCOLOR => format!("saturate({a} + (1.0 - ({a}).a) * {b})"),
+        D3DTOP_MODULATEINVCOLOR_ADDALPHA => format!("saturate((1.0 - {a}) * {b} + ({a}).a)"),
         D3DTOP_ADD => format!("saturate({a} + {b})"),
         D3DTOP_ADDSIGNED => format!("saturate({a} + {b} - 0.5)"),
         D3DTOP_ADDSIGNED2X => format!("saturate(2.0 * ({a} + {b} - 0.5))"),

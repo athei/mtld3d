@@ -192,6 +192,7 @@ fn texture_op_caps_match_emitter() {
         | TexOpCaps::MODULATEALPHA_ADDCOLOR
         | TexOpCaps::MODULATECOLOR_ADDALPHA
         | TexOpCaps::MODULATEINVALPHA_ADDCOLOR
+        | TexOpCaps::MODULATEINVCOLOR_ADDALPHA
         | TexOpCaps::ADD
         | TexOpCaps::ADDSIGNED
         | TexOpCaps::ADDSIGNED2X
