@@ -14,7 +14,9 @@
 //!
 //! The test binary links its own snmalloc rather than reaching into
 //! `d3d9.dll`, but it is built for the same target with the same features,
-//! so it exercises the configuration that ships.
+//! so it exercises the configuration that ships. Only probe allocations use
+//! snmalloc. The harness keeps its system allocator so Rust TLS destructors
+//! cannot outlive snmalloc's EXE reservation cleanup.
 //!
 //! # Why there is no "stays committed below the cutoff" twin
 //!
@@ -27,16 +29,13 @@
 //! that direction is deterministic and is the one asserted here.
 
 use core::ffi::c_void;
-use std::alloc::{Layout, alloc, dealloc};
+use std::alloc::Layout;
 
 use mtld3d_core::page_box::{PAGE_SIZE, SNMALLOC_LOCAL_CACHE_BYTES, bypasses_local_cache};
-use snmalloc_rs::SnMalloc;
+use shape::allocation::SnmallocAllocation;
 
 #[path = "../../core/tests/snmalloc_drift/shape.rs"]
 mod shape;
-
-#[global_allocator]
-static ALLOCATOR: SnMalloc = SnMalloc;
 
 const MEM_COMMIT: u32 = 0x1000;
 const MEM_RESERVE: u32 = 0x2000;
@@ -96,9 +95,8 @@ fn allocator_shape_and_cache_budget_match_model() {
     );
 
     let layout = Layout::from_size_align(size, PAGE_SIZE).expect("valid page-aligned layout");
-    // SAFETY: non-zero size, power-of-two alignment.
-    let ptr = unsafe { alloc(layout) };
-    assert!(!ptr.is_null(), "allocation failed");
+    let allocation = SnmallocAllocation::new(layout);
+    let ptr = allocation.as_ptr();
 
     // Touch the first page so the region is unambiguously live, then
     // confirm the probe reports COMMIT. Without this the post-free
@@ -111,13 +109,12 @@ fn allocator_shape_and_cache_budget_match_model() {
         "region should be committed while the allocation is live"
     );
 
-    // SAFETY: same pointer and layout the allocation came from.
-    unsafe { dealloc(ptr, layout) };
+    let freed = allocation.release();
 
     // Nothing allocates between the free and the query, so the address is
     // still the one snmalloc just released.
     assert_eq!(
-        region_state(ptr),
+        region_state(freed),
         MEM_RESERVE,
         "snmalloc no longer decommits at {SNMALLOC_LOCAL_CACHE_BYTES} bytes: \
          LocalCacheSizeBits has moved, so SNMALLOC_LOCAL_CACHE_BYTES and the \
