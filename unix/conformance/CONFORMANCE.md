@@ -921,8 +921,7 @@ on the missing lanes. The four-channel members (A16B16G16R16F,
 A32B32G32R32F) and L8 pass.
 
 ### visual.c/test_fetch4
-Sites: 15617=caps 15668=ceiling 15824=ceiling 15829=ceiling
-Sites: 15727=expected
+Sites: 15668=ceiling 15727=expected
 
 Fetch4 uses native gather for point-filtered 2D L8/L16/R16F/R32F/A8 and
 INTZ/DF16/DF24 samplers. GET4 and GET1 commands through D3DSAMP_MIPMAPLODBIAS
@@ -930,20 +929,18 @@ set and clear a latch; numeric bias writes preserve it. Gather honors projected
 coordinates and reads the base mip, including texldb/texldd/texldl. DF16/DF24
 raw reads now return (depth, 0, 0, 1), while INTZ broadcasts depth.
 
-All six local variants clear 15617/15824/15829. Their classifications and
-`@mac2` pins remain temporarily pending a recording on that device.
+The basic gather and DF raw-depth checks pass on local and `@mac2` legs.
 
 15668 keeps its existing ceilings. The test writes only four bytes of each
 format texture, so projected L16/R16F samples can read unwritten texels. ATI1
 is outside the supported Fetch4 format set and keeps ordinary sampling, with
 alpha one rather than a fourth gathered texel. A8R8G8B8 also keeps ordinary
 sampling; its unwritten texels can have alpha one rather than the expected zero.
-These cases account for the remaining local failures. Keep the higher pins
+These cases account for the remaining format-site failures. Keep the higher pins
 because counts vary with allocation contents. 15727 (`@mac2` legs only) is the
-3D section's `L8` volume
-texture, which reads its green and blue lanes through the channel swizzle
-the paravirtual device ignores (the swizzle cluster above): the sample
-carries red alone there.
+3D section's `L8` volume texture, which reads its green and blue lanes through
+the channel swizzle the paravirtual device ignores (the swizzle cluster above):
+the sample carries red alone there.
 
 ### visual.c/fp_special_test
 Sites: 16433=expected
