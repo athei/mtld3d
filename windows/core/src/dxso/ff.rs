@@ -52,8 +52,8 @@ use super::emit::{
 bitflags::bitflags! {
     /// Boolean predicates for `FfVsKey`.
     ///
-    /// Packs ten 1-bit fields into a `u16` so the cache key stays compact and
-    /// `Hash` walks one word instead of ten. Bit layout is stable —
+    /// Packs boolean fields into a `u16` so the cache key stays compact and
+    /// `Hash` walks one word. Bit layout is stable:
     /// `SHADER_CACHE_SCHEMA_VERSION` must bump on any reorder or addition.
     #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
     pub struct FfVsFlags: u16 {
@@ -129,6 +129,10 @@ bitflags::bitflags! {
         /// Only ever set on an untransformed layout; pre-transformed vertices
         /// have no eye-space distance to scale by.
         const POINT_SCALE = 1 << 14;
+        /// Computed vertex fog uses distance from the eye instead of Z.
+        ///
+        /// Canonicalized off for disabled, table and supplied-factor fog.
+        const RANGE_FOG = 1 << 15;
     }
 }
 
@@ -1300,11 +1304,18 @@ fn emit_vs(out: &mut String, vs: &FfVsKey, entry: &str) {
     // (row 2 of transpose(WV), full 4 components including translation) so
     // `dot(pos, vs_c[2])` is the eye-space Z coordinate of the vertex. Fog
     // params live at vs_c[8] (see the layout comment above).
+    let fog_coordinate = if vs.flags.contains(FfVsFlags::RANGE_FOG) {
+        // pos_view already includes the world/view transforms and any
+        // sequential or indexed vertex blending, before projection.
+        "        float eyeZ = length(pos_view.xyz);\n"
+    } else {
+        "        float eyeZ = abs(dot(pos, vs_c[2]));\n"
+    };
     match vs.fog_mode {
         1 => {
             // EXP: exp(-density * z) = exp2(-1.442695 * density * z)
             out.push_str("    {\n");
-            out.push_str("        float eyeZ = abs(dot(pos, vs_c[2]));\n");
+            out.push_str(fog_coordinate);
             out.push_str("        float fogDensity = vs_c[8].z;\n");
             out.push_str("        float f = saturate(exp2(-1.442695 * fogDensity * eyeZ));\n");
             out.push_str("        out.fog = float4(f, 0.0, 0.0, 0.0);\n");
@@ -1313,7 +1324,7 @@ fn emit_vs(out: &mut String, vs: &FfVsKey, entry: &str) {
         2 => {
             // EXP2: exp(-(density*z)^2) = exp2(-1.442695 * (density*z)^2)
             out.push_str("    {\n");
-            out.push_str("        float eyeZ = abs(dot(pos, vs_c[2]));\n");
+            out.push_str(fog_coordinate);
             out.push_str("        float fogDensity = vs_c[8].z;\n");
             out.push_str("        float dz = fogDensity * eyeZ;\n");
             out.push_str("        float f = saturate(exp2(-1.442695 * dz * dz));\n");
@@ -1323,7 +1334,7 @@ fn emit_vs(out: &mut String, vs: &FfVsKey, entry: &str) {
         3 => {
             // LINEAR: (end - z) / (end - start)
             out.push_str("    {\n");
-            out.push_str("        float eyeZ = abs(dot(pos, vs_c[2]));\n");
+            out.push_str(fog_coordinate);
             out.push_str("        float fogStart = vs_c[8].x;\n");
             out.push_str("        float fogEnd = vs_c[8].y;\n");
             // Signed denominator (no `max(..,eps)`): reversed fog (start>end)
