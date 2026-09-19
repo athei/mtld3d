@@ -24,7 +24,8 @@ pub use in_flight::spawn_scoped;
 pub use pixel::{Rgba8, assert_pixel_approx, assert_pixel_eq};
 pub use resource::{
     BufferLock, CubeTexture, IndexBuffer, LockedRect, PixelShader, Query, StateBlock, Surface,
-    SurfaceDc, Texture, VertexBuffer, VertexDeclaration, VertexShader, Volume, VolumeTexture,
+    SurfaceDc, SwapChain, Texture, VertexBuffer, VertexDeclaration, VertexShader, Volume,
+    VolumeTexture,
 };
 pub use shared::{SharedDevice, SharedQuery, SharedVertexBuffer};
 pub use vertex::{
