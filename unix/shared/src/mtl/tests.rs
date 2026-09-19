@@ -114,7 +114,11 @@ fn srgb_twin_table() {
     assert_eq!(DestroyKind::Buffer as u32, 0);
     assert_eq!(DestroyKind::DepthStencilState as u32, 6);
     assert_eq!(DestroyKind::from_repr(3), Some(DestroyKind::ShaderLibrary));
-    assert_eq!(DestroyKind::from_repr(7), None);
+    assert_eq!(
+        DestroyKind::from_repr(7),
+        Some(DestroyKind::ComputePipeline)
+    );
+    assert_eq!(DestroyKind::from_repr(8), None);
 
     assert_eq!(BufferKind::VbIb as u32, 0);
     assert_eq!(BufferKind::TexStaging as u32, 1);

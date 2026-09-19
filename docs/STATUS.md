@@ -19,7 +19,9 @@ divergences from D3D9 it keeps on purpose. The tested games are in the
   YUV decoding, `GetDC`.
 - Raw sampleable depth (INTZ, DF16, DF24), hardware shadow comparisons on
   standard depth formats, depth bias, the full two-sided stencil test, and
-  GPU-only plain depth textures for RESZ destinations.
+  GPU-only plain depth textures for RESZ destinations. Dynamic DEFAULT-pool
+  D16, D24X8 and D24S8 textures support packed CPU locks, explicit mips and
+  RESZ readback.
 - Fetch4 gathers on 2D L8, L16, A8, R16F, R32F and raw-depth textures.
 - Anisotropic filtering, LOD bias, sRGB read and write, alpha test, scissor,
   separate alpha blend, blend factor, write masks, native wireframe fill.
@@ -43,9 +45,10 @@ Each fails cleanly, with an absent cap bit or a documented error return.
 
 - Point polygon fill: Metal has no point-fill mode, so the state is warned
   once and drawn solid.
-- Dynamic depth textures: packed depth uploads have no conversion path.
-  Depth textures also have no vertex sampling. Automatic mip-generation
-  requests use the single-level `D3DOK_NOAUTOGEN` fallback.
+- Dynamic depth textures outside DEFAULT-pool 2D D16, D24X8 and D24S8,
+  including dynamic depth attachments, remain unavailable. Depth textures
+  have no vertex sampling. Automatic mip-generation requests use the
+  single-level `D3DOK_NOAUTOGEN` fallback.
 - Timestamp, timestamp frequency, timestamp disjoint and other niche query
   types: capability probes and creation report `D3DERR_NOTAVAILABLE`.
 - Scaled, sub-rect or converting depth-to-depth `StretchRect`: only the

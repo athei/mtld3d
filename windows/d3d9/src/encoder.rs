@@ -101,6 +101,8 @@ use super::{
 /// `MSL_TRACE_TARGET`) so the emitter and its output share one knob.
 const DRAW_TRACE_TARGET: &str = "mtld3d::d3d9::draw";
 
+mod depth;
+
 /// Sub-target for the once-per-distinct sampler-state diagnostic.
 ///
 /// Emitted from `get_or_create_sampler`. Permanent probe (zero-cost when
@@ -1113,6 +1115,7 @@ pub struct FrameEncoder {
     /// buffer argument. Process-lifetime, same posture as
     /// `blit_pipeline_cache`.
     upload_pipeline_cache: FxHashMap<PixelFormat, MetalHandle<MTLRenderPipelineStateKind>>,
+    depth_transfer: depth::TransferState,
     /// Reusable command buffer for one texture-upload pass.
     ///
     /// Held on the encoder so the six commands an upload pass carries cost
@@ -1633,6 +1636,7 @@ impl FrameEncoder {
             clear_quad_pipeline_cache: FxHashMap::default(),
             blit_pipeline_cache: FxHashMap::default(),
             upload_pipeline_cache: FxHashMap::default(),
+            depth_transfer: depth::TransferState::default(),
             upload_pass_commands: Vec::new(),
             dc_write_back_scratch: MetalHandle::NULL,
             dc_write_back_scratch_key: (0, 0, PixelFormat::Bgra8Unorm),
@@ -7246,9 +7250,13 @@ impl FrameEncoder {
         );
         let fresh = views.linear;
         if status != 0 || fresh.is_null() {
+            if mtld3d_core::depth_texture::PackedDepth::from_d3d(job.src_d3d_format).is_some() {
+                error!(target: LOG_TARGET, "rename_sampled_texture: depth allocation failed, upload deferred");
+                return 0;
+            }
             error!(
                 target: LOG_TARGET,
-                "rename_sampled_texture: fresh CreateTexture failed — uploading into the \
+                "rename_sampled_texture: fresh CreateTexture failed, uploading into the \
                  live texture (one already-emitted draw may sample too-new content this frame)"
             );
             return old_handle;
@@ -7280,6 +7288,18 @@ impl FrameEncoder {
         } else {
             1
         };
+        // Dynamic RESZ writes live between application passes. Preserving a
+        // different mip at the frame head would copy its pre-RESZ contents.
+        // Keep both preservation and subsequent depth uploads in that order.
+        let ordered_depth = mtld3d_core::depth_texture::PackedDepth::from_d3d(job.src_d3d_format)
+            .is_some()
+            && self.pass_state.texture_written_by_blit_this_frame(
+                // SAFETY: old_handle is the live texture being renamed.
+                unsafe { MetalHandle::new(old_handle) },
+            );
+        if ordered_depth {
+            self.end_current_pass("dynamic_depth_preserve");
+        }
         for slice in 0..slices {
             for level in 0..info.levels {
                 if slice == job.destination_slice && level == job.level && full_cover {
@@ -7307,10 +7327,16 @@ impl FrameEncoder {
                 };
                 preserve.src_slice = slice;
                 preserve.dst_slice = slice;
-                self.frame_blit_commands.push(preserve);
+                if ordered_depth {
+                    self.pass_state.push_pending_leading_blit(preserve);
+                } else {
+                    self.frame_blit_commands.push(preserve);
+                }
             }
         }
-        self.flags.insert(FrameEncoderFlags::BLIT_CMDS_NEED_ENCODER);
+        if !ordered_depth {
+            self.flags.insert(FrameEncoderFlags::BLIT_CMDS_NEED_ENCODER);
+        }
 
         // Earlier commands retain their original aliases through GPU retirement.
         self.retire_texture_views(&old_views, MetalHandle::NULL);
@@ -7374,6 +7400,10 @@ impl FrameEncoder {
     /// `PageBox`) and emit a `BlitCopyBufferToTexture` against the frame's
     /// leading blit pass.
     fn run_texture_upload_blit(&mut self, job: &TextureUploadJob, texture_handle: u64) -> bool {
+        if let Some(format) = mtld3d_core::depth_texture::PackedDepth::from_d3d(job.src_d3d_format)
+        {
+            return self.run_depth_upload_blit(job, texture_handle, &format);
+        }
         if let Some(outcome) = self.try_texture_upload_pass(job, texture_handle) {
             return outcome;
         }
@@ -8403,6 +8433,7 @@ impl FrameEncoder {
         destroy_resources_bulk(DestroyKind::Texture, &textures);
         mtld3d_shared::crumb!("phase:SdPipes");
         destroy_resources_bulk(DestroyKind::RenderPipeline, &pipelines);
+        self.depth_transfer.destroy();
         mtld3d_shared::crumb!("phase:SdFns");
         destroy_resources_bulk(DestroyKind::ShaderFunction, &functions);
         mtld3d_shared::crumb!("phase:SdLibs");

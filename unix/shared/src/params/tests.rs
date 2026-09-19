@@ -74,7 +74,7 @@ fn blit_texture_to_buffer_layout() {
     // 3*u64 (handles) + 2*u64 (dst ptr/len) + 10*u32
     // = 24 + 16 + 40 = 80, a multiple of the align-8.
     assert_eq!(core::mem::align_of::<BlitTextureToBufferParams>(), 8);
-    assert_eq!(core::mem::size_of::<BlitTextureToBufferParams>(), 80);
+    assert_eq!(core::mem::size_of::<BlitTextureToBufferParams>(), 96);
 }
 
 #[test]
@@ -179,4 +179,30 @@ fn pass_descriptor_flags_preserve_ordinary_pass_bytes() {
         1 | (5 << 1) | (9 << 4) | (3 << 8)
     );
     assert_eq!(core::mem::size_of::<PassDescriptor>(), 216);
+}
+
+#[test]
+fn depth_transfer_layouts_match_wow64() {
+    use super::{BlitTextureToBufferParams, CreateDepthTransferPipelineParams};
+    assert_eq!(
+        core::mem::size_of::<CreateDepthTransferPipelineParams>(),
+        24
+    );
+    assert_eq!(
+        core::mem::align_of::<CreateDepthTransferPipelineParams>(),
+        8
+    );
+    assert_eq!(
+        core::mem::offset_of!(CreateDepthTransferPipelineParams, kind),
+        16
+    );
+    assert_eq!(core::mem::size_of::<BlitTextureToBufferParams>(), 96);
+    assert_eq!(
+        core::mem::offset_of!(BlitTextureToBufferParams, stencil_offset),
+        8
+    );
+    assert_eq!(
+        core::mem::offset_of!(BlitTextureToBufferParams, queue_handle),
+        16
+    );
 }
