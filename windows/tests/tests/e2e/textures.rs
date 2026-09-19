@@ -4490,3 +4490,145 @@ fn intra_frame_rename_keeps_generated_mips_in_upload_order() {
         assert_pixel_eq(h.read_pixel(x, 240), color, "generated mip at its draw");
     }
 }
+
+#[test]
+fn plain_depth_textures_preserve_the_gpu_only_resource_contract() {
+    let h = Harness::new();
+    for format in [
+        mtld3d_types::D3DFMT_D16_LOCKABLE,
+        mtld3d_types::D3DFMT_D32F_LOCKABLE,
+        mtld3d_types::D3DFMT_D24FS8,
+    ] {
+        assert_eq!(
+            h.check_device_format(D3DFMT_X8R8G8B8, 0, mtld3d_types::D3DRTYPE_TEXTURE, format),
+            mtld3d_types::D3DERR_NOTAVAILABLE
+        );
+        let (hr, ptr) = h.try_create_texture(17, 9, 1, 0, format, D3DPOOL_DEFAULT);
+        assert_eq!(hr, D3DERR_INVALIDCALL);
+        assert!(ptr.is_null());
+    }
+    for format in [
+        mtld3d_types::D3DFMT_D16,
+        mtld3d_types::D3DFMT_D24X8,
+        mtld3d_types::D3DFMT_D24S8,
+        mtld3d_types::D3DFMT_D32,
+        D3DFMT_INTZ,
+    ] {
+        assert_eq!(
+            h.check_device_format(D3DFMT_X8R8G8B8, 0, mtld3d_types::D3DRTYPE_TEXTURE, format),
+            0,
+            "plain depth format {format}"
+        );
+        let memory_before = h.available_texture_mem();
+        let tex = h.create_texture(17, 9, 0, 0, format, D3DPOOL_DEFAULT);
+        let memory_with_plain = h.available_texture_mem();
+        let attachment = h.create_texture(17, 9, 0, D3DUSAGE_DEPTHSTENCIL, format, D3DPOOL_DEFAULT);
+        assert_eq!(
+            memory_before - memory_with_plain,
+            memory_with_plain - h.available_texture_mem()
+        );
+        drop(attachment);
+        assert_eq!(tex.level_count(), 5);
+        for level in 0..5 {
+            let (hr, desc) = tex.level_desc(level);
+            assert_eq!(hr, 0);
+            assert_eq!(
+                (desc.width, desc.height),
+                ((17 >> level).max(1), (9 >> level).max(1))
+            );
+            assert_eq!(
+                (desc.format, desc.usage, desc.pool),
+                (format, 0, D3DPOOL_DEFAULT)
+            );
+            assert_eq!(tex.lock_rect_probe(level, 0), (D3DERR_INVALIDCALL, false));
+            let surface = tex.surface_level(level);
+            assert_eq!(surface.lock_rect_probe(0), (D3DERR_INVALIDCALL, false));
+            assert_eq!(h.set_depth_stencil_surface(&surface), D3DERR_INVALIDCALL);
+            assert_eq!(h.set_render_target(0, &surface), D3DERR_INVALIDCALL);
+        }
+        assert_eq!(h.set_texture(0, &tex), 0);
+        assert_eq!(h.clear_texture(0), 0);
+        for pool in [D3DPOOL_MANAGED, D3DPOOL_SYSTEMMEM, D3DPOOL_SCRATCH] {
+            let (hr, ptr) = h.try_create_texture(17, 9, 1, 0, format, pool);
+            assert_eq!(hr, D3DERR_INVALIDCALL);
+            assert!(ptr.is_null());
+        }
+        assert_eq!(
+            h.check_device_format(
+                D3DFMT_X8R8G8B8,
+                D3DUSAGE_AUTOGENMIPMAP,
+                mtld3d_types::D3DRTYPE_TEXTURE,
+                format
+            ),
+            mtld3d_types::D3DOK_NOAUTOGEN
+        );
+        for levels in [0, 1] {
+            let fallback = h.create_texture(
+                17,
+                9,
+                levels,
+                D3DUSAGE_AUTOGENMIPMAP,
+                format,
+                D3DPOOL_DEFAULT,
+            );
+            assert_eq!(fallback.level_count(), 1);
+            let (hr, desc) = fallback.level_desc(0);
+            assert_eq!(hr, 0);
+            assert_eq!(
+                (desc.width, desc.height, desc.usage),
+                (17, 9, D3DUSAGE_AUTOGENMIPMAP)
+            );
+            assert_eq!(fallback.level_desc(1).0, D3DERR_INVALIDCALL);
+            fallback.generate_mip_sub_levels();
+        }
+        let (hr, ptr) =
+            h.try_create_texture(17, 9, 2, D3DUSAGE_AUTOGENMIPMAP, format, D3DPOOL_DEFAULT);
+        assert_eq!(hr, D3DERR_INVALIDCALL);
+        assert!(ptr.is_null());
+        for usage in [D3DUSAGE_DYNAMIC, D3DUSAGE_RENDERTARGET] {
+            assert_eq!(
+                h.check_device_format(
+                    D3DFMT_X8R8G8B8,
+                    usage,
+                    mtld3d_types::D3DRTYPE_TEXTURE,
+                    format
+                ),
+                mtld3d_types::D3DERR_NOTAVAILABLE
+            );
+            let (hr, ptr) = h.try_create_texture(17, 9, 1, usage, format, D3DPOOL_DEFAULT);
+            assert_eq!(hr, D3DERR_INVALIDCALL);
+            assert!(ptr.is_null());
+        }
+        for pool in [D3DPOOL_DEFAULT, D3DPOOL_SYSTEMMEM, D3DPOOL_SCRATCH] {
+            assert_eq!(
+                h.create_offscreen_plain_surface_hr(17, 9, format, pool),
+                D3DERR_INVALIDCALL
+            );
+        }
+        for usage in [
+            mtld3d_types::D3DUSAGE_QUERY_SRGBREAD,
+            mtld3d_types::D3DUSAGE_QUERY_SRGBWRITE,
+            mtld3d_types::D3DUSAGE_QUERY_VERTEXTEXTURE,
+        ] {
+            assert_eq!(
+                h.check_device_format(
+                    D3DFMT_X8R8G8B8,
+                    usage,
+                    mtld3d_types::D3DRTYPE_TEXTURE,
+                    format
+                ),
+                mtld3d_types::D3DERR_NOTAVAILABLE
+            );
+        }
+        for resource in [
+            D3DRTYPE_SURFACE,
+            mtld3d_types::D3DRTYPE_CUBETEXTURE,
+            mtld3d_types::D3DRTYPE_VOLUMETEXTURE,
+        ] {
+            assert_eq!(
+                h.check_device_format(D3DFMT_X8R8G8B8, 0, resource, format),
+                mtld3d_types::D3DERR_NOTAVAILABLE
+            );
+        }
+    }
+}

@@ -4129,6 +4129,20 @@ fn depth_texture_mip_level_binds_as_depth_attachment() {
 
 #[test]
 fn resz_resolve_copies_bound_depth_into_the_stage0_texture() {
+    resz_resolve_to_texture(D3DUSAGE_DEPTHSTENCIL);
+}
+
+#[test]
+fn resz_resolve_copies_bound_depth_into_a_plain_depth_texture() {
+    resz_resolve_to_texture(0);
+}
+
+#[test]
+fn resz_resolve_preserves_the_noautogen_depth_fallback() {
+    resz_resolve_to_texture(D3DUSAGE_AUTOGENMIPMAP);
+}
+
+fn resz_resolve_to_texture(destination_usage: u32) {
     // The RESZ hack: SetRenderState(POINTSIZE, 0x7fa05000) resolves the
     // bound depth-stencil into the depth texture at stage 0. Engines on the
     // matching vendor path use it as their only depth hand-off, so support
@@ -4153,14 +4167,7 @@ fn resz_resolve_copies_bound_depth_into_the_stage0_texture() {
         D3DFMT_INTZ,
         D3DPOOL_DEFAULT,
     );
-    let depth_dst = h.create_texture(
-        640,
-        480,
-        1,
-        D3DUSAGE_DEPTHSTENCIL,
-        D3DFMT_INTZ,
-        D3DPOOL_DEFAULT,
-    );
+    let depth_dst = h.create_texture(640, 480, 1, destination_usage, D3DFMT_INTZ, D3DPOOL_DEFAULT);
     let backbuffer = h.render_target(0);
 
     // Pass 1: write depth 0.25 into the source through the FF pipeline.
@@ -4208,6 +4215,10 @@ fn resz_resolve_copies_bound_depth_into_the_stage0_texture() {
         0
     );
 
+    if destination_usage & D3DUSAGE_AUTOGENMIPMAP != 0 {
+        depth_dst.generate_mip_sub_levels();
+    }
+
     // Pass 2: sample the DESTINATION; only the resolve can have filled it.
     let ps = h.create_pixel_shader(&PS_SAMPLE_DEPTH);
     assert_eq!(h.set_pixel_shader(&ps), 0);
@@ -4238,21 +4249,29 @@ fn resz_resolve_copies_bound_depth_into_the_stage0_texture() {
         v(0.5, -0.5, 1.0, 1.0),
         v(-0.5, -0.5, 0.0, 1.0),
     ];
-    assert_eq!(h.begin_scene(), 0);
-    assert_eq!(h.clear_target(BLACK), 0);
-    assert_eq!(
-        h.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad),
-        0,
-        "sample the resolved copy"
-    );
-    assert_eq!(h.end_scene(), 0);
-    assert_eq!(h.present(), 0);
+    for programmable in [false, true] {
+        if programmable {
+            assert_eq!(h.set_pixel_shader(&ps), 0);
+        } else {
+            assert_eq!(h.clear_pixel_shader(), 0);
+            h.select_texture_stage(0);
+        }
+        assert_eq!(h.begin_scene(), 0);
+        assert_eq!(h.clear_target(BLACK), 0);
+        assert_eq!(
+            h.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad),
+            0,
+            "sample the resolved copy"
+        );
+        assert_eq!(h.end_scene(), 0);
+        assert_eq!(h.present(), 0);
 
-    let center = Rgba8::from_pixel(h.read_pixel(320, 240));
-    assert!(
-        (48..=90).contains(&center.r) && (48..=90).contains(&center.g),
-        "the resolved depth (0.25) samples back as dark gray, got {center:?}"
-    );
+        let center = Rgba8::from_pixel(h.read_pixel(320, 240));
+        assert!(
+            (48..=90).contains(&center.r) && (48..=90).contains(&center.g),
+            "the resolved depth (0.25) samples back as dark gray, programmable={programmable}, got {center:?}"
+        );
+    }
 
     assert_eq!(h.clear_pixel_shader(), 0);
     assert_eq!(h.clear_texture(0), 0);

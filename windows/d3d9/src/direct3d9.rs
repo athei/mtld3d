@@ -26,9 +26,9 @@ use mtld3d_types::{
     D3DFMT_RESZ, D3DFMT_UYVY, D3DFMT_X8B8G8R8, D3DFMT_X8R8G8B8, D3DFMT_YUY2, D3DMULTISAMPLE_NONE,
     D3DMULTISAMPLE_NONMASKABLE, D3DOK_NOAUTOGEN, D3DPRESENT_PARAMETERS, D3DRTYPE_CUBETEXTURE,
     D3DRTYPE_SURFACE, D3DRTYPE_TEXTURE, D3DRTYPE_VOLUME, D3DRTYPE_VOLUMETEXTURE,
-    D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING,
-    D3DUSAGE_QUERY_SRGBREAD, D3DUSAGE_QUERY_SRGBWRITE, D3DUSAGE_QUERY_VERTEXTEXTURE,
-    D3DUSAGE_RENDERTARGET, Guid, IDirect3D9Vtbl,
+    D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_DYNAMIC,
+    D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING, D3DUSAGE_QUERY_SRGBREAD, D3DUSAGE_QUERY_SRGBWRITE,
+    D3DUSAGE_QUERY_VERTEXTEXTURE, D3DUSAGE_RENDERTARGET, Guid, IDirect3D9Vtbl,
 };
 
 use super::{
@@ -932,6 +932,23 @@ extern "system" fn d3d9_check_device_format(
         );
         return D3DERR_NOTAVAILABLE;
     }
+    // Depth textures are GPU-only: they have no packed-depth upload or
+    // automatic mip-generation path. Their shader support is fragment-only,
+    // and neither sRGB conversion nor color blending applies to depth.
+    if is_depth_stencil_format(check_format)
+        && usage
+            & (D3DUSAGE_DYNAMIC
+                | D3DUSAGE_RENDERTARGET
+                | D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING
+                | D3DUSAGE_QUERY_SRGBREAD
+                | D3DUSAGE_QUERY_SRGBWRITE
+                | D3DUSAGE_QUERY_VERTEXTEXTURE)
+            != 0
+    {
+        trace!(target: LOG_TARGET,
+            "reject CheckDeviceFormat depth format={check_format} usage={usage:#x} → NOTAVAILABLE");
+        return D3DERR_NOTAVAILABLE;
+    }
     // Vertex texture fetch: any sampleable texture format can be read from
     // the vertex stage (Metal binds textures to vertex functions natively),
     // matching the non-zero `VertexTextureFilterCaps`. Strip the bit and
@@ -967,7 +984,10 @@ extern "system" fn d3d9_check_device_format(
     ) {
         return D3DERR_NOTAVAILABLE;
     }
-    let supported = if rtype == D3DRTYPE_CUBETEXTURE {
+    let supported = if is_depth_stencil_format(check_format) {
+        rtype == D3DRTYPE_TEXTURE
+            || (rtype == D3DRTYPE_SURFACE && usage & D3DUSAGE_DEPTHSTENCIL != 0)
+    } else if rtype == D3DRTYPE_CUBETEXTURE {
         if usage & D3DUSAGE_DEPTHSTENCIL != 0 {
             false
         } else if usage & D3DUSAGE_RENDERTARGET != 0 {

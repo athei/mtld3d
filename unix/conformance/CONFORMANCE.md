@@ -822,19 +822,17 @@ Per-subresource pixel data is correct.
 ### device.c/test_resource_access
 Sites: 13838=caps
 
-"Test 2D 6" creates a DEFAULT-pool, `D3DUSAGE_DEPTHSTENCIL` texture in the
-device's depth format and derives the expected HRESULT from
-`CheckDeviceFormat(usage = 0, D3DRTYPE_TEXTURE, depth format)`: on every
-desktop driver a depth format that works as a depth-stencil texture also
-works as a plain (usage 0) texture, so the test treats the two queries as
-one capability. They are two capabilities here. We expose depth textures
-only with `D3DUSAGE_DEPTHSTENCIL` (the shadow-map idiom: bind as depth, then
-sample), never as plain textures (no mip chains, no lockable levels), and
-each query answers for its own usage: the usage-0 query says NOTAVAILABLE
-and a usage-0 create fails with it, the DEPTHSTENCIL query says OK and the
-DEPTHSTENCIL create succeeds with it. The test's inference from the first
-answer to the second create is the cap-blind step; our responses are each
-the conformant one for the capability set we advertise.
+"Test 2D 9" creates a DEFAULT-pool, `D3DUSAGE_DYNAMIC` depth texture and
+uses the plain (usage 0) texture probe to derive the expected HRESULT. Plain
+and `D3DUSAGE_DEPTHSTENCIL` 2D depth textures are supported in DEFAULT, with
+explicit mip chains and GPU-only storage. Dynamic depth is a separate
+capability: its format query returns NOTAVAILABLE and its create returns
+INVALIDCALL. The test never queries DYNAMIC before expecting it to work.
+Supporting CPU-written packed depth would require format conversion and a
+depth-writing upload path; plain RESZ destinations do not need either.
+CPU pools, plain depth surfaces and depth cubes remain unavailable.
+AUTOGENMIPMAP queries return NOAUTOGEN and creation falls back to one level,
+without enabling automatic generation.
 
 ### device.c/test_cursor_clipping
 Sites: 14930=ceiling

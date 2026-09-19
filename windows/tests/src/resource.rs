@@ -540,6 +540,12 @@ impl<'h> Texture<'h> {
         unsafe { (self.vtbl().set_auto_gen_filter_type)(self.ptr, filter) }
     }
 
+    /// Request generation of the runtime-owned mip chain.
+    pub fn generate_mip_sub_levels(&self) {
+        // SAFETY: `self.ptr` is a live texture for the wrapper's lifetime.
+        unsafe { (self.vtbl().generate_mip_sub_levels)(self.ptr) };
+    }
+
     /// `GetAutoGenFilterType`.
     #[must_use]
     pub fn auto_gen_filter_type(&self) -> u32 {
