@@ -2278,3 +2278,63 @@ fn q16w16v16u16_vertex_texture_preserves_signed_values() {
         );
     }
 }
+
+#[test]
+fn a2r10g10b10_vertex_texture_keeps_ten_bit_precision_and_alpha() {
+    let h = Harness::new();
+    let tex = h.create_texture(
+        1,
+        1,
+        1,
+        0,
+        mtld3d_types::D3DFMT_A2R10G10B10,
+        D3DPOOL_MANAGED,
+    );
+    assert_eq!(h.set_texture(257, &tex), 0);
+    let ps = h.create_pixel_shader(&PS_COLOR_PASSTHROUGH);
+    assert_eq!(h.set_pixel_shader(&ps), 0);
+    assert_eq!(h.set_fvf(D3DFVF_XYZ), 0);
+    for (src, gain, offset) in [(0x80e4_0000, 255.75, -128.0), (0x80ff_0000, 1.0, 0.0)] {
+        let mut tokens = VS_FETCH.to_vec();
+        tokens.pop();
+        tokens.extend_from_slice(&[
+            0x0400_0004,
+            0xe00f_0001,
+            src,
+            0xa0e4_0000,
+            0xa0e4_0001,
+            0x0000_ffff,
+        ]);
+        let vs = h.create_vertex_shader(&tokens);
+        assert_eq!(h.set_vertex_shader(&vs), 0);
+        assert_eq!(
+            h.set_vertex_shader_constant_f(0, &[gain, gain, gain, 1.0]),
+            0
+        );
+        assert_eq!(
+            h.set_vertex_shader_constant_f(1, &[offset, offset, offset, 0.0]),
+            0
+        );
+        for alpha in 0..4 {
+            tex.lock_rect(0, 0)
+                .write_u32(&[(alpha << 30) | (513 << 20) | (514 << 10) | 0x0203]);
+            h.render_once(0, |d| {
+                assert_eq!(
+                    d.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &centered_triangle()),
+                    0
+                );
+            });
+            let expected = if src == 0x80ff_0000 {
+                alpha * 85 * 0x0101_0101
+            } else {
+                ((alpha * 85) << 24) | 0x0040_80bf
+            };
+            mtld3d_tests::assert_pixel_approx(
+                h.read_pixel(320, 280),
+                expected,
+                1,
+                "packed vertex fetch",
+            );
+        }
+    }
+}

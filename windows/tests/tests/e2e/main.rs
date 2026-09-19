@@ -9,6 +9,7 @@
 //! installs its own global allocator. `COVERAGE.md` indexes the modules;
 //! this file only declares them.
 
+mod a2r10g10b10;
 mod buffers;
 mod clip_planes;
 mod d3d9ex;

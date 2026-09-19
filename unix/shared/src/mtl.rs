@@ -110,6 +110,8 @@ pub enum PixelFormat {
     /// `newTextureViewWithPixelFormat:` over a `Bgra8Unorm` texture when a
     /// sampler requests `D3DSAMP_SRGBTEXTURE`.
     Bgra8UnormSrgb = 81,
+    /// Packed normalized B10/G10/R10/A2 from low to high bits. D3D9 `D3DFMT_A2R10G10B10`.
+    Bgr10A2Unorm = 94,
     /// 64-bit two-channel float. D3D9 `D3DFMT_G32R32F`.
     Rg32Float = 105,
     /// 64-bit four-channel unorm. D3D9 `D3DFMT_A16B16G16R16`.
@@ -205,6 +207,7 @@ impl PixelFormat {
             | Self::Rgba8Snorm
             | Self::Bgra8Unorm
             | Self::Bgra8UnormSrgb
+            | Self::Bgr10A2Unorm
             | Self::Depth32Float => BlockLayout::pixel(4),
             Self::Rg32Float
             | Self::Rgba16Unorm

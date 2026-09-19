@@ -1347,3 +1347,16 @@ Signed-format ColorFill on DEFAULT offscreen plain surfaces still reaches
 the existing missing fill-codec path, which warns and returns success without
 writing. This also affects V8U8, V16U16 and Q8W8V8U8; native sampling support
 does not resolve that separate ColorFill gap.
+
+### device.c/test_getdc, A2R10G10B10
+
+A2R10G10B10 CPU surfaces and textures are creatable with native four-byte
+packed words. The format35 row at 9014 expects GetDC to fail; its creation
+skip at 9064 disappears, but that row does not verify uploaded pixels.
+The dedicated regression suite checks sampled ten-bit precision, two-bit
+alpha and raw lock/copy bytes. Native BGR10A2Unorm needs no channel view or
+texture conversion. This capability excludes display/backbuffer, render-target,
+sRGB and legacy bump-map usages. Texture/cube AUTOGEN returns NOAUTOGEN and
+uses one physical level with raw usage retained. DEFAULT offscreen ColorFill
+uses nearest normalized channel scaling in the existing packed encoder;
+byte-exact Windows-driver rounding has not been measured.

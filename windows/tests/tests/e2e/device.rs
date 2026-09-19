@@ -180,8 +180,8 @@ fn check_device_format_accept_and_reject() {
     );
     assert_eq!(
         h.check_device_format(D3DFMT_X8R8G8B8, 0, D3DRTYPE_TEXTURE, D3DFMT_A2R10G10B10),
-        D3DERR_NOTAVAILABLE,
-        "A2R10G10B10 texture must be NOTAVAILABLE",
+        0,
+        "A2R10G10B10 texture should be supported",
     );
     // D3DUSAGE_AUTOGENMIPMAP needs render-target capability. A renderable
     // format succeeds; a supported-but-non-renderable format (DXT1) returns the
