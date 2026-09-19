@@ -17,6 +17,9 @@ divergences from D3D9 it keeps on purpose. The tested games are in the
 - Compressed (DXT1 to DXT5, ATI1), integer and float formats, cube and volume
   textures, auto-generated mipmaps, `StretchRect` with format conversion and
   YUV decoding, `GetDC`.
+- Managed 2D texture publication through `AddDirtyRect`, including scaled
+  mip regions. `NO_DIRTY_UPDATE` leaves initialized GPU content unchanged
+  until publication; initial uploads and eviction retain their CPU source.
 - Raw sampleable depth (INTZ, DF16, DF24), hardware shadow comparisons on
   standard depth formats, depth bias, the full two-sided stencil test, and
   GPU-only plain depth textures for RESZ destinations. Dynamic DEFAULT-pool
