@@ -237,6 +237,20 @@ record. A knob, where one makes sense, is named with its default.
   `D3DPRASTERCAPS_MULTISAMPLE_TOGGLE` is not advertised, which is how D3D9
   says the toggle is unavailable, and the first write is logged. No knob.
 
+## Fill-mode coverage
+
+`D3DFILL_WIREFRAME` uses Metal's native triangle-line fill, preserving triangle
+culling and the existing triangle-list conversion for fans. `D3DFILL_POINT`
+remains unimplemented: Metal exposes solid and line polygon fill only, and the
+layer warns once before drawing solid. D3D9 has no fill-mode capability bit.
+
+The upstream `stateblock.c` covers the solid default, stored wireframe value,
+and pixel-stateblock membership (`render_state_indices`,
+`render_state_default_data_init`, `render_state_test_data_init` and
+`render_state_test_init`). It has no visual fill-mode assertion. The end-to-end
+suite covers rendered edges and interiors, state transitions and internal
+clear triangles; these capabilities do not imply a baseline count reduction.
+
 ## What the baseline records — and where classes live
 
 Each datum has exactly one authoritative home, split by who writes it:

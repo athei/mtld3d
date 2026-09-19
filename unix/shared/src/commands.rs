@@ -1,6 +1,6 @@
 use strum::FromRepr;
 
-use super::mtl::{CullMode, IndexType, PrimitiveType, VisibilityResultMode};
+use super::mtl::{CullMode, IndexType, PrimitiveType, TriangleFillMode, VisibilityResultMode};
 
 /// Metal render command encoder commands.
 ///
@@ -119,6 +119,8 @@ pub enum CommandType {
     PushDebugGroup = 25,
     /// `encoder.popDebugGroup()`, closing a [`CommandType::PushDebugGroup`].
     PopDebugGroup = 26,
+    /// `encoder.setTriangleFillMode(mode)`
+    SetTriangleFillMode = 27,
 }
 
 /// Dimensionality of the opaque-black texture a null-texture bind selects.
@@ -236,6 +238,18 @@ impl Command {
             cmd: CommandType::SetDepthStencilState as u32,
             param_a: 0,
             param_b: state_handle,
+            param_c: 0,
+            param_d: 0,
+        }
+    }
+
+    /// `encoder.setTriangleFillMode(mode)`
+    #[must_use]
+    pub const fn set_triangle_fill_mode(mode: TriangleFillMode) -> Self {
+        Self {
+            cmd: CommandType::SetTriangleFillMode as u32,
+            param_a: mode as u32,
+            param_b: 0,
             param_c: 0,
             param_d: 0,
         }

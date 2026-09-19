@@ -6,7 +6,7 @@ use mtld3d_types::{
 use super::*;
 
 /// Every render state this module classifies as an enum.
-const ENUM_STATES: [u32; 17] = [
+const ENUM_STATES: [u32; 18] = [
     D3DRS_ZFUNC,
     D3DRS_ALPHAFUNC,
     D3DRS_STENCILFUNC,
@@ -18,6 +18,7 @@ const ENUM_STATES: [u32; 17] = [
     D3DRS_BLENDOP,
     D3DRS_BLENDOPALPHA,
     D3DRS_CULLMODE,
+    D3DRS_FILLMODE,
     D3DRS_STENCILFAIL,
     D3DRS_STENCILZFAIL,
     D3DRS_STENCILPASS,

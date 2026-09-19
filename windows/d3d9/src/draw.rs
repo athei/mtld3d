@@ -14,7 +14,7 @@ pub use mtld3d_core::shader_cache::{
 use mtld3d_core::{
     convert::{
         DecalHeuristicInputs, IMPLICIT_DECAL_BIAS_RAW, IMPLICIT_DECAL_SLOPE_SCALE,
-        d3d_depth_bias_to_metal, d3d_to_metal_cull, looks_like_decal,
+        d3d_depth_bias_to_metal, d3d_to_metal_cull, d3d_to_metal_fill, looks_like_decal,
     },
     depth_stencil_state::{DepthStencilSnapshot, STENCIL_MASK_BITS},
     dirty_range::{indexed_vb_range_lower_bound, nonindexed_vb_range},
@@ -1123,6 +1123,7 @@ pub struct RenderStateSnapshot {
     /// this same snapshot, so the two cannot drift apart.
     pub depth_stencil_state: DepthStencilSnapshot,
     pub cull_mode: u8,
+    pub fill_mode: u8,
     pub scissor_rect: [u16; 4],
     /// Constant RGBA referenced by `MTLBlendFactor::BlendColor` / `OneMinusBlendColor`.
     ///
@@ -1712,6 +1713,8 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
     if enc.last_bound().cull_mode_changed(metal_cull) {
         enc.emit_command(Command::set_cull_mode(metal_cull));
     }
+
+    enc.emit_triangle_fill_mode(d3d_to_metal_fill(u32::from(render_state.fill_mode)));
 
     // D3DRS_DEPTHBIAS / D3DRS_SLOPESCALEDEPTHBIAS drive Metal's
     // per-encoder rasterizer offset. Routed through `LastBoundCache`
