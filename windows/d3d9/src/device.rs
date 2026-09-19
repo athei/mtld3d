@@ -897,6 +897,41 @@ bitflags::bitflags! {
 }
 
 impl DeviceInner {
+    /// Read the implicit front buffer into a validated caller-owned surface.
+    ///
+    /// Both front-buffer entry points use the persistent backbuffer and the
+    /// same extent/format policy. The caller holds this device's API lock.
+    pub fn read_front_buffer(&mut self, dst_surf: &Direct3DSurface9) -> i32 {
+        let Some(dst_desc) = dst_surf.system_memory_blit_dst() else {
+            warn_readback_rejected("GetFrontBufferData", ReadbackReject::NotSystemMemory);
+            return D3DERR_INVALIDCALL;
+        };
+        // Front-buffer reads are approximated by the persistent back-buffer
+        // texture, whose extent and layout the destination is measured against.
+        let source = ReadbackSource {
+            width: self.backbuffer_width,
+            height: self.backbuffer_height,
+            format: self.current_frame.backbuffer_format(),
+        };
+        if reject_readback("GetFrontBufferData", &source, &dst_desc).is_some() {
+            return D3DERR_INVALIDCALL;
+        }
+        let hr = blit_texture_to_systemmem(
+            self,
+            &SystemMemReadback::for_readback(
+                self.backbuffer_handle,
+                // The back-buffer texture is one image: mip 0, slice 0.
+                (0, 0),
+                (source.width, source.height),
+                &dst_desc,
+            ),
+        );
+        if hr == D3D_OK {
+            dst_surf.note_system_memory_written();
+        }
+        hr
+    }
+
     /// The scale a game-created render target or depth-stencil of this size inherits.
     ///
     /// A surface created at exactly the resolution D3D9 reports for the back
@@ -6745,11 +6780,17 @@ fn readback_from_texture_rt(
 
 extern "system" fn device_get_front_buffer_data(
     this: *mut c_void,
-    _swap_chain: u32,
+    swap_chain: u32,
     dst_surface: *mut c_void,
 ) -> i32 {
     let _api = device_api_lock(this);
     let _timer = device_timer(this, DeviceSubCategory::Misc);
+    // Only the implicit swapchain is addressed by this device entry point.
+    if swap_chain != 0 {
+        mtld3d_shared::log_once_warn!(target: LOG_TARGET,
+            "reject GetFrontBufferData swapchain={swap_chain} → INVALIDCALL (expected 0)");
+        return D3DERR_INVALIDCALL;
+    }
     // SAFETY: vtable thunk; `this` is *mut Direct3DDevice9 per IDirect3DDevice9 ABI.
     let Some(obj) = (unsafe { InPtr::<Direct3DDevice9>::opt(this) }) else {
         return D3DERR_INVALIDCALL;
@@ -6758,35 +6799,7 @@ extern "system" fn device_get_front_buffer_data(
     let Some(dst_surf) = (unsafe { InPtr::<Direct3DSurface9>::opt(dst_surface) }) else {
         return D3DERR_INVALIDCALL;
     };
-    let Some(dst_desc) = dst_surf.system_memory_blit_dst() else {
-        warn_readback_rejected("GetFrontBufferData", ReadbackReject::NotSystemMemory);
-        return D3DERR_INVALIDCALL;
-    };
-    let device_inner = obj.inner();
-    // Front-buffer reads are approximated by the persistent back-buffer
-    // texture, whose extent and layout the destination is measured against.
-    let source = ReadbackSource {
-        width: device_inner.backbuffer_width,
-        height: device_inner.backbuffer_height,
-        format: device_inner.current_frame.backbuffer_format(),
-    };
-    if reject_readback("GetFrontBufferData", &source, &dst_desc).is_some() {
-        return D3DERR_INVALIDCALL;
-    }
-    let hr = blit_texture_to_systemmem(
-        device_inner,
-        &SystemMemReadback::for_readback(
-            device_inner.backbuffer_handle,
-            // The back-buffer texture is one image: mip 0, slice 0.
-            (0, 0),
-            (source.width, source.height),
-            &dst_desc,
-        ),
-    );
-    if hr == D3D_OK {
-        dst_surf.note_system_memory_written();
-    }
-    hr
+    obj.inner().read_front_buffer(&dst_surf)
 }
 
 /// Flush pending GPU work, then blit a Metal color texture into system memory.

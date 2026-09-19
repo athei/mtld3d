@@ -5389,3 +5389,161 @@ fn a_render_target_row_no_draw_covers_reads_black() {
         "the target holds the draw and the creation clear, nothing else",
     );
 }
+
+#[test]
+fn front_buffer_readback_accepts_the_implicit_swapchain_entry_point() {
+    let h = Harness::new();
+    assert_eq!(h.clear_target(MAGENTA), D3D_OK);
+    assert_eq!(h.present(), D3D_OK);
+    let (_, desc) = h.render_target(0).desc();
+    let readback = h.create_offscreen_plain_surface(
+        desc.width,
+        desc.height,
+        D3DFMT_A8R8G8B8,
+        D3DPOOL_SYSTEMMEM,
+    );
+    assert_eq!(h.get_front_buffer_data_hr(&readback), D3D_OK);
+    {
+        let mut lock = readback.lock_rect(0);
+        lock.write_u32_rect(
+            desc.width as usize,
+            desc.height as usize,
+            &vec![GREEN; (desc.width * desc.height) as usize],
+        );
+    }
+    assert_eq!(
+        h.implicit_swapchain().front_buffer_data(Some(&readback)),
+        D3D_OK
+    );
+    let lock = readback.lock_rect(D3DLOCK_READONLY);
+    let idx = ((desc.height / 2) * (lock.pitch().cast_unsigned() / 4) + desc.width / 2) as usize;
+    assert_eq!(
+        lock.as_u32(idx + 1)[idx] & 0x00ff_ffff,
+        MAGENTA & 0x00ff_ffff
+    );
+}
+
+#[test]
+fn front_buffer_readback_rejects_invalid_device_swapchain_indices() {
+    let h = Harness::new();
+    assert_eq!(h.clear_target(MAGENTA), D3D_OK);
+    assert_eq!(h.present(), D3D_OK);
+    let (_, desc) = h.render_target(0).desc();
+    let readback = h.create_offscreen_plain_surface(
+        desc.width,
+        desc.height,
+        D3DFMT_A8R8G8B8,
+        D3DPOOL_SYSTEMMEM,
+    );
+    for index in [1, u32::MAX] {
+        {
+            let mut lock = readback.lock_rect(0);
+            lock.write_u32_rect(
+                desc.width as usize,
+                desc.height as usize,
+                &vec![GREEN; (desc.width * desc.height) as usize],
+            );
+        }
+        assert_eq!(
+            h.get_front_buffer_data_index_hr(index, &readback),
+            D3DERR_INVALIDCALL
+        );
+        let lock = readback.lock_rect(D3DLOCK_READONLY);
+        assert_eq!(
+            lock.as_u32(1)[0],
+            GREEN,
+            "rejected read leaves the destination untouched"
+        );
+    }
+}
+
+#[test]
+fn front_buffer_readback_preserves_rejected_destinations_and_references() {
+    let h = Harness::new();
+    assert_eq!(h.clear_target(MAGENTA), D3D_OK);
+    assert_eq!(h.present(), D3D_OK);
+    let before = h.device_refcount();
+    let chain = h.implicit_swapchain();
+    assert_eq!(h.device_refcount(), before + 1);
+    let (_, desc) = h.render_target(0).desc();
+    for (width, height, format, pool) in [
+        (desc.width, desc.height, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED),
+        (32, 16, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM),
+        (desc.width, desc.height, D3DFMT_A8B8G8R8, D3DPOOL_SYSTEMMEM),
+    ] {
+        let texture = h.create_texture(width, height, 1, 0, format, pool);
+        {
+            let mut lock = texture.lock_rect(0, 0);
+            lock.write_u32_rect(
+                width as usize,
+                height as usize,
+                &vec![GREEN; (width * height) as usize],
+            );
+        }
+        let surface = texture.surface_level(0);
+        let held = h.device_refcount();
+        assert_eq!(chain.front_buffer_data(Some(&surface)), D3DERR_INVALIDCALL);
+        assert_eq!(h.device_refcount(), held);
+        let lock = surface.lock_rect(D3DLOCK_READONLY);
+        assert_eq!(lock.as_u32(1)[0], GREEN);
+    }
+    let dst = h.create_offscreen_plain_surface(
+        desc.width,
+        desc.height,
+        D3DFMT_A8R8G8B8,
+        D3DPOOL_SYSTEMMEM,
+    );
+    {
+        let mut lock = dst.lock_rect(0);
+        lock.write_u32_rect(
+            desc.width as usize,
+            desc.height as usize,
+            &vec![GREEN; (desc.width * desc.height) as usize],
+        );
+    }
+    assert_eq!(chain.front_buffer_data(None), D3DERR_INVALIDCALL);
+    assert_eq!(chain.front_buffer_data_null_this(&dst), D3DERR_INVALIDCALL);
+    let additional = h.additional_swapchain();
+    assert_eq!(additional.front_buffer_data(Some(&dst)), D3DERR_INVALIDCALL);
+    assert_eq!(
+        h.get_front_buffer_data_index_hr(1, &dst),
+        D3DERR_INVALIDCALL
+    );
+    {
+        let lock = dst.lock_rect(D3DLOCK_READONLY);
+        assert_eq!(lock.as_u32(1)[0], GREEN);
+    }
+    drop(additional);
+    drop(dst);
+    drop(chain);
+    assert_eq!(h.device_refcount(), before);
+}
+
+#[test]
+fn front_buffer_readback_held_swapchain_tracks_reset_and_msaa() {
+    for samples in [
+        mtld3d_types::D3DMULTISAMPLE_NONE,
+        mtld3d_types::D3DMULTISAMPLE_2_SAMPLES,
+    ] {
+        let h = Harness::create(&HarnessConfig {
+            multi_sample_type: samples,
+            ..HarnessConfig::default()
+        });
+        let chain = h.implicit_swapchain();
+        for (width, height, color) in [(640, 480, MAGENTA), (320, 240, BLUE)] {
+            assert_eq!(h.reset(width, height), D3D_OK);
+            assert_eq!(h.clear_target(color), D3D_OK);
+            assert_eq!(h.present(), D3D_OK);
+            let texture = h.create_texture(width, height, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM);
+            let surface = texture.surface_level(0);
+            let held = h.device_refcount();
+            assert_eq!(chain.front_buffer_data(Some(&surface)), D3D_OK);
+            assert_eq!(h.device_refcount(), held);
+            {
+                let lock = surface.lock_rect(D3DLOCK_READONLY);
+                let idx = ((height / 2) * (lock.pitch().cast_unsigned() / 4) + width / 2) as usize;
+                assert_eq!(lock.as_u32(idx + 1)[idx] & 0x00ff_ffff, color & 0x00ff_ffff);
+            }
+        }
+    }
+}

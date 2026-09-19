@@ -19,8 +19,8 @@ use crate::{
     check::expect_ok,
     ffi::Direct3DCreate9,
     resource::{
-        CubeTexture, IndexBuffer, PixelShader, Query, StateBlock, Surface, Texture, VertexBuffer,
-        VertexDeclaration, VertexShader, VolumeTexture,
+        CubeTexture, IndexBuffer, PixelShader, Query, StateBlock, Surface, SwapChain, Texture,
+        VertexBuffer, VertexDeclaration, VertexShader, VolumeTexture,
     },
     vtbl::deref_vtbl,
     win32,
@@ -2608,10 +2608,53 @@ impl Harness {
         unsafe { (self.dev_vtbl().update_texture)(self.device, src.as_ptr(), dst.as_ptr()) }
     }
 
-    /// `GetFrontBufferData` (a documented stub today). Returns the hr.
+    /// Read the device's implicit front buffer into `dst`.
     pub fn get_front_buffer_data_hr(&self, dst: &Surface<'_>) -> i32 {
+        self.get_front_buffer_data_index_hr(0, dst)
+    }
+
+    /// Probe a device front-buffer read with an explicit swapchain index.
+    pub fn get_front_buffer_data_index_hr(&self, index: u32, dst: &Surface<'_>) -> i32 {
         // SAFETY: vtable thunk; `dst` is a live surface.
-        unsafe { (self.dev_vtbl().get_front_buffer_data)(self.device, 0, dst.as_ptr()) }
+        unsafe { (self.dev_vtbl().get_front_buffer_data)(self.device, index, dst.as_ptr()) }
+    }
+
+    /// Acquire an owned reference to the implicit swapchain.
+    ///
+    /// # Panics
+    /// Panics if `GetSwapChain` fails.
+    pub fn implicit_swapchain(&self) -> SwapChain<'_> {
+        let mut chain = core::ptr::null_mut();
+        // SAFETY: live device and initialized output for its implicit swapchain.
+        let hr = unsafe { (self.dev_vtbl().get_swap_chain)(self.device, 0, &raw mut chain) };
+        expect_ok(hr, "GetSwapChain");
+        // SAFETY: successful query returned one owned reference, tied to self.
+        unsafe { SwapChain::from_raw(chain) }
+    }
+
+    /// Create an additional windowed swapchain on this harness's window.
+    ///
+    /// # Panics
+    /// Panics if `CreateAdditionalSwapChain` fails.
+    pub fn additional_swapchain(&self) -> SwapChain<'_> {
+        let cfg = HarnessConfig {
+            width: self.width.get(),
+            height: self.height.get(),
+            ..HarnessConfig::default()
+        };
+        let mut pp = present_params(&cfg, self.hwnd);
+        let mut chain = core::ptr::null_mut();
+        // SAFETY: live device, valid presentation parameters and writable output.
+        let hr = unsafe {
+            (self.dev_vtbl().create_additional_swap_chain)(
+                self.device,
+                (&raw mut pp).cast::<c_void>(),
+                &raw mut chain,
+            )
+        };
+        expect_ok(hr, "CreateAdditionalSwapChain");
+        // SAFETY: successful creation returned one owned reference, tied to self.
+        unsafe { SwapChain::from_raw(chain) }
     }
 
     /// `CreateOffscreenPlainSurface` returning the raw hr, for the rejection paths.
