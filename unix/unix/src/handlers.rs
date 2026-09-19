@@ -848,20 +848,11 @@ pub extern "C" fn create_textures_batch_handler(args: *mut c_void) -> i32 {
             params.count as usize,
         )
     };
-    // SAFETY: PE allocates a `[MetalHandle<MTLTextureKind>; count]` slice
-    // and hands its raw pointer here; the layout is wire-compatible with
-    // `u64` (`#[repr(transparent)]`).
-    let handles = unsafe {
+    // SAFETY: PE supplied an initialized, aligned TextureViews array of
+    // count elements with exclusive access for the duration of this call.
+    let views = unsafe {
         core::slice::from_raw_parts_mut(
-            params.handles_out_ptr as *mut MetalHandle<MTLTextureKind>,
-            params.count as usize,
-        )
-    };
-    // SAFETY: same wire contract as `handles_out_ptr` — a caller-owned
-    // `[MetalHandle<MTLTextureKind>; count]` slice for the sRGB twin views.
-    let srgb_handles = unsafe {
-        core::slice::from_raw_parts_mut(
-            params.srgb_handles_out_ptr as *mut MetalHandle<MTLTextureKind>,
+            params.views_out_ptr as *mut mtld3d_shared::texture_views::TextureViews,
             params.count as usize,
         )
     };
@@ -869,19 +860,14 @@ pub extern "C" fn create_textures_batch_handler(args: *mut c_void) -> i32 {
     // Collected rather than cleared per element, so the batch costs one
     // command buffer instead of one each.
     let mut clear_on_create: Vec<MetalHandle<MTLTextureKind>> = Vec::new();
-    for ((desc, slot), srgb_slot) in descs.iter().zip(handles.iter_mut()).zip(srgb_handles) {
-        if let Some((handle, srgb_handle)) = metal::create_texture(&device, desc) {
-            // SAFETY: `create_texture` returns the raw u64s of freshly
-            // retained MTLTextures; adopt them as the canonical typed handles.
-            *slot = unsafe { MetalHandle::<MTLTextureKind>::new(handle) };
-            // SAFETY: as above; 0 (no twin) adopts as NULL.
-            *srgb_slot = unsafe { MetalHandle::<MTLTextureKind>::new(srgb_handle) };
+    for (desc, slot) in descs.iter().zip(views) {
+        if let Some(created) = metal::create_texture(&device, desc) {
+            *slot = created;
             if desc.flags.contains(TextureCreateFlags::CLEAR_ON_CREATE) {
-                clear_on_create.push(*slot);
+                clear_on_create.push(slot.linear);
             }
         } else {
-            *slot = MetalHandle::NULL;
-            *srgb_slot = MetalHandle::NULL;
+            *slot = mtld3d_shared::texture_views::TextureViews::EMPTY;
             any_failed = true;
             error!(
                 target: LOG_TARGET,

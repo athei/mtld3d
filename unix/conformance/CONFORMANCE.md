@@ -907,18 +907,17 @@ the same Rule B depth-store elision as z_range_test.
 Sites: 12008=expected
 
 Renders into a one- or two-channel texture (G16R16, R16F, G16R16F, R32F,
-G32R32F) with blending on, then samples it and expects the channels the
-format does not store to read as 1.0 (`0x001820ff`, blue forced to `ff`). We
-return `0x00182000`: the stored channels are exact, the missing ones read 0.
-The 1.0 rule is implemented as a sampler swizzle on the texture view, and
-Metal forbids `RenderTarget` usage on a swizzled view, so a render-target
-texture is bound as its base texture and loses the swizzle when sampled. The
-same trade already covers X8R8G8B8 render targets (`unix/unix/src/metal/
-texture.rs`). Lifting it means carrying two handles per render-target
-texture (base for attachment, swizzled view for sampling); worth doing only
-if a workload samples its own single/dual-channel render target and relies
-on the missing lanes. The four-channel members (A16B16G16R16F,
-A32B32G32R32F) and L8 pass.
+G32R32F) with blending on, then samples it and expects absent channels to
+read as 1.0. Render targets now keep separate attachment and sampling views,
+including both linear and sRGB roles for X8 formats. Native Apple GPUs apply
+the sampling swizzle while stored channels retain their blended values.
+
+The remaining failure is the Mac2 Paravirtual device's ignored texture-view
+swizzle, shared with ordinary sampled textures below. It reads absent colour
+lanes as zero despite reporting the requested view swizzle. The E2E controls
+compare those lanes with an ordinary same-format texture on that device and
+still verify stored lanes, mip and cube addressing, and view retirement.
+Physical-GPU tests additionally require the specified all-ones missing lanes.
 
 ### visual.c/test_fetch4
 Sites: 15668=ceiling 15727=expected

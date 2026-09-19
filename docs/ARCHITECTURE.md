@@ -128,6 +128,22 @@ and render buffers on the queue when the pending present had to be copied. Every
 registers at its commit and never before, so a submission that fails midway leaves nothing
 registered that never commits.
 
+## Texture attachment and sampling views
+
+`TextureViews` carries linear and sRGB attachment handles separately from
+linear and sRGB sampling handles. Identity-swizzled textures alias the existing
+handles. A render target with a channel swizzle keeps renderable attachments
+and pre-creates sampling views over the same storage. Bind getters load these
+resolved handles directly; they do not create or discover views while drawing.
+The creation batch owns one retain per distinct non-null handle, even when
+several roles alias one native object.
+
+Pass analysis resolves all views through one view-to-resource map. Its reverse
+sRGB map contains only renderable attachment views. Release and rename detach
+attachment selection immediately, while forward aliases survive final store
+and clear-coalescing decisions until the existing GPU retirement boundary.
+The retirement walk removes each alias before destroying its native object.
+
 ## One attachment record per device
 
 D3D9 allows several devices per process, and the e2e suite creates two live ones. Everything the display decides for one device's window therefore lives on a per-device record on the unix side (`metal/macdrv/attachment.rs`), not in process statics: whether the layer carries the HDR configuration, the live EDR headroom, the present throttle, the window's occlusion, the backing scale published to the PE side, and the present-geometry streak that gates the MetalFX route. `AttachMetalLayer` registers the record, keyed by the raw address of the metal view it created, which is the handle the device's later thunks already carry: the presenter looks its record up by the `present_view` each packet carries, once per present, `DestroyCommandQueue` retires it by `view_handle`, `SetDisplaySyncEnabled` finds it by `layer_handle`, and `SetCursorOverlay` names it by the `view_handle` it carries. A thunk whose view has no record warns once and, for a present, uses the defaults a session on no display would (not occluded, headroom 1.0, no throttle, the stretch route).
