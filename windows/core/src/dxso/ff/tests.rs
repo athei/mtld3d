@@ -64,6 +64,57 @@ fn default_ps_key() -> FfPsKey {
 }
 
 #[test]
+fn premultiplied_blend_reads_unmodified_texture_alpha_for_both_channels() {
+    use mtld3d_types::{D3DTA_COMPLEMENT, D3DTA_TFACTOR, D3DTOP_BLENDTEXTUREALPHAPM};
+
+    let mut ps = default_ps_key();
+    ps.stages[0] = FfStage {
+        color_op: narrow(D3DTOP_BLENDTEXTUREALPHAPM),
+        color_arg1: narrow(D3DTA_DIFFUSE | D3DTA_COMPLEMENT | D3DTA_ALPHAREPLICATE),
+        color_arg2: narrow(D3DTA_TFACTOR),
+        alpha_op: narrow(D3DTOP_BLENDTEXTUREALPHAPM),
+        alpha_arg1: narrow(D3DTA_DIFFUSE),
+        alpha_arg2: narrow(D3DTA_CURRENT),
+        has_texture: true,
+    };
+    assert_eq!(ps.sampled_stage_mask(), 1);
+    assert!(ps.reads_texture_factor());
+    let msl = emit_ps_ff(&ps, VariantKey::default());
+    assert!(
+        msl.contains("float4 t0 = s0.sample(samp0, in.texcoord0.xy);"),
+        "{msl}"
+    );
+    assert!(
+        msl.contains("saturate((1.0 - in.color0.aaaa) + ps_c[0] * (1.0 - t0.a))"),
+        "{msl}"
+    );
+    assert!(
+        msl.contains("saturate(in.color0 + current * (1.0 - t0.a))"),
+        "{msl}"
+    );
+
+    ps.stages[0].has_texture = false;
+    assert_eq!(ps.sampled_stage_mask(), 0);
+    let missing = emit_ps_ff(&ps, VariantKey::default());
+    assert!(!missing.contains("[[texture(0)]]"), "{missing}");
+    assert!(
+        missing.contains("saturate((1.0 - in.color0.aaaa) + ps_c[0])"),
+        "{missing}"
+    );
+    assert!(
+        missing.contains("saturate(in.color0 + current)"),
+        "{missing}"
+    );
+
+    ps.stages[0].color_arg1 = narrow(D3DTA_TEXTURE | D3DTA_COMPLEMENT);
+    let explicit_missing = emit_ps_ff(&ps, VariantKey::default());
+    assert!(
+        explicit_missing.contains("current = float4((current).rgb,"),
+        "{explicit_missing}"
+    );
+}
+
+#[test]
 fn emits_two_step_wv_then_proj() {
     let vs = default_vs_key();
     let ps = default_ps_key();
@@ -1416,4 +1467,38 @@ fn dotproduct3_unbound_color_keeps_independent_alpha() {
     ps.stages[0].color_arg1 = narrow(D3DTA_CURRENT);
     assert_eq!(fallback, emit_ps_ff(&ps, VariantKey::default()));
     assert!(fallback.contains("current = float4((current).rgb, (ps_c[0]).a);"));
+}
+
+#[test]
+fn premultiplied_alpha_follows_effective_dotproduct3_color() {
+    use mtld3d_types::{D3DTA_TFACTOR, D3DTOP_BLENDTEXTUREALPHAPM, D3DTOP_DOTPRODUCT3};
+
+    for has_texture in [false, true] {
+        let mut ps = default_ps_key();
+        ps.stages[0] = FfStage {
+            color_op: narrow(D3DTOP_DOTPRODUCT3),
+            color_arg1: narrow(D3DTA_DIFFUSE),
+            color_arg2: narrow(D3DTA_TFACTOR),
+            alpha_op: narrow(D3DTOP_SELECTARG1),
+            alpha_arg1: narrow(D3DTA_DIFFUSE),
+            alpha_arg2: narrow(D3DTA_TFACTOR),
+            has_texture,
+        };
+        let dot = emit_ps_ff(&ps, VariantKey::default());
+        ps.stages[0].alpha_op = narrow(D3DTOP_BLENDTEXTUREALPHAPM);
+        assert_eq!(dot, emit_ps_ff(&ps, VariantKey::default()));
+
+        // A missing explicit color argument falls back before DOT3 can
+        // override alpha, leaving the independent PM operation effective.
+        ps.stages[0].has_texture = false;
+        ps.stages[0].color_arg1 = narrow(D3DTA_TEXTURE);
+        let fallback = emit_ps_ff(&ps, VariantKey::default());
+        assert!(
+            fallback
+                .contains("current = float4((current).rgb, (saturate(in.color0 + ps_c[0])).a);")
+        );
+        ps.stages[0].color_op = narrow(D3DTOP_SELECTARG1);
+        ps.stages[0].color_arg1 = narrow(D3DTA_CURRENT);
+        assert_eq!(fallback, emit_ps_ff(&ps, VariantKey::default()));
+    }
 }

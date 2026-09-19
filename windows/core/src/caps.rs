@@ -250,9 +250,6 @@ const ADDRESS_DEFAULT: AddressCaps = AddressCaps::WRAP
 const STENCIL_DEFAULT: StencilCaps = StencilCaps::all();
 
 /// Fixed-function texture blend operations the FF pixel-shader emitter implements.
-///
-/// `BLENDTEXTUREALPHAPM` is intentionally absent: `dxso::ff` does not emit the
-/// premultiplied form.
 const TEXOP_DEFAULT: TexOpCaps = TexOpCaps::DISABLE
     .union(TexOpCaps::SELECTARG1)
     .union(TexOpCaps::SELECTARG2)
@@ -266,6 +263,7 @@ const TEXOP_DEFAULT: TexOpCaps = TexOpCaps::DISABLE
     .union(TexOpCaps::ADDSMOOTH)
     .union(TexOpCaps::BLENDDIFFUSEALPHA)
     .union(TexOpCaps::BLENDTEXTUREALPHA)
+    .union(TexOpCaps::BLENDTEXTUREALPHAPM)
     .union(TexOpCaps::BLENDFACTORALPHA)
     .union(TexOpCaps::BLENDCURRENTALPHA)
     .union(TexOpCaps::DOTPRODUCT3);

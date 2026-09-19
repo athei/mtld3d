@@ -335,6 +335,20 @@ Sites 19210, 19217 and 19232 pass on both architectures in the local normal,
 Intel and scale variants and in both hosted Mac2 recordings. Their obsolete
 baseline pins are removed.
 
+## Premultiplied texture-alpha blending
+
+`BLENDTEXTUREALPHAPM` is advertised and emits
+`saturate(arg1 + arg2 * (1 - texture_alpha))` for color and alpha operations.
+Wine's `visual.c/texop_test` exercises its previously skipped row. The direct
+E2E also checks implicit texture-alpha use with nontexture arguments,
+argument modifiers and saturation before a following texture stage.
+
+An implicit-only missing texture uses zero alpha, following the native
+observation recorded in DXVK commit `0b49a39896f25896b83ed01c0609393dfc3bb85c`.
+This is a reference choice, not a new native measurement: Wine's D3D9 GL
+dummy texture uses alpha one. Existing explicit-unbound-argument handling
+and ordinary `BLENDTEXTUREALPHA` behavior remain unchanged.
+
 ## What the baseline records — and where classes live
 
 Each datum has exactly one authoritative home, split by who writes it:
