@@ -123,6 +123,13 @@ pub trait Launcher {
     /// Returns the reason when the file cannot be written.
     fn keep_stderr(&self, pid: u32, stderr: &str) -> Result<PathBuf, String>;
 
+    /// Keep the captured streams and exit status of an abnormal completed process.
+    ///
+    /// # Errors
+    ///
+    /// Returns the reason when the diagnostic file cannot be written.
+    fn keep_process(&self, end: &ProcessEnd) -> Result<PathBuf, String>;
+
     /// Keep the layer's own log of the process `pid`, and read its account of the end.
     ///
     /// The layer writes every line, its crash report included, into this
@@ -368,9 +375,18 @@ pub fn run_binary(
             }
             let reason = end.kind.describe();
             if tallied && complete {
+                let kept = match launcher.keep_process(&end) {
+                    Ok(path) => format!(
+                        "its captured output and exit status are in {}",
+                        path.display()
+                    ),
+                    Err(why) => {
+                        format!("its captured output and exit status could not be kept ({why})")
+                    }
+                };
                 report.note(&format!(
-                "the process ended with {reason} after reporting every test; nothing to run again"
-            ));
+                    "the process ended with {reason} after reporting every test; nothing to run again; {kept}"
+                ));
                 break;
             }
 

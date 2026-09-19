@@ -253,6 +253,7 @@ jobs:
             ${{ runner.temp }}/*.log
             ${{ runner.temp }}/*.stderr
             ${{ runner.temp }}/*.layer-log
+            ${{ runner.temp }}/*.process-log
           retention-days: 14
           if-no-files-found: ignore
       # The job budget is twenty minutes. Include five minutes of bounded

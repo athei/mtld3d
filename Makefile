@@ -635,6 +635,8 @@ stage: all
 # the PE side, where the unix root is drive Z, and the runner writes the whole
 # stderr of every process that died there beside those logs and moves the
 # layer's log of that process next to it, out of the layer's own retention.
+# Abnormal exits after complete test reports also keep captured stdout, stderr
+# and exit status together in a .process-log file, without changing verdicts.
 # Ten files of each kind are kept per directory.
 INTEL_CONF := intel.expandPacked16=true;intel.denyFloat32Filtering=true;intel.managedMemory=true;intel.linearAlign256=true
 MTLD3D_CONF_TEST := shaderCache.enable=false;color.hdr.enable=false;debug.mainThreadChecker=true$(if $(SCALE),;render.scale=$(SCALE))$(if $(INTEL),;$(INTEL_CONF))$(if $(LOG_DIR),;log.dir=Z:$(LOG_DIR))

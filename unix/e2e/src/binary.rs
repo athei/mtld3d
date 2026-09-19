@@ -22,6 +22,9 @@ use crate::{
 /// How many kept files of each kind a directory holds, as many as the layer keeps logs.
 const KEEP: usize = 10;
 
+/// A completed abnormal process's captured streams and exit status.
+const PROCESS_LOG_EXT: &str = "process-log";
+
 /// Windows command-line capacity in UTF-16 units, including the terminating NUL.
 const COMMAND_LINE_UNITS: usize = 32_767;
 
@@ -174,6 +177,10 @@ impl Launcher for WineLauncher {
         keep_stderr(&self.log_dir, &binary_name(&self.exe), pid, stderr)
     }
 
+    fn keep_process(&self, end: &ProcessEnd) -> Result<PathBuf, String> {
+        keep_process(&self.log_dir, &binary_name(&self.exe), end)
+    }
+
     fn keep_layer_log(&self, pid: u32) -> Result<LayerLog, String> {
         // The layer names the file after the executable's whole stem, cargo
         // hash and all, and after the host pid, which is the one the runner
@@ -240,10 +247,37 @@ pub struct LayerLog {
 ///
 /// Returns the reason when the directory or the file cannot be written.
 pub fn keep_stderr(dir: &Path, binary: &str, pid: u32, stderr: &str) -> Result<PathBuf, String> {
+    keep_text(dir, binary, pid, STDERR_EXT, stderr)
+}
+
+/// Keep full captured text and exit metadata together after abnormal completion.
+///
+/// Lengths frame the captured strings even when they contain section headings.
+/// stdout has already been decoded line by line and stderr lossily, so this is
+/// the runner's captured text, not a byte-exact recording of the original pipes.
+///
+/// # Errors
+///
+/// Returns the reason when the directory or the file cannot be written.
+pub fn keep_process(dir: &Path, binary: &str, end: &ProcessEnd) -> Result<PathBuf, String> {
+    let text = format!(
+        "binary: {binary}\npid: {}\nexit: {}\nstdout-bytes: {}\nstderr-bytes: {}\n\nstdout:\n{}\nstderr:\n{}",
+        end.pid,
+        end.kind.describe(),
+        end.stdout.len(),
+        end.stderr.len(),
+        end.stdout,
+        end.stderr,
+    );
+    keep_text(dir, binary, end.pid, PROCESS_LOG_EXT, &text)
+}
+
+/// Write one retained account using the same per-kind file budget.
+fn keep_text(dir: &Path, binary: &str, pid: u32, ext: &str, text: &str) -> Result<PathBuf, String> {
     fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    prune(dir, STDERR_EXT, KEEP - 1);
-    let path = dir.join(format!("{binary}-{pid}.{STDERR_EXT}"));
-    fs::write(&path, stderr).map_err(|e| format!("{}: {e}", path.display()))?;
+    prune(dir, ext, KEEP - 1);
+    let path = dir.join(format!("{binary}-{pid}.{ext}"));
+    fs::write(&path, text).map_err(|e| format!("{}: {e}", path.display()))?;
     Ok(path)
 }
 

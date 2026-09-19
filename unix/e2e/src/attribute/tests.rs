@@ -37,7 +37,7 @@ use super::{
     BinaryOutcome, Launcher, ProcessEnd, Report, TestResult, Verdict, announced, run_binary,
 };
 use crate::{
-    binary::{LayerLog, keep_layer_log, keep_stderr},
+    binary::{LayerLog, keep_layer_log, keep_process, keep_stderr},
     libtest::Parser,
     run::ExitKind,
 };
@@ -135,6 +135,10 @@ impl Launcher for Scripted {
 
     fn keep_stderr(&self, pid: u32, stderr: &str) -> Result<PathBuf, String> {
         keep_stderr(&self.log_dir, "scripted", pid, stderr)
+    }
+
+    fn keep_process(&self, end: &ProcessEnd) -> Result<PathBuf, String> {
+        keep_process(&self.log_dir, "scripted", end)
     }
 
     fn keep_layer_log(&self, pid: u32) -> Result<LayerLog, String> {
