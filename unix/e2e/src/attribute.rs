@@ -1,6 +1,7 @@
 //! Run one binary's tests to completion and attribute what its processes report.
 //!
-//! One process runs the whole selection at first. A process that ends with
+//! An unfiltered binary runs in one process at first. Explicit selections
+//! are split to fit each process's command line. A process that ends with
 //! tests unaccounted for (the harness's panic hook ends it at the first
 //! failed assertion, a crash takes it down, the watchdog kills a hang)
 //! costs one result and one more process: the test the end is attributed
@@ -41,7 +42,11 @@
 //! the exit code is then the whole assertion, since libtest never gets to
 //! report a result. A binary that carries such a test carries nothing else.
 
-use std::{collections::BTreeSet, mem, path::PathBuf};
+use std::{
+    collections::{BTreeSet, VecDeque},
+    mem,
+    path::PathBuf,
+};
 
 use crate::{
     binary::{LayerLog, stderr_tail},
@@ -79,6 +84,15 @@ pub struct ProcessEnd {
 
 /// Runs the processes of one test binary.
 pub trait Launcher {
+    /// Number of leading names that fit one process's command line.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message if even the first name cannot fit.
+    fn batch_len(&self, names: &[String], _threads: u32) -> Result<usize, String> {
+        Ok(names.len())
+    }
+
     /// Run `names` (`None` = every test) on `threads` test threads, streaming stdout events.
     ///
     /// # Errors
@@ -195,20 +209,29 @@ pub fn run_binary(
     let jobs = threads;
     let mut remaining = selection;
     let mut threads = threads;
-    let mut deferred: Vec<String> = Vec::new();
+    let mut deferred: VecDeque<(Vec<String>, u32)> = VecDeque::new();
     let mut done: BTreeSet<String> = BTreeSet::new();
     let mut run = BinaryRun {
         processes: 0,
         failed: false,
         outcome: BinaryOutcome::Complete,
     };
-    // The inner loop runs one binary's rounds; leaving it means the rounds
-    // are done, and the outer one picks up whatever a narrowed round set
-    // aside and runs it at the width the caller asked for.
+    // The inner loop finishes one batch's recovery rounds. Deferred batches
+    // retain their thread width, including serial attribution; tests excluded
+    // from a narrowed round keep the caller's width.
     'binary: loop {
         loop {
             if remaining.as_ref().is_some_and(Vec::is_empty) {
                 break;
+            }
+            if let Some(names) = &mut remaining {
+                let count = launcher.batch_len(names, threads)?;
+                if count == 0 || count > names.len() {
+                    return Err("the launcher returned an invalid test batch size".to_owned());
+                }
+                if count < names.len() {
+                    deferred.push_front((names.split_off(count), threads));
+                }
             }
             run.processes += 1;
             let mut round = Round {
@@ -389,7 +412,11 @@ pub fn run_binary(
                     "the process ended ({reason}) before running any test; {kept}\n{}",
                     stderr_tail(&end.stderr)
                 );
-                for name in in_flight {
+                for name in in_flight.into_iter().chain(
+                    mem::take(&mut deferred)
+                        .into_iter()
+                        .flat_map(|(names, _)| names),
+                ) {
                     done.insert(name.clone());
                     report.result(TestResult {
                         name,
@@ -431,19 +458,25 @@ pub fn run_binary(
                 // their own at the caller's width.
                 threads = 1;
                 if !running.is_empty() {
-                    deferred.extend(
+                    deferred.push_front((
                         in_flight
                             .iter()
                             .filter(|name| !running.contains(name))
-                            .cloned(),
-                    );
+                            .cloned()
+                            .collect(),
+                        jobs,
+                    ));
                     in_flight = mem::take(&mut running);
                 }
                 report
                     .note("nothing names the test it ended in; running those again one at a time");
             }
             if fail_fast && run.failed {
-                for name in in_flight.into_iter().chain(mem::take(&mut deferred)) {
+                for name in in_flight.into_iter().chain(
+                    mem::take(&mut deferred)
+                        .into_iter()
+                        .flat_map(|(names, _)| names),
+                ) {
                     report.result(TestResult {
                         name,
                         verdict: Verdict::NotRun,
@@ -459,15 +492,26 @@ pub fn run_binary(
             }
             remaining = Some(in_flight);
         }
-        if deferred.is_empty() {
-            break 'binary;
+        if fail_fast && run.failed {
+            for name in mem::take(&mut deferred)
+                .into_iter()
+                .flat_map(|(names, _)| names)
+            {
+                report.result(TestResult {
+                    name,
+                    verdict: Verdict::NotRun,
+                });
+            }
         }
+        let Some((names, width)) = deferred.pop_front() else {
+            break 'binary;
+        };
         report.note(&format!(
-            "running the {} tests the narrowed round set aside",
-            deferred.len()
+            "running the {} tests set aside for another process",
+            names.len()
         ));
-        remaining = Some(mem::take(&mut deferred));
-        threads = jobs;
+        remaining = Some(names);
+        threads = width;
     }
     Ok(run)
 }

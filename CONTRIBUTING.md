@@ -166,6 +166,16 @@ culprit. So a failure costs one result and one extra process, and the
 `processes` count in the summary says how many the run took: eight is a
 clean `make test`.
 
+Explicit test selections, including recovery rounds and filtered initial runs,
+are split into batches that fit the Windows command-line limit. The budget
+counts UTF-16 units after quoting, with flags, separators, the terminator and
+an allowance for Wine's executable-path mapping. Every deferred name keeps
+its intended thread width, so a serial recovery stays serial across batches.
+Each batch is an actual process with its own summary and retained failure
+logs; the original failure remains failed. Fail-fast and a GPU-hang report
+stop before later batches. A single name that cannot fit reports a runner
+error instead of repeatedly launching an impossible command.
+
 The harness defaults to hidden borderless windows. Wine builds a framed
 window's title bar and controls on the AppKit main thread, so creating and
 destroying them for every rendering test serializes a parallel run.
