@@ -1204,6 +1204,8 @@ fn debug_guard_in_sync_across_every_tracked_slot() {
     shadow.record(&Command::set_depth_stencil_state(0x9002));
     assert!(cache.cull_mode_changed(CullMode::Back));
     shadow.record(&Command::set_cull_mode(CullMode::Back));
+    assert!(cache.triangle_fill_mode_changed(TriangleFillMode::Lines));
+    shadow.record(&Command::set_triangle_fill_mode(TriangleFillMode::Lines));
     assert!(cache.fragment_texture_changed(3, 0x7E10));
     shadow.record(&Command::set_fragment_texture(0x7E10, 3));
     assert!(cache.fragment_sampler_changed(3, 0x5A77));
@@ -5443,4 +5445,62 @@ fn upload_prefix_preserves_order_through_pass_optimization() {
     );
     reset_test_frame(&mut s);
     assert_eq!(s.upload_pass_count(), 0);
+}
+
+#[test]
+fn triangle_fill_dedup_starts_solid_and_resets_at_each_encoder() {
+    let mut cache = LastBoundCache::new();
+    assert!(!cache.triangle_fill_mode_changed(TriangleFillMode::Fill));
+    assert!(cache.triangle_fill_mode_changed(TriangleFillMode::Lines));
+    assert!(!cache.triangle_fill_mode_changed(TriangleFillMode::Lines));
+    assert!(cache.triangle_fill_mode_changed(TriangleFillMode::Fill));
+    assert!(!cache.triangle_fill_mode_changed(TriangleFillMode::Fill));
+    assert!(cache.triangle_fill_mode_changed(TriangleFillMode::Lines));
+    cache.reset();
+    assert!(!cache.triangle_fill_mode_changed(TriangleFillMode::Fill));
+    assert!(cache.triangle_fill_mode_changed(TriangleFillMode::Lines));
+}
+
+#[test]
+fn rule_h_keeps_fill_changes_outside_removed_color_clear() {
+    const CLEAR_PIPELINE: u64 = 0xCAFE_BABE;
+    let mut s = fresh();
+    s.set_color_render_target(tex(0x3000), 256, 256, RT_FORMAT, RenderScale::IDENTITY);
+    s.emit_command(set_pso(PSO_WITH));
+    s.emit_command(Command::set_triangle_fill_mode(TriangleFillMode::Lines));
+    s.emit_command(dummy_draw());
+    s.emit_command(Command::set_triangle_fill_mode(TriangleFillMode::Fill));
+    let start = s.open_color_clear_quad_block();
+    s.emit_command(set_pso(CLEAR_PIPELINE));
+    s.emit_command(dummy_draw());
+    s.close_color_clear_quad_block(start);
+    s.emit_command(set_pso(PSO_WITH));
+    s.emit_command(dummy_draw());
+    s.emit_command(Command::set_triangle_fill_mode(TriangleFillMode::Lines));
+    s.emit_command(dummy_draw());
+    s.end_current_pass("test");
+    let mut alt = FxHashMap::default();
+    alt.insert(PSO_WITH, pso(PSO_NO_COLOR));
+    s.strip_color_from_no_color_draw_passes(&alt);
+    let pass = &s.passes()[0];
+    assert!(pass.color_texture().is_null());
+    assert!(pass.color_clear_quad_ranges().is_empty());
+    let mut fill = TriangleFillMode::Fill as u32;
+    let mut draw_modes = Vec::new();
+    for cmd in pass.commands() {
+        if cmd.cmd == CommandType::SetTriangleFillMode as u32 {
+            fill = cmd.param_a;
+        }
+        if cmd.is_draw() {
+            draw_modes.push(fill);
+        }
+    }
+    assert_eq!(
+        draw_modes,
+        [
+            TriangleFillMode::Lines as u32,
+            TriangleFillMode::Fill as u32,
+            TriangleFillMode::Lines as u32
+        ]
+    );
 }

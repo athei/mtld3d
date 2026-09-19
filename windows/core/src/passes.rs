@@ -6,7 +6,10 @@
 use log::{Level, log_enabled, trace};
 use mtld3d_shared::{
     BlitCommand, BlitCommandType, Command, CommandType, MetalHandle,
-    mtl::{CullMode, DepthResolveFilter, PixelFormat, VERTEX_STREAM_SLOTS, VisibilityResultMode},
+    mtl::{
+        CullMode, DepthResolveFilter, PixelFormat, TriangleFillMode, VERTEX_STREAM_SLOTS,
+        VisibilityResultMode,
+    },
     mtl_handle::{MTLRenderPipelineStateKind, MTLTextureKind},
 };
 use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
@@ -5037,6 +5040,7 @@ pub struct LastBoundCache {
     depth_stencil: u64,
     stencil_reference: u32,
     cull_mode: Option<CullMode>,
+    triangle_fill_mode: TriangleFillMode,
     /// VS pos-fixup slot — half-pixel rasterization fixup `(1/vp_w, -1/vp_h, 0, 0)`.
     ///
     /// Re-bound only when the viewport dims change (rare), so the per-draw
@@ -5108,6 +5112,7 @@ impl LastBoundCache {
             depth_stencil: 0,
             stencil_reference: 0,
             cull_mode: None,
+            triangle_fill_mode: TriangleFillMode::Fill,
             vs_pos_fixup: Vec::new(),
             vs_draw: Vec::new(),
             ps_alpha_ref: Vec::new(),
@@ -5137,6 +5142,7 @@ impl LastBoundCache {
         self.depth_stencil = 0;
         self.stencil_reference = 0;
         self.cull_mode = None;
+        self.triangle_fill_mode = TriangleFillMode::Fill;
         self.vs_pos_fixup.clear();
         self.vs_draw.clear();
         self.ps_alpha_ref.clear();
@@ -5212,6 +5218,15 @@ impl LastBoundCache {
             self.depth_stencil = handle;
             true
         }
+    }
+
+    /// Emit only changes from the native encoder's initial solid fill.
+    pub fn triangle_fill_mode_changed(&mut self, mode: TriangleFillMode) -> bool {
+        if self.triangle_fill_mode == mode {
+            return false;
+        }
+        self.triangle_fill_mode = mode;
+        true
     }
 
     #[inline]
@@ -5446,6 +5461,7 @@ pub struct DebugBoundShadow {
     depth_stencil: u64,
     /// Raw `CullMode` discriminant (`Command::param_a`).
     cull_mode: Option<u32>,
+    triangle_fill_mode: u32,
     /// Per vertex stream slot `(handle, offset)`, `offset` kept as the command's `u64` param.
     vertex_buffers: [(u64, u64); VERTEX_STREAM_SLOTS as usize],
     /// Raw `(param_a, param_b, param_c)` of `Command::set_scissor_rect`.
@@ -5469,6 +5485,8 @@ impl DebugBoundShadow {
             self.depth_stencil = cmd.param_b;
         } else if t == CommandType::SetCullMode as u32 {
             self.cull_mode = Some(cmd.param_a);
+        } else if t == CommandType::SetTriangleFillMode as u32 {
+            self.triangle_fill_mode = cmd.param_a;
         } else if t == CommandType::SetFragmentTexture as u32 {
             self.fragment_textures[cmd.param_a as usize] = cmd.param_b;
         } else if t == CommandType::SetFragmentSamplerState as u32 {
@@ -5524,6 +5542,10 @@ impl LastBoundCache {
             self.cull_mode.map(|c| c as u32),
             shadow.cull_mode,
             "cull-mode cache desync (cache vs encoder-emitted)"
+        );
+        assert_eq!(
+            self.triangle_fill_mode as u32, shadow.triangle_fill_mode,
+            "triangle fill cache desync (cache vs encoder-emitted)"
         );
         // The generation behind the handle is a cache-side key only; the
         // emitted command carries handle and offset.

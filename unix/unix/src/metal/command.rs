@@ -14,7 +14,7 @@ use mtld3d_shared::{
     NullTextureKind, PassDescriptor, SubmitFrameParams,
     mtl::{
         BlockLayout, CullMode, DepthResolveFilter, IndexType, LoadAction, PixelFormat,
-        PrimitiveType, StoreAction, VisibilityResultMode,
+        PrimitiveType, StoreAction, TriangleFillMode, VisibilityResultMode,
     },
     mtl_handle::{
         MTLBufferKind, MTLCommandQueueKind, MTLDepthStencilStateKind, MTLDeviceKind,
@@ -29,7 +29,7 @@ use objc2_metal::{
     MTLLoadAction, MTLMultisampleDepthResolveFilter, MTLOrigin, MTLPixelFormat, MTLPrimitiveType,
     MTLRenderCommandEncoder, MTLRenderPassDescriptor, MTLResource, MTLResourceOptions,
     MTLSamplerState, MTLScissorRect, MTLSize, MTLStoreAction, MTLTexture, MTLTextureType,
-    MTLViewport, MTLVisibilityResultMode,
+    MTLTriangleFillMode, MTLViewport, MTLVisibilityResultMode,
 };
 use objc2_metal_fx::MTLFXSpatialScalerColorProcessingMode;
 use objc2_quartz_core::CAMetalDrawable;
@@ -2637,6 +2637,19 @@ fn encode_pass(
                         }
                     };
                     encoder.setCullMode(mode);
+                }
+                Some(CommandType::SetTriangleFillMode) => {
+                    let mode = match TriangleFillMode::from_repr(cmd.param_a) {
+                        Some(TriangleFillMode::Fill) => MTLTriangleFillMode::Fill,
+                        Some(TriangleFillMode::Lines) => MTLTriangleFillMode::Lines,
+                        None => {
+                            mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+                                "SetTriangleFillMode: raw={} unmapped → MTLTriangleFillMode::Fill",
+                                cmd.param_a);
+                            MTLTriangleFillMode::Fill
+                        }
+                    };
+                    encoder.setTriangleFillMode(mode);
                 }
                 Some(CommandType::SetDepthBias) => {
                     // PE side already scales `depth_bias` to the active

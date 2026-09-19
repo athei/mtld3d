@@ -143,8 +143,9 @@ fn set_get_round_trip() {
 ///
 /// `SetRenderState` takes a DWORD, so each of these can be handed a value the
 /// space does not contain; the layer reads the state's spec default instead.
-const ENUM_STATES: [u32; 21] = [
+const ENUM_STATES: [u32; 22] = [
     mtld3d_types::D3DRS_ZFUNC,
+    D3DRS_FILLMODE,
     mtld3d_types::D3DRS_ALPHAFUNC,
     D3DRS_STENCILFUNC,
     mtld3d_types::D3DRS_CCW_STENCILFUNC,
@@ -389,10 +390,7 @@ fn stencil_render_states_round_trip() {
 }
 
 #[test]
-fn wireframe_fill_mode_is_a_noop() {
-    // Metal has no native wireframe fill; mtld3d classifies D3DFILL_WIREFRAME as
-    // an unimplemented port-candidate and renders solid. Pin that: the interior
-    // stays filled in both modes (no target workload uses wireframe).
+fn wireframe_fill_mode_leaves_triangle_interior_clear() {
     let h = Harness::new();
     arm_diffuse(&h);
     let tri = centered_triangle(GREEN);
@@ -413,8 +411,8 @@ fn wireframe_fill_mode_is_a_noop() {
     });
     assert_eq!(
         h.read_pixel(320, 280),
-        GREEN,
-        "wireframe is a no-op — interior still filled"
+        BLACK,
+        "wireframe leaves the triangle interior clear"
     );
 }
 

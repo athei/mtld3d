@@ -418,6 +418,14 @@ pub enum CullMode {
     Back = 2,
 }
 
+/// `MTLTriangleFillMode` wire encoding for dynamic triangle rasterization.
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, FromRepr)]
+pub enum TriangleFillMode {
+    Fill = 0,
+    Lines = 1,
+}
+
 /// `MTLIndexType` wire encoding.
 ///
 /// Appears packed into the low 8 bits of `Command::param_d` for

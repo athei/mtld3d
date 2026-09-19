@@ -202,6 +202,8 @@ fn enum_layout_is_u32() {
     assert_eq!(core::mem::align_of::<StorageMode>(), 4);
     assert_eq!(core::mem::size_of::<PixelFormat>(), 4);
     assert_eq!(core::mem::size_of::<LoadAction>(), 4);
+    assert_eq!(core::mem::size_of::<TriangleFillMode>(), 4);
+    assert_eq!(core::mem::align_of::<TriangleFillMode>(), 4);
     assert_eq!(core::mem::size_of::<CompareFunc>(), 4);
     assert_eq!(core::mem::size_of::<BlendFactor>(), 4);
     assert_eq!(core::mem::size_of::<BlendOperation>(), 4);
