@@ -4,7 +4,6 @@
 //!   `GetData` reports completion once the GPU has retired that frame,
 //!   queueing it first while the frame is still open. Applications fence
 //!   their own storage reuse on this answer, so it comes from the GPU.
-//! - `TIMESTAMP`: stub — returns 0 ticks. Not implemented, logs once.
 //! - `OCCLUSION`: real Metal visibility-result query. `Issue(BEGIN/END)`
 //!   pushes closures onto the current frame that bump the encoder's
 //!   visibility offset allocator and emit
@@ -19,10 +18,10 @@ use std::sync::{
 };
 
 use mtld3d_core::visibility::{QueryStatus, VisibilityQueryCore};
-use mtld3d_shared::{InPtr, OutPtr};
+use mtld3d_shared::InPtr;
 use mtld3d_types::{
     D3DGETDATA_FLUSH, D3DISSUE_BEGIN, D3DISSUE_END, D3DQUERYTYPE_EVENT, D3DQUERYTYPE_OCCLUSION,
-    D3DQUERYTYPE_TIMESTAMP, Guid, IDirect3DQuery9Vtbl,
+    Guid, IDirect3DQuery9Vtbl,
 };
 
 use super::{D3D_OK, D3DERR_INVALIDCALL, LOG_TARGET, S_FALSE, device::DeviceInner};
@@ -83,7 +82,6 @@ pub const fn data_size_for(query_type: u32) -> Option<u32> {
     match query_type {
         // BOOL (EVENT) / DWORD pixel count (OCCLUSION) — both u32-sized.
         D3DQUERYTYPE_EVENT | D3DQUERYTYPE_OCCLUSION => Some(4),
-        D3DQUERYTYPE_TIMESTAMP => Some(8), // UINT64
         _ => None,
     }
 }
@@ -97,7 +95,7 @@ struct QueryInner {
     ///
     /// BEGIN/END closures on the encoder thread mutate this via atomics;
     /// `intake_visibility` finalizes it post-GPU. `None` for
-    /// EVENT / TIMESTAMP.
+    /// EVENT.
     core: Option<Arc<VisibilityQueryCore>>,
     /// For EVENT queries: the frame seq `Issue(D3DISSUE_END)` recorded.
     ///
@@ -518,15 +516,6 @@ extern "system" fn query_get_data(
                     D3D_OK
                 }
             }
-        }
-        D3DQUERYTYPE_TIMESTAMP if wanted >= 8 => {
-            // SAFETY: vtable out-param; `data` is the typed out-buffer per ABI.
-            unsafe { OutPtr::write_opt(data.cast::<u64>(), 0) };
-            mtld3d_shared::log_once_warn!(
-                target: LOG_TARGET,
-                "stub IDirect3DQuery9::GetData for D3DQUERYTYPE_TIMESTAMP → reporting 0 ticks"
-            );
-            D3D_OK
         }
         other => {
             // SAFETY: `data` is non-null and per the D3D9 ABI points to a

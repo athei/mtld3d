@@ -2063,13 +2063,21 @@ impl Harness {
     /// `CreateQuery(type)`. Returns `None` if the type is unsupported.
     #[must_use]
     pub fn create_query(&self, query_type: u32) -> Option<Query<'_>> {
+        self.try_create_query(query_type).ok()
+    }
+
+    /// `CreateQuery(type)`, preserving the error returned by the device.
+    ///
+    /// # Errors
+    /// Returns the HRESULT when creation fails or returns no object.
+    pub fn try_create_query(&self, query_type: u32) -> Result<Query<'_>, i32> {
         let mut out: *mut c_void = core::ptr::null_mut();
         // SAFETY: vtable thunk; `&mut out` is writable.
         let hr = unsafe { (self.dev_vtbl().create_query)(self.device, query_type, &raw mut out) };
         if hr != 0 || out.is_null() {
-            return None;
+            return Err(hr);
         }
-        Some(Query::from_raw(out))
+        Ok(Query::from_raw(out))
     }
 
     /// `CreateVertexDeclaration` from a `D3DVERTEXELEMENT9` array, asserting success.

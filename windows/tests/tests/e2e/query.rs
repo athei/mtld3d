@@ -2,11 +2,12 @@
 
 use mtld3d_tests::{Harness, HarnessConfig, PosColorVertex, Query};
 use mtld3d_types::{
-    D3DCLEAR_TARGET, D3DCLEAR_ZBUFFER, D3DCMP_LESS, D3DFMT_D24S8, D3DFMT_X8R8G8B8, D3DFVF_DIFFUSE,
-    D3DFVF_XYZ, D3DGETDATA_FLUSH, D3DISSUE_BEGIN, D3DISSUE_END, D3DLOCK_DISCARD,
-    D3DLOCK_NOOVERWRITE, D3DPOOL_DEFAULT, D3DPT_TRIANGLELIST, D3DQUERYTYPE_EVENT,
-    D3DQUERYTYPE_OCCLUSION, D3DQUERYTYPE_TIMESTAMP, D3DRS_LIGHTING, D3DRS_ZENABLE, D3DRS_ZFUNC,
-    D3DUSAGE_DYNAMIC, D3DUSAGE_WRITEONLY, S_FALSE,
+    D3DCLEAR_TARGET, D3DCLEAR_ZBUFFER, D3DCMP_LESS, D3DERR_NOTAVAILABLE, D3DFMT_D24S8,
+    D3DFMT_X8R8G8B8, D3DFVF_DIFFUSE, D3DFVF_XYZ, D3DGETDATA_FLUSH, D3DISSUE_BEGIN, D3DISSUE_END,
+    D3DLOCK_DISCARD, D3DLOCK_NOOVERWRITE, D3DPOOL_DEFAULT, D3DPT_TRIANGLELIST, D3DQUERYTYPE_EVENT,
+    D3DQUERYTYPE_OCCLUSION, D3DQUERYTYPE_TIMESTAMP, D3DQUERYTYPE_TIMESTAMPDISJOINT,
+    D3DQUERYTYPE_TIMESTAMPFREQ, D3DRS_LIGHTING, D3DRS_ZENABLE, D3DRS_ZFUNC, D3DUSAGE_DYNAMIC,
+    D3DUSAGE_WRITEONLY, S_FALSE,
 };
 
 /// Poll an EVENT query without other calls that could submit its work.
@@ -304,16 +305,35 @@ fn occlusion_query_counts_in_reported_pixels_under_the_scale() {
 }
 
 #[test]
-fn timestamp_query_contract() {
+fn timestamp_queries_are_not_advertised() {
     let h = Harness::new();
-    // TIMESTAMP is not backed by a Metal counter here; pin whatever the device
-    // reports (supported → a usable object, or unsupported → no object).
-    let supported = h.query_supported(D3DQUERYTYPE_TIMESTAMP) == 0;
-    assert_eq!(
-        h.create_query(D3DQUERYTYPE_TIMESTAMP).is_some(),
-        supported,
-        "CreateQuery(TIMESTAMP) agrees with the null-out probe",
-    );
+    for query_type in [
+        D3DQUERYTYPE_TIMESTAMP,
+        D3DQUERYTYPE_TIMESTAMPDISJOINT,
+        D3DQUERYTYPE_TIMESTAMPFREQ,
+    ] {
+        assert_eq!(
+            h.query_supported(query_type),
+            D3DERR_NOTAVAILABLE,
+            "unsupported timestamp probe {query_type}",
+        );
+        assert_eq!(
+            h.try_create_query(query_type).err(),
+            Some(D3DERR_NOTAVAILABLE),
+            "unsupported timestamp creation {query_type}",
+        );
+    }
+    for query_type in [D3DQUERYTYPE_EVENT, D3DQUERYTYPE_OCCLUSION] {
+        assert_eq!(
+            h.query_supported(query_type),
+            0,
+            "supported probe {query_type}"
+        );
+        assert!(
+            h.try_create_query(query_type).is_ok(),
+            "supported creation {query_type}"
+        );
+    }
 }
 
 #[test]

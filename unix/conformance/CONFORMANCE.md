@@ -753,6 +753,15 @@ baseline's source locations when Wine changes. The classification remains
 `expected` and its count stays pinned at one: `ceiling` would also tolerate
 an assertion that ran and passed, which this observation does not establish.
 
+### device.c/test_timestamp_query
+
+No failing sites. The test first creates `TIMESTAMPFREQ` and skips when it
+returns `D3DERR_NOTAVAILABLE`, before probing `TIMESTAMP` or
+`TIMESTAMPDISJOINT`. That skip establishes no result for either later query.
+All three types are unsupported; the end-to-end query test checks each
+capability probe and creation against `D3DERR_NOTAVAILABLE`, with EVENT and
+OCCLUSION as supported controls.
+
 ### device.c/test_lockrect_invalid
 Sites: 8664=expected 8682=expected 8701=expected
 
