@@ -9804,7 +9804,8 @@ extern "system" fn device_set_texture(this: *mut c_void, stage: u32, texture: *m
     if delta.intersects(
         TextureSwapDelta::DEPTH_CHANGED
             | TextureSwapDelta::VOLUME_CHANGED
-            | TextureSwapDelta::CUBE_CHANGED,
+            | TextureSwapDelta::CUBE_CHANGED
+            | TextureSwapDelta::SAMPLING_CHANGED,
     ) {
         bits |= SnapshotDirty::VARIANT;
     }
@@ -9967,6 +9968,11 @@ extern "system" fn device_set_sampler_state(
             sampler,
             type_,
             value,
+            fetch4: if type_ == mtld3d_types::D3DSAMP_MIPMAPLODBIAS {
+                mtld3d_core::fetch4::command(value)
+            } else {
+                None
+            },
         });
         return D3D_OK;
     }
@@ -9974,8 +9980,12 @@ extern "system" fn device_set_sampler_state(
         dev.set_vertex_sampler_slot_state(slot, type_ as usize, value);
         return D3D_OK;
     }
+    let old_fetch4 = dev.stage_bindings().fetch4().masks();
     dev.stage_bindings_mut()
         .set_sampler_state(sampler as usize, type_ as usize, value);
+    if old_fetch4 != dev.stage_bindings().fetch4().masks() {
+        dev.mark_snapshot_dirty(SnapshotDirty::VARIANT);
+    }
     // Sampler state lives inside StageBinding only.
     dev.mark_snapshot_dirty(SnapshotDirty::STAGES);
     0 // S_OK
@@ -11186,6 +11196,8 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
             .variant_key(rs, dev.cached_ff_vs_layout.has_rhw());
         variant.depth_sampler_mask = dev.stage_bindings().depth_sampler_mask();
         variant.depth_fetch_mask = dev.stage_bindings().depth_fetch_mask();
+        variant.raw_depth_red_mask = dev.stage_bindings().fetch4().raw_red_mask();
+        (variant.fetch4_mask, variant.fetch4_alpha_mask) = dev.stage_bindings().fetch4().masks();
         variant.volume_sampler_mask = dev.stage_bindings().volume_sampler_mask();
         variant.cube_sampler_mask = dev.stage_bindings().cube_sampler_mask();
         // D3DTTFF_PROJECTED stages drive an implicit per-pixel projective divide

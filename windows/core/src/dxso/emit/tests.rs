@@ -38,6 +38,104 @@ const SWIZ_IDENTITY: u8 = 0xE4;
 const SWIZ_BGRA: u8 = 0xC6;
 const SWIZ_BBBB: u8 = 0xAA;
 
+#[test]
+fn fetch4_emits_one_native_gather_and_keeps_ordinary_shaders_unchanged() {
+    let ps = single_sampler_ps(0x9000_0000);
+    let ordinary = emit_ps_programmable(&ps, VariantKey::default()).expect("ordinary sample");
+    assert!(!ordinary.contains(".gather("));
+    for (depth, alpha) in [(false, false), (false, true), (true, false)] {
+        let variant = VariantKey {
+            fetch4_mask: 1,
+            fetch4_alpha_mask: u16::from(alpha),
+            depth_sampler_mask: u16::from(depth),
+            depth_fetch_mask: u16::from(depth),
+            ..VariantKey::default()
+        };
+        let source = emit_ps_programmable(&ps, variant).expect("gather sample");
+        assert_eq!(source.matches(".gather(").count(), 1);
+        assert!(!source.contains(".sample("));
+        assert!(!source.contains(".sample_compare("));
+        assert!(!source.contains("lod_bias [[buffer"));
+        assert!(source.contains(".zxyw"));
+        assert_eq!(source.contains("component::w"), alpha);
+        metal_compile_or_fail(&source);
+    }
+}
+
+#[test]
+fn fetch4_ignores_instruction_lod_and_preserves_projection_and_sm1_slots() {
+    for opcode in [
+        0x0300_0042,
+        0x0301_0042,
+        0x0302_0042,
+        0x0300_005f,
+        0x0500_005d,
+    ] {
+        let mut code = vec![
+            PS3_HEADER,
+            0x0200_001f,
+            0x9000_0000,
+            0xa00f_0803,
+            0x0200_001f,
+            0x8000_0005,
+            0x900f_0000,
+            opcode,
+            0x800f_0000,
+            0x90e4_0000,
+            0xa0e4_0803,
+        ];
+        if opcode == 0x0500_005d {
+            code.extend_from_slice(&[0x80e4_0001, 0x80e4_0002]);
+        }
+        code.extend_from_slice(&[0x0200_0001, 0x800f_0800, 0x80e4_0000, END_TOKEN]);
+        let ps = parse(&code).expect("texture instruction");
+        let source = emit_ps_programmable(
+            &ps,
+            VariantKey {
+                fetch4_mask: 8,
+                ..VariantKey::default()
+            },
+        )
+        .expect("gather");
+        assert!(source.contains("s3.gather(samp3,"), "{source}");
+        assert!(!source.contains(".sample("));
+        assert!(!source.contains("gradient2d("));
+        assert!(!source.contains("level("));
+        assert!(!source.contains("bias("));
+        if opcode == 0x0301_0042 {
+            assert!(
+                source.contains("/ (in.texcoord0).w"),
+                "projective divide survives"
+            );
+        }
+        metal_compile_or_fail(&source);
+    }
+    for minor in 1..=3 {
+        let ps = parse(&[
+            0xffff_0100 | minor,
+            0x0000_0042,
+            0xb00f_0003,
+            0x0000_0001,
+            0x800f_0000,
+            0xb0e4_0003,
+            END_TOKEN,
+        ])
+        .expect("SM1 texture");
+        let source = emit_ps_programmable(
+            &ps,
+            VariantKey {
+                fetch4_mask: 8,
+                tt_projected_mask: 8,
+                ..VariantKey::default()
+            },
+        )
+        .expect("SM1 gather");
+        assert!(source.contains("s3.gather(samp3,"));
+        assert!(!source.contains(".sample("));
+        metal_compile_or_fail(&source);
+    }
+}
+
 const TYPE_TEMP: u32 = 0;
 const TYPE_INPUT: u32 = 1;
 const TYPE_CONST: u32 = 2;
@@ -1096,6 +1194,9 @@ fn programmable_ps_emits_fog_blend_when_variant_fog_mode_set() {
         fog_table_mode: 0,
         depth_sampler_mask: 0,
         depth_fetch_mask: 0,
+        fetch4_mask: 0,
+        fetch4_alpha_mask: 0,
+        raw_depth_red_mask: 0,
         sample_mask: 0,
         volume_sampler_mask: 0,
         cube_sampler_mask: 0,
@@ -1750,6 +1851,9 @@ fn depth_sampler_mask_emits_depth2d_binding_and_widens_sample_result() {
     let depth_variant = VariantKey {
         depth_sampler_mask: 0b0001,
         depth_fetch_mask: 0,
+        fetch4_mask: 0,
+        fetch4_alpha_mask: 0,
+        raw_depth_red_mask: 0,
         ..VariantKey::default()
     };
     let depth = emit_ps_programmable(&ps, depth_variant).expect("emit depth");
@@ -1833,6 +1937,9 @@ fn ps_sampler_index_8_emits_slot_8_binding_and_compiles() {
     let depth_variant = VariantKey {
         depth_sampler_mask: 1 << 8,
         depth_fetch_mask: 0,
+        fetch4_mask: 0,
+        fetch4_alpha_mask: 0,
+        raw_depth_red_mask: 0,
         ..VariantKey::default()
     };
     let depth = emit_ps_programmable(&ps, depth_variant).expect("emit depth");
@@ -3844,6 +3951,9 @@ fn depth_sample_compare_gets_level_zero_by_default() {
     let depth_variant = VariantKey {
         depth_sampler_mask: 0b0001,
         depth_fetch_mask: 0,
+        fetch4_mask: 0,
+        fetch4_alpha_mask: 0,
+        raw_depth_red_mask: 0,
         ..VariantKey::default()
     };
     let depth = emit_ps_programmable(&ps, depth_variant).expect("emit depth");

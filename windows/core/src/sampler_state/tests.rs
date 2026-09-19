@@ -397,3 +397,11 @@ fn forcing_point_keeps_the_filters_in_space() {
         "the forced filters pack into the low three nibbles"
     );
 }
+#[test]
+fn fetch4_commands_are_not_lod_biases() {
+    let mut states = mtld3d_types::sampler_state_defaults();
+    for command in [u32::from_le_bytes(*b"GET4"), u32::from_le_bytes(*b"GET1")] {
+        states[mtld3d_types::D3DSAMP_MIPMAPLODBIAS as usize] = command;
+        assert_eq!(super::lod_bias(&states).to_bits(), 0.0f32.to_bits());
+    }
+}
