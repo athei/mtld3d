@@ -312,11 +312,11 @@ const _: () = {
 
 /// Per-draw varying parameters.
 ///
-/// Pushed onto the encoder ops Vec as `Op::Draw`; consumed by `emit_draw`
+/// Carried by `Op::Draw` or `Op::DrawWithSnapshot`; consumed by `emit_draw`
 /// which combines them with the encoder's `CurrentSnapshot` to issue the
 /// actual GPU commands. State shared with the previous draw (RS, textures,
 /// constants, etc.) lives in `CurrentSnapshot` and is updated via separate
-/// `Op::Set*` ops only when a dirty bit fires.
+/// draw snapshots only when a dirty bit fires.
 pub struct DrawOp {
     pub metal_prim: PrimitiveType,
     pub vertex_source: VertexSource,
@@ -585,7 +585,7 @@ bitflags::bitflags! {
 /// Encoder-thread state representing what's currently "bound" for `emit_draw`.
 ///
 /// Lives in the per-frame `ScratchArena`; `FrameEncoder` holds an
-/// `Option<CurrentSnapshotPtr>` that the `Op::SetCurrentSnapshot` op
+/// `Option<CurrentSnapshotPtr>` that a draw carrying changed state
 /// updates. `emit_draw` borrows `&CurrentSnapshot` once via lifetime
 /// laundering and reads fields directly — no struct copies on the encoder
 /// side.
@@ -1211,7 +1211,7 @@ fn close_dump_group(enc: &mut FrameEncoder, dump_draw: Option<u32>) {
 /// Encoder-thread draw dispatch.
 ///
 /// Pulls the cumulative state from `enc.current_snapshot` (updated by
-/// `Op::Set*` ops earlier in the op stream) and combines it with `draw`'s
+/// the draw op before dispatch) and combines it with `draw`'s
 /// per-call varying parameters (primitive type + vertex/index source).
 /// Consumes `draw` so the captured `VertexSource::Up` `Vec` drops at the
 /// end of the frame.
@@ -1236,10 +1236,10 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
     // the rest of emit_draw can freely reborrow `&mut enc`. SAFETY:
     // the pointee lives in `FrameData::scratch` which the encoder
     // owns for the full op-drain duration; the pointer was set by
-    // `Op::SetCurrentSnapshot` earlier in this frame's op stream.
+    // this draw or an earlier draw in the same frame.
     let snap_ptr = enc
         .current_snapshot_ptr()
-        .expect("emit_draw: SetCurrentSnapshot not seen")
+        .expect("emit_draw: snapshot not supplied")
         .as_ptr();
     // SAFETY: snap_ptr is non-null (NonNull invariant) and points to
     // a live CurrentSnapshot in FrameData::scratch. The pointee
@@ -1247,7 +1247,7 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
     // `enc` reborrow below.
     let snap: &CurrentSnapshot = unsafe { &*snap_ptr };
     // Every Option must be Some by the time a Draw runs — the API
-    // thread populates every field before pushing SetCurrentSnapshot.
+    // thread populates every field before queuing the changed snapshot.
     let render_state: &RenderStateSnapshot = snap
         .render_state
         .as_ref()

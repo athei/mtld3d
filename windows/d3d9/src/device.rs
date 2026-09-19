@@ -720,7 +720,7 @@ pub struct DeviceInner {
     snapshot_dirty: SnapshotDirty,
     /// Cached `CurrentSnapshot` pieces from the most recent `emit_snapshot_deltas`.
     ///
-    /// Each `Op::SetCurrentSnapshot` op shipped to the encoder is built from
+    /// Each changed snapshot shipped with a draw is built from
     /// this cache: dirty pieces are rebuilt + the cache field is updated; clean
     /// pieces reuse the cached scratch pointer (same per-frame arena, still
     /// valid). Initial state is `default()` (all `None`); the first draw of
@@ -10404,17 +10404,20 @@ extern "system" fn device_draw_primitive(
         );
         return D3DERR_INVALIDCALL;
     };
-    emit_snapshot_deltas(&obj);
+    let snapshot = emit_snapshot_deltas(&obj);
     drop(snap);
     let _push = CycleAddTimer::start(draw_push_op_ptr(perf_ptr));
-    obj.inner().push_op_inline(Op::Draw(DrawOp {
-        metal_prim,
-        vertex_source,
-        index_source: IndexSource::None {
-            start_vertex,
-            vertex_count: vtx_count,
+    obj.inner().push_op_inline(Op::draw(
+        DrawOp {
+            metal_prim,
+            vertex_source,
+            index_source: IndexSource::None {
+                start_vertex,
+                vertex_count: vtx_count,
+            },
         },
-    }));
+        snapshot,
+    ));
     D3D_OK
 }
 
@@ -10471,14 +10474,17 @@ fn draw_bound_triangle_fan(
         );
         return no_vertex_buffer_hr;
     };
-    emit_snapshot_deltas(obj);
+    let snapshot = emit_snapshot_deltas(obj);
     drop(snap);
     let _push = CycleAddTimer::start(draw_push_op_ptr(perf_ptr));
-    obj.inner().push_op_inline(Op::Draw(DrawOp {
-        metal_prim: mtld3d_shared::mtl::PrimitiveType::Triangle,
-        vertex_source,
-        index_source,
-    }));
+    obj.inner().push_op_inline(Op::draw(
+        DrawOp {
+            metal_prim: mtld3d_shared::mtl::PrimitiveType::Triangle,
+            vertex_source,
+            index_source,
+        },
+        snapshot,
+    ));
     D3D_OK
 }
 
@@ -10672,14 +10678,17 @@ extern "system" fn device_draw_indexed_primitive(
         return D3DERR_INVALIDCALL;
     };
 
-    emit_snapshot_deltas(&obj);
+    let snapshot = emit_snapshot_deltas(&obj);
     drop(snap);
     let _push = CycleAddTimer::start(draw_push_op_ptr(perf_ptr));
-    obj.inner().push_op_inline(Op::Draw(DrawOp {
-        metal_prim,
-        vertex_source,
-        index_source,
-    }));
+    obj.inner().push_op_inline(Op::draw(
+        DrawOp {
+            metal_prim,
+            vertex_source,
+            index_source,
+        },
+        snapshot,
+    ));
     D3D_OK
 }
 
@@ -10879,20 +10888,23 @@ extern "system" fn device_draw_primitive_up(
         };
         let perf_ptr = DeviceInner::perf_ptr_of(obj.inner);
         let snap = CycleAddTimer::start(draw_snapshot_ptr(perf_ptr));
-        emit_snapshot_deltas(&obj);
+        let snapshot = emit_snapshot_deltas(&obj);
         drop(snap);
         let _push = CycleAddTimer::start(draw_push_op_ptr(perf_ptr));
         let metal_prim =
             d3d_to_metal_primitive(D3DPT_TRIANGLELIST).expect("triangle list is supported");
-        dev.push_op_inline(Op::Draw(DrawOp {
-            metal_prim,
-            vertex_source: VertexSource::Up {
-                bytes: vertex_copy,
-                size: u32::try_from(fan_bytes).expect("triangle-fan UP size fits u32"),
-                stride: vertex_stride,
+        dev.push_op_inline(Op::draw(
+            DrawOp {
+                metal_prim,
+                vertex_source: VertexSource::Up {
+                    bytes: vertex_copy,
+                    size: u32::try_from(fan_bytes).expect("triangle-fan UP size fits u32"),
+                    stride: vertex_stride,
+                },
+                index_source,
             },
-            index_source,
-        }));
+            snapshot,
+        ));
         // D3D9 resets stream source 0 to (NULL, 0, 0) after DrawPrimitiveUP.
         dev.bound_buffers_mut().reset_stream0();
         return D3D_OK;
@@ -10914,21 +10926,24 @@ extern "system" fn device_draw_primitive_up(
     // contract.
     let vertex_copy = unsafe { copy_up_vertices(vertex_data, data_size) };
 
-    emit_snapshot_deltas(&obj);
+    let snapshot = emit_snapshot_deltas(&obj);
     drop(snap);
     let _push = CycleAddTimer::start(draw_push_op_ptr(perf_ptr));
-    dev.push_op_inline(Op::Draw(DrawOp {
-        metal_prim,
-        vertex_source: VertexSource::Up {
-            bytes: vertex_copy,
-            size: u32::try_from(data_size).expect("DrawPrimitiveUP data size fits u32"),
-            stride: vertex_stride,
+    dev.push_op_inline(Op::draw(
+        DrawOp {
+            metal_prim,
+            vertex_source: VertexSource::Up {
+                bytes: vertex_copy,
+                size: u32::try_from(data_size).expect("DrawPrimitiveUP data size fits u32"),
+                stride: vertex_stride,
+            },
+            index_source: IndexSource::None {
+                start_vertex: 0,
+                vertex_count: vtx_count,
+            },
         },
-        index_source: IndexSource::None {
-            start_vertex: 0,
-            vertex_count: vtx_count,
-        },
-    }));
+        snapshot,
+    ));
     // D3D9 resets stream source 0 to (NULL, 0, 0) after DrawPrimitiveUP.
     dev.bound_buffers_mut().reset_stream0();
     D3D_OK
@@ -11017,17 +11032,16 @@ fn bump_const_delta(
 
 /// Rebuild the dirty pieces of `DeviceInner::snapshot_cache` into a fresh `CurrentSnapshot`.
 ///
-/// The snapshot — a mix of newly-rebuilt and cached scratch
-/// pointers — is bumped into the per-frame arena, then pushed as one
-/// `Op::SetCurrentSnapshot` op onto `current_frame.ops`. The encoder
-/// applies the snapshot wholesale on each Draw.
+/// The snapshot combines rebuilt and cached scratch pointers in the
+/// per-frame arena. The returned pointer travels with the following draw,
+/// which installs it before the encoder reads the draw state.
 ///
 /// Gated on `DeviceInner::snapshot_dirty`: clean draws return
 /// immediately (encoder's `current_snapshot` already valid). Dirty
 /// draws rebuild ONLY the pieces whose bits fired — clean pieces
 /// reuse their cached scratch pointers (same per-frame arena, still
 /// valid until `stamp_and_swap` sets `all()`).
-fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
+fn emit_snapshot_deltas(obj: &Direct3DDevice9) -> Option<CurrentSnapshotPtr> {
     let dirty = obj.inner().snapshot_dirty;
     if dirty.is_empty() {
         // A draw with the same state as its predecessor still gets its dump
@@ -11035,7 +11049,7 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
         if obj.inner().frame_dump.active {
             obj.inner().frame_dump_draw();
         }
-        return;
+        return None;
     }
 
     let stages_ptr = draw_snapshot_stages_ptr(DeviceInner::perf_ptr_of(obj.inner));
@@ -11712,12 +11726,12 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
     let snap_ptr = unsafe { scratch.alloc_from(&dev.snapshot_cache) };
 
     let snap_nn = NonNull::new(snap_ptr).expect("ScratchArena returned non-null");
-    dev.push_op_inline(Op::SetCurrentSnapshot(CurrentSnapshotPtr(snap_nn)));
     dev.snapshot_dirty = SnapshotDirty::empty();
     if dev.frame_dump.active {
         dev.frame_dump_draw();
     }
     drop(bumps_timer);
+    Some(CurrentSnapshotPtr(snap_nn))
 }
 
 /// Give a system-memory texture the Metal texture its pool withheld.
@@ -11957,18 +11971,22 @@ extern "system" fn device_draw_indexed_primitive_up(
 
     let perf_ptr = DeviceInner::perf_ptr_of(obj.inner);
     let snap = CycleAddTimer::start(draw_snapshot_ptr(perf_ptr));
-    emit_snapshot_deltas(&obj);
+    let snapshot = emit_snapshot_deltas(&obj);
     drop(snap);
     let _push = CycleAddTimer::start(draw_push_op_ptr(perf_ptr));
-    dev.push_op_inline(Op::Draw(DrawOp {
-        metal_prim,
-        vertex_source: VertexSource::Up {
-            bytes: vertex_copy,
-            size: u32::try_from(vtx_bytes).expect("DrawIndexedPrimitiveUP vertex size fits u32"),
-            stride: vertex_stride,
+    dev.push_op_inline(Op::draw(
+        DrawOp {
+            metal_prim,
+            vertex_source: VertexSource::Up {
+                bytes: vertex_copy,
+                size: u32::try_from(vtx_bytes)
+                    .expect("DrawIndexedPrimitiveUP vertex size fits u32"),
+                stride: vertex_stride,
+            },
+            index_source,
         },
-        index_source,
-    }));
+        snapshot,
+    ));
     // D3D9 resets stream source 0 to (NULL, 0, 0) AND the index buffer to NULL
     // after a successful DrawIndexedPrimitiveUP.
     let bound = dev.bound_buffers_mut();

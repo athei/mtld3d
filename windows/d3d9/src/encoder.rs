@@ -171,8 +171,8 @@ const RGBA_BYTE_LEN: u32 = 16;
 
 /// Discriminated union over the work the API thread queues for the encoder.
 ///
-/// The hot per-draw path uses `SetCurrentSnapshot` (one push per dirty
-/// draw) + `Draw` — both inline, no per-op heap allocation. `Closure` is
+/// The hot per-draw path uses `Draw` or `DrawWithSnapshot`, with no
+/// per-op heap allocation. The latter carries changed state. `Closure` is
 /// the escape hatch for the long tail of non-draw work (RT swap, blit,
 /// clear, upload, present, mid-frame submit, …).
 ///
@@ -180,12 +180,6 @@ const RGBA_BYTE_LEN: u32 = 16;
 /// const ranges, stage bindings) are pointers into the per-frame arena
 /// rather than `Box<T>`.
 pub enum Op {
-    /// Replace `FrameEncoder.current_snapshot` wholesale with the scratch-allocated snapshot.
-    ///
-    /// Pushed once per dirty draw — every field is populated by
-    /// `emit_snapshot_deltas`, so the encoder just memcpys the pointee
-    /// into its `current_snapshot`.
-    SetCurrentSnapshot(CurrentSnapshotPtr),
     /// Apply a delta into the encoder-side VS programmable constant mirror.
     ///
     /// `data` is a scratch-allocated `[u8]` of `rows × 16` bytes starting
@@ -216,6 +210,11 @@ pub enum Op {
     },
     /// Issue a draw using the current snapshot.
     Draw(DrawOp),
+    /// Install changed state and issue the draw that consumes it.
+    DrawWithSnapshot {
+        draw: DrawOp,
+        snapshot: CurrentSnapshotPtr,
+    },
     /// Long-tail escape hatch: arbitrary closure for non-draw work.
     Closure(EncoderFn),
     /// Inline op-stream-ordered `Staged` VB/IB upload.
@@ -234,6 +233,18 @@ pub enum Op {
         dst_offset: u32,
         size: u32,
     },
+}
+
+impl Op {
+    /// Attach changed state to its draw without a separate snapshot op.
+    #[must_use]
+    #[inline]
+    pub const fn draw(draw: DrawOp, snapshot: Option<CurrentSnapshotPtr>) -> Self {
+        match snapshot {
+            Some(snapshot) => Self::DrawWithSnapshot { draw, snapshot },
+            None => Self::Draw(draw),
+        }
+    }
 }
 
 /// Render target 0 as the encoder binds it.
@@ -1249,11 +1260,11 @@ pub struct FrameEncoder {
     /// Pointer to the most recently shipped `CurrentSnapshot`.
     ///
     /// Lives in the per-frame `ScratchArena`. Set by
-    /// `Op::SetCurrentSnapshot` in the dispatch loop; read by `emit_draw`
+    /// `Op::DrawWithSnapshot` in the dispatch loop; read by `emit_draw`
     /// via lifetime-laundered deref. Reset to `None` at the head of
     /// `run_frame` so stale pointers from a prior frame's arena can't
     /// dangle into the new frame's op stream — the API thread re-emits a
-    /// fresh `Op::SetCurrentSnapshot` on the first draw of every new frame
+    /// fresh snapshot with the first draw of every new frame
     /// (`stamp_and_swap` sets `SnapshotDirty::all()`).
     current_snapshot: Option<CurrentSnapshotPtr>,
 
@@ -9683,7 +9694,7 @@ fn run_frame(enc: &mut FrameEncoder, mut frame: Box<FrameData>, fc: u64, mode: S
     // Reset encoder-side state cache before draining ops: the pointer
     // it holds aliases into the *previous* frame's ScratchArena, which
     // is about to drop. The API thread always re-emits a fresh
-    // SetCurrentSnapshot on the first draw of a new frame (driven by
+    // snapshot with the first draw of a new frame (driven by
     // SnapshotDirty::all() after arena rotation).
     enc.current_snapshot = None;
     enc.begin_frame(&frame);
@@ -9715,7 +9726,6 @@ fn run_frame(enc: &mut FrameEncoder, mut frame: Box<FrameData>, fc: u64, mode: S
             let idx_u32 = u32::try_from(idx).expect("per-frame op count fits u32");
             mtld3d_shared::crumb!("enc_op", fc, u64::from(idx_u32));
             match op {
-                Op::SetCurrentSnapshot(p) => enc.current_snapshot = Some(p),
                 Op::SetVsConstRange {
                     start_row,
                     rows,
@@ -9746,7 +9756,11 @@ fn run_frame(enc: &mut FrameEncoder, mut frame: Box<FrameData>, fc: u64, mode: S
                     );
                     enc.apply_ff_vs_const_range(start_row, rows, data);
                 }
-                Op::Draw(d) => draw::emit_draw(enc, d),
+                Op::Draw(draw) => draw::emit_draw(enc, draw),
+                Op::DrawWithSnapshot { draw, snapshot } => {
+                    enc.current_snapshot = Some(snapshot);
+                    draw::emit_draw(enc, draw);
+                }
                 Op::Closure(f) => f(enc),
                 Op::StageUpload {
                     buffer_id,
