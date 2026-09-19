@@ -1116,7 +1116,7 @@ impl Thunk for CreateDepthStencilStateParams {
 ///
 /// One entry per `MTLTexture` to create. The unix side iterates the slice
 /// and writes each resulting handle into the matching slot of
-/// `handles_out_ptr`. No `device_handle` or output handle field here — both
+/// `views_out_ptr`. No `device_handle` or output handle field here: both
 /// live on the batch struct.
 #[repr(C, align(8))]
 pub struct TextureCreateDesc {
@@ -1135,33 +1135,22 @@ pub struct TextureCreateDesc {
     pub usage_flags: TextureUsage, // in
 }
 
-/// Batched `MTLTexture` create.
+/// Batched `MTLTexture` creation with distinct attachment and sampling roles.
 ///
-/// One PE↔Unix crossing creates `count` textures from the descriptor
-/// array. `handles_out_ptr` points at a caller-owned `[u64; count]` buffer;
-/// each slot receives the resulting `MTLTexture*` (zero on per-element
-/// failure). `srgb_handles_out_ptr` points at a second caller-owned
-/// `[u64; count]` buffer; each slot receives the eagerly-created sRGB twin
-/// view of the same texture when the pixel format has one
-/// (`PixelFormat::srgb_twin`), or NULL when the format has no sRGB
-/// encoding. All three arrays must be 8-byte aligned and stable for the
-/// duration of the call — the unix side dereferences these pointers,
-/// so the backing storage cannot move until `unix_call` returns.
-///
-/// Single-create call sites use `count = 1` against one-element arrays.
+/// `descs_ptr` names `count` texture descriptors. `views_out_ptr` names a
+/// caller-owned array of `TextureViews` with the same length. Both arrays
+/// remain aligned and stable throughout the call. A failed element receives
+/// an empty bundle; every distinct non-null handle in a successful bundle
+/// transfers one canonical retain to the caller.
 #[repr(C, align(8))]
 pub struct CreateTexturesBatchParams {
-    pub device_handle: MetalHandle<MTLDeviceKind>, // in
-    /// Frame queue the creation-time clears are encoded on.
-    ///
-    /// One command buffer covers the whole batch.
-    pub queue_handle: MetalHandle<MTLCommandQueueKind>, // in
-    pub count: u32,                                // in
+    pub device_handle: MetalHandle<MTLDeviceKind>,
+    pub queue_handle: MetalHandle<MTLCommandQueueKind>,
+    pub count: u32,
     // allow: FFI struct padding; pub for cross-crate field-init.
     pub pad0: u32,
-    pub descs_ptr: u64,            // in: *const TextureCreateDesc, len=count
-    pub handles_out_ptr: u64, // out: *mut MetalHandle<MTLTextureKind>, len=count (NULL on failure)
-    pub srgb_handles_out_ptr: u64, // out: *mut MetalHandle<MTLTextureKind>, len=count (NULL = no twin)
+    pub descs_ptr: u64,
+    pub views_out_ptr: u64,
 }
 
 impl Thunk for CreateTexturesBatchParams {

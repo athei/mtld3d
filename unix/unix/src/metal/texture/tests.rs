@@ -220,3 +220,189 @@ fn read_first_pixel(
     // the completed GPU copy and is retained until this read returns.
     unsafe { buffer.contents().cast::<[u8; 4]>().read() }
 }
+
+#[test]
+fn texture_roles_transfer_only_one_retain_for_each_native_object() {
+    use objc2::runtime::NSObjectProtocol;
+    let Some(device) = MTLCreateSystemDefaultDevice() else {
+        return;
+    };
+    let desc = MTLTextureDescriptor::new();
+    desc.setPixelFormat(MTLPixelFormat::RGBA8Unorm);
+    let texture = device.newTextureWithDescriptor(&desc).expect("texture");
+    let before = texture.retainCount();
+    let views = super::mint_texture_views([
+        Some(texture.clone()),
+        Some(texture.clone()),
+        Some(texture.clone()),
+        Some(texture.clone()),
+    ]);
+    assert_eq!(views.owned_handles().count(), 1);
+    assert_eq!(texture.retainCount(), before + 1);
+    for handle in views.owned_handles() {
+        super::destroy_texture(handle.raw());
+    }
+    assert_eq!(texture.retainCount(), before);
+}
+
+#[test]
+fn render_target_views_preserve_usage_shape_and_role_swizzles() {
+    use mtld3d_shared::{
+        TextureCreateDesc,
+        mtl::{StorageMode, Swizzle, TextureCreateFlags, TextureUsage},
+    };
+
+    use crate::metal::handle::IntoRetained;
+    let Some(device) = MTLCreateSystemDefaultDevice() else {
+        return;
+    };
+    for cube in [false, true] {
+        for format in [
+            PixelFormat::R16Float,
+            PixelFormat::Rg16Unorm,
+            PixelFormat::Rg16Float,
+            PixelFormat::R32Float,
+            PixelFormat::Rg32Float,
+            PixelFormat::Bgra8Unorm,
+            PixelFormat::Rgba8Unorm,
+        ] {
+            let flags = TextureCreateFlags::HAS_SWIZZLE
+                | if cube {
+                    TextureCreateFlags::TYPE_CUBE
+                } else {
+                    TextureCreateFlags::empty()
+                };
+            let desc = TextureCreateDesc {
+                tex_id: 1,
+                width: 16,
+                height: 16,
+                depth: 1,
+                levels: 3,
+                pixel_format: format,
+                storage_mode: StorageMode::Private,
+                flags,
+                swizzle_r: Swizzle::Red,
+                swizzle_g: Swizzle::Green,
+                swizzle_b: Swizzle::One,
+                swizzle_a: Swizzle::One,
+                usage_flags: TextureUsage::RENDER_TARGET,
+            };
+            let views = super::create_texture(&device, &desc).expect("required views");
+            let base = views.linear.into_retained().expect("base");
+            let sample = views.sample_linear.into_retained().expect("sample");
+            assert_ne!(views.linear, views.sample_linear);
+            assert_eq!(base.mipmapLevelCount(), 3);
+            assert_eq!(sample.mipmapLevelCount(), 3);
+            assert_eq!(base.textureType(), sample.textureType());
+            assert_eq!(base.swizzle(), super::IDENTITY_SWIZZLE);
+            assert_eq!(sample.swizzle().alpha, objc2_metal::MTLTextureSwizzle::One);
+            assert_eq!(base.usage(), super::texture_usage(&device, true, true));
+            if format.srgb_twin().is_some() {
+                assert_eq!(views.owned_handles().count(), 4);
+                let srgb = views.srgb.into_retained().expect("sRGB attachment");
+                let sample_srgb = views.sample_srgb.into_retained().expect("sRGB sample");
+                assert_eq!(srgb.swizzle(), super::IDENTITY_SWIZZLE);
+                assert_eq!(
+                    sample_srgb.swizzle().alpha,
+                    objc2_metal::MTLTextureSwizzle::One
+                );
+            } else {
+                assert_eq!(views.owned_handles().count(), 2);
+                assert!(views.srgb.is_null());
+                assert!(views.sample_srgb.is_null());
+            }
+            for handle in views.owned_handles() {
+                super::destroy_texture(handle.raw());
+            }
+        }
+    }
+}
+
+#[test]
+fn required_view_failure_drops_every_temporary_owner_before_minting() {
+    use objc2::runtime::NSObjectProtocol;
+    let Some(device) = MTLCreateSystemDefaultDevice() else {
+        return;
+    };
+    let desc = MTLTextureDescriptor::new();
+    desc.setPixelFormat(MTLPixelFormat::RGBA8Unorm);
+    let texture = device.newTextureWithDescriptor(&desc).expect("texture");
+    let before = texture.retainCount();
+    for fail_srgb_sample in [false, true] {
+        let result = super::assemble_texture_views(
+            texture.clone(),
+            true,
+            true,
+            |_, srgb| {
+                if srgb == fail_srgb_sample {
+                    None
+                } else {
+                    Some(texture.clone())
+                }
+            },
+            |_| Some(texture.clone()),
+        );
+        assert!(result.is_none());
+        assert_eq!(
+            texture.retainCount(),
+            before,
+            "failed sRGB sample={fail_srgb_sample}"
+        );
+        let raw = Retained::as_ptr(&texture) as u64;
+        assert!(!super::LIVE_TEXTURES.lock().expect("ledger").contains(&raw));
+    }
+}
+
+#[test]
+fn optional_srgb_refusal_keeps_the_required_linear_view() {
+    use objc2::runtime::NSObjectProtocol;
+    let Some(device) = MTLCreateSystemDefaultDevice() else {
+        return;
+    };
+    let desc = MTLTextureDescriptor::new();
+    desc.setPixelFormat(MTLPixelFormat::RGBA8Unorm);
+    let texture = device.newTextureWithDescriptor(&desc).expect("texture");
+    let before = texture.retainCount();
+    let views = super::assemble_texture_views(
+        texture.clone(),
+        true,
+        true,
+        |_, srgb| {
+            assert!(!srgb);
+            Some(texture.clone())
+        },
+        |_| None,
+    )
+    .expect("linear fallback");
+    assert!(views.srgb.is_null());
+    assert!(views.sample_srgb.is_null());
+    assert_eq!(views.sample_linear, views.linear);
+    assert_eq!(texture.retainCount(), before + 1);
+    for handle in views.owned_handles() {
+        super::destroy_texture(handle.raw());
+    }
+    assert_eq!(texture.retainCount(), before);
+}
+
+#[test]
+fn identity_roles_do_not_create_sampling_views() {
+    let Some(device) = MTLCreateSystemDefaultDevice() else {
+        return;
+    };
+    let desc = MTLTextureDescriptor::new();
+    desc.setPixelFormat(MTLPixelFormat::RGBA8Unorm);
+    let texture = device.newTextureWithDescriptor(&desc).expect("texture");
+    let views = super::assemble_texture_views(
+        texture,
+        true,
+        false,
+        |_, _| panic!("identity allocation must not create a sampling view"),
+        |_| None,
+    )
+    .expect("identity allocation");
+    assert_eq!(views.linear, views.sample_linear);
+    assert_eq!(views.owned_handles().count(), 1);
+    for handle in views.owned_handles() {
+        super::destroy_texture(handle.raw());
+    }
+}

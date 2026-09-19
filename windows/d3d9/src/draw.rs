@@ -1507,7 +1507,7 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
             if mtld3d_core::sampler_state::srgb_texture_enabled(&b.sampler_state) {
                 enc.get_texture_handle_by_id_srgb(b.texture_id)
             } else {
-                enc.get_texture_handle_by_id(b.texture_id)
+                enc.get_texture_sample_handle_by_id(b.texture_id)
             };
     }
     // A draw that samples the bound depth attachment reads a copy of it: Metal
@@ -2017,7 +2017,7 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
                 if mtld3d_core::sampler_state::srgb_texture_enabled(&ss) {
                     enc.get_texture_handle_by_id_srgb(id)
                 } else {
-                    enc.get_texture_handle_by_id(id)
+                    enc.get_texture_sample_handle_by_id(id)
                 }
             });
             if handle == 0 {

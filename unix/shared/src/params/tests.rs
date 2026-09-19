@@ -158,8 +158,8 @@ fn frame_param_layouts_match_wow64() {
 
     // CreateTexturesBatchParams:
     //   8 device_handle + 8 queue_handle + 4 count + 4 _pad0 + 8 descs_ptr
-    //   + 8 handles_out_ptr + 8 srgb_handles_out_ptr = 48
-    assert_eq!(core::mem::size_of::<CreateTexturesBatchParams>(), 48);
+    //   + 8 views_out_ptr = 40
+    assert_eq!(core::mem::size_of::<CreateTexturesBatchParams>(), 40);
 
     // TextureCreateDesc:
     //   8 tex_id
