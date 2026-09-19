@@ -11,9 +11,9 @@ use mtld3d_types::{
     D3D_OK, D3DBOX, D3DINDEXBUFFER_DESC, D3DLOCKED_BOX, D3DLOCKED_RECT, D3DSURFACE_DESC,
     D3DVERTEXBUFFER_DESC, D3DVOLUME_DESC, Guid, IDirect3DCubeTexture9Vtbl,
     IDirect3DIndexBuffer9Vtbl, IDirect3DPixelShader9Vtbl, IDirect3DQuery9Vtbl,
-    IDirect3DStateBlock9Vtbl, IDirect3DSurface9Vtbl, IDirect3DTexture9Vtbl,
-    IDirect3DVertexBuffer9Vtbl, IDirect3DVertexDeclaration9Vtbl, IDirect3DVertexShader9Vtbl,
-    IDirect3DVolume9Vtbl, IDirect3DVolumeTexture9Vtbl,
+    IDirect3DStateBlock9Vtbl, IDirect3DSurface9Vtbl, IDirect3DSwapChain9Vtbl,
+    IDirect3DTexture9Vtbl, IDirect3DVertexBuffer9Vtbl, IDirect3DVertexDeclaration9Vtbl,
+    IDirect3DVertexShader9Vtbl, IDirect3DVolume9Vtbl, IDirect3DVolumeTexture9Vtbl,
 };
 
 use crate::{
@@ -64,6 +64,51 @@ fn get_private_data(
     // SAFETY: vtable thunk; `ptr` is null or writable for `size` bytes.
     let hr = unsafe { get(this, &raw const *guid, ptr, &raw mut size) };
     (hr, size)
+}
+
+/// One owned `IDirect3DSwapChain9` reference.
+pub struct SwapChain<'h> {
+    ptr: *mut c_void,
+    _marker: PhantomData<&'h ()>,
+}
+
+impl SwapChain<'_> {
+    /// Adopt the reference returned by a successful swapchain creation or query.
+    ///
+    /// # Safety
+    /// `ptr` is a live swapchain owning one reference; its device outlives `'h`.
+    pub const unsafe fn from_raw(ptr: *mut c_void) -> Self {
+        Self {
+            ptr,
+            _marker: PhantomData,
+        }
+    }
+
+    fn vtbl(&self) -> &'static IDirect3DSwapChain9Vtbl {
+        // SAFETY: the wrapper owns a live swapchain reference until Drop.
+        unsafe { deref_vtbl::<IDirect3DSwapChain9Vtbl>(self.ptr) }
+    }
+
+    /// Read the front buffer, or probe a null destination with `None`.
+    pub fn front_buffer_data(&self, dst: Option<&Surface<'_>>) -> i32 {
+        let ptr = dst.map_or(core::ptr::null_mut(), Surface::as_ptr);
+        // SAFETY: live swapchain and a live destination or explicit null probe.
+        unsafe { (self.vtbl().get_front_buffer_data)(self.ptr, ptr) }
+    }
+
+    /// Probe the readback thunk's null-this rejection with a valid destination.
+    #[must_use]
+    pub fn front_buffer_data_null_this(&self, dst: &Surface<'_>) -> i32 {
+        // SAFETY: the thunk accepts null this as a rejected API call; dst is live.
+        unsafe { (self.vtbl().get_front_buffer_data)(core::ptr::null_mut(), dst.as_ptr()) }
+    }
+}
+
+impl Drop for SwapChain<'_> {
+    fn drop(&mut self) {
+        // SAFETY: balances the reference adopted by this wrapper.
+        unsafe { (self.vtbl().release)(self.ptr) };
+    }
 }
 
 // ── Volume texture ──

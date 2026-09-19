@@ -256,13 +256,33 @@ extern "system" fn swapchain_present(
     dev.present()
 }
 
-extern "system" fn swapchain_get_front_buffer_data(
-    this: *mut c_void,
-    _surface: *mut c_void,
-) -> i32 {
+extern "system" fn swapchain_get_front_buffer_data(this: *mut c_void, surface: *mut c_void) -> i32 {
     let _api = crate::com_ref::com_api_lock::<Direct3DSwapChain9>(this);
-    mtld3d_shared::log_once_warn!(target: LOG_TARGET, "stub IDirect3DSwapChain9::GetFrontBufferData → INVALIDCALL");
-    D3DERR_INVALIDCALL
+    // SAFETY: vtable thunk; `this` is a live swapchain pointer or null.
+    let Some(obj) = (unsafe { InPtr::<Direct3DSwapChain9>::opt(this) }) else {
+        mtld3d_shared::log_once_warn!(target: LOG_TARGET,
+            "reject swapchain GetFrontBufferData: null swapchain → INVALIDCALL");
+        return D3DERR_INVALIDCALL;
+    };
+    if !obj.inner().owned_by_device {
+        mtld3d_shared::log_once_warn!(target: LOG_TARGET,
+            "reject swapchain GetFrontBufferData: additional swapchain has no front image → INVALIDCALL");
+        return D3DERR_INVALIDCALL;
+    }
+    // SAFETY: the destination is a caller-owned IDirect3DSurface9 or null.
+    let Some(dst) = (unsafe { InPtr::<Direct3DSurface9>::opt(surface) }) else {
+        mtld3d_shared::log_once_warn!(target: LOG_TARGET,
+            "reject swapchain GetFrontBufferData: null destination → INVALIDCALL");
+        return D3DERR_INVALIDCALL;
+    };
+    // SAFETY: a referenced implicit swapchain pins its owning device. The API
+    // lock above serializes access; an unset owner is rejected below.
+    let Some(dev) = (unsafe { obj.inner().device_inner.as_mut() }) else {
+        mtld3d_shared::log_once_warn!(target: LOG_TARGET,
+            "reject swapchain GetFrontBufferData: no owning device → INVALIDCALL");
+        return D3DERR_INVALIDCALL;
+    };
+    dev.read_front_buffer(&dst)
 }
 
 extern "system" fn swapchain_get_back_buffer(
