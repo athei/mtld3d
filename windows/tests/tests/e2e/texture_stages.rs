@@ -2109,3 +2109,264 @@ fn modulate_color_add_alpha_constants_preserve_queued_draws() {
         "CONSTANT in ARG2",
     );
 }
+
+#[test]
+fn modulate_inverse_alpha_add_color_wine_equation() {
+    use mtld3d_types::D3DTOP_MODULATEINVALPHA_ADDCOLOR;
+    let h = Harness::new();
+    let tex = solid_texture(&h, 0x9900_ff00);
+    assert_eq!(h.set_render_state(D3DRS_TEXTUREFACTOR, 0xdd33_3333), 0);
+    let pixel = render_stage(
+        &h,
+        &tex,
+        D3DTOP_MODULATEINVALPHA_ADDCOLOR,
+        D3DTA_TEXTURE,
+        D3DTA_TFACTOR,
+        0x55ff_0000,
+    );
+    assert!(
+        pixel.r.abs_diff(20) <= 1 && pixel.g == 255 && pixel.b.abs_diff(20) <= 1,
+        "inverse-alpha Wine equation expected RGB 0x14ff14, got {pixel:?}"
+    );
+}
+
+fn inverse_alpha_stage(h: &Harness, stage: u32, arg1: u32, arg2: u32) {
+    use mtld3d_types::D3DTOP_MODULATEINVALPHA_ADDCOLOR;
+    modulate_alpha_add_stage(h, stage, arg1, arg2);
+    assert_eq!(
+        h.set_texture_stage_state(stage, D3DTSS_COLOROP, D3DTOP_MODULATEINVALPHA_ADDCOLOR),
+        0
+    );
+}
+
+#[test]
+fn modulate_inverse_alpha_add_color_nontexture_alpha_is_not_pm() {
+    use mtld3d_tests::assert_pixel_approx;
+    use mtld3d_types::{D3DTA_ALPHAREPLICATE, D3DTA_CURRENT, D3DTOP_DISABLE};
+    let h = Harness::new();
+    assert_eq!(h.set_render_state(D3DRS_TEXTUREFACTOR, 0x33b3_4d1a), 0);
+    inverse_alpha_stage(&h, 0, D3DTA_DIFFUSE, D3DTA_TFACTOR);
+    let zero = solid_texture(&h, 0x0022_4466);
+    let full = solid_texture(&h, 0xff22_4466);
+    for texture in [None, Some(&zero), Some(&full)] {
+        if let Some(texture) = texture {
+            assert_eq!(h.set_texture(0, texture), 0);
+        } else {
+            assert_eq!(h.clear_texture(0), 0);
+        }
+        assert_eq!(
+            h.set_texture_stage_state(1, D3DTSS_COLOROP, D3DTOP_DISABLE),
+            0
+        );
+        assert_pixel_approx(
+            temp_probe_pixel(&h, 0x4033_99cc),
+            0x00b9_d3df,
+            1,
+            "resolved diffuse alpha, independent of bound texture alpha",
+        );
+        temp_probe_stage(
+            &h,
+            1,
+            D3DTA_CURRENT | D3DTA_ALPHAREPLICATE,
+            D3DTA_CURRENT,
+            D3DTA_CURRENT,
+        );
+        assert_eq!(
+            temp_probe_pixel(&h, 0x4033_99cc),
+            0x0033_3333,
+            "independent alpha operation survives"
+        );
+    }
+}
+
+#[test]
+fn modulate_inverse_alpha_add_color_modifiers_and_argument_order() {
+    use mtld3d_tests::assert_pixel_approx;
+    use mtld3d_types::{D3DTA_ALPHAREPLICATE, D3DTA_COMPLEMENT};
+    let h = Harness::new();
+    assert_eq!(h.set_render_state(D3DRS_TEXTUREFACTOR, 0xc0b3_4d1a), 0);
+    let tex = solid_texture(&h, 0x4033_99cc);
+    assert_eq!(h.set_texture(0, &tex), 0);
+    for (a, b, expected) in [
+        (D3DTA_TEXTURE, D3DTA_TFACTOR, 0x00b9_d3df),
+        (D3DTA_TFACTOR, D3DTA_TEXTURE, 0x00c0_734c),
+        (D3DTA_TEXTURE | D3DTA_COMPLEMENT, D3DTA_TFACTOR, 0x00f9_793a),
+        (
+            D3DTA_TEXTURE | D3DTA_ALPHAREPLICATE,
+            D3DTA_TFACTOR,
+            0x00c6_7a53,
+        ),
+        (
+            D3DTA_TEXTURE | D3DTA_COMPLEMENT | D3DTA_ALPHAREPLICATE,
+            D3DTA_TFACTOR,
+            0x00ec_d2c6,
+        ),
+        (D3DTA_TEXTURE, D3DTA_TFACTOR | D3DTA_COMPLEMENT, 0x006c_ffff),
+        (
+            D3DTA_TEXTURE,
+            D3DTA_TFACTOR | D3DTA_ALPHAREPLICATE,
+            0x00c3_ffff,
+        ),
+        (
+            D3DTA_TEXTURE,
+            D3DTA_TFACTOR | D3DTA_COMPLEMENT | D3DTA_ALPHAREPLICATE,
+            0x0062_c8fb,
+        ),
+    ] {
+        inverse_alpha_stage(&h, 0, a, b);
+        assert_pixel_approx(
+            temp_probe_pixel(&h, 0),
+            expected,
+            1,
+            "inverse uses the modified first alpha and keeps argument order",
+        );
+    }
+}
+
+#[test]
+fn modulate_inverse_alpha_add_color_clamps_before_later_reduction() {
+    use mtld3d_tests::assert_pixel_approx;
+    use mtld3d_types::{D3DTA_CONSTANT, D3DTA_CURRENT, D3DTSS_CONSTANT};
+    let h = Harness::new();
+    let tex = solid_texture(&h, 0xcce6_cc1a);
+    assert_eq!(h.set_texture(0, &tex), 0);
+    assert_eq!(h.set_render_state(D3DRS_TEXTUREFACTOR, 0x1acc_80ff), 0);
+    inverse_alpha_stage(&h, 0, D3DTA_TEXTURE, D3DTA_TFACTOR);
+    assert_pixel_approx(temp_probe_pixel(&h, 0), 0x00ff_e64d, 1, "stage saturation");
+    temp_probe_stage(&h, 1, D3DTA_CURRENT, D3DTA_CURRENT, D3DTA_CURRENT);
+    assert_eq!(
+        h.set_texture_stage_state(1, D3DTSS_COLOROP, D3DTOP_MODULATE),
+        0
+    );
+    assert_eq!(
+        h.set_texture_stage_state(1, D3DTSS_COLORARG2, D3DTA_CONSTANT),
+        0
+    );
+    assert_eq!(
+        h.set_texture_stage_state(1, D3DTSS_CONSTANT, 0x8080_8080),
+        0
+    );
+    assert_pixel_approx(
+        temp_probe_pixel(&h, 0),
+        0x0080_7327,
+        1,
+        "clamp must happen before the following stage, not only at render-target output",
+    );
+}
+
+#[test]
+fn modulate_inverse_alpha_add_color_unbound_inputs_preserve_current_and_alpha() {
+    use mtld3d_types::{D3DTA_ALPHAREPLICATE, D3DTA_COMPLEMENT, D3DTA_CURRENT, D3DTOP_DISABLE};
+    let h = Harness::new();
+    assert_eq!(h.set_render_state(D3DRS_TEXTUREFACTOR, 0x3310_2030), 0);
+    for (a, b) in [
+        (D3DTA_TEXTURE | D3DTA_COMPLEMENT, D3DTA_TFACTOR),
+        (D3DTA_DIFFUSE, D3DTA_TEXTURE | D3DTA_ALPHAREPLICATE),
+    ] {
+        inverse_alpha_stage(&h, 0, a, b);
+        assert_eq!(
+            h.set_texture_stage_state(1, D3DTSS_COLOROP, D3DTOP_DISABLE),
+            0
+        );
+        assert_eq!(temp_probe_pixel(&h, 0x8040_6080), 0x0040_6080);
+        temp_probe_stage(
+            &h,
+            1,
+            D3DTA_CURRENT | D3DTA_ALPHAREPLICATE,
+            D3DTA_CURRENT,
+            D3DTA_CURRENT,
+        );
+        assert_eq!(temp_probe_pixel(&h, 0x8040_6080), 0x0033_3333);
+    }
+}
+
+#[test]
+fn modulate_inverse_alpha_add_color_temp_alias_reads_old_alpha() {
+    use mtld3d_tests::assert_pixel_approx;
+    use mtld3d_types::{
+        D3DTA_ALPHAREPLICATE, D3DTA_CONSTANT, D3DTA_CURRENT, D3DTA_TEMP, D3DTSS_CONSTANT,
+        D3DTSS_RESULTARG,
+    };
+    let h = Harness::new();
+    assert_eq!(h.set_render_state(D3DRS_TEXTUREFACTOR, 0x4033_99cc), 0);
+    temp_probe_stage(&h, 0, D3DTA_TFACTOR, D3DTA_TFACTOR, D3DTA_TEMP);
+    inverse_alpha_stage(&h, 1, D3DTA_TEMP, D3DTA_CURRENT);
+    assert_eq!(
+        h.set_texture_stage_state(1, D3DTSS_ALPHAARG1, D3DTA_CONSTANT),
+        0
+    );
+    assert_eq!(
+        h.set_texture_stage_state(1, D3DTSS_CONSTANT, 0x3300_0000),
+        0
+    );
+    assert_eq!(
+        h.set_texture_stage_state(1, D3DTSS_RESULTARG, D3DTA_TEMP),
+        0
+    );
+    temp_probe_stage(&h, 2, D3DTA_TEMP, D3DTA_TEMP, D3DTA_CURRENT);
+    assert_pixel_approx(
+        temp_probe_pixel(&h, 0xc0b3_4d1a),
+        0x00b9_d3df,
+        1,
+        "old TEMP alpha feeds color",
+    );
+    assert_eq!(
+        h.set_texture_stage_state(2, D3DTSS_COLORARG1, D3DTA_TEMP | D3DTA_ALPHAREPLICATE),
+        0
+    );
+    assert_eq!(temp_probe_pixel(&h, 0xc0b3_4d1a), 0x0033_3333);
+    assert_eq!(
+        h.set_texture_stage_state(2, D3DTSS_COLORARG1, D3DTA_CURRENT),
+        0
+    );
+    assert_eq!(
+        temp_probe_pixel(&h, 0xc0b3_4d1a),
+        0x00b3_4d1a,
+        "TEMP assignment preserves CURRENT"
+    );
+}
+
+#[test]
+fn modulate_inverse_alpha_add_color_stage_constants_survive_queued_updates() {
+    use mtld3d_tests::assert_pixel_approx;
+    use mtld3d_types::{D3DTA_CONSTANT, D3DTA_CURRENT, D3DTSS_CONSTANT};
+    let h = Harness::new();
+    assert_eq!(h.set_render_state(D3DRS_LIGHTING, 0), 0);
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1), 0);
+    assert_eq!(h.set_render_state(D3DRS_TEXTUREFACTOR, 0x33b3_4d1a), 0);
+    temp_probe_stage(&h, 0, D3DTA_DIFFUSE, D3DTA_DIFFUSE, D3DTA_CURRENT);
+    assert_eq!(
+        h.set_texture_stage_state(0, D3DTSS_CONSTANT, 0xff00_ff00),
+        0
+    );
+    inverse_alpha_stage(&h, 1, D3DTA_CONSTANT, D3DTA_TFACTOR);
+    h.render_once(BLACK, |d| {
+        for (offset, constant) in [
+            (-2.0 / 3.0, 0x4033_99cc),
+            (0.0, 0xc033_99cc),
+            (2.0 / 3.0, 0x4033_99cc),
+        ] {
+            assert_eq!(d.set_texture_stage_state(1, D3DTSS_CONSTANT, constant), 0);
+            let verts = quad(0x8010_2030).map(|mut v| {
+                v.x = v.x.mul_add(1.0 / 3.0, offset);
+                v
+            });
+            assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &verts), 0);
+        }
+    });
+    for (x, expected) in [(106, 0x00b9_d3df), (320, 0x005f_acd2), (533, 0x00b9_d3df)] {
+        assert_pixel_approx(
+            h.read_pixel(x, 240),
+            expected | 0x3300_0000,
+            1,
+            "queued stage 1 constant alpha",
+        );
+    }
+    inverse_alpha_stage(&h, 1, D3DTA_TFACTOR, D3DTA_CONSTANT);
+    assert_eq!(
+        h.set_texture_stage_state(1, D3DTSS_CONSTANT, 0x4033_99cc),
+        0
+    );
+    assert_eq!(h.set_render_state(D3DRS_TEXTUREFACTOR, 0xc0b3_4d1a), 0);
+    assert_pixel_approx(temp_probe_pixel(&h, 0), 0x00c0_734c, 1, "CONSTANT as ARG2");
+}
