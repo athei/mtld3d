@@ -4,6 +4,8 @@
 //! `replace_*` setters transfer one refcount into the slot and release
 //! the prior slot value via auto-`Drop` on assignment.
 
+use mtld3d_core::shader_constants::rows_differ;
+
 use super::{
     com_ref::{Bound, CachedComPtr},
     pixel_shader::Direct3DPixelShader9,
@@ -110,8 +112,8 @@ impl ShaderBindings {
     /// Redundant-set elimination: a same-value constant write produces a
     /// byte-identical mirror (and so a byte-identical encoder delta), so
     /// callers gate the encoder propagation + snapshot dirty-mark on the
-    /// returned bool. The compare is per-`f32` via `to_bits`, exact and
-    /// NaN-safe.
+    /// returned bool. The comparison preserves exact float bits, including
+    /// NaN payloads and signed zero.
     pub fn write_vs_constants(&mut self, start: u32, data: &[[f32; 4]]) -> bool {
         let start = start as usize;
         let end = (start + data.len()).min(CONSTANT_ROWS);
@@ -266,16 +268,4 @@ fn write_rows<T: Copy + PartialEq>(dst_all: &mut [T], start: u32, data: &[T]) ->
         dst.copy_from_slice(src);
     }
     changed
-}
-
-/// Whether the existing rows `cur` differ from the incoming rows `new`.
-///
-/// Compared per-`f32` via `to_bits` (exact, NaN-safe — a same-value write
-/// must read as unchanged so the redundant-set gate can fire). The two
-/// slices are the same length by construction at every call site.
-fn rows_differ(cur: &[[f32; 4]], new: &[[f32; 4]]) -> bool {
-    cur.as_flattened()
-        .iter()
-        .zip(new.as_flattened())
-        .any(|(a, b)| a.to_bits() != b.to_bits())
 }

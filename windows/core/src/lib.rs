@@ -52,6 +52,7 @@ pub mod sampler_state;
 pub mod scratch;
 pub mod shader_cache;
 pub mod shader_compile_stats;
+pub mod shader_constants;
 pub mod shader_prewarm;
 pub mod staging_coverage;
 pub mod startup_work;
