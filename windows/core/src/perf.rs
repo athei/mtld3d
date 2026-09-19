@@ -626,6 +626,12 @@ impl Drop for ApiTimer {
 #[cfg(perf_tracking)]
 #[derive(Clone, Copy)]
 struct FrameCounters {
+    /// Device reset epoch, copied at drain after the previous frame was flushed.
+    reset_epoch: u64,
+    reset_epoch_saturated: bool,
+    /// Uniform builds partitioned into no-clip bypass, cache hit, and recompute.
+    inverse_view: [u64; 3],
+    inverse_view_saturated: bool,
     /// TSC cycles this frame, bucketed by `ApiCategory`.
     ///
     /// Accumulated on the API thread inside every D3D9 COM vtable entry
@@ -835,6 +841,10 @@ impl Default for FrameCounters {
 impl FrameCounters {
     const fn new() -> Self {
         Self {
+            reset_epoch: 0,
+            reset_epoch_saturated: false,
+            inverse_view: [0; 3],
+            inverse_view_saturated: false,
             api_cycles_by_category: [0; ApiCategory::COUNT],
             api_call_counts_by_category: [0; ApiCategory::COUNT],
             vb_rename: 0,
@@ -953,6 +963,14 @@ struct EncoderFrameCounters {
     /// preserve that draw's bytes. The rare path; the common case is a
     /// cheap in-place upload.
     vbib_mid_pass_reorders: u32,
+    /// Successful overlap renames whose full upload omitted preservation.
+    vbib_full_upload_skips: u32,
+    /// Device-buffer bytes not copied by those full-allocation uploads.
+    vbib_full_upload_skip_bytes: u64,
+    /// Device-buffer bytes queued for preservation before partial or padded uploads.
+    vbib_preserve_gpu_bytes: u64,
+    /// Failed fresh-device allocations on the overlap path, excluded from successful renames.
+    vbib_reorder_alloc_failures: u32,
     /// Per-frame total texture uploads.
     ///
     /// Count of `run_texture_upload_blit` invocations that emitted a
@@ -1073,6 +1091,10 @@ impl EncoderFrameCounters {
             texture_destroys: 0,
             vbib_staging_uploads: 0,
             vbib_mid_pass_reorders: 0,
+            vbib_full_upload_skips: 0,
+            vbib_full_upload_skip_bytes: 0,
+            vbib_preserve_gpu_bytes: 0,
+            vbib_reorder_alloc_failures: 0,
             texture_blit_uploads: 0,
             texture_blit_padded_uploads: 0,
             texture_expand_uploads: 0,
@@ -1110,6 +1132,8 @@ pub struct ApiPerfState {
     /// `drain_into_payload` moves this wholesale into the payload and
     /// leaves a zeroed `FrameCounters` behind.
     counters: FrameCounters,
+    reset_epoch: u64,
+    reset_epoch_saturated: bool,
     /// TSC at the start of the previous `device_present`.
     ///
     /// Used to derive the wall-clock frame period. API-thread
@@ -1145,10 +1169,31 @@ impl ApiPerfState {
     pub const fn new() -> Self {
         Self {
             counters: FrameCounters::new(),
+            reset_epoch: 0,
+            reset_epoch_saturated: false,
             prev_present_rdtsc: 0,
             active_child_cycles: 0,
             timer_depth: 0,
         }
+    }
+
+    /// Count only consumed uniform builds, without a timer or another key read.
+    pub const fn record_inverse_view(&mut self, outcome: &crate::vs_draw::InverseViewUse) {
+        use crate::vs_draw::InverseViewUse;
+        let index = match outcome {
+            InverseViewUse::Bypass => 0,
+            InverseViewUse::Hit => 1,
+            InverseViewUse::Recompute => 2,
+        };
+        let count = &mut self.counters.inverse_view[index];
+        self.counters.inverse_view_saturated |= *count == u64::MAX;
+        *count = count.saturating_add(1);
+    }
+
+    /// Start a new cache lifetime after Reset drained the previous frame.
+    pub const fn advance_reset_epoch(&mut self) {
+        self.reset_epoch_saturated |= self.reset_epoch == u64::MAX;
+        self.reset_epoch = self.reset_epoch.saturating_add(1);
     }
 
     /// Pointer the `CycleAddTimer` writes into.
@@ -1438,6 +1483,8 @@ impl ApiPerfState {
         // drain, so moving only `counters` + `frame_total_cycles` here never
         // clobbers them.
         payload.counters = core::mem::take(&mut self.counters);
+        payload.counters.reset_epoch = self.reset_epoch;
+        payload.counters.reset_epoch_saturated = self.reset_epoch_saturated;
         payload.timing.frame_total_cycles = if prev == 0 { 0 } else { now - prev };
     }
 }
@@ -1955,6 +2002,24 @@ impl EncoderPerfState {
         self.enc.vbib_mid_pass_reorders = self.enc.vbib_mid_pass_reorders.saturating_add(1);
     }
 
+    /// Record the preservation blit omitted by an exact full-allocation upload.
+    pub const fn bump_vbib_full_upload_skip(&mut self, bytes: u64) {
+        self.enc.vbib_full_upload_skips = self.enc.vbib_full_upload_skips.saturating_add(1);
+        self.enc.vbib_full_upload_skip_bytes =
+            self.enc.vbib_full_upload_skip_bytes.saturating_add(bytes);
+    }
+
+    /// Record the full device-buffer extent of an emitted preservation blit.
+    pub const fn bump_vbib_preserve_gpu(&mut self, bytes: u64) {
+        self.enc.vbib_preserve_gpu_bytes = self.enc.vbib_preserve_gpu_bytes.saturating_add(bytes);
+    }
+
+    /// Count an overlap rename whose fresh-device allocation failed.
+    pub const fn bump_vbib_reorder_alloc_failure(&mut self) {
+        self.enc.vbib_reorder_alloc_failures =
+            self.enc.vbib_reorder_alloc_failures.saturating_add(1);
+    }
+
     pub const fn bump_vbib_retained_add(&mut self, bytes: usize) {
         self.vbib_retained_bytes = self.vbib_retained_bytes.saturating_add(bytes);
     }
@@ -2177,7 +2242,7 @@ impl EncoderPerfState {
             let mut rendered = Summary::render(&self.perf_window, caches, window_secs);
             self.compilation
                 .append_window(&mut rendered, self.perf_window.frames);
-            info!(target: LOG_TARGET, "{rendered}");
+            info!(target: LOG_TARGET, "encoder={:?} {rendered}", std::thread::current().id());
         }
 
         if want_passes {
@@ -2502,6 +2567,14 @@ impl Stat {
     }
 }
 
+/// Inverse outcomes for one device reset epoch within the current window.
+#[cfg(perf_tracking)]
+struct InverseEpoch {
+    epoch: u64,
+    counts: [u64; 3],
+    saturated: bool,
+}
+
 /// Rolling 5-second window that folds per-frame counters into a [`Stat`] per metric.
 ///
 /// Each [`Stat`] is a window sum + per-frame peak. On emit, time sums
@@ -2513,6 +2586,7 @@ impl Stat {
 #[cfg(perf_tracking)]
 #[derive(Default)]
 struct PerfWindow {
+    inverse_epochs: Vec<InverseEpoch>,
     started_tsc: u64,
     frames: u32,
     passes: Stat,
@@ -2629,6 +2703,10 @@ struct PerfWindow {
     ///
     /// The deciding number for a hybrid upload model.
     vbib_mid_pass_reorders: Stat,
+    vbib_full_upload_skips: Stat,
+    vbib_full_upload_skip_bytes: Stat,
+    vbib_preserve_gpu_bytes: Stat,
+    vbib_reorder_alloc_failures: Stat,
     retention_cap_drain: Stat,
     /// Heavy-tier cap enforcements (~1-2 ms each).
     ///
@@ -2734,6 +2812,25 @@ impl PerfWindow {
             self.started_tsc = rdtsc();
         }
         self.frames += 1;
+        let c = &s.counters;
+        if self
+            .inverse_epochs
+            .last()
+            .is_none_or(|e| e.epoch != c.reset_epoch)
+        {
+            self.inverse_epochs.push(InverseEpoch {
+                epoch: c.reset_epoch,
+                counts: [0; 3],
+                saturated: false,
+            });
+        }
+        if let Some(epoch) = self.inverse_epochs.last_mut() {
+            epoch.saturated |= c.inverse_view_saturated || c.reset_epoch_saturated;
+            for (total, count) in epoch.counts.iter_mut().zip(c.inverse_view) {
+                epoch.saturated |= total.checked_add(count).is_none();
+                *total = total.saturating_add(count);
+            }
+        }
         // Paired metrics: `Stat::add` folds the value into both the window
         // sum and the per-frame peak. Sum-only metrics also land in `.max`,
         // but render never reads that half for them.
@@ -2829,6 +2926,14 @@ impl PerfWindow {
             .add(u64::from(s.enc.vbib_staging_uploads));
         self.vbib_mid_pass_reorders
             .add(u64::from(s.enc.vbib_mid_pass_reorders));
+        self.vbib_full_upload_skips
+            .add(u64::from(s.enc.vbib_full_upload_skips));
+        self.vbib_full_upload_skip_bytes
+            .add(s.enc.vbib_full_upload_skip_bytes);
+        self.vbib_preserve_gpu_bytes
+            .add(s.enc.vbib_preserve_gpu_bytes);
+        self.vbib_reorder_alloc_failures
+            .add(u64::from(s.enc.vbib_reorder_alloc_failures));
         self.retention_cap_drain
             .add(u64::from(s.counters.retention_cap_drain));
         self.retention_cap_submit
@@ -3361,6 +3466,7 @@ impl<'a> Summary<'a> {
         self.write_caches(&mut out);
         self.write_commands_passes(&mut out);
         self.write_keys_gating(&mut out);
+        self.write_inverse_view(&mut out);
         self.write_alloc_footprint(&mut out);
 
         if out.ends_with('\n') {
@@ -3381,6 +3487,41 @@ impl<'a> Summary<'a> {
             frames = self.w.frames,
             label = bn.label(),
         );
+        if let (Some(first), Some(last)) =
+            (self.w.inverse_epochs.first(), self.w.inverse_epochs.last())
+        {
+            let _ = writeln!(
+                out,
+                "reset epochs={}..{}; inverse/upload counts are interval totals (not cumulative)",
+                first.epoch, last.epoch
+            );
+        }
+    }
+
+    fn write_inverse_view(&self, out: &mut String) {
+        use mtld3d_shared::tsc::u64_to_f64_exact;
+
+        for epoch in &self.w.inverse_epochs {
+            let [bypass, hit, recompute] = epoch.counts;
+            let enabled = hit.checked_add(recompute);
+            let builds = enabled.and_then(|n| n.checked_add(bypass));
+            let saturated = epoch.saturated || builds.is_none();
+            let rate = match enabled {
+                Some(n) if n != 0 && !saturated => {
+                    format!(
+                        "{:.1}%",
+                        u64_to_f64_exact(hit) * 100.0 / u64_to_f64_exact(n)
+                    )
+                }
+                _ => "n/a".to_string(),
+            };
+            let _ = writeln!(
+                out,
+                "inverse-view interval epoch={} builds={} bypass={bypass} hit={hit} recompute={recompute} enabled-hit={rate} saturated={saturated}",
+                epoch.epoch,
+                builds.unwrap_or(u64::MAX)
+            );
+        }
     }
 
     fn write_bucket_summary(
@@ -4297,7 +4438,47 @@ impl<'a> Summary<'a> {
             "reorder",
             &format!("{r}", r = w.vbib_mid_pass_reorders.sum),
             None,
-            "encoder: rename-at-overlap (upload hit a just-drawn region; rare)",
+            "encoder: successful overlap renames (full skip + GPU copy)",
+        );
+        self.res_row(
+            out,
+            "  full skip",
+            &format!(
+                "count={} bytes={}",
+                w.vbib_full_upload_skips.sum, w.vbib_full_upload_skip_bytes.sum,
+            ),
+            None,
+            "encoder: exact allocation overwritten; preservation omitted",
+        );
+        // Saturated inputs cannot give an exact derived preservation count.
+        let preserve_count = if w.vbib_mid_pass_reorders.max == u64::from(u32::MAX)
+            || w.vbib_full_upload_skips.max == u64::from(u32::MAX)
+            || w.vbib_mid_pass_reorders.sum == u64::MAX
+            || w.vbib_full_upload_skips.sum == u64::MAX
+        {
+            "saturated".to_owned()
+        } else {
+            w.vbib_mid_pass_reorders
+                .sum
+                .saturating_sub(w.vbib_full_upload_skips.sum)
+                .to_string()
+        };
+        self.res_row(
+            out,
+            "  GPU copy",
+            &format!(
+                "count={} bytes={}",
+                preserve_count, w.vbib_preserve_gpu_bytes.sum,
+            ),
+            None,
+            "encoder: partial/padded upload; queued preservation bytes",
+        );
+        self.res_row(
+            out,
+            "  allocfail",
+            &format!("{}", w.vbib_reorder_alloc_failures.sum),
+            None,
+            "encoder: fresh allocation failed; excluded from reorder",
         );
         self.res_row(
             out,

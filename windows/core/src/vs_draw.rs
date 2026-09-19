@@ -41,6 +41,8 @@ pub const VS_DRAW_MSL: &str = "struct VsDraw {\n    float4 point;\n    float4 po
 /// and plane changes reuse it, as do new frames with an unchanged view.
 pub struct VsDrawState {
     inverse: Option<InverseView>,
+    #[cfg(perf_tracking)]
+    last_use: InverseViewUse,
     #[cfg(test)]
     inversions: usize,
 }
@@ -57,6 +59,8 @@ impl VsDrawState {
     pub const fn new() -> Self {
         Self {
             inverse: None,
+            #[cfg(perf_tracking)]
+            last_use: InverseViewUse::Bypass,
             #[cfg(test)]
             inversions: 0,
         }
@@ -76,6 +80,10 @@ impl VsDrawState {
         planes: &[[f32; 4]],
     ) -> [u8; VS_DRAW_BYTES] {
         let rows = if clip_plane_count(rs) == 0 {
+            #[cfg(perf_tracking)]
+            {
+                self.last_use = InverseViewUse::Bypass;
+            }
             &D3DMATRIX::IDENTITY
         } else {
             self.inverse_rows(view)
@@ -83,13 +91,28 @@ impl VsDrawState {
         pack_bytes(rs, point_size, rows, planes)
     }
 
+    /// Outcome of the most recent uniform build, not of every draw.
+    #[cfg(perf_tracking)]
+    #[must_use]
+    pub const fn last_use(&self) -> &InverseViewUse {
+        &self.last_use
+    }
+
     fn inverse_rows(&mut self, view: &D3DMATRIX) -> &D3DMATRIX {
+        #[cfg(perf_tracking)]
+        {
+            self.last_use = InverseViewUse::Hit;
+        }
         let view_bits = view.m.map(f32::to_bits);
         if self
             .inverse
             .as_ref()
             .is_none_or(|entry| entry.view_bits != view_bits)
         {
+            #[cfg(perf_tracking)]
+            {
+                self.last_use = InverseViewUse::Recompute;
+            }
             let inverse = FfState::inverse(view).unwrap_or_else(|| {
                 mtld3d_shared::log_once_warn!(
                     target: crate::LOG_TARGET,
@@ -128,6 +151,17 @@ pub fn clip_plane_count(rs: &[u32; RENDER_STATE_COUNT]) -> u8 {
     let mask = rs[D3DRS_CLIPPLANEENABLE as usize] & ((1u32 << MAX_CLIP_PLANES) - 1);
     // At most six bits survive the mask, so the conversion cannot fail.
     u8::try_from(mask.count_ones()).unwrap_or(6)
+}
+
+/// Work performed by a consumed vertex draw uniform build.
+#[cfg(perf_tracking)]
+pub enum InverseViewUse {
+    /// No active user clip planes, so no inverse was needed.
+    Bypass,
+    /// All sixteen matrix bit patterns matched the device cache.
+    Hit,
+    /// Compute the existing inverse, including its singular fallback.
+    Recompute,
 }
 
 struct InverseView {

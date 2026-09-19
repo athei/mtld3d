@@ -334,3 +334,36 @@ fn independent_devices_and_restored_transforms_keep_their_own_inverse() {
     assert_eq!(first.inversions, 3);
     assert_eq!(second.inversions, 1);
 }
+
+#[cfg(perf_tracking)]
+#[test]
+fn perf_outcomes_follow_consumption_and_cached_singular_fallback() {
+    let mut state = VsDrawState::new();
+    let mut rs = render_state_defaults();
+    let mut view = D3DMATRIX::IDENTITY;
+    let _ = state.build_bytes(&rs, rs[D3DRS_POINTSIZE as usize], &view, &NO_PLANES);
+    assert!(matches!(state.last_use(), InverseViewUse::Bypass));
+    rs[D3DRS_CLIPPLANEENABLE as usize] = 1;
+    let _ = state.build_bytes(&rs, rs[D3DRS_POINTSIZE as usize], &view, &NO_PLANES);
+    assert!(matches!(state.last_use(), InverseViewUse::Recompute));
+    rs[D3DRS_POINTSIZE as usize] = 2.0f32.to_bits();
+    let _ = state.build_bytes(&rs, rs[D3DRS_POINTSIZE as usize], &view, &NO_PLANES);
+    assert!(matches!(state.last_use(), InverseViewUse::Hit));
+    view.m[1] = -0.0;
+    let _ = state.build_bytes(&rs, rs[D3DRS_POINTSIZE as usize], &view, &NO_PLANES);
+    assert!(matches!(state.last_use(), InverseViewUse::Recompute));
+    view.m = [0.0; 16];
+    let first = state.build_bytes(&rs, rs[D3DRS_POINTSIZE as usize], &view, &NO_PLANES);
+    assert!(matches!(state.last_use(), InverseViewUse::Recompute));
+    assert_eq!(
+        first,
+        state.build_bytes(&rs, rs[D3DRS_POINTSIZE as usize], &view, &NO_PLANES)
+    );
+    assert!(matches!(state.last_use(), InverseViewUse::Hit));
+    rs[D3DRS_CLIPPING as usize] = 0;
+    let _ = state.build_bytes(&rs, rs[D3DRS_POINTSIZE as usize], &view, &NO_PLANES);
+    assert!(matches!(state.last_use(), InverseViewUse::Bypass));
+    rs[D3DRS_CLIPPING as usize] = 1;
+    let _ = state.build_bytes(&rs, rs[D3DRS_POINTSIZE as usize], &view, &NO_PLANES);
+    assert!(matches!(state.last_use(), InverseViewUse::Hit));
+}

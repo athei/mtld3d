@@ -2153,6 +2153,11 @@ impl FrameEncoder {
                                 byte_size: length,
                             },
                         ));
+                    #[cfg(perf_tracking)]
+                    self.perf.bump_vbib_preserve_gpu(length);
+                } else {
+                    #[cfg(perf_tracking)]
+                    self.perf.bump_vbib_full_upload_skip(length);
                 }
                 if let Some(s) = self.buffer_cache.get_mut(&buffer_id) {
                     s.device_buffer = fresh;
@@ -2171,6 +2176,8 @@ impl FrameEncoder {
                 self.perf.bump_vbib_mid_pass_reorder();
                 fresh.raw()
             } else {
+                #[cfg(perf_tracking)]
+                self.perf.bump_vbib_reorder_alloc_failure();
                 // Alloc failed — fall back to overwriting the live buffer.
                 // One draw may glitch this frame, but dropping the upload
                 // would persist stale geometry instead.

@@ -509,6 +509,30 @@ AppKit's views, windows and screens belong to the main thread, and the layer tou
 
 The `mtld3d::perf` summary in `windows/core/src/perf.rs` is compiled in only on a `PERF=1` build (`cfg(perf_tracking)`) and emits a multi-line report every 5 s at `info!` under `RUST_LOG=mtld3d::perf=info`. Counters group by which thread owns them (API, encoder, submit, presenter); subtimers indent under their parent. The `Submit thread` block reports `Encode+commit` (the thunk's execute less the wait) and `Present wait`, the wait for the previous present to commit; the `Present thread` block reports `Drawable wait`, still the `gpu_wait` bucket, and `Snapshots`, an event count of the presents that went out from a copy of the back buffer: none in steady state, one per read-back; `Slot waits` counts the copies that first waited for a slot, a wait on the display and the tripwire for the ring's size, 0 being the goal. Both blocks come back with the next payload, lagged one frame, and a barrier's snapshot carries over to the next sample rather than being reset. Banner shows `bottleneck=…` based on `present_block` share + `gpu_wait` vs `enc_cpu`; the four terminal buckets are echoed on a `buckets:` line for auditability. The same Info gate also enables the per-call cycle accounting — single switch. Pass / workload shape (per-pass dump, `present_texture=…` audit line, per-RT pair stats) lives on the separate `mtld3d::d3d9::passes=trace` switch — those are diagnostics, not perf metrics.
 
+Each report identifies its owning encoder thread with `encoder=ThreadId(...)`,
+which distinguishes D3D device instances without a shared counter. The interval
+header gives its first and last device reset epochs. Inverse outcomes and
+upload event counts are interval totals, not cumulative counters. A span
+containing several epochs includes work before and after Reset. Reset flushes the old frame before advancing the API epoch.
+
+The `inverse-view` rows partition consumed vertex draw uniform builds into
+`bypass` (no active clip planes), `hit` (all sixteen view matrix bit patterns
+match), and `recompute` (including the existing singular identity fallback).
+Clean snapshots and dirty snapshots that do not rebuild this uniform contribute
+nothing. `builds = bypass + hit + recompute`; `enabled-hit` divides `hit` by
+`hit + recompute`, and is `n/a` for zero enabled builds. Each reset epoch has its
+own row within a reporting interval, so reuse across frames is counted but
+reuse across a cache reset is not implied. Counts saturate at `u64::MAX`; an
+overflow of a count, total, or epoch sets `saturated=true` and makes the rate
+`n/a`. Avoided inverse attempts relative to the original unconditional builder
+are `bypass + hit`, not the number of draws or a frame-time gain.
+
+This instrumentation adds an outcome store and a saturating counter increment
+with an existing short API-state borrow per consumed build. Epoch aggregation
+runs per frame; reporting formats once per interval. It adds no per-build timer,
+allocation, atomic, or second matrix comparison. All fields and callsites
+compile out without `PERF=1`. Use normal builds for timing comparisons.
+
 Counter aggregation — mixing these up misreads the log:
 
 - **Time counters** (anything ending in `ms`): per-frame averages.

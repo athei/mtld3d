@@ -113,6 +113,70 @@ fn snapshots_survive_begin_frame_until_sampled() {
     assert_eq!(state.enc.op_cycles, 0, "every other counter was reset");
 }
 
+/// Upload outcome totals partition successful renames and survive only their reporting window.
+#[test]
+fn staged_upload_outcomes_partition_bytes_and_reset_per_device() {
+    let mut first = EncoderPerfState::new();
+    let second = EncoderPerfState::new();
+    for (length, offset, size) in [(16_384, 0, 16_384), (32_768, 64, 48), (16_384, 0, 16_368)] {
+        if crate::buffer_rename::stage_upload_needs_preserve(length, offset, size) {
+            first.bump_vbib_preserve_gpu(length);
+        } else {
+            first.bump_vbib_full_upload_skip(length);
+        }
+        first.bump_vbib_mid_pass_reorder();
+    }
+    first.bump_vbib_reorder_alloc_failure();
+    assert_eq!(first.enc.vbib_mid_pass_reorders, 3);
+    assert_eq!(first.enc.vbib_full_upload_skips, 1);
+    assert_eq!(first.enc.vbib_full_upload_skip_bytes, 16_384);
+    assert_eq!(first.enc.vbib_preserve_gpu_bytes, 49_152);
+    assert_eq!(first.enc.vbib_reorder_alloc_failures, 1);
+    assert_eq!(second.enc.vbib_mid_pass_reorders, 0);
+    assert_eq!(second.enc.vbib_full_upload_skips, 0);
+    assert_eq!(second.enc.vbib_full_upload_skip_bytes, 0);
+    assert_eq!(second.enc.vbib_preserve_gpu_bytes, 0);
+    assert_eq!(second.enc.vbib_reorder_alloc_failures, 0);
+
+    let mut frame = sample(0, 0);
+    frame.enc = first.enc;
+    let mut window = PerfWindow::new();
+    window.accumulate(&frame);
+    first.begin_frame(&FramePerfPayload::new());
+    assert_eq!(first.enc.vbib_mid_pass_reorders, 0);
+    assert_eq!(first.enc.vbib_full_upload_skips, 0);
+    assert_eq!(first.enc.vbib_full_upload_skip_bytes, 0);
+    assert_eq!(first.enc.vbib_preserve_gpu_bytes, 0);
+    assert_eq!(first.enc.vbib_reorder_alloc_failures, 0);
+    frame.enc = first.enc;
+    window.accumulate(&frame);
+    assert_eq!(window.vbib_mid_pass_reorders.sum, 3);
+    assert_eq!(window.vbib_full_upload_skips.sum, 1);
+    assert_eq!(window.vbib_full_upload_skip_bytes.sum, 16_384);
+    assert_eq!(window.vbib_preserve_gpu_bytes.sum, 49_152);
+    assert_eq!(window.vbib_reorder_alloc_failures.sum, 1);
+    window.reset();
+    assert_eq!(window.vbib_mid_pass_reorders.sum, 0);
+    assert_eq!(window.vbib_full_upload_skips.sum, 0);
+    assert_eq!(window.vbib_full_upload_skip_bytes.sum, 0);
+    assert_eq!(window.vbib_preserve_gpu_bytes.sum, 0);
+    assert_eq!(window.vbib_reorder_alloc_failures.sum, 0);
+}
+
+/// Byte totals keep their width on PE32 and saturate instead of wrapping.
+#[test]
+fn staged_upload_byte_totals_are_wide_and_saturating() {
+    let mut state = EncoderPerfState::new();
+    state.bump_vbib_full_upload_skip(1_u64 << 32);
+    state.bump_vbib_preserve_gpu(1_u64 << 32);
+    assert_eq!(state.enc.vbib_full_upload_skip_bytes, 1_u64 << 32);
+    assert_eq!(state.enc.vbib_preserve_gpu_bytes, 1_u64 << 32);
+    state.bump_vbib_full_upload_skip(u64::MAX);
+    state.bump_vbib_preserve_gpu(u64::MAX);
+    assert_eq!(state.enc.vbib_full_upload_skip_bytes, u64::MAX);
+    assert_eq!(state.enc.vbib_preserve_gpu_bytes, u64::MAX);
+}
+
 /// `ApiPerfState::drain_into_payload` moves counters to the payload and zeroes the source.
 ///
 /// First-frame `frame_total` must be 0 (no predecessor TSC yet);
@@ -259,6 +323,21 @@ fn summary_ansi_off_matches_stripped_ansi_on() {
     );
 }
 
+#[test]
+fn staged_upload_summary_marks_saturated_derived_counts() {
+    for saturated_input in 0..4 {
+        let mut window = sample_window();
+        match saturated_input {
+            0 => window.vbib_mid_pass_reorders.max = u64::from(u32::MAX),
+            1 => window.vbib_full_upload_skips.max = u64::from(u32::MAX),
+            2 => window.vbib_mid_pass_reorders.sum = u64::MAX,
+            _ => window.vbib_full_upload_skips.sum = u64::MAX,
+        }
+        let summary = Summary::render_with_ansi(&window, &sample_caches(), 5.01, false);
+        assert!(summary.contains("  GPU copy  count=saturated bytes=49152"));
+    }
+}
+
 /// Golden-string snapshot pinning the column grid.
 ///
 /// Every cell in the layout lands at a fixed column (`LABEL_W`,
@@ -273,6 +352,7 @@ fn summary_golden_layout() {
     let got = Summary::render_with_ansi(&w, &caches, 5.01, false);
     let want = concat!(
         "── perf  window=5.01s  frames=1  bottleneck=ENCODER (GPU) ──\n",
+        "reset epochs=0..0; inverse/upload counts are interval totals (not cumulative)\n",
         "buckets: api_d3d9=2.80  api_outside=3.00  enc_work=1.50  submit_work=0.10  gpu_wait=6.00  (ms/frame, avg)\n",
         "\n",
         "API thread             10.00 ms                                             peak 10.00 ms\n",
@@ -361,8 +441,11 @@ fn summary_golden_layout() {
         "  preserve  2                                                   API: rename + sync memcpy (whole-buffer non-WRITEONLY contended — game may read back)\n",
         "  bytes     720 KB                  peak/frame 720 KB           API: fresh PageBox bytes behind rename (16 KiB-padded; what the allocator serves)\n",
         "in-place    3                                                   API: contended partial Lock handed back live (kept divergence; no rename, no stall)\n",
-        "staging up  0                                                   encoder: Staged (non-DYNAMIC) dirty-range upload blits — separate-staging path; high here with rename≈0 is the goal\n",
-        "reorder     0                                                   encoder: rename-at-overlap (upload hit a just-drawn region; rare)\n",
+        "staging up  4                                                   encoder: Staged (non-DYNAMIC) dirty-range upload blits — separate-staging path; high here with rename≈0 is the goal\n",
+        "reorder     3                                                   encoder: successful overlap renames (full skip + GPU copy)\n",
+        "  full skip count=1 bytes=16384                                 encoder: exact allocation overwritten; preservation omitted\n",
+        "  GPU copy  count=2 bytes=49152                                 encoder: partial/padded upload; queued preservation bytes\n",
+        "  allocfail 1                                                   encoder: fresh allocation failed; excluded from reorder\n",
         "destroys    1                                                   encoder: MTLBuffer wrappers freed (VB/IB cache renames, Lock-rename intake, visibility-pool eviction)\n",
         "ret cap     drain=2 submit=1        peak/frame submit=1         API: VB/IB retention cap hit before a rename alloc (drain=cheap, submit=GPU wait)\n",
         "retention   depth= 6.0  3.5 MB avg  peak depth=6   3.5 MB       encoder: shared PageBox queue (VB/IB renames + texture-blit padded staging + visibility pool)\n",
@@ -402,6 +485,7 @@ fn summary_golden_layout() {
         "  SetPixelShader           0 / 0         (  0.0%)\n",
         "  SetVsConst               0 / 0         (  0.0%)\n",
         "  SetPsConst               0 / 0         (  0.0%)\n",
+        "inverse-view interval epoch=0 builds=0 bypass=0 hit=0 recompute=0 enabled-hit=n/a saturated=false\n",
         "\n",
         "Per-frame allocator footprint  scratch as small/oversized blocks; op_vec + cmd_vec each split into size + realloc\n",
         "scratch     24.0/0.0  2.0 MB avg    peak 24/0   peak 2.0 MB     per-frame bump arena (VS/PS constants + UP vertices); cleared at begin_frame\n",
@@ -541,6 +625,10 @@ fn sample_window() -> PerfWindow {
     scalls[SurfaceSubCategory::Misc as usize] = 15;
     let s = FrameSample {
         counters: FrameCounters {
+            reset_epoch: 0,
+            reset_epoch_saturated: false,
+            inverse_view: [0; 3],
+            inverse_view_saturated: false,
             api_cycles_by_category: cats,
             api_call_counts_by_category: calls,
             vb_rename: 12,
@@ -623,8 +711,12 @@ fn sample_window() -> PerfWindow {
             // this frame, matching the 14 hits above.
             pagebox_pool_recycled: 14,
             pagebox_pool_recycled_bytes: 688_128,
-            vbib_staging_uploads: 0,
-            vbib_mid_pass_reorders: 0,
+            vbib_staging_uploads: 4,
+            vbib_mid_pass_reorders: 3,
+            vbib_full_upload_skips: 1,
+            vbib_full_upload_skip_bytes: 16_384,
+            vbib_preserve_gpu_bytes: 49_152,
+            vbib_reorder_alloc_failures: 1,
             texture_blit_uploads: 2,
             texture_blit_padded_uploads: 0,
             texture_expand_uploads: 0,
@@ -884,4 +976,94 @@ fn api_perf_storage_without_timers_is_reclaimed() {
     let weak = Rc::downgrade(&storage.state);
     drop(storage);
     assert!(weak.upgrade().is_none());
+}
+
+#[test]
+fn inverse_counts_partition_builds_and_preserve_reset_intervals() {
+    use mtld3d_types::{D3DMATRIX, D3DRS_CLIPPLANEENABLE, render_state_defaults};
+
+    use crate::vs_draw::{InverseViewUse, VsDrawState};
+    let mut api = ApiPerfState::new();
+    let mut cache = VsDrawState::new();
+    let mut rs = render_state_defaults();
+    let _ = cache.build_bytes(&rs, 1.0f32.to_bits(), &D3DMATRIX::IDENTITY, &[]);
+    api.record_inverse_view(cache.last_use());
+    rs[D3DRS_CLIPPLANEENABLE as usize] = 1;
+    for _ in 0..2 {
+        let _ = cache.build_bytes(&rs, 1.0f32.to_bits(), &D3DMATRIX::IDENTITY, &[]);
+        api.record_inverse_view(cache.last_use());
+    }
+    let mut payload = FramePerfPayload::new();
+    api.drain_into_payload(&mut payload);
+    assert_eq!(payload.counters.inverse_view, [1, 1, 1]);
+    assert_eq!(api.counters.inverse_view, [0; 3]);
+    let mut old = sample(0, 0);
+    old.counters = payload.counters;
+    let mut w = PerfWindow::new();
+    w.accumulate(&old);
+    // Reset flushes old counters before replacing the cache and advancing epoch.
+    cache = VsDrawState::new();
+    api.advance_reset_epoch();
+    let _ = cache.build_bytes(&rs, 1.0f32.to_bits(), &D3DMATRIX::IDENTITY, &[]);
+    assert!(matches!(cache.last_use(), InverseViewUse::Recompute));
+    api.record_inverse_view(cache.last_use());
+    api.drain_into_payload(&mut payload);
+    let mut new = sample(0, 0);
+    new.counters = payload.counters;
+    w.accumulate(&new);
+    assert_eq!(w.inverse_epochs.len(), 2);
+    assert_eq!(w.inverse_epochs[0].counts, [1, 1, 1]);
+    assert_eq!(w.inverse_epochs[1].counts, [0, 0, 1]);
+    let out = Summary::render_with_ansi(&w, &sample_caches(), 5.0, false);
+    assert!(
+        out.contains(
+            "reset epochs=0..1; inverse/upload counts are interval totals (not cumulative)"
+        )
+    );
+    assert!(out.contains("epoch=0 builds=3 bypass=1 hit=1 recompute=1 enabled-hit=50.0%"));
+    assert!(out.contains("epoch=1 builds=1 bypass=0 hit=0 recompute=1 enabled-hit=0.0%"));
+    let mut other = ApiPerfState::new();
+    other.drain_into_payload(&mut payload);
+    assert_eq!(payload.counters.reset_epoch, 0);
+    assert_eq!(payload.counters.inverse_view, [0; 3]);
+    let mut other_window = PerfWindow::new();
+    other_window.accumulate(&sample(0, 0));
+    assert_eq!(other_window.inverse_epochs[0].counts, [0; 3]);
+    w.reset();
+    assert!(w.inverse_epochs.is_empty());
+}
+
+#[test]
+fn inverse_rates_are_undefined_for_empty_or_saturated_counts() {
+    use crate::vs_draw::InverseViewUse;
+    let mut api = ApiPerfState::new();
+    api.record_inverse_view(&InverseViewUse::Bypass);
+    let mut payload = FramePerfPayload::new();
+    api.drain_into_payload(&mut payload);
+    let mut s = sample(0, 0);
+    s.counters = payload.counters;
+    let mut w = PerfWindow::new();
+    w.accumulate(&s);
+    let out = Summary::render_with_ansi(&w, &sample_caches(), 5.0, false);
+    assert!(out.contains("enabled-hit=n/a saturated=false"));
+    api.counters.inverse_view[1] = u64::MAX;
+    api.record_inverse_view(&InverseViewUse::Hit);
+    assert!(api.counters.inverse_view_saturated);
+    assert_eq!(api.counters.inverse_view[1], u64::MAX);
+    api.drain_into_payload(&mut payload);
+    s.counters = payload.counters;
+    w.accumulate(&s);
+    let out = Summary::render_with_ansi(&w, &sample_caches(), 5.0, false);
+    assert!(out.contains("enabled-hit=n/a saturated=true"));
+    // Aggregation overflow is also visible even if each frame fit individually.
+    w.reset();
+    s.counters.inverse_view_saturated = false;
+    w.accumulate(&s);
+    w.accumulate(&s);
+    assert!(w.inverse_epochs[0].saturated);
+    api.reset_epoch = u64::MAX;
+    api.advance_reset_epoch();
+    api.drain_into_payload(&mut payload);
+    assert_eq!(payload.counters.reset_epoch, u64::MAX);
+    assert!(payload.counters.reset_epoch_saturated);
 }

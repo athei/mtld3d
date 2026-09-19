@@ -2442,6 +2442,8 @@ impl DeviceInner {
         self.flags.remove(DeviceFlags::A2M_ENABLED);
         self.ff_state = FfState::new();
         self.vs_draw = mtld3d_core::vs_draw::VsDrawState::new();
+        #[cfg(perf_tracking)]
+        self.perf.state_mut().advance_reset_epoch();
         // Reset abandons any open scene; a following EndScene must fail.
         self.flags.remove(DeviceFlags::IN_SCENE);
         // Scissor defaults to the full target, like the viewport reseed below.
@@ -11557,7 +11559,21 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) -> Option<CurrentSnapshotPtr> {
             .copied()
             .unwrap_or(D3DMATRIX::IDENTITY);
         let point_size = dev.point_size();
-        Some(dev.vs_draw.build_bytes(rs, point_size, &view, &dev.clip_planes))
+        #[cfg(perf_tracking)]
+        {
+            let bytes = dev
+                .vs_draw
+                .build_bytes(rs, point_size, &view, &dev.clip_planes);
+            dev.perf
+                .state_mut()
+                .record_inverse_view(dev.vs_draw.last_use());
+            Some(bytes)
+        }
+        #[cfg(not(perf_tracking))]
+        Some(
+            dev.vs_draw
+                .build_bytes(rs, point_size, &view, &dev.clip_planes),
+        )
     } else {
         None
     };
