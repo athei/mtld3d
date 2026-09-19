@@ -79,7 +79,7 @@ fn the_gauge_class_follows_the_release_rule() {
 fn live_bytes_track_every_backing_transition() {
     let base = live_backing_bytes();
     let mut writeonly = backing(D3DUSAGE_WRITEONLY, D3DPOOL_DEFAULT);
-    let padded = writeonly.padded_len();
+    let padded = writeonly.padded_len() as u64;
     assert_eq!(
         live_backing_bytes().write_only_static,
         base.write_only_static + padded
@@ -188,7 +188,7 @@ fn note_upload_never_moves_a_released_backing() {
 fn the_padded_length_survives_a_release() {
     let mut b = backing(D3DUSAGE_WRITEONLY, D3DPOOL_DEFAULT);
     let padded = b.padded_len();
-    assert!(padded >= u64::from(SMALL));
+    assert!(padded >= SMALL as usize);
     drop(b.release());
     assert_eq!(
         b.padded_len(),
@@ -201,9 +201,9 @@ fn the_padded_length_survives_a_release() {
 fn write_pointers_land_inside_the_backing_and_stop_at_its_end() {
     let mut b = backing(D3DUSAGE_WRITEONLY, D3DPOOL_DEFAULT);
     let base = b.ptr();
-    let padded = usize::try_from(b.padded_len()).expect("padded length fits usize");
+    let padded = b.padded_len();
     let at = b.write_ptr_at(64).expect("64 is inside the backing");
-    assert_eq!(at as u64, base + 64);
+    assert_eq!(at as usize, base + 64);
     assert!(
         b.write_ptr_at(padded).is_some(),
         "one past the end is legal"

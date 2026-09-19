@@ -200,10 +200,10 @@ impl BufferBacking {
         matches!(self.state, BackingState::Mirrors)
     }
 
-    /// The backing's address as the wire carries it; `0` once released.
+    /// The backing's CPU address; `0` once released.
     #[must_use]
-    pub fn ptr(&self) -> u64 {
-        self.page_box.as_ref().map_or(0, |b| b.as_ptr() as u64)
+    pub fn ptr(&self) -> usize {
+        self.page_box.as_ref().map_or(0, |b| b.as_ptr() as usize)
     }
 
     /// The current backing allocation's identity; `0` once released.
@@ -218,8 +218,8 @@ impl BufferBacking {
 
     /// The backing's padded length, which outlives the bytes themselves.
     #[must_use]
-    pub const fn padded_len(&self) -> u64 {
-        self.padded_len as u64
+    pub const fn padded_len(&self) -> usize {
+        self.padded_len
     }
 
     /// The backing's full padded region; empty once released.

@@ -5697,8 +5697,8 @@ extern "system" fn device_create_vertex_buffer(
     let inner = buffer.inner();
     dev.push_buffer_warmup(VbibWarmupEntry {
         buffer_id: inner.buffer_id(),
-        backing_ptr: inner.current_backing_ptr(),
-        backing_len: inner.current_backing_len(),
+        backing_ptr: inner.current_backing_ptr() as u64,
+        backing_len: inner.current_backing_len() as u64,
         backing_generation: inner.current_backing_generation(),
         map_mode: inner.map_mode(),
     });
@@ -5776,8 +5776,8 @@ extern "system" fn device_create_index_buffer(
     let inner = buffer.inner();
     dev.push_buffer_warmup(VbibWarmupEntry {
         buffer_id: inner.buffer_id(),
-        backing_ptr: inner.current_backing_ptr(),
-        backing_len: inner.current_backing_len(),
+        backing_ptr: inner.current_backing_ptr() as u64,
+        backing_len: inner.current_backing_len() as u64,
         backing_generation: inner.current_backing_generation(),
         map_mode: inner.map_mode(),
     });
@@ -10586,14 +10586,14 @@ fn bound_index_fan(
     let inner = unsafe { &*ptr }.inner();
     let first = u64::from(start_index) * index_size;
     let len = (u64::from(primitive_count) + 2) * index_size;
-    if first + len > inner.current_backing_len() {
+    if first + len > inner.current_backing_len() as u64 {
         mtld3d_shared::log_once_warn!(
             target: LOG_TARGET,
             "DrawIndexedPrimitive: triangle fan reads past the index buffer (start {start_index}, {primitive_count} primitives)"
         );
         return None;
     }
-    let base = usize::try_from(inner.current_backing_ptr() + first).ok()?;
+    let base = usize::try_from(inner.current_backing_ptr() as u64 + first).ok()?;
     let len = usize::try_from(len).ok()?;
     // SAFETY: `[first, first + len)` lies inside the live backing box (checked
     // above); the API thread owns CPU access to it while the buffer is bound.

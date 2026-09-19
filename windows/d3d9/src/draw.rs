@@ -118,6 +118,7 @@ pub enum VertexSource {
 
 /// One bound vertex stream of a draw.
 ///
+/// CPU addresses and lengths keep their native width until the wire boundary.
 /// `buffer_id` keys the encoder's `MTLBuffer` wrap cache; `backing_ptr` /
 /// `backing_len` describe the `PageBox` to wrap if we need a fresh
 /// `MTLBuffer`; `offset` is the game's `SetStreamSource` byte offset.
@@ -128,8 +129,8 @@ pub struct StreamBinding {
     /// D3D9 stream index, which is also the Metal vertex buffer slot.
     pub stream: u8,
     pub buffer_id: BufferId,
-    pub backing_ptr: u64,
-    pub backing_len: u64,
+    pub backing_ptr: usize,
+    pub backing_len: usize,
     /// The backing allocation's identity (see `PageBox::generation`).
     pub backing_generation: u64,
     pub offset: u32,
@@ -229,8 +230,8 @@ pub enum IndexSource {
     /// Mirrors `VertexSource::Bound` but carries index-stream metadata.
     Bound {
         buffer_id: BufferId,
-        backing_ptr: u64,
-        backing_len: u64,
+        backing_ptr: usize,
+        backing_len: usize,
         /// The backing allocation's identity (see `PageBox::generation`).
         backing_generation: u64,
         offset: u32,
@@ -321,6 +322,16 @@ pub struct DrawOp {
     pub vertex_source: VertexSource,
     pub index_source: IndexSource,
 }
+
+// CPU backing addresses stay native-width in the API-to-encoder queue.
+// Widening them before the wire boundary adds two unused words per buffer
+// to every op slot in a 32-bit process.
+#[cfg(target_pointer_width = "32")]
+const _: () = {
+    assert!(core::mem::size_of::<StreamBinding>() <= 40);
+    assert!(core::mem::size_of::<IndexSource>() <= 40);
+    assert!(core::mem::size_of::<DrawOp>() <= 104);
+};
 
 /// Cached vertex-attribute layout.
 ///
@@ -2217,8 +2228,8 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
                 }
                 let buffer_handle = enc.ensure_vbib_mtl_buffer(
                     b.buffer_id,
-                    b.backing_ptr,
-                    b.backing_len,
+                    b.backing_ptr as u64,
+                    b.backing_len as u64,
                     b.backing_generation,
                 );
                 if buffer_handle == 0 {
@@ -2406,8 +2417,12 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
             index_type,
             base_vertex,
         } => {
-            let buffer_handle =
-                enc.ensure_vbib_mtl_buffer(buffer_id, backing_ptr, backing_len, backing_generation);
+            let buffer_handle = enc.ensure_vbib_mtl_buffer(
+                buffer_id,
+                backing_ptr as u64,
+                backing_len as u64,
+                backing_generation,
+            );
             if buffer_handle == 0 {
                 mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET, "draw dropped: ensure_vbib_mtl_buffer returned 0 for IB");
                 mtld3d_shared::log_once_trace_by!(

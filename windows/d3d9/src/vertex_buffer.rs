@@ -238,7 +238,7 @@ impl VertexBufferInner {
         self.map_mode
     }
 
-    pub fn current_backing_ptr(&self) -> u64 {
+    pub fn current_backing_ptr(&self) -> usize {
         self.backing.ptr()
     }
 
@@ -247,7 +247,7 @@ impl VertexBufferInner {
         self.backing.generation()
     }
 
-    pub const fn current_backing_len(&self) -> u64 {
+    pub const fn current_backing_len(&self) -> usize {
         self.backing.padded_len()
     }
 
@@ -781,8 +781,7 @@ extern "system" fn vb_lock(
                     }
                 }
                 dev.perf_mut().bump_vb_rename();
-                let renamed_bytes = usize::try_from(inner.backing.padded_len())
-                    .expect("a PageBox length fits the host address space");
+                let renamed_bytes = inner.backing.padded_len();
                 dev.perf_mut().bump_vbib_rename_bytes(renamed_bytes);
                 dev.queue_vbib_retention(buffer_id, old_box, old_seq);
                 inner.last_submit_seq = 0;
