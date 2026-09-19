@@ -279,7 +279,6 @@
   device.c:12689 count=1
   device.c:12784 count=72
   device.c:12823 count=477
-  device.c:13838 count=1
   device.c:14378 count=1
   device.c:14379 count=1
   device.c:14383 count=1
@@ -701,7 +700,6 @@
   device.c:12689 count=1
   device.c:12784 count=72
   device.c:12823 count=477
-  device.c:13838 count=1
   device.c:14378 count=1
   device.c:14379 count=1
   device.c:14383 count=1

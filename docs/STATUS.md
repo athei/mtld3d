@@ -45,9 +45,10 @@ Each fails cleanly, with an absent cap bit or a documented error return.
 
 - Point polygon fill: Metal has no point-fill mode, so the state is warned
   once and drawn solid.
-- Dynamic depth textures: packed depth uploads have no conversion path.
-  Depth textures also have no vertex sampling. Automatic mip-generation
-  requests use the single-level `D3DOK_NOAUTOGEN` fallback.
+- Dynamic depth textures outside DEFAULT-pool 2D D16, D24X8 and D24S8,
+  including dynamic depth attachments, remain unavailable. Depth textures
+  have no vertex sampling. Automatic mip-generation requests use the
+  single-level `D3DOK_NOAUTOGEN` fallback.
 - Timestamp, timestamp frequency, timestamp disjoint and other niche query
   types: capability probes and creation report `D3DERR_NOTAVAILABLE`.
 - Scaled, sub-rect or converting depth-to-depth `StretchRect`: only the
