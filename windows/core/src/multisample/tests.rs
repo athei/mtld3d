@@ -194,13 +194,40 @@ fn the_effective_mask_narrows_to_the_sample_count() {
 #[test]
 fn coverage_request_requires_both_atoc_and_alpha_test() {
     let mut states = mtld3d_types::render_state_defaults();
-    assert!(!alpha_to_coverage_requested(&states));
+    assert!(!alpha_to_coverage_requested(&states, false));
     states[mtld3d_types::D3DRS_ADAPTIVETESS_Y as usize] = mtld3d_types::D3DFMT_ATOC;
-    assert!(!alpha_to_coverage_requested(&states));
+    assert!(!alpha_to_coverage_requested(&states, false));
     states[mtld3d_types::D3DRS_ALPHATESTENABLE as usize] = 1;
-    assert!(alpha_to_coverage_requested(&states));
+    assert!(alpha_to_coverage_requested(&states, false));
     states[mtld3d_types::D3DRS_ADAPTIVETESS_Y as usize] = 1.0f32.to_bits();
-    assert!(!alpha_to_coverage_requested(&states));
+    assert!(!alpha_to_coverage_requested(&states, false));
     states[mtld3d_types::D3DRS_ADAPTIVETESS_Y as usize] = 0;
-    assert!(!alpha_to_coverage_requested(&states));
+    assert!(!alpha_to_coverage_requested(&states, false));
+}
+
+#[test]
+fn a2m_is_independent_of_numeric_point_size_and_atoc() {
+    let mut states = mtld3d_types::render_state_defaults();
+    for raw in [
+        1.0f32.to_bits(),
+        mtld3d_types::D3DFMT_A2M0,
+        mtld3d_types::D3DFMT_A2M1,
+        0x7fa0_5000,
+    ] {
+        states[mtld3d_types::D3DRS_POINTSIZE as usize] = raw;
+        assert!(alpha_to_coverage_requested(&states, true));
+        assert!(!alpha_to_coverage_requested(&states, false));
+    }
+    assert_eq!(a2m_control(mtld3d_types::D3DFMT_A2M1), Some(true));
+    assert_eq!(a2m_control(mtld3d_types::D3DFMT_A2M0), Some(false));
+    assert_eq!(a2m_control(8.0f32.to_bits()), None);
+    assert_eq!(a2m_control(0x7fa0_5000), None);
+    for control in [
+        mtld3d_types::D3DFMT_A2M1,
+        mtld3d_types::D3DFMT_A2M0,
+        0x7fa0_5000,
+    ] {
+        assert_eq!(numeric_point_size(control), None);
+    }
+    assert_eq!(numeric_point_size(8.0f32.to_bits()), Some(8.0f32.to_bits()));
 }

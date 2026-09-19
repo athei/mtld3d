@@ -1359,13 +1359,33 @@ fn alpha_to_coverage_state_blocks_restore_the_extension() {
 
 #[test]
 fn alpha_to_coverage_endpoints_and_sample_mask_intersect() {
+    coverage_endpoints_and_sample_mask(false);
+}
+
+#[test]
+fn a2m_coverage_endpoints_and_sample_mask() {
+    coverage_endpoints_and_sample_mask(true);
+}
+
+fn coverage_endpoints_and_sample_mask(a2m: bool) {
     let h = Harness::new();
     arm(&h);
     h.select_diffuse_stage(0);
     assert_eq!(h.set_render_state(D3DRS_ZENABLE, 0), D3D_OK);
     assert_eq!(h.set_render_state(D3DRS_ALPHATESTENABLE, 1), D3D_OK);
     assert_eq!(
-        h.set_render_state(D3DRS_ADAPTIVETESS_Y, D3DFMT_ATOC),
+        h.set_render_state(
+            if a2m {
+                D3DRS_POINTSIZE
+            } else {
+                D3DRS_ADAPTIVETESS_Y
+            },
+            if a2m {
+                mtld3d_types::D3DFMT_A2M1
+            } else {
+                D3DFMT_ATOC
+            },
+        ),
         D3D_OK
     );
     let target = h.create_render_target_ms(
@@ -1396,6 +1416,15 @@ fn alpha_to_coverage_endpoints_and_sample_mask_intersect() {
 
 #[test]
 fn alpha_to_coverage_gates_depth_writes_with_color_masked_out() {
+    coverage_depth_writes_with_color_masked_out(false);
+}
+
+#[test]
+fn a2m_coverage_depth_writes_with_color_masked_out() {
+    coverage_depth_writes_with_color_masked_out(true);
+}
+
+fn coverage_depth_writes_with_color_masked_out(a2m: bool) {
     let h = Harness::new();
     arm(&h);
     h.select_diffuse_stage(0);
@@ -1421,7 +1450,18 @@ fn alpha_to_coverage_gates_depth_writes_with_color_masked_out() {
     assert_eq!(h.set_render_state(D3DRS_ALPHAFUNC, D3DCMP_GREATER), D3D_OK);
     assert_eq!(h.set_render_state(D3DRS_ALPHAREF, 255), D3D_OK);
     assert_eq!(
-        h.set_render_state(D3DRS_ADAPTIVETESS_Y, D3DFMT_ATOC),
+        h.set_render_state(
+            if a2m {
+                D3DRS_POINTSIZE
+            } else {
+                D3DRS_ADAPTIVETESS_Y
+            },
+            if a2m {
+                mtld3d_types::D3DFMT_A2M1
+            } else {
+                D3DFMT_ATOC
+            },
+        ),
         D3D_OK
     );
     assert_eq!(h.set_render_state(D3DRS_COLORWRITEENABLE, 0), D3D_OK);
@@ -1447,6 +1487,399 @@ fn alpha_to_coverage_gates_depth_writes_with_color_masked_out() {
     );
     assert_eq!(h.set_render_state(D3DRS_COLORWRITEENABLE, 15), D3D_OK);
     assert_eq!(h.set_render_state(D3DRS_ALPHATESTENABLE, 0), D3D_OK);
+    assert_eq!(
+        h.set_render_state(D3DRS_POINTSIZE, mtld3d_types::D3DFMT_A2M0),
+        D3D_OK
+    );
     // Only the samples the near coverage draw left untouched pass depth.
     assert_partial_coverage(coverage_pixel(&h, &target, &resolve, WHITE));
+}
+
+#[test]
+fn a2m_latch_survives_numeric_size_and_target_changes() {
+    let h = Harness::new();
+    arm(&h);
+    h.select_diffuse_stage(0);
+    assert_eq!(h.set_render_state(D3DRS_ZENABLE, 0), D3D_OK);
+    let target = h.create_render_target_ms(
+        (RT_SIZE, RT_SIZE),
+        D3DFMT_A8R8G8B8,
+        (D3DMULTISAMPLE_4_SAMPLES, 0),
+    );
+    let single = h.create_render_target(RT_SIZE, RT_SIZE, D3DFMT_A8R8G8B8);
+    let resolve = h.create_render_target(RT_SIZE, RT_SIZE, D3DFMT_A8R8G8B8);
+    let ps = h.create_pixel_shader(&COVERAGE_PS);
+    for programmable in [false, true] {
+        if programmable {
+            assert_eq!(h.set_pixel_shader(&ps), D3D_OK);
+            assert_eq!(
+                h.set_pixel_shader_constant_f(0, &[1.0, 1.0, 1.0, 0.5]),
+                D3D_OK
+            );
+        }
+        assert_eq!(h.set_render_state(D3DRS_ALPHATESTENABLE, 0), D3D_OK);
+        assert_eq!(
+            h.set_render_state(D3DRS_POINTSIZE, mtld3d_types::D3DFMT_A2M1),
+            D3D_OK
+        );
+        assert_partial_coverage(coverage_pixel(&h, &target, &resolve, 0x80ff_ffff));
+        assert_eq!(
+            h.set_render_state(D3DRS_POINTSIZE, 8.0f32.to_bits()),
+            D3D_OK
+        );
+        assert_eq!(h.render_state(D3DRS_POINTSIZE), 8.0f32.to_bits());
+        assert_eq!(h.set_render_state(D3DRS_ALPHATESTENABLE, 1), D3D_OK);
+        assert_eq!(
+            h.set_render_state(D3DRS_ALPHAFUNC, mtld3d_types::D3DCMP_NEVER),
+            D3D_OK
+        );
+        assert_partial_coverage(coverage_pixel(&h, &target, &resolve, 0x80ff_ffff));
+        assert_eq!(coverage_pixel(&h, &single, &resolve, 0x80ff_ffff), BLUE);
+        assert_partial_coverage(coverage_pixel(&h, &target, &resolve, 0x80ff_ffff));
+        assert_eq!(
+            h.set_render_state(D3DRS_POINTSIZE, mtld3d_types::D3DFMT_A2M0),
+            D3D_OK
+        );
+        assert_eq!(coverage_pixel(&h, &target, &resolve, 0x80ff_ffff), BLUE);
+    }
+}
+
+#[test]
+fn a2m_and_atoc_requests_are_independent() {
+    let h = Harness::new();
+    arm(&h);
+    h.select_diffuse_stage(0);
+    assert_eq!(h.set_render_state(D3DRS_ZENABLE, 0), D3D_OK);
+    let target = h.create_render_target_ms(
+        (RT_SIZE, RT_SIZE),
+        D3DFMT_A8R8G8B8,
+        (D3DMULTISAMPLE_4_SAMPLES, 0),
+    );
+    let resolve = h.create_render_target(RT_SIZE, RT_SIZE, D3DFMT_A8R8G8B8);
+    for token in [mtld3d_types::D3DFMT_A2M1, mtld3d_types::D3DFMT_A2M0] {
+        assert_eq!(
+            h.check_device_format(D3DFMT_X8R8G8B8, 0, D3DRTYPE_SURFACE, token),
+            D3DERR_NOTAVAILABLE
+        );
+    }
+    assert_eq!(h.set_render_state(D3DRS_ALPHAFUNC, D3DCMP_ALWAYS), D3D_OK);
+    for a2m in [false, true] {
+        assert_eq!(
+            h.set_render_state(
+                D3DRS_POINTSIZE,
+                if a2m {
+                    mtld3d_types::D3DFMT_A2M1
+                } else {
+                    mtld3d_types::D3DFMT_A2M0
+                }
+            ),
+            D3D_OK
+        );
+        for atoc in [true, false] {
+            assert_eq!(
+                h.set_render_state(D3DRS_ADAPTIVETESS_Y, if atoc { D3DFMT_ATOC } else { 0 }),
+                D3D_OK
+            );
+            for alpha_test in [false, true, false] {
+                assert_eq!(
+                    h.set_render_state(D3DRS_ALPHATESTENABLE, u32::from(alpha_test)),
+                    D3D_OK
+                );
+                let pixel = coverage_pixel(&h, &target, &resolve, 0x80ff_ffff);
+                if a2m || atoc && alpha_test {
+                    assert_partial_coverage(pixel);
+                } else {
+                    assert_pixel_eq(pixel, 0x80ff_ffff, "neither request enabled");
+                }
+            }
+        }
+    }
+    assert_eq!(
+        h.set_render_state(D3DRS_ADAPTIVETESS_Y, D3DFMT_ATOC),
+        D3D_OK
+    );
+    assert_eq!(h.set_render_state(D3DRS_ALPHATESTENABLE, 1), D3D_OK);
+    assert_eq!(
+        h.set_render_state(D3DRS_POINTSIZE, mtld3d_types::D3DFMT_A2M0),
+        D3D_OK
+    );
+    assert_partial_coverage(coverage_pixel(&h, &target, &resolve, 0x80ff_ffff));
+}
+
+#[test]
+fn a2m_snapshot_blocks_keep_latch_after_raw_numeric_overwrite() {
+    let h = Harness::new();
+    arm(&h);
+    h.select_diffuse_stage(0);
+    assert_eq!(h.set_render_state(D3DRS_ZENABLE, 0), D3D_OK);
+    let target = h.create_render_target_ms(
+        (RT_SIZE, RT_SIZE),
+        D3DFMT_A8R8G8B8,
+        (D3DMULTISAMPLE_4_SAMPLES, 0),
+    );
+    let resolve = h.create_render_target(RT_SIZE, RT_SIZE, D3DFMT_A8R8G8B8);
+    for block_type in [
+        mtld3d_types::D3DSBT_ALL,
+        D3DSBT_VERTEXSTATE,
+        mtld3d_types::D3DSBT_PIXELSTATE,
+    ] {
+        assert_eq!(
+            h.set_render_state(D3DRS_POINTSIZE, mtld3d_types::D3DFMT_A2M1),
+            D3D_OK
+        );
+        assert_eq!(
+            h.set_render_state(D3DRS_POINTSIZE, 8.0f32.to_bits()),
+            D3D_OK
+        );
+        let block = h.create_state_block(block_type);
+        assert_eq!(
+            h.set_render_state(D3DRS_POINTSIZE, mtld3d_types::D3DFMT_A2M0),
+            D3D_OK
+        );
+        // Same raw DWORD, different hidden latch: Apply must still restore it.
+        assert_eq!(
+            h.set_render_state(D3DRS_POINTSIZE, 8.0f32.to_bits()),
+            D3D_OK
+        );
+        for _ in 0..2 {
+            assert_eq!(block.apply(), D3D_OK);
+            let pixel = coverage_pixel(&h, &target, &resolve, 0x80ff_ffff);
+            if block_type == mtld3d_types::D3DSBT_PIXELSTATE {
+                assert_pixel_eq(pixel, 0x80ff_ffff, "pixel block leaves A2M disabled");
+            } else {
+                assert_partial_coverage(pixel);
+            }
+        }
+        assert_eq!(
+            h.set_render_state(D3DRS_POINTSIZE, mtld3d_types::D3DFMT_A2M0),
+            D3D_OK
+        );
+        assert_eq!(
+            h.set_render_state(D3DRS_POINTSIZE, 16.0f32.to_bits()),
+            D3D_OK
+        );
+        assert_eq!(block.capture(), D3D_OK);
+        assert_eq!(
+            h.set_render_state(D3DRS_POINTSIZE, mtld3d_types::D3DFMT_A2M1),
+            D3D_OK
+        );
+        assert_eq!(
+            h.set_render_state(D3DRS_POINTSIZE, 8.0f32.to_bits()),
+            D3D_OK
+        );
+        assert_eq!(block.apply(), D3D_OK);
+        let pixel = coverage_pixel(&h, &target, &resolve, 0x80ff_ffff);
+        if block_type == mtld3d_types::D3DSBT_PIXELSTATE {
+            assert_partial_coverage(pixel);
+        } else {
+            assert_pixel_eq(
+                pixel,
+                0x80ff_ffff,
+                "Capture refreshes the latch to disabled",
+            );
+            assert_eq!(h.render_state(D3DRS_POINTSIZE), 16.0f32.to_bits());
+        }
+    }
+}
+
+#[test]
+fn a2m_recorded_capture_retains_component_membership() {
+    let h = Harness::new();
+    arm(&h);
+    h.select_diffuse_stage(0);
+    assert_eq!(h.set_render_state(D3DRS_ZENABLE, 0), D3D_OK);
+    let target = h.create_render_target_ms(
+        (RT_SIZE, RT_SIZE),
+        D3DFMT_A8R8G8B8,
+        (D3DMULTISAMPLE_4_SAMPLES, 0),
+    );
+    let resolve = h.create_render_target(RT_SIZE, RT_SIZE, D3DFMT_A8R8G8B8);
+    for numeric_after_control in [false, true] {
+        assert_eq!(
+            h.set_render_state(D3DRS_POINTSIZE, mtld3d_types::D3DFMT_A2M0),
+            D3D_OK
+        );
+        assert_eq!(h.begin_state_block(), D3D_OK);
+        assert_eq!(
+            h.set_render_state(D3DRS_POINTSIZE, mtld3d_types::D3DFMT_A2M1),
+            D3D_OK
+        );
+        if numeric_after_control {
+            assert_eq!(
+                h.set_render_state(D3DRS_POINTSIZE, 8.0f32.to_bits()),
+                D3D_OK
+            );
+        }
+        let block = h.end_state_block();
+        assert_eq!(
+            h.render_state(D3DRS_POINTSIZE),
+            mtld3d_types::D3DFMT_A2M0,
+            "recording leaves live raw state alone"
+        );
+        assert_pixel_eq(
+            coverage_pixel(&h, &target, &resolve, 0x80ff_ffff),
+            0x80ff_ffff,
+            "recording leaves live latch alone",
+        );
+        assert_eq!(block.apply(), D3D_OK);
+        assert_partial_coverage(coverage_pixel(&h, &target, &resolve, 0x80ff_ffff));
+        assert_eq!(
+            h.set_render_state(D3DRS_POINTSIZE, 16.0f32.to_bits()),
+            D3D_OK
+        );
+        assert_eq!(block.capture(), D3D_OK);
+        assert_eq!(
+            h.set_render_state(D3DRS_POINTSIZE, mtld3d_types::D3DFMT_A2M0),
+            D3D_OK
+        );
+        assert_eq!(
+            h.set_render_state(D3DRS_POINTSIZE, 16.0f32.to_bits()),
+            D3D_OK
+        );
+        assert_eq!(block.apply(), D3D_OK);
+        assert_eq!(h.render_state(D3DRS_POINTSIZE), 16.0f32.to_bits());
+        assert_partial_coverage(coverage_pixel(&h, &target, &resolve, 0x80ff_ffff));
+    }
+    // A numeric-only recording must not adopt latch membership when Capture
+    // refreshes its raw value from a live A2M1 control token.
+    assert_eq!(h.begin_state_block(), D3D_OK);
+    assert_eq!(
+        h.set_render_state(D3DRS_POINTSIZE, 8.0f32.to_bits()),
+        D3D_OK
+    );
+    let numeric = h.end_state_block();
+    assert_eq!(
+        h.set_render_state(D3DRS_POINTSIZE, mtld3d_types::D3DFMT_A2M1),
+        D3D_OK
+    );
+    assert_eq!(numeric.capture(), D3D_OK);
+    assert_eq!(
+        h.set_render_state(D3DRS_POINTSIZE, mtld3d_types::D3DFMT_A2M0),
+        D3D_OK
+    );
+    assert_eq!(numeric.apply(), D3D_OK);
+    assert_eq!(h.render_state(D3DRS_POINTSIZE), mtld3d_types::D3DFMT_A2M1);
+    assert_pixel_eq(
+        coverage_pixel(&h, &target, &resolve, 0x80ff_ffff),
+        0x80ff_ffff,
+        "raw control token is not captured latch membership",
+    );
+    // The same raw write now does change hidden state and must dirty coverage.
+    assert_eq!(
+        h.set_render_state(D3DRS_POINTSIZE, mtld3d_types::D3DFMT_A2M1),
+        D3D_OK
+    );
+    assert_partial_coverage(coverage_pixel(&h, &target, &resolve, 0x80ff_ffff));
+}
+
+#[test]
+fn a2m_resz_keeps_latch_and_resolves_depth() {
+    let h = Harness::new();
+    if h.device_is_paravirtual() {
+        return;
+    }
+    let target = h.create_render_target_ms(
+        (RT_SIZE, RT_SIZE),
+        D3DFMT_A8R8G8B8,
+        (D3DMULTISAMPLE_4_SAMPLES, 0),
+    );
+    let depth = h
+        .create_depth_stencil_surface_ms_hr(
+            (RT_SIZE, RT_SIZE),
+            D3DFMT_D24S8,
+            (D3DMULTISAMPLE_4_SAMPLES, 0),
+        )
+        .1
+        .expect("MSAA depth");
+    let resolve = h.create_render_target(RT_SIZE, RT_SIZE, D3DFMT_A8R8G8B8);
+    let intz = h.create_texture(
+        RT_SIZE,
+        RT_SIZE,
+        1,
+        D3DUSAGE_DEPTHSTENCIL,
+        D3DFMT_INTZ,
+        D3DPOOL_DEFAULT,
+    );
+    prime_intz(&h, &resolve, &intz);
+    assert_eq!(
+        h.set_render_state(D3DRS_POINTSIZE, mtld3d_types::D3DFMT_A2M1),
+        D3D_OK
+    );
+    resz_into(&h, &target, &depth, &intz);
+    assert_eq!(h.render_state(D3DRS_POINTSIZE), 0x7fa0_5000);
+    let pixel = Rgba8::from_pixel(sample_intz(&h, &resolve, &intz));
+    assert!(
+        pixel.r.abs_diff(64) <= 2,
+        "RESZ retained its depth operation: {pixel:?}"
+    );
+    assert_eq!(h.clear_texture(0), D3D_OK);
+    arm(&h);
+    h.select_diffuse_stage(0);
+    assert_eq!(h.set_render_state(D3DRS_ZENABLE, 0), D3D_OK);
+    assert_partial_coverage(coverage_pixel(&h, &target, &resolve, 0x80ff_ffff));
+}
+
+#[test]
+fn a2m_reset_clears_latch_and_numeric_size() {
+    let h = Harness::new();
+    assert_eq!(
+        h.set_render_state(D3DRS_POINTSIZE, 32.0f32.to_bits()),
+        D3D_OK
+    );
+    assert_eq!(
+        h.set_render_state(D3DRS_POINTSIZE, mtld3d_types::D3DFMT_A2M1),
+        D3D_OK
+    );
+    assert_eq!(h.reset(640, 480), D3D_OK);
+    assert_eq!(h.render_state(D3DRS_POINTSIZE), 1.0f32.to_bits());
+    arm(&h);
+    h.select_diffuse_stage(0);
+    assert_eq!(h.set_render_state(D3DRS_ZENABLE, 0), D3D_OK);
+    let target = h.create_render_target_ms(
+        (RT_SIZE, RT_SIZE),
+        D3DFMT_A8R8G8B8,
+        (D3DMULTISAMPLE_4_SAMPLES, 0),
+    );
+    let resolve = h.create_render_target(RT_SIZE, RT_SIZE, D3DFMT_A8R8G8B8);
+    assert_pixel_eq(
+        coverage_pixel(&h, &target, &resolve, 0x80ff_ffff),
+        0x80ff_ffff,
+        "Reset clears A2M independently of raw POINTSIZE",
+    );
+}
+
+#[test]
+fn a2m_recorded_resz_capture_excludes_latch() {
+    let h = Harness::new();
+    arm(&h);
+    h.select_diffuse_stage(0);
+    assert_eq!(h.set_render_state(D3DRS_ZENABLE, 0), D3D_OK);
+    let target = h.create_render_target_ms(
+        (RT_SIZE, RT_SIZE),
+        D3DFMT_A8R8G8B8,
+        (D3DMULTISAMPLE_4_SAMPLES, 0),
+    );
+    let resolve = h.create_render_target(RT_SIZE, RT_SIZE, D3DFMT_A8R8G8B8);
+    assert_eq!(h.begin_state_block(), D3D_OK);
+    assert_eq!(h.set_render_state(D3DRS_POINTSIZE, 0x7fa0_5000), D3D_OK);
+    let resz = h.end_state_block();
+    for raw in [mtld3d_types::D3DFMT_A2M1, 32.0f32.to_bits()] {
+        assert_eq!(
+            h.set_render_state(D3DRS_POINTSIZE, mtld3d_types::D3DFMT_A2M1),
+            D3D_OK
+        );
+        assert_eq!(h.set_render_state(D3DRS_POINTSIZE, raw), D3D_OK);
+        assert_eq!(resz.capture(), D3D_OK);
+        assert_eq!(
+            h.set_render_state(D3DRS_POINTSIZE, mtld3d_types::D3DFMT_A2M0),
+            D3D_OK
+        );
+        assert_eq!(resz.apply(), D3D_OK);
+        assert_eq!(h.render_state(D3DRS_POINTSIZE), raw);
+        assert_pixel_eq(
+            coverage_pixel(&h, &target, &resolve, 0x80ff_ffff),
+            0x80ff_ffff,
+            "RESZ Capture cannot acquire latch membership",
+        );
+    }
 }

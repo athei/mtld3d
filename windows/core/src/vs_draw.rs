@@ -11,8 +11,7 @@
 
 use mtld3d_types::{
     D3DMATRIX, D3DRS_CLIPPING, D3DRS_CLIPPLANEENABLE, D3DRS_POINTSCALE_A, D3DRS_POINTSCALE_B,
-    D3DRS_POINTSCALE_C, D3DRS_POINTSIZE, D3DRS_POINTSIZE_MAX, D3DRS_POINTSIZE_MIN,
-    RENDER_STATE_COUNT,
+    D3DRS_POINTSCALE_C, D3DRS_POINTSIZE_MAX, D3DRS_POINTSIZE_MIN, RENDER_STATE_COUNT,
 };
 
 use crate::ff_state::FfState;
@@ -28,7 +27,7 @@ pub const VS_DRAW_BYTES: usize = 16 * (2 + 4 + MAX_CLIP_PLANES);
 
 /// MSL declaration of the uniform, emitted ahead of every vertex function.
 ///
-/// `point = (D3DRS_POINTSIZE, D3DRS_POINTSIZE_MIN, D3DRS_POINTSIZE_MAX, 0)`,
+/// `point = (numeric_point_size, D3DRS_POINTSIZE_MIN, D3DRS_POINTSIZE_MAX, 0)`,
 /// `point_scale = (D3DRS_POINTSCALE_A, _B, _C, 0)`, `inv_view` the rows of
 /// `transpose(inverse(D3DTS_VIEW))` so `dot(pos_view, inv_view[i])` is lane
 /// `i` of the world-space position, and `clip` the enabled user clip planes
@@ -53,6 +52,7 @@ pub fn clip_plane_count(rs: &[u32; RENDER_STATE_COUNT]) -> u8 {
 
 /// Serialise the point render states, the inverse view and the clip planes.
 ///
+/// `point_size` is the last numeric POINTSIZE, excluding driver controls.
 /// Each point state DWORD already holds an f32 bit pattern and is copied
 /// through verbatim; the fourth lane of each row is padding. `planes` holds
 /// the application's `SetClipPlane` coefficients by index (at least
@@ -63,11 +63,12 @@ pub fn clip_plane_count(rs: &[u32; RENDER_STATE_COUNT]) -> u8 {
 #[must_use]
 pub fn build_vs_draw_bytes(
     rs: &[u32; RENDER_STATE_COUNT],
+    point_size: u32,
     view: &D3DMATRIX,
     planes: &[[f32; 4]],
 ) -> [u8; VS_DRAW_BYTES] {
     let mut lanes = [0u32; VS_DRAW_BYTES / 4];
-    lanes[0] = rs[D3DRS_POINTSIZE as usize];
+    lanes[0] = point_size;
     lanes[1] = rs[D3DRS_POINTSIZE_MIN as usize];
     lanes[2] = rs[D3DRS_POINTSIZE_MAX as usize];
     lanes[4] = rs[D3DRS_POINTSCALE_A as usize];

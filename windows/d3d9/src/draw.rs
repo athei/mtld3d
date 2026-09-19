@@ -55,6 +55,7 @@ use mtld3d_types::{
 static VS_DRAW_DEFAULT: std::sync::LazyLock<[u8; VS_DRAW_BYTES]> = std::sync::LazyLock::new(|| {
     build_vs_draw_bytes(
         &render_state_defaults(),
+        render_state_defaults()[mtld3d_types::D3DRS_POINTSIZE as usize],
         &D3DMATRIX::IDENTITY,
         &[[0.0; 4]; MAX_CLIP_PLANES],
     )

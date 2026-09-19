@@ -27,10 +27,11 @@ divergences from D3D9 it keeps on purpose. The tested games are in the
   separate alpha blend, blend factor, write masks, native wireframe fill.
 - Four render targets with independent formats and blending.
 - Multisampling at 2x and 4x, 8x where the device offers it, and the ATOC
-  alpha-to-coverage extension through `D3DRS_ADAPTIVETESS_Y`.
-  `ALPHATESTENABLE` gates coverage, which replaces alpha testing only on
-  multisampled render targets. AMD's `A2M1`/`A2M0` controls through
-  `D3DRS_POINTSIZE` are not implemented.
+  alpha-to-coverage extension through `D3DRS_ADAPTIVETESS_Y`, plus AMD's
+  `A2M1`/`A2M0` controls through `D3DRS_POINTSIZE`. `ALPHATESTENABLE` gates
+  ATOC; A2M is an independent latch. Either request replaces alpha testing
+  only on multisampled render targets. Both controls work independently
+  of reported vendor; control writes preserve numeric point size.
 - Windowed and fullscreen swap chains, mode enumeration, hardware and software
   cursors, MetalFX upscaling, HDR output.
 - `D3DCREATE_MULTITHREADED`: a device created with it, and every object it
