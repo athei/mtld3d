@@ -42,6 +42,11 @@ divergences from D3D9 it keeps on purpose. The tested games are in the
 - `ColorFill` of a DEFAULT offscreen plain surface in V8U8, V16U16, Q8W8V8U8
   or Q16W16V16U16 writes each colour channel as the nearest nonnegative signed
   code, R, G, B, A into U, V, W, Q.
+- DXT1 to DXT5 volume textures use native BC1, BC2 and BC3 3D storage in
+  every pool, with short mips, slice filtering and sRGB sampling. DXT2 and
+  DXT4 keep their identities and sample the stored blocks unchanged. ATI1
+  and packed-YUV volumes stay SCRATCH-only, and render-target usage and mip
+  autogeneration stay unavailable on volumes.
 - Compressed (DXT1 to DXT5, ATI1), integer and float formats, cube and volume
   textures, auto-generated mipmaps, `StretchRect` with format conversion and
   packed and planar YUV decoding, `GetDC`.

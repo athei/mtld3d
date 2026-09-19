@@ -1524,6 +1524,27 @@ impl Harness {
             .0
     }
 
+    /// Probe volume creation with a null result pointer.
+    #[must_use]
+    pub fn create_volume_texture_null_output(&self, format: u32, pool: u32) -> i32 {
+        // SAFETY: the live device receives a deliberately null out-pointer;
+        // this invalid API call must reject it before writing the result.
+        unsafe {
+            (self.dev_vtbl().create_volume_texture)(
+                self.device,
+                4,
+                4,
+                2,
+                1,
+                0,
+                format,
+                pool,
+                core::ptr::null_mut(),
+                core::ptr::null_mut(),
+            )
+        }
+    }
+
     /// `CreateVolumeTexture` returning the hr and the texture when it succeeded.
     pub fn try_create_volume_texture(
         &self,

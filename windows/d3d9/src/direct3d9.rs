@@ -1036,7 +1036,14 @@ extern "system" fn d3d9_check_device_format(
             is_render_target_format_on_device(check_format, cfg.expand_packed16)
         }
     } else if matches!(rtype, D3DRTYPE_VOLUME | D3DRTYPE_VOLUMETEXTURE) {
-        if usage & D3DUSAGE_QUERY_SRGBREAD != 0 && !has_srgb_read_decode(check_format) {
+        // Newly supported BC volumes are sampled only. Preserve legacy 2D
+        // and cube answers while refusing an sRGB-write capability here.
+        if (mtld3d_core::format::is_dxt_format(check_format)
+            && usage & D3DUSAGE_QUERY_SRGBWRITE != 0)
+            || (usage & D3DUSAGE_QUERY_SRGBREAD != 0
+                && !has_srgb_read_decode(check_format)
+                && !mtld3d_core::format::is_dxt_format(check_format))
+        {
             false
         } else {
             mtld3d_core::format::is_volume_texture_format(check_format)

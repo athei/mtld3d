@@ -336,15 +336,17 @@ pub const fn planar_yuv_storage_mapping() -> FormatMapping {
 
 /// True for colour formats creatable as GPU-backed volume textures.
 ///
-/// The backend has no 3D sampling path for block-compressed or packed-YUV
-/// formats. `D3DPOOL_SCRATCH` volumes keep a separate CPU-only exception for
-/// those formats, but that is not a hardware capability for `CheckDeviceFormat`.
+/// Native BC1/2/3 storage supports DXT1 through DXT5, with DXT2/4 retaining
+/// their premultiplied-content format identities. Other compressed formats
+/// and packed YUV retain the separate SCRATCH creation exception, which is not
+/// a hardware capability for `CheckDeviceFormat`.
 #[must_use]
 pub const fn is_volume_texture_format(d3d_format: u32) -> bool {
     let Some(mapping) = lookup_d3d_format(d3d_format) else {
         return false;
     };
-    !mapping.is_compressed() && !matches!(d3d_format, D3DFMT_YUY2 | D3DFMT_UYVY)
+    (is_dxt_format(d3d_format) || !mapping.is_compressed())
+        && !matches!(d3d_format, D3DFMT_YUY2 | D3DFMT_UYVY)
 }
 
 /// `map_d3d_format`, honouring whether the device has the packed 16-bit formats.

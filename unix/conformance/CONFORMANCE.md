@@ -1433,3 +1433,39 @@ end-to-end suite runs the A2R10G10B10 scenarios in this lane order and adds
 two witnesses of the order itself: the same word written to both formats
 samples with red and blue exchanged, and copies between the two formats are
 rejected with the destination unchanged.
+
+### visual.c/volume_dxtn_test and device.c/test_volume_blocks
+
+DXT1 to DXT5 volume textures are creatable in every pool, stored as native
+BC1, BC2 and BC3 textures: a 3D texture when the base depth is above one, the
+2D texture every depth-one volume already uses otherwise. Locks expose the
+compressed blocks with a row pitch of one block row and a slice pitch of the
+level's block rows, and uploads copy them verbatim, so nothing is decompressed
+and no shader or draw-time work is added. The level's compressed-layout
+marker (a zero bytes-per-pixel) is kept through volume creation, so an upload
+of a level that has reached one slice counts block rows, not texel rows, and
+the alignment repack never asks for bytes past the level's staging. That path
+was reachable before this capability through a SCRATCH volume bound for
+sampling.
+
+volume_dxtn_test (visual.c:18588) skipped its DXT1, DXT3 and DXT5 rows on the
+VOLUMETEXTURE query and now runs them: three skips fewer and the row's eight
+readbacks at visual.c:18631 per format on every visual leg, all expected to
+pass, including the scaled legs (the back buffer is read at reported
+coordinates) and the `@mac2` legs (BC formats store every lane and carry no
+view swizzle). test_volume_blocks (device.c:10713) takes its supported branch
+for the five DXT rows, where DEFAULT, SYSTEMMEM and MANAGED creates of every
+block-aligned size now succeed as device.c:10760 expects; its pitch, offset
+and misaligned-box checks already ran against the SCRATCH volume. A
+successful create skips the null-pointer check of a failed one, so the device
+assertion total can fall while nothing fails. No failing site is expected to
+move on any leg, and the table has no DXT2 or DXT4 row in visual.c.
+
+Volume queries accept DYNAMIC, FILTER, SRGBREAD, VERTEXTEXTURE and WRAPANDMIP
+for the five formats and reject SRGBWRITE, RENDERTARGET, DEPTHSTENCIL,
+POSTPIXELSHADER_BLENDING and AUTOGENMIPMAP. SRGBREAD covers DXT2 and DXT4 on
+volumes because BC2 and BC3 have sRGB views; the 2D and cube answers for those
+two formats are unchanged. ATI1 and packed-YUV volumes stay unadvertised and
+SCRATCH-only. DXT2 and DXT4 keep their format identities and share the DXT3
+and DXT5 block encodings: the stored blocks are sampled as they are, with no
+multiply or divide by alpha, and the application chooses its blend factors.
