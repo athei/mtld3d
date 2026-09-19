@@ -1376,10 +1376,11 @@ do not establish signed pixel correctness. Dedicated end-to-end tests pin
 all four signed16 lanes, alpha, eight-byte transport and float32 sampling
 precision. This feature does not claim a Wine positive-pixel skip reduction.
 
-Signed-format ColorFill on DEFAULT offscreen plain surfaces still reaches
-the existing missing fill-codec path, which warns and returns success without
-writing. This also affects V8U8, V16U16 and Q8W8V8U8; native sampling support
-does not resolve that separate ColorFill gap.
+ColorFill on DEFAULT offscreen V8U8, V16U16, Q8W8V8U8 and Q16W16V16U16
+surfaces encodes each normalized D3DCOLOR channel as its nearest nonnegative
+signed-format value. Dedicated tests pin exact full/partial bytes, exterior
+texel preservation and scheduled GPU-upload visibility. This codec coverage
+does not claim an upstream conformance skip reduction.
 
 ### device.c/test_getdc, A2R10G10B10
 

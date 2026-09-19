@@ -23,8 +23,9 @@ use mtld3d_types::{
     D3DDECLUSAGE_POSITIONT, D3DDECLUSAGE_PSIZE, D3DDECLUSAGE_TEXCOORD, D3DFILL_POINT,
     D3DFILL_SOLID, D3DFILL_WIREFRAME, D3DFMT_A1R5G5B5, D3DFMT_A2R10G10B10, D3DFMT_A4R4G4B4,
     D3DFMT_A8, D3DFMT_A8B8G8R8, D3DFMT_A8R8G8B8, D3DFMT_A16B16G16R16, D3DFMT_A16B16G16R16F,
-    D3DFMT_A32B32G32R32F, D3DFMT_G16R16, D3DFMT_G16R16F, D3DFMT_G32R32F, D3DFMT_L8, D3DFMT_R5G6B5,
-    D3DFMT_R16F, D3DFMT_R32F, D3DFMT_X1R5G5B5, D3DFMT_X8B8G8R8, D3DFMT_X8R8G8B8, D3DFVF_DIFFUSE,
+    D3DFMT_A32B32G32R32F, D3DFMT_G16R16, D3DFMT_G16R16F, D3DFMT_G32R32F, D3DFMT_L8,
+    D3DFMT_Q8W8V8U8, D3DFMT_Q16W16V16U16, D3DFMT_R5G6B5, D3DFMT_R16F, D3DFMT_R32F, D3DFMT_V8U8,
+    D3DFMT_V16U16, D3DFMT_X1R5G5B5, D3DFMT_X8B8G8R8, D3DFMT_X8R8G8B8, D3DFVF_DIFFUSE,
     D3DFVF_LASTBETA_D3DCOLOR, D3DFVF_LASTBETA_UBYTE4, D3DFVF_NORMAL, D3DFVF_POSITION_MASK,
     D3DFVF_PSIZE, D3DFVF_SPECULAR, D3DFVF_TEXCOUNT_MASK, D3DFVF_TEXCOUNT_SHIFT,
     D3DFVF_TEXTUREFORMAT1, D3DFVF_TEXTUREFORMAT3, D3DFVF_TEXTUREFORMAT4, D3DFVF_XYZ, D3DFVF_XYZB1,
@@ -171,6 +172,33 @@ pub fn d3dcolor_fill_pixel_bytes(color: u32, d3d_format: u32) -> Option<Vec<u8>>
         // colour's luminance, an alpha destination its alpha byte.
         D3DFMT_L8 => Some(vec![d3dcolor_luminance(r, g, b)]),
         D3DFMT_A8 => Some(vec![a]),
+        // D3DCOLOR components are nonnegative normalized values even when
+        // the destination is signed. Preserve that value with nearest SNORM
+        // quantization, rather than reinterpreting the source byte's sign.
+        D3DFMT_V8U8 | D3DFMT_Q8W8V8U8 => {
+            let channels = [r, g, b, a];
+            let count = if d3d_format == D3DFMT_V8U8 { 2 } else { 4 };
+            Some(
+                channels[..count]
+                    .iter()
+                    .map(|&channel| unorm8_to_positive_snorm(channel, 127).to_le_bytes()[0])
+                    .collect(),
+            )
+        }
+        D3DFMT_V16U16 => {
+            let mut bytes = Vec::with_capacity(4);
+            for channel in [r, g] {
+                bytes.extend_from_slice(&unorm8_to_positive_snorm(channel, 32767).to_le_bytes());
+            }
+            Some(bytes)
+        }
+        D3DFMT_Q16W16V16U16 => {
+            let mut bytes = Vec::with_capacity(8);
+            for channel in [r, g, b, a] {
+                bytes.extend_from_slice(&unorm8_to_positive_snorm(channel, 32767).to_le_bytes());
+            }
+            Some(bytes)
+        }
         // Float formats carry the D3DCOLOR channels normalised to [0, 1], in
         // channel order R, G, B, A — the D3D9 names list them most-significant
         // first, so the stored order is the reverse of the name.
@@ -229,6 +257,12 @@ pub fn d3dcolor_fill_pixel_bytes(color: u32, d3d_format: u32) -> Option<Vec<u8>>
 fn d3dcolor_luminance(r: u8, g: u8, b: u8) -> u8 {
     let weighted = 2125 * u32::from(r) + 7154 * u32::from(g) + 721 * u32::from(b);
     u8::try_from((weighted + 5_000) / 10_000).expect("Rec. 709 weights sum to one")
+}
+
+/// Encode a nonnegative normalized byte in a signed destination's range.
+fn unorm8_to_positive_snorm(channel: u8, max_positive: u16) -> u16 {
+    u16::try_from((u32::from(channel) * u32::from(max_positive) + 127) / 255)
+        .expect("the normalized result cannot exceed max_positive")
 }
 
 /// Widen an 8-bit unorm channel to 16 bits by replication.

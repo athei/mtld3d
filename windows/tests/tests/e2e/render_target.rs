@@ -6270,3 +6270,201 @@ fn front_buffer_readback_held_swapchain_tracks_reset_and_msaa() {
         }
     }
 }
+
+fn signed_colorfill_zero_replaces_sentinel(format: u32, bytes_per_pixel: usize) {
+    let h = Harness::new();
+    let surface = h.create_offscreen_plain_surface(4, 3, format, D3DPOOL_DEFAULT);
+    {
+        let mut locked = surface.lock_rect(0);
+        let count = usize::try_from(locked.pitch()).unwrap() / 4 * 3;
+        locked.write_u32(&vec![0x5a5a_a5a5; count]);
+    }
+    assert_eq!(h.color_fill_hr(&surface, 0), D3D_OK);
+    let locked = surface.lock_rect(D3DLOCK_READONLY);
+    let stride = usize::try_from(locked.pitch()).unwrap() / 4;
+    let words = locked.as_u32(stride * 3);
+    for row in 0..3 {
+        assert_eq!(
+            &words[row * stride..row * stride + bytes_per_pixel],
+            vec![0; bytes_per_pixel],
+            "format {format}, row {row}: successful zero ColorFill must replace sentinel bytes"
+        );
+    }
+}
+
+#[test]
+fn signed_colorfill_zero_v8u8() {
+    signed_colorfill_zero_replaces_sentinel(mtld3d_types::D3DFMT_V8U8, 2);
+}
+
+#[test]
+fn signed_colorfill_zero_v16u16() {
+    signed_colorfill_zero_replaces_sentinel(mtld3d_types::D3DFMT_V16U16, 4);
+}
+
+#[test]
+fn signed_colorfill_zero_q8w8v8u8() {
+    signed_colorfill_zero_replaces_sentinel(mtld3d_types::D3DFMT_Q8W8V8U8, 4);
+}
+
+#[test]
+fn signed_colorfill_zero_q16w16v16u16() {
+    signed_colorfill_zero_replaces_sentinel(mtld3d_types::D3DFMT_Q16W16V16U16, 8);
+}
+
+#[test]
+fn signed_colorfill_full_partial_bytes_match_reference() {
+    use mtld3d_types::{D3DFMT_Q8W8V8U8, D3DFMT_Q16W16V16U16, D3DFMT_V8U8, D3DFMT_V16U16};
+    let h = Harness::new();
+    // Measured RGBA bytes/words, shared only by the component width.
+    let cases = [
+        (0x0000_0000u32, [0, 0, 0, 0], [0, 0, 0, 0]),
+        (
+            0xffff_ffffu32,
+            [127, 127, 127, 127],
+            [32767, 32767, 32767, 32767],
+        ),
+        (
+            0x8040_c0ffu32,
+            [32, 96, 127, 64],
+            [8224, 24672, 32767, 16448],
+        ),
+        (
+            0xdead_beefu32,
+            [86, 95, 119, 111],
+            [22230, 24415, 30711, 28527],
+        ),
+        (0x0101_0101u32, [0, 0, 0, 0], [128, 128, 128, 128]),
+        (
+            0x7f7f_7f7fu32,
+            [63, 63, 63, 63],
+            [16319, 16319, 16319, 16319],
+        ),
+        (
+            0x8080_8080u32,
+            [64, 64, 64, 64],
+            [16448, 16448, 16448, 16448],
+        ),
+        (
+            0xfefe_fefeu32,
+            [127, 127, 127, 127],
+            [32639, 32639, 32639, 32639],
+        ),
+        (0xff00_0000u32, [0, 0, 0, 127], [0, 0, 0, 32767]),
+        (0x00ff_0000u32, [127, 0, 0, 0], [32767, 0, 0, 0]),
+        (0x0000_ff00u32, [0, 127, 0, 0], [0, 32767, 0, 0]),
+        (0x0000_00ffu32, [0, 0, 127, 0], [0, 0, 32767, 0]),
+    ];
+    for (format, bytes_per_pixel) in [
+        (D3DFMT_V8U8, 2),
+        (D3DFMT_V16U16, 4),
+        (D3DFMT_Q8W8V8U8, 4),
+        (D3DFMT_Q16W16V16U16, 8),
+        (D3DFMT_A8R8G8B8, 4),
+    ] {
+        let surface = h.create_offscreen_plain_surface(5, 3, format, D3DPOOL_DEFAULT);
+        for (color, narrow, wide) in cases {
+            let expected = match format {
+                D3DFMT_Q16W16V16U16 => wide.iter().flat_map(|v: &u16| v.to_le_bytes()).collect(),
+                D3DFMT_V16U16 => wide[..2]
+                    .iter()
+                    .flat_map(|v: &u16| v.to_le_bytes())
+                    .collect(),
+                D3DFMT_A8R8G8B8 => color.to_le_bytes().to_vec(),
+                _ => narrow[..bytes_per_pixel].to_vec(),
+            };
+            for partial in [false, true] {
+                {
+                    let mut locked = surface.lock_rect(0);
+                    let len = usize::try_from(locked.pitch()).unwrap() * 3;
+                    locked.write(&vec![0xa5u8; len]);
+                }
+                let hr = if partial {
+                    h.color_fill_rect_hr(&surface, (1, 1, 4, 2), color)
+                } else {
+                    h.color_fill_hr(&surface, color)
+                };
+                assert_eq!(hr, D3D_OK);
+                let locked = surface.lock_rect(D3DLOCK_READONLY);
+                let pitch = usize::try_from(locked.pitch()).unwrap();
+                let bytes = locked.as_u8(pitch * 3);
+                for y in 0..3 {
+                    for x in 0..5 {
+                        let offset = y * pitch + x * bytes_per_pixel;
+                        let untouched = vec![0xa5; bytes_per_pixel];
+                        let wanted = if !partial || (y == 1 && (1..4).contains(&x)) {
+                            &expected
+                        } else {
+                            &untouched
+                        };
+                        assert_eq!(
+                            &bytes[offset..offset + bytes_per_pixel],
+                            wanted,
+                            "format {format}, color {color:#x}, partial {partial}, pixel {x},{y}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn signed_colorfill_upload_reaches_gpu_sampling() {
+    use mtld3d_types::{D3DFMT_Q8W8V8U8, D3DFMT_Q16W16V16U16, D3DFMT_V8U8, D3DFMT_V16U16};
+    let h = Harness::new();
+    for format in [
+        D3DFMT_V8U8,
+        D3DFMT_V16U16,
+        D3DFMT_Q8W8V8U8,
+        D3DFMT_Q16W16V16U16,
+        D3DFMT_A8R8G8B8,
+    ] {
+        let source = h.create_offscreen_plain_surface(5, 3, format, D3DPOOL_DEFAULT);
+        let target = h.create_render_target(5, 3, D3DFMT_A8R8G8B8);
+        let readback = h.create_offscreen_plain_surface(5, 3, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM);
+        {
+            let mut locked = source.lock_rect(0);
+            let len = usize::try_from(locked.pitch()).unwrap() * 3;
+            locked.write(&vec![0xa5u8; len]);
+        }
+        for partial in [false, true] {
+            let hr = if partial {
+                h.color_fill_rect_hr(&source, (1, 1, 4, 2), 0xdead_beef)
+            } else {
+                h.color_fill_hr(&source, 0x8040_c0ff)
+            };
+            assert_eq!(hr, D3D_OK);
+            // The existing cross-format render-quad samples the signed source.
+            // Read the GPU result before locking the source again.
+            assert_eq!(h.stretch_rect(&source, &target, D3DTEXF_NONE), D3D_OK);
+            assert_eq!(h.get_render_target_data_hr(&target, &readback), D3D_OK);
+            let locked = readback.lock_rect(D3DLOCK_READONLY);
+            let pitch = usize::try_from(locked.pitch()).unwrap() / 4;
+            let pixels = locked.as_u32(pitch * 3);
+            for y in 0..3 {
+                for x in 0..5 {
+                    let expected = if partial && y == 1 && (1..4).contains(&x) {
+                        0xdead_beef
+                    } else {
+                        0x8040_c0ff
+                    };
+                    for shift in [0, 8, 16, 24] {
+                        // This witness observes stored components. Missing
+                        // V8/V16 channels have separate sampling regressions.
+                        if matches!(format, D3DFMT_V8U8 | D3DFMT_V16U16) && !matches!(shift, 8 | 16)
+                        {
+                            continue;
+                        }
+                        let actual = (pixels[y * pitch + x] >> shift) & 255;
+                        let wanted = (expected >> shift) & 255;
+                        assert!(
+                            actual.abs_diff(wanted) <= 1,
+                            "format {format}, partial {partial}, pixel {x},{y}, channel {shift}: {actual} != {wanted}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}

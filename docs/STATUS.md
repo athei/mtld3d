@@ -37,6 +37,8 @@ divergences from D3D9 it keeps on purpose. The tested games are in the
 - Signed V16U16 textures use native 16-bit U/V storage across 2D, cube and
   volume resources. AUTOGEN requests on 2D/cube use the one-level NOAUTOGEN
   fallback; render-target and sRGB usages remain unavailable.
+- `ColorFill` into DEFAULT offscreen V8U8, V16U16, Q8W8V8U8 and Q16W16V16U16 surfaces
+  encodes nonnegative D3DCOLOR channels in their signed normalized storage.
 - Compressed (DXT1 to DXT5, ATI1), integer and float formats, cube and volume
   textures, auto-generated mipmaps, `StretchRect` with format conversion and
   packed and planar YUV decoding, `GetDC`.

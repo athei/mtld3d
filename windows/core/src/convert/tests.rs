@@ -1147,3 +1147,52 @@ fn colorfill_a2r10g10b10_uses_nearest_normalized_channels() {
     let bytes = d3dcolor_fill_pixel_bytes(0x7f2b_00ff, D3DFMT_A2R10G10B10).unwrap();
     assert_eq!(bytes, ((1_u32 << 30) | (173 << 20) | 1023).to_le_bytes());
 }
+
+#[test]
+fn color_fill_signed_formats_match_measured_bytes() {
+    // Measured raw little-endian bytes for independent color channels.
+    for (format, expected) in [
+        (D3DFMT_V8U8, vec![0x56, 0x5f]),
+        (D3DFMT_Q8W8V8U8, vec![0x56, 0x5f, 0x77, 0x6f]),
+        (D3DFMT_V16U16, vec![0xd6, 0x56, 0x5f, 0x5f]),
+        (
+            D3DFMT_Q16W16V16U16,
+            vec![0xd6, 0x56, 0x5f, 0x5f, 0xf7, 0x77, 0x6f, 0x6f],
+        ),
+    ] {
+        assert_eq!(
+            d3dcolor_fill_pixel_bytes(0xdead_beef, format),
+            Some(expected)
+        );
+    }
+}
+
+#[test]
+fn color_fill_signed_channels_quantize_all_input_bytes() {
+    for channel in 0..=255u8 {
+        let color = u32::from_le_bytes([channel, 255 - channel, channel, 255 - channel]);
+        let values = [channel, 255 - channel, channel, 255 - channel];
+        for (format, bits, count) in [
+            (D3DFMT_V8U8, 8, 2),
+            (D3DFMT_Q8W8V8U8, 8, 4),
+            (D3DFMT_V16U16, 16, 2),
+            (D3DFMT_Q16W16V16U16, 16, 4),
+        ] {
+            let bytes = d3dcolor_fill_pixel_bytes(color, format).unwrap();
+            let encoded: Vec<_> = if bits == 8 {
+                bytes.iter().map(|&v| u16::from(v)).collect()
+            } else {
+                u16_indices(&bytes)
+            };
+            assert_eq!(encoded.len(), count);
+            let maximum = if bits == 8 { 127.0 } else { 32767.0 };
+            for (&actual, &input) in encoded.iter().zip(&values) {
+                let expected = (f64::from(input) / 255.0 * maximum).round();
+                assert!(
+                    (f64::from(actual) - expected).abs() < 0.5,
+                    "format {format}, input {input}: {actual} != {expected}"
+                );
+            }
+        }
+    }
+}
