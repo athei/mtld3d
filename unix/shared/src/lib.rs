@@ -30,14 +30,15 @@ pub use params::{
     AttachMetalLayerParams, BlitTextureToBufferParams, BufferCreateDesc,
     CompileShaderLibraryParams, CreateBackbufferParams, CreateBuffersBatchParams,
     CreateColorTargetParams, CreateCommandQueueParams, CreateDepthStencilStateParams,
-    CreateDepthTextureParams, CreateRenderPipelineParams, CreateSamplerStateParams,
-    CreateTextureSliceViewParams, CreateTexturesBatchParams, DestroyCommandQueueParams,
-    DestroyResourcesBulkParams, DetachMetalLayerParams, EnsureBlitPipelineParams,
-    EnsureClearQuadPipelineParams, ExtraColorAttachmentParams, ExtraColorDesc, GetDeviceInfoParams,
-    GetTaskFaultsParams, InitLoggerParams, OpenLogParams, PassDescriptor, SetCursorOverlayParams,
-    SetDisplaySyncEnabledParams, SetPresentWaitPolicyParams, StartGpuCaptureParams,
-    StencilFaceParams, StopGpuCaptureParams, SubmitFrameParams, TextureCreateDesc, VertexAttrDesc,
-    VertexBufferLayoutDesc, WaitForGpuRetireParams, WaitForPresentIdleParams, WriteLogParams,
+    CreateDepthTextureParams, CreateDepthTransferPipelineParams, CreateRenderPipelineParams,
+    CreateSamplerStateParams, CreateTextureSliceViewParams, CreateTexturesBatchParams,
+    DestroyCommandQueueParams, DestroyResourcesBulkParams, DetachMetalLayerParams,
+    EnsureBlitPipelineParams, EnsureClearQuadPipelineParams, ExtraColorAttachmentParams,
+    ExtraColorDesc, GetDeviceInfoParams, GetTaskFaultsParams, InitLoggerParams, OpenLogParams,
+    PassDescriptor, SetCursorOverlayParams, SetDisplaySyncEnabledParams,
+    SetPresentWaitPolicyParams, StartGpuCaptureParams, StencilFaceParams, StopGpuCaptureParams,
+    SubmitFrameParams, TextureCreateDesc, VertexAttrDesc, VertexBufferLayoutDesc,
+    WaitForGpuRetireParams, WaitForPresentIdleParams, WriteLogParams,
 };
 
 #[repr(u32)]
@@ -74,6 +75,7 @@ pub enum Thunks {
     DetachMetalLayer,
     SetPresentWaitPolicy,
     WaitForPresentIdle,
+    CreateDepthTransferPipeline,
 }
 
 pub trait Thunk {

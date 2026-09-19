@@ -590,6 +590,21 @@ pub extern "C" fn ensure_clear_quad_pipeline_handler(args: *mut c_void) -> i32 {
     }
 }
 
+pub extern "C" fn create_depth_transfer_pipeline_handler(args: *mut c_void) -> i32 {
+    // SAFETY: the paired thunk supplies this writable, aligned parameter block.
+    let Some(mut params) =
+        (unsafe { InPtrMut::<mtld3d_shared::CreateDepthTransferPipelineParams>::opt(args) })
+    else {
+        return STATUS_UNSUCCESSFUL;
+    };
+    let Some(pipeline) = metal::depth_transfer::create_pipeline(params.device_handle, params.kind)
+    else {
+        return STATUS_UNSUCCESSFUL;
+    };
+    params.pipeline_handle = pipeline;
+    STATUS_SUCCESS
+}
+
 pub extern "C" fn ensure_blit_pipeline_handler(args: *mut c_void) -> i32 {
     // SAFETY: unix-call handler params; PE side passes *mut EnsureBlitPipelineParams.
     let Some(mut params) = (unsafe { InPtrMut::<EnsureBlitPipelineParams>::opt(args) }) else {
@@ -700,6 +715,9 @@ pub extern "C" fn blit_texture_to_buffer_handler(args: *mut c_void) -> i32 {
         return -1;
     };
     let blit_args = metal::BlitArgs {
+        planes: params.planes,
+        stencil_bytes_per_row: params.stencil_bytes_per_row,
+        stencil_offset: params.stencil_offset,
         queue_handle: params.queue_handle,
         device_handle: params.device_handle,
         tex_handle: params.tex_handle,
@@ -1006,6 +1024,11 @@ pub extern "C" fn destroy_resources_bulk_handler(args: *mut c_void) -> i32 {
         DestroyKind::SamplerState => {
             for &h in slice {
                 metal::destroy_sampler_state(h);
+            }
+        }
+        DestroyKind::ComputePipeline => {
+            for &h in slice {
+                metal::depth_transfer::destroy_pipeline(h);
             }
         }
         DestroyKind::DepthStencilState => {

@@ -20,6 +20,7 @@ pub mod config;
 pub mod convert;
 pub mod cursor;
 pub mod depth_stencil_state;
+pub mod depth_texture;
 pub mod dirty_range;
 pub mod dirty_rect;
 pub mod display_mode;

@@ -1280,6 +1280,12 @@ impl Thunk for DestroyResourcesBulkParams {
 /// previously-submitted render command buffer has finished.
 #[repr(C, align(8))]
 pub struct BlitTextureToBufferParams {
+    /// Native layout, including both planes in one submission when requested.
+    pub planes: crate::mtl::ReadbackPlanes,
+    /// Row pitch of the optional stencil plane.
+    pub stencil_bytes_per_row: u32,
+    /// Byte offset of stencil within the same page-aligned destination allocation.
+    pub stencil_offset: u64,
     pub queue_handle: MetalHandle<MTLCommandQueueKind>, // in
     pub device_handle: MetalHandle<MTLDeviceKind>,      // in (for newBufferWithBytesNoCopy)
     pub tex_handle: MetalHandle<MTLTextureKind>,        // in
@@ -1317,6 +1323,19 @@ pub struct BlitTextureToBufferParams {
 
 impl Thunk for BlitTextureToBufferParams {
     const CODE: u32 = Thunks::BlitTextureToBuffer as u32;
+}
+
+/// Create one device-owned pipeline for native depth-plane extraction.
+#[repr(C, align(8))]
+pub struct CreateDepthTransferPipelineParams {
+    pub device_handle: MetalHandle<MTLDeviceKind>,
+    pub pipeline_handle: MetalHandle<crate::mtl_handle::MTLComputePipelineStateKind>,
+    pub kind: crate::mtl::DepthTransferKind,
+    pub pad: u32,
+}
+
+impl Thunk for CreateDepthTransferPipelineParams {
+    const CODE: u32 = Thunks::CreateDepthTransferPipeline as u32;
 }
 
 #[cfg(test)]

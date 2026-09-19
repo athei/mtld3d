@@ -74,6 +74,9 @@ const fn dispatch(code: Thunks) -> UnixCallFn {
         Thunks::StartGpuCapture => arp!(handlers::start_gpu_capture_handler),
         Thunks::StopGpuCapture => arp!(handlers::stop_gpu_capture_handler),
         Thunks::EnsureClearQuadPipeline => arp!(handlers::ensure_clear_quad_pipeline_handler),
+        Thunks::CreateDepthTransferPipeline => {
+            arp!(handlers::create_depth_transfer_pipeline_handler)
+        }
         Thunks::EnsureBlitPipeline => arp!(handlers::ensure_blit_pipeline_handler),
         Thunks::CreateTextureSliceView => arp!(handlers::create_texture_slice_view_handler),
         Thunks::GetTaskFaults => arp!(handlers::get_task_faults_handler),

@@ -5039,40 +5039,18 @@ struct DepthTextureCreateInfo {
     texture: *mut *mut c_void,
 }
 
-/// Sub-path of `device_create_texture` for depth-format textures (sampleable shadow maps).
+/// Create sampleable depth textures, optionally with packed dynamic staging.
 ///
-/// D3D9 accepts `CreateTexture(format=Dxx, usage=D3DUSAGE_DEPTHSTENCIL)`: the
-/// resulting texture is bindable as a depth attachment through
-/// `IDirect3DTexture9::GetSurfaceLevel` + `SetDepthStencilSurface` and
-/// sampleable in shaders. Without it, games that bump shadow quality silently
-/// fail to allocate shadow maps and the lit pass samples stale texture-slot
-/// contents (visible flicker). The colour mapping table `map_d3d_format`
-/// carries no depth entries, so a depth format routes through
-/// `map_d3d_depth_format` and this path instead. Usage 0 creates the same
-/// GPU-only resource for sampling and RESZ destinations, while its level
-/// surfaces cannot be bound as depth attachments.
+/// DEPTHSTENCIL textures can attach through their level surfaces. Plain
+/// textures are sampling/RESZ resources; their surface usage rejects attachment
+/// binds. DYNAMIC admits only D16, D24X8 and D24S8 plain DEFAULT-pool resources
+/// and retains packed CPU staging for each mip. Every other depth resource
+/// stays GPU-only. Color render-target usage and CPU pools remain rejected.
 ///
-/// Rejected with `D3DERR_INVALIDCALL`:
-/// - `pool` other than `D3DPOOL_DEFAULT`. Depth textures live on the GPU
-///   only.
-/// - `D3DUSAGE_DYNAMIC` and `D3DUSAGE_RENDERTARGET`: there is no CPU upload
-///   path, and the colour and depth usages are exclusive.
-/// - `D3DUSAGE_AUTOGENMIPMAP` with more than one requested level. The format
-///   probe answers `D3DOK_NOAUTOGEN`, so accepted requests receive one mip
-///   without generation, preserving the requested usage in their description.
-/// - A format with no `map_d3d_depth_format` entry.
-///
-/// `levels` follows the colour path's rule, through the shared
-/// [`resolve_create_levels`]: 0 requests the full chain down to one texel, and
-/// any other value is the level count, capped at that chain. An attachment
-/// texture's depth pyramid is written through `GetSurfaceLevel(n)` bound
-/// as depth. A plain texture can receive a RESZ copy at level zero; automatic
-/// generation and CPU uploads cannot fill its remaining levels.
-///
-/// The created texture has no PE-side staging buffer, so its per-level
-/// tracking arrays are sized from the level count rather than from the
-/// staging vector, and `LockRect` is rejected at the texture level (see
-/// `texture::texture_lock_rect`).
+/// Levels follow [`resolve_create_levels`], including full explicit chains.
+/// AUTOGEN is the existing NOAUTOGEN one-level fallback, with no native mip
+/// generation. Dynamic resources use logical dimensions, even at render.scale;
+/// RESZ transfers convert the attachment's physical extent when necessary.
 fn create_depth_texture_path(info: &DepthTextureCreateInfo) -> i32 {
     let DepthTextureCreateInfo {
         this,
@@ -5102,7 +5080,15 @@ fn create_depth_texture_path(info: &DepthTextureCreateInfo) -> i32 {
         null_out(texture);
         return D3DERR_INVALIDCALL;
     }
-    let bad_usage_bits = usage & (D3DUSAGE_DYNAMIC | D3DUSAGE_RENDERTARGET);
+    let dynamic = usage & D3DUSAGE_DYNAMIC != 0;
+    let dynamic_supported = mtld3d_core::depth_texture::PackedDepth::from_d3d(format).is_some()
+        && usage & D3DUSAGE_DEPTHSTENCIL == 0;
+    let bad_usage_bits = usage & D3DUSAGE_RENDERTARGET
+        | if dynamic && !dynamic_supported {
+            D3DUSAGE_DYNAMIC
+        } else {
+            0
+        };
     if bad_usage_bits != 0 {
         mtld3d_shared::log_once_warn_by!(
             target: crate::LOG_TARGET,
@@ -5168,8 +5154,8 @@ fn create_depth_texture_path(info: &DepthTextureCreateInfo) -> i32 {
     // Per-level dimensions so `GetLevelDesc` reports each mip, and a per-level
     // row pitch so `TextureInner::allocated_bytes` charges the chain on the
     // formula a colour chain is charged on: the host-visible stride of the
-    // level's width, not a tight one. There is no CPU staging behind a depth
-    // texture, so the pitch is a size and never a lock's stride. All three stay
+    // level's width, not a tight one. Dynamic depth also uses that pitch for
+    // packed CPU staging. All three stay
     // in the dimensions the application asked for, which is what `GetLevelDesc`
     // answers with; a chain rasterized at `render.scale` is charged at the
     // extent its Metal levels hold instead, which `allocated_bytes` measures
@@ -5191,7 +5177,20 @@ fn create_depth_texture_path(info: &DepthTextureCreateInfo) -> i32 {
     // Sized to the back buffer, this is the depth buffer for the main view and
     // has to keep matching the colour attachment it is bound with; any other
     // size is a shadow map with its own resolution.
-    let render_scale = obj.inner().scale_for_created_target(width, height, true);
+    let render_scale = if dynamic {
+        mtld3d_core::render_scale::RenderScale::IDENTITY
+    } else {
+        obj.inner().scale_for_created_target(width, height, true)
+    };
+    let staging = if dynamic {
+        mip_bytes_per_row
+            .iter()
+            .zip(&mip_heights)
+            .map(|(&pitch, &rows)| PageBox::new_zeroed(pitch as usize * rows as usize))
+            .collect()
+    } else {
+        Vec::new()
+    };
     let tex = Direct3DTexture9::new(TextureCreateInfo {
         texture_id: TextureId::new_unique(),
         device_handle: obj.inner().device_handle,
@@ -5212,7 +5211,7 @@ fn create_depth_texture_path(info: &DepthTextureCreateInfo) -> i32 {
         block_w: 1,
         block_h: 1,
         block_bytes: bytes_per_pixel,
-        staging: Vec::new(),
+        staging,
         mip_widths,
         mip_heights,
         mip_bytes_per_row,
@@ -6876,6 +6875,9 @@ impl SystemMemReadback {
 /// the texture-RT path and the released-staging refill.
 pub fn blit_handle_to_systemmem(device_inner: &DeviceInner, read: &SystemMemReadback) -> i32 {
     let mut params = BlitTextureToBufferParams {
+        planes: mtld3d_shared::mtl::ReadbackPlanes::Color,
+        stencil_bytes_per_row: 0,
+        stencil_offset: 0,
         queue_handle: device_inner.queue_handle(),
         device_handle: device_inner.device_handle(),
         tex_handle: read.tex_handle,
@@ -9554,7 +9556,7 @@ extern "system" fn device_set_render_state(this: *mut c_void, state: u32, value:
         } else {
             // SAFETY: a bound stage holds a live texture reference until it
             // is rebound or released, both on this thread.
-            let tex = unsafe { &*tex };
+            let tex = unsafe { &mut *tex };
             let inner = tex.inner();
             // The resolve is a texture-to-texture copy, so the destination is
             // measured where its Metal texture lives: a depth texture created
@@ -9566,10 +9568,22 @@ extern "system" fn device_set_render_state(this: *mut c_void, state: u32, value:
             if dev.frame_dump.active {
                 dev.frame_dump_event(&format!("RESZ resolve → {id:?} {w}x{h}"));
             }
-            dev.push_op(Box::new(move |enc| {
-                let dst = enc.get_texture_handle_by_id(id);
-                enc.resolve_depth_to_texture(dst, w, h);
-            }));
+            let dynamic_depth = inner.d3d_usage() & D3DUSAGE_DYNAMIC != 0 && tex.is_depth_format();
+            if dynamic_depth && dev.depth_stencil_bound() {
+                let inner = tex.inner_mut();
+                crate::texture::flush_dirty_mips(inner, dev);
+                let info = inner.texture_info();
+                inner.mark_subresource_gpu_authoritative(0, 0);
+                dev.push_op(Box::new(move |enc| {
+                    let dst = enc.get_texture_handle_by_id(id);
+                    enc.resolve_dynamic_depth(dst, &info);
+                }));
+            } else if !dynamic_depth {
+                dev.push_op(Box::new(move |enc| {
+                    let dst = enc.get_texture_handle_by_id(id);
+                    enc.resolve_depth_to_texture(dst, w, h);
+                }));
+            }
         }
     }
     if let Some(rec) = dev.recording_state_block_mut() {

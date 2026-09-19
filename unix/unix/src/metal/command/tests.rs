@@ -1217,3 +1217,146 @@ fn hdr_upscale_failure_reencodes_the_original_source() {
     crate::metal::upscale::retire_scalers(handle);
     crate::metal::upscale::retire_scratch(handle);
 }
+
+/// Invalid second-plane uploads must not publish the already encoded depth plane.
+#[test]
+fn depth_plane_failure_aborts_the_pair_and_retry_retains_sources() {
+    use mtld3d_shared::{BlitCommand, BlitCommandType, CopyBufferToTextureInfo};
+    use objc2_metal::{MTLBlitOption, MTLEvent};
+
+    let queue = test_queue();
+    let device = queue.device();
+    // SAFETY: a 2x1 private combined depth texture has one valid mip.
+    let desc = unsafe {
+        MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(
+            MTLPixelFormat::Depth32Float_Stencil8,
+            2,
+            1,
+            false,
+        )
+    };
+    desc.setStorageMode(MTLStorageMode::Private);
+    desc.setUsage(MTLTextureUsage::RenderTarget);
+    let texture = device
+        .newTextureWithDescriptor(&desc)
+        .expect("depth destination");
+    texture.setLabel(Some(&NSString::from_str("mtld3d-test-depth-pair")));
+    let color = upload_test_texture(&queue);
+    let readback = device
+        .newBufferWithLength_options(512, MTLResourceOptions::StorageModeShared)
+        .expect("plane readback");
+    readback.setLabel(Some(&NSString::from_str("mtld3d-test-depth-readback")));
+    let read = || {
+        let cb = queue.commandBuffer().expect("read command buffer");
+        cb.setLabel(Some(&NSString::from_str("mtld3d-test-depth-read")));
+        let blit = cb.blitCommandEncoder().expect("read encoder");
+        blit.setLabel(Some(&NSString::from_str("mtld3d-test-depth-read-planes")));
+        for (offset, plane) in [
+            (0, MTLBlitOption::DepthFromDepthStencil),
+            (256, MTLBlitOption::StencilFromDepthStencil),
+        ] {
+            // SAFETY: both 2x1 planes fit their disjoint aligned rows, retained until completion.
+            unsafe {
+                blit.copyFromTexture_sourceSlice_sourceLevel_sourceOrigin_sourceSize_toBuffer_destinationOffset_destinationBytesPerRow_destinationBytesPerImage_options(
+                    &texture, 0, 0, MTLOrigin { x: 0, y: 0, z: 0 }, MTLSize { width: 2, height: 1, depth: 1 },
+                    &readback, offset, 256, 256, plane,
+                );
+            }
+        }
+        blit.endEncoding();
+        cb.commit();
+        cb.waitUntilCompleted();
+        assert_eq!(cb.status(), MTLCommandBufferStatus::Completed);
+        // SAFETY: completion made the shared depth row CPU-visible.
+        let depths = unsafe { readback.contents().cast::<[f32; 2]>().read() };
+        let masks = readback
+            .contents()
+            .cast::<u8>()
+            .as_ptr()
+            .wrapping_add(256)
+            .cast::<[u8; 2]>();
+        // SAFETY: the completed stencil copy occupies the second aligned row.
+        let stencil = unsafe { masks.read() };
+        (depths, stencil)
+    };
+    for (generation, depths, stencil) in
+        [(0, [0.25f32, 0.75], [17u8, 239]), (1, [0.5, 1.0], [91, 75])]
+    {
+        let depth = device
+            .newBufferWithLength_options(256, MTLResourceOptions::StorageModeShared)
+            .expect("depth upload");
+        depth.setLabel(Some(&NSString::from_str("mtld3d-test-depth-upload")));
+        let masks = device
+            .newBufferWithLength_options(256, MTLResourceOptions::StorageModeShared)
+            .expect("stencil upload");
+        masks.setLabel(Some(&NSString::from_str("mtld3d-test-stencil-upload")));
+        // SAFETY: the fresh shared depth buffer holds two float values.
+        unsafe { depth.contents().cast::<[f32; 2]>().write(depths) };
+        // SAFETY: the fresh shared stencil buffer holds two stencil bytes.
+        unsafe { masks.contents().cast::<[u8; 2]>().write(stencil) };
+        let make = |buffer: &ProtocolObject<dyn MTLBuffer>, kind| {
+            let mut cmd = BlitCommand::copy_buffer_to_texture(&CopyBufferToTextureInfo {
+                buffer_handle: core::ptr::from_ref(buffer) as u64,
+                buffer_offset: 0,
+                bytes_per_row: 256,
+                texture_handle: core::ptr::from_ref(&*texture) as u64,
+                destination_slice: 0,
+                mip_level: 0,
+                origin_x: 0,
+                origin_y: 0,
+                region_w: 2,
+                region_h: 1,
+                depth: 1,
+                bytes_per_image: 256,
+            });
+            cmd.cmd = kind as u32;
+            cmd
+        };
+        let commands = [
+            make(&depth, BlitCommandType::CopyBufferToDepth),
+            make(&masks, BlitCommandType::CopyBufferToStencil),
+        ];
+        if generation != 0 {
+            for bad in 0..6 {
+                let mut rejected = commands;
+                match bad {
+                    0 => rejected[1].src_handle = 0,
+                    1 => rejected[1].dst_handle = 0,
+                    2 => rejected[1].mip_level = 1,
+                    3 => rejected[1].src_offset = 256,
+                    4 => rejected[1].region_w = 3,
+                    _ => rejected[1].dst_handle = core::ptr::from_ref(&*color) as u64,
+                }
+                let coherent = AtomicU64::new(0);
+                let upload = AtomicU64::new(0);
+                let failed = AtomicU64::new(0);
+                let mut params = test_submit_params(&queue, &coherent, &upload, &failed);
+                params.blit_commands_ptr = rejected.as_ptr() as u64;
+                params.blit_command_count = 2;
+                params.blit_commands_need_encoder = 1;
+                assert!(!submit_frame(&mut params), "invalid plane case {bad}");
+                assert_eq!(failed.load(Ordering::Acquire), params.submit_seq);
+                assert_eq!(coherent.load(Ordering::Acquire), params.submit_seq);
+                assert_eq!(read(), ([0.25, 0.75], [17, 239]));
+            }
+        }
+        let event = device.newSharedEvent().expect("completion gate");
+        event.setLabel(Some(&NSString::from_str("mtld3d-test-depth-gate")));
+        let cb = queue.commandBuffer().expect("upload command buffer");
+        cb.setLabel(Some(&NSString::from_str("mtld3d-test-depth-pair-upload")));
+        cb.encodeWaitForEvent_value(ProtocolObject::from_ref(&*event), 1);
+        assert!(super::encode_leading_blits(
+            &cb,
+            &commands,
+            true,
+            super::BlitSite::FrameLeading
+        ));
+        drop(depth);
+        drop(masks);
+        cb.commit();
+        event.setSignaledValue(1);
+        cb.waitUntilCompleted();
+        assert_eq!(cb.status(), MTLCommandBufferStatus::Completed);
+        assert_eq!(read(), (depths, stencil));
+    }
+}

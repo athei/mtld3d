@@ -25,6 +25,29 @@
 //! Option<Self>` from `strum::FromRepr`. Never cast, never transmute.
 
 use bitflags::bitflags;
+
+/// Concrete depth extraction kernel, selected from the source texture's planes and samples.
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DepthTransferKind {
+    Depth = 0,
+    DepthStencil = 1,
+    MultisampleDepth = 2,
+    MultisampleDepthStencil = 3,
+}
+
+/// Native planes returned by one texture readback submission.
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReadbackPlanes {
+    /// The format's ordinary color layout.
+    Color = 0,
+    /// Float32 depth only.
+    Depth = 1,
+    /// Float32 depth followed by an independently pitched byte stencil plane.
+    DepthStencil = 2,
+}
+
 use strum::FromRepr;
 
 /// `MTLStorageMode` wire encoding. Matches the native Metal enum values.
@@ -508,6 +531,7 @@ pub enum DestroyKind {
     ShaderFunction = 4,
     SamplerState = 5,
     DepthStencilState = 6,
+    ComputePipeline = 7,
 }
 
 /// `MTLTextureSwizzle` wire encoding for per-channel texture-view swizzles.

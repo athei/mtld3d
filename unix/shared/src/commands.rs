@@ -622,6 +622,16 @@ pub enum BlitCommandType {
     /// frame-leading blit encoder. `dst_handle` = `MTLTexture`. All
     /// other fields unused.
     GenerateMipmaps = 5,
+    /// A float32 buffer copied into the destination depth plane.
+    CopyBufferToDepth = 6,
+    /// A byte buffer copied into a combined texture's stencil plane.
+    CopyBufferToStencil = 7,
+    /// Sample-zero depth/stencil extraction and nearest transfer between textures.
+    ///
+    /// Source/destination handles are textures; `src_offset` is the typed compute
+    /// pipeline's raw handle. Mip fields select endpoints. Region fields carry
+    /// destination extent. Other fields are zero.
+    TransferDepth = 8,
 }
 
 /// Fixed-size blit command struct.

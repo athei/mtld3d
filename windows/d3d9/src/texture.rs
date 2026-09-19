@@ -522,7 +522,7 @@ impl TextureInner {
     /// A cube addresses its six faces through the sidecar; every other texture
     /// kind keeps one allocation per level and ignores `face`. `None` when the
     /// subresource carries no staging at all, which is the case for a
-    /// depth-format texture's levels.
+    /// GPU-only depth texture's levels.
     fn subresource_staging_backing(&self, face: u32, level: usize) -> Option<(u64, usize)> {
         let page = match self.cube.as_deref() {
             Some(cube) => cube
@@ -2500,8 +2500,17 @@ impl TextureInner {
         let coherent_seq = self.staging_coherent_seq(level);
         let contended = is_in_flight(self.last_submit_seq[level], coherent_seq)
             || self.staging[level].has_readers();
-        let action =
-            decide_lock_action(contended, flags, self.d3d_pool, rect, self.mip_shape(level));
+        let action = if contended && self.flags.contains(TextureFlags::DEPTH_FORMAT) {
+            LockAction::FreshBox {
+                preserve: if flags & D3DLOCK_DISCARD == 0 {
+                    PreserveKind::Cpu
+                } else {
+                    PreserveKind::None
+                },
+            }
+        } else {
+            decide_lock_action(contended, flags, self.d3d_pool, rect, self.mip_shape(level))
+        };
 
         let base: *mut u8 = match action {
             LockAction::WriteInPlace => {
@@ -3723,7 +3732,13 @@ fn materialize_subresource_from_gpu(ti: &mut TextureInner, face: u32, level: usi
              read-back → materialization failed");
         return false;
     }
+    if let Some(format) = mtld3d_core::depth_texture::PackedDepth::from_d3d(ti.d3d_format) {
+        return materialize_depth_planes(ti, level, handle, &format);
+    }
     let mut params = BlitTextureToBufferParams {
+        planes: mtld3d_shared::mtl::ReadbackPlanes::Color,
+        stencil_bytes_per_row: 0,
+        stencil_offset: 0,
         queue_handle: dev.queue_handle(),
         device_handle: dev.device_handle(),
         // SAFETY: `handle` is non-zero (checked above) and a live retained
@@ -3763,6 +3778,74 @@ fn materialize_subresource_from_gpu(ti: &mut TextureInner, face: u32, level: usi
     true
 }
 
+/// Recover both native planes with one submission and publish fresh packed staging.
+fn materialize_depth_planes(
+    ti: &mut TextureInner,
+    level: usize,
+    handle: u64,
+    format: &mtld3d_core::depth_texture::PackedDepth,
+) -> bool {
+    let Some(layout) = mtld3d_core::depth_texture::PlaneLayout::new(
+        ti.mip_width(level),
+        ti.mip_height(level),
+        256,
+    ) else {
+        log::error!(target: crate::LOG_TARGET, "depth readback: invalid plane geometry");
+        return false;
+    };
+    let depth_len = layout.depth_pitch * layout.height;
+    let stencil_len = if format.has_stencil() {
+        layout.stencil_pitch * layout.height
+    } else {
+        0
+    };
+    let Some(length) = depth_len.checked_add(stencil_len) else {
+        log::error!(target: crate::LOG_TARGET, "depth readback: plane allocation overflow");
+        return false;
+    };
+    let mut planes = PageBox::new_zeroed(length);
+    let dev = DeviceInner::from_ptr(ti.device_inner);
+    let mut params = BlitTextureToBufferParams {
+        planes: if format.has_stencil() {
+            mtld3d_shared::mtl::ReadbackPlanes::DepthStencil
+        } else {
+            mtld3d_shared::mtl::ReadbackPlanes::Depth
+        },
+        stencil_bytes_per_row: u32::try_from(layout.stencil_pitch)
+            .expect("depth texture pitch fits u32"),
+        stencil_offset: depth_len as u64,
+        queue_handle: dev.queue_handle(),
+        device_handle: dev.device_handle(),
+        // SAFETY: the caller resolved this live texture handle after draining the encoder.
+        tex_handle: unsafe { MetalHandle::new(handle) },
+        dst_ptr: planes.as_mut_ptr() as u64,
+        dst_len: planes.len() as u64,
+        mip_level: u32::try_from(level).expect("D3D mip index fits u32"),
+        slice: 0,
+        origin_x: 0,
+        origin_y: 0,
+        width: ti.mip_width(level),
+        height: ti.mip_height(level),
+        bytes_per_row: u32::try_from(layout.depth_pitch).expect("depth texture pitch fits u32"),
+        source_width: ti.mip_width(0),
+        source_height: ti.mip_height(0),
+        block_height: 1,
+    };
+    if unix_call(&mut params) != 0 {
+        log::error!(target: crate::LOG_TARGET, "depth readback: native plane copy failed");
+        return false;
+    }
+    let pitch = ti.mip_bytes_per_row(level) as usize;
+    ti.rename_staging(level, PreserveKind::None);
+    let packed = Arc::get_mut(&mut ti.staging[level]).expect("renamed staging is unique");
+    let (depth, stencil) = planes.as_slice().split_at(depth_len);
+    if !layout.pack(format, depth, stencil, packed.as_mut_slice(), pitch) {
+        log::error!(target: crate::LOG_TARGET, "depth readback: packed destination bounds failed");
+        return false;
+    }
+    true
+}
+
 extern "system" fn texture_lock_rect(
     this: *mut c_void,
     level: u32,
@@ -3796,7 +3879,7 @@ extern "system" fn texture_lock_rect(
     // LockRect on D3DUSAGE_DEPTHSTENCIL textures unless the depth format
     // is one of the LOCKABLE variants — mtld3d doesn't expose those, so any
     // LockRect on a depth texture is a real error to surface.
-    if ti.flags.contains(TextureFlags::DEPTH_FORMAT) {
+    if ti.flags.contains(TextureFlags::DEPTH_FORMAT) && ti.d3d_usage & D3DUSAGE_DYNAMIC == 0 {
         mtld3d_shared::log_once_warn!(
             target: crate::LOG_TARGET,
             "reject IDirect3DTexture9::LockRect on depth-format texture → INVALIDCALL"
@@ -3930,6 +4013,11 @@ extern "system" fn texture_unlock_rect(this: *mut c_void, level: u32) -> i32 {
     // it only triggers the one-time initial upload below.
     if !read_only && !no_dirty {
         ti.mark_update_dirty(level_u, lock_rect);
+    }
+    // Dynamic depth keeps explicit dirty updates: a no-dirty write changes only
+    // its retained packed staging, until a later dirty write publishes it.
+    if no_dirty && ti.flags.contains(TextureFlags::DEPTH_FORMAT) {
+        return D3D_OK;
     }
     // Lazy upload: flag the mip dirty and return. Bind-time
     // `flush_dirty_mips` dispatches the actual upload via
