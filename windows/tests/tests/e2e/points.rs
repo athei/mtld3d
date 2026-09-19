@@ -599,3 +599,120 @@ fn point_sprite_replaces_programmable_ps_texcoords() {
     });
     assert_sprite_quadrants(&h, "ps_2_0 sprite");
 }
+
+#[test]
+fn a2m_and_resz_preserve_numeric_point_size() {
+    let h = Harness::new();
+    arm_diffuse(&h);
+    set_float_rs(&h, D3DRS_POINTSIZE, 32.0);
+    for token in [
+        mtld3d_types::D3DFMT_A2M1,
+        mtld3d_types::D3DFMT_A2M0,
+        0x7fa0_5000,
+    ] {
+        assert_eq!(h.set_render_state(D3DRS_POINTSIZE, token), 0);
+        assert_eq!(h.render_state(D3DRS_POINTSIZE), token);
+        assert_point_extent(&h, 12, 20, "control preserves numeric 32");
+        assert_eq!(h.set_clip_plane(0, [1.0, 0.0, 0.0, 1.0]), 0);
+        assert_point_extent(&h, 12, 20, "unrelated uniform rebuild preserves numeric 32");
+    }
+    set_float_rs(&h, D3DRS_POINTSIZE, 8.0);
+    assert_point_extent(&h, 2, 7, "numeric writes still update size");
+    assert_eq!(
+        h.set_render_state(D3DRS_POINTSIZE, mtld3d_types::D3DFMT_A2M1),
+        0
+    );
+    assert_eq!(h.reset(640, 480), 0);
+    arm_diffuse(&h);
+    assert_point_extent(&h, 0, 3, "Reset restores numeric 1");
+}
+
+#[test]
+fn a2m_state_blocks_restore_numeric_size_behind_raw_controls() {
+    let h = Harness::new();
+    arm_diffuse(&h);
+    for block_type in [
+        mtld3d_types::D3DSBT_ALL,
+        mtld3d_types::D3DSBT_VERTEXSTATE,
+        mtld3d_types::D3DSBT_PIXELSTATE,
+    ] {
+        set_float_rs(&h, D3DRS_POINTSIZE, 32.0);
+        assert_eq!(
+            h.set_render_state(D3DRS_POINTSIZE, mtld3d_types::D3DFMT_A2M1),
+            0
+        );
+        let block = h.create_state_block(block_type);
+        set_float_rs(&h, D3DRS_POINTSIZE, 8.0);
+        assert_eq!(block.apply(), 0);
+        if block_type == mtld3d_types::D3DSBT_PIXELSTATE {
+            assert_point_extent(&h, 2, 7, "pixel block leaves numeric 8");
+        } else {
+            assert_point_extent(&h, 12, 20, "vertex/all block restores hidden numeric 32");
+        }
+        set_float_rs(&h, D3DRS_POINTSIZE, 16.0);
+        assert_eq!(
+            h.set_render_state(D3DRS_POINTSIZE, mtld3d_types::D3DFMT_A2M1),
+            0
+        );
+        assert_eq!(block.capture(), 0);
+        set_float_rs(&h, D3DRS_POINTSIZE, 8.0);
+        assert_eq!(block.apply(), 0);
+        if block_type == mtld3d_types::D3DSBT_PIXELSTATE {
+            assert_point_extent(&h, 2, 7, "pixel Capture still excludes numeric size");
+        } else {
+            assert_point_extent(&h, 5, 12, "Capture refreshes hidden numeric 16");
+        }
+    }
+    // Capture updates only membership: a control-only recording cannot start
+    // restoring numeric size when its refreshed raw value happens to be numeric.
+    assert_eq!(h.begin_state_block(), 0);
+    assert_eq!(
+        h.set_render_state(D3DRS_POINTSIZE, mtld3d_types::D3DFMT_A2M1),
+        0
+    );
+    let control = h.end_state_block();
+    set_float_rs(&h, D3DRS_POINTSIZE, 32.0);
+    assert_eq!(control.capture(), 0);
+    set_float_rs(&h, D3DRS_POINTSIZE, 8.0);
+    assert_eq!(control.apply(), 0);
+    assert_eq!(h.render_state(D3DRS_POINTSIZE), 32.0f32.to_bits());
+    assert_point_extent(&h, 2, 7, "control-only Capture leaves live numeric 8");
+    set_float_rs(&h, D3DRS_POINTSIZE, 32.0);
+    assert_point_extent(&h, 12, 20, "same raw numeric write dirties hidden size");
+    // Numeric membership survives Capture while the raw DWORD is a control.
+    assert_eq!(h.begin_state_block(), 0);
+    set_float_rs(&h, D3DRS_POINTSIZE, 8.0);
+    let numeric = h.end_state_block();
+    set_float_rs(&h, D3DRS_POINTSIZE, 32.0);
+    assert_eq!(
+        h.set_render_state(D3DRS_POINTSIZE, mtld3d_types::D3DFMT_A2M1),
+        0
+    );
+    assert_eq!(numeric.capture(), 0);
+    set_float_rs(&h, D3DRS_POINTSIZE, 8.0);
+    assert_eq!(numeric.apply(), 0);
+    assert_point_extent(
+        &h,
+        12,
+        20,
+        "numeric-only Capture restores numeric 32 behind token",
+    );
+}
+
+#[test]
+fn a2m_recorded_resz_capture_excludes_numeric_size() {
+    let h = Harness::new();
+    arm_diffuse(&h);
+    assert_eq!(h.begin_state_block(), 0);
+    assert_eq!(h.set_render_state(D3DRS_POINTSIZE, 0x7fa0_5000), 0);
+    let resz = h.end_state_block();
+    for raw in [mtld3d_types::D3DFMT_A2M1, 32.0f32.to_bits()] {
+        set_float_rs(&h, D3DRS_POINTSIZE, 32.0);
+        assert_eq!(h.set_render_state(D3DRS_POINTSIZE, raw), 0);
+        assert_eq!(resz.capture(), 0);
+        set_float_rs(&h, D3DRS_POINTSIZE, 8.0);
+        assert_eq!(resz.apply(), 0);
+        assert_eq!(h.render_state(D3DRS_POINTSIZE), raw);
+        assert_point_extent(&h, 2, 7, "RESZ Capture cannot acquire numeric membership");
+    }
+}

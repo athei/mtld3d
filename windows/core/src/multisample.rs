@@ -202,16 +202,40 @@ pub const fn mask_applies(multi_sample_type: u32) -> bool {
     multi_sample_type > D3DMULTISAMPLE_NONMASKABLE
 }
 
-/// Whether the portable ATOC render-state request is enabled.
+/// Whether either explicit alpha-to-coverage request is enabled.
 ///
 /// Coverage replaces alpha testing only on a multisampled render target;
 /// the encoder resolves that attachment-dependent half when it builds the draw.
 #[must_use]
 pub const fn alpha_to_coverage_requested(
     render_states: &[u32; mtld3d_types::RENDER_STATE_COUNT],
+    a2m_enabled: bool,
 ) -> bool {
-    render_states[mtld3d_types::D3DRS_ADAPTIVETESS_Y as usize] == mtld3d_types::D3DFMT_ATOC
-        && render_states[mtld3d_types::D3DRS_ALPHATESTENABLE as usize] != 0
+    a2m_enabled
+        || render_states[mtld3d_types::D3DRS_ADAPTIVETESS_Y as usize] == mtld3d_types::D3DFMT_ATOC
+            && render_states[mtld3d_types::D3DRS_ALPHATESTENABLE as usize] != 0
+}
+
+/// A POINTSIZE control changes only the independent A2M latch.
+#[must_use]
+pub const fn a2m_control(value: u32) -> Option<bool> {
+    match value {
+        mtld3d_types::D3DFMT_A2M1 => Some(true),
+        mtld3d_types::D3DFMT_A2M0 => Some(false),
+        _ => None,
+    }
+}
+
+/// Numeric point size supplied by a POINTSIZE write, excluding driver controls.
+///
+/// A2M controls and the RESZ command preserve the last numeric size. Raw
+/// render-state storage still retains each DWORD for `GetRenderState`.
+#[must_use]
+pub const fn numeric_point_size(value: u32) -> Option<u32> {
+    match value {
+        mtld3d_types::D3DFMT_A2M1 | mtld3d_types::D3DFMT_A2M0 | 0x7fa0_5000 => None,
+        _ => Some(value),
+    }
 }
 
 #[cfg(test)]

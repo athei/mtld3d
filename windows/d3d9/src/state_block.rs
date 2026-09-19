@@ -58,6 +58,12 @@ static DIRECT3D_STATE_BLOCK9_VTBL: IDirect3DStateBlock9Vtbl = IDirect3DStateBloc
 /// [`CachedComPtr::raw`] — the live setter does its own AddRef/Release
 /// dance, so refcounts stay balanced.
 pub enum StateOp {
+    /// Raw POINTSIZE plus the numeric/latch components this operation includes.
+    PointSize {
+        raw: u32,
+        numeric: Option<u32>,
+        coverage: Option<bool>,
+    },
     RenderState {
         state: u32,
         value: u32,
@@ -176,6 +182,19 @@ impl RecordingStateBlock {
     fn capture_from(&mut self, dev: &DeviceInner) {
         for op in &mut self.ops {
             match op {
+                StateOp::PointSize {
+                    raw,
+                    numeric,
+                    coverage,
+                } => {
+                    *raw = dev.render_state(mtld3d_types::D3DRS_POINTSIZE as usize);
+                    if let Some(size) = numeric {
+                        *size = dev.point_size();
+                    }
+                    if let Some(enabled) = coverage {
+                        *enabled = dev.a2m_enabled();
+                    }
+                }
                 StateOp::RenderState { state, value } => {
                     *value = dev.render_state(*state as usize);
                 }
@@ -348,6 +367,13 @@ impl RecordingStateBlock {
     fn apply_to(&self, dev: &mut DeviceInner) {
         for op in &self.ops {
             match op {
+                StateOp::PointSize {
+                    raw,
+                    numeric,
+                    coverage,
+                } => {
+                    dev.set_point_size_state(*raw, *numeric, *coverage);
+                }
                 StateOp::RenderState { state, value } => {
                     dev.set_render_state(*state as usize, *value);
                 }
@@ -570,6 +596,8 @@ struct StateSnapshot {
     block_type: StateBlockType,
     fvf: u32,
     render_states: [u32; RENDER_STATE_COUNT],
+    point_size: u32,
+    a2m_enabled: bool,
     sampler_states: [[u32; SAMPLER_STATE_COUNT]; STAGE_COUNT],
     fetch4_enabled: u16,
     vertex_sampler_states: [[u32; SAMPLER_STATE_COUNT]; 4],
@@ -655,6 +683,8 @@ impl StateSnapshot {
             block_type,
             fvf,
             render_states: *dev.render_states(),
+            point_size: dev.point_size(),
+            a2m_enabled: dev.a2m_enabled(),
             sampler_states: capture_sampler_states(dev),
             vertex_sampler_states: capture_vertex_sampler_states(dev),
             fetch4_enabled: dev.stage_bindings().fetch4().enabled(),
@@ -700,6 +730,14 @@ impl StateSnapshot {
             if block_type.includes_render_state(rs) {
                 dev.set_render_state(rs as usize, v);
             }
+        }
+
+        if block_type.includes_vertex_pipeline() {
+            dev.set_point_size_state(
+                self.render_states[mtld3d_types::D3DRS_POINTSIZE as usize],
+                Some(self.point_size),
+                Some(self.a2m_enabled),
+            );
         }
 
         // Sampler states — per-type membership, every stage.

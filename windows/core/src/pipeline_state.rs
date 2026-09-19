@@ -31,7 +31,7 @@ bitflags::bitflags! {
     pub struct PipelineRsFlags: u8 {
         const BLEND_ENABLE = 1 << 0;
         const SEPARATE_ALPHA_BLEND = 1 << 1;
-        /// ATOC plus alpha test enabled; effective only on multisampled targets.
+        /// ATOC plus alpha test or the A2M latch; effective only on MSAA targets.
         const ALPHA_TO_COVERAGE = 1 << 2;
     }
 }

@@ -315,6 +315,8 @@ bitflags::bitflags! {
         /// already captured and is about to release, so the resize path
         /// checks this and stands down.
         const RELEASING = 1 << 3;
+        /// Independent coverage request controlled only by A2M1/A2M0.
+        const A2M_ENABLED = 1 << 4;
     }
 }
 
@@ -556,6 +558,8 @@ pub struct DeviceInner {
     /// decides a per-call answer.
     config: Arc<Mtld3dConfig>,
     render_states: [u32; RENDER_STATE_COUNT],
+    /// Last numeric POINTSIZE, preserved across A2M and RESZ controls.
+    point_size: u32,
     /// Per-slot "have we warned about this unsupported RS write yet?" latch.
     ///
     /// Bit-packed one bit per RS index (`[u64; 4]` covers all 210 slots in
@@ -2226,12 +2230,19 @@ impl DeviceInner {
         self.render_states[index]
     }
 
-    /// Returns whether the stored value actually changed.
+    /// Returns whether raw or derived state changed.
     ///
-    /// Callers gate `mark_snapshot_dirty` on this: a same-value write
-    /// produces a byte-identical `RenderStateSnapshot`/FF key, so re-marking
-    /// the snapshot dirty would force an identical rebuild on the next draw.
+    /// Callers gate `mark_snapshot_dirty` on this. POINTSIZE also compares
+    /// its numeric value and coverage latch: a state-block restore can leave
+    /// either different from the component a same-raw write would select.
     pub fn set_render_state(&mut self, index: usize, value: u32) -> bool {
+        if index == D3DRS_POINTSIZE as usize {
+            return self.set_point_size_state(
+                value,
+                mtld3d_core::multisample::numeric_point_size(value),
+                mtld3d_core::multisample::a2m_control(value),
+            );
+        }
         self.warn_rs_non_default_once(index, value);
         let prev = self.render_states[index];
         self.render_states[index] = value;
@@ -2278,6 +2289,38 @@ impl DeviceInner {
             if !bits.is_empty() {
                 self.ff_state.mark_ff_vs_dirty(bits);
             }
+        }
+        changed
+    }
+
+    pub const fn point_size(&self) -> u32 {
+        self.point_size
+    }
+
+    pub const fn a2m_enabled(&self) -> bool {
+        self.flags.contains(DeviceFlags::A2M_ENABLED)
+    }
+
+    /// Restore raw POINTSIZE and only the hidden components included by the caller.
+    ///
+    /// Recorded Capture retains membership separately from the raw value, so
+    /// a refreshed numeric DWORD cannot erase a captured latch or vice versa.
+    pub fn set_point_size_state(
+        &mut self,
+        raw: u32,
+        numeric: Option<u32>,
+        coverage: Option<bool>,
+    ) -> bool {
+        self.warn_rs_non_default_once(D3DRS_POINTSIZE as usize, raw);
+        let mut changed = self.render_states[D3DRS_POINTSIZE as usize] != raw;
+        self.render_states[D3DRS_POINTSIZE as usize] = raw;
+        if let Some(size) = numeric {
+            changed |= self.point_size != size;
+            self.point_size = size;
+        }
+        if let Some(enabled) = coverage {
+            changed |= self.a2m_enabled() != enabled;
+            self.flags.set(DeviceFlags::A2M_ENABLED, enabled);
         }
         changed
     }
@@ -2399,6 +2442,8 @@ impl DeviceInner {
 
         self.fvf = 0;
         self.render_states = render_state_defaults();
+        self.point_size = self.render_states[D3DRS_POINTSIZE as usize];
+        self.flags.remove(DeviceFlags::A2M_ENABLED);
         self.ff_state = FfState::new();
         // Reset abandons any open scene; a following EndScene must fail.
         self.flags.remove(DeviceFlags::IN_SCENE);
@@ -2906,6 +2951,7 @@ impl Direct3DDevice9 {
             pending_retention_bytes: 0,
             retention_cap_bytes: info.config.vbib_retention_cap_bytes,
             config: info.config,
+            point_size: info.render_states[D3DRS_POINTSIZE as usize],
             render_states: info.render_states,
             rs_warn_fired: [0; RENDER_STATE_COUNT.div_ceil(64)],
             ff_state: FfState::new(),
@@ -9600,11 +9646,18 @@ extern "system" fn device_set_render_state(this: *mut c_void, state: u32, value:
         }
     }
     if let Some(rec) = dev.recording_state_block_mut() {
-        rec.record(StateOp::RenderState { state, value });
+        if state == D3DRS_POINTSIZE {
+            rec.record(StateOp::PointSize {
+                raw: value,
+                numeric: mtld3d_core::multisample::numeric_point_size(value),
+                coverage: mtld3d_core::multisample::a2m_control(value),
+            });
+        } else {
+            rec.record(StateOp::RenderState { state, value });
+        }
         return D3D_OK;
     }
-    // Redundant-set elimination: a write that doesn't change the stored
-    // value yields a byte-identical snapshot, so skip the dirty mark.
+    // Skip the dirty mark only when raw and derived state are unchanged.
     let changed = dev.set_render_state(state as usize, value);
     if changed {
         let mut mask = dev.ff_aware_mask(rs_dirty_mask(state));
@@ -11113,7 +11166,7 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
         );
         prs_flags.set(
             PipelineRsFlags::ALPHA_TO_COVERAGE,
-            mtld3d_core::multisample::alpha_to_coverage_requested(rs),
+            mtld3d_core::multisample::alpha_to_coverage_requested(rs, dev.a2m_enabled()),
         );
         let pipeline_rs = PipelineRsBits {
             flags: prs_flags,
@@ -11494,6 +11547,7 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
             .unwrap_or(D3DMATRIX::IDENTITY);
         Some(mtld3d_core::vs_draw::build_vs_draw_bytes(
             rs,
+            dev.point_size(),
             &view,
             dev.clip_planes(),
         ))
