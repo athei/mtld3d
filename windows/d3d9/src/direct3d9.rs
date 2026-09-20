@@ -310,10 +310,13 @@ const fn is_present_compatible(src: u32, dst: u32) -> bool {
 /// Formats `StretchRect` can read as the source of a format conversion.
 ///
 /// The render-quad path samples any colour format the device can render and
-/// decodes the two packed 4:2:2 YUV formats (`YUY2` / `UYVY`) in its fragment
-/// function; the offscreen-plain CPU converter covers the same set.
+/// decodes the packed 4:2:2 (`YUY2` / `UYVY`) and planar 4:2:0 (`YV12` /
+/// `NV12`) YUV formats in its fragment function; the offscreen-plain CPU
+/// converter covers the YUV members too.
 const fn is_conversion_source(fmt: u32) -> bool {
-    mtld3d_core::format::is_render_target_format(fmt) || matches!(fmt, D3DFMT_YUY2 | D3DFMT_UYVY)
+    mtld3d_core::format::is_render_target_format(fmt)
+        || mtld3d_core::stretch_rect::is_packed_yuv(fmt)
+        || mtld3d_core::stretch_rect::is_planar_yuv(fmt)
 }
 
 /// `CheckDeviceFormatConversion`: whether `StretchRect` converts `src` into `dst`.
@@ -341,7 +344,9 @@ fn is_format_conversion_supported(src: u32, dst: u32, expand_packed16: bool) -> 
 // callers that probe first (every engine that picks a scene format from
 // `CheckDeviceFormat`) take a fallback path for a format we support. That
 // covers the odd ones deliberately: YUY2/UYVY back a creatable, lockable RG8
-// surface with no YUV sampling, and ATI1 is a creatable BC4 texture.
+// surface with no YUV sampling, and ATI1 is a creatable BC4 texture. The planar
+// YUV pair is the exception in the other direction: it has no mapping, so it
+// is no texture, and `is_plain_surface_format` admits it as a surface alone.
 //
 // The FOURCC sampleable-depth formats (`INTZ` / `DF24` / `DF16`) belong here
 // too, and are not colour mappings: D3D9-era engines (incl. WoW's CSM path)
@@ -355,6 +360,15 @@ const fn is_texture_format(fmt: u32) -> bool {
     // advertising it would hand callers a pitch they cannot use.
     (mtld3d_core::format::is_mapped_color_format(fmt) && !matches!(fmt, D3DFMT_ATI1))
         || mtld3d_core::format::is_raw_depth_fetch_format(fmt)
+}
+
+/// Formats `CreateOffscreenPlainSurface` accepts, the `D3DRTYPE_SURFACE` answer without usage.
+///
+/// Every texture format, plus the planar 4:2:0 YUV pair, which exists as a
+/// default-pool offscreen plain surface only: a lockable `StretchRect` source
+/// with no sampling path, so every texture-typed query for it stays refused.
+const fn is_plain_surface_format(fmt: u32) -> bool {
+    is_texture_format(fmt) || mtld3d_core::stretch_rect::is_planar_yuv(fmt)
 }
 
 /// Sampleable cube colour formats backed by `MTLTextureTypeCube`.
@@ -1034,6 +1048,8 @@ extern "system" fn d3d9_check_device_format(
         // — only formats with an MTLPixelFormat sRGB twin succeed.
         if usage & D3DUSAGE_QUERY_SRGBREAD != 0 && !has_srgb_read_decode(check_format) {
             false
+        } else if rtype == D3DRTYPE_SURFACE {
+            is_plain_surface_format(check_format)
         } else {
             is_texture_format(check_format)
         }
