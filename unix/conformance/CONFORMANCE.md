@@ -1035,20 +1035,22 @@ feasible nor desirable. No capability involved (old `caps` tag incoherent).
 The `@mac2` legs count three, not two: the paravirtual device encodes one
 more instruction's result its own way.
 
-### visual.c/float_texture_test, g16r16_texture_test, test_mipmap_autogen, test_signed_formats
-Sites: 5090=expected 5169=expected 6034=expected 20702=expected
+### visual.c/float_texture_test, g16r16_texture_test, test_mipmap_autogen, test_signed_formats, volume_v16u16_test
+Sites: 5090=expected 5169=expected 6034=expected 18787=expected
+Sites: 18790=expected 18793=expected 18796=expected 20702=expected
 Sites: 20751=expected
 
 `@mac2` legs only, one mechanism. Every format whose D3D9 sample fills a
 lane the Metal format lacks (R32F's green and blue, G16R16's alpha, V8U8's
-blue and alpha, X8R8G8B8's alpha, L8's green and blue) is handed out as a
+and V16U16's blue and alpha, X8R8G8B8's alpha, L8's green and blue) is handed out as a
 texture view with a channel swizzle. The paravirtual device on the Intel CI
 image creates that view, reports the swizzle on it, and samples through the
 base texture's lanes anyway, measured in the workflow's probe job; every
 real GPU family applies the swizzle. So R32F reads its missing lanes as
-zero (5090), G16R16 its alpha as zero (5169), V8U8 its blue as the stored
-byte (20702, 20751), and the autogen X8R8G8B8 chain its padding byte as
-alpha (6034). A device limitation with no D3D9-side answer, so `expected`;
+zero (5090), G16R16 its alpha as zero (5169), V8U8 and V16U16 their blue
+as a stored lane (20702 and 20751, which count both formats' rows, and the
+four V16U16 volume probes 18787, 18790, 18793 and 18796), and the autogen
+X8R8G8B8 chain its padding byte as alpha (6034). A device limitation with no D3D9-side answer, so `expected`;
 none of these fire on the Apple family, and a real Intel/AMD Mac is expected
 to read zero here.
 
@@ -1310,3 +1312,12 @@ capability guards. Its individual cases still check TextureOpCaps. Raw
 D3DTSS_CONSTANT defaults remain zero, as device.c:7746 asserts. ALL and
 recorded stateblocks retain the value; this feature preserves the existing
 PIXEL preset exclusion rather than changing capture policy.
+
+### visual.c/volume_v16u16_test and test_signed_formats
+
+V16U16 textures use native RG16Snorm storage, with missing blue and alpha
+set to one. The signed-format and volume tests run through the same native
+byte uploads as other mapped formats. 2D and cube AUTOGEN requests answer
+D3DOK_NOAUTOGEN and create one actual level with the public usage retained;
+no mip-generation work is submitted. Render-target and sRGB queries remain
+unavailable. Other signed formats remain separate capabilities.

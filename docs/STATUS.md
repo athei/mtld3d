@@ -20,6 +20,9 @@ divergences from D3D9 it keeps on purpose. The tested games are in the
 - Every draw call and primitive type, point sprites, user clip planes, all
   sixteen vertex streams, hardware instancing.
 - State blocks, occlusion and event queries.
+- Signed V16U16 textures use native 16-bit U/V storage across 2D, cube and
+  volume resources. AUTOGEN requests on 2D/cube use the one-level NOAUTOGEN
+  fallback; render-target and sRGB usages remain unavailable.
 - Compressed (DXT1 to DXT5, ATI1), integer and float formats, cube and volume
   textures, auto-generated mipmaps, `StretchRect` with format conversion and
   YUV decoding, `GetDC`.

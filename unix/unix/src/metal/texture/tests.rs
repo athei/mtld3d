@@ -19,7 +19,7 @@ use super::{
 };
 
 /// Every wire pixel format, in declaration order.
-const ALL: [PixelFormat; 29] = [
+const ALL: [PixelFormat; 30] = [
     PixelFormat::A8Unorm,
     PixelFormat::R8Unorm,
     PixelFormat::R16Unorm,
@@ -30,6 +30,7 @@ const ALL: [PixelFormat; 29] = [
     PixelFormat::Abgr4Unorm,
     PixelFormat::Bgr5A1Unorm,
     PixelFormat::Rg16Unorm,
+    PixelFormat::Rg16Snorm,
     PixelFormat::R32Float,
     PixelFormat::Rg16Float,
     PixelFormat::Rgba8Unorm,
@@ -86,8 +87,8 @@ fn only_uncompressed_colour_formats_are_resolvable() {
         .collect();
     assert_eq!(
         resolvable.len(),
-        20,
-        "20 uncompressed colour formats: {resolvable:?}"
+        21,
+        "21 uncompressed colour formats: {resolvable:?}"
     );
     assert!(!is_resolvable_color_format(PixelFormat::Bc1Rgba));
     assert!(!is_resolvable_color_format(PixelFormat::Bc4RUnorm));

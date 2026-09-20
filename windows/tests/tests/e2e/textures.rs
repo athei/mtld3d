@@ -10,15 +10,15 @@ use mtld3d_types::{
     D3DBLEND_INVSRCALPHA, D3DBLEND_SRCALPHA, D3DBLEND_ZERO, D3DBOX, D3DERR_INVALIDCALL,
     D3DFMT_A1R5G5B5, D3DFMT_A4R4G4B4, D3DFMT_A8, D3DFMT_A8B8G8R8, D3DFMT_A8R8G8B8, D3DFMT_ATI1,
     D3DFMT_DXT1, D3DFMT_DXT5, D3DFMT_INTZ, D3DFMT_L8, D3DFMT_R5G6B5, D3DFMT_R8G8B8, D3DFMT_UYVY,
-    D3DFMT_V8U8, D3DFMT_X1R5G5B5, D3DFMT_X8B8G8R8, D3DFMT_X8R8G8B8, D3DFMT_YUY2, D3DFVF_DIFFUSE,
-    D3DFVF_TEX1, D3DFVF_TEXTUREFORMAT3, D3DFVF_XYZ, D3DLOCK_DISCARD, D3DLOCK_NO_DIRTY_UPDATE,
-    D3DLOCK_READONLY, D3DPOOL_DEFAULT, D3DPOOL_MANAGED, D3DPOOL_SCRATCH, D3DPOOL_SYSTEMMEM,
-    D3DPT_TRIANGLELIST, D3DRECT, D3DRS_ALPHABLENDENABLE, D3DRS_DESTBLEND, D3DRS_SRCBLEND,
-    D3DRTYPE_SURFACE, D3DRTYPE_VOLUME, D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_MAGFILTER,
-    D3DSAMP_MAXMIPLEVEL, D3DSAMP_MINFILTER, D3DSAMP_MIPFILTER, D3DTA_TEXTURE, D3DTADDRESS_CLAMP,
-    D3DTEXF_ANISOTROPIC, D3DTEXF_LINEAR, D3DTEXF_NONE, D3DTEXF_POINT, D3DTOP_SELECTARG1,
-    D3DTSS_ALPHAARG1, D3DTSS_ALPHAOP, D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_DEPTHSTENCIL,
-    D3DUSAGE_DYNAMIC, D3DUSAGE_RENDERTARGET,
+    D3DFMT_V8U8, D3DFMT_V16U16, D3DFMT_X1R5G5B5, D3DFMT_X8B8G8R8, D3DFMT_X8R8G8B8, D3DFMT_YUY2,
+    D3DFVF_DIFFUSE, D3DFVF_TEX1, D3DFVF_TEXTUREFORMAT3, D3DFVF_XYZ, D3DLOCK_DISCARD,
+    D3DLOCK_NO_DIRTY_UPDATE, D3DLOCK_READONLY, D3DPOOL_DEFAULT, D3DPOOL_MANAGED, D3DPOOL_SCRATCH,
+    D3DPOOL_SYSTEMMEM, D3DPT_TRIANGLELIST, D3DRECT, D3DRS_ALPHABLENDENABLE, D3DRS_DESTBLEND,
+    D3DRS_SRCBLEND, D3DRTYPE_SURFACE, D3DRTYPE_VOLUME, D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV,
+    D3DSAMP_MAGFILTER, D3DSAMP_MAXMIPLEVEL, D3DSAMP_MINFILTER, D3DSAMP_MIPFILTER, D3DTA_TEXTURE,
+    D3DTADDRESS_CLAMP, D3DTEXF_ANISOTROPIC, D3DTEXF_LINEAR, D3DTEXF_NONE, D3DTEXF_POINT,
+    D3DTOP_SELECTARG1, D3DTSS_ALPHAARG1, D3DTSS_ALPHAOP, D3DUSAGE_AUTOGENMIPMAP,
+    D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_DYNAMIC, D3DUSAGE_RENDERTARGET,
 };
 
 const BLACK: u32 = 0xFF00_0000;
@@ -5258,4 +5258,481 @@ fn blend_texture_alpha_premultiplied() {
         assert_eq!(h.clear_texture(0), 0);
     }
     assert!(failures.is_empty(), "PM failures: {failures:x?}");
+}
+
+/// Asserts a sampled V16U16 pixel, leaving the swizzle-filled blue lane to physical GPUs.
+///
+/// Red and green are the stored signed lanes and are compared on every device,
+/// and so is alpha, which a two-channel format samples as one with or without
+/// a swizzle. Blue is one only through the view swizzle. The paravirtual
+/// device samples a swizzle view through the base texture's lanes, so blue is
+/// left out of the comparison there and required on every physical GPU.
+#[track_caller]
+fn assert_v16u16_pixel(h: &Harness, actual: u32, expected: u32, tol: u8, context: &str) {
+    const BLUE: u32 = 0x0000_00ff;
+    let mask = if h.device_is_paravirtual() {
+        !BLUE
+    } else {
+        u32::MAX
+    };
+    assert_pixel_approx(actual & mask, expected & mask, tol, context);
+}
+
+/// V16U16 preserves signed endpoints and fills missing blue with one.
+#[test]
+fn v16u16_signed_extrema_and_missing_channels() {
+    // ps_1_1: sample t0, then map signed channels from [-1,1] into [0,1].
+    const PS: &[u32] = &[
+        0xffff_0101,
+        0x0000_0051,
+        0xa00f_0000,
+        0x3f00_0000,
+        0x3f00_0000,
+        0x3f00_0000,
+        0x3f00_0000,
+        0x0000_0042,
+        0xb00f_0000,
+        0x0000_0004,
+        0x800f_0000,
+        0xb0e4_0000,
+        0xa0e4_0000,
+        0xa0e4_0000,
+        0x0000_ffff,
+    ];
+    let h = Harness::new();
+    let shader = h.create_pixel_shader(PS);
+    assert_eq!(h.set_pixel_shader(&shader), 0, "SetPixelShader");
+    for (u, v, expected) in [
+        (i16::MIN, i16::MAX, 0xff00_ffff),
+        (-32767, 0, 0xff00_80ff),
+        (0, i16::MIN, 0xff80_00ff),
+        (i16::MAX, i16::MAX, 0xffff_ffff),
+    ] {
+        let tex = h.create_texture(1, 1, 1, 0, D3DFMT_V16U16, D3DPOOL_MANAGED);
+        tex.lock_rect(0, 0).write::<i16>(&[u, v]);
+        assert_v16u16_pixel(
+            &h,
+            sample_center(&h, &tex).to_pixel(),
+            expected,
+            1,
+            "signed V16U16 sample with blue one",
+        );
+    }
+}
+
+/// Missing alpha samples as one even when both stored signed channels are zero.
+#[test]
+fn v16u16_missing_alpha_is_one() {
+    const PS: &[u32] = &[
+        0xffff_0101,
+        0x0000_0042,
+        0xb00f_0000,
+        0x0000_0001,
+        0x800f_0000,
+        0xb0ff_0000,
+        0x0000_ffff,
+    ];
+    let h = Harness::new();
+    let ps = h.create_pixel_shader(PS);
+    assert_eq!(h.set_pixel_shader(&ps), 0);
+    let tex = h.create_texture(1, 1, 1, 0, D3DFMT_V16U16, D3DPOOL_MANAGED);
+    tex.lock_rect(0, 0).write::<i16>(&[0, 0]);
+    assert_pixel_eq(
+        sample_center(&h, &tex).to_pixel(),
+        0xffff_ffff,
+        "missing alpha",
+    );
+}
+
+/// Native byte layout is preserved through explicit mips and partial updates.
+#[test]
+fn v16u16_native_bytes_mips_and_partial_updates() {
+    let h = Harness::new();
+    for pool in [
+        D3DPOOL_DEFAULT,
+        D3DPOOL_MANAGED,
+        D3DPOOL_SYSTEMMEM,
+        D3DPOOL_SCRATCH,
+    ] {
+        let usage = if pool == D3DPOOL_DEFAULT {
+            D3DUSAGE_DYNAMIC
+        } else {
+            0
+        };
+        let tex = h.create_texture(4, 4, 0, usage, D3DFMT_V16U16, pool);
+        assert_eq!(tex.level_count(), 3);
+        for level in 0..3 {
+            let (hr, desc) = tex.level_desc(level);
+            assert_eq!(hr, 0);
+            assert_eq!(
+                (desc.format, desc.pool, desc.usage),
+                (D3DFMT_V16U16, pool, usage)
+            );
+            let mut lock = tex.lock_rect(level, 0);
+            assert_eq!(lock.pitch(), i32::try_from(desc.width * 4).unwrap());
+            let values = vec![0x8000_7fff; (desc.width * desc.height) as usize];
+            lock.write_u32(&values);
+        }
+        {
+            let lock = tex.lock_rect(2, D3DLOCK_READONLY);
+            // SAFETY: the held 1x1 V16U16 lock contains four initialized bytes.
+            let raw = unsafe { lock.bits_ptr().cast::<u32>().read_unaligned() };
+            assert_eq!(raw, 0x8000_7fff, "native signed bytes pool={pool}");
+        }
+        let cube = h.create_cube_texture_owned(4, 0, usage, D3DFMT_V16U16, pool);
+        assert_eq!(cube.level_count(), 3);
+        cube.lock_rect(0, 2, 0).write_u32(&[0x8000_7fff]);
+        let lock = cube.lock_rect(0, 2, D3DLOCK_READONLY);
+        assert_eq!(lock.pitch(), 4);
+        // SAFETY: the held 1x1 V16U16 cube lock contains four initialized bytes.
+        let raw = unsafe { lock.bits_ptr().cast::<u32>().read_unaligned() };
+        assert_eq!(raw, 0x8000_7fff, "native cube bytes pool={pool}");
+        let (hr, volume) = h.try_create_volume_texture([2, 2, 2], 0, usage, D3DFMT_V16U16, pool);
+        assert_eq!(hr, 0);
+        let volume = volume.expect("volume native storage");
+        assert_eq!(volume.level_count(), 2);
+        assert_eq!(volume.level_desc(0).1.usage, usage);
+        volume.write_u32(1, &[0x8000_7fff]);
+    }
+    let src = h.create_texture(4, 4, 1, 0, D3DFMT_V16U16, D3DPOOL_SYSTEMMEM);
+    src.lock_rect(0, 0).write_u32(&[0x0000_7fff; 16]);
+    let dst = h.create_texture(4, 4, 1, 0, D3DFMT_V16U16, D3DPOOL_DEFAULT);
+    assert_eq!(h.update_texture_hr(&src, &dst), 0);
+    assert_v16u16_pixel(
+        &h,
+        sample_center(&h, &dst).to_pixel(),
+        0xffff_00ff,
+        0,
+        "UpdateTexture signed pair",
+    );
+    src.lock_rect_partial(0, &[0, 0, 1, 1], 0)
+        .write_u32(&[0x7fff_0000]);
+    assert_eq!(
+        h.update_surface_region_hr(
+            &src.surface_level(0),
+            &D3DRECT {
+                x1: 0,
+                y1: 0,
+                x2: 1,
+                y2: 1
+            },
+            &dst.surface_level(0),
+            (2, 2)
+        ),
+        0
+    );
+    assert_v16u16_pixel(
+        &h,
+        sample_at(&h, &dst, 400, 300).to_pixel(),
+        0xff00_ffff,
+        0,
+        "partial UpdateSurface",
+    );
+    assert_v16u16_pixel(
+        &h,
+        sample_at(&h, &dst, 80, 60).to_pixel(),
+        0xffff_00ff,
+        0,
+        "untouched pixel",
+    );
+    let mip = h.create_texture(4, 4, 0, 0, D3DFMT_V16U16, D3DPOOL_MANAGED);
+    for (level, value) in [(0, 0x0000_7fff), (1, 0x7fff_0000), (2, 0x7fff_7fff)] {
+        let size = (4usize >> level).pow(2);
+        mip.lock_rect(level, 0).write_u32(&vec![value; size]);
+    }
+    assert_eq!(h.set_sampler_state(0, D3DSAMP_MIPFILTER, D3DTEXF_POINT), 0);
+    for (level, expected) in [(0, 0xffff_00ff), (1, 0xff00_ffff), (2, 0xffff_ffff)] {
+        assert_eq!(h.set_sampler_state(0, D3DSAMP_MAXMIPLEVEL, level), 0);
+        assert_v16u16_pixel(
+            &h,
+            sample_center(&h, &mip).to_pixel(),
+            expected,
+            0,
+            "explicit mip",
+        );
+    }
+}
+
+/// Cube faces and volume slices retain their native format through `UpdateTexture`.
+#[test]
+fn v16u16_cube_and_volume_updates() {
+    let h = Harness::new();
+    for pool in [D3DPOOL_MANAGED, D3DPOOL_SYSTEMMEM] {
+        let src = h.create_cube_texture_owned(4, 0, 0, D3DFMT_V16U16, pool);
+        assert_eq!(src.level_count(), 3);
+        for face in 0..6 {
+            for level in 0..3 {
+                let count = (4usize >> level).pow(2);
+                src.lock_rect(face, level, 0).write_u32(&vec![
+                    if face == 0 {
+                        0x0000_7fff
+                    } else {
+                        0x7fff_0000
+                    };
+                    count
+                ]);
+            }
+        }
+        let dst = h.create_cube_texture_owned(4, 0, 0, D3DFMT_V16U16, D3DPOOL_DEFAULT);
+        let sampled = if pool == D3DPOOL_SYSTEMMEM {
+            assert_eq!(h.update_cube_texture_hr(&src, &dst), 0);
+            &dst
+        } else {
+            &src
+        };
+        assert_v16u16_pixel(
+            &h,
+            sample_cube_x(&h, sampled, 1.0),
+            0xffff_00ff,
+            0,
+            "positive X cube",
+        );
+        assert_v16u16_pixel(
+            &h,
+            sample_cube_x(&h, sampled, -1.0),
+            0xff00_ffff,
+            0,
+            "negative X cube",
+        );
+        let (hr, src) = h.try_create_volume_texture([2, 2, 2], 0, 0, D3DFMT_V16U16, pool);
+        assert_eq!(hr, 0);
+        let src = src.expect("volume");
+        assert_eq!(src.level_count(), 2);
+        src.write_u32(
+            0,
+            &[
+                0x0000_7fff,
+                0x0000_7fff,
+                0x0000_7fff,
+                0x0000_7fff,
+                0x7fff_0000,
+                0x7fff_0000,
+                0x7fff_0000,
+                0x7fff_0000,
+            ],
+        );
+        src.write_u32(1, &[0x7fff_7fff]);
+        let (hr, dst) =
+            h.try_create_volume_texture([2, 2, 2], 0, 0, D3DFMT_V16U16, D3DPOOL_DEFAULT);
+        assert_eq!(hr, 0);
+        let dst = dst.expect("default volume");
+        let sampled = if pool == D3DPOOL_SYSTEMMEM {
+            assert_eq!(h.update_volume_texture_hr(&src, &dst), 0);
+            &dst
+        } else {
+            &src
+        };
+        assert_eq!(h.set_volume_texture(0, sampled), 0);
+        h.select_texture_stage(0);
+        point_clamp(&h);
+        assert_eq!(
+            h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1 | (D3DFVF_TEXTUREFORMAT3 << 16)),
+            0
+        );
+        assert_v16u16_pixel(
+            &h,
+            sample_volume_depth(&h, 0.25),
+            0xffff_00ff,
+            0,
+            "first slice",
+        );
+        assert_v16u16_pixel(
+            &h,
+            sample_volume_depth(&h, 0.75),
+            0xff00_ffff,
+            0,
+            "second slice",
+        );
+        assert_eq!(h.set_sampler_state(0, D3DSAMP_MIPFILTER, D3DTEXF_POINT), 0);
+        assert_eq!(h.set_sampler_state(0, D3DSAMP_MAXMIPLEVEL, 1), 0);
+        assert_v16u16_pixel(
+            &h,
+            sample_volume_depth(&h, 0.5),
+            0xffff_ffff,
+            0,
+            "volume mip",
+        );
+        assert_eq!(h.set_sampler_state(0, D3DSAMP_MAXMIPLEVEL, 0), 0);
+        assert_eq!(h.clear_texture(0), 0);
+    }
+}
+
+/// Query capabilities match creation, including a one-level AUTOGEN fallback.
+#[test]
+fn v16u16_queries_and_noautogen_contract() {
+    use mtld3d_types::{
+        D3DERR_NOTAVAILABLE, D3DOK_NOAUTOGEN, D3DRTYPE_CUBETEXTURE, D3DRTYPE_TEXTURE,
+        D3DRTYPE_VOLUMETEXTURE, D3DUSAGE_QUERY_FILTER, D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING,
+        D3DUSAGE_QUERY_SRGBREAD, D3DUSAGE_QUERY_VERTEXTEXTURE,
+    };
+    let h = Harness::new();
+    for rtype in [
+        D3DRTYPE_TEXTURE,
+        D3DRTYPE_CUBETEXTURE,
+        D3DRTYPE_VOLUMETEXTURE,
+    ] {
+        for usage in [
+            0,
+            D3DUSAGE_DYNAMIC,
+            D3DUSAGE_QUERY_FILTER,
+            D3DUSAGE_QUERY_VERTEXTEXTURE,
+        ] {
+            assert_eq!(
+                h.check_device_format(D3DFMT_X8R8G8B8, usage, rtype, D3DFMT_V16U16),
+                0,
+                "rtype={rtype} usage={usage:#x}"
+            );
+        }
+        for usage in [
+            D3DUSAGE_RENDERTARGET,
+            D3DUSAGE_DEPTHSTENCIL,
+            D3DUSAGE_QUERY_SRGBREAD,
+            D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING,
+        ] {
+            assert_eq!(
+                h.check_device_format(D3DFMT_X8R8G8B8, usage, rtype, D3DFMT_V16U16),
+                D3DERR_NOTAVAILABLE
+            );
+        }
+        let expected = if rtype == D3DRTYPE_VOLUMETEXTURE {
+            D3DERR_NOTAVAILABLE
+        } else {
+            D3DOK_NOAUTOGEN
+        };
+        assert_eq!(
+            h.check_device_format(
+                D3DFMT_X8R8G8B8,
+                D3DUSAGE_AUTOGENMIPMAP,
+                rtype,
+                D3DFMT_V16U16
+            ),
+            expected
+        );
+    }
+    for rtype in [
+        D3DRTYPE_TEXTURE,
+        D3DRTYPE_CUBETEXTURE,
+        D3DRTYPE_VOLUMETEXTURE,
+    ] {
+        for extra in [
+            0,
+            D3DUSAGE_QUERY_FILTER,
+            D3DUSAGE_AUTOGENMIPMAP,
+            D3DUSAGE_RENDERTARGET,
+            D3DUSAGE_QUERY_SRGBREAD,
+        ] {
+            assert_eq!(
+                h.check_device_format(
+                    D3DFMT_X8R8G8B8,
+                    mtld3d_types::D3DUSAGE_QUERY_SRGBWRITE | extra,
+                    rtype,
+                    D3DFMT_V16U16
+                ),
+                D3DERR_NOTAVAILABLE
+            );
+        }
+    }
+    for pool in [D3DPOOL_DEFAULT, D3DPOOL_MANAGED] {
+        for levels in [0, 1] {
+            let tex = h.create_texture(4, 4, levels, D3DUSAGE_AUTOGENMIPMAP, D3DFMT_V16U16, pool);
+            assert_eq!(tex.level_count(), 1);
+            let (hr, desc) = tex.level_desc(0);
+            assert_eq!(hr, 0);
+            assert_eq!(desc.usage, D3DUSAGE_AUTOGENMIPMAP);
+            assert_eq!(tex.level_desc(1).0, D3DERR_INVALIDCALL);
+            assert_eq!(tex.auto_gen_filter_type(), D3DTEXF_LINEAR);
+            assert_eq!(tex.set_auto_gen_filter_type(D3DTEXF_POINT), 0);
+            assert_eq!(tex.auto_gen_filter_type(), D3DTEXF_POINT);
+            assert_eq!(
+                tex.set_auto_gen_filter_type(D3DTEXF_NONE),
+                D3DERR_INVALIDCALL
+            );
+            assert_eq!(tex.auto_gen_filter_type(), D3DTEXF_POINT);
+            tex.lock_rect(0, 0).write_u32(&[0x0000_7fff; 16]);
+            tex.generate_mip_sub_levels();
+            assert_v16u16_pixel(
+                &h,
+                sample_center(&h, &tex).to_pixel(),
+                0xffff_00ff,
+                0,
+                "NOAUTOGEN top-level upload",
+            );
+            tex.lock_rect(0, 0).write_u32(&[0x7fff_0000; 16]);
+            tex.generate_mip_sub_levels();
+            assert_v16u16_pixel(
+                &h,
+                sample_center(&h, &tex).to_pixel(),
+                0xff00_ffff,
+                0,
+                "NOAUTOGEN second publication",
+            );
+            let cube =
+                h.create_cube_texture_owned(4, levels, D3DUSAGE_AUTOGENMIPMAP, D3DFMT_V16U16, pool);
+            assert_eq!(cube.level_count(), 1);
+            let (hr, desc) = cube.surface(0, 0).desc();
+            assert_eq!(hr, 0);
+            assert_eq!(desc.usage, D3DUSAGE_AUTOGENMIPMAP);
+            let (hr, out) = cube.try_surface(0, 1);
+            assert_eq!(hr, D3DERR_INVALIDCALL);
+            assert!(out.is_null());
+            assert_eq!(cube.auto_gen_filter_type(), D3DTEXF_LINEAR);
+            assert_eq!(cube.set_auto_gen_filter_type(D3DTEXF_POINT), 0);
+            assert_eq!(cube.auto_gen_filter_type(), D3DTEXF_POINT);
+            assert_eq!(
+                cube.set_auto_gen_filter_type(D3DTEXF_NONE),
+                D3DERR_INVALIDCALL
+            );
+            assert_eq!(cube.auto_gen_filter_type(), D3DTEXF_POINT);
+            if pool == D3DPOOL_DEFAULT {
+                let source = h.create_cube_texture_owned(4, 1, 0, D3DFMT_V16U16, D3DPOOL_SYSTEMMEM);
+                for face in 0..6 {
+                    source.lock_rect(face, 0, 0).write_u32(&[0x0000_7fff; 16]);
+                }
+                assert_eq!(h.update_cube_texture_hr(&source, &cube), 0);
+            } else {
+                cube.lock_rect(0, 0, 0).write_u32(&[0x0000_7fff; 16]);
+            }
+            cube.generate_mip_sub_levels();
+            assert_v16u16_pixel(
+                &h,
+                sample_cube_x(&h, &cube, 1.0),
+                0xffff_00ff,
+                0,
+                "NOAUTOGEN cube publication",
+            );
+        }
+    }
+    for (pool, levels, usage) in [
+        (D3DPOOL_DEFAULT, 2, D3DUSAGE_AUTOGENMIPMAP),
+        (D3DPOOL_MANAGED, 2, D3DUSAGE_AUTOGENMIPMAP),
+        (D3DPOOL_SYSTEMMEM, 1, D3DUSAGE_AUTOGENMIPMAP),
+        (D3DPOOL_SCRATCH, 1, D3DUSAGE_AUTOGENMIPMAP),
+        (D3DPOOL_DEFAULT, 1, D3DUSAGE_RENDERTARGET),
+        (D3DPOOL_DEFAULT, 1, D3DUSAGE_DEPTHSTENCIL),
+        (D3DPOOL_MANAGED, 1, D3DUSAGE_DYNAMIC),
+    ] {
+        let (hr, out) = h.try_create_texture(4, 4, levels, usage, D3DFMT_V16U16, pool);
+        assert_eq!(
+            hr, D3DERR_INVALIDCALL,
+            "texture pool={pool} levels={levels} usage={usage:#x}"
+        );
+        assert!(out.is_null());
+        let (hr, out) = h.try_create_cube_texture(4, levels, usage, D3DFMT_V16U16, pool);
+        assert_eq!(
+            hr, D3DERR_INVALIDCALL,
+            "cube pool={pool} levels={levels} usage={usage:#x}"
+        );
+        assert!(out.is_null());
+    }
+    for pool in [
+        D3DPOOL_DEFAULT,
+        D3DPOOL_MANAGED,
+        D3DPOOL_SYSTEMMEM,
+        D3DPOOL_SCRATCH,
+    ] {
+        assert_eq!(
+            h.create_volume_texture([2, 2, 2], 1, D3DUSAGE_AUTOGENMIPMAP, D3DFMT_V16U16, pool),
+            D3DERR_INVALIDCALL
+        );
+    }
 }

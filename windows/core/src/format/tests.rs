@@ -1040,3 +1040,43 @@ fn a_requested_level_count_is_capped_at_the_natural_chain() {
     // A 1x1 texture has exactly one level, whatever is asked for.
     assert_eq!(resolve_mip_levels(4, compute_mip_count(1, 1)), 1);
 }
+
+#[test]
+fn v16u16_uses_native_signed_storage_and_noautogen_fallback() {
+    let format = mtld3d_types::D3DFMT_V16U16;
+    let mapped = map_d3d_format(format).expect("V16U16 mapping");
+    assert_eq!(mapped.metal_pixel_format(), PixelFormat::Rg16Snorm);
+    assert_eq!(
+        mapped.swizzle(),
+        Some([Swizzle::Red, Swizzle::Green, Swizzle::One, Swizzle::One])
+    );
+    assert_eq!(mapped.bytes_per_pixel(), 4);
+    assert!(!mapped.has_alpha());
+    assert!(!mapped.is_compressed());
+    assert_eq!(compute_mip_size(3, 2, 0, &mapped), (3, 2, 24, 12));
+    assert!(is_volume_texture_format(format));
+    assert!(!super::is_render_target_format(format));
+    assert!(super::uses_noautogen_fallback(format));
+    assert!(super::uses_strict_dynamic_pool_validation(format));
+    for ordinary in [mtld3d_types::D3DFMT_V8U8, D3DFMT_A8R8G8B8, D3DFMT_DXT1] {
+        assert!(!super::uses_noautogen_fallback(ordinary));
+        assert!(!super::uses_strict_dynamic_pool_validation(ordinary));
+    }
+}
+
+#[test]
+fn v16u16_rejects_srgb_write_queries_before_autogen_fallback() {
+    for extra in [
+        0,
+        D3DUSAGE_QUERY_FILTER,
+        D3DUSAGE_AUTOGENMIPMAP,
+        D3DUSAGE_RENDERTARGET,
+        D3DUSAGE_QUERY_SRGBREAD,
+    ] {
+        assert!(!super::supports_usage_query(
+            mtld3d_types::D3DFMT_V16U16,
+            D3DUSAGE_QUERY_SRGBWRITE | extra,
+            true
+        ));
+    }
+}
