@@ -5591,7 +5591,9 @@ extern "system" fn device_create_cube_texture(
         null_out(texture);
         return D3DERR_INVALIDCALL;
     }
-    let bpp = fmt.bytes_per_pixel().max(1);
+    // Zero stays zero: it marks a compressed layout, and a face upload counts
+    // block rows and block offsets only while the marker survives creation.
+    let bpp = fmt.bytes_per_pixel();
     // `levels == 0` means the full chain. Staging is face-major so the cube
     // sidecar can address `face * levels + level` without another allocation.
     let autogen_requested = usage & D3DUSAGE_AUTOGENMIPMAP != 0;

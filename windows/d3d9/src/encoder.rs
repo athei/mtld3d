@@ -7943,8 +7943,11 @@ impl FrameEncoder {
     /// stride; the transient box's row stride is
     /// `gpu_caps.min_linear_texture_align`. Wraps that `PageBox` in a fresh
     /// `MTLBuffer`, queues both for retire, and returns an updated `info`
-    /// aimed at the new buffer. Returns `None` only on `CreateBuffer`
-    /// failure.
+    /// aimed at the new buffer. Returns `None` on `CreateBuffer` failure, and
+    /// when the rows asked for do not end inside the staging's logical bytes:
+    /// a compressed level counted in texel rows instead of block rows asks
+    /// for `block_height` times what the level holds, and the span is checked
+    /// before any source pointer is formed.
     ///
     /// Why this exists: the staging `PageBox` is sized to D3D's
     /// per-mip pitch, which for tiny mips (1×1 BGRA8 = 4 bytes,
@@ -7961,6 +7964,21 @@ impl FrameEncoder {
         let src_pitch = info.bytes_per_row as usize;
         let padded_pitch = self.gpu_caps.min_linear_texture_align as usize;
         debug_assert!(padded_pitch > src_pitch);
+        let source_end = mtld3d_shared::blit_geometry::source_rows_end(
+            info.buffer_offset,
+            info.bytes_per_row,
+            num_blit_rows,
+        );
+        if source_end.is_none_or(|end| end > staging.logical_len() as u64) {
+            error!(
+                target: LOG_TARGET,
+                "repack_blit_source_padded: {num_blit_rows} rows of {src_pitch} bytes from offset \
+                 {} end at {source_end:?}, past the {} staging bytes; upload declined",
+                info.buffer_offset,
+                staging.logical_len(),
+            );
+            return None;
+        }
 
         // Snap buffer_offset to the start of its row; the within-row
         // offset (origin_x * bpp / block_x * block_bytes) is preserved
@@ -7975,13 +7993,13 @@ impl FrameEncoder {
             .checked_mul(num_blit_rows as usize)
             .expect("padded blit-source size overflow");
         let mut padded = PageBox::new_uninit(padded_size);
-        // SAFETY: `start_row * src_pitch` stays within the staging slab per
-        // the caller's row-bound contract.
+        // SAFETY: `start_row * src_pitch` is at most `source_end`, checked
+        // above against the staging's logical length.
         let src_base = unsafe { staging.as_ptr().add(start_row * src_pitch) };
         let dst_base = padded.as_mut_ptr();
         for row in 0..num_blit_rows as usize {
             // SAFETY: `src_base + row * src_pitch` covers `src_pitch` bytes
-            // within the staging slab; `dst_base + row * padded_pitch`
+            // below `source_end`, inside the staging; `dst_base + row * padded_pitch`
             // covers `padded_pitch >= src_pitch` bytes within the just-
             // allocated `padded` slab. Source and dest are disjoint slabs.
             let src_row = unsafe { src_base.add(row * src_pitch) };

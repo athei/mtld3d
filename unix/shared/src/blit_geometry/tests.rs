@@ -6,7 +6,7 @@
 //! (block height 1, and the degenerate 0) has to keep answering `bytes_per_row *
 //! height`, since every existing caller relies on that.
 
-use super::{block_rows, bytes_per_image};
+use super::{block_rows, bytes_per_image, source_rows_end};
 
 /// An uncompressed format counts pixel rows, and an unset block height reads as one.
 #[test]
@@ -56,4 +56,35 @@ fn partial_block_row_rounds_up() {
 #[test]
 fn overflow_saturates() {
     assert_eq!(bytes_per_image(u32::MAX, 8, 4), u32::MAX);
+}
+
+/// A compressed level counted in block rows ends inside its staging; texel rows do not.
+#[test]
+fn source_rows_end_separates_block_rows_from_texel_rows() {
+    // A 4x2048 BC1 level is 512 block rows of one 8-byte block: 4096 bytes.
+    let staging = 4096;
+    assert_eq!(source_rows_end(0, 8, block_rows(2048, 4)), Some(staging));
+    assert_eq!(
+        source_rows_end(0, 8, block_rows(2048, 1)),
+        Some(4 * staging)
+    );
+    // Eight slices of a 4x4 BC3 level repack as eight rows of 16 bytes.
+    assert_eq!(source_rows_end(0, 16, 8), Some(128));
+}
+
+/// An offset inside a row snaps to the row start, and later rows count from there.
+#[test]
+fn source_rows_end_snaps_the_start_to_its_row() {
+    // Block (1, 2) of a level two BC1 blocks wide: row 2, one block in.
+    assert_eq!(source_rows_end(2 * 16 + 8, 16, 1), Some(48));
+    assert_eq!(source_rows_end(2 * 16 + 8, 16, 3), Some(80));
+    assert_eq!(source_rows_end(0, 16, 0), Some(0));
+}
+
+/// A zero stride and an overflowing span have no end.
+#[test]
+fn source_rows_end_rejects_zero_stride_and_overflow() {
+    assert_eq!(source_rows_end(0, 0, 4), None);
+    assert_eq!(source_rows_end(u64::MAX, 1, 1), None);
+    assert_eq!(source_rows_end(u64::MAX / 2, u32::MAX, u32::MAX), None);
 }
