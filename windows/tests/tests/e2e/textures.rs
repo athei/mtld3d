@@ -9,16 +9,17 @@ use mtld3d_tests::{
 use mtld3d_types::{
     D3DBLEND_INVSRCALPHA, D3DBLEND_SRCALPHA, D3DBLEND_ZERO, D3DBOX, D3DERR_INVALIDCALL,
     D3DFMT_A1R5G5B5, D3DFMT_A4R4G4B4, D3DFMT_A8, D3DFMT_A8B8G8R8, D3DFMT_A8R8G8B8, D3DFMT_ATI1,
-    D3DFMT_DXT1, D3DFMT_DXT5, D3DFMT_INTZ, D3DFMT_L8, D3DFMT_NV12, D3DFMT_Q8W8V8U8, D3DFMT_R5G6B5,
-    D3DFMT_R8G8B8, D3DFMT_UYVY, D3DFMT_V8U8, D3DFMT_V16U16, D3DFMT_X1R5G5B5, D3DFMT_X8B8G8R8,
-    D3DFMT_X8R8G8B8, D3DFMT_YUY2, D3DFMT_YV12, D3DFVF_DIFFUSE, D3DFVF_TEX1, D3DFVF_TEXTUREFORMAT3,
-    D3DFVF_XYZ, D3DLOCK_DISCARD, D3DLOCK_NO_DIRTY_UPDATE, D3DLOCK_READONLY, D3DPOOL_DEFAULT,
-    D3DPOOL_MANAGED, D3DPOOL_SCRATCH, D3DPOOL_SYSTEMMEM, D3DPT_TRIANGLELIST, D3DRECT,
-    D3DRS_ALPHABLENDENABLE, D3DRS_DESTBLEND, D3DRS_SRCBLEND, D3DRTYPE_SURFACE, D3DRTYPE_VOLUME,
-    D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_MAGFILTER, D3DSAMP_MAXMIPLEVEL, D3DSAMP_MINFILTER,
-    D3DSAMP_MIPFILTER, D3DTA_TEXTURE, D3DTADDRESS_CLAMP, D3DTEXF_ANISOTROPIC, D3DTEXF_LINEAR,
-    D3DTEXF_NONE, D3DTEXF_POINT, D3DTOP_SELECTARG1, D3DTSS_ALPHAARG1, D3DTSS_ALPHAOP,
-    D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_DYNAMIC, D3DUSAGE_RENDERTARGET,
+    D3DFMT_DXT1, D3DFMT_DXT2, D3DFMT_DXT3, D3DFMT_DXT4, D3DFMT_DXT5, D3DFMT_INTZ, D3DFMT_L8,
+    D3DFMT_NV12, D3DFMT_Q8W8V8U8, D3DFMT_R5G6B5, D3DFMT_R8G8B8, D3DFMT_UYVY, D3DFMT_V8U8,
+    D3DFMT_V16U16, D3DFMT_X1R5G5B5, D3DFMT_X8B8G8R8, D3DFMT_X8R8G8B8, D3DFMT_YUY2, D3DFMT_YV12,
+    D3DFVF_DIFFUSE, D3DFVF_TEX1, D3DFVF_TEXTUREFORMAT3, D3DFVF_XYZ, D3DLOCK_DISCARD,
+    D3DLOCK_NO_DIRTY_UPDATE, D3DLOCK_READONLY, D3DPOOL_DEFAULT, D3DPOOL_MANAGED, D3DPOOL_SCRATCH,
+    D3DPOOL_SYSTEMMEM, D3DPT_TRIANGLELIST, D3DRECT, D3DRS_ALPHABLENDENABLE, D3DRS_DESTBLEND,
+    D3DRS_SRCBLEND, D3DRTYPE_SURFACE, D3DRTYPE_VOLUME, D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV,
+    D3DSAMP_MAGFILTER, D3DSAMP_MAXMIPLEVEL, D3DSAMP_MINFILTER, D3DSAMP_MIPFILTER, D3DTA_TEXTURE,
+    D3DTADDRESS_CLAMP, D3DTEXF_ANISOTROPIC, D3DTEXF_LINEAR, D3DTEXF_NONE, D3DTEXF_POINT,
+    D3DTOP_SELECTARG1, D3DTSS_ALPHAARG1, D3DTSS_ALPHAOP, D3DUSAGE_AUTOGENMIPMAP,
+    D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_DYNAMIC, D3DUSAGE_RENDERTARGET,
 };
 
 const BLACK: u32 = 0xFF00_0000;
@@ -1120,6 +1121,177 @@ fn managed_dxt_cube_samples_every_level() {
         }
         assert_eq!(h.set_sampler_state(0, D3DSAMP_MAXMIPLEVEL, 0), 0);
         assert_eq!(h.set_sampler_state(0, D3DSAMP_MIPFILTER, D3DTEXF_NONE), 0);
+    }
+}
+
+/// DXT2 and DXT4 answer `CheckDeviceFormat` on 2D and cube textures as DXT3 and DXT5 do.
+///
+/// The sRGB read is the BC2 and BC3 twin view, so it is advertised for the
+/// aliases too, and no render-target question turns into a yes with it. Every
+/// other answer is compared with the DXT3 or DXT5 answer rather than spelled
+/// out. Formats without a twin view are the negative control.
+#[test]
+fn premultiplied_dxt_aliases_answer_format_queries_as_dxt3_and_dxt5() {
+    use mtld3d_types::{
+        D3D_OK, D3DERR_NOTAVAILABLE, D3DRTYPE_CUBETEXTURE, D3DRTYPE_TEXTURE,
+        D3DRTYPE_VOLUMETEXTURE, D3DUSAGE_QUERY_FILTER, D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING,
+        D3DUSAGE_QUERY_SRGBREAD, D3DUSAGE_QUERY_SRGBWRITE, D3DUSAGE_QUERY_VERTEXTEXTURE,
+        D3DUSAGE_QUERY_WRAPANDMIP,
+    };
+    let h = Harness::factory_only();
+    let check = |usage: u32, rtype: u32, format: u32| {
+        h.check_device_format(D3DFMT_X8R8G8B8, usage, rtype, format)
+    };
+    for rtype in [D3DRTYPE_TEXTURE, D3DRTYPE_CUBETEXTURE] {
+        for format in [
+            D3DFMT_DXT1,
+            D3DFMT_DXT2,
+            D3DFMT_DXT3,
+            D3DFMT_DXT4,
+            D3DFMT_DXT5,
+        ] {
+            for usage in [
+                D3DUSAGE_QUERY_SRGBREAD,
+                D3DUSAGE_QUERY_SRGBREAD | D3DUSAGE_QUERY_FILTER,
+                D3DUSAGE_QUERY_SRGBREAD | D3DUSAGE_QUERY_VERTEXTEXTURE | D3DUSAGE_QUERY_WRAPANDMIP,
+            ] {
+                assert_eq!(
+                    check(usage, rtype, format),
+                    D3D_OK,
+                    "format {format:#x} rtype {rtype} usage {usage:#x}"
+                );
+            }
+            for usage in [
+                D3DUSAGE_RENDERTARGET,
+                D3DUSAGE_RENDERTARGET | D3DUSAGE_QUERY_SRGBREAD,
+                D3DUSAGE_RENDERTARGET | D3DUSAGE_QUERY_SRGBWRITE,
+                D3DUSAGE_RENDERTARGET | D3DUSAGE_QUERY_SRGBWRITE | D3DUSAGE_QUERY_SRGBREAD,
+                D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING,
+                D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING | D3DUSAGE_QUERY_SRGBREAD,
+                D3DUSAGE_DEPTHSTENCIL,
+                D3DUSAGE_DEPTHSTENCIL | D3DUSAGE_QUERY_SRGBREAD,
+            ] {
+                assert_eq!(
+                    check(usage, rtype, format),
+                    D3DERR_NOTAVAILABLE,
+                    "format {format:#x} rtype {rtype} usage {usage:#x}"
+                );
+            }
+        }
+        for format in [D3DFMT_L8, D3DFMT_A8, D3DFMT_R5G6B5] {
+            assert_eq!(
+                check(0, rtype, format),
+                D3D_OK,
+                "format {format} is sampled"
+            );
+            assert_eq!(
+                check(D3DUSAGE_QUERY_SRGBREAD, rtype, format),
+                D3DERR_NOTAVAILABLE,
+                "format {format} has no twin view"
+            );
+        }
+        assert_eq!(
+            check(D3DUSAGE_QUERY_SRGBREAD, rtype, D3DFMT_ATI1),
+            D3DERR_NOTAVAILABLE,
+            "ATI1 has no twin view"
+        );
+    }
+    for (alias, ordinary) in [(D3DFMT_DXT2, D3DFMT_DXT3), (D3DFMT_DXT4, D3DFMT_DXT5)] {
+        for rtype in [
+            D3DRTYPE_TEXTURE,
+            D3DRTYPE_CUBETEXTURE,
+            D3DRTYPE_VOLUMETEXTURE,
+            D3DRTYPE_VOLUME,
+            D3DRTYPE_SURFACE,
+        ] {
+            for usage in [
+                0,
+                D3DUSAGE_DYNAMIC,
+                D3DUSAGE_DYNAMIC | D3DUSAGE_QUERY_SRGBREAD,
+                D3DUSAGE_AUTOGENMIPMAP,
+                D3DUSAGE_AUTOGENMIPMAP | D3DUSAGE_QUERY_SRGBREAD,
+                D3DUSAGE_QUERY_FILTER,
+                D3DUSAGE_QUERY_SRGBREAD,
+                D3DUSAGE_QUERY_SRGBWRITE,
+                D3DUSAGE_QUERY_SRGBWRITE | D3DUSAGE_QUERY_SRGBREAD,
+                D3DUSAGE_RENDERTARGET,
+                D3DUSAGE_RENDERTARGET | D3DUSAGE_QUERY_SRGBWRITE,
+                D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING,
+                D3DUSAGE_DEPTHSTENCIL,
+            ] {
+                assert_eq!(
+                    check(usage, rtype, alias),
+                    check(usage, rtype, ordinary),
+                    "alias {alias:#x} rtype {rtype} usage {usage:#x}"
+                );
+            }
+        }
+    }
+}
+
+/// `D3DSAMP_SRGBTEXTURE` decodes DXT2 and DXT4 samples on 2D and cube textures.
+///
+/// The opaque block is a grey of 0x7b, 0x7d, 0x7b, which reads raw with the
+/// state off and as 0x33, 0x34, 0x33 with it on. The second block holds
+/// partial alpha (136 and 128) over a red of 66, a colour below its alpha: a
+/// multiply or a divide by alpha would move red before the decode, and a
+/// decode of the alpha lane would move alpha. Each read equals the read of
+/// the same bytes through DXT3 or DXT5.
+#[test]
+fn premultiplied_dxt_aliases_decode_srgb_samples_as_dxt3_and_dxt5() {
+    use mtld3d_types::D3DSAMP_SRGBTEXTURE;
+    const GREY: [u8; 8] = [0xef, 0x7b, 0xef, 0x7b, 0, 0, 0, 0];
+    const RED: [u8; 8] = [0, 0x40, 0, 0x40, 0, 0, 0, 0];
+    let h = Harness::new();
+    for (alias, ordinary, opaque_alpha, partial_alpha, alpha) in [
+        (D3DFMT_DXT2, D3DFMT_DXT3, [0xff; 8], [0x88; 8], 136u32),
+        (
+            D3DFMT_DXT4,
+            D3DFMT_DXT5,
+            [0xff, 0xff, 0, 0, 0, 0, 0, 0],
+            [0x80, 0x80, 0, 0, 0, 0, 0, 0],
+            128,
+        ),
+    ] {
+        let cases = [
+            ([opaque_alpha, GREY].concat(), 0xff7b_7d7b, 0xff33_3433),
+            (
+                [partial_alpha, RED].concat(),
+                (alpha << 24) | 0x0042_0000,
+                (alpha << 24) | 0x000e_0000,
+            ),
+        ];
+        let mut observed = [Vec::new(), Vec::new()];
+        for (format, pixels) in [alias, ordinary].into_iter().zip(&mut observed) {
+            let tex = h.create_texture(4, 4, 1, 0, format, D3DPOOL_MANAGED);
+            let cube = h.create_cube_texture_owned(4, 1, 0, format, D3DPOOL_MANAGED);
+            for (block, raw, decoded) in &cases {
+                tex.lock_rect(0, 0).write(block.as_slice());
+                for face in 0..6 {
+                    cube.lock_rect(face, 0, 0).write(block.as_slice());
+                }
+                for (srgb, expected) in [(0, *raw), (1, *decoded), (0, *raw)] {
+                    assert_eq!(h.set_sampler_state(0, D3DSAMP_SRGBTEXTURE, srgb), 0);
+                    let sampled = [
+                        sample_center(&h, &tex).to_pixel(),
+                        sample_cube_x(&h, &cube, 1.0),
+                    ];
+                    for (pixel, shape) in sampled.into_iter().zip(["2D", "cube"]) {
+                        assert_pixel_approx(
+                            pixel,
+                            expected,
+                            2,
+                            &format!("format {format:#x} {shape} sRGB={srgb}"),
+                        );
+                    }
+                    pixels.extend(sampled);
+                }
+            }
+        }
+        assert_eq!(
+            observed[0], observed[1],
+            "alias {alias:#x} against the ordinary format"
+        );
     }
 }
 

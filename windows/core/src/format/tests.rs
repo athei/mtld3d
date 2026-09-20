@@ -322,6 +322,34 @@ fn volume_texture_formats_include_native_bc1_bc2_bc3() {
     }
 }
 
+/// DXT2 and DXT4 map to the Metal formats of DXT3 and DXT5: sRGB-twinned, never rendered.
+///
+/// The sRGB read answer of `CheckDeviceFormat` lists D3D9 formats by hand and
+/// has to list all four: the twin view is taken by Metal format at create.
+#[test]
+fn premultiplied_dxt_aliases_share_the_srgb_twinned_format_of_dxt3_and_dxt5() {
+    use mtld3d_types::{D3DFMT_DXT2, D3DFMT_DXT3, D3DFMT_DXT4, D3DFMT_DXT5};
+    for (alias, ordinary, srgb) in [
+        (D3DFMT_DXT2, D3DFMT_DXT3, PixelFormat::Bc2RgbaSrgb),
+        (D3DFMT_DXT4, D3DFMT_DXT5, PixelFormat::Bc3RgbaSrgb),
+    ] {
+        let alias_format = map_d3d_format(alias)
+            .expect("mapped alias")
+            .metal_pixel_format();
+        let ordinary_format = map_d3d_format(ordinary)
+            .expect("mapped ordinary format")
+            .metal_pixel_format();
+        assert_eq!(alias_format, ordinary_format, "alias {alias:#x}");
+        assert_eq!(alias_format.srgb_twin(), Some(srgb), "alias {alias:#x}");
+        for format in [alias, ordinary] {
+            assert!(
+                !super::is_render_target_format(format),
+                "format {format:#x}"
+            );
+        }
+    }
+}
+
 #[test]
 fn format_name_renders_mapped_names_and_a_fixed_unknown() {
     assert_eq!(format_name(D3DFMT_A8R8G8B8), "A8R8G8B8");
