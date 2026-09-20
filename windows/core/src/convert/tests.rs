@@ -1125,3 +1125,25 @@ fn fill_mode_preserves_triangles_and_maps_only_wireframe_to_lines() {
     assert_eq!(d3d_to_metal_fill(D3DFILL_POINT), TriangleFillMode::Fill);
     assert_eq!(d3d_to_metal_fill(u32::MAX), TriangleFillMode::Fill);
 }
+
+#[test]
+fn colorfill_a2r10g10b10_uses_nearest_normalized_channels() {
+    for (input, rgb, alpha) in [
+        (0, 0, 0),
+        (42, 168, 0),
+        (43, 173, 1),
+        (63, 253, 1),
+        (127, 509, 1),
+        (128, 514, 2),
+        (212, 850, 2),
+        (213, 855, 3),
+        (255, 1023, 3),
+    ] {
+        let color = u32::from_le_bytes([input; 4]);
+        let bytes = d3dcolor_fill_pixel_bytes(color, D3DFMT_A2R10G10B10).unwrap();
+        let expected = (alpha << 30) | (rgb << 20) | (rgb << 10) | rgb;
+        assert_eq!(bytes, u32::to_le_bytes(expected), "channel={input}");
+    }
+    let bytes = d3dcolor_fill_pixel_bytes(0x7f2b_00ff, D3DFMT_A2R10G10B10).unwrap();
+    assert_eq!(bytes, ((1_u32 << 30) | (173 << 20) | 1023).to_le_bytes());
+}

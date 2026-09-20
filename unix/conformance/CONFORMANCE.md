@@ -1331,8 +1331,8 @@ Q8W8V8U8 rows of test_signed_formats do not depend on the mechanism that
 fails the V8U8 rows on the `@mac2` legs. Render-target and sRGB capabilities
 stay absent; AUTOGEN texture/cube requests preserve usage but use one actual
 level with no generated chain. MANAGED+DYNAMIC creation is rejected for
-V16U16, Q8W8V8U8 and Q16W16V16U16 only. X8L8V8U8 and L6V5U5 remain separate
-capabilities.
+V16U16, Q8W8V8U8, Q16W16V16U16 and A2R10G10B10 only. X8L8V8U8 and L6V5U5
+remain separate capabilities.
 
 Q16W16V16U16 textures use native RGBA16Snorm storage and the same scoped
 NOAUTOGEN, pool and unavailable render/sRGB policies. All four lanes are
@@ -1347,3 +1347,27 @@ Signed-format ColorFill on DEFAULT offscreen plain surfaces still reaches
 the existing missing fill-codec path, which warns and returns success without
 writing. This also affects V8U8, V16U16 and Q8W8V8U8; native sampling support
 does not resolve that separate ColorFill gap.
+
+### device.c/test_getdc, A2R10G10B10
+
+A2R10G10B10 textures and CPU surfaces are creatable, stored as native
+BGR10A2Unorm. D3D9 packs blue in the low ten bits, then green, red and the
+two alpha bits, which is that Metal format's layout, so locks expose the
+native words and sampling needs no conversion and no view swizzle. Every
+lane is stored, so nothing here depends on the mechanism that fails the V8U8
+and V16U16 rows on the `@mac2` legs.
+
+The A2R10G10B10 row of test_getdc used to skip because neither the SYSTEMMEM
+surface nor the MANAGED texture could be created. It now runs and passes:
+the row expects GetDC to fail and the out pointer to stay untouched, and the
+format has no GDI mapping. The row uploads no pixels. The other upstream
+references are the display-format table of test_display_formats, where the
+format stays no display, back-buffer or render-target format, and the
+identity row of test_format_conversion. No failing site moves on any leg.
+
+The end-to-end suite checks ten-bit precision per lane, the four alpha
+codes and the raw lock and copy words. Render-target, sRGB and legacy
+bump-map queries are rejected. Texture and cube AUTOGEN answers NOAUTOGEN
+with one physical level and the requested usage retained. ColorFill of a
+DEFAULT offscreen plain surface encodes each channel to its nearest code;
+the rounding of a Windows driver has not been measured.
