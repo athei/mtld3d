@@ -25,18 +25,20 @@ use mtld3d_types::{
     D3DRS_LIGHTING, D3DRS_LOCALVIEWER, D3DRS_NORMALIZENORMALS, D3DRS_POINTSCALEENABLE,
     D3DRS_POINTSPRITEENABLE, D3DRS_RANGEFOGENABLE, D3DRS_SPECULARENABLE,
     D3DRS_SPECULARMATERIALSOURCE, D3DRS_TEXTUREFACTOR, D3DRS_VERTEXBLEND, D3DTA_ALPHAREPLICATE,
-    D3DTA_COMPLEMENT, D3DTA_CONSTANT, D3DTOP_DISABLE, D3DTOP_LERP, D3DTSS_ALPHAARG1,
-    D3DTSS_ALPHAARG2, D3DTSS_ALPHAOP, D3DTSS_BUMPENVLOFFSET, D3DTSS_BUMPENVLSCALE,
-    D3DTSS_BUMPENVMAT00, D3DTSS_BUMPENVMAT01, D3DTSS_BUMPENVMAT10, D3DTSS_BUMPENVMAT11,
-    D3DTSS_COLORARG1, D3DTSS_COLORARG2, D3DTSS_COLOROP, D3DTSS_TEXCOORDINDEX,
-    D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_PROJECTED, RENDER_STATE_COUNT, StateBlockType,
-    TEXTURE_STAGE_STATE_COUNT, texture_stage_state_defaults,
+    D3DTA_COMPLEMENT, D3DTA_CONSTANT, D3DTA_CURRENT, D3DTA_TEMP, D3DTOP_DISABLE, D3DTOP_LERP,
+    D3DTSS_ALPHAARG1, D3DTSS_ALPHAARG2, D3DTSS_ALPHAOP, D3DTSS_BUMPENVLOFFSET,
+    D3DTSS_BUMPENVLSCALE, D3DTSS_BUMPENVMAT00, D3DTSS_BUMPENVMAT01, D3DTSS_BUMPENVMAT10,
+    D3DTSS_BUMPENVMAT11, D3DTSS_COLORARG1, D3DTSS_COLORARG2, D3DTSS_COLOROP, D3DTSS_RESULTARG,
+    D3DTSS_TEXCOORDINDEX, D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_PROJECTED, RENDER_STATE_COUNT,
+    StateBlockType, TEXTURE_STAGE_STATE_COUNT, texture_stage_state_defaults,
 };
 
 use crate::{
     LOG_TARGET,
     convert::FfVsLayout,
-    dxso::{FfPsKey, FfStage, FfVsFlags, FfVsKey, VariantFlags, VariantKey},
+    dxso::{
+        FfPsKey, FfStage, FfStageFlags, FfStageResult, FfVsFlags, FfVsKey, VariantFlags, VariantKey,
+    },
     scratch::ScratchArena,
 };
 
@@ -1195,7 +1197,15 @@ impl FfState {
             // `D3DTSS_TEXCOORDINDEX` is now consumed VS-side via
             // `FfVsKey::tci_modes` + `tci_coord_indices` (one entry per
             // stage). The PS samples `Varyings.texcoord[stage]` 1:1.
-            stage.has_texture = (bound_texture_mask & (1 << i)) != 0;
+            stage.flags.set(
+                FfStageFlags::HAS_TEXTURE,
+                (bound_texture_mask & (1 << i)) != 0,
+            );
+            stage.set_result(if u32::from(to_u8(D3DTSS_RESULTARG)) == D3DTA_TEMP {
+                FfStageResult::Temp
+            } else {
+                FfStageResult::Current
+            });
         }
         FfPsKey {
             stages,
@@ -1810,6 +1820,7 @@ fn stage_enum_value(stage_states: &[u32; TEXTURE_STAGE_STATE_COUNT], stage: u8, 
     let byte = value.to_le_bytes()[0];
     let fits = u32::from(byte) == value;
     let in_space = match ty {
+        D3DTSS_RESULTARG => matches!(value, D3DTA_CURRENT | D3DTA_TEMP),
         D3DTSS_COLOROP | D3DTSS_ALPHAOP => fits && (D3DTOP_DISABLE..=D3DTOP_LERP).contains(&value),
         D3DTSS_COLORARG1 | D3DTSS_COLORARG2 | D3DTSS_ALPHAARG1 | D3DTSS_ALPHAARG2 => {
             fits && value & !(D3DTA_COMPLEMENT | D3DTA_ALPHAREPLICATE) <= D3DTA_CONSTANT
@@ -2146,7 +2157,8 @@ const fn tss_classify(ty: u32) -> TssClass {
         | D3DTSS_ALPHAARG1
         | D3DTSS_ALPHAARG2
         | D3DTSS_TEXCOORDINDEX
-        | D3DTSS_TEXTURETRANSFORMFLAGS => TssClass::Consumed,
+        | D3DTSS_TEXTURETRANSFORMFLAGS
+        | D3DTSS_RESULTARG => TssClass::Consumed,
 
         // Neither consumes.
         _ => TssClass::NotImplemented,

@@ -1282,3 +1282,14 @@ remain unsupported. Adding these two codecs does not broaden the separately
 validated UpdateSurface/UpdateTexture format set. The existing device.c
 StretchRect matrix covers A8R8G8B8, X8R8G8B8 and R5G6B5, so these corrections
 are pinned by end-to-end pixel regressions rather than a baseline reduction.
+
+### visual.c/tssargtemp_test
+
+The fixed-function cascade supports the optional TSSARGTEMP capability.
+RESULTARG selects CURRENT or a fragment-local TEMP register initialized to
+zero. Both color and alpha read the pre-stage register values before the
+whole result is assigned. The final output remains CURRENT. The Wine test
+at 12124 combines independently retained red CURRENT and green TEMP values
+into yellow; the focused end-to-end tests additionally cover initialization,
+modifiers, destination changes, stateblocks, and Reset. No uniform or texture
+allocation backs the register.

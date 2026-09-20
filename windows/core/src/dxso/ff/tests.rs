@@ -10,7 +10,7 @@ use mtld3d_types::{
     D3DTOP_DISABLE, D3DTOP_MODULATE, D3DTOP_SELECTARG1,
 };
 
-use super::{FfPsKey, FfStage, FfVsFlags, FfVsKey, emit_ps_ff, emit_vs_ff};
+use super::{FfPsKey, FfStage, FfStageFlags, FfVsFlags, FfVsKey, emit_ps_ff, emit_vs_ff};
 use crate::dxso::emit::{VariantFlags, VariantKey};
 
 /// D3D enum constant at the key's narrow width.
@@ -75,7 +75,7 @@ fn premultiplied_blend_reads_unmodified_texture_alpha_for_both_channels() {
         alpha_op: narrow(D3DTOP_BLENDTEXTUREALPHAPM),
         alpha_arg1: narrow(D3DTA_DIFFUSE),
         alpha_arg2: narrow(D3DTA_CURRENT),
-        has_texture: true,
+        flags: FfStageFlags::HAS_TEXTURE,
     };
     assert_eq!(ps.sampled_stage_mask(), 1);
     assert!(ps.reads_texture_factor());
@@ -93,7 +93,7 @@ fn premultiplied_blend_reads_unmodified_texture_alpha_for_both_channels() {
         "{msl}"
     );
 
-    ps.stages[0].has_texture = false;
+    ps.stages[0].flags.remove(FfStageFlags::HAS_TEXTURE);
     assert_eq!(ps.sampled_stage_mask(), 0);
     let missing = emit_ps_ff(&ps, VariantKey::default());
     assert!(!missing.contains("[[texture(0)]]"), "{missing}");
@@ -441,7 +441,7 @@ fn emits_texture_sample_and_modulate() {
         alpha_op: narrow(D3DTOP_MODULATE),
         alpha_arg1: narrow(D3DTA_TEXTURE),
         alpha_arg2: narrow(D3DTA_CURRENT),
-        has_texture: true,
+        flags: FfStageFlags::HAS_TEXTURE,
     };
     let msl = emit_pair_for_tests(&vs, &ps, VariantKey::default());
     assert!(msl.contains("texture2d<float> s0 [[texture(0)]]"), "{msl}");
@@ -470,7 +470,7 @@ fn depth_sampler_mask_emits_depth2d_and_sample_compare() {
         alpha_op: 2,
         alpha_arg1: 2,
         alpha_arg2: 1,
-        has_texture: true,
+        flags: FfStageFlags::HAS_TEXTURE,
     };
 
     // Colour variant (mask 0): plain texture2d + sample.
@@ -530,7 +530,7 @@ fn volume_sampler_mask_emits_texture3d_and_xyz_sample() {
         alpha_op: 2,
         alpha_arg1: 2,
         alpha_arg2: 1,
-        has_texture: true,
+        flags: FfStageFlags::HAS_TEXTURE,
     };
 
     let volume = emit_pair_for_tests(
@@ -588,7 +588,7 @@ fn cube_sampler_mask_emits_texturecube_and_xyz_sample() {
         alpha_op: 2,
         alpha_arg1: 2,
         alpha_arg2: 1,
-        has_texture: true,
+        flags: FfStageFlags::HAS_TEXTURE,
     };
 
     let cube = emit_pair_for_tests(
@@ -816,7 +816,7 @@ fn multi_stage_modulate() {
         alpha_op: 2,
         alpha_arg1: 2,
         alpha_arg2: 1,
-        has_texture: true,
+        flags: FfStageFlags::HAS_TEXTURE,
     };
     ps.stages[1] = FfStage {
         color_op: 4,   // MODULATE
@@ -825,7 +825,7 @@ fn multi_stage_modulate() {
         alpha_op: 4,
         alpha_arg1: 2,
         alpha_arg2: 1,
-        has_texture: true,
+        flags: FfStageFlags::HAS_TEXTURE,
     };
     let msl = emit_pair_for_tests(&vs, &ps, VariantKey::default());
     assert!(msl.contains("s0.sample(samp0, in.texcoord0.xy)"), "{msl}");
@@ -845,7 +845,7 @@ fn stops_at_first_disabled_stage() {
         alpha_op: 2,   // SELECTARG1
         alpha_arg1: 0,
         alpha_arg2: 1,
-        has_texture: false,
+        flags: FfStageFlags::empty(),
     };
     ps.stages[1] = stage_disable();
     ps.stages[2] = FfStage {
@@ -855,7 +855,7 @@ fn stops_at_first_disabled_stage() {
         alpha_op: 4,
         alpha_arg1: 2,
         alpha_arg2: 1,
-        has_texture: true,
+        flags: FfStageFlags::HAS_TEXTURE,
     };
     let msl = emit_pair_for_tests(&vs, &ps, VariantKey::default());
     // Stage 2 must not emit a texture sample because iteration stopped at stage 1.
@@ -882,7 +882,7 @@ fn tci_passthru_honours_coord_index_override() {
         alpha_op: 4,
         alpha_arg1: 2,
         alpha_arg2: 1,
-        has_texture: true,
+        flags: FfStageFlags::HAS_TEXTURE,
     };
     let msl = emit_pair_for_tests(&vs, &ps, VariantKey::default());
     assert!(
@@ -911,7 +911,7 @@ fn tci_cameraspacereflection_emits_reflection_vector() {
         alpha_op: 4,
         alpha_arg1: 2,
         alpha_arg2: 1,
-        has_texture: true,
+        flags: FfStageFlags::HAS_TEXTURE,
     };
     let msl = emit_pair_for_tests(&vs, &ps, VariantKey::default());
     // Eye-space normal + position must be declared (pre-scan hoist, since
@@ -980,7 +980,7 @@ fn ttff_count2_emits_texture_matrix_mul() {
         alpha_op: 4,
         alpha_arg1: 2,
         alpha_arg2: 1,
-        has_texture: true,
+        flags: FfStageFlags::HAS_TEXTURE,
     };
     let msl = emit_pair_for_tests(&vs, &ps, VariantKey::default());
     // First unbacked component (index n=2) padded to 1.0 before the matmul.
@@ -1030,7 +1030,7 @@ fn active_stage_without_input_texcoords_does_not_reference_v4() {
         alpha_op: 4,
         alpha_arg1: 2,
         alpha_arg2: 1,
-        has_texture: true,
+        flags: FfStageFlags::HAS_TEXTURE,
     };
     let msl = emit_pair_for_tests(&vs, &ps, VariantKey::default());
     assert!(
@@ -1328,7 +1328,7 @@ fn lod_bias_variant_biases_the_fixed_function_sample() {
         color_arg1: narrow(D3DTA_TEXTURE),
         alpha_op: narrow(D3DTOP_SELECTARG1),
         alpha_arg1: narrow(D3DTA_TEXTURE),
-        has_texture: true,
+        flags: FfStageFlags::HAS_TEXTURE,
         ..FfStage::default()
     };
 
@@ -1441,7 +1441,7 @@ fn modulate_keeps_separate_color_and_alpha_arguments() {
         color_arg2: narrow(D3DTA_DIFFUSE),
         alpha_op: narrow(D3DTOP_SELECTARG1),
         alpha_arg1: narrow(D3DTA_TFACTOR),
-        has_texture: true,
+        flags: FfStageFlags::HAS_TEXTURE,
         ..FfStage::default()
     };
     let msl = emit_ps_ff(&ps, VariantKey::default());
@@ -1482,7 +1482,11 @@ fn premultiplied_alpha_follows_effective_dotproduct3_color() {
             alpha_op: narrow(D3DTOP_SELECTARG1),
             alpha_arg1: narrow(D3DTA_DIFFUSE),
             alpha_arg2: narrow(D3DTA_TFACTOR),
-            has_texture,
+            flags: if has_texture {
+                FfStageFlags::HAS_TEXTURE
+            } else {
+                FfStageFlags::empty()
+            },
         };
         let dot = emit_ps_ff(&ps, VariantKey::default());
         ps.stages[0].alpha_op = narrow(D3DTOP_BLENDTEXTUREALPHAPM);
@@ -1490,7 +1494,7 @@ fn premultiplied_alpha_follows_effective_dotproduct3_color() {
 
         // A missing explicit color argument falls back before DOT3 can
         // override alpha, leaving the independent PM operation effective.
-        ps.stages[0].has_texture = false;
+        ps.stages[0].flags.remove(FfStageFlags::HAS_TEXTURE);
         ps.stages[0].color_arg1 = narrow(D3DTA_TEXTURE);
         let fallback = emit_ps_ff(&ps, VariantKey::default());
         assert!(
@@ -1501,4 +1505,190 @@ fn premultiplied_alpha_follows_effective_dotproduct3_color() {
         ps.stages[0].color_arg1 = narrow(D3DTA_CURRENT);
         assert_eq!(fallback, emit_ps_ff(&ps, VariantKey::default()));
     }
+}
+
+#[test]
+fn temp_register_keeps_both_old_channels_until_whole_result_assignment() {
+    use mtld3d_types::{D3DTA_COMPLEMENT, D3DTA_TEMP, D3DTA_TFACTOR};
+
+    use super::FfStageResult;
+    let mut stages = [stage_disable(); 8];
+    for stage in &mut stages[..3] {
+        stage.color_op = narrow(D3DTOP_SELECTARG1);
+        stage.alpha_op = narrow(D3DTOP_SELECTARG1);
+    }
+    stages[0].color_arg1 = narrow(D3DTA_TFACTOR);
+    stages[0].alpha_arg1 = narrow(D3DTA_TFACTOR);
+    stages[0].set_result(FfStageResult::Temp);
+    stages[1].color_arg1 = narrow(D3DTA_TEMP | D3DTA_ALPHAREPLICATE);
+    stages[1].alpha_arg1 = narrow(D3DTA_TEMP | D3DTA_COMPLEMENT);
+    stages[1].set_result(FfStageResult::Temp);
+    stages[2].color_arg1 = narrow(D3DTA_TEMP);
+    stages[2].alpha_arg1 = narrow(D3DTA_CURRENT);
+    let key = FfPsKey {
+        stages,
+        specular_add: false,
+        tt_projected_mask: 0,
+    };
+    let msl = emit_ps_ff(&key, VariantKey::default());
+    assert_eq!(msl.matches("float4 temp = float4(0.0);").count(), 1);
+    assert!(msl.contains("temp = float4((temp.aaaa).rgb, ((1.0 - temp)).a);"));
+    assert!(msl.contains("current = float4((temp).rgb, (current).a);"));
+    assert!(msl.contains("float4 oC0 = current;"));
+    assert!(!msl.contains("temp.rgb ="));
+    assert!(!msl.contains("temp.a ="));
+}
+
+#[test]
+fn unused_temp_operands_and_disabled_stages_emit_no_register() {
+    use mtld3d_types::D3DTA_TEMP;
+
+    use super::FfStageResult;
+    let mut stages = [stage_disable(); 8];
+    stages[0] = FfStage {
+        color_op: narrow(D3DTOP_SELECTARG1),
+        color_arg1: narrow(D3DTA_CURRENT),
+        color_arg2: narrow(D3DTA_TEMP),
+        alpha_op: narrow(D3DTOP_SELECTARG1),
+        alpha_arg1: narrow(D3DTA_DIFFUSE),
+        alpha_arg2: narrow(D3DTA_TEMP),
+        flags: FfStageFlags::empty(),
+    };
+    stages[1].set_result(FfStageResult::Temp);
+    stages[2] = stages[0];
+    stages[2].color_arg1 = narrow(D3DTA_TEMP);
+    let mut key = FfPsKey {
+        stages,
+        specular_add: false,
+        tt_projected_mask: 0,
+    };
+    assert!(!emit_ps_ff(&key, VariantKey::default()).contains("float4 temp"));
+    // The unbound-texture fallback replaces this whole color expression.
+    key.stages[0].color_op = narrow(D3DTOP_MODULATE);
+    key.stages[0].color_arg1 = narrow(D3DTA_TEXTURE);
+    assert!(!emit_ps_ff(&key, VariantKey::default()).contains("float4 temp"));
+    key.stages[0].flags.insert(FfStageFlags::HAS_TEXTURE);
+    assert!(emit_ps_ff(&key, VariantKey::default()).contains("float4 temp"));
+}
+
+#[test]
+fn packed_stage_preserves_legacy_current_hash_stream_and_key_sizes() {
+    use std::hash::{Hash, Hasher};
+
+    use super::FfStageResult;
+    #[derive(Hash)]
+    struct LegacyStage {
+        color_op: u8,
+        color_arg1: u8,
+        color_arg2: u8,
+        alpha_op: u8,
+        alpha_arg1: u8,
+        alpha_arg2: u8,
+        has_texture: bool,
+    }
+    #[derive(Hash)]
+    struct LegacyKey {
+        stages: [LegacyStage; 8],
+        specular_add: bool,
+        tt_projected_mask: u8,
+    }
+    #[derive(Default)]
+    struct HashWrites(Vec<u8>);
+    impl Hasher for HashWrites {
+        fn finish(&self) -> u64 {
+            0
+        }
+        fn write(&mut self, bytes: &[u8]) {
+            self.0.extend_from_slice(bytes);
+        }
+    }
+    fn writes(value: &impl Hash) -> Vec<u8> {
+        let mut h = HashWrites::default();
+        value.hash(&mut h);
+        h.0
+    }
+    assert_eq!(size_of::<FfStage>(), 7);
+    assert_eq!(size_of::<FfPsKey>(), 58);
+    assert_eq!(align_of::<FfPsKey>(), 1);
+    for mask in 0u8..=u8::MAX {
+        let stages = std::array::from_fn(|i| FfStage {
+            color_op: narrow(D3DTOP_MODULATE),
+            color_arg1: narrow(D3DTA_TEXTURE),
+            color_arg2: narrow(D3DTA_DIFFUSE),
+            alpha_op: narrow(D3DTOP_SELECTARG1),
+            alpha_arg1: narrow(D3DTA_CURRENT),
+            alpha_arg2: narrow(D3DTA_TEXTURE),
+            flags: if mask & (1 << i) != 0 {
+                FfStageFlags::HAS_TEXTURE
+            } else {
+                FfStageFlags::empty()
+            },
+        });
+        let mut key = FfPsKey {
+            stages,
+            specular_add: mask & 1 != 0,
+            tt_projected_mask: mask,
+        };
+        let legacy = LegacyKey {
+            stages: key.stages.each_ref().map(|s| LegacyStage {
+                color_op: s.color_op,
+                color_arg1: s.color_arg1,
+                color_arg2: s.color_arg2,
+                alpha_op: s.alpha_op,
+                alpha_arg1: s.alpha_arg1,
+                alpha_arg2: s.alpha_arg2,
+                has_texture: s.has_texture(),
+            }),
+            specular_add: key.specular_add,
+            tt_projected_mask: key.tt_projected_mask,
+        };
+        assert_eq!(writes(&key), writes(&legacy), "CURRENT stream, mask {mask}");
+        assert_eq!(
+            crate::shader_cache::ff_key_hash(&key),
+            crate::shader_cache::ff_key_hash(&legacy)
+        );
+        let current = key.clone();
+        key.stages[0].set_result(FfStageResult::Temp);
+        assert_ne!(key, current);
+        assert_ne!(writes(&key), writes(&current));
+        assert_ne!(
+            crate::shader_cache::ff_key_hash(&key),
+            crate::shader_cache::ff_key_hash(&current)
+        );
+        assert_eq!(key.stages[0].has_texture(), mask & 1 != 0);
+    }
+}
+
+#[test]
+fn temp_detection_tracks_effective_dotproduct3_alpha_consumption() {
+    use mtld3d_types::{D3DTA_TEMP, D3DTA_TFACTOR, D3DTOP_DOTPRODUCT3};
+
+    use super::FfStageResult;
+    let mut key = default_ps_key();
+    key.stages[0] = FfStage {
+        color_op: narrow(D3DTOP_DOTPRODUCT3),
+        color_arg1: narrow(D3DTA_DIFFUSE),
+        color_arg2: narrow(D3DTA_TFACTOR),
+        alpha_op: narrow(D3DTOP_SELECTARG1),
+        alpha_arg1: narrow(D3DTA_TEMP),
+        ..FfStage::default()
+    };
+    let current = emit_ps_ff(&key, VariantKey::default());
+    assert!(
+        !current.contains("float4 temp"),
+        "effective DOT3 ignores TEMP alpha input"
+    );
+    key.stages[0].set_result(FfStageResult::Temp);
+    let temp = emit_ps_ff(&key, VariantKey::default());
+    assert!(temp.contains("float4 temp = float4(0.0);"));
+    assert!(temp.contains("temp = float4(saturate(4.0 * dot("));
+    assert!(
+        !temp.contains("(temp).a"),
+        "ignored alpha op must not split the DOT3 write"
+    );
+    key.stages[0].set_result(FfStageResult::Current);
+    key.stages[0].color_arg1 = narrow(D3DTA_TEXTURE);
+    let unbound = emit_ps_ff(&key, VariantKey::default());
+    assert!(unbound.contains("float4 temp = float4(0.0);"));
+    assert!(unbound.contains("current = float4((current).rgb, (temp).a);"));
 }

@@ -5209,3 +5209,37 @@ fn vertex_sampler_kinds_reads_one_slot_at_a_time() {
         }
     );
 }
+
+#[test]
+fn ff_temp_register_compiles_with_simultaneous_color_alpha_updates() {
+    use mtld3d_types::{
+        D3DTA_ALPHAREPLICATE, D3DTA_COMPLEMENT, D3DTA_TEMP, D3DTOP_DISABLE, D3DTOP_SELECTARG1,
+    };
+
+    use crate::dxso::{FfPsKey, FfStage, FfStageResult, emit_ps_ff};
+    let narrow = |value| u8::try_from(value).expect("D3D stage value fits one byte");
+    let mut stages = [FfStage {
+        color_op: narrow(D3DTOP_DISABLE),
+        ..FfStage::default()
+    }; 8];
+    stages[0] = FfStage {
+        color_op: narrow(D3DTOP_SELECTARG1),
+        color_arg1: narrow(D3DTA_TEMP | D3DTA_ALPHAREPLICATE),
+        alpha_op: narrow(D3DTOP_SELECTARG1),
+        alpha_arg1: narrow(D3DTA_TEMP | D3DTA_COMPLEMENT),
+        ..FfStage::default()
+    };
+    stages[0].set_result(FfStageResult::Temp);
+    stages[1] = stages[0];
+    stages[1].set_result(FfStageResult::Current);
+    let mut key = FfPsKey {
+        stages,
+        specular_add: false,
+        tt_projected_mask: 0,
+    };
+    metal_compile_or_fail(&emit_ps_ff(&key, VariantKey::default()));
+    key.stages[0].color_op = narrow(mtld3d_types::D3DTOP_DOTPRODUCT3);
+    metal_compile_or_fail(&emit_ps_ff(&key, VariantKey::default()));
+    key.stages[0].color_arg1 = narrow(mtld3d_types::D3DTA_TEXTURE);
+    metal_compile_or_fail(&emit_ps_ff(&key, VariantKey::default()));
+}

@@ -1232,3 +1232,33 @@ fn shader_owned_fog_reuses_the_existing_disabled_key_and_source() {
         }
     }
 }
+
+#[test]
+fn resultarg_narrows_to_the_typed_destination_and_preserves_raw_state() {
+    use mtld3d_types::{D3DTA_CURRENT, D3DTA_TEMP, D3DTSS_RESULTARG, render_state_defaults};
+
+    use crate::dxso::FfStageResult;
+    let mut state = FfState::new();
+    let rs = render_state_defaults();
+    for value in [D3DTA_TEMP, D3DTA_CURRENT, 0, 0x105, u32::MAX] {
+        state.set_texture_stage_state(0, D3DTSS_RESULTARG as usize, value);
+        let key = state.build_ps_key(&rs, 1);
+        assert_eq!(
+            state.texture_stage_states[0][D3DTSS_RESULTARG as usize],
+            value
+        );
+        assert_eq!(
+            key.stages[0].result(),
+            if value == D3DTA_TEMP {
+                FfStageResult::Temp
+            } else {
+                FfStageResult::Current
+            }
+        );
+        assert!(key.stages[0].has_texture());
+    }
+    assert_eq!(
+        FfState::new().build_ps_key(&rs, 0).stages[0].result(),
+        FfStageResult::Current
+    );
+}

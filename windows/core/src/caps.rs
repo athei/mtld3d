@@ -118,6 +118,7 @@ const PRIMITIVE_MISC_DEFAULT: PrimitiveMiscCaps = PrimitiveMiscCaps::MASKZ
     .union(PrimitiveMiscCaps::CULLNONE)
     .union(PrimitiveMiscCaps::CULLCW)
     .union(PrimitiveMiscCaps::CULLCCW)
+    .union(PrimitiveMiscCaps::TSSARGTEMP)
     .union(PrimitiveMiscCaps::COLORWRITEENABLE)
     .union(PrimitiveMiscCaps::CLIPTLVERTS)
     .union(PrimitiveMiscCaps::BLENDOP)

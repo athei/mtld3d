@@ -33,7 +33,7 @@ use mtld3d_types::{
     D3DCMP_LESSEQUAL, D3DCMP_NEVER, D3DCMP_NOTEQUAL, D3DDECLUSAGE_BLENDINDICES,
     D3DDECLUSAGE_BLENDWEIGHT, D3DDECLUSAGE_COLOR, D3DDECLUSAGE_NORMAL, D3DDECLUSAGE_POSITION,
     D3DDECLUSAGE_POSITIONT, D3DDECLUSAGE_PSIZE, D3DDECLUSAGE_TEXCOORD, D3DTA_ALPHAREPLICATE,
-    D3DTA_COMPLEMENT, D3DTA_CURRENT, D3DTA_DIFFUSE, D3DTA_SELECTMASK, D3DTA_SPECULAR,
+    D3DTA_COMPLEMENT, D3DTA_CURRENT, D3DTA_DIFFUSE, D3DTA_SELECTMASK, D3DTA_SPECULAR, D3DTA_TEMP,
     D3DTA_TEXTURE, D3DTA_TFACTOR, D3DTOP_ADD, D3DTOP_ADDSIGNED, D3DTOP_ADDSIGNED2X,
     D3DTOP_ADDSMOOTH, D3DTOP_BLENDCURRENTALPHA, D3DTOP_BLENDDIFFUSEALPHA, D3DTOP_BLENDFACTORALPHA,
     D3DTOP_BLENDTEXTUREALPHA, D3DTOP_BLENDTEXTUREALPHAPM, D3DTOP_DISABLE, D3DTOP_DOTPRODUCT3,
@@ -318,6 +318,24 @@ pub const fn tt_projected(flags: u8) -> bool {
     (flags & 0x10) != 0
 }
 
+bitflags::bitflags! {
+    /// Texture presence and result destination share one byte in the stage key.
+    // Copy keeps the existing seven-byte FfStage value semantics.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+    pub struct FfStageFlags: u8 {
+        const HAS_TEXTURE = 1 << 0;
+        const RESULT_TEMP = 1 << 1;
+    }
+}
+
+/// Register receiving one whole texture-stage result.
+// Copy lets the stage setter accept this scalar selector by value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FfStageResult {
+    Current,
+    Temp,
+}
+
 /// Per-stage texture combiner state derived from `texture_stage_states[stage]`.
 ///
 /// Note: D3D9's `D3DTSS_TEXCOORDINDEX` controls *both* the VS (TCI mode +
@@ -335,7 +353,28 @@ pub struct FfStage {
     pub alpha_op: u8,
     pub alpha_arg1: u8,
     pub alpha_arg2: u8,
-    pub has_texture: bool,
+    pub flags: FfStageFlags,
+}
+
+impl FfStage {
+    #[must_use]
+    pub const fn has_texture(&self) -> bool {
+        self.flags.contains(FfStageFlags::HAS_TEXTURE)
+    }
+
+    #[must_use]
+    pub const fn result(&self) -> FfStageResult {
+        if self.flags.contains(FfStageFlags::RESULT_TEMP) {
+            FfStageResult::Temp
+        } else {
+            FfStageResult::Current
+        }
+    }
+
+    pub fn set_result(&mut self, result: FfStageResult) {
+        self.flags
+            .set(FfStageFlags::RESULT_TEMP, result == FfStageResult::Temp);
+    }
 }
 
 /// Summary of the current D3D9 Fixed-Function pixel state.
@@ -374,7 +413,7 @@ impl FfPsKey {
             if u32::from(stage.color_op) == D3DTOP_DISABLE {
                 break;
             }
-            if stage.has_texture {
+            if stage.has_texture() {
                 mask |= 1u16 << i;
             }
         }
@@ -1463,7 +1502,7 @@ fn emit_ps(out: &mut String, ps: &FfPsKey, variant: VariantKey, entry: &str) {
         if u32::from(stage.color_op) == D3DTOP_DISABLE {
             break;
         }
-        if stage.has_texture {
+        if stage.has_texture() {
             // A depth-format texture bound to this slot (sampleable shadow
             // map) must be declared `depth2d<float>` — Metal rejects binding a
             // `Depth32Float` texture to a `texture2d<float>` slot. Mirrors the
@@ -1494,12 +1533,32 @@ fn emit_ps(out: &mut String, ps: &FfPsKey, variant: VariantKey, entry: &str) {
     // current = diffuse by default (CURRENT at stage 0 resolves to DIFFUSE
     // since no previous stage contributed).
     out.push_str("    float4 current = in.color0;\n");
+    // A local belongs to this fragment invocation, not a texture or draw.
+    // Ignore disabled stages and arguments discarded by SELECTARG1/2.
+    let uses_temp = ps
+        .stages
+        .iter()
+        .take_while(|s| u32::from(s.color_op) != D3DTOP_DISABLE)
+        .any(|s| {
+            let reads_temp = |op, arg1, arg2| {
+                op_reads_argument(op, arg1, arg2, D3DTA_TEMP)
+                    && (s.has_texture() || !op_reads_texture(op, arg1, arg2))
+            };
+            let dot_writes_alpha = u32::from(s.color_op) == D3DTOP_DOTPRODUCT3
+                && (s.has_texture() || !op_reads_texture(s.color_op, s.color_arg1, s.color_arg2));
+            s.result() == FfStageResult::Temp
+                || reads_temp(s.color_op, s.color_arg1, s.color_arg2)
+                || (!dot_writes_alpha && reads_temp(s.alpha_op, s.alpha_arg1, s.alpha_arg2))
+        });
+    if uses_temp {
+        out.push_str("    float4 temp = float4(0.0);\n");
+    }
 
     for (i, stage) in ps.stages.iter().enumerate() {
         if u32::from(stage.color_op) == D3DTOP_DISABLE {
             break;
         }
-        if stage.has_texture {
+        if stage.has_texture() {
             // VS emits the TCI-resolved coord for stage i into
             // `Varyings.texcoord[i]`, so PS stage i samples slot i directly.
             // Depth slots are comparison samplers (`compareFunction =
@@ -1583,32 +1642,38 @@ fn emit_ps(out: &mut String, ps: &FfPsKey, variant: VariantKey, entry: &str) {
         // opaque white. SELECTARG1 of CURRENT is just `current`, so short-circuit
         // to it. Colour and alpha are tested independently; textured stages take
         // the byte-identical path.
-        let unbound_color = !stage.has_texture
+        let result = match stage.result() {
+            FfStageResult::Current => "current",
+            FfStageResult::Temp => "temp",
+        };
+        let unbound_color = !stage.has_texture()
             && op_reads_texture(stage.color_op, stage.color_arg1, stage.color_arg2);
         let color_expr = if unbound_color {
             "current".to_string()
         } else {
-            let c1 = resolve_arg(stage.color_arg1, i, stage.has_texture);
-            let c2 = resolve_arg(stage.color_arg2, i, stage.has_texture);
-            apply_op(stage.color_op, &c1, &c2, i, stage.has_texture)
+            let c1 = resolve_arg(stage.color_arg1, i, stage.has_texture());
+            let c2 = resolve_arg(stage.color_arg2, i, stage.has_texture());
+            apply_op(stage.color_op, &c1, &c2, i, stage.has_texture())
         };
         // DOTPRODUCT3 supplies alpha as well as RGB, ignoring the alpha operation.
         if !unbound_color && u32::from(stage.color_op) == D3DTOP_DOTPRODUCT3 {
-            let _ = writeln!(out, "    current = {color_expr};");
+            let _ = writeln!(out, "    {result} = {color_expr};");
             continue;
         }
-        let alpha_expr = if !stage.has_texture
+        let alpha_expr = if !stage.has_texture()
             && op_reads_texture(stage.alpha_op, stage.alpha_arg1, stage.alpha_arg2)
         {
             "current".to_string()
         } else {
-            let a1 = resolve_arg(stage.alpha_arg1, i, stage.has_texture);
-            let a2 = resolve_arg(stage.alpha_arg2, i, stage.has_texture);
-            apply_op_scalar(stage.alpha_op, &a1, &a2, i, stage.has_texture)
+            let a1 = resolve_arg(stage.alpha_arg1, i, stage.has_texture());
+            let a2 = resolve_arg(stage.alpha_arg2, i, stage.has_texture());
+            apply_op_scalar(stage.alpha_op, &a1, &a2, i, stage.has_texture())
         };
+        // Both expressions read the old register values before either channel
+        // changes, including when this stage reads its own destination.
         let _ = writeln!(
             out,
-            "    current = float4(({color_expr}).rgb, ({alpha_expr}).a);",
+            "    {result} = float4(({color_expr}).rgb, ({alpha_expr}).a);",
         );
     }
 
@@ -1671,9 +1736,13 @@ fn emit_ps(out: &mut String, ps: &FfPsKey, variant: VariantKey, entry: &str) {
 /// stage referencing an unbound texture so it can be rewritten to
 /// SELECTARG1(CURRENT) — the D3D9 default for an unbound-texture stage.
 fn op_reads_texture(op: u8, arg1: u8, arg2: u8) -> bool {
+    op_reads_argument(op, arg1, arg2, D3DTA_TEXTURE)
+}
+
+fn op_reads_argument(op: u8, arg1: u8, arg2: u8, selector: u32) -> bool {
     let op = u32::from(op);
-    let is_tex = |a: u8| u32::from(a & 0x0f) == D3DTA_TEXTURE;
-    (is_tex(arg1) && op != D3DTOP_SELECTARG2) || (is_tex(arg2) && op != D3DTOP_SELECTARG1)
+    let selected = |a: u8| u32::from(a) & D3DTA_SELECTMASK == selector;
+    (selected(arg1) && op != D3DTOP_SELECTARG2) || (selected(arg2) && op != D3DTOP_SELECTARG1)
 }
 
 fn resolve_arg(arg: u8, stage: usize, has_texture: bool) -> String {
@@ -1682,6 +1751,7 @@ fn resolve_arg(arg: u8, stage: usize, has_texture: bool) -> String {
     let resolved = match selector {
         D3DTA_DIFFUSE => "in.color0".to_string(),
         D3DTA_CURRENT => "current".to_string(),
+        D3DTA_TEMP => "temp".to_string(),
         D3DTA_SPECULAR => "in.color1".to_string(),
         D3DTA_TEXTURE => {
             if has_texture {
