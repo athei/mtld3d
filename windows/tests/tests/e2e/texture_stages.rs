@@ -742,7 +742,7 @@ fn quad(diffuse: u32) -> [TexturedVertex; 6] {
 
 /// Bind `tex`, set the stage colour op/args, draw a full quad of `diffuse`.
 ///
-/// Returns the centre pixel. Alpha always comes from the texture.
+/// Returns the centre pixel. The independent alpha operation selects the texture.
 fn render_stage(
     h: &Harness,
     tex: &Texture<'_>,
@@ -923,4 +923,138 @@ fn texturefactor_as_color_source() {
         px.r < 40 && px.g < 40 && px.b > 200,
         "tfactor blue, got {px:?}"
     );
+}
+
+fn dotproduct3_alpha_cascade(
+    h: &Harness,
+    color_arg: u32,
+    alpha_arg: u32,
+    diffuse: u32,
+    factor: u32,
+) -> Rgba8 {
+    use mtld3d_types::{D3DTA_ALPHAREPLICATE, D3DTA_CURRENT, D3DTOP_DOTPRODUCT3};
+
+    assert_eq!(h.set_render_state(D3DRS_LIGHTING, 0), 0);
+    assert_eq!(h.set_render_state(D3DRS_TEXTUREFACTOR, factor), 0);
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1), 0);
+    for (stage, state, value) in [
+        (0, D3DTSS_COLOROP, D3DTOP_DOTPRODUCT3),
+        (0, D3DTSS_COLORARG1, color_arg),
+        (0, D3DTSS_COLORARG2, D3DTA_TFACTOR),
+        (0, D3DTSS_ALPHAOP, D3DTOP_SELECTARG1),
+        (0, D3DTSS_ALPHAARG1, alpha_arg),
+        (1, D3DTSS_COLOROP, D3DTOP_SELECTARG1),
+        (1, D3DTSS_COLORARG1, D3DTA_CURRENT | D3DTA_ALPHAREPLICATE),
+        (1, D3DTSS_ALPHAOP, D3DTOP_SELECTARG1),
+        (1, D3DTSS_ALPHAARG1, D3DTA_CURRENT),
+    ] {
+        assert_eq!(h.set_texture_stage_state(stage, state, value), 0);
+    }
+    let verts = quad(diffuse);
+    h.render_once(BLACK, |d| {
+        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &verts), 0);
+    });
+    Rgba8::from_pixel(h.read_pixel(320, 240))
+}
+
+#[test]
+fn dotproduct3_overrides_alpha_and_chains_current() {
+    let h = Harness::new();
+    let px = dotproduct3_alpha_cascade(&h, D3DTA_DIFFUSE, D3DTA_DIFFUSE, 0x4080_80C0, 0xFFFF_FFFF);
+    // The signed RGB dot is 131/255, while the conflicting alpha is 64/255.
+    for channel in [px.r, px.g, px.b] {
+        assert!(
+            channel.abs_diff(131) <= 2,
+            "DOTPRODUCT3 alpha in next stage: {px:?}"
+        );
+    }
+}
+
+#[test]
+fn dotproduct3_unbound_color_texture_preserves_independent_alpha() {
+    let h = Harness::new();
+    let px = dotproduct3_alpha_cascade(&h, D3DTA_TEXTURE, D3DTA_TFACTOR, 0x4080_80C0, 0xC0FF_FFFF);
+    // An unbound color texture selects CURRENT instead of executing DOTPRODUCT3.
+    for channel in [px.r, px.g, px.b] {
+        assert_eq!(
+            channel, 192,
+            "independent factor alpha after unbound color fallback: {px:?}"
+        );
+    }
+}
+
+#[test]
+fn dotproduct3_signed_clamp_and_argument_modifiers() {
+    use mtld3d_types::{D3DTA_ALPHAREPLICATE, D3DTA_COMPLEMENT, D3DTA_CURRENT, D3DTOP_DOTPRODUCT3};
+
+    let h = Harness::new();
+    for (state, value) in [
+        (D3DTSS_COLOROP, D3DTOP_SELECTARG1),
+        (D3DTSS_ALPHAOP, D3DTOP_SELECTARG1),
+        (D3DTSS_ALPHAARG1, D3DTA_CURRENT),
+    ] {
+        assert_eq!(h.set_texture_stage_state(1, state, value), 0);
+    }
+    for (name, texel, factor, texture_modifier, factor_modifier, expected) in [
+        ("positive", 0x4080_80C0, 0xFFFF_FFFF, 0, 0, 131u8),
+        ("negative clamp", 0x40FF_FFFF, 0xFF00_0000, 0, 0, 0),
+        ("positive clamp", 0x40FF_FFFF, 0xFFFF_FFFF, 0, 0, 255),
+        ("both negative", 0x4000_0000, 0xFF00_0000, 0, 0, 255),
+        (
+            "complement",
+            0x4080_80C0,
+            0xFFFF_FFFF,
+            D3DTA_COMPLEMENT,
+            0,
+            0,
+        ),
+        (
+            "both complemented",
+            0x4080_80C0,
+            0xFFFF_FFFF,
+            D3DTA_COMPLEMENT,
+            D3DTA_COMPLEMENT,
+            131,
+        ),
+        (
+            "alpha replicate",
+            0xA020_4080,
+            0xFF80_80FF,
+            D3DTA_ALPHAREPLICATE,
+            0,
+            66,
+        ),
+        (
+            "replicate then complement",
+            0xA020_4080,
+            0xFF80_80FF,
+            D3DTA_ALPHAREPLICATE | D3DTA_COMPLEMENT,
+            D3DTA_COMPLEMENT,
+            66,
+        ),
+    ] {
+        let tex = solid_texture(&h, texel);
+        assert_eq!(h.set_render_state(D3DRS_TEXTUREFACTOR, factor), 0);
+        // Read color directly, then observe alpha through the next stage's RGB.
+        for modifier in [0, D3DTA_ALPHAREPLICATE] {
+            assert_eq!(
+                h.set_texture_stage_state(1, D3DTSS_COLORARG1, D3DTA_CURRENT | modifier),
+                0
+            );
+            let px = render_stage(
+                &h,
+                &tex,
+                D3DTOP_DOTPRODUCT3,
+                D3DTA_TEXTURE | texture_modifier,
+                D3DTA_TFACTOR | factor_modifier,
+                0x4000_0000,
+            );
+            for channel in [px.r, px.g, px.b] {
+                assert!(
+                    channel.abs_diff(expected) <= 2,
+                    "{name}, next-stage modifier {modifier:#x}: expected {expected}, got {px:?}"
+                );
+            }
+        }
+    }
 }

@@ -1582,15 +1582,20 @@ fn emit_ps(out: &mut String, ps: &FfPsKey, variant: VariantKey, entry: &str) {
         // opaque white. SELECTARG1 of CURRENT is just `current`, so short-circuit
         // to it. Colour and alpha are tested independently; textured stages take
         // the byte-identical path.
-        let color_expr = if !stage.has_texture
-            && op_reads_texture(stage.color_op, stage.color_arg1, stage.color_arg2)
-        {
+        let unbound_color = !stage.has_texture
+            && op_reads_texture(stage.color_op, stage.color_arg1, stage.color_arg2);
+        let color_expr = if unbound_color {
             "current".to_string()
         } else {
             let c1 = resolve_arg(stage.color_arg1, i, stage.has_texture);
             let c2 = resolve_arg(stage.color_arg2, i, stage.has_texture);
             apply_op(stage.color_op, &c1, &c2, i, stage.has_texture)
         };
+        // DOTPRODUCT3 supplies alpha as well as RGB, ignoring the alpha operation.
+        if !unbound_color && u32::from(stage.color_op) == D3DTOP_DOTPRODUCT3 {
+            let _ = writeln!(out, "    current = {color_expr};");
+            continue;
+        }
         let alpha_expr = if !stage.has_texture
             && op_reads_texture(stage.alpha_op, stage.alpha_arg1, stage.alpha_arg2)
         {
