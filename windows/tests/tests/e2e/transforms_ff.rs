@@ -13,7 +13,7 @@ use mtld3d_types::{
     D3DTA_DIFFUSE, D3DTA_SPECULAR, D3DTA_TEXTURE, D3DTADDRESS_WRAP, D3DTEXF_POINT, D3DTOP_MODULATE,
     D3DTOP_SELECTARG1, D3DTS_PROJECTION, D3DTS_TEXTURE0, D3DTS_VIEW, D3DTS_WORLD, D3DTSS_ALPHAARG1,
     D3DTSS_ALPHAOP, D3DTSS_COLORARG1, D3DTSS_COLORARG2, D3DTSS_COLOROP, D3DTSS_TEXCOORDINDEX,
-    D3DVECTOR,
+    D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_COUNT2, D3DVECTOR,
 };
 
 #[rustfmt::skip]
@@ -972,4 +972,230 @@ fn texgen_cameraspaceposition_unlit() {
         assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad), 0, "draw");
     });
     assert_eye_position_texgen(&h, TEXGEN_UNLIT_LEVEL, "unlit, no normal");
+}
+
+/// `D3DTSS_TCI_SPHEREMAP`, in the same byte of `D3DTSS_TEXCOORDINDEX`.
+const TCI_SPHEREMAP: u32 = 4 << 16;
+
+/// The colour of texel (`col`, `row`) of the 4x4 sphere-map texture.
+///
+/// Red encodes the column and green the row in steps of 0x55, so a probe
+/// names the texel it read and a swapped or negated axis lands on a different
+/// colour. Blue is a constant 0x40, which keeps every texel apart from the
+/// magenta clear colour.
+const fn sphere_texel(col: u32, row: u32) -> u32 {
+    0xFF00_0040 | ((col * 0x55) << 16) | ((row * 0x55) << 8)
+}
+
+/// Arm stage 0 to show a 4x4 texture addressed by the sphere map, unmodulated.
+///
+/// `view` and `projection` place the quad: the sphere map depends on the
+/// direction from the eye to the vertex, so the tests move the geometry far
+/// from the eye in view space, which makes that direction the same for every
+/// vertex to within a hundredth, and undo the move in the projection.
+fn arm_sphere_map<'h>(h: &'h Harness, view: &[f32; 16], projection: &[f32; 16]) -> Texture<'h> {
+    assert_eq!(h.set_transform(D3DTS_WORLD, &IDENTITY), 0, "world");
+    assert_eq!(h.set_transform(D3DTS_VIEW, view), 0, "view");
+    assert_eq!(h.set_transform(D3DTS_PROJECTION, projection), 0, "proj");
+    let tex = h.create_texture(4, 4, 1, 0, D3DFMT_A8R8G8B8, 0);
+    let mut texels = [0u32; 16];
+    for row in 0..4u32 {
+        for col in 0..4u32 {
+            texels[(row * 4 + col) as usize] = sphere_texel(col, row);
+        }
+    }
+    tex.lock_rect(0, 0).write_u32(&texels);
+    assert_eq!(h.set_texture(0, &tex), 0, "SetTexture");
+    for (state, value) in [
+        (D3DTSS_COLOROP, D3DTOP_SELECTARG1),
+        (D3DTSS_COLORARG1, D3DTA_TEXTURE),
+        (D3DTSS_ALPHAOP, D3DTOP_SELECTARG1),
+        (D3DTSS_ALPHAARG1, D3DTA_TEXTURE),
+        (D3DTSS_TEXCOORDINDEX, TCI_SPHEREMAP),
+    ] {
+        assert_eq!(
+            h.set_texture_stage_state(0, state, value),
+            0,
+            "SetTextureStageState"
+        );
+    }
+    for (state, value) in [
+        (D3DSAMP_MINFILTER, D3DTEXF_POINT),
+        (D3DSAMP_MAGFILTER, D3DTEXF_POINT),
+        (D3DSAMP_ADDRESSU, D3DTADDRESS_WRAP),
+        (D3DSAMP_ADDRESSV, D3DTADDRESS_WRAP),
+    ] {
+        assert_eq!(h.set_sampler_state(0, state, value), 0, "SetSamplerState");
+    }
+    tex
+}
+
+/// View matrix that moves the geometry 100 units down the view axis.
+#[rustfmt::skip]
+const SPHERE_VIEW_AXIAL: [f32; 16] = [
+    1.0, 0.0, 0.0, 0.0,
+    0.0, 1.0, 0.0, 0.0,
+    0.0, 0.0, 1.0, 0.0,
+    0.0, 0.0, 100.0, 1.0,
+];
+
+/// Projection that brings eye-space z = 100 back to depth 0.5.
+#[rustfmt::skip]
+const SPHERE_PROJ_AXIAL: [f32; 16] = [
+    1.0, 0.0, 0.0, 0.0,
+    0.0, 1.0, 0.0, 0.0,
+    0.0, 0.0, 0.005, 0.0,
+    0.0, 0.0, 0.0, 1.0,
+];
+
+/// Draw one quad per viewport quadrant, each with its own normal, under the sphere map.
+///
+/// The quadrant with signs (`sx`, `sy`) carries the unit normal
+/// (0.576 `sx`, 0.168 `sy`, -0.8). With the eye-to-vertex direction
+/// E = (0, 0, 1): N.E = -0.8, R = E - 2 (N.E) N = E + 1.6 N
+/// = (0.9216 `sx`, 0.2688 `sy`, -0.28), R + (0, 0, 1) has length
+/// sqrt(0.84935 + 0.07225 + 0.5184) = 1.2, so m = 2.4 and
+/// (u, v) = (0.5 + 0.384 `sx`, 0.5 + 0.112 `sy`): 0.884 or 0.116 across,
+/// 0.612 or 0.388 down. The x and y components differ so that a swapped axis
+/// moves the coordinate to another texel. E is off the axis by at most 0.01
+/// at the outer corners, which moves a coordinate by less than 0.006, and
+/// every pixel interpolates between vertices that all lie in one texel.
+fn draw_sphere_map_quadrants(h: &Harness) {
+    let mut vertices = Vec::with_capacity(24);
+    for (sx, sy) in [(1.0f32, 1.0f32), (1.0, -1.0), (-1.0, 1.0), (-1.0, -1.0)] {
+        for (cx, cy) in TEXGEN_CORNERS {
+            // Map the corner from -1..1 onto the quadrant without mirroring
+            // it, so every quad keeps the clockwise winding.
+            vertices.push(LitVertex {
+                x: f32::midpoint(sx, cx),
+                y: f32::midpoint(sy, cy),
+                z: 0.0,
+                nx: 0.576 * sx,
+                ny: 0.168 * sy,
+                nz: -0.8,
+            });
+        }
+    }
+    h.render_once(0xFFFF_00FF, |d| {
+        assert_eq!(
+            d.draw_primitive_up(D3DPT_TRIANGLELIST, 8, &vertices),
+            0,
+            "draw"
+        );
+    });
+}
+
+/// Probe the centre of each quadrant for the texel (`col`, `row`) it must show.
+///
+/// The array is ordered right-top, right-bottom, left-top, left-bottom, the
+/// order [`draw_sphere_map_quadrants`] draws in.
+fn assert_sphere_map_quadrants(h: &Harness, expected: [(u32, u32); 4], context: &str) {
+    for ((x, y), (col, row)) in [(480, 120), (480, 360), (160, 120), (160, 360)]
+        .into_iter()
+        .zip(expected)
+    {
+        assert_pixel_approx(
+            h.read_pixel(x, y),
+            sphere_texel(col, row),
+            2,
+            &format!("{context}: texel ({col}, {row}) at ({x}, {y})"),
+        );
+    }
+}
+
+/// Texels the untransformed sphere map selects: column 3 or 0 from x, row 2 or 1 from y.
+const SPHERE_QUADRANT_TEXELS: [(u32, u32); 4] = [(3, 2), (3, 1), (0, 2), (0, 1)];
+
+#[test]
+fn texgen_spheremap_selects_the_texel_by_normal() {
+    // The FVF carries no texture coordinate, so a stage that passed its input
+    // through reads texel (0, 0) everywhere.
+    let h = Harness::new();
+    assert_eq!(h.set_render_state(D3DRS_LIGHTING, 0), 0, "lighting off");
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_NORMAL), 0, "SetFVF");
+    let _tex = arm_sphere_map(&h, &SPHERE_VIEW_AXIAL, &SPHERE_PROJ_AXIAL);
+    draw_sphere_map_quadrants(&h);
+    assert_sphere_map_quadrants(&h, SPHERE_QUADRANT_TEXELS, "unlit");
+}
+
+#[test]
+fn texgen_spheremap_lit_reads_the_lighting_normal() {
+    // With lighting on the sphere map reads the eye-space normal and position
+    // the lighting computation declares. The view is a pure translation, so
+    // that normal is the vertex normal and the texels are the unlit ones.
+    let h = Harness::new();
+    assert_eq!(h.set_render_state(D3DRS_LIGHTING, 1), 0, "lighting on");
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_NORMAL), 0, "SetFVF");
+    let _tex = arm_sphere_map(&h, &SPHERE_VIEW_AXIAL, &SPHERE_PROJ_AXIAL);
+    draw_sphere_map_quadrants(&h);
+    assert_sphere_map_quadrants(&h, SPHERE_QUADRANT_TEXELS, "lit");
+}
+
+#[test]
+fn texgen_spheremap_texture_transform_applies_after_generation() {
+    // COUNT2 multiplies the generated (u, v, 0, 1) by the stage matrix, here
+    // u' = v + 0.25 and v' = u. The quarter offset rides on the fourth
+    // component, which only a generated coordinate of dimension 3 pads to 1.
+    // Right-top: (0.612 + 0.25, 0.884) = (0.862, 0.884), texel (3, 3);
+    // right-bottom: (0.638, 0.884), texel (2, 3); left-top: (0.862, 0.116),
+    // texel (3, 0); left-bottom: (0.638, 0.116), texel (2, 0).
+    #[rustfmt::skip]
+    const SWAP_AND_SHIFT: [f32; 16] = [
+        0.0,  1.0, 0.0, 0.0,
+        1.0,  0.0, 0.0, 0.0,
+        0.0,  0.0, 1.0, 0.0,
+        0.25, 0.0, 0.0, 1.0,
+    ];
+    let h = Harness::new();
+    assert_eq!(h.set_render_state(D3DRS_LIGHTING, 0), 0, "lighting off");
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_NORMAL), 0, "SetFVF");
+    let _tex = arm_sphere_map(&h, &SPHERE_VIEW_AXIAL, &SPHERE_PROJ_AXIAL);
+    assert_eq!(h.set_transform(D3DTS_TEXTURE0, &SWAP_AND_SHIFT), 0, "tex");
+    assert_eq!(
+        h.set_texture_stage_state(0, D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_COUNT2),
+        0,
+        "COUNT2"
+    );
+    draw_sphere_map_quadrants(&h);
+    assert_sphere_map_quadrants(&h, [(3, 3), (2, 3), (3, 0), (2, 0)], "transformed");
+}
+
+#[test]
+fn texgen_spheremap_without_normal_maps_the_view_direction() {
+    // A vertex without a normal reads a zero normal, so R is the eye-to-vertex
+    // direction E. The view moves the quad to (50, -50, 80) and the projection
+    // moves it back: E = (5, -5, 8) / sqrt(114) = (0.4683, -0.4683, 0.7493),
+    // m = 2 sqrt(2 + 2 * 0.7493) = 3.7409, (u, v) = (0.6252, 0.3748), texel
+    // (2, 1) over the whole quad. The FVF has no texture coordinate, so a
+    // stage that fell back to its input reads texel (0, 0).
+    #[rustfmt::skip]
+    const VIEW: [f32; 16] = [
+        1.0,   0.0,  0.0,  0.0,
+        0.0,   1.0,  0.0,  0.0,
+        0.0,   0.0,  1.0,  0.0,
+        50.0, -50.0, 80.0, 1.0,
+    ];
+    #[rustfmt::skip]
+    const PROJECTION: [f32; 16] = [
+        1.0,   0.0,  0.0,     0.0,
+        0.0,   1.0,  0.0,     0.0,
+        0.0,   0.0,  0.00625, 0.0,
+        -50.0, 50.0, 0.0,     1.0,
+    ];
+    let h = Harness::new();
+    assert_eq!(h.set_render_state(D3DRS_LIGHTING, 0), 0, "lighting off");
+    assert_eq!(h.set_fvf(D3DFVF_XYZ), 0, "SetFVF (no normal)");
+    let _tex = arm_sphere_map(&h, &VIEW, &PROJECTION);
+    let quad = TEXGEN_CORNERS.map(|(x, y)| PosVertex { x, y, z: 0.0 });
+    h.render_once(0xFFFF_00FF, |d| {
+        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad), 0, "draw");
+    });
+    for (x, y) in [(320, 240), (80, 60), (560, 420)] {
+        assert_pixel_approx(
+            h.read_pixel(x, y),
+            sphere_texel(2, 1),
+            2,
+            &format!("no normal: texel (2, 1) at ({x}, {y})"),
+        );
+    }
 }

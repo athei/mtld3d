@@ -263,6 +263,7 @@ fn point_size_cap_is_the_render_state_default() {
 #[test]
 fn vertex_processing_caps_matches_implementation() {
     let expected = VtxpCaps::TEXGEN
+        | VtxpCaps::TEXGEN_SPHEREMAP
         | VtxpCaps::MATERIALSOURCE7
         | VtxpCaps::DIRECTIONALLIGHTS
         | VtxpCaps::POSITIONALLIGHTS

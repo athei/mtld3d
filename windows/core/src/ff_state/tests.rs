@@ -10,7 +10,7 @@ use mtld3d_types::{
     D3DFOG_EXP, D3DFOG_LINEAR, D3DMATRIX, D3DRS_DEPTHBIAS, D3DRS_FOGCOLOR, D3DRS_FOGDENSITY,
     D3DRS_FOGENABLE, D3DRS_FOGEND, D3DRS_FOGSTART, D3DRS_FOGTABLEMODE, D3DRS_FOGVERTEXMODE,
     D3DRS_TEXTUREFACTOR, D3DTOP_MODULATE, D3DTSS_BUMPENVMAT00, D3DTSS_COLOROP,
-    D3DTSS_TEXTURETRANSFORMFLAGS, RENDER_STATE_COUNT, render_state_defaults,
+    D3DTSS_TEXCOORDINDEX, D3DTSS_TEXTURETRANSFORMFLAGS, RENDER_STATE_COUNT, render_state_defaults,
 };
 
 use super::{FfState, FfVsLayout, VariantFlags, VariantKey, build_fog_color_bytes};
@@ -215,6 +215,26 @@ fn restore_filtered_respects_block_type() {
         a_ref.texture_stage_state(0, TCI),
         "restore_filtered(All) matches restore_into"
     );
+}
+
+/// `build_vs_key` carries the whole texgen byte of `D3DTSS_TEXCOORDINDEX` into the key.
+///
+/// The sphere-map mode is bit 18 of the state, above the two bits the three
+/// camera-space modes use, so a mask narrower than the byte would turn it
+/// into passthru.
+#[test]
+fn spheremap_texgen_mode_reaches_the_vs_key() {
+    let mut ff = FfState::new();
+    ff.set_texture_stage_state(0, D3DTSS_TEXCOORDINDEX as usize, 0x0004_0001);
+    let layout = FfVsLayout {
+        flags: FfVsLayoutFlags::HAS_NORMAL,
+        tex_coord_count: 1,
+        tex_coord_dims: [0; 8],
+        declared_weights_count: 0,
+    };
+    let key = ff.build_vs_key(&rs(), layout, 0b0000_0001);
+    assert_eq!(key.tci_modes[0], 4);
+    assert_eq!(key.tci_coord_indices[0], 1);
 }
 
 /// `build_vs_key` must populate `tci_coord_indices` for every stage the VB layout declares.
