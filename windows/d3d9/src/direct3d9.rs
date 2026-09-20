@@ -1055,8 +1055,9 @@ extern "system" fn d3d9_check_device_format(
     // backing, but advertising mip generation for a format the same interface
     // refuses as a render target is the contradiction, so R5G6B5/A1R5G5B5
     // answer NOAUTOGEN there and keep their existing creation policy.
-    // The new signed-format fallbacks also retain usage at creation, with
-    // exactly one backing level and no internal generation flag.
+    // The signed formats of `uses_noautogen_fallback` answer NOAUTOGEN too, and
+    // their create retains usage with exactly one backing level and no internal
+    // generation flag.
     if usage & D3DUSAGE_AUTOGENMIPMAP != 0
         && !is_render_target_format_on_device(check_format, cfg.expand_packed16)
     {

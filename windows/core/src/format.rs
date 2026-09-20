@@ -446,8 +446,8 @@ pub const fn is_render_target_format_device(d3d_format: u32, native_packed16: bo
 /// advertised either way.
 ///
 /// V16U16, Q8W8V8U8 and Q16W16V16U16 reject sRGB-write queries even without
-/// a render-target bit. Other usage policy stays with the caller; the float family is
-/// colour-renderable on both GPU families.
+/// a render-target bit. Other usage policy stays with the caller; the float
+/// family is colour-renderable on both GPU families.
 #[must_use]
 pub const fn supports_usage_query(d3d_format: u32, usage: u32, float32_filtering: bool) -> bool {
     // These signed sampling formats have no sRGB write representation.

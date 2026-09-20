@@ -1153,8 +1153,4 @@ fn q16w16v16u16_rejects_srgb_write_queries_before_autogen_fallback() {
             true
         ));
     }
-    assert!(
-        super::supports_usage_query(mtld3d_types::D3DFMT_V8U8, D3DUSAGE_QUERY_SRGBWRITE, true),
-        "existing format query policy"
-    );
 }

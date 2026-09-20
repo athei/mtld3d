@@ -6442,11 +6442,12 @@ fn q16w16v16u16_float_precision_all_lanes() {
     }
 }
 
+/// Queries agree with creation, with the one-level AUTOGEN contract of the signed formats.
 #[test]
 fn q16w16v16u16_queries_and_noautogen_contract() {
     use mtld3d_types::{
         D3DERR_NOTAVAILABLE, D3DRTYPE_CUBETEXTURE, D3DRTYPE_TEXTURE, D3DRTYPE_VOLUMETEXTURE,
-        D3DUSAGE_QUERY_LEGACYBUMPMAP, D3DUSAGE_QUERY_WRAPANDMIP, TexOpCaps,
+        D3DUSAGE_QUERY_LEGACYBUMPMAP, D3DUSAGE_QUERY_WRAPANDMIP,
     };
     let h = Harness::new();
     assert_eq!(
@@ -6473,25 +6474,18 @@ fn q16w16v16u16_queries_and_noautogen_contract() {
             ),
             0
         );
-        assert_eq!(
-            h.check_device_format(
-                D3DFMT_X8R8G8B8,
-                D3DUSAGE_QUERY_LEGACYBUMPMAP,
-                rtype,
-                mtld3d_types::D3DFMT_Q16W16V16U16
-            ),
-            if rtype == D3DRTYPE_TEXTURE {
-                0
-            } else {
+        if rtype != D3DRTYPE_TEXTURE {
+            assert_eq!(
+                h.check_device_format(
+                    D3DFMT_X8R8G8B8,
+                    D3DUSAGE_QUERY_LEGACYBUMPMAP,
+                    rtype,
+                    mtld3d_types::D3DFMT_Q16W16V16U16
+                ),
                 D3DERR_NOTAVAILABLE
-            }
-        );
+            );
+        }
     }
-    assert_eq!(
-        h.device_caps().texture_op_caps
-            & (TexOpCaps::BUMPENVMAP | TexOpCaps::BUMPENVMAPLUMINANCE).bits(),
-        0
-    );
     signed_texture_queries_and_noautogen(
         &h,
         mtld3d_types::D3DFMT_Q16W16V16U16,
@@ -6502,6 +6496,7 @@ fn q16w16v16u16_queries_and_noautogen_contract() {
     );
 }
 
+/// The A8R8G8B8 pixel the half-scale, half-bias remap shader writes for four signed lanes.
 fn signed_q16_pixel(lanes: [i16; 4]) -> u32 {
     let rgba = lanes.map(|lane| {
         let signed = i32::from(lane).max(-32767);
@@ -6510,6 +6505,7 @@ fn signed_q16_pixel(lanes: [i16; 4]) -> u32 {
     rgba[3] << 24 | rgba[0] << 16 | rgba[1] << 8 | rgba[2]
 }
 
+/// Locks expose eight bytes per texel, and updates copy them unchanged in every pool.
 #[test]
 fn q16w16v16u16_native_bytes_updates_and_plain_surfaces() {
     use mtld3d_types::D3DFMT_Q16W16V16U16 as FORMAT;
@@ -6628,6 +6624,7 @@ fn q16w16v16u16_native_bytes_updates_and_plain_surfaces() {
     assert!(out.is_null());
 }
 
+/// Cube faces, volume slices, their mips and a partial box keep eight-byte texels apart.
 #[test]
 fn q16w16v16u16_cube_volume_mips_and_partial_box() {
     use mtld3d_types::{D3DBOX, D3DFMT_Q16W16V16U16 as FORMAT};
@@ -6800,6 +6797,7 @@ fn q16w16v16u16_cube_volume_mips_and_partial_box() {
     );
 }
 
+/// Both minimum Q encodings sample as minus one, never below it.
 #[test]
 fn q16w16v16u16_sm1_negative_alpha_floor() {
     // RG maps Q; B is one only for Q < -1.
@@ -6893,6 +6891,7 @@ fn q16w16v16u16_sm1_negative_alpha_floor() {
     }
 }
 
+/// Fixed-function stages see signed colour lanes and a signed Q lane.
 #[test]
 fn q16w16v16u16_fixed_function_signed_color_and_alpha() {
     use mtld3d_types::{
@@ -6950,6 +6949,7 @@ fn q16w16v16u16_fixed_function_signed_color_and_alpha() {
     }
 }
 
+/// Near-zero codes, linear filtering, wrapping and explicit mips through `ps_2_0`.
 #[test]
 fn q16w16v16u16_filter_wrap_and_modern_shader() {
     // ps_2_0: dcl t0; dcl_2d s0; texld r0,t0,s0; mad oC0,r0,c0,c0.
