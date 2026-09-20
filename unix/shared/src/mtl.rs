@@ -114,6 +114,8 @@ pub enum PixelFormat {
     Rg32Float = 105,
     /// 64-bit four-channel unorm. D3D9 `D3DFMT_A16B16G16R16`.
     Rgba16Unorm = 110,
+    /// Signed normalized 16-bit U/V/W/Q. D3D9 `D3DFMT_Q16W16V16U16`.
+    Rgba16Snorm = 112,
     /// 64-bit four-channel float. D3D9 `D3DFMT_A16B16G16R16F`.
     Rgba16Float = 115,
     /// 128-bit four-channel float. D3D9 `D3DFMT_A32B32G32R32F`.
@@ -206,6 +208,7 @@ impl PixelFormat {
             | Self::Depth32Float => BlockLayout::pixel(4),
             Self::Rg32Float
             | Self::Rgba16Unorm
+            | Self::Rgba16Snorm
             | Self::Rgba16Float
             | Self::Depth32FloatStencil8 => BlockLayout::pixel(8),
             Self::Rgba32Float => BlockLayout::pixel(16),

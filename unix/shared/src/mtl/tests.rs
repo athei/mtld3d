@@ -34,6 +34,8 @@ fn enum_discriminants_round_trip() {
         Some(PixelFormat::Bgra8UnormSrgb)
     );
     assert_eq!(PixelFormat::from_repr(130), Some(PixelFormat::Bc1Rgba));
+    assert_eq!(PixelFormat::from_repr(112), Some(PixelFormat::Rgba16Snorm));
+    assert_eq!(PixelFormat::Rgba16Snorm.block_layout().bytes, 8);
     assert_eq!(PixelFormat::from_repr(131), Some(PixelFormat::Bc1RgbaSrgb));
     assert_eq!(PixelFormat::from_repr(133), Some(PixelFormat::Bc2RgbaSrgb));
     assert_eq!(PixelFormat::from_repr(135), Some(PixelFormat::Bc3RgbaSrgb));

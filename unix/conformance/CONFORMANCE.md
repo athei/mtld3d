@@ -1331,4 +1331,19 @@ Q8W8V8U8 rows of test_signed_formats do not depend on the mechanism that
 fails the V8U8 rows on the `@mac2` legs. Render-target and sRGB capabilities
 stay absent; AUTOGEN texture/cube requests preserve usage but use one actual
 level with no generated chain. MANAGED+DYNAMIC creation is rejected for
-V16U16 and Q8W8V8U8 only. X8L8V8U8 and L6V5U5 remain separate capabilities.
+V16U16, Q8W8V8U8 and Q16W16V16U16 only. X8L8V8U8 and L6V5U5 remain separate
+capabilities.
+
+Q16W16V16U16 textures use native RGBA16Snorm storage and the same scoped
+NOAUTOGEN, pool and unavailable render/sRGB policies. All four lanes are
+stored and no view swizzle applies, so nothing here depends on the mechanism
+that fails the V8U8 and V16U16 rows on the `@mac2` legs. Upstream Wine has no
+Q16 positive row in test_signed_formats; existing mode/conversion references
+do not establish signed pixel correctness. Dedicated end-to-end tests pin
+all four signed16 lanes, alpha, eight-byte transport and float32 sampling
+precision. This feature does not claim a Wine positive-pixel skip reduction.
+
+Signed-format ColorFill on DEFAULT offscreen plain surfaces still reaches
+the existing missing fill-codec path, which warns and returns success without
+writing. This also affects V8U8, V16U16 and Q8W8V8U8; native sampling support
+does not resolve that separate ColorFill gap.

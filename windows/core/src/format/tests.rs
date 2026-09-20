@@ -1117,3 +1117,40 @@ fn q8w8v8u8_rejects_srgb_write_queries_before_autogen_fallback() {
         ));
     }
 }
+
+#[test]
+fn q16w16v16u16_uses_native_signed_storage_and_noautogen_fallback() {
+    let format = mtld3d_types::D3DFMT_Q16W16V16U16;
+    let mapped = map_d3d_format(format).expect("Q16W16V16U16 mapping");
+    assert_eq!(mapped.metal_pixel_format(), PixelFormat::Rgba16Snorm);
+    assert_eq!(mapped.swizzle(), None);
+    assert_eq!(mapped.bytes_per_pixel(), 8);
+    assert!(mapped.has_alpha());
+    assert!(!mapped.is_compressed());
+    assert_eq!(compute_mip_size(3, 2, 0, &mapped), (3, 2, 48, 24));
+    assert!(is_volume_texture_format(format));
+    assert!(!super::is_render_target_format(format));
+    assert!(super::uses_noautogen_fallback(format));
+    assert!(super::uses_strict_dynamic_pool_validation(format));
+    for ordinary in [mtld3d_types::D3DFMT_V8U8, D3DFMT_A8R8G8B8, D3DFMT_DXT1] {
+        assert!(!super::uses_noautogen_fallback(ordinary));
+        assert!(!super::uses_strict_dynamic_pool_validation(ordinary));
+    }
+}
+
+#[test]
+fn q16w16v16u16_rejects_srgb_write_queries_before_autogen_fallback() {
+    for extra in [
+        0,
+        D3DUSAGE_QUERY_FILTER,
+        D3DUSAGE_AUTOGENMIPMAP,
+        D3DUSAGE_RENDERTARGET,
+        D3DUSAGE_QUERY_SRGBREAD,
+    ] {
+        assert!(!super::supports_usage_query(
+            mtld3d_types::D3DFMT_Q16W16V16U16,
+            D3DUSAGE_QUERY_SRGBWRITE | extra,
+            true
+        ));
+    }
+}
