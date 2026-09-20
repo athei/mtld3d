@@ -204,8 +204,8 @@ pub struct FfVsKey {
     ///
     /// Decoded from the high byte of `D3DTSS_TEXCOORDINDEX[i]`. 0 = PASSTHRU,
     /// 1 = CAMERASPACENORMAL, 2 = CAMERASPACEPOSITION,
-    /// 3 = CAMERASPACEREFLECTIONVECTOR. Mode 4 (SPHEREMAP) and unknown modes
-    /// fall back to passthru with a one-shot warn.
+    /// 3 = CAMERASPACEREFLECTIONVECTOR, 4 = SPHEREMAP. Higher values are
+    /// undefined and fall back to passthru with a one-shot warn.
     pub tci_modes: [u8; 8],
     /// Per-stage input coord-set index for passthru mode.
     ///
@@ -968,7 +968,7 @@ fn emit_vs(out: &mut String, vs: &FfVsKey, entry: &str) {
         // non-default set picks the right attribute.
         for i in 0..vs.tex_coord_count as usize {
             let mode = vs.tci_modes[i];
-            if matches!(mode, 1..=3) {
+            if matches!(mode, 1..=4) {
                 mtld3d_shared::log_once_warn!(target: super::LOG_TARGET,
                     "dxso FF: TCI mode {mode} on XYZRHW stage {i} — eye-space undefined, falling back to passthru"
                 );
@@ -1078,8 +1078,10 @@ fn emit_vs(out: &mut String, vs: &FfVsKey, entry: &str) {
     // whenever lighting is enabled (its ambient and emissive terms run
     // without a normal), `n` only when the vertex also carries a normal.
     let active = vs.tex_coord_count as usize;
-    let need_eye_normal = vs.tci_modes[..active].iter().any(|&m| m == 1 || m == 3);
-    let need_eye_pos = vs.tci_modes[..active].iter().any(|&m| m == 2 || m == 3);
+    let need_eye_normal = vs.tci_modes[..active]
+        .iter()
+        .any(|&m| matches!(m, 1 | 3 | 4));
+    let need_eye_pos = vs.tci_modes[..active].iter().any(|&m| matches!(m, 2..=4));
     let lighting_declares_pos_eye = vs.lighting_enabled();
     let lighting_declares_normal = vs.lighting_enabled() && vs.has_normal();
     let blended = vs.vertex_blend_count > 0;
@@ -1348,10 +1350,34 @@ fn emit_vs(out: &mut String, vs: &FfVsKey, entry: &str) {
                 n = input_dim(vs, src);
                 let _ = writeln!(out, "    float4 raw{i} = {};", masked_input_rhs(vs, i, src));
             }
+            4 => {
+                // Sphere map of the reflection vector R = reflect(E, N), with
+                // E the unit eye-to-vertex direction:
+                // m = 2 * |R + (0, 0, 1)|, (u, v) = R.xy / m + 0.5. The
+                // coordinate has dimension 3 like the other generated modes,
+                // so a texture transform multiplies (u, v, 0, 1). A vertex
+                // without a normal reads a zero normal, which leaves R = E.
+                n = 3;
+                let _ = writeln!(out, "    float4 raw{i};");
+                let _ = writeln!(out, "    {{");
+                out.push_str("        float3 E_tci = normalize(posEye);\n");
+                if vs.has_normal() {
+                    out.push_str("        float3 R_tci = reflect(E_tci, n);\n");
+                } else {
+                    out.push_str("        float3 R_tci = E_tci;\n");
+                }
+                out.push_str(
+                    "        float m_tci = 2.0 * length(R_tci + float3(0.0, 0.0, 1.0));\n",
+                );
+                let _ = writeln!(
+                    out,
+                    "        raw{i} = float4(R_tci.xy / m_tci + 0.5, 0.0, 0.0);"
+                );
+                let _ = writeln!(out, "    }}");
+            }
             _ => {
-                // 4 = SPHEREMAP; higher values are undefined. SPHEREMAP
-                // is not implemented.
-                mtld3d_shared::log_once_warn!(target: super::LOG_TARGET, "dxso FF: TCI mode {mode} not implemented → passthru");
+                // Modes above SPHEREMAP are undefined.
+                mtld3d_shared::log_once_warn!(target: super::LOG_TARGET, "dxso FF: TCI mode {mode} is undefined → passthru");
                 n = input_dim(vs, src);
                 let _ = writeln!(out, "    float4 raw{i} = {};", masked_input_rhs(vs, i, src));
             }

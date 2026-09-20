@@ -9,7 +9,8 @@ divergences from D3D9 it keeps on purpose. The tested games are in the
 
 - Shader models 1.x through 3.0, translated from DXSO to MSL and cached on
   disk by content hash.
-- The fixed-function pipeline: lighting, texture-coordinate generation, the
+- The fixed-function pipeline: lighting, texture-coordinate generation
+  (camera-space normal, position and reflection vector, and sphere map), the
   texture-stage cascade (CURRENT/TEMP registers, per-stage constants,
   DOTPRODUCT3 color and alpha, MODULATEALPHA_ADDCOLOR,
   MODULATECOLOR_ADDALPHA, MODULATEINVALPHA_ADDCOLOR,

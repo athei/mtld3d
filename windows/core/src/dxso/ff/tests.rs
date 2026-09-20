@@ -1077,7 +1077,7 @@ fn eye_space_locals_are_declared_once_for_every_lighting_normal_and_tci_mix() {
     for blended in [false, true] {
         for lighting in [false, true] {
             for normal in [false, true] {
-                for mode in 0..=3u8 {
+                for mode in 0..=4u8 {
                     let mut vs = default_vs_key();
                     vs.flags.set(FfVsFlags::LIGHTING_ENABLED, lighting);
                     vs.flags.set(FfVsFlags::HAS_NORMAL, normal);
@@ -1100,14 +1100,15 @@ fn eye_space_locals_are_declared_once_for_every_lighting_normal_and_tci_mix() {
                     let normal_decls = msl.matches("float3 n =").count();
                     // The pre-scan hoists for the texgen mode alone, before it
                     // knows whether a normal-less stage falls back to passthru.
-                    let wants_pos_eye = lighting || matches!(mode, 2 | 3);
-                    let wants_normal = normal && (lighting || matches!(mode, 1 | 3));
+                    let wants_pos_eye = lighting || matches!(mode, 2..=4);
+                    let wants_normal = normal && (lighting || matches!(mode, 1 | 3 | 4));
                     assert_eq!(pos_eye_decls, usize::from(wants_pos_eye), "{case}");
                     assert_eq!(normal_decls, usize::from(wants_normal), "{case}");
 
                     // Every consumer has its declaration.
                     let pos_eye_uses = msl.matches("posEye").count() - pos_eye_decls;
-                    let normal_uses = msl.matches("dot(n, ").count();
+                    let normal_uses =
+                        msl.matches("dot(n, ").count() + msl.matches("reflect(E_tci, n)").count();
                     assert!(pos_eye_uses == 0 || pos_eye_decls == 1, "{case}");
                     assert!(normal_uses == 0 || normal_decls == 1, "{case}");
 
@@ -1116,9 +1117,20 @@ fn eye_space_locals_are_declared_once_for_every_lighting_normal_and_tci_mix() {
                         1 if normal => "float4 raw0 = float4(n_texgen, 0.0);",
                         2 => "float4 raw0 = float4(posEye, 0.0);",
                         3 if normal => "raw0 = float4(R_tci, 0.0);",
+                        4 => "raw0 = float4(R_tci.xy / m_tci + 0.5, 0.0, 0.0);",
                         _ => "float4 raw0 = float4(0.0);",
                     };
                     assert!(msl.contains(raw), "{case}");
+                    // The sphere map reflects about the vertex normal, and
+                    // about a zero normal when the vertex has none.
+                    if mode == 4 {
+                        let reflection = if normal {
+                            "float3 R_tci = reflect(E_tci, n);"
+                        } else {
+                            "float3 R_tci = E_tci;"
+                        };
+                        assert!(msl.contains(reflection), "{case}");
+                    }
                     // Lighting without a normal keeps its position-dependent
                     // ambient term and drops the N.L term.
                     if lighting {
@@ -1132,6 +1144,157 @@ fn eye_space_locals_are_declared_once_for_every_lighting_normal_and_tci_mix() {
             }
         }
     }
+}
+
+#[test]
+fn tci_spheremap_emits_sphere_map_of_the_reflection_vector() {
+    // D3DTSS_TEXCOORDINDEX = 0x40000 (TCI_SPHEREMAP). With lighting off the
+    // pre-scan hoists both eye-space locals, and the stage emits
+    // R = reflect(normalize(posEye), n), m = 2 * |R + (0, 0, 1)| and the
+    // coordinate (R.x / m + 0.5, R.y / m + 0.5, 0, 0).
+    let mut vs = default_vs_key();
+    vs.flags.set(FfVsFlags::HAS_NORMAL, true);
+    vs.tex_coord_count = 1;
+    vs.input_tex_coord_count = 1;
+    vs.tex_coord_dims[0] = 2;
+    vs.tci_modes[0] = 4;
+    let msl = emit_vs_ff(&vs);
+    assert_eq!(msl.matches("float3 n = normalize(").count(), 1, "{msl}");
+    assert_eq!(msl.matches("float3 posEye =").count(), 1, "{msl}");
+    for line in [
+        "        float3 E_tci = normalize(posEye);\n",
+        "        float3 R_tci = reflect(E_tci, n);\n",
+        "        float m_tci = 2.0 * length(R_tci + float3(0.0, 0.0, 1.0));\n",
+        "        raw0 = float4(R_tci.xy / m_tci + 0.5, 0.0, 0.0);\n",
+        "    out.texcoord0 = raw0;\n",
+    ] {
+        assert!(msl.contains(line), "missing {line:?}: {msl}");
+    }
+    // The declared input coordinate is not what the stage reads.
+    assert!(!msl.contains("in.v4"), "{msl}");
+}
+
+#[test]
+fn tci_spheremap_without_normal_reflects_about_a_zero_normal() {
+    // A vertex without a normal reads a zero normal, so the reflection vector
+    // is the view direction itself: the stage still generates coordinates,
+    // needs no `n`, and does not fall back to the input coordinate.
+    let mut vs = default_vs_key();
+    vs.tex_coord_count = 1;
+    vs.input_tex_coord_count = 1;
+    vs.tex_coord_dims[0] = 2;
+    vs.tci_modes[0] = 4;
+    let msl = emit_vs_ff(&vs);
+    assert_eq!(msl.matches("float3 posEye =").count(), 1, "{msl}");
+    assert!(!msl.contains("float3 n ="), "{msl}");
+    assert!(msl.contains("        float3 R_tci = E_tci;\n"), "{msl}");
+    assert!(
+        msl.contains("raw0 = float4(R_tci.xy / m_tci + 0.5, 0.0, 0.0);"),
+        "{msl}"
+    );
+    assert!(!msl.contains("in.v4"), "{msl}");
+}
+
+#[test]
+fn tci_spheremap_lit_reuses_the_lighting_locals() {
+    // With lighting on and a normal the lighting branch owns both locals; the
+    // sphere map reads them and the pre-scan hoists neither.
+    let mut vs = default_vs_key();
+    vs.flags.set(FfVsFlags::HAS_NORMAL, true);
+    vs.flags.set(FfVsFlags::LIGHTING_ENABLED, true);
+    vs.light_active_mask = 1;
+    vs.light_directional_mask = 1;
+    vs.tex_coord_count = 1;
+    vs.tci_modes[0] = 4;
+    let msl = emit_vs_ff(&vs);
+    assert_eq!(msl.matches("float3 posEye =").count(), 1, "{msl}");
+    assert_eq!(msl.matches("float3 n =").count(), 1, "{msl}");
+    assert!(!msl.contains("float3 n = normalize("), "{msl}");
+    assert!(msl.contains("float3 R_tci = reflect(E_tci, n);"), "{msl}");
+}
+
+#[test]
+fn tci_spheremap_vertex_blended_reads_the_blended_locals() {
+    let mut vs = default_vs_key();
+    vs.flags.set(FfVsFlags::HAS_NORMAL, true);
+    vs.vertex_blend_count = 1;
+    vs.declared_weights_count = 1;
+    vs.tex_coord_count = 1;
+    vs.tci_modes[0] = 4;
+    let msl = emit_vs_ff(&vs);
+    assert_eq!(
+        msl.matches("    float3 posEye = pos_view.xyz;\n").count(),
+        1,
+        "{msl}"
+    );
+    assert_eq!(
+        msl.matches("    float3 n = normalize(n_blend);\n").count(),
+        1,
+        "{msl}"
+    );
+    assert!(msl.contains("float3 R_tci = reflect(E_tci, n);"), "{msl}");
+}
+
+#[test]
+fn tci_spheremap_texture_transform_applies_to_the_generated_coordinate() {
+    // The generated coordinate has dimension 3, so D3DTTFF_COUNT2 pads
+    // component 3 to 1.0 and multiplies (u, v, 0, 1) by the stage matrix,
+    // after the sphere map has been computed.
+    let mut vs = default_vs_key();
+    vs.flags.set(FfVsFlags::HAS_NORMAL, true);
+    vs.tex_coord_count = 1;
+    vs.tci_modes[0] = 4;
+    vs.tt_flags[0] = 2;
+    let msl = emit_vs_ff(&vs);
+    let generated = msl
+        .find("raw0 = float4(R_tci.xy / m_tci + 0.5, 0.0, 0.0);")
+        .unwrap_or_else(|| panic!("no generated coordinate: {msl}"));
+    let pad = msl
+        .find("    raw0[3] = 1.0;\n")
+        .unwrap_or_else(|| panic!("no pad: {msl}"));
+    let mul = msl
+        .find("    float4 r0 = float4(dot(raw0, vs_c[63]), dot(raw0, vs_c[64]), dot(raw0, vs_c[65]), dot(raw0, vs_c[66]));\n")
+        .unwrap_or_else(|| panic!("no matrix multiply: {msl}"));
+    assert!(generated < pad && pad < mul, "{msl}");
+    assert!(
+        msl.contains("    out.texcoord0 = float4(r0.x, r0.y, 0.0, 0.0);\n"),
+        "{msl}"
+    );
+}
+
+#[test]
+fn tci_modes_above_spheremap_pass_the_input_coordinate_through() {
+    // Modes 5 and up are undefined; the stage reads its input coordinate and
+    // hoists nothing.
+    let mut vs = default_vs_key();
+    vs.flags.set(FfVsFlags::HAS_NORMAL, true);
+    vs.tex_coord_count = 1;
+    vs.input_tex_coord_count = 1;
+    vs.tex_coord_dims[0] = 2;
+    vs.tci_modes[0] = 5;
+    let msl = emit_vs_ff(&vs);
+    assert!(
+        msl.contains("float4 raw0 = float4(in.v4.xy, 0.0, 0.0);"),
+        "{msl}"
+    );
+    assert!(!msl.contains("posEye"), "{msl}");
+    assert!(!msl.contains("R_tci"), "{msl}");
+}
+
+#[test]
+fn tci_spheremap_on_xyzrhw_passes_the_input_coordinate_through() {
+    // Pre-transformed vertices have no eye space, so every texgen mode reads
+    // the declared coordinate.
+    let mut vs = default_vs_key();
+    vs.flags.set(FfVsFlags::HAS_RHW, true);
+    vs.tex_coord_count = 1;
+    vs.input_tex_coord_count = 1;
+    vs.tex_coord_dims[0] = 2;
+    vs.tci_modes[0] = 4;
+    let msl = emit_vs_ff(&vs);
+    assert!(msl.contains("out.texcoord0 = float4(("), "{msl}");
+    assert!(msl.contains("in.v4"), "{msl}");
+    assert!(!msl.contains("R_tci"), "{msl}");
 }
 
 #[test]

@@ -288,10 +288,11 @@ const FVF_DEFAULT: FvfCaps = FvfCaps::texcoord_sets(FF_TEXTURE_STAGES).union(Fvf
 
 /// Vertex-processing caps.
 ///
-/// The FF vertex shader honors TCI texgen modes, all three light types
+/// The FF vertex shader honors every TCI texgen mode, all three light types
 /// (directional / point / spot cone), and both specular view-vector models via
 /// `D3DRS_LOCALVIEWER`.
 const VTXP_DEFAULT: VtxpCaps = VtxpCaps::TEXGEN
+    .union(VtxpCaps::TEXGEN_SPHEREMAP)
     .union(VtxpCaps::MATERIALSOURCE7)
     .union(VtxpCaps::DIRECTIONALLIGHTS)
     .union(VtxpCaps::POSITIONALLIGHTS)
