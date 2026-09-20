@@ -877,11 +877,7 @@ fn systemmem_texture_survives_reset() {
     );
 }
 
-/// A block-compressed volume texture exists only as a `D3DPOOL_SCRATCH` resource.
-///
-/// Metal has no 3D block-compressed texture, so a DXT volume is representable
-/// at all only because the scratch pool allocates none: it is created, locked
-/// and written entirely CPU-side. Every GPU-resident pool rejects the format.
+/// A SCRATCH block-compressed volume is lockable without a sampling bind.
 #[test]
 fn scratch_block_compressed_volume_is_cpu_only() {
     let h = Harness::new();
@@ -892,10 +888,6 @@ fn scratch_block_compressed_volume_is_cpu_only() {
     assert_eq!(hr, 0, "LockBox on a scratch volume");
     assert!(!bits_null, "a successful lock hands out a pointer");
     assert_eq!(volume.unlock_box(0), 0, "UnlockBox");
-    for pool in [D3DPOOL_DEFAULT, D3DPOOL_MANAGED, D3DPOOL_SYSTEMMEM] {
-        let (hr, _) = h.try_create_volume_texture([4, 4, 4], 1, 0, D3DFMT_DXT1, pool);
-        assert_eq!(hr, D3DERR_INVALIDCALL, "DXT1 volume in pool {pool}");
-    }
     // The device still renders after the scratch volume has been created.
     h.render_once(BLACK, |_| {});
     assert_eq!(h.read_pixel(320, 240), BLACK, "the frame after the create");

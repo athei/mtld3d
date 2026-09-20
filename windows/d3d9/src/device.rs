@@ -5443,17 +5443,10 @@ extern "system" fn device_create_volume_texture(
         null_out(texture);
         return D3DERR_INVALIDCALL;
     };
-    // D3D9 volume-creation validation. Two rejection rules,
-    // both consistent with what `CheckDeviceFormat(D3DRTYPE_VOLUMETEXTURE, fmt)`
-    // reports (the test derives its expected HRESULTs from that query):
-    //  1. block-compressed (DXTn) volumes must have block-aligned width/height in
-    //     every pool — a non-multiple-of-4 extent is INVALIDCALL.
-    //  2. block-compressed or packed-YUV formats are not creatable as a Metal 3D
-    //     texture, so the GPU-backed pools (DEFAULT/SYSTEMMEM/MANAGED) reject them;
-    //     only `D3DPOOL_SCRATCH`, a CPU-only staging volume, accepts them.
-    // Plain (uncompressed) formats are creatable on every pool, so this
-    // validation only rejects block-compressed / packed-YUV formats and leaves
-    // every uncompressed create path valid.
+    // DXT base extents must be block aligned in every pool. The GPU-backed
+    // pools take what `is_volume_texture_format` advertises, DXT1 to DXT5
+    // among the compressed formats; the other compressed and the packed-YUV
+    // formats are creatable as SCRATCH volumes only.
     let block_w = fmt.block_width();
     let block_h = fmt.block_height();
     if is_dxt_format(format) && (!width.is_multiple_of(block_w) || !height.is_multiple_of(block_h))
@@ -5491,7 +5484,9 @@ extern "system" fn device_create_volume_texture(
     // the full chain. Sizing the levels correctly is what lets `LockBox(level)`
     // resolve a real box instead of returning NULL (a NULL box would fault a
     // LockBox on a mip sub-level).
-    let bpp = fmt.bytes_per_pixel().max(1);
+    // Zero stays zero: it marks a compressed layout, and the upload of a level
+    // that is one slice deep counts block rows only while the marker survives.
+    let bpp = fmt.bytes_per_pixel();
     let actual_levels = resolve_create_levels(
         "CreateVolumeTexture",
         levels,

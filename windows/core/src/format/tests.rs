@@ -242,6 +242,10 @@ fn is_mapped_color_format_tracks_the_lookup() {
     }
 }
 
+/// Volume formats are the uncompressed colour mappings plus DXT1 to DXT5.
+///
+/// The five DXT mappings keep a zero bytes-per-pixel, the compressed-layout
+/// marker the upload paths select block rows by.
 #[test]
 fn planar_yuv_stays_out_of_the_generic_mapping() {
     use mtld3d_types::{D3DFMT_NV12, D3DFMT_YV12};
@@ -281,7 +285,7 @@ fn planar_yuv_stays_out_of_the_generic_mapping() {
 }
 
 #[test]
-fn volume_texture_formats_are_uncompressed_colour_mappings() {
+fn volume_texture_formats_include_native_bc1_bc2_bc3() {
     for fmt in [
         D3DFMT_A8R8G8B8,
         D3DFMT_R5G6B5,
@@ -291,7 +295,29 @@ fn volume_texture_formats_are_uncompressed_colour_mappings() {
     ] {
         assert!(is_volume_texture_format(fmt), "format {fmt}");
     }
-    for fmt in [D3DFMT_DXT1, D3DFMT_YUY2, D3DFMT_UYVY, D3DFMT_D24S8, 0] {
+    for fmt in [
+        D3DFMT_DXT1,
+        mtld3d_types::D3DFMT_DXT2,
+        mtld3d_types::D3DFMT_DXT3,
+        mtld3d_types::D3DFMT_DXT4,
+        mtld3d_types::D3DFMT_DXT5,
+    ] {
+        assert!(is_volume_texture_format(fmt), "format {fmt}");
+        assert_eq!(
+            map_d3d_format(fmt)
+                .expect("mapped BC format")
+                .bytes_per_pixel(),
+            0,
+            "format {fmt}"
+        );
+    }
+    for fmt in [
+        mtld3d_types::D3DFMT_ATI1,
+        D3DFMT_YUY2,
+        D3DFMT_UYVY,
+        D3DFMT_D24S8,
+        0,
+    ] {
         assert!(!is_volume_texture_format(fmt), "format {fmt}");
     }
 }

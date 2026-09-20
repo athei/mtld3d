@@ -180,15 +180,32 @@ impl VolumeTexture<'_> {
     /// that leaves it untouched reads as non-null.
     #[must_use]
     pub fn lock_box_probe(&self, level: u32, flags: u32) -> (i32, bool) {
+        self.lock_box_region_probe(level, None, flags)
+    }
+
+    /// Probe a whole or partial volume lock, including rejected box geometry.
+    #[must_use]
+    pub fn lock_box_region_probe(
+        &self,
+        level: u32,
+        region: Option<&D3DBOX>,
+        flags: u32,
+    ) -> (i32, bool) {
         let mut locked = D3DLOCKED_BOX {
             row_pitch: 0,
             slice_pitch: 0,
             bits: core::ptr::without_provenance_mut(0xdead_beef),
         };
         // SAFETY: vtable thunk; `self.ptr` is live, `&mut locked` is writable,
-        // a null box locks the whole level.
+        // the optional box is live through the call, null locks the whole level.
         let hr = unsafe {
-            (self.vtbl().lock_box)(self.ptr, level, &raw mut locked, core::ptr::null(), flags)
+            (self.vtbl().lock_box)(
+                self.ptr,
+                level,
+                &raw mut locked,
+                region.map_or(core::ptr::null(), |b| core::ptr::from_ref(b).cast()),
+                flags,
+            )
         };
         (hr, locked.bits.is_null())
     }
@@ -296,6 +313,124 @@ impl VolumeTexture<'_> {
     /// Panics if the lock fails or `texels` does not fill the box exactly.
     pub fn write_box_u32(&self, level: u32, region: &D3DBOX, texels: &[u32]) {
         self.write_texels(level, Some(region), texels);
+    }
+
+    /// Write raw DXT blocks into a volume box, honoring both returned pitches.
+    ///
+    /// # Panics
+    /// Panics for an unsupported format, invalid box, size or failed lock.
+    pub fn write_blocks(&self, level: u32, region: Option<&D3DBOX>, blocks: &[u8]) {
+        self.transfer_blocks(level, region, Some(blocks));
+    }
+
+    /// Read a complete DXT mip's raw blocks and return row and slice pitches.
+    ///
+    /// # Panics
+    /// Panics for an unsupported format or failed description/lock.
+    #[must_use]
+    pub fn read_blocks(&self, level: u32) -> (i32, i32, Vec<u8>) {
+        self.transfer_blocks(level, None, None)
+    }
+
+    /// Lock a level or a box of it and copy whole block rows in or out.
+    ///
+    /// Rows step by the returned row pitch and slices by the slice pitch, so a
+    /// pitch wider than the blocks of a row is honoured in both directions.
+    fn transfer_blocks(
+        &self,
+        level: u32,
+        region: Option<&D3DBOX>,
+        input: Option<&[u8]>,
+    ) -> (i32, i32, Vec<u8>) {
+        let (hr, desc) = self.level_desc(level);
+        expect_ok(hr, "compressed volume GetLevelDesc");
+        let block_bytes = match desc.format {
+            mtld3d_types::D3DFMT_DXT1 => 8,
+            mtld3d_types::D3DFMT_DXT2
+            | mtld3d_types::D3DFMT_DXT3
+            | mtld3d_types::D3DFMT_DXT4
+            | mtld3d_types::D3DFMT_DXT5 => 16,
+            other => panic!("not a supported compressed volume format {other:#x}"),
+        };
+        let (width, height, depth) = region.map_or((desc.width, desc.height, desc.depth), |b| {
+            assert!(b.left < b.right && b.top < b.bottom && b.front < b.back);
+            assert!(b.right <= desc.width && b.bottom <= desc.height && b.back <= desc.depth);
+            assert!(b.left.is_multiple_of(4) && b.top.is_multiple_of(4));
+            assert!(b.right.is_multiple_of(4) || b.right == desc.width);
+            assert!(b.bottom.is_multiple_of(4) || b.bottom == desc.height);
+            (b.right - b.left, b.bottom - b.top, b.back - b.front)
+        });
+        let row_bytes = width.div_ceil(4) as usize * block_bytes;
+        let rows = height.div_ceil(4) as usize;
+        let depth = depth as usize;
+        let len = row_bytes * rows * depth;
+        if let Some(bytes) = input {
+            assert_eq!(bytes.len(), len);
+        }
+        let mut locked = D3DLOCKED_BOX {
+            row_pitch: 0,
+            slice_pitch: 0,
+            bits: core::ptr::null_mut(),
+        };
+        let flags = if input.is_none() {
+            mtld3d_types::D3DLOCK_READONLY
+        } else {
+            0
+        };
+        // SAFETY: the live volume owns this subresource; the validated box
+        // and writable lock result remain live throughout the COM call.
+        let hr = unsafe {
+            (self.vtbl().lock_box)(
+                self.ptr,
+                level,
+                &raw mut locked,
+                region.map_or(core::ptr::null(), |b| core::ptr::from_ref(b).cast()),
+                flags,
+            )
+        };
+        expect_ok(hr, "compressed volume LockBox");
+        assert!(!locked.bits.is_null());
+        let row_pitch = usize::try_from(locked.row_pitch).expect("positive row pitch");
+        let slice_pitch = usize::try_from(locked.slice_pitch).expect("positive slice pitch");
+        assert!(row_pitch >= row_bytes);
+        assert!(slice_pitch >= row_pitch * rows);
+        let mut output = if input.is_none() {
+            vec![0; len]
+        } else {
+            Vec::new()
+        };
+        for z in 0..depth {
+            for y in 0..rows {
+                let offset = (z * rows + y) * row_bytes;
+                // SAFETY: the block-aligned region is in bounds, and the
+                // reported pitches cover each complete row of blocks.
+                let mapped = unsafe {
+                    locked
+                        .bits
+                        .cast::<u8>()
+                        .add(z * slice_pitch + y * row_pitch)
+                };
+                if let Some(bytes) = input {
+                    // SAFETY: the input length was checked; the destination
+                    // is this row of the exclusive writable volume lock.
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(bytes[offset..].as_ptr(), mapped, row_bytes);
+                    };
+                } else {
+                    // SAFETY: the output owns len bytes; this initialized
+                    // locked row is copied before the lock is released.
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(
+                            mapped,
+                            output[offset..].as_mut_ptr(),
+                            row_bytes,
+                        );
+                    };
+                }
+            }
+        }
+        expect_ok(self.unlock_box(level), "compressed volume UnlockBox");
+        (locked.row_pitch, locked.slice_pitch, output)
     }
 
     fn write_texels<T: Copy>(&self, level: u32, region: Option<&D3DBOX>, texels: &[T]) {

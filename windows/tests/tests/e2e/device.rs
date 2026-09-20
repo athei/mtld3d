@@ -301,13 +301,13 @@ fn volume_format_queries_match_gpu_creation() {
 
     assert_eq!(
         h.check_device_format(D3DFMT_X8R8G8B8, 0, D3DRTYPE_VOLUMETEXTURE, D3DFMT_DXT1),
-        D3DERR_NOTAVAILABLE,
-        "a scratch-only DXT1 volume is not a GPU volume capability",
+        D3D_OK,
+        "native DXT1 volume sampling is available",
     );
     assert_eq!(
         h.create_volume_texture([4, 4, 4], 1, 0, D3DFMT_DXT1, D3DPOOL_DEFAULT),
-        D3DERR_INVALIDCALL,
-        "a GPU-backed DXT1 volume is rejected",
+        D3D_OK,
+        "a GPU-backed DXT1 volume creates",
     );
     assert_eq!(
         h.create_volume_texture([4, 4, 4], 1, 0, D3DFMT_DXT1, D3DPOOL_SCRATCH),
