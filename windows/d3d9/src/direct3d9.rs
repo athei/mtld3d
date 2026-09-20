@@ -22,13 +22,14 @@ use mtld3d_shared::{
 use mtld3d_types::{
     D3DADAPTER_IDENTIFIER9, D3DCAPS9, D3DDEVTYPE_HAL, D3DDISPLAYMODE, D3DFMT_A8B8G8R8,
     D3DFMT_A8R8G8B8, D3DFMT_ATI1, D3DFMT_D16, D3DFMT_D24S8, D3DFMT_D24X8, D3DFMT_D32, D3DFMT_DF16,
-    D3DFMT_DF24, D3DFMT_DXT1, D3DFMT_DXT3, D3DFMT_DXT5, D3DFMT_INTZ, D3DFMT_R5G6B5, D3DFMT_R8G8B8,
-    D3DFMT_RESZ, D3DFMT_UYVY, D3DFMT_X8B8G8R8, D3DFMT_X8R8G8B8, D3DFMT_YUY2, D3DMULTISAMPLE_NONE,
-    D3DMULTISAMPLE_NONMASKABLE, D3DOK_NOAUTOGEN, D3DPRESENT_PARAMETERS, D3DRTYPE_CUBETEXTURE,
-    D3DRTYPE_SURFACE, D3DRTYPE_TEXTURE, D3DRTYPE_VOLUME, D3DRTYPE_VOLUMETEXTURE,
-    D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_DYNAMIC,
-    D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING, D3DUSAGE_QUERY_SRGBREAD, D3DUSAGE_QUERY_SRGBWRITE,
-    D3DUSAGE_QUERY_VERTEXTEXTURE, D3DUSAGE_RENDERTARGET, Guid, IDirect3D9Vtbl,
+    D3DFMT_DF24, D3DFMT_DXT1, D3DFMT_DXT2, D3DFMT_DXT3, D3DFMT_DXT4, D3DFMT_DXT5, D3DFMT_INTZ,
+    D3DFMT_R5G6B5, D3DFMT_R8G8B8, D3DFMT_RESZ, D3DFMT_UYVY, D3DFMT_X8B8G8R8, D3DFMT_X8R8G8B8,
+    D3DFMT_YUY2, D3DMULTISAMPLE_NONE, D3DMULTISAMPLE_NONMASKABLE, D3DOK_NOAUTOGEN,
+    D3DPRESENT_PARAMETERS, D3DRTYPE_CUBETEXTURE, D3DRTYPE_SURFACE, D3DRTYPE_TEXTURE,
+    D3DRTYPE_VOLUME, D3DRTYPE_VOLUMETEXTURE, D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_DEPTHSTENCIL,
+    D3DUSAGE_DYNAMIC, D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING, D3DUSAGE_QUERY_SRGBREAD,
+    D3DUSAGE_QUERY_SRGBWRITE, D3DUSAGE_QUERY_VERTEXTEXTURE, D3DUSAGE_RENDERTARGET, Guid,
+    IDirect3D9Vtbl,
 };
 
 use super::{
@@ -460,6 +461,10 @@ pub const fn depth_format_has_stencil(fmt: u32) -> bool {
 // device-dependent and this predicate is pure; the SRGBWRITE arm is gated on
 // `is_render_target_format_on_device` regardless, which none of the widened
 // formats pass.
+//
+// The list follows the Metal format, not the D3D9 name: DXT2 and DXT4 are the
+// BC2 and BC3 block encodings of DXT3 and DXT5 under another content
+// convention, take the same twin view at create, and answer as they do.
 const fn has_srgb_twin(fmt: u32) -> bool {
     matches!(
         fmt,
@@ -469,7 +474,9 @@ const fn has_srgb_twin(fmt: u32) -> bool {
             | D3DFMT_X8B8G8R8
             | D3DFMT_R8G8B8
             | D3DFMT_DXT1
+            | D3DFMT_DXT2
             | D3DFMT_DXT3
+            | D3DFMT_DXT4
             | D3DFMT_DXT5
     )
 }
@@ -1037,12 +1044,11 @@ extern "system" fn d3d9_check_device_format(
         }
     } else if matches!(rtype, D3DRTYPE_VOLUME | D3DRTYPE_VOLUMETEXTURE) {
         // A DXT volume is sampled only, so it has no sRGB write. Its sRGB
-        // read is the sRGB view BC1, BC2 and BC3 all have, which covers DXT2
-        // and DXT4; `has_srgb_read_decode` omits those two and keeps
-        // answering for 2D and cube textures.
+        // read is the twin view BC1, BC2 and BC3 all have, the answer
+        // `has_srgb_read_decode` gives for the five DXT formats.
         let dxt = mtld3d_core::format::is_dxt_format(check_format);
         if (dxt && usage & D3DUSAGE_QUERY_SRGBWRITE != 0)
-            || (usage & D3DUSAGE_QUERY_SRGBREAD != 0 && !dxt && !has_srgb_read_decode(check_format))
+            || (usage & D3DUSAGE_QUERY_SRGBREAD != 0 && !has_srgb_read_decode(check_format))
         {
             false
         } else {
