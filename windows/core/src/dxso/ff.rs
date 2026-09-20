@@ -1073,26 +1073,28 @@ fn emit_vs(out: &mut String, vs: &FfVsKey, entry: &str) {
     }
 
     // TCI pre-scan: if any active stage needs eye-space normal / position
-    // but the lighting branch below won't declare them, emit them here.
+    // but the lighting branch below won't declare them, emit them here. The
+    // lighting branch owns the two under different conditions: `posEye`
+    // whenever lighting is enabled (its ambient and emissive terms run
+    // without a normal), `n` only when the vertex also carries a normal.
     let active = vs.tex_coord_count as usize;
     let need_eye_normal = vs.tci_modes[..active].iter().any(|&m| m == 1 || m == 3);
     let need_eye_pos = vs.tci_modes[..active].iter().any(|&m| m == 2 || m == 3);
-    let will_emit_in_lighting = vs.lighting_enabled() && vs.has_normal();
+    let lighting_declares_pos_eye = vs.lighting_enabled();
+    let lighting_declares_normal = vs.lighting_enabled() && vs.has_normal();
     let blended = vs.vertex_blend_count > 0;
-    if !will_emit_in_lighting {
-        if need_eye_normal && vs.has_normal() {
-            if blended {
-                out.push_str("    float3 n = normalize(n_blend);\n");
-            } else {
-                out.push_str("    float3 n = normalize(float3(dot(in.v1.xyz, vs_c[0].xyz), dot(in.v1.xyz, vs_c[1].xyz), dot(in.v1.xyz, vs_c[2].xyz)));\n");
-            }
+    if need_eye_normal && vs.has_normal() && !lighting_declares_normal {
+        if blended {
+            out.push_str("    float3 n = normalize(n_blend);\n");
+        } else {
+            out.push_str("    float3 n = normalize(float3(dot(in.v1.xyz, vs_c[0].xyz), dot(in.v1.xyz, vs_c[1].xyz), dot(in.v1.xyz, vs_c[2].xyz)));\n");
         }
-        if need_eye_pos {
-            if blended {
-                out.push_str("    float3 posEye = pos_view.xyz;\n");
-            } else {
-                out.push_str("    float3 posEye = float3(dot(pos, vs_c[0]), dot(pos, vs_c[1]), dot(pos, vs_c[2]));\n");
-            }
+    }
+    if need_eye_pos && !lighting_declares_pos_eye {
+        if blended {
+            out.push_str("    float3 posEye = pos_view.xyz;\n");
+        } else {
+            out.push_str("    float3 posEye = float3(dot(pos, vs_c[0]), dot(pos, vs_c[1]), dot(pos, vs_c[2]));\n");
         }
     }
 
