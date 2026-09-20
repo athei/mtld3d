@@ -23,8 +23,9 @@ use mtld3d_types::{
     D3DDECLUSAGE_POSITIONT, D3DDECLUSAGE_PSIZE, D3DDECLUSAGE_TEXCOORD, D3DFILL_POINT,
     D3DFILL_SOLID, D3DFILL_WIREFRAME, D3DFMT_A1R5G5B5, D3DFMT_A2R10G10B10, D3DFMT_A4R4G4B4,
     D3DFMT_A8, D3DFMT_A8B8G8R8, D3DFMT_A8R8G8B8, D3DFMT_A16B16G16R16, D3DFMT_A16B16G16R16F,
-    D3DFMT_A32B32G32R32F, D3DFMT_G16R16, D3DFMT_G16R16F, D3DFMT_G32R32F, D3DFMT_L8, D3DFMT_R5G6B5,
-    D3DFMT_R16F, D3DFMT_R32F, D3DFMT_X1R5G5B5, D3DFMT_X8B8G8R8, D3DFMT_X8R8G8B8, D3DFVF_DIFFUSE,
+    D3DFMT_A32B32G32R32F, D3DFMT_G16R16, D3DFMT_G16R16F, D3DFMT_G32R32F, D3DFMT_L8,
+    D3DFMT_Q8W8V8U8, D3DFMT_Q16W16V16U16, D3DFMT_R5G6B5, D3DFMT_R16F, D3DFMT_R32F, D3DFMT_V8U8,
+    D3DFMT_V16U16, D3DFMT_X1R5G5B5, D3DFMT_X8B8G8R8, D3DFMT_X8R8G8B8, D3DFVF_DIFFUSE,
     D3DFVF_LASTBETA_D3DCOLOR, D3DFVF_LASTBETA_UBYTE4, D3DFVF_NORMAL, D3DFVF_POSITION_MASK,
     D3DFVF_PSIZE, D3DFVF_SPECULAR, D3DFVF_TEXCOUNT_MASK, D3DFVF_TEXCOUNT_SHIFT,
     D3DFVF_TEXTUREFORMAT1, D3DFVF_TEXTUREFORMAT3, D3DFVF_TEXTUREFORMAT4, D3DFVF_XYZ, D3DFVF_XYZB1,
@@ -133,11 +134,11 @@ pub fn d3dcolor_fill_pixel_bytes(color: u32, d3d_format: u32) -> Option<Vec<u8>>
         // whose surfaces are also colour attachments on this device, so a
         // `D3DPOOL_DEFAULT` offscreen plain in one of them has to fill.
         D3DFMT_A8B8G8R8 | D3DFMT_X8B8G8R8 => Some(vec![r, g, b, a]),
+        // Ten bits per colour channel and two of alpha, each the nearest code.
         D3DFMT_A2R10G10B10 => {
-            // Convert normalized channels to their nearest representable value.
-            let rgb = [r, g, b].map(|channel| (u32::from(channel) * 1023 + 127) / 255);
-            let alpha = (u32::from(a) * 3 + 127) / 255;
-            let packed = (alpha << 30) | (rgb[0] << 20) | (rgb[1] << 10) | rgb[2];
+            let [red, green, blue] = [r, g, b].map(|channel| unorm8_to_nearest_code(channel, 1023));
+            let alpha = unorm8_to_nearest_code(a, 3);
+            let packed = (alpha << 30) | (red << 20) | (green << 10) | blue;
             Some(packed.to_le_bytes().to_vec())
         }
         // 16-bit packed R5G6B5: top 5 bits of red, top 6 of green, top 5 of
@@ -171,6 +172,14 @@ pub fn d3dcolor_fill_pixel_bytes(color: u32, d3d_format: u32) -> Option<Vec<u8>>
         // colour's luminance, an alpha destination its alpha byte.
         D3DFMT_L8 => Some(vec![d3dcolor_luminance(r, g, b)]),
         D3DFMT_A8 => Some(vec![a]),
+        // The signed formats store U, V, W, Q in ascending order and take R, G,
+        // B, A in that order. A D3DCOLOR channel is a value in [0, 1], so it
+        // lands on the nearest code of the positive half of the signed range
+        // (0x7f or 0x7fff for one); the colour byte's top bit is never a sign.
+        D3DFMT_V8U8 => Some([r, g].map(unorm8_to_snorm8).to_vec()),
+        D3DFMT_Q8W8V8U8 => Some([r, g, b, a].map(unorm8_to_snorm8).to_vec()),
+        D3DFMT_V16U16 => Some([r, g].map(unorm8_to_snorm16).as_flattened().to_vec()),
+        D3DFMT_Q16W16V16U16 => Some([r, g, b, a].map(unorm8_to_snorm16).as_flattened().to_vec()),
         // Float formats carry the D3DCOLOR channels normalised to [0, 1], in
         // channel order R, G, B, A — the D3D9 names list them most-significant
         // first, so the stored order is the reverse of the name.
@@ -229,6 +238,26 @@ pub fn d3dcolor_fill_pixel_bytes(color: u32, d3d_format: u32) -> Option<Vec<u8>>
 fn d3dcolor_luminance(r: u8, g: u8, b: u8) -> u8 {
     let weighted = 2125 * u32::from(r) + 7154 * u32::from(g) + 721 * u32::from(b);
     u8::try_from((weighted + 5_000) / 10_000).expect("Rec. 709 weights sum to one")
+}
+
+/// The code nearest to an 8-bit unorm channel on a scale whose top code is `max`.
+///
+/// 255 is odd, so no channel lands halfway between two codes and the result
+/// needs no tie rule.
+fn unorm8_to_nearest_code(channel: u8, max: u32) -> u32 {
+    (u32::from(channel) * max + 127) / 255
+}
+
+/// An 8-bit unorm channel as the nearest nonnegative 8-bit snorm byte.
+fn unorm8_to_snorm8(channel: u8) -> u8 {
+    u8::try_from(unorm8_to_nearest_code(channel, 0x7f)).expect("a code never exceeds its scale")
+}
+
+/// An 8-bit unorm channel as the nearest nonnegative 16-bit snorm word, little-endian.
+fn unorm8_to_snorm16(channel: u8) -> [u8; 2] {
+    u16::try_from(unorm8_to_nearest_code(channel, 0x7fff))
+        .expect("a code never exceeds its scale")
+        .to_le_bytes()
 }
 
 /// Widen an 8-bit unorm channel to 16 bits by replication.

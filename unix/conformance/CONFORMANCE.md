@@ -1376,10 +1376,14 @@ do not establish signed pixel correctness. Dedicated end-to-end tests pin
 all four signed16 lanes, alpha, eight-byte transport and float32 sampling
 precision. This feature does not claim a Wine positive-pixel skip reduction.
 
-Signed-format ColorFill on DEFAULT offscreen plain surfaces still reaches
-the existing missing fill-codec path, which warns and returns success without
-writing. This also affects V8U8, V16U16 and Q8W8V8U8; native sampling support
-does not resolve that separate ColorFill gap.
+ColorFill of a DEFAULT offscreen plain surface in V8U8, V16U16, Q8W8V8U8 or
+Q16W16V16U16 writes each D3DCOLOR channel as the nearest nonnegative signed
+code, R, G, B, A into U, V, W, Q, which is the value a clear of the matching
+signed-normalized attachment to the colour's [0, 1] floats stores. The format
+table of visual.c/color_fill_test has no signed row and no other upstream test
+fills a signed surface, so no site moves. Dedicated end-to-end tests pin the
+whole and sub-rect bytes, the texels around a sub-rect, the rejected CPU-pool
+and texture-level destinations, and the upload the GPU samples.
 
 ### device.c/test_getdc, A2R10G10B10
 

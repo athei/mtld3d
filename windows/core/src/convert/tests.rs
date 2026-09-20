@@ -1147,3 +1147,84 @@ fn colorfill_a2r10g10b10_uses_nearest_normalized_channels() {
     let bytes = d3dcolor_fill_pixel_bytes(0x7f2b_00ff, D3DFMT_A2R10G10B10).unwrap();
     assert_eq!(bytes, ((1_u32 << 30) | (173 << 20) | 1023).to_le_bytes());
 }
+
+#[test]
+fn colorfill_signed_formats_store_r_g_b_a_as_u_v_w_q() {
+    // 0xdeadbeef has four distinct channels, so an exchanged lane changes the
+    // bytes: R 0xad, G 0xbe, B 0xef, A 0xde land on 0x56, 0x5f, 0x77, 0x6f of
+    // 0x7f and on 0x56d6, 0x5f5f, 0x77f7, 0x6f6f of 0x7fff.
+    for (format, expected) in [
+        (D3DFMT_V8U8, vec![0x56, 0x5f]),
+        (D3DFMT_Q8W8V8U8, vec![0x56, 0x5f, 0x77, 0x6f]),
+        (D3DFMT_V16U16, vec![0xd6, 0x56, 0x5f, 0x5f]),
+        (
+            D3DFMT_Q16W16V16U16,
+            vec![0xd6, 0x56, 0x5f, 0x5f, 0xf7, 0x77, 0x6f, 0x6f],
+        ),
+    ] {
+        assert_eq!(
+            d3dcolor_fill_pixel_bytes(0xdead_beef, format),
+            Some(expected)
+        );
+    }
+}
+
+#[test]
+fn colorfill_signed_formats_never_set_the_sign_bit() {
+    // A channel at or above 0x80 is still a value in [0, 1]: the endpoints
+    // are zero and the largest positive code, never a negative one.
+    for (color, narrow, wide) in [
+        (0x0000_0000, [0x00; 4], [0x0000; 4]),
+        (0xffff_ffff, [0x7f; 4], [0x7fff; 4]),
+        (0x8080_8080, [0x40; 4], [0x4040; 4]),
+        (0x00ff_0000, [0x7f, 0, 0, 0], [0x7fff, 0, 0, 0]),
+        (0x0000_ff00, [0, 0x7f, 0, 0], [0, 0x7fff, 0, 0]),
+        (0x0000_00ff, [0, 0, 0x7f, 0], [0, 0, 0x7fff, 0]),
+        (0xff00_0000, [0, 0, 0, 0x7f], [0, 0, 0, 0x7fff]),
+    ] {
+        let wide: Vec<u8> = wide.iter().flat_map(|w: &u16| w.to_le_bytes()).collect();
+        for (format, expected) in [
+            (D3DFMT_V8U8, &narrow[..2]),
+            (D3DFMT_Q8W8V8U8, &narrow[..]),
+            (D3DFMT_V16U16, &wide[..4]),
+            (D3DFMT_Q16W16V16U16, &wide[..]),
+        ] {
+            assert_eq!(
+                d3dcolor_fill_pixel_bytes(color, format).as_deref(),
+                Some(expected),
+                "format {format}, colour {color:#010x}"
+            );
+        }
+    }
+}
+
+#[test]
+fn colorfill_signed_channels_are_the_nearest_code_for_every_byte() {
+    for channel in 0..=255u8 {
+        let values = [channel, 255 - channel, channel ^ 0x55, channel ^ 0xaa];
+        let [r, g, b, a] = values;
+        let color = u32::from_le_bytes([b, g, r, a]);
+        for (format, maximum, count) in [
+            (D3DFMT_V8U8, 127.0, 2),
+            (D3DFMT_Q8W8V8U8, 127.0, 4),
+            (D3DFMT_V16U16, 32767.0, 2),
+            (D3DFMT_Q16W16V16U16, 32767.0, 4),
+        ] {
+            let bytes = d3dcolor_fill_pixel_bytes(color, format).unwrap();
+            let encoded: Vec<u16> = if bytes.len() == count {
+                bytes.iter().map(|&v| u16::from(v)).collect()
+            } else {
+                u16_indices(&bytes)
+            };
+            assert_eq!(encoded.len(), count);
+            for (&actual, &input) in encoded.iter().zip(&values) {
+                let expected = (f64::from(input) / 255.0 * maximum).round();
+                assert_eq!(
+                    f64::from(actual).to_bits(),
+                    expected.to_bits(),
+                    "format {format}, input {input}"
+                );
+            }
+        }
+    }
+}
