@@ -5260,6 +5260,24 @@ fn blend_texture_alpha_premultiplied() {
     assert!(failures.is_empty(), "PM failures: {failures:x?}");
 }
 
+/// Asserts a sampled V16U16 pixel, leaving the swizzle-filled blue lane to physical GPUs.
+///
+/// Red and green are the stored signed lanes and are compared on every device,
+/// and so is alpha, which a two-channel format samples as one with or without
+/// a swizzle. Blue is one only through the view swizzle. The paravirtual
+/// device samples a swizzle view through the base texture's lanes, so blue is
+/// left out of the comparison there and required on every physical GPU.
+#[track_caller]
+fn assert_v16u16_pixel(h: &Harness, actual: u32, expected: u32, tol: u8, context: &str) {
+    const BLUE: u32 = 0x0000_00ff;
+    let mask = if h.device_is_paravirtual() {
+        !BLUE
+    } else {
+        u32::MAX
+    };
+    assert_pixel_approx(actual & mask, expected & mask, tol, context);
+}
+
 /// V16U16 preserves signed endpoints and fills missing blue with one.
 #[test]
 fn v16u16_signed_extrema_and_missing_channels() {
@@ -5292,7 +5310,8 @@ fn v16u16_signed_extrema_and_missing_channels() {
     ] {
         let tex = h.create_texture(1, 1, 1, 0, D3DFMT_V16U16, D3DPOOL_MANAGED);
         tex.lock_rect(0, 0).write::<i16>(&[u, v]);
-        assert_pixel_approx(
+        assert_v16u16_pixel(
+            &h,
             sample_center(&h, &tex).to_pixel(),
             expected,
             1,
@@ -5379,9 +5398,11 @@ fn v16u16_native_bytes_mips_and_partial_updates() {
     src.lock_rect(0, 0).write_u32(&[0x0000_7fff; 16]);
     let dst = h.create_texture(4, 4, 1, 0, D3DFMT_V16U16, D3DPOOL_DEFAULT);
     assert_eq!(h.update_texture_hr(&src, &dst), 0);
-    assert_pixel_eq(
+    assert_v16u16_pixel(
+        &h,
         sample_center(&h, &dst).to_pixel(),
         0xffff_00ff,
+        0,
         "UpdateTexture signed pair",
     );
     src.lock_rect_partial(0, &[0, 0, 1, 1], 0)
@@ -5400,14 +5421,18 @@ fn v16u16_native_bytes_mips_and_partial_updates() {
         ),
         0
     );
-    assert_pixel_eq(
+    assert_v16u16_pixel(
+        &h,
         sample_at(&h, &dst, 400, 300).to_pixel(),
         0xff00_ffff,
+        0,
         "partial UpdateSurface",
     );
-    assert_pixel_eq(
+    assert_v16u16_pixel(
+        &h,
         sample_at(&h, &dst, 80, 60).to_pixel(),
         0xffff_00ff,
+        0,
         "untouched pixel",
     );
     let mip = h.create_texture(4, 4, 0, 0, D3DFMT_V16U16, D3DPOOL_MANAGED);
@@ -5418,7 +5443,13 @@ fn v16u16_native_bytes_mips_and_partial_updates() {
     assert_eq!(h.set_sampler_state(0, D3DSAMP_MIPFILTER, D3DTEXF_POINT), 0);
     for (level, expected) in [(0, 0xffff_00ff), (1, 0xff00_ffff), (2, 0xffff_ffff)] {
         assert_eq!(h.set_sampler_state(0, D3DSAMP_MAXMIPLEVEL, level), 0);
-        assert_pixel_eq(sample_center(&h, &mip).to_pixel(), expected, "explicit mip");
+        assert_v16u16_pixel(
+            &h,
+            sample_center(&h, &mip).to_pixel(),
+            expected,
+            0,
+            "explicit mip",
+        );
     }
 }
 
@@ -5449,14 +5480,18 @@ fn v16u16_cube_and_volume_updates() {
         } else {
             &src
         };
-        assert_pixel_eq(
+        assert_v16u16_pixel(
+            &h,
             sample_cube_x(&h, sampled, 1.0),
             0xffff_00ff,
+            0,
             "positive X cube",
         );
-        assert_pixel_eq(
+        assert_v16u16_pixel(
+            &h,
             sample_cube_x(&h, sampled, -1.0),
             0xff00_ffff,
+            0,
             "negative X cube",
         );
         let (hr, src) = h.try_create_volume_texture([2, 2, 2], 0, 0, D3DFMT_V16U16, pool);
@@ -5494,11 +5529,29 @@ fn v16u16_cube_and_volume_updates() {
             h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1 | (D3DFVF_TEXTUREFORMAT3 << 16)),
             0
         );
-        assert_pixel_eq(sample_volume_depth(&h, 0.25), 0xffff_00ff, "first slice");
-        assert_pixel_eq(sample_volume_depth(&h, 0.75), 0xff00_ffff, "second slice");
+        assert_v16u16_pixel(
+            &h,
+            sample_volume_depth(&h, 0.25),
+            0xffff_00ff,
+            0,
+            "first slice",
+        );
+        assert_v16u16_pixel(
+            &h,
+            sample_volume_depth(&h, 0.75),
+            0xff00_ffff,
+            0,
+            "second slice",
+        );
         assert_eq!(h.set_sampler_state(0, D3DSAMP_MIPFILTER, D3DTEXF_POINT), 0);
         assert_eq!(h.set_sampler_state(0, D3DSAMP_MAXMIPLEVEL, 1), 0);
-        assert_pixel_eq(sample_volume_depth(&h, 0.5), 0xffff_ffff, "volume mip");
+        assert_v16u16_pixel(
+            &h,
+            sample_volume_depth(&h, 0.5),
+            0xffff_ffff,
+            0,
+            "volume mip",
+        );
         assert_eq!(h.set_sampler_state(0, D3DSAMP_MAXMIPLEVEL, 0), 0);
         assert_eq!(h.clear_texture(0), 0);
     }
@@ -5597,16 +5650,20 @@ fn v16u16_queries_and_noautogen_contract() {
             assert_eq!(tex.auto_gen_filter_type(), D3DTEXF_POINT);
             tex.lock_rect(0, 0).write_u32(&[0x0000_7fff; 16]);
             tex.generate_mip_sub_levels();
-            assert_pixel_eq(
+            assert_v16u16_pixel(
+                &h,
                 sample_center(&h, &tex).to_pixel(),
                 0xffff_00ff,
+                0,
                 "NOAUTOGEN top-level upload",
             );
             tex.lock_rect(0, 0).write_u32(&[0x7fff_0000; 16]);
             tex.generate_mip_sub_levels();
-            assert_pixel_eq(
+            assert_v16u16_pixel(
+                &h,
                 sample_center(&h, &tex).to_pixel(),
                 0xff00_ffff,
+                0,
                 "NOAUTOGEN second publication",
             );
             let cube =
@@ -5636,9 +5693,11 @@ fn v16u16_queries_and_noautogen_contract() {
                 cube.lock_rect(0, 0, 0).write_u32(&[0x0000_7fff; 16]);
             }
             cube.generate_mip_sub_levels();
-            assert_pixel_eq(
+            assert_v16u16_pixel(
+                &h,
                 sample_cube_x(&h, &cube, 1.0),
                 0xffff_00ff,
+                0,
                 "NOAUTOGEN cube publication",
             );
         }

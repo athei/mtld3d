@@ -26,10 +26,10 @@ use mtld3d_types::{
     D3DLOCK_NOOVERWRITE, D3DLOCK_READONLY, D3DLOCKED_BOX, D3DLOCKED_RECT, D3DPOOL_DEFAULT,
     D3DPOOL_MANAGED, D3DRECT, D3DRTYPE_CUBETEXTURE, D3DRTYPE_SURFACE, D3DRTYPE_TEXTURE,
     D3DRTYPE_VOLUME, D3DRTYPE_VOLUMETEXTURE, D3DSURFACE_DESC, D3DTEXF_LINEAR, D3DTEXF_NONE,
-    D3DUSAGE_DYNAMIC, D3DVOLUME_DESC, Guid, IDirect3DCubeTexture9Vtbl, IDirect3DTexture9Vtbl,
-    IDirect3DVolume9Vtbl, IDirect3DVolumeTexture9Vtbl, IID_IDIRECT3DBASETEXTURE9,
-    IID_IDIRECT3DCUBETEXTURE9, IID_IDIRECT3DRESOURCE9, IID_IDIRECT3DTEXTURE9, IID_IDIRECT3DVOLUME9,
-    IID_IDIRECT3DVOLUMETEXTURE9, IID_IUNKNOWN,
+    D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_DYNAMIC, D3DVOLUME_DESC, Guid, IDirect3DCubeTexture9Vtbl,
+    IDirect3DTexture9Vtbl, IDirect3DVolume9Vtbl, IDirect3DVolumeTexture9Vtbl,
+    IID_IDIRECT3DBASETEXTURE9, IID_IDIRECT3DCUBETEXTURE9, IID_IDIRECT3DRESOURCE9,
+    IID_IDIRECT3DTEXTURE9, IID_IDIRECT3DVOLUME9, IID_IDIRECT3DVOLUMETEXTURE9, IID_IUNKNOWN,
 };
 
 use super::{
@@ -3565,9 +3565,14 @@ extern "system" fn texture_generate_mip_sub_levels(this: *mut c_void) {
     };
     let ti = obj.inner_mut();
     if !ti.autogen_mipmap() {
-        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
-            "GenerateMipSubLevels without a generated mip chain → no-op"
-        );
+        // A texture created with AUTOGENMIPMAP in a format that answers
+        // D3DOK_NOAUTOGEN keeps the usage and has one level, so there is
+        // nothing to regenerate and returning is the whole behaviour.
+        if ti.d3d_usage() & D3DUSAGE_AUTOGENMIPMAP == 0 {
+            mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+                "GenerateMipSubLevels on non-AUTOGENMIPMAP texture → no-op"
+            );
+        }
         return;
     }
     let texture_id = ti.texture_id;
