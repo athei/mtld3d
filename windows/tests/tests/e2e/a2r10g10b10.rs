@@ -17,6 +17,7 @@ use mtld3d_types::{
     D3DUSAGE_QUERY_VERTEXTEXTURE, D3DUSAGE_QUERY_WRAPANDMIP, D3DUSAGE_RENDERTARGET,
 };
 
+/// Creation needs no configuration key and reports the requested format.
 #[test]
 fn a2r10g10b10_creation_is_not_capability_gated() {
     let h = Harness::new();
@@ -24,6 +25,7 @@ fn a2r10g10b10_creation_is_not_capability_gated() {
     assert_eq!(texture.level_desc(0).1.format, D3DFMT_A2R10G10B10);
 }
 
+/// Blue is the low lane and alpha the top two bits, with all ten bits of each colour lane kept.
 #[test]
 fn a2r10g10b10_channels_alpha_and_lower_rgb_bits() {
     let h = Harness::new();
@@ -66,6 +68,7 @@ fn a2r10g10b10_channels_alpha_and_lower_rgb_bits() {
     }
 }
 
+/// Locks expose the native words in every pool, and copies and updates move them unchanged.
 #[test]
 fn a2r10g10b10_native_words_pools_mips_and_updates() {
     let h = Harness::new();
@@ -171,6 +174,7 @@ fn a2r10g10b10_native_words_pools_mips_and_updates() {
     );
 }
 
+/// Queries agree with creation, with one level and the usage kept for AUTOGEN requests.
 #[test]
 fn a2r10g10b10_queries_and_noautogen() {
     let h = Harness::new();
@@ -343,6 +347,7 @@ fn a2r10g10b10_queries_and_noautogen() {
     }
 }
 
+/// Cube faces, volume slices and their mips stay apart, and filtering and wrapping are native.
 #[test]
 fn a2r10g10b10_cube_volume_filter_and_mips() {
     let h = Harness::new();
@@ -436,6 +441,7 @@ fn a2r10g10b10_cube_volume_filter_and_mips() {
     assert_pixel_approx(h.read_pixel(320, 240), 0x0000_ff00, 1, "native wrap");
 }
 
+/// `ColorFill` writes the nearest codes, and a lock after a GPU copy reads the copied words.
 #[test]
 fn a2r10g10b10_colorfill_and_gpu_authority() {
     let h = Harness::new();
@@ -489,13 +495,14 @@ fn a2r10g10b10_colorfill_and_gpu_authority() {
         "queued source before partial fill",
     );
     assert_words(&surface.lock_rect(D3DLOCK_READONLY), 3, &expected);
-    assert_eq!(surface.get_dc(core::ptr::null_mut()).0, D3DERR_INVALIDCALL);
+    let sentinel = core::ptr::dangling_mut::<core::ffi::c_void>();
+    assert_eq!(surface.get_dc(sentinel), (D3DERR_INVALIDCALL, sentinel));
     for pool in [D3DPOOL_SYSTEMMEM, D3DPOOL_SCRATCH] {
         let cpu = h.create_offscreen_plain_surface(3, 2, D3DFMT_A2R10G10B10, pool);
         assert_eq!(h.color_fill_hr(&cpu, 0), D3DERR_INVALIDCALL);
         cpu.lock_rect(0).write_u32(&[raw; 6]);
         assert_words(&cpu.lock_rect(D3DLOCK_READONLY), 3, &[raw; 6]);
-        assert_eq!(cpu.get_dc(core::ptr::null_mut()).0, D3DERR_INVALIDCALL);
+        assert_eq!(cpu.get_dc(sentinel), (D3DERR_INVALIDCALL, sentinel));
     }
     let texture = h.create_texture(3, 2, 1, 0, D3DFMT_A2R10G10B10, D3DPOOL_DEFAULT);
     assert_eq!(
@@ -504,6 +511,7 @@ fn a2r10g10b10_colorfill_and_gpu_authority() {
     );
 }
 
+/// Copies to and from other four-byte and wider formats are rejected with no write.
 #[test]
 fn a2r10g10b10_rejects_mixed_raw_copies() {
     let h = Harness::new();
@@ -539,15 +547,18 @@ fn a2r10g10b10_rejects_mixed_raw_copies() {
     }
 }
 
+/// The A2R10G10B10 word of ten-bit red, green and blue codes and a two-bit alpha code.
 const fn packed(r: u32, g: u32, b: u32, alpha: u32) -> u32 {
     (alpha << 30) | (r << 20) | (g << 10) | b
 }
 
+/// The A8R8G8B8 pixel an A2R10G10B10 word samples as, each lane rounded to nearest.
 fn pixel(raw: u32) -> u32 {
     let rgb = [20, 10, 0].map(|shift| (((raw >> shift) & 1023) * 255 + 511) / 1023);
     (((raw >> 30) * 85) << 24) | (rgb[0] << 16) | (rgb[1] << 8) | rgb[2]
 }
 
+/// Assert a whole-subresource lock's pitch and its raw little-endian words.
 fn assert_words(lock: &LockedRect<'_>, width: usize, expected: &[u32]) {
     assert_eq!(lock.pitch(), i32::try_from(width * 4).unwrap());
     for (i, word) in expected.iter().enumerate() {
@@ -563,6 +574,7 @@ fn assert_words(lock: &LockedRect<'_>, width: usize, expected: &[u32]) {
     }
 }
 
+/// `ps_2_0` tokens sampling stage 0 and writing `sample.<swizzle> * c0 + c1`.
 fn sample_shader(swizzle: u32) -> Vec<u32> {
     // ps_2_0: sample s0, then apply the caller's scale and offset to chosen lanes.
     vec![
@@ -586,6 +598,7 @@ fn sample_shader(swizzle: u32) -> Vec<u32> {
     ]
 }
 
+/// A full-target quad whose every vertex carries `uv`.
 fn quad(uv: [f32; 2]) -> [TexturedVertex; 6] {
     [
         (-1.0, 1.0),
@@ -605,6 +618,7 @@ fn quad(uv: [f32; 2]) -> [TexturedVertex; 6] {
     })
 }
 
+/// Point filtering and CLAMP addressing on stage 0.
 fn point_clamp(h: &Harness) {
     for (state, value) in [
         (D3DSAMP_MINFILTER, D3DTEXF_POINT),
@@ -616,18 +630,21 @@ fn point_clamp(h: &Harness) {
     }
 }
 
+/// Fixed-function stage 0 selecting the texture, for the textured FVF.
 fn setup_2d(h: &Harness) {
     h.select_texture_stage(0);
     point_clamp(h);
     assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1), 0);
 }
 
+/// Draw the full-target quad sampling at `uv`.
 fn draw_sample(h: &Harness, uv: [f32; 2]) {
     h.render_once(0, |d| {
         assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad(uv)), 0);
     });
 }
 
+/// The centre pixel after drawing `tex` sampled at `uv`.
 fn sample(h: &Harness, tex: &Texture<'_>, uv: [f32; 2]) -> u32 {
     assert_eq!(h.set_texture(0, tex), 0);
     setup_2d(h);
@@ -635,6 +652,7 @@ fn sample(h: &Harness, tex: &Texture<'_>, uv: [f32; 2]) -> u32 {
     h.read_pixel(320, 240)
 }
 
+/// The centre pixel after drawing the bound cube or volume texture sampled at `coords`.
 fn sample_3d(h: &Harness, coords: [f32; 3]) -> u32 {
     h.select_texture_stage(0);
     point_clamp(h);

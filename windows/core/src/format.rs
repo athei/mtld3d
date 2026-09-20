@@ -277,8 +277,9 @@ pub const fn is_mapped_color_format(d3d_format: u32) -> bool {
 
 /// Colour formats whose creation rejects the MANAGED/DYNAMIC combination.
 ///
-/// Selected native sampling formats follow the pool rule. Existing formats retain
-/// their legacy creation policy; this does not replace other pool validation.
+/// V16U16, Q8W8V8U8, Q16W16V16U16 and A2R10G10B10 follow the native pool
+/// rule. Other formats retain their legacy policy; this does not replace pool
+/// validation.
 #[must_use]
 pub const fn uses_strict_dynamic_pool_validation(d3d_format: u32) -> bool {
     matches!(
@@ -289,9 +290,9 @@ pub const fn uses_strict_dynamic_pool_validation(d3d_format: u32) -> bool {
 
 /// Colour formats whose AUTOGEN requests use one level without generation.
 ///
-/// Selected native sampling formats advertise NOAUTOGEN. Usage is
-/// retained; creation suppresses the internal generation flag and hidden levels.
-/// Other formats keep their existing creation policy.
+/// V16U16, Q8W8V8U8, Q16W16V16U16 and A2R10G10B10 advertise NOAUTOGEN. Usage
+/// is retained; creation suppresses the internal generation flag and hidden
+/// levels. Other formats keep their existing creation policy.
 #[must_use]
 pub const fn uses_noautogen_fallback(d3d_format: u32) -> bool {
     matches!(
@@ -462,6 +463,8 @@ pub const fn supports_usage_query(d3d_format: u32, usage: u32, float32_filtering
     {
         return false;
     }
+    // A2R10G10B10 has no sRGB twin and is no bump-map format, and neither
+    // answer may turn into the NOAUTOGEN success of a combined query.
     if d3d_format == D3DFMT_A2R10G10B10
         && usage & (D3DUSAGE_QUERY_SRGBWRITE | D3DUSAGE_QUERY_LEGACYBUMPMAP) != 0
     {

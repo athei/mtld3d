@@ -2279,6 +2279,7 @@ fn q16w16v16u16_vertex_texture_preserves_signed_values() {
     }
 }
 
+/// Vertex fetch keeps the low two bits of each ten-bit lane and the four alpha codes.
 #[test]
 fn a2r10g10b10_vertex_texture_keeps_ten_bit_precision_and_alpha() {
     let h = Harness::new();
