@@ -300,9 +300,8 @@ fn planar_fill(d3d_format: u32, pitch: usize, luma_rows: usize, yuv: (u8, u8, u8
         chroma[..plane].fill(yuv.2);
         chroma[plane..2 * plane].fill(yuv.1);
     } else {
-        for pair in chroma.chunks_exact_mut(2) {
-            pair[0] = yuv.1;
-            pair[1] = yuv.2;
+        for pair in chroma.as_chunks_mut::<2>().0 {
+            *pair = [yuv.1, yuv.2];
         }
     }
     bytes

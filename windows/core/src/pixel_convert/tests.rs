@@ -596,9 +596,9 @@ fn planar_pattern(d3d_format: u32, width: usize, height: usize) -> (Vec<u8>, usi
 
 /// The `X8R8G8B8` word the test pattern decodes to at `(x, y)`.
 fn planar_expected(x: usize, y: usize) -> u32 {
-    let (u, v) = planar_chroma(x / 2, y / 2);
-    let (r, g, b) = yuv_to_rgb8(planar_luma(x, y), u, v);
-    0xFF00_0000 | (u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b)
+    let (cb, cr) = planar_chroma(x / 2, y / 2);
+    let (red, green, blue) = yuv_to_rgb8(planar_luma(x, y), cb, cr);
+    0xFF00_0000 | (u32::from(red) << 16) | (u32::from(green) << 8) | u32::from(blue)
 }
 
 #[test]

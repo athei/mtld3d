@@ -4472,14 +4472,14 @@ fn stretch_rect_of_a_planar_yuv_sub_rect_with_an_odd_origin() {
             "{name} sub-rect scaled into the middle of the backbuffer"
         );
         let (pixels, width) = read_back_buffer(&h);
-        for j in 0..4 {
-            for i in 0..4 {
-                let (px, py) = (160 + 80 * i + 40, 120 + 60 * j + 30);
+        for row in 0..4 {
+            for col in 0..4 {
+                let (px, py) = (160 + 80 * col + 40, 120 + 60 * row + 30);
                 assert_rgb_close(
                     pixels[py * width + px],
-                    planar_pattern_colour(3 + i, 1 + j),
+                    planar_pattern_colour(3 + col, 1 + row),
                     2,
-                    &format!("{name} GPU source texel ({}, {})", 3 + i, 1 + j),
+                    &format!("{name} GPU source texel ({}, {})", 3 + col, 1 + row),
                 );
             }
         }
