@@ -65,6 +65,10 @@ impl Direct3DPixelShader9 {
         self.inner().max_const_used
     }
 
+    pub fn uses_automatic_fog(&self) -> bool {
+        self.inner().flags.contains(PsUsage::AUTOMATIC_FOG)
+    }
+
     pub fn uses_bump_env(&self) -> bool {
         self.inner().flags.contains(PsUsage::USES_BUMP_ENV)
     }
@@ -93,7 +97,7 @@ impl Direct3DPixelShader9 {
 bitflags::bitflags! {
     /// What a compiled PS pulls in beyond its float constants.
     ///
-    /// Gates the per-draw fragment uniform binds.
+    /// Gates fragment specialization and per-draw uniform binds.
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
     pub struct PsUsage: u8 {
         /// Uses an SM1 bump-environment op (`texbem`/`texbeml`/`bem`).
@@ -113,6 +117,8 @@ bitflags::bitflags! {
         /// by `SetPixelShaderConstantB`; such draws bind the boolean-constant
         /// bitmask (fragment slot 10).
         const USES_BOOL_CONST = 1 << 2;
+        /// SM1/SM2 output goes through the fixed-function fog stage.
+        const AUTOMATIC_FOG = 1 << 3;
     }
 }
 

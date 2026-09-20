@@ -78,7 +78,7 @@ fn table_fog_wins_over_vertex_mode_and_keys_source_on_projection() {
 
     // Identity projection (4th column (0,0,0,1)) = orthographic → Z source.
     let mut ff = FfState::new();
-    let variant = ff.variant_key(&states, false);
+    let variant = ff.variant_key(&states, false, true);
     assert_eq!(variant.fog_mode, 0, "table fog must zero the vertex mode");
     assert_eq!(variant.fog_table_mode, 3);
     assert!(
@@ -90,21 +90,21 @@ fn table_fog_wins_over_vertex_mode_and_keys_source_on_projection() {
     let mut proj = D3DMATRIX::IDENTITY;
     proj.m[15] = 1.01;
     ff.set_transform(mtld3d_types::D3DTS_PROJECTION, &proj);
-    let variant = ff.variant_key(&states, false);
+    let variant = ff.variant_key(&states, false, true);
     assert!(
         variant.flags.contains(VariantFlags::FOG_SOURCE_W),
         "non-ortho projection → W source"
     );
 
     // Table fog applies on the RHW path too.
-    let variant = ff.variant_key(&states, true);
+    let variant = ff.variant_key(&states, true, true);
     assert_eq!(variant.fog_table_mode, 3);
     assert_eq!(variant.fog_mode, 0);
 
     // Vertex fog only: no table mode, no source bit churn from the
     // (still perspective) projection.
     states[D3DRS_FOGTABLEMODE as usize] = 0;
-    let variant = ff.variant_key(&states, false);
+    let variant = ff.variant_key(&states, false, true);
     assert_eq!(variant.fog_mode, 1);
     assert_eq!(variant.fog_table_mode, 0);
     assert!(!variant.flags.contains(VariantFlags::FOG_SOURCE_W));
@@ -1195,6 +1195,40 @@ fn range_fog_keys_only_computed_vertex_fog() {
             assert_eq!(range.flags.contains(FfVsFlags::RANGE_FOG), active);
             range.flags.remove(FfVsFlags::RANGE_FOG);
             assert_eq!(ordinary, range, "range fog changes only its active key bit");
+        }
+    }
+}
+
+#[test]
+fn shader_owned_fog_reuses_the_existing_disabled_key_and_source() {
+    use crate::{
+        dxso::{emit_ps_programmable, parse},
+        shader_cache::ff_key_hash,
+    };
+
+    let shader =
+        parse(&[0xffff_0300, 0x0200_0001, 0x800f_0800, 0xa0e4_0000, 0xffff]).expect("constant PS3");
+    let mut ff = FfState::new();
+    let mut states = rs();
+    let disabled = ff.variant_key(&states, false, true);
+    let source = emit_ps_programmable(&shader, disabled).expect("disabled shader");
+    assert!(!source.contains("fog_data"));
+    states[D3DRS_FOGENABLE as usize] = 1;
+    for projection_w in [1.0, 2.0] {
+        let mut projection = D3DMATRIX::IDENTITY;
+        projection.m[15] = projection_w;
+        ff.set_transform(mtld3d_types::D3DTS_PROJECTION, &projection);
+        for table_mode in 0..=3 {
+            states[D3DRS_FOGTABLEMODE as usize] = table_mode;
+            for vertex_mode in 0..=3 {
+                states[D3DRS_FOGVERTEXMODE as usize] = vertex_mode;
+                let canonical = ff.variant_key(&states, false, false);
+                assert_eq!(canonical, disabled);
+                assert_eq!(ff_key_hash(&canonical), ff_key_hash(&disabled));
+                assert_eq!(build_fog_color_bytes(&states, canonical).1, 0);
+                assert_eq!(emit_ps_programmable(&shader, canonical).unwrap(), source);
+                assert_ne!(ff.variant_key(&states, false, true), canonical);
+            }
         }
     }
 }

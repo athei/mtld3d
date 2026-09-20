@@ -1123,7 +1123,7 @@ impl FfState {
             lighting_enabled,
             vertex_blend_indexed,
         );
-        let fog_mode = resolve_fog_config(render_states, layout.has_rhw()).vertex_mode;
+        let fog_mode = resolve_fog_config(render_states, layout.has_rhw(), true).vertex_mode;
         flags.set(
             FfVsFlags::RANGE_FOG,
             matches!(fog_mode, 1..=3) && render_states[D3DRS_RANGEFOGENABLE as usize] != 0,
@@ -1225,15 +1225,18 @@ impl FfState {
     ///
     /// Callers pass `has_rhw` so XYZRHW pipelines get `fog_mode = 0` (D3D9
     /// bypasses vertex fog for pre-transformed geometry) matching the VS key.
+    /// SM3 pixel shaders disable `automatic_fog`, canonicalizing all fog
+    /// fields before shader and pipeline cache lookup.
     #[must_use]
     pub fn variant_key(
         &self,
         render_states: &[u32; RENDER_STATE_COUNT],
         has_rhw: bool,
+        automatic_fog: bool,
     ) -> VariantKey {
         use mtld3d_types::{D3DRS_SHADEMODE, D3DRS_SRGBWRITEENABLE, D3DSHADE_FLAT};
         let alpha_test_on = render_states[D3DRS_ALPHATESTENABLE as usize] != 0;
-        let fog = resolve_fog_config(render_states, has_rhw);
+        let fog = resolve_fog_config(render_states, has_rhw, automatic_fog);
         let mut flags = VariantFlags::empty();
         // Source select is only meaningful for table fog; held clear
         // otherwise so vertex-fog variants don't churn on projection changes.
@@ -1862,12 +1865,16 @@ struct FogConfig {
     table_mode: u8,
 }
 
-fn resolve_fog_config(render_states: &[u32; RENDER_STATE_COUNT], has_rhw: bool) -> FogConfig {
+fn resolve_fog_config(
+    render_states: &[u32; RENDER_STATE_COUNT],
+    has_rhw: bool,
+    automatic_fog: bool,
+) -> FogConfig {
     const OFF: FogConfig = FogConfig {
         vertex_mode: 0,
         table_mode: 0,
     };
-    if render_states[D3DRS_FOGENABLE as usize] == 0 {
+    if !automatic_fog || render_states[D3DRS_FOGENABLE as usize] == 0 {
         return OFF;
     }
     // A non-NONE table mode wins over any vertex mode: D3D9 fogs per-pixel

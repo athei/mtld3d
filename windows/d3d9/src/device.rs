@@ -1076,6 +1076,14 @@ impl DeviceInner {
         &mut self.shader_bindings
     }
 
+    fn uses_automatic_fog(&self) -> bool {
+        let shader = self.shader_bindings().pixel_shader();
+        shader.is_null() || {
+            // SAFETY: the non-null shader is kept live by the device binding.
+            unsafe { (*shader).uses_automatic_fog() }
+        }
+    }
+
     pub const fn vertex_decl(&self) -> *mut Direct3DVertexDeclaration9 {
         self.vertex_decl.raw()
     }
@@ -2367,12 +2375,6 @@ impl DeviceInner {
         let default = RS_DEFAULTS[index];
         match class {
             RsClass::Consumed => {} // unreachable given early-return above
-            RsClass::PortCandidate(feat) => {
-                warn!(
-                    target: LOG_TARGET,
-                    "D3DRS_{index} = {value:#x} (default {default:#x}) set but {feat} not implemented"
-                );
-            }
             RsClass::Obsolete(reason) => {
                 info!(
                     target: LOG_TARGET,
@@ -11284,9 +11286,11 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) -> Option<CurrentSnapshotPtr> {
     // VARIANT: depends on RS + ff_vs_layout.has_rhw + depth_sampler_mask
     // (current live stage bindings).
     let variant_value = if dirty.contains(SnapshotDirty::VARIANT) {
-        let mut variant = dev
-            .ff_state()
-            .variant_key(rs, dev.cached_ff_vs_layout.has_rhw());
+        let mut variant = dev.ff_state().variant_key(
+            rs,
+            dev.cached_ff_vs_layout.has_rhw(),
+            dev.uses_automatic_fog(),
+        );
         variant.depth_sampler_mask = dev.stage_bindings().depth_sampler_mask();
         variant.depth_fetch_mask = dev.stage_bindings().depth_fetch_mask();
         variant.raw_depth_red_mask = dev.stage_bindings().fetch4().raw_red_mask();
@@ -13126,6 +13130,10 @@ extern "system" fn device_create_pixel_shader(
     let max_const_used = program.max_const_reg().map_or(0, |m| u32::from(m) + 1);
     let mut usage = crate::pixel_shader::PsUsage::empty();
     usage.set(
+        crate::pixel_shader::PsUsage::AUTOMATIC_FOG,
+        program.major < 3,
+    );
+    usage.set(
         crate::pixel_shader::PsUsage::USES_BUMP_ENV,
         program.uses_bump_env(),
     );
@@ -13176,9 +13184,15 @@ extern "system" fn device_set_pixel_shader(this: *mut c_void, shader: *mut c_voi
     }
     // Redundant-set elimination: re-binding the same PS pointer leaves
     // the shader id / max_const_used identical, so skip the rebuild.
+    let automatic_fog = dev.uses_automatic_fog();
     let changed = dev.shader_bindings_mut().replace_pixel_shader(new);
     if changed {
         dev.mark_snapshot_dirty(SnapshotDirty::PS_SOURCE | SnapshotDirty::PS_CONST);
+        if automatic_fog != dev.uses_automatic_fog() {
+            // SM3 owns its fog. Rebinding a legacy shader restores both its
+            // fog specialization and the uniform bytes suppressed for SM3.
+            dev.mark_snapshot_dirty(SnapshotDirty::VARIANT | SnapshotDirty::FOG_COLOR);
+        }
     }
     dev.perf_mut()
         .record_keys_gate(KeysGate::SetPixelShader, !changed);
@@ -13484,13 +13498,11 @@ extern "system" fn device_create_query(
 // Closes the class of bug where a silently-ignored render-state hides a
 // feature gap. Per-slot latches live on `DeviceInner.rs_warn_fired`;
 // this table classifies each slot so the warn message is targeted.
-// Slots not yet implemented are flagged as port candidates with a
-// targeted message; slots that are obsolete or have no Metal analog
-// route to `Obsolete`; everything else is `NotImplemented`.
+// Slots that are obsolete or have no Metal analog route to `Obsolete`;
+// unknown slots are `NotImplemented`.
 
 enum RsClass {
     Consumed,
-    PortCandidate(&'static str),
     /// Done-by-design no-op.
     ///
     /// Metal has no analog or the feature is
@@ -13544,6 +13556,7 @@ const fn rs_classify(index: u32, value: u32) -> RsClass {
         | D3DRS_TEXTUREFACTOR
         | D3DRS_FOGENABLE
         | D3DRS_FOGVERTEXMODE
+        | D3DRS_FOGTABLEMODE
         | D3DRS_RANGEFOGENABLE
         | D3DRS_FOGCOLOR
         | D3DRS_FOGSTART
@@ -13628,8 +13641,6 @@ const fn rs_classify(index: u32, value: u32) -> RsClass {
         // Metal takes a coverage mask.
         | D3DRS_MULTISAMPLEMASK => RsClass::Consumed,
 
-        // Bucket B — not yet implemented → port-target candidates.
-        D3DRS_FOGTABLEMODE => RsClass::PortCandidate("table fog"),
         // Bucket D — obsolete / no Metal analog. Info-level (not warn)
         // because the no-op IS the correct behaviour on every modern
         // driver.

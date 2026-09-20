@@ -39,6 +39,7 @@ mod smoke;
 mod state_block;
 mod streams;
 mod subresource_identity;
+mod table_fog;
 mod texture_stages;
 mod textures;
 mod transforms_ff;
