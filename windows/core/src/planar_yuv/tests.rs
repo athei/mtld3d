@@ -86,8 +86,9 @@ fn other_formats_and_empty_extents_have_no_layout() {
         assert!(planar_yuv_layout_from_pitch(format, 0, 16).is_none());
         assert!(planar_yuv_layout_from_pitch(format, 20, 0).is_none());
     }
-    // Half a YV12 pitch has to be a whole number of bytes.
+    // An odd pitch would split a chroma pair, or half a pitch, across rows.
     assert!(planar_yuv_layout_from_pitch(D3DFMT_YV12, 21, 16).is_none());
+    assert!(planar_yuv_layout_from_pitch(D3DFMT_NV12, 21, 16).is_none());
 }
 
 #[test]

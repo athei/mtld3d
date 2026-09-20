@@ -9,7 +9,9 @@
 //! The codec covers every uncompressed colour format whose channels are
 //! unsigned normalised and at most 8 bits wide, in both directions, plus the
 //! packed 4:2:2 YUV formats as a source. RGBA8 is the intermediate, so it
-//! carries those formats without loss. A16B16G16R16 and A32B32G32R32F also
+//! carries those formats without loss. The planar 4:2:0 YUV formats are a
+//! source for `StretchRect` alone, decoded through the same intermediate.
+//! A16B16G16R16 and A32B32G32R32F also
 //! convert directly into A8R8G8B8, quantizing only to the final destination.
 //! [`can_convert`] answers for a pair up
 //! front, so a caller can reject the pairs no codec covers instead of writing
@@ -21,7 +23,7 @@ use mtld3d_types::{
     D3DFMT_X1R5G5B5, D3DFMT_X8B8G8R8, D3DFMT_X8R8G8B8,
 };
 
-use crate::stretch_rect::{decode_packed_yuv, is_packed_yuv};
+use crate::stretch_rect::{decode_packed_yuv, decode_planar_yuv, is_packed_yuv, is_planar_yuv};
 
 /// One [`convert_region`] copy: the shared extent, both origins, both layouts.
 ///
@@ -47,19 +49,22 @@ pub struct ConvertRegion {
 /// The narrow normalized and packed-YUV codecs also serve the Update APIs.
 /// Wide RGBA sources have a direct BGRA8 destination codec for offscreen
 /// `StretchRect`; they do not pass through an RGBA8 intermediate on their way
-/// to another format.
+/// to another format. A planar YUV source decodes into every colour format
+/// the narrow codec encodes, again for offscreen `StretchRect` only.
 #[must_use]
 pub const fn can_convert(src_format: u32, dst_format: u32) -> bool {
     can_convert_update(src_format, dst_format)
         || (dst_format == D3DFMT_A8R8G8B8
             && matches!(src_format, D3DFMT_A16B16G16R16 | D3DFMT_A32B32G32R32F))
+        || (is_planar_yuv(src_format) && is_convertible_rgb(dst_format))
 }
 
 /// Format conversion accepted by `UpdateSurface` and `UpdateTexture`.
 ///
 /// Keep API acceptance independent of codecs added for other entry points.
 /// These APIs support the existing narrow normalized and packed-YUV sources;
-/// the wide offscreen `StretchRect` codecs do not expand their contract.
+/// the wide and planar-YUV offscreen `StretchRect` codecs do not expand their
+/// contract.
 #[must_use]
 pub const fn can_convert_update(src_format: u32, dst_format: u32) -> bool {
     (is_convertible_rgb(src_format) || is_packed_yuv(src_format)) && is_convertible_rgb(dst_format)
@@ -101,6 +106,9 @@ pub fn convert_region(
         }
         _ => {}
     }
+    if is_planar_yuv(src_format) {
+        return convert_planar_region(dst, dst_format, src, src_format, region);
+    }
     let yuv_src = is_packed_yuv(src_format);
     let src_bpp = rgb_bpp(src_format);
     let dst_bpp = rgb_bpp(dst_format);
@@ -138,6 +146,48 @@ pub fn convert_region(
                 };
                 encode_rgb_pixel(dst_format, rgba, out);
             }
+        }
+    }
+    true
+}
+
+/// Planar 4:2:0 YUV source into an `is_convertible_rgb` destination.
+///
+/// The luma row count the chroma planes sit behind is the source slice in
+/// rows, which is the source level's height: a planar level is a single slice,
+/// so `src_slice_pitch` describes its luma plane and nothing else. A region
+/// that names more than one slice, or a slice that is not whole rows, names no
+/// layout and is refused, as is any texel outside the luma plane.
+fn convert_planar_region(
+    dst: &mut [u8],
+    dst_format: u32,
+    src: &[u8],
+    src_format: u32,
+    region: &ConvertRegion,
+) -> bool {
+    if region.depth != 1
+        || region.src_pitch == 0
+        || !region.src_slice_pitch.is_multiple_of(region.src_pitch)
+    {
+        return false;
+    }
+    let luma_rows = region.src_slice_pitch / region.src_pitch;
+    let dst_bpp = rgb_bpp(dst_format);
+    for row in 0..region.height {
+        let sy = (region.src_y + row) as usize;
+        let dst_row = (region.dst_y + row) as usize * region.dst_pitch;
+        for col in 0..region.width {
+            let sx = (region.src_x + col) as usize;
+            let Some((r, g, b)) =
+                decode_planar_yuv(src_format, src, region.src_pitch, luma_rows, sx, sy)
+            else {
+                return false;
+            };
+            let off = dst_row + (region.dst_x + col) as usize * dst_bpp;
+            let Some(out) = dst.get_mut(off..off + dst_bpp) else {
+                return false;
+            };
+            encode_rgb_pixel(dst_format, (r, g, b, 0xff), out);
         }
     }
     true
