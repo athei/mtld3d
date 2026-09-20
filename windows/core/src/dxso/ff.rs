@@ -1334,12 +1334,15 @@ fn emit_vs(out: &mut String, vs: &FfVsKey, entry: &str) {
                 let _ = writeln!(out, "    float4 raw{i} = float4(posEye, 0.0);");
             }
             3 if vs.has_normal() => {
-                // R = 2 * N * dot(N, E) - E, where E = normalize(posEye).
+                // D3D9 defines R = 2 (E.N) N - E with E the unit vector from
+                // the vertex to the eye. `posEye` is the vertex in camera
+                // space, so `E_tci` = normalize(posEye) points the other way
+                // and R = E_tci - 2 (E_tci.N) N = reflect(E_tci, N).
                 n = 3;
                 let _ = writeln!(out, "    float4 raw{i};");
                 let _ = writeln!(out, "    {{");
                 out.push_str("        float3 E_tci = normalize(posEye);\n");
-                out.push_str("        float3 R_tci = 2.0 * n * dot(n, E_tci) - E_tci;\n");
+                out.push_str("        float3 R_tci = reflect(E_tci, n);\n");
                 let _ = writeln!(out, "        raw{i} = float4(R_tci, 0.0);");
                 let _ = writeln!(out, "    }}");
             }

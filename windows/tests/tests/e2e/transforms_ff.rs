@@ -1,19 +1,21 @@
 //! Fixed-function transform + texture-stage routing + alpha test.
 
 use mtld3d_tests::{
-    Harness, LitVertex, PosVertex, SpecularVertex, Texture, Vertex, assert_pixel_approx,
+    CubeTexture, Harness, LitVertex, PosVertex, SpecularVertex, Texture, Vertex,
+    assert_pixel_approx,
 };
 use mtld3d_types::{
     D3DCMP_GREATER, D3DCOLORVALUE, D3DFMT_A8R8G8B8, D3DFVF_DIFFUSE, D3DFVF_NORMAL, D3DFVF_SPECULAR,
     D3DFVF_XYZ, D3DLIGHT_DIRECTIONAL, D3DLIGHT_POINT, D3DLIGHT_SPOT, D3DLIGHT9, D3DMATERIAL9,
-    D3DMCS_MATERIAL, D3DPT_TRIANGLELIST, D3DRS_ALPHAFUNC, D3DRS_ALPHAREF, D3DRS_ALPHATESTENABLE,
-    D3DRS_AMBIENT, D3DRS_AMBIENTMATERIALSOURCE, D3DRS_DIFFUSEMATERIALSOURCE,
+    D3DMCS_MATERIAL, D3DPOOL_MANAGED, D3DPT_TRIANGLELIST, D3DRS_ALPHAFUNC, D3DRS_ALPHAREF,
+    D3DRS_ALPHATESTENABLE, D3DRS_AMBIENT, D3DRS_AMBIENTMATERIALSOURCE, D3DRS_DIFFUSEMATERIALSOURCE,
     D3DRS_EMISSIVEMATERIALSOURCE, D3DRS_LIGHTING, D3DRS_LOCALVIEWER, D3DRS_SPECULARENABLE,
     D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_MAGFILTER, D3DSAMP_MINFILTER, D3DTA_ALPHAREPLICATE,
-    D3DTA_DIFFUSE, D3DTA_SPECULAR, D3DTA_TEXTURE, D3DTADDRESS_WRAP, D3DTEXF_POINT, D3DTOP_MODULATE,
-    D3DTOP_SELECTARG1, D3DTS_PROJECTION, D3DTS_TEXTURE0, D3DTS_VIEW, D3DTS_WORLD, D3DTSS_ALPHAARG1,
-    D3DTSS_ALPHAOP, D3DTSS_COLORARG1, D3DTSS_COLORARG2, D3DTSS_COLOROP, D3DTSS_TEXCOORDINDEX,
-    D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_COUNT2, D3DVECTOR,
+    D3DTA_DIFFUSE, D3DTA_SPECULAR, D3DTA_TEXTURE, D3DTADDRESS_CLAMP, D3DTADDRESS_WRAP,
+    D3DTEXF_POINT, D3DTOP_MODULATE, D3DTOP_SELECTARG1, D3DTS_PROJECTION, D3DTS_TEXTURE0,
+    D3DTS_VIEW, D3DTS_WORLD, D3DTSS_ALPHAARG1, D3DTSS_ALPHAOP, D3DTSS_COLORARG1, D3DTSS_COLORARG2,
+    D3DTSS_COLOROP, D3DTSS_TEXCOORDINDEX, D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_COUNT2,
+    D3DTTFF_COUNT3, D3DVECTOR,
 };
 
 #[rustfmt::skip]
@@ -1198,4 +1200,154 @@ fn texgen_spheremap_without_normal_maps_the_view_direction() {
             &format!("no normal: texel (2, 1) at ({x}, {y})"),
         );
     }
+}
+
+/// `D3DTSS_TCI_CAMERASPACENORMAL`, in the same byte of `D3DTSS_TEXCOORDINDEX`.
+const TCI_CAMERASPACENORMAL: u32 = 1 << 16;
+/// `D3DTSS_TCI_CAMERASPACEREFLECTIONVECTOR`, in the same byte.
+const TCI_CAMERASPACEREFLECTIONVECTOR: u32 = 3 << 16;
+
+/// One solid colour per cube face, in `D3DCUBEMAP_FACES` order: +X, -X, +Y, -Y, +Z, -Z.
+///
+/// None of them is the grey the cube texgen tests clear to.
+const CUBE_FACE_COLORS: [u32; 6] = [
+    0xFFFF_0000,
+    0xFF00_FF00,
+    0xFF00_00FF,
+    0xFFFF_FF00,
+    0xFF00_FFFF,
+    0xFFFF_FFFF,
+];
+
+/// Clear colour of the cube texgen tests, which no cube face carries.
+const CUBE_TEXGEN_CLEAR: u32 = 0xFF20_2020;
+
+/// Arm stage 0 to show a cube texture addressed by the generated vector `tci`, unmodulated.
+///
+/// The transforms are the ones the sphere-map tests use: the geometry sits 100
+/// units down the view axis, so the eye-to-vertex direction is (0, 0, 1) to
+/// within a hundredth at every vertex. The stage transforms the generated
+/// vector with `D3DTTFF_COUNT3` and an identity matrix, the way a cube
+/// environment map is set up.
+fn arm_cube_texgen(h: &Harness, tci: u32) -> CubeTexture<'_> {
+    assert_eq!(h.set_render_state(D3DRS_LIGHTING, 0), 0, "lighting off");
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_NORMAL), 0, "SetFVF");
+    assert_eq!(h.set_transform(D3DTS_WORLD, &IDENTITY), 0, "world");
+    assert_eq!(h.set_transform(D3DTS_VIEW, &SPHERE_VIEW_AXIAL), 0, "view");
+    assert_eq!(
+        h.set_transform(D3DTS_PROJECTION, &SPHERE_PROJ_AXIAL),
+        0,
+        "proj"
+    );
+    assert_eq!(h.set_transform(D3DTS_TEXTURE0, &IDENTITY), 0, "tex");
+    let cube = h.create_cube_texture_owned(4, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED);
+    for (face, color) in (0u32..).zip(CUBE_FACE_COLORS) {
+        cube.lock_rect(face, 0, 0).write_u32(&[color; 16]);
+    }
+    assert_eq!(h.set_cube_texture(0, &cube), 0, "SetTexture");
+    for (state, value) in [
+        (D3DTSS_COLOROP, D3DTOP_SELECTARG1),
+        (D3DTSS_COLORARG1, D3DTA_TEXTURE),
+        (D3DTSS_ALPHAOP, D3DTOP_SELECTARG1),
+        (D3DTSS_ALPHAARG1, D3DTA_TEXTURE),
+        (D3DTSS_TEXCOORDINDEX, tci),
+        (D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_COUNT3),
+    ] {
+        assert_eq!(
+            h.set_texture_stage_state(0, state, value),
+            0,
+            "SetTextureStageState"
+        );
+    }
+    for (state, value) in [
+        (D3DSAMP_MINFILTER, D3DTEXF_POINT),
+        (D3DSAMP_MAGFILTER, D3DTEXF_POINT),
+        (D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP),
+        (D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP),
+    ] {
+        assert_eq!(h.set_sampler_state(0, state, value), 0, "SetSamplerState");
+    }
+    cube
+}
+
+/// Unit normals of the four cube texgen quads: right-top, right-bottom, left-top, left-bottom.
+///
+/// With the eye-to-vertex direction E = (0, 0, 1) the D3D9 reflection vector
+/// is R = E - 2 (N.E) N = (-2 nz nx, -2 nz ny, 1 - 2 nz nz), and the cube face
+/// is the axis of the largest component with its sign:
+///
+/// - (0.96, 0, -0.28): R = (0.5376, 0, 0.8432), face +Z; N names +X.
+/// - (-0.6, 0, -0.8): R = (-0.96, 0, -0.28), face -X; N names -Z.
+/// - (0, 0.6, -0.8): R = (0, 0.96, -0.28), face +Y; N names -Z.
+/// - (0, -0.96, -0.28): R = (0, -0.5376, 0.8432), face +Z; N names -Y.
+///
+/// The negated vector names the opposite face each time, and no quad has R
+/// and N on one face. E is off the axis by at most 0.01, which moves a
+/// component of R by less than 0.01 against a lead of 0.3 or more, and every
+/// pixel interpolates between vertices whose vectors all name one face.
+const CUBE_TEXGEN_NORMALS: [(f32, f32, f32); 4] = [
+    (0.96, 0.0, -0.28),
+    (-0.6, 0.0, -0.8),
+    (0.0, 0.6, -0.8),
+    (0.0, -0.96, -0.28),
+];
+
+/// Draw one quad per viewport quadrant with its normal, then probe each quadrant's centre.
+///
+/// `faces` is the `D3DCUBEMAP_FACES` index each quadrant must show, in the
+/// order of [`CUBE_TEXGEN_NORMALS`].
+fn assert_cube_texgen_faces(h: &Harness, faces: [usize; 4], context: &str) {
+    let mut vertices = Vec::with_capacity(24);
+    for ((sx, sy), (nx, ny, nz)) in [(1.0f32, 1.0f32), (1.0, -1.0), (-1.0, 1.0), (-1.0, -1.0)]
+        .into_iter()
+        .zip(CUBE_TEXGEN_NORMALS)
+    {
+        for (cx, cy) in TEXGEN_CORNERS {
+            vertices.push(LitVertex {
+                x: f32::midpoint(sx, cx),
+                y: f32::midpoint(sy, cy),
+                z: 0.0,
+                nx,
+                ny,
+                nz,
+            });
+        }
+    }
+    h.render_once(CUBE_TEXGEN_CLEAR, |d| {
+        assert_eq!(
+            d.draw_primitive_up(D3DPT_TRIANGLELIST, 8, &vertices),
+            0,
+            "draw"
+        );
+    });
+    for ((x, y), face) in [(480, 120), (480, 360), (160, 120), (160, 360)]
+        .into_iter()
+        .zip(faces)
+    {
+        assert_pixel_approx(
+            h.read_pixel(x, y),
+            CUBE_FACE_COLORS[face],
+            2,
+            &format!("{context}: cube face {face} at ({x}, {y})"),
+        );
+    }
+}
+
+#[test]
+fn texgen_cube_reflection_vector_selects_the_mirror_face() {
+    // The reflection vector leaves the surface on the side the eye is on, so
+    // the four quads show +Z, -X, +Y and +Z. The negated vector would show
+    // -Z, +X, -Y and -Z.
+    let h = Harness::new();
+    let _cube = arm_cube_texgen(&h, TCI_CAMERASPACEREFLECTIONVECTOR);
+    assert_cube_texgen_faces(&h, [4, 1, 2, 4], "reflection vector");
+}
+
+#[test]
+fn texgen_cube_camera_space_normal_selects_the_face_the_normal_names() {
+    // The same cube and quads addressed by the normal itself show +X, -Z, -Z
+    // and -Y, which pins the face layout apart from the reflection.
+    let h = Harness::new();
+    let _cube = arm_cube_texgen(&h, TCI_CAMERASPACENORMAL);
+    assert_cube_texgen_faces(&h, [0, 5, 5, 3], "camera-space normal");
 }
