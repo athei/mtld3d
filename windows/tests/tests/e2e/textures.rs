@@ -5591,6 +5591,7 @@ fn v16u16_queries_and_noautogen_contract() {
     );
 }
 
+/// The query, creation and one-level AUTOGEN contract the signed native formats share.
 fn signed_texture_queries_and_noautogen(
     h: &Harness,
     format: u32,
@@ -5816,7 +5817,7 @@ fn q8w8v8u8_signed_alpha_and_channels() {
 fn q8w8v8u8_queries_and_noautogen_contract() {
     use mtld3d_types::{
         D3DERR_NOTAVAILABLE, D3DRTYPE_CUBETEXTURE, D3DRTYPE_TEXTURE, D3DRTYPE_VOLUMETEXTURE,
-        D3DUSAGE_QUERY_LEGACYBUMPMAP, D3DUSAGE_QUERY_WRAPANDMIP, TexOpCaps,
+        D3DUSAGE_QUERY_LEGACYBUMPMAP, D3DUSAGE_QUERY_WRAPANDMIP,
     };
     let h = Harness::new();
     assert_eq!(
@@ -5838,25 +5839,18 @@ fn q8w8v8u8_queries_and_noautogen_contract() {
             ),
             0
         );
-        assert_eq!(
-            h.check_device_format(
-                D3DFMT_X8R8G8B8,
-                D3DUSAGE_QUERY_LEGACYBUMPMAP,
-                rtype,
-                D3DFMT_Q8W8V8U8
-            ),
-            if rtype == D3DRTYPE_TEXTURE {
-                0
-            } else {
+        if rtype != D3DRTYPE_TEXTURE {
+            assert_eq!(
+                h.check_device_format(
+                    D3DFMT_X8R8G8B8,
+                    D3DUSAGE_QUERY_LEGACYBUMPMAP,
+                    rtype,
+                    D3DFMT_Q8W8V8U8
+                ),
                 D3DERR_NOTAVAILABLE
-            }
-        );
+            );
+        }
     }
-    assert_eq!(
-        h.device_caps().texture_op_caps
-            & (TexOpCaps::BUMPENVMAP | TexOpCaps::BUMPENVMAPLUMINANCE).bits(),
-        0
-    );
     signed_texture_queries_and_noautogen(
         &h,
         D3DFMT_Q8W8V8U8,

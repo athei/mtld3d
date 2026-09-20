@@ -151,6 +151,7 @@ fn block_layout_table() {
         (PixelFormat::B5G6R5Unorm, 2),
         (PixelFormat::Bgra8Unorm, 4),
         (PixelFormat::Rg16Snorm, 4),
+        (PixelFormat::Rgba8Snorm, 4),
         (PixelFormat::Bgra8UnormSrgb, 4),
         (PixelFormat::Rgba8Unorm, 4),
         (PixelFormat::Rgba8UnormSrgb, 4),

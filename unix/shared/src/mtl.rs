@@ -196,11 +196,11 @@ impl PixelFormat {
             | Self::Bgr5A1Unorm => BlockLayout::pixel(2),
             Self::R32Float
             | Self::Rg16Unorm
-            | Self::Rgba8Snorm
             | Self::Rg16Snorm
             | Self::Rg16Float
             | Self::Rgba8Unorm
             | Self::Rgba8UnormSrgb
+            | Self::Rgba8Snorm
             | Self::Bgra8Unorm
             | Self::Bgra8UnormSrgb
             | Self::Depth32Float => BlockLayout::pixel(4),
