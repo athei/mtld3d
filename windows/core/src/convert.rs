@@ -21,11 +21,11 @@ use mtld3d_types::{
     D3DDECLTYPE_UDEC3, D3DDECLTYPE_USHORT2N, D3DDECLTYPE_USHORT4N, D3DDECLUSAGE_BLENDINDICES,
     D3DDECLUSAGE_BLENDWEIGHT, D3DDECLUSAGE_COLOR, D3DDECLUSAGE_NORMAL, D3DDECLUSAGE_POSITION,
     D3DDECLUSAGE_POSITIONT, D3DDECLUSAGE_PSIZE, D3DDECLUSAGE_TEXCOORD, D3DFILL_POINT,
-    D3DFILL_SOLID, D3DFILL_WIREFRAME, D3DFMT_A1R5G5B5, D3DFMT_A2R10G10B10, D3DFMT_A4R4G4B4,
-    D3DFMT_A8, D3DFMT_A8B8G8R8, D3DFMT_A8R8G8B8, D3DFMT_A16B16G16R16, D3DFMT_A16B16G16R16F,
-    D3DFMT_A32B32G32R32F, D3DFMT_G16R16, D3DFMT_G16R16F, D3DFMT_G32R32F, D3DFMT_L8,
-    D3DFMT_Q8W8V8U8, D3DFMT_Q16W16V16U16, D3DFMT_R5G6B5, D3DFMT_R16F, D3DFMT_R32F, D3DFMT_V8U8,
-    D3DFMT_V16U16, D3DFMT_X1R5G5B5, D3DFMT_X8B8G8R8, D3DFMT_X8R8G8B8, D3DFVF_DIFFUSE,
+    D3DFILL_SOLID, D3DFILL_WIREFRAME, D3DFMT_A1R5G5B5, D3DFMT_A2B10G10R10, D3DFMT_A2R10G10B10,
+    D3DFMT_A4R4G4B4, D3DFMT_A8, D3DFMT_A8B8G8R8, D3DFMT_A8R8G8B8, D3DFMT_A16B16G16R16,
+    D3DFMT_A16B16G16R16F, D3DFMT_A32B32G32R32F, D3DFMT_G16R16, D3DFMT_G16R16F, D3DFMT_G32R32F,
+    D3DFMT_L8, D3DFMT_Q8W8V8U8, D3DFMT_Q16W16V16U16, D3DFMT_R5G6B5, D3DFMT_R16F, D3DFMT_R32F,
+    D3DFMT_V8U8, D3DFMT_V16U16, D3DFMT_X1R5G5B5, D3DFMT_X8B8G8R8, D3DFMT_X8R8G8B8, D3DFVF_DIFFUSE,
     D3DFVF_LASTBETA_D3DCOLOR, D3DFVF_LASTBETA_UBYTE4, D3DFVF_NORMAL, D3DFVF_POSITION_MASK,
     D3DFVF_PSIZE, D3DFVF_SPECULAR, D3DFVF_TEXCOUNT_MASK, D3DFVF_TEXCOUNT_SHIFT,
     D3DFVF_TEXTUREFORMAT1, D3DFVF_TEXTUREFORMAT3, D3DFVF_TEXTUREFORMAT4, D3DFVF_XYZ, D3DFVF_XYZB1,
@@ -135,12 +135,10 @@ pub fn d3dcolor_fill_pixel_bytes(color: u32, d3d_format: u32) -> Option<Vec<u8>>
         // `D3DPOOL_DEFAULT` offscreen plain in one of them has to fill.
         D3DFMT_A8B8G8R8 | D3DFMT_X8B8G8R8 => Some(vec![r, g, b, a]),
         // Ten bits per colour channel and two of alpha, each the nearest code.
-        D3DFMT_A2R10G10B10 => {
-            let [red, green, blue] = [r, g, b].map(|channel| unorm8_to_nearest_code(channel, 1023));
-            let alpha = unorm8_to_nearest_code(a, 3);
-            let packed = (alpha << 30) | (red << 20) | (green << 10) | blue;
-            Some(packed.to_le_bytes().to_vec())
-        }
+        // The name lists the lanes from the top of the word down, so blue is
+        // the low lane of A2R10G10B10 and red the low lane of A2B10G10R10.
+        D3DFMT_A2R10G10B10 => Some(pack_a2_rgb10(a, [r, g, b])),
+        D3DFMT_A2B10G10R10 => Some(pack_a2_rgb10(a, [b, g, r])),
         // 16-bit packed R5G6B5: top 5 bits of red, top 6 of green, top 5 of
         // blue. Little-endian 2-byte value (e.g. 0xdeadbeef → 0xadfd).
         D3DFMT_R5G6B5 => {
@@ -246,6 +244,13 @@ fn d3dcolor_luminance(r: u8, g: u8, b: u8) -> u8 {
 /// needs no tie rule.
 fn unorm8_to_nearest_code(channel: u8, max: u32) -> u32 {
     (u32::from(channel) * max + 127) / 255
+}
+
+/// A two-bit alpha over three ten-bit lanes, highest lane first, as a little-endian word.
+fn pack_a2_rgb10(alpha: u8, lanes: [u8; 3]) -> Vec<u8> {
+    let [high, middle, low] = lanes.map(|channel| unorm8_to_nearest_code(channel, 1023));
+    let packed = (unorm8_to_nearest_code(alpha, 3) << 30) | (high << 20) | (middle << 10) | low;
+    packed.to_le_bytes().to_vec()
 }
 
 /// An 8-bit unorm channel as the nearest nonnegative 8-bit snorm byte.

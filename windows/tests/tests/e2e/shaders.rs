@@ -2282,15 +2282,19 @@ fn q16w16v16u16_vertex_texture_preserves_signed_values() {
 /// Vertex fetch keeps the low two bits of each ten-bit lane and the four alpha codes.
 #[test]
 fn a2r10g10b10_vertex_texture_keeps_ten_bit_precision_and_alpha() {
+    packed10_vertex_texture(mtld3d_types::D3DFMT_A2R10G10B10);
+}
+
+/// Vertex fetch reads red from the low lane of A2B10G10R10, with the same precision and alpha.
+#[test]
+fn a2b10g10r10_vertex_texture_keeps_ten_bit_precision_and_alpha() {
+    packed10_vertex_texture(mtld3d_types::D3DFMT_A2B10G10R10);
+}
+
+/// Fetch 513, 514 and 515 from `format` in a vertex shader, amplified, then alpha alone.
+fn packed10_vertex_texture(format: u32) {
     let h = Harness::new();
-    let tex = h.create_texture(
-        1,
-        1,
-        1,
-        0,
-        mtld3d_types::D3DFMT_A2R10G10B10,
-        D3DPOOL_MANAGED,
-    );
+    let tex = h.create_texture(1, 1, 1, 0, format, D3DPOOL_MANAGED);
     assert_eq!(h.set_texture(257, &tex), 0);
     let ps = h.create_pixel_shader(&PS_COLOR_PASSTHROUGH);
     assert_eq!(h.set_pixel_shader(&ps), 0);
@@ -2318,7 +2322,7 @@ fn a2r10g10b10_vertex_texture_keeps_ten_bit_precision_and_alpha() {
         );
         for alpha in 0..4 {
             tex.lock_rect(0, 0)
-                .write_u32(&[(alpha << 30) | (513 << 20) | (514 << 10) | 0x0203]);
+                .write_u32(&[super::packed10::packed(format, 513, 514, 515, alpha)]);
             h.render_once(0, |d| {
                 assert_eq!(
                     d.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &centered_triangle()),

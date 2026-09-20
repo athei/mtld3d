@@ -19,7 +19,7 @@ use super::{
 };
 
 /// Every wire pixel format, in declaration order.
-const ALL: [PixelFormat; 33] = [
+const ALL: [PixelFormat; 34] = [
     PixelFormat::A8Unorm,
     PixelFormat::R8Unorm,
     PixelFormat::R16Unorm,
@@ -38,6 +38,7 @@ const ALL: [PixelFormat; 33] = [
     PixelFormat::Rgba8Snorm,
     PixelFormat::Bgra8Unorm,
     PixelFormat::Bgra8UnormSrgb,
+    PixelFormat::Rgb10A2Unorm,
     PixelFormat::Bgr10A2Unorm,
     PixelFormat::Rg32Float,
     PixelFormat::Rgba16Unorm,
@@ -78,7 +79,7 @@ fn wire_pixel_format_inverts_mtl_pixel_format_for_every_format() {
 
 #[test]
 fn wire_pixel_format_declines_a_format_mtld3d_never_creates() {
-    assert_eq!(wire_pixel_format(MTLPixelFormat::RGB10A2Unorm), None);
+    assert_eq!(wire_pixel_format(MTLPixelFormat::RGB10A2Uint), None);
     assert_eq!(wire_pixel_format(MTLPixelFormat::Invalid), None);
 }
 
@@ -90,8 +91,8 @@ fn only_uncompressed_colour_formats_are_resolvable() {
         .collect();
     assert_eq!(
         resolvable.len(),
-        24,
-        "24 uncompressed colour formats: {resolvable:?}"
+        25,
+        "25 uncompressed colour formats: {resolvable:?}"
     );
     assert!(!is_resolvable_color_format(PixelFormat::Bc1Rgba));
     assert!(!is_resolvable_color_format(PixelFormat::Bc4RUnorm));

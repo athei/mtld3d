@@ -9,6 +9,7 @@
 //! installs its own global allocator. `COVERAGE.md` indexes the modules;
 //! this file only declares them.
 
+mod a2b10g10r10;
 mod a2r10g10b10;
 mod buffers;
 mod clip_planes;
@@ -25,6 +26,7 @@ mod msaa;
 mod multi_device;
 mod multithreaded;
 mod non_uma;
+mod packed10;
 mod points;
 mod present_split;
 mod query;
