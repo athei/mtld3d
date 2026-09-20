@@ -1,13 +1,19 @@
 //! Fixed-function transform + texture-stage routing + alpha test.
 
-use mtld3d_tests::{Harness, LitVertex, PosVertex, SpecularVertex, Vertex};
+use mtld3d_tests::{
+    Harness, LitVertex, PosVertex, SpecularVertex, Texture, Vertex, assert_pixel_approx,
+};
 use mtld3d_types::{
-    D3DCMP_GREATER, D3DCOLORVALUE, D3DFVF_DIFFUSE, D3DFVF_NORMAL, D3DFVF_SPECULAR, D3DFVF_XYZ,
-    D3DLIGHT_DIRECTIONAL, D3DLIGHT_POINT, D3DLIGHT_SPOT, D3DLIGHT9, D3DMATERIAL9, D3DMCS_MATERIAL,
-    D3DPT_TRIANGLELIST, D3DRS_ALPHAFUNC, D3DRS_ALPHAREF, D3DRS_ALPHATESTENABLE, D3DRS_AMBIENT,
-    D3DRS_AMBIENTMATERIALSOURCE, D3DRS_EMISSIVEMATERIALSOURCE, D3DRS_LIGHTING, D3DRS_LOCALVIEWER,
-    D3DRS_SPECULARENABLE, D3DTA_ALPHAREPLICATE, D3DTA_DIFFUSE, D3DTA_SPECULAR, D3DTS_PROJECTION,
-    D3DTS_TEXTURE0, D3DTS_VIEW, D3DTS_WORLD, D3DTSS_COLORARG1, D3DVECTOR,
+    D3DCMP_GREATER, D3DCOLORVALUE, D3DFMT_A8R8G8B8, D3DFVF_DIFFUSE, D3DFVF_NORMAL, D3DFVF_SPECULAR,
+    D3DFVF_XYZ, D3DLIGHT_DIRECTIONAL, D3DLIGHT_POINT, D3DLIGHT_SPOT, D3DLIGHT9, D3DMATERIAL9,
+    D3DMCS_MATERIAL, D3DPT_TRIANGLELIST, D3DRS_ALPHAFUNC, D3DRS_ALPHAREF, D3DRS_ALPHATESTENABLE,
+    D3DRS_AMBIENT, D3DRS_AMBIENTMATERIALSOURCE, D3DRS_DIFFUSEMATERIALSOURCE,
+    D3DRS_EMISSIVEMATERIALSOURCE, D3DRS_LIGHTING, D3DRS_LOCALVIEWER, D3DRS_SPECULARENABLE,
+    D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_MAGFILTER, D3DSAMP_MINFILTER, D3DTA_ALPHAREPLICATE,
+    D3DTA_DIFFUSE, D3DTA_SPECULAR, D3DTA_TEXTURE, D3DTADDRESS_WRAP, D3DTEXF_POINT, D3DTOP_MODULATE,
+    D3DTOP_SELECTARG1, D3DTS_PROJECTION, D3DTS_TEXTURE0, D3DTS_VIEW, D3DTS_WORLD, D3DTSS_ALPHAARG1,
+    D3DTSS_ALPHAOP, D3DTSS_COLORARG1, D3DTSS_COLORARG2, D3DTSS_COLOROP, D3DTSS_TEXCOORDINDEX,
+    D3DVECTOR,
 };
 
 #[rustfmt::skip]
@@ -784,4 +790,186 @@ fn sparse_light_indices_round_trip() {
         !h.light_enabled(high),
         "high-index light reads back disabled"
     );
+}
+
+/// `D3DTSS_TCI_CAMERASPACEPOSITION`.
+///
+/// The texgen mode occupies bits 16..23 of `D3DTSS_TEXCOORDINDEX`.
+const TCI_CAMERASPACEPOSITION: u32 = 2 << 16;
+
+/// Grey level of the lit rows' ambient plus emissive sum, as a channel value.
+const TEXGEN_AMBIENT_LEVEL: u32 = 0x80;
+/// The same with the directional light's full N.L diffuse term added.
+const TEXGEN_DIFFUSE_LEVEL: u32 = 0xBF;
+/// Unlit geometry without a vertex colour reads opaque white.
+const TEXGEN_UNLIT_LEVEL: u32 = 0xFF;
+
+/// A full-viewport quad at z = 0.5 as two triangles, positions only.
+const TEXGEN_CORNERS: [(f32, f32); 6] = [
+    (-1.0, -1.0),
+    (-1.0, 1.0),
+    (1.0, -1.0),
+    (1.0, -1.0),
+    (-1.0, 1.0),
+    (1.0, 1.0),
+];
+
+/// Arm stage 0 to modulate a 2x2 texture, addressed by eye-space position, by the diffuse colour.
+///
+/// Every transform is the identity, so the generated coordinate is the vertex
+/// position: `u = x`, `v = y`, both spanning -1..1 over the viewport. WRAP
+/// addressing with POINT filtering turns that into quarter-viewport bands
+/// alternating between the two texel columns and the two texel rows. The
+/// texture is (0,0)=red (1,0)=green (0,1)=blue (1,1)=white.
+///
+/// The lighting inputs are chosen so each term is a distinct grey: global
+/// ambient white over material ambient 0.25, emissive 0.25, and a directional
+/// light along +z whose white diffuse meets material diffuse 0.25. A vertex
+/// without a normal takes ambient plus emissive (0.5) and no N.L term; a
+/// vertex facing the light adds the full diffuse (0.75).
+fn arm_eye_position_texgen(h: &Harness) -> Texture<'_> {
+    for state in [D3DTS_WORLD, D3DTS_VIEW, D3DTS_PROJECTION] {
+        assert_eq!(h.set_transform(state, &IDENTITY), 0, "SetTransform");
+    }
+    for (state, value) in [
+        (D3DRS_AMBIENT, 0xFFFF_FFFF),
+        (D3DRS_DIFFUSEMATERIALSOURCE, D3DMCS_MATERIAL),
+        (D3DRS_AMBIENTMATERIALSOURCE, D3DMCS_MATERIAL),
+        (D3DRS_EMISSIVEMATERIALSOURCE, D3DMCS_MATERIAL),
+    ] {
+        assert_eq!(h.set_render_state(state, value), 0, "SetRenderState");
+    }
+    let grey = D3DCOLORVALUE {
+        r: 0.25,
+        g: 0.25,
+        b: 0.25,
+        a: 1.0,
+    };
+    let material = D3DMATERIAL9 {
+        diffuse: grey,
+        ambient: grey,
+        specular: D3DCOLORVALUE::default(),
+        emissive: grey,
+        power: 0.0,
+    };
+    assert_eq!(h.set_material(&material), 0, "SetMaterial");
+    let light = D3DLIGHT9 {
+        type_: D3DLIGHT_DIRECTIONAL,
+        diffuse: D3DCOLORVALUE {
+            r: 1.0,
+            g: 1.0,
+            b: 1.0,
+            a: 0.0,
+        },
+        direction: D3DVECTOR {
+            x: 0.0,
+            y: 0.0,
+            z: 1.0,
+        },
+        ..D3DLIGHT9::default()
+    };
+    assert_eq!(h.set_light(0, &light), 0, "SetLight");
+    assert_eq!(h.light_enable(0, true), 0, "LightEnable");
+
+    let tex = h.create_texture(2, 2, 1, 0, D3DFMT_A8R8G8B8, 0);
+    tex.lock_rect(0, 0)
+        .write_u32(&[0xFFFF_0000, 0xFF00_FF00, 0xFF00_00FF, 0xFFFF_FFFF]);
+    assert_eq!(h.set_texture(0, &tex), 0, "SetTexture");
+    for (state, value) in [
+        (D3DTSS_COLOROP, D3DTOP_MODULATE),
+        (D3DTSS_COLORARG1, D3DTA_TEXTURE),
+        (D3DTSS_COLORARG2, D3DTA_DIFFUSE),
+        (D3DTSS_ALPHAOP, D3DTOP_SELECTARG1),
+        (D3DTSS_ALPHAARG1, D3DTA_TEXTURE),
+        (D3DTSS_TEXCOORDINDEX, TCI_CAMERASPACEPOSITION),
+    ] {
+        assert_eq!(
+            h.set_texture_stage_state(0, state, value),
+            0,
+            "SetTextureStageState"
+        );
+    }
+    for (state, value) in [
+        (D3DSAMP_MINFILTER, D3DTEXF_POINT),
+        (D3DSAMP_MAGFILTER, D3DTEXF_POINT),
+        (D3DSAMP_ADDRESSU, D3DTADDRESS_WRAP),
+        (D3DSAMP_ADDRESSV, D3DTADDRESS_WRAP),
+    ] {
+        assert_eq!(h.set_sampler_state(0, state, value), 0, "SetSamplerState");
+    }
+    tex
+}
+
+/// Probe the centre of one band per texel, plus one band right of the origin.
+///
+/// `level` is the grey the diffuse colour contributes, so each probe expects
+/// its texel scaled by it. A draw Metal rejected leaves the clear colour, and
+/// a stage that fell back to the absent vertex coordinate reads the (0,0)
+/// texel everywhere.
+fn assert_eye_position_texgen(h: &Harness, level: u32, context: &str) {
+    let grey = |mask: u32| 0xFF00_0000 | ((level * 0x0001_0101) & mask);
+    for (x, y, mask, texel) in [
+        (80, 180, 0x00FF_0000, "red (0,0) at x=-0.75 y=0.25"),
+        (240, 180, 0x0000_FF00, "green (1,0) at x=-0.25 y=0.25"),
+        (80, 60, 0x0000_00FF, "blue (0,1) at x=-0.75 y=0.75"),
+        (240, 60, 0x00FF_FFFF, "white (1,1) at x=-0.25 y=0.75"),
+        (560, 420, 0x0000_FF00, "green (1,0) at x=0.75 y=-0.75"),
+    ] {
+        assert_pixel_approx(
+            h.read_pixel(x, y),
+            grey(mask),
+            2,
+            &format!("{context}: {texel}"),
+        );
+    }
+}
+
+#[test]
+fn texgen_cameraspaceposition_lit_without_normal() {
+    // Lighting declares the eye-space position for its own use whether or not
+    // the vertex has a normal, and the texgen stage reads that same value.
+    // Without a normal the light's N.L term is dropped, so the texel is
+    // modulated by ambient plus emissive alone.
+    let h = Harness::new();
+    assert_eq!(h.set_render_state(D3DRS_LIGHTING, 1), 0, "lighting on");
+    assert_eq!(h.set_fvf(D3DFVF_XYZ), 0, "SetFVF (no normal)");
+    let _tex = arm_eye_position_texgen(&h);
+    let quad = TEXGEN_CORNERS.map(|(x, y)| PosVertex { x, y, z: 0.5 });
+    h.render_once(0xFFFF_00FF, |d| {
+        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad), 0, "draw");
+    });
+    assert_eye_position_texgen(&h, TEXGEN_AMBIENT_LEVEL, "lit, no normal");
+}
+
+#[test]
+fn texgen_cameraspaceposition_lit_with_normal() {
+    let h = Harness::new();
+    assert_eq!(h.set_render_state(D3DRS_LIGHTING, 1), 0, "lighting on");
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_NORMAL), 0, "SetFVF");
+    let _tex = arm_eye_position_texgen(&h);
+    let quad = TEXGEN_CORNERS.map(|(x, y)| LitVertex {
+        x,
+        y,
+        z: 0.5,
+        nx: 0.0,
+        ny: 0.0,
+        nz: -1.0,
+    });
+    h.render_once(0xFFFF_00FF, |d| {
+        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad), 0, "draw");
+    });
+    assert_eye_position_texgen(&h, TEXGEN_DIFFUSE_LEVEL, "lit, normal");
+}
+
+#[test]
+fn texgen_cameraspaceposition_unlit() {
+    let h = Harness::new();
+    assert_eq!(h.set_render_state(D3DRS_LIGHTING, 0), 0, "lighting off");
+    assert_eq!(h.set_fvf(D3DFVF_XYZ), 0, "SetFVF (no normal)");
+    let _tex = arm_eye_position_texgen(&h);
+    let quad = TEXGEN_CORNERS.map(|(x, y)| PosVertex { x, y, z: 0.5 });
+    h.render_once(0xFFFF_00FF, |d| {
+        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad), 0, "draw");
+    });
+    assert_eye_position_texgen(&h, TEXGEN_UNLIT_LEVEL, "unlit, no normal");
 }
