@@ -18,6 +18,11 @@
 //! the macropixel byte order that separates `YUY2` from `UYVY`. The conversion has a
 //! float twin in the blit shader, so a change here that is not mirrored there shows up
 //! as a colour shift no other test would catch.
+//!
+//! The planar cases pin the two 4:2:0 selectors, the plane order that separates `YV12`
+//! from `NV12` with a sample whose U and V differ, the pitch-relative chroma addressing
+//! on a surface whose pitch is wider than its width, and the route a planar endpoint
+//! takes through `StretchRect`.
 
 use super::*;
 
@@ -69,6 +74,7 @@ fn reject_keys_are_distinct() {
         RejectReason::Scaling,
         RejectReason::UnsupportedSource,
         RejectReason::UnsupportedDestination,
+        RejectReason::PlanarDestination,
     ]
     .iter()
     .map(|r| r.key())
@@ -261,5 +267,202 @@ fn packed_yuv_macropixel_byte_order() {
     assert_eq!(
         decode_packed_yuv(mtld3d_types::D3DFMT_X8R8G8B8, mp, false),
         None
+    );
+}
+
+#[test]
+fn blit_decode_selects_the_planar_formats() {
+    use mtld3d_types::{D3DFMT_NV12, D3DFMT_YV12};
+
+    assert!(matches!(blit_decode(D3DFMT_YV12), BlitDecode::Yv12));
+    assert!(matches!(blit_decode(D3DFMT_NV12), BlitDecode::Nv12));
+    // The uniform values are the discriminants the MSL matches on.
+    assert_eq!(BlitDecode::Yv12.uniform().to_bits(), 3.0f32.to_bits());
+    assert_eq!(BlitDecode::Nv12.uniform().to_bits(), 4.0f32.to_bits());
+    assert!(is_planar_yuv(D3DFMT_YV12) && is_planar_yuv(D3DFMT_NV12));
+    assert!(!is_planar_yuv(D3DFMT_YUY2) && !is_planar_yuv(D3DFMT_UYVY));
+    assert!(!is_packed_yuv(D3DFMT_YV12) && !is_packed_yuv(D3DFMT_NV12));
+}
+
+/// A planar surface of `pitch` x `luma_rows` holding one colour.
+///
+/// The planes are written through the layout the lock exposes: `YV12` stores V
+/// ahead of U, `NV12` interleaves U then V.
+fn planar_fill(d3d_format: u32, pitch: usize, luma_rows: usize, yuv: (u8, u8, u8)) -> Vec<u8> {
+    use mtld3d_types::D3DFMT_YV12;
+
+    let chroma_rows = luma_rows.div_ceil(2);
+    let mut bytes = vec![0u8; pitch * (luma_rows + chroma_rows)];
+    bytes[..pitch * luma_rows].fill(yuv.0);
+    let chroma = &mut bytes[pitch * luma_rows..];
+    if d3d_format == D3DFMT_YV12 {
+        let plane = pitch / 2 * chroma_rows;
+        chroma[..plane].fill(yuv.2);
+        chroma[plane..2 * plane].fill(yuv.1);
+    } else {
+        for pair in chroma.chunks_exact_mut(2) {
+            pair[0] = yuv.1;
+            pair[1] = yuv.2;
+        }
+    }
+    bytes
+}
+
+#[test]
+fn planar_decode_reads_v_and_u_from_their_own_planes() {
+    use mtld3d_types::{D3DFMT_NV12, D3DFMT_YV12};
+
+    // (0x51, 0x5a, 0xf0) is pure red; with U and V exchanged it is blue-ish,
+    // so a plane or interleave exchange cannot pass.
+    for format in [D3DFMT_YV12, D3DFMT_NV12] {
+        let red = planar_fill(format, 20, 16, (0x51, 0x5a, 0xf0));
+        for (x, y) in [(0, 0), (19, 0), (0, 15), (19, 15), (7, 9)] {
+            assert_eq!(
+                decode_planar_yuv(format, &red, 20, 16, x, y),
+                Some((0xff, 0x00, 0x00)),
+                "{format:#x} at ({x}, {y})"
+            );
+        }
+        let exchanged = planar_fill(format, 20, 16, (0x51, 0xf0, 0x5a));
+        let (r, _, b) = decode_planar_yuv(format, &exchanged, 20, 16, 3, 3).unwrap();
+        assert!(r < 0x40 && b > 0xc0, "{format:#x}: ({r:#x}, {b:#x})");
+    }
+}
+
+#[test]
+fn planar_decode_matches_the_reference_value_table() {
+    use mtld3d_types::{D3DFMT_NV12, D3DFMT_YV12};
+
+    let rows: [(u8, u8, u8, u32, u32); 17] = [
+        (0x40, 0x40, 0x40, 0x00_8400, 0x00_8400),
+        (0x10, 0x80, 0x80, 0x00_0000, 0x10_1010),
+        (0xeb, 0x80, 0x80, 0xff_ffff, 0xeb_ebeb),
+        (0x51, 0x5a, 0xf0, 0xff_0000, 0xee_0e0e),
+        (0x91, 0x36, 0x22, 0x00_ff01, 0x0d_ee0e),
+        (0x29, 0xf0, 0x6e, 0x00_00ff, 0x10_0fef),
+        (0x7e, 0x80, 0x80, 0x80_8080, 0x7e_7e7e),
+        (0x00, 0x80, 0x80, 0x00_0000, 0x00_0000),
+        (0xff, 0x80, 0x80, 0xff_ffff, 0xff_ffff),
+        (0x00, 0x00, 0x00, 0x00_8800, 0x00_8800),
+        (0xff, 0x00, 0x00, 0x4a_ff14, 0x4c_ff1c),
+        (0x00, 0xff, 0x00, 0x00_24ee, 0x00_30e1),
+        (0x00, 0x00, 0xff, 0xb8_0000, 0xb2_0000),
+        (0xff, 0xff, 0x00, 0x4a_ffff, 0x4c_ffff),
+        (0xff, 0x00, 0xff, 0xff_e114, 0xff_d01c),
+        (0x00, 0xff, 0xff, 0xb8_00ee, 0xb2_00e1),
+        (0xff, 0xff, 0xff, 0xff_7dff, 0xff_78ff),
+    ];
+    let close = |got: u32, expected: u32| {
+        [16, 8, 0].iter().all(|&shift| {
+            let a = i32::try_from((got >> shift) & 0xff).unwrap_or(0);
+            let e = i32::try_from((expected >> shift) & 0xff).unwrap_or(0);
+            (a - e).abs() <= 1
+        })
+    };
+    for format in [D3DFMT_YV12, D3DFMT_NV12] {
+        for (y, u, v, full, reduced) in rows {
+            let bytes = planar_fill(format, 20, 16, (y, u, v));
+            let (r, g, b) = decode_planar_yuv(format, &bytes, 20, 16, 12, 10).unwrap();
+            let got = (u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b);
+            assert!(
+                close(got, full) || close(got, reduced),
+                "{format:#x} ({y:#x}, {u:#x}, {v:#x}) -> {got:#08x}, expected {full:#08x} or \
+                 {reduced:#08x}"
+            );
+        }
+    }
+}
+
+#[test]
+fn planar_chroma_is_addressed_by_the_pitch() {
+    use mtld3d_types::D3DFMT_YV12;
+
+    // A 22-wide surface locks at a pitch of 24. Its second V row starts 12
+    // bytes into the plane; a reader striding half the width would start at
+    // 11 and take the grey byte planted there, which is padding of the first
+    // V row.
+    let (pitch, luma_rows) = (24usize, 16usize);
+    let mut bytes = planar_fill(D3DFMT_YV12, pitch, luma_rows, (0x51, 0x5a, 0xf0));
+    let v_plane = pitch * luma_rows;
+    bytes[v_plane + 11] = 0x80;
+    assert_eq!(
+        decode_planar_yuv(D3DFMT_YV12, &bytes, pitch, luma_rows, 0, 2),
+        Some((0xff, 0x00, 0x00))
+    );
+    // The same grey at the real start of the second V row is what rows 2
+    // and 3 decode with.
+    bytes[v_plane + 12] = 0x80;
+    let (r, _, _) = decode_planar_yuv(D3DFMT_YV12, &bytes, pitch, luma_rows, 1, 3).unwrap();
+    assert!(r < 0xa0, "the second V row was not read at half the pitch");
+}
+
+#[test]
+fn planar_decode_rejects_what_it_cannot_address() {
+    use mtld3d_types::{D3DFMT_NV12, D3DFMT_YV12};
+
+    for format in [D3DFMT_YV12, D3DFMT_NV12] {
+        let bytes = planar_fill(format, 20, 16, (0x51, 0x5a, 0xf0));
+        // One byte short of the last chroma sample.
+        let truncated = &bytes[..bytes.len() - 1];
+        assert_eq!(decode_planar_yuv(format, truncated, 20, 16, 19, 15), None);
+        assert!(decode_planar_yuv(format, truncated, 20, 16, 0, 0).is_some());
+        // Outside the luma plane.
+        assert_eq!(decode_planar_yuv(format, &bytes, 20, 16, 20, 0), None);
+        assert_eq!(decode_planar_yuv(format, &bytes, 20, 16, 0, 16), None);
+        assert_eq!(decode_planar_yuv(format, &bytes, 0, 16, 0, 0), None);
+    }
+    let bytes = planar_fill(D3DFMT_YUY2, 20, 16, (0x51, 0x5a, 0xf0));
+    assert_eq!(decode_planar_yuv(D3DFMT_YUY2, &bytes, 20, 16, 0, 0), None);
+    // An odd YV12 height has no defined U-plane origin.
+    let bytes = planar_fill(D3DFMT_YV12, 20, 15, (0x51, 0x5a, 0xf0));
+    assert_eq!(decode_planar_yuv(D3DFMT_YV12, &bytes, 20, 15, 0, 0), None);
+}
+
+#[test]
+fn a_planar_endpoint_routes_by_destination_class() {
+    use mtld3d_types::{D3DFMT_A8R8G8B8, D3DFMT_NV12, D3DFMT_V8U8, D3DFMT_X8R8G8B8, D3DFMT_YV12};
+
+    for format in [D3DFMT_YV12, D3DFMT_NV12] {
+        // Into a render target the quad decodes, scaled or not.
+        assert_eq!(
+            planar_stretch_route(format, D3DFMT_X8R8G8B8, true, false),
+            PlanarStretch::RenderQuad
+        );
+        assert_eq!(
+            planar_stretch_route(format, D3DFMT_A8R8G8B8, true, true),
+            PlanarStretch::RenderQuad
+        );
+        // Into an offscreen plain only the 1:1 CPU conversion exists.
+        assert_eq!(
+            planar_stretch_route(format, D3DFMT_X8R8G8B8, false, false),
+            PlanarStretch::CpuConvert
+        );
+        assert_eq!(
+            planar_stretch_route(format, D3DFMT_X8R8G8B8, false, true),
+            PlanarStretch::Reject(RejectReason::Scaling)
+        );
+        assert_eq!(
+            planar_stretch_route(format, D3DFMT_V8U8, false, false),
+            PlanarStretch::Reject(RejectReason::FormatMismatch)
+        );
+        // A planar destination is never written, whatever the source is.
+        for dst_is_render_target in [false, true] {
+            assert_eq!(
+                planar_stretch_route(D3DFMT_X8R8G8B8, format, dst_is_render_target, false),
+                PlanarStretch::Reject(RejectReason::PlanarDestination)
+            );
+            assert_eq!(
+                planar_stretch_route(format, format, dst_is_render_target, false),
+                PlanarStretch::Reject(RejectReason::PlanarDestination)
+            );
+        }
+    }
+    assert_eq!(
+        planar_stretch_route(D3DFMT_YUY2, D3DFMT_X8R8G8B8, true, false),
+        PlanarStretch::NotPlanar
+    );
+    assert_eq!(
+        planar_stretch_route(D3DFMT_A8R8G8B8, D3DFMT_X8R8G8B8, false, true),
+        PlanarStretch::NotPlanar
     );
 }

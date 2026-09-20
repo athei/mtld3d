@@ -294,6 +294,10 @@ pub const D3DFMT_DXT4: u32 = 0x3454_5844;
 pub const D3DFMT_DXT5: u32 = 0x3554_5844;
 pub const D3DFMT_YUY2: u32 = 0x3259_5559;
 pub const D3DFMT_UYVY: u32 = 0x5956_5955;
+/// `MAKEFOURCC('Y','V','1','2')`: planar 4:2:0, the V plane ahead of the U plane.
+pub const D3DFMT_YV12: u32 = 0x3231_5659;
+/// `MAKEFOURCC('N','V','1','2')`: planar 4:2:0, one interleaved U, V plane.
+pub const D3DFMT_NV12: u32 = 0x3231_564E;
 /// `MAKEFOURCC('A','T','I','1')` — ATI1N / BC4 single-channel block format.
 pub const D3DFMT_ATI1: u32 = 0x3149_5441;
 
