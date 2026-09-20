@@ -269,7 +269,11 @@ fn planar_yuv_stays_out_of_the_generic_mapping() {
     assert_eq!(storage.metal_pixel_format(), PixelFormat::R8Unorm);
     assert_eq!(storage.bytes_per_pixel(), 1);
     assert_eq!(
-        (storage.block_width(), storage.block_height(), storage.block_bytes()),
+        (
+            storage.block_width(),
+            storage.block_height(),
+            storage.block_bytes()
+        ),
         (1, 1, 1)
     );
     assert!(storage.swizzle().is_none());

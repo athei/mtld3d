@@ -661,7 +661,13 @@ fn a_planar_source_rect_with_an_odd_origin_keeps_its_chroma_blocks() {
             dst_slice_pitch: width * 4 * height,
             depth: 1,
         };
-        assert!(convert_region(&mut dst, D3DFMT_X8R8G8B8, &src, format, &region));
+        assert!(convert_region(
+            &mut dst,
+            D3DFMT_X8R8G8B8,
+            &src,
+            format,
+            &region
+        ));
         for y in 0..height {
             for x in 0..width {
                 let off = (y * width + x) * 4;
@@ -729,15 +735,33 @@ fn a_planar_region_outside_the_luma_plane_is_refused() {
     let mut region = whole(6, 4, pitch, 24);
     region.height = 5;
     region.dst_slice_pitch = 24 * 8;
-    assert!(!convert_region(&mut dst, D3DFMT_X8R8G8B8, &src, D3DFMT_NV12, &region));
+    assert!(!convert_region(
+        &mut dst,
+        D3DFMT_X8R8G8B8,
+        &src,
+        D3DFMT_NV12,
+        &region
+    ));
     // A slice that is not a whole number of rows names no luma row count.
     let mut region = whole(6, 4, pitch, 24);
     region.src_slice_pitch += 1;
-    assert!(!convert_region(&mut dst, D3DFMT_X8R8G8B8, &src, D3DFMT_NV12, &region));
+    assert!(!convert_region(
+        &mut dst,
+        D3DFMT_X8R8G8B8,
+        &src,
+        D3DFMT_NV12,
+        &region
+    ));
     // A planar level is a single slice.
     let mut region = whole(6, 4, pitch, 24);
     region.depth = 2;
-    assert!(!convert_region(&mut dst, D3DFMT_X8R8G8B8, &src, D3DFMT_NV12, &region));
+    assert!(!convert_region(
+        &mut dst,
+        D3DFMT_X8R8G8B8,
+        &src,
+        D3DFMT_NV12,
+        &region
+    ));
     // A source allocation short of its chroma plane.
     let region = whole(6, 4, pitch, 24);
     assert!(!convert_region(

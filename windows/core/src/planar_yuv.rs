@@ -106,7 +106,11 @@ impl PlanarYuvLayout {
 /// surface, and a guess would exchange chroma rows silently. `NV12` has one
 /// chroma plane, so an odd height only rounds its row count up.
 #[must_use]
-pub const fn planar_yuv_layout(d3d_format: u32, width: u32, height: u32) -> Option<PlanarYuvLayout> {
+pub const fn planar_yuv_layout(
+    d3d_format: u32,
+    width: u32,
+    height: u32,
+) -> Option<PlanarYuvLayout> {
     if width == 0 || width > MAX_TEXTURE_DIM {
         return None;
     }

@@ -1285,6 +1285,39 @@ validated UpdateSurface/UpdateTexture format set. The existing device.c
 StretchRect matrix covers A8R8G8B8, X8R8G8B8 and R5G6B5, so these corrections
 are pinned by end-to-end pixel regressions rather than a baseline reduction.
 
+### visual.c/yuv_layout_test, YV12 and NV12
+
+The test creates a 20x16 DEFAULT offscreen plain per format, behind two
+gates: `CheckDeviceFormat(SURFACE, usage 0)` (`visual.c:12991`) and
+`CheckDeviceFormatConversion` into the back-buffer format (`visual.c:12997`).
+Both now answer yes for YV12 and NV12, so the planar halves run instead of
+skipping.
+
+The layout the test writes is relative to the lock pitch, never to the width:
+the chroma starts at `Pitch * height`, YV12 stores a V plane and then a U
+plane whose rows stride `Pitch / 2`, NV12 one interleaved plane whose rows
+stride `Pitch`. mtld3d reports the width rounded up to four bytes as the
+pitch, allocates `Pitch * (height + ceil(height / 2))` bytes, uploads them
+verbatim into one R8 texture as wide as the pitch, and addresses every plane
+from the pitch in the fragment decode and in the CPU converter. wined3d
+stores the same single-channel image but places the YV12 half-planes at half
+the texture width, which agrees only when the pitch equals the width; DXVK
+reports the same pitch and then addresses by the extent. Neither difference
+is visible at the test's 20x16.
+
+The probes expect reduced-range BT.601 within 1 (`visual.c:13074`,
+`visual.c:13077`), the matrix the packed formats already decode with. DXVK
+converts with BT.709 and answers the conversion query no for both formats, so
+it takes the 12997 skip and its colours are never checked here.
+
+Limits: DEFAULT pool only, YV12 heights even (the origin of the U plane of an
+odd-height surface follows `floor(height / 2)` rows in the test's arithmetic
+and `ceil(height / 2)` in a writer that stores the rounded-up row count, and
+the test's even surface pins neither), no texture advertisement (wined3d's
+choice; DXVK advertises one), and unfiltered chroma. The test's `ColorFill`
+calls expect `S_OK` only and read nothing back; mtld3d returns it and leaves
+the surface unfilled, as for YUY2 and UYVY.
+
 ### visual.c/tssargtemp_test
 
 The fixed-function cascade supports the optional TSSARGTEMP capability.

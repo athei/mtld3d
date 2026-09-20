@@ -24,16 +24,17 @@ use mtld3d_types::{
     D3DDISPLAYMODE, D3DERR_DEVICENOTRESET, D3DERR_INVALIDCALL, D3DERR_NOTAVAILABLE, D3DFILL_SOLID,
     D3DFMT_A2R10G10B10, D3DFMT_A8B8G8R8, D3DFMT_A8R8G8B8, D3DFMT_A16B16G16R16,
     D3DFMT_A16B16G16R16F, D3DFMT_A32B32G32R32F, D3DFMT_ATI1, D3DFMT_D24S8, D3DFMT_DF24,
-    D3DFMT_DXT1, D3DFMT_G16R16, D3DFMT_G16R16F, D3DFMT_G32R32F, D3DFMT_L8, D3DFMT_R5G6B5,
-    D3DFMT_R8G8B8, D3DFMT_R16F, D3DFMT_R32F, D3DFMT_UYVY, D3DFMT_X8B8G8R8, D3DFMT_X8R8G8B8,
-    D3DFMT_YUY2, D3DFVF_DIFFUSE, D3DFVF_TEX1, D3DFVF_XYZ, D3DOK_NOAUTOGEN, D3DPOOL_DEFAULT,
-    D3DPOOL_MANAGED, D3DPOOL_SCRATCH, D3DPOOL_SYSTEMMEM, D3DPRESENT_INTERVAL_IMMEDIATE,
-    D3DPRESENT_INTERVAL_ONE, D3DPRESENT_PARAMETERS, D3DPT_TRIANGLELIST, D3DRS_FILLMODE,
-    D3DRS_LIGHTING, D3DRTYPE_CUBETEXTURE, D3DRTYPE_SURFACE, D3DRTYPE_TEXTURE, D3DRTYPE_VOLUME,
-    D3DRTYPE_VOLUMETEXTURE, D3DSWAPEFFECT_DISCARD, D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_DEPTHSTENCIL,
-    D3DUSAGE_DYNAMIC, D3DUSAGE_QUERY_FILTER, D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING,
-    D3DUSAGE_QUERY_SRGBREAD, D3DUSAGE_QUERY_SRGBWRITE, D3DUSAGE_QUERY_VERTEXTEXTURE,
-    D3DUSAGE_QUERY_WRAPANDMIP, D3DUSAGE_RENDERTARGET, D3DVIEWPORT9, DevCaps, TextureCaps,
+    D3DFMT_DXT1, D3DFMT_G16R16, D3DFMT_G16R16F, D3DFMT_G32R32F, D3DFMT_L8, D3DFMT_NV12,
+    D3DFMT_R5G6B5, D3DFMT_R8G8B8, D3DFMT_R16F, D3DFMT_R32F, D3DFMT_UYVY, D3DFMT_X8B8G8R8,
+    D3DFMT_X8R8G8B8, D3DFMT_YUY2, D3DFMT_YV12, D3DFVF_DIFFUSE, D3DFVF_TEX1, D3DFVF_XYZ,
+    D3DOK_NOAUTOGEN, D3DPOOL_DEFAULT, D3DPOOL_MANAGED, D3DPOOL_SCRATCH, D3DPOOL_SYSTEMMEM,
+    D3DPRESENT_INTERVAL_IMMEDIATE, D3DPRESENT_INTERVAL_ONE, D3DPRESENT_PARAMETERS,
+    D3DPT_TRIANGLELIST, D3DRS_FILLMODE, D3DRS_LIGHTING, D3DRTYPE_CUBETEXTURE, D3DRTYPE_SURFACE,
+    D3DRTYPE_TEXTURE, D3DRTYPE_VOLUME, D3DRTYPE_VOLUMETEXTURE, D3DSWAPEFFECT_DISCARD,
+    D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_DYNAMIC, D3DUSAGE_QUERY_FILTER,
+    D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING, D3DUSAGE_QUERY_SRGBREAD, D3DUSAGE_QUERY_SRGBWRITE,
+    D3DUSAGE_QUERY_VERTEXTEXTURE, D3DUSAGE_QUERY_WRAPANDMIP, D3DUSAGE_RENDERTARGET, D3DVIEWPORT9,
+    DevCaps, TextureCaps,
 };
 
 #[test]
@@ -687,6 +688,135 @@ fn windowed_device_type_follows_format_conversion() {
         D3DERR_NOTAVAILABLE,
         "YUY2 converts but is not renderable, so it is no backbuffer",
     );
+}
+
+/// `YV12` and `NV12` answer as plain surfaces and as `StretchRect` sources, and as nothing else.
+///
+/// The surface answer holds without usage only, every texture-typed resource
+/// answers no whatever the usage, and the conversion answer follows the
+/// render-target answer of the destination the device gives, since the decode
+/// runs in the quad that draws into it.
+#[test]
+fn planar_yuv_is_a_plain_surface_and_a_conversion_source_only() {
+    let h = Harness::factory_only();
+    let check = |usage: u32, rtype: u32, format: u32| {
+        h.check_device_format(D3DFMT_X8R8G8B8, usage, rtype, format)
+    };
+    for (format, name) in [(D3DFMT_YV12, "YV12"), (D3DFMT_NV12, "NV12")] {
+        assert_eq!(
+            check(0, D3DRTYPE_SURFACE, format),
+            D3D_OK,
+            "{name} is an offscreen plain surface format"
+        );
+        for usage in [
+            D3DUSAGE_RENDERTARGET,
+            D3DUSAGE_DEPTHSTENCIL,
+            D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING,
+            D3DUSAGE_RENDERTARGET | D3DUSAGE_QUERY_SRGBWRITE,
+            D3DUSAGE_DYNAMIC,
+            D3DUSAGE_AUTOGENMIPMAP,
+            D3DUSAGE_QUERY_FILTER,
+            D3DUSAGE_QUERY_SRGBREAD,
+            D3DUSAGE_QUERY_VERTEXTEXTURE,
+            D3DUSAGE_QUERY_WRAPANDMIP,
+        ] {
+            assert_eq!(
+                check(usage, D3DRTYPE_SURFACE, format),
+                D3DERR_NOTAVAILABLE,
+                "{name} surface with usage {usage:#x}"
+            );
+        }
+        for rtype in [
+            D3DRTYPE_TEXTURE,
+            D3DRTYPE_CUBETEXTURE,
+            D3DRTYPE_VOLUME,
+            D3DRTYPE_VOLUMETEXTURE,
+        ] {
+            for usage in [
+                0,
+                D3DUSAGE_DYNAMIC,
+                D3DUSAGE_RENDERTARGET,
+                D3DUSAGE_DEPTHSTENCIL,
+                D3DUSAGE_AUTOGENMIPMAP,
+                D3DUSAGE_QUERY_FILTER,
+                D3DUSAGE_QUERY_SRGBREAD,
+                D3DUSAGE_QUERY_VERTEXTEXTURE,
+                D3DUSAGE_QUERY_WRAPANDMIP,
+            ] {
+                assert_eq!(
+                    check(usage, rtype, format),
+                    D3DERR_NOTAVAILABLE,
+                    "{name} as resource type {rtype} with usage {usage:#x}"
+                );
+            }
+        }
+
+        // Every destination the device renders into, and no other.
+        let mut converted = 0;
+        for target in [
+            D3DFMT_A8R8G8B8,
+            D3DFMT_X8R8G8B8,
+            D3DFMT_A8B8G8R8,
+            D3DFMT_X8B8G8R8,
+            D3DFMT_R5G6B5,
+            D3DFMT_G16R16,
+            D3DFMT_A16B16G16R16,
+            D3DFMT_R16F,
+            D3DFMT_G16R16F,
+            D3DFMT_A16B16G16R16F,
+            D3DFMT_R32F,
+            D3DFMT_G32R32F,
+            D3DFMT_A32B32G32R32F,
+            D3DFMT_A2R10G10B10,
+            D3DFMT_R8G8B8,
+            D3DFMT_L8,
+            D3DFMT_DXT1,
+            D3DFMT_D24S8,
+            D3DFMT_YUY2,
+            D3DFMT_UYVY,
+        ] {
+            let renders = check(D3DUSAGE_RENDERTARGET, D3DRTYPE_SURFACE, target) == D3D_OK;
+            converted += u32::from(renders);
+            assert_eq!(
+                h.check_device_format_conversion(format, target),
+                if renders { D3D_OK } else { D3DERR_NOTAVAILABLE },
+                "{name} -> {target:#x} follows the render-target answer ({renders})"
+            );
+            assert_eq!(
+                h.check_device_format_conversion(target, format),
+                D3DERR_NOTAVAILABLE,
+                "{target:#x} -> {name}: nothing encodes into a planar surface"
+            );
+        }
+        assert!(converted >= 2, "{name}: the 32-bit colour targets render");
+        assert_eq!(
+            h.check_device_format_conversion(format, D3DFMT_X8R8G8B8),
+            D3D_OK,
+            "{name} -> X8R8G8B8 is decoded by StretchRect"
+        );
+        assert_eq!(
+            h.check_device_format_conversion(format, format),
+            D3D_OK,
+            "{name}: the identity row holds for every format"
+        );
+        for windowed in [true, false] {
+            assert_eq!(
+                h.check_device_type(D3DFMT_X8R8G8B8, format, windowed),
+                D3DERR_NOTAVAILABLE,
+                "{name} converts but is not renderable, so it is no backbuffer"
+            );
+        }
+    }
+    assert_eq!(
+        h.check_device_format_conversion(D3DFMT_YV12, D3DFMT_NV12),
+        D3DERR_NOTAVAILABLE,
+        "one planar format does not convert into the other"
+    );
+    // The packed formats keep the texture answer they had.
+    for format in [D3DFMT_YUY2, D3DFMT_UYVY] {
+        assert_eq!(check(0, D3DRTYPE_TEXTURE, format), D3D_OK);
+        assert_eq!(check(0, D3DRTYPE_SURFACE, format), D3D_OK);
+    }
 }
 
 #[test]
