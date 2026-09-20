@@ -9,15 +9,15 @@ use mtld3d_tests::{
 use mtld3d_types::{
     D3DBLEND_INVSRCALPHA, D3DBLEND_SRCALPHA, D3DBLEND_ZERO, D3DBOX, D3DERR_INVALIDCALL,
     D3DFMT_A1R5G5B5, D3DFMT_A4R4G4B4, D3DFMT_A8, D3DFMT_A8B8G8R8, D3DFMT_A8R8G8B8, D3DFMT_ATI1,
-    D3DFMT_DXT1, D3DFMT_DXT5, D3DFMT_INTZ, D3DFMT_L8, D3DFMT_R5G6B5, D3DFMT_R8G8B8, D3DFMT_UYVY,
-    D3DFMT_V8U8, D3DFMT_V16U16, D3DFMT_X1R5G5B5, D3DFMT_X8B8G8R8, D3DFMT_X8R8G8B8, D3DFMT_YUY2,
-    D3DFVF_DIFFUSE, D3DFVF_TEX1, D3DFVF_TEXTUREFORMAT3, D3DFVF_XYZ, D3DLOCK_DISCARD,
-    D3DLOCK_NO_DIRTY_UPDATE, D3DLOCK_READONLY, D3DPOOL_DEFAULT, D3DPOOL_MANAGED, D3DPOOL_SCRATCH,
-    D3DPOOL_SYSTEMMEM, D3DPT_TRIANGLELIST, D3DRECT, D3DRS_ALPHABLENDENABLE, D3DRS_DESTBLEND,
-    D3DRS_SRCBLEND, D3DRTYPE_SURFACE, D3DRTYPE_VOLUME, D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV,
-    D3DSAMP_MAGFILTER, D3DSAMP_MAXMIPLEVEL, D3DSAMP_MINFILTER, D3DSAMP_MIPFILTER, D3DTA_TEXTURE,
-    D3DTADDRESS_CLAMP, D3DTEXF_ANISOTROPIC, D3DTEXF_LINEAR, D3DTEXF_NONE, D3DTEXF_POINT,
-    D3DTOP_SELECTARG1, D3DTSS_ALPHAARG1, D3DTSS_ALPHAOP, D3DUSAGE_AUTOGENMIPMAP,
+    D3DFMT_DXT1, D3DFMT_DXT5, D3DFMT_INTZ, D3DFMT_L8, D3DFMT_Q8W8V8U8, D3DFMT_R5G6B5,
+    D3DFMT_R8G8B8, D3DFMT_UYVY, D3DFMT_V8U8, D3DFMT_V16U16, D3DFMT_X1R5G5B5, D3DFMT_X8B8G8R8,
+    D3DFMT_X8R8G8B8, D3DFMT_YUY2, D3DFVF_DIFFUSE, D3DFVF_TEX1, D3DFVF_TEXTUREFORMAT3, D3DFVF_XYZ,
+    D3DLOCK_DISCARD, D3DLOCK_NO_DIRTY_UPDATE, D3DLOCK_READONLY, D3DPOOL_DEFAULT, D3DPOOL_MANAGED,
+    D3DPOOL_SCRATCH, D3DPOOL_SYSTEMMEM, D3DPT_TRIANGLELIST, D3DRECT, D3DRS_ALPHABLENDENABLE,
+    D3DRS_DESTBLEND, D3DRS_SRCBLEND, D3DRTYPE_SURFACE, D3DRTYPE_VOLUME, D3DSAMP_ADDRESSU,
+    D3DSAMP_ADDRESSV, D3DSAMP_MAGFILTER, D3DSAMP_MAXMIPLEVEL, D3DSAMP_MINFILTER, D3DSAMP_MIPFILTER,
+    D3DTA_TEXTURE, D3DTADDRESS_CLAMP, D3DTEXF_ANISOTROPIC, D3DTEXF_LINEAR, D3DTEXF_NONE,
+    D3DTEXF_POINT, D3DTOP_SELECTARG1, D3DTSS_ALPHAARG1, D3DTSS_ALPHAOP, D3DUSAGE_AUTOGENMIPMAP,
     D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_DYNAMIC, D3DUSAGE_RENDERTARGET,
 };
 
@@ -5278,6 +5278,26 @@ fn assert_v16u16_pixel(h: &Harness, actual: u32, expected: u32, tol: u8, context
     assert_pixel_approx(actual & mask, expected & mask, tol, context);
 }
 
+/// Asserts an exact sampled pixel for a signed format in the shared contract test.
+///
+/// V16U16 takes its blue lane from the view swizzle and goes through
+/// [`assert_v16u16_pixel`]. Q8W8V8U8 stores all four lanes, so every lane is
+/// compared on every device.
+#[track_caller]
+fn assert_signed_texture_pixel(
+    h: &Harness,
+    format: u32,
+    actual: u32,
+    expected: u32,
+    context: &str,
+) {
+    if format == D3DFMT_V16U16 {
+        assert_v16u16_pixel(h, actual, expected, 0, context);
+    } else {
+        assert_pixel_eq(actual, expected, context);
+    }
+}
+
 /// V16U16 preserves signed endpoints and fills missing blue with one.
 #[test]
 fn v16u16_signed_extrema_and_missing_channels() {
@@ -5560,16 +5580,36 @@ fn v16u16_cube_and_volume_updates() {
 /// Query capabilities match creation, including a one-level AUTOGEN fallback.
 #[test]
 fn v16u16_queries_and_noautogen_contract() {
+    let h = Harness::new();
+    signed_texture_queries_and_noautogen(
+        &h,
+        D3DFMT_V16U16,
+        0x0000_7fff,
+        0x7fff_0000,
+        0xffff_00ff,
+        0xff00_ffff,
+    );
+}
+
+/// The query, creation and one-level AUTOGEN contract the signed native formats share.
+fn signed_texture_queries_and_noautogen(
+    h: &Harness,
+    format: u32,
+    first: u32,
+    second: u32,
+    first_pixel: u32,
+    second_pixel: u32,
+) {
     use mtld3d_types::{
         D3DERR_NOTAVAILABLE, D3DOK_NOAUTOGEN, D3DRTYPE_CUBETEXTURE, D3DRTYPE_TEXTURE,
         D3DRTYPE_VOLUMETEXTURE, D3DUSAGE_QUERY_FILTER, D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING,
         D3DUSAGE_QUERY_SRGBREAD, D3DUSAGE_QUERY_VERTEXTEXTURE,
     };
-    let h = Harness::new();
     for rtype in [
         D3DRTYPE_TEXTURE,
         D3DRTYPE_CUBETEXTURE,
         D3DRTYPE_VOLUMETEXTURE,
+        D3DRTYPE_VOLUME,
     ] {
         for usage in [
             0,
@@ -5578,7 +5618,7 @@ fn v16u16_queries_and_noautogen_contract() {
             D3DUSAGE_QUERY_VERTEXTEXTURE,
         ] {
             assert_eq!(
-                h.check_device_format(D3DFMT_X8R8G8B8, usage, rtype, D3DFMT_V16U16),
+                h.check_device_format(D3DFMT_X8R8G8B8, usage, rtype, format),
                 0,
                 "rtype={rtype} usage={usage:#x}"
             );
@@ -5590,22 +5630,17 @@ fn v16u16_queries_and_noautogen_contract() {
             D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING,
         ] {
             assert_eq!(
-                h.check_device_format(D3DFMT_X8R8G8B8, usage, rtype, D3DFMT_V16U16),
+                h.check_device_format(D3DFMT_X8R8G8B8, usage, rtype, format),
                 D3DERR_NOTAVAILABLE
             );
         }
-        let expected = if rtype == D3DRTYPE_VOLUMETEXTURE {
+        let expected = if matches!(rtype, D3DRTYPE_VOLUMETEXTURE | D3DRTYPE_VOLUME) {
             D3DERR_NOTAVAILABLE
         } else {
             D3DOK_NOAUTOGEN
         };
         assert_eq!(
-            h.check_device_format(
-                D3DFMT_X8R8G8B8,
-                D3DUSAGE_AUTOGENMIPMAP,
-                rtype,
-                D3DFMT_V16U16
-            ),
+            h.check_device_format(D3DFMT_X8R8G8B8, D3DUSAGE_AUTOGENMIPMAP, rtype, format),
             expected
         );
     }
@@ -5613,6 +5648,7 @@ fn v16u16_queries_and_noautogen_contract() {
         D3DRTYPE_TEXTURE,
         D3DRTYPE_CUBETEXTURE,
         D3DRTYPE_VOLUMETEXTURE,
+        D3DRTYPE_VOLUME,
     ] {
         for extra in [
             0,
@@ -5626,7 +5662,7 @@ fn v16u16_queries_and_noautogen_contract() {
                     D3DFMT_X8R8G8B8,
                     mtld3d_types::D3DUSAGE_QUERY_SRGBWRITE | extra,
                     rtype,
-                    D3DFMT_V16U16
+                    format
                 ),
                 D3DERR_NOTAVAILABLE
             );
@@ -5634,7 +5670,7 @@ fn v16u16_queries_and_noautogen_contract() {
     }
     for pool in [D3DPOOL_DEFAULT, D3DPOOL_MANAGED] {
         for levels in [0, 1] {
-            let tex = h.create_texture(4, 4, levels, D3DUSAGE_AUTOGENMIPMAP, D3DFMT_V16U16, pool);
+            let tex = h.create_texture(4, 4, levels, D3DUSAGE_AUTOGENMIPMAP, format, pool);
             assert_eq!(tex.level_count(), 1);
             let (hr, desc) = tex.level_desc(0);
             assert_eq!(hr, 0);
@@ -5648,26 +5684,25 @@ fn v16u16_queries_and_noautogen_contract() {
                 D3DERR_INVALIDCALL
             );
             assert_eq!(tex.auto_gen_filter_type(), D3DTEXF_POINT);
-            tex.lock_rect(0, 0).write_u32(&[0x0000_7fff; 16]);
+            tex.lock_rect(0, 0).write_u32(&[first; 16]);
             tex.generate_mip_sub_levels();
-            assert_v16u16_pixel(
-                &h,
-                sample_center(&h, &tex).to_pixel(),
-                0xffff_00ff,
-                0,
+            assert_signed_texture_pixel(
+                h,
+                format,
+                sample_center(h, &tex).to_pixel(),
+                first_pixel,
                 "NOAUTOGEN top-level upload",
             );
-            tex.lock_rect(0, 0).write_u32(&[0x7fff_0000; 16]);
+            tex.lock_rect(0, 0).write_u32(&[second; 16]);
             tex.generate_mip_sub_levels();
-            assert_v16u16_pixel(
-                &h,
-                sample_center(&h, &tex).to_pixel(),
-                0xff00_ffff,
-                0,
+            assert_signed_texture_pixel(
+                h,
+                format,
+                sample_center(h, &tex).to_pixel(),
+                second_pixel,
                 "NOAUTOGEN second publication",
             );
-            let cube =
-                h.create_cube_texture_owned(4, levels, D3DUSAGE_AUTOGENMIPMAP, D3DFMT_V16U16, pool);
+            let cube = h.create_cube_texture_owned(4, levels, D3DUSAGE_AUTOGENMIPMAP, format, pool);
             assert_eq!(cube.level_count(), 1);
             let (hr, desc) = cube.surface(0, 0).desc();
             assert_eq!(hr, 0);
@@ -5684,20 +5719,20 @@ fn v16u16_queries_and_noautogen_contract() {
             );
             assert_eq!(cube.auto_gen_filter_type(), D3DTEXF_POINT);
             if pool == D3DPOOL_DEFAULT {
-                let source = h.create_cube_texture_owned(4, 1, 0, D3DFMT_V16U16, D3DPOOL_SYSTEMMEM);
+                let source = h.create_cube_texture_owned(4, 1, 0, format, D3DPOOL_SYSTEMMEM);
                 for face in 0..6 {
-                    source.lock_rect(face, 0, 0).write_u32(&[0x0000_7fff; 16]);
+                    source.lock_rect(face, 0, 0).write_u32(&[first; 16]);
                 }
                 assert_eq!(h.update_cube_texture_hr(&source, &cube), 0);
             } else {
-                cube.lock_rect(0, 0, 0).write_u32(&[0x0000_7fff; 16]);
+                cube.lock_rect(0, 0, 0).write_u32(&[first; 16]);
             }
             cube.generate_mip_sub_levels();
-            assert_v16u16_pixel(
-                &h,
-                sample_cube_x(&h, &cube, 1.0),
-                0xffff_00ff,
-                0,
+            assert_signed_texture_pixel(
+                h,
+                format,
+                sample_cube_x(h, &cube, 1.0),
+                first_pixel,
                 "NOAUTOGEN cube publication",
             );
         }
@@ -5710,14 +5745,19 @@ fn v16u16_queries_and_noautogen_contract() {
         (D3DPOOL_DEFAULT, 1, D3DUSAGE_RENDERTARGET),
         (D3DPOOL_DEFAULT, 1, D3DUSAGE_DEPTHSTENCIL),
         (D3DPOOL_MANAGED, 1, D3DUSAGE_DYNAMIC),
+        (
+            D3DPOOL_MANAGED,
+            1,
+            D3DUSAGE_DYNAMIC | D3DUSAGE_AUTOGENMIPMAP,
+        ),
     ] {
-        let (hr, out) = h.try_create_texture(4, 4, levels, usage, D3DFMT_V16U16, pool);
+        let (hr, out) = h.try_create_texture(4, 4, levels, usage, format, pool);
         assert_eq!(
             hr, D3DERR_INVALIDCALL,
             "texture pool={pool} levels={levels} usage={usage:#x}"
         );
         assert!(out.is_null());
-        let (hr, out) = h.try_create_cube_texture(4, levels, usage, D3DFMT_V16U16, pool);
+        let (hr, out) = h.try_create_cube_texture(4, levels, usage, format, pool);
         assert_eq!(
             hr, D3DERR_INVALIDCALL,
             "cube pool={pool} levels={levels} usage={usage:#x}"
@@ -5731,8 +5771,537 @@ fn v16u16_queries_and_noautogen_contract() {
         D3DPOOL_SCRATCH,
     ] {
         assert_eq!(
-            h.create_volume_texture([2, 2, 2], 1, D3DUSAGE_AUTOGENMIPMAP, D3DFMT_V16U16, pool),
+            h.create_volume_texture([2, 2, 2], 1, D3DUSAGE_AUTOGENMIPMAP, format, pool),
             D3DERR_INVALIDCALL
+        );
+    }
+}
+
+/// Signed Q remains negative through SM1 sampling and is observable in RGB.
+#[test]
+fn q8w8v8u8_signed_alpha_and_channels() {
+    // ps_1_1: tex t0; mad r0, t0.aaaa, c0, c0, with c0=.5.
+    const PS: &[u32] = &[
+        0xffff_0101,
+        0x0000_0051,
+        0xa00f_0000,
+        0x3f00_0000,
+        0x3f00_0000,
+        0x3f00_0000,
+        0x3f00_0000,
+        0x0000_0042,
+        0xb00f_0000,
+        0x0000_0004,
+        0x800f_0000,
+        0xb0ff_0000,
+        0xa0e4_0000,
+        0xa0e4_0000,
+        0x0000_ffff,
+    ];
+    let h = Harness::new();
+    let shader = h.create_pixel_shader(PS);
+    assert_eq!(h.set_pixel_shader(&shader), 0);
+    for (bits, expected) in [
+        (0x8000_7f81, 0x0000_0000),
+        (0x817f_0080, 0x0000_0000),
+        (0x0080_817f, 0x8080_8080),
+        (0x7f81_8000, 0xffff_ffff),
+    ] {
+        let tex = h.create_texture(1, 1, 1, 0, D3DFMT_Q8W8V8U8, D3DPOOL_MANAGED);
+        tex.lock_rect(0, 0).write_u32(&[bits]);
+        assert_pixel_approx(sample_center(&h, &tex).to_pixel(), expected, 1, "signed Q");
+    }
+}
+
+#[test]
+fn q8w8v8u8_queries_and_noautogen_contract() {
+    use mtld3d_types::{
+        D3DERR_NOTAVAILABLE, D3DRTYPE_CUBETEXTURE, D3DRTYPE_TEXTURE, D3DRTYPE_VOLUMETEXTURE,
+        D3DUSAGE_QUERY_LEGACYBUMPMAP, D3DUSAGE_QUERY_WRAPANDMIP,
+    };
+    let h = Harness::new();
+    assert_eq!(
+        h.check_device_format(D3DFMT_X8R8G8B8, 0, D3DRTYPE_SURFACE, D3DFMT_Q8W8V8U8),
+        0
+    );
+    for rtype in [
+        D3DRTYPE_TEXTURE,
+        D3DRTYPE_CUBETEXTURE,
+        D3DRTYPE_VOLUMETEXTURE,
+        D3DRTYPE_VOLUME,
+    ] {
+        assert_eq!(
+            h.check_device_format(
+                D3DFMT_X8R8G8B8,
+                D3DUSAGE_QUERY_WRAPANDMIP,
+                rtype,
+                D3DFMT_Q8W8V8U8
+            ),
+            0
+        );
+        if rtype != D3DRTYPE_TEXTURE {
+            assert_eq!(
+                h.check_device_format(
+                    D3DFMT_X8R8G8B8,
+                    D3DUSAGE_QUERY_LEGACYBUMPMAP,
+                    rtype,
+                    D3DFMT_Q8W8V8U8
+                ),
+                D3DERR_NOTAVAILABLE
+            );
+        }
+    }
+    signed_texture_queries_and_noautogen(
+        &h,
+        D3DFMT_Q8W8V8U8,
+        0x7f00_007f,
+        0x7f00_7f00,
+        0xffff_0000,
+        0xff00_ff00,
+    );
+}
+
+/// Read all signed channels without clamping before the range conversion.
+fn signed_rgba_shader() -> Vec<u32> {
+    vec![
+        0xffff_0101,
+        0x0000_0051,
+        0xa00f_0000,
+        0x3f00_0000,
+        0x3f00_0000,
+        0x3f00_0000,
+        0x3f00_0000,
+        0x0000_0042,
+        0xb00f_0000,
+        0x0000_0004,
+        0x800f_0000,
+        0xb0e4_0000,
+        0xa0e4_0000,
+        0xa0e4_0000,
+        0x0000_ffff,
+    ]
+}
+
+#[test]
+fn q8w8v8u8_sm1_negative_alpha_floor() {
+    // RG maps Q; B is one only for Q < -1.
+    let ps = [
+        0xffff_0101,
+        0x0000_0051,
+        0xa00f_0000,
+        0x3f00_0000,
+        0x3f00_0000,
+        0x3f00_0000,
+        0x3f00_0000,
+        0x0000_0051,
+        0xa00f_0001,
+        0x3f80_0000,
+        0x3f80_0000,
+        0x0000_0000,
+        0x3f80_0000,
+        0x0000_0051,
+        0xa00f_0002,
+        0x0000_0000,
+        0x0000_0000,
+        0x3f80_0000,
+        0x0000_0000,
+        0x0000_0042,
+        0xb00f_0000,
+        0x0000_0004,
+        0x8007_0000,
+        0xb0ff_0000,
+        0xa0e4_0000,
+        0xa0e4_0000,
+        0x0000_0003,
+        0x8008_0000,
+        0xb1ff_0000,
+        0xa0e4_0000,
+        0x0000_0050,
+        0x8008_0000,
+        0x80ff_0000,
+        0xa0ff_0001,
+        0xa0ff_0002,
+        0x0000_0005,
+        0x8007_0001,
+        0xa0e4_0001,
+        0x80e4_0000,
+        0x0000_0004,
+        0x8007_0000,
+        0x80ff_0000,
+        0xa0e4_0002,
+        0x80e4_0001,
+        0x0000_ffff,
+    ];
+    let h = Harness::new();
+    let shader = h.create_pixel_shader(&ps);
+    assert_eq!(h.set_pixel_shader(&shader), 0);
+    for (q, expected) in [
+        (0x80, 0x0000_0000),
+        (0x81, 0x0000_0000),
+        (0, 0x0080_8000),
+        (0x7f, 0x00ff_ff00),
+        (0xc0, 0x003f_3f00),
+    ] {
+        let tex = h.create_texture(1, 1, 1, 0, D3DFMT_Q8W8V8U8, D3DPOOL_MANAGED);
+        tex.lock_rect(0, 0).write_u32(&[q << 24 | 0x007f_0080]);
+        let actual = sample_center(&h, &tex).to_pixel();
+        assert_eq!(actual & 255, 0, "Q must not sample below -1");
+        assert_pixel_approx(actual, expected, 1, "signed alpha floor");
+    }
+}
+
+#[test]
+fn q8w8v8u8_fixed_function_signed_color_and_alpha() {
+    use mtld3d_types::{
+        D3DRS_TEXTUREFACTOR, D3DTA_ALPHAREPLICATE, D3DTA_CURRENT, D3DTA_TFACTOR, D3DTOP_ADD,
+        D3DTSS_ALPHAARG2, D3DTSS_COLORARG1, D3DTSS_COLORARG2, D3DTSS_COLOROP,
+    };
+    let h = Harness::new();
+    let tex = h.create_texture(1, 1, 1, 0, D3DFMT_Q8W8V8U8, D3DPOOL_MANAGED);
+    tex.lock_rect(0, 0).write_u32(&[0xf030_10e0]);
+    assert_eq!(h.set_texture(0, &tex), 0);
+    assert_eq!(h.set_render_state(D3DRS_TEXTUREFACTOR, 0x8080_8080), 0);
+    for (state, value) in [
+        (D3DTSS_COLOROP, D3DTOP_ADD),
+        (D3DTSS_COLORARG1, D3DTA_TEXTURE),
+        (D3DTSS_COLORARG2, D3DTA_TFACTOR),
+        (D3DTSS_ALPHAOP, D3DTOP_ADD),
+        (D3DTSS_ALPHAARG1, D3DTA_TEXTURE),
+        (D3DTSS_ALPHAARG2, D3DTA_TFACTOR),
+    ] {
+        assert_eq!(h.set_texture_stage_state(0, state, value), 0);
+    }
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1), 0);
+    point_clamp(&h);
+    let quad = fullscreen_quad();
+    h.render_once(BLACK, |d| {
+        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad), 0);
+    });
+    assert_pixel_approx(h.read_pixel(320, 240), 0x6040_a0e0, 1, "FF signed RGB");
+    assert_eq!(
+        h.set_texture_stage_state(1, D3DTSS_COLOROP, D3DTOP_SELECTARG1),
+        0
+    );
+    assert_eq!(
+        h.set_texture_stage_state(1, D3DTSS_COLORARG1, D3DTA_CURRENT | D3DTA_ALPHAREPLICATE),
+        0
+    );
+    h.render_once(BLACK, |d| {
+        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad), 0);
+    });
+    assert_pixel_approx(h.read_pixel(320, 240), 0x6060_6060, 1, "FF signed Q");
+}
+
+#[test]
+fn q8w8v8u8_native_bytes_mips_updates_and_plain_surfaces() {
+    let h = Harness::new();
+    let shader = h.create_pixel_shader(&signed_rgba_shader());
+    assert_eq!(h.set_pixel_shader(&shader), 0);
+    for pool in [
+        D3DPOOL_DEFAULT,
+        D3DPOOL_MANAGED,
+        D3DPOOL_SYSTEMMEM,
+        D3DPOOL_SCRATCH,
+    ] {
+        let usage = if pool == D3DPOOL_DEFAULT {
+            D3DUSAGE_DYNAMIC
+        } else {
+            0
+        };
+        let tex = h.create_texture(3, 3, 0, usage, D3DFMT_Q8W8V8U8, pool);
+        assert_eq!(tex.level_count(), 2);
+        for level in 0..2 {
+            let desc = tex.level_desc(level).1;
+            let values = vec![0x817f_0080; (desc.width * desc.height) as usize];
+            let mut lock = tex.lock_rect(
+                level,
+                if pool == D3DPOOL_DEFAULT {
+                    D3DLOCK_DISCARD
+                } else {
+                    0
+                },
+            );
+            assert_eq!(lock.pitch(), i32::try_from(desc.width * 4).unwrap());
+            lock.write_u32(&values);
+        }
+        let lock = tex.lock_rect(1, D3DLOCK_READONLY);
+        // SAFETY: this held 1x1 lock contains one initialized four-byte texel.
+        let raw = unsafe { lock.bits_ptr().cast::<u32>().read_unaligned() };
+        assert_eq!(raw, 0x817f_0080);
+        drop(lock);
+        if matches!(pool, D3DPOOL_DEFAULT | D3DPOOL_MANAGED) {
+            assert_pixel_approx(
+                sample_center(&h, &tex).to_pixel(),
+                0x0000_80ff,
+                1,
+                "native signed bytes",
+            );
+        }
+    }
+    let src = h.create_texture(4, 4, 1, 0, D3DFMT_Q8W8V8U8, D3DPOOL_SYSTEMMEM);
+    let dst = h.create_texture(4, 4, 1, 0, D3DFMT_Q8W8V8U8, D3DPOOL_DEFAULT);
+    src.lock_rect(0, 0).write_u32(&[0x817f_0080; 16]);
+    assert_eq!(h.update_texture_hr(&src, &dst), 0);
+    src.lock_rect_partial(0, &[0, 0, 1, 1], 0)
+        .write_u32(&[0x8000_817f]);
+    assert_eq!(
+        h.update_surface_region_hr(
+            &src.surface_level(0),
+            &D3DRECT {
+                x1: 0,
+                y1: 0,
+                x2: 1,
+                y2: 1
+            },
+            &dst.surface_level(0),
+            (2, 2)
+        ),
+        0
+    );
+    assert_pixel_approx(
+        sample_at(&h, &dst, 400, 300).to_pixel(),
+        0x00ff_0080,
+        1,
+        "partial signed update",
+    );
+    assert_pixel_approx(
+        sample_at(&h, &dst, 80, 60).to_pixel(),
+        0x0000_80ff,
+        1,
+        "untouched signed texel",
+    );
+    let unsigned = h.create_texture(4, 4, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM);
+    unsigned.lock_rect(0, 0).write_u32(&[0xffff_ffff; 16]);
+    assert_eq!(h.update_texture_hr(&unsigned, &dst), D3DERR_INVALIDCALL);
+    assert_eq!(
+        h.update_surface_region_hr(
+            &unsigned.surface_level(0),
+            &D3DRECT {
+                x1: 0,
+                y1: 0,
+                x2: 1,
+                y2: 1
+            },
+            &dst.surface_level(0),
+            (2, 2)
+        ),
+        D3DERR_INVALIDCALL
+    );
+    assert_pixel_approx(
+        sample_at(&h, &dst, 400, 300).to_pixel(),
+        0x00ff_0080,
+        1,
+        "rejected mixed conversion preserves destination",
+    );
+    for pool in [D3DPOOL_DEFAULT, D3DPOOL_SYSTEMMEM, D3DPOOL_SCRATCH] {
+        let surf = h.create_offscreen_plain_surface(3, 2, D3DFMT_Q8W8V8U8, pool);
+        assert_eq!(surf.desc().1.format, D3DFMT_Q8W8V8U8);
+        surf.lock_rect(0).write_u32(&[0x8081_007f; 6]);
+        let lock = surf.lock_rect(D3DLOCK_READONLY);
+        assert_eq!(lock.pitch(), 12);
+        // SAFETY: the held surface lock contains six initialized texels.
+        let raw = unsafe { lock.bits_ptr().cast::<u32>().read_unaligned() };
+        assert_eq!(raw, 0x8081_007f);
+        drop(lock);
+        assert_eq!(surf.get_dc(core::ptr::null_mut()).0, D3DERR_INVALIDCALL);
+    }
+    assert_eq!(
+        h.create_offscreen_plain_surface_hr(3, 2, D3DFMT_Q8W8V8U8, D3DPOOL_MANAGED),
+        D3DERR_INVALIDCALL
+    );
+}
+
+fn signed_q8_pixel(raw: u32) -> u32 {
+    let converted = raw.to_le_bytes().map(|byte| {
+        let signed = i32::from(i8::from_ne_bytes([byte])).max(-127);
+        u32::try_from(((signed + 127) * 255 + 127) / 254).unwrap()
+    });
+    converted[3] << 24 | converted[0] << 16 | converted[1] << 8 | converted[2]
+}
+
+#[test]
+fn q8w8v8u8_cube_faces_volume_slices_and_mips() {
+    let h = Harness::new();
+    let shader = h.create_pixel_shader(&signed_rgba_shader());
+    assert_eq!(h.set_pixel_shader(&shader), 0);
+    let values = [
+        0x807f_0080,
+        0x817f_00c0,
+        0xc07f_00e0,
+        0x007f_0000,
+        0x407f_0020,
+        0x7f7f_007f,
+    ];
+    let directions = [
+        [1.0, 0.0, 0.0],
+        [-1.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [0.0, -1.0, 0.0],
+        [0.0, 0.0, 1.0],
+        [0.0, 0.0, -1.0],
+    ];
+    for pool in [D3DPOOL_MANAGED, D3DPOOL_SYSTEMMEM] {
+        let src = h.create_cube_texture_owned(2, 0, 0, D3DFMT_Q8W8V8U8, pool);
+        for (face, value) in values.into_iter().enumerate() {
+            src.lock_rect(u32::try_from(face).unwrap(), 0, 0)
+                .write_u32(&[value; 4]);
+            src.lock_rect(u32::try_from(face).unwrap(), 1, 0)
+                .write_u32(&[0x007f_0081]);
+        }
+        let dst = h.create_cube_texture_owned(2, 0, 0, D3DFMT_Q8W8V8U8, D3DPOOL_DEFAULT);
+        let sample = if pool == D3DPOOL_SYSTEMMEM {
+            assert_eq!(h.update_cube_texture_hr(&src, &dst), 0);
+            &dst
+        } else {
+            &src
+        };
+        assert_eq!(h.set_cube_texture(0, sample), 0);
+        assert_eq!(
+            h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1 | (D3DFVF_TEXTUREFORMAT3 << 16)),
+            0
+        );
+        point_clamp(&h);
+        assert_eq!(h.set_sampler_state(0, D3DSAMP_MIPFILTER, D3DTEXF_POINT), 0);
+        for level in [0, 1] {
+            assert_eq!(h.set_sampler_state(0, D3DSAMP_MAXMIPLEVEL, level), 0);
+            for (face, direction) in directions.into_iter().enumerate() {
+                let quad = fullscreen_quad().map(|v| CubeVertex {
+                    x: v.x,
+                    y: v.y,
+                    z: v.z,
+                    color: v.color,
+                    u: direction[0],
+                    v: direction[1],
+                    w: direction[2],
+                });
+                h.render_once(BLACK, |d| {
+                    assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad), 0);
+                });
+                let raw = if level == 0 {
+                    values[face]
+                } else {
+                    0x007f_0081
+                };
+                assert_pixel_approx(
+                    h.read_pixel(320, 240),
+                    signed_q8_pixel(raw),
+                    1,
+                    "signed cube RGBA",
+                );
+            }
+        }
+        assert_eq!(h.clear_texture(0), 0);
+        assert_eq!(h.set_sampler_state(0, D3DSAMP_MAXMIPLEVEL, 0), 0);
+        let src = h
+            .try_create_volume_texture([3, 2, 2], 0, 0, D3DFMT_Q8W8V8U8, pool)
+            .1
+            .expect("Q8 volume");
+        let mut data = vec![0x807f_0081; 6];
+        data.extend_from_slice(&[0xc000_7f80; 6]);
+        src.write_u32(0, &data);
+        src.write_u32(1, &[0x7f81_007f]);
+        let dst = h
+            .try_create_volume_texture([3, 2, 2], 0, 0, D3DFMT_Q8W8V8U8, D3DPOOL_DEFAULT)
+            .1
+            .expect("Q8 destination volume");
+        let sample = if pool == D3DPOOL_SYSTEMMEM {
+            assert_eq!(h.update_volume_texture_hr(&src, &dst), 0);
+            &dst
+        } else {
+            &src
+        };
+        assert_eq!(h.set_volume_texture(0, sample), 0);
+        for (w, value) in [(0.25, 0x807f_0081), (0.75, 0xc000_7f80)] {
+            assert_pixel_approx(
+                sample_volume_depth(&h, w),
+                signed_q8_pixel(value),
+                1,
+                "signed volume RGBA",
+            );
+        }
+        assert_eq!(h.set_sampler_state(0, D3DSAMP_MAXMIPLEVEL, 1), 0);
+        assert_pixel_approx(
+            sample_volume_depth(&h, 0.5),
+            signed_q8_pixel(0x7f81_007f),
+            1,
+            "signed volume mip",
+        );
+        assert_eq!(h.set_sampler_state(0, D3DSAMP_MAXMIPLEVEL, 0), 0);
+        assert_eq!(h.clear_texture(0), 0);
+    }
+}
+
+#[test]
+fn q8w8v8u8_filter_wrap_and_modern_shader() {
+    // ps_2_0: dcl t0; dcl_2d s0; texld r0,t0,s0; mad oC0,r0,c0,c0.
+    let ps = [
+        0xffff_0200,
+        0x0500_0051,
+        0xa00f_0000,
+        0x3f00_0000,
+        0x3f00_0000,
+        0x3f00_0000,
+        0x3f00_0000,
+        0x0200_001f,
+        0x8000_0000,
+        0xb00f_0000,
+        0x0200_001f,
+        0x9000_0000,
+        0xa00f_0800,
+        0x0300_0042,
+        0x800f_0000,
+        0xb0e4_0000,
+        0xa0e4_0800,
+        0x0400_0004,
+        0x800f_0800,
+        0x80e4_0000,
+        0xa0e4_0000,
+        0xa0e4_0000,
+        0x0000_ffff,
+    ];
+    let h = Harness::new();
+    let shader = h.create_pixel_shader(&ps);
+    assert_eq!(h.set_pixel_shader(&shader), 0);
+    let tex = h.create_texture(2, 1, 1, 0, D3DFMT_Q8W8V8U8, D3DPOOL_MANAGED);
+    tex.lock_rect(0, 0).write_u32(&[0x8080_8080, 0x7f7f_7f7f]);
+    assert_eq!(h.set_texture(0, &tex), 0);
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1), 0);
+    for (u, filter, address, expected) in [
+        (0.5, D3DTEXF_LINEAR, D3DTADDRESS_CLAMP, 0x8080_8080),
+        (1.25, D3DTEXF_POINT, mtld3d_types::D3DTADDRESS_WRAP, 0),
+    ] {
+        for state in [D3DSAMP_MINFILTER, D3DSAMP_MAGFILTER] {
+            assert_eq!(h.set_sampler_state(0, state, filter), 0);
+        }
+        assert_eq!(h.set_sampler_state(0, D3DSAMP_ADDRESSU, address), 0);
+        let mut quad = fullscreen_quad();
+        for vertex in &mut quad {
+            vertex.u = u;
+            vertex.v = 0.5;
+        }
+        h.render_once(BLACK, |d| {
+            assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad), 0);
+        });
+        assert_pixel_approx(
+            h.read_pixel(320, 240),
+            expected,
+            1,
+            "signed filtering/wrapping",
+        );
+    }
+    let mip = h.create_texture(4, 4, 0, 0, D3DFMT_Q8W8V8U8, D3DPOOL_MANAGED);
+    for (level, raw) in [(0, 0x8080_8080), (1, 0), (2, 0x7f7f_7f7f)] {
+        mip.lock_rect(level, 0)
+            .write_u32(&vec![raw; (4usize >> level).pow(2)]);
+    }
+    assert_eq!(h.set_sampler_state(0, D3DSAMP_MIPFILTER, D3DTEXF_POINT), 0);
+    for (level, expected) in [(0, 0), (1, 0x8080_8080), (2, 0xffff_ffff)] {
+        assert_eq!(h.set_sampler_state(0, D3DSAMP_MAXMIPLEVEL, level), 0);
+        assert_pixel_approx(
+            sample_center(&h, &mip).to_pixel(),
+            expected,
+            1,
+            "modern explicit mip",
         );
     }
 }

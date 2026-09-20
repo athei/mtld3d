@@ -1320,4 +1320,15 @@ set to one. The signed-format and volume tests run through the same native
 byte uploads as other mapped formats. 2D and cube AUTOGEN requests answer
 D3DOK_NOAUTOGEN and create one actual level with the public usage retained;
 no mip-generation work is submitted. Render-target and sRGB queries remain
-unavailable. Other signed formats remain separate capabilities.
+unavailable.
+
+Q8W8V8U8 textures use native RGBA8Snorm storage with four signed channels.
+The negative Q channel follows signed normalization, including a floor of
+minus one for both minimum encodings. The legacy R200 exception in Wine's
+signed-format alpha test is not an emulated target. All four lanes are
+stored, so sampling needs no conversion and no view swizzle, and the
+Q8W8V8U8 rows of test_signed_formats do not depend on the mechanism that
+fails the V8U8 rows on the `@mac2` legs. Render-target and sRGB capabilities
+stay absent; AUTOGEN texture/cube requests preserve usage but use one actual
+level with no generated chain. MANAGED+DYNAMIC creation is rejected for
+V16U16 and Q8W8V8U8 only. X8L8V8U8 and L6V5U5 remain separate capabilities.

@@ -4919,7 +4919,7 @@ fn create_texture_path(info: &TextureCreateArgs) -> i32 {
         && pool == D3DPOOL_MANAGED
     {
         mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
-            "reject CreateTexture(V16U16, DYNAMIC, MANAGED) → INVALIDCALL");
+            "reject CreateTexture(format={format}, DYNAMIC, MANAGED) → INVALIDCALL");
         null_out(texture);
         return D3DERR_INVALIDCALL;
     }
@@ -5561,7 +5561,7 @@ extern "system" fn device_create_cube_texture(
         && pool == D3DPOOL_MANAGED
     {
         mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
-            "reject CreateCubeTexture(V16U16, DYNAMIC, MANAGED) → INVALIDCALL");
+            "reject CreateCubeTexture(format={format}, DYNAMIC, MANAGED) → INVALIDCALL");
         null_out(texture);
         return D3DERR_INVALIDCALL;
     }

@@ -20,6 +20,10 @@ divergences from D3D9 it keeps on purpose. The tested games are in the
 - Every draw call and primitive type, point sprites, user clip planes, all
   sixteen vertex streams, hardware instancing.
 - State blocks, occlusion and event queries.
+- Signed Q8W8V8U8 textures use native RGBA8Snorm storage across 2D, cube and
+  volume resources. All four channels, including alpha, retain signed values.
+  Render targets and sRGB are unavailable; AUTOGEN texture/cube requests use
+  a single-level fallback. MANAGED+DYNAMIC creation is rejected.
 - Signed V16U16 textures use native 16-bit U/V storage across 2D, cube and
   volume resources. AUTOGEN requests on 2D/cube use the one-level NOAUTOGEN
   fallback; render-target and sRGB usages remain unavailable.
