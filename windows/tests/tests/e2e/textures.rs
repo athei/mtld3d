@@ -9,16 +9,16 @@ use mtld3d_tests::{
 use mtld3d_types::{
     D3DBLEND_INVSRCALPHA, D3DBLEND_SRCALPHA, D3DBLEND_ZERO, D3DBOX, D3DERR_INVALIDCALL,
     D3DFMT_A1R5G5B5, D3DFMT_A4R4G4B4, D3DFMT_A8, D3DFMT_A8B8G8R8, D3DFMT_A8R8G8B8, D3DFMT_ATI1,
-    D3DFMT_DXT1, D3DFMT_DXT5, D3DFMT_INTZ, D3DFMT_L8, D3DFMT_Q8W8V8U8, D3DFMT_R5G6B5,
+    D3DFMT_DXT1, D3DFMT_DXT5, D3DFMT_INTZ, D3DFMT_L8, D3DFMT_NV12, D3DFMT_Q8W8V8U8, D3DFMT_R5G6B5,
     D3DFMT_R8G8B8, D3DFMT_UYVY, D3DFMT_V8U8, D3DFMT_V16U16, D3DFMT_X1R5G5B5, D3DFMT_X8B8G8R8,
-    D3DFMT_X8R8G8B8, D3DFMT_YUY2, D3DFVF_DIFFUSE, D3DFVF_TEX1, D3DFVF_TEXTUREFORMAT3, D3DFVF_XYZ,
-    D3DLOCK_DISCARD, D3DLOCK_NO_DIRTY_UPDATE, D3DLOCK_READONLY, D3DPOOL_DEFAULT, D3DPOOL_MANAGED,
-    D3DPOOL_SCRATCH, D3DPOOL_SYSTEMMEM, D3DPT_TRIANGLELIST, D3DRECT, D3DRS_ALPHABLENDENABLE,
-    D3DRS_DESTBLEND, D3DRS_SRCBLEND, D3DRTYPE_SURFACE, D3DRTYPE_VOLUME, D3DSAMP_ADDRESSU,
-    D3DSAMP_ADDRESSV, D3DSAMP_MAGFILTER, D3DSAMP_MAXMIPLEVEL, D3DSAMP_MINFILTER, D3DSAMP_MIPFILTER,
-    D3DTA_TEXTURE, D3DTADDRESS_CLAMP, D3DTEXF_ANISOTROPIC, D3DTEXF_LINEAR, D3DTEXF_NONE,
-    D3DTEXF_POINT, D3DTOP_SELECTARG1, D3DTSS_ALPHAARG1, D3DTSS_ALPHAOP, D3DUSAGE_AUTOGENMIPMAP,
-    D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_DYNAMIC, D3DUSAGE_RENDERTARGET,
+    D3DFMT_X8R8G8B8, D3DFMT_YUY2, D3DFMT_YV12, D3DFVF_DIFFUSE, D3DFVF_TEX1, D3DFVF_TEXTUREFORMAT3,
+    D3DFVF_XYZ, D3DLOCK_DISCARD, D3DLOCK_NO_DIRTY_UPDATE, D3DLOCK_READONLY, D3DPOOL_DEFAULT,
+    D3DPOOL_MANAGED, D3DPOOL_SCRATCH, D3DPOOL_SYSTEMMEM, D3DPT_TRIANGLELIST, D3DRECT,
+    D3DRS_ALPHABLENDENABLE, D3DRS_DESTBLEND, D3DRS_SRCBLEND, D3DRTYPE_SURFACE, D3DRTYPE_VOLUME,
+    D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_MAGFILTER, D3DSAMP_MAXMIPLEVEL, D3DSAMP_MINFILTER,
+    D3DSAMP_MIPFILTER, D3DTA_TEXTURE, D3DTADDRESS_CLAMP, D3DTEXF_ANISOTROPIC, D3DTEXF_LINEAR,
+    D3DTEXF_NONE, D3DTEXF_POINT, D3DTOP_SELECTARG1, D3DTSS_ALPHAARG1, D3DTSS_ALPHAOP,
+    D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_DYNAMIC, D3DUSAGE_RENDERTARGET,
 };
 
 const BLACK: u32 = 0xFF00_0000;
@@ -714,6 +714,92 @@ fn scratch_extension_cubes_are_cpu_only_resources() {
             D3DERR_INVALIDCALL,
             "GPU extension cube remains unsupported",
         );
+    }
+}
+
+/// `YV12` and `NV12` create as `D3DPOOL_DEFAULT` offscreen plains and as nothing else.
+///
+/// A planar level holds its chroma rows after its luma rows, so it is larger
+/// than pitch times height. Only the default-pool plain is sized for that:
+/// every CPU pool, every texture type in every pool, and the render-target
+/// and depth-stencil creates are refused with the out pointer nulled. A
+/// `YV12` plain of odd height is refused too, its U plane having no agreed
+/// origin, as is an extent whose luma and chroma rows pass the texture limit.
+#[test]
+fn planar_yuv_creates_only_as_a_default_pool_offscreen_plain() {
+    let h = Harness::new();
+    let pools = [
+        D3DPOOL_DEFAULT,
+        D3DPOOL_MANAGED,
+        D3DPOOL_SYSTEMMEM,
+        D3DPOOL_SCRATCH,
+    ];
+    for (format, name) in [(D3DFMT_YV12, "YV12"), (D3DFMT_NV12, "NV12")] {
+        for (width, height) in [(20, 16), (21, 16), (22, 2)] {
+            let (hr, out) =
+                h.create_offscreen_plain_surface_seeded(width, height, format, D3DPOOL_DEFAULT);
+            assert_eq!(hr, 0, "{name} {width}x{height} DEFAULT offscreen plain");
+            assert!(
+                !out.is_null(),
+                "{name} {width}x{height} hands back a surface"
+            );
+        }
+        let odd = h.create_offscreen_plain_surface_seeded(20, 15, format, D3DPOOL_DEFAULT);
+        if format == D3DFMT_NV12 {
+            assert_eq!(odd.0, 0, "NV12 rounds an odd height's chroma rows up");
+        } else {
+            assert_eq!(
+                odd,
+                (D3DERR_INVALIDCALL, core::ptr::null_mut()),
+                "YV12 of odd height is refused with the out pointer nulled"
+            );
+        }
+        // 10924 luma rows and 5462 chroma rows are 16386 rows of storage.
+        assert_eq!(
+            h.create_offscreen_plain_surface_seeded(16, 10924, format, D3DPOOL_DEFAULT),
+            (D3DERR_INVALIDCALL, core::ptr::null_mut()),
+            "{name}: storage rows past the texture limit"
+        );
+        for pool in [D3DPOOL_MANAGED, D3DPOOL_SYSTEMMEM, D3DPOOL_SCRATCH] {
+            assert_eq!(
+                h.create_offscreen_plain_surface_seeded(20, 16, format, pool),
+                (D3DERR_INVALIDCALL, core::ptr::null_mut()),
+                "{name} offscreen plain in pool {pool}"
+            );
+        }
+        for pool in pools {
+            assert_eq!(
+                h.try_create_texture(16, 16, 1, 0, format, pool),
+                (D3DERR_INVALIDCALL, core::ptr::null_mut()),
+                "{name} texture in pool {pool}"
+            );
+            assert_eq!(
+                h.try_create_cube_texture(16, 1, 0, format, pool),
+                (D3DERR_INVALIDCALL, core::ptr::null_mut()),
+                "{name} cube texture in pool {pool}"
+            );
+            let (hr, volume) = h.try_create_volume_texture([16, 16, 2], 1, 0, format, pool);
+            assert_eq!(
+                hr, D3DERR_INVALIDCALL,
+                "{name} volume texture in pool {pool}"
+            );
+            assert!(volume.is_none(), "{name} volume texture in pool {pool}");
+        }
+        for usage in [D3DUSAGE_DYNAMIC, D3DUSAGE_RENDERTARGET] {
+            assert_eq!(
+                h.try_create_texture(16, 16, 1, usage, format, D3DPOOL_DEFAULT),
+                (D3DERR_INVALIDCALL, core::ptr::null_mut()),
+                "{name} texture with usage {usage:#x}"
+            );
+        }
+        assert_eq!(
+            h.create_render_target_hr(16, 16, format),
+            D3DERR_INVALIDCALL,
+            "{name} render target"
+        );
+        let (hr, depth) = h.create_depth_stencil_surface_ms_hr((16, 16), format, (0, 0));
+        assert_eq!(hr, D3DERR_INVALIDCALL, "{name} depth-stencil surface");
+        assert!(depth.is_none(), "{name} depth-stencil surface");
     }
 }
 

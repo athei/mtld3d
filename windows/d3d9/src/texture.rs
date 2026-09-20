@@ -22,14 +22,15 @@ use mtld3d_shared::{
     mtl_handle::{MTLDeviceKind, MTLTextureKind},
 };
 use mtld3d_types::{
-    D3DBOX, D3DFMT_UYVY, D3DFMT_YUY2, D3DLOCK_DISCARD, D3DLOCK_KNOWN_BITS, D3DLOCK_NO_DIRTY_UPDATE,
-    D3DLOCK_NOOVERWRITE, D3DLOCK_READONLY, D3DLOCKED_BOX, D3DLOCKED_RECT, D3DPOOL_DEFAULT,
-    D3DPOOL_MANAGED, D3DRECT, D3DRTYPE_CUBETEXTURE, D3DRTYPE_SURFACE, D3DRTYPE_TEXTURE,
-    D3DRTYPE_VOLUME, D3DRTYPE_VOLUMETEXTURE, D3DSURFACE_DESC, D3DTEXF_LINEAR, D3DTEXF_NONE,
-    D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_DYNAMIC, D3DVOLUME_DESC, Guid, IDirect3DCubeTexture9Vtbl,
-    IDirect3DTexture9Vtbl, IDirect3DVolume9Vtbl, IDirect3DVolumeTexture9Vtbl,
-    IID_IDIRECT3DBASETEXTURE9, IID_IDIRECT3DCUBETEXTURE9, IID_IDIRECT3DRESOURCE9,
-    IID_IDIRECT3DTEXTURE9, IID_IDIRECT3DVOLUME9, IID_IDIRECT3DVOLUMETEXTURE9, IID_IUNKNOWN,
+    D3DBOX, D3DFMT_NV12, D3DFMT_UYVY, D3DFMT_YUY2, D3DFMT_YV12, D3DLOCK_DISCARD,
+    D3DLOCK_KNOWN_BITS, D3DLOCK_NO_DIRTY_UPDATE, D3DLOCK_NOOVERWRITE, D3DLOCK_READONLY,
+    D3DLOCKED_BOX, D3DLOCKED_RECT, D3DPOOL_DEFAULT, D3DPOOL_MANAGED, D3DRECT, D3DRTYPE_CUBETEXTURE,
+    D3DRTYPE_SURFACE, D3DRTYPE_TEXTURE, D3DRTYPE_VOLUME, D3DRTYPE_VOLUMETEXTURE, D3DSURFACE_DESC,
+    D3DTEXF_LINEAR, D3DTEXF_NONE, D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_DYNAMIC, D3DVOLUME_DESC, Guid,
+    IDirect3DCubeTexture9Vtbl, IDirect3DTexture9Vtbl, IDirect3DVolume9Vtbl,
+    IDirect3DVolumeTexture9Vtbl, IID_IDIRECT3DBASETEXTURE9, IID_IDIRECT3DCUBETEXTURE9,
+    IID_IDIRECT3DRESOURCE9, IID_IDIRECT3DTEXTURE9, IID_IDIRECT3DVOLUME9,
+    IID_IDIRECT3DVOLUMETEXTURE9, IID_IUNKNOWN,
 };
 
 use super::{
@@ -878,6 +879,11 @@ impl TextureInner {
     /// are re-measured there, on the pitch formula the arrays themselves were
     /// built with.
     fn level_charge_extent(&self, level: usize) -> (u32, u32) {
+        if let Some(storage) = self.planar_storage_extent() {
+            // One level, charged for the chroma rows it holds after the luma
+            // rows. The charge and the refund both come through here.
+            return storage;
+        }
         if self.render_scale.is_identity() {
             return (self.mip_bytes_per_row[level], self.mip_heights[level]);
         }
@@ -886,6 +892,20 @@ impl TextureInner {
             block_row_pitch(width, self.block_w, self.block_bytes, self.bytes_per_pixel),
             self.render_scale.dimension(self.mip_heights[level]),
         )
+    }
+
+    /// Pitch and storage row count of a planar YUV level, `None` for any other format.
+    ///
+    /// The extent of the level's staging allocation in rows of its lock pitch,
+    /// and of the one-byte-per-texel Metal texture that holds the same bytes.
+    /// It is taller than the logical height `mip_heights` keeps, by the chroma
+    /// rows, and as wide as the pitch rather than the width, because the
+    /// chroma planes use the row padding's columns too. The create path only
+    /// builds a planar texture at an extent the layout defines.
+    fn planar_storage_extent(&self) -> Option<(u32, u32)> {
+        let layout =
+            mtld3d_core::planar_yuv::planar_yuv_layout(self.d3d_format, self.width, self.height)?;
+        Some((layout.pitch(), layout.storage_rows()))
     }
 
     /// True for `D3DPOOL_DEFAULT` textures.
@@ -2083,14 +2103,22 @@ impl TextureInner {
 
     /// Build a `TextureInfo` snapshot for upload closures and draw-time stage binding capture.
     pub fn texture_info(&self) -> TextureInfo {
+        // Render space: this snapshot is what creates and addresses the Metal
+        // texture. `self.width`/`self.height` stay logical for `GetLevelDesc`
+        // and for every rect the game supplies. A planar YUV level is backed
+        // by a texture of its whole allocation, chroma rows included, which no
+        // scale applies to: it is never a render target.
+        let (width, height) = self.planar_storage_extent().unwrap_or_else(|| {
+            (
+                self.render_scale.dimension(self.width),
+                self.render_scale.dimension(self.height),
+            )
+        });
         TextureInfo {
             texture_id: self.texture_id,
             d3d_format: self.d3d_format,
-            // Render space: this snapshot is what creates and addresses the
-            // Metal texture. `self.width`/`self.height` stay logical for
-            // `GetLevelDesc` and for every rect the game supplies.
-            width: self.render_scale.dimension(self.width),
-            height: self.render_scale.dimension(self.height),
+            width,
+            height,
             depth: self.depth,
             levels: self.levels,
             pixel_format: self.metal_pixel_format,
@@ -3927,8 +3955,11 @@ extern "system" fn texture_lock_rect(
         // For DEFAULT-pool lock validation they nonetheless require 2-pixel X
         // alignment, so derive a YUV-aware block size
         // here without disturbing the stored block_w/h.
+        // The planar 4:2:0 formats share one chroma sample across a 2×2 luma
+        // block, so their rects align in both directions.
         let (vbw, vbh) = match ti.d3d_format {
             D3DFMT_YUY2 | D3DFMT_UYVY => (2, 1),
+            D3DFMT_YV12 | D3DFMT_NV12 => (2, 2),
             _ => (ti.block_w, ti.block_h),
         };
         if provided.is_some_and(|r| !default_lock_rect_valid(&r, mip_w, mip_h, vbw, vbh)) {
@@ -4288,6 +4319,15 @@ fn schedule_upload_with_order<const ORDERED: bool>(
     // consulted by the volume blit path.
     let block_rows = ti.mip_height(level_u).div_ceil(ti.block_h.max(1));
     let slice_pitch = ti.mip_bytes_per_row(level_u).saturating_mul(block_rows);
+    // A planar YUV level always uploads whole. A dirty rect is in luma texels,
+    // and the chroma that belongs to it sits in other rows of the allocation,
+    // so no sub-rect of the backing texture carries one write. The whole
+    // upload reads `pitch * storage_rows` bytes from offset 0, which is the
+    // staging's logical length by construction, so the source span the
+    // encoder checks always ends exactly at the allocation's end.
+    let rect = ti
+        .planar_storage_extent()
+        .map_or(rect, |(pitch, rows)| DirtyRect::full(pitch, rows));
     // Every byte of a level the game cannot lock again is on the GPU once this
     // upload is emitted: each write since the staging was allocated was
     // uploaded by the flush that followed it, this one included, and together

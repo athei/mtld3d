@@ -4908,9 +4908,9 @@ fn create_texture_path(info: &TextureCreateArgs) -> i32 {
         return D3DERR_INVALIDCALL;
     };
     let expand_packed16 = obj.inner().config().expand_packed16;
-    let Some(fmt) = crate::direct3d9::map_for_device(format, expand_packed16) else {
-        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
-            "reject CreateTexture(format={format}) → INVALIDCALL (no format mapping)");
+    let Some((fmt, planar_layout)) =
+        resolve_texture_storage(format, (width, height), offscreen_plain, expand_packed16)
+    else {
         null_out(texture);
         return D3DERR_INVALIDCALL;
     };
@@ -5026,12 +5026,27 @@ fn create_texture_path(info: &TextureCreateArgs) -> i32 {
     let mut mip_heights = Vec::with_capacity(actual_levels as usize);
     let mut mip_bytes_per_row = Vec::with_capacity(actual_levels as usize);
 
-    for level in 0..actual_levels {
-        let (mw, mh, size, bpr) = compute_mip_size(width, height, level, &fmt);
-        staging.push(new_uninit_page_box(size as usize));
-        mip_widths.push(mw);
-        mip_heights.push(mh);
-        mip_bytes_per_row.push(bpr);
+    if let Some(layout) = &planar_layout {
+        // One level whose allocation is the planar layout's, not pitch times
+        // height: the chroma planes follow the luma rows in the same box, and
+        // the lock pitch strides all of them. The per-level arrays keep the
+        // logical extent, which is what `GetDesc` and rect validation read.
+        staging.push(new_uninit_page_box(layout.total_bytes()));
+        mip_widths.push(width);
+        mip_heights.push(height);
+        mip_bytes_per_row.push(layout.pitch());
+        // Every offset a planar lock, upload or decode forms is derived from
+        // the layout, so the allocation has to be exactly the layout's size.
+        debug_assert_eq!(staging[0].logical_len(), layout.total_bytes());
+        debug_assert_eq!(actual_levels, 1);
+    } else {
+        for level in 0..actual_levels {
+            let (mw, mh, size, bpr) = compute_mip_size(width, height, level, &fmt);
+            staging.push(new_uninit_page_box(size as usize));
+            mip_widths.push(mw);
+            mip_heights.push(mh);
+            mip_bytes_per_row.push(bpr);
+        }
     }
 
     let mut flags = TextureFlags::empty();
@@ -5088,6 +5103,57 @@ fn create_texture_path(info: &TextureCreateArgs) -> i32 {
     // SAFETY: vtable out-param; `texture` is *mut *mut c_void per IDirect3DDevice9 ABI.
     unsafe { OutPtr::write_opt(texture, tex_ptr.cast::<c_void>()) };
     0 // S_OK
+}
+
+/// Storage a 2D colour create uses: the Metal mapping, plus the planar layout if it has one.
+///
+/// Every format but the planar YUV pair answers from the device-aware format
+/// lookup. `YV12` and `NV12` are absent from that lookup on purpose, because a
+/// planar level is taller than its logical height and no generic consumer of a
+/// mapping sizes for that. They are accepted here for the one create that
+/// sizes the level from the planar layout, the default-pool offscreen plain,
+/// and only at an extent the layout defines. `None` has been warned about and
+/// is the caller's `D3DERR_INVALIDCALL`.
+fn resolve_texture_storage(
+    format: u32,
+    (width, height): (u32, u32),
+    offscreen_plain: bool,
+    expand_packed16: bool,
+) -> Option<(
+    FormatMapping,
+    Option<mtld3d_core::planar_yuv::PlanarYuvLayout>,
+)> {
+    if !mtld3d_core::stretch_rect::is_planar_yuv(format) {
+        let mapping = crate::direct3d9::map_for_device(format, expand_packed16);
+        if mapping.is_none() {
+            mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+                "reject CreateTexture(format={format}) → INVALIDCALL (no format mapping)");
+        }
+        return mapping.map(|fmt| (fmt, None));
+    }
+    if !offscreen_plain {
+        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+            "reject CreateTexture(format={}) → INVALIDCALL (planar YUV exists only as a \
+             D3DPOOL_DEFAULT offscreen plain surface)",
+            mtld3d_core::format::format_name(format));
+        return None;
+    }
+    let Some(layout) = mtld3d_core::planar_yuv::planar_yuv_layout(format, width, height) else {
+        mtld3d_shared::log_once_warn_by!(
+            target: crate::LOG_TARGET,
+            key: u64::from(format),
+            "reject CreateOffscreenPlainSurface({width}x{height}, format={}) → INVALIDCALL (a \
+             YV12 surface needs an even height, and the luma and chroma rows together have to \
+             fit the {} texture limit)",
+            mtld3d_core::format::format_name(format),
+            caps::MAX_TEXTURE_DIM
+        );
+        return None;
+    };
+    Some((
+        mtld3d_core::format::planar_yuv_storage_mapping(),
+        Some(layout),
+    ))
 }
 
 /// Queue the eager `MTLTexture` create and per-mip staging-buffer wraps.
@@ -6333,6 +6399,24 @@ extern "system" fn device_update_surface(
     }
     let src_parent = src_surf.parent_texture();
     let dst_parent = dst_surf.parent_texture();
+    // A planar YUV surface is a `StretchRect` source and nothing else. Its
+    // level is taller than its logical height, which none of the staging
+    // copies below size for, so a planar endpoint is refused before any of
+    // them can run, whatever the other endpoint is.
+    for parent in [src_parent, dst_parent] {
+        // SAFETY: a non-null parent is the live `Direct3DTexture9` the surface
+        // holds a reference on.
+        if let Some(tex) = unsafe { parent.as_ref() }
+            && mtld3d_core::stretch_rect::is_planar_yuv(tex.d3d_format())
+        {
+            mtld3d_shared::log_once_warn!(
+                target: crate::LOG_TARGET,
+                "reject UpdateSurface: planar YUV endpoint ({}) → INVALIDCALL",
+                mtld3d_core::format::format_name(tex.d3d_format())
+            );
+            return D3DERR_INVALIDCALL;
+        }
+    }
     // A standalone offscreen *source* surface (not texture-backed) updating a
     // texture destination: copy its CPU backing into the dst texture's mip
     // staging and mark it dirty so a subsequent bind / StretchRect uploads it.
@@ -7224,7 +7308,15 @@ extern "system" fn device_stretch_rect(
     }
 
     let expand_packed16 = dev.config().expand_packed16;
-    if let Err(hr) = check_stretch_rect_formats(&src_info, &dst_info, expand_packed16) {
+    // The planar YUV formats have no entry in the format lookup, so the
+    // generic format gate would refuse them as unmappable. A pair with a
+    // planar endpoint is judged by its own route below, once the rects say
+    // whether the copy scales.
+    let planar_endpoint = mtld3d_core::stretch_rect::is_planar_yuv(src_info.format)
+        || mtld3d_core::stretch_rect::is_planar_yuv(dst_info.format);
+    if !planar_endpoint
+        && let Err(hr) = check_stretch_rect_formats(&src_info, &dst_info, expand_packed16)
+    {
         return hr;
     }
     let Some((src_region, dst_region)) =
@@ -7234,6 +7326,33 @@ extern "system" fn device_stretch_rect(
     };
 
     let scaling = src_region.w != dst_region.w || src_region.h != dst_region.h;
+    // A planar source decodes through the render quad into a render target and
+    // through the CPU converter, 1:1, into an offscreen plain; both are the
+    // cross-format branches below. Everything else with a planar endpoint is
+    // refused here, ahead of the upload flush, so a rejected call schedules
+    // nothing.
+    if let mtld3d_core::stretch_rect::PlanarStretch::Reject(reason) =
+        mtld3d_core::stretch_rect::planar_stretch_route(
+            src_info.format,
+            dst_info.format,
+            dst_info
+                .flags
+                .contains(StretchSurfaceFlags::IS_RENDER_TARGET),
+            scaling,
+        )
+    {
+        mtld3d_shared::log_once_warn_by!(
+            target: crate::LOG_TARGET,
+            key: reason.key(),
+            "reject StretchRect: {} (src={} 0x{:x}, dst={} 0x{:x}) → INVALIDCALL",
+            reason.as_str(),
+            mtld3d_core::format::format_name(src_info.format),
+            src_info.format,
+            mtld3d_core::format::format_name(dst_info.format),
+            dst_info.format
+        );
+        return D3DERR_INVALIDCALL;
+    }
     // A scaling StretchRect needs a render pass that samples the source onto
     // the destination quad (Metal's blit encoder can't scale). That requires
     // the destination to be a render target — an offscreen-plain destination
@@ -7266,10 +7385,14 @@ extern "system" fn device_stretch_rect(
     // Device-aware mapping: it must agree with the Metal formats the textures
     // were actually created with (e.g. a packed 16-bit pair that is
     // BGRA8-backed on this device is NOT cross-format).
-    let cross_format = crate::direct3d9::map_for_device(src_info.format, expand_packed16)
-        .map(|m| m.metal_pixel_format())
-        != crate::direct3d9::map_for_device(dst_info.format, expand_packed16)
-            .map(|m| m.metal_pixel_format());
+    // A planar source always converts: its R8 storage holds YUV planes, not
+    // the pixels of any colour format, so it never takes the 1:1 blit. It is
+    // answered ahead of the lookup, which has no entry for it.
+    let cross_format = planar_endpoint
+        || crate::direct3d9::map_for_device(src_info.format, expand_packed16)
+            .map(|m| m.metal_pixel_format())
+            != crate::direct3d9::map_for_device(dst_info.format, expand_packed16)
+                .map(|m| m.metal_pixel_format());
 
     // A cross-format 1:1 copy into an offscreen-plain destination has no GPU
     // path: the render-quad conversion needs a render-target destination, and
@@ -8389,6 +8512,17 @@ extern "system" fn device_color_fill(
             "ColorFill: surface is not a DEFAULT render target or offscreen-plain → INVALIDCALL");
         return D3DERR_INVALIDCALL;
     }
+    // A planar YUV plain has no fill encoding: a D3DCOLOR names no Y, U, V
+    // triple the layer could defend, the same position the packed YUV formats
+    // are in. The call succeeds and the surface keeps its bytes. Answered
+    // here because the format lookup below has no entry for the format and
+    // would warn on every call.
+    if mtld3d_core::stretch_rect::is_planar_yuv(info.format) {
+        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+            "ColorFill: no fill encoding for planar YUV format {} → surface left unfilled",
+            mtld3d_core::format::format_name(info.format));
+        return D3D_OK;
+    }
     let extent = (info.width, info.height);
     let Some(region) = color_fill_region(rect, extent) else {
         return D3D_OK;
@@ -8475,6 +8609,19 @@ extern "system" fn device_create_offscreen_plain_surface(
         // SAFETY: vtable out-param; `surface` is *mut *mut c_void per IDirect3DDevice9 ABI.
         unsafe { OutPtr::write_opt(surface, Box::into_raw(Box::new(surf)).cast::<c_void>()) };
         return D3D_OK;
+    }
+    // A planar YUV surface holds its chroma planes after its luma rows, so it
+    // is half again as large as the pitch-times-height backing the CPU pools
+    // below allocate. Only the DEFAULT path above sizes it from the planar
+    // layout; a CPU-pool surface would let the application write its chroma
+    // past the end of the allocation.
+    if mtld3d_core::stretch_rect::is_planar_yuv(format) {
+        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+            "reject CreateOffscreenPlainSurface(format={}, pool={pool}) → INVALIDCALL (planar \
+             YUV surfaces exist in D3DPOOL_DEFAULT only)",
+            mtld3d_core::format::format_name(format));
+        null_out(surface);
+        return D3DERR_INVALIDCALL;
     }
     // Otherwise a CPU/system-memory offscreen surface: D3DPOOL_SYSTEMMEM (the
     // destination of GetRenderTargetData / GetFrontBufferData) and D3DPOOL_SCRATCH

@@ -22,7 +22,7 @@ use crate::ff_state::MAX_ACTIVE_LIGHTS;
 ///
 /// Also the D3D9 maximum render-target dimension, so scissor / viewport
 /// coordinates derived from it fit in `u16`.
-const MAX_TEXTURE_DIM: u32 = 16384;
+pub const MAX_TEXTURE_DIM: u32 = 16384;
 
 /// Address-space wrap count for a single texture coordinate.
 const MAX_TEXTURE_REPEAT: u32 = 8192;

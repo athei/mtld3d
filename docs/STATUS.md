@@ -39,7 +39,12 @@ divergences from D3D9 it keeps on purpose. The tested games are in the
   fallback; render-target and sRGB usages remain unavailable.
 - Compressed (DXT1 to DXT5, ATI1), integer and float formats, cube and volume
   textures, auto-generated mipmaps, `StretchRect` with format conversion and
-  YUV decoding, `GetDC`.
+  packed and planar YUV decoding, `GetDC`.
+- Planar YV12 and NV12 as DEFAULT-pool offscreen plain surfaces: they lock at
+  the 4-byte-aligned width with the chroma planes after the luma rows, and
+  `StretchRect` decodes them (reduced-range BT.601) into any render target, at
+  any size, and 1:1 into a colour offscreen plain. They are no texture, cube,
+  volume or render-target format.
 - Managed 2D texture publication through `AddDirtyRect`, including scaled
   mip regions. `NO_DIRTY_UPDATE` adds no publication after initialization;
   initial uploads and eviction retain their CPU source. Overlapping partial
@@ -83,6 +88,13 @@ Each fails cleanly, with an absent cap bit or a documented error return.
   codecs and A16B16G16R16/A32B32G32R32F into A8R8G8B8 returns
   `D3DERR_INVALIDCALL`. Wide-to-wide conversion and offscreen scaling remain
   unsupported. Render-target conversion uses its separate GPU path.
+- Planar YUV (YV12, NV12) outside the DEFAULT pool: SYSTEMMEM, SCRATCH and
+  MANAGED offscreen plains are rejected with `D3DERR_INVALIDCALL`, and so is
+  `UpdateSurface` with a planar endpoint. A YV12 surface of odd height is
+  rejected as well, because the origin of its U plane is not pinned by any
+  reference. Planar chroma is never filtered: `D3DTEXF_LINEAR` filters luma
+  and replicates each chroma sample over its 2x2 block. `ColorFill` of a
+  packed or planar YUV surface succeeds and leaves it unfilled.
 - Scaled, sub-rect or converting depth-to-depth `StretchRect`: only the
   whole-surface 1:1 copy between same-format DEFAULT-pool depth surfaces
   works, multisample resolve included.

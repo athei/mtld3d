@@ -1,6 +1,7 @@
-use mtld3d_types::{D3DFMT_DXT1, D3DFMT_L16, D3DFMT_V8U8, D3DFMT_YUY2};
+use mtld3d_types::{D3DFMT_DXT1, D3DFMT_L16, D3DFMT_NV12, D3DFMT_V8U8, D3DFMT_YUY2, D3DFMT_YV12};
 
 use super::*;
+use crate::stretch_rect::yuv_to_rgb8;
 
 /// A `ConvertRegion` covering a whole `width` x `height` level pair.
 fn whole(width: u32, height: u32, src_pitch: usize, dst_pitch: usize) -> ConvertRegion {
@@ -547,4 +548,227 @@ fn wide_regions_preserve_padding_origins_and_other_slices() {
         ));
         assert_eq!(dst, expected);
     }
+}
+
+/// Four chroma pairs with U and V distinct in each, one per 2x2 luma block in turn.
+const PLANAR_CHROMA: [(u8, u8); 4] = [(0x5a, 0xf0), (0x36, 0x22), (0xf0, 0x6e), (0x80, 0x80)];
+
+/// The chroma pair block `(cx, cy)` of the test pattern carries.
+fn planar_chroma(cx: usize, cy: usize) -> (u8, u8) {
+    PLANAR_CHROMA[(cx + 2 * cy) % PLANAR_CHROMA.len()]
+}
+
+/// The luma the test pattern carries at `(x, y)`, distinct per texel.
+fn planar_luma(x: usize, y: usize) -> u8 {
+    u8::try_from(0x30 + 0x10 * y + 3 * x).unwrap()
+}
+
+/// A planar surface holding the test pattern, and the pitch it is laid out at.
+///
+/// The pitch is the width rounded up to four bytes, so a width that is not a
+/// multiple of four leaves padding the chroma addressing has to step over.
+/// Padding bytes hold `0xEE`, which no plane of the pattern uses.
+fn planar_pattern(d3d_format: u32, width: usize, height: usize) -> (Vec<u8>, usize) {
+    let pitch = width.next_multiple_of(4);
+    let chroma_rows = height.div_ceil(2);
+    let mut bytes = vec![0xEEu8; pitch * (height + chroma_rows)];
+    for y in 0..height {
+        for x in 0..width {
+            bytes[y * pitch + x] = planar_luma(x, y);
+        }
+    }
+    let chroma = pitch * height;
+    for cy in 0..chroma_rows {
+        for cx in 0..width.div_ceil(2) {
+            let (u, v) = planar_chroma(cx, cy);
+            if d3d_format == D3DFMT_YV12 {
+                let half = pitch / 2;
+                bytes[chroma + cy * half + cx] = v;
+                bytes[chroma + chroma_rows * half + cy * half + cx] = u;
+            } else {
+                bytes[chroma + cy * pitch + 2 * cx] = u;
+                bytes[chroma + cy * pitch + 2 * cx + 1] = v;
+            }
+        }
+    }
+    (bytes, pitch)
+}
+
+/// The `X8R8G8B8` word the test pattern decodes to at `(x, y)`.
+fn planar_expected(x: usize, y: usize) -> u32 {
+    let (cb, cr) = planar_chroma(x / 2, y / 2);
+    let (red, green, blue) = yuv_to_rgb8(planar_luma(x, y), cb, cr);
+    0xFF00_0000 | (u32::from(red) << 16) | (u32::from(green) << 8) | u32::from(blue)
+}
+
+#[test]
+fn planar_yuv_converts_as_a_stretch_source_only() {
+    for src in [D3DFMT_YV12, D3DFMT_NV12] {
+        for dst in CONVERTIBLE {
+            assert!(can_convert(src, dst), "{src:#x} into {dst:#x}");
+            assert!(!can_convert(dst, src), "{dst:#x} into {src:#x}");
+            // The Update APIs never see a planar endpoint.
+            assert!(!can_convert_update(src, dst), "{src:#x} into {dst:#x}");
+            assert!(!can_convert_update(dst, src), "{dst:#x} into {src:#x}");
+        }
+        assert!(!can_convert(src, D3DFMT_YV12));
+        assert!(!can_convert(src, D3DFMT_NV12));
+        assert!(!can_convert(src, D3DFMT_YUY2));
+        assert!(!can_convert(src, mtld3d_types::D3DFMT_A16B16G16R16));
+    }
+}
+
+#[test]
+fn a_planar_chroma_sample_covers_exactly_its_two_by_two_luma_block() {
+    // Width 6 lays out at a pitch of 8, so every plane carries padding.
+    let (width, height) = (6usize, 4usize);
+    for format in [D3DFMT_YV12, D3DFMT_NV12] {
+        let (src, pitch) = planar_pattern(format, width, height);
+        let mut dst = vec![0u8; width * 4 * height];
+        assert!(convert_region(
+            &mut dst,
+            D3DFMT_X8R8G8B8,
+            &src,
+            format,
+            &whole(6, 4, pitch, width * 4)
+        ));
+        for y in 0..height {
+            for x in 0..width {
+                let off = (y * width + x) * 4;
+                let got = u32::from_le_bytes([dst[off], dst[off + 1], dst[off + 2], dst[off + 3]]);
+                assert_eq!(got, planar_expected(x, y), "{format:#x} at ({x}, {y})");
+            }
+        }
+    }
+}
+
+#[test]
+fn a_planar_source_rect_with_an_odd_origin_keeps_its_chroma_blocks() {
+    let (width, height) = (6usize, 4usize);
+    for format in [D3DFMT_YV12, D3DFMT_NV12] {
+        let (src, pitch) = planar_pattern(format, width, height);
+        let mut dst = vec![0x77u8; width * 4 * height];
+        let region = ConvertRegion {
+            src_x: 1,
+            src_y: 1,
+            dst_x: 2,
+            dst_y: 1,
+            width: 3,
+            height: 2,
+            src_pitch: pitch,
+            dst_pitch: width * 4,
+            src_slice_pitch: pitch * height,
+            dst_slice_pitch: width * 4 * height,
+            depth: 1,
+        };
+        assert!(convert_region(
+            &mut dst,
+            D3DFMT_X8R8G8B8,
+            &src,
+            format,
+            &region
+        ));
+        for y in 0..height {
+            for x in 0..width {
+                let off = (y * width + x) * 4;
+                let got = u32::from_le_bytes([dst[off], dst[off + 1], dst[off + 2], dst[off + 3]]);
+                let inside = (2..5).contains(&x) && (1..3).contains(&y);
+                let expected = if inside {
+                    planar_expected(x - 1, y)
+                } else {
+                    0x7777_7777
+                };
+                assert_eq!(got, expected, "{format:#x} at ({x}, {y})");
+            }
+        }
+    }
+}
+
+#[test]
+fn an_odd_nv12_height_converts_its_last_row_from_the_last_chroma_row() {
+    let (width, height) = (5usize, 3usize);
+    let (src, pitch) = planar_pattern(D3DFMT_NV12, width, height);
+    let mut dst = vec![0u8; width * 4 * height];
+    assert!(convert_region(
+        &mut dst,
+        D3DFMT_X8R8G8B8,
+        &src,
+        D3DFMT_NV12,
+        &whole(5, 3, pitch, width * 4)
+    ));
+    for x in 0..width {
+        let off = (2 * width + x) * 4;
+        let got = u32::from_le_bytes([dst[off], dst[off + 1], dst[off + 2], dst[off + 3]]);
+        assert_eq!(got, planar_expected(x, 2), "at ({x}, 2)");
+    }
+}
+
+#[test]
+fn a_planar_source_into_l8_stores_the_luma_of_the_decoded_colour() {
+    // Pure red: the Rec. 709 luma of (255, 0, 0) is 54, not the 0x51 the Y
+    // plane holds.
+    for format in [D3DFMT_YV12, D3DFMT_NV12] {
+        let mut src = vec![0x51u8; 4 * 2];
+        if format == D3DFMT_YV12 {
+            src.extend_from_slice(&[0xf0, 0xf0, 0x5a, 0x5a]);
+        } else {
+            src.extend_from_slice(&[0x5a, 0xf0, 0x5a, 0xf0]);
+        }
+        let mut dst = [0u8; 8];
+        assert!(convert_region(
+            &mut dst,
+            D3DFMT_L8,
+            &src,
+            format,
+            &whole(4, 2, 4, 4)
+        ));
+        assert_eq!(dst, [54; 8], "{format:#x}");
+    }
+}
+
+#[test]
+fn a_planar_region_outside_the_luma_plane_is_refused() {
+    let (src, pitch) = planar_pattern(D3DFMT_NV12, 6, 4);
+    let mut dst = vec![0u8; 6 * 4 * 8];
+    // Five rows of a four-row surface: the fifth would read the chroma plane
+    // as luma.
+    let mut region = whole(6, 4, pitch, 24);
+    region.height = 5;
+    region.dst_slice_pitch = 24 * 8;
+    assert!(!convert_region(
+        &mut dst,
+        D3DFMT_X8R8G8B8,
+        &src,
+        D3DFMT_NV12,
+        &region
+    ));
+    // A slice that is not a whole number of rows names no luma row count.
+    let mut region = whole(6, 4, pitch, 24);
+    region.src_slice_pitch += 1;
+    assert!(!convert_region(
+        &mut dst,
+        D3DFMT_X8R8G8B8,
+        &src,
+        D3DFMT_NV12,
+        &region
+    ));
+    // A planar level is a single slice.
+    let mut region = whole(6, 4, pitch, 24);
+    region.depth = 2;
+    assert!(!convert_region(
+        &mut dst,
+        D3DFMT_X8R8G8B8,
+        &src,
+        D3DFMT_NV12,
+        &region
+    ));
+    // A source allocation short of its chroma plane.
+    let region = whole(6, 4, pitch, 24);
+    assert!(!convert_region(
+        &mut dst,
+        D3DFMT_X8R8G8B8,
+        &src[..pitch * 4],
+        D3DFMT_NV12,
+        &region
+    ));
 }

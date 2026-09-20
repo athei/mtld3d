@@ -6,10 +6,10 @@ use mtld3d_types::{
     D3DFMT_D15S1, D3DFMT_D16, D3DFMT_D16_LOCKABLE, D3DFMT_D24FS8, D3DFMT_D24S8, D3DFMT_D24X4S4,
     D3DFMT_D24X8, D3DFMT_D32, D3DFMT_D32F_LOCKABLE, D3DFMT_DF16, D3DFMT_DF24, D3DFMT_DXT1,
     D3DFMT_DXT2, D3DFMT_DXT3, D3DFMT_DXT4, D3DFMT_DXT5, D3DFMT_G16R16, D3DFMT_G16R16F,
-    D3DFMT_G32R32F, D3DFMT_INTZ, D3DFMT_L8, D3DFMT_L16, D3DFMT_Q8W8V8U8, D3DFMT_Q16W16V16U16,
-    D3DFMT_R5G6B5, D3DFMT_R8G8B8, D3DFMT_R16F, D3DFMT_R32F, D3DFMT_UYVY, D3DFMT_V8U8,
-    D3DFMT_V16U16, D3DFMT_X1R5G5B5, D3DFMT_X8B8G8R8, D3DFMT_X8R8G8B8, D3DFMT_YUY2,
-    D3DRTYPE_CUBETEXTURE, D3DRTYPE_INDEXBUFFER, D3DRTYPE_SURFACE, D3DRTYPE_TEXTURE,
+    D3DFMT_G32R32F, D3DFMT_INTZ, D3DFMT_L8, D3DFMT_L16, D3DFMT_NV12, D3DFMT_Q8W8V8U8,
+    D3DFMT_Q16W16V16U16, D3DFMT_R5G6B5, D3DFMT_R8G8B8, D3DFMT_R16F, D3DFMT_R32F, D3DFMT_UYVY,
+    D3DFMT_V8U8, D3DFMT_V16U16, D3DFMT_X1R5G5B5, D3DFMT_X8B8G8R8, D3DFMT_X8R8G8B8, D3DFMT_YUY2,
+    D3DFMT_YV12, D3DRTYPE_CUBETEXTURE, D3DRTYPE_INDEXBUFFER, D3DRTYPE_SURFACE, D3DRTYPE_TEXTURE,
     D3DRTYPE_VERTEXBUFFER, D3DRTYPE_VOLUME, D3DRTYPE_VOLUMETEXTURE, D3DUSAGE_AUTOGENMIPMAP,
     D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_DMAP, D3DUSAGE_DONOTCLIP, D3DUSAGE_DYNAMIC, D3DUSAGE_NPATCHES,
     D3DUSAGE_POINTS, D3DUSAGE_QUERY_FILTER, D3DUSAGE_QUERY_LEGACYBUMPMAP,
@@ -168,6 +168,8 @@ pub const fn format_name(d3d_format: u32) -> &'static str {
         D3DFMT_DXT5 => "DXT5",
         D3DFMT_YUY2 => "YUY2",
         D3DFMT_UYVY => "UYVY",
+        D3DFMT_YV12 => "YV12",
+        D3DFMT_NV12 => "NV12",
         D3DFMT_D16_LOCKABLE => "D16_LOCKABLE",
         D3DFMT_D32 => "D32",
         D3DFMT_D15S1 => "D15S1",
@@ -299,6 +301,28 @@ pub const fn uses_noautogen_fallback(d3d_format: u32) -> bool {
         d3d_format,
         D3DFMT_V16U16 | D3DFMT_Q8W8V8U8 | D3DFMT_Q16W16V16U16 | D3DFMT_A2R10G10B10
     )
+}
+
+/// Storage behind a planar 4:2:0 YUV (`YV12` / `NV12`) offscreen plain surface.
+///
+/// One byte per texel with no view swizzle: the locked bytes of every plane go
+/// to the texture verbatim and the `StretchRect` decode reads them through
+/// `.r`. Deliberately not a row of the format lookup. A planar level holds its
+/// chroma rows after its luma rows (`planar_yuv`), so it is taller than its
+/// logical height, and every consumer of a looked-up mapping sizes a level as
+/// pitch times height. Only the default-pool offscreen-plain create, which
+/// sizes the level from the planar layout, takes this mapping.
+#[must_use]
+pub const fn planar_yuv_storage_mapping() -> FormatMapping {
+    FormatMapping {
+        metal_pixel_format: PixelFormat::R8Unorm,
+        bytes_per_pixel: 1,
+        block_width: 1,
+        block_height: 1,
+        block_bytes: 1,
+        swizzle: None,
+        has_alpha: false,
+    }
 }
 
 /// True for colour formats creatable as GPU-backed volume textures.

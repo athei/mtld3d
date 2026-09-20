@@ -10,16 +10,17 @@ use mtld3d_types::{
     D3D_OK, D3DBLEND_INVSRCALPHA, D3DBLEND_SRCALPHA, D3DCLEAR_TARGET, D3DCLEAR_ZBUFFER,
     D3DCMP_ALWAYS, D3DCMP_LESS, D3DCMP_LESSEQUAL, D3DERR_INVALIDCALL, D3DERR_NOTFOUND,
     D3DFMT_A1R5G5B5, D3DFMT_A4R4G4B4, D3DFMT_A8, D3DFMT_A8B8G8R8, D3DFMT_A8R8G8B8,
-    D3DFMT_A16B16G16R16F, D3DFMT_A32B32G32R32F, D3DFMT_D24S8, D3DFMT_INTZ, D3DFMT_L8,
-    D3DFMT_R5G6B5, D3DFMT_UYVY, D3DFMT_X1R5G5B5, D3DFMT_X8R8G8B8, D3DFMT_YUY2, D3DFVF_DIFFUSE,
-    D3DFVF_TEX1, D3DFVF_XYZ, D3DLOCK_DISCARD, D3DLOCK_READONLY, D3DPOOL_DEFAULT, D3DPOOL_MANAGED,
-    D3DPOOL_SCRATCH, D3DPOOL_SYSTEMMEM, D3DPT_TRIANGLELIST, D3DRECT, D3DRS_ALPHABLENDENABLE,
-    D3DRS_DESTBLEND, D3DRS_LIGHTING, D3DRS_SRCBLEND, D3DRS_ZENABLE, D3DRS_ZFUNC,
-    D3DRS_ZWRITEENABLE, D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_MAGFILTER, D3DSAMP_MAXMIPLEVEL,
-    D3DSAMP_MINFILTER, D3DSAMP_MIPFILTER, D3DTA_DIFFUSE, D3DTA_TEXTURE, D3DTADDRESS_CLAMP,
-    D3DTEXF_LINEAR, D3DTEXF_NONE, D3DTEXF_POINT, D3DTOP_MODULATE, D3DTOP_SELECTARG1,
-    D3DTSS_ALPHAARG1, D3DTSS_ALPHAOP, D3DTSS_COLORARG1, D3DTSS_COLORARG2, D3DTSS_COLOROP,
-    D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_RENDERTARGET, D3DVIEWPORT9,
+    D3DFMT_A16B16G16R16F, D3DFMT_A32B32G32R32F, D3DFMT_D24S8, D3DFMT_INTZ, D3DFMT_L8, D3DFMT_NV12,
+    D3DFMT_R5G6B5, D3DFMT_UYVY, D3DFMT_X1R5G5B5, D3DFMT_X8R8G8B8, D3DFMT_YUY2, D3DFMT_YV12,
+    D3DFVF_DIFFUSE, D3DFVF_TEX1, D3DFVF_XYZ, D3DLOCK_DISCARD, D3DLOCK_NOOVERWRITE,
+    D3DLOCK_READONLY, D3DPOOL_DEFAULT, D3DPOOL_MANAGED, D3DPOOL_SCRATCH, D3DPOOL_SYSTEMMEM,
+    D3DPT_TRIANGLELIST, D3DRECT, D3DRS_ALPHABLENDENABLE, D3DRS_DESTBLEND, D3DRS_LIGHTING,
+    D3DRS_SRCBLEND, D3DRS_ZENABLE, D3DRS_ZFUNC, D3DRS_ZWRITEENABLE, D3DSAMP_ADDRESSU,
+    D3DSAMP_ADDRESSV, D3DSAMP_MAGFILTER, D3DSAMP_MAXMIPLEVEL, D3DSAMP_MINFILTER, D3DSAMP_MIPFILTER,
+    D3DTA_DIFFUSE, D3DTA_TEXTURE, D3DTADDRESS_CLAMP, D3DTEXF_LINEAR, D3DTEXF_NONE, D3DTEXF_POINT,
+    D3DTOP_MODULATE, D3DTOP_SELECTARG1, D3DTSS_ALPHAARG1, D3DTSS_ALPHAOP, D3DTSS_COLORARG1,
+    D3DTSS_COLORARG2, D3DTSS_COLOROP, D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_DEPTHSTENCIL,
+    D3DUSAGE_RENDERTARGET, D3DVIEWPORT9,
 };
 
 const RED: u32 = 0xFFFF_0000;
@@ -4007,6 +4008,728 @@ fn stretch_rect_converts_a_sub_rect_into_a_smaller_offscreen_surface() {
     let px = locked.as_u32(2);
     assert_rgb_close(px[0], 0x00ff_ffff, 18, "pixel 0");
     assert_rgb_close(px[1], 0x00ff_ffff, 18, "pixel 1");
+}
+
+/// The two planar 4:2:0 YUV formats, with the names the assertions print.
+const PLANAR_FORMATS: [(u32, &str); 2] = [(D3DFMT_YV12, "YV12"), (D3DFMT_NV12, "NV12")];
+
+/// Byte the planar helpers leave in row padding, which no plane of a test image uses.
+const PLANAR_PADDING: u8 = 0x07;
+
+/// Four `(Y, U, V)` samples with the `0x00RRGGBB` each decodes to.
+///
+/// Pure red, green and blue and a dark green. U and V differ in every one of
+/// them, so a plane exchange (`YV12`) or an interleave exchange (`NV12`) turns
+/// red into blue instead of passing.
+const PLANAR_COLOURS: [((u8, u8, u8), u32); 4] = [
+    ((0x51, 0x5a, 0xf0), 0x00ff_0000),
+    ((0x91, 0x36, 0x22), 0x0000_ff01),
+    ((0x29, 0xf0, 0x6e), 0x0000_00ff),
+    ((0x40, 0x40, 0x40), 0x0000_8400),
+];
+
+/// Index into [`PLANAR_COLOURS`] of chroma block `(cx, cy)` of the four-colour pattern.
+///
+/// Every block differs from its horizontal and its vertical neighbours, so a
+/// chroma sample that covers more or less than its 2x2 luma block shows.
+const fn planar_pattern_index(cx: usize, cy: usize) -> usize {
+    (cx + 2 * cy) % PLANAR_COLOURS.len()
+}
+
+/// The colour the four-colour pattern decodes to at luma texel `(x, y)`.
+const fn planar_pattern_colour(x: usize, y: usize) -> u32 {
+    PLANAR_COLOURS[planar_pattern_index(x / 2, y / 2)].1
+}
+
+/// The locked bytes of a planar surface, every plane laid out from the pitch.
+///
+/// The pitch is the width rounded up to four bytes. `YV12` stores a V plane
+/// then a U plane, each of `ceil(height / 2)` rows striding half the pitch;
+/// `NV12` one plane of that many rows striding the pitch, U then V. `index`
+/// names the [`PLANAR_COLOURS`] entry of a chroma block, and every luma texel
+/// of the block takes the same entry's luma.
+fn planar_bytes(
+    format: u32,
+    (width, height): (usize, usize),
+    index: impl Fn(usize, usize) -> usize,
+) -> Vec<u8> {
+    let pitch = width.next_multiple_of(4);
+    let chroma_rows = height.div_ceil(2);
+    let mut bytes = vec![PLANAR_PADDING; pitch * (height + chroma_rows)];
+    for y in 0..height {
+        for x in 0..width {
+            bytes[y * pitch + x] = PLANAR_COLOURS[index(x / 2, y / 2)].0.0;
+        }
+    }
+    let chroma = pitch * height;
+    for cy in 0..chroma_rows {
+        for cx in 0..width.div_ceil(2) {
+            let (_, u, v) = PLANAR_COLOURS[index(cx, cy)].0;
+            if format == D3DFMT_YV12 {
+                let half = pitch / 2;
+                bytes[chroma + cy * half + cx] = v;
+                bytes[chroma + chroma_rows * half + cy * half + cx] = u;
+            } else {
+                bytes[chroma + cy * pitch + 2 * cx] = u;
+                bytes[chroma + cy * pitch + 2 * cx + 1] = v;
+            }
+        }
+    }
+    bytes
+}
+
+/// Create a `D3DPOOL_DEFAULT` planar plain, check its lock pitch and write `bytes` to it.
+fn planar_surface<'h>(
+    h: &'h Harness,
+    (format, name): (u32, &str),
+    (width, height): (usize, usize),
+    bytes: &[u8],
+) -> Surface<'h> {
+    let surface = h.create_offscreen_plain_surface(
+        u32::try_from(width).expect("test width"),
+        u32::try_from(height).expect("test height"),
+        format,
+        D3DPOOL_DEFAULT,
+    );
+    let mut locked = surface.lock_rect(0);
+    assert_eq!(
+        usize::try_from(locked.pitch()).expect("positive pitch"),
+        width.next_multiple_of(4),
+        "{name} {width}x{height} locks at the width rounded up to four bytes"
+    );
+    locked.write(bytes);
+    drop(locked);
+    surface
+}
+
+/// Read the whole back buffer once: its pixels row by row, and its width.
+fn read_back_buffer(h: &Harness) -> (Vec<u32>, usize) {
+    let rt = h.render_target(0);
+    let (hr, desc) = rt.desc();
+    assert_eq!(hr, D3D_OK, "back buffer desc");
+    let sysmem = h.create_offscreen_plain_surface(
+        desc.width,
+        desc.height,
+        D3DFMT_A8R8G8B8,
+        D3DPOOL_SYSTEMMEM,
+    );
+    assert_eq!(
+        h.get_render_target_data_hr(&rt, &sysmem),
+        D3D_OK,
+        "GetRenderTargetData of the back buffer"
+    );
+    let locked = sysmem.lock_rect(D3DLOCK_READONLY);
+    let pitch_px = usize::try_from(locked.pitch()).expect("positive pitch") / 4;
+    let (width, height) = (desc.width as usize, desc.height as usize);
+    let mut pixels = Vec::with_capacity(width * height);
+    for row in locked.as_u32(pitch_px * height).chunks_exact(pitch_px) {
+        pixels.extend_from_slice(&row[..width]);
+    }
+    (pixels, width)
+}
+
+/// A planar plain locks at the 4-byte-aligned width and keeps every byte of every plane.
+///
+/// The span a lock exposes is the luma rows plus `ceil(height / 2)` rows of
+/// chroma at the same pitch. Writing all of it and reading it back under
+/// `D3DLOCK_READONLY` walks the whole allocation, row padding included, which
+/// is what an allocation sized for the luma plane alone would not survive.
+#[test]
+fn planar_yuv_plain_locks_at_the_aligned_width_and_keeps_every_plane() {
+    let h = Harness::new();
+    for (format, name) in PLANAR_FORMATS {
+        let mut sizes = vec![(20usize, 16usize), (22, 16), (21, 16), (2, 2)];
+        if format == D3DFMT_NV12 {
+            sizes.extend([(20, 15), (5, 3), (1, 1)]);
+        }
+        for (width, height) in sizes {
+            let pitch = width.next_multiple_of(4);
+            let span = pitch * (height + height.div_ceil(2));
+            let bytes: Vec<u8> = (0..span)
+                .map(|i| u8::try_from((i * 7 + 3) % 251).expect("below 251"))
+                .collect();
+            let surface = planar_surface(&h, (format, name), (width, height), &bytes);
+            let (hr, desc) = surface.desc();
+            assert_eq!(hr, D3D_OK, "{name} GetDesc");
+            assert_eq!(
+                (
+                    desc.format,
+                    desc.width as usize,
+                    desc.height as usize,
+                    desc.pool
+                ),
+                (format, width, height, D3DPOOL_DEFAULT),
+                "{name} {width}x{height} reports its logical extent"
+            );
+            for flags in [D3DLOCK_READONLY, D3DLOCK_NOOVERWRITE, 0] {
+                let locked = surface.lock_rect(flags);
+                assert_eq!(
+                    usize::try_from(locked.pitch()).expect("positive pitch"),
+                    pitch,
+                    "{name} {width}x{height} pitch under flags {flags:#x}"
+                );
+                assert_eq!(
+                    locked.as_u8(span),
+                    bytes.as_slice(),
+                    "{name} {width}x{height} planes under flags {flags:#x}"
+                );
+            }
+            // A discarding lock still hands out the whole span.
+            let mut locked = surface.lock_rect(D3DLOCK_DISCARD);
+            locked.write(&bytes);
+            drop(locked);
+            assert_eq!(
+                surface.lock_rect(D3DLOCK_READONLY).as_u8(span),
+                bytes.as_slice(),
+                "{name} {width}x{height} planes after a discarding lock"
+            );
+        }
+    }
+}
+
+/// A planar lock rect aligns to the 2x2 chroma block, and a locked plain refuses a second lock.
+#[test]
+fn planar_yuv_lock_rects_align_to_the_chroma_block() {
+    let h = Harness::new();
+    for (format, name) in PLANAR_FORMATS {
+        let bytes: Vec<u8> = (0..20 * 24)
+            .map(|i| u8::try_from((i * 7 + 3) % 251).expect("below 251"))
+            .collect();
+        let surface = planar_surface(&h, (format, name), (20, 16), &bytes);
+        for rect in [[1, 0, 3, 2], [0, 1, 2, 3], [2, 2, 5, 4], [2, 2, 4, 5]] {
+            assert_eq!(
+                surface.lock_rect_partial_probe(&rect, 0),
+                (D3DERR_INVALIDCALL, false),
+                "{name} rect {rect:?} is off the 2x2 grid and leaves the out struct alone"
+            );
+        }
+        {
+            let locked = surface.lock_rect_partial(&[2, 2, 6, 4], D3DLOCK_READONLY);
+            assert_eq!(locked.pitch(), 20, "{name} aligned rect keeps the pitch");
+            // The rect starts at luma texel (2, 2) of the first plane.
+            assert_eq!(locked.as_u8(1)[0], bytes[2 * 20 + 2], "{name} rect origin");
+            assert_eq!(
+                surface.lock_rect_probe(0),
+                (D3DERR_INVALIDCALL, false),
+                "{name} second lock of a locked plain"
+            );
+        }
+        assert_eq!(
+            surface.lock_rect(D3DLOCK_READONLY).as_u8(bytes.len()),
+            bytes.as_slice(),
+            "{name} planes unchanged by the refused locks"
+        );
+    }
+}
+
+/// A planar source decodes through the render quad with V and U read from their own planes.
+///
+/// Each reference sample fills a 20x16 surface that is stretched over the
+/// whole back buffer. The expected colours are the reduced-range BT.601 values
+/// desktop drivers produce, held within 2: one for the convention and one for
+/// the float decode. Red is asserted by channel as well, since exchanged
+/// chroma reads blue.
+#[test]
+fn stretch_rect_decodes_planar_yuv_into_the_backbuffer() {
+    let h = Harness::new();
+    let bb = h.render_target(0);
+    for (format, name) in PLANAR_FORMATS {
+        for (index, &((y, u, v), expected)) in PLANAR_COLOURS.iter().enumerate() {
+            let bytes = planar_bytes(format, (20, 16), |_, _| index);
+            let surface = planar_surface(&h, (format, name), (20, 16), &bytes);
+            assert_eq!(h.clear_target(MAGENTA), 0, "clear before {name} {index}");
+            assert_eq!(
+                h.stretch_rect(&surface, &bb, D3DTEXF_POINT),
+                D3D_OK,
+                "StretchRect {name} ({y:#x}, {u:#x}, {v:#x}) onto the backbuffer"
+            );
+            let (pixels, width) = read_back_buffer(&h);
+            for (px, py) in [(80, 60), (560, 60), (320, 240), (80, 420), (560, 420)] {
+                assert_rgb_close(
+                    pixels[py * width + px],
+                    expected,
+                    2,
+                    &format!("{name} ({y:#x}, {u:#x}, {v:#x}) at ({px}, {py})"),
+                );
+            }
+            if index == 0 {
+                let centre = pixels[240 * width + 320];
+                assert!(
+                    (centre >> 16) & 0xff > 0xf0 && centre & 0xff < 0x10,
+                    "{name}: red decoded as {centre:#010x}, U and V are exchanged"
+                );
+            }
+        }
+    }
+}
+
+/// A planar source copied 1:1 into an offscreen plain is decoded on the CPU.
+///
+/// Every texel of the destination is read, at three widths: 20, whose pitch is
+/// the width; 22, whose pitch of 24 puts half the pitch (12) one byte past
+/// half the width (11), so a reader addressing `YV12` chroma rows by the
+/// extent shears them; and 21, whose last column is half a chroma block.
+#[test]
+fn stretch_rect_decodes_planar_yuv_into_an_offscreen_plain_surface() {
+    let h = Harness::new();
+    for (format, name) in PLANAR_FORMATS {
+        for (width, height) in [(20usize, 16usize), (22, 16), (21, 16)] {
+            let bytes = planar_bytes(format, (width, height), planar_pattern_index);
+            let src = planar_surface(&h, (format, name), (width, height), &bytes);
+            let dst = h.create_offscreen_plain_surface(
+                u32::try_from(width).expect("test width"),
+                u32::try_from(height).expect("test height"),
+                D3DFMT_X8R8G8B8,
+                D3DPOOL_DEFAULT,
+            );
+            assert_eq!(
+                h.stretch_rect(&src, &dst, D3DTEXF_NONE),
+                D3D_OK,
+                "1:1 {name} {width}x{height} -> X8R8G8B8 into an offscreen plain"
+            );
+            let locked = dst.lock_rect(D3DLOCK_READONLY);
+            let pitch_px = usize::try_from(locked.pitch()).expect("positive pitch") / 4;
+            let px = locked.as_u32(pitch_px * height);
+            for y in 0..height {
+                for x in 0..width {
+                    assert_rgb_close(
+                        px[y * pitch_px + x],
+                        planar_pattern_colour(x, y),
+                        1,
+                        &format!("{name} {width}x{height} at ({x}, {y})"),
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// One chroma sample covers exactly its 2x2 luma block on both `StretchRect` paths.
+///
+/// An 8x8 source carries the four-colour pattern. The CPU path is read texel
+/// by texel. The GPU path is read scaled 16x, at the centre of every source
+/// texel, and agrees with the CPU path within 1. At the identity
+/// `render.scale` it is also read 1:1, texel by texel.
+#[test]
+fn planar_yuv_chroma_covers_its_two_by_two_luma_block() {
+    let h = Harness::new();
+    let bb = h.render_target(0);
+    for (format, name) in PLANAR_FORMATS {
+        let bytes = planar_bytes(format, (8, 8), planar_pattern_index);
+        let src = planar_surface(&h, (format, name), (8, 8), &bytes);
+
+        let cpu = h.create_offscreen_plain_surface(8, 8, D3DFMT_X8R8G8B8, D3DPOOL_DEFAULT);
+        assert_eq!(
+            h.stretch_rect(&src, &cpu, D3DTEXF_NONE),
+            D3D_OK,
+            "{name} 1:1 into an offscreen plain"
+        );
+        let cpu_pixels: Vec<u32> = {
+            let locked = cpu.lock_rect(D3DLOCK_READONLY);
+            assert_eq!(locked.pitch(), 32, "8 texels of 4 bytes");
+            locked.as_u32(64).to_vec()
+        };
+        for (i, &got) in cpu_pixels.iter().enumerate() {
+            let (x, y) = (i % 8, i / 8);
+            assert_rgb_close(
+                got,
+                planar_pattern_colour(x, y),
+                1,
+                &format!("{name} CPU at ({x}, {y})"),
+            );
+        }
+
+        assert_eq!(h.clear_target(MAGENTA), 0, "clear before {name}");
+        assert_eq!(
+            h.stretch_rect_rects(&src, (0, 0, 8, 8), &bb, (0, 0, 128, 128), D3DTEXF_POINT),
+            D3D_OK,
+            "{name} scaled 16x onto the backbuffer"
+        );
+        let (pixels, width) = read_back_buffer(&h);
+        for y in 0..8 {
+            for x in 0..8 {
+                let got = pixels[(16 * y + 8) * width + 16 * x + 8];
+                assert_rgb_close(
+                    got,
+                    planar_pattern_colour(x, y),
+                    2,
+                    &format!("{name} GPU 16x at ({x}, {y})"),
+                );
+                assert_rgb_close(
+                    got,
+                    cpu_pixels[y * 8 + x],
+                    1,
+                    &format!("{name} GPU against CPU at ({x}, {y})"),
+                );
+            }
+        }
+
+        // Single-pixel resolution: only what the identity scale rasterizes.
+        if mtld3d_tests::render_scale_is_identity() {
+            assert_eq!(h.clear_target(MAGENTA), 0, "clear before {name} 1:1");
+            assert_eq!(
+                h.stretch_rect_rects(&src, (0, 0, 8, 8), &bb, (200, 200, 208, 208), D3DTEXF_POINT),
+                D3D_OK,
+                "{name} 1:1 onto the backbuffer"
+            );
+            let (pixels, width) = read_back_buffer(&h);
+            for y in 0..8 {
+                for x in 0..8 {
+                    assert_rgb_close(
+                        pixels[(200 + y) * width + 200 + x],
+                        planar_pattern_colour(x, y),
+                        2,
+                        &format!("{name} GPU 1:1 at ({x}, {y})"),
+                    );
+                }
+            }
+            assert_rgb_close(
+                pixels[199 * width + 199],
+                MAGENTA,
+                0,
+                &format!("{name} GPU 1:1 leaves the texel outside the rect"),
+            );
+        }
+    }
+}
+
+/// Odd widths and an odd `NV12` height decode on the GPU with pitch-relative chroma.
+///
+/// The image is red left of a split and blue right of it, exchanged in the
+/// lower half. A fragment decode that strides `YV12` chroma rows by half the
+/// width instead of half the pitch drifts one block left per row, which the
+/// probes in the leftmost block of the lower rows read as the other colour.
+/// 5x3 has a pitch of 8, below the linear-texture alignment of every GPU, so
+/// its upload takes the padded repack.
+#[test]
+fn stretch_rect_decodes_planar_yuv_of_odd_sizes_on_the_gpu() {
+    let h = Harness::new();
+    let bb = h.render_target(0);
+    let cases = [
+        (PLANAR_FORMATS[0], (22usize, 16usize)),
+        (PLANAR_FORMATS[1], (22, 16)),
+        (PLANAR_FORMATS[0], (21, 16)),
+        (PLANAR_FORMATS[1], (21, 16)),
+        (PLANAR_FORMATS[1], (21, 15)),
+        (PLANAR_FORMATS[1], (5, 3)),
+    ];
+    for ((format, name), (width, height)) in cases {
+        let (blocks_x, blocks_y) = (width.div_ceil(2), height.div_ceil(2));
+        let (split_x, split_y) = (blocks_x / 2, blocks_y.div_ceil(2));
+        // Red is entry 0 and blue entry 2.
+        let index = |cx: usize, cy: usize| {
+            if (cx < split_x) == (cy < split_y) {
+                0
+            } else {
+                2
+            }
+        };
+        let bytes = planar_bytes(format, (width, height), index);
+        let src = planar_surface(&h, (format, name), (width, height), &bytes);
+        assert_eq!(h.clear_target(MAGENTA), 0, "clear before {name}");
+        assert_eq!(
+            h.stretch_rect(&src, &bb, D3DTEXF_POINT),
+            D3D_OK,
+            "{name} {width}x{height} onto the backbuffer"
+        );
+        let (pixels, bb_width) = read_back_buffer(&h);
+        for cy in 0..blocks_y {
+            for cx in [0, split_x] {
+                // The centre of the block's first luma texel, which every
+                // block has whatever the parity of the extent.
+                let px = (4 * cx + 1) * 640 / (2 * width);
+                let py = (4 * cy + 1) * 480 / (2 * height);
+                assert_rgb_close(
+                    pixels[py * bb_width + px],
+                    PLANAR_COLOURS[index(cx, cy)].1,
+                    2,
+                    &format!("{name} {width}x{height} block ({cx}, {cy}) at ({px}, {py})"),
+                );
+            }
+        }
+    }
+}
+
+/// A planar source rect with an odd origin keeps its chroma blocks, and the copy stays in its rect.
+///
+/// The source rect starts at (3, 1), inside a chroma block in both directions.
+/// On the GPU it is scaled into the middle of the back buffer; on the CPU it
+/// is copied 1:1 into the middle of an offscreen plain. Both leave what is
+/// outside the destination rect as it was.
+#[test]
+fn stretch_rect_of_a_planar_yuv_sub_rect_with_an_odd_origin() {
+    const FILLER: u32 = 0xFF12_3456;
+    let h = Harness::new();
+    let bb = h.render_target(0);
+    for (format, name) in PLANAR_FORMATS {
+        let bytes = planar_bytes(format, (8, 8), planar_pattern_index);
+        let src = planar_surface(&h, (format, name), (8, 8), &bytes);
+
+        assert_eq!(h.clear_target(MAGENTA), 0, "clear before {name}");
+        assert_eq!(
+            h.stretch_rect_rects(&src, (3, 1, 7, 5), &bb, (160, 120, 480, 360), D3DTEXF_POINT),
+            D3D_OK,
+            "{name} sub-rect scaled into the middle of the backbuffer"
+        );
+        let (pixels, width) = read_back_buffer(&h);
+        for row in 0..4 {
+            for col in 0..4 {
+                let (px, py) = (160 + 80 * col + 40, 120 + 60 * row + 30);
+                assert_rgb_close(
+                    pixels[py * width + px],
+                    planar_pattern_colour(3 + col, 1 + row),
+                    2,
+                    &format!("{name} GPU source texel ({}, {})", 3 + col, 1 + row),
+                );
+            }
+        }
+        for (px, py) in [(80, 60), (320, 60), (560, 420), (80, 240), (560, 240)] {
+            assert_rgb_close(
+                pixels[py * width + px],
+                MAGENTA,
+                2,
+                &format!("{name} GPU outside the destination rect at ({px}, {py})"),
+            );
+        }
+
+        let dst = h.create_offscreen_plain_surface(8, 8, D3DFMT_X8R8G8B8, D3DPOOL_DEFAULT);
+        {
+            let mut locked = dst.lock_rect(0);
+            locked.write(&[FILLER; 64]);
+        }
+        assert_eq!(
+            h.stretch_rect_rects(&src, (3, 1, 7, 5), &dst, (2, 3, 6, 7), D3DTEXF_NONE),
+            D3D_OK,
+            "{name} sub-rect 1:1 into the middle of an offscreen plain"
+        );
+        let locked = dst.lock_rect(D3DLOCK_READONLY);
+        let px = locked.as_u32(64);
+        for y in 0..8usize {
+            for x in 0..8usize {
+                if (2..6).contains(&x) && (3..7).contains(&y) {
+                    assert_rgb_close(
+                        px[y * 8 + x],
+                        planar_pattern_colour(x + 1, y - 2),
+                        1,
+                        &format!("{name} CPU at ({x}, {y})"),
+                    );
+                } else {
+                    assert_eq!(px[y * 8 + x], FILLER, "{name} CPU outside at ({x}, {y})");
+                }
+            }
+        }
+    }
+}
+
+/// `D3DTEXF_LINEAR` filters planar luma and leaves planar chroma a step.
+///
+/// A 4x2 source scaled over the back buffer puts its two middle luma texel
+/// centres at x = 240 and x = 400, either side of a black-to-white luma edge
+/// at x = 320. LINEAR ramps between the two centres, so the edge reads a grey
+/// and a point a quarter of the way along is already lit; POINT keeps both
+/// sides of the edge pure. A chroma edge at the same place stays a step under
+/// LINEAR: 20 pixels either side of it the hue is still the block's own.
+#[test]
+fn stretch_rect_filters_planar_yuv_luma_and_not_chroma() {
+    let h = Harness::new();
+    let bb = h.render_target(0);
+    for (format, name) in PLANAR_FORMATS {
+        // Luma edge over neutral chroma: (0x10, 0x80, 0x80) is black and
+        // (0xeb, 0x80, 0x80) white.
+        let mut bytes = vec![0x80u8; 4 * 3];
+        for row in 0..2 {
+            bytes[row * 4..row * 4 + 4].copy_from_slice(&[0x10, 0x10, 0xeb, 0xeb]);
+        }
+        let ramp = planar_surface(&h, (format, name), (4, 2), &bytes);
+        for (filter, label) in [(D3DTEXF_LINEAR, "LINEAR"), (D3DTEXF_POINT, "POINT")] {
+            assert_eq!(h.clear_target(MAGENTA), 0, "clear before {name} {label}");
+            assert_eq!(
+                h.stretch_rect(&ramp, &bb, filter),
+                D3D_OK,
+                "{name} luma edge, {label}"
+            );
+            let (pixels, width) = read_back_buffer(&h);
+            let green_at = |px: usize| (pixels[240 * width + px] >> 8) & 0xff;
+            if filter == D3DTEXF_LINEAR {
+                assert!(
+                    (0x40..0xc0).contains(&green_at(320)),
+                    "{name} LINEAR: the luma edge reads {:#x} halfway between the texel centres",
+                    green_at(320)
+                );
+                assert!(
+                    (0x20..0x70).contains(&green_at(280)) && (0x90..0xe0).contains(&green_at(360)),
+                    "{name} LINEAR: the ramp reads {:#x} and {:#x} a quarter in from either centre",
+                    green_at(280),
+                    green_at(360)
+                );
+            } else {
+                // 40 pixels either side of the edge, clear of it at any scale.
+                assert_rgb_close(
+                    pixels[240 * width + 280],
+                    0,
+                    2,
+                    &format!("{name} POINT left"),
+                );
+                assert_rgb_close(
+                    pixels[240 * width + 360],
+                    0x00ff_ffff,
+                    2,
+                    &format!("{name} POINT right"),
+                );
+            }
+            assert_rgb_close(
+                pixels[240 * width + 80],
+                0,
+                2,
+                &format!("{name} {label} black"),
+            );
+            assert_rgb_close(
+                pixels[240 * width + 560],
+                0x00ff_ffff,
+                2,
+                &format!("{name} {label} white"),
+            );
+        }
+
+        // Chroma edge: red left, blue right.
+        let bytes = planar_bytes(format, (4, 2), |cx, _| if cx == 0 { 0 } else { 2 });
+        let edge = planar_surface(&h, (format, name), (4, 2), &bytes);
+        assert_eq!(
+            h.clear_target(MAGENTA),
+            0,
+            "clear before {name} chroma edge"
+        );
+        assert_eq!(
+            h.stretch_rect(&edge, &bb, D3DTEXF_LINEAR),
+            D3D_OK,
+            "{name} chroma edge, LINEAR"
+        );
+        let (pixels, width) = read_back_buffer(&h);
+        // Luma differs across the edge too and is filtered, so only the hue is
+        // held: left of the edge no blue, right of it no red.
+        let left = pixels[240 * width + 170];
+        let right = pixels[240 * width + 470];
+        assert!(
+            (left >> 16) & 0xff > 0xf0 && left & 0xff < 0x10,
+            "{name}: left of the chroma edge reads {left:#010x}"
+        );
+        assert!(
+            right & 0xff > 0xf0 && (right >> 16) & 0xff < 0x10,
+            "{name}: right of the chroma edge reads {right:#010x}"
+        );
+        let near_left = pixels[240 * width + 300];
+        let near_right = pixels[240 * width + 340];
+        assert!(
+            near_left & 0xff < (near_left >> 16) & 0xff,
+            "{name}: 20 pixels left of the chroma edge reads {near_left:#010x}"
+        );
+        assert!(
+            near_right & 0xff > (near_right >> 16) & 0xff,
+            "{name}: 20 pixels right of the chroma edge reads {near_right:#010x}"
+        );
+    }
+}
+
+/// A planar plain is a `StretchRect` source only, and every refused call leaves its target alone.
+///
+/// Refused: a planar destination (from a colour plain, from a render target
+/// and from another planar plain), a scaled copy into an offscreen plain,
+/// `UpdateSurface` into a planar plain, and `GetDC`. `ColorFill` succeeds and
+/// fills nothing, as it does for the packed YUV formats. The planar surface's
+/// planes and the colour destination's texels are compared after each call,
+/// and the source still decodes afterwards.
+#[test]
+fn planar_yuv_plain_refuses_every_write_and_keeps_its_planes() {
+    const FILLER: u32 = 0xFF12_3456;
+    let h = Harness::new();
+    let bb = h.render_target(0);
+    let colour = h.create_offscreen_plain_surface(20, 16, D3DFMT_X8R8G8B8, D3DPOOL_DEFAULT);
+    {
+        let mut locked = colour.lock_rect(0);
+        locked.write(&[FILLER; 20 * 16]);
+    }
+    let sysmem = h.create_offscreen_plain_surface(20, 16, D3DFMT_X8R8G8B8, D3DPOOL_SYSTEMMEM);
+    {
+        let mut locked = sysmem.lock_rect(0);
+        locked.write(&[FILLER; 20 * 16]);
+    }
+    let small = h.create_offscreen_plain_surface(10, 8, D3DFMT_X8R8G8B8, D3DPOOL_DEFAULT);
+    {
+        let mut locked = small.lock_rect(0);
+        locked.write(&[FILLER; 10 * 8]);
+    }
+    for (format, name) in PLANAR_FORMATS {
+        let bytes = planar_bytes(format, (20, 16), |_, _| 0);
+        let planar = planar_surface(&h, (format, name), (20, 16), &bytes);
+        let other = planar_surface(&h, (format, name), (20, 16), &bytes);
+
+        assert_eq!(
+            h.stretch_rect(&colour, &planar, D3DTEXF_NONE),
+            D3DERR_INVALIDCALL,
+            "{name}: a colour plain into a planar plain"
+        );
+        assert_eq!(
+            h.stretch_rect(&bb, &planar, D3DTEXF_NONE),
+            D3DERR_INVALIDCALL,
+            "{name}: a render target into a planar plain"
+        );
+        assert_eq!(
+            h.stretch_rect(&other, &planar, D3DTEXF_NONE),
+            D3DERR_INVALIDCALL,
+            "{name}: a planar plain into a planar plain"
+        );
+        assert_eq!(
+            h.update_surface_hr(&sysmem, &planar),
+            D3DERR_INVALIDCALL,
+            "{name}: UpdateSurface into a planar plain"
+        );
+        assert_eq!(
+            h.color_fill_hr(&planar, RED ^ 0x00ff_ffff),
+            D3D_OK,
+            "{name}: ColorFill succeeds and fills nothing"
+        );
+        let sentinel = core::ptr::dangling_mut::<core::ffi::c_void>();
+        assert_eq!(
+            planar.get_dc(sentinel),
+            (D3DERR_INVALIDCALL, sentinel),
+            "{name}: GetDC is refused and leaves the HDC slot alone"
+        );
+        assert_eq!(
+            planar.lock_rect(D3DLOCK_READONLY).as_u8(bytes.len()),
+            bytes.as_slice(),
+            "{name}: planes unchanged by the refused writes and the fill"
+        );
+
+        assert_eq!(
+            h.stretch_rect(&planar, &small, D3DTEXF_LINEAR),
+            D3DERR_INVALIDCALL,
+            "{name}: a scaled copy into an offscreen plain"
+        );
+        assert_eq!(
+            small.lock_rect(D3DLOCK_READONLY).as_u32(10 * 8),
+            [FILLER; 10 * 8].as_slice(),
+            "{name}: the refused scaled copy left its destination alone"
+        );
+
+        // The source still decodes, to the red it held before the fill.
+        assert_eq!(h.clear_target(MAGENTA), 0, "clear before {name}");
+        assert_eq!(
+            h.stretch_rect(&planar, &bb, D3DTEXF_POINT),
+            D3D_OK,
+            "{name}: decode after the refused calls"
+        );
+        assert_rgb_close(
+            h.read_pixel(320, 240),
+            PLANAR_COLOURS[0].1,
+            2,
+            &format!("{name}: decode after the refused calls"),
+        );
+    }
+    assert_eq!(
+        colour.lock_rect(D3DLOCK_READONLY).as_u32(20 * 16),
+        [FILLER; 20 * 16].as_slice(),
+        "the colour plain was only ever a source"
+    );
 }
 
 #[test]

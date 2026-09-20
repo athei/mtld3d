@@ -243,6 +243,44 @@ fn is_mapped_color_format_tracks_the_lookup() {
 }
 
 #[test]
+fn planar_yuv_stays_out_of_the_generic_mapping() {
+    use mtld3d_types::{D3DFMT_NV12, D3DFMT_YV12};
+
+    // A planar level is half again as tall as its logical height, which no
+    // consumer of a `FormatMapping` sizes for, so neither format may reach one
+    // through the lookup: the texture, cube and volume answers and every
+    // generic create path stay closed.
+    for fmt in [D3DFMT_YV12, D3DFMT_NV12] {
+        assert!(!is_mapped_color_format(fmt), "format {fmt:#x}");
+        assert!(super::lookup_d3d_format(fmt).is_none(), "format {fmt:#x}");
+        assert!(
+            super::map_d3d_format_device(fmt, false).is_none(),
+            "format {fmt:#x}"
+        );
+        assert!(!is_volume_texture_format(fmt), "format {fmt:#x}");
+        assert!(!super::is_render_target_format(fmt), "format {fmt:#x}");
+        assert!(!super::is_depth_format(fmt), "format {fmt:#x}");
+    }
+    assert_eq!(format_name(D3DFMT_YV12), "YV12");
+    assert_eq!(format_name(D3DFMT_NV12), "NV12");
+    // The storage a planar offscreen plain opts into: one byte per texel,
+    // read through `.r` with no swizzled view.
+    let storage = super::planar_yuv_storage_mapping();
+    assert_eq!(storage.metal_pixel_format(), PixelFormat::R8Unorm);
+    assert_eq!(storage.bytes_per_pixel(), 1);
+    assert_eq!(
+        (
+            storage.block_width(),
+            storage.block_height(),
+            storage.block_bytes()
+        ),
+        (1, 1, 1)
+    );
+    assert!(storage.swizzle().is_none());
+    assert!(!storage.has_alpha());
+}
+
+#[test]
 fn volume_texture_formats_are_uncompressed_colour_mappings() {
     for fmt in [
         D3DFMT_A8R8G8B8,

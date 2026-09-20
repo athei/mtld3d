@@ -1042,6 +1042,30 @@ impl Surface<'_> {
         (hr, locked.bits.is_null())
     }
 
+    /// `LockRect` over `rect`. Returns the hr and whether `pBits` came back null.
+    ///
+    /// The rect form of [`Self::lock_rect_probe`], with the same garbage seed:
+    /// for a test that expects the rect to be refused. A successful one leaves
+    /// the surface mapped until [`Self::unlock_rect`].
+    #[must_use]
+    pub fn lock_rect_partial_probe(&self, rect: &[i32; 4], flags: u32) -> (i32, bool) {
+        let mut locked = D3DLOCKED_RECT {
+            pitch: 0,
+            bits: core::ptr::without_provenance_mut(0xdead_beef),
+        };
+        // SAFETY: vtable thunk; `self.ptr` is live, `&mut locked` is writable,
+        // and `rect` is a live four-`i32` RECT for the duration of the call.
+        let hr = unsafe {
+            (self.vtbl().lock_rect)(
+                self.ptr,
+                &raw mut locked,
+                core::ptr::from_ref(rect).cast(),
+                flags,
+            )
+        };
+        (hr, locked.bits.is_null())
+    }
+
     /// `UnlockRect`. Returns the hr.
     #[must_use]
     pub fn unlock_rect(&self) -> i32 {

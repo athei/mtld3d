@@ -53,6 +53,11 @@ use crate::{LOG_TARGET, metal::handle::IntoRetained};
 /// filter. Its `float4` uniform carries the source mip level in `.x` and the
 /// source decode in `.y`: a packed YUV source (`YUY2` / `UYVY`, backed by an
 /// RG8 texture) is fetched per macropixel and converted to RGB, unfiltered.
+/// A planar YUV source (`YV12` / `NV12`) is one R8 texture as wide as the lock
+/// pitch that holds the luma rows and then the chroma planes, so its logical
+/// extent differs from the texture's and rides in `.zw`. Luma goes through the
+/// bound sampler, clamped to the luma plane; chroma is read unfiltered from
+/// the sample the texel's 2x2 block shares.
 const BLIT_MSL: &str = r"
 #include <metal_stdlib>
 using namespace metal;
@@ -90,28 +95,71 @@ fragment float4 mtld3d_blit_ps(
 ) {
     // src_level.x is the source mip level (the sampler's point mip filter
     // makes the explicit level exact); src_level.y is the source decode,
-    // 0 = sample as-is, 1 = YUY2, 2 = UYVY (mtld3d_core BlitDecode).
+    // 0 = sample as-is, 1 = YUY2, 2 = UYVY, 3 = YV12, 4 = NV12. The numbering
+    // is owned by mtld3d_core::stretch_rect::BlitDecode. src_level.zw is the
+    // source's logical extent, which only the planar decodes read.
     uint decode = uint(src_level.y);
     if (decode == 0u) {
         return src.sample(samp, in.texcoord, level(src_level.x));
     }
-    // Packed 4:2:2 YUV backed by an RG8 texture: one texel per pixel, the
-    // even/odd texel pair is one macropixel. YUY2 texels are (Y0,U) (Y1,V),
-    // UYVY texels are (U,Y0) (V,Y1). Luma comes from the pixel's own texel,
-    // chroma from its pair, all fetched unfiltered: a linear sample across
-    // the pair would mix U into V.
-    uint lvl = uint(src_level.x);
-    float2 size = float2(max(src.get_width(lvl), 1u), max(src.get_height(lvl), 1u));
-    uint2 texel = uint2(clamp(in.texcoord * size, float2(0.0), size - 1.0));
-    uint even_x = texel.x & ~1u;
-    uint odd_x = min(even_x + 1u, uint(size.x) - 1u);
-    float2 own = src.read(texel, lvl).rg;
-    float2 even = src.read(uint2(even_x, texel.y), lvl).rg;
-    float2 odd = src.read(uint2(odd_x, texel.y), lvl).rg;
-    bool yuy2 = decode == 1u;
-    float y = yuy2 ? own.r : own.g;
-    float u = yuy2 ? even.g : even.r;
-    float v = yuy2 ? odd.g : odd.r;
+    float y;
+    float u;
+    float v;
+    if (decode == 1u || decode == 2u) {
+        // Packed 4:2:2 YUV backed by an RG8 texture: one texel per pixel, the
+        // even/odd texel pair is one macropixel. YUY2 texels are (Y0,U)
+        // (Y1,V), UYVY texels are (U,Y0) (V,Y1). Luma comes from the pixel's
+        // own texel, chroma from its pair, all fetched unfiltered: a linear
+        // sample across the pair would mix U into V.
+        uint lvl = uint(src_level.x);
+        float2 size = float2(max(src.get_width(lvl), 1u), max(src.get_height(lvl), 1u));
+        uint2 texel = uint2(clamp(in.texcoord * size, float2(0.0), size - 1.0));
+        uint even_x = texel.x & ~1u;
+        uint odd_x = min(even_x + 1u, uint(size.x) - 1u);
+        float2 own = src.read(texel, lvl).rg;
+        float2 even = src.read(uint2(even_x, texel.y), lvl).rg;
+        float2 odd = src.read(uint2(odd_x, texel.y), lvl).rg;
+        bool yuy2 = decode == 1u;
+        y = yuy2 ? own.r : own.g;
+        u = yuy2 ? even.g : even.r;
+        v = yuy2 ? odd.g : odd.r;
+    } else {
+        // Planar 4:2:0 YUV in one single-level R8 texture that holds the
+        // locked bytes verbatim: `logical.y` luma rows, then the chroma
+        // planes, every row as wide as the lock pitch, which is the texture
+        // width. The byte at offset o of the allocation is texel
+        // (o % pitch, o / pitch). The texcoord is normalised to the logical
+        // extent, not to the texture.
+        float2 logical = max(src_level.zw, float2(1.0));
+        float2 p = clamp(in.texcoord * logical, float2(0.5), logical - 0.5);
+        uint pitch = max(src.get_width(), 1u);
+        float storage_rows = float(max(src.get_height(), 1u));
+        // Luma through the bound sampler, so POINT and LINEAR both apply. The
+        // clamp keeps a linear footprint inside the luma plane: out of the row
+        // padding on the right and out of the first chroma row below.
+        y = src.sample(samp, float2(p.x / float(pitch), p.y / storage_rows), level(0.0)).r;
+        // Chroma is the unfiltered sample the texel's 2x2 block shares. The
+        // layout keeps every chroma byte of a well-formed source inside the
+        // texture; the clamps only keep a read defined if the extent in the
+        // uniform ever disagreed with the texture.
+        uint luma_rows = uint(logical.y);
+        uint last_row = max(src.get_height(), 1u) - 1u;
+        uint2 block = uint2(p) >> 1u;
+        if (decode == 3u) {
+            // YV12: a V plane then a U plane, each of ceil(rows / 2) rows that
+            // stride half the pitch.
+            uint half_pitch = pitch / 2u;
+            uint v_offset = block.y * half_pitch + block.x;
+            uint u_offset = ((luma_rows + 1u) / 2u) * half_pitch + v_offset;
+            v = src.read(uint2(v_offset % pitch, min(luma_rows + v_offset / pitch, last_row))).r;
+            u = src.read(uint2(u_offset % pitch, min(luma_rows + u_offset / pitch, last_row))).r;
+        } else {
+            // NV12: one plane of pitch-wide rows, U and V interleaved.
+            uint row = min(luma_rows + block.y, last_row);
+            u = src.read(uint2(min(2u * block.x, pitch - 1u), row)).r;
+            v = src.read(uint2(min(2u * block.x + 1u, pitch - 1u), row)).r;
+        }
+    }
     // Reduced-range Y'CbCr to RGB (BT.601 coefficients, luma scaled from
     // [16, 235], chroma centred on 128); the CPU twin is
     // mtld3d_core::stretch_rect::yuv_to_rgb8, keep them in step.

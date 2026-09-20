@@ -2680,6 +2680,40 @@ impl Harness {
         }
     }
 
+    /// `CreateOffscreenPlainSurface` with the out slot seeded non-null, for the rejection paths.
+    ///
+    /// Returns `(hr, out)`. D3D9 nulls the out pointer of a refused create, and
+    /// a slot that starts null cannot show that, so this one starts at a
+    /// dangling sentinel: a refused create has to hand back null. A create
+    /// that succeeds is released here, and its non-null pointer only says so.
+    #[must_use]
+    pub fn create_offscreen_plain_surface_seeded(
+        &self,
+        width: u32,
+        height: u32,
+        format: u32,
+        pool: u32,
+    ) -> (i32, *mut c_void) {
+        let sentinel = core::ptr::dangling_mut::<c_void>();
+        let mut out = sentinel;
+        // SAFETY: vtable thunk; `&mut out` is writable, null shared-handle allowed.
+        let hr = unsafe {
+            (self.dev_vtbl().create_offscreen_plain_surface)(
+                self.device,
+                width,
+                height,
+                format,
+                pool,
+                &raw mut out,
+                core::ptr::null_mut(),
+            )
+        };
+        if hr == 0 && !out.is_null() && out != sentinel {
+            drop(Surface::from_raw(out));
+        }
+        (hr, out)
+    }
+
     /// `CreateOffscreenPlainSurface`, asserting success and returning the surface.
     ///
     /// Use [`Self::create_offscreen_plain_surface_hr`] to test the rejection

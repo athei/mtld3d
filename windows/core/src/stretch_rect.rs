@@ -1,9 +1,14 @@
 //! Rect parsing + validation for `IDirect3DDevice9::StretchRect`.
 //!
 //! The actual blit dispatch lives in `windows/d3d9` (it needs a Metal
-//! handle); only the pure host-testable parts live here.
+//! handle); only the pure host-testable parts live here: the rect clamp, the
+//! routes a same-texture pair and a planar YUV endpoint take, the source
+//! decode selector, and the CPU twins of the YUV decodes the blit fragment
+//! function runs.
 
-use mtld3d_types::{D3DFMT_UYVY, D3DFMT_YUY2};
+use mtld3d_types::{D3DFMT_NV12, D3DFMT_UYVY, D3DFMT_YUY2, D3DFMT_YV12};
+
+use crate::{pixel_convert::can_convert, planar_yuv::planar_yuv_layout_from_pitch};
 
 /// Parsed source / destination region for a `StretchRect`.
 ///
@@ -76,6 +81,8 @@ pub enum RejectReason {
     UnsupportedSource,
     /// Destination surface has no Metal backing.
     UnsupportedDestination,
+    /// Destination is a planar YUV surface, which nothing encodes into.
+    PlanarDestination,
 }
 
 impl RejectReason {
@@ -95,6 +102,7 @@ impl RejectReason {
             Self::Scaling => "src and dst dimensions differ (no scaling)",
             Self::UnsupportedSource => "source surface has no Metal backing",
             Self::UnsupportedDestination => "destination surface has no Metal backing",
+            Self::PlanarDestination => "destination is a planar YUV surface (decode only)",
         }
     }
 }
@@ -147,13 +155,63 @@ pub const fn same_surface_route(
     }
 }
 
+/// How a `StretchRect` with a planar YUV endpoint is carried out.
+///
+/// A planar surface is a decode source only. Nothing encodes into one, the
+/// render quad decodes it into a render target at any size, and the CPU
+/// converter decodes it 1:1 into an offscreen plain, which cannot be rendered
+/// into.
+#[derive(Debug, PartialEq, Eq)]
+pub enum PlanarStretch {
+    /// Neither endpoint is planar: the ordinary format rules decide.
+    NotPlanar,
+    /// Planar source into a render target: the render quad decodes while sampling.
+    RenderQuad,
+    /// Planar source copied 1:1 into an offscreen plain: the CPU converter decodes.
+    CpuConvert,
+    /// No path carries the pair out.
+    Reject(RejectReason),
+}
+
+/// Route a `StretchRect` by its planar YUV endpoints, if it has any.
+///
+/// `dst_is_render_target` separates the two destination classes `StretchRect`
+/// accepts, the other being a default-pool offscreen plain; `scaling` is
+/// whether the two rects differ in size.
+#[must_use]
+pub const fn planar_stretch_route(
+    src_format: u32,
+    dst_format: u32,
+    dst_is_render_target: bool,
+    scaling: bool,
+) -> PlanarStretch {
+    if is_planar_yuv(dst_format) {
+        return PlanarStretch::Reject(RejectReason::PlanarDestination);
+    }
+    if !is_planar_yuv(src_format) {
+        return PlanarStretch::NotPlanar;
+    }
+    if dst_is_render_target {
+        return PlanarStretch::RenderQuad;
+    }
+    if scaling {
+        return PlanarStretch::Reject(RejectReason::Scaling);
+    }
+    if can_convert(src_format, dst_format) {
+        PlanarStretch::CpuConvert
+    } else {
+        PlanarStretch::Reject(RejectReason::FormatMismatch)
+    }
+}
+
 /// Source-side decode the `StretchRect` render quad applies while sampling.
 ///
 /// Reaches the blit fragment function as a uniform (`src_level.y`), so the one
 /// pipeline per destination format serves every source format: mode 0 samples
-/// the source as-is, the YUV modes fetch the 4:2:2 macropixel and convert it
-/// to RGB. The discriminants are the uniform's values; the MSL in
-/// `unix/unix/src/metal/blit.rs` matches on them.
+/// the source as-is, the packed modes fetch the 4:2:2 macropixel and the
+/// planar modes the luma texel and its 4:2:0 chroma sample, and all four YUV
+/// modes convert to RGB. The discriminants are the uniform's values; the MSL
+/// in `unix/unix/src/metal/blit.rs` matches on them.
 #[repr(u32)]
 pub enum BlitDecode {
     /// Sample the source texture as-is (any RGB format).
@@ -162,6 +220,10 @@ pub enum BlitDecode {
     Yuy2 = 1,
     /// `D3DFMT_UYVY`: macropixel bytes `U Y0 V Y1`, backed by an RG8 texture.
     Uyvy = 2,
+    /// `D3DFMT_YV12`: luma rows, a V plane, a U plane, backed by one R8 texture.
+    Yv12 = 3,
+    /// `D3DFMT_NV12`: luma rows, one interleaved U, V plane, backed by one R8 texture.
+    Nv12 = 4,
 }
 
 impl BlitDecode {
@@ -172,6 +234,8 @@ impl BlitDecode {
             Self::None => 0.0,
             Self::Yuy2 => 1.0,
             Self::Uyvy => 2.0,
+            Self::Yv12 => 3.0,
+            Self::Nv12 => 4.0,
         }
     }
 }
@@ -182,6 +246,8 @@ pub const fn blit_decode(d3d_format: u32) -> BlitDecode {
     match d3d_format {
         D3DFMT_YUY2 => BlitDecode::Yuy2,
         D3DFMT_UYVY => BlitDecode::Uyvy,
+        D3DFMT_YV12 => BlitDecode::Yv12,
+        D3DFMT_NV12 => BlitDecode::Nv12,
         _ => BlitDecode::None,
     }
 }
@@ -190,6 +256,12 @@ pub const fn blit_decode(d3d_format: u32) -> BlitDecode {
 #[must_use]
 pub const fn is_packed_yuv(d3d_format: u32) -> bool {
     matches!(d3d_format, D3DFMT_YUY2 | D3DFMT_UYVY)
+}
+
+/// Whether `d3d_format` is one of the two planar 4:2:0 YUV formats.
+#[must_use]
+pub const fn is_planar_yuv(d3d_format: u32) -> bool {
+    matches!(d3d_format, D3DFMT_YV12 | D3DFMT_NV12)
 }
 
 /// Convert one reduced-range `Y'CbCr` sample to 8-bit RGB.
@@ -234,6 +306,39 @@ pub fn decode_packed_yuv(d3d_format: u32, macropixel: [u8; 4], odd: bool) -> Opt
         _ => return None,
     };
     Some(yuv_to_rgb8(y, u, v))
+}
+
+/// Decode texel `(x, y)` of a locked planar 4:2:0 surface (`YV12` / `NV12`).
+///
+/// `src` is the whole allocation, `pitch` its lock pitch and `luma_rows` its
+/// height. The texel's luma is its own byte; its chroma is the sample its 2x2
+/// block shares, taken unfiltered. `None` for a format that is not planar
+/// YUV, for a layout `planar_yuv` rejects, for a texel outside the luma plane,
+/// and for an allocation too short to hold the bytes the texel names.
+#[must_use]
+pub fn decode_planar_yuv(
+    d3d_format: u32,
+    src: &[u8],
+    pitch: usize,
+    luma_rows: usize,
+    x: usize,
+    y: usize,
+) -> Option<(u8, u8, u8)> {
+    let layout = planar_yuv_layout_from_pitch(d3d_format, pitch, luma_rows)?;
+    if !layout.contains(x, y) {
+        return None;
+    }
+    let luma = *src.get(layout.luma_offset(x, y))?;
+    let (cb, cr) = if d3d_format == D3DFMT_YV12 {
+        (
+            *src.get(layout.yv12_u_offset(x, y))?,
+            *src.get(layout.yv12_v_offset(x, y))?,
+        )
+    } else {
+        let pair = layout.nv12_uv_offset(x, y);
+        (*src.get(pair)?, *src.get(pair + 1)?)
+    };
+    Some(yuv_to_rgb8(luma, cb, cr))
 }
 
 /// Whether two half-open regions of one mip level share a texel.
