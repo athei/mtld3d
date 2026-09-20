@@ -4031,6 +4031,13 @@ extern "system" fn texture_unlock_rect(this: *mut c_void, level: u32) -> i32 {
     if no_dirty && ti.flags.contains(TextureFlags::DEPTH_FORMAT) {
         return D3D_OK;
     }
+    // Managed staging can be newer than its sampled image. An unannounced
+    // write leaves existing publication regions intact, but adds none. The
+    // first upload still publishes the initially dirty mip.
+    let managed_no_dirty = no_dirty && ti.d3d_pool == D3DPOOL_MANAGED;
+    if managed_no_dirty && ti.was_uploaded[level_u] {
+        return D3D_OK;
+    }
     // Lazy upload: flag the mip dirty and return. Bind-time
     // `flush_dirty_mips` dispatches the actual upload via
     // `schedule_upload` — Unlock is now a single byte write, the
@@ -4038,7 +4045,7 @@ extern "system" fn texture_unlock_rect(this: *mut c_void, level: u32) -> i32 {
     // Lock publishes the rect it named and nothing more; the initial upload a
     // READONLY first lock triggers carries the whole mip.
     match lock_rect {
-        Some(rect) if !read_only => ti.mark_written_region(level_u, rect),
+        Some(rect) if !read_only && !managed_no_dirty => ti.mark_written_region(level_u, rect),
         _ => ti.mark_mip_dirty(level_u),
     }
     let texture_id = ti.texture_id;
@@ -4122,11 +4129,32 @@ extern "system" fn texture_add_dirty_rect(this: *mut c_void, rect: *const c_void
             .perf_mut()
             .bump_texture_add_dirty_rect(partial, area_bp);
     }
-    // Mark the source dirty region so a subsequent UpdateTexture re-copies it
-    // (partial-rectangle tracking). This does NOT
-    // schedule a GPU upload — UpdateTexture reads the CPU staging directly, and
-    // an upload from un-Lock-written staging would clobber GPU-resident content.
+    // Source dirtiness and managed GPU publication are separate consumers.
+    // Other pools keep their existing metadata-only AddDirtyRect behavior.
     ti.mark_update_dirty(0, dirty);
+    if ti.d3d_pool == D3DPOOL_MANAGED {
+        let mut mip_rect = dirty;
+        for level in 0..ti.app_level_count() as usize {
+            if let Some(rect) = mip_rect {
+                if let Some(region) = rect.clip_to_level(
+                    ti.mip_width(level),
+                    ti.mip_height(level),
+                    ti.block_w,
+                    ti.block_h,
+                ) {
+                    ti.mark_written_region(level, region);
+                }
+                mip_rect = Some(rect.next_mip());
+            } else {
+                ti.mark_mip_dirty(level);
+            }
+        }
+        if di != 0 {
+            // SAFETY: the texture owns a reference to this attached device;
+            // the entry point holds its API lock.
+            unsafe { &mut *(di as *mut DeviceInner) }.mark_snapshot_dirty_all();
+        }
+    }
     0 // S_OK
 }
 
@@ -5007,9 +5035,8 @@ extern "system" fn volume_add_dirty_box(this: *mut c_void, _box: *const c_void) 
     let Some(mut obj) = (unsafe { InPtrMut::<Direct3DTexture9>::opt(this) }) else {
         return D3DERR_INVALIDCALL;
     };
-    // Same contract as `texture_add_dirty_rect`: a hint that the CPU bytes
-    // changed, consumed by the next UpdateTexture from this volume. It never
-    // schedules a GPU upload (the staging may not carry Lock-written bytes).
+    // Volume dirty boxes update source metadata for the next UpdateTexture.
+    // They do not schedule GPU uploads; staging may not carry Lock-written bytes.
     // Volumes track the whole level, so the box itself is not recorded.
     obj.inner_mut().mark_update_dirty(0, None);
     D3D_OK

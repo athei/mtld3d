@@ -314,6 +314,24 @@ that readback and versions any destination still named by pending work.
 Both architectures and all local variants pass device.c:13838. Hosted Mac2
 recordings also pass on both architectures; its obsolete pins are removed.
 
+## Managed 2D dirty publication coverage
+
+Managed 2D textures retain their sampled image after a NO_DIRTY_UPDATE lock
+(19210/19217) until an explicit publication. AddDirtyRect publishes its region
+across the application mip levels (19232), using the existing partial-upload
+path. Initial contents and eviction still publish the CPU image. READONLY
+adds no publication after initialization.
+
+The earlier eager-publication rationale no longer applies to this path.
+Separate policies remain: mip staging is independently allocated, dirty
+rectangles union to one bounding box per mip, and overlapping partial locks
+may modify bytes an earlier queued upload still reads. This change neither
+adds exact disjoint-region tracking nor changes that partial-lock policy.
+
+Sites 19210, 19217 and 19232 pass on both architectures in the local normal,
+Intel and scale variants and in both hosted Mac2 recordings. Their obsolete
+baseline pins are removed.
+
 ## What the baseline records — and where classes live
 
 Each datum has exactly one authoritative home, split by who writes it:
@@ -1016,16 +1034,6 @@ byte (20702, 20751), and the autogen X8R8G8B8 chain its padding byte as
 alpha (6034). A device limitation with no D3D9-side answer, so `expected`;
 none of these fire on the Apple family, and a real Intel/AMD Mac is expected
 to read zero here.
-
-### visual.c/add_dirty_rect_test
-Sites: 19210=expected 19217=expected 19232=expected
-
-The surviving sites require STALE data to be shown: a NO_DIRTY_UPDATE lock
-must NOT be uploaded (19210/19217), and after AddDirtyRect only the dirty
-sub-rect may refresh (19232). Our design uploads whole mips eagerly with
-self-tracked dirtiness and treats AddDirtyRect as a no-op — we show fresher
-data than required. Deliberate; the READONLY-first-lock upload defect that
-used to live here (19156/19163) is fixed.
 
 ### visual.c/test_multisample_get_front_buffer_data
 Sites: 17167=expected 17169=expected 17179=expected 17181=expected

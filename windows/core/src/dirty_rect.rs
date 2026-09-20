@@ -18,6 +18,23 @@ impl DirtyRect {
         Self { x: 0, y: 0, w, h }
     }
 
+    /// Scale to the next mip, rounding both edges outward.
+    ///
+    /// The caller clips to the next level's extent and format block grid.
+    #[must_use]
+    pub const fn next_mip(self) -> Self {
+        let x = self.x / 2;
+        let y = self.y / 2;
+        let right = self.x.saturating_add(self.w).div_ceil(2);
+        let bottom = self.y.saturating_add(self.h).div_ceil(2);
+        Self {
+            x,
+            y,
+            w: right - x,
+            h: bottom - y,
+        }
+    }
+
     /// The bounding box of `self` and `other`.
     ///
     /// The upload and source-dirty trackers keep one rect per level, so two
