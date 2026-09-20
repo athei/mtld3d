@@ -1376,11 +1376,14 @@ do not establish signed pixel correctness. Dedicated end-to-end tests pin
 all four signed16 lanes, alpha, eight-byte transport and float32 sampling
 precision. This feature does not claim a Wine positive-pixel skip reduction.
 
-ColorFill on DEFAULT offscreen V8U8, V16U16, Q8W8V8U8 and Q16W16V16U16
-surfaces encodes each normalized D3DCOLOR channel as its nearest nonnegative
-signed-format value. Dedicated tests pin exact full/partial bytes, exterior
-texel preservation and scheduled GPU-upload visibility. This codec coverage
-does not claim an upstream conformance skip reduction.
+ColorFill of a DEFAULT offscreen plain surface in V8U8, V16U16, Q8W8V8U8 or
+Q16W16V16U16 writes each D3DCOLOR channel as the nearest nonnegative signed
+code, R, G, B, A into U, V, W, Q, which is the value a clear of the matching
+signed-normalized attachment to the colour's [0, 1] floats stores. The format
+table of visual.c/color_fill_test has no signed row and no other upstream test
+fills a signed surface, so no site moves. Dedicated end-to-end tests pin the
+whole and sub-rect bytes, the texels around a sub-rect, the rejected CPU-pool
+and texture-level destinations, and the upload the GPU samples.
 
 ### device.c/test_getdc, A2R10G10B10
 

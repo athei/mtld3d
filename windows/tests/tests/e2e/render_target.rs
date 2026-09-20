@@ -6271,52 +6271,15 @@ fn front_buffer_readback_held_swapchain_tracks_reset_and_msaa() {
     }
 }
 
-fn signed_colorfill_zero_replaces_sentinel(format: u32, bytes_per_pixel: usize) {
-    let h = Harness::new();
-    let surface = h.create_offscreen_plain_surface(4, 3, format, D3DPOOL_DEFAULT);
-    {
-        let mut locked = surface.lock_rect(0);
-        let count = usize::try_from(locked.pitch()).unwrap() / 4 * 3;
-        locked.write_u32(&vec![0x5a5a_a5a5; count]);
-    }
-    assert_eq!(h.color_fill_hr(&surface, 0), D3D_OK);
-    let locked = surface.lock_rect(D3DLOCK_READONLY);
-    let stride = usize::try_from(locked.pitch()).unwrap() / 4;
-    let words = locked.as_u32(stride * 3);
-    for row in 0..3 {
-        assert_eq!(
-            &words[row * stride..row * stride + bytes_per_pixel],
-            vec![0; bytes_per_pixel],
-            "format {format}, row {row}: successful zero ColorFill must replace sentinel bytes"
-        );
-    }
-}
-
+/// `ColorFill` of a signed DEFAULT offscreen plain writes the nearest nonnegative codes.
+///
+/// Each row is a colour with the R, G, B, A codes it lands on at eight and at
+/// sixteen bits, stored as U, V, W, Q. The whole-surface fill replaces every
+/// seeded byte and the sub-rect fill leaves the seed around it.
 #[test]
-fn signed_colorfill_zero_v8u8() {
-    signed_colorfill_zero_replaces_sentinel(mtld3d_types::D3DFMT_V8U8, 2);
-}
-
-#[test]
-fn signed_colorfill_zero_v16u16() {
-    signed_colorfill_zero_replaces_sentinel(mtld3d_types::D3DFMT_V16U16, 4);
-}
-
-#[test]
-fn signed_colorfill_zero_q8w8v8u8() {
-    signed_colorfill_zero_replaces_sentinel(mtld3d_types::D3DFMT_Q8W8V8U8, 4);
-}
-
-#[test]
-fn signed_colorfill_zero_q16w16v16u16() {
-    signed_colorfill_zero_replaces_sentinel(mtld3d_types::D3DFMT_Q16W16V16U16, 8);
-}
-
-#[test]
-fn signed_colorfill_full_partial_bytes_match_reference() {
+fn signed_colorfill_writes_nearest_codes_whole_and_partial() {
     use mtld3d_types::{D3DFMT_Q8W8V8U8, D3DFMT_Q16W16V16U16, D3DFMT_V8U8, D3DFMT_V16U16};
     let h = Harness::new();
-    // Measured RGBA bytes/words, shared only by the component width.
     let cases = [
         (0x0000_0000u32, [0, 0, 0, 0], [0, 0, 0, 0]),
         (
@@ -6409,6 +6372,67 @@ fn signed_colorfill_full_partial_bytes_match_reference() {
     }
 }
 
+/// `ColorFill` rejects a signed surface outside DEFAULT offscreen plain and writes nothing.
+#[test]
+fn signed_colorfill_rejects_other_surfaces_without_writing() {
+    use mtld3d_types::{D3DFMT_Q8W8V8U8, D3DFMT_Q16W16V16U16, D3DFMT_V8U8, D3DFMT_V16U16};
+    let h = Harness::new();
+    for format in [
+        D3DFMT_V8U8,
+        D3DFMT_V16U16,
+        D3DFMT_Q8W8V8U8,
+        D3DFMT_Q16W16V16U16,
+    ] {
+        for pool in [D3DPOOL_SYSTEMMEM, D3DPOOL_SCRATCH] {
+            let surface = h.create_offscreen_plain_surface(4, 3, format, pool);
+            let len = {
+                let mut locked = surface.lock_rect(0);
+                let len = usize::try_from(locked.pitch()).unwrap() * 3;
+                locked.write(&vec![0xa5u8; len]);
+                len
+            };
+            for hr in [
+                h.color_fill_hr(&surface, 0xdead_beef),
+                h.color_fill_rect_hr(&surface, (1, 1, 3, 2), 0xdead_beef),
+            ] {
+                assert_eq!(hr, D3DERR_INVALIDCALL, "format {format}, pool {pool}");
+            }
+            assert_eq!(
+                surface.lock_rect(D3DLOCK_READONLY).as_u8(len),
+                vec![0xa5u8; len],
+                "format {format}, pool {pool}: a rejected fill wrote"
+            );
+        }
+        let texture = h.create_texture(4, 4, 1, 0, format, D3DPOOL_MANAGED);
+        let len = {
+            let mut locked = texture.lock_rect(0, 0);
+            let len = usize::try_from(locked.pitch()).unwrap() * 4;
+            locked.write(&vec![0xa5u8; len]);
+            len
+        };
+        assert_eq!(
+            h.color_fill_hr(&texture.surface_level(0), 0xdead_beef),
+            D3DERR_INVALIDCALL,
+            "format {format}, MANAGED texture level"
+        );
+        assert_eq!(
+            texture.lock_rect(0, D3DLOCK_READONLY).as_u8(len),
+            vec![0xa5u8; len],
+            "format {format}: a rejected fill wrote the MANAGED level"
+        );
+        let texture = h.create_texture(4, 4, 1, 0, format, D3DPOOL_DEFAULT);
+        assert_eq!(
+            h.color_fill_hr(&texture.surface_level(0), 0xdead_beef),
+            D3DERR_INVALIDCALL,
+            "format {format}, DEFAULT texture level"
+        );
+    }
+}
+
+/// A signed `ColorFill` reaches the Metal texture, whole and as a sub-rect over it.
+///
+/// The filled surface is copied into an A8R8G8B8 render target, which samples
+/// it, and the target is read back before the source is locked again.
 #[test]
 fn signed_colorfill_upload_reaches_gpu_sampling() {
     use mtld3d_types::{D3DFMT_Q8W8V8U8, D3DFMT_Q16W16V16U16, D3DFMT_V8U8, D3DFMT_V16U16};
@@ -6435,8 +6459,6 @@ fn signed_colorfill_upload_reaches_gpu_sampling() {
                 h.color_fill_hr(&source, 0x8040_c0ff)
             };
             assert_eq!(hr, D3D_OK);
-            // The existing cross-format render-quad samples the signed source.
-            // Read the GPU result before locking the source again.
             assert_eq!(h.stretch_rect(&source, &target, D3DTEXF_NONE), D3D_OK);
             assert_eq!(h.get_render_target_data_hr(&target, &readback), D3D_OK);
             let locked = readback.lock_rect(D3DLOCK_READONLY);
@@ -6450,8 +6472,8 @@ fn signed_colorfill_upload_reaches_gpu_sampling() {
                         0x8040_c0ff
                     };
                     for shift in [0, 8, 16, 24] {
-                        // This witness observes stored components. Missing
-                        // V8/V16 channels have separate sampling regressions.
+                        // Only a stored lane carries the fill: the two-lane
+                        // formats are probed on red and green alone.
                         if matches!(format, D3DFMT_V8U8 | D3DFMT_V16U16) && !matches!(shift, 8 | 16)
                         {
                             continue;

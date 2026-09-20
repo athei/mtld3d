@@ -1149,8 +1149,10 @@ fn colorfill_a2r10g10b10_uses_nearest_normalized_channels() {
 }
 
 #[test]
-fn color_fill_signed_formats_match_measured_bytes() {
-    // Measured raw little-endian bytes for independent color channels.
+fn colorfill_signed_formats_store_r_g_b_a_as_u_v_w_q() {
+    // 0xdeadbeef has four distinct channels, so an exchanged lane changes the
+    // bytes: R 0xad, G 0xbe, B 0xef, A 0xde land on 0x56, 0x5f, 0x77, 0x6f of
+    // 0x7f and on 0x56d6, 0x5f5f, 0x77f7, 0x6f6f of 0x7fff.
     for (format, expected) in [
         (D3DFMT_V8U8, vec![0x56, 0x5f]),
         (D3DFMT_Q8W8V8U8, vec![0x56, 0x5f, 0x77, 0x6f]),
@@ -1168,29 +1170,59 @@ fn color_fill_signed_formats_match_measured_bytes() {
 }
 
 #[test]
-fn color_fill_signed_channels_quantize_all_input_bytes() {
+fn colorfill_signed_formats_never_set_the_sign_bit() {
+    // A channel at or above 0x80 is still a value in [0, 1]: the endpoints
+    // are zero and the largest positive code, never a negative one.
+    for (color, narrow, wide) in [
+        (0x0000_0000, [0x00; 4], [0x0000; 4]),
+        (0xffff_ffff, [0x7f; 4], [0x7fff; 4]),
+        (0x8080_8080, [0x40; 4], [0x4040; 4]),
+        (0x00ff_0000, [0x7f, 0, 0, 0], [0x7fff, 0, 0, 0]),
+        (0x0000_ff00, [0, 0x7f, 0, 0], [0, 0x7fff, 0, 0]),
+        (0x0000_00ff, [0, 0, 0x7f, 0], [0, 0, 0x7fff, 0]),
+        (0xff00_0000, [0, 0, 0, 0x7f], [0, 0, 0, 0x7fff]),
+    ] {
+        let wide: Vec<u8> = wide.iter().flat_map(|w: &u16| w.to_le_bytes()).collect();
+        for (format, expected) in [
+            (D3DFMT_V8U8, &narrow[..2]),
+            (D3DFMT_Q8W8V8U8, &narrow[..]),
+            (D3DFMT_V16U16, &wide[..4]),
+            (D3DFMT_Q16W16V16U16, &wide[..]),
+        ] {
+            assert_eq!(
+                d3dcolor_fill_pixel_bytes(color, format).as_deref(),
+                Some(expected),
+                "format {format}, colour {color:#010x}"
+            );
+        }
+    }
+}
+
+#[test]
+fn colorfill_signed_channels_are_the_nearest_code_for_every_byte() {
     for channel in 0..=255u8 {
-        let color = u32::from_le_bytes([channel, 255 - channel, channel, 255 - channel]);
-        let values = [channel, 255 - channel, channel, 255 - channel];
-        for (format, bits, count) in [
-            (D3DFMT_V8U8, 8, 2),
-            (D3DFMT_Q8W8V8U8, 8, 4),
-            (D3DFMT_V16U16, 16, 2),
-            (D3DFMT_Q16W16V16U16, 16, 4),
+        let values = [channel, 255 - channel, channel ^ 0x55, channel ^ 0xaa];
+        let [r, g, b, a] = values;
+        let color = u32::from_le_bytes([b, g, r, a]);
+        for (format, maximum, count) in [
+            (D3DFMT_V8U8, 127.0, 2),
+            (D3DFMT_Q8W8V8U8, 127.0, 4),
+            (D3DFMT_V16U16, 32767.0, 2),
+            (D3DFMT_Q16W16V16U16, 32767.0, 4),
         ] {
             let bytes = d3dcolor_fill_pixel_bytes(color, format).unwrap();
-            let encoded: Vec<_> = if bits == 8 {
+            let encoded: Vec<u16> = if bytes.len() == count {
                 bytes.iter().map(|&v| u16::from(v)).collect()
             } else {
                 u16_indices(&bytes)
             };
             assert_eq!(encoded.len(), count);
-            let maximum = if bits == 8 { 127.0 } else { 32767.0 };
             for (&actual, &input) in encoded.iter().zip(&values) {
                 let expected = (f64::from(input) / 255.0 * maximum).round();
-                assert!(
-                    (f64::from(actual) - expected).abs() < 0.5,
-                    "format {format}, input {input}: {actual} != {expected}"
+                assert_eq!(
+                    f64::from(actual).to_bits(),
+                    expected.to_bits(),
+                    "format {format}, input {input}"
                 );
             }
         }
