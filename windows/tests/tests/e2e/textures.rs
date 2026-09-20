@@ -989,6 +989,62 @@ fn managed_dxt_cube_keeps_faces_independent() {
     }
 }
 
+/// A DXT cube uploads one block row per one-block face level and samples each level.
+///
+/// A 4x4 face is a single block whose row pitch sits under the linear texture
+/// alignment on either GPU family for DXT1, so every level takes the padded
+/// copy. That copy reads whole rows and is declined when the rows asked for run
+/// past the level's staging, which four texel rows of a one-block level would.
+#[test]
+fn managed_dxt_cube_samples_every_level() {
+    const RED: u16 = 0xF800;
+    const GREEN: u16 = 0x07E0;
+    const BLUE: u16 = 0x001F;
+    const WHITE: u16 = 0xFFFF;
+    const fn argb(color565: u16) -> u32 {
+        match color565 {
+            RED => 0xFFFF_0000,
+            GREEN => 0xFF00_FF00,
+            BLUE => 0xFF00_00FF,
+            _ => 0xFFFF_FFFF,
+        }
+    }
+    let h = Harness::new();
+    // Positive-X and negative-X colours per level; no two neighbours in face
+    // or level share one, so an exchanged face or level reads differently.
+    let faces = [[RED, GREEN], [BLUE, WHITE], [GREEN, RED]];
+    for format in [D3DFMT_DXT1, D3DFMT_DXT5] {
+        let cube = h.create_cube_texture_owned(4, 0, 0, format, D3DPOOL_MANAGED);
+        assert_eq!(cube.level_count(), 3, "format {format:#x}");
+        for (level, colors) in (0u32..).zip(faces) {
+            for (face, color) in (0u32..).zip(colors) {
+                let mut block = if format == D3DFMT_DXT5 {
+                    // Two equal opaque alpha endpoints, every alpha index 0.
+                    vec![0xFF, 0xFF, 0, 0, 0, 0, 0, 0]
+                } else {
+                    Vec::new()
+                };
+                block.extend_from_slice(&dxt1_solid_block(color));
+                cube.lock_rect(face, level, 0).write(block.as_slice());
+            }
+        }
+        assert_eq!(h.set_sampler_state(0, D3DSAMP_MIPFILTER, D3DTEXF_POINT), 0);
+        for (level, colors) in (0u32..).zip(faces) {
+            assert_eq!(h.set_sampler_state(0, D3DSAMP_MAXMIPLEVEL, level), 0);
+            for (direction_x, color) in [1.0, -1.0].into_iter().zip(colors) {
+                assert_pixel_approx(
+                    sample_cube_x(&h, &cube, direction_x),
+                    argb(color),
+                    1,
+                    &format!("format {format:#x} level {level} direction {direction_x}"),
+                );
+            }
+        }
+        assert_eq!(h.set_sampler_state(0, D3DSAMP_MAXMIPLEVEL, 0), 0);
+        assert_eq!(h.set_sampler_state(0, D3DSAMP_MIPFILTER, D3DTEXF_NONE), 0);
+    }
+}
+
 #[test]
 fn state_block_restores_cube_binding() {
     let h = Harness::new();
