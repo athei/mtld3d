@@ -1692,3 +1692,71 @@ fn temp_detection_tracks_effective_dotproduct3_alpha_consumption() {
     assert!(unbound.contains("float4 temp = float4(0.0);"));
     assert!(unbound.contains("current = float4((current).rgb, (temp).a);"));
 }
+
+#[test]
+fn per_stage_constant_extent_follows_effective_operands() {
+    use mtld3d_types::{D3DTA_CONSTANT, D3DTOP_DOTPRODUCT3, D3DTOP_SELECTARG2};
+
+    let mut key = default_ps_key();
+    let active = FfStage {
+        color_op: narrow(D3DTOP_SELECTARG1),
+        color_arg1: narrow(D3DTA_DIFFUSE),
+        color_arg2: narrow(D3DTA_CONSTANT),
+        alpha_op: narrow(D3DTOP_SELECTARG1),
+        alpha_arg1: narrow(D3DTA_CURRENT),
+        alpha_arg2: narrow(D3DTA_CONSTANT),
+        flags: FfStageFlags::empty(),
+    };
+    key.stages[0] = active;
+    key.stages[7] = FfStage {
+        color_arg1: narrow(D3DTA_CONSTANT),
+        ..active
+    };
+    assert_eq!(
+        key.constant_rows(),
+        0,
+        "unused operands and disabled suffix"
+    );
+    key.stages[0].color_op = narrow(D3DTOP_SELECTARG2);
+    assert_eq!(key.constant_rows(), 2);
+    key.stages[0].color_op = narrow(D3DTOP_MODULATE);
+    key.stages[0].color_arg1 = narrow(D3DTA_TEXTURE);
+    assert_eq!(key.constant_rows(), 0, "unbound color fallback");
+    key.stages[0].flags.insert(FfStageFlags::HAS_TEXTURE);
+    assert_eq!(
+        key.constant_rows(),
+        2,
+        "texture occupancy makes constant live"
+    );
+    key.stages[0] = FfStage {
+        color_op: narrow(D3DTOP_DOTPRODUCT3),
+        color_arg2: narrow(D3DTA_DIFFUSE),
+        alpha_arg1: narrow(D3DTA_CONSTANT),
+        ..active
+    };
+    assert_eq!(key.constant_rows(), 0, "effective DOT3 ignores alpha");
+    key.stages[0].color_arg1 = narrow(D3DTA_TEXTURE);
+    assert_eq!(
+        key.constant_rows(),
+        2,
+        "DOT3 fallback retains independent alpha"
+    );
+    key.stages[..7].fill(active);
+    assert_eq!(
+        key.constant_rows(),
+        9,
+        "highest active stage has its own row"
+    );
+    let msl = emit_ps_ff(&key, VariantKey::default());
+    assert!(msl.contains("current = float4((ps_c[8]).rgb"));
+    // DISABLE and unknown alpha operations retain the emitter's arg1 fallback.
+    key.stages = [stage_disable(); 8];
+    for alpha_op in [narrow(D3DTOP_DISABLE), 255] {
+        key.stages[0] = FfStage {
+            alpha_op,
+            alpha_arg1: narrow(D3DTA_CONSTANT),
+            ..active
+        };
+        assert_eq!(key.constant_rows(), 2);
+    }
+}

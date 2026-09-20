@@ -63,7 +63,8 @@ fn primitive_misc_caps_matches_implementation() {
         | PrimitiveMiscCaps::SEPARATEALPHABLEND
         | PrimitiveMiscCaps::MRTINDEPENDENTBITDEPTHS
         | PrimitiveMiscCaps::MRTPOSTPIXELSHADERBLENDING
-        | PrimitiveMiscCaps::POSTBLENDSRGBCONVERT;
+        | PrimitiveMiscCaps::POSTBLENDSRGBCONVERT
+        | PrimitiveMiscCaps::PERSTAGECONSTANT;
     assert_eq!(filled().primitive_misc_caps, expected.bits());
     // CLIPPLANESCALEDPOINTS stays off: scaled points are clipped as
     // points, not as the quads they rasterize to.

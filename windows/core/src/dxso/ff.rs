@@ -33,12 +33,12 @@ use mtld3d_types::{
     D3DCMP_LESSEQUAL, D3DCMP_NEVER, D3DCMP_NOTEQUAL, D3DDECLUSAGE_BLENDINDICES,
     D3DDECLUSAGE_BLENDWEIGHT, D3DDECLUSAGE_COLOR, D3DDECLUSAGE_NORMAL, D3DDECLUSAGE_POSITION,
     D3DDECLUSAGE_POSITIONT, D3DDECLUSAGE_PSIZE, D3DDECLUSAGE_TEXCOORD, D3DTA_ALPHAREPLICATE,
-    D3DTA_COMPLEMENT, D3DTA_CURRENT, D3DTA_DIFFUSE, D3DTA_SELECTMASK, D3DTA_SPECULAR, D3DTA_TEMP,
-    D3DTA_TEXTURE, D3DTA_TFACTOR, D3DTOP_ADD, D3DTOP_ADDSIGNED, D3DTOP_ADDSIGNED2X,
-    D3DTOP_ADDSMOOTH, D3DTOP_BLENDCURRENTALPHA, D3DTOP_BLENDDIFFUSEALPHA, D3DTOP_BLENDFACTORALPHA,
-    D3DTOP_BLENDTEXTUREALPHA, D3DTOP_BLENDTEXTUREALPHAPM, D3DTOP_DISABLE, D3DTOP_DOTPRODUCT3,
-    D3DTOP_MODULATE, D3DTOP_MODULATE2X, D3DTOP_MODULATE4X, D3DTOP_SELECTARG1, D3DTOP_SELECTARG2,
-    D3DTOP_SUBTRACT,
+    D3DTA_COMPLEMENT, D3DTA_CONSTANT, D3DTA_CURRENT, D3DTA_DIFFUSE, D3DTA_SELECTMASK,
+    D3DTA_SPECULAR, D3DTA_TEMP, D3DTA_TEXTURE, D3DTA_TFACTOR, D3DTOP_ADD, D3DTOP_ADDSIGNED,
+    D3DTOP_ADDSIGNED2X, D3DTOP_ADDSMOOTH, D3DTOP_BLENDCURRENTALPHA, D3DTOP_BLENDDIFFUSEALPHA,
+    D3DTOP_BLENDFACTORALPHA, D3DTOP_BLENDTEXTUREALPHA, D3DTOP_BLENDTEXTUREALPHAPM, D3DTOP_DISABLE,
+    D3DTOP_DOTPRODUCT3, D3DTOP_MODULATE, D3DTOP_MODULATE2X, D3DTOP_MODULATE4X, D3DTOP_SELECTARG1,
+    D3DTOP_SELECTARG2, D3DTOP_SUBTRACT,
 };
 
 use super::emit::{
@@ -371,9 +371,55 @@ impl FfStage {
         }
     }
 
+    /// Whether the effective color or alpha operation consumes this argument source.
+    ///
+    /// Explicit unbound-texture fallback reads CURRENT, and effective DOTPRODUCT3
+    /// supplies alpha itself. Unsupported operations conservatively retain their
+    /// inputs so their arg1 fallback cannot read an unbound constant buffer.
+    #[must_use]
+    pub fn reads_argument(&self, selector: u32) -> bool {
+        let color = if self.color_uses_unbound_fallback() {
+            selector == D3DTA_CURRENT
+        } else {
+            op_reads_argument(self.color_op, self.color_arg1, self.color_arg2, selector)
+        };
+        color
+            || (!self.color_writes_alpha()
+                && if self.alpha_uses_unbound_fallback() {
+                    selector == D3DTA_CURRENT
+                } else {
+                    op_reads_argument(self.alpha_op, self.alpha_arg1, self.alpha_arg2, selector)
+                })
+    }
+
     pub fn set_result(&mut self, result: FfStageResult) {
         self.flags
             .set(FfStageFlags::RESULT_TEMP, result == FfStageResult::Temp);
+    }
+
+    fn color_uses_unbound_fallback(self) -> bool {
+        !self.has_texture() && op_reads_texture(self.color_op, self.color_arg1, self.color_arg2)
+    }
+
+    fn alpha_uses_unbound_fallback(self) -> bool {
+        !self.has_texture() && op_reads_texture(self.alpha_op, self.alpha_arg1, self.alpha_arg2)
+    }
+
+    fn color_writes_alpha(self) -> bool {
+        u32::from(self.color_op) == D3DTOP_DOTPRODUCT3 && !self.color_uses_unbound_fallback()
+    }
+
+    fn references_texture_factor(self) -> bool {
+        u32::from(self.color_op) == D3DTOP_BLENDFACTORALPHA
+            || u32::from(self.alpha_op) == D3DTOP_BLENDFACTORALPHA
+            || [
+                self.color_arg1,
+                self.color_arg2,
+                self.alpha_arg1,
+                self.alpha_arg2,
+            ]
+            .iter()
+            .any(|a| u32::from(*a) & D3DTA_SELECTMASK == D3DTA_TFACTOR)
     }
 }
 
@@ -423,9 +469,8 @@ impl FfPsKey {
     /// Whether any active stage reads the texture-factor row.
     ///
     /// `D3DTA_TFACTOR` on an argument and the `D3DTOP_BLENDFACTORALPHA` op are
-    /// the only readers of the fixed-function pixel constant buffer, whose sole
-    /// row holds `D3DRS_TEXTUREFACTOR`. A key with neither leaves the whole
-    /// buffer unread, so the draw binds nothing to the slot. Over-approximates
+    /// the readers of row zero, which holds `D3DRS_TEXTUREFACTOR`. Stage
+    /// constants occupy later rows independently. Over-approximates
     /// on the argument an op discards (`D3DTOP_SELECTARG1` ignoring arg2), which
     /// only costs a bind that would otherwise be skipped.
     #[must_use]
@@ -433,13 +478,27 @@ impl FfPsKey {
         self.stages
             .iter()
             .take_while(|s| u32::from(s.color_op) != D3DTOP_DISABLE)
-            .any(|s| {
-                u32::from(s.color_op) == D3DTOP_BLENDFACTORALPHA
-                    || u32::from(s.alpha_op) == D3DTOP_BLENDFACTORALPHA
-                    || [s.color_arg1, s.color_arg2, s.alpha_arg1, s.alpha_arg2]
-                        .iter()
-                        .any(|a| u32::from(*a) & D3DTA_SELECTMASK == D3DTA_TFACTOR)
-            })
+            .any(|s| s.references_texture_factor())
+    }
+
+    /// Number of fragment constant rows read by the active combiner cascade.
+    ///
+    /// Row zero retains texture factor; row `stage + 1` holds that stage's
+    /// constant. Zero skips the binding, one keeps the ordinary 16-byte path.
+    #[must_use]
+    pub fn constant_rows(&self) -> u8 {
+        let mut rows = 0;
+        for (extent, stage) in (2u8..).zip(&self.stages) {
+            if u32::from(stage.color_op) == D3DTOP_DISABLE {
+                break;
+            }
+            if stage.reads_argument(D3DTA_CONSTANT) {
+                rows = extent;
+            } else if rows == 0 && stage.references_texture_factor() {
+                rows = 1;
+            }
+        }
+        rows
     }
 }
 
@@ -1539,17 +1598,7 @@ fn emit_ps(out: &mut String, ps: &FfPsKey, variant: VariantKey, entry: &str) {
         .stages
         .iter()
         .take_while(|s| u32::from(s.color_op) != D3DTOP_DISABLE)
-        .any(|s| {
-            let reads_temp = |op, arg1, arg2| {
-                op_reads_argument(op, arg1, arg2, D3DTA_TEMP)
-                    && (s.has_texture() || !op_reads_texture(op, arg1, arg2))
-            };
-            let dot_writes_alpha = u32::from(s.color_op) == D3DTOP_DOTPRODUCT3
-                && (s.has_texture() || !op_reads_texture(s.color_op, s.color_arg1, s.color_arg2));
-            s.result() == FfStageResult::Temp
-                || reads_temp(s.color_op, s.color_arg1, s.color_arg2)
-                || (!dot_writes_alpha && reads_temp(s.alpha_op, s.alpha_arg1, s.alpha_arg2))
-        });
+        .any(|s| s.result() == FfStageResult::Temp || s.reads_argument(D3DTA_TEMP));
     if uses_temp {
         out.push_str("    float4 temp = float4(0.0);\n");
     }
@@ -1646,8 +1695,7 @@ fn emit_ps(out: &mut String, ps: &FfPsKey, variant: VariantKey, entry: &str) {
             FfStageResult::Current => "current",
             FfStageResult::Temp => "temp",
         };
-        let unbound_color = !stage.has_texture()
-            && op_reads_texture(stage.color_op, stage.color_arg1, stage.color_arg2);
+        let unbound_color = stage.color_uses_unbound_fallback();
         let color_expr = if unbound_color {
             "current".to_string()
         } else {
@@ -1656,13 +1704,11 @@ fn emit_ps(out: &mut String, ps: &FfPsKey, variant: VariantKey, entry: &str) {
             apply_op(stage.color_op, &c1, &c2, i, stage.has_texture())
         };
         // DOTPRODUCT3 supplies alpha as well as RGB, ignoring the alpha operation.
-        if !unbound_color && u32::from(stage.color_op) == D3DTOP_DOTPRODUCT3 {
+        if stage.color_writes_alpha() {
             let _ = writeln!(out, "    {result} = {color_expr};");
             continue;
         }
-        let alpha_expr = if !stage.has_texture()
-            && op_reads_texture(stage.alpha_op, stage.alpha_arg1, stage.alpha_arg2)
-        {
+        let alpha_expr = if stage.alpha_uses_unbound_fallback() {
             "current".to_string()
         } else {
             let a1 = resolve_arg(stage.alpha_arg1, i, stage.has_texture());
@@ -1761,6 +1807,7 @@ fn resolve_arg(arg: u8, stage: usize, has_texture: bool) -> String {
             }
         }
         D3DTA_TFACTOR => "ps_c[0]".to_string(),
+        D3DTA_CONSTANT => format!("ps_c[{}]", stage + 1),
         other => {
             mtld3d_shared::log_once_warn!(target: super::LOG_TARGET,
                 "ff-fallback texture-arg unhandled={other} (stage={stage}) → float4(1.0)"

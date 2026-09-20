@@ -10,7 +10,7 @@ divergences from D3D9 it keeps on purpose. The tested games are in the
 - Shader models 1.x through 3.0, translated from DXSO to MSL and cached on
   disk by content hash.
 - The fixed-function pipeline: lighting, texture-coordinate generation, the
-  texture-stage cascade (CURRENT/TEMP registers, DOTPRODUCT3 color and alpha,
+  texture-stage cascade (CURRENT/TEMP registers, per-stage constants, DOTPRODUCT3 color and alpha,
   and premultiplied texture-alpha blending), vertex blending and range-based
   vertex fog. Table fog supports Z and W sources with LINEAR,
   EXP and EXP2; SM3 shaders own their fog.

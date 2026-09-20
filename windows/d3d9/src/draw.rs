@@ -960,12 +960,11 @@ pub enum PsSource {
         /// texture only inside the mask; a stage outside it is one the
         /// combiner cascade never samples.
         sampled_stage_mask: u16,
-        /// Whether the shader reads the fixed-function pixel constant buffer.
+        /// Used fragment constant rows, cached from `FfPsKey::constant_rows`.
         ///
-        /// `FfPsKey::reads_texture_factor`. Its one row is
-        /// `D3DRS_TEXTUREFACTOR`, so a key that references neither
-        /// `D3DTA_TFACTOR` nor `D3DTOP_BLENDFACTORALPHA` binds no constants.
-        reads_texture_factor: bool,
+        /// Zero skips slot 15; one is texture factor only. Larger extents
+        /// include stage constants without enlarging the snapshot or key.
+        constant_rows: u8,
     },
 }
 
@@ -1411,10 +1410,9 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
     };
     let ps_constants = match ps {
         PsSource::Programmable { max_const_used, .. } => enc.ps_const_scratch(*max_const_used),
-        PsSource::FixedFunction {
-            reads_texture_factor: true,
-            ..
-        } => snap.ps_constants.unwrap_or(ScratchSlice::EMPTY),
+        PsSource::FixedFunction { constant_rows, .. } if *constant_rows != 0 => {
+            snap.ps_constants.unwrap_or(ScratchSlice::EMPTY)
+        }
         PsSource::FixedFunction { .. } => ScratchSlice::EMPTY,
     };
     let alpha_ref_slice = snap.alpha_ref_bytes.unwrap_or(ScratchSlice::EMPTY);

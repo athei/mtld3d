@@ -126,7 +126,8 @@ const PRIMITIVE_MISC_DEFAULT: PrimitiveMiscCaps = PrimitiveMiscCaps::MASKZ
     .union(PrimitiveMiscCaps::SEPARATEALPHABLEND)
     .union(PrimitiveMiscCaps::MRTINDEPENDENTBITDEPTHS)
     .union(PrimitiveMiscCaps::MRTPOSTPIXELSHADERBLENDING)
-    .union(PrimitiveMiscCaps::POSTBLENDSRGBCONVERT);
+    .union(PrimitiveMiscCaps::POSTBLENDSRGBCONVERT)
+    .union(PrimitiveMiscCaps::PERSTAGECONSTANT);
 
 /// Rasterizer caps.
 ///

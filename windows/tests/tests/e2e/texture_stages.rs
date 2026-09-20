@@ -1382,3 +1382,251 @@ fn texture_stage_temp_unbound_dotproduct3_color_keeps_temp_alpha_read() {
     );
     assert_eq!(temp_probe_pixel(&h, 0x2040_6080), 0x0040_6080);
 }
+
+#[test]
+fn per_stage_constant_color_and_modifiers() {
+    use mtld3d_types::{D3DTA_ALPHAREPLICATE, D3DTA_COMPLEMENT, D3DTA_CONSTANT, D3DTSS_CONSTANT};
+
+    let h = Harness::new();
+    assert_eq!(h.set_render_state(D3DRS_LIGHTING, 0), 0);
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1), 0);
+    assert_eq!(
+        h.set_texture_stage_state(0, D3DTSS_CONSTANT, 0x80A1_B2C3),
+        0
+    );
+    assert_eq!(
+        h.set_texture_stage_state(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1),
+        0
+    );
+    let verts = quad(0xFFFF_FFFF);
+    for (modifier, expected) in [
+        (0, 0x00A1_B2C3),
+        (D3DTA_COMPLEMENT, 0x005E_4D3C),
+        (D3DTA_ALPHAREPLICATE, 0x0080_8080),
+        (D3DTA_ALPHAREPLICATE | D3DTA_COMPLEMENT, 0x007F_7F7F),
+    ] {
+        assert_eq!(
+            h.set_texture_stage_state(0, D3DTSS_COLORARG1, D3DTA_CONSTANT | modifier),
+            0
+        );
+        h.render_once(BLACK, |d| {
+            assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &verts), 0);
+        });
+        let actual = h.read_pixel(320, 240) & 0x00FF_FFFF;
+        assert_eq!(
+            actual, expected,
+            "per-stage constant modifier {modifier:#x}: got {actual:#08x}, expected {expected:#08x}"
+        );
+    }
+}
+
+#[test]
+fn per_stage_constant_all_stages_color_alpha_and_factor() {
+    use mtld3d_types::{
+        D3DBLEND_INVSRCALPHA, D3DBLEND_SRCALPHA, D3DRS_ALPHABLENDENABLE, D3DRS_DESTBLEND,
+        D3DRS_SRCBLEND, D3DTA_CONSTANT, D3DTA_CURRENT, D3DTSS_ALPHAARG2, D3DTSS_CONSTANT,
+        PrimitiveMiscCaps,
+    };
+    let h = Harness::new();
+    assert_ne!(
+        h.device_caps().primitive_misc_caps & PrimitiveMiscCaps::PERSTAGECONSTANT.bits(),
+        0
+    );
+    assert_eq!(h.set_render_state(D3DRS_LIGHTING, 0), 0);
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1), 0);
+    for stage in 0..8 {
+        h.select_diffuse_stage(stage);
+        let color = 0x8000_0000 | ((stage + 1) * 0x0010_2030);
+        for (state, value) in [
+            (D3DTSS_CONSTANT, color),
+            (D3DTSS_COLOROP, D3DTOP_SELECTARG2),
+            (D3DTSS_COLORARG2, D3DTA_CONSTANT),
+            (D3DTSS_ALPHAOP, D3DTOP_SELECTARG2),
+            (D3DTSS_ALPHAARG2, D3DTA_CONSTANT),
+        ] {
+            assert_eq!(h.set_texture_stage_state(stage, state, value), 0);
+        }
+        assert_eq!(h.texture_stage_state(stage, D3DTSS_CONSTANT), color);
+        assert_eq!(temp_probe_pixel(&h, 0xFFFF_0000), color & 0x00FF_FFFF);
+        assert_eq!(
+            h.set_texture_stage_state(stage, D3DTSS_COLORARG2, D3DTA_CURRENT),
+            0
+        );
+        assert_eq!(h.set_render_state(D3DRS_ALPHABLENDENABLE, 1), 0);
+        assert_eq!(h.set_render_state(D3DRS_SRCBLEND, D3DBLEND_SRCALPHA), 0);
+        assert_eq!(h.set_render_state(D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA), 0);
+        h.render_once(0xFF00_00FF, |d| {
+            assert_eq!(
+                d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad(0xFFFF_0000)),
+                0
+            );
+        });
+        let pixel = Rgba8::from_pixel(h.read_pixel(320, 240));
+        assert!(
+            pixel.r.abs_diff(128) <= 1 && pixel.g == 0 && pixel.b.abs_diff(127) <= 1,
+            "stage {stage} alpha: {pixel:?}"
+        );
+        assert_eq!(h.set_render_state(D3DRS_ALPHABLENDENABLE, 0), 0);
+        h.select_diffuse_stage(stage);
+    }
+    assert_eq!(h.set_render_state(D3DRS_TEXTUREFACTOR, 0xFF10_2030), 0);
+    assert_eq!(
+        h.set_texture_stage_state(7, D3DTSS_CONSTANT, 0xFF20_4060),
+        0
+    );
+    for (state, value) in [
+        (D3DTSS_COLOROP, D3DTOP_ADD),
+        (D3DTSS_COLORARG1, D3DTA_CONSTANT),
+        (D3DTSS_COLORARG2, D3DTA_TFACTOR),
+    ] {
+        assert_eq!(h.set_texture_stage_state(7, state, value), 0);
+    }
+    assert_eq!(temp_probe_pixel(&h, 0xFFFF_FFFF), 0x0030_6090);
+}
+
+#[test]
+fn per_stage_constant_updates_preserve_queued_draws() {
+    use mtld3d_types::{D3DTA_CONSTANT, D3DTSS_CONSTANT};
+    let h = Harness::new();
+    h.select_diffuse_stage(0);
+    assert_eq!(h.set_render_state(D3DRS_LIGHTING, 0), 0);
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1), 0);
+    assert_eq!(
+        h.set_texture_stage_state(0, D3DTSS_COLORARG1, D3DTA_CONSTANT),
+        0
+    );
+    h.render_once(BLACK, |d| {
+        for (offset, color) in [(-0.5, 0xFF20_4060), (0.5, 0xFF80_A0C0)] {
+            assert_eq!(d.set_texture_stage_state(0, D3DTSS_CONSTANT, color), 0);
+            let verts = quad(0xFFFF_FFFF).map(|mut v| {
+                v.x = v.x.mul_add(0.5, offset);
+                v
+            });
+            assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &verts), 0);
+        }
+    });
+    assert_eq!(h.read_pixel(160, 240) & 0x00FF_FFFF, 0x0020_4060);
+    assert_eq!(h.read_pixel(480, 240) & 0x00FF_FFFF, 0x0080_A0C0);
+}
+
+#[test]
+fn per_stage_constant_stateblock_reset_and_shader_transitions() {
+    use mtld3d_types::{D3DSBT_ALL, D3DSBT_PIXELSTATE, D3DTA_CONSTANT, D3DTSS_CONSTANT};
+    const PS: &[u32] = &[
+        0xFFFF_0200,
+        0x0200_0001,
+        0x800F_0800,
+        0xA0E4_0000,
+        0x0000_FFFF,
+    ];
+    let h = Harness::new();
+    for stage in 0..8 {
+        assert_eq!(h.texture_stage_state(stage, D3DTSS_CONSTANT), 0);
+    }
+    h.select_diffuse_stage(0);
+    assert_eq!(
+        h.set_texture_stage_state(0, D3DTSS_COLORARG1, D3DTA_CONSTANT),
+        0
+    );
+    assert_eq!(
+        h.set_texture_stage_state(0, D3DTSS_CONSTANT, 0xFF12_3456),
+        0
+    );
+    {
+        let all = h.create_state_block(D3DSBT_ALL);
+        let pixel = h.create_state_block(D3DSBT_PIXELSTATE);
+        assert_eq!(
+            h.set_texture_stage_state(0, D3DTSS_CONSTANT, 0xFF65_4321),
+            0
+        );
+        assert_eq!(temp_probe_pixel(&h, 0xFFFF_FFFF), 0x0065_4321);
+        assert_eq!(pixel.apply(), 0);
+        // Preserve the existing PIXEL preset's exclusion of CONSTANT.
+        assert_eq!(h.texture_stage_state(0, D3DTSS_CONSTANT), 0xFF65_4321);
+        assert_eq!(temp_probe_pixel(&h, 0xFFFF_FFFF), 0x0065_4321);
+        assert_eq!(all.apply(), 0);
+        assert_eq!(temp_probe_pixel(&h, 0xFFFF_FFFF), 0x0012_3456);
+        assert_eq!(h.begin_state_block(), 0);
+        assert_eq!(
+            h.set_texture_stage_state(0, D3DTSS_CONSTANT, 0xFFAB_CDEF),
+            0
+        );
+        let recorded = h.end_state_block();
+        assert_eq!(h.texture_stage_state(0, D3DTSS_CONSTANT), 0xFF12_3456);
+        assert_eq!(recorded.apply(), 0);
+        assert_eq!(temp_probe_pixel(&h, 0xFFFF_FFFF), 0x00AB_CDEF);
+    }
+    {
+        let ps = h.create_pixel_shader(PS);
+        assert_eq!(h.set_pixel_shader(&ps), 0);
+        assert_eq!(h.set_pixel_shader_constant_f(0, &[0.0, 1.0, 0.0, 1.0]), 0);
+        assert_eq!(temp_probe_pixel(&h, 0xFFFF_FFFF), 0x0000_FF00);
+        assert_eq!(
+            h.set_texture_stage_state(0, D3DTSS_CONSTANT, 0xFF32_5476),
+            0
+        );
+        assert_eq!(h.clear_pixel_shader(), 0);
+        assert_eq!(temp_probe_pixel(&h, 0xFFFF_FFFF), 0x0032_5476);
+    }
+    assert!(h.set_texture_stage_state(8, D3DTSS_CONSTANT, 0xFFFF_FFFF) < 0);
+    assert_eq!(h.texture_stage_state(0, D3DTSS_CONSTANT), 0xFF32_5476);
+    assert_eq!(h.reset(640, 480), 0);
+    for stage in 0..8 {
+        assert_eq!(h.texture_stage_state(stage, D3DTSS_CONSTANT), 0);
+    }
+    h.select_diffuse_stage(0);
+    assert_eq!(
+        h.set_texture_stage_state(0, D3DTSS_COLORARG1, D3DTA_CONSTANT),
+        0
+    );
+    assert_eq!(temp_probe_pixel(&h, 0xFFFF_FFFF), 0);
+}
+
+#[test]
+fn per_stage_constant_extent_tracks_texture_occupancy_and_dot3() {
+    use mtld3d_types::{
+        D3DTA_ALPHAREPLICATE, D3DTA_CONSTANT, D3DTA_CURRENT, D3DTOP_DOTPRODUCT3, D3DTSS_CONSTANT,
+    };
+    let h = Harness::new();
+    assert_eq!(
+        h.set_texture_stage_state(0, D3DTSS_CONSTANT, 0xC020_4060),
+        0
+    );
+    h.select_diffuse_stage(0);
+    assert_eq!(
+        h.set_texture_stage_state(0, D3DTSS_ALPHAARG1, D3DTA_CONSTANT),
+        0
+    );
+    assert_eq!(
+        h.set_texture_stage_state(0, D3DTSS_COLOROP, D3DTOP_DOTPRODUCT3),
+        0
+    );
+    assert_eq!(
+        h.set_texture_stage_state(0, D3DTSS_COLORARG2, D3DTA_DIFFUSE),
+        0
+    );
+    h.select_diffuse_stage(1);
+    assert_eq!(
+        h.set_texture_stage_state(1, D3DTSS_COLORARG1, D3DTA_CURRENT | D3DTA_ALPHAREPLICATE),
+        0
+    );
+    assert_eq!(
+        temp_probe_pixel(&h, 0x40FF_FFFF),
+        0x00FF_FFFF,
+        "DOT3 supplies alpha"
+    );
+    assert_eq!(
+        h.set_texture_stage_state(0, D3DTSS_COLORARG1, D3DTA_TEXTURE),
+        0
+    );
+    assert_eq!(
+        temp_probe_pixel(&h, 0x40FF_FFFF),
+        0x00C0_C0C0,
+        "unbound fallback exposes constant alpha"
+    );
+    let tex = solid_texture(&h, 0xFFFF_FFFF);
+    assert_eq!(h.set_texture(0, &tex), 0);
+    assert_eq!(temp_probe_pixel(&h, 0x40FF_FFFF), 0x00FF_FFFF);
+    assert_eq!(h.clear_texture(0), 0);
+    assert_eq!(temp_probe_pixel(&h, 0x40FF_FFFF), 0x00C0_C0C0);
+}

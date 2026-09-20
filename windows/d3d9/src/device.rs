@@ -9962,14 +9962,16 @@ extern "system" fn device_set_texture_stage_state(
     // layout + FF PS key + variant + constants — ff_aware strips VS/PS
     // bits for programmable shaders.
     if changed {
-        let mut mask = dev.ff_aware_mask(
+        let mut mask = dev.ff_aware_mask(if type_ == mtld3d_types::D3DTSS_CONSTANT {
+            SnapshotDirty::PS_CONST
+        } else {
             SnapshotDirty::STAGES
                 | SnapshotDirty::VARIANT
                 | SnapshotDirty::VS_SOURCE
                 | SnapshotDirty::VS_CONST
                 | SnapshotDirty::PS_SOURCE
-                | SnapshotDirty::PS_CONST,
-        );
+                | SnapshotDirty::PS_CONST
+        });
         // The bump-environment matrix / luminance states feed the SM1
         // texbem PS uniform (slot 12), independent of the FF keys above.
         if matches!(
@@ -11357,11 +11359,11 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) -> Option<CurrentSnapshotPtr> {
         if bound_pixel_shader.is_null() {
             let key = dev.ff_state().build_ps_key(rs, bound_mask);
             let sampled_stage_mask = key.sampled_stage_mask();
-            let reads_texture_factor = key.reads_texture_factor();
+            let constant_rows = key.constant_rows();
             Some(PsSource::FixedFunction {
                 key,
                 sampled_stage_mask,
-                reads_texture_factor,
+                constant_rows,
             })
         } else {
             // SAFETY: non-null check; refcount holds it live.
@@ -11531,7 +11533,33 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) -> Option<CurrentSnapshotPtr> {
 
     // PS_CONST source. Same routing as VS_CONST: programmable PS uses
     // the encoder mirror; only FF runs here.
-    let ps_const_buf = if dirty.contains(SnapshotDirty::PS_CONST) && bound_pixel_shader.is_null() {
+    let ps_rows = if dirty.contains(SnapshotDirty::PS_CONST) && bound_pixel_shader.is_null() {
+        match ps_value
+            .as_ref()
+            .or_else(|| dev.snapshot_cache.ps.as_ref().map(PsSourcePtr::as_ref))
+        {
+            Some(PsSource::FixedFunction { constant_rows, .. }) => *constant_rows,
+            _ => 0,
+        }
+    } else {
+        0
+    };
+    let ps_stage_constants =
+        if dirty.contains(SnapshotDirty::PS_CONST) && bound_pixel_shader.is_null() && ps_rows > 1 {
+            let ptr =
+                dev.ff_state
+                    .build_ps_stage_constants(rs, ps_rows, dev.current_frame.scratch_mut());
+            Some(ScratchSlice::from_raw_parts(
+                NonNull::new(ptr).expect("stage constants scratch is non-null"),
+                u32::from(ps_rows) * 16,
+            ))
+        } else {
+            None
+        };
+    let ps_const_buf = if dirty.contains(SnapshotDirty::PS_CONST)
+        && bound_pixel_shader.is_null()
+        && ps_rows <= 1
+    {
         Some(dev.ff_state().build_ps_constants(rs))
     } else {
         None
@@ -11619,8 +11647,8 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) -> Option<CurrentSnapshotPtr> {
     };
 
     // Phase 2: take scratch + bump dirty pieces + update cache. The
-    // const payloads above are fixed stack buffers built in Phase 1, so
-    // nothing here aliases device state. Direct field access on
+    // ordinary const payloads above are fixed stack buffers. The optional
+    // stage-constant prefix is already immutable in frame scratch. Direct field access on
     // `dev.current_frame.scratch` splits the borrow off
     // `dev.snapshot_cache`, letting both be mutated/read in turn.
     let scratch = dev.current_frame.scratch_mut();
@@ -11639,7 +11667,8 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) -> Option<CurrentSnapshotPtr> {
         dev.snapshot_cache.vs_constants = None;
     }
     if dirty.contains(SnapshotDirty::PS_CONST) {
-        dev.snapshot_cache.ps_constants = ps_const_buf.map(|b| arena_alloc_bytes(scratch, &b));
+        dev.snapshot_cache.ps_constants =
+            ps_stage_constants.or_else(|| ps_const_buf.map(|b| arena_alloc_bytes(scratch, &b)));
     }
     if let Some((buf, len)) = alpha_ref_buf {
         dev.snapshot_cache.alpha_ref_bytes = Some(arena_alloc_bytes(scratch, &buf[..len]));

@@ -1293,3 +1293,20 @@ at 12124 combines independently retained red CURRENT and green TEMP values
 into yellow; the focused end-to-end tests additionally cover initialization,
 modifiers, destination changes, stateblocks, and Reset. No uniform or texture
 allocation backs the register.
+
+### visual.c/test_per_stage_constant and test_texture_blending
+
+PERSTAGECONSTANT is advertised. D3DTA_CONSTANT selects the current stage's
+D3DTSS_CONSTANT color, with alpha-replicate and complement modifiers. Values
+use fragment constants rather than shader keys. Only a shader consuming a
+stage constant extends the existing texture-factor buffer, to at most nine
+float4 rows. Ordinary shaders keep their existing one-row construction and
+unused-buffer bind suppression.
+
+The dedicated test expects 0xa1b2c3, complement 0x5e4d3c, alpha-replicated
+0x808080 and alpha-blended 0x80007f at 19538/19556/19574/19596. Together with
+TSSARGTEMP, the capability also opens test_texture_blending after its two
+capability guards. Its individual cases still check TextureOpCaps. Raw
+D3DTSS_CONSTANT defaults remain zero, as device.c:7746 asserts. ALL and
+recorded stateblocks retain the value; this feature preserves the existing
+PIXEL preset exclusion rather than changing capture policy.

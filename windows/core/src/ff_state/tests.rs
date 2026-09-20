@@ -1262,3 +1262,45 @@ fn resultarg_narrows_to_the_typed_destination_and_preserves_raw_state() {
         FfStageResult::Current
     );
 }
+
+#[test]
+fn per_stage_constants_pack_fresh_prefix_without_changing_keys() {
+    use mtld3d_types::{D3DTA_CONSTANT, D3DTOP_SELECTARG1, D3DTSS_COLORARG1, D3DTSS_CONSTANT};
+
+    use crate::scratch::ScratchArena;
+
+    let mut ff = FfState::new();
+    let states = rs();
+    for stage in 0..8 {
+        ff.set_texture_stage_state(stage, D3DTSS_COLOROP as usize, D3DTOP_SELECTARG1);
+        ff.set_texture_stage_state(stage, D3DTSS_COLORARG1 as usize, D3DTA_CONSTANT);
+        ff.set_texture_stage_state(stage, D3DTSS_CONSTANT as usize, 0x8040_2010);
+    }
+    let key = ff.build_ps_key(&states, 0);
+    let mut scratch = ScratchArena::new();
+    let ptr = ff.build_ps_stage_constants(&states, key.constant_rows(), &mut scratch);
+    // SAFETY: the builder initialized nine 16-byte rows retained in scratch.
+    let first = unsafe { core::slice::from_raw_parts(ptr, 144) };
+    assert_eq!(&first[..16], &ff.build_ps_constants(&states));
+    let expected = [64.0_f32 / 255.0, 32.0 / 255.0, 16.0 / 255.0, 128.0 / 255.0];
+    for row in first[16..].as_chunks::<16>().0 {
+        for (bytes, expected) in row.as_chunks::<4>().0.iter().zip(expected) {
+            assert_eq!(*bytes, expected.to_le_bytes());
+        }
+    }
+    ff.set_texture_stage_state(7, D3DTSS_CONSTANT as usize, 0xFF12_3456);
+    assert_eq!(
+        key,
+        ff.build_ps_key(&states, 0),
+        "values are not shader identity"
+    );
+    let next = ff.build_ps_stage_constants(&states, 9, &mut scratch);
+    assert_ne!(ptr, next, "queued draws keep immutable constant rows");
+    // SAFETY: this second allocation also contains nine initialized rows.
+    let second = unsafe { core::slice::from_raw_parts(next, 144) };
+    assert_ne!(&first[128..], &second[128..]);
+    let short = ff.build_ps_stage_constants(&states, 2, &mut scratch);
+    // SAFETY: the requested two initialized rows occupy 32 bytes.
+    let short = unsafe { core::slice::from_raw_parts(short, 32) };
+    assert_eq!(short, &first[..32]);
+}
