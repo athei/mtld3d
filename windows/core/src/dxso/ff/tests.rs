@@ -897,8 +897,9 @@ fn tci_passthru_honours_coord_index_override() {
 #[test]
 fn tci_cameraspacereflection_emits_reflection_vector() {
     // D3DTSS_TEXCOORDINDEX[stage=0] = 0x30000 (TCI_CAMERASPACEREFLECTION).
-    // Requires `has_normal` so eye-space normal is available. VS must emit
-    // the reflection calculation into Varyings.texcoord[0].
+    // D3D9 defines R = 2 (E.N) N - E with E the unit vector from the vertex
+    // to the eye. `posEye` is the vertex in camera space, so
+    // I = normalize(posEye) = -E and R = I - 2 (I.N) N = reflect(I, N).
     let mut vs = default_vs_key();
     vs.flags.set(FfVsFlags::HAS_NORMAL, true);
     vs.tex_coord_count = 1;
@@ -916,14 +917,55 @@ fn tci_cameraspacereflection_emits_reflection_vector() {
     let msl = emit_pair_for_tests(&vs, &ps, VariantKey::default());
     // Eye-space normal + position must be declared (pre-scan hoist, since
     // lighting is disabled in the default key).
-    assert!(msl.contains("float3 n = normalize("), "{msl}");
-    assert!(msl.contains("float3 posEye ="), "{msl}");
-    // Reflection vector: R = 2 * N * dot(N, E) - E.
-    assert!(msl.contains("2.0 * n * dot(n, E_tci)"), "{msl}");
-    assert!(msl.contains("raw0 = float4(R_tci, 0.0);"), "{msl}");
-    assert!(msl.contains("out.texcoord0 = raw0;"), "{msl}");
+    assert_eq!(msl.matches("float3 n = normalize(").count(), 1, "{msl}");
+    assert_eq!(msl.matches("float3 posEye =").count(), 1, "{msl}");
+    assert!(
+        msl.contains(concat!(
+            "    float4 raw0;\n",
+            "    {\n",
+            "        float3 E_tci = normalize(posEye);\n",
+            "        float3 R_tci = reflect(E_tci, n);\n",
+            "        raw0 = float4(R_tci, 0.0);\n",
+            "    }\n",
+            "    out.texcoord0 = raw0;\n",
+        )),
+        "{msl}"
+    );
+    // The mirrored form, which feeds the eye-to-vertex direction into the
+    // vertex-to-eye formula, is the negated vector.
+    assert!(!msl.contains("dot(n, E_tci)"), "{msl}");
     // Passthru from a bogus input v4 must NOT be emitted at slot 0.
     assert!(!msl.contains("in.v4"), "{msl}");
+}
+
+#[test]
+fn tci_cameraspacereflection_vertex_blended_reads_the_blended_locals() {
+    let mut vs = default_vs_key();
+    vs.flags.set(FfVsFlags::HAS_NORMAL, true);
+    vs.vertex_blend_count = 1;
+    vs.declared_weights_count = 1;
+    vs.tex_coord_count = 1;
+    vs.tci_modes[0] = 3;
+    let msl = emit_vs_ff(&vs);
+    assert_eq!(
+        msl.matches("    float3 posEye = pos_view.xyz;\n").count(),
+        1,
+        "{msl}"
+    );
+    assert_eq!(
+        msl.matches("    float3 n = normalize(n_blend);\n").count(),
+        1,
+        "{msl}"
+    );
+    assert!(
+        msl.contains(concat!(
+            "        float3 E_tci = normalize(posEye);\n",
+            "        float3 R_tci = reflect(E_tci, n);\n",
+            "        raw0 = float4(R_tci, 0.0);\n",
+        )),
+        "{msl}"
+    );
+    assert!(!msl.contains("dot(n, E_tci)"), "{msl}");
 }
 
 #[test]
@@ -1121,6 +1163,11 @@ fn eye_space_locals_are_declared_once_for_every_lighting_normal_and_tci_mix() {
                         _ => "float4 raw0 = float4(0.0);",
                     };
                     assert!(msl.contains(raw), "{case}");
+                    // The reflection vector reflects the view direction about
+                    // the vertex normal in both modes that read it.
+                    if mode == 3 && normal {
+                        assert!(msl.contains("float3 R_tci = reflect(E_tci, n);"), "{case}");
+                    }
                     // The sphere map reflects about the vertex normal, and
                     // about a zero normal when the vertex has none.
                     if mode == 4 {
