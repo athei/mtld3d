@@ -2040,3 +2040,84 @@ fn modulate_color_add_alpha_dependency_extent_keeps_alpha_and_factor_policy() {
     key.stages[0] = stage_disable();
     assert_eq!(key.constant_rows(), 0, "disabled cascade ends dependencies");
 }
+
+#[test]
+fn modulate_inverse_alpha_add_color_fallback_preserves_source_identity() {
+    use mtld3d_types::{D3DTA_COMPLEMENT, D3DTA_TFACTOR, D3DTOP_MODULATEINVALPHA_ADDCOLOR};
+    for (arg1, arg2) in [
+        (D3DTA_TEXTURE | D3DTA_COMPLEMENT, D3DTA_DIFFUSE),
+        (D3DTA_DIFFUSE, D3DTA_TEXTURE | D3DTA_ALPHAREPLICATE),
+    ] {
+        let mut key = default_ps_key();
+        key.stages[0] = FfStage {
+            color_op: narrow(D3DTOP_MODULATEINVALPHA_ADDCOLOR),
+            color_arg1: narrow(arg1),
+            color_arg2: narrow(arg2),
+            alpha_op: narrow(D3DTOP_SELECTARG1),
+            alpha_arg1: narrow(D3DTA_TFACTOR),
+            ..FfStage::default()
+        };
+        let fallback = emit_ps_ff(&key, VariantKey::default());
+        assert!(!fallback.contains("[[texture("));
+        assert!(!fallback.contains("[[sampler("));
+        key.stages[0].color_op = narrow(D3DTOP_SELECTARG1);
+        key.stages[0].color_arg1 = narrow(D3DTA_CURRENT);
+        assert_eq!(fallback, emit_ps_ff(&key, VariantKey::default()));
+    }
+}
+
+#[test]
+fn modulate_inverse_alpha_add_color_uses_existing_binary_constant_extent() {
+    use mtld3d_types::{D3DTA_CONSTANT, D3DTA_TFACTOR, D3DTOP_MODULATEINVALPHA_ADDCOLOR};
+    for constant_first in [true, false] {
+        let mut key = default_ps_key();
+        key.stages[0] = FfStage {
+            color_op: narrow(D3DTOP_SELECTARG1),
+            color_arg1: narrow(D3DTA_DIFFUSE),
+            alpha_op: narrow(D3DTOP_SELECTARG1),
+            alpha_arg1: narrow(D3DTA_DIFFUSE),
+            ..FfStage::default()
+        };
+        key.stages[1] = FfStage {
+            color_op: narrow(D3DTOP_MODULATEINVALPHA_ADDCOLOR),
+            color_arg1: narrow(if constant_first {
+                D3DTA_CONSTANT
+            } else {
+                D3DTA_CURRENT
+            }),
+            color_arg2: narrow(if constant_first {
+                D3DTA_CURRENT
+            } else {
+                D3DTA_CONSTANT
+            }),
+            alpha_op: narrow(D3DTOP_SELECTARG1),
+            alpha_arg1: narrow(D3DTA_CURRENT),
+            ..FfStage::default()
+        };
+        assert_eq!(key.constant_rows(), 3);
+        if constant_first {
+            key.stages[1].color_arg2 = narrow(D3DTA_TEXTURE);
+        } else {
+            key.stages[1].color_arg1 = narrow(D3DTA_TEXTURE);
+        }
+        assert_eq!(key.constant_rows(), 0, "unbound color suppresses CONSTANT");
+        key.stages[1].alpha_arg1 = narrow(D3DTA_CONSTANT);
+        assert_eq!(key.constant_rows(), 3, "independent alpha retains CONSTANT");
+        key.stages[1].alpha_arg1 = narrow(D3DTA_TFACTOR);
+        assert_eq!(key.constant_rows(), 1);
+        key.stages[1].alpha_arg1 = narrow(D3DTA_CURRENT);
+        key.stages[1].color_arg1 = narrow(D3DTA_TFACTOR);
+        key.stages[1].color_arg2 = narrow(D3DTA_TEXTURE);
+        assert_eq!(
+            key.constant_rows(),
+            1,
+            "inherited conservative TFACTOR extent"
+        );
+        assert!(
+            emit_ps_ff(&key, VariantKey::default())
+                .contains("current = float4((current).rgb, (current).a);")
+        );
+        key.stages[0].color_op = narrow(D3DTOP_DISABLE);
+        assert_eq!(key.constant_rows(), 0, "disabled tail does not contribute");
+    }
+}
