@@ -5012,3 +5012,250 @@ fn managed_dirty_change_preserves_other_pool_contracts() {
         "explicit source metadata still works",
     );
 }
+
+/// Premultiplied texture alpha applies to both channels and implicit samples.
+#[test]
+fn blend_texture_alpha_premultiplied() {
+    use mtld3d_types::{
+        D3DRS_LIGHTING, D3DRS_TEXTUREFACTOR, D3DTA_ALPHAREPLICATE, D3DTA_COMPLEMENT, D3DTA_CURRENT,
+        D3DTA_DIFFUSE, D3DTA_TFACTOR, D3DTOP_BLENDTEXTUREALPHA, D3DTOP_BLENDTEXTUREALPHAPM,
+        D3DTOP_DISABLE, D3DTOP_MODULATE, D3DTSS_ALPHAARG2, D3DTSS_COLORARG1, D3DTSS_COLORARG2,
+        D3DTSS_COLOROP,
+    };
+    struct Case {
+        name: &'static str,
+        texel: Option<u32>,
+        diffuse: u32,
+        factor: u32,
+        arg1: u32,
+        arg2: u32,
+        alpha: bool,
+        post_modulate: bool,
+        ordinary: bool,
+        expected: u32,
+    }
+    let cases = [
+        Case {
+            name: "premultiplied",
+            texel: Some(0x8040_2010),
+            diffuse: 0xff80_8080,
+            factor: 0x4020_4080,
+            arg1: D3DTA_TEXTURE,
+            arg2: D3DTA_TFACTOR,
+            alpha: false,
+            post_modulate: false,
+            ordinary: false,
+            expected: 0x0050_4050,
+        },
+        Case {
+            name: "ordinary control",
+            texel: Some(0x8040_2010),
+            diffuse: 0xff80_8080,
+            factor: 0x4020_4080,
+            arg1: D3DTA_TEXTURE,
+            arg2: D3DTA_TFACTOR,
+            alpha: false,
+            post_modulate: false,
+            ordinary: true,
+            expected: 0x0030_3048,
+        },
+        Case {
+            name: "Wine texop row",
+            texel: Some(0x9900_ff00),
+            diffuse: 0x55ff_0000,
+            factor: 0xdd33_3333,
+            arg1: D3DTA_TEXTURE,
+            arg2: D3DTA_TFACTOR,
+            alpha: false,
+            post_modulate: false,
+            ordinary: false,
+            expected: 0x0014_ff14,
+        },
+        Case {
+            name: "implicit alpha low",
+            texel: Some(0x4020_1008),
+            diffuse: 0x4040_8020,
+            factor: 0x8080_2040,
+            arg1: D3DTA_DIFFUSE,
+            arg2: D3DTA_TFACTOR,
+            alpha: false,
+            post_modulate: false,
+            ordinary: false,
+            expected: 0x00a0_9850,
+        },
+        Case {
+            name: "implicit alpha high",
+            texel: Some(0xc020_1008),
+            diffuse: 0x4040_8020,
+            factor: 0x8080_2040,
+            arg1: D3DTA_DIFFUSE,
+            arg2: D3DTA_TFACTOR,
+            alpha: false,
+            post_modulate: false,
+            ordinary: false,
+            expected: 0x0060_8830,
+        },
+        Case {
+            name: "saturate before next stage",
+            texel: Some(0x40c0_a0e0),
+            diffuse: 0xff80_8080,
+            factor: 0xff80_8080,
+            arg1: D3DTA_TEXTURE,
+            arg2: D3DTA_TFACTOR,
+            alpha: false,
+            post_modulate: true,
+            ordinary: false,
+            expected: 0x0080_8080,
+        },
+        Case {
+            name: "color argument modifiers",
+            texel: Some(0x8040_2010),
+            diffuse: 0x4040_8020,
+            factor: 0x8020_4080,
+            arg1: D3DTA_TEXTURE | D3DTA_ALPHAREPLICATE | D3DTA_COMPLEMENT,
+            arg2: D3DTA_DIFFUSE | D3DTA_ALPHAREPLICATE,
+            alpha: false,
+            post_modulate: false,
+            ordinary: false,
+            expected: 0x009f_9f9f,
+        },
+        Case {
+            name: "alpha operation",
+            texel: Some(0x8040_2010),
+            diffuse: 0x4040_8020,
+            factor: 0x8020_4080,
+            arg1: D3DTA_DIFFUSE,
+            arg2: D3DTA_TFACTOR,
+            alpha: true,
+            post_modulate: false,
+            ordinary: false,
+            expected: 0x0080_8080,
+        },
+        Case {
+            name: "alpha argument modifier",
+            texel: Some(0x8040_2010),
+            diffuse: 0x4040_8020,
+            factor: 0x8020_4080,
+            arg1: D3DTA_DIFFUSE | D3DTA_COMPLEMENT,
+            arg2: D3DTA_TFACTOR,
+            alpha: true,
+            post_modulate: false,
+            ordinary: false,
+            expected: 0x00ff_ffff,
+        },
+        Case {
+            name: "missing implicit texture reference choice",
+            texel: None,
+            diffuse: 0x4040_8020,
+            factor: 0x8080_2040,
+            arg1: D3DTA_DIFFUSE,
+            arg2: D3DTA_TFACTOR,
+            alpha: false,
+            post_modulate: false,
+            ordinary: false,
+            expected: 0x00c0_a060,
+        },
+        Case {
+            name: "missing explicit texture existing policy",
+            texel: None,
+            diffuse: 0x4040_8020,
+            factor: 0x8080_2040,
+            arg1: D3DTA_TEXTURE,
+            arg2: D3DTA_TFACTOR,
+            alpha: false,
+            post_modulate: false,
+            ordinary: false,
+            expected: 0x0040_8020,
+        },
+    ];
+    let h = Harness::new();
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1), 0);
+    assert_eq!(h.set_render_state(D3DRS_LIGHTING, 0), 0);
+    point_clamp(&h);
+    let mut failures = Vec::new();
+    for case in cases {
+        let tex = case.texel.map(|value| {
+            let tex = h.create_texture(1, 1, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED);
+            tex.lock_rect(0, 0).write_u32(&[value]);
+            tex
+        });
+        if let Some(tex) = &tex {
+            assert_eq!(h.set_texture(0, tex), 0);
+        } else {
+            assert_eq!(h.clear_texture(0), 0);
+        }
+        assert_eq!(h.set_render_state(D3DRS_TEXTUREFACTOR, case.factor), 0);
+        let op = if case.ordinary {
+            D3DTOP_BLENDTEXTUREALPHA
+        } else {
+            D3DTOP_BLENDTEXTUREALPHAPM
+        };
+        for (state, value) in [
+            (
+                D3DTSS_COLOROP,
+                if case.alpha { D3DTOP_SELECTARG1 } else { op },
+            ),
+            (
+                D3DTSS_COLORARG1,
+                if case.alpha { D3DTA_DIFFUSE } else { case.arg1 },
+            ),
+            (D3DTSS_COLORARG2, case.arg2),
+            (
+                D3DTSS_ALPHAOP,
+                if case.alpha { op } else { D3DTOP_SELECTARG1 },
+            ),
+            (
+                D3DTSS_ALPHAARG1,
+                if case.alpha { case.arg1 } else { D3DTA_DIFFUSE },
+            ),
+            (D3DTSS_ALPHAARG2, case.arg2),
+        ] {
+            assert_eq!(h.set_texture_stage_state(0, state, value), 0);
+        }
+        for (state, value) in [
+            (
+                D3DTSS_COLOROP,
+                if case.alpha {
+                    D3DTOP_SELECTARG1
+                } else if case.post_modulate {
+                    D3DTOP_MODULATE
+                } else {
+                    D3DTOP_DISABLE
+                },
+            ),
+            (
+                D3DTSS_COLORARG1,
+                D3DTA_CURRENT | if case.alpha { D3DTA_ALPHAREPLICATE } else { 0 },
+            ),
+            (D3DTSS_COLORARG2, D3DTA_DIFFUSE),
+            (D3DTSS_ALPHAOP, D3DTOP_SELECTARG1),
+            (D3DTSS_ALPHAARG1, D3DTA_CURRENT),
+        ] {
+            assert_eq!(h.set_texture_stage_state(1, state, value), 0);
+        }
+        assert_eq!(
+            h.set_texture_stage_state(2, D3DTSS_COLOROP, D3DTOP_DISABLE),
+            0
+        );
+        let mut quad = fullscreen_quad();
+        for vertex in &mut quad {
+            vertex.color = case.diffuse;
+        }
+        h.render_once(BLACK, |d| {
+            assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad), 0);
+        });
+        let observed = h.read_pixel(320, 240) & 0x00ff_ffff;
+        eprintln!(
+            "PM_CASE {} observed={observed:06x} expected={:06x}",
+            case.name, case.expected
+        );
+        let matches = [0, 8, 16]
+            .into_iter()
+            .all(|shift| ((observed >> shift) & 255).abs_diff((case.expected >> shift) & 255) <= 2);
+        if !matches {
+            failures.push((case.name, observed, case.expected));
+        }
+        assert_eq!(h.clear_texture(0), 0);
+    }
+    assert!(failures.is_empty(), "PM failures: {failures:x?}");
+}

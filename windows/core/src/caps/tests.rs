@@ -180,8 +180,7 @@ fn shade_caps_matches_implementation() {
 }
 
 #[test]
-fn texture_op_caps_exclude_premultiplied_blend() {
-    // `dxso::ff` emits every listed op; BLENDTEXTUREALPHAPM has no emitter.
+fn texture_op_caps_match_emitter() {
     let expected = TexOpCaps::DISABLE
         | TexOpCaps::SELECTARG1
         | TexOpCaps::SELECTARG2
@@ -195,14 +194,11 @@ fn texture_op_caps_exclude_premultiplied_blend() {
         | TexOpCaps::ADDSMOOTH
         | TexOpCaps::BLENDDIFFUSEALPHA
         | TexOpCaps::BLENDTEXTUREALPHA
+        | TexOpCaps::BLENDTEXTUREALPHAPM
         | TexOpCaps::BLENDFACTORALPHA
         | TexOpCaps::BLENDCURRENTALPHA
         | TexOpCaps::DOTPRODUCT3;
     assert_eq!(filled().texture_op_caps, expected.bits());
-    assert_eq!(
-        filled().texture_op_caps & TexOpCaps::BLENDTEXTUREALPHAPM.bits(),
-        0
-    );
 }
 
 #[test]

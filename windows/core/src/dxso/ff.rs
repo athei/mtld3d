@@ -36,8 +36,9 @@ use mtld3d_types::{
     D3DTA_COMPLEMENT, D3DTA_CURRENT, D3DTA_DIFFUSE, D3DTA_SELECTMASK, D3DTA_SPECULAR,
     D3DTA_TEXTURE, D3DTA_TFACTOR, D3DTOP_ADD, D3DTOP_ADDSIGNED, D3DTOP_ADDSIGNED2X,
     D3DTOP_ADDSMOOTH, D3DTOP_BLENDCURRENTALPHA, D3DTOP_BLENDDIFFUSEALPHA, D3DTOP_BLENDFACTORALPHA,
-    D3DTOP_BLENDTEXTUREALPHA, D3DTOP_DISABLE, D3DTOP_DOTPRODUCT3, D3DTOP_MODULATE,
-    D3DTOP_MODULATE2X, D3DTOP_MODULATE4X, D3DTOP_SELECTARG1, D3DTOP_SELECTARG2, D3DTOP_SUBTRACT,
+    D3DTOP_BLENDTEXTUREALPHA, D3DTOP_BLENDTEXTUREALPHAPM, D3DTOP_DISABLE, D3DTOP_DOTPRODUCT3,
+    D3DTOP_MODULATE, D3DTOP_MODULATE2X, D3DTOP_MODULATE4X, D3DTOP_SELECTARG1, D3DTOP_SELECTARG2,
+    D3DTOP_SUBTRACT,
 };
 
 use super::emit::{
@@ -1737,6 +1738,15 @@ fn apply_op(op: u8, a: &str, b: &str, stage: usize, has_texture: bool) -> String
                 "current".to_string()
             };
             format!("({a} * {tex}.a + {b} * (1.0 - {tex}.a))")
+        }
+        D3DTOP_BLENDTEXTUREALPHAPM => {
+            if has_texture {
+                format!("saturate({a} + {b} * (1.0 - t{stage}.a))")
+            } else {
+                // Implicit-only missing textures use zero alpha. Explicit
+                // missing-texture arguments have already taken their fallback.
+                format!("saturate({a} + {b})")
+            }
         }
         D3DTOP_BLENDFACTORALPHA => format!("({a} * ps_c[0].a + {b} * (1.0 - ps_c[0].a))"),
         D3DTOP_BLENDCURRENTALPHA => format!("({a} * current.a + {b} * (1.0 - current.a))"),
