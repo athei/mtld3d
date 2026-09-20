@@ -1036,13 +1036,13 @@ extern "system" fn d3d9_check_device_format(
             is_render_target_format_on_device(check_format, cfg.expand_packed16)
         }
     } else if matches!(rtype, D3DRTYPE_VOLUME | D3DRTYPE_VOLUMETEXTURE) {
-        // Newly supported BC volumes are sampled only. Preserve legacy 2D
-        // and cube answers while refusing an sRGB-write capability here.
-        if (mtld3d_core::format::is_dxt_format(check_format)
-            && usage & D3DUSAGE_QUERY_SRGBWRITE != 0)
-            || (usage & D3DUSAGE_QUERY_SRGBREAD != 0
-                && !has_srgb_read_decode(check_format)
-                && !mtld3d_core::format::is_dxt_format(check_format))
+        // A DXT volume is sampled only, so it has no sRGB write. Its sRGB
+        // read is the sRGB view BC1, BC2 and BC3 all have, which covers DXT2
+        // and DXT4; `has_srgb_read_decode` omits those two and keeps
+        // answering for 2D and cube textures.
+        let dxt = mtld3d_core::format::is_dxt_format(check_format);
+        if (dxt && usage & D3DUSAGE_QUERY_SRGBWRITE != 0)
+            || (usage & D3DUSAGE_QUERY_SRGBREAD != 0 && !dxt && !has_srgb_read_decode(check_format))
         {
             false
         } else {

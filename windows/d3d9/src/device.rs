@@ -5443,9 +5443,10 @@ extern "system" fn device_create_volume_texture(
         null_out(texture);
         return D3DERR_INVALIDCALL;
     };
-    // DXT base extents must be block aligned in every pool. Only the
-    // validated native BC1/2/3 formats are advertised for GPU-backed volumes;
-    // other compressed and packed-YUV formats keep the SCRATCH exception.
+    // DXT base extents must be block aligned in every pool. The GPU-backed
+    // pools take what `is_volume_texture_format` advertises, DXT1 to DXT5
+    // among the compressed formats; the other compressed and the packed-YUV
+    // formats are creatable as SCRATCH volumes only.
     let block_w = fmt.block_width();
     let block_h = fmt.block_height();
     if is_dxt_format(format) && (!width.is_multiple_of(block_w) || !height.is_multiple_of(block_h))
@@ -5483,7 +5484,8 @@ extern "system" fn device_create_volume_texture(
     // the full chain. Sizing the levels correctly is what lets `LockBox(level)`
     // resolve a real box instead of returning NULL (a NULL box would fault a
     // LockBox on a mip sub-level).
-    // Zero is the compressed-layout marker used by single-slice uploads.
+    // Zero stays zero: it marks a compressed layout, and the upload of a level
+    // that is one slice deep counts block rows only while the marker survives.
     let bpp = fmt.bytes_per_pixel();
     let actual_levels = resolve_create_levels(
         "CreateVolumeTexture",

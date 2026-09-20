@@ -1446,7 +1446,8 @@ marker (a zero bytes-per-pixel) is kept through volume creation, so an upload
 of a level that has reached one slice counts block rows, not texel rows, and
 the alignment repack never asks for bytes past the level's staging. That path
 was reachable before this capability through a SCRATCH volume bound for
-sampling.
+sampling. Cube creation keeps the marker as well, and the repack checks the
+rows it is asked for against the staging length before it copies.
 
 volume_dxtn_test (visual.c:18588) skipped its DXT1, DXT3 and DXT5 rows on the
 VOLUMETEXTURE query and now runs them: three skips fewer and the row's eight

@@ -332,6 +332,10 @@ impl VolumeTexture<'_> {
         self.transfer_blocks(level, None, None)
     }
 
+    /// Lock a level or a box of it and copy whole block rows in or out.
+    ///
+    /// Rows step by the returned row pitch and slices by the slice pitch, so a
+    /// pitch wider than the blocks of a row is honoured in both directions.
     fn transfer_blocks(
         &self,
         level: u32,

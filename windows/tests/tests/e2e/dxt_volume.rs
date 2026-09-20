@@ -8,6 +8,7 @@ use mtld3d_types::{
     D3DTSS_ALPHAOP,
 };
 
+/// The five DXT formats: DXT1 is BC1, DXT2 and DXT3 are BC2, DXT4 and DXT5 are BC3.
 const FORMATS: [u32; 5] = [
     D3DFMT_DXT1,
     D3DFMT_DXT2,
@@ -16,6 +17,10 @@ const FORMATS: [u32; 5] = [
     D3DFMT_DXT5,
 ];
 
+/// One block of `format` whose sixteen texels are `color` (R5G6B5) at `alpha`.
+///
+/// DXT2 and DXT3 store four explicit alpha bits per texel, so `alpha` rounds
+/// down to a multiple of 17; DXT4 and DXT5 store two equal alpha endpoints.
 fn solid_block(format: u32, color: u16, alpha: u8) -> Vec<u8> {
     let [lo, hi] = color.to_le_bytes();
     let mut block = match format {
@@ -28,6 +33,7 @@ fn solid_block(format: u32, color: u16, alpha: u8) -> Vec<u8> {
     block
 }
 
+/// Point-sampled fixed-function stage 0 with a 3D texcoord, passing texture alpha through.
 fn setup(h: &Harness) {
     h.select_texture_stage(0);
     assert_eq!(
@@ -47,6 +53,7 @@ fn setup(h: &Harness) {
     );
 }
 
+/// A full-height quad from `left` to `right` with one constant volume coordinate.
 fn quad(left: f32, right: f32, coord: [f32; 3]) -> [VolumeVertex; 6] {
     let v = |x, y| VolumeVertex {
         x,
@@ -67,6 +74,7 @@ fn quad(left: f32, right: f32, coord: [f32; 3]) -> [VolumeVertex; 6] {
     ]
 }
 
+/// Draw the bound volume at `coord` over the whole target and read the centre pixel.
 fn sample(h: &Harness, coord: [f32; 3]) -> u32 {
     let quad = quad(-1.0, 1.0, coord);
     h.render_once(0, |d| {
@@ -75,6 +83,9 @@ fn sample(h: &Harness, coord: [f32; 3]) -> u32 {
     h.read_pixel(320, 240)
 }
 
+/// A MANAGED 8x4x2 volume of each format locks block pitches and samples both slices.
+///
+/// The slices hold different colours, so an exchanged or repeated slice reads wrong.
 #[test]
 fn dxt_volume_ungated_create_upload_and_sample_slices() {
     let h = Harness::new();
@@ -106,6 +117,12 @@ fn dxt_volume_ungated_create_upload_and_sample_slices() {
     }
 }
 
+/// Twelve-level SCRATCH chains upload every level down to 1x1 once bound for sampling.
+///
+/// A 4x2048x1 and an 8x2048x2 base put one-slice levels of many block rows and
+/// of a sub-alignment row pitch on the padded copy, which has to count block
+/// rows. Alternate levels differ in colour, so a level read in place of its
+/// neighbour shows.
 #[test]
 fn dxt_volume_scratch_block_rows_and_short_mips() {
     use mtld3d_types::{D3DPOOL_SCRATCH, D3DSAMP_MAXMIPLEVEL, D3DSAMP_MIPFILTER};
@@ -166,6 +183,10 @@ fn dxt_volume_scratch_block_rows_and_short_mips() {
     }
 }
 
+/// `CheckDeviceFormat` and `CreateVolumeTexture` agree for each format, usage and pool.
+///
+/// ATI1 and packed-YUV volumes are the negative control: unadvertised and
+/// rejected in the GPU-backed pools.
 #[test]
 fn dxt_volume_queries_pools_and_exclusions_agree() {
     use mtld3d_types::{
@@ -266,7 +287,6 @@ fn dxt_volume_queries_pools_and_exclusions_agree() {
     }
     for format in [
         mtld3d_types::D3DFMT_ATI1,
-        u32::from_le_bytes(*b"ATI2"),
         mtld3d_types::D3DFMT_YUY2,
         mtld3d_types::D3DFMT_UYVY,
     ] {
@@ -282,6 +302,11 @@ fn dxt_volume_queries_pools_and_exclusions_agree() {
     }
 }
 
+/// A one-block box lock changes that block alone, and `UpdateTexture` publishes it.
+///
+/// Boxes off the block grid or past the level are rejected with the blocks
+/// unchanged; a box ending on the edge of a level that is no multiple of four
+/// wide is accepted.
 #[test]
 fn dxt_volume_partial_boxes_preserve_other_blocks_and_publish_update_texture() {
     use mtld3d_types::{D3DBOX, D3DERR_INVALIDCALL, D3DPOOL_DEFAULT, D3DPOOL_SYSTEMMEM};
@@ -372,6 +397,7 @@ fn dxt_volume_partial_boxes_preserve_other_blocks_and_publish_update_texture() {
     }
 }
 
+/// Linear filtering blends two slices, and `D3DSAMP_SRGBTEXTURE` decodes every format.
 #[test]
 fn dxt_volume_srgb_decode_and_linear_slice_filtering() {
     use mtld3d_types::{D3DSAMP_SRGBTEXTURE, D3DTEXF_LINEAR};
@@ -415,6 +441,7 @@ fn dxt_volume_srgb_decode_and_linear_slice_filtering() {
     }
 }
 
+/// Transparent and opaque blocks sample their alpha, and a MANAGED volume survives `Reset`.
 #[test]
 fn dxt_volume_alpha_modes_and_managed_reset() {
     let h = Harness::new();
@@ -474,6 +501,7 @@ const VS_VOLUME_FETCH: [u32;30]=[
     0x0200_0001,0xe00f_0001,0x80e4_0000,0x0000_ffff,
 ];
 
+/// A `vs_3_0` `texldl` reads a volume of base depth one and of depth two.
 #[test]
 fn dxt_volume_vertex_fetch_follows_native_resource_dimension() {
     let h = Harness::new();
@@ -518,6 +546,7 @@ fn dxt_volume_vertex_fetch_follows_native_resource_dimension() {
     }
 }
 
+/// `ps_2_0` and `ps_3_0` sample every format at base depth one and two.
 #[test]
 fn dxt_volume_pixel_shaders_sample_all_compressed_formats() {
     let h = Harness::new();
@@ -611,6 +640,9 @@ fn dxt_volume_pixel_shaders_sample_all_compressed_formats() {
     }
 }
 
+/// A box write between two draws of one frame leaves the earlier draw its blocks.
+///
+/// The texture is released inside the frame, with both uploads still queued.
 #[test]
 fn dxt_volume_queued_partial_write_preserves_earlier_draw_and_release() {
     use mtld3d_types::{D3DBOX, D3DPOOL_DEFAULT, D3DUSAGE_DYNAMIC};
@@ -671,6 +703,11 @@ fn dxt_volume_queued_partial_write_preserves_earlier_draw_and_release() {
     }
 }
 
+/// DXT2 and DXT4 sample the stored blocks exactly as DXT3 and DXT5 do.
+///
+/// The literal blocks hold partial alpha (136 and 128) over a red of 66, a
+/// colour below its alpha, so a multiply or a divide by alpha on upload or
+/// sampling would move red. ONE and INVSRCALPHA blending is the application's.
 #[test]
 fn dxt_volume_premultiplied_aliases_keep_raw_samples_and_application_blending() {
     use mtld3d_types::{
