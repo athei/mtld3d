@@ -36,5 +36,23 @@ pub const fn bytes_per_image(bytes_per_row: u32, height: u32, block_height: u32)
     bytes_per_row.saturating_mul(block_rows(height, block_height))
 }
 
+/// End offset of the whole source rows a blit starting at `buffer_offset` reads.
+///
+/// The start is snapped down to its row, the unit a row-by-row repack copies
+/// in, and `rows` rows of `bytes_per_row` follow it. `None` is an overflow or a
+/// zero stride; a caller compares the answer against the staging length before
+/// it forms a pointer.
+#[must_use]
+pub const fn source_rows_end(buffer_offset: u64, bytes_per_row: u32, rows: u32) -> Option<u64> {
+    if bytes_per_row == 0 {
+        return None;
+    }
+    let stride = bytes_per_row as u64;
+    let Some(last_row) = (buffer_offset / stride).checked_add(rows as u64) else {
+        return None;
+    };
+    last_row.checked_mul(stride)
+}
+
 #[cfg(test)]
 mod tests;
