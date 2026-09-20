@@ -4500,11 +4500,18 @@ impl FrameEncoder {
         let xform_ptr = self.scratch.alloc(&xform);
         // The source level, as the float the blit PS passes to `level()`; mip
         // counts are tiny, so the conversion is exact. `.y` carries the source
-        // decode (0 = sample as-is, 1 = YUY2, 2 = UYVY) so one pipeline per
-        // destination format serves every source format.
+        // decode (`BlitDecode::uniform`) so one pipeline per destination
+        // format serves every source format. `.zw` carries the source's
+        // logical extent, the space the texcoord is normalised to. For every
+        // source but a planar YUV one that is also the texture's extent; a
+        // planar texture is as wide as the lock pitch and holds the chroma
+        // rows after the luma rows, so its decode cannot take the extent from
+        // the texture.
         let mut src_level = [0u8; 16];
         src_level[..4].copy_from_slice(&to_f(src_mip).to_le_bytes());
         src_level[4..8].copy_from_slice(&decode.uniform().to_le_bytes());
+        src_level[8..12].copy_from_slice(&to_f(src_dims.0).to_le_bytes());
+        src_level[12..16].copy_from_slice(&to_f(src_dims.1).to_le_bytes());
         let src_level_ptr = self.scratch.alloc(&src_level);
 
         // Save the device's current attachments + viewport so the one-off
