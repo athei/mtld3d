@@ -1364,8 +1364,8 @@ Q8W8V8U8 rows of test_signed_formats do not depend on the mechanism that
 fails the V8U8 rows on the `@mac2` legs. Render-target and sRGB capabilities
 stay absent; AUTOGEN texture/cube requests preserve usage but use one actual
 level with no generated chain. MANAGED+DYNAMIC creation is rejected for
-V16U16, Q8W8V8U8, Q16W16V16U16 and A2R10G10B10 only. X8L8V8U8 and L6V5U5
-remain separate capabilities.
+V16U16, Q8W8V8U8, Q16W16V16U16, A2R10G10B10 and A2B10G10R10 only. X8L8V8U8
+and L6V5U5 remain separate capabilities.
 
 Q16W16V16U16 textures use native RGBA16Snorm storage and the same scoped
 NOAUTOGEN, pool and unavailable render/sRGB policies. All four lanes are

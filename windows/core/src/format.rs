@@ -280,9 +280,9 @@ pub const fn is_mapped_color_format(d3d_format: u32) -> bool {
 
 /// Colour formats whose creation rejects the MANAGED/DYNAMIC combination.
 ///
-/// V16U16, Q8W8V8U8, Q16W16V16U16 and A2R10G10B10 follow the native pool
-/// rule. Other formats retain their legacy policy; this does not replace pool
-/// validation.
+/// V16U16, Q8W8V8U8, Q16W16V16U16, A2R10G10B10 and A2B10G10R10 follow the
+/// native pool rule. Other formats retain their legacy policy; this does not
+/// replace pool validation.
 #[must_use]
 pub const fn uses_strict_dynamic_pool_validation(d3d_format: u32) -> bool {
     matches!(
@@ -297,9 +297,9 @@ pub const fn uses_strict_dynamic_pool_validation(d3d_format: u32) -> bool {
 
 /// Colour formats whose AUTOGEN requests use one level without generation.
 ///
-/// V16U16, Q8W8V8U8, Q16W16V16U16 and A2R10G10B10 advertise NOAUTOGEN. Usage
-/// is retained; creation suppresses the internal generation flag and hidden
-/// levels. Other formats keep their existing creation policy.
+/// V16U16, Q8W8V8U8, Q16W16V16U16, A2R10G10B10 and A2B10G10R10 advertise
+/// NOAUTOGEN. Usage is retained; creation suppresses the internal generation
+/// flag and hidden levels. Other formats keep their existing creation policy.
 #[must_use]
 pub const fn uses_noautogen_fallback(d3d_format: u32) -> bool {
     matches!(

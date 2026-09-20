@@ -2285,11 +2285,13 @@ fn a2r10g10b10_vertex_texture_keeps_ten_bit_precision_and_alpha() {
     packed10_vertex_texture(mtld3d_types::D3DFMT_A2R10G10B10);
 }
 
+/// Vertex fetch reads red from the low lane of A2B10G10R10, with the same precision and alpha.
 #[test]
 fn a2b10g10r10_vertex_texture_keeps_ten_bit_precision_and_alpha() {
     packed10_vertex_texture(mtld3d_types::D3DFMT_A2B10G10R10);
 }
 
+/// Fetch 513, 514 and 515 from `format` in a vertex shader, amplified, then alpha alone.
 fn packed10_vertex_texture(format: u32) {
     let h = Harness::new();
     let tex = h.create_texture(1, 1, 1, 0, format, D3DPOOL_MANAGED);

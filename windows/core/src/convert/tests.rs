@@ -1255,4 +1255,9 @@ fn colorfill_a2b10g10r10_exchanges_only_red_and_blue() {
         d3dcolor_fill_pixel_bytes(0x7f2b_00ff, D3DFMT_A2B10G10R10).unwrap(),
         ((1_u32 << 30) | (1023 << 20) | 0x00ad).to_le_bytes()
     );
+    // Four distinct channels: alpha 3, blue 959, green 762, red 694 (0x2b6).
+    assert_eq!(
+        d3dcolor_fill_pixel_bytes(0xdead_beef, D3DFMT_A2B10G10R10).unwrap(),
+        ((3_u32 << 30) | (959 << 20) | (762 << 10) | 0x02b6).to_le_bytes()
+    );
 }
