@@ -584,6 +584,42 @@ fn autogen_mipmap_texture_rejects_sub_level_unlock() {
 }
 
 #[test]
+fn autogen_generate_mip_sub_levels_reads_the_pending_level_zero_write() {
+    // An explicit `GenerateMipSubLevels` downsamples level 0, and a level-0
+    // write whose upload is still waiting for a bind is part of that level.
+    // The generated chain has to carry it, whether the call publishes the
+    // write itself or the bind that samples the chain does.
+    const RED: u32 = 0xFFFF_0000;
+    const GREEN: u32 = 0xFF00_FF00;
+    let h = Harness::new();
+    assert_eq!(h.set_sampler_state(0, D3DSAMP_MIPFILTER, D3DTEXF_POINT), 0);
+    // Level 4 of a 64x64 chain is generated, never written: what it reads is
+    // the downsample of the level 0 the generate op saw.
+    assert_eq!(h.set_sampler_state(0, D3DSAMP_MAXMIPLEVEL, 4), 0);
+    for pool in [D3DPOOL_DEFAULT, D3DPOOL_MANAGED] {
+        let tex = h.create_texture(64, 64, 0, D3DUSAGE_AUTOGENMIPMAP, D3DFMT_A8R8G8B8, pool);
+        tex.lock_rect(0, 0).write_u32(&[RED; 64 * 64]);
+        assert_pixel_eq(
+            sample_center(&h, &tex).to_pixel(),
+            RED,
+            "the chain follows the first level-0 write",
+        );
+        // Nothing binds the texture between this unlock and the explicit
+        // call, so the write is still an upload the layer owes level 0.
+        tex.lock_rect(0, 0).write_u32(&[GREEN; 64 * 64]);
+        tex.generate_mip_sub_levels();
+        // Close the frame the call was queued in, so its generate reaches the
+        // GPU before anything binds the texture again.
+        assert_eq!(h.present(), 0, "submit the explicit regeneration");
+        assert_pixel_eq(
+            sample_center(&h, &tex).to_pixel(),
+            GREEN,
+            "the chain follows the pending level-0 write",
+        );
+    }
+}
+
+#[test]
 fn default_pool_texture_lock_splits_by_entry_point() {
     let h = Harness::new();
     // D3D9 makes a `D3DPOOL_DEFAULT` texture without `D3DUSAGE_DYNAMIC`

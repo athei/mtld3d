@@ -3602,8 +3602,8 @@ extern "system" fn texture_get_auto_gen_filter_type(this: *mut c_void) -> u32 {
     obj.inner().autogen_filter_type
 }
 
-// Game-driven explicit mip regeneration. For an AUTOGENMIPMAP texture
-// it pushes the same `run_generate_mipmaps` op the upload path uses.
+// Game-driven explicit mip regeneration. For an AUTOGENMIPMAP texture it
+// publishes level 0's pending write and generates the chain from it, once.
 // For a non-AUTOGENMIPMAP texture the D3D9 spec leaves it undefined —
 // log once and do nothing.
 extern "system" fn texture_generate_mip_sub_levels(this: *mut c_void) {
@@ -3633,6 +3633,17 @@ extern "system" fn texture_generate_mip_sub_levels(this: *mut c_void) {
         return;
     }
     let dev = DeviceInner::from_ptr(ti.device_inner);
+    // A set level-0 bit is a write waiting for a bind to upload it, and the
+    // generate op leads the frame it is pushed into, so without this flush the
+    // chain would be downsampled from the copy the GPU still holds. The flush
+    // emits that upload with its own regeneration behind it, which is the
+    // chain this call asks for, so pushing another op here would generate it
+    // a second time.
+    let upload_regenerates = ti.dirty_mask & 1 != 0 && !ti.is_cpu_only();
+    flush_dirty_mips(ti, dev);
+    if upload_regenerates {
+        return;
+    }
     dev.push_op(Box::new(move |enc: &mut FrameEncoder| {
         enc.run_generate_mipmaps(texture_id);
     }));
