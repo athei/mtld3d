@@ -16,8 +16,8 @@ use mtld3d_types::{
 };
 
 use super::{
-    VariantFlags, VariantKey, VsSamplerKinds, declared_ps_samplers, emit_ps_programmable,
-    emit_vs_programmable, emit_vs_programmable_named,
+    POS_FIXUP_MSL, VariantFlags, VariantKey, VsSamplerKinds, declared_ps_samplers,
+    emit_ps_programmable, emit_vs_programmable, emit_vs_programmable_named,
 };
 use crate::{
     dxso::{ir::TextureType, parser::parse},
@@ -4022,9 +4022,13 @@ fn programmable_vs_emits_half_pixel_pos_fixup() {
     let msl = emit_vs_programmable(&vs).expect("emit vs_1_1");
     assert!(
         msl.contains(&format!(
-            "constant float4 &pos_fixup [[buffer({VS_POS_FIXUP_SLOT})]]"
+            "constant PosFixup &pos_fixup [[buffer({VS_POS_FIXUP_SLOT})]]"
         )),
-        "VS must declare the pos_fixup uniform at slot 13:\n{msl}"
+        "VS must declare the pos_fixup uniform at its slot:\n{msl}"
+    );
+    assert!(
+        msl.contains(POS_FIXUP_MSL),
+        "VS must declare the PosFixup struct:\n{msl}"
     );
     assert!(
         msl.contains("out.position.x += pos_fixup.x * out.position.w;")
@@ -4035,6 +4039,60 @@ fn programmable_vs_emits_half_pixel_pos_fixup() {
     assert!(
         msl.contains("out.position = in.v0;"),
         "oPos write must survive the epilogue:\n{msl}"
+    );
+    metal_compile_or_fail(&msl);
+}
+
+#[test]
+fn programmable_vs_zeroes_the_texcoords_it_never_writes() {
+    // `mov oPos, v0` writes no texture coordinate, so a PS reading `t0`
+    // must see zero, as it does on D3D9 hardware, rather than whatever the
+    // register held.
+    let bc = [
+        0xFFFE_0101,
+        opcode_token(OP_DCL, 2),
+        0x0000_0000,
+        dst_token(TYPE_INPUT, 0, 0xF, false),
+        opcode_token(OP_MOV, 2),
+        dst_token(TYPE_RASTOUT, 0, 0xF, false),
+        src_token(TYPE_INPUT, 0, SWIZ_IDENTITY, 0),
+        END_TOKEN,
+    ];
+    let vs = parse(&bc).expect("vs_1_1 parse");
+    let msl = emit_vs_programmable(&vs).expect("emit vs_1_1");
+    for i in 0..16 {
+        assert!(
+            msl.contains(&format!("out.texcoord{i} = float4(0.0);")),
+            "texcoord{i} must start at zero:\n{msl}"
+        );
+    }
+}
+
+#[test]
+fn programmable_vs_adds_the_depth_bias_after_fog_z() {
+    // `D3DRS_DEPTHBIAS` is an absolute depth offset, which Metal's
+    // `setDepthBias` cannot express on a float depth buffer, so the vertex
+    // shader adds it, scaled by `w` to survive the perspective divide. It
+    // lands after `fog_z`: the table-fog source adds the raw bias itself and
+    // must read the unbiased depth.
+    let bc = [
+        0xFFFE_0101,
+        opcode_token(OP_DCL, 2),
+        0x0000_0000,
+        dst_token(TYPE_INPUT, 0, 0xF, false),
+        opcode_token(OP_MOV, 2),
+        dst_token(TYPE_RASTOUT, 0, 0xF, false),
+        src_token(TYPE_INPUT, 0, SWIZ_IDENTITY, 0),
+        END_TOKEN,
+    ];
+    let vs = parse(&bc).expect("vs_1_1 parse");
+    let msl = emit_vs_programmable(&vs).expect("emit vs_1_1");
+    let bias = "float _depth_biased = _pos.z + pos_fixup.depth_bias * _pos.w;";
+    let bias_at = msl.find(bias).expect("VS applies the depth bias");
+    let fog_z = msl.find("out.fog_z =").expect("VS writes fog_z");
+    assert!(
+        fog_z < bias_at,
+        "fog_z must read the unbiased depth:\n{msl}"
     );
     metal_compile_or_fail(&msl);
 }

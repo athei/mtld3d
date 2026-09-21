@@ -557,12 +557,13 @@ impl Command {
 
     /// `encoder.setDepthBias(bias, slopeScale: slope, clamp: 0.0)`.
     ///
-    /// `depth_bias` is already scaled to the active depth format's ULP
-    /// (every depth surface in mtld3d resolves to `Depth32Float` or
-    /// `Depth32Float_Stencil8`, so callers multiply the raw D3D9 float
-    /// by 2^23 before constructing the command — see
-    /// `mtld3d_core::convert::d3d_depth_bias_to_metal`). `slope_scale` is
-    /// passed through unchanged. Clamp is hardcoded to 0.0 unix-side.
+    /// Both values are passed through unchanged. `emit_draw` sends a zero
+    /// `depth_bias`: on a float depth buffer Metal scales the constant term
+    /// by the depth's exponent, which `D3DRS_DEPTHBIAS` does not, so that
+    /// state reaches the vertex shader instead (see
+    /// `mtld3d_core::convert::d3d_depth_bias_to_clip`) and only
+    /// `D3DRS_SLOPESCALEDEPTHBIAS` arrives here. Clamp is hardcoded to 0.0
+    /// unix-side.
     #[must_use]
     pub const fn set_depth_bias(depth_bias: f32, slope_scale: f32) -> Self {
         Self {

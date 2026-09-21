@@ -436,43 +436,46 @@ pub fn d3d_to_metal_blend_op(d3d_op: u32) -> BlendOperation {
     }
 }
 
-/// Scale D3D9's raw `D3DRS_DEPTHBIAS` value into a Metal `setDepthBias` value.
+/// Convert D3D9's raw `D3DRS_DEPTHBIAS` into the clip-space offset the vertex shader adds.
 ///
-/// The raw value is a float stored in the state DWORD; the scaled result
-/// is sized for the active depth-buffer format.
+/// D3D9 adds the bias to the fragment's depth as an absolute value in the
+/// `[0, 1]` depth range, whatever that depth is. Metal's `setDepthBias`
+/// cannot express that on a float depth buffer, and every D3D9 depth format
+/// maps to `Depth32Float` here: Metal scales the constant term by
+/// `2^(exponent(z) - 23)`, so one value delivers half the offset at a depth
+/// of 0.75, a quarter at 0.375 and a thirty-second at 0.047. The vertex
+/// shaders add the offset themselves instead, as
+/// `position.z += depth_bias * position.w`, which survives the perspective
+/// divide as a constant.
 ///
-/// D3D9's contract is "1 ULP at the depth-buffer's resolution", so the
-/// scale factor is `1 / depth_min_unit`. mtld3d maps every D3D9 depth
-/// format (D16 / D24X8 / D24S8 / D32 / D32F) to `MTLPixelFormat::Depth32Float`
-/// (or `Depth32Float_Stencil8`) — see
-/// `unix/unix/src/metal/texture.rs`. For `Depth32Float` the minimum
-/// representable depth step in the `[0, 1]` projected range is 2^-23
-/// (the float mantissa width), so the scale is `1 << 23`.
+/// That sum happens ahead of the viewport's depth mapping, which would scale
+/// it by `max_z - min_z`, so the value is divided by that range here. An
+/// empty or inverted range maps every fragment to one depth, where no offset
+/// can order them, and returns zero.
 ///
-/// `D3DRS_SLOPESCALEDEPTHBIAS` is a unit-less multiplier, so it does
-/// not need scaling — pass it straight through to `setDepthBias`.
+/// `D3DRS_SLOPESCALEDEPTHBIAS` is not part of this: Metal applies the slope
+/// term unscaled, so it stays on `setDepthBias`.
 #[must_use]
-pub fn d3d_depth_bias_to_metal(raw_d3d: u32) -> f32 {
-    // 2^23 = 8_388_608 — exactly representable in f32 (literal is exact).
-    const D32_FLOAT_BIAS_SCALE: f32 = 8_388_608.0;
-    f32::from_bits(raw_d3d) * D32_FLOAT_BIAS_SCALE
+pub fn d3d_depth_bias_to_clip(raw_d3d: u32, min_z: f32, max_z: f32) -> f32 {
+    let range = max_z - min_z;
+    if range > 0.0 {
+        f32::from_bits(raw_d3d) / range
+    } else {
+        0.0
+    }
 }
 
-/// `-1e-4` as `f32` bits — magnitude of the implicit decal-bias.
+/// `-5e-5` as `f32` bits, the magnitude of the implicit decal bias.
 ///
 /// Applied by `emit_draw` when `looks_like_decal` matches. Negative
-/// pushes toward camera (D3D9 depth: 0 = near, 1 = far). After the
-/// `d3d_depth_bias_to_metal` scaling (`1 << 23`) this lands around
-/// `-838.9` Metal units — large enough to swamp ULP-level noise from
-/// divergent FP rounding between pipelines on Apple Silicon, small
-/// enough that genuine geometry an order of magnitude further from the
-/// surface still composites correctly. At grazing angles a typical
-/// structural eye-space delta between two decal/surface VSes lands in
-/// `(3e-5, 1e-4]` on observed pixels at `z ≈ 0.92`, which sets the
-/// lower bound. Stored as the precomputed IEEE-754 bit pattern via
+/// pushes toward camera (D3D9 depth: 0 = near, 1 = far). The value was
+/// tuned as `-1e-4` while the bias went through Metal's `setDepthBias`,
+/// which delivered half of it at the depth it was tuned at (`z = 0.92`);
+/// now that the offset arrives whole, half the old constant keeps the
+/// effect where it was. Stored as the precomputed IEEE-754 bit pattern via
 /// `f32::to_bits` so the magnitude can be tuned in float-literal form
 /// while the call site keeps consuming `u32`.
-pub const IMPLICIT_DECAL_BIAS_RAW: u32 = (-1.0e-4_f32).to_bits();
+pub const IMPLICIT_DECAL_BIAS_RAW: u32 = (-5.0e-5_f32).to_bits();
 
 /// Slope-scale component applied alongside `IMPLICIT_DECAL_BIAS_RAW`.
 ///

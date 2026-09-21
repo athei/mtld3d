@@ -14,7 +14,7 @@ pub use mtld3d_core::shader_cache::{
 use mtld3d_core::{
     convert::{
         DecalHeuristicInputs, IMPLICIT_DECAL_BIAS_RAW, IMPLICIT_DECAL_SLOPE_SCALE,
-        d3d_depth_bias_to_metal, d3d_to_metal_cull, d3d_to_metal_fill, looks_like_decal,
+        d3d_depth_bias_to_clip, d3d_to_metal_cull, d3d_to_metal_fill, looks_like_decal,
     },
     depth_stencil_state::{DepthStencilSnapshot, STENCIL_MASK_BITS},
     dirty_range::{indexed_vb_range_lower_bound, nonindexed_vb_range},
@@ -1145,7 +1145,7 @@ pub struct RenderStateSnapshot {
     /// Raw `D3DRS_DEPTHBIAS` bit pattern (f32 stored in the state DWORD).
     ///
     /// Decoded inside `emit_draw` via
-    /// `mtld3d_core::convert::d3d_depth_bias_to_metal`.
+    /// `mtld3d_core::convert::d3d_depth_bias_to_clip`.
     pub depth_bias: u32,
     /// Raw `D3DRS_SLOPESCALEDEPTHBIAS` bit pattern.
     pub slope_scale_depth_bias: u32,
@@ -1768,7 +1768,12 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
     } else {
         render_state.depth_bias
     };
-    let depth_bias = d3d_depth_bias_to_metal(raw_bias);
+    // The constant term goes to the vertex shader through `pos_fixup`
+    // (emitted below): Metal's own constant bias scales with the depth's
+    // exponent on a float depth buffer, D3D9's does not. Only the slope
+    // term, which Metal applies unscaled, stays on `setDepthBias`.
+    let (min_z, max_z) = enc.viewport_depth_range();
+    let depth_bias = d3d_depth_bias_to_clip(raw_bias, min_z, max_z);
     // Slope-scale: when the decal heuristic fires, layer
     // `IMPLICIT_DECAL_SLOPE_SCALE` on top of the absolute bias.
     // `looks_like_decal` already requires the game's own slope-scale to be
@@ -1783,8 +1788,8 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
     } else {
         f32::from_bits(render_state.slope_scale_depth_bias)
     };
-    if enc.last_bound().depth_bias_changed(depth_bias, slope_scale) {
-        enc.emit_command(Command::set_depth_bias(depth_bias, slope_scale));
+    if enc.last_bound().depth_bias_changed(0.0, slope_scale) {
+        enc.emit_command(Command::set_depth_bias(0.0, slope_scale));
     }
 
     // D3D9 depth-clamps (skips z-clip on) pre-transformed (XYZRHW) geometry
@@ -1855,7 +1860,7 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
              rs[Z={z} ZW={zw} AB={ab} zf={zf} bias={bias:#010x} slope={slope:#010x}] \
              blend[src={src} dst={dst} op={op}] at={alpha_func} \
              decal_fires={decal_fires} applied_raw={raw_bias:#010x} \
-             applied_metal={depth_bias:.3} slope_metal={slope_scale:.3}",
+             applied_clip={depth_bias:e} slope_metal={slope_scale:.3}",
             z = u32::from(render_state.depth_enable()),
             zw = u32::from(render_state.depth_write()),
             ab = u32::from(render_state.blend_enable()),
@@ -2087,31 +2092,34 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
     // shader declares `constant float4 &pos_fixup` there and shifts
     // clip-space position half a pixel right/down so on-boundary geometry
     // lands on the D3D9 window→NDC reference.
-    // `(1/vp_w, -1/vp_h, depth_clamp_z, render_scale)` from the live viewport;
+    // `(1/vp_w, -1/vp_h, depth_clamp_z, render_scale, depth_bias)`, the
+    // `PosFixup` struct of `mtld3d_core::dxso::emit::POS_FIXUP_MSL`;
     // the `.z` lane selects the FF RHW epilogue's depth clamp (the D3D9
     // depth-clamp rule, see `depth_clamp_z` above) and the `.w` lane carries
     // render pixels per logical pixel, which the point-size epilogue applies
     // to a size D3D9 states in the logical space. The viewport dims are
     // already in the bound target's space, so `.xy` needs no conversion.
-    // Deduped so it only re-emits when the viewport dims, the clamp predicate
-    // or the bound target's scale change (rare).
+    // The last lane is `D3DRS_DEPTHBIAS` as the clip-space offset resolved
+    // above. Deduped so it only re-emits when the viewport dims, the clamp
+    // predicate, the bound target's scale or the bias change (rare).
     let (_, _, vp_w, vp_h) = enc.effective_viewport();
     // Viewport dims fit u16 in practice; convert without an `as`-cast
     // precision-loss lint (same idiom as `encoder.rs`).
     let to_f = |v: u32| f32::from(u16::try_from(v).unwrap_or(u16::MAX));
-    let pos_fixup: [f32; 4] = [
+    let pos_fixup: [f32; 5] = [
         1.0 / to_f(vp_w.max(1)),
         -1.0 / to_f(vp_h.max(1)),
         f32::from(u8::from(depth_clamp_z)),
         enc.target_scale().factor(),
+        depth_bias,
     ];
-    // SAFETY: `[f32; 4]` is POD with no padding; reinterpreting the array as
-    // 16 contiguous bytes is sound and the borrow is local to this scope.
+    // SAFETY: `[f32; 5]` is POD with no padding; reinterpreting the array as
+    // 20 contiguous bytes is sound and the borrow is local to this scope.
     let pos_fixup_bytes =
-        unsafe { core::slice::from_raw_parts(pos_fixup.as_ptr().cast::<u8>(), 16) };
+        unsafe { core::slice::from_raw_parts(pos_fixup.as_ptr().cast::<u8>(), 20) };
     if enc.last_bound().vs_pos_fixup_changed(pos_fixup_bytes) {
         let ptr = enc.alloc_scratch(pos_fixup_bytes);
-        enc.emit_command(Command::set_vertex_bytes_at(ptr, 16, VS_POS_FIXUP_SLOT));
+        enc.emit_command(Command::set_vertex_bytes_at(ptr, 20, VS_POS_FIXUP_SLOT));
     }
     // Per-draw `VsDraw` uniform (point size state). Every vertex shader
     // declares it, so it must be bound before the first draw of a pass; the

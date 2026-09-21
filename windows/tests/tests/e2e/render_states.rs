@@ -8,12 +8,13 @@ use mtld3d_tests::{
 };
 use mtld3d_types::{
     D3DBLEND_INVSRCALPHA, D3DBLEND_ONE, D3DBLEND_SRCALPHA, D3DBLENDOP_ADD, D3DCLEAR_STENCIL,
-    D3DCLEAR_TARGET, D3DCLEAR_ZBUFFER, D3DCMP_ALWAYS, D3DCMP_EQUAL, D3DCMP_LESSEQUAL, D3DCULL_CCW,
-    D3DCULL_CW, D3DCULL_NONE, D3DFILL_SOLID, D3DFILL_WIREFRAME, D3DFMT_A8R8G8B8, D3DFVF_DIFFUSE,
-    D3DFVF_TEX1, D3DFVF_XYZ, D3DPOOL_DEFAULT, D3DPT_TRIANGLELIST, D3DRECT, D3DRS_ALPHABLENDENABLE,
-    D3DRS_BLENDOP, D3DRS_COLORWRITEENABLE, D3DRS_CULLMODE, D3DRS_DESTBLEND, D3DRS_FILLMODE,
-    D3DRS_LIGHTING, D3DRS_SCISSORTESTENABLE, D3DRS_SRCBLEND, D3DRS_SRGBWRITEENABLE,
-    D3DRS_STENCILENABLE, D3DRS_STENCILFUNC, D3DRS_STENCILMASK, D3DRS_STENCILPASS, D3DRS_STENCILREF,
+    D3DCLEAR_TARGET, D3DCLEAR_ZBUFFER, D3DCMP_ALWAYS, D3DCMP_EQUAL, D3DCMP_LESS, D3DCMP_LESSEQUAL,
+    D3DCULL_CCW, D3DCULL_CW, D3DCULL_NONE, D3DFILL_SOLID, D3DFILL_WIREFRAME, D3DFMT_A8R8G8B8,
+    D3DFVF_DIFFUSE, D3DFVF_TEX1, D3DFVF_XYZ, D3DPOOL_DEFAULT, D3DPT_TRIANGLELIST, D3DRECT,
+    D3DRS_ALPHABLENDENABLE, D3DRS_BLENDOP, D3DRS_COLORWRITEENABLE, D3DRS_CULLMODE, D3DRS_DEPTHBIAS,
+    D3DRS_DESTBLEND, D3DRS_FILLMODE, D3DRS_LIGHTING, D3DRS_SCISSORTESTENABLE, D3DRS_SRCBLEND,
+    D3DRS_SRGBWRITEENABLE, D3DRS_STENCILENABLE, D3DRS_STENCILFUNC, D3DRS_STENCILMASK,
+    D3DRS_STENCILPASS, D3DRS_STENCILREF, D3DRS_ZENABLE, D3DRS_ZFUNC, D3DRS_ZWRITEENABLE,
     D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_MAGFILTER, D3DSAMP_MINFILTER, D3DSTENCILOP_KEEP,
     D3DSTENCILOP_REPLACE, D3DTADDRESS_CLAMP, D3DTEXF_POINT, D3DUSAGE_RENDERTARGET,
     render_state_defaults,
@@ -502,6 +503,78 @@ fn additive_pass_selected_by_depth_equal_reaches_the_target() {
         WHITE,
         "the EQUAL-selected additive pass reached the target"
     );
+}
+
+#[test]
+fn depth_bias_is_an_absolute_offset_at_every_depth() {
+    // `D3DRS_DEPTHBIAS` is added to the fragment's depth as it stands, whatever
+    // that depth is. A quad one `gap` behind a stored depth under `LESS` passes
+    // once the bias exceeds the gap and not before, and the amount it takes must
+    // not depend on where in the depth range the pair sits: a float depth buffer
+    // that scales the bias by the depth's exponent delivers half of it at 0.75
+    // and a thirty-second of it at 0.047.
+    let h = Harness::with_depth();
+    arm_diffuse(&h);
+    let gap = 1.0_f32 / 4096.0;
+    let wins = |z0: f32, bias: f32| {
+        h.render_once(BLACK, |d| {
+            assert_eq!(d.clear(D3DCLEAR_ZBUFFER, 0, 1.0, 0), 0, "depth clear");
+            assert_eq!(d.set_render_state(D3DRS_ZENABLE, 1), 0);
+            assert_eq!(d.set_render_state(D3DRS_ZWRITEENABLE, 1), 0);
+            assert_eq!(d.set_render_state(D3DRS_ZFUNC, D3DCMP_LESS), 0);
+            assert_eq!(d.set_render_state(D3DRS_DEPTHBIAS, 0), 0);
+            assert_eq!(
+                d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad_at_depth(GREEN, z0)),
+                0,
+                "stored depth"
+            );
+            assert_eq!(d.set_render_state(D3DRS_DEPTHBIAS, bias.to_bits()), 0);
+            assert_eq!(
+                d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad_at_depth(RED, z0 + gap)),
+                0,
+                "biased quad"
+            );
+        });
+        h.read_pixel(320, 240) == RED
+    };
+    for z0 in [0.75_f32, 0.375, 0.1875, 0.046_875] {
+        assert!(
+            !wins(z0, -0.75 * gap),
+            "z0={z0}: a bias under the gap leaves the quad behind"
+        );
+        assert!(
+            wins(z0, -1.5 * gap),
+            "z0={z0}: a bias over the gap brings the quad in front"
+        );
+    }
+}
+
+#[test]
+fn depth_bias_never_clips_geometry_on_a_depth_plane() {
+    // D3D9 biases a fragment after clipping and clamps the result to the depth
+    // range, so a quad lying on the far plane under a positive bias, or on the
+    // near plane under a negative one, is still drawn. A bias added to the
+    // clip-space position alone would push either one out of the clip volume.
+    let h = Harness::with_depth();
+    arm_diffuse(&h);
+    for (z, bias) in [(1.0_f32, 0.1_f32), (0.0, -0.1)] {
+        h.render_once(BLACK, |d| {
+            assert_eq!(d.clear(D3DCLEAR_ZBUFFER, 0, 1.0, 0), 0, "depth clear");
+            assert_eq!(d.set_render_state(D3DRS_ZENABLE, 1), 0);
+            assert_eq!(d.set_render_state(D3DRS_ZFUNC, D3DCMP_LESSEQUAL), 0);
+            assert_eq!(d.set_render_state(D3DRS_DEPTHBIAS, bias.to_bits()), 0);
+            assert_eq!(
+                d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad_at_depth(GREEN, z)),
+                0,
+                "biased quad on the plane"
+            );
+        });
+        assert_eq!(
+            h.read_pixel(320, 240),
+            GREEN,
+            "z={z} bias={bias}: the quad survives the bias"
+        );
+    }
 }
 
 #[test]

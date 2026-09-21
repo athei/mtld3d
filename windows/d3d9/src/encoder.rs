@@ -3670,6 +3670,15 @@ impl FrameEncoder {
         self.pass_state.effective_viewport()
     }
 
+    /// Depth range of the current viewport, `(min_z, max_z)`.
+    ///
+    /// Read at draw time for the `pos_fixup` uniform: the vertex shader adds
+    /// `D3DRS_DEPTHBIAS` ahead of the viewport's depth mapping, so the bias
+    /// is divided by this range first.
+    pub const fn viewport_depth_range(&self) -> (f32, f32) {
+        self.pass_state.viewport_depth_range()
+    }
+
     /// Scale between the D3D9-reported space and the bound target's own.
     ///
     /// `render.scale` while the back buffer is bound, the identity otherwise.

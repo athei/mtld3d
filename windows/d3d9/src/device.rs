@@ -13839,9 +13839,9 @@ const fn rs_classify(index: u32, value: u32) -> RsClass {
         // `Command::set_blend_color`, emitted in `emit_draw` whenever
         // the value differs from the default opaque white.
         | D3DRS_BLENDFACTOR
-        // DEPTHBIAS / SLOPESCALEDEPTHBIAS feed Metal's per-encoder
-        // rasterizer offset via `Command::set_depth_bias`, emitted
-        // unconditionally per draw. Without these, ground-projected
+        // DEPTHBIAS feeds the vertex shaders' `pos_fixup.depth_bias`
+        // and SLOPESCALEDEPTHBIAS Metal's per-encoder rasterizer offset
+        // (`Command::set_depth_bias`), both resolved per draw. Without these, ground-projected
         // decals (shadows, projectors, alpha overlays) z-fight with
         // the surface they sit on.
         | D3DRS_DEPTHBIAS
