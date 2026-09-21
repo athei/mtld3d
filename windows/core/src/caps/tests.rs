@@ -7,7 +7,7 @@
 //! `debug.capsAll` fill is pinned as a superset that leaves shader versions and SM2.x caps alone.
 
 use mtld3d_types::{
-    AddressCaps, BlendCaps, CmpCaps, D3DCAPS9, DeclTypeCaps, DevCaps, DevCaps2, FilterCaps,
+    AddressCaps, BlendCaps, Caps3, CmpCaps, D3DCAPS9, DeclTypeCaps, DevCaps, DevCaps2, FilterCaps,
     FvfCaps, LineCaps, PrimitiveMiscCaps, RasterCaps, ShadeCaps, StencilCaps, TexOpCaps,
     TextureCaps, VtxpCaps, d3dps_version, d3dvs_version,
 };
@@ -45,6 +45,38 @@ fn default_caps_advertise_hardware_rasterization() {
     );
 }
 
+#[test]
+fn dev_caps_matches_implementation() {
+    // Everything a D3D9 HAL reports except the four patch bits and
+    // SEPARATETEXTUREMEMORIES. DRAWPRIMITIVES2EX is what the IW4 engine
+    // (Modern Warfare 2) tests as "at least DirectX 7 compliant".
+    let expected = DevCaps::EXECUTESYSTEMMEMORY
+        | DevCaps::EXECUTEVIDEOMEMORY
+        | DevCaps::TLVERTEXSYSTEMMEMORY
+        | DevCaps::TLVERTEXVIDEOMEMORY
+        | DevCaps::TEXTURESYSTEMMEMORY
+        | DevCaps::TEXTUREVIDEOMEMORY
+        | DevCaps::DRAWPRIMTLVERTEX
+        | DevCaps::CANRENDERAFTERFLIP
+        | DevCaps::TEXTURENONLOCALVIDMEM
+        | DevCaps::DRAWPRIMITIVES2
+        | DevCaps::DRAWPRIMITIVES2EX
+        | DevCaps::HWTRANSFORMANDLIGHT
+        | DevCaps::CANBLTSYSTONONLOCAL
+        | DevCaps::HWRASTERIZATION
+        | DevCaps::PUREDEVICE;
+    assert_eq!(filled().dev_caps, expected.bits());
+}
+
+#[test]
+fn caps3_advertises_the_copy_paths() {
+    // UpdateSurface / UpdateTexture and GetRenderTargetData are live; there
+    // is no D3DPRESENT_LINEAR_CONTENT conversion, so that bit stays off.
+    let expected =
+        Caps3::ALPHA_FULLSCREEN_FLIP_OR_DISCARD | Caps3::COPY_TO_VIDMEM | Caps3::COPY_TO_SYSTEMMEM;
+    assert_eq!(filled().caps3, expected.bits());
+}
+
 // Each field below is spelled out bit by bit, independently of the
 // constant `fill_default` reads, because every bit is backed by a
 // Consumed classifier arm: the test fails if a future edit silently
@@ -60,6 +92,7 @@ fn primitive_misc_caps_matches_implementation() {
         | PrimitiveMiscCaps::CLIPTLVERTS
         | PrimitiveMiscCaps::BLENDOP
         | PrimitiveMiscCaps::INDEPENDENTWRITEMASKS
+        | PrimitiveMiscCaps::FOGANDSPECULARALPHA
         | PrimitiveMiscCaps::SEPARATEALPHABLEND
         | PrimitiveMiscCaps::MRTINDEPENDENTBITDEPTHS
         | PrimitiveMiscCaps::MRTPOSTPIXELSHADERBLENDING
@@ -76,7 +109,9 @@ fn primitive_misc_caps_matches_implementation() {
 
 #[test]
 fn raster_caps_matches_implementation() {
-    let expected = RasterCaps::ZTEST
+    let expected = RasterCaps::DITHER
+        | RasterCaps::ZTEST
+        | RasterCaps::COLORPERSPECTIVE
         | RasterCaps::FOGTABLE
         | RasterCaps::WFOG
         | RasterCaps::FOGVERTEX
@@ -94,6 +129,7 @@ fn raster_caps_matches_implementation() {
 fn texture_caps_matches_implementation() {
     let expected = TextureCaps::ALPHA
         | TextureCaps::PERSPECTIVE
+        | TextureCaps::TEXREPEATNOTSCALEDBYSIZE
         | TextureCaps::PROJECTED
         | TextureCaps::MIPMAP
         | TextureCaps::CUBEMAP
@@ -141,7 +177,8 @@ fn filter_caps_matches_implementation() {
         | FilterCaps::MIPFPOINT
         | FilterCaps::MIPFLINEAR
         | FilterCaps::MAGFPOINT
-        | FilterCaps::MAGFLINEAR;
+        | FilterCaps::MAGFLINEAR
+        | FilterCaps::MAGFANISOTROPIC;
     assert_eq!(filled().texture_filter_caps, expected.bits());
 }
 
@@ -176,8 +213,10 @@ fn compare_caps_advertise_every_function() {
 
 #[test]
 fn shade_caps_matches_implementation() {
-    let expected =
-        ShadeCaps::COLORGOURAUDRGB | ShadeCaps::SPECULARGOURAUDRGB | ShadeCaps::ALPHAGOURAUDBLEND;
+    let expected = ShadeCaps::COLORGOURAUDRGB
+        | ShadeCaps::SPECULARGOURAUDRGB
+        | ShadeCaps::ALPHAGOURAUDBLEND
+        | ShadeCaps::FOGGOURAUD;
     assert_eq!(filled().shade_caps, expected.bits());
 }
 
@@ -209,7 +248,8 @@ fn texture_op_caps_match_emitter() {
 
 #[test]
 fn line_caps_matches_implementation() {
-    let expected = LineCaps::TEXTURE | LineCaps::ZTEST | LineCaps::BLEND | LineCaps::ALPHACMP;
+    let expected =
+        LineCaps::TEXTURE | LineCaps::ZTEST | LineCaps::BLEND | LineCaps::ALPHACMP | LineCaps::FOG;
     assert_eq!(filled().line_caps, expected.bits());
 }
 
