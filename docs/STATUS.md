@@ -21,21 +21,23 @@ divergences from D3D9 it keeps on purpose. The tested games are in the
 - Every draw call and primitive type, point sprites, user clip planes, all
   sixteen vertex streams, hardware instancing.
 - State blocks, occlusion and event queries.
+- `D3DUSAGE_DYNAMIC` with `D3DPOOL_MANAGED` is rejected with
+  `D3DERR_INVALIDCALL` at 2D, cube and volume texture creation, for every
+  format: the two name different owners of the copy the device reads.
 - Signed Q16W16V16U16 textures use native RGBA16Snorm storage for 2D, cube
   and volume resources. All four lanes retain signed 16-bit samples without
-  conversion. Render-target and sRGB usages are unavailable; texture/cube
-  AUTOGEN uses one actual level, and MANAGED+DYNAMIC creation is rejected.
+  conversion. Render-target and sRGB usages are unavailable, and texture/cube
+  AUTOGEN uses one actual level.
 - A2R10G10B10 and A2B10G10R10 textures use native BGR10A2Unorm and
   RGB10A2Unorm storage for 2D, cube and volume resources, including all ten
   RGB bits and two alpha bits; blue is the low lane of the first and red of
   the second. Explicit mip chains and DEFAULT offscreen ColorFill are
   supported. Render-target, display/backbuffer, sRGB and BUMP usages remain
-  unavailable; AUTOGEN uses one actual level and MANAGED+DYNAMIC creation is
-  rejected.
+  unavailable, and AUTOGEN uses one actual level.
 - Signed Q8W8V8U8 textures use native RGBA8Snorm storage across 2D, cube and
   volume resources. All four channels, including alpha, retain signed values.
   Render targets and sRGB are unavailable; AUTOGEN texture/cube requests use
-  a single-level fallback. MANAGED+DYNAMIC creation is rejected.
+  a single-level fallback.
 - Signed V16U16 textures use native 16-bit U/V storage across 2D, cube and
   volume resources. AUTOGEN requests on 2D/cube use the one-level NOAUTOGEN
   fallback; render-target and sRGB usages remain unavailable.

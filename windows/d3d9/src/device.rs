@@ -4918,12 +4918,12 @@ fn create_texture_path(info: &TextureCreateArgs) -> i32 {
         null_out(texture);
         return D3DERR_INVALIDCALL;
     };
-    if mtld3d_core::format::uses_strict_dynamic_pool_validation(format)
-        && usage & D3DUSAGE_DYNAMIC != 0
-        && pool == D3DPOOL_MANAGED
-    {
-        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
-            "reject CreateTexture(format={format}, DYNAMIC, MANAGED) → INVALIDCALL");
+    if mtld3d_core::pool::usage_conflicts_with_pool(usage, pool) {
+        mtld3d_shared::log_once_warn_by!(
+            target: crate::LOG_TARGET,
+            key: u64::from(format),
+            "reject CreateTexture(format={format}, DYNAMIC, MANAGED) → INVALIDCALL"
+        );
         null_out(texture);
         return D3DERR_INVALIDCALL;
     }
@@ -5621,12 +5621,12 @@ extern "system" fn device_create_cube_texture(
         null_out(texture);
         return D3DERR_INVALIDCALL;
     };
-    if mtld3d_core::format::uses_strict_dynamic_pool_validation(format)
-        && usage & D3DUSAGE_DYNAMIC != 0
-        && pool == D3DPOOL_MANAGED
-    {
-        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
-            "reject CreateCubeTexture(format={format}, DYNAMIC, MANAGED) → INVALIDCALL");
+    if mtld3d_core::pool::usage_conflicts_with_pool(usage, pool) {
+        mtld3d_shared::log_once_warn_by!(
+            target: crate::LOG_TARGET,
+            key: u64::from(format),
+            "reject CreateCubeTexture(format={format}, DYNAMIC, MANAGED) → INVALIDCALL"
+        );
         null_out(texture);
         return D3DERR_INVALIDCALL;
     }

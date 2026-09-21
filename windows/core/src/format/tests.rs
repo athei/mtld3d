@@ -1206,10 +1206,8 @@ fn v16u16_uses_native_signed_storage_and_noautogen_fallback() {
     assert!(is_volume_texture_format(format));
     assert!(!super::is_render_target_format(format));
     assert!(super::uses_noautogen_fallback(format));
-    assert!(super::uses_strict_dynamic_pool_validation(format));
     for ordinary in [mtld3d_types::D3DFMT_V8U8, D3DFMT_A8R8G8B8, D3DFMT_DXT1] {
         assert!(!super::uses_noautogen_fallback(ordinary));
-        assert!(!super::uses_strict_dynamic_pool_validation(ordinary));
     }
 }
 
@@ -1244,10 +1242,8 @@ fn q8w8v8u8_uses_native_signed_storage_and_noautogen_fallback() {
     assert!(is_volume_texture_format(format));
     assert!(!super::is_render_target_format(format));
     assert!(super::uses_noautogen_fallback(format));
-    assert!(super::uses_strict_dynamic_pool_validation(format));
     for ordinary in [mtld3d_types::D3DFMT_V8U8, D3DFMT_A8R8G8B8, D3DFMT_DXT1] {
         assert!(!super::uses_noautogen_fallback(ordinary));
-        assert!(!super::uses_strict_dynamic_pool_validation(ordinary));
     }
 }
 
@@ -1282,10 +1278,8 @@ fn q16w16v16u16_uses_native_signed_storage_and_noautogen_fallback() {
     assert!(is_volume_texture_format(format));
     assert!(!super::is_render_target_format(format));
     assert!(super::uses_noautogen_fallback(format));
-    assert!(super::uses_strict_dynamic_pool_validation(format));
     for ordinary in [mtld3d_types::D3DFMT_V8U8, D3DFMT_A8R8G8B8, D3DFMT_DXT1] {
         assert!(!super::uses_noautogen_fallback(ordinary));
-        assert!(!super::uses_strict_dynamic_pool_validation(ordinary));
     }
 }
 
@@ -1334,7 +1328,6 @@ fn ten_bit_formats_use_native_packed_storage_without_attachment_support() {
         assert_eq!(mapping.metal_pixel_format().srgb_twin(), None);
         assert_eq!(super::format_name(format), name);
         assert!(super::uses_noautogen_fallback(format));
-        assert!(super::uses_strict_dynamic_pool_validation(format));
         assert!(super::is_volume_texture_format(format));
         assert!(!super::is_render_target_format(format));
         assert_eq!(native as u32, value);
