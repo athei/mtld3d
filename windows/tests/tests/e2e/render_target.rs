@@ -3710,6 +3710,44 @@ fn get_render_target_data_fills_a_system_memory_texture_level() {
 }
 
 #[test]
+fn get_render_target_data_of_a_texture_level_sees_a_pending_cpu_write() {
+    // A level of a non-dynamic DEFAULT-pool texture is lockable here, so a
+    // render-target texture level can carry a CPU write that no bind has
+    // uploaded yet. `GetRenderTargetData` reads that level on the GPU and
+    // never looks at its staging, so the pending upload has to be scheduled
+    // ahead of the read; without that the read hands back the GPU content the
+    // write was meant to replace.
+    let h = Harness::new();
+    let rt = h.create_texture(
+        64,
+        64,
+        1,
+        D3DUSAGE_RENDERTARGET,
+        D3DFMT_A8R8G8B8,
+        D3DPOOL_DEFAULT,
+    );
+    let level = rt.surface_level(0);
+    // Seed the Metal texture with a colour the read-back can be caught
+    // returning; a level nothing has written has no Metal texture to read.
+    assert_eq!(h.color_fill_hr(&level, RED), D3D_OK, "seed the level red");
+    // Close the frame the fill was queued in. An upload leads the frame it is
+    // scheduled in, so a write flushed into the fill's own frame would land
+    // under the fill rather than over it, and the read would be right for the
+    // wrong reason.
+    assert_eq!(h.present(), 0, "submit the fill");
+    {
+        let mut locked = rt.lock_rect(0, 0);
+        let pitch_px = locked.pitch().cast_unsigned() / 4;
+        locked.write_u32(&vec![GREEN; (pitch_px * 64) as usize]);
+    }
+    assert_eq!(
+        read_surface_pixel(&h, &level, 32, 32),
+        GREEN,
+        "the read-back carries the write the lock left pending, not the fill under it"
+    );
+}
+
+#[test]
 fn get_front_buffer_data_fills_a_system_memory_texture_level() {
     // Same destination rule on the front-buffer read; the source is the
     // presented image rather than a caller-named render target.
