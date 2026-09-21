@@ -16,6 +16,7 @@ use std::{
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
+        mpsc,
     },
     thread,
     time::{Duration, Instant},
@@ -48,6 +49,18 @@ const SAMPLE_BUDGET: Duration = Duration::from_secs(60);
 
 /// How long `sample` watches the process before symbolicating.
 const SAMPLE_SECONDS: &str = "2";
+
+/// How long a pipe may stay open after the process the runner spawned is gone.
+///
+/// A pipe every holder has died on ends within milliseconds of the last of
+/// them; one still open past this has a survivor on it whose output is not
+/// the subtest's. Wine starts `explorer.exe /desktop` for the prefix's first
+/// process that needs a desktop, it inherits the subtest's pipes, and it puts
+/// itself in a process group of its own, so neither the budget nor the group
+/// kill reaches it and the end of those pipes is as far away as the next
+/// process of that prefix leaves it. Each pipe gets its own grace, so the
+/// wait after the process is gone is at most twice this.
+const DRAIN_GRACE: Duration = Duration::from_secs(1);
 
 /// The driver's codes for a hung GPU, as Metal prints them to stderr.
 ///
@@ -182,10 +195,14 @@ pub fn wine_version(wine: &Path) -> String {
 /// the same verdict cost minutes.
 ///
 /// The child runs in a process group of its own, and a kill, for the hang or
-/// for the budget, takes the whole group: the pipes end with the last process
-/// holding them, so a descendant cannot park the run past the kill. The
-/// wineserver the caller booted for the whole run is in the caller's group
-/// and is never touched.
+/// for the budget, takes that group. It does not take every descendant: a
+/// process that puts itself in a group of its own is outside it, keeps the
+/// pipes it inherited, and can hold them long past the subtest, whether the
+/// subtest exited on its own or was killed. So the collection of what the
+/// pipes hold is bounded too ([`DRAIN_GRACE`]), the subtest is judged on what
+/// arrived before that, and the raw log says so when the collection was cut
+/// short. The wineserver the caller booted for the whole run is in the
+/// caller's group and is never touched.
 ///
 /// A process still running at `launch.timeout` is sampled before its group is
 /// killed, and the sample is kept beside the raw output, or printed when
@@ -245,13 +262,12 @@ pub fn run_subtest(
 
     // Drain stdout/stderr on their own threads so a full pipe buffer can't
     // wedge the child while we poll for the timeout.
-    let out_reader = drain_on_thread(child.stdout.take().expect("stdout piped"));
-    let child_stderr = child.stderr.take().expect("stderr piped");
+    let out_chunks = drain_on_thread(child.stdout.take().expect("stdout piped"));
     let hung = Arc::new(AtomicBool::new(false));
-    let err_reader = {
-        let hung = Arc::clone(&hung);
-        thread::spawn(move || drain_stderr(child_stderr, &hung))
-    };
+    let err_chunks = drain_stderr_on_thread(
+        child.stderr.take().expect("stderr piped"),
+        Arc::clone(&hung),
+    );
 
     let timeout = launch.timeout;
     let start = Instant::now();
@@ -279,10 +295,12 @@ pub fn run_subtest(
         }
         thread::sleep(Duration::from_millis(50));
     };
-    let stdout = out_reader.join().unwrap_or_default();
-    let stderr = err_reader.join().unwrap_or_default();
-    // Read after the join, so a line the process printed just before ending
-    // on its own counts too: its later reads were zeros all the same.
+    // Each pipe from here on is a bounded collection, not a wait for its end:
+    // the process is gone and what still holds a pipe is not it.
+    let stdout = collect_pipe(&out_chunks, Instant::now() + DRAIN_GRACE);
+    let stderr = collect_pipe(&err_chunks, Instant::now() + DRAIN_GRACE);
+    // Read after the collection, so a line the process printed just before
+    // ending on its own counts too: its later reads were zeros all the same.
     let gpu_hang = hung.load(Ordering::Relaxed);
 
     // Surface Metal API-validation failures (the layer runs in `nslog` mode, so
@@ -290,14 +308,17 @@ pub fn run_subtest(
     // normalised, prefixed with the subtest. The count is what gates the leg:
     // the per-site pass/fail counts never capture Metal misuse.
     let validation_errors =
-        report_validation_errors(leg, subtest, &String::from_utf8_lossy(&stderr));
+        report_validation_errors(leg, subtest, &String::from_utf8_lossy(&stderr.bytes));
 
     // A timeout is a hang: treat it like a fatal signal so it surfaces as a
     // crash (and a regression vs a clean baseline) rather than a silent count.
     // A GPU hang is one too: the counts stop meaning anything at its line.
     let signaled = timed_out.is_some() || gpu_hang || status.signal().is_some();
-    let mut combined = String::from_utf8_lossy(&stdout).into_owned();
-    combined.push_str(&String::from_utf8_lossy(&stderr));
+    let mut combined = String::from_utf8_lossy(&stdout.bytes).into_owned();
+    combined.push_str(&String::from_utf8_lossy(&stderr.bytes));
+    if !stdout.complete || !stderr.complete {
+        report_cut_short(leg, subtest, &mut combined);
+    }
     if let Some(sample) = &timed_out {
         let _ = write!(
             combined,
@@ -344,16 +365,80 @@ pub fn run_subtest(
     })
 }
 
-/// Read a pipe to its end on a thread of its own.
+/// Read a pipe on a thread of its own, handing each chunk over as it arrives.
 ///
 /// A pipe nobody reads fills, and the writer blocks on it: a child polled for
 /// its budget, or a sampler polled for its own, must never wait on the poller.
-fn drain_on_thread(mut reader: impl Read + Send + 'static) -> thread::JoinHandle<Vec<u8>> {
+/// The thread is never joined, because the end of the pipe is not the caller's
+/// to wait for: it ends when the last holder of the write end closes it, and
+/// the chunks it still sends after the caller has collected go nowhere, since
+/// the send fails once the receiver is dropped.
+fn drain_on_thread(mut reader: impl Read + Send + 'static) -> mpsc::Receiver<Vec<u8>> {
+    let (chunks, received) = mpsc::channel();
     thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = reader.read_to_end(&mut buf);
-        buf
-    })
+        let mut buf = [0_u8; 8192];
+        while let Ok(read @ 1..) = reader.read(&mut buf) {
+            if chunks.send(buf[..read].to_vec()).is_err() {
+                return;
+            }
+        }
+    });
+    received
+}
+
+/// Everything a pipe delivered inside the grace, and whether its end was seen.
+struct Drained {
+    bytes: Vec<u8>,
+    complete: bool,
+}
+
+/// Collect a pipe's chunks until it ends or `deadline` passes.
+///
+/// A pipe that ends delivers every chunk it sent before the caller sees the
+/// disconnect, so the bound only ever cuts off what has not arrived.
+fn collect_pipe(chunks: &mpsc::Receiver<Vec<u8>>, deadline: Instant) -> Drained {
+    let mut bytes = Vec::new();
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let next = if remaining.is_zero() {
+            Err(mpsc::RecvTimeoutError::Timeout)
+        } else {
+            chunks.recv_timeout(remaining)
+        };
+        match next {
+            Ok(chunk) => bytes.extend_from_slice(&chunk),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Drained {
+                    bytes,
+                    complete: true,
+                };
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                return Drained {
+                    bytes,
+                    complete: false,
+                };
+            }
+        }
+    }
+}
+
+/// Say, on stderr and in the raw log, that the output is not all of it.
+///
+/// The counts are still the counts of what arrived, so the verdict is
+/// unchanged; what a reader must not have to guess is that the end of the
+/// output is missing rather than absent.
+fn report_cut_short(leg: Leg, subtest: Subtest, combined: &mut String) {
+    let after = DRAIN_GRACE.as_secs();
+    eprintln!(
+        "  [{leg}/{subtest}] output cut short: something outside the subtest's process group \
+         still held its pipes {after}s after it ended"
+    );
+    let _ = write!(
+        combined,
+        "\n[conformance] output cut short after {after}s: something outside the subtest's \
+         process group still held its pipes open, so the end of this output is missing\n"
+    );
 }
 
 /// A `sample` of the process, taken while it still runs.
@@ -376,8 +461,8 @@ fn sample_process(pid: u32) -> String {
         Ok(child) => child,
         Err(e) => return format!("[conformance] sample could not be started: {e}\n"),
     };
-    let out_reader = drain_on_thread(child.stdout.take().expect("stdout piped"));
-    let err_reader = drain_on_thread(child.stderr.take().expect("stderr piped"));
+    let out_chunks = drain_on_thread(child.stdout.take().expect("stdout piped"));
+    let err_chunks = drain_on_thread(child.stderr.take().expect("stderr piped"));
     let started = Instant::now();
     let ended = loop {
         match child.try_wait() {
@@ -393,8 +478,17 @@ fn sample_process(pid: u32) -> String {
             Err(e) => break Err(format!("could not be waited for: {e}")),
         }
     };
-    let mut text = String::from_utf8_lossy(&out_reader.join().unwrap_or_default()).into_owned();
-    let stderr = String::from_utf8_lossy(&err_reader.join().unwrap_or_default()).into_owned();
+    let out = collect_pipe(&out_chunks, Instant::now() + DRAIN_GRACE);
+    let err = collect_pipe(&err_chunks, Instant::now() + DRAIN_GRACE);
+    let mut text = String::from_utf8_lossy(&out.bytes).into_owned();
+    let stderr = String::from_utf8_lossy(&err.bytes).into_owned();
+    if !out.complete || !err.complete {
+        let _ = write!(
+            text,
+            "\n[conformance] the sample's own output was cut short after {}s\n",
+            DRAIN_GRACE.as_secs()
+        );
+    }
     match ended {
         Ok(status) if status.success() => {}
         Ok(status) => {
@@ -438,23 +532,30 @@ fn report_timeout(
     }
 }
 
-/// Drain stderr into a buffer, raising `hung` on the driver's GPU-hang line.
+/// Drain stderr on a thread of its own, raising `hung` on the GPU-hang line.
 ///
-/// Line by line, so the line is seen while the process still runs and the
-/// poll loop can kill it on the flag instead of waiting out the budget. The
-/// buffer keeps every byte, invalid UTF-8 included: the check reads a lossy
+/// A chunk is a line, so the line is seen while the process still runs and
+/// the poll loop can kill it on the flag instead of waiting out the budget.
+/// Every byte is handed over, invalid UTF-8 included: the check reads a lossy
 /// copy of each line and the drain never stops on one.
-fn drain_stderr(stderr: impl Read, hung: &AtomicBool) -> Vec<u8> {
-    let mut reader = BufReader::new(stderr);
-    let mut buf = Vec::new();
-    let mut line = Vec::new();
-    while let Ok(1..) = reader.read_until(b'\n', &mut line) {
-        if is_gpu_hang_line(&String::from_utf8_lossy(&line)) {
-            hung.store(true, Ordering::Relaxed);
+fn drain_stderr_on_thread(
+    stderr: impl Read + Send + 'static,
+    hung: Arc<AtomicBool>,
+) -> mpsc::Receiver<Vec<u8>> {
+    let (chunks, received) = mpsc::channel();
+    thread::spawn(move || {
+        let mut reader = BufReader::new(stderr);
+        let mut line = Vec::new();
+        while let Ok(1..) = reader.read_until(b'\n', &mut line) {
+            if is_gpu_hang_line(&String::from_utf8_lossy(&line)) {
+                hung.store(true, Ordering::Relaxed);
+            }
+            if chunks.send(std::mem::take(&mut line)).is_err() {
+                return;
+            }
         }
-        buf.append(&mut line);
-    }
-    buf
+    });
+    received
 }
 
 /// Whether a stderr line is the driver reporting a hung GPU.
