@@ -8,10 +8,10 @@ use mtld3d_types::{
     D3DFMT_DXT2, D3DFMT_DXT3, D3DFMT_DXT4, D3DFMT_DXT5, D3DFMT_G16R16, D3DFMT_L8, D3DFMT_L16,
     D3DFMT_Q8W8V8U8, D3DFMT_Q16W16V16U16, D3DFMT_R5G6B5, D3DFMT_R8G8B8, D3DFMT_R16F, D3DFMT_R32F,
     D3DFMT_V8U8, D3DFMT_V16U16, D3DFMT_X1R5G5B5, D3DFMT_X8B8G8R8, D3DFMT_X8R8G8B8, D3DPOOL_DEFAULT,
-    D3DPOOL_MANAGED, D3DRTYPE_CUBETEXTURE, D3DRTYPE_SURFACE, D3DRTYPE_TEXTURE, D3DRTYPE_VOLUME,
-    D3DRTYPE_VOLUMETEXTURE, D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_DYNAMIC, D3DUSAGE_QUERY_LEGACYBUMPMAP,
-    D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING, D3DUSAGE_QUERY_SRGBREAD, D3DUSAGE_QUERY_SRGBWRITE,
-    D3DUSAGE_RENDERTARGET,
+    D3DPOOL_MANAGED, D3DPOOL_SCRATCH, D3DRTYPE_CUBETEXTURE, D3DRTYPE_SURFACE, D3DRTYPE_TEXTURE,
+    D3DRTYPE_VOLUME, D3DRTYPE_VOLUMETEXTURE, D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_DYNAMIC,
+    D3DUSAGE_QUERY_LEGACYBUMPMAP, D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING, D3DUSAGE_QUERY_SRGBREAD,
+    D3DUSAGE_QUERY_SRGBWRITE, D3DUSAGE_RENDERTARGET,
 };
 
 /// The mapped colour formats, each with the name a failure prints.
@@ -54,33 +54,50 @@ const FORMATS: [(u32, &str); 31] = [
     (D3DFMT_DXT5, "DXT5"),
 ];
 
-/// The managed pool refuses dynamic usage whatever the format is.
+/// The pools that keep the device's copy refuse dynamic usage, for every format.
 ///
-/// `D3DUSAGE_DYNAMIC` and `D3DPOOL_MANAGED` name two different owners of the
-/// copy the device reads, so D3D9 rejects the pair at creation. Each format
-/// is created in the managed pool without the flag first: the formats a cube
-/// or a texture cannot take at all (ATI1 cubes are scratch-only) drop out of
-/// the case that way, and what is left is a create the flag alone turns into
-/// `D3DERR_INVALIDCALL`.
+/// `D3DUSAGE_DYNAMIC` says the application drives the copy the device reads.
+/// `D3DPOOL_MANAGED` gives that copy to the runtime and `D3DPOOL_SCRATCH` has
+/// no device copy at all, so D3D9 rejects the pair at creation, on a texture,
+/// a cube and a volume alike. Each format is created in the pool without the
+/// flag first: the formats a type cannot take at all (ATI1 cubes are
+/// scratch-only) drop out of the case that way, and what is left is a create
+/// the flag alone turns into `D3DERR_INVALIDCALL`.
 #[test]
-fn dynamic_usage_in_the_managed_pool_is_rejected_for_every_format() {
+fn dynamic_usage_in_a_pool_that_refuses_it_is_rejected_for_every_format() {
     let h = Harness::new();
-    for (format, name) in FORMATS {
-        let (plain, out) = h.try_create_texture(4, 4, 1, 0, format, D3DPOOL_MANAGED);
-        if plain == D3D_OK {
-            drop(Texture::from_raw(out));
-            let (hr, out) =
-                h.try_create_texture(4, 4, 1, D3DUSAGE_DYNAMIC, format, D3DPOOL_MANAGED);
-            assert_eq!(hr, D3DERR_INVALIDCALL, "{name} managed dynamic texture");
-            assert!(out.is_null(), "{name} managed dynamic texture out pointer");
-        }
-        let (plain, out) = h.try_create_cube_texture(4, 1, 0, format, D3DPOOL_MANAGED);
-        if plain == D3D_OK {
-            drop(CubeTexture::from_raw(out));
-            let (hr, out) =
-                h.try_create_cube_texture(4, 1, D3DUSAGE_DYNAMIC, format, D3DPOOL_MANAGED);
-            assert_eq!(hr, D3DERR_INVALIDCALL, "{name} managed dynamic cube");
-            assert!(out.is_null(), "{name} managed dynamic cube out pointer");
+    for pool in [D3DPOOL_MANAGED, D3DPOOL_SCRATCH] {
+        for (format, name) in FORMATS {
+            let (plain, out) = h.try_create_texture(4, 4, 1, 0, format, pool);
+            if plain == D3D_OK {
+                drop(Texture::from_raw(out));
+                let (hr, out) = h.try_create_texture(4, 4, 1, D3DUSAGE_DYNAMIC, format, pool);
+                assert_eq!(
+                    hr, D3DERR_INVALIDCALL,
+                    "{name} dynamic texture, pool {pool}"
+                );
+                assert!(
+                    out.is_null(),
+                    "{name} dynamic texture out pointer, pool {pool}"
+                );
+            }
+            let (plain, out) = h.try_create_cube_texture(4, 1, 0, format, pool);
+            if plain == D3D_OK {
+                drop(CubeTexture::from_raw(out));
+                let (hr, out) = h.try_create_cube_texture(4, 1, D3DUSAGE_DYNAMIC, format, pool);
+                assert_eq!(hr, D3DERR_INVALIDCALL, "{name} dynamic cube, pool {pool}");
+                assert!(
+                    out.is_null(),
+                    "{name} dynamic cube out pointer, pool {pool}"
+                );
+            }
+            let (plain, volume) = h.try_create_volume_texture([4, 4, 4], 1, 0, format, pool);
+            if plain == D3D_OK {
+                drop(volume);
+                let (hr, _) =
+                    h.try_create_volume_texture([4, 4, 4], 1, D3DUSAGE_DYNAMIC, format, pool);
+                assert_eq!(hr, D3DERR_INVALIDCALL, "{name} dynamic volume, pool {pool}");
+            }
         }
     }
 }
@@ -88,15 +105,19 @@ fn dynamic_usage_in_the_managed_pool_is_rejected_for_every_format() {
 /// The default pool keeps taking dynamic usage.
 ///
 /// The rejection above belongs to the pair, not to the flag: the same usage
-/// in the pool the application drives itself creates a texture and a cube of
-/// every one of these formats, the signed one the rule was first written for
-/// included.
+/// in the pool the application drives itself creates a texture, a cube and a
+/// volume of every one of these formats, the signed one the rule was first
+/// written for included.
 #[test]
 fn dynamic_usage_in_the_default_pool_is_accepted() {
     let h = Harness::new();
     for format in [D3DFMT_A8R8G8B8, D3DFMT_R5G6B5, D3DFMT_L8, D3DFMT_V16U16] {
         drop(h.create_texture(4, 4, 1, D3DUSAGE_DYNAMIC, format, D3DPOOL_DEFAULT));
         drop(h.create_cube_texture_owned(4, 1, D3DUSAGE_DYNAMIC, format, D3DPOOL_DEFAULT));
+        let (hr, volume) =
+            h.try_create_volume_texture([4, 4, 4], 1, D3DUSAGE_DYNAMIC, format, D3DPOOL_DEFAULT);
+        assert_eq!(hr, D3D_OK, "default dynamic volume, format {format}");
+        assert!(volume.is_some(), "default dynamic volume, format {format}");
     }
 }
 

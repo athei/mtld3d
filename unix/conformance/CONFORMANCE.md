@@ -1363,9 +1363,10 @@ stored, so sampling needs no conversion and no view swizzle, and the
 Q8W8V8U8 rows of test_signed_formats do not depend on the mechanism that
 fails the V8U8 rows on the `@mac2` legs. Render-target and sRGB capabilities
 stay absent; AUTOGEN texture/cube requests preserve usage but use one actual
-level with no generated chain. MANAGED+DYNAMIC creation is rejected for every
-format, the way D3D9 rejects it, rather than for the signed and packed
-ten-bit formats alone. X8L8V8U8 and L6V5U5 remain separate capabilities.
+level with no generated chain. DYNAMIC creation in the MANAGED and the SCRATCH
+pool is rejected for every format and every texture type, the way D3D9 rejects
+it, rather than for the signed and packed ten-bit formats alone or for volumes
+alone. X8L8V8U8 and L6V5U5 remain separate capabilities.
 
 Q16W16V16U16 textures use native RGBA16Snorm storage and the same scoped
 NOAUTOGEN and unavailable render/sRGB policies. All four lanes are
@@ -1427,8 +1428,8 @@ a resource, so there is no skip to open and no failing site moves on any leg.
 
 The format shares the A2R10G10B10 policy: render-target, sRGB and legacy
 bump-map queries are rejected, texture and cube AUTOGEN answers NOAUTOGEN
-with one physical level, MANAGED with DYNAMIC is rejected, and ColorFill of a
-DEFAULT offscreen plain surface encodes each channel to its nearest code. The
+with one physical level, and ColorFill of a DEFAULT offscreen plain surface
+encodes each channel to its nearest code. The
 end-to-end suite runs the A2R10G10B10 scenarios in this lane order and adds
 two witnesses of the order itself: the same word written to both formats
 samples with red and blue exchanged, and copies between the two formats are

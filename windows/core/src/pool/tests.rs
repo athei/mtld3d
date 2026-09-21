@@ -27,18 +27,23 @@ fn an_out_of_range_pool_value_is_not_cpu_only() {
 }
 
 #[test]
-fn the_managed_pool_conflicts_with_dynamic_usage() {
-    assert!(usage_conflicts_with_pool(D3DUSAGE_DYNAMIC, D3DPOOL_MANAGED));
-    // The flag stays the one that conflicts when it arrives beside another.
-    assert!(usage_conflicts_with_pool(
-        D3DUSAGE_DYNAMIC | D3DUSAGE_AUTOGENMIPMAP,
-        D3DPOOL_MANAGED
-    ));
+fn the_managed_and_scratch_pools_conflict_with_dynamic_usage() {
+    for pool in [D3DPOOL_MANAGED, D3DPOOL_SCRATCH] {
+        assert!(
+            usage_conflicts_with_pool(D3DUSAGE_DYNAMIC, pool),
+            "pool {pool}"
+        );
+        // The flag stays the one that conflicts when it arrives beside another.
+        assert!(
+            usage_conflicts_with_pool(D3DUSAGE_DYNAMIC | D3DUSAGE_AUTOGENMIPMAP, pool),
+            "pool {pool}"
+        );
+    }
 }
 
 #[test]
 fn the_other_pools_take_dynamic_usage() {
-    for pool in [D3DPOOL_DEFAULT, D3DPOOL_SYSTEMMEM, D3DPOOL_SCRATCH] {
+    for pool in [D3DPOOL_DEFAULT, D3DPOOL_SYSTEMMEM] {
         assert!(
             !usage_conflicts_with_pool(D3DUSAGE_DYNAMIC, pool),
             "pool {pool}"
