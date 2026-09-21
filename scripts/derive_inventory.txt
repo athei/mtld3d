@@ -80,7 +80,6 @@ windows/core/src/buffer_rename.rs LockPlan Debug,Clone,Copy,PartialEq,Eq
 windows/core/src/buffer_rename.rs PreserveKind Debug,Clone,Copy,PartialEq,Eq
 windows/core/src/config.rs AdapterSpoof Debug,Clone,Copy,PartialEq,Eq
 windows/core/src/config.rs CursorScale Debug,Clone,Copy,PartialEq,Eq
-windows/core/src/convert.rs DecalHeuristicInputs Clone,Copy,Debug
 windows/core/src/convert.rs FfVsLayout Clone,Copy,Default
 windows/core/src/convert.rs FfVsLayoutFlags Clone,Copy,Debug,Default,PartialEq,Eq
 windows/core/src/convert.rs InputSemantic Clone,Copy,Debug,PartialEq,Eq
