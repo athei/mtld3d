@@ -882,6 +882,7 @@ fn looks_like_decal_fires_on_alpha_blended_no_bias() {
         depth_enable: 1,
         depth_write: 0,
         blend_enable: 1,
+        depth_func: D3DCMP_LESSEQUAL,
         raw_depth_bias: 0,
         raw_slope_scale: 0,
     };
@@ -898,6 +899,7 @@ fn looks_like_decal_skips_alpha_blended_depth_writer() {
         depth_enable: 1,
         depth_write: 1,
         blend_enable: 1,
+        depth_func: D3DCMP_LESSEQUAL,
         raw_depth_bias: 0,
         raw_slope_scale: 0,
     };
@@ -913,6 +915,7 @@ fn looks_like_decal_skips_game_supplied_bias() {
         depth_enable: 1,
         depth_write: 0,
         blend_enable: 1,
+        depth_func: D3DCMP_LESSEQUAL,
         raw_depth_bias: 0x3a83_126f, // ~ +1e-3 as f32 bits
         raw_slope_scale: 0,
     };
@@ -928,10 +931,59 @@ fn looks_like_decal_skips_opaque_draw() {
         depth_enable: 1,
         depth_write: 0,
         blend_enable: 0,
+        depth_func: D3DCMP_LESSEQUAL,
         raw_depth_bias: 0,
         raw_slope_scale: 0,
     };
     assert!(!looks_like_decal(inputs));
+}
+
+#[test]
+fn looks_like_decal_skips_comparisons_a_nudge_would_break() {
+    // A multipass engine lays depth down in one pass and selects the
+    // same fragments in a later additive pass with EQUAL. Such a
+    // fragment has to match the stored value exactly, so any nudge
+    // toward the camera makes the second pass select nothing and its
+    // contribution disappears. Only LESS and LESSEQUAL ask a question
+    // the nudge can help, so every other comparison declines.
+    for depth_func in [
+        D3DCMP_NEVER,
+        D3DCMP_EQUAL,
+        D3DCMP_GREATEREQUAL,
+        D3DCMP_NOTEQUAL,
+        D3DCMP_GREATER,
+        D3DCMP_ALWAYS,
+    ] {
+        let inputs = DecalHeuristicInputs {
+            depth_enable: 1,
+            depth_write: 0,
+            blend_enable: 1,
+            depth_func,
+            raw_depth_bias: 0,
+            raw_slope_scale: 0,
+        };
+        assert!(
+            !looks_like_decal(inputs),
+            "D3DCMP {depth_func} must decline"
+        );
+    }
+}
+
+#[test]
+fn looks_like_decal_fires_on_both_tolerant_comparisons() {
+    // LESS and LESSEQUAL both read the stored depth as "what is already
+    // in front", so the nudge only resolves the tie the decal wanted.
+    for depth_func in [D3DCMP_LESS, D3DCMP_LESSEQUAL] {
+        let inputs = DecalHeuristicInputs {
+            depth_enable: 1,
+            depth_write: 0,
+            blend_enable: 1,
+            depth_func,
+            raw_depth_bias: 0,
+            raw_slope_scale: 0,
+        };
+        assert!(looks_like_decal(inputs), "D3DCMP {depth_func} must fire");
+    }
 }
 
 #[test]

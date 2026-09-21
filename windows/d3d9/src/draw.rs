@@ -1734,8 +1734,9 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
     // mode (every emit updates the slot; every change re-emits).
     //
     // Implicit decal bias: when the render-state pattern matches a
-    // typical alpha-blended decal (depth-test on, depth-write off,
-    // alpha-blend on, game's DEPTHBIAS == 0) AND the game hasn't
+    // typical alpha-blended decal (depth-test on under `LESS` or
+    // `LESSEQUAL`, depth-write off, alpha-blend on, game's
+    // DEPTHBIAS == 0) AND the game hasn't
     // already supplied a slope-scale, push the polygon slightly
     // toward the camera so it reliably wins ZTest against the
     // underlying surface. A ground-projected decal whose VS and the
@@ -1759,6 +1760,7 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
         blend_enable: u32::from(render_state.blend_enable()),
         raw_depth_bias: render_state.depth_bias,
         raw_slope_scale: render_state.slope_scale_depth_bias,
+        depth_func: u32::from(render_state.depth_stencil_state.depth_func),
     };
     let decal_fires = looks_like_decal(decal_inputs);
     let raw_bias = if decal_fires {
@@ -1833,26 +1835,31 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
         let ps_hash = ps.disk_key(variant);
         let pair_key = vs_hash ^ ps_hash.rotate_left(1);
         // Bake the discriminating render-state bits into the dedup
-        // key so a shader pair re-used in distinct (ZW, AB)
+        // key so a shader pair re-used in distinct (ZFUNC, ZW, AB)
         // configurations produces one trace row per configuration
-        // instead of collapsing.
-        let state_bits = (u64::from(decal_fires) << 2)
+        // instead of collapsing. The comparison earns its own bits
+        // rather than riding on `decal_fires`: that flag groups every
+        // declining comparison together, so two of them on one shader
+        // pair would share a row and report whichever arrived first.
+        let state_bits = (u64::from(render_state.depth_stencil_state.depth_func) << 3)
+            | (u64::from(decal_fires) << 2)
             | (u64::from(render_state.depth_write()) << 1)
             | u64::from(render_state.blend_enable());
-        let probe_key = pair_key ^ (state_bits << 60);
+        let probe_key = pair_key ^ (state_bits << 57);
         let pass_idx = enc.current_pass_index();
         let alpha_func = variant.alpha_func;
         mtld3d_shared::log_once_trace_by!(
             target: DECAL_TRACE_TARGET,
             key: probe_key,
             "decal: pass={pass_idx} VS prog {vs_hash:#018x} PS prog {ps_hash:#018x} \
-             rs[Z={z} ZW={zw} AB={ab} bias={bias:#010x} slope={slope:#010x}] \
+             rs[Z={z} ZW={zw} AB={ab} zf={zf} bias={bias:#010x} slope={slope:#010x}] \
              blend[src={src} dst={dst} op={op}] at={alpha_func} \
              decal_fires={decal_fires} applied_raw={raw_bias:#010x} \
              applied_metal={depth_bias:.3} slope_metal={slope_scale:.3}",
             z = u32::from(render_state.depth_enable()),
             zw = u32::from(render_state.depth_write()),
             ab = u32::from(render_state.blend_enable()),
+            zf = render_state.depth_stencil_state.depth_func,
             bias = render_state.depth_bias,
             slope = render_state.slope_scale_depth_bias,
             src = render_state.pipeline_rs.src_blend,
