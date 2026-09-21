@@ -856,8 +856,10 @@ pub struct D3DCAPS9 {
 // LOCKABLE_BACKBUFFER bit is honoured today (WoW portrait read-back path).
 pub const D3DPRESENTFLAG_LOCKABLE_BACKBUFFER: u32 = 0x0000_0001;
 
-// D3DPRESENT_INTERVAL_* values of D3DPRESENT_PARAMETERS::PresentationInterval,
-// which double as the bits of D3DCAPS9::PresentationIntervals.
+// D3DPRESENT_INTERVAL_* values of D3DPRESENT_PARAMETERS::PresentationInterval.
+// All but DEFAULT double as the bits of D3DCAPS9::PresentationIntervals; DEFAULT
+// is zero, so it names no bit and a device advertising any interval serves it.
+pub const D3DPRESENT_INTERVAL_DEFAULT: u32 = 0x0000_0000;
 pub const D3DPRESENT_INTERVAL_ONE: u32 = 0x0000_0001;
 pub const D3DPRESENT_INTERVAL_TWO: u32 = 0x0000_0002;
 pub const D3DPRESENT_INTERVAL_THREE: u32 = 0x0000_0004;
