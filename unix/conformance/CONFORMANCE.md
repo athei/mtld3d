@@ -1081,13 +1081,15 @@ see the resolve. The draws are therefore tested against the target's clear
 rather than the resolved scene. A device fault in Metal's ordering
 guarantee, and a submit boundary alone does not mask it either: a copy in
 the next command buffer can still read the pre-resolve content. The layer
-therefore waits for the resolving command buffer to complete before it
-copies out of a resolve target on this device (`RESOLVE_NEEDS_RETIRE` in
-`DeviceCapsFlags`), the wait a readback pays anyway; these two sites read
-through a draw, not a copy, so they stay `expected`, and a real Intel/AMD
-Mac is expected to read zero here. 17330 reads its full count on one run
-and zero on the next, since the resolve sometimes lands before the load
-after all; `flaky`, pinned at the higher count.
+therefore submits the frame recorded so far and waits for that command
+buffer to complete before it copies out of a multisampled source on this
+device, a `StretchRect` and the depth transfer behind RESZ alike
+(`RESOLVE_NEEDS_RETIRE` in `DeviceCapsFlags`), so the copy never shares the
+resolving command buffer and pays the wait a readback pays anyway; these two
+sites read through a draw, not a copy, so they stay `expected`, and a real
+Intel/AMD Mac is expected to read zero here. 17330 reads its full count on
+one run and zero on the next, since the resolve sometimes lands before the
+load after all; `flaky`, pinned at the higher count.
 
 ### visual.c/test_multisample_mismatch
 Sites: 20880=expected 20883=expected 20959=expected 20962=expected

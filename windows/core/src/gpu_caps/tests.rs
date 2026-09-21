@@ -14,6 +14,11 @@
 //! The resolve-retire tests pin `resolve_needs_retire` to the `RESOLVE_NEEDS_RETIRE` bit of the
 //! device's answer and pin the overrides to leaving it alone: the forced Intel answers describe
 //! an Intel/AMD Mac, whose GPU orders its queue, so they must not turn the wait on.
+//!
+//! The submission-split tests pin `multisample_read_splits_submission`: it takes both the device
+//! bit and a source of more than one sample, so a device without the bit never submits early
+//! whatever it reads, a single-sampled read never does on any device, and the forced Intel
+//! answers change neither.
 
 use super::*;
 
@@ -100,4 +105,43 @@ fn intel_overrides_leave_resolve_retire_alone() {
     }
     .with_intel_overrides(true, true);
     assert!(paravirtual.resolve_needs_retire());
+}
+
+#[test]
+fn a_multisample_read_splits_the_submission_only_on_the_device_bit() {
+    let ordered = GpuCaps::apple_silicon_default();
+    let paravirtual = GpuCaps {
+        device_caps: DeviceCapsFlags::RESOLVE_NEEDS_RETIRE | DeviceCapsFlags::SAMPLE_COUNT_4,
+        ..GpuCaps::apple_silicon_default()
+    };
+    for samples in [0, 1, 2, 4, 8, u8::MAX] {
+        assert!(
+            !ordered.multisample_read_splits_submission(samples),
+            "a device that orders its encoders submits nothing extra at {samples} samples"
+        );
+        assert_eq!(
+            paravirtual.multisample_read_splits_submission(samples),
+            samples > 1,
+            "{samples} samples on the device that answered the bit"
+        );
+    }
+}
+
+#[test]
+fn intel_overrides_leave_the_submission_split_alone() {
+    let forced = GpuCaps::apple_silicon_default().with_intel_overrides(true, true);
+    assert!(!forced.multisample_read_splits_submission(4));
+    let other_bits = GpuCaps {
+        device_caps: DeviceCapsFlags::SAMPLER_BORDER | DeviceCapsFlags::SAMPLE_COUNT_4,
+        ..GpuCaps::apple_silicon_default()
+    }
+    .with_intel_overrides(true, true);
+    assert!(!other_bits.multisample_read_splits_submission(4));
+    let paravirtual = GpuCaps {
+        device_caps: DeviceCapsFlags::RESOLVE_NEEDS_RETIRE,
+        ..GpuCaps::apple_silicon_default()
+    }
+    .with_intel_overrides(true, true);
+    assert!(paravirtual.multisample_read_splits_submission(4));
+    assert!(!paravirtual.multisample_read_splits_submission(1));
 }
