@@ -65,7 +65,10 @@ divergences from D3D9 it keeps on purpose. The tested games are in the
   D16, D24X8 and D24S8 textures support packed CPU locks, explicit mips and
   RESZ readback.
 - Fetch4 gathers on 2D L8, L16, A8, R16F, R32F and raw-depth textures.
-- Anisotropic filtering, LOD bias, sRGB read and write, alpha test, scissor,
+- Anisotropic filtering, LOD bias, sRGB read on the formats whose Metal
+  counterpart has an sRGB twin and sRGB write into any render target (through
+  that twin where it exists, through the pixel shader otherwise, which is
+  what `D3DUSAGE_QUERY_SRGBWRITE` answers), alpha test, scissor,
   separate alpha blend, blend factor, write masks, native wireframe fill.
 - Four render targets with independent formats and blending.
 - Multisampling at 2x and 4x, 8x where the device offers it, and the ATOC
@@ -98,6 +101,11 @@ Each fails cleanly, with an absent cap bit or a documented error return.
   single-level `D3DOK_NOAUTOGEN` fallback.
 - Timestamp, timestamp frequency, timestamp disjoint and other niche query
   types: capability probes and creation report `D3DERR_NOTAVAILABLE`.
+- Fixed-function bump-environment mapping: `D3DTOP_BUMPENVMAP` and
+  `D3DTOP_BUMPENVMAPLUMINANCE` are absent from `TextureOpCaps`, and
+  `D3DUSAGE_QUERY_LEGACYBUMPMAP` answers `D3DERR_NOTAVAILABLE` for every
+  format to match. The SM1 `texbem` instruction and the `D3DTSS_BUMPENVMAT*`
+  matrix it reads are a separate surface and do work.
 - DEFAULT offscreen cross-format `StretchRect` outside the narrow normalized
   codecs and A16B16G16R16/A32B32G32R32F into A8R8G8B8 returns
   `D3DERR_INVALIDCALL`. Wide-to-wide conversion and offscreen scaling remain

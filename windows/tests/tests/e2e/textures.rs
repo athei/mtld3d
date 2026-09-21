@@ -6145,17 +6145,15 @@ fn q8w8v8u8_queries_and_noautogen_contract() {
             ),
             0
         );
-        if rtype != D3DRTYPE_TEXTURE {
-            assert_eq!(
-                h.check_device_format(
-                    D3DFMT_X8R8G8B8,
-                    D3DUSAGE_QUERY_LEGACYBUMPMAP,
-                    rtype,
-                    D3DFMT_Q8W8V8U8
-                ),
-                D3DERR_NOTAVAILABLE
-            );
-        }
+        assert_eq!(
+            h.check_device_format(
+                D3DFMT_X8R8G8B8,
+                D3DUSAGE_QUERY_LEGACYBUMPMAP,
+                rtype,
+                D3DFMT_Q8W8V8U8
+            ),
+            D3DERR_NOTAVAILABLE
+        );
     }
     signed_texture_queries_and_noautogen(
         &h,
@@ -6780,17 +6778,15 @@ fn q16w16v16u16_queries_and_noautogen_contract() {
             ),
             0
         );
-        if rtype != D3DRTYPE_TEXTURE {
-            assert_eq!(
-                h.check_device_format(
-                    D3DFMT_X8R8G8B8,
-                    D3DUSAGE_QUERY_LEGACYBUMPMAP,
-                    rtype,
-                    mtld3d_types::D3DFMT_Q16W16V16U16
-                ),
-                D3DERR_NOTAVAILABLE
-            );
-        }
+        assert_eq!(
+            h.check_device_format(
+                D3DFMT_X8R8G8B8,
+                D3DUSAGE_QUERY_LEGACYBUMPMAP,
+                rtype,
+                mtld3d_types::D3DFMT_Q16W16V16U16
+            ),
+            D3DERR_NOTAVAILABLE
+        );
     }
     signed_texture_queries_and_noautogen(
         &h,

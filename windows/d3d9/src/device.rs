@@ -10256,6 +10256,7 @@ extern "system" fn device_set_sampler_state(
 fn rejected_filter_stage(dev: &DeviceInner) -> Option<i32> {
     let float32_filtering =
         crate::direct3d9::float32_filtering_supported(dev.config().deny_float32_filtering);
+    let native_packed16 = crate::direct3d9::native_packed16_supported(dev.config().expand_packed16);
     let filterable = |texture: *mut Direct3DTexture9| {
         if texture.is_null() {
             return None;
@@ -10267,6 +10268,7 @@ fn rejected_filter_stage(dev: &DeviceInner) -> Option<i32> {
             format,
             D3DUSAGE_QUERY_FILTER,
             float32_filtering,
+            native_packed16,
         ))
     };
     let fragment = (0..STAGE_COUNT).map(|stage| {

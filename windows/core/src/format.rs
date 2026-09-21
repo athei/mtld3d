@@ -482,27 +482,36 @@ pub const fn is_render_target_format_device(d3d_format: u32, native_packed16: bo
 /// members (R16F / G16R16F / A16B16G16R16F) filter on every family and stay
 /// advertised either way.
 ///
-/// V16U16, Q8W8V8U8 and Q16W16V16U16 reject sRGB-write queries even without
-/// a render-target bit. A2R10G10B10 and A2B10G10R10 reject sRGB-write and
-/// legacy bump-map queries. Other usage policy stays with the caller; the
-/// float family is colour-renderable on both GPU families.
+/// `D3DUSAGE_QUERY_SRGBWRITE` asks whether the format encodes sRGB as it is
+/// written, which is a property of the render pass: the answer is the
+/// device's render-target answer for the format, whether or not the query
+/// also carries `D3DUSAGE_RENDERTARGET`. Every colour attachment encodes,
+/// through the sRGB twin view where the Metal format has one and through the
+/// pixel shader's OETF variant where it has not, so the twin table is the
+/// read side's question rather than this one. A format that is no colour
+/// attachment has nothing to encode into and answers no.
+///
+/// `D3DUSAGE_QUERY_LEGACYBUMPMAP` asks for the fixed-function
+/// bump-environment operations, which `D3DCAPS9::TextureOpCaps` does not
+/// advertise, so no format answers it. The SM1 `texbem` instruction and its
+/// `D3DTSS_BUMPENVMAT*` uniforms are a different surface and unaffected.
+///
+/// Both are answered before the filter arm, so neither can turn into the
+/// `D3DOK_NOAUTOGEN` success of a combined `D3DUSAGE_AUTOGENMIPMAP` query.
+/// Other usage policy stays with the caller; the float family is
+/// colour-renderable on both GPU families.
 #[must_use]
-pub const fn supports_usage_query(d3d_format: u32, usage: u32, float32_filtering: bool) -> bool {
-    // These signed sampling formats have no sRGB write representation.
-    // Reject this even without RENDERTARGET, before an AUTOGEN query can
-    // return the successful NOAUTOGEN fallback.
-    if matches!(
-        d3d_format,
-        D3DFMT_V16U16 | D3DFMT_Q8W8V8U8 | D3DFMT_Q16W16V16U16
-    ) && usage & D3DUSAGE_QUERY_SRGBWRITE != 0
-    {
+pub const fn supports_usage_query(
+    d3d_format: u32,
+    usage: u32,
+    float32_filtering: bool,
+    native_packed16: bool,
+) -> bool {
+    if usage & D3DUSAGE_QUERY_LEGACYBUMPMAP != 0 {
         return false;
     }
-    // The packed ten-bit formats have no sRGB twin and are no bump-map
-    // formats, and neither answer may turn into the NOAUTOGEN success of a
-    // combined query.
-    if matches!(d3d_format, D3DFMT_A2R10G10B10 | D3DFMT_A2B10G10R10)
-        && usage & (D3DUSAGE_QUERY_SRGBWRITE | D3DUSAGE_QUERY_LEGACYBUMPMAP) != 0
+    if usage & D3DUSAGE_QUERY_SRGBWRITE != 0
+        && !is_render_target_format_device(d3d_format, native_packed16)
     {
         return false;
     }
