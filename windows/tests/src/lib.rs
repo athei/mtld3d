@@ -11,6 +11,7 @@ mod ffi;
 mod harness;
 mod in_flight;
 mod pixel;
+mod reread;
 mod resource;
 mod shared;
 mod vertex;
@@ -22,6 +23,7 @@ pub use harness::{
 };
 pub use in_flight::spawn_scoped;
 pub use pixel::{Rgba8, assert_pixel_approx, assert_pixel_eq};
+pub use reread::{Reading, assert_or_reread};
 pub use resource::{
     BufferLock, CubeTexture, IndexBuffer, LockedRect, PixelShader, Query, StateBlock, Surface,
     SurfaceDc, SwapChain, Texture, VertexBuffer, VertexDeclaration, VertexShader, Volume,

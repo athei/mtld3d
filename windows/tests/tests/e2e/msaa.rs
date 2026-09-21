@@ -8,7 +8,8 @@
 //! the edge or on the device's sample positions.
 
 use mtld3d_tests::{
-    Harness, HarnessConfig, Rgba8, RhwVertex, Surface, Texture, TexturedVertex, assert_pixel_eq,
+    Harness, HarnessConfig, Reading, Rgba8, RhwVertex, Surface, Texture, TexturedVertex,
+    assert_or_reread, assert_pixel_eq,
 };
 use mtld3d_types::{
     D3D_OK, D3DCLEAR_TARGET, D3DCLEAR_ZBUFFER, D3DCMP_ALWAYS, D3DCMP_GREATER, D3DCMP_LESS,
@@ -164,6 +165,62 @@ fn surface_row(h: &Harness, rt: &Surface<'_>, size: (u32, u32)) -> Vec<u32> {
     let base = ((height / 2) * pitch_px) as usize;
     let row = locked.as_u32(base + width as usize);
     row[base..base + width as usize].to_vec()
+}
+
+/// `StretchRect` `source` into `resolve` and read the middle scanline `accept` has to pass.
+///
+/// For a read whose zero would say nothing about the stage that lost it: a
+/// multisampled pass, the resolve and copy out of it, and one CPU read. A
+/// rejected row is read again through `assert_or_reread`, first with a second
+/// `GetRenderTargetData` of `resolve` into a fresh system-memory surface and
+/// then after a second `StretchRect`, before the test fails with all three.
+fn resolved_row(
+    h: &Harness,
+    source: &Surface<'_>,
+    resolve: &Surface<'_>,
+    context: &str,
+    expected: &str,
+    accept: impl Fn(&[u32]) -> bool,
+) -> Vec<u32> {
+    let (hr, desc) = resolve.desc();
+    assert_eq!(hr, D3D_OK, "GetDesc on the resolve destination");
+    let size = (desc.width, desc.height);
+    let copy_and_read = || {
+        assert_eq!(
+            h.stretch_rect(source, resolve, D3DTEXF_NONE),
+            D3D_OK,
+            "StretchRect into the resolve destination"
+        );
+        surface_row(h, resolve, size)
+    };
+    let reading = |row: &[u32]| Reading::described(show_row(row), accept(row));
+    let row = copy_and_read();
+    assert_or_reread(
+        h,
+        context,
+        expected,
+        reading(&row),
+        || reading(&surface_row(h, resolve, size)),
+        || reading(&copy_and_read()),
+    );
+    row
+}
+
+/// A scanline for a failure report: whole when short, else both ends, the middle and a count.
+fn show_row(row: &[u32]) -> String {
+    const SHOWN: usize = 8;
+    if row.len() <= RT_SIZE as usize {
+        return format!("{row:08x?}");
+    }
+    let zero = row.iter().filter(|&&p| p == 0).count();
+    let middle = row.len() / 2 - SHOWN / 2;
+    format!(
+        "{} pixels, {zero} of them zero, first {:08x?}, middle {:08x?}, last {:08x?}",
+        row.len(),
+        &row[..SHOWN],
+        &row[middle..middle + SHOWN],
+        &row[row.len() - SHOWN..],
+    )
 }
 
 /// Render the diagonal into `rt`, which must be `RT_SIZE` square.
@@ -620,15 +677,15 @@ fn depth_test_holds_on_a_multisampled_target() {
     assert_eq!(h.end_scene(), 0, "EndScene");
     assert_eq!(h.present(), 0, "Present");
 
-    let row = back_buffer_row(&h);
-    assert!(
-        count_intermediate(&row) > 0,
-        "the depth-tested 4x edge still resolves: {row:02X?}"
-    );
-    assert_pixel_eq(
-        row[INSIDE_X as usize],
-        WHITE,
-        "the near draw's white survives the occluded blue one",
+    let (width, height) = h.dims();
+    let staging = h.create_render_target(width, height, D3DFMT_X8R8G8B8);
+    resolved_row(
+        &h,
+        &h.back_buffer(0),
+        &staging,
+        "the depth-tested 4x edge resolves and the near draw's white survives the occluded blue",
+        "intermediate pixels along the edge and 0xffffffff at x=4",
+        |row| count_intermediate(row) > 0 && row[INSIDE_X as usize] == WHITE,
     );
 }
 
@@ -1216,6 +1273,13 @@ fn a_clear_before_a_stretch_rect_resolve_does_not_wipe_it() {
 }
 
 fn coverage_pixel(h: &Harness, target: &Surface<'_>, resolve: &Surface<'_>, color: u32) -> u32 {
+    draw_coverage(h, target, color);
+    assert_eq!(h.stretch_rect(target, resolve, D3DTEXF_NONE), D3D_OK);
+    render_target_row(h, resolve)[INSIDE_X as usize]
+}
+
+/// Clear `target` to blue and draw the diagonal over it in `color`.
+fn draw_coverage(h: &Harness, target: &Surface<'_>, color: u32) {
     assert_eq!(h.set_render_target(0, target), D3D_OK);
     assert_eq!(h.begin_scene(), D3D_OK);
     assert_eq!(h.clear_target(BLUE), D3D_OK);
@@ -1228,18 +1292,19 @@ fn coverage_pixel(h: &Harness, target: &Surface<'_>, resolve: &Surface<'_>, colo
         D3D_OK
     );
     assert_eq!(h.end_scene(), D3D_OK);
-    assert_eq!(h.stretch_rect(target, resolve, D3DTEXF_NONE), D3D_OK);
-    render_target_row(h, resolve)[INSIDE_X as usize]
+}
+
+/// Whether `pixel` is white over blue at a fraction of the samples.
+fn is_partial_coverage(pixel: u32) -> bool {
+    let c = Rgba8::from_pixel(pixel);
+    c.r > 16 && c.r < 239 && c.r == c.g && c.b == 255
 }
 
 fn assert_partial_coverage(pixel: u32) {
-    let c = Rgba8::from_pixel(pixel);
     assert!(
-        c.r > 16 && c.r < 239,
-        "fractional white coverage over blue: {pixel:#010x}"
+        is_partial_coverage(pixel),
+        "fractional white coverage over blue, red equal to green and blue full: {pixel:#010x}"
     );
-    assert_eq!(c.r, c.g, "white's red and green coverage agree");
-    assert_eq!(c.b, 255, "covered and uncovered samples are blue");
 }
 
 #[test]
@@ -1479,11 +1544,13 @@ fn coverage_depth_writes_with_color_masked_out(a2m: bool) {
         D3D_OK
     );
     assert_eq!(h.end_scene(), D3D_OK);
-    assert_eq!(h.stretch_rect(&target, &resolve, D3DTEXF_NONE), D3D_OK);
-    assert_eq!(
-        render_target_row(&h, &resolve)[INSIDE_X as usize],
-        BLUE,
-        "color mask keeps every color sample"
+    resolved_row(
+        &h,
+        &target,
+        &resolve,
+        "color mask keeps every color sample",
+        "0xff0000ff at x=4",
+        |row| row[INSIDE_X as usize] == BLUE,
     );
     assert_eq!(h.set_render_state(D3DRS_COLORWRITEENABLE, 15), D3D_OK);
     assert_eq!(h.set_render_state(D3DRS_ALPHATESTENABLE, 0), D3D_OK);
@@ -1492,7 +1559,15 @@ fn coverage_depth_writes_with_color_masked_out(a2m: bool) {
         D3D_OK
     );
     // Only the samples the near coverage draw left untouched pass depth.
-    assert_partial_coverage(coverage_pixel(&h, &target, &resolve, WHITE));
+    draw_coverage(&h, &target, WHITE);
+    resolved_row(
+        &h,
+        &target,
+        &resolve,
+        "only the samples the near coverage draw left untouched pass depth",
+        "fractional white coverage over blue at x=4, red equal to green and blue full",
+        |row| is_partial_coverage(row[INSIDE_X as usize]),
+    );
 }
 
 #[test]
