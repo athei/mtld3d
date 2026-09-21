@@ -478,6 +478,21 @@ and encoded offset, row pitch and image pitch. Image pitch counts block rows
 for compressed textures. The existing `readback-wait` record supplies completion.
 Texture extents in these records are base-level extents; `level` selects the mip.
 
+The depth transfer behind RESZ is one of those copies. It records its two ends
+as a `texture-copy` at site `depth-transfer/0`, before any of its encoders
+exist: the live source and destination textures, their levels, their sample
+counts and the destination region. It reaches the destination through private
+depth and stencil planes rather than one `copyFromTexture:`, so that record
+states the transfer it was asked for, not the operands of a single encoded
+copy. When the sample-zero compute pass runs, a `depth-transfer-resample`
+record follows at site `depth-transfer/1` with `sample=0`, naming the private
+multisample copy the kernel samples and its stencil view, or the planes
+extracted from a single-sample source, the output planes the destination copy
+then inserts, the source and output regions, the kernel's four row strides
+(depth in floats, stencil in bytes) and the dispatch grid and threadgroup. A
+transfer whose source is already single-sampled at the destination's size needs
+no compute pass and emits no such record, so its `texture-copy` stands alone.
+
 These records include command-buffer pointer, label and queue, plus pass or
 blit site, so a producer attachment can be followed through copies into a
 readback destination. All additional property queries and formatting are behind
