@@ -1440,6 +1440,134 @@ fn color_fill_render_target_texture_succeeds() {
 }
 
 #[test]
+fn color_fill_of_a_render_target_texture_level_outlasts_a_pending_cpu_write() {
+    // A level of a non-dynamic DEFAULT-pool texture is lockable here, so a
+    // render-target texture level can carry a CPU write that no bind has
+    // uploaded yet. `ColorFill` paints such a level on the GPU and never
+    // touches its staging, so the pending upload has to be scheduled ahead of
+    // the fill: the bind that samples the level afterwards would otherwise
+    // push the older CPU bytes over the fill.
+    let h = Harness::new();
+    let rt = h.create_texture(
+        64,
+        64,
+        1,
+        D3DUSAGE_RENDERTARGET,
+        D3DFMT_A8R8G8B8,
+        D3DPOOL_DEFAULT,
+    );
+    {
+        let mut locked = rt.lock_rect(0, 0);
+        let pitch_px = locked.pitch().cast_unsigned() / 4;
+        locked.write_u32(&vec![GREEN; (pitch_px * 64) as usize]);
+    }
+    assert_eq!(
+        h.color_fill_hr(&rt.surface_level(0), RED),
+        D3D_OK,
+        "ColorFill of the level the lock left dirty",
+    );
+    // Close the frame the fill was queued in. An upload leads the frame it is
+    // scheduled in, so the pending write has to be flushed here rather than by
+    // the bind in the frame after this one, where it would lead that frame and
+    // land on top of the fill.
+    assert_eq!(h.present(), 0, "submit the fill");
+
+    for (state, value) in [
+        (D3DTSS_COLOROP, D3DTOP_SELECTARG1),
+        (D3DTSS_COLORARG1, D3DTA_TEXTURE),
+        (D3DTSS_ALPHAOP, D3DTOP_SELECTARG1),
+        (D3DTSS_ALPHAARG1, D3DTA_TEXTURE),
+    ] {
+        assert_eq!(h.set_texture_stage_state(0, state, value), 0, "TSS");
+    }
+    assert_eq!(h.set_render_state(D3DRS_LIGHTING, 0), 0, "lighting off");
+    assert_eq!(h.set_texture(0, &rt), 0, "bind the filled texture");
+    for (state, value) in [
+        (D3DSAMP_MINFILTER, D3DTEXF_POINT),
+        (D3DSAMP_MAGFILTER, D3DTEXF_POINT),
+        (D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP),
+        (D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP),
+    ] {
+        assert_eq!(h.set_sampler_state(0, state, value), 0, "sampler");
+    }
+    assert_eq!(
+        h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1),
+        0,
+        "SetFVF TEX1"
+    );
+    let quad = textured_fullscreen_quad();
+    h.render_once(BLACK, |d| {
+        assert_eq!(
+            d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad),
+            0,
+            "sample the filled level"
+        );
+    });
+
+    let center = Rgba8::from_pixel(h.read_pixel(320, 240));
+    assert!(
+        center.r > 200 && center.g < 40 && center.b < 40,
+        "the sampled level shows the fill, got {center:?}"
+    );
+
+    assert_eq!(h.clear_texture(0), 0, "unbind the texture");
+}
+
+/// A quad over the whole backbuffer with UVs spanning the unit square.
+const fn textured_fullscreen_quad() -> [TexturedVertex; 6] {
+    [
+        TexturedVertex {
+            x: -1.0,
+            y: 1.0,
+            z: 0.5,
+            color: WHITE,
+            u: 0.0,
+            v: 0.0,
+        },
+        TexturedVertex {
+            x: 1.0,
+            y: 1.0,
+            z: 0.5,
+            color: WHITE,
+            u: 1.0,
+            v: 0.0,
+        },
+        TexturedVertex {
+            x: -1.0,
+            y: -1.0,
+            z: 0.5,
+            color: WHITE,
+            u: 0.0,
+            v: 1.0,
+        },
+        TexturedVertex {
+            x: 1.0,
+            y: 1.0,
+            z: 0.5,
+            color: WHITE,
+            u: 1.0,
+            v: 0.0,
+        },
+        TexturedVertex {
+            x: 1.0,
+            y: -1.0,
+            z: 0.5,
+            color: WHITE,
+            u: 1.0,
+            v: 1.0,
+        },
+        TexturedVertex {
+            x: -1.0,
+            y: -1.0,
+            z: 0.5,
+            color: WHITE,
+            u: 0.0,
+            v: 1.0,
+        },
+    ]
+}
+
+#[test]
 fn fresh_default_offscreen_plain_round_trips_through_lock_rect() {
     // A DEFAULT offscreen plain is lockable, so it owns its level-0 staging
     // from creation on. Three locks a fresh surface has to serve out of that

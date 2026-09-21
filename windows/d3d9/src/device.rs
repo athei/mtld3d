@@ -7217,7 +7217,7 @@ extern "system" fn device_stretch_rect(
         }
         // Past every depth-stencil gate, so the endpoints' pending uploads are
         // work this call will use.
-        flush_dirty_mips_for_stretch(&obj, src_surf, dst_surf);
+        flush_dirty_mips_for_gpu_write(&obj, &[src_surf, dst_surf]);
         if resolve {
             // The samples are reduced on a render pass of the source, which
             // also enters the destination into the load/store model as
@@ -7379,7 +7379,7 @@ extern "system" fn device_stretch_rect(
     }
     // Past every gate that can reject the call, so the endpoints' pending
     // uploads are work this call will use.
-    flush_dirty_mips_for_stretch(&obj, src_surf, dst_surf);
+    flush_dirty_mips_for_gpu_write(&obj, &[src_surf, dst_surf]);
     // A cross-Metal-format same-size copy also needs the render-quad path (the
     // 1:1 blit can't convert). `check_stretch_rect_formats` guaranteed a
     // cross-format destination is a render target or an offscreen-plain surface
@@ -7583,24 +7583,25 @@ fn convert_stretch_dst_staging(
 
 /// Lazy texture upload: flush any pending dirty mips on the surfaces' parent textures.
 ///
-/// The `StretchRect` blit then operates on the latest
-/// CPU-uploaded content. Render targets never carry a `dirty` flag
-/// (RTs aren't Lock+Unlocked), so this is a no-op for them.
+/// A GPU write of a surface (`StretchRect` either way round, `ColorFill` of a
+/// render target) reads and writes Metal textures alone, so every upload a
+/// surface's texture still owes has to be scheduled ahead of it: an upload runs
+/// at the head of the frame it is scheduled in, so one left for a later bind
+/// lands on top of the write instead of under it.
 ///
 /// Every caller sits below the gates that return `D3DERR_INVALIDCALL`, so a
-/// rejected `StretchRect` schedules no upload for either endpoint.
-fn flush_dirty_mips_for_stretch(
+/// rejected call schedules no upload for any endpoint.
+fn flush_dirty_mips_for_gpu_write(
     obj: &Direct3DDevice9,
-    src_surf: *mut crate::surface::Direct3DSurface9,
-    dst_surf: *mut crate::surface::Direct3DSurface9,
+    surfaces: &[*mut crate::surface::Direct3DSurface9],
 ) {
-    for surf in [src_surf, dst_surf] {
+    for &surf in surfaces {
         if surf.is_null() {
             continue;
         }
         // SAFETY: `surf` is non-null (checked above) and is a
-        // caller-supplied `Direct3DSurface9*` from a `StretchRect`
-        // thunk; the caller must pass live surface wrappers.
+        // caller-supplied `Direct3DSurface9*` from a `StretchRect` or
+        // `ColorFill` thunk; the caller must pass live surface wrappers.
         let parent = unsafe { (*surf).parent_texture() };
         if parent.is_null() {
             continue;
@@ -8538,8 +8539,12 @@ extern "system" fn device_color_fill(
     if info.flags.contains(StretchSurfaceFlags::IS_RENDER_TARGET) {
         // The fill runs as a render pass over the destination's Metal texture
         // and never touches its CPU staging, so a texture-backed destination
-        // hands the next map a read back rather than the staging it left.
+        // owes the same two things a `StretchRect` destination does: the
+        // uploads its levels still have pending go first, past every gate that
+        // can reject the call, and the next map reads the fill back rather
+        // than the staging it left.
         if matches!(info.kind, StretchKind::Texture(_)) {
+            flush_dirty_mips_for_gpu_write(&obj, &[surf]);
             claim_dst_subresource_for_gpu(surf, &info);
         }
         return color_fill_render_target(obj.inner(), info, region, color);
