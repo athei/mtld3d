@@ -1,15 +1,25 @@
-use objc2::{define_class, extern_methods, rc::Retained, runtime::AnyObject};
+use log::{Level, log_enabled};
+use objc2::{
+    define_class, extern_methods,
+    rc::Retained,
+    runtime::{AnyObject, ProtocolObject},
+};
 use objc2_foundation::{
     NSArray, NSDictionary, NSError, NSLocalizedDescriptionKey, NSObject, NSObjectProtocol, NSString,
 };
 use objc2_metal::{
-    MTLCommandBufferEncoderInfo, MTLCommandBufferEncoderInfoErrorKey, MTLCommandBufferErrorOption,
-    MTLCommandBufferStatus, MTLCommandEncoderErrorState,
+    MTLBuffer, MTLCommandBufferEncoderInfo, MTLCommandBufferEncoderInfoErrorKey,
+    MTLCommandBufferErrorOption, MTLCommandBufferStatus, MTLCommandEncoderErrorState,
+    MTLCommandQueue, MTLCreateSystemDefaultDevice, MTLDevice, MTLPixelFormat, MTLResource,
+    MTLResourceOptions, MTLSize, MTLStorageMode, MTLTexture, MTLTextureDescriptor, MTLTextureType,
+    MTLTextureUsage,
 };
 
 use super::{
-    append_signposts, buffer_role, diagnostic_descriptor, encoder_state_name, error_details,
-    metadata_string, optional_string, sequence, status_name,
+    BlitSite, DepthTransfer, DepthTransferResample, append_signposts, buffer_role,
+    copy_buffer_details, depth_transfer, depth_transfer_resample, diagnostic_descriptor,
+    dispatch_region, encoder_state_name, error_details, metadata_string, optional_string,
+    resample_details, sequence, status_name, texture_details,
 };
 
 define_class!(
@@ -282,6 +292,162 @@ fn optional_identity_fields_preserve_missing_and_escape_present_strings() {
     assert_eq!(buffer_role(Some("mtld3d-init-clear-extra")), "unknown");
     assert_eq!(buffer_role(Some("unexpected")), "unknown");
     assert_eq!(buffer_role(None), "unknown");
+}
+
+#[test]
+fn absent_copy_ends_and_dispatch_sizes_keep_the_copy_vocabulary() {
+    assert_eq!(texture_details(None, 0), "missing");
+    assert_eq!(copy_buffer_details(None), "missing");
+    assert_eq!(BlitSite::DepthTransfer.to_string(), "depth-transfer");
+    assert_eq!(
+        dispatch_region(MTLSize {
+            width: 3,
+            height: 5,
+            depth: 1,
+        })
+        .to_string(),
+        "3x5x1",
+    );
+}
+
+/// The multisample path's record names both kernel ends and the sample it reads.
+///
+/// The transfer's own ends ride the `texture-copy` record, so what this pins is
+/// the private copy the kernel samples, its stencil view, the output planes and
+/// the kernel's own argument.
+#[test]
+fn depth_transfer_resample_names_both_kernel_ends_and_the_sample_it_reads() {
+    let Some(fixture) = ResampleFixture::new() else {
+        return;
+    };
+    let details = resample_details(&fixture.pass());
+    assert_eq!(
+        details,
+        format!(
+            "site=depth-transfer/1 sample=0 \
+             src={{texture={:p} label=\"source\\\"plane\" storage=MTLStorageMode(2) usage=0x11 \
+             type=MTLTextureType(4) array_length=1 \
+             MTLPixelFormat(260) samples=4 level=0/1 origin=0,0 size=8x4x1}} \
+             src_stencil={{texture={:p} label=missing storage=MTLStorageMode(2) usage=0x11 \
+             type=MTLTextureType(4) array_length=1 \
+             MTLPixelFormat(261) samples=4 level=0/1 origin=0,0 size=8x4x1}} \
+             src_planes={{depth={{missing}} stencil={{missing}}}} \
+             dst_planes={{depth={{buffer={:p} label=\"depth\\nplane\" \
+             storage=MTLStorageMode(2)}} \
+             stencil={{buffer={:p} label=missing storage=MTLStorageMode(2)}}}} \
+             src_region=8x4x1 region=4x2x1 \
+             src_strides={{depth=0 stencil=0}} dst_strides={{depth=64 stencil=256}} \
+             grid=1x1x1 threadgroup=8x8x1",
+            Retained::as_ptr(&fixture.source),
+            Retained::as_ptr(&fixture.stencil_view),
+            Retained::as_ptr(&fixture.output_depth),
+            Retained::as_ptr(&fixture.output_stencil),
+        ),
+    );
+    assert!(!details.contains(['\n', '\r', '\t']));
+}
+
+/// With the target off both entry points return before querying anything.
+///
+/// Nothing observes a record that is never written, so what this pins is that
+/// the disabled calls are reached at all and that the detail helpers stay
+/// behind them.
+#[test]
+fn depth_transfer_records_are_inert_without_the_target() {
+    assert!(!log_enabled!(target: super::LOG_TARGET, Level::Debug));
+    let Some(fixture) = ResampleFixture::new() else {
+        return;
+    };
+    let Some(queue) = fixture.device.newCommandQueue() else {
+        return;
+    };
+    let Some(cb) = queue.commandBuffer() else {
+        return;
+    };
+    depth_transfer(
+        &cb,
+        &DepthTransfer {
+            source: &fixture.source,
+            source_level: 0,
+            destination: &fixture.source,
+            destination_level: 0,
+            width: 8,
+            height: 4,
+        },
+    );
+    depth_transfer_resample(&cb, &fixture.pass());
+}
+
+/// The live Metal objects one depth-transfer compute pass would bind.
+struct ResampleFixture {
+    device: Retained<ProtocolObject<dyn MTLDevice>>,
+    source: Retained<ProtocolObject<dyn MTLTexture>>,
+    stencil_view: Retained<ProtocolObject<dyn MTLTexture>>,
+    output_depth: Retained<ProtocolObject<dyn MTLBuffer>>,
+    output_stencil: Retained<ProtocolObject<dyn MTLBuffer>>,
+}
+
+impl ResampleFixture {
+    fn new() -> Option<Self> {
+        let Some(device) = MTLCreateSystemDefaultDevice() else {
+            eprintln!("MTLCreateSystemDefaultDevice returned nil, skipping");
+            return None;
+        };
+        // SAFETY: objc2 typed binding; a class method building a descriptor.
+        let desc = unsafe {
+            MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(
+                MTLPixelFormat::Depth32Float_Stencil8,
+                8,
+                4,
+                false,
+            )
+        };
+        desc.setStorageMode(MTLStorageMode::Private);
+        desc.setTextureType(MTLTextureType::Type2DMultisample);
+        // SAFETY: every Metal device this layer runs on answers for four samples.
+        unsafe {
+            desc.setSampleCount(4);
+        }
+        desc.setUsage(MTLTextureUsage::ShaderRead | MTLTextureUsage::PixelFormatView);
+        let source = device.newTextureWithDescriptor(&desc)?;
+        source.setLabel(Some(&NSString::from_str("source\"plane")));
+        let stencil_view = source.newTextureViewWithPixelFormat(MTLPixelFormat::X32_Stencil8)?;
+        let plane = |length| {
+            device.newBufferWithLength_options(length, MTLResourceOptions::StorageModePrivate)
+        };
+        let output_depth = plane(128)?;
+        output_depth.setLabel(Some(&NSString::from_str("depth\nplane")));
+        let output_stencil = plane(512)?;
+        Some(Self {
+            device,
+            source,
+            stencil_view,
+            output_depth,
+            output_stencil,
+        })
+    }
+
+    fn pass(&self) -> DepthTransferResample<'_> {
+        DepthTransferResample {
+            source: Some(&self.source),
+            source_stencil: Some(&self.stencil_view),
+            input_depth: None,
+            input_stencil: None,
+            output_depth: &self.output_depth,
+            output_stencil: Some(&self.output_stencil),
+            sizes: [8, 4, 4, 2, 0, 0, 64, 256],
+            grid: MTLSize {
+                width: 1,
+                height: 1,
+                depth: 1,
+            },
+            threadgroup: MTLSize {
+                width: 8,
+                height: 8,
+                depth: 1,
+            },
+        }
+    }
 }
 
 fn fixture_error(payload: Option<&AnyObject>) -> Retained<NSError> {

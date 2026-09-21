@@ -14,7 +14,10 @@ use objc2_metal::{
     MTLStorageMode, MTLTexture, MTLTextureDescriptor, MTLTextureType, MTLTextureUsage,
 };
 
-use super::handle::{IntoRetained, ReleaseRetain};
+use super::{
+    command::diagnostics,
+    handle::{IntoRetained, ReleaseRetain},
+};
 use crate::LOG_TARGET;
 
 /// Compile only the concrete source layout requested by the device owner.
@@ -132,6 +135,17 @@ pub fn encode(cb: &ProtocolObject<dyn MTLCommandBuffer>, command: &BlitCommand) 
     let height = (source.height() >> source_level).max(1);
     let out_width = (destination.width() >> destination_level).max(1);
     let out_height = (destination.height() >> destination_level).max(1);
+    diagnostics::depth_transfer(
+        cb,
+        &diagnostics::DepthTransfer {
+            source: &source,
+            source_level,
+            destination: &destination,
+            destination_level,
+            width: out_width,
+            height: out_height,
+        },
+    );
     let stencil = source.pixelFormat() == MTLPixelFormat::Depth32Float_Stencil8
         && destination.pixelFormat() == MTLPixelFormat::Depth32Float_Stencil8;
     let device = source.device();
@@ -240,18 +254,31 @@ pub fn encode(cb: &ProtocolObject<dyn MTLCommandBuffer>, command: &BlitCommand) 
                 4,
             );
         }
-        compute.dispatchThreadgroups_threadsPerThreadgroup(
-            MTLSize {
-                width: out_width.div_ceil(8),
-                height: out_height.div_ceil(8),
-                depth: 1,
-            },
-            MTLSize {
-                width: 8,
-                height: 8,
-                depth: 1,
+        let grid = MTLSize {
+            width: out_width.div_ceil(8),
+            height: out_height.div_ceil(8),
+            depth: 1,
+        };
+        let threadgroup = MTLSize {
+            width: 8,
+            height: 8,
+            depth: 1,
+        };
+        diagnostics::depth_transfer_resample(
+            cb,
+            &diagnostics::DepthTransferResample {
+                source: sampleable.as_deref(),
+                source_stencil: view.as_deref(),
+                input_depth: input.as_ref().map(|planes| &*planes.depth),
+                input_stencil: input.as_ref().and_then(|planes| planes.stencil.as_deref()),
+                output_depth: &output.depth,
+                output_stencil: output.stencil.as_deref(),
+                sizes,
+                grid,
+                threadgroup,
             },
         );
+        compute.dispatchThreadgroups_threadsPerThreadgroup(grid, threadgroup);
         compute.endEncoding();
     }
     let Some(blit) = cb.blitCommandEncoder() else {

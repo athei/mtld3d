@@ -312,15 +312,18 @@ pub fn command_buffer_error(error: Option<&NSError>) -> (u64, String) {
 // that PE status, so the PE error log never names the actual crash
 // site). When `cfg(mtld3d_crumb)` is off the probes compile to nothing.
 
-/// Origin of a `encode_leading_blits` invocation.
+/// Origin of a copy the trace probes and the debug records bracket.
 ///
 /// Used as the bracket label in trace probes (`blit[frame-leading/3]: …`,
-/// `blit[pass2/0]: …`). `Display` formats only when the trace macro
-/// fires, so the empty-args case allocates nothing.
+/// `blit[pass2/0]: …`) and as the site of a `texture-copy` record.
+/// `Display` formats only when the record or the trace macro fires, so the
+/// empty-args case allocates nothing.
 #[derive(Clone, Copy)]
 enum BlitSite {
     FrameLeading,
     Pass(usize),
+    /// A depth transfer, which encodes outside `encode_leading_blits`.
+    DepthTransfer,
 }
 
 impl core::fmt::Display for BlitSite {
@@ -328,6 +331,7 @@ impl core::fmt::Display for BlitSite {
         match self {
             Self::FrameLeading => f.write_str("frame-leading"),
             Self::Pass(idx) => write!(f, "pass{idx}"),
+            Self::DepthTransfer => f.write_str("depth-transfer"),
         }
     }
 }

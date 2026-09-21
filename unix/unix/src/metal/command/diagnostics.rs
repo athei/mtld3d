@@ -12,7 +12,7 @@ use objc2_metal::{
     MTLBuffer, MTLCommandBuffer, MTLCommandBufferDescriptor, MTLCommandBufferEncoderInfo,
     MTLCommandBufferEncoderInfoErrorKey, MTLCommandBufferErrorOption, MTLCommandBufferStatus,
     MTLCommandEncoderErrorState, MTLCommandQueue, MTLDevice, MTLRenderPassAttachmentDescriptor,
-    MTLRenderPassDescriptor, MTLResource, MTLTexture,
+    MTLRenderPassDescriptor, MTLResource, MTLSize, MTLTexture,
 };
 
 use super::{BlitSite, CopyBufferEndpoint, CopyEndpoint, CopyRegion};
@@ -104,16 +104,100 @@ pub(super) fn readback(
     debug!(
         target: LOG_TARGET,
         "readback-copy {} site=readback-blit src={{{} {} slice={} z=0}} \
-         dst={{buffer={buffer:p} label={} storage={:?} {destination}}} \
+         dst={{{} {destination}}} \
          pe_destination={:#x} pe_length={} region={region}",
         buffer_identity(cb),
         texture_identity(source.texture),
         source.endpoint,
         source.slice,
-        optional_string(buffer.label().map(|s| s.to_string()).as_deref()),
-        buffer.storageMode(),
+        copy_buffer_identity(buffer),
         pe_destination.0,
         pe_destination.1,
+    );
+}
+
+/// The two ends of a depth transfer, as the live textures describe them.
+///
+/// The transfer reaches its destination through private depth and stencil
+/// planes rather than one `copyFromTexture:`, so these are the endpoints it
+/// was asked for, not the operands of a single encoded copy.
+pub struct DepthTransfer<'a> {
+    pub source: &'a ProtocolObject<dyn MTLTexture>,
+    pub source_level: usize,
+    pub destination: &'a ProtocolObject<dyn MTLTexture>,
+    pub destination_level: usize,
+    pub width: usize,
+    pub height: usize,
+}
+
+/// The sample-zero compute pass of a depth transfer, as it is encoded.
+///
+/// The kernel reads either the private multisample copy of the source or the
+/// planes extracted from a single-sample one, and always writes the output
+/// planes the destination copy then inserts.
+pub struct DepthTransferResample<'a> {
+    /// The private multisample copy the kernel samples, absent on the plane path.
+    pub source: Option<&'a ProtocolObject<dyn MTLTexture>>,
+    /// The stencil view of `source`, absent when the transfer carries no stencil.
+    pub source_stencil: Option<&'a ProtocolObject<dyn MTLTexture>>,
+    /// The extracted input depth plane, absent on the multisample path.
+    pub input_depth: Option<&'a ProtocolObject<dyn MTLBuffer>>,
+    /// The extracted input stencil plane, on the plane path of a stencil transfer.
+    pub input_stencil: Option<&'a ProtocolObject<dyn MTLBuffer>>,
+    pub output_depth: &'a ProtocolObject<dyn MTLBuffer>,
+    /// The output stencil plane, absent when the transfer carries no stencil.
+    pub output_stencil: Option<&'a ProtocolObject<dyn MTLBuffer>>,
+    /// The kernel's eight-word argument: source extent, output extent, four row strides.
+    ///
+    /// A depth stride counts floats and a stencil stride bytes, in the order
+    /// input depth, input stencil, output depth, output stencil.
+    pub sizes: [u32; 8],
+    pub grid: MTLSize,
+    pub threadgroup: MTLSize,
+}
+
+/// Record a depth transfer's two ends as the texture copy it is asked for.
+pub fn depth_transfer(cb: &ProtocolObject<dyn MTLCommandBuffer>, transfer: &DepthTransfer<'_>) {
+    if !log_enabled!(target: LOG_TARGET, Level::Debug) {
+        return;
+    }
+    let source = texture_endpoint(transfer.source, transfer.source_level);
+    let destination = texture_endpoint(transfer.destination, transfer.destination_level);
+    texture_copy(
+        cb,
+        BlitSite::DepthTransfer,
+        0,
+        &TextureCopy {
+            texture: transfer.source,
+            endpoint: &source,
+            slice: 0,
+        },
+        &TextureCopy {
+            texture: transfer.destination,
+            endpoint: &destination,
+            slice: 0,
+        },
+        &CopyRegion {
+            width: transfer.width,
+            height: transfer.height,
+            depth: 1,
+        },
+    );
+}
+
+/// Record the compute pass that selects sample zero of a depth transfer.
+pub fn depth_transfer_resample(
+    cb: &ProtocolObject<dyn MTLCommandBuffer>,
+    pass: &DepthTransferResample<'_>,
+) {
+    if !log_enabled!(target: LOG_TARGET, Level::Debug) {
+        return;
+    }
+    debug!(
+        target: LOG_TARGET,
+        "depth-transfer-resample {} {}",
+        buffer_identity(cb),
+        resample_details(pass),
     );
 }
 
@@ -136,11 +220,9 @@ fn texture_identity(texture: &ProtocolObject<dyn MTLTexture>) -> String {
     )
 }
 
-fn attachment_texture(texture: Option<&ProtocolObject<dyn MTLTexture>>, level: usize) -> String {
-    let Some(texture) = texture else {
-        return "missing".to_owned();
-    };
-    let endpoint = CopyEndpoint {
+/// The whole of a live texture at `level`, addressed from its origin.
+fn texture_endpoint(texture: &ProtocolObject<dyn MTLTexture>, level: usize) -> CopyEndpoint {
+    CopyEndpoint {
         pixel_format: texture.pixelFormat(),
         sample_count: texture.sampleCount(),
         width: texture.width(),
@@ -150,19 +232,78 @@ fn attachment_texture(texture: Option<&ProtocolObject<dyn MTLTexture>>, level: u
         levels: texture.mipmapLevelCount(),
         origin_x: 0,
         origin_y: 0,
+    }
+}
+
+fn texture_details(texture: Option<&ProtocolObject<dyn MTLTexture>>, level: usize) -> String {
+    let Some(texture) = texture else {
+        return "missing".to_owned();
     };
+    let endpoint = texture_endpoint(texture, level);
     format!("{} {endpoint}", texture_identity(texture))
+}
+
+fn copy_buffer_identity(buffer: &ProtocolObject<dyn MTLBuffer>) -> String {
+    format!(
+        "buffer={buffer:p} label={} storage={:?}",
+        optional_string(buffer.label().map(|s| s.to_string()).as_deref()),
+        buffer.storageMode(),
+    )
+}
+
+fn copy_buffer_details(buffer: Option<&ProtocolObject<dyn MTLBuffer>>) -> String {
+    buffer.map_or_else(|| "missing".to_owned(), copy_buffer_identity)
+}
+
+/// Read a dispatch size as the region vocabulary the copy records use.
+const fn dispatch_region(size: MTLSize) -> CopyRegion {
+    CopyRegion {
+        width: size.width,
+        height: size.height,
+        depth: size.depth,
+    }
+}
+
+fn resample_details(pass: &DepthTransferResample<'_>) -> String {
+    let extent = |width: u32, height: u32| CopyRegion {
+        width: usize::try_from(width).expect("a Metal extent fits usize"),
+        height: usize::try_from(height).expect("a Metal extent fits usize"),
+        depth: 1,
+    };
+    format!(
+        "site={}/1 sample=0 src={{{}}} src_stencil={{{}}} \
+         src_planes={{depth={{{}}} stencil={{{}}}}} \
+         dst_planes={{depth={{{}}} stencil={{{}}}}} \
+         src_region={} region={} \
+         src_strides={{depth={} stencil={}}} dst_strides={{depth={} stencil={}}} \
+         grid={} threadgroup={}",
+        BlitSite::DepthTransfer,
+        texture_details(pass.source, 0),
+        texture_details(pass.source_stencil, 0),
+        copy_buffer_details(pass.input_depth),
+        copy_buffer_details(pass.input_stencil),
+        copy_buffer_identity(pass.output_depth),
+        copy_buffer_details(pass.output_stencil),
+        extent(pass.sizes[0], pass.sizes[1]),
+        extent(pass.sizes[2], pass.sizes[3]),
+        pass.sizes[4],
+        pass.sizes[5],
+        pass.sizes[6],
+        pass.sizes[7],
+        dispatch_region(pass.grid),
+        dispatch_region(pass.threadgroup),
+    )
 }
 
 fn attachment_details(attachment: &MTLRenderPassAttachmentDescriptor) -> String {
     format!(
         "texture={{{}}} level={} slice={} plane={} resolve={{{}}} \
          resolve_level={} resolve_slice={} resolve_plane={} load={:?} store={:?}",
-        attachment_texture(attachment.texture().as_deref(), attachment.level()),
+        texture_details(attachment.texture().as_deref(), attachment.level()),
         attachment.level(),
         attachment.slice(),
         attachment.depthPlane(),
-        attachment_texture(
+        texture_details(
             attachment.resolveTexture().as_deref(),
             attachment.resolveLevel(),
         ),
