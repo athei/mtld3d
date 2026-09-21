@@ -6909,6 +6909,21 @@ fn readback_from_texture_rt(
         return D3DERR_INVALIDCALL;
     }
     let texture_id = ti.texture_info().texture_id;
+    // The texture's own logical extent, which the mip extent above is measured
+    // against. Taken here because the flush below reborrows the texture.
+    let full_extent = (ti.mip_width(0), ti.mip_height(0));
+    // Past every gate that rejects the call, so the uploads scheduled here are
+    // work this read will use. A level of a non-dynamic DEFAULT-pool texture is
+    // lockable here, so the source can carry a CPU write no bind has uploaded
+    // yet, and the read below reads the Metal texture alone: an upload left for
+    // a later bind would land after it and the read would hand back the older
+    // GPU content. `flush_dirty_mips_for_gpu_write` does the same for a
+    // surface a GPU write claims, but it walks the surface to its parent and
+    // rehydrates it first, and this path holds the validated parent already,
+    // whose DEFAULT pool leaves the rehydration nothing to do.
+    // SAFETY: `parent` is non-null (checked above) and points to a live
+    // `Direct3DTexture9` whose refcount keeps it alive while the surface is.
+    crate::texture::flush_dirty_mips(unsafe { (*parent).inner_mut() }, dev.inner());
     let slot = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let slot_op = std::sync::Arc::clone(&slot);
     dev.inner().push_op(Box::new(move |enc| {
@@ -6934,9 +6949,7 @@ fn readback_from_texture_rt(
             // MTLTexture handle from the encoder texture cache.
             unsafe { MetalHandle::<MTLTextureKind>::new(h) },
             (level, slice),
-            // The texture's own logical extent, which the mip extent above is
-            // measured against.
-            (ti.mip_width(0), ti.mip_height(0)),
+            full_extent,
             dst,
         ),
     )
