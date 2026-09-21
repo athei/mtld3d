@@ -1105,7 +1105,8 @@ pub struct FrameEncoder {
     /// A key Metal refused is remembered as failed, so its later draws are
     /// dropped on the probe instead of repeating the synchronous build. The
     /// no-color sibling has a key of its own and is remembered the same way.
-    /// `reset_cleanup` forgets the failures.
+    /// `reset_cleanup` forgets the failures; a Reset at unchanged back-buffer
+    /// dimensions never reaches it.
     pipeline_cache: BuildIndex<PipelineKey, MetalHandle<MTLRenderPipelineStateKind>>,
     /// Per-format-combo "clear-quad" pipeline handles.
     ///
@@ -1211,7 +1212,8 @@ pub struct FrameEncoder {
     /// (warm-load) and address the on-disk cache. A key whose cold resolve
     /// failed is recorded too: the same key yields the same source, so its
     /// later draws are dropped on the probe instead of compiling again.
-    /// Reset forgets the failures, shutdown forgets everything.
+    /// `reset_cleanup` forgets the failures (a Reset at unchanged back-buffer
+    /// dimensions never reaches it), shutdown forgets everything.
     ff_vs_libs: BuildIndex<FfVsKey, StageLibHandles>,
     prog_vs_libs: BuildIndex<(ProgramId, u16, u8, VsSamplerKinds), StageLibHandles>,
     ff_ps_libs: FxHashMap<FfPsKey, BuildIndex<VariantKey, StageLibHandles>>,
@@ -8641,7 +8643,8 @@ impl FrameEncoder {
         drop(held);
         self.pending_blit_retention.clear();
         self.current_blit_retention.clear();
-        // A failed library or pipeline build gets one more attempt per Reset:
+        // A failed library or pipeline build gets one more attempt per Reset
+        // that reaches this cleanup (one at unchanged dimensions does not):
         // a rejected source or descriptor fails again at the cost of one
         // build, a build the compiler service dropped goes through.
         self.ff_vs_libs.forget_failures();

@@ -62,7 +62,8 @@ impl<K: Eq + Hash, H: Copy> BuildIndex<K, H> {
     /// Forget the failed keys so each is built once more; successes stay.
     ///
     /// For a boundary after which a failure may no longer hold, such as a
-    /// device reset following a compiler service that went away mid-build.
+    /// device reset that recreates its surfaces, following a compiler service
+    /// that went away mid-build.
     pub fn forget_failures(&mut self) {
         self.entries.retain(|_, outcome| outcome.is_some());
     }

@@ -594,9 +594,11 @@ depth-state misses are separate. Cache hits do not count as creation attempts;
 a source-index miss that finds an already-prewarmed library is still a hit.
 A library or pipeline build that fails is one attempt and one failure: the
 source index or the pipeline cache remembers the key, its later draws are
-dropped on the probe, and a device Reset forgets the failures so each key gets
-one more attempt. A failed no-color sibling drops no draw; its passes keep
-their color attachment.
+dropped on the probe. A Reset that goes through the encoder's reset cleanup,
+one that recreates the implicit surfaces, forgets the failures so each key
+gets one more attempt; a Reset that keeps the back-buffer dimensions skips
+that cycle and forgets nothing. A failed no-color sibling drops no draw; its
+passes keep their color attachment.
 
 Rows report total duration, ms/frame, peak summed duration on one encoder
 submission, attempts (`calls`), and failures. Successful calls are attempts
