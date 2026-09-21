@@ -780,11 +780,7 @@ bitflags! {
         /// target held before the resolve. Metal has no query for it, so
         /// the unix side answers from the device's name, and the encoder
         /// waits for the last submitted command buffer before it copies
-        /// out of a resolve target when this is set. Nor does that device
-        /// order a blit or compute read of a multisampled attachment, or of
-        /// its resolve target, after the pass inside one command buffer, so
-        /// the PE side also submits the frame recorded so far ahead of such
-        /// a read (`GpuCaps::multisample_read_splits_submission`).
+        /// out of a resolve target when this is set.
         const RESOLVE_NEEDS_RETIRE = 1 << 6;
     }
 }
