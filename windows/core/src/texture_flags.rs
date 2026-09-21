@@ -17,8 +17,9 @@ bitflags::bitflags! {
         /// in `device_create_texture` for those. When set, mip-0 uploads append
         /// a `BlitCommand::generate_mipmaps` to the frame's leading-blit list
         /// right after the mip-0 `CopyBufferToTexture`, and the COM
-        /// `IDirect3DBaseTexture9::GenerateMipSubLevels` call pushes the same op
-        /// explicitly. Also collapses the app-visible level count to 1.
+        /// `IDirect3DBaseTexture9::GenerateMipSubLevels` call publishes any
+        /// pending mip-0 write and pushes that op itself only when the write it
+        /// flushed did not. Also collapses the app-visible level count to 1.
         const AUTOGEN_MIPMAP = 1 << 1;
         /// Sampleable shadow-map texture.
         ///
