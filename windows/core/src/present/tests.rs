@@ -6,9 +6,14 @@
 //! silently drop vsync for a whole class of intervals. The ceiling tests pin how a divided
 //! interval, the mode's refresh rate and `present.maxFps` fold into one number.
 
+use mtld3d_types::{
+    D3DPRESENT_INTERVAL_DEFAULT, D3DPRESENT_INTERVAL_FOUR, D3DPRESENT_INTERVAL_IMMEDIATE,
+    D3DPRESENT_INTERVAL_ONE, D3DPRESENT_INTERVAL_THREE, D3DPRESENT_INTERVAL_TWO,
+};
+
 use super::{
     DisplaySync, LayerPacing, display_sync_for, effective_max_fps, interval_divisor,
-    layer_pacing_for, present_interval as pi, queued_pacing,
+    layer_pacing_for, queued_pacing,
 };
 
 const fn pacing(display_sync: bool, max_fps: u32) -> LayerPacing {
@@ -20,20 +25,26 @@ const fn pacing(display_sync: bool, max_fps: u32) -> LayerPacing {
 
 #[test]
 fn default_and_one_enable_vsync() {
-    assert_eq!(display_sync_for(pi::DEFAULT), DisplaySync::On);
-    assert_eq!(display_sync_for(pi::ONE), DisplaySync::On);
+    assert_eq!(
+        display_sync_for(D3DPRESENT_INTERVAL_DEFAULT),
+        DisplaySync::On
+    );
+    assert_eq!(display_sync_for(D3DPRESENT_INTERVAL_ONE), DisplaySync::On);
 }
 
 #[test]
 fn immediate_disables_vsync() {
-    assert_eq!(display_sync_for(pi::IMMEDIATE), DisplaySync::Off);
+    assert_eq!(
+        display_sync_for(D3DPRESENT_INTERVAL_IMMEDIATE),
+        DisplaySync::Off
+    );
 }
 
 #[test]
 fn divided_intervals_enable_vsync_without_a_warning() {
-    assert_eq!(display_sync_for(pi::TWO), DisplaySync::On);
-    assert_eq!(display_sync_for(pi::THREE), DisplaySync::On);
-    assert_eq!(display_sync_for(pi::FOUR), DisplaySync::On);
+    assert_eq!(display_sync_for(D3DPRESENT_INTERVAL_TWO), DisplaySync::On);
+    assert_eq!(display_sync_for(D3DPRESENT_INTERVAL_THREE), DisplaySync::On);
+    assert_eq!(display_sync_for(D3DPRESENT_INTERVAL_FOUR), DisplaySync::On);
 }
 
 #[test]
@@ -42,7 +53,7 @@ fn unknown_bits_fall_through() {
     assert!(display_sync_for(0x1234_5678).enabled());
     // Two interval bits at once name no interval.
     assert_eq!(
-        display_sync_for(pi::ONE | pi::TWO),
+        display_sync_for(D3DPRESENT_INTERVAL_ONE | D3DPRESENT_INTERVAL_TWO),
         DisplaySync::Fallthrough
     );
 }
@@ -56,46 +67,51 @@ fn enabled_polarity() {
 
 #[test]
 fn the_divisor_is_the_interval_count_not_its_bit_value() {
-    assert_eq!(interval_divisor(pi::DEFAULT), 1);
-    assert_eq!(interval_divisor(pi::ONE), 1);
-    assert_eq!(interval_divisor(pi::TWO), 2);
-    assert_eq!(interval_divisor(pi::THREE), 3);
-    assert_eq!(interval_divisor(pi::FOUR), 4);
-    assert_eq!(interval_divisor(pi::IMMEDIATE), 1);
+    assert_eq!(interval_divisor(D3DPRESENT_INTERVAL_DEFAULT), 1);
+    assert_eq!(interval_divisor(D3DPRESENT_INTERVAL_ONE), 1);
+    assert_eq!(interval_divisor(D3DPRESENT_INTERVAL_TWO), 2);
+    assert_eq!(interval_divisor(D3DPRESENT_INTERVAL_THREE), 3);
+    assert_eq!(interval_divisor(D3DPRESENT_INTERVAL_FOUR), 4);
+    assert_eq!(interval_divisor(D3DPRESENT_INTERVAL_IMMEDIATE), 1);
     assert_eq!(interval_divisor(0x1234_5678), 1);
 }
 
 #[test]
 fn a_divided_interval_is_a_ceiling_of_the_refresh_rate_over_n() {
-    assert_eq!(effective_max_fps(pi::TWO, 60, 0), 30);
-    assert_eq!(effective_max_fps(pi::THREE, 60, 0), 20);
-    assert_eq!(effective_max_fps(pi::FOUR, 60, 0), 15);
-    assert_eq!(effective_max_fps(pi::TWO, 120, 0), 60);
-    assert_eq!(effective_max_fps(pi::THREE, 120, 0), 40);
-    assert_eq!(effective_max_fps(pi::FOUR, 120, 0), 30);
+    assert_eq!(effective_max_fps(D3DPRESENT_INTERVAL_TWO, 60, 0), 30);
+    assert_eq!(effective_max_fps(D3DPRESENT_INTERVAL_THREE, 60, 0), 20);
+    assert_eq!(effective_max_fps(D3DPRESENT_INTERVAL_FOUR, 60, 0), 15);
+    assert_eq!(effective_max_fps(D3DPRESENT_INTERVAL_TWO, 120, 0), 60);
+    assert_eq!(effective_max_fps(D3DPRESENT_INTERVAL_THREE, 120, 0), 40);
+    assert_eq!(effective_max_fps(D3DPRESENT_INTERVAL_FOUR, 120, 0), 30);
 }
 
 #[test]
 fn a_fractional_quotient_rounds_up() {
     // 75 / 2 = 37.5: a 38 Hz ceiling is a minimum duration just under two
     // refresh periods, so the present lands on the second one.
-    assert_eq!(effective_max_fps(pi::TWO, 75, 0), 38);
-    assert_eq!(effective_max_fps(pi::FOUR, 75, 0), 19);
-    assert_eq!(effective_max_fps(pi::THREE, 144, 0), 48);
-    assert_eq!(effective_max_fps(pi::FOUR, 1, 0), 1);
+    assert_eq!(effective_max_fps(D3DPRESENT_INTERVAL_TWO, 75, 0), 38);
+    assert_eq!(effective_max_fps(D3DPRESENT_INTERVAL_FOUR, 75, 0), 19);
+    assert_eq!(effective_max_fps(D3DPRESENT_INTERVAL_THREE, 144, 0), 48);
+    assert_eq!(effective_max_fps(D3DPRESENT_INTERVAL_FOUR, 1, 0), 1);
 }
 
 #[test]
 fn the_lower_of_the_interval_and_the_configured_ceiling_wins() {
-    assert_eq!(effective_max_fps(pi::TWO, 60, 24), 24);
-    assert_eq!(effective_max_fps(pi::TWO, 60, 30), 30);
-    assert_eq!(effective_max_fps(pi::TWO, 60, 144), 30);
-    assert_eq!(effective_max_fps(pi::FOUR, 120, 60), 30);
+    assert_eq!(effective_max_fps(D3DPRESENT_INTERVAL_TWO, 60, 24), 24);
+    assert_eq!(effective_max_fps(D3DPRESENT_INTERVAL_TWO, 60, 30), 30);
+    assert_eq!(effective_max_fps(D3DPRESENT_INTERVAL_TWO, 60, 144), 30);
+    assert_eq!(effective_max_fps(D3DPRESENT_INTERVAL_FOUR, 120, 60), 30);
 }
 
 #[test]
 fn an_undivided_interval_leaves_the_configured_ceiling_alone() {
-    for interval in [pi::DEFAULT, pi::ONE, pi::IMMEDIATE, 0x1234_5678] {
+    for interval in [
+        D3DPRESENT_INTERVAL_DEFAULT,
+        D3DPRESENT_INTERVAL_ONE,
+        D3DPRESENT_INTERVAL_IMMEDIATE,
+        0x1234_5678,
+    ] {
         assert_eq!(effective_max_fps(interval, 60, 0), 0);
         assert_eq!(effective_max_fps(interval, 60, 45), 45);
         assert_eq!(effective_max_fps(interval, 0, 45), 45);
@@ -104,19 +120,40 @@ fn an_undivided_interval_leaves_the_configured_ceiling_alone() {
 
 #[test]
 fn an_unknown_refresh_rate_divides_nothing() {
-    assert_eq!(effective_max_fps(pi::TWO, 0, 0), 0);
-    assert_eq!(effective_max_fps(pi::TWO, 0, 50), 50);
+    assert_eq!(effective_max_fps(D3DPRESENT_INTERVAL_TWO, 0, 0), 0);
+    assert_eq!(effective_max_fps(D3DPRESENT_INTERVAL_TWO, 0, 50), 50);
 }
 
 #[test]
 fn layer_pacing_pairs_the_vsync_request_with_the_ceiling() {
-    assert_eq!(layer_pacing_for(pi::DEFAULT, 60, 0), pacing(true, 0));
-    assert_eq!(layer_pacing_for(pi::ONE, 60, 90), pacing(true, 90));
-    assert_eq!(layer_pacing_for(pi::TWO, 60, 0), pacing(true, 30));
-    assert_eq!(layer_pacing_for(pi::THREE, 60, 0), pacing(true, 20));
-    assert_eq!(layer_pacing_for(pi::FOUR, 60, 10), pacing(true, 10));
-    assert_eq!(layer_pacing_for(pi::IMMEDIATE, 60, 0), pacing(false, 0));
-    assert_eq!(layer_pacing_for(pi::IMMEDIATE, 60, 72), pacing(false, 72));
+    assert_eq!(
+        layer_pacing_for(D3DPRESENT_INTERVAL_DEFAULT, 60, 0),
+        pacing(true, 0)
+    );
+    assert_eq!(
+        layer_pacing_for(D3DPRESENT_INTERVAL_ONE, 60, 90),
+        pacing(true, 90)
+    );
+    assert_eq!(
+        layer_pacing_for(D3DPRESENT_INTERVAL_TWO, 60, 0),
+        pacing(true, 30)
+    );
+    assert_eq!(
+        layer_pacing_for(D3DPRESENT_INTERVAL_THREE, 60, 0),
+        pacing(true, 20)
+    );
+    assert_eq!(
+        layer_pacing_for(D3DPRESENT_INTERVAL_FOUR, 60, 10),
+        pacing(true, 10)
+    );
+    assert_eq!(
+        layer_pacing_for(D3DPRESENT_INTERVAL_IMMEDIATE, 60, 0),
+        pacing(false, 0)
+    );
+    assert_eq!(
+        layer_pacing_for(D3DPRESENT_INTERVAL_IMMEDIATE, 60, 72),
+        pacing(false, 72)
+    );
 }
 
 #[test]

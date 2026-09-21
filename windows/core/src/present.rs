@@ -4,14 +4,10 @@
 //! contributes the vsync request, and a divided interval a frame-rate ceiling
 //! on top of it; the user's `present.maxFps` rides the same ceiling.
 
-pub mod present_interval {
-    pub const DEFAULT: u32 = 0x0000_0000;
-    pub const ONE: u32 = 0x0000_0001;
-    pub const TWO: u32 = 0x0000_0002;
-    pub const THREE: u32 = 0x0000_0004;
-    pub const FOUR: u32 = 0x0000_0008;
-    pub const IMMEDIATE: u32 = 0x8000_0000;
-}
+use mtld3d_types::{
+    D3DPRESENT_INTERVAL_DEFAULT, D3DPRESENT_INTERVAL_FOUR, D3DPRESENT_INTERVAL_IMMEDIATE,
+    D3DPRESENT_INTERVAL_ONE, D3DPRESENT_INTERVAL_THREE, D3DPRESENT_INTERVAL_TWO,
+};
 
 /// Result of mapping a `D3DPRESENT_INTERVAL_*` to the vsync request.
 ///
@@ -47,12 +43,12 @@ pub struct LayerPacing {
 #[must_use]
 pub const fn display_sync_for(interval: u32) -> DisplaySync {
     match interval {
-        present_interval::DEFAULT
-        | present_interval::ONE
-        | present_interval::TWO
-        | present_interval::THREE
-        | present_interval::FOUR => DisplaySync::On,
-        present_interval::IMMEDIATE => DisplaySync::Off,
+        D3DPRESENT_INTERVAL_DEFAULT
+        | D3DPRESENT_INTERVAL_ONE
+        | D3DPRESENT_INTERVAL_TWO
+        | D3DPRESENT_INTERVAL_THREE
+        | D3DPRESENT_INTERVAL_FOUR => DisplaySync::On,
+        D3DPRESENT_INTERVAL_IMMEDIATE => DisplaySync::Off,
         _ => DisplaySync::Fallthrough,
     }
 }
@@ -65,9 +61,9 @@ pub const fn display_sync_for(interval: u32) -> DisplaySync {
 #[must_use]
 pub const fn interval_divisor(interval: u32) -> u32 {
     match interval {
-        present_interval::TWO => 2,
-        present_interval::THREE => 3,
-        present_interval::FOUR => 4,
+        D3DPRESENT_INTERVAL_TWO => 2,
+        D3DPRESENT_INTERVAL_THREE => 3,
+        D3DPRESENT_INTERVAL_FOUR => 4,
         _ => 1,
     }
 }
