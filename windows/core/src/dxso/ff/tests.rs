@@ -289,6 +289,54 @@ fn directional_and_point_lights_emit_no_cone_factor() {
 }
 
 #[test]
+fn the_light_vector_is_declared_only_where_it_is_read() {
+    // `L` has three readers: the diffuse N.L term and the specular
+    // half-angle, both of which need a vertex normal, and the spot cone
+    // factor. A light with none of them would declare a local nothing reads.
+    for normal in [false, true] {
+        for specular in [false, true] {
+            for (directional, spot) in [(true, false), (false, false), (false, true)] {
+                let mut vs = default_vs_key();
+                vs.flags.set(FfVsFlags::LIGHTING_ENABLED, true);
+                vs.flags.set(FfVsFlags::HAS_NORMAL, normal);
+                vs.flags.set(FfVsFlags::SPECULAR_ENABLE, specular);
+                vs.light_active_mask = 1;
+                vs.light_directional_mask = u8::from(directional);
+                vs.light_spot_mask = u8::from(spot);
+                let msl = emit_vs_ff(&vs);
+                let case = format!(
+                    "normal={normal} specular={specular} directional={directional} spot={spot}\n{msl}"
+                );
+
+                assert_eq!(
+                    msl.matches("float3 L = ").count(),
+                    usize::from(normal || spot),
+                    "{case}"
+                );
+                // Each reader appears exactly under the condition that emits
+                // it, so a declaration is present wherever one is read.
+                assert_eq!(msl.contains("dot(n, L)"), normal, "{case}");
+                assert_eq!(
+                    msl.contains("normalize(L + V)"),
+                    normal && specular,
+                    "{case}"
+                );
+                assert_eq!(msl.contains("dot(-L,"), spot, "{case}");
+                // Slot 0's ambient row is 18; its term reads no light vector
+                // and applies to every light, and the POINT / SPOT distance
+                // attenuation keeps its own use of `toL`.
+                assert!(msl.contains("diffuseAccum += atten * (vs_c[18]"), "{case}");
+                assert_eq!(
+                    msl.contains("float dist = length(toL);"),
+                    !directional,
+                    "{case}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn fog_mode_4_sources_factor_from_specular_alpha() {
     // fog_mode 4 (vertex+table fog both D3DFOG_NONE) reads the COLOR1/specular
     // alpha as the per-vertex fog factor.
