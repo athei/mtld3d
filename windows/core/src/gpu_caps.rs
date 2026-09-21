@@ -37,10 +37,9 @@ pub struct GpuCaps {
     pub min_linear_texture_align: u32,
     /// The device's boolean answers from the `GetDeviceInfo` thunk.
     ///
-    /// The device and its encoder consult one of them,
-    /// `RESOLVE_NEEDS_RETIRE`, through [`Self::resolve_needs_retire`] and
-    /// [`Self::multisample_read_splits_submission`]; the caps advertisement
-    /// reads the rest from its own process-wide copy of the same answer.
+    /// The encoder consults one of them, `RESOLVE_NEEDS_RETIRE`, through
+    /// [`Self::resolve_needs_retire`]; the caps advertisement reads the
+    /// rest from its own process-wide copy of the same answer.
     pub device_caps: DeviceCapsFlags,
 }
 
@@ -68,22 +67,6 @@ impl GpuCaps {
     pub const fn resolve_needs_retire(self) -> bool {
         self.device_caps
             .contains(DeviceCapsFlags::RESOLVE_NEEDS_RETIRE)
-    }
-
-    /// Whether a read of a multisampled pass's output gets a submission of its own.
-    ///
-    /// The paravirtualized device can hand a blit or compute encoder the
-    /// content a multisampled attachment, or its resolve target, held before
-    /// an earlier pass of the same command buffer wrote it. So on a device
-    /// that answered `RESOLVE_NEEDS_RETIRE`, a reader outside a render pass
-    /// (the depth transfer behind RESZ, a `StretchRect` copy) whose source has
-    /// more than one sample makes the API thread submit the frame recorded so
-    /// far, and the reader waits for that submission before it is encoded
-    /// into the next one. False for a single-sampled source and on every
-    /// device that orders its encoders, which therefore submit nothing extra.
-    #[must_use]
-    pub const fn multisample_read_splits_submission(self, source_sample_count: u8) -> bool {
-        self.resolve_needs_retire() && source_sample_count > 1
     }
 
     /// Apply the `intel.managedMemory` and `intel.linearAlign256` answers over the device's.
