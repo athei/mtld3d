@@ -451,15 +451,17 @@ fn install_occlusion_observer_once() {
 /// Present-throttle request resolved PE-side.
 ///
 /// The guest's vsync ask (`D3DPRESENT_PARAMETERS::PresentationInterval`
-/// mapped through `display_sync_for`) plus the user's `present.maxFps`
-/// ceiling from `mtld3d.conf` (`0` = uncapped). Bundled so the attach/Reset
-/// entry points stay inside clippy's `too_many_arguments` threshold.
+/// mapped through `display_sync_for`) plus the effective frame-rate ceiling
+/// (`0` = uncapped): the lower of the user's `present.maxFps` from
+/// `mtld3d.conf` and the rate a divided interval (TWO/THREE/FOUR) asks for.
+/// Bundled so the attach/Reset entry points stay inside clippy's
+/// `too_many_arguments` threshold.
 pub struct PresentPacing {
-    /// `true` for DEFAULT/ONE presentation intervals, `false` for IMMEDIATE.
+    /// `true` for every presentation interval but IMMEDIATE.
     ///
     /// Caps presents at the panel ceiling when set.
     pub vsync_requested: bool,
-    /// User frame-rate ceiling in Hz; `0` = uncapped.
+    /// Effective frame-rate ceiling in Hz; `0` = uncapped.
     ///
     /// When both this and vsync are active the lower rate wins.
     pub max_fps: u32,
@@ -467,7 +469,7 @@ pub struct PresentPacing {
 
 /// Derive the present-throttle duration from the panel ceiling and the PE-side pacing request.
 ///
-/// A vsync request (DEFAULT/ONE) contributes `1 / panel_max_hz`, capping
+/// A vsync request (any interval but IMMEDIATE) contributes `1 / panel_max_hz`, capping
 /// presents at the panel ceiling; on `ProMotion` the system fills the gap
 /// with adaptive cadence below that. A non-zero `max_fps` contributes
 /// `1 / max_fps` regardless of the vsync state. The throttle takes the
@@ -2277,13 +2279,13 @@ fn configure_metal_layer_inner(
     // thread sustains under the cap (transparent VRR) — fractional
     // production rates land at their actual rate instead of being
     // rounded down to the next vsync divisor. PE-side
-    // `D3DPRESENT_INTERVAL_*` mapping (`display_sync_for`): DEFAULT/ONE
-    // → vsync requested, IMMEDIATE → free-run. Non-1:1 ratios still
-    // fall through to vsync-requested with a one-shot warn at the call
-    // site. The user's `present.maxFps` ceiling rides the same
-    // throttle: the lower rate wins, and it also bounds the
-    // IMMEDIATE free-run. The duration itself is derived by the caller and
-    // kept on the attachment record.
+    // `D3DPRESENT_INTERVAL_*` mapping (`display_sync_for`): every
+    // interval but IMMEDIATE → vsync requested, IMMEDIATE → free-run.
+    // A divided interval (TWO/THREE/FOUR) arrives as a frame-rate
+    // ceiling, folded PE-side with the user's `present.maxFps` into
+    // the one ceiling that rides the same throttle: the lower rate
+    // wins, and it also bounds the IMMEDIATE free-run. The duration
+    // itself is derived by the caller and kept on the attachment record.
     layer.setDisplaySyncEnabled(false);
     layer.setMaximumDrawableCount(DRAWABLE_POOL_DEPTH);
     // Default true; surface stalls surface as errors, not hangs.

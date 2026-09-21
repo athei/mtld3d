@@ -76,6 +76,10 @@ divergences from D3D9 it keeps on purpose. The tested games are in the
   of reported vendor; control writes preserve numeric point size.
 - Windowed and fullscreen swap chains, mode enumeration, hardware and software
   cursors, MetalFX upscaling, HDR output.
+- Every presentation interval: `DEFAULT` and `ONE` pace at the display rate,
+  `TWO`, `THREE` and `FOUR` at the reported mode's refresh rate over two,
+  three and four, and `IMMEDIATE` runs free. `present.maxFps` lowers any of
+  them.
 - `D3DCREATE_MULTITHREADED`: a device created with it, and every object it
   creates, may be called from any thread; each entry point holds a reentrant
   per-device lock, and a device created without the flag pays nothing.

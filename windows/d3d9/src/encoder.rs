@@ -38,6 +38,7 @@ use mtld3d_core::{
         perf_enabled,
     },
     pipeline_state::{self, PipelineBuildInputs, PipelineKey, PipelineSnapshot},
+    present::LayerPacing,
     render_scale::RenderScale,
     sampler_state,
     scratch::ScratchArena,
@@ -8933,11 +8934,12 @@ pub struct FrameData {
     /// Put here by `stamp_and_swap` on the frame it hands to the encoder, so
     /// the Present that follows the Reset is the one that carries it. The
     /// encoder applies it via `SetDisplaySyncEnabledParams` at the top of
-    /// `run_frame` so the new vsync state takes effect on this frame's
+    /// `run_frame` so the new pacing takes effect on this frame's
     /// `nextDrawable`, matching the spec's "next Present" timing rather than
     /// the previous behaviour of mutating the layer property synchronously
-    /// from the API thread mid-frame.
-    apply_display_sync_enabled: Option<bool>,
+    /// from the API thread mid-frame. The ceiling it carries is the effective
+    /// one, the interval's folded with `present.maxFps`.
+    apply_pacing: Option<LayerPacing>,
     /// API-thread bump arena.
     ///
     /// Used by `snapshot_shared` to allocate per-draw VS/PS constants +
@@ -9051,7 +9053,7 @@ impl FrameData {
             upload_coherent_seq_ptr: 0,
             failed_submit_seq_ptr: 0,
             retained_bytes_ptr: 0,
-            apply_display_sync_enabled: None,
+            apply_pacing: None,
             scratch: ScratchArena::new(),
             op_vec_realloc_bytes: 0,
         }
@@ -9202,8 +9204,8 @@ impl FrameData {
     /// Called from `stamp_and_swap` for the frame being handed to the
     /// encoder. `None` is the normal case and leaves the frame carrying
     /// nothing.
-    pub const fn set_apply_display_sync_enabled(&mut self, enabled: Option<bool>) {
-        self.apply_display_sync_enabled = enabled;
+    pub const fn set_apply_pacing(&mut self, pacing: Option<LayerPacing>) {
+        self.apply_pacing = pacing;
     }
 
     /// Drain the per-frame `Vec<Op>` realloc-byte counter into the caller and zero it.
@@ -9716,13 +9718,13 @@ fn run_frame_bracketed(enc: &mut FrameEncoder, frame: Box<FrameData>, fc: u64, m
 /// rare readback / capture / reset paths (`Sync`, after a submit-thread
 /// barrier).
 fn run_frame(enc: &mut FrameEncoder, mut frame: Box<FrameData>, fc: u64, mode: SubmitMode) {
-    if let Some(enabled) = frame.apply_display_sync_enabled.take()
+    if let Some(pacing) = frame.apply_pacing.take()
         && !frame.layer_handle.is_null()
     {
         let mut params = SetDisplaySyncEnabledParams {
             layer_handle: frame.layer_handle,
-            display_sync_enabled: u32::from(enabled),
-            max_fps: enc.config().present_max_fps,
+            display_sync_enabled: u32::from(pacing.display_sync),
+            max_fps: pacing.max_fps,
         };
         unix_call(&mut params);
     }

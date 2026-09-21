@@ -167,7 +167,7 @@ still tone-maps at render size before scaling in HDR mode. A preparation or
 copy failure returns to the original source's SDR or HDR present shader.
 
 
-A Reset that flips `PresentationInterval` reaches the record through `SetDisplaySyncEnabled` on the encoder thread, which latches the new pacing on it and queues that same reconciliation, so the throttle is re-derived on the main thread for the panel under the window within one present and nothing on the encoder thread reads a screen.
+A Reset that changes `PresentationInterval` reaches the record through `SetDisplaySyncEnabled` on the encoder thread, whether it flips the vsync request (`IMMEDIATE` against the rest) or only moves the frame-rate ceiling (`ONE` against `TWO`, `THREE` or `FOUR`, which the PE side resolves to the reported refresh rate over N and folds with `present.maxFps` into the one ceiling the thunk carries). The thunk latches the new pacing on the record and queues that same reconciliation, so the throttle is re-derived on the main thread for the panel under the window within one present and nothing on the encoder thread reads a screen.
 
 The process-lifetime observers walk the records rather than a latch: the occlusion observer marks every record whose window posted the notification, and a real screen-parameter change reconciles every live record against the screen its window is on now. What stays process-wide stays so on purpose: the screen-parameter filter and Wine's application delegate (a relationship with the one `NSApp`), the observer install latches, the cursor overlay (one system cursor, one overlay window), and the presented-cadence debug probe, into which two presenting devices interleave.
 

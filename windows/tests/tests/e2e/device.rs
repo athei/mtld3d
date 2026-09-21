@@ -28,10 +28,11 @@ use mtld3d_types::{
     D3DFMT_R5G6B5, D3DFMT_R8G8B8, D3DFMT_R16F, D3DFMT_R32F, D3DFMT_UYVY, D3DFMT_X8B8G8R8,
     D3DFMT_X8R8G8B8, D3DFMT_YUY2, D3DFMT_YV12, D3DFVF_DIFFUSE, D3DFVF_TEX1, D3DFVF_XYZ,
     D3DOK_NOAUTOGEN, D3DPOOL_DEFAULT, D3DPOOL_MANAGED, D3DPOOL_SCRATCH, D3DPOOL_SYSTEMMEM,
-    D3DPRESENT_INTERVAL_IMMEDIATE, D3DPRESENT_INTERVAL_ONE, D3DPRESENT_PARAMETERS,
-    D3DPT_TRIANGLELIST, D3DRS_FILLMODE, D3DRS_LIGHTING, D3DRTYPE_CUBETEXTURE, D3DRTYPE_SURFACE,
-    D3DRTYPE_TEXTURE, D3DRTYPE_VOLUME, D3DRTYPE_VOLUMETEXTURE, D3DSWAPEFFECT_DISCARD,
-    D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_DYNAMIC, D3DUSAGE_QUERY_FILTER,
+    D3DPRESENT_INTERVAL_FOUR, D3DPRESENT_INTERVAL_IMMEDIATE, D3DPRESENT_INTERVAL_ONE,
+    D3DPRESENT_INTERVAL_THREE, D3DPRESENT_INTERVAL_TWO, D3DPRESENT_PARAMETERS, D3DPT_TRIANGLELIST,
+    D3DRS_FILLMODE, D3DRS_LIGHTING, D3DRTYPE_CUBETEXTURE, D3DRTYPE_SURFACE, D3DRTYPE_TEXTURE,
+    D3DRTYPE_VOLUME, D3DRTYPE_VOLUMETEXTURE, D3DSWAPEFFECT_DISCARD, D3DUSAGE_AUTOGENMIPMAP,
+    D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_DYNAMIC, D3DUSAGE_QUERY_FILTER,
     D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING, D3DUSAGE_QUERY_SRGBREAD, D3DUSAGE_QUERY_SRGBWRITE,
     D3DUSAGE_QUERY_VERTEXTEXTURE, D3DUSAGE_QUERY_WRAPANDMIP, D3DUSAGE_RENDERTARGET, D3DVIEWPORT9,
     DevCaps, TextureCaps,
@@ -893,7 +894,7 @@ fn device_caps_are_sane() {
         0,
         "volume maps not advertised"
     );
-    // Both honoured presentation intervals are advertised; IMMEDIATE is a hard
+    // Every honoured presentation interval is advertised; IMMEDIATE is a hard
     // requirement of 3DMark05's startup check.
     assert_ne!(
         caps.presentation_intervals & D3DPRESENT_INTERVAL_IMMEDIATE,
@@ -905,6 +906,13 @@ fn device_caps_are_sane() {
         0,
         "display-rate presentation interval not advertised"
     );
+    for (interval, name) in DIVIDED_INTERVALS {
+        assert_ne!(
+            caps.presentation_intervals & interval,
+            0,
+            "{name} presentation interval not advertised"
+        );
+    }
     // Vertex texture fetch: the caps bit and the per-format probe must
     // agree, and both now advertise it (titles gate whole effect paths on
     // the pair).
@@ -1144,6 +1152,133 @@ fn reset_flips_the_presentation_interval() {
         PACING_CHILD_NAME,
         "device::reset_flips_the_presentation_interval",
     );
+}
+
+/// The intervals that pace at the refresh rate over two, three and four.
+const DIVIDED_INTERVALS: [(u32, &str); 3] = [
+    (D3DPRESENT_INTERVAL_TWO, "TWO"),
+    (D3DPRESENT_INTERVAL_THREE, "THREE"),
+    (D3DPRESENT_INTERVAL_FOUR, "FOUR"),
+];
+
+#[test]
+fn a_divided_presentation_interval_survives_reset() {
+    let h = Harness::new();
+    for (interval, name) in DIVIDED_INTERVALS {
+        let mut pp = windowed_params(h.hwnd(), 640, 480);
+        pp.presentation_interval = interval;
+        assert_eq!(h.reset_params(&mut pp), D3D_OK, "Reset to {name}");
+        assert_eq!(
+            pp.presentation_interval, interval,
+            "Reset rewrote the {name} interval it was handed"
+        );
+        let (hr, reported) = h.implicit_swapchain().present_parameters();
+        assert_eq!(hr, D3D_OK, "GetPresentParameters after the Reset to {name}");
+        assert_eq!(
+            reported.presentation_interval, interval,
+            "the swap chain reports another interval than {name}"
+        );
+        assert_eq!(h.present(), D3D_OK, "the present that carries {name}");
+    }
+    let mut pp = windowed_params(h.hwnd(), 640, 480);
+    pp.presentation_interval = D3DPRESENT_INTERVAL_ONE;
+    assert_eq!(h.reset_params(&mut pp), D3D_OK, "Reset back to ONE");
+    let (hr, reported) = h.implicit_swapchain().present_parameters();
+    assert_eq!(hr, D3D_OK, "GetPresentParameters after the Reset to ONE");
+    assert_eq!(
+        reported.presentation_interval, D3DPRESENT_INTERVAL_ONE,
+        "the swap chain kept a divided interval past the Reset to ONE"
+    );
+}
+
+/// The name the workload child of `reset_to_a_divided_interval_moves_the_ceiling` runs under.
+const CEILING_CHILD_NAME: &str = "presentation-ceiling.exe";
+
+#[test]
+fn reset_to_a_divided_interval_moves_the_ceiling() {
+    if running_as(CEILING_CHILD_NAME) {
+        presentation_ceiling_workload();
+        return;
+    }
+    // Read out of the process log like the flip above, so it runs the same
+    // way: in a process of its own, alone in its log directory.
+    run_in_private_log_child(
+        CEILING_CHILD_NAME,
+        "device::reset_to_a_divided_interval_moves_the_ceiling",
+    );
+}
+
+/// Reset from `ONE` through every divided interval and back, one Present after each.
+///
+/// A flip between `ONE` and a divided interval keeps the vsync request and
+/// moves the frame-rate ceiling alone, so a Reset path that compared the
+/// request would send nothing. Each Present here has to write one line, and
+/// the ceiling it names is the refresh rate `GetDisplayMode` reports over the
+/// interval's count, rounded up. The suite configures no `present.maxFps`, so
+/// the Reset back to `ONE` names no ceiling at all.
+fn presentation_ceiling_workload() {
+    let h = Harness::new();
+    assert_eq!(h.present(), D3D_OK, "a present at the created interval");
+    let mut mode = D3DDISPLAYMODE {
+        width: 0,
+        height: 0,
+        refresh_rate: 0,
+        format: 0,
+    };
+    assert_eq!(h.display_mode(&mut mode), D3D_OK, "GetDisplayMode");
+    assert_ne!(mode.refresh_rate, 0, "the reported mode carries a rate");
+
+    let mut expected = Vec::new();
+    for ((interval, name), count) in DIVIDED_INTERVALS.into_iter().zip(2_u32..) {
+        let mut pp = windowed_params(h.hwnd(), 640, 480);
+        pp.presentation_interval = interval;
+        assert_eq!(h.reset_params(&mut pp), D3D_OK, "Reset to {name}");
+        assert_eq!(h.present(), D3D_OK, "the present that carries {name}");
+        expected.push(("on".to_owned(), mode.refresh_rate.div_ceil(count)));
+        await_ceilings(&expected);
+    }
+    let mut pp = windowed_params(h.hwnd(), 640, 480);
+    pp.presentation_interval = D3DPRESENT_INTERVAL_ONE;
+    assert_eq!(h.reset_params(&mut pp), D3D_OK, "Reset back to ONE");
+    assert_eq!(h.present(), D3D_OK, "the present that carries ONE");
+    expected.push(("on".to_owned(), 0));
+    await_ceilings(&expected);
+}
+
+/// Wait until the process log carries exactly the re-pacings `expected`, oldest first.
+///
+/// Each entry is the vsync state and the ceiling in Hz of one line. The wait
+/// is the one `await_pacing` documents.
+fn await_ceilings(expected: &[(String, u32)]) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let logged = logged_ceilings();
+        if logged == expected {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the layer was re-paced {logged:?}, expected {expected:?}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// The vsync state and ceiling of every re-pacing this process has logged, oldest first.
+fn logged_ceilings() -> Vec<(String, u32)> {
+    logged_lines("re-paced (vsync ")
+        .iter()
+        .filter_map(|line| line.split_once("re-paced (vsync "))
+        .filter_map(|(_, rest)| rest.split_once(", maxFps "))
+        .map(|(vsync, rest)| {
+            let ceiling = rest
+                .trim_end()
+                .trim_end_matches(')')
+                .parse()
+                .expect("the re-paced line ends in its ceiling");
+            (vsync.to_owned(), ceiling)
+        })
+        .collect()
 }
 
 /// Whether this process is the copy of the test executable named `child_name`.

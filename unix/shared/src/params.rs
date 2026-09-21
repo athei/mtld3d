@@ -212,11 +212,12 @@ pub struct AttachMetalLayerParams {
     /// designer-intended hues. PE side reads this from
     /// the interface's `color_space`.
     pub color_space: ColorSpacePolicy, // in
-    /// `present.maxFps` from `mtld3d.conf`: frame-rate ceiling in Hz, `0` = uncapped.
+    /// The effective frame-rate ceiling in Hz, `0` = uncapped.
     ///
-    /// Combined with the vsync request into the present-throttle
-    /// duration — the lower rate wins. PE side reads this from
-    /// the interface's `present_max_fps`.
+    /// The lower of `present.maxFps` from `mtld3d.conf` and the ceiling a
+    /// divided `PresentationInterval` sets (the reported refresh rate over
+    /// two, three or four), resolved on the PE side. Combined with the vsync
+    /// request into the present-throttle duration, where the lower rate wins.
     pub max_fps: u32, // in
     /// Whether this GPU can run a `MetalFX` spatial upscale.
     ///
@@ -340,10 +341,12 @@ pub struct SetDisplaySyncEnabledParams {
     /// answered with a warning and no change.
     pub layer_handle: MetalHandle<CAMetalLayerKind>, // in
     pub display_sync_enabled: u32, // in: 0 = off, !=0 = on
-    /// `present.maxFps` from `mtld3d.conf`: frame-rate ceiling in Hz, `0` = uncapped.
+    /// The effective frame-rate ceiling in Hz, `0` = uncapped.
     ///
-    /// Re-sent on every Reset so the throttle recomputation keeps
-    /// honouring the cap.
+    /// Resolved on the PE side the way `AttachMetalLayerParams::max_fps` is,
+    /// and re-sent with every change so the throttle recomputation keeps
+    /// honouring `present.maxFps` and follows a Reset between `ONE` and a
+    /// divided interval, which moves this field alone.
     pub max_fps: u32, // in
 }
 

@@ -8,8 +8,8 @@
 use core::{ffi::c_void, marker::PhantomData};
 
 use mtld3d_types::{
-    D3D_OK, D3DBOX, D3DINDEXBUFFER_DESC, D3DLOCKED_BOX, D3DLOCKED_RECT, D3DSURFACE_DESC,
-    D3DVERTEXBUFFER_DESC, D3DVOLUME_DESC, Guid, IDirect3DCubeTexture9Vtbl,
+    D3D_OK, D3DBOX, D3DINDEXBUFFER_DESC, D3DLOCKED_BOX, D3DLOCKED_RECT, D3DPRESENT_PARAMETERS,
+    D3DSURFACE_DESC, D3DVERTEXBUFFER_DESC, D3DVOLUME_DESC, Guid, IDirect3DCubeTexture9Vtbl,
     IDirect3DIndexBuffer9Vtbl, IDirect3DPixelShader9Vtbl, IDirect3DQuery9Vtbl,
     IDirect3DStateBlock9Vtbl, IDirect3DSurface9Vtbl, IDirect3DSwapChain9Vtbl,
     IDirect3DTexture9Vtbl, IDirect3DVertexBuffer9Vtbl, IDirect3DVertexDeclaration9Vtbl,
@@ -94,6 +94,32 @@ impl SwapChain<'_> {
         let ptr = dst.map_or(core::ptr::null_mut(), Surface::as_ptr);
         // SAFETY: live swapchain and a live destination or explicit null probe.
         unsafe { (self.vtbl().get_front_buffer_data)(self.ptr, ptr) }
+    }
+
+    /// `GetPresentParameters`, returning the hr and what the swapchain wrote.
+    #[must_use]
+    pub fn present_parameters(&self) -> (i32, D3DPRESENT_PARAMETERS) {
+        let mut pp = D3DPRESENT_PARAMETERS {
+            back_buffer_width: 0,
+            back_buffer_height: 0,
+            back_buffer_format: 0,
+            back_buffer_count: 0,
+            multi_sample_type: 0,
+            multi_sample_quality: 0,
+            swap_effect: 0,
+            device_window: 0,
+            windowed: 0,
+            enable_auto_depth_stencil: 0,
+            auto_depth_stencil_format: 0,
+            flags: 0,
+            full_screen_refresh_rate_in_hz: 0,
+            presentation_interval: 0,
+        };
+        // SAFETY: live swapchain; `pp` is writable for one `D3DPRESENT_PARAMETERS`.
+        let hr = unsafe {
+            (self.vtbl().get_present_parameters)(self.ptr, (&raw mut pp).cast::<c_void>())
+        };
+        (hr, pp)
     }
 
     /// Probe the readback thunk's null-this rejection with a valid destination.
