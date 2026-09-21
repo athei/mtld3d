@@ -91,21 +91,46 @@ const CAPS2_DEFAULT: Caps2 = Caps2::CANMANAGERESOURCE
     .union(Caps2::FULLSCREENGAMMA)
     .union(Caps2::CANAUTOGENMIPMAP);
 
-/// Present-path caps: the swap chain preserves alpha across a flip or discard.
-const CAPS3_DEFAULT: Caps3 = Caps3::ALPHA_FULLSCREEN_FLIP_OR_DISCARD;
+/// Present-path and copy caps.
+///
+/// The swap chain preserves alpha across a flip or discard. `COPY_TO_VIDMEM`
+/// is `UpdateSurface` / `UpdateTexture` and `COPY_TO_SYSTEMMEM` is
+/// `GetRenderTargetData`, both implemented. `LINEAR_TO_SRGB_PRESENTATION`
+/// stays off: the present path has no `D3DPRESENT_LINEAR_CONTENT` conversion.
+const CAPS3_DEFAULT: Caps3 = Caps3::ALPHA_FULLSCREEN_FLIP_OR_DISCARD
+    .union(Caps3::COPY_TO_VIDMEM)
+    .union(Caps3::COPY_TO_SYSTEMMEM);
 
 /// Cursor caps: the full-colour Win32 `HCURSOR` path is live.
 const CURSOR_CAPS_DEFAULT: CursorCaps = CursorCaps::COLOR;
 
-/// Device caps: memory classes we accept geometry from, plus HW T&L and rasterization.
+/// Device caps: what every D3D9 HAL reports, minus the patch bits.
+///
+/// The memory-class bits are all true on unified memory: geometry and textures
+/// are accepted from, and live in, any placement (`TEXTURENONLOCALVIDMEM`,
+/// `CANBLTSYSTONONLOCAL` included). `DRAWPRIMITIVES2` and `DRAWPRIMITIVES2EX`
+/// name the DX6 and DX7 driver interface levels, which any D3D9 driver is
+/// past; titles test them as a minimum-driver check (the IW4 engine refuses to
+/// start without `DRAWPRIMITIVES2EX`). Nothing blocks rendering after a
+/// `Present` (`CANRENDERAFTERFLIP`). `PUREDEVICE`: `CreateDevice` accepts
+/// `D3DCREATE_PUREDEVICE` and keeps every getter working, which is more than
+/// a pure device promises. The four patch bits stay off: there is no
+/// tessellator behind `DrawRectPatch` / `DrawTriPatch`.
 const DEV_CAPS_DEFAULT: DevCaps = DevCaps::EXECUTESYSTEMMEMORY
     .union(DevCaps::EXECUTEVIDEOMEMORY)
     .union(DevCaps::TLVERTEXSYSTEMMEMORY)
     .union(DevCaps::TLVERTEXVIDEOMEMORY)
     .union(DevCaps::TEXTURESYSTEMMEMORY)
+    .union(DevCaps::TEXTUREVIDEOMEMORY)
     .union(DevCaps::DRAWPRIMTLVERTEX)
+    .union(DevCaps::CANRENDERAFTERFLIP)
+    .union(DevCaps::TEXTURENONLOCALVIDMEM)
+    .union(DevCaps::DRAWPRIMITIVES2)
+    .union(DevCaps::DRAWPRIMITIVES2EX)
     .union(DevCaps::HWTRANSFORMANDLIGHT)
-    .union(DevCaps::HWRASTERIZATION);
+    .union(DevCaps::CANBLTSYSTONONLOCAL)
+    .union(DevCaps::HWRASTERIZATION)
+    .union(DevCaps::PUREDEVICE);
 
 /// Rasterizer-adjacent caps that are not covered by a more specific field.
 ///
@@ -115,6 +140,8 @@ const DEV_CAPS_DEFAULT: DevCaps = DevCaps::EXECUTESYSTEMMEMORY
 /// what the Metal render pass gives every colour attachment: its own write
 /// mask (`INDEPENDENTWRITEMASKS`), its own pixel format
 /// (`MRTINDEPENDENTBITDEPTHS`) and blending (`MRTPOSTPIXELSHADERBLENDING`).
+/// `FOGANDSPECULARALPHA`: the fog factor travels in its own varying, so a
+/// specular alpha is never overwritten by it.
 const PRIMITIVE_MISC_DEFAULT: PrimitiveMiscCaps = PrimitiveMiscCaps::MASKZ
     .union(PrimitiveMiscCaps::CULLNONE)
     .union(PrimitiveMiscCaps::CULLCW)
@@ -124,6 +151,7 @@ const PRIMITIVE_MISC_DEFAULT: PrimitiveMiscCaps = PrimitiveMiscCaps::MASKZ
     .union(PrimitiveMiscCaps::CLIPTLVERTS)
     .union(PrimitiveMiscCaps::BLENDOP)
     .union(PrimitiveMiscCaps::INDEPENDENTWRITEMASKS)
+    .union(PrimitiveMiscCaps::FOGANDSPECULARALPHA)
     .union(PrimitiveMiscCaps::SEPARATEALPHABLEND)
     .union(PrimitiveMiscCaps::MRTINDEPENDENTBITDEPTHS)
     .union(PrimitiveMiscCaps::MRTPOSTPIXELSHADERBLENDING)
@@ -141,8 +169,13 @@ const PRIMITIVE_MISC_DEFAULT: PrimitiveMiscCaps = PrimitiveMiscCaps::MASKZ
 /// `MIPMAPLODBIAS` advertises `D3DSAMP_MIPMAPLODBIAS`, which Metal expresses
 /// at the sample site rather than on the sampler: the bias reaches the pixel
 /// shader as a per-slot uniform and shifts the mip every implicit-LOD sample
-/// selects.
-const RASTER_DEFAULT: RasterCaps = RasterCaps::ZTEST
+/// selects. `DITHER`: `D3DRS_DITHERENABLE` is accepted, and a no-op is the
+/// correct result on the 8-bit and wider targets rendered to.
+/// `COLORPERSPECTIVE` is factual for the same reason as
+/// [`TextureCaps::PERSPECTIVE`]: Metal interpolates every varying
+/// perspective-correctly.
+const RASTER_DEFAULT: RasterCaps = RasterCaps::DITHER
+    .union(RasterCaps::ZTEST)
     .union(RasterCaps::FOGVERTEX)
     .union(RasterCaps::FOGTABLE)
     .union(RasterCaps::WFOG)
@@ -150,6 +183,7 @@ const RASTER_DEFAULT: RasterCaps = RasterCaps::ZTEST
     .union(RasterCaps::MIPMAPLODBIAS)
     .union(RasterCaps::ANISOTROPY)
     .union(RasterCaps::ZFOG)
+    .union(RasterCaps::COLORPERSPECTIVE)
     .union(RasterCaps::SCISSORTEST)
     .union(RasterCaps::SLOPESCALEDEPTHBIAS)
     .union(RasterCaps::DEPTHBIAS);
@@ -173,10 +207,14 @@ const BLEND_DEFAULT: BlendCaps = BlendCaps::ZERO
     .union(BlendCaps::SRCALPHASAT)
     .union(BlendCaps::BLENDFACTOR);
 
-/// Shading caps: the FF vertex shader emits `out.color0` + `out.color1`.
+/// Shading caps.
+///
+/// The FF vertex shader emits `out.color0` + `out.color1`, and the vertex fog
+/// factor is interpolated across the primitive like them (`FOGGOURAUD`).
 const SHADE_DEFAULT: ShadeCaps = ShadeCaps::COLORGOURAUDRGB
     .union(ShadeCaps::SPECULARGOURAUDRGB)
-    .union(ShadeCaps::ALPHAGOURAUDBLEND);
+    .union(ShadeCaps::ALPHAGOURAUDBLEND)
+    .union(ShadeCaps::FOGGOURAUD);
 
 /// Texture caps.
 ///
@@ -186,9 +224,12 @@ const SHADE_DEFAULT: ShadeCaps = ShadeCaps::COLORGOURAUDRGB
 /// sizes. `TTFF_PROJECTED` is honored in FF pixel-shader sample emission;
 /// `PERSPECTIVE` is a factual statement — Metal interpolates
 /// perspective-correctly by default and `dxso::emit` never emits `[[flat]]` /
-/// `[[no_perspective]]` qualifiers.
+/// `[[no_perspective]]` qualifiers. `TEXREPEATNOTSCALEDBYSIZE`: coordinates are
+/// normalized, so `MaxTextureRepeat` holds whatever the texture size.
+/// `ALPHAPALETTE` stays off: there are no palettized formats.
 const TEXTURE_DEFAULT: TextureCaps = TextureCaps::PERSPECTIVE
     .union(TextureCaps::ALPHA)
+    .union(TextureCaps::TEXREPEATNOTSCALEDBYSIZE)
     .union(TextureCaps::PROJECTED)
     .union(TextureCaps::MIPMAP)
     .union(TextureCaps::CUBEMAP)
@@ -212,7 +253,11 @@ const STRETCH_RECT_FILTER: FilterCaps = FilterCaps::MINFPOINT
 /// desktop drivers report.
 const GUARD_BAND: f32 = 32768.0;
 
-/// Filter caps for the 2D texture path: point, linear, and anisotropic minification.
+/// Filter caps for the 2D texture path: point, linear, and anisotropic.
+///
+/// `D3DTEXF_ANISOTROPIC` maps to a linear Metal filter on either side, and the
+/// sampler's `maxAnisotropy` applies whichever side asked for it, so the
+/// magnification bit is as true as the minification one.
 ///
 /// Device-wide, not per format: whether one format samples with linear
 /// filtering is `CheckDeviceFormat(D3DUSAGE_QUERY_FILTER)`, which answers the
@@ -223,7 +268,8 @@ const FILTER_DEFAULT: FilterCaps = FilterCaps::MINFPOINT
     .union(FilterCaps::MIPFPOINT)
     .union(FilterCaps::MIPFLINEAR)
     .union(FilterCaps::MAGFPOINT)
-    .union(FilterCaps::MAGFLINEAR);
+    .union(FilterCaps::MAGFLINEAR)
+    .union(FilterCaps::MAGFANISOTROPIC);
 
 /// Addressing modes.
 ///
@@ -275,11 +321,15 @@ const TEXOP_DEFAULT: TexOpCaps = TexOpCaps::DISABLE
     .union(TexOpCaps::BLENDCURRENTALPHA)
     .union(TexOpCaps::DOTPRODUCT3);
 
-/// Line-drawing caps: textured, depth-tested, blended, alpha-tested lines.
+/// Line-drawing caps: textured, depth-tested, blended, alpha-tested, fogged lines.
+///
+/// Each is a pixel-stage effect that does not depend on the primitive type.
+/// `ANTIALIAS` stays off: Metal has no antialiased line rasterization.
 const LINE_DEFAULT: LineCaps = LineCaps::TEXTURE
     .union(LineCaps::ZTEST)
     .union(LineCaps::BLEND)
-    .union(LineCaps::ALPHACMP);
+    .union(LineCaps::ALPHACMP)
+    .union(LineCaps::FOG);
 
 /// FVF caps: the texture-coordinate-set count plus `PSIZE`.
 ///
@@ -394,20 +444,14 @@ const fn fill_default(caps: &mut D3DCAPS9) {
     caps.texture_filter_caps = FILTER_DEFAULT.bits();
     // Cube and volume textures sample through the same Metal sampler state as
     // 2D textures (`MTLTextureTypeCube` / `Type3D` on the unix texture path),
-    // so their filter and address caps are the 2D ones. The `VOLUMEMAP`
-    // TextureCaps bit is deliberately left off: it un-gates Wine's
-    // unbound-sampler visual test, which needs an unbound sampler to read back
-    // opaque black — a separate defect to fix before the bit is honest.
+    // so their filter and address caps are the 2D ones.
     caps.cube_texture_filter_caps = FILTER_DEFAULT.bits();
     caps.volume_texture_filter_caps = FILTER_DEFAULT.bits();
     caps.texture_address_caps = ADDRESS_DEFAULT.bits();
     caps.volume_texture_address_caps = ADDRESS_DEFAULT.bits();
     caps.stretch_rect_filter_caps = STRETCH_RECT_FILTER.bits();
-    // Vertex texture fetch is not implemented: no sampler binds on the vertex
-    // stage and `SetTexture` rejects the `D3DVERTEXTEXTURESAMPLER` range, so
-    // Vertex texture fetch: point and linear min/mag filtering, no mip
-    // filter bit — `texldl` supplies its LOD explicitly, and Metal samples
-    // any level from a vertex function. Titles gate whole effect paths
+    // Vertex texture fetch samples through the same sampler states as the
+    // pixel stage, so it reports the 2D filter set. Titles gate whole effect paths
     // (per-sprite occlusion, displacement) on this being non-zero next to
     // the matching `CheckDeviceFormat(QUERY_VERTEXTEXTURE)` answer.
     caps.vertex_texture_filter_caps = FILTER_DEFAULT.bits();
