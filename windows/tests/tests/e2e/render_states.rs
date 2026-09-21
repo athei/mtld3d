@@ -8,9 +8,9 @@ use mtld3d_tests::{
 };
 use mtld3d_types::{
     D3DBLEND_INVSRCALPHA, D3DBLEND_ONE, D3DBLEND_SRCALPHA, D3DBLENDOP_ADD, D3DCLEAR_STENCIL,
-    D3DCLEAR_TARGET, D3DCLEAR_ZBUFFER, D3DCMP_ALWAYS, D3DCMP_EQUAL, D3DCULL_CCW, D3DCULL_CW,
-    D3DCULL_NONE, D3DFILL_SOLID, D3DFILL_WIREFRAME, D3DFMT_A8R8G8B8, D3DFVF_DIFFUSE, D3DFVF_TEX1,
-    D3DFVF_XYZ, D3DPOOL_DEFAULT, D3DPT_TRIANGLELIST, D3DRECT, D3DRS_ALPHABLENDENABLE,
+    D3DCLEAR_TARGET, D3DCLEAR_ZBUFFER, D3DCMP_ALWAYS, D3DCMP_EQUAL, D3DCMP_LESSEQUAL, D3DCULL_CCW,
+    D3DCULL_CW, D3DCULL_NONE, D3DFILL_SOLID, D3DFILL_WIREFRAME, D3DFMT_A8R8G8B8, D3DFVF_DIFFUSE,
+    D3DFVF_TEX1, D3DFVF_XYZ, D3DPOOL_DEFAULT, D3DPT_TRIANGLELIST, D3DRECT, D3DRS_ALPHABLENDENABLE,
     D3DRS_BLENDOP, D3DRS_COLORWRITEENABLE, D3DRS_CULLMODE, D3DRS_DESTBLEND, D3DRS_FILLMODE,
     D3DRS_LIGHTING, D3DRS_SCISSORTESTENABLE, D3DRS_SRCBLEND, D3DRS_SRGBWRITEENABLE,
     D3DRS_STENCILENABLE, D3DRS_STENCILFUNC, D3DRS_STENCILMASK, D3DRS_STENCILPASS, D3DRS_STENCILREF,
@@ -455,6 +455,53 @@ fn stencil_test_gates_rendering() {
     });
     assert_eq!(h.read_pixel(320, 240), GREEN, "inside the stamp");
     assert_eq!(h.read_pixel(10, 10), BLACK, "outside the stamp");
+}
+
+#[test]
+fn additive_pass_selected_by_depth_equal_reaches_the_target() {
+    // A renderer that writes depth in one pass and adds light in a second
+    // selects the same fragments with `EQUAL`, which only holds while the
+    // second pass rasterizes the depth the first one stored. Any nudge
+    // applied to the blended pass alone makes it match nothing and vanish.
+    // Prime depth with an opaque quad, then draw the same geometry additively
+    // under `EQUAL`: the additive white saturates the primed green, so a
+    // still-green centre is the proof that the second pass was rejected.
+    let h = Harness::with_depth();
+    arm_diffuse(&h);
+    let quad = quad_at_depth(GREEN, 0.5);
+    h.render_once(BLACK, |d| {
+        assert_eq!(d.clear(D3DCLEAR_ZBUFFER, 0, 1.0, 0), 0, "depth clear");
+        assert_eq!(d.set_render_state(mtld3d_types::D3DRS_ZENABLE, 1), 0);
+        assert_eq!(d.set_render_state(mtld3d_types::D3DRS_ZWRITEENABLE, 1), 0);
+        assert_eq!(
+            d.set_render_state(mtld3d_types::D3DRS_ZFUNC, D3DCMP_LESSEQUAL),
+            0
+        );
+        assert_eq!(
+            d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad),
+            0,
+            "depth-priming pass"
+        );
+
+        assert_eq!(d.set_render_state(mtld3d_types::D3DRS_ZWRITEENABLE, 0), 0);
+        assert_eq!(
+            d.set_render_state(mtld3d_types::D3DRS_ZFUNC, D3DCMP_EQUAL),
+            0
+        );
+        assert_eq!(d.set_render_state(D3DRS_ALPHABLENDENABLE, 1), 0);
+        assert_eq!(d.set_render_state(D3DRS_SRCBLEND, D3DBLEND_ONE), 0);
+        assert_eq!(d.set_render_state(D3DRS_DESTBLEND, D3DBLEND_ONE), 0);
+        assert_eq!(
+            d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad_at_depth(WHITE, 0.5)),
+            0,
+            "additive pass"
+        );
+    });
+    assert_eq!(
+        h.read_pixel(320, 240),
+        WHITE,
+        "the EQUAL-selected additive pass reached the target"
+    );
 }
 
 #[test]

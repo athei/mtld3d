@@ -508,22 +508,38 @@ pub struct DecalHeuristicInputs {
     pub blend_enable: u32,
     pub raw_depth_bias: u32,
     pub raw_slope_scale: u32,
+    /// Raw `D3DRS_ZFUNC`.
+    pub depth_func: u32,
 }
 
 /// Returns `true` when the draw matches a typical alpha-blended decal.
 ///
-/// Pattern: depth-test on, depth-write off, alpha-blend on, and the
+/// Pattern: depth-test on, depth-write off, alpha-blend on, a depth
+/// comparison that a nudge toward the camera can only help, and the
 /// game has not already supplied a `D3DRS_DEPTHBIAS` /
 /// `SLOPESCALEDEPTHBIAS`. On Apple Silicon (no `Depth24Unorm`; D3D9
 /// D24S8 maps to `Depth32Float`) the finer depth precision exposes
 /// ULP noise that the depth-buffer quantization absorbed on Windows.
 /// `emit_draw` replaces the game's zero bias with
 /// `IMPLICIT_DECAL_BIAS_RAW` when this fires.
+///
+/// The comparison prong is what keeps the nudge from changing which
+/// fragments pass. `LESS` and `LESSEQUAL` ask "is this at or in front of
+/// what is already there", so moving the fragment toward the camera only
+/// resolves the tie the decal wanted to win. The rest either ignore the
+/// stored value (`ALWAYS`, `NEVER`), where the nudge buys nothing, or read
+/// it as a value to match, avoid or exceed (`EQUAL`, `NOTEQUAL`,
+/// `GREATER`, `GREATEREQUAL`), where the same nudge changes which
+/// fragments pass: a renderer that lays depth down in one pass and then
+/// adds light in another selects those fragments with `EQUAL`, and a
+/// biased fragment matches nothing, so the second pass contributes
+/// nothing at all.
 #[must_use]
 pub const fn looks_like_decal(i: DecalHeuristicInputs) -> bool {
     i.depth_enable != 0
         && i.depth_write == 0
         && i.blend_enable != 0
+        && (i.depth_func == D3DCMP_LESS || i.depth_func == D3DCMP_LESSEQUAL)
         && i.raw_depth_bias == 0
         && i.raw_slope_scale == 0
 }
