@@ -610,20 +610,37 @@ fn declared_local(stmt: &str) -> Option<(usize, &str)> {
     Some((name_offset, name))
 }
 
-/// Locals the emitted vertex function declares and no later statement reads.
+/// Does any statement of `msl` read `name` as an identifier of its own?
+///
+/// The whole text, declaration included, and a field of something else does
+/// not count, which is the same identifier rule the unread-local parser uses.
+fn reads_identifier(msl: &str, name: &str) -> bool {
+    msl.lines().any(|line| {
+        let stmt = line.trim();
+        msl_identifiers(stmt)
+            .iter()
+            .any(|&(at, token)| token == name && (at == 0 || stmt.as_bytes()[at - 1] != b'.'))
+    })
+}
+
+/// Locals the emitted vertex or fragment function declares and no later statement reads.
 ///
 /// The parser reads this emitter's own regular output, not general MSL. It
 /// understands one statement per line; `{` and `}` alone on a line as the
-/// block delimiters, plus a one-line `if (...) { ... }` whose body declares
-/// nothing; a declaration `[<address space>] <type> [*]<name>[ = <value>];`
-/// whose value may run on over the following lines until one ends in a
-/// semicolon; and a plain assignment, whose target is a write. Every other
-/// occurrence of a name as an identifier not preceded by `.` is a read, so a
-/// `.w` swizzle cannot stand in for a local called `w`. Each block is a scope
-/// of its own, so one per-light block's `L` is not satisfied by the next
-/// block's use of the name. Anything else that looks like a declaration
-/// panics, and so does a body that does not parse to its closing brace.
-fn unread_vertex_locals(msl: &str) -> Vec<String> {
+/// block delimiters, plus a one-line block whose body declares nothing, which
+/// covers an `if (...) { ... }` and the `return FfPsOut { ... };` of the
+/// sample-masked fragment function; a declaration
+/// `[<address space>] <type> [*]<name>[ = <value>];` whose value may run on
+/// over the following lines until one ends in a semicolon; and a plain
+/// assignment, whose target is a write. Every other occurrence of a name as an
+/// identifier not preceded by `.` is a read, so a `.w` swizzle cannot stand in
+/// for a local called `w`. Each block is a scope of its own, so one per-light
+/// block's `L` is not satisfied by the next block's use of the name. Anything
+/// else that looks like a declaration panics, and so does a body that does not
+/// parse to its closing brace. Everything ahead of the entry point is skipped,
+/// which is where the structs, the shared helpers and the fragment output
+/// struct live.
+fn unread_locals(msl: &str) -> Vec<String> {
     let mut scopes: Vec<Vec<(&str, bool)>> = Vec::new();
     let mut in_signature = false;
     let mut continued = false;
@@ -632,10 +649,10 @@ fn unread_vertex_locals(msl: &str) -> Vec<String> {
     for line in msl.lines() {
         let stmt = line.trim();
         if scopes.is_empty() {
-            // Everything ahead of the vertex function's own body: the input
-            // struct, the varyings, the shared per-draw uniform and the
-            // normal-matrix helpers.
-            if stmt.starts_with("vertex ") {
+            // Everything ahead of the entry point's own body: the input
+            // struct, the varyings, the shared per-draw uniform, the
+            // normal-matrix helpers and the fragment output struct.
+            if stmt.starts_with("vertex ") || stmt.starts_with("fragment ") {
                 in_signature = true;
             } else if in_signature && stmt == ") {" {
                 in_signature = false;
@@ -707,7 +724,7 @@ fn unread_vertex_locals(msl: &str) -> Vec<String> {
     }
     assert!(
         scopes.is_empty() && declarations > 0,
-        "the vertex function body did not parse to its closing brace:\n{msl}"
+        "the function body did not parse to its closing brace:\n{msl}"
     );
     unread
 }
@@ -725,7 +742,7 @@ fn no_vertex_shader_local_is_declared_unread() {
     // path. Whatever a future branch declares is covered by name.
     let mut reported: Vec<(String, String)> = Vec::new();
     let mut check = |vs: &FfVsKey| {
-        for local in unread_vertex_locals(&emit_vs_ff(vs)) {
+        for local in unread_locals(&emit_vs_ff(vs)) {
             if !reported.iter().any(|(name, _)| *name == local) {
                 reported.push((local, format!("{vs:?}")));
             }
@@ -888,9 +905,296 @@ fn the_unread_local_parser_scopes_declarations_reads_and_writes() {
         "    return out;\n",
         "}\n",
     );
-    assert_eq!(
-        unread_vertex_locals(msl),
-        ["sibling", "w", "written", "shadowed"]
+    assert_eq!(unread_locals(msl), ["sibling", "w", "written", "shadowed"]);
+}
+
+#[test]
+fn no_pixel_shader_local_is_declared_unread() {
+    // The pixel twin of the vertex sweep: the fragment function declares the
+    // temporary register, one texture sample per stage that reads one, the
+    // cascade result, the fog terms and the point-sprite stage-in copy, each
+    // under a condition of its own, and a local nothing reads is a Metal
+    // compiler warning per shader. The check is a sweep of what gates any of
+    // them: every operation in the colour role and in the alpha role against
+    // every argument pair, the result register, texture presence, the
+    // cascade's length and its DISABLE terminator, and the variant bits the
+    // emitter branches on. Whatever a future branch declares is covered by
+    // name.
+    use mtld3d_types::{
+        D3DTA_COMPLEMENT, D3DTA_CONSTANT, D3DTA_TEMP, D3DTA_TFACTOR, D3DTOP_DOTPRODUCT3,
+        D3DTOP_SELECTARG2,
+    };
+
+    let mut reported: Vec<(String, String)> = Vec::new();
+    let mut check = |ps: &FfPsKey, variant: VariantKey| {
+        let msl = emit_ps_ff(ps, variant);
+        // The complement of the sweep, and the half Metal would refuse: a
+        // local the function reads has to be declared, so a sample or a write
+        // the emitter drops cannot take a reader with it.
+        for name in ["temp", "t0", "t1", "t2", "t3", "t4", "t5", "t6", "t7"] {
+            assert!(
+                !reads_identifier(&msl, name) || msl.contains(&format!("float4 {name} = ")),
+                "`{name}` is read and never declared for {ps:?} with {variant:?}:\n{msl}"
+            );
+        }
+        for local in unread_locals(&msl) {
+            if !reported.iter().any(|(name, _)| *name == local) {
+                reported.push((local, format!("{ps:?} with {variant:?}")));
+            }
+        }
+    };
+    // Every D3D9 texture operation, the five the emitter answers with its
+    // arg1 fallback among them, plus an undefined code for the fallback arm.
+    let ops: Vec<u8> = (1u32..=26)
+        .chain(std::iter::once(200))
+        .map(narrow)
+        .collect();
+    // Every argument selector, plus a modifier on the texture and on the
+    // temporary, which wrap the expression that names the local.
+    let args: Vec<u8> = [
+        D3DTA_DIFFUSE,
+        D3DTA_CURRENT,
+        D3DTA_TEXTURE,
+        D3DTA_TFACTOR,
+        D3DTA_SPECULAR,
+        D3DTA_TEMP,
+        D3DTA_CONSTANT,
+        D3DTA_TEXTURE | D3DTA_ALPHAREPLICATE,
+        D3DTA_TEMP | D3DTA_COMPLEMENT,
+    ]
+    .map(narrow)
+    .to_vec();
+    let stage_flags = |texture: bool, temp_result: bool| {
+        let mut flags = FfStageFlags::empty();
+        flags.set(FfStageFlags::HAS_TEXTURE, texture);
+        flags.set(FfStageFlags::RESULT_TEMP, temp_result);
+        flags
+    };
+
+    // One stage: every operation against every argument pair, in the colour
+    // role and in the alpha role, with each result register and with and
+    // without a bound texture.
+    for &op in &ops {
+        for &arg1 in &args {
+            for &arg2 in &args {
+                for temp_result in [false, true] {
+                    for texture in [false, true] {
+                        let flags = stage_flags(texture, temp_result);
+                        let mut ps = default_ps_key();
+                        ps.stages[0] = FfStage {
+                            color_op: op,
+                            color_arg1: arg1,
+                            color_arg2: arg2,
+                            alpha_op: narrow(D3DTOP_MODULATE),
+                            alpha_arg1: narrow(D3DTA_DIFFUSE),
+                            alpha_arg2: narrow(D3DTA_CURRENT),
+                            flags,
+                        };
+                        check(&ps, VariantKey::default());
+                        ps.stages[0] = FfStage {
+                            color_op: narrow(D3DTOP_MODULATE),
+                            color_arg1: narrow(D3DTA_DIFFUSE),
+                            color_arg2: narrow(D3DTA_CURRENT),
+                            alpha_op: op,
+                            alpha_arg1: arg1,
+                            alpha_arg2: arg2,
+                            flags,
+                        };
+                        check(&ps, VariantKey::default());
+                    }
+                }
+            }
+        }
+    }
+
+    // Two stages over the temporary register: a writer whose result is CURRENT
+    // or TEMP, a reader whose operation and arguments decide whether the
+    // temporary is read at all, and a stage behind a DISABLE that reads both
+    // the temporary and a texture from where the cascade has already ended.
+    for &op in &ops {
+        for &arg in &args {
+            for writer_temp in [false, true] {
+                for reader_temp in [false, true] {
+                    for texture in [false, true] {
+                        for trailing in [false, true] {
+                            let mut ps = default_ps_key();
+                            ps.stages[0] = FfStage {
+                                color_op: narrow(D3DTOP_MODULATE),
+                                color_arg1: narrow(D3DTA_TEXTURE),
+                                color_arg2: narrow(D3DTA_CURRENT),
+                                alpha_op: narrow(D3DTOP_SELECTARG1),
+                                alpha_arg1: narrow(D3DTA_TEXTURE),
+                                alpha_arg2: narrow(D3DTA_CURRENT),
+                                flags: stage_flags(texture, writer_temp),
+                            };
+                            ps.stages[1] = FfStage {
+                                color_op: op,
+                                color_arg1: arg,
+                                color_arg2: narrow(D3DTA_TEMP),
+                                alpha_op: op,
+                                alpha_arg1: narrow(D3DTA_TEMP),
+                                alpha_arg2: arg,
+                                flags: stage_flags(texture, reader_temp),
+                            };
+                            if trailing {
+                                ps.stages[3] = FfStage {
+                                    color_op: narrow(D3DTOP_MODULATE),
+                                    color_arg1: narrow(D3DTA_TEMP),
+                                    color_arg2: narrow(D3DTA_TEXTURE),
+                                    alpha_op: narrow(D3DTOP_SELECTARG1),
+                                    alpha_arg1: narrow(D3DTA_TEMP),
+                                    alpha_arg2: narrow(D3DTA_TEXTURE),
+                                    flags: stage_flags(true, false),
+                                };
+                            }
+                            check(&ps, VariantKey::default());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Every cascade length, each stage sampling a texture, with the result
+    // register on CURRENT and on TEMP and with the last stage reading the
+    // temporary.
+    for count in 1usize..=8 {
+        for temp_result in [false, true] {
+            for last_reads_temp in [false, true] {
+                let mut ps = default_ps_key();
+                for i in 0..count {
+                    ps.stages[i] = FfStage {
+                        color_op: narrow(D3DTOP_MODULATE),
+                        color_arg1: narrow(D3DTA_TEXTURE),
+                        color_arg2: narrow(D3DTA_CURRENT),
+                        alpha_op: narrow(D3DTOP_MODULATE),
+                        alpha_arg1: narrow(D3DTA_TEXTURE),
+                        alpha_arg2: narrow(D3DTA_CURRENT),
+                        flags: stage_flags(true, temp_result),
+                    };
+                }
+                if last_reads_temp {
+                    ps.stages[count - 1].color_arg2 = narrow(D3DTA_TEMP);
+                }
+                check(&ps, VariantKey::default());
+            }
+        }
+    }
+
+    // The variant bits, swept on bases that differ in what the cascade itself
+    // declares: no stage at all, a textured stage that reads its texture, one
+    // that selects the other argument instead, one writing only the temporary,
+    // and a DOTPRODUCT3 stage, whose colour operation supplies the alpha.
+    let mut bases = vec![default_ps_key()];
+    for (color_op, color_arg2, temp_result) in [
+        (D3DTOP_MODULATE, D3DTA_CURRENT, false),
+        (D3DTOP_SELECTARG2, D3DTA_CURRENT, false),
+        (D3DTOP_MODULATE, D3DTA_CURRENT, true),
+        (D3DTOP_DOTPRODUCT3, D3DTA_DIFFUSE, false),
+    ] {
+        let mut ps = default_ps_key();
+        ps.stages[0] = FfStage {
+            color_op: narrow(color_op),
+            color_arg1: narrow(D3DTA_TEXTURE),
+            color_arg2: narrow(color_arg2),
+            alpha_op: narrow(D3DTOP_SELECTARG1),
+            alpha_arg1: narrow(D3DTA_TEXTURE),
+            alpha_arg2: narrow(D3DTA_CURRENT),
+            flags: stage_flags(true, temp_result),
+        };
+        bases.push(ps);
+    }
+    let sampler_masks = [
+        (0u16, 0u16, 0u16, 0u16, 0u16, 0u16, 0u16),
+        (0b1, 0, 0, 0, 0, 0, 0),
+        (0b1, 0b1, 0, 0, 0b1, 0, 0),
+        (0b1, 0, 0b1, 0, 0, 0, 0),
+        (0, 0, 0b1, 0b1, 0, 0, 0),
+        (0, 0, 0, 0, 0, 0b1, 0),
+        (0, 0, 0, 0, 0, 0, 0b1),
+    ];
+    for base in &bases {
+        for specular_add in [false, true] {
+            for tt_projected_mask in [0u8, 0b1] {
+                let mut ps = base.clone();
+                ps.specular_add = specular_add;
+                ps.tt_projected_mask = tt_projected_mask;
+                // 0 and D3DCMP_ALWAYS emit no discard; 9 is undefined and
+                // takes the always-pass fallback.
+                for alpha_func in 0u8..=9 {
+                    check(
+                        &ps,
+                        VariantKey {
+                            alpha_func,
+                            ..VariantKey::default()
+                        },
+                    );
+                }
+                for fog_mode in 0u8..=4 {
+                    for fog_table_mode in 0u8..=3 {
+                        for source_w in [false, true] {
+                            let mut flags = VariantFlags::empty();
+                            flags.set(VariantFlags::FOG_SOURCE_W, source_w);
+                            check(
+                                &ps,
+                                VariantKey {
+                                    fog_mode,
+                                    fog_table_mode,
+                                    flags,
+                                    ..VariantKey::default()
+                                },
+                            );
+                        }
+                    }
+                }
+                for flags in [
+                    VariantFlags::FLAT_SHADE,
+                    VariantFlags::SRGB_WRITE,
+                    VariantFlags::POINT_SPRITE,
+                    VariantFlags::NO_DEPTH_ATTACHMENT,
+                    VariantFlags::LOD_BIAS,
+                    VariantFlags::SAMPLE_MASK,
+                    VariantFlags::VPOS_SCALE,
+                    VariantFlags::all(),
+                ] {
+                    check(
+                        &ps,
+                        VariantKey {
+                            flags,
+                            sample_mask: 0b11,
+                            ..VariantKey::default()
+                        },
+                    );
+                }
+                for (depth, depth_fetch, fetch4, fetch4_alpha, raw_red, volume, cube) in
+                    sampler_masks
+                {
+                    check(
+                        &ps,
+                        VariantKey {
+                            depth_sampler_mask: depth,
+                            depth_fetch_mask: depth_fetch,
+                            fetch4_mask: fetch4,
+                            fetch4_alpha_mask: fetch4_alpha,
+                            raw_depth_red_mask: raw_red,
+                            volume_sampler_mask: volume,
+                            cube_sampler_mask: cube,
+                            ..VariantKey::default()
+                        },
+                    );
+                }
+            }
+        }
+    }
+
+    let report = reported
+        .iter()
+        .map(|(local, key)| format!("  {local} at {key}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        reported.is_empty(),
+        "locals declared without a reader, each with one key that declares it:\n{report}"
     );
 }
 
@@ -1467,6 +1771,93 @@ fn stops_at_first_disabled_stage() {
     // Stage 2 must not emit a texture sample because iteration stopped at stage 1.
     assert!(!msl.contains("s2.sample"), "{msl}");
     assert!(!msl.contains("t2"), "{msl}");
+}
+
+#[test]
+fn a_texture_sample_and_a_temporary_nothing_reads_are_not_emitted() {
+    use mtld3d_types::{D3DTA_TEMP, D3DTOP_BLENDTEXTUREALPHA, D3DTOP_SELECTARG2};
+
+    // Stage 0 has a texture bound and selects the other argument, so the
+    // sample would have no reader; stage 1 writes the temporary and nothing
+    // reads it, so the register and the write are dead.
+    let vs = default_vs_key();
+    let mut ps = default_ps_key();
+    ps.stages[0] = FfStage {
+        color_op: narrow(D3DTOP_SELECTARG2),
+        color_arg1: narrow(D3DTA_TEXTURE),
+        color_arg2: narrow(D3DTA_CURRENT),
+        alpha_op: narrow(D3DTOP_SELECTARG2),
+        alpha_arg1: narrow(D3DTA_TEXTURE),
+        alpha_arg2: narrow(D3DTA_CURRENT),
+        flags: FfStageFlags::HAS_TEXTURE,
+    };
+    ps.stages[1] = FfStage {
+        color_op: narrow(D3DTOP_MODULATE),
+        color_arg1: narrow(D3DTA_DIFFUSE),
+        color_arg2: narrow(D3DTA_CURRENT),
+        alpha_op: narrow(D3DTOP_SELECTARG1),
+        alpha_arg1: narrow(D3DTA_DIFFUSE),
+        alpha_arg2: narrow(D3DTA_CURRENT),
+        flags: FfStageFlags::RESULT_TEMP,
+    };
+    let dropped = emit_pair_for_tests(&vs, &ps, VariantKey::default());
+    assert!(!dropped.contains("float4 t0 ="), "{dropped}");
+    assert!(!dropped.contains("s0.sample"), "{dropped}");
+    assert!(!dropped.contains("temp"), "{dropped}");
+    // The texture and sampler arguments are the binding layout, not a local,
+    // so they stay exactly where the encoder expects them.
+    assert!(
+        dropped.contains("texture2d<float> s0 [[texture(0)]]"),
+        "{dropped}"
+    );
+    assert!(
+        dropped.contains("sampler samp0 [[sampler(0)]]"),
+        "{dropped}"
+    );
+    assert!(
+        dropped.contains("current = float4((current).rgb, (current).a);"),
+        "{dropped}"
+    );
+
+    // A reader for each brings both back: stage 0 selects the texture and
+    // stage 2 reads the temporary stage 1 writes.
+    ps.stages[0].color_op = narrow(D3DTOP_SELECTARG1);
+    ps.stages[0].alpha_op = narrow(D3DTOP_SELECTARG1);
+    ps.stages[2] = FfStage {
+        color_op: narrow(D3DTOP_SELECTARG1),
+        color_arg1: narrow(D3DTA_TEMP),
+        color_arg2: narrow(D3DTA_CURRENT),
+        alpha_op: narrow(D3DTOP_SELECTARG1),
+        alpha_arg1: narrow(D3DTA_TEMP),
+        alpha_arg2: narrow(D3DTA_CURRENT),
+        flags: FfStageFlags::empty(),
+    };
+    let read = emit_pair_for_tests(&vs, &ps, VariantKey::default());
+    assert!(
+        read.contains("float4 t0 = s0.sample(samp0, in.texcoord0.xy);"),
+        "{read}"
+    );
+    assert!(read.contains("float4 temp = float4(0.0);"), "{read}");
+    assert!(
+        read.contains("temp = float4(((in.color0 * current)).rgb, (in.color0).a);"),
+        "{read}"
+    );
+
+    // The texture's alpha is a reader too, even where no argument names it:
+    // BLENDTEXTUREALPHA weighs its arguments by it.
+    ps.stages[0].color_op = narrow(D3DTOP_BLENDTEXTUREALPHA);
+    ps.stages[0].color_arg1 = narrow(D3DTA_DIFFUSE);
+    ps.stages[0].alpha_op = narrow(D3DTOP_SELECTARG2);
+    ps.stages[0].alpha_arg1 = narrow(D3DTA_DIFFUSE);
+    let implicit = emit_pair_for_tests(&vs, &ps, VariantKey::default());
+    assert!(
+        implicit.contains("float4 t0 = s0.sample(samp0, in.texcoord0.xy);"),
+        "{implicit}"
+    );
+    assert!(
+        implicit.contains("(in.color0 * t0.a + current * (1.0 - t0.a))"),
+        "{implicit}"
+    );
 }
 
 #[test]
@@ -2571,7 +2962,18 @@ fn temp_detection_tracks_effective_dotproduct3_alpha_consumption() {
         !current.contains("float4 temp"),
         "effective DOT3 ignores TEMP alpha input"
     );
+    // A write to the temporary is emitted where something reads it, so the
+    // reader here is a second DOT3 stage, which reads the register whole and
+    // therefore leaves the split below to the stage under test.
     key.stages[0].set_result(FfStageResult::Temp);
+    key.stages[1] = FfStage {
+        color_op: narrow(D3DTOP_DOTPRODUCT3),
+        color_arg1: narrow(D3DTA_TEMP),
+        color_arg2: narrow(D3DTA_DIFFUSE),
+        alpha_op: narrow(D3DTOP_SELECTARG1),
+        alpha_arg1: narrow(D3DTA_DIFFUSE),
+        ..FfStage::default()
+    };
     let temp = emit_ps_ff(&key, VariantKey::default());
     assert!(temp.contains("float4 temp = float4(0.0);"));
     assert!(temp.contains("temp = float4(saturate(4.0 * dot("));
@@ -2579,6 +2981,7 @@ fn temp_detection_tracks_effective_dotproduct3_alpha_consumption() {
         !temp.contains("(temp).a"),
         "ignored alpha op must not split the DOT3 write"
     );
+    key.stages[1] = stage_disable();
     key.stages[0].set_result(FfStageResult::Current);
     key.stages[0].color_arg1 = narrow(D3DTA_TEXTURE);
     let unbound = emit_ps_ff(&key, VariantKey::default());
