@@ -15,7 +15,9 @@
 //! reaches whoever reads the raw dir. A process that runs out of its budget
 //! has to be sampled before the kill, with the sample kept beside the raw log
 //! and named on its `TIMED OUT` line: the kill leaves no other account of
-//! where the process was.
+//! where the process was. A pipe a process outside the subtest's group still
+//! holds after the subtest is gone must not park the run: the collection ends
+//! at its grace with what arrived, and the raw log says it was cut short.
 
 use std::{
     fs,
@@ -274,6 +276,71 @@ fn a_subtest_past_its_budget_is_sampled_before_the_kill() {
     assert!(
         sample.contains("Call graph:"),
         "the sample holds no stacks of the process: {sample}"
+    );
+}
+
+/// How long the held-pipe test lets the whole call take.
+///
+/// The collection is a second per pipe, so a run that stops waiting is back
+/// in about two; the rest is room for a loaded machine. The holder lives
+/// several times longer, so a run that waits for the pipe misses the bound
+/// rather than passing slowly.
+const HELD_PIPE_BOUND: Duration = Duration::from_secs(10);
+
+/// How long the held-pipe test's holder keeps the pipes open, in seconds.
+const HELD_PIPE_HOLD: &str = "30";
+
+#[test]
+fn a_pipe_held_past_the_exit_does_not_park_the_run() {
+    let holder_pid = std::env::temp_dir().join(format!(
+        "mtld3d-conformance-held-pipe-{}.pid",
+        std::process::id()
+    ));
+    // `set -m` gives the background job a process group of its own, which is
+    // where `explorer.exe /desktop` puts itself: it inherits the subtest's
+    // pipes and neither the budget nor a group kill reaches it.
+    let exe = script(
+        "held-pipe",
+        &format!(
+            "echo 'device.c:10: Test failed: x'\necho '{SUMMARY}'\nset -m\nsleep \
+             {HELD_PIPE_HOLD} &\necho $! > '{}'\nexit 0\n",
+            holder_pid.display()
+        ),
+    );
+    let launch = launch_kept(exe);
+    let dir = launch.raw_dir.clone().expect("kept");
+    let started = Instant::now();
+    let run = run_subtest(&launch, LEG, Subtest::Device, None).expect("spawn sh");
+    let elapsed = started.elapsed();
+
+    let holder = fs::read_to_string(&holder_pid).expect("the holder wrote its pid");
+    let holder: i32 = holder.trim().parse().expect("a pid");
+    // SAFETY: kill(2) touches no memory of ours, and the holder is not this
+    // process's child, so an id that has already gone is reported as ESRCH
+    // rather than acted on.
+    unsafe {
+        let _ = libc::kill(holder, libc::SIGKILL);
+    }
+    let _ = fs::remove_file(&holder_pid);
+
+    assert!(
+        elapsed < HELD_PIPE_BOUND,
+        "took {elapsed:?}: the run waited for a pipe the subtest no longer holds"
+    );
+    assert_eq!(
+        run.result.sites.values().sum::<u32>(),
+        1,
+        "the output that arrived before the grace is still parsed in full: {:?}",
+        run.result.sites
+    );
+    assert!(
+        !run.result.crash,
+        "the subtest printed its summary and exited"
+    );
+    let raw = fs::read_to_string(dir.join("i686-device.log")).expect("raw log kept");
+    assert!(
+        raw.contains("[conformance] output cut short after"),
+        "a collection that stopped early has to say so: {raw}"
     );
 }
 
