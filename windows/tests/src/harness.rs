@@ -3058,15 +3058,21 @@ impl Harness {
     /// assertion would measure the device rather than the layer.
     #[must_use]
     pub fn device_is_paravirtual(&self) -> bool {
+        self.adapter_description().contains("Paravirtual")
+    }
+
+    /// The adapter's description string, which is the Metal device's name.
+    ///
+    /// A failure report that carries it says which GPU produced it.
+    #[must_use]
+    pub fn adapter_description(&self) -> String {
         let id = self.adapter_identifier();
         let len = id
             .description
             .iter()
             .position(|&b| b == 0)
             .unwrap_or(id.description.len());
-        id.description[..len]
-            .windows(b"Paravirtual".len())
-            .any(|w| w == b"Paravirtual")
+        String::from_utf8_lossy(&id.description[..len]).into_owned()
     }
 
     /// `IDirect3D9::GetAdapterIdentifier`, asserting success.

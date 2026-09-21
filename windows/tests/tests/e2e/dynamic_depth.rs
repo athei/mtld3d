@@ -1,7 +1,8 @@
 //! Packed dynamic depth uploads and deferred GPU-authoritative locks.
 
 use mtld3d_tests::{
-    Harness, HarnessConfig, PosColorVertex, Texture, VolumeVertex, assert_pixel_eq,
+    Harness, HarnessConfig, LockedRect, PosColorVertex, Reading, Texture, VolumeVertex,
+    assert_or_reread, assert_pixel_eq,
 };
 use mtld3d_types::{
     D3DCLEAR_STENCIL, D3DCLEAR_ZBUFFER, D3DERR_INVALIDCALL, D3DERR_NOTAVAILABLE, D3DFMT_A8R8G8B8,
@@ -224,11 +225,111 @@ fn multisample_resz_reads_sample_zero_depth_and_stencil() {
     let t = h.create_texture(640, 480, 1, D3DUSAGE_DYNAMIC, D3DFMT_D24S8, D3DPOOL_DEFAULT);
     resolve(&h, &t);
     let locked = t.lock_rect(0, D3DLOCK_READONLY);
+    let (h, t) = (&h, &t);
+    assert_or_reread(
+        h,
+        "RESZ out of a 4x depth surface reads sample zero",
+        "0x8000004b (depth 0x800000, stencil 0x4b) at every probe",
+        &sample_zero_words(&locked),
+        || sampled_gpu_depth(h, t),
+        move || {
+            // The level cannot be locked twice, and the write below claims it
+            // for the GPU again, so this lock reads the texture back as well.
+            drop(locked);
+            resolve(h, t);
+            sample_zero_words(&t.lock_rect(0, D3DLOCK_READONLY))
+        },
+    );
+}
+
+/// The four probes of a locked 640x480 D24S8 level against sample zero's depth and stencil.
+fn sample_zero_words(locked: &LockedRect<'_>) -> Reading {
+    const PROBES: [(usize, usize); 4] = [(160, 120), (480, 120), (160, 360), (480, 360)];
     let pitch = usize::try_from(locked.pitch()).unwrap() / 4;
     let words = locked.as_u32(pitch * 479 + 640);
-    for (x, y) in [(160, 120), (480, 120), (160, 360), (480, 360)] {
-        assert_eq!(words[y * pitch + x], 0x8000_004b, "sample zero at {x},{y}");
+    let probes = PROBES.map(|(x, y)| words[y * pitch + x]);
+    let zero = (0..480)
+        .flat_map(|y| &words[y * pitch..y * pitch + 640])
+        .filter(|&&word| word == 0)
+        .count();
+    let shown = PROBES
+        .iter()
+        .zip(probes)
+        .map(|(&(x, y), word)| {
+            format!(
+                "{x},{y}: {word:#010x} (depth {:#08x}, stencil {:#04x})",
+                word >> 8,
+                word & 0xff
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    Reading::described(
+        format!("{shown}; {zero} of 307200 words are zero"),
+        probes == [0x8000_004b; 4],
+    )
+}
+
+/// Observe the GPU copy of `t`'s level 0 through a draw, while its first lock is still held.
+///
+/// A second lock cannot do it: the first `READONLY` lock of a level a RESZ
+/// write claimed reads the texture back and hands authority to the staging,
+/// so the next lock returns that staging and never reaches the GPU. Until the
+/// first lock is released nothing has marked the level dirty either, so a draw
+/// binds the Metal texture as the transfer left it and uploads nothing over it.
+///
+/// Two draws compare a reference depth against the texture's centre on a
+/// single-sampled target cleared to blue, with no depth surface bound, so no
+/// multisampled pass is involved. The comparison passes, and draws white,
+/// where the reference is at most the stored depth. The left band uses 0.375
+/// and the middle band 0.625, so white then transparent black brackets the
+/// stored depth between the two, which sample zero's 0.5 satisfies and a zero
+/// or a cleared 1.0 does not. It says nothing about stencil or about any other
+/// texel. Blue in the undrawn right band says the probe's own pass ran.
+fn sampled_gpu_depth(h: &Harness, t: &Texture<'_>) -> Reading {
+    use mtld3d_types::{D3DRS_MULTISAMPLEMASK, D3DRS_STENCILENABLE};
+    const BLUE: u32 = 0xff00_00ff;
+    const WHITE: u32 = 0xffff_ffff;
+    let back = h.render_target(0);
+    let depth = h.depth_stencil_surface().expect("the device's depth");
+    let probe = h.create_render_target(16, 16, D3DFMT_A8R8G8B8);
+    assert_eq!(h.set_render_target(0, &probe), 0);
+    setup_sample(h);
+    assert_eq!(h.set_render_state(D3DRS_STENCILENABLE, 0), 0);
+    assert_eq!(h.set_render_state(D3DRS_MULTISAMPLEMASK, u32::MAX), 0);
+    assert_eq!(h.set_texture(0, t), 0);
+    assert_eq!(h.clear_target(BLUE), 0);
+    for (left, right, reference) in [(-1.0, -0.25, 0.375), (-0.25, 0.5, 0.625)] {
+        let v = |x, y| VolumeVertex {
+            x,
+            y,
+            z: 0.5,
+            color: WHITE,
+            u: 0.5,
+            v: 0.5,
+            w: reference,
+        };
+        let band = [
+            v(left, 1.0),
+            v(right, 1.0),
+            v(left, -1.0),
+            v(right, 1.0),
+            v(right, -1.0),
+            v(left, -1.0),
+        ];
+        assert_eq!(h.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &band), 0);
     }
+    let bands = [2, 9, 14].map(|x| h.read_pixel(x, 8));
+    assert_eq!(h.set_render_target(0, &back), 0);
+    assert_eq!(h.set_depth_stencil_surface(&depth), 0);
+    Reading::described(
+        format!(
+            "the GPU copy sampled against 0.375, against 0.625, and the undrawn band: {bands:08x?} \
+             (0xffffffff = holds at least the reference, 0 = holds less, 0xff0000ff = the \
+             probe's clear)"
+        ),
+        bands == [WHITE, 0, BLUE],
+    )
 }
 
 #[test]
