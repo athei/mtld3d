@@ -1188,16 +1188,26 @@ fn emit_vs(out: &mut String, vs: &FfVsKey, entry: &str) {
             let base = 15 + i * 6;
             let is_directional = (vs.light_directional_mask & (1u8 << i)) != 0;
             let is_spot = (vs.light_spot_mask & (1u8 << i)) != 0;
+            // The unit light vector feeds the diffuse N.L term and the
+            // specular half-angle, neither of which a normal-less vertex
+            // computes, and the spot cone factor, which only the POINT / SPOT
+            // branch emits. Declared anywhere else it is a local nothing
+            // reads, which Metal's compiler warns about once per light.
+            let needs_light_vector = has_n || (is_spot && !is_directional);
             let _ = writeln!(out, "    {{");
             if is_directional {
                 // DIRECTIONAL — constant direction, no attenuation.
-                let _ = writeln!(out, "        float3 L = -vs_c[{b}].xyz;", b = base + 1);
+                if needs_light_vector {
+                    let _ = writeln!(out, "        float3 L = -vs_c[{b}].xyz;", b = base + 1);
+                }
                 out.push_str("        float atten = 1.0;\n");
             } else {
                 // POINT / SPOT — eye-space vector from vertex to light.
                 let _ = writeln!(out, "        float3 toL = vs_c[{base}].xyz - posEye;");
                 out.push_str("        float dist = length(toL);\n");
-                out.push_str("        float3 L = toL / max(dist, 1e-30);\n");
+                if needs_light_vector {
+                    out.push_str("        float3 L = toL / max(dist, 1e-30);\n");
+                }
                 // Attenuation: 1 / (a0 + a1*d + a2*d²). Clamp to zero when
                 // beyond range (.w of the attenuation slot) per D3D9 spec —
                 // `step(dist, range)` is 1.0 when dist <= range, else 0.
