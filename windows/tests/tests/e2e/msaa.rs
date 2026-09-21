@@ -174,6 +174,7 @@ fn surface_row(h: &Harness, rt: &Surface<'_>, size: (u32, u32)) -> Vec<u32> {
 /// rejected row is read again through `assert_or_reread`, first with a second
 /// `GetRenderTargetData` of `resolve` into a fresh system-memory surface and
 /// then after a second `StretchRect`, before the test fails with all three.
+#[track_caller]
 fn resolved_row(
     h: &Harness,
     source: &Surface<'_>,
@@ -206,20 +207,25 @@ fn resolved_row(
     row
 }
 
-/// A scanline for a failure report: whole when short, else both ends, the middle and a count.
+/// A scanline for a failure report, as runs of equal pixels.
+///
+/// A row these tests read is a few flat spans and an edge, so the runs keep
+/// every pixel of it; a row with more runs than `SHOWN` is cut there and says so.
 fn show_row(row: &[u32]) -> String {
-    const SHOWN: usize = 8;
-    if row.len() <= RT_SIZE as usize {
-        return format!("{row:08x?}");
-    }
-    let zero = row.iter().filter(|&&p| p == 0).count();
-    let middle = row.len() / 2 - SHOWN / 2;
+    const SHOWN: usize = 24;
+    let runs: Vec<String> = row
+        .chunk_by(|a, b| a == b)
+        .map(|run| format!("{:08x} x{}", run[0], run.len()))
+        .collect();
+    let cut = if runs.len() > SHOWN {
+        format!(", and {} more runs", runs.len() - SHOWN)
+    } else {
+        String::new()
+    };
     format!(
-        "{} pixels, {zero} of them zero, first {:08x?}, middle {:08x?}, last {:08x?}",
+        "{} pixels: [{}{cut}]",
         row.len(),
-        &row[..SHOWN],
-        &row[middle..middle + SHOWN],
-        &row[row.len() - SHOWN..],
+        runs[..runs.len().min(SHOWN)].join(", ")
     )
 }
 
