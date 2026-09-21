@@ -13,6 +13,7 @@ use std::{
 use log::{Level, debug, error, log_enabled, trace, warn};
 use mtld3d_core::{
     buffer_rename::{BufferMapMode, stage_upload_needs_preserve},
+    build_index::{BuildIndex, BuildLookup},
     config::Mtld3dConfig,
     convert::{FAN_PATTERN_MAX_TRIANGLES, fan_pattern_bytes, fill_fan_pattern_u16},
     depth_stencil_state::{DepthStencilSnapshot, key_from_snapshot, params_from_snapshot},
@@ -25,7 +26,6 @@ use mtld3d_core::{
     format::map_d3d_format,
     gpu_caps::GpuCaps,
     ids::{BufferId, DepthStencilKey, ProgramId, SamplerKey, TextureId},
-    library_index::{LibraryIndex, LibraryLookup},
     page_box::{PageBox, PageBoxRead},
     passes::{
         ColorClearOutcome, ColorLoad, DepthClearOutcome, DepthLoad, DepthResolve, ExtraColorSlot,
@@ -1100,7 +1100,14 @@ pub struct FrameEncoder {
     /// encoded on the queue the frames run on to be ordered ahead of them.
     queue_handle: MetalHandle<MTLCommandQueueKind>,
     depth_stencil_cache: FxHashMap<DepthStencilKey, MetalHandle<MTLDepthStencilStateKind>>,
-    pipeline_cache: FxHashMap<PipelineKey, MetalHandle<MTLRenderPipelineStateKind>>,
+    /// Every render pipeline build by key, failures included.
+    ///
+    /// A key Metal refused is remembered as failed, so its later draws are
+    /// dropped on the probe instead of repeating the synchronous build. The
+    /// no-color sibling has a key of its own and is remembered the same way.
+    /// `reset_cleanup` forgets the failures; a Reset at unchanged back-buffer
+    /// dimensions never reaches it.
+    pipeline_cache: BuildIndex<PipelineKey, MetalHandle<MTLRenderPipelineStateKind>>,
     /// Per-format-combo "clear-quad" pipeline handles.
     ///
     /// One entry per `(depth_format, color_format, has_color, has_stencil)`
@@ -1167,8 +1174,8 @@ pub struct FrameEncoder {
     /// no borrowed/arena pointer) + the `u64` handle, so it persists
     /// across frames safely — `pipeline_cache` never evicts, so a
     /// snapshot→handle mapping stays valid for the process lifetime. Only
-    /// successful (non-null) resolves are stored; failures fall through to
-    /// the unchanged resolve path.
+    /// successful (non-null) resolves are stored; a failing snapshot goes to
+    /// `pipeline_cache`, which remembers the failure.
     last_pipeline_memo: Option<(PipelineSnapshot, u64)>,
     program_cache: FxHashMap<ProgramId, Box<DxsoProgram>>,
     /// Per-PS declared sampler slots + types, computed once at registration.
@@ -1205,11 +1212,12 @@ pub struct FrameEncoder {
     /// (warm-load) and address the on-disk cache. A key whose cold resolve
     /// failed is recorded too: the same key yields the same source, so its
     /// later draws are dropped on the probe instead of compiling again.
-    /// Reset forgets the failures, shutdown forgets everything.
-    ff_vs_libs: LibraryIndex<FfVsKey, StageLibHandles>,
-    prog_vs_libs: LibraryIndex<(ProgramId, u16, u8, VsSamplerKinds), StageLibHandles>,
-    ff_ps_libs: FxHashMap<FfPsKey, LibraryIndex<VariantKey, StageLibHandles>>,
-    prog_ps_libs: LibraryIndex<(ProgramId, VariantKey), StageLibHandles>,
+    /// `reset_cleanup` forgets the failures (a Reset at unchanged back-buffer
+    /// dimensions never reaches it), shutdown forgets everything.
+    ff_vs_libs: BuildIndex<FfVsKey, StageLibHandles>,
+    prog_vs_libs: BuildIndex<(ProgramId, u16, u8, VsSamplerKinds), StageLibHandles>,
+    ff_ps_libs: FxHashMap<FfPsKey, BuildIndex<VariantKey, StageLibHandles>>,
+    prog_ps_libs: BuildIndex<(ProgramId, VariantKey), StageLibHandles>,
     texture_cache: FxHashMap<TextureId, TextureGpuState>,
     sampler_cache: FxHashMap<SamplerKey, MetalHandle<MTLSamplerStateKind>>,
     /// Per-stage memo of the last sampler resolve, keyed on the raw D3D9 sampler-state words.
@@ -1648,7 +1656,7 @@ impl FrameEncoder {
             device_handle: MetalHandle::NULL,
             queue_handle: MetalHandle::NULL,
             depth_stencil_cache: FxHashMap::default(),
-            pipeline_cache: FxHashMap::default(),
+            pipeline_cache: BuildIndex::default(),
             clear_quad_pipeline_cache: FxHashMap::default(),
             blit_pipeline_cache: FxHashMap::default(),
             upload_pipeline_cache: FxHashMap::default(),
@@ -1662,10 +1670,10 @@ impl FrameEncoder {
             prog_sampler_decls: FxHashMap::default(),
             prog_reads_vpos: FxHashSet::default(),
             lib_cache: FxHashMap::default(),
-            ff_vs_libs: LibraryIndex::default(),
-            prog_vs_libs: LibraryIndex::default(),
+            ff_vs_libs: BuildIndex::default(),
+            prog_vs_libs: BuildIndex::default(),
             ff_ps_libs: FxHashMap::default(),
-            prog_ps_libs: LibraryIndex::default(),
+            prog_ps_libs: BuildIndex::default(),
             texture_cache: FxHashMap::default(),
             sampler_cache: FxHashMap::default(),
             sampler_resolve_memo: core::array::from_fn(|_| None),
@@ -5391,7 +5399,7 @@ impl FrameEncoder {
             self.lib_cache.insert(reference, handles);
         }
         for (key, handle) in warm.pipelines {
-            self.pipeline_cache.insert(key, handle);
+            self.pipeline_cache.record(key, Some(handle));
         }
         for (primary, sibling) in warm.no_color_siblings {
             self.no_color_pipeline_alt.insert(primary, sibling);
@@ -5528,9 +5536,9 @@ impl FrameEncoder {
             )),
         };
         match known {
-            LibraryLookup::Ready(handles) => return Some(handles),
-            LibraryLookup::Failed => return None,
-            LibraryLookup::Unknown => {}
+            BuildLookup::Ready(handles) => return Some(handles),
+            BuildLookup::Failed => return None,
+            BuildLookup::Unknown => {}
         }
         let outcome = self.resolve_vs_library_cold(source);
         if outcome.is_none() {
@@ -5738,13 +5746,13 @@ impl FrameEncoder {
             PsSource::FixedFunction { key, .. } => self
                 .ff_ps_libs
                 .get(key)
-                .map_or(LibraryLookup::Unknown, |variants| variants.lookup(&variant)),
+                .map_or(BuildLookup::Unknown, |variants| variants.lookup(&variant)),
             PsSource::Programmable { ps_id, .. } => self.prog_ps_libs.lookup(&(*ps_id, variant)),
         };
         match known {
-            LibraryLookup::Ready(handles) => return Some(handles),
-            LibraryLookup::Failed => return None,
-            LibraryLookup::Unknown => {}
+            BuildLookup::Ready(handles) => return Some(handles),
+            BuildLookup::Failed => return None,
+            BuildLookup::Unknown => {}
         }
         let outcome = self.resolve_ps_library_cold(source, variant);
         if outcome.is_none() {
@@ -6080,11 +6088,10 @@ impl FrameEncoder {
         // previous one returns the cached handle without rebuilding the
         // `PipelineKey` (its D3D→Metal translations) or probing
         // `pipeline_cache`. It also skips the no-color twin's second resolve
-        // below. A successful sibling mapping is process-lifetime; after a
-        // failed sibling build, the next L0 miss retries it. Only successful
-        // primary resolves are memoised, so a failing snapshot still flows
-        // through the unchanged path (and keeps its existing per-draw
-        // error/retry behaviour). The `match` copies the handle out so the
+        // below. A successful sibling mapping is process-lifetime. Only
+        // successful primary resolves are memoised: a failing snapshot goes
+        // on to `resolve_pipeline`, whose cache remembers the failure and
+        // answers null on the probe. The `match` copies the handle out so the
         // memo borrow ends before the `&mut perf` bump.
         let memo_hit = match &self.last_pipeline_memo {
             Some((prev, handle)) if *prev == *snapshot => Some(*handle),
@@ -6102,8 +6109,9 @@ impl FrameEncoder {
         // sibling would have no attachments, which Mac2 Metal rejects.
         // A successful sibling mapping stays valid as long as the pipeline
         // cache, so an L0 miss can reuse it without rebuilding the alternate
-        // snapshot and key. A failed sibling build leaves no mapping and is
-        // retried on the next L0 miss.
+        // snapshot and key. A failed sibling build leaves no mapping, so the
+        // next L0 miss rebuilds the alternate key and `resolve_pipeline`
+        // answers null from its cache without another build.
         if !with_color.is_null()
             && snapshot.has_depth()
             && snapshot.writes_no_color()
@@ -6113,7 +6121,7 @@ impl FrameEncoder {
             // No-color twin: same identity except the attach flag (and no
             // render targets 1..3, which Rule H strips together with target
             // 0). Explicit `.clone()` because PipelineSnapshot is no longer
-            // Copy; fires on L0 misses until the sibling builds successfully.
+            // Copy; fires on L0 misses until the sibling has a mapping.
             let mut alt = snapshot.clone();
             alt.attach
                 .remove(mtld3d_core::pipeline_state::PipelineAttachFlags::HAS_COLOR_OUTPUT);
@@ -6138,8 +6146,10 @@ impl FrameEncoder {
         sibling: bool,
     ) -> MetalHandle<MTLRenderPipelineStateKind> {
         let key = pipeline_state::key_from_snapshot(snapshot);
-        if let Some(&handle) = self.pipeline_cache.get(&key) {
-            return handle;
+        match self.pipeline_cache.lookup(&key) {
+            BuildLookup::Ready(handle) => return handle,
+            BuildLookup::Failed => return MetalHandle::NULL,
+            BuildLookup::Unknown => {}
         }
         let mut total_ns = 0;
         let total = NanosSetTimer::start(&raw mut total_ns);
@@ -6231,12 +6241,22 @@ impl FrameEncoder {
                 identity,
             );
         }
-        if status != 0 || pipeline.is_null() {
+        if !success {
             error!(target: LOG_TARGET, "encoder: CreateRenderPipeline failed");
-            return MetalHandle::NULL;
+            let consequence = if sibling {
+                "its passes keep their color attachment"
+            } else {
+                "its draws are dropped"
+            };
+            warn!(
+                target: LOG_TARGET,
+                "encoder: render pipeline (VS {}, PS {}, sibling={sibling}) failed to build, {consequence} without another attempt",
+                shader_source_tag_vs(shaders.vs),
+                shader_source_tag_ps(shaders.ps, shaders.variant)
+            );
         }
-        self.pipeline_cache.insert(key, pipeline);
-        pipeline
+        self.pipeline_cache.record(key, success.then_some(pipeline));
+        if success { pipeline } else { MetalHandle::NULL }
     }
 
     fn pipeline_shader_refs(
@@ -8510,7 +8530,7 @@ impl FrameEncoder {
             textures.extend(state.views.owned_handles().map(MetalHandle::raw));
         }
 
-        let pipelines: Vec<u64> = self.pipeline_cache.values().map(|h| h.raw()).collect();
+        let pipelines: Vec<u64> = self.pipeline_cache.ready().map(MetalHandle::raw).collect();
         let libraries: Vec<u64> = self
             .lib_cache
             .values()
@@ -8623,15 +8643,17 @@ impl FrameEncoder {
         drop(held);
         self.pending_blit_retention.clear();
         self.current_blit_retention.clear();
-        // A failed library build gets one more attempt per Reset: a rejected
-        // source fails again at the cost of one compile, a build the compiler
-        // service dropped goes through.
+        // A failed library or pipeline build gets one more attempt per Reset
+        // that reaches this cleanup (one at unchanged dimensions does not):
+        // a rejected source or descriptor fails again at the cost of one
+        // build, a build the compiler service dropped goes through.
         self.ff_vs_libs.forget_failures();
         self.prog_vs_libs.forget_failures();
         for variants in self.ff_ps_libs.values_mut() {
             variants.forget_failures();
         }
         self.prog_ps_libs.forget_failures();
+        self.pipeline_cache.forget_failures();
         // The implicit surfaces the caller is about to destroy never pass
         // through the retention queue, so this is their only chance to leave
         // the handle-keyed records. The wait above has retired every
