@@ -40,7 +40,8 @@ impl Reading {
 /// it waits for, while a second `LockRect` of a texture the first lock read
 /// back does not, because the first lock moved authority to the CPU staging.
 /// `recopy` repeats the copy out of the same source without drawing, then
-/// reads. Both run [`SETTLE`] after the first read at the earliest.
+/// reads. Both run a tenth of a second after the first read at the earliest, so
+/// the frame that carried the pass has had time to finish.
 ///
 /// What the three readings say, with `A` the command buffer that carried the
 /// copy and `B` the first read-back's own, committed after `A` on one queue:
