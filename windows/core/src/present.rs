@@ -1,6 +1,8 @@
-//! Mapping between D3D9 `D3DPRESENT_INTERVAL_*` and `CAMetalLayer`'s `displaySyncEnabled`.
+//! Mapping from a D3D9 `D3DPRESENT_INTERVAL_*` to the pacing a device asks of its layer.
 //!
-//! That property is Apple's recommended vsync knob.
+//! The layer paces presents by a minimum duration alone. An interval
+//! contributes the vsync request, and a divided interval a frame-rate ceiling
+//! on top of it; the user's `present.maxFps` rides the same ceiling.
 
 pub mod present_interval {
     pub const DEFAULT: u32 = 0x0000_0000;
@@ -11,12 +13,12 @@ pub mod present_interval {
     pub const IMMEDIATE: u32 = 0x8000_0000;
 }
 
-/// Result of mapping a `D3DPRESENT_INTERVAL_*` to `displaySyncEnabled`.
+/// Result of mapping a `D3DPRESENT_INTERVAL_*` to the vsync request.
 ///
 /// `Fallthrough` carries the same boolean as a supported choice but
 /// signals the caller to fire a `log_once_warn_by!` keyed on the raw
-/// input — non-1:1 ratios (TWO/THREE/FOUR) and unknown bit patterns
-/// take this path. Display-rate is the only ratio honoured directly.
+/// input: a bit pattern that names no interval takes this path and runs at
+/// display rate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DisplaySync {
     On,
@@ -31,12 +33,74 @@ impl DisplaySync {
     }
 }
 
+/// The pacing a device hands its layer: the vsync request and the frame-rate ceiling.
+///
+/// `max_fps` is in Hz and `0` means no ceiling. It is the effective ceiling
+/// ([`effective_max_fps`]), so a divided interval and `present.maxFps` are
+/// already folded into it and the unix side sees one number.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LayerPacing {
+    pub display_sync: bool,
+    pub max_fps: u32,
+}
+
 #[must_use]
 pub const fn display_sync_for(interval: u32) -> DisplaySync {
     match interval {
-        present_interval::DEFAULT | present_interval::ONE => DisplaySync::On,
+        present_interval::DEFAULT
+        | present_interval::ONE
+        | present_interval::TWO
+        | present_interval::THREE
+        | present_interval::FOUR => DisplaySync::On,
         present_interval::IMMEDIATE => DisplaySync::Off,
         _ => DisplaySync::Fallthrough,
+    }
+}
+
+/// How many refresh periods one present of `interval` spans.
+///
+/// `TWO`, `THREE` and `FOUR` answer 2, 3 and 4. Every other value answers 1:
+/// display rate for `DEFAULT` and `ONE`, and nothing to divide for
+/// `IMMEDIATE` or a pattern that names no interval.
+#[must_use]
+pub const fn interval_divisor(interval: u32) -> u32 {
+    match interval {
+        present_interval::TWO => 2,
+        present_interval::THREE => 3,
+        present_interval::FOUR => 4,
+        _ => 1,
+    }
+}
+
+/// The frame-rate ceiling in Hz for `interval` on a `refresh_hz` mode, `0` for none.
+///
+/// A divided interval is a ceiling of `refresh_hz / N`, and the result is the
+/// lower of that and `configured` (`present.maxFps`), where `0` on either
+/// side means that side sets no ceiling. The quotient rounds up: the ceiling
+/// becomes a minimum present duration, and one a little shorter than `N`
+/// refresh periods still lands on the `N`th, while one a little longer would
+/// slip to the period after it. An undivided interval, or a mode whose rate
+/// is unknown (`refresh_hz == 0`), leaves `configured` as it is.
+#[must_use]
+pub const fn effective_max_fps(interval: u32, refresh_hz: u32, configured: u32) -> u32 {
+    let divisor = interval_divisor(interval);
+    if divisor == 1 || refresh_hz == 0 {
+        return configured;
+    }
+    let divided = refresh_hz.div_ceil(divisor);
+    if configured == 0 || divided < configured {
+        divided
+    } else {
+        configured
+    }
+}
+
+/// The pacing `interval` asks for on a `refresh_hz` mode under a `configured` ceiling.
+#[must_use]
+pub const fn layer_pacing_for(interval: u32, refresh_hz: u32, configured: u32) -> LayerPacing {
+    LayerPacing {
+        display_sync: display_sync_for(interval).enabled(),
+        max_fps: effective_max_fps(interval, refresh_hz, configured),
     }
 }
 
@@ -48,8 +112,12 @@ pub const fn display_sync_for(interval: u32) -> DisplaySync {
 /// guest asked for, so nothing has to go out and anything still queued is
 /// dropped rather than written back as the value the layer never left.
 #[must_use]
-pub const fn queued_display_sync(held: bool, want: bool) -> Option<bool> {
-    if want == held { None } else { Some(want) }
+pub const fn queued_pacing(held: LayerPacing, want: LayerPacing) -> Option<LayerPacing> {
+    if want.display_sync == held.display_sync && want.max_fps == held.max_fps {
+        None
+    } else {
+        Some(want)
+    }
 }
 
 /// Which capture marks frame `index` of a `total`-frame diagnostic run carries.

@@ -1,6 +1,7 @@
 use mtld3d_types::{
     AddressCaps, BlendCaps, Caps2, Caps3, CmpCaps, CursorCaps, D3D_MAX_SIMULTANEOUS_RENDERTARGETS,
-    D3DCAPS9, D3DDEVTYPE_HAL, D3DPRESENT_INTERVAL_IMMEDIATE, D3DPRESENT_INTERVAL_ONE,
+    D3DCAPS9, D3DDEVTYPE_HAL, D3DPRESENT_INTERVAL_FOUR, D3DPRESENT_INTERVAL_IMMEDIATE,
+    D3DPRESENT_INTERVAL_ONE, D3DPRESENT_INTERVAL_THREE, D3DPRESENT_INTERVAL_TWO,
     D3DPS20_MAX_DYNAMICFLOWCONTROLDEPTH, D3DPS20_MAX_NUMINSTRUCTIONSLOTS, D3DPS20_MAX_NUMTEMPS,
     D3DPS20_MAX_STATICFLOWCONTROLDEPTH, D3DPS30_INSTRUCTIONSLOTS_MAX, D3DVBF_3WEIGHTS,
     D3DVS20_MAX_DYNAMICFLOWCONTROLDEPTH, D3DVS20_MAX_NUMTEMPS, D3DVS20_MAX_STATICFLOWCONTROLDEPTH,
@@ -369,12 +370,15 @@ const fn fill_default(caps: &mut D3DCAPS9) {
     caps.device_type = D3DDEVTYPE_HAL;
     caps.caps2 = CAPS2_DEFAULT.bits();
     caps.caps3 = CAPS3_DEFAULT.bits();
-    // The two intervals the present path implements: display-rate vsync
-    // (`ONE`, also what `DEFAULT` resolves to) and `IMMEDIATE`. The divided
-    // rates are accepted by `CreateDevice` but fall through to `ONE` with a
-    // warn, so they are not advertised. 3DMark05 refuses to start without
-    // `IMMEDIATE` here.
-    caps.presentation_intervals = D3DPRESENT_INTERVAL_ONE | D3DPRESENT_INTERVAL_IMMEDIATE;
+    // Every interval the present path honours: display-rate vsync (`ONE`,
+    // also what `DEFAULT` resolves to), the divided rates, which pace at the
+    // mode's refresh rate over two, three and four, and `IMMEDIATE`.
+    // 3DMark05 refuses to start without `IMMEDIATE` here.
+    caps.presentation_intervals = D3DPRESENT_INTERVAL_ONE
+        | D3DPRESENT_INTERVAL_TWO
+        | D3DPRESENT_INTERVAL_THREE
+        | D3DPRESENT_INTERVAL_FOUR
+        | D3DPRESENT_INTERVAL_IMMEDIATE;
     caps.cursor_caps = CURSOR_CAPS_DEFAULT.bits();
     caps.dev_caps = DEV_CAPS_DEFAULT.bits();
     caps.primitive_misc_caps = PRIMITIVE_MISC_DEFAULT.bits();

@@ -11,6 +11,7 @@ use mtld3d_core::{
     display_mode::{MAX_SERVED_SIZES, ModeRequest, select_mode_sizes, served_mode_sizes},
     format_probe::FormatProbeKey,
     multisample,
+    present::LayerPacing,
 };
 use mtld3d_shared::{
     AttachMetalLayerParams, CreateBackbufferParams, CreateCommandQueueParams,
@@ -1610,7 +1611,7 @@ extern "system" fn d3d9_create_device(
         queue_handle: cq_params.queue_handle,
         view_handle: layer_params.view_handle,
         layer_handle: layer_params.layer_handle,
-        display_sync_enabled: layer_params.display_sync_enabled != 0,
+        pacing: attached_pacing(&layer_params),
         backbuffer_handle: bb_params.texture_handle,
         backbuffer_srgb_handle: bb_params.srgb_texture_handle,
         backbuffer_msaa_handle: bb_params.msaa_texture_handle,
@@ -1724,7 +1725,7 @@ pub fn attach_metal_layer(
     cfg: &Mtld3dConfig,
     sinks: &crate::cursor::DisplaySinks,
 ) -> AttachMetalLayerParams {
-    let display_sync_enabled = crate::device::resolve_display_sync(pp.presentation_interval);
+    let pacing = crate::device::resolve_layer_pacing(pp, cfg);
     let mut layer_params = AttachMetalLayerParams {
         hwnd,
         device_handle,
@@ -1733,10 +1734,10 @@ pub fn attach_metal_layer(
         view_handle: MetalHandle::NULL,
         layer_handle: MetalHandle::NULL,
         backing_scale: 1,
-        display_sync_enabled: u32::from(display_sync_enabled),
+        display_sync_enabled: u32::from(pacing.display_sync),
         hdr_enable: u32::from(cfg.hdr_enable),
         color_space: cfg.color_space,
-        max_fps: cfg.present_max_fps,
+        max_fps: pacing.max_fps,
         metalfx_available: 0,
         backing_scale_ptr: sinks.backing_scale_ptr(),
         software_cursor: cfg.cursor_software,
@@ -1747,6 +1748,16 @@ pub fn attach_metal_layer(
         unix_call(&mut layer_params);
     }
     layer_params
+}
+
+/// The pacing an attach was called with, read back off its parameters.
+///
+/// What a later `Reset` compares its own pacing against.
+pub const fn attached_pacing(layer_params: &AttachMetalLayerParams) -> LayerPacing {
+    LayerPacing {
+        display_sync: layer_params.display_sync_enabled != 0,
+        max_fps: layer_params.max_fps,
+    }
 }
 
 /// Retain the parent `IDirect3D9` for `IDirect3DDevice9::GetDirect3D`.

@@ -402,10 +402,14 @@ fn vertex_texture_fetch_is_advertised() {
 }
 
 #[test]
-fn presentation_intervals_are_the_two_the_present_path_honours() {
+fn presentation_intervals_are_the_five_the_present_path_honours() {
     assert_eq!(
         filled().presentation_intervals,
-        mtld3d_types::D3DPRESENT_INTERVAL_ONE | mtld3d_types::D3DPRESENT_INTERVAL_IMMEDIATE
+        mtld3d_types::D3DPRESENT_INTERVAL_ONE
+            | mtld3d_types::D3DPRESENT_INTERVAL_TWO
+            | mtld3d_types::D3DPRESENT_INTERVAL_THREE
+            | mtld3d_types::D3DPRESENT_INTERVAL_FOUR
+            | mtld3d_types::D3DPRESENT_INTERVAL_IMMEDIATE
     );
 }
 

@@ -30,6 +30,7 @@ use mtld3d_core::{
         ApiPerfState, ApiPerfStorage, ApiTimer, BindSubCategory, CycleAddTimer, CycleSetTimer,
         DeviceSubCategory, KeysGate,
     },
+    present::LayerPacing,
     readback::{ReadbackDestination, ReadbackReject, ReadbackSource},
     streams::validate_stream_freq,
     texture_flags::TextureFlags,
@@ -629,20 +630,20 @@ pub struct DeviceInner {
     /// via `recording_state_block()`; mutating through
     /// `recording_state_block_mut()` is how each setter records its op.
     recording_state_block: Option<Box<RecordingStateBlock>>,
-    /// The `displaySyncEnabled` this device has handed to its layer.
+    /// The pacing this device has handed to its layer.
     ///
     /// Seeded with what `AttachMetalLayer` was called with, at device
     /// creation and again at a retarget's fresh attach, and moved to a queued
     /// value once `stamp_and_swap` puts that value on the frame carrying it.
     /// A `Reset` compares its resolved interval against this, so one that
     /// does not move the pacing sends no thunk.
-    layer_display_sync_enabled: bool,
+    layer_pacing: LayerPacing,
     /// `Some(v)` if `IDirect3DDevice9::Reset` changed `PresentationInterval` since the last frame.
     ///
     /// Consumed by `stamp_and_swap` and applied by the encoder thread on the
     /// first frame sent after the Reset, before that frame's own
     /// `nextDrawable`, matching the spec's "next Present" timing.
-    pending_display_sync_enabled: Option<bool>,
+    pending_pacing: Option<LayerPacing>,
     /// The colour render-target binding most recently applied via `SetRenderTarget`.
     ///
     /// `None` means the implicit backbuffer default is in effect. The encoder's
@@ -1494,11 +1495,11 @@ impl DeviceInner {
         // leaves the device after it, which is this one: the encoder applies it
         // before the frame's own `nextDrawable`. Putting it on the replacement
         // instead would hold it back until the Present after the next one.
-        if let Some(enabled) = self.pending_display_sync_enabled.take() {
+        if let Some(pacing) = self.pending_pacing.take() {
             // Handing it over commits it: a later Reset can no longer take it
             // back, and this is the pacing the next one compares against.
-            self.layer_display_sync_enabled = enabled;
-            frame.set_apply_display_sync_enabled(Some(enabled));
+            self.layer_pacing = pacing;
+            frame.set_apply_pacing(Some(pacing));
         }
         // An F12 run ends with the frame the closing `Present` submits. A
         // mid-frame flush sends the marked frame out early, so its stop mark
@@ -2536,13 +2537,14 @@ impl DeviceInner {
     /// A queued change is drained by `stamp_and_swap` onto the frame it hands
     /// over, which is the spec-compliant timing: a synchronous layer-property
     /// write from the API thread races the encoder's in-flight submission.
-    /// The comparison against `layer_display_sync_enabled` keeps a `Reset` at
-    /// the interval the device already runs on off that path entirely: the
-    /// thunk, the store on the attachment record and the main-thread walk it
-    /// queues would all write the pacing the layer holds.
-    pub const fn queue_display_sync_change(&mut self, enabled: bool) {
-        self.pending_display_sync_enabled =
-            mtld3d_core::present::queued_display_sync(self.layer_display_sync_enabled, enabled);
+    /// The comparison against `layer_pacing` keeps a `Reset` at the pacing
+    /// the device already runs on off that path entirely: the thunk, the
+    /// store on the attachment record and the main-thread walk it queues
+    /// would all write the pacing the layer holds. A flip between `ONE` and a
+    /// divided interval keeps the vsync request and moves the ceiling, so the
+    /// comparison is over the pair.
+    pub const fn queue_pacing_change(&mut self, pacing: LayerPacing) {
+        self.pending_pacing = mtld3d_core::present::queued_pacing(self.layer_pacing, pacing);
     }
 
     /// Drive the encoder thread to run `reset_cleanup`.
@@ -2814,11 +2816,11 @@ pub struct DeviceCreateInfo {
     pub queue_handle: MetalHandle<MTLCommandQueueKind>,
     pub view_handle: MetalHandle<NSViewKind>,
     pub layer_handle: MetalHandle<CAMetalLayerKind>,
-    /// The `displaySyncEnabled` that attach was called with.
+    /// The pacing that attach was called with.
     ///
-    /// Seeds `DeviceInner::layer_display_sync_enabled`, so the first `Reset`
-    /// compares its interval against the pacing the attach put on the layer.
-    pub display_sync_enabled: bool,
+    /// Seeds `DeviceInner::layer_pacing`, so the first `Reset` compares its
+    /// interval against the pacing the attach put on the layer.
+    pub pacing: LayerPacing,
     pub backbuffer_handle: MetalHandle<MTLTextureKind>,
     /// sRGB twin view of `backbuffer_handle`; see `DeviceInner`.
     pub backbuffer_srgb_handle: MetalHandle<MTLTextureKind>,
@@ -2979,8 +2981,8 @@ impl Direct3DDevice9 {
             vertex_texture_kinds: VsSamplerKinds::default(),
             last_sized_depth: None,
             recording_state_block: None,
-            layer_display_sync_enabled: info.display_sync_enabled,
-            pending_display_sync_enabled: None,
+            layer_pacing: info.pacing,
+            pending_pacing: None,
             last_color_rt_binding: None,
             last_extra_rt_bindings: [const { None }; RENDER_TARGET_SLOTS - 1],
             cur_autogen_rt_ids: [None; RENDER_TARGET_SLOTS],
@@ -4209,7 +4211,7 @@ extern "system" fn device_reset(this: *mut c_void, present_params: *mut c_void) 
         // frame the retarget flush below sends, which still names the layer
         // the device is leaving. The fresh attach receives this Reset's
         // pacing directly.
-        dev.pending_display_sync_enabled = None;
+        dev.pending_pacing = None;
         retarget_device_window(dev, &pp, target_window);
     }
 
@@ -4294,7 +4296,7 @@ extern "system" fn device_reset(this: *mut c_void, present_params: *mut c_void) 
     //    layer would be written the value it holds, and the write costs a
     //    thunk, a store on the attachment record and a main-thread walk.
     if !retargeted && !dev.layer_handle.is_null() {
-        dev.queue_display_sync_change(resolve_display_sync(pp.presentation_interval));
+        dev.queue_pacing_change(resolve_layer_pacing(&pp, &dev.config));
     }
 
     D3D_OK
@@ -4406,7 +4408,7 @@ fn retarget_device_window(
     dev.layer_handle = layer_params.layer_handle;
     // The attach above latched this Reset's pacing on the new layer, so that
     // is the value a later Reset on this window compares against.
-    dev.layer_display_sync_enabled = layer_params.display_sync_enabled != 0;
+    dev.layer_pacing = crate::direct3d9::attached_pacing(&layer_params);
     let (cursor_scale, _origin) =
         crate::direct3d9::resolve_cursor_scale(layer_params.backing_scale, config.cursor_scale);
     let dev_ptr = std::ptr::from_mut::<DeviceInner>(dev);
@@ -14053,27 +14055,48 @@ pub fn warn_present_params_fields_once(pp: &mtld3d_types::D3DPRESENT_PARAMETERS)
         );
     }
     // presentation_interval is honoured at the AttachMetalLayer call site via
-    // resolve_display_sync, which fires its own log_once_warn_by! for non-1:1
-    // ratios — no separate arm here.
+    // resolve_layer_pacing, which fires its own log_once_warn_by! for a value
+    // that names no interval, so there is no separate arm here.
 }
 
-/// Map `D3DPRESENT_PARAMETERS::PresentationInterval` to `CAMetalLayer.displaySyncEnabled`.
+/// Map `D3DPRESENT_PARAMETERS::PresentationInterval` to the pacing the layer is handed.
 ///
-/// The boolean value is sent across the PE/Unix
-/// boundary, and unsupported ratios fire a one-shot warn.
+/// `ONE` and `DEFAULT` ask for display-rate vsync and `IMMEDIATE` for none.
+/// `TWO`, `THREE` and `FOUR` ask for vsync under a ceiling of the refresh
+/// rate over two, three and four, folded with `present.maxFps` into the one
+/// ceiling that crosses the PE/Unix boundary. The rate divided is the one
+/// `GetDisplayMode` reports for `pp`, which is the one the application saw.
 ///
-/// Pure mapping lives in `mtld3d_core::present`; this wrapper layers the
-/// project's logging policy on top so the helper itself stays
-/// host-testable without pulling in `log` plumbing.
-pub fn resolve_display_sync(interval: u32) -> bool {
-    use mtld3d_core::present::{DisplaySync, display_sync_for};
-    let mapped = display_sync_for(interval);
-    if matches!(mapped, DisplaySync::Fallthrough) {
+/// Pure mapping lives in `mtld3d_core::present`; this wrapper supplies the
+/// reported mode and layers the project's logging policy on top so the
+/// helper itself stays host-testable without pulling in `log` plumbing.
+pub fn resolve_layer_pacing(
+    pp: &mtld3d_types::D3DPRESENT_PARAMETERS,
+    cfg: &Mtld3dConfig,
+) -> LayerPacing {
+    use mtld3d_core::present::{DisplaySync, display_sync_for, interval_divisor, layer_pacing_for};
+    let interval = pp.presentation_interval;
+    if matches!(display_sync_for(interval), DisplaySync::Fallthrough) {
         mtld3d_shared::log_once_warn_by!(
             target: crate::LOG_TARGET,
             key: u64::from(interval),
-            "PresentationInterval={interval:#x} not supported — only display-rate (DEFAULT/ONE) and IMMEDIATE are honoured; falling through to display-rate vsync"
+            "PresentationInterval={interval:#x} names no interval; falling through to display-rate vsync"
         );
     }
-    mapped.enabled()
+    // The reported mode of a windowed device is a Win32 query, so only an
+    // interval that divides the rate asks for it.
+    let refresh_hz = if interval_divisor(interval) > 1 {
+        let refresh_hz = crate::direct3d9::reported_display_mode(pp).refresh_rate;
+        if refresh_hz == 0 {
+            mtld3d_shared::log_once_warn!(
+                target: crate::LOG_TARGET,
+                "PresentationInterval={interval:#x}: the reported display mode carries no refresh \
+                 rate to divide; pacing at display-rate vsync"
+            );
+        }
+        refresh_hz
+    } else {
+        0
+    };
+    layer_pacing_for(interval, refresh_hz, cfg.present_max_fps)
 }
