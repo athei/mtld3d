@@ -4507,15 +4507,20 @@ pub fn release_emitted_staging(ti: &mut TextureInner, level: usize, generation: 
     ti.drop_staging(level);
 }
 
-/// Mark every previously-uploaded mip dirty for the next bind-time `flush_dirty_mips`.
+/// Mark a managed texture's uploaded mips dirty for the next `flush_dirty_mips`.
 ///
-/// That replays the staging upload. Render targets are skipped (RTs have no
-/// Lock+Unlock staging — their content is GPU-rendered, so dropping their cache
-/// entry would lose pixels irrecoverably). Returns `Some(texture_id)` when any
-/// mip was marked so `evict_managed_resources` can enqueue a cache eviction;
-/// `None` for unwritten textures and RTs.
+/// That replays the staging upload, which is what makes the eviction free of
+/// consequence: the runtime owns a `D3DPOOL_MANAGED` texture's system-memory
+/// copy, so the pixels come back. Every other pool is skipped, because nothing
+/// else has a copy worth replaying. A `D3DPOOL_DEFAULT` texture's staging is
+/// whatever its last lock wrote, and a render target, a RESZ destination or a
+/// `StretchRect` destination holds pixels that exist only on the device, which
+/// the replay would overwrite; the CPU-only pools have no device copy to drop.
+/// Returns `Some(texture_id)` when any mip was marked so
+/// `evict_managed_resources` can enqueue a cache eviction; `None` for an
+/// unwritten managed texture and for every other pool.
 pub fn evict_mark_dirty(ti: &mut TextureInner) -> Option<TextureId> {
-    if ti.usage_flags.contains(TextureUsage::RENDER_TARGET) {
+    if !mtld3d_core::pool::is_runtime_managed(ti.d3d_pool) {
         return None;
     }
     if ti.flags.contains(TextureFlags::CUBE) {

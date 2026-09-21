@@ -1769,6 +1769,51 @@ fn stretch_rect_into_offscreen_plain_is_visible_to_lock_rect() {
 }
 
 #[test]
+fn evict_managed_resources_keeps_a_stretched_offscreen_plain() {
+    // EvictManagedResources drops the device copy of a D3DPOOL_MANAGED
+    // resource, which the runtime owns a system-memory copy of and replays on
+    // the next use. A DEFAULT offscreen plain has no such copy: its staging
+    // holds what the last lock wrote, and the StretchRect into it puts newer
+    // pixels on its Metal texture alone. Evicting it would publish that stale
+    // staging over them. The destination is read through a blit out of it
+    // rather than through a lock, which would read the level back into its
+    // staging first and so hide the loss.
+    let h = Harness::new();
+    let src = h.create_offscreen_plain_surface(64, 64, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT);
+    let dst = h.create_offscreen_plain_surface(64, 64, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT);
+    let fill = |surface: &Surface<'_>, color: u32| {
+        let mut locked = surface.lock_rect(0);
+        let pitch_px = locked.pitch().cast_unsigned() / 4;
+        locked.write_u32(&vec![color; (pitch_px * 64) as usize]);
+    };
+    let gpu_pixel = || {
+        let mirror = h.create_offscreen_plain_surface(64, 64, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT);
+        assert_eq!(h.stretch_rect(&dst, &mirror, D3DTEXF_NONE), D3D_OK);
+        let locked = mirror.lock_rect(D3DLOCK_READONLY);
+        let pitch_px = locked.pitch().cast_unsigned() / 4;
+        locked.as_u32((pitch_px * 64) as usize)[(32 * pitch_px + 32) as usize]
+    };
+
+    fill(&dst, GREEN);
+    // The blit out of the destination is also what uploads its staging, which
+    // is the state the eviction walk acts on.
+    assert_eq!(
+        gpu_pixel(),
+        GREEN,
+        "the lock's pixels reach the Metal texture"
+    );
+    fill(&src, RED);
+    assert_eq!(
+        h.stretch_rect(&src, &dst, D3DTEXF_NONE),
+        D3D_OK,
+        "1:1 same-format StretchRect between two DEFAULT offscreen plains",
+    );
+    assert_eq!(gpu_pixel(), RED, "the transfer's pixels are on the texture");
+    assert_eq!(h.evict_managed_resources(), D3D_OK);
+    assert_eq!(gpu_pixel(), RED, "EvictManagedResources leaves them there");
+}
+
+#[test]
 fn discard_lock_after_a_stretch_rect_keeps_what_the_lock_wrote() {
     // A StretchRect into a lockable DEFAULT offscreen plain leaves the level's
     // pixels on the plain's Metal texture alone. D3DLOCK_DISCARD declares them
