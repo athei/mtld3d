@@ -1673,22 +1673,51 @@ fn emit_ps(out: &mut String, ps: &FfPsKey, variant: VariantKey, entry: &str) {
     // current = diffuse by default (CURRENT at stage 0 resolves to DIFFUSE
     // since no previous stage contributed).
     out.push_str("    float4 current = in.color0;\n");
-    // A local belongs to this fragment invocation, not a texture or draw.
-    // Ignore disabled stages and arguments discarded by SELECTARG1/2.
-    let uses_temp = ps
-        .stages
-        .iter()
-        .take_while(|s| u32::from(s.color_op) != D3DTOP_DISABLE)
-        .any(|s| s.result() == FfStageResult::Temp || s.reads_argument(D3DTA_TEMP));
-    if uses_temp {
+    // The temporary register is a local of this fragment invocation, not a
+    // texture or a draw. Its readers are the cascade's own expressions, which
+    // end at the first DISABLE, so a stage behind that one is not a reader and
+    // neither is an argument the operation discards. A stage whose result is
+    // the temporary contributes nothing else, so with no reader at all the
+    // register and every write to it are dead, and the declaration would be a
+    // local nothing reads, which Metal's compiler warns about. A stage that
+    // reads the temporary makes the register live and is therefore never one
+    // of the writes this drops.
+    let active = || {
+        ps.stages
+            .iter()
+            .enumerate()
+            .take_while(|(_, s)| u32::from(s.color_op) != D3DTOP_DISABLE)
+    };
+    let reads_temp = active().any(|(i, stage)| {
+        let (color_expr, alpha_expr) = stage_expressions(*stage, i);
+        names_local(&color_expr, "temp")
+            || alpha_expr
+                .as_deref()
+                .is_some_and(|alpha| names_local(alpha, "temp"))
+    });
+    if reads_temp {
         out.push_str("    float4 temp = float4(0.0);\n");
     }
 
-    for (i, stage) in ps.stages.iter().enumerate() {
-        if u32::from(stage.color_op) == D3DTOP_DISABLE {
-            break;
+    for (i, stage) in active() {
+        if stage.result() == FfStageResult::Temp && !reads_temp {
+            continue;
         }
-        if stage.has_texture() {
+        let result = match stage.result() {
+            FfStageResult::Current => "current",
+            FfStageResult::Temp => "temp",
+        };
+        let (color_expr, alpha_expr) = stage_expressions(*stage, i);
+        // The sample feeds this stage's own expressions and nothing else, so
+        // it is emitted for the stage that names it and skipped for the stage
+        // that discards it. The texture and sampler arguments stay as they
+        // are: an unread sample costs a declaration, not a binding.
+        let texture_local = format!("t{i}");
+        let samples_texture = names_local(&color_expr, &texture_local)
+            || alpha_expr
+                .as_deref()
+                .is_some_and(|alpha| names_local(alpha, &texture_local));
+        if samples_texture {
             // VS emits the TCI-resolved coord for stage i into
             // `Varyings.texcoord[i]`, so PS stage i samples slot i directly.
             // Depth slots are comparison samplers (`compareFunction =
@@ -1766,42 +1795,16 @@ fn emit_ps(out: &mut String, ps: &FfPsKey, variant: VariantKey, entry: &str) {
                 let _ = writeln!(out, "    float4 t{i} = s{i}.sample(samp{i}, {uv}{bias});");
             }
         }
-        // Unbound-texture "invalid op" handling: a stage with NO bound texture
-        // whose op consumes a D3DTA_TEXTURE argument resolves to
-        // SELECTARG1(CURRENT) — the unbound-texture default is CURRENT, not
-        // opaque white. SELECTARG1 of CURRENT is just `current`, so short-circuit
-        // to it. Colour and alpha are tested independently; textured stages take
-        // the byte-identical path.
-        let result = match stage.result() {
-            FfStageResult::Current => "current",
-            FfStageResult::Temp => "temp",
-        };
-        let unbound_color = stage.color_uses_unbound_fallback();
-        let color_expr = if unbound_color {
-            "current".to_string()
-        } else {
-            let c1 = resolve_arg(stage.color_arg1, i, stage.has_texture());
-            let c2 = resolve_arg(stage.color_arg2, i, stage.has_texture());
-            apply_op(stage.color_op, &c1, &c2, i, stage.has_texture())
-        };
-        // DOTPRODUCT3 supplies alpha as well as RGB, ignoring the alpha operation.
-        if stage.color_writes_alpha() {
-            let _ = writeln!(out, "    {result} = {color_expr};");
-            continue;
-        }
-        let alpha_expr = if stage.alpha_uses_unbound_fallback() {
-            "current".to_string()
-        } else {
-            let a1 = resolve_arg(stage.alpha_arg1, i, stage.has_texture());
-            let a2 = resolve_arg(stage.alpha_arg2, i, stage.has_texture());
-            apply_op_scalar(stage.alpha_op, &a1, &a2, i, stage.has_texture())
-        };
         // Both expressions read the old register values before either channel
         // changes, including when this stage reads its own destination.
-        let _ = writeln!(
-            out,
-            "    {result} = float4(({color_expr}).rgb, ({alpha_expr}).a);",
-        );
+        if let Some(alpha_expr) = alpha_expr {
+            let _ = writeln!(
+                out,
+                "    {result} = float4(({color_expr}).rgb, ({alpha_expr}).a);",
+            );
+        } else {
+            let _ = writeln!(out, "    {result} = {color_expr};");
+        }
     }
 
     // End-of-cascade specular add: oD1 joins the cascade result after the
@@ -1854,6 +1857,63 @@ fn emit_ps(out: &mut String, ps: &FfPsKey, variant: VariantKey, entry: &str) {
         out.push_str("    return oC0;\n");
     }
     out.push_str("}\n");
+}
+
+/// The colour and alpha expressions one texture stage's result is assembled from.
+///
+/// A `None` alpha means the colour operation supplies the alpha as well
+/// (`D3DTOP_DOTPRODUCT3`), so the stage writes the colour expression whole.
+///
+/// Unbound-texture "invalid op" handling: a stage with NO bound texture whose
+/// op consumes a `D3DTA_TEXTURE` argument resolves to SELECTARG1(CURRENT),
+/// since the unbound-texture default is CURRENT, not opaque white. SELECTARG1
+/// of CURRENT is just `current`, so short-circuit to it. Colour and alpha are
+/// tested independently; textured stages take the byte-identical path.
+fn stage_expressions(stage: FfStage, i: usize) -> (String, Option<String>) {
+    let color_expr = if stage.color_uses_unbound_fallback() {
+        "current".to_string()
+    } else {
+        let c1 = resolve_arg(stage.color_arg1, i, stage.has_texture());
+        let c2 = resolve_arg(stage.color_arg2, i, stage.has_texture());
+        apply_op(stage.color_op, &c1, &c2, i, stage.has_texture())
+    };
+    let alpha_expr = if stage.color_writes_alpha() {
+        None
+    } else if stage.alpha_uses_unbound_fallback() {
+        Some("current".to_string())
+    } else {
+        let a1 = resolve_arg(stage.alpha_arg1, i, stage.has_texture());
+        let a2 = resolve_arg(stage.alpha_arg2, i, stage.has_texture());
+        Some(apply_op_scalar(
+            stage.alpha_op,
+            &a1,
+            &a2,
+            i,
+            stage.has_texture(),
+        ))
+    };
+    (color_expr, alpha_expr)
+}
+
+/// Does an emitted stage expression read the local called `name`?
+///
+/// The identifier itself: a longer name that merely contains it is not a read,
+/// and neither is a field of something else. Taken off the emitted text rather
+/// than off the operation table because the two disagree. An argument the
+/// operation discards is resolved and then dropped (`D3DTOP_SELECTARG1`
+/// resolves arg2 and never emits it), an operation the emitter has no arm for
+/// keeps only its first argument, and `D3DTOP_BLENDTEXTUREALPHA` and
+/// `D3DTOP_BLENDTEXTUREALPHAPM` read the texture's alpha whether or not an
+/// argument names it. The text is what the function compiles, so an operation
+/// that names a local cannot read one the function never declared.
+fn names_local(expr: &str, name: &str) -> bool {
+    let bytes = expr.as_bytes();
+    let boundary = |b: u8| !(b.is_ascii_alphanumeric() || b == b'_');
+    expr.match_indices(name).any(|(at, _)| {
+        let before = at == 0 || (boundary(bytes[at - 1]) && bytes[at - 1] != b'.');
+        let end = at + name.len();
+        before && (end == bytes.len() || boundary(bytes[end]))
+    })
 }
 
 /// Does `op` read a `D3DTA_TEXTURE` argument?
