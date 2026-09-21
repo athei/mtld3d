@@ -378,7 +378,11 @@ fn the_eye_space_position_is_declared_only_where_it_is_read() {
                     // either way.
                     let texgen_reads = tci == 2 || tci == 4 || (tci == 3 && normal);
                     let light_vector_reads = lighting && light_active != 0 && directional == 0;
-                    let local_viewer_reads = lighting && normal && specular && local_viewer;
+                    // The specular view vector is read by the half-angle
+                    // inside the per-light block, so it needs an active slot
+                    // as much as it needs a normal.
+                    let lit_specular = lighting && normal && specular && light_active != 0;
+                    let local_viewer_reads = lit_specular && local_viewer;
                     let reads = texgen_reads || light_vector_reads || local_viewer_reads;
 
                     assert_eq!(
@@ -412,7 +416,7 @@ fn the_eye_space_position_is_declared_only_where_it_is_read() {
                     );
                     assert_eq!(
                         msl.contains("float3 V = float3(0.0, 0.0, -1.0);"),
-                        lighting && normal && specular && !local_viewer,
+                        lit_specular && !local_viewer,
                         "{case}"
                     );
                 }
@@ -518,6 +522,376 @@ fn the_eye_space_normal_is_declared_only_where_it_is_read() {
             }
         }
     }
+}
+
+/// Identifier tokens of one emitted MSL statement, with their byte offsets.
+///
+/// A numeric literal is consumed whole, so the `u` of `4u` and the `e` of
+/// `1e-30` never read as an identifier.
+fn msl_identifiers(stmt: &str) -> Vec<(usize, &str)> {
+    let bytes = stmt.as_bytes();
+    let mut tokens = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i].is_ascii_alphabetic() || bytes[i] == b'_' {
+            let start = i;
+            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                i += 1;
+            }
+            tokens.push((start, &stmt[start..i]));
+        } else if bytes[i].is_ascii_digit() {
+            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'.') {
+                i += 1;
+            }
+        } else {
+            i += 1;
+        }
+    }
+    tokens
+}
+
+/// Byte offset of the target of a plain `name... = value;` assignment.
+///
+/// The target is written, not read. A compound assignment (`+=`, `*=`) and a
+/// comparison read their left-hand side, so neither is one of these.
+fn plain_write_target(stmt: &str) -> Option<usize> {
+    let bytes = stmt.as_bytes();
+    let eq = stmt.find('=')?;
+    if eq == 0
+        || matches!(
+            bytes[eq - 1],
+            b'+' | b'-' | b'*' | b'/' | b'<' | b'>' | b'!' | b'='
+        )
+        || bytes.get(eq + 1) == Some(&b'=')
+    {
+        return None;
+    }
+    let &(offset, _) = msl_identifiers(&stmt[..eq]).first()?;
+    (offset == 0).then_some(0)
+}
+
+/// Name and byte offset of the local an emitted statement declares.
+///
+/// `None` when the statement declares nothing. A statement that does declare
+/// something in a shape this does not understand panics instead of being
+/// skipped, so an emitted shape the parser has not been taught fails the
+/// sweep rather than disappearing from it.
+fn declared_local(stmt: &str) -> Option<(usize, &str)> {
+    const ADDRESS_SPACES: [&str; 4] = ["constant", "device", "thread", "threadgroup"];
+    const STATEMENT_HEADS: [&str; 8] = [
+        "return", "if", "else", "for", "while", "do", "break", "continue",
+    ];
+    const TYPES: [&str; 21] = [
+        "bool", "float", "float2", "float3", "float4", "float2x2", "float3x3", "float4x4", "half",
+        "half2", "half3", "half4", "int", "int2", "int3", "int4", "uint", "uint2", "uint3",
+        "uint4", "Varyings",
+    ];
+    let tokens = msl_identifiers(stmt);
+    let &(first_offset, first) = tokens.first()?;
+    if first_offset != 0 || STATEMENT_HEADS.contains(&first) {
+        return None;
+    }
+    let type_index = usize::from(ADDRESS_SPACES.contains(&first));
+    let &(type_offset, type_name) = tokens.get(type_index)?;
+    let &(name_offset, name) = tokens.get(type_index + 1)?;
+    // A declaration separates its type from its name by whitespace and at
+    // most a pointer or reference marker. A `.`, an operator or a bracket
+    // there means some other statement.
+    let gap = &stmt[type_offset + type_name.len()..name_offset];
+    if gap.is_empty() || !gap.chars().all(|c| c == ' ' || c == '*' || c == '&') {
+        return None;
+    }
+    assert!(TYPES.contains(&type_name), "unknown local type: `{stmt}`");
+    let tail = stmt[name_offset + name.len()..].trim_start();
+    assert!(
+        tail == ";" || tail.starts_with('='),
+        "unknown declaration shape: `{stmt}`"
+    );
+    Some((name_offset, name))
+}
+
+/// Locals the emitted vertex function declares and no later statement reads.
+///
+/// The parser reads this emitter's own regular output, not general MSL. It
+/// understands one statement per line; `{` and `}` alone on a line as the
+/// block delimiters, plus a one-line `if (...) { ... }` whose body declares
+/// nothing; a declaration `[<address space>] <type> [*]<name>[ = <value>];`
+/// whose value may run on over the following lines until one ends in a
+/// semicolon; and a plain assignment, whose target is a write. Every other
+/// occurrence of a name as an identifier not preceded by `.` is a read, so a
+/// `.w` swizzle cannot stand in for a local called `w`. Each block is a scope
+/// of its own, so one per-light block's `L` is not satisfied by the next
+/// block's use of the name. Anything else that looks like a declaration
+/// panics, and so does a body that does not parse to its closing brace.
+fn unread_vertex_locals(msl: &str) -> Vec<String> {
+    let mut scopes: Vec<Vec<(&str, bool)>> = Vec::new();
+    let mut in_signature = false;
+    let mut continued = false;
+    let mut declarations = 0usize;
+    let mut unread = Vec::new();
+    for line in msl.lines() {
+        let stmt = line.trim();
+        if scopes.is_empty() {
+            // Everything ahead of the vertex function's own body: the input
+            // struct, the varyings, the shared per-draw uniform and the
+            // normal-matrix helpers.
+            if stmt.starts_with("vertex ") {
+                in_signature = true;
+            } else if in_signature && stmt == ") {" {
+                in_signature = false;
+                scopes.push(Vec::new());
+            }
+            continue;
+        }
+        if stmt == "{" {
+            scopes.push(Vec::new());
+            continue;
+        }
+        if stmt == "}" {
+            let scope = scopes.pop().expect("an open scope for every closing brace");
+            unread.extend(
+                scope
+                    .iter()
+                    .filter(|(_, read)| !read)
+                    .map(|(name, _)| (*name).to_string()),
+            );
+            if scopes.is_empty() {
+                break;
+            }
+            continue;
+        }
+        let declared = if continued {
+            None
+        } else if stmt.contains('{') || stmt.contains('}') {
+            // A one-line block keeps its body in the enclosing scope, which
+            // holds only while that body declares nothing.
+            for segment in stmt.split(['{', '}']) {
+                assert!(
+                    declared_local(segment.trim()).is_none(),
+                    "a declaration inside a one-line block is not understood: `{stmt}`"
+                );
+            }
+            None
+        } else {
+            declared_local(stmt)
+        };
+        let write_target = if declared.is_some() {
+            None
+        } else {
+            plain_write_target(stmt)
+        };
+        for (offset, token) in msl_identifiers(stmt) {
+            if Some(offset) == declared.map(|(at, _)| at) || Some(offset) == write_target {
+                continue;
+            }
+            if offset > 0 && stmt.as_bytes()[offset - 1] == b'.' {
+                continue;
+            }
+            if let Some(decl) = scopes
+                .iter_mut()
+                .rev()
+                .flat_map(|scope| scope.iter_mut().rev())
+                .find(|(name, _)| *name == token)
+            {
+                decl.1 = true;
+            }
+        }
+        if let Some((_, name)) = declared {
+            declarations += 1;
+            scopes
+                .last_mut()
+                .expect("an open scope")
+                .push((name, false));
+        }
+        continued = !stmt.ends_with(';') && !stmt.ends_with('}');
+    }
+    assert!(
+        scopes.is_empty() && declarations > 0,
+        "the vertex function body did not parse to its closing brace:\n{msl}"
+    );
+    unread
+}
+
+#[test]
+fn no_vertex_shader_local_is_declared_unread() {
+    // A local nothing reads is a Metal compiler warning per shader, and the
+    // signal that an emitter branch writes something no branch consumes. The
+    // declaration and its readers sit under separate conditions in `emit_vs`,
+    // so the check is a sweep of the key bits that gate either: lighting with
+    // its normal, specular, viewer and renormalization flags, the light type
+    // and active masks, every TCI mode, vertex blending in its three index
+    // and weight shapes, and, on a handful of bases, the fog modes, the point
+    // size, the clip planes, the texture transform and the pre-transformed
+    // path. Whatever a future branch declares is covered by name.
+    let mut reported: Vec<(String, String)> = Vec::new();
+    let mut check = |vs: &FfVsKey| {
+        for local in unread_vertex_locals(&emit_vs_ff(vs)) {
+            if !reported.iter().any(|(name, _)| *name == local) {
+                reported.push((local, format!("{vs:?}")));
+            }
+        }
+    };
+
+    for bits in 0u8..32 {
+        // (active, directional, spot) masks: no light, directional, point,
+        // spot, and two slots of different types at once.
+        for (light_active, directional, spot) in
+            [(0, 0, 0), (1, 1, 0), (1, 0, 0), (1, 0, 1), (3, 1, 2)]
+        {
+            // TCI modes: passthru, CAMERASPACENORMAL, CAMERASPACEPOSITION,
+            // CAMERASPACEREFLECTIONVECTOR, SPHEREMAP.
+            for tci in 0u8..=4 {
+                // Vertex blend: off, one and two sequential matrices, the
+                // weightless indexed single matrix (D3DVBF_0WEIGHTS), and
+                // three indexed matrices.
+                for (blend, weights, blend_flags) in [
+                    (0, 0, FfVsFlags::empty()),
+                    (1, 1, FfVsFlags::empty()),
+                    (2, 2, FfVsFlags::empty()),
+                    (
+                        1,
+                        0,
+                        FfVsFlags::VERTEX_BLEND_INDEXED | FfVsFlags::DECLARED_INDICES,
+                    ),
+                    (
+                        3,
+                        3,
+                        FfVsFlags::VERTEX_BLEND_INDEXED | FfVsFlags::DECLARED_INDICES,
+                    ),
+                ] {
+                    let mut vs = default_vs_key();
+                    vs.flags.set(FfVsFlags::LIGHTING_ENABLED, bits & 1 != 0);
+                    vs.flags.set(FfVsFlags::HAS_NORMAL, bits & 2 != 0);
+                    vs.flags.set(FfVsFlags::SPECULAR_ENABLE, bits & 4 != 0);
+                    vs.flags.set(FfVsFlags::LOCAL_VIEWER, bits & 8 != 0);
+                    vs.flags.set(FfVsFlags::NORMALIZE_NORMALS, bits & 16 != 0);
+                    vs.flags.insert(blend_flags);
+                    vs.light_active_mask = light_active;
+                    vs.light_directional_mask = directional;
+                    vs.light_spot_mask = spot;
+                    vs.tex_coord_count = 1;
+                    vs.input_tex_coord_count = 1;
+                    vs.tex_coord_dims[0] = 2;
+                    vs.tci_modes[0] = tci;
+                    vs.vertex_blend_count = blend;
+                    vs.declared_weights_count = weights;
+                    check(&vs);
+                }
+            }
+        }
+    }
+
+    // The key bits that gate a local outside the lighting and texgen product
+    // above, swept on each of four bases rather than multiplied into it.
+    let mut bases = Vec::new();
+    for (normal, lighting, blend, rhw) in [
+        (true, false, 0, false),
+        (true, true, 0, false),
+        (true, true, 2, false),
+        (false, false, 0, true),
+    ] {
+        let mut vs = default_vs_key();
+        vs.flags.set(FfVsFlags::HAS_NORMAL, normal);
+        vs.flags.set(FfVsFlags::LIGHTING_ENABLED, lighting);
+        vs.flags.set(FfVsFlags::HAS_RHW, rhw);
+        vs.flags.set(FfVsFlags::SPECULAR_ENABLE, lighting);
+        vs.light_active_mask = u8::from(lighting);
+        vs.vertex_blend_count = blend;
+        vs.declared_weights_count = blend;
+        bases.push(vs);
+    }
+    for base in &bases {
+        for fog_mode in 0u8..=4 {
+            for range_fog in [false, true] {
+                for color1 in [false, true] {
+                    let mut vs = base.clone();
+                    vs.fog_mode = fog_mode;
+                    vs.flags.set(FfVsFlags::RANGE_FOG, range_fog);
+                    vs.flags.set(FfVsFlags::HAS_COLOR1, color1);
+                    check(&vs);
+                }
+            }
+        }
+        for psize in [false, true] {
+            for point_scale in [false, true] {
+                let mut vs = base.clone();
+                vs.flags.set(FfVsFlags::HAS_PSIZE, psize);
+                vs.flags.set(FfVsFlags::POINT_SCALE, point_scale);
+                check(&vs);
+            }
+        }
+        for planes in 0..=6 {
+            let mut vs = base.clone();
+            vs.clip_plane_count = planes;
+            check(&vs);
+        }
+        // Texture transform: disabled, COUNT1..COUNT4 and the projected
+        // forms, over each input dimension and each TCI mode.
+        for tt in [0u8, 1, 2, 3, 4, 0x12, 0x13, 0x14] {
+            for dim in 0u8..=4 {
+                for tci in 0u8..=4 {
+                    let mut vs = base.clone();
+                    vs.tex_coord_count = 1;
+                    vs.input_tex_coord_count = 1;
+                    vs.tex_coord_dims[0] = dim;
+                    vs.tci_modes[0] = tci;
+                    vs.tt_flags[0] = tt;
+                    check(&vs);
+                }
+            }
+        }
+    }
+
+    let report = reported
+        .iter()
+        .map(|(local, key)| format!("  {local} at {key}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        reported.is_empty(),
+        "locals declared without a reader, each with one key that declares it:\n{report}"
+    );
+}
+
+#[test]
+fn the_unread_local_parser_scopes_declarations_reads_and_writes() {
+    // The sweep above is only as honest as its parser, so the rules are
+    // pinned on a function written for the purpose: `kept` is read in a
+    // nested block and on a run-on initializer, `run_on` after it, the inner
+    // `shadowed` satisfies itself and not the outer one, `sibling` is named
+    // only in the block after its own, `written` is only ever an assignment
+    // target, and `w` appears only as another name's swizzle. The four
+    // nothing reads are what it must report, in the order their scopes end.
+    let msl = concat!(
+        "#include <metal_stdlib>\n",
+        "vertex Varyings vs_main(\n",
+        "    VertexIn in [[stage_in]],\n",
+        "    constant float4 &pos_fixup [[buffer(20)]]\n",
+        ") {\n",
+        "    Varyings out;\n",
+        "    float kept = pos_fixup.x;\n",
+        "    float w = 1.0;\n",
+        "    float written;\n",
+        "    float shadowed = pos_fixup.y;\n",
+        "    float3 run_on = float3(\n",
+        "        kept, kept, kept);\n",
+        "    {\n",
+        "        float sibling = pos_fixup.z;\n",
+        "        out.color0 = float4(kept + pos_fixup.w);\n",
+        "    }\n",
+        "    {\n",
+        "        float shadowed = pos_fixup.w;\n",
+        "        out.color1 = float4(sibling + shadowed);\n",
+        "    }\n",
+        "    written = 1.0;\n",
+        "    out.position = float4(run_on, 1.0);\n",
+        "    return out;\n",
+        "}\n",
+    );
+    assert_eq!(
+        unread_vertex_locals(msl),
+        ["sibling", "w", "written", "shadowed"]
+    );
 }
 
 #[test]
@@ -1612,8 +1986,12 @@ fn emit_vs_ff_tex_coord_count_8_non_rhw_does_not_panic() {
 fn vertex_blend_sequential_2_weight_emits_implicit_last_weight_and_palette_reads() {
     // D3DVBF_2WEIGHTS → vertex_blend_count = 3 (2 explicit + 1 implicit).
     // Sequential mode reads palette[0..2] directly from vs_c[95 + i*4].
+    // The blended normal is accumulated for a reader, so the key lights the
+    // draw from one slot.
     let mut vs = default_vs_key();
     vs.flags.set(FfVsFlags::HAS_NORMAL, true);
+    vs.flags.set(FfVsFlags::LIGHTING_ENABLED, true);
+    vs.light_active_mask = 1;
     vs.vertex_blend_count = 3;
     vs.flags.set(FfVsFlags::VERTEX_BLEND_INDEXED, false);
     vs.declared_weights_count = 2;
