@@ -422,6 +422,105 @@ fn the_eye_space_position_is_declared_only_where_it_is_read() {
 }
 
 #[test]
+fn the_eye_space_normal_is_declared_only_where_it_is_read() {
+    // `n` has two kinds of reader, both of which need a vertex normal: the
+    // diffuse N.L term and the specular half-angle, which sit inside the
+    // per-light block, and the reflection vector of the
+    // CAMERASPACEREFLECTIONVECTOR and SPHEREMAP texgen modes.
+    // CAMERASPACENORMAL is not one of them: it reads the separate
+    // un-normalized `n_texgen`. A key with no reader would declare a local
+    // nothing reads; a key with one that lost the declaration would not
+    // compile, so every combination is swept.
+    for bits in 0u8..32 {
+        let lighting = bits & 1 != 0;
+        let normal = bits & 2 != 0;
+        let specular = bits & 4 != 0;
+        let local_viewer = bits & 8 != 0;
+        let normalize_normals = bits & 16 != 0;
+        // (active, directional, spot) masks: no light, directional, point, spot.
+        for (light_active, directional, spot) in [(0, 0, 0), (1, 1, 0), (1, 0, 0), (1, 0, 1)] {
+            // TCI modes: passthru, CAMERASPACENORMAL, CAMERASPACEPOSITION,
+            // CAMERASPACEREFLECTIONVECTOR, SPHEREMAP.
+            for tci in 0u8..=4 {
+                for blend in [0u8, 1] {
+                    let mut vs = default_vs_key();
+                    vs.flags.set(FfVsFlags::LIGHTING_ENABLED, lighting);
+                    vs.flags.set(FfVsFlags::HAS_NORMAL, normal);
+                    vs.flags.set(FfVsFlags::SPECULAR_ENABLE, specular);
+                    vs.flags.set(FfVsFlags::LOCAL_VIEWER, local_viewer);
+                    vs.flags
+                        .set(FfVsFlags::NORMALIZE_NORMALS, normalize_normals);
+                    vs.light_active_mask = light_active;
+                    vs.light_directional_mask = directional;
+                    vs.light_spot_mask = spot;
+                    vs.tex_coord_count = 1;
+                    vs.input_tex_coord_count = 1;
+                    vs.tci_modes[0] = tci;
+                    vs.vertex_blend_count = blend;
+                    vs.declared_weights_count = blend;
+                    let msl = emit_vs_ff(&vs);
+                    let case = format!(
+                        "lighting={lighting} normal={normal} specular={specular} local_viewer={local_viewer} normalize={normalize_normals} light={light_active}/{directional}/{spot} tci={tci} blend={blend}\n{msl}"
+                    );
+
+                    // Both texgen modes fall back to a normal-less arm that
+                    // reads nothing, and the lighting terms live inside the
+                    // per-light block, so an enabled lighting branch with no
+                    // active slot reads nothing either.
+                    let texgen_reads = normal && (tci == 3 || tci == 4);
+                    let lit_reads = lighting && normal && light_active != 0;
+                    let reads = texgen_reads || lit_reads;
+
+                    assert_eq!(
+                        msl.matches("float3 n = ").count(),
+                        usize::from(reads),
+                        "{case}"
+                    );
+                    // Each reader appears exactly under the condition that
+                    // emits it, so a declaration is present wherever one is
+                    // read and the name never occurs undeclared.
+                    assert_eq!(msl.contains("dot(n, L)"), lit_reads, "{case}");
+                    assert_eq!(msl.contains("dot(n, H)"), lit_reads && specular, "{case}");
+                    assert_eq!(msl.contains("reflect(E_tci, n)"), texgen_reads, "{case}");
+                    // The name is a single letter, so it is counted as a
+                    // token rather than as a substring: no token at all is
+                    // what says the shader neither declares nor reads it.
+                    let tokens = msl
+                        .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                        .filter(|t| *t == "n")
+                        .count();
+                    assert_eq!(tokens > 0, reads, "{case}");
+                    // The terms that must not move with the declaration: the
+                    // renormalization the single-matrix lit path appends
+                    // rides with it, the sphere map's normal-less reflection
+                    // does not, and `n_texgen` keeps its own reader.
+                    assert_eq!(
+                        msl.contains("    n = normalize(n);"),
+                        reads && lighting && blend == 0 && normalize_normals,
+                        "{case}"
+                    );
+                    assert_eq!(
+                        msl.contains("float3 R_tci = E_tci;"),
+                        tci == 4 && !normal,
+                        "{case}"
+                    );
+                    assert_eq!(
+                        msl.contains("float3 n_texgen = "),
+                        normal && tci == 1,
+                        "{case}"
+                    );
+                    assert_eq!(
+                        msl.contains("float4(n_texgen, 0.0)"),
+                        normal && tci == 1,
+                        "{case}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn fog_mode_4_sources_factor_from_specular_alpha() {
     // fog_mode 4 (vertex+table fog both D3DFOG_NONE) reads the COLOR1/specular
     // alpha as the per-vertex fog factor.
@@ -1245,11 +1344,10 @@ fn tci_cameraspaceposition_reuses_lighting_poseye() {
 fn eye_space_locals_are_declared_once_for_every_lighting_normal_and_tci_mix() {
     // `posEye` and `n` each have two possible declaration sites, the texgen
     // pre-scan and the lighting branch, and the two sites own them under
-    // different conditions: lighting declares `posEye` whenever one of its
-    // own terms reads it, which the point light below always does, and `n`
-    // only with a vertex normal. A second declaration of either is a Metal
-    // compile error, a missing one an undeclared identifier, so every
-    // combination pins the count of both.
+    // different conditions: lighting declares either whenever one of its own
+    // terms reads it, which the two lights below always do. A second
+    // declaration of either is a Metal compile error, a missing one an
+    // undeclared identifier, so every combination pins the count of both.
     for blended in [false, true] {
         for lighting in [false, true] {
             for normal in [false, true] {
@@ -1278,16 +1376,20 @@ fn eye_space_locals_are_declared_once_for_every_lighting_normal_and_tci_mix() {
                     // back to passthru and reads no eye-space position, so
                     // the pre-scan does not hoist one for it.
                     let wants_pos_eye = lighting || mode == 2 || mode == 4 || (mode == 3 && normal);
-                    let wants_normal = normal && (lighting || matches!(mode, 1 | 3 | 4));
+                    // A CAMERASPACENORMAL stage reads `n_texgen`, and a
+                    // normal-less CAMERASPACEREFLECTIONVECTOR stage falls
+                    // back to passthru, so neither hoists an eye normal.
+                    let wants_normal = normal && (lighting || mode == 3 || mode == 4);
                     assert_eq!(pos_eye_decls, usize::from(wants_pos_eye), "{case}");
                     assert_eq!(normal_decls, usize::from(wants_normal), "{case}");
 
-                    // Every consumer has its declaration.
+                    // Every consumer has its declaration, and the eye normal
+                    // is declared only where one reads it.
                     let pos_eye_uses = msl.matches("posEye").count() - pos_eye_decls;
                     let normal_uses =
                         msl.matches("dot(n, ").count() + msl.matches("reflect(E_tci, n)").count();
                     assert!(pos_eye_uses == 0 || pos_eye_decls == 1, "{case}");
-                    assert!(normal_uses == 0 || normal_decls == 1, "{case}");
+                    assert_eq!(normal_decls, usize::from(normal_uses > 0), "{case}");
 
                     // The texgen source each mode resolves to.
                     let raw = match mode {

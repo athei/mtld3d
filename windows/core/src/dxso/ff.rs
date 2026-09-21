@@ -1074,13 +1074,22 @@ fn emit_vs(out: &mut String, vs: &FfVsKey, entry: &str) {
 
     // TCI pre-scan: if any active stage needs eye-space normal / position
     // but the lighting branch below won't declare them, emit them here. The
-    // lighting branch owns the two under different conditions: `posEye`
-    // whenever lighting is enabled and something reads it, `n` only when the
-    // vertex also carries a normal.
+    // lighting branch owns both whenever lighting is enabled and something
+    // reads them.
     let active = vs.tex_coord_count as usize;
-    let need_eye_normal = vs.tci_modes[..active]
-        .iter()
-        .any(|&m| matches!(m, 1 | 3 | 4));
+    // Every reader of the eye-space normal, stated as the emitter's own
+    // branch structure. Lighting reads it for the diffuse N.L term and for
+    // the specular half-angle, both of which sit inside the per-light block,
+    // so an enabled lighting branch with no active slot reads neither.
+    // Texgen reads it for the reflection vector of
+    // CAMERASPACEREFLECTIONVECTOR and of SPHEREMAP; CAMERASPACENORMAL reads
+    // the separately declared, un-normalized `n_texgen` instead. All of them
+    // need a vertex normal, without which the emitter takes a normal-less
+    // arm. Declared anywhere else it is a local nothing reads, which Metal's
+    // compiler warns about.
+    let texgen_reads_normal = vs.tci_modes[..active].iter().any(|&m| m == 3 || m == 4);
+    let lit_reads_normal = vs.lighting_enabled() && vs.light_active_mask != 0;
+    let needs_normal = vs.has_normal() && (texgen_reads_normal || lit_reads_normal);
     // Every reader of the eye-space position, stated as the emitter's own
     // branch structure. Texgen reads it for CAMERASPACEPOSITION and
     // SPHEREMAP always and for CAMERASPACEREFLECTIONVECTOR only with a
@@ -1096,9 +1105,8 @@ fn emit_vs(out: &mut String, vs: &FfVsKey, entry: &str) {
         && ((vs.light_active_mask & !vs.light_directional_mask) != 0
             || (vs.has_normal() && vs.specular_enable() && vs.local_viewer()));
     let needs_pos_eye = texgen_reads_pos_eye || lit_reads_pos_eye;
-    let lighting_declares_normal = vs.lighting_enabled() && vs.has_normal();
     let blended = vs.vertex_blend_count > 0;
-    if need_eye_normal && vs.has_normal() && !lighting_declares_normal {
+    if needs_normal && !vs.lighting_enabled() {
         if blended {
             out.push_str("    float3 n = normalize(n_blend);\n");
         } else {
@@ -1136,7 +1144,7 @@ fn emit_vs(out: &mut String, vs: &FfVsKey, entry: &str) {
             if needs_pos_eye {
                 out.push_str("    float3 posEye = pos_view.xyz;\n");
             }
-            if has_n {
+            if needs_normal {
                 out.push_str("    float3 n = normalize(n_blend);\n");
             }
         } else {
@@ -1147,7 +1155,7 @@ fn emit_vs(out: &mut String, vs: &FfVsKey, entry: &str) {
             if needs_pos_eye {
                 out.push_str("    float3 posEye = float3(dot(pos, vs_c[0]), dot(pos, vs_c[1]), dot(pos, vs_c[2]));\n");
             }
-            if has_n {
+            if needs_normal {
                 // The eye normal is the model normal (a column vector) times
                 // the D3D9 normal matrix: the upper-left 3x3 block of
                 // inverse(WV). For an affine WV that is the inverse of its
