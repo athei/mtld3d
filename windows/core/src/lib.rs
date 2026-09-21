@@ -33,6 +33,7 @@ pub mod fullscreen_resize;
 pub mod gpu_caps;
 pub mod ids;
 pub mod level_authority;
+pub mod library_index;
 pub mod multisample;
 pub mod page_box;
 pub mod page_box_pool;

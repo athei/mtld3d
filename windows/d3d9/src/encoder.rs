@@ -10,7 +10,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use log::{Level, debug, error, log_enabled, trace};
+use log::{Level, debug, error, log_enabled, trace, warn};
 use mtld3d_core::{
     buffer_rename::{BufferMapMode, stage_upload_needs_preserve},
     config::Mtld3dConfig,
@@ -25,6 +25,7 @@ use mtld3d_core::{
     format::map_d3d_format,
     gpu_caps::GpuCaps,
     ids::{BufferId, DepthStencilKey, ProgramId, SamplerKey, TextureId},
+    library_index::{LibraryIndex, LibraryLookup},
     page_box::{PageBox, PageBoxRead},
     passes::{
         ColorClearOutcome, ColorLoad, DepthClearOutcome, DepthLoad, DepthResolve, ExtraColorSlot,
@@ -1201,11 +1202,14 @@ pub struct FrameEncoder {
     /// (a programmable VS compiles one library per count), PS keys fold the
     /// variant in. The Xxh3
     /// `disk_key` is computed only on a miss here, to bridge `lib_cache`
-    /// (warm-load) and address the on-disk cache.
-    ff_vs_libs: FxHashMap<FfVsKey, StageLibHandles>,
-    prog_vs_libs: FxHashMap<(ProgramId, u16, u8, VsSamplerKinds), StageLibHandles>,
-    ff_ps_libs: FxHashMap<FfPsKey, FxHashMap<VariantKey, StageLibHandles>>,
-    prog_ps_libs: FxHashMap<(ProgramId, VariantKey), StageLibHandles>,
+    /// (warm-load) and address the on-disk cache. A key whose cold resolve
+    /// failed is recorded too: the same key yields the same source, so its
+    /// later draws are dropped on the probe instead of compiling again.
+    /// Reset forgets the failures, shutdown forgets everything.
+    ff_vs_libs: LibraryIndex<FfVsKey, StageLibHandles>,
+    prog_vs_libs: LibraryIndex<(ProgramId, u16, u8, VsSamplerKinds), StageLibHandles>,
+    ff_ps_libs: FxHashMap<FfPsKey, LibraryIndex<VariantKey, StageLibHandles>>,
+    prog_ps_libs: LibraryIndex<(ProgramId, VariantKey), StageLibHandles>,
     texture_cache: FxHashMap<TextureId, TextureGpuState>,
     sampler_cache: FxHashMap<SamplerKey, MetalHandle<MTLSamplerStateKind>>,
     /// Per-stage memo of the last sampler resolve, keyed on the raw D3D9 sampler-state words.
@@ -1658,10 +1662,10 @@ impl FrameEncoder {
             prog_sampler_decls: FxHashMap::default(),
             prog_reads_vpos: FxHashSet::default(),
             lib_cache: FxHashMap::default(),
-            ff_vs_libs: FxHashMap::default(),
-            prog_vs_libs: FxHashMap::default(),
+            ff_vs_libs: LibraryIndex::default(),
+            prog_vs_libs: LibraryIndex::default(),
             ff_ps_libs: FxHashMap::default(),
-            prog_ps_libs: FxHashMap::default(),
+            prog_ps_libs: LibraryIndex::default(),
             texture_cache: FxHashMap::default(),
             sampler_cache: FxHashMap::default(),
             sampler_resolve_memo: core::array::from_fn(|_| None),
@@ -5502,35 +5506,43 @@ impl FrameEncoder {
     /// no clone. VS variants share one `MTLLibrary`, so the index key
     /// excludes `variant`. On a miss (≈ once per shader) the cold path
     /// computes the `disk_key`. Returns `None` if no program was registered
-    /// or emit/compile fails.
+    /// or emit/compile fails, and records that outcome under the key, so a
+    /// failure costs one cold resolve and its log lines however often the
+    /// key is drawn. Programs register before the first draw that names
+    /// them and are never removed, so a missing program is as final as a
+    /// rejected one.
     pub fn resolve_vs_library(&mut self, source: &VsSource) -> Option<StageLibHandles> {
-        match source {
-            VsSource::FixedFunction { key, .. } => {
-                if let Some(&handles) = self.ff_vs_libs.get(key) {
-                    return Some(handles);
-                }
-            }
+        let known = match source {
+            VsSource::FixedFunction { key, .. } => self.ff_vs_libs.lookup(key),
             VsSource::Programmable {
                 vs_id,
                 provided_input_mask,
                 clip_plane_count,
                 sampler_kinds,
                 ..
-            } => {
-                if let Some(&handles) = self.prog_vs_libs.get(&(
-                    *vs_id,
-                    *provided_input_mask,
-                    *clip_plane_count,
-                    *sampler_kinds,
-                )) {
-                    return Some(handles);
-                }
-            }
+            } => self.prog_vs_libs.lookup(&(
+                *vs_id,
+                *provided_input_mask,
+                *clip_plane_count,
+                *sampler_kinds,
+            )),
+        };
+        match known {
+            LibraryLookup::Ready(handles) => return Some(handles),
+            LibraryLookup::Failed => return None,
+            LibraryLookup::Unknown => {}
         }
-        let handles = self.resolve_vs_library_cold(source)?;
+        let outcome = self.resolve_vs_library_cold(source);
+        if outcome.is_none() {
+            warn!(
+                target: LOG_TARGET,
+                "encoder: VS library {} failed to build, its draws are dropped without another attempt",
+                shader_source_tag_vs(source)
+            );
+        }
         match source {
             VsSource::FixedFunction { key, .. } => {
-                self.ff_vs_libs.insert(key.clone(), handles);
+                self.ff_vs_libs.record(key.clone(), outcome);
             }
             VsSource::Programmable {
                 vs_id,
@@ -5539,18 +5551,18 @@ impl FrameEncoder {
                 sampler_kinds,
                 ..
             } => {
-                self.prog_vs_libs.insert(
+                self.prog_vs_libs.record(
                     (
                         *vs_id,
                         *provided_input_mask,
                         *clip_plane_count,
                         *sampler_kinds,
                     ),
-                    handles,
+                    outcome,
                 );
             }
         }
-        Some(handles)
+        outcome
     }
 
     /// Cold path of [`resolve_vs_library`] — index miss.
@@ -5715,37 +5727,45 @@ impl FrameEncoder {
     /// `variant`, so the key folds it in — `ff_ps_libs` nests
     /// `FfPsKey → variant → handles` (borrow the `FfPsKey`, no clone),
     /// `prog_ps_libs` uses a `(ProgramId, VariantKey)` `Copy` tuple. On a
-    /// miss the cold path computes the `disk_key`.
+    /// miss the cold path computes the `disk_key`, and its outcome is
+    /// recorded under the key either way, as for the vertex stage.
     pub fn resolve_ps_library(
         &mut self,
         source: &PsSource,
         variant: VariantKey,
     ) -> Option<StageLibHandles> {
-        match source {
-            PsSource::FixedFunction { key, .. } => {
-                if let Some(&handles) = self.ff_ps_libs.get(key).and_then(|m| m.get(&variant)) {
-                    return Some(handles);
-                }
-            }
-            PsSource::Programmable { ps_id, .. } => {
-                if let Some(&handles) = self.prog_ps_libs.get(&(*ps_id, variant)) {
-                    return Some(handles);
-                }
-            }
+        let known = match source {
+            PsSource::FixedFunction { key, .. } => self
+                .ff_ps_libs
+                .get(key)
+                .map_or(LibraryLookup::Unknown, |variants| variants.lookup(&variant)),
+            PsSource::Programmable { ps_id, .. } => self.prog_ps_libs.lookup(&(*ps_id, variant)),
+        };
+        match known {
+            LibraryLookup::Ready(handles) => return Some(handles),
+            LibraryLookup::Failed => return None,
+            LibraryLookup::Unknown => {}
         }
-        let handles = self.resolve_ps_library_cold(source, variant)?;
+        let outcome = self.resolve_ps_library_cold(source, variant);
+        if outcome.is_none() {
+            warn!(
+                target: LOG_TARGET,
+                "encoder: PS library {} failed to build, its draws are dropped without another attempt",
+                shader_source_tag_ps(source, variant)
+            );
+        }
         match source {
             PsSource::FixedFunction { key, .. } => {
                 self.ff_ps_libs
                     .entry(key.clone())
                     .or_default()
-                    .insert(variant, handles);
+                    .record(variant, outcome);
             }
             PsSource::Programmable { ps_id, .. } => {
-                self.prog_ps_libs.insert((*ps_id, variant), handles);
+                self.prog_ps_libs.record((*ps_id, variant), outcome);
             }
         }
-        Some(handles)
+        outcome
     }
 
     /// Cold path of [`resolve_ps_library`] — index miss.
@@ -8603,6 +8623,15 @@ impl FrameEncoder {
         drop(held);
         self.pending_blit_retention.clear();
         self.current_blit_retention.clear();
+        // A failed library build gets one more attempt per Reset: a rejected
+        // source fails again at the cost of one compile, a build the compiler
+        // service dropped goes through.
+        self.ff_vs_libs.forget_failures();
+        self.prog_vs_libs.forget_failures();
+        for variants in self.ff_ps_libs.values_mut() {
+            variants.forget_failures();
+        }
+        self.prog_ps_libs.forget_failures();
         // The implicit surfaces the caller is about to destroy never pass
         // through the retention queue, so this is their only chance to leave
         // the handle-keyed records. The wait above has retired every

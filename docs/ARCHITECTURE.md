@@ -577,6 +577,9 @@ native descriptor preparation, the synchronous Metal PSO build, and recipe
 compression/write. PSO cache persistence has its own nested row. Draw-path
 depth-state misses are separate. Cache hits do not count as creation attempts;
 a source-index miss that finds an already-prewarmed library is still a hit.
+A library build that fails is one attempt and one failure: the source index
+remembers the key, its later draws are dropped on the probe, and a device
+Reset forgets the failures so each key gets one more attempt.
 
 Rows report total duration, ms/frame, peak summed duration on one encoder
 submission, attempts (`calls`), and failures. Successful calls are attempts
