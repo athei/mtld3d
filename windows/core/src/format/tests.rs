@@ -35,6 +35,51 @@ use super::{
     standalone_surface_bytes, surface_bytes, usage_allowed_for_rtype,
 };
 
+/// Every mapped colour format, in `format_name` order.
+///
+/// The usage-query rules below are properties of the whole table rather than
+/// of the formats that once carried a rule of their own, so they are asserted
+/// over all of it.
+const COLOUR_FORMATS: [u32; 37] = [
+    mtld3d_types::D3DFMT_A8R8G8B8,
+    mtld3d_types::D3DFMT_X8R8G8B8,
+    mtld3d_types::D3DFMT_A8B8G8R8,
+    mtld3d_types::D3DFMT_X8B8G8R8,
+    mtld3d_types::D3DFMT_R8G8B8,
+    mtld3d_types::D3DFMT_R5G6B5,
+    mtld3d_types::D3DFMT_A1R5G5B5,
+    mtld3d_types::D3DFMT_X1R5G5B5,
+    mtld3d_types::D3DFMT_A4R4G4B4,
+    mtld3d_types::D3DFMT_A8,
+    mtld3d_types::D3DFMT_A8L8,
+    mtld3d_types::D3DFMT_L8,
+    mtld3d_types::D3DFMT_L16,
+    mtld3d_types::D3DFMT_G16R16,
+    mtld3d_types::D3DFMT_A16B16G16R16,
+    mtld3d_types::D3DFMT_R16F,
+    mtld3d_types::D3DFMT_G16R16F,
+    mtld3d_types::D3DFMT_A16B16G16R16F,
+    mtld3d_types::D3DFMT_R32F,
+    mtld3d_types::D3DFMT_G32R32F,
+    mtld3d_types::D3DFMT_A32B32G32R32F,
+    mtld3d_types::D3DFMT_ATI1,
+    mtld3d_types::D3DFMT_V8U8,
+    mtld3d_types::D3DFMT_A2B10G10R10,
+    mtld3d_types::D3DFMT_A2R10G10B10,
+    mtld3d_types::D3DFMT_V16U16,
+    mtld3d_types::D3DFMT_Q8W8V8U8,
+    mtld3d_types::D3DFMT_Q16W16V16U16,
+    mtld3d_types::D3DFMT_DXT1,
+    mtld3d_types::D3DFMT_DXT2,
+    mtld3d_types::D3DFMT_DXT3,
+    mtld3d_types::D3DFMT_DXT4,
+    mtld3d_types::D3DFMT_DXT5,
+    mtld3d_types::D3DFMT_YUY2,
+    mtld3d_types::D3DFMT_UYVY,
+    mtld3d_types::D3DFMT_YV12,
+    mtld3d_types::D3DFMT_NV12,
+];
+
 #[test]
 fn depth_only_formats_promote_to_depth32float() {
     // Apple Silicon has no Depth24Unorm — D24X8, D32, D16, and the
@@ -569,7 +614,7 @@ fn only_the_single_precision_floats_depend_on_device_filtering() {
                 // Without the filter bit the answer is the same on either
                 // device: renderability and blending are device-independent.
                 assert!(
-                    supports_usage_query(fmt, usage, float32_filtering),
+                    supports_usage_query(fmt, usage, float32_filtering, true),
                     "format {fmt} usage {usage:#x} filtering {float32_filtering}",
                 );
             }
@@ -578,7 +623,12 @@ fn only_the_single_precision_floats_depend_on_device_filtering() {
         for fmt in HALF_FLOATS {
             for usage in PLAIN {
                 assert!(
-                    supports_usage_query(fmt, usage | D3DUSAGE_QUERY_FILTER, float32_filtering),
+                    supports_usage_query(
+                        fmt,
+                        usage | D3DUSAGE_QUERY_FILTER,
+                        float32_filtering,
+                        true
+                    ),
                     "format {fmt} usage {usage:#x} filtering {float32_filtering}",
                 );
             }
@@ -588,7 +638,12 @@ fn only_the_single_precision_floats_depend_on_device_filtering() {
         for fmt in SINGLE_FLOATS {
             for usage in PLAIN {
                 assert_eq!(
-                    supports_usage_query(fmt, usage | D3DUSAGE_QUERY_FILTER, float32_filtering),
+                    supports_usage_query(
+                        fmt,
+                        usage | D3DUSAGE_QUERY_FILTER,
+                        float32_filtering,
+                        true
+                    ),
                     float32_filtering,
                     "format {fmt} usage {usage:#x} filtering {float32_filtering}",
                 );
@@ -598,12 +653,14 @@ fn only_the_single_precision_floats_depend_on_device_filtering() {
         assert!(supports_usage_query(
             D3DFMT_A8R8G8B8,
             D3DUSAGE_QUERY_FILTER,
-            float32_filtering
+            float32_filtering,
+            true
         ));
         assert!(supports_usage_query(
             D3DFMT_A16B16G16R16,
             D3DUSAGE_QUERY_FILTER,
-            float32_filtering
+            float32_filtering,
+            true
         ));
     }
 }
@@ -1168,6 +1225,7 @@ fn v16u16_rejects_srgb_write_queries_before_autogen_fallback() {
         assert!(!super::supports_usage_query(
             mtld3d_types::D3DFMT_V16U16,
             D3DUSAGE_QUERY_SRGBWRITE | extra,
+            true,
             true
         ));
     }
@@ -1205,6 +1263,7 @@ fn q8w8v8u8_rejects_srgb_write_queries_before_autogen_fallback() {
         assert!(!super::supports_usage_query(
             mtld3d_types::D3DFMT_Q8W8V8U8,
             D3DUSAGE_QUERY_SRGBWRITE | extra,
+            true,
             true
         ));
     }
@@ -1242,6 +1301,7 @@ fn q16w16v16u16_rejects_srgb_write_queries_before_autogen_fallback() {
         assert!(!super::supports_usage_query(
             mtld3d_types::D3DFMT_Q16W16V16U16,
             D3DUSAGE_QUERY_SRGBWRITE | extra,
+            true,
             true
         ));
     }
@@ -1284,15 +1344,140 @@ fn ten_bit_formats_use_native_packed_storage_without_attachment_support() {
                     assert!(!super::supports_usage_query(
                         format,
                         extra | unsupported,
-                        filtering
+                        filtering,
+                        true
                     ));
                 }
             }
             assert!(super::supports_usage_query(
                 format,
                 D3DUSAGE_QUERY_FILTER,
-                filtering
+                filtering,
+                true
             ));
         }
+    }
+}
+
+/// The sRGB-write query is the render-target answer, for every format.
+///
+/// The encode belongs to the render pass, and every colour attachment takes
+/// it: the pass binds the sRGB twin view where the Metal format has one and
+/// the pixel shader emits the OETF where it has not. So the answer tracks
+/// `is_render_target_format_device` across the whole table and on either
+/// device, with no format carrying a rule of its own, and it does not depend
+/// on the bits the query is combined with.
+#[test]
+fn srgb_write_queries_follow_render_target_capability() {
+    use mtld3d_types::{
+        D3DFMT_A8R8G8B8, D3DFMT_DXT1, D3DFMT_L8, D3DFMT_R5G6B5, D3DFMT_R32F, D3DFMT_V8U8,
+    };
+
+    const COMBINED: [u32; 6] = [
+        0,
+        D3DUSAGE_RENDERTARGET,
+        D3DUSAGE_AUTOGENMIPMAP,
+        D3DUSAGE_QUERY_SRGBREAD,
+        D3DUSAGE_QUERY_FILTER,
+        D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING,
+    ];
+
+    for native_packed16 in [false, true] {
+        for format in COLOUR_FORMATS {
+            let renderable = super::is_render_target_format_device(format, native_packed16);
+            for extra in COMBINED {
+                assert_eq!(
+                    super::supports_usage_query(
+                        format,
+                        D3DUSAGE_QUERY_SRGBWRITE | extra,
+                        true,
+                        native_packed16
+                    ),
+                    renderable,
+                    "format {format} extra {extra:#x} packed16 {native_packed16}"
+                );
+            }
+        }
+        // The two ends of the rule, named: a colour attachment answers yes
+        // whether or not its Metal format has an sRGB twin, and a sampled
+        // format answers no whether or not it has one.
+        for format in [D3DFMT_A8R8G8B8, D3DFMT_R32F] {
+            assert!(super::supports_usage_query(
+                format,
+                D3DUSAGE_QUERY_SRGBWRITE,
+                true,
+                native_packed16
+            ));
+        }
+        for format in [D3DFMT_DXT1, D3DFMT_L8, D3DFMT_V8U8] {
+            assert!(!super::supports_usage_query(
+                format,
+                D3DUSAGE_QUERY_SRGBWRITE,
+                true,
+                native_packed16
+            ));
+        }
+    }
+    // A device that widens the packed 16-bit formats renders into neither,
+    // so the encode goes with the render target.
+    assert!(super::supports_usage_query(
+        D3DFMT_R5G6B5,
+        D3DUSAGE_QUERY_SRGBWRITE,
+        true,
+        true
+    ));
+    assert!(!super::supports_usage_query(
+        D3DFMT_R5G6B5,
+        D3DUSAGE_QUERY_SRGBWRITE,
+        true,
+        false
+    ));
+}
+
+/// No format answers the legacy bump-map query.
+///
+/// `D3DCAPS9::TextureOpCaps` advertises neither `BUMPENVMAP` nor
+/// `BUMPENVMAPLUMINANCE`, so the operations the query asks about do not
+/// exist, and that holds for the signed formats hardware of the era
+/// advertised as well as for every other one.
+#[test]
+fn legacy_bump_map_queries_answer_no_for_every_format() {
+    use mtld3d_types::{D3DFMT_Q8W8V8U8, D3DFMT_V8U8, D3DFMT_V16U16};
+
+    const COMBINED: [u32; 6] = [
+        0,
+        D3DUSAGE_DYNAMIC,
+        D3DUSAGE_AUTOGENMIPMAP,
+        D3DUSAGE_QUERY_FILTER,
+        D3DUSAGE_QUERY_SRGBREAD,
+        D3DUSAGE_QUERY_WRAPANDMIP,
+    ];
+
+    for float32_filtering in [false, true] {
+        for native_packed16 in [false, true] {
+            for format in COLOUR_FORMATS {
+                for extra in COMBINED {
+                    assert!(
+                        !super::supports_usage_query(
+                            format,
+                            D3DUSAGE_QUERY_LEGACYBUMPMAP | extra,
+                            float32_filtering,
+                            native_packed16
+                        ),
+                        "format {format} extra {extra:#x}"
+                    );
+                }
+            }
+        }
+    }
+    // The signed formats the legacy fixed-function path used are no
+    // exception while the operations are absent.
+    for format in [D3DFMT_V8U8, D3DFMT_V16U16, D3DFMT_Q8W8V8U8] {
+        assert!(!super::supports_usage_query(
+            format,
+            D3DUSAGE_QUERY_LEGACYBUMPMAP,
+            true,
+            true
+        ));
     }
 }

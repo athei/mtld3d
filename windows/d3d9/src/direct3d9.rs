@@ -453,15 +453,16 @@ pub const fn depth_format_has_stencil(fmt: u32) -> bool {
 // D3D9 colour formats whose Metal counterpart has an sRGB twin. Mirror of
 // the PE-side `PixelFormat::srgb_twin()` table in `unix/shared/src/mtl.rs`
 // — drives the answer `CheckDeviceFormat` returns for
-// `D3DUSAGE_QUERY_SRGBREAD` / `D3DUSAGE_QUERY_SRGBWRITE`. Adding a new
-// linear/sRGB pair to `PixelFormat` requires extending this list too.
+// `D3DUSAGE_QUERY_SRGBREAD`. Adding a new linear/sRGB pair to `PixelFormat`
+// requires extending this list too. The write side is not this question: a
+// colour target without a twin encodes through the pixel shader's OETF
+// variant instead, so `D3DUSAGE_QUERY_SRGBWRITE` follows render-target
+// capability (`mtld3d_core::format::supports_usage_query`).
 //
 // `R8G8B8` belongs here even though it is widened on upload: its backing is
 // `Bgra8Unorm` on every device, so the eager twin view exists and the decode
 // is real. The packed 16-bit formats stay out because their backing is
-// device-dependent and this predicate is pure; the SRGBWRITE arm is gated on
-// `is_render_target_format_on_device` regardless, which none of the widened
-// formats pass.
+// device-dependent and this predicate is pure.
 //
 // The list follows the Metal format, not the D3D9 name: DXT2 and DXT4 are the
 // BC2 and BC3 block encodings of DXT3 and DXT5 under another content
@@ -1005,15 +1006,18 @@ extern "system" fn d3d9_check_device_format(
     {
         return D3DERR_NOTAVAILABLE;
     }
-    // D3DUSAGE_QUERY_FILTER asks whether the format samples with linear
-    // filtering, which is a per-format device answer rather than the
-    // device-wide `D3DPTFILTERCAPS` bits `GetDeviceCaps` reports. Only the
-    // single-precision float family depends on the device; every other
-    // advertised format filters on both GPU families.
+    // The per-format device answers: D3DUSAGE_QUERY_FILTER (whether the
+    // format samples with linear filtering, a per-format device answer
+    // rather than the device-wide `D3DPTFILTERCAPS` bits `GetDeviceCaps`
+    // reports, and only the single-precision float family depends on the
+    // device), D3DUSAGE_QUERY_SRGBWRITE (the render-target answer, the
+    // encode being a property of the pass) and D3DUSAGE_QUERY_LEGACYBUMPMAP
+    // (no bump-environment operation is advertised).
     if !mtld3d_core::format::supports_usage_query(
         check_format,
         usage,
         float32_filtering_supported(cfg.deny_float32_filtering),
+        native_packed16_supported(cfg.expand_packed16),
     ) {
         return D3DERR_NOTAVAILABLE;
     }
@@ -1025,7 +1029,6 @@ extern "system" fn d3d9_check_device_format(
             false
         } else if usage & D3DUSAGE_RENDERTARGET != 0 {
             is_render_target_format_on_device(check_format, cfg.expand_packed16)
-                && (usage & D3DUSAGE_QUERY_SRGBWRITE == 0 || has_srgb_twin(check_format))
         } else if usage & D3DUSAGE_QUERY_SRGBREAD != 0 && !has_srgb_read_decode(check_format) {
             false
         } else {
@@ -1034,23 +1037,11 @@ extern "system" fn d3d9_check_device_format(
     } else if usage & D3DUSAGE_DEPTHSTENCIL != 0 {
         is_depth_stencil_format(check_format)
     } else if usage & D3DUSAGE_RENDERTARGET != 0 {
-        // SRGBWRITE is only meaningful for render-targetable colour
-        // formats. Restrict to formats whose Metal twin has an sRGB
-        // pair, otherwise the caller is asking "can I write linear
-        // through an sRGB-encoded RT view?" which we can't honour.
-        if usage & D3DUSAGE_QUERY_SRGBWRITE != 0 && !has_srgb_twin(check_format) {
-            false
-        } else {
-            is_render_target_format_on_device(check_format, cfg.expand_packed16)
-        }
+        is_render_target_format_on_device(check_format, cfg.expand_packed16)
     } else if matches!(rtype, D3DRTYPE_VOLUME | D3DRTYPE_VOLUMETEXTURE) {
-        // A DXT volume is sampled only, so it has no sRGB write. Its sRGB
-        // read is the twin view BC1, BC2 and BC3 all have, the answer
-        // `has_srgb_read_decode` gives for the five DXT formats.
-        let dxt = mtld3d_core::format::is_dxt_format(check_format);
-        if (dxt && usage & D3DUSAGE_QUERY_SRGBWRITE != 0)
-            || (usage & D3DUSAGE_QUERY_SRGBREAD != 0 && !has_srgb_read_decode(check_format))
-        {
+        // A volume's sRGB read is the twin view BC1, BC2 and BC3 all have,
+        // the answer `has_srgb_read_decode` gives for the five DXT formats.
+        if usage & D3DUSAGE_QUERY_SRGBREAD != 0 && !has_srgb_read_decode(check_format) {
             false
         } else {
             mtld3d_core::format::is_volume_texture_format(check_format)

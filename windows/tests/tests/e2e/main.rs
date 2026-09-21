@@ -21,6 +21,7 @@ mod dxt_volume;
 mod dynamic_depth;
 mod expand16;
 mod float_filter;
+mod format_query;
 mod implicit_surface;
 mod mrt;
 mod msaa;
