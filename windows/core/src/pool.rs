@@ -20,6 +20,20 @@ pub const fn is_cpu_only(pool: u32) -> bool {
     matches!(pool, D3DPOOL_SYSTEMMEM | D3DPOOL_SCRATCH)
 }
 
+/// Whether the runtime, not the application, owns the system-memory copy of `pool`.
+///
+/// `D3DPOOL_MANAGED` is the one pool that keeps such a copy: the runtime
+/// uploads it, may drop the device copy whenever it likes, and puts it back
+/// from that system-memory copy on the next use. This is what
+/// `EvictManagedResources` acts on, and why it acts on nothing else. A
+/// `D3DPOOL_DEFAULT` resource has no runtime copy to replay, so its current
+/// pixels can exist on the device alone, and the CPU-only pools have no device
+/// copy to drop in the first place.
+#[must_use]
+pub const fn is_runtime_managed(pool: u32) -> bool {
+    pool == D3DPOOL_MANAGED
+}
+
 /// Whether `usage` asks for something `pool` cannot give a texture.
 ///
 /// `D3DUSAGE_DYNAMIC` says the application rewrites the resource often enough

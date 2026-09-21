@@ -2113,12 +2113,13 @@ impl DeviceInner {
     /// `IDirect3DDevice9::EvictManagedResources` body.
     ///
     /// Walks the live-textures registry, marks every previously-uploaded mip
-    /// dirty (via `texture::evict_mark_dirty`), and pushes one
-    /// `destroy_cached_texture` closure per affected texture. The next
-    /// bind-time `flush_dirty_mips` repopulates fresh `MTLTextures` from the
-    /// still-alive PE-side staging Arc — exactly the spec contract "evict
-    /// from VRAM, runtime re-uploads on next use". Render targets are
-    /// filtered out by `evict_mark_dirty`; their cache entries stay intact.
+    /// of a `D3DPOOL_MANAGED` texture dirty (via `texture::evict_mark_dirty`),
+    /// and pushes one `destroy_cached_texture` closure per affected texture.
+    /// The next bind-time `flush_dirty_mips` repopulates fresh `MTLTextures`
+    /// from the still-alive PE-side staging Arc, which is the spec contract
+    /// "evict from VRAM, runtime re-uploads on next use". A texture of any
+    /// other pool is filtered out by `evict_mark_dirty`, which is where the
+    /// reason lives; its cache entry stays intact.
     pub fn evict_managed_resources(&mut self) {
         let live: Vec<*mut TextureInner> = self
             .live_textures
