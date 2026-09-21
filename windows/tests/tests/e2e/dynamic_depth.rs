@@ -274,9 +274,9 @@ fn sample_zero_words(locked: &LockedRect<'_>) -> Reading {
 ///
 /// A second lock cannot do it: the first `READONLY` lock of a level a RESZ
 /// write claimed reads the texture back and hands authority to the staging,
-/// so the next lock returns that staging and never reaches the GPU. Until the
-/// first lock is released nothing has marked the level dirty either, so a draw
-/// binds the Metal texture as the transfer left it and uploads nothing over it.
+/// so the next lock returns that staging and never reaches the GPU. A
+/// `READONLY` lock publishes nothing, so a draw binds the Metal texture as the
+/// transfer left it and uploads nothing over it.
 ///
 /// Two draws compare a reference depth against the texture's centre on a
 /// single-sampled target cleared to blue, with no depth surface bound, so no
@@ -287,41 +287,9 @@ fn sample_zero_words(locked: &LockedRect<'_>) -> Reading {
 /// or a cleared 1.0 does not. It says nothing about stencil or about any other
 /// texel. Blue in the undrawn right band says the probe's own pass ran.
 fn sampled_gpu_depth(h: &Harness, t: &Texture<'_>) -> Reading {
-    use mtld3d_types::{D3DRS_MULTISAMPLEMASK, D3DRS_STENCILENABLE};
     const BLUE: u32 = 0xff00_00ff;
     const WHITE: u32 = 0xffff_ffff;
-    let back = h.render_target(0);
-    let depth = h.depth_stencil_surface().expect("the device's depth");
-    let probe = h.create_render_target(16, 16, D3DFMT_A8R8G8B8);
-    assert_eq!(h.set_render_target(0, &probe), 0);
-    setup_sample(h);
-    assert_eq!(h.set_render_state(D3DRS_STENCILENABLE, 0), 0);
-    assert_eq!(h.set_render_state(D3DRS_MULTISAMPLEMASK, u32::MAX), 0);
-    assert_eq!(h.set_texture(0, t), 0);
-    assert_eq!(h.clear_target(BLUE), 0);
-    for (left, right, reference) in [(-1.0, -0.25, 0.375), (-0.25, 0.5, 0.625)] {
-        let v = |x, y| VolumeVertex {
-            x,
-            y,
-            z: 0.5,
-            color: WHITE,
-            u: 0.5,
-            v: 0.5,
-            w: reference,
-        };
-        let band = [
-            v(left, 1.0),
-            v(right, 1.0),
-            v(left, -1.0),
-            v(right, 1.0),
-            v(right, -1.0),
-            v(left, -1.0),
-        ];
-        assert_eq!(h.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &band), 0);
-    }
-    let bands = [2, 9, 14].map(|x| h.read_pixel(x, 8));
-    assert_eq!(h.set_render_target(0, &back), 0);
-    assert_eq!(h.set_depth_stencil_surface(&depth), 0);
+    let bands = compared_bands(h, t, &[0.375, 0.625]);
     Reading::described(
         format!(
             "the GPU copy sampled against 0.375, against 0.625, and the undrawn band: {bands:08x?} \
@@ -330,6 +298,59 @@ fn sampled_gpu_depth(h: &Harness, t: &Texture<'_>) -> Reading {
         ),
         bands == [WHITE, 0, BLUE],
     )
+}
+
+/// Comparison-sample the centre of `t`'s level 0 against each reference, one band each.
+///
+/// The bands split the left three quarters of a single-sampled 16x16 target
+/// cleared to blue, drawn with no depth surface bound. A band is white where
+/// its reference is at most the stored depth and transparent black where it is
+/// more. Returns one pixel per band in order, then one from the undrawn right
+/// quarter, which stays blue when the probe's own pass ran. The render target
+/// and depth surface bound on entry are bound again on return.
+fn compared_bands(h: &Harness, t: &Texture<'_>, references: &[f32]) -> Vec<u32> {
+    use mtld3d_types::{D3DRS_MULTISAMPLEMASK, D3DRS_STENCILENABLE};
+    let back = h.render_target(0);
+    let depth = h.depth_stencil_surface();
+    let probe = h.create_render_target(16, 16, D3DFMT_A8R8G8B8);
+    assert_eq!(h.set_render_target(0, &probe), 0);
+    setup_sample(h);
+    assert_eq!(h.set_render_state(D3DRS_STENCILENABLE, 0), 0);
+    assert_eq!(h.set_render_state(D3DRS_MULTISAMPLEMASK, u32::MAX), 0);
+    assert_eq!(h.set_texture(0, t), 0);
+    assert_eq!(h.clear_target(0xff00_00ff), 0);
+    let count = u8::try_from(references.len()).expect("a handful of bands");
+    let edge = |band: u8| -1.0 + 1.5 * f32::from(band) / f32::from(count);
+    let mut columns = Vec::new();
+    for (band, &reference) in (0..count).zip(references) {
+        let (left, right) = (edge(band), edge(band + 1));
+        let v = |x, y| VolumeVertex {
+            x,
+            y,
+            z: 0.5,
+            color: 0xffff_ffff,
+            u: 0.5,
+            v: 0.5,
+            w: reference,
+        };
+        let quad = [
+            v(left, 1.0),
+            v(right, 1.0),
+            v(left, -1.0),
+            v(right, 1.0),
+            v(right, -1.0),
+            v(left, -1.0),
+        ];
+        assert_eq!(h.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad), 0);
+        columns.push((24 * u32::from(band) + 12) / (2 * u32::from(count)));
+    }
+    columns.push(14);
+    let bands = columns.into_iter().map(|x| h.read_pixel(x, 8)).collect();
+    assert_eq!(h.set_render_target(0, &back), 0);
+    if let Some(depth) = depth {
+        assert_eq!(h.set_depth_stencil_surface(&depth), 0);
+    }
+    bands
 }
 
 #[test]
@@ -567,5 +588,41 @@ fn resz_readback_packs_every_admitted_format() {
                 );
             }
         }
+    }
+}
+
+/// A READONLY lock of a level only the GPU has written publishes nothing.
+///
+/// The Metal texture keeps depth as a float and a D16 lock hands out 16-bit
+/// codes, so an upload of the read-back staging would replace the stored depth
+/// with its nearest code. The transfer writes a depth that lies between two
+/// codes, and the probe compares against a reference between that depth and
+/// the code below it: the band is white while the texture holds what the
+/// transfer wrote, and black once the code has been uploaded over it.
+#[test]
+fn readonly_lock_of_a_resz_written_level_uploads_nothing() {
+    const WHITE: u32 = 0xffff_ffff;
+    const BLUE: u32 = 0xff00_00ff;
+    const STORED: f32 = 32_768.45 / 65_535.0;
+    const BETWEEN: f32 = 32_768.225 / 65_535.0;
+    let h = Harness::new();
+    let target = h.create_render_target(16, 16, D3DFMT_A8R8G8B8);
+    let source = h.create_depth_stencil_surface(16, 16, D3DFMT_D24S8);
+    assert_eq!(h.set_render_target(0, &target), 0);
+    assert_eq!(h.set_depth_stencil_surface(&source), 0);
+    assert_eq!(h.clear(D3DCLEAR_ZBUFFER, 0, STORED, 0), 0);
+    for lock in [false, true] {
+        let t = h.create_texture(16, 16, 1, D3DUSAGE_DYNAMIC, D3DFMT_D16, D3DPOOL_DEFAULT);
+        resolve(&h, &t);
+        if lock {
+            let locked = t.lock_rect(0, D3DLOCK_READONLY);
+            assert_eq!(locked.as_u8(2), [0x00, 0x80], "the read-back's D16 code");
+        }
+        assert_eq!(
+            compared_bands(&h, &t, &[0.375, BETWEEN, 0.625]),
+            [WHITE, WHITE, 0, BLUE],
+            "the transferred depth against 0.375, a value just under it, and 0.625, then the \
+             undrawn band (READONLY lock first: {lock})"
+        );
     }
 }

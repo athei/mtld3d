@@ -313,6 +313,9 @@ depth sample zero. Scaled attachments are resampled on the GPU into the
 logical-sized destination. Readback and packing wait until a preservation
 or READONLY lock needs the GPU-authoritative bytes; a whole DISCARD skips
 that readback and versions any destination still named by pending work.
+The readback counts as the level's initial upload, so a READONLY lock of a
+level only the GPU wrote publishes nothing and the texture keeps the
+transferred depth rather than its packed code.
 
 Both architectures and all local variants pass device.c:13838. Hosted Mac2
 recordings also pass on both architectures; its obsolete pins are removed.
