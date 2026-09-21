@@ -337,6 +337,91 @@ fn the_light_vector_is_declared_only_where_it_is_read() {
 }
 
 #[test]
+fn the_eye_space_position_is_declared_only_where_it_is_read() {
+    // `posEye` has three kinds of reader: the vertex-to-light vector of a
+    // POINT or SPOT light, the local-viewer `V`, which also needs a normal
+    // and specular, and the texgen modes that read camera-space position or
+    // a reflection vector. A key with none of them would declare a local
+    // nothing reads; a key with one that lost the declaration would not
+    // compile, so every combination is swept.
+    for bits in 0u8..16 {
+        let lighting = bits & 1 != 0;
+        let normal = bits & 2 != 0;
+        let specular = bits & 4 != 0;
+        let local_viewer = bits & 8 != 0;
+        // (active, directional, spot) masks: no light, directional, point, spot.
+        for (light_active, directional, spot) in [(0, 0, 0), (1, 1, 0), (1, 0, 0), (1, 0, 1)] {
+            // TCI modes: passthru, CAMERASPACENORMAL, CAMERASPACEPOSITION,
+            // CAMERASPACEREFLECTIONVECTOR, SPHEREMAP.
+            for tci in 0u8..=4 {
+                for blend in [0u8, 1] {
+                    let mut vs = default_vs_key();
+                    vs.flags.set(FfVsFlags::LIGHTING_ENABLED, lighting);
+                    vs.flags.set(FfVsFlags::HAS_NORMAL, normal);
+                    vs.flags.set(FfVsFlags::SPECULAR_ENABLE, specular);
+                    vs.flags.set(FfVsFlags::LOCAL_VIEWER, local_viewer);
+                    vs.light_active_mask = light_active;
+                    vs.light_directional_mask = directional;
+                    vs.light_spot_mask = spot;
+                    vs.tex_coord_count = 1;
+                    vs.input_tex_coord_count = 1;
+                    vs.tci_modes[0] = tci;
+                    vs.vertex_blend_count = blend;
+                    vs.declared_weights_count = blend;
+                    let msl = emit_vs_ff(&vs);
+                    let case = format!(
+                        "lighting={lighting} normal={normal} specular={specular} local_viewer={local_viewer} light={light_active}/{directional}/{spot} tci={tci} blend={blend}\n{msl}"
+                    );
+
+                    // Mode 3 without a vertex normal falls back to passthru,
+                    // which reads no eye-space position; mode 4 reads one
+                    // either way.
+                    let texgen_reads = tci == 2 || tci == 4 || (tci == 3 && normal);
+                    let light_vector_reads = lighting && light_active != 0 && directional == 0;
+                    let local_viewer_reads = lighting && normal && specular && local_viewer;
+                    let reads = texgen_reads || light_vector_reads || local_viewer_reads;
+
+                    assert_eq!(
+                        msl.matches("float3 posEye = ").count(),
+                        usize::from(reads),
+                        "{case}"
+                    );
+                    // Each reader appears exactly under the condition that
+                    // emits it, so a declaration is present wherever one is
+                    // read and the name never occurs undeclared.
+                    assert_eq!(msl.contains(" - posEye;"), light_vector_reads, "{case}");
+                    assert_eq!(
+                        msl.contains("normalize(-posEye)"),
+                        local_viewer_reads,
+                        "{case}"
+                    );
+                    assert_eq!(msl.contains("float4(posEye, 0.0)"), tci == 2, "{case}");
+                    assert_eq!(
+                        msl.contains("normalize(posEye)"),
+                        tci == 4 || (tci == 3 && normal),
+                        "{case}"
+                    );
+                    assert_eq!(msl.contains("posEye"), reads, "{case}");
+                    // The blended path has its own declaration site, and the
+                    // infinite-viewer `V` is the term that must not move with
+                    // the declaration.
+                    assert_eq!(
+                        msl.contains("float3 posEye = pos_view.xyz;"),
+                        reads && blend != 0,
+                        "{case}"
+                    );
+                    assert_eq!(
+                        msl.contains("float3 V = float3(0.0, 0.0, -1.0);"),
+                        lighting && normal && specular && !local_viewer,
+                        "{case}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn fog_mode_4_sources_factor_from_specular_alpha() {
     // fog_mode 4 (vertex+table fog both D3DFOG_NONE) reads the COLOR1/specular
     // alpha as the per-vertex fog factor.
@@ -1160,10 +1245,11 @@ fn tci_cameraspaceposition_reuses_lighting_poseye() {
 fn eye_space_locals_are_declared_once_for_every_lighting_normal_and_tci_mix() {
     // `posEye` and `n` each have two possible declaration sites, the texgen
     // pre-scan and the lighting branch, and the two sites own them under
-    // different conditions: lighting declares `posEye` whenever it is
-    // enabled and `n` only with a vertex normal. A second declaration of
-    // either is a Metal compile error, a missing one an undeclared
-    // identifier, so every combination pins the count of both.
+    // different conditions: lighting declares `posEye` whenever one of its
+    // own terms reads it, which the point light below always does, and `n`
+    // only with a vertex normal. A second declaration of either is a Metal
+    // compile error, a missing one an undeclared identifier, so every
+    // combination pins the count of both.
     for blended in [false, true] {
         for lighting in [false, true] {
             for normal in [false, true] {
@@ -1188,9 +1274,10 @@ fn eye_space_locals_are_declared_once_for_every_lighting_normal_and_tci_mix() {
 
                     let pos_eye_decls = msl.matches("float3 posEye =").count();
                     let normal_decls = msl.matches("float3 n =").count();
-                    // The pre-scan hoists for the texgen mode alone, before it
-                    // knows whether a normal-less stage falls back to passthru.
-                    let wants_pos_eye = lighting || matches!(mode, 2..=4);
+                    // A normal-less CAMERASPACEREFLECTIONVECTOR stage falls
+                    // back to passthru and reads no eye-space position, so
+                    // the pre-scan does not hoist one for it.
+                    let wants_pos_eye = lighting || mode == 2 || mode == 4 || (mode == 3 && normal);
                     let wants_normal = normal && (lighting || matches!(mode, 1 | 3 | 4));
                     assert_eq!(pos_eye_decls, usize::from(wants_pos_eye), "{case}");
                     assert_eq!(normal_decls, usize::from(wants_normal), "{case}");

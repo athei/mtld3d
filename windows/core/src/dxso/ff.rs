@@ -1075,14 +1075,27 @@ fn emit_vs(out: &mut String, vs: &FfVsKey, entry: &str) {
     // TCI pre-scan: if any active stage needs eye-space normal / position
     // but the lighting branch below won't declare them, emit them here. The
     // lighting branch owns the two under different conditions: `posEye`
-    // whenever lighting is enabled (its ambient and emissive terms run
-    // without a normal), `n` only when the vertex also carries a normal.
+    // whenever lighting is enabled and something reads it, `n` only when the
+    // vertex also carries a normal.
     let active = vs.tex_coord_count as usize;
     let need_eye_normal = vs.tci_modes[..active]
         .iter()
         .any(|&m| matches!(m, 1 | 3 | 4));
-    let need_eye_pos = vs.tci_modes[..active].iter().any(|&m| matches!(m, 2..=4));
-    let lighting_declares_pos_eye = vs.lighting_enabled();
+    // Every reader of the eye-space position, stated as the emitter's own
+    // branch structure. Texgen reads it for CAMERASPACEPOSITION and
+    // SPHEREMAP always and for CAMERASPACEREFLECTIONVECTOR only with a
+    // vertex normal, since without one that mode falls back to passthru.
+    // Lighting reads it for the vertex-to-light vector of a POINT or SPOT
+    // slot and for the local-viewer `V`, which the specular block emits only
+    // with a normal. Declared anywhere else it is a local nothing reads,
+    // which Metal's compiler warns about.
+    let texgen_reads_pos_eye = vs.tci_modes[..active]
+        .iter()
+        .any(|&m| m == 2 || m == 4 || (m == 3 && vs.has_normal()));
+    let lit_reads_pos_eye = vs.lighting_enabled()
+        && ((vs.light_active_mask & !vs.light_directional_mask) != 0
+            || (vs.has_normal() && vs.specular_enable() && vs.local_viewer()));
+    let needs_pos_eye = texgen_reads_pos_eye || lit_reads_pos_eye;
     let lighting_declares_normal = vs.lighting_enabled() && vs.has_normal();
     let blended = vs.vertex_blend_count > 0;
     if need_eye_normal && vs.has_normal() && !lighting_declares_normal {
@@ -1092,7 +1105,7 @@ fn emit_vs(out: &mut String, vs: &FfVsKey, entry: &str) {
             out.push_str("    float3 n = normalize(float3(dot(in.v1.xyz, vs_c[0].xyz), dot(in.v1.xyz, vs_c[1].xyz), dot(in.v1.xyz, vs_c[2].xyz)));\n");
         }
     }
-    if need_eye_pos && !lighting_declares_pos_eye {
+    if needs_pos_eye && !vs.lighting_enabled() {
         if blended {
             out.push_str("    float3 posEye = pos_view.xyz;\n");
         } else {
@@ -1120,7 +1133,9 @@ fn emit_vs(out: &mut String, vs: &FfVsKey, entry: &str) {
         if blended {
             // Blended-WV path: `n_blend` and `pos_view` are accumulated in
             // `emit_vertex_blend` from the per-bone palette × view matrices.
-            out.push_str("    float3 posEye = pos_view.xyz;\n");
+            if needs_pos_eye {
+                out.push_str("    float3 posEye = pos_view.xyz;\n");
+            }
             if has_n {
                 out.push_str("    float3 n = normalize(n_blend);\n");
             }
@@ -1129,7 +1144,9 @@ fn emit_vs(out: &mut String, vs: &FfVsKey, entry: &str) {
             // Eye-space position (needs only `pos`) for point-light vectors and
             // specular half-angle. `vs_c[0..2]` hold full rows of transpose(WV)
             // including translation.
-            out.push_str("    float3 posEye = float3(dot(pos, vs_c[0]), dot(pos, vs_c[1]), dot(pos, vs_c[2]));\n");
+            if needs_pos_eye {
+                out.push_str("    float3 posEye = float3(dot(pos, vs_c[0]), dot(pos, vs_c[1]), dot(pos, vs_c[2]));\n");
+            }
             if has_n {
                 // The eye normal is the model normal (a column vector) times
                 // the D3D9 normal matrix: the upper-left 3x3 block of
