@@ -7,7 +7,6 @@
 //! returns before either follow-up is built, so a passing test does no GPU
 //! work it did not do before.
 
-use core::fmt::Debug;
 use std::{thread, time::Duration};
 
 use crate::Harness;
@@ -26,16 +25,7 @@ pub struct Reading {
 }
 
 impl Reading {
-    /// `value` as the panic message shows it, integers in hex, and the test's verdict on it.
-    #[must_use]
-    pub fn new<T: Debug + ?Sized>(value: &T, accepted: bool) -> Self {
-        Self {
-            accepted,
-            shown: format!("{value:08x?}"),
-        }
-    }
-
-    /// A reading whose rendering the test wrote itself.
+    /// What the test read, as the panic message shows it, and the test's verdict on it.
     #[must_use]
     pub const fn described(shown: String, accepted: bool) -> Self {
         Self { accepted, shown }
@@ -76,7 +66,7 @@ pub fn assert_or_reread(
     h: &Harness,
     context: &str,
     expected: &str,
-    first: Reading,
+    first: &Reading,
     plain: impl FnOnce() -> Reading,
     recopy: impl FnOnce() -> Reading,
 ) {

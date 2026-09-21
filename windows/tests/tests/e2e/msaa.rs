@@ -200,7 +200,7 @@ fn resolved_row(
         h,
         context,
         expected,
-        reading(&row),
+        &reading(&row),
         || reading(&surface_row(h, resolve, size)),
         || reading(&copy_and_read()),
     );

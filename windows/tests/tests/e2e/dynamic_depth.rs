@@ -230,7 +230,7 @@ fn multisample_resz_reads_sample_zero_depth_and_stencil() {
         h,
         "RESZ out of a 4x depth surface reads sample zero",
         "0x8000004b (depth 0x800000, stencil 0x4b) at every probe",
-        sample_zero_words(&locked),
+        &sample_zero_words(&locked),
         || sampled_gpu_depth(h, t),
         move || {
             // The level cannot be locked twice, and the write below claims it
