@@ -1595,38 +1595,6 @@ impl DeviceInner {
         self.encoder.mid_frame_submit(frame);
     }
 
-    /// Submit the frame recorded so far ahead of a read of a multisampled pass's output.
-    ///
-    /// Does nothing, and returns `false`, unless
-    /// `GpuCaps::multisample_read_splits_submission` says the device cannot
-    /// be trusted to order such a read after the pass inside one command
-    /// buffer. There the passes recorded so far, the multisampled one and its
-    /// resolve among them, go out as a submission of their own, so the read
-    /// the caller queues next is encoded into the following command buffer.
-    /// Returns whether it submitted; the queued read then waits for that
-    /// submission through `FrameEncoder::wait_for_resolve_retire`.
-    pub fn split_submission_for_multisample_read(&mut self, source_sample_count: u8) -> bool {
-        let split = self
-            .encoder
-            .gpu_caps()
-            .multisample_read_splits_submission(source_sample_count);
-        if split {
-            self.flush_current_frame_blocking();
-        }
-        split
-    }
-
-    /// Sample count of the depth-stencil attachment the next draw would use.
-    ///
-    /// The explicit binding when the application made one, else the implicit
-    /// depth-stencil, which is created at the back buffer's sample count.
-    const fn bound_depth_sample_count(&self) -> u8 {
-        match &self.last_depth_binding {
-            Some((_, _, _, sample_count)) => *sample_count,
-            None => self.backbuffer_sample_count,
-        }
-    }
-
     /// Let the submits in flight copy the present they wait for, ahead of a flush.
     ///
     /// A flush queues behind the encoder, and the encoder may be blocked on a
@@ -7300,8 +7268,6 @@ extern "system" fn device_stretch_rect(
         if dev.frame_dump.active {
             dev.frame_dump_event("StretchRect: full-surface depth copy queued");
         }
-        // A multisampled pair is copied by a blit that reads the attachment.
-        dev.split_submission_for_multisample_read(src_info.sample_count);
         dev.push_op(Box::new(move |enc| {
             emit_stretch_rect_blit(
                 enc,
@@ -7495,9 +7461,6 @@ extern "system" fn device_stretch_rect(
             }
         ));
     }
-    // Either transport reads the single-sample twin a multisampled source
-    // resolves into, from outside the pass that takes the resolve.
-    dev.split_submission_for_multisample_read(src_info.sample_count);
     dev.push_op(Box::new(move |enc| {
         emit_stretch_rect_blit(
             enc,
@@ -7821,11 +7784,10 @@ fn emit_stretch_rect_blit(
     // SAFETY: `src_handle` came from the encoder's texture cache or from a
     // surface's retained handle, both of which are `MTLTexture` handles.
     enc.note_msaa_read(unsafe { MetalHandle::<MTLTextureKind>::new(src_handle) });
-    // A multisampled source is read through its resolve target, or as the
-    // attachment itself for a depth pair, and the submission that last wrote
-    // it must have completed before this copy reads it on a device that does
-    // not order that itself. `device_stretch_rect` ended that submission.
-    if src_info.sample_count > 1 {
+    // A source with a multisampled companion is a resolve target, and a
+    // resolve the last submission stored into it must have completed before
+    // this copy reads it on a device that does not order that itself.
+    if !src_info.msaa.is_null() {
         enc.wait_for_resolve_retire();
     }
     let dst_handle = match &dst_info.kind {
@@ -9865,19 +9827,11 @@ extern "system" fn device_set_render_state(this: *mut c_void, state: u32, value:
             }
             let dynamic_depth = inner.d3d_usage() & D3DUSAGE_DYNAMIC != 0 && tex.is_depth_format();
             if dynamic_depth && dev.depth_stencil_bound() {
-                // The transfer reads the multisampled attachment with blit and
-                // compute encoders, so it leaves the command buffer of the
-                // passes that drew into it on a device that needs that.
-                let split =
-                    dev.split_submission_for_multisample_read(dev.bound_depth_sample_count());
                 let inner = tex.inner_mut();
                 crate::texture::flush_dirty_mips(inner, dev);
                 let info = inner.texture_info();
                 inner.mark_subresource_gpu_authoritative(0, 0);
                 dev.push_op(Box::new(move |enc| {
-                    if split {
-                        enc.wait_for_resolve_retire();
-                    }
                     let dst = enc.get_texture_handle_by_id(id);
                     enc.resolve_dynamic_depth(dst, &info);
                 }));

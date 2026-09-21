@@ -1296,13 +1296,6 @@ fn running_as(child_name: &str) -> bool {
 /// test that reads its own process log reads its device's lines and nobody
 /// else's. Panics with the child's standard error when the child fails.
 fn run_in_private_log_child(child_name: &str, test: &str) {
-    // The workloads consume unix-side info records even when the suite
-    // disables them.
-    run_in_private_log_child_filtered(child_name, test, "warn,mtld3d::unix=info");
-}
-
-/// [`run_in_private_log_child`] with the log filter the workload's records need.
-fn run_in_private_log_child_filtered(child_name: &str, test: &str, filter: &str) {
     let exe = std::env::current_exe().expect("resolve test executable");
     let _factory = Harness::factory_only();
     let stamp = std::time::SystemTime::now()
@@ -1319,8 +1312,10 @@ fn run_in_private_log_child_filtered(child_name: &str, test: &str, filter: &str)
     std::fs::copy(&exe, &child).expect("copy the workload executable");
     let mut command = std::process::Command::new(&child);
     command.args(["--exact", test, "--nocapture"]);
-    // Wine inherits its Unix environment separately from the PE child's: its
-    // promotion prefix sets the native filter too.
+    // The workloads consume unix-side info records even when the suite
+    // disables them. Wine inherits its Unix environment separately from the
+    // PE child's: its promotion prefix sets the native filter too.
+    let filter = "warn,mtld3d::unix=info";
     command.envs([("RUST_LOG", filter), ("__CX_UNIX_RUST_LOG", filter)]);
     // A run that collects its logs from one directory (`LOG_DIR`, which every
     // CI leg sets) carries `log.dir` in the suite-wide configuration, and a
@@ -1496,175 +1491,6 @@ fn await_logged_lines(needle: &str, expected: usize) -> Vec<String> {
         );
         std::thread::sleep(Duration::from_millis(20));
     }
-}
-
-/// The name the workload child of the multisample read test below runs under.
-const MULTISAMPLE_READ_CHILD_NAME: &str = "multisample-read.exe";
-
-#[test]
-fn a_multisample_read_leaves_its_pass_submission_only_where_the_device_needs_it() {
-    if running_as(MULTISAMPLE_READ_CHILD_NAME) {
-        multisample_read_workload();
-        return;
-    }
-    // Which command buffer took which encoder is read out of the layer's
-    // command records, which the suite's filter leaves off, and the records
-    // of every device in the suite's process would be in one file. So the
-    // workload runs in a process of its own with the records on.
-    run_in_private_log_child_filtered(
-        MULTISAMPLE_READ_CHILD_NAME,
-        "device::a_multisample_read_leaves_its_pass_submission_only_where_the_device_needs_it",
-        "warn,mtld3d::unix::command=debug",
-    );
-}
-
-/// A `StretchRect` out of a 4x target and a RESZ transfer out of a 4x depth surface, by label.
-///
-/// Each read is queued right behind the multisampled pass it reads, with no
-/// flush between them, and the layer's records say which frame command
-/// buffer took the pass and which took the read. A device that orders the
-/// encoders of one command buffer keeps both in one submission, which is
-/// what a game pays for; the paravirtualized device, which can hand the read
-/// the content from before the pass, gets the pass in a submission of its own
-/// and the read in the very next one. Pixel values are not this test's
-/// subject: the tests that read them carry the re-read report.
-fn multisample_read_workload() {
-    use mtld3d_types::{
-        D3DCLEAR_ZBUFFER, D3DLOCK_READONLY, D3DMULTISAMPLE_4_SAMPLES, D3DRS_POINTSIZE,
-        D3DRS_ZENABLE, D3DTEXF_NONE,
-    };
-    const SIZE: u32 = 64;
-    let h = Harness::create(&HarnessConfig {
-        depth_format: Some(D3DFMT_D24S8),
-        multi_sample_type: D3DMULTISAMPLE_4_SAMPLES,
-        ..HarnessConfig::default()
-    });
-    let splits = h.device_is_paravirtual();
-    let triangle = |z| {
-        let v = |x, y| mtld3d_tests::PosColorVertex {
-            x,
-            y,
-            z,
-            color: 0xffff_ffff,
-        };
-        [v(-1.0, -1.0), v(-1.0, 3.0), v(3.0, -1.0)]
-    };
-    h.select_diffuse_stage(0);
-    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE), D3D_OK);
-    assert_eq!(h.set_render_state(D3DRS_LIGHTING, 0), D3D_OK);
-
-    // The colour shape: the pass that takes the resolve, then the copy out
-    // of the resolve target.
-    let back = h.render_target(0);
-    let target =
-        h.create_render_target_ms((SIZE, SIZE), D3DFMT_A8R8G8B8, (D3DMULTISAMPLE_4_SAMPLES, 0));
-    let resolved = h.create_render_target(SIZE, SIZE, D3DFMT_A8R8G8B8);
-    let sysmem = h.create_offscreen_plain_surface(SIZE, SIZE, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM);
-    let depth = h.depth_stencil_surface();
-    assert_eq!(h.set_render_target(0, &target), D3D_OK);
-    assert_eq!(h.clear_depth_stencil_surface(), D3D_OK);
-    assert_eq!(h.clear_target(0xff00_00ff), D3D_OK);
-    assert_eq!(
-        h.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &triangle(0.5)),
-        D3D_OK
-    );
-    assert_eq!(h.stretch_rect(&target, &resolved, D3DTEXF_NONE), D3D_OK);
-    assert_eq!(h.get_render_target_data_hr(&resolved, &sysmem), D3D_OK);
-    let copies: Vec<_> = await_logged_lines("texture-copy ", 1)
-        .into_iter()
-        .filter(|line| !line.contains("site=depth-transfer/"))
-        .collect();
-    assert_eq!(copies.len(), 1, "one StretchRect copy: {copies:?}");
-    let twin = record_field(&copies[0], "src={texture=");
-    let pass = last_record_before(&copies[0], &format!("resolve={{texture={twin} "));
-    assert_submissions(
-        splits,
-        "the pass that resolves",
-        &pass,
-        "the StretchRect copy",
-        &copies[0],
-    );
-
-    // The depth shape: the pass that writes the multisampled depth surface,
-    // then the transfer that reads it.
-    assert_eq!(h.set_render_target(0, &back), D3D_OK);
-    if let Some(depth) = depth {
-        assert_eq!(h.set_depth_stencil_surface(&depth), D3D_OK);
-    }
-    assert_eq!(h.set_render_state(D3DRS_ZENABLE, 1), D3D_OK);
-    assert_eq!(h.clear(D3DCLEAR_ZBUFFER, 0, 1.0, 0), D3D_OK);
-    assert_eq!(
-        h.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &triangle(0.5)),
-        D3D_OK
-    );
-    let t = h.create_texture(640, 480, 1, D3DUSAGE_DYNAMIC, D3DFMT_D24S8, D3DPOOL_DEFAULT);
-    assert_eq!(h.set_texture(0, &t), D3D_OK);
-    assert_eq!(h.set_render_state(D3DRS_POINTSIZE, 0x7fa0_5000), D3D_OK);
-    drop(t.lock_rect(0, D3DLOCK_READONLY));
-    let transfers = await_logged_lines("site=depth-transfer/0", 1);
-    assert_eq!(transfers.len(), 1, "one RESZ transfer: {transfers:?}");
-    let source = record_field(&transfers[0], "src={texture=");
-    assert!(
-        transfers[0]
-            .split_once(" dst={")
-            .is_some_and(|(source, _)| source.contains(" samples=4 ")),
-        "the transfer reads a 4x source: {}",
-        transfers[0]
-    );
-    let pass = last_record_before(
-        &transfers[0],
-        &format!("depth={{texture={{texture={source} "),
-    );
-    assert_submissions(
-        splits,
-        "the pass that writes the depth surface",
-        &pass,
-        "the RESZ transfer",
-        &transfers[0],
-    );
-}
-
-/// The value that follows `key` in a command record, up to the next space.
-fn record_field(record: &str, key: &str) -> String {
-    let (_, rest) = record
-        .split_once(key)
-        .unwrap_or_else(|| panic!("{key:?} in the record: {record}"));
-    rest.split(' ').next().unwrap_or_default().to_owned()
-}
-
-/// The last `render-pass` record carrying `needle` that the log holds ahead of `reader`.
-fn last_record_before(reader: &str, needle: &str) -> String {
-    let records = logged_lines("");
-    let end = records
-        .iter()
-        .position(|line| line == reader)
-        .expect("the reader's record is in the log");
-    records[..end]
-        .iter()
-        .rev()
-        .find(|line| line.contains("render-pass ") && line.contains(needle))
-        .unwrap_or_else(|| panic!("a render pass with {needle:?} ahead of: {reader}"))
-        .clone()
-}
-
-/// The submit sequence in the `mtld3d-frame-<seq>` label of a record's command buffer.
-fn frame_sequence(record: &str) -> u64 {
-    let label = record_field(record, "label=\"mtld3d-frame-0x");
-    u64::from_str_radix(label.trim_end_matches('"'), 16)
-        .unwrap_or_else(|_| panic!("a frame label on the record's command buffer: {record}"))
-}
-
-/// Pin the reader to its pass's command buffer, or to the very next one where the device splits.
-fn assert_submissions(splits: bool, pass_name: &str, pass: &str, reader_name: &str, reader: &str) {
-    let (written, read) = (frame_sequence(pass), frame_sequence(reader));
-    let expected = if splits { written + 1 } else { written };
-    assert_eq!(
-        read,
-        expected,
-        "{reader_name} is in frame {read:#x} and {pass_name} in frame {written:#x} (the device \
-         {} a submission of its own for the read)\n{pass}\n{reader}",
-        if splits { "needs" } else { "does not need" }
-    );
 }
 
 /// A full-target quad whose texture coordinates address a cube's +X face.

@@ -8768,20 +8768,17 @@ impl FrameEncoder {
         let _ = unix_call(&mut params);
     }
 
-    /// Hold a read of a multisampled pass's output until that pass's command buffer has completed.
+    /// Hold a copy out of a resolve target until the resolving command buffer has completed.
     ///
     /// A no-op unless the device answered `RESOLVE_NEEDS_RETIRE`. There, a
-    /// blit or compute encoder that reads a multisampled attachment or its
-    /// resolve target can see the content it held before the pass, from the
-    /// pass's own command buffer and from a later one alike, so the read
-    /// waits for every command buffer submitted so far. The ops of a frame
-    /// run before that frame is submitted, so the last submitted command
-    /// buffer is the one before `current_submit_seq`; the submit thread is
-    /// drained first so that buffer is committed and registered for the
-    /// wait. The API thread keeps the pass out of the frame being built: it
-    /// submits the frame recorded so far before it queues such a read
-    /// (`split_submission_for_multisample_read`), which is also where that
-    /// submission's last multisampled pass takes its resolve.
+    /// copy that reads a multisample resolve target from a later command
+    /// buffer can see the content the target held before the resolve, so
+    /// the copy waits for every command buffer submitted so far. The ops of
+    /// a frame run before that frame is submitted, so the last submitted
+    /// command buffer is the one before `current_submit_seq`; the submit
+    /// thread is drained first so that buffer is committed and registered
+    /// for the wait. A resolve recorded in the frame being built is ordered
+    /// by the pass list itself, through `note_msaa_read`.
     pub fn wait_for_resolve_retire(&mut self) {
         if !self.gpu_caps.resolve_needs_retire() {
             return;
