@@ -21,9 +21,10 @@ divergences from D3D9 it keeps on purpose. The tested games are in the
 - Every draw call and primitive type, point sprites, user clip planes, all
   sixteen vertex streams, hardware instancing.
 - State blocks, occlusion and event queries.
-- `D3DUSAGE_DYNAMIC` with `D3DPOOL_MANAGED` is rejected with
-  `D3DERR_INVALIDCALL` at 2D, cube and volume texture creation, for every
-  format: the two name different owners of the copy the device reads.
+- `D3DUSAGE_DYNAMIC` with `D3DPOOL_MANAGED` or `D3DPOOL_SCRATCH` is rejected
+  with `D3DERR_INVALIDCALL` at 2D, cube and volume texture creation, for every
+  format: the flag asks to drive the copy the device reads, which the managed
+  pool keeps for the runtime and the scratch pool does not have at all.
 - Signed Q16W16V16U16 textures use native RGBA16Snorm storage for 2D, cube
   and volume resources. All four lanes retain signed 16-bit samples without
   conversion. Render-target and sRGB usages are unavailable, and texture/cube

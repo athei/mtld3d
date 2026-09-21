@@ -4921,8 +4921,8 @@ fn create_texture_path(info: &TextureCreateArgs) -> i32 {
     if mtld3d_core::pool::usage_conflicts_with_pool(usage, pool) {
         mtld3d_shared::log_once_warn_by!(
             target: crate::LOG_TARGET,
-            key: u64::from(format),
-            "reject CreateTexture(format={format}, DYNAMIC, MANAGED) → INVALIDCALL"
+            key: (u64::from(pool) << 32) | u64::from(format),
+            "reject CreateTexture(format={format}, DYNAMIC, pool={pool}) → INVALIDCALL"
         );
         null_out(texture);
         return D3DERR_INVALIDCALL;
@@ -5475,9 +5475,12 @@ extern "system" fn device_create_volume_texture(
         null_out(texture);
         return D3DERR_INVALIDCALL;
     }
-    // D3DUSAGE_DYNAMIC is a DEFAULT/SYSTEMMEM-pool property: the managed pool
-    // and the scratch pool reject it.
-    if usage & D3DUSAGE_DYNAMIC != 0 && matches!(pool, D3DPOOL_MANAGED | D3DPOOL_SCRATCH) {
+    if mtld3d_core::pool::usage_conflicts_with_pool(usage, pool) {
+        mtld3d_shared::log_once_warn_by!(
+            target: crate::LOG_TARGET,
+            key: (u64::from(pool) << 32) | u64::from(format),
+            "reject CreateVolumeTexture(format={format}, DYNAMIC, pool={pool}) → INVALIDCALL"
+        );
         null_out(texture);
         return D3DERR_INVALIDCALL;
     }
@@ -5624,8 +5627,8 @@ extern "system" fn device_create_cube_texture(
     if mtld3d_core::pool::usage_conflicts_with_pool(usage, pool) {
         mtld3d_shared::log_once_warn_by!(
             target: crate::LOG_TARGET,
-            key: u64::from(format),
-            "reject CreateCubeTexture(format={format}, DYNAMIC, MANAGED) → INVALIDCALL"
+            key: (u64::from(pool) << 32) | u64::from(format),
+            "reject CreateCubeTexture(format={format}, DYNAMIC, pool={pool}) → INVALIDCALL"
         );
         null_out(texture);
         return D3DERR_INVALIDCALL;
