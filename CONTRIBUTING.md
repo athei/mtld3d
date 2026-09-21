@@ -58,14 +58,19 @@ plain `make install` still targets the shared trees on purpose, since that is
 how the game gets a build. The clones and the persistent wineserver of the
 private prefix stay behind for the next run; `make clean-isolated` takes down
 the ones in the checkout you are in, and `make clean-isolated-orphans` the ones
-a removed checkout left behind. It finds them three ways: the clones beside the
-checkouts, the record every isolated checkout writes into the directory the
-worktrees share, and any server still running. So neither a removed directory,
-nor a checkout kept somewhere else, nor a reboot that took the servers hides
-one. A directory that is still a checkout is left alone there: its environment
-may be mid-run, and it is that checkout's own `make clean-isolated` to take
-down. A failing run whose log shows a `d3d9.dll v` stamp that is not your
-checkout's is that collision, not a regression.
+a removed checkout left behind. Either one ends the whole Wine session rather
+than its server alone: the service processes a prefix keeps (`services.exe`,
+the two `winedevice.exe`, `plugplay.exe`, `svchost.exe`, `rpcss.exe`) outlive a
+server that is merely signalled, and nothing in their name says which checkout
+they belong to, so what is left over after the server is gone is found by the
+paths it holds open. `clean-isolated-orphans` finds the environments three ways:
+the clones beside the checkouts, the record every isolated checkout writes into
+the directory the worktrees share, and any process still running out of one. So
+neither a removed directory, nor a checkout kept somewhere else, nor a reboot
+that took the servers hides one. A directory that is still a checkout is left
+alone there: its environment may be mid-run, and it is that checkout's own
+`make clean-isolated` to take down. A failing run whose log shows a `d3d9.dll v`
+stamp that is not your checkout's is that collision, not a regression.
 
 Both agent runners configured in this tree already print the conventions digest
 at session start and run `scripts/audit.sh --file` after every edit, so a

@@ -1026,23 +1026,61 @@ clean:
 	cd windows && cargo +$(RUST_STABLE) clean
 	cd unix && cargo +$(RUST_STABLE) clean
 
-# Take down what ISOLATED=1 left under the isolated root $(1): the persistent
-# wineserver of its private prefix (and the winedevice residents it keeps)
-# first, then the clones. The server is ended by a signal rather than through
-# `wineserver -k`: that execs a binary out of the very tree that is about to go
-# and then waits, without a bound, for the server to exit, so a wedged prefix
-# would hold this and every root after it. The signal asks the server for the
-# same shutdown `-k` asks for, and here the wait for it is bounded: five
-# seconds, then SIGKILL. So the clones only go once nothing is running out of
-# them, a root whose SDK clone is already gone is still taken down, and nothing
-# is executed out of a directory that is about to be deleted. A server is
-# recognised by its executable path (`ps -o comm=`, one field however many
-# spaces it holds), never by splitting a command line into words. One logical
-# shell line, so a caller that found a root of its own can run it inside a
-# loop; $(1) arrives unquoted and is quoted here.
+# Take down what ISOLATED=1 left under the isolated root $(1): the Wine session
+# of its private prefix first, then the clones. Three steps, because a session
+# is more than its server. Signalling the server alone leaves the service
+# processes the prefix keeps (services.exe, the two winedevice.exe, plugplay.exe,
+# svchost.exe, rpcss.exe) running, reparented to launchd, with their cwd in a
+# prefix that is about to be deleted and their images mapped out of an SDK clone
+# that is about to go with it.
+#
+# So the session is ended through the root's own `wineserver -k`, which takes
+# the clients down with the server. The prefix is named on the command line
+# rather than inherited, since the caller's WINEPREFIX is its own checkout's and
+# every root this is called for may be another's. `-k` waits for the server to
+# exit without a bound, and it execs a binary out of the tree that is about to
+# go, so it runs in the background and gets five seconds before the helper
+# itself is killed: a wedged prefix holds this root and no other. With no server
+# up it returns at once and boots none.
+#
+# The server is then signalled by pid, which is how a root whose SDK clone is
+# already gone is still taken down, and how one that did not answer `-k` ends:
+# SIGTERM, five seconds, SIGKILL. A server is recognised by its executable path
+# (`ps -o comm=`, one field however many spaces it holds), never by splitting a
+# command line into words.
+#
+# Whatever is left is matched by what it holds open. A service process carries
+# the Windows path `C:\windows\system32\winedevice.exe` as its `comm`, so its
+# name says nothing about which checkout it belongs to, but its cwd is in the
+# prefix and its images are mapped out of the SDK clone, and lsof reports both
+# by path even once the tree is removed. Only a cwd and a mapped image count, so
+# something that merely has a file under the root open is not taken for a member
+# of the session. Each match is SIGTERMed, given five seconds, then SIGKILLed,
+# and it is asked again for the same paths immediately before either signal, so
+# a pid reused in between is left alone.
+#
+# The clones therefore only go once nothing is running out of them, and the one
+# thing executed out of a directory that is about to be deleted is the bounded
+# `-k` above. One logical shell line, so a caller that found a root of its own
+# can run it inside a loop; $(1) arrives unquoted and is quoted here.
 define clean_isolated_at
+iso_root="$(1)" ; \
+holds_isolated() { \
+	lsof -n -P -w -a -p "$$1" -d cwd,txt -F n 2>/dev/null \
+	| awk -v root="$$iso_root/" 'substr($$0, 1, 1) == "n" && substr($$0, 2, length(root)) == root { held = 1 } END { exit !held }' ; \
+} ; \
+if [ -x "$$iso_root/sdk/bin/wineserver" ]; then \
+	WINEPREFIX="$$iso_root/prefix" "$$iso_root/sdk/bin/wineserver" -k >/dev/null 2>&1 & \
+	ender=$$! ; \
+	for i in 1 2 3 4 5 6 7 8 9 10; do \
+		kill -0 $$ender 2>/dev/null || break ; \
+		sleep 0.5 ; \
+	done ; \
+	kill -9 $$ender 2>/dev/null || true ; \
+	wait $$ender 2>/dev/null || true ; \
+fi ; \
 for pid in $$(pgrep -f '/\.wine-isolated/sdk/bin/wineserver'); do \
-	[ "$$(ps -o comm= -p $$pid 2>/dev/null)" = "$(1)/sdk/bin/wineserver" ] || continue ; \
+	[ "$$(ps -o comm= -p $$pid 2>/dev/null)" = "$$iso_root/sdk/bin/wineserver" ] || continue ; \
 	kill $$pid 2>/dev/null || true ; \
 	for i in 1 2 3 4 5 6 7 8 9 10; do \
 		kill -0 $$pid 2>/dev/null || break ; \
@@ -1050,7 +1088,21 @@ for pid in $$(pgrep -f '/\.wine-isolated/sdk/bin/wineserver'); do \
 	done ; \
 	kill -9 $$pid 2>/dev/null || true ; \
 done ; \
-rm -rf "$(1)"
+left=$$(lsof -n -P -w -d cwd,txt -F pn 2>/dev/null \
+	| awk -v root="$$iso_root/" '/^p/ { pid = substr($$0, 2); held = 0; next } held { next } /^n/ { if (substr($$0, 2, length(root)) == root) { print pid; held = 1 } }') ; \
+for pid in $$left; do \
+	holds_isolated $$pid && kill $$pid 2>/dev/null || true ; \
+done ; \
+for i in 1 2 3 4 5 6 7 8 9 10; do \
+	alive="" ; \
+	for pid in $$left; do kill -0 $$pid 2>/dev/null && alive="$$alive $$pid" || true ; done ; \
+	[ -n "$$alive" ] || break ; \
+	sleep 0.5 ; \
+done ; \
+for pid in $$alive; do \
+	holds_isolated $$pid && kill -9 $$pid 2>/dev/null || true ; \
+done ; \
+rm -rf "$$iso_root"
 endef
 
 # The clones and the server of this checkout. Named after the knob rather than
@@ -1075,18 +1127,22 @@ clean-isolated:
 #   - the clones a checkout recorded in `ISOLATED_REGISTRY` when it made them,
 #     which is the only thing that reaches a checkout kept somewhere else, and
 #     is read filtered by what is still on disk;
-#   - the servers by the executable they are running, which is all that is left
-#     to name a checkout whose directory went with the worktree.
+#   - the environments by what a process of one holds open, which is all that is
+#     left to name a checkout whose directory went with the worktree. A server
+#     maps its own executable out of the SDK clone and the service processes it
+#     leaves behind have their cwd in the prefix, so this reaches a session the
+#     server no longer holds together, which asking `ps` for a name cannot: a
+#     service process answers with a Windows path that names no checkout.
 #
 # What is still a checkout is then dropped from all three: a directory that
 # carries its own `.git` that git can still resolve is in use, and its
 # environment is that checkout's own `clean-isolated` to take down, never this
 # sweep's. What is left is shut down through its own SDK clone while the clones
-# are still there, its clones removed, and its server signalled by pid, never by
-# a pattern that could reach a checkout in use. A server is recognised by its
-# executable path alone, so a command line that merely carries one (an editor,
-# this recipe under a shell) is never taken for a server, and a path with a
-# space in it is still one field.
+# are still there, its clones removed, and its processes signalled by pid, never
+# by a pattern that could reach a checkout in use. A process is recognised by a
+# path it holds, never by its command line, so an editor whose command line
+# merely carries one (or this recipe under a shell) is never taken for a member
+# of a session, and a path with a space in it is still one field.
 #
 # The list of roots is fed to the loop on a descriptor of its own with the
 # loop's own input closed, so that nothing a takedown runs can read the roots
@@ -1104,12 +1160,8 @@ clean-isolated-orphans:
 	  [ -f '$(ISOLATED_REGISTRY)' ] && while IFS= read -r recorded; do \
 		[ -d "$$recorded/.wine-isolated" ] && printf '%s\n' "$$recorded" ; \
 	  done < '$(ISOLATED_REGISTRY)' ; \
-	  for pid in $$(pgrep -f '/\.wine-isolated/sdk/bin/wineserver'); do \
-		exe=$$(ps -o comm= -p $$pid 2>/dev/null) ; \
-		case "$$exe" in */.wine-isolated/sdk/bin/wineserver) \
-			printf '%s\n' "$${exe%/.wine-isolated/sdk/bin/wineserver}" ;; \
-		esac ; \
-	  done ; \
+	  lsof -n -P -w -d cwd,txt -F n 2>/dev/null \
+	  | sed -n 's|^n\(/.*\)/\.wine-isolated/.*|\1|p' ; \
 	} | sort -u | while IFS= read -r root <&3; do \
 		{ [ -e "$$root/.git" ] && git -C "$$root" rev-parse --git-dir >/dev/null 2>&1 ; } && continue ; \
 		echo "==> orphan of $$root" ; \
