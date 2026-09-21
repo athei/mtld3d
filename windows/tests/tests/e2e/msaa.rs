@@ -1301,7 +1301,7 @@ fn draw_coverage(h: &Harness, target: &Surface<'_>, color: u32) {
 }
 
 /// Whether `pixel` is white over blue at a fraction of the samples.
-fn is_partial_coverage(pixel: u32) -> bool {
+const fn is_partial_coverage(pixel: u32) -> bool {
     let c = Rgba8::from_pixel(pixel);
     c.r > 16 && c.r < 239 && c.r == c.g && c.b == 255
 }
