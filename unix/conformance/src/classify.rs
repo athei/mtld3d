@@ -16,7 +16,7 @@ pub enum Classification {
     ///
     /// Our pixels/values are correct, so this is not a defect.
     Caps,
-    /// We deliberately do not implement this (e.g. `D3D9Ex`).
+    /// We deliberately do not implement this (e.g. device loss).
     ///
     /// The failure is the documented, by-design outcome.
     Expected,

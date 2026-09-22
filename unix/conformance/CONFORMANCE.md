@@ -420,13 +420,13 @@ hard-to-fix or low-value defect is still `real`):
   `broken()`, which the runner does not honor. If our response to the missing
   capability is itself non-conformant, the site is `real`.
 - **`expected`** — we deliberately do not implement this and intend to keep it
-  that way, for a positive, documented reason: a scope decision (D3D9Ex,
-  device loss, desktop mode switching — see below), a kept perf tradeoff
-  (the TBDR depth-store elision,
-  buffer-rename over stalls), or an accepted platform limitation (Metal's
-  0xffff primitive restart, GPU-defined NaN encodings). "We don't want to fix
-  it" or "the fix is invasive" is not a rationale — without a positive reason
-  to keep the divergence, the site is `real`.
+  that way, for a positive, documented reason: a scope decision (device loss,
+  desktop mode switching, the D3D9-on-D3D12 bridge — see below), a kept perf
+  tradeoff (the TBDR depth-store elision, buffer-rename over stalls), or an
+  accepted platform limitation (Metal's 0xffff primitive restart, GPU-defined
+  NaN encodings). "We don't want to fix it" or "the fix is invasive" is not a
+  rationale — without a positive reason to keep the divergence, the site is
+  `real`.
 - **`flaky`** — environmental/non-deterministic (display config, Retina scale,
   macdrv window-manager timing). Count changes in either direction never gate.
   Tag reactively — only once a flutter actually trips the gate — and pin the
@@ -1288,8 +1288,9 @@ so START_TEST resolves it and proceeds instead of taking the
 `win_skip("Failed to get address of Direct3DCreate9Ex")` that counted as a
 failure under Wine (formerly site 5184, classified expected). Every test then
 fails to create its Ex device and skips, which is not a failure, so the suite
-reports none. D3D9Ex itself remains out of scope; only the entry point
-resolves.
+reports none. D3D9Ex itself is not implemented yet; only the entry point
+resolves. It is wanted once a title needs it, so a site landing here later is
+not `expected`; `docs/STATUS.md` says what an extended device changes.
 
 ### Wide-format offscreen conversion
 

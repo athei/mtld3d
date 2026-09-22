@@ -130,13 +130,27 @@ Each fails cleanly, with an absent cap bit or a documented error return.
 - Scaled, sub-rect or converting depth-to-depth `StretchRect`: only the
   whole-surface 1:1 copy between same-format DEFAULT-pool depth surfaces
   works, multisample resolve included.
+- D3D9Ex: `Direct3DCreate9Ex` resolves and answers `D3DERR_NOTAVAILABLE`, so
+  a runtime probe sees a d3d9 without 9Ex rather than a broken DLL. There is
+  no `IDirect3D9Ex` and no `IDirect3DDevice9Ex`, every create rejects a
+  non-null `pSharedHandle` with `E_NOTIMPL`, and `Caps2` leaves
+  `CANSHARERESOURCE` off. 9Ex is the same device created with an extended
+  flag rather than a separate contract: the flag refuses `D3DPOOL_MANAGED`,
+  changes which pools a caller may lock, reports `WHQLLevel` 1 on the adapter
+  identifier, and puts the extended entry points on the objects that already
+  exist, `CreateDeviceEx`, `PresentEx`, `ResetEx`, `CheckDeviceState`,
+  `GetDisplayModeEx`, `ComposeRects`, the frame-latency pair, the SYSTEMMEM
+  user-memory create that the same `pSharedHandle` parameter carries, and
+  shared resources. It is wanted eventually and waits for a title that needs
+  it: both World of Warcraft targets create a plain device, and nothing else
+  in the tested set asks for 9Ex. Issue #789 is the record of the decision
+  and of what an implementation would cover.
 
 ## Deliberately not implemented
 
-- D3D9Ex: `Direct3DCreate9Ex` resolves and answers `D3DERR_NOTAVAILABLE`, so
-  a runtime probe sees a d3d9 without 9Ex rather than a broken DLL; no
-  `IDirect3D9Ex`, shared handles or D3D9On12. A different contract, built for
-  the Vista compositor.
+- D3D9On12: `Direct3DCreate9On12` is not exported and there is no bridge
+  behind it. It maps a D3D9 device onto a D3D12 device, which has no
+  counterpart here.
 - Physical display-mode switching: the mode is meant to stay virtual, see the
   README's [Fullscreen](../README.md#fullscreen) section.
 - Device loss: no exclusive mode is taken, so nothing is ever lost, and
