@@ -17,8 +17,8 @@ use mtld3d_shared::{
         PrimitiveType, StoreAction, TriangleFillMode, VisibilityResultMode,
     },
     mtl_handle::{
-        MTLBufferKind, MTLCommandQueueKind, MTLDepthStencilStateKind, MTLDeviceKind,
-        MTLRenderPipelineStateKind, MTLSamplerStateKind, MTLTextureKind,
+        MTLBufferKind, MTLDepthStencilStateKind, MTLDeviceKind, MTLRenderPipelineStateKind,
+        MTLSamplerStateKind, MTLTextureKind,
     },
 };
 use objc2::{Message, rc::Retained, runtime::ProtocolObject};
@@ -42,6 +42,7 @@ use crate::{
         null_texture,
         record::DeviceRecord,
         texture::mtl_pixel_format,
+        upscale::UpscaleCache,
     },
 };
 
@@ -511,7 +512,7 @@ fn encode_frame(record: &Arc<DeviceRecord>, params: &mut SubmitFrameParams) -> b
     // pending present reads before this frame's render work can overwrite it.
     super::presenter::resolve_present_conflict(record.present(), &queue, params, packet.is_some());
 
-    super::upscale::retire_evicted(&cmd_buf, queue_handle);
+    super::upscale::retire_evicted(&cmd_buf, record.upscale());
 
     // Register an addCompletedHandler that bumps the PE-side
     // `coherent_seq` atomic when this frame retires on the GPU. The
@@ -704,7 +705,7 @@ pub fn encode_present(
         match route {
             PresentRoute::Upscale => encode_hdr_present_upscaled(
                 cmd_buf,
-                args.record.queue(),
+                args.record.upscale(),
                 args.source,
                 &drawable_texture,
                 current,
@@ -739,7 +740,7 @@ pub fn encode_present(
             PresentRoute::Upscale => {
                 encode_sdr_upscaled(
                     cmd_buf,
-                    args.record.queue(),
+                    args.record.upscale(),
                     args.source,
                     &drawable_texture,
                     gamma_layer,
@@ -1214,7 +1215,7 @@ fn clear_texture(
 /// check precedes scratch allocation so an unsupported GPU allocates none.
 fn encode_hdr_present_upscaled(
     cmd_buf: &ProtocolObject<dyn MTLCommandBuffer>,
-    queue_handle: MetalHandle<MTLCommandQueueKind>,
+    upscale: &UpscaleCache,
     src: &ProtocolObject<dyn MTLTexture>,
     drawable: &ProtocolObject<dyn MTLTexture>,
     peak: f32,
@@ -1222,7 +1223,7 @@ fn encode_hdr_present_upscaled(
 ) -> bool {
     encode_hdr_present_upscaled_with(
         cmd_buf,
-        queue_handle,
+        upscale,
         src,
         drawable,
         peak,
@@ -1231,7 +1232,7 @@ fn encode_hdr_present_upscaled(
             super::upscale::encode(
                 cmd_buf,
                 &cmd_buf.device(),
-                queue_handle,
+                upscale,
                 scratch,
                 drawable,
                 MTLFXSpatialScalerColorProcessingMode::HDR,
@@ -1253,7 +1254,7 @@ fn encode_hdr_present_upscaled(
 /// pixel either way.
 fn encode_sdr_upscaled(
     cmd_buf: &ProtocolObject<dyn MTLCommandBuffer>,
-    queue_handle: MetalHandle<MTLCommandQueueKind>,
+    upscale: &UpscaleCache,
     src: &ProtocolObject<dyn MTLTexture>,
     drawable: &ProtocolObject<dyn MTLTexture>,
     gamma_layer: usize,
@@ -1263,7 +1264,7 @@ fn encode_sdr_upscaled(
         super::upscale::encode(
             cmd_buf,
             &device,
-            queue_handle,
+            upscale,
             source,
             drawable,
             MTLFXSpatialScalerColorProcessingMode::Perceptual,
@@ -1274,13 +1275,9 @@ fn encode_sdr_upscaled(
     }
     let width = u32::try_from(src.width()).unwrap_or(u32::MAX);
     let height = u32::try_from(src.height()).unwrap_or(u32::MAX);
-    let Some(scratch) = super::upscale::scratch_target(
-        &device,
-        queue_handle,
-        width,
-        height,
-        PixelFormat::Bgra8Unorm,
-    ) else {
+    let Some(scratch) =
+        super::upscale::scratch_target(&device, upscale, width, height, PixelFormat::Bgra8Unorm)
+    else {
         return false;
     };
     encode_present_copy(cmd_buf, src, &scratch, gamma_layer) && scale(&scratch)
@@ -1288,12 +1285,12 @@ fn encode_sdr_upscaled(
 
 fn encode_hdr_present_upscaled_with(
     cmd_buf: &ProtocolObject<dyn MTLCommandBuffer>,
-    queue_handle: MetalHandle<MTLCommandQueueKind>,
+    upscale: &UpscaleCache,
     src: &ProtocolObject<dyn MTLTexture>,
     drawable: &ProtocolObject<dyn MTLTexture>,
     peak: f32,
     gamma_layer: usize,
-    upscale: impl FnOnce(&ProtocolObject<dyn MTLTexture>) -> bool,
+    scale: impl FnOnce(&ProtocolObject<dyn MTLTexture>) -> bool,
 ) -> bool {
     let device = cmd_buf.device();
     let width = u32::try_from(src.width()).unwrap_or(u32::MAX);
@@ -1302,20 +1299,14 @@ fn encode_hdr_present_upscaled_with(
     // presenting at the same render size tone-maps and upscales through its
     // own.
     let scratch = if super::upscale::is_available(&device) {
-        super::upscale::scratch_target(
-            &device,
-            queue_handle,
-            width,
-            height,
-            PixelFormat::Rgba16Float,
-        )
+        super::upscale::scratch_target(&device, upscale, width, height, PixelFormat::Rgba16Float)
     } else {
         None
     };
     let Some(scratch) = scratch.filter(|scratch| {
         super::upscale::can_scale(
             &device,
-            queue_handle,
+            upscale,
             scratch,
             drawable,
             MTLFXSpatialScalerColorProcessingMode::HDR,
@@ -1329,7 +1320,7 @@ fn encode_hdr_present_upscaled_with(
         return encode_hdr_present(cmd_buf, src, drawable, peak, gamma_layer);
     };
 
-    (encode_hdr_present(cmd_buf, src, &scratch, peak, gamma_layer) && upscale(&scratch))
+    (encode_hdr_present(cmd_buf, src, &scratch, peak, gamma_layer) && scale(&scratch))
         || encode_hdr_present(cmd_buf, src, drawable, peak, gamma_layer)
 }
 
@@ -3295,11 +3286,15 @@ fn mtl_primitive_type_or_fallback(raw: u32, site: &str) -> MTLPrimitiveType {
 ///
 /// Grouped so the function's argument list stays under the clippy
 /// threshold.
-pub struct BlitArgs {
+pub struct BlitArgs<'a> {
     pub planes: mtld3d_shared::mtl::ReadbackPlanes,
     pub stencil_bytes_per_row: u32,
     pub stencil_offset: u64,
-    pub queue_handle: MetalHandle<MTLCommandQueueKind>,
+    /// The device reading back.
+    ///
+    /// Its queue orders the resolve, and its scratch target is what the
+    /// resolve renders into.
+    pub record: &'a Arc<DeviceRecord>,
     pub device_handle: MetalHandle<MTLDeviceKind>,
     pub tex_handle: MetalHandle<MTLTextureKind>,
     pub dst_ptr: u64,
@@ -3339,7 +3334,7 @@ pub struct BlitArgs {
 /// end of the texture.
 fn resolve_readback_source(
     cmd_buf: &ProtocolObject<dyn MTLCommandBuffer>,
-    queue_handle: MetalHandle<MTLCommandQueueKind>,
+    upscale: &UpscaleCache,
     device: &ProtocolObject<dyn MTLDevice>,
     texture: &ProtocolObject<dyn MTLTexture>,
     (level, slice): (u32, u32),
@@ -3358,7 +3353,7 @@ fn resolve_readback_source(
     }
     let resolved = encode_readback_resolve(
         cmd_buf,
-        queue_handle,
+        upscale,
         device,
         texture,
         (level, slice),
@@ -3399,7 +3394,7 @@ fn resolve_readback_source(
 /// `src` directly.
 fn encode_readback_resolve(
     cmd_buf: &ProtocolObject<dyn MTLCommandBuffer>,
-    queue_handle: MetalHandle<MTLCommandQueueKind>,
+    upscale: &UpscaleCache,
     device: &ProtocolObject<dyn MTLDevice>,
     src: &ProtocolObject<dyn MTLTexture>,
     (level, slice): (u32, u32),
@@ -3426,8 +3421,7 @@ fn encode_readback_resolve(
     // The scratch is this queue's alone. The resolve and the caller's blit
     // are ordered on this queue only, so a shared scratch would let another
     // device's resolve land between them.
-    let Some(target) = super::upscale::scratch_target(device, queue_handle, out_w, out_h, format)
-    else {
+    let Some(target) = super::upscale::scratch_target(device, upscale, out_w, out_h, format) else {
         mtld3d_shared::log_once_warn!(
             target: LOG_TARGET,
             "readback resolve target {out_w}x{out_h} {format:?} could not be created; readback \
@@ -3487,7 +3481,7 @@ fn encode_readback_resolve(
 /// the caller's memory holds the requested pixels. Metal orders this command
 /// buffer after every previously committed buffer on the same `queue_handle`.
 /// A failed readback may have written part of the destination.
-pub fn blit_texture_to_buffer(args: &BlitArgs) -> bool {
+pub fn blit_texture_to_buffer(args: &BlitArgs<'_>) -> bool {
     use core::{ffi::c_void, ptr::NonNull};
 
     let to_usize =
@@ -3496,7 +3490,7 @@ pub fn blit_texture_to_buffer(args: &BlitArgs) -> bool {
         planes,
         stencil_bytes_per_row,
         stencil_offset,
-        queue_handle,
+        record,
         device_handle,
         tex_handle,
         dst_ptr,
@@ -3517,7 +3511,7 @@ pub fn blit_texture_to_buffer(args: &BlitArgs) -> bool {
         error!(target: LOG_TARGET, "blit_texture_to_buffer: invalid args");
         return false;
     }
-    let Some(queue) = queue_handle.into_retained() else {
+    let Some(queue) = record.queue().into_retained() else {
         error!(target: LOG_TARGET, "blit_texture_to_buffer: queue retain failed");
         return false;
     };
@@ -3574,7 +3568,7 @@ pub fn blit_texture_to_buffer(args: &BlitArgs) -> bool {
     // the default scale and this is skipped.
     let source = resolve_readback_source(
         &cmd_buf,
-        queue_handle,
+        record.upscale(),
         &device,
         &texture,
         (mip_level, slice),

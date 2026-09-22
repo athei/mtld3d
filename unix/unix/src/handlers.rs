@@ -794,7 +794,7 @@ pub extern "C" fn blit_texture_to_buffer_handler(args: *mut c_void) -> i32 {
         planes: params.planes,
         stencil_bytes_per_row: params.stencil_bytes_per_row,
         stencil_offset: params.stencil_offset,
-        queue_handle: record.queue(),
+        record: &record,
         device_handle: params.device_handle,
         tex_handle: params.tex_handle,
         dst_ptr: params.dst_ptr,

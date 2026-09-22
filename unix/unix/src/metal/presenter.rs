@@ -125,7 +125,6 @@ pub struct PresentState {
 }
 
 struct Inner {
-    queue: MetalHandle<MTLCommandQueueKind>,
     /// Packets in presentation order; the front is the one being presented.
     pending: VecDeque<PresentPacket>,
     /// Sequence of the last packet the presenter committed or dropped.
@@ -255,11 +254,11 @@ impl PresentState {
         core::ptr::from_ref(&self.present_retired) as u64
     }
 
-    /// Build the presentation state for `queue`.
+    /// Build a device's presentation state, with no thread yet.
     ///
     /// The thread starts separately, once the record that owns this state
     /// exists, since the thread holds a reference to it.
-    pub fn new(queue: MetalHandle<MTLCommandQueueKind>, gate: Option<PathBuf>) -> Self {
+    pub fn new(gate: Option<PathBuf>) -> Self {
         if let Some(path) = &gate {
             log::info!(
                 target: LOG_TARGET,
@@ -269,7 +268,6 @@ impl PresentState {
         }
         Self {
             inner: Mutex::new(Inner {
-                queue,
                 pending: VecDeque::new(),
                 committed_present_seq: 0,
                 presented_seq: 0,
@@ -826,7 +824,7 @@ fn present_frame(record: &Arc<DeviceRecord>, queue: &ProtocolObject<dyn MTLComma
             drawable_wait_ns,
         },
     );
-    super::upscale::retire_evicted(&cb, inner.queue);
+    super::upscale::retire_evicted(&cb, record.upscale());
     let present_ptr = state.present_retired_ptr();
     let owner = Arc::clone(record);
     let handler = RcBlock::new(

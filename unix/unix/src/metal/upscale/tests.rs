@@ -1,21 +1,21 @@
-//! Unit tests for the `MetalFX` scaler cache bound and the per-queue scratch.
+//! Unit tests for the `MetalFX` scaler cache bound and the per-device scratch.
 //!
 //! Scalers are the one Metal object here that is not leaked for the
 //! process: each holds tens of MiB of intermediates, and a window drag
 //! walks through a fresh geometry per size the user rests at. The first
 //! test encodes through four times as many geometries as the cap holds and
-//! pins both halves of the bound, that one queue's live entries never exceed
+//! pins both halves of the bound, that a device's live entries never exceed
 //! `MAX_CACHED_SCALERS`, and that every eviction is released once the
 //! following command buffer retires. It skips when the GPU has no
 //! `MetalFX`.
 //!
-//! Both caches in this module are keyed by the queue, which is the device.
-//! The map-only tests pin that bookkeeping without a Metal object behind the
-//! entries: a bound and an eviction list per queue, and a retire that takes
-//! one queue's entries only. The GPU-backed tests pin that two queues at one
+//! Both caches in this module belong to one device's record. The map-only
+//! tests pin that bookkeeping without a Metal object behind the entries: a
+//! bound and an eviction list per cache, and a retire that empties one cache
+//! and leaves another alone. The GPU-backed tests pin that two devices at one
 //! geometry are served two objects rather than one stateful one.
 
-use mtld3d_shared::{MetalHandle, mtl::PixelFormat, mtl_handle::MTLCommandQueueKind};
+use mtld3d_shared::mtl::PixelFormat;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
     MTLCommandBuffer, MTLCommandQueue, MTLCreateSystemDefaultDevice, MTLDevice, MTLPixelFormat,
@@ -25,35 +25,21 @@ use objc2_metal_fx::{MTLFXSpatialScaler, MTLFXSpatialScalerColorProcessingMode};
 use rustc_hash::FxHashMap;
 
 use super::{
-    MAX_CACHED_SCALERS, ScalerCache, ScalerEntry, ScalerKey, ScalerSlot, ScratchKey,
-    evict_least_recently_used, live_for_queue, take_evicted, take_queue_entries,
-    take_queue_scalers,
+    MAX_CACHED_SCALERS, ScalerCache, ScalerEntry, ScalerKey, ScalerSlot, ScratchKey, UpscaleCache,
+    evict_least_recently_used, take_evicted, take_scalers,
 };
 
-/// A queue's live scaler count, or `None` when the GPU has no `MetalFX` at all.
-fn cached_scaler_count(queue: MetalHandle<MTLCommandQueueKind>) -> Option<usize> {
-    let cache = super::CACHE.get().and_then(Option::as_ref)?;
-    let cache = cache.lock().ok()?;
-    Some(live_for_queue(&cache, queue.raw()))
+/// A cache's live scaler count.
+fn cached_scaler_count(cache: &UpscaleCache) -> Option<usize> {
+    Some(cache.scalers.lock().ok()?.scalers.len())
 }
 
-/// Scalers `queue` has evicted but not yet released.
-fn pending_release_count(queue: MetalHandle<MTLCommandQueueKind>) -> usize {
-    super::CACHE
-        .get()
-        .and_then(Option::as_ref)
-        .and_then(|cache| cache.lock().ok())
-        .and_then(|cache| cache.evicted.get(&queue.raw()).map(Vec::len))
-        .unwrap_or(0)
-}
-
-/// A `MetalHandle` naming a queue this process owns for the test's duration.
-fn queue_handle(
-    queue: &objc2::rc::Retained<ProtocolObject<dyn MTLCommandQueue>>,
-) -> MetalHandle<MTLCommandQueueKind> {
-    // SAFETY: the handle wraps a live queue the caller holds; the cache only
-    // reads the raw address as a key.
-    unsafe { MetalHandle::<MTLCommandQueueKind>::new(objc2::rc::Retained::as_ptr(queue) as u64) }
+/// Scalers a cache has evicted but not yet released.
+fn pending_release_count(cache: &UpscaleCache) -> usize {
+    cache
+        .scalers
+        .lock()
+        .map_or(0, |scalers| scalers.evicted.len())
 }
 
 /// A slot standing for a scaler, never dereferenced and never released.
@@ -64,10 +50,9 @@ fn slot(addr: usize) -> ScalerSlot {
     }
 }
 
-/// A key for `queue` at the geometry `size` names.
-fn scaler_key(queue: u64, size: u32) -> ScalerKey {
+/// A key at the geometry `size` names.
+fn scaler_key(size: u32) -> ScalerKey {
     ScalerKey {
-        queue,
         input_width: size,
         input_height: size,
         output_width: size * 2,
@@ -78,22 +63,22 @@ fn scaler_key(queue: u64, size: u32) -> ScalerKey {
     }
 }
 
-/// The per-queue bound, in the `u32` the geometry helpers count in.
+/// The per-device bound, in the `u32` the geometry helpers count in.
 fn bound() -> u32 {
     u32::try_from(MAX_CACHED_SCALERS).expect("the bound is a small constant")
 }
 
-/// A cache holding `count` entries for `queue`, oldest first.
-fn cache_with(queue: u64, count: u32, first_addr: usize) -> ScalerCache {
+/// A cache holding `count` entries, oldest first.
+fn cache_with(count: u32, first_addr: usize) -> ScalerCache {
     let mut cache = ScalerCache {
         scalers: FxHashMap::default(),
         tick: 0,
-        evicted: FxHashMap::default(),
+        evicted: Vec::new(),
     };
     for step in 0..count {
         cache.tick += 1;
         cache.scalers.insert(
-            scaler_key(queue, 64 + step),
+            scaler_key(64 + step),
             ScalerEntry {
                 slot: slot(first_addr + step as usize),
                 last_used: cache.tick,
@@ -120,7 +105,7 @@ fn walking_through_geometries_bounds_the_cache_and_releases_evictions() {
     let Some(queue) = device.newCommandQueue() else {
         return;
     };
-    let queue_handle = queue_handle(&queue);
+    let cache = UpscaleCache::new();
     let texture = |w: usize, h: usize, usage: MTLTextureUsage| {
         // SAFETY: objc2 typed binding; a class method building a descriptor.
         let desc = unsafe {
@@ -155,7 +140,7 @@ fn walking_through_geometries_bounds_the_cache_and_releases_evictions() {
         if !super::encode(
             &cmd_buf,
             &device,
-            queue_handle,
+            &cache,
             &src,
             &dst,
             MTLFXSpatialScalerColorProcessingMode::Perceptual,
@@ -168,110 +153,101 @@ fn walking_through_geometries_bounds_the_cache_and_releases_evictions() {
         cmd_buf.waitUntilCompleted();
 
         assert!(
-            cached_scaler_count(queue_handle).is_none_or(|live| live <= MAX_CACHED_SCALERS),
+            cached_scaler_count(&cache).is_none_or(|live| live <= MAX_CACHED_SCALERS),
             "cache grew past {MAX_CACHED_SCALERS} at geometry {step}",
         );
     }
 
     assert_eq!(
-        pending_release_count(queue_handle),
+        pending_release_count(&cache),
         0,
         "every eviction must be released by the command buffer that followed it"
     );
     assert_eq!(
-        cached_scaler_count(queue_handle),
+        cached_scaler_count(&cache),
         Some(MAX_CACHED_SCALERS),
         "{geometries} distinct geometries must leave the cache exactly full"
     );
-    super::retire_scalers(queue_handle);
+    super::retire(&cache);
     assert_eq!(
-        cached_scaler_count(queue_handle),
+        cached_scaler_count(&cache),
         Some(0),
-        "retiring the queue releases every scaler it held"
+        "retiring the device releases every scaler it held"
     );
 }
 
-/// The bound, the eviction list and a retire are all per queue.
+/// The bound, the eviction list and a retire all belong to one device.
 ///
-/// One queue at its cap must evict its own least recently used entry and
-/// nothing of the other queue's, park it under its own key, and hand a retire
-/// its live and its evicted slots together. Map bookkeeping only: the slots
-/// stand for scalers and are never dereferenced or released.
+/// A device at its cap must evict its own least recently used entry and park
+/// it in its own list, and a retire must hand back its live and its evicted
+/// slots together while another device's cache keeps everything. Map
+/// bookkeeping only: the slots stand for scalers and are never dereferenced
+/// or released.
 #[test]
-fn the_bound_the_eviction_list_and_a_retire_are_per_queue() {
-    let mut cache = cache_with(1, bound(), 0x1000);
-    for step in 0..bound() {
-        cache.tick += 1;
-        cache.scalers.insert(
-            scaler_key(2, 64 + step),
-            ScalerEntry {
-                slot: slot(0x2000 + step as usize),
-                last_used: cache.tick,
-            },
-        );
-    }
-    assert_eq!(live_for_queue(&cache, 1), MAX_CACHED_SCALERS);
-    assert_eq!(live_for_queue(&cache, 2), MAX_CACHED_SCALERS);
+fn the_bound_the_eviction_list_and_a_retire_are_per_device() {
+    let mut first = cache_with(bound(), 0x1000);
+    let mut second = cache_with(bound(), 0x2000);
+    assert_eq!(first.scalers.len(), MAX_CACHED_SCALERS);
+    assert_eq!(second.scalers.len(), MAX_CACHED_SCALERS);
 
-    evict_least_recently_used(&mut cache, 1);
+    evict_least_recently_used(&mut first);
     assert_eq!(
-        live_for_queue(&cache, 1),
+        first.scalers.len(),
         MAX_CACHED_SCALERS - 1,
-        "the evicting queue loses one entry"
+        "the evicting device loses one entry"
     );
     assert_eq!(
-        live_for_queue(&cache, 2),
+        second.scalers.len(),
         MAX_CACHED_SCALERS,
-        "a queue at its own cap keeps every entry when another evicts"
+        "a device at its own cap keeps every entry when another evicts"
     );
     assert!(
-        !cache.scalers.contains_key(&scaler_key(1, 64)),
-        "the least recently used of the evicting queue is the victim"
+        !first.scalers.contains_key(&scaler_key(64)),
+        "the least recently used entry is the victim"
     );
 
-    let mut evicted = take_evicted(&mut cache, 2);
-    assert!(evicted.is_empty(), "queue 2 evicted nothing");
-    evicted = take_evicted(&mut cache, 1);
+    assert!(
+        take_evicted(&mut second).is_empty(),
+        "the second device evicted nothing"
+    );
+    let evicted = take_evicted(&mut first);
     assert_eq!(
         evicted.iter().map(|slot| slot.scaler).collect::<Vec<_>>(),
         vec![slot(0x1000).scaler],
-        "the eviction waits under the queue whose command buffers order it"
+        "the eviction waits for a command buffer of the device that made it"
     );
 
-    cache.evicted.entry(1).or_default().push(slot(0x1001));
-    let retired = take_queue_scalers(&mut cache, 1);
+    first.evicted.push(slot(0x1001));
+    let retired = take_scalers(&mut first);
     assert_eq!(
         retired.len(),
         MAX_CACHED_SCALERS,
-        "a retire takes the queue's live entries and its pending eviction"
+        "a retire takes the live entries and the pending eviction"
     );
-    assert_eq!(live_for_queue(&cache, 1), 0);
+    assert_eq!(first.scalers.len(), 0);
     assert_eq!(
-        live_for_queue(&cache, 2),
+        second.scalers.len(),
         MAX_CACHED_SCALERS,
-        "the other queue keeps its scalers"
+        "the other device keeps its scalers"
     );
     assert!(
-        take_queue_scalers(&mut cache, 3).is_empty(),
-        "a queue with no entries retires nothing"
+        take_scalers(&mut first).is_empty(),
+        "a cache with no entries retires nothing"
     );
 }
 
-/// Two queues at one geometry are served two scalers, not one shared object.
+/// Two devices at one geometry are served two scalers, not one shared object.
 ///
 /// `MTLFXSpatialScaler` carries its input and output textures as properties
 /// across an encode, so one object shared by two presenting devices lets each
 /// encode with the other's textures set.
 #[test]
-fn two_queues_at_one_geometry_get_their_own_scaler() {
+fn two_devices_at_one_geometry_get_their_own_scaler() {
     let Some(device) = MTLCreateSystemDefaultDevice() else {
         eprintln!("MTLCreateSystemDefaultDevice returned nil, skipping");
         return;
     };
-    let (Some(first), Some(second)) = (device.newCommandQueue(), device.newCommandQueue()) else {
-        return;
-    };
-    let (first_handle, second_handle) = (queue_handle(&first), queue_handle(&second));
+    let (first_cache, second_cache) = (UpscaleCache::new(), UpscaleCache::new());
     let texture = |w: usize, h: usize, usage: MTLTextureUsage| {
         // SAFETY: objc2 typed binding; a class method building a descriptor.
         let desc = unsafe {
@@ -297,20 +273,18 @@ fn two_queues_at_one_geometry_get_their_own_scaler() {
         return;
     };
 
-    let scaler = |queue: MetalHandle<MTLCommandQueueKind>| {
+    let scaler = |cache: &UpscaleCache| {
         let key = super::scaler_key(
-            queue.raw(),
             &src,
             &dst,
             MTLFXSpatialScalerColorProcessingMode::Perceptual,
         )?;
-        let cache = super::CACHE.get().and_then(Option::as_ref)?;
-        let cache = cache.lock().ok()?;
-        cache.scalers.get(&key).map(|entry| entry.slot.scaler)
+        let scalers = cache.scalers.lock().ok()?;
+        scalers.scalers.get(&key).map(|entry| entry.slot.scaler)
     };
     if !super::can_scale(
         &device,
-        first_handle,
+        &first_cache,
         &src,
         &dst,
         MTLFXSpatialScalerColorProcessingMode::Perceptual,
@@ -320,146 +294,152 @@ fn two_queues_at_one_geometry_get_their_own_scaler() {
     }
     assert!(super::can_scale(
         &device,
-        second_handle,
+        &second_cache,
         &src,
         &dst,
         MTLFXSpatialScalerColorProcessingMode::Perceptual,
     ));
 
-    let (Some(first_scaler), Some(second_scaler)) = (scaler(first_handle), scaler(second_handle))
+    let (Some(first_scaler), Some(second_scaler)) = (scaler(&first_cache), scaler(&second_cache))
     else {
-        panic!("both queues must have a cached scaler at this geometry");
+        panic!("both devices must have a cached scaler at this geometry");
     };
     assert_ne!(
         first_scaler, second_scaler,
-        "two queues at one geometry must not share a stateful scaler"
+        "two devices at one geometry must not share a stateful scaler"
     );
     assert_eq!(
-        scaler(first_handle),
+        scaler(&first_cache),
         Some(first_scaler),
-        "the same queue at the same geometry gets its scaler back"
+        "the same device at the same geometry gets its scaler back"
     );
 
-    super::retire_scalers(first_handle);
+    super::retire(&first_cache);
     assert_eq!(
-        scaler(first_handle),
+        scaler(&first_cache),
         None,
-        "the retire takes the first queue's scaler"
+        "the retire takes the first device's scaler"
     );
     assert_eq!(
-        scaler(second_handle),
+        scaler(&second_cache),
         Some(second_scaler),
-        "retiring the first queue leaves the second's scaler in place"
+        "retiring the first device leaves the second's scaler in place"
     );
-    super::retire_scalers(second_handle);
+    super::retire(&second_cache);
 }
 
-/// Live scratch entries keyed by `queue`.
-fn scratch_entries_for(queue: MetalHandle<MTLCommandQueueKind>) -> usize {
-    super::SCRATCH
-        .get()
-        .and_then(|cache| cache.lock().ok())
-        .map_or(0, |scratch| {
-            scratch
-                .keys()
-                .filter(|key| key.queue == queue.raw())
-                .count()
-        })
+/// Live scratch entries in one device's cache.
+fn scratch_entries(cache: &UpscaleCache) -> usize {
+    cache.scratch.lock().map_or(0, |scratch| scratch.len())
 }
 
-/// A key for `queue` at one fixed geometry.
-fn key(queue: u64) -> ScratchKey {
+/// A key at one fixed geometry.
+fn key() -> ScratchKey {
     ScratchKey {
-        queue,
         width: 64,
         height: 64,
         format: PixelFormat::Bgra8Unorm,
     }
 }
 
-/// A retire takes every entry of its queue and nothing of another's.
+/// A retire empties one device's scratch map and leaves another's alone.
 #[test]
-fn a_retire_takes_one_queues_entries_only() {
-    let mut scratch = FxHashMap::default();
-    scratch.insert(key(1), 0x10);
-    scratch.insert(
-        ScratchKey {
-            format: PixelFormat::Rgba16Float,
-            ..key(1)
-        },
-        0x11,
-    );
-    scratch.insert(key(2), 0x20);
+fn a_retire_takes_one_devices_entries_only() {
+    let first = UpscaleCache::new();
+    let second = UpscaleCache::new();
+    {
+        let mut scratch = first.scratch.lock().expect("a fresh cache lock");
+        scratch.insert(key(), 0x10);
+        scratch.insert(
+            ScratchKey {
+                format: PixelFormat::Rgba16Float,
+                ..key()
+            },
+            0x11,
+        );
+    }
+    second
+        .scratch
+        .lock()
+        .expect("a fresh cache lock")
+        .insert(key(), 0x20);
 
-    let mut retired = take_queue_entries(&mut scratch, 1);
+    let mut retired: Vec<u64> = first
+        .scratch
+        .lock()
+        .expect("a fresh cache lock")
+        .drain()
+        .map(|(_, handle)| handle)
+        .collect();
     retired.sort_unstable();
-    assert_eq!(retired, [0x10, 0x11], "both of queue 1's entries go");
-    assert_eq!(scratch.get(&key(2)), Some(&0x20), "queue 2's entry stays");
-    assert!(
-        take_queue_entries(&mut scratch, 3).is_empty(),
-        "a queue with no entries retires nothing"
+    assert_eq!(retired, [0x10, 0x11], "both of the device's entries go");
+    assert_eq!(
+        second
+            .scratch
+            .lock()
+            .expect("a fresh cache lock")
+            .get(&key()),
+        Some(&0x20),
+        "the other device's entry stays"
     );
 }
 
-/// Two queues at one geometry get two textures, and a retire frees one queue's.
+/// Two devices at one geometry get two textures, and a retire frees one device's.
 ///
 /// The readback resolve of two devices at one back-buffer size used to share
-/// a scratch across their queues (#445); a scratch is per queue now, and the
-/// device that goes away takes only its own with it.
+/// a scratch across their queues (#445); a scratch belongs to a device now,
+/// and the device that goes away takes only its own with it.
 #[test]
-fn two_queues_get_their_own_scratch_and_a_retire_takes_only_its_own() {
+fn two_devices_get_their_own_scratch_and_a_retire_takes_only_its_own() {
     let Some(device) = MTLCreateSystemDefaultDevice() else {
         eprintln!("MTLCreateSystemDefaultDevice returned nil — skipping");
         return;
     };
-    let (Some(first), Some(second)) = (device.newCommandQueue(), device.newCommandQueue()) else {
-        return;
-    };
-    let (first_handle, second_handle) = (queue_handle(&first), queue_handle(&second));
-    let scratch = |queue| {
-        super::scratch_target(&device, queue, 64, 64, PixelFormat::Bgra8Unorm)
+    let (first_cache, second_cache) = (UpscaleCache::new(), UpscaleCache::new());
+    let scratch = |cache: &UpscaleCache| {
+        super::scratch_target(&device, cache, 64, 64, PixelFormat::Bgra8Unorm)
             .map(|texture| objc2::rc::Retained::as_ptr(&texture) as usize)
     };
 
-    let Some(first_scratch) = scratch(first_handle) else {
+    let Some(first_scratch) = scratch(&first_cache) else {
         eprintln!("no Private scratch on this device — skipping");
         return;
     };
-    let second_scratch = scratch(second_handle).expect("the second queue gets a scratch");
+    let second_scratch = scratch(&second_cache).expect("the second device gets a scratch");
     assert_ne!(
         first_scratch, second_scratch,
-        "two queues at one geometry must not share a scratch"
+        "two devices at one geometry must not share a scratch"
     );
     assert_eq!(
-        scratch(first_handle),
+        scratch(&first_cache),
         Some(first_scratch),
-        "the same queue at the same geometry gets its scratch back"
+        "the same device at the same geometry gets its scratch back"
     );
 
-    assert_eq!(scratch_entries_for(first_handle), 1);
-    assert_eq!(scratch_entries_for(second_handle), 1);
+    assert_eq!(scratch_entries(&first_cache), 1);
+    assert_eq!(scratch_entries(&second_cache), 1);
 
-    super::retire_scratch(first_handle);
+    super::retire(&first_cache);
     assert_eq!(
-        scratch_entries_for(first_handle),
+        scratch_entries(&first_cache),
         0,
-        "the retire takes the first queue's entry"
+        "the retire takes the first device's entry"
     );
     assert_eq!(
-        scratch(second_handle),
+        scratch(&second_cache),
         Some(second_scratch),
-        "retiring the first queue leaves the second's scratch in place"
+        "retiring the first device leaves the second's scratch in place"
     );
     // The retired texture's address may be handed out again, so what the
     // next request proves is that the entry was minted afresh, not its value.
     assert!(
-        scratch(first_handle).is_some(),
-        "the retired queue's next request mints a fresh scratch"
+        scratch(&first_cache).is_some(),
+        "the retired device's next request mints a fresh scratch"
     );
-    assert_eq!(scratch_entries_for(first_handle), 1);
-    super::retire_scratch(first_handle);
-    super::retire_scratch(second_handle);
-    assert_eq!(scratch_entries_for(second_handle), 0);
+    assert_eq!(scratch_entries(&first_cache), 1);
+    super::retire(&first_cache);
+    super::retire(&second_cache);
+    assert_eq!(scratch_entries(&second_cache), 0);
 }
 
 /// GPU fixtures fail on unexpected allocation errors once `MetalFX` is supported.
@@ -594,16 +574,14 @@ fn pixels(
     pixels
 }
 
-fn output_count(queue: MetalHandle<MTLCommandQueueKind>) -> usize {
-    super::CACHE
-        .get()
-        .and_then(Option::as_ref)
-        .expect("cache")
+fn output_count(cache: &UpscaleCache) -> usize {
+    cache
+        .scalers
         .lock()
         .expect("cache lock")
         .scalers
-        .iter()
-        .filter(|(key, entry)| key.queue == queue.raw() && !entry.slot.output.is_null())
+        .values()
+        .filter(|entry| !entry.slot.output.is_null())
         .count()
 }
 
@@ -613,7 +591,7 @@ fn managed_outputs_match_private_outputs_in_sdr_and_hdr() {
     use objc2_metal::{MTLCommandBufferStatus, MTLResource};
     let Some(device) = gpu() else { return };
     let queue = device.newCommandQueue().expect("queue");
-    let handle = queue_handle(&queue);
+    let cache = UpscaleCache::new();
     for (format, mode, red) in [
         (
             MTLPixelFormat::BGRA8Unorm,
@@ -653,15 +631,15 @@ fn managed_outputs_match_private_outputs_in_sdr_and_hdr() {
             "mtld3d-test-upscale-pair",
         )));
         fill(&cmd, &src, red);
-        assert!(super::encode(&cmd, &device, handle, &src, &direct, mode));
+        assert!(super::encode(&cmd, &device, &cache, &src, &direct, mode));
         assert_eq!(
-            output_count(handle),
+            output_count(&cache),
             0,
             "direct output allocates no intermediate"
         );
-        assert!(super::can_scale(&device, handle, &src, &copied, mode));
-        assert_eq!(output_count(handle), 1);
-        assert!(super::encode(&cmd, &device, handle, &src, &copied, mode));
+        assert!(super::can_scale(&device, &cache, &src, &copied, mode));
+        assert_eq!(output_count(&cache), 1);
+        assert!(super::encode(&cmd, &device, &cache, &src, &copied, mode));
         cmd.commit();
         cmd.waitUntilCompleted();
         assert_eq!(
@@ -688,7 +666,7 @@ fn managed_outputs_match_private_outputs_in_sdr_and_hdr() {
                     .all(|pixel| pixel[2] > 128 && pixel[3] == 255)
             );
         }
-        super::retire_scalers(handle);
+        super::retire(&cache);
     }
 }
 
@@ -711,7 +689,6 @@ fn unknown_usage_is_permissive_and_explicit_usage_must_cover_requirements() {
 fn allocation_scaler_and_copy_failures_remain_recoverable() {
     let Some(device) = gpu() else { return };
     let queue = device.newCommandQueue().expect("queue");
-    let handle = queue_handle(&queue);
     let src = target(
         &device,
         32,
@@ -727,14 +704,15 @@ fn allocation_scaler_and_copy_failures_remain_recoverable() {
         MTLTextureUsage::Unknown,
     );
     let mode = MTLFXSpatialScalerColorProcessingMode::Perceptual;
-    let key = super::scaler_key(handle.raw(), &src, &dst, mode).expect("key");
-    let mut cache = ScalerCache {
+    let key = super::scaler_key(&src, &dst, mode).expect("key");
+    let mut scalers = ScalerCache {
         scalers: FxHashMap::default(),
         tick: 0,
-        evicted: FxHashMap::default(),
+        evicted: Vec::new(),
     };
-    assert!(super::scaler_in_with(&mut cache, &device, key, |_, _| None).is_none());
-    assert!(cache.scalers.is_empty());
+    assert!(super::scaler_in_with(&mut scalers, &device, key, |_, _| None).is_none());
+    assert!(scalers.scalers.is_empty());
+    let cache = UpscaleCache::new();
     let mut slot = super::build_scaler(&device, &key).expect("scaler");
     assert!(
         slot.prepare_with(&device, &src, &dst, |_, _, _| None)
@@ -748,14 +726,14 @@ fn allocation_scaler_and_copy_failures_remain_recoverable() {
     assert!(!super::encode_with(
         &cmd,
         &device,
-        handle,
+        &cache,
         &src,
         &dst,
         mode,
         |_, _, _| false
     ));
     // A later attempt can still encode and cover the full destination.
-    assert!(super::encode(&cmd, &device, handle, &src, &dst, mode));
+    assert!(super::encode(&cmd, &device, &cache, &src, &dst, mode));
     cmd.commit();
     cmd.waitUntilCompleted();
     assert!(
@@ -765,22 +743,23 @@ fn allocation_scaler_and_copy_failures_remain_recoverable() {
             .iter()
             .all(|p| p[2] > 128 && p[3] == 255)
     );
-    super::retire_scalers(handle);
+    super::retire(&cache);
 }
 
-/// Resizing two live queues keeps each output private to its queue and bounded.
+/// Resizing two live devices keeps each output private to its device and bounded.
 #[test]
-fn queued_resizes_bound_outputs_and_preserve_two_queues_pixels() {
+fn queued_resizes_bound_outputs_and_preserve_two_devices_pixels() {
     use objc2_metal::MTLCommandBufferStatus;
     let Some(device) = gpu() else { return };
     let queues = [
         device.newCommandQueue().expect("first queue"),
         device.newCommandQueue().expect("second queue"),
     ];
+    let caches = [UpscaleCache::new(), UpscaleCache::new()];
     let mut submitted = Vec::new();
     for step in 0..(MAX_CACHED_SCALERS + 4) {
         for (index, queue) in queues.iter().enumerate() {
-            let handle = queue_handle(queue);
+            let cache = &caches[index];
             let src = target(
                 &device,
                 16 + step,
@@ -803,14 +782,14 @@ fn queued_resizes_bound_outputs_and_preserve_two_queues_pixels() {
             assert!(super::encode(
                 &cmd,
                 &device,
-                handle,
+                cache,
                 &src,
                 &dst,
                 MTLFXSpatialScalerColorProcessingMode::Perceptual
             ));
             cmd.commit();
             submitted.push((index, cmd, dst));
-            assert!(output_count(handle) <= MAX_CACHED_SCALERS);
+            assert!(output_count(cache) <= MAX_CACHED_SCALERS);
         }
     }
     // No per-frame wait: older encoded resources must survive cache eviction.
@@ -831,15 +810,14 @@ fn queued_resizes_bound_outputs_and_preserve_two_queues_pixels() {
                 .all(|p| (p[2] > 128) == (index == 1) && p[3] == 255)
         );
     }
-    let first = queue_handle(&queues[0]);
-    let second = queue_handle(&queues[1]);
+    let [first, second] = &caches;
     assert_eq!(output_count(first), MAX_CACHED_SCALERS);
     assert_eq!(output_count(second), MAX_CACHED_SCALERS);
-    super::retire_scalers(first);
+    super::retire(first);
     assert_eq!(output_count(first), 0);
     assert_eq!(output_count(second), MAX_CACHED_SCALERS);
-    super::retire_scalers(second);
-    // Reusing a retired queue key must build a fresh cache entry.
+    super::retire(second);
+    // A retired cache must build a fresh entry for its next request.
     let src = target(
         &device,
         32,
@@ -862,7 +840,7 @@ fn queued_resizes_bound_outputs_and_preserve_two_queues_pixels() {
         MTLFXSpatialScalerColorProcessingMode::Perceptual
     ));
     assert_eq!(output_count(first), 1);
-    super::retire_scalers(first);
+    super::retire(first);
 }
 
 /// A preflight eviction must retire even when no subsequent upscale is encoded.
@@ -870,7 +848,7 @@ fn queued_resizes_bound_outputs_and_preserve_two_queues_pixels() {
 fn fallback_submission_drains_preflight_evictions() {
     let Some(device) = gpu() else { return };
     let queue = device.newCommandQueue().expect("queue");
-    let handle = queue_handle(&queue);
+    let cache = UpscaleCache::new();
     for step in 0..=MAX_CACHED_SCALERS {
         let src = target(
             &device,
@@ -888,31 +866,30 @@ fn fallback_submission_drains_preflight_evictions() {
         );
         assert!(super::can_scale(
             &device,
-            handle,
+            &cache,
             &src,
             &dst,
             MTLFXSpatialScalerColorProcessingMode::Perceptual
         ));
     }
-    assert_eq!(pending_release_count(handle), 1);
+    assert_eq!(pending_release_count(&cache), 1);
     let cmd = queue.commandBuffer().expect("fallback command buffer");
     cmd.setLabel(Some(&objc2_foundation::NSString::from_str(
         "mtld3d-test-upscale-fallback",
     )));
-    super::retire_evicted(&cmd, handle);
-    assert_eq!(pending_release_count(handle), 0);
+    super::retire_evicted(&cmd, &cache);
+    assert_eq!(pending_release_count(&cache), 0);
     cmd.commit();
     cmd.waitUntilCompleted();
-    super::retire_scalers(handle);
-    assert_eq!(output_count(handle), 0);
+    super::retire(&cache);
+    assert_eq!(output_count(&cache), 0);
 }
 
 /// Explicitly incompatible output usage requires an intermediate even on Private storage.
 #[test]
 fn usage_requirements_select_an_intermediate_and_reject_invalid_input() {
     let Some(device) = gpu() else { return };
-    let queue = device.newCommandQueue().expect("queue");
-    let handle = queue_handle(&queue);
+    let cache = UpscaleCache::new();
     let src = target(
         &device,
         32,
@@ -928,9 +905,9 @@ fn usage_requirements_select_an_intermediate_and_reject_invalid_input() {
         MTLTextureUsage::ShaderRead,
     );
     let mode = MTLFXSpatialScalerColorProcessingMode::Perceptual;
-    assert!(super::can_scale(&device, handle, &src, &dst, mode));
+    assert!(super::can_scale(&device, &cache, &src, &dst, mode));
     assert_eq!(
-        output_count(handle),
+        output_count(&cache),
         1,
         "a shader-read-only output cannot serve the scaler's writes"
     );
@@ -941,6 +918,6 @@ fn usage_requirements_select_an_intermediate_and_reject_invalid_input() {
         MTLStorageMode::Private,
         MTLTextureUsage::RenderTarget,
     );
-    assert!(!super::can_scale(&device, handle, &invalid, &dst, mode));
-    super::retire_scalers(handle);
+    assert!(!super::can_scale(&device, &cache, &invalid, &dst, mode));
+    super::retire(&cache);
 }

@@ -37,7 +37,6 @@ fn slot(reader: u64) -> Slot {
 
 fn empty_inner() -> Inner {
     Inner {
-        queue: MetalHandle::<MTLCommandQueueKind>::NULL,
         pending: VecDeque::new(),
         committed_present_seq: 0,
         presented_seq: 0,
