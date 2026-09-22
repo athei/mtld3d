@@ -399,6 +399,8 @@ impl Thunk for SetGammaRampParams {
 /// the frame's uploads failed.
 #[repr(C, align(8))]
 pub struct WaitForGpuRetireParams {
+    /// The device whose in-flight command buffers the wait looks through.
+    pub record_handle: DeviceRecordHandle, // in
     pub target_seq: u64,       // in
     pub coherent_seq_ptr: u64, // in: PE-side AtomicU64 backing
     /// Where an aborted command buffer is recorded, mirroring `SubmitFrameParams`.

@@ -2,7 +2,7 @@ use core::ffi::c_void;
 use std::{
     collections::BTreeMap,
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, PoisonError,
         atomic::{AtomicU64, Ordering},
     },
 };
@@ -72,25 +72,44 @@ unsafe impl Send for PendingCmdBuf {}
 // SAFETY: as above.
 unsafe impl Sync for PendingCmdBuf {}
 
-/// Registry of in-flight `MTLCommandBuffer`s keyed by `(device, submit_seq)`.
+/// One device's in-flight `MTLCommandBuffer`s, keyed by `(counter, submit_seq)`.
 ///
-/// The first half of the key is the draw or upload `coherent_seq_ptr`, the
-/// PE-side counter the buffer's completion advances. Draw and upload
-/// counters have distinct addresses, stable across the device's submissions. Every
-/// device mints its own `submit_seq` from one, so without it two live
-/// devices would share a key space, replace each other's entries and wait
-/// on each other's buffers; and the in-order argument behind
-/// `wait_for_gpu_retire` holds only within one queue, which is one device.
+/// Owned by the device's record, because the in-order argument behind
+/// `wait_for_gpu_retire` holds within one queue, which is one device, and
+/// because every device mints its own `submit_seq`: one map for the process
+/// had two live devices replacing each other's entries and waiting on each
+/// other's buffers.
 ///
-/// `submit_frame` inserts before `commit()`; the
-/// `addCompletedHandler` block removes after the GPU retires;
-/// `wait_for_gpu_retire` looks up by range within its device to do a
-/// kernel-blocked wait. The retain held here is what keeps the cmdbuf
-/// addressable after `commit()` returns ownership to Metal — Metal's queue
+/// The counter stays in the key because a device has more than one: the draw
+/// and upload `coherent_seq_ptr`s the PE side owns, and the presenter's own
+/// `present_retired`. Each has a stable address across the device's
+/// submissions and its own sequence of retirements.
+///
+/// `submit_frame` inserts before `commit()`; the `addCompletedHandler` block
+/// removes after the GPU retires; `wait_for_gpu_retire` looks up by range to
+/// do a kernel-blocked wait. The retain held here is what keeps the cmdbuf
+/// addressable after `commit()` returns ownership to Metal: Metal's queue
 /// keeps its own refcount, but we need a stable pointer to call
-/// `waitUntilCompleted` on. The completion handler always removes,
-/// so the map size is bounded by in-flight frames.
-static PENDING_CMDBUFS: Mutex<BTreeMap<(u64, u64), PendingCmdBuf>> = Mutex::new(BTreeMap::new());
+/// `waitUntilCompleted` on. The completion handler always removes, so the map
+/// is bounded by the frames in flight.
+pub struct PendingCmdBufs(Mutex<BTreeMap<(u64, u64), PendingCmdBuf>>);
+
+impl Default for PendingCmdBufs {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PendingCmdBufs {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self(Mutex::new(BTreeMap::new()))
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, BTreeMap<(u64, u64), PendingCmdBuf>> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
 
 /// The entry for the smallest seq at or past `target` on one device.
 ///
@@ -210,7 +229,12 @@ fn register_presented_probe(
 /// right, but recording it as retired and nothing else would hide the
 /// abort from the PE-side upload recovery that the completion handlers
 /// feed. `failed_submit_seq_ptr` gets the same `fetch_max` they do.
-pub fn wait_for_gpu_retire(target_seq: u64, coherent_seq_ptr: u64, failed_submit_seq_ptr: u64) {
+pub fn wait_for_gpu_retire(
+    pending: &PendingCmdBufs,
+    target_seq: u64,
+    coherent_seq_ptr: u64,
+    failed_submit_seq_ptr: u64,
+) {
     if coherent_seq_ptr == 0 || target_seq == 0 {
         return;
     }
@@ -225,7 +249,7 @@ pub fn wait_for_gpu_retire(target_seq: u64, coherent_seq_ptr: u64, failed_submit
         // Lock dropped before `waitUntilCompleted`; the completion
         // handler removes from the same map and would deadlock if we
         // held the lock across the kernel sleep.
-        let map = PENDING_CMDBUFS.lock().unwrap();
+        let map = pending.lock();
         first_pending(&map, coherent_seq_ptr, target_seq).map(|(&(_, seq), cb)| (seq, cb.0.clone()))
     };
     let Some((retired_seq, cmdbuf)) = cmdbuf else {
@@ -339,41 +363,43 @@ impl core::fmt::Display for BlitSite {
 /// against this frame's writes, commits, and hands the presenter what it
 /// needs to show the frame once a drawable is available.
 pub fn submit_frame(record: &Arc<DeviceRecord>, params: &mut SubmitFrameParams) -> bool {
-    submit_frame_with(params, |params| encode_frame(record, params))
+    submit_frame_with(record.pending(), params, |params| {
+        encode_frame(record, params)
+    })
 }
 
 /// Keep CPU encoding failures inside the same retirement boundary as GPU failures.
 fn submit_frame_with(
+    pending: &PendingCmdBufs,
     params: &mut SubmitFrameParams,
     encode: impl FnOnce(&mut SubmitFrameParams) -> bool,
 ) -> bool {
     let success = encode(params);
     if !success {
-        retire_failed_submit(params);
+        retire_failed_submit(pending, params);
     }
     success
 }
 
 /// Retire every committed buffer before publishing a failed CPU submission as finished.
-fn retire_failed_submit(params: &SubmitFrameParams) {
+fn retire_failed_submit(pending: &PendingCmdBufs, params: &SubmitFrameParams) {
     // SubmitFrame is serialized per device. Nothing can insert a later buffer
     // for either counter while this call drains the failed frame's work.
     for counter in [params.coherent_seq_ptr, params.upload_coherent_seq_ptr] {
         loop {
-            let pending = PENDING_CMDBUFS
+            let oldest = pending
                 .lock()
-                .unwrap()
                 .range((counter, 0)..=(counter, params.submit_seq))
                 .next()
                 .map(|(&key, cb)| (key, cb.0.clone()));
-            let Some((key, cb)) = pending else {
+            let Some((key, cb)) = oldest else {
                 break;
             };
             // This waits for completion handlers too, protecting the PE sink
             // atomics as well as the backing pages read by the GPU.
             cb.waitUntilCompleted();
             let _ = record_failed_submit(&cb, key.1, params.failed_submit_seq_ptr, "cpu-cleanup");
-            let _ = PENDING_CMDBUFS.lock().unwrap().remove(&key);
+            let _ = pending.lock().remove(&key);
         }
     }
     // Recovery can inspect failed_seq before retirement and abandon retries.
@@ -452,7 +478,7 @@ fn encode_frame(record: &Arc<DeviceRecord>, params: &mut SubmitFrameParams) -> b
     let draw_pass_start = if params.upload_coherent_seq_ptr != 0 {
         if !blits.is_empty() || upload_pass_count != 0 {
             let Some(cb) =
-                encode_upload_cmd_buf(&queue, blits, &passes[..upload_pass_count], params)
+                encode_upload_cmd_buf(record, &queue, blits, &passes[..upload_pass_count], params)
             else {
                 return false;
             };
@@ -526,6 +552,9 @@ fn encode_frame(record: &Arc<DeviceRecord>, params: &mut SubmitFrameParams) -> b
     // so another device's frame at the same seq is a different entry.
     if params.coherent_seq_ptr != 0 && params.submit_seq > 0 {
         let device = params.coherent_seq_ptr;
+        // The handler outlives this call, so it holds the record whose map
+        // it takes its entry out of.
+        let retiring = Arc::clone(record);
         let atomic_ptr = usize::try_from(device)
             .expect("PE wire pointer fits host address space (unix is 64-bit)");
         let seq = params.submit_seq;
@@ -567,7 +596,7 @@ fn encode_frame(record: &Arc<DeviceRecord>, params: &mut SubmitFrameParams) -> b
                 let atomic = unsafe { &*(atomic_ptr as *const AtomicU64) };
                 atomic.fetch_max(seq, Ordering::Release);
                 mtld3d_shared::crumb!("submit:retire", seq);
-                unregister_pending(device, seq);
+                unregister_pending(retiring.pending(), device, seq);
             },
         );
         // SAFETY: objc2 typed binding; `handler` is kept alive on the stack
@@ -582,13 +611,19 @@ fn encode_frame(record: &Arc<DeviceRecord>, params: &mut SubmitFrameParams) -> b
     if let Some(upload_cb) = upload_cb {
         mtld3d_shared::crumb!("submit:upcommit");
         commit_registered(
+            record.pending(),
             &upload_cb,
             params.upload_coherent_seq_ptr,
             params.submit_seq,
         );
     }
     mtld3d_shared::crumb!("submit:commit");
-    commit_registered(&cmd_buf, params.coherent_seq_ptr, params.submit_seq);
+    commit_registered(
+        record.pending(),
+        &cmd_buf,
+        params.coherent_seq_ptr,
+        params.submit_seq,
+    );
     if let Some(packet) = packet {
         mtld3d_shared::crumb!("submit:push", params.submit_seq);
         params.drawable_wait_ns = super::presenter::push(record.present(), packet);
@@ -804,9 +839,14 @@ pub fn encode_present(
 /// stays uncommitted, which would hang a wait on it. A zero counter or
 /// sequence (a frame stamped before its counters were wired) commits
 /// without registering, as its completion handler was not installed either.
-pub fn commit_registered(cb: &ProtocolObject<dyn MTLCommandBuffer>, counter: u64, seq: u64) {
+pub fn commit_registered(
+    pending: &PendingCmdBufs,
+    cb: &ProtocolObject<dyn MTLCommandBuffer>,
+    counter: u64,
+    seq: u64,
+) {
     if counter != 0 && seq > 0 {
-        register_pending(counter, seq, cb.retain());
+        register_pending(pending, counter, seq, cb.retain());
     }
     cb.commit();
 }
@@ -815,16 +855,18 @@ pub fn commit_registered(cb: &ProtocolObject<dyn MTLCommandBuffer>, counter: u64
 ///
 /// The retain is what keeps the buffer addressable for a wait after
 /// `commit()` hands ownership to Metal.
-fn register_pending(counter: u64, seq: u64, cb: Retained<ProtocolObject<dyn MTLCommandBuffer>>) {
-    PENDING_CMDBUFS
-        .lock()
-        .unwrap()
-        .insert((counter, seq), PendingCmdBuf(cb));
+fn register_pending(
+    pending: &PendingCmdBufs,
+    counter: u64,
+    seq: u64,
+    cb: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
+) {
+    pending.lock().insert((counter, seq), PendingCmdBuf(cb));
 }
 
 /// Take `(counter, seq)` out of the in-flight map, if it is there.
-pub fn unregister_pending(counter: u64, seq: u64) {
-    let _ = PENDING_CMDBUFS.lock().unwrap().remove(&(counter, seq));
+pub fn unregister_pending(pending: &PendingCmdBufs, counter: u64, seq: u64) {
+    let _ = pending.lock().remove(&(counter, seq));
 }
 
 /// Encode the frame-leading (texture-upload) blits into a dedicated command buffer.
@@ -846,6 +888,7 @@ pub fn unregister_pending(counter: u64, seq: u64) {
 /// Render uploads and their interleaved blits share this buffer, so its
 /// retirement covers every staging read. `None` on creation or encoding failure.
 fn encode_upload_cmd_buf(
+    record: &Arc<DeviceRecord>,
     queue: &ProtocolObject<dyn MTLCommandQueue>,
     blits: &[BlitCommand],
     passes: &[PassDescriptor],
@@ -882,6 +925,8 @@ fn encode_upload_cmd_buf(
             .expect("PE wire pointer fits host address space (unix is 64-bit)");
         let seq = submit_seq;
         let failed_seq_ptr = params.failed_submit_seq_ptr;
+        // As the render buffer's handler: the record outlives the block.
+        let retiring = Arc::clone(record);
         let handler = RcBlock::new(
             move |cb_ptr: core::ptr::NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
                 // This buffer carries every upload pass and blit, so an
@@ -916,7 +961,7 @@ fn encode_upload_cmd_buf(
                 let atomic = unsafe { &*(atomic_ptr as *const AtomicU64) };
                 atomic.fetch_max(seq, Ordering::Release);
                 mtld3d_shared::crumb!("submit:upretire", seq);
-                unregister_pending(upload_coherent_seq_ptr, seq);
+                unregister_pending(retiring.pending(), upload_coherent_seq_ptr, seq);
             },
         );
         // SAFETY: objc2 typed binding; Metal copies the block on
