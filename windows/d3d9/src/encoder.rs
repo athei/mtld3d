@@ -5175,7 +5175,17 @@ impl FrameEncoder {
     /// `apply_ff_vs_const_range` invalidates the cache so the next draw
     /// gets fresh bytes. **Never** returns a pointer into the mirror
     /// itself; always bumps to scratch.
+    ///
+    /// `rows` past the mirror is a caller bug (`ff_vs_row_count` bounds the
+    /// world-matrix palette by `MAX_VERTEX_BLEND_MATRIX_INDEX`), so it trips a
+    /// debug assertion; the release build still clamps rather than reading off
+    /// the end of the mirror.
     pub fn ff_vs_const_scratch(&mut self, rows: u16) -> ScratchSlice {
+        debug_assert!(
+            rows <= CONSTANT_ROWS_U16,
+            "FF VS constant rows past the mirror"
+        );
+        let rows = rows.min(CONSTANT_ROWS_U16);
         if rows == 0 {
             return ScratchSlice::EMPTY;
         }
@@ -5185,8 +5195,9 @@ impl FrameEncoder {
             return slice;
         }
         let byte_len = usize::from(rows) * core::mem::size_of::<[f32; 4]>();
-        // SAFETY: see [`Self::vs_const_scratch`]. `[f32; 4]` is POD and
-        // the byte_len lies fully within `ff_vs_constants_mirror`.
+        // SAFETY: see [`Self::vs_const_scratch`]. `[f32; 4]` is POD, and
+        // `rows` was clamped to `CONSTANT_ROWS_U16` above, so `byte_len` lies
+        // fully within `ff_vs_constants_mirror`.
         let bytes = unsafe {
             core::slice::from_raw_parts(self.ff_vs_constants_mirror.as_ptr().cast::<u8>(), byte_len)
         };
