@@ -342,6 +342,52 @@ fn vertex_blending_advertises_four_matrices_per_vertex() {
 }
 
 #[test]
+fn indexed_vertex_blending_advertises_the_palette_the_layout_carries() {
+    // Rows of the FF VS constant block a draw can bind, i.e. the encoder's
+    // `ff_vs_constants_mirror` (`CONSTANT_ROWS` in the `d3d9` crate, whose own
+    // compile-time assert pins it against the advertised index).
+    const FF_VS_CONST_ROWS: u32 = 256;
+    let caps = filled();
+    // Zero is how D3D9 spells "this device has no indexed vertex blending",
+    // which sends a title to its software or non-indexed path although
+    // `D3DRS_INDEXEDVERTEXBLENDENABLE` and `BLENDINDICES` are honoured.
+    assert_ne!(
+        caps.max_vertex_blend_matrix_index, 0,
+        "indexed vertex blending reported as absent"
+    );
+    assert_eq!(
+        caps.max_vertex_blend_matrix_index,
+        crate::ff_state::MAX_VERTEX_BLEND_MATRIX_INDEX
+    );
+    // The palette is packed four rows per matrix from the base row, so the
+    // advertised index is the last one whose four rows end inside the block,
+    // and one more would not fit.
+    let palette_base = u32::from(crate::ff_state::FF_VS_PALETTE_BASE_ROW);
+    let rows_through = |index: u32| palette_base + (index + 1) * 4;
+    assert!(
+        rows_through(caps.max_vertex_blend_matrix_index) <= FF_VS_CONST_ROWS,
+        "advertised index reaches past the FF VS constant block"
+    );
+    assert!(
+        rows_through(caps.max_vertex_blend_matrix_index + 1) > FF_VS_CONST_ROWS,
+        "a further matrix still fits, so the cap under-reports the palette"
+    );
+    // Every matrix one vertex blends has to be addressable in the palette.
+    assert!(caps.max_vertex_blend_matrix_index + 1 >= caps.max_vertex_blend_matrices);
+}
+
+#[test]
+fn advertise_all_leaves_the_vertex_blend_palette_truthful() {
+    // Raising this one would be harmful rather than merely optimistic: a
+    // higher index names palette rows the FF VS constant block does not
+    // carry, so the blended vertex would read constants no draw bound.
+    assert_eq!(
+        advertised().max_vertex_blend_matrix_index,
+        filled().max_vertex_blend_matrix_index
+    );
+}
+
+#[test]
 fn active_light_cap_matches_the_ff_slot_count() {
     // The advertised cap and the FF fast-path slot array are the same
     // constant, so a game cannot enable a light the FF VS has no slot for.
