@@ -473,8 +473,9 @@ the line is `real`.
 Audit provenance: every cluster below was re-derived on 2026-07-20 from the
 Wine test source, the raw actual-vs-expected failure messages
 (`MTLD3D_CONFORMANCE_RAW_DIR`), and the implementation — independently
-re-checked before retagging. Current classifications: 0 `real`, 133
-`expected`, 4 `caps`, 24 `ceiling`, 4 `flaky`, 0 `untriaged` unique sites.
+re-checked before retagging. Current classifications, counted from the
+`Sites:` tokens below on 2026-09-22: 0 `real`, 131 `expected`, 1 `caps`,
+22 `ceiling`, 4 `flaky`, 0 `untriaged`, 158 unique sites in all.
 The audit recorded all 24 Apple-family subtest-legs `crash=0`.
 (2026-09-05: the two answers a device
 without the packed 16-bit formats derives from its render-target answer,
