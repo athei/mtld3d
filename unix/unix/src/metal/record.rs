@@ -24,6 +24,7 @@ use mtld3d_shared::{
 use super::{
     handle::ReleaseRetain,
     presenter::{PresentState, Presented},
+    upscale::UpscaleCache,
 };
 
 /// Everything one device owns on the unix side.
@@ -37,6 +38,7 @@ pub struct DeviceRecord {
     queue: MetalHandle<MTLCommandQueueKind>,
     present: PresentState,
     presented: Presented,
+    upscale: UpscaleCache,
 }
 
 impl Drop for DeviceRecord {
@@ -54,8 +56,9 @@ impl DeviceRecord {
     pub fn new(queue: MetalHandle<MTLCommandQueueKind>, gate: Option<PathBuf>) -> Arc<Self> {
         Arc::new(Self {
             queue,
-            present: PresentState::new(queue, gate),
+            present: PresentState::new(gate),
             presented: Presented::new(),
+            upscale: UpscaleCache::new(),
         })
     }
 
@@ -72,6 +75,11 @@ impl DeviceRecord {
     /// The device's presented-cadence probe.
     pub const fn presented(&self) -> &Presented {
         &self.presented
+    }
+
+    /// The device's `MetalFX` scalers and scratch targets.
+    pub const fn upscale(&self) -> &UpscaleCache {
+        &self.upscale
     }
 
     /// Hand the record to the PE side as an opaque handle.

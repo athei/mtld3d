@@ -1166,7 +1166,6 @@ fn readback_completion_preserves_driver_error_details() {
 /// A failed upscale after HDR preflight must still convert the original SDR frame.
 #[test]
 fn hdr_upscale_failure_reencodes_the_original_source() {
-    use mtld3d_shared::mtl_handle::MTLCommandQueueKind;
     use objc2_metal::{MTLClearColor, MTLLoadAction, MTLRenderPassDescriptor, MTLStoreAction};
     let queue = test_queue();
     let device = queue.device();
@@ -1174,14 +1173,12 @@ fn hdr_upscale_failure_reencodes_the_original_source() {
         eprintln!("MetalFX unsupported, skipping HDR fallback regression");
         return;
     }
-    // SAFETY: the test owns queue through all encoding and retirement below.
-    let handle =
-        unsafe { MetalHandle::<MTLCommandQueueKind>::new(Retained::as_ptr(&queue) as u64) };
+    let cache = crate::metal::upscale::UpscaleCache::new();
     let src =
-        crate::metal::upscale::scratch_target(&device, handle, 32, 32, PixelFormat::Bgra8Unorm)
+        crate::metal::upscale::scratch_target(&device, &cache, 32, 32, PixelFormat::Bgra8Unorm)
             .expect("source");
     let dst =
-        crate::metal::upscale::scratch_target(&device, handle, 64, 64, PixelFormat::Rgba16Float)
+        crate::metal::upscale::scratch_target(&device, &cache, 64, 64, PixelFormat::Rgba16Float)
             .expect("destination");
     let cmd = queue.commandBuffer().expect("reference command buffer");
     cmd.setLabel(Some(&NSString::from_str("mtld3d-test-hdr-reference")));
@@ -1213,7 +1210,7 @@ fn hdr_upscale_failure_reencodes_the_original_source() {
     let invoked = std::cell::Cell::new(false);
     assert!(super::encode_hdr_present_upscaled_with(
         &cmd,
-        handle,
+        &cache,
         &src,
         &dst,
         2.0,
@@ -1227,12 +1224,11 @@ fn hdr_upscale_failure_reencodes_the_original_source() {
         invoked.get(),
         "the failure must occur after successful preflight"
     );
-    crate::metal::upscale::retire_evicted(&cmd, handle);
+    crate::metal::upscale::retire_evicted(&cmd, &cache);
     cmd.commit();
     cmd.waitUntilCompleted();
     assert_eq!(upload_test_pixel(&queue, &dst), expected);
-    crate::metal::upscale::retire_scalers(handle);
-    crate::metal::upscale::retire_scratch(handle);
+    crate::metal::upscale::retire(&cache);
 }
 
 /// Invalid second-plane uploads must not publish the already encoded depth plane.
