@@ -412,6 +412,8 @@ fn content(hash: u64) -> super::Content {
         mode: super::LayerMode::Sdr,
         peak: 1.0,
         geometry: geometry(),
+        gamma_layer: 0,
+        gamma_revision: 0,
     }
 }
 
@@ -484,6 +486,8 @@ fn sprite_geometry_invalidates_content_even_if_hash_and_color_mode_match() {
             scale: 1.0,
             ..geometry()
         },
+        gamma_layer: 0,
+        gamma_revision: 0,
     };
     let mut draws = 0;
     assert!(state.ensure(changed(), |_, _, _| {

@@ -86,6 +86,12 @@ const PIXEL_SHADER_1X_MAX_VALUE: f32 = 65504.0;
 const DEFAULT_SIMULTANEOUS_RTS: u32 = D3D_MAX_SIMULTANEOUS_RENDERTARGETS;
 
 /// Driver-level caps: resource management, dynamic textures, gamma, mip generation.
+///
+/// `FULLSCREENGAMMA`: a fullscreen device's `SetGammaRamp` reaches the present
+/// pass, which looks every channel up in the ramp on its way to the drawable.
+/// `CANCALIBRATEGAMMA` stays off, and `D3DSGR_CALIBRATE` is logged and
+/// ignored to match: the ramp is applied exactly as the application wrote it,
+/// with no correction for the display's own response.
 const CAPS2_DEFAULT: Caps2 = Caps2::CANMANAGERESOURCE
     .union(Caps2::DYNAMICTEXTURES)
     .union(Caps2::FULLSCREENGAMMA)

@@ -10,9 +10,9 @@ use mtld3d_shared::{
     DestroyResourcesBulkParams, DetachMetalLayerParams, EnsureBlitPipelineParams,
     EnsureClearQuadPipelineParams, GetDeviceInfoParams, GetTaskFaultsParams, InPtr, InPtrMut,
     MetalHandle, OpenLogParams, SetCursorOverlayParams, SetDisplaySyncEnabledParams,
-    SetPresentWaitPolicyParams, StartGpuCaptureParams, SubmitFrameParams, TextureCreateDesc,
-    VertexAttrDesc, VertexBufferLayoutDesc, WaitForGpuRetireParams, WaitForPresentIdleParams,
-    WriteLogParams, identity,
+    SetGammaRampParams, SetPresentWaitPolicyParams, StartGpuCaptureParams, SubmitFrameParams,
+    TextureCreateDesc, VertexAttrDesc, VertexBufferLayoutDesc, WaitForGpuRetireParams,
+    WaitForPresentIdleParams, WriteLogParams, identity,
     mtl::{CursorOverlayFlags, DestroyKind, QuadPipelineKind, TextureCreateFlags},
     mtl_handle::{MTLBufferKind, MTLTextureKind},
 };
@@ -357,6 +357,35 @@ pub extern "C" fn set_display_sync_enabled_handler(args: *mut c_void) -> i32 {
         },
     );
     STATUS_SUCCESS
+}
+
+pub extern "C" fn set_gamma_ramp_handler(args: *mut c_void) -> i32 {
+    // SAFETY: unix-call handler params; PE side passes *const SetGammaRampParams.
+    let Some(params) = (unsafe { InPtr::<SetGammaRampParams>::opt(args.cast()) }) else {
+        return -1;
+    };
+    let entries = if params.entries_ptr == 0 {
+        None
+    } else {
+        let expected = metal::gamma_table_lanes();
+        if params.entries_len as usize != expected {
+            warn!(
+                target: LOG_TARGET,
+                "SetGammaRamp: rejected a table of {} lanes (expected {expected})",
+                params.entries_len,
+            );
+            return STATUS_UNSUCCESSFUL;
+        }
+        // SAFETY: PE supplied `entries_ptr`/`entries_len` as a `u16` table
+        // valid for the call duration; the pointer is non-zero per the branch
+        // and the lane count was just checked against the one table shape.
+        Some(unsafe { core::slice::from_raw_parts(params.entries_ptr as *const u16, expected) })
+    };
+    if metal::set_gamma_ramp(&params, entries) {
+        STATUS_SUCCESS
+    } else {
+        STATUS_UNSUCCESSFUL
+    }
 }
 
 pub extern "C" fn wait_for_gpu_retire_handler(args: *mut c_void) -> i32 {

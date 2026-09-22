@@ -50,24 +50,24 @@ use mtld3d_types::{
     D3D_MAX_SIMULTANEOUS_RENDERTARGETS, D3DCAPS9, D3DCLEAR_STENCIL, D3DCLEAR_TARGET,
     D3DCLEAR_ZBUFFER, D3DDEVICE_CREATION_PARAMETERS, D3DDISPLAYMODE,
     D3DERR_UNSUPPORTEDTEXTUREFILTER, D3DFMT_ATI1, D3DFMT_INDEX16, D3DFMT_INDEX32, D3DFMT_UYVY,
-    D3DFMT_YUY2, D3DLIGHT9, D3DMATERIAL9, D3DMATRIX, D3DPOOL_DEFAULT, D3DPOOL_MANAGED,
-    D3DPOOL_SCRATCH, D3DPOOL_SYSTEMMEM, D3DPRESENT_INTERVAL_DEFAULT, D3DPRESENT_INTERVAL_FOUR,
-    D3DPRESENT_INTERVAL_IMMEDIATE, D3DPRESENT_INTERVAL_ONE, D3DPRESENT_INTERVAL_THREE,
-    D3DPRESENT_INTERVAL_TWO, D3DPRESENT_PARAMETERS, D3DPRESENTFLAG_LOCKABLE_BACKBUFFER,
-    D3DPT_TRIANGLEFAN, D3DPT_TRIANGLELIST, D3DRS_ALPHABLENDENABLE, D3DRS_ALPHAFUNC, D3DRS_ALPHAREF,
-    D3DRS_ALPHATESTENABLE, D3DRS_AMBIENT, D3DRS_AMBIENTMATERIALSOURCE, D3DRS_BLENDFACTOR,
-    D3DRS_BLENDOP, D3DRS_BLENDOPALPHA, D3DRS_CCW_STENCILFAIL, D3DRS_CCW_STENCILFUNC,
-    D3DRS_CCW_STENCILPASS, D3DRS_CCW_STENCILZFAIL, D3DRS_CLIPPING, D3DRS_CLIPPLANEENABLE,
-    D3DRS_COLORVERTEX, D3DRS_COLORWRITEENABLE, D3DRS_COLORWRITEENABLE1, D3DRS_COLORWRITEENABLE2,
-    D3DRS_COLORWRITEENABLE3, D3DRS_CULLMODE, D3DRS_DEBUGMONITORTOKEN, D3DRS_DEPTHBIAS,
-    D3DRS_DESTBLEND, D3DRS_DESTBLENDALPHA, D3DRS_DIFFUSEMATERIALSOURCE,
-    D3DRS_EMISSIVEMATERIALSOURCE, D3DRS_FILLMODE, D3DRS_FOGCOLOR, D3DRS_FOGDENSITY,
-    D3DRS_FOGENABLE, D3DRS_FOGEND, D3DRS_FOGSTART, D3DRS_FOGTABLEMODE, D3DRS_FOGVERTEXMODE,
-    D3DRS_INDEXEDVERTEXBLENDENABLE, D3DRS_LIGHTING, D3DRS_LOCALVIEWER, D3DRS_MULTISAMPLEANTIALIAS,
-    D3DRS_MULTISAMPLEMASK, D3DRS_NORMALDEGREE, D3DRS_NORMALIZENORMALS, D3DRS_PATCHEDGESTYLE,
-    D3DRS_POINTSCALE_A, D3DRS_POINTSCALE_B, D3DRS_POINTSCALE_C, D3DRS_POINTSCALEENABLE,
-    D3DRS_POINTSIZE, D3DRS_POINTSIZE_MAX, D3DRS_POINTSIZE_MIN, D3DRS_POINTSPRITEENABLE,
-    D3DRS_POSITIONDEGREE, D3DRS_RANGEFOGENABLE, D3DRS_SCISSORTESTENABLE,
+    D3DFMT_YUY2, D3DGAMMARAMP, D3DLIGHT9, D3DMATERIAL9, D3DMATRIX, D3DPOOL_DEFAULT,
+    D3DPOOL_MANAGED, D3DPOOL_SCRATCH, D3DPOOL_SYSTEMMEM, D3DPRESENT_INTERVAL_DEFAULT,
+    D3DPRESENT_INTERVAL_FOUR, D3DPRESENT_INTERVAL_IMMEDIATE, D3DPRESENT_INTERVAL_ONE,
+    D3DPRESENT_INTERVAL_THREE, D3DPRESENT_INTERVAL_TWO, D3DPRESENT_PARAMETERS,
+    D3DPRESENTFLAG_LOCKABLE_BACKBUFFER, D3DPT_TRIANGLEFAN, D3DPT_TRIANGLELIST,
+    D3DRS_ALPHABLENDENABLE, D3DRS_ALPHAFUNC, D3DRS_ALPHAREF, D3DRS_ALPHATESTENABLE, D3DRS_AMBIENT,
+    D3DRS_AMBIENTMATERIALSOURCE, D3DRS_BLENDFACTOR, D3DRS_BLENDOP, D3DRS_BLENDOPALPHA,
+    D3DRS_CCW_STENCILFAIL, D3DRS_CCW_STENCILFUNC, D3DRS_CCW_STENCILPASS, D3DRS_CCW_STENCILZFAIL,
+    D3DRS_CLIPPING, D3DRS_CLIPPLANEENABLE, D3DRS_COLORVERTEX, D3DRS_COLORWRITEENABLE,
+    D3DRS_COLORWRITEENABLE1, D3DRS_COLORWRITEENABLE2, D3DRS_COLORWRITEENABLE3, D3DRS_CULLMODE,
+    D3DRS_DEBUGMONITORTOKEN, D3DRS_DEPTHBIAS, D3DRS_DESTBLEND, D3DRS_DESTBLENDALPHA,
+    D3DRS_DIFFUSEMATERIALSOURCE, D3DRS_EMISSIVEMATERIALSOURCE, D3DRS_FILLMODE, D3DRS_FOGCOLOR,
+    D3DRS_FOGDENSITY, D3DRS_FOGENABLE, D3DRS_FOGEND, D3DRS_FOGSTART, D3DRS_FOGTABLEMODE,
+    D3DRS_FOGVERTEXMODE, D3DRS_INDEXEDVERTEXBLENDENABLE, D3DRS_LIGHTING, D3DRS_LOCALVIEWER,
+    D3DRS_MULTISAMPLEANTIALIAS, D3DRS_MULTISAMPLEMASK, D3DRS_NORMALDEGREE, D3DRS_NORMALIZENORMALS,
+    D3DRS_PATCHEDGESTYLE, D3DRS_POINTSCALE_A, D3DRS_POINTSCALE_B, D3DRS_POINTSCALE_C,
+    D3DRS_POINTSCALEENABLE, D3DRS_POINTSIZE, D3DRS_POINTSIZE_MAX, D3DRS_POINTSIZE_MIN,
+    D3DRS_POINTSPRITEENABLE, D3DRS_POSITIONDEGREE, D3DRS_RANGEFOGENABLE, D3DRS_SCISSORTESTENABLE,
     D3DRS_SEPARATEALPHABLENDENABLE, D3DRS_SHADEMODE, D3DRS_SLOPESCALEDEPTHBIAS,
     D3DRS_SPECULARENABLE, D3DRS_SPECULARMATERIALSOURCE, D3DRS_SRCBLEND, D3DRS_SRCBLENDALPHA,
     D3DRS_SRGBWRITEENABLE, D3DRS_STENCILENABLE, D3DRS_STENCILFAIL, D3DRS_STENCILFUNC,
@@ -646,6 +646,25 @@ pub struct DeviceInner {
     /// first frame sent after the Reset, before that frame's own
     /// `nextDrawable`, matching the spec's "next Present" timing.
     pending_pacing: Option<LayerPacing>,
+    /// The gamma ramp the application last set, identity until it sets one.
+    ///
+    /// Kept verbatim so `GetGammaRamp` answers with what `SetGammaRamp` was
+    /// given, whether or not it reached the present pass: D3D9 stores the
+    /// ramp on the swap chain and reports it back unchanged.
+    gamma_ramp: Box<D3DGAMMARAMP>,
+    /// The present-pass table a queued ramp change carries, if one is queued.
+    ///
+    /// `Some(Some(table))` applies a table, `Some(None)` removes the one the
+    /// layer has, and `None` is the steady state. Consumed by
+    /// `stamp_and_swap` and applied by the encoder thread on the first frame
+    /// sent afterwards, so the ramp lands on the present that follows the
+    /// call, the same timing the queued pacing uses.
+    pending_gamma: Option<mtld3d_core::gamma::Change>,
+    /// Whether the layer currently carries a table.
+    ///
+    /// A ramp that changes nothing sends nothing: an identity ramp set twice,
+    /// or a windowed device's ramp, leaves this alone.
+    gamma_applied: bool,
     /// The colour render-target binding most recently applied via `SetRenderTarget`.
     ///
     /// `None` means the implicit backbuffer default is in effect. The encoder's
@@ -1502,6 +1521,12 @@ impl DeviceInner {
             // back, and this is the pacing the next one compares against.
             self.layer_pacing = pacing;
             frame.set_apply_pacing(Some(pacing));
+        }
+        // The gamma ramp rides the same frame for the same reason: the
+        // encoder applies it before this frame's own present, so the first
+        // frame after `SetGammaRamp` is the one that shows it.
+        if let Some(change) = self.pending_gamma.take() {
+            frame.set_apply_gamma(Some(change));
         }
         // An F12 run ends with the frame the closing `Present` submits. A
         // mid-frame flush sends the marked frame out early, so its stop mark
@@ -2986,6 +3011,9 @@ impl Direct3DDevice9 {
             recording_state_block: None,
             layer_pacing: info.pacing,
             pending_pacing: None,
+            gamma_ramp: Box::new(mtld3d_core::gamma::identity_ramp()),
+            pending_gamma: None,
+            gamma_applied: false,
             last_color_rt_binding: None,
             last_extra_rt_bindings: [const { None }; RENDER_TARGET_SLOTS - 1],
             cur_autogen_rt_ids: [None; RENDER_TARGET_SLOTS],
@@ -3193,6 +3221,66 @@ impl DeviceInner {
         self.present_params.windowed == 0
     }
 
+    /// The ramp the application last set, for `GetGammaRamp`.
+    pub fn gamma_ramp(&self) -> D3DGAMMARAMP {
+        D3DGAMMARAMP {
+            red: self.gamma_ramp.red,
+            green: self.gamma_ramp.green,
+            blue: self.gamma_ramp.blue,
+        }
+    }
+
+    /// Keep a validated ramp and queue what the present pass should do with it.
+    pub fn set_gamma_ramp(&mut self, ramp: &D3DGAMMARAMP) {
+        *self.gamma_ramp = D3DGAMMARAMP {
+            red: ramp.red,
+            green: ramp.green,
+            blue: ramp.blue,
+        };
+        if !self.is_fullscreen() && !mtld3d_core::gamma::is_identity(&self.gamma_ramp) {
+            // Native ramps the whole desktop for a windowed device, which is
+            // not ours to touch, so the ramp is kept for `GetGammaRamp` and
+            // changes nothing on screen. It applies as soon as a `Reset`
+            // takes the device fullscreen.
+            mtld3d_shared::log_once_warn!(
+                target: crate::LOG_TARGET,
+                "SetGammaRamp on a windowed device: the ramp is stored and reported back, \
+                 but only a fullscreen device applies one"
+            );
+        }
+        self.queue_gamma();
+    }
+
+    /// Queue the table the layer should carry, when it is not the one it has.
+    ///
+    /// A non-identity ramp on a fullscreen device is queued every time it is
+    /// set, since two different ramps both want applying; a ramp that stops
+    /// applying is queued once, as a removal.
+    fn queue_gamma(&mut self) {
+        let apply = self.is_fullscreen() && !mtld3d_core::gamma::is_identity(&self.gamma_ramp);
+        if apply {
+            self.pending_gamma = Some(mtld3d_core::gamma::Change::Apply(Box::new(
+                mtld3d_core::gamma::to_lut(&self.gamma_ramp),
+            )));
+            self.gamma_applied = true;
+        } else if self.gamma_applied {
+            self.pending_gamma = Some(mtld3d_core::gamma::Change::Remove);
+            self.gamma_applied = false;
+        }
+    }
+
+    /// Re-queue the ramp for a layer that has just been attached.
+    ///
+    /// A `Reset` that retargets the device window, or one that moves it
+    /// between windowed and fullscreen, leaves the ramp where it was and the
+    /// new layer carrying nothing, so what the device holds is sent again
+    /// rather than assumed to be live.
+    pub fn reapply_gamma(&mut self) {
+        self.gamma_applied = false;
+        self.pending_gamma = None;
+        self.queue_gamma();
+    }
+
     /// The device's presentation window.
     ///
     /// The `device_window` it was created with, falling back to the focus
@@ -3271,7 +3359,14 @@ impl DeviceInner {
     /// Back-buffer count clamped to >= 1, matching `CreateDevice`.
     pub fn set_present_params(&mut self, mut pp: D3DPRESENT_PARAMETERS) {
         pp.back_buffer_count = pp.back_buffer_count.max(1);
+        let was_fullscreen = self.is_fullscreen();
         self.present_params = pp;
+        // A gamma ramp only applies fullscreen, and a layer the Reset
+        // re-attached carries no table, so the ramp the device holds is sent
+        // again on both edges rather than assumed live.
+        if was_fullscreen != self.is_fullscreen() {
+            self.reapply_gamma();
+        }
         // Keep the cached implicit swapchain (if it has already been handed
         // out) in lockstep: GetSwapChain(0).GetPresentParameters must reflect
         // the post-Reset geometry, not the values captured when it was created.
@@ -4216,6 +4311,8 @@ extern "system" fn device_reset(this: *mut c_void, present_params: *mut c_void) 
         // pacing directly.
         dev.pending_pacing = None;
         retarget_device_window(dev, &pp, target_window);
+        // The fresh attach's layer carries no gamma table either.
+        dev.reapply_gamma();
     }
 
     // debug, not info — fires per-frame during a window drag.
@@ -4718,19 +4815,85 @@ extern "system" fn device_set_dialog_box_mode(this: *mut c_void, _enable: i32) -
 
 extern "system" fn device_set_gamma_ramp(
     this: *mut c_void,
-    _swap_chain: u32,
-    _flags: u32,
-    _ramp: *const c_void,
+    swap_chain: u32,
+    flags: u32,
+    ramp: *const c_void,
 ) {
     let _api = device_api_lock(this);
     let _timer = device_timer(this, DeviceSubCategory::Misc);
-    mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET, "stub IDirect3DDevice9::SetGammaRamp");
+    // The call returns nothing, so every rejection below is a warn and a
+    // no-op: there is no channel to answer through.
+    if ramp.is_null() {
+        mtld3d_shared::log_once_warn!(
+            target: crate::LOG_TARGET,
+            "SetGammaRamp: null ramp → ignored"
+        );
+        return;
+    }
+    if swap_chain != 0 {
+        mtld3d_shared::log_once_warn!(
+            target: crate::LOG_TARGET,
+            "SetGammaRamp: only the implicit swap chain carries a ramp; \
+             swap chain {swap_chain} is ignored"
+        );
+        return;
+    }
+    if flags & mtld3d_types::D3DSGR_CALIBRATE != 0 {
+        // The cap that promises calibration, D3DCAPS2_CANCALIBRATEGAMMA, is
+        // not advertised, so applying the ramp as given is the conformant
+        // answer to the flag rather than a shortcut.
+        mtld3d_shared::log_once_info!(
+            target: crate::LOG_TARGET,
+            "SetGammaRamp: D3DSGR_CALIBRATE without CANCALIBRATEGAMMA → the ramp is \
+             applied uncalibrated"
+        );
+    }
+    // SAFETY: vtable thunk; `this` is *mut Direct3DDevice9 per IDirect3DDevice9 ABI.
+    let Some(obj) = (unsafe { InPtrMut::<Direct3DDevice9>::opt(this) }) else {
+        return;
+    };
+    // SAFETY: per the ABI `ramp` points at one readable `D3DGAMMARAMP` for
+    // the call; it is non-null per the branch above and read, never retained.
+    let ramp = unsafe { &*ramp.cast::<D3DGAMMARAMP>() };
+    if !mtld3d_core::gamma::is_usable(ramp) {
+        mtld3d_shared::log_once_warn!(
+            target: crate::LOG_TARGET,
+            "SetGammaRamp: no channel of the ramp rises end to end → ignored, the \
+             display keeps the ramp it has"
+        );
+        return;
+    }
+    let dev = obj.inner();
+    dev.set_gamma_ramp(ramp);
 }
 
-extern "system" fn device_get_gamma_ramp(this: *mut c_void, _swap_chain: u32, _ramp: *mut c_void) {
+extern "system" fn device_get_gamma_ramp(this: *mut c_void, swap_chain: u32, ramp: *mut c_void) {
     let _api = device_api_lock(this);
     let _timer = device_timer(this, DeviceSubCategory::Misc);
-    mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET, "stub IDirect3DDevice9::GetGammaRamp");
+    if ramp.is_null() {
+        mtld3d_shared::log_once_warn!(
+            target: crate::LOG_TARGET,
+            "GetGammaRamp: null ramp → ignored"
+        );
+        return;
+    }
+    if swap_chain != 0 {
+        mtld3d_shared::log_once_warn!(
+            target: crate::LOG_TARGET,
+            "GetGammaRamp: only the implicit swap chain carries a ramp; \
+             swap chain {swap_chain} answers nothing"
+        );
+        return;
+    }
+    // SAFETY: vtable thunk; `this` is *mut Direct3DDevice9 per IDirect3DDevice9 ABI.
+    let Some(obj) = (unsafe { InPtr::<Direct3DDevice9>::opt(this) }) else {
+        return;
+    };
+    // SAFETY: per the ABI `ramp` points at one writable `D3DGAMMARAMP` for
+    // the call; it is non-null per the branch above.
+    unsafe {
+        core::ptr::write(ramp.cast::<D3DGAMMARAMP>(), obj.inner().gamma_ramp());
+    }
 }
 
 extern "system" fn device_create_texture(

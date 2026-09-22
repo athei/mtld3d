@@ -1186,7 +1186,7 @@ fn hdr_upscale_failure_reencodes_the_original_source() {
         .expect("clear encoder");
     encoder.setLabel(Some(&NSString::from_str("mtld3d-test-hdr-source")));
     encoder.endEncoding();
-    assert!(super::encode_hdr_present(&cmd, &src, &dst, 2.0));
+    assert!(super::encode_hdr_present(&cmd, &src, &dst, 2.0, 0));
     cmd.commit();
     cmd.waitUntilCompleted();
     let expected = upload_test_pixel(&queue, &dst);
@@ -1201,6 +1201,7 @@ fn hdr_upscale_failure_reencodes_the_original_source() {
         &src,
         &dst,
         2.0,
+        0,
         |_| {
             invoked.set(true);
             false
