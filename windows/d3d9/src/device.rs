@@ -2791,6 +2791,13 @@ impl DeviceInner {
             bb_params.msaa_texture_handle,
             bb_params.msaa_srgb_texture_handle,
         );
+        // The colour backing now has these dimensions even if rebuilding the
+        // depth surface fails. Keep both existing and future swapchain queries
+        // consistent with GetDesc on the live backbuffer.
+        let mut pp = self.present_params;
+        pp.back_buffer_width = new_width;
+        pp.back_buffer_height = new_height;
+        self.set_present_params(pp);
 
         if self.depth_stencil_format != 0 {
             let Some(pixel_format) =
@@ -3363,7 +3370,7 @@ impl DeviceInner {
         self.implicit_depth_stencil as *mut crate::surface::Direct3DSurface9
     }
 
-    /// Refresh the stored present parameters after a successful `Reset`.
+    /// Refresh the stored present parameters after Reset or a backbuffer resize.
     ///
     /// Back-buffer count clamped to >= 1, matching `CreateDevice`.
     pub fn set_present_params(&mut self, mut pp: D3DPRESENT_PARAMETERS) {
@@ -3378,7 +3385,7 @@ impl DeviceInner {
         }
         // Keep the cached implicit swapchain (if it has already been handed
         // out) in lockstep: GetSwapChain(0).GetPresentParameters must reflect
-        // the post-Reset geometry, not the values captured when it was created.
+        // the live geometry, not the values captured when it was created.
         if self.implicit_swapchain != 0 {
             let sc = self.implicit_swapchain as *mut crate::swapchain::Direct3DSwapChain9;
             // SAFETY: `implicit_swapchain` is a device-owned `Box::into_raw`,
@@ -4125,10 +4132,14 @@ extern "system" fn device_create_additional_swap_chain(
         dev.window()
     };
     crate::direct3d9::resolve_backbuffer_dims(target_window as u64, &mut pp);
+    if pp.back_buffer_format == 0 {
+        pp.back_buffer_format = crate::direct3d9::adapter_display_format();
+    }
     pp.back_buffer_count = pp.back_buffer_count.max(1);
     pp_in.back_buffer_width = pp.back_buffer_width;
     pp_in.back_buffer_height = pp.back_buffer_height;
     pp_in.back_buffer_count = pp.back_buffer_count;
+    pp_in.back_buffer_format = pp.back_buffer_format;
     // The stored copy resolves hDeviceWindow so GetPresentParameters reports the
     // real target window even when the caller passed NULL.
     pp.device_window = target_window;
@@ -4244,6 +4255,7 @@ extern "system" fn device_reset(this: *mut c_void, present_params: *mut c_void) 
     if pp.windowed != 0 && pp.back_buffer_format == 0 {
         pp.back_buffer_format = crate::direct3d9::adapter_display_format();
     }
+    crate::direct3d9::warn_unsupported_backbuffer_format(pp.back_buffer_format);
     // `Reset` re-specifies the swap chain, multisample configuration
     // included. Its validation depends on the format and device caps alone,
     // so reject it before changing the window or display mode.

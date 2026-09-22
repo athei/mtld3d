@@ -319,7 +319,7 @@ impl Direct3DSurface9 {
     /// Handed out by `GetRenderTarget(0)` / `GetBackBuffer(0)`. Device-owned:
     /// refcount starts at 0, forwards to the device on the 0↔1 boundary, is
     /// never freed at refcount 0 (destroyed at device teardown), and resolves
-    /// its color handle + dimensions live from the device (see
+    /// its color handle, dimensions and format live from the device (see
     /// [`ImplicitKind`]). `container` is the implicit swapchain wrapper
     /// `GetContainer` returns.
     pub fn new_implicit_backbuffer(device_inner: *mut DeviceInner, container: u64) -> Self {
@@ -328,8 +328,7 @@ impl Direct3DSurface9 {
             parent_texture: core::ptr::null_mut(),
             mip_level: 0,
             cube_face: u32::MAX,
-            // Extent + Metal handle resolve live; only the pinned D3D format is a
-            // snapshot (`live_format` returns it for a `Backbuffer` surface).
+            // Extent, format and Metal handle resolve live from the device.
             standalone_width: 0,
             standalone_height: 0,
             standalone_render_scale: RenderScale::IDENTITY,
@@ -1420,13 +1419,19 @@ impl SurfaceInner {
 
     /// Live surface format.
     ///
-    /// The device's current depth-stencil format for an implicit
-    /// `DepthStencil` surface, else the stored snapshot (the implicit
-    /// `Backbuffer` keeps its pinned `D3DFMT_X8R8G8B8`).
+    /// Implicit surfaces follow the device across Reset, including a change
+    /// between A8 and X8 that keeps the same BGRA8 backbuffer storage.
     fn live_format(&self) -> u32 {
-        if self.implicit_kind == ImplicitKind::DepthStencil && !self.device_inner.is_null() {
+        if self.implicit_kind != ImplicitKind::None && !self.device_inner.is_null() {
             // SAFETY: `device_inner` is the live owning device (see above).
-            unsafe { (*self.device_inner).depth_stencil_format() }
+            let device = unsafe { &*self.device_inner };
+            if self.implicit_kind == ImplicitKind::DepthStencil {
+                device.depth_stencil_format()
+            } else {
+                mtld3d_core::format::backbuffer_surface_format(
+                    device.present_params().back_buffer_format,
+                )
+            }
         } else {
             self.standalone_format
         }

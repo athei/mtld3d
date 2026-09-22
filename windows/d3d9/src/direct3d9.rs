@@ -1825,10 +1825,10 @@ fn spawn_encoder_and_prewarm(
 /// render HDR internally do it in their own off-screen float targets and
 /// tone-map into an 8-bit backbuffer, so nothing has needed it. Warn once so a
 /// game that asked shows up.
-fn warn_unsupported_backbuffer_format(format: u32) {
+pub fn warn_unsupported_backbuffer_format(format: u32) {
     if !matches!(format, D3DFMT_A8R8G8B8 | D3DFMT_X8R8G8B8) {
         mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
-            "CreateDevice: back_buffer_format {format:#x} requested but layer/backbuffer is hardcoded BGRA8Unorm — substituting"
+            "back_buffer_format {format:#x} requested but layer/backbuffer is hardcoded BGRA8Unorm, substituting"
         );
     }
 }

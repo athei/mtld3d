@@ -73,6 +73,19 @@ pub struct SwapChain<'h> {
 }
 
 impl SwapChain<'_> {
+    /// Acquire the swapchain's first backbuffer.
+    ///
+    /// # Panics
+    /// Panics if `GetBackBuffer` fails.
+    #[must_use]
+    pub fn back_buffer(&self) -> Surface<'_> {
+        let mut surface = core::ptr::null_mut();
+        // SAFETY: live swapchain, first mono buffer, and writable output.
+        let hr = unsafe { (self.vtbl().get_back_buffer)(self.ptr, 0, 0, &raw mut surface) };
+        expect_created(hr, surface, "SwapChain::GetBackBuffer");
+        Surface::from_raw(surface)
+    }
+
     /// Adopt the reference returned by a successful swapchain creation or query.
     ///
     /// # Safety
