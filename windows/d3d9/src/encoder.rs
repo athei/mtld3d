@@ -2732,12 +2732,29 @@ impl FrameEncoder {
     /// frames it brackets are inside the trace and no earlier frame's is.
     fn drain_presentation(&self) {
         if self.record_handle.is_null() {
+            // Every frame carries the handle, so a null one before the first
+            // frame is a device that has queued no present and has nothing to
+            // drain. After one, the wait cannot run at all, and what follows
+            // it goes ahead of presents still reading the surfaces it
+            // replaces.
+            if !self.device_handle.is_null() {
+                error!(
+                    target: LOG_TARGET,
+                    "encoder: WaitForPresentIdle skipped, the device has no record handle; a queued present may still be reading the surfaces this drain guards"
+                );
+            }
             return;
         }
         let mut params = WaitForPresentIdleParams {
             record_handle: self.record_handle,
         };
-        let _ = unix_call(&mut params);
+        let status = unix_call(&mut params);
+        if status != 0 {
+            error!(
+                target: LOG_TARGET,
+                "encoder: WaitForPresentIdle failed status={status:#x}; a queued present may still be reading the surfaces this drain guards"
+            );
+        }
     }
 
     /// Tag the current pass with "this draw wants to write color".
@@ -8781,7 +8798,13 @@ impl FrameEncoder {
             coherent_seq_ptr: self.coherent_seq_ptr,
             failed_submit_seq_ptr: self.failed_seq_ptr,
         };
-        let _ = unix_call(&mut params);
+        let status = unix_call(&mut params);
+        if status != 0 {
+            error!(
+                target: LOG_TARGET,
+                "encoder: WaitForGpuRetire(target_seq={target_seq}) failed status={status:#x}; the work it waited for may not have retired"
+            );
+        }
     }
 
     /// Hold a copy out of a resolve target until the resolving command buffer has completed.
@@ -9724,7 +9747,13 @@ fn encoder_thread_main(
                             failed_submit_seq_ptr: enc.failed_seq_ptr,
                         };
                         mtld3d_shared::crumb!("vis:retirebeg", target_seq, coh);
-                        let _ = unix_call(&mut params);
+                        let status = unix_call(&mut params);
+                        if status != 0 {
+                            error!(
+                                target: LOG_TARGET,
+                                "encoder: WaitForGpuRetire(target_seq={target_seq}) failed status={status:#x}; the visibility counts read next may miss the queries of that frame"
+                            );
+                        }
                         mtld3d_shared::crumb!("vis:retireend", target_seq);
                     }
                 }

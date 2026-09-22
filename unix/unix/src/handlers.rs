@@ -184,12 +184,10 @@ pub extern "C" fn get_device_info_handler(args: *mut c_void) -> i32 {
 ///
 /// A null or unknown handle is a device whose creation failed or one already
 /// destroyed; the caller returns without touching Metal, as it did when the
-/// device was looked up by queue address.
+/// device was looked up by queue address. A thunk whose call cannot be
+/// dropped takes the stricter [`wait_device_record`] instead.
 fn device_record(handle: DeviceRecordHandle, thunk: &str) -> Option<Arc<metal::DeviceRecord>> {
-    // SAFETY: the PE side passes back a handle `CreateCommandQueue` produced
-    // and keeps it until its `DestroyCommandQueue`, which is the one caller
-    // that consumes it.
-    let record = unsafe { metal::DeviceRecord::borrow(handle) };
+    let record = borrow_device_record(handle);
     if record.is_none() {
         mtld3d_shared::log_once_warn!(
             target: LOG_TARGET,
@@ -197,6 +195,35 @@ fn device_record(handle: DeviceRecordHandle, thunk: &str) -> Option<Arc<metal::D
         );
     }
     record
+}
+
+/// The record a wait thunk names, or `None` after an error.
+///
+/// A wait whose record is missing never happens, so the read-back or the
+/// `Reset` behind it runs against GPU work that has not retired. Every miss
+/// is an ordering violation of its own rather than one process-wide gap, so
+/// each one is logged, and the thunk answers `STATUS_UNSUCCESSFUL` so the
+/// caller learns that the wait it asked for did not run.
+fn wait_device_record(handle: DeviceRecordHandle, thunk: &str) -> Option<Arc<metal::DeviceRecord>> {
+    let record = borrow_device_record(handle);
+    if record.is_none() {
+        error!(
+            target: LOG_TARGET,
+            "{thunk}: no device record for handle {handle:#x}; the wait did not happen",
+        );
+    }
+    record
+}
+
+/// The record a handle names, with no verdict on a miss.
+///
+/// The two lookups above differ only in how loudly a miss is reported, so the
+/// borrow and its safety argument have one home between them.
+fn borrow_device_record(handle: DeviceRecordHandle) -> Option<Arc<metal::DeviceRecord>> {
+    // SAFETY: the PE side passes back a handle `CreateCommandQueue` produced
+    // and keeps it until its `DestroyCommandQueue`, which is the one caller
+    // that consumes it.
+    unsafe { metal::DeviceRecord::borrow(handle) }
 }
 
 pub extern "C" fn create_command_queue_handler(args: *mut c_void) -> i32 {
@@ -414,8 +441,8 @@ pub extern "C" fn wait_for_gpu_retire_handler(args: *mut c_void) -> i32 {
     let Some(params) = (unsafe { InPtr::<WaitForGpuRetireParams>::opt(args.cast()) }) else {
         return -1;
     };
-    let Some(record) = device_record(params.record_handle, "WaitForGpuRetire") else {
-        return STATUS_SUCCESS;
+    let Some(record) = wait_device_record(params.record_handle, "WaitForGpuRetire") else {
+        return STATUS_UNSUCCESSFUL;
     };
     metal::wait_for_gpu_retire(
         record.pending(),
@@ -432,6 +459,9 @@ pub extern "C" fn set_present_wait_policy_handler(args: *mut c_void) -> i32 {
         return -1;
     };
     let Some(record) = device_record(params.record_handle, "SetPresentWaitPolicy") else {
+        // The policy is a hint for the presents of one device, so a handle
+        // that names no device has no present to apply it to and the caller
+        // has nothing to do differently.
         return STATUS_SUCCESS;
     };
     metal::set_wait_policy(record.present(), params.policy);
@@ -443,8 +473,8 @@ pub extern "C" fn wait_for_present_idle_handler(args: *mut c_void) -> i32 {
     let Some(params) = (unsafe { InPtr::<WaitForPresentIdleParams>::opt(args.cast()) }) else {
         return -1;
     };
-    let Some(record) = device_record(params.record_handle, "WaitForPresentIdle") else {
-        return STATUS_SUCCESS;
+    let Some(record) = wait_device_record(params.record_handle, "WaitForPresentIdle") else {
+        return STATUS_UNSUCCESSFUL;
     };
     metal::wait_for_present_idle(&record);
     STATUS_SUCCESS

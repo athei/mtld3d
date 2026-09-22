@@ -54,3 +54,37 @@ fn rejected_shader_thunk_clears_timing_outputs() {
         (0, 0, 0)
     );
 }
+
+#[test]
+fn wait_thunks_without_a_record_report_failure() {
+    let mut retire = mtld3d_shared::WaitForGpuRetireParams {
+        record_handle: mtld3d_shared::record_handle::DeviceRecordHandle::NULL,
+        target_seq: 1,
+        coherent_seq_ptr: 0,
+        failed_submit_seq_ptr: 0,
+    };
+    assert_eq!(
+        super::wait_for_gpu_retire_handler((&raw mut retire).cast()),
+        super::STATUS_UNSUCCESSFUL
+    );
+    let mut idle = mtld3d_shared::WaitForPresentIdleParams {
+        record_handle: mtld3d_shared::record_handle::DeviceRecordHandle::NULL,
+    };
+    assert_eq!(
+        super::wait_for_present_idle_handler((&raw mut idle).cast()),
+        super::STATUS_UNSUCCESSFUL
+    );
+}
+
+#[test]
+fn the_wait_policy_hint_without_a_record_reports_success() {
+    let mut params = mtld3d_shared::SetPresentWaitPolicyParams {
+        record_handle: mtld3d_shared::record_handle::DeviceRecordHandle::NULL,
+        policy: mtld3d_shared::mtl::PresentWaitPolicy::WaitForCommit,
+        pad0: 0,
+    };
+    assert_eq!(
+        super::set_present_wait_policy_handler((&raw mut params).cast()),
+        super::STATUS_SUCCESS
+    );
+}
