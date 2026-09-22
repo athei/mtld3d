@@ -61,12 +61,21 @@ fn real_main() -> Result<ExitCode, String> {
         ),
         None => None,
     };
+    // The prefix is this process's own: the spawn sets none, so a subtest
+    // inherits it and its wineserver is the one that would owe that subtest a
+    // reply. Without the binary to match a running server against, a timeout
+    // keeps the process sample alone.
+    let wineserver = config
+        .wineserver
+        .zip(wine_prefix())
+        .map(|(exe, prefix)| run::Wineserver { exe, prefix });
     let launch = run::Launch {
         wine: config.wine,
         exe: config.exe,
         log: config.log,
         raw_dir,
         timeout: run::timeout_from_env(),
+        wineserver,
     };
     let leg = Leg {
         arch: config.arch,
@@ -159,6 +168,17 @@ fn real_main() -> Result<ExitCode, String> {
     let report = diff::diff(&baseline, &classes, &current);
     print!("{}", report.text);
     Ok(verdict(&report, validation_errors))
+}
+
+/// The Wine prefix the subtests run in: `WINEPREFIX`, else Wine's default.
+///
+/// `$HOME/.wine` is where Wine goes without the variable, which is the same
+/// fallback the Makefile's prefix target uses, and `None` is a machine that
+/// names neither.
+fn wine_prefix() -> Option<PathBuf> {
+    std::env::var_os("WINEPREFIX")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".wine")))
 }
 
 /// The exit for a leg a GPU hang cut short: no diff, no baseline write.

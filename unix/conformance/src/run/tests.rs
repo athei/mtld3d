@@ -15,19 +15,27 @@
 //! reaches whoever reads the raw dir. A process that runs out of its budget
 //! has to be sampled before the kill, with the sample kept beside the raw log
 //! and named on its `TIMED OUT` line: the kill leaves no other account of
-//! where the process was. A pipe a process outside the subtest's group still
+//! where the process was. Its `TIMED OUT` line names the wineserver sample
+//! too, and that file says why it holds no stacks when no server was looked
+//! for. A pipe a process outside the subtest's group still
 //! holds after the subtest is gone must not park the run: the collection ends
 //! at its grace with what arrived, and the raw log says it was cut short.
+//!
+//! Which server to sample is decided on a process table and a working
+//! directory, so the decision is tested on both rather than on the machine's
+//! own processes: a name alone must never pick another checkout's server, and
+//! a server counts as this prefix's only when the directory it works from is
+//! the one that prefix's device and inode name.
 
 use std::{
     fs,
-    path::PathBuf,
+    path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 
 use super::{
-    DEFAULT_TIMEOUT, Launch, is_gpu_hang_line, normalize_numbers, run_subtest, validation_errors,
-    validation_gate_failed,
+    DEFAULT_TIMEOUT, Launch, cwd_is_server_dir, is_gpu_hang_line, normalize_numbers, run_subtest,
+    server_dir_for, validation_errors, validation_gate_failed, wineserver_pids,
 };
 use crate::model::{Arch, Gpu, Leg, Subtest, Variant};
 
@@ -153,6 +161,7 @@ fn launch(exe: PathBuf) -> Launch {
         log: "off".to_owned(),
         raw_dir: None,
         timeout: DEFAULT_TIMEOUT,
+        wineserver: None,
     }
 }
 
@@ -268,7 +277,8 @@ fn a_subtest_past_its_budget_is_sampled_before_the_kill() {
     let trailer = raw.trim_end().lines().last().expect("trailer");
     assert!(
         trailer.starts_with("[conformance] subtest TIMED OUT after 1s and was killed")
-            && trailer.ends_with("i686-device.sample.txt"),
+            && trailer.contains("i686-device.sample.txt")
+            && trailer.ends_with("i686-device.wineserver-sample.txt"),
         "{trailer}"
     );
     let sample = fs::read_to_string(dir.join("i686-device.sample.txt"))
@@ -276,6 +286,68 @@ fn a_subtest_past_its_budget_is_sampled_before_the_kill() {
     assert!(
         sample.contains("Call graph:"),
         "the sample holds no stacks of the process: {sample}"
+    );
+    // This spawn names no wineserver, so the second file says that rather
+    // than being absent: a reader must not have to tell a server that was
+    // never looked for from one that was and could not be found.
+    let server = fs::read_to_string(dir.join("i686-device.wineserver-sample.txt"))
+        .expect("wineserver sample kept beside the process's");
+    assert!(
+        server.contains("no wineserver was sampled"),
+        "the wineserver sample says nothing about why it holds no stacks: {server}"
+    );
+}
+
+/// A process table in the shape `ps -Ao pid=,comm=` prints, two prefixes deep.
+///
+/// Two checkouts each run a server out of their own isolated clone of a Wine
+/// SDK, a third install has one of its own, and the loader of the first
+/// checkout is running too.
+const PROCESS_TABLE: &str = "  431 /usr/sbin/cfprefsd
+ 43903 /work/one/.wine-isolated/sdk/bin/wineserver
+ 44438 /work/two/.wine-isolated/sdk/bin/wineserver
+ 49324 /Applications/Other.app/Contents/Resources/wine/bin/wineserver
+ 50001 /work/one/.wine-isolated/sdk/bin/wine
+";
+
+#[test]
+fn only_the_named_wineserver_binary_matches() {
+    assert_eq!(
+        wineserver_pids(
+            PROCESS_TABLE,
+            Path::new("/work/one/.wine-isolated/sdk/bin/wineserver")
+        ),
+        vec![43903],
+        "another checkout's server, another install's, and the loader itself          all carry the same name"
+    );
+    assert!(
+        wineserver_pids(PROCESS_TABLE, Path::new("/work/three/sdk/bin/wineserver")).is_empty(),
+        "a binary nothing was exec'd from matches nothing"
+    );
+}
+
+#[test]
+fn the_server_directory_names_the_prefix_by_device_and_inode() {
+    assert_eq!(
+        server_dir_for(0x0100_0011, 0x08ac_256f),
+        "server-1000011-8ac256f"
+    );
+}
+
+#[test]
+fn a_server_is_its_own_prefix_only_when_its_directory_says_so() {
+    let cwd = |dir: &str| format!("p43903\nfcwd\nn/private/tmp/.wine-501/{dir}\n");
+    assert!(cwd_is_server_dir(
+        &cwd("server-1000011-8ac256f"),
+        "server-1000011-8ac256f"
+    ));
+    assert!(
+        !cwd_is_server_dir(&cwd("server-1000011-360f506"), "server-1000011-8ac256f"),
+        "another prefix's server directory is not this prefix's"
+    );
+    assert!(
+        !cwd_is_server_dir("", "server-1000011-8ac256f"),
+        "a process whose directory could not be read is not a match"
     );
 }
 

@@ -11,6 +11,12 @@ pub struct Config {
     pub update: bool,
     /// `--wine`: the Wine loader to spawn the test binary with.
     pub wine: PathBuf,
+    /// `--wineserver`: the `wineserver` of the install `--wine` comes from.
+    ///
+    /// Optional, and used for one thing: a subtest that runs out of its budget
+    /// has the server of its prefix sampled beside it. Without it that sample
+    /// says no server was named instead of holding the server's stacks.
+    pub wineserver: Option<PathBuf>,
     /// `--exe`: the `d3d9_test.exe` to run.
     pub exe: PathBuf,
     /// `--arch`: which architecture `exe` is, i.e. the label results record under.
@@ -42,9 +48,9 @@ pub struct Config {
 
 /// Parse CLI args (excluding `argv[0]`).
 ///
-/// Recognised flags: `--update-baseline`, `--wine <path>`, `--exe <path>`,
-/// `--arch <arch>`, `--variant <native|intel|scale>`, `--assets <dir>`,
-/// `--only <subtest>`, `--repeat <N>`, `--log <filter>`.
+/// Recognised flags: `--update-baseline`, `--wine <path>`, `--wineserver
+/// <path>`, `--exe <path>`, `--arch <arch>`, `--variant <native|intel|scale>`,
+/// `--assets <dir>`, `--only <subtest>`, `--repeat <N>`, `--log <filter>`.
 /// `--wine`, `--exe` and `--arch` are mandatory: the runner resolves no paths of
 /// its own, so the caller (the Makefile) owns every Wine location. One
 /// invocation runs one test binary, which is what lets a 32-bit and a 64-bit CI
@@ -61,6 +67,7 @@ pub struct Config {
 pub fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Config, String> {
     let mut update = false;
     let mut wine: Option<PathBuf> = None;
+    let mut wineserver: Option<PathBuf> = None;
     let mut exe: Option<PathBuf> = None;
     let mut arch: Option<Arch> = None;
     let mut variant = Variant::Native;
@@ -76,6 +83,12 @@ pub fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Config, Stri
                     .next()
                     .ok_or_else(|| "--wine needs a path".to_owned())?;
                 wine = Some(PathBuf::from(value));
+            }
+            "--wineserver" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "--wineserver needs a path".to_owned())?;
+                wineserver = Some(PathBuf::from(value));
             }
             "--exe" => {
                 let value = args.next().ok_or_else(|| "--exe needs a path".to_owned())?;
@@ -135,6 +148,7 @@ pub fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Config, Stri
     Ok(Config {
         update,
         wine,
+        wineserver,
         exe,
         arch,
         variant,

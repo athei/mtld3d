@@ -72,15 +72,23 @@ A raw log is stdout followed by stderr, and ends with how the process ended:
 `[conformance] subtest exited: code N` or `signal N` (a number, never a name,
 so a fault the process survived cannot read as a crash to the scanner), or the
 `TIMED OUT` line when the runner killed it. A process the runner kills for its
-budget is sampled first (`sample <pid> 2`, every thread's stack), and the
-sample is kept beside the raw log as `<leg>-<subtest>.sample.txt`, named on
-that line; without a raw directory the sample goes to the runner's stderr.
-It is the one account of where a hang was: the raw log of a process parked in
-a syscall ends in that line and nothing else. A run without the framework's
-`tests executed` summary is a crash whatever else it holds, and this line is
-what tells an unhandled Win32 exception (Wine ends the process with the
-exception code, of which unix keeps the low byte: `code 5` is an access
-violation) from a signal (11 `SIGSEGV`, 10 `SIGBUS`, 6 `SIGABRT`, 9 `SIGKILL`).
+budget is sampled first (`sample <pid> 2`, every thread's stack), and so is the
+wineserver serving its prefix, the process it may be waiting on: the samples
+are kept beside the raw log as `<leg>-<subtest>.sample.txt` and
+`<leg>-<subtest>.wineserver-sample.txt`, both named on that line; without a raw
+directory they go to the runner's stderr. They are the one account of where a
+hang was: the raw log of a process parked in a syscall ends in that line and
+nothing else, and a thread parked in `wine_server_call` shows nothing of the
+server that owes it a reply. The server is matched on two things, so no other
+prefix's is ever read: the binary it was exec'd from, which the Makefile names
+with `--wineserver` out of the same Wine SDK as the loader, and the directory
+it works from, which wineserver names after the device and inode of the prefix
+it serves. When no such server is running, the file says so instead of failing
+the leg. A run without the framework's `tests executed` summary is a crash
+whatever else it holds, and this line is what tells an unhandled Win32
+exception (Wine ends the process with the exception code, of which unix keeps
+the low byte: `code 5` is an access violation) from a signal (11 `SIGSEGV`,
+10 `SIGBUS`, 6 `SIGABRT`, 9 `SIGKILL`).
 A run that reached its summary reads `code 0` once a device existed (the layer
 ends the process from its detach, see CONTRIBUTING.md), else the framework's
 failure count capped at 255.
