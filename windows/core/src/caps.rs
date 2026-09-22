@@ -11,7 +11,7 @@ use mtld3d_types::{
     d3dps_version, d3dvs_version,
 };
 
-use crate::ff_state::MAX_ACTIVE_LIGHTS;
+use crate::ff_state::{MAX_ACTIVE_LIGHTS, MAX_VERTEX_BLEND_MATRIX_INDEX};
 
 // Caps are a *truthful floor* under current capability: they advertise only
 // what the renderer actually implements. Every default below therefore names
@@ -55,8 +55,9 @@ const FF_TEXTURE_STAGES: u32 = 8;
 /// layout, and `emit_vs` blends position + normal via the explicit-weight loop
 /// with an implicit last weight. `D3DVBF_3WEIGHTS` is the spec maximum per
 /// vertex, so the cap is that mode's explicit weight count plus the implicit
-/// one. The palette size is the separate `D3DTS_WORLDMATRIX(0..255)` range,
-/// which `D3DCAPS9` has no field for (games discover it by trial).
+/// one. How far into the palette those matrices may sit is the separate
+/// `MaxVertexBlendMatrixIndex` field, reported from
+/// [`MAX_VERTEX_BLEND_MATRIX_INDEX`].
 const MAX_VERTEX_BLEND_MATRICES: u32 = D3DVBF_3WEIGHTS + 1;
 
 /// Primitives a single `DrawPrimitive` call may emit.
@@ -485,6 +486,12 @@ const fn fill_default(caps: &mut D3DCAPS9) {
     caps.vertex_processing_caps = VTXP_DEFAULT.bits();
     caps.max_active_lights = MAX_ACTIVE_LIGHTS;
     caps.max_vertex_blend_matrices = MAX_VERTEX_BLEND_MATRICES;
+    // Indexed vertex blending (`D3DRS_INDEXEDVERTEXBLENDENABLE` with a
+    // `BLENDINDICES` element) reads the palette through the same rows, so the
+    // highest index it can address is what the FF VS constant layout carries.
+    // Zero here reads as "no indexed vertex blending on this device", which
+    // sends a title to its software or non-indexed path.
+    caps.max_vertex_blend_matrix_index = MAX_VERTEX_BLEND_MATRIX_INDEX;
     caps.max_point_size = MAX_POINT_SIZE;
     caps.max_primitive_count = MAX_PRIMITIVE_COUNT;
     caps.vertex_shader_version = d3dvs_version(3, 0);
@@ -569,6 +576,9 @@ fn apply_advertise_all(caps: &mut D3DCAPS9) {
     // spec maximum on the default path, so this is a no-op kept for symmetry.
     // `max_vertex_blend_matrices` and `max_point_size` need no raise: the
     // truthful values in `fill_default` are already what the path supports.
+    // `max_vertex_blend_matrix_index` is not raised either, and this one would
+    // do harm: a higher index is a palette row the FF VS constant block does
+    // not carry, so the blended vertex would read constants no draw bound.
     caps.num_simultaneous_rts = caps
         .num_simultaneous_rts
         .max(D3D_MAX_SIMULTANEOUS_RENDERTARGETS);

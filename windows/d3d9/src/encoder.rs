@@ -23,6 +23,7 @@ use mtld3d_core::{
         declared_ps_samplers, emit_ps_ff_named, emit_ps_programmable_named, emit_vs_ff_named,
         emit_vs_programmable_named,
     },
+    ff_state::{FF_VS_PALETTE_BASE_ROW, MAX_VERTEX_BLEND_MATRIX_INDEX},
     format::map_d3d_format,
     gpu_caps::GpuCaps,
     ids::{BufferId, DepthStencilKey, ProgramId, SamplerKey, TextureId},
@@ -158,6 +159,17 @@ const _: () = assert!(
 /// count is a compile error rather than a silent truncating `as` cast.
 const CONSTANT_ROWS_U16: u16 = 256;
 const _: () = assert!(CONSTANT_ROWS == CONSTANT_ROWS_U16 as usize);
+
+// The FF VS world-matrix palette shares this mirror: it starts at
+// `FF_VS_PALETTE_BASE_ROW` and takes four rows per matrix, and `caps::fill`
+// reports the last index that fits as `D3DCAPS9::MaxVertexBlendMatrixIndex`.
+// A mirror too small for that index would leave a title's blended vertex
+// reading rows no draw ever bound.
+const _: () = assert!(
+    FF_VS_PALETTE_BASE_ROW as usize + (MAX_VERTEX_BLEND_MATRIX_INDEX as usize + 1) * 4
+        <= CONSTANT_ROWS,
+    "the FF VS constant mirror no longer holds the advertised vertex-blend palette"
+);
 
 /// Wire size of an `f32` clear-depth scratch entry.
 ///

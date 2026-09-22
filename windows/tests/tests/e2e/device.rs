@@ -862,6 +862,17 @@ fn device_caps_are_sane() {
         "no texture-creation restriction is advertised"
     );
     assert!(caps.max_streams >= 1, "no vertex streams");
+    // Indexed vertex blending: zero in MaxVertexBlendMatrixIndex reads as "no
+    // indexed vertex blending on this device", and the palette has to hold at
+    // least the matrices one vertex blends.
+    assert_ne!(
+        caps.max_vertex_blend_matrix_index, 0,
+        "indexed vertex blending reported as absent"
+    );
+    assert!(
+        caps.max_vertex_blend_matrix_index + 1 >= caps.max_vertex_blend_matrices,
+        "world-matrix palette smaller than the per-vertex blend count"
+    );
     // A 2.0+ device reports its SM2 sub-structs; all-zero reads as "no
     // ps_2_x profile" to engines of that era (3DMark05 refused to start).
     assert!(

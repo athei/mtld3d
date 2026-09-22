@@ -51,6 +51,23 @@ use crate::{
 /// advertised cap cannot drift from the number of slots the FF VS has.
 pub const MAX_ACTIVE_LIGHTS: u32 = 8;
 
+/// First FF VS constant row of the world-matrix palette.
+///
+/// Every section below it has a fixed row range (`FfVsDirty` names each one);
+/// the palette runs from here to the end of the constant block, four rows per
+/// matrix, and the emitted FF VS reads it as `vs_c + 95 + idx * 4`.
+pub const FF_VS_PALETTE_BASE_ROW: u16 = 95;
+
+/// Highest `D3DTS_WORLDMATRIX(i)` index a draw can read through vertex blending.
+///
+/// The encoder binds 256 FF VS constant rows (`CONSTANT_ROWS` in the `d3d9`
+/// crate, which asserts that its mirror still holds this index), so rows
+/// 95..=255 carry 40 whole matrices and 39 is the last index whose four rows
+/// are inside the block. `caps::fill` reports it as
+/// `D3DCAPS9::MaxVertexBlendMatrixIndex`, so a title that sizes its bone
+/// palette from the cap never asks for a matrix the layout has no rows for.
+pub const MAX_VERTEX_BLEND_MATRIX_INDEX: u32 = 39;
+
 bitflags! {
     /// Per-section dirty bits for the FF VS const buffer.
     ///
@@ -1377,7 +1394,8 @@ impl FfState {
         let mut row_count: u32 = u32::from(max_row) + 1;
         if vs_key.vertex_blend_count > 0 {
             let used = self.world_palette_used();
-            let palette_rows = 95 + u32::try_from(used).expect("palette ≤ 256") * 4;
+            let palette_rows =
+                u32::from(FF_VS_PALETTE_BASE_ROW) + u32::try_from(used).expect("palette ≤ 256") * 4;
             if palette_rows > row_count {
                 row_count = palette_rows;
             }
@@ -1697,7 +1715,7 @@ impl FfState {
                 Self::transpose(&Self::mat_mul(&self.world_palette[bone], &self.view));
             write_matrix_rows(chunk, &bone_view_t);
         }
-        Some((95, rows, dst_ptr.cast::<u8>()))
+        Some((FF_VS_PALETTE_BASE_ROW, rows, dst_ptr.cast::<u8>()))
     }
 
     /// Pack a used stage-constant prefix directly into immutable frame scratch.
