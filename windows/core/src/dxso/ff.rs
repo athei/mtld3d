@@ -548,6 +548,7 @@ pub fn emit_vs_ff_named(vs_key: &FfVsKey, entry: &str) -> String {
     out.push_str("using namespace metal;\n\n");
     emit_vertex_in(&mut out, vs_key);
     emit_varyings(&mut out, false, vs_key.clip_plane_count);
+    out.push_str(super::emit::POS_FIXUP_MSL);
     out.push_str(crate::vs_draw::VS_DRAW_MSL);
     if vs_key.lighting_enabled() && vs_key.has_normal() {
         emit_normal_matrix_helpers(&mut out);
@@ -899,7 +900,7 @@ fn emit_vs(out: &mut String, vs: &FfVsKey, entry: &str) {
     // collide with them.
     let _ = writeln!(
         out,
-        "    constant float4 &pos_fixup [[buffer({VS_POS_FIXUP_SLOT})]],"
+        "    constant PosFixup &pos_fixup [[buffer({VS_POS_FIXUP_SLOT})]],"
     );
     // Per-draw point state (`crate::vs_draw`): `D3DRS_POINTSIZE` for a
     // layout without PSIZE, the `POINTSIZE_MIN/MAX` clamp, and the
@@ -1002,6 +1003,9 @@ fn emit_vs(out: &mut String, vs: &FfVsKey, entry: &str) {
         // clip-space round trip (`z*w / w`) keeps the FP rounding shape the
         // rasterizer's own depth uses.
         out.push_str("    out.fog_z = out.position.z / out.position.w;\n");
+        // `D3DRS_DEPTHBIAS`, after `fog_z` (the table-fog source adds the raw
+        // bias itself) and ahead of the clamp below.
+        out.push_str(super::emit::POS_FIXUP_DEPTH_BIAS_MSL);
 
         // Depth-clamp for pre-transformed geometry with the depth test
         // inactive: D3D9 does not z-clip an
@@ -1541,6 +1545,8 @@ fn emit_vs(out: &mut String, vs: &FfVsKey, entry: &str) {
     }
     // NDC depth for the table-fog Z source (see the Varyings decl).
     out.push_str("    out.fog_z = out.position.z / out.position.w;\n");
+    // `D3DRS_DEPTHBIAS`, after `fog_z`: the table-fog source adds the raw bias itself.
+    out.push_str(super::emit::POS_FIXUP_DEPTH_BIAS_MSL);
 
     out.push_str("    return out;\n");
     out.push_str("}\n");

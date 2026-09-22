@@ -5161,10 +5161,11 @@ pub struct LastBoundCache {
     /// (which already skips default values) continues to skip the first
     /// default-value draw of each pass.
     blend_color: u32,
-    /// `D3DRS_DEPTHBIAS` + `D3DRS_SLOPESCALEDEPTHBIAS`.
+    /// The `setDepthBias` pair.
     ///
-    /// Post the `d3d_depth_bias_to_metal` conversion + the
-    /// implicit-decal-bias heuristic. Stored as raw bits so the
+    /// Only `D3DRS_SLOPESCALEDEPTHBIAS` (or the implicit decal slope) is
+    /// non-zero in practice: the constant `D3DRS_DEPTHBIAS` term reaches the
+    /// vertex shader through `pos_fixup` instead. Stored as raw bits so the
     /// comparison is exact (no NaN ambiguity) and the slot has a
     /// definite "not yet bound" sentinel — `(0, 0)` matches Metal's
     /// fresh-encoder default.

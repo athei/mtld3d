@@ -319,7 +319,11 @@ mod source;
 /// `76` adds the canonical fixed-function vertex range-fog flag.
 ///
 /// `77` adds the fixed-function TEMP register and packed result destination.
-pub const SHADER_CACHE_SCHEMA_VERSION: u32 = 77;
+///
+/// `78` turns `pos_fixup` into the `PosFixup` struct and adds the
+/// `D3DRS_DEPTHBIAS` offset to the position epilogue, changing the MSL of
+/// every vertex shader.
+pub const SHADER_CACHE_SCHEMA_VERSION: u32 = 78;
 
 /// Source-derived identity of MSL emission, independent of persistent DXSO and shader keys.
 pub const SHADER_EMITTER_VERSION: u64 = include!(concat!(env!("OUT_DIR"), "/emitter_version.rs"));

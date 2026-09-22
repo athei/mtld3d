@@ -2724,11 +2724,10 @@ fn encode_pass(
                     encoder.setTriangleFillMode(mode);
                 }
                 Some(CommandType::SetDepthBias) => {
-                    // PE side already scales `depth_bias` to the active
-                    // depth format's ULP via
-                    // `mtld3d_core::convert::d3d_depth_bias_to_metal`,
-                    // so pass straight through. D3D9 has no clamp
-                    // analog — hardcode 0.0.
+                    // Passed straight through; the PE side sends the
+                    // slope term here and applies the constant one in
+                    // the vertex shader. D3D9 has no clamp analog, so
+                    // hardcode 0.0.
                     let depth_bias = f32::from_bits(cmd.param_a);
                     let slope_scale = f32::from_bits(to_u32(cmd.param_b));
                     encoder.setDepthBias_slopeScale_clamp(depth_bias, slope_scale, 0.0);

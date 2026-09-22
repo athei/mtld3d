@@ -2536,12 +2536,28 @@ fn rhw_emits_pos_fixup_selected_depth_clamp() {
         fog_z < clamp_at,
         "fog_z must be written from the unclamped position:\n{msl}"
     );
+    // `D3DRS_DEPTHBIAS` lands between the two: after `fog_z`, because the
+    // table-fog source adds the raw bias itself, and ahead of the clamp.
+    let bias = "float _depth_biased = _pos.z + pos_fixup.depth_bias * _pos.w;";
+    let bias_at = msl.find(bias).expect("RHW epilogue applies the depth bias");
+    assert!(
+        fog_z < bias_at && bias_at < clamp_at,
+        "the depth bias sits between fog_z and the clamp:\n{msl}"
+    );
     // The regular (non-RHW) transform path clips like every other draw and
     // must not grow the clamp.
     let msl_plain = emit_vs_ff(&default_vs_key());
     assert!(
         !msl_plain.contains("pos_fixup.z != 0.0"),
         "non-RHW FF VS must not emit the depth clamp:\n{msl_plain}"
+    );
+    // It applies the same depth bias line, byte-identical to the
+    // programmable emitter's, after its own `fog_z`.
+    let plain_bias = msl_plain.find(bias).expect("FF VS applies the depth bias");
+    let plain_fog_z = msl_plain.find("out.fog_z =").expect("FF VS writes fog_z");
+    assert!(
+        plain_fog_z < plain_bias,
+        "fog_z must read the unbiased depth:\n{msl_plain}"
     );
 }
 
@@ -2555,7 +2571,7 @@ fn ff_transform_emits_half_pixel_pos_fixup() {
     let msl = emit_vs_ff(&vs);
     assert!(
         msl.contains(&format!(
-            "constant float4 &pos_fixup [[buffer({VS_POS_FIXUP_SLOT})]]"
+            "constant PosFixup &pos_fixup [[buffer({VS_POS_FIXUP_SLOT})]]"
         )),
         "FF VS must declare the pos_fixup uniform at its slot:\n{msl}"
     );

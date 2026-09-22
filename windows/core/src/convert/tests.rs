@@ -843,33 +843,32 @@ fn ff_vs_layout_single_tex0_yields_1() {
 }
 
 #[test]
-fn d3d_depth_bias_zero_passes_through() {
-    // D3DRS_DEPTHBIAS default is 0.0 (u32 0). Most draws don't touch
-    // it — the scaled output must stay exactly zero so games that
-    // never write the state see no rasterizer offset.
-    assert_eq!(d3d_depth_bias_to_metal(0).to_bits(), 0.0_f32.to_bits());
+fn d3d_depth_bias_reaches_clip_space_unscaled_over_the_full_depth_range() {
+    // D3D9 states the bias in the depth range itself, and the vertex shader
+    // adds it times `w`, so over a 0..1 viewport the raw value is the offset.
+    for raw in [0.0_f32, -0.0, 2.5e-5, -2.5e-5, 0.1] {
+        assert_eq!(
+            d3d_depth_bias_to_clip(raw.to_bits(), 0.0, 1.0).to_bits(),
+            raw.to_bits()
+        );
+    }
 }
 
 #[test]
-fn d3d_depth_bias_scales_by_two_pow_23() {
-    // D3D9 spec: 1 ULP at the depth resolution. Metal's setDepthBias
-    // takes the value in absolute float units of the depth format.
-    // mtld3d's depth always resolves to Depth32Float (mantissa = 23
-    // bits), so the scale is 2^23.
-    let raw = 1.0f32.to_bits();
-    let scaled = d3d_depth_bias_to_metal(raw);
-    // 2^23 = 8_388_608.0 is exactly representable in f32; bit-equality holds.
-    assert_eq!(scaled.to_bits(), 8_388_608.0_f32.to_bits());
+fn d3d_depth_bias_is_divided_by_the_viewport_depth_range() {
+    // The viewport maps clip depth into `min_z..max_z` after the vertex
+    // shader added the offset, scaling it by the range; dividing first
+    // leaves the fragment the absolute bias D3D9 asked for.
+    let clip = d3d_depth_bias_to_clip(0.125_f32.to_bits(), 0.25, 0.75);
+    assert_eq!(clip.to_bits(), 0.25_f32.to_bits());
 }
 
 #[test]
-fn d3d_depth_bias_negative_pushes_toward_camera() {
-    // Negative bias is the canonical decal-pull-forward direction.
-    // Sign must be preserved through the scale.
-    // raw = -1.0 / 2^23 → scale × raw = -1.0
-    let raw = (-(1.0_f32 / 8_388_608.0_f32)).to_bits();
-    let scaled = d3d_depth_bias_to_metal(raw);
-    assert!((scaled - -1.0).abs() < 1e-6);
+fn d3d_depth_bias_is_dropped_over_an_empty_depth_range() {
+    for (min_z, max_z) in [(0.5_f32, 0.5_f32), (0.75, 0.25)] {
+        let clip = d3d_depth_bias_to_clip(0.125_f32.to_bits(), min_z, max_z);
+        assert_eq!(clip.to_bits(), 0.0_f32.to_bits());
+    }
 }
 
 #[test]
@@ -987,26 +986,21 @@ fn looks_like_decal_fires_on_both_tolerant_comparisons() {
 }
 
 #[test]
-fn implicit_decal_bias_scales_to_safe_metal_band() {
-    // Magnitude band rationale:
-    // (a) > ~500 Metal units swamps the depth-buffer's 2^-23
-    //     step plus the structural eye-space delta observed
-    //     between two SM3 pipelines on Apple Silicon at grazing
-    //     angles;
-    // (b) < ~5000 keeps flat decals from punching through
-    //     adjacent geometry on steep terrain.
-    // Tune the constant if a future workload forces it out of
-    // this band; the test catches accidental order-of-magnitude
-    // changes.
-    let metal = d3d_depth_bias_to_metal(IMPLICIT_DECAL_BIAS_RAW);
+fn implicit_decal_bias_stays_in_its_safe_band() {
+    // (a) above 3e-5 covers the eye-space delta observed between a decal's
+    //     and its surface's vertex shader at grazing angles;
+    // (b) below 3e-4 keeps flat decals from punching through adjacent
+    //     geometry on steep terrain.
+    // The test catches accidental order-of-magnitude changes.
+    let bias = f32::from_bits(IMPLICIT_DECAL_BIAS_RAW);
     assert!(
-        metal < 0.0,
-        "implicit bias must pull toward camera, got {metal}"
+        bias < 0.0,
+        "implicit bias must pull toward camera, got {bias}"
     );
-    let mag = -metal;
-    assert!(mag > 500.0, "magnitude {mag} too small to swamp ULP noise");
+    let mag = -bias;
+    assert!(mag > 3.0e-5, "magnitude {mag} too small to cover the delta");
     assert!(
-        mag < 5000.0,
+        mag < 3.0e-4,
         "magnitude {mag} risks punching through terrain"
     );
 }

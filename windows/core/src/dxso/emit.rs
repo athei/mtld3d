@@ -303,6 +303,33 @@ pub enum EmitError {
     UnsupportedRegisterKind(String),
 }
 
+/// MSL declaration of the per-draw position fixup uniform, emitted ahead of every vertex function.
+///
+/// `(x, y) = (1/vp_w, -1/vp_h)` is the half-pixel shift, `z` selects the
+/// fixed-function RHW depth clamp, `w` is render pixels per logical pixel,
+/// and `depth_bias` is `D3DRS_DEPTHBIAS` as a clip-space offset
+/// (`crate::convert::d3d_depth_bias_to_clip`). The encoder packs the same
+/// five floats in `emit_draw`; the two move in lock-step.
+pub const POS_FIXUP_MSL: &str = "struct PosFixup {\n    float x;\n    float y;\n    float z;\n    float w;\n    float depth_bias;\n};\n\n";
+
+/// The epilogue lines that apply `D3DRS_DEPTHBIAS` to the clip-space position.
+///
+/// Scaled by `.w` so the offset is constant after the perspective divide.
+/// D3D9 biases a fragment after clipping and clamps the result to the depth
+/// range, so a bias never removes geometry: a vertex inside the depth range
+/// is clamped back into it, where the sum alone would hand a quad on the far
+/// plane under a positive bias (or one on the near plane under a negative
+/// one) to the clipper. A vertex outside the range keeps the plain sum, so a
+/// triangle crossing a plane is still clipped and its visible part carries
+/// the full bias. Shared by both vertex emitters so the two stay
+/// byte-identical.
+pub const POS_FIXUP_DEPTH_BIAS_MSL: &str = concat!(
+    "    float4 _pos = out.position;\n",
+    "    float _depth_biased = _pos.z + pos_fixup.depth_bias * _pos.w;\n",
+    "    _pos.z = select(_depth_biased, clamp(_depth_biased, 0.0, _pos.w), _pos.z >= 0.0 && _pos.z <= _pos.w);\n",
+    "    out.position = _pos;\n",
+);
+
 /// Default VS / PS entry-point names used when callers don't supply one.
 ///
 /// Those callers are the tests and the offline `disasm` tool.
@@ -355,6 +382,7 @@ pub fn emit_vs_programmable_named(
     w(&mut out, "using namespace metal;\n\n");
     emit_vertex_in(&mut out, vs, provided_mask);
     emit_varyings(&mut out, false, clip_plane_count);
+    w(&mut out, POS_FIXUP_MSL);
     w(&mut out, crate::vs_draw::VS_DRAW_MSL);
     emit_const_rel_helper(&mut out, vs);
     emit_vs_function(
@@ -600,7 +628,7 @@ fn emit_vs_function(
     // consts are 0..255 inside vs_c.
     let _ = write!(
         out,
-        ",\n    constant float4 &pos_fixup [[buffer({VS_POS_FIXUP_SLOT})]]"
+        ",\n    constant PosFixup &pos_fixup [[buffer({VS_POS_FIXUP_SLOT})]]"
     );
     // Per-draw point state (`crate::vs_draw`): the `D3DRS_POINTSIZE` default
     // for a shader that never writes `oPts`, and the `POINTSIZE_MIN/MAX`
@@ -664,6 +692,14 @@ fn emit_vs_function(
     // diffuse/specular is unchanged.
     w(out, "    out.color0 = float4(1.0);\n");
     w(out, "    out.color1 = float4(0.0);\n");
+    // A texture coordinate the VS never writes, or writes in part, reads as
+    // zero in the lanes it left alone, as on D3D9 hardware. The FF emitter
+    // zeroes its unwritten texcoords the same way; without this the paired PS
+    // reads whatever the register held, which differs by device and by
+    // unrelated changes to the shader.
+    for i in 0..16 {
+        let _ = writeln!(out, "    out.texcoord{i} = float4(0.0);");
+    }
     // Default-initialize fog to 1.0 (unfogged) so shaders that never write
     // oFog pair safely with the FF PS fog-blend (variant.fog_mode != 0
     // would read garbage otherwise). Writes to oFog land here too, via
@@ -769,6 +805,9 @@ fn emit_vs_function(
     w(out, "    out.position.y += pos_fixup.y * out.position.w;\n");
     // NDC depth for the table-fog Z source (see the Varyings decl).
     w(out, "    out.fog_z = out.position.z / out.position.w;\n");
+    // `D3DRS_DEPTHBIAS` (see `POS_FIXUP_MSL`). After `fog_z`, which stays
+    // unbiased because the table-fog source adds the raw bias itself.
+    w(out, POS_FIXUP_DEPTH_BIAS_MSL);
     // `D3DRS_POINTSIZE_MIN/MAX` clamp the final size whether it came from
     // the shader (`oPts` / `dcl_psize`) or the render-state default. The
     // clamp runs in the logical pixels D3D9 states every point size in, and
