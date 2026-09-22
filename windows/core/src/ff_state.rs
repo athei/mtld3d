@@ -443,6 +443,31 @@ impl FfState {
         self.world_palette_high_water as usize + 1
     }
 
+    /// World matrices a vertex-blending draw uploads and the shader may read.
+    ///
+    /// [`Self::world_palette_used`] counts every `D3DTS_WORLDMATRIX(i)` the
+    /// title has written, and D3D9 lets that run to 256, while the FF VS
+    /// constant block holds the palette only up to
+    /// [`MAX_VERTEX_BLEND_MATRIX_INDEX`], the index `caps::fill` advertises as
+    /// `D3DCAPS9::MaxVertexBlendMatrixIndex`. Counting or packing past it runs
+    /// off the end of the block, so the matrices above the cap are dropped and
+    /// the first draw that would have carried one says so once.
+    fn world_palette_uploaded(&self) -> usize {
+        let used = self.world_palette_used();
+        let limit = usize::try_from(MAX_VERTEX_BLEND_MATRIX_INDEX)
+            .expect("MaxVertexBlendMatrixIndex fits usize")
+            + 1;
+        if used > limit {
+            mtld3d_shared::log_once_warn!(
+                target: crate::LOG_TARGET,
+                "FF vertex blend: D3DTS_WORLDMATRIX({}) is past MaxVertexBlendMatrixIndex {MAX_VERTEX_BLEND_MATRIX_INDEX} → matrices above the cap not uploaded",
+                used - 1
+            );
+            return limit;
+        }
+        used
+    }
+
     /// Read-only access to the world-matrix palette.
     ///
     /// Slice length is bounded by `world_palette_used()` for callers that want
@@ -1351,9 +1376,11 @@ impl FfState {
     ///
     /// # Panics
     ///
-    /// Panics if `world_palette_used()` exceeds `u32` (unreachable —
-    /// bounded by 256 per spec) or if the computed row count exceeds
-    /// `u16` (also unreachable — `95 + 256*4 = 1119 < u16::MAX`).
+    /// Panics if the uploaded palette count exceeds `u32` or if the computed
+    /// row count exceeds `u16`. Both are unreachable:
+    /// `world_palette_uploaded` bounds the palette by
+    /// [`MAX_VERTEX_BLEND_MATRIX_INDEX`], so the count stops at
+    /// `95 + 40 * 4 = 255`.
     #[must_use]
     pub fn ff_vs_row_count(&self, vs_key: &FfVsKey) -> u16 {
         if vs_key.has_rhw() {
@@ -1393,14 +1420,14 @@ impl FfState {
         }
         let mut row_count: u32 = u32::from(max_row) + 1;
         if vs_key.vertex_blend_count > 0 {
-            let used = self.world_palette_used();
-            let palette_rows =
-                u32::from(FF_VS_PALETTE_BASE_ROW) + u32::try_from(used).expect("palette ≤ 256") * 4;
+            let used = self.world_palette_uploaded();
+            let palette_rows = u32::from(FF_VS_PALETTE_BASE_ROW)
+                + u32::try_from(used).expect("uploaded palette ≤ 40") * 4;
             if palette_rows > row_count {
                 row_count = palette_rows;
             }
         }
-        u16::try_from(row_count).expect("FF VS row_count ≤ 95 + 256*4 fits u16")
+        u16::try_from(row_count).expect("FF VS row_count ≤ 95 + 40*4 fits u16")
     }
 
     /// XYZRHW path: pack `[vp_w, vp_h, vp_x, vp_y]` into row 0.
@@ -1687,14 +1714,14 @@ impl FfState {
 
     /// Bump-copy the row 95+ PALETTE section (world-matrix palette × view).
     ///
-    /// Extent: `world_palette_used() * 4` rows. Returns `None` when
+    /// Extent: `world_palette_uploaded` × 4 rows. Returns `None` when
     /// `vs_key.vertex_blend_count == 0` (palette is never read by the
     /// shader in that case).
     ///
     /// # Panics
     ///
-    /// Panics if `world_palette_used()` exceeds `u16` capacity — unreachable
-    /// (bounded by 256 per spec → `256 * 4 = 1024 < u16::MAX`).
+    /// Panics if the uploaded palette exceeds `u16` capacity — unreachable
+    /// (bounded by [`MAX_VERTEX_BLEND_MATRIX_INDEX`] → `40 * 4 = 160`).
     pub fn build_palette_section(
         &self,
         vs_key: &FfVsKey,
@@ -1703,9 +1730,9 @@ impl FfState {
         if vs_key.vertex_blend_count == 0 {
             return None;
         }
-        let used = self.world_palette_used();
+        let used = self.world_palette_uploaded();
         let rows_usize = used * 4;
-        let rows = u16::try_from(rows_usize).expect("PALETTE rows ≤ 256*4 fits u16");
+        let rows = u16::try_from(rows_usize).expect("PALETTE rows ≤ 40*4 fits u16");
         let dst_ptr = scratch.alloc_uninit_slice::<core::mem::MaybeUninit<[f32; 4]>>(rows_usize);
         // SAFETY: see `build_xyzrhw_row`.
         let dst: &mut [core::mem::MaybeUninit<[f32; 4]>] =

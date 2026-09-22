@@ -5,17 +5,19 @@ use mtld3d_tests::{
     assert_pixel_approx,
 };
 use mtld3d_types::{
-    D3DCMP_GREATER, D3DCOLORVALUE, D3DFMT_A8R8G8B8, D3DFVF_DIFFUSE, D3DFVF_NORMAL, D3DFVF_SPECULAR,
-    D3DFVF_XYZ, D3DLIGHT_DIRECTIONAL, D3DLIGHT_POINT, D3DLIGHT_SPOT, D3DLIGHT9, D3DMATERIAL9,
-    D3DMCS_MATERIAL, D3DPOOL_MANAGED, D3DPT_TRIANGLELIST, D3DRS_ALPHAFUNC, D3DRS_ALPHAREF,
-    D3DRS_ALPHATESTENABLE, D3DRS_AMBIENT, D3DRS_AMBIENTMATERIALSOURCE, D3DRS_DIFFUSEMATERIALSOURCE,
-    D3DRS_EMISSIVEMATERIALSOURCE, D3DRS_LIGHTING, D3DRS_LOCALVIEWER, D3DRS_SPECULARENABLE,
-    D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_MAGFILTER, D3DSAMP_MINFILTER, D3DTA_ALPHAREPLICATE,
-    D3DTA_DIFFUSE, D3DTA_SPECULAR, D3DTA_TEXTURE, D3DTADDRESS_CLAMP, D3DTADDRESS_WRAP,
-    D3DTEXF_POINT, D3DTOP_MODULATE, D3DTOP_SELECTARG1, D3DTS_PROJECTION, D3DTS_TEXTURE0,
-    D3DTS_VIEW, D3DTS_WORLD, D3DTSS_ALPHAARG1, D3DTSS_ALPHAOP, D3DTSS_COLORARG1, D3DTSS_COLORARG2,
-    D3DTSS_COLOROP, D3DTSS_TEXCOORDINDEX, D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_COUNT2,
-    D3DTTFF_COUNT3, D3DVECTOR,
+    D3DCMP_GREATER, D3DCOLORVALUE, D3DCULL_NONE, D3DFMT_A8R8G8B8, D3DFVF_DIFFUSE,
+    D3DFVF_LASTBETA_UBYTE4, D3DFVF_NORMAL, D3DFVF_SPECULAR, D3DFVF_XYZ, D3DFVF_XYZB2,
+    D3DLIGHT_DIRECTIONAL, D3DLIGHT_POINT, D3DLIGHT_SPOT, D3DLIGHT9, D3DMATERIAL9, D3DMCS_MATERIAL,
+    D3DPOOL_MANAGED, D3DPT_TRIANGLELIST, D3DPT_TRIANGLESTRIP, D3DRS_ALPHAFUNC, D3DRS_ALPHAREF,
+    D3DRS_ALPHATESTENABLE, D3DRS_AMBIENT, D3DRS_AMBIENTMATERIALSOURCE, D3DRS_CULLMODE,
+    D3DRS_DIFFUSEMATERIALSOURCE, D3DRS_EMISSIVEMATERIALSOURCE, D3DRS_INDEXEDVERTEXBLENDENABLE,
+    D3DRS_LIGHTING, D3DRS_LOCALVIEWER, D3DRS_SPECULARENABLE, D3DRS_VERTEXBLEND, D3DSAMP_ADDRESSU,
+    D3DSAMP_ADDRESSV, D3DSAMP_MAGFILTER, D3DSAMP_MINFILTER, D3DTA_ALPHAREPLICATE, D3DTA_DIFFUSE,
+    D3DTA_SPECULAR, D3DTA_TEXTURE, D3DTADDRESS_CLAMP, D3DTADDRESS_WRAP, D3DTEXF_POINT,
+    D3DTOP_MODULATE, D3DTOP_SELECTARG1, D3DTS_PROJECTION, D3DTS_TEXTURE0, D3DTS_VIEW, D3DTS_WORLD,
+    D3DTSS_ALPHAARG1, D3DTSS_ALPHAOP, D3DTSS_COLORARG1, D3DTSS_COLORARG2, D3DTSS_COLOROP,
+    D3DTSS_TEXCOORDINDEX, D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_COUNT2, D3DTTFF_COUNT3,
+    D3DVBF_1WEIGHTS, D3DVECTOR,
 };
 
 #[rustfmt::skip]
@@ -1350,4 +1352,105 @@ fn texgen_cube_camera_space_normal_selects_the_face_the_normal_names() {
     let h = Harness::new();
     let _cube = arm_cube_texgen(&h, TCI_CAMERASPACENORMAL);
     assert_cube_texgen_faces(&h, [0, 5, 5, 3], "camera-space normal");
+}
+
+// ── Indexed vertex blending past the advertised palette index ──
+
+const BLEND_RED: u32 = 0xFFFF_0000;
+
+/// Position, one blend weight, four `UBYTE4` indices and a diffuse colour.
+///
+/// The FVF is `D3DFVF_XYZB2 | D3DFVF_LASTBETA_UBYTE4 | D3DFVF_DIFFUSE`, so the
+/// second beta carries the indices rather than a weight.
+#[repr(C)]
+struct IndexedBlendVertex {
+    position: [f32; 3],
+    weight: f32,
+    indices: [u8; 4],
+    color: u32,
+}
+
+/// Row-major translation along x.
+const fn translate_x(x: f32) -> [f32; 16] {
+    let mut m = IDENTITY;
+    m[12] = x;
+    m
+}
+
+/// A quarter-sized quad, its whole weight on the bone `index` names.
+fn indexed_quad(index: u8) -> [IndexedBlendVertex; 4] {
+    [(-0.25, 0.25), (-0.25, -0.25), (0.25, 0.25), (0.25, -0.25)].map(|(x, y)| IndexedBlendVertex {
+        position: [x, y, 0.5],
+        weight: 1.0,
+        indices: [index, 0, 0, 0],
+        color: BLEND_RED,
+    })
+}
+
+#[test]
+fn indexed_vertex_blend_bounds_the_palette_at_the_advertised_index() {
+    let h = Harness::new();
+    assert_eq!(h.set_render_state(D3DRS_LIGHTING, 0), 0);
+    assert_eq!(h.set_render_state(D3DRS_CULLMODE, D3DCULL_NONE), 0);
+    for state in [D3DTS_VIEW, D3DTS_PROJECTION] {
+        assert_eq!(h.set_transform(state, &IDENTITY), 0);
+    }
+    // The device names the last matrix a blended vertex may index; the test
+    // reads it rather than restating it, since the layout owns the number.
+    let cap = h.device_caps().max_vertex_blend_matrix_index;
+    assert!(cap > 1, "no palette to bound");
+    // The palette the draw reads: bone 1 shifts right, the last bone the
+    // advertised cap covers shifts left, and a matrix at the highest index
+    // D3D9 accepts sits far off screen. Setting it raises the palette's
+    // high-water mark to 255, four rows per matrix past the constant block.
+    assert_eq!(h.set_transform(D3DTS_WORLD, &IDENTITY), 0);
+    assert_eq!(h.set_transform(D3DTS_WORLD + 1, &translate_x(0.5)), 0);
+    assert_eq!(h.set_transform(D3DTS_WORLD + cap, &translate_x(-0.5)), 0);
+    assert_eq!(h.set_transform(D3DTS_WORLD + 255, &translate_x(10.0)), 0);
+    assert_eq!(h.set_render_state(D3DRS_VERTEXBLEND, D3DVBF_1WEIGHTS), 0);
+    assert_eq!(h.set_render_state(D3DRS_INDEXEDVERTEXBLENDENABLE, 1), 0);
+    assert_eq!(
+        h.set_fvf(D3DFVF_XYZB2 | D3DFVF_LASTBETA_UBYTE4 | D3DFVF_DIFFUSE),
+        0
+    );
+    h.select_diffuse_stage(0);
+
+    // An in-range bone still lands where its matrix puts it, although the
+    // palette now runs to index 255.
+    let in_range = indexed_quad(1);
+    h.render_once(BLUE, |d| {
+        assert_eq!(
+            d.draw_primitive_up(D3DPT_TRIANGLESTRIP, 2, &in_range),
+            0,
+            "in-range draw"
+        );
+    });
+    assert_eq!(h.read_pixel(480, 240), BLEND_RED, "bone 1 shifted right");
+    assert_eq!(h.read_pixel(320, 240), BLUE, "nothing left at the origin");
+
+    // A bone past the advertised cap is undefined in D3D9 and clamped here,
+    // so it draws with the last matrix the constant block carries rather than
+    // reading rows no draw ever bound. The first index outside the cap and one
+    // far outside it land on the same matrix.
+    let first_past = u8::try_from(cap + 1).expect("a cap under 255 leaves a higher index");
+    for index in [first_past, 200] {
+        let past_cap = indexed_quad(index);
+        h.render_once(BLUE, |d| {
+            assert_eq!(
+                d.draw_primitive_up(D3DPT_TRIANGLESTRIP, 2, &past_cap),
+                0,
+                "draw with bone {index}"
+            );
+        });
+        assert_eq!(
+            h.read_pixel(160, 240),
+            BLEND_RED,
+            "bone {index} clamped onto the last matrix the block holds"
+        );
+        assert_eq!(
+            h.read_pixel(320, 240),
+            BLUE,
+            "bone {index} left nothing at the origin"
+        );
+    }
 }

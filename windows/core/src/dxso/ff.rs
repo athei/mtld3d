@@ -45,6 +45,7 @@ use mtld3d_types::{
 use super::emit::{
     VariantFlags, VariantKey, fog_blend_active, write_fog_blend, write_point_sprite_prologue,
 };
+use crate::ff_state::MAX_VERTEX_BLEND_MATRIX_INDEX;
 
 // The FF emitter stores D3D9 texture-op / texture-arg / compare-func codes in
 // `u8` cache-key fields and matches on them; the canonical `mtld3d_types`
@@ -761,8 +762,13 @@ fn emit_point_size(out: &mut String, vs: &FfVsKey, scale: bool) {
 /// transpose — matches D3D9 spec).
 ///
 /// Index source:
-/// - Indexed mode (`vertex_blend_indexed = true`): `idx[i] = in.blend_indices[i]`.
-/// - Sequential mode: `idx[i] = i` (matrices come from `world_palette[0..K]`).
+/// - Indexed mode (`vertex_blend_indexed = true`): `idx[i] = in.blend_indices[i]`,
+///   clamped to [`MAX_VERTEX_BLEND_MATRIX_INDEX`]. D3D9 leaves a `BLENDINDICES`
+///   value above `MaxVertexBlendMatrixIndex` undefined, and the palette only
+///   reaches that far, so the clamp is what keeps the read inside the bound
+///   constant block: one `min` per index, and every in-range index unchanged.
+/// - Sequential mode: `idx[i] = i` (matrices come from `world_palette[0..K]`),
+///   already inside the cap since K is at most `D3DVBF_3WEIGHTS + 1`.
 ///
 /// Special case K=1 with `vertex_blend_indexed = true` (`D3DVBF_0WEIGHTS`):
 /// no explicit weights, single matrix at `in.blend_indices[0]` with weight 1.
@@ -782,7 +788,10 @@ fn emit_vertex_blend(out: &mut String, vs: &FfVsKey, needs_normal: bool) {
     // D3DVBF_0WEIGHTS indexed-only path: K=1, weight = 1.0, single matrix.
     if k == 1 && indexed {
         out.push_str("    {\n");
-        out.push_str("        uint idx = in.blend_indices[0];\n");
+        let _ = writeln!(
+            out,
+            "        uint idx = min(in.blend_indices[0], {MAX_VERTEX_BLEND_MATRIX_INDEX}u);"
+        );
         out.push_str("        constant float4 *m = vs_c + 95 + idx * 4u;\n");
         out.push_str(
             "        pos_view = float4(dot(pos, m[0]), dot(pos, m[1]), dot(pos, m[2]), dot(pos, m[3]));\n",
@@ -803,7 +812,10 @@ fn emit_vertex_blend(out: &mut String, vs: &FfVsKey, needs_normal: bool) {
         out.push_str("    {\n");
         let _ = writeln!(out, "        float w = in.blend_weight[{i}];");
         if indexed {
-            let _ = writeln!(out, "        uint idx = in.blend_indices[{i}];");
+            let _ = writeln!(
+                out,
+                "        uint idx = min(in.blend_indices[{i}], {MAX_VERTEX_BLEND_MATRIX_INDEX}u);"
+            );
         } else {
             let _ = writeln!(out, "        uint idx = {i}u;");
         }
@@ -822,7 +834,10 @@ fn emit_vertex_blend(out: &mut String, vs: &FfVsKey, needs_normal: bool) {
     out.push_str("        float w = 1.0 - weight_sum;\n");
     let last = explicit;
     if indexed {
-        let _ = writeln!(out, "        uint idx = in.blend_indices[{last}];");
+        let _ = writeln!(
+            out,
+            "        uint idx = min(in.blend_indices[{last}], {MAX_VERTEX_BLEND_MATRIX_INDEX}u);"
+        );
     } else {
         let _ = writeln!(out, "        uint idx = {last}u;");
     }

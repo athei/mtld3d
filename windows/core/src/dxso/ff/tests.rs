@@ -11,7 +11,10 @@ use mtld3d_types::{
 };
 
 use super::{FfPsKey, FfStage, FfStageFlags, FfVsFlags, FfVsKey, emit_ps_ff, emit_vs_ff};
-use crate::dxso::emit::{VariantFlags, VariantKey};
+use crate::{
+    dxso::emit::{VariantFlags, VariantKey},
+    ff_state::MAX_VERTEX_BLEND_MATRIX_INDEX,
+};
 
 /// D3D enum constant at the key's narrow width.
 fn narrow(v: u32) -> u8 {
@@ -2435,11 +2438,15 @@ fn vertex_blend_indexed_3_weight_reads_blend_indices() {
         msl.contains("uint4 blend_indices [[attribute(13)]]"),
         "{msl}"
     );
-    // Three explicit + one implicit indexed reads.
+    // Three explicit + one implicit indexed reads, each clamped to the
+    // advertised palette index: D3D9 leaves a higher BLENDINDICES value
+    // undefined and the constant block carries no rows past it.
     for i in 0..4 {
         assert!(
-            msl.contains(&format!("in.blend_indices[{i}]")),
-            "indexed mode reads blend_indices[{i}]: {msl}"
+            msl.contains(&format!(
+                "in.blend_indices[{i}], {MAX_VERTEX_BLEND_MATRIX_INDEX}u)"
+            )),
+            "indexed mode reads a clamped blend_indices[{i}]: {msl}"
         );
     }
 }
@@ -2466,7 +2473,12 @@ fn vertex_blend_indexed_only_0_weights_single_matrix() {
         !msl.contains("weight_sum"),
         "single matrix has no weight_sum: {msl}"
     );
-    assert!(msl.contains("in.blend_indices[0]"), "{msl}");
+    assert!(
+        msl.contains(&format!(
+            "in.blend_indices[0], {MAX_VERTEX_BLEND_MATRIX_INDEX}u)"
+        )),
+        "{msl}"
+    );
 }
 
 #[test]

@@ -1324,3 +1324,92 @@ fn per_stage_constants_pack_fresh_prefix_without_changing_keys() {
     let short = unsafe { core::slice::from_raw_parts(short, 32) };
     assert_eq!(short, &first[..32]);
 }
+
+// ─────────────────────────────────────────────────────────────────────
+// World-matrix palette bound
+//
+// `D3DTS_WORLDMATRIX(i)` accepts i up to 255, but the FF VS constant
+// block holds the palette only to `MAX_VERTEX_BLEND_MATRIX_INDEX`, the
+// index advertised as `D3DCAPS9::MaxVertexBlendMatrixIndex`. Both the
+// row count and the packed section stop there, whatever the title set.
+// ─────────────────────────────────────────────────────────────────────
+
+/// Rows of the FF VS constant block a draw can bind.
+///
+/// The encoder's `ff_vs_constants_mirror` is this many `float4` rows, and its
+/// own compile-time assert pins the same number against the advertised index.
+const FF_VS_CONST_ROWS: u16 = 256;
+
+fn blend_key() -> super::FfVsKey {
+    let mut key = make_vs_key(super::FfVsFlags::empty(), 0);
+    key.vertex_blend_count = 2;
+    key
+}
+
+fn state_with_palette_high_water(index: u32) -> FfState {
+    let mut state = FfState::new();
+    state.set_transform(mtld3d_types::D3DTS_WORLD, &D3DMATRIX::IDENTITY);
+    state.set_transform(256 + index, &D3DMATRIX::IDENTITY);
+    state
+}
+
+#[test]
+fn ff_vs_row_count_stops_at_the_advertised_palette_index() {
+    let key = blend_key();
+    let cap = u16::try_from(super::MAX_VERTEX_BLEND_MATRIX_INDEX).expect("cap fits u16");
+    let full = super::FF_VS_PALETTE_BASE_ROW + (cap + 1) * 4;
+    // The last index the block holds is packed whole.
+    assert_eq!(
+        state_with_palette_high_water(u32::from(cap)).ff_vs_row_count(&key),
+        full
+    );
+    // One past it, and the highest index D3D9 accepts, add no rows.
+    for index in [u32::from(cap) + 1, 255] {
+        let rows = state_with_palette_high_water(index).ff_vs_row_count(&key);
+        assert_eq!(rows, full, "D3DTS_WORLDMATRIX({index}) extended the count");
+        assert!(
+            rows <= FF_VS_CONST_ROWS,
+            "D3DTS_WORLDMATRIX({index}) counts past the FF VS constant block"
+        );
+    }
+}
+
+#[test]
+fn build_palette_section_packs_no_matrix_past_the_advertised_index() {
+    use crate::scratch::ScratchArena;
+    let cap = usize::try_from(super::MAX_VERTEX_BLEND_MATRIX_INDEX).expect("cap fits usize");
+    let key = blend_key();
+    for index in [cap, cap + 1, 255] {
+        let mut state = state_with_palette_high_water(u32::try_from(index).expect("index ≤ 255"));
+        // A distinct diagonal in the last matrix the block holds and in the
+        // one after it, so the packed bytes name which was taken. The view is
+        // identity, so the transpose leaves `m[0]` where it was.
+        let mut marked = D3DMATRIX::IDENTITY;
+        marked.m[0] = 9.0;
+        state.set_transform(256 + u32::try_from(cap).expect("cap fits u32"), &marked);
+        let mut past = D3DMATRIX::IDENTITY;
+        past.m[0] = 5.0;
+        state.set_transform(256 + u32::try_from(cap + 1).expect("cap fits u32"), &past);
+
+        let mut scratch = ScratchArena::new();
+        let (start, rows, ptr) = state
+            .build_palette_section(&key, &mut scratch)
+            .expect("vertex blending is on");
+        assert_eq!(start, super::FF_VS_PALETTE_BASE_ROW);
+        let expected = u16::try_from((cap + 1) * 4).expect("palette rows fit u16");
+        assert_eq!(
+            rows, expected,
+            "D3DTS_WORLDMATRIX({index}) packed extra rows"
+        );
+        assert!(
+            start + rows <= FF_VS_CONST_ROWS,
+            "D3DTS_WORLDMATRIX({index}) packs past the FF VS constant block"
+        );
+        // SAFETY: the builder initialized `rows` 16-byte rows at `ptr`.
+        let packed = unsafe { read_section_rows(ptr, usize::from(rows)) };
+        assert!(
+            (packed[cap * 4][0] - 9.0).abs() < f32::EPSILON,
+            "the last matrix the block holds was not packed"
+        );
+    }
+}
