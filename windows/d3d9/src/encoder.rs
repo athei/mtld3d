@@ -2433,7 +2433,14 @@ impl FrameEncoder {
         self.backbuffer_width = frame.backbuffer_width;
         self.backbuffer_height = frame.backbuffer_height;
         self.device_handle = frame.device_handle;
-        self.record_handle = frame.record_handle;
+        // Sticky like the counters above, and for the same reason: the record
+        // is the device's identity for its whole life, and the retirement
+        // waits key off it. A frame that arrived without one must not leave
+        // the encoder unable to name its device, which would turn a wait into
+        // a warn and let a read-back run ahead of the GPU.
+        if !frame.record_handle.is_null() {
+            self.record_handle = frame.record_handle;
+        }
         self.perf.begin_frame(frame.perf());
         // Drain VB/IB retention entries whose seq has retired on the
         // GPU. Intake of *this* frame's entries is deferred to
