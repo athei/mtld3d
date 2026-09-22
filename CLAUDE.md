@@ -13,7 +13,9 @@ It points at the files that own the rules:
 - [`CONTRIBUTING.md`](CONTRIBUTING.md), the workflow and the lessons that no
   other file owns.
 - [`docs/CONVENTIONS.md`](docs/CONVENTIONS.md), every code rule, with
-  `make audit` enforcing the mechanical half.
+  `make audit` enforcing the mechanical half. State lives on an object, not in
+  a static: a new `static` holding mutable state needs one of the arguments
+  that section lists, written in its doc block.
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md), the PE/Unix boundary contract,
   the threading model, and the diagnostic toolkits.
 - [`unix/conformance/CONFORMANCE.md`](unix/conformance/CONFORMANCE.md), the

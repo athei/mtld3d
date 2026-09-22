@@ -3,24 +3,14 @@
 //! `CompileBucket::from_sm_major` is pinned on both sides: majors 1/2/3 map to `Sm1`/`Sm2`/`Sm3`,
 //! anything else yields `None`. `format_summary` is checked against exact strings so the
 //! fixed-column layout stays stable across emits: all four buckets print, zeros included, and the
-//! verb substitutes in place. One test round-trips `record`, `current_counts` and `drain` under a
-//! lock, and five walk `BurstTracker` through the zero state, arm, growth reset, fire and disarm.
-
-use std::sync::Mutex;
+//! verb substitutes in place. Two tests round-trip `record` and `poll_drain`, one of them over two
+//! `CompileStats` at once, and five walk `BurstTracker` through the zero state, arm, growth reset,
+//! fire and disarm. No test needs a lock: the counters are owned, not shared.
 
 use super::*;
 
-/// Serializes any test that touches the file-scope statics.
-///
-/// Pure-function tests below don't acquire it.
-static GLOBALS_LOCK: Mutex<()> = Mutex::new(());
-
-fn reset_globals() {
-    for b in &BUCKETS {
-        b.count.store(0, Ordering::Relaxed);
-        b.duration_ns.store(0, Ordering::Relaxed);
-    }
-}
+/// Enough idle cycles for `poll_drain` to answer, given the fixed readings below.
+const IDLE: u64 = 1000;
 
 #[test]
 fn from_sm_major_maps_valid_versions() {
@@ -86,22 +76,52 @@ fn format_pre_warmed_verb_substitutes_in_place() {
 
 #[test]
 fn record_drain_round_trip() {
-    let _guard = GLOBALS_LOCK.lock().unwrap();
-    reset_globals();
+    let mut stats = CompileStats::new();
 
-    record(CompileBucket::Sm2, Duration::from_millis(10));
-    record(CompileBucket::Sm2, Duration::from_millis(15));
-    record(CompileBucket::Ff, Duration::from_millis(2));
+    stats.record(CompileBucket::Sm2, Duration::from_millis(10));
+    stats.record(CompileBucket::Sm2, Duration::from_millis(15));
+    stats.record(CompileBucket::Ff, Duration::from_millis(2));
 
-    let counts = current_counts();
-    assert_eq!(counts, [1, 0, 2, 0], "non-draining read sees current");
+    // Still growing as far as the debounce is concerned: no answer yet.
+    assert!(stats.poll_drain(100, IDLE).is_none());
 
-    let snap = drain();
+    let snap = stats
+        .poll_drain(100 + IDLE + 1, IDLE)
+        .expect("burst idle long enough to emit");
     assert_eq!(snap.counts, [1, 0, 2, 0]);
     assert_eq!(snap.duration_ns, [2_000_000, 0, 25_000_000, 0]);
 
-    // After drain, counts read back to zero.
-    assert_eq!(current_counts(), [0; BUCKET_COUNT]);
+    // Drained: nothing left to report.
+    assert!(stats.poll_drain(100 + 2 * IDLE + 2, IDLE).is_none());
+}
+
+#[test]
+fn two_encoders_do_not_see_each_others_compiles() {
+    let mut first = CompileStats::new();
+    let mut second = CompileStats::new();
+
+    first.record(CompileBucket::Sm2, Duration::from_millis(10));
+    second.record(CompileBucket::Ff, Duration::from_millis(4));
+    second.record(CompileBucket::Sm3, Duration::from_millis(6));
+
+    let first_snap = {
+        assert!(first.poll_drain(100, IDLE).is_none());
+        first
+            .poll_drain(100 + IDLE + 1, IDLE)
+            .expect("first encoder's burst went idle")
+    };
+    assert_eq!(first_snap.counts, [0, 0, 1, 0], "only its own compile");
+    assert_eq!(first_snap.duration_ns, [0, 0, 10_000_000, 0]);
+
+    // Draining the first leaves the second's counts untouched.
+    let second_snap = {
+        assert!(second.poll_drain(100, IDLE).is_none());
+        second
+            .poll_drain(100 + IDLE + 1, IDLE)
+            .expect("second encoder's burst went idle")
+    };
+    assert_eq!(second_snap.counts, [1, 0, 0, 1]);
+    assert_eq!(second_snap.duration_ns, [4_000_000, 0, 0, 6_000_000]);
 }
 
 #[test]

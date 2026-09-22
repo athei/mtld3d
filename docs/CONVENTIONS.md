@@ -464,6 +464,24 @@ No glob imports. Explicit named imports only — never `use foo::*`. Two excepti
 - A `pub use submodule::*` re-export of a crate's **own** constant-definition modules (`mtld3d-types`' `lib.rs` re-exports `device::*` / `direct3d9::*`): the glob is the crate's public API surface, and it lets a new `pub const` land in those modules without a parallel `lib.rs` edit. That is a re-export of in-crate items, not a glob *import* of another module's names into local scope.
 - `use super::*` at the top of a `#[cfg(test)]` test module file (`foo/tests.rs`): the standard Rust idiom for pulling the module-under-test's items into its unit tests. The test module is private, so nothing leaks past the crate, and the glob tracks the parent's surface without churn as items come and go.
 
+## State lives on an object, not in a static
+
+Mutable state hangs off the object that owns it. On the PE side that is `Direct3D9Inner` (everything an interface decides, starting with the resolved configuration), `DeviceInner`, or `FrameEncoder` for anything the encoder thread alone touches. On the unix side it is the per-device records: `PresentState` per command queue, `Attachment` per metal view. Where the unix side needs state the PE side owns the lifetime of, the PE side holds the record and every thunk carries its handle — that is what `queue_handle`, `view_handle` and the `DisplaySinks` pointers already are.
+
+A `static` that holds mutable state is an exception, and its doc block names which of these arguments earns it:
+
+- **The caller has no object to reach.** A signal handler, the VEH, `DllMain`, an IAT hook the guest calls through its own `user32`/`kernel32` imports, an `NSNotification` observer, a Metal completion handler, a window procedure whose only key is the `HWND`. Those last two take a map keyed by what they do have (`DEVICE_INSTANCES`, `DRIVING_WINDOWS`, `ATTACHMENTS`) — a registry of per-object records, not state of its own.
+- **The resource is process-wide.** One log file, one global allocator, one `MTLDevice`, one `MTLCaptureManager`, one `NSApp` and Wine delegate, one system cursor, one 32-bit address space. A cache built on the one `MTLDevice` (pipelines, functions, null textures) is process-wide for the same reason, and says so.
+- **It outlives every object.** The kept metal views keyed by `HWND`, the page-box pool and its generation counter: a box retired by one device serves the next, and generations must not collide when addresses are reused.
+- **It is a machine fact, latched once and immutable after.** The adapter mode list, the device info, the TSC rate, the `RUST_LOG` gates.
+- **It is a per-call-site log-once latch** (§No silent failures — use `log_once_warn!`). Those carry nothing beyond "fired".
+
+What does not earn one: "the handler had no context, so I keyed a global map by an address I happen to have", "it is only a counter", "it is just a cache". A counter in a static counts every device at once — two devices sample a per-device cadence at double rate and drain each other's statistics — and a global map puts a lock on a path that would otherwise need none. Diagnostic counters are not exempt: they are read as per-device numbers.
+
+A static touched by exactly one function is declared inside that function, not at module scope. Same address stability and `'static` lifetime, with the visibility matching the actual reach. Module scope is for the load-bearing cases: `#[global_allocator]`, cross-module flags, anything `pub`.
+
+`make audit` does not count statics; the plan's Rules check does. A plan that introduces one names it and gives its argument (see `CLAUDE.md`).
+
 ## Inline attributes
 
 Default `#[inline]`, not `#[inline(always)]`. Thin-LTO inlines small functions on its own; `#[inline(always)]` is reserved for cases where measurement proves it pays.

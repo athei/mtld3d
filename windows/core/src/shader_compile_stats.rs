@@ -1,22 +1,20 @@
 //! Per-bucket counters for shader compiles.
 //!
-//! The encoder thread polls `current_counts()` once per frame and emits a
-//! `shaders: N compiled in Tms (FF: …, SMx: …, M total)` info line once a
-//! burst has gone idle for ≥1 second. The wall-clock check lives on the
-//! encoder itself (using `rdtsc()` + `secs_to_cycles(1)`) so this module is
-//! pure atomics + pure functions: no thread, no mutex, no `OnceLock`.
+//! One `CompileStats` lives on each `FrameEncoder`, so the numbers a device
+//! reports are its own: a process with two devices compiles on two encoder
+//! threads, and a shared counter would have each of them draining the
+//! other's work into its summary line.
 //!
-//! `record()` accumulates count + busy-compile time per bucket. The
-//! encoder reads via `current_counts()` (non-draining) on every frame
-//! to detect "burst is still growing" vs "burst has stalled"; when
-//! it decides to emit, it calls `drain()` which atomic-swaps each
-//! bucket back to zero.
+//! `record()` accumulates count + busy-compile time per bucket, called from
+//! the cold path of the encoder's own shader resolution. `poll_drain()` runs
+//! once per frame and answers with a `Snapshot` once the burst has been
+//! stable and nonzero for ≥1 second, which is when the encoder emits its
+//! `shaders: N compiled in Tms (FF: …, SMx: …, M total)` info line. The
+//! wall-clock source stays with the caller (`rdtsc()` + `secs_to_cycles(1)`)
+//! so this module is plain fields and pure functions: no thread, no mutex,
+//! no atomics, no `OnceLock`.
 
-use std::{
-    fmt::Write as _,
-    sync::atomic::{AtomicU32, AtomicU64, Ordering},
-    time::Duration,
-};
+use std::{fmt::Write as _, time::Duration};
 
 use super::LOG_TARGET;
 
@@ -77,55 +75,64 @@ impl CompileBucket {
     }
 }
 
-/// Record one finished compile.
+/// One encoder's compile counters and the debounce that decides when to emit.
 ///
-/// Pure atomic bumps — no thread spawn, no allocation. The encoder
-/// thread observes the counts on its next frame via `current_counts()`.
-pub fn record(bucket: CompileBucket, elapsed: Duration) {
-    let i = bucket.index();
-    BUCKETS[i].count.fetch_add(1, Ordering::Relaxed);
-    // u128 nanos → u64: saturates at ~584 years; single compile fits trivially.
-    BUCKETS[i].duration_ns.fetch_add(
-        u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX),
-        Ordering::Relaxed,
-    );
+/// Owned by the `FrameEncoder` that does the compiling, so every value it
+/// reports was produced by its own device. Single-threaded by construction:
+/// the encoder thread both records and drains, which is why the counters are
+/// plain integers.
+pub struct CompileStats {
+    counts: [u32; BUCKET_COUNT],
+    duration_ns: [u64; BUCKET_COUNT],
+    burst: BurstTracker,
 }
 
-/// Non-draining snapshot of the per-bucket count atomics.
-///
-/// Used by the encoder's burst-debounce check on every frame.
-#[must_use]
-pub fn current_counts() -> [u32; BUCKET_COUNT] {
-    std::array::from_fn(|i| BUCKETS[i].count.load(Ordering::Relaxed))
-}
-
-/// Atomic-swap each bucket back to zero and return the drained values as a `Snapshot`.
-///
-/// Called by the encoder once it's decided the burst has stalled and
-/// is ready to emit.
-pub fn drain() -> Snapshot {
-    let mut snap = Snapshot {
-        counts: [0; BUCKET_COUNT],
-        duration_ns: [0; BUCKET_COUNT],
-    };
-    for (i, b) in BUCKETS.iter().enumerate() {
-        snap.counts[i] = b.count.swap(0, Ordering::Relaxed);
-        snap.duration_ns[i] = b.duration_ns.swap(0, Ordering::Relaxed);
+impl Default for CompileStats {
+    fn default() -> Self {
+        Self::new()
     }
-    snap
 }
 
-struct BucketCounters {
-    count: AtomicU32,
-    duration_ns: AtomicU64,
-}
-
-static BUCKETS: [BucketCounters; BUCKET_COUNT] = [const {
-    BucketCounters {
-        count: AtomicU32::new(0),
-        duration_ns: AtomicU64::new(0),
+impl CompileStats {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            counts: [0; BUCKET_COUNT],
+            duration_ns: [0; BUCKET_COUNT],
+            burst: BurstTracker::new(),
+        }
     }
-}; BUCKET_COUNT];
+
+    /// Record one finished compile.
+    ///
+    /// Two adds and no allocation, on the cold path of a shader resolution
+    /// that just compiled.
+    pub fn record(&mut self, bucket: CompileBucket, elapsed: Duration) {
+        let i = bucket.index();
+        self.counts[i] = self.counts[i].saturating_add(1);
+        // u128 nanos → u64: saturates at ~584 years; single compile fits trivially.
+        let ns = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
+        self.duration_ns[i] = self.duration_ns[i].saturating_add(ns);
+    }
+
+    /// Drain the counters once the burst has been idle for `idle_cycles`.
+    ///
+    /// Called once per frame with the current TSC reading. `None` means the
+    /// burst is still growing, has not gone quiet yet, or there is nothing
+    /// to report; `Some` leaves every bucket back at zero.
+    pub fn poll_drain(&mut self, now_tsc: u64, idle_cycles: u64) -> Option<Snapshot> {
+        if !self.burst.poll(self.counts, now_tsc, idle_cycles) {
+            return None;
+        }
+        let snap = Snapshot {
+            counts: self.counts,
+            duration_ns: self.duration_ns,
+        };
+        self.counts = [0; BUCKET_COUNT];
+        self.duration_ns = [0; BUCKET_COUNT];
+        Some(snap)
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Snapshot {
@@ -135,24 +142,17 @@ pub struct Snapshot {
 
 /// Pure debounce state for "burst has gone idle for ≥ `idle_cycles`".
 ///
-/// Lives on the encoder thread alongside its other per-frame state.
-/// Tracking with `rdtsc` cycles instead of `Instant::now()` so the
-/// per-frame poll cost stays in the few-cycle range.
-pub struct BurstTracker {
+/// Half of [`CompileStats`], which owns it. Tracking with `rdtsc` cycles
+/// instead of `Instant::now()` so the per-frame poll cost stays in the
+/// few-cycle range.
+struct BurstTracker {
     last_seen: [u32; BUCKET_COUNT],
     last_change_tsc: u64,
     armed: bool,
 }
 
-impl Default for BurstTracker {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl BurstTracker {
-    #[must_use]
-    pub const fn new() -> Self {
+    const fn new() -> Self {
         Self {
             last_seen: [0; BUCKET_COUNT],
             last_change_tsc: 0,
@@ -162,9 +162,9 @@ impl BurstTracker {
 
     /// Returns `true` once the current burst has gone idle for `idle_cycles`.
     ///
-    /// Signalling the caller should `drain()` and emit. Resets internal
-    /// state on emit so subsequent compiles start a fresh burst.
-    pub fn poll(&mut self, current: [u32; BUCKET_COUNT], now_tsc: u64, idle_cycles: u64) -> bool {
+    /// Signalling the owner should drain and emit. Resets internal state on
+    /// emit so subsequent compiles start a fresh burst.
+    fn poll(&mut self, current: [u32; BUCKET_COUNT], now_tsc: u64, idle_cycles: u64) -> bool {
         if current.iter().all(|&c| c == 0) {
             // No work to emit. Clear armed state so a future burst
             // starts clean even if the previous one was reset by an

@@ -36,9 +36,28 @@ const REPORT_EVERY_SAMPLES: u32 = 10;
 /// Free-address-space thresholds, in MiB, each logged once when crossed downwards.
 const THRESHOLDS_MIB: [u64; 6] = [1536, 1024, 768, 512, 256, 128];
 
-static PRESENTS: AtomicU32 = AtomicU32::new(0);
 /// Index of the next threshold to report; thresholds above it were already logged.
+///
+/// Process-wide, like the map latch above: free address space is a property of
+/// the process, so a threshold is crossed once however many devices are live.
 static NEXT_THRESHOLD: AtomicU8 = AtomicU8::new(0);
+
+/// The watch's per-device state, embedded in `DeviceInner`.
+///
+/// The sampling counter is per device because the cadence is: on one counter,
+/// two presenting devices reach `SAMPLE_EVERY` twice as fast as one does, and
+/// each samples on whichever of its presents happened to land on the multiple.
+pub struct MemWatchState {
+    presents: AtomicU32,
+}
+
+impl MemWatchState {
+    pub const fn new() -> Self {
+        Self {
+            presents: AtomicU32::new(0),
+        }
+    }
+}
 
 /// What the live textures hold in the 32-bit address space.
 struct TextureFootprint {
@@ -89,7 +108,7 @@ impl DeviceInner {
 
     /// Sample the free virtual address space and log threshold crossings.
     pub fn mem_watch_present(&self) {
-        let present = PRESENTS.fetch_add(1, Ordering::Relaxed);
+        let present = self.mem_watch.presents.fetch_add(1, Ordering::Relaxed);
         if !present.is_multiple_of(SAMPLE_EVERY) {
             return;
         }
