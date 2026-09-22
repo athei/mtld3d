@@ -1,16 +1,23 @@
 //! Spawn Wine's `d3d9_test.exe` for one `(leg, subtest)` and interpret it.
 //!
 //! Both paths, the loader and the test binary, come from the caller
-//! (`--wine`/`--exe`). This module resolves nothing itself: it knows no Wine
-//! directory layout and reads no environment for one, so whoever invokes the
-//! runner owns where a Wine install keeps its loader and its test binaries.
+//! (`--wine`/`--exe`), as does the wineserver a timed-out subtest is sampled
+//! against (`--wineserver`, with the prefix). This module resolves nothing
+//! itself: it knows no Wine directory layout and reads no environment for one,
+//! so whoever invokes the runner owns where a Wine install keeps its loader and
+//! its test binaries. The one thing it knows of a running Wine is how a
+//! wineserver names the directory of the prefix it serves, which is what tells
+//! one prefix's server from another's (see [`server_dir_for`]).
 
 use std::{
     collections::BTreeSet,
     fmt::Write as _,
     fs,
     io::{BufRead, BufReader, Read},
-    os::unix::process::{CommandExt, ExitStatusExt},
+    os::unix::{
+        fs::MetadataExt as _,
+        process::{CommandExt, ExitStatusExt},
+    },
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
     sync::{
@@ -38,13 +45,15 @@ use crate::{
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(180);
 const HEADLESS_DLL_OVERRIDES: &str = "mscoree,mshtml=";
 
-/// How long the sample of a timed-out process may take.
+/// How long the samples of a timed-out subtest may take, together.
 ///
 /// `sample` reads the process for [`SAMPLE_SECONDS`] and then symbolicates,
 /// which on a translated Wine process with a few dozen threads has taken ten
 /// seconds. A sampler still running past this is killed and the sample says
 /// so: the process it was meant to explain must not park the run a second
-/// time.
+/// time. The subtest and the wineserver of its prefix are sampled at the same
+/// time and share this one budget, so the second account costs the kill
+/// nothing.
 const SAMPLE_BUDGET: Duration = Duration::from_secs(60);
 
 /// How long `sample` watches the process before symbolicating.
@@ -117,6 +126,25 @@ pub struct Launch {
     /// its group, and the subtest reads as a crash. [`DEFAULT_TIMEOUT`] unless
     /// the caller has another: the spawn reads no environment.
     pub timeout: Duration,
+    /// The wineserver to sample beside a subtest that runs out of budget.
+    ///
+    /// `None` keeps the process sample alone, and the wineserver sample says
+    /// the caller named no server rather than going missing.
+    pub wineserver: Option<Wineserver>,
+}
+
+/// The wineserver a timed-out subtest waits on, as the caller names it.
+///
+/// A subtest parked in `wine_server_call` shows a thread waiting for a reply
+/// and nothing of the server that owes it one, so the server is the other
+/// account of such a hang. Both paths come from the caller, like every other
+/// Wine path here: the binary is the one of the install the loader belongs to,
+/// and the prefix is the one the subtest inherits.
+pub struct Wineserver {
+    /// The `wineserver` binary the running server has to have been exec'd from.
+    pub exe: PathBuf,
+    /// The prefix the running server has to serve.
+    pub prefix: PathBuf,
 }
 
 /// How many detail lines one validation message keeps.
@@ -205,9 +233,11 @@ pub fn wine_version(wine: &Path) -> String {
 /// caller's group and is never touched.
 ///
 /// A process still running at `launch.timeout` is sampled before its group is
-/// killed, and the sample is kept beside the raw output, or printed when
-/// nothing is kept. The raw log of a hang ends in its `TIMED OUT` line and
-/// says nothing about where the process was; the sample is that account.
+/// killed, and so is the wineserver of its prefix when the caller named one.
+/// Both samples are kept beside the raw output, or printed when nothing is
+/// kept. The raw log of a hang ends in its `TIMED OUT` line and says nothing
+/// about where the process was; the samples are that account, and a process
+/// waiting on a reply is only half of it.
 ///
 /// # Errors
 ///
@@ -271,8 +301,8 @@ pub fn run_subtest(
 
     let timeout = launch.timeout;
     let start = Instant::now();
-    // The sample of a process that ran out of budget, taken before its kill.
-    let mut timed_out: Option<String> = None;
+    // The samples of a process that ran out of budget, taken before its kill.
+    let mut timed_out: Option<TimeoutSamples> = None;
     let status = loop {
         if let Some(status) = child
             .try_wait()
@@ -287,7 +317,7 @@ pub fn run_subtest(
                 .map_err(|e| format!("reap of hung {} failed: {e}", launch.wine.display()))?;
         }
         if start.elapsed() >= timeout {
-            timed_out = Some(sample_process(child.id()));
+            timed_out = Some(sample_timed_out(child.id(), launch.wineserver.as_ref()));
             kill_group(&child);
             break child
                 .wait()
@@ -319,19 +349,20 @@ pub fn run_subtest(
     if !stdout.complete || !stderr.complete {
         report_cut_short(leg, subtest, &mut combined);
     }
-    if let Some(sample) = &timed_out {
+    if let Some(samples) = &timed_out {
         let _ = write!(
             combined,
             "\n[conformance] subtest TIMED OUT after {}s and was killed{}\n",
             timeout.as_secs(),
             raw.as_ref().map_or_else(String::new, |raw| {
                 format!(
-                    "; the sample taken before the kill is {}",
-                    raw.sample_file_name()
+                    "; the samples taken before the kill are {} and {}",
+                    raw.sample_file_name(),
+                    raw.wineserver_sample_file_name()
                 )
             })
         );
-        report_timeout(leg, subtest, timeout, sample, raw.as_ref());
+        report_timeout(leg, subtest, timeout, samples, raw.as_ref());
     } else {
         let _ = write!(combined, "\n{}\n", exit_trailer(status));
     }
@@ -441,15 +472,180 @@ fn report_cut_short(leg: Leg, subtest: Subtest, combined: &mut String) {
     );
 }
 
+/// What was sampled before a timed-out subtest's group was killed.
+struct TimeoutSamples {
+    /// The subtest process itself.
+    process: String,
+    /// The wineserver of its prefix, or why none was sampled.
+    wineserver: String,
+}
+
+/// Sample the timed-out process and the wineserver of its prefix.
+///
+/// The two samplers run at the same time and share the one [`SAMPLE_BUDGET`],
+/// which starts here: the search for the server runs inside it too, so the
+/// second account never delays the kill past what the process sample alone
+/// would have cost.
+fn sample_timed_out(pid: u32, wineserver: Option<&Wineserver>) -> TimeoutSamples {
+    let deadline = Instant::now() + SAMPLE_BUDGET;
+    let sampling_server = wineserver.map(|server| {
+        let exe = server.exe.clone();
+        let prefix = server.prefix.clone();
+        thread::spawn(move || sample_wineserver(&exe, &prefix, deadline))
+    });
+    let process = sample_process(pid, deadline);
+    let wineserver = sampling_server.map_or_else(
+        || "[conformance] no wineserver was sampled: the runner was given none\n".to_owned(),
+        |sampler| {
+            sampler.join().unwrap_or_else(|_| {
+                "[conformance] no wineserver was sampled: the sampler panicked\n".to_owned()
+            })
+        },
+    );
+    TimeoutSamples {
+        process,
+        wineserver,
+    }
+}
+
+/// A `sample` of the wineserver serving `prefix`, or why none was taken.
+///
+/// Nothing but that prefix's own server is read: every other checkout on the
+/// machine runs one of its own, and the subtest's hang says nothing about
+/// theirs. A server that cannot be found leaves the text saying so, since a
+/// missing second account must not cost the run its first one.
+fn sample_wineserver(exe: &Path, prefix: &Path, deadline: Instant) -> String {
+    match find_wineserver(exe, prefix) {
+        Ok(pid) => format!(
+            "[conformance] wineserver {pid} ({}) serving {}\n{}",
+            exe.display(),
+            prefix.display(),
+            sample_process(pid, deadline)
+        ),
+        Err(why) => format!("[conformance] no wineserver was sampled: {why}\n"),
+    }
+}
+
+/// The pid of the wineserver `exe` that serves `prefix`, if one runs.
+///
+/// Two conditions, both exact, because a sample of the wrong server is worse
+/// than none. The process has to have been exec'd from that binary, so a
+/// server of another Wine install (or of another checkout's isolated clone of
+/// one) is not read on the strength of its name. And its working directory has
+/// to be this prefix's server directory, which is the server's own statement
+/// of what it serves (see [`server_dir_for`]).
+///
+/// # Errors
+///
+/// Returns why no server was found: the prefix could not be read, `ps` could
+/// not be run, or nothing matched both conditions.
+fn find_wineserver(exe: &Path, prefix: &Path) -> Result<u32, String> {
+    let dir = server_dir_name(prefix)?;
+    let table = process_table()?;
+    wineserver_pids(&table, exe)
+        .into_iter()
+        .find(|&pid| serves_server_dir(pid, &dir))
+        .ok_or_else(|| {
+            format!(
+                "no {} runs with the server directory {dir} of {}",
+                exe.display(),
+                prefix.display()
+            )
+        })
+}
+
+/// Every process's pid and executable path, one per line, as `ps` reports them.
+///
+/// # Errors
+///
+/// Returns why the process table could not be read.
+fn process_table() -> Result<String, String> {
+    let out = Command::new("ps")
+        .args(["-Ao", "pid=,comm="])
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| format!("ps could not be run: {e}"))?;
+    if !out.status.success() {
+        return Err(format!("ps ended with {}", out.status));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// The pids in a `ps -Ao pid=,comm=` table whose executable is exactly `exe`.
+fn wineserver_pids(table: &str, exe: &Path) -> Vec<u32> {
+    table
+        .lines()
+        .filter_map(|line| {
+            let (pid, command) = line.trim_start().split_once(' ')?;
+            if Path::new(command.trim()) == exe {
+                pid.parse().ok()
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// Whether the process's working directory is the server directory `dir`.
+///
+/// Read through `lsof`, which reports the directory a process is in whether or
+/// not it still holds anything else. A process that cannot be read at all is
+/// not this prefix's server as far as the search goes: the caller then reports
+/// that none was found rather than sampling one it could not identify.
+fn serves_server_dir(pid: u32, dir: &str) -> bool {
+    let pid = pid.to_string();
+    let Ok(out) = Command::new("lsof")
+        .args(["-w", "-a", "-d", "cwd", "-Fn", "-p", pid.as_str()])
+        .stdin(Stdio::null())
+        .output()
+    else {
+        return false;
+    };
+    cwd_is_server_dir(&String::from_utf8_lossy(&out.stdout), dir)
+}
+
+/// Whether an `lsof -Fn` report of one process's cwd names `dir`.
+///
+/// The report is one `n<path>` line per file, and the search asked for the
+/// working directory alone, so any path in it is that directory.
+fn cwd_is_server_dir(report: &str, dir: &str) -> bool {
+    report
+        .lines()
+        .filter_map(|line| line.strip_prefix('n'))
+        .any(|path| Path::new(path).file_name().is_some_and(|name| name == dir))
+}
+
+/// The name of the directory a wineserver serves `prefix` from.
+///
+/// # Errors
+///
+/// Returns why the prefix could not be read.
+fn server_dir_name(prefix: &Path) -> Result<String, String> {
+    let meta = fs::metadata(prefix)
+        .map_err(|e| format!("the prefix {} could not be read: {e}", prefix.display()))?;
+    Ok(server_dir_for(meta.dev(), meta.ino()))
+}
+
+/// The directory name wineserver derives from a prefix's device and inode.
+///
+/// A server creates `/tmp/.wine-<uid>/server-<dev>-<ino>` for the prefix it
+/// serves, both numbers in hex, and works from there for its whole life. Two
+/// prefixes cannot share a name, and a prefix reached by another spelling of
+/// its path still gets the same one, so the pair is what identifies a running
+/// server's prefix rather than the string the caller happened to pass.
+fn server_dir_for(dev: u64, ino: u64) -> String {
+    format!("server-{dev:x}-{ino:x}")
+}
+
 /// A `sample` of the process, taken while it still runs.
 ///
 /// The kill that follows leaves a raw log ending in `TIMED OUT` and the
 /// process's own log silent on a thread parked in a syscall, so the sample is
 /// the one account of where a hang was. The tool's stderr and how it ended
 /// stay in the text when it fails, so a process it could not read is reported
-/// rather than dropped, and a sampler still running at [`SAMPLE_BUDGET`] is
-/// killed and the text says so.
-fn sample_process(pid: u32) -> String {
+/// rather than dropped, and a sampler still running at `deadline` is killed
+/// and the text says so.
+fn sample_process(pid: u32, deadline: Instant) -> String {
     let pid = pid.to_string();
     let mut child = match Command::new("sample")
         .args([pid.as_str(), SAMPLE_SECONDS, "-mayDie"])
@@ -463,11 +659,10 @@ fn sample_process(pid: u32) -> String {
     };
     let out_chunks = drain_on_thread(child.stdout.take().expect("stdout piped"));
     let err_chunks = drain_on_thread(child.stderr.take().expect("stderr piped"));
-    let started = Instant::now();
     let ended = loop {
         match child.try_wait() {
             Ok(Some(status)) => break Ok(status),
-            Ok(None) if started.elapsed() < SAMPLE_BUDGET => {
+            Ok(None) if Instant::now() < deadline => {
                 thread::sleep(Duration::from_millis(50));
             }
             Ok(None) => {
@@ -504,31 +699,36 @@ fn sample_process(pid: u32) -> String {
     text
 }
 
-/// Say on stderr that the subtest ran out of budget, and keep its sample.
+/// Say on stderr that the subtest ran out of budget, and keep its samples.
 ///
-/// With a raw dir the sample is a file beside the raw log and the line names
-/// it. Without one nothing is kept, so the sample itself follows the line.
+/// With a raw dir each sample is a file beside the raw log and the line names
+/// both, the process's first and its prefix's wineserver second. Without one
+/// nothing is kept, so the samples themselves follow the line.
 fn report_timeout(
     leg: Leg,
     subtest: Subtest,
     timeout: Duration,
-    sample: &str,
+    samples: &TimeoutSamples,
     raw: Option<&RawTarget>,
 ) {
     let after = timeout.as_secs();
     if let Some(raw) = raw {
-        raw.save_sample(sample);
+        raw.save_sample(&samples.process);
+        raw.save_wineserver_sample(&samples.wineserver);
         eprintln!(
-            "  [{leg}/{subtest}] TIMED OUT after {after}s; the process was sampled before the \
-             kill: {}",
-            raw.dir.join(raw.sample_file_name()).display()
+            "  [{leg}/{subtest}] TIMED OUT after {after}s; the process and the wineserver of its \
+             prefix were sampled before the kill: {} and {}",
+            raw.dir.join(raw.sample_file_name()).display(),
+            raw.dir.join(raw.wineserver_sample_file_name()).display()
         );
     } else {
         eprintln!(
-            "  [{leg}/{subtest}] TIMED OUT after {after}s; the process was sampled before the \
-             kill (set MTLD3D_CONFORMANCE_RAW_DIR to keep the sample as a file):"
+            "  [{leg}/{subtest}] TIMED OUT after {after}s; the process and the wineserver of its \
+             prefix were sampled before the kill (set MTLD3D_CONFORMANCE_RAW_DIR to keep the \
+             samples as files):"
         );
-        eprint!("{sample}");
+        eprint!("{}", samples.process);
+        eprint!("{}", samples.wineserver);
     }
 }
 
@@ -633,7 +833,8 @@ fn config_entries(leg: Leg, raw: Option<&RawTarget>) -> String {
 /// `<dir>/<leg>-<subtest>[-<attempt>].log` for the output and a directory of
 /// the same stem for the log file, one per process, so the layer's retention
 /// of ten files per directory never prunes one run's log to make room for
-/// another's. A timed-out process's sample is `<stem>.sample.txt` beside them.
+/// another's. A timed-out process's sample is `<stem>.sample.txt` beside them,
+/// and the sample of the wineserver it was waiting on `<stem>.wineserver-sample.txt`.
 struct RawTarget {
     dir: PathBuf,
     stem: String,
@@ -664,6 +865,11 @@ impl RawTarget {
         format!("{}.sample.txt", self.stem)
     }
 
+    /// The file the sample of that process's wineserver is kept as, beside it.
+    fn wineserver_sample_file_name(&self) -> String {
+        format!("{}.wineserver-sample.txt", self.stem)
+    }
+
     /// Persist the raw output; a failure is reported and never fails the run.
     fn save(&self, combined: &str) {
         self.write(&format!("{}.log", self.stem), combined);
@@ -672,6 +878,11 @@ impl RawTarget {
     /// Persist the sample of a timed-out process; a failure is reported and never fails the run.
     fn save_sample(&self, sample: &str) {
         self.write(&self.sample_file_name(), sample);
+    }
+
+    /// Persist that process's wineserver sample; a failure is reported and never fails the run.
+    fn save_wineserver_sample(&self, sample: &str) {
+        self.write(&self.wineserver_sample_file_name(), sample);
     }
 
     fn write(&self, file_name: &str, text: &str) {

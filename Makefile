@@ -855,9 +855,12 @@ test-e2e-x86_64: install-windows-x86_64 install-unix-$(SDK_UNIX_ARCH)
 # From a build here the runner is built and run through cargo; from a stage it
 # is the staged binary for this machine's arch. The assets directory is named
 # explicitly either way: the runner's compiled-in default is the crate path on
-# the machine that built it.
+# the machine that built it. The wineserver of the same SDK is named too: a
+# subtest killed at its budget is sampled, and a subtest parked waiting for a
+# server reply shows nothing of the server on its own stacks, so the server
+# that serves this prefix is sampled beside it.
 CONFORMANCE_BIN = $(if $(STAGE),$(STAGE)/conformance/$(HOST_ARCH)/mtld3d-conformance,cd unix && cargo +$(RUST_STABLE) run --profile $(PROFILE) -p mtld3d-conformance --)
-CONFORMANCE_RUN = $(CONFORMANCE_BIN) --wine $(WINE_SDK)/bin/wine --assets $(CURDIR)/unix/conformance
+CONFORMANCE_RUN = $(CONFORMANCE_BIN) --wine $(WINE_SDK)/bin/wine --wineserver $(WINESERVER) --assets $(CURDIR)/unix/conformance
 
 # $(1) = arch (i686|x86_64), $(2) = extra runner args. Checks the exe up front
 # so a bundle that predates the published test binaries says so, rather than
@@ -866,8 +869,9 @@ CONFORMANCE_RUN = $(CONFORMANCE_BIN) --wine $(WINE_SDK)/bin/wine --assets $(CURD
 # default is `off`: the counts are the measurement). With
 # MTLD3D_CONFORMANCE_RAW_DIR set, each process's log file lands in a directory
 # beside its raw output, so LOG=debug there keeps what the layer did before a
-# process ended without its summary, and the sample the runner takes of a
-# process it kills at its budget lands beside them.
+# process ended without its summary, and the samples the runner takes of a
+# process it kills at its budget, and of the wineserver of its prefix, land
+# beside them.
 define conformance_leg
 	$(MAKE) configure-test-prefix
 	test -f $(D3D9_TEST_$(1)) || { echo "$(D3D9_TEST_$(1)) is missing: re-bundle the Wine SDK, this one predates the published d3d9 test binaries" >&2; exit 2; }
