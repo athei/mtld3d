@@ -12,10 +12,7 @@ pub use mtld3d_core::shader_cache::{
     ps_source_disk_key_programmable, vs_source_disk_key_programmable,
 };
 use mtld3d_core::{
-    convert::{
-        DecalHeuristicInputs, IMPLICIT_DECAL_BIAS_RAW, IMPLICIT_DECAL_SLOPE_SCALE,
-        d3d_depth_bias_to_clip, d3d_to_metal_cull, d3d_to_metal_fill, looks_like_decal,
-    },
+    convert::{d3d_depth_bias_to_clip, d3d_to_metal_cull, d3d_to_metal_fill},
     depth_stencil_state::{DepthStencilSnapshot, STENCIL_MASK_BITS},
     dirty_range::{indexed_vb_range_lower_bound, nonindexed_vb_range},
     dxso::{
@@ -63,7 +60,7 @@ static VS_DRAW_DEFAULT: std::sync::LazyLock<[u8; VS_DRAW_BYTES]> = std::sync::La
 
 use super::{encoder::FrameEncoder, stage_bindings::STAGE_COUNT};
 
-/// Sub-target for the per-`(VS, PS, decision)` diagnostic from the implicit-decal-bias site below.
+/// Sub-target for the per-`(VS, PS, state)` diagnostic from the depth-bias site below.
 ///
 /// Sits under `mtld3d::d3d9::*` like the other diag probes;
 /// `RUST_LOG=mtld3d::d3d9::decal=trace` opts in without flipping the
@@ -1726,68 +1723,15 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
 
     enc.emit_triangle_fill_mode(d3d_to_metal_fill(u32::from(render_state.fill_mode)));
 
-    // D3DRS_DEPTHBIAS / D3DRS_SLOPESCALEDEPTHBIAS drive Metal's
-    // per-encoder rasterizer offset. Routed through `LastBoundCache`
-    // so the per-encoder bias only re-binds when the resolved
-    // (bias, slope-scale) pair actually changes — the cache itself
-    // is what prevents the "leaked from a previous draw" failure
-    // mode (every emit updates the slot; every change re-emits).
-    //
-    // Implicit decal bias: when the render-state pattern matches a
-    // typical alpha-blended decal (depth-test on under `LESS` or
-    // `LESSEQUAL`, depth-write off, alpha-blend on, game's
-    // DEPTHBIAS == 0) AND the game hasn't
-    // already supplied a slope-scale, push the polygon slightly
-    // toward the camera so it reliably wins ZTest against the
-    // underlying surface. A ground-projected decal whose VS and the
-    // underlying surface's VS use different WV translation columns
-    // (e.g. a decal in object-space verts × `world_decal · view`
-    // versus terrain in world-space verts × `view`) produces ULP-level
-    // different eye-space depths for the same world point even when
-    // the math is bit-identical — no shader-invariance trick can
-    // bridge that on Apple Silicon, so the bias is the load-bearing
-    // fix.
-    //
-    // Magnitude: negative pushes toward camera (D3D9 depth: 0 = near,
-    // 1 = far). Small enough that genuine geometry an order of
-    // magnitude further from the surface still composites correctly;
-    // large enough to swamp ULP-level noise from divergent FP rounding
-    // between pipelines (~10s of ULPs at the depth-buffer's
-    // precision).
-    let decal_inputs = DecalHeuristicInputs {
-        depth_enable: u32::from(render_state.depth_enable()),
-        depth_write: u32::from(render_state.depth_write()),
-        blend_enable: u32::from(render_state.blend_enable()),
-        raw_depth_bias: render_state.depth_bias,
-        raw_slope_scale: render_state.slope_scale_depth_bias,
-        depth_func: u32::from(render_state.depth_stencil_state.depth_func),
-    };
-    let decal_fires = looks_like_decal(decal_inputs);
-    let raw_bias = if decal_fires {
-        IMPLICIT_DECAL_BIAS_RAW
-    } else {
-        render_state.depth_bias
-    };
-    // The constant term goes to the vertex shader through `pos_fixup`
-    // (emitted below): Metal's own constant bias scales with the depth's
-    // exponent on a float depth buffer, D3D9's does not. Only the slope
-    // term, which Metal applies unscaled, stays on `setDepthBias`.
+    // `D3DRS_DEPTHBIAS` and `D3DRS_SLOPESCALEDEPTHBIAS`, applied as the game
+    // set them. The constant term goes to the vertex shader through
+    // `pos_fixup` (emitted below): Metal's own constant bias scales with the
+    // depth's exponent on a float depth buffer, D3D9's does not. Only the
+    // slope term, which Metal applies unscaled, stays on `setDepthBias`,
+    // routed through `LastBoundCache` so it re-binds only when it changes.
     let (min_z, max_z) = enc.viewport_depth_range();
-    let depth_bias = d3d_depth_bias_to_clip(raw_bias, min_z, max_z);
-    // Slope-scale: when the decal heuristic fires, layer
-    // `IMPLICIT_DECAL_SLOPE_SCALE` on top of the absolute bias.
-    // `looks_like_decal` already requires the game's own slope-scale to be
-    // zero, so `decal_fires` alone implies "the game hasn't supplied one".
-    // Metal applies `m × slopeScale + r × bias`, so this term is
-    // free for flat surfaces (m ≈ 0) and does the heavy lifting
-    // at grazing angles where the structural eye-space delta
-    // exceeds the absolute budget — see the constant's doc for
-    // the rationale.
-    let slope_scale = if decal_fires {
-        IMPLICIT_DECAL_SLOPE_SCALE
-    } else {
-        f32::from_bits(render_state.slope_scale_depth_bias)
-    };
+    let depth_bias = d3d_depth_bias_to_clip(render_state.depth_bias, min_z, max_z);
+    let slope_scale = f32::from_bits(render_state.slope_scale_depth_bias);
     if enc.last_bound().depth_bias_changed(0.0, slope_scale) {
         enc.emit_command(Command::set_depth_bias(0.0, slope_scale));
     }
@@ -1842,15 +1786,11 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
         // Bake the discriminating render-state bits into the dedup
         // key so a shader pair re-used in distinct (ZFUNC, ZW, AB)
         // configurations produces one trace row per configuration
-        // instead of collapsing. The comparison earns its own bits
-        // rather than riding on `decal_fires`: that flag groups every
-        // declining comparison together, so two of them on one shader
-        // pair would share a row and report whichever arrived first.
-        let state_bits = (u64::from(render_state.depth_stencil_state.depth_func) << 3)
-            | (u64::from(decal_fires) << 2)
+        // instead of collapsing.
+        let state_bits = (u64::from(render_state.depth_stencil_state.depth_func) << 2)
             | (u64::from(render_state.depth_write()) << 1)
             | u64::from(render_state.blend_enable());
-        let probe_key = pair_key ^ (state_bits << 57);
+        let probe_key = pair_key ^ (state_bits << 58);
         let pass_idx = enc.current_pass_index();
         let alpha_func = variant.alpha_func;
         mtld3d_shared::log_once_trace_by!(
@@ -1859,7 +1799,6 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
             "decal: pass={pass_idx} VS prog {vs_hash:#018x} PS prog {ps_hash:#018x} \
              rs[Z={z} ZW={zw} AB={ab} zf={zf} bias={bias:#010x} slope={slope:#010x}] \
              blend[src={src} dst={dst} op={op}] at={alpha_func} \
-             decal_fires={decal_fires} applied_raw={raw_bias:#010x} \
              applied_clip={depth_bias:e} slope_metal={slope_scale:.3}",
             z = u32::from(render_state.depth_enable()),
             zw = u32::from(render_state.depth_write()),

@@ -3,8 +3,8 @@
 //! Pins the enum tables (blend ops, `D3DDECLTYPE_*` formats) alongside the conversions that
 //! have no second source of truth: D3DCOLOR byte order and the `ColorFill` encodings, FVF
 //! expansion into `D3DVERTEXELEMENT9`, attribute resolution against declared VS semantics and
-//! the fixed-function convention, triangle-fan rewriting, and the depth-bias scale with its
-//! decal heuristic, and the `ColorFill` pattern splat. A wrong mapping here reaches the
+//! the fixed-function convention, triangle-fan rewriting, the depth-bias conversion, and the
+//! `ColorFill` pattern splat. A wrong mapping here reaches the
 //! screen as wrong pixels, not a crash.
 
 use super::*;
@@ -869,140 +869,6 @@ fn d3d_depth_bias_is_dropped_over_an_empty_depth_range() {
         let clip = d3d_depth_bias_to_clip(0.125_f32.to_bits(), min_z, max_z);
         assert_eq!(clip.to_bits(), 0.0_f32.to_bits());
     }
-}
-
-#[test]
-fn looks_like_decal_fires_on_alpha_blended_no_bias() {
-    // Canonical decal pattern: depth-test on, depth-write off,
-    // alpha-blend on, game's DEPTHBIAS + SLOPESCALEDEPTHBIAS both
-    // zero. Predicate fires → caller substitutes
-    // IMPLICIT_DECAL_BIAS_RAW for the zero game bias.
-    let inputs = DecalHeuristicInputs {
-        depth_enable: 1,
-        depth_write: 0,
-        blend_enable: 1,
-        depth_func: D3DCMP_LESSEQUAL,
-        raw_depth_bias: 0,
-        raw_slope_scale: 0,
-    };
-    assert!(looks_like_decal(inputs));
-}
-
-#[test]
-fn looks_like_decal_skips_alpha_blended_depth_writer() {
-    // An alpha-blended draw that ALSO writes depth is not a decal:
-    // the depth-write prong excludes it, so it keeps the game's own
-    // bias. Widening the predicate to such draws would need a
-    // different signal (e.g. D3DRS_ALPHATESTENABLE).
-    let inputs = DecalHeuristicInputs {
-        depth_enable: 1,
-        depth_write: 1,
-        blend_enable: 1,
-        depth_func: D3DCMP_LESSEQUAL,
-        raw_depth_bias: 0,
-        raw_slope_scale: 0,
-    };
-    assert!(!looks_like_decal(inputs));
-}
-
-#[test]
-fn looks_like_decal_skips_game_supplied_bias() {
-    // Alpha-blended decal-shaped draw whose game-side
-    // D3DRS_DEPTHBIAS is already non-zero. The predicate declines,
-    // so the game's own bias is left alone rather than clobbered.
-    let inputs = DecalHeuristicInputs {
-        depth_enable: 1,
-        depth_write: 0,
-        blend_enable: 1,
-        depth_func: D3DCMP_LESSEQUAL,
-        raw_depth_bias: 0x3a83_126f, // ~ +1e-3 as f32 bits
-        raw_slope_scale: 0,
-    };
-    assert!(!looks_like_decal(inputs));
-}
-
-#[test]
-fn looks_like_decal_skips_opaque_draw() {
-    // No alpha blend → not a decal pattern. Solid geometry that
-    // happens to disable depth-write (e.g. a deferred normals
-    // prepass) shouldn't be pulled toward camera.
-    let inputs = DecalHeuristicInputs {
-        depth_enable: 1,
-        depth_write: 0,
-        blend_enable: 0,
-        depth_func: D3DCMP_LESSEQUAL,
-        raw_depth_bias: 0,
-        raw_slope_scale: 0,
-    };
-    assert!(!looks_like_decal(inputs));
-}
-
-#[test]
-fn looks_like_decal_skips_comparisons_a_nudge_would_break() {
-    // A multipass engine lays depth down in one pass and selects the
-    // same fragments in a later additive pass with EQUAL. Such a
-    // fragment has to match the stored value exactly, so any nudge
-    // toward the camera makes the second pass select nothing and its
-    // contribution disappears. Only LESS and LESSEQUAL ask a question
-    // the nudge can help, so every other comparison declines.
-    for depth_func in [
-        D3DCMP_NEVER,
-        D3DCMP_EQUAL,
-        D3DCMP_GREATEREQUAL,
-        D3DCMP_NOTEQUAL,
-        D3DCMP_GREATER,
-        D3DCMP_ALWAYS,
-    ] {
-        let inputs = DecalHeuristicInputs {
-            depth_enable: 1,
-            depth_write: 0,
-            blend_enable: 1,
-            depth_func,
-            raw_depth_bias: 0,
-            raw_slope_scale: 0,
-        };
-        assert!(
-            !looks_like_decal(inputs),
-            "D3DCMP {depth_func} must decline"
-        );
-    }
-}
-
-#[test]
-fn looks_like_decal_fires_on_both_tolerant_comparisons() {
-    // LESS and LESSEQUAL both read the stored depth as "what is already
-    // in front", so the nudge only resolves the tie the decal wanted.
-    for depth_func in [D3DCMP_LESS, D3DCMP_LESSEQUAL] {
-        let inputs = DecalHeuristicInputs {
-            depth_enable: 1,
-            depth_write: 0,
-            blend_enable: 1,
-            depth_func,
-            raw_depth_bias: 0,
-            raw_slope_scale: 0,
-        };
-        assert!(looks_like_decal(inputs), "D3DCMP {depth_func} must fire");
-    }
-}
-
-#[test]
-fn implicit_decal_bias_stays_in_its_safe_band() {
-    // (a) above 3e-5 covers the eye-space delta observed between a decal's
-    //     and its surface's vertex shader at grazing angles;
-    // (b) below 3e-4 keeps flat decals from punching through adjacent
-    //     geometry on steep terrain.
-    // The test catches accidental order-of-magnitude changes.
-    let bias = f32::from_bits(IMPLICIT_DECAL_BIAS_RAW);
-    assert!(
-        bias < 0.0,
-        "implicit bias must pull toward camera, got {bias}"
-    );
-    let mag = -bias;
-    assert!(mag > 3.0e-5, "magnitude {mag} too small to cover the delta");
-    assert!(
-        mag < 3.0e-4,
-        "magnitude {mag} risks punching through terrain"
-    );
 }
 
 #[test]

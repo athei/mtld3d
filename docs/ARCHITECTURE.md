@@ -376,7 +376,7 @@ Every crate logs via `log` + `env_logger`. All targets sit under `mtld3d::*` and
 | `mtld3d::d3d9::draw`      | per-draw breadcrumb (trace)                                              |
 | `mtld3d::d3d9::sampler`   | sampler-state translation (trace)                                        |
 | `mtld3d::d3d9::caster`    | one row per unique shadow-caster pipeline state (trace)                  |
-| `mtld3d::d3d9::decal`     | the implicit decal-bias decision per (VS, PS) pair (trace)               |
+| `mtld3d::d3d9::decal`     | the depth bias applied per (VS, PS) pair and depth state (trace)         |
 | `mtld3d::dxso`            | DXSO to MSL emitter (`trace` dumps the MSL)                              |
 | `mtld3d::perf`            | 5-second averaged performance summary (`PERF=1` builds only)             |
 | `mtld3d::shim`            | Wine unix-call PE shim DLL                                               |
