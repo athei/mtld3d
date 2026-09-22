@@ -3817,7 +3817,7 @@ fn materialize_subresource_from_gpu(ti: &mut TextureInner, face: u32, level: usi
         planes: mtld3d_shared::mtl::ReadbackPlanes::Color,
         stencil_bytes_per_row: 0,
         stencil_offset: 0,
-        queue_handle: dev.queue_handle(),
+        record_handle: dev.record_handle(),
         device_handle: dev.device_handle(),
         // SAFETY: `handle` is non-zero (checked above) and a live retained
         // `MTLTexture` handle from the encoder texture cache.
@@ -3892,7 +3892,7 @@ fn materialize_depth_planes(
         stencil_bytes_per_row: u32::try_from(layout.stencil_pitch)
             .expect("depth texture pitch fits u32"),
         stencil_offset: depth_len as u64,
-        queue_handle: dev.queue_handle(),
+        record_handle: dev.record_handle(),
         device_handle: dev.device_handle(),
         // SAFETY: the caller resolved this live texture handle after draining the encoder.
         tex_handle: unsafe { MetalHandle::new(handle) },

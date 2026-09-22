@@ -55,16 +55,16 @@ fn state_with(inner: Inner) -> Arc<PresentState> {
         presenter_cv: Condvar::new(),
         present_retired: AtomicU64::new(0),
         thread: Mutex::new(None),
-        queue_retain: MetalHandle::<MTLCommandQueueKind>::NULL,
+        stalled: AtomicBool::new(false),
     })
 }
 
-/// The record's retain outlives the caller's, so the thread starts on a live queue.
+/// The record owns the queue's only retain, so its thread runs on a live queue.
 ///
-/// The caller drops its retain the moment `register` returns, before the
-/// thread has necessarily run; the thread then retains the queue itself and
-/// finds the record's retain holding it. Without that retain this is a
-/// use after free that a loaded machine turns into a crash at thread start.
+/// `create_command_queue` hands the retain to the record and keeps no copy,
+/// and the presenter thread retains the queue again at start. Without the
+/// record's retain this is a use after free that a loaded machine turns into
+/// a crash at thread start.
 #[test]
 fn a_record_keeps_the_queue_alive_for_its_thread() {
     use objc2_metal::{MTLCreateSystemDefaultDevice, MTLDevice};
@@ -75,14 +75,39 @@ fn a_record_keeps_the_queue_alive_for_its_thread() {
     let queue = device
         .newCommandQueue()
         .expect("a queue on the default device");
-    // SAFETY: the raw address carries this retain until it is released below.
+    // SAFETY: the raw address carries this retain, which the record adopts
+    // and releases when it drops at the end of this test.
     let handle =
         unsafe { MetalHandle::<MTLCommandQueueKind>::new(Retained::into_raw(queue) as u64) };
-    assert!(register(handle, None), "the record and its thread start");
-    // SAFETY: this was the caller's only retain; the record holds one of its
-    // own, and the copy passed below is only a registry key.
-    unsafe { handle.release_retain() };
-    unregister_and_join(handle);
+    let record = DeviceRecord::new(handle, None);
+    assert!(spawn(&record), "the presenter thread starts");
+    stop_and_join(record.present());
+}
+
+/// A handle round-trips to its record, and only the destroying caller ends it.
+///
+/// `borrow` hands out a reference without consuming the handle's own, so a
+/// thunk that resolves a device leaves the record live for the next one;
+/// `consume` takes that last reference back.
+#[test]
+fn a_record_handle_round_trips_and_only_consume_ends_it() {
+    let record = DeviceRecord::new(MetalHandle::<MTLCommandQueueKind>::NULL, None);
+    let handle = Arc::clone(&record).into_handle();
+    {
+        // SAFETY: the handle came from `into_handle` above and has not been
+        // consumed.
+        let borrowed = unsafe { DeviceRecord::borrow(handle) }.expect("the record is live");
+        assert!(Arc::ptr_eq(&borrowed, &record), "the same record");
+    }
+    // SAFETY: as above, and nothing names the handle after this.
+    let consumed = unsafe { DeviceRecord::consume(handle) }.expect("the record is live");
+    assert!(Arc::ptr_eq(&consumed, &record));
+    drop(consumed);
+    assert_eq!(
+        Arc::strong_count(&record),
+        1,
+        "the handle's reference is gone"
+    );
 }
 
 #[test]
@@ -342,36 +367,15 @@ fn an_idle_wait_returns_once_the_presenter_pops_the_last_packet() {
 }
 
 #[test]
-fn two_queues_keep_their_own_flags_and_records() {
-    let a = MetalHandle::<MTLCommandQueueKind>::NULL;
-    // Distinct opaque keys: nothing dereferences a registry key.
-    // SAFETY: test-only opaque values that are never dereferenced.
-    let key_a = unsafe { MetalHandle::<MTLCommandQueueKind>::new(0x7a00_0010) };
-    // SAFETY: as above.
-    let key_b = unsafe { MetalHandle::<MTLCommandQueueKind>::new(0x7a00_0020) };
-    let _ = a;
+fn two_devices_keep_their_own_wait_policy() {
     let state_a = state_with(empty_inner());
     let state_b = state_with(empty_inner());
-    {
-        let mut map = PRESENTERS.lock().unwrap_or_else(PoisonError::into_inner);
-        map.insert(key_a.raw(), Arc::clone(&state_a));
-        map.insert(key_b.raw(), Arc::clone(&state_b));
-    }
-    set_wait_policy(key_a, PresentWaitPolicy::SnapshotPending);
+    set_wait_policy(&state_a, PresentWaitPolicy::SnapshotPending);
     assert!(state_a.lock().flags.contains(PresenterFlags::HURRY));
     assert!(
         state_b.lock().flags.is_empty(),
-        "the other queue is untouched"
+        "the other device is untouched"
     );
-    set_wait_policy(key_a, PresentWaitPolicy::WaitForCommit);
+    set_wait_policy(&state_a, PresentWaitPolicy::WaitForCommit);
     assert!(state_a.lock().flags.is_empty());
-    {
-        let mut map = PRESENTERS.lock().unwrap_or_else(PoisonError::into_inner);
-        map.remove(&key_a.raw());
-        assert!(
-            map.contains_key(&key_b.raw()),
-            "removing one leaves the other"
-        );
-        map.remove(&key_b.raw());
-    }
 }

@@ -42,9 +42,8 @@ use mtld3d_shared::{
     DestroyCommandQueueParams, InPtr, InPtrMut, MetalHandle, OutPtr, SetPresentWaitPolicyParams,
     ValueIn, VtableThis,
     mtl::PresentWaitPolicy,
-    mtl_handle::{
-        CAMetalLayerKind, MTLCommandQueueKind, MTLDeviceKind, MTLTextureKind, NSViewKind,
-    },
+    mtl_handle::{CAMetalLayerKind, MTLDeviceKind, MTLTextureKind, NSViewKind},
+    record_handle::DeviceRecordHandle,
 };
 use mtld3d_types::{
     D3D_MAX_SIMULTANEOUS_RENDERTARGETS, D3DCAPS9, D3DCLEAR_STENCIL, D3DCLEAR_TARGET,
@@ -326,7 +325,11 @@ bitflags::bitflags! {
 pub struct DeviceInner {
     // Metal handles / presentation.
     device_handle: MetalHandle<MTLDeviceKind>,
-    queue_handle: MetalHandle<MTLCommandQueueKind>,
+    /// This device's unix-side record, opaque here.
+    ///
+    /// Names the device on every thunk that acts on it, from a submission to
+    /// the destroy that frees the record and the queue behind it.
+    record_handle: DeviceRecordHandle,
     view_handle: MetalHandle<NSViewKind>,
     layer_handle: MetalHandle<CAMetalLayerKind>,
     backbuffer_handle: MetalHandle<MTLTextureKind>,
@@ -1490,7 +1493,7 @@ impl DeviceInner {
     pub const fn fresh_frame(&self) -> FrameData {
         FrameData::new(&FrameInit {
             device_handle: self.device_handle,
-            queue_handle: self.queue_handle,
+            record_handle: self.record_handle,
             backbuffer_handle: self.backbuffer_handle,
             backbuffer_srgb_handle: self.backbuffer_srgb_handle,
             backbuffer_msaa_handle: self.backbuffer_msaa_handle,
@@ -1636,11 +1639,11 @@ impl DeviceInner {
     /// thunk this side issues off the device lifecycle, and only on a path
     /// that is already a synchronous read-back.
     fn hurry_presentation(&self) {
-        if self.queue_handle.is_null() {
+        if self.record_handle.is_null() {
             return;
         }
         let mut params = SetPresentWaitPolicyParams {
-            queue_handle: self.queue_handle,
+            record_handle: self.record_handle,
             policy: PresentWaitPolicy::SnapshotPending,
             pad0: 0,
         };
@@ -2756,7 +2759,7 @@ impl DeviceInner {
 
         let mut bb_params = mtld3d_shared::CreateBackbufferParams {
             device_handle: self.device_handle,
-            queue_handle: self.queue_handle,
+            record_handle: self.record_handle,
             width: self.render_scale.dimension(new_width),
             height: self.render_scale.dimension(new_height),
             sample_count: u32::from(self.backbuffer_sample_count),
@@ -2846,7 +2849,7 @@ impl DeviceInner {
 /// Grouped so the constructor doesn't take a dozen positional arguments.
 pub struct DeviceCreateInfo {
     pub device_handle: MetalHandle<MTLDeviceKind>,
-    pub queue_handle: MetalHandle<MTLCommandQueueKind>,
+    pub record_handle: DeviceRecordHandle,
     pub view_handle: MetalHandle<NSViewKind>,
     pub layer_handle: MetalHandle<CAMetalLayerKind>,
     /// The pacing that attach was called with.
@@ -2940,7 +2943,7 @@ impl Direct3DDevice9 {
 
         let inner = Box::into_raw(Box::new(DeviceInner {
             device_handle: info.device_handle,
-            queue_handle: info.queue_handle,
+            record_handle: info.record_handle,
             view_handle: info.view_handle,
             layer_handle: info.layer_handle,
             backbuffer_handle: info.backbuffer_handle,
@@ -3084,8 +3087,8 @@ impl DeviceInner {
         self.device_handle
     }
 
-    pub const fn queue_handle(&self) -> MetalHandle<MTLCommandQueueKind> {
-        self.queue_handle
+    pub const fn record_handle(&self) -> DeviceRecordHandle {
+        self.record_handle
     }
 
     /// Owning `Direct3DDevice9`* wrapper, or null until `CreateDevice` stamps it.
@@ -3701,7 +3704,7 @@ extern "system" fn device_release(this: *mut c_void) -> u32 {
         }
         let mut params = DestroyCommandQueueParams {
             device_handle: device_inner.device_handle,
-            queue_handle: device_inner.queue_handle,
+            record_handle: device_inner.record_handle,
             view_handle: device_inner.view_handle,
             backbuffer_handle: device_inner.backbuffer_handle,
             pipeline_handle: MetalHandle::NULL, // pipelines managed by encoder cache
@@ -4584,7 +4587,7 @@ fn reset_recreate_resources(
     //    view, and present resolves whatever difference remains.
     let mut bb_params = mtld3d_shared::CreateBackbufferParams {
         device_handle: dev.device_handle,
-        queue_handle: dev.queue_handle,
+        record_handle: dev.record_handle,
         width: dev.render_scale.dimension(pp.back_buffer_width),
         height: dev.render_scale.dimension(pp.back_buffer_height),
         sample_count: u32::from(dev.backbuffer_sample_count),
@@ -6192,7 +6195,7 @@ fn create_color_target_surface(
     let scale = device.scale_for_created_target(width, height, usage & D3DUSAGE_RENDERTARGET != 0);
     let mut params = CreateColorTargetParams {
         device_handle,
-        queue_handle: device.queue_handle(),
+        record_handle: device.record_handle(),
         width: scale.dimension(width),
         height: scale.dimension(height),
         pixel_format: mapping.metal_pixel_format(),
@@ -7237,7 +7240,7 @@ pub fn blit_handle_to_systemmem(device_inner: &DeviceInner, read: &SystemMemRead
         planes: mtld3d_shared::mtl::ReadbackPlanes::Color,
         stencil_bytes_per_row: 0,
         stencil_offset: 0,
-        queue_handle: device_inner.queue_handle(),
+        record_handle: device_inner.record_handle(),
         device_handle: device_inner.device_handle(),
         tex_handle: read.tex_handle,
         dst_ptr: read.dst_ptr,

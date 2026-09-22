@@ -1,4 +1,7 @@
-use std::{path::PathBuf, sync::LazyLock};
+use std::{
+    path::PathBuf,
+    sync::{Arc, LazyLock},
+};
 
 use mtld3d_shared::{
     MetalHandle,
@@ -6,6 +9,7 @@ use mtld3d_shared::{
     mtl_handle::{
         MTLCommandQueueKind, MTLDeviceKind, MTLRenderPipelineStateKind, MTLTextureKind, NSViewKind,
     },
+    record_handle::DeviceRecordHandle,
 };
 use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_metal::{
@@ -16,6 +20,7 @@ use objc2_metal::{
 use super::{
     handle::{IntoRetained, ReleaseRetain},
     macdrv::{detach_metal_layer, retire_metal_view},
+    record::DeviceRecord,
 };
 use crate::LOG_TARGET;
 
@@ -204,7 +209,8 @@ pub fn supports_float32_filtering(device: &ProtocolObject<dyn MTLDevice>) -> boo
 /// Captured once at device creation, never re-queried.
 pub struct DeviceCaps {
     pub device_handle: MetalHandle<MTLDeviceKind>,
-    pub queue_handle: MetalHandle<MTLCommandQueueKind>,
+    /// The device's record, which owns the queue and its presentation state.
+    pub record_handle: DeviceRecordHandle,
     /// `MTLDevice.hasUnifiedMemory`. False on Intel/AMD discrete GPUs.
     pub unified_memory: bool,
     /// `device.minimumLinearTextureAlignmentForPixelFormat(BGRA8Unorm)`, in bytes.
@@ -223,13 +229,14 @@ pub fn create_command_queue(gate: Option<PathBuf>) -> Option<DeviceCaps> {
     let queue = device.newCommandQueue()?;
     let queue_label = objc2_foundation::NSString::from_str("mtld3d");
     queue.setLabel(Some(&queue_label));
-    // The presentation record is keyed by the address the handle below
-    // carries, so it is registered on the still-retained queue.
-    // SAFETY: `Retained::as_ptr` is the address `into_raw` hands out below,
-    // and the handle is used only as the record's key until then.
-    let queue_key =
-        unsafe { MetalHandle::<MTLCommandQueueKind>::new(Retained::as_ptr(&queue) as u64) };
-    if !super::presenter::register(queue_key, gate) {
+    // The record takes the queue's retain before the presenter thread
+    // exists, so the thread's own retain at start lands on a live object.
+    // SAFETY: `Retained::into_raw` transfers the retain into the raw
+    // address, which the record's `Drop` releases.
+    let queue_handle =
+        unsafe { MetalHandle::<MTLCommandQueueKind>::new(Retained::into_raw(queue) as u64) };
+    let record = DeviceRecord::new(queue_handle, gate);
+    if !super::presenter::spawn(&record) {
         return None;
     }
     let unified_memory = device.hasUnifiedMemory();
@@ -238,21 +245,18 @@ pub fn create_command_queue(gate: Option<PathBuf>) -> Option<DeviceCaps> {
     )
     .expect("Metal min linear texture alignment fits u32");
 
-    // SAFETY: `Retained::into_raw` transfers each retain into the
-    // returned `u64`; `MetalHandle::new` adopts that retain into a
-    // typed handle. The PE side keeps the handle alive until the
-    // matching destroy thunk fires. The device retain is the one
-    // `pinned_device` took for this caller, not the pin's own, so
-    // `destroy_command_queue` releasing it leaves the pinned device live
-    // for the next D3D device and for the process-wide caches.
+    // SAFETY: `Retained::into_raw` transfers the retain into the returned
+    // `u64`; `MetalHandle::new` adopts that retain into a typed handle. The
+    // PE side keeps the handle alive until the matching destroy thunk fires.
+    // The device retain is the one `pinned_device` took for this caller, not
+    // the pin's own, so `destroy_command_queue` releasing it leaves the
+    // pinned device live for the next D3D device and for the process-wide
+    // caches.
     let device_handle =
         unsafe { MetalHandle::<MTLDeviceKind>::new(Retained::into_raw(device) as u64) };
-    // SAFETY: as above.
-    let queue_handle =
-        unsafe { MetalHandle::<MTLCommandQueueKind>::new(Retained::into_raw(queue) as u64) };
     Some(DeviceCaps {
         device_handle,
-        queue_handle,
+        record_handle: record.into_handle(),
         unified_memory,
         min_linear_texture_align,
     })
@@ -264,17 +268,18 @@ pub fn create_command_queue(gate: Option<PathBuf>) -> Option<DeviceCaps> {
 /// window's next device, see `macdrv::retire_metal_view`.
 pub fn destroy_command_queue(
     device_handle: MetalHandle<MTLDeviceKind>,
-    queue_handle: MetalHandle<MTLCommandQueueKind>,
+    device_record: &Arc<DeviceRecord>,
     view_handle: MetalHandle<NSViewKind>,
     backbuffer_handle: MetalHandle<MTLTextureKind>,
     pipeline_handle: MetalHandle<MTLRenderPipelineStateKind>,
     depth_texture_handle: MetalHandle<MTLTextureKind>,
 ) {
+    let queue_handle = device_record.queue();
     // The presenter first: it may still be inside `nextDrawable` on the
     // layer this call retires, and its last present must be committed before
     // the fence below can order it. The PE side has already drained its
     // submit thread and waited for presentation to go idle.
-    super::presenter::unregister_and_join(queue_handle);
+    super::presenter::stop_and_join(device_record.present());
     // Drop the latched view, layer and window first: the main thread
     // reconciles them against the display it is told about, and this call is
     // about to release the view all three belong to.
@@ -315,8 +320,8 @@ pub fn destroy_command_queue(
     // SAFETY: as above.
     crate::metal::destroy_texture(depth_texture_handle.raw());
     crate::metal::destroy_texture(backbuffer_handle.raw());
-    // SAFETY: as above.
-    unsafe { queue_handle.release_retain() };
+    // The queue's own retain rides on the record, which the caller drops
+    // once this returns.
     // SAFETY: as above.
     unsafe { device_handle.release_retain() };
     if !view_handle.is_null() {

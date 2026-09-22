@@ -19,6 +19,7 @@ use mtld3d_shared::{
     MetalHandle, OutPtr, VtableThis,
     mtl::DeviceCapsFlags,
     mtl_handle::{MTLDeviceKind, MTLTextureKind, NSViewKind},
+    record_handle::DeviceRecordHandle,
 };
 use mtld3d_types::{
     D3DADAPTER_IDENTIFIER9, D3DCAPS9, D3DDEVTYPE_HAL, D3DDISPLAYMODE, D3DFMT_A8B8G8R8,
@@ -1419,7 +1420,7 @@ extern "system" fn d3d9_create_device(
     let gate = present_gate_unix_path(cfg);
     let mut cq_params = CreateCommandQueueParams {
         device_handle: MetalHandle::NULL,
-        queue_handle: MetalHandle::NULL,
+        record_handle: DeviceRecordHandle::NULL,
         unified_memory: 0,
         min_linear_texture_align: 0,
         gate_file_ptr: gate.as_ref().map_or(0, |path| path.as_ptr() as u64),
@@ -1552,7 +1553,7 @@ extern "system" fn d3d9_create_device(
     // Create backbuffer texture
     let mut bb_params = CreateBackbufferParams {
         device_handle: cq_params.device_handle,
-        queue_handle: cq_params.queue_handle,
+        record_handle: cq_params.record_handle,
         width: render_width,
         height: render_height,
         sample_count: u32::from(sample_count),
@@ -1599,7 +1600,7 @@ extern "system" fn d3d9_create_device(
 
     let dev = Direct3DDevice9::new(crate::device::DeviceCreateInfo {
         device_handle: cq_params.device_handle,
-        queue_handle: cq_params.queue_handle,
+        record_handle: cq_params.record_handle,
         view_handle: layer_params.view_handle,
         layer_handle: layer_params.layer_handle,
         pacing: attached_pacing(&layer_params),
@@ -1621,7 +1622,7 @@ extern "system" fn d3d9_create_device(
         prewarm,
         current_frame: FrameData::new(&FrameInit {
             device_handle: cq_params.device_handle,
-            queue_handle: cq_params.queue_handle,
+            record_handle: cq_params.record_handle,
             backbuffer_handle: bb_params.texture_handle,
             backbuffer_srgb_handle: bb_params.srgb_texture_handle,
             backbuffer_msaa_handle: bb_params.msaa_texture_handle,
@@ -1963,7 +1964,7 @@ fn destroy_partial_device(
     }
     let mut destroy = DestroyCommandQueueParams {
         device_handle: cq.device_handle,
-        queue_handle: cq.queue_handle,
+        record_handle: cq.record_handle,
         view_handle,
         backbuffer_handle: backbuffer.map_or(MetalHandle::NULL, |bb| bb.texture_handle),
         pipeline_handle: MetalHandle::NULL,

@@ -96,10 +96,10 @@ fn wait_for_gpu_retire_layout() {
 #[test]
 fn present_sync_param_layouts_match_wow64() {
     use super::{SetPresentWaitPolicyParams, WaitForPresentIdleParams};
-    // 8 queue_handle + 4 policy + 4 pad0 = 16
+    // 8 record_handle + 4 policy + 4 pad0 = 16
     assert_eq!(core::mem::align_of::<SetPresentWaitPolicyParams>(), 8);
     assert_eq!(core::mem::size_of::<SetPresentWaitPolicyParams>(), 16);
-    // 8 queue_handle
+    // 8 record_handle
     assert_eq!(core::mem::align_of::<WaitForPresentIdleParams>(), 8);
     assert_eq!(core::mem::size_of::<WaitForPresentIdleParams>(), 8);
 }
@@ -107,7 +107,7 @@ fn present_sync_param_layouts_match_wow64() {
 #[test]
 fn create_command_queue_layout_matches_wow64() {
     use super::CreateCommandQueueParams;
-    // 8 device_handle + 8 queue_handle + 4 unified_memory
+    // 8 device_handle + 8 record_handle + 4 unified_memory
     // + 4 min_linear_texture_align + 8 gate_file_ptr + 4 gate_file_len
     // + 4 pad0 = 40
     assert_eq!(core::mem::align_of::<CreateCommandQueueParams>(), 8);
@@ -132,7 +132,7 @@ fn frame_param_layouts_match_wow64() {
     assert_eq!(core::mem::size_of::<ExtraColorDesc>(), 32);
 
     // SubmitFrameParams:
-    //   8 queue_handle
+    //   8 record_handle
     //   + 8 blit_commands_ptr + 4 blit_command_count + 4 blit_commands_need_encoder
     //   + 8 passes_ptr + 4 pass_count + 4 upload_pass_count
     //   + 8 present_layer + 8 present_texture
@@ -157,7 +157,7 @@ fn frame_param_layouts_match_wow64() {
     );
 
     // CreateTexturesBatchParams:
-    //   8 device_handle + 8 queue_handle + 4 count + 4 _pad0 + 8 descs_ptr
+    //   8 device_handle + 8 record_handle + 4 count + 4 _pad0 + 8 descs_ptr
     //   + 8 views_out_ptr = 40
     assert_eq!(core::mem::size_of::<CreateTexturesBatchParams>(), 40);
 
@@ -202,7 +202,7 @@ fn depth_transfer_layouts_match_wow64() {
         8
     );
     assert_eq!(
-        core::mem::offset_of!(BlitTextureToBufferParams, queue_handle),
+        core::mem::offset_of!(BlitTextureToBufferParams, record_handle),
         16
     );
 }

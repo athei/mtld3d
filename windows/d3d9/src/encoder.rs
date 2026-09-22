@@ -69,11 +69,11 @@ use mtld3d_shared::{
         TextureUsage, TriangleFillMode, VisibilityResultMode,
     },
     mtl_handle::{
-        CAMetalLayerKind, MTLBufferKind, MTLCommandQueueKind, MTLDepthStencilStateKind,
-        MTLDeviceKind, MTLFunctionKind, MTLRenderPipelineStateKind, MTLSamplerStateKind,
-        MTLTextureKind, NSViewKind,
+        CAMetalLayerKind, MTLBufferKind, MTLDepthStencilStateKind, MTLDeviceKind, MTLFunctionKind,
+        MTLRenderPipelineStateKind, MTLSamplerStateKind, MTLTextureKind, NSViewKind,
     },
     perf::{NanosSetTimer, ShaderTimings},
+    record_handle::DeviceRecordHandle,
     texture_views::TextureViews,
     tsc::{ns_to_cycles, rdtsc, secs_to_cycles},
 };
@@ -1094,11 +1094,12 @@ pub struct FrameEncoder {
 
     // Persistent caches (survive across frames)
     device_handle: MetalHandle<MTLDeviceKind>,
-    /// The device's frame queue, adopted from each frame alongside `device_handle`.
+    /// The device's unix-side record, adopted from each frame alongside `device_handle`.
     ///
     /// Carried into `CreateTexturesBatch`: a creation-time clear has to be
-    /// encoded on the queue the frames run on to be ordered ahead of them.
-    queue_handle: MetalHandle<MTLCommandQueueKind>,
+    /// encoded on the queue the frames run on to be ordered ahead of them,
+    /// and the record is what names that queue.
+    record_handle: DeviceRecordHandle,
     depth_stencil_cache: FxHashMap<DepthStencilKey, MetalHandle<MTLDepthStencilStateKind>>,
     /// Every render pipeline build by key, failures included.
     ///
@@ -1654,7 +1655,7 @@ impl FrameEncoder {
             pass_shader_log_fired: FxHashSet::default(),
             gpu_caps,
             device_handle: MetalHandle::NULL,
-            queue_handle: MetalHandle::NULL,
+            record_handle: DeviceRecordHandle::NULL,
             depth_stencil_cache: FxHashMap::default(),
             pipeline_cache: BuildIndex::default(),
             clear_quad_pipeline_cache: FxHashMap::default(),
@@ -1728,7 +1729,7 @@ impl FrameEncoder {
             u32::try_from(descs.len()).expect("batch_create_textures: descs.len() exceeds u32");
         let mut params = CreateTexturesBatchParams {
             device_handle: self.device_handle,
-            queue_handle: self.queue_handle,
+            record_handle: self.record_handle,
             count,
             pad0: 0,
             descs_ptr: descs.as_ptr() as u64,
@@ -2432,7 +2433,7 @@ impl FrameEncoder {
         self.backbuffer_width = frame.backbuffer_width;
         self.backbuffer_height = frame.backbuffer_height;
         self.device_handle = frame.device_handle;
-        self.queue_handle = frame.queue_handle;
+        self.record_handle = frame.record_handle;
         self.perf.begin_frame(frame.perf());
         // Drain VB/IB retention entries whose seq has retired on the
         // GPU. Intake of *this* frame's entries is deferred to
@@ -2704,11 +2705,11 @@ impl FrameEncoder {
 
     /// Tell the queue's presenter how a submit treats a present still waiting for its drawable.
     fn set_present_wait_policy(&self, policy: PresentWaitPolicy) {
-        if self.queue_handle.is_null() {
+        if self.record_handle.is_null() {
             return;
         }
         let mut params = SetPresentWaitPolicyParams {
-            queue_handle: self.queue_handle,
+            record_handle: self.record_handle,
             policy,
             pad0: 0,
         };
@@ -2723,11 +2724,11 @@ impl FrameEncoder {
     /// them, and what the GPU capture needs so the present buffers of the
     /// frames it brackets are inside the trace and no earlier frame's is.
     fn drain_presentation(&self) {
-        if self.queue_handle.is_null() {
+        if self.record_handle.is_null() {
             return;
         }
         let mut params = WaitForPresentIdleParams {
-            queue_handle: self.queue_handle,
+            record_handle: self.record_handle,
         };
         let _ = unix_call(&mut params);
     }
@@ -8906,7 +8907,7 @@ pub struct FrameData {
     /// exists.
     pending_staging_warmups: Vec<StagingWarmupEntry>,
     device_handle: MetalHandle<MTLDeviceKind>,
-    queue_handle: MetalHandle<MTLCommandQueueKind>,
+    record_handle: DeviceRecordHandle,
     backbuffer_handle: MetalHandle<MTLTextureKind>,
     /// sRGB twin view of the back buffer; see `FrameInit`.
     backbuffer_srgb_handle: MetalHandle<MTLTextureKind>,
@@ -9053,7 +9054,7 @@ pub struct SubmitFence {
 /// `TextureCreateInfo`.
 pub struct FrameInit {
     pub device_handle: MetalHandle<MTLDeviceKind>,
-    pub queue_handle: MetalHandle<MTLCommandQueueKind>,
+    pub record_handle: DeviceRecordHandle,
     pub backbuffer_handle: MetalHandle<MTLTextureKind>,
     /// sRGB twin view of the back buffer, attached under `D3DRS_SRGBWRITEENABLE`.
     pub backbuffer_srgb_handle: MetalHandle<MTLTextureKind>,
@@ -9094,7 +9095,7 @@ impl FrameData {
             pending_buffer_warmups: Vec::new(),
             pending_staging_warmups: Vec::new(),
             device_handle: init.device_handle,
-            queue_handle: init.queue_handle,
+            record_handle: init.record_handle,
             backbuffer_handle: init.backbuffer_handle,
             backbuffer_srgb_handle: init.backbuffer_srgb_handle,
             backbuffer_msaa_handle: init.backbuffer_msaa_handle,
@@ -10094,7 +10095,7 @@ fn finalize_submit(enc: &mut FrameEncoder, frame: &FrameData) -> (SubmitFramePar
     payload.trailing_blits = trailing_blits;
 
     let params = SubmitFrameParams {
-        queue_handle: frame.queue_handle,
+        record_handle: frame.record_handle,
         blit_commands_ptr: if has_upload_passes || payload.frame_blit_commands.is_empty() {
             0
         } else {

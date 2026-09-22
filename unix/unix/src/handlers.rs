@@ -1,4 +1,5 @@
 use core::ffi::c_void;
+use std::sync::Arc;
 
 use log::{debug, error, info, warn};
 use mtld3d_shared::{
@@ -15,6 +16,7 @@ use mtld3d_shared::{
     WaitForPresentIdleParams, WriteLogParams, identity,
     mtl::{CursorOverlayFlags, DestroyKind, QuadPipelineKind, TextureCreateFlags},
     mtl_handle::{MTLBufferKind, MTLTextureKind},
+    record_handle::DeviceRecordHandle,
 };
 use objc2_core_foundation::kCFRunLoopCommonModes;
 
@@ -178,6 +180,25 @@ pub extern "C" fn get_device_info_handler(args: *mut c_void) -> i32 {
     STATUS_SUCCESS
 }
 
+/// The record a thunk names, or `None` after a warning.
+///
+/// A null or unknown handle is a device whose creation failed or one already
+/// destroyed; the caller returns without touching Metal, as it did when the
+/// device was looked up by queue address.
+fn device_record(handle: DeviceRecordHandle, thunk: &str) -> Option<Arc<metal::DeviceRecord>> {
+    // SAFETY: the PE side passes back a handle `CreateCommandQueue` produced
+    // and keeps it until its `DestroyCommandQueue`, which is the one caller
+    // that consumes it.
+    let record = unsafe { metal::DeviceRecord::borrow(handle) };
+    if record.is_none() {
+        mtld3d_shared::log_once_warn!(
+            target: LOG_TARGET,
+            "{thunk}: no device record for handle {handle:#x}; the call is dropped",
+        );
+    }
+    record
+}
+
 pub extern "C" fn create_command_queue_handler(args: *mut c_void) -> i32 {
     // SAFETY: unix-call handler params; PE side passes *mut CreateCommandQueueParams.
     let Some(mut params) = (unsafe { InPtrMut::<CreateCommandQueueParams>::opt(args) }) else {
@@ -206,7 +227,7 @@ pub extern "C" fn create_command_queue_handler(args: *mut c_void) -> i32 {
     };
     if let Some(caps) = metal::create_command_queue(gate) {
         params.device_handle = caps.device_handle;
-        params.queue_handle = caps.queue_handle;
+        params.record_handle = caps.record_handle;
         params.unified_memory = u32::from(caps.unified_memory);
         params.min_linear_texture_align = caps.min_linear_texture_align;
         info!(
@@ -406,7 +427,10 @@ pub extern "C" fn set_present_wait_policy_handler(args: *mut c_void) -> i32 {
     let Some(params) = (unsafe { InPtr::<SetPresentWaitPolicyParams>::opt(args.cast()) }) else {
         return -1;
     };
-    metal::set_wait_policy(params.queue_handle, params.policy);
+    let Some(record) = device_record(params.record_handle, "SetPresentWaitPolicy") else {
+        return STATUS_SUCCESS;
+    };
+    metal::set_wait_policy(record.present(), params.policy);
     STATUS_SUCCESS
 }
 
@@ -415,7 +439,10 @@ pub extern "C" fn wait_for_present_idle_handler(args: *mut c_void) -> i32 {
     let Some(params) = (unsafe { InPtr::<WaitForPresentIdleParams>::opt(args.cast()) }) else {
         return -1;
     };
-    metal::wait_for_present_idle(params.queue_handle);
+    let Some(record) = device_record(params.record_handle, "WaitForPresentIdle") else {
+        return STATUS_SUCCESS;
+    };
+    metal::wait_for_present_idle(record.present());
     STATUS_SUCCESS
 }
 
@@ -464,9 +491,20 @@ pub extern "C" fn destroy_command_queue_handler(args: *mut c_void) -> i32 {
     let Some(params) = (unsafe { InPtr::<DestroyCommandQueueParams>::opt(args.cast()) }) else {
         return -1;
     };
+    // SAFETY: the handle is the one `CreateCommandQueue` produced for this
+    // device, and this is the only thunk that gives it back; no later thunk
+    // may name it.
+    let Some(record) = (unsafe { metal::DeviceRecord::consume(params.record_handle) }) else {
+        mtld3d_shared::log_once_warn!(
+            target: LOG_TARGET,
+            "DestroyCommandQueue: no device record for handle {:#x}; nothing is released",
+            params.record_handle,
+        );
+        return STATUS_SUCCESS;
+    };
     metal::destroy_command_queue(
         params.device_handle,
-        params.queue_handle,
+        &record,
         params.view_handle,
         params.backbuffer_handle,
         params.pipeline_handle,
@@ -483,6 +521,9 @@ pub extern "C" fn create_backbuffer_handler(args: *mut c_void) -> i32 {
         return -1;
     };
     let params: &mut CreateBackbufferParams = &mut params;
+    let Some(record) = device_record(params.record_handle, "CreateBackbuffer") else {
+        return STATUS_UNSUCCESSFUL;
+    };
 
     let Some((handle, srgb_handle)) =
         metal::create_backbuffer(params.device_handle, params.width, params.height)
@@ -494,7 +535,7 @@ pub extern "C" fn create_backbuffer_handler(args: *mut c_void) -> i32 {
             params.height,
             params.sample_count,
             params.device_handle.raw(),
-            params.queue_handle.raw(),
+            record.queue().raw(),
         );
         return STATUS_UNSUCCESSFUL;
     };
@@ -515,7 +556,7 @@ pub extern "C" fn create_backbuffer_handler(args: *mut c_void) -> i32 {
             params.width,
             params.height,
             params.device_handle.raw(),
-            params.queue_handle.raw(),
+            record.queue().raw(),
         );
         // Both handles are minted and neither has been handed back, so this
         // side owns their only copies; the view goes first, since it holds a
@@ -535,7 +576,7 @@ pub extern "C" fn create_backbuffer_handler(args: *mut c_void) -> i32 {
     params.msaa_srgb_texture_handle =
         unsafe { MetalHandle::<MTLTextureKind>::new(msaa_srgb_handle) };
     metal::clear_new_color_textures(
-        params.queue_handle,
+        record.queue(),
         &[params.texture_handle, params.msaa_texture_handle],
         metal::OPAQUE_BLACK,
     );
@@ -554,7 +595,7 @@ pub extern "C" fn create_backbuffer_handler(args: *mut c_void) -> i32 {
         params.msaa_texture_handle.raw(),
         params.msaa_srgb_texture_handle.raw(),
         params.device_handle.raw(),
-        params.queue_handle.raw(),
+        record.queue().raw(),
     );
     STATUS_SUCCESS
 }
@@ -731,7 +772,10 @@ pub extern "C" fn submit_frame_handler(args: *mut c_void) -> i32 {
         return -1;
     };
 
-    if metal::submit_frame(&mut params) {
+    let Some(record) = device_record(params.record_handle, "SubmitFrame") else {
+        return STATUS_UNSUCCESSFUL;
+    };
+    if metal::submit_frame(&record, &mut params) {
         STATUS_SUCCESS
     } else {
         STATUS_UNSUCCESSFUL
@@ -743,11 +787,14 @@ pub extern "C" fn blit_texture_to_buffer_handler(args: *mut c_void) -> i32 {
     let Some(params) = (unsafe { InPtr::<BlitTextureToBufferParams>::opt(args.cast()) }) else {
         return -1;
     };
+    let Some(record) = device_record(params.record_handle, "BlitTextureToBuffer") else {
+        return STATUS_UNSUCCESSFUL;
+    };
     let blit_args = metal::BlitArgs {
         planes: params.planes,
         stencil_bytes_per_row: params.stencil_bytes_per_row,
         stencil_offset: params.stencil_offset,
-        queue_handle: params.queue_handle,
+        queue_handle: record.queue(),
         device_handle: params.device_handle,
         tex_handle: params.tex_handle,
         dst_ptr: params.dst_ptr,
@@ -806,6 +853,9 @@ pub extern "C" fn create_color_target_handler(args: *mut c_void) -> i32 {
         return -1;
     };
     let params: &mut CreateColorTargetParams = &mut params;
+    let Some(record) = device_record(params.record_handle, "CreateColorTarget") else {
+        return STATUS_UNSUCCESSFUL;
+    };
 
     let Some((handle, srgb_handle)) = metal::create_color_target(
         params.device_handle,
@@ -848,7 +898,7 @@ pub extern "C" fn create_color_target_handler(args: *mut c_void) -> i32 {
     params.msaa_srgb_texture_handle =
         unsafe { MetalHandle::<MTLTextureKind>::new(msaa_srgb_handle) };
     metal::clear_new_color_textures(
-        params.queue_handle,
+        record.queue(),
         &[params.texture_handle, params.msaa_texture_handle],
         metal::TRANSPARENT_BLACK,
     );
@@ -879,6 +929,9 @@ pub extern "C" fn create_textures_batch_handler(args: *mut c_void) -> i32 {
     if params.count == 0 {
         return STATUS_SUCCESS;
     }
+    let Some(record) = device_record(params.record_handle, "CreateTexturesBatch") else {
+        return STATUS_UNSUCCESSFUL;
+    };
     let Some(device) = params.device_handle.into_retained() else {
         error!(
             target: LOG_TARGET,
@@ -923,11 +976,7 @@ pub extern "C" fn create_textures_batch_handler(args: *mut c_void) -> i32 {
             );
         }
     }
-    metal::clear_new_color_textures(
-        params.queue_handle,
-        &clear_on_create,
-        metal::TRANSPARENT_BLACK,
-    );
+    metal::clear_new_color_textures(record.queue(), &clear_on_create, metal::TRANSPARENT_BLACK);
     if any_failed {
         STATUS_UNSUCCESSFUL
     } else {

@@ -15,6 +15,7 @@ pub mod mtl;
 pub mod mtl_handle;
 mod params;
 pub mod perf;
+pub mod record_handle;
 pub mod texture_views;
 pub mod trig;
 pub mod tsc;
@@ -40,6 +41,7 @@ pub use params::{
     SubmitFrameParams, TextureCreateDesc, VertexAttrDesc, VertexBufferLayoutDesc,
     WaitForGpuRetireParams, WaitForPresentIdleParams, WriteLogParams,
 };
+pub use record_handle::DeviceRecordHandle;
 
 #[repr(u32)]
 #[derive(Clone, Copy, EnumCount, VariantArray)]
