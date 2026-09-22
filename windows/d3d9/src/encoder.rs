@@ -44,7 +44,7 @@ use mtld3d_core::{
     sampler_state,
     scratch::ScratchArena,
     shader_cache::{self, CachedKind, PipelineRecipe, ShaderRecordRef},
-    shader_compile_stats::{self, BurstTracker, CompileBucket},
+    shader_compile_stats::{self, CompileBucket, CompileStats},
     storage_policy::{buffer_storage_mode, gpu_written_buffer_storage_mode},
     stretch_rect::StretchRegion,
     upload_pass::UploadDecode,
@@ -1264,12 +1264,12 @@ pub struct FrameEncoder {
     /// disabled). After that, shader and pipeline cache misses append their
     /// successful compiles.
     cache_writer: Option<shader_cache::CacheWriter>,
-    /// Debounce state for the live `shaders: N compiled in Tms (…)` burst log.
+    /// This device's shader-compile counters and their burst debounce.
     ///
-    /// Polled once per frame from `run_frame`; emits when
-    /// `shader_compile_stats::current_counts` has been stable + nonzero
-    /// for ≥1 second of TSC cycles.
-    compile_burst: BurstTracker,
+    /// Bumped by the cold path of `resolve_vs_library` / `resolve_ps_library`
+    /// and polled once per frame from `run_frame`; emits when the counts have
+    /// been stable + nonzero for ≥1 second of TSC cycles.
+    compile_stats: CompileStats,
     /// Pointer to the most recently shipped `CurrentSnapshot`.
     ///
     /// Lives in the per-frame `ScratchArena`. Set by
@@ -1683,7 +1683,7 @@ impl FrameEncoder {
             fan_index_buffer: FanIndexBuffer::EMPTY,
             visibility: VisibilityQueryState::new(),
             cache_writer: None,
-            compile_burst: BurstTracker::new(),
+            compile_stats: CompileStats::new(),
             current_snapshot: None,
             vs_constants_mirror: Box::new([[0.0; 4]; CONSTANT_ROWS]),
             ps_constants_mirror: Box::new([[0.0; 4]; CONSTANT_ROWS]),
@@ -5435,12 +5435,10 @@ impl FrameEncoder {
     /// poll cost stays in the few-cycle range — no `Instant::now()`
     /// syscall.
     pub fn maybe_emit_compile_summary(&mut self) {
-        let counts = shader_compile_stats::current_counts();
         let idle = secs_to_cycles(1);
-        if !self.compile_burst.poll(counts, rdtsc(), idle) {
+        let Some(snap) = self.compile_stats.poll_drain(rdtsc(), idle) else {
             return;
-        }
-        let snap = shader_compile_stats::drain();
+        };
         let total = self.shader_cache_total();
         log::info!(
             target: LOG_TARGET,
@@ -5666,7 +5664,7 @@ impl FrameEncoder {
                 &mut timings,
             )?;
             if let Some(b) = bucket {
-                shader_compile_stats::record(b, started.elapsed());
+                self.compile_stats.record(b, started.elapsed());
             }
             if let Some(kind) = kind
                 && self.flags.contains(FrameEncoderFlags::CACHE_READY)
@@ -5854,7 +5852,7 @@ impl FrameEncoder {
                 &mut timings,
             )?;
             if let Some(b) = bucket {
-                shader_compile_stats::record(b, started.elapsed());
+                self.compile_stats.record(b, started.elapsed());
             }
             if let Some(kind) = kind
                 && self.flags.contains(FrameEncoderFlags::CACHE_READY)

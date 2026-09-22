@@ -505,6 +505,11 @@ pub struct DeviceInner {
     /// `alloc_pagebox_capped` to cap retention before a rename burst
     /// balloons PE-heap usage into 32-bit OOM territory.
     vbib_retained_bytes: Arc<AtomicU64>,
+    /// Address-space watch state: this device's present-sampling counter.
+    ///
+    /// See `mem_watch::MemWatchState`; the thresholds it reports against stay
+    /// process-wide because the address space is.
+    mem_watch: mem_watch::MemWatchState,
     /// Running total of bytes occupied by live `D3DPOOL_DEFAULT` resources.
     ///
     /// Counts RTs + DEFAULT textures, maintained at `register_texture` /
@@ -2973,6 +2978,7 @@ impl Direct3DDevice9 {
             upload_coherent_seq,
             failed_submit_seq,
             vbib_retained_bytes,
+            mem_watch: mem_watch::MemWatchState::new(),
             vram_bytes_used: Arc::new(AtomicU64::new(0)),
             outstanding_reset_blockers: AtomicU32::new(0),
             // Start at 1 so `current_seq - 1` never underflows.
