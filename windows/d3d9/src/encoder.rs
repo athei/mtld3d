@@ -8769,6 +8769,7 @@ impl FrameEncoder {
             return;
         }
         let mut params = WaitForGpuRetireParams {
+            record_handle: self.record_handle,
             target_seq,
             coherent_seq_ptr: self.coherent_seq_ptr,
             failed_submit_seq_ptr: self.failed_seq_ptr,
@@ -9710,6 +9711,7 @@ fn encoder_thread_main(
                         unsafe { SharedCounter::new(enc.coherent_seq_ptr) }.load(Ordering::Acquire);
                     if coh < target_seq {
                         let mut params = WaitForGpuRetireParams {
+                            record_handle: enc.record_handle,
                             target_seq,
                             coherent_seq_ptr: enc.coherent_seq_ptr,
                             failed_submit_seq_ptr: enc.failed_seq_ptr,

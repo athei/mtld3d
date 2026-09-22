@@ -464,7 +464,8 @@ pub fn set_wait_policy(state: &PresentState, policy: PresentWaitPolicy) {
 /// buffer, so its sequence never retires and must not be waited for, and a
 /// drop behind a committed present must not stand in for that present's
 /// retirement either.
-pub fn wait_for_present_idle(state: &PresentState) {
+pub fn wait_for_present_idle(record: &DeviceRecord) {
+    let state = record.present();
     let presented = {
         let inner = state.lock();
         let inner = state
@@ -475,7 +476,7 @@ pub fn wait_for_present_idle(state: &PresentState) {
             .unwrap_or_else(PoisonError::into_inner);
         inner.presented_seq
     };
-    command::wait_for_gpu_retire(presented, state.present_retired_ptr(), 0);
+    command::wait_for_gpu_retire(record.pending(), presented, state.present_retired_ptr(), 0);
 }
 
 /// Hand a frame's presentation to the presenter; returns the last drawable wait.
@@ -849,14 +850,14 @@ fn present_frame(record: &Arc<DeviceRecord>, queue: &ProtocolObject<dyn MTLComma
                 .present()
                 .present_retired
                 .fetch_max(seq, Ordering::Release);
-            command::unregister_pending(present_ptr, seq);
+            command::unregister_pending(owner.pending(), present_ptr, seq);
         },
     );
     // SAFETY: objc2 typed binding; Metal retains the block on registration,
     // so the local `handler` may drop when this returns.
     unsafe { cb.addCompletedHandler(RcBlock::as_ptr(&handler)) };
     mtld3d_shared::crumb!("present:commit", seq);
-    command::commit_registered(&cb, present_ptr, seq);
+    command::commit_registered(record.pending(), &cb, present_ptr, seq);
     let packet = inner.pending.pop_front();
     inner.committed_present_seq = inner.committed_present_seq.max(seq);
     inner.presented_seq = seq;

@@ -22,6 +22,7 @@ use mtld3d_shared::{
 };
 
 use super::{
+    command::PendingCmdBufs,
     handle::ReleaseRetain,
     presenter::{PresentState, Presented},
     upscale::UpscaleCache,
@@ -39,6 +40,7 @@ pub struct DeviceRecord {
     present: PresentState,
     presented: Presented,
     upscale: UpscaleCache,
+    pending: PendingCmdBufs,
 }
 
 impl Drop for DeviceRecord {
@@ -59,6 +61,7 @@ impl DeviceRecord {
             present: PresentState::new(gate),
             presented: Presented::new(),
             upscale: UpscaleCache::new(),
+            pending: PendingCmdBufs::new(),
         })
     }
 
@@ -80,6 +83,11 @@ impl DeviceRecord {
     /// The device's `MetalFX` scalers and scratch targets.
     pub const fn upscale(&self) -> &UpscaleCache {
         &self.upscale
+    }
+
+    /// The device's in-flight command buffers, by counter and sequence.
+    pub const fn pending(&self) -> &PendingCmdBufs {
+        &self.pending
     }
 
     /// Hand the record to the PE side as an opaque handle.

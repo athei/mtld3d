@@ -414,7 +414,11 @@ pub extern "C" fn wait_for_gpu_retire_handler(args: *mut c_void) -> i32 {
     let Some(params) = (unsafe { InPtr::<WaitForGpuRetireParams>::opt(args.cast()) }) else {
         return -1;
     };
+    let Some(record) = device_record(params.record_handle, "WaitForGpuRetire") else {
+        return STATUS_SUCCESS;
+    };
     metal::wait_for_gpu_retire(
+        record.pending(),
         params.target_seq,
         params.coherent_seq_ptr,
         params.failed_submit_seq_ptr,
@@ -442,7 +446,7 @@ pub extern "C" fn wait_for_present_idle_handler(args: *mut c_void) -> i32 {
     let Some(record) = device_record(params.record_handle, "WaitForPresentIdle") else {
         return STATUS_SUCCESS;
     };
-    metal::wait_for_present_idle(record.present());
+    metal::wait_for_present_idle(&record);
     STATUS_SUCCESS
 }
 

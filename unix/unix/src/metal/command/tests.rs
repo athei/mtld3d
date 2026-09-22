@@ -48,11 +48,11 @@ use objc2_metal::{
 };
 
 use super::{
-    CopyBufferEndpoint, CopyEndpoint, CopyRegion, CopyRejectReason, DeviceRecord, PENDING_CMDBUFS,
-    PendingCmdBuf, PresentGeometry, PresentRoute, SETTLED_PRESENTS, command_buffer_error,
-    commit_registered, copy_buffer_to_texture_reject, copy_texture_reject,
-    copy_texture_to_buffer_reject, encode_upload_cmd_buf, first_pending, geometry_settled,
-    present_route, readback_completed, submit_frame, submit_frame_with, wait_for_gpu_retire,
+    CopyBufferEndpoint, CopyEndpoint, CopyRegion, CopyRejectReason, DeviceRecord, PendingCmdBuf,
+    PresentGeometry, PresentRoute, SETTLED_PRESENTS, command_buffer_error, commit_registered,
+    copy_buffer_to_texture_reject, copy_texture_reject, copy_texture_to_buffer_reject,
+    encode_upload_cmd_buf, first_pending, geometry_settled, present_route, readback_completed,
+    submit_frame, submit_frame_with, wait_for_gpu_retire,
 };
 
 /// Two device identities that sort either side of each other's seqs.
@@ -702,19 +702,20 @@ fn missing_final_submit_waits_for_earlier_work() {
     let coherent = AtomicU64::new(0);
     let failed = AtomicU64::new(0);
     let counter = atomic_address(&coherent);
-    PENDING_CMDBUFS
+    let record = test_record(&queue);
+    record
+        .pending()
         .lock()
-        .unwrap()
         .insert((counter, 1), PendingCmdBuf(cb.clone()));
     cb.commit();
     let (done, watchdog) = release_event_after_wait(event);
-    wait_for_gpu_retire(2, counter, atomic_address(&failed));
+    wait_for_gpu_retire(record.pending(), 2, counter, atomic_address(&failed));
     let status_at_return = cb.status();
     let retired_at_return = coherent.load(Ordering::Acquire);
     let _ = done.send(());
     watchdog.join().unwrap();
     cb.waitUntilCompleted();
-    PENDING_CMDBUFS.lock().unwrap().remove(&(counter, 1));
+    record.pending().lock().remove(&(counter, 1));
     assert_eq!(status_at_return, MTLCommandBufferStatus::Completed);
     assert_eq!(
         retired_at_return, 1,
@@ -754,9 +755,10 @@ fn cpu_submit_failure_drain(upload_committed: bool) {
     );
     // SAFETY: Metal retains the block, whose only capture owns its atomic.
     unsafe { cb.addCompletedHandler(block2::RcBlock::as_ptr(&handler)) };
-    PENDING_CMDBUFS
+    let record = test_record(&queue);
+    record
+        .pending()
         .lock()
-        .unwrap()
         .insert((draw_counter, 1), PendingCmdBuf(cb.clone()));
     cb.commit();
     if upload_committed {
@@ -774,23 +776,29 @@ fn cpu_submit_failure_drain(upload_committed: bool) {
     let upload_pass = upload_test_pass(&texture);
     let (done, watchdog) = release_event_after_wait(event);
     let mut committed_upload = None;
-    let success = submit_frame_with(&mut params, |params| {
+    let success = submit_frame_with(record.pending(), &mut params, |params| {
         if upload_committed {
-            let upload_cb =
-                encode_upload_cmd_buf(&queue, &[], core::slice::from_ref(&upload_pass), params)
-                    .expect("an upload buffer");
+            let upload_cb = encode_upload_cmd_buf(
+                &record,
+                &queue,
+                &[],
+                core::slice::from_ref(&upload_pass),
+                params,
+            )
+            .expect("an upload buffer");
             commit_registered(
+                record.pending(),
                 &upload_cb,
                 params.upload_coherent_seq_ptr,
                 params.submit_seq,
             );
             // The upload at seq 2 is parked behind its own gate. Register
             // a draw at the same seq to prove the counter identities do not collide.
-            PENDING_CMDBUFS
+            record
+                .pending()
                 .lock()
-                .unwrap()
                 .insert((draw_counter, 2), PendingCmdBuf(cb.clone()));
-            let pending = PENDING_CMDBUFS.lock().unwrap();
+            let pending = record.pending().lock();
             assert!(pending.contains_key(&(draw_counter, 2)));
             committed_upload = pending.get(&(upload_counter, 2)).map(|cb| cb.0.clone());
             drop(pending);
@@ -810,18 +818,18 @@ fn cpu_submit_failure_drain(upload_committed: bool) {
     watchdog.join().unwrap();
     cb.waitUntilCompleted();
     // Cleanup precedes assertions so the pre-fix reproduction frees no live sink.
-    let pending_upload = PENDING_CMDBUFS
+    let pending_upload = record
+        .pending()
         .lock()
-        .unwrap()
         .get(&(upload_counter, 2))
         .map(|cb| cb.0.clone());
     if let Some(upload_cb) = pending_upload {
         upload_cb.waitUntilCompleted();
     }
     upload_gate.waitUntilCompleted();
-    PENDING_CMDBUFS
+    record
+        .pending()
         .lock()
-        .unwrap()
         .retain(|&(counter, _), _| counter != draw_counter && counter != upload_counter);
     assert!(!success);
     assert_eq!(status_at_return, MTLCommandBufferStatus::Completed);
@@ -950,13 +958,17 @@ fn upload_prefix_finishes_before_its_retirement_signal() {
     let upload = AtomicU64::new(0);
     let failed = AtomicU64::new(0);
     let params = test_submit_params(&coherent, &upload, &failed);
-    let upload_cb = encode_upload_cmd_buf(&queue, &[], &[pass], &params).expect("an upload buffer");
+    let record = test_record(&queue);
+    let upload_cb =
+        encode_upload_cmd_buf(&record, &queue, &[], &[pass], &params).expect("an upload buffer");
     commit_registered(
+        record.pending(),
         &upload_cb,
         params.upload_coherent_seq_ptr,
         params.submit_seq,
     );
     wait_for_gpu_retire(
+        record.pending(),
         params.submit_seq,
         atomic_address(&upload),
         atomic_address(&failed),
@@ -990,12 +1002,14 @@ fn frame_submission_accepts_empty_no_upload_and_all_upload_prefixes() {
         let record = test_record(&queue);
         assert!(submit_frame(&record, &mut params));
         wait_for_gpu_retire(
+            record.pending(),
             params.submit_seq,
             atomic_address(&coherent),
             atomic_address(&failed),
         );
         if separate_upload && upload_count != 0 {
             wait_for_gpu_retire(
+                record.pending(),
                 params.submit_seq,
                 atomic_address(&upload),
                 atomic_address(&failed),

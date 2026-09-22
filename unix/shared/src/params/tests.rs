@@ -88,9 +88,9 @@ fn create_texture_slice_view_layout() {
 #[test]
 fn wait_for_gpu_retire_layout() {
     use super::WaitForGpuRetireParams;
-    // 3 * u64 = 24
+    // 8 record_handle + 3 * u64 = 32
     assert_eq!(core::mem::align_of::<WaitForGpuRetireParams>(), 8);
-    assert_eq!(core::mem::size_of::<WaitForGpuRetireParams>(), 24);
+    assert_eq!(core::mem::size_of::<WaitForGpuRetireParams>(), 32);
 }
 
 #[test]
