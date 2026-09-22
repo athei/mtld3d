@@ -35,6 +35,7 @@ use mtld3d_shared::{
     mtl::{BlockLayout, DepthResolveFilter, LoadAction, PixelFormat, StoreAction},
 };
 use objc2::{
+    Message as _,
     rc::Retained,
     runtime::{AnyObject, ProtocolObject},
 };
@@ -47,11 +48,11 @@ use objc2_metal::{
 };
 
 use super::{
-    CopyBufferEndpoint, CopyEndpoint, CopyRegion, CopyRejectReason, PENDING_CMDBUFS, PendingCmdBuf,
-    PresentGeometry, PresentRoute, SETTLED_PRESENTS, command_buffer_error, commit_registered,
-    copy_buffer_to_texture_reject, copy_texture_reject, copy_texture_to_buffer_reject,
-    encode_upload_cmd_buf, first_pending, geometry_settled, present_route, readback_completed,
-    submit_frame, submit_frame_with, wait_for_gpu_retire,
+    CopyBufferEndpoint, CopyEndpoint, CopyRegion, CopyRejectReason, DeviceRecord, PENDING_CMDBUFS,
+    PendingCmdBuf, PresentGeometry, PresentRoute, SETTLED_PRESENTS, command_buffer_error,
+    commit_registered, copy_buffer_to_texture_reject, copy_texture_reject,
+    copy_texture_to_buffer_reject, encode_upload_cmd_buf, first_pending, geometry_settled,
+    present_route, readback_completed, submit_frame, submit_frame_with, wait_for_gpu_retire,
 };
 
 /// Two device identities that sort either side of each other's seqs.
@@ -768,7 +769,7 @@ fn cpu_submit_failure_drain(upload_committed: bool) {
         upload_gate.encodeWaitForEvent_value(ProtocolObject::from_ref(&*event), 1);
     }
     upload_gate.commit();
-    let mut params = test_submit_params(&queue, &coherent, &upload, &failed);
+    let mut params = test_submit_params(&coherent, &upload, &failed);
     let texture = upload_test_texture(&queue);
     let upload_pass = upload_test_pass(&texture);
     let (done, watchdog) = release_event_after_wait(event);
@@ -843,15 +844,28 @@ fn atomic_address(value: &AtomicU64) -> u64 {
     core::ptr::from_ref(value) as u64
 }
 
+/// A record around the test's queue, as `create_command_queue` would build one.
+///
+/// Takes a retain of its own, which the record releases when it drops, so the
+/// caller's `Retained` stays valid. No presenter thread: the submissions here
+/// carry no present.
+fn test_record(queue: &ProtocolObject<dyn MTLCommandQueue>) -> Arc<DeviceRecord> {
+    let retained = queue.retain();
+    // SAFETY: `Retained::into_raw` transfers this test's extra retain into the
+    // handle, which the record's `Drop` releases.
+    let handle = unsafe { MetalHandle::new(Retained::into_raw(retained) as u64) };
+    DeviceRecord::new(handle, None)
+}
+
 fn test_submit_params(
-    queue: &ProtocolObject<dyn MTLCommandQueue>,
     coherent: &AtomicU64,
     upload: &AtomicU64,
     failed: &AtomicU64,
 ) -> SubmitFrameParams {
     SubmitFrameParams {
-        // SAFETY: the caller's retained queue stays alive throughout the submission.
-        queue_handle: unsafe { MetalHandle::new(core::ptr::from_ref(queue) as u64) },
+        // The record the submission runs against is passed beside the params;
+        // the handle is what the thunk resolves, and no test goes through it.
+        record_handle: mtld3d_shared::record_handle::DeviceRecordHandle::NULL,
         blit_commands_ptr: 0,
         blit_command_count: 0,
         blit_commands_need_encoder: 0,
@@ -935,7 +949,7 @@ fn upload_prefix_finishes_before_its_retirement_signal() {
     let coherent = AtomicU64::new(0);
     let upload = AtomicU64::new(0);
     let failed = AtomicU64::new(0);
-    let params = test_submit_params(&queue, &coherent, &upload, &failed);
+    let params = test_submit_params(&coherent, &upload, &failed);
     let upload_cb = encode_upload_cmd_buf(&queue, &[], &[pass], &params).expect("an upload buffer");
     commit_registered(
         &upload_cb,
@@ -964,7 +978,7 @@ fn frame_submission_accepts_empty_no_upload_and_all_upload_prefixes() {
         let coherent = AtomicU64::new(0);
         let upload = AtomicU64::new(0);
         let failed = AtomicU64::new(0);
-        let mut params = test_submit_params(&queue, &coherent, &upload, &failed);
+        let mut params = test_submit_params(&coherent, &upload, &failed);
         params.pass_count = pass_count;
         params.upload_pass_count = upload_count;
         if pass_count != 0 {
@@ -973,7 +987,8 @@ fn frame_submission_accepts_empty_no_upload_and_all_upload_prefixes() {
         if !separate_upload {
             params.upload_coherent_seq_ptr = 0;
         }
-        assert!(submit_frame(&mut params));
+        let record = test_record(&queue);
+        assert!(submit_frame(&record, &mut params));
         wait_for_gpu_retire(
             params.submit_seq,
             atomic_address(&coherent),
@@ -1009,11 +1024,12 @@ fn frame_submission_rejects_invalid_upload_prefix_and_null_arrays() {
         let coherent = AtomicU64::new(0);
         let upload = AtomicU64::new(0);
         let failed = AtomicU64::new(0);
-        let mut params = test_submit_params(&queue, &coherent, &upload, &failed);
+        let mut params = test_submit_params(&coherent, &upload, &failed);
         params.pass_count = pass_count;
         params.upload_pass_count = upload_count;
         params.blit_command_count = blit_count;
-        assert!(!submit_frame(&mut params));
+        let record = test_record(&queue);
+        assert!(!submit_frame(&record, &mut params));
         assert_eq!(failed.load(Ordering::Acquire), params.submit_seq);
         assert_eq!(coherent.load(Ordering::Acquire), params.submit_seq);
         assert_eq!(upload.load(Ordering::Acquire), params.submit_seq);
@@ -1331,11 +1347,15 @@ fn depth_plane_failure_aborts_the_pair_and_retry_retains_sources() {
                 let coherent = AtomicU64::new(0);
                 let upload = AtomicU64::new(0);
                 let failed = AtomicU64::new(0);
-                let mut params = test_submit_params(&queue, &coherent, &upload, &failed);
+                let mut params = test_submit_params(&coherent, &upload, &failed);
                 params.blit_commands_ptr = rejected.as_ptr() as u64;
                 params.blit_command_count = 2;
                 params.blit_commands_need_encoder = 1;
-                assert!(!submit_frame(&mut params), "invalid plane case {bad}");
+                let record = test_record(&queue);
+                assert!(
+                    !submit_frame(&record, &mut params),
+                    "invalid plane case {bad}"
+                );
                 assert_eq!(failed.load(Ordering::Acquire), params.submit_seq);
                 assert_eq!(coherent.load(Ordering::Acquire), params.submit_seq);
                 assert_eq!(read(), ([0.25, 0.75], [17, 239]));

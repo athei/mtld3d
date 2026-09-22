@@ -33,18 +33,15 @@ mod disabled {
     pub const fn dump_recent(_n: usize) {}
 
     #[inline(always)]
-    pub const fn dump_on_stall_edge(_stalled: bool) {}
-
-    #[inline(always)]
     pub const fn set_write_sink(_sink: fn(&[u8])) {}
 }
 
 #[cfg(not(mtld3d_crumb))]
-pub use disabled::{dump_on_stall_edge, dump_recent, init, record, set_write_sink};
+pub use disabled::{dump_recent, init, record, set_write_sink};
 
 #[cfg(mtld3d_crumb)]
 mod enabled {
-    use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicU64, Ordering};
+    use core::sync::atomic::{AtomicPtr, AtomicU8, AtomicU64, Ordering};
 
     pub const NUM_ENTRIES: usize = 1024;
     const MAGIC: u64 = 0x4D54_4C44_3344_4342; // "MTLD3DCB" (BE bytes)
@@ -230,21 +227,6 @@ mod enabled {
                 continue;
             }
             emit_entry(&entry);
-        }
-    }
-
-    /// Dump the recent ring to stderr once on each edge of a stall condition.
-    ///
-    /// An intermittent present stall then self-documents in the log with
-    /// no manual timing. `stalled` is whether the current present failed
-    /// to acquire its drawable; the ring is written when that flips in
-    /// either direction — the rising edge captures the lead-up, the
-    /// falling edge captures the whole episode (few entries accrue while
-    /// stalled, so the recovery dump still spans it).
-    pub fn dump_on_stall_edge(stalled: bool) {
-        static STALLED: AtomicBool = AtomicBool::new(false);
-        if STALLED.swap(stalled, Ordering::Relaxed) != stalled {
-            dump_recent(512);
         }
     }
 
@@ -511,7 +493,7 @@ mod enabled {
 }
 
 #[cfg(mtld3d_crumb)]
-pub use enabled::{dump_on_stall_edge, dump_recent, init, record, set_write_sink};
+pub use enabled::{dump_recent, init, record, set_write_sink};
 
 /// Probe macro.
 ///

@@ -115,7 +115,7 @@ application render-target write or `StretchRect` remains ordered among the appli
 passes.
 
 A third buffer, the present buffer, is committed by the presenter after the render buffer
-and advances a unix-side per-queue counter, `present_retired`, kept on the presenter state
+and advances a unix-side per-device counter, `present_retired`, kept on the presenter state
 because nothing on the PE side reads it. It registers in the same in-flight map as the
 other two, under that counter's address, so the one retirement wait serves presentation
 too; the presenter's idle wait is the only caller, and it targets the last present buffer
@@ -143,6 +143,12 @@ sRGB map contains only renderable attachment views. Release and rename detach
 attachment selection immediately, while forward aliases survive final store
 and clear-coalescing decisions until the existing GPU retirement boundary.
 The retirement walk removes each alias before destroying its native object.
+
+## The device record the wire names
+
+`CreateCommandQueue` builds one record per D3D device on the unix side (`metal/record.rs`): the `MTLCommandQueue` and its retain, the presentation state the presenter thread and the submit thread share, and the device's presented-cadence probe. It hands the PE side a `DeviceRecordHandle` for it, which `DeviceInner` keeps and every later thunk that acts on that device carries: a submission, the wait-policy and idle-wait barriers, the creation-time clears, a read-back, and the `DestroyCommandQueue` that gives the handle back and frees the record. The unix side resolves a device by dereferencing what the caller holds, so nothing indexes devices by address and no `MTLCommandQueue` pointer rides the wire for the PE side to outlive.
+
+The record's `Arc` is what orders its teardown: the presenter thread holds one while it runs, so the queue's retain, which the record releases when it drops, outlives the thread whatever the PE side does with its handle. A thunk that names a record already destroyed, or a device whose creation failed, warns once and returns without touching Metal.
 
 ## One attachment record per device
 

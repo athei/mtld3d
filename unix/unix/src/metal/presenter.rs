@@ -19,8 +19,8 @@
 //! that read it has committed: the next copy into it is a later buffer on the
 //! same queue, and Metal executes a queue's buffers in commit order.
 //!
-//! Lock order, top to bottom: the registry (`PRESENTERS`, a map operation
-//! only); a state's `inner`, held across the encode and commit of one present
+//! Lock order, top to bottom: a state's `inner`, held across the encode and
+//! commit of one present
 //! or snapshot buffer and never across `nextDrawable`, `waitUntilCompleted`,
 //! the gate or a synchronous main-thread hop; then the upscale caches, the
 //! in-flight command buffer registry, the attachment registry and its
@@ -33,8 +33,8 @@ use std::{
     collections::VecDeque,
     path::PathBuf,
     sync::{
-        Arc, Condvar, LazyLock, Mutex, MutexGuard, PoisonError,
-        atomic::{AtomicU64, Ordering},
+        Arc, Condvar, Mutex, MutexGuard, PoisonError,
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread::{self, JoinHandle},
     time::Duration,
@@ -53,12 +53,12 @@ use objc2_metal::{
     MTLCommandQueue, MTLOrigin, MTLPixelFormat, MTLResource, MTLSize, MTLTexture,
 };
 use objc2_quartz_core::CAMetalLayer;
-use rustc_hash::FxHashMap;
 
 use super::{
     command::{self, PresentEncode, diagnostics},
     handle::{IntoRetained, IntoRetainedLayer, ReleaseRetain},
     macdrv::attachment,
+    record::DeviceRecord,
     texture,
 };
 use crate::LOG_TARGET;
@@ -80,12 +80,6 @@ pub const SNAPSHOT_SLOTS: usize = PRESENT_PIPELINE_DEPTH;
 
 /// How often a parked presenter looks for the gate file to be gone.
 const GATE_POLL: Duration = Duration::from_millis(1);
-
-/// The live records, keyed by the raw `MTLCommandQueue*` address.
-///
-/// `LazyLock` because the map's constructor is not `const`.
-static PRESENTERS: LazyLock<Mutex<FxHashMap<u64, Arc<PresentState>>>> =
-    LazyLock::new(|| Mutex::new(FxHashMap::default()));
 
 bitflags::bitflags! {
     /// The two switches a state carries besides its queue of packets.
@@ -122,23 +116,12 @@ pub struct PresentState {
     /// sequence.
     present_retired: AtomicU64,
     thread: Mutex<Option<JoinHandle<()>>>,
-    /// One retain on the queue, held from registration until the record drops.
+    /// Whether the last drawable acquisition failed, for the stall dump.
     ///
-    /// The thread retains the queue again when it starts, and this retain
-    /// is what makes that a live object whenever the thread gets to run:
-    /// the caller may drop its own handle the moment `register` returns.
-    /// Released by `Drop`, which runs after the thread was joined, since the
-    /// thread holds an `Arc` of the record while it runs.
-    queue_retain: MetalHandle<MTLCommandQueueKind>,
-}
-
-impl Drop for PresentState {
-    fn drop(&mut self) {
-        // SAFETY: the handle holds the retain `register` took and no other
-        // copy of it is used; the thread that would use the queue has ended,
-        // since it held an `Arc` of this record.
-        unsafe { self.queue_retain.release_retain() };
-    }
+    /// Written by this device's presenter thread alone; an atomic because
+    /// the record it lives on is shared. Per device so two presenters do not
+    /// clear each other's edge and swallow the dump.
+    stalled: AtomicBool,
 }
 
 struct Inner {
@@ -271,6 +254,93 @@ impl PresentState {
     fn present_retired_ptr(&self) -> u64 {
         core::ptr::from_ref(&self.present_retired) as u64
     }
+
+    /// Build the presentation state for `queue`.
+    ///
+    /// The thread starts separately, once the record that owns this state
+    /// exists, since the thread holds a reference to it.
+    pub fn new(queue: MetalHandle<MTLCommandQueueKind>, gate: Option<PathBuf>) -> Self {
+        if let Some(path) = &gate {
+            log::info!(
+                target: LOG_TARGET,
+                "presenter: gated at {} (parks before each drawable while it exists)",
+                path.display(),
+            );
+        }
+        Self {
+            inner: Mutex::new(Inner {
+                queue,
+                pending: VecDeque::new(),
+                committed_present_seq: 0,
+                presented_seq: 0,
+                flags: PresenterFlags::empty(),
+                slots: [const { None }; SNAPSHOT_SLOTS],
+                last_drawable_wait_ns: 0,
+                gate,
+            }),
+            submit_cv: Condvar::new(),
+            presenter_cv: Condvar::new(),
+            present_retired: AtomicU64::new(0),
+            thread: Mutex::new(None),
+            stalled: AtomicBool::new(false),
+        }
+    }
+
+    /// Dump the recent crumb ring on each edge of this device's stall condition.
+    ///
+    /// An intermittent present stall then self-documents in the log with no
+    /// manual timing. `stalled` is whether the current present failed to
+    /// acquire its drawable; the ring is written when that flips in either
+    /// direction, so the rising edge captures the lead-up and the falling
+    /// edge the whole episode.
+    fn note_stall(&self, stalled: bool) {
+        if self.stalled.swap(stalled, Ordering::Relaxed) != stalled {
+            mtld3d_shared::crumb::dump_recent(512);
+        }
+    }
+}
+
+/// The presented-cadence probe's state, one per device.
+///
+/// Read and written by the presented handlers Metal runs on its own thread,
+/// so both halves are atomics. Per device because the probe reports the
+/// interval between consecutive frames of one swap chain: two devices
+/// sharing it would report the interleaving of two cadences as one.
+pub struct Presented {
+    last_ns: AtomicU64,
+    typical_ns: AtomicU64,
+}
+
+impl Default for Presented {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Presented {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            last_ns: AtomicU64::new(0),
+            typical_ns: AtomicU64::new(0),
+        }
+    }
+
+    /// Host time of the previous presented frame, replaced by this one's.
+    ///
+    /// Zero means unseeded: the first frame of a device has no interval.
+    pub fn swap_last(&self, now_ns: u64) -> u64 {
+        self.last_ns.swap(now_ns, Ordering::AcqRel)
+    }
+
+    /// Exponential running average of the presented interval, ns; 0 = unseeded.
+    pub fn typical(&self) -> u64 {
+        self.typical_ns.load(Ordering::Relaxed)
+    }
+
+    pub fn set_typical(&self, ns: u64) {
+        self.typical_ns.store(ns, Ordering::Relaxed);
+    }
 }
 
 /// Decide for one submit, given what is pending.
@@ -318,54 +388,15 @@ fn choose_slot(inner: &Inner) -> SlotChoice {
     SlotChoice::Busy(oldest.0)
 }
 
-/// Create the record and the presenter thread for `queue`.
+/// Start the presenter thread for `record`.
 ///
-/// `false` when the queue cannot be retained or the thread cannot start,
-/// which leaves the queue unable to present; the caller fails the device
-/// rather than run one that renders into nothing. The record takes its
-/// retain on the queue here, before the thread exists, so the thread's own
-/// retain at start lands on a live object whatever the caller does with its
-/// handle once this returns. A record already registered under the address
-/// is replaced with a warning: the address belongs to one live queue at a
-/// time.
-pub fn register(queue: MetalHandle<MTLCommandQueueKind>, gate: Option<PathBuf>) -> bool {
-    if let Some(path) = &gate {
-        log::info!(
-            target: LOG_TARGET,
-            "presenter: gated at {} (parks before each drawable while it exists)",
-            path.display(),
-        );
-    }
-    let Some(owned) = queue.into_retained() else {
-        mtld3d_shared::log_once_warn!(
-            target: LOG_TARGET,
-            "presenter: queue {:#x} could not be retained; the device is refused",
-            queue.raw(),
-        );
-        return false;
-    };
-    // SAFETY: `Retained::into_raw` transfers the retain into the raw address;
-    // the record's `Drop` releases it.
-    let queue_retain =
-        unsafe { MetalHandle::<MTLCommandQueueKind>::new(Retained::into_raw(owned) as u64) };
-    let state = Arc::new(PresentState {
-        inner: Mutex::new(Inner {
-            queue,
-            pending: VecDeque::new(),
-            committed_present_seq: 0,
-            presented_seq: 0,
-            flags: PresenterFlags::empty(),
-            slots: [const { None }; SNAPSHOT_SLOTS],
-            last_drawable_wait_ns: 0,
-            gate,
-        }),
-        submit_cv: Condvar::new(),
-        presenter_cv: Condvar::new(),
-        present_retired: AtomicU64::new(0),
-        thread: Mutex::new(None),
-        queue_retain,
-    });
-    let worker = Arc::clone(&state);
+/// `false` when the thread cannot start, which leaves the device unable to
+/// present; the caller fails the device rather than run one that renders
+/// into nothing. The thread holds an `Arc` of the record, so the record
+/// outlives it whatever the PE side does with its handle.
+pub fn spawn(record: &Arc<DeviceRecord>) -> bool {
+    let worker = Arc::clone(record);
+    let queue = record.queue();
     let spawned = thread::Builder::new()
         .name("mtld3d-present".to_owned())
         .spawn(move || presenter_main(&worker, queue));
@@ -381,53 +412,22 @@ pub fn register(queue: MetalHandle<MTLCommandQueueKind>, gate: Option<PathBuf>) 
             return false;
         }
     };
-    *state.thread.lock().unwrap_or_else(PoisonError::into_inner) = Some(handle);
-    let mut map = PRESENTERS.lock().unwrap_or_else(PoisonError::into_inner);
-    if let Some(stale) = map.insert(queue.raw(), state) {
-        mtld3d_shared::log_once_warn!(
-            target: LOG_TARGET,
-            "presenter: queue {:#x} registered twice; the earlier record was never retired",
-            queue.raw(),
-        );
-        drop(map);
-        stop_and_join(&stale);
-    }
+    *record
+        .present()
+        .thread
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner) = Some(handle);
     true
 }
 
-/// The record for `queue`, if it is registered.
-pub fn find(queue: MetalHandle<MTLCommandQueueKind>) -> Option<Arc<PresentState>> {
-    PRESENTERS
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .get(&queue.raw())
-        .cloned()
-}
-
-/// Retire the record for `queue`: stop its thread, drop its packets and slots.
+/// Stop the presenter thread and join it: drop every packet, wake every waiter.
 ///
 /// Runs before the queue is released, and after the PE side has drained its
 /// submit thread and waited for presentation to go idle, so the stop finds
 /// nothing pending in the ordinary case; a packet it does find is dropped
 /// with a warning. A thread inside `nextDrawable` is joined once that call
 /// returns, within the layer's timeout.
-pub fn unregister_and_join(queue: MetalHandle<MTLCommandQueueKind>) {
-    let removed = PRESENTERS
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .remove(&queue.raw());
-    let Some(state) = removed else {
-        mtld3d_shared::log_once_warn!(
-            target: LOG_TARGET,
-            "presenter: queue {:#x} retired without a record",
-            queue.raw(),
-        );
-        return;
-    };
-    stop_and_join(&state);
-}
-
-fn stop_and_join(state: &Arc<PresentState>) {
+pub fn stop_and_join(state: &PresentState) {
     state.lock().flags.insert(PresenterFlags::STOP);
     state.presenter_cv.notify_all();
     state.submit_cv.notify_all();
@@ -444,15 +444,7 @@ fn stop_and_join(state: &Arc<PresentState>) {
 }
 
 /// Set or clear the hurry level for `queue`.
-pub fn set_wait_policy(queue: MetalHandle<MTLCommandQueueKind>, policy: PresentWaitPolicy) {
-    let Some(state) = find(queue) else {
-        mtld3d_shared::log_once_warn!(
-            target: LOG_TARGET,
-            "presenter: wait policy for queue {:#x}, which has no record",
-            queue.raw(),
-        );
-        return;
-    };
+pub fn set_wait_policy(state: &PresentState, policy: PresentWaitPolicy) {
     {
         let mut inner = state.lock();
         match policy {
@@ -474,15 +466,7 @@ pub fn set_wait_policy(queue: MetalHandle<MTLCommandQueueKind>, policy: PresentW
 /// buffer, so its sequence never retires and must not be waited for, and a
 /// drop behind a committed present must not stand in for that present's
 /// retirement either.
-pub fn wait_for_present_idle(queue: MetalHandle<MTLCommandQueueKind>) {
-    let Some(state) = find(queue) else {
-        mtld3d_shared::log_once_warn!(
-            target: LOG_TARGET,
-            "presenter: idle wait for queue {:#x}, which has no record",
-            queue.raw(),
-        );
-        return;
-    };
+pub fn wait_for_present_idle(state: &PresentState) {
     let presented = {
         let inner = state.lock();
         let inner = state
@@ -710,18 +694,19 @@ fn drop_front(state: &PresentState, seq: u64) {
 }
 
 /// The presenter thread's body.
-fn presenter_main(state: &Arc<PresentState>, queue: MetalHandle<MTLCommandQueueKind>) {
+fn presenter_main(record: &Arc<DeviceRecord>, queue: MetalHandle<MTLCommandQueueKind>) {
     let Some(queue) = queue.into_retained() else {
         log::error!(target: LOG_TARGET, "presenter: queue retain failed (handle={queue:#x})");
         return;
     };
-    while objc2::rc::autoreleasepool(|_| present_frame(state, &queue)) {}
+    while objc2::rc::autoreleasepool(|_| present_frame(record, &queue)) {}
 }
 
 /// One presenter iteration: take the front packet through to its commit.
 ///
 /// `false` once the state is stopped and every packet dropped.
-fn present_frame(state: &Arc<PresentState>, queue: &ProtocolObject<dyn MTLCommandQueue>) -> bool {
+fn present_frame(record: &Arc<DeviceRecord>, queue: &ProtocolObject<dyn MTLCommandQueue>) -> bool {
+    let state = record.present();
     let (seq, layer, view, gate) = {
         let inner = state.lock();
         let mut inner = state
@@ -791,7 +776,7 @@ fn present_frame(state: &Arc<PresentState>, queue: &ProtocolObject<dyn MTLComman
     // A nil drawable means `nextDrawable` exhausted its timeout; self-dump
     // the ring on the onset and on recovery so an intermittent stall is
     // captured in the log without manual timing.
-    mtld3d_shared::crumb::dump_on_stall_edge(drawable.is_none());
+    state.note_stall(drawable.is_none());
     let Some(drawable) = drawable else {
         // Visible, yet no drawable within the timeout: a rare compositor
         // stall, or an occlusion signal that has not propagated yet. The
@@ -833,7 +818,7 @@ fn present_frame(state: &Arc<PresentState>, queue: &ProtocolObject<dyn MTLComman
         &cb,
         &drawable,
         &PresentEncode {
-            queue: inner.queue,
+            record,
             attachment: attachment.as_ref(),
             source: &source,
             source_raw: source_handle.raw(),
@@ -843,7 +828,7 @@ fn present_frame(state: &Arc<PresentState>, queue: &ProtocolObject<dyn MTLComman
     );
     super::upscale::retire_evicted(&cb, inner.queue);
     let present_ptr = state.present_retired_ptr();
-    let owner = Arc::clone(state);
+    let owner = Arc::clone(record);
     let handler = RcBlock::new(
         move |cb_ptr: core::ptr::NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
             // SAFETY: Metal invokes the block with the completed command
@@ -862,7 +847,10 @@ fn present_frame(state: &Arc<PresentState>, queue: &ProtocolObject<dyn MTLComman
                      {code}: {desc}); the drawable showed undefined memory",
                 );
             }
-            owner.present_retired.fetch_max(seq, Ordering::Release);
+            owner
+                .present()
+                .present_retired
+                .fetch_max(seq, Ordering::Release);
             command::unregister_pending(present_ptr, seq);
         },
     );

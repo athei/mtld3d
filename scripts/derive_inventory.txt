@@ -54,6 +54,7 @@ unix/shared/src/mtl.rs VertexStepFunction Clone,Copy,Debug,PartialEq,Eq,Hash,Fro
 unix/shared/src/mtl.rs VisibilityResultMode Clone,Copy,Debug,PartialEq,Eq,Hash,FromRepr
 unix/shared/src/params.rs StencilFaceParams Clone,Copy,Debug,PartialEq,Eq
 unix/shared/src/params.rs VertexAttrDesc Clone,Copy,PartialEq,Eq
+unix/shared/src/record_handle.rs DeviceRecordHandle Clone,Copy
 unix/unix/src/metal/clear_quad.rs ClearQuadKey Hash,PartialEq,Eq,Clone,Copy
 unix/unix/src/metal/command.rs BlitSite Clone,Copy
 unix/unix/src/metal/command.rs CopyRejectReason Clone,Copy,PartialEq,Eq,Debug

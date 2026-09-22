@@ -8,10 +8,11 @@ use super::{
         StoreAction, Swizzle, TextureUsage, VertexFormat, VertexStepFunction,
     },
     mtl_handle::{
-        CAMetalLayerKind, MTLBufferKind, MTLCommandQueueKind, MTLDepthStencilStateKind,
-        MTLDeviceKind, MTLFunctionKind, MTLLibraryKind, MTLRenderPipelineStateKind,
-        MTLSamplerStateKind, MTLTextureKind, MetalHandle, NSViewKind,
+        CAMetalLayerKind, MTLBufferKind, MTLDepthStencilStateKind, MTLDeviceKind, MTLFunctionKind,
+        MTLLibraryKind, MTLRenderPipelineStateKind, MTLSamplerStateKind, MTLTextureKind,
+        MetalHandle, NSViewKind,
     },
+    record_handle::DeviceRecordHandle,
 };
 
 // ── Wire-layout guards ──
@@ -145,7 +146,12 @@ impl Thunk for GetDeviceInfoParams {
 #[repr(C, align(8))]
 pub struct CreateCommandQueueParams {
     pub device_handle: MetalHandle<MTLDeviceKind>, // out
-    pub queue_handle: MetalHandle<MTLCommandQueueKind>, // out
+    /// The device's unix-side record: its command queue and presentation state.
+    ///
+    /// Opaque to the PE side, which keeps it on `DeviceInner` and names the
+    /// device with it on every later thunk. `DestroyCommandQueue` returns it
+    /// and frees the record.
+    pub record_handle: DeviceRecordHandle, // out
     /// 0 / non-zero boolean: `MTLDevice.hasUnifiedMemory`.
     ///
     /// False on Intel/AMD non-UMA Macs; the storage-mode policy in
@@ -408,7 +414,7 @@ impl Thunk for WaitForGpuRetireParams {
     const CODE: u32 = Thunks::WaitForGpuRetire as u32;
 }
 
-/// Set how a present-bearing submit on `queue_handle` treats a pending present.
+/// Set how a present-bearing submit on `record_handle` treats a pending present.
 ///
 /// The PE-side barrier that waits for its in-flight submits sets
 /// `SnapshotPending` first and `WaitForCommit` after, so no submit it waits
@@ -417,8 +423,8 @@ impl Thunk for WaitForGpuRetireParams {
 /// arm puts it back. See `PresentWaitPolicy`.
 #[repr(C, align(8))]
 pub struct SetPresentWaitPolicyParams {
-    pub queue_handle: MetalHandle<MTLCommandQueueKind>, // in
-    pub policy: PresentWaitPolicy,                      // in
+    pub record_handle: DeviceRecordHandle, // in
+    pub policy: PresentWaitPolicy,         // in
     pub pad0: u32,
 }
 
@@ -426,7 +432,7 @@ impl Thunk for SetPresentWaitPolicyParams {
     const CODE: u32 = Thunks::SetPresentWaitPolicy as u32;
 }
 
-/// Block until every present queued on `queue_handle` has committed and the last one retired.
+/// Block until every present queued on `record_handle` has committed and the last one retired.
 ///
 /// The caller has drained its submit thread first, so no present is queued
 /// meanwhile and the wait ends. Runs before a Reset destroys or replaces the
@@ -435,7 +441,7 @@ impl Thunk for SetPresentWaitPolicyParams {
 /// expect one.
 #[repr(C, align(8))]
 pub struct WaitForPresentIdleParams {
-    pub queue_handle: MetalHandle<MTLCommandQueueKind>, // in
+    pub record_handle: DeviceRecordHandle, // in
 }
 
 impl Thunk for WaitForPresentIdleParams {
@@ -494,7 +500,7 @@ impl Thunk for GetTaskFaultsParams {
 #[repr(C, align(8))]
 pub struct DestroyCommandQueueParams {
     pub device_handle: MetalHandle<MTLDeviceKind>, // in
-    pub queue_handle: MetalHandle<MTLCommandQueueKind>, // in
+    pub record_handle: DeviceRecordHandle,         // in
     pub view_handle: MetalHandle<NSViewKind>,      // in (NULL = none)
     pub backbuffer_handle: MetalHandle<MTLTextureKind>, // in (NULL = none)
     pub pipeline_handle: MetalHandle<MTLRenderPipelineStateKind>, // in (NULL = none)
@@ -508,13 +514,13 @@ impl Thunk for DestroyCommandQueueParams {
 #[repr(C, align(8))]
 pub struct CreateBackbufferParams {
     pub device_handle: MetalHandle<MTLDeviceKind>, // in
-    /// Frame queue the creation-time clear is encoded on.
+    /// The device whose frame queue the creation-time clear is encoded on.
     ///
     /// A new `MTLTexture` has undefined contents, and the back buffer is
     /// presentable before the application's first draw or clear reaches it.
     /// Encoding the clear on the frame queue makes commit order the fence:
     /// every later frame command buffer observes a black back buffer.
-    pub queue_handle: MetalHandle<MTLCommandQueueKind>, // in
+    pub record_handle: DeviceRecordHandle, // in
     pub width: u32,                                // in
     pub height: u32,                               // in
     /// Multisample count of the back buffer, 1 for none.
@@ -957,7 +963,7 @@ impl ExtraColorDesc {
 /// the flat command stream into separate Metal encoders.
 #[repr(C, align(8))]
 pub struct SubmitFrameParams {
-    pub queue_handle: MetalHandle<MTLCommandQueueKind>, // in
+    pub record_handle: DeviceRecordHandle, // in
     // Leading blit pass. Replayed inside a single
     // `MTLBlitCommandEncoder` before any render pass. 0-count =
     // skip.
@@ -1078,8 +1084,8 @@ impl Thunk for CreateDepthTextureParams {
 #[repr(C, align(8))]
 pub struct CreateColorTargetParams {
     pub device_handle: MetalHandle<MTLDeviceKind>, // in
-    /// Frame queue the creation-time clear is encoded on.
-    pub queue_handle: MetalHandle<MTLCommandQueueKind>, // in
+    /// The device whose frame queue the creation-time clear is encoded on.
+    pub record_handle: DeviceRecordHandle, // in
     pub width: u32,                                // in
     pub height: u32,                               // in
     pub pixel_format: PixelFormat, // in (resolved via mtld3d_core::format::map_d3d_format)
@@ -1174,7 +1180,7 @@ pub struct TextureCreateDesc {
 #[repr(C, align(8))]
 pub struct CreateTexturesBatchParams {
     pub device_handle: MetalHandle<MTLDeviceKind>,
-    pub queue_handle: MetalHandle<MTLCommandQueueKind>,
+    pub record_handle: DeviceRecordHandle,
     pub count: u32,
     // allow: FFI struct padding; pub for cross-crate field-init.
     pub pad0: u32,
@@ -1315,19 +1321,19 @@ pub struct BlitTextureToBufferParams {
     pub stencil_bytes_per_row: u32,
     /// Byte offset of stencil within the same page-aligned destination allocation.
     pub stencil_offset: u64,
-    pub queue_handle: MetalHandle<MTLCommandQueueKind>, // in
-    pub device_handle: MetalHandle<MTLDeviceKind>,      // in (for newBufferWithBytesNoCopy)
-    pub tex_handle: MetalHandle<MTLTextureKind>,        // in
-    pub dst_ptr: u64,   // in: page-aligned PE-addressable destination
-    pub dst_len: u64,   // in: page-multiple length of dst_ptr
-    pub mip_level: u32, // in
+    pub record_handle: DeviceRecordHandle,         // in
+    pub device_handle: MetalHandle<MTLDeviceKind>, // in (for newBufferWithBytesNoCopy)
+    pub tex_handle: MetalHandle<MTLTextureKind>,   // in
+    pub dst_ptr: u64,                              // in: page-aligned PE-addressable destination
+    pub dst_len: u64,                              // in: page-multiple length of dst_ptr
+    pub mip_level: u32,                            // in
     /// Source array slice: a cube face index, zero for every other texture.
     pub slice: u32, // in
-    pub origin_x: u32,  // in
-    pub origin_y: u32,  // in
-    pub width: u32,     // in
-    pub height: u32,    // in
-    pub bytes_per_row: u32, // in: destination row stride
+    pub origin_x: u32,                             // in
+    pub origin_y: u32,                             // in
+    pub width: u32,                                // in
+    pub height: u32,                               // in
+    pub bytes_per_row: u32,                        // in: destination row stride
     /// Full width of the image `origin_*` / `width` / `height` are measured in.
     ///
     /// The *logical* resolution: under `render.scale` the source texture is

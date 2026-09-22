@@ -16,11 +16,13 @@ use crate::metal::handle::{IntoRetained, ReleaseRetain};
 /// The caller must be done with both handles, and no copy of either may be
 /// used afterwards.
 fn release(caps: &DeviceCaps) {
-    crate::metal::presenter::unregister_and_join(caps.queue_handle);
-    // SAFETY: this stands in for `destroy_command_queue`, whose presenter
-    // retirement above dropped the record's retain; the queue handle now
-    // carries the only retain on a queue nothing else names.
-    unsafe { caps.queue_handle.release_retain() };
+    // SAFETY: this stands in for `destroy_command_queue`: the handle came
+    // from `create_command_queue` and nothing names it afterwards.
+    let record = unsafe { crate::metal::DeviceRecord::consume(caps.record_handle) }
+        .expect("the record of a created device");
+    crate::metal::presenter::stop_and_join(record.present());
+    // The queue's retain rides on the record, released as it drops here.
+    drop(record);
     // SAFETY: the device handle carries the retain `create_command_queue`
     // took for this D3D device, not the pin's own.
     unsafe { caps.device_handle.release_retain() };
@@ -46,9 +48,9 @@ fn create_command_queue_hands_out_the_pinned_device() {
         "every D3D device gets the same MTLDevice"
     );
     assert_ne!(
-        first.queue_handle.raw(),
-        second.queue_handle.raw(),
-        "each D3D device gets its own MTLCommandQueue"
+        first.record_handle.raw(),
+        second.record_handle.raw(),
+        "each D3D device gets its own record, and its own MTLCommandQueue with it"
     );
 
     let (_, registry_id, _) = default_device_info().expect("caps for the pinned device");

@@ -40,6 +40,7 @@ use crate::{
         handle::{BorrowRetained, IntoRetained},
         macdrv::attachment,
         null_texture,
+        record::DeviceRecord,
         texture::mtl_pixel_format,
     },
 };
@@ -111,15 +112,6 @@ fn first_pending<V>(
 /// turns on the per-frame rows without touching anything else.
 const PRESENT_LOG_TARGET: &str = "mtld3d::unix::present";
 
-/// Host time (ns) at which the previous drawable reached the screen.
-///
-/// Half of the presented-cadence probe, see [`register_presented_probe`].
-/// Atomics because Metal runs the presented handler on its own thread.
-/// One pair for the process: two devices presenting at once interleave
-/// into one cadence line, which is what a debug probe can afford.
-static LAST_PRESENTED_NS: AtomicU64 = AtomicU64::new(0);
-/// Exponential running average of the presented interval, ns; 0 = unseeded.
-static TYPICAL_PRESENTED_NS: AtomicU64 = AtomicU64::new(0);
 /// A presented interval above this is a pause, not a hitch; it reseeds.
 const PRESENTED_MAX_INTERVAL_NS: u64 = 500_000_000;
 /// Minimum excess over the typical presented interval for a hitch, ns.
@@ -143,9 +135,11 @@ const PRESENTED_MIN_EXCESS_NS: u64 = 3_000_000;
 /// line only forms on a hitch.
 fn register_presented_probe(
     drawable: &ProtocolObject<dyn CAMetalDrawable>,
+    record: &Arc<DeviceRecord>,
     seq: u64,
     drawable_wait_ns: u64,
 ) {
+    let record = Arc::clone(record);
     let handler = RcBlock::new(
         move |d_ptr: core::ptr::NonNull<ProtocolObject<dyn MTLDrawable>>| {
             // SAFETY: Metal invokes the block with the presented drawable;
@@ -156,7 +150,8 @@ fn register_presented_probe(
                 // Never presented (drawable dropped): leave the chain alone.
                 return;
             }
-            let last_ns = LAST_PRESENTED_NS.swap(now_ns, Ordering::AcqRel);
+            let presented = record.presented();
+            let last_ns = presented.swap_last(now_ns);
             if last_ns == 0 || now_ns <= last_ns {
                 return;
             }
@@ -172,16 +167,16 @@ fn register_presented_probe(
                 now_ns / 1000,
             );
             if interval_ns > PRESENTED_MAX_INTERVAL_NS {
-                TYPICAL_PRESENTED_NS.store(0, Ordering::Relaxed);
+                presented.set_typical(0);
                 return;
             }
-            let typical_ns = TYPICAL_PRESENTED_NS.load(Ordering::Relaxed);
+            let typical_ns = presented.typical();
             let next_typical = if typical_ns == 0 {
                 interval_ns
             } else {
                 typical_ns - typical_ns / 16 + interval_ns / 16
             };
-            TYPICAL_PRESENTED_NS.store(next_typical, Ordering::Relaxed);
+            presented.set_typical(next_typical);
             let hitch = typical_ns != 0
                 && interval_ns * 2 > typical_ns * 3
                 && interval_ns > typical_ns + PRESENTED_MIN_EXCESS_NS;
@@ -342,8 +337,8 @@ impl core::fmt::Display for BlitSite {
 /// with its own attachments and load actions, settles the pending present
 /// against this frame's writes, commits, and hands the presenter what it
 /// needs to show the frame once a drawable is available.
-pub fn submit_frame(params: &mut SubmitFrameParams) -> bool {
-    submit_frame_with(params, encode_frame)
+pub fn submit_frame(record: &Arc<DeviceRecord>, params: &mut SubmitFrameParams) -> bool {
+    submit_frame_with(params, |params| encode_frame(record, params))
 }
 
 /// Keep CPU encoding failures inside the same retirement boundary as GPU failures.
@@ -397,14 +392,15 @@ pub fn advance_counter(pointer: u64, seq: u64) {
     }
 }
 
-fn encode_frame(params: &mut SubmitFrameParams) -> bool {
+fn encode_frame(record: &Arc<DeviceRecord>, params: &mut SubmitFrameParams) -> bool {
     params.drawable_wait_ns = 0;
     params.present_wait_ns = 0;
     params.snapshot_flags = mtld3d_shared::mtl::SnapshotFlags::empty();
-    mtld3d_shared::crumb!("submit:enter", params.queue_handle.raw(), params.pass_count);
-    mtld3d_shared::crumb!("submit:queueret", params.queue_handle.raw());
-    let Some(queue) = params.queue_handle.into_retained() else {
-        error!(target: LOG_TARGET, "submit_frame: queue retain failed (handle={:#x})", params.queue_handle);
+    let queue_handle = record.queue();
+    mtld3d_shared::crumb!("submit:enter", queue_handle.raw(), params.pass_count);
+    mtld3d_shared::crumb!("submit:queueret", queue_handle.raw());
+    let Some(queue) = queue_handle.into_retained() else {
+        error!(target: LOG_TARGET, "submit_frame: queue retain failed (handle={queue_handle:#x})");
         return false;
     };
 
@@ -486,7 +482,7 @@ fn encode_frame(params: &mut SubmitFrameParams) -> bool {
     // addresses the PE side keeps valid until it has drained the submit thread
     // and waited for presentation to go idle, which every path that retires
     // them does first; the packet owns the retains from here on.
-    let mut packet = if params.present_layer.is_null() {
+    let packet = if params.present_layer.is_null() {
         None
     } else {
         mtld3d_shared::crumb!("submit:layerret", params.present_layer.raw());
@@ -511,22 +507,11 @@ fn encode_frame(params: &mut SubmitFrameParams) -> bool {
             None
         }
     };
-    let presenter = super::presenter::find(params.queue_handle);
-    if packet.is_some() && presenter.is_none() {
-        mtld3d_shared::log_once_warn!(
-            target: LOG_TARGET,
-            "submit_frame: queue {:#x} has no presenter; the frame is not presented",
-            params.queue_handle.raw(),
-        );
-        packet = None;
-    }
     // Everything is encoded and nothing has committed: settle what the
     // pending present reads before this frame's render work can overwrite it.
-    if let Some(state) = &presenter {
-        super::presenter::resolve_present_conflict(state, &queue, params, packet.is_some());
-    }
+    super::presenter::resolve_present_conflict(record.present(), &queue, params, packet.is_some());
 
-    super::upscale::retire_evicted(&cmd_buf, params.queue_handle);
+    super::upscale::retire_evicted(&cmd_buf, queue_handle);
 
     // Register an addCompletedHandler that bumps the PE-side
     // `coherent_seq` atomic when this frame retires on the GPU. The
@@ -603,9 +588,9 @@ fn encode_frame(params: &mut SubmitFrameParams) -> bool {
     }
     mtld3d_shared::crumb!("submit:commit");
     commit_registered(&cmd_buf, params.coherent_seq_ptr, params.submit_seq);
-    if let (Some(state), Some(packet)) = (presenter, packet) {
+    if let Some(packet) = packet {
         mtld3d_shared::crumb!("submit:push", params.submit_seq);
-        params.drawable_wait_ns = super::presenter::push(&state, packet);
+        params.drawable_wait_ns = super::presenter::push(record.present(), packet);
     }
     mtld3d_shared::crumb!("submit:done");
     true
@@ -617,7 +602,8 @@ fn encode_frame(params: &mut SubmitFrameParams) -> bool {
 /// drawable: the queue the upscale caches are keyed by, the device's
 /// attachment record, the texture to present and the frame's identity.
 pub struct PresentEncode<'a> {
-    pub queue: MetalHandle<MTLCommandQueueKind>,
+    /// The device presenting, for its cadence probe.
+    pub record: &'a Arc<DeviceRecord>,
     pub attachment: Option<&'a Arc<attachment::Attachment>>,
     pub source: &'a ProtocolObject<dyn MTLTexture>,
     /// The wire handle of `source`, for the blit fallback's log line.
@@ -718,7 +704,7 @@ pub fn encode_present(
         match route {
             PresentRoute::Upscale => encode_hdr_present_upscaled(
                 cmd_buf,
-                args.queue,
+                args.record.queue(),
                 args.source,
                 &drawable_texture,
                 current,
@@ -753,7 +739,7 @@ pub fn encode_present(
             PresentRoute::Upscale => {
                 encode_sdr_upscaled(
                     cmd_buf,
-                    args.queue,
+                    args.record.queue(),
                     args.source,
                     &drawable_texture,
                     gamma_layer,
@@ -807,7 +793,7 @@ pub fn encode_present(
     // Debug and trace output only, so the per-frame block allocation
     // and handler registration are skipped when the target is off.
     if log::log_enabled!(target: PRESENT_LOG_TARGET, log::Level::Debug) {
-        register_presented_probe(drawable, args.seq, args.drawable_wait_ns);
+        register_presented_probe(drawable, args.record, args.seq, args.drawable_wait_ns);
     }
 }
 
