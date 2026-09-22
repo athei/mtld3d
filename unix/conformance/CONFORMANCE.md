@@ -468,8 +468,10 @@ and rationale, grouped by enclosing Wine test function. The classes exist only
 here (`baseline.txt` holds counts); the runner loads them at gate time, and a
 unit test in the runner crate fails if any baseline site has no `Sites:` entry
 below, any entry names a site that no longer fails, or a site is declared
-twice. When a re-baseline adds or removes sites, update the matching cluster
-block (and its rationale) in the same commit.
+twice. A second test recounts those tokens against the "Current
+classifications" sentence below and fails with the sentence to copy in when
+they disagree. When a re-baseline adds or removes sites, update the matching
+cluster block (and its rationale) in the same commit.
 
 Line numbers refer to the Wine version recorded in the baseline header. A
 `Sites:` line lists every baseline site of the cluster as `<line>=<class>`;
