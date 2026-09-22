@@ -9,10 +9,10 @@ use std::sync::{Condvar, Mutex, PoisonError, RwLock};
 
 use mtld3d_types::{
     D3DADAPTER_IDENTIFIER9, D3DCAPS9, D3DCLEAR_TARGET, D3DCREATE_HARDWARE_VERTEXPROCESSING,
-    D3DDEVTYPE_HAL, D3DLIGHT9, D3DMATERIAL9, D3DPRESENT_PARAMETERS, D3DRECT, D3DSDK_VERSION,
-    D3DSWAPEFFECT_DISCARD, D3DTA_DIFFUSE, D3DTOP_SELECTARG1, D3DTSS_ALPHAARG1, D3DTSS_ALPHAOP,
-    D3DTSS_COLORARG1, D3DTSS_COLOROP, D3DVIEWPORT9, Guid, IDirect3D9Vtbl, IDirect3DDevice9Vtbl,
-    IDirect3DSwapChain9Vtbl,
+    D3DDEVTYPE_HAL, D3DGAMMARAMP, D3DLIGHT9, D3DMATERIAL9, D3DPRESENT_PARAMETERS, D3DRECT,
+    D3DSDK_VERSION, D3DSWAPEFFECT_DISCARD, D3DTA_DIFFUSE, D3DTOP_SELECTARG1, D3DTSS_ALPHAARG1,
+    D3DTSS_ALPHAOP, D3DTSS_COLORARG1, D3DTSS_COLOROP, D3DVIEWPORT9, Guid, IDirect3D9Vtbl,
+    IDirect3DDevice9Vtbl, IDirect3DSwapChain9Vtbl,
 };
 
 use crate::{
@@ -668,10 +668,44 @@ impl Harness {
         (hr, plane)
     }
 
-    /// `SetGammaRamp` — a no-op that must not crash (returns void).
-    pub fn set_gamma_ramp_noop(&self) {
-        // SAFETY: vtable thunk; null ramp is tolerated by the no-op handler.
+    /// `SetGammaRamp` with a null ramp: ignored, and it must not crash.
+    pub fn set_gamma_ramp_null(&self) {
+        // SAFETY: vtable thunk; a null ramp is rejected before it is read.
         unsafe { (self.dev_vtbl().set_gamma_ramp)(self.device, 0, 0, core::ptr::null()) };
+    }
+
+    /// `SetGammaRamp(swap_chain, flags, ramp)`. Returns nothing, as D3D9 does.
+    pub fn set_gamma_ramp(&self, swap_chain: u32, flags: u32, ramp: &D3DGAMMARAMP) {
+        // SAFETY: vtable thunk; `ramp` is one readable D3DGAMMARAMP for the call.
+        unsafe {
+            (self.dev_vtbl().set_gamma_ramp)(
+                self.device,
+                swap_chain,
+                flags,
+                core::ptr::from_ref(ramp).cast::<c_void>(),
+            );
+        }
+    }
+
+    /// `GetGammaRamp(swap_chain)` into a caller-visible ramp.
+    ///
+    /// Seeded with a sentinel the implementation never writes, so a caller can
+    /// tell an untouched buffer from an answered one.
+    pub fn get_gamma_ramp(&self, swap_chain: u32) -> D3DGAMMARAMP {
+        let mut ramp = D3DGAMMARAMP {
+            red: [0xDEAD; 256],
+            green: [0xDEAD; 256],
+            blue: [0xDEAD; 256],
+        };
+        // SAFETY: vtable thunk; `ramp` is one writable D3DGAMMARAMP.
+        unsafe {
+            (self.dev_vtbl().get_gamma_ramp)(
+                self.device,
+                swap_chain,
+                core::ptr::from_mut(&mut ramp).cast::<c_void>(),
+            );
+        }
+        ramp
     }
 
     /// `SetPaletteEntries` (a documented stub today). Returns the hr.

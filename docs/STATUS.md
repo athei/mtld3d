@@ -82,6 +82,13 @@ divergences from D3D9 it keeps on purpose. The tested games are in the
   of reported vendor; control writes preserve numeric point size.
 - Windowed and fullscreen swap chains, mode enumeration, hardware and software
   cursors, MetalFX upscaling, HDR output.
+- The gamma ramp of a fullscreen device. `SetGammaRamp` validates the ramp,
+  keeps it for `GetGammaRamp`, and the present pass looks each channel up in
+  it on the way to the drawable, the software cursor's sprite included. A ramp
+  that changes nothing costs nothing, and `D3DSGR_CALIBRATE` is accepted and
+  ignored, which is what a device without `D3DCAPS2_CANCALIBRATEGAMMA`
+  answers. Readback is unaffected: the ramp is the display's transfer
+  function, not part of the image the game drew.
 - Every presentation interval: `DEFAULT` and `ONE` pace at the display rate,
   `TWO`, `THREE` and `FOUR` at the reported mode's refresh rate over two,
   three and four, and `IMMEDIATE` runs free. `present.maxFps` lowers any of
@@ -137,8 +144,7 @@ Each fails cleanly, with an absent cap bit or a documented error return.
 - Software paths: no reference rasterizer, no software vertex processing, no
   `RegisterSoftwareDevice`; the default Metal device is the only adapter.
 - Legacy remnants: N-patch and RT-patch tessellation, vertex tweening,
-  palettized textures, gamma ramp. Accepted or rejected per spec,
-  non-functional.
+  palettized textures. Accepted or rejected per spec, non-functional.
 
 ## Kept divergences
 
@@ -164,3 +170,6 @@ is in [`CONFORMANCE.md`](../unix/conformance/CONFORMANCE.md#kept-divergences).
   auto-resize is the device window's, and follows a `Reset` that names another
   window; D3D9 subclasses the focus window instead. No knob.
 - `D3DRS_MULTISAMPLEANTIALIAS = FALSE` is ignored. No knob.
+- A windowed device's `SetGammaRamp` is stored and reported back but changes
+  nothing on screen, where D3D9 ramps the whole desktop. Only the implicit
+  swap chain carries a ramp. No knob.

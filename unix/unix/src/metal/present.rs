@@ -158,6 +158,96 @@ pub fn hdr_uniforms(peak: f32) -> [f32; 4] {
 
 static PIPELINES: OnceLock<PresentPipelines> = OnceLock::new();
 
+/// Which present stage a gamma pipeline is the twin of.
+///
+/// The six ordinary pipelines are built together at first use because every
+/// session presents; the gamma twins are built one at a time, on the first
+/// present that actually applies a ramp, so a game that never sets one
+/// compiles exactly what it compiled before gamma existed.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub enum GammaStage {
+    Copy,
+    Passthrough,
+    Bt2446,
+    CursorCopy,
+    CursorPassthrough,
+    CursorBt2446,
+}
+
+impl GammaStage {
+    /// The MSL entry point and the colour format its pipeline writes.
+    const fn function(self) -> (&'static str, MTLPixelFormat) {
+        match self {
+            Self::Copy => ("mtld3d_present_ps_copy_gamma", MTLPixelFormat::BGRA8Unorm),
+            Self::Passthrough => (
+                "mtld3d_present_ps_hdr_passthrough_gamma",
+                MTLPixelFormat::RGBA16Float,
+            ),
+            Self::Bt2446 => (
+                "mtld3d_present_ps_hdr_bt2446_gamma",
+                MTLPixelFormat::RGBA16Float,
+            ),
+            Self::CursorCopy => ("mtld3d_cursor_ps_copy_gamma", MTLPixelFormat::BGRA8Unorm),
+            Self::CursorPassthrough => (
+                "mtld3d_cursor_ps_hdr_passthrough_gamma",
+                MTLPixelFormat::RGBA16Float,
+            ),
+            Self::CursorBt2446 => (
+                "mtld3d_cursor_ps_hdr_bt2446_gamma",
+                MTLPixelFormat::RGBA16Float,
+            ),
+        }
+    }
+}
+
+/// Gamma pipelines, built on the first present of their stage that needs one.
+///
+/// Keyed by stage; the values are retained `MTLRenderPipelineState` handles
+/// that live for the process, like the ordinary present pipelines.
+static GAMMA_PIPELINES: LazyLock<Mutex<FxHashMap<GammaStage, u64>>> =
+    LazyLock::new(|| Mutex::new(FxHashMap::default()));
+
+/// The pipeline for `stage` with the gamma lookup, compiled on first use.
+///
+/// `None` when the library, the function or the pipeline state could not be
+/// created, logged at the point of failure; the caller then presents without
+/// the ramp rather than dropping the frame.
+pub fn ensure_gamma_pipeline(
+    device: &ProtocolObject<dyn MTLDevice>,
+    stage: GammaStage,
+) -> Option<u64> {
+    if let Some(&handle) = GAMMA_PIPELINES
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get(&stage)
+    {
+        return Some(handle);
+    }
+    // Built outside the lock, as `ensure_readback_pipeline` does: a compile is
+    // milliseconds, and two threads building the same key both succeed, one
+    // copy is kept and the other's retain released.
+    let library = ensure_library(device)?;
+    let vs = library.newFunctionWithName(&NSString::from_str("mtld3d_present_vs"))?;
+    let (ps_name, color_format) = stage.function();
+    let ps = library.newFunctionWithName(&NSString::from_str(ps_name))?;
+    let label = format!("mtld3d-present-pipeline-{ps_name}");
+    let pipeline = build_pipeline(device, &vs, &ps, color_format, &label)?;
+    let handle = Retained::into_raw(pipeline) as u64;
+    let kept = *GAMMA_PIPELINES
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .entry(stage)
+        .or_insert(handle);
+    if kept != handle {
+        // SAFETY: `handle` is the retain `into_raw` transferred above and
+        // nothing else holds it.
+        drop(unsafe {
+            Retained::from_raw(handle as *mut ProtocolObject<dyn MTLRenderPipelineState>)
+        });
+    }
+    Some(kept)
+}
+
 /// The compiled present library, retained for the process.
 ///
 /// `create` builds the fixed present pipelines from it and the readback

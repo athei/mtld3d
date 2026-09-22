@@ -182,6 +182,14 @@ pub struct Attachment {
     current_backing_scale: AtomicU32,
     /// Consecutive presents at one geometry; gates the `MetalFX` route.
     present_streak: GeometryStreak,
+    /// Whether the present pass applies this layer's gamma ramp.
+    ///
+    /// The ramp's 256 entries live in `metal::gamma`, which owns them for as
+    /// long as the layer is attached; this flag is what the present path
+    /// reads per frame to pick the pipeline. It is set only after the entries
+    /// are in place and cleared before they are removed, both on the encoder
+    /// thread, so a frame that reads `true` always finds a table to bind.
+    gamma_active: AtomicBool,
 }
 
 impl Attachment {
@@ -205,7 +213,23 @@ impl Attachment {
             present_pacing_bits: AtomicU64::new(latches.pacing_bits),
             current_backing_scale: AtomicU32::new(latches.backing_scale),
             present_streak: GeometryStreak::new(),
+            gamma_active: AtomicBool::new(false),
         }
+    }
+
+    /// Whether this layer's present pass applies a gamma ramp.
+    ///
+    /// The `Acquire` pairs with the `Release` in [`Self::set_gamma_active`],
+    /// so a frame that reads `true` also observes the entries the ramp's
+    /// handler wrote before it.
+    #[must_use]
+    pub fn gamma_active(&self) -> bool {
+        self.gamma_active.load(Ordering::Acquire)
+    }
+
+    /// Turn the present-pass gamma transform on or off for this layer.
+    pub fn set_gamma_active(&self, active: bool) {
+        self.gamma_active.store(active, Ordering::Release);
     }
 
     /// The raw `NSView*` address this record is keyed by; compared, never dereferenced here.

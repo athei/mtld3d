@@ -236,6 +236,18 @@ record. A knob, where one makes sense, is named with its default.
   count to the pass's attachments with no per-draw override.
   `D3DPRASTERCAPS_MULTISAMPLE_TOGGLE` is not advertised, which is how D3D9
   says the toggle is unavailable, and the first write is logged. No knob.
+- **A windowed device's `SetGammaRamp` changes nothing on screen**, and only
+  the implicit swap chain carries a ramp at all. The ramp is stored and
+  `GetGammaRamp` reports it back either way, and it starts applying as soon as
+  a `Reset` takes the device fullscreen. D3D9 ramps the whole desktop for a
+  windowed device, through a path that outlives the process that asked for it;
+  that is the display's configuration rather than this window's frame, and the
+  present pass is the only place we are willing to carry a ramp. A second
+  device, or the compositor, would otherwise inherit a brightness a game set
+  for itself. The hardware cursor keeps its own brightness for the same
+  reason: macOS composites it and no API ramps it. Wine's suite has no
+  `GammaRamp` coverage, so no site observes any of this. No knob: the
+  behaviour a knob would restore is one we cannot implement, not a trade.
 
 ## Range-fog coverage
 

@@ -354,6 +354,32 @@ impl Thunk for SetDisplaySyncEnabledParams {
     const CODE: u32 = Thunks::SetDisplaySyncEnabled as u32;
 }
 
+/// Put a gamma lookup table on an attached layer, or take the current one off.
+///
+/// The PE side owns every D3D9 rule behind it: it validates the ramp the
+/// application set, keeps it for `GetGammaRamp`, decides that it changes
+/// something and that the device is fullscreen, and converts it to the
+/// entries below. The handler keeps them for the layer and the present pass
+/// hands them to its fragment stage, so a layer either has a table or does
+/// not.
+#[repr(C, align(8))]
+pub struct SetGammaRampParams {
+    /// The layer whose attachment record takes the table.
+    ///
+    /// Looked up by layer address, like `SetDisplaySyncEnabledParams`, so a
+    /// device that never attached one is answered with a warning.
+    pub layer_handle: MetalHandle<CAMetalLayerKind>, // in
+    /// `*const u16`, the ramp as four lanes per entry (R, G, B, one); `0` removes the table.
+    pub entries_ptr: u64, // in
+    /// `u16` lane count at `entries_ptr`, four per entry. Zero with a null pointer.
+    pub entries_len: u32, // in
+    pub pad0: u32,
+}
+
+impl Thunk for SetGammaRampParams {
+    const CODE: u32 = Thunks::SetGammaRamp as u32;
+}
+
 /// Block the caller until the GPU has retired the cmdbuf with `submit_seq >= target_seq`.
 ///
 /// Then bump `coherent_seq` so subsequent `Acquire` loaders observe the

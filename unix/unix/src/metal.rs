@@ -5,6 +5,7 @@ mod clear_quad;
 mod command;
 pub mod depth_transfer;
 mod device;
+mod gamma;
 pub mod handle;
 mod macdrv;
 mod null_texture;
@@ -23,6 +24,7 @@ pub use capture::{start_capture, stop_capture};
 pub use clear_quad::ensure_clear_quad_pipeline;
 pub use command::{BlitArgs, blit_texture_to_buffer, submit_frame, wait_for_gpu_retire};
 pub use device::{create_command_queue, default_device_info, destroy_command_queue};
+pub use gamma::{expected_lanes as gamma_table_lanes, set_gamma_ramp};
 pub use macdrv::{
     LayerAttachRequest, PresentPacing, attach_metal_layer, declare_latency_critical_activity,
     detach_metal_layer, retire_metal_view, set_cursor_overlay, set_display_sync_enabled,

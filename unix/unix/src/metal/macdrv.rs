@@ -50,6 +50,7 @@ pub fn detach_metal_layer(view_handle: MetalHandle<NSViewKind>) -> Option<Arc<At
         usize::try_from(view_handle.raw()).expect("a 64-bit host addresses every view pointer");
     let att = attachment::unregister(view_addr)?;
     cursor_overlay::detach(&att);
+    super::gamma::detach(&att);
     debug!(
         target: LOG_TARGET,
         "present: detached view {:#x} (layer {:#x}); its display state is retired",

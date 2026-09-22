@@ -7,12 +7,13 @@ use core::ffi::c_void;
 
 use mtld3d_tests::Harness;
 use mtld3d_types::{
-    D3D_OK, D3DDECL_END_STREAM, D3DDECLTYPE_FLOAT3, D3DDECLTYPE_UNUSED, D3DDECLUSAGE_POSITION,
-    D3DERR_INVALIDCALL, D3DERR_MOREDATA, D3DERR_NOTFOUND, D3DERR_UNSUPPORTEDTEXTUREFILTER,
-    D3DFMT_A8R8G8B8, D3DFMT_D16, D3DFMT_D24S8, D3DFMT_INDEX16, D3DFMT_R5G6B5, D3DFVF_XYZ,
-    D3DMULTISAMPLE_4_SAMPLES, D3DPOOL_DEFAULT, D3DPOOL_MANAGED, D3DPOOL_SCRATCH, D3DPOOL_SYSTEMMEM,
-    D3DQUERYTYPE_EVENT, D3DRTYPE_SURFACE, D3DRTYPE_TEXTURE, D3DSAMP_MAGFILTER, D3DSAMP_MINFILTER,
-    D3DSAMP_MIPFILTER, D3DSBT_ALL, D3DTEXF_LINEAR, D3DTEXF_NONE, D3DTEXF_POINT,
+    D3D_OK, D3DCLEAR_TARGET, D3DDECL_END_STREAM, D3DDECLTYPE_FLOAT3, D3DDECLTYPE_UNUSED,
+    D3DDECLUSAGE_POSITION, D3DERR_INVALIDCALL, D3DERR_MOREDATA, D3DERR_NOTFOUND,
+    D3DERR_UNSUPPORTEDTEXTUREFILTER, D3DFMT_A8R8G8B8, D3DFMT_D16, D3DFMT_D24S8, D3DFMT_INDEX16,
+    D3DFMT_R5G6B5, D3DFVF_XYZ, D3DGAMMARAMP, D3DMULTISAMPLE_4_SAMPLES, D3DPOOL_DEFAULT,
+    D3DPOOL_MANAGED, D3DPOOL_SCRATCH, D3DPOOL_SYSTEMMEM, D3DQUERYTYPE_EVENT, D3DRTYPE_SURFACE,
+    D3DRTYPE_TEXTURE, D3DSAMP_MAGFILTER, D3DSAMP_MINFILTER, D3DSAMP_MIPFILTER, D3DSBT_ALL,
+    D3DSGR_CALIBRATE, D3DSGR_NO_CALIBRATION, D3DTEXF_LINEAR, D3DTEXF_NONE, D3DTEXF_POINT,
     D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_WRITEONLY, D3DVERTEXELEMENT9, E_NOINTERFACE, Guid,
     IID_IDIRECT3D9, IID_IDIRECT3DDEVICE9, IID_IDIRECT3DSWAPCHAIN9, IID_IDIRECT3DTEXTURE9,
     IID_IUNKNOWN,
@@ -1009,11 +1010,124 @@ fn validate_device_rejects_a_stage_that_disables_a_filter() {
     );
 }
 
+/// A ramp whose every entry is `65535 * i / 255`, what a device starts with.
+fn identity_ramp() -> D3DGAMMARAMP {
+    let mut channel = [0u16; 256];
+    for (level, index) in channel.iter_mut().zip(0..=u8::MAX) {
+        *level = u16::from(index) * 257;
+    }
+    D3DGAMMARAMP {
+        red: channel,
+        green: channel,
+        blue: channel,
+    }
+}
+
+/// A ramp that halves every level: monotonic, usable, and not identity.
+fn dimmed_ramp() -> D3DGAMMARAMP {
+    let mut ramp = identity_ramp();
+    for channel in [&mut ramp.red, &mut ramp.green, &mut ramp.blue] {
+        for level in channel.iter_mut() {
+            *level /= 2;
+        }
+    }
+    ramp
+}
+
 #[test]
-fn set_gamma_ramp_is_a_safe_no_op() {
+fn a_null_gamma_ramp_is_ignored() {
     let h = Harness::new();
-    // SetGammaRamp is a no-op (Wine/Metal handle gamma); it must not crash.
-    h.set_gamma_ramp_noop();
+    // The call returns void, so the contract is that it is ignored rather
+    // than that it answers: it must not read the pointer or crash.
+    h.set_gamma_ramp_null();
+    let kept = h.get_gamma_ramp(0);
+    assert_eq!(
+        kept.red[128], 32896,
+        "a null Set left the stored identity ramp alone"
+    );
+}
+
+#[test]
+fn the_gamma_ramp_round_trips_and_starts_at_identity() {
+    let h = Harness::new();
+    let initial = h.get_gamma_ramp(0);
+    let identity = identity_ramp();
+    assert_eq!(
+        initial.red, identity.red,
+        "GetGammaRamp before any Set answers identity, not the sentinel"
+    );
+    assert_eq!(initial.green, identity.green, "identity on green");
+    assert_eq!(initial.blue, identity.blue, "identity on blue");
+
+    let dimmed = dimmed_ramp();
+    h.set_gamma_ramp(0, D3DSGR_NO_CALIBRATION, &dimmed);
+    let read = h.get_gamma_ramp(0);
+    assert_eq!(read.red, dimmed.red, "the ramp reads back as written, red");
+    assert_eq!(read.green, dimmed.green, "green");
+    assert_eq!(read.blue, dimmed.blue, "blue");
+    // The device is windowed here, which is what the suite creates, so the
+    // ramp is stored and reported without reaching the presented frame. The
+    // frame is presented to prove the present path is unaffected either way.
+    assert_eq!(
+        h.clear(D3DCLEAR_TARGET, 0xFF20_4060, 1.0, 0),
+        D3D_OK,
+        "clear after a stored ramp"
+    );
+    assert_eq!(h.present(), D3D_OK, "present after a stored ramp");
+}
+
+#[test]
+fn an_unusable_gamma_ramp_leaves_the_stored_one_alone() {
+    let h = Harness::new();
+    let dimmed = dimmed_ramp();
+    h.set_gamma_ramp(0, D3DSGR_NO_CALIBRATION, &dimmed);
+    // Every channel decreasing end to end is the shape a game writes from
+    // uninitialised or byte-swapped memory. Applying one turns a display
+    // unreadable, so it is rejected whole and the last good ramp stands.
+    let mut inverted = identity_ramp();
+    inverted.red.reverse();
+    inverted.green.reverse();
+    inverted.blue.reverse();
+    h.set_gamma_ramp(0, D3DSGR_NO_CALIBRATION, &inverted);
+    assert_eq!(
+        h.get_gamma_ramp(0).red,
+        dimmed.red,
+        "the rejected ramp was not stored"
+    );
+}
+
+#[test]
+fn gamma_calibration_is_accepted_and_ignored() {
+    let h = Harness::new();
+    let dimmed = dimmed_ramp();
+    // D3DCAPS2_CANCALIBRATEGAMMA is not advertised, so the flag carries no
+    // obligation: the ramp is taken as given rather than rejected.
+    h.set_gamma_ramp(0, D3DSGR_CALIBRATE, &dimmed);
+    assert_eq!(
+        h.get_gamma_ramp(0).green,
+        dimmed.green,
+        "the calibrated Set stored its ramp"
+    );
+}
+
+#[test]
+fn only_the_implicit_swap_chain_carries_a_gamma_ramp() {
+    let h = Harness::new();
+    let dimmed = dimmed_ramp();
+    h.set_gamma_ramp(1, D3DSGR_NO_CALIBRATION, &dimmed);
+    let identity = identity_ramp();
+    assert_eq!(
+        h.get_gamma_ramp(0).red,
+        identity.red,
+        "a Set on swap chain 1 changed nothing"
+    );
+    // The same index answers nothing rather than writing the ramp, so the
+    // caller's buffer keeps the sentinel the harness seeded.
+    assert_eq!(
+        h.get_gamma_ramp(1).red[0],
+        0xDEAD,
+        "a Get on swap chain 1 left the buffer untouched"
+    );
 }
 
 #[test]

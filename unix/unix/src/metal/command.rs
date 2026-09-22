@@ -707,6 +707,12 @@ pub fn encode_present(
     // and a BGRA8 drawable must not, because the HDR pipelines declare
     // a float colour attachment.
     let hdr = drawable_texture.pixelFormat() == MTLPixelFormat::RGBA16Float;
+    // The guest's gamma ramp, as the layer carries it right now. One atomic
+    // load per present when no ramp is set, which is every session that does
+    // not touch `SetGammaRamp`, and it leaves every route below as it was.
+    let gamma_layer = attachment
+        .filter(|att| att.gamma_active())
+        .map_or(0, |att| att.layer());
 
     let presented = if hdr {
         match route {
@@ -716,33 +722,46 @@ pub fn encode_present(
                 args.source,
                 &drawable_texture,
                 current,
+                gamma_layer,
             ),
             // The tone-map pass samples through `filter::linear`, so
             // one encode covers both an exact present and a
             // minification.
-            PresentRoute::Copy | PresentRoute::Stretch => {
-                encode_hdr_present(cmd_buf, args.source, &drawable_texture, current)
-            }
+            PresentRoute::Copy | PresentRoute::Stretch => encode_hdr_present(
+                cmd_buf,
+                args.source,
+                &drawable_texture,
+                current,
+                gamma_layer,
+            ),
         }
     } else {
         match route {
             // Extents match: the blit below is exact and cheaper than
-            // a render pass.
-            PresentRoute::Copy => false,
+            // a render pass. A gamma ramp is the one thing a blit
+            // cannot carry, so it takes the shader instead.
+            PresentRoute::Copy if gamma_layer == 0 => false,
             // A scaler Metal declines after `is_available` said yes
             // still has to write every drawable pixel, so it falls
             // through to the stretch rather than to the blit.
+            //
+            // `MetalFX` writes the drawable itself, so a ramp cannot ride
+            // that pass: the ramp goes into a scratch at render resolution
+            // first and the scaler enlarges the ramped frame. That keeps
+            // `render.scale` working while a ramp is set, at one extra pass
+            // over the render grid.
             PresentRoute::Upscale => {
-                super::upscale::encode(
+                encode_sdr_upscaled(
                     cmd_buf,
-                    &device,
                     args.queue,
                     args.source,
                     &drawable_texture,
-                    MTLFXSpatialScalerColorProcessingMode::Perceptual,
-                ) || encode_present_copy(cmd_buf, args.source, &drawable_texture)
+                    gamma_layer,
+                ) || encode_present_copy(cmd_buf, args.source, &drawable_texture, gamma_layer)
             }
-            PresentRoute::Stretch => encode_present_copy(cmd_buf, args.source, &drawable_texture),
+            PresentRoute::Copy | PresentRoute::Stretch => {
+                encode_present_copy(cmd_buf, args.source, &drawable_texture, gamma_layer)
+            }
         }
     };
     if !presented {
@@ -1213,17 +1232,72 @@ fn encode_hdr_present_upscaled(
     src: &ProtocolObject<dyn MTLTexture>,
     drawable: &ProtocolObject<dyn MTLTexture>,
     peak: f32,
+    gamma_layer: usize,
 ) -> bool {
-    encode_hdr_present_upscaled_with(cmd_buf, queue_handle, src, drawable, peak, |scratch| {
+    encode_hdr_present_upscaled_with(
+        cmd_buf,
+        queue_handle,
+        src,
+        drawable,
+        peak,
+        gamma_layer,
+        |scratch| {
+            super::upscale::encode(
+                cmd_buf,
+                &cmd_buf.device(),
+                queue_handle,
+                scratch,
+                drawable,
+                MTLFXSpatialScalerColorProcessingMode::HDR,
+            )
+        },
+    )
+}
+
+/// SDR upscale with the guest's gamma ramp applied before the scaler.
+///
+/// `MetalFX` writes the drawable from the source it is given, so the ramp has
+/// to be in that source: the present shader writes a ramped copy of the render
+/// grid into a `BGRA8` scratch and the scaler enlarges that. Without a ramp
+/// there is nothing to insert and the scaler reads the game's own texture, the
+/// route this had before.
+///
+/// `false` when the scratch, the ramped copy or the scaler is unavailable; the
+/// caller then falls back to the shader stretch, which writes every drawable
+/// pixel either way.
+fn encode_sdr_upscaled(
+    cmd_buf: &ProtocolObject<dyn MTLCommandBuffer>,
+    queue_handle: MetalHandle<MTLCommandQueueKind>,
+    src: &ProtocolObject<dyn MTLTexture>,
+    drawable: &ProtocolObject<dyn MTLTexture>,
+    gamma_layer: usize,
+) -> bool {
+    let device = cmd_buf.device();
+    let scale = |source: &ProtocolObject<dyn MTLTexture>| {
         super::upscale::encode(
             cmd_buf,
-            &cmd_buf.device(),
+            &device,
             queue_handle,
-            scratch,
+            source,
             drawable,
-            MTLFXSpatialScalerColorProcessingMode::HDR,
+            MTLFXSpatialScalerColorProcessingMode::Perceptual,
         )
-    })
+    };
+    if gamma_layer == 0 {
+        return scale(src);
+    }
+    let width = u32::try_from(src.width()).unwrap_or(u32::MAX);
+    let height = u32::try_from(src.height()).unwrap_or(u32::MAX);
+    let Some(scratch) = super::upscale::scratch_target(
+        &device,
+        queue_handle,
+        width,
+        height,
+        PixelFormat::Bgra8Unorm,
+    ) else {
+        return false;
+    };
+    encode_present_copy(cmd_buf, src, &scratch, gamma_layer) && scale(&scratch)
 }
 
 fn encode_hdr_present_upscaled_with(
@@ -1232,6 +1306,7 @@ fn encode_hdr_present_upscaled_with(
     src: &ProtocolObject<dyn MTLTexture>,
     drawable: &ProtocolObject<dyn MTLTexture>,
     peak: f32,
+    gamma_layer: usize,
     upscale: impl FnOnce(&ProtocolObject<dyn MTLTexture>) -> bool,
 ) -> bool {
     let device = cmd_buf.device();
@@ -1265,11 +1340,11 @@ fn encode_hdr_present_upscaled_with(
             "present: no MetalFX HDR upscale for {width}x{height} — the frame is stretched by \
              the present shader instead and will look softer"
         );
-        return encode_hdr_present(cmd_buf, src, drawable, peak);
+        return encode_hdr_present(cmd_buf, src, drawable, peak, gamma_layer);
     };
 
-    (encode_hdr_present(cmd_buf, src, &scratch, peak) && upscale(&scratch))
-        || encode_hdr_present(cmd_buf, src, drawable, peak)
+    (encode_hdr_present(cmd_buf, src, &scratch, peak, gamma_layer) && upscale(&scratch))
+        || encode_hdr_present(cmd_buf, src, drawable, peak, gamma_layer)
 }
 
 /// HDR present pass: the game's `BGRA8` backbuffer onto an `RGBA16Float` surface.
@@ -1289,6 +1364,7 @@ fn encode_hdr_present(
     src: &ProtocolObject<dyn MTLTexture>,
     dst: &ProtocolObject<dyn MTLTexture>,
     peak: f32,
+    gamma_layer: usize,
 ) -> bool {
     let device = cmd_buf.device();
     let Some(resources) = super::present::ensure_resources(&device) else {
@@ -1299,16 +1375,39 @@ fn encode_hdr_present(
     // the vertex stage and the sRGB EOTF; pass-through skips the
     // BT.2446 math and requires no uniforms. See `present.rs` for
     // the per-pipeline rationale.
+    // A gamma ramp replaces the stage with its twin, which looks each channel
+    // up in the layer's table before the sRGB decode. The twins are compiled
+    // on first use, so a session without a ramp pays nothing for them; a
+    // compile that fails presents without the ramp rather than dropping the
+    // frame.
+    let stage = if peak <= 1.0 {
+        super::present::GammaStage::Passthrough
+    } else {
+        super::present::GammaStage::Bt2446
+    };
+    let gamma_pipeline = if gamma_layer == 0 {
+        None
+    } else {
+        super::present::ensure_gamma_pipeline(&device, stage)
+    };
     let (pipeline_handle, uniforms) = if peak <= 1.0 {
-        (resources.passthrough, None)
+        (gamma_pipeline.unwrap_or(resources.passthrough), None)
     } else {
         // Fragment uniform block consumed by the BT.2446 pipeline, 16 bytes;
         // MSL alignment for `constant T&` requires 16-byte alignment, and a
         // stack array of four f32 is naturally aligned and fits. Computed once
         // per frame on the CPU rather than in every fragment.
-        (resources.bt2446, Some(super::present::hdr_uniforms(peak)))
+        (
+            gamma_pipeline.unwrap_or(resources.bt2446),
+            Some(super::present::hdr_uniforms(peak)),
+        )
     };
-    encode_present_pass(cmd_buf, src, dst, pipeline_handle, uniforms)
+    let gamma_layer = if gamma_pipeline.is_some() {
+        gamma_layer
+    } else {
+        0
+    };
+    encode_present_pass(cmd_buf, src, dst, pipeline_handle, uniforms, gamma_layer)
 }
 
 /// SDR present pass: the game's back buffer onto a same-format drawable, resampled.
@@ -1325,12 +1424,29 @@ fn encode_present_copy(
     cmd_buf: &ProtocolObject<dyn MTLCommandBuffer>,
     src: &ProtocolObject<dyn MTLTexture>,
     dst: &ProtocolObject<dyn MTLTexture>,
+    gamma_layer: usize,
 ) -> bool {
     let device = cmd_buf.device();
     let Some(resources) = super::present::ensure_resources(&device) else {
         return false;
     };
-    encode_present_pass(cmd_buf, src, dst, resources.copy, None)
+    let gamma_pipeline = if gamma_layer == 0 {
+        None
+    } else {
+        super::present::ensure_gamma_pipeline(&device, super::present::GammaStage::Copy)
+    };
+    encode_present_pass(
+        cmd_buf,
+        src,
+        dst,
+        gamma_pipeline.unwrap_or(resources.copy),
+        None,
+        if gamma_pipeline.is_some() {
+            gamma_layer
+        } else {
+            0
+        },
+    )
 }
 
 /// Encode one present pass: a fullscreen triangle sampling `src` across `dst`.
@@ -1344,16 +1460,20 @@ fn encode_present_pass(
     dst: &ProtocolObject<dyn MTLTexture>,
     pipeline_handle: u64,
     uniforms: Option<[f32; 4]>,
+    gamma_layer: usize,
 ) -> bool {
     // The fullscreen triangle covers every pixel, so nothing is loaded.
     encode_fullscreen_pass(
         cmd_buf,
         src,
         dst,
-        pipeline_handle,
-        uniforms,
-        MTLLoadAction::DontCare,
-        "mtld3d-present-pass",
+        &FullscreenPass {
+            pipeline_handle,
+            uniforms,
+            load_action: MTLLoadAction::DontCare,
+            label: "mtld3d-present-pass",
+            gamma_layer,
+        },
     )
 }
 
@@ -1369,30 +1489,52 @@ pub fn encode_cursor_pass(
     dst: &ProtocolObject<dyn MTLTexture>,
     pipeline_handle: u64,
     uniforms: Option<[f32; 4]>,
+    gamma_layer: usize,
 ) -> bool {
     encode_fullscreen_pass(
         cmd_buf,
         src,
         dst,
-        pipeline_handle,
-        uniforms,
-        MTLLoadAction::Clear,
-        "mtld3d-cursor-pass",
+        &FullscreenPass {
+            pipeline_handle,
+            uniforms,
+            load_action: MTLLoadAction::Clear,
+            label: "mtld3d-cursor-pass",
+            gamma_layer,
+        },
     )
 }
 
-/// One fullscreen-triangle pass sampling `src` across `dst` with `pipeline_handle`.
+/// What one fullscreen pass does, beside the two textures it reads and writes.
+struct FullscreenPass<'a> {
+    pipeline_handle: u64,
+    /// The `BT.2446` block at fragment slot 0; `None` for the stages with none.
+    uniforms: Option<[f32; 4]>,
+    load_action: MTLLoadAction,
+    label: &'a str,
+    /// Layer whose gamma table the fragment stage reads, `0` for none.
+    ///
+    /// Set only for a gamma pipeline, which indexes the table
+    /// unconditionally, so the two travel together.
+    gamma_layer: usize,
+}
+
+/// One fullscreen-triangle pass sampling `src` across `dst` with `pass.pipeline_handle`.
 ///
 /// `MTLLoadAction::Clear` clears to transparent black.
 fn encode_fullscreen_pass(
     cmd_buf: &ProtocolObject<dyn MTLCommandBuffer>,
     src: &ProtocolObject<dyn MTLTexture>,
     dst: &ProtocolObject<dyn MTLTexture>,
-    pipeline_handle: u64,
-    uniforms: Option<[f32; 4]>,
-    load_action: MTLLoadAction,
-    label: &str,
+    pass: &FullscreenPass,
 ) -> bool {
+    let FullscreenPass {
+        pipeline_handle,
+        uniforms,
+        load_action,
+        label,
+        gamma_layer,
+    } = *pass;
     // SAFETY: pipeline_handle is a previously-retained MTLRenderPipelineState address.
     let Some(pipeline) =
         (unsafe { MetalHandle::<MTLRenderPipelineStateKind>::new(pipeline_handle) })
@@ -1440,6 +1582,20 @@ fn encode_fullscreen_pass(
         unsafe {
             enc.setFragmentBytes_length_atIndex(uniforms_ptr, core::mem::size_of_val(&uniforms), 0);
         }
+    }
+    // A gamma pipeline indexes the layer's table unconditionally, so a table
+    // that is gone by the time the pass encodes has to end the pass rather
+    // than draw through a pipeline with an unbound argument. The caller
+    // resolved the pipeline from the same flag the table is published under,
+    // so this is the teardown race and nothing else.
+    if gamma_layer != 0 && !super::gamma::bind(&enc, gamma_layer) {
+        mtld3d_shared::log_once_warn!(
+            target: LOG_TARGET,
+            "present: layer {gamma_layer:#x} lost its gamma table between the route and the \
+             pass; the frame is presented without the ramp"
+        );
+        enc.endEncoding();
+        return false;
     }
     // SAFETY: objc2 typed binding; pipeline is bound above; no buffer args.
     unsafe {
@@ -3322,10 +3478,16 @@ fn encode_readback_resolve(
         cmd_buf,
         source,
         &target,
-        pipeline,
-        None,
-        MTLLoadAction::DontCare,
-        "mtld3d-readback-resolve",
+        &FullscreenPass {
+            pipeline_handle: pipeline,
+            uniforms: None,
+            load_action: MTLLoadAction::DontCare,
+            label: "mtld3d-readback-resolve",
+            // A readback reads the game's own pixels. The gamma ramp is the
+            // display's transfer function, so it belongs to the presented
+            // frame alone and never to what `GetRenderTargetData` hands back.
+            gamma_layer: 0,
+        },
     )
     .then_some(target)
 }

@@ -137,6 +137,19 @@ enum Content {
         mode: LayerMode,
         peak: f32,
         geometry: SpriteGeometry,
+        /// The owner layer whose gamma ramp the sprite was rendered through.
+        ///
+        /// `0` when no ramp applies. A D3D9 gamma ramp is the display's
+        /// transfer function, so the sprite takes it too: ramping the frame
+        /// and leaving the cursor at full brightness is what a player reads
+        /// as a bug.
+        gamma_layer: usize,
+        /// Which of that layer's ramps it was, so a new one re-renders.
+        ///
+        /// The image is cached and only rebuilt when this record changes,
+        /// which is why the revision is part of the identity rather than the
+        /// table itself.
+        gamma_revision: u64,
     },
 }
 
@@ -1040,6 +1053,8 @@ impl Overlay {
             geometry: _,
             mode,
             peak,
+            gamma_layer,
+            gamma_revision: _,
         } = content
         else {
             mtld3d_shared::log_once_warn!(target: LOG_TARGET, "cursor: sprite renderer received transparent content");
@@ -1075,12 +1090,30 @@ impl Overlay {
             mtld3d_shared::log_once_warn!(target: LOG_TARGET, "cursor: pipeline allocation failed");
             return None;
         };
-        let (pipeline, uniforms) = match mode {
-            LayerMode::Sdr => (pipelines.cursor_copy, None),
-            LayerMode::Hdr if *peak <= 1.0 => (pipelines.cursor_passthrough, None),
-            LayerMode::Hdr => (pipelines.cursor_bt2446, Some(present::hdr_uniforms(*peak))),
+        let (stage, pipeline, uniforms) = match mode {
+            LayerMode::Sdr => (present::GammaStage::CursorCopy, pipelines.cursor_copy, None),
+            LayerMode::Hdr if *peak <= 1.0 => (
+                present::GammaStage::CursorPassthrough,
+                pipelines.cursor_passthrough,
+                None,
+            ),
+            LayerMode::Hdr => (
+                present::GammaStage::CursorBt2446,
+                pipelines.cursor_bt2446,
+                Some(present::hdr_uniforms(*peak)),
+            ),
         };
-        if !command::encode_cursor_pass(&command, texture, &output, pipeline, uniforms) {
+        // The ramped twin, compiled on the first sprite that needs it. A
+        // compile that fails renders the sprite unramped rather than leaving
+        // the pointer invisible.
+        let gamma = if *gamma_layer == 0 {
+            None
+        } else {
+            present::ensure_gamma_pipeline(&device, stage).map(|handle| (handle, *gamma_layer))
+        };
+        let (pipeline, gamma_layer) = gamma.unwrap_or((pipeline, 0));
+        if !command::encode_cursor_pass(&command, texture, &output, pipeline, uniforms, gamma_layer)
+        {
             mtld3d_shared::log_once_warn!(target: LOG_TARGET, "cursor: sprite encoder allocation failed");
             return None;
         }
@@ -1173,11 +1206,14 @@ impl Overlay {
                 }) if *h == hash && *m == mode && !peak_changed(*p, peak) => *p,
                 _ => peak,
             };
+            let gamma_layer = if att.gamma_active() { att.layer() } else { 0 };
             Content::Sprite {
                 hash,
                 mode,
                 peak,
                 geometry: geometry.clone(),
+                gamma_layer,
+                gamma_revision: crate::metal::gamma::revision(gamma_layer),
             }
         } else {
             Content::Transparent

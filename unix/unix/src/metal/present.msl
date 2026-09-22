@@ -34,6 +34,41 @@ fragment float4 mtld3d_present_ps_copy(
     return src.sample(s, in.uv);
 }
 
+// ── Gamma ramp ──
+//
+// D3D9's gamma ramp maps each 8-bit code to a 16-bit display level. It is the
+// display's transfer function, so it applies to the gamma-encoded value the
+// sampler just read, before any decode: the HDR stages run it first and
+// linearise the result, which is the same order as applying it to the frame a
+// monitor would have received.
+//
+// The table is 256 entries of `ushort4` (R, G, B, one), handed in per pass
+// through `setFragmentBytes:`. The source is 8-bit, but the sampler resamples
+// it, so a channel lands between two codes: interpolating between the
+// neighbouring entries is what keeps a stretched or scaled frame smooth
+// instead of banding on the table's steps.
+inline float3 apply_gamma_ramp(float3 encoded, constant ushort4* lut) {
+    float3 x = clamp(encoded, 0.0f, 1.0f) * 255.0f;
+    float3 lo = floor(x);
+    float3 frac = x - lo;
+    uint3 i0 = uint3(lo);
+    uint3 i1 = min(i0 + 1u, uint3(255u));
+    float3 a = float3(lut[i0.x].r, lut[i0.y].g, lut[i0.z].b);
+    float3 b = float3(lut[i1.x].r, lut[i1.y].g, lut[i1.z].b);
+    return mix(a, b, frac) * (1.0f / 65535.0f);
+}
+
+fragment float4 mtld3d_present_ps_copy_gamma(
+    VsOut in [[stage_in]],
+    texture2d<float> src [[texture(0)]],
+    constant ushort4* lut [[buffer(1)]]
+) {
+    constexpr sampler s(coord::normalized, filter::linear,
+                        address::clamp_to_edge);
+    float4 sample = src.sample(s, in.uv);
+    return float4(apply_gamma_ramp(sample.rgb, lut), sample.a);
+}
+
 // Readback resolve for the single-precision float formats: the same copy with
 // a nearest sampler. `R32Float`, `RG32Float` and `RGBA32Float` filter only
 // where the device says so (never on the Mac2 family), and a readback has to
@@ -78,6 +113,17 @@ fragment float4 mtld3d_present_ps_hdr_passthrough(
                         address::clamp_to_edge);
     float4 sample = src.sample(s, in.uv);
     return float4(srgb_eotf(sample.rgb), sample.a);
+}
+
+fragment float4 mtld3d_present_ps_hdr_passthrough_gamma(
+    VsOut in [[stage_in]],
+    texture2d<float> src [[texture(0)]],
+    constant ushort4* lut [[buffer(1)]]
+) {
+    constexpr sampler s(coord::normalized, filter::linear,
+                        address::clamp_to_edge);
+    float4 sample = src.sample(s, in.uv);
+    return float4(srgb_eotf(apply_gamma_ramp(sample.rgb, lut)), sample.a);
 }
 
 // BT.709 linear-light → LMS (combined BT.709 → BT.2020 → LMS).
@@ -212,6 +258,19 @@ fragment float4 mtld3d_present_ps_hdr_bt2446(
     return float4(bt2446_ictcp(srgb_eotf(sample.rgb), u), sample.a);
 }
 
+fragment float4 mtld3d_present_ps_hdr_bt2446_gamma(
+    VsOut in [[stage_in]],
+    texture2d<float> src [[texture(0)]],
+    constant HdrUniforms& u [[buffer(0)]],
+    constant ushort4* lut [[buffer(1)]]
+) {
+    constexpr sampler s(coord::normalized, filter::linear,
+                        address::clamp_to_edge);
+    float4 sample = src.sample(s, in.uv);
+    float3 ramped = apply_gamma_ramp(sample.rgb, lut);
+    return float4(bt2446_ictcp(srgb_eotf(ramped), u), sample.a);
+}
+
 // ── Cursor sprite stages ──
 //
 // The software cursor's sprite onto the overlay window's own drawable, sized
@@ -250,4 +309,45 @@ fragment float4 mtld3d_cursor_ps_hdr_bt2446(
                         address::clamp_to_edge);
     float4 sample = src.sample(s, in.uv);
     return float4(bt2446_ictcp(srgb_eotf(sample.rgb), u) * sample.a, sample.a);
+}
+
+// The gamma twins of the three stages above. A D3D9 gamma ramp is the
+// display's transfer function, so it reaches the cursor as well: ramping the
+// frame and leaving the sprite at full brightness is what a player would see
+// as a bug. The sprite is its own drawable, so it carries the table itself
+// rather than inheriting the frame pass's binding.
+
+fragment float4 mtld3d_cursor_ps_copy_gamma(
+    VsOut in [[stage_in]],
+    texture2d<float> src [[texture(0)]],
+    constant ushort4* lut [[buffer(1)]]
+) {
+    constexpr sampler s(coord::normalized, filter::linear,
+                        address::clamp_to_edge);
+    float4 sample = src.sample(s, in.uv);
+    return float4(apply_gamma_ramp(sample.rgb, lut) * sample.a, sample.a);
+}
+
+fragment float4 mtld3d_cursor_ps_hdr_passthrough_gamma(
+    VsOut in [[stage_in]],
+    texture2d<float> src [[texture(0)]],
+    constant ushort4* lut [[buffer(1)]]
+) {
+    constexpr sampler s(coord::normalized, filter::linear,
+                        address::clamp_to_edge);
+    float4 sample = src.sample(s, in.uv);
+    return float4(srgb_eotf(apply_gamma_ramp(sample.rgb, lut)) * sample.a, sample.a);
+}
+
+fragment float4 mtld3d_cursor_ps_hdr_bt2446_gamma(
+    VsOut in [[stage_in]],
+    texture2d<float> src [[texture(0)]],
+    constant HdrUniforms& u [[buffer(0)]],
+    constant ushort4* lut [[buffer(1)]]
+) {
+    constexpr sampler s(coord::normalized, filter::linear,
+                        address::clamp_to_edge);
+    float4 sample = src.sample(s, in.uv);
+    float3 ramped = apply_gamma_ramp(sample.rgb, lut);
+    return float4(bt2446_ictcp(srgb_eotf(ramped), u) * sample.a, sample.a);
 }

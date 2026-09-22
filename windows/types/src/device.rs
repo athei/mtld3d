@@ -1153,6 +1153,28 @@ pub struct D3DDISPLAYMODE {
     pub format: u32,
 }
 
+// ── D3DGAMMARAMP ──
+
+// Three 256-entry channel ramps, red then green then blue. Each entry is the
+// 16-bit level the display should show for the 8-bit code that indexes it, so
+// an identity ramp is `65535 * i / 255`.
+#[repr(C)]
+pub struct D3DGAMMARAMP {
+    pub red: [u16; GAMMA_RAMP_ENTRIES],
+    pub green: [u16; GAMMA_RAMP_ENTRIES],
+    pub blue: [u16; GAMMA_RAMP_ENTRIES],
+}
+
+// Entries per channel of a `D3DGAMMARAMP`, one per 8-bit code.
+pub const GAMMA_RAMP_ENTRIES: usize = 256;
+
+// D3DSGR_* flags of IDirect3DDevice9::SetGammaRamp. CALIBRATE asks the driver
+// to correct the ramp for the display's response, which needs
+// D3DCAPS2_CANCALIBRATEGAMMA; a device without that cap applies the ramp as
+// given, so the flag carries no obligation here.
+pub const D3DSGR_NO_CALIBRATION: u32 = 0x0000_0000;
+pub const D3DSGR_CALIBRATE: u32 = 0x0000_0001;
+
 // ── D3DDEVICE_CREATION_PARAMETERS ──
 
 #[repr(C)]

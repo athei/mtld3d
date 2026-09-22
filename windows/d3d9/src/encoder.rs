@@ -59,9 +59,9 @@ use mtld3d_shared::{
     CopyBufferToBufferInfo, CopyBufferToTextureInfo, CreateBuffersBatchParams,
     CreateTextureSliceViewParams, CreateTexturesBatchParams, DestroyResourcesBulkParams,
     EnsureBlitPipelineParams, EnsureClearQuadPipelineParams, ExtraColorDesc, GetTaskFaultsParams,
-    MetalHandle, PassDescriptor, SetDisplaySyncEnabledParams, SetPresentWaitPolicyParams,
-    SubmitFrameParams, TextureCreateDesc, VertexAttrDesc, WaitForGpuRetireParams,
-    WaitForPresentIdleParams,
+    MetalHandle, PassDescriptor, SetDisplaySyncEnabledParams, SetGammaRampParams,
+    SetPresentWaitPolicyParams, SubmitFrameParams, TextureCreateDesc, VertexAttrDesc,
+    WaitForGpuRetireParams, WaitForPresentIdleParams,
     mtl::{
         BufferKind, ClearQuadFlags, CullMode, DepthResolveFilter, DestroyKind, LoadAction,
         PRESENT_PIPELINE_DEPTH, PixelFormat, PresentWaitPolicy, PrimitiveType, QuadPipelineKind,
@@ -9000,6 +9000,14 @@ pub struct FrameData {
     /// from the API thread mid-frame. The ceiling it carries is the effective
     /// one, the interval's folded with `present.maxFps`.
     apply_pacing: Option<LayerPacing>,
+    /// `Some(t)` if `SetGammaRamp` changed what the layer should carry since the last frame.
+    ///
+    /// `Some(Some(table))` applies that table, `Some(None)` removes the one
+    /// the layer has. Put here by `stamp_and_swap`, like `apply_pacing`, and
+    /// sent by the encoder at the top of `run_frame` so the ramp is live for
+    /// this frame's own present rather than the one after it. A `Box` so a
+    /// frame carrying no change costs a pointer.
+    apply_gamma: Option<mtld3d_core::gamma::Change>,
     /// API-thread bump arena.
     ///
     /// Used by `snapshot_shared` to allocate per-draw VS/PS constants +
@@ -9114,6 +9122,7 @@ impl FrameData {
             failed_submit_seq_ptr: 0,
             retained_bytes_ptr: 0,
             apply_pacing: None,
+            apply_gamma: None,
             scratch: ScratchArena::new(),
             op_vec_realloc_bytes: 0,
         }
@@ -9266,6 +9275,14 @@ impl FrameData {
     /// nothing.
     pub const fn set_apply_pacing(&mut self, pacing: Option<LayerPacing>) {
         self.apply_pacing = pacing;
+    }
+
+    /// Put a queued gamma-ramp change on this frame.
+    ///
+    /// Called from `stamp_and_swap` for the frame being handed to the
+    /// encoder, the same way the queued pacing is.
+    pub fn set_apply_gamma(&mut self, change: Option<mtld3d_core::gamma::Change>) {
+        self.apply_gamma = change;
     }
 
     /// Drain the per-frame `Vec<Op>` realloc-byte counter into the caller and zero it.
@@ -9787,6 +9804,25 @@ fn run_frame(enc: &mut FrameEncoder, mut frame: Box<FrameData>, fc: u64, mode: S
             max_fps: pacing.max_fps,
         };
         unix_call(&mut params);
+    }
+    if let Some(change) = frame.apply_gamma.take()
+        && !frame.layer_handle.is_null()
+    {
+        let table = match &change {
+            mtld3d_core::gamma::Change::Apply(table) => Some(&**table),
+            mtld3d_core::gamma::Change::Remove => None,
+        };
+        let mut params = SetGammaRampParams {
+            layer_handle: frame.layer_handle,
+            entries_ptr: table.map_or(0, |table| core::ptr::from_ref::<u16>(&table[0]) as u64),
+            entries_len: table.map_or(0, |table| {
+                u32::try_from(table.len()).expect("the gamma table has 1024 lanes")
+            }),
+            pad0: 0,
+        };
+        unix_call(&mut params);
+        // The thunk copies the entries, so the table may go here.
+        drop(change);
     }
     mtld3d_shared::crumb!("phase:BfEnter");
     // Reset encoder-side state cache before draining ops: the pointer

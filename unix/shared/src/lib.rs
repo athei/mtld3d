@@ -35,7 +35,7 @@ pub use params::{
     DestroyCommandQueueParams, DestroyResourcesBulkParams, DetachMetalLayerParams,
     EnsureBlitPipelineParams, EnsureClearQuadPipelineParams, ExtraColorAttachmentParams,
     ExtraColorDesc, GetDeviceInfoParams, GetTaskFaultsParams, InitLoggerParams, OpenLogParams,
-    PassDescriptor, SetCursorOverlayParams, SetDisplaySyncEnabledParams,
+    PassDescriptor, SetCursorOverlayParams, SetDisplaySyncEnabledParams, SetGammaRampParams,
     SetPresentWaitPolicyParams, StartGpuCaptureParams, StencilFaceParams, StopGpuCaptureParams,
     SubmitFrameParams, TextureCreateDesc, VertexAttrDesc, VertexBufferLayoutDesc,
     WaitForGpuRetireParams, WaitForPresentIdleParams, WriteLogParams,
@@ -76,6 +76,7 @@ pub enum Thunks {
     SetPresentWaitPolicy,
     WaitForPresentIdle,
     CreateDepthTransferPipeline,
+    SetGammaRamp,
 }
 
 pub trait Thunk {
