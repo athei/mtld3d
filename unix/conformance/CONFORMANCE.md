@@ -1117,8 +1117,7 @@ defined the case: every assertion here carries a second accepted colour under
 about whether the draw happens at all.
 
 ### visual.c/test_flip
-Sites: 22053=expected 22055=real 22064=expected 22066=real
-Sites: 22072=real
+Sites: 22053=expected 22064=expected
 
 The device is created with D3DSWAPEFFECT_DISCARD, under which post-Present
 backbuffer contents are UNDEFINED by spec; the test observes native's
@@ -1134,10 +1133,10 @@ incorrectly reported `X8R8G8B8`. That descriptor defect was `real`, including on
 the mixed sites whose remaining assertions observe undefined contents.
 
 Reporting the requested `A8R8G8B8` format lets the helper read pixels. Sites
-22055, 22066 and 22072 then pass on the Apple GPU legs; their old `@mac2` pins
-remain `real` until an Intel/AMD runner records their results. Sites 22053 and
-22064 now return actual colours from the shared backing rather than a rotating
-chain, so only their by-design remainder is classified `expected`.
+22055, 22066 and 22072 pass on both architectures across the Apple GPU legs
+and the Intel/AMD `@mac2` runners. Their baseline pins have been removed. Sites
+22053 and 22064 return actual colours from the shared backing rather than a
+rotating chain, so only their by-design remainder is classified `expected`.
 
 ### visual.c/test_max_index16
 Sites: 24133=expected 24135=expected
