@@ -1117,15 +1117,27 @@ defined the case: every assertion here carries a second accepted colour under
 about whether the draw happens at all.
 
 ### visual.c/test_flip
-Sites: 22053=expected 22055=expected 22064=expected 22066=expected
-Sites: 22072=expected
+Sites: 22053=expected 22055=real 22064=expected 22066=real
+Sites: 22072=real
 
 The device is created with D3DSWAPEFFECT_DISCARD, under which post-Present
 backbuffer contents are UNDEFINED by spec; the test observes native's
 incidental flip-chain content rotation. Not emulating that is
-spec-compliant. Surface identity and lockable read-back pass. A title
+spec-compliant. Surface identity and lockable read-back now pass. A title
 relying on flip-chain read-back under FLIP/COPY swap effects would be a
 different (real) matter.
+
+The original `expected` classification of all five sites was wrong: their raw
+result was `0xdeadbeef`, not a colour from an undefined backbuffer. The lockable
+read-back helper accepts only `A8R8G8B8`, and the backbuffer's `GetDesc`
+incorrectly reported `X8R8G8B8`. That descriptor defect was `real`, including on
+the mixed sites whose remaining assertions observe undefined contents.
+
+Reporting the requested `A8R8G8B8` format lets the helper read pixels. Sites
+22055, 22066 and 22072 then pass on the Apple GPU legs; their old `@mac2` pins
+remain `real` until an Intel/AMD runner records their results. Sites 22053 and
+22064 now return actual colours from the shared backing rather than a rotating
+chain, so only their by-design remainder is classified `expected`.
 
 ### visual.c/test_max_index16
 Sites: 24133=expected 24135=expected

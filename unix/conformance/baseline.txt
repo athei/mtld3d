@@ -102,10 +102,7 @@
   visual.c:20959 count=1
   visual.c:20962 count=1
   visual.c:22053 count=1
-  visual.c:22055 count=1
   visual.c:22064 count=1
-  visual.c:22066 count=1
-  visual.c:22072 count=1
   visual.c:24133 count=1
   visual.c:24135 count=1
   visual.c:25148 count=1
@@ -205,10 +202,7 @@
   visual.c:20959 count=1
   visual.c:20962 count=1
   visual.c:22053 count=1
-  visual.c:22055 count=1
   visual.c:22064 count=1
-  visual.c:22066 count=1
-  visual.c:22072 count=1
   visual.c:24133 count=1
   visual.c:24135 count=1
   visual.c:25148 count=1
@@ -414,10 +408,7 @@
   visual.c:20959 count=1
   visual.c:20962 count=1
   visual.c:22053 count=1
-  visual.c:22055 count=1
   visual.c:22064 count=1
-  visual.c:22066 count=1
-  visual.c:22072 count=1
   visual.c:24133 count=1
   visual.c:24135 count=1
   visual.c:25148 count=1
@@ -519,10 +510,7 @@
   visual.c:20959 count=1
   visual.c:20962 count=1
   visual.c:22053 count=1
-  visual.c:22055 count=1
   visual.c:22064 count=1
-  visual.c:22066 count=1
-  visual.c:22072 count=1
   visual.c:24133 count=1
   visual.c:24135 count=1
   visual.c:25148 count=1
@@ -620,10 +608,7 @@
   visual.c:20959 count=1
   visual.c:20962 count=1
   visual.c:22053 count=1
-  visual.c:22055 count=1
   visual.c:22064 count=1
-  visual.c:22066 count=1
-  visual.c:22072 count=1
   visual.c:24133 count=1
   visual.c:24135 count=1
   visual.c:25148 count=1
@@ -827,10 +812,7 @@
   visual.c:20959 count=1
   visual.c:20962 count=1
   visual.c:22053 count=1
-  visual.c:22055 count=1
   visual.c:22064 count=1
-  visual.c:22066 count=1
-  visual.c:22072 count=1
   visual.c:24133 count=1
   visual.c:24135 count=1
   visual.c:25148 count=1

@@ -85,10 +85,10 @@ impl Direct3DSwapChain9 {
 
     /// Overwrite the present parameters this swapchain reports.
     ///
-    /// The device keeps its cached implicit swapchain in lockstep after a
-    /// `Reset` re-resolves them, so `GetSwapChain(0).GetPresentParameters`
-    /// reflects the post-Reset geometry rather than the values captured at
-    /// first hand-out.
+    /// The device keeps its cached implicit swapchain in lockstep after Reset
+    /// or an automatic resize, so `GetSwapChain(0).GetPresentParameters`
+    /// reflects the live geometry rather than the values captured at first
+    /// hand-out.
     pub fn set_present_params(&mut self, present_params: D3DPRESENT_PARAMETERS) {
         // SAFETY: `self.inner` is a live `Box::into_raw` (see `inner()`), valid
         // for every live wrapper reference.

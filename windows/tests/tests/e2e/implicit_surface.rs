@@ -9,8 +9,138 @@
 
 use mtld3d_tests::{Harness, HarnessConfig};
 use mtld3d_types::{
-    D3D_OK, D3DERR_INVALIDCALL, D3DLOCK_READONLY, D3DPRESENTFLAG_LOCKABLE_BACKBUFFER,
+    D3D_OK, D3DERR_INVALIDCALL, D3DFMT_A8R8G8B8, D3DFMT_A16B16G16R16F, D3DFMT_R5G6B5,
+    D3DFMT_X8R8G8B8, D3DLOCK_READONLY, D3DPRESENTFLAG_LOCKABLE_BACKBUFFER,
 };
+
+fn assert_backbuffer_format(h: &Harness, expected: u32) {
+    let chain = h.implicit_swapchain();
+    for surface in [h.render_target(0), h.back_buffer(0), chain.back_buffer()] {
+        let (hr, desc) = surface.desc();
+        assert_eq!(hr, D3D_OK, "GetDesc");
+        assert_eq!(desc.format, expected, "backbuffer format");
+    }
+}
+
+#[test]
+fn backbuffer_reporting_preserves_alpha_format_at_creation() {
+    let h = Harness::create(&HarnessConfig {
+        back_buffer_format: D3DFMT_A8R8G8B8,
+        ..HarnessConfig::default()
+    });
+    assert_backbuffer_format(&h, D3DFMT_A8R8G8B8);
+}
+
+#[test]
+fn backbuffer_reporting_tracks_same_size_format_resets() {
+    let h = Harness::new();
+    let chain = h.implicit_swapchain();
+    let (hr, mut pp) = chain.present_parameters();
+    assert_eq!(hr, D3D_OK);
+    let original = h.back_buffer(0).as_ptr();
+    for format in [
+        D3DFMT_X8R8G8B8,
+        D3DFMT_A8R8G8B8,
+        D3DFMT_X8R8G8B8,
+        D3DFMT_A8R8G8B8,
+    ] {
+        pp.back_buffer_format = format;
+        assert_eq!(h.reset_params(&mut pp), D3D_OK, "same-size Reset");
+        assert_eq!(
+            h.back_buffer(0).as_ptr(),
+            original,
+            "cached surface identity"
+        );
+        assert_backbuffer_format(&h, format);
+        let (hr, reported) = chain.present_parameters();
+        assert_eq!(hr, D3D_OK);
+        assert_eq!(
+            reported.back_buffer_format, format,
+            "cached swapchain format"
+        );
+    }
+}
+
+#[test]
+fn backbuffer_reporting_retains_bgra8_fallback_pitch() {
+    const FILL: u32 = 0xff20_4080;
+    let h = Harness::create(&HarnessConfig {
+        back_buffer_format: D3DFMT_R5G6B5,
+        config_entries: "render.scale=1",
+        ..HarnessConfig::default()
+    });
+    for format in [D3DFMT_R5G6B5, D3DFMT_A16B16G16R16F] {
+        let (hr, mut pp) = h.implicit_swapchain().present_parameters();
+        assert_eq!(hr, D3D_OK);
+        pp.back_buffer_format = format;
+        assert_eq!(h.reset_params(&mut pp), D3D_OK);
+        assert_backbuffer_format(&h, D3DFMT_X8R8G8B8);
+        assert_eq!(h.clear_target(FILL), D3D_OK);
+        let surface = h.back_buffer(0);
+        let locked = surface.lock_rect(D3DLOCK_READONLY);
+        assert_eq!(
+            locked.pitch(),
+            640 * 4,
+            "BGRA8 backing keeps a four-byte pitch"
+        );
+        assert_eq!(locked.as_u32(1)[0], FILL, "fallback readback colour");
+    }
+}
+
+#[test]
+fn backbuffer_reporting_resolves_additional_swapchain_unknown_format() {
+    let h = Harness::create(&HarnessConfig {
+        back_buffer_format: D3DFMT_A8R8G8B8,
+        ..HarnessConfig::default()
+    });
+    let (hr, mut pp) = h.implicit_swapchain().present_parameters();
+    assert_eq!(hr, D3D_OK);
+    pp.back_buffer_format = 0;
+    pp.back_buffer_width = 0;
+    pp.back_buffer_height = 0;
+    pp.back_buffer_count = 0;
+    pp.device_window = 0;
+    let chain = h.additional_swapchain_params(&mut pp);
+    assert_eq!(
+        pp.back_buffer_format, D3DFMT_X8R8G8B8,
+        "resolve the desktop format"
+    );
+    assert_eq!((pp.back_buffer_width, pp.back_buffer_height), (640, 480));
+    assert_eq!(pp.back_buffer_count, 1);
+    assert_eq!(pp.device_window, 0, "the caller's window stays as supplied");
+    let (hr, reported) = chain.present_parameters();
+    assert_eq!(hr, D3D_OK);
+    assert_eq!(reported.back_buffer_format, pp.back_buffer_format);
+    assert_eq!(reported.device_window, h.hwnd());
+}
+
+#[test]
+fn backbuffer_reporting_tracks_auto_resize_in_present_parameters() {
+    const WM_SIZE: u32 = 0x0005;
+    for cache_first in [false, true] {
+        let h = Harness::create(&HarnessConfig {
+            back_buffer_format: D3DFMT_A8R8G8B8,
+            ..HarnessConfig::default()
+        });
+        let mut chain = cache_first.then(|| h.implicit_swapchain());
+        for (width, height) in [(320_u32, 240_u32), (800, 600)] {
+            let size = isize::try_from((height << 16) | width).unwrap();
+            h.send_window_message(WM_SIZE, 0, size);
+            let (hr, desc) = h.back_buffer(0).desc();
+            assert_eq!(hr, D3D_OK);
+            assert_eq!((desc.width, desc.height), (width, height));
+            let sc = chain.get_or_insert_with(|| h.implicit_swapchain());
+            let (hr, pp) = sc.present_parameters();
+            assert_eq!(hr, D3D_OK);
+            assert_eq!(
+                (pp.back_buffer_width, pp.back_buffer_height),
+                (width, height)
+            );
+            assert_eq!(pp.back_buffer_format, D3DFMT_A8R8G8B8);
+            assert_eq!(pp.device_window, h.hwnd());
+        }
+    }
+}
 
 #[test]
 fn implicit_render_target_is_cached_and_aliases_backbuffer() {

@@ -2698,12 +2698,20 @@ impl Harness {
             ..HarnessConfig::default()
         };
         let mut pp = present_params(&cfg, self.hwnd);
+        self.additional_swapchain_params(&mut pp)
+    }
+
+    /// Create an additional swapchain and retain the resolved parameters.
+    ///
+    /// # Panics
+    /// Panics if `CreateAdditionalSwapChain` fails.
+    pub fn additional_swapchain_params(&self, pp: &mut D3DPRESENT_PARAMETERS) -> SwapChain<'_> {
         let mut chain = core::ptr::null_mut();
         // SAFETY: live device, valid presentation parameters and writable output.
         let hr = unsafe {
             (self.dev_vtbl().create_additional_swap_chain)(
                 self.device,
-                (&raw mut pp).cast::<c_void>(),
+                core::ptr::from_mut(pp).cast::<c_void>(),
                 &raw mut chain,
             )
         };

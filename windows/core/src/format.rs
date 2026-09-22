@@ -21,6 +21,21 @@ use mtld3d_types::{
 use super::LOG_TARGET;
 use crate::render_scale::RenderScale;
 
+/// The D3D9 surface format of the fixed BGRA8 backbuffer storage.
+///
+/// A8 and X8 share the byte layout but keep distinct alpha semantics. Other
+/// requests use the opaque BGRA8 fallback, which device creation and Reset
+/// warn about. Reporting their requested format would give CPU readback the
+/// wrong pixel size for the storage that was actually allocated.
+#[must_use]
+pub const fn backbuffer_surface_format(requested: u32) -> u32 {
+    if requested == D3DFMT_A8R8G8B8 {
+        D3DFMT_A8R8G8B8
+    } else {
+        D3DFMT_X8R8G8B8
+    }
+}
+
 // Usage bits `usage_allowed_for_rtype` weighs. The named D3D9 usage flags
 // outside this set are the ones the runtime strips before it validates:
 // `D3DUSAGE_WRITEONLY` is a lock hint rather than a capability question, and
