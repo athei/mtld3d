@@ -23,6 +23,12 @@ pub const D3DCREATE_NOWINDOWCHANGES: u32 = 0x800;
 /// `D3DSWAPEFFECT_DISCARD` — `D3DPRESENT_PARAMETERS::SwapEffect`.
 pub const D3DSWAPEFFECT_DISCARD: u32 = 1;
 
+/// `D3DSWAPEFFECT_FLIP`, a `D3DPRESENT_PARAMETERS::SwapEffect` value.
+pub const D3DSWAPEFFECT_FLIP: u32 = 2;
+
+/// `D3DSWAPEFFECT_COPY`, a `D3DPRESENT_PARAMETERS::SwapEffect` value.
+pub const D3DSWAPEFFECT_COPY: u32 = 3;
+
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Guid {

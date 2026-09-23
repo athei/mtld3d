@@ -9,6 +9,7 @@ use mtld3d_shared::{
     mtl::{CullMode, PixelFormat, TriangleFillMode, VERTEX_STREAM_SLOTS, VisibilityResultMode},
     mtl_handle::{MTLRenderPipelineStateKind, MTLTextureKind},
 };
+use mtld3d_types::D3DSWAPEFFECT_DISCARD;
 use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 
 use crate::{
@@ -48,14 +49,15 @@ struct ClearMerge {
 
 /// Compile-time gate for Rule A (first-use `DontCare`).
 ///
-/// On the colour side only the back buffer qualifies: under
-/// `D3DSWAPEFFECT_DISCARD`, the one swap effect implemented, its contents are
-/// undefined after `Present`, so its first pass of a frame has nothing to load.
-/// Every other colour target keeps its contents across `Present` in D3D9, and
-/// a game may draw over last frame's pixels without clearing, so its first use
-/// loads. The depth plane takes the same first-use `DontCare`. Flip to `false`
-/// for a single-line hotfix if a game surfaces that reads prior-frame depth on
-/// first use of frame N.
+/// On the colour side only the back buffer qualifies, and only under
+/// `D3DSWAPEFFECT_DISCARD`: its contents are undefined after `Present`, so its
+/// first pass of a frame has nothing to load. Under `FLIP` and `COPY` the back
+/// buffer's contents are defined after `Present`, and every other colour
+/// target keeps its contents across `Present` in D3D9; a game may draw over
+/// last frame's pixels without clearing, so their first use loads. The depth
+/// plane takes the same first-use `DontCare`. Flip to `false` for a
+/// single-line hotfix if a game surfaces that reads prior-frame depth on first
+/// use of frame N.
 const ENABLE_FIRST_USE_DONTCARE: bool = true;
 
 /// Compile-time gate for Rule A on the stencil plane (first-use `DontCare`).
@@ -1015,6 +1017,33 @@ bitflags::bitflags! {
     }
 }
 
+/// What the back buffer holds when a frame starts, as the swap effect defines it.
+///
+/// `D3DSWAPEFFECT_DISCARD` leaves the back buffer undefined after `Present`,
+/// which is what lets Rule A discard it on first use. `FLIP` and `COPY` define
+/// its contents after `Present`; the one back-buffer texture keeps the pixels
+/// the previous frame left, the closest match, so a game that redraws only
+/// part of the frame without clearing keeps the rest.
+#[derive(Clone, Copy)]
+pub enum BackbufferContents {
+    /// `D3DSWAPEFFECT_DISCARD`: undefined after `Present`.
+    Undefined,
+    /// `D3DSWAPEFFECT_FLIP` or `D3DSWAPEFFECT_COPY`: the pixels carry over.
+    Preserved,
+}
+
+impl BackbufferContents {
+    /// The contents a swap chain created with `swap_effect` starts each frame with.
+    #[must_use]
+    pub const fn from_swap_effect(swap_effect: u32) -> Self {
+        if swap_effect == D3DSWAPEFFECT_DISCARD {
+            Self::Undefined
+        } else {
+            Self::Preserved
+        }
+    }
+}
+
 /// The per-frame inputs `PassState::reset_frame` seeds a new frame from.
 ///
 /// A parameter struct rather than a long argument list: the frame's
@@ -1043,6 +1072,8 @@ pub struct FrameReset {
     /// Logical back-buffer size, the resolution D3D9 reports.
     pub backbuffer_size: (u32, u32),
     pub backbuffer_format: PixelFormat,
+    /// Whether `backbuffer` starts the frame undefined, from the swap effect.
+    pub backbuffer_contents: BackbufferContents,
     pub depth_texture: MetalHandle<MTLTextureKind>,
     /// Extent of `depth_texture` in its own space; `(0, 0)` when there is none.
     ///
@@ -1209,11 +1240,18 @@ pub struct PassState {
     /// The swap-chain backbuffer texture for this frame, captured in `reset_frame`.
     ///
     /// Rule A's colour `DontCare` applies to this handle alone, since only the
-    /// back buffer starts a frame with undefined contents. Also the
+    /// back buffer starts a frame with undefined contents (see
+    /// [`Self::backbuffer_contents`]). Also the
     /// left-hand side of [`Self::target_scale`]'s comparison: it is what makes
     /// "is the back buffer bound" a handle identity rather than something the
     /// D3D9 layer has to infer and pass down.
     backbuffer_texture: MetalHandle<MTLTextureKind>,
+    /// Whether `backbuffer_texture` starts the frame undefined, seeded in `reset_frame`.
+    ///
+    /// Rule A discards the back buffer on first use only when it is
+    /// [`BackbufferContents::Undefined`], the discard swap effect; under `FLIP`
+    /// and `COPY` its first use loads, like any other colour target.
+    backbuffer_contents: BackbufferContents,
     /// Fraction of the logical resolution the back buffer is rasterized at.
     ///
     /// Seeded per frame from `FrameData`. Applies to the back buffer alone: a
@@ -1426,6 +1464,7 @@ impl PassState {
             seen_depth_rts_segment: FxHashSet::with_capacity_and_hasher(2, FxBuildHasher),
             blit_written_rts: FxHashSet::with_capacity_and_hasher(2, FxBuildHasher),
             backbuffer_texture: MetalHandle::NULL,
+            backbuffer_contents: BackbufferContents::Undefined,
             // Placeholder; `reset_frame` reseeds it from the frame stamp.
             // Identity means a `PassState` that never saw a frame cannot
             // perturb a coordinate.
@@ -1483,6 +1522,7 @@ impl PassState {
             backbuffer_sample_count,
             backbuffer_size,
             backbuffer_format,
+            backbuffer_contents,
             depth_texture,
             depth_size,
             depth_has_stencil,
@@ -1555,6 +1595,7 @@ impl PassState {
         self.current_attachments
             .set(CurrentAttachmentFlags::DEPTH_HAS_STENCIL, depth_has_stencil);
         self.backbuffer_texture = backbuffer;
+        self.backbuffer_contents = backbuffer_contents;
         self.pending_color_clear = None;
         self.pending_depth_clear = None;
         self.pending_stencil_clear = None;
@@ -2633,8 +2674,9 @@ impl PassState {
     /// `DontCare` instead of `Load`. Saves the TBDR tile-fill cost on
     /// passes that will fully overwrite undefined contents anyway. On the
     /// colour side only the back buffer's contents are undefined at the
-    /// start of a frame; any other colour target still holds what the
-    /// previous frame left in it, so it loads.
+    /// start of a frame, and only under the discard swap effect; any other
+    /// colour target still holds what the previous frame left in it, so it
+    /// loads.
     pub fn ensure_pass_open(&mut self) {
         if !self.current_pass_closed && !self.passes.is_empty() {
             return;
@@ -2664,10 +2706,12 @@ impl PassState {
         // Shared by render target 0 and every extra: a pending clear lands on
         // all of them (D3D9 clears every bound target), and the Rule A
         // first-use predicate is evaluated per attachment. Only the back
-        // buffer qualifies: `Present` under the discard swap effect leaves it
-        // undefined, while every other target keeps its contents into the
-        // next frame.
+        // buffer qualifies, and only when `Present` under the discard swap
+        // effect left it undefined; every other target, and the back buffer
+        // under `FLIP` or `COPY`, keeps its contents into the next frame.
         let backbuffer = self.backbuffer_texture;
+        let backbuffer_undefined =
+            matches!(self.backbuffer_contents, BackbufferContents::Undefined);
         let color_load_for =
             |texture: MetalHandle<MTLTextureKind>, subresource: u32| match pending_color_clear {
                 Some((r, g, b, a)) => ColorLoad::Clear { r, g, b, a },
@@ -2675,6 +2719,7 @@ impl PassState {
                     && viewport_covers_color_extent
                     && !texture.is_null()
                     && texture == backbuffer
+                    && backbuffer_undefined
                     && !self.seen_color_rts.contains(&(texture, subresource))
                     && !self.seen_sampled_textures.contains(&texture)
                     && !self.blit_written_rts.contains(&texture) =>

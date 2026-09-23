@@ -53,6 +53,7 @@ fn reset_test_frame(s: &mut PassState) {
         backbuffer_sample_count: 1,
         backbuffer_size: BB_SIZE,
         backbuffer_format: BB_FORMAT,
+        backbuffer_contents: BackbufferContents::Undefined,
         depth_texture: depth(),
         depth_size: BB_SIZE,
         depth_has_stencil: false,
@@ -72,6 +73,7 @@ fn fresh_scaled() -> PassState {
         backbuffer_sample_count: 1,
         backbuffer_size: BB_SIZE,
         backbuffer_format: BB_FORMAT,
+        backbuffer_contents: BackbufferContents::Undefined,
         depth_texture: depth(),
         depth_size: (BB_SIZE.0 / 2, BB_SIZE.1 / 2),
         depth_has_stencil: false,
@@ -246,6 +248,7 @@ fn frame_sampled_textures_clears_on_reset_frame() {
             backbuffer_sample_count: 1,
             backbuffer_size: BB_SIZE,
             backbuffer_format: BB_FORMAT,
+            backbuffer_contents: BackbufferContents::Undefined,
             depth_texture: depth(),
             depth_size: BB_SIZE,
             depth_has_stencil: false,
@@ -551,6 +554,61 @@ fn first_use_colour_dontcare_is_the_back_buffer_alone() {
     assert_eq!(s.passes()[1].depth_load(), DepthLoad::Load);
 }
 
+/// A frame on the default surfaces whose back buffer starts with `contents`.
+fn reset_frame_with_backbuffer_contents(s: &mut PassState, contents: BackbufferContents) {
+    s.reset_frame(&FrameReset {
+        backbuffer: backbuffer(),
+        backbuffer_srgb: backbuffer_srgb(),
+        backbuffer_msaa: MetalHandle::NULL,
+        backbuffer_msaa_srgb: MetalHandle::NULL,
+        backbuffer_sample_count: 1,
+        backbuffer_size: BB_SIZE,
+        backbuffer_format: BB_FORMAT,
+        backbuffer_contents: contents,
+        depth_texture: depth(),
+        depth_size: BB_SIZE,
+        depth_has_stencil: false,
+        render_scale: RenderScale::IDENTITY,
+        continues_frame: false,
+    });
+}
+
+#[test]
+fn first_use_colour_dontcare_needs_the_discard_swap_effect() {
+    // Under COPY or FLIP the back buffer keeps its contents across
+    // `Present`, so a game redrawing part of the frame without clearing
+    // relies on the rest surviving: its first use loads. The depth plane
+    // is unaffected.
+    let mut s = PassState::new();
+    reset_frame_with_backbuffer_contents(&mut s, BackbufferContents::Preserved);
+    s.emit_command(dummy_draw());
+    assert_eq!(s.passes()[0].color_texture(), backbuffer());
+    assert_eq!(s.passes()[0].color_load(), ColorLoad::Load);
+    assert_eq!(s.passes()[0].depth_load(), DepthLoad::DontCare);
+
+    // The next frame under DISCARD takes the first-use `DontCare` again.
+    reset_frame_with_backbuffer_contents(&mut s, BackbufferContents::Undefined);
+    s.emit_command(dummy_draw());
+    assert_eq!(s.passes()[0].color_load(), ColorLoad::DontCare);
+}
+
+#[test]
+fn only_the_discard_swap_effect_leaves_the_back_buffer_undefined() {
+    assert!(matches!(
+        BackbufferContents::from_swap_effect(mtld3d_types::D3DSWAPEFFECT_DISCARD),
+        BackbufferContents::Undefined
+    ));
+    for swap_effect in [
+        mtld3d_types::D3DSWAPEFFECT_FLIP,
+        mtld3d_types::D3DSWAPEFFECT_COPY,
+    ] {
+        assert!(matches!(
+            BackbufferContents::from_swap_effect(swap_effect),
+            BackbufferContents::Preserved
+        ));
+    }
+}
+
 #[test]
 fn region_clear_as_first_touch_loads_instead_of_dontcare() {
     // A `Clear(pRects)` opening the frame's first backbuffer pass:
@@ -635,6 +693,7 @@ fn reset_frame_drops_pending_clears() {
         backbuffer_sample_count: 1,
         backbuffer_size: BB_SIZE,
         backbuffer_format: BB_FORMAT,
+        backbuffer_contents: BackbufferContents::Undefined,
         depth_texture: depth(),
         depth_size: BB_SIZE,
         depth_has_stencil: false,
@@ -1348,6 +1407,7 @@ fn rule_a_reset_frame_re_arms_dontcare() {
         backbuffer_sample_count: 1,
         backbuffer_size: BB_SIZE,
         backbuffer_format: BB_FORMAT,
+        backbuffer_contents: BackbufferContents::Undefined,
         depth_texture: depth(),
         depth_size: BB_SIZE,
         depth_has_stencil: false,
@@ -1445,6 +1505,7 @@ fn rule_a_reset_frame_re_arms_stencil_dontcare() {
         backbuffer_sample_count: 1,
         backbuffer_size: BB_SIZE,
         backbuffer_format: BB_FORMAT,
+        backbuffer_contents: BackbufferContents::Undefined,
         depth_texture: depth(),
         depth_size: BB_SIZE,
         depth_has_stencil: true,
@@ -3591,6 +3652,7 @@ fn colour_reuse_after_sample(retire: bool, bind: Command) -> StoreAction {
         backbuffer_sample_count: 1,
         backbuffer_size: BB_SIZE,
         backbuffer_format: BB_FORMAT,
+        backbuffer_contents: BackbufferContents::Undefined,
         depth_texture: depth(),
         depth_size: BB_SIZE,
         depth_has_stencil: false,
@@ -3725,6 +3787,7 @@ fn a_replaced_backbuffer_view_retires_the_old_registration() {
         backbuffer_sample_count: 1,
         backbuffer_size: BB_SIZE,
         backbuffer_format: BB_FORMAT,
+        backbuffer_contents: BackbufferContents::Undefined,
         depth_texture: depth(),
         depth_size: BB_SIZE,
         depth_has_stencil: false,
@@ -4399,6 +4462,7 @@ fn blit_written_set_resets_with_the_frame() {
         backbuffer_sample_count: 1,
         backbuffer_size: BB_SIZE,
         backbuffer_format: BB_FORMAT,
+        backbuffer_contents: BackbufferContents::Undefined,
         depth_texture: depth(),
         depth_size: BB_SIZE,
         depth_has_stencil: false,
@@ -4430,6 +4494,7 @@ fn blit_written_set_survives_a_mid_frame_flush() {
         backbuffer_sample_count: 1,
         backbuffer_size: BB_SIZE,
         backbuffer_format: BB_FORMAT,
+        backbuffer_contents: BackbufferContents::Undefined,
         depth_texture: depth(),
         depth_size: BB_SIZE,
         depth_has_stencil: false,
@@ -4578,6 +4643,7 @@ fn continuation_loads_targets_drawn_before_the_flush() {
         backbuffer_sample_count: 1,
         backbuffer_size: BB_SIZE,
         backbuffer_format: BB_FORMAT,
+        backbuffer_contents: BackbufferContents::Undefined,
         depth_texture: depth(),
         depth_size: BB_SIZE,
         depth_has_stencil: false,
@@ -4613,6 +4679,7 @@ fn a_real_present_still_dontcares_first_use() {
         backbuffer_sample_count: 1,
         backbuffer_size: BB_SIZE,
         backbuffer_format: BB_FORMAT,
+        backbuffer_contents: BackbufferContents::Undefined,
         depth_texture: depth(),
         depth_size: BB_SIZE,
         depth_has_stencil: false,
@@ -4650,6 +4717,7 @@ fn a_clear_after_a_flush_folds_instead_of_a_scissored_quad() {
         backbuffer_sample_count: 1,
         backbuffer_size: BB_SIZE,
         backbuffer_format: BB_FORMAT,
+        backbuffer_contents: BackbufferContents::Undefined,
         depth_texture: depth(),
         depth_size: BB_SIZE,
         depth_has_stencil: false,
@@ -4836,6 +4904,7 @@ fn srgb_twin_bind_marks_the_base_texture_sampled() {
             backbuffer_sample_count: 1,
             backbuffer_size: BB_SIZE,
             backbuffer_format: BB_FORMAT,
+            backbuffer_contents: BackbufferContents::Undefined,
             depth_texture: depth(),
             depth_size: BB_SIZE,
             depth_has_stencil: false,
@@ -5038,6 +5107,7 @@ fn replacing_the_backbuffer_forgets_the_retired_twin() {
         backbuffer_sample_count: 1,
         backbuffer_size: BB_SIZE,
         backbuffer_format: BB_FORMAT,
+        backbuffer_contents: BackbufferContents::Undefined,
         depth_texture: depth(),
         depth_size: BB_SIZE,
         depth_has_stencil: false,
@@ -5163,6 +5233,7 @@ fn fresh_multisampled() -> PassState {
         backbuffer_sample_count: 4,
         backbuffer_size: BB_SIZE,
         backbuffer_format: BB_FORMAT,
+        backbuffer_contents: BackbufferContents::Undefined,
         depth_texture: depth(),
         depth_size: BB_SIZE,
         depth_has_stencil: false,

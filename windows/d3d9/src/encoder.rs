@@ -29,9 +29,9 @@ use mtld3d_core::{
     ids::{BufferId, DepthStencilKey, ProgramId, SamplerKey, TextureId},
     page_box::{PageBox, PageBoxRead},
     passes::{
-        ColorClearOutcome, ColorLoad, DepthClearOutcome, DepthLoad, ExtraColorSlot, LastBoundCache,
-        Pass, PassState, SnapshotBytesCache, StencilClearOutcome, StencilLoad,
-        StoreAction as PassStoreAction, UploadPassTarget,
+        BackbufferContents, ColorClearOutcome, ColorLoad, DepthClearOutcome, DepthLoad,
+        ExtraColorSlot, LastBoundCache, Pass, PassState, SnapshotBytesCache, StencilClearOutcome,
+        StencilLoad, StoreAction as PassStoreAction, UploadPassTarget,
     },
     perf::{
         CacheSizes, EncoderPerfState, FramePerfPayload, FrameSummaryContext, OpSub, OpSubDetail,
@@ -2491,6 +2491,7 @@ impl FrameEncoder {
                 backbuffer_sample_count: frame.backbuffer_sample_count,
                 backbuffer_size: (frame.backbuffer_width, frame.backbuffer_height),
                 backbuffer_format: frame.backbuffer_format,
+                backbuffer_contents: frame.backbuffer_contents,
                 depth_texture: frame.depth_texture,
                 // The frame's default depth attachment is created at the
                 // rasterized back-buffer size so it matches the colour one
@@ -9054,6 +9055,8 @@ pub struct FrameData {
     /// `PassState::reset_frame` so the initial pass's pipeline cache key has
     /// the right format before any `SetRenderTarget`.
     backbuffer_format: PixelFormat,
+    /// Whether the back buffer starts the frame undefined; see `FrameInit`.
+    backbuffer_contents: BackbufferContents,
     depth_texture: MetalHandle<MTLTextureKind>,
     /// Per-frame boolean state (`DEPTH_HAS_STENCIL` / `NO_PRESENT`).
     ///
@@ -9191,6 +9194,11 @@ pub struct FrameInit {
     /// Forwarded to `PassState::reset_frame`, which is the single place the
     /// logical and render coordinate spaces are reconciled.
     pub render_scale: RenderScale,
+    /// Whether the back buffer starts each frame undefined, from the swap effect.
+    ///
+    /// Forwarded to `PassState::reset_frame`: Rule A discards the back buffer
+    /// on first use only under `D3DSWAPEFFECT_DISCARD`.
+    pub backbuffer_contents: BackbufferContents,
     pub depth_texture: MetalHandle<MTLTextureKind>,
     /// `true` when the frame's default depth attachment is a combined depth+stencil format.
     ///
@@ -9219,6 +9227,7 @@ impl FrameData {
             backbuffer_height: init.backbuffer_height,
             backbuffer_format: init.backbuffer_format,
             render_scale: init.render_scale,
+            backbuffer_contents: init.backbuffer_contents,
             depth_texture: init.depth_texture,
             flags: if init.depth_has_stencil {
                 FrameDataFlags::DEPTH_HAS_STENCIL
