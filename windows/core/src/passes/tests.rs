@@ -3920,6 +3920,33 @@ fn take_and_restore_round_trip_the_binding_set() {
     assert_eq!(s.current_depth_texture(), depth());
 }
 
+/// A clear pending when the extras are taken lands on every target it was issued against.
+///
+/// `Clear` with no pass open stashes the clear, then the per-target bracket
+/// takes the binding set because render target 2 is sized differently. The
+/// clear-only pass that flushes out must still carry render target 1.
+#[test]
+fn take_flushes_a_pending_clear_onto_the_bound_extras() {
+    let mut s = fresh();
+    s.set_extra_color_render_target(1, Some(slot(tex(0x3000), BB_SIZE)));
+    s.set_extra_color_render_target(2, Some(slot(tex(0x3001), (64, 64))));
+    assert_eq!(s.extra_present_mask(), 0b001);
+    assert_eq!(s.clear_color(1, 2, 3, 4), ColorClearOutcome::Folded);
+    let saved = s.take_color_attachments();
+    assert!(saved.slot(1).is_some());
+    let pass = s.passes().last().expect("clear-only pass");
+    let clear = ColorLoad::Clear {
+        r: 1,
+        g: 2,
+        b: 3,
+        a: 4,
+    };
+    assert_eq!(pass.color_load(), clear);
+    assert_eq!(pass.extra_color()[0].texture(), tex(0x3000));
+    assert_eq!(pass.extra_color()[0].load(), clear);
+    assert!(!pass.extra_color()[1].is_bound());
+}
+
 #[test]
 fn depth_clear_in_a_multi_target_pass_stays_a_quad() {
     // The depth clear-quad declares the extra targets with an empty

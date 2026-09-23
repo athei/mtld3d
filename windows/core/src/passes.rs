@@ -1997,8 +1997,16 @@ impl PassState {
     ///
     /// Pairs with [`Self::restore_color_attachments`]. Ends the current pass
     /// when extras were bound, since a pass records its attachment set at
-    /// open and the caller is about to bind targets of its own.
+    /// open and the caller is about to bind targets of its own. A pending
+    /// clear flushes first, while the extras it was issued against are
+    /// still bound.
     pub fn take_color_attachments(&mut self) -> SavedColorAttachments {
+        if self.has_extra_color_targets() {
+            if self.pending_color_clear.is_some() {
+                self.flush_pending_clears();
+            }
+            self.end_current_pass("take_color_attachments");
+        }
         let saved = SavedColorAttachments {
             texture: self.current_color_texture,
             msaa_texture: self.current_color_msaa_texture,
@@ -2012,12 +2020,6 @@ impl PassState {
             has_alpha: self.current_color_rt_has_alpha(),
             extra: core::mem::replace(&mut self.current_extra_color, [ExtraColorSlot::NONE; 3]),
         };
-        if saved.extra.iter().any(ExtraColorSlot::is_bound) {
-            if self.pending_color_clear.is_some() {
-                self.flush_pending_clears();
-            }
-            self.end_current_pass("take_color_attachments");
-        }
         self.recompute_extra_present_mask();
         saved
     }
