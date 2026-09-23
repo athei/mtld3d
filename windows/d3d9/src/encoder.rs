@@ -3689,6 +3689,10 @@ impl FrameEncoder {
             self.pass_state
                 .set_depth_stencil_attachment(MetalHandle::NULL, (0, 0), false, false);
             f(self);
+            // A folded clear is still only pending; materialise it while this
+            // target is bound alone and depth is off, or the restore below
+            // lands it on a pass that attaches the device's depth.
+            self.pass_state.flush_pending_clears();
             self.end_current_pass("color_target_clear");
         }
         self.pass_state.set_depth_stencil_attachment_level(
