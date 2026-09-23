@@ -215,7 +215,12 @@ between devices; a native reconciliation owns one attachment and sprite snapshot
 throughout its work. Metal allocation and pixel upload happen outside the mutex.
 
 There is one stationary, borderless, click-through overlay window, one level above
-the followed game window. Its sprite sublayer mirrors the game layer's actual pixel
+the followed game window. It is an AppKit child of that window, so it follows
+native fullscreen Spaces as well as ordinary desktops. Each reconciliation binds
+it to the live attachment's window; device retirement detaches and orders it out.
+AppKit's weak parent reference does not retain a destroyed game window. Cursor
+show/hide still changes only the image, not window ordering. Its sprite sublayer
+mirrors the game layer's actual pixel
 format, colorspace and EDR setting, including handoffs within the same HDR/SDR
 class. A device change rebuilds the command queue and texture cache. Changes to
 sprite geometry, layer configuration, owner or relevant headroom invalidate the
