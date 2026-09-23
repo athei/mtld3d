@@ -4353,6 +4353,46 @@ fn blit_written_set_resets_with_the_frame() {
 }
 
 #[test]
+fn blit_written_set_survives_a_mid_frame_flush() {
+    // A copy into the back buffer and one into the depth surface run as a
+    // trailing blit pass, then a mid-frame flush (a readback). The D3D9 frame
+    // continues, so the continuation's first pass on those attachments must
+    // Load the copies, not open with Rule A's first-use `DontCare`.
+    let rt_src = tex(0x3000);
+    let depth_src = tex(0x4000);
+    let mut s = fresh();
+    s.push_pending_leading_blit(copy_blit(rt_src, backbuffer()));
+    s.push_pending_leading_blit(copy_blit(depth_src, depth()));
+    s.take_pending_leading_blits();
+    s.reset_frame(&FrameReset {
+        backbuffer: backbuffer(),
+        backbuffer_srgb: backbuffer_srgb(),
+        backbuffer_msaa: MetalHandle::NULL,
+        backbuffer_msaa_srgb: MetalHandle::NULL,
+        backbuffer_sample_count: 1,
+        backbuffer_size: BB_SIZE,
+        backbuffer_format: BB_FORMAT,
+        depth_texture: depth(),
+        depth_size: BB_SIZE,
+        depth_has_stencil: false,
+        render_scale: RenderScale::IDENTITY,
+        continues_frame: true,
+    });
+    s.emit_command(dummy_draw());
+    assert_eq!(s.passes()[0].color_texture(), backbuffer());
+    assert_eq!(
+        s.passes()[0].color_load(),
+        ColorLoad::Load,
+        "continuation loads the back buffer a blit wrote before the flush",
+    );
+    assert_eq!(
+        s.passes()[0].depth_load(),
+        DepthLoad::Load,
+        "continuation loads the depth surface a blit wrote before the flush",
+    );
+}
+
+#[test]
 fn rule_e_keeps_a_clear_only_pass_that_carries_leading_blits() {
     // A copy is queued, then Clear(rt_x) goes pending, and SetRT(rt_y)
     // materialises it as a clear-only pass that drains the copy. The later

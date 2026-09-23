@@ -1197,7 +1197,9 @@ pub struct PassState {
     /// it: the blit that wrote the texture may sit in an earlier pass's
     /// leading list, not the one that first attaches the texture, so the
     /// attachment's own `leading_blits` are not enough to know that its
-    /// content is live. Reset each frame in `reset_frame`.
+    /// content is live. Frame-scoped like [`Self::seen_color_rts`]: a mid-frame
+    /// flush keeps it, since the copy stays in VRAM for the continuation, and a
+    /// real `Present` resets it.
     blit_written_rts: FxHashSet<MetalHandle<MTLTextureKind>>,
     /// The swap-chain backbuffer texture for this frame, captured in `reset_frame`.
     ///
@@ -1462,9 +1464,10 @@ impl PassState {
     /// flush (a readback / retention drain, `NO_PRESENT`) rather than a
     /// `Present`. The D3D9 frame the game is drawing did not end there, so the
     /// render targets and depth surface it already wrote keep their content in
-    /// VRAM. The per-frame "seen" sets are kept across the boundary so Rule A
-    /// loads those attachments on their first use in the continuation instead
-    /// of discarding them with `DontCare` (the store side is handled by
+    /// VRAM, and so do the targets a blit copied into. The per-frame "seen" and
+    /// blit-written sets are kept across the boundary so Rule A loads those
+    /// attachments on their first use in the continuation instead of
+    /// discarding them with `DontCare` (the store side is handled by
     /// `finalize_store_actions` skipping Rules B and D on the flush).
     pub fn reset_frame(&mut self, reset: &FrameReset) {
         let &FrameReset {
@@ -1551,20 +1554,21 @@ impl PassState {
         self.pending_depth_clear = None;
         self.pending_stencil_clear = None;
         self.pending_leading_blits.clear();
-        // Keep the frame-scoped seen-rt sets across a mid-frame flush: the D3D9
-        // frame continues, so the targets already drawn keep their VRAM content
-        // and their first use in the continuation must Load, not `DontCare`. On
-        // a real `Present` (`continues_frame` false) the frame ended and every
-        // target starts fresh. The segment-scoped sets always reset: after the
-        // flush every attachment is stored, so a fresh full clear is correct
-        // and must fold rather than paint a scissored quad.
+        // Keep the frame-scoped seen-rt and blit-written sets across a mid-frame
+        // flush: the D3D9 frame continues, so the targets already drawn or
+        // copied into keep their VRAM content and their first use in the
+        // continuation must Load, not `DontCare`. On a real `Present`
+        // (`continues_frame` false) the frame ended and every target starts
+        // fresh. The segment-scoped sets always reset: after the flush every
+        // attachment is stored, so a fresh full clear is correct and must fold
+        // rather than paint a scissored quad.
         if !continues_frame {
             self.seen_color_rts.clear();
             self.seen_depth_rts.clear();
+            self.blit_written_rts.clear();
         }
         self.seen_color_rts_segment.clear();
         self.seen_depth_rts_segment.clear();
-        self.blit_written_rts.clear();
         self.frame_caster_writes.clear();
         self.frame_cascade_samples.clear();
         self.frame_sampled_textures.clear();
