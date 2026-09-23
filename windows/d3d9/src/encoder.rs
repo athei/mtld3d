@@ -3788,9 +3788,12 @@ impl FrameEncoder {
     /// is an sRGB view that converts the clear value itself.
     pub fn clear_color(&mut self, r: u32, g: u32, b: u32, a: u32, srgb_write: bool) {
         self.pass_state.set_srgb_write_enabled(srgb_write);
-        let (r, g, b, a) = self.resolved_clear_rgba(r, g, b, a, srgb_write);
+        let resolved = self.resolved_clear_rgba(r, g, b, a, srgb_write);
         let passes_before = self.pass_state.passes().len();
-        match self.pass_state.clear_color(r, g, b, a) {
+        match self
+            .pass_state
+            .clear_color(resolved.0, resolved.1, resolved.2, resolved.3)
+        {
             ColorClearOutcome::Folded => {}
             ColorClearOutcome::EmitQuad {
                 rgba,
@@ -3802,9 +3805,14 @@ impl FrameEncoder {
             }
         }
         // A target bound outside the pass (sized unlike target 0) is owed the
-        // clear too; neither the fold nor the quad above reached it.
+        // clear too; neither the fold nor the quad above reached it. It takes
+        // the caller's value, resolved again for its own attachment, and the
+        // viewport over its own extent, which a covering viewport on target 0
+        // need not cover.
         if self.pass_state.has_extra_color_targets_outside_pass() {
-            self.clear_targets_outside_pass(|enc| enc.clear_color(r, g, b, a, srgb_write));
+            self.clear_targets_outside_pass(|enc| {
+                enc.clear_color_bounded_to_viewport(r, g, b, a, srgb_write);
+            });
         }
     }
 
