@@ -4864,7 +4864,6 @@ fn pass_reads_texture(
     if target_handle.is_null() {
         return false;
     }
-    let target_raw = target_handle.raw();
     let sampler_reads = pass.commands.iter().any(|command| {
         let Some(texture) = command_sampled_texture(command) else {
             return false;
@@ -4880,28 +4879,10 @@ fn pass_reads_texture(
         return true;
     }
     pass.leading_blits.iter().any(|b| {
-        blit_read_texture(b) == Some(target_handle)
-            || (BlitCommandType::from_repr(b.cmd) == Some(BlitCommandType::GenerateMipmaps)
-                && b.dst_handle == target_raw)
+        blit_read_texture(b).is_some_and(|texture| {
+            texture == target_handle || texture_view_to_base.get(&texture) == Some(&target_handle)
+        })
     })
-}
-
-/// The texture a blit reads, if it reads one.
-///
-/// A texture-to-texture copy and a depth transfer both read their source from
-/// device memory after every pass recorded before them, so the source's
-/// content has to be there when the blit runs.
-const fn blit_read_texture(blit: &BlitCommand) -> Option<MetalHandle<MTLTextureKind>> {
-    let reads_texture = matches!(
-        BlitCommandType::from_repr(blit.cmd),
-        Some(BlitCommandType::CopyTextureToTexture | BlitCommandType::TransferDepth)
-    );
-    if !reads_texture || blit.src_handle == 0 {
-        return None;
-    }
-    // SAFETY: both commands carry a non-null MTLTexture handle in
-    // `src_handle`, packed from the encoder's typed cache via `.raw()`.
-    Some(unsafe { MetalHandle::<MTLTextureKind>::new(blit.src_handle) })
 }
 
 /// Return the texture view a real sampler bind reads.
@@ -4994,6 +4975,36 @@ const fn blit_written_texture(blit: &BlitCommand) -> Option<MetalHandle<MTLTextu
     // SAFETY: a texture-writing blit carries a non-null MTLTexture handle in
     // `dst_handle`, packed from the encoder's typed cache via `.raw()`.
     Some(unsafe { MetalHandle::<MTLTextureKind>::new(blit.dst_handle) })
+}
+
+/// The texture a blit reads, if it reads one.
+///
+/// A texture copy and a depth transfer read their source; mipmap generation
+/// reads level 0 of the texture it writes. The buffer-sourced variants read
+/// no texture. An unknown variant on the wire carries no known source and is
+/// treated as reading none. The exhaustive match makes any new
+/// `BlitCommandType` a compile error here, forcing the author to classify it.
+const fn blit_read_texture(blit: &BlitCommand) -> Option<MetalHandle<MTLTextureKind>> {
+    let handle = match BlitCommandType::from_repr(blit.cmd) {
+        Some(BlitCommandType::CopyTextureToTexture | BlitCommandType::TransferDepth) => {
+            blit.src_handle
+        }
+        Some(BlitCommandType::GenerateMipmaps) => blit.dst_handle,
+        Some(
+            BlitCommandType::CopyBufferToTexture
+            | BlitCommandType::CopyBufferToDepth
+            | BlitCommandType::CopyBufferToStencil
+            | BlitCommandType::CopyBufferToBuffer
+            | BlitCommandType::NotifyBufferDidModifyRange,
+        )
+        | None => 0,
+    };
+    if handle == 0 {
+        return None;
+    }
+    // SAFETY: a texture-reading blit carries a non-null MTLTexture handle in
+    // the field chosen above, packed from the encoder's typed cache via `.raw()`.
+    Some(unsafe { MetalHandle::<MTLTextureKind>::new(handle) })
 }
 
 /// True if any blit in `blits` writes to texture `target_handle`.

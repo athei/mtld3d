@@ -4509,6 +4509,34 @@ fn rule_e_aborts_when_an_intervening_blit_writes_the_target() {
     assert_eq!(s.passes()[2].color_load(), ColorLoad::Load);
 }
 
+#[test]
+fn rule_e_aborts_when_the_target_passes_depth_transfer_reads_the_depth() {
+    // Clear(ZBUFFER) with no draw materialises as a clear-only pass, then a
+    // RESZ-style depth transfer reads that depth into another texture as a
+    // leading blit of the next pass on the same depth. The blit runs before
+    // that pass's load action, so folding the clear into it would hand the
+    // transfer the pre-clear depth.
+    let resolved = tex(0x9000);
+    let mut s = fresh();
+    s.clear_depth(f32::to_bits(1.0));
+    s.flush_pending_clears();
+    let mut transfer = copy_blit(depth(), resolved);
+    transfer.cmd = BlitCommandType::TransferDepth as u32;
+    s.push_pending_leading_blit(transfer);
+    s.emit_command(dummy_draw());
+    s.end_current_pass("test");
+    assert_eq!(s.passes().len(), 2);
+    assert_eq!(s.passes()[1].leading_blits().len(), 1);
+    assert_eq!(s.passes()[1].depth_load(), DepthLoad::Load);
+    s.coalesce_clear_only_passes();
+    assert_eq!(s.passes().len(), 2, "the clear stays ahead of the transfer");
+    assert!(matches!(
+        s.passes()[0].depth_load(),
+        DepthLoad::Clear { .. }
+    ));
+    assert_eq!(s.passes()[1].depth_load(), DepthLoad::Load);
+}
+
 // ── B3: a mid-frame flush is not a frame end ─────────────────
 
 #[test]
