@@ -36,6 +36,11 @@ struct ClearMerge {
     /// A merge target must carry exactly this set, slot for slot.
     extra: [(MetalHandle<MTLTextureKind>, u32); 3],
     depth: MetalHandle<MTLTextureKind>,
+    /// Mip level of `depth` the clear lands on.
+    ///
+    /// A merge target must render into the same level: a pass on another
+    /// level of the texture neither takes the clear nor consumes it.
+    depth_level: u32,
     needs_color: bool,
     needs_depth: bool,
     needs_stencil: bool,
@@ -4375,6 +4380,7 @@ impl PassState {
             let target_extra: [(MetalHandle<MTLTextureKind>, u32); 3] =
                 core::array::from_fn(|k| (p.extra_color[k].texture, p.extra_color[k].subresource));
             let target_depth = p.depth_texture;
+            let target_depth_level = p.depth_level;
             let color_load = p.color_load;
             let extra_loads: [ColorLoad; 3] = core::array::from_fn(|k| p.extra_color[k].load);
             let depth_load = p.depth_load;
@@ -4392,6 +4398,7 @@ impl PassState {
                     color_subresource: target_color_subresource,
                     extra: target_extra,
                     depth: target_depth,
+                    depth_level: target_depth_level,
                     needs_color,
                     needs_depth,
                     needs_stencil,
@@ -4444,10 +4451,14 @@ impl PassState {
             color_subresource: target_color_subresource,
             extra: target_extra,
             depth: target_depth,
+            depth_level: target_depth_level,
             needs_color,
             needs_depth,
             needs_stencil,
         } = *want;
+        let attaches_target_depth = |cand: &Pass| {
+            cand.depth_texture == target_depth && cand.depth_level == target_depth_level
+        };
         for j in (start + 1)..self.passes.len() {
             let cand = &self.passes[j];
             // Intervening read on a side we care about kills the merge.
@@ -4529,13 +4540,13 @@ impl PassState {
                 return None;
             }
             if needs_depth
-                && cand.depth_texture == target_depth
+                && attaches_target_depth(cand)
                 && matches!(cand.depth_load, DepthLoad::Clear { .. })
             {
                 return None;
             }
             if needs_stencil
-                && cand.depth_texture == target_depth
+                && attaches_target_depth(cand)
                 && matches!(cand.stencil_load, StencilLoad::Clear { .. })
             {
                 return None;
@@ -4548,14 +4559,12 @@ impl PassState {
                     && cand.color_subresource == target_color_subresource
                     && matches!(cand.color_load, ColorLoad::Load));
             let depth_ok = !needs_depth
-                || (cand.depth_texture == target_depth
-                    && matches!(cand.depth_load, DepthLoad::Load));
+                || (attaches_target_depth(cand) && matches!(cand.depth_load, DepthLoad::Load));
             // A `DontCare` candidate cannot occur here: the clear-only pass
             // was this texture's first use of the frame, so every later pass
             // on it opened with `Load` or its own `Clear`.
             let stencil_ok = !needs_stencil
-                || (cand.depth_texture == target_depth
-                    && matches!(cand.stencil_load, StencilLoad::Load));
+                || (attaches_target_depth(cand) && matches!(cand.stencil_load, StencilLoad::Load));
             if color_ok && depth_ok && stencil_ok {
                 return Some(j);
             }
@@ -4578,10 +4587,10 @@ impl PassState {
                     .chain(target_extra)
                     .any(|(tex, sub)| pass_attaches_color(cand, tex, sub));
             let consumes_depth = needs_depth
-                && cand.depth_texture == target_depth
+                && attaches_target_depth(cand)
                 && matches!(cand.depth_load, DepthLoad::Load);
             let consumes_stencil = needs_stencil
-                && cand.depth_texture == target_depth
+                && attaches_target_depth(cand)
                 && matches!(cand.stencil_load, StencilLoad::Load);
             if consumes_color || consumes_depth || consumes_stencil {
                 return None;

@@ -2314,6 +2314,64 @@ fn rule_e_carries_the_stencil_clear_into_the_merge_target() {
     );
 }
 
+/// A depth clear on one mip level never folds into a pass on another level.
+#[test]
+fn rule_e_keeps_a_depth_clear_off_another_level_of_the_same_texture() {
+    let ds = tex(0x3300);
+    let half = (BB_SIZE.0 / 2, BB_SIZE.1 / 2);
+    let mut s = fresh();
+    s.set_depth_stencil_attachment_level(ds, 0, BB_SIZE, false, true);
+    s.clear_depth(f32::to_bits(0.5));
+    s.clear_stencil(0x2A);
+    // Rebinding to level 1 materialises the clear-only pass on level 0.
+    s.set_depth_stencil_attachment_level(ds, 1, half, false, true);
+    s.emit_command(dummy_draw());
+    s.end_current_pass("test");
+    s.coalesce_clear_only_passes();
+
+    let passes = s.passes();
+    assert_eq!(passes.len(), 2, "the level 0 clear-only pass stands");
+    assert_eq!(passes[0].depth_level(), 0);
+    assert_eq!(
+        passes[0].depth_load(),
+        DepthLoad::Clear {
+            value: f32::to_bits(0.5)
+        }
+    );
+    assert_eq!(passes[0].stencil_load(), StencilLoad::Clear { value: 0x2A });
+    assert_eq!(passes[1].depth_level(), 1);
+    assert_eq!(passes[1].depth_load(), DepthLoad::Load);
+    assert_eq!(passes[1].stencil_load(), StencilLoad::Load);
+}
+
+/// A pass on another mip level is not a consumer, so the clear folds past it.
+#[test]
+fn rule_e_folds_a_depth_clear_past_another_level_into_its_own_level() {
+    let ds = tex(0x3300);
+    let half = (BB_SIZE.0 / 2, BB_SIZE.1 / 2);
+    let mut s = fresh();
+    s.set_depth_stencil_attachment_level(ds, 0, BB_SIZE, false, false);
+    s.clear_depth(f32::to_bits(0.5));
+    s.set_depth_stencil_attachment_level(ds, 1, half, false, false);
+    s.emit_command(dummy_draw());
+    s.set_depth_stencil_attachment_level(ds, 0, BB_SIZE, false, false);
+    s.emit_command(dummy_draw());
+    s.end_current_pass("test");
+    s.coalesce_clear_only_passes();
+
+    let passes = s.passes();
+    assert_eq!(passes.len(), 2, "the clear-only pass folds away");
+    assert_eq!(passes[0].depth_level(), 1);
+    assert_eq!(passes[0].depth_load(), DepthLoad::Load);
+    assert_eq!(passes[1].depth_level(), 0);
+    assert_eq!(
+        passes[1].depth_load(),
+        DepthLoad::Clear {
+            value: f32::to_bits(0.5)
+        }
+    );
+}
+
 #[test]
 fn rule_e_aborts_when_intervening_pass_samples_target() {
     for (stage, bind) in sampler_binds(0x4000) {
