@@ -2894,6 +2894,205 @@ fn rule_h_strips_color_and_clear_quad_when_only_zero_mask_draws_plus_clear_quad(
     );
 }
 
+// ── Draw-state replay: the submit-time rules must leave the encoder state
+// ── every surviving draw sees exactly as it was recorded.
+
+#[cfg(debug_assertions)]
+const PSO_TILE_COLOR_CLEAR: u64 = 0xCAFE_BABE;
+#[cfg(debug_assertions)]
+const PSO_TILE_DEPTH_CLEAR: u64 = 0xCCCC_3333;
+#[cfg(debug_assertions)]
+const DSS_INERT: u64 = 0xD000;
+#[cfg(debug_assertions)]
+const DSS_DEPTH_CLEAR: u64 = 0xD001;
+#[cfg(debug_assertions)]
+const DSS_CASTER: u64 = 0xD002;
+#[cfg(debug_assertions)]
+const CASCADE_TILES: [(u32, u32, u32, u32); 2] = [(0, 0, 256, 256), (256, 0, 256, 256)];
+
+/// Where a colour clear-quad binds the depth-stencil, scissor and cull state.
+#[cfg(debug_assertions)]
+enum ClearQuadStateOrder {
+    /// Inside the block Rule H drains with the colour attachment.
+    InsideBlock,
+    /// Ahead of the block, so the state survives the drain.
+    BeforeBlock,
+}
+
+/// Bind depth-stencil state, scissor and cull mode through the dedup cache, as the encoder does.
+#[cfg(debug_assertions)]
+fn bind_quad_state(
+    s: &mut PassState,
+    cache: &mut LastBoundCache,
+    depth_stencil: u64,
+    rect: (u32, u32, u32, u32),
+    cull: CullMode,
+) {
+    if cache.depth_stencil_changed(depth_stencil) {
+        s.emit_command(Command::set_depth_stencil_state(depth_stencil));
+    }
+    if cache.scissor_rect_changed(rect) {
+        s.emit_command(Command::set_scissor_rect(rect.0, rect.1, rect.2, rect.3));
+    }
+    if cache.cull_mode_changed(cull) {
+        s.emit_command(Command::set_cull_mode(cull));
+    }
+}
+
+/// Bind `pipeline` through the dedup cache.
+#[cfg(debug_assertions)]
+fn bind_pipeline(s: &mut PassState, cache: &mut LastBoundCache, pipeline: u64) {
+    if cache.pipeline_changed(pipeline) {
+        s.emit_command(set_pso(pipeline));
+    }
+}
+
+/// Record shadow-cascade tiles into one atlas pass the way `FrameEncoder` emits them.
+///
+/// Per tile: `SetViewport(tile)`, then `Clear(TARGET | ZBUFFER)` as a colour
+/// clear-quad followed by a depth clear-quad, then a caster draw under
+/// cull-back. Every state change goes through a real `LastBoundCache`, so the
+/// depth quad re-binds neither the scissor nor the cull mode the colour quad
+/// just bound.
+#[cfg(debug_assertions)]
+fn record_cascade_tiles(order: &ClearQuadStateOrder, caster_mask: u32) -> PassState {
+    let mut s = fresh();
+    s.set_color_render_target(tex(0x3000), 512, 256, RT_FORMAT, RenderScale::IDENTITY);
+    let mut cache = LastBoundCache::new();
+    for tile in CASCADE_TILES {
+        s.set_viewport(tile.0, tile.1, tile.2, tile.3, 0.0, 1.0);
+        if matches!(order, ClearQuadStateOrder::BeforeBlock) {
+            bind_quad_state(&mut s, &mut cache, DSS_INERT, tile, CullMode::None);
+        }
+        let start = s.open_color_clear_quad_block();
+        bind_pipeline(&mut s, &mut cache, PSO_TILE_COLOR_CLEAR);
+        if matches!(order, ClearQuadStateOrder::InsideBlock) {
+            bind_quad_state(&mut s, &mut cache, DSS_INERT, tile, CullMode::None);
+        }
+        s.emit_command(Command::set_vertex_bytes_at(0x5000, 4, 0));
+        cache.invalidate_vertex_buffer();
+        s.emit_command(Command::set_fragment_bytes_at(0x5100, 16, 0));
+        s.emit_command(dummy_draw());
+        s.close_color_clear_quad_block(start);
+
+        bind_pipeline(&mut s, &mut cache, PSO_TILE_DEPTH_CLEAR);
+        bind_quad_state(&mut s, &mut cache, DSS_DEPTH_CLEAR, tile, CullMode::None);
+        s.emit_command(Command::set_vertex_bytes_at(0x5200, 4, 0));
+        cache.invalidate_vertex_buffer();
+        s.emit_command(dummy_draw());
+
+        s.note_draw_color_write_mask(caster_mask);
+        bind_pipeline(&mut s, &mut cache, PSO_WITH);
+        bind_quad_state(&mut s, &mut cache, DSS_CASTER, tile, CullMode::Back);
+        if cache.vertex_buffer_changed(0, 0x7000, 0, 1) != VertexBufferBind::Same {
+            s.emit_command(Command::set_vertex_buffer(0x7000, 0, 0));
+        }
+        s.emit_command(dummy_draw());
+    }
+    s.end_current_pass("test");
+    s
+}
+
+/// The side map for the cascade pass: the caster's no-colour sibling, the depth quad itself.
+#[cfg(debug_assertions)]
+fn cascade_alt() -> FxHashMap<u64, MetalHandle<MTLRenderPipelineStateKind>> {
+    let mut alt = FxHashMap::default();
+    alt.insert(PSO_WITH, pso(PSO_NO_COLOR));
+    alt.insert(PSO_TILE_DEPTH_CLEAR, pso(PSO_TILE_DEPTH_CLEAR));
+    alt
+}
+
+/// The scissor and raw cull mode a draw runs with; `None` while no cull mode is bound.
+#[cfg(debug_assertions)]
+#[derive(Debug, PartialEq, Eq)]
+struct QuadDrawState {
+    scissor: (u32, u32, u32, u32),
+    cull: Option<u32>,
+}
+
+/// The state each depth clear-quad draw of `pass` runs with.
+#[cfg(debug_assertions)]
+fn depth_clear_draw_state(pass: &Pass) -> Vec<QuadDrawState> {
+    let mut pipeline = 0;
+    let mut scissor = (0, 0, 0, 0);
+    let mut cull = None;
+    let mut seen = Vec::new();
+    for cmd in pass.commands() {
+        if cmd.cmd == CommandType::SetRenderPipelineState as u32 {
+            pipeline = cmd.param_b;
+        } else if cmd.cmd == CommandType::SetScissorRect as u32 {
+            scissor = unpack_scissor(cmd);
+        } else if cmd.cmd == CommandType::SetCullMode as u32 {
+            cull = Some(cmd.param_a);
+        } else if cmd.is_draw() && pipeline == PSO_TILE_DEPTH_CLEAR {
+            seen.push(QuadDrawState { scissor, cull });
+        }
+    }
+    seen
+}
+
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "pass rules changed the cull mode a surviving draw sees")]
+fn draw_state_check_catches_state_a_drained_clear_quad_bound() {
+    // The colour clear-quad binds cull mode and scissor inside its block;
+    // Rule H drains the block, and the depth quad that deduplicated against
+    // them runs with the previous tile's cull-back and scissor instead.
+    let mut s = record_cascade_tiles(&ClearQuadStateOrder::InsideBlock, 0);
+    let before = s.debug_record_draw_states();
+    let alt = cascade_alt();
+    s.strip_color_from_no_color_draw_passes(&alt);
+    s.debug_assert_draw_states_preserved(&before, &alt);
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn rule_h_keeps_the_state_a_clear_quad_binds_ahead_of_its_block() {
+    let mut s = record_cascade_tiles(&ClearQuadStateOrder::BeforeBlock, 0);
+    let before = s.debug_record_draw_states();
+    let alt = cascade_alt();
+    s.strip_color_from_no_color_draw_passes(&alt);
+    let pass = &s.passes()[0];
+    assert_eq!(pass.color_texture(), MetalHandle::NULL, "colour stripped");
+    assert!(pass.color_clear_quad_ranges().is_empty(), "blocks drained");
+    s.debug_assert_draw_states_preserved(&before, &alt);
+    // Each tile's depth clear-quad runs unculled under its own tile's scissor.
+    let tile_state = |scissor| QuadDrawState {
+        scissor,
+        cull: Some(CullMode::None as u32),
+    };
+    assert_eq!(
+        depth_clear_draw_state(&s.passes()[0]),
+        vec![tile_state(CASCADE_TILES[0]), tile_state(CASCADE_TILES[1])],
+    );
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn draw_state_check_is_quiet_when_no_rule_drops_a_block() {
+    // A caster that writes colour keeps the attachment and the blocks, so
+    // nothing the depth quads inherited goes away, whatever the order.
+    let mut s = record_cascade_tiles(&ClearQuadStateOrder::InsideBlock, 0xF);
+    let before = s.debug_record_draw_states();
+    let alt = cascade_alt();
+    s.strip_color_from_no_color_draw_passes(&alt);
+    assert_eq!(s.passes()[0].color_clear_quad_ranges().len(), 2);
+    s.debug_assert_draw_states_preserved(&before, &alt);
+}
+
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "pass rules changed the pipeline a surviving draw sees")]
+fn draw_state_check_catches_a_pipeline_rewrite_outside_the_side_map() {
+    let mut s = record_cascade_tiles(&ClearQuadStateOrder::BeforeBlock, 0);
+    let before = s.debug_record_draw_states();
+    s.strip_color_from_no_color_draw_passes(&cascade_alt());
+    // Checked against a side map that never named the caster's sibling.
+    let mut other = FxHashMap::default();
+    other.insert(PSO_TILE_DEPTH_CLEAR, pso(PSO_TILE_DEPTH_CLEAR));
+    s.debug_assert_draw_states_preserved(&before, &other);
+}
+
 #[test]
 fn rule_h_keeps_color_clear_quad_when_real_color_writing_draw_present() {
     const PSO_CLEAR_QUAD_COLOR: u64 = 0xCAFE_BABE;

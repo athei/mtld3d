@@ -18,6 +18,12 @@ use crate::{
     dirty_range::DirtyRange, pipeline_state::ExtraColorAttachments, render_scale::RenderScale,
 };
 
+#[cfg(debug_assertions)]
+mod draw_state;
+
+#[cfg(debug_assertions)]
+pub use draw_state::DrawStateLedger;
+
 /// What a clear-only pass carries, and the attachments it must land on.
 struct ClearMerge {
     color: MetalHandle<MTLTextureKind>,

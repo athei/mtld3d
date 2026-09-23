@@ -4955,18 +4955,18 @@ impl FrameEncoder {
         viewport: (u32, u32, u32, u32),
         color_format: PixelFormat,
     ) {
-        // Bracket the emitted commands in a color-clear-quad block so
-        // Rule H can tell synthetic clear-quad writes apart from real
-        // color-writing draws. When every other draw in the pass has
-        // `COLORWRITEENABLE == 0`, Rule H strips the color attachment
-        // AND drains this block — both are dead work once the
-        // attachment is gone (the clear-quad pipeline declares a
-        // color output and would otherwise fail Metal's pipeline-vs-RP
-        // format validation against the depth-only descriptor).
-        // Keep this state change outside the removable block: a later solid
-        // draw can reuse it even when Rule H drops the color clear itself.
+        // The pipeline bind, the inline arguments and the draw go in a
+        // color-clear-quad block so Rule H can tell synthetic clear-quad
+        // writes apart from real color-writing draws. When every other draw
+        // in the pass has `COLORWRITEENABLE == 0`, Rule H strips the color
+        // attachment AND drains this block: both are dead work once the
+        // attachment is gone (the clear-quad pipeline declares a color
+        // output and would otherwise fail Metal's pipeline-vs-RP format
+        // validation against the depth-only descriptor).
+        // Every state change the dedup cache records stays outside the
+        // block: a later command that skips re-binding a matching value
+        // relies on it still being bound after Rule H drops the block.
         self.emit_triangle_fill_mode(TriangleFillMode::Fill);
-        let block_start = self.pass_state.open_color_clear_quad_block();
         // A color clear-quad must declare a depth attachment ONLY when the live
         // pass has one. On a no-depth pass (an explicit
         // `SetDepthStencilSurface(NULL)`, or a depth surface the pass drops
@@ -4993,10 +4993,6 @@ impl FrameEncoder {
         };
         let pipeline = self.get_or_create_clear_quad_pipeline(key);
         if pipeline == 0 {
-            // Open/close pair must be balanced even on the legacy
-            // fallback path so a future `emit_clear_quad_color_inner`
-            // doesn't see a stale start offset on the same pass.
-            self.pass_state.close_color_clear_quad_block(block_start);
             self.pass_state
                 .clear_color_legacy_break(rgba.0, rgba.1, rgba.2, rgba.3);
             return;
@@ -5028,10 +5024,6 @@ impl FrameEncoder {
         let z_ptr = self.scratch.alloc(&z_bytes);
         let rgba_ptr = self.scratch.alloc(&rgba_bytes);
         let (vx, vy, vw, vh) = viewport;
-        if self.last_bound.pipeline_changed(pipeline) {
-            self.pass_state
-                .emit_command(Command::set_render_pipeline_state(pipeline));
-        }
         if self.last_bound.depth_stencil_changed(depth_state) {
             self.pass_state
                 .emit_command(Command::set_depth_stencil_state(depth_state));
@@ -5045,6 +5037,14 @@ impl FrameEncoder {
         if self.last_bound.cull_mode_changed(CullMode::None) {
             self.pass_state
                 .emit_command(Command::set_cull_mode(CullMode::None));
+        }
+        let block_start = self.pass_state.open_color_clear_quad_block();
+        // The pipeline declares a color output, so it goes with the block.
+        // Once Rule H drains it the cache still names this pipeline, which
+        // only makes the next draw re-bind its own.
+        if self.last_bound.pipeline_changed(pipeline) {
+            self.pass_state
+                .emit_command(Command::set_render_pipeline_state(pipeline));
         }
         self.pass_state
             .emit_command(Command::set_vertex_bytes_at(z_ptr, F32_BYTE_LEN, 0));
@@ -10094,7 +10094,15 @@ fn finalize_submit(enc: &mut FrameEncoder, frame: &FrameData) -> (SubmitFramePar
         .iter()
         .map(|pass| pass.commands().as_ptr())
         .collect();
+    // The record-time cache check cannot see commands the rules drop or
+    // rewrite; replay every pass around them and compare what each
+    // surviving draw sees.
+    #[cfg(debug_assertions)]
+    let draw_states = enc.pass_state.debug_record_draw_states();
     apply_pass_rules(enc, no_present);
+    #[cfg(debug_assertions)]
+    enc.pass_state
+        .debug_assert_draw_states_preserved(&draw_states, &enc.no_color_pipeline_alt);
     // Upload passes contain draws and must survive every load/store rule
     // at their original prefix positions.
     #[cfg(debug_assertions)]
