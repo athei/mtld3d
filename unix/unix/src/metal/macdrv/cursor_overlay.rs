@@ -90,7 +90,7 @@ use objc2_app_kit::{
     NSApplication, NSApplicationDidBecomeActiveNotification,
     NSApplicationDidResignActiveNotification, NSBackingStoreType, NSBitmapImageRep, NSColor,
     NSCursor, NSDeviceRGBColorSpace, NSEvent, NSImage, NSScreen, NSView, NSWindow,
-    NSWindowAnimationBehavior, NSWindowCollectionBehavior, NSWindowStyleMask,
+    NSWindowAnimationBehavior, NSWindowCollectionBehavior, NSWindowOrderingMode, NSWindowStyleMask,
 };
 use objc2_core_foundation::{
     CFRetained, CFRunLoop, CFRunLoopActivity, CFRunLoopObserver, CGPoint, CGRect, CGSize,
@@ -851,11 +851,10 @@ impl Overlay {
         window.setIgnoresMouseEvents(true);
         window.setHasShadow(false);
         window.setAnimationBehavior(NSWindowAnimationBehavior::None);
-        // On every Space: the overlay is never ordered in or out, so it must
-        // be wherever the game window is moved to.
+        // The parent relationship follows the game's Space, including native
+        // fullscreen Spaces created after this process-lifetime overlay.
         window.setCollectionBehavior(
-            NSWindowCollectionBehavior::CanJoinAllSpaces
-                | NSWindowCollectionBehavior::Transient
+            NSWindowCollectionBehavior::Transient
                 | NSWindowCollectionBehavior::IgnoresCycle
                 | NSWindowCollectionBehavior::FullScreenAuxiliary,
         );
@@ -874,7 +873,6 @@ impl Overlay {
         view.setLayer(Some(&host));
         view.setWantsLayer(true);
         window.setContentView(Some(&view));
-        window.orderFrontRegardless();
 
         info!(
             target: LOG_TARGET,
@@ -905,6 +903,7 @@ impl Overlay {
         active: bool,
         hit: Option<&PointerHit>,
     ) -> bool {
+        self.follow_window(mtm, wanted);
         if !same_owner(self.owner.as_ref(), wanted.owner.as_ref()) {
             self.content.invalidate();
             self.pending = None;
@@ -923,6 +922,42 @@ impl Overlay {
         }
         self.sync_position(mtm, wanted, active, hit);
         self.content.completed()
+    }
+
+    /// Keep the overlay attached to the live game window across device replacement.
+    ///
+    /// Joining all ordinary Spaces does not join a newly created fullscreen
+    /// Space. `AppKit` carries child windows with their parent. Its parent
+    /// reference is weak, so this relationship cannot retain a destroyed game
+    /// window. Detaching a device removes the child before its next owner arrives.
+    fn follow_window(&self, mtm: MainThreadMarker, wanted: &WantedSnapshot) {
+        let window = wanted
+            .owner
+            .as_ref()
+            .and_then(|att| attachment::retain_view(att, mtm))
+            .and_then(|view| view.window());
+        let parent = self.window.parentWindow();
+        if parent.as_deref() != window.as_deref() {
+            if let Some(parent) = parent {
+                parent.removeChildWindow(&self.window);
+            }
+            if let Some(window) = window.as_ref() {
+                self.window.setLevel(window.level() + 1);
+                // SAFETY: both windows are live on the main thread. The overlay
+                // owns no child windows, so attaching it cannot create a cycle.
+                unsafe { window.addChildWindow_ordered(&self.window, NSWindowOrderingMode::Above) };
+                debug!(target: LOG_TARGET, "cursor: overlay {} follows game window {}",
+                    self.window.windowNumber(), window.windowNumber());
+            }
+        }
+        if window.is_some_and(|window| window.isVisible()) {
+            if !self.window.isVisible() {
+                self.window.orderFront(None);
+            }
+        } else if self.window.isVisible() {
+            self.window.orderOut(None);
+            debug!(target: LOG_TARGET, "cursor: overlay ordered out without a visible game window");
+        }
     }
 
     /// Mirror the actual followed layer, including same-mode profile and device handoffs.
