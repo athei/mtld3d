@@ -534,19 +534,19 @@ fn viewport_applied_to_new_pass_start() {
 }
 
 #[test]
-fn first_use_each_rt_is_dontcare() {
+fn first_use_colour_dontcare_is_the_back_buffer_alone() {
     let rt = tex(0x3000);
-    // Rule A — every rt's first use in a frame, with no pending
-    // clear, gets DontCare. Backbuffer is first-use in pass A;
-    // rt is first-use in pass B. Depth is shared so it's
-    // first-use in A and re-use (Load) in B.
+    // Rule A: the back buffer's first use in a frame, with no pending
+    // clear, gets DontCare, since `Present` left it undefined. A game
+    // render target keeps last frame's contents, so its first use loads.
+    // Depth is shared so it's first-use in A and re-use (Load) in B.
     let mut s = fresh();
     s.emit_command(dummy_draw()); // pass A on backbuffer() + depth()
     s.set_color_render_target(rt, 256, 256, RT_FORMAT, RenderScale::IDENTITY);
     s.emit_command(dummy_draw()); // pass B on rt + depth()
     assert_eq!(s.passes()[0].color_load(), ColorLoad::DontCare);
     assert_eq!(s.passes()[0].depth_load(), DepthLoad::DontCare);
-    assert_eq!(s.passes()[1].color_load(), ColorLoad::DontCare);
+    assert_eq!(s.passes()[1].color_load(), ColorLoad::Load);
     // depth() is seen-already (pass A used it), so Load this time.
     assert_eq!(s.passes()[1].depth_load(), DepthLoad::Load);
 }
@@ -1367,17 +1367,15 @@ fn rule_a_depth_wider_than_the_rt_loads_on_first_use() {
     // render target 0 exactly, the pass cannot write the depth surface outside
     // that area, so its first use in the frame must Load rather than discard
     // what the surface holds there. The stencil plane rides the same texture.
-    let rt = tex(0x3000);
     let ds = tex(0x3300);
     let mut s = fresh();
-    s.set_color_render_target(rt, 256, 256, RT_FORMAT, RenderScale::IDENTITY);
-    s.set_depth_stencil_attachment(ds, (512, 512), false, true);
-    s.set_viewport(0, 0, 256, 256, 0.0, 1.0);
+    s.set_depth_stencil_attachment(ds, (1024, 1024), false, true);
+    s.set_viewport(0, 0, BB_SIZE.0, BB_SIZE.1, 0.0, 1.0);
     s.emit_command(dummy_draw());
     assert_eq!(s.passes().len(), 1);
     assert_eq!(s.passes()[0].depth_load(), DepthLoad::Load);
     assert_eq!(s.passes()[0].stencil_load(), StencilLoad::Load);
-    // The colour plane is judged against its own extent and keeps the discard.
+    // The back buffer is judged against its own extent and keeps the discard.
     assert_eq!(s.passes()[0].color_load(), ColorLoad::DontCare);
 }
 
@@ -1584,8 +1582,8 @@ fn rule_c_distinct_rts_no_next_use_keep_store() {
     // Pass 0 backbuffer(), pass 1 rt, pass 2 backbuffer() — neither rt
     // is followed by another pass with the SAME color rt (backbuffer()'s
     // re-use at pass 2 has color_load=Load, not Clear). Rule C does
-    // not fire for any pass here. Rule D, however, flips pass 1's
-    // rt (non-backbuffer, last use, not sampled) to DontCare.
+    // not fire for any pass here, and pass 1's rt keeps its store at its
+    // last use: a later frame may read it.
     let mut s = fresh();
     s.emit_command(dummy_draw());
     s.set_color_render_target(rt, 256, 256, RT_FORMAT, RenderScale::IDENTITY);
@@ -1601,7 +1599,7 @@ fn rule_c_distinct_rts_no_next_use_keep_store() {
     s.end_current_pass("test");
     s.finalize_store_actions(false);
     assert_eq!(s.passes()[0].color_store(), StoreAction::Store);
-    assert_eq!(s.passes()[1].color_store(), StoreAction::DontCare);
+    assert_eq!(s.passes()[1].color_store(), StoreAction::Store);
     assert_eq!(s.passes()[2].color_store(), StoreAction::Store);
 }
 
@@ -1610,10 +1608,9 @@ fn rule_c_next_pass_clears_same_rt_flips_store() {
     let rt = tex(0x3000);
     // Pass 0 backbuffer(), pass 1 rt with clear, pass 2 backbuffer() with
     // clear. backbuffer() pass 0's next use is pass 2 (clear) → Rule C
-    // flips. rt pass 1 has no next use → Rule C keeps Store, then
-    // Rule D (non-backbuffer last-use) flips to DontCare.
-    // backbuffer() pass 2 is the last pass for backbuffer() → exempt
-    // from Rule D, keeps Store (Present reads it).
+    // flips. rt pass 1 has no next use → Rule C keeps Store, and it
+    // stays: a later frame may read it. backbuffer() pass 2 is the last
+    // pass for backbuffer() and keeps Store (Present reads it).
     let mut s = fresh();
     s.emit_command(dummy_draw());
     s.set_color_render_target(rt, 256, 256, RT_FORMAT, RenderScale::IDENTITY);
@@ -1634,7 +1631,7 @@ fn rule_c_next_pass_clears_same_rt_flips_store() {
     assert_eq!(s.passes()[0].color_texture(), backbuffer());
     assert_eq!(s.passes()[0].color_store(), StoreAction::DontCare);
     assert_eq!(s.passes()[1].color_texture(), rt);
-    assert_eq!(s.passes()[1].color_store(), StoreAction::DontCare);
+    assert_eq!(s.passes()[1].color_store(), StoreAction::Store);
     assert_eq!(s.passes()[2].color_texture(), backbuffer());
     assert_eq!(s.passes()[2].color_store(), StoreAction::Store);
 }
@@ -1708,12 +1705,11 @@ fn rule_c_csm_cluster_intra_frame_stores_drop() {
     assert_eq!(s.passes()[0].color_store(), StoreAction::Store);
     // Pass 1 rt_a → next rt_a use is pass 3 Clear → Rule C flips.
     assert_eq!(s.passes()[1].color_store(), StoreAction::DontCare);
-    // Pass 2 rt_b → no next rt_b use → Rule D (non-backbuffer last-use)
-    // flips to DontCare since rt_b is never sampled.
-    assert_eq!(s.passes()[2].color_store(), StoreAction::DontCare);
-    // Pass 3 rt_a → no next rt_a use → Rule D flips.
-    assert_eq!(s.passes()[3].color_store(), StoreAction::DontCare);
-    // Pass 4 backbuffer() → last in frame, exempt from Rule D (Present reads it).
+    // Pass 2 rt_b → no next rt_b use → keeps Store for a later frame.
+    assert_eq!(s.passes()[2].color_store(), StoreAction::Store);
+    // Pass 3 rt_a → no next rt_a use → keeps Store for a later frame.
+    assert_eq!(s.passes()[3].color_store(), StoreAction::Store);
+    // Pass 4 backbuffer() → last in frame, keeps Store (Present reads it).
     assert_eq!(s.passes()[4].color_store(), StoreAction::Store);
 }
 
@@ -1792,19 +1788,17 @@ fn rule_b_keeps_store_when_depth_sampled_later() {
 }
 
 #[test]
-fn rule_a_reverts_dontcare_when_color_sampled_later() {
+fn rule_a_colour_target_sampled_later_loads_on_first_use() {
     let rt = tex(0x4000);
-    // Pass 0 first-attaches a fresh color rt (Rule A: Load=DontCare),
-    // pass 1 samples that same rt as a fragment texture. The eager
-    // DontCare must be reverted at finalize so the sampler reads the
-    // pass-0 content, not undefined tile memory.
+    // Pass 1 first-attaches a colour rt, pass 2 samples that same rt as a
+    // fragment texture. A game target keeps its contents across frames, so
+    // Rule A never discards its load, and finalize has nothing to revert.
     let mut s = fresh();
     // Bounce off backbuffer() first so the next pass-open is first-use of rt.
     s.emit_command(dummy_draw());
     s.set_color_render_target(rt, 256, 256, RT_FORMAT, RenderScale::IDENTITY);
     s.emit_command(dummy_draw());
-    // First-use ⇒ Rule A flipped Load=DontCare eagerly.
-    assert_eq!(s.passes()[1].color_load(), ColorLoad::DontCare);
+    assert_eq!(s.passes()[1].color_load(), ColorLoad::Load);
     // Bounce back to backbuffer() and sample rt.
     s.set_color_render_target(
         backbuffer(),
@@ -1817,7 +1811,6 @@ fn rule_a_reverts_dontcare_when_color_sampled_later() {
     s.emit_command(dummy_draw());
     s.end_current_pass("test");
     s.finalize_load_actions();
-    // finalize_load_actions must revert pass 1's eager DontCare.
     assert_eq!(s.passes()[1].color_load(), ColorLoad::Load);
 }
 
@@ -1883,18 +1876,22 @@ fn rule_g_strips_color_from_clear_only_pass_with_wasted_color() {
 fn rule_f_culls_pass_where_both_stores_become_dontcare() {
     let cascade_color = tex(0x3000);
     let cascade_depth = tex(0x9000);
+    let other_depth = tex(0x9100);
     // Pass 0: cascade_color (Clear) + cascade_depth (Clear), no
     // draws. cascade_depth is NEVER sampled this frame, so Rule B
-    // flips depth Store=DontCare. cascade_color is non-backbuffer,
-    // not sampled, last-use → Rule D flips color Store=DontCare.
+    // flips depth Store=DontCare. The next pass on cascade_color
+    // begins with a Clear, so Rule C flips color Store=DontCare.
     // Both Stores DontCare + no draws + no blits → Rule F culls.
     let mut s = fresh();
     s.set_color_render_target(cascade_color, 2048, 2048, RT_FORMAT, RenderScale::IDENTITY);
     s.set_depth_stencil_attachment(cascade_depth, BB_SIZE, false, false);
     s.clear_color(1, 2, 3, 4);
     s.clear_depth(f32::to_bits(1.0));
-    // No draws, no blits — pure clear-only pass.
-    // Switch back to BB so this is the last cascade frame use.
+    // No draws, no blits — pure clear-only pass. The next pass clears
+    // cascade_color again under a different depth surface and draws.
+    s.set_depth_stencil_attachment(other_depth, BB_SIZE, false, false);
+    s.clear_color(5, 6, 7, 8);
+    s.emit_command(dummy_draw());
     s.set_color_render_target(
         backbuffer(),
         BB_SIZE.0,
@@ -1909,10 +1906,52 @@ fn rule_f_culls_pass_where_both_stores_become_dontcare() {
     s.finalize_load_actions();
     s.finalize_store_actions(false);
     s.cull_dead_clear_only_passes();
-    // The cascade clear-only pass should be gone; only the BB
-    // scene pass remains.
-    assert_eq!(s.passes().len(), 1);
-    assert_eq!(s.passes()[0].color_texture(), backbuffer());
+    // The cascade clear-only pass should be gone; the redraw of
+    // cascade_color and the BB scene pass remain.
+    assert!(
+        s.passes()
+            .iter()
+            .all(|p| p.depth_texture() != cascade_depth),
+        "the dead clear-only pass is culled",
+    );
+    assert_eq!(s.passes().len(), 2);
+}
+
+#[test]
+fn rule_f_keeps_a_last_use_clear_only_colour_pass() {
+    let cascade_color = tex(0x3000);
+    let cascade_depth = tex(0x9000);
+    // A clear-only pass whose colour target is not touched again this
+    // frame. Its depth is never sampled, so Rule B discards the depth
+    // store, but the cleared colour is the target's content for a later
+    // frame, which may sample it. The colour store stays and Rule F
+    // must keep the pass.
+    let mut s = fresh();
+    s.set_color_render_target(cascade_color, 2048, 2048, RT_FORMAT, RenderScale::IDENTITY);
+    s.set_depth_stencil_attachment(cascade_depth, BB_SIZE, false, false);
+    s.clear_color(1, 2, 3, 4);
+    s.clear_depth(f32::to_bits(1.0));
+    s.set_color_render_target(
+        backbuffer(),
+        BB_SIZE.0,
+        BB_SIZE.1,
+        BB_FORMAT,
+        s.render_scale,
+    );
+    s.set_depth_stencil_attachment(depth(), BB_SIZE, false, false);
+    s.emit_command(dummy_draw());
+    s.end_current_pass("test");
+    s.coalesce_clear_only_passes();
+    s.finalize_load_actions();
+    s.finalize_store_actions(false);
+    s.cull_dead_clear_only_passes();
+    let kept = s
+        .passes()
+        .iter()
+        .find(|p| p.color_texture() == cascade_color)
+        .expect("the clear-only colour pass is kept");
+    assert_eq!(kept.color_store(), StoreAction::Store);
+    assert_eq!(kept.depth_store(), StoreAction::DontCare);
 }
 
 #[test]
@@ -2338,17 +2377,17 @@ fn rule_e_aborts_when_intervening_pass_samples_target_through_srgb_twin() {
 }
 
 #[test]
-fn rule_d_non_backbuffer_color_last_use_is_dontcare() {
-    let cascade_color = tex(0x3000);
-    // CSM cascade color is a placeholder for the depth-only caster
-    // pass and is never sampled. Rule D must flip its Store to
-    // DontCare so the 16 MB writeback doesn't hit VRAM. Backbuffer
-    // color in the next pass must stay Store (Present consumes it).
+fn unsampled_colour_target_keeps_its_contents_into_the_next_frame() {
+    let portrait = tex(0x3000);
+    // A render target the frame clears and draws into but never samples:
+    // the next frame is the first to read it. D3D9 keeps render-target
+    // contents across `Present`, so its last use stores, and the next
+    // frame's first uncleared full-viewport pass on it loads.
     let mut s = fresh();
-    // Pass 0: cascade caster pass — color is junk, depth gets work.
-    s.set_color_render_target(cascade_color, 2048, 2048, RT_FORMAT, RenderScale::IDENTITY);
+    s.set_color_render_target(portrait, 64, 64, RT_FORMAT, RenderScale::IDENTITY);
+    s.set_viewport(0, 0, 64, 64, 0.0, 1.0);
+    s.clear_color(0, 0, 0, 0);
     s.emit_command(dummy_draw());
-    // Pass 1: scene pass on backbuffer.
     s.set_color_render_target(
         backbuffer(),
         BB_SIZE.0,
@@ -2356,24 +2395,37 @@ fn rule_d_non_backbuffer_color_last_use_is_dontcare() {
         BB_FORMAT,
         s.render_scale,
     );
+    s.set_viewport(0, 0, BB_SIZE.0, BB_SIZE.1, 0.0, 1.0);
     s.emit_command(dummy_draw());
     s.end_current_pass("test");
+    s.finalize_load_actions();
     s.finalize_store_actions(false);
     assert_eq!(s.passes().len(), 2);
-    assert_eq!(s.passes()[0].color_texture(), cascade_color);
-    assert_eq!(s.passes()[0].color_store(), StoreAction::DontCare);
-    // Backbuffer Present needs the pixels — exempt from Rule D.
+    assert_eq!(s.passes()[0].color_texture(), portrait);
+    assert_eq!(s.passes()[0].color_store(), StoreAction::Store);
     assert_eq!(s.passes()[1].color_texture(), backbuffer());
     assert_eq!(s.passes()[1].color_store(), StoreAction::Store);
+
+    reset_test_frame(&mut s);
+    s.set_color_render_target(portrait, 64, 64, RT_FORMAT, RenderScale::IDENTITY);
+    s.set_viewport(0, 0, 64, 64, 0.0, 1.0);
+    s.emit_command(dummy_draw());
+    s.end_current_pass("test");
+    s.finalize_load_actions();
+    let next = s
+        .passes()
+        .iter()
+        .find(|p| p.color_texture() == portrait)
+        .expect("the next frame's pass on the target");
+    assert_eq!(next.color_load(), ColorLoad::Load);
 }
 
 #[test]
-fn rule_d_keeps_store_when_color_sampled_later() {
+fn colour_target_sampled_later_keeps_store() {
     for (stage, bind) in sampler_binds(0x4000) {
         let rt = tex(0x4000);
         // A non-backbuffer color rt that is sampled by a later pass
-        // must preserve its content; Rule D must not flip Store to
-        // DontCare for it.
+        // must preserve its content.
         let mut s = fresh();
         s.set_color_render_target(rt, 256, 256, RT_FORMAT, RenderScale::IDENTITY);
         s.emit_command(dummy_draw());
@@ -3169,8 +3221,10 @@ fn cascade_rebind_with_the_same_sampleable_flag_is_a_no_op() {
 ///
 /// Frame N renders into `rt` and samples it, which puts the handle in the
 /// session-wide sampled set. Frame N+1 binds the same address as a colour
-/// target nothing reads. Returns that pass's load and store actions.
-fn colour_reuse_after_sample(retire: bool, bind: Command) -> (ColorLoad, StoreAction) {
+/// target nothing reads, then clears it in a later pass. Returns the first
+/// pass's store action, which Rule C discards only for a handle it does not
+/// consider sampled.
+fn colour_reuse_after_sample(retire: bool, bind: Command) -> StoreAction {
     let rt = tex(0xCAFE_8000);
     let mut s = fresh();
     s.set_color_render_target(rt, 256, 256, RT_FORMAT, RenderScale::IDENTITY);
@@ -3212,15 +3266,17 @@ fn colour_reuse_after_sample(retire: bool, bind: Command) -> (ColorLoad, StoreAc
         s.render_scale,
     );
     s.emit_command(dummy_draw());
+    s.set_color_render_target(rt, 256, 256, RT_FORMAT, RenderScale::IDENTITY);
+    s.clear_color(0, 0, 0, 0);
+    s.emit_command(dummy_draw());
     s.end_current_pass("test");
     s.finalize_load_actions();
     s.finalize_store_actions(false);
-    let reuse = s
-        .passes()
+    s.passes()
         .iter()
         .find(|p| p.color_texture() == rt)
-        .expect("the reuse pass is present");
-    (reuse.color_load(), reuse.color_store())
+        .expect("the reuse pass is present")
+        .color_store()
 }
 
 /// A retired colour handle stops looking sampled, so its address can be reused.
@@ -3237,14 +3293,14 @@ fn a_retired_colour_handle_drops_its_sampled_marking() {
     {
         assert_eq!(
             colour_reuse_after_sample(true, retired_bind),
-            (ColorLoad::DontCare, StoreAction::DontCare),
-            "{stage:?}: the reused address is a first use nothing reads: Rule A discards \
-             the load, Rule D drops the store",
+            StoreAction::DontCare,
+            "{stage:?}: nothing reads the reused address before its next clear, so Rule C \
+             drops the store",
         );
         assert_eq!(
             colour_reuse_after_sample(false, live_bind),
-            (ColorLoad::Load, StoreAction::Store),
-            "{stage:?}: a live texture sampled last frame keeps both, which is what the \
+            StoreAction::Store,
+            "{stage:?}: a live texture sampled last frame keeps its store, which is what the \
              prune must not weaken",
         );
     }
@@ -3281,13 +3337,25 @@ fn unregister_texture_re_arms_the_frame_scoped_sets() {
     );
     s.set_color_render_target(rt, 256, 256, RT_FORMAT, RenderScale::IDENTITY);
     s.emit_command(dummy_draw());
+    let reuse = s.passes().len() - 1;
+    s.set_color_render_target(
+        backbuffer(),
+        BB_SIZE.0,
+        BB_SIZE.1,
+        BB_FORMAT,
+        s.render_scale,
+    );
+    s.emit_command(dummy_draw());
+    s.set_color_render_target(rt, 256, 256, RT_FORMAT, RenderScale::IDENTITY);
+    s.clear_color(0, 0, 0, 0);
+    s.emit_command(dummy_draw());
+    s.end_current_pass("test");
+    s.finalize_store_actions(false);
     assert_eq!(
-        s.passes()
-            .last()
-            .expect("the reuse pass is present")
-            .color_load(),
-        ColorLoad::DontCare,
-        "the reused address is a first use again, so Rule A discards its load",
+        s.passes()[reuse].color_store(),
+        StoreAction::DontCare,
+        "the reused address no longer counts as sampled, so Rule C drops the store \
+         its next clear overwrites",
     );
 }
 
@@ -3422,8 +3490,11 @@ fn extra_target_joins_the_pass_when_it_matches_rt0() {
     let pass = &s.passes()[0];
     assert_eq!(pass.extra_color()[0].texture(), tex(0x3000));
     assert!(!pass.extra_color()[1].is_bound());
-    // First use under a covering viewport: Rule A, like render target 0.
-    assert_eq!(pass.extra_color()[0].load(), ColorLoad::DontCare);
+    // A game target keeps its contents across frames, so even its first use
+    // under a covering viewport loads, while the back buffer beside it
+    // takes Rule A's discard.
+    assert_eq!(pass.extra_color()[0].load(), ColorLoad::Load);
+    assert_eq!(pass.color_load(), ColorLoad::DontCare);
     assert_eq!(pass.extra_color()[0].store(), StoreAction::Store);
 }
 
@@ -3586,7 +3657,7 @@ fn depth_clear_in_a_multi_target_pass_stays_a_quad() {
 }
 
 #[test]
-fn rule_c_and_d_apply_per_attachment() {
+fn rule_c_applies_per_attachment() {
     // Pass 0: backbuffer + rt_a (slot 1). Pass 1: rt_a alone as render
     // target 0 with a clear, then rt_b (slot 2) never used again.
     let rt_a = tex(0x3000);
@@ -3605,8 +3676,8 @@ fn rule_c_and_d_apply_per_attachment() {
     let first = &s.passes()[0];
     // rt_a's next use clears it: Rule C flips the slot-1 store.
     assert_eq!(first.extra_color()[0].store(), StoreAction::DontCare);
-    // rt_b is never used again and is not the backbuffer: Rule D.
-    assert_eq!(first.extra_color()[1].store(), StoreAction::DontCare);
+    // rt_b is never used again this frame: it keeps its store for a later frame.
+    assert_eq!(first.extra_color()[1].store(), StoreAction::Store);
     // The backbuffer keeps its store for Present.
     assert_eq!(first.color_store(), StoreAction::Store);
 }
@@ -3755,11 +3826,18 @@ fn rule_g_strips_only_the_dead_extra_and_rule_f_needs_every_store_dead() {
     s.set_extra_color_render_target(2, Some(slot(rt_b, BB_SIZE)));
     s.clear_color(1, 2, 3, 4);
     s.flush_pending_clears();
-    // rt_a is read back later, so its store survives; rt_b's is dead.
+    // rt_a is read back later, so its store survives; rt_b is cleared again
+    // by the next pass, so Rule C kills its store.
     s.note_color_read_back(rt_a);
+    s.set_extra_color_render_target(1, None);
+    s.set_extra_color_render_target(2, None);
+    s.set_color_render_target(rt_b, BB_SIZE.0, BB_SIZE.1, BB_FORMAT, RenderScale::IDENTITY);
+    s.clear_color(5, 6, 7, 8);
+    s.emit_command(dummy_draw());
+    s.end_current_pass("test");
     s.finalize_store_actions(false);
     s.strip_dead_color_in_clear_only_passes();
-    assert_eq!(s.passes().len(), 1);
+    assert_eq!(s.passes().len(), 2);
     let pass = &s.passes()[0];
     assert!(
         pass.extra_color()[0].is_bound(),
@@ -3767,15 +3845,15 @@ fn rule_g_strips_only_the_dead_extra_and_rule_f_needs_every_store_dead() {
     );
     assert!(!pass.extra_color()[1].is_bound(), "dead extra stripped");
     s.cull_dead_clear_only_passes();
-    assert_eq!(s.passes().len(), 1, "a live store keeps the pass");
+    assert_eq!(s.passes().len(), 2, "a live store keeps the pass");
 }
 
 #[test]
 fn mid_frame_flush_keeps_every_colour_store() {
     // Two clear-only passes on two targets; the first is read back, which
     // flushes the frame. The second target is read back afterwards, so
-    // its last-use store must survive the flush (Rule D off) and Rule F
-    // must keep its pass.
+    // its last-use store must survive the flush and Rule F must keep its
+    // pass.
     let rt_a = tex(0x3000);
     let rt_b = tex(0x3001);
     let mut s = fresh();
@@ -3793,9 +3871,9 @@ fn mid_frame_flush_keeps_every_colour_store() {
         "both clear-only passes survive a readback flush"
     );
     assert_eq!(s.passes()[1].color_store(), StoreAction::Store);
-    // At a real frame end the unread target's store is elided as before.
+    // A real frame end keeps it too: a later frame may read the target.
     s.finalize_store_actions(false);
-    assert_eq!(s.passes()[1].color_store(), StoreAction::DontCare);
+    assert_eq!(s.passes()[1].color_store(), StoreAction::Store);
 }
 
 // ── Blits in the read/write model ─────────────────────────────
@@ -3805,7 +3883,7 @@ fn copy_blit(src: MetalHandle<MTLTextureKind>, dst: MetalHandle<MTLTextureKind>)
 }
 
 #[test]
-fn rule_d_keeps_store_when_a_stretch_rect_reads_the_target() {
+fn a_stretch_rect_read_keeps_the_last_use_store() {
     // Render into rt, then copy rt to the backbuffer after the pass: the
     // copy reads rt from device memory, so its last-use store must stay.
     let rt = tex(0x3000);
@@ -3868,22 +3946,29 @@ fn rule_c_keeps_store_when_a_blit_reads_between_write_and_clear() {
 
 #[test]
 fn rule_a_loads_a_target_written_by_a_blit_in_an_earlier_pass() {
-    // A copy into rt_x is queued while rt_y is bound, so it lands in
-    // rt_y's pass. rt_x's own first pass must still Load the copy.
+    // A copy into the back buffer is queued while rt_y is bound, so it
+    // lands in rt_y's pass. The back buffer's own first pass, which Rule A
+    // would otherwise open with a discard, must still Load the copy.
     let rt_src = tex(0x3000);
-    let rt_x = tex(0x4000);
     let rt_y = tex(0x5000);
     let mut s = fresh();
     s.set_color_render_target(rt_y, 64, 64, RT_FORMAT, RenderScale::IDENTITY);
-    s.push_pending_leading_blit(copy_blit(rt_src, rt_x));
+    s.set_viewport(0, 0, 64, 64, 0.0, 1.0);
+    s.push_pending_leading_blit(copy_blit(rt_src, backbuffer()));
     s.emit_command(dummy_draw());
-    s.set_color_render_target(rt_x, 64, 64, RT_FORMAT, RenderScale::IDENTITY);
+    s.set_color_render_target(
+        backbuffer(),
+        BB_SIZE.0,
+        BB_SIZE.1,
+        BB_FORMAT,
+        s.render_scale,
+    );
+    s.set_viewport(0, 0, BB_SIZE.0, BB_SIZE.1, 0.0, 1.0);
     s.emit_command(dummy_draw());
     assert_eq!(s.passes().len(), 2);
     assert_eq!(s.passes()[0].color_texture(), rt_y);
     assert_eq!(s.passes()[0].leading_blits().len(), 1);
-    assert_eq!(s.passes()[0].color_load(), ColorLoad::DontCare);
-    assert_eq!(s.passes()[1].color_texture(), rt_x);
+    assert_eq!(s.passes()[1].color_texture(), backbuffer());
     assert_eq!(s.passes()[1].leading_blits().len(), 0);
     assert_eq!(s.passes()[1].color_load(), ColorLoad::Load);
 }
@@ -3891,9 +3976,8 @@ fn rule_a_loads_a_target_written_by_a_blit_in_an_earlier_pass() {
 #[test]
 fn blit_written_set_resets_with_the_frame() {
     let rt_src = tex(0x3000);
-    let rt_x = tex(0x4000);
     let mut s = fresh();
-    s.push_pending_leading_blit(copy_blit(rt_src, rt_x));
+    s.push_pending_leading_blit(copy_blit(rt_src, backbuffer()));
     s.take_pending_leading_blits();
     s.reset_frame(&FrameReset {
         backbuffer: backbuffer(),
@@ -3909,8 +3993,8 @@ fn blit_written_set_resets_with_the_frame() {
         render_scale: RenderScale::IDENTITY,
         continues_frame: false,
     });
-    s.set_color_render_target(rt_x, 64, 64, RT_FORMAT, RenderScale::IDENTITY);
     s.emit_command(dummy_draw());
+    assert_eq!(s.passes()[0].color_texture(), backbuffer());
     assert_eq!(s.passes()[0].color_load(), ColorLoad::DontCare);
 }
 

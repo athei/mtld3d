@@ -40,8 +40,14 @@ struct ClearMerge {
 
 /// Compile-time gate for Rule A (first-use `DontCare`).
 ///
-/// Flip to `false` for a single-line hotfix if a temporal-blending game
-/// surfaces that reads prior-frame contents on first use of frame N.
+/// On the colour side only the back buffer qualifies: under
+/// `D3DSWAPEFFECT_DISCARD`, the one swap effect implemented, its contents are
+/// undefined after `Present`, so its first pass of a frame has nothing to load.
+/// Every other colour target keeps its contents across `Present` in D3D9, and
+/// a game may draw over last frame's pixels without clearing, so its first use
+/// loads. The depth plane takes the same first-use `DontCare`. Flip to `false`
+/// for a single-line hotfix if a game surfaces that reads prior-frame depth on
+/// first use of frame N.
 const ENABLE_FIRST_USE_DONTCARE: bool = true;
 
 /// Compile-time gate for Rule A on the stencil plane (first-use `DontCare`).
@@ -80,30 +86,17 @@ const ENABLE_NEXT_CLEAR_COLOR_DONTCARE: bool = true;
 /// Compile-time gate for Rule F (cull clear-only passes with dead Stores).
 ///
 /// A pass qualifies when its every-attachment-Store ends up `DontCare`
-/// after Rules B/C/D run. Such a pass has zero observable effect: no
+/// after Rules B/C run. Such a pass has zero observable effect: no
 /// draws, no leading blits, and nothing reaches VRAM. Runs at the very
 /// end of the pass-finalisation pipeline so it sees the post-rule Store
 /// actions. Cheap correctness guard: passes with leading blits stay
 /// (the blits are real work scheduled before the encoder).
 const ENABLE_CULL_DEAD_CLEAR_PASSES: bool = true;
 
-/// Compile-time gate for Rule D (last-use non-backbuffer color `Store=DontCare`).
-///
-/// Symmetric to Rule B for the color attachment, with the backbuffer
-/// explicitly exempted because Present consumes its content from VRAM
-/// after submit and we have no in-pass visibility into that consumer.
-/// Sampler-aware via `seen_sampled_textures`. Eliminates the multi-MB
-/// writeback of a cascade color attachment — that color is a
-/// placeholder for depth-only caster draws and is never sampled. Flip
-/// to `false` if a game samples a non-backbuffer color rt
-/// across the Present boundary in a way mtld3d's single-frame
-/// `seen_sampled_textures` can't capture.
-const ENABLE_LAST_USE_COLOR_DONTCARE: bool = true;
-
 /// Compile-time gate for Rule G — strip the color attachment from a clear-only pass.
 ///
 /// Fires when the pass's color side is provably wasted
-/// (`color_store == DontCare` after Rules C/D, no draws, no leading
+/// (`color_store == DontCare` after Rule C, no draws, no leading
 /// blits). The pass becomes a *depth-only* Metal render pass with no
 /// `colorAttachments[0]` binding. Eliminates Apple's "Unused Texture"
 /// Insight on the cascade-color placeholder that per-cascade
@@ -1199,8 +1192,8 @@ pub struct PassState {
     blit_written_rts: FxHashSet<MetalHandle<MTLTextureKind>>,
     /// The swap-chain backbuffer texture for this frame, captured in `reset_frame`.
     ///
-    /// Rule D (last-use color `Store=DontCare`) exempts this handle so
-    /// Present can still read the pixels from VRAM after submit. Also the
+    /// Rule A's colour `DontCare` applies to this handle alone, since only the
+    /// back buffer starts a frame with undefined contents. Also the
     /// left-hand side of [`Self::target_scale`]'s comparison: it is what makes
     /// "is the back buffer bound" a handle identity rather than something the
     /// D3D9 layer has to infer and pass down.
@@ -2053,13 +2046,10 @@ impl PassState {
 
     /// Record that a colour texture is read back this session.
     ///
-    /// Read back by something the in-frame load/store analysis can't see — a
+    /// Read back by something the in-frame load/store analysis can't see: a
     /// `GetRenderTargetData` blit runs *after* the frame's
-    /// `finalize_store_actions`, so without this hint Rule D (last-use
-    /// non-backbuffer colour `Store=DontCare`) would discard the rendered
-    /// content and the readback would observe a cleared/garbage surface.
-    /// Treated exactly like a sampled texture, which already exempts the
-    /// colour store (Rules C/D).
+    /// `finalize_store_actions`. Treated exactly like a sampled texture,
+    /// which exempts the colour store from Rule C's next-clear `DontCare`.
     pub fn note_color_read_back(&mut self, handle: MetalHandle<MTLTextureKind>) {
         self.note_texture_read(handle);
     }
@@ -2606,7 +2596,10 @@ impl PassState {
     /// seen yet this frame AND there is no pending clear AND no queued
     /// leading-blit writes the same attachment, the load action is
     /// `DontCare` instead of `Load`. Saves the TBDR tile-fill cost on
-    /// passes that will fully overwrite undefined contents anyway.
+    /// passes that will fully overwrite undefined contents anyway. On the
+    /// colour side only the back buffer's contents are undefined at the
+    /// start of a frame; any other colour target still holds what the
+    /// previous frame left in it, so it loads.
     pub fn ensure_pass_open(&mut self) {
         if !self.current_pass_closed && !self.passes.is_empty() {
             return;
@@ -2635,13 +2628,18 @@ impl PassState {
         let pending_color_clear = self.pending_color_clear.take();
         // Shared by render target 0 and every extra: a pending clear lands on
         // all of them (D3D9 clears every bound target), and the Rule A
-        // first-use predicate is evaluated per attachment.
+        // first-use predicate is evaluated per attachment. Only the back
+        // buffer qualifies: `Present` under the discard swap effect leaves it
+        // undefined, while every other target keeps its contents into the
+        // next frame.
+        let backbuffer = self.backbuffer_texture;
         let color_load_for =
             |texture: MetalHandle<MTLTextureKind>, subresource: u32| match pending_color_clear {
                 Some((r, g, b, a)) => ColorLoad::Clear { r, g, b, a },
                 None if ENABLE_FIRST_USE_DONTCARE
                     && viewport_covers_color_extent
                     && !texture.is_null()
+                    && texture == backbuffer
                     && !self.seen_color_rts.contains(&(texture, subresource))
                     && !self.seen_sampled_textures.contains(&texture)
                     && !self.blit_written_rts.contains(&texture) =>
@@ -2843,8 +2841,8 @@ impl PassState {
     /// The destination is also entered into the read/write model the
     /// load/store rules reason over: `blit_written_rts` so a later pass loads
     /// the attachment instead of discarding it (Rule A), and the sampled set
-    /// so the pass's own colour store survives (Rules C/D) even in a frame
-    /// where nothing samples the texture.
+    /// so the pass's own colour store survives Rule C even in a frame where
+    /// nothing samples the texture.
     pub fn push_upload_pass(
         &mut self,
         target: &UploadPassTarget,
@@ -2962,7 +2960,7 @@ impl PassState {
     /// The blit is also entered into the read/write model the load/store rules
     /// reason over. A texture-to-texture copy reads its source from device
     /// memory after every pass that wrote it, so the source counts as read
-    /// (`seen_sampled_textures`, which Rules B/C/D consult before discarding a
+    /// (`seen_sampled_textures`, which Rules B/C consult before discarding a
     /// store). The destination of any texture-writing blit goes into
     /// `blit_written_rts` so Rule A loads it instead of discarding the copy.
     pub fn push_pending_leading_blit(&mut self, blit: BlitCommand) {
@@ -4184,7 +4182,7 @@ impl PassState {
 
     /// Rule F — cull clear-only passes that perform no observable work.
     ///
-    /// Runs after Rules B/C/D finalise. A pass with zero draw commands,
+    /// Runs after Rules B/C finalise. A pass with zero draw commands,
     /// no leading blits, and every attachment's Store flipped to
     /// `DontCare` writes nothing to VRAM and exists purely as encoder
     /// overhead; drop it. Typical case: a cascade init clear-only pass
@@ -4598,13 +4596,17 @@ impl PassState {
     ///   resolves and that next pass's `color_load` is `Clear`, flip
     ///   `i.color_store`. Then update the map with `i`.
     ///
+    /// A colour target's last use in the frame keeps its `Store`. D3D9 keeps render-target
+    /// contents across `Present`, and the read that needs them (a sampler, a `StretchRect`, a
+    /// readback, a draw that blends over them) may come in a later frame, where nothing this
+    /// submission holds can see it.
+    ///
     /// `frame_continues` marks a mid-frame flush (a readback or retention drain, not
-    /// `Present`): the D3D9 frame keeps going afterwards, so a colour target may still be
-    /// read back or drawn into and a depth surface may still be tested against. Both last-use
-    /// rules are therefore suppressed — Rule D (colour) and Rule B (depth/stencil) would
-    /// discard content the continuation still needs. Rule C (next-clear) still runs, since a
-    /// pass that a later pass *in this submission* clears is provably overwritten regardless
-    /// of whether the frame ends here.
+    /// `Present`): the D3D9 frame keeps going afterwards, so a depth surface may still be
+    /// tested against. Rule B is therefore suppressed, since it would discard depth the
+    /// continuation still needs. Rule C (next-clear) still runs, since a pass that a later
+    /// pass *in this submission* clears is provably overwritten regardless of whether the
+    /// frame ends here.
     pub fn finalize_store_actions(&mut self, frame_continues: bool) {
         if ENABLE_LAST_USE_DEPTH_DONTCARE && !frame_continues {
             let mut handled: FxHashSet<MetalHandle<MTLTextureKind>> =
@@ -4670,41 +4672,6 @@ impl PassState {
                         }
                     }
                     next_color_use.insert(key, (i, slot));
-                }
-            }
-        }
-        if ENABLE_LAST_USE_COLOR_DONTCARE && !frame_continues {
-            let mut handled: FxHashSet<(MetalHandle<MTLTextureKind>, u32)> =
-                FxHashSet::with_capacity_and_hasher(self.seen_color_rts.len(), FxBuildHasher);
-            let backbuffer = self.backbuffer_texture;
-            for pass in self.passes.iter_mut().rev() {
-                let attachments = pass.bound_color_attachments();
-                for attachment in attachments.iter() {
-                    let (slot, rt, sub) =
-                        (attachment.slot, attachment.texture, attachment.subresource);
-                    if rt == backbuffer {
-                        continue;
-                    }
-                    if handled.insert((rt, sub))
-                        && !matches!(attachment.store, StoreAction::DontCare)
-                    {
-                        if self.seen_sampled_textures.contains(&rt) {
-                            if log_enabled!(target: TRACE_TARGET, Level::Trace) {
-                                trace!(
-                                    target: TRACE_TARGET,
-                                    "pass-store color={rt:#x} → keep Store (sampled this frame)",
-                                );
-                            }
-                        } else {
-                            pass.set_color_store_of(slot, StoreAction::DontCare);
-                            if log_enabled!(target: TRACE_TARGET, Level::Trace) {
-                                trace!(
-                                    target: TRACE_TARGET,
-                                    "pass-store color={rt:#x} → DontCare (last-use, non-backbuffer)",
-                                );
-                            }
-                        }
-                    }
                 }
             }
         }

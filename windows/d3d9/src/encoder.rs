@@ -4470,9 +4470,8 @@ impl FrameEncoder {
     /// overwrites exactly the scissor rect) so content outside the dst rect is
     /// preserved. The prior render-target / depth / viewport binding is saved
     /// and restored around the pass, so a `StretchRect` mid-frame doesn't
-    /// perturb the device's current RT. `note_color_read_back` marks the dst so a
-    /// post-frame `GetRenderTargetData` keeps the rendered content (the store
-    /// optimiser would otherwise discard a last-use non-backbuffer colour).
+    /// perturb the device's current RT. `note_color_read_back` marks the dst as
+    /// read, so the store-action rules treat its content as live.
     pub fn stretch_blit_scaled(
         &mut self,
         src: &BlitSide,
