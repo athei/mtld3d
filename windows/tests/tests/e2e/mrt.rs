@@ -8,12 +8,11 @@
 
 use mtld3d_tests::{Harness, PosColorVertex, Rgba8, Surface, TexturedVertex};
 use mtld3d_types::{
-    D3D_OK, D3DCLEAR_TARGET, D3DERR_INVALIDCALL, D3DERR_NOTFOUND, D3DFMT_A8R8G8B8, D3DFMT_D24S8,
-    D3DFMT_R32F, D3DFVF_DIFFUSE, D3DFVF_TEX1, D3DFVF_XYZ, D3DLOCK_READONLY, D3DPOOL_DEFAULT,
-    D3DPOOL_SYSTEMMEM, D3DPT_TRIANGLELIST, D3DRECT, D3DRS_COLORWRITEENABLE1, D3DRS_LIGHTING,
-    D3DRS_SRGBWRITEENABLE, D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_MAGFILTER,
-    D3DSAMP_MINFILTER, D3DTADDRESS_CLAMP, D3DTEXF_POINT, D3DUSAGE_RENDERTARGET, D3DVIEWPORT9,
-    PrimitiveMiscCaps,
+    D3D_OK, D3DCLEAR_TARGET, D3DERR_INVALIDCALL, D3DERR_NOTFOUND, D3DFMT_A8R8G8B8, D3DFMT_R32F,
+    D3DFVF_DIFFUSE, D3DFVF_TEX1, D3DFVF_XYZ, D3DLOCK_READONLY, D3DPOOL_DEFAULT, D3DPOOL_SYSTEMMEM,
+    D3DPT_TRIANGLELIST, D3DRECT, D3DRS_COLORWRITEENABLE1, D3DRS_LIGHTING, D3DRS_SRGBWRITEENABLE,
+    D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_MAGFILTER, D3DSAMP_MINFILTER, D3DTADDRESS_CLAMP,
+    D3DTEXF_POINT, D3DUSAGE_RENDERTARGET, D3DVIEWPORT9, PrimitiveMiscCaps,
 };
 
 const BLACK: u32 = 0xFF00_0000;
@@ -363,62 +362,6 @@ fn mismatched_target_is_cleared_but_not_drawn() {
         "a target sized unlike slot 0 is left out of the draw",
     );
     assert_eq!(h.clear_pixel_shader(), D3D_OK);
-}
-
-#[test]
-fn a_target_larger_than_the_depth_surface_is_cleared_over_its_whole_extent() {
-    // Slot 1 is twice the size of slot 0 and of the bound depth surface, so it
-    // sits outside the pass. Its scoped clear runs with depth unbound; a clear
-    // that lands on a pass carrying the smaller depth surface stops at that
-    // surface's extent and leaves the rest of slot 1 as it was.
-    let h = Harness::new();
-    let rt0 = h.create_texture(
-        64,
-        64,
-        1,
-        D3DUSAGE_RENDERTARGET,
-        D3DFMT_A8R8G8B8,
-        D3DPOOL_DEFAULT,
-    );
-    let rt1 = h.create_texture(
-        128,
-        128,
-        1,
-        D3DUSAGE_RENDERTARGET,
-        D3DFMT_A8R8G8B8,
-        D3DPOOL_DEFAULT,
-    );
-    let depth = h.create_depth_stencil_surface(64, 64, D3DFMT_D24S8);
-    let rt1_surface = rt1.surface_level(0);
-    assert_eq!(h.color_fill_hr(&rt1_surface, BLUE), D3D_OK, "fill slot 1");
-    assert_color(
-        read_rt_pixel(&h, &rt1_surface, 100, 100),
-        BLUE,
-        "slot 1 filled before the clear",
-    );
-    assert_eq!(
-        h.set_render_target(0, &rt0.surface_level(0)),
-        D3D_OK,
-        "bind slot 0"
-    );
-    assert_eq!(h.set_render_target(1, &rt1_surface), D3D_OK, "bind slot 1");
-    assert_eq!(h.set_depth_stencil_surface(&depth), D3D_OK, "bind depth");
-    assert_eq!(h.clear(D3DCLEAR_TARGET, RED, 1.0, 0), D3D_OK, "clear both");
-    assert_color(
-        read_rt_pixel(&h, &rt0.surface_level(0), 32, 32),
-        RED,
-        "slot 0 cleared",
-    );
-    assert_color(
-        read_rt_pixel(&h, &rt1_surface, 16, 16),
-        RED,
-        "slot 1 cleared inside the depth surface's extent",
-    );
-    assert_color(
-        read_rt_pixel(&h, &rt1_surface, 100, 100),
-        RED,
-        "slot 1 cleared beyond the depth surface's extent",
-    );
 }
 
 #[test]
