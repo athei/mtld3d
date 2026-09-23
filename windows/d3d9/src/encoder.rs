@@ -355,6 +355,12 @@ pub struct ColorFillTarget {
     pub rect: (u32, u32, u32, u32),
     /// Fill colour, one `f32::to_bits` per channel in RGBA order.
     pub rgba: (u32, u32, u32, u32),
+    /// Multisampled companion of the destination, null when single-sampled.
+    pub msaa: MetalHandle<MTLTextureKind>,
+    /// sRGB twin view of `msaa`, null whenever `msaa` is.
+    pub msaa_srgb: MetalHandle<MTLTextureKind>,
+    /// Sample count of the destination; 1 without a companion.
+    pub sample_count: u8,
     /// True when the destination is level 0 of a `D3DUSAGE_AUTOGENMIPMAP` texture.
     ///
     /// The runtime owns that texture's mip chain, so the fill is followed by a
@@ -3654,6 +3660,7 @@ impl FrameEncoder {
     fn clear_targets_outside_pass(&mut self, mut f: impl FnMut(&mut Self)) {
         let saved = self.pass_state.take_color_attachments();
         let prev_depth = self.pass_state.current_depth_texture();
+        let prev_depth_level = self.pass_state.current_depth_level();
         let prev_depth_size = self.pass_state.current_depth_size();
         let prev_depth_sampleable = self.pass_state.current_depth_is_sampleable();
         let prev_depth_has_stencil = self.pass_state.current_depth_has_stencil();
@@ -3684,8 +3691,9 @@ impl FrameEncoder {
             f(self);
             self.end_current_pass("color_target_clear");
         }
-        self.pass_state.set_depth_stencil_attachment(
+        self.pass_state.set_depth_stencil_attachment_level(
             prev_depth,
+            prev_depth_level,
             prev_depth_size,
             prev_depth_sampleable,
             prev_depth_has_stencil,
@@ -4579,6 +4587,7 @@ impl FrameEncoder {
         // the identity, which would otherwise leak onto the device's target.
         let saved_color = self.pass_state.take_color_attachments();
         let prev_depth = self.pass_state.current_depth_texture();
+        let prev_depth_level = self.pass_state.current_depth_level();
         let prev_depth_size = self.pass_state.current_depth_size();
         let prev_depth_sampleable = self.pass_state.current_depth_is_sampleable();
         let prev_depth_has_stencil = self.pass_state.current_depth_has_stencil();
@@ -4670,8 +4679,9 @@ impl FrameEncoder {
 
         // Restore the device's previous attachments + viewport.
         self.pass_state.restore_color_attachments(saved_color);
-        self.pass_state.set_depth_stencil_attachment(
+        self.pass_state.set_depth_stencil_attachment_level(
             prev_depth,
+            prev_depth_level,
             prev_depth_size,
             prev_depth_sampleable,
             prev_depth_has_stencil,
@@ -4721,9 +4731,11 @@ impl FrameEncoder {
         // set comes back verbatim, scale and extra targets included.
         let saved_color = self.pass_state.take_color_attachments();
         let prev_depth = self.pass_state.current_depth_texture();
+        let prev_depth_level = self.pass_state.current_depth_level();
         let prev_depth_size = self.pass_state.current_depth_size();
         let prev_depth_sampleable = self.pass_state.current_depth_is_sampleable();
         let prev_depth_has_stencil = self.pass_state.current_depth_has_stencil();
+        let prev_depth_sample_count = self.pass_state.current_depth_sample_count();
         let prev_viewport = self.pass_state.viewport();
         let (prev_min_z, prev_max_z) = self.pass_state.viewport_depth_range();
 
@@ -4738,6 +4750,11 @@ impl FrameEncoder {
             fill.scale,
             fill.subresource,
         );
+        // A multisampled destination is filled through its companion and
+        // resolved into `fill.texture` at pass end; the next resolve would
+        // otherwise overwrite a fill painted into the single-sample texture.
+        self.pass_state
+            .set_color_msaa(fill.msaa, fill.msaa_srgb, fill.sample_count);
         self.pass_state
             .set_depth_stencil_attachment(MetalHandle::NULL, (0, 0), false, false);
         self.pass_state.set_viewport(rx, ry, rw, rh, 0.0, 1.0);
@@ -4763,12 +4780,18 @@ impl FrameEncoder {
 
         // Restore the device's previous attachments + viewport.
         self.pass_state.restore_color_attachments(saved_color);
-        self.pass_state.set_depth_stencil_attachment(
+        self.pass_state.set_depth_stencil_attachment_level(
             prev_depth,
+            prev_depth_level,
             prev_depth_size,
             prev_depth_sampleable,
             prev_depth_has_stencil,
         );
+        // The setter above reset the count, so it travels back with the
+        // handle; without it a multisampled depth attachment would come back
+        // declared single-sampled and be dropped at the next pass open.
+        self.pass_state
+            .set_depth_sample_count(prev_depth_sample_count);
         let (pvx, pvy, pvw, pvh) = prev_viewport;
         self.pass_state
             .set_viewport(pvx, pvy, pvw, pvh, prev_min_z, prev_max_z);

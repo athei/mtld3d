@@ -8604,6 +8604,9 @@ fn color_fill_render_target(
         subresource: (info.slice.unwrap_or(0), info.mip_level),
         rect: (region.x, region.y, region.w, region.h),
         rgba: (r.to_bits(), g.to_bits(), b.to_bits(), a.to_bits()),
+        msaa: info.msaa,
+        msaa_srgb: info.msaa_srgb,
+        sample_count: info.sample_count,
         regenerate_mipmaps: info.autogen_texture_id.is_some(),
     };
     let kind = info.kind;
