@@ -1253,14 +1253,22 @@ impl Overlay {
     }
 }
 
-/// Honor Win32's native hide only over the active device's unobscured client area.
+/// Whether this cursor mode owns native blank selection.
+const fn native_blank_needed(flags: CursorOverlayFlags) -> bool {
+    !flags.contains(CursorOverlayFlags::HARDWARE)
+        && flags.contains(CursorOverlayFlags::NATIVE_HIDDEN)
+}
+
+/// Honor a software cursor's native hide over the active device's unobscured client area.
 fn reconcile_native_cursor(
     mtm: MainThreadMarker,
     wanted: &WantedSnapshot,
     hit: Option<&PointerHit>,
 ) {
-    if !wanted.flags.contains(CursorOverlayFlags::NATIVE_HIDDEN) {
-        // Wine and the foreground application own visible cursors.
+    if !native_blank_needed(wanted.flags) {
+        // Wine owns hardware cursors, including their hide/show transitions.
+        // A sampled native hide can outlive its Win32 show and must not
+        // overwrite the cursor Wine has already restored.
         return;
     }
     let (Some(att), Some(hit)) = (wanted.owner.as_ref(), hit) else {

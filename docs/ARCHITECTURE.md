@@ -244,16 +244,21 @@ its own cursor and never supplies a D3D cursor surface. This adds no cursor imag
 or Metal window for such a game.
 
 The main-thread pointer watch owns one native blank image. It selects that image
-when the software overlay is visible or Win32 requests a native hide, only over
-the active, unobscured game client area and outside external captures. It compares
-the current native cursor by identity so an unchanged blank needs no setter call,
-while an AppKit replacement is repaired at the next reconciliation. This does not
-move the pointer, synthesize input, or change cursor hide counts. The image the
+when the software overlay is visible or its software cursor is natively hidden,
+only over the active, unobscured game client area and outside external captures.
+It compares the current native cursor by identity so an unchanged blank needs no
+setter call, while an AppKit replacement is repaired at the next reconciliation.
+This does not move the pointer, synthesize input, or change cursor hide counts.
+The image the
 blank displaced is never put back: Wine selects its own cursor again on every
 handle change, and what was displaced may be the arrow AppKit resolved for the
 pointer rather than Wine's cursor. Device release
 replaces an owned hidden blank HCURSOR with null before freeing it; visible
 cursors still restore the window's class cursor.
+
+Hardware cursor images and their hide/show transitions belong exclusively to
+Wine. The sampled native-hide bit can lag behind a Win32 show; applying a blank
+from that snapshot would overwrite Wine's restored cursor until pointer motion.
 
 The hit test serves both cursor modes. While the cursor is shown or natively
 hidden and the application active, the window a click at the pointer would land
