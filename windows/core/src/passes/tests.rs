@@ -5065,7 +5065,7 @@ fn pass_binds_depth_answers_for_the_attachment_the_pass_takes() {
         s.pass_binds_depth(),
         "the frame's own depth companion matches the target"
     );
-    s.set_depth_stencil_attachment(depth(), BB_SIZE, false, true);
+    s.set_depth_stencil_attachment(tex(0x2001), BB_SIZE, false, true);
     assert!(
         !s.pass_binds_depth(),
         "a single-sampled depth surface under a 4x target is dropped"
@@ -5168,8 +5168,9 @@ fn a_depth_attachment_that_disagrees_on_samples_is_dropped() {
     // The depth surface is single-sampled while render target 0 is 4x: Metal
     // rejects such a pass outright, so the attachment goes rather than the
     // draw.
+    let single = tex(0x2001);
     let mut s = fresh_multisampled();
-    s.set_depth_stencil_attachment(depth(), BB_SIZE, false, false);
+    s.set_depth_stencil_attachment(single, BB_SIZE, false, false);
     s.emit_command(dummy_draw());
     s.end_current_pass("test");
     assert!(
@@ -5179,11 +5180,11 @@ fn a_depth_attachment_that_disagrees_on_samples_is_dropped() {
 
     // Declared at the matching count it binds normally.
     let mut s = fresh_multisampled();
-    s.set_depth_stencil_attachment(depth(), BB_SIZE, false, false);
+    s.set_depth_stencil_attachment(single, BB_SIZE, false, false);
     s.set_depth_sample_count(4);
     s.emit_command(dummy_draw());
     s.end_current_pass("test");
-    assert_eq!(s.passes()[0].depth_texture(), depth());
+    assert_eq!(s.passes()[0].depth_texture(), single);
 }
 
 #[test]
@@ -5640,6 +5641,11 @@ fn a_clear_only_pass_does_not_fold_past_a_colour_resolve_into_its_target() {
     s.emit_command(dummy_draw());
     s.end_current_pass("test");
     assert_eq!(
+        s.passes()[0].color_attachment_texture(),
+        rt_msaa,
+        "the clear paints the companion the resolve reads"
+    );
+    assert_eq!(
         s.passes()[1].extra_color()[0].resolve_texture(),
         rt,
         "the middle pass resolves into the cleared target"
@@ -5659,6 +5665,107 @@ fn a_clear_only_pass_does_not_fold_past_a_colour_resolve_into_its_target() {
         matches!(s.passes()[2].color_load(), ColorLoad::Load),
         "the draw after the resolve loads what it wrote"
     );
+}
+
+#[test]
+fn a_target_switch_flushes_pending_clears_onto_the_outgoing_multisampled_attachments() {
+    // Clear(TARGET | ZBUFFER) with no pass open, then SetRenderTarget: the
+    // clear-only pass paints the target the clear was issued against, so it
+    // carries the back buffer's companion and its 4x depth surface.
+    let offscreen = tex(0x3300);
+    let mut s = fresh_multisampled();
+    s.clear_color(1, 2, 3, 4);
+    s.clear_depth(f32::to_bits(1.0));
+    s.set_color_render_target(
+        offscreen,
+        BB_SIZE.0,
+        BB_SIZE.1,
+        BB_FORMAT,
+        RenderScale::IDENTITY,
+    );
+
+    assert_eq!(s.passes().len(), 1, "the clears materialise as a pass");
+    let pass = &s.passes()[0];
+    assert_eq!(pass.color_texture(), backbuffer());
+    assert_eq!(
+        pass.color_attachment_texture(),
+        msaa_backbuffer(),
+        "the colour clear paints the companion the frame resolves"
+    );
+    assert!(matches!(pass.color_load(), ColorLoad::Clear { .. }));
+    assert_eq!(
+        pass.depth_texture(),
+        depth(),
+        "the depth surface matches the companion's sample count"
+    );
+    assert!(matches!(pass.depth_load(), DepthLoad::Clear { .. }));
+}
+
+#[test]
+fn a_depth_switch_flushes_the_pending_depth_clear_onto_the_outgoing_multisampled_surface() {
+    let other = tex(0x3301);
+    let mut s = fresh_multisampled();
+    s.clear_depth(f32::to_bits(1.0));
+    s.set_depth_stencil_attachment(other, BB_SIZE, false, false);
+    s.set_depth_sample_count(4);
+
+    assert_eq!(s.passes().len(), 1, "the clear materialises as a pass");
+    let pass = &s.passes()[0];
+    assert_eq!(
+        pass.depth_texture(),
+        depth(),
+        "the clear lands on the surface it was issued against"
+    );
+    assert!(matches!(pass.depth_load(), DepthLoad::Clear { .. }));
+    assert_eq!(s.current_depth_texture(), other);
+    assert_eq!(s.current_depth_sample_count(), 4);
+}
+
+#[test]
+fn rebinding_render_target_0_keeps_multisampled_extras_in_the_pass() {
+    let extra = tex(0x3302);
+    let extra_msaa = tex(0x3303);
+    let scene = tex(0x3304);
+    let scene_msaa = tex(0x3305);
+    let mut s = fresh_multisampled();
+    s.set_extra_color_render_target(1, Some(msaa_slot(extra, extra_msaa, BB_SIZE)));
+    assert_eq!(s.extra_present_mask(), 0b001);
+    s.emit_command(dummy_draw());
+
+    // Games re-assert the bound target between scenes.
+    s.set_color_render_target(
+        backbuffer(),
+        BB_SIZE.0,
+        BB_SIZE.1,
+        BB_FORMAT,
+        RenderScale::IDENTITY,
+    );
+    s.set_color_msaa(msaa_backbuffer(), msaa_backbuffer_srgb(), 4);
+    assert_eq!(
+        s.extra_present_mask(),
+        0b001,
+        "a redundant rebind keeps the 4x extra"
+    );
+    assert_eq!(s.passes().len(), 1);
+    assert!(!s.current_pass_closed(), "and keeps the pass open");
+
+    s.set_color_render_target(
+        scene,
+        BB_SIZE.0,
+        BB_SIZE.1,
+        BB_FORMAT,
+        RenderScale::IDENTITY,
+    );
+    s.set_color_msaa(scene_msaa, MetalHandle::NULL, 4);
+    assert_eq!(
+        s.extra_present_mask(),
+        0b001,
+        "a 4x target 0 readmits the 4x extra"
+    );
+    s.emit_command(dummy_draw());
+    let pass = s.passes().last().expect("the scene pass");
+    assert_eq!(pass.color_attachment_texture(), scene_msaa);
+    assert_eq!(pass.extra_color()[0].texture(), extra);
 }
 
 fn uneven_command_frame(s: &mut PassState) {

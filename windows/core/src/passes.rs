@@ -1823,31 +1823,45 @@ impl PassState {
     /// Attach `msaa` as render target 0's multisampled companion.
     ///
     /// Called in lockstep with `set_color_render_target*`, which clears both
-    /// fields first, so a single-sampled bind needs no call at all. `msaa`
-    /// NULL with a `sample_count` above 1 is the caller saying the target is
-    /// multisampled but its companion could not be created; the pass then
-    /// renders single-sampled into the resolve texture, which is visually
-    /// wrong only in that it is not antialiased.
+    /// fields when the target changes, so a single-sampled bind needs no call
+    /// at all. `msaa` NULL with a `sample_count` above 1 is the caller saying
+    /// the target is multisampled but its companion could not be created; the
+    /// pass then renders single-sampled into the resolve texture, which is
+    /// visually wrong only in that it is not antialiased.
     pub fn set_color_msaa(
         &mut self,
         msaa: MetalHandle<MTLTextureKind>,
         msaa_srgb: MetalHandle<MTLTextureKind>,
         sample_count: u8,
     ) {
-        self.current_color_msaa_texture = msaa;
-        self.current_color_msaa_srgb_texture = if msaa.is_null() {
+        let msaa_srgb = if msaa.is_null() {
             MetalHandle::NULL
         } else {
             msaa_srgb
         };
-        self.current_color_sample_count = if msaa.is_null() {
+        let sample_count = if msaa.is_null() {
             1
         } else {
             sample_count.max(1)
         };
-        // The companion carries its own sRGB view, so gaining or losing one
-        // can change whether the pass can encode through the attachment.
-        self.apply_srgb_write_change();
+        // A pass freezes its attachments when it opens, and a same-target
+        // rebind leaves it open, so a companion that differs from the one it
+        // attached ends it.
+        if self.current_color_msaa_texture != msaa
+            || self.current_color_msaa_srgb_texture != msaa_srgb
+            || self.current_color_sample_count != sample_count
+        {
+            if self.pending_color_clear.is_some() {
+                self.flush_pending_clears();
+            }
+            self.end_current_pass("set_color_msaa");
+        }
+        self.current_color_msaa_texture = msaa;
+        self.current_color_msaa_srgb_texture = msaa_srgb;
+        self.current_color_sample_count = sample_count;
+        // An extra target takes part only at target 0's sample count, and the
+        // mask recompute re-resolves the sRGB views the companion carries.
+        self.recompute_extra_present_mask();
     }
 
     /// Sample count of the currently bound render target 0.
@@ -1884,9 +1898,9 @@ impl PassState {
     /// Declare the sample count of the depth attachment bound alongside the colour one.
     ///
     /// Called in lockstep with `set_depth_stencil_attachment*`, which reset it
-    /// to 1. A depth attachment whose count does not match render target 0's
-    /// is dropped at pass open rather than handed to Metal, which rejects the
-    /// pass outright.
+    /// to 1 when the surface changes. A depth attachment whose count does not
+    /// match render target 0's is dropped at pass open rather than handed to
+    /// Metal, which rejects the pass outright.
     pub const fn set_depth_sample_count(&mut self, sample_count: u8) {
         self.current_depth_sample_count = if sample_count == 0 { 1 } else { sample_count };
     }
@@ -3115,18 +3129,10 @@ impl PassState {
         scale: RenderScale,
         subresource: (u32, u32),
     ) {
-        // A target binds without multisampling unless the caller says
-        // otherwise in the same breath, so a single-sampled target can never
-        // inherit the previous one's companion. Mirrors how
-        // `set_color_rt_has_alpha` is paired with this setter.
-        self.current_color_msaa_texture = MetalHandle::NULL;
-        self.current_color_msaa_srgb_texture = MetalHandle::NULL;
-        self.current_color_sample_count = 1;
         // `width`/`height` arrive logical, the size D3D9 reports for this
         // target; `scale` says what it is actually rasterized at.
         // `current_color_size` is the real texture extent.
-        self.current_color_scale = scale;
-        self.current_color_logical_size = (width, height);
+        let logical_size = (width, height);
         self.warn_if_scale_wasted(width, height, scale);
         let (width, height) = (scale.dimension(width), scale.dimension(height));
         let (slice, level) = subresource;
@@ -3140,6 +3146,10 @@ impl PassState {
             && self.current_color_format == format
             && self.current_color_size == (width, height)
         {
+            // The same target keeps its companion and sample count; the
+            // caller's `set_color_msaa` restates them.
+            self.current_color_scale = scale;
+            self.current_color_logical_size = logical_size;
             if self.has_extra_color_targets() {
                 self.recompute_extra_present_mask();
             } else {
@@ -3155,10 +3165,21 @@ impl PassState {
                 texture,
             );
         }
+        // The pending clears belong to the outgoing target, so they flush
+        // before any of its state is replaced.
         if self.pending_color_clear.is_some() {
             self.flush_pending_clears();
         }
         self.end_current_pass("set_color_rt");
+        // A target binds without multisampling unless the caller says
+        // otherwise in the same breath, so a single-sampled target can never
+        // inherit the previous one's companion. Mirrors how
+        // `set_color_rt_has_alpha` is paired with this setter.
+        self.current_color_msaa_texture = MetalHandle::NULL;
+        self.current_color_msaa_srgb_texture = MetalHandle::NULL;
+        self.current_color_sample_count = 1;
+        self.current_color_scale = scale;
+        self.current_color_logical_size = logical_size;
         self.current_color_texture = texture;
         self.current_color_subresource = packed_subresource;
         self.current_color_size = (width, height);
@@ -3215,17 +3236,9 @@ impl PassState {
                 || !self.seen_sampleable_depth_textures.contains(&texture),
             "depth handle {texture:#x} rebound as non-sampleable after a sampleable bind",
         );
-        // A depth surface binds single-sampled unless the caller declares
-        // otherwise in the same breath, exactly as a colour target does.
-        self.current_depth_sample_count = 1;
         if is_sampleable && !texture.is_null() {
             self.seen_sampleable_depth_textures.insert(texture);
         }
-        // `has_stencil` is a property of the bound texture's format, so a
-        // repeat bind of the same texture carries the same value — fold it
-        // before the no-change early-out below.
-        self.current_attachments
-            .set(CurrentAttachmentFlags::DEPTH_HAS_STENCIL, has_stencil);
         if self.current_depth_texture == texture
             && self.current_depth_level == level
             && self
@@ -3233,12 +3246,14 @@ impl PassState {
                 .contains(CurrentAttachmentFlags::DEPTH_SAMPLEABLE)
                 == is_sampleable
         {
-            // Same handle and level, so the same extent: a repeat bind carries
-            // nothing new for the size either.
+            // `has_stencil` is a property of the bound texture's format, so a
+            // repeat bind of the same texture carries the same value. Same
+            // handle and level, so the same extent and sample count too: a
+            // repeat bind carries nothing new for either.
+            self.current_attachments
+                .set(CurrentAttachmentFlags::DEPTH_HAS_STENCIL, has_stencil);
             return;
         }
-        self.current_attachments
-            .set(CurrentAttachmentFlags::DEPTH_SAMPLEABLE, is_sampleable);
         if log_enabled!(target: TRACE_TARGET, Level::Trace) {
             trace!(
                 target: TRACE_TARGET,
@@ -3249,10 +3264,19 @@ impl PassState {
                 level,
             );
         }
+        // The pending clears belong to the outgoing surface, so they flush
+        // before any of its state is replaced.
         if self.pending_depth_clear.is_some() || self.pending_stencil_clear.is_some() {
             self.flush_pending_clears();
         }
         self.end_current_pass("set_depth_attach");
+        // A depth surface binds single-sampled unless the caller declares
+        // otherwise in the same breath, exactly as a colour target does.
+        self.current_depth_sample_count = 1;
+        self.current_attachments
+            .set(CurrentAttachmentFlags::DEPTH_HAS_STENCIL, has_stencil);
+        self.current_attachments
+            .set(CurrentAttachmentFlags::DEPTH_SAMPLEABLE, is_sampleable);
         self.current_depth_texture = texture;
         self.current_depth_level = level;
         self.current_depth_size = size;
