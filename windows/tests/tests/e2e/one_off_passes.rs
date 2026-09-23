@@ -143,10 +143,16 @@ fn resolved_pixel(h: &Harness, source: &Surface<'_>, x: u32, y: u32) -> u32 {
 /// A far draw must lose against level 1 of a depth texture across `interrupt`.
 ///
 /// Level 1 of a 1280x960 INTZ chain is the back buffer's size and is bound
-/// beside it; level 0 is cleared to the far plane first, so a draw that tests
-/// against level 0 instead passes. A near red draw, then `interrupt` (a
-/// one-off pass against another target), then a far green draw: the green
-/// must fail the depth test the red one wrote into level 1.
+/// beside it; level 0 is given a depth behind the far draw first, so a draw
+/// that tests against level 0 instead passes. A near red draw, then
+/// `interrupt` (a one-off pass against another target), then a far green
+/// draw: the green must fail the depth test the red one wrote into level 1.
+///
+/// Level 0 gets its depth from a draw, not from a `Clear` alone. A clear with
+/// no draw after it is a clear-only pass, and the pass optimiser moves that
+/// clear onto the next pass attaching the same depth texture, whatever its
+/// level: the level-1 pass would take it and level 0 would keep the zeros it
+/// was created with, which the far draw fails against on either level.
 fn far_draw_loses_in_depth_level_1_across(interrupt: impl Fn(&Harness), context: &str) {
     let h = Harness::new();
     let backbuffer = h.back_buffer(0);
@@ -168,15 +174,22 @@ fn far_draw_loses_in_depth_level_1_across(interrupt: impl Fn(&Harness), context:
         "level-0-sized target"
     );
     assert_eq!(h.set_depth_stencil_surface(&level0), D3D_OK, "bind level 0");
+    arm_depth_test(&h);
+    assert_eq!(h.begin_scene(), D3D_OK, "BeginScene");
     assert_eq!(
         h.clear(D3DCLEAR_ZBUFFER, BLACK, 1.0, 0),
         D3D_OK,
         "level 0 at the far plane"
     );
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &fullscreen(0.9, WHITE)),
+        D3D_OK,
+        "level 0 behind the far draw"
+    );
+    assert_eq!(h.end_scene(), D3D_OK, "EndScene");
 
     assert_eq!(h.set_render_target(0, &backbuffer), D3D_OK, "back buffer");
     assert_eq!(h.set_depth_stencil_surface(&level1), D3D_OK, "bind level 1");
-    arm_depth_test(&h);
     assert_eq!(h.begin_scene(), D3D_OK, "BeginScene");
     assert_eq!(
         h.clear(D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, BLACK, 1.0, 0),
