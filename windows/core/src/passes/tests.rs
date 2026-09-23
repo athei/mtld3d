@@ -5214,6 +5214,82 @@ fn a_depth_attachment_that_disagrees_on_samples_is_dropped() {
     assert_eq!(s.passes()[0].depth_texture(), single);
 }
 
+/// A 4x frame with a depth and a stencil clear stashed, then a pass on a 1x target.
+///
+/// The pass drops the 4x depth surface, so the clears must stay pending
+/// rather than be consumed by a pass that has no attachment to apply them to.
+fn msaa_depth_clear_then_single_sampled_draw() -> PassState {
+    let mut s = fresh_multisampled();
+    assert_eq!(s.clear_depth(0x3f80_0000), DepthClearOutcome::Folded);
+    assert_eq!(s.clear_stencil(7), StencilClearOutcome::Folded);
+    s.set_color_render_target(tex(0x3000), 256, 256, RT_FORMAT, RenderScale::IDENTITY);
+    s.emit_command(dummy_draw());
+    assert!(s.passes()[0].depth_texture().is_null());
+    assert_eq!(s.pending_depth_clear(), Some(0x3f80_0000));
+    assert_eq!(s.pending_stencil_clear, Some(7));
+    s
+}
+
+#[test]
+fn a_pass_that_drops_depth_leaves_the_depth_clear_pending() {
+    let mut s = msaa_depth_clear_then_single_sampled_draw();
+    s.set_color_render_target(
+        backbuffer(),
+        BB_SIZE.0,
+        BB_SIZE.1,
+        BB_FORMAT,
+        s.render_scale,
+    );
+    s.set_color_msaa(msaa_backbuffer(), msaa_backbuffer_srgb(), 4);
+    s.emit_command(dummy_draw());
+    let pass = &s.passes()[1];
+    assert_eq!(pass.depth_texture(), depth());
+    assert_eq!(
+        pass.depth_load(),
+        DepthLoad::Clear { value: 0x3f80_0000 },
+        "the next pass that binds the depth surface applies the clear"
+    );
+    assert_eq!(pass.stencil_load(), StencilLoad::Clear { value: 7 });
+}
+
+#[test]
+fn a_depth_clear_left_pending_flushes_onto_its_own_surface() {
+    // Rebinding depth, submitting and retiring the surface all go through the
+    // flush while render target 0 still disagrees on samples: the clear lands
+    // in a depth-only pass on the surface it was issued for, never on the
+    // next one bound.
+    let expect_depth_only_clear = |s: &PassState| {
+        let pass = s.passes().last().expect("a clear pass");
+        assert!(pass.color_texture().is_null());
+        assert_eq!(pass.depth_texture(), depth());
+        assert_eq!(pass.depth_load(), DepthLoad::Clear { value: 0x3f80_0000 });
+        assert_eq!(pass.stencil_load(), StencilLoad::Clear { value: 7 });
+        assert!(s.pending_depth_clear().is_none());
+        assert!(s.pending_stencil_clear.is_none());
+        assert!(s.current_pass_closed());
+    };
+
+    let other = tex(0x4000);
+    let mut s = msaa_depth_clear_then_single_sampled_draw();
+    s.set_depth_stencil_attachment(other, (256, 256), false, true);
+    expect_depth_only_clear(&s);
+    s.emit_command(dummy_draw());
+    let pass = s.passes().last().unwrap();
+    assert_eq!(pass.depth_texture(), other);
+    assert!(
+        !matches!(pass.depth_load(), DepthLoad::Clear { .. }),
+        "the replacement surface does not inherit the clear"
+    );
+
+    let mut s = msaa_depth_clear_then_single_sampled_draw();
+    s.flush_pending_clears();
+    expect_depth_only_clear(&s);
+
+    let mut s = msaa_depth_clear_then_single_sampled_draw();
+    s.retire_depth_texture(depth());
+    expect_depth_only_clear(&s);
+}
+
 #[test]
 fn a_resolving_clear_only_pass_survives_the_cull() {
     // The pass has no draw and its multisample content is dead, but the

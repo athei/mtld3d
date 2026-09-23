@@ -2775,12 +2775,23 @@ impl PassState {
             && !self.seen_depth_rts.contains(&depth_texture)
             && !self.seen_sampled_textures.contains(&depth_texture)
             && !self.blit_written_rts.contains(&depth_texture);
-        let depth_load = match self.pending_depth_clear.take() {
+        // A pass that dropped the depth surface has nowhere to apply a pending
+        // depth or stencil clear, so both stay pending for the next pass that
+        // attaches the surface, or for `flush_pending_clears`.
+        let (pending_depth, pending_stencil) = if depth_texture.is_null() {
+            (None, None)
+        } else {
+            (
+                self.pending_depth_clear.take(),
+                self.pending_stencil_clear.take(),
+            )
+        };
+        let depth_load = match pending_depth {
             Some(value) => DepthLoad::Clear { value },
             None if ENABLE_FIRST_USE_DONTCARE && depth_first_use => DepthLoad::DontCare,
             None => DepthLoad::Load,
         };
-        let stencil_load = match self.pending_stencil_clear.take() {
+        let stencil_load = match pending_stencil {
             Some(value) => StencilLoad::Clear { value },
             None if ENABLE_FIRST_USE_STENCIL_DONTCARE && depth_first_use => StencilLoad::DontCare,
             None => StencilLoad::Load,
@@ -3081,14 +3092,84 @@ impl PassState {
     /// time; if the game then changes rt (or calls Present without drawing),
     /// the original target must still be cleared. This is a no-op when there
     /// are no pending clears.
+    ///
+    /// A depth or stencil clear the current attachments cannot carry (render
+    /// target 0 disagrees with the depth surface on samples) is materialised
+    /// as a depth-only pass on the bound depth surface. Nothing is left
+    /// pending afterwards, so the depth setters, which flush before they
+    /// rebind, never let a clear reach a different surface.
     pub fn flush_pending_clears(&mut self) {
-        if self.pending_color_clear.is_some()
-            || self.pending_depth_clear.is_some()
-            || self.pending_stencil_clear.is_some()
-        {
+        let depth_pending =
+            self.pending_depth_clear.is_some() || self.pending_stencil_clear.is_some();
+        if self.pending_color_clear.is_some() || (depth_pending && self.pass_binds_depth()) {
             self.ensure_pass_open();
             self.end_current_pass("flush_pending_clears");
         }
+        if self.pending_depth_clear.is_some() || self.pending_stencil_clear.is_some() {
+            self.push_depth_clear_pass();
+        }
+    }
+
+    /// Record the pending depth and stencil clears as a closed pass with no colour attachment.
+    ///
+    /// Shaped like the depth resolve pass: no draws, the whole depth surface
+    /// as its extent, and the load actions doing the work. A pending clear
+    /// with no depth surface bound has nothing to land on and is dropped.
+    fn push_depth_clear_pass(&mut self) {
+        let depth_texture = self.current_depth_texture;
+        let depth_load = self
+            .pending_depth_clear
+            .take()
+            .map_or(DepthLoad::Load, |value| DepthLoad::Clear { value });
+        let stencil_load = self
+            .pending_stencil_clear
+            .take()
+            .map_or(StencilLoad::Load, |value| StencilLoad::Clear { value });
+        if depth_texture.is_null() {
+            mtld3d_shared::log_once_warn!(
+                target: crate::LOG_TARGET,
+                "pending depth/stencil clear with no depth attachment bound → dropped"
+            );
+            return;
+        }
+        self.end_current_pass("depth_clear");
+        let (width, height) = self.current_depth_size;
+        let commands = self
+            .command_vec_pool
+            .pop()
+            .unwrap_or_else(|| Vec::with_capacity(64));
+        self.passes.push(Pass {
+            color_texture: MetalHandle::NULL,
+            color_srgb_texture: MetalHandle::NULL,
+            color_msaa_texture: MetalHandle::NULL,
+            color_msaa_srgb_texture: MetalHandle::NULL,
+            color_resolve_texture: MetalHandle::NULL,
+            color_subresource: 0,
+            color_size: (width, height),
+            color_format: self.current_color_format,
+            color_load: ColorLoad::DontCare,
+            color_store: StoreAction::DontCare,
+            depth_texture,
+            depth_level: self.current_depth_level,
+            depth_load,
+            stencil_load,
+            depth_store: StoreAction::Store,
+            depth_resolve_texture: MetalHandle::NULL,
+            depth_resolve_filter: DepthResolveFilter::Sample0,
+            viewport: (0, 0, width, height),
+            commands,
+            leading_blits: core::mem::take(&mut self.pending_leading_blits),
+            has_counting_visibility: false,
+            depth_is_sampleable: self
+                .current_attachments
+                .contains(CurrentAttachmentFlags::DEPTH_SAMPLEABLE),
+            color_writes_observed: false,
+            color_clear_quad_ranges: Vec::new(),
+            extra_color: core::array::from_fn(|_| PassColorAttachment::NONE),
+        });
+        self.current_pass_closed = true;
+        self.seen_depth_rts.insert(depth_texture);
+        self.seen_depth_rts_segment.insert(depth_texture);
     }
 
     /// Rebind the color attachment for the next pass.
