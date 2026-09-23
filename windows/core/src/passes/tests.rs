@@ -5317,6 +5317,53 @@ fn a_read_between_passes_pulls_the_resolve_forward() {
 }
 
 #[test]
+fn a_read_after_a_pending_clear_resolves_the_clear_only_pass() {
+    // Clear(rt) with no pass open, StretchRect(rt -> dst), then a draw into rt
+    // in the same submission. The `StretchRect` path materialises the clear
+    // before it notes the read, so the clear-only pass takes the resolve and
+    // the copy reads the cleared contents rather than whatever the twin held.
+    let rt = tex(0x3400);
+    let rt_msaa = tex(0x3401);
+    let dst = tex(0x3402);
+    let mut s = fresh();
+    s.set_color_render_target(rt, BB_SIZE.0, BB_SIZE.1, BB_FORMAT, RenderScale::IDENTITY);
+    s.set_color_msaa(rt_msaa, MetalHandle::NULL, 4);
+    s.clear_color(0, 0, 255, 255);
+    assert!(
+        s.pending_color_clear().is_some(),
+        "a first clear of an untouched target waits for a pass"
+    );
+    s.flush_pending_clears();
+    s.note_msaa_read(rt);
+    s.push_pending_leading_blit(copy_blit(rt, dst));
+    s.emit_command(dummy_draw());
+    s.end_current_pass("test");
+    s.coalesce_clear_only_passes();
+    s.finalize_store_actions(false);
+
+    assert_eq!(s.passes().len(), 2, "the clear stays a pass of its own");
+    assert!(
+        matches!(s.passes()[0].color_load(), ColorLoad::Clear { .. }),
+        "the first pass is the clear"
+    );
+    assert_eq!(
+        s.passes()[0].color_resolve_texture(),
+        rt,
+        "the clear-only pass resolves before the copy reads rt"
+    );
+    assert_eq!(
+        s.passes()[1].leading_blits().len(),
+        1,
+        "the copy runs ahead of the draw"
+    );
+    assert_eq!(
+        s.passes()[1].color_resolve_texture(),
+        rt,
+        "and the last use still resolves"
+    );
+}
+
+#[test]
 fn a_depth_attachment_that_disagrees_on_samples_is_dropped() {
     // The depth surface is single-sampled while render target 0 is 4x: Metal
     // rejects such a pass outright, so the attachment goes rather than the

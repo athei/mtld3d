@@ -1433,6 +1433,64 @@ fn a_clear_before_a_stretch_rect_resolve_does_not_wipe_it() {
     );
 }
 
+#[test]
+fn a_stretch_rect_after_a_clear_resolves_the_cleared_contents() {
+    // Frame one leaves a white multisampled surface resolved into its twin.
+    // Frame two clears it to blue with no draw, copies it out, then draws
+    // into it again. The copy is ordered after the clear, so it reads blue,
+    // not the white the twin held from the frame before.
+    let h = harness(D3DMULTISAMPLE_NONE, None);
+    let ms = h.create_render_target_ms(
+        (RT_SIZE, RT_SIZE),
+        D3DFMT_A8R8G8B8,
+        (D3DMULTISAMPLE_4_SAMPLES, 0),
+    );
+    let copy = h.create_render_target(RT_SIZE, RT_SIZE, D3DFMT_A8R8G8B8);
+    arm(&h);
+    h.select_diffuse_stage(0);
+
+    assert_eq!(h.set_render_target(0, &ms), 0, "SetRenderTarget(first)");
+    assert_eq!(h.begin_scene(), 0, "BeginScene(first)");
+    assert_eq!(h.clear_target(BLACK), 0, "clear the first frame");
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &covering_triangle(0.5)),
+        0,
+        "covering draw",
+    );
+    assert_eq!(h.end_scene(), 0, "EndScene(first)");
+    assert_eq!(h.present(), 0, "Present the first frame");
+
+    assert_eq!(h.set_render_target(0, &ms), 0, "SetRenderTarget(second)");
+    assert_eq!(h.begin_scene(), 0, "BeginScene(second)");
+    assert_eq!(h.clear_target(BLUE), 0, "clear with no draw after it");
+    assert_eq!(h.end_scene(), 0, "EndScene(second)");
+    assert_eq!(
+        h.stretch_rect(&ms, &copy, D3DTEXF_NONE),
+        D3D_OK,
+        "StretchRect the cleared surface out"
+    );
+    assert_eq!(h.set_render_target(0, &ms), 0, "SetRenderTarget(over)");
+    assert_eq!(h.begin_scene(), 0, "BeginScene(over)");
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &corner_triangle(BLACK)),
+        0,
+        "corner draw after the copy",
+    );
+    assert_eq!(h.end_scene(), 0, "EndScene(over)");
+
+    let row = surface_row(&h, &copy, (RT_SIZE, RT_SIZE));
+    assert_pixel_eq(
+        row[INSIDE_X as usize],
+        BLUE,
+        "the draw after the copy does not reach it",
+    );
+    assert_pixel_eq(
+        row[(RT_SIZE - 4) as usize],
+        BLUE,
+        "the copy reads the clear ordered before it",
+    );
+}
+
 fn coverage_pixel(h: &Harness, target: &Surface<'_>, resolve: &Surface<'_>, color: u32) -> u32 {
     draw_coverage(h, target, color);
     assert_eq!(h.stretch_rect(target, resolve, D3DTEXF_NONE), D3D_OK);

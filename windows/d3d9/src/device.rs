@@ -7984,6 +7984,12 @@ fn emit_stretch_rect_blit(
     // surface. The blit runs after the passes recorded so far, so the last of
     // them that rendered into the multisampled companion takes the resolve;
     // for a single-sampled source this finds nothing and does nothing.
+    // A `Clear` still waiting for a pass is one of those passes: D3D9 ordered
+    // it before the copy, so it becomes a pass first and takes the resolve,
+    // rather than an older pass handing the copy pre-clear content.
+    if !src_info.msaa.is_null() {
+        enc.flush_pending_clears();
+    }
     // SAFETY: `src_handle` came from the encoder's texture cache or from a
     // surface's retained handle, both of which are `MTLTexture` handles.
     enc.note_msaa_read(unsafe { MetalHandle::<MTLTextureKind>::new(src_handle) });
