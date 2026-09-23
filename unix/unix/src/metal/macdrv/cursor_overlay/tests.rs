@@ -399,7 +399,10 @@ fn native_hide_without_a_sprite_wakes_main_and_retires_with_its_device() {
     assert!(!shared.pending);
     native.flags = CursorOverlayFlags::HARDWARE;
     assert!(shared.update(A, &native, None));
-    assert!(shared.pending, "show must release the native blank on main");
+    assert!(
+        shared.pending,
+        "show must reconcile pointer capture on main"
+    );
     assert!(shared.detach(&owner));
     assert!(shared.snapshot().flags.is_empty());
     assert!(shared.pending, "detach must reconcile the retired owner");
@@ -539,4 +542,45 @@ fn same_mode_color_handoffs_compare_profile_format_and_edr_independently() {
     next.edr = false;
     next.colorspace = None;
     assert_ne!(current, next);
+}
+
+#[test]
+fn hardware_show_is_not_overwritten_by_a_stale_native_hide() {
+    use mtld3d_shared::mtl::CursorOverlayFlags;
+    const A: usize = 0xcf_0000;
+    let _owner = attachment(A);
+    let mut shared = super::Shared::default();
+    let mut hardware = request(0);
+    hardware.flags = CursorOverlayFlags::HARDWARE | CursorOverlayFlags::NATIVE_HIDDEN;
+    assert!(shared.update(A, &hardware, None));
+    let hidden = shared.snapshot();
+
+    // The game has shown its HCURSOR, but Present has not sampled that yet.
+    hardware.flags |= CursorOverlayFlags::VISIBLE;
+    assert!(shared.update(A, &hardware, None));
+    let shown_before_poll = shared.snapshot();
+    hardware.flags.remove(CursorOverlayFlags::NATIVE_HIDDEN);
+    assert!(shared.update(A, &hardware, None));
+    let shown_after_poll = shared.snapshot();
+
+    for snapshot in [hidden, shown_before_poll, shown_after_poll] {
+        assert!(snapshot.sprite.is_none());
+        assert!(
+            !super::native_blank_needed(snapshot.flags),
+            "a delayed hardware snapshot must never replace Wine's cursor"
+        );
+    }
+    super::attachment::unregister(A);
+}
+
+#[test]
+fn software_native_hide_still_selects_the_blank() {
+    use mtld3d_shared::mtl::CursorOverlayFlags;
+    assert!(super::native_blank_needed(
+        CursorOverlayFlags::NATIVE_HIDDEN
+    ));
+    assert!(super::native_blank_needed(
+        CursorOverlayFlags::VISIBLE | CursorOverlayFlags::NATIVE_HIDDEN
+    ));
+    assert!(!super::native_blank_needed(CursorOverlayFlags::VISIBLE));
 }
