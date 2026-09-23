@@ -327,7 +327,7 @@ pub struct ExtraColorSlot {
     /// the pass, the same way a differently-sized one does not: Metal takes a
     /// pass's sample count from its attachments and rejects a disagreement.
     pub sample_count: u8,
-    /// `slice | (level << 8)`, as on [`Pass`].
+    /// `slice | (level << 16)`, as on [`Pass`].
     pub subresource: u32,
     pub size: (u32, u32),
     pub logical_size: (u32, u32),
@@ -460,11 +460,11 @@ impl PassColorAttachment {
     }
     #[must_use]
     pub const fn slice(&self) -> u32 {
-        self.subresource & 0xff
+        self.subresource & 0xffff
     }
     #[must_use]
     pub const fn level(&self) -> u32 {
-        self.subresource >> 8
+        self.subresource >> 16
     }
     #[must_use]
     pub const fn format(&self) -> PixelFormat {
@@ -546,7 +546,7 @@ impl SavedColorAttachments {
                 msaa_texture: self.msaa_texture,
                 msaa_srgb_texture: self.msaa_srgb_texture,
                 sample_count: self.sample_count,
-                subresource: self.slice | (self.level << 8),
+                subresource: self.slice | (self.level << 16),
                 size: (
                     self.scale.dimension(self.logical_size.0),
                     self.scale.dimension(self.logical_size.1),
@@ -818,11 +818,11 @@ impl Pass {
     }
     #[must_use]
     pub const fn color_slice(&self) -> u32 {
-        self.color_subresource & 0xff
+        self.color_subresource & 0xffff
     }
     #[must_use]
     pub const fn color_level(&self) -> u32 {
-        self.color_subresource >> 8
+        self.color_subresource >> 16
     }
     #[must_use]
     pub const fn color_size(&self) -> (u32, u32) {
@@ -2024,8 +2024,8 @@ impl PassState {
             msaa_texture: self.current_color_msaa_texture,
             msaa_srgb_texture: self.current_color_msaa_srgb_texture,
             sample_count: self.current_color_sample_count,
-            slice: self.current_color_subresource & 0xff,
-            level: self.current_color_subresource >> 8,
+            slice: self.current_color_subresource & 0xffff,
+            level: self.current_color_subresource >> 16,
             logical_size: self.current_color_logical_size,
             format: self.current_color_format,
             scale: self.current_color_scale,
@@ -2959,7 +2959,7 @@ impl PassState {
             ColorLoad::Load
         };
         let (slice, level) = target.subresource;
-        let subresource = slice | (level << 8);
+        let subresource = slice | (level << 16);
         let mut cmds = self
             .command_vec_pool
             .pop()
@@ -3240,7 +3240,7 @@ impl PassState {
         self.warn_if_scale_wasted(width, height, scale);
         let (width, height) = (scale.dimension(width), scale.dimension(height));
         let (slice, level) = subresource;
-        let packed_subresource = slice | (level << 8);
+        let packed_subresource = slice | (level << 16);
         // A pass freezes the attachment's format and extent when it opens, so
         // the binding is only unchanged when both still match: a same-handle
         // rebind that moves either one leaves the descriptor carrying one pair

@@ -3689,7 +3689,7 @@ impl FrameEncoder {
                 target.logical_size.1,
                 target.format,
                 target.scale,
-                (target.subresource & 0xff, target.subresource >> 8),
+                (target.subresource & 0xffff, target.subresource >> 16),
             );
             self.pass_state.set_color_rt_has_alpha(target.has_alpha);
             self.pass_state.set_color_msaa(
@@ -7953,6 +7953,20 @@ impl FrameEncoder {
         let _t = mtld3d_core::perf::CycleAddTimer::start(self.op_sub_cycles_ptr(OpSub::TexRaw));
         let backing_length = job.staging.backing().len() as u64;
         if backing_length == 0 || job.bytes_per_pixel != decode.bytes_per_texel() {
+            return false;
+        }
+        // One pass per depth plane, and `pass_flags` carries the plane: a
+        // deeper volume would wrap onto the planes below it.
+        if job.depth > PassDescriptor::MAX_COLOR_SLICE + 1 {
+            mtld3d_shared::log_once_warn_by!(
+                target: LOG_TARGET,
+                key: job.info.texture_id.raw(),
+                "run_texture_upload_pass: volume {:#x} is {} planes deep, past the {} an upload \
+                 pass can address; declining the upload",
+                job.info.texture_id.raw(),
+                job.depth,
+                PassDescriptor::MAX_COLOR_SLICE + 1,
+            );
             return false;
         }
         let pipeline = self.get_or_create_upload_pipeline(job.info.pixel_format);

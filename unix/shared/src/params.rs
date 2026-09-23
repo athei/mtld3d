@@ -843,10 +843,11 @@ pub struct PassDescriptor {
     pub leading_blits_count: u32,                   // in
     /// Leading-blit and color-subresource flags.
     ///
-    /// Bit 0 is whether the leading-blit list needs an encoder. Bits 1..3
-    /// carry the color attachment slice, and bits 4..7 carry its mip level.
-    /// Ordinary 2D level-zero passes therefore retain their previous 0/1
-    /// value and the descriptor keeps its size.
+    /// Bit 0 is whether the leading-blit list needs an encoder. Bits 1..11
+    /// carry the color attachment slice, wide enough for every depth plane of
+    /// a volume, bits 12..15 its mip level and bits 16..19 the depth
+    /// attachment's mip level. Ordinary 2D level-zero passes therefore retain
+    /// their previous 0/1 value and the descriptor keeps its size.
     pub pass_flags: u32, // in
     /// Render targets 1..3 (`colorAttachments[1..=3]`); `texture` null = unbound.
     ///
@@ -860,8 +861,13 @@ pub struct PassDescriptor {
 impl PassDescriptor {
     const LEADING_BLITS_NEED_ENCODER: u32 = 1;
     const COLOR_SLICE_SHIFT: u32 = 1;
-    const COLOR_LEVEL_SHIFT: u32 = 4;
-    const DEPTH_LEVEL_SHIFT: u32 = 8;
+    const COLOR_LEVEL_SHIFT: u32 = 12;
+    const DEPTH_LEVEL_SHIFT: u32 = 16;
+    /// Largest color attachment slice `pass_flags` carries.
+    ///
+    /// Eleven bits: an upload pass addresses each depth plane of a volume,
+    /// and `D3DCAPS9::MaxVolumeExtent` advertises 2048.
+    pub const MAX_COLOR_SLICE: u32 = 0x7ff;
 
     /// Pack leading-blit, color-subresource and depth-level state.
     #[must_use]
@@ -872,7 +878,7 @@ impl PassDescriptor {
         depth_level: u32,
     ) -> u32 {
         (if needs_encoder { 1 } else { 0 })
-            | ((color_slice & 0x7) << Self::COLOR_SLICE_SHIFT)
+            | ((color_slice & Self::MAX_COLOR_SLICE) << Self::COLOR_SLICE_SHIFT)
             | ((color_level & 0xf) << Self::COLOR_LEVEL_SHIFT)
             | ((depth_level & 0xf) << Self::DEPTH_LEVEL_SHIFT)
     }
@@ -892,7 +898,7 @@ impl PassDescriptor {
     /// Color attachment array slice.
     #[must_use]
     pub const fn color_slice(&self) -> u32 {
-        (self.pass_flags >> Self::COLOR_SLICE_SHIFT) & 0x7
+        (self.pass_flags >> Self::COLOR_SLICE_SHIFT) & Self::MAX_COLOR_SLICE
     }
 
     /// Color attachment mip level.
@@ -905,8 +911,8 @@ impl PassDescriptor {
 /// One of render targets 1..3 on a [`PassDescriptor`].
 ///
 /// `subresource` packs the array slice in bits 0..7 and the mip level in
-/// bits 8..15, the same packing the PE side keeps for attachment 0 before it
-/// folds it into `pass_flags`. 24 bytes, 8-aligned through `texture`.
+/// bits 8..15: an extra attachment is a render target, whose slice is a cube
+/// face at most. 24 bytes, 8-aligned through `texture`.
 #[repr(C)]
 pub struct ExtraColorDesc {
     pub texture: MetalHandle<MTLTextureKind>, // in (NULL = unbound)

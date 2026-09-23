@@ -1821,7 +1821,7 @@ impl DeviceInner {
                         msaa_texture: msaa,
                         msaa_srgb_texture: msaa_srgb,
                         sample_count,
-                        subresource: slice | (level << 8),
+                        subresource: slice | (level << 16),
                         // Derived from `logical_size` and `scale` by the setter.
                         size: (0, 0),
                         logical_size: (w, h),
