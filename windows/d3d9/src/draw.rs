@@ -1867,14 +1867,14 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
     }
 
     // D3DRS_BLENDFACTOR drives Metal's per-encoder constant blend
-    // color. Default is 0xFFFFFFFF (opaque white), which is also the
-    // Metal default — only emit the command when the game has overridden
-    // it, so the per-pass command stream stays minimal for the common
-    // case where no constant-color blend is used.
-    if render_state.blend_factor != 0xFFFF_FFFF
-        && enc
-            .last_bound()
-            .blend_color_changed(render_state.blend_factor)
+    // color. The D3D9 default 0xFFFFFFFF (opaque white) is also Metal's,
+    // and the cache starts each fresh encoder at it, so a pass that never
+    // overrides the factor emits nothing. Every change is emitted,
+    // including back to the default, so a pass that restores white
+    // mid-encoder doesn't keep blending with the previous factor.
+    if enc
+        .last_bound()
+        .blend_color_changed(render_state.blend_factor)
     {
         let [r, g, b, a] = mtld3d_core::convert::d3dcolor_to_rgba_f32(render_state.blend_factor);
         enc.emit_command(Command::set_blend_color(r, g, b, a));

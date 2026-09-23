@@ -14053,7 +14053,7 @@ const fn rs_classify(index: u32, value: u32) -> RsClass {
         | D3DRS_CLIPPLANEENABLE
         // BLENDFACTOR feeds the per-encoder constant blend color via
         // `Command::set_blend_color`, emitted in `emit_draw` whenever
-        // the value differs from the default opaque white.
+        // the value differs from the one bound on the encoder.
         | D3DRS_BLENDFACTOR
         // DEPTHBIAS feeds the vertex shaders' `pos_fixup.depth_bias`
         // and SLOPESCALEDEPTHBIAS Metal's per-encoder rasterizer offset
