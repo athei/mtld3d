@@ -5131,6 +5131,173 @@ fn a_multisampled_target_without_a_companion_twin_keeps_the_linear_attachment() 
     assert_eq!(pass.color_resolve_texture(), backbuffer());
 }
 
+// ── Colour strips drop every view of attachment 0 ──
+
+/// Rule H on a pass that encodes through the sRGB twin attaches no colour at all.
+///
+/// The pass's pipelines are rewritten to the no-colour variant, so an
+/// attachment left behind through the twin view fails Metal's
+/// pipeline-versus-render-pass format validation.
+#[test]
+fn rule_h_strip_drops_the_srgb_twin_view() {
+    let mut s = fresh();
+    s.set_srgb_write_enabled(true);
+    assert!(s.pass_srgb_write());
+    s.note_draw_color_write_mask(0);
+    s.emit_command(set_pso(PSO_WITH));
+    s.emit_command(dummy_draw());
+    s.end_current_pass("test");
+    assert_eq!(s.passes()[0].color_attachment_texture(), backbuffer_srgb());
+    let mut alt = FxHashMap::default();
+    alt.insert(PSO_WITH, pso(PSO_NO_COLOR));
+
+    s.strip_color_from_no_color_draw_passes(&alt);
+
+    assert_eq!(s.passes()[0].color_texture(), MetalHandle::NULL);
+    assert_eq!(
+        s.passes()[0].color_attachment_texture(),
+        MetalHandle::NULL,
+        "the stripped pass must not attach the sRGB twin"
+    );
+}
+
+/// Rule H on a multisampled pass that does not take the resolve attaches no colour at all.
+///
+/// Leaving the companion attached with `DontCare` store would also discard
+/// the samples an earlier pass stored for the later pass that loads them.
+#[test]
+fn rule_h_strip_drops_the_multisampled_companion() {
+    let rt = tex(0x3000);
+    let mut s = fresh_multisampled();
+    s.note_draw_color_write_mask(0);
+    s.emit_command(set_pso(PSO_WITH));
+    s.emit_command(dummy_draw());
+    s.set_color_render_target(rt, 256, 256, RT_FORMAT, RenderScale::IDENTITY);
+    s.note_draw_color_write_mask(0xF);
+    s.emit_command(dummy_draw());
+    s.set_color_render_target(
+        backbuffer(),
+        BB_SIZE.0,
+        BB_SIZE.1,
+        BB_FORMAT,
+        s.render_scale,
+    );
+    s.set_color_msaa(msaa_backbuffer(), msaa_backbuffer_srgb(), 4);
+    s.note_draw_color_write_mask(0xF);
+    s.emit_command(dummy_draw());
+    s.end_current_pass("test");
+    s.finalize_store_actions(false);
+    assert_eq!(s.passes().len(), 3);
+    assert!(
+        s.passes()[0].color_resolve_texture().is_null(),
+        "the last pass on the back buffer takes the resolve"
+    );
+    assert_eq!(s.passes()[0].color_attachment_texture(), msaa_backbuffer());
+    let mut alt = FxHashMap::default();
+    alt.insert(PSO_WITH, pso(PSO_NO_COLOR));
+
+    s.strip_color_from_no_color_draw_passes(&alt);
+
+    assert_eq!(s.passes()[0].color_texture(), MetalHandle::NULL);
+    assert_eq!(
+        s.passes()[0].color_attachment_texture(),
+        MetalHandle::NULL,
+        "the stripped pass must not attach the multisampled companion"
+    );
+    assert_eq!(
+        s.passes()[2].color_attachment_texture(),
+        msaa_backbuffer(),
+        "the colour-writing pass keeps its attachment"
+    );
+}
+
+/// Rule G on a clear-only pass that encodes through the sRGB twin attaches no colour at all.
+#[test]
+fn rule_g_strip_drops_the_srgb_twin_view() {
+    let cascade_color = tex(0x3000);
+    let cascade_twin = tex(0x3001);
+    let cascade_d0 = tex(0x9000);
+    let cascade_d1 = tex(0x9100);
+    let mut s = fresh();
+    s.register_srgb_twin(cascade_twin, cascade_color);
+    s.set_color_render_target(cascade_color, 2048, 2048, RT_FORMAT, RenderScale::IDENTITY);
+    s.set_srgb_write_enabled(true);
+    assert!(s.pass_srgb_write());
+    s.set_depth_stencil_attachment(cascade_d0, BB_SIZE, false, false);
+    s.clear_color(1, 2, 3, 4);
+    s.clear_depth(f32::to_bits(1.0));
+    s.set_depth_stencil_attachment(cascade_d1, BB_SIZE, false, false);
+    s.clear_color(1, 2, 3, 4);
+    s.clear_depth(f32::to_bits(1.0));
+    s.emit_command(dummy_draw());
+    s.set_srgb_write_enabled(false);
+    s.set_color_render_target(
+        backbuffer(),
+        BB_SIZE.0,
+        BB_SIZE.1,
+        BB_FORMAT,
+        s.render_scale,
+    );
+    s.set_depth_stencil_attachment(depth(), BB_SIZE, false, false);
+    s.emit_command(Command::set_fragment_texture(cascade_d0.raw(), 4));
+    s.emit_command(dummy_draw());
+    s.end_current_pass("test");
+    s.finalize_load_actions();
+    s.finalize_store_actions(false);
+    let before = s
+        .passes()
+        .iter()
+        .find(|p| p.depth_texture() == cascade_d0)
+        .expect("cascade_d0 pass");
+    assert_eq!(before.color_attachment_texture(), cascade_twin);
+    assert_eq!(before.color_store(), StoreAction::DontCare);
+
+    s.strip_dead_color_in_clear_only_passes();
+
+    let stripped = s
+        .passes()
+        .iter()
+        .find(|p| p.depth_texture() == cascade_d0)
+        .expect("cascade_d0 pass");
+    assert_eq!(stripped.color_texture(), MetalHandle::NULL);
+    assert_eq!(
+        stripped.color_attachment_texture(),
+        MetalHandle::NULL,
+        "the stripped pass must not attach the sRGB twin"
+    );
+}
+
+/// Rule G on a multisampled clear-only pass that does not take the resolve attaches no colour.
+#[test]
+fn rule_g_strip_drops_the_multisampled_companion() {
+    let second_depth = tex(0x9000);
+    let mut s = fresh_multisampled();
+    s.clear_color(1, 1, 1, 1);
+    s.clear_depth(f32::to_bits(1.0));
+    s.ensure_pass_open();
+    s.set_depth_stencil_attachment(second_depth, BB_SIZE, false, false);
+    s.set_depth_sample_count(4);
+    s.clear_color(1, 1, 1, 1);
+    s.note_draw_color_write_mask(0xF);
+    s.emit_command(dummy_draw());
+    s.end_current_pass("test");
+    s.finalize_load_actions();
+    s.finalize_store_actions(false);
+    assert_eq!(s.passes().len(), 2);
+    assert!(s.passes()[0].color_resolve_texture().is_null());
+    assert_eq!(s.passes()[0].color_store(), StoreAction::DontCare);
+    assert_eq!(s.passes()[0].color_attachment_texture(), msaa_backbuffer());
+
+    s.strip_dead_color_in_clear_only_passes();
+
+    assert_eq!(s.passes()[0].color_texture(), MetalHandle::NULL);
+    assert_eq!(
+        s.passes()[0].color_attachment_texture(),
+        MetalHandle::NULL,
+        "the stripped pass must not attach the multisampled companion"
+    );
+}
+
 // ── RESZ depth resolve ──
 
 #[test]

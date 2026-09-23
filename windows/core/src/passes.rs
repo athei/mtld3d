@@ -755,6 +755,23 @@ impl Pass {
             self.color_srgb_texture
         }
     }
+    /// Drop colour attachment 0 together with every view of it the render pass could bind.
+    ///
+    /// `color_attachment_texture` falls back to the sRGB twin and the
+    /// multisampled companion, so a strip that nulled `color_texture` alone
+    /// would still attach one of those, `DontCare` on both ends, to a pass
+    /// whose pipelines may declare no colour output. Load and store go back
+    /// to their unused defaults so a stale `Clear` does not mislead readers.
+    const fn drop_color_attachment(&mut self) {
+        self.color_texture = MetalHandle::NULL;
+        self.color_srgb_texture = MetalHandle::NULL;
+        self.color_msaa_texture = MetalHandle::NULL;
+        self.color_msaa_srgb_texture = MetalHandle::NULL;
+        self.color_resolve_texture = MetalHandle::NULL;
+        self.color_subresource = 0;
+        self.color_load = ColorLoad::DontCare;
+        self.color_store = StoreAction::DontCare;
+    }
     /// Render targets 1..3 of this pass, unbound entries included.
     #[must_use]
     pub const fn extra_color(&self) -> &[PassColorAttachment; 3] {
@@ -4006,14 +4023,7 @@ impl PassState {
                 && !pass.depth_texture.is_null()
             {
                 let stripped = pass.color_texture;
-                pass.color_texture = MetalHandle::NULL;
-                pass.color_subresource = 0;
-                // Once the color attachment is gone, the load/store
-                // actions are moot for the unix side; reset them to
-                // their unused defaults so a stale `Clear` doesn't
-                // mislead readers.
-                pass.color_load = ColorLoad::DontCare;
-                pass.color_store = StoreAction::DontCare;
+                pass.drop_color_attachment();
                 if log_enabled!(target: TRACE_TARGET, Level::Trace) {
                     trace!(
                         target: TRACE_TARGET,
@@ -4169,10 +4179,7 @@ impl PassState {
             }
             pass.color_clear_quad_ranges.clear();
             let stripped = pass.color_texture;
-            pass.color_texture = MetalHandle::NULL;
-            pass.color_subresource = 0;
-            pass.color_load = ColorLoad::DontCare;
-            pass.color_store = StoreAction::DontCare;
+            pass.drop_color_attachment();
             // The no-colour twin declares no colour attachment at all, so
             // render targets 1..3 go with target 0.
             pass.extra_color = [PassColorAttachment::NONE; 3];
