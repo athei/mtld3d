@@ -4132,6 +4132,50 @@ fn rule_g_strips_only_the_dead_extra_and_rule_f_needs_every_store_dead() {
 }
 
 #[test]
+fn clear_colour_survives_rule_g_stripping_target_zero() {
+    // Clear rt_a (target 0) and rt_b (target 1) red, unbind rt_b so a
+    // clear-only pass materialises, then clear rt_a blue and draw while
+    // sampling rt_b. Rule C kills rt_a's store in the clear-only pass and
+    // Rule G strips it; rt_b keeps its store and its Clear. The pass still
+    // has to carry red for rt_b, not the zeros of a stripped target 0.
+    let rt_a = tex(0x3000);
+    let rt_b = tex(0x3001);
+    let red = (1.0f32.to_bits(), 0, 0, 1.0f32.to_bits());
+    let blue = (0, 0, 1.0f32.to_bits(), 1.0f32.to_bits());
+    let mut s = fresh();
+    s.set_color_render_target(rt_a, BB_SIZE.0, BB_SIZE.1, RT_FORMAT, RenderScale::IDENTITY);
+    s.set_extra_color_render_target(1, Some(slot(rt_b, BB_SIZE)));
+    s.clear_color(red.0, red.1, red.2, red.3);
+    s.set_extra_color_render_target(1, None);
+    s.clear_color(blue.0, blue.1, blue.2, blue.3);
+    s.emit_command(Command::set_fragment_texture(rt_b.raw(), 0));
+    s.emit_command(dummy_draw());
+    s.end_current_pass("test");
+    s.coalesce_clear_only_passes();
+    s.finalize_load_actions();
+    s.finalize_store_actions(false);
+    s.strip_dead_color_in_clear_only_passes();
+    assert_eq!(s.passes().len(), 2);
+    let pass = &s.passes()[0];
+    assert_eq!(pass.color_texture(), MetalHandle::NULL, "target 0 stripped");
+    assert_eq!(pass.color_load(), ColorLoad::DontCare);
+    let extra = &pass.extra_color()[0];
+    assert_eq!(extra.texture(), rt_b);
+    assert_eq!(extra.store(), StoreAction::Store, "sampled later");
+    assert_eq!(
+        extra.load(),
+        ColorLoad::Clear {
+            r: red.0,
+            g: red.1,
+            b: red.2,
+            a: red.3
+        }
+    );
+    assert_eq!(pass.color_clear_rgba(), Some(red));
+    assert_eq!(s.passes()[1].color_clear_rgba(), Some(blue));
+}
+
+#[test]
 fn mid_frame_flush_keeps_every_colour_store() {
     // Two clear-only passes on two targets; the first is read back, which
     // flushes the frame. The second target is read back afterwards, so

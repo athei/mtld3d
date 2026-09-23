@@ -10267,11 +10267,14 @@ fn pass_to_descriptor(
     p: &Pass,
     visibility_buffer_handle: MetalHandle<MTLBufferKind>,
 ) -> PassDescriptor {
-    let (color_load_action, clear_r, clear_g, clear_b, clear_a) = match p.color_load() {
-        ColorLoad::Load => (LoadAction::Load, 0, 0, 0, 0),
-        ColorLoad::Clear { r, g, b, a } => (LoadAction::Clear, r, g, b, a),
-        ColorLoad::DontCare => (LoadAction::DontCare, 0, 0, 0, 0),
+    let color_load_action = match p.color_load() {
+        ColorLoad::Load => LoadAction::Load,
+        ColorLoad::Clear { .. } => LoadAction::Clear,
+        ColorLoad::DontCare => LoadAction::DontCare,
     };
+    // Every clearing attachment reads this one colour on the unix side, so it
+    // is taken from whichever attachment clears, not from attachment 0 alone.
+    let (clear_r, clear_g, clear_b, clear_a) = p.color_clear_rgba().unwrap_or((0, 0, 0, 0));
     let (depth_load_action, depth_clear_value) = match p.depth_load() {
         DepthLoad::Load => (LoadAction::Load, f32::to_bits(1.0)),
         DepthLoad::Clear { value } => (LoadAction::Clear, value),

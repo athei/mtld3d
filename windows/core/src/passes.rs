@@ -871,6 +871,26 @@ impl Pass {
     pub const fn color_load(&self) -> ColorLoad {
         self.color_load
     }
+    /// The colour a `Clear` load writes, from whichever colour attachment clears.
+    ///
+    /// A D3D9 `Clear` gives every bound target one colour, so the attachments
+    /// that load with `Clear` agree on it. Render target 0 is not always one
+    /// of them: Rule G strips it from a clear-only pass whose extras it keeps,
+    /// so the extras are asked too. `None` when no attachment clears.
+    #[must_use]
+    pub fn color_clear_rgba(&self) -> Option<(u32, u32, u32, u32)> {
+        core::iter::once(self.color_load)
+            .chain(
+                self.extra_color
+                    .iter()
+                    .filter(|a| a.is_bound())
+                    .map(PassColorAttachment::load),
+            )
+            .find_map(|load| match load {
+                ColorLoad::Clear { r, g, b, a } => Some((r, g, b, a)),
+                ColorLoad::Load | ColorLoad::DontCare => None,
+            })
+    }
     #[must_use]
     pub const fn color_store(&self) -> StoreAction {
         self.color_store
