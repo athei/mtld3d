@@ -7170,10 +7170,9 @@ extern "system" fn device_get_front_buffer_data(
 /// already been checked against the source by `reject_readback`.
 fn blit_texture_to_systemmem(device_inner: &mut DeviceInner, read: &SystemMemReadback) -> i32 {
     let src = read.tex_handle;
-    // The store-action optimiser runs at flush time and would discard an
-    // offscreen RT's colour store when nothing samples it in-frame (Rule D) —
-    // but this blit reads it right after. Mark it read-back BEFORE the flush
-    // so finalize_store_actions keeps the rendered content.
+    // This blit reads the RT right after the flush. Mark it read-back BEFORE
+    // the flush so the store-action rules treat it as live and never discard
+    // its colour store.
     device_inner.push_op(Box::new(move |enc| enc.note_color_read_back(src)));
     device_inner.flush_current_frame_blocking();
     blit_handle_to_systemmem(device_inner, read)

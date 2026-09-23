@@ -6701,3 +6701,180 @@ fn signed_colorfill_upload_reaches_gpu_sampling() {
         }
     }
 }
+
+/// Read one pixel of a 64x64 `A8R8G8B8` render target through `GetRenderTargetData`.
+fn target_pixel(h: &Harness, target: &Surface<'_>, x: u32, y: u32) -> u32 {
+    let sysmem = h.create_offscreen_plain_surface(64, 64, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM);
+    assert_eq!(
+        h.get_render_target_data_hr(target, &sysmem),
+        D3D_OK,
+        "read the render target back",
+    );
+    let locked = sysmem.lock_rect(D3DLOCK_READONLY);
+    let pitch_px = locked.pitch().cast_unsigned() / 4;
+    let idx = (y * pitch_px + x) as usize;
+    locked.as_u32(idx + 1)[idx]
+}
+
+/// Clear a render target and draw over all of it in `color`, then finish the frame.
+///
+/// Nothing samples or reads the target in this frame, so the next frame is the
+/// first to see what it holds.
+fn fill_target_and_present(h: &Harness, target: &Surface<'_>, color: u32) {
+    let backbuffer = h.render_target(0);
+    assert_eq!(h.set_render_state(D3DRS_LIGHTING, 0), 0, "lighting off");
+    assert_eq!(h.clear_texture(0), 0, "no texture for the fill");
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE), 0, "SetFVF");
+    assert_eq!(h.set_render_target(0, target), 0, "bind the target");
+    assert_eq!(h.begin_scene(), 0);
+    assert_eq!(h.clear_target(BLACK), 0, "clear the target");
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &fullscreen_triangle(color)),
+        0,
+        "fill the target",
+    );
+    assert_eq!(
+        h.set_render_target(0, &backbuffer),
+        0,
+        "restore the backbuffer"
+    );
+    assert_eq!(h.clear_target(BLACK), 0, "clear the backbuffer");
+    assert_eq!(h.end_scene(), 0);
+    assert_eq!(h.present(), 0, "end the frame that drew the target");
+}
+
+#[test]
+fn render_target_texture_sampled_only_in_the_next_frame_keeps_its_contents() {
+    // A texture rendered in one frame and first sampled in the next, the way a
+    // UI caches a model portrait: D3D9 keeps render-target contents across
+    // Present, so the sample shows the fill.
+    let h = Harness::new();
+    let rt = h.create_texture(
+        64,
+        64,
+        1,
+        D3DUSAGE_RENDERTARGET,
+        D3DFMT_A8R8G8B8,
+        D3DPOOL_DEFAULT,
+    );
+    fill_target_and_present(&h, &rt.surface_level(0), RED);
+
+    for (state, value) in [
+        (D3DTSS_COLOROP, D3DTOP_SELECTARG1),
+        (D3DTSS_COLORARG1, D3DTA_TEXTURE),
+        (D3DTSS_ALPHAOP, D3DTOP_SELECTARG1),
+        (D3DTSS_ALPHAARG1, D3DTA_TEXTURE),
+    ] {
+        assert_eq!(h.set_texture_stage_state(0, state, value), 0, "TSS");
+    }
+    assert_eq!(h.set_texture(0, &rt), 0, "bind the rendered texture");
+    for (state, value) in [
+        (D3DSAMP_MINFILTER, D3DTEXF_POINT),
+        (D3DSAMP_MAGFILTER, D3DTEXF_POINT),
+        (D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP),
+        (D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP),
+    ] {
+        assert_eq!(h.set_sampler_state(0, state, value), 0, "sampler");
+    }
+    assert_eq!(
+        h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1),
+        0,
+        "SetFVF TEX1"
+    );
+    let quad = textured_fullscreen_quad();
+    h.render_once(BLACK, |d| {
+        assert_eq!(
+            d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad),
+            0,
+            "sample the texture a frame after it was drawn"
+        );
+    });
+
+    let center = Rgba8::from_pixel(h.read_pixel(320, 240));
+    assert!(
+        center.r > 200 && center.g < 40 && center.b < 40,
+        "the sample shows last frame's fill, got {center:?}"
+    );
+    assert_eq!(h.clear_texture(0), 0, "unbind the texture");
+}
+
+#[test]
+fn render_target_surface_read_only_in_the_next_frame_keeps_its_contents() {
+    // A standalone render target drawn in one frame and read back in the
+    // next: the read sees the draw, whatever frame boundary sits between.
+    let h = Harness::new();
+    let target = h.create_render_target(64, 64, D3DFMT_A8R8G8B8);
+    fill_target_and_present(&h, &target, GREEN);
+
+    let pixel = Rgba8::from_pixel(target_pixel(&h, &target, 32, 32));
+    assert!(
+        pixel.g > 200 && pixel.r < 40 && pixel.b < 40,
+        "the read-back shows last frame's fill, got {pixel:?}"
+    );
+}
+
+#[test]
+fn uncleared_draw_into_a_render_target_texture_keeps_last_frames_pixels() {
+    // Frame 1 fills the target blue. Frame 2 draws a small green triangle
+    // into it under a viewport covering the whole target, with no clear.
+    // D3D9 keeps what frame 1 left everywhere the triangle does not reach.
+    let h = Harness::new();
+    let rt = h.create_texture(
+        64,
+        64,
+        1,
+        D3DUSAGE_RENDERTARGET,
+        D3DFMT_A8R8G8B8,
+        D3DPOOL_DEFAULT,
+    );
+    let surface = rt.surface_level(0);
+    fill_target_and_present(&h, &surface, BLUE);
+
+    let small = [
+        PosColorVertex {
+            x: -0.25,
+            y: 0.25,
+            z: 0.5,
+            color: GREEN,
+        },
+        PosColorVertex {
+            x: 0.25,
+            y: -0.25,
+            z: 0.5,
+            color: GREEN,
+        },
+        PosColorVertex {
+            x: -0.25,
+            y: -0.25,
+            z: 0.5,
+            color: GREEN,
+        },
+    ];
+    let backbuffer = h.render_target(0);
+    assert_eq!(h.set_render_target(0, &surface), 0, "bind the target again");
+    assert_eq!(h.begin_scene(), 0);
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &small),
+        0,
+        "draw over part of last frame's contents"
+    );
+    assert_eq!(
+        h.set_render_target(0, &backbuffer),
+        0,
+        "restore the backbuffer"
+    );
+    assert_eq!(h.clear_target(BLACK), 0, "clear the backbuffer");
+    assert_eq!(h.end_scene(), 0);
+    assert_eq!(h.present(), 0, "end the second frame");
+
+    let corner = Rgba8::from_pixel(target_pixel(&h, &surface, 2, 2));
+    assert!(
+        corner.b > 200 && corner.r < 40 && corner.g < 40,
+        "outside the triangle the target keeps frame 1's blue, got {corner:?}"
+    );
+    let inside = Rgba8::from_pixel(target_pixel(&h, &surface, 28, 36));
+    assert!(
+        inside.g > 200 && inside.r < 40 && inside.b < 40,
+        "inside the triangle the target shows the green draw, got {inside:?}"
+    );
+}

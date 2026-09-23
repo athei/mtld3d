@@ -2766,8 +2766,8 @@ fn refresh_lockable_rt_staging(inner: &mut SurfaceInner) -> bool {
 /// surface into the staging at its own row pitch, via the same
 /// `BlitTextureToBuffer` core the backbuffer / `GetRenderTargetData` path
 /// uses. Marks the texture
-/// read-back BEFORE the flush so the store-action optimiser (Rule D) keeps the
-/// rendered content. A failed blit rejects the mapping; staging may contain
+/// read-back BEFORE the flush so the store-action rules treat the rendered
+/// content as live. A failed blit rejects the mapping; staging may contain
 /// only part of the requested pixels.
 fn lockable_rt_readback_fill(inner: &mut SurfaceInner, bpp: u32) -> bool {
     let (width, height) = (inner.standalone_width, inner.standalone_height);
@@ -2816,10 +2816,9 @@ fn lockable_rt_readback_fill(inner: &mut SurfaceInner, bpp: u32) -> bool {
     // non-null here, and the device outlives all its child resources per D3D9
     // lifetime rules. It is a different allocation from `page` above.
     let device_inner = unsafe { &mut *device_ptr };
-    // The store-action optimiser runs at flush time and would discard this RT's
-    // colour store when nothing samples it in-frame (Rule D) — but this blit
-    // reads it right after. Mark it read-back BEFORE the flush so
-    // `finalize_store_actions` keeps the rendered content.
+    // This blit reads the RT right after the flush. Mark it read-back BEFORE
+    // the flush so the store-action rules treat it as live and never discard
+    // its colour store.
     device_inner.push_op(Box::new(move |enc| enc.note_color_read_back(tex_handle)));
     device_inner.flush_current_frame_blocking();
     let mut params = BlitTextureToBufferParams {
