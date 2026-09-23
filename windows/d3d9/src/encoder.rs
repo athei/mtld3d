@@ -4958,11 +4958,13 @@ impl FrameEncoder {
         // The pipeline bind, the inline arguments and the draw go in a
         // color-clear-quad block so Rule H can tell synthetic clear-quad
         // writes apart from real color-writing draws. When every other draw
-        // in the pass has `COLORWRITEENABLE == 0`, Rule H strips the color
-        // attachment AND drains this block: both are dead work once the
-        // attachment is gone (the clear-quad pipeline declares a color
-        // output and would otherwise fail Metal's pipeline-vs-RP format
-        // validation against the depth-only descriptor).
+        // in the pass has `COLORWRITEENABLE == 0` and Rule C already made the
+        // pass's colour store `DontCare`, Rule H strips the color attachment
+        // AND drains this block: both are dead work once the attachment is
+        // gone (the clear-quad pipeline declares a color output and would
+        // otherwise fail Metal's pipeline-vs-RP format validation against the
+        // depth-only descriptor). A block whose colour is stored keeps the
+        // pass's colour attachment.
         // Every state change the dedup cache records stays outside the
         // block: a later command that skips re-binding a matching value
         // relies on it still being bound after Rule H drops the block.

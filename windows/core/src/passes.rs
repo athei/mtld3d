@@ -118,7 +118,10 @@ const ENABLE_STRIP_DEAD_COLOR_IN_CLEAR_ONLY: bool = true;
 /// covers clear-only passes). Predicate: `color_writes_observed == false`,
 /// `color_texture != 0`, `depth_texture != 0` (Metal needs ≥1 attachment),
 /// and at least one draw command (otherwise Rule G already handled it).
-/// The rule also rewrites the pass's `SetRenderPipelineState` commands to
+/// A pass that also carries a colour clear-quad qualifies only when Rule C
+/// already discarded its colour stores, since the clear is content D3D9
+/// keeps across `Present`. The rule also rewrites the pass's
+/// `SetRenderPipelineState` commands to
 /// bind a matching no-color pipeline variant — the caller passes a
 /// `with_color_handle → no_color_handle` side-map populated at draw time
 /// from `FrameEncoder::no_color_pipeline_alt`. Eliminates Apple's "Unused
@@ -712,8 +715,9 @@ pub struct Pass {
     /// ranges entirely when it strips the color attachment — the
     /// color clear-quad pipeline declares a color output and would
     /// fail Metal's pipeline-vs-RP format validation against a
-    /// stripped (depth-only) descriptor, and its writes are dead work
-    /// anyway once the attachment is gone.
+    /// stripped (depth-only) descriptor. It strips such a pass only when
+    /// Rule C already discards its colour stores, so the removed writes
+    /// are dead work.
     color_clear_quad_ranges: Vec<(usize, usize)>,
     /// Render targets 1..3; all unbound on a single-target pass.
     extra_color: [PassColorAttachment; 3],
@@ -2490,8 +2494,9 @@ impl PassState {
     ///
     /// Deliberately does NOT tag `color_writes_observed`: a clear-quad's
     /// output is a fixed RGBA over a viewport, and if the pass closes
-    /// with no other color-writing draws, Rule H drops the block along
-    /// with the color attachment (both are dead work). Opens a pass
+    /// with no other color-writing draws and Rule C discards its colour
+    /// stores, Rule H drops the block along with the color attachment
+    /// (both are dead work). Opens a pass
     /// first if none is live (mirrors the `emit_command` contract).
     pub fn open_color_clear_quad_block(&mut self) -> usize {
         self.ensure_pass_open();
@@ -4049,10 +4054,15 @@ impl PassState {
     /// Color clear-quad blocks are walked separately: their pipelines
     /// declare a color output (they have to, to write the clear value)
     /// and would fail Metal's pipeline-vs-RP format validation against
-    /// the stripped descriptor. Removing them is sound here because
-    /// once the color attachment is gone, the clear-quad's writes are
-    /// dead anyway — the pass is now depth-only and the cascade-color
-    /// VRAM is never read.
+    /// the stripped descriptor. A clear-quad is real colour content that
+    /// D3D9 keeps across `Present`, so a pass carrying one is stripped
+    /// only when every colour store of the pass is already `DontCare`
+    /// after `finalize_store_actions` (Rule C: the next pass on each
+    /// target clears it in full). Otherwise the pass keeps its colour
+    /// attachment and its with-colour pipelines. Without a clear-quad the
+    /// strip is content-preserving: no colour is written, so the texture
+    /// keeps what a `Load` would have carried through (and a `DontCare`
+    /// load stored undefined contents anyway).
     ///
     /// If the side-map is missing an entry for a non-clear-quad `SetPSO`
     /// inside a candidate pass, abort the strip for that pass (single
@@ -4060,8 +4070,9 @@ impl PassState {
     /// dual-build path in `FrameEncoder::get_or_create_pipeline`, which
     /// would be a correctness bug elsewhere.
     ///
-    /// Must run after `strip_dead_color_in_clear_only_passes` (Rule G)
-    /// so clear-only passes are already handled, and before
+    /// Must run after `finalize_store_actions`, whose store decisions the
+    /// clear-quad check reads, and after `strip_dead_color_in_clear_only_passes`
+    /// (Rule G) so clear-only passes are already handled, and before
     /// `cull_dead_clear_only_passes` (Rule F) — though Rule F won't
     /// touch the pass anyway because it still has draws.
     pub fn strip_color_from_no_color_draw_passes(
@@ -4071,21 +4082,7 @@ impl PassState {
         if !ENABLE_NO_COLOR_PASS_FOR_DRAWS {
             return;
         }
-        // Colour textures a later pass that keeps its colour attachment opens
-        // with `Load`: a colour clear-quad in an earlier pass is content they
-        // observe. Walked in reverse so a later pass that is itself stripped
-        // never counts as an observer.
-        let mut loaded_later: FxHashSet<MetalHandle<MTLTextureKind>> =
-            FxHashSet::with_capacity_and_hasher(4, FxBuildHasher);
-        for i in (0..self.passes.len()).rev() {
-            let pass = &self.passes[i];
-            let record_loads = |loaded_later: &mut FxHashSet<MetalHandle<MTLTextureKind>>| {
-                for attachment in pass.bound_color_attachments().iter() {
-                    if matches!(pass.color_load_of(attachment.slot), ColorLoad::Load) {
-                        loaded_later.insert(attachment.texture);
-                    }
-                }
-            };
+        for pass in &mut self.passes {
             if pass.color_writes_observed
                 || pass.color_texture.is_null()
                 || pass.depth_texture.is_null()
@@ -4101,7 +4098,6 @@ impl PassState {
                 // clear; a later Load pass would then read black.
                 || matches!(pass.color_load, ColorLoad::Clear { .. })
             {
-                record_loads(&mut loaded_later);
                 continue;
             }
             // Local copy so we can mutate `pass.commands` below while
@@ -4118,7 +4114,6 @@ impl PassState {
                 .enumerate()
                 .any(|(idx, c)| !in_clear_quad(idx) && c.is_draw());
             if !has_real_draw {
-                record_loads(&mut loaded_later);
                 continue;
             }
             // Confirm every non-clear-quad SetPSO has a no-color sibling
@@ -4132,32 +4127,25 @@ impl PassState {
             if !all_resolvable {
                 mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
                     "strip_color_from_no_color_draw_passes: side-map miss → keeping color attachment");
-                record_loads(&mut loaded_later);
                 continue;
             }
             // The mask-0 draws write no colour, so dropping the attachment
-            // loses nothing of theirs. A colour clear-quad does write: it can
-            // only go when no one observes the colour texture afterwards. The
-            // back buffer is presented, a texture read back or sampled is
-            // seen, a later blit or sampler read sees it, and a later pass
-            // that keeps its colour attachment and loads it sees it (the
-            // cross-pass colour clear of a later frame region, for one).
-            if !cq_ranges.is_empty() {
-                let observed_later = pass.bound_color_attachments().iter().any(|attachment| {
-                    let tex = attachment.texture;
-                    tex == self.backbuffer_texture
-                        || self.seen_sampled_textures.contains(&tex)
-                        || loaded_later.contains(&tex)
-                        || self.passes[i + 1..]
-                            .iter()
-                            .any(|later| pass_reads_texture(later, tex, &self.texture_view_to_base))
-                });
-                if observed_later {
-                    record_loads(&mut loaded_later);
-                    continue;
-                }
+            // loses nothing of theirs: the texture keeps what the pass would
+            // have loaded and stored. A colour clear-quad does write, and D3D9
+            // keeps render-target contents across `Present`, so its result may
+            // be read after this submission (a later frame's sampler,
+            // `StretchRect` or readback) where nothing here can see it. It
+            // can only go when Rule C already discards every colour store of
+            // the pass, i.e. a later pass of this submission clears each
+            // target in full before anything reads it.
+            if !cq_ranges.is_empty()
+                && pass
+                    .bound_color_attachments()
+                    .iter()
+                    .any(|attachment| matches!(attachment.store, StoreAction::Store))
+            {
+                continue;
             }
-            let pass = &mut self.passes[i];
             // Rewrite non-clear-quad SetPSO handles to the no-color
             // variant. Clear-quad SetPSOs are about to be removed
             // wholesale, so leave them alone here.

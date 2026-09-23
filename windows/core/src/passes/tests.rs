@@ -2830,20 +2830,78 @@ fn rule_h_keeps_color_clear_quad_a_later_pass_loads() {
 }
 
 #[test]
-fn rule_h_strips_color_and_clear_quad_when_only_zero_mask_draws_plus_clear_quad() {
+fn rule_h_keeps_color_clear_quad_whose_store_survives_the_submission() {
     const PSO_CLEAR_QUAD_COLOR: u64 = 0xCAFE_BABE;
-    // Cascade caster pass shape: WoW issued mid-pass `Clear` on
-    // the cascade color atlas (e.g. per-tile clear), which the
-    // encoder folded into a cross-pass color clear-quad. The rest
-    // of the pass is zero-mask caster draws. Rule H must strip
-    // the color attachment AND drain the clear-quad's commands so
-    // the resulting depth-only descriptor doesn't try to bind a
-    // color-output clear-quad pipeline. The atlas is a texture of its
-    // own that nothing later in the frame observes.
+    // An offscreen target is cleared through a colour clear-quad (the
+    // cross-pass shape: `Clear` on a closed pass of a target drawn earlier)
+    // in a pass whose other draws are all zero-mask. Nothing later in this
+    // submission reads the target, but D3D9 keeps its contents: a sampler, a
+    // `StretchRect` or a readback may read it after a mid-frame flush or in a
+    // later frame, and must see the clear. The colour store survives
+    // finalisation, so Rule H leaves the pass alone.
+    for frame_continues in [false, true] {
+        let mut s = fresh();
+        let target = tex(0x3000);
+        s.set_color_render_target(target, 256, 256, RT_FORMAT, RenderScale::IDENTITY);
+        let start = s.open_color_clear_quad_block();
+        s.emit_command(set_pso(PSO_CLEAR_QUAD_COLOR));
+        s.emit_command(dummy_draw());
+        s.close_color_clear_quad_block(start);
+        for _ in 0..2 {
+            s.note_draw_color_write_mask(0);
+            s.emit_command(set_pso(PSO_WITH));
+            s.emit_command(dummy_draw());
+        }
+        s.end_current_pass("test");
+        let mut alt = FxHashMap::default();
+        alt.insert(PSO_WITH, pso(PSO_NO_COLOR));
+        s.finalize_load_actions();
+        s.finalize_store_actions(frame_continues);
+        s.strip_dead_color_in_clear_only_passes();
+        s.strip_color_from_no_color_draw_passes(&alt);
+        s.cull_dead_clear_only_passes();
+
+        let pass = &s.passes()[0];
+        assert_eq!(
+            pass.color_texture(),
+            target,
+            "continues={frame_continues}: colour kept"
+        );
+        assert_eq!(pass.color_store(), StoreAction::Store);
+        assert_eq!(
+            pass.color_clear_quad_ranges().len(),
+            1,
+            "continues={frame_continues}: clear-quad kept"
+        );
+        let pso_handles: Vec<u64> = pass
+            .commands()
+            .iter()
+            .filter(|c| c.cmd == CommandType::SetRenderPipelineState as u32)
+            .map(|c| c.param_b)
+            .collect();
+        assert_eq!(
+            pso_handles,
+            [PSO_CLEAR_QUAD_COLOR, PSO_WITH, PSO_WITH],
+            "continues={frame_continues}: no pipeline rewritten"
+        );
+    }
+}
+
+#[test]
+fn rule_h_strips_color_and_clear_quad_when_the_next_pass_clears_the_target() {
+    const PSO_CLEAR_QUAD_COLOR: u64 = 0xCAFE_BABE;
+    // Cascade caster pass shape: a mid-pass `Clear` on the cascade colour
+    // atlas became a colour clear-quad, and the rest of the pass is
+    // zero-mask caster draws. The next pass on the atlas opens with a full
+    // `Clear`, so Rule C discards this pass's colour store: the clear-quad
+    // is dead work. Rule H strips the colour attachment AND drains the
+    // clear-quad's commands so the depth-only descriptor doesn't bind a
+    // colour-output clear-quad pipeline.
     let mut s = fresh();
-    s.set_color_render_target(tex(0x3000), 256, 256, RT_FORMAT, RenderScale::IDENTITY);
-    // Color clear-quad block — 6 commands, none of which should
-    // tag `color_writes_observed`.
+    let atlas = tex(0x3000);
+    s.set_color_render_target(atlas, 256, 256, RT_FORMAT, RenderScale::IDENTITY);
+    // Color clear-quad block: none of its commands should tag
+    // `color_writes_observed`.
     let start = s.open_color_clear_quad_block();
     s.emit_command(set_pso(PSO_CLEAR_QUAD_COLOR));
     s.emit_command(dummy_draw());
@@ -2855,12 +2913,28 @@ fn rule_h_strips_color_and_clear_quad_when_only_zero_mask_draws_plus_clear_quad(
         s.emit_command(dummy_draw());
     }
     s.end_current_pass("test");
+    s.clear_color(0, 0, 0, 0);
+    s.note_draw_color_write_mask(0xF);
+    s.emit_command(set_pso(PSO_WITH));
+    s.emit_command(dummy_draw());
+    s.end_current_pass("test");
     // Only the real caster needs a side-map entry; clear-quad
     // PSOs are removed wholesale and don't need to resolve.
     let mut alt = FxHashMap::default();
     alt.insert(PSO_WITH, pso(PSO_NO_COLOR));
+    s.finalize_load_actions();
+    s.finalize_store_actions(false);
+    assert_eq!(s.passes()[1].color_texture(), atlas);
+    assert!(matches!(
+        s.passes()[1].color_load(),
+        ColorLoad::Clear { .. }
+    ));
+    assert_eq!(s.passes()[0].color_store(), StoreAction::DontCare);
+    s.strip_dead_color_in_clear_only_passes();
     s.strip_color_from_no_color_draw_passes(&alt);
+    s.cull_dead_clear_only_passes();
 
+    assert_eq!(s.passes()[1].color_texture(), atlas, "clearing pass kept");
     let pass = &s.passes()[0];
     assert_eq!(
         pass.color_texture(),
@@ -2990,6 +3064,16 @@ fn record_cascade_tiles(order: &ClearQuadStateOrder, caster_mask: u32) -> PassSt
         s.emit_command(dummy_draw());
     }
     s.end_current_pass("test");
+    // The next pass opens with a whole-atlas colour Clear (the legacy-break
+    // form, so it folds into the load action rather than painting a quad over
+    // the atlas the tiles already drew), so Rule C discards the caster pass's
+    // colour store and Rule H may drain its colour clear-quads.
+    s.clear_color_legacy_break(0, 0, 0, 0);
+    s.note_draw_color_write_mask(0xF);
+    s.emit_command(set_pso(PSO_WITH));
+    s.emit_command(dummy_draw());
+    s.end_current_pass("test");
+    s.finalize_store_actions(false);
     s
 }
 
@@ -5932,6 +6016,12 @@ fn rule_h_keeps_fill_changes_outside_removed_color_clear() {
     s.emit_command(Command::set_triangle_fill_mode(TriangleFillMode::Lines));
     s.emit_command(dummy_draw());
     s.end_current_pass("test");
+    // The next pass clears the target in full, so the colour clear is dead
+    // and Rule H may remove it.
+    s.clear_color(0, 0, 0, 0);
+    s.emit_command(dummy_draw());
+    s.end_current_pass("test");
+    s.finalize_store_actions(false);
     let mut alt = FxHashMap::default();
     alt.insert(PSO_WITH, pso(PSO_NO_COLOR));
     s.strip_color_from_no_color_draw_passes(&alt);
