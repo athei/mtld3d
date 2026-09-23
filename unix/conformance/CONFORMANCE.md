@@ -204,11 +204,20 @@ record. A knob, where one makes sense, is named with its default.
   There is no synchronous encoder or submit completion wait, but admission
   can backpressure like Present. Completion still requires GPU retirement.
   No knob.
-- **Depth stores are elided where nothing reads the buffer back.** Content
-  relying on depth surviving a pass it never cleared can read stale depth.
-  Preserving it unconditionally costs the optimization on every frame of every
-  game that does clear, which is all tested ones. Sites: `z_range_test` and
-  `texdepth_test` below (store-action Rule B). No knob.
+- **Depth and stencil are discarded at every `Present` on a surface nothing
+  samples.** D3D9 keeps a depth-stencil surface's contents across `Present`
+  and leaves them undefined only when the game asks for it:
+  `D3DPRESENTFLAG_DISCARD_DEPTHSTENCIL` on the implicit surface, or
+  `Discard = TRUE` passed to `CreateDepthStencilSurface`. We consult neither.
+  The last pass of a frame to use a depth surface stores nothing
+  (store-action Rule B) and the first pass of the next frame loads nothing
+  (Rule A), unless the surface is sampleable or has been bound as a texture.
+  Preserving depth costs a store and a load of every depth surface on every
+  frame of every game that clears it anyway, which is all tested ones.
+  Content that tests against depth or stencil from an earlier frame without
+  clearing reads undefined values. Sites: `z_range_test` and `texdepth_test`
+  below. No knob: the gates are compile-time constants in
+  `windows/core/src/passes.rs`.
 - **A partial `Lock` of a dynamic vertex or index buffer without
   `D3DLOCK_DISCARD` returns a pointer into memory a queued draw may still
   read.** D3D9 keeps the game's writes from landing under a draw the GPU has

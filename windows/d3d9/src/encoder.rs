@@ -10164,10 +10164,10 @@ fn finalize_submit(enc: &mut FrameEncoder, frame: &FrameData) -> (SubmitFramePar
     // against the continuation frame's allocator at the next `begin_frame`.
     enc.visibility.split_open_spans(frame.submit_seq);
 
-    // A readback flush is not a frame end: the frame continues and any colour
-    // or depth target may still be read back or drawn into, so the last-use
-    // rules (D colour, B depth/stencil) are suppressed. Remember it so the
-    // next `begin_frame` keeps the seen-rt sets for the continuation's Rule A.
+    // A readback flush is not a frame end: the frame continues and its depth
+    // surface may still be tested against, so Rule B (last-use depth/stencil
+    // `DontCare`) is suppressed. Remember it so the next `begin_frame` keeps
+    // the seen-rt sets for the continuation's Rule A.
     let no_present = frame.flags.contains(FrameDataFlags::NO_PRESENT);
     enc.prev_submit_no_present = no_present;
     let mut upload_pass_count = enc.pass_state.upload_pass_count();

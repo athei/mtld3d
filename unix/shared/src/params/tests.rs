@@ -8,7 +8,7 @@
 //! volume depth plane round-trips.
 
 use super::{
-    BufferCreateDesc, CreateBuffersBatchParams, CreateTexturesBatchParams, DepthResolveFilter,
+    BufferCreateDesc, CreateBuffersBatchParams, CreateTexturesBatchParams,
     DestroyResourcesBulkParams, ExtraColorDesc, LoadAction, MetalHandle, PassDescriptor,
     StoreAction, SubmitFrameParams, TextureCreateDesc,
 };
@@ -188,7 +188,6 @@ fn pass_with_flags(pass_flags: u32) -> PassDescriptor {
         color_texture: MetalHandle::NULL,
         color_resolve_texture: MetalHandle::NULL,
         depth_texture: MetalHandle::NULL,
-        depth_resolve_texture: MetalHandle::NULL,
         commands_ptr: 0,
         visibility_result_buffer: MetalHandle::NULL,
         leading_blits_ptr: 0,
@@ -206,8 +205,6 @@ fn pass_with_flags(pass_flags: u32) -> PassDescriptor {
         command_count: 0,
         leading_blits_count: 0,
         pass_flags,
-        depth_resolve_filter: DepthResolveFilter::Sample0,
-        pad0: 0,
         extra_color: [ExtraColorDesc::NONE; 3],
     }
 }
