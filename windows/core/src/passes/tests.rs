@@ -5989,12 +5989,15 @@ fn a_clear_only_pass_does_not_fold_past_a_depth_transfer_out_of_its_target() {
 }
 
 /// Run the load/store rules in the order the encoder applies them at submit.
+///
+/// Rule I and Rule H, which needs a pipeline side map, are left out.
 fn apply_submit_rules(s: &mut PassState) {
     s.coalesce_clear_only_passes();
     s.finalize_load_actions();
     s.finalize_store_actions(false);
     s.strip_dead_color_in_clear_only_passes();
     s.cull_dead_clear_only_passes();
+    s.merge_adjacent_identical_passes();
 }
 
 #[test]
@@ -6430,6 +6433,12 @@ fn command_pool_retires_dead_clears_without_reordering_survivors() {
     s.passes[2].leading_blits.push(dummy_blit());
     s.passes[3].color_store = StoreAction::DontCare;
     s.passes[3].depth_store = StoreAction::DontCare;
+    s.passes[4].color_load = ColorLoad::Clear {
+        r: 0,
+        g: 0,
+        b: 0,
+        a: 0,
+    };
     s.passes[4].color_store = StoreAction::Store;
     s.passes[5].color_resolve_texture = tex(0x4000);
     let original = command_allocations(s.passes());
@@ -8167,4 +8176,797 @@ fn the_multisampled_back_buffer_keeps_its_samples_unless_presented_under_discard
         StoreAction::Store,
         "a multisampled render target keeps its samples across Present"
     );
+}
+
+// ── Rules G and F: attachments and passes a clear-only pass leaves unchanged ──
+
+#[test]
+fn rule_g_strips_a_loading_colour_target_from_a_depth_clear_pass() {
+    // Clear(ZBUFFER) with nothing drawn before the depth surface changes
+    // lands as a clear-only pass on the bound colour target and depth. The
+    // colour target only loads there, so its load and store change nothing.
+    let target = tex(0x3000);
+    let other_depth = tex(0x9100);
+    let mut s = fresh();
+    s.set_color_render_target(
+        target,
+        BB_SIZE.0,
+        BB_SIZE.1,
+        RT_FORMAT,
+        RenderScale::IDENTITY,
+    );
+    s.emit_command(dummy_draw());
+    s.end_current_pass("test");
+    assert_eq!(s.clear_depth(f32::to_bits(1.0)), DepthClearOutcome::Folded);
+    s.set_depth_stencil_attachment(other_depth, BB_SIZE, false, false);
+    // A later pass samples the cleared depth, so its store survives Rule B.
+    s.emit_command(Command::set_fragment_texture(depth().raw(), 0));
+    s.emit_command(dummy_draw());
+    s.end_current_pass("test");
+    assert_eq!(s.passes().len(), 3);
+    assert_eq!(s.passes()[1].color_texture(), target);
+    assert_eq!(s.passes()[1].color_load(), ColorLoad::Load);
+
+    apply_submit_rules(&mut s);
+
+    assert_eq!(s.passes().len(), 3);
+    let clear = &s.passes()[1];
+    assert!(matches!(clear.depth_load(), DepthLoad::Clear { .. }));
+    assert_eq!(clear.depth_store(), StoreAction::Store);
+    assert_eq!(
+        clear.color_attachment_texture(),
+        MetalHandle::NULL,
+        "the colour target the clear leaves unchanged is not attached"
+    );
+    assert_eq!(s.passes()[0].color_texture(), target, "draw passes keep it");
+    assert_eq!(s.passes()[2].color_texture(), target);
+}
+
+/// `count` passes on the back buffer and the depth surface, each closed with nothing in it.
+fn clear_only_passes(count: usize) -> PassState {
+    let mut s = fresh();
+    for _ in 0..count {
+        s.ensure_pass_open();
+        s.end_current_pass("test");
+    }
+    s
+}
+
+#[test]
+fn rule_g_strips_unwritten_colour_targets_whatever_their_store() {
+    let extra = tex(0x3300);
+    let mut s = clear_only_passes(3);
+    // A `DontCare` load (the back buffer's first use) stored, a `Load`
+    // stored, and a render target 1 that loads beside a stored clear of
+    // render target 0.
+    assert_eq!(s.passes[0].color_load, ColorLoad::DontCare);
+    assert_eq!(s.passes[1].color_load, ColorLoad::Load);
+    s.passes[2].color_load = ColorLoad::Clear {
+        r: 1,
+        g: 2,
+        b: 3,
+        a: 4,
+    };
+    s.passes[2].extra_color[0] = PassColorAttachment {
+        texture: extra,
+        size: BB_SIZE,
+        load: ColorLoad::Load,
+        store: StoreAction::Store,
+        ..PassColorAttachment::NONE
+    };
+    for pass in &s.passes {
+        assert_eq!(pass.color_store, StoreAction::Store);
+    }
+
+    s.strip_dead_color_in_clear_only_passes();
+
+    assert!(
+        s.passes[0].color_texture.is_null(),
+        "DontCare load stripped"
+    );
+    assert!(s.passes[1].color_texture.is_null(), "Load stripped");
+    assert_eq!(s.passes[2].color_texture, backbuffer(), "stored clear kept");
+    assert!(
+        !s.passes[2].extra_color[0].is_bound(),
+        "loading extra stripped"
+    );
+    for pass in &s.passes {
+        assert_eq!(pass.depth_texture, depth(), "depth stays attached");
+    }
+}
+
+#[test]
+fn rule_g_keeps_the_colour_targets_a_clear_only_pass_still_needs() {
+    let mut s = clear_only_passes(3);
+    // A resolve writes the single-sample twin.
+    s.passes[0].color_resolve_texture = backbuffer();
+    // Without a depth attachment render target 0 is the pass's only one.
+    s.passes[1].depth_texture = MetalHandle::NULL;
+    // A leading blit is work of its own; the pass is not clear-only.
+    s.passes[2].leading_blits.push(dummy_blit());
+
+    s.strip_dead_color_in_clear_only_passes();
+
+    for (index, pass) in s.passes.iter().enumerate() {
+        assert_eq!(
+            pass.color_texture,
+            backbuffer(),
+            "pass {index} keeps colour"
+        );
+    }
+}
+
+#[test]
+fn rule_f_culls_a_pass_holding_only_a_viewport_and_a_visibility_mode() {
+    // `Issue(BEGIN)` right after a draw's pass closed opens a pass for its
+    // Counting mode, and a render-target change closes it again with nothing
+    // drawn. The slot it armed counts nothing whether or not the pass runs.
+    let other = tex(0x3000);
+    let mut s = fresh();
+    s.emit_command(dummy_draw());
+    s.end_current_pass("test");
+    s.emit_command(Command::set_visibility_result_mode(
+        VisibilityResultMode::Counting,
+        8,
+    ));
+    s.set_color_render_target(
+        other,
+        BB_SIZE.0,
+        BB_SIZE.1,
+        RT_FORMAT,
+        RenderScale::IDENTITY,
+    );
+    s.emit_command(dummy_draw());
+    s.end_current_pass("test");
+    assert_eq!(s.passes().len(), 3);
+    assert!(s.passes()[1].has_counting_visibility());
+    assert_eq!(s.passes()[1].commands().len(), 2, "viewport and mode");
+
+    apply_submit_rules(&mut s);
+
+    assert_eq!(s.passes().len(), 2, "the empty pass is culled");
+    assert!(s.passes().iter().all(|p| !p.has_counting_visibility()));
+    assert_eq!(s.passes()[0].color_texture(), backbuffer());
+    assert_eq!(s.passes()[1].color_texture(), other);
+}
+
+#[test]
+fn rule_f_culls_a_pass_whose_draw_was_dropped_after_it_opened() {
+    // A draw that bound its state and then failed leaves the pass it opened
+    // with state commands only; loading and storing the attachments around
+    // them changes nothing.
+    let other = tex(0x3000);
+    let mut s = fresh();
+    s.emit_command(dummy_draw());
+    s.set_color_render_target(
+        other,
+        BB_SIZE.0,
+        BB_SIZE.1,
+        RT_FORMAT,
+        RenderScale::IDENTITY,
+    );
+    s.emit_command(set_pso(0xAB00));
+    s.emit_command(Command::set_scissor_rect(0, 0, 8, 8));
+    s.set_color_render_target(
+        backbuffer(),
+        BB_SIZE.0,
+        BB_SIZE.1,
+        BB_FORMAT,
+        s.render_scale,
+    );
+    s.emit_command(Command::set_fragment_texture(other.raw(), 0));
+    s.emit_command(dummy_draw());
+    s.end_current_pass("test");
+    assert_eq!(s.passes().len(), 3);
+
+    s.finalize_load_actions();
+    s.finalize_store_actions(false);
+    s.strip_dead_color_in_clear_only_passes();
+    s.cull_dead_clear_only_passes();
+
+    assert_eq!(s.passes().len(), 2);
+    assert!(s.passes().iter().all(|p| p.color_texture() == backbuffer()));
+}
+
+#[test]
+fn rule_f_keeps_clear_only_passes_that_write_something() {
+    let mut s = clear_only_passes(4);
+    // A stored colour clear, a stored stencil clear, a resolve, a blit.
+    s.passes[0].color_load = ColorLoad::Clear {
+        r: 0,
+        g: 0,
+        b: 0,
+        a: 0,
+    };
+    s.passes[1].stencil_load = StencilLoad::Clear { value: 1 };
+    s.passes[1].depth_flags |= PassDepthFlags::HAS_STENCIL;
+    s.passes[1].stencil_store = StoreAction::Store;
+    s.passes[2].color_resolve_texture = backbuffer();
+    s.passes[3].leading_blits.push(dummy_blit());
+
+    s.strip_dead_color_in_clear_only_passes();
+    s.cull_dead_clear_only_passes();
+
+    assert_eq!(s.passes().len(), 4);
+}
+
+#[test]
+fn rule_f_culls_a_clear_whose_every_store_is_discarded() {
+    let mut s = clear_only_passes(2);
+    // A colour clear Rule C discards beside a depth plane that only loads,
+    // and a depth clear Rule B discards beside a colour target that loads.
+    s.passes[0].color_load = ColorLoad::Clear {
+        r: 0,
+        g: 0,
+        b: 0,
+        a: 0,
+    };
+    s.passes[0].color_store = StoreAction::DontCare;
+    s.passes[0].depth_load = DepthLoad::Load;
+    s.passes[1].depth_load = DepthLoad::Clear {
+        value: f32::to_bits(1.0),
+    };
+    s.passes[1].depth_store = StoreAction::DontCare;
+
+    s.cull_dead_clear_only_passes();
+
+    assert!(s.passes().is_empty());
+}
+
+// ── Rule J: adjacent passes on identical attachments ──────────
+
+/// Draw into `target`, bind `detour` and bind `target` again with nothing in between, then draw.
+fn round_trip(
+    s: &mut PassState,
+    target: MetalHandle<MTLTextureKind>,
+    detour: MetalHandle<MTLTextureKind>,
+) {
+    s.set_color_render_target(
+        target,
+        BB_SIZE.0,
+        BB_SIZE.1,
+        RT_FORMAT,
+        RenderScale::IDENTITY,
+    );
+    s.emit_command(dummy_draw());
+    s.set_color_render_target(
+        detour,
+        BB_SIZE.0,
+        BB_SIZE.1,
+        RT_FORMAT,
+        RenderScale::IDENTITY,
+    );
+    s.set_color_render_target(
+        target,
+        BB_SIZE.0,
+        BB_SIZE.1,
+        RT_FORMAT,
+        RenderScale::IDENTITY,
+    );
+}
+
+#[test]
+fn rule_j_joins_the_two_passes_a_render_target_round_trip_leaves() {
+    let target = tex(0x3000);
+    let mut s = fresh();
+    round_trip(&mut s, target, tex(0x3100));
+    s.emit_command(dummy_draw());
+    s.end_current_pass("test");
+    assert_eq!(
+        s.passes().len(),
+        2,
+        "the round trip splits the target's pass"
+    );
+    assert_eq!(s.passes()[1].color_load(), ColorLoad::Load);
+
+    apply_submit_rules(&mut s);
+
+    assert_eq!(s.passes().len(), 1);
+    let pass = &s.passes()[0];
+    assert_eq!(pass.color_texture(), target);
+    assert_eq!(pass.depth_texture(), depth());
+    let kinds: Vec<u32> = pass.commands().iter().map(|c| c.cmd).collect();
+    let viewport = CommandType::SetViewport as u32;
+    let draw = CommandType::DrawPrimitives as u32;
+    assert_eq!(
+        kinds,
+        [viewport, draw, viewport, draw],
+        "nothing to restore"
+    );
+}
+
+#[test]
+fn rule_j_joins_a_run_of_passes_into_one() {
+    let target = tex(0x3000);
+    let mut s = fresh();
+    round_trip(&mut s, target, tex(0x3100));
+    s.emit_command(dummy_draw());
+    round_trip(&mut s, target, tex(0x3200));
+    s.emit_command(dummy_draw());
+    s.end_current_pass("test");
+    assert_eq!(s.passes().len(), 3);
+
+    apply_submit_rules(&mut s);
+
+    assert_eq!(s.passes().len(), 1);
+    let draws = s.passes()[0]
+        .commands()
+        .iter()
+        .filter(|c| c.is_draw())
+        .count();
+    assert_eq!(draws, 4, "the draw of each half, in order");
+}
+
+#[test]
+fn rule_j_restores_the_fresh_encoder_state_the_second_pass_reads() {
+    // The first pass leaves every state the dedup cache starts at its fresh
+    // value changed; the second draws without setting them, so a fresh
+    // encoder's values go back at the join.
+    let target = tex(0x3000);
+    let mut s = fresh();
+    s.set_color_render_target(
+        target,
+        BB_SIZE.0,
+        BB_SIZE.1,
+        RT_FORMAT,
+        RenderScale::IDENTITY,
+    );
+    s.emit_command(Command::set_triangle_fill_mode(TriangleFillMode::Lines));
+    s.emit_command(Command::set_depth_bias(0.0, 2.0));
+    s.emit_command(Command::set_stencil_reference(7));
+    s.emit_command(Command::set_blend_color(0.5, 0.5, 0.5, 0.5));
+    s.emit_command(Command::set_visibility_result_mode(
+        VisibilityResultMode::Counting,
+        16,
+    ));
+    s.emit_command(dummy_draw());
+    s.set_color_render_target(
+        tex(0x3100),
+        BB_SIZE.0,
+        BB_SIZE.1,
+        RT_FORMAT,
+        RenderScale::IDENTITY,
+    );
+    s.set_color_render_target(
+        target,
+        BB_SIZE.0,
+        BB_SIZE.1,
+        RT_FORMAT,
+        RenderScale::IDENTITY,
+    );
+    s.emit_command(dummy_draw());
+    s.end_current_pass("test");
+    #[cfg(debug_assertions)]
+    let before = s.debug_record_draw_states();
+
+    apply_submit_rules(&mut s);
+
+    assert_eq!(s.passes().len(), 1);
+    let pass = &s.passes()[0];
+    assert!(pass.has_counting_visibility());
+    let first_draw = pass.commands().iter().position(Command::is_draw).unwrap();
+    let join = &pass.commands()[first_draw + 1..first_draw + 6];
+    let expected = [
+        Command::set_triangle_fill_mode(TriangleFillMode::Fill),
+        Command::set_depth_bias(0.0, 0.0),
+        Command::set_stencil_reference(0),
+        Command::set_blend_color(1.0, 1.0, 1.0, 1.0),
+        Command::set_visibility_result_mode(VisibilityResultMode::Disabled, 16),
+    ];
+    for (got, want) in join.iter().zip(&expected) {
+        assert!(same_command(got, want), "join restores {}", want.cmd);
+    }
+    assert_eq!(
+        pass.commands()[first_draw + 6].cmd,
+        CommandType::SetViewport as u32,
+        "the second pass's own commands follow the join"
+    );
+    #[cfg(debug_assertions)]
+    s.debug_assert_draw_states_preserved(&before, &FxHashMap::default());
+}
+
+#[test]
+fn rule_j_restores_nothing_the_second_pass_sets_before_it_draws() {
+    let target = tex(0x3000);
+    let mut s = fresh();
+    s.set_color_render_target(
+        target,
+        BB_SIZE.0,
+        BB_SIZE.1,
+        RT_FORMAT,
+        RenderScale::IDENTITY,
+    );
+    s.emit_command(Command::set_stencil_reference(7));
+    s.emit_command(Command::set_cull_mode(CullMode::Back));
+    s.emit_command(dummy_draw());
+    s.set_color_render_target(
+        tex(0x3100),
+        BB_SIZE.0,
+        BB_SIZE.1,
+        RT_FORMAT,
+        RenderScale::IDENTITY,
+    );
+    s.set_color_render_target(
+        target,
+        BB_SIZE.0,
+        BB_SIZE.1,
+        RT_FORMAT,
+        RenderScale::IDENTITY,
+    );
+    s.emit_command(Command::set_stencil_reference(3));
+    s.emit_command(Command::set_cull_mode(CullMode::Front));
+    s.emit_command(dummy_draw());
+    s.end_current_pass("test");
+    #[cfg(debug_assertions)]
+    let before = s.debug_record_draw_states();
+    let second_len = s.passes()[1].commands().len();
+    let first_len = s.passes()[0].commands().len();
+
+    apply_submit_rules(&mut s);
+
+    assert_eq!(s.passes().len(), 1);
+    assert_eq!(s.passes()[0].commands().len(), first_len + second_len);
+    #[cfg(debug_assertions)]
+    s.debug_assert_draw_states_preserved(&before, &FxHashMap::default());
+}
+
+#[test]
+fn rule_j_keeps_passes_apart_when_the_second_reads_state_it_cannot_restore() {
+    // The first pass culls back faces; the second draws before any cull mode
+    // is set and so relies on a fresh encoder culling nothing.
+    let target = tex(0x3000);
+    let mut s = fresh();
+    s.set_color_render_target(
+        target,
+        BB_SIZE.0,
+        BB_SIZE.1,
+        RT_FORMAT,
+        RenderScale::IDENTITY,
+    );
+    s.emit_command(Command::set_cull_mode(CullMode::Back));
+    s.emit_command(dummy_draw());
+    s.set_color_render_target(
+        tex(0x3100),
+        BB_SIZE.0,
+        BB_SIZE.1,
+        RT_FORMAT,
+        RenderScale::IDENTITY,
+    );
+    s.set_color_render_target(
+        target,
+        BB_SIZE.0,
+        BB_SIZE.1,
+        RT_FORMAT,
+        RenderScale::IDENTITY,
+    );
+    s.emit_command(dummy_draw());
+    s.end_current_pass("test");
+
+    apply_submit_rules(&mut s);
+
+    assert_eq!(s.passes().len(), 2);
+}
+
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "pass rules changed the triangle fill mode a surviving draw sees")]
+fn draw_state_check_catches_a_join_that_restores_nothing() {
+    let target = tex(0x3000);
+    let mut s = fresh();
+    s.set_color_render_target(
+        target,
+        BB_SIZE.0,
+        BB_SIZE.1,
+        RT_FORMAT,
+        RenderScale::IDENTITY,
+    );
+    s.emit_command(Command::set_triangle_fill_mode(TriangleFillMode::Lines));
+    s.emit_command(dummy_draw());
+    s.set_color_render_target(
+        tex(0x3100),
+        BB_SIZE.0,
+        BB_SIZE.1,
+        RT_FORMAT,
+        RenderScale::IDENTITY,
+    );
+    s.set_color_render_target(
+        target,
+        BB_SIZE.0,
+        BB_SIZE.1,
+        RT_FORMAT,
+        RenderScale::IDENTITY,
+    );
+    s.emit_command(dummy_draw());
+    s.end_current_pass("test");
+    let before = s.debug_record_draw_states();
+    let mut next = s.passes.remove(1);
+    s.passes[0].absorb(&mut next, &PassJoin::new());
+    s.debug_assert_draw_states_preserved(&before, &FxHashMap::default());
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn draw_state_check_ignores_bindings_the_first_half_leaves_behind() {
+    // The first pass binds a texture and a vertex buffer the second pass's
+    // draw never reads; the dedup cache let the second pass bind only what
+    // it reads, so the leftovers are no change to what its draw sees.
+    let target = tex(0x3000);
+    let mut s = fresh();
+    s.set_color_render_target(
+        target,
+        BB_SIZE.0,
+        BB_SIZE.1,
+        RT_FORMAT,
+        RenderScale::IDENTITY,
+    );
+    s.emit_command(Command::set_fragment_texture(0x7700, 3));
+    s.emit_command(Command::set_vertex_buffer(0x7800, 0, 1));
+    s.emit_command(dummy_draw());
+    s.set_color_render_target(
+        tex(0x3100),
+        BB_SIZE.0,
+        BB_SIZE.1,
+        RT_FORMAT,
+        RenderScale::IDENTITY,
+    );
+    s.set_color_render_target(
+        target,
+        BB_SIZE.0,
+        BB_SIZE.1,
+        RT_FORMAT,
+        RenderScale::IDENTITY,
+    );
+    s.emit_command(Command::set_fragment_texture(0x7900, 0));
+    s.emit_command(dummy_draw());
+    s.end_current_pass("test");
+    let before = s.debug_record_draw_states();
+
+    apply_submit_rules(&mut s);
+
+    assert_eq!(s.passes().len(), 1);
+    s.debug_assert_draw_states_preserved(&before, &FxHashMap::default());
+}
+
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(
+    expected = "pass rules changed the fragment textures and samplers a surviving draw sees"
+)]
+fn draw_state_check_still_catches_a_binding_the_draw_had() {
+    // Masking the leftovers must not hide a slot the draw did have bound.
+    let target = tex(0x3000);
+    let mut s = fresh();
+    s.set_color_render_target(
+        target,
+        BB_SIZE.0,
+        BB_SIZE.1,
+        RT_FORMAT,
+        RenderScale::IDENTITY,
+    );
+    s.emit_command(Command::set_fragment_texture(0x7700, 0));
+    s.emit_command(dummy_draw());
+    s.end_current_pass("test");
+    let before = s.debug_record_draw_states();
+    s.passes[0].commands[1] = Command::set_fragment_texture(0x7900, 0);
+    s.debug_assert_draw_states_preserved(&before, &FxHashMap::default());
+}
+
+/// Assert a render-target round trip with `split` before the second pass keeps two passes.
+fn assert_split_keeps_passes_apart(name: &str, split: impl FnOnce(&mut PassState)) {
+    let mut s = fresh();
+    round_trip(&mut s, tex(0x3000), tex(0x3100));
+    split(&mut s);
+    s.emit_command(dummy_draw());
+    s.end_current_pass("test");
+    assert_eq!(s.passes().len(), 2, "{name}: two passes recorded");
+
+    apply_submit_rules(&mut s);
+
+    assert_eq!(s.passes().len(), 2, "{name}: the passes stay apart");
+}
+
+#[test]
+fn rule_j_keeps_passes_apart_across_a_boundary_the_join_would_change() {
+    let target = tex(0x3000);
+    assert_split_keeps_passes_apart("a clear", |s| {
+        s.clear_color(1, 2, 3, 4);
+    });
+    assert_split_keeps_passes_apart("a leading blit", |s| {
+        s.push_pending_leading_blit(dummy_blit());
+    });
+    assert_split_keeps_passes_apart("a sample of the target", |s| {
+        s.emit_command(Command::set_fragment_texture(target.raw(), 0));
+    });
+    assert_split_keeps_passes_apart("another mip level", |s| {
+        s.set_color_render_target_subresource(
+            target,
+            BB_SIZE.0,
+            BB_SIZE.1,
+            RT_FORMAT,
+            RenderScale::IDENTITY,
+            (0, 1),
+        );
+    });
+    assert_split_keeps_passes_apart("a multisampled companion", |s| {
+        s.set_color_msaa(tex(0x3001), MetalHandle::NULL, 4);
+    });
+    assert_split_keeps_passes_apart("another depth level", |s| {
+        s.set_depth_stencil_attachment_level(depth(), 1, BB_SIZE, false, false);
+    });
+}
+
+#[test]
+fn rule_j_keeps_a_resolving_pass_apart_and_moves_a_later_resolve_onto_the_join() {
+    let rt = tex(0x3000);
+    // The back buffer resolves where a read between the passes pulled it
+    // forward, so that pass ends there.
+    let mut s = fresh_multisampled();
+    s.emit_command(dummy_draw());
+    s.end_current_pass("test");
+    s.note_msaa_read(backbuffer());
+    s.emit_command(dummy_draw());
+    s.end_current_pass("test");
+    apply_submit_rules(&mut s);
+    assert_eq!(s.passes().len(), 2, "a resolving pass is not joined");
+
+    // Without that read, the last use takes the one resolve and the join
+    // carries it.
+    let mut s = fresh_multisampled();
+    s.emit_command(dummy_draw());
+    s.set_color_render_target(rt, BB_SIZE.0, BB_SIZE.1, RT_FORMAT, RenderScale::IDENTITY);
+    s.set_color_render_target(
+        backbuffer(),
+        BB_SIZE.0,
+        BB_SIZE.1,
+        BB_FORMAT,
+        s.render_scale,
+    );
+    s.set_color_msaa(msaa_backbuffer(), msaa_backbuffer_srgb(), 4);
+    s.emit_command(dummy_draw());
+    s.end_current_pass("test");
+    assert_eq!(s.passes().len(), 2);
+    apply_submit_rules(&mut s);
+    assert_eq!(s.passes().len(), 1);
+    assert_eq!(s.passes()[0].color_resolve_texture(), backbuffer());
+}
+
+#[test]
+fn rule_j_leaves_the_upload_prefix_alone() {
+    let target = tex(0x5000);
+    let upload = UploadPassTarget {
+        texture: target,
+        subresource: (0, 0),
+        size: BB_SIZE,
+        format: BB_FORMAT,
+        rect: (0, 0, 8, 8),
+    };
+    let mut s = fresh();
+    s.push_upload_pass(&upload, &[dummy_draw()], Vec::new());
+    s.set_color_render_target(
+        target,
+        BB_SIZE.0,
+        BB_SIZE.1,
+        BB_FORMAT,
+        RenderScale::IDENTITY,
+    );
+    s.set_depth_stencil_attachment(MetalHandle::NULL, (0, 0), false, false);
+    s.emit_command(dummy_draw());
+    s.end_current_pass("test");
+    assert_eq!(s.passes()[1].color_load(), ColorLoad::Load);
+
+    s.merge_adjacent_identical_passes();
+
+    assert_eq!(s.passes().len(), 2);
+    assert_eq!(s.upload_pass_count(), 1);
+}
+
+#[test]
+fn rule_j_moves_the_second_pass_clear_quad_ranges_with_its_commands() {
+    let target = tex(0x3000);
+    let mut s = fresh();
+    round_trip(&mut s, target, tex(0x3100));
+    s.emit_command(dummy_draw());
+    let start = s.open_color_clear_quad_block();
+    s.emit_command(set_pso(0xC1EA));
+    s.emit_command(Command::draw_primitives(PrimitiveType::Triangle, 0, 6));
+    s.close_color_clear_quad_block(start);
+    s.end_current_pass("test");
+    let block: Vec<(u32, u64, u64)> = {
+        let pass = &s.passes()[1];
+        let (start, end) = pass.color_clear_quad_ranges()[0];
+        pass.commands()[start..end]
+            .iter()
+            .map(|c| (c.cmd, c.param_b, c.param_c))
+            .collect()
+    };
+
+    s.merge_adjacent_identical_passes();
+
+    assert_eq!(s.passes().len(), 1);
+    let pass = &s.passes()[0];
+    assert_eq!(pass.color_clear_quad_ranges().len(), 1);
+    let (start, end) = pass.color_clear_quad_ranges()[0];
+    let moved: Vec<(u32, u64, u64)> = pass.commands()[start..end]
+        .iter()
+        .map(|c| (c.cmd, c.param_b, c.param_c))
+        .collect();
+    assert_eq!(moved, block);
+}
+
+#[test]
+fn every_fresh_state_command_reads_as_a_fresh_value() {
+    let changed = [
+        Command::set_triangle_fill_mode(TriangleFillMode::Lines),
+        Command::set_depth_bias(1.0, 0.0),
+        Command::set_stencil_reference(1),
+        Command::set_blend_color(0.0, 0.0, 0.0, 0.0),
+        Command::set_visibility_result_mode(VisibilityResultMode::Counting, 24),
+    ];
+    for last in &changed {
+        assert!(!sets_fresh_value(last), "{} is a change", last.cmd);
+        let restore = fresh_state_command(last).expect("a restorable state");
+        assert_eq!(restore.cmd, last.cmd);
+        assert!(sets_fresh_value(&restore), "{} restores", last.cmd);
+    }
+    for kind in [
+        CommandType::SetRenderPipelineState,
+        CommandType::SetViewport,
+        CommandType::SetDepthStencilState,
+        CommandType::SetCullMode,
+        CommandType::SetScissorRect,
+    ] {
+        let cmd = Command {
+            cmd: kind as u32,
+            param_a: 0,
+            param_b: 1,
+            param_c: 0,
+            param_d: 0,
+        };
+        assert!(
+            fresh_state_command(&cmd).is_none(),
+            "{kind:?} has no restore"
+        );
+    }
+}
+
+#[test]
+fn rule_j_joins_across_a_stencil_plane_nothing_has_written() {
+    // The stencil plane of a D24S8 surface no draw writes loads and stores
+    // `DontCare` on every pass, so it cannot keep a round trip's passes apart.
+    let target = tex(0x3000);
+    let mut s = fresh_with_stencil();
+    round_trip(&mut s, target, tex(0x3100));
+    s.emit_command(dummy_draw());
+    s.end_current_pass("test");
+    assert_eq!(s.passes().len(), 2);
+
+    apply_submit_rules(&mut s);
+
+    assert_eq!(s.passes().len(), 1);
+}
+
+#[test]
+fn rule_j_keeps_passes_apart_when_a_loaded_depth_plane_was_not_stored() {
+    let target = tex(0x3000);
+    for (name, discard) in [
+        (
+            "depth",
+            (|p: &mut Pass| p.depth_store = StoreAction::DontCare) as fn(&mut Pass),
+        ),
+        ("stencil", |p: &mut Pass| {
+            p.stencil_store = StoreAction::DontCare
+        }),
+    ] {
+        let mut s = fresh_with_stencil();
+        round_trip(&mut s, target, tex(0x3100));
+        s.emit_command(dummy_draw());
+        s.end_current_pass("test");
+        s.passes[1].depth_load = DepthLoad::Load;
+        s.passes[1].stencil_load = StencilLoad::Load;
+        discard(&mut s.passes[0]);
+
+        s.merge_adjacent_identical_passes();
+
+        assert_eq!(s.passes().len(), 2, "{name}: the passes stay apart");
+    }
 }

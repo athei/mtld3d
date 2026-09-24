@@ -7,6 +7,14 @@
 //! render encoder, so the state a draw sees is a function of the commands before it in its pass:
 //! replaying every pass once before the rules and once after them and comparing what each
 //! surviving draw sees closes that class for every rule at once.
+//!
+//! Rule J joins passes, so a draw of the second half now runs after the first half's commands.
+//! Two things make that comparable. A command that sets a state to the value a fresh encoder
+//! starts with replays as the state left unset, since a draw cannot tell the two apart. And a
+//! binding slot (a vertex or fragment buffer, texture or sampler) is compared only where it was
+//! bound before the rules: the recording starts every pass from an empty dedup cache, so a draw
+//! binds every slot it reads inside its own pass, and a slot it found unbound is one it does not
+//! read, whatever the first half left there.
 
 use mtld3d_shared::{
     Command, CommandType, MetalHandle, mtl::VERTEX_STREAM_SLOTS,
@@ -15,7 +23,7 @@ use mtld3d_shared::{
 use rustc_hash::FxHashMap;
 use xxhash_rust::xxh3::Xxh3;
 
-use super::{LAST_BOUND_MAX_STAGES, Pass, PassState, VERTEX_SAMPLER_SLOTS};
+use super::{LAST_BOUND_MAX_STAGES, Pass, PassState, VERTEX_SAMPLER_SLOTS, sets_fresh_value};
 
 /// Entries in Metal's per-stage buffer argument table.
 const BUFFER_SLOTS: usize = 31;
@@ -36,6 +44,12 @@ const FRAGMENT_SAMPLERS: usize = FRAGMENT_TEXTURES + LAST_BOUND_MAX_STAGES;
 const VERTEX_TEXTURES: usize = FRAGMENT_SAMPLERS + LAST_BOUND_MAX_STAGES;
 const VERTEX_SAMPLERS: usize = VERTEX_TEXTURES + VERTEX_SAMPLER_SLOTS;
 const SLOT_COUNT: usize = VERTEX_SAMPLERS + VERTEX_SAMPLER_SLOTS;
+
+/// The classes from this one on hold bindings, compared only where they were bound before.
+const FIRST_BINDING_CLASS: usize = 9;
+
+const _: () = assert!(SLOT_COUNT <= u128::BITS as usize, "one mask bit per slot");
+const _: () = assert!(CLASSES[FIRST_BINDING_CLASS].1 == VERTEX_BUFFERS);
 
 /// The state classes a fingerprint hashes separately, as `(name, first slot, end slot)`.
 ///
@@ -86,6 +100,8 @@ struct DrawState {
     location: (usize, usize),
     pipeline: u64,
     classes: [u64; CLASSES.len()],
+    /// Bit `n` set when slot `n` held a value, so a binding class can be compared on those slots.
+    set: u128,
 }
 
 /// The state one Metal render encoder holds while its commands replay.
@@ -96,6 +112,8 @@ struct DrawState {
 struct EncoderReplay {
     pipeline: u64,
     slots: [[u64; 4]; SLOT_COUNT],
+    /// Bit `n` set while slot `n` holds a value.
+    set: u128,
     class_hashes: [u64; CLASSES.len()],
     dirty: u16,
 }
@@ -108,11 +126,12 @@ impl PassState {
     pub fn debug_record_draw_states(&self) -> DrawStateLedger {
         let mut draws = Vec::new();
         for (pass_index, pass) in self.passes.iter().enumerate() {
-            replay_pass(pass, |command_index, pipeline, classes| {
+            replay_pass(pass, |command_index, encoder| {
                 draws.push(DrawState {
                     location: (pass_index, command_index),
-                    pipeline,
-                    classes: *classes,
+                    pipeline: encoder.pipeline,
+                    set: encoder.set,
+                    classes: *encoder.class_hashes(),
                 });
             });
         }
@@ -137,7 +156,7 @@ impl PassState {
     ) {
         let mut next = 0usize;
         for (pass_index, pass) in self.passes.iter().enumerate() {
-            replay_pass(pass, |command_index, pipeline, classes| {
+            replay_pass(pass, |command_index, encoder| {
                 let Some(recorded) = before.draws.get(next) else {
                     panic!(
                         "pass rules added a draw at pass {pass_index} command {command_index} \
@@ -146,6 +165,8 @@ impl PassState {
                     );
                 };
                 let (was_pass, was_command) = recorded.location;
+                let pipeline = encoder.pipeline;
+                let classes = encoder.compared_hashes(recorded.set);
                 assert!(
                     pipeline == recorded.pipeline
                         || alt.get(&recorded.pipeline).map(|h| h.raw()) == Some(pipeline),
@@ -181,6 +202,7 @@ impl EncoderReplay {
         Self {
             pipeline: 0,
             slots: [[0; 4]; SLOT_COUNT],
+            set: 0,
             class_hashes: [0; CLASSES.len()],
             dirty: u16::MAX,
         }
@@ -194,7 +216,12 @@ impl EncoderReplay {
             return;
         };
         let index = cmd.param_a as usize;
-        let bits = command_bits(cmd);
+        // A fresh value replays as the slot left unset: a draw sees the same state either way.
+        let bits = if sets_fresh_value(cmd) {
+            [0; 4]
+        } else {
+            command_bits(cmd)
+        };
         match kind {
             CommandType::SetRenderPipelineState => self.pipeline = cmd.param_b,
             CommandType::SetViewport => self.set(VIEWPORT, bits),
@@ -271,6 +298,11 @@ impl EncoderReplay {
 
     fn set(&mut self, slot: usize, bits: [u64; 4]) {
         self.slots[slot] = bits;
+        if bits == [0; 4] {
+            self.set &= !(1 << slot);
+        } else {
+            self.set |= 1 << slot;
+        }
         let class = CLASSES
             .iter()
             .position(|&(_, start, end)| (start..end).contains(&slot))
@@ -292,12 +324,41 @@ impl EncoderReplay {
         self.dirty = 0;
         &self.class_hashes
     }
+
+    /// The per-class hashes to compare with a recorded draw whose set slots were `recorded`.
+    ///
+    /// A binding class is hashed over the slots bound at the recorded draw only, the rest read as
+    /// unset; every other class is hashed whole. When no binding slot is set here that was unset
+    /// there, those are the ordinary hashes.
+    fn compared_hashes(&mut self, recorded: u128) -> [u64; CLASSES.len()] {
+        let mut compared = *self.class_hashes();
+        let extra = self.set & !recorded;
+        for (class, &(_, start, end)) in CLASSES.iter().enumerate().skip(FIRST_BINDING_CLASS) {
+            let class_mask = ((1u128 << (end - start)) - 1) << start;
+            if extra & class_mask == 0 {
+                continue;
+            }
+            let mut hasher = Xxh3::new();
+            for (slot, words) in self.slots[start..end].iter().enumerate() {
+                let words = if recorded & (1 << (start + slot)) == 0 {
+                    &[0; 4]
+                } else {
+                    words
+                };
+                for word in words {
+                    hasher.update(&word.to_le_bytes());
+                }
+            }
+            compared[class] = hasher.digest();
+        }
+        compared
+    }
 }
 
 /// Replay `pass` on a fresh encoder, calling `on_draw` for each draw outside its clear-quad blocks.
 ///
-/// `on_draw` receives the draw's command index, its pipeline and the per-class state hashes.
-fn replay_pass(pass: &Pass, mut on_draw: impl FnMut(usize, u64, &[u64; CLASSES.len()])) {
+/// `on_draw` receives the draw's command index and the encoder state the draw runs with.
+fn replay_pass(pass: &Pass, mut on_draw: impl FnMut(usize, &mut EncoderReplay)) {
     let mut encoder = EncoderReplay::new();
     for (index, cmd) in pass.commands.iter().enumerate() {
         if !cmd.is_draw() {
@@ -309,8 +370,7 @@ fn replay_pass(pass: &Pass, mut on_draw: impl FnMut(usize, u64, &[u64; CLASSES.l
             .iter()
             .any(|&(start, end)| (start..end).contains(&index));
         if !in_clear_quad {
-            let pipeline = encoder.pipeline;
-            on_draw(index, pipeline, encoder.class_hashes());
+            on_draw(index, &mut encoder);
         }
     }
 }

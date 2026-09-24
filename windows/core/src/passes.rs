@@ -187,26 +187,24 @@ const ENABLE_UNWRITTEN_STENCIL_DONTCARE: bool = true;
 /// draw path that does not report its depth-stencil state.
 const ENABLE_UNUSED_DEPTH_LOAD_DONTCARE: bool = true;
 
-/// Compile-time gate for Rule F (cull clear-only passes with dead Stores).
+/// Compile-time gate for Rule F (cull clear-only passes that write nothing).
 ///
-/// A pass qualifies when its every-attachment-Store ends up `DontCare`
-/// after Rules B/C run. Such a pass has zero observable effect: no
-/// draws, no leading blits, and nothing reaches VRAM. Runs at the very
-/// end of the pass-finalisation pipeline so it sees the post-rule Store
-/// actions. Cheap correctness guard: passes with leading blits stay
-/// (the blits are real work scheduled before the encoder).
+/// A pass with no draws and no leading blits qualifies when none of its
+/// attachments both clears and stores, and none resolves, after Rules B/C
+/// and G run, whatever the store actions of the attachments that only load.
+/// Such a pass has no observable effect: what it stores is what it loaded or
+/// what was undefined already. Passes with leading blits stay (the blits are
+/// real work scheduled before the encoder).
 const ENABLE_CULL_DEAD_CLEAR_PASSES: bool = true;
 
-/// Compile-time gate for Rule G — strip the color attachment from a clear-only pass.
+/// Compile-time gate for Rule G: strip unwritten colour attachments from a clear-only pass.
 ///
-/// Fires when the pass's color side is provably wasted
-/// (`color_store == DontCare` after Rule C, no draws, no leading
-/// blits). The pass becomes a *depth-only* Metal render pass with no
-/// `colorAttachments[0]` binding. Eliminates Apple's "Unused Texture"
-/// Insight on the cascade-color placeholder that per-cascade
-/// depth-clear sub-passes would otherwise attach. Requires unix-side
-/// `encode_pass` to handle `color_texture == 0` with
-/// `command_count > 0`.
+/// Fires per colour attachment of a pass with no draws and no leading blits
+/// when the attachment neither stores a `Clear` nor resolves, whatever its
+/// store. Render target 0 goes only when a depth attachment remains; the pass
+/// then becomes a *depth-only* Metal render pass with no
+/// `colorAttachments[0]` binding. Requires unix-side `encode_pass` to handle
+/// `color_texture == 0` with `command_count > 0`.
 const ENABLE_STRIP_DEAD_COLOR_IN_CLEAR_ONLY: bool = true;
 
 /// Compile-time gate for Rule H — strip the color attachment from a pass-with-draws.
@@ -263,6 +261,38 @@ const ENABLE_DROP_OVERWRITTEN_CLEAR_PASSES: bool = true;
 /// the pass it would have opened stays unopened. Flip to `false` if a game
 /// surfaces that observes such a draw through a path this list misses.
 const ENABLE_SKIP_DEAD_DRAWS: bool = true;
+
+/// Compile-time gate for Rule J (join adjacent passes on identical attachments).
+///
+/// A pass that loads every attachment the pass before it stored, on the same
+/// views, with no leading blit in between and no sampler reading one of those
+/// attachments, continues that pass rather than starting a new one; the two
+/// become one Metal render pass and the store and load between them go. The
+/// encoder state a fresh encoder would have given the second pass is put back
+/// at the join, or the passes stay apart. Flip to `false` if a game surfaces
+/// that observes the boundary between two such passes through a path the
+/// join does not model.
+const ENABLE_MERGE_ADJACENT_PASSES: bool = true;
+
+/// The encoder states Rule J reconciles at a join, as the command type that sets each.
+///
+/// A draw can read each without its pass having set it, because a fresh
+/// Metal render encoder starts with a value for it and the per-draw dedup
+/// cache leaves out a command that would set the value a fresh encoder
+/// already holds (`LastBoundCache::reset`). Bindings are not on the list: the
+/// cache starts every binding unset, so a draw binds everything it reads.
+const JOIN_STATES: [CommandType; 10] = [
+    CommandType::SetRenderPipelineState,
+    CommandType::SetViewport,
+    CommandType::SetDepthStencilState,
+    CommandType::SetCullMode,
+    CommandType::SetScissorRect,
+    CommandType::SetTriangleFillMode,
+    CommandType::SetDepthBias,
+    CommandType::SetStencilReference,
+    CommandType::SetBlendColor,
+    CommandType::SetVisibilityResultMode,
+];
 
 /// Sub-target for one-line-per-event pass-break / pass-open trace probes.
 ///
@@ -653,6 +683,16 @@ impl PassColorAttachment {
     pub const fn store(&self) -> StoreAction {
         self.store
     }
+    /// Whether the attachment changes its texture in a pass that draws nothing.
+    ///
+    /// Only a `Clear` load that is stored, or a multisample resolve, does: a
+    /// `Load` stores back what it loaded, and a `DontCare` load stores
+    /// contents that were already undefined, which the texture's old contents
+    /// stand in for as well as anything.
+    const fn written_without_draws(&self) -> bool {
+        clear_is_stored(matches!(self.load, ColorLoad::Clear { .. }), self.store)
+            || !self.resolve_texture.is_null()
+    }
 }
 
 /// One bound colour attachment of a [`Pass`] as the store rules see it.
@@ -942,6 +982,59 @@ impl Pass {
         self.color_subresource = 0;
         self.color_load = ColorLoad::DontCare;
         self.color_store = StoreAction::DontCare;
+    }
+    /// Whether render target 0 changes its texture when the pass draws nothing.
+    ///
+    /// The same test as `PassColorAttachment::written_without_draws`.
+    const fn color_written_without_draws(&self) -> bool {
+        !self.color_texture.is_null()
+            && (clear_is_stored(
+                matches!(self.color_load, ColorLoad::Clear { .. }),
+                self.color_store,
+            ) || !self.color_resolve_texture.is_null())
+    }
+    /// Whether the depth attachment changes its texture when the pass draws nothing.
+    ///
+    /// A stored `Clear` of either plane does, each plane judged by its own
+    /// store action; the stencil plane counts only where the texture has one.
+    const fn depth_written_without_draws(&self) -> bool {
+        !self.depth_texture.is_null()
+            && (clear_is_stored(
+                matches!(self.depth_load, DepthLoad::Clear { .. }),
+                self.depth_store,
+            ) || (self.depth_flags.contains(PassDepthFlags::HAS_STENCIL)
+                && clear_is_stored(
+                    matches!(self.stencil_load, StencilLoad::Clear { .. }),
+                    self.stencil_store,
+                )))
+    }
+    /// Take `next`'s work into this pass, as Rule J joins them.
+    ///
+    /// `join` is emitted between the two command lists. The joined pass keeps
+    /// this pass's load actions and takes `next`'s store actions and
+    /// resolves; `next` is left with an empty command list.
+    fn absorb(&mut self, next: &mut Self, join: &PassJoin) {
+        let offset = self.commands.len() + join.len;
+        self.commands.extend_from_slice(join.commands());
+        self.commands.append(&mut next.commands);
+        self.color_clear_quad_ranges.extend(
+            next.color_clear_quad_ranges
+                .iter()
+                .map(|&(start, end)| (start + offset, end + offset)),
+        );
+        self.color_store = next.color_store;
+        self.color_resolve_texture = next.color_resolve_texture;
+        for (mine, theirs) in self.extra_color.iter_mut().zip(&next.extra_color) {
+            mine.store = theirs.store;
+            mine.resolve_texture = theirs.resolve_texture;
+        }
+        self.depth_store = next.depth_store;
+        self.stencil_store = next.stencil_store;
+        // What the draws of either half did to the depth planes.
+        self.depth_flags |=
+            next.depth_flags & (PassDepthFlags::USED | PassDepthFlags::STENCIL_WRITTEN);
+        self.has_counting_visibility |= next.has_counting_visibility;
+        self.color_writes_observed |= next.color_writes_observed;
     }
     /// Render targets 1..3 of this pass, unbound entries included.
     #[must_use]
@@ -4336,18 +4429,23 @@ impl PassState {
         }
     }
 
-    /// Rule G — strip the color attachment from clear-only passes.
+    /// Rule G: strip the colour attachments a clear-only pass leaves unchanged.
     ///
-    /// Fires when the pass's color side is provably wasted
-    /// (`color_store == DontCare`, no draws, no leading blits). Result:
-    /// depth-only Metal render pass on the unix side. Eliminates Apple's
-    /// "Unused Texture" Insight on the cascade-color placeholder in
-    /// cascade-init clear-only sub-passes.
+    /// In a pass with no draws and no leading blits an attachment changes its
+    /// texture only through a stored `Clear` load or a multisample resolve
+    /// (`PassColorAttachment::written_without_draws`). Every other colour
+    /// attachment is dropped, render target 0 and the extras alike, whatever
+    /// its store: a `Load` stores back what it loaded, a `DontCare` load
+    /// stores contents that were undefined already, and a cleared attachment
+    /// whose store Rule C discarded writes nothing. Render target 0 stays
+    /// when the pass has no depth attachment, since the pass needs one;
+    /// Rule F culls that pass when nothing in it writes. A depth-clear pass
+    /// that also bound a colour target becomes a depth-only Metal render
+    /// pass on the unix side.
     ///
     /// Must run after `finalize_store_actions` so the Store decisions
     /// are stable, but before `cull_dead_clear_only_passes` so the
-    /// cull's `color_writes` check sees `color_texture == 0` on
-    /// stripped passes.
+    /// cull sees the stripped attachments.
     pub fn strip_dead_color_in_clear_only_passes(&mut self) {
         if !ENABLE_STRIP_DEAD_COLOR_IN_CLEAR_ONLY {
             return;
@@ -4358,30 +4456,29 @@ impl PassState {
                 continue;
             }
             for attachment in pass.extra_color.iter_mut().filter(|a| a.is_bound()) {
-                if matches!(attachment.store, StoreAction::DontCare)
-                    && attachment.resolve_texture.is_null()
-                {
+                if !attachment.written_without_draws() {
                     if log_enabled!(target: TRACE_TARGET, Level::Trace) {
                         trace!(
                             target: TRACE_TARGET,
-                            "pass-strip color={:#x} → dropped (clear-only pass, extra target)",
+                            "pass-strip color={:#x} load={:?} → dropped (clear-only pass, extra target)",
                             attachment.texture,
+                            attachment.load,
                         );
                     }
                     *attachment = PassColorAttachment::NONE;
                 }
             }
             if !pass.color_texture.is_null()
-                && matches!(pass.color_store, StoreAction::DontCare)
-                && pass.color_resolve_texture.is_null()
+                && !pass.color_written_without_draws()
                 && !pass.depth_texture.is_null()
             {
                 let stripped = pass.color_texture;
+                let load = pass.color_load;
                 pass.drop_color_attachment();
                 if log_enabled!(target: TRACE_TARGET, Level::Trace) {
                     trace!(
                         target: TRACE_TARGET,
-                        "pass-strip color={stripped:#x} → depth-only (clear-only pass)",
+                        "pass-strip color={stripped:#x} load={load:?} → depth-only (clear-only pass)",
                     );
                 }
             }
@@ -4532,17 +4629,29 @@ impl PassState {
 
     /// Rule F — cull clear-only passes that perform no observable work.
     ///
-    /// Runs after Rules B/C finalise. A pass with zero draw commands,
-    /// no leading blits, and every attachment's Store flipped to
-    /// `DontCare` (the stencil plane's included, which is stored apart
-    /// from depth) writes nothing to VRAM and exists purely as encoder
-    /// overhead; drop it. Typical case: a cascade init clear-only pass
-    /// for a depth texture that is never sampled this frame, so Rule B
-    /// flipped depth Store=DontCare on top of Rule C already flipping
-    /// the color side.
+    /// Runs after Rules B/C finalise and Rule G strips. A pass with zero draw
+    /// commands and no leading blits changes an attachment only through a
+    /// stored `Clear` load (of the stencil plane too, which is stored apart
+    /// from depth) or a multisample resolve; when none of its
+    /// attachments does either
+    /// (`PassColorAttachment::written_without_draws`), whatever their store
+    /// actions, the pass exists purely as encoder overhead plus a load and
+    /// store of every attachment, and it goes. Typical cases: a cascade init
+    /// clear-only pass whose depth Rule B discards and whose colour Rule C
+    /// discards; a pass a render-target change closed with nothing in it but
+    /// its viewport and an occlusion query's `SetVisibilityResultMode`; a pass
+    /// a draw opened before the draw itself was dropped.
+    ///
+    /// Culling a visibility command is safe. The frame's visibility buffer is
+    /// zeroed when it is installed and lives in shared storage, a slot only
+    /// takes a count from draws that run while it is armed, and a query sums
+    /// its slots once the GPU has retired the frame: a slot armed in a pass
+    /// with no draws reads zero whether or not the pass runs. The Metal
+    /// encoder state such a pass sets does not reach the next pass, which
+    /// opens its own encoder and arms its own slot at its first draw.
     ///
     /// Must run after `finalize_load_actions` / `finalize_store_actions`
-    /// so the Store decisions are stable.
+    /// so the load and store decisions are stable.
     pub fn cull_dead_clear_only_passes(&mut self) {
         if !ENABLE_CULL_DEAD_CLEAR_PASSES {
             return;
@@ -4553,20 +4662,11 @@ impl PassState {
             if has_draw || !p.leading_blits.is_empty() {
                 return true;
             }
-            // A pass whose only remaining effect is a multisample resolve
-            // still writes the twin every later reader looks at, so it is not
-            // dead work.
-            let resolves = !p.color_resolve_texture.is_null()
-                || p.extra_color.iter().any(|a| !a.resolve_texture.is_null());
-            let color_writes = resolves
-                || p.bound_color_attachments()
+            let keep = p.color_written_without_draws()
+                || p.extra_color
                     .iter()
-                    .any(|a| matches!(a.store, StoreAction::Store));
-            let depth_writes = !p.depth_texture.is_null()
-                && (matches!(p.depth_store, StoreAction::Store)
-                    || (p.depth_flags.contains(PassDepthFlags::HAS_STENCIL)
-                        && matches!(p.stencil_store, StoreAction::Store)));
-            let keep = color_writes || depth_writes;
+                    .any(|a| a.is_bound() && a.written_without_draws())
+                || p.depth_written_without_draws();
             if !keep {
                 recycle_command_vec(&mut self.command_vec_pool, core::mem::take(&mut p.commands));
             }
@@ -4581,6 +4681,79 @@ impl PassState {
                 );
             }
         }
+    }
+
+    /// Rule J: fuse a pass into the one before it when both bind the same attachments.
+    ///
+    /// Two adjacent passes on identical attachments (every view, subresource,
+    /// extent and format of render targets 0..3, the depth texture and level)
+    /// are one Metal render pass split in two, with a full store and a full
+    /// load of every attachment between the halves. That split is what a
+    /// render-target change undone before anything is drawn leaves, or an sRGB
+    /// toggle undone the same way, or a borrowed binding put back. The second
+    /// pass joins the first when the join changes nothing D3D9 can see
+    /// (`merge_join` has the conditions): it has no leading blits and loads
+    /// every attachment the first stores unresolved (a depth plane it discards
+    /// on load may have any store before it), and the second samples none of
+    /// them, since a sample reads memory the
+    /// first pass's stores no longer reach before the joined pass ends. The
+    /// joined pass keeps the first pass's load actions, takes the second's
+    /// store actions and resolves, and runs the second's commands after the
+    /// first's.
+    ///
+    /// The second pass's commands were recorded against a fresh encoder, and
+    /// the per-draw dedup cache left out every state a fresh encoder already
+    /// holds. Where the first pass leaves one of those states changed and the
+    /// second draws before setting it, the join emits the fresh value
+    /// (`fresh_state_command`): the triangle fill mode, the depth bias, the
+    /// stencil reference, the blend colour and the visibility result mode. A
+    /// state with no such command (the viewport, the pipeline, the
+    /// depth-stencil state, the cull mode, the scissor) keeps the passes apart
+    /// in that case instead. Every binding the second pass's draws read is
+    /// bound inside the second pass, so a binding the first pass leaves behind
+    /// is one nothing reads.
+    ///
+    /// Only adjacent passes join, walked front to back so a run of them
+    /// becomes one pass. The upload prefix is left alone: it is submitted in a
+    /// command buffer of its own. Runs last, after Rule F has taken out the
+    /// empty passes that would otherwise separate two joinable ones.
+    pub fn merge_adjacent_identical_passes(&mut self) {
+        if !ENABLE_MERGE_ADJACENT_PASSES {
+            return;
+        }
+        let start = self.upload_pass_end;
+        if self.passes.len() < start + 2 {
+            return;
+        }
+        let mut write = start;
+        for read in start + 1..self.passes.len() {
+            let Some(join) = merge_join(
+                &self.passes[write],
+                &self.passes[read],
+                &self.texture_view_to_base,
+            ) else {
+                write += 1;
+                self.passes.swap(write, read);
+                continue;
+            };
+            let (head, tail) = self.passes.split_at_mut(read);
+            let (prev, next) = (&mut head[write], &mut tail[0]);
+            prev.absorb(next, &join);
+            recycle_command_vec(
+                &mut self.command_vec_pool,
+                core::mem::take(&mut next.commands),
+            );
+            if log_enabled!(target: TRACE_TARGET, Level::Trace) {
+                trace!(
+                    target: TRACE_TARGET,
+                    "pass-merge idx={read} → idx={write} color={:#x} depth={:#x} restored={}",
+                    prev.color_texture,
+                    prev.depth_texture,
+                    join.len,
+                );
+            }
+        }
+        self.passes.truncate(write + 1);
     }
 
     /// Rule I: drop clear-only passes whose every cleared target is overwritten before a read.
@@ -5398,6 +5571,238 @@ fn draw_writes_stencil(ds: &DepthStencilSnapshot, attach: PipelineAttachFlags) -
         && ds.stencil_enable != 0
         && ds.write_mask & STENCIL_MASK_BITS != 0
         && !(face_keeps(ds.front) && face_keeps(ds.back))
+}
+
+/// The commands Rule J emits between the command lists of two passes it joins.
+///
+/// At most one per entry of [`JOIN_STATES`], each putting a state back to the
+/// value a fresh encoder starts with.
+struct PassJoin {
+    commands: [Command; JOIN_STATES.len()],
+    len: usize,
+}
+
+impl PassJoin {
+    const fn new() -> Self {
+        Self {
+            commands: [Command::set_triangle_fill_mode(TriangleFillMode::Fill); JOIN_STATES.len()],
+            len: 0,
+        }
+    }
+
+    const fn push(&mut self, cmd: Command) {
+        self.commands[self.len] = cmd;
+        self.len += 1;
+    }
+
+    fn commands(&self) -> &[Command] {
+        &self.commands[..self.len]
+    }
+}
+
+/// The join that fuses `next` into `prev` under Rule J, `None` when the two must stay apart.
+///
+/// The passes stay apart unless they bind identical attachments, `next` has
+/// no leading blits, every attachment carries over ([`color_carries_over`],
+/// [`depth_carries_over`]), and no sampler bind in `next` reads an
+/// attachment. Then every state of [`JOIN_STATES`] that `next` reads before
+/// setting it (it has a draw ahead of its first command for the state) must
+/// read what a fresh encoder holds: when `prev` leaves it changed, the join
+/// puts the fresh value back, or keeps the passes apart where no command can
+/// (`fresh_state_command`).
+fn merge_join(
+    prev: &Pass,
+    next: &Pass,
+    texture_view_to_base: &FxHashMap<MetalHandle<MTLTextureKind>, MetalHandle<MTLTextureKind>>,
+) -> Option<PassJoin> {
+    if !attachments_match(prev, next)
+        || !next.leading_blits.is_empty()
+        || !color_carries_over(prev, next)
+        || !depth_carries_over(prev, next)
+    {
+        return None;
+    }
+    let attached = [prev.color_texture, prev.depth_texture]
+        .into_iter()
+        .chain(prev.extra_color.iter().map(PassColorAttachment::texture));
+    for texture in attached {
+        if pass_samples_texture(next, texture, texture_view_to_base) {
+            return None;
+        }
+    }
+    let mut join = PassJoin::new();
+    let Some(first_draw) = next.commands.iter().position(Command::is_draw) else {
+        return Some(join);
+    };
+    // One walk over each list: the states `next` sets ahead of its first
+    // draw, and the command that last set each state in `prev`.
+    let mut set_before_draw = [false; JOIN_STATES.len()];
+    for cmd in &next.commands[..first_draw] {
+        if let Some(state) = JOIN_STATES.iter().position(|&kind| kind as u32 == cmd.cmd) {
+            set_before_draw[state] = true;
+        }
+    }
+    let mut last_set: [Option<&Command>; JOIN_STATES.len()] = [None; JOIN_STATES.len()];
+    let mut pending = set_before_draw.iter().filter(|&&set| !set).count();
+    for cmd in prev.commands.iter().rev() {
+        if pending == 0 {
+            break;
+        }
+        if let Some(state) = JOIN_STATES.iter().position(|&kind| kind as u32 == cmd.cmd)
+            && !set_before_draw[state]
+            && last_set[state].is_none()
+        {
+            last_set[state] = Some(cmd);
+            pending -= 1;
+        }
+    }
+    for last in last_set.into_iter().flatten() {
+        if !sets_fresh_value(last) {
+            join.push(fresh_state_command(last)?);
+        }
+    }
+    Some(join)
+}
+
+/// Whether `a` and `b` bind the same attachments, view for view, and bind at least one.
+///
+/// A multisampled companion's identity carries its sample count, so equal
+/// companions agree on it. The extent and format of render target 0 count
+/// only while it is bound: a stripped attachment keeps its old extent and
+/// format, which no pass descriptor reads.
+fn attachments_match(a: &Pass, b: &Pass) -> bool {
+    let color = a.color_texture == b.color_texture
+        && (a.color_texture.is_null()
+            || (a.color_srgb_texture == b.color_srgb_texture
+                && a.color_msaa_texture == b.color_msaa_texture
+                && a.color_msaa_srgb_texture == b.color_msaa_srgb_texture
+                && a.color_subresource == b.color_subresource
+                && a.color_size == b.color_size
+                && a.color_format == b.color_format));
+    let extras = a.extra_color.iter().zip(&b.extra_color).all(|(x, y)| {
+        x.texture == y.texture
+            && (x.texture.is_null()
+                || (x.srgb_texture == y.srgb_texture
+                    && x.msaa_texture == y.msaa_texture
+                    && x.msaa_srgb_texture == y.msaa_srgb_texture
+                    && x.subresource == y.subresource
+                    && x.size == y.size
+                    && x.format == y.format))
+    });
+    let depth = a.depth_texture == b.depth_texture
+        && (a.depth_texture.is_null()
+            || (a.depth_level == b.depth_level
+                && a.depth_size == b.depth_size
+                && a.depth_flags
+                    .intersection(PassDepthFlags::SAMPLEABLE | PassDepthFlags::HAS_STENCIL)
+                    == b.depth_flags
+                        .intersection(PassDepthFlags::SAMPLEABLE | PassDepthFlags::HAS_STENCIL)));
+    let binds_any = !a.color_texture.is_null()
+        || !a.depth_texture.is_null()
+        || a.extra_color.iter().any(PassColorAttachment::is_bound);
+    color && extras && depth && binds_any
+}
+
+/// Whether `next` carries forward every colour attachment `prev` leaves: `prev` stores it
+/// unresolved and `next` loads it.
+fn color_carries_over(prev: &Pass, next: &Pass) -> bool {
+    (prev.color_texture.is_null()
+        || (matches!(prev.color_store, StoreAction::Store)
+            && prev.color_resolve_texture.is_null()
+            && matches!(next.color_load, ColorLoad::Load)))
+        && prev
+            .extra_color
+            .iter()
+            .zip(&next.extra_color)
+            .all(|(mine, theirs)| {
+                !mine.is_bound()
+                    || (matches!(mine.store, StoreAction::Store)
+                        && mine.resolve_texture.is_null()
+                        && matches!(theirs.load, ColorLoad::Load))
+            })
+}
+
+/// Whether joining `next` onto `prev` keeps each depth plane what `next` would have found.
+///
+/// A plane `next` loads must have been stored by `prev`. A plane `next` loads
+/// `DontCare` (a stencil plane nothing has written, a pass that never uses
+/// depth) starts undefined, so `prev`'s contents serve as well, and the
+/// joined pass takes `next`'s store for it. A plane `next` clears keeps the
+/// passes apart. The stencil plane counts only where the texture has one.
+fn depth_carries_over(prev: &Pass, next: &Pass) -> bool {
+    let plane = |store: StoreAction, loads: bool, discards: bool| {
+        discards || (loads && matches!(store, StoreAction::Store))
+    };
+    prev.depth_texture.is_null()
+        || (plane(
+            prev.depth_store,
+            matches!(next.depth_load, DepthLoad::Load),
+            matches!(next.depth_load, DepthLoad::DontCare),
+        ) && (!prev.depth_flags.contains(PassDepthFlags::HAS_STENCIL)
+            || plane(
+                prev.stencil_store,
+                matches!(next.stencil_load, StencilLoad::Load),
+                matches!(next.stencil_load, StencilLoad::DontCare),
+            )))
+}
+
+/// Whether `a` and `b` are the same command, field for field.
+const fn same_command(a: &Command, b: &Command) -> bool {
+    a.cmd == b.cmd
+        && a.param_a == b.param_a
+        && a.param_b == b.param_b
+        && a.param_c == b.param_c
+        && a.param_d == b.param_d
+}
+
+/// Whether `cmd` sets its state to the value a fresh Metal render encoder starts with.
+///
+/// Answers for the states whose fresh value the per-draw dedup cache assumes
+/// (`LastBoundCache::reset`): solid fill, no depth bias, stencil reference
+/// zero, opaque white blend colour, and visibility counting off, whatever
+/// offset the disarm names. Every other command answers `false`.
+fn sets_fresh_value(cmd: &Command) -> bool {
+    if cmd.cmd == CommandType::SetVisibilityResultMode as u32 {
+        return cmd.param_a == VisibilityResultMode::Disabled as u32;
+    }
+    let fresh = [
+        Command::set_triangle_fill_mode(TriangleFillMode::Fill),
+        Command::set_depth_bias(0.0, 0.0),
+        Command::set_stencil_reference(0),
+        Command::set_blend_color(1.0, 1.0, 1.0, 1.0),
+    ];
+    fresh.iter().any(|value| same_command(cmd, value))
+}
+
+/// The command that puts the state `last` set back to a fresh encoder's value.
+///
+/// `None` for the other states of [`JOIN_STATES`]. The viewport and the
+/// pipeline have no fresh value a draw may read, and the rule holds no handle
+/// for a fresh depth-stencil state. The cull mode and the scissor start unset
+/// in the dedup cache, so a draw recorded through it sets both itself; a path
+/// that reads their fresh values without setting them keeps its pass apart.
+/// A disarm of visibility counting keeps the offset `last` armed, which lies
+/// inside the pass's visibility buffer.
+fn fresh_state_command(last: &Command) -> Option<Command> {
+    match CommandType::from_repr(last.cmd)? {
+        CommandType::SetTriangleFillMode => {
+            Some(Command::set_triangle_fill_mode(TriangleFillMode::Fill))
+        }
+        CommandType::SetDepthBias => Some(Command::set_depth_bias(0.0, 0.0)),
+        CommandType::SetStencilReference => Some(Command::set_stencil_reference(0)),
+        CommandType::SetBlendColor => Some(Command::set_blend_color(1.0, 1.0, 1.0, 1.0)),
+        CommandType::SetVisibilityResultMode => Some(Command::set_visibility_result_mode(
+            VisibilityResultMode::Disabled,
+            u32::try_from(last.param_b).expect("a visibility offset is a u32 on the wire"),
+        )),
+        // The remaining states of `JOIN_STATES`, the only commands passed in.
+        _ => None,
+    }
+}
+
+/// Whether an attachment whose load clears (`clears`) keeps the cleared contents at pass end.
+const fn clear_is_stored(clears: bool, store: StoreAction) -> bool {
+    clears && matches!(store, StoreAction::Store)
 }
 
 /// True if `pass` would observe the contents of `target_handle`.

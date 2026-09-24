@@ -10614,7 +10614,9 @@ fn trailing_blit_descriptor(trailing_blits: &[BlitCommand]) -> PassDescriptor {
 /// `color_write_mask=0` (caster passes), rewriting `SetRenderPipelineState`
 /// to the no-color variant so Metal's RP-format validation stays happy.
 /// Rule F drops clear-only passes that nothing observes; must run after
-/// Rule G so the cull picks up the strip.
+/// Rule G so the cull picks up the strip. Rule J joins each remaining pass
+/// into the one before it when both bind the same attachments; it runs last
+/// so the passes Rule F dropped no longer separate two it can join.
 fn apply_pass_rules(enc: &mut FrameEncoder, frame_continues: bool) {
     enc.pass_state.drop_overwritten_clear_only_passes();
     enc.pass_state.coalesce_clear_only_passes();
@@ -10624,6 +10626,7 @@ fn apply_pass_rules(enc: &mut FrameEncoder, frame_continues: bool) {
     enc.pass_state
         .strip_color_from_no_color_draw_passes(&enc.no_color_pipeline_alt);
     enc.pass_state.cull_dead_clear_only_passes();
+    enc.pass_state.merge_adjacent_identical_passes();
 }
 
 /// Per-frame cascade summary probe.
