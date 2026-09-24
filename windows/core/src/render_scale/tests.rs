@@ -92,6 +92,71 @@ fn a_split_at_any_edge_tiles_the_whole_texture() {
     }
 }
 
+/// A full-level rect lands on the texture Metal allocated for the level.
+#[test]
+fn a_full_level_rect_spans_the_level_metal_allocated() {
+    for percent in 1..=100 {
+        let s = RenderScale::from_percent(percent);
+        for base in 1..=1024u32 {
+            for level in 0..=4u32 {
+                let logical = (base >> level).max(1);
+                let extent =
+                    TargetExtent::mip_level(s, (logical, logical), (s.dimension(base), 1), level);
+                let texture = (s.dimension(base) >> level).max(1);
+                assert_eq!(extent.texture().0, texture);
+                assert_eq!(
+                    extent.rect(0, 0, logical, 1).2,
+                    texture,
+                    "{percent}% of {base} at level {level}"
+                );
+                let signed = logical.cast_signed();
+                assert_eq!(
+                    extent.rect_edges_i32((0, 0, signed, 1)).2,
+                    texture.cast_signed(),
+                    "{percent}% of {base} at level {level}, signed"
+                );
+            }
+        }
+    }
+}
+
+/// Pinning the far edge keeps every edge in order and adjacent rects abutting.
+#[test]
+fn a_pinned_level_rect_still_tiles() {
+    // 67% of a 1920 base is 1286 texels, so level 1 is 643 wide while the
+    // scale of its reported 960 is 643 too, and level 2 is 321 against a
+    // reported 480 that scales to 322: the far edge is pulled in by one.
+    let s = RenderScale::from_percent(67);
+    let extent = TargetExtent::mip_level(s, (480, 1), (s.dimension(1920), 1), 2);
+    assert_eq!(extent.texture().0, 321);
+    let mut previous = 0;
+    for v in 0..=600 {
+        let (x, _, w, _) = extent.rect(0, 0, v, 1);
+        assert_eq!(x, 0);
+        assert!(w >= previous, "edge {v} moved backwards");
+        previous = w;
+        let (bx, _, bw, _) = extent.rect(v, 0, 480u32.saturating_sub(v), 1);
+        if v <= 480 {
+            assert_eq!(bx, w, "split at {v} seams");
+            assert_eq!(bx + bw, 321, "split at {v} ends on the texture");
+        }
+    }
+}
+
+/// A surface or level 0 converts exactly as the scale's own rect does.
+#[test]
+fn a_whole_target_extent_converts_like_the_scale() {
+    for percent in [33, 50, 67, 75] {
+        let s = RenderScale::from_percent(percent);
+        let extent = TargetExtent::whole(s, (803, 603));
+        for (x, y, w, h) in [(0, 0, 803, 603), (13, 7, 400, 300), (100, 100, 900, 900)] {
+            assert_eq!(extent.rect(x, y, w, h), s.rect(x, y, w, h), "{percent}%");
+        }
+        let r = (-5, 3, 803, 700);
+        assert_eq!(extent.rect_edges_i32(r), s.rect_edges_i32(r), "{percent}%");
+    }
+}
+
 #[test]
 fn rect_scales_origin_and_extent_together() {
     let s = RenderScale::from_percent(50);

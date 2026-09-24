@@ -20,7 +20,7 @@ use crate::{
     depth_stencil_state::{DepthStencilSnapshot, STENCIL_MASK_BITS, StencilFaceState},
     dirty_range::DirtyRange,
     pipeline_state::{ExtraColorAttachments, PipelineAttachFlags, PipelineRsBits},
-    render_scale::RenderScale,
+    render_scale::{RenderScale, TargetExtent},
 };
 
 #[cfg(debug_assertions)]
@@ -476,8 +476,9 @@ pub enum ColorClearOutcome {
 
 /// Render target 1..3 as currently bound, before any pass has frozen it.
 ///
-/// `size` is the texture extent the pass will see and `logical_size` the one
-/// D3D9 reports; `scale` relates the two exactly as for render target 0. A
+/// `size` is the extent Metal allocated for the bound subresource, the one the
+/// pass will see, and `logical_size` the one D3D9 reports; `scale` relates the
+/// two exactly as for render target 0, through [`TargetExtent`]. A
 /// slot is bound when `texture` is non-null, and takes part in a pass only
 /// when `size` equals render target 0's (the D3D9 rule: draws reach targets
 /// whose extent matches the first one; a mismatched target is still cleared).
@@ -748,6 +749,8 @@ pub struct SavedColorAttachments {
     slice: u32,
     level: u32,
     logical_size: (u32, u32),
+    /// Extent Metal allocated for the bound subresource.
+    size: (u32, u32),
     format: PixelFormat,
     scale: RenderScale,
     has_alpha: bool,
@@ -769,10 +772,7 @@ impl SavedColorAttachments {
                 msaa_srgb_texture: self.msaa_srgb_texture,
                 sample_count: self.sample_count,
                 subresource: self.slice | (self.level << 16),
-                size: (
-                    self.scale.dimension(self.logical_size.0),
-                    self.scale.dimension(self.logical_size.1),
-                ),
+                size: self.size,
                 logical_size: self.logical_size,
                 format: self.format,
                 scale: self.scale,
@@ -797,12 +797,8 @@ impl SavedColorAttachments {
     /// Whether extra slot `slot` (1..=3) matches render target 0's extent.
     #[must_use]
     pub fn extra_matches_rt0(&self, slot: usize) -> bool {
-        let rt0 = (
-            self.scale.dimension(self.logical_size.0),
-            self.scale.dimension(self.logical_size.1),
-        );
         let extra = &self.extra[slot - 1];
-        extra.is_bound() && extra.size == rt0
+        extra.is_bound() && extra.size == self.size
     }
 }
 
@@ -1572,14 +1568,16 @@ pub struct PassState {
     /// The back buffer's own scale while it is bound, and whatever
     /// `set_color_render_target` was told for a game-created target: one sized
     /// to the back buffer shares its scale, anything else is the identity.
-    /// Read by [`Self::target_scale`], which every coordinate conversion goes
+    /// Read by [`Self::target_extent`], which every coordinate conversion goes
     /// through, so the rule lives in exactly one field.
     current_color_scale: RenderScale,
     /// The bound colour attachment's size as D3D9 reports it.
     ///
-    /// `current_color_size` is this times [`Self::current_color_scale`]. Held
+    /// `current_color_size` is the extent Metal allocated for it, which is
+    /// not always [`Self::current_color_scale`] of this: a deeper mip level of
+    /// a scaled texture is Metal's halving of the scaled base. Held
     /// separately rather than divided back out, because the scale rounds and a
-    /// round trip through it would not be exact — and because the encoder's
+    /// round trip through it would not be exact, and because the encoder's
     /// scoped `StretchRect` pass has to restore the device's binding precisely.
     current_color_logical_size: (u32, u32),
     /// The frame's logical resolution, the one D3D9 reports.
@@ -2288,14 +2286,12 @@ impl PassState {
     /// Mirrors `set_color_render_target_subresource`: a rebind of the same
     /// texture, subresource, format and extent is a no-op, any other change
     /// materialises a pending colour clear and ends the pass.
-    /// `slot.logical_size` is the D3D9-reported extent; the stored `size` is
-    /// what `slot.scale` makes of it.
+    /// `slot.logical_size` is the D3D9-reported extent and `slot.size` the
+    /// extent Metal allocated for the bound subresource, which the caller
+    /// states: a deeper mip level of a scaled texture is not `slot.scale` of
+    /// its logical size.
     pub fn set_extra_color_render_target(&mut self, slot: usize, binding: Option<ExtraColorSlot>) {
-        let mut binding = binding.unwrap_or(ExtraColorSlot::NONE);
-        binding.size = (
-            binding.scale.dimension(binding.logical_size.0),
-            binding.scale.dimension(binding.logical_size.1),
-        );
+        let binding = binding.unwrap_or(ExtraColorSlot::NONE);
         let index = slot - 1;
         let current = &self.current_extra_color[index];
         if current.texture == binding.texture
@@ -2347,6 +2343,7 @@ impl PassState {
             slice: self.current_color_subresource & 0xffff,
             level: self.current_color_subresource >> 16,
             logical_size: self.current_color_logical_size,
+            size: self.current_color_size,
             format: self.current_color_format,
             scale: self.current_color_scale,
             has_alpha: self.current_color_rt_has_alpha(),
@@ -2364,10 +2361,8 @@ impl PassState {
     pub fn restore_color_attachments(&mut self, saved: SavedColorAttachments) {
         self.set_color_render_target_subresource(
             saved.texture,
-            saved.logical_size.0,
-            saved.logical_size.1,
+            &TargetExtent::new(saved.scale, saved.logical_size, saved.size),
             saved.format,
-            saved.scale,
             (saved.slice, saved.level),
         );
         self.set_color_rt_has_alpha(saved.has_alpha);
@@ -2737,7 +2732,7 @@ impl PassState {
             // is bound *now* rather than baking the scale in at `set_viewport`,
             // so a viewport that outlives a render-target change is read in the
             // space of the target it is actually clipping.
-            self.target_scale().rect(
+            self.target_extent().rect(
                 self.viewport_x,
                 self.viewport_y,
                 self.viewport_width,
@@ -3678,25 +3673,32 @@ impl PassState {
         format: PixelFormat,
         scale: RenderScale,
     ) {
-        self.set_color_render_target_subresource(texture, width, height, format, scale, (0, 0));
+        self.set_color_render_target_subresource(
+            texture,
+            &TargetExtent::whole(scale, (width, height)),
+            format,
+            (0, 0),
+        );
     }
 
     /// Rebind a color attachment slice and mip level for the next pass.
+    ///
+    /// `extent` pairs the size D3D9 reports for the subresource with the one
+    /// Metal allocated for it, which `current_color_size` records: every
+    /// coverage test, scissor and viewport fallback measures against the
+    /// texture itself, and a deeper mip level of a scaled texture is Metal's
+    /// halving of the scaled base rather than the scale of its logical size.
     pub fn set_color_render_target_subresource(
         &mut self,
         texture: MetalHandle<MTLTextureKind>,
-        width: u32,
-        height: u32,
+        extent: &TargetExtent,
         format: PixelFormat,
-        scale: RenderScale,
         subresource: (u32, u32),
     ) {
-        // `width`/`height` arrive logical, the size D3D9 reports for this
-        // target; `scale` says what it is actually rasterized at.
-        // `current_color_size` is the real texture extent.
-        let logical_size = (width, height);
-        self.warn_if_scale_wasted(width, height, scale);
-        let (width, height) = (scale.dimension(width), scale.dimension(height));
+        let scale = extent.scale();
+        let logical_size = extent.logical();
+        self.warn_if_scale_wasted(logical_size.0, logical_size.1, scale);
+        let (width, height) = extent.texture();
         let (slice, level) = subresource;
         let packed_subresource = slice | (level << 16);
         // A pass freezes the attachment's format and extent when it opens, so
@@ -4343,6 +4345,20 @@ impl PassState {
         self.current_color_scale
     }
 
+    /// The bound colour attachment's extent in both spaces.
+    ///
+    /// What every game-supplied rect converts through on its way to a Metal
+    /// command, so a rect spanning the bound subresource's reported extent
+    /// spans the texture Metal allocated for it.
+    #[must_use]
+    pub const fn target_extent(&self) -> TargetExtent {
+        TargetExtent::new(
+            self.current_color_scale,
+            self.current_color_logical_size,
+            self.current_color_size,
+        )
+    }
+
     /// The bound colour attachment's size as D3D9 reports it, with its scale.
     ///
     /// Pairs with [`Self::target_scale`] for a caller that binds a target of
@@ -4363,7 +4379,8 @@ impl PassState {
     #[must_use]
     pub fn resolved_scissor_rect(&self, test_enable: bool, rect: [u32; 4]) -> (u32, u32, u32, u32) {
         if test_enable && rect[2] != 0 && rect[3] != 0 {
-            self.target_scale().rect(rect[0], rect[1], rect[2], rect[3])
+            self.target_extent()
+                .rect(rect[0], rect[1], rect[2], rect[3])
         } else {
             self.effective_viewport()
         }
@@ -4405,7 +4422,7 @@ impl PassState {
         // The fields above keep the game's own numbers so a later render-target
         // change re-reads them in the new target's space; only what reaches
         // Metal is converted.
-        let rect = self.target_scale().rect(x, y, width, height);
+        let rect = self.target_extent().rect(x, y, width, height);
         self.emit_viewport_if_changed(rect, min_z, max_z);
     }
 

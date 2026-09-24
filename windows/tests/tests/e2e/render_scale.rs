@@ -780,6 +780,80 @@ fn a_whole_target_clear_reaches_the_last_column_and_row_of_an_odd_sized_frame() 
     assert_edges_read(&h, BLUE, "whole-target clear");
 }
 
+/// A draw into mip level 1 of a scaled target reaches that level's last column and row.
+///
+/// Metal sizes the level from the scaled base: 67% of 853x659 is 572x442, so
+/// level 1 is 286x221 texels, a texel wider and taller than the 285x220 the
+/// scale makes of the level's reported 426x329. Bound with a full-level
+/// viewport and scissor, a pass measured against the scaled reported extent
+/// leaves the level's last column and row undrawn. Pins its own scale,
+/// because at the suite's 0.75 these sizes do not mismatch.
+#[test]
+fn a_draw_into_a_scaled_mip_level_reaches_its_last_column_and_row() {
+    let config = "render.scale=0.67";
+    let (width, height) = (853, 659);
+    let h = Harness::create(&HarnessConfig {
+        width,
+        height,
+        config_entries: config,
+        ..HarnessConfig::default()
+    });
+    let rt = h.create_texture(
+        width,
+        height,
+        2,
+        D3DUSAGE_RENDERTARGET,
+        D3DFMT_A8R8G8B8,
+        D3DPOOL_DEFAULT,
+    );
+    let level = rt.surface_level(1);
+    let (level_w, level_h) = (width / 2, height / 2);
+    assert_eq!(h.set_render_target(0, &level), 0, "{config}: bind level 1");
+    let full = D3DVIEWPORT9 {
+        x: 0,
+        y: 0,
+        width: level_w,
+        height: level_h,
+        min_z: 0.0,
+        max_z: 1.0,
+    };
+    assert_eq!(h.set_viewport(&full), 0, "{config}: full-level viewport");
+    assert_eq!(h.set_render_state(D3DRS_SCISSORTESTENABLE, 1), 0);
+    assert_eq!(
+        h.set_scissor_rect(&D3DRECT {
+            x1: 0,
+            y1: 0,
+            x2: level_w.cast_signed(),
+            y2: level_h.cast_signed(),
+        }),
+        0,
+        "{config}: full-level scissor",
+    );
+    assert_eq!(h.set_render_state(D3DRS_LIGHTING, 0), 0, "lighting off");
+    h.select_diffuse_stage(0);
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE), 0, "SetFVF");
+    h.render_once(RED, |h| {
+        assert_eq!(
+            h.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &covering_quad(0.5)),
+            0,
+            "{config}: covering draw",
+        );
+    });
+    let (last_x, last_y) = (level_w - 1, level_h - 1);
+    for (x, y, what) in [
+        (level_w / 2, level_h / 2, "middle"),
+        (last_x, level_h / 2, "last column"),
+        (level_w / 2, last_y, "last row"),
+        (last_x, last_y, "last corner"),
+    ] {
+        assert_pixel_eq(
+            h.read_pixel(x, y),
+            GREEN,
+            &format!("{config}: level 1 {what}"),
+        );
+    }
+}
+
 #[test]
 fn color_fill_of_a_target_at_the_backbuffer_size_uses_reported_coordinates() {
     // A render target created at the reported back-buffer size belongs to the
