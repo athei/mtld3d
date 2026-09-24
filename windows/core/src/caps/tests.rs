@@ -5,14 +5,20 @@
 //! many fields `fill_default` writes carry no assertion. Other cases tie a cap to its backing
 //! code: clip planes to the vertex-shader uniform, active lights to the FF light slots. The
 //! `debug.capsAll` fill is pinned as a superset that leaves shader versions and SM2.x caps alone.
+//! The texture-operation caps are also checked against the fixed-function emitter's output for
+//! every operation value, through the unimplemented-operation answer the stage-state setter warns
+//! from.
 
 use mtld3d_types::{
-    AddressCaps, BlendCaps, Caps3, CmpCaps, D3DCAPS9, DeclTypeCaps, DevCaps, DevCaps2, FilterCaps,
-    FvfCaps, LineCaps, PrimitiveMiscCaps, RasterCaps, ShadeCaps, StencilCaps, TexOpCaps,
-    TextureCaps, VtxpCaps, d3dps_version, d3dvs_version,
+    AddressCaps, BlendCaps, Caps3, CmpCaps, D3DCAPS9, D3DTA_CURRENT, D3DTA_DIFFUSE,
+    D3DTOP_BUMPENVMAP, D3DTOP_BUMPENVMAPLUMINANCE, D3DTOP_DISABLE, D3DTOP_LERP, D3DTOP_MULTIPLYADD,
+    D3DTOP_PREMODULATE, D3DTOP_SELECTARG1, DeclTypeCaps, DevCaps, DevCaps2, FilterCaps, FvfCaps,
+    LineCaps, PrimitiveMiscCaps, RasterCaps, ShadeCaps, StencilCaps, TexOpCaps, TextureCaps,
+    VtxpCaps, d3dps_version, d3dvs_version,
 };
 
-use super::{FF_TEXTURE_STAGES, apply_advertise_all, fill_default};
+use super::{FF_TEXTURE_STAGES, apply_advertise_all, fill_default, unimplemented_texture_op};
+use crate::dxso::{FfPsKey, FfStage, FfStageFlags, VariantKey, emit_ps_ff};
 
 fn filled() -> D3DCAPS9 {
     // Calls `fill_default` directly so the assertions describe the
@@ -244,6 +250,78 @@ fn texture_op_caps_match_emitter() {
         | TexOpCaps::BLENDCURRENTALPHA
         | TexOpCaps::DOTPRODUCT3;
     assert_eq!(filled().texture_op_caps, expected.bits());
+}
+
+/// Fragment source for a single active stage with the given colour and alpha operations.
+///
+/// Both argument pairs are `D3DTA_DIFFUSE` and `D3DTA_CURRENT`, which declare
+/// nothing and take no unbound-texture path, so the operation is the only
+/// difference between two keys built here.
+fn one_stage_ps(color_op: u32, alpha_op: u32) -> String {
+    let narrow = |v: u32| u8::try_from(v).expect("D3D9 fixed-function enum value fits u8");
+    let mut stages = [FfStage {
+        color_op: narrow(D3DTOP_DISABLE),
+        ..FfStage::default()
+    }; 8];
+    stages[0] = FfStage {
+        color_op: narrow(color_op),
+        color_arg1: narrow(D3DTA_DIFFUSE),
+        color_arg2: narrow(D3DTA_CURRENT),
+        alpha_op: narrow(alpha_op),
+        alpha_arg1: narrow(D3DTA_DIFFUSE),
+        alpha_arg2: narrow(D3DTA_CURRENT),
+        flags: FfStageFlags::empty(),
+    };
+    let key = FfPsKey {
+        stages,
+        specular_add: false,
+        tt_projected_mask: 0,
+    };
+    emit_ps_ff(&key, VariantKey::default())
+}
+
+#[test]
+fn unimplemented_texture_ops_are_the_ones_the_emitter_renders_as_selectarg1() {
+    // An operation the emitter has no arm for keeps its first argument, so
+    // its stage compiles to exactly the source `D3DTOP_SELECTARG1` gives.
+    // Every implemented operation reads the second argument, reads an alpha
+    // or ends the cascade, so its source differs. The operations the setter
+    // warns about (those `TEXOP_DEFAULT` leaves out) must be exactly the
+    // in-space ones that come out identical. Values outside the space come
+    // out identical too; the key builder reads them as the stage default.
+    let in_space = D3DTOP_DISABLE..=D3DTOP_LERP;
+    let reference = one_stage_ps(D3DTOP_SELECTARG1, D3DTOP_SELECTARG1);
+    for op in 0..=D3DTOP_LERP + 1 {
+        let falls_back =
+            op != D3DTOP_SELECTARG1 && one_stage_ps(op, D3DTOP_SELECTARG1) == reference;
+        let expected = unimplemented_texture_op(op).is_some() || !in_space.contains(&op);
+        assert_eq!(falls_back, expected, "D3DTSS_COLOROP = {op}");
+    }
+    // The alpha operation runs through the same arms. `D3DTOP_DISABLE` is
+    // left out: it ends the cascade as a colour operation, and D3D9 leaves an
+    // alpha `D3DTOP_DISABLE` under an enabled colour operation undefined.
+    for op in (D3DTOP_DISABLE + 1)..=D3DTOP_LERP + 1 {
+        let falls_back =
+            op != D3DTOP_SELECTARG1 && one_stage_ps(D3DTOP_SELECTARG1, op) == reference;
+        let expected = unimplemented_texture_op(op).is_some() || !in_space.contains(&op);
+        assert_eq!(falls_back, expected, "D3DTSS_ALPHAOP = {op}");
+    }
+}
+
+#[test]
+fn unimplemented_texture_op_names_the_operation() {
+    for (op, name) in [
+        (D3DTOP_PREMODULATE, "PREMODULATE"),
+        (D3DTOP_BUMPENVMAP, "BUMPENVMAP"),
+        (D3DTOP_BUMPENVMAPLUMINANCE, "BUMPENVMAPLUMINANCE"),
+        (D3DTOP_MULTIPLYADD, "MULTIPLYADD"),
+        (D3DTOP_LERP, "LERP"),
+    ] {
+        assert_eq!(unimplemented_texture_op(op), Some(name), "D3DTOP {op}");
+    }
+    for op in [0, D3DTOP_LERP + 1, 33, u32::MAX] {
+        assert_eq!(unimplemented_texture_op(op), None, "D3DTOP {op}");
+    }
 }
 
 #[test]

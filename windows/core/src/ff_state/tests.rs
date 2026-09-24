@@ -6,14 +6,17 @@
 //! into dense eye-space shader slots, the const-row extent checked against the `vs_c` rows the
 //! emitter reads, `inverse` round-tripping affine matrices while rejecting singular ones, and
 //! the texture-stage-state warn latch firing per stage for unconsumed slots and never for the
-//! bump-environment slots, which route to the texbem uniform alone.
+//! bump-environment slots, which route to the texbem uniform alone, and the unimplemented
+//! texture-operation warning firing at the write, once per slot, while a value outside the
+//! `D3DTOP_*` space reads as the stage default instead.
 
 use mtld3d_types::{
     D3DFOG_EXP, D3DFOG_LINEAR, D3DMATRIX, D3DRS_DEPTHBIAS, D3DRS_FOGCOLOR, D3DRS_FOGDENSITY,
     D3DRS_FOGENABLE, D3DRS_FOGEND, D3DRS_FOGSTART, D3DRS_FOGTABLEMODE, D3DRS_FOGVERTEXMODE,
-    D3DRS_TEXTUREFACTOR, D3DTA_TEXTURE, D3DTOP_MODULATE, D3DTSS_BUMPENVLOFFSET,
-    D3DTSS_BUMPENVLSCALE, D3DTSS_BUMPENVMAT00, D3DTSS_BUMPENVMAT01, D3DTSS_BUMPENVMAT10,
-    D3DTSS_BUMPENVMAT11, D3DTSS_COLORARG0, D3DTSS_COLOROP, D3DTSS_CONSTANT, D3DTSS_TEXCOORDINDEX,
+    D3DRS_TEXTUREFACTOR, D3DTA_TEXTURE, D3DTOP_BUMPENVMAP, D3DTOP_LERP, D3DTOP_MODULATE,
+    D3DTOP_MULTIPLYADD, D3DTSS_ALPHAOP, D3DTSS_BUMPENVLOFFSET, D3DTSS_BUMPENVLSCALE,
+    D3DTSS_BUMPENVMAT00, D3DTSS_BUMPENVMAT01, D3DTSS_BUMPENVMAT10, D3DTSS_BUMPENVMAT11,
+    D3DTSS_COLORARG0, D3DTSS_COLOROP, D3DTSS_CONSTANT, D3DTSS_TEXCOORDINDEX,
     D3DTSS_TEXTURETRANSFORMFLAGS, RENDER_STATE_COUNT, render_state_defaults,
 };
 
@@ -392,6 +395,43 @@ fn bump_env_tss_writes_do_not_warn() {
                 "D3DTSS_{ty} (stage {stage}) fired the not-consumed warn"
             );
         }
+    }
+}
+
+#[test]
+fn unimplemented_texture_op_write_warns_once_per_slot() {
+    // The warning fires at the write, so a warm shader cache that never runs
+    // the emitter still reports the operation. An implemented operation never
+    // warns, and neither does the not-consumed latch, since both op slots are
+    // consumed.
+    let color = D3DTSS_COLOROP as usize;
+    let alpha = D3DTSS_ALPHAOP as usize;
+    let mut state = FfState::new();
+    state.set_texture_stage_state(0, color, D3DTOP_MODULATE);
+    assert!(!state.texture_op_warn_fired(color, D3DTOP_MODULATE));
+    state.set_texture_stage_state(1, color, D3DTOP_BUMPENVMAP);
+    assert!(state.texture_op_warn_fired(color, D3DTOP_BUMPENVMAP));
+    assert!(!state.texture_op_warn_fired(alpha, D3DTOP_BUMPENVMAP));
+    assert!(!state.texture_op_warn_fired(color, D3DTOP_MULTIPLYADD));
+    state.set_texture_stage_state(2, alpha, D3DTOP_MULTIPLYADD);
+    assert!(state.texture_op_warn_fired(alpha, D3DTOP_MULTIPLYADD));
+    assert!(!state.texture_op_warn_fired(color, D3DTOP_MULTIPLYADD));
+    assert!(!state.tss_warn_fired(1, color));
+    assert!(!state.tss_warn_fired(2, alpha));
+}
+
+#[test]
+fn texture_op_outside_the_space_reads_the_stage_default() {
+    // The emitter renders a value outside the `D3DTOP_*` space as it renders
+    // an unimplemented operation, so the key builder reads the stage default
+    // instead, and that read carries the warning. The write does not also
+    // warn as an unimplemented operation.
+    for op in [0, D3DTOP_LERP + 1] {
+        let mut state = FfState::new();
+        state.set_texture_stage_state(0, D3DTSS_COLOROP as usize, op);
+        assert!(!state.texture_op_warn_fired(D3DTSS_COLOROP as usize, op));
+        let key = state.build_ps_key(&rs(), 0);
+        assert_eq!(u32::from(key.stages[0].color_op), D3DTOP_MODULATE);
     }
 }
 
