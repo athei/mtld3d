@@ -182,6 +182,8 @@ is in [`CONFORMANCE.md`](../unix/conformance/CONFORMANCE.md#kept-divergences).
   instead of waiting for the GPU. `query.flushImmediate`, off by default.
 - EVENT query polls queue the open frame even without `D3DGETDATA_FLUSH`,
   so a caller polling before Present can make progress. No knob.
+- An EVENT query poll can answer completed at once instead of waiting for
+  the GPU. `query.eventImmediate`, off by default.
 - Depth and stencil are discarded at every `Present` on a surface nothing
   samples. D3D9 keeps them unless the game sets
   `D3DPRESENTFLAG_DISCARD_DEPTHSTENCIL` or creates the surface with

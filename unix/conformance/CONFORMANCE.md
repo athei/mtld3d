@@ -202,8 +202,19 @@ record. A knob, where one makes sense, is named with its default.
   setting the flag. The first poll splits the frame and queues its work on
   the existing bounded encoder channel; later polls only read retirement.
   There is no synchronous encoder or submit completion wait, but admission
-  can backpressure like Present. Completion still requires GPU retirement.
-  No knob.
+  can backpressure like Present. Completion still requires GPU retirement,
+  unless the next entry's knob is on. No knob.
+- **An EVENT query poll can answer completed at once** instead of waiting for
+  the GPU to retire the frame the query was issued in. Off by default. A title
+  that polls the query only to keep the CPU from running ahead of the GPU
+  gains nothing from the real answer, because the encoder and submit threads
+  already bound how far ahead it can get; waiting for retirement makes its
+  CPU and GPU work run back to back instead. The immediate answer cannot fence
+  reuse of CPU-writable dynamic storage behind a `D3DLOCK_NOOVERWRITE` lock,
+  so it is only for titles verified not to rely on that. The `wow` profile
+  turns it on for `gxFixLag`, which took 3.3.5a from 120 FPS to 77 with the
+  same GPU time per frame; through 0.9.0 every EVENT poll answered at once
+  on both clients. Knob: `query.eventImmediate`, default `false`.
 - **Depth and stencil are discarded at every `Present` on a surface nothing
   samples.** D3D9 keeps a depth-stencil surface's contents across `Present`
   and leaves them undefined only when the game asks for it:

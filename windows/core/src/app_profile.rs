@@ -67,13 +67,19 @@ static PROFILES: &[AppProfile] = &[
     // `D3DLOCK_NOOVERWRITE` into pages a queued draw still reads. The sun and
     // moon lens flares read their queries without FLUSH and still get the real
     // counts.
+    //
+    // `gxFixLag` ("Reduce Input Lag", on by default) polls an EVENT query every
+    // frame to keep the CPU from running ahead of the GPU. Answering it from
+    // GPU retirement serialises CPU and GPU work: 3.3.5a fell from 120 FPS to
+    // 77 with unchanged GPU time per frame. Through 0.9.0 every EVENT poll
+    // answered completed at once, on both clients, with no reported corruption.
     AppProfile {
         name: "wow",
         exe: "WoW.exe",
         company: Some("Blizzard Entertainment"),
         product: Some("World of Warcraft"),
         original_filename: None,
-        settings: "query.flushImmediate=true",
+        settings: "query.flushImmediate=true;query.eventImmediate=true",
     },
 ];
 
