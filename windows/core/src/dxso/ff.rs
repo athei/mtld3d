@@ -375,9 +375,11 @@ impl FfStage {
 
     /// Whether the effective color or alpha operation consumes this argument source.
     ///
-    /// Explicit unbound-texture fallback reads CURRENT, and effective DOTPRODUCT3
-    /// supplies alpha itself. Unsupported operations conservatively retain their
-    /// inputs so their arg1 fallback cannot read an unbound constant buffer.
+    /// Explicit unbound-texture fallback reads CURRENT, effective DOTPRODUCT3
+    /// supplies alpha itself, and a disabled alpha operation keeps the result
+    /// register's alpha without reading an argument. Unsupported operations
+    /// conservatively retain their inputs so their arg1 fallback cannot read an
+    /// unbound constant buffer.
     #[must_use]
     pub fn reads_argument(&self, selector: u32) -> bool {
         let color = if self.color_uses_unbound_fallback() {
@@ -412,16 +414,13 @@ impl FfStage {
     }
 
     fn references_texture_factor(self) -> bool {
+        let selects_factor = |a: u8| u32::from(a) & D3DTA_SELECTMASK == D3DTA_TFACTOR;
         u32::from(self.color_op) == D3DTOP_BLENDFACTORALPHA
             || u32::from(self.alpha_op) == D3DTOP_BLENDFACTORALPHA
-            || [
-                self.color_arg1,
-                self.color_arg2,
-                self.alpha_arg1,
-                self.alpha_arg2,
-            ]
-            .iter()
-            .any(|a| u32::from(*a) & D3DTA_SELECTMASK == D3DTA_TFACTOR)
+            || selects_factor(self.color_arg1)
+            || selects_factor(self.color_arg2)
+            || (u32::from(self.alpha_op) != D3DTOP_DISABLE
+                && (selects_factor(self.alpha_arg1) || selects_factor(self.alpha_arg2)))
     }
 }
 
@@ -1709,12 +1708,11 @@ fn emit_ps(out: &mut String, ps: &FfPsKey, variant: VariantKey, entry: &str) {
             .enumerate()
             .take_while(|(_, s)| u32::from(s.color_op) != D3DTOP_DISABLE)
     };
+    // A stage that keeps its result register's alpha does not read that
+    // register: the value it keeps is already the register's own.
     let reads_temp = active().any(|(i, stage)| {
-        let (color_expr, alpha_expr) = stage_expressions(*stage, i);
-        names_local(&color_expr, "temp")
-            || alpha_expr
-                .as_deref()
-                .is_some_and(|alpha| names_local(alpha, "temp"))
+        let (color_expr, alpha) = stage_expressions(*stage, i);
+        names_local(&color_expr, "temp") || alpha.names_local("temp")
     });
     if reads_temp {
         out.push_str("    float4 temp = float4(0.0);\n");
@@ -1728,16 +1726,14 @@ fn emit_ps(out: &mut String, ps: &FfPsKey, variant: VariantKey, entry: &str) {
             FfStageResult::Current => "current",
             FfStageResult::Temp => "temp",
         };
-        let (color_expr, alpha_expr) = stage_expressions(*stage, i);
+        let (color_expr, alpha) = stage_expressions(*stage, i);
         // The sample feeds this stage's own expressions and nothing else, so
         // it is emitted for the stage that names it and skipped for the stage
         // that discards it. The texture and sampler arguments stay as they
         // are: an unread sample costs a declaration, not a binding.
         let texture_local = format!("t{i}");
-        let samples_texture = names_local(&color_expr, &texture_local)
-            || alpha_expr
-                .as_deref()
-                .is_some_and(|alpha| names_local(alpha, &texture_local));
+        let samples_texture =
+            names_local(&color_expr, &texture_local) || alpha.names_local(&texture_local);
         if samples_texture {
             // VS emits the TCI-resolved coord for stage i into
             // `Varyings.texcoord[i]`, so PS stage i samples slot i directly.
@@ -1818,13 +1814,22 @@ fn emit_ps(out: &mut String, ps: &FfPsKey, variant: VariantKey, entry: &str) {
         }
         // Both expressions read the old register values before either channel
         // changes, including when this stage reads its own destination.
-        if let Some(alpha_expr) = alpha_expr {
-            let _ = writeln!(
-                out,
-                "    {result} = float4(({color_expr}).rgb, ({alpha_expr}).a);",
-            );
-        } else {
-            let _ = writeln!(out, "    {result} = {color_expr};");
+        match alpha {
+            StageAlpha::FromColor => {
+                let _ = writeln!(out, "    {result} = {color_expr};");
+            }
+            StageAlpha::Kept => {
+                let _ = writeln!(
+                    out,
+                    "    {result} = float4(({color_expr}).rgb, ({result}).a);",
+                );
+            }
+            StageAlpha::Op(alpha_expr) => {
+                let _ = writeln!(
+                    out,
+                    "    {result} = float4(({color_expr}).rgb, ({alpha_expr}).a);",
+                );
+            }
         }
     }
 
@@ -1880,17 +1885,37 @@ fn emit_ps(out: &mut String, ps: &FfPsKey, variant: VariantKey, entry: &str) {
     out.push_str("}\n");
 }
 
+/// Where one texture stage's result alpha comes from.
+enum StageAlpha {
+    /// The colour operation writes all four channels (`D3DTOP_DOTPRODUCT3`).
+    FromColor,
+    /// `D3DTOP_DISABLE` under an enabled colour operation: the register keeps its alpha.
+    ///
+    /// The register is the stage's own destination, CURRENT or TEMP, so a
+    /// stage writing TEMP keeps TEMP's alpha, zero until a stage writes it.
+    Kept,
+    /// The alpha operation's expression, whose `.a` the stage writes.
+    Op(String),
+}
+
+impl StageAlpha {
+    fn names_local(&self, name: &str) -> bool {
+        match self {
+            Self::FromColor | Self::Kept => false,
+            Self::Op(expr) => names_local(expr, name),
+        }
+    }
+}
+
 /// The colour and alpha expressions one texture stage's result is assembled from.
-///
-/// A `None` alpha means the colour operation supplies the alpha as well
-/// (`D3DTOP_DOTPRODUCT3`), so the stage writes the colour expression whole.
 ///
 /// Unbound-texture "invalid op" handling: a stage with NO bound texture whose
 /// op consumes a `D3DTA_TEXTURE` argument resolves to SELECTARG1(CURRENT),
 /// since the unbound-texture default is CURRENT, not opaque white. SELECTARG1
 /// of CURRENT is just `current`, so short-circuit to it. Colour and alpha are
-/// tested independently; textured stages take the byte-identical path.
-fn stage_expressions(stage: FfStage, i: usize) -> (String, Option<String>) {
+/// tested independently; textured stages take the byte-identical path. A
+/// disabled alpha operation reads no argument, so it never takes that fallback.
+fn stage_expressions(stage: FfStage, i: usize) -> (String, StageAlpha) {
     let color_expr = if stage.color_uses_unbound_fallback() {
         "current".to_string()
     } else {
@@ -1898,14 +1923,16 @@ fn stage_expressions(stage: FfStage, i: usize) -> (String, Option<String>) {
         let c2 = resolve_arg(stage.color_arg2, i, stage.has_texture());
         apply_op(stage.color_op, &c1, &c2, i, stage.has_texture())
     };
-    let alpha_expr = if stage.color_writes_alpha() {
-        None
+    let alpha = if stage.color_writes_alpha() {
+        StageAlpha::FromColor
+    } else if u32::from(stage.alpha_op) == D3DTOP_DISABLE {
+        StageAlpha::Kept
     } else if stage.alpha_uses_unbound_fallback() {
-        Some("current".to_string())
+        StageAlpha::Op("current".to_string())
     } else {
         let a1 = resolve_arg(stage.alpha_arg1, i, stage.has_texture());
         let a2 = resolve_arg(stage.alpha_arg2, i, stage.has_texture());
-        Some(apply_op_scalar(
+        StageAlpha::Op(apply_op_scalar(
             stage.alpha_op,
             &a1,
             &a2,
@@ -1913,7 +1940,7 @@ fn stage_expressions(stage: FfStage, i: usize) -> (String, Option<String>) {
             stage.has_texture(),
         ))
     };
-    (color_expr, alpha_expr)
+    (color_expr, alpha)
 }
 
 /// Does an emitted stage expression read the local called `name`?
@@ -1947,10 +1974,16 @@ fn op_reads_texture(op: u8, arg1: u8, arg2: u8) -> bool {
     op_reads_argument(op, arg1, arg2, D3DTA_TEXTURE)
 }
 
+/// Does `op` consume an argument naming `selector`?
+///
+/// `D3DTOP_DISABLE` consumes none: a disabled colour operation ends the
+/// cascade, and a disabled alpha operation keeps the register's alpha.
 fn op_reads_argument(op: u8, arg1: u8, arg2: u8, selector: u32) -> bool {
     let op = u32::from(op);
     let selected = |a: u8| u32::from(a) & D3DTA_SELECTMASK == selector;
-    (selected(arg1) && op != D3DTOP_SELECTARG2) || (selected(arg2) && op != D3DTOP_SELECTARG1)
+    op != D3DTOP_DISABLE
+        && ((selected(arg1) && op != D3DTOP_SELECTARG2)
+            || (selected(arg2) && op != D3DTOP_SELECTARG1))
 }
 
 fn resolve_arg(arg: u8, stage: usize, has_texture: bool) -> String {
