@@ -108,14 +108,12 @@ pub fn destroy_pipeline(handle: u64) {
 /// Native temporary objects can leave this function after encoding: the command
 /// buffer retains every bound texture, view, buffer and pipeline until completion.
 /// Its creation is centralized in `command::diagnostics::command_buffer`. The
-/// private planes come from the device's `planes` pool, stamped with `stamp`;
-/// `labels` says whether the encoders and temporaries it creates get labels.
+/// private planes come from the device's `planes` pool, stamped with `stamp`.
 pub fn encode(
     cb: &ProtocolObject<dyn MTLCommandBuffer>,
     command: &BlitCommand,
     planes: &mut PlanePool,
     stamp: &SubmitStamp,
-    labels: bool,
 ) -> bool {
     // SAFETY: TransferDepth encodes source and destination canonical texture handles.
     let source_handle = unsafe { MetalHandle::<MTLTextureKind>::new(command.src_handle) };
@@ -186,7 +184,7 @@ pub fn encode(
         };
         let input = if let Some(set) = input_set {
             let input = planes.view(set, width, stencil);
-            if !extract_planes(cb, &source, source_level, (width, height), &input, labels) {
+            if !extract_planes(cb, &source, source_level, width, height, &input) {
                 return false;
             }
             Some(input)
@@ -194,8 +192,7 @@ pub fn encode(
             None
         };
         let sampleable = if input.is_none() {
-            let Some(texture) =
-                copy_multisample_source(cb, &source, source_level, (width, height), labels)
+            let Some(texture) = copy_multisample_source(cb, &source, source_level, width, height)
             else {
                 return false;
             };
@@ -209,9 +206,7 @@ pub fn encode(
                 log::error!(target: LOG_TARGET, "depth transfer: stencil view allocation failed");
                 return false;
             };
-            if labels {
-                view.setLabel(Some(&NSString::from_str("mtld3d-depth-transfer-stencil")));
-            }
+            view.setLabel(Some(&NSString::from_str("mtld3d-depth-transfer-stencil")));
             Some(view)
         } else {
             None
@@ -220,9 +215,7 @@ pub fn encode(
             log::error!(target: LOG_TARGET, "depth transfer: compute encoder failed");
             return false;
         };
-        if labels {
-            compute.setLabel(Some(&NSString::from_str("mtld3d-depth-transfer-resample")));
-        }
+        compute.setLabel(Some(&NSString::from_str("mtld3d-depth-transfer-resample")));
         compute.setComputePipelineState(&pipeline);
         if let Some(input) = input.as_ref() {
             // SAFETY: the single-sample kernel reads the full extracted depth plane at slot zero.
@@ -303,18 +296,16 @@ pub fn encode(
         );
         compute.dispatchThreadgroups_threadsPerThreadgroup(grid, threadgroup);
         compute.endEncoding();
-    } else if !extract_planes(cb, &source, source_level, (width, height), &output, labels) {
+    } else if !extract_planes(cb, &source, source_level, width, height, &output) {
         return false;
     }
     let Some(blit) = cb.blitCommandEncoder() else {
         log::error!(target: LOG_TARGET, "depth transfer: destination blit encoder failed");
         return false;
     };
-    if labels {
-        blit.setLabel(Some(&NSString::from_str(
-            "mtld3d-depth-transfer-destination-copy",
-        )));
-    }
+    blit.setLabel(Some(&NSString::from_str(
+        "mtld3d-depth-transfer-destination-copy",
+    )));
     let depth_option = if destination.pixelFormat() == MTLPixelFormat::Depth32Float_Stencil8 {
         MTLBlitOption::DepthFromDepthStencil
     } else {
@@ -497,16 +488,14 @@ fn extract_planes(
     cb: &ProtocolObject<dyn MTLCommandBuffer>,
     source: &ProtocolObject<dyn MTLTexture>,
     level: usize,
-    (width, height): (usize, usize),
+    width: usize,
+    height: usize,
     output: &PlaneBuffers<'_>,
-    labels: bool,
 ) -> bool {
     let Some(blit) = cb.blitCommandEncoder() else {
         return false;
     };
-    if labels {
-        blit.setLabel(Some(&NSString::from_str("mtld3d-depth-transfer-extract")));
-    }
+    blit.setLabel(Some(&NSString::from_str("mtld3d-depth-transfer-extract")));
     let depth_option = if source.pixelFormat() == MTLPixelFormat::Depth32Float_Stencil8 {
         MTLBlitOption::DepthFromDepthStencil
     } else {
@@ -534,8 +523,8 @@ fn copy_multisample_source(
     cb: &ProtocolObject<dyn MTLCommandBuffer>,
     source: &ProtocolObject<dyn MTLTexture>,
     level: usize,
-    (width, height): (usize, usize),
-    labels: bool,
+    width: usize,
+    height: usize,
 ) -> Option<Retained<ProtocolObject<dyn MTLTexture>>> {
     // SAFETY: source mip dimensions and format are already validated.
     let desc = unsafe {
@@ -554,13 +543,11 @@ fn copy_multisample_source(
     }
     desc.setUsage(MTLTextureUsage::ShaderRead | MTLTextureUsage::PixelFormatView);
     let sampleable = source.device().newTextureWithDescriptor(&desc)?;
+    sampleable.setLabel(Some(&NSString::from_str("mtld3d-depth-transfer-source")));
     let blit = cb.blitCommandEncoder()?;
-    if labels {
-        sampleable.setLabel(Some(&NSString::from_str("mtld3d-depth-transfer-source")));
-        blit.setLabel(Some(&NSString::from_str(
-            "mtld3d-depth-transfer-source-copy",
-        )));
-    }
+    blit.setLabel(Some(&NSString::from_str(
+        "mtld3d-depth-transfer-source-copy",
+    )));
     // SAFETY: matching format, sample count and validated same-sized source mip.
     unsafe {
         blit.copyFromTexture_sourceSlice_sourceLevel_sourceOrigin_sourceSize_toTexture_destinationSlice_destinationLevel_destinationOrigin(

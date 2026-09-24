@@ -315,11 +315,6 @@ fn attachment_details(attachment: &MTLRenderPassAttachmentDescriptor) -> String 
     )
 }
 
-/// Whether the command-buffer diagnostics target is at debug.
-pub fn enabled() -> bool {
-    log_enabled!(target: LOG_TARGET, Level::Debug)
-}
-
 pub fn command_buffer(
     queue: &ProtocolObject<dyn MTLCommandQueue>,
 ) -> Option<Retained<ProtocolObject<dyn MTLCommandBuffer>>> {
