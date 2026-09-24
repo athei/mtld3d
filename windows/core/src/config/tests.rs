@@ -37,6 +37,7 @@ fn defaults_match_documented_values() {
     assert!(d.skip_shaders.is_empty());
     assert!(d.present_gate_file.is_empty());
     assert!(!d.query_flush_immediate);
+    assert!(!d.query_event_immediate);
     assert!(!d.buffer_ignore_lock_bounds);
     assert_eq!(d.vbib_retention_cap_bytes, 512 * 1024 * 1024);
     assert_eq!(d.pagebox_pool_cap_bytes, 128 * 1024 * 1024);
@@ -175,6 +176,18 @@ fn query_flush_immediate_round_trips_false() {
 fn query_flush_immediate_round_trips_true() {
     let cfg = parse(None, "query.flushImmediate = true\n", None);
     assert!(cfg.query_flush_immediate);
+}
+
+#[test]
+fn query_event_immediate_round_trips_false() {
+    let cfg = parse(None, "query.eventImmediate = false\n", None);
+    assert!(!cfg.query_event_immediate);
+}
+
+#[test]
+fn query_event_immediate_round_trips_true() {
+    let cfg = parse(None, "query.eventImmediate = true\n", None);
+    assert!(cfg.query_event_immediate);
 }
 
 #[test]
@@ -499,6 +512,7 @@ fn env_override_supports_all_keys() {
         ;debug.bytecodeDumpDir=/tmp/x\
         ;debug.skipShaders=0xabc,def\
         ;query.flushImmediate=false\
+        ;query.eventImmediate=true\
         ;memory.vbibRetentionCapMB=256\
         ;memory.pageboxPoolCapMB=96\
         ;present.maxFps=72\
@@ -512,6 +526,7 @@ fn env_override_supports_all_keys() {
     assert_eq!(cfg.bytecode_dump_dir, "/tmp/x");
     assert_eq!(cfg.skip_shaders, vec![0xabc, 0xdef]);
     assert!(!cfg.query_flush_immediate);
+    assert!(cfg.query_event_immediate);
     assert_eq!(cfg.vbib_retention_cap_bytes, 256 * 1024 * 1024);
     assert_eq!(cfg.pagebox_pool_cap_bytes, 96 * 1024 * 1024);
     assert_eq!(cfg.present_max_fps, 72);

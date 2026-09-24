@@ -53,7 +53,7 @@ fn the_gta_iv_profile_matches_the_real_binarys_resource() {
 }
 
 #[test]
-fn the_wow_profile_matches_both_clients_and_keeps_the_immediate_answer() {
+fn the_wow_profile_matches_both_clients_and_keeps_the_immediate_answers() {
     for version in ["Version 1.12", "Version 3.3"] {
         let blob = blob(&[
             ("CompanyName", "Blizzard Entertainment"),
@@ -63,8 +63,12 @@ fn the_wow_profile_matches_both_clients_and_keeps_the_immediate_answer() {
         let id = AppIdentity::new("WoW.exe".to_owned(), Some(&blob));
         let profile = lookup(&id).expect("the wow profile matches");
         assert_eq!(profile.name(), "wow");
-        assert!(!parse(None, "", None).query_flush_immediate);
-        assert!(parse(Some(profile), "", None).query_flush_immediate);
+        let stock = parse(None, "", None);
+        assert!(!stock.query_flush_immediate);
+        assert!(!stock.query_event_immediate);
+        let profiled = parse(Some(profile), "", None);
+        assert!(profiled.query_flush_immediate);
+        assert!(profiled.query_event_immediate);
     }
     let nameless = AppIdentity::new("WoW.exe".to_owned(), None);
     assert!(lookup(&nameless).is_none());

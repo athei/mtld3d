@@ -165,6 +165,19 @@ pub struct Mtld3dConfig {
     /// measured to save seconds per load; that benefit does not establish the
     /// absence of this hazard. File key: `query.flushImmediate`.
     pub query_flush_immediate: bool,
+    /// Answer every EVENT query poll as completed at once.
+    ///
+    /// Skips the GPU-retirement fence: no early submit of the recording
+    /// frame, no wait for the issued seq to retire. Default: `false`, the
+    /// spec-correct answer, because an application may recycle dynamic
+    /// storage behind it. `true` is only for a title verified to use the
+    /// query as a CPU run-ahead throttle, without gating reuse of
+    /// CPU-writable dynamic storage on it. Metal cannot track a CPU write
+    /// through `D3DLOCK_NOOVERWRITE` into pages a queued draw still reads.
+    /// The `wow` profile sets it because `gxFixLag` polls such a throttle
+    /// every frame and the real fence serialises its CPU and GPU work. File
+    /// key: `query.eventImmediate`.
+    pub query_event_immediate: bool,
     /// A newly bound same-size depth-stencil texture inherits the previous one's contents.
     ///
     /// D3D9-era drivers commonly backed all equal-size depth-stencil
@@ -348,6 +361,7 @@ impl Default for Mtld3dConfig {
             skip_shaders: Vec::new(),
             present_gate_file: String::new(),
             query_flush_immediate: false,
+            query_event_immediate: false,
             depth_alias_same_size: false,
             buffer_ignore_lock_bounds: false,
             vbib_retention_cap_bytes: 512 * 1024 * 1024,
@@ -503,6 +517,10 @@ pub fn log_options(cfg: &Mtld3dConfig) {
     );
     info!(
         target: crate::LOG_TARGET,
+        "config: query.eventImmediate = {}", cfg.query_event_immediate
+    );
+    info!(
+        target: crate::LOG_TARGET,
         "config: depth.aliasSameSize = {}", cfg.depth_alias_same_size
     );
     info!(
@@ -589,6 +607,7 @@ fn apply(cfg: &mut Mtld3dConfig, source: &str, key: &str, value: &str) {
         "debug.skipShaders" => cfg.skip_shaders = parse_hex_list(value),
         "debug.presentGateFile" => value.clone_into(&mut cfg.present_gate_file),
         "query.flushImmediate" => assign_bool(source, key, value, &mut cfg.query_flush_immediate),
+        "query.eventImmediate" => assign_bool(source, key, value, &mut cfg.query_event_immediate),
         "depth.aliasSameSize" => assign_bool(source, key, value, &mut cfg.depth_alias_same_size),
         "buffer.ignoreLockBounds" => {
             assign_bool(source, key, value, &mut cfg.buffer_ignore_lock_bounds);

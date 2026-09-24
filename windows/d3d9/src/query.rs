@@ -3,7 +3,8 @@
 //! - `EVENT`: `Issue(D3DISSUE_END)` stamps the frame being recorded, and
 //!   `GetData` reports completion once the GPU has retired that frame,
 //!   queueing it first while the frame is still open. Applications fence
-//!   their own storage reuse on this answer, so it comes from the GPU.
+//!   their own storage reuse on this answer, so it comes from the GPU,
+//!   unless `query.eventImmediate` answers every poll as completed.
 //! - `OCCLUSION`: real Metal visibility-result query. `Issue(BEGIN/END)`
 //!   pushes closures onto the current frame that bump the encoder's
 //!   visibility offset allocator and emit
@@ -360,11 +361,29 @@ extern "system" fn query_get_data(
     let inner = obj.inner();
     let has_output = !data.is_null() && size != 0;
     if inner.query_type == D3DQUERYTYPE_EVENT {
-        let status = event_status(inner);
+        // SAFETY: `inner.device_inner` was stamped at `Self::new` from a
+        // live `DeviceInner` and is kept alive by the device.
+        let dev = unsafe { &*inner.device_inner };
+        let status = if dev.config().query_event_immediate {
+            // A title that polls the query only to keep the CPU from running
+            // ahead of the GPU gains nothing from the real fence here: the
+            // encoder and submit threads already bound how far ahead it can
+            // get, and waiting for retirement serialises its CPU and GPU
+            // work. The answer cannot fence `D3DLOCK_NOOVERWRITE` reuse, so
+            // the key is set only for titles verified not to depend on that.
+            if dev.frame_dump_active() {
+                dev.frame_dump_event(&format!(
+                    "Query({this:?}) GetData(EVENT) → completed (query.eventImmediate)"
+                ));
+            }
+            D3D_OK
+        } else {
+            event_status(inner)
+        };
         if has_output {
-            // The BOOL is TRUE only once the GPU has retired the issued
-            // frame. A short read takes the low bytes of it rather than
-            // nothing: the runtime fills what the caller asked for.
+            // The BOOL is TRUE exactly when the status is `D3D_OK`. A short
+            // read takes the low bytes of it rather than nothing: the
+            // runtime fills what the caller asked for.
             let signalled = u32::from(status == D3D_OK).to_le_bytes();
             let n = (size as usize).min(signalled.len());
             // SAFETY: `has_output` guarantees `data` is non-null with at

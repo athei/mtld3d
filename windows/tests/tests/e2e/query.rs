@@ -92,7 +92,9 @@ fn assert_full_frames(count: u32, frames: u32, dims: (u32, u32), what: &str) {
 
 #[test]
 fn event_query_signals() {
-    let h = Harness::new();
+    // `query.eventImmediate` is pinned false here and in every EVENT fence case
+    // below, so none of them can be satisfied by the immediate answer.
+    let h = Harness::with_config("query.eventImmediate=false");
     // Null-out probe: a supported type returns S_OK.
     assert_eq!(
         h.query_supported(D3DQUERYTYPE_EVENT),
@@ -619,7 +621,7 @@ fn occlusion_count_survives_a_reset_between_begin_and_end() {
 /// buffer as the caller left it.
 #[test]
 fn a_short_event_read_leaves_the_bytes_past_it_alone() {
-    let h = Harness::new();
+    let h = Harness::with_config("query.eventImmediate=false");
     let q = h
         .create_query(D3DQUERYTYPE_EVENT)
         .expect("EVENT query is supported");
@@ -658,7 +660,7 @@ fn event_gates_buffer_reuse(flags: u32) {
     const REFILL: u32 = 0xFFFF_0000;
     const BACKGROUND: u32 = 0xFF00_00FF;
 
-    let h = Harness::new();
+    let h = Harness::with_config("query.eventImmediate=false");
     let stride = u32::try_from(size_of::<PosColorVertex>()).expect("stride fits u32");
     let vb = h.create_vertex_buffer(
         stride * 6,
@@ -728,9 +730,35 @@ fn an_event_query_flush_gates_buffer_reuse_without_present() {
     event_gates_buffer_reuse(D3DGETDATA_FLUSH);
 }
 
+/// Under `query.eventImmediate`, an EVENT poll answers completed at once.
+///
+/// The query is issued into the frame still being recorded, behind a queued
+/// draw, and polled without Present: the spec-correct answer would be pending
+/// until that frame retired, and the immediate one is TRUE on the first poll
+/// whatever the flags.
+#[test]
+fn an_event_poll_under_event_immediate_answers_completed_at_once() {
+    let h = Harness::with_config("query.eventImmediate=true");
+    arm_for_counting_draws(&h);
+    let q = h
+        .create_query(D3DQUERYTYPE_EVENT)
+        .expect("EVENT query is supported");
+    for flags in [0, D3DGETDATA_FLUSH] {
+        assert_eq!(h.begin_scene(), 0, "BeginScene");
+        draw_full_frame(&h, "the draw the query is issued behind");
+        assert_eq!(h.end_scene(), 0, "EndScene");
+        assert_eq!(q.issue(D3DISSUE_END), 0, "Issue(END)");
+        assert_eq!(
+            q.data_u32(flags),
+            (0, 1),
+            "the first poll (flags {flags:#x}) answers D3D_OK with TRUE",
+        );
+    }
+}
+
 #[test]
 fn event_reissue_and_reset_keep_retirement_order() {
-    let h = Harness::new();
+    let h = Harness::with_config("query.eventImmediate=false");
     let q = h.create_query(D3DQUERYTYPE_EVENT).expect("EVENT supported");
     assert_eq!(h.clear_target(0xFF00_FF00), 0);
     assert_eq!(q.issue(D3DISSUE_END), 0);
