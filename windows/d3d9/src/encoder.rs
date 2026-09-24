@@ -29,8 +29,8 @@ use mtld3d_core::{
     ids::{BufferId, DepthStencilKey, ProgramId, SamplerKey, TextureId},
     page_box::{PageBox, PageBoxRead},
     passes::{
-        ColorClearOutcome, ColorLoad, DepthClearOutcome, DepthLoad, DepthResolve, ExtraColorSlot,
-        LastBoundCache, Pass, PassState, SnapshotBytesCache, StencilClearOutcome, StencilLoad,
+        ColorClearOutcome, ColorLoad, DepthClearOutcome, DepthLoad, ExtraColorSlot, LastBoundCache,
+        Pass, PassState, SnapshotBytesCache, StencilClearOutcome, StencilLoad,
         StoreAction as PassStoreAction, UploadPassTarget,
     },
     perf::{
@@ -64,10 +64,10 @@ use mtld3d_shared::{
     SetPresentWaitPolicyParams, SubmitFrameParams, TextureCreateDesc, VertexAttrDesc,
     WaitForGpuRetireParams, WaitForPresentIdleParams,
     mtl::{
-        BufferKind, ClearQuadFlags, CullMode, DepthResolveFilter, DestroyKind, LoadAction,
-        PRESENT_PIPELINE_DEPTH, PixelFormat, PresentWaitPolicy, PrimitiveType, QuadPipelineKind,
-        SnapshotFlags, StageTag, StorageMode, StoreAction, Swizzle, TextureCreateFlags,
-        TextureUsage, TriangleFillMode, VisibilityResultMode,
+        BufferKind, ClearQuadFlags, CullMode, DestroyKind, LoadAction, PRESENT_PIPELINE_DEPTH,
+        PixelFormat, PresentWaitPolicy, PrimitiveType, QuadPipelineKind, SnapshotFlags, StageTag,
+        StorageMode, StoreAction, Swizzle, TextureCreateFlags, TextureUsage, TriangleFillMode,
+        VisibilityResultMode,
     },
     mtl_handle::{
         CAMetalLayerKind, MTLBufferKind, MTLDepthStencilStateKind, MTLDeviceKind, MTLFunctionKind,
@@ -105,6 +105,7 @@ use super::{
 const DRAW_TRACE_TARGET: &str = "mtld3d::d3d9::draw";
 
 mod depth;
+pub use depth::DepthTransfer;
 
 /// Sub-target for the once-per-distinct sampler-state diagnostic.
 ///
@@ -3078,12 +3079,19 @@ impl FrameEncoder {
     /// The magic `SetRenderState(POINTSIZE, 0x7fa05000)` asks for the
     /// current depth-stencil contents in the texture bound at stage 0.
     /// From a single-sampled depth surface that is a full-surface depth
-    /// blit queued ahead of the next pass; from a multisampled one the
-    /// samples have to be resolved, which Metal offers on a render pass
-    /// rather than on the blit encoder. The destination keeps its own
-    /// contents when no depth attachment is bound (the resolve is then a
-    /// no-op, as on hardware).
-    pub fn resolve_depth_to_texture(&mut self, dst: u64, dst_w: u32, dst_h: u32) {
+    /// blit queued ahead of the next pass. From a multisampled one it is a
+    /// depth transfer that takes sample zero, written by compute and blit
+    /// work rather than a render-pass resolve attachment: on some devices a
+    /// resolve into a texture an earlier render pass cleared reads back as
+    /// that clear. The destination keeps its own contents when no depth
+    /// attachment is bound (the resolve is then a no-op, as on hardware).
+    pub fn resolve_depth_to_texture(
+        &mut self,
+        dst: u64,
+        dst_w: u32,
+        dst_h: u32,
+        dst_format: PixelFormat,
+    ) {
         let src = self.pass_state.current_depth_texture();
         if src.is_null() || dst == 0 {
             mtld3d_shared::log_once_warn!(
@@ -3092,7 +3100,7 @@ impl FrameEncoder {
             );
             return;
         }
-        let (width, height, _) = self.depth_attachment_desc;
+        let (width, height, source_format) = self.depth_attachment_desc;
         if width != dst_w || height != dst_h {
             mtld3d_shared::log_once_warn!(
                 target: LOG_TARGET,
@@ -3101,18 +3109,25 @@ impl FrameEncoder {
             );
             return;
         }
-        if self.pass_state.current_depth_sample_count() > 1 {
+        let samples = self.pass_state.current_depth_sample_count();
+        if samples > 1 {
             mtld3d_shared::log_once_info!(
                 target: LOG_TARGET,
-                "RESZ resolve: resolving the bound {}x multisampled depth attachment \
-                 ({width}x{height}) into the stage-0 texture",
-                self.pass_state.current_depth_sample_count()
+                "RESZ resolve: resolving the bound {samples}x multisampled depth attachment \
+                 ({width}x{height}) into the stage-0 texture"
             );
-            // SAFETY: `dst` is a Metal texture handle the encoder's typed
-            // cache produced through `.raw()` and checked non-zero above.
-            let destination = unsafe { MetalHandle::<MTLTextureKind>::new(dst) };
-            self.pass_state
-                .resolve_depth_attachment(destination, DepthResolveFilter::Sample0);
+            self.queue_depth_transfer(&DepthTransfer {
+                source: src,
+                source_level: self.pass_state.current_depth_level(),
+                source_size: (width, height),
+                source_format,
+                source_samples: samples,
+                // SAFETY: `dst` is a Metal texture handle the encoder's typed
+                // cache produced through `.raw()` and checked non-zero above.
+                destination: unsafe { MetalHandle::<MTLTextureKind>::new(dst) },
+                destination_size: (dst_w, dst_h),
+                destination_format: dst_format,
+            });
             return;
         }
         mtld3d_shared::log_once_info!(
@@ -3120,53 +3135,43 @@ impl FrameEncoder {
             "RESZ resolve: copying the bound depth attachment ({width}x{height}) into the \
              stage-0 texture"
         );
-        self.end_current_pass("resz");
-        self.pass_state.push_pending_leading_blit(BlitCommand {
-            cmd: BlitCommandType::CopyTextureToTexture as u32,
-            mip_level: 0,
-            src_handle: src.raw(),
-            dst_handle: dst,
-            src_offset: 0,
-            bytes_per_row: 0,
-            origin_x: 0,
-            origin_y: 0,
-            region_w: width,
-            region_h: height,
-            dst_offset: 0,
-            byte_size: 0,
-            depth: 1,
-            bytes_per_image: 0,
-            dst_mip_level: 0,
-            dst_slice: 0,
-            src_slice: 0,
-        });
+        self.pass_state.push_leading_blit_after_clears(
+            BlitCommand {
+                cmd: BlitCommandType::CopyTextureToTexture as u32,
+                mip_level: 0,
+                src_handle: src.raw(),
+                dst_handle: dst,
+                src_offset: 0,
+                bytes_per_row: 0,
+                origin_x: 0,
+                origin_y: 0,
+                region_w: width,
+                region_h: height,
+                dst_offset: 0,
+                byte_size: 0,
+                depth: 1,
+                bytes_per_image: 0,
+                dst_mip_level: 0,
+                dst_slice: 0,
+                src_slice: 0,
+            },
+            "resz",
+        );
     }
 
     /// Resolve one multisampled depth surface into a single-sampled one.
     ///
     /// The multisample arm of the depth-to-depth `StretchRect`: D3D9 resolves
-    /// the samples on a copy that leaves a multisampled surface, and Metal
-    /// takes a depth resolve on a render pass rather than on the blit encoder,
-    /// which refuses a sample-count change outright. Both handles address the
-    /// whole surface at the same extent and depth format, which the caller has
-    /// established. Sample zero is the reduction: D3D9 defines no filter for
-    /// this and it is what the hardware the copy was written for delivers.
-    pub fn resolve_depth_surface(
-        &mut self,
-        src: MetalHandle<MTLTextureKind>,
-        dst: MetalHandle<MTLTextureKind>,
-        width: u32,
-        height: u32,
-    ) {
-        let resolved = self.pass_state.resolve_depth_texture(&DepthResolve {
-            source: src,
-            level: 0,
-            size: (width, height),
-            destination: dst,
-            filter: DepthResolveFilter::Sample0,
-            source_is_sampleable: false,
-        });
-        if resolved {
+    /// the samples on a copy that leaves a multisampled surface, and Metal's
+    /// blit encoder refuses a sample-count change outright, so the copy is a
+    /// depth transfer (see [`Self::resolve_depth_to_texture`] for why not a
+    /// render-pass resolve). Both handles address the whole surface, which the
+    /// caller has established. Sample zero is the reduction: D3D9 defines no
+    /// filter for this and it is what the hardware the copy was written for
+    /// delivers.
+    pub fn resolve_depth_surface(&mut self, transfer: &DepthTransfer) {
+        let (width, height) = transfer.source_size;
+        if self.queue_depth_transfer(transfer) {
             mtld3d_shared::log_once_info!(
                 target: LOG_TARGET,
                 "StretchRect: resolving a multisampled {width}x{height} depth surface \
@@ -3175,10 +3180,9 @@ impl FrameEncoder {
         } else {
             mtld3d_shared::log_once_warn!(
                 target: LOG_TARGET,
-                "StretchRect: depth resolve skipped, source or destination texture unresolved \
-                 (src={:#x}, dst={:#x})",
-                src.raw(),
-                dst.raw()
+                "StretchRect: depth resolve skipped (src={:#x}, dst={:#x})",
+                transfer.source.raw(),
+                transfer.destination.raw()
             );
         }
     }
@@ -3188,9 +3192,10 @@ impl FrameEncoder {
     /// The bind-time carry for engines that expect equal-size depth-stencil
     /// surfaces to share one physical allocation: the destination is about to
     /// be bound as the depth attachment and must open on the source's
-    /// contents. Same shape as the RESZ resolve: close the pass, queue a
-    /// full-surface blit ahead of the next one (which registers the
-    /// destination as blit-written, so its first-use load stays `Load`).
+    /// contents. Same shape as the RESZ resolve: land a pending clear, close
+    /// the pass, queue a full-surface blit ahead of the next one (which
+    /// registers the destination as blit-written, so its first-use load stays
+    /// `Load`).
     pub fn carry_depth_contents(&mut self, src_id: TextureId, dst_id: TextureId, w: u32, h: u32) {
         let src = self.get_texture_handle_by_id(src_id);
         let dst = self.get_texture_handle_by_id(dst_id);
@@ -3205,26 +3210,28 @@ impl FrameEncoder {
             target: LOG_TARGET,
             "depth.aliasSameSize: carrying {w}x{h} depth contents across a same-size bind"
         );
-        self.end_current_pass("depth-alias");
-        self.pass_state.push_pending_leading_blit(BlitCommand {
-            cmd: BlitCommandType::CopyTextureToTexture as u32,
-            mip_level: 0,
-            src_handle: src,
-            dst_handle: dst,
-            src_offset: 0,
-            bytes_per_row: 0,
-            origin_x: 0,
-            origin_y: 0,
-            region_w: w,
-            region_h: h,
-            dst_offset: 0,
-            byte_size: 0,
-            depth: 1,
-            bytes_per_image: 0,
-            dst_mip_level: 0,
-            dst_slice: 0,
-            src_slice: 0,
-        });
+        self.pass_state.push_leading_blit_after_clears(
+            BlitCommand {
+                cmd: BlitCommandType::CopyTextureToTexture as u32,
+                mip_level: 0,
+                src_handle: src,
+                dst_handle: dst,
+                src_offset: 0,
+                bytes_per_row: 0,
+                origin_x: 0,
+                origin_y: 0,
+                region_w: w,
+                region_h: h,
+                dst_offset: 0,
+                byte_size: 0,
+                depth: 1,
+                bytes_per_image: 0,
+                dst_mip_level: 0,
+                dst_slice: 0,
+                src_slice: 0,
+            },
+            "depth-alias",
+        );
     }
 
     /// A readable copy of the bound depth attachment, for a draw that samples it.
@@ -3233,11 +3240,11 @@ impl FrameEncoder {
     /// pass, and Apple GPUs return garbage rather than the depth. D3D9 allows
     /// it (a deferred renderer binds its INTZ scene depth for the depth test
     /// and samples it for position reconstruction in the same draws), with
-    /// the values as of the last write. So: close the pass, queue a blit that
-    /// copies the attachment into a scratch depth texture of the same size
-    /// and format, and hand that copy out. The copy stays valid until a
-    /// depth write or clear bumps the epoch, so a run of light-volume draws
-    /// costs one copy. Returns 0 when no depth attachment is bound or the
+    /// the values as of the last write or clear. So: land a pending clear,
+    /// close the pass, queue a blit that copies the attachment into a scratch
+    /// depth texture of the same size and format, and hand that copy out. The
+    /// copy stays valid until a depth write or clear bumps the epoch, so a run
+    /// of light-volume draws costs one copy. Returns 0 when no depth attachment is bound or the
     /// scratch texture cannot be created.
     pub fn depth_snapshot_for_sampling(&mut self) -> u64 {
         let src = self.pass_state.current_depth_texture();
@@ -3327,26 +3334,28 @@ impl FrameEncoder {
             (snap.handle, needs_copy)
         };
         if needs_copy {
-            self.end_current_pass("depth_snapshot");
-            self.pass_state.push_pending_leading_blit(BlitCommand {
-                cmd: BlitCommandType::CopyTextureToTexture as u32,
-                mip_level: 0,
-                src_handle: src.raw(),
-                dst_handle: dst.raw(),
-                src_offset: 0,
-                bytes_per_row: 0,
-                origin_x: 0,
-                origin_y: 0,
-                region_w: width,
-                region_h: height,
-                dst_offset: 0,
-                byte_size: 0,
-                depth: 1,
-                bytes_per_image: 0,
-                dst_mip_level: 0,
-                dst_slice: 0,
-                src_slice: 0,
-            });
+            self.pass_state.push_leading_blit_after_clears(
+                BlitCommand {
+                    cmd: BlitCommandType::CopyTextureToTexture as u32,
+                    mip_level: 0,
+                    src_handle: src.raw(),
+                    dst_handle: dst.raw(),
+                    src_offset: 0,
+                    bytes_per_row: 0,
+                    origin_x: 0,
+                    origin_y: 0,
+                    region_w: width,
+                    region_h: height,
+                    dst_offset: 0,
+                    byte_size: 0,
+                    depth: 1,
+                    bytes_per_image: 0,
+                    dst_mip_level: 0,
+                    dst_slice: 0,
+                    src_slice: 0,
+                },
+                "depth_snapshot",
+            );
         }
         dst.raw()
     }
@@ -10327,13 +10336,10 @@ fn pass_to_descriptor(
     if !p.color_resolve_texture().is_null() {
         color_store_action = color_store_action.with_resolve();
     }
-    let mut depth_store_action = match p.depth_store() {
+    let depth_store_action = match p.depth_store() {
         PassStoreAction::Store => StoreAction::Store,
         PassStoreAction::DontCare => StoreAction::DontCare,
     };
-    if !p.depth_resolve_texture().is_null() {
-        depth_store_action = depth_store_action.with_resolve();
-    }
     log_pass_depth_attach(p);
     let leading = p.leading_blits();
     let visibility_result_buffer =
@@ -10350,7 +10356,6 @@ fn pass_to_descriptor(
         color_texture: p.color_attachment_texture(),
         color_resolve_texture: p.color_resolve_texture(),
         depth_texture: p.depth_texture(),
-        depth_resolve_texture: p.depth_resolve_texture(),
         commands_ptr: p.commands().as_ptr() as u64,
         visibility_result_buffer,
         leading_blits_ptr: if leading.is_empty() {
@@ -10380,8 +10385,6 @@ fn pass_to_descriptor(
             p.color_level(),
             p.depth_level(),
         ),
-        depth_resolve_filter: p.depth_resolve_filter(),
-        pad0: 0,
         extra_color: core::array::from_fn(|i| {
             let a = &p.extra_color()[i];
             if !a.is_bound() {
@@ -10448,7 +10451,6 @@ fn trailing_blit_descriptor(trailing_blits: &[BlitCommand]) -> PassDescriptor {
         color_texture: MetalHandle::NULL,
         color_resolve_texture: MetalHandle::NULL,
         depth_texture: MetalHandle::NULL,
-        depth_resolve_texture: MetalHandle::NULL,
         commands_ptr: 0,
         visibility_result_buffer: MetalHandle::NULL,
         leading_blits_ptr: trailing_blits.as_ptr() as u64,
@@ -10474,8 +10476,6 @@ fn trailing_blit_descriptor(trailing_blits: &[BlitCommand]) -> PassDescriptor {
             0,
             0,
         ),
-        depth_resolve_filter: DepthResolveFilter::Sample0,
-        pad0: 0,
         extra_color: [ExtraColorDesc::NONE; 3],
     }
 }

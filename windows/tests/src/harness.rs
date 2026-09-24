@@ -3095,7 +3095,8 @@ impl Harness {
     /// real GPU family applies the swizzle; and a later encoder of the same
     /// command buffer that loads or samples a multisample depth resolve
     /// target sees the content an earlier encoder stored there, not the
-    /// resolve. The renderer keys two sampler fallbacks on the same name. A
+    /// resolve, which is why the layer resolves depth through a transfer
+    /// instead. The renderer keys two sampler fallbacks on the same name. A
     /// test of a feature the device lacks returns early on it, since its
     /// assertion would measure the device rather than the layer.
     #[must_use]

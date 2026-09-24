@@ -337,6 +337,15 @@ The readback counts as the level's initial upload, so a READONLY lock of a
 level only the GPU wrote publishes nothing and the texture keeps the
 transferred depth rather than its packed code.
 
+A multisampled RESZ into any other destination, and a depth-to-depth
+`StretchRect` out of a multisampled surface, take the same transfer: sample
+zero of depth and of the common stencil plane, written by compute and blit
+work. Neither uses a render-pass depth resolve, whose destination the Intel CI
+image's paravirtual device leaves reading what an earlier pass stored there
+(resz_test 17724 and 17862 read the INTZ's clear through one). Every transfer
+lands a clear still waiting for a pass first, so a `Clear` issued just before
+it is what it reads.
+
 Both architectures and all local variants pass device.c:13838. Hosted Mac2
 recordings also pass on both architectures; its obsolete pins are removed.
 

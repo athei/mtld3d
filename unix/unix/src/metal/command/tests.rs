@@ -32,7 +32,7 @@ use std::{
 
 use mtld3d_shared::{
     ExtraColorDesc, MetalHandle, PassDescriptor, SubmitFrameParams,
-    mtl::{BlockLayout, DepthResolveFilter, LoadAction, PixelFormat, StoreAction},
+    mtl::{BlockLayout, LoadAction, PixelFormat, StoreAction},
 };
 use objc2::{
     Message as _,
@@ -1078,7 +1078,6 @@ fn upload_test_pass(texture: &ProtocolObject<dyn MTLTexture>) -> PassDescriptor 
         color_texture: unsafe { MetalHandle::new(core::ptr::from_ref(texture) as u64) },
         color_resolve_texture: MetalHandle::NULL,
         depth_texture: MetalHandle::NULL,
-        depth_resolve_texture: MetalHandle::NULL,
         commands_ptr: 0,
         visibility_result_buffer: MetalHandle::NULL,
         leading_blits_ptr: 0,
@@ -1096,8 +1095,6 @@ fn upload_test_pass(texture: &ProtocolObject<dyn MTLTexture>) -> PassDescriptor 
         command_count: 0,
         leading_blits_count: 0,
         pass_flags: PassDescriptor::pack_flags(false, 0, 0, 0),
-        depth_resolve_filter: DepthResolveFilter::Sample0,
-        pad0: 0,
         extra_color: [ExtraColorDesc::NONE; 3],
     }
 }

@@ -6,9 +6,10 @@ use mtld3d_core::{
     storage_policy::buffer_storage_mode,
 };
 use mtld3d_shared::{
-    BlitCommand, BlitCommandType, BufferCreateDesc, CopyBufferToTextureInfo, MetalHandle,
-    mtl::{BufferKind, DestroyKind},
-    mtl_handle::MTLBufferKind,
+    BlitCommand, BlitCommandType, BufferCreateDesc, CopyBufferToTextureInfo,
+    CreateDepthTransferPipelineParams, MetalHandle,
+    mtl::{BufferKind, DepthTransferKind, DestroyKind, PixelFormat},
+    mtl_handle::{MTLBufferKind, MTLTextureKind},
 };
 
 use super::{
@@ -163,81 +164,134 @@ impl TransferState {
     }
 }
 
+/// One whole-level depth transfer between two depth textures.
+///
+/// `source_size` is the extent of the source level and `destination_size` that
+/// of the destination's level 0. The two may differ, in which case each
+/// destination texel takes the nearest source texel. A multisampled source
+/// contributes sample zero, which is what the D3D9 RESZ hack and a
+/// depth-to-depth `StretchRect` resolve deliver. The stencil plane travels
+/// when both ends carry one.
+pub struct DepthTransfer {
+    pub source: MetalHandle<MTLTextureKind>,
+    pub source_level: u32,
+    pub source_size: (u32, u32),
+    pub source_format: PixelFormat,
+    pub source_samples: u8,
+    pub destination: MetalHandle<MTLTextureKind>,
+    pub destination_size: (u32, u32),
+    pub destination_format: PixelFormat,
+}
+
 impl FrameEncoder {
-    /// Queue a common-plane transfer without making CPU staging authoritative.
-    pub fn resolve_dynamic_depth(&mut self, destination: u64, info: &super::TextureInfo) {
-        use mtld3d_shared::{
-            CreateDepthTransferPipelineParams,
-            mtl::{DepthTransferKind, PixelFormat},
-            mtl_handle::MTLTextureKind,
-        };
-        let source = self.pass_state.current_depth_texture();
-        if source.is_null() || destination == 0 {
-            mtld3d_shared::log_once_warn!(target: super::LOG_TARGET, "dynamic depth transfer: missing endpoint");
-            return;
+    /// Queue `transfer` after the passes recorded so far and ahead of the next one.
+    ///
+    /// A clear still waiting for a pass lands first, since D3D9 ordered it
+    /// before the copy: a `Clear(ZBUFFER)` of the source with no draw after it
+    /// is what the transfer reads. The transfer then runs as a leading blit of
+    /// the pass that opens next, so it reads what the earlier passes left in
+    /// the source and anything after it reads what it wrote. Queuing it enters
+    /// the source as read (its last pass keeps its depth store) and the
+    /// destination as blit-written (its next pass loads rather than
+    /// discards). Returns `false` with nothing queued when either end is not a
+    /// depth texture or the transfer pipeline cannot be created.
+    pub fn queue_depth_transfer(&mut self, transfer: &DepthTransfer) -> bool {
+        let &DepthTransfer {
+            source,
+            source_level,
+            source_size,
+            source_format,
+            source_samples,
+            destination,
+            destination_size: (width, height),
+            destination_format,
+        } = transfer;
+        if source.is_null() || destination.is_null() {
+            mtld3d_shared::log_once_warn!(target: super::LOG_TARGET, "depth transfer: missing endpoint");
+            return false;
         }
-        let (width, height) = self.pass_state.current_depth_size();
-        let source_format = if self.pass_state.current_depth_has_stencil() {
-            PixelFormat::Depth32FloatStencil8
-        } else {
-            PixelFormat::Depth32Float
-        };
-        let samples = self.pass_state.current_depth_sample_count();
-        let source_level = self.pass_state.current_depth_level();
-        // SAFETY: the destination was resolved from this encoder's live texture cache.
-        let destination = unsafe { MetalHandle::<MTLTextureKind>::new(destination) };
-        self.pass_state.flush_pending_clears();
-        self.pass_state.note_texture_read(source);
-        self.end_current_pass("dynamic_depth_transfer");
-        self.pass_state.note_ordered_texture_write(destination);
-        if samples == 1
-            && width == info.width
-            && height == info.height
-            && source_format == info.pixel_format
-        {
-            let mut command = BlitCommand::copy_texture_to_texture_full_mip(
-                source.raw(),
-                destination.raw(),
-                0,
-                width,
-                height,
+        if !is_depth_format(source_format) || !is_depth_format(destination_format) {
+            mtld3d_shared::log_once_warn!(
+                target: super::LOG_TARGET,
+                "depth transfer: {source_format:?} to {destination_format:?} is not a depth pair, skipped"
             );
-            command.mip_level = source_level;
-            self.pass_state.push_pending_leading_blit(command);
-            return;
-        }
-        let stencil = source_format == PixelFormat::Depth32FloatStencil8
-            && info.pixel_format == PixelFormat::Depth32FloatStencil8;
-        let kind = match (samples > 1, stencil) {
-            (false, false) => DepthTransferKind::Depth,
-            (false, true) => DepthTransferKind::DepthStencil,
-            (true, false) => DepthTransferKind::MultisampleDepth,
-            (true, true) => DepthTransferKind::MultisampleDepthStencil,
-        };
-        let slot = &mut self.depth_transfer.pipelines[kind as usize];
-        if slot.is_null() && (samples > 1 || width != info.width || height != info.height) {
-            let mut params = CreateDepthTransferPipelineParams {
-                device_handle: self.device_handle,
-                pipeline_handle: MetalHandle::NULL,
-                kind,
-                pad: 0,
-            };
-            if crate::unix_call::unix_call(&mut params) != 0 || params.pipeline_handle.is_null() {
-                log::error!(target: super::LOG_TARGET, "dynamic depth transfer: pipeline creation failed");
-                return;
-            }
-            *slot = params.pipeline_handle;
+            return false;
         }
         let mut command = BlitCommand::copy_texture_to_texture_full_mip(
             source.raw(),
             destination.raw(),
             0,
-            info.width,
-            info.height,
+            width,
+            height,
         );
         command.mip_level = source_level;
-        command.cmd = BlitCommandType::TransferDepth as u32;
-        command.src_offset = slot.raw();
-        self.pass_state.push_pending_leading_blit(command);
+        let same_extent = source_size == (width, height);
+        // A same-shaped single-sample pair is a plain texture copy; anything
+        // else goes through the transfer, which resamples only when it must.
+        if source_samples > 1 || !same_extent || source_format != destination_format {
+            let stencil = source_format == PixelFormat::Depth32FloatStencil8
+                && destination_format == PixelFormat::Depth32FloatStencil8;
+            let kind = match (source_samples > 1, stencil) {
+                (false, false) => DepthTransferKind::Depth,
+                (false, true) => DepthTransferKind::DepthStencil,
+                (true, false) => DepthTransferKind::MultisampleDepth,
+                (true, true) => DepthTransferKind::MultisampleDepthStencil,
+            };
+            let slot = &mut self.depth_transfer.pipelines[kind as usize];
+            if slot.is_null() && (source_samples > 1 || !same_extent) {
+                let mut params = CreateDepthTransferPipelineParams {
+                    device_handle: self.device_handle,
+                    pipeline_handle: MetalHandle::NULL,
+                    kind,
+                    pad: 0,
+                };
+                if crate::unix_call::unix_call(&mut params) != 0 || params.pipeline_handle.is_null()
+                {
+                    log::error!(target: super::LOG_TARGET, "depth transfer: pipeline creation failed");
+                    return false;
+                }
+                *slot = params.pipeline_handle;
+            }
+            command.cmd = BlitCommandType::TransferDepth as u32;
+            command.src_offset = slot.raw();
+        }
+        self.pass_state
+            .push_leading_blit_after_clears(command, "depth_transfer");
+        true
     }
+
+    /// Queue a common-plane transfer without making CPU staging authoritative.
+    pub fn resolve_dynamic_depth(&mut self, destination: u64, info: &super::TextureInfo) {
+        let source = self.pass_state.current_depth_texture();
+        if source.is_null() || destination == 0 {
+            mtld3d_shared::log_once_warn!(target: super::LOG_TARGET, "dynamic depth transfer: missing endpoint");
+            return;
+        }
+        let source_format = if self.pass_state.current_depth_has_stencil() {
+            PixelFormat::Depth32FloatStencil8
+        } else {
+            PixelFormat::Depth32Float
+        };
+        // SAFETY: the destination was resolved from this encoder's live texture cache.
+        let destination = unsafe { MetalHandle::<MTLTextureKind>::new(destination) };
+        self.pass_state.note_ordered_texture_write(destination);
+        self.queue_depth_transfer(&DepthTransfer {
+            source,
+            source_level: self.pass_state.current_depth_level(),
+            source_size: self.pass_state.current_depth_size(),
+            source_format,
+            source_samples: self.pass_state.current_depth_sample_count(),
+            destination,
+            destination_size: (info.width, info.height),
+            destination_format: info.pixel_format,
+        });
+    }
+}
+
+/// True for the two depth formats a depth transfer reads and writes.
+const fn is_depth_format(format: PixelFormat) -> bool {
+    matches!(
+        format,
+        PixelFormat::Depth32Float | PixelFormat::Depth32FloatStencil8
+    )
 }
