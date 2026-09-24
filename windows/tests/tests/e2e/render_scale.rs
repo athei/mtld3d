@@ -702,10 +702,11 @@ const ODD_FRAME: (u32, u32) = (803, 603);
 
 /// A device at [`ODD_FRAME`] rasterizing at 75%, whatever the run's own scale.
 ///
-/// Pins the scale rather than inheriting it: at the identity the two roundings
-/// cannot disagree, and this must fail in the ordinary `make test` if it
-/// regresses. The parser keeps the last entry, so this wins over a
-/// `make test SCALE=<n>` run too.
+/// Its viewport is the whole target, set through `SetViewport`. Pins the scale
+/// rather than inheriting it: at the identity the two roundings cannot
+/// disagree, and this must fail in the ordinary `make test` if it regresses.
+/// The parser keeps the last entry, so this wins over a `make test SCALE=<n>`
+/// run too.
 fn odd_frame_at_three_quarters() -> Harness {
     let h = Harness::create(&HarnessConfig {
         width: ODD_FRAME.0,
@@ -714,12 +715,18 @@ fn odd_frame_at_three_quarters() -> Harness {
         ..HarnessConfig::default()
     });
     assert_eq!(h.dims(), ODD_FRAME, "the device reports the requested size");
-    let vp = h.viewport();
-    assert_eq!(
-        (vp.x, vp.y, vp.width, vp.height),
-        (0, 0, ODD_FRAME.0, ODD_FRAME.1),
-        "the default viewport covers the whole target",
-    );
+    // Set explicitly, as a game does and as `SetRenderTarget` does for it: a
+    // device that never saw `SetViewport` reads the bound texture's own extent
+    // instead, which is not the conversion under test.
+    let full = D3DVIEWPORT9 {
+        x: 0,
+        y: 0,
+        width: ODD_FRAME.0,
+        height: ODD_FRAME.1,
+        min_z: 0.0,
+        max_z: 1.0,
+    };
+    assert_eq!(h.set_viewport(&full), 0, "SetViewport(full target)");
     h
 }
 
