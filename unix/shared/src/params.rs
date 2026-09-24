@@ -56,7 +56,7 @@ const _: () = {
     assert!(core::mem::size_of::<AttachMetalLayerParams>() == 88);
     assert!(core::mem::size_of::<DetachMetalLayerParams>() == 8);
     assert!(core::mem::size_of::<CreateBackbufferParams>() == 64);
-    assert!(core::mem::size_of::<DestroyCommandQueueParams>() == 48);
+    assert!(core::mem::size_of::<DestroyCommandQueueParams>() == 40);
     assert!(core::mem::size_of::<SubmitFrameParams>() == 120);
     assert!(core::mem::size_of::<SetCursorOverlayParams>() == 56);
     assert!(core::mem::size_of::<PassDescriptor>() == 216);
@@ -505,7 +505,6 @@ pub struct DestroyCommandQueueParams {
     pub record_handle: DeviceRecordHandle,         // in
     pub view_handle: MetalHandle<NSViewKind>,      // in (NULL = none)
     pub backbuffer_handle: MetalHandle<MTLTextureKind>, // in (NULL = none)
-    pub pipeline_handle: MetalHandle<MTLRenderPipelineStateKind>, // in (NULL = none)
     pub depth_texture_handle: MetalHandle<MTLTextureKind>, // in (NULL = none)
 }
 

@@ -541,7 +541,6 @@ pub extern "C" fn destroy_command_queue_handler(args: *mut c_void) -> i32 {
         &record,
         params.view_handle,
         params.backbuffer_handle,
-        params.pipeline_handle,
         params.depth_texture_handle,
     );
     info!(target: LOG_TARGET, "destroyed Metal device + command queue");
