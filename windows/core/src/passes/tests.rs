@@ -8954,10 +8954,12 @@ fn rule_j_keeps_passes_apart_when_a_loaded_depth_plane_was_not_stored() {
     for (name, discard) in [
         (
             "depth",
-            (|p: &mut Pass| p.depth_store = StoreAction::DontCare) as fn(&mut Pass),
+            (|p: &mut Pass| {
+                p.depth_store = StoreAction::DontCare;
+            }) as fn(&mut Pass),
         ),
         ("stencil", |p: &mut Pass| {
-            p.stencil_store = StoreAction::DontCare
+            p.stencil_store = StoreAction::DontCare;
         }),
     ] {
         let mut s = fresh_with_stencil();

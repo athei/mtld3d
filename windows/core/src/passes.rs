@@ -5710,8 +5710,9 @@ fn attachments_match(a: &Pass, b: &Pass) -> bool {
     color && extras && depth && binds_any
 }
 
-/// Whether `next` carries forward every colour attachment `prev` leaves: `prev` stores it
-/// unresolved and `next` loads it.
+/// Whether `next` carries forward every colour attachment `prev` leaves.
+///
+/// `prev` stores each one unresolved and `next` loads it.
 fn color_carries_over(prev: &Pass, next: &Pass) -> bool {
     (prev.color_texture.is_null()
         || (matches!(prev.color_store, StoreAction::Store)
