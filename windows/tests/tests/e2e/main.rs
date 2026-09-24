@@ -27,6 +27,7 @@ mod mrt;
 mod msaa;
 mod multi_device;
 mod multithreaded;
+mod no_color_passes;
 mod non_uma;
 mod packed10;
 mod points;

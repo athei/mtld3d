@@ -2830,20 +2830,78 @@ fn rule_h_keeps_color_clear_quad_a_later_pass_loads() {
 }
 
 #[test]
-fn rule_h_strips_color_and_clear_quad_when_only_zero_mask_draws_plus_clear_quad() {
+fn rule_h_keeps_color_clear_quad_whose_store_survives_the_submission() {
     const PSO_CLEAR_QUAD_COLOR: u64 = 0xCAFE_BABE;
-    // Cascade caster pass shape: WoW issued mid-pass `Clear` on
-    // the cascade color atlas (e.g. per-tile clear), which the
-    // encoder folded into a cross-pass color clear-quad. The rest
-    // of the pass is zero-mask caster draws. Rule H must strip
-    // the color attachment AND drain the clear-quad's commands so
-    // the resulting depth-only descriptor doesn't try to bind a
-    // color-output clear-quad pipeline. The atlas is a texture of its
-    // own that nothing later in the frame observes.
+    // An offscreen target is cleared through a colour clear-quad (the
+    // cross-pass shape: `Clear` on a closed pass of a target drawn earlier)
+    // in a pass whose other draws are all zero-mask. Nothing later in this
+    // submission reads the target, but D3D9 keeps its contents: a sampler, a
+    // `StretchRect` or a readback may read it after a mid-frame flush or in a
+    // later frame, and must see the clear. The colour store survives
+    // finalisation, so Rule H leaves the pass alone.
+    for frame_continues in [false, true] {
+        let mut s = fresh();
+        let target = tex(0x3000);
+        s.set_color_render_target(target, 256, 256, RT_FORMAT, RenderScale::IDENTITY);
+        let start = s.open_color_clear_quad_block();
+        s.emit_command(set_pso(PSO_CLEAR_QUAD_COLOR));
+        s.emit_command(dummy_draw());
+        s.close_color_clear_quad_block(start);
+        for _ in 0..2 {
+            s.note_draw_color_write_mask(0);
+            s.emit_command(set_pso(PSO_WITH));
+            s.emit_command(dummy_draw());
+        }
+        s.end_current_pass("test");
+        let mut alt = FxHashMap::default();
+        alt.insert(PSO_WITH, pso(PSO_NO_COLOR));
+        s.finalize_load_actions();
+        s.finalize_store_actions(frame_continues);
+        s.strip_dead_color_in_clear_only_passes();
+        s.strip_color_from_no_color_draw_passes(&alt);
+        s.cull_dead_clear_only_passes();
+
+        let pass = &s.passes()[0];
+        assert_eq!(
+            pass.color_texture(),
+            target,
+            "continues={frame_continues}: colour kept"
+        );
+        assert_eq!(pass.color_store(), StoreAction::Store);
+        assert_eq!(
+            pass.color_clear_quad_ranges().len(),
+            1,
+            "continues={frame_continues}: clear-quad kept"
+        );
+        let pso_handles: Vec<u64> = pass
+            .commands()
+            .iter()
+            .filter(|c| c.cmd == CommandType::SetRenderPipelineState as u32)
+            .map(|c| c.param_b)
+            .collect();
+        assert_eq!(
+            pso_handles,
+            [PSO_CLEAR_QUAD_COLOR, PSO_WITH, PSO_WITH],
+            "continues={frame_continues}: no pipeline rewritten"
+        );
+    }
+}
+
+#[test]
+fn rule_h_strips_color_and_clear_quad_when_the_next_pass_clears_the_target() {
+    const PSO_CLEAR_QUAD_COLOR: u64 = 0xCAFE_BABE;
+    // Cascade caster pass shape: a mid-pass `Clear` on the cascade colour
+    // atlas became a colour clear-quad, and the rest of the pass is
+    // zero-mask caster draws. The next pass on the atlas opens with a full
+    // `Clear`, so Rule C discards this pass's colour store: the clear-quad
+    // is dead work. Rule H strips the colour attachment AND drains the
+    // clear-quad's commands so the depth-only descriptor doesn't bind a
+    // colour-output clear-quad pipeline.
     let mut s = fresh();
-    s.set_color_render_target(tex(0x3000), 256, 256, RT_FORMAT, RenderScale::IDENTITY);
-    // Color clear-quad block — 6 commands, none of which should
-    // tag `color_writes_observed`.
+    let atlas = tex(0x3000);
+    s.set_color_render_target(atlas, 256, 256, RT_FORMAT, RenderScale::IDENTITY);
+    // Color clear-quad block: none of its commands should tag
+    // `color_writes_observed`.
     let start = s.open_color_clear_quad_block();
     s.emit_command(set_pso(PSO_CLEAR_QUAD_COLOR));
     s.emit_command(dummy_draw());
@@ -2855,12 +2913,28 @@ fn rule_h_strips_color_and_clear_quad_when_only_zero_mask_draws_plus_clear_quad(
         s.emit_command(dummy_draw());
     }
     s.end_current_pass("test");
+    s.clear_color(0, 0, 0, 0);
+    s.note_draw_color_write_mask(0xF);
+    s.emit_command(set_pso(PSO_WITH));
+    s.emit_command(dummy_draw());
+    s.end_current_pass("test");
     // Only the real caster needs a side-map entry; clear-quad
     // PSOs are removed wholesale and don't need to resolve.
     let mut alt = FxHashMap::default();
     alt.insert(PSO_WITH, pso(PSO_NO_COLOR));
+    s.finalize_load_actions();
+    s.finalize_store_actions(false);
+    assert_eq!(s.passes()[1].color_texture(), atlas);
+    assert!(matches!(
+        s.passes()[1].color_load(),
+        ColorLoad::Clear { .. }
+    ));
+    assert_eq!(s.passes()[0].color_store(), StoreAction::DontCare);
+    s.strip_dead_color_in_clear_only_passes();
     s.strip_color_from_no_color_draw_passes(&alt);
+    s.cull_dead_clear_only_passes();
 
+    assert_eq!(s.passes()[1].color_texture(), atlas, "clearing pass kept");
     let pass = &s.passes()[0];
     assert_eq!(
         pass.color_texture(),
@@ -2892,6 +2966,215 @@ fn rule_h_strips_color_and_clear_quad_when_only_zero_mask_draws_plus_clear_quad(
         pso_handles.iter().all(|h| *h == PSO_NO_COLOR),
         "every surviving SetPSO is the no-color variant: {pso_handles:?}"
     );
+}
+
+// ── Draw-state replay: the submit-time rules must leave the encoder state
+// ── every surviving draw sees exactly as it was recorded.
+
+#[cfg(debug_assertions)]
+const PSO_TILE_COLOR_CLEAR: u64 = 0xCAFE_BABE;
+#[cfg(debug_assertions)]
+const PSO_TILE_DEPTH_CLEAR: u64 = 0xCCCC_3333;
+#[cfg(debug_assertions)]
+const DSS_INERT: u64 = 0xD000;
+#[cfg(debug_assertions)]
+const DSS_DEPTH_CLEAR: u64 = 0xD001;
+#[cfg(debug_assertions)]
+const DSS_CASTER: u64 = 0xD002;
+#[cfg(debug_assertions)]
+const CASCADE_TILES: [(u32, u32, u32, u32); 2] = [(0, 0, 256, 256), (256, 0, 256, 256)];
+
+/// Where a colour clear-quad binds the depth-stencil, scissor and cull state.
+#[cfg(debug_assertions)]
+enum ClearQuadStateOrder {
+    /// Inside the block Rule H drains with the colour attachment.
+    InsideBlock,
+    /// Ahead of the block, so the state survives the drain.
+    BeforeBlock,
+}
+
+/// Bind depth-stencil state, scissor and cull mode through the dedup cache, as the encoder does.
+#[cfg(debug_assertions)]
+fn bind_quad_state(
+    s: &mut PassState,
+    cache: &mut LastBoundCache,
+    depth_stencil: u64,
+    rect: (u32, u32, u32, u32),
+    cull: CullMode,
+) {
+    if cache.depth_stencil_changed(depth_stencil) {
+        s.emit_command(Command::set_depth_stencil_state(depth_stencil));
+    }
+    if cache.scissor_rect_changed(rect) {
+        s.emit_command(Command::set_scissor_rect(rect.0, rect.1, rect.2, rect.3));
+    }
+    if cache.cull_mode_changed(cull) {
+        s.emit_command(Command::set_cull_mode(cull));
+    }
+}
+
+/// Bind `pipeline` through the dedup cache.
+#[cfg(debug_assertions)]
+fn bind_pipeline(s: &mut PassState, cache: &mut LastBoundCache, pipeline: u64) {
+    if cache.pipeline_changed(pipeline) {
+        s.emit_command(set_pso(pipeline));
+    }
+}
+
+/// Record shadow-cascade tiles into one atlas pass the way `FrameEncoder` emits them.
+///
+/// Per tile: `SetViewport(tile)`, then `Clear(TARGET | ZBUFFER)` as a colour
+/// clear-quad followed by a depth clear-quad, then a caster draw under
+/// cull-back. Every state change goes through a real `LastBoundCache`, so the
+/// depth quad re-binds neither the scissor nor the cull mode the colour quad
+/// just bound.
+#[cfg(debug_assertions)]
+fn record_cascade_tiles(order: &ClearQuadStateOrder, caster_mask: u32) -> PassState {
+    let mut s = fresh();
+    s.set_color_render_target(tex(0x3000), 512, 256, RT_FORMAT, RenderScale::IDENTITY);
+    let mut cache = LastBoundCache::new();
+    for tile in CASCADE_TILES {
+        s.set_viewport(tile.0, tile.1, tile.2, tile.3, 0.0, 1.0);
+        if matches!(order, ClearQuadStateOrder::BeforeBlock) {
+            bind_quad_state(&mut s, &mut cache, DSS_INERT, tile, CullMode::None);
+        }
+        let start = s.open_color_clear_quad_block();
+        bind_pipeline(&mut s, &mut cache, PSO_TILE_COLOR_CLEAR);
+        if matches!(order, ClearQuadStateOrder::InsideBlock) {
+            bind_quad_state(&mut s, &mut cache, DSS_INERT, tile, CullMode::None);
+        }
+        s.emit_command(Command::set_vertex_bytes_at(0x5000, 4, 0));
+        cache.invalidate_vertex_buffer();
+        s.emit_command(Command::set_fragment_bytes_at(0x5100, 16, 0));
+        s.emit_command(dummy_draw());
+        s.close_color_clear_quad_block(start);
+
+        bind_pipeline(&mut s, &mut cache, PSO_TILE_DEPTH_CLEAR);
+        bind_quad_state(&mut s, &mut cache, DSS_DEPTH_CLEAR, tile, CullMode::None);
+        s.emit_command(Command::set_vertex_bytes_at(0x5200, 4, 0));
+        cache.invalidate_vertex_buffer();
+        s.emit_command(dummy_draw());
+
+        s.note_draw_color_write_mask(caster_mask);
+        bind_pipeline(&mut s, &mut cache, PSO_WITH);
+        bind_quad_state(&mut s, &mut cache, DSS_CASTER, tile, CullMode::Back);
+        if cache.vertex_buffer_changed(0, 0x7000, 0, 1) != VertexBufferBind::Same {
+            s.emit_command(Command::set_vertex_buffer(0x7000, 0, 0));
+        }
+        s.emit_command(dummy_draw());
+    }
+    s.end_current_pass("test");
+    // The next pass opens with a whole-atlas colour Clear (the legacy-break
+    // form, so it folds into the load action rather than painting a quad over
+    // the atlas the tiles already drew), so Rule C discards the caster pass's
+    // colour store and Rule H may drain its colour clear-quads.
+    s.clear_color_legacy_break(0, 0, 0, 0);
+    s.note_draw_color_write_mask(0xF);
+    s.emit_command(set_pso(PSO_WITH));
+    s.emit_command(dummy_draw());
+    s.end_current_pass("test");
+    s.finalize_store_actions(false);
+    s
+}
+
+/// The side map for the cascade pass: the caster's no-colour sibling, the depth quad itself.
+#[cfg(debug_assertions)]
+fn cascade_alt() -> FxHashMap<u64, MetalHandle<MTLRenderPipelineStateKind>> {
+    let mut alt = FxHashMap::default();
+    alt.insert(PSO_WITH, pso(PSO_NO_COLOR));
+    alt.insert(PSO_TILE_DEPTH_CLEAR, pso(PSO_TILE_DEPTH_CLEAR));
+    alt
+}
+
+/// The scissor and raw cull mode a draw runs with; `None` while no cull mode is bound.
+#[cfg(debug_assertions)]
+#[derive(Debug, PartialEq, Eq)]
+struct QuadDrawState {
+    scissor: (u32, u32, u32, u32),
+    cull: Option<u32>,
+}
+
+/// The state each depth clear-quad draw of `pass` runs with.
+#[cfg(debug_assertions)]
+fn depth_clear_draw_state(pass: &Pass) -> Vec<QuadDrawState> {
+    let mut pipeline = 0;
+    let mut scissor = (0, 0, 0, 0);
+    let mut cull = None;
+    let mut seen = Vec::new();
+    for cmd in pass.commands() {
+        if cmd.cmd == CommandType::SetRenderPipelineState as u32 {
+            pipeline = cmd.param_b;
+        } else if cmd.cmd == CommandType::SetScissorRect as u32 {
+            scissor = unpack_scissor(cmd);
+        } else if cmd.cmd == CommandType::SetCullMode as u32 {
+            cull = Some(cmd.param_a);
+        } else if cmd.is_draw() && pipeline == PSO_TILE_DEPTH_CLEAR {
+            seen.push(QuadDrawState { scissor, cull });
+        }
+    }
+    seen
+}
+
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "pass rules changed the cull mode a surviving draw sees")]
+fn draw_state_check_catches_state_a_drained_clear_quad_bound() {
+    // The colour clear-quad binds cull mode and scissor inside its block;
+    // Rule H drains the block, and the depth quad that deduplicated against
+    // them runs with the previous tile's cull-back and scissor instead.
+    let mut s = record_cascade_tiles(&ClearQuadStateOrder::InsideBlock, 0);
+    let before = s.debug_record_draw_states();
+    let alt = cascade_alt();
+    s.strip_color_from_no_color_draw_passes(&alt);
+    s.debug_assert_draw_states_preserved(&before, &alt);
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn rule_h_keeps_the_state_a_clear_quad_binds_ahead_of_its_block() {
+    let mut s = record_cascade_tiles(&ClearQuadStateOrder::BeforeBlock, 0);
+    let before = s.debug_record_draw_states();
+    let alt = cascade_alt();
+    s.strip_color_from_no_color_draw_passes(&alt);
+    let pass = &s.passes()[0];
+    assert_eq!(pass.color_texture(), MetalHandle::NULL, "colour stripped");
+    assert!(pass.color_clear_quad_ranges().is_empty(), "blocks drained");
+    s.debug_assert_draw_states_preserved(&before, &alt);
+    // Each tile's depth clear-quad runs unculled under its own tile's scissor.
+    let tile_state = |scissor| QuadDrawState {
+        scissor,
+        cull: Some(CullMode::None as u32),
+    };
+    assert_eq!(
+        depth_clear_draw_state(&s.passes()[0]),
+        vec![tile_state(CASCADE_TILES[0]), tile_state(CASCADE_TILES[1])],
+    );
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn draw_state_check_is_quiet_when_no_rule_drops_a_block() {
+    // A caster that writes colour keeps the attachment and the blocks, so
+    // nothing the depth quads inherited goes away, whatever the order.
+    let mut s = record_cascade_tiles(&ClearQuadStateOrder::InsideBlock, 0xF);
+    let before = s.debug_record_draw_states();
+    let alt = cascade_alt();
+    s.strip_color_from_no_color_draw_passes(&alt);
+    assert_eq!(s.passes()[0].color_clear_quad_ranges().len(), 2);
+    s.debug_assert_draw_states_preserved(&before, &alt);
+}
+
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "pass rules changed the pipeline a surviving draw sees")]
+fn draw_state_check_catches_a_pipeline_rewrite_outside_the_side_map() {
+    let mut s = record_cascade_tiles(&ClearQuadStateOrder::BeforeBlock, 0);
+    let before = s.debug_record_draw_states();
+    s.strip_color_from_no_color_draw_passes(&cascade_alt());
+    // Checked against a side map that never named the caster's sibling.
+    let mut other = FxHashMap::default();
+    other.insert(PSO_TILE_DEPTH_CLEAR, pso(PSO_TILE_DEPTH_CLEAR));
+    s.debug_assert_draw_states_preserved(&before, &other);
 }
 
 #[test]
@@ -3846,6 +4129,50 @@ fn rule_g_strips_only_the_dead_extra_and_rule_f_needs_every_store_dead() {
     assert!(!pass.extra_color()[1].is_bound(), "dead extra stripped");
     s.cull_dead_clear_only_passes();
     assert_eq!(s.passes().len(), 2, "a live store keeps the pass");
+}
+
+#[test]
+fn clear_colour_survives_rule_g_stripping_target_zero() {
+    // Clear rt_a (target 0) and rt_b (target 1) red, unbind rt_b so a
+    // clear-only pass materialises, then clear rt_a blue and draw while
+    // sampling rt_b. Rule C kills rt_a's store in the clear-only pass and
+    // Rule G strips it; rt_b keeps its store and its Clear. The pass still
+    // has to carry red for rt_b, not the zeros of a stripped target 0.
+    let rt_a = tex(0x3000);
+    let rt_b = tex(0x3001);
+    let red = (1.0f32.to_bits(), 0, 0, 1.0f32.to_bits());
+    let blue = (0, 0, 1.0f32.to_bits(), 1.0f32.to_bits());
+    let mut s = fresh();
+    s.set_color_render_target(rt_a, BB_SIZE.0, BB_SIZE.1, RT_FORMAT, RenderScale::IDENTITY);
+    s.set_extra_color_render_target(1, Some(slot(rt_b, BB_SIZE)));
+    s.clear_color(red.0, red.1, red.2, red.3);
+    s.set_extra_color_render_target(1, None);
+    s.clear_color(blue.0, blue.1, blue.2, blue.3);
+    s.emit_command(Command::set_fragment_texture(rt_b.raw(), 0));
+    s.emit_command(dummy_draw());
+    s.end_current_pass("test");
+    s.coalesce_clear_only_passes();
+    s.finalize_load_actions();
+    s.finalize_store_actions(false);
+    s.strip_dead_color_in_clear_only_passes();
+    assert_eq!(s.passes().len(), 2);
+    let pass = &s.passes()[0];
+    assert_eq!(pass.color_texture(), MetalHandle::NULL, "target 0 stripped");
+    assert_eq!(pass.color_load(), ColorLoad::DontCare);
+    let extra = &pass.extra_color()[0];
+    assert_eq!(extra.texture(), rt_b);
+    assert_eq!(extra.store(), StoreAction::Store, "sampled later");
+    assert_eq!(
+        extra.load(),
+        ColorLoad::Clear {
+            r: red.0,
+            g: red.1,
+            b: red.2,
+            a: red.3
+        }
+    );
+    assert_eq!(pass.color_clear_rgba(), Some(red));
+    assert_eq!(s.passes()[1].color_clear_rgba(), Some(blue));
 }
 
 #[test]
@@ -4932,6 +5259,173 @@ fn a_multisampled_target_without_a_companion_twin_keeps_the_linear_attachment() 
     assert_eq!(pass.color_resolve_texture(), backbuffer());
 }
 
+// ── Colour strips drop every view of attachment 0 ──
+
+/// Rule H on a pass that encodes through the sRGB twin attaches no colour at all.
+///
+/// The pass's pipelines are rewritten to the no-colour variant, so an
+/// attachment left behind through the twin view fails Metal's
+/// pipeline-versus-render-pass format validation.
+#[test]
+fn rule_h_strip_drops_the_srgb_twin_view() {
+    let mut s = fresh();
+    s.set_srgb_write_enabled(true);
+    assert!(s.pass_srgb_write());
+    s.note_draw_color_write_mask(0);
+    s.emit_command(set_pso(PSO_WITH));
+    s.emit_command(dummy_draw());
+    s.end_current_pass("test");
+    assert_eq!(s.passes()[0].color_attachment_texture(), backbuffer_srgb());
+    let mut alt = FxHashMap::default();
+    alt.insert(PSO_WITH, pso(PSO_NO_COLOR));
+
+    s.strip_color_from_no_color_draw_passes(&alt);
+
+    assert_eq!(s.passes()[0].color_texture(), MetalHandle::NULL);
+    assert_eq!(
+        s.passes()[0].color_attachment_texture(),
+        MetalHandle::NULL,
+        "the stripped pass must not attach the sRGB twin"
+    );
+}
+
+/// Rule H on a multisampled pass that does not take the resolve attaches no colour at all.
+///
+/// Leaving the companion attached with `DontCare` store would also discard
+/// the samples an earlier pass stored for the later pass that loads them.
+#[test]
+fn rule_h_strip_drops_the_multisampled_companion() {
+    let rt = tex(0x3000);
+    let mut s = fresh_multisampled();
+    s.note_draw_color_write_mask(0);
+    s.emit_command(set_pso(PSO_WITH));
+    s.emit_command(dummy_draw());
+    s.set_color_render_target(rt, 256, 256, RT_FORMAT, RenderScale::IDENTITY);
+    s.note_draw_color_write_mask(0xF);
+    s.emit_command(dummy_draw());
+    s.set_color_render_target(
+        backbuffer(),
+        BB_SIZE.0,
+        BB_SIZE.1,
+        BB_FORMAT,
+        s.render_scale,
+    );
+    s.set_color_msaa(msaa_backbuffer(), msaa_backbuffer_srgb(), 4);
+    s.note_draw_color_write_mask(0xF);
+    s.emit_command(dummy_draw());
+    s.end_current_pass("test");
+    s.finalize_store_actions(false);
+    assert_eq!(s.passes().len(), 3);
+    assert!(
+        s.passes()[0].color_resolve_texture().is_null(),
+        "the last pass on the back buffer takes the resolve"
+    );
+    assert_eq!(s.passes()[0].color_attachment_texture(), msaa_backbuffer());
+    let mut alt = FxHashMap::default();
+    alt.insert(PSO_WITH, pso(PSO_NO_COLOR));
+
+    s.strip_color_from_no_color_draw_passes(&alt);
+
+    assert_eq!(s.passes()[0].color_texture(), MetalHandle::NULL);
+    assert_eq!(
+        s.passes()[0].color_attachment_texture(),
+        MetalHandle::NULL,
+        "the stripped pass must not attach the multisampled companion"
+    );
+    assert_eq!(
+        s.passes()[2].color_attachment_texture(),
+        msaa_backbuffer(),
+        "the colour-writing pass keeps its attachment"
+    );
+}
+
+/// Rule G on a clear-only pass that encodes through the sRGB twin attaches no colour at all.
+#[test]
+fn rule_g_strip_drops_the_srgb_twin_view() {
+    let cascade_color = tex(0x3000);
+    let cascade_twin = tex(0x3001);
+    let cascade_d0 = tex(0x9000);
+    let cascade_d1 = tex(0x9100);
+    let mut s = fresh();
+    s.register_srgb_twin(cascade_twin, cascade_color);
+    s.set_color_render_target(cascade_color, 2048, 2048, RT_FORMAT, RenderScale::IDENTITY);
+    s.set_srgb_write_enabled(true);
+    assert!(s.pass_srgb_write());
+    s.set_depth_stencil_attachment(cascade_d0, BB_SIZE, false, false);
+    s.clear_color(1, 2, 3, 4);
+    s.clear_depth(f32::to_bits(1.0));
+    s.set_depth_stencil_attachment(cascade_d1, BB_SIZE, false, false);
+    s.clear_color(1, 2, 3, 4);
+    s.clear_depth(f32::to_bits(1.0));
+    s.emit_command(dummy_draw());
+    s.set_srgb_write_enabled(false);
+    s.set_color_render_target(
+        backbuffer(),
+        BB_SIZE.0,
+        BB_SIZE.1,
+        BB_FORMAT,
+        s.render_scale,
+    );
+    s.set_depth_stencil_attachment(depth(), BB_SIZE, false, false);
+    s.emit_command(Command::set_fragment_texture(cascade_d0.raw(), 4));
+    s.emit_command(dummy_draw());
+    s.end_current_pass("test");
+    s.finalize_load_actions();
+    s.finalize_store_actions(false);
+    let before = s
+        .passes()
+        .iter()
+        .find(|p| p.depth_texture() == cascade_d0)
+        .expect("cascade_d0 pass");
+    assert_eq!(before.color_attachment_texture(), cascade_twin);
+    assert_eq!(before.color_store(), StoreAction::DontCare);
+
+    s.strip_dead_color_in_clear_only_passes();
+
+    let stripped = s
+        .passes()
+        .iter()
+        .find(|p| p.depth_texture() == cascade_d0)
+        .expect("cascade_d0 pass");
+    assert_eq!(stripped.color_texture(), MetalHandle::NULL);
+    assert_eq!(
+        stripped.color_attachment_texture(),
+        MetalHandle::NULL,
+        "the stripped pass must not attach the sRGB twin"
+    );
+}
+
+/// Rule G on a multisampled clear-only pass that does not take the resolve attaches no colour.
+#[test]
+fn rule_g_strip_drops_the_multisampled_companion() {
+    let second_depth = tex(0x9000);
+    let mut s = fresh_multisampled();
+    s.clear_color(1, 1, 1, 1);
+    s.clear_depth(f32::to_bits(1.0));
+    s.ensure_pass_open();
+    s.set_depth_stencil_attachment(second_depth, BB_SIZE, false, false);
+    s.set_depth_sample_count(4);
+    s.clear_color(1, 1, 1, 1);
+    s.note_draw_color_write_mask(0xF);
+    s.emit_command(dummy_draw());
+    s.end_current_pass("test");
+    s.finalize_load_actions();
+    s.finalize_store_actions(false);
+    assert_eq!(s.passes().len(), 2);
+    assert!(s.passes()[0].color_resolve_texture().is_null());
+    assert_eq!(s.passes()[0].color_store(), StoreAction::DontCare);
+    assert_eq!(s.passes()[0].color_attachment_texture(), msaa_backbuffer());
+
+    s.strip_dead_color_in_clear_only_passes();
+
+    assert_eq!(s.passes()[0].color_texture(), MetalHandle::NULL);
+    assert_eq!(
+        s.passes()[0].color_attachment_texture(),
+        MetalHandle::NULL,
+        "the stripped pass must not attach the multisampled companion"
+    );
+}
+
 // ── RESZ depth resolve ──
 
 #[test]
@@ -5566,6 +6060,12 @@ fn rule_h_keeps_fill_changes_outside_removed_color_clear() {
     s.emit_command(Command::set_triangle_fill_mode(TriangleFillMode::Lines));
     s.emit_command(dummy_draw());
     s.end_current_pass("test");
+    // The next pass clears the target in full, so the colour clear is dead
+    // and Rule H may remove it.
+    s.clear_color(0, 0, 0, 0);
+    s.emit_command(dummy_draw());
+    s.end_current_pass("test");
+    s.finalize_store_actions(false);
     let mut alt = FxHashMap::default();
     alt.insert(PSO_WITH, pso(PSO_NO_COLOR));
     s.strip_color_from_no_color_draw_passes(&alt);

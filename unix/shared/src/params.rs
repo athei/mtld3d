@@ -865,6 +865,8 @@ pub struct PassDescriptor {
     ///
     /// They share `clear_r..clear_a` with attachment 0 (a D3D9 `Clear` has
     /// one colour for every target) and carry their own load/store actions.
+    /// The shared colour is set whenever any attachment clears, including a
+    /// pass whose attachment 0 is stripped or does not clear.
     pub extra_color: [ExtraColorDesc; 3], // in
 }
 
