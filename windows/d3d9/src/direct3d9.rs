@@ -1967,7 +1967,6 @@ fn destroy_partial_device(
         record_handle: cq.record_handle,
         view_handle,
         backbuffer_handle: backbuffer.map_or(MetalHandle::NULL, |bb| bb.texture_handle),
-        pipeline_handle: MetalHandle::NULL,
         depth_texture_handle: MetalHandle::NULL,
     };
     unix_call(&mut destroy);

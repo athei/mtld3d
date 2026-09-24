@@ -3714,7 +3714,6 @@ extern "system" fn device_release(this: *mut c_void) -> u32 {
             record_handle: device_inner.record_handle,
             view_handle: device_inner.view_handle,
             backbuffer_handle: device_inner.backbuffer_handle,
-            pipeline_handle: MetalHandle::NULL, // pipelines managed by encoder cache
             depth_texture_handle: device_inner.depth_stencil_handle,
         };
         // Neither the back buffer's sRGB twin view, nor its multisampled

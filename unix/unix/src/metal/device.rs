@@ -6,9 +6,7 @@ use std::{
 use mtld3d_shared::{
     MetalHandle,
     mtl::DeviceCapsFlags,
-    mtl_handle::{
-        MTLCommandQueueKind, MTLDeviceKind, MTLRenderPipelineStateKind, MTLTextureKind, NSViewKind,
-    },
+    mtl_handle::{MTLCommandQueueKind, MTLDeviceKind, MTLTextureKind, NSViewKind},
     record_handle::DeviceRecordHandle,
 };
 use objc2::{rc::Retained, runtime::ProtocolObject};
@@ -262,7 +260,7 @@ pub fn create_command_queue(gate: Option<PathBuf>) -> Option<DeviceCaps> {
     })
 }
 
-/// Releases `MTLDevice` + `MTLCommandQueue` + backbuffer + pipeline.
+/// Releases `MTLDevice` + `MTLCommandQueue` + backbuffer + depth texture.
 ///
 /// If `view_handle` is non-null, retires the macdrv metal view: kept for the
 /// window's next device, see `macdrv::retire_metal_view`.
@@ -271,7 +269,6 @@ pub fn destroy_command_queue(
     device_record: &Arc<DeviceRecord>,
     view_handle: MetalHandle<NSViewKind>,
     backbuffer_handle: MetalHandle<MTLTextureKind>,
-    pipeline_handle: MetalHandle<MTLRenderPipelineStateKind>,
     depth_texture_handle: MetalHandle<MTLTextureKind>,
 ) {
     let queue_handle = device_record.queue();
@@ -311,17 +308,14 @@ pub fn destroy_command_queue(
     // buffer of this queue still touches them, and before the queue itself.
     super::upscale::retire(device_record.upscale());
 
-    // SAFETY: PE side has flushed the GPU and is dropping its only
-    // copy of each handle, so the canonical retain transferred at creation
-    // time is now ours to release. (Same rationale for each of the five
-    // `release_retain` calls below.)
-    unsafe { pipeline_handle.release_retain() };
-    // SAFETY: as above.
+    // The PE side has flushed the GPU and is dropping its only copy of each
+    // handle, so the canonical retain transferred at creation time is now
+    // ours to release.
     crate::metal::destroy_texture(depth_texture_handle.raw());
     crate::metal::destroy_texture(backbuffer_handle.raw());
     // The queue's own retain rides on the record, which the caller drops
     // once this returns.
-    // SAFETY: as above.
+    // SAFETY: as above: the device's canonical retain is ours to release.
     unsafe { device_handle.release_retain() };
     if !view_handle.is_null() {
         retire_metal_view(view_handle, record.as_deref());

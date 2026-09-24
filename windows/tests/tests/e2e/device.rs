@@ -30,9 +30,9 @@ use mtld3d_types::{
     D3DOK_NOAUTOGEN, D3DPOOL_DEFAULT, D3DPOOL_MANAGED, D3DPOOL_SCRATCH, D3DPOOL_SYSTEMMEM,
     D3DPRESENT_INTERVAL_FOUR, D3DPRESENT_INTERVAL_IMMEDIATE, D3DPRESENT_INTERVAL_ONE,
     D3DPRESENT_INTERVAL_THREE, D3DPRESENT_INTERVAL_TWO, D3DPRESENT_PARAMETERS, D3DPT_TRIANGLELIST,
-    D3DRS_FILLMODE, D3DRS_LIGHTING, D3DRTYPE_CUBETEXTURE, D3DRTYPE_SURFACE, D3DRTYPE_TEXTURE,
-    D3DRTYPE_VOLUME, D3DRTYPE_VOLUMETEXTURE, D3DSWAPEFFECT_DISCARD, D3DUSAGE_AUTOGENMIPMAP,
-    D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_DYNAMIC, D3DUSAGE_QUERY_FILTER,
+    D3DRS_COLORWRITEENABLE, D3DRS_FILLMODE, D3DRS_LIGHTING, D3DRTYPE_CUBETEXTURE, D3DRTYPE_SURFACE,
+    D3DRTYPE_TEXTURE, D3DRTYPE_VOLUME, D3DRTYPE_VOLUMETEXTURE, D3DSWAPEFFECT_DISCARD,
+    D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_DYNAMIC, D3DUSAGE_QUERY_FILTER,
     D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING, D3DUSAGE_QUERY_SRGBREAD, D3DUSAGE_QUERY_SRGBWRITE,
     D3DUSAGE_QUERY_VERTEXTEXTURE, D3DUSAGE_QUERY_WRAPANDMIP, D3DUSAGE_RENDERTARGET, D3DVIEWPORT9,
     DevCaps, TextureCaps,
@@ -1162,6 +1162,7 @@ fn reset_flips_the_presentation_interval() {
     run_in_private_log_child(
         PACING_CHILD_NAME,
         "device::reset_flips_the_presentation_interval",
+        PRIVATE_LOG_FILTER,
     );
 }
 
@@ -1216,6 +1217,7 @@ fn reset_to_a_divided_interval_moves_the_ceiling() {
     run_in_private_log_child(
         CEILING_CHILD_NAME,
         "device::reset_to_a_divided_interval_moves_the_ceiling",
+        PRIVATE_LOG_FILTER,
     );
 }
 
@@ -1300,13 +1302,16 @@ fn running_as(child_name: &str) -> bool {
         .is_some_and(|name| name == child_name)
 }
 
+/// The log filter a workload child runs under unless it needs more: unix-side info records.
+const PRIVATE_LOG_FILTER: &str = "warn,mtld3d::unix=info";
+
 /// Run `test` in a copy of this executable named `child_name`, alone in a log directory of its own.
 ///
-/// The copy sees unix-side info records whatever the suite's filter is, and
-/// the layer writes its log into a directory only that process uses, so a
-/// test that reads its own process log reads its device's lines and nobody
+/// The copy logs under `filter` whatever the suite's filter is, and the
+/// layer writes its log into a directory only that process uses, so a test
+/// that reads its own process log reads its device's lines and nobody
 /// else's. Panics with the child's standard error when the child fails.
-fn run_in_private_log_child(child_name: &str, test: &str) {
+fn run_in_private_log_child(child_name: &str, test: &str, filter: &str) {
     let exe = std::env::current_exe().expect("resolve test executable");
     let _factory = Harness::factory_only();
     let stamp = std::time::SystemTime::now()
@@ -1323,10 +1328,9 @@ fn run_in_private_log_child(child_name: &str, test: &str) {
     std::fs::copy(&exe, &child).expect("copy the workload executable");
     let mut command = std::process::Command::new(&child);
     command.args(["--exact", test, "--nocapture"]);
-    // The workloads consume unix-side info records even when the suite
-    // disables them. Wine inherits its Unix environment separately from the
-    // PE child's: its promotion prefix sets the native filter too.
-    let filter = "warn,mtld3d::unix=info";
+    // The workloads consume unix-side records even when the suite disables
+    // them. Wine inherits its Unix environment separately from the PE
+    // child's: its promotion prefix sets the native filter too.
     command.envs([("RUST_LOG", filter), ("__CX_UNIX_RUST_LOG", filter)]);
     // A run that collects its logs from one directory (`LOG_DIR`, which every
     // CI leg sets) carries `log.dir` in the suite-wide configuration, and a
@@ -1461,10 +1465,19 @@ fn logged_pacing() -> Vec<String> {
 /// The log is the one the layer writes into this process's log directory,
 /// which for a workload child holds its device's lines and nobody else's.
 fn logged_lines(needle: &str) -> Vec<String> {
+    process_log()
+        .lines()
+        .filter(|line| line.contains(needle))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// This process's log as the layer has written it so far; empty before the first line.
+fn process_log() -> String {
     let logs = log_directory();
     let Ok(entries) = std::fs::read_dir(&logs) else {
         // The directory appears with the first line the layer writes.
-        return Vec::new();
+        return String::new();
     };
     let mut files: Vec<_> = entries
         .map(|entry| entry.expect("read a log directory entry").path())
@@ -1475,13 +1488,9 @@ fn logged_lines(needle: &str) -> Vec<String> {
         "one process log beside the child: {files:?}"
     );
     let Some(log) = files.pop() else {
-        return Vec::new();
+        return String::new();
     };
-    let text = std::fs::read_to_string(&log).expect("read the process log");
-    text.lines()
-        .filter(|line| line.contains(needle))
-        .map(str::to_owned)
-        .collect()
+    std::fs::read_to_string(&log).expect("read the process log")
 }
 
 /// Wait until the process log carries `expected` lines with `needle`, and hand them all back.
@@ -3826,6 +3835,7 @@ fn a_live_child_window_keeps_its_metal_view() {
         run_in_private_log_child(
             LIVE_CHILD_VIEW_CHILD_NAME,
             "device::a_live_child_window_keeps_its_metal_view",
+            PRIVATE_LOG_FILTER,
         );
         return;
     }
@@ -3868,6 +3878,7 @@ fn a_new_window_takes_the_metal_view_a_destroyed_window_left() {
     run_in_private_log_child(
         KEPT_VIEW_CHILD_NAME,
         "device::a_new_window_takes_the_metal_view_a_destroyed_window_left",
+        PRIVATE_LOG_FILTER,
     );
 }
 
@@ -3907,6 +3918,162 @@ fn kept_view_move_workload() {
             );
         });
     });
+}
+
+/// The name the workload child of the device-recreation pipeline test runs under.
+const PIPELINE_CYCLES_CHILD_NAME: &str = "pipeline-cycles.exe";
+
+#[test]
+fn device_recreation_releases_every_pipeline_it_built() {
+    if running_as(PIPELINE_CYCLES_CHILD_NAME) {
+        pipeline_cycles_workload();
+        return;
+    }
+    // Every pipeline create and release is read out of the process log, and
+    // in the suite's process other tests' devices build and release their
+    // own. The workload runs in a process of its own, with the unix side's
+    // debug records on: those are the lines that carry the handles.
+    run_in_private_log_child(
+        PIPELINE_CYCLES_CHILD_NAME,
+        "device::device_recreation_releases_every_pipeline_it_built",
+        "warn,mtld3d::unix=debug",
+    );
+}
+
+/// Recreate a device four times, as a game does on each mode switch, matching creates to releases.
+///
+/// Each cycle is one device on a window of its own, on a thread of its own
+/// (a destroyed window posts `WM_QUIT` to the thread that destroyed it),
+/// drawing the same quad with colour writes on and then off, so the draw's
+/// pipeline and its no-colour sibling are both built. The shader cache is on
+/// and starts empty beside the private executable, so the first device
+/// compiles live and every later one prewarms what the first recorded.
+///
+/// Once a device is gone, every pipeline handle created so far has been
+/// released as many times as it was created, so no device's pipelines
+/// outlive it. The recreated devices each build the same number, so a
+/// recreate rebuilds one set instead of adding to one it kept.
+fn pipeline_cycles_workload() {
+    const CYCLES: usize = 4;
+    const RED: u32 = 0xFFFF_0000;
+    const BLUE: u32 = 0xFF00_00FF;
+
+    let mut built = Vec::with_capacity(CYCLES);
+    for cycle in 1..=CYCLES {
+        let before = created_pipelines(&process_log()).len();
+        std::thread::scope(|scope| {
+            spawn_scoped(scope, || {
+                let h = Harness::with_config("shaderCache.enable=true");
+                assert_eq!(h.set_render_state(D3DRS_LIGHTING, 0), 0, "LIGHTING off");
+                assert_eq!(
+                    h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1),
+                    0,
+                    "SetFVF"
+                );
+                h.render_once(BLUE, |d| {
+                    assert_eq!(
+                        d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &flat_quad(RED)),
+                        0,
+                        "colour draw"
+                    );
+                });
+                assert_pixel_eq(h.read_pixel(320, 240), RED, "the colour draw lands");
+                assert_eq!(
+                    h.set_render_state(D3DRS_COLORWRITEENABLE, 0),
+                    0,
+                    "colour writes off"
+                );
+                h.render_once(BLUE, |d| {
+                    assert_eq!(
+                        d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &flat_quad(RED)),
+                        0,
+                        "no-colour draw"
+                    );
+                });
+                assert_pixel_eq(
+                    h.read_pixel(320, 240),
+                    BLUE,
+                    "the no-colour draw keeps the clear",
+                );
+            });
+        });
+        let created = await_pipelines_released(cycle);
+        built.push(created - before);
+    }
+    assert!(
+        built[0] >= 2,
+        "the first device built both pipelines: {built:?}"
+    );
+    assert!(
+        built[1..].iter().all(|&count| count == built[1]),
+        "every recreated device builds the same set: {built:?}"
+    );
+}
+
+/// Wait until every render pipeline created so far is released; return how many were created.
+///
+/// The release is logged by the device's teardown, which has returned by
+/// the time this is called; the layer's log thread writes the lines a moment
+/// later, so they are polled for, within a bound. Handles are compared as a
+/// multiset: an address a released pipeline had can be handed to a later one.
+fn await_pipelines_released(cycle: usize) -> usize {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let log = process_log();
+        let mut created = created_pipelines(&log);
+        let mut released = released_pipelines(&log);
+        created.sort_unstable();
+        released.sort_unstable();
+        if !created.is_empty() && created == released {
+            return created.len();
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "after device {cycle}, {} pipeline(s) created and {} released; \
+             created {created:#x?}, released {released:#x?}",
+            created.len(),
+            released.len()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// The render pipeline handles the unix side logged as created, oldest first.
+fn created_pipelines(log: &str) -> Vec<u64> {
+    log.lines()
+        .filter_map(|line| line.split_once("created render pipeline 0x"))
+        .map(|(_, rest)| {
+            let digits = rest.split(' ').next().unwrap_or_default();
+            u64::from_str_radix(digits, 16).expect("a created pipeline names its handle in hex")
+        })
+        .collect()
+}
+
+/// The render pipeline handles the unix side logged as released by a bulk destroy.
+///
+/// The destroy line prints its handles as a pretty-printed hex list, one
+/// handle per line after the header, closed by `]`.
+fn released_pipelines(log: &str) -> Vec<u64> {
+    let mut released = Vec::new();
+    let mut in_list = false;
+    for line in log.lines() {
+        if line.contains("DestroyResourcesBulk RenderPipeline x") {
+            in_list = true;
+            continue;
+        }
+        if !in_list {
+            continue;
+        }
+        let entry = line.trim().trim_end_matches(',');
+        if let Some(digits) = entry.strip_prefix("0x") {
+            released.push(
+                u64::from_str_radix(digits, 16).expect("a released pipeline is logged in hex"),
+            );
+        } else {
+            in_list = false;
+        }
+    }
+    released
 }
 
 #[test]

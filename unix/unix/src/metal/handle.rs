@@ -7,6 +7,8 @@
 //! conversion below is **safe** because the invariant rides on the
 //! [`MetalHandle`] type.
 
+use core::hash::Hash;
+
 use mtld3d_shared::{
     MetalHandle,
     mtl_handle::{
@@ -24,6 +26,7 @@ use objc2_metal::{
     MTLDevice, MTLFunction, MTLLibrary, MTLRenderPipelineState, MTLSamplerState, MTLTexture,
 };
 use objc2_quartz_core::CAMetalLayer;
+use rustc_hash::FxHashMap;
 
 /// Maps a wire-side marker kind to the real Metal protocol type.
 pub trait ToMetalProtocol {
@@ -271,6 +274,30 @@ unsafe impl ReleaseRetain for MetalHandle<CAMetalLayerKind> {
             drop(Retained::from_raw(self.raw() as *mut CAMetalLayer));
         }
     }
+}
+
+/// Cache `built` under `key` unless an entry is already there, and return the cached handle.
+///
+/// The process-wide helper caches build a missing entry outside their lock,
+/// so two threads that miss the same key both build one. The first stored
+/// is kept; a later `built` loses and its retain is released here, where
+/// dropping the `u64` would leak the object.
+///
+/// # Safety
+///
+/// `built` holds the retain `Retained::into_raw` gave it, and the caller
+/// keeps no other copy of it.
+pub unsafe fn keep_first<Key: Hash + Eq, K: ToMetalProtocol>(
+    cache: &mut FxHashMap<Key, MetalHandle<K>>,
+    key: Key,
+    built: MetalHandle<K>,
+) -> MetalHandle<K> {
+    let kept = *cache.entry(key).or_insert(built);
+    if kept.raw() != built.raw() {
+        // SAFETY: the caller's assertion; `built` lost, so nothing holds it.
+        unsafe { built.release_retain() };
+    }
+    kept
 }
 
 #[cfg(test)]

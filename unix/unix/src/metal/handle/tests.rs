@@ -178,3 +178,55 @@ fn render_pipeline_state_handle_borrows_without_a_refcount_bump() {
         pipeline
     ));
 }
+
+/// A second handle stored under a cached key is released, and the first one is kept.
+///
+/// Two threads that miss the same helper-cache key both build an object; the
+/// loser's retain must be dropped rather than leaked with its `u64`.
+#[test]
+fn keep_first_releases_the_losing_handle() {
+    let Some(device) = MTLCreateSystemDefaultDevice() else {
+        eprintln!("MTLCreateSystemDefaultDevice returned nil, skipping");
+        return;
+    };
+    let first = device
+        .newBufferWithLength_options(256, MTLResourceOptions::StorageModeShared)
+        .expect("Metal buffer");
+    let second = device
+        .newBufferWithLength_options(256, MTLResourceOptions::StorageModeShared)
+        .expect("Metal buffer");
+    let first_base = first.retainCount();
+    let second_base = second.retainCount();
+    // SAFETY: `into_raw` hands the cloned retain to the handle.
+    let first_handle =
+        unsafe { MetalHandle::<MTLBufferKind>::new(Retained::into_raw(first.clone()) as u64) };
+    // SAFETY: as above.
+    let second_handle =
+        unsafe { MetalHandle::<MTLBufferKind>::new(Retained::into_raw(second.clone()) as u64) };
+    let mut cache = FxHashMap::default();
+
+    // SAFETY: `first_handle` holds the only copy of its retain.
+    let kept = unsafe { keep_first(&mut cache, 7u8, first_handle) };
+    assert_eq!(kept.raw(), first_handle.raw());
+    // SAFETY: `second_handle` holds the only copy of its retain.
+    let kept = unsafe { keep_first(&mut cache, 7u8, second_handle) };
+    assert_eq!(
+        kept.raw(),
+        first_handle.raw(),
+        "the first stored stays cached"
+    );
+    assert_eq!(
+        second.retainCount(),
+        second_base,
+        "the loser's retain is released"
+    );
+    assert_eq!(
+        first.retainCount(),
+        first_base + 1,
+        "the cached retain stays"
+    );
+
+    // SAFETY: the cache's copy is the only one left and is not used after.
+    unsafe { first_handle.release_retain() };
+    assert_eq!(first.retainCount(), first_base);
+}
