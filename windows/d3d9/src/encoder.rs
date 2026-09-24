@@ -10509,9 +10509,7 @@ fn pass_to_descriptor(
         leading_blits_count: u32::try_from(leading.len())
             .expect("per-pass leading blit count fits u32"),
         pass_flags: PassDescriptor::pack_flags(
-            leading
-                .iter()
-                .any(|blit| blit.cmd != BlitCommandType::NotifyBufferDidModifyRange as u32),
+            leading.iter().any(BlitCommand::needs_blit_encoder),
             p.color_slice(),
             p.color_level(),
             p.depth_level(),
@@ -10602,9 +10600,7 @@ fn trailing_blit_descriptor(trailing_blits: &[BlitCommand]) -> PassDescriptor {
         leading_blits_count: u32::try_from(trailing_blits.len())
             .expect("trailing blit count fits u32"),
         pass_flags: PassDescriptor::pack_flags(
-            trailing_blits
-                .iter()
-                .any(|blit| blit.cmd != BlitCommandType::NotifyBufferDidModifyRange as u32),
+            trailing_blits.iter().any(BlitCommand::needs_blit_encoder),
             0,
             0,
             0,

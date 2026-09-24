@@ -365,3 +365,16 @@ fn triangle_fill_mode_round_trips_through_the_wire_command() {
         assert!(!command.is_draw());
     }
 }
+
+/// Only commands encoded on the list's own blit encoder ask the unix side to open one.
+#[test]
+fn notifies_and_depth_transfers_need_no_blit_encoder() {
+    let notify = BlitCommand::notify_buffer_did_modify_range(1, 0, 4);
+    assert!(!notify.needs_blit_encoder());
+    let mut transfer = BlitCommand::copy_texture_to_texture_full_mip(1, 2, 0, 4, 4);
+    assert!(transfer.needs_blit_encoder());
+    transfer.cmd = BlitCommandType::TransferDepth as u32;
+    assert!(!transfer.needs_blit_encoder());
+    transfer.cmd = 0xff;
+    assert!(transfer.needs_blit_encoder(), "an unknown command keeps the encoder");
+}

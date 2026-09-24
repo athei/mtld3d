@@ -2067,11 +2067,63 @@ fn copy_texture_to_buffer_reject(
     None
 }
 
-/// Replay the frame's leading blit commands inside a single `MTLBlitCommandEncoder`.
+/// The blit encoder of one leading-blit list, opened at its first encoder-bound command.
 ///
-/// Runs before any render pass. Preserves ordering between
+/// A list of notifies and depth transfers never opens one: a notify is a call
+/// on the buffer and a transfer opens the encoders it needs, so an encoder
+/// opened ahead of either would be ended empty. A transfer ends an open
+/// encoder, and the next encoder-bound command after it opens a new one.
+struct LazyBlitEncoder<'a> {
+    cmd_buf: &'a ProtocolObject<dyn MTLCommandBuffer>,
+    site: BlitSite,
+    /// What the PE side's flag says: whether the list holds an encoder-bound command.
+    expected: bool,
+    encoder: Option<Retained<ProtocolObject<dyn MTLBlitCommandEncoder>>>,
+}
+
+impl LazyBlitEncoder<'_> {
+    /// The open encoder, opened now if this is the list's first encoder-bound command.
+    ///
+    /// `None`, logged, when Metal returns no encoder or the PE side flagged
+    /// the list as needing none; either fails the submission.
+    fn get(&mut self, count: usize) -> Option<&ProtocolObject<dyn MTLBlitCommandEncoder>> {
+        if self.encoder.is_none() {
+            if !self.expected {
+                error!(
+                    target: LOG_TARGET,
+                    "encode_leading_blits: encoder-bound blit in a list flagged as needing no encoder (count={count})",
+                );
+                return None;
+            }
+            let Some(encoder) = self.cmd_buf.blitCommandEncoder() else {
+                error!(
+                    target: LOG_TARGET,
+                    "encode_leading_blits: blitCommandEncoder() returned nil (count={count})",
+                );
+                return None;
+            };
+            let label =
+                objc2_foundation::NSString::from_str(&format!("mtld3d-leading-blits-{}", self.site));
+            encoder.setLabel(Some(&label));
+            self.encoder = Some(encoder);
+        }
+        self.encoder.as_deref()
+    }
+
+    /// End the open encoder, if any.
+    fn end(&mut self) {
+        if let Some(encoder) = self.encoder.take() {
+            mtld3d_shared::crumb!("blit:endenc");
+            encoder.endEncoding();
+        }
+    }
+}
+
+/// Replay a list of leading blit commands, in order, on the encoders they need.
+///
+/// Runs before the pass it leads. Preserves ordering between
 /// `CopyTextureToTexture` (preserve) and `CopyBufferToTexture` (sub-rect
-/// upload) the PE side emits — preserve blits targeting a given texture
+/// upload) the PE side emits: preserve blits targeting a given texture
 /// must precede any sub-rect upload blits targeting that same texture.
 fn encode_leading_blits(
     cmd_buf: &ProtocolObject<dyn MTLCommandBuffer>,
@@ -2082,48 +2134,20 @@ fn encode_leading_blits(
     let to_usize =
         |v: u64| usize::try_from(v).expect("PE wire u64 fits unix host usize (unix is 64-bit)");
     mtld3d_shared::crumb!("blit:enter", blits.len() as u64, u64::from(needs_encoder),);
-    // `needs_encoder` is set on the PE side whenever an encoder-bound
-    // command (CopyBuffer/Texture variants) was emitted. Without it
-    // we'd have to scan the blit list to know whether to create the
-    // blit encoder; the PE side already knows, so just trust the flag.
-    // Pure-notify frames skip encoder creation entirely.
-    let mut blit = if needs_encoder {
-        if let Some(b) = cmd_buf.blitCommandEncoder() {
-            let label =
-                objc2_foundation::NSString::from_str(&format!("mtld3d-leading-blits-{site}"));
-            b.setLabel(Some(&label));
-            Some(b)
-        } else {
-            error!(
-                target: LOG_TARGET,
-                "encode_leading_blits: blitCommandEncoder() returned nil (count={})",
-                blits.len(),
-            );
-            return false;
-        }
-    } else {
-        None
+    let mut lazy = LazyBlitEncoder {
+        cmd_buf,
+        site,
+        expected: needs_encoder,
+        encoder: None,
     };
 
     for (i, cmd) in blits.iter().enumerate() {
         mtld3d_shared::crumb!("blit:cmd", u64::from(cmd.cmd), i as u64);
         match BlitCommandType::from_repr(cmd.cmd) {
             Some(BlitCommandType::TransferDepth) => {
-                if let Some(encoder) = blit.take() {
-                    encoder.endEncoding();
-                }
+                lazy.end();
                 if !super::depth_transfer::encode(cmd_buf, cmd) {
                     return false;
-                }
-                if i + 1 < blits.len() {
-                    let Some(encoder) = cmd_buf.blitCommandEncoder() else {
-                        error!(target: LOG_TARGET, "depth transfer: following blit encoder failed");
-                        return false;
-                    };
-                    encoder.setLabel(Some(&objc2_foundation::NSString::from_str(
-                        "mtld3d-depth-transfer-following-blits",
-                    )));
-                    blit = Some(encoder);
                 }
             }
             Some(BlitCommandType::NotifyBufferDidModifyRange) => {
@@ -2161,7 +2185,9 @@ fn encode_leading_blits(
                 | BlitCommandType::CopyBufferToDepth
                 | BlitCommandType::CopyBufferToStencil),
             ) => {
-                let blit = blit.as_ref().expect("non-notify command requires encoder");
+                let Some(blit) = lazy.get(blits.len()) else {
+                    return false;
+                };
                 // SAFETY: cmd.src_handle is a previously-retained MTLBuffer address.
                 let src_buffer_handle =
                     unsafe { MetalHandle::<MTLBufferKind>::new(cmd.src_handle) };
@@ -2308,7 +2334,9 @@ fn encode_leading_blits(
                 }
             }
             Some(BlitCommandType::CopyTextureToTexture) => {
-                let blit = blit.as_ref().expect("non-notify command requires encoder");
+                let Some(blit) = lazy.get(blits.len()) else {
+                    return false;
+                };
                 // SAFETY: cmd.src_handle is a previously-retained MTLTexture address.
                 let src_texture_handle =
                     unsafe { MetalHandle::<MTLTextureKind>::new(cmd.src_handle) };
@@ -2433,7 +2461,9 @@ fn encode_leading_blits(
                 }
             }
             Some(BlitCommandType::CopyBufferToBuffer) => {
-                let blit = blit.as_ref().expect("non-notify command requires encoder");
+                let Some(blit) = lazy.get(blits.len()) else {
+                    return false;
+                };
                 // SAFETY: cmd.src_handle is a previously-retained MTLBuffer address.
                 let src_buffer_handle =
                     unsafe { MetalHandle::<MTLBufferKind>::new(cmd.src_handle) };
@@ -2471,7 +2501,9 @@ fn encode_leading_blits(
                 }
             }
             Some(BlitCommandType::GenerateMipmaps) => {
-                let blit = blit.as_ref().expect("non-notify command requires encoder");
+                let Some(blit) = lazy.get(blits.len()) else {
+                    return false;
+                };
                 // SAFETY: cmd.dst_handle is a previously-retained MTLTexture address.
                 let dst_texture_handle =
                     unsafe { MetalHandle::<MTLTextureKind>::new(cmd.dst_handle) };
@@ -2506,10 +2538,7 @@ fn encode_leading_blits(
         }
     }
 
-    if let Some(blit) = blit {
-        mtld3d_shared::crumb!("blit:endenc");
-        blit.endEncoding();
-    }
+    lazy.end();
     true
 }
 
