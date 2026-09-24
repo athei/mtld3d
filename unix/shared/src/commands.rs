@@ -740,17 +740,6 @@ pub struct CopyBufferToTextureInfo {
 }
 
 impl BlitCommand {
-    /// Whether the command is encoded on its list's shared `MTLBlitCommandEncoder`.
-    ///
-    /// A notify is a call on the buffer itself and a depth transfer opens the
-    /// encoders it needs, so neither needs the list's blit encoder; an
-    /// unknown command counts as needing it.
-    #[must_use]
-    pub const fn needs_blit_encoder(&self) -> bool {
-        self.cmd != BlitCommandType::NotifyBufferDidModifyRange as u32
-            && self.cmd != BlitCommandType::TransferDepth as u32
-    }
-
     /// `blit.copyFromBuffer(...).toTexture(...)` with `size.depth = info.depth`.
     ///
     /// Full form: `blit.copyFromBuffer(buffer, offset, bytesPerRow,
