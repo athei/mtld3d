@@ -99,20 +99,28 @@ impl RenderScale {
         self.factor().log2()
     }
 
-    /// Convert one logical dimension to its render-resolution counterpart.
+    /// Convert one logical dimension, or one rect edge, to render resolution.
+    ///
+    /// Rounds to nearest. This is the one rule every conversion here goes
+    /// through: a texture is created at `dimension` of its logical extent and
+    /// [`Self::rect`] scales each rect edge with it, so a rect that ends at the
+    /// logical extent ends exactly at the texture's, and a shared edge maps to
+    /// one value from both rects that meet on it.
     ///
     /// Never returns zero for a non-zero input: a back buffer dimension of `0`
     /// is rejected long before this, but a small render target scaled down
-    /// hard could otherwise round to nothing and fail texture creation.
+    /// hard could otherwise round to nothing and fail texture creation. With the
+    /// floor the mapping is still non-decreasing, so a converted rect never
+    /// inverts.
     #[must_use]
     pub fn dimension(self, logical: u32) -> u32 {
         if self.is_identity() || logical == 0 {
             return logical;
         }
-        let scaled = (u64::from(logical) * u64::from(self.0)).div_ceil(100);
-        // `logical` is a texture dimension and the scale is at most 100%, so
-        // the product cannot approach `u32::MAX`; saturate rather than cast so
-        // the conversion stays total either way.
+        let scaled = (u64::from(logical) * u64::from(self.0) + 50) / 100;
+        // `logical` is a texture dimension or a rect edge and the scale is at
+        // most 100%, so the product cannot approach `u32::MAX`; saturate
+        // rather than cast so the conversion stays total either way.
         u32::try_from(scaled).unwrap_or(u32::MAX).max(1)
     }
 
@@ -127,8 +135,8 @@ impl RenderScale {
         if self.is_identity() {
             return (x, y, width, height);
         }
-        let (x1, x2) = (self.edge(x), self.edge(x.saturating_add(width)));
-        let (y1, y2) = (self.edge(y), self.edge(y.saturating_add(height)));
+        let (x1, x2) = (self.dimension(x), self.dimension(x.saturating_add(width)));
+        let (y1, y2) = (self.dimension(y), self.dimension(y.saturating_add(height)));
         (x1, y1, x2 - x1, y2 - y1)
     }
 
@@ -148,19 +156,10 @@ impl RenderScale {
             return r;
         }
         let e = |v: i32| {
-            let scaled = self.edge(v.max(0).cast_unsigned());
+            let scaled = self.dimension(v.max(0).cast_unsigned());
             i32::try_from(scaled).unwrap_or(i32::MAX)
         };
         (e(r.0), e(r.1), e(r.2), e(r.3))
-    }
-
-    /// Scale a single rect edge, rounding to nearest.
-    ///
-    /// Rounding to nearest (rather than the `dimension` ceiling) is what makes
-    /// adjacent rects tile: a shared edge maps to one value from both sides.
-    fn edge(self, v: u32) -> u32 {
-        let scaled = (u64::from(v) * u64::from(self.0) + 50) / 100;
-        u32::try_from(scaled).unwrap_or(u32::MAX)
     }
 }
 

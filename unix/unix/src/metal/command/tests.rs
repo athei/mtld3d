@@ -185,7 +185,7 @@ fn single_axis_enlargement_routes_to_metalfx() {
 /// workspace and is not a dependency here.
 #[test]
 fn every_render_scale_setting_routes_to_metalfx() {
-    let dimension = |logical: usize, percent: usize| (logical * percent).div_ceil(100).max(1);
+    let dimension = |logical: usize, percent: usize| ((logical * percent + 50) / 100).max(1);
     for percent in 1..100 {
         let src = (dimension(2560, percent), dimension(1600, percent));
         assert_eq!(

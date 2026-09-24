@@ -614,8 +614,9 @@ fn logical_samples_scales_by_the_area_ratio_rounding_to_nearest() {
     assert_eq!(logical_samples(76_800, 320 * 240, 640 * 480), 307_200);
     // At 75% a 480x360 grid; 172_800 * 16 / 9.
     assert_eq!(logical_samples(172_800, 480 * 360, 640 * 480), 307_200);
-    // A dimension the scale does not divide rounds up on the render grid:
-    // 3456x2234 at 75% is 2592x1676, and a full-frame count is exact only
+    // A dimension the scale does not divide rounds to a whole texel on the
+    // render grid: 3456x2234 at 75% is 2592x1676 (1675.5 rounds to nearest,
+    // half up), and a full-frame count is exact only
     // through the actual ratio, where the nominal 16/9 would give 7_723_008.
     assert_eq!(
         logical_samples(2592 * 1676, 2592 * 1676, 3456 * 2234),

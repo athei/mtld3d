@@ -693,6 +693,86 @@ fn a_point_keeps_its_reported_diameter_under_the_scale() {
     assert_pixel_eq(h.read_pixel(320, 200), BLACK, "40 px above the square");
 }
 
+/// A reported back-buffer size whose 75% edges carry a fraction below one half.
+///
+/// 803 and 603 scale to 602.25 and 452.25, where a texture extent rounded one
+/// way and a viewport edge rounded the other disagree by a texel, leaving the
+/// last column and row of the rasterized frame outside a full-target viewport.
+const ODD_FRAME: (u32, u32) = (803, 603);
+
+/// A device at [`ODD_FRAME`] rasterizing at 75%, whatever the run's own scale.
+///
+/// Pins the scale rather than inheriting it: at the identity the two roundings
+/// cannot disagree, and this must fail in the ordinary `make test` if it
+/// regresses. The parser keeps the last entry, so this wins over a
+/// `make test SCALE=<n>` run too.
+fn odd_frame_at_three_quarters() -> Harness {
+    let h = Harness::create(&HarnessConfig {
+        width: ODD_FRAME.0,
+        height: ODD_FRAME.1,
+        config_entries: "render.scale=0.75",
+        ..HarnessConfig::default()
+    });
+    assert_eq!(h.dims(), ODD_FRAME, "the device reports the requested size");
+    let vp = h.viewport();
+    assert_eq!(
+        (vp.x, vp.y, vp.width, vp.height),
+        (0, 0, ODD_FRAME.0, ODD_FRAME.1),
+        "the default viewport covers the whole target",
+    );
+    h
+}
+
+/// Probe the last reported column and row, and the middle, for `expected`.
+fn assert_edges_read(h: &Harness, expected: u32, what: &str) {
+    let (width, height) = ODD_FRAME;
+    let (last_x, last_y) = (width - 1, height - 1);
+    assert_pixel_eq(h.read_pixel(width / 2, height / 2), expected, what);
+    assert_pixel_eq(
+        h.read_pixel(last_x, height / 2),
+        expected,
+        &format!("{what}: last column"),
+    );
+    assert_pixel_eq(
+        h.read_pixel(width / 2, last_y),
+        expected,
+        &format!("{what}: last row"),
+    );
+    assert_pixel_eq(
+        h.read_pixel(last_x, last_y),
+        expected,
+        &format!("{what}: last corner"),
+    );
+}
+
+/// A draw under a full-target viewport covers the target's last column and row.
+///
+/// The readback resolves the rasterized frame up to the reported size, so a
+/// render column the draw never reached comes back as the last reported one.
+#[test]
+fn a_full_target_draw_reaches_the_last_column_and_row_of_an_odd_sized_frame() {
+    let h = odd_frame_at_three_quarters();
+    assert_eq!(h.set_render_state(D3DRS_LIGHTING, 0), 0, "lighting off");
+    h.select_diffuse_stage(0);
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE), 0, "SetFVF");
+    h.render_once(RED, |h| {
+        assert_eq!(
+            h.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &covering_quad(0.5)),
+            0,
+            "covering draw",
+        );
+    });
+    assert_edges_read(&h, GREEN, "full-viewport draw");
+}
+
+/// A whole-target `Clear` under a full-target viewport reaches the last column and row.
+#[test]
+fn a_whole_target_clear_reaches_the_last_column_and_row_of_an_odd_sized_frame() {
+    let h = odd_frame_at_three_quarters();
+    h.render_once(BLUE, |_| {});
+    assert_edges_read(&h, BLUE, "whole-target clear");
+}
+
 #[test]
 fn color_fill_of_a_target_at_the_backbuffer_size_uses_reported_coordinates() {
     // A render target created at the reported back-buffer size belongs to the

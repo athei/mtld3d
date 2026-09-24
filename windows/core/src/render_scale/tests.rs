@@ -1,10 +1,11 @@
 //! Unit tests for logical-to-render resolution conversion.
 //!
 //! Pins the properties the call sites depend on: 100% is an exact identity,
-//! `dimension` rounds up so a small target never collapses to zero, and an
-//! out-of-range percentage clamps (rendering above the presented size is not
-//! offered). The rect cases cover edge-based scaling, so abutting rects still
-//! share an edge, and `rect` and `rect_edges_i32` land on the same pixels.
+//! `dimension` never collapses a small target to zero, and an out-of-range
+//! percentage clamps (rendering above the presented size is not offered). The
+//! rect cases cover edge-based scaling, so abutting rects still share an edge,
+//! a rect spanning the logical extent spans the texture that extent creates,
+//! and `rect` and `rect_edges_i32` land on the same pixels.
 //! `factor` carries the same ratio as a float, for lengths the shaders scale.
 
 use super::*;
@@ -52,6 +53,43 @@ fn abutting_rects_stay_abutting() {
     assert_eq!(ax + aw, bx, "tile A must end exactly where B starts");
     assert_eq!(bx + bw, cx, "tile B must end exactly where C starts");
     assert_eq!(cx + cw, s.rect(0, 0, 350, 10).2, "total width preserved");
+}
+
+/// A full-target rect ends exactly where the texture it addresses ends.
+///
+/// A target's Metal texture is `dimension` of its logical extent and a
+/// full-target viewport or `Clear` rect goes through `rect`, so the two must
+/// agree at the far edge or the last texel column or row is never drawn.
+#[test]
+fn a_full_target_rect_spans_the_whole_texture() {
+    for percent in 1..=100 {
+        let s = RenderScale::from_percent(percent);
+        for n in 0..=4096 {
+            let d = s.dimension(n);
+            assert_eq!(s.rect(0, 0, n, n), (0, 0, d, d), "{percent}% of {n}");
+            let (d, n) = (d.cast_signed(), n.cast_signed());
+            assert_eq!(
+                s.rect_edges_i32((0, 0, n, n)),
+                (0, 0, d, d),
+                "{percent}% of {n}, signed"
+            );
+        }
+    }
+}
+
+/// Two rects split at any column tile the whole target with no gap or overlap.
+#[test]
+fn a_split_at_any_edge_tiles_the_whole_texture() {
+    const EXTENT: u32 = 803;
+    for percent in [1, 33, 50, 67, 75, 99] {
+        let s = RenderScale::from_percent(percent);
+        for split in 0..=EXTENT {
+            let (ax, _, aw, _) = s.rect(0, 0, split, 1);
+            let (bx, _, bw, _) = s.rect(split, 0, EXTENT - split, 1);
+            assert_eq!(ax + aw, bx, "{percent}%: split at {split} seams");
+            assert_eq!(bx + bw, s.dimension(EXTENT), "{percent}%: split at {split}");
+        }
+    }
 }
 
 #[test]
