@@ -35,6 +35,7 @@ use mtld3d_types::{
 
 use crate::{
     LOG_TARGET,
+    caps::unimplemented_texture_op,
     convert::FfVsLayout,
     dxso::{
         FfPsKey, FfStage, FfStageFlags, FfStageResult, FfVsFlags, FfVsKey, VariantFlags, VariantKey,
@@ -233,6 +234,13 @@ pub struct FfState {
     /// for that pair. `TEXTURE_STAGE_STATE_COUNT == 33`, so a single
     /// `u64` per stage covers every legal `ty` index with bits to spare.
     tss_warn_fired: [u64; 8],
+    /// Once-warn latch for a `D3DTOP_*` operation the fixed-function emitter lacks.
+    ///
+    /// Bit `op` is `D3DTSS_COLOROP` and bit `32 + op` is `D3DTSS_ALPHAOP`, so
+    /// each unimplemented operation warns once per slot whichever stage names
+    /// it. Every such operation is at most `D3DTOP_LERP` (26), so both halves
+    /// fit one `u64`.
+    texture_op_warn_fired: u64,
     /// Per-section dirty bits for the FF VS const buffer.
     ///
     /// Set by setters (and by `SetRenderState` for the RS-driven sections)
@@ -280,6 +288,7 @@ impl FfState {
             ],
             tt_active_mask: 0,
             tss_warn_fired: [0; 8],
+            texture_op_warn_fired: 0,
             // Cold-start: encoder mirror is zero-init, so every section
             // must be uploaded before the first FF draw reads.
             ff_vs_dirty: FfVsDirty::all(),
@@ -790,6 +799,17 @@ impl FfState {
         self.tss_warn_fired[stage] |= 1u64 << ty;
     }
 
+    /// Whether the unimplemented-operation warning has fired for `op` on `slot`.
+    ///
+    /// `slot` is `D3DTSS_COLOROP` or `D3DTSS_ALPHAOP`. Stays false for an
+    /// operation the emitter implements, which never warns.
+    const fn texture_op_warn_fired(&self, slot: usize, op: u32) -> bool {
+        match texture_op_warn_bit(slot, op) {
+            Some(bit) => self.texture_op_warn_fired & bit != 0,
+            None => false,
+        }
+    }
+
     /// Returns whether the stored value actually changed.
     ///
     /// Callers gate snapshot dirty-marking on this: a same-value write (very
@@ -797,6 +817,9 @@ impl FfState {
     /// byte-identical.
     pub fn set_texture_stage_state(&mut self, stage: usize, ty: usize, value: u32) -> bool {
         self.warn_tss_non_default_once(stage, ty, value);
+        if ty == D3DTSS_COLOROP as usize || ty == D3DTSS_ALPHAOP as usize {
+            self.warn_unimplemented_texture_op_once(stage, ty, value);
+        }
         let changed = self.texture_stage_states[stage][ty] != value;
         self.texture_stage_states[stage][ty] = value;
         if ty == D3DTSS_TEXTURETRANSFORMFLAGS as usize && stage < 8 {
@@ -817,6 +840,36 @@ impl FfState {
             }
         }
         changed
+    }
+
+    /// Warn once per slot when a stage names a `D3DTOP_*` operation the emitter lacks.
+    ///
+    /// The emitter renders such a stage as `D3DTOP_SELECTARG1`, and it runs
+    /// only for a shader the on-disk cache does not already hold, so its own
+    /// warning is absent from a warm run. This one fires at the write,
+    /// whatever the cache holds. `slot` is `D3DTSS_COLOROP` or
+    /// `D3DTSS_ALPHAOP`. A value outside the `D3DTOP_*` space is left to
+    /// `stage_enum_value`, which reads it as the stage default.
+    fn warn_unimplemented_texture_op_once(&mut self, stage: usize, slot: usize, op: u32) {
+        let Some(name) = unimplemented_texture_op(op) else {
+            return;
+        };
+        let Some(bit) = texture_op_warn_bit(slot, op) else {
+            return;
+        };
+        if self.texture_op_warn_fired(slot, op) {
+            return;
+        }
+        self.texture_op_warn_fired |= bit;
+        let slot_name = if slot == D3DTSS_COLOROP as usize {
+            "D3DTSS_COLOROP"
+        } else {
+            "D3DTSS_ALPHAOP"
+        };
+        log::warn!(
+            target: LOG_TARGET,
+            "D3DTOP_{name} ({op}) set on {slot_name} (stage {stage}) is not implemented; the stage renders as SELECTARG1"
+        );
     }
 
     fn warn_tss_non_default_once(&mut self, stage: usize, ty: usize, value: u32) {
@@ -2284,6 +2337,24 @@ const fn tss_classify(ty: u32) -> TssClass {
         // Nothing consumes.
         _ => TssClass::NotImplemented,
     }
+}
+
+/// The `FfState::texture_op_warn_fired` bit for `op` written to `slot`.
+///
+/// `None` unless `op` is below 32 and `slot` is `D3DTSS_COLOROP` or
+/// `D3DTSS_ALPHAOP`; every `D3DTOP_*` value is.
+const fn texture_op_warn_bit(slot: usize, op: u32) -> Option<u64> {
+    if op >= 32 {
+        return None;
+    }
+    let base = if slot == D3DTSS_COLOROP as usize {
+        0
+    } else if slot == D3DTSS_ALPHAOP as usize {
+        32
+    } else {
+        return None;
+    };
+    Some(1u64 << (base + op))
 }
 
 #[cfg(test)]

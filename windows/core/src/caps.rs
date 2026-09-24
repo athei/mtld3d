@@ -310,6 +310,9 @@ const ADDRESS_DEFAULT: AddressCaps = AddressCaps::WRAP
 const STENCIL_DEFAULT: StencilCaps = StencilCaps::all();
 
 /// Fixed-function texture blend operations the FF pixel-shader emitter implements.
+///
+/// `unimplemented_texture_op` answers from this set, so a stage-state write
+/// naming an operation outside it warns whatever the shader cache holds.
 const TEXOP_DEFAULT: TexOpCaps = TexOpCaps::DISABLE
     .union(TexOpCaps::SELECTARG1)
     .union(TexOpCaps::SELECTARG2)
@@ -421,6 +424,26 @@ pub fn fill(caps: &mut D3DCAPS9, caps_all: bool, sampler_border: bool) {
             "debug.capsAll=true: advertising spec-max caps for bring-up diagnostic — visual rendering may degrade"
         );
     }
+}
+
+/// The `TexOpCaps` name of a `D3DTOP_*` operation the fixed-function emitter lacks.
+///
+/// `None` for an operation in `TEXOP_DEFAULT` and for a value outside the
+/// `D3DTOP_*` space. The emitter renders a stage naming one of these as
+/// `D3DTOP_SELECTARG1`, and the unit tests check `TEXOP_DEFAULT` against its
+/// output for every operation value, so the caps, this answer and the emitter
+/// agree.
+#[must_use]
+pub fn unimplemented_texture_op(op: u32) -> Option<&'static str> {
+    // `D3DTOP_*` value `n` is `TexOpCaps` bit `n - 1`.
+    let bit = op
+        .checked_sub(1)
+        .and_then(|shift| 1u32.checked_shl(shift))
+        .and_then(TexOpCaps::from_bits)?;
+    if TEXOP_DEFAULT.contains(bit) {
+        return None;
+    }
+    bit.iter_names().next().map(|(name, _)| name)
 }
 
 const fn fill_default(caps: &mut D3DCAPS9) {
