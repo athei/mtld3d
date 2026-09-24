@@ -2229,7 +2229,10 @@ enum TssClass {
 
 const fn tss_classify(ty: u32) -> TssClass {
     match ty {
-        // Consumed by mtld3d (FF VS + PS keys).
+        // Consumed by mtld3d. The first ten feed the FF VS + PS keys; the
+        // bump-environment matrix and luminance slots feed the SM1
+        // `texbem`/`texbeml`/`bem` PS uniform (`build_bump_env_bytes`), not
+        // the FF keys.
         D3DTSS_COLOROP
         | D3DTSS_COLORARG1
         | D3DTSS_COLORARG2
@@ -2239,9 +2242,15 @@ const fn tss_classify(ty: u32) -> TssClass {
         | D3DTSS_CONSTANT
         | D3DTSS_TEXCOORDINDEX
         | D3DTSS_TEXTURETRANSFORMFLAGS
-        | D3DTSS_RESULTARG => TssClass::Consumed,
+        | D3DTSS_RESULTARG
+        | D3DTSS_BUMPENVMAT00
+        | D3DTSS_BUMPENVMAT01
+        | D3DTSS_BUMPENVMAT10
+        | D3DTSS_BUMPENVMAT11
+        | D3DTSS_BUMPENVLSCALE
+        | D3DTSS_BUMPENVLOFFSET => TssClass::Consumed,
 
-        // Neither consumes.
+        // Nothing consumes.
         _ => TssClass::NotImplemented,
     }
 }

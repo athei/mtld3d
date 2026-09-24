@@ -4,13 +4,17 @@
 //! restore must rebuild), the FF shader keys derived from render state (fog source, local
 //! viewer, texcoord routing past a disabled color op, vertex blend), sparse lights compacting
 //! into dense eye-space shader slots, the const-row extent checked against the `vs_c` rows the
-//! emitter reads, and `inverse` round-tripping affine matrices while rejecting singular ones.
+//! emitter reads, `inverse` round-tripping affine matrices while rejecting singular ones, and
+//! the texture-stage-state warn latch firing per stage for unconsumed slots and never for the
+//! bump-environment slots.
 
 use mtld3d_types::{
     D3DFOG_EXP, D3DFOG_LINEAR, D3DMATRIX, D3DRS_DEPTHBIAS, D3DRS_FOGCOLOR, D3DRS_FOGDENSITY,
     D3DRS_FOGENABLE, D3DRS_FOGEND, D3DRS_FOGSTART, D3DRS_FOGTABLEMODE, D3DRS_FOGVERTEXMODE,
-    D3DRS_TEXTUREFACTOR, D3DTOP_MODULATE, D3DTSS_BUMPENVMAT00, D3DTSS_COLOROP,
-    D3DTSS_TEXCOORDINDEX, D3DTSS_TEXTURETRANSFORMFLAGS, RENDER_STATE_COUNT, render_state_defaults,
+    D3DRS_TEXTUREFACTOR, D3DTA_TEXTURE, D3DTOP_MODULATE, D3DTSS_BUMPENVLOFFSET,
+    D3DTSS_BUMPENVLSCALE, D3DTSS_BUMPENVMAT00, D3DTSS_BUMPENVMAT01, D3DTSS_BUMPENVMAT10,
+    D3DTSS_BUMPENVMAT11, D3DTSS_COLORARG0, D3DTSS_COLOROP, D3DTSS_TEXCOORDINDEX,
+    D3DTSS_TEXTURETRANSFORMFLAGS, RENDER_STATE_COUNT, render_state_defaults,
 };
 
 use super::{FfState, FfVsLayout, VariantFlags, VariantKey, build_fog_color_bytes};
@@ -350,16 +354,42 @@ fn fog_color_bytes_two_rows_when_fog_on() {
 
 #[test]
 fn tss_warn_latch_is_per_stage() {
-    // BUMPENVMAT00 is NotImplemented (not in the Consumed list), so a
+    // COLORARG0 is NotImplemented (not in the Consumed list), so a
     // non-default write fires warn_tss_non_default_once. Default for
-    // BUMPENVMAT00 is 0; write 1 to stages 0 and 1. A latch keyed only
-    // on `ty` would set tss_warn_fired[ty] on stage 0 and silently
-    // swallow stage 1 — the per-stage latch must fire for both.
+    // COLORARG0 is D3DTA_CURRENT; write D3DTA_TEXTURE to stages 0 and 1.
+    // A latch keyed only on `ty` would set tss_warn_fired[ty] on stage 0
+    // and silently swallow stage 1, so the per-stage latch must fire for
+    // both.
     let mut state = FfState::new();
-    state.set_texture_stage_state(0, D3DTSS_BUMPENVMAT00 as usize, 1);
-    state.set_texture_stage_state(1, D3DTSS_BUMPENVMAT00 as usize, 1);
-    assert!(state.tss_warn_fired(0, D3DTSS_BUMPENVMAT00 as usize));
-    assert!(state.tss_warn_fired(1, D3DTSS_BUMPENVMAT00 as usize));
+    state.set_texture_stage_state(0, D3DTSS_COLORARG0 as usize, D3DTA_TEXTURE);
+    state.set_texture_stage_state(1, D3DTSS_COLORARG0 as usize, D3DTA_TEXTURE);
+    assert!(state.tss_warn_fired(0, D3DTSS_COLORARG0 as usize));
+    assert!(state.tss_warn_fired(1, D3DTSS_COLORARG0 as usize));
+}
+
+#[test]
+fn bump_env_tss_writes_do_not_warn() {
+    // The bump-environment matrix and luminance slots feed the texbem PS
+    // uniform, so a non-default write is consumed and must not fire the
+    // "written but not consumed" latch on any stage.
+    let slots = [
+        D3DTSS_BUMPENVMAT00,
+        D3DTSS_BUMPENVMAT01,
+        D3DTSS_BUMPENVMAT10,
+        D3DTSS_BUMPENVMAT11,
+        D3DTSS_BUMPENVLSCALE,
+        D3DTSS_BUMPENVLOFFSET,
+    ];
+    let mut state = FfState::new();
+    for stage in 0..8 {
+        for ty in slots {
+            state.set_texture_stage_state(stage, ty as usize, 1.0f32.to_bits());
+            assert!(
+                !state.tss_warn_fired(stage, ty as usize),
+                "D3DTSS_{ty} (stage {stage}) fired the not-consumed warn"
+            );
+        }
+    }
 }
 
 #[test]
