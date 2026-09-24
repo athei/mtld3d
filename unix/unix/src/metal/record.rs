@@ -26,6 +26,7 @@ use mtld3d_shared::{
 
 use super::{
     command::PendingCmdBufs,
+    depth_transfer::PlanePool,
     handle::ReleaseRetain,
     presenter::{PresentState, Presented},
     transient::UploadRing,
@@ -50,6 +51,8 @@ pub struct DeviceRecord {
     /// Only a submission touches it, and submissions of one device never run
     /// concurrently, so the lock is never contended.
     upload_ring: Mutex<UploadRing>,
+    /// The private planes depth transfers stage through, locked like the ring.
+    depth_planes: Mutex<PlanePool>,
 }
 
 impl Drop for DeviceRecord {
@@ -72,6 +75,7 @@ impl DeviceRecord {
             upscale: UpscaleCache::new(),
             pending: PendingCmdBufs::new(),
             upload_ring: Mutex::new(UploadRing::default()),
+            depth_planes: Mutex::new(PlanePool::default()),
         })
     }
 
@@ -103,6 +107,13 @@ impl DeviceRecord {
     /// The device's upload ring, for the length of one submission.
     pub fn upload_ring(&self) -> MutexGuard<'_, UploadRing> {
         self.upload_ring
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The device's depth-transfer planes, for the length of one submission.
+    pub fn depth_planes(&self) -> MutexGuard<'_, PlanePool> {
+        self.depth_planes
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
     }

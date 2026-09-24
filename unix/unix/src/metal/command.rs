@@ -40,6 +40,7 @@ use crate::{
         handle::{BorrowRetained, IntoRetained},
         macdrv::attachment,
         null_texture,
+        depth_transfer::PlanePool,
         record::DeviceRecord,
         texture::mtl_pixel_format,
         transient::{SubmitStamp, UploadRing},
@@ -377,6 +378,7 @@ struct EncodeContext<'a> {
     device: &'a ProtocolObject<dyn MTLDevice>,
     stamp: SubmitStamp,
     ring: &'a mut UploadRing,
+    planes: &'a mut PlanePool,
 }
 
 /// Processes a frame into its command buffers and commits them.
@@ -502,19 +504,22 @@ fn encode_frame(record: &Arc<DeviceRecord>, params: &mut SubmitFrameParams) -> b
     // A submission whose buffers can never be seen to retire uses a ring of
     // its own, dropped with this frame; the command buffers keep what they
     // reference alive until they complete.
-    let mut shared_ring;
-    let mut own_ring;
-    let ring: &mut UploadRing = if stamp.persistent() {
+    let (mut shared_ring, mut shared_planes);
+    let (mut own_ring, mut own_planes);
+    let (ring, planes): (&mut UploadRing, &mut PlanePool) = if stamp.persistent() {
         shared_ring = record.upload_ring();
-        &mut shared_ring
+        shared_planes = record.depth_planes();
+        (&mut shared_ring, &mut shared_planes)
     } else {
         own_ring = UploadRing::default();
-        &mut own_ring
+        own_planes = PlanePool::default();
+        (&mut own_ring, &mut own_planes)
     };
     let mut ctx = EncodeContext {
         device: &device,
         stamp: stamp.upload(),
         ring,
+        planes,
     };
     let mut upload_cb = None;
     let draw_pass_start = if params.upload_coherent_seq_ptr != 0 {
@@ -533,12 +538,14 @@ fn encode_frame(record: &Arc<DeviceRecord>, params: &mut SubmitFrameParams) -> b
         }
         upload_pass_count
     } else {
+        ctx.stamp = SubmitStamp::new(params);
         if !blits.is_empty()
             && !encode_leading_blits(
                 &cmd_buf,
                 blits,
                 params.blit_commands_need_encoder != 0,
                 BlitSite::FrameLeading,
+                &mut ctx,
             )
         {
             return false;
@@ -552,6 +559,7 @@ fn encode_frame(record: &Arc<DeviceRecord>, params: &mut SubmitFrameParams) -> b
         }
     }
     ctx.ring.end_submission(&ctx.stamp);
+    ctx.planes.end_submission(&ctx.stamp);
 
     // Presentation: what the presenter needs once this frame's render work
     // has committed. The layer and the back buffer are retained here from the
@@ -961,6 +969,7 @@ fn encode_upload_cmd_buf(
             blits,
             params.blit_commands_need_encoder != 0,
             BlitSite::FrameLeading,
+            ctx,
         )
     {
         return None;
@@ -2130,6 +2139,7 @@ fn encode_leading_blits(
     blits: &[BlitCommand],
     needs_encoder: bool,
     site: BlitSite,
+    ctx: &mut EncodeContext<'_>,
 ) -> bool {
     let to_usize =
         |v: u64| usize::try_from(v).expect("PE wire u64 fits unix host usize (unix is 64-bit)");
@@ -2146,7 +2156,7 @@ fn encode_leading_blits(
         match BlitCommandType::from_repr(cmd.cmd) {
             Some(BlitCommandType::TransferDepth) => {
                 lazy.end();
-                if !super::depth_transfer::encode(cmd_buf, cmd) {
+                if !super::depth_transfer::encode(cmd_buf, cmd, ctx.planes, &ctx.stamp) {
                     return false;
                 }
             }
@@ -2570,6 +2580,7 @@ fn encode_pass(
             blits,
             pass.leading_blits_need_encoder(),
             BlitSite::Pass(pass_idx),
+            ctx,
         ) {
             return false;
         }

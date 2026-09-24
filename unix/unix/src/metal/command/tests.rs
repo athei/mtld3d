@@ -47,7 +47,10 @@ use objc2_metal::{
     MTLTextureDescriptor, MTLTextureUsage,
 };
 
-use crate::metal::transient::{SubmitStamp, UploadRing};
+use crate::metal::{
+    depth_transfer::PlanePool,
+    transient::{SubmitStamp, UploadRing},
+};
 
 use super::{
     CopyBufferEndpoint, CopyEndpoint, CopyRegion, CopyRejectReason, DeviceRecord, EncodeContext,
@@ -854,10 +857,12 @@ fn encode_test_upload(
 ) -> Option<Retained<ProtocolObject<dyn MTLCommandBuffer>>> {
     let device = queue.device();
     let mut ring = UploadRing::default();
+    let mut planes = PlanePool::default();
     let mut ctx = EncodeContext {
         device: &device,
         stamp: SubmitStamp::new(params).upload(),
         ring: &mut ring,
+        planes: &mut planes,
     };
     encode_upload_cmd_buf(record, queue, &[], passes, params, &mut ctx)
 }
@@ -1394,11 +1399,24 @@ fn depth_plane_failure_aborts_the_pair_and_retry_retains_sources() {
         let cb = queue.commandBuffer().expect("upload command buffer");
         cb.setLabel(Some(&NSString::from_str("mtld3d-test-depth-pair-upload")));
         cb.encodeWaitForEvent_value(ProtocolObject::from_ref(&*event), 1);
+        let coherent = AtomicU64::new(0);
+        let upload = AtomicU64::new(0);
+        let failed = AtomicU64::new(0);
+        let params = test_submit_params(&coherent, &upload, &failed);
+        let mut ring = UploadRing::default();
+        let mut planes = PlanePool::default();
+        let mut ctx = EncodeContext {
+            device: &device,
+            stamp: SubmitStamp::new(&params),
+            ring: &mut ring,
+            planes: &mut planes,
+        };
         assert!(super::encode_leading_blits(
             &cb,
             &commands,
             true,
-            super::BlitSite::FrameLeading
+            super::BlitSite::FrameLeading,
+            &mut ctx,
         ));
         drop(depth);
         drop(masks);

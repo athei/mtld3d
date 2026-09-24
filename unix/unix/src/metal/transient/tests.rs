@@ -9,12 +9,7 @@ fn address(counter: &AtomicU64) -> u64 {
 }
 
 fn stamp(seq: u64, draw: &AtomicU64, upload: &AtomicU64) -> SubmitStamp {
-    SubmitStamp {
-        seq,
-        upload: false,
-        draw_counter: address(draw),
-        upload_counter: address(upload),
-    }
+    SubmitStamp::for_counters(seq, draw, upload)
 }
 
 /// Write `len` bytes of `fill` and return the chunk's address and the offset.

@@ -17,8 +17,12 @@ use objc2_metal::{
 use super::{
     command::diagnostics,
     handle::{IntoRetained, ReleaseRetain},
+    transient::{LastUse, SubmitStamp},
 };
 use crate::LOG_TARGET;
+
+/// Retired plane sets a device keeps beside the ones in flight.
+const SPARE_PLANE_SETS: usize = 2;
 
 /// Compile only the concrete source layout requested by the device owner.
 pub fn create_pipeline(
@@ -103,8 +107,14 @@ pub fn destroy_pipeline(handle: u64) {
 ///
 /// Native temporary objects can leave this function after encoding: the command
 /// buffer retains every bound texture, view, buffer and pipeline until completion.
-/// Its creation is centralized in `command::diagnostics::command_buffer`.
-pub fn encode(cb: &ProtocolObject<dyn MTLCommandBuffer>, command: &BlitCommand) -> bool {
+/// Its creation is centralized in `command::diagnostics::command_buffer`. The
+/// private planes come from the device's `planes` pool, stamped with `stamp`.
+pub fn encode(
+    cb: &ProtocolObject<dyn MTLCommandBuffer>,
+    command: &BlitCommand,
+    planes: &mut PlanePool,
+    stamp: &SubmitStamp,
+) -> bool {
     // SAFETY: TransferDepth encodes source and destination canonical texture handles.
     let source_handle = unsafe { MetalHandle::<MTLTextureKind>::new(command.src_handle) };
     // SAFETY: as above; the destination handle is retained by the frame's resource owner.
@@ -149,10 +159,21 @@ pub fn encode(cb: &ProtocolObject<dyn MTLCommandBuffer>, command: &BlitCommand) 
     let stencil = source.pixelFormat() == MTLPixelFormat::Depth32Float_Stencil8
         && destination.pixelFormat() == MTLPixelFormat::Depth32Float_Stencil8;
     let device = source.device();
-    let Some(output) = PlaneBuffers::new(&device, out_width, out_height, stencil) else {
+    let resample = !(source.sampleCount() == 1 && width == out_width && height == out_height);
+    let input_set = if resample && source.sampleCount() == 1 {
+        let Some(set) = planes.acquire(&device, width, height, stencil, stamp, None) else {
+            return false;
+        };
+        Some(set)
+    } else {
+        None
+    };
+    let Some(output_set) = planes.acquire(&device, out_width, out_height, stencil, stamp, input_set)
+    else {
         return false;
     };
-    if source.sampleCount() == 1 && width == out_width && height == out_height {
+    let output = planes.view(output_set, out_width, stencil);
+    if !resample {
         if !extract_planes(cb, &source, source_level, width, height, &output) {
             return false;
         }
@@ -164,10 +185,8 @@ pub fn encode(cb: &ProtocolObject<dyn MTLCommandBuffer>, command: &BlitCommand) 
             log::error!(target: LOG_TARGET, "depth transfer: missing resample pipeline");
             return false;
         };
-        let input = if source.sampleCount() == 1 {
-            let Some(input) = PlaneBuffers::new(&device, width, height, stencil) else {
-                return false;
-            };
+        let input = if let Some(set) = input_set {
+            let input = planes.view(set, width, stencil);
             if !extract_planes(cb, &source, source_level, width, height, &input) {
                 return false;
             }
@@ -204,9 +223,9 @@ pub fn encode(cb: &ProtocolObject<dyn MTLCommandBuffer>, command: &BlitCommand) 
         if let Some(input) = input.as_ref() {
             // SAFETY: the single-sample kernel reads the full extracted depth plane at slot zero.
             unsafe {
-                compute.setBuffer_offset_atIndex(Some(&input.depth), 0, 0);
+                compute.setBuffer_offset_atIndex(Some(input.depth), 0, 0);
             }
-            if let Some(stencil) = input.stencil.as_ref() {
+            if let Some(stencil) = input.stencil {
                 // SAFETY: the stencil kernel reads the full extracted stencil plane at slot one.
                 unsafe {
                     compute.setBuffer_offset_atIndex(Some(stencil), 0, 1);
@@ -227,9 +246,9 @@ pub fn encode(cb: &ProtocolObject<dyn MTLCommandBuffer>, command: &BlitCommand) 
         }
         // SAFETY: the kernel bounds every write against the validated output dimensions.
         unsafe {
-            compute.setBuffer_offset_atIndex(Some(&output.depth), 0, 2);
+            compute.setBuffer_offset_atIndex(Some(output.depth), 0, 2);
         }
-        if let Some(stencil) = output.stencil.as_ref() {
+        if let Some(stencil) = output.stencil {
             // SAFETY: the selected stencil kernel writes this full-sized byte plane.
             unsafe {
                 compute.setBuffer_offset_atIndex(Some(stencil), 0, 3);
@@ -269,10 +288,10 @@ pub fn encode(cb: &ProtocolObject<dyn MTLCommandBuffer>, command: &BlitCommand) 
             &diagnostics::DepthTransferResample {
                 source: sampleable.as_deref(),
                 source_stencil: view.as_deref(),
-                input_depth: input.as_ref().map(|planes| &*planes.depth),
-                input_stencil: input.as_ref().and_then(|planes| planes.stencil.as_deref()),
-                output_depth: &output.depth,
-                output_stencil: output.stencil.as_deref(),
+                input_depth: input.as_ref().map(|planes| planes.depth),
+                input_stencil: input.as_ref().and_then(|planes| planes.stencil),
+                output_depth: output.depth,
+                output_stencil: output.stencil,
                 sizes,
                 grid,
                 threadgroup,
@@ -301,12 +320,12 @@ pub fn encode(cb: &ProtocolObject<dyn MTLCommandBuffer>, command: &BlitCommand) 
     };
     insert_plane(
         &blit,
-        &output.depth,
+        output.depth,
         output.depth_pitch,
         depth_option,
         &region,
     );
-    if let Some(stencil) = output.stencil.as_ref() {
+    if let Some(stencil) = output.stencil {
         insert_plane(
             &blit,
             stencil,
@@ -319,34 +338,108 @@ pub fn encode(cb: &ProtocolObject<dyn MTLCommandBuffer>, command: &BlitCommand) 
     true
 }
 
-struct PlaneBuffers {
-    depth: Retained<ProtocolObject<dyn MTLBuffer>>,
-    stencil: Option<Retained<ProtocolObject<dyn MTLBuffer>>>,
-    depth_pitch: usize,
-    stencil_pitch: usize,
+/// Private depth and stencil planes a device's depth transfers reuse.
+///
+/// A transfer stages its planes in private buffers, about 10 MB at 1920x1080,
+/// which a pool keeps rather than allocating per transfer. A set is written
+/// again only once every submission that used it retired, or when the only
+/// unretired use is the same command buffer, whose encoders Metal's hazard
+/// tracking orders. Sets grow to the largest transfer they served, and at
+/// most `SPARE_PLANE_SETS` retired sets stay beside those in flight.
+#[derive(Default)]
+pub struct PlanePool {
+    sets: Vec<PlaneSet>,
 }
 
-impl PlaneBuffers {
-    fn new(
+impl PlanePool {
+    /// Close a submission: drop retired sets beyond the spares.
+    pub fn end_submission(&mut self, stamp: &SubmitStamp) {
+        let mut kept = 0;
+        self.sets.retain(|set| {
+            if !set.last_use.retired(stamp) {
+                return true;
+            }
+            kept += 1;
+            kept <= SPARE_PLANE_SETS
+        });
+    }
+
+    /// Sets the pool holds.
+    #[cfg(test)]
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.sets.len()
+    }
+
+    /// A set that holds `width` x `height` planes and `stamp` may write, stamped for it.
+    ///
+    /// Allocates a set when none fits. `exclude` is a set the same transfer
+    /// already holds. `None` when Metal refuses the allocation.
+    fn acquire(
+        &mut self,
         device: &ProtocolObject<dyn MTLDevice>,
         width: usize,
         height: usize,
         stencil: bool,
+        stamp: &SubmitStamp,
+        exclude: Option<usize>,
+    ) -> Option<usize> {
+        let (depth_len, stencil_len) = plane_lengths(width, height);
+        let fits = |set: &PlaneSet| {
+            set.depth.length() >= depth_len
+                && (!stencil || set.stencil.as_ref().is_some_and(|s| s.length() >= stencil_len))
+                && set.last_use.writable_by(stamp)
+        };
+        let index = if let Some(index) = (0..self.sets.len())
+            .find(|&index| Some(index) != exclude && fits(&self.sets[index]))
+        {
+            index
+        } else {
+            self.sets.push(PlaneSet::new(device, depth_len, stencil.then_some(stencil_len))?);
+            self.sets.len() - 1
+        };
+        self.sets[index].last_use.record(stamp);
+        Some(index)
+    }
+
+    /// The planes of set `index` laid out for a transfer `width` pixels wide.
+    fn view(&self, index: usize, width: usize, stencil: bool) -> PlaneBuffers<'_> {
+        let set = &self.sets[index];
+        PlaneBuffers {
+            depth: &set.depth,
+            stencil: if stencil { set.stencil.as_deref() } else { None },
+            depth_pitch: depth_pitch(width),
+            stencil_pitch: stencil_pitch(width),
+        }
+    }
+}
+
+/// One pooled pair of private planes and the submissions that use it.
+struct PlaneSet {
+    depth: Retained<ProtocolObject<dyn MTLBuffer>>,
+    stencil: Option<Retained<ProtocolObject<dyn MTLBuffer>>>,
+    last_use: LastUse,
+}
+
+// SAFETY: a set lives on its device's record behind a mutex, so one
+// submitting thread at a time touches it, and retaining or releasing an
+// `MTLBuffer` is thread-safe.
+unsafe impl Send for PlaneSet {}
+
+impl PlaneSet {
+    fn new(
+        device: &ProtocolObject<dyn MTLDevice>,
+        depth_len: usize,
+        stencil_len: Option<usize>,
     ) -> Option<Self> {
-        let depth_pitch = (width * 4).next_multiple_of(256);
-        let stencil_pitch = width.next_multiple_of(256);
-        let depth = device.newBufferWithLength_options(
-            depth_pitch * height,
-            MTLResourceOptions::StorageModePrivate,
-        )?;
+        let depth =
+            device.newBufferWithLength_options(depth_len, MTLResourceOptions::StorageModePrivate)?;
         depth.setLabel(Some(&NSString::from_str(
             "mtld3d-depth-transfer-depth-plane",
         )));
-        let stencil = if stencil {
-            let buffer = device.newBufferWithLength_options(
-                stencil_pitch * height,
-                MTLResourceOptions::StorageModePrivate,
-            )?;
+        let stencil = if let Some(len) = stencil_len {
+            let buffer =
+                device.newBufferWithLength_options(len, MTLResourceOptions::StorageModePrivate)?;
             buffer.setLabel(Some(&NSString::from_str(
                 "mtld3d-depth-transfer-stencil-plane",
             )));
@@ -357,10 +450,32 @@ impl PlaneBuffers {
         Some(Self {
             depth,
             stencil,
-            depth_pitch,
-            stencil_pitch,
+            last_use: LastUse::default(),
         })
     }
+}
+
+/// Row stride of a float depth plane, aligned as a buffer-texture copy wants.
+const fn depth_pitch(width: usize) -> usize {
+    (width * 4).next_multiple_of(256)
+}
+
+/// Row stride of a byte stencil plane.
+const fn stencil_pitch(width: usize) -> usize {
+    width.next_multiple_of(256)
+}
+
+/// Bytes the depth and stencil planes of one `width` x `height` transfer take.
+const fn plane_lengths(width: usize, height: usize) -> (usize, usize) {
+    (depth_pitch(width) * height, stencil_pitch(width) * height)
+}
+
+/// One transfer's view of a plane set.
+struct PlaneBuffers<'a> {
+    depth: &'a ProtocolObject<dyn MTLBuffer>,
+    stencil: Option<&'a ProtocolObject<dyn MTLBuffer>>,
+    depth_pitch: usize,
+    stencil_pitch: usize,
 }
 
 fn extract_planes(
@@ -369,7 +484,7 @@ fn extract_planes(
     level: usize,
     width: usize,
     height: usize,
-    output: &PlaneBuffers,
+    output: &PlaneBuffers<'_>,
 ) -> bool {
     let Some(blit) = cb.blitCommandEncoder() else {
         return false;
@@ -384,9 +499,9 @@ fn extract_planes(
     unsafe {
         blit.copyFromTexture_sourceSlice_sourceLevel_sourceOrigin_sourceSize_toBuffer_destinationOffset_destinationBytesPerRow_destinationBytesPerImage_options(
             source, 0, level, MTLOrigin { x: 0, y: 0, z: 0 }, MTLSize { width, height, depth: 1 },
-            &output.depth, 0, output.depth_pitch, 0, depth_option);
+            output.depth, 0, output.depth_pitch, 0, depth_option);
     }
-    if let Some(stencil) = output.stencil.as_ref() {
+    if let Some(stencil) = output.stencil {
         // SAFETY: both endpoints have stencil; the buffer holds the full byte plane.
         unsafe {
             blit.copyFromTexture_sourceSlice_sourceLevel_sourceOrigin_sourceSize_toBuffer_destinationOffset_destinationBytesPerRow_destinationBytesPerImage_options(
@@ -466,3 +581,6 @@ const fn depth_format(format: MTLPixelFormat) -> bool {
         MTLPixelFormat::Depth32Float | MTLPixelFormat::Depth32Float_Stencil8
     )
 }
+
+#[cfg(test)]
+mod tests;

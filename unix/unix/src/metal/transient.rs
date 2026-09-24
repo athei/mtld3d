@@ -71,6 +71,18 @@ impl SubmitStamp {
         }
     }
 
+    /// A render-buffer stamp for `seq` against two counters the caller owns.
+    #[cfg(test)]
+    #[must_use]
+    pub fn for_counters(seq: u64, draw: &AtomicU64, upload: &AtomicU64) -> Self {
+        Self {
+            seq,
+            upload: false,
+            draw_counter: core::ptr::from_ref(draw) as u64,
+            upload_counter: core::ptr::from_ref(upload) as u64,
+        }
+    }
+
     /// Whether what this submission uses can retire, so the device's pools may keep it.
     #[must_use]
     pub const fn persistent(&self) -> bool {
