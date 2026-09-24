@@ -1887,11 +1887,11 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
     }
 
     // D3DRS_BLENDFACTOR drives Metal's per-encoder constant blend
-    // color. The D3D9 default 0xFFFFFFFF (opaque white) is also Metal's,
-    // and the cache starts each fresh encoder at it, so a pass that never
-    // overrides the factor emits nothing. Every change is emitted,
-    // including back to the default, so a pass that restores white
-    // mid-encoder doesn't keep blending with the previous factor.
+    // color. A fresh encoder blends with zero, not with the D3D9 default
+    // opaque white, and the cache starts each pass at that zero, so the
+    // first draw of a pass emits the factor it blends with. Every change
+    // is emitted, including back to the default, so a pass that restores
+    // white mid-encoder doesn't keep blending with the previous factor.
     if enc
         .last_bound()
         .blend_color_changed(render_state.blend_factor)

@@ -339,6 +339,98 @@ fn blend_factor_restored_to_the_default_mid_pass_takes_effect() {
 }
 
 #[test]
+fn the_default_blend_factor_blends_at_full_weight_on_a_pass_first_draw() {
+    // `D3DRS_BLENDFACTOR` is left at its default opaque white and is the
+    // source factor, with a zero destination factor: the frame's only draw
+    // must come out at full weight. A fresh Metal encoder blends with zero,
+    // so a draw that relies on the encoder's own blend colour draws nothing.
+    let h = Harness::new();
+    arm_diffuse(&h);
+    h.render_once(BLACK, |d| {
+        assert_eq!(d.set_render_state(D3DRS_ALPHABLENDENABLE, 1), 0);
+        assert_eq!(
+            d.set_render_state(D3DRS_SRCBLEND, mtld3d_types::D3DBLEND_BLENDFACTOR),
+            0
+        );
+        assert_eq!(
+            d.set_render_state(D3DRS_DESTBLEND, mtld3d_types::D3DBLEND_ZERO),
+            0
+        );
+        assert_eq!(
+            d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &fill_quad(GREEN)),
+            0
+        );
+    });
+    let got = Rgba8::from_pixel(h.read_pixel(320, 240));
+    assert!(
+        got.r < 20 && got.g > 240,
+        "the default factor blends green at full weight, got {got:?}"
+    );
+}
+
+#[test]
+fn a_render_target_round_trip_leaves_the_next_draw_its_own_fill_mode_and_blend_factor() {
+    // A draw into the back buffer under wireframe fill and a half-weight
+    // blend factor, then another render target bound and the back buffer
+    // bound again with nothing drawn in between, then a solid draw at full
+    // weight over the right half. Both draws bind the same attachments, so
+    // their passes may run as one render pass; the second draw must still
+    // fill solid and blend at full weight rather than inherit the first
+    // draw's fill mode or factor.
+    let h = Harness::new();
+    arm_diffuse(&h);
+    let back = h.render_target(0);
+    let other = h.create_render_target(64, 64, D3DFMT_A8R8G8B8);
+    let mut right_half = fill_quad(GREEN);
+    for v in &mut right_half {
+        v.x = v.x.max(0.0);
+    }
+    h.render_once(BLACK, |d| {
+        assert_eq!(d.set_render_state(D3DRS_ALPHABLENDENABLE, 1), 0);
+        assert_eq!(
+            d.set_render_state(D3DRS_SRCBLEND, mtld3d_types::D3DBLEND_BLENDFACTOR),
+            0
+        );
+        assert_eq!(
+            d.set_render_state(D3DRS_DESTBLEND, mtld3d_types::D3DBLEND_INVBLENDFACTOR),
+            0
+        );
+        assert_eq!(
+            d.set_render_state(mtld3d_types::D3DRS_BLENDFACTOR, 0x8080_8080),
+            0
+        );
+        assert_eq!(d.set_render_state(D3DRS_FILLMODE, D3DFILL_WIREFRAME), 0);
+        assert_eq!(
+            d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &fill_quad(RED)),
+            0,
+            "wireframe half-weight draw"
+        );
+        assert_eq!(d.set_render_target(0, &other), 0, "detour");
+        assert_eq!(d.set_render_target(0, &back), 0, "back again");
+        assert_eq!(d.set_render_state(D3DRS_FILLMODE, D3DFILL_SOLID), 0);
+        assert_eq!(
+            d.set_render_state(mtld3d_types::D3DRS_BLENDFACTOR, WHITE),
+            0
+        );
+        assert_eq!(
+            d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &right_half),
+            0,
+            "solid full-weight draw"
+        );
+    });
+    assert_eq!(
+        h.read_pixel(160, 240),
+        BLACK,
+        "the wireframe draw leaves the left half's interior clear"
+    );
+    let right = Rgba8::from_pixel(h.read_pixel(480, 240));
+    assert!(
+        right.r < 20 && right.g > 240,
+        "right half is filled green at full weight, got {right:?}"
+    );
+}
+
+#[test]
 fn colorwrite_mask_drops_red() {
     let h = Harness::new();
     arm_diffuse(&h);
