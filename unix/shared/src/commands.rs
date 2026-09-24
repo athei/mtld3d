@@ -64,9 +64,8 @@ pub enum CommandType {
     /// `encoder.drawIndexedPrimitives(...)` with an inline (user-pointer) index stream.
     ///
     /// Backs `DrawIndexedPrimitiveUP`. The index bytes live in the per-frame
-    /// scratch arena; the unix side copies them into a transient `MTLBuffer`
-    /// (`newBufferWithBytes`) for the draw, since Metal has no inline-index
-    /// form.
+    /// scratch arena; the unix side copies them into its upload ring and
+    /// draws from that buffer, since Metal has no inline-index form.
     DrawIndexedPrimitivesUp = 17,
     // 18 was SetDepthClipMode; the D3D9 depth-clamp rule is realized in the
     // FF vertex shader now (`pos_fixup.z`), because encoder-level clamp is
@@ -439,9 +438,8 @@ impl Command {
     /// `DrawIndexedPrimitiveUP`: draw with an inline (user-pointer) index stream.
     ///
     /// `index_ptr` points into the per-frame scratch arena and
-    /// `index_bytes` is its length; the unix side copies it into a transient
-    /// `MTLBuffer` (`newBufferWithBytes`) for the draw, since Metal has no
-    /// inline-index form. `param_d` carries the counts packed by
+    /// `index_bytes` is its length; the unix side copies it into its upload
+    /// ring and draws from that buffer, since Metal has no inline-index form. `param_d` carries the counts packed by
     /// [`Self::pack_indexed_draw_counts`]. Base vertex is always 0 (UP indices
     /// are absolute).
     #[must_use]

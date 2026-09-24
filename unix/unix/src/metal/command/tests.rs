@@ -47,8 +47,11 @@ use objc2_metal::{
     MTLTextureDescriptor, MTLTextureUsage,
 };
 
+use crate::metal::transient::{SubmitStamp, UploadRing};
+
 use super::{
-    CopyBufferEndpoint, CopyEndpoint, CopyRegion, CopyRejectReason, DeviceRecord, PendingCmdBuf,
+    CopyBufferEndpoint, CopyEndpoint, CopyRegion, CopyRejectReason, DeviceRecord, EncodeContext,
+    PendingCmdBuf,
     PresentGeometry, PresentRoute, SETTLED_PRESENTS, command_buffer_error, commit_registered,
     copy_buffer_to_texture_reject, copy_texture_reject, copy_texture_to_buffer_reject,
     encode_upload_cmd_buf, first_pending, geometry_settled, present_route, readback_completed,
@@ -778,10 +781,9 @@ fn cpu_submit_failure_drain(upload_committed: bool) {
     let mut committed_upload = None;
     let success = submit_frame_with(record.pending(), &mut params, |params| {
         if upload_committed {
-            let upload_cb = encode_upload_cmd_buf(
+            let upload_cb = encode_test_upload(
                 &record,
                 &queue,
-                &[],
                 core::slice::from_ref(&upload_pass),
                 params,
             )
@@ -841,6 +843,23 @@ fn cpu_submit_failure_drain(upload_committed: bool) {
         );
     }
     assert_eq!(counters_at_return, (2, 2, 2));
+}
+
+/// Encode `passes` into an upload command buffer with a ring of the test's own.
+fn encode_test_upload(
+    record: &Arc<DeviceRecord>,
+    queue: &ProtocolObject<dyn MTLCommandQueue>,
+    passes: &[PassDescriptor],
+    params: &SubmitFrameParams,
+) -> Option<Retained<ProtocolObject<dyn MTLCommandBuffer>>> {
+    let device = queue.device();
+    let mut ring = UploadRing::default();
+    let mut ctx = EncodeContext {
+        device: &device,
+        stamp: SubmitStamp::new(params).upload(),
+        ring: &mut ring,
+    };
+    encode_upload_cmd_buf(record, queue, &[], passes, params, &mut ctx)
 }
 
 fn test_queue() -> Retained<ProtocolObject<dyn MTLCommandQueue>> {
@@ -960,7 +979,7 @@ fn upload_prefix_finishes_before_its_retirement_signal() {
     let params = test_submit_params(&coherent, &upload, &failed);
     let record = test_record(&queue);
     let upload_cb =
-        encode_upload_cmd_buf(&record, &queue, &[], &[pass], &params).expect("an upload buffer");
+        encode_test_upload(&record, &queue, &[pass], &params).expect("an upload buffer");
     commit_registered(
         record.pending(),
         &upload_cb,
