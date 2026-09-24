@@ -1632,7 +1632,9 @@ pub struct PassState {
     /// the `MTLTexture` instead (fresh handle for later draws, earlier
     /// draws keep the old one). Handle-keyed on purpose: the fresh
     /// handle has been sampled by no earlier draw, so a rename needs no
-    /// explicit clear here.
+    /// explicit clear here. The pass scans use it too: every sampler bind in
+    /// `passes` went through `emit_command`, so a target missing here is read
+    /// by no pass's commands.
     frame_sampled_textures: FxHashSet<MetalHandle<MTLTextureKind>>,
     /// Sampling or attachment view to resource identity, through native retirement.
     ///
@@ -4844,7 +4846,7 @@ impl PassState {
                     BlitEffect::Neither => {}
                 }
             }
-            if pass_samples_texture(cand, target.texture, views)
+            if pass_samples_texture(cand, target.texture, views, &self.frame_sampled_textures)
                 || pass_attaches_texture(cand, target.texture)
                 || pass_resolves_into(cand, target.texture, views)
             {
@@ -4982,12 +4984,25 @@ impl PassState {
         for j in (start + 1)..self.passes.len() {
             let cand = &self.passes[j];
             // Intervening read on a side we care about kills the merge.
-            if needs_color && pass_reads_texture(cand, target_color, &self.texture_view_to_base) {
+            if needs_color
+                && pass_reads_texture(
+                    cand,
+                    target_color,
+                    &self.texture_view_to_base,
+                    &self.frame_sampled_textures,
+                )
+            {
                 return None;
             }
             if needs_color
                 && target_extra.iter().any(|&(tex, _)| {
-                    !tex.is_null() && pass_reads_texture(cand, tex, &self.texture_view_to_base)
+                    !tex.is_null()
+                        && pass_reads_texture(
+                            cand,
+                            tex,
+                            &self.texture_view_to_base,
+                            &self.frame_sampled_textures,
+                        )
                 })
             {
                 return None;
@@ -5047,7 +5062,12 @@ impl PassState {
                 }
             }
             if (needs_depth || needs_stencil)
-                && pass_reads_texture(cand, target_depth, &self.texture_view_to_base)
+                && pass_reads_texture(
+                    cand,
+                    target_depth,
+                    &self.texture_view_to_base,
+                    &self.frame_sampled_textures,
+                )
             {
                 return None;
             }
@@ -5844,11 +5864,12 @@ fn pass_reads_texture(
     pass: &Pass,
     target_handle: MetalHandle<MTLTextureKind>,
     texture_view_to_base: &FxHashMap<MetalHandle<MTLTextureKind>, MetalHandle<MTLTextureKind>>,
+    frame_sampled: &FxHashSet<MetalHandle<MTLTextureKind>>,
 ) -> bool {
     if target_handle.is_null() {
         return false;
     }
-    if pass_samples_texture(pass, target_handle, texture_view_to_base) {
+    if pass_samples_texture(pass, target_handle, texture_view_to_base, frame_sampled) {
         return true;
     }
     pass.leading_blits.iter().any(|b| {
@@ -5863,10 +5884,31 @@ fn pass_samples_texture(
     pass: &Pass,
     target_handle: MetalHandle<MTLTextureKind>,
     texture_view_to_base: &FxHashMap<MetalHandle<MTLTextureKind>, MetalHandle<MTLTextureKind>>,
+    frame_sampled: &FxHashSet<MetalHandle<MTLTextureKind>>,
 ) -> bool {
     if target_handle.is_null() {
         return false;
     }
+    // Every sampler bind in a pass of this submission went through
+    // `emit_command`, which puts the bound texture and the storage it views
+    // into `frame_sampled`, so a target missing there is sampled by no pass
+    // and the command scan is skipped.
+    if !frame_sampled.contains(&target_handle) {
+        debug_assert!(
+            !commands_sample_texture(pass, target_handle, texture_view_to_base),
+            "a pass samples {target_handle:#x}, which no bind this submission marked"
+        );
+        return false;
+    }
+    commands_sample_texture(pass, target_handle, texture_view_to_base)
+}
+
+/// Scan `pass`'s commands for a sampler bind of `target_handle` or a view of it.
+fn commands_sample_texture(
+    pass: &Pass,
+    target_handle: MetalHandle<MTLTextureKind>,
+    texture_view_to_base: &FxHashMap<MetalHandle<MTLTextureKind>, MetalHandle<MTLTextureKind>>,
+) -> bool {
     pass.commands.iter().any(|command| {
         let Some(texture) = command_sampled_texture(command) else {
             return false;

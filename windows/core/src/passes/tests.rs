@@ -2493,6 +2493,61 @@ fn rule_e_aborts_when_intervening_pass_samples_target_through_srgb_twin() {
 }
 
 #[test]
+fn rule_e_aborts_when_only_an_intervening_leading_blit_reads_the_target() {
+    // A blit source is no sampler bind, so the target is unmarked for this
+    // submission; the command scan may be skipped but the leading blits of
+    // the intervening pass must still be read.
+    let rt = tex(0x4000);
+    let mut s = fresh();
+    s.set_color_render_target(rt, 64, 64, RT_FORMAT, RenderScale::IDENTITY);
+    s.clear_color(1, 2, 3, 4);
+    s.set_color_render_target(tex(0x5000), 64, 64, RT_FORMAT, RenderScale::IDENTITY);
+    s.emit_command(dummy_draw());
+    s.end_current_pass("test");
+    s.push_pending_leading_blit(copy_blit(rt, tex(0x6000)));
+    s.emit_command(dummy_draw());
+    s.set_color_render_target(rt, 64, 64, RT_FORMAT, RenderScale::IDENTITY);
+    s.emit_command(dummy_draw());
+    s.end_current_pass("test");
+    assert!(!s.texture_sampled_this_frame(rt));
+    let before = s.passes().len();
+    s.coalesce_clear_only_passes();
+    assert_eq!(
+        s.passes().len(),
+        before,
+        "the copy reads the cleared target"
+    );
+    assert!(matches!(
+        s.passes()[0].color_load(),
+        ColorLoad::Clear { .. }
+    ));
+}
+
+/// The pass scans skip a target no sampler bind marked in this submission.
+///
+/// A bind that bypassed `emit_command` breaks the premise, and the debug
+/// build checks the skipped scan against the full one, so reaching that
+/// check at all shows the scan was skipped.
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "which no bind this submission marked")]
+fn pass_scan_skips_a_target_no_bind_marked() {
+    let rt = tex(0x4000);
+    let mut s = fresh();
+    s.emit_command(dummy_draw());
+    s.end_current_pass("test");
+    s.passes[0]
+        .commands
+        .push(Command::set_fragment_texture(rt.raw(), 0));
+    pass_samples_texture(
+        &s.passes[0],
+        rt,
+        &s.texture_view_to_base,
+        &s.frame_sampled_textures,
+    );
+}
+
+#[test]
 fn unsampled_colour_target_keeps_its_contents_into_the_next_frame() {
     let portrait = tex(0x3000);
     // A render target the frame clears and draws into but never samples:
@@ -7456,7 +7511,8 @@ fn dead_draw_before_resz_leaves_rule_i_free_to_drop_the_clear() {
     assert!(!pass_samples_texture(
         pass,
         resz_intz(),
-        &FxHashMap::default()
+        &s.texture_view_to_base,
+        &s.frame_sampled_textures
     ));
     transfer_into_intz(&mut s, 0);
     sample_intz_on_the_backbuffer(&mut s);
