@@ -1174,8 +1174,9 @@ pub struct FrameEncoder {
     /// time by `PassState::strip_color_from_no_color_draw_passes` (Rule H)
     /// to retroactively rewrite the pass's `SetRenderPipelineState`
     /// commands, and queried by later draws before rebuilding a known
-    /// sibling. Process-lifetime (the `pipeline_cache` itself is
-    /// process-lifetime, so the handles never dangle); no per-frame clear.
+    /// sibling. Lives as long as `pipeline_cache`, which holds both handles
+    /// until device teardown destroys them, so the mapping never dangles; no
+    /// per-frame clear.
     no_color_pipeline_alt: FxHashMap<u64, MetalHandle<MTLRenderPipelineStateKind>>,
     /// Single-entry "L0" memo in front of `pipeline_cache`.
     ///
@@ -1186,7 +1187,7 @@ pub struct FrameEncoder {
     /// probing the cache. Holds a `PipelineSnapshot` (all-`Copy` fields,
     /// no borrowed/arena pointer) + the `u64` handle, so it persists
     /// across frames safely — `pipeline_cache` never evicts, so a
-    /// snapshot→handle mapping stays valid for the process lifetime. Only
+    /// snapshot→handle mapping stays valid for the device's lifetime. Only
     /// successful (non-null) resolves are stored; a failing snapshot goes to
     /// `pipeline_cache`, which remembers the failure.
     last_pipeline_memo: Option<(PipelineSnapshot, u64)>,
@@ -5640,18 +5641,27 @@ impl FrameEncoder {
         let disk_key = source.disk_key();
         let kind = match source {
             VsSource::Programmable { vs_id, .. } => {
-                let major = self
-                    .program_cache
-                    .get(vs_id)
-                    .map_or(0, |program| program.major);
-                CachedKind::from_programmable(major, false)
+                let Some(program) = self.program_cache.get(vs_id) else {
+                    error!(target: LOG_TARGET, "VS {vs_id:#x} missing from program_cache");
+                    return None;
+                };
+                CachedKind::from_programmable(program.major, false)
             }
             VsSource::FixedFunction { .. } => Some(CachedKind::FfVs),
         };
-        let reference = kind.map(|kind| ShaderRecordRef::new(kind, disk_key));
-        if let Some(reference) = reference
-            && let Some(&handles) = self.lib_cache.get(&reference)
-        {
+        // `lib_cache` owns every library compiled below, and device teardown
+        // destroys what it holds. A shader with no cache kind would compile
+        // into the non-owning indexes alone and outlive its device, so it is
+        // not compiled; the parser admits no such model today.
+        let Some(kind) = kind else {
+            mtld3d_shared::log_once_warn!(
+                target: LOG_TARGET,
+                "VS {disk_key:#x}: shader model has no cache kind, not compiled"
+            );
+            return None;
+        };
+        let reference = ShaderRecordRef::new(kind, disk_key);
+        if let Some(&handles) = self.lib_cache.get(&reference) {
             return Some(handles);
         }
         let mut total_ns = 0;
@@ -5715,8 +5725,7 @@ impl FrameEncoder {
             if let Some(b) = bucket {
                 self.compile_stats.record(b, started.elapsed());
             }
-            if let Some(kind) = kind
-                && self.flags.contains(FrameEncoderFlags::CACHE_READY)
+            if self.flags.contains(FrameEncoderFlags::CACHE_READY)
                 && !self.flags.contains(FrameEncoderFlags::CACHE_DISABLED)
             {
                 let _persist = NanosSetTimer::start(&raw mut persist_ns);
@@ -5741,9 +5750,7 @@ impl FrameEncoder {
                     kind, disk_key, msl, retained,
                 ));
             }
-            if let Some(reference) = reference {
-                self.lib_cache.insert(reference, handles);
-            }
+            self.lib_cache.insert(reference, handles);
             Some(handles)
         })();
         drop(total_timer);
@@ -5844,18 +5851,27 @@ impl FrameEncoder {
         let disk_key = source.disk_key(variant);
         let kind = match source {
             PsSource::Programmable { ps_id, .. } => {
-                let major = self
-                    .program_cache
-                    .get(ps_id)
-                    .map_or(0, |program| program.major);
-                CachedKind::from_programmable(major, true)
+                let Some(program) = self.program_cache.get(ps_id) else {
+                    error!(target: LOG_TARGET, "PS {ps_id:#x} missing from program_cache");
+                    return None;
+                };
+                CachedKind::from_programmable(program.major, true)
             }
             PsSource::FixedFunction { .. } => Some(CachedKind::FfPs),
         };
-        let reference = kind.map(|kind| ShaderRecordRef::new(kind, disk_key));
-        if let Some(reference) = reference
-            && let Some(&handles) = self.lib_cache.get(&reference)
-        {
+        // `lib_cache` owns every library compiled below, and device teardown
+        // destroys what it holds. A shader with no cache kind would compile
+        // into the non-owning indexes alone and outlive its device, so it is
+        // not compiled; the parser admits no such model today.
+        let Some(kind) = kind else {
+            mtld3d_shared::log_once_warn!(
+                target: LOG_TARGET,
+                "PS {disk_key:#x}: shader model has no cache kind, not compiled"
+            );
+            return None;
+        };
+        let reference = ShaderRecordRef::new(kind, disk_key);
+        if let Some(&handles) = self.lib_cache.get(&reference) {
             return Some(handles);
         }
         let mut total_ns = 0;
@@ -5903,8 +5919,7 @@ impl FrameEncoder {
             if let Some(b) = bucket {
                 self.compile_stats.record(b, started.elapsed());
             }
-            if let Some(kind) = kind
-                && self.flags.contains(FrameEncoderFlags::CACHE_READY)
+            if self.flags.contains(FrameEncoderFlags::CACHE_READY)
                 && !self.flags.contains(FrameEncoderFlags::CACHE_DISABLED)
             {
                 let _persist = NanosSetTimer::start(&raw mut persist_ns);
@@ -5919,9 +5934,7 @@ impl FrameEncoder {
                     kind, disk_key, msl, retained,
                 ));
             }
-            if let Some(reference) = reference {
-                self.lib_cache.insert(reference, handles);
-            }
+            self.lib_cache.insert(reference, handles);
             Some(handles)
         })();
         drop(total_timer);

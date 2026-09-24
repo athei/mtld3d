@@ -182,18 +182,19 @@ pub fn create_render_pipeline(
         }
     };
 
+    let raw = Retained::into_raw(pipeline) as u64;
+    // The handle by value, as the bulk destroy logs it, so a create can be
+    // matched to the destroy that released it.
     debug!(
         target: LOG_TARGET,
-        "created render pipeline (attrs={}, layouts={}, blend={}, depth={})",
+        "created render pipeline {raw:#x} (attrs={}, layouts={}, blend={}, depth={})",
         vertex_attrs.len(),
         vertex_layouts.len(),
         params.blend_enable,
         params.has_depth != 0
     );
-    // SAFETY: `Retained::into_raw` transfers the retain into the typed handle.
-    Some(unsafe {
-        MetalHandle::<MTLRenderPipelineStateKind>::new(Retained::into_raw(pipeline) as u64)
-    })
+    // SAFETY: `Retained::into_raw` above transferred the retain into `raw`.
+    Some(unsafe { MetalHandle::<MTLRenderPipelineStateKind>::new(raw) })
 }
 
 const fn mtl_blend_op(op: BlendOperation) -> MTLBlendOperation {
