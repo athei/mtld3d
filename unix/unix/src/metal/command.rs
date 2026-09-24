@@ -2666,11 +2666,11 @@ fn encode_pass(
                 let stencil_attach = rp_desc.stencilAttachment();
                 stencil_attach.setTexture(Some(&depth_tex));
                 stencil_attach.setLevel(level as usize);
-                // Stencil shares the depth attachment's storage on
-                // `Depth32Float_Stencil8`, so its store action mirrors depth:
-                // flipping one without the other would either be a Metal
-                // validation error or a redundant store.
-                stencil_attach.setStoreAction(map_store_action(pass.depth_store_action));
+                // The two planes of a `Depth32Float_Stencil8` texture take
+                // independent load and store actions: Metal validates each
+                // attachment descriptor on its own, so discarding one plane
+                // while the other is loaded or kept is a legal pass.
+                stencil_attach.setStoreAction(map_store_action(pass.stencil_store_action));
                 match pass.stencil_load_action {
                     LoadAction::Clear => {
                         stencil_attach.setLoadAction(MTLLoadAction::Clear);

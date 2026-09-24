@@ -513,6 +513,55 @@ fn stencil_test_gates_rendering() {
     assert_eq!(h.read_pixel(10, 10), BLACK, "outside the stamp");
 }
 
+/// Stencil stamped before a mid-frame readback still gates the draws after it.
+///
+/// The readback ends the submission without a `Present`, so the stamp and the
+/// gated draw land in two submissions of one frame. The second one writes no
+/// stencil of its own, only tests it, so the stencil plane has to be loaded
+/// from what the first one stored rather than discarded as never written.
+#[test]
+fn stencil_stamped_before_a_mid_frame_readback_gates_the_continuation() {
+    let h = Harness::with_depth();
+    arm_diffuse(&h);
+    assert!(h.pump(), "WM_QUIT before render");
+    assert_eq!(h.begin_scene(), 0);
+    assert_eq!(
+        h.clear(
+            D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER | D3DCLEAR_STENCIL,
+            BLACK,
+            1.0,
+            0
+        ),
+        0,
+        "colour, depth and stencil clear"
+    );
+    assert_eq!(h.set_render_state(D3DRS_STENCILENABLE, 1), 0);
+    assert_eq!(h.set_render_state(D3DRS_STENCILFUNC, D3DCMP_ALWAYS), 0);
+    assert_eq!(
+        h.set_render_state(D3DRS_STENCILPASS, D3DSTENCILOP_REPLACE),
+        0
+    );
+    assert_eq!(h.set_render_state(D3DRS_STENCILREF, 1), 0);
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &centered_triangle(BLUE)),
+        0,
+        "stamp draw"
+    );
+    assert_eq!(h.read_pixel(320, 240), BLUE, "the stamp is drawn");
+
+    assert_eq!(h.set_render_state(D3DRS_STENCILFUNC, D3DCMP_EQUAL), 0);
+    assert_eq!(h.set_render_state(D3DRS_STENCILPASS, D3DSTENCILOP_KEEP), 0);
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &fill_quad(GREEN)),
+        0,
+        "gated draw"
+    );
+    assert_eq!(h.end_scene(), 0);
+    assert_eq!(h.set_render_state(D3DRS_STENCILENABLE, 0), 0);
+    assert_eq!(h.read_pixel(320, 240), GREEN, "inside the stamp");
+    assert_eq!(h.read_pixel(10, 10), BLACK, "outside the stamp");
+}
+
 #[test]
 fn additive_pass_selected_by_depth_equal_reaches_the_target() {
     // A renderer that writes depth in one pass and adds light in a second

@@ -119,6 +119,7 @@ impl FrameEncoder {
             if ordered {
                 self.pass_state.push_pending_leading_blit(command);
             } else {
+                self.pass_state.note_stencil_blit(&command);
                 self.frame_blit_commands.push(command);
             }
             self.perf.bump_vbib_retained_add(page.len());

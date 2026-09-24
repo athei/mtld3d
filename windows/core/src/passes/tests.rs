@@ -7505,3 +7505,657 @@ fn dead_draw_alone_before_resz_leaves_rule_i_free_to_drop_the_clear() {
     assert!(leads_with_intz_transfer(&s, 0));
     assert_eq!(s.passes()[0].color_texture(), backbuffer());
 }
+
+// ── Depth and stencil planes nothing observes ──
+
+/// A frame whose default depth surface carries a stencil plane (D24S8).
+fn fresh_with_stencil() -> PassState {
+    let mut s = PassState::new();
+    s.reset_frame(&FrameReset {
+        backbuffer: backbuffer(),
+        backbuffer_srgb: backbuffer_srgb(),
+        backbuffer_msaa: MetalHandle::NULL,
+        backbuffer_msaa_srgb: MetalHandle::NULL,
+        backbuffer_sample_count: 1,
+        backbuffer_size: BB_SIZE,
+        backbuffer_format: BB_FORMAT,
+        backbuffer_contents: BackbufferContents::Undefined,
+        depth_texture: depth(),
+        depth_size: BB_SIZE,
+        depth_has_stencil: true,
+        render_scale: RenderScale::IDENTITY,
+        continues_frame: false,
+    });
+    s
+}
+
+const BOTH_PLANES: PipelineAttachFlags =
+    PipelineAttachFlags::HAS_DEPTH.union(PipelineAttachFlags::HAS_STENCIL);
+
+/// A draw that tests and writes depth, stencil off.
+fn depth_draw(s: &mut PassState) {
+    s.note_draw_depth_stencil(&DepthStencilSnapshot::depth_overwrite(), BOTH_PLANES);
+    s.emit_command(dummy_draw());
+}
+
+/// A draw that writes stencil (the stencil clear-quad's state, drawn by the game).
+fn stencil_writing_draw(s: &mut PassState) {
+    s.note_draw_depth_stencil(&DepthStencilSnapshot::stencil_overwrite(), BOTH_PLANES);
+    s.emit_command(dummy_draw());
+}
+
+/// A draw with depth and stencil both off, like an interface draw.
+fn depthless_draw(s: &mut PassState) {
+    s.note_draw_depth_stencil(&DepthStencilSnapshot::inert(), BOTH_PLANES);
+    s.emit_command(dummy_draw());
+}
+
+/// Bounce render target 0 to `other` and back, ending the pass on the back buffer.
+fn break_pass_via(s: &mut PassState, other: MetalHandle<MTLTextureKind>) {
+    s.set_color_render_target(other, 256, 256, RT_FORMAT, RenderScale::IDENTITY);
+    s.emit_command(dummy_draw());
+    s.set_color_render_target(
+        backbuffer(),
+        BB_SIZE.0,
+        BB_SIZE.1,
+        BB_FORMAT,
+        s.render_scale,
+    );
+}
+
+/// Draw one pass into `other` with no depth attachment, then rebind the back buffer and `depth()`.
+///
+/// Leaves a pass between two passes on the depth texture that does not attach
+/// it, so the second one is the first's next use. `leading` is queued ahead
+/// of that pass.
+fn depthless_pass(
+    s: &mut PassState,
+    other: MetalHandle<MTLTextureKind>,
+    has_stencil: bool,
+    leading: Option<BlitCommand>,
+) {
+    s.set_depth_stencil_attachment(MetalHandle::NULL, (0, 0), false, false);
+    s.set_color_render_target(other, 256, 256, RT_FORMAT, RenderScale::IDENTITY);
+    if let Some(blit) = leading {
+        s.push_pending_leading_blit(blit);
+    }
+    s.emit_command(dummy_draw());
+    s.set_color_render_target(
+        backbuffer(),
+        BB_SIZE.0,
+        BB_SIZE.1,
+        BB_FORMAT,
+        s.render_scale,
+    );
+    s.set_depth_stencil_attachment(depth(), BB_SIZE, false, has_stencil);
+}
+
+/// Open a pass on the bound attachments whose planes load with a whole-attachment `Clear`.
+///
+/// The shape a covering depth or stencil clear folds into when it reaches a
+/// pass before any draw. `None` leaves that plane's load as the pass opened it.
+fn open_clearing_pass(s: &mut PassState, depth: Option<u32>, stencil: Option<u32>) {
+    s.ensure_pass_open();
+    let pass = s.passes.last_mut().expect("a pass is open");
+    if let Some(value) = depth {
+        pass.depth_load = DepthLoad::Clear { value };
+    }
+    if let Some(value) = stencil {
+        pass.stencil_load = StencilLoad::Clear { value };
+    }
+}
+
+// Rule C's depth arm.
+
+#[test]
+fn depth_arm_discards_a_depth_store_the_next_pass_clears() {
+    for frame_continues in [false, true] {
+        let mut s = fresh();
+        depth_draw(&mut s);
+        depthless_pass(&mut s, tex(0x3000), false, None);
+        open_clearing_pass(&mut s, Some(0), None);
+        depth_draw(&mut s);
+        s.end_current_pass("test");
+        s.finalize_store_actions(frame_continues);
+        assert_eq!(s.passes().len(), 3);
+        assert_eq!(
+            s.passes()[0].depth_store(),
+            StoreAction::DontCare,
+            "the clear in pass 2 overwrites what pass 0 stored (frame_continues={frame_continues})"
+        );
+    }
+}
+
+#[test]
+fn depth_arm_keeps_the_store_when_the_next_pass_loads() {
+    let mut s = fresh();
+    depth_draw(&mut s);
+    break_pass_via(&mut s, tex(0x3000));
+    depth_draw(&mut s);
+    s.end_current_pass("test");
+    s.finalize_store_actions(true);
+    assert!(
+        s.passes()
+            .iter()
+            .all(|p| p.depth_store() == StoreAction::Store)
+    );
+}
+
+#[test]
+fn depth_arm_keeps_the_store_of_a_sampled_or_sampleable_texture() {
+    let mut sampled = fresh();
+    depth_draw(&mut sampled);
+    sampled.set_depth_stencil_attachment(MetalHandle::NULL, (0, 0), false, false);
+    sampled.set_color_render_target(tex(0x3000), 256, 256, RT_FORMAT, RenderScale::IDENTITY);
+    sampled.emit_command(Command::set_fragment_texture(depth().raw(), 0));
+    sampled.emit_command(dummy_draw());
+    sampled.set_color_render_target(
+        backbuffer(),
+        BB_SIZE.0,
+        BB_SIZE.1,
+        BB_FORMAT,
+        sampled.render_scale,
+    );
+    sampled.set_depth_stencil_attachment(depth(), BB_SIZE, false, false);
+    open_clearing_pass(&mut sampled, Some(0), None);
+    depth_draw(&mut sampled);
+    sampled.end_current_pass("test");
+    sampled.finalize_store_actions(true);
+    assert_eq!(
+        sampled.passes()[0].depth_store(),
+        StoreAction::Store,
+        "the sampler in pass 1 reads what pass 0 stored"
+    );
+
+    let shadow = tex(0x6000);
+    let mut sampleable = fresh();
+    sampleable.set_depth_stencil_attachment(shadow, BB_SIZE, true, false);
+    depth_draw(&mut sampleable);
+    sampleable.end_current_pass("test");
+    open_clearing_pass(&mut sampleable, Some(0), None);
+    depth_draw(&mut sampleable);
+    sampleable.end_current_pass("test");
+    sampleable.finalize_store_actions(true);
+    assert_eq!(
+        sampleable.passes()[0].depth_store(),
+        StoreAction::Store,
+        "a sampleable shadow map keeps every store"
+    );
+}
+
+#[test]
+fn depth_arm_keeps_the_store_when_a_blit_between_touches_the_texture() {
+    // A depth transfer into the texture, carried by the pass in between or
+    // by the clearing pass itself, runs after pass 0's store and before the
+    // clear. Neither is a read `seen_sampled_textures` records, so the scan
+    // is what keeps the store.
+    let other = tex(0x6100);
+    for on_clearing_pass in [false, true] {
+        let mut s = fresh();
+        depth_draw(&mut s);
+        let between = (!on_clearing_pass).then(|| depth_transfer(other, depth()));
+        depthless_pass(&mut s, tex(0x3000), false, between);
+        if on_clearing_pass {
+            s.push_pending_leading_blit(depth_transfer(other, depth()));
+        }
+        open_clearing_pass(&mut s, Some(0), None);
+        depth_draw(&mut s);
+        s.end_current_pass("test");
+        assert!(!s.seen_sampled_textures.contains(&depth()));
+        s.finalize_store_actions(true);
+        assert_eq!(
+            s.passes()[0].depth_store(),
+            StoreAction::Store,
+            "a blit touching the texture runs before the clear (on_clearing_pass={on_clearing_pass})"
+        );
+    }
+}
+
+#[test]
+fn depth_arm_keeps_the_store_when_a_pass_between_reads_the_texture() {
+    // A read the session set has not recorded (inserted straight into the
+    // pass list) still keeps the store: the scan checks the passes between.
+    let mut s = fresh();
+    depth_draw(&mut s);
+    depthless_pass(&mut s, tex(0x3000), false, None);
+    open_clearing_pass(&mut s, Some(0), None);
+    depth_draw(&mut s);
+    s.end_current_pass("test");
+    s.passes[1]
+        .leading_blits
+        .push(copy_blit(depth(), tex(0x6200)));
+    s.finalize_store_actions(true);
+    assert_eq!(s.passes()[0].depth_store(), StoreAction::Store);
+}
+
+#[test]
+fn depth_arm_matches_the_mip_level() {
+    let half = (BB_SIZE.0 / 2, BB_SIZE.1 / 2);
+    let mut s = fresh();
+    s.set_depth_stencil_attachment_level(depth(), 0, BB_SIZE, false, false);
+    depth_draw(&mut s);
+    s.set_depth_stencil_attachment_level(depth(), 1, half, false, false);
+    open_clearing_pass(&mut s, Some(0), None);
+    depth_draw(&mut s);
+    s.end_current_pass("test");
+    s.finalize_store_actions(true);
+    assert_eq!(
+        s.passes()[0].depth_store(),
+        StoreAction::Store,
+        "a clear of level 1 does not overwrite level 0"
+    );
+}
+
+#[test]
+fn depth_arm_decides_the_depth_and_stencil_planes_apart() {
+    // depth only, stencil only, both: each plane's store goes only when the
+    // next pass clears that plane.
+    let cases = [
+        (Some(0), None, StoreAction::DontCare, StoreAction::Store),
+        (None, Some(0), StoreAction::Store, StoreAction::DontCare),
+        (
+            Some(0),
+            Some(0),
+            StoreAction::DontCare,
+            StoreAction::DontCare,
+        ),
+    ];
+    for (depth_clear, stencil_clear, depth_store, stencil_store) in cases {
+        let mut s = fresh_with_stencil();
+        stencil_writing_draw(&mut s);
+        depth_draw(&mut s);
+        depthless_pass(&mut s, tex(0x3000), true, None);
+        open_clearing_pass(&mut s, depth_clear, stencil_clear);
+        depth_draw(&mut s);
+        s.end_current_pass("test");
+        s.finalize_store_actions(true);
+        let pass = &s.passes()[0];
+        assert_eq!(
+            (pass.depth_store(), pass.stencil_store()),
+            (depth_store, stencil_store),
+            "next pass clears depth={depth_clear:?} stencil={stencil_clear:?}"
+        );
+    }
+}
+
+// A stencil plane nothing has written.
+
+#[test]
+fn an_unwritten_stencil_plane_loads_and_stores_dontcare() {
+    let mut s = fresh_with_stencil();
+    depth_draw(&mut s);
+    break_pass_via(&mut s, tex(0x3000));
+    depth_draw(&mut s);
+    s.end_current_pass("test");
+    s.finalize_store_actions(true);
+    for pass in s.passes().iter().filter(|p| p.depth_texture() == depth()) {
+        assert_eq!(pass.stencil_load(), StencilLoad::DontCare);
+        assert_eq!(pass.stencil_store(), StoreAction::DontCare);
+        assert_eq!(pass.depth_store(), StoreAction::Store, "depth is untouched");
+    }
+    assert_eq!(s.passes()[2].depth_load(), DepthLoad::Load);
+}
+
+#[test]
+fn draws_that_do_not_write_stencil_leave_it_unwritten() {
+    let keep_ops_test = DepthStencilSnapshot {
+        stencil_enable: 1,
+        write_mask: STENCIL_MASK_BITS,
+        ..DepthStencilSnapshot::inert()
+    };
+    let masked_writes = DepthStencilSnapshot {
+        write_mask: 0,
+        ..DepthStencilSnapshot::stencil_overwrite()
+    };
+    for (name, state) in [
+        ("inert", DepthStencilSnapshot::inert()),
+        ("depth only", DepthStencilSnapshot::depth_overwrite()),
+        ("stencil test with KEEP on every outcome", keep_ops_test),
+        ("stencil write mask zero", masked_writes),
+    ] {
+        let mut s = fresh_with_stencil();
+        s.note_draw_depth_stencil(&state, BOTH_PLANES);
+        s.emit_command(dummy_draw());
+        break_pass_via(&mut s, tex(0x3000));
+        depth_draw(&mut s);
+        s.end_current_pass("test");
+        s.finalize_store_actions(true);
+        assert_eq!(
+            s.passes()[0].stencil_store(),
+            StoreAction::DontCare,
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn every_stencil_write_keeps_the_stencil_plane() {
+    // A stencil-writing draw in the last pass keeps the first pass's load
+    // and store too: a write anywhere in the submission counts.
+    let written_by = [
+        (
+            "a stencil-writing draw",
+            stencil_writing_draw as fn(&mut PassState),
+        ),
+        ("a stencil clear-quad", |s: &mut PassState| {
+            s.note_depth_stencil_clear_quad(true);
+            s.emit_command(dummy_draw());
+        }),
+        ("a folded stencil clear", |s: &mut PassState| {
+            s.end_current_pass("test");
+            open_clearing_pass(s, None, Some(7));
+            s.emit_command(dummy_draw());
+        }),
+        ("a stencil upload blit", |s: &mut PassState| {
+            let mut upload = copy_blit(tex(0x6300), depth());
+            upload.cmd = BlitCommandType::CopyBufferToStencil as u32;
+            s.push_leading_blit_after_clears(upload, "test");
+            s.emit_command(dummy_draw());
+        }),
+    ];
+    for (name, write) in written_by {
+        let mut s = fresh_with_stencil();
+        depth_draw(&mut s);
+        break_pass_via(&mut s, tex(0x3000));
+        write(&mut s);
+        s.end_current_pass("test");
+        s.finalize_store_actions(true);
+        assert_eq!(
+            s.passes()[0].stencil_load(),
+            StencilLoad::DontCare,
+            "{name}: Rule A"
+        );
+        assert_eq!(s.passes()[0].stencil_store(), StoreAction::Store, "{name}");
+        assert_ne!(
+            s.passes().last().unwrap().stencil_load(),
+            StencilLoad::DontCare,
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn a_depth_transfer_or_frame_head_copy_marks_its_destination_written() {
+    let mut s = fresh_with_stencil();
+    s.push_leading_blit_after_clears(depth_transfer(tex(0x6400), depth()), "test");
+    depth_draw(&mut s);
+    s.end_current_pass("test");
+    s.finalize_store_actions(true);
+    assert_eq!(s.passes()[0].stencil_store(), StoreAction::Store);
+
+    let mut s = fresh_with_stencil();
+    s.note_stencil_blit(&copy_blit(tex(0x6400), depth()));
+    depth_draw(&mut s);
+    s.end_current_pass("test");
+    s.finalize_store_actions(true);
+    assert_eq!(s.passes()[0].stencil_store(), StoreAction::Store);
+}
+
+#[test]
+fn a_stencil_write_survives_into_the_next_submission() {
+    // Written before a mid-frame flush, tested after it: the continuation
+    // must load what the first submission stored.
+    let mut s = fresh_with_stencil();
+    stencil_writing_draw(&mut s);
+    s.end_current_pass("test");
+    s.finalize_store_actions(true);
+    assert_eq!(s.passes()[0].stencil_store(), StoreAction::Store);
+
+    s.reset_frame(&FrameReset {
+        backbuffer: backbuffer(),
+        backbuffer_srgb: backbuffer_srgb(),
+        backbuffer_msaa: MetalHandle::NULL,
+        backbuffer_msaa_srgb: MetalHandle::NULL,
+        backbuffer_sample_count: 1,
+        backbuffer_size: BB_SIZE,
+        backbuffer_format: BB_FORMAT,
+        backbuffer_contents: BackbufferContents::Undefined,
+        depth_texture: depth(),
+        depth_size: BB_SIZE,
+        depth_has_stencil: true,
+        render_scale: RenderScale::IDENTITY,
+        continues_frame: true,
+    });
+    let keep_ops_test = DepthStencilSnapshot {
+        stencil_enable: 1,
+        ..DepthStencilSnapshot::inert()
+    };
+    s.note_draw_depth_stencil(&keep_ops_test, BOTH_PLANES);
+    s.emit_command(dummy_draw());
+    s.end_current_pass("test");
+    s.finalize_store_actions(true);
+    assert_eq!(s.passes()[0].stencil_load(), StencilLoad::Load);
+    assert_eq!(s.passes()[0].stencil_store(), StoreAction::Store);
+
+    s.unregister_texture(depth());
+    assert!(
+        !s.stencil_written_textures.contains(&depth()),
+        "a destroyed texture's address may come back as a fresh surface"
+    );
+}
+
+#[test]
+fn a_texture_without_stencil_keeps_its_stencil_fields() {
+    let mut s = fresh();
+    depth_draw(&mut s);
+    break_pass_via(&mut s, tex(0x3000));
+    depth_draw(&mut s);
+    s.end_current_pass("test");
+    s.finalize_store_actions(true);
+    assert_eq!(s.passes()[0].stencil_store(), StoreAction::Store);
+}
+
+#[test]
+fn a_clear_only_pass_that_keeps_only_its_stencil_survives_the_cull() {
+    // Pass 0 clears stencil alone; pass 1 clears colour and depth and tests
+    // the stencil pass 0 left. Pass 0's colour and depth stores go (pass 1
+    // clears both), its stencil store stays, so Rule F must keep it.
+    let mut s = fresh_with_stencil();
+    open_clearing_pass(&mut s, None, Some(3));
+    s.end_current_pass("test");
+    open_clearing_pass(&mut s, Some(0), None);
+    s.passes.last_mut().unwrap().color_load = ColorLoad::Clear {
+        r: 0,
+        g: 0,
+        b: 0,
+        a: 0,
+    };
+    let keep_ops_test = DepthStencilSnapshot {
+        stencil_enable: 1,
+        ..DepthStencilSnapshot::inert()
+    };
+    s.note_draw_depth_stencil(&keep_ops_test, BOTH_PLANES);
+    s.emit_command(dummy_draw());
+    s.end_current_pass("test");
+    s.finalize_store_actions(true);
+    assert_eq!(s.passes()[0].color_store(), StoreAction::DontCare);
+    assert_eq!(s.passes()[0].depth_store(), StoreAction::DontCare);
+    assert_eq!(s.passes()[0].stencil_store(), StoreAction::Store);
+    s.strip_dead_color_in_clear_only_passes();
+    s.cull_dead_clear_only_passes();
+    assert_eq!(s.passes().len(), 2, "the stencil clear is kept");
+    assert_eq!(
+        s.passes()[0].stencil_load(),
+        StencilLoad::Clear { value: 3 }
+    );
+}
+
+// A pass that never uses depth.
+
+#[test]
+fn a_last_pass_that_never_uses_depth_discards_its_loads() {
+    let mut s = fresh_with_stencil();
+    stencil_writing_draw(&mut s);
+    depth_draw(&mut s);
+    break_pass_via(&mut s, tex(0x3000));
+    depthless_draw(&mut s);
+    s.end_current_pass("test");
+    s.finalize_store_actions(false);
+    let last = s.passes().last().unwrap();
+    assert_eq!(last.depth_store(), StoreAction::DontCare, "Rule B");
+    assert_eq!(last.depth_load(), DepthLoad::DontCare);
+    assert_eq!(last.stencil_load(), StencilLoad::DontCare);
+    assert_eq!(s.passes()[0].depth_load(), DepthLoad::DontCare, "Rule A");
+    assert_eq!(s.passes()[0].depth_store(), StoreAction::Store);
+}
+
+#[test]
+fn any_depth_or_stencil_use_keeps_the_loads() {
+    let uses = [
+        ("a depth-testing draw", depth_draw as fn(&mut PassState)),
+        ("a stencil-testing draw", |s: &mut PassState| {
+            s.note_draw_depth_stencil(
+                &DepthStencilSnapshot {
+                    stencil_enable: 1,
+                    ..DepthStencilSnapshot::inert()
+                },
+                BOTH_PLANES,
+            );
+            s.emit_command(dummy_draw());
+        }),
+        ("a depth clear-quad", |s: &mut PassState| {
+            s.note_depth_stencil_clear_quad(false);
+            s.emit_command(dummy_draw());
+        }),
+        ("a stencil clear-quad", |s: &mut PassState| {
+            s.note_depth_stencil_clear_quad(true);
+            s.emit_command(dummy_draw());
+        }),
+    ];
+    for (name, use_depth) in uses {
+        let mut s = fresh_with_stencil();
+        stencil_writing_draw(&mut s);
+        break_pass_via(&mut s, tex(0x3000));
+        depthless_draw(&mut s);
+        use_depth(&mut s);
+        s.end_current_pass("test");
+        s.finalize_store_actions(false);
+        let last = s.passes().last().unwrap();
+        assert_eq!(last.depth_load(), DepthLoad::Load, "{name}");
+        assert_eq!(last.stencil_load(), StencilLoad::Load, "{name}");
+    }
+}
+
+#[test]
+fn an_unused_pass_keeps_its_loads_when_its_stores_are_kept() {
+    // A mid-frame flush turns Rule B off, so the stores stay and so do the loads.
+    let mut s = fresh_with_stencil();
+    stencil_writing_draw(&mut s);
+    break_pass_via(&mut s, tex(0x3000));
+    depthless_draw(&mut s);
+    s.end_current_pass("test");
+    s.finalize_store_actions(true);
+    let last = s.passes().last().unwrap();
+    assert_eq!(last.depth_load(), DepthLoad::Load);
+    assert_eq!(last.stencil_load(), StencilLoad::Load);
+}
+
+#[test]
+fn an_unused_pass_decides_each_plane_on_its_own_store() {
+    // Pass 1 never uses depth and is followed by a pass that clears depth
+    // alone: its depth load goes, its stencil load stays for the store that
+    // keeps what pass 0 wrote.
+    let mut s = fresh_with_stencil();
+    stencil_writing_draw(&mut s);
+    s.end_current_pass("test");
+    depthless_draw(&mut s);
+    s.end_current_pass("test");
+    open_clearing_pass(&mut s, Some(0), None);
+    depth_draw(&mut s);
+    s.end_current_pass("test");
+    s.finalize_store_actions(true);
+    let unused = &s.passes()[1];
+    assert_eq!(unused.depth_texture(), depth());
+    assert_eq!(unused.depth_store(), StoreAction::DontCare);
+    assert_eq!(unused.depth_load(), DepthLoad::DontCare);
+    assert_eq!(unused.stencil_store(), StoreAction::Store);
+    assert_eq!(unused.stencil_load(), StencilLoad::Load);
+}
+
+#[test]
+fn an_unused_pass_keeps_a_clear_load() {
+    let mut s = fresh_with_stencil();
+    open_clearing_pass(&mut s, Some(0), Some(0));
+    depthless_draw(&mut s);
+    s.end_current_pass("test");
+    s.finalize_store_actions(false);
+    assert_eq!(s.passes()[0].depth_load(), DepthLoad::Clear { value: 0 });
+    assert_eq!(
+        s.passes()[0].stencil_load(),
+        StencilLoad::Clear { value: 0 }
+    );
+}
+
+// The presented multisampled back buffer.
+
+#[test]
+fn a_presented_multisampled_back_buffer_resolves_without_storing_its_samples() {
+    let mut s = fresh_multisampled();
+    s.emit_command(dummy_draw());
+    break_pass_via(&mut s, tex(0x3000));
+    s.set_color_msaa(msaa_backbuffer(), msaa_backbuffer_srgb(), 4);
+    s.emit_command(dummy_draw());
+    s.end_current_pass("test");
+    s.finalize_store_actions(false);
+    let last = s.passes().last().unwrap();
+    assert_eq!(last.color_resolve_texture(), backbuffer());
+    assert_eq!(last.color_store(), StoreAction::DontCare);
+    assert_eq!(
+        s.passes()[0].color_store(),
+        StoreAction::Store,
+        "the earlier pass keeps its samples for the last one"
+    );
+}
+
+#[test]
+fn the_multisampled_back_buffer_keeps_its_samples_unless_presented_under_discard() {
+    let mut flush = fresh_multisampled();
+    flush.emit_command(dummy_draw());
+    flush.end_current_pass("test");
+    flush.finalize_store_actions(true);
+    assert_eq!(
+        flush.passes()[0].color_store(),
+        StoreAction::Store,
+        "a mid-frame flush: a later pass may load the samples"
+    );
+
+    let mut preserved = PassState::new();
+    preserved.reset_frame(&FrameReset {
+        backbuffer: backbuffer(),
+        backbuffer_srgb: backbuffer_srgb(),
+        backbuffer_msaa: msaa_backbuffer(),
+        backbuffer_msaa_srgb: msaa_backbuffer_srgb(),
+        backbuffer_sample_count: 4,
+        backbuffer_size: BB_SIZE,
+        backbuffer_format: BB_FORMAT,
+        backbuffer_contents: BackbufferContents::Preserved,
+        depth_texture: depth(),
+        depth_size: BB_SIZE,
+        depth_has_stencil: false,
+        render_scale: RenderScale::IDENTITY,
+        continues_frame: false,
+    });
+    preserved.emit_command(dummy_draw());
+    preserved.end_current_pass("test");
+    preserved.finalize_store_actions(false);
+    assert_eq!(
+        preserved.passes()[0].color_store(),
+        StoreAction::Store,
+        "a copy or flip swap effect keeps the back buffer across Present"
+    );
+
+    let rt = tex(0x3400);
+    let mut offscreen = fresh();
+    offscreen.set_color_render_target(rt, BB_SIZE.0, BB_SIZE.1, BB_FORMAT, RenderScale::IDENTITY);
+    offscreen.set_color_msaa(tex(0x3401), MetalHandle::NULL, 4);
+    offscreen.set_depth_stencil_attachment(MetalHandle::NULL, (0, 0), false, false);
+    offscreen.emit_command(dummy_draw());
+    offscreen.end_current_pass("test");
+    offscreen.finalize_store_actions(false);
+    assert_eq!(offscreen.passes()[0].color_resolve_texture(), rt);
+    assert_eq!(
+        offscreen.passes()[0].color_store(),
+        StoreAction::Store,
+        "a multisampled render target keeps its samples across Present"
+    );
+}

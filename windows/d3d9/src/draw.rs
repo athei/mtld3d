@@ -1704,11 +1704,11 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
         );
         return;
     }
+    let depth_stencil = render_state
+        .depth_stencil_state
+        .gated_on_stencil_attachment(has_stencil);
     let depth_state = if has_depth {
-        let snapshot = render_state
-            .depth_stencil_state
-            .gated_on_stencil_attachment(has_stencil);
-        enc.get_or_create_depth_stencil(&snapshot, true)
+        enc.get_or_create_depth_stencil(&depth_stencil, true)
     } else {
         0
     };
@@ -1723,6 +1723,10 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
     // the bound pipeline to the no-color variant. Must run after
     // begin_render_pass_if_needed so the tag lands on the right pass.
     enc.note_draw_color_write_mask(u32::from(!pipeline_snapshot.writes_no_color()));
+    // Tag the pass with what the draw does to its depth-stencil attachment:
+    // a pass none of whose draws test or write it may discard its loads,
+    // and a stencil write keeps the stencil plane's stores.
+    enc.note_draw_depth_stencil(&depth_stencil, target_planes);
     enc.emit_scissor(
         render_state.scissor_test_enable(),
         render_state.scissor_rect.map(u32::from),

@@ -1091,10 +1091,12 @@ fn upload_test_pass(texture: &ProtocolObject<dyn MTLTexture>) -> PassDescriptor 
         depth_store_action: StoreAction::DontCare,
         depth_clear_value: 0,
         stencil_load_action: LoadAction::DontCare,
+        stencil_store_action: StoreAction::DontCare,
         stencil_clear_value: 0,
         command_count: 0,
         leading_blits_count: 0,
         pass_flags: PassDescriptor::pack_flags(false, 0, 0, 0),
+        reserved: 0,
         extra_color: [ExtraColorDesc::NONE; 3],
     }
 }
