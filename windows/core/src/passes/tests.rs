@@ -9318,3 +9318,146 @@ fn a_scaled_mip_level_binds_at_the_extent_metal_allocated() {
         }
     }
 }
+
+// ── A small render target 0 over a larger depth surface. The frame's
+// ── depth surface is the back buffer's 640x480 one, at the identity scale.
+
+/// A 1x1 render target 0 bound over the frame's depth surface.
+fn tiny() -> MetalHandle<MTLTextureKind> {
+    tex(0x7000)
+}
+
+/// A frame with the 1x1 [`tiny`] target over the 640x480 depth surface and a viewport over the depth surface.
+fn tiny_over_depth() -> PassState {
+    let mut s = fresh();
+    s.set_color_render_target(tiny(), 1, 1, RT_FORMAT, RenderScale::IDENTITY);
+    s.set_viewport(0, 0, BB_SIZE.0, BB_SIZE.1, 0.0, 1.0);
+    s
+}
+
+#[test]
+fn rule_h_keeps_a_colour_target_smaller_than_the_depth_surface() {
+    // Stripping the 64x64 target would make the depth surface alone set the
+    // render area, so the masked draws would reach texels outside the
+    // target's 64x64 that D3D9 never rasterizes.
+    let mut s = fresh();
+    s.set_color_render_target(tex(0x7100), 64, 64, RT_FORMAT, RenderScale::IDENTITY);
+    s.note_draw_color_write_mask(0);
+    s.emit_command(set_pso(PSO_WITH));
+    s.emit_command(dummy_draw());
+    s.end_current_pass("test");
+    let mut alt = FxHashMap::default();
+    alt.insert(PSO_WITH, pso(PSO_NO_COLOR));
+    s.strip_color_from_no_color_draw_passes(&alt);
+    assert_eq!(
+        s.passes()[0].color_texture(),
+        tex(0x7100),
+        "the target smaller than the depth surface stays attached"
+    );
+}
+
+#[test]
+fn rule_h_strips_a_colour_target_the_size_of_the_depth_surface() {
+    let mut s = fresh();
+    s.set_color_render_target(
+        tex(0x7100),
+        BB_SIZE.0,
+        BB_SIZE.1,
+        RT_FORMAT,
+        RenderScale::IDENTITY,
+    );
+    s.note_draw_color_write_mask(0);
+    s.emit_command(set_pso(PSO_WITH));
+    s.emit_command(dummy_draw());
+    s.end_current_pass("test");
+    let mut alt = FxHashMap::default();
+    alt.insert(PSO_WITH, pso(PSO_NO_COLOR));
+    s.strip_color_from_no_color_draw_passes(&alt);
+    assert_eq!(s.passes()[0].color_texture(), MetalHandle::NULL);
+}
+
+#[test]
+fn rule_e_keeps_a_depth_clear_out_of_a_pass_smaller_than_the_depth_surface() {
+    // The clear-only pass clears the whole depth surface; the next pass on it
+    // rasterizes only the 1x1 target's area, so folding the clear into that
+    // pass's load action would leave the rest of the surface uncleared.
+    let z = f32::to_bits(0.25);
+    let mut s = fresh();
+    s.pending_depth_clear = Some(z);
+    s.push_depth_clear_pass();
+    s.set_color_render_target(tiny(), 1, 1, RT_FORMAT, RenderScale::IDENTITY);
+    s.emit_command(dummy_draw());
+    s.end_current_pass("test");
+    s.coalesce_clear_only_passes();
+    assert_eq!(s.passes().len(), 2, "the depth clear keeps its own pass");
+    assert_eq!(s.passes()[0].color_texture(), MetalHandle::NULL);
+    assert_eq!(s.passes()[0].depth_load(), DepthLoad::Clear { value: z });
+    assert_eq!(s.passes()[1].depth_load(), DepthLoad::Load);
+}
+
+#[test]
+fn rule_e_still_folds_a_depth_clear_into_a_pass_the_size_of_the_depth_surface() {
+    let z = f32::to_bits(0.25);
+    let mut s = fresh();
+    s.pending_depth_clear = Some(z);
+    s.push_depth_clear_pass();
+    s.set_color_render_target(
+        tex(0x7100),
+        BB_SIZE.0,
+        BB_SIZE.1,
+        RT_FORMAT,
+        RenderScale::IDENTITY,
+    );
+    s.emit_command(dummy_draw());
+    s.end_current_pass("test");
+    s.coalesce_clear_only_passes();
+    assert_eq!(
+        s.passes().len(),
+        1,
+        "the depth clear folds into the next pass"
+    );
+    assert_eq!(s.passes()[0].depth_load(), DepthLoad::Clear { value: z });
+}
+
+#[test]
+fn a_pending_depth_clear_meeting_a_1x1_target_gets_a_depth_only_pass() {
+    let z = f32::to_bits(0.5);
+    let mut s = tiny_over_depth();
+    assert!(matches!(s.clear_depth(z), DepthClearOutcome::Folded));
+    // A draw that writes the 1x1 target opens its pass.
+    s.emit_command(dummy_draw());
+    s.end_current_pass("test");
+    assert_eq!(s.passes().len(), 2, "a depth-only clear pass comes first");
+    assert_eq!(s.passes()[0].color_texture(), MetalHandle::NULL);
+    assert_eq!(s.passes()[0].depth_texture(), depth());
+    assert_eq!(s.passes()[0].depth_load(), DepthLoad::Clear { value: z });
+    assert_eq!(s.passes()[1].color_texture(), tiny());
+    assert_eq!(s.passes()[1].depth_load(), DepthLoad::Load);
+}
+
+#[test]
+fn a_whole_depth_clear_ends_an_open_pass_on_a_1x1_target() {
+    // A quad painted into the open pass would be clipped to the 1x1 area.
+    let z = f32::to_bits(0.5);
+    let mut s = tiny_over_depth();
+    s.emit_command(dummy_draw());
+    assert!(matches!(s.clear_depth(z), DepthClearOutcome::Folded));
+    assert!(s.current_pass_closed(), "the pass on the 1x1 target ended");
+    assert_eq!(s.pending_depth_clear, Some(z));
+}
+
+#[test]
+fn a_region_depth_clear_over_a_1x1_target_opens_a_depth_only_pass() {
+    let mut s = tiny_over_depth();
+    let (has_color, _) = s
+        .begin_region_depth_stencil_clear()
+        .expect("a depth surface is bound");
+    assert!(!has_color, "the quads go to a pass without colour");
+    let pass = s.passes().last().expect("a pass is open");
+    assert_eq!(pass.color_texture(), MetalHandle::NULL);
+    assert_eq!(pass.depth_texture(), depth());
+    assert_eq!(
+        pass.depth_size, BB_SIZE,
+        "the depth surface sets the extent"
+    );
+}
