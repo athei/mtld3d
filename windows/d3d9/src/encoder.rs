@@ -6237,6 +6237,16 @@ impl FrameEncoder {
         self.perf.bump_fan_generated();
     }
 
+    /// Count a `DrawIndexedPrimitiveUP` draw.
+    pub const fn bump_up_indexed(&mut self) {
+        self.perf.bump_up_indexed();
+    }
+
+    /// Count a UP draw whose inline vertices exceed `SET_BYTES_MAX`.
+    pub const fn bump_up_vertex_oversized(&mut self) {
+        self.perf.bump_up_vertex_oversized();
+    }
+
     pub fn bump_pair_stats(
         &mut self,
         shaders: ShaderRef,

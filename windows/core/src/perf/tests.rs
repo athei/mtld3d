@@ -474,6 +474,8 @@ fn summary_golden_layout() {
         "  passes=4         commands=140         draws=100\n",
         "  pipeline memo  97 / 100  (97.0%)  consecutive-draw resolve elided\n",
         "  fan generated  0         indexed / oversized fans rewritten per draw (slow path; 0 is the goal)\n",
+        "  up indexed     3         DrawIndexedPrimitiveUP draws (inline indices copied into the upload ring)\n",
+        "  up oversized   2         UP draws past the 4 KiB inline limit (vertices copied into the upload ring)\n",
         "\n",
         "Keys gating  — redundant snapshot dirty-marks elided (skips/calls); higher = more `keys` work avoided\n",
         "  SetTexture               0 / 0         (  0.0%)\n",
@@ -735,6 +737,10 @@ fn sample_window() -> PerfWindow {
             // 97 of 100 pipeline resolves served from the memo → 97.0%.
             pipeline_memo_hits: 97,
             fan_generated: 0,
+            // Three indexed UP draws and two oversized inline vertex streams
+            // went through the unix upload ring.
+            up_indexed: 3,
+            up_vertex_oversized: 2,
             pipeline_memo_calls: 100,
             submit_cycles: 300_000,
             // Presenter: the last present waited 6.0M for its drawable.

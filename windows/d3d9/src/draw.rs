@@ -37,8 +37,8 @@ use mtld3d_shared::{
     Command, NullTextureKind, VertexAttrDesc,
     mtl::{
         IndexType, PS_BOOL_CONST_SLOT, PS_DRAW_SLOT, PS_INT_CONST_SLOT, PS_LOD_BIAS_SLOT,
-        PrimitiveType, VS_BOOL_CONST_SLOT, VS_DRAW_SLOT, VS_FLOAT_CONST_SLOT, VS_INT_CONST_SLOT,
-        VS_POS_FIXUP_SLOT, VertexStepFunction,
+        PrimitiveType, SET_BYTES_MAX, VS_BOOL_CONST_SLOT, VS_DRAW_SLOT, VS_FLOAT_CONST_SLOT,
+        VS_INT_CONST_SLOT, VS_POS_FIXUP_SLOT, VertexStepFunction,
     },
 };
 use mtld3d_types::{
@@ -272,7 +272,7 @@ pub enum IndexSource {
     /// Indexed draw from an inline (user-pointer) index stream (`DrawIndexedPrimitiveUP`).
     ///
     /// The bytes are copied per draw and uploaded via the encoder scratch
-    /// arena; the unix side wraps them in a transient `MTLBuffer`. The
+    /// arena; the unix side copies them into its upload ring. The
     /// indices are absolute (base vertex 0), paired with `VertexSource::Up`.
     Up {
         bytes: Vec<u8>,
@@ -2183,6 +2183,9 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
     match &vertex_source {
         VertexSource::Up { bytes, size, .. } => {
             let scratch_ptr = enc.alloc_scratch(bytes);
+            if usize::try_from(*size).is_ok_and(|size| size > SET_BYTES_MAX) {
+                enc.bump_up_vertex_oversized();
+            }
             enc.emit_command(Command::set_vertex_bytes(scratch_ptr, *size, 0));
             // Inline slot-0 bind clobbers the real Metal vertex-buffer
             // binding; drop the cached bound-VB so the next bound draw
@@ -2362,8 +2365,8 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
     #[cfg(debug_assertions)]
     enc.debug_assert_cache_in_sync();
     let t_draw = CycleAddTimer::start(enc.op_sub_detail_ptr(OpSubDetail::BDraw));
-    // The generated-index fan is the slow path (per-draw rewrite plus a
-    // transient index buffer); the PERF grid counts it as a tripwire.
+    // The generated-index fan is the slow path (per-draw rewrite plus an
+    // upload-ring copy); the PERF grid counts it as a tripwire.
     if matches!(index_source, IndexSource::Generated { .. }) {
         enc.bump_fan_generated();
     }
@@ -2474,9 +2477,10 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
             index_type,
         } => {
             // Inline index stream: stage the bytes in the per-frame scratch
-            // arena and let the unix side wrap them in a transient MTLBuffer
+            // arena and let the unix side copy them into its upload ring
             // (Metal has no inline-index draw form). The vertices were bound
             // above from `VertexSource::Up`.
+            enc.bump_up_indexed();
             let scratch_ptr = enc.alloc_scratch(&bytes);
             let byte_len = u32::try_from(bytes.len()).unwrap_or(u32::MAX);
             enc.emit_command(Command::draw_indexed_primitives_up(
