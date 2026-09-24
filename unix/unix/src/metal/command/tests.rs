@@ -1423,3 +1423,36 @@ fn depth_plane_failure_aborts_the_pair_and_retry_retains_sources() {
         assert_eq!(read(), (depths, stencil));
     }
 }
+
+/// A leading-blit encoder opens once, at its first use, and only for a flagged list.
+#[test]
+fn a_leading_blit_encoder_opens_at_first_use_and_only_when_flagged() {
+    let queue = test_queue();
+    let cb = queue.commandBuffer().expect("command buffer");
+    cb.setLabel(Some(&NSString::from_str("mtld3d-test-lazy-blit")));
+    let mut unflagged = super::LazyBlitEncoder {
+        cmd_buf: &cb,
+        site: super::BlitSite::FrameLeading,
+        labels: true,
+        expected: false,
+        encoder: None,
+    };
+    assert!(unflagged.get(1).is_none(), "a list flagged as needing none never opens one");
+    unflagged.end();
+    let mut lazy = super::LazyBlitEncoder {
+        cmd_buf: &cb,
+        site: super::BlitSite::FrameLeading,
+        labels: true,
+        expected: true,
+        encoder: None,
+    };
+    assert!(lazy.encoder.is_none(), "nothing is opened before the first use");
+    let first = core::ptr::from_ref(lazy.get(1).expect("an encoder")).addr();
+    let second = core::ptr::from_ref(lazy.get(1).expect("an encoder")).addr();
+    assert_eq!(first, second, "later commands share the open encoder");
+    lazy.end();
+    assert!(lazy.encoder.is_none());
+    cb.commit();
+    cb.waitUntilCompleted();
+    assert_eq!(cb.status(), MTLCommandBufferStatus::Completed);
+}
