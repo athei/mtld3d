@@ -315,7 +315,7 @@ const BIG_F: f32 = 256.0;
 /// Where the depth surface is probed: its first texel, its middle, its last texel.
 const PROBES: [(u32, u32); 3] = [(0, 0), (BIG / 2, BIG / 2), (BIG - 1, BIG - 1)];
 
-/// A small render target 0 over a [`BIG`]-square depth surface, with a [`BIG`]-square target to read the depth through.
+/// A small render target 0 over a [`BIG`]-square depth surface, and a target to read it through.
 struct SmallOverDepth<'h> {
     big: Surface<'h>,
     small: Surface<'h>,
@@ -597,7 +597,7 @@ fn a_1x1_target_the_shader_leaves_unwritten_draws_over_the_whole_depth_surface()
     assert_probes(probes, [RED; 3], "the draw wrote the whole depth surface");
 }
 
-/// A scissored depth `Clear` over an unwritten 1x1 target reaches the half of the depth surface it names.
+/// A scissored depth `Clear` over an unwritten 1x1 target reaches the half of the depth it names.
 ///
 /// The masked draw lays 0.5 over the whole depth surface, then a depth clear
 /// under a scissor over the right half puts that half back to 1.0.

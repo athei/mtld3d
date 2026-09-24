@@ -198,7 +198,7 @@ impl DeviceInner {
             None => String::from("none"),
         };
         let ds = match &self.last_depth_binding {
-            Some((DepthBinding::Lazy(info, level), ..)) => {
+            Some((DepthBinding::Lazy(info, level, _), ..)) => {
                 format!("{:?} level={level}", info.texture_id)
             }
             Some((DepthBinding::Eager(..), ..)) => String::from("default"),

@@ -415,3 +415,30 @@ fn alpha_to_coverage_keys_only_multisampled_pipelines_and_reaches_wire() {
         );
     }
 }
+
+#[test]
+fn render_target_0_is_written_only_under_a_mask_and_an_oc0_write() {
+    let mut rs = base().rs;
+    for (mask, ps_color_out_mask, written) in [
+        (0xF, 0b01, true),
+        (0xF, 0b10, false),
+        (0x0, 0b01, false),
+        (0x0, 0b10, false),
+    ] {
+        rs.color_write_mask = mask;
+        assert_eq!(
+            rs.writes_rt0(ps_color_out_mask),
+            written,
+            "mask {mask:#x}, shader outputs {ps_color_out_mask:#b}"
+        );
+    }
+}
+
+#[test]
+fn removing_the_colour_output_matches_a_pass_without_colour_attachments() {
+    let mut snapshot = base();
+    snapshot.extra.present_mask = 0b1;
+    snapshot.remove_color_output();
+    assert!(!snapshot.has_color_output());
+    assert_eq!(snapshot.extra, ExtraColorAttachments::NONE);
+}
