@@ -3920,6 +3920,33 @@ fn take_and_restore_round_trip_the_binding_set() {
     assert_eq!(s.current_depth_texture(), depth());
 }
 
+/// A clear pending when the extras are taken lands on every target it was issued against.
+///
+/// `Clear` with no pass open stashes the clear, then the per-target bracket
+/// takes the binding set because render target 2 is sized differently. The
+/// clear-only pass that flushes out must still carry render target 1.
+#[test]
+fn take_flushes_a_pending_clear_onto_the_bound_extras() {
+    let mut s = fresh();
+    s.set_extra_color_render_target(1, Some(slot(tex(0x3000), BB_SIZE)));
+    s.set_extra_color_render_target(2, Some(slot(tex(0x3001), (64, 64))));
+    assert_eq!(s.extra_present_mask(), 0b001);
+    assert_eq!(s.clear_color(1, 2, 3, 4), ColorClearOutcome::Folded);
+    let saved = s.take_color_attachments();
+    assert!(saved.slot(1).is_some());
+    let pass = s.passes().last().expect("clear-only pass");
+    let clear = ColorLoad::Clear {
+        r: 1,
+        g: 2,
+        b: 3,
+        a: 4,
+    };
+    assert_eq!(pass.color_load(), clear);
+    assert_eq!(pass.extra_color()[0].texture(), tex(0x3000));
+    assert_eq!(pass.extra_color()[0].load(), clear);
+    assert!(!pass.extra_color()[1].is_bound());
+}
+
 #[test]
 fn depth_clear_in_a_multi_target_pass_stays_a_quad() {
     // The depth clear-quad declares the extra targets with an empty
@@ -5065,7 +5092,7 @@ fn pass_binds_depth_answers_for_the_attachment_the_pass_takes() {
         s.pass_binds_depth(),
         "the frame's own depth companion matches the target"
     );
-    s.set_depth_stencil_attachment(depth(), BB_SIZE, false, true);
+    s.set_depth_stencil_attachment(tex(0x2001), BB_SIZE, false, true);
     assert!(
         !s.pass_binds_depth(),
         "a single-sampled depth surface under a 4x target is dropped"
@@ -5168,8 +5195,9 @@ fn a_depth_attachment_that_disagrees_on_samples_is_dropped() {
     // The depth surface is single-sampled while render target 0 is 4x: Metal
     // rejects such a pass outright, so the attachment goes rather than the
     // draw.
+    let single = tex(0x2001);
     let mut s = fresh_multisampled();
-    s.set_depth_stencil_attachment(depth(), BB_SIZE, false, false);
+    s.set_depth_stencil_attachment(single, BB_SIZE, false, false);
     s.emit_command(dummy_draw());
     s.end_current_pass("test");
     assert!(
@@ -5179,11 +5207,87 @@ fn a_depth_attachment_that_disagrees_on_samples_is_dropped() {
 
     // Declared at the matching count it binds normally.
     let mut s = fresh_multisampled();
-    s.set_depth_stencil_attachment(depth(), BB_SIZE, false, false);
+    s.set_depth_stencil_attachment(single, BB_SIZE, false, false);
     s.set_depth_sample_count(4);
     s.emit_command(dummy_draw());
     s.end_current_pass("test");
-    assert_eq!(s.passes()[0].depth_texture(), depth());
+    assert_eq!(s.passes()[0].depth_texture(), single);
+}
+
+/// A 4x frame with a depth and a stencil clear stashed, then a pass on a 1x target.
+///
+/// The pass drops the 4x depth surface, so the clears must stay pending
+/// rather than be consumed by a pass that has no attachment to apply them to.
+fn msaa_depth_clear_then_single_sampled_draw() -> PassState {
+    let mut s = fresh_multisampled();
+    assert_eq!(s.clear_depth(0x3f80_0000), DepthClearOutcome::Folded);
+    assert_eq!(s.clear_stencil(7), StencilClearOutcome::Folded);
+    s.set_color_render_target(tex(0x3000), 256, 256, RT_FORMAT, RenderScale::IDENTITY);
+    s.emit_command(dummy_draw());
+    assert!(s.passes()[0].depth_texture().is_null());
+    assert_eq!(s.pending_depth_clear(), Some(0x3f80_0000));
+    assert_eq!(s.pending_stencil_clear, Some(7));
+    s
+}
+
+#[test]
+fn a_pass_that_drops_depth_leaves_the_depth_clear_pending() {
+    let mut s = msaa_depth_clear_then_single_sampled_draw();
+    s.set_color_render_target(
+        backbuffer(),
+        BB_SIZE.0,
+        BB_SIZE.1,
+        BB_FORMAT,
+        s.render_scale,
+    );
+    s.set_color_msaa(msaa_backbuffer(), msaa_backbuffer_srgb(), 4);
+    s.emit_command(dummy_draw());
+    let pass = &s.passes()[1];
+    assert_eq!(pass.depth_texture(), depth());
+    assert_eq!(
+        pass.depth_load(),
+        DepthLoad::Clear { value: 0x3f80_0000 },
+        "the next pass that binds the depth surface applies the clear"
+    );
+    assert_eq!(pass.stencil_load(), StencilLoad::Clear { value: 7 });
+}
+
+#[test]
+fn a_depth_clear_left_pending_flushes_onto_its_own_surface() {
+    // Rebinding depth, submitting and retiring the surface all go through the
+    // flush while render target 0 still disagrees on samples: the clear lands
+    // in a depth-only pass on the surface it was issued for, never on the
+    // next one bound.
+    let expect_depth_only_clear = |s: &PassState| {
+        let pass = s.passes().last().expect("a clear pass");
+        assert!(pass.color_texture().is_null());
+        assert_eq!(pass.depth_texture(), depth());
+        assert_eq!(pass.depth_load(), DepthLoad::Clear { value: 0x3f80_0000 });
+        assert_eq!(pass.stencil_load(), StencilLoad::Clear { value: 7 });
+        assert!(s.pending_depth_clear().is_none());
+        assert!(s.pending_stencil_clear.is_none());
+        assert!(s.current_pass_closed());
+    };
+
+    let other = tex(0x4000);
+    let mut s = msaa_depth_clear_then_single_sampled_draw();
+    s.set_depth_stencil_attachment(other, (256, 256), false, true);
+    expect_depth_only_clear(&s);
+    s.emit_command(dummy_draw());
+    let pass = s.passes().last().unwrap();
+    assert_eq!(pass.depth_texture(), other);
+    assert!(
+        !matches!(pass.depth_load(), DepthLoad::Clear { .. }),
+        "the replacement surface does not inherit the clear"
+    );
+
+    let mut s = msaa_depth_clear_then_single_sampled_draw();
+    s.flush_pending_clears();
+    expect_depth_only_clear(&s);
+
+    let mut s = msaa_depth_clear_then_single_sampled_draw();
+    s.retire_depth_texture(depth());
+    expect_depth_only_clear(&s);
 }
 
 #[test]
@@ -5426,139 +5530,213 @@ fn rule_g_strip_drops_the_multisampled_companion() {
     );
 }
 
-// ── RESZ depth resolve ──
+// ── Depth transfers (RESZ and the depth StretchRect resolve) ──
+
+/// A depth transfer out of `source` into `destination`, as the encoder queues it.
+fn depth_transfer(
+    source: MetalHandle<MTLTextureKind>,
+    destination: MetalHandle<MTLTextureKind>,
+) -> BlitCommand {
+    let mut blit = BlitCommand::copy_texture_to_texture_full_mip(
+        source.raw(),
+        destination.raw(),
+        0,
+        BB_SIZE.0,
+        BB_SIZE.1,
+    );
+    blit.cmd = BlitCommandType::TransferDepth as u32;
+    blit
+}
 
 #[test]
-fn the_resz_resolve_from_a_multisampled_depth_surface_gets_its_own_pass() {
-    // Metal has no depth resolve on the blit encoder, so the RESZ hack turns
-    // into a render pass that loads the multisampled depth, draws nothing and
-    // resolves into the single-sample destination.
+fn a_depth_transfer_runs_between_the_pass_that_wrote_its_source_and_the_next() {
+    // The transfer is a leading blit of the pass that opens after it, so it
+    // reads what the draws before it left in the multisampled depth and
+    // anything after it sees what it wrote.
     let destination = tex(0x4000);
     let mut s = fresh_multisampled();
     s.emit_command(dummy_draw());
-    assert!(s.resolve_depth_attachment(destination, DepthResolveFilter::Sample0));
+    s.end_current_pass("test");
+    s.push_pending_leading_blit(depth_transfer(depth(), destination));
+    s.emit_command(dummy_draw());
+    s.end_current_pass("test");
 
-    assert_eq!(s.passes().len(), 2, "the resolve is a pass of its own");
-    let resolve = &s.passes()[1];
-    assert_eq!(
-        resolve.depth_texture(),
-        depth(),
-        "the source is the samples"
-    );
-    assert_eq!(resolve.depth_resolve_texture(), destination);
-    assert_eq!(resolve.depth_resolve_filter(), DepthResolveFilter::Sample0);
-    assert_eq!(
-        resolve.depth_load(),
-        DepthLoad::Load,
-        "the pass has to read what the draws left"
-    );
-    assert!(
-        resolve.color_texture().is_null(),
-        "nothing but the depth plane is touched"
-    );
-    assert!(resolve.commands().is_empty(), "and no draw is emitted");
+    assert_eq!(s.passes().len(), 2);
+    assert!(s.passes()[0].leading_blits().is_empty());
+    let blits = s.passes()[1].leading_blits();
+    assert_eq!(blits.len(), 1, "the transfer leads the pass after the draw");
+    assert_eq!(blits[0].cmd, BlitCommandType::TransferDepth as u32);
+    assert_eq!(blits[0].src_handle, depth().raw());
+    assert_eq!(blits[0].dst_handle, destination.raw());
 }
 
 #[test]
-fn the_depth_resolve_pass_survives_the_dead_pass_cull() {
-    // It has no draw, and Rule B drops the multisample content as the last
-    // use of that depth surface. The resolve is still the whole point of it.
+fn a_depth_transfer_keeps_the_store_of_the_pass_that_wrote_its_source() {
+    // Rule B drops the depth store on a depth texture's last pass of the
+    // frame. The transfer reads that depth from memory after the pass, so the
+    // store has to survive.
     let destination = tex(0x4001);
     let mut s = fresh_multisampled();
     s.emit_command(dummy_draw());
-    assert!(s.resolve_depth_attachment(destination, DepthResolveFilter::Sample0));
+    s.end_current_pass("test");
+    s.push_pending_leading_blit(depth_transfer(depth(), destination));
+    s.set_depth_stencil_attachment(MetalHandle::NULL, (0, 0), false, false);
+    s.emit_command(dummy_draw());
+    s.end_current_pass("test");
+    s.finalize_load_actions();
     s.finalize_store_actions(false);
-    s.strip_dead_color_in_clear_only_passes();
-    s.cull_dead_clear_only_passes();
 
-    assert_eq!(s.passes().len(), 2, "the resolve pass is not dead work");
-    assert_eq!(s.passes()[1].depth_resolve_texture(), destination);
+    assert_eq!(s.passes()[0].depth_texture(), depth());
+    assert_eq!(
+        s.passes()[0].depth_store(),
+        StoreAction::Store,
+        "the transfer reads the samples the draw left"
+    );
 }
 
 #[test]
-fn the_depth_resolve_destination_opens_a_later_pass_on_its_contents() {
+fn a_depth_transfer_destination_opens_a_later_pass_on_its_contents() {
     // Rule A would discard the destination's first use this frame; the
-    // resolve wrote it, so the bind that follows has to load.
+    // transfer wrote it, so the bind that follows has to load.
     let destination = tex(0x4002);
     let mut s = fresh_multisampled();
     s.emit_command(dummy_draw());
-    assert!(s.resolve_depth_attachment(destination, DepthResolveFilter::Sample0));
+    s.end_current_pass("test");
+    s.push_pending_leading_blit(depth_transfer(depth(), destination));
     s.set_depth_stencil_attachment(destination, BB_SIZE, false, false);
     s.set_depth_sample_count(4);
     s.emit_command(dummy_draw());
     s.end_current_pass("test");
+    s.finalize_load_actions();
 
+    assert!(s.texture_written_by_blit_this_frame(destination));
     assert_eq!(
-        s.passes()[2].depth_load(),
+        s.passes()[1].depth_load(),
         DepthLoad::Load,
-        "the resolved contents are loaded, not discarded"
+        "the transferred contents are loaded, not discarded"
     );
 }
 
 #[test]
-fn a_resz_resolve_without_a_bound_depth_attachment_records_nothing() {
-    let mut s = fresh_multisampled();
-    s.set_depth_stencil_attachment(MetalHandle::NULL, (0, 0), false, false);
-    s.emit_command(dummy_draw());
-    let passes_before = s.passes().len();
-    assert!(!s.resolve_depth_attachment(tex(0x4003), DepthResolveFilter::Sample0));
-    assert_eq!(s.passes().len(), passes_before, "no pass is synthesised");
-}
-
-#[test]
-fn a_depth_resolve_takes_a_source_that_is_not_the_bound_attachment() {
-    // The depth-to-depth `StretchRect` names both of its surfaces, and neither
-    // has to be the one `SetDepthStencilSurface` last bound.
-    let source = tex(0x4004);
-    let destination = tex(0x4005);
-    let mut s = fresh_multisampled();
-    s.emit_command(dummy_draw());
-    assert!(s.resolve_depth_texture(&DepthResolve {
-        source,
-        level: 0,
-        size: BB_SIZE,
-        destination,
-        filter: DepthResolveFilter::Sample0,
-        source_is_sampleable: false,
-    }));
-
-    let resolve = s.passes().last().expect("the resolve pass");
-    assert_eq!(
-        resolve.depth_texture(),
-        source,
-        "the pass reads the surface the copy named"
-    );
-    assert_ne!(
-        resolve.depth_texture(),
-        depth(),
-        "and not the bound attachment"
-    );
-    assert_eq!(resolve.depth_resolve_texture(), destination);
-}
-
-#[test]
-fn a_clear_only_pass_does_not_fold_past_a_depth_resolve_into_its_target() {
-    // Clear(ds) → resolve into ds → depth-test against ds. Rule E may not move
-    // the clear into the last pass's load action: the resolve lands between
-    // them, and a clear moved past it would wipe what it wrote.
+fn a_clear_only_pass_does_not_fold_past_a_depth_transfer_out_of_its_target() {
+    // Clear(ds) → transfer out of ds → draw against ds. Rule E may not move
+    // the clear into the draw pass's load action: the transfer runs ahead of
+    // that pass's render encoder, so it would read the depth from before the
+    // clear.
     let other_rt = tex(0x3000);
     let source = tex(0x4006);
-    let resolved = tex(0x4007);
+    let destination = tex(0x4007);
+    let mut s = fresh();
+    s.set_color_render_target(other_rt, 256, 256, RT_FORMAT, RenderScale::IDENTITY);
+    s.set_depth_stencil_attachment(source, BB_SIZE, false, false);
+    s.clear_depth(f32::to_bits(1.0));
+    s.push_leading_blit_after_clears(depth_transfer(source, destination), "test");
+    s.emit_command(dummy_draw());
+    s.end_current_pass("test");
+    s.coalesce_clear_only_passes();
+
+    assert_eq!(
+        s.passes().len(),
+        2,
+        "the clear-only pass stays where it was"
+    );
+    assert!(
+        matches!(s.passes()[0].depth_load(), DepthLoad::Clear { .. }),
+        "the clear lands before the transfer"
+    );
+    assert!(
+        matches!(s.passes()[1].depth_load(), DepthLoad::Load),
+        "the pass the transfer leads loads the cleared depth"
+    );
+}
+
+/// Run the load/store rules in the order the encoder applies them at submit.
+fn apply_submit_rules(s: &mut PassState) {
+    s.coalesce_clear_only_passes();
+    s.finalize_load_actions();
+    s.finalize_store_actions(false);
+    s.strip_dead_color_in_clear_only_passes();
+    s.cull_dead_clear_only_passes();
+}
+
+#[test]
+fn a_pending_depth_clear_lands_before_a_depth_transfer_out_of_its_surface() {
+    // Clear(ZBUFFER) on the bound multisampled depth with no pass open, then
+    // RESZ with no draw in between: the transfer reads the cleared depth, so
+    // the clear is recorded as a pass ahead of the one the transfer leads.
+    let cleared = f32::to_bits(0.5);
+    let destination = tex(0x400a);
+    let mut s = fresh_multisampled();
+    assert_eq!(s.clear_depth(cleared), DepthClearOutcome::Folded);
+    assert_eq!(s.pending_depth_clear(), Some(cleared));
+    s.push_leading_blit_after_clears(depth_transfer(depth(), destination), "test");
+    assert!(s.pending_depth_clear().is_none(), "nothing is left pending");
+    s.set_depth_stencil_attachment(MetalHandle::NULL, (0, 0), false, false);
+    s.emit_command(dummy_draw());
+    s.end_current_pass("test");
+    apply_submit_rules(&mut s);
+
+    assert_eq!(s.passes().len(), 2);
+    let clear = &s.passes()[0];
+    assert_eq!(clear.depth_texture(), depth());
+    assert_eq!(clear.depth_load(), DepthLoad::Clear { value: cleared });
+    assert_eq!(
+        clear.depth_store(),
+        StoreAction::Store,
+        "the cleared depth reaches memory for the transfer to read"
+    );
+    assert!(clear.leading_blits().is_empty());
+    let blits = s.passes()[1].leading_blits();
+    assert_eq!(blits.len(), 1, "the transfer runs after the clear");
+    assert_eq!(blits[0].cmd, BlitCommandType::TransferDepth as u32);
+    assert_eq!(blits[0].src_handle, depth().raw());
+}
+
+#[test]
+fn a_depth_clear_the_target_cannot_carry_lands_before_a_depth_transfer() {
+    // Render target 0 disagrees with the depth surface on samples, so the
+    // pending clear lands as a depth-only pass on that surface, still ahead
+    // of the transfer out of it.
+    let destination = tex(0x400b);
+    let mut s = msaa_depth_clear_then_single_sampled_draw();
+    s.push_leading_blit_after_clears(depth_transfer(depth(), destination), "test");
+    assert!(s.pending_depth_clear().is_none(), "nothing is left pending");
+    s.emit_command(dummy_draw());
+    s.end_current_pass("test");
+    apply_submit_rules(&mut s);
+
+    let transfer_pass = s
+        .passes()
+        .iter()
+        .position(|p| !p.leading_blits().is_empty())
+        .expect("the pass the transfer leads");
+    let clear_pass = s
+        .passes()
+        .iter()
+        .position(|p| p.depth_texture() == depth())
+        .expect("the depth-only clear pass");
+    assert!(clear_pass < transfer_pass, "the clear runs first");
+    let clear = &s.passes()[clear_pass];
+    assert!(clear.color_texture().is_null(), "a depth-only pass");
+    assert_eq!(clear.depth_load(), DepthLoad::Clear { value: 0x3f80_0000 });
+    assert_eq!(clear.depth_store(), StoreAction::Store);
+}
+
+#[test]
+fn a_clear_only_pass_does_not_fold_past_a_depth_transfer_into_its_target() {
+    // Clear(ds) → transfer into ds → depth-test against ds. The transfer lands
+    // between them, and a clear moved past it would wipe what it wrote.
+    let other_rt = tex(0x3000);
+    let source = tex(0x4008);
+    let resolved = tex(0x4009);
     let mut s = fresh();
     s.set_depth_stencil_attachment(resolved, BB_SIZE, false, false);
     s.clear_depth(f32::to_bits(1.0));
-    // Switching the target materialises the clear as a pass of its own.
     s.set_color_render_target(other_rt, 256, 256, RT_FORMAT, RenderScale::IDENTITY);
     s.set_depth_stencil_attachment(source, BB_SIZE, false, false);
     s.emit_command(dummy_draw());
-    assert!(s.resolve_depth_texture(&DepthResolve {
-        source,
-        level: 0,
-        size: BB_SIZE,
-        destination: resolved,
-        filter: DepthResolveFilter::Sample0,
-        source_is_sampleable: false,
-    }));
+    s.end_current_pass("test");
+    s.push_pending_leading_blit(depth_transfer(source, resolved));
     s.set_color_render_target(
         backbuffer(),
         BB_SIZE.0,
@@ -5573,16 +5751,16 @@ fn a_clear_only_pass_does_not_fold_past_a_depth_resolve_into_its_target() {
 
     assert_eq!(
         s.passes().len(),
-        4,
+        3,
         "the clear-only pass stays where it was"
     );
     assert!(
         matches!(s.passes()[0].depth_load(), DepthLoad::Clear { .. }),
-        "the clear lands before the resolve"
+        "the clear lands before the transfer"
     );
     assert!(
-        matches!(s.passes()[3].depth_load(), DepthLoad::Load),
-        "the draw after the resolve loads what it wrote"
+        matches!(s.passes()[2].depth_load(), DepthLoad::Load),
+        "the draw after the transfer loads what it wrote"
     );
 }
 
@@ -5640,6 +5818,11 @@ fn a_clear_only_pass_does_not_fold_past_a_colour_resolve_into_its_target() {
     s.emit_command(dummy_draw());
     s.end_current_pass("test");
     assert_eq!(
+        s.passes()[0].color_attachment_texture(),
+        rt_msaa,
+        "the clear paints the companion the resolve reads"
+    );
+    assert_eq!(
         s.passes()[1].extra_color()[0].resolve_texture(),
         rt,
         "the middle pass resolves into the cleared target"
@@ -5659,6 +5842,107 @@ fn a_clear_only_pass_does_not_fold_past_a_colour_resolve_into_its_target() {
         matches!(s.passes()[2].color_load(), ColorLoad::Load),
         "the draw after the resolve loads what it wrote"
     );
+}
+
+#[test]
+fn a_target_switch_flushes_pending_clears_onto_the_outgoing_multisampled_attachments() {
+    // Clear(TARGET | ZBUFFER) with no pass open, then SetRenderTarget: the
+    // clear-only pass paints the target the clear was issued against, so it
+    // carries the back buffer's companion and its 4x depth surface.
+    let offscreen = tex(0x3300);
+    let mut s = fresh_multisampled();
+    s.clear_color(1, 2, 3, 4);
+    s.clear_depth(f32::to_bits(1.0));
+    s.set_color_render_target(
+        offscreen,
+        BB_SIZE.0,
+        BB_SIZE.1,
+        BB_FORMAT,
+        RenderScale::IDENTITY,
+    );
+
+    assert_eq!(s.passes().len(), 1, "the clears materialise as a pass");
+    let pass = &s.passes()[0];
+    assert_eq!(pass.color_texture(), backbuffer());
+    assert_eq!(
+        pass.color_attachment_texture(),
+        msaa_backbuffer(),
+        "the colour clear paints the companion the frame resolves"
+    );
+    assert!(matches!(pass.color_load(), ColorLoad::Clear { .. }));
+    assert_eq!(
+        pass.depth_texture(),
+        depth(),
+        "the depth surface matches the companion's sample count"
+    );
+    assert!(matches!(pass.depth_load(), DepthLoad::Clear { .. }));
+}
+
+#[test]
+fn a_depth_switch_flushes_the_pending_depth_clear_onto_the_outgoing_multisampled_surface() {
+    let other = tex(0x3301);
+    let mut s = fresh_multisampled();
+    s.clear_depth(f32::to_bits(1.0));
+    s.set_depth_stencil_attachment(other, BB_SIZE, false, false);
+    s.set_depth_sample_count(4);
+
+    assert_eq!(s.passes().len(), 1, "the clear materialises as a pass");
+    let pass = &s.passes()[0];
+    assert_eq!(
+        pass.depth_texture(),
+        depth(),
+        "the clear lands on the surface it was issued against"
+    );
+    assert!(matches!(pass.depth_load(), DepthLoad::Clear { .. }));
+    assert_eq!(s.current_depth_texture(), other);
+    assert_eq!(s.current_depth_sample_count(), 4);
+}
+
+#[test]
+fn rebinding_render_target_0_keeps_multisampled_extras_in_the_pass() {
+    let extra = tex(0x3302);
+    let extra_msaa = tex(0x3303);
+    let scene = tex(0x3304);
+    let scene_msaa = tex(0x3305);
+    let mut s = fresh_multisampled();
+    s.set_extra_color_render_target(1, Some(msaa_slot(extra, extra_msaa, BB_SIZE)));
+    assert_eq!(s.extra_present_mask(), 0b001);
+    s.emit_command(dummy_draw());
+
+    // Games re-assert the bound target between scenes.
+    s.set_color_render_target(
+        backbuffer(),
+        BB_SIZE.0,
+        BB_SIZE.1,
+        BB_FORMAT,
+        RenderScale::IDENTITY,
+    );
+    s.set_color_msaa(msaa_backbuffer(), msaa_backbuffer_srgb(), 4);
+    assert_eq!(
+        s.extra_present_mask(),
+        0b001,
+        "a redundant rebind keeps the 4x extra"
+    );
+    assert_eq!(s.passes().len(), 1);
+    assert!(!s.current_pass_closed(), "and keeps the pass open");
+
+    s.set_color_render_target(
+        scene,
+        BB_SIZE.0,
+        BB_SIZE.1,
+        BB_FORMAT,
+        RenderScale::IDENTITY,
+    );
+    s.set_color_msaa(scene_msaa, MetalHandle::NULL, 4);
+    assert_eq!(
+        s.extra_present_mask(),
+        0b001,
+        "a 4x target 0 readmits the 4x extra"
+    );
+    s.emit_command(dummy_draw());
+    let pass = s.passes().last().expect("the scene pass");
+    assert_eq!(pass.color_attachment_texture(), scene_msaa);
+    assert_eq!(pass.extra_color()[0].texture(), extra);
 }
 
 fn uneven_command_frame(s: &mut PassState) {
@@ -5852,14 +6136,8 @@ fn mixed_command_frame(s: &mut PassState) {
         }
         s.end_current_pass("test");
     }
-    assert!(s.resolve_depth_texture(&DepthResolve {
-        source: depth(),
-        level: 0,
-        size: BB_SIZE,
-        destination: tex(0x4000),
-        filter: DepthResolveFilter::Sample0,
-        source_is_sampleable: true,
-    }));
+    s.pending_depth_clear = Some(f32::to_bits(1.0));
+    s.push_depth_clear_pass();
     for target in [tex(0x5000), tex(0x6000)] {
         s.push_upload_pass(
             &UploadPassTarget {
@@ -5877,11 +6155,11 @@ fn mixed_command_frame(s: &mut PassState) {
     assert_eq!(s.passes[0].color_texture, tex(0x5000));
     assert_eq!(s.passes[1].color_texture, tex(0x6000));
     assert!(s.passes[5].commands.is_empty());
-    assert_eq!(s.passes[5].depth_resolve_texture, tex(0x4000));
+    assert!(matches!(s.passes[5].depth_load, DepthLoad::Clear { .. }));
 }
 
 #[test]
-fn command_pool_converges_with_head_uploads_and_depth_resolves() {
+fn command_pool_converges_with_head_uploads_and_depth_clear_passes() {
     let mut s = fresh();
     // Uploads move to the front after borrowing vectors in recording order,
     // so their capacity alignment can take more than one frame to converge.

@@ -7414,12 +7414,22 @@ extern "system" fn device_stretch_rect(
         // work this call will use.
         flush_dirty_mips_for_gpu_write(&obj, &[src_surf, dst_surf]);
         if resolve {
-            // The samples are reduced on a render pass of the source, which
-            // also enters the destination into the load/store model as
-            // written. Both endpoints are standalone depth surfaces, the only
-            // shape that carries `IS_DEPTH_STENCIL`.
-            let (StretchKind::DepthStencil(src_handle), StretchKind::DepthStencil(dst_handle)) =
-                (&src_info.kind, &dst_info.kind)
+            // The samples are reduced by a depth transfer queued after the
+            // passes recorded so far, which also enters the source into the
+            // load/store model as read and the destination as written. Both
+            // endpoints are standalone depth surfaces, the only shape that
+            // carries `IS_DEPTH_STENCIL`.
+            let (
+                StretchKind::DepthStencil(src_handle),
+                StretchKind::DepthStencil(dst_handle),
+                Some(source_format),
+                Some(destination_format),
+            ) = (
+                &src_info.kind,
+                &dst_info.kind,
+                mtld3d_core::format::map_d3d_depth_format(src_info.format),
+                mtld3d_core::format::map_d3d_depth_format(dst_info.format),
+            )
             else {
                 mtld3d_shared::log_once_warn!(
                     target: crate::LOG_TARGET,
@@ -7427,16 +7437,27 @@ extern "system" fn device_stretch_rect(
                 );
                 return D3DERR_INVALIDCALL;
             };
-            let (src_handle, dst_handle) = (*src_handle, *dst_handle);
-            let (width, height) = (
-                src_info.scale.dimension(src_info.width),
-                src_info.scale.dimension(src_info.height),
-            );
+            let transfer = crate::encoder::DepthTransfer {
+                source: *src_handle,
+                source_level: 0,
+                source_size: (
+                    src_info.scale.dimension(src_info.width),
+                    src_info.scale.dimension(src_info.height),
+                ),
+                source_format,
+                source_samples: src_info.sample_count,
+                destination: *dst_handle,
+                destination_size: (
+                    dst_info.scale.dimension(dst_info.width),
+                    dst_info.scale.dimension(dst_info.height),
+                ),
+                destination_format,
+            };
             if dev.frame_dump.active {
                 dev.frame_dump_event("StretchRect: multisampled depth resolve queued");
             }
             dev.push_op(Box::new(move |enc| {
-                enc.resolve_depth_surface(src_handle, dst_handle, width, height);
+                enc.resolve_depth_surface(&transfer);
             }));
             return D3D_OK;
         }
@@ -8603,6 +8624,9 @@ fn color_fill_render_target(
         subresource: (info.slice.unwrap_or(0), info.mip_level),
         rect: (region.x, region.y, region.w, region.h),
         rgba: (r.to_bits(), g.to_bits(), b.to_bits(), a.to_bits()),
+        msaa: info.msaa,
+        msaa_srgb: info.msaa_srgb,
+        sample_count: info.sample_count,
         regenerate_mipmaps: info.autogen_texture_id.is_some(),
     };
     let kind = info.kind;
@@ -10018,9 +10042,10 @@ extern "system" fn device_set_render_state(this: *mut c_void, state: u32, value:
                     enc.resolve_dynamic_depth(dst, &info);
                 }));
             } else if !dynamic_depth {
+                let format = tex.metal_pixel_format();
                 dev.push_op(Box::new(move |enc| {
                     let dst = enc.get_texture_handle_by_id(id);
-                    enc.resolve_depth_to_texture(dst, w, h);
+                    enc.resolve_depth_to_texture(dst, w, h, format);
                 }));
             }
         }

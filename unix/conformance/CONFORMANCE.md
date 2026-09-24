@@ -337,6 +337,15 @@ The readback counts as the level's initial upload, so a READONLY lock of a
 level only the GPU wrote publishes nothing and the texture keeps the
 transferred depth rather than its packed code.
 
+A multisampled RESZ into any other destination, and a depth-to-depth
+`StretchRect` out of a multisampled surface, take the same transfer: sample
+zero of depth and of the common stencil plane, written by compute and blit
+work. Neither uses a render-pass depth resolve, whose destination the Intel CI
+image's paravirtual device leaves reading what an earlier pass stored there
+(resz_test 17724 and 17862 read the INTZ's clear through one). Every transfer
+lands a clear still waiting for a pass first, so a `Clear` issued just before
+it is what it reads.
+
 Both architectures and all local variants pass device.c:13838. Hosted Mac2
 recordings also pass on both architectures; its obsolete pins are removed.
 
@@ -484,8 +493,8 @@ Audit provenance: every cluster below was re-derived on 2026-07-20 from the
 Wine test source, the raw actual-vs-expected failure messages
 (`MTLD3D_CONFORMANCE_RAW_DIR`), and the implementation — independently
 re-checked before retagging. Current classifications, counted from the
-`Sites:` tokens below on 2026-09-22: 0 `real`, 131 `expected`, 1 `caps`,
-22 `ceiling`, 4 `flaky`, 0 `untriaged`, 158 unique sites in all.
+`Sites:` tokens below on 2026-09-24: 0 `real`, 130 `expected`, 1 `caps`,
+22 `ceiling`, 3 `flaky`, 0 `untriaged`, 156 unique sites in all.
 The audit recorded all 24 Apple-family subtest-legs `crash=0`.
 (2026-09-05: the two answers a device
 without the packed 16-bit formats derives from its render-target answer,
@@ -534,7 +543,13 @@ device window hands the session over instead of giving the old window back,
 so test_device_window_reset 5968 passes and that cluster leaves the document
 as well; retargeting the Metal layer and the cursor subclass onto that window
 in the same `Reset` then added 5975 and 5978, the same window-procedure
-decision test_wndproc already records, and the cluster comes back for them.) Only two tags change what the gate tolerates:
+decision test_wndproc already records, and the cluster comes back for them.
+2026-09-24: both multisampled depth resolves (RESZ and the depth-to-depth
+`StretchRect`) copy through a depth transfer instead of a render pass with a
+depth resolve attachment, so the paravirtual device's resolve fault no longer
+reaches multisampled_depth_buffer_test and its `@mac2` cluster (17330, 17476)
+leaves the document; test_multisample_mismatch 20959 and 20962 pass on the
+`@mac2` legs as well.) Only two tags change what the gate tolerates:
 `flaky` (count changes in either direction) and `ceiling` (reads below the
 pin). Every other tag is documentation, so a correction between `real`,
 `expected` and `caps` is never a gate change.
@@ -1092,26 +1107,6 @@ on the paravirtual display, whose single mode makes the request a non-mode
 one (`test_mode_change` above); that mechanism is inferred from the
 rejection, not read from a trace. The Apple-family legs pass every site.
 
-### visual.c/multisampled_depth_buffer_test
-Sites: 17330=flaky 17476=expected
-
-`@mac2` legs only. Both sections resolve a multisampled depth surface
-through `StretchRect` and then depth-test draws against the resolve target.
-The paravirtual device hands a later encoder of the same command buffer the
-content the resolve target held before the resolve (measured in the
-workflow's probe job, with and without an encoder in between); Apple GPUs
-see the resolve. The draws are therefore tested against the target's clear
-rather than the resolved scene. A device fault in Metal's ordering
-guarantee, and a submit boundary alone does not mask it either: a copy in
-the next command buffer can still read the pre-resolve content. The layer
-therefore waits for the resolving command buffer to complete before it
-copies out of a resolve target on this device (`RESOLVE_NEEDS_RETIRE` in
-`DeviceCapsFlags`), the wait a readback pays anyway; these two sites read
-through a draw, not a copy, so they stay `expected`, and a real Intel/AMD
-Mac is expected to read zero here. 17330 reads its full count on one run
-and zero on the next, since the resolve sometimes lands before the load
-after all; `flaky`, pinned at the higher count.
-
 ### visual.c/test_multisample_mismatch
 Sites: 20880=expected 20883=expected 20959=expected 20962=expected
 
@@ -1121,9 +1116,7 @@ pass whose attachments disagree on sample count, so mtld3d drops the
 mismatched depth attachment; the draws land but the depth test does not
 gate them. The pipelines and clear quads built for such a pass declare no
 depth or stencil format either, since Metal rejects a pipeline that names a
-format the pass has no attachment for. Same rationale as
-multisampled_depth_buffer_test 17476, and the same evidence that D3D9 never
-defined the case: every assertion here carries a second accepted colour under
+format the pass has no attachment for. D3D9 never defined the case: every assertion here carries a second accepted colour under
 `broken()`, and the comments in the test record that AMD and Nvidia disagree
 about whether the draw happens at all.
 

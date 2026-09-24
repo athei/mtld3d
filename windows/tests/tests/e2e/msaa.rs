@@ -1021,17 +1021,11 @@ fn sample_intz(h: &Harness, rt: &Surface<'_>, intz: &Texture<'_>) -> u32 {
 fn resz_resolves_a_multisampled_depth_surface() {
     // The RESZ hack hands the bound depth-stencil to a single-sampled INTZ
     // texture. From a multisampled surface that is a resolve, not a copy:
-    // Metal's blit encoder refuses the sample-count change, so the pass
-    // machinery has to take the resolve instead. The scene writes one constant
+    // Metal's blit encoder refuses the sample-count change, so a depth
+    // transfer takes sample zero instead. The scene writes one constant
     // depth, so the multisampled answer and the single-sampled one are the
     // same value and can be compared directly.
     let h = harness(D3DMULTISAMPLE_NONE, None);
-    if h.device_is_paravirtual() {
-        // The paravirtual device hands a later encoder of the same command
-        // buffer the content a depth resolve target held before the resolve,
-        // so a resolved depth cannot be read back through it there.
-        return;
-    }
     let size = (RT_SIZE, RT_SIZE);
     let ms = (D3DMULTISAMPLE_4_SAMPLES, 0);
 
@@ -1083,22 +1077,183 @@ fn resz_resolves_a_multisampled_depth_surface() {
     assert_eq!(h.clear_texture(0), 0, "clear the sampler bind");
 }
 
+#[test]
+fn resz_reads_the_resolved_depth_over_a_render_pass_clear_of_its_destination() {
+    // The INTZ destination is cleared to the far plane by a depth-only Clear
+    // while it is the bound depth surface, so a render pass writes it before
+    // the resolve does. The scene then renders into a 2x target and depth
+    // surface, a draw with colour writes and depth off samples the INTZ
+    // before the resolve, and the RESZ lands inside the same scene. What the
+    // INTZ reads back afterwards is the scene's depth, not that clear.
+    let h = harness(D3DMULTISAMPLE_NONE, None);
+    let size = (RT_SIZE, RT_SIZE);
+    let ms = (D3DMULTISAMPLE_2_SAMPLES, 0);
+    let ms_rt = h.create_render_target_ms(size, D3DFMT_A8R8G8B8, ms);
+    let ms_ds = h
+        .create_depth_stencil_surface_ms_hr(size, D3DFMT_D24S8, ms)
+        .1
+        .expect("2x depth surface");
+    let ss_rt = h.create_render_target(RT_SIZE, RT_SIZE, D3DFMT_A8R8G8B8);
+    let intz = h.create_texture(
+        RT_SIZE,
+        RT_SIZE,
+        1,
+        D3DUSAGE_DEPTHSTENCIL,
+        D3DFMT_INTZ,
+        D3DPOOL_DEFAULT,
+    );
+
+    assert_eq!(h.set_render_target(0, &ss_rt), 0, "SetRenderTarget(prime)");
+    assert_eq!(
+        h.set_depth_stencil_surface(&intz.surface_level(0)),
+        0,
+        "bind the INTZ level as depth"
+    );
+    assert_eq!(
+        h.clear(D3DCLEAR_ZBUFFER, 0, 1.0, 0),
+        0,
+        "depth-only clear of the INTZ to the far plane"
+    );
+
+    arm(&h);
+    h.select_diffuse_stage(0);
+    assert_eq!(h.set_render_target(0, &ms_rt), 0, "SetRenderTarget(scene)");
+    assert_eq!(
+        h.set_depth_stencil_surface(&ms_ds),
+        0,
+        "SetDepthStencilSurface(scene)"
+    );
+    assert_eq!(h.set_render_state(D3DRS_ZENABLE, 1), 0, "depth test on");
+    assert_eq!(h.set_render_state(D3DRS_ZWRITEENABLE, 1), 0, "depth writes");
+    assert_eq!(
+        h.set_render_state(D3DRS_ZFUNC, D3DCMP_ALWAYS),
+        0,
+        "depth func"
+    );
+    assert_eq!(
+        h.clear(D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, BLACK, 1.0, 0),
+        0,
+        "clear colour + depth"
+    );
+    assert_eq!(h.begin_scene(), 0, "BeginScene");
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &covering_triangle(RESZ_DEPTH)),
+        0,
+        "depth-writing draw",
+    );
+
+    // The draw ahead of the resolve samples the INTZ with every write off.
+    assert_eq!(h.set_texture(0, &intz), 0, "bind the RESZ destination");
+    h.select_texture_stage(0);
+    assert_eq!(
+        h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1),
+        0,
+        "SetFVF(dummy)"
+    );
+    assert_eq!(h.set_render_state(D3DRS_ZENABLE, 0), 0, "depth test off");
+    assert_eq!(
+        h.set_render_state(D3DRS_ZWRITEENABLE, 0),
+        0,
+        "depth writes off"
+    );
+    assert_eq!(
+        h.set_render_state(D3DRS_COLORWRITEENABLE, 0),
+        0,
+        "colour writes off"
+    );
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &textured_quad()),
+        0,
+        "dummy draw sampling the INTZ",
+    );
+    assert_eq!(h.set_render_state(D3DRS_ZENABLE, 1), 0, "depth test on");
+    assert_eq!(h.set_render_state(D3DRS_ZWRITEENABLE, 1), 0, "depth writes");
+    assert_eq!(
+        h.set_render_state(D3DRS_COLORWRITEENABLE, 0xf),
+        0,
+        "colour writes on"
+    );
+
+    assert_eq!(
+        h.set_render_state(D3DRS_POINTSIZE, 0x7fa0_5000),
+        0,
+        "the RESZ magic value"
+    );
+    assert_eq!(h.end_scene(), 0, "EndScene");
+
+    // RESZ_DEPTH is 0.25, which an 8-bit channel reads as 64; the far plane
+    // the clear left would read as 255.
+    let pixel = Rgba8::from_pixel(sample_intz(&h, &ss_rt, &intz));
+    assert!(
+        pixel.r.abs_diff(64) <= 2,
+        "the INTZ holds the resolved scene depth, not its clear: {pixel:?}"
+    );
+
+    assert_eq!(h.clear_texture(0), 0, "clear the sampler bind");
+}
+
+#[test]
+fn resz_reads_a_depth_clear_with_no_draw_before_it() {
+    // Clear(ZBUFFER) on the bound multisampled depth with no pass open, then
+    // RESZ straight away: the resolve reads the cleared depth, not whatever
+    // the surface held before the clear.
+    let h = harness(D3DMULTISAMPLE_NONE, None);
+    let size = (RT_SIZE, RT_SIZE);
+    let ms = (D3DMULTISAMPLE_2_SAMPLES, 0);
+    let ms_rt = h.create_render_target_ms(size, D3DFMT_A8R8G8B8, ms);
+    let ms_ds = h
+        .create_depth_stencil_surface_ms_hr(size, D3DFMT_D24S8, ms)
+        .1
+        .expect("2x depth surface");
+    let ss_rt = h.create_render_target(RT_SIZE, RT_SIZE, D3DFMT_A8R8G8B8);
+    let intz = h.create_texture(
+        RT_SIZE,
+        RT_SIZE,
+        1,
+        D3DUSAGE_DEPTHSTENCIL,
+        D3DFMT_INTZ,
+        D3DPOOL_DEFAULT,
+    );
+    prime_intz(&h, &ss_rt, &intz);
+
+    assert_eq!(h.set_render_target(0, &ms_rt), 0, "SetRenderTarget(scene)");
+    assert_eq!(
+        h.set_depth_stencil_surface(&ms_ds),
+        0,
+        "SetDepthStencilSurface(scene)"
+    );
+    assert_eq!(
+        h.clear(D3DCLEAR_ZBUFFER, 0, RESZ_DEPTH, 0),
+        0,
+        "clear the multisampled depth, no draw after it"
+    );
+    assert_eq!(h.set_texture(0, &intz), 0, "bind the RESZ destination");
+    assert_eq!(
+        h.set_render_state(D3DRS_POINTSIZE, 0x7fa0_5000),
+        0,
+        "the RESZ magic value"
+    );
+
+    // RESZ_DEPTH is 0.25, which an 8-bit channel reads as 64.
+    let pixel = Rgba8::from_pixel(sample_intz(&h, &ss_rt, &intz));
+    assert!(
+        pixel.r.abs_diff(64) <= 2,
+        "the INTZ holds the cleared depth: {pixel:?}"
+    );
+
+    assert_eq!(h.clear_texture(0), 0, "clear the sampler bind");
+}
+
 // ── StretchRect from a multisampled depth surface ──
 
 #[test]
 fn stretch_rect_resolves_a_multisampled_depth_surface() {
     // A depth-to-depth StretchRect out of a multisampled surface is a resolve,
-    // not a copy: Metal's blit encoder refuses the sample-count change, so the
-    // pass machinery has to take it. The destination is observed through the
-    // depth test rather than read back, which D3D9 does not allow on a depth
-    // surface.
+    // not a copy: Metal's blit encoder refuses the sample-count change, so a
+    // depth transfer takes sample zero instead. The destination is observed
+    // through the depth test rather than read back, which D3D9 does not allow
+    // on a depth surface.
     let h = harness(D3DMULTISAMPLE_NONE, None);
-    if h.device_is_paravirtual() {
-        // The paravirtual device hands a later encoder of the same command
-        // buffer the content a depth resolve target held before the resolve,
-        // so a resolved depth cannot be read back through it there.
-        return;
-    }
     let size = (RT_SIZE, RT_SIZE);
     let ms = (D3DMULTISAMPLE_4_SAMPLES, 0);
 
@@ -1856,9 +2011,6 @@ fn a2m_recorded_capture_retains_component_membership() {
 #[test]
 fn a2m_resz_keeps_latch_and_resolves_depth() {
     let h = Harness::new();
-    if h.device_is_paravirtual() {
-        return;
-    }
     let target = h.create_render_target_ms(
         (RT_SIZE, RT_SIZE),
         D3DFMT_A8R8G8B8,

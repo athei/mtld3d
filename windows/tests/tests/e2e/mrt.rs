@@ -10,9 +10,9 @@ use mtld3d_tests::{Harness, PosColorVertex, Rgba8, Surface, TexturedVertex};
 use mtld3d_types::{
     D3D_OK, D3DCLEAR_TARGET, D3DERR_INVALIDCALL, D3DERR_NOTFOUND, D3DFMT_A8R8G8B8, D3DFMT_R32F,
     D3DFVF_DIFFUSE, D3DFVF_TEX1, D3DFVF_XYZ, D3DLOCK_READONLY, D3DPOOL_DEFAULT, D3DPOOL_SYSTEMMEM,
-    D3DPT_TRIANGLELIST, D3DRECT, D3DRS_COLORWRITEENABLE1, D3DRS_LIGHTING, D3DSAMP_ADDRESSU,
-    D3DSAMP_ADDRESSV, D3DSAMP_MAGFILTER, D3DSAMP_MINFILTER, D3DTADDRESS_CLAMP, D3DTEXF_POINT,
-    D3DUSAGE_RENDERTARGET, PrimitiveMiscCaps,
+    D3DPT_TRIANGLELIST, D3DRECT, D3DRS_COLORWRITEENABLE1, D3DRS_LIGHTING, D3DRS_SRGBWRITEENABLE,
+    D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_MAGFILTER, D3DSAMP_MINFILTER, D3DTADDRESS_CLAMP,
+    D3DTEXF_POINT, D3DUSAGE_RENDERTARGET, D3DVIEWPORT9, PrimitiveMiscCaps,
 };
 
 const BLACK: u32 = 0xFF00_0000;
@@ -696,4 +696,69 @@ fn a_clear_stays_ahead_of_a_pass_that_draws_into_its_target_as_an_extra() {
         "the corner draw lands on top",
     );
     assert_eq!(h.clear_pixel_shader(), D3D_OK);
+}
+
+#[test]
+fn larger_target_outside_the_pass_takes_one_srgb_encode_inside_the_viewport() {
+    // Target 0 is a 32x32 R32F with no sRGB view, so the clear is encoded
+    // before it is stored; slot 1 is a 64x64 A8R8G8B8 outside the pass, whose
+    // sRGB view encodes the value itself. Slot 1 must hold linear 0x80 encoded
+    // once (~0xBC, not ~0xDF), and only inside the 32x32 viewport: D3D9 clears
+    // the viewport intersected with each target, not the whole target.
+    let h = Harness::new();
+    let rt0 = h.create_texture(
+        32,
+        32,
+        1,
+        D3DUSAGE_RENDERTARGET,
+        D3DFMT_R32F,
+        D3DPOOL_DEFAULT,
+    );
+    let rt1 = h.create_texture(
+        64,
+        64,
+        1,
+        D3DUSAGE_RENDERTARGET,
+        D3DFMT_A8R8G8B8,
+        D3DPOOL_DEFAULT,
+    );
+    let rt1_surface = rt1.surface_level(0);
+    assert_eq!(h.set_render_target(0, &rt1_surface), D3D_OK, "rt1 alone");
+    assert_eq!(h.clear_target(BLACK), D3D_OK, "clear rt1 whole");
+    assert_eq!(
+        h.set_render_target(0, &rt0.surface_level(0)),
+        D3D_OK,
+        "bind slot 0"
+    );
+    assert_eq!(h.set_render_target(1, &rt1_surface), D3D_OK, "bind slot 1");
+    let viewport = D3DVIEWPORT9 {
+        x: 0,
+        y: 0,
+        width: 32,
+        height: 32,
+        min_z: 0.0,
+        max_z: 1.0,
+    };
+    assert_eq!(h.set_viewport(&viewport), D3D_OK, "viewport over slot 0");
+    assert_eq!(
+        h.set_render_state(D3DRS_SRGBWRITEENABLE, 1),
+        D3D_OK,
+        "sRGB on"
+    );
+    assert_eq!(h.clear_target(0xFF80_8080), D3D_OK, "sRGB-write clear");
+    assert_eq!(
+        h.set_render_state(D3DRS_SRGBWRITEENABLE, 0),
+        D3D_OK,
+        "sRGB off"
+    );
+    assert_color(
+        read_rt_pixel(&h, &rt1_surface, 8, 8),
+        0xFFBC_BCBC,
+        "slot 1 inside the viewport is encoded once",
+    );
+    assert_color(
+        read_rt_pixel(&h, &rt1_surface, 48, 48),
+        BLACK,
+        "slot 1 outside the viewport keeps its contents",
+    );
 }

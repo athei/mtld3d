@@ -6,10 +6,7 @@
 use log::{Level, log_enabled, trace};
 use mtld3d_shared::{
     BlitCommand, BlitCommandType, Command, CommandType, MetalHandle,
-    mtl::{
-        CullMode, DepthResolveFilter, PixelFormat, TriangleFillMode, VERTEX_STREAM_SLOTS,
-        VisibilityResultMode,
-    },
+    mtl::{CullMode, PixelFormat, TriangleFillMode, VERTEX_STREAM_SLOTS, VisibilityResultMode},
     mtl_handle::{MTLRenderPipelineStateKind, MTLTextureKind},
 };
 use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
@@ -400,21 +397,6 @@ pub struct UploadPassTarget {
     pub rect: (u32, u32, u32, u32),
 }
 
-/// The two ends of a depth resolve and how it reduces the samples.
-///
-/// `size` is the source level's extent, which the destination shares: a
-/// resolve neither scales nor sub-rects. `source_is_sampleable` marks a source
-/// something also reads as a texture, which keeps its store action alive under
-/// Rule B.
-pub struct DepthResolve {
-    pub source: MetalHandle<MTLTextureKind>,
-    pub level: u32,
-    pub size: (u32, u32),
-    pub destination: MetalHandle<MTLTextureKind>,
-    pub filter: DepthResolveFilter,
-    pub source_is_sampleable: bool,
-}
-
 impl PassColorAttachment {
     /// The unbound attachment.
     pub const NONE: Self = Self {
@@ -654,16 +636,6 @@ pub struct Pass {
     /// back to device memory is wasted. The unix side mirrors this to the
     /// stencil attachment when the texture is `Depth32Float_Stencil8`.
     depth_store: StoreAction,
-    /// Single-sample depth texture this pass resolves `depth_texture` into.
-    ///
-    /// NULL on every ordinary pass. Set by
-    /// [`PassState::resolve_depth_attachment`] on the pass it synthesises for
-    /// the RESZ hack, the one place D3D9 asks for a depth surface's samples to
-    /// be resolved. `depth_store` still decides whether the multisample
-    /// content survives the pass; the resolve rides alongside it.
-    depth_resolve_texture: MetalHandle<MTLTextureKind>,
-    /// How the resolve reduces the samples; meaningless without `depth_resolve_texture`.
-    depth_resolve_filter: DepthResolveFilter,
     viewport: (u32, u32, u32, u32),
     commands: Vec<Command>,
     /// Blits replayed inside an `MTLBlitCommandEncoder` *before* this pass's render encoder begins.
@@ -907,16 +879,6 @@ impl Pass {
     #[must_use]
     pub const fn depth_store(&self) -> StoreAction {
         self.depth_store
-    }
-    /// Single-sample depth texture this pass resolves into, NULL for none.
-    #[must_use]
-    pub const fn depth_resolve_texture(&self) -> MetalHandle<MTLTextureKind> {
-        self.depth_resolve_texture
-    }
-    /// How the depth resolve reduces the samples; meaningless without a resolve texture.
-    #[must_use]
-    pub const fn depth_resolve_filter(&self) -> DepthResolveFilter {
-        self.depth_resolve_filter
     }
     /// `(origin_x, origin_y, width, height)` in pixels.
     ///
@@ -1823,31 +1785,45 @@ impl PassState {
     /// Attach `msaa` as render target 0's multisampled companion.
     ///
     /// Called in lockstep with `set_color_render_target*`, which clears both
-    /// fields first, so a single-sampled bind needs no call at all. `msaa`
-    /// NULL with a `sample_count` above 1 is the caller saying the target is
-    /// multisampled but its companion could not be created; the pass then
-    /// renders single-sampled into the resolve texture, which is visually
-    /// wrong only in that it is not antialiased.
+    /// fields when the target changes, so a single-sampled bind needs no call
+    /// at all. `msaa` NULL with a `sample_count` above 1 is the caller saying
+    /// the target is multisampled but its companion could not be created; the
+    /// pass then renders single-sampled into the resolve texture, which is
+    /// visually wrong only in that it is not antialiased.
     pub fn set_color_msaa(
         &mut self,
         msaa: MetalHandle<MTLTextureKind>,
         msaa_srgb: MetalHandle<MTLTextureKind>,
         sample_count: u8,
     ) {
-        self.current_color_msaa_texture = msaa;
-        self.current_color_msaa_srgb_texture = if msaa.is_null() {
+        let msaa_srgb = if msaa.is_null() {
             MetalHandle::NULL
         } else {
             msaa_srgb
         };
-        self.current_color_sample_count = if msaa.is_null() {
+        let sample_count = if msaa.is_null() {
             1
         } else {
             sample_count.max(1)
         };
-        // The companion carries its own sRGB view, so gaining or losing one
-        // can change whether the pass can encode through the attachment.
-        self.apply_srgb_write_change();
+        // A pass freezes its attachments when it opens, and a same-target
+        // rebind leaves it open, so a companion that differs from the one it
+        // attached ends it.
+        if self.current_color_msaa_texture != msaa
+            || self.current_color_msaa_srgb_texture != msaa_srgb
+            || self.current_color_sample_count != sample_count
+        {
+            if self.pending_color_clear.is_some() {
+                self.flush_pending_clears();
+            }
+            self.end_current_pass("set_color_msaa");
+        }
+        self.current_color_msaa_texture = msaa;
+        self.current_color_msaa_srgb_texture = msaa_srgb;
+        self.current_color_sample_count = sample_count;
+        // An extra target takes part only at target 0's sample count, and the
+        // mask recompute re-resolves the sRGB views the companion carries.
+        self.recompute_extra_present_mask();
     }
 
     /// Sample count of the currently bound render target 0.
@@ -1884,9 +1860,9 @@ impl PassState {
     /// Declare the sample count of the depth attachment bound alongside the colour one.
     ///
     /// Called in lockstep with `set_depth_stencil_attachment*`, which reset it
-    /// to 1. A depth attachment whose count does not match render target 0's
-    /// is dropped at pass open rather than handed to Metal, which rejects the
-    /// pass outright.
+    /// to 1 when the surface changes. A depth attachment whose count does not
+    /// match render target 0's is dropped at pass open rather than handed to
+    /// Metal, which rejects the pass outright.
     pub const fn set_depth_sample_count(&mut self, sample_count: u8) {
         self.current_depth_sample_count = if sample_count == 0 { 1 } else { sample_count };
     }
@@ -1983,8 +1959,16 @@ impl PassState {
     ///
     /// Pairs with [`Self::restore_color_attachments`]. Ends the current pass
     /// when extras were bound, since a pass records its attachment set at
-    /// open and the caller is about to bind targets of its own.
+    /// open and the caller is about to bind targets of its own. A pending
+    /// clear flushes first, while the extras it was issued against are
+    /// still bound.
     pub fn take_color_attachments(&mut self) -> SavedColorAttachments {
+        if self.has_extra_color_targets() {
+            if self.pending_color_clear.is_some() {
+                self.flush_pending_clears();
+            }
+            self.end_current_pass("take_color_attachments");
+        }
         let saved = SavedColorAttachments {
             texture: self.current_color_texture,
             msaa_texture: self.current_color_msaa_texture,
@@ -1998,12 +1982,6 @@ impl PassState {
             has_alpha: self.current_color_rt_has_alpha(),
             extra: core::mem::replace(&mut self.current_extra_color, [ExtraColorSlot::NONE; 3]),
         };
-        if saved.extra.iter().any(ExtraColorSlot::is_bound) {
-            if self.pending_color_clear.is_some() {
-                self.flush_pending_clears();
-            }
-            self.end_current_pass("take_color_attachments");
-        }
         self.recompute_extra_present_mask();
         saved
     }
@@ -2759,12 +2737,23 @@ impl PassState {
             && !self.seen_depth_rts.contains(&depth_texture)
             && !self.seen_sampled_textures.contains(&depth_texture)
             && !self.blit_written_rts.contains(&depth_texture);
-        let depth_load = match self.pending_depth_clear.take() {
+        // A pass that dropped the depth surface has nowhere to apply a pending
+        // depth or stencil clear, so both stay pending for the next pass that
+        // attaches the surface, or for `flush_pending_clears`.
+        let (pending_depth, pending_stencil) = if depth_texture.is_null() {
+            (None, None)
+        } else {
+            (
+                self.pending_depth_clear.take(),
+                self.pending_stencil_clear.take(),
+            )
+        };
+        let depth_load = match pending_depth {
             Some(value) => DepthLoad::Clear { value },
             None if ENABLE_FIRST_USE_DONTCARE && depth_first_use => DepthLoad::DontCare,
             None => DepthLoad::Load,
         };
-        let stencil_load = match self.pending_stencil_clear.take() {
+        let stencil_load = match pending_stencil {
             Some(value) => StencilLoad::Clear { value },
             None if ENABLE_FIRST_USE_STENCIL_DONTCARE && depth_first_use => StencilLoad::DontCare,
             None => StencilLoad::Load,
@@ -2816,8 +2805,6 @@ impl PassState {
             depth_load,
             stencil_load,
             depth_store: StoreAction::Store,
-            depth_resolve_texture: MetalHandle::NULL,
-            depth_resolve_filter: DepthResolveFilter::Sample0,
             viewport: (vpx, vpy, vpw, vph),
             commands,
             leading_blits,
@@ -2946,8 +2933,6 @@ impl PassState {
             depth_load: DepthLoad::DontCare,
             stencil_load: StencilLoad::DontCare,
             depth_store: StoreAction::DontCare,
-            depth_resolve_texture: MetalHandle::NULL,
-            depth_resolve_filter: DepthResolveFilter::Sample0,
             viewport: (x, y, w, h),
             commands: cmds,
             leading_blits,
@@ -3006,24 +2991,35 @@ impl PassState {
     /// `take_pending_leading_blits`.
     ///
     /// The blit is also entered into the read/write model the load/store rules
-    /// reason over. A texture-to-texture copy reads its source from device
-    /// memory after every pass that wrote it, so the source counts as read
+    /// reason over. A texture-to-texture copy or a depth transfer reads its
+    /// source from device memory after every pass that wrote it, so the source
+    /// counts as read
     /// (`seen_sampled_textures`, which Rules B/C consult before discarding a
     /// store). The destination of any texture-writing blit goes into
     /// `blit_written_rts` so Rule A loads it instead of discarding the copy.
     pub fn push_pending_leading_blit(&mut self, blit: BlitCommand) {
-        if BlitCommandType::from_repr(blit.cmd) == Some(BlitCommandType::CopyTextureToTexture)
-            && blit.src_handle != 0
-        {
-            // SAFETY: a texture copy carries a non-null MTLTexture handle in
-            // `src_handle`, packed from the encoder's typed cache via `.raw()`.
-            let src = unsafe { MetalHandle::<MTLTextureKind>::new(blit.src_handle) };
+        if let Some(src) = blit_read_texture(&blit) {
             self.note_texture_read(src);
         }
         if let Some(dst) = blit_written_texture(&blit) {
             self.blit_written_rts.insert(dst);
         }
         self.pending_leading_blits.push(blit);
+    }
+
+    /// Queue `blit` after everything D3D9 ordered before it, clears included.
+    ///
+    /// A clear still waiting for a pass is materialised first (as a
+    /// depth-only pass when render target 0 cannot carry the depth surface,
+    /// see [`Self::flush_pending_clears`]) and the pass open at the time
+    /// ends, so the blit, which leads the next pass, reads what the clear
+    /// left rather than what it replaced, and a clear of its destination
+    /// cannot land on top of what it wrote. `caller` names the trigger in
+    /// the pass-break trace.
+    pub fn push_leading_blit_after_clears(&mut self, blit: BlitCommand, caller: &'static str) {
+        self.flush_pending_clears();
+        self.end_current_pass(caller);
+        self.push_pending_leading_blit(blit);
     }
 
     /// Drain any leading blits queued after the last pass ended.
@@ -3065,14 +3061,82 @@ impl PassState {
     /// time; if the game then changes rt (or calls Present without drawing),
     /// the original target must still be cleared. This is a no-op when there
     /// are no pending clears.
+    ///
+    /// A depth or stencil clear the current attachments cannot carry (render
+    /// target 0 disagrees with the depth surface on samples) is materialised
+    /// as a depth-only pass on the bound depth surface. Nothing is left
+    /// pending afterwards, so the depth setters, which flush before they
+    /// rebind, never let a clear reach a different surface.
     pub fn flush_pending_clears(&mut self) {
-        if self.pending_color_clear.is_some()
-            || self.pending_depth_clear.is_some()
-            || self.pending_stencil_clear.is_some()
-        {
+        let depth_pending =
+            self.pending_depth_clear.is_some() || self.pending_stencil_clear.is_some();
+        if self.pending_color_clear.is_some() || (depth_pending && self.pass_binds_depth()) {
             self.ensure_pass_open();
             self.end_current_pass("flush_pending_clears");
         }
+        if self.pending_depth_clear.is_some() || self.pending_stencil_clear.is_some() {
+            self.push_depth_clear_pass();
+        }
+    }
+
+    /// Record the pending depth and stencil clears as a closed pass with no colour attachment.
+    ///
+    /// No draws, the whole depth surface as its extent, and the load actions
+    /// doing the work. A pending clear
+    /// with no depth surface bound has nothing to land on and is dropped.
+    fn push_depth_clear_pass(&mut self) {
+        let depth_texture = self.current_depth_texture;
+        let depth_load = self
+            .pending_depth_clear
+            .take()
+            .map_or(DepthLoad::Load, |value| DepthLoad::Clear { value });
+        let stencil_load = self
+            .pending_stencil_clear
+            .take()
+            .map_or(StencilLoad::Load, |value| StencilLoad::Clear { value });
+        if depth_texture.is_null() {
+            mtld3d_shared::log_once_warn!(
+                target: crate::LOG_TARGET,
+                "pending depth/stencil clear with no depth attachment bound → dropped"
+            );
+            return;
+        }
+        self.end_current_pass("depth_clear");
+        let (width, height) = self.current_depth_size;
+        let commands = self
+            .command_vec_pool
+            .pop()
+            .unwrap_or_else(|| Vec::with_capacity(64));
+        self.passes.push(Pass {
+            color_texture: MetalHandle::NULL,
+            color_srgb_texture: MetalHandle::NULL,
+            color_msaa_texture: MetalHandle::NULL,
+            color_msaa_srgb_texture: MetalHandle::NULL,
+            color_resolve_texture: MetalHandle::NULL,
+            color_subresource: 0,
+            color_size: (width, height),
+            color_format: self.current_color_format,
+            color_load: ColorLoad::DontCare,
+            color_store: StoreAction::DontCare,
+            depth_texture,
+            depth_level: self.current_depth_level,
+            depth_load,
+            stencil_load,
+            depth_store: StoreAction::Store,
+            viewport: (0, 0, width, height),
+            commands,
+            leading_blits: core::mem::take(&mut self.pending_leading_blits),
+            has_counting_visibility: false,
+            depth_is_sampleable: self
+                .current_attachments
+                .contains(CurrentAttachmentFlags::DEPTH_SAMPLEABLE),
+            color_writes_observed: false,
+            color_clear_quad_ranges: Vec::new(),
+            extra_color: core::array::from_fn(|_| PassColorAttachment::NONE),
+        });
+        self.current_pass_closed = true;
+        self.seen_depth_rts.insert(depth_texture);
+        self.seen_depth_rts_segment.insert(depth_texture);
     }
 
     /// Rebind the color attachment for the next pass.
@@ -3115,18 +3179,10 @@ impl PassState {
         scale: RenderScale,
         subresource: (u32, u32),
     ) {
-        // A target binds without multisampling unless the caller says
-        // otherwise in the same breath, so a single-sampled target can never
-        // inherit the previous one's companion. Mirrors how
-        // `set_color_rt_has_alpha` is paired with this setter.
-        self.current_color_msaa_texture = MetalHandle::NULL;
-        self.current_color_msaa_srgb_texture = MetalHandle::NULL;
-        self.current_color_sample_count = 1;
         // `width`/`height` arrive logical, the size D3D9 reports for this
         // target; `scale` says what it is actually rasterized at.
         // `current_color_size` is the real texture extent.
-        self.current_color_scale = scale;
-        self.current_color_logical_size = (width, height);
+        let logical_size = (width, height);
         self.warn_if_scale_wasted(width, height, scale);
         let (width, height) = (scale.dimension(width), scale.dimension(height));
         let (slice, level) = subresource;
@@ -3140,6 +3196,10 @@ impl PassState {
             && self.current_color_format == format
             && self.current_color_size == (width, height)
         {
+            // The same target keeps its companion and sample count; the
+            // caller's `set_color_msaa` restates them.
+            self.current_color_scale = scale;
+            self.current_color_logical_size = logical_size;
             if self.has_extra_color_targets() {
                 self.recompute_extra_present_mask();
             } else {
@@ -3155,10 +3215,21 @@ impl PassState {
                 texture,
             );
         }
+        // The pending clears belong to the outgoing target, so they flush
+        // before any of its state is replaced.
         if self.pending_color_clear.is_some() {
             self.flush_pending_clears();
         }
         self.end_current_pass("set_color_rt");
+        // A target binds without multisampling unless the caller says
+        // otherwise in the same breath, so a single-sampled target can never
+        // inherit the previous one's companion. Mirrors how
+        // `set_color_rt_has_alpha` is paired with this setter.
+        self.current_color_msaa_texture = MetalHandle::NULL;
+        self.current_color_msaa_srgb_texture = MetalHandle::NULL;
+        self.current_color_sample_count = 1;
+        self.current_color_scale = scale;
+        self.current_color_logical_size = logical_size;
         self.current_color_texture = texture;
         self.current_color_subresource = packed_subresource;
         self.current_color_size = (width, height);
@@ -3215,17 +3286,9 @@ impl PassState {
                 || !self.seen_sampleable_depth_textures.contains(&texture),
             "depth handle {texture:#x} rebound as non-sampleable after a sampleable bind",
         );
-        // A depth surface binds single-sampled unless the caller declares
-        // otherwise in the same breath, exactly as a colour target does.
-        self.current_depth_sample_count = 1;
         if is_sampleable && !texture.is_null() {
             self.seen_sampleable_depth_textures.insert(texture);
         }
-        // `has_stencil` is a property of the bound texture's format, so a
-        // repeat bind of the same texture carries the same value — fold it
-        // before the no-change early-out below.
-        self.current_attachments
-            .set(CurrentAttachmentFlags::DEPTH_HAS_STENCIL, has_stencil);
         if self.current_depth_texture == texture
             && self.current_depth_level == level
             && self
@@ -3233,12 +3296,14 @@ impl PassState {
                 .contains(CurrentAttachmentFlags::DEPTH_SAMPLEABLE)
                 == is_sampleable
         {
-            // Same handle and level, so the same extent: a repeat bind carries
-            // nothing new for the size either.
+            // `has_stencil` is a property of the bound texture's format, so a
+            // repeat bind of the same texture carries the same value. Same
+            // handle and level, so the same extent and sample count too: a
+            // repeat bind carries nothing new for either.
+            self.current_attachments
+                .set(CurrentAttachmentFlags::DEPTH_HAS_STENCIL, has_stencil);
             return;
         }
-        self.current_attachments
-            .set(CurrentAttachmentFlags::DEPTH_SAMPLEABLE, is_sampleable);
         if log_enabled!(target: TRACE_TARGET, Level::Trace) {
             trace!(
                 target: TRACE_TARGET,
@@ -3249,10 +3314,19 @@ impl PassState {
                 level,
             );
         }
+        // The pending clears belong to the outgoing surface, so they flush
+        // before any of its state is replaced.
         if self.pending_depth_clear.is_some() || self.pending_stencil_clear.is_some() {
             self.flush_pending_clears();
         }
         self.end_current_pass("set_depth_attach");
+        // A depth surface binds single-sampled unless the caller declares
+        // otherwise in the same breath, exactly as a colour target does.
+        self.current_depth_sample_count = 1;
+        self.current_attachments
+            .set(CurrentAttachmentFlags::DEPTH_HAS_STENCIL, has_stencil);
+        self.current_attachments
+            .set(CurrentAttachmentFlags::DEPTH_SAMPLEABLE, is_sampleable);
         self.current_depth_texture = texture;
         self.current_depth_level = level;
         self.current_depth_size = size;
@@ -4232,9 +4306,8 @@ impl PassState {
                 || p.bound_color_attachments()
                     .iter()
                     .any(|a| matches!(a.store, StoreAction::Store));
-            let depth_writes = !p.depth_texture.is_null()
-                && (matches!(p.depth_store, StoreAction::Store)
-                    || !p.depth_resolve_texture.is_null());
+            let depth_writes =
+                !p.depth_texture.is_null() && matches!(p.depth_store, StoreAction::Store);
             let keep = color_writes || depth_writes;
             if !keep {
                 recycle_command_vec(&mut self.command_vec_pool, core::mem::take(&mut p.commands));
@@ -4396,11 +4469,6 @@ impl PassState {
             }
             if (needs_depth || needs_stencil) && blit_list_writes(&cand.leading_blits, target_depth)
             {
-                return None;
-            }
-            // A depth resolve into the target writes it the same way a blit
-            // does, and is ordered after our clear for the same reason.
-            if (needs_depth || needs_stencil) && cand.depth_resolve_texture == target_depth {
                 return None;
             }
             // So does a colour resolve, on any of the pass's attachments: the
@@ -4732,97 +4800,6 @@ impl PassState {
         }
     }
 
-    /// Resolve the bound multisampled depth attachment into `destination`.
-    ///
-    /// The RESZ shape of [`Self::resolve_depth_texture`]: the source is
-    /// whatever `SetDepthStencilSurface` last bound, at its own level and
-    /// extent. Returns `false` with nothing recorded when no depth attachment
-    /// is bound.
-    pub fn resolve_depth_attachment(
-        &mut self,
-        destination: MetalHandle<MTLTextureKind>,
-        filter: DepthResolveFilter,
-    ) -> bool {
-        let sampleable = self
-            .current_attachments
-            .contains(CurrentAttachmentFlags::DEPTH_SAMPLEABLE);
-        self.resolve_depth_texture(&DepthResolve {
-            source: self.current_depth_texture,
-            level: self.current_depth_level,
-            size: self.current_depth_size,
-            destination,
-            filter,
-            source_is_sampleable: sampleable,
-        })
-    }
-
-    /// Resolve one multisampled depth texture into a single-sample one.
-    ///
-    /// Metal has no depth resolve on the blit encoder, so the resolve is a
-    /// render pass of its own: the multisampled depth texture loaded, no
-    /// draws, and a store action that also writes the single-sample
-    /// destination. Colour is left unattached, so the pass touches nothing
-    /// else. It goes in after the passes recorded so far, which is where D3D9
-    /// asked for it, and the pass open at the time ends first.
-    ///
-    /// The destination joins the blit-written set, so a later pass that binds
-    /// it loads the resolved content instead of discarding it under Rule A,
-    /// and the pass stays out of the dead-pass rules through
-    /// `depth_resolve_texture`. Returns `false` with nothing recorded when
-    /// either end is null.
-    pub fn resolve_depth_texture(&mut self, resolve: &DepthResolve) -> bool {
-        let &DepthResolve {
-            source,
-            level,
-            size: (width, height),
-            destination,
-            filter,
-            source_is_sampleable,
-        } = resolve;
-        if source.is_null() || destination.is_null() {
-            return false;
-        }
-        self.end_current_pass("depth-resolve");
-        let commands = self
-            .command_vec_pool
-            .pop()
-            .unwrap_or_else(|| Vec::with_capacity(64));
-        self.passes.push(Pass {
-            color_texture: MetalHandle::NULL,
-            color_srgb_texture: MetalHandle::NULL,
-            color_msaa_texture: MetalHandle::NULL,
-            color_msaa_srgb_texture: MetalHandle::NULL,
-            color_resolve_texture: MetalHandle::NULL,
-            color_subresource: 0,
-            color_size: (width, height),
-            color_format: self.current_color_format,
-            color_load: ColorLoad::DontCare,
-            color_store: StoreAction::DontCare,
-            depth_texture: source,
-            depth_level: level,
-            depth_load: DepthLoad::Load,
-            stencil_load: StencilLoad::Load,
-            depth_store: StoreAction::Store,
-            depth_resolve_texture: destination,
-            depth_resolve_filter: filter,
-            viewport: (0, 0, width, height),
-            commands,
-            // Drained here rather than left for the next pass so a blit queued
-            // before the resolve still runs before it.
-            leading_blits: core::mem::take(&mut self.pending_leading_blits),
-            has_counting_visibility: false,
-            depth_is_sampleable: source_is_sampleable,
-            color_writes_observed: false,
-            color_clear_quad_ranges: Vec::new(),
-            extra_color: core::array::from_fn(|_| PassColorAttachment::NONE),
-        });
-        self.current_pass_closed = true;
-        self.seen_depth_rts.insert(source);
-        self.seen_depth_rts_segment.insert(source);
-        self.blit_written_rts.insert(destination);
-        true
-    }
-
     /// Resolve `texture` now, because something is about to read it mid-submission.
     ///
     /// `texture` is the single-sample twin, the handle every reader knows.
@@ -4889,13 +4866,29 @@ fn pass_reads_texture(
     if sampler_reads {
         return true;
     }
-    pass.leading_blits
-        .iter()
-        .any(|b| match BlitCommandType::from_repr(b.cmd) {
-            Some(BlitCommandType::CopyTextureToTexture) => b.src_handle == target_raw,
-            Some(BlitCommandType::GenerateMipmaps) => b.dst_handle == target_raw,
-            _ => false,
-        })
+    pass.leading_blits.iter().any(|b| {
+        blit_read_texture(b) == Some(target_handle)
+            || (BlitCommandType::from_repr(b.cmd) == Some(BlitCommandType::GenerateMipmaps)
+                && b.dst_handle == target_raw)
+    })
+}
+
+/// The texture a blit reads, if it reads one.
+///
+/// A texture-to-texture copy and a depth transfer both read their source from
+/// device memory after every pass recorded before them, so the source's
+/// content has to be there when the blit runs.
+const fn blit_read_texture(blit: &BlitCommand) -> Option<MetalHandle<MTLTextureKind>> {
+    let reads_texture = matches!(
+        BlitCommandType::from_repr(blit.cmd),
+        Some(BlitCommandType::CopyTextureToTexture | BlitCommandType::TransferDepth)
+    );
+    if !reads_texture || blit.src_handle == 0 {
+        return None;
+    }
+    // SAFETY: both commands carry a non-null MTLTexture handle in
+    // `src_handle`, packed from the encoder's typed cache via `.raw()`.
+    Some(unsafe { MetalHandle::<MTLTextureKind>::new(blit.src_handle) })
 }
 
 /// Return the texture view a real sampler bind reads.
