@@ -3052,7 +3052,8 @@ fn encode_pass(
                         );
                         continue;
                     };
-                    let Some(null) = null_texture::ensure(ctx.device) else {
+                    let device = cmd_buf.device();
+                    let Some(null) = null_texture::ensure(&device) else {
                         continue;
                     };
                     // SAFETY: the handle came from `null_texture::create`'s
@@ -3064,7 +3065,7 @@ fn encode_pass(
                     let Some(tex) = (unsafe { handle.borrow_retained() }) else {
                         continue;
                     };
-                    let Some(sampler) = null_texture::default_sampler(ctx.device) else {
+                    let Some(sampler) = null_texture::default_sampler(&device) else {
                         continue;
                     };
                     // SAFETY: objc2 typed binding; the encoder retains both
@@ -3087,7 +3088,8 @@ fn encode_pass(
                         );
                         continue;
                     };
-                    let Some(null) = null_texture::ensure(ctx.device) else {
+                    let device = cmd_buf.device();
+                    let Some(null) = null_texture::ensure(&device) else {
                         continue;
                     };
                     // SAFETY: the handle came from `null_texture::create`'s
@@ -3098,7 +3100,7 @@ fn encode_pass(
                     let Some(tex) = (unsafe { handle.borrow_retained() }) else {
                         continue;
                     };
-                    let Some(sampler) = null_texture::default_sampler(ctx.device) else {
+                    let Some(sampler) = null_texture::default_sampler(&device) else {
                         continue;
                     };
                     // SAFETY: objc2 typed binding; the encoder retains both
