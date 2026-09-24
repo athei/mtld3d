@@ -29,7 +29,7 @@ use mtld3d_core::{
     ids::{BufferId, DepthStencilKey, ProgramId, SamplerKey, TextureId},
     page_box::{PageBox, PageBoxRead},
     passes::{
-        BackbufferContents, ColorClearOutcome, ColorLoad, DepthClearOutcome, DepthLoad,
+        BackbufferContents, ColorClearOutcome, ColorLoad, DepthClearOutcome, DepthLoad, DrawWrites,
         ExtraColorSlot, LastBoundCache, Pass, PassState, SnapshotBytesCache, StencilClearOutcome,
         StencilLoad, StoreAction as PassStoreAction, UploadPassTarget,
     },
@@ -2790,6 +2790,30 @@ impl FrameEncoder {
 
     pub fn emit_command(&mut self, cmd: Command) {
         self.pass_state.emit_command(cmd);
+    }
+
+    /// Whether the draw about to be emitted can write nothing and is left out.
+    ///
+    /// Proxies [`PassState::skip_dead_draw`], filling in the one fact only the
+    /// encoder has: whether an occlusion query is open. Asked before the draw
+    /// emits anything, so a skipped draw leaves `last_bound` and the pass
+    /// list exactly as they were.
+    pub fn skip_dead_draw(
+        &self,
+        rs: &mtld3d_core::pipeline_state::PipelineRsBits,
+        depth_stencil: &mtld3d_core::depth_stencil_state::DepthStencilSnapshot,
+        ps_color_out_mask: u8,
+        attach: mtld3d_core::pipeline_state::PipelineAttachFlags,
+    ) -> bool {
+        let extra = self.pass_state.extra_color_attachments();
+        self.pass_state.skip_dead_draw(&DrawWrites {
+            rs,
+            extra: &extra,
+            ps_color_out_mask,
+            depth_stencil,
+            attach,
+            counting_query: self.visibility.active_count() != 0,
+        })
     }
 
     /// Reserve the frame's next visibility slot.

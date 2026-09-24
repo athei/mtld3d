@@ -6,14 +6,21 @@
 use log::{Level, log_enabled, trace};
 use mtld3d_shared::{
     BlitCommand, BlitCommandType, Command, CommandType, MetalHandle,
-    mtl::{CullMode, PixelFormat, TriangleFillMode, VERTEX_STREAM_SLOTS, VisibilityResultMode},
+    mtl::{
+        CullMode, PixelFormat, StencilOp, TriangleFillMode, VERTEX_STREAM_SLOTS,
+        VisibilityResultMode,
+    },
     mtl_handle::{MTLRenderPipelineStateKind, MTLTextureKind},
 };
 use mtld3d_types::D3DSWAPEFFECT_DISCARD;
 use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 
 use crate::{
-    dirty_range::DirtyRange, pipeline_state::ExtraColorAttachments, render_scale::RenderScale,
+    convert::d3d_to_metal_stencil_op,
+    depth_stencil_state::{DepthStencilSnapshot, STENCIL_MASK_BITS, StencilFaceState},
+    dirty_range::DirtyRange,
+    pipeline_state::{ExtraColorAttachments, PipelineAttachFlags, PipelineRsBits},
+    render_scale::RenderScale,
 };
 
 #[cfg(debug_assertions)]
@@ -209,6 +216,22 @@ const ENABLE_NO_COLOR_PASS_FOR_DRAWS: bool = true;
 /// into a later pass's load action. Flip to `false` if a game surfaces that
 /// reads a cleared target through a path the scan does not model.
 const ENABLE_DROP_OVERWRITTEN_CLEAR_PASSES: bool = true;
+
+/// Compile-time gate for leaving out draws that can write nothing.
+///
+/// A draw is dead when colour writes are masked off on every colour target
+/// of its pass, the depth write cannot happen (no depth attachment, or
+/// `D3DRS_ZENABLE` or `D3DRS_ZWRITEENABLE` off), the stencil cannot change
+/// (no stencil plane, `D3DRS_STENCILENABLE` off, a zero write mask, or
+/// `KEEP` for every operation of both faces), and no occlusion query is
+/// counting. D3D9 has no other way for a draw to be observed: there are no
+/// unordered writes or stream output, a vertex texture fetch only reads, and
+/// clip planes, point sprites, alpha-to-coverage and the multisample mask only
+/// narrow which of those writes land. The encoder then records none of the
+/// draw's commands, so no sampler bind of it counts as a read for Rule I and
+/// the pass it would have opened stays unopened. Flip to `false` if a game
+/// surfaces that observes such a draw through a path this list misses.
+const ENABLE_SKIP_DEAD_DRAWS: bool = true;
 
 /// Sub-target for one-line-per-event pass-break / pass-open trace probes.
 ///
@@ -478,6 +501,52 @@ pub struct UploadPassTarget {
     pub format: PixelFormat,
     /// `(x, y, width, height)` of the dirty rect, in destination texels.
     pub rect: (u32, u32, u32, u32),
+}
+
+/// The states that decide whether a draw can write anything, as the encoder resolves them.
+///
+/// `attach` carries the depth and stencil planes the pass the draw lands in
+/// actually binds (`HAS_DEPTH`, `HAS_STENCIL`); its other bits are ignored.
+/// `extra` and `ps_color_out_mask` are what the pipeline key reads for render
+/// targets 1..3. `counting_query` is set while any occlusion query is open on
+/// the encoder, since a counting query observes samples that write nothing.
+pub struct DrawWrites<'a> {
+    pub rs: &'a PipelineRsBits,
+    pub extra: &'a ExtraColorAttachments,
+    pub ps_color_out_mask: u8,
+    pub depth_stencil: &'a DepthStencilSnapshot,
+    pub attach: PipelineAttachFlags,
+    pub counting_query: bool,
+}
+
+/// `true` when a draw running with `writes` has no effect D3D9 lets anyone observe.
+///
+/// The conditions are the ones the `ENABLE_SKIP_DEAD_DRAWS` gate lists.
+/// Stencil operations are compared after translation, so they read exactly
+/// as the `MTLDepthStencilState` the draw would get.
+#[must_use]
+pub fn draw_writes_nothing(writes: &DrawWrites<'_>) -> bool {
+    if writes.counting_query
+        || !writes
+            .rs
+            .writes_no_color(writes.extra, writes.ps_color_out_mask)
+    {
+        return false;
+    }
+    let ds = writes.depth_stencil;
+    let depth_writes = writes.attach.contains(PipelineAttachFlags::HAS_DEPTH)
+        && ds.depth_enable != 0
+        && ds.depth_write != 0;
+    let face_keeps = |face: StencilFaceState| {
+        [face.fail_op, face.depth_fail_op, face.pass_op]
+            .iter()
+            .all(|&op| d3d_to_metal_stencil_op(u32::from(op)) == StencilOp::Keep)
+    };
+    let stencil_writes = writes.attach.contains(PipelineAttachFlags::HAS_STENCIL)
+        && ds.stencil_enable != 0
+        && ds.write_mask & STENCIL_MASK_BITS != 0
+        && !(face_keeps(ds.front) && face_keeps(ds.back));
+    !depth_writes && !stencil_writes
 }
 
 impl PassColorAttachment {
@@ -2548,6 +2617,34 @@ impl PassState {
         }
         let (vpx, vpy, vpw, vph) = self.effective_viewport();
         vpx == 0 && vpy == 0 && vpw >= self.current_depth_size.0 && vph >= self.current_depth_size.1
+    }
+
+    /// Whether the encoder may leave out a draw running with `writes`.
+    ///
+    /// True when the gate is on and [`draw_writes_nothing`] holds, unless a
+    /// clear is still pending with no pass open: the draw would have opened
+    /// the pass that carries that clear as its load action, and a leading
+    /// blit queued without landing the pending clears first (an ordered
+    /// texture upload) would then run ahead of the clear. Such a draw is
+    /// emitted as before.
+    #[must_use]
+    pub fn skip_dead_draw(&self, writes: &DrawWrites<'_>) -> bool {
+        if !ENABLE_SKIP_DEAD_DRAWS || !draw_writes_nothing(writes) {
+            return false;
+        }
+        let pass_open = !self.current_pass_closed && !self.passes.is_empty();
+        let clear_pending = self.pending_color_clear.is_some()
+            || self.pending_depth_clear.is_some()
+            || self.pending_stencil_clear.is_some();
+        if clear_pending && !pass_open {
+            return false;
+        }
+        mtld3d_shared::log_once_info!(
+            target: TRACE_TARGET,
+            "passes: leaving out draws that can write nothing (colour masked, no depth or \
+             stencil write, no counting query)"
+        );
+        true
     }
 
     /// Tag the current pass with "color writes happened" iff `mask != 0`.
