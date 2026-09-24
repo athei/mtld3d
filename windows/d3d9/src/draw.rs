@@ -2198,7 +2198,7 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
                     // attributes: nothing to bind.
                     continue;
                 }
-                let buffer_handle = enc.ensure_vbib_mtl_buffer(
+                let (buffer_handle, staged) = enc.ensure_vbib_mtl_buffer(
                     b.buffer_id,
                     b.backing_ptr as u64,
                     b.backing_len as u64,
@@ -2235,6 +2235,11 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
                 let vb_emitted = bind != VertexBufferBind::Same;
                 if vb_emitted {
                     enc.emit_command(Command::set_vertex_buffer(buffer_handle, b.offset, slot));
+                }
+                // Only a staged buffer takes staging uploads, so only its
+                // ranges are ever asked about.
+                if !staged {
+                    continue;
                 }
                 // Record this draw's VB read range so a later overlapping
                 // staging upload renames instead of corrupting this draw.
@@ -2389,7 +2394,7 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
             index_type,
             base_vertex,
         } => {
-            let buffer_handle = enc.ensure_vbib_mtl_buffer(
+            let (buffer_handle, staged) = enc.ensure_vbib_mtl_buffer(
                 buffer_id,
                 backing_ptr as u64,
                 backing_len as u64,
@@ -2406,16 +2411,18 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
                 close_dump_group(enc, dump_draw);
                 return;
             }
-            // Record this draw's IB read range so a later overlapping
+            // Record a staged IB's read range so a later overlapping
             // staging upload renames instead of corrupting this draw.
             // Exact — `[offset, offset + index_count × index_size)`.
-            let index_size: u32 = match index_type {
-                IndexType::UInt16 => 2,
-                IndexType::UInt32 => 4,
-            };
-            let read_bytes = index_count.saturating_mul(index_size);
-            let logical_len = u32::try_from(backing_len).unwrap_or(u32::MAX);
-            enc.note_buffer_draw_range(buffer_id.raw(), offset, read_bytes, logical_len);
+            if staged {
+                let index_size: u32 = match index_type {
+                    IndexType::UInt16 => 2,
+                    IndexType::UInt32 => 4,
+                };
+                let read_bytes = index_count.saturating_mul(index_size);
+                let logical_len = u32::try_from(backing_len).unwrap_or(u32::MAX);
+                enc.note_buffer_draw_range(buffer_id.raw(), offset, read_bytes, logical_len);
+            }
             enc.emit_command(Command::draw_indexed_primitives(
                 metal_prim,
                 index_count,

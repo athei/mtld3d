@@ -1632,7 +1632,9 @@ pub struct PassState {
     /// the `MTLTexture` instead (fresh handle for later draws, earlier
     /// draws keep the old one). Handle-keyed on purpose: the fresh
     /// handle has been sampled by no earlier draw, so a rename needs no
-    /// explicit clear here.
+    /// explicit clear here. The pass scans use it too: every sampler bind in
+    /// `passes` went through `emit_command`, so a target missing here is read
+    /// by no pass's commands.
     frame_sampled_textures: FxHashSet<MetalHandle<MTLTextureKind>>,
     /// Sampling or attachment view to resource identity, through native retirement.
     ///
@@ -3108,9 +3110,21 @@ impl PassState {
 
     /// Ensure a pass is live for the next command.
     ///
-    /// Opens a new `Pass` if the previous one was closed (or if this is the
-    /// first command of the frame), consuming any pending clears and emitting
-    /// the current viewport as the first command of the new pass.
+    /// Runs before every emitted command, and a pass is already open for
+    /// nearly all of them, so that test stays inline at the caller and
+    /// opening a pass is the out-of-line `open_pass`.
+    #[inline]
+    pub fn ensure_pass_open(&mut self) {
+        if self.current_pass_closed || self.passes.is_empty() {
+            self.open_pass();
+        }
+    }
+
+    /// Open a new `Pass` for the next command.
+    ///
+    /// Called when the previous one was closed (or for the first command of
+    /// the frame); consumes any pending clears and emits the current viewport
+    /// as the first command of the new pass.
     ///
     /// Rule A — first-use `DontCare`: when an attachment has not been
     /// seen yet this frame AND there is no pending clear AND no queued
@@ -3121,10 +3135,8 @@ impl PassState {
     /// start of a frame, and only under the discard swap effect; any other
     /// colour target still holds what the previous frame left in it, so it
     /// loads.
-    pub fn ensure_pass_open(&mut self) {
-        if !self.current_pass_closed && !self.passes.is_empty() {
-            return;
-        }
+    #[cold]
+    fn open_pass(&mut self) {
         let (vpx, vpy, vpw, vph) = self.effective_viewport();
         let leading_blits = core::mem::take(&mut self.pending_leading_blits);
 
@@ -4738,6 +4750,7 @@ impl PassState {
                 &self.passes[write],
                 &self.passes[read],
                 &self.texture_view_to_base,
+                &self.frame_sampled_textures,
             ) else {
                 write += 1;
                 self.passes.swap(write, read);
@@ -4834,7 +4847,7 @@ impl PassState {
                     BlitEffect::Neither => {}
                 }
             }
-            if pass_samples_texture(cand, target.texture, views)
+            if pass_samples_texture(cand, target.texture, views, &self.frame_sampled_textures)
                 || pass_attaches_texture(cand, target.texture)
                 || pass_resolves_into(cand, target.texture, views)
             {
@@ -4972,12 +4985,25 @@ impl PassState {
         for j in (start + 1)..self.passes.len() {
             let cand = &self.passes[j];
             // Intervening read on a side we care about kills the merge.
-            if needs_color && pass_reads_texture(cand, target_color, &self.texture_view_to_base) {
+            if needs_color
+                && pass_reads_texture(
+                    cand,
+                    target_color,
+                    &self.texture_view_to_base,
+                    &self.frame_sampled_textures,
+                )
+            {
                 return None;
             }
             if needs_color
                 && target_extra.iter().any(|&(tex, _)| {
-                    !tex.is_null() && pass_reads_texture(cand, tex, &self.texture_view_to_base)
+                    !tex.is_null()
+                        && pass_reads_texture(
+                            cand,
+                            tex,
+                            &self.texture_view_to_base,
+                            &self.frame_sampled_textures,
+                        )
                 })
             {
                 return None;
@@ -5037,7 +5063,12 @@ impl PassState {
                 }
             }
             if (needs_depth || needs_stencil)
-                && pass_reads_texture(cand, target_depth, &self.texture_view_to_base)
+                && pass_reads_texture(
+                    cand,
+                    target_depth,
+                    &self.texture_view_to_base,
+                    &self.frame_sampled_textures,
+                )
             {
                 return None;
             }
@@ -5382,7 +5413,7 @@ impl PassState {
     ) -> bool {
         let views = &self.texture_view_to_base;
         self.passes[first + 1..=next].iter().any(|pass| {
-            pass_reads_texture(pass, texture, views)
+            pass_reads_texture(pass, texture, views, &self.frame_sampled_textures)
                 || blit_list_writes(&pass.leading_blits, texture)
                 || pass_resolves_into(pass, texture, views)
         })
@@ -5621,6 +5652,7 @@ fn merge_join(
     prev: &Pass,
     next: &Pass,
     texture_view_to_base: &FxHashMap<MetalHandle<MTLTextureKind>, MetalHandle<MTLTextureKind>>,
+    frame_sampled: &FxHashSet<MetalHandle<MTLTextureKind>>,
 ) -> Option<PassJoin> {
     if !attachments_match(prev, next)
         || !next.leading_blits.is_empty()
@@ -5633,7 +5665,7 @@ fn merge_join(
         .into_iter()
         .chain(prev.extra_color.iter().map(PassColorAttachment::texture));
     for texture in attached {
-        if pass_samples_texture(next, texture, texture_view_to_base) {
+        if pass_samples_texture(next, texture, texture_view_to_base, frame_sampled) {
             return None;
         }
     }
@@ -5834,11 +5866,12 @@ fn pass_reads_texture(
     pass: &Pass,
     target_handle: MetalHandle<MTLTextureKind>,
     texture_view_to_base: &FxHashMap<MetalHandle<MTLTextureKind>, MetalHandle<MTLTextureKind>>,
+    frame_sampled: &FxHashSet<MetalHandle<MTLTextureKind>>,
 ) -> bool {
     if target_handle.is_null() {
         return false;
     }
-    if pass_samples_texture(pass, target_handle, texture_view_to_base) {
+    if pass_samples_texture(pass, target_handle, texture_view_to_base, frame_sampled) {
         return true;
     }
     pass.leading_blits.iter().any(|b| {
@@ -5853,10 +5886,31 @@ fn pass_samples_texture(
     pass: &Pass,
     target_handle: MetalHandle<MTLTextureKind>,
     texture_view_to_base: &FxHashMap<MetalHandle<MTLTextureKind>, MetalHandle<MTLTextureKind>>,
+    frame_sampled: &FxHashSet<MetalHandle<MTLTextureKind>>,
 ) -> bool {
     if target_handle.is_null() {
         return false;
     }
+    // Every sampler bind in a pass of this submission went through
+    // `emit_command`, which puts the bound texture and the storage it views
+    // into `frame_sampled`, so a target missing there is sampled by no pass
+    // and the command scan is skipped.
+    if !frame_sampled.contains(&target_handle) {
+        debug_assert!(
+            !commands_sample_texture(pass, target_handle, texture_view_to_base),
+            "a pass samples {target_handle:#x}, which no bind this submission marked"
+        );
+        return false;
+    }
+    commands_sample_texture(pass, target_handle, texture_view_to_base)
+}
+
+/// Scan `pass`'s commands for a sampler bind of `target_handle` or a view of it.
+fn commands_sample_texture(
+    pass: &Pass,
+    target_handle: MetalHandle<MTLTextureKind>,
+    texture_view_to_base: &FxHashMap<MetalHandle<MTLTextureKind>, MetalHandle<MTLTextureKind>>,
+) -> bool {
     pass.commands.iter().any(|command| {
         let Some(texture) = command_sampled_texture(command) else {
             return false;
