@@ -649,8 +649,8 @@ fn indexed_triangle_fan_materialises_partial_backing_during_a_lock() {
 #[test]
 fn indexed_primitive_up_draws() {
     // DrawIndexedPrimitiveUP feeds inline vertices + an inline index stream; the
-    // index data is copied into a transient Metal buffer per draw. The triangle
-    // covers the screen centre; the corners stay background.
+    // index data is copied into the unix side's upload ring per draw. The
+    // triangle covers the screen centre; the corners stay background.
     let h = Harness::new();
     arm_diffuse(&h);
     let verts = [
@@ -764,6 +764,88 @@ fn indexed_primitive_up_triangle_fan_draws() {
         BLACK,
         "corner is outside the fan diamond"
     );
+}
+
+#[test]
+fn inline_draw_data_reads_its_own_payload_across_upload_ring_chunks() {
+    // Inline indices and inline vertices past 4 KiB are copied into the unix
+    // upload ring, one payload after another, and each draw binds its own
+    // offset. Twenty oversized vertex streams (4800 bytes each) outgrow the
+    // ring's first chunk mid-frame. Every draw paints the same region, so the
+    // pixel names the draw whose payload the last bind read: a bind at the
+    // wrong offset shows an earlier draw's colour. Three frames run back to
+    // back, so later frames append behind payloads earlier ones still read.
+    const RED: u32 = 0xFFFF_0000;
+    const BLUE: u32 = 0xFF00_00FF;
+    let h = Harness::new();
+    arm_diffuse(&h);
+    assert_eq!(h.set_render_state(D3DRS_CULLMODE, D3DCULL_NONE), 0);
+    let v = |x, y, color| PosColorVertex {
+        x,
+        y,
+        z: 0.5,
+        color,
+    };
+    // One triangle over the top-left quadrant, then 99 degenerate ones.
+    let stream = |color| {
+        let mut verts = vec![v(-1.0, 1.0, color), v(0.2, 1.0, color), v(-1.0, -0.2, color)];
+        verts.resize(300, v(-1.0, -1.0, color));
+        verts
+    };
+    let streams: Vec<Vec<PosColorVertex>> = (0..20)
+        .map(|i| stream(if i == 19 { BLUE } else { RED }))
+        .collect();
+    assert!(core::mem::size_of_val(streams[0].as_slice()) > 4096);
+    // Two quads over the top-right quadrant; odd draws index the magenta one.
+    let quad = |color| {
+        [
+            v(0.1, 0.1, color),
+            v(0.1, 0.9, color),
+            v(0.9, 0.9, color),
+            v(0.9, 0.1, color),
+        ]
+    };
+    let mut quads = quad(GREEN).to_vec();
+    quads.extend_from_slice(&quad(MAGENTA));
+    let green: [u16; 6] = [0, 1, 2, 0, 2, 3];
+    let magenta: [u16; 6] = [4, 5, 6, 4, 6, 7];
+    let params = DrawIndexedUpParams {
+        prim: D3DPT_TRIANGLELIST,
+        min_vertex_index: 0,
+        num_vertices: 8,
+        prim_count: 2,
+        index_format: D3DFMT_INDEX16,
+    };
+    for _ in 0..3 {
+        h.render_once(BLACK, |d| {
+            for (i, verts) in streams.iter().enumerate() {
+                assert_eq!(
+                    d.draw_primitive_up(D3DPT_TRIANGLELIST, 100, verts),
+                    0,
+                    "oversized UP draw {i}"
+                );
+            }
+            for j in 0..40 {
+                let indices = if j % 2 == 0 { &green } else { &magenta };
+                assert_eq!(
+                    d.draw_indexed_primitive_up(&params, indices, &quads),
+                    0,
+                    "indexed UP draw {j}"
+                );
+            }
+        });
+    }
+    assert_eq!(
+        h.read_pixel(160, 120),
+        BLUE,
+        "the last oversized stream drew from its own vertices"
+    );
+    assert_eq!(
+        h.read_pixel(480, 120),
+        MAGENTA,
+        "the last indexed draw read its own indices"
+    );
+    assert_eq!(h.read_pixel(320, 400), BLACK, "the bottom stays clear");
 }
 
 #[test]

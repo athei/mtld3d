@@ -114,6 +114,18 @@ returns. Mip generation after an upload stays in the upload prefix; generation a
 application render-target write or `StretchRect` remains ordered among the application's
 passes.
 
+Two kinds of Metal buffer the submit thread creates are reused across submissions rather
+than allocated per use: the upload ring (`metal/transient.rs`) that inline indices and inline
+vertex streams past `SET_BYTES_MAX` are copied into, and the private planes a depth transfer
+stages through (`PlanePool` in `metal/depth_transfer.rs`). Both live on the device record and
+stamp each use with the submission's sequence and the command buffer it went into, upload or
+render. A region is written again only once the counter of every command buffer that read it,
+`upload_coherent_seq` or `coherent_seq`, has reached the stamped sequence; the ring only
+appends to a chunk in flight and starts one again from its first byte after that point, and a
+plane set may also serve a later transfer in the same command buffer, whose encoders Metal's
+hazard tracking orders. A submission without a sequence gets pools of its own, dropped with
+it, since nothing it used could ever be seen to retire.
+
 A third buffer, the present buffer, is committed by the presenter after the render buffer
 and advances a unix-side per-device counter, `present_retired`, kept on the presenter state
 because nothing on the PE side reads it. It registers in the same in-flight map as the
