@@ -18,7 +18,7 @@ use mtld3d_core::{
     },
     dirty_rect::DirtyRect,
     dxso::{VsSamplerKinds, operand_token_count},
-    ff_state::{FfState, FfVsDirty},
+    ff_state::{FfState, FfVsDirty, TssWriteFeeds, tss_write_feeds},
     format::{
         FormatMapping, compute_mip_count, compute_mip_size, compute_volume_mip_count,
         is_dxt_format, linear_mip_size, linear_row_pitch, map_d3d_format, resolve_mip_levels,
@@ -75,12 +75,11 @@ use mtld3d_types::{
     D3DRS_STENCILZFAIL, D3DRS_TEXTUREFACTOR, D3DRS_TWEENFACTOR, D3DRS_TWOSIDEDSTENCILMODE,
     D3DRS_VERTEXBLEND, D3DRS_ZENABLE, D3DRS_ZFUNC, D3DRS_ZWRITEENABLE, D3DRTYPE_CUBETEXTURE,
     D3DSAMP_MAXMIPLEVEL, D3DSAMP_MIPFILTER, D3DTEXF_LINEAR, D3DTEXF_NONE, D3DTEXF_POINT,
-    D3DTSS_BUMPENVLOFFSET, D3DTSS_BUMPENVLSCALE, D3DTSS_BUMPENVMAT00, D3DTSS_BUMPENVMAT01,
-    D3DTSS_BUMPENVMAT10, D3DTSS_BUMPENVMAT11, D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_DEPTHSTENCIL,
-    D3DUSAGE_DMAP, D3DUSAGE_DONOTCLIP, D3DUSAGE_DYNAMIC, D3DUSAGE_NONSECURE, D3DUSAGE_NPATCHES,
-    D3DUSAGE_POINTS, D3DUSAGE_QUERY_FILTER, D3DUSAGE_RENDERTARGET, D3DUSAGE_RTPATCHES,
-    D3DUSAGE_SOFTWAREPROCESSING, D3DUSAGE_WRITEONLY, D3DVIEWPORT9, Guid, IDirect3DDevice9Vtbl,
-    RENDER_STATE_COUNT, SAMPLER_STATE_COUNT, TEXTURE_STAGE_STATE_COUNT, render_state_defaults,
+    D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_DMAP, D3DUSAGE_DONOTCLIP,
+    D3DUSAGE_DYNAMIC, D3DUSAGE_NONSECURE, D3DUSAGE_NPATCHES, D3DUSAGE_POINTS,
+    D3DUSAGE_QUERY_FILTER, D3DUSAGE_RENDERTARGET, D3DUSAGE_RTPATCHES, D3DUSAGE_SOFTWAREPROCESSING,
+    D3DUSAGE_WRITEONLY, D3DVIEWPORT9, Guid, IDirect3DDevice9Vtbl, RENDER_STATE_COUNT,
+    SAMPLER_STATE_COUNT, TEXTURE_STAGE_STATE_COUNT, render_state_defaults,
 };
 
 use super::{
@@ -10389,33 +10388,23 @@ extern "system" fn device_set_texture_stage_state(
         .ff_state_mut()
         .set_texture_stage_state(stage as usize, type_ as usize, value);
     // Redundant-set elimination: a same-value TSS write leaves every FF
-    // VS/PS key byte-identical, so skip the rebuild. TSS feeds FF VS
-    // layout + FF PS key + variant + constants — ff_aware strips VS/PS
-    // bits for programmable shaders.
+    // VS/PS key byte-identical, so skip the rebuild. Each slot dirties only
+    // the piece that reads it. ff_aware strips the VS/PS bits for
+    // programmable shaders; the bump uniform is not an FF piece and needs
+    // no such filter.
     if changed {
-        let mut mask = dev.ff_aware_mask(if type_ == mtld3d_types::D3DTSS_CONSTANT {
-            SnapshotDirty::PS_CONST
-        } else {
-            SnapshotDirty::STAGES
-                | SnapshotDirty::VARIANT
-                | SnapshotDirty::VS_SOURCE
-                | SnapshotDirty::VS_CONST
-                | SnapshotDirty::PS_SOURCE
-                | SnapshotDirty::PS_CONST
-        });
-        // The bump-environment matrix / luminance states feed the SM1
-        // texbem PS uniform (slot 12), independent of the FF keys above.
-        if matches!(
-            type_,
-            D3DTSS_BUMPENVMAT00
-                | D3DTSS_BUMPENVMAT01
-                | D3DTSS_BUMPENVMAT10
-                | D3DTSS_BUMPENVMAT11
-                | D3DTSS_BUMPENVLSCALE
-                | D3DTSS_BUMPENVLOFFSET
-        ) {
-            mask |= SnapshotDirty::BUMP_ENV;
-        }
+        let mask = match tss_write_feeds(type_) {
+            TssWriteFeeds::StageConstant => dev.ff_aware_mask(SnapshotDirty::PS_CONST),
+            TssWriteFeeds::BumpEnv => SnapshotDirty::BUMP_ENV,
+            TssWriteFeeds::FfPipeline => dev.ff_aware_mask(
+                SnapshotDirty::STAGES
+                    | SnapshotDirty::VARIANT
+                    | SnapshotDirty::VS_SOURCE
+                    | SnapshotDirty::VS_CONST
+                    | SnapshotDirty::PS_SOURCE
+                    | SnapshotDirty::PS_CONST,
+            ),
+        };
         dev.mark_snapshot_dirty(mask);
     }
     dev.perf_mut()

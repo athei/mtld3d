@@ -1831,6 +1831,37 @@ pub fn build_fog_color_bytes(
     (bytes, 32)
 }
 
+/// The snapshot piece a `SetTextureStageState` write feeds.
+///
+/// The device turns this into its dirty mask, so a slot routed here is rebuilt
+/// by exactly the consumer that reads it.
+pub enum TssWriteFeeds {
+    /// The FF VS and PS keys, the pipeline variant and their constants.
+    ///
+    /// Slots nothing consumes land here too, so a slot that gains an FF
+    /// consumer is already routed to it.
+    FfPipeline,
+    /// The per-stage `D3DTSS_CONSTANT` rows of the FF PS constants.
+    StageConstant,
+    /// The SM1 `texbem`/`texbeml`/`bem` PS uniform (`build_bump_env_bytes`).
+    BumpEnv,
+}
+
+/// Route a `D3DTSS_*` slot to the snapshot piece that reads it.
+#[must_use]
+pub const fn tss_write_feeds(ty: u32) -> TssWriteFeeds {
+    match ty {
+        D3DTSS_CONSTANT => TssWriteFeeds::StageConstant,
+        D3DTSS_BUMPENVMAT00
+        | D3DTSS_BUMPENVMAT01
+        | D3DTSS_BUMPENVMAT10
+        | D3DTSS_BUMPENVMAT11
+        | D3DTSS_BUMPENVLSCALE
+        | D3DTSS_BUMPENVLOFFSET => TssWriteFeeds::BumpEnv,
+        _ => TssWriteFeeds::FfPipeline,
+    }
+}
+
 /// Assemble the `FfVsFlags` for a `FfVsKey`.
 ///
 /// Pure helper used by `build_vs_key`; lifts the flag-set sequence out so the
@@ -2229,7 +2260,10 @@ enum TssClass {
 
 const fn tss_classify(ty: u32) -> TssClass {
     match ty {
-        // Consumed by mtld3d (FF VS + PS keys).
+        // Consumed by mtld3d. The first ten feed the FF VS + PS keys; the
+        // bump-environment matrix and luminance slots feed the SM1
+        // `texbem`/`texbeml`/`bem` PS uniform (`build_bump_env_bytes`), not
+        // the FF keys.
         D3DTSS_COLOROP
         | D3DTSS_COLORARG1
         | D3DTSS_COLORARG2
@@ -2239,9 +2273,15 @@ const fn tss_classify(ty: u32) -> TssClass {
         | D3DTSS_CONSTANT
         | D3DTSS_TEXCOORDINDEX
         | D3DTSS_TEXTURETRANSFORMFLAGS
-        | D3DTSS_RESULTARG => TssClass::Consumed,
+        | D3DTSS_RESULTARG
+        | D3DTSS_BUMPENVMAT00
+        | D3DTSS_BUMPENVMAT01
+        | D3DTSS_BUMPENVMAT10
+        | D3DTSS_BUMPENVMAT11
+        | D3DTSS_BUMPENVLSCALE
+        | D3DTSS_BUMPENVLOFFSET => TssClass::Consumed,
 
-        // Neither consumes.
+        // Nothing consumes.
         _ => TssClass::NotImplemented,
     }
 }
