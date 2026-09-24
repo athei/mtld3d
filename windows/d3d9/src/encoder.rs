@@ -5368,7 +5368,8 @@ impl FrameEncoder {
     ///
     /// Size 0 = to end of buffer. Feeds rename-at-overlap (and the
     /// `reorder` perf counter). Call in op order (after the bind) so a
-    /// later overlapping staging upload sees it.
+    /// later overlapping staging upload sees it, and only for a `Staged`
+    /// buffer: no other buffer takes a staging upload.
     pub fn note_buffer_draw_range(&mut self, id: u64, offset: u32, size: u32, logical_len: u32) {
         self.pass_state
             .note_draw_range(id, offset, size, logical_len);
@@ -6580,13 +6581,17 @@ impl FrameEncoder {
     /// the subsequent frame. A `Staged` entry left as a failed-warmup
     /// placeholder gets its device buffer recreated here before the draw
     /// binds it.
+    ///
+    /// Returns the handle to bind, 0 on failure, and whether the buffer is
+    /// `Staged`: only a staged buffer takes the staging uploads whose
+    /// rename-at-overlap reads the drawn ranges.
     pub fn ensure_vbib_mtl_buffer(
         &mut self,
         buffer_id: BufferId,
         backing_ptr: u64,
         backing_len: u64,
         backing_generation: u64,
-    ) -> u64 {
+    ) -> (u64, bool) {
         let current_seq = self.current_submit_seq;
         if let Some(state) = self.buffer_cache.get_mut(&buffer_id) {
             if state.is_staged {
@@ -6602,7 +6607,7 @@ impl FrameEncoder {
                 let device = state.device_buffer;
                 let length = state.length;
                 if !device.is_null() {
-                    return device.raw();
+                    return (device.raw(), true);
                 }
                 // Failed-warmup placeholder: recreate the device buffer so
                 // the entry heals and later uploads take the fast path. Its
@@ -6612,7 +6617,7 @@ impl FrameEncoder {
                 // repeat failure return 0; the draw sites drop the draw
                 // and log it.
                 let Some(fresh) = self.alloc_fresh_device_buffer(buffer_id, length) else {
-                    return 0;
+                    return (0, true);
                 };
                 if let Some(s) = self.buffer_cache.get_mut(&buffer_id) {
                     s.device_buffer = fresh;
@@ -6624,7 +6629,7 @@ impl FrameEncoder {
                      at draw time, contents undefined until the next upload",
                     buffer_id.raw()
                 );
-                return fresh.raw();
+                return (fresh.raw(), true);
             }
             if state.backing_ptr == backing_ptr
                 && state.length == backing_len
@@ -6641,7 +6646,7 @@ impl FrameEncoder {
                     state.last_submit_seq = current_seq;
                     self.enqueue_notify_buffer_did_modify_range(mtl_buffer.raw(), 0, backing_len);
                 }
-                return mtl_buffer.raw();
+                return (mtl_buffer.raw(), false);
             }
             // Backing changed mid-frame for the same `BufferId` — the
             // expected pattern is `Draw; Lock(DISCARD|default); Draw`
@@ -6684,7 +6689,7 @@ impl FrameEncoder {
                 "ensure_vbib_mtl_buffer: CreateBuffer failed \
                  (id={buffer_id:#x}, backing={backing_ptr:#x}, len={backing_len}, status={status:#x})",
             );
-            return 0;
+            return (0, false);
         }
         self.buffer_cache.insert(
             buffer_id,
@@ -6702,7 +6707,7 @@ impl FrameEncoder {
         // GPU about every byte the CPU may have written since the
         // backing was allocated. No-op on UMA via the helper's gate.
         self.enqueue_notify_buffer_did_modify_range(handle.raw(), 0, backing_len);
-        handle.raw()
+        (handle.raw(), false)
     }
 
     /// Copy a `Staged` VB/IB's device buffer into caller-owned PE memory.
