@@ -1202,12 +1202,15 @@ fn last_bound_scissor_dedup() {
 #[test]
 fn last_bound_blend_color_dedup() {
     let mut c = LastBoundCache::new();
-    // Default `0xFFFF_FFFF` is the post-reset value; matches Metal's
-    // own default, so a first-call with the default reports unchanged.
+    // A fresh encoder blends with zero, so the D3D9 default opaque white is
+    // a change on a pass's first draw and zero is not.
+    assert!(!c.blend_color_changed(FRESH_BLEND_COLOR));
+    assert!(c.blend_color_changed(0xFFFF_FFFF));
     assert!(!c.blend_color_changed(0xFFFF_FFFF));
     assert!(c.blend_color_changed(0xFF80_2040));
     assert!(!c.blend_color_changed(0xFF80_2040));
-    assert!(c.blend_color_changed(0xFFFF_FFFF));
+    c.reset();
+    assert!(c.blend_color_changed(0xFFFF_FFFF), "reset returns to zero");
 }
 
 #[test]
@@ -8550,7 +8553,7 @@ fn rule_j_restores_the_fresh_encoder_state_the_second_pass_reads() {
         Command::set_triangle_fill_mode(TriangleFillMode::Fill),
         Command::set_depth_bias(0.0, 0.0),
         Command::set_stencil_reference(0),
-        Command::set_blend_color(1.0, 1.0, 1.0, 1.0),
+        Command::set_blend_color(0.0, 0.0, 0.0, 0.0),
         Command::set_visibility_result_mode(VisibilityResultMode::Disabled, 16),
     ];
     for (got, want) in join.iter().zip(&expected) {
@@ -8899,7 +8902,7 @@ fn every_fresh_state_command_reads_as_a_fresh_value() {
         Command::set_triangle_fill_mode(TriangleFillMode::Lines),
         Command::set_depth_bias(1.0, 0.0),
         Command::set_stencil_reference(1),
-        Command::set_blend_color(0.0, 0.0, 0.0, 0.0),
+        Command::set_blend_color(1.0, 1.0, 1.0, 1.0),
         Command::set_visibility_result_mode(VisibilityResultMode::Counting, 24),
     ];
     for last in &changed {

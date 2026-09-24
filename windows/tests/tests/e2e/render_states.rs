@@ -339,6 +339,36 @@ fn blend_factor_restored_to_the_default_mid_pass_takes_effect() {
 }
 
 #[test]
+fn the_default_blend_factor_blends_at_full_weight_on_a_pass_first_draw() {
+    // `D3DRS_BLENDFACTOR` is left at its default opaque white and is the
+    // source factor, with a zero destination factor: the frame's only draw
+    // must come out at full weight. A fresh Metal encoder blends with zero,
+    // so a draw that relies on the encoder's own blend colour draws nothing.
+    let h = Harness::new();
+    arm_diffuse(&h);
+    h.render_once(BLACK, |d| {
+        assert_eq!(d.set_render_state(D3DRS_ALPHABLENDENABLE, 1), 0);
+        assert_eq!(
+            d.set_render_state(D3DRS_SRCBLEND, mtld3d_types::D3DBLEND_BLENDFACTOR),
+            0
+        );
+        assert_eq!(
+            d.set_render_state(D3DRS_DESTBLEND, mtld3d_types::D3DBLEND_ZERO),
+            0
+        );
+        assert_eq!(
+            d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &fill_quad(GREEN)),
+            0
+        );
+    });
+    let got = Rgba8::from_pixel(h.read_pixel(320, 240));
+    assert!(
+        got.r < 20 && got.g > 240,
+        "the default factor blends green at full weight, got {got:?}"
+    );
+}
+
+#[test]
 fn a_render_target_round_trip_leaves_the_next_draw_its_own_fill_mode_and_blend_factor() {
     // A draw into the back buffer under wireframe fill and a half-weight
     // blend factor, then another render target bound and the back buffer

@@ -274,6 +274,13 @@ const ENABLE_SKIP_DEAD_DRAWS: bool = true;
 /// join does not model.
 const ENABLE_MERGE_ADJACENT_PASSES: bool = true;
 
+/// The blend factor, as a `D3DCOLOR`, that a fresh Metal render encoder blends with.
+///
+/// A fresh encoder blends with (0, 0, 0, 0), not with D3D9's default opaque
+/// white, so the per-draw dedup starts each pass at this value and a draw at
+/// the D3D9 default emits its `SetBlendColor`.
+const FRESH_BLEND_COLOR: u32 = 0x0000_0000;
+
 /// The encoder states Rule J reconciles at a join, as the command type that sets each.
 ///
 /// A draw can read each without its pass having set it, because a fresh
@@ -5757,10 +5764,11 @@ const fn same_command(a: &Command, b: &Command) -> bool {
 
 /// Whether `cmd` sets its state to the value a fresh Metal render encoder starts with.
 ///
-/// Answers for the states whose fresh value the per-draw dedup cache assumes
-/// (`LastBoundCache::reset`): solid fill, no depth bias, stencil reference
-/// zero, opaque white blend colour, and visibility counting off, whatever
-/// offset the disarm names. Every other command answers `false`.
+/// Answers for the states whose fresh value the per-draw dedup cache starts
+/// each pass at (`LastBoundCache::reset`): solid fill, no depth bias, stencil
+/// reference zero, the zero blend colour of [`FRESH_BLEND_COLOR`], and
+/// visibility counting off, whatever offset the disarm names. Every other
+/// command answers `false`.
 fn sets_fresh_value(cmd: &Command) -> bool {
     if cmd.cmd == CommandType::SetVisibilityResultMode as u32 {
         return cmd.param_a == VisibilityResultMode::Disabled as u32;
@@ -5769,9 +5777,15 @@ fn sets_fresh_value(cmd: &Command) -> bool {
         Command::set_triangle_fill_mode(TriangleFillMode::Fill),
         Command::set_depth_bias(0.0, 0.0),
         Command::set_stencil_reference(0),
-        Command::set_blend_color(1.0, 1.0, 1.0, 1.0),
+        fresh_blend_color_command(),
     ];
     fresh.iter().any(|value| same_command(cmd, value))
+}
+
+/// `SetBlendColor` with a fresh encoder's blend colour, [`FRESH_BLEND_COLOR`].
+fn fresh_blend_color_command() -> Command {
+    let [r, g, b, a] = crate::convert::d3dcolor_to_rgba_f32(FRESH_BLEND_COLOR);
+    Command::set_blend_color(r, g, b, a)
 }
 
 /// The command that puts the state `last` set back to a fresh encoder's value.
@@ -5790,7 +5804,7 @@ fn fresh_state_command(last: &Command) -> Option<Command> {
         }
         CommandType::SetDepthBias => Some(Command::set_depth_bias(0.0, 0.0)),
         CommandType::SetStencilReference => Some(Command::set_stencil_reference(0)),
-        CommandType::SetBlendColor => Some(Command::set_blend_color(1.0, 1.0, 1.0, 1.0)),
+        CommandType::SetBlendColor => Some(fresh_blend_color_command()),
         CommandType::SetVisibilityResultMode => Some(Command::set_visibility_result_mode(
             VisibilityResultMode::Disabled,
             u32::try_from(last.param_b).expect("a visibility offset is a u32 on the wire"),
@@ -6301,10 +6315,9 @@ pub struct LastBoundCache {
     scissor_rect: Option<(u32, u32, u32, u32)>,
     /// `D3DRS_BLENDFACTOR` as a `D3DCOLOR` u32.
     ///
-    /// `0xFFFF_FFFF` is the Metal default (opaque white) and the value
-    /// at fresh-pass entry, so the per-draw conditional in `emit_draw`
-    /// (which already skips default values) continues to skip the first
-    /// default-value draw of each pass.
+    /// Starts each pass at [`FRESH_BLEND_COLOR`], the value a fresh Metal
+    /// encoder blends with, so the first draw of a pass at any other factor,
+    /// the D3D9 default opaque white included, emits its `SetBlendColor`.
     blend_color: u32,
     /// The `setDepthBias` pair.
     ///
@@ -6339,7 +6352,7 @@ impl LastBoundCache {
             ps_draw: Vec::new(),
             vertex_buffers: [(0, 0, 0); VERTEX_STREAM_SLOTS as usize],
             scissor_rect: None,
-            blend_color: 0xFFFF_FFFF,
+            blend_color: FRESH_BLEND_COLOR,
             depth_bias_bits: (0, 0),
         }
     }
@@ -6369,7 +6382,7 @@ impl LastBoundCache {
         self.ps_draw.clear();
         self.vertex_buffers = [(0, 0, 0); VERTEX_STREAM_SLOTS as usize];
         self.scissor_rect = None;
-        self.blend_color = 0xFFFF_FFFF;
+        self.blend_color = FRESH_BLEND_COLOR;
         self.depth_bias_bits = (0, 0);
     }
 
