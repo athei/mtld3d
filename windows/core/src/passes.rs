@@ -6,14 +6,21 @@
 use log::{Level, log_enabled, trace};
 use mtld3d_shared::{
     BlitCommand, BlitCommandType, Command, CommandType, MetalHandle,
-    mtl::{CullMode, PixelFormat, TriangleFillMode, VERTEX_STREAM_SLOTS, VisibilityResultMode},
+    mtl::{
+        CullMode, PixelFormat, StencilOp, TriangleFillMode, VERTEX_STREAM_SLOTS,
+        VisibilityResultMode,
+    },
     mtl_handle::{MTLRenderPipelineStateKind, MTLTextureKind},
 };
 use mtld3d_types::D3DSWAPEFFECT_DISCARD;
 use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 
 use crate::{
-    dirty_range::DirtyRange, pipeline_state::ExtraColorAttachments, render_scale::RenderScale,
+    convert::d3d_to_metal_stencil_op,
+    depth_stencil_state::{DepthStencilSnapshot, STENCIL_MASK_BITS, StencilFaceState},
+    dirty_range::DirtyRange,
+    pipeline_state::{ExtraColorAttachments, PipelineAttachFlags, PipelineRsBits},
+    render_scale::RenderScale,
 };
 
 #[cfg(debug_assertions)]
@@ -45,6 +52,48 @@ struct ClearMerge {
     needs_color: bool,
     needs_depth: bool,
     needs_stencil: bool,
+}
+
+/// One attachment a clear-only pass clears, as Rule I follows it through later passes.
+///
+/// `slice` and `level` locate the subresource and `size` is that level's extent,
+/// which a later write has to cover in full to overwrite the clear. `depth`
+/// marks the depth plane, the only one a depth transfer can overwrite.
+struct ClearedTarget {
+    texture: MetalHandle<MTLTextureKind>,
+    slice: u32,
+    level: u32,
+    size: (u32, u32),
+    depth: bool,
+}
+
+impl ClearedTarget {
+    const NONE: Self = Self {
+        texture: MetalHandle::NULL,
+        slice: 0,
+        level: 0,
+        size: (0, 0),
+        depth: false,
+    };
+}
+
+/// The attachments one clear-only pass clears: render targets 0..3 and depth, at most five.
+///
+/// A fixed array rather than a `Vec`, so judging a candidate allocates nothing.
+struct ClearedTargets {
+    items: [ClearedTarget; 5],
+    len: usize,
+}
+
+impl ClearedTargets {
+    const fn push(&mut self, target: ClearedTarget) {
+        self.items[self.len] = target;
+        self.len += 1;
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &ClearedTarget> {
+        self.items[..self.len].iter()
+    }
 }
 
 /// Compile-time gate for Rule A (first-use `DontCare`).
@@ -148,6 +197,41 @@ const ENABLE_STRIP_DEAD_COLOR_IN_CLEAR_ONLY: bool = true;
 /// against a masked-everywhere attachment (no such case is known — D3D9
 /// spec is unambiguous).
 const ENABLE_NO_COLOR_PASS_FOR_DRAWS: bool = true;
+
+/// Compile-time gate for Rule I (drop a clear-only pass whose targets are overwritten unread).
+///
+/// A clear-only pass (no draw, no leading blit, no resolve of its own, no
+/// counting query, no multisampled colour attachment, no stencil clear) goes
+/// when every attachment it clears is fully overwritten later in the same
+/// submission before anything reads it. A full overwrite is a leading depth
+/// transfer into the same level of a depth target, which always writes that
+/// whole level, or a leading texture-to-texture copy onto the same slice and
+/// level covering its whole extent. Anything else that touches the texture first (a sampler bind, a
+/// blit reading it, any attachment of it) is a read and keeps the pass, and so
+/// does reaching the end of the submission: D3D9 keeps render-target contents
+/// across `Present`, and a mid-frame flush continues the frame. The pass's
+/// uncleared attachments load and store what they already hold, or discard it
+/// under a `DontCare` load, so dropping them changes nothing D3D9 defines.
+/// Runs first in the submit pipeline, before Rule E could fold the dead clear
+/// into a later pass's load action. Flip to `false` if a game surfaces that
+/// reads a cleared target through a path the scan does not model.
+const ENABLE_DROP_OVERWRITTEN_CLEAR_PASSES: bool = true;
+
+/// Compile-time gate for leaving out draws that can write nothing.
+///
+/// A draw is dead when colour writes are masked off on every colour target
+/// of its pass, the depth write cannot happen (no depth attachment, or
+/// `D3DRS_ZENABLE` or `D3DRS_ZWRITEENABLE` off), the stencil cannot change
+/// (no stencil plane, `D3DRS_STENCILENABLE` off, a zero write mask, or
+/// `KEEP` for every operation of both faces), and no occlusion query is
+/// counting. D3D9 has no other way for a draw to be observed: there are no
+/// unordered writes or stream output, a vertex texture fetch only reads, and
+/// clip planes, point sprites, alpha-to-coverage and the multisample mask only
+/// narrow which of those writes land. The encoder then records none of the
+/// draw's commands, so no sampler bind of it counts as a read for Rule I and
+/// the pass it would have opened stays unopened. Flip to `false` if a game
+/// surfaces that observes such a draw through a path this list misses.
+const ENABLE_SKIP_DEAD_DRAWS: bool = true;
 
 /// Sub-target for one-line-per-event pass-break / pass-open trace probes.
 ///
@@ -419,6 +503,52 @@ pub struct UploadPassTarget {
     pub rect: (u32, u32, u32, u32),
 }
 
+/// The states that decide whether a draw can write anything, as the encoder resolves them.
+///
+/// `attach` carries the depth and stencil planes the pass the draw lands in
+/// actually binds (`HAS_DEPTH`, `HAS_STENCIL`); its other bits are ignored.
+/// `extra` and `ps_color_out_mask` are what the pipeline key reads for render
+/// targets 1..3. `counting_query` is set while any occlusion query is open on
+/// the encoder, since a counting query observes samples that write nothing.
+pub struct DrawWrites<'a> {
+    pub rs: &'a PipelineRsBits,
+    pub extra: &'a ExtraColorAttachments,
+    pub ps_color_out_mask: u8,
+    pub depth_stencil: &'a DepthStencilSnapshot,
+    pub attach: PipelineAttachFlags,
+    pub counting_query: bool,
+}
+
+/// `true` when a draw running with `writes` has no effect D3D9 lets anyone observe.
+///
+/// The conditions are the ones the `ENABLE_SKIP_DEAD_DRAWS` gate lists.
+/// Stencil operations are compared after translation, so they read exactly
+/// as the `MTLDepthStencilState` the draw would get.
+#[must_use]
+pub fn draw_writes_nothing(writes: &DrawWrites<'_>) -> bool {
+    if writes.counting_query
+        || !writes
+            .rs
+            .writes_no_color(writes.extra, writes.ps_color_out_mask)
+    {
+        return false;
+    }
+    let ds = writes.depth_stencil;
+    let depth_writes = writes.attach.contains(PipelineAttachFlags::HAS_DEPTH)
+        && ds.depth_enable != 0
+        && ds.depth_write != 0;
+    let face_keeps = |face: StencilFaceState| {
+        [face.fail_op, face.depth_fail_op, face.pass_op]
+            .iter()
+            .all(|&op| d3d_to_metal_stencil_op(u32::from(op)) == StencilOp::Keep)
+    };
+    let stencil_writes = writes.attach.contains(PipelineAttachFlags::HAS_STENCIL)
+        && ds.stencil_enable != 0
+        && ds.write_mask & STENCIL_MASK_BITS != 0
+        && !(face_keeps(ds.front) && face_keeps(ds.back));
+    !depth_writes && !stencil_writes
+}
+
 impl PassColorAttachment {
     /// The unbound attachment.
     pub const NONE: Self = Self {
@@ -648,6 +778,12 @@ pub struct Pass {
     depth_texture: MetalHandle<MTLTextureKind>,
     /// Mip level of `depth_texture` the pass renders depth into.
     depth_level: u32,
+    /// Extent of `depth_texture` at `depth_level`, in its own space; `(0, 0)` without one.
+    ///
+    /// Carried beside the handle because D3D9 lets a depth surface be larger
+    /// than render target 0, so `color_size` does not say how much of the
+    /// depth plane a load action or a copy covers.
+    depth_size: (u32, u32),
     depth_load: DepthLoad,
     stencil_load: StencilLoad,
     /// Defaults to `Store`.
@@ -2483,6 +2619,34 @@ impl PassState {
         vpx == 0 && vpy == 0 && vpw >= self.current_depth_size.0 && vph >= self.current_depth_size.1
     }
 
+    /// Whether the encoder may leave out a draw running with `writes`.
+    ///
+    /// True when the gate is on and [`draw_writes_nothing`] holds, unless a
+    /// clear is still pending with no pass open: the draw would have opened
+    /// the pass that carries that clear as its load action, and a leading
+    /// blit queued without landing the pending clears first (an ordered
+    /// texture upload) would then run ahead of the clear. Such a draw is
+    /// emitted as before.
+    #[must_use]
+    pub fn skip_dead_draw(&self, writes: &DrawWrites<'_>) -> bool {
+        if !ENABLE_SKIP_DEAD_DRAWS || !draw_writes_nothing(writes) {
+            return false;
+        }
+        let pass_open = !self.current_pass_closed && !self.passes.is_empty();
+        let clear_pending = self.pending_color_clear.is_some()
+            || self.pending_depth_clear.is_some()
+            || self.pending_stencil_clear.is_some();
+        if clear_pending && !pass_open {
+            return false;
+        }
+        mtld3d_shared::log_once_info!(
+            target: TRACE_TARGET,
+            "passes: leaving out draws that can write nothing (colour masked, no depth or \
+             stencil write, no counting query)"
+        );
+        true
+    }
+
     /// Tag the current pass with "color writes happened" iff `mask != 0`.
     ///
     /// Called by the PE encoder right before emitting the per-draw
@@ -2875,6 +3039,11 @@ impl PassState {
             color_store: StoreAction::Store,
             depth_texture,
             depth_level: self.current_depth_level,
+            depth_size: if depth_texture.is_null() {
+                (0, 0)
+            } else {
+                self.current_depth_size
+            },
             depth_load,
             stencil_load,
             depth_store: StoreAction::Store,
@@ -3003,6 +3172,7 @@ impl PassState {
             color_store: StoreAction::Store,
             depth_texture: MetalHandle::NULL,
             depth_level: 0,
+            depth_size: (0, 0),
             depth_load: DepthLoad::DontCare,
             stencil_load: StencilLoad::DontCare,
             depth_store: StoreAction::DontCare,
@@ -3193,6 +3363,7 @@ impl PassState {
             color_store: StoreAction::DontCare,
             depth_texture,
             depth_level: self.current_depth_level,
+            depth_size: (width, height),
             depth_load,
             stencil_load,
             depth_store: StoreAction::Store,
@@ -4398,6 +4569,87 @@ impl PassState {
         }
     }
 
+    /// Rule I: drop clear-only passes whose every cleared target is overwritten before a read.
+    ///
+    /// The candidates and the overwrites are the ones the
+    /// `ENABLE_DROP_OVERWRITTEN_CLEAR_PASSES` gate lists. Each cleared attachment
+    /// is followed through the later passes in submission order, and per pass
+    /// in the order the GPU runs it: the leading blits one by one, then the
+    /// render pass's sampler binds, attachments and colour resolves. The
+    /// first of those that touches the texture decides: a full overwrite
+    /// clears the attachment for removal, anything else keeps the pass. A
+    /// partial write (a blit onto part of the level, or onto another level)
+    /// reads nothing and decides nothing, because the full overwrite that has
+    /// to follow replaces it along with the clear.
+    ///
+    /// A colour target can only be overwritten by the copy. A multisample
+    /// resolve into it does not count: the pass that takes the resolve
+    /// attaches the target, which the scan treats as a read, and a clear on a
+    /// multisampled target lands on its companion, so such a pass is no
+    /// candidate in the first place. A stencil clear keeps its pass: a depth
+    /// transfer carries the stencil plane only when both ends are
+    /// `Depth32FloatStencil8`, and the blit does not record the source's
+    /// format, so the scan cannot show that the stencil is overwritten.
+    ///
+    /// Walked back to front, so a removal leaves the indices still to visit in
+    /// place and a later dead clear of the same texture is gone before an
+    /// earlier one is judged against it. The scan of one candidate is linear
+    /// in the commands and blits after it, and only clear-only passes pay it.
+    pub fn drop_overwritten_clear_only_passes(&mut self) {
+        if !ENABLE_DROP_OVERWRITTEN_CLEAR_PASSES {
+            return;
+        }
+        for i in (0..self.passes.len()).rev() {
+            let Some(targets) = dead_clear_candidate(&self.passes[i]) else {
+                continue;
+            };
+            if !targets
+                .iter()
+                .all(|target| self.overwritten_before_read(i, target))
+            {
+                continue;
+            }
+            if log_enabled!(target: TRACE_TARGET, Level::Trace) {
+                let p = &self.passes[i];
+                trace!(
+                    target: TRACE_TARGET,
+                    "pass-dead-clear drop idx={i} color={:#x} depth={:#x}:{} \
+                     (every cleared target overwritten before a read)",
+                    p.color_texture,
+                    p.depth_texture,
+                    p.depth_level,
+                );
+            }
+            let retired = self.passes.remove(i);
+            recycle_command_vec(&mut self.command_vec_pool, retired.commands);
+        }
+    }
+
+    /// Whether `target` is fully overwritten after pass `start` before anything reads it.
+    fn overwritten_before_read(&self, start: usize, target: &ClearedTarget) -> bool {
+        // An extent nobody recorded cannot be shown to be covered.
+        if target.size.0 == 0 || target.size.1 == 0 {
+            return false;
+        }
+        let views = &self.texture_view_to_base;
+        for cand in &self.passes[start + 1..] {
+            for blit in &cand.leading_blits {
+                match blit_effect_on(blit, target, views) {
+                    BlitEffect::Reads => return false,
+                    BlitEffect::Overwrites => return true,
+                    BlitEffect::Neither => {}
+                }
+            }
+            if pass_samples_texture(cand, target.texture, views)
+                || pass_attaches_texture(cand, target.texture)
+                || pass_resolves_into(cand, target.texture, views)
+            {
+                return false;
+            }
+        }
+        false
+    }
+
     /// Rule E — coalesce clear-only passes into the load action of the next pass.
     ///
     /// The merge target is the next pass that attaches the same texture.
@@ -4931,7 +5183,26 @@ fn pass_reads_texture(
     if target_handle.is_null() {
         return false;
     }
-    let sampler_reads = pass.commands.iter().any(|command| {
+    if pass_samples_texture(pass, target_handle, texture_view_to_base) {
+        return true;
+    }
+    pass.leading_blits.iter().any(|b| {
+        blit_read_texture(b).is_some_and(|texture| {
+            texture == target_handle || texture_view_to_base.get(&texture) == Some(&target_handle)
+        })
+    })
+}
+
+/// True if a fragment- or vertex-sampler bind inside `pass` reads `target_handle` or a view of it.
+fn pass_samples_texture(
+    pass: &Pass,
+    target_handle: MetalHandle<MTLTextureKind>,
+    texture_view_to_base: &FxHashMap<MetalHandle<MTLTextureKind>, MetalHandle<MTLTextureKind>>,
+) -> bool {
+    if target_handle.is_null() {
+        return false;
+    }
+    pass.commands.iter().any(|command| {
         let Some(texture) = command_sampled_texture(command) else {
             return false;
         };
@@ -4941,15 +5212,177 @@ fn pass_reads_texture(
         // A bind of the target's sRGB twin view reads the same storage.
         !texture_view_to_base.is_empty()
             && texture_view_to_base.get(&texture) == Some(&target_handle)
-    });
-    if sampler_reads {
+    })
+}
+
+/// True if `pass` attaches `texture` anywhere: any colour slot at any subresource, or as depth.
+fn pass_attaches_texture(pass: &Pass, texture: MetalHandle<MTLTextureKind>) -> bool {
+    !texture.is_null()
+        && (pass.color_texture == texture
+            || pass.depth_texture == texture
+            || pass.extra_color.iter().any(|a| a.texture == texture))
+}
+
+/// True if the texture handle `raw` is `target` or a view of it.
+///
+/// `raw` must come from a field that carries a texture handle; 0 names nothing.
+fn handle_names_texture(
+    raw: u64,
+    target: MetalHandle<MTLTextureKind>,
+    texture_view_to_base: &FxHashMap<MetalHandle<MTLTextureKind>, MetalHandle<MTLTextureKind>>,
+) -> bool {
+    if raw == 0 || target.is_null() {
+        return false;
+    }
+    if raw == target.raw() {
         return true;
     }
-    pass.leading_blits.iter().any(|b| {
-        blit_read_texture(b).is_some_and(|texture| {
-            texture == target_handle || texture_view_to_base.get(&texture) == Some(&target_handle)
-        })
-    })
+    if texture_view_to_base.is_empty() {
+        return false;
+    }
+    // SAFETY: callers pass only texture-typed fields (a texture blit's
+    // `src_handle` / `dst_handle`), each packed from
+    // the encoder's typed cache via `.raw()` and checked non-zero above.
+    let handle = unsafe { MetalHandle::<MTLTextureKind>::new(raw) };
+    texture_view_to_base.get(&handle) == Some(&target)
+}
+
+/// What one leading blit does to the texture a Rule I scan follows.
+enum BlitEffect {
+    Reads,
+    Overwrites,
+    Neither,
+}
+
+/// Classify `blit` against `target` for Rule I.
+///
+/// A blit that takes the texture as its source reads it, and so does a
+/// mipmap regeneration, which reads level 0 to write the rest. A
+/// texture-to-texture copy overwrites the target when it lands on the same
+/// slice and level at origin zero, one plane deep, with the region the size
+/// of that level. A depth transfer overwrites a depth target when it lands
+/// on the same level: the unix encoder (`metal::depth_transfer::encode`)
+/// ignores the region fields and always writes slice 0 of `dst_mip_level`
+/// from origin zero at that level's full extent, resampling the source when
+/// the sizes differ. It writes the depth plane in every case and the stencil
+/// plane only when both ends carry one, which is why a stencil clear is no
+/// candidate. Every other write (a partial copy, a buffer upload) counts as
+/// neither. An unknown variant touching the texture at either end is a read.
+fn blit_effect_on(
+    blit: &BlitCommand,
+    target: &ClearedTarget,
+    texture_view_to_base: &FxHashMap<MetalHandle<MTLTextureKind>, MetalHandle<MTLTextureKind>>,
+) -> BlitEffect {
+    match BlitCommandType::from_repr(blit.cmd) {
+        Some(BlitCommandType::CopyTextureToTexture) => {
+            if handle_names_texture(blit.src_handle, target.texture, texture_view_to_base) {
+                BlitEffect::Reads
+            } else if handle_names_texture(blit.dst_handle, target.texture, texture_view_to_base)
+                && blit.dst_mip_level == target.level
+                && blit.dst_slice == target.slice
+                && blit.dst_offset == 0
+                && blit.depth <= 1
+                && (blit.region_w, blit.region_h) == target.size
+            {
+                BlitEffect::Overwrites
+            } else {
+                BlitEffect::Neither
+            }
+        }
+        Some(BlitCommandType::TransferDepth) => {
+            if handle_names_texture(blit.src_handle, target.texture, texture_view_to_base) {
+                BlitEffect::Reads
+            } else if target.depth
+                && target.slice == 0
+                && handle_names_texture(blit.dst_handle, target.texture, texture_view_to_base)
+                && blit.dst_mip_level == target.level
+            {
+                BlitEffect::Overwrites
+            } else {
+                BlitEffect::Neither
+            }
+        }
+        Some(BlitCommandType::GenerateMipmaps) => {
+            if handle_names_texture(blit.dst_handle, target.texture, texture_view_to_base) {
+                BlitEffect::Reads
+            } else {
+                BlitEffect::Neither
+            }
+        }
+        Some(
+            BlitCommandType::CopyBufferToTexture
+            | BlitCommandType::CopyBufferToDepth
+            | BlitCommandType::CopyBufferToStencil
+            | BlitCommandType::CopyBufferToBuffer
+            | BlitCommandType::NotifyBufferDidModifyRange,
+        ) => BlitEffect::Neither,
+        None => {
+            let raw = target.texture.raw();
+            if blit.src_handle == raw || blit.dst_handle == raw {
+                BlitEffect::Reads
+            } else {
+                BlitEffect::Neither
+            }
+        }
+    }
+}
+
+/// The attachments a Rule I candidate clears, or `None` when the pass is no candidate.
+///
+/// A candidate draws nothing, carries no leading blit, no colour resolve and
+/// no counting query, has no multisampled colour attachment (a clear there lands
+/// on the companion later passes load), and clears no stencil plane. Its
+/// uncleared attachments are ignored: a `Load` stores back what it loaded,
+/// and a `DontCare` load stores undefined contents that leaving the texture
+/// alone can only improve on.
+fn dead_clear_candidate(pass: &Pass) -> Option<ClearedTargets> {
+    if !pass.leading_blits.is_empty()
+        || pass.has_counting_visibility
+        || pass.commands.iter().any(Command::is_draw)
+        || !pass.color_resolve_texture.is_null()
+        || !pass.color_msaa_texture.is_null()
+        || pass
+            .extra_color
+            .iter()
+            .any(|a| !a.resolve_texture.is_null() || !a.msaa_texture.is_null())
+        || (!pass.depth_texture.is_null() && matches!(pass.stencil_load, StencilLoad::Clear { .. }))
+    {
+        return None;
+    }
+    let mut targets = ClearedTargets {
+        items: [ClearedTarget::NONE; 5],
+        len: 0,
+    };
+    if !pass.color_texture.is_null() && matches!(pass.color_load, ColorLoad::Clear { .. }) {
+        targets.push(ClearedTarget {
+            texture: pass.color_texture,
+            slice: pass.color_slice(),
+            level: pass.color_level(),
+            size: pass.color_size,
+            depth: false,
+        });
+    }
+    for a in &pass.extra_color {
+        if a.is_bound() && matches!(a.load, ColorLoad::Clear { .. }) {
+            targets.push(ClearedTarget {
+                texture: a.texture,
+                slice: a.slice(),
+                level: a.level(),
+                size: a.size,
+                depth: false,
+            });
+        }
+    }
+    if !pass.depth_texture.is_null() && matches!(pass.depth_load, DepthLoad::Clear { .. }) {
+        targets.push(ClearedTarget {
+            texture: pass.depth_texture,
+            slice: 0,
+            level: pass.depth_level,
+            size: pass.depth_size,
+            depth: true,
+        });
+    }
+    (targets.len > 0).then_some(targets)
 }
 
 /// Return the texture view a real sampler bind reads.

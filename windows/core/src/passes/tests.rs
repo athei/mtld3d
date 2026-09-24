@@ -6759,3 +6759,655 @@ fn ordered_upload_keeps_application_passes_and_blits_in_sequence() {
     assert_eq!(conversion.leading_blits()[0].dst_handle, destination.raw());
     assert_eq!(s.passes()[2].color_texture(), backbuffer());
 }
+
+// ── Rule I: clears overwritten before a read ──
+
+fn resz_intz() -> MetalHandle<MTLTextureKind> {
+    tex(0x7000)
+}
+
+fn resz_ds() -> MetalHandle<MTLTextureKind> {
+    tex(0x7200)
+}
+
+/// The RESZ frame up to its multisampled draw: a depth clear on INTZ, then a draw on a 2x target.
+///
+/// The clear lands in a depth-only pass of its own, because the multisampled
+/// render target cannot share a pass with the single-sample INTZ surface.
+/// `before_draw` runs inside the draw pass ahead of its draw; `stencil` makes
+/// the INTZ surface a stencil format and clears its stencil plane too.
+fn resz_clear_then_msaa_draw(stencil: bool, before_draw: impl FnOnce(&mut PassState)) -> PassState {
+    let mut s = fresh();
+    s.set_depth_stencil_attachment(resz_intz(), BB_SIZE, true, stencil);
+    assert_eq!(s.clear_depth(f32::to_bits(1.0)), DepthClearOutcome::Folded);
+    if stencil {
+        assert_eq!(s.clear_stencil(0), StencilClearOutcome::Folded);
+    }
+    s.set_color_render_target(
+        tex(0x7100),
+        BB_SIZE.0,
+        BB_SIZE.1,
+        RT_FORMAT,
+        RenderScale::IDENTITY,
+    );
+    s.set_color_msaa(tex(0x7101), MetalHandle::NULL, 2);
+    s.set_depth_stencil_attachment(resz_ds(), BB_SIZE, false, true);
+    s.set_depth_sample_count(2);
+    s.ensure_pass_open();
+    before_draw(&mut s);
+    s.emit_command(dummy_draw());
+    let clear = &s.passes()[0];
+    assert!(
+        clear.color_texture().is_null(),
+        "the clear is a depth-only pass"
+    );
+    assert_eq!(clear.depth_texture(), resz_intz());
+    assert_eq!(
+        clear.depth_load(),
+        DepthLoad::Clear {
+            value: f32::to_bits(1.0)
+        }
+    );
+    s
+}
+
+/// Queue the RESZ transfer of the bound 2x depth surface into level `level` of INTZ.
+///
+/// The shape `FrameEncoder::queue_depth_transfer` records: a `TransferDepth`
+/// queued after the clears, leading the next pass that opens. The unix side
+/// writes the whole destination level whatever the region fields say.
+fn transfer_into_intz(s: &mut PassState, level: u32) {
+    let mut blit = depth_transfer(resz_ds(), resz_intz());
+    blit.dst_mip_level = level;
+    s.push_leading_blit_after_clears(blit, "test");
+}
+
+/// Whether pass `index` of `s` leads with the transfer into INTZ.
+fn leads_with_intz_transfer(s: &PassState, index: usize) -> bool {
+    s.passes()[index].leading_blits().iter().any(|b| {
+        b.cmd == BlitCommandType::TransferDepth as u32 && b.dst_handle == resz_intz().raw()
+    })
+}
+
+/// Draw onto the back buffer with INTZ bound to sampler 0, and close the pass.
+fn sample_intz_on_the_backbuffer(s: &mut PassState) {
+    s.set_color_render_target(
+        backbuffer(),
+        BB_SIZE.0,
+        BB_SIZE.1,
+        BB_FORMAT,
+        s.render_scale,
+    );
+    s.set_depth_stencil_attachment(MetalHandle::NULL, (0, 0), false, false);
+    s.emit_command(Command::set_fragment_texture(resz_intz().raw(), 0));
+    s.emit_command(dummy_draw());
+    s.end_current_pass("test");
+}
+
+/// Whether some pass of `s` still clears the depth plane of `texture`.
+fn clears_depth_of(s: &PassState, texture: MetalHandle<MTLTextureKind>) -> bool {
+    s.passes()
+        .iter()
+        .any(|p| p.depth_texture() == texture && matches!(p.depth_load(), DepthLoad::Clear { .. }))
+}
+
+#[test]
+fn rule_i_drops_a_depth_clear_the_resz_transfer_overwrites() {
+    // The clear on INTZ, the multisampled draw, the transfer into INTZ's
+    // level 0, then a pass sampling INTZ: nothing reads the cleared depth
+    // before the transfer replaces every texel of it.
+    let mut s = resz_clear_then_msaa_draw(false, |_| {});
+    transfer_into_intz(&mut s, 0);
+    sample_intz_on_the_backbuffer(&mut s);
+    assert_eq!(s.passes().len(), 3);
+    assert!(leads_with_intz_transfer(&s, 2));
+
+    s.drop_overwritten_clear_only_passes();
+
+    assert_eq!(s.passes().len(), 2, "the clear-only pass is gone");
+    assert!(!clears_depth_of(&s, resz_intz()));
+    assert_eq!(
+        s.passes()[0].depth_texture(),
+        resz_ds(),
+        "the draw pass stays"
+    );
+    assert_eq!(s.passes()[1].color_texture(), backbuffer());
+    assert!(
+        leads_with_intz_transfer(&s, 1),
+        "the transfer still leads the sampling pass"
+    );
+
+    // The rest of the pipeline keeps the transfer as well.
+    s.coalesce_clear_only_passes();
+    s.finalize_load_actions();
+    s.finalize_store_actions(false);
+    s.strip_dead_color_in_clear_only_passes();
+    s.cull_dead_clear_only_passes();
+    assert_eq!(s.passes().len(), 2);
+    assert!(leads_with_intz_transfer(&s, 1));
+}
+
+#[test]
+fn rule_i_takes_a_depth_transfer_as_the_whole_level_whatever_its_region() {
+    // The unix encoder reads neither the origin nor the region of a
+    // TransferDepth: it writes the destination level at its full extent. A
+    // region that disagrees with the level does not make it partial.
+    let mut s = resz_clear_then_msaa_draw(false, |_| {});
+    let mut blit = depth_transfer(resz_ds(), resz_intz());
+    blit.region_w = 1;
+    blit.region_h = 1;
+    s.push_leading_blit_after_clears(blit, "test");
+    sample_intz_on_the_backbuffer(&mut s);
+    s.drop_overwritten_clear_only_passes();
+    assert!(!clears_depth_of(&s, resz_intz()));
+    assert!(leads_with_intz_transfer(&s, 1));
+}
+
+#[test]
+fn rule_i_keeps_a_clear_read_before_the_overwrite() {
+    // A sampler bind of INTZ in the draw pass reads the cleared depth.
+    let mut s = resz_clear_then_msaa_draw(false, |s| {
+        s.emit_command(Command::set_fragment_texture(resz_intz().raw(), 0));
+    });
+    transfer_into_intz(&mut s, 0);
+    sample_intz_on_the_backbuffer(&mut s);
+    s.drop_overwritten_clear_only_passes();
+    assert_eq!(s.passes().len(), 3, "a sampler read keeps the clear");
+    assert!(clears_depth_of(&s, resz_intz()));
+
+    // So does a copy out of INTZ queued ahead of the transfer.
+    let mut s = resz_clear_then_msaa_draw(false, |_| {});
+    s.end_current_pass("test");
+    s.push_pending_leading_blit(BlitCommand::copy_texture_to_texture_full_mip(
+        resz_intz().raw(),
+        0x7300,
+        0,
+        BB_SIZE.0,
+        BB_SIZE.1,
+    ));
+    transfer_into_intz(&mut s, 0);
+    sample_intz_on_the_backbuffer(&mut s);
+    s.drop_overwritten_clear_only_passes();
+    assert!(
+        clears_depth_of(&s, resz_intz()),
+        "a blit read keeps the clear"
+    );
+
+    // And a transfer out of INTZ ahead of the one into it.
+    let mut s = resz_clear_then_msaa_draw(false, |_| {});
+    s.push_leading_blit_after_clears(depth_transfer(resz_intz(), tex(0x7300)), "test");
+    transfer_into_intz(&mut s, 0);
+    sample_intz_on_the_backbuffer(&mut s);
+    s.drop_overwritten_clear_only_passes();
+    assert!(
+        clears_depth_of(&s, resz_intz()),
+        "a transfer reading INTZ keeps the clear"
+    );
+
+    // And a later pass that attaches INTZ, whatever it loads.
+    let mut s = resz_clear_then_msaa_draw(false, |_| {});
+    s.set_color_render_target(
+        tex(0x7400),
+        BB_SIZE.0,
+        BB_SIZE.1,
+        RT_FORMAT,
+        RenderScale::IDENTITY,
+    );
+    s.set_depth_stencil_attachment(resz_intz(), BB_SIZE, true, false);
+    s.emit_command(dummy_draw());
+    s.set_color_render_target(
+        tex(0x7100),
+        BB_SIZE.0,
+        BB_SIZE.1,
+        RT_FORMAT,
+        RenderScale::IDENTITY,
+    );
+    s.set_color_msaa(tex(0x7101), MetalHandle::NULL, 2);
+    s.set_depth_stencil_attachment(resz_ds(), BB_SIZE, false, true);
+    s.set_depth_sample_count(2);
+    s.emit_command(dummy_draw());
+    transfer_into_intz(&mut s, 0);
+    sample_intz_on_the_backbuffer(&mut s);
+    s.drop_overwritten_clear_only_passes();
+    assert!(
+        clears_depth_of(&s, resz_intz()),
+        "an attachment keeps the clear"
+    );
+}
+
+#[test]
+fn rule_i_keeps_a_clear_only_partly_overwritten() {
+    // A copy smaller than the level leaves cleared texels behind.
+    let mut s = resz_clear_then_msaa_draw(false, |_| {});
+    s.push_leading_blit_after_clears(
+        BlitCommand::copy_texture_to_texture_full_mip(
+            resz_ds().raw(),
+            resz_intz().raw(),
+            0,
+            BB_SIZE.0 / 2,
+            BB_SIZE.1 / 2,
+        ),
+        "test",
+    );
+    sample_intz_on_the_backbuffer(&mut s);
+    s.drop_overwritten_clear_only_passes();
+    assert!(
+        clears_depth_of(&s, resz_intz()),
+        "a smaller copy keeps the clear"
+    );
+
+    // A transfer into another level leaves the cleared level untouched.
+    let mut s = resz_clear_then_msaa_draw(false, |_| {});
+    transfer_into_intz(&mut s, 1);
+    sample_intz_on_the_backbuffer(&mut s);
+    s.drop_overwritten_clear_only_passes();
+    assert!(
+        clears_depth_of(&s, resz_intz()),
+        "another level keeps the clear"
+    );
+
+    // The same for a copy onto a cleared colour target.
+    for (label, blit) in [
+        (
+            "a smaller region",
+            BlitCommand::copy_texture_to_texture_full_mip(0x7500, 0x7600, 0, 128, 128),
+        ),
+        (
+            "another level",
+            BlitCommand::copy_texture_to_texture_full_mip(0x7500, 0x7600, 1, 256, 256),
+        ),
+    ] {
+        let mut s = colour_clear_then_draw_elsewhere(tex(0x7600));
+        s.push_pending_leading_blit(blit);
+        s.emit_command(dummy_draw());
+        s.end_current_pass("test");
+        s.drop_overwritten_clear_only_passes();
+        assert!(clears_colour_of(&s, tex(0x7600)), "{label} keeps the clear");
+    }
+}
+
+#[test]
+fn rule_i_keeps_a_clear_nothing_overwrites_in_the_submission() {
+    // The store is the result: D3D9 keeps it across `Present`, and a flush
+    // continues the frame.
+    let mut s = resz_clear_then_msaa_draw(false, |_| {});
+    s.end_current_pass("test");
+    s.drop_overwritten_clear_only_passes();
+    assert_eq!(s.passes().len(), 2);
+    assert!(clears_depth_of(&s, resz_intz()));
+
+    let mut s = colour_clear_then_draw_elsewhere(tex(0x7600));
+    s.drop_overwritten_clear_only_passes();
+    assert!(clears_colour_of(&s, tex(0x7600)));
+}
+
+#[test]
+fn rule_i_keeps_a_stencil_clear_under_a_depth_transfer() {
+    // The transfer carries stencil only when both ends are
+    // Depth32FloatStencil8, which the blit does not record, so the cleared
+    // stencil could be lost with the pass.
+    let mut s = resz_clear_then_msaa_draw(true, |_| {});
+    assert_eq!(
+        s.passes()[0].stencil_load(),
+        StencilLoad::Clear { value: 0 }
+    );
+    transfer_into_intz(&mut s, 0);
+    sample_intz_on_the_backbuffer(&mut s);
+    s.drop_overwritten_clear_only_passes();
+    assert_eq!(s.passes().len(), 3, "the stencil clear stays");
+    assert!(clears_depth_of(&s, resz_intz()));
+}
+
+/// A colour clear on `rt` materialised as a clear-only pass, then a draw on the back buffer.
+///
+/// The back buffer pass is closed, so a blit pushed next leads the pass after it.
+fn colour_clear_then_draw_elsewhere(rt: MetalHandle<MTLTextureKind>) -> PassState {
+    let mut s = fresh();
+    s.set_color_render_target(rt, 256, 256, RT_FORMAT, RenderScale::IDENTITY);
+    assert_eq!(s.clear_color(1, 2, 3, 4), ColorClearOutcome::Folded);
+    s.set_color_render_target(
+        backbuffer(),
+        BB_SIZE.0,
+        BB_SIZE.1,
+        BB_FORMAT,
+        s.render_scale,
+    );
+    s.emit_command(dummy_draw());
+    s.end_current_pass("test");
+    let clear = &s.passes()[0];
+    assert_eq!(clear.color_texture(), rt);
+    assert!(matches!(clear.color_load(), ColorLoad::Clear { .. }));
+    assert!(!clear.commands().iter().any(Command::is_draw));
+    s
+}
+
+/// Whether some pass of `s` still clears render target 0 `texture`.
+fn clears_colour_of(s: &PassState, texture: MetalHandle<MTLTextureKind>) -> bool {
+    s.passes()
+        .iter()
+        .any(|p| p.color_texture() == texture && matches!(p.color_load(), ColorLoad::Clear { .. }))
+}
+
+#[test]
+fn rule_i_drops_a_colour_clear_a_full_copy_overwrites() {
+    // A copy onto the whole level lands before anything reads the target,
+    // so the clear under it is never seen.
+    let rt = tex(0x7600);
+    let mut s = colour_clear_then_draw_elsewhere(rt);
+    s.push_pending_leading_blit(BlitCommand::copy_texture_to_texture_full_mip(
+        0x7500,
+        rt.raw(),
+        0,
+        256,
+        256,
+    ));
+    s.emit_command(dummy_draw());
+    s.end_current_pass("test");
+    s.set_color_render_target(
+        backbuffer(),
+        BB_SIZE.0,
+        BB_SIZE.1,
+        BB_FORMAT,
+        s.render_scale,
+    );
+    s.emit_command(Command::set_fragment_texture(rt.raw(), 0));
+    s.emit_command(dummy_draw());
+    s.end_current_pass("test");
+    let before = s.passes().len();
+
+    s.drop_overwritten_clear_only_passes();
+
+    assert_eq!(s.passes().len(), before - 1, "the clear-only pass is gone");
+    assert!(!clears_colour_of(&s, rt));
+    assert_eq!(
+        s.passes()[1].leading_blits().len(),
+        1,
+        "the copy keeps its place ahead of the pass it leads"
+    );
+}
+
+// ── Dead draws: nothing written, nothing recorded ──
+
+/// The state of the dummy draw ahead of a RESZ resolve, minus the render state under test.
+///
+/// Colour masked off on render target 0, depth test off with the depth write
+/// still enabled, the default stencil state, and a depth-stencil attachment
+/// carrying both planes: nothing this draw runs can write.
+struct DeadDrawState {
+    rs: PipelineRsBits,
+    extra: ExtraColorAttachments,
+    ps_color_out_mask: u8,
+    depth_stencil: DepthStencilSnapshot,
+    attach: PipelineAttachFlags,
+    counting_query: bool,
+}
+
+impl DeadDrawState {
+    fn new() -> Self {
+        Self {
+            rs: PipelineRsBits::default(),
+            extra: ExtraColorAttachments::NONE,
+            ps_color_out_mask: 1,
+            depth_stencil: DepthStencilSnapshot {
+                depth_write: 1,
+                ..DepthStencilSnapshot::inert()
+            },
+            attach: PipelineAttachFlags::HAS_DEPTH | PipelineAttachFlags::HAS_STENCIL,
+            counting_query: false,
+        }
+    }
+
+    fn writes(&self) -> DrawWrites<'_> {
+        DrawWrites {
+            rs: &self.rs,
+            extra: &self.extra,
+            ps_color_out_mask: self.ps_color_out_mask,
+            depth_stencil: &self.depth_stencil,
+            attach: self.attach,
+            counting_query: self.counting_query,
+        }
+    }
+
+    fn is_dead(&self) -> bool {
+        draw_writes_nothing(&self.writes())
+    }
+}
+
+/// Assert that applying `change` to the dead baseline makes the draw live.
+fn assert_makes_live(label: &str, change: impl FnOnce(&mut DeadDrawState)) {
+    let mut state = DeadDrawState::new();
+    assert!(state.is_dead(), "the baseline writes nothing");
+    change(&mut state);
+    assert!(!state.is_dead(), "{label} makes the draw observable");
+}
+
+/// Assert that applying `change` to the dead baseline leaves the draw dead.
+fn assert_stays_dead(label: &str, change: impl FnOnce(&mut DeadDrawState)) {
+    let mut state = DeadDrawState::new();
+    change(&mut state);
+    assert!(state.is_dead(), "{label} still writes nothing");
+}
+
+#[test]
+fn dead_draw_colour_write_on_any_bound_target_is_live() {
+    assert_makes_live("COLORWRITEENABLE on render target 0", |s| {
+        s.rs.color_write_mask = 0x1;
+    });
+    assert_makes_live("COLORWRITEENABLE1 on a bound, written target 1", |s| {
+        s.extra.present_mask = 0b001;
+        s.ps_color_out_mask = 0b011;
+        s.rs.color_write_mask_ext[0] = 0xF;
+    });
+    assert_makes_live("COLORWRITEENABLE3 on a bound, written target 3", |s| {
+        s.extra.present_mask = 0b100;
+        s.ps_color_out_mask = 0b1001;
+        s.rs.color_write_mask_ext[2] = 0x8;
+    });
+    // A mask on a target the pass does not attach, or one the shader never
+    // writes, writes nothing, the same reading the pipeline key takes.
+    assert_stays_dead("COLORWRITEENABLE1 with no target 1", |s| {
+        s.ps_color_out_mask = 0b011;
+        s.rs.color_write_mask_ext[0] = 0xF;
+    });
+    assert_stays_dead("COLORWRITEENABLE1 on a target the shader skips", |s| {
+        s.extra.present_mask = 0b001;
+        s.rs.color_write_mask_ext[0] = 0xF;
+    });
+}
+
+#[test]
+fn dead_draw_depth_write_needs_the_test_the_write_and_the_plane() {
+    assert_makes_live("ZENABLE with ZWRITEENABLE", |s| {
+        s.depth_stencil.depth_enable = 1;
+    });
+    assert_stays_dead("ZENABLE without ZWRITEENABLE", |s| {
+        s.depth_stencil.depth_enable = 1;
+        s.depth_stencil.depth_write = 0;
+    });
+    assert_stays_dead("ZENABLE and ZWRITEENABLE with no depth attachment", |s| {
+        s.depth_stencil.depth_enable = 1;
+        s.attach = PipelineAttachFlags::empty();
+    });
+}
+
+#[test]
+fn dead_draw_stencil_write_needs_an_op_the_mask_and_the_plane() {
+    let replace = u8::try_from(mtld3d_types::D3DSTENCILOP_REPLACE).expect("stencil op fits u8");
+    let incr = u8::try_from(mtld3d_types::D3DSTENCILOP_INCR).expect("stencil op fits u8");
+    let enabled = |s: &mut DeadDrawState| {
+        s.depth_stencil.stencil_enable = 1;
+        s.depth_stencil.write_mask = u32::MAX;
+    };
+    // Every operation of either face writes on its own.
+    assert_makes_live("a front-face fail op", |s| {
+        enabled(s);
+        s.depth_stencil.front.fail_op = replace;
+    });
+    assert_makes_live("a front-face depth-fail op", |s| {
+        enabled(s);
+        s.depth_stencil.front.depth_fail_op = incr;
+    });
+    assert_makes_live("a front-face pass op", |s| {
+        enabled(s);
+        s.depth_stencil.front.pass_op = replace;
+    });
+    assert_makes_live("a back-face op under two-sided stencil", |s| {
+        enabled(s);
+        s.depth_stencil.back.pass_op = incr;
+    });
+    // `KEEP` everywhere, a write mask the 8-bit plane cannot see, stencil
+    // off, or no stencil plane: nothing changes.
+    assert_stays_dead("KEEP on every op", enabled);
+    assert_stays_dead("a write mask above the stencil bits", |s| {
+        enabled(s);
+        s.depth_stencil.write_mask = !STENCIL_MASK_BITS;
+        s.depth_stencil.front.pass_op = replace;
+    });
+    assert_stays_dead("STENCILENABLE off", |s| {
+        enabled(s);
+        s.depth_stencil.stencil_enable = 0;
+        s.depth_stencil.front.pass_op = replace;
+    });
+    assert_stays_dead("no stencil plane", |s| {
+        enabled(s);
+        s.depth_stencil.front.pass_op = replace;
+        s.attach = PipelineAttachFlags::HAS_DEPTH;
+    });
+}
+
+#[test]
+fn dead_draw_counting_query_observes_it() {
+    assert_makes_live("an open occlusion query", |s| s.counting_query = true);
+}
+
+#[test]
+fn dead_draw_coverage_states_alone_write_nothing() {
+    // Alpha-to-coverage only narrows which samples a write reaches; with no
+    // write left there is nothing for it to narrow.
+    assert_stays_dead("alpha-to-coverage", |s| {
+        s.rs.flags |= crate::pipeline_state::PipelineRsFlags::ALPHA_TO_COVERAGE;
+    });
+    assert_stays_dead("blending", |s| {
+        s.rs.flags |= crate::pipeline_state::PipelineRsFlags::BLEND_ENABLE;
+    });
+}
+
+#[test]
+fn dead_draw_is_not_skipped_while_it_would_land_a_pending_clear() {
+    let dead = DeadDrawState::new();
+    // A depth clear with no pass open waits for the pass the draw would open.
+    let mut s = fresh();
+    assert_eq!(s.clear_depth(f32::to_bits(1.0)), DepthClearOutcome::Folded);
+    assert!(!s.skip_dead_draw(&dead.writes()));
+    s.ensure_pass_open();
+    assert!(
+        s.skip_dead_draw(&dead.writes()),
+        "once the pass is open it may go"
+    );
+
+    let mut s = fresh();
+    assert_eq!(s.clear_color(1, 2, 3, 4), ColorClearOutcome::Folded);
+    assert!(!s.skip_dead_draw(&dead.writes()));
+
+    // Nothing pending and no pass open: the draw opens nothing either.
+    assert!(fresh().skip_dead_draw(&dead.writes()));
+
+    // And a draw that writes stays whatever is pending.
+    let mut live = DeadDrawState::new();
+    live.depth_stencil.depth_enable = 1;
+    let mut s = fresh();
+    s.ensure_pass_open();
+    assert!(!s.skip_dead_draw(&live.writes()));
+}
+
+/// What the encoder records for a draw that samples INTZ: nothing when it is dead.
+fn draw_sampling_intz(s: &mut PassState, state: &DeadDrawState) {
+    if s.skip_dead_draw(&state.writes()) {
+        return;
+    }
+    s.emit_command(Command::set_fragment_texture(resz_intz().raw(), 0));
+    s.emit_command(dummy_draw());
+}
+
+#[test]
+fn dead_draw_before_resz_leaves_rule_i_free_to_drop_the_clear() {
+    // The RESZ frame: the depth clear on INTZ, the multisampled draw pass
+    // with its depth writes, then the dummy draw with INTZ on sampler 0,
+    // COLORWRITEENABLE 0 and ZENABLE off, then the transfer into INTZ and a
+    // pass sampling it.
+    let dead = DeadDrawState::new();
+    let mut s = resz_clear_then_msaa_draw(false, |_| {});
+    let draw_pass = s.passes().len() - 1;
+    let commands_before = s.passes()[draw_pass].commands().len();
+    draw_sampling_intz(&mut s, &dead);
+    let pass = &s.passes()[draw_pass];
+    assert_eq!(
+        pass.commands().len(),
+        commands_before,
+        "the dead draw records nothing"
+    );
+    assert_eq!(pass.commands().iter().filter(|c| c.is_draw()).count(), 1);
+    assert!(!pass_samples_texture(
+        pass,
+        resz_intz(),
+        &FxHashMap::default()
+    ));
+    transfer_into_intz(&mut s, 0);
+    sample_intz_on_the_backbuffer(&mut s);
+    s.drop_overwritten_clear_only_passes();
+    assert!(
+        !clears_depth_of(&s, resz_intz()),
+        "nothing reads the cleared INTZ before the transfer replaces it"
+    );
+
+    // The same draw with the depth test on writes depth, so it is recorded,
+    // its sampler bind reads the cleared INTZ, and the clear stays.
+    let mut live = DeadDrawState::new();
+    live.depth_stencil.depth_enable = 1;
+    let mut s = resz_clear_then_msaa_draw(false, |_| {});
+    draw_sampling_intz(&mut s, &live);
+    transfer_into_intz(&mut s, 0);
+    sample_intz_on_the_backbuffer(&mut s);
+    s.drop_overwritten_clear_only_passes();
+    assert!(
+        clears_depth_of(&s, resz_intz()),
+        "a live draw's read keeps it"
+    );
+}
+
+#[test]
+fn dead_draw_alone_before_resz_leaves_rule_i_free_to_drop_the_clear() {
+    // The resz_test shape: the INTZ clear lands as a depth-only pass when the
+    // multisampled surfaces are bound, the pass on them gets only the dummy
+    // draw, which is dead, then the transfer into INTZ and a pass sampling it.
+    let dead = DeadDrawState::new();
+    let mut s = fresh();
+    s.set_depth_stencil_attachment(resz_intz(), BB_SIZE, true, false);
+    assert_eq!(s.clear_depth(f32::to_bits(1.0)), DepthClearOutcome::Folded);
+    s.set_color_render_target(
+        tex(0x7100),
+        BB_SIZE.0,
+        BB_SIZE.1,
+        RT_FORMAT,
+        RenderScale::IDENTITY,
+    );
+    s.set_color_msaa(tex(0x7101), MetalHandle::NULL, 2);
+    s.set_depth_stencil_attachment(resz_ds(), BB_SIZE, false, true);
+    s.set_depth_sample_count(2);
+    assert_eq!(s.passes().len(), 1, "the clear landed before the rebind");
+    assert!(s.passes()[0].color_texture().is_null());
+    assert_eq!(s.passes()[0].depth_texture(), resz_intz());
+    draw_sampling_intz(&mut s, &dead);
+    assert_eq!(s.passes().len(), 1, "the dead draw opens no pass");
+    transfer_into_intz(&mut s, 0);
+    sample_intz_on_the_backbuffer(&mut s);
+    assert_eq!(s.passes().len(), 2);
+    assert!(leads_with_intz_transfer(&s, 1));
+
+    s.drop_overwritten_clear_only_passes();
+
+    assert_eq!(s.passes().len(), 1, "the clear-only pass is gone");
+    assert!(!clears_depth_of(&s, resz_intz()));
+    assert!(leads_with_intz_transfer(&s, 0));
+    assert_eq!(s.passes()[0].color_texture(), backbuffer());
+}

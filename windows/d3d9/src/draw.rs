@@ -24,7 +24,7 @@ use mtld3d_core::{
         sampler_cache_key,
     },
     perf::{CycleAddTimer, OpSub, OpSubDetail, PairShaderId},
-    pipeline_state::{PipelineSnapshot, StreamLayout},
+    pipeline_state::{PipelineAttachFlags, PipelineSnapshot, StreamLayout},
     scratch::ScratchArena,
     shader_cache,
     streams::{
@@ -1265,6 +1265,42 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
         .expect("emit_draw: ps not populated")
         .as_ref();
     let variant = snap.variant.expect("emit_draw: variant not populated");
+    // The snapshot records what the app bound; the pass records what Metal
+    // will accept. A depth surface that disagrees with render target 0 on
+    // sample count is dropped at pass open, and a pipeline built for that pass
+    // must declare neither a depth nor a stencil format or Metal rejects the
+    // draw.
+    let pass_binds_depth = enc.pass_binds_depth();
+    let mut target_planes = PipelineAttachFlags::empty();
+    target_planes.set(
+        PipelineAttachFlags::HAS_DEPTH,
+        pass_binds_depth && snap.depth_stencil.contains(DepthStencilFlags::HAS_DEPTH),
+    );
+    target_planes.set(
+        PipelineAttachFlags::HAS_STENCIL,
+        pass_binds_depth && snap.depth_stencil.contains(DepthStencilFlags::HAS_STENCIL),
+    );
+    let has_depth = target_planes.contains(PipelineAttachFlags::HAS_DEPTH);
+    let has_stencil = target_planes.contains(PipelineAttachFlags::HAS_STENCIL);
+    // Bit `i` set ⇒ the pixel shader writes `oCi`; the FF PS writes one output.
+    let ps_color_out_mask = match ps {
+        PsSource::Programmable { color_out_mask, .. } => *color_out_mask,
+        PsSource::FixedFunction { .. } => 1,
+    };
+    // A draw that can write nothing is left out before it emits or resolves
+    // anything, so the pass list and `last_bound` stay exactly as they were
+    // and no bind of it reads a texture. `PassState::skip_dead_draw` owns the
+    // conditions. Occlusion queries are ordered by their own ops and a RESZ
+    // depth transfer by the `POINTSIZE` write that queued it, so neither
+    // moves.
+    if enc.skip_dead_draw(
+        &render_state.pipeline_rs,
+        &render_state.depth_stencil_state,
+        ps_color_out_mask,
+        target_planes,
+    ) {
+        return;
+    }
     // Stages the bound pixel shader declares a sampler for. Every texture,
     // sampler and per-slot bias bind below is confined to this mask: a stage
     // the game bound a texture to that the shader never samples has no
@@ -1313,15 +1349,12 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
     // the VS key, which shares `variant`, is untouched; the FF PS writes one
     // output and keeps the default so its library index never fragments.
     let extra_attachments = enc.current_extra_color_attachments();
-    let (mut ps_variant, ps_color_out_mask) = match ps {
-        PsSource::Programmable { color_out_mask, .. } => (
-            VariantKey {
-                color_out_mask: extra_attachments.present_mask << 1,
-                ..variant
-            },
-            *color_out_mask,
-        ),
-        PsSource::FixedFunction { .. } => (variant, 1),
+    let mut ps_variant = match ps {
+        PsSource::Programmable { .. } => VariantKey {
+            color_out_mask: extra_attachments.present_mask << 1,
+            ..variant
+        },
+        PsSource::FixedFunction { .. } => variant,
     };
     // Coverage consumes the fragment alpha instead of applying ALPHAFUNC.
     // Resolve from the current target so switching back to one sample restores
@@ -1481,15 +1514,6 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
     } else {
         ScratchSlice::EMPTY
     };
-    // The snapshot records what the app bound; the pass records what Metal
-    // will accept. A depth surface that disagrees with render target 0 on
-    // sample count is dropped at pass open, and a pipeline built for that pass
-    // must declare neither a depth nor a stencil format or Metal rejects the
-    // draw.
-    let pass_binds_depth = enc.pass_binds_depth();
-    let has_depth = pass_binds_depth && snap.depth_stencil.contains(DepthStencilFlags::HAS_DEPTH);
-    let has_stencil =
-        pass_binds_depth && snap.depth_stencil.contains(DepthStencilFlags::HAS_STENCIL);
     drop(t_consts);
 
     // 1. Lazily create each bound Metal texture; collect handles. Upload
@@ -1645,20 +1669,12 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
 
     // 3. Pipeline + depth state + cull.
     let color_format = enc.current_color_format();
-    let mut attach = mtld3d_core::pipeline_state::PipelineAttachFlags::HAS_COLOR_OUTPUT;
-    attach.set(
-        mtld3d_core::pipeline_state::PipelineAttachFlags::HAS_DEPTH,
-        has_depth,
-    );
-    attach.set(
-        mtld3d_core::pipeline_state::PipelineAttachFlags::HAS_STENCIL,
-        has_stencil,
-    );
+    let mut attach = target_planes | PipelineAttachFlags::HAS_COLOR_OUTPUT;
     // Carry the bound RT's D3D "has alpha" bit so destination-alpha blend
     // factors clamp on alpha-less targets (X8R8G8B8 shares `Bgra8Unorm` with
     // A8R8G8B8, so the color format alone can't distinguish them).
     attach.set(
-        mtld3d_core::pipeline_state::PipelineAttachFlags::COLOR_HAS_ALPHA,
+        PipelineAttachFlags::COLOR_HAS_ALPHA,
         enc.current_color_rt_has_alpha(),
     );
     let pipeline_snapshot = PipelineSnapshot {

@@ -29,7 +29,7 @@ use mtld3d_core::{
     ids::{BufferId, DepthStencilKey, ProgramId, SamplerKey, TextureId},
     page_box::{PageBox, PageBoxRead},
     passes::{
-        BackbufferContents, ColorClearOutcome, ColorLoad, DepthClearOutcome, DepthLoad,
+        BackbufferContents, ColorClearOutcome, ColorLoad, DepthClearOutcome, DepthLoad, DrawWrites,
         ExtraColorSlot, LastBoundCache, Pass, PassState, SnapshotBytesCache, StencilClearOutcome,
         StencilLoad, StoreAction as PassStoreAction, UploadPassTarget,
     },
@@ -2790,6 +2790,30 @@ impl FrameEncoder {
 
     pub fn emit_command(&mut self, cmd: Command) {
         self.pass_state.emit_command(cmd);
+    }
+
+    /// Whether the draw about to be emitted can write nothing and is left out.
+    ///
+    /// Proxies [`PassState::skip_dead_draw`], filling in the one fact only the
+    /// encoder has: whether an occlusion query is open. Asked before the draw
+    /// emits anything, so a skipped draw leaves `last_bound` and the pass
+    /// list exactly as they were.
+    pub fn skip_dead_draw(
+        &self,
+        rs: &mtld3d_core::pipeline_state::PipelineRsBits,
+        depth_stencil: &mtld3d_core::depth_stencil_state::DepthStencilSnapshot,
+        ps_color_out_mask: u8,
+        attach: mtld3d_core::pipeline_state::PipelineAttachFlags,
+    ) -> bool {
+        let extra = self.pass_state.extra_color_attachments();
+        self.pass_state.skip_dead_draw(&DrawWrites {
+            rs,
+            extra: &extra,
+            ps_color_out_mask,
+            depth_stencil,
+            attach,
+            counting_query: self.visibility.active_count() != 0,
+        })
     }
 
     /// Reserve the frame's next visibility slot.
@@ -10518,10 +10542,14 @@ fn trailing_blit_descriptor(trailing_blits: &[BlitCommand]) -> PassDescriptor {
 
 /// Apply the load/store optimiser rules in dependency order.
 ///
-/// Rule E (coalesce) runs first so the load/store finalisers see the
-/// merged pass list. Rule A reverts eager `Load=DontCare` whose attachment
-/// is sampled later this frame; Rules B/C set store actions on stable load
-/// actions. Rule G strips dead color attachments from clear-only passes
+/// Rule I runs first: a clear-only pass whose every cleared target is fully
+/// overwritten later in the submission before anything reads it is dropped
+/// before Rule E could fold that dead clear into a later pass's load action,
+/// and before Rule A's correction reasons over it. Rule E (coalesce) runs
+/// next so the load/store finalisers see the merged pass list. Rule A
+/// reverts eager `Load=DontCare` whose attachment is sampled later this
+/// frame; Rules B/C set store actions on stable load actions. Rule G
+/// strips dead color attachments from clear-only passes
 /// (kills Apple's "Unused Texture" Insight on the cascade placeholder).
 /// Rule H strips color from passes-with-draws where every draw had
 /// `color_write_mask=0` (caster passes), rewriting `SetRenderPipelineState`
@@ -10529,6 +10557,7 @@ fn trailing_blit_descriptor(trailing_blits: &[BlitCommand]) -> PassDescriptor {
 /// Rule F drops clear-only passes that nothing observes; must run after
 /// Rule G so the cull picks up the strip.
 fn apply_pass_rules(enc: &mut FrameEncoder, frame_continues: bool) {
+    enc.pass_state.drop_overwritten_clear_only_passes();
     enc.pass_state.coalesce_clear_only_passes();
     enc.pass_state.finalize_load_actions();
     enc.pass_state.finalize_store_actions(frame_continues);

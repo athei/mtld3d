@@ -159,6 +159,39 @@ impl PipelineRsBits {
     pub const fn separate_alpha_blend_enable(&self) -> bool {
         self.flags.contains(PipelineRsFlags::SEPARATE_ALPHA_BLEND)
     }
+
+    /// Effective Metal write mask of extra target `extra_index` (slot `extra_index + 1`).
+    ///
+    /// Empty when the target is absent from the pass or the pixel shader,
+    /// whose `oCn` outputs `ps_color_out_mask` lists, does not write it;
+    /// otherwise the D3D9 `COLORWRITEENABLEn` mask.
+    #[must_use]
+    pub fn extra_write_mask(
+        &self,
+        extra: &ExtraColorAttachments,
+        ps_color_out_mask: u8,
+        extra_index: usize,
+    ) -> ColorWriteMask {
+        let written = ps_color_out_mask & (1 << (extra_index + 1)) != 0;
+        if extra.is_present(extra_index) && written {
+            d3d_to_metal_write_mask(u32::from(self.color_write_mask_ext[extra_index]))
+        } else {
+            ColorWriteMask::empty()
+        }
+    }
+
+    /// `true` when no colour target of the pass receives a write under these states.
+    ///
+    /// Render target 0 by its D3D9 mask, targets 1..3 by their effective
+    /// mask (present, written by the shader, non-zero `COLORWRITEENABLEn`).
+    #[must_use]
+    pub fn writes_no_color(&self, extra: &ExtraColorAttachments, ps_color_out_mask: u8) -> bool {
+        self.color_write_mask == 0
+            && (0..3).all(|i| {
+                self.extra_write_mask(extra, ps_color_out_mask, i)
+                    .is_empty()
+            })
+    }
 }
 
 /// Input describing one draw's pipeline state.
@@ -225,22 +258,17 @@ impl PipelineSnapshot {
     /// Empty when the target is absent from the pass or the shader does not
     /// write it; otherwise the D3D9 `COLORWRITEENABLEn` mask.
     fn extra_write_mask(&self, extra_index: usize) -> ColorWriteMask {
-        let written = self.ps_color_out_mask & (1 << (extra_index + 1)) != 0;
-        if self.extra.is_present(extra_index) && written {
-            d3d_to_metal_write_mask(u32::from(self.rs.color_write_mask_ext[extra_index]))
-        } else {
-            ColorWriteMask::empty()
-        }
+        self.rs
+            .extra_write_mask(&self.extra, self.ps_color_out_mask, extra_index)
     }
 
     /// `true` when no colour target of the pass receives a write from this draw.
     ///
-    /// Render target 0 by its D3D9 mask, targets 1..3 by their effective
-    /// mask (present, written by the shader, non-zero `COLORWRITEENABLEn`).
-    /// Rule H builds the no-colour pipeline twin for such draws.
+    /// See [`PipelineRsBits::writes_no_color`]. Rule H builds the no-colour
+    /// pipeline twin for such draws.
     #[must_use]
     pub fn writes_no_color(&self) -> bool {
-        self.rs.color_write_mask == 0 && (0..3).all(|i| self.extra_write_mask(i).is_empty())
+        self.rs.writes_no_color(&self.extra, self.ps_color_out_mask)
     }
 
     /// Metal format keyed for extra target `extra_index`, normalised when absent.
