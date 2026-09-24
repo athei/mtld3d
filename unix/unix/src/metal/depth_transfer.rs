@@ -17,7 +17,7 @@ use objc2_metal::{
 use super::{
     command::diagnostics,
     handle::{IntoRetained, ReleaseRetain},
-    transient::{LastUse, SubmitStamp},
+    transient::{LastUse, OwnedBuffer, SubmitStamp},
 };
 use crate::LOG_TARGET;
 
@@ -161,7 +161,7 @@ pub fn encode(
     let stencil = source.pixelFormat() == MTLPixelFormat::Depth32Float_Stencil8
         && destination.pixelFormat() == MTLPixelFormat::Depth32Float_Stencil8;
     let device = source.device();
-    let resample = !(source.sampleCount() == 1 && width == out_width && height == out_height);
+    let resample = source.sampleCount() != 1 || width != out_width || height != out_height;
     let input_set = if resample && source.sampleCount() == 1 {
         let Some(set) = planes.acquire(&device, width, height, stencil, stamp, None) else {
             return false;
@@ -170,16 +170,13 @@ pub fn encode(
     } else {
         None
     };
-    let Some(output_set) = planes.acquire(&device, out_width, out_height, stencil, stamp, input_set)
+    let Some(output_set) =
+        planes.acquire(&device, out_width, out_height, stencil, stamp, input_set)
     else {
         return false;
     };
     let output = planes.view(output_set, out_width, stencil);
-    if !resample {
-        if !extract_planes(cb, &source, source_level, (width, height), &output, labels) {
-            return false;
-        }
-    } else {
+    if resample {
         // SAFETY: the typed transfer constructor carries the encoder-owned pipeline retain.
         let pipeline_handle =
             unsafe { MetalHandle::<MTLComputePipelineStateKind>::new(command.src_offset) };
@@ -306,6 +303,8 @@ pub fn encode(
         );
         compute.dispatchThreadgroups_threadsPerThreadgroup(grid, threadgroup);
         compute.endEncoding();
+    } else if !extract_planes(cb, &source, source_level, (width, height), &output, labels) {
+        return false;
     }
     let Some(blit) = cb.blitCommandEncoder() else {
         log::error!(target: LOG_TARGET, "depth transfer: destination blit encoder failed");
@@ -376,7 +375,7 @@ impl PlanePool {
     /// Sets the pool holds.
     #[cfg(test)]
     #[must_use]
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.sets.len()
     }
 
@@ -395,16 +394,20 @@ impl PlanePool {
     ) -> Option<usize> {
         let (depth_len, stencil_len) = plane_lengths(width, height);
         let fits = |set: &PlaneSet| {
-            set.depth.length() >= depth_len
-                && (!stencil || set.stencil.as_ref().is_some_and(|s| s.length() >= stencil_len))
+            set.depth_len >= depth_len
+                && (!stencil || set.stencil.is_some() && set.stencil_len >= stencil_len)
                 && set.last_use.writable_by(stamp)
         };
-        let index = if let Some(index) = (0..self.sets.len())
-            .find(|&index| Some(index) != exclude && fits(&self.sets[index]))
+        let index = if let Some(index) =
+            (0..self.sets.len()).find(|&index| Some(index) != exclude && fits(&self.sets[index]))
         {
             index
         } else {
-            self.sets.push(PlaneSet::new(device, depth_len, stencil.then_some(stencil_len))?);
+            self.sets.push(PlaneSet::new(
+                device,
+                depth_len,
+                stencil.then_some(stencil_len),
+            )?);
             self.sets.len() - 1
         };
         self.sets[index].last_use.record(stamp);
@@ -415,8 +418,12 @@ impl PlanePool {
     fn view(&self, index: usize, width: usize, stencil: bool) -> PlaneBuffers<'_> {
         let set = &self.sets[index];
         PlaneBuffers {
-            depth: &set.depth,
-            stencil: if stencil { set.stencil.as_deref() } else { None },
+            depth: set.depth.get(),
+            stencil: if stencil {
+                set.stencil.as_ref().map(OwnedBuffer::get)
+            } else {
+                None
+            },
             depth_pitch: depth_pitch(width),
             stencil_pitch: stencil_pitch(width),
         }
@@ -425,15 +432,12 @@ impl PlanePool {
 
 /// One pooled pair of private planes and the submissions that use it.
 struct PlaneSet {
-    depth: Retained<ProtocolObject<dyn MTLBuffer>>,
-    stencil: Option<Retained<ProtocolObject<dyn MTLBuffer>>>,
+    depth: OwnedBuffer,
+    depth_len: usize,
+    stencil: Option<OwnedBuffer>,
+    stencil_len: usize,
     last_use: LastUse,
 }
-
-// SAFETY: a set lives on its device's record behind a mutex, so one
-// submitting thread at a time touches it, and retaining or releasing an
-// `MTLBuffer` is thread-safe.
-unsafe impl Send for PlaneSet {}
 
 impl PlaneSet {
     fn new(
@@ -441,8 +445,8 @@ impl PlaneSet {
         depth_len: usize,
         stencil_len: Option<usize>,
     ) -> Option<Self> {
-        let depth =
-            device.newBufferWithLength_options(depth_len, MTLResourceOptions::StorageModePrivate)?;
+        let depth = device
+            .newBufferWithLength_options(depth_len, MTLResourceOptions::StorageModePrivate)?;
         depth.setLabel(Some(&NSString::from_str(
             "mtld3d-depth-transfer-depth-plane",
         )));
@@ -452,13 +456,15 @@ impl PlaneSet {
             buffer.setLabel(Some(&NSString::from_str(
                 "mtld3d-depth-transfer-stencil-plane",
             )));
-            Some(buffer)
+            Some(OwnedBuffer::new(buffer))
         } else {
             None
         };
         Some(Self {
-            depth,
+            depth: OwnedBuffer::new(depth),
+            depth_len,
             stencil,
+            stencil_len: stencil_len.unwrap_or(0),
             last_use: LastUse::default(),
         })
     }

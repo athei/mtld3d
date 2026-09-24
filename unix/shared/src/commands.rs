@@ -439,7 +439,8 @@ impl Command {
     ///
     /// `index_ptr` points into the per-frame scratch arena and
     /// `index_bytes` is its length; the unix side copies it into its upload
-    /// ring and draws from that buffer, since Metal has no inline-index form. `param_d` carries the counts packed by
+    /// ring and draws from that buffer, since Metal has no inline-index form.
+    /// `param_d` carries the counts packed by
     /// [`Self::pack_indexed_draw_counts`]. Base vertex is always 0 (UP indices
     /// are absolute).
     #[must_use]

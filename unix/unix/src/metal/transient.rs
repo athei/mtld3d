@@ -8,13 +8,14 @@
 //! has still to read, which Apple Silicon usually hides and the Intel and
 //! paravirtual devices do not.
 
-use core::{ffi::c_void, ptr::NonNull};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use mtld3d_shared::SubmitFrameParams;
+use mtld3d_shared::{MetalHandle, SubmitFrameParams, mtl_handle::MTLBufferKind};
 use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_foundation::NSString;
 use objc2_metal::{MTLBuffer, MTLDevice, MTLResource, MTLResourceOptions};
+
+use super::handle::{BorrowRetained, ReleaseRetain};
 
 /// Capacity of the first upload-ring chunk.
 const FIRST_CHUNK_BYTES: usize = 64 * 1024;
@@ -142,9 +143,19 @@ impl LastUse {
     #[must_use]
     pub fn writable_by(&self, stamp: &SubmitStamp) -> bool {
         let (own, other, own_retired, other_retired) = if stamp.upload {
-            (self.upload, self.draw, stamp.upload_retired(), stamp.draw_retired())
+            (
+                self.upload,
+                self.draw,
+                stamp.upload_retired(),
+                stamp.draw_retired(),
+            )
         } else {
-            (self.draw, self.upload, stamp.draw_retired(), stamp.upload_retired())
+            (
+                self.draw,
+                self.upload,
+                stamp.draw_retired(),
+                stamp.upload_retired(),
+            )
         };
         (other == 0 || other_retired >= other)
             && (own == 0 || own == stamp.seq || own_retired >= own)
@@ -190,22 +201,17 @@ impl UploadRing {
     ) -> Option<RingSlice<'_>> {
         let offset = self.reserve(device, stamp, bytes.len(), align)?;
         let chunk = self.active.as_mut()?;
+        let buffer = chunk.buffer.get();
+        let destination = buffer.contents().as_ptr().cast::<u8>().wrapping_add(offset);
         // SAFETY: `reserve` placed `offset..offset + len` inside the chunk's
         // shared storage, a region no queued command buffer reads: it lies
         // past every earlier write since the chunk was last started, and a
         // chunk is started again only after its readers retired.
         unsafe {
-            core::ptr::copy_nonoverlapping(
-                bytes.as_ptr(),
-                chunk.contents.as_ptr().cast::<u8>().add(offset),
-                bytes.len(),
-            );
+            core::ptr::copy_nonoverlapping(bytes.as_ptr(), destination, bytes.len());
         }
         chunk.last_use.record(stamp);
-        Some(RingSlice {
-            buffer: &chunk.buffer,
-            offset,
-        })
+        Some(RingSlice { buffer, offset })
     }
 
     /// Close a submission: grow to its total, and drop spares it outgrew or no longer needs.
@@ -244,7 +250,10 @@ impl UploadRing {
     ) -> Option<usize> {
         if let Some(chunk) = self.active.as_mut() {
             let offset = chunk.cursor.next_multiple_of(align);
-            if offset.checked_add(len).is_some_and(|end| end <= chunk.capacity) {
+            if offset
+                .checked_add(len)
+                .is_some_and(|end| end <= chunk.capacity)
+            {
                 self.written += offset + len - chunk.cursor;
                 chunk.cursor = offset + len;
                 return Some(offset);
@@ -272,30 +281,56 @@ impl UploadRing {
     }
 }
 
+/// One canonical retain on an `MTLBuffer`, released when dropped.
+///
+/// Kept as the wire handle rather than a `Retained`, which is not `Send`, so
+/// the pools that own buffers can live on the device record. Retaining,
+/// releasing and reading an `MTLBuffer` are thread-safe, and the pools are
+/// only touched by one submitting thread at a time, behind the record's locks.
+pub struct OwnedBuffer(MetalHandle<MTLBufferKind>);
+
+impl OwnedBuffer {
+    /// Take over `buffer`'s retain.
+    #[must_use]
+    pub fn new(buffer: Retained<ProtocolObject<dyn MTLBuffer>>) -> Self {
+        // SAFETY: `Retained::into_raw` hands over a live retain on a non-null
+        // `MTLBuffer`, which this handle now owns until `Drop`.
+        Self(unsafe { MetalHandle::new(Retained::into_raw(buffer) as u64) })
+    }
+
+    /// The buffer, borrowed for as long as the owner lives.
+    #[must_use]
+    pub fn get(&self) -> &ProtocolObject<dyn MTLBuffer> {
+        // SAFETY: `self` holds the canonical retain until it drops, which the
+        // borrow of `self` outlives no longer than.
+        unsafe { self.0.borrow_retained() }.expect("an owned buffer is never null")
+    }
+}
+
+impl Drop for OwnedBuffer {
+    fn drop(&mut self) {
+        // SAFETY: the handle owns the retain `new` took over and no copy of
+        // it escapes; a command buffer that still reads the buffer holds a
+        // retain of its own.
+        unsafe { self.0.release_retain() };
+    }
+}
+
 /// One shared-storage buffer of the ring and where its next payload goes.
 struct Chunk {
-    buffer: Retained<ProtocolObject<dyn MTLBuffer>>,
-    contents: NonNull<c_void>,
+    buffer: OwnedBuffer,
     capacity: usize,
     cursor: usize,
     last_use: LastUse,
 }
-
-// SAFETY: a chunk lives on its device's record behind a mutex, so one
-// submitting thread at a time touches it. Retaining and releasing an
-// `MTLBuffer` is thread-safe, and the contents pointer names shared storage
-// that stays mapped for the buffer's life on any thread.
-unsafe impl Send for Chunk {}
 
 impl Chunk {
     fn new(device: &ProtocolObject<dyn MTLDevice>, capacity: usize) -> Option<Self> {
         let buffer =
             device.newBufferWithLength_options(capacity, MTLResourceOptions::StorageModeShared)?;
         buffer.setLabel(Some(&NSString::from_str("mtld3d-upload-ring")));
-        let contents = buffer.contents();
         Some(Self {
-            buffer,
-            contents,
+            buffer: OwnedBuffer::new(buffer),
             capacity,
             cursor: 0,
             last_use: LastUse::default(),

@@ -41,7 +41,9 @@ fn one_command_buffer_reuses_a_set_but_input_and_output_differ() {
     let (draw, upload) = (AtomicU64::new(0), AtomicU64::new(0));
     let mut pool = PlanePool::default();
     let s = stamp(2, &draw, &upload);
-    let input = pool.acquire(&device, 64, 64, false, &s, None).expect("input");
+    let input = pool
+        .acquire(&device, 64, 64, false, &s, None)
+        .expect("input");
     let output = pool
         .acquire(&device, 32, 32, false, &s, Some(input))
         .expect("output");
@@ -56,7 +58,10 @@ fn one_command_buffer_reuses_a_set_but_input_and_output_differ() {
     let other = pool
         .acquire(&device, 64, 64, false, &upload_stamp, None)
         .expect("planes");
-    assert!(other != input && other != output, "the render buffer has not retired");
+    assert!(
+        other != input && other != output,
+        "the render buffer has not retired"
+    );
 }
 
 /// A set too small for the transfer, or lacking a stencil plane, is not reused.
@@ -66,12 +71,21 @@ fn a_set_is_reused_only_when_its_planes_fit() {
     let (draw, upload) = (AtomicU64::new(0), AtomicU64::new(0));
     let mut pool = PlanePool::default();
     let s = stamp(2, &draw, &upload);
-    let small = pool.acquire(&device, 16, 16, false, &s, None).expect("planes");
-    let larger = pool.acquire(&device, 128, 16, false, &s, None).expect("planes");
+    let small = pool
+        .acquire(&device, 16, 16, false, &s, None)
+        .expect("planes");
+    let larger = pool
+        .acquire(&device, 128, 16, false, &s, None)
+        .expect("planes");
     assert_ne!(small, larger);
-    let with_stencil = pool.acquire(&device, 16, 16, true, &s, None).expect("planes");
+    let with_stencil = pool
+        .acquire(&device, 16, 16, true, &s, None)
+        .expect("planes");
     assert!(with_stencil != small && with_stencil != larger);
-    assert_eq!(pool.acquire(&device, 16, 16, true, &s, None), Some(with_stencil));
+    assert_eq!(
+        pool.acquire(&device, 16, 16, true, &s, None),
+        Some(with_stencil)
+    );
 }
 
 /// Retired sets beyond the spares go at the end of a submission.

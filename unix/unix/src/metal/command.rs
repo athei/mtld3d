@@ -37,10 +37,10 @@ use objc2_quartz_core::CAMetalDrawable;
 use crate::{
     LOG_TARGET,
     metal::{
+        depth_transfer::PlanePool,
         handle::{BorrowRetained, IntoRetained},
         macdrv::attachment,
         null_texture,
-        depth_transfer::PlanePool,
         record::DeviceRecord,
         texture::mtl_pixel_format,
         transient::{SubmitStamp, UploadRing},

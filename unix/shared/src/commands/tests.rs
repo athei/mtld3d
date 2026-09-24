@@ -376,5 +376,8 @@ fn notifies_and_depth_transfers_need_no_blit_encoder() {
     transfer.cmd = BlitCommandType::TransferDepth as u32;
     assert!(!transfer.needs_blit_encoder());
     transfer.cmd = 0xff;
-    assert!(transfer.needs_blit_encoder(), "an unknown command keeps the encoder");
+    assert!(
+        transfer.needs_blit_encoder(),
+        "an unknown command keeps the encoder"
+    );
 }

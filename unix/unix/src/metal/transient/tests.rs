@@ -36,10 +36,18 @@ fn a_payload_is_readable_at_its_offset() {
     let slice = ring
         .write(&device, &s, &[1, 2, 3, 4, 5], 16)
         .expect("ring write");
-    assert_eq!(slice.offset, 16, "the second payload starts at the next aligned offset");
-    let contents = slice.buffer.contents().as_ptr().cast::<u8>();
+    assert_eq!(
+        slice.offset, 16,
+        "the second payload starts at the next aligned offset"
+    );
+    let payload = slice
+        .buffer
+        .contents()
+        .as_ptr()
+        .cast::<u8>()
+        .wrapping_add(slice.offset);
     // SAFETY: the shared buffer holds at least `offset + 5` bytes, just written.
-    let read = unsafe { core::slice::from_raw_parts(contents.add(slice.offset), 5) };
+    let read = unsafe { core::slice::from_raw_parts(payload, 5) };
     assert_eq!(read, &[1, 2, 3, 4, 5]);
 }
 
@@ -66,7 +74,11 @@ fn a_chunk_is_not_started_again_before_its_readers_retire() {
     assert_ne!(c, a, "frame 2 is still reading its chunk");
     assert_ne!(c, b, "frame 3 is still reading its chunk");
     draw.store(2, Ordering::Release);
-    assert_eq!(frame(5, &mut ring), (a, 0), "frame 2 retired, so its chunk starts again");
+    assert_eq!(
+        frame(5, &mut ring),
+        (a, 0),
+        "frame 2 retired, so its chunk starts again"
+    );
 }
 
 /// A chunk the upload command buffer read waits for the upload counter too.
@@ -124,7 +136,10 @@ fn an_unstamped_use_never_retires() {
     let mut last = LastUse::default();
     last.record(&unstamped);
     assert!(!last.retired(&unstamped));
-    assert!(LastUse::default().retired(&unstamped), "an unused resource is free");
+    assert!(
+        LastUse::default().retired(&unstamped),
+        "an unused resource is free"
+    );
 }
 
 /// Spare chunks beyond the few the next frames need go once they retired.

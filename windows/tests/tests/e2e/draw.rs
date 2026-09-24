@@ -788,7 +788,11 @@ fn inline_draw_data_reads_its_own_payload_across_upload_ring_chunks() {
     };
     // One triangle over the top-left quadrant, then 99 degenerate ones.
     let stream = |color| {
-        let mut verts = vec![v(-1.0, 1.0, color), v(0.2, 1.0, color), v(-1.0, -0.2, color)];
+        let mut verts = vec![
+            v(-1.0, 1.0, color),
+            v(0.2, 1.0, color),
+            v(-1.0, -0.2, color),
+        ];
         verts.resize(300, v(-1.0, -1.0, color));
         verts
     };

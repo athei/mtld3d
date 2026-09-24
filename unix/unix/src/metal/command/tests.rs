@@ -47,18 +47,16 @@ use objc2_metal::{
     MTLTextureDescriptor, MTLTextureUsage,
 };
 
+use super::{
+    CopyBufferEndpoint, CopyEndpoint, CopyRegion, CopyRejectReason, DeviceRecord, EncodeContext,
+    PendingCmdBuf, PresentGeometry, PresentRoute, SETTLED_PRESENTS, command_buffer_error,
+    commit_registered, copy_buffer_to_texture_reject, copy_texture_reject,
+    copy_texture_to_buffer_reject, encode_upload_cmd_buf, first_pending, geometry_settled,
+    present_route, readback_completed, submit_frame, submit_frame_with, wait_for_gpu_retire,
+};
 use crate::metal::{
     depth_transfer::PlanePool,
     transient::{SubmitStamp, UploadRing},
-};
-
-use super::{
-    CopyBufferEndpoint, CopyEndpoint, CopyRegion, CopyRejectReason, DeviceRecord, EncodeContext,
-    PendingCmdBuf,
-    PresentGeometry, PresentRoute, SETTLED_PRESENTS, command_buffer_error, commit_registered,
-    copy_buffer_to_texture_reject, copy_texture_reject, copy_texture_to_buffer_reject,
-    encode_upload_cmd_buf, first_pending, geometry_settled, present_route, readback_completed,
-    submit_frame, submit_frame_with, wait_for_gpu_retire,
 };
 
 /// Two device identities that sort either side of each other's seqs.
@@ -784,13 +782,9 @@ fn cpu_submit_failure_drain(upload_committed: bool) {
     let mut committed_upload = None;
     let success = submit_frame_with(record.pending(), &mut params, |params| {
         if upload_committed {
-            let upload_cb = encode_test_upload(
-                &record,
-                &queue,
-                core::slice::from_ref(&upload_pass),
-                params,
-            )
-            .expect("an upload buffer");
+            let upload_cb =
+                encode_test_upload(&record, &queue, core::slice::from_ref(&upload_pass), params)
+                    .expect("an upload buffer");
             commit_registered(
                 record.pending(),
                 &upload_cb,
