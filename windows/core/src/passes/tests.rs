@@ -7592,16 +7592,25 @@ fn depthless_pass(
 
 /// Open a pass on the bound attachments whose planes load with a whole-attachment `Clear`.
 ///
-/// The shape a covering depth or stencil clear folds into when it reaches a
-/// pass before any draw. `None` leaves that plane's load as the pass opened it.
+/// Issues the covering `Clear` of each plane given through the real clear
+/// path, which folds into the next pass's load action even on a texture the
+/// submission already drew into. `None` leaves that plane's load as the pass
+/// opens it.
 fn open_clearing_pass(s: &mut PassState, depth: Option<u32>, stencil: Option<u32>) {
-    s.ensure_pass_open();
-    let pass = s.passes.last_mut().expect("a pass is open");
+    s.end_current_pass("test");
     if let Some(value) = depth {
-        pass.depth_load = DepthLoad::Clear { value };
+        assert_eq!(s.clear_depth(value), DepthClearOutcome::Folded);
     }
     if let Some(value) = stencil {
-        pass.stencil_load = StencilLoad::Clear { value };
+        assert_eq!(s.clear_stencil(value), StencilClearOutcome::Folded);
+    }
+    s.ensure_pass_open();
+    let pass = s.passes().last().expect("a pass is open");
+    if let Some(value) = depth {
+        assert_eq!(pass.depth_load(), DepthLoad::Clear { value });
+    }
+    if let Some(value) = stencil {
+        assert_eq!(pass.stencil_load(), StencilLoad::Clear { value });
     }
 }
 
