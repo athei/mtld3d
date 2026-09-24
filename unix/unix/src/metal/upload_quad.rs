@@ -37,7 +37,10 @@ use objc2_metal::{
 use rustc_hash::FxHashMap;
 
 use super::texture::mtl_pixel_format;
-use crate::{LOG_TARGET, metal::handle::IntoRetained};
+use crate::{
+    LOG_TARGET,
+    metal::handle::{IntoRetained, keep_first},
+};
 
 /// MSL source for the upload-quad library.
 ///
@@ -175,7 +178,9 @@ pub fn ensure_upload_pipeline(
 
     let handle = build_pipeline(&device, cache, params.color_format)?;
     let mut pipelines = cache.pipelines.lock().ok()?;
-    Some(*pipelines.entry(params.color_format).or_insert(handle))
+    // SAFETY: `build_pipeline` handed `handle` the only retain on its
+    // pipeline, and nothing else copied it.
+    Some(unsafe { keep_first(&mut pipelines, params.color_format, handle) })
 }
 
 fn build_library_and_functions(device: &ProtocolObject<dyn MTLDevice>) -> Option<UploadCache> {

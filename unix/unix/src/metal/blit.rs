@@ -32,7 +32,10 @@ use objc2_metal::{
 use rustc_hash::FxHashMap;
 
 use super::texture::mtl_pixel_format;
-use crate::{LOG_TARGET, metal::handle::IntoRetained};
+use crate::{
+    LOG_TARGET,
+    metal::handle::{IntoRetained, keep_first},
+};
 
 /// MSL source for the blit-quad library.
 ///
@@ -209,7 +212,9 @@ pub fn ensure_blit_pipeline(
 
     let handle = build_pipeline(&device, cache, key)?;
     let mut pipelines = cache.pipelines.lock().ok()?;
-    Some(*pipelines.entry(key).or_insert(handle))
+    // SAFETY: `build_pipeline` handed `handle` the only retain on its
+    // pipeline, and nothing else copied it.
+    Some(unsafe { keep_first(&mut pipelines, key, handle) })
 }
 
 fn build_library_and_functions(device: &ProtocolObject<dyn MTLDevice>) -> Option<BlitCache> {

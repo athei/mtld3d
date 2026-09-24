@@ -45,7 +45,10 @@ use objc2_metal::{
 use rustc_hash::FxHashMap;
 
 use super::texture::mtl_pixel_format;
-use crate::{LOG_TARGET, metal::handle::IntoRetained};
+use crate::{
+    LOG_TARGET,
+    metal::handle::{IntoRetained, keep_first},
+};
 
 /// MSL source for the clear-quad library.
 ///
@@ -180,7 +183,9 @@ pub fn ensure_clear_quad_pipeline(
 
     let handle = build_pipeline(&device, cache, &key)?;
     let mut pipelines = cache.pipelines.lock().ok()?;
-    Some(*pipelines.entry(key).or_insert(handle))
+    // SAFETY: `build_pipeline` handed `handle` the only retain on its
+    // pipeline, and nothing else copied it.
+    Some(unsafe { keep_first(&mut pipelines, key, handle) })
 }
 
 fn build_library_and_functions(device: &ProtocolObject<dyn MTLDevice>) -> Option<ClearQuadCache> {
@@ -304,9 +309,9 @@ fn color_ps_function(
     let handle =
         unsafe { MetalHandle::<MTLFunctionKind>::new(Retained::into_raw(function) as u64) };
     let mut fns = cache.ps_color_fns_by_mask.lock().ok()?;
-    fns.entry(extra_present_mask)
-        .or_insert(handle)
-        .into_retained()
+    // SAFETY: `into_raw` above handed `handle` the only retain on the
+    // function, and nothing else copied it.
+    unsafe { keep_first(&mut fns, extra_present_mask, handle) }.into_retained()
 }
 
 /// Declare render targets 1..3 on the pipeline, writing colour or not as `write` says.

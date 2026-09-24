@@ -38,7 +38,11 @@
 use core::ptr::NonNull;
 use std::sync::{LazyLock, Mutex, OnceLock, PoisonError};
 
-use mtld3d_shared::{MetalHandle, mtl::PixelFormat, mtl_handle::MTLLibraryKind};
+use mtld3d_shared::{
+    MetalHandle,
+    mtl::PixelFormat,
+    mtl_handle::{MTLLibraryKind, MTLRenderPipelineStateKind},
+};
 use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_foundation::NSString;
 use objc2_metal::{
@@ -47,7 +51,10 @@ use objc2_metal::{
 };
 use rustc_hash::FxHashMap;
 
-use crate::{LOG_TARGET, metal::handle::IntoRetained};
+use crate::{
+    LOG_TARGET,
+    metal::handle::{IntoRetained, ReleaseRetain, keep_first},
+};
 
 /// MSL source for the present-pass library.
 ///
@@ -156,6 +163,30 @@ pub fn hdr_uniforms(peak: f32) -> [f32; 4] {
     [l_hdr_nits, p_hdr, log2_p_hdr, inv_p_minus_one]
 }
 
+impl PresentPipelines {
+    /// Release the six pipeline retains this set holds.
+    ///
+    /// # Safety
+    ///
+    /// Each field holds the retain `Retained::into_raw` gave it, and no copy
+    /// of this set is used afterwards.
+    unsafe fn release(self) {
+        for raw in [
+            self.copy,
+            self.passthrough,
+            self.bt2446,
+            self.cursor_copy,
+            self.cursor_passthrough,
+            self.cursor_bt2446,
+        ] {
+            // SAFETY: the caller's assertion: `raw` is a retained pipeline.
+            let handle = unsafe { MetalHandle::<MTLRenderPipelineStateKind>::new(raw) };
+            // SAFETY: the caller's assertion: nothing uses this retain after.
+            unsafe { handle.release_retain() };
+        }
+    }
+}
+
 static PIPELINES: OnceLock<PresentPipelines> = OnceLock::new();
 
 /// Which present stage a gamma pipeline is the twin of.
@@ -204,8 +235,9 @@ impl GammaStage {
 ///
 /// Keyed by stage; the values are retained `MTLRenderPipelineState` handles
 /// that live for the process, like the ordinary present pipelines.
-static GAMMA_PIPELINES: LazyLock<Mutex<FxHashMap<GammaStage, u64>>> =
-    LazyLock::new(|| Mutex::new(FxHashMap::default()));
+static GAMMA_PIPELINES: LazyLock<
+    Mutex<FxHashMap<GammaStage, MetalHandle<MTLRenderPipelineStateKind>>>,
+> = LazyLock::new(|| Mutex::new(FxHashMap::default()));
 
 /// The pipeline for `stage` with the gamma lookup, compiled on first use.
 ///
@@ -221,7 +253,7 @@ pub fn ensure_gamma_pipeline(
         .unwrap_or_else(PoisonError::into_inner)
         .get(&stage)
     {
-        return Some(handle);
+        return Some(handle.raw());
     }
     // Built outside the lock, as `ensure_readback_pipeline` does: a compile is
     // milliseconds, and two threads building the same key both succeed, one
@@ -232,20 +264,15 @@ pub fn ensure_gamma_pipeline(
     let ps = library.newFunctionWithName(&NSString::from_str(ps_name))?;
     let label = format!("mtld3d-present-pipeline-{ps_name}");
     let pipeline = build_pipeline(device, &vs, &ps, color_format, &label)?;
-    let handle = Retained::into_raw(pipeline) as u64;
-    let kept = *GAMMA_PIPELINES
+    // SAFETY: `Retained::into_raw` transfers the retain into the typed handle.
+    let handle = unsafe {
+        MetalHandle::<MTLRenderPipelineStateKind>::new(Retained::into_raw(pipeline) as u64)
+    };
+    let mut pipelines = GAMMA_PIPELINES
         .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .entry(stage)
-        .or_insert(handle);
-    if kept != handle {
-        // SAFETY: `handle` is the retain `into_raw` transferred above and
-        // nothing else holds it.
-        drop(unsafe {
-            Retained::from_raw(handle as *mut ProtocolObject<dyn MTLRenderPipelineState>)
-        });
-    }
-    Some(kept)
+        .unwrap_or_else(PoisonError::into_inner);
+    // SAFETY: `handle` holds the only retain on its pipeline.
+    Some(unsafe { keep_first(&mut pipelines, stage, handle) }.raw())
 }
 
 /// The compiled present library, retained for the process.
@@ -262,8 +289,17 @@ static LIBRARY: OnceLock<u64> = OnceLock::new();
 /// states are keyed by format and by whether the copy snaps to the nearest
 /// texel. The values are retained `MTLRenderPipelineState` handles that live
 /// for the process, like the present pipelines.
-static READBACK_PIPELINES: LazyLock<Mutex<FxHashMap<(PixelFormat, bool), u64>>> =
-    LazyLock::new(|| Mutex::new(FxHashMap::default()));
+static READBACK_PIPELINES: LazyLock<
+    Mutex<FxHashMap<ReadbackKey, MetalHandle<MTLRenderPipelineStateKind>>>,
+> = LazyLock::new(|| Mutex::new(FxHashMap::default()));
+
+/// What a readback resolve pipeline is built for: the target's format and the filter.
+#[derive(PartialEq, Eq, Hash)]
+struct ReadbackKey {
+    format: PixelFormat,
+    /// The nearest-texel copy rather than the filtered one.
+    nearest: bool,
+}
 
 /// The pipeline that resamples a texture of `format` into a scratch of `format` for a readback.
 ///
@@ -276,13 +312,13 @@ pub fn ensure_readback_pipeline(
     format: PixelFormat,
     nearest: bool,
 ) -> Option<u64> {
-    let key = (format, nearest);
+    let key = ReadbackKey { format, nearest };
     if let Some(&handle) = READBACK_PIPELINES
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .get(&key)
     {
-        return Some(handle);
+        return Some(handle.raw());
     }
     // Built outside the lock: a pipeline compile is milliseconds, and two
     // threads building the same key both succeed, one copy is kept and the
@@ -304,20 +340,15 @@ pub fn ensure_readback_pipeline(
         super::texture::mtl_pixel_format(format),
         &label,
     )?;
-    let handle = Retained::into_raw(pipeline) as u64;
-    let kept = *READBACK_PIPELINES
+    // SAFETY: `Retained::into_raw` transfers the retain into the typed handle.
+    let handle = unsafe {
+        MetalHandle::<MTLRenderPipelineStateKind>::new(Retained::into_raw(pipeline) as u64)
+    };
+    let mut pipelines = READBACK_PIPELINES
         .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .entry(key)
-        .or_insert(handle);
-    if kept != handle {
-        // SAFETY: `handle` is the retain `into_raw` transferred above and
-        // nothing else holds it.
-        drop(unsafe {
-            Retained::from_raw(handle as *mut ProtocolObject<dyn MTLRenderPipelineState>)
-        });
-    }
-    Some(kept)
+        .unwrap_or_else(PoisonError::into_inner);
+    // SAFETY: `handle` holds the only retain on its pipeline.
+    Some(unsafe { keep_first(&mut pipelines, key, handle) }.raw())
 }
 
 /// The present library, compiled on first use and retained for the process.
@@ -358,8 +389,17 @@ pub fn ensure_resources(device: &ProtocolObject<dyn MTLDevice>) -> Option<Presen
     if let Some(r) = PIPELINES.get() {
         return Some(*r);
     }
+    // Built outside the `OnceLock`, as the gamma and readback pipelines are:
+    // the presenter thread and the cursor overlay on the main thread can both
+    // arrive first, and the set that loses is released.
     let resources = create(device)?;
-    Some(*PIPELINES.get_or_init(|| resources))
+    let kept = *PIPELINES.get_or_init(|| resources);
+    if kept.copy != resources.copy {
+        // SAFETY: `create` handed `resources` the only retains on its six
+        // pipelines, and the `OnceLock` kept another set.
+        unsafe { resources.release() };
+    }
+    Some(kept)
 }
 
 /// Compile [`PRESENT_MSL`] for `device`.
