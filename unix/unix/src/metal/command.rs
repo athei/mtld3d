@@ -379,6 +379,21 @@ struct EncodeContext<'a> {
     stamp: SubmitStamp,
     ring: &'a mut UploadRing,
     planes: &'a mut PlanePool,
+    /// Whether the per-frame objects get labels ([`labels_wanted`]).
+    labels: bool,
+}
+
+/// Whether a submission labels the per-frame command buffers and encoders it creates.
+///
+/// Those labels are read by a GPU capture and by the command-buffer
+/// diagnostics, which name an encoder by its label, so they are built while a
+/// capture runs or `mtld3d::unix::command` is at debug, and skipped otherwise:
+/// each costs a `format!`, an `NSString` and a message send per pass and per
+/// command buffer.
+fn labels_wanted() -> bool {
+    // SAFETY: `sharedCaptureManager` is an always-live process-wide singleton.
+    let manager = unsafe { objc2_metal::MTLCaptureManager::sharedCaptureManager() };
+    diagnostics::enabled() || manager.isCapturing()
 }
 
 /// Processes a frame into its command buffers and commits them.
@@ -461,7 +476,8 @@ fn encode_frame(record: &Arc<DeviceRecord>, params: &mut SubmitFrameParams) -> b
         error!(target: LOG_TARGET, "submit_frame: commandBuffer() returned nil");
         return false;
     };
-    {
+    let labels = labels_wanted();
+    if labels {
         let label =
             objc2_foundation::NSString::from_str(&format!("mtld3d-frame-{:#x}", params.submit_seq));
         cmd_buf.setLabel(Some(&label));
@@ -520,6 +536,7 @@ fn encode_frame(record: &Arc<DeviceRecord>, params: &mut SubmitFrameParams) -> b
         stamp: stamp.upload(),
         ring,
         planes,
+        labels,
     };
     let mut upload_cb = None;
     let draw_pass_start = if params.upload_coherent_seq_ptr != 0 {
@@ -959,7 +976,7 @@ fn encode_upload_cmd_buf(
         error!(target: LOG_TARGET, "submit_frame: upload commandBuffer() returned nil");
         return None;
     };
-    {
+    if ctx.labels {
         let label = objc2_foundation::NSString::from_str(&format!("mtld3d-upload-{submit_seq:#x}"));
         upload_cb.setLabel(Some(&label));
     }
@@ -2085,6 +2102,7 @@ fn copy_texture_to_buffer_reject(
 struct LazyBlitEncoder<'a> {
     cmd_buf: &'a ProtocolObject<dyn MTLCommandBuffer>,
     site: BlitSite,
+    labels: bool,
     /// What the PE side's flag says: whether the list holds an encoder-bound command.
     expected: bool,
     encoder: Option<Retained<ProtocolObject<dyn MTLBlitCommandEncoder>>>,
@@ -2111,9 +2129,13 @@ impl LazyBlitEncoder<'_> {
                 );
                 return None;
             };
-            let label =
-                objc2_foundation::NSString::from_str(&format!("mtld3d-leading-blits-{}", self.site));
-            encoder.setLabel(Some(&label));
+            if self.labels {
+                let label = objc2_foundation::NSString::from_str(&format!(
+                    "mtld3d-leading-blits-{}",
+                    self.site
+                ));
+                encoder.setLabel(Some(&label));
+            }
             self.encoder = Some(encoder);
         }
         self.encoder.as_deref()
@@ -2147,6 +2169,7 @@ fn encode_leading_blits(
     let mut lazy = LazyBlitEncoder {
         cmd_buf,
         site,
+        labels: ctx.labels,
         expected: needs_encoder,
         encoder: None,
     };
@@ -2156,7 +2179,8 @@ fn encode_leading_blits(
         match BlitCommandType::from_repr(cmd.cmd) {
             Some(BlitCommandType::TransferDepth) => {
                 lazy.end();
-                if !super::depth_transfer::encode(cmd_buf, cmd, ctx.planes, &ctx.stamp) {
+                if !super::depth_transfer::encode(cmd_buf, cmd, ctx.planes, &ctx.stamp, ctx.labels)
+                {
                     return false;
                 }
             }
@@ -2795,7 +2819,7 @@ fn encode_pass(
         );
         return false;
     };
-    {
+    if ctx.labels {
         let label = objc2_foundation::NSString::from_str(&format!("mtld3d-pass-{pass_idx}"));
         encoder.setLabel(Some(&label));
     }

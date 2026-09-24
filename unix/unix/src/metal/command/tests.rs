@@ -863,6 +863,7 @@ fn encode_test_upload(
         stamp: SubmitStamp::new(params).upload(),
         ring: &mut ring,
         planes: &mut planes,
+        labels: true,
     };
     encode_upload_cmd_buf(record, queue, &[], passes, params, &mut ctx)
 }
@@ -1410,6 +1411,7 @@ fn depth_plane_failure_aborts_the_pair_and_retry_retains_sources() {
             stamp: SubmitStamp::new(&params),
             ring: &mut ring,
             planes: &mut planes,
+            labels: true,
         };
         assert!(super::encode_leading_blits(
             &cb,
