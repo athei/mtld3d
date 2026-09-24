@@ -4750,6 +4750,7 @@ impl PassState {
                 &self.passes[write],
                 &self.passes[read],
                 &self.texture_view_to_base,
+                &self.frame_sampled_textures,
             ) else {
                 write += 1;
                 self.passes.swap(write, read);
@@ -5412,7 +5413,7 @@ impl PassState {
     ) -> bool {
         let views = &self.texture_view_to_base;
         self.passes[first + 1..=next].iter().any(|pass| {
-            pass_reads_texture(pass, texture, views)
+            pass_reads_texture(pass, texture, views, &self.frame_sampled_textures)
                 || blit_list_writes(&pass.leading_blits, texture)
                 || pass_resolves_into(pass, texture, views)
         })
@@ -5651,6 +5652,7 @@ fn merge_join(
     prev: &Pass,
     next: &Pass,
     texture_view_to_base: &FxHashMap<MetalHandle<MTLTextureKind>, MetalHandle<MTLTextureKind>>,
+    frame_sampled: &FxHashSet<MetalHandle<MTLTextureKind>>,
 ) -> Option<PassJoin> {
     if !attachments_match(prev, next)
         || !next.leading_blits.is_empty()
@@ -5663,7 +5665,7 @@ fn merge_join(
         .into_iter()
         .chain(prev.extra_color.iter().map(PassColorAttachment::texture));
     for texture in attached {
-        if pass_samples_texture(next, texture, texture_view_to_base) {
+        if pass_samples_texture(next, texture, texture_view_to_base, frame_sampled) {
             return None;
         }
     }
