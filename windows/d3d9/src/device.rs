@@ -25,7 +25,7 @@ use mtld3d_core::{
     },
     ids::{BufferId, ProgramId, TextureId},
     page_box::PageBox,
-    passes::ExtraColorSlot,
+    passes::{BackbufferContents, ExtraColorSlot},
     perf::{
         ApiPerfState, ApiPerfStorage, ApiTimer, BindSubCategory, CycleAddTimer, CycleSetTimer,
         DeviceSubCategory, KeysGate,
@@ -1508,6 +1508,9 @@ impl DeviceInner {
             backbuffer_height: self.backbuffer_height,
             backbuffer_format: mtld3d_shared::mtl::PixelFormat::Bgra8Unorm,
             render_scale: self.render_scale,
+            backbuffer_contents: BackbufferContents::from_swap_effect(
+                self.present_params.swap_effect,
+            ),
             depth_texture: self.depth_stencil_handle,
             depth_has_stencil: depth_format_has_stencil(self.depth_stencil_format),
         })
@@ -7984,6 +7987,12 @@ fn emit_stretch_rect_blit(
     // surface. The blit runs after the passes recorded so far, so the last of
     // them that rendered into the multisampled companion takes the resolve;
     // for a single-sampled source this finds nothing and does nothing.
+    // A `Clear` still waiting for a pass is one of those passes: D3D9 ordered
+    // it before the copy, so it becomes a pass first and takes the resolve,
+    // rather than an older pass handing the copy pre-clear content.
+    if !src_info.msaa.is_null() {
+        enc.flush_pending_clears();
+    }
     // SAFETY: `src_handle` came from the encoder's texture cache or from a
     // surface's retained handle, both of which are `MTLTexture` handles.
     enc.note_msaa_read(unsafe { MetalHandle::<MTLTextureKind>::new(src_handle) });
@@ -14250,10 +14259,13 @@ pub fn warn_present_params_fields_once(pp: &mtld3d_types::D3DPRESENT_PARAMETERS)
         );
     }
     if pp.swap_effect != 0 && pp.swap_effect != 1 {
-        // 0 is invalid per spec; 1 = D3DSWAPEFFECT_DISCARD. FLIP/COPY/etc.
-        // would need a real swap chain instead of a single drawable.
+        // 0 is invalid per spec; 1 = D3DSWAPEFFECT_DISCARD. FLIP and COPY
+        // keep the one back buffer's contents across Present
+        // (`BackbufferContents::Preserved`); FLIP's buffer rotation would need
+        // a real swap chain instead of a single drawable.
         mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
-            "CreateDevice: swap_effect={} requested but only DISCARD (1) implemented",
+            "CreateDevice: swap_effect={} requested: the back buffer keeps its contents \
+             across Present but is not rotated",
             pp.swap_effect
         );
     }

@@ -9,6 +9,7 @@ use mtld3d_shared::{
     mtl::{CullMode, PixelFormat, TriangleFillMode, VERTEX_STREAM_SLOTS, VisibilityResultMode},
     mtl_handle::{MTLRenderPipelineStateKind, MTLTextureKind},
 };
+use mtld3d_types::D3DSWAPEFFECT_DISCARD;
 use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 
 use crate::{
@@ -36,6 +37,11 @@ struct ClearMerge {
     /// A merge target must carry exactly this set, slot for slot.
     extra: [(MetalHandle<MTLTextureKind>, u32); 3],
     depth: MetalHandle<MTLTextureKind>,
+    /// Mip level of `depth` the clear lands on.
+    ///
+    /// A merge target must render into the same level: a pass on another
+    /// level of the texture neither takes the clear nor consumes it.
+    depth_level: u32,
     needs_color: bool,
     needs_depth: bool,
     needs_stencil: bool,
@@ -43,14 +49,15 @@ struct ClearMerge {
 
 /// Compile-time gate for Rule A (first-use `DontCare`).
 ///
-/// On the colour side only the back buffer qualifies: under
-/// `D3DSWAPEFFECT_DISCARD`, the one swap effect implemented, its contents are
-/// undefined after `Present`, so its first pass of a frame has nothing to load.
-/// Every other colour target keeps its contents across `Present` in D3D9, and
-/// a game may draw over last frame's pixels without clearing, so its first use
-/// loads. The depth plane takes the same first-use `DontCare`. Flip to `false`
-/// for a single-line hotfix if a game surfaces that reads prior-frame depth on
-/// first use of frame N.
+/// On the colour side only the back buffer qualifies, and only under
+/// `D3DSWAPEFFECT_DISCARD`: its contents are undefined after `Present`, so its
+/// first pass of a frame has nothing to load. Under `FLIP` and `COPY` the back
+/// buffer's contents are defined after `Present`, and every other colour
+/// target keeps its contents across `Present` in D3D9; a game may draw over
+/// last frame's pixels without clearing, so their first use loads. The depth
+/// plane takes the same first-use `DontCare`. Flip to `false` for a
+/// single-line hotfix if a game surfaces that reads prior-frame depth on first
+/// use of frame N.
 const ENABLE_FIRST_USE_DONTCARE: bool = true;
 
 /// Compile-time gate for Rule A on the stencil plane (first-use `DontCare`).
@@ -1010,6 +1017,33 @@ bitflags::bitflags! {
     }
 }
 
+/// What the back buffer holds when a frame starts, as the swap effect defines it.
+///
+/// `D3DSWAPEFFECT_DISCARD` leaves the back buffer undefined after `Present`,
+/// which is what lets Rule A discard it on first use. `FLIP` and `COPY` define
+/// its contents after `Present`; the one back-buffer texture keeps the pixels
+/// the previous frame left, the closest match, so a game that redraws only
+/// part of the frame without clearing keeps the rest.
+#[derive(Clone, Copy)]
+pub enum BackbufferContents {
+    /// `D3DSWAPEFFECT_DISCARD`: undefined after `Present`.
+    Undefined,
+    /// `D3DSWAPEFFECT_FLIP` or `D3DSWAPEFFECT_COPY`: the pixels carry over.
+    Preserved,
+}
+
+impl BackbufferContents {
+    /// The contents a swap chain created with `swap_effect` starts each frame with.
+    #[must_use]
+    pub const fn from_swap_effect(swap_effect: u32) -> Self {
+        if swap_effect == D3DSWAPEFFECT_DISCARD {
+            Self::Undefined
+        } else {
+            Self::Preserved
+        }
+    }
+}
+
 /// The per-frame inputs `PassState::reset_frame` seeds a new frame from.
 ///
 /// A parameter struct rather than a long argument list: the frame's
@@ -1038,6 +1072,8 @@ pub struct FrameReset {
     /// Logical back-buffer size, the resolution D3D9 reports.
     pub backbuffer_size: (u32, u32),
     pub backbuffer_format: PixelFormat,
+    /// Whether `backbuffer` starts the frame undefined, from the swap effect.
+    pub backbuffer_contents: BackbufferContents,
     pub depth_texture: MetalHandle<MTLTextureKind>,
     /// Extent of `depth_texture` in its own space; `(0, 0)` when there is none.
     ///
@@ -1197,16 +1233,25 @@ pub struct PassState {
     /// it: the blit that wrote the texture may sit in an earlier pass's
     /// leading list, not the one that first attaches the texture, so the
     /// attachment's own `leading_blits` are not enough to know that its
-    /// content is live. Reset each frame in `reset_frame`.
+    /// content is live. Frame-scoped like [`Self::seen_color_rts`]: a mid-frame
+    /// flush keeps it, since the copy stays in VRAM for the continuation, and a
+    /// real `Present` resets it.
     blit_written_rts: FxHashSet<MetalHandle<MTLTextureKind>>,
     /// The swap-chain backbuffer texture for this frame, captured in `reset_frame`.
     ///
     /// Rule A's colour `DontCare` applies to this handle alone, since only the
-    /// back buffer starts a frame with undefined contents. Also the
+    /// back buffer starts a frame with undefined contents (see
+    /// [`Self::backbuffer_contents`]). Also the
     /// left-hand side of [`Self::target_scale`]'s comparison: it is what makes
     /// "is the back buffer bound" a handle identity rather than something the
     /// D3D9 layer has to infer and pass down.
     backbuffer_texture: MetalHandle<MTLTextureKind>,
+    /// Whether `backbuffer_texture` starts the frame undefined, seeded in `reset_frame`.
+    ///
+    /// Rule A discards the back buffer on first use only when it is
+    /// [`BackbufferContents::Undefined`], the discard swap effect; under `FLIP`
+    /// and `COPY` its first use loads, like any other colour target.
+    backbuffer_contents: BackbufferContents,
     /// Fraction of the logical resolution the back buffer is rasterized at.
     ///
     /// Seeded per frame from `FrameData`. Applies to the back buffer alone: a
@@ -1419,6 +1464,7 @@ impl PassState {
             seen_depth_rts_segment: FxHashSet::with_capacity_and_hasher(2, FxBuildHasher),
             blit_written_rts: FxHashSet::with_capacity_and_hasher(2, FxBuildHasher),
             backbuffer_texture: MetalHandle::NULL,
+            backbuffer_contents: BackbufferContents::Undefined,
             // Placeholder; `reset_frame` reseeds it from the frame stamp.
             // Identity means a `PassState` that never saw a frame cannot
             // perturb a coordinate.
@@ -1462,9 +1508,10 @@ impl PassState {
     /// flush (a readback / retention drain, `NO_PRESENT`) rather than a
     /// `Present`. The D3D9 frame the game is drawing did not end there, so the
     /// render targets and depth surface it already wrote keep their content in
-    /// VRAM. The per-frame "seen" sets are kept across the boundary so Rule A
-    /// loads those attachments on their first use in the continuation instead
-    /// of discarding them with `DontCare` (the store side is handled by
+    /// VRAM, and so do the targets a blit copied into. The per-frame "seen" and
+    /// blit-written sets are kept across the boundary so Rule A loads those
+    /// attachments on their first use in the continuation instead of
+    /// discarding them with `DontCare` (the store side is handled by
     /// `finalize_store_actions` skipping Rules B and D on the flush).
     pub fn reset_frame(&mut self, reset: &FrameReset) {
         let &FrameReset {
@@ -1475,6 +1522,7 @@ impl PassState {
             backbuffer_sample_count,
             backbuffer_size,
             backbuffer_format,
+            backbuffer_contents,
             depth_texture,
             depth_size,
             depth_has_stencil,
@@ -1547,24 +1595,26 @@ impl PassState {
         self.current_attachments
             .set(CurrentAttachmentFlags::DEPTH_HAS_STENCIL, depth_has_stencil);
         self.backbuffer_texture = backbuffer;
+        self.backbuffer_contents = backbuffer_contents;
         self.pending_color_clear = None;
         self.pending_depth_clear = None;
         self.pending_stencil_clear = None;
         self.pending_leading_blits.clear();
-        // Keep the frame-scoped seen-rt sets across a mid-frame flush: the D3D9
-        // frame continues, so the targets already drawn keep their VRAM content
-        // and their first use in the continuation must Load, not `DontCare`. On
-        // a real `Present` (`continues_frame` false) the frame ended and every
-        // target starts fresh. The segment-scoped sets always reset: after the
-        // flush every attachment is stored, so a fresh full clear is correct
-        // and must fold rather than paint a scissored quad.
+        // Keep the frame-scoped seen-rt and blit-written sets across a mid-frame
+        // flush: the D3D9 frame continues, so the targets already drawn or
+        // copied into keep their VRAM content and their first use in the
+        // continuation must Load, not `DontCare`. On a real `Present`
+        // (`continues_frame` false) the frame ended and every target starts
+        // fresh. The segment-scoped sets always reset: after the flush every
+        // attachment is stored, so a fresh full clear is correct and must fold
+        // rather than paint a scissored quad.
         if !continues_frame {
             self.seen_color_rts.clear();
             self.seen_depth_rts.clear();
+            self.blit_written_rts.clear();
         }
         self.seen_color_rts_segment.clear();
         self.seen_depth_rts_segment.clear();
-        self.blit_written_rts.clear();
         self.frame_caster_writes.clear();
         self.frame_cascade_samples.clear();
         self.frame_sampled_textures.clear();
@@ -2624,8 +2674,9 @@ impl PassState {
     /// `DontCare` instead of `Load`. Saves the TBDR tile-fill cost on
     /// passes that will fully overwrite undefined contents anyway. On the
     /// colour side only the back buffer's contents are undefined at the
-    /// start of a frame; any other colour target still holds what the
-    /// previous frame left in it, so it loads.
+    /// start of a frame, and only under the discard swap effect; any other
+    /// colour target still holds what the previous frame left in it, so it
+    /// loads.
     pub fn ensure_pass_open(&mut self) {
         if !self.current_pass_closed && !self.passes.is_empty() {
             return;
@@ -2655,10 +2706,12 @@ impl PassState {
         // Shared by render target 0 and every extra: a pending clear lands on
         // all of them (D3D9 clears every bound target), and the Rule A
         // first-use predicate is evaluated per attachment. Only the back
-        // buffer qualifies: `Present` under the discard swap effect leaves it
-        // undefined, while every other target keeps its contents into the
-        // next frame.
+        // buffer qualifies, and only when `Present` under the discard swap
+        // effect left it undefined; every other target, and the back buffer
+        // under `FLIP` or `COPY`, keeps its contents into the next frame.
         let backbuffer = self.backbuffer_texture;
+        let backbuffer_undefined =
+            matches!(self.backbuffer_contents, BackbufferContents::Undefined);
         let color_load_for =
             |texture: MetalHandle<MTLTextureKind>, subresource: u32| match pending_color_clear {
                 Some((r, g, b, a)) => ColorLoad::Clear { r, g, b, a },
@@ -2666,6 +2719,7 @@ impl PassState {
                     && viewport_covers_color_extent
                     && !texture.is_null()
                     && texture == backbuffer
+                    && backbuffer_undefined
                     && !self.seen_color_rts.contains(&(texture, subresource))
                     && !self.seen_sampled_textures.contains(&texture)
                     && !self.blit_written_rts.contains(&texture) =>
@@ -4371,6 +4425,7 @@ impl PassState {
             let target_extra: [(MetalHandle<MTLTextureKind>, u32); 3] =
                 core::array::from_fn(|k| (p.extra_color[k].texture, p.extra_color[k].subresource));
             let target_depth = p.depth_texture;
+            let target_depth_level = p.depth_level;
             let color_load = p.color_load;
             let extra_loads: [ColorLoad; 3] = core::array::from_fn(|k| p.extra_color[k].load);
             let depth_load = p.depth_load;
@@ -4388,6 +4443,7 @@ impl PassState {
                     color_subresource: target_color_subresource,
                     extra: target_extra,
                     depth: target_depth,
+                    depth_level: target_depth_level,
                     needs_color,
                     needs_depth,
                     needs_stencil,
@@ -4440,10 +4496,14 @@ impl PassState {
             color_subresource: target_color_subresource,
             extra: target_extra,
             depth: target_depth,
+            depth_level: target_depth_level,
             needs_color,
             needs_depth,
             needs_stencil,
         } = *want;
+        let attaches_target_depth = |cand: &Pass| {
+            cand.depth_texture == target_depth && cand.depth_level == target_depth_level
+        };
         for j in (start + 1)..self.passes.len() {
             let cand = &self.passes[j];
             // Intervening read on a side we care about kills the merge.
@@ -4525,13 +4585,13 @@ impl PassState {
                 return None;
             }
             if needs_depth
-                && cand.depth_texture == target_depth
+                && attaches_target_depth(cand)
                 && matches!(cand.depth_load, DepthLoad::Clear { .. })
             {
                 return None;
             }
             if needs_stencil
-                && cand.depth_texture == target_depth
+                && attaches_target_depth(cand)
                 && matches!(cand.stencil_load, StencilLoad::Clear { .. })
             {
                 return None;
@@ -4544,14 +4604,12 @@ impl PassState {
                     && cand.color_subresource == target_color_subresource
                     && matches!(cand.color_load, ColorLoad::Load));
             let depth_ok = !needs_depth
-                || (cand.depth_texture == target_depth
-                    && matches!(cand.depth_load, DepthLoad::Load));
+                || (attaches_target_depth(cand) && matches!(cand.depth_load, DepthLoad::Load));
             // A `DontCare` candidate cannot occur here: the clear-only pass
             // was this texture's first use of the frame, so every later pass
             // on it opened with `Load` or its own `Clear`.
             let stencil_ok = !needs_stencil
-                || (cand.depth_texture == target_depth
-                    && matches!(cand.stencil_load, StencilLoad::Load));
+                || (attaches_target_depth(cand) && matches!(cand.stencil_load, StencilLoad::Load));
             if color_ok && depth_ok && stencil_ok {
                 return Some(j);
             }
@@ -4574,10 +4632,10 @@ impl PassState {
                     .chain(target_extra)
                     .any(|(tex, sub)| pass_attaches_color(cand, tex, sub));
             let consumes_depth = needs_depth
-                && cand.depth_texture == target_depth
+                && attaches_target_depth(cand)
                 && matches!(cand.depth_load, DepthLoad::Load);
             let consumes_stencil = needs_stencil
-                && cand.depth_texture == target_depth
+                && attaches_target_depth(cand)
                 && matches!(cand.stencil_load, StencilLoad::Load);
             if consumes_color || consumes_depth || consumes_stencil {
                 return None;
@@ -4851,7 +4909,6 @@ fn pass_reads_texture(
     if target_handle.is_null() {
         return false;
     }
-    let target_raw = target_handle.raw();
     let sampler_reads = pass.commands.iter().any(|command| {
         let Some(texture) = command_sampled_texture(command) else {
             return false;
@@ -4867,28 +4924,10 @@ fn pass_reads_texture(
         return true;
     }
     pass.leading_blits.iter().any(|b| {
-        blit_read_texture(b) == Some(target_handle)
-            || (BlitCommandType::from_repr(b.cmd) == Some(BlitCommandType::GenerateMipmaps)
-                && b.dst_handle == target_raw)
+        blit_read_texture(b).is_some_and(|texture| {
+            texture == target_handle || texture_view_to_base.get(&texture) == Some(&target_handle)
+        })
     })
-}
-
-/// The texture a blit reads, if it reads one.
-///
-/// A texture-to-texture copy and a depth transfer both read their source from
-/// device memory after every pass recorded before them, so the source's
-/// content has to be there when the blit runs.
-const fn blit_read_texture(blit: &BlitCommand) -> Option<MetalHandle<MTLTextureKind>> {
-    let reads_texture = matches!(
-        BlitCommandType::from_repr(blit.cmd),
-        Some(BlitCommandType::CopyTextureToTexture | BlitCommandType::TransferDepth)
-    );
-    if !reads_texture || blit.src_handle == 0 {
-        return None;
-    }
-    // SAFETY: both commands carry a non-null MTLTexture handle in
-    // `src_handle`, packed from the encoder's typed cache via `.raw()`.
-    Some(unsafe { MetalHandle::<MTLTextureKind>::new(blit.src_handle) })
 }
 
 /// Return the texture view a real sampler bind reads.
@@ -4981,6 +5020,36 @@ const fn blit_written_texture(blit: &BlitCommand) -> Option<MetalHandle<MTLTextu
     // SAFETY: a texture-writing blit carries a non-null MTLTexture handle in
     // `dst_handle`, packed from the encoder's typed cache via `.raw()`.
     Some(unsafe { MetalHandle::<MTLTextureKind>::new(blit.dst_handle) })
+}
+
+/// The texture a blit reads, if it reads one.
+///
+/// A texture copy and a depth transfer read their source; mipmap generation
+/// reads level 0 of the texture it writes. The buffer-sourced variants read
+/// no texture. An unknown variant on the wire carries no known source and is
+/// treated as reading none. The exhaustive match makes any new
+/// `BlitCommandType` a compile error here, forcing the author to classify it.
+const fn blit_read_texture(blit: &BlitCommand) -> Option<MetalHandle<MTLTextureKind>> {
+    let handle = match BlitCommandType::from_repr(blit.cmd) {
+        Some(BlitCommandType::CopyTextureToTexture | BlitCommandType::TransferDepth) => {
+            blit.src_handle
+        }
+        Some(BlitCommandType::GenerateMipmaps) => blit.dst_handle,
+        Some(
+            BlitCommandType::CopyBufferToTexture
+            | BlitCommandType::CopyBufferToDepth
+            | BlitCommandType::CopyBufferToStencil
+            | BlitCommandType::CopyBufferToBuffer
+            | BlitCommandType::NotifyBufferDidModifyRange,
+        )
+        | None => 0,
+    };
+    if handle == 0 {
+        return None;
+    }
+    // SAFETY: a texture-reading blit carries a non-null MTLTexture handle in
+    // the field chosen above, packed from the encoder's typed cache via `.raw()`.
+    Some(unsafe { MetalHandle::<MTLTextureKind>::new(handle) })
 }
 
 /// True if any blit in `blits` writes to texture `target_handle`.

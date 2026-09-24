@@ -53,6 +53,7 @@ fn reset_test_frame(s: &mut PassState) {
         backbuffer_sample_count: 1,
         backbuffer_size: BB_SIZE,
         backbuffer_format: BB_FORMAT,
+        backbuffer_contents: BackbufferContents::Undefined,
         depth_texture: depth(),
         depth_size: BB_SIZE,
         depth_has_stencil: false,
@@ -72,6 +73,7 @@ fn fresh_scaled() -> PassState {
         backbuffer_sample_count: 1,
         backbuffer_size: BB_SIZE,
         backbuffer_format: BB_FORMAT,
+        backbuffer_contents: BackbufferContents::Undefined,
         depth_texture: depth(),
         depth_size: (BB_SIZE.0 / 2, BB_SIZE.1 / 2),
         depth_has_stencil: false,
@@ -246,6 +248,7 @@ fn frame_sampled_textures_clears_on_reset_frame() {
             backbuffer_sample_count: 1,
             backbuffer_size: BB_SIZE,
             backbuffer_format: BB_FORMAT,
+            backbuffer_contents: BackbufferContents::Undefined,
             depth_texture: depth(),
             depth_size: BB_SIZE,
             depth_has_stencil: false,
@@ -551,6 +554,61 @@ fn first_use_colour_dontcare_is_the_back_buffer_alone() {
     assert_eq!(s.passes()[1].depth_load(), DepthLoad::Load);
 }
 
+/// A frame on the default surfaces whose back buffer starts with `contents`.
+fn reset_frame_with_backbuffer_contents(s: &mut PassState, contents: BackbufferContents) {
+    s.reset_frame(&FrameReset {
+        backbuffer: backbuffer(),
+        backbuffer_srgb: backbuffer_srgb(),
+        backbuffer_msaa: MetalHandle::NULL,
+        backbuffer_msaa_srgb: MetalHandle::NULL,
+        backbuffer_sample_count: 1,
+        backbuffer_size: BB_SIZE,
+        backbuffer_format: BB_FORMAT,
+        backbuffer_contents: contents,
+        depth_texture: depth(),
+        depth_size: BB_SIZE,
+        depth_has_stencil: false,
+        render_scale: RenderScale::IDENTITY,
+        continues_frame: false,
+    });
+}
+
+#[test]
+fn first_use_colour_dontcare_needs_the_discard_swap_effect() {
+    // Under COPY or FLIP the back buffer keeps its contents across
+    // `Present`, so a game redrawing part of the frame without clearing
+    // relies on the rest surviving: its first use loads. The depth plane
+    // is unaffected.
+    let mut s = PassState::new();
+    reset_frame_with_backbuffer_contents(&mut s, BackbufferContents::Preserved);
+    s.emit_command(dummy_draw());
+    assert_eq!(s.passes()[0].color_texture(), backbuffer());
+    assert_eq!(s.passes()[0].color_load(), ColorLoad::Load);
+    assert_eq!(s.passes()[0].depth_load(), DepthLoad::DontCare);
+
+    // The next frame under DISCARD takes the first-use `DontCare` again.
+    reset_frame_with_backbuffer_contents(&mut s, BackbufferContents::Undefined);
+    s.emit_command(dummy_draw());
+    assert_eq!(s.passes()[0].color_load(), ColorLoad::DontCare);
+}
+
+#[test]
+fn only_the_discard_swap_effect_leaves_the_back_buffer_undefined() {
+    assert!(matches!(
+        BackbufferContents::from_swap_effect(mtld3d_types::D3DSWAPEFFECT_DISCARD),
+        BackbufferContents::Undefined
+    ));
+    for swap_effect in [
+        mtld3d_types::D3DSWAPEFFECT_FLIP,
+        mtld3d_types::D3DSWAPEFFECT_COPY,
+    ] {
+        assert!(matches!(
+            BackbufferContents::from_swap_effect(swap_effect),
+            BackbufferContents::Preserved
+        ));
+    }
+}
+
 #[test]
 fn region_clear_as_first_touch_loads_instead_of_dontcare() {
     // A `Clear(pRects)` opening the frame's first backbuffer pass:
@@ -635,6 +693,7 @@ fn reset_frame_drops_pending_clears() {
         backbuffer_sample_count: 1,
         backbuffer_size: BB_SIZE,
         backbuffer_format: BB_FORMAT,
+        backbuffer_contents: BackbufferContents::Undefined,
         depth_texture: depth(),
         depth_size: BB_SIZE,
         depth_has_stencil: false,
@@ -1348,6 +1407,7 @@ fn rule_a_reset_frame_re_arms_dontcare() {
         backbuffer_sample_count: 1,
         backbuffer_size: BB_SIZE,
         backbuffer_format: BB_FORMAT,
+        backbuffer_contents: BackbufferContents::Undefined,
         depth_texture: depth(),
         depth_size: BB_SIZE,
         depth_has_stencil: false,
@@ -1445,6 +1505,7 @@ fn rule_a_reset_frame_re_arms_stencil_dontcare() {
         backbuffer_sample_count: 1,
         backbuffer_size: BB_SIZE,
         backbuffer_format: BB_FORMAT,
+        backbuffer_contents: BackbufferContents::Undefined,
         depth_texture: depth(),
         depth_size: BB_SIZE,
         depth_has_stencil: true,
@@ -2311,6 +2372,64 @@ fn rule_e_carries_the_stencil_clear_into_the_merge_target() {
             .iter()
             .any(|p| matches!(p.stencil_load(), StencilLoad::Clear { value: 0x2A })),
         "the stencil clear must survive coalescing"
+    );
+}
+
+/// A depth clear on one mip level never folds into a pass on another level.
+#[test]
+fn rule_e_keeps_a_depth_clear_off_another_level_of_the_same_texture() {
+    let ds = tex(0x3300);
+    let half = (BB_SIZE.0 / 2, BB_SIZE.1 / 2);
+    let mut s = fresh();
+    s.set_depth_stencil_attachment_level(ds, 0, BB_SIZE, false, true);
+    s.clear_depth(f32::to_bits(0.5));
+    s.clear_stencil(0x2A);
+    // Rebinding to level 1 materialises the clear-only pass on level 0.
+    s.set_depth_stencil_attachment_level(ds, 1, half, false, true);
+    s.emit_command(dummy_draw());
+    s.end_current_pass("test");
+    s.coalesce_clear_only_passes();
+
+    let passes = s.passes();
+    assert_eq!(passes.len(), 2, "the level 0 clear-only pass stands");
+    assert_eq!(passes[0].depth_level(), 0);
+    assert_eq!(
+        passes[0].depth_load(),
+        DepthLoad::Clear {
+            value: f32::to_bits(0.5)
+        }
+    );
+    assert_eq!(passes[0].stencil_load(), StencilLoad::Clear { value: 0x2A });
+    assert_eq!(passes[1].depth_level(), 1);
+    assert_eq!(passes[1].depth_load(), DepthLoad::Load);
+    assert_eq!(passes[1].stencil_load(), StencilLoad::Load);
+}
+
+/// A pass on another mip level is not a consumer, so the clear folds past it.
+#[test]
+fn rule_e_folds_a_depth_clear_past_another_level_into_its_own_level() {
+    let ds = tex(0x3300);
+    let half = (BB_SIZE.0 / 2, BB_SIZE.1 / 2);
+    let mut s = fresh();
+    s.set_depth_stencil_attachment_level(ds, 0, BB_SIZE, false, false);
+    s.clear_depth(f32::to_bits(0.5));
+    s.set_depth_stencil_attachment_level(ds, 1, half, false, false);
+    s.emit_command(dummy_draw());
+    s.set_depth_stencil_attachment_level(ds, 0, BB_SIZE, false, false);
+    s.emit_command(dummy_draw());
+    s.end_current_pass("test");
+    s.coalesce_clear_only_passes();
+
+    let passes = s.passes();
+    assert_eq!(passes.len(), 2, "the clear-only pass folds away");
+    assert_eq!(passes[0].depth_level(), 1);
+    assert_eq!(passes[0].depth_load(), DepthLoad::Load);
+    assert_eq!(passes[1].depth_level(), 0);
+    assert_eq!(
+        passes[1].depth_load(),
+        DepthLoad::Clear {
+            value: f32::to_bits(0.5)
+        }
     );
 }
 
@@ -3533,6 +3652,7 @@ fn colour_reuse_after_sample(retire: bool, bind: Command) -> StoreAction {
         backbuffer_sample_count: 1,
         backbuffer_size: BB_SIZE,
         backbuffer_format: BB_FORMAT,
+        backbuffer_contents: BackbufferContents::Undefined,
         depth_texture: depth(),
         depth_size: BB_SIZE,
         depth_has_stencil: false,
@@ -3667,6 +3787,7 @@ fn a_replaced_backbuffer_view_retires_the_old_registration() {
         backbuffer_sample_count: 1,
         backbuffer_size: BB_SIZE,
         backbuffer_format: BB_FORMAT,
+        backbuffer_contents: BackbufferContents::Undefined,
         depth_texture: depth(),
         depth_size: BB_SIZE,
         depth_has_stencil: false,
@@ -4341,6 +4462,7 @@ fn blit_written_set_resets_with_the_frame() {
         backbuffer_sample_count: 1,
         backbuffer_size: BB_SIZE,
         backbuffer_format: BB_FORMAT,
+        backbuffer_contents: BackbufferContents::Undefined,
         depth_texture: depth(),
         depth_size: BB_SIZE,
         depth_has_stencil: false,
@@ -4350,6 +4472,47 @@ fn blit_written_set_resets_with_the_frame() {
     s.emit_command(dummy_draw());
     assert_eq!(s.passes()[0].color_texture(), backbuffer());
     assert_eq!(s.passes()[0].color_load(), ColorLoad::DontCare);
+}
+
+#[test]
+fn blit_written_set_survives_a_mid_frame_flush() {
+    // A copy into the back buffer and one into the depth surface run as a
+    // trailing blit pass, then a mid-frame flush (a readback). The D3D9 frame
+    // continues, so the continuation's first pass on those attachments must
+    // Load the copies, not open with Rule A's first-use `DontCare`.
+    let rt_src = tex(0x3000);
+    let depth_src = tex(0x4000);
+    let mut s = fresh();
+    s.push_pending_leading_blit(copy_blit(rt_src, backbuffer()));
+    s.push_pending_leading_blit(copy_blit(depth_src, depth()));
+    s.take_pending_leading_blits();
+    s.reset_frame(&FrameReset {
+        backbuffer: backbuffer(),
+        backbuffer_srgb: backbuffer_srgb(),
+        backbuffer_msaa: MetalHandle::NULL,
+        backbuffer_msaa_srgb: MetalHandle::NULL,
+        backbuffer_sample_count: 1,
+        backbuffer_size: BB_SIZE,
+        backbuffer_format: BB_FORMAT,
+        backbuffer_contents: BackbufferContents::Undefined,
+        depth_texture: depth(),
+        depth_size: BB_SIZE,
+        depth_has_stencil: false,
+        render_scale: RenderScale::IDENTITY,
+        continues_frame: true,
+    });
+    s.emit_command(dummy_draw());
+    assert_eq!(s.passes()[0].color_texture(), backbuffer());
+    assert_eq!(
+        s.passes()[0].color_load(),
+        ColorLoad::Load,
+        "continuation loads the back buffer a blit wrote before the flush",
+    );
+    assert_eq!(
+        s.passes()[0].depth_load(),
+        DepthLoad::Load,
+        "continuation loads the depth surface a blit wrote before the flush",
+    );
 }
 
 #[test]
@@ -4411,6 +4574,34 @@ fn rule_e_aborts_when_an_intervening_blit_writes_the_target() {
     assert_eq!(s.passes()[2].color_load(), ColorLoad::Load);
 }
 
+#[test]
+fn rule_e_aborts_when_the_target_passes_depth_transfer_reads_the_depth() {
+    // Clear(ZBUFFER) with no draw materialises as a clear-only pass, then a
+    // RESZ-style depth transfer reads that depth into another texture as a
+    // leading blit of the next pass on the same depth. The blit runs before
+    // that pass's load action, so folding the clear into it would hand the
+    // transfer the pre-clear depth.
+    let resolved = tex(0x9000);
+    let mut s = fresh();
+    s.clear_depth(f32::to_bits(1.0));
+    s.flush_pending_clears();
+    let mut transfer = copy_blit(depth(), resolved);
+    transfer.cmd = BlitCommandType::TransferDepth as u32;
+    s.push_pending_leading_blit(transfer);
+    s.emit_command(dummy_draw());
+    s.end_current_pass("test");
+    assert_eq!(s.passes().len(), 2);
+    assert_eq!(s.passes()[1].leading_blits().len(), 1);
+    assert_eq!(s.passes()[1].depth_load(), DepthLoad::Load);
+    s.coalesce_clear_only_passes();
+    assert_eq!(s.passes().len(), 2, "the clear stays ahead of the transfer");
+    assert!(matches!(
+        s.passes()[0].depth_load(),
+        DepthLoad::Clear { .. }
+    ));
+    assert_eq!(s.passes()[1].depth_load(), DepthLoad::Load);
+}
+
 // ── B3: a mid-frame flush is not a frame end ─────────────────
 
 #[test]
@@ -4452,6 +4643,7 @@ fn continuation_loads_targets_drawn_before_the_flush() {
         backbuffer_sample_count: 1,
         backbuffer_size: BB_SIZE,
         backbuffer_format: BB_FORMAT,
+        backbuffer_contents: BackbufferContents::Undefined,
         depth_texture: depth(),
         depth_size: BB_SIZE,
         depth_has_stencil: false,
@@ -4487,6 +4679,7 @@ fn a_real_present_still_dontcares_first_use() {
         backbuffer_sample_count: 1,
         backbuffer_size: BB_SIZE,
         backbuffer_format: BB_FORMAT,
+        backbuffer_contents: BackbufferContents::Undefined,
         depth_texture: depth(),
         depth_size: BB_SIZE,
         depth_has_stencil: false,
@@ -4524,6 +4717,7 @@ fn a_clear_after_a_flush_folds_instead_of_a_scissored_quad() {
         backbuffer_sample_count: 1,
         backbuffer_size: BB_SIZE,
         backbuffer_format: BB_FORMAT,
+        backbuffer_contents: BackbufferContents::Undefined,
         depth_texture: depth(),
         depth_size: BB_SIZE,
         depth_has_stencil: false,
@@ -4710,6 +4904,7 @@ fn srgb_twin_bind_marks_the_base_texture_sampled() {
             backbuffer_sample_count: 1,
             backbuffer_size: BB_SIZE,
             backbuffer_format: BB_FORMAT,
+            backbuffer_contents: BackbufferContents::Undefined,
             depth_texture: depth(),
             depth_size: BB_SIZE,
             depth_has_stencil: false,
@@ -4912,6 +5107,7 @@ fn replacing_the_backbuffer_forgets_the_retired_twin() {
         backbuffer_sample_count: 1,
         backbuffer_size: BB_SIZE,
         backbuffer_format: BB_FORMAT,
+        backbuffer_contents: BackbufferContents::Undefined,
         depth_texture: depth(),
         depth_size: BB_SIZE,
         depth_has_stencil: false,
@@ -5037,6 +5233,7 @@ fn fresh_multisampled() -> PassState {
         backbuffer_sample_count: 4,
         backbuffer_size: BB_SIZE,
         backbuffer_format: BB_FORMAT,
+        backbuffer_contents: BackbufferContents::Undefined,
         depth_texture: depth(),
         depth_size: BB_SIZE,
         depth_has_stencil: false,
@@ -5186,6 +5383,53 @@ fn a_read_between_passes_pulls_the_resolve_forward() {
     assert_eq!(
         s.passes()[2].color_resolve_texture(),
         backbuffer(),
+        "and the last use still resolves"
+    );
+}
+
+#[test]
+fn a_read_after_a_pending_clear_resolves_the_clear_only_pass() {
+    // Clear(rt) with no pass open, StretchRect(rt -> dst), then a draw into rt
+    // in the same submission. The `StretchRect` path materialises the clear
+    // before it notes the read, so the clear-only pass takes the resolve and
+    // the copy reads the cleared contents rather than whatever the twin held.
+    let rt = tex(0x3400);
+    let rt_msaa = tex(0x3401);
+    let dst = tex(0x3402);
+    let mut s = fresh();
+    s.set_color_render_target(rt, BB_SIZE.0, BB_SIZE.1, BB_FORMAT, RenderScale::IDENTITY);
+    s.set_color_msaa(rt_msaa, MetalHandle::NULL, 4);
+    s.clear_color(0, 0, 255, 255);
+    assert!(
+        s.pending_color_clear().is_some(),
+        "a first clear of an untouched target waits for a pass"
+    );
+    s.flush_pending_clears();
+    s.note_msaa_read(rt);
+    s.push_pending_leading_blit(copy_blit(rt, dst));
+    s.emit_command(dummy_draw());
+    s.end_current_pass("test");
+    s.coalesce_clear_only_passes();
+    s.finalize_store_actions(false);
+
+    assert_eq!(s.passes().len(), 2, "the clear stays a pass of its own");
+    assert!(
+        matches!(s.passes()[0].color_load(), ColorLoad::Clear { .. }),
+        "the first pass is the clear"
+    );
+    assert_eq!(
+        s.passes()[0].color_resolve_texture(),
+        rt,
+        "the clear-only pass resolves before the copy reads rt"
+    );
+    assert_eq!(
+        s.passes()[1].leading_blits().len(),
+        1,
+        "the copy runs ahead of the draw"
+    );
+    assert_eq!(
+        s.passes()[1].color_resolve_texture(),
+        rt,
         "and the last use still resolves"
     );
 }

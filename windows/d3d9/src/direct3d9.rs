@@ -11,6 +11,7 @@ use mtld3d_core::{
     display_mode::{MAX_SERVED_SIZES, ModeRequest, select_mode_sizes, served_mode_sizes},
     format_probe::FormatProbeKey,
     multisample,
+    passes::BackbufferContents,
     present::LayerPacing,
 };
 use mtld3d_shared::{
@@ -1636,6 +1637,7 @@ extern "system" fn d3d9_create_device(
             backbuffer_height: pp.back_buffer_height,
             backbuffer_format: mtld3d_shared::mtl::PixelFormat::Bgra8Unorm,
             render_scale,
+            backbuffer_contents: BackbufferContents::from_swap_effect(pp.swap_effect),
             depth_texture: depth_handle,
             depth_has_stencil: depth_format_has_stencil(pp.auto_depth_stencil_format),
         }),
