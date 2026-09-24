@@ -1021,10 +1021,16 @@ struct EncoderFrameCounters {
     ///
     /// Indexed fans and fans past the 16-bit pattern's reach: the API
     /// thread rewrote the index list into the frame arena per draw and the
-    /// unix side wrapped it in a transient `MTLBuffer`. Non-indexed fans
-    /// ride the shared pattern buffer and are not counted. A tripwire: 0
-    /// is the goal.
+    /// unix side copied it into its upload ring. Non-indexed fans ride the
+    /// shared pattern buffer and are not counted. A tripwire: 0 is the goal.
     fan_generated: u32,
+    /// `DrawIndexedPrimitiveUP` draws, whose inline indices the unix side copies into its ring.
+    up_indexed: u32,
+    /// UP draws whose inline vertices exceed `SET_BYTES_MAX` and go through the ring.
+    ///
+    /// Smaller inline vertex streams are bound with `setVertexBytes`, which
+    /// Metal copies into the command buffer.
+    up_vertex_oversized: u32,
     /// Encoder-thread submit cost.
     ///
     /// Finalize (close passes, build descriptors, swap buffers, hand off)
@@ -1104,6 +1110,8 @@ impl EncoderFrameCounters {
             op_sub_detail: [0; OpSubDetail::COUNT],
             pipeline_memo_hits: 0,
             fan_generated: 0,
+            up_indexed: 0,
+            up_vertex_oversized: 0,
             pipeline_memo_calls: 0,
             submit_cycles: 0,
             drawable_wait_cycles: 0,
@@ -1941,6 +1949,16 @@ impl EncoderPerfState {
         self.enc.fan_generated = self.enc.fan_generated.saturating_add(1);
     }
 
+    /// Count one `DrawIndexedPrimitiveUP` draw.
+    pub const fn bump_up_indexed(&mut self) {
+        self.enc.up_indexed = self.enc.up_indexed.saturating_add(1);
+    }
+
+    /// Count one UP draw whose inline vertices exceed `SET_BYTES_MAX`.
+    pub const fn bump_up_vertex_oversized(&mut self) {
+        self.enc.up_vertex_oversized = self.enc.up_vertex_oversized.saturating_add(1);
+    }
+
     /// Pointer the encoder thread's `CycleSetTimer` writes into for the per-frame submit.
     ///
     /// Covers `drawable_wait` + commit. Bracketed by `run_frame`.
@@ -2384,6 +2402,10 @@ impl EncoderPerfState {
     #[inline]
     pub const fn bump_fan_generated(&mut self) {}
     #[inline]
+    pub const fn bump_up_indexed(&mut self) {}
+    #[inline]
+    pub const fn bump_up_vertex_oversized(&mut self) {}
+    #[inline]
     pub const fn submit_cycles_ptr(&mut self) -> *mut u64 {
         core::ptr::null_mut()
     }
@@ -2632,6 +2654,8 @@ struct PerfWindow {
     /// Pipeline-resolve memo hits / calls — rendered as a hit rate (sum only).
     pipeline_memo_hits: Stat,
     fan_generated: Stat,
+    up_indexed: Stat,
+    up_vertex_oversized: Stat,
     pipeline_memo_calls: Stat,
     submit_cyc: Stat,
     drawable_wait: Stat,
@@ -2868,6 +2892,9 @@ impl PerfWindow {
         self.pipeline_memo_hits
             .add(u64::from(s.enc.pipeline_memo_hits));
         self.fan_generated.add(u64::from(s.enc.fan_generated));
+        self.up_indexed.add(u64::from(s.enc.up_indexed));
+        self.up_vertex_oversized
+            .add(u64::from(s.enc.up_vertex_oversized));
         self.pipeline_memo_calls
             .add(u64::from(s.enc.pipeline_memo_calls));
         self.submit_cyc.add(s.enc.submit_cycles);
@@ -4793,13 +4820,25 @@ impl<'a> Summary<'a> {
             "  pipeline memo  {memo_hits} / {memo_calls}  ({memo_pct:.1}%)  consecutive-draw resolve elided",
         );
         // Fan draws off the shared pattern buffer: each one rewrote its
-        // index list on the API thread and cost a transient MTLBuffer.
-        // Every indexed fan is one, since the pattern only serves fans
+        // index list on the API thread and copied it into the unix upload
+        // ring. Every indexed fan is one, since the pattern only serves fans
         // whose vertices are consecutive.
         let _ = writeln!(
             out,
             "  fan generated  {fans:<9} indexed / oversized fans rewritten per draw (slow path; 0 is the goal)",
             fans = w.fan_generated.sum,
+        );
+        // The other two payloads the unix side copies into its upload ring
+        // per draw, the submit-thread cost that scales with UP draws.
+        let _ = writeln!(
+            out,
+            "  up indexed     {up:<9} DrawIndexedPrimitiveUP draws (inline indices copied into the upload ring)",
+            up = w.up_indexed.sum,
+        );
+        let _ = writeln!(
+            out,
+            "  up oversized   {big:<9} UP draws past the 4 KiB inline limit (vertices copied into the upload ring)",
+            big = w.up_vertex_oversized.sum,
         );
     }
 

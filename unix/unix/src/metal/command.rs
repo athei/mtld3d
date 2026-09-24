@@ -13,8 +13,8 @@ use mtld3d_shared::{
     BlitCommand, BlitCommandType, Command, CommandType, ExtraColorDesc, MetalHandle,
     NullTextureKind, PassDescriptor, SubmitFrameParams,
     mtl::{
-        BlockLayout, CullMode, IndexType, LoadAction, PixelFormat, PrimitiveType, StoreAction,
-        TriangleFillMode, VisibilityResultMode,
+        BlockLayout, CullMode, IndexType, LoadAction, PixelFormat, PrimitiveType, SET_BYTES_MAX,
+        StoreAction, TriangleFillMode, VisibilityResultMode,
     },
     mtl_handle::{
         MTLBufferKind, MTLDepthStencilStateKind, MTLDeviceKind, MTLRenderPipelineStateKind,
@@ -37,11 +37,13 @@ use objc2_quartz_core::CAMetalDrawable;
 use crate::{
     LOG_TARGET,
     metal::{
+        depth_transfer::PlanePool,
         handle::{BorrowRetained, IntoRetained},
         macdrv::attachment,
         null_texture,
         record::DeviceRecord,
         texture::mtl_pixel_format,
+        transient::{SubmitStamp, UploadRing},
         upscale::UpscaleCache,
     },
 };
@@ -356,6 +358,29 @@ impl core::fmt::Display for BlitSite {
     }
 }
 
+/// Offset alignment of an oversized inline vertex stream in the upload ring.
+///
+/// Metal's strictest buffer-offset rule, a constant-address-space binding on
+/// macOS; the padding is small next to a payload past `SET_BYTES_MAX`.
+const RING_VERTEX_ALIGN: usize = 256;
+/// Offset alignment of an inline index list in the upload ring.
+///
+/// An index buffer offset must be a multiple of the index size; 16 covers
+/// both index types with room to spare.
+const RING_INDEX_ALIGN: usize = 16;
+
+/// What one command buffer's encode carries besides the command buffer itself.
+///
+/// The device is fetched once per submission rather than per command, and
+/// `stamp` names the command buffer the device's reusable buffers are stamped
+/// with, the upload or the render one.
+struct EncodeContext<'a> {
+    device: &'a ProtocolObject<dyn MTLDevice>,
+    stamp: SubmitStamp,
+    ring: &'a mut UploadRing,
+    planes: &'a mut PlanePool,
+}
+
 /// Processes a frame into its command buffers and commits them.
 ///
 /// Encodes each `PassDescriptor` as a distinct `MTLRenderCommandEncoder`
@@ -474,35 +499,67 @@ fn encode_frame(record: &Arc<DeviceRecord>, params: &mut SubmitFrameParams) -> b
         }
     };
     let upload_pass_count = params.upload_pass_count as usize;
+    let device = queue.device();
+    let stamp = SubmitStamp::new(params);
+    // A submission whose buffers can never be seen to retire uses a ring of
+    // its own, dropped with this frame; the command buffers keep what they
+    // reference alive until they complete.
+    let (mut shared_ring, mut shared_planes);
+    let (mut own_ring, mut own_planes);
+    let (ring, planes): (&mut UploadRing, &mut PlanePool) = if stamp.persistent() {
+        shared_ring = record.upload_ring();
+        shared_planes = record.depth_planes();
+        (&mut shared_ring, &mut shared_planes)
+    } else {
+        own_ring = UploadRing::default();
+        own_planes = PlanePool::default();
+        (&mut own_ring, &mut own_planes)
+    };
+    let mut ctx = EncodeContext {
+        device: &device,
+        stamp: stamp.upload(),
+        ring,
+        planes,
+    };
     let mut upload_cb = None;
     let draw_pass_start = if params.upload_coherent_seq_ptr != 0 {
         if !blits.is_empty() || upload_pass_count != 0 {
-            let Some(cb) =
-                encode_upload_cmd_buf(record, &queue, blits, &passes[..upload_pass_count], params)
-            else {
+            let Some(cb) = encode_upload_cmd_buf(
+                record,
+                &queue,
+                blits,
+                &passes[..upload_pass_count],
+                params,
+                &mut ctx,
+            ) else {
                 return false;
             };
             upload_cb = Some(cb);
         }
         upload_pass_count
     } else {
+        ctx.stamp = SubmitStamp::new(params);
         if !blits.is_empty()
             && !encode_leading_blits(
                 &cmd_buf,
                 blits,
                 params.blit_commands_need_encoder != 0,
                 BlitSite::FrameLeading,
+                &mut ctx,
             )
         {
             return false;
         }
         0
     };
+    ctx.stamp = stamp;
     for (pass_idx, pass) in passes.iter().enumerate().skip(draw_pass_start) {
-        if !encode_pass(&cmd_buf, pass, pass_idx) {
+        if !encode_pass(&cmd_buf, pass, pass_idx, &mut ctx) {
             return false;
         }
     }
+    ctx.ring.end_submission(&ctx.stamp);
+    ctx.planes.end_submission(&ctx.stamp);
 
     // Presentation: what the presenter needs once this frame's render work
     // has committed. The layer and the back buffer are retained here from the
@@ -893,6 +950,7 @@ fn encode_upload_cmd_buf(
     blits: &[BlitCommand],
     passes: &[PassDescriptor],
     params: &SubmitFrameParams,
+    ctx: &mut EncodeContext<'_>,
 ) -> Option<Retained<ProtocolObject<dyn MTLCommandBuffer>>> {
     let submit_seq = params.submit_seq;
     let upload_coherent_seq_ptr = params.upload_coherent_seq_ptr;
@@ -911,12 +969,13 @@ fn encode_upload_cmd_buf(
             blits,
             params.blit_commands_need_encoder != 0,
             BlitSite::FrameLeading,
+            ctx,
         )
     {
         return None;
     }
     for (pass_idx, pass) in passes.iter().enumerate() {
-        if !encode_pass(&upload_cb, pass, pass_idx) {
+        if !encode_pass(&upload_cb, pass, pass_idx, ctx) {
             return None;
         }
     }
@@ -1050,13 +1109,6 @@ impl Default for GeometryStreak {
 /// shader's bilinear stretch, and they are frames right after a resize, a
 /// `Reset`, or device creation, which are about to change again anyway.
 const SETTLED_PRESENTS: u32 = 30;
-
-/// Metal's `setVertexBytes`/`setFragmentBytes` payload cap in bytes.
-///
-/// A larger payload (a `DrawPrimitiveUP` vertex stream past ~200 vertices)
-/// must ride a transient `MTLBuffer` instead; the validation layer rejects
-/// the `setBytes` call outright ("length must be <= 4096").
-const SET_BYTES_MAX: usize = 4096;
 
 /// Advance the settle counter for `geometry`, and say whether it has settled.
 ///
@@ -2035,6 +2087,7 @@ fn encode_leading_blits(
     blits: &[BlitCommand],
     needs_encoder: bool,
     site: BlitSite,
+    ctx: &mut EncodeContext<'_>,
 ) -> bool {
     let to_usize =
         |v: u64| usize::try_from(v).expect("PE wire u64 fits unix host usize (unix is 64-bit)");
@@ -2069,7 +2122,7 @@ fn encode_leading_blits(
                 if let Some(encoder) = blit.take() {
                     encoder.endEncoding();
                 }
-                if !super::depth_transfer::encode(cmd_buf, cmd) {
+                if !super::depth_transfer::encode(cmd_buf, cmd, ctx.planes, &ctx.stamp) {
                     return false;
                 }
                 if i + 1 < blits.len() {
@@ -2474,6 +2527,7 @@ fn encode_pass(
     cmd_buf: &ProtocolObject<dyn MTLCommandBuffer>,
     pass: &PassDescriptor,
     pass_idx: usize,
+    ctx: &mut EncodeContext<'_>,
 ) -> bool {
     let to_usize =
         |v: u64| usize::try_from(v).expect("PE wire u64 fits unix host usize (unix is 64-bit)");
@@ -2497,6 +2551,7 @@ fn encode_pass(
             blits,
             pass.leading_blits_need_encoder(),
             BlitSite::Pass(pass_idx),
+            ctx,
         ) {
             return false;
         }
@@ -2785,33 +2840,30 @@ fn encode_pass(
                         let length = to_usize(cmd.param_c);
                         if length > SET_BYTES_MAX {
                             // `setVertexBytes` caps at 4 KiB; a UP draw with a
-                            // larger inline vertex payload rides a transient
-                            // buffer instead. Metal retains buffers a draw
-                            // references until the command buffer completes,
-                            // so releasing our handle after encoding is safe.
-                            let device = cmd_buf.device();
+                            // larger inline vertex payload rides the upload
+                            // ring instead.
                             // SAFETY: `ptr` is non-null (checked) and the PE
                             // scratch arena holds `length` readable bytes for
-                            // the frame; Metal copies them into the new buffer.
-                            let vertex_buffer = unsafe {
-                                device.newBufferWithBytes_length_options(
-                                    ptr,
-                                    length,
-                                    MTLResourceOptions::StorageModeShared,
-                                )
+                            // the duration of the call.
+                            let bytes = unsafe {
+                                core::slice::from_raw_parts(ptr.as_ptr().cast::<u8>(), length)
                             };
-                            let Some(vertex_buffer) = vertex_buffer else {
+                            let Some(slice) =
+                                ctx.ring
+                                    .write(ctx.device, &ctx.stamp, bytes, RING_VERTEX_ALIGN)
+                            else {
                                 mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
-                                    "SetVertexBytes: transient vertex buffer alloc failed ({length} B) — bind skipped"
+                                    "SetVertexBytes: upload ring chunk allocation failed ({length} B); bind skipped"
                                 );
                                 continue;
                             };
-                            // SAFETY: objc2 typed binding; `vertex_buffer` is
-                            // retained for the call.
+                            // SAFETY: objc2 typed binding; the encoder retains
+                            // the ring chunk into the command buffer's resource
+                            // set, and the payload lies at `offset`.
                             unsafe {
                                 encoder.setVertexBuffer_offset_atIndex(
-                                    Some(&vertex_buffer),
-                                    0,
+                                    Some(slice.buffer),
+                                    slice.offset,
                                     cmd.param_a as usize,
                                 );
                             }
@@ -3195,35 +3247,31 @@ fn encode_pass(
                         }
                     };
                     // Metal has no inline-index draw, so copy the scratch index
-                    // bytes into a transient buffer. Metal retains buffers a draw
-                    // references until the command buffer completes, so releasing
-                    // our handle after encoding is safe.
-                    let device = cmd_buf.device();
+                    // bytes into the upload ring.
                     // SAFETY: `ptr` is non-null (checked) and the PE scratch arena
-                    // holds `byte_len` readable index bytes for the frame; Metal
-                    // copies them into the new buffer.
-                    let index_buffer = unsafe {
-                        device.newBufferWithBytes_length_options(
-                            ptr,
-                            byte_len,
-                            MTLResourceOptions::StorageModeShared,
-                        )
-                    };
-                    let Some(index_buffer) = index_buffer else {
+                    // holds `byte_len` readable index bytes for the duration of
+                    // the call.
+                    let bytes =
+                        unsafe { core::slice::from_raw_parts(ptr.as_ptr().cast::<u8>(), byte_len) };
+                    let Some(slice) =
+                        ctx.ring
+                            .write(ctx.device, &ctx.stamp, bytes, RING_INDEX_ALIGN)
+                    else {
                         mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
-                            "DrawIndexedPrimitivesUp: transient index buffer alloc failed — draw skipped"
+                            "DrawIndexedPrimitivesUp: upload ring chunk allocation failed ({byte_len} B); draw skipped"
                         );
                         continue;
                     };
-                    // SAFETY: objc2 typed binding; `index_buffer` is retained for
-                    // the call; inline UP indices are absolute (base vertex 0).
+                    // SAFETY: objc2 typed binding; the encoder retains the ring
+                    // chunk into the command buffer's resource set; inline UP
+                    // indices are absolute (base vertex 0).
                     unsafe {
                         encoder.drawIndexedPrimitives_indexCount_indexType_indexBuffer_indexBufferOffset_instanceCount_baseVertex_baseInstance(
                             prim_type,
                             to_usize(u64::from(index_count)),
                             index_type,
-                            &index_buffer,
-                            0,
+                            slice.buffer,
+                            slice.offset,
                             to_usize(u64::from(instance_count.max(1))),
                             0,
                             0,

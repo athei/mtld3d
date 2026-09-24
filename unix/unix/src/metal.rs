@@ -16,6 +16,7 @@ mod record;
 mod sampler;
 mod shader;
 mod texture;
+mod transient;
 mod upload_quad;
 mod upscale;
 

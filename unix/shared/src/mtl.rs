@@ -607,6 +607,13 @@ pub const VS_FLOAT_CONST_SLOT: u32 = 30;
 /// `mtld3d_core::vs_draw` and read by both vertex-shader emitters.
 pub const VS_DRAW_SLOT: u32 = 27;
 
+/// Metal's `setVertexBytes`/`setFragmentBytes` payload cap in bytes.
+///
+/// A larger inline payload (a `DrawPrimitiveUP` vertex stream past ~200
+/// vertices) cannot be bound inline: the unix side copies it into its upload
+/// ring and binds that buffer instead, and the PE side counts such draws.
+pub const SET_BYTES_MAX: usize = 4096;
+
 /// Presents that can be pending on one queue at once.
 ///
 /// A present is pending from its frame's commit until the presenter commits
