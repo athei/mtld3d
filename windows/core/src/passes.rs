@@ -4541,10 +4541,15 @@ impl PassState {
     /// only when every colour store of the pass is already `DontCare`
     /// after `finalize_store_actions` (Rule C: the next pass on each
     /// target clears it in full). Otherwise the pass keeps its colour
-    /// attachment and its with-colour pipelines. Without a clear-quad the
-    /// strip is content-preserving: no colour is written, so the texture
-    /// keeps what a `Load` would have carried through (and a `DontCare`
-    /// load stored undefined contents anyway).
+    /// attachment and its with-colour pipelines. A `Clear` load action is
+    /// the same kind of write and follows the same test per attachment,
+    /// the one Rule G applies (`written_without_draws`): a stored `Clear`
+    /// or a resolve keeps the pass, a `Clear` Rule C discarded does not.
+    /// That is the cascade caster shape, where every caster pass opens by
+    /// clearing a shared colour placeholder that only the last pass
+    /// stores. Without a colour write the strip is content-preserving: the
+    /// texture keeps what a `Load` would have carried through (and a
+    /// `DontCare` load stored undefined contents anyway).
     ///
     /// If the side-map is missing an entry for a non-clear-quad `SetPSO`
     /// inside a candidate pass, abort the strip for that pass (single
@@ -4568,17 +4573,18 @@ impl PassState {
             if pass.color_writes_observed
                 || pass.color_texture.is_null()
                 || pass.depth_texture.is_null()
-                // The resolve writes the single-sample twin every later reader
-                // looks at, so the attachment is not dead even with no colour
-                // write in the pass.
-                || !pass.color_resolve_texture.is_null()
-                || pass.extra_color.iter().any(|a| !a.resolve_texture.is_null())
-                // A folded color Clear (`color_load == Clear`) is a real color
-                // write even with no draw to tag `color_writes_observed` — e.g.
-                // a backbuffer color Clear that shares a pass with a depth
-                // clear-quad. Stripping color here would discard that
-                // clear; a later Load pass would then read black.
-                || matches!(pass.color_load, ColorLoad::Clear { .. })
+                // A stored `Clear` load is a real colour write even with no
+                // draw to tag `color_writes_observed` (a back-buffer Clear
+                // that shares a pass with a depth clear-quad, say): stripping
+                // it would leave a later `Load` reading the old contents. A
+                // resolve writes the single-sample twin every later reader
+                // looks at. A `Clear` whose store Rule C discarded writes
+                // nothing anyone observes, so it does not keep the pass.
+                || pass.color_written_without_draws()
+                || pass
+                    .extra_color
+                    .iter()
+                    .any(PassColorAttachment::written_without_draws)
             {
                 continue;
             }
@@ -4649,6 +4655,7 @@ impl PassState {
             }
             pass.color_clear_quad_ranges.clear();
             let stripped = pass.color_texture;
+            let load = pass.color_load;
             pass.drop_color_attachment();
             // The no-colour twin declares no colour attachment at all, so
             // render targets 1..3 go with target 0.
@@ -4656,7 +4663,7 @@ impl PassState {
             if log_enabled!(target: TRACE_TARGET, Level::Trace) {
                 trace!(
                     target: TRACE_TARGET,
-                    "pass-strip color={stripped:#x} → depth-only \
+                    "pass-strip color={stripped:#x} load={load:?} → depth-only \
                      (all draws color_write_mask=0; dropped {dropped_cmds} clear-quad cmds)",
                 );
             }

@@ -3154,6 +3154,241 @@ fn rule_h_strips_color_and_clear_quad_when_the_next_pass_clears_the_target() {
     );
 }
 
+/// Run every submit-time pass rule in the order `apply_pass_rules` does.
+fn apply_pass_rules_with(
+    s: &mut PassState,
+    alt: &FxHashMap<u64, MetalHandle<MTLRenderPipelineStateKind>>,
+) {
+    s.drop_overwritten_clear_only_passes();
+    s.coalesce_clear_only_passes();
+    s.finalize_load_actions();
+    s.finalize_store_actions(false);
+    s.strip_dead_color_in_clear_only_passes();
+    s.strip_color_from_no_color_draw_passes(alt);
+    s.cull_dead_clear_only_passes();
+    s.merge_adjacent_identical_passes();
+}
+
+/// The colour clear value the cascade placeholder tests clear to: 1.0 in every channel.
+const PLACEHOLDER_CLEAR: u32 = 0x3F80_0000;
+
+/// Record the cascade caster passes of `WoW` 3.3.5a, one pass per cascade depth texture.
+///
+/// Every pass binds the same colour placeholder, clears it and its own
+/// depth texture in full, and draws casters with colour writes masked off.
+/// Each cascade is a sampleable shadow map, so Rule B keeps its depth.
+fn record_cascade_casters(
+    s: &mut PassState,
+    placeholder: MetalHandle<MTLTextureKind>,
+    cascades: &[MetalHandle<MTLTextureKind>],
+) {
+    for &cascade in cascades {
+        s.set_color_render_target(placeholder, 256, 256, RT_FORMAT, RenderScale::IDENTITY);
+        s.set_depth_stencil_attachment(cascade, (256, 256), true, false);
+        s.set_viewport(0, 0, 256, 256, 0.0, 1.0);
+        let v = PLACEHOLDER_CLEAR;
+        s.clear_color(v, v, v, v);
+        s.clear_depth(f32::to_bits(1.0));
+        for _ in 0..2 {
+            s.note_draw_color_write_mask(0);
+            s.emit_command(set_pso(PSO_WITH));
+            s.emit_command(dummy_draw());
+        }
+    }
+    s.end_current_pass("test");
+}
+
+fn pipelines_of(pass: &Pass) -> Vec<u64> {
+    pass.commands()
+        .iter()
+        .filter(|c| c.cmd == CommandType::SetRenderPipelineState as u32)
+        .map(|c| c.param_b)
+        .collect()
+}
+
+#[test]
+fn rule_h_strips_a_cleared_placeholder_from_every_caster_pass_but_the_last() {
+    // Each caster pass opens by clearing the shared placeholder, so Rule C
+    // discards the colour store of all but the last, and those Clears write
+    // nothing anyone observes. The last pass's Clear is stored: it is what
+    // the placeholder holds after the frame, so that pass keeps its colour.
+    let placeholder = tex(0x3000);
+    let cascades = [tex(0x4000), tex(0x4001), tex(0x4002), tex(0x4003)];
+    let mut s = fresh();
+    record_cascade_casters(&mut s, placeholder, &cascades);
+    let mut alt = FxHashMap::default();
+    alt.insert(PSO_WITH, pso(PSO_NO_COLOR));
+    apply_pass_rules_with(&mut s, &alt);
+
+    let passes = s.passes();
+    assert_eq!(passes.len(), cascades.len(), "every caster pass survives");
+    for (pass, cascade) in passes.iter().zip(cascades) {
+        assert_eq!(pass.depth_texture(), cascade);
+        assert_eq!(pass.depth_store(), StoreAction::Store, "shadow map kept");
+    }
+    let (last, stripped) = passes.split_last().expect("caster passes");
+    for (i, pass) in stripped.iter().enumerate() {
+        assert_eq!(
+            pass.color_texture(),
+            MetalHandle::NULL,
+            "pass {i}: colour stripped"
+        );
+        assert_eq!(pass.color_load(), ColorLoad::DontCare, "pass {i}");
+        assert!(
+            pipelines_of(pass).iter().all(|&h| h == PSO_NO_COLOR),
+            "pass {i}: every caster binds the no-colour pipeline"
+        );
+    }
+    let v = PLACEHOLDER_CLEAR;
+    assert_eq!(
+        last.color_texture(),
+        placeholder,
+        "last caster pass keeps colour"
+    );
+    assert_eq!(
+        last.color_load(),
+        ColorLoad::Clear {
+            r: v,
+            g: v,
+            b: v,
+            a: v
+        }
+    );
+    assert_eq!(last.color_store(), StoreAction::Store);
+    assert!(pipelines_of(last).iter().all(|&h| h == PSO_WITH));
+}
+
+#[test]
+fn rule_h_keeps_every_cleared_placeholder_a_sampler_reads() {
+    // A sampled placeholder keeps every colour store (Rule C stands down), so
+    // every caster pass's Clear is stored and every pass keeps its colour.
+    let placeholder = tex(0x3000);
+    let cascades = [tex(0x4000), tex(0x4001), tex(0x4002)];
+    let mut s = fresh();
+    s.note_texture_read(placeholder);
+    record_cascade_casters(&mut s, placeholder, &cascades);
+    let mut alt = FxHashMap::default();
+    alt.insert(PSO_WITH, pso(PSO_NO_COLOR));
+    apply_pass_rules_with(&mut s, &alt);
+
+    assert_eq!(s.passes().len(), cascades.len());
+    for (i, pass) in s.passes().iter().enumerate() {
+        assert_eq!(pass.color_texture(), placeholder, "pass {i}: colour kept");
+        assert_eq!(pass.color_store(), StoreAction::Store, "pass {i}");
+        assert!(
+            pipelines_of(pass).iter().all(|&h| h == PSO_WITH),
+            "pass {i}"
+        );
+    }
+}
+
+#[test]
+fn rule_h_keeps_a_stored_clear_beside_zero_mask_draws() {
+    // Nothing later in the submission clears the target, so its Clear is
+    // stored and a later frame may read it: the pass keeps its colour.
+    let target = tex(0x3000);
+    let mut s = fresh();
+    s.set_color_render_target(target, 256, 256, RT_FORMAT, RenderScale::IDENTITY);
+    s.set_viewport(0, 0, 256, 256, 0.0, 1.0);
+    s.clear_color(1, 2, 3, 4);
+    s.note_draw_color_write_mask(0);
+    s.emit_command(set_pso(PSO_WITH));
+    s.emit_command(dummy_draw());
+    s.end_current_pass("test");
+    let mut alt = FxHashMap::default();
+    alt.insert(PSO_WITH, pso(PSO_NO_COLOR));
+    apply_pass_rules_with(&mut s, &alt);
+
+    let pass = &s.passes()[0];
+    assert_eq!(pass.color_texture(), target, "colour kept");
+    assert_eq!(
+        pass.color_load(),
+        ColorLoad::Clear {
+            r: 1,
+            g: 2,
+            b: 3,
+            a: 4
+        }
+    );
+    assert_eq!(pass.color_store(), StoreAction::Store);
+    assert_eq!(pipelines_of(pass), [PSO_WITH]);
+}
+
+#[test]
+fn rule_h_keeps_a_pass_whose_extra_target_stores_its_clear() {
+    // Render target 0's Clear is dead (the next pass on it clears it again),
+    // but render target 1's Clear is stored. The no-colour pipeline drops
+    // every colour attachment, so the pass keeps them all.
+    let rt0 = tex(0x3000);
+    let rt1 = tex(0x3001);
+    let mut s = fresh();
+    s.set_color_render_target(rt0, BB_SIZE.0, BB_SIZE.1, RT_FORMAT, RenderScale::IDENTITY);
+    s.set_extra_color_render_target(1, Some(slot(rt1, BB_SIZE)));
+    s.clear_color(0, 0, 0, 0);
+    s.note_draw_color_write_mask(0);
+    s.emit_command(set_pso(PSO_WITH));
+    s.emit_command(dummy_draw());
+    s.end_current_pass("test");
+    s.set_extra_color_render_target(1, None);
+    s.clear_color(0, 0, 0, 0);
+    s.note_draw_color_write_mask(0xF);
+    s.emit_command(set_pso(PSO_WITH));
+    s.emit_command(dummy_draw());
+    s.end_current_pass("test");
+    let mut alt = FxHashMap::default();
+    alt.insert(PSO_WITH, pso(PSO_NO_COLOR));
+    apply_pass_rules_with(&mut s, &alt);
+
+    let pass = &s.passes()[0];
+    assert_eq!(
+        pass.color_store(),
+        StoreAction::DontCare,
+        "Rule C fired on rt0"
+    );
+    assert_eq!(pass.extra_color()[0].store(), StoreAction::Store);
+    assert_eq!(pass.color_texture(), rt0, "render target 0 kept");
+    assert_eq!(pass.extra_color()[0].texture(), rt1, "render target 1 kept");
+    assert_eq!(pipelines_of(pass), [PSO_WITH]);
+}
+
+#[test]
+fn rule_h_strips_a_discarded_clear_and_its_clear_quads_together() {
+    const PSO_CLEAR_QUAD_COLOR: u64 = 0xCAFE_BABE;
+    // The pass opens with a full Clear and repaints part of the target with a
+    // colour clear-quad before its zero-mask draws; the next pass clears the
+    // target again. Both writes are dead, so the colour and the quad go.
+    let atlas = tex(0x3000);
+    let mut s = fresh();
+    s.set_color_render_target(atlas, 256, 256, RT_FORMAT, RenderScale::IDENTITY);
+    s.set_viewport(0, 0, 256, 256, 0.0, 1.0);
+    s.clear_color(1, 1, 1, 1);
+    let start = s.open_color_clear_quad_block();
+    s.emit_command(set_pso(PSO_CLEAR_QUAD_COLOR));
+    s.emit_command(dummy_draw());
+    s.close_color_clear_quad_block(start);
+    s.note_draw_color_write_mask(0);
+    s.emit_command(set_pso(PSO_WITH));
+    s.emit_command(dummy_draw());
+    s.end_current_pass("test");
+    s.clear_color(0, 0, 0, 0);
+    s.note_draw_color_write_mask(0xF);
+    s.emit_command(set_pso(PSO_WITH));
+    s.emit_command(dummy_draw());
+    s.end_current_pass("test");
+    let mut alt = FxHashMap::default();
+    alt.insert(PSO_WITH, pso(PSO_NO_COLOR));
+    apply_pass_rules_with(&mut s, &alt);
+
+    let pass = &s.passes()[0];
+    assert_eq!(pass.color_texture(), MetalHandle::NULL, "colour stripped");
+    assert!(
+        pass.color_clear_quad_ranges().is_empty(),
+        "clear-quad drained"
+    );
+    assert_eq!(pipelines_of(pass), [PSO_NO_COLOR]);
+    assert_eq!(s.passes()[1].color_texture(), atlas, "clearing pass kept");
+}
+
 // ── Draw-state replay: the submit-time rules must leave the encoder state
 // ── every surviving draw sees exactly as it was recorded.
 
