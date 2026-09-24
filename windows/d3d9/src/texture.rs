@@ -8,7 +8,7 @@ use mtld3d_core::{
     level_authority::{LevelAuthorityMask, WritePlan},
     page_box::{PageBox, PageBoxRead},
     pixel_convert,
-    render_scale::RenderScale,
+    render_scale::{RenderScale, TargetExtent},
     staging_coverage::StagingCoverage,
     texture_flags::TextureFlags,
     texture_staging::{
@@ -909,10 +909,16 @@ impl TextureInner {
         if self.render_scale.is_identity() {
             return (self.mip_bytes_per_row[level], self.mip_heights[level]);
         }
-        let width = self.render_scale.dimension(self.mip_widths[level]);
+        let (width, height) = TargetExtent::mip_level(
+            self.render_scale,
+            (self.mip_widths[level], self.mip_heights[level]),
+            self.render_extent(),
+            u32::try_from(level).expect("a mip level index fits u32"),
+        )
+        .texture();
         (
             block_row_pitch(width, self.block_w, self.block_bytes, self.bytes_per_pixel),
-            self.render_scale.dimension(self.mip_heights[level]),
+            height,
         )
     }
 

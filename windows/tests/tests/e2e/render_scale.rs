@@ -693,6 +693,167 @@ fn a_point_keeps_its_reported_diameter_under_the_scale() {
     assert_pixel_eq(h.read_pixel(320, 200), BLACK, "40 px above the square");
 }
 
+/// A reported back-buffer size whose 75% edges carry a fraction below one half.
+///
+/// 803 and 603 scale to 602.25 and 452.25, where a texture extent rounded one
+/// way and a viewport edge rounded the other disagree by a texel, leaving the
+/// last column and row of the rasterized frame outside a full-target viewport.
+const ODD_FRAME: (u32, u32) = (803, 603);
+
+/// A device at [`ODD_FRAME`] rasterizing at 75%, whatever the run's own scale.
+///
+/// Its viewport is the whole target, set through `SetViewport`. Pins the scale
+/// rather than inheriting it: at the identity the two roundings cannot
+/// disagree, and this must fail in the ordinary `make test` if it regresses.
+/// The parser keeps the last entry, so this wins over a `make test SCALE=<n>`
+/// run too.
+fn odd_frame_at_three_quarters() -> Harness {
+    let h = Harness::create(&HarnessConfig {
+        width: ODD_FRAME.0,
+        height: ODD_FRAME.1,
+        config_entries: "render.scale=0.75",
+        ..HarnessConfig::default()
+    });
+    assert_eq!(h.dims(), ODD_FRAME, "the device reports the requested size");
+    // Set explicitly, as a game does and as `SetRenderTarget` does for it: a
+    // device that never saw `SetViewport` reads the bound texture's own extent
+    // instead, which is not the conversion under test.
+    let full = D3DVIEWPORT9 {
+        x: 0,
+        y: 0,
+        width: ODD_FRAME.0,
+        height: ODD_FRAME.1,
+        min_z: 0.0,
+        max_z: 1.0,
+    };
+    assert_eq!(h.set_viewport(&full), 0, "SetViewport(full target)");
+    h
+}
+
+/// Probe the last reported column and row, and the middle, for `expected`.
+fn assert_edges_read(h: &Harness, expected: u32, what: &str) {
+    let (width, height) = ODD_FRAME;
+    let (last_x, last_y) = (width - 1, height - 1);
+    assert_pixel_eq(h.read_pixel(width / 2, height / 2), expected, what);
+    assert_pixel_eq(
+        h.read_pixel(last_x, height / 2),
+        expected,
+        &format!("{what}: last column"),
+    );
+    assert_pixel_eq(
+        h.read_pixel(width / 2, last_y),
+        expected,
+        &format!("{what}: last row"),
+    );
+    assert_pixel_eq(
+        h.read_pixel(last_x, last_y),
+        expected,
+        &format!("{what}: last corner"),
+    );
+}
+
+/// A draw under a full-target viewport covers the target's last column and row.
+///
+/// The readback resolves the rasterized frame up to the reported size, so a
+/// render column the draw never reached comes back as the last reported one.
+#[test]
+fn a_full_target_draw_reaches_the_last_column_and_row_of_an_odd_sized_frame() {
+    let h = odd_frame_at_three_quarters();
+    assert_eq!(h.set_render_state(D3DRS_LIGHTING, 0), 0, "lighting off");
+    h.select_diffuse_stage(0);
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE), 0, "SetFVF");
+    h.render_once(RED, |h| {
+        assert_eq!(
+            h.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &covering_quad(0.5)),
+            0,
+            "covering draw",
+        );
+    });
+    assert_edges_read(&h, GREEN, "full-viewport draw");
+}
+
+/// A whole-target `Clear` under a full-target viewport reaches the last column and row.
+#[test]
+fn a_whole_target_clear_reaches_the_last_column_and_row_of_an_odd_sized_frame() {
+    let h = odd_frame_at_three_quarters();
+    h.render_once(BLUE, |_| {});
+    assert_edges_read(&h, BLUE, "whole-target clear");
+}
+
+/// A draw into mip level 1 of a scaled target reaches that level's last column and row.
+///
+/// Metal sizes the level from the scaled base: 67% of 853x659 is 572x442, so
+/// level 1 is 286x221 texels, a texel wider and taller than the 285x220 the
+/// scale makes of the level's reported 426x329. Bound with a full-level
+/// viewport and scissor, a pass measured against the scaled reported extent
+/// leaves the level's last column and row undrawn. Pins its own scale,
+/// because at the suite's 0.75 these sizes do not mismatch.
+#[test]
+fn a_draw_into_a_scaled_mip_level_reaches_its_last_column_and_row() {
+    let config = "render.scale=0.67";
+    let (width, height) = (853, 659);
+    let h = Harness::create(&HarnessConfig {
+        width,
+        height,
+        config_entries: config,
+        ..HarnessConfig::default()
+    });
+    let rt = h.create_texture(
+        width,
+        height,
+        2,
+        D3DUSAGE_RENDERTARGET,
+        D3DFMT_A8R8G8B8,
+        D3DPOOL_DEFAULT,
+    );
+    let level = rt.surface_level(1);
+    let (level_w, level_h) = (width / 2, height / 2);
+    assert_eq!(h.set_render_target(0, &level), 0, "{config}: bind level 1");
+    let full = D3DVIEWPORT9 {
+        x: 0,
+        y: 0,
+        width: level_w,
+        height: level_h,
+        min_z: 0.0,
+        max_z: 1.0,
+    };
+    assert_eq!(h.set_viewport(&full), 0, "{config}: full-level viewport");
+    assert_eq!(h.set_render_state(D3DRS_SCISSORTESTENABLE, 1), 0);
+    assert_eq!(
+        h.set_scissor_rect(&D3DRECT {
+            x1: 0,
+            y1: 0,
+            x2: level_w.cast_signed(),
+            y2: level_h.cast_signed(),
+        }),
+        0,
+        "{config}: full-level scissor",
+    );
+    assert_eq!(h.set_render_state(D3DRS_LIGHTING, 0), 0, "lighting off");
+    h.select_diffuse_stage(0);
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE), 0, "SetFVF");
+    h.render_once(RED, |h| {
+        assert_eq!(
+            h.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &covering_quad(0.5)),
+            0,
+            "{config}: covering draw",
+        );
+    });
+    let (last_x, last_y) = (level_w - 1, level_h - 1);
+    for (x, y, what) in [
+        (level_w / 2, level_h / 2, "middle"),
+        (last_x, level_h / 2, "last column"),
+        (level_w / 2, last_y, "last row"),
+        (last_x, last_y, "last corner"),
+    ] {
+        assert_pixel_eq(
+            h.read_pixel(x, y),
+            GREEN,
+            &format!("{config}: level 1 {what}"),
+        );
+    }
+}
+
 #[test]
 fn color_fill_of_a_target_at_the_backbuffer_size_uses_reported_coordinates() {
     // A render target created at the reported back-buffer size belongs to the

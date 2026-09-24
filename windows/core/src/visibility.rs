@@ -100,8 +100,9 @@ pub struct VisibilityQueryCore {
     /// which under a reduced `render.scale` holds fewer pixels than D3D9
     /// reports, so the count is scaled back up by the ratio of the two areas
     /// before the game reads it. The areas rather than the nominal scale,
-    /// because a dimension the scale does not divide rounds up on the render
-    /// grid, and only the actual ratio makes a full-frame count exact.
+    /// because a dimension the scale does not divide rounds to a whole texel
+    /// on the render grid, and only the actual ratio makes a full-frame count
+    /// exact.
     logical_area: AtomicU64,
     /// Pixel area of the same target's render grid.
     render_area: AtomicU64,

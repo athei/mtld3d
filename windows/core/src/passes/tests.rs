@@ -414,11 +414,26 @@ fn set_render_target_same_handle_no_break() {
 fn set_render_target_subresource_breaks_on_slice_or_level_change() {
     let rt = tex(0x3000);
     let mut s = fresh();
-    s.set_color_render_target_subresource(rt, 256, 256, RT_FORMAT, RenderScale::IDENTITY, (0, 0));
+    s.set_color_render_target_subresource(
+        rt,
+        &TargetExtent::whole(RenderScale::IDENTITY, (256, 256)),
+        RT_FORMAT,
+        (0, 0),
+    );
     s.emit_command(dummy_draw());
-    s.set_color_render_target_subresource(rt, 256, 256, RT_FORMAT, RenderScale::IDENTITY, (1, 0));
+    s.set_color_render_target_subresource(
+        rt,
+        &TargetExtent::whole(RenderScale::IDENTITY, (256, 256)),
+        RT_FORMAT,
+        (1, 0),
+    );
     s.emit_command(dummy_draw());
-    s.set_color_render_target_subresource(rt, 128, 128, RT_FORMAT, RenderScale::IDENTITY, (1, 1));
+    s.set_color_render_target_subresource(
+        rt,
+        &TargetExtent::whole(RenderScale::IDENTITY, (128, 128)),
+        RT_FORMAT,
+        (1, 1),
+    );
     s.emit_command(dummy_draw());
 
     assert_eq!(s.passes().len(), 3);
@@ -4023,7 +4038,7 @@ fn slot(texture: MetalHandle<MTLTextureKind>, size: (u32, u32)) -> ExtraColorSlo
         msaa_srgb_texture: MetalHandle::NULL,
         sample_count: 1,
         subresource: 0,
-        size: (0, 0),
+        size,
         logical_size: size,
         format: PixelFormat::R8Unorm,
         scale: RenderScale::IDENTITY,
@@ -4178,10 +4193,8 @@ fn take_and_restore_round_trip_the_binding_set() {
     let target = saved.slot(2).expect("slot 2 bound");
     s.set_color_render_target_subresource(
         target.texture,
-        target.logical_size.0,
-        target.logical_size.1,
+        &TargetExtent::new(target.scale, target.logical_size, target.size),
         target.format,
-        target.scale,
         (0, 0),
     );
     s.set_color_rt_has_alpha(target.has_alpha);
@@ -6175,7 +6188,7 @@ fn msaa_slot(
         msaa_srgb_texture: MetalHandle::NULL,
         sample_count: 4,
         subresource: 0,
-        size: (0, 0),
+        size,
         logical_size: size,
         format: BB_FORMAT,
         scale: RenderScale::IDENTITY,
@@ -8839,10 +8852,8 @@ fn rule_j_keeps_passes_apart_across_a_boundary_the_join_would_change() {
     assert_split_keeps_passes_apart("another mip level", |s| {
         s.set_color_render_target_subresource(
             target,
-            BB_SIZE.0,
-            BB_SIZE.1,
+            &TargetExtent::whole(RenderScale::IDENTITY, (BB_SIZE.0, BB_SIZE.1)),
             RT_FORMAT,
-            RenderScale::IDENTITY,
             (0, 1),
         );
     });
@@ -9029,5 +9040,46 @@ fn rule_j_keeps_passes_apart_when_a_loaded_depth_plane_was_not_stored() {
         s.merge_adjacent_identical_passes();
 
         assert_eq!(s.passes().len(), 2, "{name}: the passes stay apart");
+    }
+}
+
+/// A bound mip level of a scaled target records the extent Metal allocated for it.
+///
+/// Metal sizes a level from the scaled base, `max(1, dimension(base) >> level)`,
+/// which can differ by a texel from the scale of the level's reported size. A
+/// full-level viewport and scissor have to land on exactly that extent, and the
+/// coverage tests have to see the level as covered.
+#[test]
+fn a_scaled_mip_level_binds_at_the_extent_metal_allocated() {
+    let rt = tex(0x3000);
+    let mut s = fresh();
+    for percent in [50, 67, 75, 99, 100] {
+        let scale = RenderScale::from_percent(percent);
+        for base in 1..=2048u32 {
+            let base_texture = (scale.dimension(base), scale.dimension(base + 1));
+            for level in 0..=3u32 {
+                let logical = ((base >> level).max(1), ((base + 1) >> level).max(1));
+                let texture = (
+                    (base_texture.0 >> level).max(1),
+                    (base_texture.1 >> level).max(1),
+                );
+                let extent = TargetExtent::mip_level(scale, logical, base_texture, level);
+                s.set_color_render_target_subresource(rt, &extent, RT_FORMAT, (0, level));
+                let what = format!("{percent}% of {base} at level {level}");
+                assert_eq!(s.current_color_size(), texture, "{what}: recorded extent");
+                s.set_viewport(0, 0, logical.0, logical.1, 0.0, 1.0);
+                assert_eq!(
+                    s.effective_viewport(),
+                    (0, 0, texture.0, texture.1),
+                    "{what}: full-level viewport",
+                );
+                assert!(s.viewport_covers_color_attachment(), "{what}: coverage");
+                assert_eq!(
+                    s.resolved_scissor_rect(true, [0, 0, logical.0, logical.1]),
+                    (0, 0, texture.0, texture.1),
+                    "{what}: full-level scissor",
+                );
+            }
+        }
     }
 }

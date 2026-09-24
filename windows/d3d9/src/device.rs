@@ -32,6 +32,7 @@ use mtld3d_core::{
     },
     present::LayerPacing,
     readback::{ReadbackDestination, ReadbackReject, ReadbackSource},
+    render_scale::TargetExtent,
     streams::validate_stream_freq,
     texture_flags::TextureFlags,
     upload_redirty::RedirtyQueue,
@@ -1734,7 +1735,7 @@ impl DeviceInner {
         scale: mtld3d_core::render_scale::RenderScale,
     ) {
         self.push_op(Box::new(move |enc| {
-            let (handle, msaa, msaa_srgb, sample_count, w, h, fmt, has_alpha, slice, level) =
+            let (handle, msaa, msaa_srgb, sample_count, extent, fmt, has_alpha, slice, level) =
                 match info {
                     RtBinding::Backbuffer {
                         handle,
@@ -1748,8 +1749,7 @@ impl DeviceInner {
                         msaa,
                         msaa_srgb,
                         sample_count,
-                        width,
-                        height,
+                        TargetExtent::whole(scale, (width, height)),
                         mtld3d_shared::mtl::PixelFormat::Bgra8Unorm,
                         // The backbuffer is an alpha-bearing A8R8G8B8 target
                         // (see `PassState::reset_frame`), so its destination-alpha
@@ -1775,8 +1775,7 @@ impl DeviceInner {
                             msaa,
                             msaa_srgb,
                             sample_count,
-                            width,
-                            height,
+                            TargetExtent::whole(scale, (width, height)),
                             format,
                             has_alpha,
                             0,
@@ -1792,6 +1791,15 @@ impl DeviceInner {
                         level,
                     } => {
                         let fmt = info.pixel_format;
+                        // `info` measures the base level in render texels, the
+                        // extent the Metal texture was created at; the level
+                        // bound is Metal's own halving of that.
+                        let extent = TargetExtent::mip_level(
+                            scale,
+                            (width, height),
+                            (info.width, info.height),
+                            level,
+                        );
                         let h = enc.get_or_create_texture(&info);
                         // SAFETY: `get_or_create_texture` returns a Metal texture
                         // handle from the encoder's typed `texture_cache` via `.raw()`.
@@ -1804,8 +1812,7 @@ impl DeviceInner {
                             MetalHandle::NULL,
                             MetalHandle::NULL,
                             1,
-                            width,
-                            height,
+                            extent,
                             fmt,
                             has_alpha,
                             slice,
@@ -1822,9 +1829,8 @@ impl DeviceInner {
                         msaa_srgb_texture: msaa_srgb,
                         sample_count,
                         subresource: slice | (level << 16),
-                        // Derived from `logical_size` and `scale` by the setter.
-                        size: (0, 0),
-                        logical_size: (w, h),
+                        size: extent.texture(),
+                        logical_size: extent.logical(),
                         format: fmt,
                         scale,
                         has_alpha,
@@ -1836,7 +1842,8 @@ impl DeviceInner {
                     msaa_texture: msaa,
                     msaa_srgb_texture: msaa_srgb,
                     sample_count,
-                    logical_size: (w, h),
+                    logical_size: extent.logical(),
+                    size: extent.texture(),
                     format: fmt,
                     has_alpha,
                     scale,
@@ -7443,17 +7450,11 @@ extern "system" fn device_stretch_rect(
             let transfer = crate::encoder::DepthTransfer {
                 source: *src_handle,
                 source_level: 0,
-                source_size: (
-                    src_info.scale.dimension(src_info.width),
-                    src_info.scale.dimension(src_info.height),
-                ),
+                source_size: src_info.texture_size,
                 source_format,
                 source_samples: src_info.sample_count,
                 destination: *dst_handle,
-                destination_size: (
-                    dst_info.scale.dimension(dst_info.width),
-                    dst_info.scale.dimension(dst_info.height),
-                ),
+                destination_size: dst_info.texture_size,
                 destination_format,
             };
             if dev.frame_dump.active {
@@ -7918,16 +7919,18 @@ fn parse_stretch_regions(
 
 /// Convert a `StretchRect` region into the space of the texture it addresses.
 ///
-/// A no-op for anything but the back buffer under a non-default
-/// `render.scale`, and an exact identity at the default.
+/// A no-op for anything but a surface rasterized at a non-default
+/// `render.scale`, and an exact identity at the default. A region spanning
+/// the surface spans the subresource Metal allocated for it.
 fn scale_stretch_region(
-    scale: mtld3d_core::render_scale::RenderScale,
+    info: &StretchSurfaceInfo,
     region: mtld3d_core::stretch_rect::StretchRegion,
 ) -> mtld3d_core::stretch_rect::StretchRegion {
-    if scale.is_identity() {
+    if info.scale.is_identity() {
         return region;
     }
-    let (x, y, w, h) = scale.rect(region.x, region.y, region.w, region.h);
+    let extent = TargetExtent::new(info.scale, (info.width, info.height), info.texture_size);
+    let (x, y, w, h) = extent.rect(region.x, region.y, region.w, region.h);
     mtld3d_core::stretch_rect::StretchRegion { x, y, w, h }
 }
 
@@ -8018,17 +8021,9 @@ fn emit_stretch_rect_blit(
     // VS builds from the two is preserved, while the destination rect (which
     // drives an absolute viewport and scissor) lands on real pixels. An
     // endpoint the game created keeps its own coordinates.
-    let (src_scale, dst_scale) = (src_info.scale, dst_info.scale);
-    let src_region = scale_stretch_region(src_scale, src_region);
-    let dst_region = scale_stretch_region(dst_scale, dst_region);
-    let src_dims = (
-        src_scale.dimension(src_info.width),
-        src_scale.dimension(src_info.height),
-    );
-    let dst_dims = (
-        dst_scale.dimension(dst_info.width),
-        dst_scale.dimension(dst_info.height),
-    );
+    let src_region = scale_stretch_region(src_info, src_region);
+    let dst_region = scale_stretch_region(dst_info, dst_region);
+    let (src_dims, dst_dims) = (src_info.texture_size, dst_info.texture_size);
 
     // The API thread decided this from the game's own rects. Scaling only one
     // endpoint can turn a logically 1:1 copy into a physical resize, which the
@@ -8399,11 +8394,15 @@ bitflags::bitflags! {
 struct StretchSurfaceInfo {
     kind: StretchKind,
     /// Surface width as D3D9 reports it.
-    ///
-    /// The Metal texture behind it is `scale` of this.
     width: u32,
-    /// Surface height as D3D9 reports it. See [`Self::width`].
+    /// Surface height as D3D9 reports it.
     height: u32,
+    /// Extent Metal allocated for the addressed subresource.
+    ///
+    /// `scale` of `width`/`height` for a surface or level 0, and Metal's own
+    /// halving of the scaled base for a deeper level, which can differ from
+    /// the scale of that level's reported size by a texel.
+    texture_size: (u32, u32),
     /// What this endpoint's texture is rasterized at relative to `width`/`height`.
     ///
     /// Resolved on the API thread, where the backing resource is reachable, so
@@ -8483,10 +8482,18 @@ fn resolve_stretch_surface(
             tex.inner().mip_width(lvl_idx),
             tex.inner().mip_height(lvl_idx),
         );
+        let texture_size = TargetExtent::mip_level(
+            tex.inner().render_scale(),
+            (width, height),
+            tex.inner().render_extent(),
+            level,
+        )
+        .texture();
         return Some(StretchSurfaceInfo {
             kind: StretchKind::Texture(info),
             width,
             height,
+            texture_size,
             // The texture's own scale, not one re-derived from the device: it
             // is what its Metal levels were created at, it holds for every
             // level rather than only the one that matches the back buffer, and
@@ -8513,6 +8520,11 @@ fn resolve_stretch_surface(
             kind: StretchKind::Backbuffer(color),
             width: s.standalone_width(),
             height: s.standalone_height(),
+            texture_size: TargetExtent::whole(
+                s.render_scale(),
+                (s.standalone_width(), s.standalone_height()),
+            )
+            .texture(),
             // The surface's own scale, fixed when it was created: it is what
             // its Metal texture was allocated at, and it does not move when
             // the back buffer is resized under it.
@@ -8537,6 +8549,11 @@ fn resolve_stretch_surface(
             kind: StretchKind::DepthStencil(depth),
             width: s.standalone_width(),
             height: s.standalone_height(),
+            texture_size: TargetExtent::whole(
+                s.render_scale(),
+                (s.standalone_width(), s.standalone_height()),
+            )
+            .texture(),
             // See the colour branch above: the surface answers with what its
             // own depth texture was created at.
             scale: s.render_scale(),
@@ -8628,6 +8645,7 @@ fn color_fill_render_target(
         // its `MTLTexture` on the encoder thread.
         texture: MetalHandle::NULL,
         logical_size: (info.width, info.height),
+        texture_size: info.texture_size,
         format,
         scale: info.scale,
         subresource: (info.slice.unwrap_or(0), info.mip_level),

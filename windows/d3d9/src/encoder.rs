@@ -41,7 +41,7 @@ use mtld3d_core::{
     },
     pipeline_state::{self, PipelineBuildInputs, PipelineKey, PipelineSnapshot},
     present::LayerPacing,
-    render_scale::RenderScale,
+    render_scale::{RenderScale, TargetExtent},
     sampler_state,
     scratch::ScratchArena,
     shader_cache::{self, CachedKind, PipelineRecipe, ShaderRecordRef},
@@ -265,7 +265,8 @@ impl Op {
 /// Render target 0 as the encoder binds it.
 ///
 /// A parameter bag rather than eight positional arguments. `logical_size` is
-/// the extent D3D9 reports and `scale` what it is rasterized at; `msaa_texture`
+/// the extent D3D9 reports, `size` the one Metal allocated for the bound
+/// subresource, and `scale` what it is rasterized at; `msaa_texture`
 /// is the multisampled companion the pass attaches, NULL for a single-sampled
 /// target, and `sample_count` its count.
 pub struct ColorRtBinding {
@@ -275,6 +276,8 @@ pub struct ColorRtBinding {
     pub msaa_srgb_texture: MetalHandle<MTLTextureKind>,
     pub sample_count: u8,
     pub logical_size: (u32, u32),
+    /// Extent Metal allocated for the bound subresource.
+    pub size: (u32, u32),
     pub format: PixelFormat,
     pub has_alpha: bool,
     pub scale: RenderScale,
@@ -344,11 +347,15 @@ pub struct ResampledUpload {
 pub struct ColorFillTarget {
     /// Destination `MTLTexture`.
     pub texture: MetalHandle<MTLTextureKind>,
-    /// Mip extent as D3D9 reports it; `scale` converts it to the texture's own.
+    /// Mip extent as D3D9 reports it.
     pub logical_size: (u32, u32),
+    /// Extent Metal allocated for the destination subresource.
+    pub texture_size: (u32, u32),
     /// Metal format of the destination as it was created on this device.
     pub format: PixelFormat,
     /// What the destination is rasterized at relative to `logical_size`.
+    ///
+    /// The fill rect converts from `logical_size` to `texture_size` through it.
     pub scale: RenderScale,
     /// `(array slice, mip level)` of the destination subresource.
     pub subresource: (u32, u32),
@@ -3553,13 +3560,10 @@ impl FrameEncoder {
 
     /// Bind render target 0, with its subresource, alpha bit and multisample companion.
     pub fn set_color_render_target(&mut self, binding: &ColorRtBinding) {
-        let (width, height) = binding.logical_size;
         self.pass_state.set_color_render_target_subresource(
             binding.texture,
-            width,
-            height,
+            &TargetExtent::new(binding.scale, binding.logical_size, binding.size),
             binding.format,
-            binding.scale,
             binding.subresource,
         );
         // Kept in lockstep with the format: the Metal pixel format alone can't
@@ -3723,10 +3727,8 @@ impl FrameEncoder {
             };
             self.pass_state.set_color_render_target_subresource(
                 target.texture,
-                target.logical_size.0,
-                target.logical_size.1,
+                &TargetExtent::new(target.scale, target.logical_size, target.size),
                 target.format,
-                target.scale,
                 (target.subresource & 0xffff, target.subresource >> 16),
             );
             self.pass_state.set_color_rt_has_alpha(target.has_alpha);
@@ -3966,12 +3968,12 @@ impl FrameEncoder {
         // `rects` are the game's own; the viewport they clip against is already
         // the bound texture's, so convert before clipping rather than after, or
         // the intersection is taken between two different spaces.
-        let scale = self.pass_state.target_scale();
-        if scale.is_identity() {
+        let extent = self.pass_state.target_extent();
+        if extent.scale().is_identity() {
             self.clear_color_rects_resolved(r, g, b, a, srgb_write, rects);
         } else {
             let scaled: Vec<(i32, i32, i32, i32)> =
-                rects.iter().map(|&rc| scale.rect_edges_i32(rc)).collect();
+                rects.iter().map(|&rc| extent.rect_edges_i32(rc)).collect();
             self.clear_color_rects_resolved(r, g, b, a, srgb_write, &scaled);
         }
         // A target outside the pass clips the rects against its own viewport
@@ -4039,12 +4041,12 @@ impl FrameEncoder {
         stencil: Option<u32>,
         rects: &[(i32, i32, i32, i32)],
     ) {
-        let scale = self.pass_state.target_scale();
-        if scale.is_identity() {
+        let extent = self.pass_state.target_extent();
+        if extent.scale().is_identity() {
             self.clear_depth_stencil_rects_resolved(depth, stencil, rects);
         } else {
             let scaled: Vec<(i32, i32, i32, i32)> =
-                rects.iter().map(|&rc| scale.rect_edges_i32(rc)).collect();
+                rects.iter().map(|&rc| extent.rect_edges_i32(rc)).collect();
             self.clear_depth_stencil_rects_resolved(depth, stencil, &scaled);
         }
     }
@@ -4699,10 +4701,8 @@ impl FrameEncoder {
         // identity rather than converting a second time.
         self.pass_state.set_color_render_target_subresource(
             dst_tex,
-            dst_dims.0,
-            dst_dims.1,
+            &TargetExtent::new(RenderScale::IDENTITY, dst_dims, dst_dims),
             dst_format,
-            RenderScale::IDENTITY,
             (dst_slice.unwrap_or(0), dst_mip),
         );
         // A multisampled destination is written through its companion and
@@ -4839,10 +4839,8 @@ impl FrameEncoder {
         // attachment into the load action and scissors a quad to it otherwise.
         self.pass_state.set_color_render_target_subresource(
             fill.texture,
-            fill.logical_size.0,
-            fill.logical_size.1,
+            &TargetExtent::new(fill.scale, fill.logical_size, fill.texture_size),
             fill.format,
-            fill.scale,
             fill.subresource,
         );
         // A multisampled destination is filled through its companion and

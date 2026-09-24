@@ -99,20 +99,28 @@ impl RenderScale {
         self.factor().log2()
     }
 
-    /// Convert one logical dimension to its render-resolution counterpart.
+    /// Convert one logical dimension, or one rect edge, to render resolution.
+    ///
+    /// Rounds to nearest. This is the one rule every conversion here goes
+    /// through: a texture is created at `dimension` of its logical extent and
+    /// [`Self::rect`] scales each rect edge with it, so a rect that ends at the
+    /// logical extent ends exactly at the texture's, and a shared edge maps to
+    /// one value from both rects that meet on it.
     ///
     /// Never returns zero for a non-zero input: a back buffer dimension of `0`
     /// is rejected long before this, but a small render target scaled down
-    /// hard could otherwise round to nothing and fail texture creation.
+    /// hard could otherwise round to nothing and fail texture creation. With the
+    /// floor the mapping is still non-decreasing, so a converted rect never
+    /// inverts.
     #[must_use]
     pub fn dimension(self, logical: u32) -> u32 {
         if self.is_identity() || logical == 0 {
             return logical;
         }
-        let scaled = (u64::from(logical) * u64::from(self.0)).div_ceil(100);
-        // `logical` is a texture dimension and the scale is at most 100%, so
-        // the product cannot approach `u32::MAX`; saturate rather than cast so
-        // the conversion stays total either way.
+        let scaled = (u64::from(logical) * u64::from(self.0) + 50) / 100;
+        // `logical` is a texture dimension or a rect edge and the scale is at
+        // most 100%, so the product cannot approach `u32::MAX`; saturate
+        // rather than cast so the conversion stays total either way.
         u32::try_from(scaled).unwrap_or(u32::MAX).max(1)
     }
 
@@ -127,8 +135,8 @@ impl RenderScale {
         if self.is_identity() {
             return (x, y, width, height);
         }
-        let (x1, x2) = (self.edge(x), self.edge(x.saturating_add(width)));
-        let (y1, y2) = (self.edge(y), self.edge(y.saturating_add(height)));
+        let (x1, x2) = (self.dimension(x), self.dimension(x.saturating_add(width)));
+        let (y1, y2) = (self.dimension(y), self.dimension(y.saturating_add(height)));
         (x1, y1, x2 - x1, y2 - y1)
     }
 
@@ -148,25 +156,141 @@ impl RenderScale {
             return r;
         }
         let e = |v: i32| {
-            let scaled = self.edge(v.max(0).cast_unsigned());
+            let scaled = self.dimension(v.max(0).cast_unsigned());
             i32::try_from(scaled).unwrap_or(i32::MAX)
         };
         (e(r.0), e(r.1), e(r.2), e(r.3))
     }
+}
 
-    /// Scale a single rect edge, rounding to nearest.
+/// A bound render target's extent in both spaces, and the conversion into it.
+///
+/// `logical` is the size D3D9 reports for the bound surface or mip level, the
+/// space every rect the game supplies lives in. `texture` is the extent Metal
+/// allocated for it. For a surface and for level 0 that is `dimension` of
+/// `logical`, but a deeper level of a scaled texture is Metal's own halving of
+/// the scaled base, which can differ from `dimension` of the level's logical
+/// size by a texel. The rect conversions here scale through `dimension` and
+/// then pin the far edge: an edge at the logical extent lands exactly on the
+/// texture's, an edge inside it never passes it, and an edge beyond it never
+/// falls short. So a full-target rect covers the attachment at every level,
+/// and adjacent rects still share an edge.
+pub struct TargetExtent {
+    scale: RenderScale,
+    logical: (u32, u32),
+    texture: (u32, u32),
+}
+
+impl TargetExtent {
+    /// An extent whose texture Metal allocated at `texture` for the reported `logical`.
     ///
-    /// Rounding to nearest (rather than the `dimension` ceiling) is what makes
-    /// adjacent rects tile: a shared edge maps to one value from both sides.
-    fn edge(self, v: u32) -> u32 {
-        let scaled = (u64::from(v) * u64::from(self.0) + 50) / 100;
-        u32::try_from(scaled).unwrap_or(u32::MAX)
+    /// At the identity scale `texture` is `logical`: nothing converts.
+    #[must_use]
+    pub const fn new(scale: RenderScale, logical: (u32, u32), texture: (u32, u32)) -> Self {
+        Self {
+            scale,
+            logical,
+            texture,
+        }
+    }
+
+    /// A surface, or level 0 of a texture: the texture is `dimension` of `logical`.
+    #[must_use]
+    pub fn whole(scale: RenderScale, logical: (u32, u32)) -> Self {
+        let texture = (scale.dimension(logical.0), scale.dimension(logical.1));
+        Self::new(scale, logical, texture)
+    }
+
+    /// Mip `level` of a texture Metal created at `base_texture`, reported as `logical`.
+    ///
+    /// Metal sizes every level from the base, `max(1, base >> level)` per axis,
+    /// so that is the extent a pass attaching the level measures against.
+    #[must_use]
+    pub fn mip_level(
+        scale: RenderScale,
+        logical: (u32, u32),
+        base_texture: (u32, u32),
+        level: u32,
+    ) -> Self {
+        let halve = |base: u32| base.checked_shr(level).unwrap_or(0).max(1);
+        Self::new(
+            scale,
+            logical,
+            (halve(base_texture.0), halve(base_texture.1)),
+        )
+    }
+
+    #[must_use]
+    pub const fn scale(&self) -> RenderScale {
+        self.scale
+    }
+
+    #[must_use]
+    pub const fn logical(&self) -> (u32, u32) {
+        self.logical
+    }
+
+    #[must_use]
+    pub const fn texture(&self) -> (u32, u32) {
+        self.texture
+    }
+
+    /// Convert a logical `(x, y, width, height)` rect into the texture's space.
+    ///
+    /// [`RenderScale::rect`] with the far edge pinned to the texture's extent.
+    #[must_use]
+    pub fn rect(&self, x: u32, y: u32, width: u32, height: u32) -> (u32, u32, u32, u32) {
+        if self.scale.is_identity() {
+            return (x, y, width, height);
+        }
+        let (x1, x2) = (self.edge_x(x), self.edge_x(x.saturating_add(width)));
+        let (y1, y2) = (self.edge_y(y), self.edge_y(y.saturating_add(height)));
+        (x1, y1, x2 - x1, y2 - y1)
+    }
+
+    /// Convert a logical half-open `(x1, y1, x2, y2)` rect into the texture's space.
+    ///
+    /// [`RenderScale::rect_edges_i32`] with the far edge pinned the way
+    /// [`Self::rect`] pins it; a negative edge clamps to zero first.
+    #[must_use]
+    pub fn rect_edges_i32(&self, r: (i32, i32, i32, i32)) -> (i32, i32, i32, i32) {
+        if self.scale.is_identity() {
+            return r;
+        }
+        let signed = |v: u32| i32::try_from(v).unwrap_or(i32::MAX);
+        let unsigned = |v: i32| v.max(0).cast_unsigned();
+        (
+            signed(self.edge_x(unsigned(r.0))),
+            signed(self.edge_y(unsigned(r.1))),
+            signed(self.edge_x(unsigned(r.2))),
+            signed(self.edge_y(unsigned(r.3))),
+        )
+    }
+
+    fn edge_x(&self, v: u32) -> u32 {
+        pinned_edge(self.scale.dimension(v), v, self.logical.0, self.texture.0)
+    }
+
+    fn edge_y(&self, v: u32) -> u32 {
+        pinned_edge(self.scale.dimension(v), v, self.logical.1, self.texture.1)
     }
 }
 
 impl Default for RenderScale {
     fn default() -> Self {
         Self::IDENTITY
+    }
+}
+
+/// Pin a scaled edge `scaled` of logical edge `v` against an axis's two extents.
+///
+/// The edge at `logical` is `texture`; an edge short of it stays within the
+/// texture and one past it stays beyond, which keeps the mapping monotonic.
+fn pinned_edge(scaled: u32, v: u32, logical: u32, texture: u32) -> u32 {
+    match v.cmp(&logical) {
+        core::cmp::Ordering::Less => scaled.min(texture),
+        core::cmp::Ordering::Equal => texture,
+        core::cmp::Ordering::Greater => scaled.max(texture),
     }
 }
 
