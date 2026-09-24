@@ -3108,9 +3108,21 @@ impl PassState {
 
     /// Ensure a pass is live for the next command.
     ///
-    /// Opens a new `Pass` if the previous one was closed (or if this is the
-    /// first command of the frame), consuming any pending clears and emitting
-    /// the current viewport as the first command of the new pass.
+    /// Runs before every emitted command, and a pass is already open for
+    /// nearly all of them, so that test stays inline at the caller and
+    /// opening a pass is the out-of-line `open_pass`.
+    #[inline]
+    pub fn ensure_pass_open(&mut self) {
+        if self.current_pass_closed || self.passes.is_empty() {
+            self.open_pass();
+        }
+    }
+
+    /// Open a new `Pass` for the next command.
+    ///
+    /// Called when the previous one was closed (or for the first command of
+    /// the frame); consumes any pending clears and emits the current viewport
+    /// as the first command of the new pass.
     ///
     /// Rule A — first-use `DontCare`: when an attachment has not been
     /// seen yet this frame AND there is no pending clear AND no queued
@@ -3121,10 +3133,8 @@ impl PassState {
     /// start of a frame, and only under the discard swap effect; any other
     /// colour target still holds what the previous frame left in it, so it
     /// loads.
-    pub fn ensure_pass_open(&mut self) {
-        if !self.current_pass_closed && !self.passes.is_empty() {
-            return;
-        }
+    #[cold]
+    fn open_pass(&mut self) {
         let (vpx, vpy, vpw, vph) = self.effective_viewport();
         let leading_blits = core::mem::take(&mut self.pending_leading_blits);
 
