@@ -284,6 +284,61 @@ fn additive_blend_accumulates() {
 }
 
 #[test]
+fn blend_factor_restored_to_the_default_mid_pass_takes_effect() {
+    // `D3DRS_BLENDFACTOR` is per-encoder state, so a second draw in the
+    // same pass that sets it back to opaque white must blend at full
+    // weight rather than keep the first draw's factor. Red at half weight
+    // over black fills the frame, then green at full weight covers the
+    // right half: a right half that stays mixed with red is the stale
+    // factor.
+    let h = Harness::new();
+    arm_diffuse(&h);
+    let mut right_half = fill_quad(GREEN);
+    for v in &mut right_half {
+        v.x = v.x.max(0.0);
+    }
+    h.render_once(BLACK, |d| {
+        assert_eq!(d.set_render_state(D3DRS_ALPHABLENDENABLE, 1), 0);
+        assert_eq!(
+            d.set_render_state(D3DRS_SRCBLEND, mtld3d_types::D3DBLEND_BLENDFACTOR),
+            0
+        );
+        assert_eq!(
+            d.set_render_state(D3DRS_DESTBLEND, mtld3d_types::D3DBLEND_INVBLENDFACTOR),
+            0
+        );
+        assert_eq!(
+            d.set_render_state(mtld3d_types::D3DRS_BLENDFACTOR, 0x8080_8080),
+            0
+        );
+        assert_eq!(
+            d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &fill_quad(RED)),
+            0,
+            "half-weight draw"
+        );
+        assert_eq!(
+            d.set_render_state(mtld3d_types::D3DRS_BLENDFACTOR, WHITE),
+            0
+        );
+        assert_eq!(
+            d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &right_half),
+            0,
+            "full-weight draw"
+        );
+    });
+    let left = Rgba8::from_pixel(h.read_pixel(160, 240));
+    assert!(
+        (110..=145).contains(&left.r) && left.g < 20,
+        "left half is red at half weight, got {left:?}"
+    );
+    let right = Rgba8::from_pixel(h.read_pixel(480, 240));
+    assert!(
+        right.r < 20 && right.g > 240,
+        "right half is green at full weight, got {right:?}"
+    );
+}
+
+#[test]
 fn colorwrite_mask_drops_red() {
     let h = Harness::new();
     arm_diffuse(&h);

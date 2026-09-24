@@ -101,7 +101,8 @@ divergences from D3D9 it keeps on purpose. The tested games are in the
 
 ## Not implemented yet
 
-Each fails cleanly, with an absent cap bit or a documented error return.
+Each fails cleanly, with an absent cap bit or a documented error return,
+unless its entry says otherwise.
 
 - Point polygon fill: Metal has no point-fill mode, so the state is warned
   once and drawn solid.
@@ -145,6 +146,15 @@ Each fails cleanly, with an absent cap bit or a documented error return.
   it: both World of Warcraft targets create a plain device, and nothing else
   in the tested set asks for 9Ex. Issue #789 is the record of the decision
   and of what an implementation would cover.
+- A draw that samples the colour render target it is drawing into (a
+  feedback loop) has no hazard handling, and nothing detects the bind, so
+  this one does not fail cleanly. Metal leaves the result undefined, and an
+  Apple GPU returns the target's contents from before the pass began rather
+  than the pixels the pass has written. Depth has this handled: a draw that
+  samples the bound depth attachment reads a snapshot copy
+  (`depth_snapshot_for_sampling` in `windows/d3d9/src/encoder.rs`). Colour
+  has no equivalent. DXVK detects the bind and resolves it; it is not built
+  here because no known title needs it.
 
 ## Deliberately not implemented
 
@@ -172,7 +182,13 @@ is in [`CONFORMANCE.md`](../unix/conformance/CONFORMANCE.md#kept-divergences).
   instead of waiting for the GPU. `query.flushImmediate`, off by default.
 - EVENT query polls queue the open frame even without `D3DGETDATA_FLUSH`,
   so a caller polling before Present can make progress. No knob.
-- Depth stores are elided where nothing reads the buffer back. No knob.
+- Depth and stencil are discarded at every `Present` on a surface nothing
+  samples. D3D9 keeps them unless the game sets
+  `D3DPRESENTFLAG_DISCARD_DEPTHSTENCIL` or creates the surface with
+  `Discard = TRUE`, and neither is consulted. Keeping them costs a store and
+  a load of the depth surface every frame on a tile-based GPU. A game that
+  tests against an earlier frame's depth or stencil without clearing reads
+  undefined values. No knob.
 - A partial `Lock` of a dynamic vertex or index buffer without
   `D3DLOCK_DISCARD` returns a pointer a queued draw may still read. No knob.
 - A partial `LockRect` of a texture level without `D3DLOCK_NOOVERWRITE` or

@@ -3,13 +3,14 @@
 //! Each covered struct pins `size_of` against a field-by-field tally in a comment, and `align_of`
 //! against 8 (`ExtraColorDesc` gets only the size check); the other param structs are not covered.
 //! No test reads `offset_of`, so swapping two same-width fields still passes here; the parent
-//! module asserts field offsets at compile time only for `CreateDepthStencilStateParams`. One
-//! test also pins `PassDescriptor::pack_flags`, where an ordinary pass encodes as zero.
+//! module asserts field offsets at compile time only for `CreateDepthStencilStateParams`. Two
+//! tests also pin `PassDescriptor::pack_flags`, where an ordinary pass encodes as zero and every
+//! volume depth plane round-trips.
 
 use super::{
     BufferCreateDesc, CreateBuffersBatchParams, CreateTexturesBatchParams,
-    DestroyResourcesBulkParams, ExtraColorDesc, PassDescriptor, SubmitFrameParams,
-    TextureCreateDesc,
+    DestroyResourcesBulkParams, ExtraColorDesc, LoadAction, MetalHandle, PassDescriptor,
+    StoreAction, SubmitFrameParams, TextureCreateDesc,
 };
 
 #[test]
@@ -176,9 +177,54 @@ fn pass_descriptor_flags_preserve_ordinary_pass_bytes() {
     assert_eq!(PassDescriptor::pack_flags(true, 0, 0, 0), 1);
     assert_eq!(
         PassDescriptor::pack_flags(true, 5, 9, 3),
-        1 | (5 << 1) | (9 << 4) | (3 << 8)
+        1 | (5 << 1) | (9 << 12) | (3 << 16)
     );
     assert_eq!(core::mem::size_of::<PassDescriptor>(), 200);
+}
+
+/// A blit-only descriptor carrying `pass_flags`, for reading the flags back.
+fn pass_with_flags(pass_flags: u32) -> PassDescriptor {
+    PassDescriptor {
+        color_texture: MetalHandle::NULL,
+        color_resolve_texture: MetalHandle::NULL,
+        depth_texture: MetalHandle::NULL,
+        commands_ptr: 0,
+        visibility_result_buffer: MetalHandle::NULL,
+        leading_blits_ptr: 0,
+        color_load_action: LoadAction::DontCare,
+        color_store_action: StoreAction::DontCare,
+        clear_r: 0,
+        clear_g: 0,
+        clear_b: 0,
+        clear_a: 0,
+        depth_load_action: LoadAction::DontCare,
+        depth_store_action: StoreAction::DontCare,
+        depth_clear_value: 0,
+        stencil_load_action: LoadAction::DontCare,
+        stencil_clear_value: 0,
+        command_count: 0,
+        leading_blits_count: 0,
+        pass_flags,
+        extra_color: [ExtraColorDesc::NONE; 3],
+    }
+}
+
+#[test]
+fn pass_descriptor_flags_round_trip_every_volume_depth_plane() {
+    // An upload pass writes one volume depth plane per pass, up to
+    // `MaxVolumeExtent` (2048) planes deep.
+    assert_eq!(PassDescriptor::MAX_COLOR_SLICE, 2047);
+    for slice in [0, 7, 8, 9, 15, 255, 256, 2047] {
+        let pass = pass_with_flags(PassDescriptor::pack_flags(true, slice, 15, 15));
+        assert_eq!(pass.color_slice(), slice);
+        assert_eq!(pass.color_level(), 15);
+        assert_eq!(pass.depth_level(), 15);
+        assert!(pass.leading_blits_need_encoder());
+        let pass = pass_with_flags(PassDescriptor::pack_flags(false, slice, 0, 0));
+        assert_eq!(pass.color_slice(), slice);
+        assert_eq!((pass.color_level(), pass.depth_level()), (0, 0));
+        assert!(!pass.leading_blits_need_encoder());
+    }
 }
 
 #[test]

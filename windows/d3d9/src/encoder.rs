@@ -3689,7 +3689,7 @@ impl FrameEncoder {
                 target.logical_size.1,
                 target.format,
                 target.scale,
-                (target.subresource & 0xff, target.subresource >> 8),
+                (target.subresource & 0xffff, target.subresource >> 16),
             );
             self.pass_state.set_color_rt_has_alpha(target.has_alpha);
             self.pass_state.set_color_msaa(
@@ -7955,6 +7955,20 @@ impl FrameEncoder {
         if backing_length == 0 || job.bytes_per_pixel != decode.bytes_per_texel() {
             return false;
         }
+        // One pass per depth plane, and `pass_flags` carries the plane: a
+        // deeper volume would wrap onto the planes below it.
+        if job.depth > PassDescriptor::MAX_COLOR_SLICE + 1 {
+            mtld3d_shared::log_once_warn_by!(
+                target: LOG_TARGET,
+                key: job.info.texture_id.raw(),
+                "run_texture_upload_pass: volume {:#x} is {} planes deep, past the {} an upload \
+                 pass can address; declining the upload",
+                job.info.texture_id.raw(),
+                job.depth,
+                PassDescriptor::MAX_COLOR_SLICE + 1,
+            );
+            return false;
+        }
         let pipeline = self.get_or_create_upload_pipeline(job.info.pixel_format);
         if pipeline == 0 {
             return false;
@@ -10150,10 +10164,10 @@ fn finalize_submit(enc: &mut FrameEncoder, frame: &FrameData) -> (SubmitFramePar
     // against the continuation frame's allocator at the next `begin_frame`.
     enc.visibility.split_open_spans(frame.submit_seq);
 
-    // A readback flush is not a frame end: the frame continues and any colour
-    // or depth target may still be read back or drawn into, so the last-use
-    // rules (D colour, B depth/stencil) are suppressed. Remember it so the
-    // next `begin_frame` keeps the seen-rt sets for the continuation's Rule A.
+    // A readback flush is not a frame end: the frame continues and its depth
+    // surface may still be tested against, so Rule B (last-use depth/stencil
+    // `DontCare`) is suppressed. Remember it so the next `begin_frame` keeps
+    // the seen-rt sets for the continuation's Rule A.
     let no_present = frame.flags.contains(FrameDataFlags::NO_PRESENT);
     enc.prev_submit_no_present = no_present;
     let mut upload_pass_count = enc.pass_state.upload_pass_count();

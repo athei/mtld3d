@@ -6403,6 +6403,29 @@ fn mixed_command_frame(s: &mut PassState) {
 }
 
 #[test]
+fn upload_passes_keep_every_volume_depth_plane_and_level() {
+    let mut s = fresh();
+    let planes = [0, 7, 8, 255, 256, 2047];
+    for plane in planes {
+        s.push_upload_pass(
+            &UploadPassTarget {
+                texture: tex(0x5000),
+                subresource: (plane, 1),
+                size: (2, 2),
+                format: BB_FORMAT,
+                rect: (0, 0, 2, 2),
+            },
+            &[dummy_draw()],
+            Vec::new(),
+        );
+    }
+    assert_eq!(s.upload_pass_count(), planes.len());
+    for (pass, plane) in s.passes().iter().zip(planes) {
+        assert_eq!((pass.color_slice(), pass.color_level()), (plane, 1));
+    }
+}
+
+#[test]
 fn command_pool_converges_with_head_uploads_and_depth_clear_passes() {
     let mut s = fresh();
     // Uploads move to the front after borrowing vectors in recording order,

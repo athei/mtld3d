@@ -55,9 +55,11 @@ struct ClearMerge {
 /// buffer's contents are defined after `Present`, and every other colour
 /// target keeps its contents across `Present` in D3D9; a game may draw over
 /// last frame's pixels without clearing, so their first use loads. The depth
-/// plane takes the same first-use `DontCare`. Flip to `false` for a
-/// single-line hotfix if a game surfaces that reads prior-frame depth on first
-/// use of frame N.
+/// plane takes the same first-use `DontCare`, which together with Rule B drops
+/// depth across `Present` as a kept divergence (see
+/// [`ENABLE_LAST_USE_DEPTH_DONTCARE`]). Flip to `false` for a single-line
+/// hotfix if a game surfaces that reads prior-frame depth on first use of
+/// frame N.
 const ENABLE_FIRST_USE_DONTCARE: bool = true;
 
 /// Compile-time gate for Rule A on the stencil plane (first-use `DontCare`).
@@ -65,18 +67,30 @@ const ENABLE_FIRST_USE_DONTCARE: bool = true;
 /// The stencil plane shares the depth texture, so its first use in a frame
 /// takes the same `DontCare` the depth plane takes, under the same
 /// predicate. Stencil written in frame N and tested in frame N+1 without a
-/// clear in between was already undefined before this rule: the stencil
-/// store mirrors the depth store, so whenever Rule B discards depth at frame
-/// end the stencil content goes with it. Flip to `false` if a game surfaces
+/// clear in between was already lost before this rule: the stencil store
+/// mirrors the depth store, so whenever Rule B discards depth at frame end
+/// the stencil content goes with it. Flip to `false` if a game surfaces
 /// that carries stencil across `Present` and a frame-start `Load` turns out
 /// to matter.
 const ENABLE_FIRST_USE_STENCIL_DONTCARE: bool = true;
 
 /// Compile-time gate for Rule B (last-use depth/stencil `DontCare`).
 ///
-/// Flip to `false` if a game using `INTZ`-style late-frame depth-readback
-/// surfaces. D3D9 spec already says depth contents are undefined across
-/// `Present`, so this is conformant for any game that respects the spec.
+/// Together with Rule A's first-use `DontCare` on the depth and stencil
+/// planes, this discards the depth and stencil contents of every surface
+/// nothing samples at each `Present`. D3D9 leaves those contents undefined
+/// after `Present` only when the game asks for it:
+/// `D3DPRESENTFLAG_DISCARD_DEPTHSTENCIL` on the implicit surface, or
+/// `Discard = TRUE` passed to `CreateDepthStencilSurface`. Neither is
+/// consulted. The discard is a kept divergence for the store and load
+/// bandwidth it saves on a tile-based GPU; a game that tests against depth
+/// or stencil left from an earlier frame without clearing it reads undefined
+/// values. Depth that is sampleable or has been bound as a texture keeps
+/// `Store`. The rationale and the sites it costs are in the Kept divergences
+/// section of `unix/conformance/CONFORMANCE.md`. Flipping this alone does not
+/// carry depth across `Present`: [`ENABLE_FIRST_USE_DONTCARE`] and
+/// [`ENABLE_FIRST_USE_STENCIL_DONTCARE`] discard it again on the next frame's
+/// first use.
 const ENABLE_LAST_USE_DEPTH_DONTCARE: bool = true;
 
 /// Compile-time gate for Rule C (color `Store=DontCare`).
@@ -228,7 +242,8 @@ pub enum StencilLoad {
 ///
 /// `Store` writes tile memory back to device memory; `DontCare`
 /// discards it. Used on the last pass with a given depth attachment
-/// in a frame (depth never crosses Present, Rule B) and on color
+/// in a frame (Rule B, a kept divergence: see
+/// `ENABLE_LAST_USE_DEPTH_DONTCARE`) and on color
 /// attachments whose next consumer this frame begins with a full-
 /// attachment `Clear` (Rule C).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -327,7 +342,7 @@ pub struct ExtraColorSlot {
     /// the pass, the same way a differently-sized one does not: Metal takes a
     /// pass's sample count from its attachments and rejects a disagreement.
     pub sample_count: u8,
-    /// `slice | (level << 8)`, as on [`Pass`].
+    /// `slice | (level << 16)`, as on [`Pass`].
     pub subresource: u32,
     pub size: (u32, u32),
     pub logical_size: (u32, u32),
@@ -460,11 +475,11 @@ impl PassColorAttachment {
     }
     #[must_use]
     pub const fn slice(&self) -> u32 {
-        self.subresource & 0xff
+        self.subresource & 0xffff
     }
     #[must_use]
     pub const fn level(&self) -> u32 {
-        self.subresource >> 8
+        self.subresource >> 16
     }
     #[must_use]
     pub const fn format(&self) -> PixelFormat {
@@ -546,7 +561,7 @@ impl SavedColorAttachments {
                 msaa_texture: self.msaa_texture,
                 msaa_srgb_texture: self.msaa_srgb_texture,
                 sample_count: self.sample_count,
-                subresource: self.slice | (self.level << 8),
+                subresource: self.slice | (self.level << 16),
                 size: (
                     self.scale.dimension(self.logical_size.0),
                     self.scale.dimension(self.logical_size.1),
@@ -638,10 +653,12 @@ pub struct Pass {
     /// Defaults to `Store`.
     ///
     /// Flipped to `DontCare` by `finalize_store_actions` on the *last*
-    /// pass with each depth texture in the frame — depth/stencil contents
-    /// are undefined across `Present` per D3D9 spec, so the final flush
-    /// back to device memory is wasted. The unix side mirrors this to the
-    /// stencil attachment when the texture is `Depth32Float_Stencil8`.
+    /// pass with each depth texture in the frame (Rule B), unless the texture
+    /// is sampleable or sampled. D3D9 keeps depth and stencil across
+    /// `Present` unless the game asked to discard them; dropping them anyway
+    /// is a kept divergence, see [`ENABLE_LAST_USE_DEPTH_DONTCARE`]. The unix
+    /// side mirrors this to the stencil attachment when the texture is
+    /// `Depth32Float_Stencil8`.
     depth_store: StoreAction,
     viewport: (u32, u32, u32, u32),
     commands: Vec<Command>,
@@ -818,11 +835,11 @@ impl Pass {
     }
     #[must_use]
     pub const fn color_slice(&self) -> u32 {
-        self.color_subresource & 0xff
+        self.color_subresource & 0xffff
     }
     #[must_use]
     pub const fn color_level(&self) -> u32 {
-        self.color_subresource >> 8
+        self.color_subresource >> 16
     }
     #[must_use]
     pub const fn color_size(&self) -> (u32, u32) {
@@ -1512,7 +1529,7 @@ impl PassState {
     /// blit-written sets are kept across the boundary so Rule A loads those
     /// attachments on their first use in the continuation instead of
     /// discarding them with `DontCare` (the store side is handled by
-    /// `finalize_store_actions` skipping Rules B and D on the flush).
+    /// `finalize_store_actions` skipping Rule B on the flush).
     pub fn reset_frame(&mut self, reset: &FrameReset) {
         let &FrameReset {
             backbuffer,
@@ -1649,7 +1666,7 @@ impl PassState {
         &self.passes
     }
 
-    /// Take the frame's finished passes, leaving an empty (capacity-retained) vec behind.
+    /// Take the frame's finished passes, leaving an empty, unallocated vec behind.
     ///
     /// The caller owns the passes for the duration of the submit stage — the
     /// unix side reads each pass's `commands` via raw pointer — then returns
@@ -1657,7 +1674,9 @@ impl PassState {
     /// pool. This is the seam that lets the finished passes outlive this
     /// `PassState` while the next frame starts building; the synchronous
     /// recycling `reset_frame` does inline still covers the path where passes
-    /// were never taken out (it then sees an empty vec).
+    /// were never taken out (it then sees an empty vec). `mem::take` hands the
+    /// allocation to the caller, so the next frame's pass list grows again
+    /// from zero capacity.
     pub fn take_finished_passes(&mut self) -> Vec<Pass> {
         core::mem::take(&mut self.passes)
     }
@@ -1777,9 +1796,9 @@ impl PassState {
     /// value back for the next texture once this one is gone. Every set and
     /// map here is keyed on that address, and an entry that outlives the
     /// texture makes the load/store rules answer for the wrong resource:
-    /// Rules A, C and D would keep `Load`/`Store` on an attachment nothing
-    /// samples, Rule B would refuse a first-use `DontCare` on a fresh depth
-    /// surface, and rename-at-overlap would copy a texture no draw has read.
+    /// Rule A would load a fresh surface it could discard, Rules B and C would
+    /// keep `Store` on an attachment nothing samples, and rename-at-overlap
+    /// would copy a texture no draw has read.
     ///
     /// Covers `seen_color_rts` and `seen_depth_rts` with their segment twins,
     /// `blit_written_rts`, `seen_sampled_textures`, `frame_sampled_textures`,
@@ -2024,8 +2043,8 @@ impl PassState {
             msaa_texture: self.current_color_msaa_texture,
             msaa_srgb_texture: self.current_color_msaa_srgb_texture,
             sample_count: self.current_color_sample_count,
-            slice: self.current_color_subresource & 0xff,
-            level: self.current_color_subresource >> 8,
+            slice: self.current_color_subresource & 0xffff,
+            level: self.current_color_subresource >> 16,
             logical_size: self.current_color_logical_size,
             format: self.current_color_format,
             scale: self.current_color_scale,
@@ -2959,7 +2978,7 @@ impl PassState {
             ColorLoad::Load
         };
         let (slice, level) = target.subresource;
-        let subresource = slice | (level << 8);
+        let subresource = slice | (level << 16);
         let mut cmds = self
             .command_vec_pool
             .pop()
@@ -3240,7 +3259,7 @@ impl PassState {
         self.warn_if_scale_wasted(width, height, scale);
         let (width, height) = (scale.dimension(width), scale.dimension(height));
         let (slice, level) = subresource;
-        let packed_subresource = slice | (level << 8);
+        let packed_subresource = slice | (level << 16);
         // A pass freezes the attachment's format and extent when it opens, so
         // the binding is only unchanged when both still match: a same-handle
         // rebind that moves either one leaves the descriptor carrying one pair
@@ -4716,9 +4735,12 @@ impl PassState {
 
     /// Rule B — flip `depth_store` to `DontCare` on each depth attachment's *last* pass.
     ///
-    /// Scoped to this frame. D3D9 spec says depth/stencil contents are
-    /// undefined across `Present`, so the final flush back to device
-    /// memory is wasted bandwidth on TBDR.
+    /// Scoped to this frame. D3D9 keeps depth and stencil across `Present`
+    /// unless the game set `D3DPRESENTFLAG_DISCARD_DEPTHSTENCIL` or created
+    /// the surface with `Discard = TRUE`; this rule discards them regardless,
+    /// as a kept divergence that saves the final flush back to device memory
+    /// on TBDR (see `ENABLE_LAST_USE_DEPTH_DONTCARE`).
+    ///
     /// Also flips `color_store` to `DontCare` on a pass whose very
     /// next consumer of the same color rt this frame begins with a
     /// full-attachment `Clear` (Rule C) — the next pass's `Clear`
