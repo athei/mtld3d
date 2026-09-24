@@ -3073,16 +3073,161 @@ fn per_stage_constant_extent_follows_effective_operands() {
     );
     let msl = emit_ps_ff(&key, VariantKey::default());
     assert!(msl.contains("current = float4((ps_c[8]).rgb"));
-    // DISABLE and unknown alpha operations retain the emitter's arg1 fallback.
+    // An unknown alpha operation retains the emitter's arg1 fallback.
     key.stages = [stage_disable(); 8];
-    for alpha_op in [narrow(D3DTOP_DISABLE), 255] {
-        key.stages[0] = FfStage {
-            alpha_op,
-            alpha_arg1: narrow(D3DTA_CONSTANT),
-            ..active
-        };
-        assert_eq!(key.constant_rows(), 2);
+    key.stages[0] = FfStage {
+        alpha_op: 255,
+        alpha_arg1: narrow(D3DTA_CONSTANT),
+        ..active
+    };
+    assert_eq!(key.constant_rows(), 2);
+    // A disabled alpha operation under an enabled colour one reads no argument.
+    key.stages[0].alpha_op = narrow(D3DTOP_DISABLE);
+    assert_eq!(key.constant_rows(), 0);
+    assert!(!key.stages[0].reads_argument(D3DTA_CONSTANT));
+}
+
+/// Stage 1 enabled through its colour operation alone, alpha left at `D3DTOP_DISABLE`.
+fn modulate_stage_with_alpha_disabled(flags: FfStageFlags) -> FfStage {
+    FfStage {
+        color_op: narrow(D3DTOP_MODULATE),
+        color_arg1: narrow(D3DTA_TEXTURE),
+        color_arg2: narrow(D3DTA_CURRENT),
+        alpha_op: narrow(D3DTOP_DISABLE),
+        alpha_arg1: narrow(D3DTA_TEXTURE),
+        alpha_arg2: narrow(D3DTA_CURRENT),
+        flags,
     }
+}
+
+/// Stage 0 selecting the diffuse colour and alpha into CURRENT.
+fn diffuse_stage() -> FfStage {
+    FfStage {
+        color_op: narrow(D3DTOP_SELECTARG1),
+        color_arg1: narrow(D3DTA_DIFFUSE),
+        alpha_op: narrow(D3DTOP_SELECTARG1),
+        alpha_arg1: narrow(D3DTA_DIFFUSE),
+        ..FfStage::default()
+    }
+}
+
+#[test]
+fn disabled_alpha_under_enabled_color_keeps_the_incoming_alpha() {
+    let mut key = default_ps_key();
+    key.stages[0] = diffuse_stage();
+    key.stages[1] = modulate_stage_with_alpha_disabled(FfStageFlags::HAS_TEXTURE);
+    let msl = emit_ps_ff(&key, VariantKey::default());
+    let expected = "    current = float4(((t1 * current)).rgb, (current).a);";
+    assert!(msl.lines().any(|line| line == expected), "{msl}");
+    assert!(!msl.contains("(t1).a"), "{msl}");
+    // Keeping CURRENT's alpha is exactly SELECTARG1(CURRENT) on the alpha.
+    key.stages[1].alpha_op = narrow(D3DTOP_SELECTARG1);
+    key.stages[1].alpha_arg1 = narrow(D3DTA_CURRENT);
+    assert_eq!(msl, emit_ps_ff(&key, VariantKey::default()));
+}
+
+#[test]
+fn disabled_alpha_without_a_texture_keeps_the_incoming_alpha() {
+    use mtld3d_types::D3DTA_TFACTOR;
+
+    let mut key = default_ps_key();
+    key.stages[0] = diffuse_stage();
+    key.stages[1] = modulate_stage_with_alpha_disabled(FfStageFlags::empty());
+    key.stages[1].color_arg1 = narrow(D3DTA_DIFFUSE);
+    key.stages[1].alpha_arg1 = narrow(D3DTA_TFACTOR);
+    let msl = emit_ps_ff(&key, VariantKey::default());
+    let expected = "    current = float4(((in.color0 * current)).rgb, (current).a);";
+    assert!(msl.lines().any(|line| line == expected), "{msl}");
+    assert!(!msl.contains("ps_c[0]"), "{msl}");
+    assert!(!key.reads_texture_factor());
+    assert_eq!(key.constant_rows(), 0);
+}
+
+#[test]
+fn disabled_alpha_keeps_the_temporary_alpha_when_the_stage_writes_temp() {
+    use mtld3d_types::D3DTA_TEMP;
+
+    use super::FfStageResult;
+    for flags in [FfStageFlags::HAS_TEXTURE, FfStageFlags::empty()] {
+        let mut key = default_ps_key();
+        key.stages[0] = diffuse_stage();
+        key.stages[1] = modulate_stage_with_alpha_disabled(flags);
+        key.stages[1].set_result(FfStageResult::Temp);
+        key.stages[2] = FfStage {
+            color_op: narrow(D3DTOP_SELECTARG1),
+            color_arg1: narrow(D3DTA_TEMP),
+            alpha_op: narrow(D3DTOP_SELECTARG1),
+            alpha_arg1: narrow(D3DTA_TEMP),
+            ..FfStage::default()
+        };
+        let msl = emit_ps_ff(&key, VariantKey::default());
+        let color = if flags.contains(FfStageFlags::HAS_TEXTURE) {
+            "(t1 * current)"
+        } else {
+            "current"
+        };
+        let expected = format!("    temp = float4(({color}).rgb, (temp).a);");
+        assert!(msl.lines().any(|line| line == expected), "{msl}");
+        assert!(msl.contains("float4 temp = float4(0.0);"), "{msl}");
+        assert!(
+            msl.contains("current = float4((temp).rgb, (temp).a);"),
+            "{msl}"
+        );
+    }
+}
+
+#[test]
+fn disabled_alpha_on_a_first_stage_writing_temp_keeps_the_zeroed_temporary_alpha() {
+    use mtld3d_types::D3DTA_TEMP;
+
+    use super::FfStageResult;
+    let mut key = default_ps_key();
+    key.stages[0] = modulate_stage_with_alpha_disabled(FfStageFlags::HAS_TEXTURE);
+    key.stages[0].set_result(FfStageResult::Temp);
+    key.stages[1] = FfStage {
+        color_op: narrow(D3DTOP_SELECTARG1),
+        color_arg1: narrow(D3DTA_TEMP),
+        alpha_op: narrow(D3DTOP_SELECTARG1),
+        alpha_arg1: narrow(D3DTA_TEMP),
+        ..FfStage::default()
+    };
+    let msl = emit_ps_ff(&key, VariantKey::default());
+    assert!(msl.contains("float4 temp = float4(0.0);"), "{msl}");
+    let expected = "    temp = float4(((t0 * current)).rgb, (temp).a);";
+    assert!(msl.lines().any(|line| line == expected), "{msl}");
+    assert!(!msl.contains("in.color0.a"), "{msl}");
+}
+
+#[test]
+fn disabled_alpha_samples_no_texture_the_color_does_not_read() {
+    use mtld3d_types::D3DTOP_SELECTARG2;
+
+    let mut key = default_ps_key();
+    key.stages[0] = diffuse_stage();
+    key.stages[1] = modulate_stage_with_alpha_disabled(FfStageFlags::HAS_TEXTURE);
+    key.stages[1].color_op = narrow(D3DTOP_SELECTARG2);
+    let msl = emit_ps_ff(&key, VariantKey::default());
+    assert!(!msl.contains("float4 t1 ="), "{msl}");
+    assert!(
+        msl.contains("current = float4((current).rgb, (current).a);"),
+        "{msl}"
+    );
+    // The declaration follows the bound texture, not the operations.
+    assert_eq!(key.sampled_stage_mask(), 0b10);
+}
+
+#[test]
+fn disabled_alpha_leaves_a_dotproduct3_stage_writing_its_whole_result() {
+    use mtld3d_types::D3DTOP_DOTPRODUCT3;
+
+    let mut key = default_ps_key();
+    key.stages[0] = diffuse_stage();
+    key.stages[1] = modulate_stage_with_alpha_disabled(FfStageFlags::HAS_TEXTURE);
+    key.stages[1].color_op = narrow(D3DTOP_DOTPRODUCT3);
+    let msl = emit_ps_ff(&key, VariantKey::default());
+    let expected =
+        "    current = float4(saturate(4.0 * dot((t1).rgb - 0.5, (current).rgb - 0.5)));";
+    assert!(msl.lines().any(|line| line == expected), "{msl}");
 }
 
 #[test]

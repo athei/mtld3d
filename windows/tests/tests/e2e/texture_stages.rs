@@ -2633,3 +2633,69 @@ fn modulate_inv_color_add_alpha_stage_constants_preserve_queued_draws() {
         "CONSTANT works in ARG2",
     );
 }
+
+/// Draw stage 0 selecting `diffuse` into CURRENT and stage 1 enabled by COLOROP alone.
+///
+/// Stage 1 leaves `D3DTSS_ALPHAOP` at its `D3DTOP_DISABLE` default and names
+/// `alpha_arg1`, so the frame blends white by whichever alpha reaches the
+/// output over a black clear, and the centre pixel's red channel reads it.
+fn disabled_alpha_cascade(h: &Harness, tex: Option<&Texture<'_>>, alpha_arg1: u32) -> u8 {
+    use mtld3d_types::{
+        D3DBLEND_INVSRCALPHA, D3DBLEND_SRCALPHA, D3DRS_ALPHABLENDENABLE, D3DRS_DESTBLEND,
+        D3DRS_SRCBLEND, D3DTA_CURRENT,
+    };
+
+    assert_eq!(h.set_render_state(D3DRS_LIGHTING, 0), 0);
+    assert_eq!(h.set_render_state(D3DRS_TEXTUREFACTOR, 0xFFFF_FFFF), 0);
+    assert_eq!(h.set_render_state(D3DRS_ALPHABLENDENABLE, 1), 0);
+    assert_eq!(h.set_render_state(D3DRS_SRCBLEND, D3DBLEND_SRCALPHA), 0);
+    assert_eq!(h.set_render_state(D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA), 0);
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1), 0);
+    if let Some(tex) = tex {
+        assert_eq!(h.set_texture(1, tex), 0, "SetTexture");
+    }
+    for (stage, state, value) in [
+        (0, D3DTSS_COLOROP, D3DTOP_SELECTARG1),
+        (0, D3DTSS_COLORARG1, D3DTA_DIFFUSE),
+        (0, D3DTSS_ALPHAOP, D3DTOP_SELECTARG1),
+        (0, D3DTSS_ALPHAARG1, D3DTA_DIFFUSE),
+        (1, D3DTSS_COLOROP, D3DTOP_MODULATE),
+        (1, D3DTSS_COLORARG1, D3DTA_TEXTURE),
+        (1, D3DTSS_COLORARG2, D3DTA_CURRENT),
+        (1, D3DTSS_ALPHAARG1, alpha_arg1),
+    ] {
+        assert_eq!(h.set_texture_stage_state(stage, state, value), 0);
+    }
+    let verts = quad(0x40FF_FFFF);
+    h.render_once(BLACK, |d| {
+        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &verts), 0);
+    });
+    Rgba8::from_pixel(h.read_pixel(320, 240)).r
+}
+
+#[test]
+fn disabled_alpha_under_an_enabled_color_stage_keeps_the_incoming_alpha() {
+    use mtld3d_types::D3DTOP_DISABLE;
+
+    let h = Harness::new();
+    assert_eq!(
+        h.texture_stage_state(1, D3DTSS_ALPHAOP),
+        D3DTOP_DISABLE,
+        "stage 1 ALPHAOP default"
+    );
+    let white = solid_texture(&h, 0xFFFF_FFFF);
+    // Diffuse alpha 0x40 blends white to 64; the texture's 0xff alpha would give 255.
+    let red = disabled_alpha_cascade(&h, Some(&white), D3DTA_TEXTURE);
+    assert!(
+        red.abs_diff(64) <= 2,
+        "textured stage kept alpha, red {red}"
+    );
+    // Without a texture the colour falls back to CURRENT and the alpha argument
+    // names the opaque factor, which a disabled alpha operation never reads.
+    let h = Harness::new();
+    let red = disabled_alpha_cascade(&h, None, D3DTA_TFACTOR);
+    assert!(
+        red.abs_diff(64) <= 2,
+        "untextured stage kept alpha, red {red}"
+    );
+}

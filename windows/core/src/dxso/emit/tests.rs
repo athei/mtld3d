@@ -5301,3 +5301,44 @@ fn ff_temp_register_compiles_with_simultaneous_color_alpha_updates() {
     key.stages[0].color_arg1 = narrow(mtld3d_types::D3DTA_TEXTURE);
     metal_compile_or_fail(&emit_ps_ff(&key, VariantKey::default()));
 }
+
+#[test]
+fn ff_disabled_alpha_keeping_the_register_alpha_compiles() {
+    use mtld3d_types::{
+        D3DTA_CURRENT, D3DTA_TEMP, D3DTA_TEXTURE, D3DTOP_DISABLE, D3DTOP_MODULATE,
+        D3DTOP_SELECTARG1,
+    };
+
+    use crate::dxso::{FfPsKey, FfStage, FfStageFlags, FfStageResult, emit_ps_ff};
+    let narrow = |value| u8::try_from(value).expect("D3D stage value fits one byte");
+    let mut stages = [FfStage {
+        color_op: narrow(D3DTOP_DISABLE),
+        ..FfStage::default()
+    }; 8];
+    stages[0] = FfStage {
+        color_op: narrow(D3DTOP_MODULATE),
+        color_arg1: narrow(D3DTA_TEXTURE),
+        color_arg2: narrow(D3DTA_CURRENT),
+        alpha_op: narrow(D3DTOP_DISABLE),
+        alpha_arg1: narrow(D3DTA_TEXTURE),
+        alpha_arg2: narrow(D3DTA_CURRENT),
+        flags: FfStageFlags::HAS_TEXTURE,
+    };
+    stages[1] = stages[0];
+    stages[2] = FfStage {
+        color_op: narrow(D3DTOP_SELECTARG1),
+        color_arg1: narrow(D3DTA_TEMP),
+        alpha_op: narrow(D3DTOP_SELECTARG1),
+        alpha_arg1: narrow(D3DTA_TEMP),
+        ..FfStage::default()
+    };
+    let mut key = FfPsKey {
+        stages,
+        specular_add: false,
+        tt_projected_mask: 0,
+    };
+    metal_compile_or_fail(&emit_ps_ff(&key, VariantKey::default()));
+    key.stages[0].set_result(FfStageResult::Temp);
+    key.stages[1].set_result(FfStageResult::Temp);
+    metal_compile_or_fail(&emit_ps_ff(&key, VariantKey::default()));
+}
