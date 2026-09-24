@@ -6,18 +6,21 @@
 //! into dense eye-space shader slots, the const-row extent checked against the `vs_c` rows the
 //! emitter reads, `inverse` round-tripping affine matrices while rejecting singular ones, and
 //! the texture-stage-state warn latch firing per stage for unconsumed slots and never for the
-//! bump-environment slots.
+//! bump-environment slots, which route to the texbem uniform alone.
 
 use mtld3d_types::{
     D3DFOG_EXP, D3DFOG_LINEAR, D3DMATRIX, D3DRS_DEPTHBIAS, D3DRS_FOGCOLOR, D3DRS_FOGDENSITY,
     D3DRS_FOGENABLE, D3DRS_FOGEND, D3DRS_FOGSTART, D3DRS_FOGTABLEMODE, D3DRS_FOGVERTEXMODE,
     D3DRS_TEXTUREFACTOR, D3DTA_TEXTURE, D3DTOP_MODULATE, D3DTSS_BUMPENVLOFFSET,
     D3DTSS_BUMPENVLSCALE, D3DTSS_BUMPENVMAT00, D3DTSS_BUMPENVMAT01, D3DTSS_BUMPENVMAT10,
-    D3DTSS_BUMPENVMAT11, D3DTSS_COLORARG0, D3DTSS_COLOROP, D3DTSS_TEXCOORDINDEX,
+    D3DTSS_BUMPENVMAT11, D3DTSS_COLORARG0, D3DTSS_COLOROP, D3DTSS_CONSTANT, D3DTSS_TEXCOORDINDEX,
     D3DTSS_TEXTURETRANSFORMFLAGS, RENDER_STATE_COUNT, render_state_defaults,
 };
 
-use super::{FfState, FfVsLayout, VariantFlags, VariantKey, build_fog_color_bytes};
+use super::{
+    FfState, FfVsLayout, TssWriteFeeds, VariantFlags, VariantKey, build_fog_color_bytes,
+    tss_write_feeds,
+};
 use crate::convert::FfVsLayoutFlags;
 
 fn rs() -> [u32; RENDER_STATE_COUNT] {
@@ -389,6 +392,41 @@ fn bump_env_tss_writes_do_not_warn() {
                 "D3DTSS_{ty} (stage {stage}) fired the not-consumed warn"
             );
         }
+    }
+}
+
+#[test]
+fn bump_env_tss_writes_feed_only_the_bump_uniform() {
+    // No FF key, variant or FF constant reads a bump-environment slot, so a
+    // write to one routes to the texbem uniform alone. The neighbouring
+    // slots keep their routing.
+    for ty in [
+        D3DTSS_BUMPENVMAT00,
+        D3DTSS_BUMPENVMAT01,
+        D3DTSS_BUMPENVMAT10,
+        D3DTSS_BUMPENVMAT11,
+        D3DTSS_BUMPENVLSCALE,
+        D3DTSS_BUMPENVLOFFSET,
+    ] {
+        assert!(
+            matches!(tss_write_feeds(ty), TssWriteFeeds::BumpEnv),
+            "D3DTSS_{ty} does not route to the bump uniform alone"
+        );
+    }
+    assert!(matches!(
+        tss_write_feeds(D3DTSS_CONSTANT),
+        TssWriteFeeds::StageConstant
+    ));
+    for ty in [
+        D3DTSS_COLOROP,
+        D3DTSS_TEXCOORDINDEX,
+        D3DTSS_TEXTURETRANSFORMFLAGS,
+        D3DTSS_COLORARG0,
+    ] {
+        assert!(
+            matches!(tss_write_feeds(ty), TssWriteFeeds::FfPipeline),
+            "D3DTSS_{ty} does not route to the FF pipeline"
+        );
     }
 }
 
