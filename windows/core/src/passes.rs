@@ -280,6 +280,12 @@ const fn pack_viewport_key(vp: (u32, u32, u32, u32)) -> u64 {
     ((x as u64) << 48) ^ ((y as u64) << 32) ^ ((w as u64) << 16) ^ (h as u64)
 }
 
+/// Whether the `(x, y, w, h)` region spans a whole `(w, h)` extent from its origin.
+const fn region_covers_extent(region: (u32, u32, u32, u32), extent: (u32, u32)) -> bool {
+    let (x, y, w, h) = region;
+    x == 0 && y == 0 && w >= extent.0 && h >= extent.1
+}
+
 /// How the next render-pass should load its color attachment.
 ///
 /// `Load` preserves whatever the previous pass wrote; `Clear` replaces
@@ -1363,22 +1369,6 @@ pub struct PassState {
     ///
     /// Same semantics as `seen_color_rts`.
     seen_depth_rts: FxHashSet<MetalHandle<MTLTextureKind>>,
-    /// Colour rts that received content in the *current submission segment*.
-    ///
-    /// Reset on every `reset_frame`, mid-frame flush included, unlike
-    /// [`Self::seen_color_rts`]. The clear paths key on this: a cross-pass
-    /// `Clear` paints a scissored quad (preserving prior tiles) only when the
-    /// target already holds content Metal's full-attachment `loadAction =
-    /// Clear` would wipe *within this segment*. After a flush every attachment
-    /// is safely stored to VRAM, so a fresh full clear is correct and must fold
-    /// — a shared shadow-atlas ping-pong lives inside one segment, so the
-    /// preserve-tiles case still fires there.
-    seen_color_rts_segment: FxHashSet<(MetalHandle<MTLTextureKind>, u32)>,
-    /// Depth rts that received content in the current submission segment.
-    ///
-    /// Segment-scoped twin of [`Self::seen_depth_rts`]; drives the depth and
-    /// stencil cross-pass clear decisions for the same reason.
-    seen_depth_rts_segment: FxHashSet<MetalHandle<MTLTextureKind>>,
     /// Textures a queued blit writes this frame (`StretchRect` destinations, mipmap regens).
     ///
     /// Inserted by `push_pending_leading_blit`, which sees every ordered blit
@@ -1613,8 +1603,6 @@ impl PassState {
             pending_leading_blits: Vec::new(),
             seen_color_rts: FxHashSet::with_capacity_and_hasher(4, FxBuildHasher),
             seen_depth_rts: FxHashSet::with_capacity_and_hasher(2, FxBuildHasher),
-            seen_color_rts_segment: FxHashSet::with_capacity_and_hasher(4, FxBuildHasher),
-            seen_depth_rts_segment: FxHashSet::with_capacity_and_hasher(2, FxBuildHasher),
             blit_written_rts: FxHashSet::with_capacity_and_hasher(2, FxBuildHasher),
             backbuffer_texture: MetalHandle::NULL,
             backbuffer_contents: BackbufferContents::Undefined,
@@ -1758,16 +1746,12 @@ impl PassState {
         // copied into keep their VRAM content and their first use in the
         // continuation must Load, not `DontCare`. On a real `Present`
         // (`continues_frame` false) the frame ended and every target starts
-        // fresh. The segment-scoped sets always reset: after the flush every
-        // attachment is stored, so a fresh full clear is correct and must fold
-        // rather than paint a scissored quad.
+        // fresh.
         if !continues_frame {
             self.seen_color_rts.clear();
             self.seen_depth_rts.clear();
             self.blit_written_rts.clear();
         }
-        self.seen_color_rts_segment.clear();
-        self.seen_depth_rts_segment.clear();
         self.frame_caster_writes.clear();
         self.frame_cascade_samples.clear();
         self.frame_sampled_textures.clear();
@@ -1936,8 +1920,8 @@ impl PassState {
     /// keep `Store` on an attachment nothing samples, and rename-at-overlap
     /// would copy a texture no draw has read.
     ///
-    /// Covers `seen_color_rts` and `seen_depth_rts` with their segment twins,
-    /// `blit_written_rts`, `seen_sampled_textures`, `frame_sampled_textures`,
+    /// Covers `seen_color_rts`, `seen_depth_rts`, `blit_written_rts`,
+    /// `seen_sampled_textures`, `frame_sampled_textures`,
     /// `seen_sampleable_depth_textures`, and the two cascade-probe counters.
     /// View identity also lives until this retirement boundary, so released
     /// textures remain visible to queued pass store analysis. Current attachment
@@ -1959,10 +1943,7 @@ impl PassState {
         }
         self.srgb_base_to_twin.remove(&texture);
         self.seen_color_rts.retain(|&(handle, _)| handle != texture);
-        self.seen_color_rts_segment
-            .retain(|&(handle, _)| handle != texture);
         self.seen_depth_rts.remove(&texture);
-        self.seen_depth_rts_segment.remove(&texture);
         self.blit_written_rts.remove(&texture);
         self.seen_sampled_textures.remove(&texture);
         self.frame_sampled_textures.remove(&texture);
@@ -2593,11 +2574,20 @@ impl PassState {
     /// attachment bound there is nothing to bound, so fold.
     #[must_use]
     pub fn viewport_covers_color_attachment(&self) -> bool {
-        if self.current_color_texture.is_null() {
-            return true;
-        }
-        let (vpx, vpy, vpw, vph) = self.effective_viewport();
-        vpx == 0 && vpy == 0 && vpw >= self.current_color_size.0 && vph >= self.current_color_size.1
+        self.region_covers_color_attachment(self.effective_viewport())
+    }
+
+    /// True when `region` covers (or exceeds) the whole bound color attachment.
+    ///
+    /// `region` is `(x, y, w, h)` in the bound texture's own space, as
+    /// [`Self::effective_viewport`] and a clipped `Clear` rect are, so the
+    /// comparison against the texture extent holds under `render.scale`. A
+    /// covering region clears exactly what a whole-target clear does. With no
+    /// color attachment bound there is nothing to bound, so it covers.
+    #[must_use]
+    pub const fn region_covers_color_attachment(&self, region: (u32, u32, u32, u32)) -> bool {
+        self.current_color_texture.is_null()
+            || region_covers_extent(region, self.current_color_size)
     }
 
     /// True when the current viewport covers (or exceeds) the whole bound depth attachment.
@@ -2612,11 +2602,19 @@ impl PassState {
     /// to bound, so fold.
     #[must_use]
     pub fn viewport_covers_depth_attachment(&self) -> bool {
-        if self.current_depth_texture.is_null() {
-            return true;
-        }
-        let (vpx, vpy, vpw, vph) = self.effective_viewport();
-        vpx == 0 && vpy == 0 && vpw >= self.current_depth_size.0 && vph >= self.current_depth_size.1
+        self.region_covers_depth_attachment(self.effective_viewport())
+    }
+
+    /// True when `region` covers (or exceeds) the whole bound depth attachment.
+    ///
+    /// The depth-stencil mirror of [`Self::region_covers_color_attachment`],
+    /// measured against the depth attachment's own extent: D3D9 permits a
+    /// depth surface larger than render target 0, and a region clipped to a
+    /// viewport inside render target 0 leaves the rest of such a surface out.
+    #[must_use]
+    pub const fn region_covers_depth_attachment(&self, region: (u32, u32, u32, u32)) -> bool {
+        self.current_depth_texture.is_null()
+            || region_covers_extent(region, self.current_depth_size)
     }
 
     /// Whether the encoder may leave out a draw running with `writes`.
@@ -2998,16 +2996,13 @@ impl PassState {
         if !self.current_color_texture.is_null() {
             let key = (self.current_color_texture, self.current_color_subresource);
             self.seen_color_rts.insert(key);
-            self.seen_color_rts_segment.insert(key);
         }
         for attachment in extra_color.iter().filter(|a| a.is_bound()) {
             let key = (attachment.texture, attachment.subresource);
             self.seen_color_rts.insert(key);
-            self.seen_color_rts_segment.insert(key);
         }
         if !depth_texture.is_null() {
             self.seen_depth_rts.insert(depth_texture);
-            self.seen_depth_rts_segment.insert(depth_texture);
         }
 
         // Reuse a `Vec<Command>` recycled from a previous frame's pass
@@ -3199,8 +3194,6 @@ impl PassState {
             self.upload_pass_end += 1;
         }
         self.seen_color_rts.insert((target.texture, subresource));
-        self.seen_color_rts_segment
-            .insert((target.texture, subresource));
         if ORDERED {
             self.blit_written_rts.insert(target.texture);
         }
@@ -3380,7 +3373,6 @@ impl PassState {
         });
         self.current_pass_closed = true;
         self.seen_depth_rts.insert(depth_texture);
-        self.seen_depth_rts_segment.insert(depth_texture);
     }
 
     /// Rebind the color attachment for the next pass.
@@ -3601,7 +3593,6 @@ impl PassState {
             self.set_depth_stencil_attachment(MetalHandle::NULL, (0, 0), false, false);
         }
         self.seen_depth_rts.remove(&texture);
-        self.seen_depth_rts_segment.remove(&texture);
         self.seen_sampleable_depth_textures.remove(&texture);
         self.seen_sampled_textures.remove(&texture);
         self.frame_sampled_textures.remove(&texture);
@@ -3610,21 +3601,23 @@ impl PassState {
         self.frame_cascade_samples.remove(&texture);
     }
 
-    /// Apply a color clear.
+    /// Apply a whole-target colour clear.
     ///
-    /// If the current pass already has draws, end it so the clear applies to
-    /// the next pass's load action. If the current pass is open but has only
-    /// the initial viewport, amend its load action in place. Otherwise stash
-    /// as pending for the next pass-begin.
+    /// The caller has decided the clear covers every colour attachment of the
+    /// pass (the viewport, or a clipped rect, spans the whole extent), so a
+    /// full-attachment `loadAction = Clear` is D3D9's result whatever the
+    /// targets held before. If the current pass already has draws, the clear
+    /// lands after them as a clear-quad inside the pass, or, under an armed
+    /// counting visibility query, the pass ends first so the quad cannot
+    /// count. Otherwise an open pass with no work takes the clear as its load
+    /// action, and with no pass open it waits as pending for the next
+    /// `ensure_pass_open`. A strict sub-region never comes here: the region
+    /// path owns it, since a load action would wipe the pixels outside.
     pub fn clear_color(&mut self, r: u32, g: u32, b: u32, a: u32) -> ColorClearOutcome {
         let color_texture = self.current_color_texture;
         if self.current_pass_has_work() {
-            // Pass has draws — translate the D3D9 viewport-clipped Clear
-            // by asking the caller to emit a scissored clear-quad inside
-            // this encoder (the quad writes every colour target of the
-            // pass). Visibility-counting passes (occlusion queries active)
-            // fall back to the legacy pass-break: see comment in
-            // `clear_depth`.
+            // Visibility-counting passes (occlusion queries active) fall back
+            // to the legacy pass-break: see comment in `clear_depth`.
             if self.current_pass_has_counting_visibility() {
                 mtld3d_shared::log_once_trace_by!(
                     target: DEPTH_TRACE_TARGET,
@@ -3647,47 +3640,10 @@ impl PassState {
                 };
             }
         }
-        // Cross-pass case: the color texture already received content
-        // earlier this frame. Folding into a fresh pass's load action
-        // would let Metal's full-attachment `loadAction = Clear` wipe
-        // every prior tile. Open the pass with `Load` (preserving
-        // content) and emit a scissored clear-quad instead. Only
-        // applies when the new viewport is meaningful (non-zero size)
-        // and a color texture is bound.
-        // Any colour target of the pass, not just render target 0: the
-        // clear-quad writes all of them, so one seen target makes the quad
-        // the only safe path for the whole set.
-        if self.any_bound_color_target_seen() && self.viewport_width > 0 && self.viewport_height > 0
-        {
-            let vp = self.effective_viewport();
-            // Open the pass first (or take the existing one). When
-            // already open with no work, rewrite the load action to
-            // `Load` so the clear-quad's scissored write is the only
-            // thing that lands in this tile; the previous tile's
-            // content survives outside the scissor rect.
-            self.ensure_pass_open();
-            if let Some(pass) = self.passes.last_mut() {
-                if matches!(pass.color_load, ColorLoad::Clear { .. }) {
-                    pass.color_load = ColorLoad::Load;
-                }
-                for attachment in pass.extra_color.iter_mut().filter(|a| a.is_bound()) {
-                    if matches!(attachment.load, ColorLoad::Clear { .. }) {
-                        attachment.load = ColorLoad::Load;
-                    }
-                }
-            }
-            mtld3d_shared::log_once_trace_by!(
-                target: DEPTH_TRACE_TARGET,
-                key: color_texture.raw().rotate_left(29) ^ pack_viewport_key(vp),
-                "clear-quad color: EmitQuad(cross-pass) tex={color_texture:#x} viewport=({},{},{}x{}) — preserved via Load action",
-                vp.0, vp.1, vp.2, vp.3
-            );
-            return ColorClearOutcome::EmitQuad {
-                rgba: (r, g, b, a),
-                viewport: vp,
-                color_format: self.color_attachment_format(),
-            };
-        }
+        debug_assert!(
+            self.viewport_covers_color_attachment(),
+            "a colour clear folds only when it covers the attachment"
+        );
         if !self.current_pass_closed
             && let Some(pass) = self.passes.last_mut()
         {
@@ -3714,11 +3670,10 @@ impl PassState {
 
     /// Open (or reuse) the colour pass for a `Clear` with explicit `pRects` sub-regions.
     ///
-    /// Prior tile content is preserved. A rect-clear can NEVER fold into
-    /// a full-attachment `loadAction = Clear` (that wipes pixels outside
-    /// the rects), so — exactly like `clear_color`'s cross-pass branch —
-    /// open the pass with `Load` and rewrite a pending whole-attachment
-    /// Clear to `Load`. The caller then emits one scissored clear-quad
+    /// Prior tile content is preserved. A rect-clear that leaves part of the
+    /// attachment out can never fold into a full-attachment
+    /// `loadAction = Clear` (that wipes pixels outside the rects), so open
+    /// the pass with `Load`. The caller then emits one scissored clear-quad
     /// per clipped rect via `emit_clear_quad_color_inner`, reusing the
     /// proven clear-quad path (so there is no fresh draw-without-encoder
     /// hazard). Returns the bound colour format for the quad pipeline
@@ -3824,15 +3779,14 @@ impl PassState {
     /// Apply a depth clear.
     ///
     /// Mirrors `clear_color` semantics for the depth attachment's load
-    /// action. Routes through one of four paths, checked in order:
+    /// action, under the same contract: the caller has decided the clear
+    /// covers the whole depth attachment. Routes through one of three paths,
+    /// checked in order:
     ///
-    /// 1. Active pass with draws → emit a scissored clear-quad (or fall
-    ///    back to pass-break under visibility counting).
-    /// 2. Cross-pass — depth texture already received content this frame
-    ///    → open a Load-action pass + emit a clear-quad to avoid wiping
-    ///    prior tiles.
-    /// 3. Open pass with no draws yet → amend its load action to Clear.
-    /// 4. No open pass → stash as `pending_depth_clear`.
+    /// 1. Active pass with draws → emit a clear-quad (or fall back to
+    ///    pass-break under visibility counting).
+    /// 2. Open pass with no draws yet → amend its load action to Clear.
+    /// 3. No open pass → stash as `pending_depth_clear`.
     pub fn clear_depth(&mut self, value: u32) -> DepthClearOutcome {
         let depth_texture = self.current_depth_texture;
         if !self.pass_binds_depth() {
@@ -3846,9 +3800,10 @@ impl PassState {
         {
             return outcome;
         }
-        if let Some(outcome) = self.clear_depth_cross_pass(value, depth_texture) {
-            return outcome;
-        }
+        debug_assert!(
+            self.viewport_covers_depth_attachment(),
+            "a depth clear folds only when it covers the attachment"
+        );
         if let Some(outcome) = self.clear_depth_amend_open(value, depth_texture) {
             return outcome;
         }
@@ -3859,7 +3814,7 @@ impl PassState {
     ///
     /// Returns `Some(EmitQuad)` on the normal path or `None` if a
     /// visibility-counting query forced the legacy pass-break fallback
-    /// (caller falls through to the cross-pass / amend chain). A zero-area
+    /// (caller falls through to the amend / stash chain). A zero-area
     /// viewport is an explicit `NoOp`: D3D9 clears nothing, and a zero-size
     /// quad would only cost the state switches around it.
     ///
@@ -3908,15 +3863,12 @@ impl PassState {
 
     /// Apply a stencil clear.
     ///
-    /// Mirrors `clear_depth`: fold into the next pass's `loadAction` where
-    /// that is observationally identical, and paint a scissored quad where it
-    /// is not. Metal's `loadAction = Clear` covers the whole attachment
-    /// regardless of viewport, so a mid-frame re-clear of a plane the frame
-    /// already drew into has to be a quad or it wipes those tiles. Depth keeps
-    /// its own load action throughout, so a stencil-only clear never disturbs
-    /// the depth plane the two share.
+    /// Mirrors `clear_depth`, under the same whole-attachment contract: fold
+    /// into the pass's `loadAction` unless the pass already holds draws the
+    /// clear must land after, and paint a quad inside the pass then. Depth
+    /// keeps its own load action throughout, so a stencil-only clear never
+    /// disturbs the depth plane the two share.
     pub fn clear_stencil(&mut self, value: u32) -> StencilClearOutcome {
-        let depth_texture = self.current_depth_texture;
         if !self.pass_binds_depth() {
             // Nothing is attached to clear. Folding would carry the clear
             // onto whatever texture the next pass attaches, and a quad would
@@ -3928,9 +3880,10 @@ impl PassState {
         {
             return outcome;
         }
-        if let Some(outcome) = self.clear_stencil_cross_pass(value, depth_texture) {
-            return outcome;
-        }
+        debug_assert!(
+            self.viewport_covers_depth_attachment(),
+            "a stencil clear folds only when it covers the attachment"
+        );
         if let Some(outcome) = self.clear_stencil_amend_open(value) {
             return outcome;
         }
@@ -3953,41 +3906,6 @@ impl PassState {
         let vp = self.effective_viewport();
         if vp.2 == 0 || vp.3 == 0 {
             return Some(StencilClearOutcome::NoOp);
-        }
-        Some(StencilClearOutcome::EmitQuad {
-            value,
-            viewport: vp,
-            has_color: !self.current_color_texture.is_null(),
-            color_format: self.color_attachment_format(),
-        })
-    }
-
-    /// Cross-pass branch: the plane already carries content from this frame.
-    ///
-    /// Open the pass with `Load` so the earlier tiles survive, and let the
-    /// caller paint only the cleared region.
-    fn clear_stencil_cross_pass(
-        &mut self,
-        value: u32,
-        depth_texture: MetalHandle<MTLTextureKind>,
-    ) -> Option<StencilClearOutcome> {
-        if !self.seen_depth_rts_segment.contains(&depth_texture)
-            || self.viewport_width == 0
-            || self.viewport_height == 0
-        {
-            return None;
-        }
-        let vp = self.effective_viewport();
-        if vp.2 == 0 || vp.3 == 0 {
-            // The game's viewport rounds to nothing at render resolution.
-            // Opening a pass for a zero-size quad would only cost an encoder.
-            return Some(StencilClearOutcome::NoOp);
-        }
-        self.ensure_pass_open();
-        if let Some(pass) = self.passes.last_mut()
-            && matches!(pass.stencil_load, StencilLoad::Clear { .. })
-        {
-            pass.stencil_load = StencilLoad::Load;
         }
         Some(StencilClearOutcome::EmitQuad {
             value,
@@ -4025,52 +3943,6 @@ impl PassState {
         self.pending_stencil_clear = Some(value);
     }
 
-    /// Cross-pass branch.
-    ///
-    /// The depth texture already received content earlier this frame.
-    /// Folding into a fresh pass's load action would let Metal's
-    /// full-attachment `loadAction = Clear` wipe every prior tile — the
-    /// failure mode for a shared shadow cascade-atlas. Open the pass
-    /// with `Load` (preserving content) and emit a scissored clear-quad
-    /// instead. Only applies when the new viewport is meaningful
-    /// (non-zero size) and a depth texture is bound.
-    fn clear_depth_cross_pass(
-        &mut self,
-        value: u32,
-        depth_texture: MetalHandle<MTLTextureKind>,
-    ) -> Option<DepthClearOutcome> {
-        if !self.seen_depth_rts_segment.contains(&depth_texture)
-            || self.viewport_width == 0
-            || self.viewport_height == 0
-        {
-            return None;
-        }
-        let vp = self.effective_viewport();
-        if vp.2 == 0 || vp.3 == 0 {
-            // The game's viewport rounds to nothing at render resolution.
-            // Opening a pass for a zero-size quad would only cost an encoder.
-            return Some(DepthClearOutcome::NoOp);
-        }
-        self.ensure_pass_open();
-        if let Some(pass) = self.passes.last_mut()
-            && matches!(pass.depth_load, DepthLoad::Clear { .. })
-        {
-            pass.depth_load = DepthLoad::Load;
-        }
-        mtld3d_shared::log_once_trace_by!(
-            target: DEPTH_TRACE_TARGET,
-            key: depth_texture.raw().rotate_left(29) ^ pack_viewport_key(vp),
-            "clear-quad depth: EmitQuad(cross-pass) tex={depth_texture:#x} viewport=({},{},{}x{}) value={:?} — preserved via Load action",
-            vp.0, vp.1, vp.2, vp.3, f32::from_bits(value)
-        );
-        Some(DepthClearOutcome::EmitQuad {
-            value,
-            viewport: vp,
-            has_color: !self.current_color_texture.is_null(),
-            color_format: self.color_attachment_format(),
-        })
-    }
-
     /// Amend branch.
     ///
     /// If a pass is open with no draws yet, set its depth load action to
@@ -4098,9 +3970,8 @@ impl PassState {
 
     /// Stash branch.
     ///
-    /// No open pass to amend, no cross-pass case to quad-clear — record
-    /// the clear as pending so the next `ensure_pass_open` opens the
-    /// pass with `loadAction = Clear`.
+    /// No open pass to amend, so record the clear as pending and the next
+    /// `ensure_pass_open` opens the pass with `loadAction = Clear`.
     fn clear_depth_stash_pending(
         &mut self,
         value: u32,
@@ -4139,30 +4010,6 @@ impl PassState {
     pub fn clear_depth_legacy_break(&mut self, value: u32) {
         self.end_current_pass("clear_depth_legacy_fallback");
         self.pending_depth_clear = Some(value);
-    }
-
-    /// `true` when rt 0 or a bound extra already has content in this submission segment.
-    ///
-    /// Segment-scoped, not frame-scoped: a full `loadAction = Clear` only wipes
-    /// content in the current encoder chain, so a clear on a target last drawn
-    /// before a mid-frame flush (already stored to VRAM) correctly folds to a
-    /// full clear rather than a scissored quad.
-    fn any_bound_color_target_seen(&self) -> bool {
-        let rt0_seen = !self.current_color_texture.is_null()
-            && self
-                .seen_color_rts_segment
-                .contains(&(self.current_color_texture, self.current_color_subresource));
-        rt0_seen
-            || self
-                .current_extra_color
-                .iter()
-                .enumerate()
-                .any(|(i, slot)| {
-                    self.current_extra_present_mask & (1 << i) != 0
-                        && self
-                            .seen_color_rts_segment
-                            .contains(&(slot.texture, slot.subresource))
-                })
     }
 
     /// Color mirror of `clear_depth_legacy_break`.
@@ -4431,8 +4278,8 @@ impl PassState {
                 || pass.extra_color.iter().any(|a| !a.resolve_texture.is_null())
                 // A folded color Clear (`color_load == Clear`) is a real color
                 // write even with no draw to tag `color_writes_observed` — e.g.
-                // a backbuffer color Clear that shares a pass with a cross-pass
-                // depth clear-quad. Stripping color here would discard that
+                // a backbuffer color Clear that shares a pass with a depth
+                // clear-quad. Stripping color here would discard that
                 // clear; a later Load pass would then read black.
                 || matches!(pass.color_load, ColorLoad::Clear { .. })
             {

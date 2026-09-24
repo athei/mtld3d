@@ -249,6 +249,131 @@ fn clear_rects_intersect_the_scissor() {
 }
 
 #[test]
+fn a_scissor_covering_the_target_clears_it_between_two_draws() {
+    // A scissored clear whose scissor is the whole target is a whole-target
+    // clear, landing after the draw before it and before the draws after it,
+    // on both planes. Every draw is a covering quad, confined by a smaller
+    // scissor for the later two.
+    let h = Harness::with_depth();
+    depth_probe_setup(&h, D3DCMP_LESSEQUAL);
+    let (width, height) = h.dims();
+    let whole = D3DRECT {
+        x1: 0,
+        y1: 0,
+        x2: width.cast_signed(),
+        y2: height.cast_signed(),
+    };
+    let left = D3DRECT {
+        x1: 64,
+        y1: 160,
+        x2: 256,
+        y2: 320,
+    };
+    let right = D3DRECT {
+        x1: 384,
+        y1: 160,
+        x2: 576,
+        y2: 320,
+    };
+
+    assert_eq!(h.clear(D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, BLUE, 1.0, 0), 0);
+    assert_eq!(h.begin_scene(), 0);
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &covering_quad(0.5)),
+        0,
+        "the target holds a draw before the clear",
+    );
+    assert_eq!(h.set_render_state(D3DRS_SCISSORTESTENABLE, 1), 0);
+    assert_eq!(h.set_scissor_rect(&whole), 0);
+    assert_eq!(
+        h.clear(D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, RED, 0.25, 0),
+        0,
+        "scissored clear over the whole target",
+    );
+    // Depth 0.25 passes a quad at 0.0 and rejects one at 0.5.
+    assert_eq!(h.set_scissor_rect(&left), 0);
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &covering_quad(0.0)),
+        0
+    );
+    assert_eq!(h.set_scissor_rect(&right), 0);
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &covering_quad(0.5)),
+        0
+    );
+    assert_eq!(h.end_scene(), 0);
+
+    assert_pixel_eq(h.read_pixel(160, 240), GREEN, "a draw after the clear");
+    assert_pixel_eq(
+        h.read_pixel(480, 240),
+        RED,
+        "the cleared depth rejects the far quad",
+    );
+    assert_pixel_eq(
+        h.read_pixel(40, 40),
+        RED,
+        "the clear replaced the first draw",
+    );
+    assert_pixel_eq(h.read_pixel(600, 440), RED, "far corner");
+}
+
+#[test]
+fn a_rect_covering_render_target_zero_leaves_a_larger_depth_surface_outside_it() {
+    // D3D9 lets the depth surface exceed render target 0. A rect past every
+    // edge of a 256x256 target covers that target once clipped to the
+    // viewport, but only the corner of a 512x512 depth surface, whose rest
+    // keeps its depth. Neither size is the back buffer's, so no scale applies.
+    let h = Harness::with_depth();
+    depth_probe_setup(&h, D3DCMP_LESSEQUAL);
+    let large = h.create_render_target(512, 512, D3DFMT_X8R8G8B8);
+    let small = h.create_render_target(256, 256, D3DFMT_X8R8G8B8);
+    let depth = h.create_depth_stencil_surface(512, 512, D3DFMT_D24S8);
+    assert_eq!(h.set_depth_stencil_surface(&depth), 0);
+    assert_eq!(h.set_render_target(0, &large), 0);
+    assert_eq!(
+        h.clear(D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, BLACK, 1.0, 0),
+        0
+    );
+
+    assert_eq!(h.set_render_target(0, &small), 0);
+    assert_eq!(
+        h.clear_rects(
+            D3DCLEAR_ZBUFFER,
+            BLACK,
+            0.0,
+            0,
+            &[D3DRECT {
+                x1: -64,
+                y1: -64,
+                x2: 1024,
+                y2: 1024,
+            }],
+        ),
+        0,
+        "a rect larger than render target 0",
+    );
+
+    assert_eq!(h.set_render_target(0, &large), 0);
+    assert_eq!(h.begin_scene(), 0);
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &covering_quad(0.5)),
+        0
+    );
+    assert_eq!(h.end_scene(), 0);
+
+    assert_pixel_eq(
+        h.read_pixel(64, 64),
+        BLACK,
+        "inside render target 0's extent the depth is 0.0",
+    );
+    assert_pixel_eq(
+        h.read_pixel(400, 400),
+        GREEN,
+        "the depth surface outside it keeps 1.0",
+    );
+}
+
+#[test]
 fn viewport_bounds_a_clear_in_reported_coordinates() {
     let h = Harness::new();
     // Narrowed inside the frame, after `render_once`'s own full-target clear.

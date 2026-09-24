@@ -3815,13 +3815,31 @@ impl FrameEncoder {
         self.pass_state.set_depth_sample_count(sample_count);
     }
 
-    /// Apply a whole-target colour `Clear`.
+    /// Apply a whole-target colour `Clear` whose viewport covers target 0.
     ///
     /// `srgb_write` is `D3DRS_SRGBWRITEENABLE` at the `Clear` call. It is
     /// resolved into the value here rather than on the API thread because
     /// only the pass state knows whether the attachment about to be bound
     /// is an sRGB view that converts the clear value itself.
-    pub fn clear_color(&mut self, r: u32, g: u32, b: u32, a: u32, srgb_write: bool) {
+    fn clear_color(&mut self, r: u32, g: u32, b: u32, a: u32, srgb_write: bool) {
+        self.clear_color_in_pass(r, g, b, a, srgb_write);
+        // A target bound outside the pass (sized unlike target 0) is owed the
+        // clear too; neither the fold nor the quad above reached it. It takes
+        // the caller's value, resolved again for its own attachment, and the
+        // viewport over its own extent, which a covering viewport on target 0
+        // need not cover.
+        if self.pass_state.has_extra_color_targets_outside_pass() {
+            self.clear_targets_outside_pass(|enc| {
+                enc.clear_color_bounded_to_viewport(r, g, b, a, srgb_write);
+            });
+        }
+    }
+
+    /// Apply a whole-target colour `Clear` to the targets the pass attaches.
+    ///
+    /// The caller has decided the clear covers them; targets bound outside
+    /// the pass are the caller's to reach.
+    fn clear_color_in_pass(&mut self, r: u32, g: u32, b: u32, a: u32, srgb_write: bool) {
         self.pass_state.set_srgb_write_enabled(srgb_write);
         let resolved = self.resolved_clear_rgba(r, g, b, a, srgb_write);
         let passes_before = self.pass_state.passes().len();
@@ -3838,16 +3856,6 @@ impl FrameEncoder {
                 self.reset_last_bound_if_pass_opened(passes_before);
                 self.emit_clear_quad_color_inner(rgba, viewport, color_format);
             }
-        }
-        // A target bound outside the pass (sized unlike target 0) is owed the
-        // clear too; neither the fold nor the quad above reached it. It takes
-        // the caller's value, resolved again for its own attachment, and the
-        // viewport over its own extent, which a covering viewport on target 0
-        // need not cover.
-        if self.pass_state.has_extra_color_targets_outside_pass() {
-            self.clear_targets_outside_pass(|enc| {
-                enc.clear_color_bounded_to_viewport(r, g, b, a, srgb_write);
-            });
         }
     }
 
@@ -3964,7 +3972,10 @@ impl FrameEncoder {
     /// `clear_color_rects` for rects already in the bound texture's space.
     ///
     /// Split out so a caller that derived its rect from `effective_viewport`
-    /// (itself already converted) cannot scale it a second time.
+    /// (itself already converted) cannot scale it a second time. A clipped
+    /// region that spans the whole attachment takes the whole-target path,
+    /// which can fold into the load action; every other region then lies
+    /// inside it and changes nothing.
     fn clear_color_rects_resolved(
         &mut self,
         r: u32,
@@ -3975,7 +3986,6 @@ impl FrameEncoder {
         rects: &[(i32, i32, i32, i32)],
     ) {
         self.pass_state.set_srgb_write_enabled(srgb_write);
-        let (r, g, b, a) = self.resolved_clear_rgba(r, g, b, a, srgb_write);
         let vp = self.pass_state.effective_viewport();
         let regions: Vec<(u32, u32, u32, u32)> = rects
             .iter()
@@ -3984,6 +3994,14 @@ impl FrameEncoder {
         if regions.is_empty() {
             return;
         }
+        if regions
+            .iter()
+            .any(|&region| self.pass_state.region_covers_color_attachment(region))
+        {
+            self.clear_color_in_pass(r, g, b, a, srgb_write);
+            return;
+        }
+        let (r, g, b, a) = self.resolved_clear_rgba(r, g, b, a, srgb_write);
         let passes_before = self.pass_state.passes().len();
         let color_format = self.pass_state.begin_region_color_clear();
         self.reset_last_bound_if_pass_opened(passes_before);
@@ -4022,7 +4040,8 @@ impl FrameEncoder {
     /// The depth-stencil mirror of `clear_color_rects_resolved`, split out for
     /// the same reason: a caller that derived its rect from
     /// `effective_viewport` (itself already converted) must not scale it a
-    /// second time.
+    /// second time. Coverage is measured against the depth attachment's own
+    /// extent, which D3D9 lets exceed render target 0's.
     fn clear_depth_stencil_rects_resolved(
         &mut self,
         depth: Option<u32>,
@@ -4036,6 +4055,13 @@ impl FrameEncoder {
             .filter_map(|&rc| clip_rect_to_viewport(rc, vp))
             .collect();
         if regions.is_empty() {
+            return;
+        }
+        if regions
+            .iter()
+            .any(|&region| self.pass_state.region_covers_depth_attachment(region))
+        {
+            self.clear_depth_stencil_planes(depth, stencil);
             return;
         }
         let passes_before = self.pass_state.passes().len();
@@ -4084,14 +4110,7 @@ impl FrameEncoder {
             return;
         }
         if self.pass_state.viewport_covers_depth_attachment() {
-            match (depth, stencil) {
-                (Some(depth), Some(stencil)) => self.clear_depth_stencil(depth, stencil),
-                (Some(depth), None) => self.clear_depth(depth),
-                (None, Some(stencil)) => self.clear_stencil(stencil),
-                // Rejected above. The arm exists for exhaustiveness, not
-                // because it is reachable.
-                (None, None) => {}
-            }
+            self.clear_depth_stencil_planes(depth, stencil);
             return;
         }
         let (vpx, vpy, vpw, vph) = self.pass_state.effective_viewport();
@@ -4106,7 +4125,22 @@ impl FrameEncoder {
         self.clear_depth_stencil_rects_resolved(depth, stencil, &[rect]);
     }
 
-    pub fn clear_depth(&mut self, value: u32) {
+    /// Apply a whole-target depth and/or stencil `Clear` to the planes named.
+    ///
+    /// The caller has decided the clear covers the depth attachment.
+    fn clear_depth_stencil_planes(&mut self, depth: Option<u32>, stencil: Option<u32>) {
+        match (depth, stencil) {
+            (Some(depth), Some(stencil)) => self.clear_depth_stencil(depth, stencil),
+            (Some(depth), None) => self.clear_depth(depth),
+            (None, Some(stencil)) => self.clear_stencil(stencil),
+            // `device_clear` pushes no depth-stencil op without a plane, and
+            // the viewport-bounded entry rejects the pair with a warning. The
+            // arm exists for exhaustiveness, not because it is reachable.
+            (None, None) => {}
+        }
+    }
+
+    fn clear_depth(&mut self, value: u32) {
         self.bump_depth_write_epoch();
         let passes_before = self.pass_state.passes().len();
         match self.pass_state.clear_depth(value) {
@@ -4129,7 +4163,7 @@ impl FrameEncoder {
         }
     }
 
-    pub fn clear_stencil(&mut self, value: u32) {
+    fn clear_stencil(&mut self, value: u32) {
         self.bump_depth_write_epoch();
         let passes_before = self.pass_state.passes().len();
         match self.pass_state.clear_stencil(value) {
@@ -4163,7 +4197,7 @@ impl FrameEncoder {
     /// two-quad shape would double the clear draws on exactly that workload.
     /// The single-plane fallback below only guards the pairing; it is not
     /// expected to run.
-    pub fn clear_depth_stencil(&mut self, depth: u32, stencil: u32) {
+    fn clear_depth_stencil(&mut self, depth: u32, stencil: u32) {
         self.bump_depth_write_epoch();
         let passes_before = self.pass_state.passes().len();
         let depth_outcome = self.pass_state.clear_depth(depth);
@@ -4247,9 +4281,9 @@ impl FrameEncoder {
 
     /// Flush `last_bound` when a `PassState` call opened a fresh Metal encoder.
     ///
-    /// `PassState::clear_{color,depth,stencil}` and the visibility mode-sets
-    /// open the new pass themselves (`ensure_pass_open`, with `loadAction =
-    /// Load` to preserve prior tiles), but they can't reach the
+    /// `PassState`'s region-clear entries and the visibility mode-sets open
+    /// the new pass themselves (`ensure_pass_open`, with `loadAction = Load`
+    /// to preserve prior tiles), but they can't reach the
     /// `FrameEncoder`-owned `last_bound`, so unlike
     /// `begin_render_pass_if_needed` the per-draw dedup would carry stale
     /// bindings across the encoder boundary. The new encoder starts with no

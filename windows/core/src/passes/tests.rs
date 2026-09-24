@@ -2222,20 +2222,21 @@ fn a_stencil_clear_under_a_zero_area_viewport_is_a_no_op() {
 }
 
 #[test]
-fn a_stencil_clear_under_a_zero_area_viewport_opens_no_pass() {
-    // The same degenerate viewport between passes: nothing to paint, so
-    // no encoder is opened for it either.
+fn a_zero_area_viewport_covers_neither_attachment() {
+    // The same degenerate viewport between passes. It is a strict sub-region
+    // of both attachments, so a whole-target clear under it takes the region
+    // path, whose clip leaves nothing to paint, rather than folding a
+    // full-attachment clear.
     let ds = tex(0x3300);
     let mut s = fresh_scaled();
     s.set_depth_stencil_attachment(ds, BB_SIZE, false, true);
     s.emit_command(dummy_draw());
     s.end_current_pass("test");
     s.set_viewport(1, 1, 1, 1, 0.0, 1.0);
+    assert_eq!(s.effective_viewport(), (1, 1, 0, 0));
 
-    assert_eq!(s.clear_stencil(7), StencilClearOutcome::NoOp);
-    assert_eq!(s.passes().len(), 1);
-    assert!(s.current_pass_closed());
-    assert!(s.pending_stencil_clear.is_none());
+    assert!(!s.viewport_covers_color_attachment());
+    assert!(!s.viewport_covers_depth_attachment());
 }
 
 #[test]
@@ -2253,19 +2254,6 @@ fn a_depth_clear_under_a_zero_area_viewport_is_a_no_op() {
     assert_eq!(s.passes().len(), 1);
     assert!(!s.current_pass_closed(), "the live pass stays open");
     assert_eq!(s.passes()[0].depth_load(), before);
-    assert!(s.pending_depth_clear.is_none());
-}
-
-#[test]
-fn a_depth_clear_under_a_zero_area_viewport_opens_no_pass() {
-    let mut s = fresh_scaled();
-    s.emit_command(dummy_draw());
-    s.end_current_pass("test");
-    s.set_viewport(1, 1, 1, 1, 0.0, 1.0);
-
-    assert_eq!(s.clear_depth(f32::to_bits(1.0)), DepthClearOutcome::NoOp);
-    assert_eq!(s.passes().len(), 1);
-    assert!(s.current_pass_closed());
     assert!(s.pending_depth_clear.is_none());
 }
 
@@ -2314,11 +2302,11 @@ fn depth_and_stencil_clears_over_draws_paint_matching_quads() {
 }
 
 #[test]
-fn depth_and_stencil_clears_under_a_counting_query_share_the_fresh_pass() {
-    // With a visibility query armed the depth chain ends the pass and
-    // reopens one with Load; the stencil chain then finds that fresh pass
-    // with no draws and paints into it as well. The pass count is what
-    // the encoder uses to know its binding cache must start over.
+fn depth_and_stencil_clears_under_a_counting_query_end_the_pass_and_fold() {
+    // With a visibility query armed the depth chain ends the pass rather than
+    // paint a quad the query would count; the covering clear then waits for
+    // the next pass, and the stencil chain, finding no pass open, waits with
+    // it. Both planes open that pass with a Clear load and no quad at all.
     let ds = tex(0x3300);
     let mut s = fresh();
     s.set_depth_stencil_attachment(ds, BB_SIZE, false, true);
@@ -2329,13 +2317,19 @@ fn depth_and_stencil_clears_under_a_counting_query_share_the_fresh_pass() {
         0,
     ));
 
-    let depth = s.clear_depth(f32::to_bits(1.0));
-    let stencil = s.clear_stencil(1);
-    assert!(matches!(depth, DepthClearOutcome::EmitQuad { .. }));
-    assert!(matches!(stencil, StencilClearOutcome::EmitQuad { .. }));
+    let z = f32::to_bits(1.0);
+    assert_eq!(s.clear_depth(z), DepthClearOutcome::Folded);
+    assert_eq!(s.clear_stencil(1), StencilClearOutcome::Folded);
+    assert!(s.current_pass_closed(), "the counted pass ended first");
+    assert_eq!(s.passes().len(), 1);
+
+    s.emit_command(dummy_draw());
     assert_eq!(s.passes().len(), 2);
-    assert_eq!(s.passes()[1].depth_load(), DepthLoad::Load);
-    assert_eq!(s.passes()[1].stencil_load(), StencilLoad::Load);
+    assert_eq!(s.passes()[1].depth_load(), DepthLoad::Clear { value: z });
+    assert_eq!(
+        s.passes()[1].stencil_load(),
+        StencilLoad::Clear { value: 1 }
+    );
 }
 
 #[test]
@@ -3474,51 +3468,149 @@ fn distinct_depth_clear_values_in_same_pass_each_emit_quad() {
     assert_eq!(s.passes().len(), 1);
 }
 
-/// Cross-pass case: a tile sequence where each tile is its own pass.
+/// A covering depth re-clear of a target drawn earlier in the frame folds.
 ///
-/// A fresh `SetRenderTarget` between tiles breaks the pass. First
-/// tile's `Clear` lands as `pending_depth_clear` and the pass opens
-/// with `loadAction = Clear` for the full attachment (correct —
-/// first use of the texture). Second tile's `Clear` hits a CLOSED
-/// pass on a depth texture *already seen* this frame — folding into
-/// a fresh `loadAction = Clear` would let Metal wipe the first
-/// tile's draws. The fix opens the second pass with
-/// `loadAction = Load` and returns `EmitQuad` so the encoder layer
-/// emits a scissored clear-quad inside the new pass.
+/// The clear covers the whole attachment, so a full-attachment
+/// `loadAction = Clear` is exactly D3D9's result and nothing drawn before it
+/// needs preserving: no `Load` pass and no clear-quad.
 #[test]
-fn cross_pass_depth_clear_uses_load_plus_quad() {
+fn a_covering_depth_reclear_of_a_drawn_target_folds_into_the_load_action() {
     let mut s = fresh();
-    // Tile 0: open the first pass on depth(); Clear folds into load
-    // action; a draw lands in the pass; we end the pass (e.g. a
-    // SetRenderTarget switch).
     let z = f32::to_bits(1.0);
-    s.set_viewport(0, 0, 683, 683, 0.0, 1.0);
+    s.set_viewport(0, 0, BB_SIZE.0, BB_SIZE.1, 0.0, 1.0);
     assert_eq!(s.clear_depth(z), DepthClearOutcome::Folded);
     s.emit_command(dummy_draw());
-    assert_eq!(s.passes().len(), 1);
-    assert_eq!(s.passes()[0].depth_load(), DepthLoad::Clear { value: z });
     s.end_current_pass("test_color_rt_switch");
 
-    // Tile 1: Clear arrives on the same depth(). Depth is already
-    // in seen_depth_rts → cross-pass case fires. Pass opens with
-    // load=Load (preserving tile 0's content) and the outcome is
-    // EmitQuad so the encoder emits a scissored clear-quad.
-    s.set_viewport(683, 0, 683, 683, 0.0, 1.0);
-    let outcome = s.clear_depth(z);
-    assert!(
-        matches!(
-            outcome,
-            DepthClearOutcome::EmitQuad { value, viewport, .. }
-                if value == z && viewport == (683, 0, 683, 683)
-        ),
-        "cross-pass clear must return EmitQuad, got {outcome:?}",
-    );
+    let z2 = f32::to_bits(0.5);
+    assert_eq!(s.clear_depth(z2), DepthClearOutcome::Folded);
+    assert_eq!(s.passes().len(), 1, "the fold opens no pass of its own");
+    s.emit_command(dummy_draw());
     assert_eq!(s.passes().len(), 2);
+    assert_eq!(s.passes()[1].depth_load(), DepthLoad::Clear { value: z2 });
+}
+
+/// The stencil twin of the covering depth re-clear.
+#[test]
+fn a_covering_stencil_reclear_of_a_drawn_target_folds_into_the_load_action() {
+    let ds = tex(0x3300);
+    let mut s = fresh();
+    s.set_depth_stencil_attachment(ds, BB_SIZE, false, true);
+    s.set_viewport(0, 0, BB_SIZE.0, BB_SIZE.1, 0.0, 1.0);
+    s.emit_command(dummy_draw());
+    s.end_current_pass("test");
+
+    assert_eq!(s.clear_stencil(0x2A), StencilClearOutcome::Folded);
+    s.emit_command(dummy_draw());
+    assert_eq!(s.passes().len(), 2);
+    assert_eq!(
+        s.passes()[1].stencil_load(),
+        StencilLoad::Clear { value: 0x2A }
+    );
     assert_eq!(
         s.passes()[1].depth_load(),
         DepthLoad::Load,
-        "tile 1 pass must use Load so Metal preserves tile 0",
+        "a stencil-only clear leaves the depth plane loading"
     );
+}
+
+/// A pass that is open but holds no work takes a covering re-clear as its load action.
+#[test]
+fn a_covering_reclear_amends_an_open_pass_with_no_work() {
+    let mut s = fresh();
+    s.set_viewport(0, 0, BB_SIZE.0, BB_SIZE.1, 0.0, 1.0);
+    s.emit_command(dummy_draw());
+    s.end_current_pass("test");
+    s.ensure_pass_open();
+    assert_eq!(s.passes()[1].color_load(), ColorLoad::Load);
+
+    assert_eq!(s.clear_color(1, 2, 3, 4), ColorClearOutcome::Folded);
+    assert_eq!(s.clear_depth(f32::to_bits(1.0)), DepthClearOutcome::Folded);
+    assert_eq!(s.passes().len(), 2);
+    assert_eq!(
+        s.passes()[1].color_load(),
+        ColorLoad::Clear {
+            r: 1,
+            g: 2,
+            b: 3,
+            a: 4
+        }
+    );
+    assert!(matches!(
+        s.passes()[1].depth_load(),
+        DepthLoad::Clear { .. }
+    ));
+}
+
+/// A combined colour and depth re-clear of drawn targets paints no quad for either plane.
+///
+/// The colour plane runs first. Were it to paint, its quad would give the
+/// pass work and turn the depth plane into a quad as well.
+#[test]
+fn a_covering_colour_and_depth_reclear_paints_no_quad() {
+    let mut s = fresh();
+    s.set_viewport(0, 0, BB_SIZE.0, BB_SIZE.1, 0.0, 1.0);
+    s.emit_command(dummy_draw());
+    s.end_current_pass("test");
+
+    assert_eq!(s.clear_color(1, 2, 3, 4), ColorClearOutcome::Folded);
+    assert_eq!(s.clear_depth(f32::to_bits(1.0)), DepthClearOutcome::Folded);
+    s.emit_command(dummy_draw());
+    assert_eq!(s.passes().len(), 2);
+    assert!(matches!(
+        s.passes()[1].color_load(),
+        ColorLoad::Clear { .. }
+    ));
+    assert!(matches!(
+        s.passes()[1].depth_load(),
+        DepthLoad::Clear { .. }
+    ));
+    assert_eq!(
+        s.passes()[1].commands().len(),
+        2,
+        "the viewport and the draw"
+    );
+}
+
+/// Rule C discards the store of a pass whose target the next pass re-clears in full.
+#[test]
+fn a_covering_reclear_lets_rule_c_discard_the_previous_colour_store() {
+    let rt = tex(0x3000);
+    let mut s = fresh();
+    s.set_color_render_target(rt, 256, 256, RT_FORMAT, RenderScale::IDENTITY);
+    s.set_viewport(0, 0, 256, 256, 0.0, 1.0);
+    s.emit_command(dummy_draw());
+    s.set_depth_stencil_attachment(tex(0x5000), (256, 256), false, false);
+    s.clear_color(1, 2, 3, 4);
+    s.emit_command(dummy_draw());
+    s.end_current_pass("test");
+    s.finalize_store_actions(false);
+
+    assert_eq!(s.passes().len(), 2);
+    assert_eq!(s.passes()[0].color_store(), StoreAction::DontCare);
+    assert_eq!(s.passes()[1].color_store(), StoreAction::Store);
+}
+
+/// A sub-rect clear of a target drawn earlier is no whole-target clear.
+///
+/// The encoder asks the coverage predicate first and sends a strict
+/// sub-region to the region path, which opens the pass with `Load` so the
+/// earlier tile survives outside the quad.
+#[test]
+fn a_sub_rect_clear_of_a_drawn_target_takes_the_region_path() {
+    let mut s = fresh();
+    s.set_viewport(0, 0, BB_SIZE.0 / 2, BB_SIZE.1, 0.0, 1.0);
+    s.emit_command(dummy_draw());
+    s.end_current_pass("test");
+    s.set_viewport(BB_SIZE.0 / 2, 0, BB_SIZE.0 / 2, BB_SIZE.1, 0.0, 1.0);
+
+    assert!(!s.viewport_covers_color_attachment());
+    assert!(!s.viewport_covers_depth_attachment());
+    s.begin_region_color_clear();
+    s.begin_region_depth_stencil_clear();
+    assert_eq!(s.passes().len(), 2);
+    assert_eq!(s.passes()[1].color_load(), ColorLoad::Load);
+    assert_eq!(s.passes()[1].depth_load(), DepthLoad::Load);
 }
 
 /// Sampleable shadow maps must keep `Store` even when not sampled in this frame.
@@ -3991,20 +4083,24 @@ fn clear_with_work_in_a_multi_target_pass_emits_one_quad() {
 }
 
 #[test]
-fn clear_after_a_target_was_drawn_opens_a_load_pass_for_every_target() {
+fn clear_after_a_target_was_drawn_folds_into_every_targets_load_action() {
     let mut s = fresh();
     s.set_extra_color_render_target(1, Some(slot(tex(0x3000), BB_SIZE)));
     s.set_viewport(0, 0, BB_SIZE.0, BB_SIZE.1, 0.0, 1.0);
     s.emit_command(dummy_draw());
     // A depth change ends the pass; the extra target has content now.
     s.set_depth_stencil_attachment(tex(0x5000), BB_SIZE, false, false);
-    assert!(matches!(
-        s.clear_color(1, 2, 3, 4),
-        ColorClearOutcome::EmitQuad { .. }
-    ));
+    assert_eq!(s.clear_color(1, 2, 3, 4), ColorClearOutcome::Folded);
+    s.emit_command(dummy_draw());
     let pass = &s.passes()[1];
-    assert_eq!(pass.color_load(), ColorLoad::Load);
-    assert_eq!(pass.extra_color()[0].load(), ColorLoad::Load);
+    let clear = ColorLoad::Clear {
+        r: 1,
+        g: 2,
+        b: 3,
+        a: 4,
+    };
+    assert_eq!(pass.color_load(), clear);
+    assert_eq!(pass.extra_color()[0].load(), clear);
 }
 
 #[test]
@@ -4691,72 +4787,6 @@ fn a_real_present_still_dontcares_first_use() {
     assert_eq!(s.passes()[0].depth_load(), DepthLoad::DontCare);
 }
 
-#[test]
-fn a_clear_after_a_flush_folds_instead_of_a_scissored_quad() {
-    // The frame continues past a mid-frame flush, so the backbuffer stays
-    // "seen" for the load rules, yet a Clear issued after the flush must
-    // still fold to a full loadAction=Clear rather than the cross-pass
-    // scissored quad, because the pre-flush content is safely in VRAM.
-    //
-    // The sub-rect viewport is what makes the fold observable: it is the
-    // rect the cross-pass quad would clip to, so a `Folded` answer proves
-    // the flush cleared the segment's seen-set and no quad was chosen. It
-    // is not a claim about the viewport BOUND on a whole-target Clear:
-    // D3D9 does bound one, and the two encoder entry points
-    // (`clear_{color,depth_stencil}_bounded_to_viewport`) decide that a
-    // layer above, before calling in here.
-    let mut s = fresh();
-    s.set_viewport(0, 0, 640, 480, 0.0, 1.0);
-    s.emit_command(dummy_draw());
-    s.end_current_pass("test");
-    s.reset_frame(&FrameReset {
-        backbuffer: backbuffer(),
-        backbuffer_srgb: backbuffer_srgb(),
-        backbuffer_msaa: MetalHandle::NULL,
-        backbuffer_msaa_srgb: MetalHandle::NULL,
-        backbuffer_sample_count: 1,
-        backbuffer_size: BB_SIZE,
-        backbuffer_format: BB_FORMAT,
-        backbuffer_contents: BackbufferContents::Undefined,
-        depth_texture: depth(),
-        depth_size: BB_SIZE,
-        depth_has_stencil: false,
-        render_scale: RenderScale::IDENTITY,
-        continues_frame: true,
-    });
-    s.set_viewport(100, 100, 64, 64, 0.0, 1.0);
-    assert_eq!(
-        s.clear_color(1, 2, 3, 4),
-        ColorClearOutcome::Folded,
-        "a full clear after a flush folds, even though the target is still seen this frame",
-    );
-    // And the depth clear on the same sequence folds too, not a quad.
-    assert_eq!(
-        s.clear_depth(f32::to_bits(1.0)),
-        DepthClearOutcome::Folded,
-        "depth clear after a flush folds as well",
-    );
-}
-
-#[test]
-fn a_clear_within_one_segment_still_paints_a_quad() {
-    // The contrast: within one submission segment (no flush), a second
-    // clear of a target already drawn takes the cross-pass quad path so a
-    // full loadAction=Clear cannot wipe the earlier content.
-    let mut s = fresh();
-    s.set_viewport(0, 0, 683, 683, 0.0, 1.0);
-    s.emit_command(dummy_draw());
-    s.end_current_pass("test");
-    s.set_viewport(683, 0, 683, 683, 0.0, 1.0);
-    assert!(
-        matches!(
-            s.clear_color(1, 2, 3, 4),
-            ColorClearOutcome::EmitQuad { .. }
-        ),
-        "a cross-pass clear inside one segment still scissors a quad",
-    );
-}
-
 /// A different mip level of the same depth texture is a different attachment.
 #[test]
 fn depth_level_change_breaks_the_pass_and_a_repeat_bind_does_not() {
@@ -4879,6 +4909,70 @@ fn viewport_coverage_converts_through_the_render_scale() {
     s.set_viewport(0, 0, BB_SIZE.0 / 2, BB_SIZE.1 / 2, 0.0, 1.0);
     assert!(!s.viewport_covers_color_attachment());
     assert!(!s.viewport_covers_depth_attachment());
+}
+
+/// A clipped `Clear` region is measured like the viewport, per attachment.
+///
+/// A scissor or rect that spans the target turns a region clear into a
+/// whole-target one, which may fold into the load action.
+#[test]
+fn region_coverage_is_answered_per_attachment() {
+    let mut s = fresh();
+    let whole = (0, 0, BB_SIZE.0, BB_SIZE.1);
+
+    // A scissor equal to the target, and a rect larger than it.
+    assert!(s.region_covers_color_attachment(whole));
+    assert!(s.region_covers_depth_attachment(whole));
+    assert!(s.region_covers_color_attachment((0, 0, 8192, 8192)));
+    assert!(s.region_covers_depth_attachment((0, 0, 8192, 8192)));
+
+    // A scissor smaller than the target on one axis, or off the origin.
+    for region in [
+        (0, 0, BB_SIZE.0 - 1, BB_SIZE.1),
+        (0, 0, BB_SIZE.0, BB_SIZE.1 - 1),
+        (1, 0, BB_SIZE.0, BB_SIZE.1),
+        (0, 1, BB_SIZE.0, BB_SIZE.1),
+    ] {
+        assert!(!s.region_covers_color_attachment(region), "{region:?}");
+        assert!(!s.region_covers_depth_attachment(region), "{region:?}");
+    }
+
+    // A depth surface larger than render target 0 is judged against its own
+    // extent: the region that covers the colour target leaves depth out.
+    s.set_depth_stencil_attachment(tex(0x9100), (1024, 1024), false, false);
+    assert!(s.region_covers_color_attachment(whole));
+    assert!(!s.region_covers_depth_attachment(whole));
+    assert!(s.region_covers_depth_attachment((0, 0, 1024, 1024)));
+
+    // Nothing bound means nothing to bound.
+    s.set_depth_stencil_attachment(MetalHandle::NULL, (0, 0), false, false);
+    assert!(s.region_covers_depth_attachment((5, 5, 1, 1)));
+}
+
+/// Region coverage compares in the bound texture's space.
+///
+/// The encoder converts the game's rects before clipping them, so a rect
+/// over the whole reported back buffer covers the smaller rasterized one and
+/// a rect over the rasterized size in reported numbers does not.
+#[test]
+fn region_coverage_is_measured_in_texture_space() {
+    let s = fresh_scaled();
+    let texture_region = |r: (i32, i32, i32, i32)| {
+        let (x1, y1, x2, y2) = s.target_scale().rect_edges_i32(r);
+        (
+            x1.cast_unsigned(),
+            y1.cast_unsigned(),
+            (x2 - x1).cast_unsigned(),
+            (y2 - y1).cast_unsigned(),
+        )
+    };
+    let full = (0, 0, BB_SIZE.0.cast_signed(), BB_SIZE.1.cast_signed());
+    assert!(s.region_covers_color_attachment(texture_region(full)));
+    assert!(s.region_covers_depth_attachment(texture_region(full)));
+
+    let half = (0, 0, full.2 / 2, full.3 / 2);
+    assert!(!s.region_covers_color_attachment(texture_region(half)));
+    assert!(!s.region_covers_depth_attachment(texture_region(half)));
 }
 
 #[test]
@@ -5872,7 +5966,7 @@ fn a_clear_only_pass_does_not_fold_past_a_depth_transfer_out_of_its_target() {
     let destination = tex(0x4007);
     let mut s = fresh();
     s.set_color_render_target(other_rt, 256, 256, RT_FORMAT, RenderScale::IDENTITY);
-    s.set_depth_stencil_attachment(source, BB_SIZE, false, false);
+    s.set_depth_stencil_attachment(source, (256, 256), false, false);
     s.clear_depth(f32::to_bits(1.0));
     s.push_leading_blit_after_clears(depth_transfer(source, destination), "test");
     s.emit_command(dummy_draw());
