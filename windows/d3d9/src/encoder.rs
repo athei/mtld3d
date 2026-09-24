@@ -2788,6 +2788,20 @@ impl FrameEncoder {
         self.pass_state.note_draw_color_write_mask(mask);
     }
 
+    /// Tag the current pass with what the draw about to be emitted does to depth and stencil.
+    ///
+    /// Forwarded into `PassState`; see
+    /// [`PassState::note_draw_depth_stencil`]. Opens a pass first if none is
+    /// live.
+    pub fn note_draw_depth_stencil(
+        &mut self,
+        depth_stencil: &DepthStencilSnapshot,
+        attach: mtld3d_core::pipeline_state::PipelineAttachFlags,
+    ) {
+        self.pass_state
+            .note_draw_depth_stencil(depth_stencil, attach);
+    }
+
     pub fn emit_command(&mut self, cmd: Command) {
         self.pass_state.emit_command(cmd);
     }
@@ -4982,6 +4996,8 @@ impl FrameEncoder {
             return;
         }
         let depth_state = self.get_or_create_depth_stencil(&snapshot, false);
+        self.pass_state
+            .note_depth_stencil_clear_quad(stencil.is_some());
         // `Clear`'s Z is a raw depth value: D3D9's `MinZ`/`MaxZ` scale a
         // transformed vertex's z, not a clear. The quad writes its value as
         // the vertex's clip-space z, so Metal's viewport depth transform would
@@ -7602,6 +7618,7 @@ impl FrameEncoder {
                 if ordered {
                     self.pass_state.push_pending_leading_blit(preserve);
                 } else {
+                    self.pass_state.note_stencil_blit(&preserve);
                     self.frame_blit_commands.push(preserve);
                 }
             }
@@ -10434,6 +10451,10 @@ fn pass_to_descriptor(
         PassStoreAction::Store => StoreAction::Store,
         PassStoreAction::DontCare => StoreAction::DontCare,
     };
+    let stencil_store_action = match p.stencil_store() {
+        PassStoreAction::Store => StoreAction::Store,
+        PassStoreAction::DontCare => StoreAction::DontCare,
+    };
     log_pass_depth_attach(p);
     let leading = p.leading_blits();
     let visibility_result_buffer =
@@ -10467,6 +10488,7 @@ fn pass_to_descriptor(
         depth_store_action,
         depth_clear_value,
         stencil_load_action,
+        stencil_store_action,
         stencil_clear_value,
         command_count: u32::try_from(p.commands().len()).expect("per-pass command count fits u32"),
         leading_blits_count: u32::try_from(leading.len())
@@ -10479,6 +10501,7 @@ fn pass_to_descriptor(
             p.color_level(),
             p.depth_level(),
         ),
+        reserved: 0,
         extra_color: core::array::from_fn(|i| {
             let a = &p.extra_color()[i];
             if !a.is_bound() {
@@ -10558,6 +10581,7 @@ fn trailing_blit_descriptor(trailing_blits: &[BlitCommand]) -> PassDescriptor {
         depth_store_action: StoreAction::DontCare,
         depth_clear_value: 0,
         stencil_load_action: LoadAction::DontCare,
+        stencil_store_action: StoreAction::DontCare,
         stencil_clear_value: 0,
         command_count: 0,
         leading_blits_count: u32::try_from(trailing_blits.len())
@@ -10570,6 +10594,7 @@ fn trailing_blit_descriptor(trailing_blits: &[BlitCommand]) -> PassDescriptor {
             0,
             0,
         ),
+        reserved: 0,
         extra_color: [ExtraColorDesc::NONE; 3],
     }
 }

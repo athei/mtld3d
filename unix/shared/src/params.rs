@@ -59,7 +59,7 @@ const _: () = {
     assert!(core::mem::size_of::<DestroyCommandQueueParams>() == 40);
     assert!(core::mem::size_of::<SubmitFrameParams>() == 120);
     assert!(core::mem::size_of::<SetCursorOverlayParams>() == 56);
-    assert!(core::mem::size_of::<PassDescriptor>() == 200);
+    assert!(core::mem::size_of::<PassDescriptor>() == 208);
 };
 
 /// One-shot "register `env_logger` on the unix side" thunk.
@@ -824,11 +824,9 @@ pub struct PassDescriptor {
     pub clear_b: u32,                               // in: f32 bits
     pub clear_a: u32,                               // in: f32 bits
     pub depth_load_action: LoadAction,              // in
-    /// Applies to both the depth attachment and the stencil attachment.
+    /// Store action for the depth plane alone.
     ///
-    /// The stencil half is live only when the depth texture is
-    /// `Depth32Float_Stencil8`, since mtld3d uses the combined format.
-    /// The unix side mirrors this value to both `setStoreAction:` calls.
+    /// The stencil plane of a combined texture takes `stencil_store_action`.
     pub depth_store_action: StoreAction, // in
     pub depth_clear_value: u32,                     // in: f32 bits (default 1.0)
     /// Load action for the stencil half of a combined depth/stencil texture.
@@ -838,6 +836,13 @@ pub struct PassDescriptor {
     /// reset stencil while carrying depth forward. Ignored when the depth
     /// texture's format has no stencil plane.
     pub stencil_load_action: LoadAction, // in
+    /// Store action for the stencil half of a combined depth/stencil texture.
+    ///
+    /// Independent of `depth_store_action`: the two planes of a
+    /// `Depth32Float_Stencil8` attachment each take their own store action,
+    /// so a plane nothing reads later is discarded while the other is kept.
+    /// Ignored when the depth texture's format has no stencil plane.
+    pub stencil_store_action: StoreAction, // in
     pub stencil_clear_value: u32,                   // in: 0..=255
     pub command_count: u32,                         // in
     pub leading_blits_count: u32,                   // in
@@ -849,6 +854,8 @@ pub struct PassDescriptor {
     /// attachment's mip level. Ordinary 2D level-zero passes therefore retain
     /// their previous 0/1 value and the descriptor keeps its size.
     pub pass_flags: u32, // in
+    /// Keeps the `u32` run even, so `extra_color` needs no implicit padding.
+    pub reserved: u32,
     /// Render targets 1..3 (`colorAttachments[1..=3]`); `texture` null = unbound.
     ///
     /// They share `clear_r..clear_a` with attachment 0 (a D3D9 `Clear` has

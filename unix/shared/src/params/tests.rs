@@ -126,8 +126,8 @@ fn frame_param_layouts_match_wow64() {
     assert_eq!(core::mem::align_of::<CreateTexturesBatchParams>(), 8);
     assert_eq!(core::mem::align_of::<TextureCreateDesc>(), 8);
 
-    // PassDescriptor: 6 * u64 + 14 * u32 + 3 * ExtraColorDesc = 48 + 56 + 96 = 200.
-    assert_eq!(core::mem::size_of::<PassDescriptor>(), 200);
+    // PassDescriptor: 6 * u64 + 16 * u32 + 3 * ExtraColorDesc = 48 + 64 + 96 = 208.
+    assert_eq!(core::mem::size_of::<PassDescriptor>(), 208);
     // ExtraColorDesc: 8 texture + 8 resolve + 4 subresource + 4 load + 4 store
     // + 4 reserved = 32.
     assert_eq!(core::mem::size_of::<ExtraColorDesc>(), 32);
@@ -179,7 +179,7 @@ fn pass_descriptor_flags_preserve_ordinary_pass_bytes() {
         PassDescriptor::pack_flags(true, 5, 9, 3),
         1 | (5 << 1) | (9 << 12) | (3 << 16)
     );
-    assert_eq!(core::mem::size_of::<PassDescriptor>(), 200);
+    assert_eq!(core::mem::size_of::<PassDescriptor>(), 208);
 }
 
 /// A blit-only descriptor carrying `pass_flags`, for reading the flags back.
@@ -201,10 +201,12 @@ fn pass_with_flags(pass_flags: u32) -> PassDescriptor {
         depth_store_action: StoreAction::DontCare,
         depth_clear_value: 0,
         stencil_load_action: LoadAction::DontCare,
+        stencil_store_action: StoreAction::DontCare,
         stencil_clear_value: 0,
         command_count: 0,
         leading_blits_count: 0,
         pass_flags,
+        reserved: 0,
         extra_color: [ExtraColorDesc::NONE; 3],
     }
 }

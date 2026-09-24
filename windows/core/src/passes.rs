@@ -116,11 +116,10 @@ const ENABLE_FIRST_USE_DONTCARE: bool = true;
 /// The stencil plane shares the depth texture, so its first use in a frame
 /// takes the same `DontCare` the depth plane takes, under the same
 /// predicate. Stencil written in frame N and tested in frame N+1 without a
-/// clear in between was already lost before this rule: the stencil store
-/// mirrors the depth store, so whenever Rule B discards depth at frame end
-/// the stencil content goes with it. Flip to `false` if a game surfaces
-/// that carries stencil across `Present` and a frame-start `Load` turns out
-/// to matter.
+/// clear in between was already lost before this rule: Rule B discards the
+/// stencil store together with the depth store at frame end. Flip to
+/// `false` if a game surfaces that carries stencil across `Present` and a
+/// frame-start `Load` turns out to matter.
 const ENABLE_FIRST_USE_STENCIL_DONTCARE: bool = true;
 
 /// Compile-time gate for Rule B (last-use depth/stencil `DontCare`).
@@ -155,6 +154,38 @@ const ENABLE_LAST_USE_DEPTH_DONTCARE: bool = true;
 /// but expects to read the underlying rt contents in some way mtld3d
 /// doesn't model (no such case is known).
 const ENABLE_NEXT_CLEAR_COLOR_DONTCARE: bool = true;
+
+/// Compile-time gate for Rule C's depth arm (depth and stencil `Store=DontCare`).
+///
+/// Applies when the next pass in the submission on the same depth texture
+/// and mip level opens with a full-attachment `Clear` of the plane: the depth
+/// store goes on a `DepthLoad::Clear`, the stencil store on a
+/// `StencilLoad::Clear`. Skipped for sampleable or ever-sampled textures and
+/// when anything between the two passes reads or writes the texture. Flip to
+/// `false` if a game surfaces that observes depth between a pass and a later
+/// clear through a path the scan does not model.
+const ENABLE_NEXT_CLEAR_DEPTH_DONTCARE: bool = true;
+
+/// Compile-time gate for discarding a stencil plane nothing has written.
+///
+/// A depth-stencil surface starts with undefined contents in D3D9, so until
+/// a stencil clear, a stencil-writing draw or a blit that can carry stencil
+/// reaches the texture, its stencil plane holds nothing to preserve and every
+/// pass on it loads and stores that plane `DontCare`. Many titles ask for
+/// D24S8 and never touch stencil. Flip to `false` if a game surfaces that
+/// writes stencil through a path `stencil_written_textures` does not see.
+const ENABLE_UNWRITTEN_STENCIL_DONTCARE: bool = true;
+
+/// Compile-time gate for discarding the depth loads of a pass that never uses depth.
+///
+/// A pass whose draws and clear-quads neither test nor write depth or
+/// stencil, and whose store of a plane is already `DontCare`, loads that
+/// plane `DontCare` instead of `Load`: nothing inside the pass reads it and
+/// nothing after it can. Typical case: an interface pass drawn over the scene
+/// with the depth test off, on the depth surface's last pass of the frame.
+/// Flip to `false` if a game surfaces that reads depth in a pass through a
+/// draw path that does not report its depth-stencil state.
+const ENABLE_UNUSED_DEPTH_LOAD_DONTCARE: bool = true;
 
 /// Compile-time gate for Rule F (cull clear-only passes with dead Stores).
 ///
@@ -318,9 +349,10 @@ pub enum DepthLoad {
 /// `Depth32Float_Stencil8` attachment take independent load actions:
 /// `Clear(D3DCLEAR_STENCIL)` without `D3DCLEAR_ZBUFFER` resets stencil while
 /// carrying depth forward, and a stencil clear value is an integer rather
-/// than an f32 bit pattern. `DontCare` is Rule A's first-use discard and
-/// nothing else: games carry stencil across passes within a frame, so a
-/// later pass in the same frame always loads.
+/// than an f32 bit pattern. `DontCare` comes from Rule A's first-use
+/// discard, from a stencil plane nothing has written yet, and from a pass
+/// that neither uses nor keeps the plane; games carry stencil across passes
+/// within a frame, so a later pass on a written plane that it uses loads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StencilLoad {
     Load,
@@ -333,9 +365,10 @@ pub enum StencilLoad {
 /// `Store` writes tile memory back to device memory; `DontCare`
 /// discards it. Used on the last pass with a given depth attachment
 /// in a frame (Rule B, a kept divergence: see
-/// `ENABLE_LAST_USE_DEPTH_DONTCARE`) and on color
-/// attachments whose next consumer this frame begins with a full-
-/// attachment `Clear` (Rule C).
+/// `ENABLE_LAST_USE_DEPTH_DONTCARE`), on colour, depth and stencil
+/// attachments whose next consumer this submission begins with a full-
+/// attachment `Clear` (Rule C), on a stencil plane nothing has written, and
+/// on the presented multisampled back buffer once its resolve is taken.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StoreAction {
     Store,
@@ -543,16 +576,7 @@ pub fn draw_writes_nothing(writes: &DrawWrites<'_>) -> bool {
     let depth_writes = writes.attach.contains(PipelineAttachFlags::HAS_DEPTH)
         && ds.depth_enable != 0
         && ds.depth_write != 0;
-    let face_keeps = |face: StencilFaceState| {
-        [face.fail_op, face.depth_fail_op, face.pass_op]
-            .iter()
-            .all(|&op| d3d_to_metal_stencil_op(u32::from(op)) == StencilOp::Keep)
-    };
-    let stencil_writes = writes.attach.contains(PipelineAttachFlags::HAS_STENCIL)
-        && ds.stencil_enable != 0
-        && ds.write_mask & STENCIL_MASK_BITS != 0
-        && !(face_keeps(ds.front) && face_keeps(ds.back));
-    !depth_writes && !stencil_writes
+    !depth_writes && !draw_writes_stencil(ds, writes.attach)
 }
 
 impl PassColorAttachment {
@@ -792,16 +816,25 @@ pub struct Pass {
     depth_size: (u32, u32),
     depth_load: DepthLoad,
     stencil_load: StencilLoad,
-    /// Defaults to `Store`.
+    /// Store action of the depth plane; defaults to `Store`.
     ///
     /// Flipped to `DontCare` by `finalize_store_actions` on the *last*
     /// pass with each depth texture in the frame (Rule B), unless the texture
     /// is sampleable or sampled. D3D9 keeps depth and stencil across
     /// `Present` unless the game asked to discard them; dropping them anyway
-    /// is a kept divergence, see [`ENABLE_LAST_USE_DEPTH_DONTCARE`]. The unix
-    /// side mirrors this to the stencil attachment when the texture is
-    /// `Depth32Float_Stencil8`.
+    /// is a kept divergence, see [`ENABLE_LAST_USE_DEPTH_DONTCARE`]. Also
+    /// flipped when the next pass on the same texture and level clears the
+    /// depth plane in full (Rule C's depth arm).
     depth_store: StoreAction,
+    /// Store action of the stencil plane of a combined texture; defaults to `Store`.
+    ///
+    /// Decided apart from `depth_store`, since each plane of a
+    /// `Depth32Float_Stencil8` attachment takes its own store action: Rule B
+    /// discards both, Rule C's depth arm discards the plane the next pass
+    /// clears, and a stencil plane nothing has written is discarded outright
+    /// (see [`ENABLE_UNWRITTEN_STENCIL_DONTCARE`]). Inert on a texture with no
+    /// stencil plane.
+    stencil_store: StoreAction,
     viewport: (u32, u32, u32, u32),
     commands: Vec<Command>,
     /// Blits replayed inside an `MTLBlitCommandEncoder` *before* this pass's render encoder begins.
@@ -823,14 +856,10 @@ pub struct Pass {
     /// set and keeps the `MTL_DEBUG_LAYER` validator from retaining
     /// per-pass tracking state for it.
     has_counting_visibility: bool,
-    /// `true` when the depth attachment is a sampleable shadow map.
+    /// What the depth attachment is and what the pass's draws did with it.
     ///
-    /// Created via `CreateTexture(D24X8, USAGE_DEPTHSTENCIL)`. Rule B
-    /// short-circuits on this flag: any sampleable depth keeps `Store`
-    /// regardless of whether it's been sampled this session yet —
-    /// avoids the bootstrap-frame gap where a cascade sampled only
-    /// every Nth frame loses content on the intervening frames.
-    depth_is_sampleable: bool,
+    /// See [`PassDepthFlags`] for the bits.
+    depth_flags: PassDepthFlags,
     /// Latched `true` as soon as any draw arrives at the pass with `D3DRS_COLORWRITEENABLE != 0`.
     ///
     /// Default `false` at pass-open. When the pass closes with this still
@@ -1046,6 +1075,11 @@ impl Pass {
     pub const fn depth_store(&self) -> StoreAction {
         self.depth_store
     }
+    /// Store action of the stencil plane, meaningful only when the depth texture has one.
+    #[must_use]
+    pub const fn stencil_store(&self) -> StoreAction {
+        self.stencil_store
+    }
     /// `(origin_x, origin_y, width, height)` in pixels.
     ///
     /// `x, y` are non-zero when the game sub-rects the render target via
@@ -1173,6 +1207,37 @@ bitflags::bitflags! {
         /// pipeline-vs-render-pass validation rejects them (undefined behaviour /
         /// heap corruption with the layer off).
         const DEPTH_HAS_STENCIL = 1 << 2;
+    }
+}
+
+bitflags::bitflags! {
+    /// What a pass's depth attachment is, and what the pass did with it.
+    ///
+    /// `SAMPLEABLE` and `HAS_STENCIL` are folded from
+    /// [`CurrentAttachmentFlags`] when the pass opens; `USED` and
+    /// `STENCIL_WRITTEN` are set while the pass records, by the draw path and
+    /// the depth-stencil clear-quad.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    struct PassDepthFlags: u8 {
+        /// The depth attachment is a sampleable shadow map.
+        ///
+        /// Created via `CreateTexture(D24X8, USAGE_DEPTHSTENCIL)`. Rule B
+        /// short-circuits on this flag: any sampleable depth keeps `Store`
+        /// regardless of whether it's been sampled this session yet, which
+        /// avoids the bootstrap-frame gap where a cascade sampled only every
+        /// Nth frame loses content on the intervening frames.
+        const SAMPLEABLE = 1 << 0;
+        /// The depth attachment carries a stencil plane (`Depth32Float_Stencil8`).
+        const HAS_STENCIL = 1 << 1;
+        /// A draw or clear-quad in the pass tested or wrote depth or stencil.
+        ///
+        /// A draw sets it when its depth-stencil state enables the depth test
+        /// or the stencil test on a plane the pass attaches; a depth or
+        /// stencil clear-quad sets it too. Every other helper draw runs with
+        /// the inert state, which neither reads nor writes the attachment.
+        const USED = 1 << 2;
+        /// A draw or clear-quad in the pass can write the stencil plane.
+        const STENCIL_WRITTEN = 1 << 3;
     }
 }
 
@@ -1438,6 +1503,20 @@ pub struct PassState {
     /// entry leaves only through `unregister_texture`, when the `MTLTexture`
     /// behind the handle is destroyed.
     seen_sampled_textures: FxHashSet<MetalHandle<MTLTextureKind>>,
+    /// Depth textures whose stencil plane something has written this session.
+    ///
+    /// A stencil `Clear` load, a stencil clear-quad or a draw that can change
+    /// stencil enters its texture when `finalize_store_actions` reads the
+    /// submission's passes; a blit that can write a stencil plane (a stencil
+    /// upload, a depth transfer, a texture copy) enters its destination when
+    /// it is queued, through [`PassState::note_stencil_blit`]. While a texture
+    /// is absent its stencil plane has never held anything D3D9 defines (a new
+    /// depth-stencil surface starts undefined), so its passes load and store
+    /// that plane `DontCare`. Session-wide like `seen_sampled_textures`: an
+    /// entry leaves only through `unregister_texture`, once the GPU has
+    /// retired every submission that names the handle. A stale entry for a
+    /// reused address only keeps a store that could have been dropped.
+    stencil_written_textures: FxHashSet<MetalHandle<MTLTextureKind>>,
     /// Texture handles bound as a sampler input so far THIS frame, in op-stream order.
     ///
     /// Populated at the `emit_command` funnel beside
@@ -1614,6 +1693,7 @@ impl PassState {
             current_color_logical_size: (0, 0),
             backbuffer_logical_size: (0, 0),
             seen_sampled_textures: FxHashSet::with_capacity_and_hasher(8, FxBuildHasher),
+            stencil_written_textures: FxHashSet::with_capacity_and_hasher(2, FxBuildHasher),
             frame_sampled_textures: FxHashSet::with_capacity_and_hasher(64, FxBuildHasher),
             texture_view_to_base: FxHashMap::with_capacity_and_hasher(8, FxBuildHasher),
             srgb_base_to_twin: FxHashMap::with_capacity_and_hasher(8, FxBuildHasher),
@@ -1922,7 +2002,8 @@ impl PassState {
     ///
     /// Covers `seen_color_rts`, `seen_depth_rts`, `blit_written_rts`,
     /// `seen_sampled_textures`, `frame_sampled_textures`,
-    /// `seen_sampleable_depth_textures`, and the two cascade-probe counters.
+    /// `seen_sampleable_depth_textures`, `stencil_written_textures`, and the
+    /// two cascade-probe counters.
     /// View identity also lives until this retirement boundary, so released
     /// textures remain visible to queued pass store analysis. Current attachment
     /// handles are bindings that [`Self::reset_frame`] reseeds.
@@ -1948,6 +2029,7 @@ impl PassState {
         self.seen_sampled_textures.remove(&texture);
         self.frame_sampled_textures.remove(&texture);
         self.seen_sampleable_depth_textures.remove(&texture);
+        self.stencil_written_textures.remove(&texture);
         self.frame_caster_writes.remove(&texture);
         self.frame_cascade_samples.remove(&texture);
     }
@@ -2660,6 +2742,69 @@ impl PassState {
         }
     }
 
+    /// Record what a draw about to be emitted does with the pass's depth-stencil attachment.
+    ///
+    /// `depth_stencil` is the state the draw runs with, already gated on the
+    /// stencil plane the pass attaches, and `attach` carries the planes the
+    /// pipeline declares (`HAS_DEPTH`, `HAS_STENCIL`). Tags the pass `USED`
+    /// when the draw enables the depth or the stencil test on a plane it
+    /// attaches, and `STENCIL_WRITTEN` when it can change stencil. Opens a
+    /// pass first if none is live (mirrors the `emit_command` contract).
+    pub fn note_draw_depth_stencil(
+        &mut self,
+        depth_stencil: &DepthStencilSnapshot,
+        attach: PipelineAttachFlags,
+    ) {
+        self.ensure_pass_open();
+        let tests_depth =
+            attach.contains(PipelineAttachFlags::HAS_DEPTH) && depth_stencil.depth_enable != 0;
+        let tests_stencil =
+            attach.contains(PipelineAttachFlags::HAS_STENCIL) && depth_stencil.stencil_enable != 0;
+        if let Some(pass) = self.passes.last_mut() {
+            if tests_depth || tests_stencil {
+                pass.depth_flags.insert(PassDepthFlags::USED);
+            }
+            if draw_writes_stencil(depth_stencil, attach) {
+                pass.depth_flags.insert(PassDepthFlags::STENCIL_WRITTEN);
+            }
+        }
+    }
+
+    /// Record a depth or stencil clear-quad about to be emitted into the pass.
+    ///
+    /// The quad writes the planes it clears, so the pass uses its attachment,
+    /// and a quad that clears stencil writes the stencil plane.
+    pub fn note_depth_stencil_clear_quad(&mut self, clears_stencil: bool) {
+        self.ensure_pass_open();
+        if let Some(pass) = self.passes.last_mut() {
+            pass.depth_flags.insert(PassDepthFlags::USED);
+            if clears_stencil {
+                pass.depth_flags.insert(PassDepthFlags::STENCIL_WRITTEN);
+            }
+        }
+    }
+
+    /// Enter the destination of a blit that can write a stencil plane into the written set.
+    ///
+    /// A stencil upload writes it outright; a depth transfer carries it when
+    /// both ends have one, and a texture copy of a combined texture copies
+    /// it too. Neither records the formats, so both count. Every queued
+    /// leading blit passes through here; the encoder calls it for the blits
+    /// it puts at the head of the frame instead.
+    pub fn note_stencil_blit(&mut self, blit: &BlitCommand) {
+        let writes_stencil = matches!(
+            BlitCommandType::from_repr(blit.cmd),
+            Some(
+                BlitCommandType::CopyBufferToStencil
+                    | BlitCommandType::TransferDepth
+                    | BlitCommandType::CopyTextureToTexture
+            )
+        );
+        if writes_stencil && let Some(dst) = blit_written_texture(blit) {
+            self.stencil_written_textures.insert(dst);
+        }
+    }
+
     /// Note a draw targeting the given depth handle.
     ///
     /// Increments the per-frame caster-writes counter iff the handle was ever
@@ -2841,6 +2986,24 @@ impl PassState {
             .iter()
             .map(|p| p.commands.capacity() as u64 * elem)
             .sum()
+    }
+
+    /// The depth flags a pass opened now starts with: what the bound attachment is.
+    const fn pass_depth_flags(&self) -> PassDepthFlags {
+        let mut flags = PassDepthFlags::empty();
+        if self
+            .current_attachments
+            .contains(CurrentAttachmentFlags::DEPTH_SAMPLEABLE)
+        {
+            flags = flags.union(PassDepthFlags::SAMPLEABLE);
+        }
+        if self
+            .current_attachments
+            .contains(CurrentAttachmentFlags::DEPTH_HAS_STENCIL)
+        {
+            flags = flags.union(PassDepthFlags::HAS_STENCIL);
+        }
+        flags
     }
 
     /// Ensure a pass is live for the next command.
@@ -3042,13 +3205,12 @@ impl PassState {
             depth_load,
             stencil_load,
             depth_store: StoreAction::Store,
+            stencil_store: StoreAction::Store,
             viewport: (vpx, vpy, vpw, vph),
             commands,
             leading_blits,
             has_counting_visibility: false,
-            depth_is_sampleable: self
-                .current_attachments
-                .contains(CurrentAttachmentFlags::DEPTH_SAMPLEABLE),
+            depth_flags: self.pass_depth_flags(),
             color_writes_observed: false,
             color_clear_quad_ranges: Vec::new(),
             extra_color,
@@ -3171,11 +3333,12 @@ impl PassState {
             depth_load: DepthLoad::DontCare,
             stencil_load: StencilLoad::DontCare,
             depth_store: StoreAction::DontCare,
+            stencil_store: StoreAction::DontCare,
             viewport: (x, y, w, h),
             commands: cmds,
             leading_blits,
             has_counting_visibility: false,
-            depth_is_sampleable: false,
+            depth_flags: PassDepthFlags::empty(),
             // The quad writes colour, so Rule H must not strip the attachment
             // it renders into.
             color_writes_observed: true,
@@ -3232,7 +3395,8 @@ impl PassState {
     /// counts as read
     /// (`seen_sampled_textures`, which Rules B/C consult before discarding a
     /// store). The destination of any texture-writing blit goes into
-    /// `blit_written_rts` so Rule A loads it instead of discarding the copy.
+    /// `blit_written_rts` so Rule A loads it instead of discarding the copy,
+    /// and one that can write a stencil plane into `stencil_written_textures`.
     pub fn push_pending_leading_blit(&mut self, blit: BlitCommand) {
         if let Some(src) = blit_read_texture(&blit) {
             self.note_texture_read(src);
@@ -3240,6 +3404,7 @@ impl PassState {
         if let Some(dst) = blit_written_texture(&blit) {
             self.blit_written_rts.insert(dst);
         }
+        self.note_stencil_blit(&blit);
         self.pending_leading_blits.push(blit);
     }
 
@@ -3360,13 +3525,12 @@ impl PassState {
             depth_load,
             stencil_load,
             depth_store: StoreAction::Store,
+            stencil_store: StoreAction::Store,
             viewport: (0, 0, width, height),
             commands,
             leading_blits: core::mem::take(&mut self.pending_leading_blits),
             has_counting_visibility: false,
-            depth_is_sampleable: self
-                .current_attachments
-                .contains(CurrentAttachmentFlags::DEPTH_SAMPLEABLE),
+            depth_flags: self.pass_depth_flags(),
             color_writes_observed: false,
             color_clear_quad_ranges: Vec::new(),
             extra_color: core::array::from_fn(|_| PassColorAttachment::NONE),
@@ -4370,7 +4534,8 @@ impl PassState {
     ///
     /// Runs after Rules B/C finalise. A pass with zero draw commands,
     /// no leading blits, and every attachment's Store flipped to
-    /// `DontCare` writes nothing to VRAM and exists purely as encoder
+    /// `DontCare` (the stencil plane's included, which is stored apart
+    /// from depth) writes nothing to VRAM and exists purely as encoder
     /// overhead; drop it. Typical case: a cascade init clear-only pass
     /// for a depth texture that is never sampled this frame, so Rule B
     /// flipped depth Store=DontCare on top of Rule C already flipping
@@ -4397,8 +4562,10 @@ impl PassState {
                 || p.bound_color_attachments()
                     .iter()
                     .any(|a| matches!(a.store, StoreAction::Store));
-            let depth_writes =
-                !p.depth_texture.is_null() && matches!(p.depth_store, StoreAction::Store);
+            let depth_writes = !p.depth_texture.is_null()
+                && (matches!(p.depth_store, StoreAction::Store)
+                    || (p.depth_flags.contains(PassDepthFlags::HAS_STENCIL)
+                        && matches!(p.stencil_store, StoreAction::Store)));
             let keep = color_writes || depth_writes;
             if !keep {
                 recycle_command_vec(&mut self.command_vec_pool, core::mem::take(&mut p.commands));
@@ -4875,6 +5042,11 @@ impl PassState {
     /// continuation still needs. Rule C (next-clear) still runs, since a pass that a later
     /// pass *in this submission* clears is provably overwritten regardless of whether the
     /// frame ends here.
+    ///
+    /// After Rules B and C come Rule C's depth arm (a depth or stencil store the next
+    /// pass on the plane clears), the discard of stencil nothing has written, the
+    /// discard of depth loads in a pass that never uses depth, and the multisample
+    /// resolves, which on a presenting submit also drop the back buffer's samples.
     pub fn finalize_store_actions(&mut self, frame_continues: bool) {
         if ENABLE_LAST_USE_DEPTH_DONTCARE && !frame_continues {
             let mut handled: FxHashSet<MetalHandle<MTLTextureKind>> =
@@ -4884,7 +5056,7 @@ impl PassState {
                     continue;
                 }
                 if handled.insert(pass.depth_texture) {
-                    if pass.depth_is_sampleable {
+                    if pass.depth_flags.contains(PassDepthFlags::SAMPLEABLE) {
                         if log_enabled!(target: TRACE_TARGET, Level::Trace) {
                             trace!(
                                 target: TRACE_TARGET,
@@ -4902,6 +5074,7 @@ impl PassState {
                         }
                     } else {
                         pass.depth_store = StoreAction::DontCare;
+                        pass.stencil_store = StoreAction::DontCare;
                         if log_enabled!(target: TRACE_TARGET, Level::Trace) {
                             trace!(
                                 target: TRACE_TARGET,
@@ -4943,7 +5116,178 @@ impl PassState {
                 }
             }
         }
-        self.assign_multisample_resolves();
+        if ENABLE_NEXT_CLEAR_DEPTH_DONTCARE {
+            self.discard_depth_stores_before_clears();
+        }
+        if ENABLE_UNWRITTEN_STENCIL_DONTCARE {
+            self.discard_unwritten_stencil();
+        }
+        if ENABLE_UNUSED_DEPTH_LOAD_DONTCARE {
+            self.discard_unused_depth_loads();
+        }
+        self.assign_multisample_resolves(!frame_continues);
+    }
+
+    /// Rule C's depth arm: discard a depth or stencil store the next pass on that plane clears.
+    ///
+    /// Keyed by `(depth texture, mip level)`, walked back to front like the
+    /// colour arm. Pass `i`'s depth store becomes `DontCare` when the next
+    /// pass in the submission on the same texture and level opens with
+    /// `DepthLoad::Clear`, and its stencil store when that pass opens with
+    /// `StencilLoad::Clear` on a texture that has a stencil plane; the two
+    /// planes are decided apart. Such a load action is only reached by a
+    /// clear that covers the whole attachment, so the next pass overwrites
+    /// every texel of the plane before anything can read it.
+    ///
+    /// Skipped for a sampleable or ever-sampled texture (a sampler, a blit
+    /// source or a readback reads device memory), and when anything that
+    /// runs between the store and the clear touches the texture: a pass in
+    /// between that samples it, resolves into it or carries a leading blit
+    /// reading or writing it, or a leading blit of the clearing pass itself,
+    /// which runs before that pass's load action. The walk stays inside one
+    /// submission, so unlike Rule B it also runs on a mid-frame flush.
+    fn discard_depth_stores_before_clears(&mut self) {
+        let mut next_depth_use: FxHashMap<(MetalHandle<MTLTextureKind>, u32), usize> =
+            FxHashMap::with_capacity_and_hasher(self.seen_depth_rts.len(), FxBuildHasher);
+        for i in (0..self.passes.len()).rev() {
+            let texture = self.passes[i].depth_texture;
+            if texture.is_null() {
+                continue;
+            }
+            let key = (texture, self.passes[i].depth_level);
+            if let Some(&next) = next_depth_use.get(&key)
+                && !self.passes[i]
+                    .depth_flags
+                    .contains(PassDepthFlags::SAMPLEABLE)
+                && !self.seen_sampled_textures.contains(&texture)
+                && !self.depth_touched_between(i, next, texture)
+            {
+                let depth_cleared = matches!(self.passes[next].depth_load, DepthLoad::Clear { .. });
+                let stencil_cleared =
+                    matches!(self.passes[next].stencil_load, StencilLoad::Clear { .. });
+                let pass = &mut self.passes[i];
+                if depth_cleared {
+                    pass.depth_store = StoreAction::DontCare;
+                    if log_enabled!(target: TRACE_TARGET, Level::Trace) {
+                        trace!(
+                            target: TRACE_TARGET,
+                            "pass-store idx={i} depth={texture:#x} → DontCare (next-clear at idx={next})",
+                        );
+                    }
+                }
+                if stencil_cleared && pass.depth_flags.contains(PassDepthFlags::HAS_STENCIL) {
+                    pass.stencil_store = StoreAction::DontCare;
+                    if log_enabled!(target: TRACE_TARGET, Level::Trace) {
+                        trace!(
+                            target: TRACE_TARGET,
+                            "pass-store idx={i} stencil={texture:#x} → DontCare (next-clear at idx={next})",
+                        );
+                    }
+                }
+            }
+            next_depth_use.insert(key, i);
+        }
+    }
+
+    /// Whether anything running after pass `first` and before `next`'s load touches `texture`.
+    ///
+    /// The passes strictly between the two, and the leading blits of `next`,
+    /// which run before its render pass begins. `next`'s sampler binds run
+    /// after its load and are counted too, which only keeps a store.
+    fn depth_touched_between(
+        &self,
+        first: usize,
+        next: usize,
+        texture: MetalHandle<MTLTextureKind>,
+    ) -> bool {
+        let views = &self.texture_view_to_base;
+        self.passes[first + 1..=next].iter().any(|pass| {
+            pass_reads_texture(pass, texture, views)
+                || blit_list_writes(&pass.leading_blits, texture)
+                || pass_resolves_into(pass, texture, views)
+        })
+    }
+
+    /// Discard the stencil plane of every pass on a texture whose stencil nothing has written.
+    ///
+    /// First enters every texture a pass of this submission writes stencil
+    /// into (a stencil `Clear` load, or a draw or clear-quad tagged
+    /// `STENCIL_WRITTEN`) into `stencil_written_textures`, so a write
+    /// anywhere in the submission keeps every pass on that texture as it was.
+    /// A pass whose texture has a stencil plane and is still absent then
+    /// loads and stores that plane `DontCare`: the plane holds nothing D3D9
+    /// defines, and no pass reads it.
+    fn discard_unwritten_stencil(&mut self) {
+        for pass in &self.passes {
+            if !pass.depth_texture.is_null()
+                && (pass.depth_flags.contains(PassDepthFlags::STENCIL_WRITTEN)
+                    || matches!(pass.stencil_load, StencilLoad::Clear { .. }))
+            {
+                self.stencil_written_textures.insert(pass.depth_texture);
+            }
+        }
+        for pass in &mut self.passes {
+            if pass.depth_texture.is_null()
+                || !pass.depth_flags.contains(PassDepthFlags::HAS_STENCIL)
+                || self.stencil_written_textures.contains(&pass.depth_texture)
+            {
+                continue;
+            }
+            if matches!(pass.stencil_load, StencilLoad::Load) {
+                pass.stencil_load = StencilLoad::DontCare;
+            }
+            pass.stencil_store = StoreAction::DontCare;
+            if log_enabled!(target: TRACE_TARGET, Level::Trace) {
+                trace!(
+                    target: TRACE_TARGET,
+                    "pass-stencil depth={:#x} → DontCare load and store (stencil never written)",
+                    pass.depth_texture,
+                );
+            }
+        }
+    }
+
+    /// Discard the depth and stencil loads of a pass that neither uses nor keeps them.
+    ///
+    /// A pass not tagged `USED` has no draw or clear-quad that tests or
+    /// writes depth or stencil. Where such a pass also discards a plane's
+    /// store, the plane's contents after the pass are undefined whatever it
+    /// loads, and nothing inside it reads them, so a `Load` of that plane
+    /// becomes `DontCare`. Each plane is decided on its own store; a `Clear`
+    /// load stays, since it reads nothing. Runs after the store rules, so it
+    /// sees their decisions, and after `finalize_load_actions`, so the
+    /// sampled-texture revert there does not undo it.
+    fn discard_unused_depth_loads(&mut self) {
+        for pass in &mut self.passes {
+            if pass.depth_texture.is_null() || pass.depth_flags.contains(PassDepthFlags::USED) {
+                continue;
+            }
+            if matches!(pass.depth_store, StoreAction::DontCare)
+                && matches!(pass.depth_load, DepthLoad::Load)
+            {
+                pass.depth_load = DepthLoad::DontCare;
+                if log_enabled!(target: TRACE_TARGET, Level::Trace) {
+                    trace!(
+                        target: TRACE_TARGET,
+                        "pass-load depth={:#x} Load → DontCare (pass never uses depth or stencil)",
+                        pass.depth_texture,
+                    );
+                }
+            }
+            if pass.depth_flags.contains(PassDepthFlags::HAS_STENCIL)
+                && matches!(pass.stencil_store, StoreAction::DontCare)
+                && matches!(pass.stencil_load, StencilLoad::Load)
+            {
+                pass.stencil_load = StencilLoad::DontCare;
+                if log_enabled!(target: TRACE_TARGET, Level::Trace) {
+                    trace!(
+                        target: TRACE_TARGET,
+                        "pass-load stencil={:#x} Load → DontCare (pass never uses depth or stencil)",
+                        pass.depth_texture,
+                    );
+                }
+            }
+        }
     }
 
     /// Give each multisampled attachment its resolve on the submission's last use of it.
@@ -4960,7 +5304,21 @@ impl PassState {
     /// a synchronous blit observe, so the twin must be current there as well.
     /// A read that happens between two passes of the same submission is
     /// covered by [`Self::note_msaa_read`] instead.
-    fn assign_multisample_resolves(&mut self) {
+    ///
+    /// On a presenting submit (`presenting`) under the discard swap effect,
+    /// the back buffer's resolving pass also drops its multisampled samples
+    /// (store `DontCare`, so the descriptor carries `MultisampleResolve`).
+    /// D3D9 allows a multisampled back buffer only with
+    /// `D3DSWAPEFFECT_DISCARD`, which leaves its contents undefined after
+    /// `Present`, and everything outside a render pass reads the resolved
+    /// twin. A mid-frame flush keeps the samples, since the frame goes on and
+    /// a later pass may load them, and so does every other target, whose
+    /// contents D3D9 keeps across `Present`.
+    fn assign_multisample_resolves(&mut self, presenting: bool) {
+        let discard_backbuffer_samples = presenting
+            && matches!(self.backbuffer_contents, BackbufferContents::Undefined)
+            && !self.backbuffer_texture.is_null();
+        let backbuffer = self.backbuffer_texture;
         let mut resolved: FxHashSet<(MetalHandle<MTLTextureKind>, u32)> =
             FxHashSet::with_capacity_and_hasher(self.seen_color_rts.len(), FxBuildHasher);
         for pass in self.passes.iter_mut().rev() {
@@ -4968,12 +5326,24 @@ impl PassState {
                 && resolved.insert((pass.color_texture, pass.color_subresource))
             {
                 pass.color_resolve_texture = pass.color_resolve_view();
+                if discard_backbuffer_samples && pass.color_texture == backbuffer {
+                    pass.color_store = StoreAction::DontCare;
+                    if log_enabled!(target: TRACE_TARGET, Level::Trace) {
+                        trace!(
+                            target: TRACE_TARGET,
+                            "pass-store color={backbuffer:#x} → resolve without store (presented back buffer)",
+                        );
+                    }
+                }
             }
             for attachment in &mut pass.extra_color {
                 if !attachment.msaa_texture.is_null()
                     && resolved.insert((attachment.texture, attachment.subresource))
                 {
                     attachment.resolve_texture = attachment.resolve_view();
+                    if discard_backbuffer_samples && attachment.texture == backbuffer {
+                        attachment.store = StoreAction::DontCare;
+                    }
                 }
             }
         }
@@ -5010,6 +5380,24 @@ impl PassState {
         }
         self.passes.last().is_some_and(|p| p.commands.len() > 1)
     }
+}
+
+/// `true` when a draw running with `ds` can change the stencil plane it attaches.
+///
+/// It needs a stencil plane (`HAS_STENCIL` in `attach`), the stencil test on,
+/// a nonzero write mask, and an operation other than `KEEP` on either face.
+/// Operations are compared after translation, so they read exactly as the
+/// `MTLDepthStencilState` the draw would get.
+fn draw_writes_stencil(ds: &DepthStencilSnapshot, attach: PipelineAttachFlags) -> bool {
+    let face_keeps = |face: StencilFaceState| {
+        [face.fail_op, face.depth_fail_op, face.pass_op]
+            .iter()
+            .all(|&op| d3d_to_metal_stencil_op(u32::from(op)) == StencilOp::Keep)
+    };
+    attach.contains(PipelineAttachFlags::HAS_STENCIL)
+        && ds.stencil_enable != 0
+        && ds.write_mask & STENCIL_MASK_BITS != 0
+        && !(face_keeps(ds.front) && face_keeps(ds.back))
 }
 
 /// True if `pass` would observe the contents of `target_handle`.
