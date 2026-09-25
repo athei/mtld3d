@@ -62,7 +62,8 @@ fn real_main() -> Result<ExitCode, String> {
             config.log_dir.as_deref(),
             config.timeout,
             Box::new(|_| {}),
-        )?;
+        )?
+        .ignored_only(config.ignored);
         let selection = if config.filter.is_empty() {
             None
         } else {

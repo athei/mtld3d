@@ -21,6 +21,7 @@ fn defaults_fill_in_behind_the_mandatory_pair() {
     assert!(config.fail_fast);
     assert!(config.filter.is_empty());
     assert!(config.log_dir.is_none());
+    assert!(!config.ignored);
     assert_eq!(config.exes.len(), 2);
 }
 
@@ -38,6 +39,7 @@ fn every_flag_is_read() {
         "msaa:: stencil",
         "--log-dir",
         "/l",
+        "--ignored",
         "--",
         "/a.exe",
     ]))
@@ -47,6 +49,7 @@ fn every_flag_is_read() {
     assert!(!config.fail_fast);
     assert_eq!(config.filter, ["msaa::", "stencil"]);
     assert_eq!(config.log_dir.as_deref(), Some(Path::new("/l")));
+    assert!(config.ignored);
 }
 
 #[test]

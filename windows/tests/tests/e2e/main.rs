@@ -11,6 +11,9 @@
 
 mod a2b10g10r10;
 mod a2r10g10b10;
+mod bench;
+mod bench_frame_shape;
+mod bench_shader_stutter;
 mod buffers;
 mod clip_planes;
 mod d3d9ex;

@@ -313,7 +313,7 @@ TAG          ?= $(shell git describe --tags --exact-match 2>/dev/null)
 	install install-windows-i686 install-windows-x86_64 install-unix-x64 install-unix-arm64 \
 	bundle version-check stage clean-isolated clean-isolated-orphans \
 	configure-test-prefix configure-test-prefix-locked configure-test-prefix-session \
-	test test-unit test-e2e-i686 test-e2e-x86_64 \
+	test test-unit test-e2e-i686 test-e2e-x86_64 bench \
 	conformance conformance-i686 conformance-x86_64 \
 	conformance-baseline conformance-baseline-i686 conformance-baseline-x86_64 \
 	conformance-intel conformance-intel-i686 conformance-intel-x86_64 \
@@ -807,13 +807,14 @@ E2E_FLAGS := --jobs $(JOBS) --timeout $(TIMEOUT) $(if $(filter 0,$(FAIL_FAST))$(
 # consumer. A glob over `deps/` would also pick up the stale hashes of earlier
 # builds. --tests excludes examples, including the visible cursor probe, which
 # are not libtest executables. Expanded inside a recipe, where the `$$(...)` is
-# the shell's. From a stage the binaries are the staged ones.
+# the shell's. From a stage the binaries are the staged ones. $(2) is extra
+# cargo arguments (`make bench` builds `--release`).
 define E2E_EXES_BUILD
 cd windows && cargo +$(RUST_STABLE) test --tests --no-run -p mtld3d-tests --target $(1) --message-format=json-render-diagnostics
 endef
 define E2E_EXES
 $$(output=$$(mktemp "$${TMPDIR:-/tmp}/mtld3d-e2e-exes.XXXXXX") || exit; \
-	$(call E2E_EXES_BUILD,$(1)) > "$$output"; result_code=$$?; \
+	$(call E2E_EXES_BUILD,$(1)) $(2) > "$$output"; result_code=$$?; \
 	if [ "$$result_code" -eq 0 ]; then \
 		sed -n 's/^.*"executable":"\([^"]*\.exe\)".*/\1/p' "$$output"; result_code=$$?; \
 	fi; \
@@ -948,6 +949,42 @@ REPEAT ?= 20
 VARIANT ?= native
 conformance-isolate: install-windows-$(ARCH) install-unix-$(SDK_UNIX_ARCH)
 	$(call conformance_leg,$(ARCH),--only $(ONLY) --repeat $(REPEAT) --variant $(VARIANT))
+
+# The synthetic benchmarks (NOT part of `make test`): `bench_frame_shape.rs`, a
+# frame shaped like World of Warcraft 3.3.5a's busy frame, and
+# `bench_shader_stutter.rs`, frames that each meet pixel shaders never seen
+# before with the shader cache off. They are `#[ignore]`d tests of the e2e
+# binary, so the suite reports them ignored; this runs them alone, one at a
+# time in one process, through the runner's `--ignored`, for one PE arch
+# (ARCH, default i686, the arch the game ships). They measure and never assert
+# on a time, so a run is red only when a device call fails.
+#
+# The binary is built `--release`, so the harness's own code is not what gets
+# measured, and the Metal validation layer and HUD are off: both cost frame
+# time and neither is under test. The configuration is the suite's without the
+# Main Thread Checker, then BENCH_CONFIG='key=value;key=value', appended last
+# the way SCALE is, so its entries win over the ones before it (the stutter
+# benchmark's own `shaderCache.enable=false` still wins over them). PERF=1
+# builds the layer with its perf summary. Each benchmark writes
+# `bench-<name>.txt` into LOG_DIR (default `.codex/evidence/bench`), beside
+# the layer's log that a PERF=1 build's summary rows are copied from, and the
+# reports are printed at the end. FILTER='<patterns>' narrows the run as it
+# does for `make test`, e.g. `FILTER=stutter`.
+BENCH_DIR := $(or $(LOG_DIR),$(CURDIR)/.codex/evidence/bench)
+BENCH_TIMEOUT ?= 300
+BENCH_TARGET := $(if $(filter x86_64,$(ARCH)),$(PE_x64),$(PE_i386))
+BENCH_EXES = $(if $(STAGE),$(STAGE)/tests/$(ARCH)/*.exe,$(call E2E_EXES,$(BENCH_TARGET),--release))
+MTLD3D_CONF_BENCH := shaderCache.enable=false;color.hdr.enable=false;log.dir=Z:$(BENCH_DIR)$(if $(BENCH_CONFIG),;$(BENCH_CONFIG))
+bench: install-windows-$(ARCH) install-unix-$(SDK_UNIX_ARCH)
+	$(MAKE) configure-test-prefix
+	mkdir -p '$(BENCH_DIR)' && rm -f '$(BENCH_DIR)'/bench-*.txt
+	$(call E2E_EXES_ASSIGN,$(BENCH_EXES)); suite=; \
+	for exe in $$exes; do case $$exe in */e2e-*.exe|*/e2e.exe) suite=$$exe;; esac; done; \
+	[ -n "$$suite" ] || { echo "no e2e test binary among: $$exes" >&2; exit 2; }; \
+	cd $(E2E_RUNNER_DIR) && MTLD3D_CONFIG='$(MTLD3D_CONF_BENCH)' WINEDEBUG= MTL_DEBUG_LAYER=0 MTL_HUD_ENABLED=0 \
+		$(E2E_RUNNER) --wine $(WINE) --jobs 1 --timeout $(BENCH_TIMEOUT) --ignored \
+		$(if $(FILTER),--filter '$(FILTER)') --log-dir '$(BENCH_DIR)' -- $$suite
+	cat '$(BENCH_DIR)'/bench-*.txt
 
 fmt:
 	cd windows && cargo +$(RUST_NIGHTLY) fmt
