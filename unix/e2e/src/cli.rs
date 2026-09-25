@@ -17,6 +17,8 @@ pub struct Config {
     pub filter: Vec<String>,
     /// `--log-dir`: where the files of a dead process go; `None` = beside the test binary.
     pub log_dir: Option<PathBuf>,
+    /// `--ignored`: run only the tests marked `#[ignore]`, which every other run skips.
+    pub ignored: bool,
     /// The test binaries, after `--`.
     pub exes: Vec<PathBuf>,
 }
@@ -25,10 +27,12 @@ pub struct Config {
 ///
 /// Recognised: `--wine <path>`, `--jobs <N>`, `--timeout <secs>`,
 /// `--no-fail-fast`, `--filter <patterns>` (whitespace-separated),
-/// `--log-dir <path>`, then `--` and the test binaries. `--wine` and at
-/// least one binary are mandatory; `--jobs` defaults to 1, `--timeout` to
-/// 60 seconds, and the log directory to the one the layer writes its own
-/// per-process logs to, `mtld3d-logs` beside the test binary.
+/// `--log-dir <path>`, `--ignored`, then `--` and the test binaries.
+/// `--wine` and at least one binary are mandatory; `--jobs` defaults to 1,
+/// `--timeout` to 60 seconds, and the log directory to the one the layer
+/// writes its own per-process logs to, `mtld3d-logs` beside the test binary.
+/// Without `--ignored` the tests marked `#[ignore]` are reported as ignored
+/// and never run; with it they are the only ones that run.
 ///
 /// # Errors
 ///
@@ -41,6 +45,7 @@ pub fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Config, Stri
     let mut fail_fast = true;
     let mut filter = Vec::new();
     let mut log_dir: Option<PathBuf> = None;
+    let mut ignored = false;
     let mut exes = Vec::new();
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -72,6 +77,7 @@ pub fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Config, Stri
                 timeout = Duration::from_secs(secs);
             }
             "--no-fail-fast" => fail_fast = false,
+            "--ignored" => ignored = true,
             "--filter" => {
                 let value = args
                     .next()
@@ -101,6 +107,7 @@ pub fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Config, Stri
         fail_fast,
         filter,
         log_dir,
+        ignored,
         exes,
     })
 }

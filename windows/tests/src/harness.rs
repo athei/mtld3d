@@ -128,6 +128,12 @@ pub struct HarnessConfig {
     /// The harness never destroys a window it was given, so the harness that
     /// owns it outlives this one.
     pub device_window: usize,
+    /// `D3DPRESENT_PARAMETERS.PresentationInterval` (`D3DPRESENT_INTERVAL_*`).
+    ///
+    /// `0` (the default) is `D3DPRESENT_INTERVAL_DEFAULT`, which waits for the
+    /// display; a benchmark that times frames asks for
+    /// `D3DPRESENT_INTERVAL_IMMEDIATE` so the refresh rate does not bound them.
+    pub presentation_interval: u32,
 }
 
 impl Default for HarnessConfig {
@@ -146,6 +152,7 @@ impl Default for HarnessConfig {
             multi_sample_type: 0,
             multi_sample_quality: 0,
             device_window: 0,
+            presentation_interval: 0,
         }
     }
 }
@@ -234,22 +241,12 @@ pub fn run_child(
 /// exact shape at the default scale. Everything that stays several pixels clear
 /// of a boundary holds at any scale and must not consult it.
 ///
-/// Reads the environment the device reads, and takes the last `render.scale`
-/// segment because that is the one the config parser keeps. This is the
-/// suite-wide value: a harness that pins its own scale through
+/// Reads the environment the device reads, through [`config_value`], so it
+/// is the suite-wide value: a harness that pins its own scale through
 /// [`HarnessConfig::config_entries`] knows what it asked for.
 #[must_use]
 pub fn render_scale_is_identity() -> bool {
-    let Some(config) = config_var() else {
-        return true;
-    };
-    let Some(value) = config
-        .split(';')
-        .filter_map(|segment| segment.split_once('='))
-        .filter(|(key, _)| key.trim() == "render.scale")
-        .map(|(_, value)| value.trim())
-        .next_back()
-    else {
+    let Some(value) = config_value("render.scale") else {
         return true;
     };
     // A value the parser rejects leaves the device at the identity, so
@@ -257,6 +254,21 @@ pub fn render_scale_is_identity() -> bool {
     value
         .parse::<f32>()
         .map_or(true, |scale| (scale - 1.0).abs() < f32::EPSILON)
+}
+
+/// The suite-wide `MTLD3D_CONFIG` value of `key`, trimmed, or `None` when it names none.
+///
+/// The last segment for the key wins, because that is the one the config
+/// parser keeps. This is the suite-wide value: a harness that sets the key
+/// through [`HarnessConfig::config_entries`] knows what it asked for.
+#[must_use]
+pub fn config_value(key: &str) -> Option<String> {
+    config_var()?
+        .split(';')
+        .filter_map(|segment| segment.split_once('='))
+        .filter(|(name, _)| name.trim() == key)
+        .map(|(_, value)| value.trim().to_owned())
+        .next_back()
 }
 
 /// A live device with its factory and window. Drops them in COM-correct order.
@@ -3245,6 +3257,6 @@ fn present_params(cfg: &HarnessConfig, hwnd: usize) -> D3DPRESENT_PARAMETERS {
         auto_depth_stencil_format: cfg.depth_format.unwrap_or(0),
         flags: cfg.present_flags,
         full_screen_refresh_rate_in_hz: 0,
-        presentation_interval: 0,
+        presentation_interval: cfg.presentation_interval,
     }
 }

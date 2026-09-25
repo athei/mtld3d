@@ -73,6 +73,8 @@ pub struct WineLauncher {
     /// Where a dead process's whole stderr goes, beside the layer's own logs.
     log_dir: PathBuf,
     timeout: Duration,
+    /// Whether every process runs the `#[ignore]` tests only (libtest's `--ignored`).
+    ignored: bool,
     /// A line as the process printed it, for the progress a caller shows.
     on_line: Box<dyn FnMut(&str)>,
 }
@@ -109,14 +111,22 @@ impl WineLauncher {
             exe,
             log_dir,
             timeout,
+            ignored: false,
             on_line,
         })
+    }
+
+    /// Run the tests marked `#[ignore]` instead of the others, listing included.
+    #[must_use]
+    pub const fn ignored_only(mut self, ignored: bool) -> Self {
+        self.ignored = ignored;
+        self
     }
 }
 
 impl Launcher for WineLauncher {
     fn batch_len(&self, names: &[String], threads: u32) -> Result<usize, String> {
-        fitting_prefix(&self.exe, names, threads)
+        fitting_prefix(&self.exe, names, threads, self.ignored)
     }
 
     fn run(
@@ -125,7 +135,7 @@ impl Launcher for WineLauncher {
         threads: u32,
         on_event: &mut dyn FnMut(Event),
     ) -> Result<ProcessEnd, String> {
-        let args = test_arguments(names, threads);
+        let args = test_arguments(names, threads, self.ignored);
         let mut parser = Parser::default();
         let mut stdout = String::new();
         let exit = run::run(&self.wine, &self.exe, &args, self.timeout, &mut |line| {
@@ -148,16 +158,14 @@ impl Launcher for WineLauncher {
 
     fn list(&mut self) -> Result<Vec<String>, String> {
         let mut stdout = String::new();
-        let exit = run::run(
-            &self.wine,
-            &self.exe,
-            &["--list".to_owned()],
-            self.timeout,
-            &mut |line| {
-                stdout.push_str(line);
-                stdout.push('\n');
-            },
-        )?;
+        let mut args = vec!["--list".to_owned()];
+        if self.ignored {
+            args.push("--ignored".to_owned());
+        }
+        let exit = run::run(&self.wine, &self.exe, &args, self.timeout, &mut |line| {
+            stdout.push_str(line);
+            stdout.push('\n');
+        })?;
         if exit.kind != ExitKind::Code(0) {
             return Err(format!(
                 "{} --list ended with {}:\n{}",
@@ -362,11 +370,17 @@ pub fn layer_tail(log: &str) -> String {
 }
 
 /// Build the arguments shared by command sizing and process launch.
-fn test_arguments(names: Option<&[String]>, threads: u32) -> Vec<String> {
+///
+/// `ignored` adds libtest's `--ignored`, so the process runs the tests marked
+/// `#[ignore]` among those it is given and no others.
+fn test_arguments(names: Option<&[String]>, threads: u32, ignored: bool) -> Vec<String> {
     let mut args = vec![
         format!("--test-threads={threads}"),
         "--nocapture".to_owned(),
     ];
+    if ignored {
+        args.push("--ignored".to_owned());
+    }
     if let Some(names) = names {
         args.push("--exact".to_owned());
         args.extend(names.iter().cloned());
@@ -375,7 +389,12 @@ fn test_arguments(names: Option<&[String]>, threads: u32) -> Vec<String> {
 }
 
 /// Fit a selection after allowing for Wine's executable-path mapping.
-fn fitting_prefix(exe: &Path, names: &[String], threads: u32) -> Result<usize, String> {
+fn fitting_prefix(
+    exe: &Path,
+    names: &[String],
+    threads: u32,
+    ignored: bool,
+) -> Result<usize, String> {
     // Wine replaces an absolute Unix path's leading mapped directory with a
     // drive prefix, or uses the longer \\?\unix prefix. Keeping the whole
     // absolute path plus that eight-unit prefix bounds either spelling.
@@ -383,7 +402,7 @@ fn fitting_prefix(exe: &Path, names: &[String], threads: u32) -> Result<usize, S
     // quoting, so a separator before a literal quote must be counted too.
     let image = format!(r"\\?\unix{}", exe.to_string_lossy().replace('/', "\\"));
     let mut units = argument_units(&image, true).saturating_add(1);
-    for arg in test_arguments(Some(&[]), threads) {
+    for arg in test_arguments(Some(&[]), threads, ignored) {
         units = units.saturating_add(1 + argument_units(&arg, false));
     }
     let mut count = 0;

@@ -326,21 +326,51 @@ fn command_size_boundary_includes_path_flags_separators_and_nul() {
         + " --test-threads=4294967295 --nocapture --exact ".len();
     let maximum = "x".repeat(COMMAND_LINE_UNITS - fixed);
     assert_eq!(
-        fitting_prefix(exe, std::slice::from_ref(&maximum), u32::MAX).unwrap(),
+        fitting_prefix(exe, std::slice::from_ref(&maximum), u32::MAX, false).unwrap(),
         1
     );
-    assert!(fitting_prefix(exe, &[maximum + "x"], u32::MAX).is_err());
-    assert_eq!(fitting_prefix(exe, &[], u32::MAX).unwrap(), 0);
+    assert!(fitting_prefix(exe, &[maximum + "x"], u32::MAX, false).is_err());
+    assert_eq!(fitting_prefix(exe, &[], u32::MAX, false).unwrap(), 0);
     // A longer path consumes capacity rather than borrowing an arbitrary
     // reserve from every selection, and a surrogate pair consumes two units.
     let short = Path::new("/suite.exe");
     let names = vec!["x".repeat(COMMAND_LINE_UNITS - fixed), "🚀".to_owned()];
-    assert_eq!(fitting_prefix(exe, &names, u32::MAX).unwrap(), 1);
-    assert_eq!(fitting_prefix(short, &names, u32::MAX).unwrap(), 2);
+    assert_eq!(fitting_prefix(exe, &names, u32::MAX, false).unwrap(), 1);
+    assert_eq!(fitting_prefix(short, &names, u32::MAX, false).unwrap(), 2);
     assert_eq!(
-        test_arguments(Some(&[]), 7),
+        test_arguments(Some(&[]), 7, false),
         ["--test-threads=7", "--nocapture", "--exact"]
     );
+}
+
+#[test]
+fn an_ignored_run_asks_libtest_for_the_ignored_tests_and_sizes_the_flag() {
+    assert_eq!(
+        test_arguments(None, 1, true),
+        ["--test-threads=1", "--nocapture", "--ignored"]
+    );
+    assert_eq!(
+        test_arguments(Some(&["a".to_owned()]), 1, true),
+        [
+            "--test-threads=1",
+            "--nocapture",
+            "--ignored",
+            "--exact",
+            "a"
+        ]
+    );
+    let exe = Path::new("/suite.exe");
+    let image = r"\\?\unix\suite.exe";
+    let fixed = image.encode_utf16().count()
+        + 2
+        + 1
+        + " --test-threads=1 --nocapture --ignored --exact ".len();
+    let name = "x".repeat(COMMAND_LINE_UNITS - fixed);
+    assert_eq!(
+        fitting_prefix(exe, std::slice::from_ref(&name), 1, true).unwrap(),
+        1
+    );
+    assert!(fitting_prefix(exe, &[name + "x"], 1, true).is_err());
 }
 
 #[test]
