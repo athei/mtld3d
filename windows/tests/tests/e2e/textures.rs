@@ -1806,9 +1806,9 @@ fn partial_updates_covering_a_default_pool_level_keep_its_pixels() {
 
     release_uploaded_staging(&h);
 
-    // The four writes covered the level, so its staging is gone. A fifth
-    // partial update re-creates it and must upload only its own rect: the
-    // pixels the GPU already holds are the only copy of the other three.
+    // The four writes covered the level, so its staging is gone and the GPU
+    // holds the only copy of it. A fifth partial update must reach the GPU
+    // without disturbing the three quadrants it does not touch.
     let (_, rect, name) = QUADRANTS[0];
     {
         let locked = src.lock_rect_partial(0, &rect, D3DLOCK_NO_DIRTY_UPDATE);
@@ -1826,10 +1826,10 @@ fn partial_updates_covering_a_default_pool_level_keep_its_pixels() {
 /// A sub-rectangle `UpdateSurface` leaves the rest of the destination level alone.
 ///
 /// The destination is a default-pool texture whose staging is released once
-/// its first whole-level upload has been emitted, so the partial update
-/// re-creates a staging buffer holding only the copied rectangle. Uploading
-/// the whole mip from it would push uninitialised pages over the GPU content
-/// the copy never touched.
+/// its first whole-level upload has been emitted, so the GPU holds the only
+/// copy of the texels outside the copied rectangle when the partial update
+/// lands. Uploading the whole mip from freshly allocated pages would push
+/// uninitialised bytes over them.
 #[test]
 fn update_surface_sub_rect_keeps_the_rest_of_the_level() {
     const RED: u32 = 0xFFFF_0000;
@@ -1875,6 +1875,75 @@ fn update_surface_sub_rect_keeps_the_rest_of_the_level() {
     assert_pixel_eq(inside, RED, "texel inside the updated rectangle");
     assert_pixel_eq(right_of_rect, GREEN, "texel right of the updated rectangle");
     assert_pixel_eq(below_rect, GREEN, "texel below the updated rectangle");
+}
+
+/// Two sub-rectangle `UpdateSurface`s after a release keep the texels between them.
+///
+/// The level's staging is released after its whole-level upload, and the two
+/// one-texel copies land before any draw, so the upload that follows them is
+/// the bounding box of both: rows 0 and 1 in full, including the earlier texel
+/// at (1,0) and the fill around it, which the GPU holds and neither copy wrote.
+#[test]
+fn update_surfaces_after_a_release_keep_the_texels_between_them() {
+    const RED: u32 = 0xFFFF_0000;
+    const GREEN: u32 = 0xFF00_FF00;
+    const BLUE: u32 = 0xFF00_00FF;
+    let h = Harness::new();
+    let dst = h.create_texture(4, 4, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT);
+    let level = dst.surface_level(0);
+
+    let whole = h.create_offscreen_plain_surface(4, 4, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM);
+    let mut fill = [GREEN; 16];
+    fill[1] = BLUE;
+    whole.lock_rect(0).write_u32(&fill);
+    assert_eq!(
+        h.update_surface_hr(&whole, &level),
+        0,
+        "whole-level UpdateSurface"
+    );
+    assert_pixel_eq(
+        sample_center(&h, &dst).to_pixel(),
+        GREEN,
+        "whole-level fill",
+    );
+    release_uploaded_staging(&h);
+
+    let patch = h.create_offscreen_plain_surface(1, 1, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM);
+    patch.lock_rect(0).write_u32(&[RED]);
+    let rect = D3DRECT {
+        x1: 0,
+        y1: 0,
+        x2: 1,
+        y2: 1,
+    };
+    for point in [(3, 0), (0, 1)] {
+        assert_eq!(
+            h.update_surface_region_hr(&patch, &rect, &level, point),
+            0,
+            "one-texel UpdateSurface at {point:?}"
+        );
+    }
+
+    // The 4x4 level spans the 640x480 backbuffer, so texel (x, y) is read at
+    // the centre of its 160x120 band.
+    let sampled = sample_points(
+        &h,
+        &dst,
+        [
+            (80, 60),
+            (240, 60),
+            (400, 60),
+            (560, 60),
+            (80, 180),
+            (240, 180),
+            (400, 180),
+            (560, 180),
+        ],
+    );
+    let expected = [GREEN, BLUE, GREEN, RED, RED, GREEN, GREEN, GREEN];
+    for (i, (got, want)) in sampled.into_iter().zip(expected).enumerate() {
+        assert_pixel_eq(got, want, &format!("texel ({}, {})", i % 4, i / 4));
+    }
 }
 
 /// A plain lock of a released default-pool level hands back the level's texels.

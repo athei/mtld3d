@@ -948,6 +948,19 @@ fn a_plain_lock_of_a_released_level_reads_it_back() {
     ));
 }
 
+/// A partial write into an uploaded level is the one write that reads it back.
+#[test]
+fn a_partial_write_into_an_uploaded_released_level_reads_it_back() {
+    assert!(released_level_write_needs_readback(false, true));
+}
+
+#[test]
+fn a_whole_write_or_a_never_uploaded_level_skips_the_readback() {
+    assert!(!released_level_write_needs_readback(true, true));
+    assert!(!released_level_write_needs_readback(true, false));
+    assert!(!released_level_write_needs_readback(false, false));
+}
+
 // ── staging_droppable_class ──
 
 /// The only class that releases: default pool, no usage bit, plain 2D.
