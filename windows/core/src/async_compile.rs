@@ -371,8 +371,11 @@ impl TextureHistory {
 /// that has a recent clear (no other can ever have a draw left out of it)
 /// is marked. Marking a texture can make a pass that writes into it kept,
 /// so the walk repeats until nothing new is marked, and a chain of scratch
-/// targets feeding a kept one is marked whole in the submission that reads
-/// it.
+/// targets that sample each other into a kept one is marked whole in the
+/// submission that reads it. A link of the chain made by a `StretchRect` is
+/// judged when the copy runs, against what is marked by then, and a link
+/// across a mid-frame flush is judged in the later submission, so each such
+/// link can leave one more frame unprotected.
 pub fn mark_kept_reads(passes: &PassState, history: &mut ClearHistory) {
     let reads = passes.pass_reads();
     if reads.is_empty() || history.is_empty() {

@@ -1194,12 +1194,7 @@ impl FrameEncoder {
                 let waited = tickets.contains(&result.ticket);
                 self.install_compile(result, waited);
             } else {
-                mtld3d_shared::log_once_warn!(
-                    target: LOG_TARGET,
-                    "encoder: every compile worker is gone with {} build(s) in flight; \
-                     the draws that need them are dropped",
-                    self.compile_in_flight.len()
-                );
+                self.abandon_lost_builds();
                 break;
             }
         }
@@ -1230,14 +1225,31 @@ impl FrameEncoder {
             if let Ok(result) = self.compile_results.recv() {
                 self.install_compile(result, false);
             } else {
-                error!(
-                    target: LOG_TARGET,
-                    "encoder: every compile worker is gone with {} build(s) in flight",
-                    self.compile_in_flight.len()
-                );
-                self.compile_in_flight.clear();
+                self.abandon_lost_builds();
             }
         }
+    }
+
+    /// Forget the builds lost with every compile worker, and build on the encoder from now on.
+    ///
+    /// The result channel only closes once no worker is left, so a job one
+    /// of them had taken will never report. Its keys leave the pending maps,
+    /// so they are unknown again rather than pending for good, and the skip
+    /// is turned off, so the next draw that needs one queues it afresh and
+    /// waits for it; with no worker to take it, that wait builds it inline
+    /// on the encoder thread.
+    #[cold]
+    fn abandon_lost_builds(&mut self) {
+        mtld3d_shared::log_once_warn!(
+            target: LOG_TARGET,
+            "encoder: every compile worker is gone with {} build(s) in flight; \
+             building on the encoder thread from now on",
+            self.compile_in_flight.len()
+        );
+        self.compile_in_flight.clear();
+        self.pending_libs.clear();
+        self.pending_pipelines.clear();
+        self.flags.remove(FrameEncoderFlags::ASYNC_COMPILE);
     }
 
     /// Record one finished build: index, owning cache, counters, and the cache latch.
