@@ -5,13 +5,13 @@
 //! flight is either left out of the frame or waited for, and the choice
 //! turns on whether leaving it out can lose content for good. This module
 //! holds the logic that choice and the queue rest on, without the threads:
-//! the job tickets, the two-lane queue, the record of what the frame
-//! cleared, and the skip predicate.
+//! the job tickets, the two-lane queue, the record of which attachments
+//! recent frames cleared, and the skip predicate.
 
 use std::collections::VecDeque;
 
 use mtld3d_shared::{MetalHandle, mtl_handle::MTLTextureKind};
-use rustc_hash::FxHashSet;
+use rustc_hash::FxHashMap;
 
 /// Identity of one queued build, unique within the encoder that queued it.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -42,20 +42,13 @@ impl TicketSource {
     }
 }
 
-/// Which lane of a [`CompileLanes`] a job waits in.
-#[derive(Clone, Copy)]
-pub enum Lane {
-    /// A draw the encoder is waiting for needs this job.
-    Urgent,
-    /// Nothing waits for this job; the draws that need it are left out until it lands.
-    Normal,
-}
-
 /// The jobs no worker has started yet, urgent ones first.
 ///
-/// A job leaves the lanes exactly once: a worker pops it, or the encoder
-/// steals it to run on its own thread. So a ticket that is no longer here
-/// names a job that is running or has finished.
+/// The normal lane holds the jobs nothing waits for; the urgent lane the
+/// ones a draw the encoder is waiting on needs. A job leaves the lanes
+/// exactly once: a worker pops it, or the encoder steals it to run on its
+/// own thread. So a ticket that is no longer here names a job that is
+/// running or has finished.
 pub struct CompileLanes<J> {
     urgent: VecDeque<(JobTicket, J)>,
     normal: VecDeque<(JobTicket, J)>,
@@ -76,12 +69,14 @@ impl<J> CompileLanes<J> {
         }
     }
 
-    /// Queue `job` behind the others of its lane.
-    pub fn push(&mut self, ticket: JobTicket, job: J, lane: Lane) {
-        match lane {
-            Lane::Urgent => self.urgent.push_back((ticket, job)),
-            Lane::Normal => self.normal.push_back((ticket, job)),
-        }
+    /// Queue `job` behind the others nothing waits for.
+    pub fn push_normal(&mut self, ticket: JobTicket, job: J) {
+        self.normal.push_back((ticket, job));
+    }
+
+    /// Queue `job` behind the other urgent ones, ahead of every normal job.
+    pub fn push_urgent(&mut self, ticket: JobTicket, job: J) {
+        self.urgent.push_back((ticket, job));
     }
 
     /// The next job to start: the oldest urgent one, else the oldest normal one.
@@ -135,64 +130,124 @@ impl<J> CompileLanes<J> {
 }
 
 bitflags::bitflags! {
-    /// What the frame so far says about one attachment a draw writes.
+    /// The planes of one attachment a clear reached.
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-    pub struct TargetFlags: u8 {
-        /// The attachment is the back buffer, or the multisampled companion that resolves into it.
-        const BACK_BUFFER = 1 << 0;
-        /// A `Clear` covering the whole attachment ran earlier in this frame.
-        const CLEARED = 1 << 1;
+    pub struct ClearPlanes: u8 {
+        const COLOR = 1 << 0;
+        const DEPTH = 1 << 1;
+        const STENCIL = 1 << 2;
     }
 }
 
 /// Whether a draw whose library or pipeline is still building may be left out of this frame.
 ///
-/// Leaving a draw out is safe when the content it would have written is
-/// rewritten from scratch each frame, so the frame after the build lands
-/// shows it: the back buffer, or a target the frame cleared before drawing
-/// into it. Anything else may be a target the application draws into once
-/// and reads for the rest of its life, and the draw has to wait for its
-/// build instead. `color_written` says whether the draw writes a colour
-/// target; one that writes none, a depth-only pass, is judged by its depth
-/// attachment alone.
+/// Leaving a draw out is safe only when every attachment its result lands
+/// in, or that later draws read it back through, is rebuilt from scratch
+/// every frame, so the frame after the build lands shows the draw. Each
+/// argument answers that for one attachment plane: `color` for every colour
+/// target the pass attaches (a draw that writes only depth still shapes what
+/// a later depth-tested draw writes into them), `depth` and `stencil` for
+/// the planes the draw tests or writes, `None` for a plane it leaves alone.
+/// A target cleared once and drawn once, at load, is exactly the one a skip
+/// would lose for good, so a clear in this frame alone does not qualify; see
+/// [`ClearHistory::regenerated`].
 #[must_use]
-pub fn may_skip_draw(color_written: bool, color: &[TargetFlags], depth: TargetFlags) -> bool {
-    if color_written {
-        color
-            .iter()
-            .all(|target| target.intersects(TargetFlags::BACK_BUFFER | TargetFlags::CLEARED))
-    } else {
-        depth.contains(TargetFlags::CLEARED)
+pub fn may_skip_draw(color: &[bool], depth: Option<bool>, stencil: Option<bool>) -> bool {
+    color.iter().all(|&regenerated| regenerated)
+        && depth.is_none_or(|regenerated| regenerated)
+        && stencil.is_none_or(|regenerated| regenerated)
+}
+
+/// Per attachment plane, the presented frames whose whole-target `Clear` reached it.
+///
+/// Keyed by the texture's identity handle, the subresource (slice in the
+/// low half, level in the high half for colour, the level for depth and
+/// stencil) and the plane, so a clear of one face, level or plane says
+/// nothing about another. Each entry keeps the index of the last frame that
+/// cleared it and of the frame that cleared it before that, which is all
+/// "cleared this frame and the one before" needs. An entry no clear reached
+/// in the current or the previous frame is dropped when the next frame
+/// begins, so the map holds only the attachments cleared recently.
+pub struct ClearHistory {
+    /// Index of the current presented frame; starts at 1, so 0 means "never".
+    frame: u64,
+    entries: FxHashMap<(MetalHandle<MTLTextureKind>, u32, u8), ClearRecord>,
+}
+
+struct ClearRecord {
+    last: u64,
+    before: u64,
+}
+
+impl Default for ClearHistory {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
-/// The attachments a whole-target `Clear` has reached in the current frame.
-///
-/// Keyed by the texture's identity handle and the subresource (slice in the
-/// low half, level in the high half for colour, the level for depth), so a
-/// clear of one face or level says nothing about another.
-#[derive(Default)]
-pub struct ClearedTargets {
-    cleared: FxHashSet<(MetalHandle<MTLTextureKind>, u32)>,
-}
-
-impl ClearedTargets {
-    /// Remember that `texture` at `subresource` was cleared; a null texture is ignored.
-    pub fn record(&mut self, texture: MetalHandle<MTLTextureKind>, subresource: u32) {
-        if !texture.is_null() {
-            self.cleared.insert((texture, subresource));
+impl ClearHistory {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            frame: 1,
+            entries: FxHashMap::default(),
         }
     }
 
-    /// Whether `texture` at `subresource` was cleared in this frame.
-    #[must_use]
-    pub fn contains(&self, texture: MetalHandle<MTLTextureKind>, subresource: u32) -> bool {
-        !texture.is_null() && self.cleared.contains(&(texture, subresource))
+    /// Start the next presented frame, forgetting attachments no recent frame cleared.
+    ///
+    /// A mid-frame flush is not a new frame: the application's frame goes
+    /// on, and so do its clears.
+    pub fn begin_frame(&mut self) {
+        self.frame += 1;
+        let frame = self.frame;
+        self.entries.retain(|_, record| record.last + 1 >= frame);
     }
 
-    /// Forget every clear, at the start of a frame.
-    pub fn reset(&mut self) {
-        self.cleared.clear();
+    /// Remember that `planes` of `texture` at `subresource` were cleared whole this frame.
+    ///
+    /// A null texture is ignored.
+    pub fn record(
+        &mut self,
+        texture: MetalHandle<MTLTextureKind>,
+        subresource: u32,
+        planes: ClearPlanes,
+    ) {
+        if texture.is_null() {
+            return;
+        }
+        for plane in planes.iter() {
+            let record = self
+                .entries
+                .entry((texture, subresource, plane.bits()))
+                .or_insert(ClearRecord { last: 0, before: 0 });
+            if record.last != self.frame {
+                record.before = record.last;
+                record.last = self.frame;
+            }
+        }
+    }
+
+    /// Whether `plane` of `texture` at `subresource` was cleared whole in this frame and the last.
+    ///
+    /// Two consecutive frames are the evidence that the application rebuilds
+    /// the attachment every frame: a clear in this frame alone is just as
+    /// likely to open a one-off render whose draw a skip would lose.
+    #[must_use]
+    pub fn regenerated(
+        &self,
+        texture: MetalHandle<MTLTextureKind>,
+        subresource: u32,
+        plane: ClearPlanes,
+    ) -> bool {
+        if texture.is_null() {
+            return false;
+        }
+        self.entries
+            .get(&(texture, subresource, plane.bits()))
+            .is_some_and(|record| {
+                record.last == self.frame && record.before != 0 && record.before + 1 == self.frame
+            })
     }
 }
 

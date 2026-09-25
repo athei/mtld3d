@@ -19,7 +19,7 @@ use std::{
 
 use log::{Level, debug, error, log_enabled, trace, warn};
 use mtld3d_core::{
-    async_compile::{CompileLanes, JobTicket, Lane, Resolution, TargetFlags, may_skip_draw},
+    async_compile::{ClearPlanes, CompileLanes, JobTicket, Resolution, may_skip_draw},
     build_index::BuildLookup,
     dxso::{
         DxsoProgram, FfPsKey, FfVsKey, LOG_TARGET as MSL_TRACE_TARGET, VariantKey, VsSamplerKinds,
@@ -58,6 +58,16 @@ use crate::{
 /// the API, encoder and submit threads.
 const COMPILE_WORKERS: usize = 4;
 
+/// Stack reserved for each compile worker, a quarter of the thread default.
+///
+/// A 32-bit guest's address space is what runs out first, and four workers
+/// at the default 2 MiB would reserve 8 MiB of it per device. A worker's
+/// stack holds the MSL emission and the thunk's PE half; the `unix_call`
+/// itself runs on Wine's kernel stack. The whole conformance suite built its
+/// shaders on workers with 128 KiB stacks without an overflow on either
+/// architecture, so this leaves four times that.
+const COMPILE_WORKER_STACK: usize = 512 * 1024;
+
 /// The jobs waiting for a worker, and the workers' wake-up.
 ///
 /// Shared by the encoder that queues and steals and the workers that pop.
@@ -91,8 +101,8 @@ impl CompileQueue {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn push(&self, ticket: JobTicket, job: QueuedJob, lane: Lane) {
-        self.lock().lanes.push(ticket, job, lane);
+    fn push(&self, ticket: JobTicket, job: QueuedJob) {
+        self.lock().lanes.push_normal(ticket, job);
         self.ready.notify_one();
     }
 
@@ -149,6 +159,7 @@ pub fn spawn_workers(queue: &Arc<CompileQueue>, results: &mpsc::Sender<CompileRe
         let results = results.clone();
         match thread::Builder::new()
             .name("mtld3d-compile".into())
+            .stack_size(COMPILE_WORKER_STACK)
             .spawn(move || worker_main(&queue, &results))
         {
             Ok(_detached) => started += 1,
@@ -957,7 +968,6 @@ impl FrameEncoder {
                 job,
                 enqueued_tsc: rdtsc(),
             },
-            Lane::Normal,
         );
         let pending = self.compile_in_flight.len();
         self.perf.compilation_mut().note_pending(pending);
@@ -981,39 +991,50 @@ impl FrameEncoder {
 
     /// Whether a draw whose build is in flight is left out of this frame.
     ///
-    /// Only under `shader.asyncCompile`, and only when the targets the draw
-    /// writes are rewritten each frame: the back buffer, or a target this
-    /// frame cleared (a depth-only draw is judged by its depth attachment).
-    /// A skip is counted and logged once; the caller drops the draw.
-    pub fn skip_pending_draw(&mut self, color_written: bool) -> bool {
-        if !self.flags.contains(FrameEncoderFlags::ASYNC_COMPILE) {
+    /// Only under `shader.asyncCompile`, never while an occlusion query
+    /// counts (the application reads that count back), and only when every
+    /// attachment the draw depends on is rebuilt each frame: each colour
+    /// target the pass attaches, and the depth and stencil planes when
+    /// `depth_used` / `stencil_used` say the draw tests or writes them. A
+    /// colour target qualifies when it is the back buffer under the discard
+    /// swap effect, which starts every frame undefined, or when a whole
+    /// clear reached it in this frame and the one before; a depth or stencil
+    /// plane only by the clears. A skip is counted and logged once; the
+    /// caller drops the draw.
+    ///
+    /// Not guarded: a skipped back-buffer draw that the application copies
+    /// into a texture of its own later in the same frame (`StretchRect` or
+    /// `GetRenderTargetData` from the back buffer) and keeps is missing
+    /// from that copy.
+    pub fn skip_pending_draw(&mut self, depth_used: bool, stencil_used: bool) -> bool {
+        if !self.flags.contains(FrameEncoderFlags::ASYNC_COMPILE)
+            || self.visibility.active_count() != 0
+        {
             return false;
         }
-        let mut color = [TargetFlags::empty(); 4];
+        let mut color = [false; 4];
         let mut count = 0;
         for (texture, subresource) in self.pass_state.attached_color_targets() {
             let Some(slot) = color.get_mut(count) else {
                 break;
             };
-            slot.set(
-                TargetFlags::BACK_BUFFER,
-                self.pass_state.is_back_buffer(texture),
-            );
-            slot.set(
-                TargetFlags::CLEARED,
-                self.cleared_targets.contains(texture, subresource),
-            );
+            *slot = self.pass_state.is_discarded_back_buffer(texture)
+                || self
+                    .cleared_targets
+                    .regenerated(texture, subresource, ClearPlanes::COLOR);
             count += 1;
         }
-        let mut depth = TargetFlags::empty();
-        depth.set(
-            TargetFlags::CLEARED,
-            self.cleared_targets.contains(
-                self.pass_state.current_depth_texture(),
-                self.pass_state.current_depth_level(),
-            ),
-        );
-        if !may_skip_draw(color_written, &color[..count], depth) {
+        let depth_texture = self.pass_state.current_depth_texture();
+        let depth_level = self.pass_state.current_depth_level();
+        let depth = depth_used.then(|| {
+            self.cleared_targets
+                .regenerated(depth_texture, depth_level, ClearPlanes::DEPTH)
+        });
+        let stencil = stencil_used.then(|| {
+            self.cleared_targets
+                .regenerated(depth_texture, depth_level, ClearPlanes::STENCIL)
+        });
+        if !may_skip_draw(&color[..count], depth, stencil) {
             return false;
         }
         mtld3d_shared::log_once_info!(
@@ -1314,15 +1335,17 @@ impl FrameEncoder {
     /// Remember that the colour targets the next pass attaches were cleared whole.
     pub fn note_color_targets_cleared(&mut self) {
         for (texture, subresource) in self.pass_state.attached_color_targets() {
-            self.cleared_targets.record(texture, subresource);
+            self.cleared_targets
+                .record(texture, subresource, ClearPlanes::COLOR);
         }
     }
 
-    /// Remember that the bound depth attachment's depth plane was cleared whole.
-    pub fn note_depth_target_cleared(&mut self) {
+    /// Remember that `planes` of the bound depth-stencil attachment were cleared whole.
+    pub fn note_depth_stencil_cleared(&mut self, planes: ClearPlanes) {
         self.cleared_targets.record(
             self.pass_state.current_depth_texture(),
             self.pass_state.current_depth_level(),
+            planes,
         );
     }
 }

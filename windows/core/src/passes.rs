@@ -2105,14 +2105,18 @@ impl PassState {
         self.current_color_texture
     }
 
-    /// Whether `texture` is this frame's back buffer, by identity.
+    /// Whether `texture` is this frame's back buffer and the frame started it undefined.
     ///
-    /// A multisampled back buffer is bound through its companion but keeps
-    /// the resolve target as its identity, so the companion answers through
-    /// the base handle too.
+    /// True under the discard swap effect only: under `FLIP` and `COPY` the
+    /// back buffer keeps its contents into the next frame, like any other
+    /// target. A multisampled back buffer is bound through its companion but
+    /// keeps the resolve target as its identity, so the companion answers
+    /// through the base handle too.
     #[must_use]
-    pub fn is_back_buffer(&self, texture: MetalHandle<MTLTextureKind>) -> bool {
-        !texture.is_null() && texture == self.backbuffer_texture
+    pub fn is_discarded_back_buffer(&self, texture: MetalHandle<MTLTextureKind>) -> bool {
+        !texture.is_null()
+            && texture == self.backbuffer_texture
+            && matches!(self.backbuffer_contents, BackbufferContents::Undefined)
     }
 
     /// Render target 0 and every extra target the next pass attaches, as `(texture, subresource)`.

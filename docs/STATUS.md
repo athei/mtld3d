@@ -210,7 +210,9 @@ is in [`CONFORMANCE.md`](../unix/conformance/CONFORMANCE.md#kept-divergences).
   nothing on screen, where D3D9 ramps the whole desktop. Only the implicit
   swap chain carries a ramp. No knob.
 - A draw whose shader library or render pipeline is still building is left
-  out of its frame when its target is the back buffer or was cleared earlier
-  in the frame, and appears once the build lands; D3D9 draws every call in
-  its frame. Building inline stalls the frame for the length of a Metal
-  compile. `shader.asyncCompile`, on by default.
+  out of its frame when everything it depends on is rebuilt every frame
+  (the discard-effect back buffer, or targets and depth or stencil planes
+  cleared in this frame and the one before) and no occlusion query counts,
+  and appears once the build lands; D3D9 draws every call in its frame.
+  Building inline stalls the frame for the length of a Metal compile.
+  `shader.asyncCompile`, on by default.

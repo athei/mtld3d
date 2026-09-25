@@ -1,6 +1,6 @@
 use mtld3d_shared::{MetalHandle, mtl_handle::MTLTextureKind};
 
-use super::{ClearedTargets, CompileLanes, Lane, TargetFlags, TicketSource, may_skip_draw};
+use super::{ClearHistory, ClearPlanes, CompileLanes, TicketSource, may_skip_draw};
 
 fn texture(raw: u64) -> MetalHandle<MTLTextureKind> {
     // SAFETY: the value is an opaque test identity; nothing dereferences it.
@@ -15,9 +15,9 @@ fn urgent_jobs_pop_first_in_order() {
     let first = tickets.issue();
     let second = tickets.issue();
     let urgent = tickets.issue();
-    lanes.push(first, "first", Lane::Normal);
-    lanes.push(second, "second", Lane::Normal);
-    lanes.push(urgent, "urgent", Lane::Urgent);
+    lanes.push_normal(first, "first");
+    lanes.push_normal(second, "second");
+    lanes.push_urgent(urgent, "urgent");
     assert_eq!(lanes.len(), 3);
     assert_eq!(lanes.pop(), Some((urgent, "urgent")));
     assert_eq!(lanes.pop(), Some((first, "first")));
@@ -33,8 +33,8 @@ fn promote_moves_a_normal_job_to_the_urgent_lane() {
     let mut lanes = CompileLanes::new();
     let first = tickets.issue();
     let waited = tickets.issue();
-    lanes.push(first, 1, Lane::Normal);
-    lanes.push(waited, 2, Lane::Normal);
+    lanes.push_normal(first, 1);
+    lanes.push_normal(waited, 2);
     assert!(lanes.promote(waited));
     assert!(lanes.promote(waited), "promoting twice keeps it urgent");
     assert_eq!(lanes.len(), 2, "promotion moves, it does not copy");
@@ -48,7 +48,7 @@ fn a_started_job_is_neither_promoted_nor_stolen() {
     let mut tickets = TicketSource::new();
     let mut lanes = CompileLanes::new();
     let started = tickets.issue();
-    lanes.push(started, (), Lane::Normal);
+    lanes.push_normal(started, ());
     assert_eq!(lanes.pop(), Some((started, ())));
     assert!(!lanes.promote(started));
     assert_eq!(lanes.steal(started), None);
@@ -62,9 +62,9 @@ fn steal_takes_only_the_named_urgent_job() {
     let normal = tickets.issue();
     let urgent = tickets.issue();
     let other = tickets.issue();
-    lanes.push(normal, "normal", Lane::Normal);
-    lanes.push(urgent, "urgent", Lane::Urgent);
-    lanes.push(other, "other", Lane::Urgent);
+    lanes.push_normal(normal, "normal");
+    lanes.push_urgent(urgent, "urgent");
+    lanes.push_urgent(other, "other");
     assert_eq!(lanes.steal(normal), None, "a normal job is promoted first");
     assert_eq!(lanes.steal(other), Some("other"));
     assert_eq!(lanes.steal(other), None, "a job leaves the lanes once");
@@ -73,50 +73,92 @@ fn steal_takes_only_the_named_urgent_job() {
     assert_eq!(lanes.pop(), Some((normal, "normal")));
 }
 
-/// The back buffer and a target cleared this frame may lose one frame's draw.
+/// Every attached colour target and every plane the draw uses has to be regenerated.
 #[test]
-fn a_color_draw_skips_only_into_rewritten_targets() {
-    let back_buffer = TargetFlags::BACK_BUFFER;
-    let cleared = TargetFlags::CLEARED;
-    let kept = TargetFlags::empty();
-    assert!(may_skip_draw(true, &[back_buffer], kept));
-    assert!(may_skip_draw(true, &[cleared], kept));
+fn a_draw_skips_only_when_everything_it_depends_on_is_regenerated() {
+    assert!(may_skip_draw(&[true], None, None));
+    assert!(!may_skip_draw(&[false], None, None));
     assert!(
-        !may_skip_draw(true, &[kept], cleared),
-        "depth does not vouch for colour"
+        !may_skip_draw(&[true, false], None, None),
+        "every attached colour target counts"
+    );
+    assert!(may_skip_draw(&[true], Some(true), Some(true)));
+    assert!(
+        !may_skip_draw(&[true], Some(false), None),
+        "a depth test against a kept attachment waits"
     );
     assert!(
-        !may_skip_draw(true, &[back_buffer, kept], cleared),
-        "every target the draw writes has to be rewritten"
+        !may_skip_draw(&[true], Some(true), Some(false)),
+        "a stencil test against a kept plane waits"
     );
-    assert!(may_skip_draw(true, &[back_buffer, cleared], kept));
-}
-
-/// A draw that writes no colour is judged by its depth attachment.
-#[test]
-fn a_depth_only_draw_skips_only_into_a_cleared_depth_target() {
-    assert!(may_skip_draw(false, &[], TargetFlags::CLEARED));
-    assert!(!may_skip_draw(false, &[], TargetFlags::empty()));
     assert!(
-        !may_skip_draw(false, &[TargetFlags::BACK_BUFFER], TargetFlags::empty()),
-        "an unwritten back buffer does not vouch for depth"
+        !may_skip_draw(&[false], Some(true), None),
+        "a depth-only draw into a regenerated depth still feeds a kept colour target"
     );
 }
 
-/// A clear is remembered per texture and subresource until the frame resets.
+/// One clear is not enough; a clear in each of two consecutive frames is.
 #[test]
-fn cleared_targets_are_per_subresource_and_per_frame() {
-    let mut cleared = ClearedTargets::default();
+fn an_attachment_is_regenerated_after_two_consecutive_cleared_frames() {
+    let mut history = ClearHistory::new();
     let rt = texture(0x100);
-    cleared.record(rt, 0);
-    cleared.record(MetalHandle::NULL, 0);
-    assert!(cleared.contains(rt, 0));
+    history.record(rt, 0, ClearPlanes::COLOR);
     assert!(
-        !cleared.contains(rt, 1 << 16),
-        "another level was not cleared"
+        !history.regenerated(rt, 0, ClearPlanes::COLOR),
+        "a first clear may open a one-off render"
     );
-    assert!(!cleared.contains(texture(0x200), 0));
-    assert!(!cleared.contains(MetalHandle::NULL, 0));
-    cleared.reset();
-    assert!(!cleared.contains(rt, 0));
+    history.begin_frame();
+    assert!(!history.regenerated(rt, 0, ClearPlanes::COLOR));
+    history.record(rt, 0, ClearPlanes::COLOR);
+    history.record(rt, 0, ClearPlanes::COLOR);
+    assert!(history.regenerated(rt, 0, ClearPlanes::COLOR));
+    history.begin_frame();
+    assert!(
+        !history.regenerated(rt, 0, ClearPlanes::COLOR),
+        "not before this frame's own clear"
+    );
+    history.record(rt, 0, ClearPlanes::COLOR);
+    assert!(history.regenerated(rt, 0, ClearPlanes::COLOR));
+}
+
+/// A frame without the clear breaks the streak and the entry is dropped.
+#[test]
+fn a_skipped_clear_restarts_the_streak() {
+    let mut history = ClearHistory::new();
+    let rt = texture(0x100);
+    history.record(rt, 0, ClearPlanes::COLOR);
+    history.begin_frame();
+    history.begin_frame();
+    history.record(rt, 0, ClearPlanes::COLOR);
+    assert!(!history.regenerated(rt, 0, ClearPlanes::COLOR));
+    history.begin_frame();
+    history.record(rt, 0, ClearPlanes::COLOR);
+    assert!(history.regenerated(rt, 0, ClearPlanes::COLOR));
+    history.begin_frame();
+    history.begin_frame();
+    assert!(
+        history.entries.is_empty(),
+        "stale attachments are forgotten"
+    );
+}
+
+/// Planes and subresources are tracked apart, and a null texture never counts.
+#[test]
+fn planes_and_subresources_are_separate() {
+    let mut history = ClearHistory::new();
+    let ds = texture(0x200);
+    for _ in 0..2 {
+        history.begin_frame();
+        history.record(ds, 0, ClearPlanes::DEPTH);
+        history.record(ds, 1, ClearPlanes::DEPTH | ClearPlanes::STENCIL);
+        history.record(MetalHandle::NULL, 0, ClearPlanes::COLOR);
+    }
+    assert!(history.regenerated(ds, 0, ClearPlanes::DEPTH));
+    assert!(
+        !history.regenerated(ds, 0, ClearPlanes::STENCIL),
+        "a depth-only clear leaves stencil kept"
+    );
+    assert!(history.regenerated(ds, 1, ClearPlanes::STENCIL));
+    assert!(!history.regenerated(ds, 2, ClearPlanes::DEPTH));
+    assert!(!history.regenerated(MetalHandle::NULL, 0, ClearPlanes::COLOR));
 }

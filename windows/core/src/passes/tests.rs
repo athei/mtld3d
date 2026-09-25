@@ -9838,8 +9838,8 @@ fn a_colour_clear_ends_a_dropped_pass_first() {
 #[test]
 fn attached_color_targets_name_rt0_and_the_extras_the_pass_attaches() {
     let mut s = fresh();
-    assert!(s.is_back_buffer(backbuffer()));
-    assert!(!s.is_back_buffer(MetalHandle::NULL));
+    assert!(s.is_discarded_back_buffer(backbuffer()));
+    assert!(!s.is_discarded_back_buffer(MetalHandle::NULL));
     assert_eq!(
         s.attached_color_targets().collect::<Vec<_>>(),
         [(backbuffer(), 0)]
@@ -9852,5 +9852,27 @@ fn attached_color_targets_name_rt0_and_the_extras_the_pass_attaches() {
         "a target sized unlike render target 0 is attached to no pass"
     );
     s.set_color_render_target(tex(0x5000), 640, 480, RT_FORMAT, RenderScale::IDENTITY);
-    assert!(!s.is_back_buffer(s.current_color_texture()));
+    assert!(!s.is_discarded_back_buffer(s.current_color_texture()));
+}
+
+/// A back buffer kept across `Present` is not rewritten every frame.
+#[test]
+fn a_kept_back_buffer_is_not_a_discarded_one() {
+    let mut s = PassState::new();
+    s.reset_frame(&FrameReset {
+        backbuffer: backbuffer(),
+        backbuffer_srgb: backbuffer_srgb(),
+        backbuffer_msaa: MetalHandle::NULL,
+        backbuffer_msaa_srgb: MetalHandle::NULL,
+        backbuffer_sample_count: 1,
+        backbuffer_size: BB_SIZE,
+        backbuffer_format: BB_FORMAT,
+        backbuffer_contents: BackbufferContents::Preserved,
+        depth_texture: depth(),
+        depth_size: BB_SIZE,
+        depth_has_stencil: false,
+        render_scale: RenderScale::IDENTITY,
+        continues_frame: false,
+    });
+    assert!(!s.is_discarded_back_buffer(backbuffer()));
 }

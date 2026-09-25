@@ -1630,13 +1630,10 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
     //    draw are installed first, so the probes see them.
     let t_lookup = CycleAddTimer::start(enc.op_sub_detail_ptr(OpSubDetail::RLookup));
     enc.drain_compile_results();
-    // Whether the draw writes a colour target, which decides whether a
-    // pending build may skip it on the colour targets' account or only on
-    // the depth attachment's.
-    let color_written = !rt0_drop
-        && !render_state
-            .pipeline_rs
-            .writes_no_color(&extra_attachments, ps_color_out_mask);
+    // Whether the draw tests or writes the depth and stencil planes, which
+    // a pending build may only skip when those planes are rebuilt each frame.
+    let depth_used = has_depth && render_state.depth_stencil_state.depth_enable != 0;
+    let stencil_used = has_stencil && render_state.depth_stencil_state.stencil_enable != 0;
     let mut waited = false;
     let (vs_handles, ps_handles) = loop {
         // Both stages resolve before any decision, so a draw missing both
@@ -1690,7 +1687,7 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
             );
             return;
         }
-        if enc.skip_pending_draw(color_written) {
+        if enc.skip_pending_draw(depth_used, stencil_used) {
             return;
         }
         let tickets: Vec<JobTicket> = pending.into_iter().flatten().collect();
@@ -1767,8 +1764,6 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
         match enc.get_or_create_pipeline(&pipeline_snapshot, attrs_ref, &shaders) {
             Resolution::Ready(handle) => break handle,
             Resolution::Pending(ticket) => {
-                let color_written =
-                    pipeline_snapshot.has_color_output() && !pipeline_snapshot.writes_no_color();
                 if waited {
                     mtld3d_shared::log_once_warn!(
                         target: crate::LOG_TARGET,
@@ -1776,7 +1771,7 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
                     );
                     return;
                 }
-                if enc.skip_pending_draw(color_written) {
+                if enc.skip_pending_draw(depth_used, stencil_used) {
                     return;
                 }
                 enc.wait_for_compiles(&[ticket]);

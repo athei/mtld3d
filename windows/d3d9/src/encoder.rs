@@ -12,7 +12,7 @@ use std::{
 
 use log::{Level, debug, error, log_enabled, trace};
 use mtld3d_core::{
-    async_compile::{ClearedTargets, JobTicket, TicketSource},
+    async_compile::{ClearHistory, ClearPlanes, JobTicket, TicketSource},
     buffer_rename::{BufferMapMode, stage_upload_needs_preserve},
     build_index::BuildIndex,
     config::Mtld3dConfig,
@@ -1311,13 +1311,13 @@ pub struct FrameEncoder {
     /// Tickets of the builds queued or running, cleared as each is installed.
     compile_in_flight: FxHashSet<JobTicket>,
     compile_tickets: TicketSource,
-    /// Attachments a whole-target `Clear` reached in the current frame.
+    /// Per attachment plane, the recent presented frames a whole-target `Clear` reached it in.
     ///
-    /// Read by `skip_pending_draw`: only a draw into the back buffer or into
-    /// one of these may be left out while its build is in flight. Reset at
-    /// `begin_frame` unless the previous submit was a mid-frame flush, whose
-    /// frame goes on.
-    cleared_targets: ClearedTargets,
+    /// Read by `skip_pending_draw`: a draw may be left out while its build is
+    /// in flight only when what it depends on was cleared in this frame and
+    /// the one before. Advanced at `begin_frame` unless the previous submit
+    /// was a mid-frame flush, whose frame goes on.
+    cleared_targets: ClearHistory,
     /// Pointer to the most recently shipped `CurrentSnapshot`.
     ///
     /// Lives in the per-frame `ScratchArena`. Set by
@@ -1751,7 +1751,7 @@ impl FrameEncoder {
             compile_results,
             compile_in_flight: FxHashSet::default(),
             compile_tickets: TicketSource::new(),
-            cleared_targets: ClearedTargets::default(),
+            cleared_targets: ClearHistory::new(),
             current_snapshot: None,
             vs_constants_mirror: Box::new([[0.0; 4]; CONSTANT_ROWS]),
             ps_constants_mirror: Box::new([[0.0; 4]; CONSTANT_ROWS]),
@@ -2485,7 +2485,7 @@ impl FrameEncoder {
         // A mid-frame flush does not end the D3D9 frame, so its clears still
         // stand for the draws after it.
         if !self.prev_submit_no_present {
-            self.cleared_targets.reset();
+            self.cleared_targets.begin_frame();
         }
         self.drain_compile_results();
         mtld3d_shared::crumb!("phase:BfRecl");
@@ -4238,9 +4238,10 @@ impl FrameEncoder {
     ///
     /// The caller has decided the clear covers the depth attachment.
     fn clear_depth_stencil_planes(&mut self, depth: Option<u32>, stencil: Option<u32>) {
-        if depth.is_some() {
-            self.note_depth_target_cleared();
-        }
+        let mut planes = ClearPlanes::empty();
+        planes.set(ClearPlanes::DEPTH, depth.is_some());
+        planes.set(ClearPlanes::STENCIL, stencil.is_some());
+        self.note_depth_stencil_cleared(planes);
         match (depth, stencil) {
             (Some(depth), Some(stencil)) => self.clear_depth_stencil(depth, stencil),
             (Some(depth), None) => self.clear_depth(depth),

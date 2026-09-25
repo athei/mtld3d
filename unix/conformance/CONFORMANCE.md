@@ -281,14 +281,17 @@ record. A knob, where one makes sense, is named with its default.
   A first-use Metal compile takes tens of milliseconds, and building it
   inline stalls that frame by as much; building it on a worker thread and
   leaving the draw out until it lands trades one or two frames of a missing
-  draw for no stall. Only a draw whose colour targets are the back buffer or
-  were cleared whole earlier in the frame, or a draw writing no colour whose
-  depth attachment was, is left out: those are redrawn every frame, so the
-  draw appears once its build lands. A draw into any other target waits for
-  its build, because the target may be drawn once and read for the rest of
-  its life. A target cleared and drawn only once, at load, can still lose a
-  draw for good. The runner pins the knob off, so no site observes it. Knob:
-  `shader.asyncCompile`, default `true`.
+  draw for no stall. A draw is left out only when every colour target its
+  pass attaches is the discard-effect back buffer or was cleared whole in
+  this frame and the one before, and the depth and stencil planes it tests
+  or writes were cleared in both frames too: those are rebuilt every frame,
+  so the draw appears once its build lands. One clear does not qualify,
+  because a target cleared and drawn once, at load, is cleared exactly when
+  its shaders are cold. A draw into any other target, and every draw while
+  an occlusion query counts, waits for its build. A skipped back-buffer draw
+  the application copies into a texture of its own in the same frame is
+  missing from that copy. The runner pins the knob off, so no site observes
+  it. Knob: `shader.asyncCompile`, default `true`.
 
 ## Range-fog coverage
 
