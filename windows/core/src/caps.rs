@@ -233,10 +233,13 @@ const SHADE_DEFAULT: ShadeCaps = ShadeCaps::COLORGOURAUDRGB
 /// non-power-of-two textures unconditionally (mipmaps + wrap addressing), which
 /// D3D9 signals by leaving them off, and texture creation accepts arbitrary
 /// sizes. `TTFF_PROJECTED` is honored in FF pixel-shader sample emission;
-/// `PERSPECTIVE` is a factual statement — Metal interpolates
-/// perspective-correctly by default and `dxso::emit` never emits `[[flat]]` /
-/// `[[no_perspective]]` qualifiers. `TEXREPEATNOTSCALEDBYSIZE`: coordinates are
-/// normalized, so `MaxTextureRepeat` holds whatever the texture size.
+/// `PERSPECTIVE` is a factual statement: Metal interpolates
+/// perspective-correctly by default and every texture-coordinate varying keeps
+/// that default. The only qualifiers the pixel-shader sources emit are
+/// `[[flat]]` on the two colour varyings under `D3DSHADE_FLAT` and
+/// `[[center_no_perspective]]` on the table-fog depth.
+/// `TEXREPEATNOTSCALEDBYSIZE`: coordinates are normalized, so
+/// `MaxTextureRepeat` holds whatever the texture size.
 /// `ALPHAPALETTE` stays off: there are no palettized formats.
 const TEXTURE_DEFAULT: TextureCaps = TextureCaps::PERSPECTIVE
     .union(TextureCaps::ALPHA)

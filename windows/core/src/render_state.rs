@@ -8,15 +8,36 @@
 //! enum space passes through, anything else reads as the state's D3D9 default
 //! and is warned once. The state array keeps the raw DWORD, so `GetRenderState`
 //! and a state block still hand back exactly what the game wrote.
+//!
+//! It also holds [`rs_classify`], the table the device's silent-write audit
+//! reads to decide whether a non-default render-state write reaches a
+//! consumer, is a no-op by design, or is a feature gap worth a warning.
 
 use mtld3d_types::{
     D3DBLEND_INVSRCCOLOR2, D3DBLEND_ONE, D3DBLEND_ZERO, D3DBLENDOP_ADD, D3DBLENDOP_MAX,
     D3DCMP_ALWAYS, D3DCMP_LESSEQUAL, D3DCMP_NEVER, D3DCULL_CCW, D3DCULL_NONE, D3DFILL_POINT,
-    D3DFILL_SOLID, D3DRS_ALPHAFUNC, D3DRS_BLENDOP, D3DRS_BLENDOPALPHA, D3DRS_CCW_STENCILFAIL,
-    D3DRS_CCW_STENCILFUNC, D3DRS_CCW_STENCILPASS, D3DRS_CCW_STENCILZFAIL, D3DRS_COLORWRITEENABLE,
+    D3DFILL_SOLID, D3DFMT_ATOC, D3DFMT_NVDB, D3DRS_ADAPTIVETESS_W, D3DRS_ADAPTIVETESS_X,
+    D3DRS_ADAPTIVETESS_Y, D3DRS_ADAPTIVETESS_Z, D3DRS_ALPHABLENDENABLE, D3DRS_ALPHAFUNC,
+    D3DRS_ALPHAREF, D3DRS_ALPHATESTENABLE, D3DRS_AMBIENT, D3DRS_AMBIENTMATERIALSOURCE,
+    D3DRS_ANTIALIASEDLINEENABLE, D3DRS_BLENDFACTOR, D3DRS_BLENDOP, D3DRS_BLENDOPALPHA,
+    D3DRS_CCW_STENCILFAIL, D3DRS_CCW_STENCILFUNC, D3DRS_CCW_STENCILPASS, D3DRS_CCW_STENCILZFAIL,
+    D3DRS_CLIPPING, D3DRS_CLIPPLANEENABLE, D3DRS_COLORVERTEX, D3DRS_COLORWRITEENABLE,
     D3DRS_COLORWRITEENABLE1, D3DRS_COLORWRITEENABLE2, D3DRS_COLORWRITEENABLE3, D3DRS_CULLMODE,
-    D3DRS_DESTBLEND, D3DRS_DESTBLENDALPHA, D3DRS_FILLMODE, D3DRS_SRCBLEND, D3DRS_SRCBLENDALPHA,
-    D3DRS_STENCILFAIL, D3DRS_STENCILFUNC, D3DRS_STENCILPASS, D3DRS_STENCILZFAIL, D3DRS_ZFUNC,
+    D3DRS_DEBUGMONITORTOKEN, D3DRS_DEPTHBIAS, D3DRS_DESTBLEND, D3DRS_DESTBLENDALPHA,
+    D3DRS_DIFFUSEMATERIALSOURCE, D3DRS_DITHERENABLE, D3DRS_EMISSIVEMATERIALSOURCE,
+    D3DRS_ENABLEADAPTIVETESSELLATION, D3DRS_FILLMODE, D3DRS_FOGCOLOR, D3DRS_FOGDENSITY,
+    D3DRS_FOGENABLE, D3DRS_FOGEND, D3DRS_FOGSTART, D3DRS_FOGTABLEMODE, D3DRS_FOGVERTEXMODE,
+    D3DRS_INDEXEDVERTEXBLENDENABLE, D3DRS_LIGHTING, D3DRS_LOCALVIEWER, D3DRS_MAXTESSELLATIONLEVEL,
+    D3DRS_MINTESSELLATIONLEVEL, D3DRS_MULTISAMPLEANTIALIAS, D3DRS_MULTISAMPLEMASK,
+    D3DRS_NORMALDEGREE, D3DRS_NORMALIZENORMALS, D3DRS_PATCHEDGESTYLE, D3DRS_POINTSCALE_A,
+    D3DRS_POINTSCALE_B, D3DRS_POINTSCALE_C, D3DRS_POINTSCALEENABLE, D3DRS_POINTSIZE,
+    D3DRS_POINTSIZE_MAX, D3DRS_POINTSIZE_MIN, D3DRS_POINTSPRITEENABLE, D3DRS_POSITIONDEGREE,
+    D3DRS_RANGEFOGENABLE, D3DRS_SCISSORTESTENABLE, D3DRS_SEPARATEALPHABLENDENABLE, D3DRS_SHADEMODE,
+    D3DRS_SLOPESCALEDEPTHBIAS, D3DRS_SPECULARENABLE, D3DRS_SPECULARMATERIALSOURCE, D3DRS_SRCBLEND,
+    D3DRS_SRCBLENDALPHA, D3DRS_SRGBWRITEENABLE, D3DRS_STENCILENABLE, D3DRS_STENCILFAIL,
+    D3DRS_STENCILFUNC, D3DRS_STENCILMASK, D3DRS_STENCILPASS, D3DRS_STENCILREF,
+    D3DRS_STENCILWRITEMASK, D3DRS_STENCILZFAIL, D3DRS_TEXTUREFACTOR, D3DRS_TWEENFACTOR,
+    D3DRS_TWOSIDEDSTENCILMODE, D3DRS_VERTEXBLEND, D3DRS_ZENABLE, D3DRS_ZFUNC, D3DRS_ZWRITEENABLE,
     D3DSTENCILOP_DECR, D3DSTENCILOP_KEEP, RENDER_STATE_COUNT,
 };
 
@@ -70,6 +91,203 @@ const _: () = assert!(FILL_LAST as u32 == D3DFILL_SOLID);
 const _: () = assert!(STENCILOP_FIRST as u32 == D3DSTENCILOP_KEEP);
 const _: () = assert!(STENCILOP_LAST as u32 == D3DSTENCILOP_DECR);
 const _: () = assert!(STENCILOP_KEEP as u32 == D3DSTENCILOP_KEEP);
+
+/// How the silent-write audit treats a non-default `SetRenderState` write.
+///
+/// The device keeps one warn latch per slot and asks [`rs_classify`] the
+/// first time a slot receives a value other than its D3D9 default.
+pub enum RsClass {
+    /// A consumer reads the slot, so the write is honoured and nothing is logged.
+    Consumed,
+    /// A no-op by design, logged once at info with the reason.
+    ///
+    /// Metal has no analog, or the feature is obsolete on every modern
+    /// driver, so the no-op is the complete correct behaviour and not a port
+    /// candidate: the `log_once_info!` side of the info-versus-warn line.
+    Obsolete(&'static str),
+    /// Nothing reads the slot, so the write is lost and warned once.
+    NotImplemented,
+}
+
+/// Classify a non-default write of `value` to render state `index`.
+///
+/// A slot is `Consumed` only while a snapshot, key or uniform builder reads
+/// it; the comment on each group names that reader. A new consumer moves its
+/// slot here in the same change, so every warning the audit prints stays a
+/// real gap.
+#[must_use]
+pub const fn rs_classify(index: u32, value: u32) -> RsClass {
+    match index {
+        // Alpha to coverage: `multisample::alpha_to_coverage_requested` reads
+        // the ATOC token. Zero is the D3D9 default and never reaches here.
+        D3DRS_ADAPTIVETESS_Y if matches!(value, 0 | D3DFMT_ATOC) => RsClass::Consumed,
+        // Depth, blend and colour-write state: the RS snapshot built on the
+        // API thread, keyed through `pipeline_state::key_from_snapshot` and
+        // `depth_stencil_state::snapshot_from_state`, whose per-field tests
+        // assert that mutating any of these produces a different key.
+        D3DRS_ZENABLE
+        | D3DRS_ZWRITEENABLE
+        | D3DRS_ZFUNC
+        | D3DRS_ALPHABLENDENABLE
+        | D3DRS_SRCBLEND
+        | D3DRS_DESTBLEND
+        | D3DRS_BLENDOP
+        | D3DRS_BLENDOPALPHA
+        | D3DRS_SEPARATEALPHABLENDENABLE
+        | D3DRS_SRCBLENDALPHA
+        | D3DRS_DESTBLENDALPHA
+        // SRGBWRITEENABLE binds the colour attachment's sRGB twin view for
+        // the pass, so Metal encodes after the blender. A target with no
+        // sRGB Metal view falls back to the pixel-shader OETF variant
+        // (`VariantFlags::SRGB_WRITE`) with `Clear` converting its colour
+        // through the same curve.
+        | D3DRS_SRGBWRITEENABLE
+        | D3DRS_COLORWRITEENABLE
+        | D3DRS_COLORWRITEENABLE1
+        | D3DRS_COLORWRITEENABLE2
+        | D3DRS_COLORWRITEENABLE3
+        | D3DRS_CULLMODE
+        | D3DRS_FILLMODE
+        | D3DRS_SCISSORTESTENABLE
+        // SHADEMODE keys `VariantFlags::FLAT_SHADE` in `FfState::variant_key`:
+        // under `D3DSHADE_FLAT` both pixel-shader sources declare the two
+        // colour varyings `[[flat]]`, so they come from the provoking vertex.
+        | D3DRS_SHADEMODE
+        // Alpha test: `FfState::variant_key` (alpha function) and the PS
+        // slot-14 alpha-ref bytes.
+        | D3DRS_ALPHATESTENABLE
+        | D3DRS_ALPHAFUNC
+        | D3DRS_ALPHAREF
+        // Fixed-function lighting, fog and texture factor: `FfState`'s VS
+        // and PS keys and constant builders.
+        | D3DRS_LIGHTING
+        | D3DRS_AMBIENT
+        | D3DRS_TEXTUREFACTOR
+        | D3DRS_FOGENABLE
+        | D3DRS_FOGVERTEXMODE
+        | D3DRS_FOGTABLEMODE
+        | D3DRS_RANGEFOGENABLE
+        | D3DRS_FOGCOLOR
+        | D3DRS_FOGSTART
+        | D3DRS_FOGEND
+        | D3DRS_FOGDENSITY
+        // COLORVERTEX and the four material sources feed the fixed-function
+        // VS emitter's `resolve_mat` (`dxso::ff`) through `FfVsFlags` and
+        // the `FfVsKey` material-source fields.
+        | D3DRS_COLORVERTEX
+        | D3DRS_DIFFUSEMATERIALSOURCE
+        | D3DRS_AMBIENTMATERIALSOURCE
+        | D3DRS_SPECULARMATERIALSOURCE
+        | D3DRS_EMISSIVEMATERIALSOURCE
+        // NORMALIZENORMALS is the `FfVsFlags::NORMALIZE_NORMALS` key bit on a
+        // lit draw with a normal: the VS renormalizes the eye-space normal.
+        | D3DRS_NORMALIZENORMALS
+        // SPECULARENABLE gates the specular colour output of the FF VS.
+        | D3DRS_SPECULARENABLE
+        // LOCALVIEWER selects the specular view-vector model (per-vertex
+        // normalize(-posEye) or the constant infinite-viewer direction);
+        // feeds `FfVsFlags::LOCAL_VIEWER`.
+        | D3DRS_LOCALVIEWER
+        // VERTEXBLEND and INDEXEDVERTEXBLENDENABLE feed
+        // `FfState::build_vs_key` through `resolve_vertex_blend_count`: the
+        // VS blends position and normal across the world-matrix palette.
+        | D3DRS_VERTEXBLEND
+        | D3DRS_INDEXEDVERTEXBLENDENABLE
+        // POINTSIZE, its clamp and POINTSCALE_A..C ride the per-draw VsDraw
+        // uniform (`vs_draw`) that every vertex shader clamps
+        // `[[point_size]]` from; POINTSIZE also carries the A2M and RESZ
+        // control tokens. POINTSCALEENABLE is the `FfVsFlags::POINT_SCALE`
+        // key bit; POINTSPRITEENABLE is the `VariantFlags::POINT_SPRITE` PS
+        // variant that samples `[[point_coord]]`.
+        | D3DRS_POINTSIZE
+        | D3DRS_POINTSIZE_MIN
+        | D3DRS_POINTSIZE_MAX
+        | D3DRS_POINTSCALE_A
+        | D3DRS_POINTSCALE_B
+        | D3DRS_POINTSCALE_C
+        | D3DRS_POINTSCALEENABLE
+        | D3DRS_POINTSPRITEENABLE
+        // CLIPPING is the master clipping switch: it gates the user clip
+        // planes (`vs_draw::clip_plane_count`); its frustum half is a no-op,
+        // since Metal always clips to the viewport. CLIPPLANEENABLE selects
+        // which of the `SetClipPlane` planes the VsDraw uniform packs and
+        // keys the `[[clip_distance]]` lane count of both vertex-shader
+        // sources.
+        | D3DRS_CLIPPING
+        | D3DRS_CLIPPLANEENABLE
+        // BLENDFACTOR is the encoder's constant blend colour
+        // (`Command::set_blend_color`), set whenever the draw's value
+        // differs from the one bound.
+        | D3DRS_BLENDFACTOR
+        // DEPTHBIAS feeds the vertex shaders' `pos_fixup.depth_bias` and
+        // SLOPESCALEDEPTHBIAS Metal's per-encoder rasterizer offset
+        // (`Command::set_depth_bias`), both resolved per draw.
+        | D3DRS_DEPTHBIAS
+        | D3DRS_SLOPESCALEDEPTHBIAS
+        // The stencil states reach Metal through
+        // `depth_stencil_state::snapshot_from_state`. STENCILREF is the
+        // exception by design: it rides the encoder as
+        // `SetStencilReference`, not the state object.
+        | D3DRS_STENCILENABLE
+        | D3DRS_STENCILFAIL
+        | D3DRS_STENCILZFAIL
+        | D3DRS_STENCILPASS
+        | D3DRS_STENCILFUNC
+        | D3DRS_STENCILMASK
+        | D3DRS_STENCILWRITEMASK
+        | D3DRS_STENCILREF
+        | D3DRS_TWOSIDEDSTENCILMODE
+        | D3DRS_CCW_STENCILFAIL
+        | D3DRS_CCW_STENCILZFAIL
+        | D3DRS_CCW_STENCILPASS
+        | D3DRS_CCW_STENCILFUNC
+        // MULTISAMPLEMASK narrows the samples a draw covers; the pixel-shader
+        // variant writes it to a `[[sample_mask]]` output, which is where
+        // Metal takes a coverage mask.
+        | D3DRS_MULTISAMPLEMASK => RsClass::Consumed,
+
+        // MULTISAMPLEANTIALIAS asks the rasterizer to drop to one sample for
+        // a draw on a multisampled target. Metal ties the pipeline's
+        // `rasterSampleCount` to the attachment's, so there is no per-draw
+        // switch to honour it with.
+        D3DRS_MULTISAMPLEANTIALIAS => RsClass::Obsolete(
+            "Metal has no per-draw multisample toggle (D3DPRASTERCAPS_MULTISAMPLE_TOGGLE is not advertised)",
+        ),
+        D3DRS_PATCHEDGESTYLE | D3DRS_POSITIONDEGREE | D3DRS_NORMALDEGREE => {
+            RsClass::Obsolete("N-patch tessellation is obsolete; every modern driver ignores it")
+        }
+        // The adaptive tessellation states drive RT-patch and N-patch
+        // tessellation, which is not implemented (`DrawRectPatch` and
+        // `DrawTriPatch` fail). NVDB on ADAPTIVETESS_X is the depth-bounds
+        // switch instead, a missing feature, so it keeps the warning; the
+        // bounds it reads from Z and W log here.
+        D3DRS_ADAPTIVETESS_X if value == D3DFMT_NVDB => RsClass::NotImplemented,
+        D3DRS_MINTESSELLATIONLEVEL
+        | D3DRS_MAXTESSELLATIONLEVEL
+        | D3DRS_ADAPTIVETESS_X
+        | D3DRS_ADAPTIVETESS_Y
+        | D3DRS_ADAPTIVETESS_Z
+        | D3DRS_ADAPTIVETESS_W
+        | D3DRS_ENABLEADAPTIVETESSELLATION => {
+            RsClass::Obsolete("adaptive patch tessellation is obsolete and not implemented")
+        }
+        D3DRS_TWEENFACTOR => RsClass::Obsolete("fixed-function vertex tweening is obsolete"),
+        D3DRS_DEBUGMONITORTOKEN => RsClass::Obsolete("debug-only token with no rendering effect"),
+        // Dithering changes nothing on the 8-bit and wider targets rendered
+        // to, which is why `D3DPRASTERCAPS_DITHER` is advertised.
+        D3DRS_DITHERENABLE => {
+            RsClass::Obsolete("dithering has no effect on 8-bit and wider render targets")
+        }
+        // Metal rasterizes lines aliased only, so the cap stays clear and the
+        // write has nothing to switch.
+        D3DRS_ANTIALIASEDLINEENABLE => RsClass::Obsolete(
+            "Metal has no antialiased line rasterization (D3DLINECAPS_ANTIALIAS is not advertised)",
+        ),
+
+        // Nothing reads the slot.
+        _ => RsClass::NotImplemented,
+    }
+}
 
 /// What a render state accepts, at the width a snapshot carries.
 enum Space {

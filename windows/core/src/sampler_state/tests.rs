@@ -405,3 +405,41 @@ fn fetch4_commands_are_not_lod_biases() {
         assert_eq!(super::lod_bias(&states).to_bits(), 0.0f32.to_bits());
     }
 }
+
+#[test]
+fn displacement_and_multi_element_sampler_states_are_obsolete() {
+    // DMAPOFFSET offsets the displacement map of N-patch tessellation and
+    // ELEMENTINDEX picks an element of a multi-element texture; neither
+    // feature exists here or on a modern driver, so a write logs at info.
+    for type_ in [
+        mtld3d_types::D3DSAMP_DMAPOFFSET,
+        mtld3d_types::D3DSAMP_ELEMENTINDEX,
+    ] {
+        assert!(
+            matches!(samp_classify(type_), SampClass::Obsolete(_)),
+            "D3DSAMP_{type_} is not classified Obsolete"
+        );
+    }
+}
+
+#[test]
+fn every_translated_sampler_state_is_consumed() {
+    for type_ in [
+        D3DSAMP_ADDRESSU,
+        D3DSAMP_ADDRESSV,
+        D3DSAMP_ADDRESSW,
+        D3DSAMP_BORDERCOLOR,
+        D3DSAMP_MAGFILTER,
+        D3DSAMP_MINFILTER,
+        D3DSAMP_MIPFILTER,
+        D3DSAMP_MIPMAPLODBIAS,
+        D3DSAMP_MAXMIPLEVEL,
+        D3DSAMP_MAXANISOTROPY,
+        D3DSAMP_SRGBTEXTURE,
+    ] {
+        assert!(
+            matches!(samp_classify(type_), SampClass::Consumed),
+            "D3DSAMP_{type_} is not classified Consumed"
+        );
+    }
+}

@@ -108,3 +108,80 @@ fn colour_write_masks_drop_bits_they_do_not_name() {
 fn an_unclassified_state_reads_as_its_low_byte() {
     assert_eq!(narrowed(mtld3d_types::D3DRS_STENCILREF, 0x42), 0x42);
 }
+
+#[test]
+fn shade_mode_is_consumed() {
+    // SHADEMODE keys `VariantFlags::FLAT_SHADE`, which puts `[[flat]]` on the
+    // colour varyings, so a FLAT write must not fire the not-consumed warn.
+    assert!(
+        matches!(
+            rs_classify(mtld3d_types::D3DRS_SHADEMODE, mtld3d_types::D3DSHADE_FLAT),
+            RsClass::Consumed
+        ),
+        "D3DRS_SHADEMODE is not classified Consumed"
+    );
+}
+
+#[test]
+fn legacy_render_states_are_obsolete() {
+    // Dithering has no effect on the 8-bit and wider targets rendered to,
+    // antialiased lines have no Metal rasterizer mode and no advertised cap,
+    // and the tessellation slots belong to RT-patch and N-patch tessellation,
+    // which is not implemented. Each logs at info, never as a gap.
+    let one = 1.0f32.to_bits();
+    let writes = [
+        (mtld3d_types::D3DRS_DITHERENABLE, 1),
+        (mtld3d_types::D3DRS_ANTIALIASEDLINEENABLE, 1),
+        (mtld3d_types::D3DRS_MINTESSELLATIONLEVEL, 2.0f32.to_bits()),
+        (mtld3d_types::D3DRS_MAXTESSELLATIONLEVEL, 4.0f32.to_bits()),
+        (mtld3d_types::D3DRS_ADAPTIVETESS_X, one),
+        (mtld3d_types::D3DRS_ADAPTIVETESS_Y, one),
+        (mtld3d_types::D3DRS_ADAPTIVETESS_Z, 0),
+        (mtld3d_types::D3DRS_ADAPTIVETESS_W, one),
+        (mtld3d_types::D3DRS_ENABLEADAPTIVETESSELLATION, 1),
+    ];
+    for (index, value) in writes {
+        assert!(
+            matches!(rs_classify(index, value), RsClass::Obsolete(_)),
+            "D3DRS_{index} = {value:#x} is not classified Obsolete"
+        );
+    }
+}
+
+#[test]
+fn vendor_tokens_on_the_tessellation_slots_keep_their_class() {
+    // ATOC on ADAPTIVETESS_Y is alpha to coverage, which is implemented.
+    // NVDB on ADAPTIVETESS_X asks for the depth-bounds test, which is a
+    // missing feature rather than an obsolete one, so it stays a warning.
+    assert!(matches!(
+        rs_classify(D3DRS_ADAPTIVETESS_Y, D3DFMT_ATOC),
+        RsClass::Consumed
+    ));
+    assert!(matches!(
+        rs_classify(
+            mtld3d_types::D3DRS_ADAPTIVETESS_X,
+            mtld3d_types::D3DFMT_NVDB
+        ),
+        RsClass::NotImplemented
+    ));
+}
+
+#[test]
+fn unconsumed_render_states_are_the_known_gaps() {
+    // No reader exists for the last-pixel rule or for cylindrical texture
+    // wrapping; both are D3D9 features rather than obsolete ones, so a
+    // non-default write keeps warning.
+    let gaps = [
+        mtld3d_types::D3DRS_LASTPIXEL,
+        mtld3d_types::D3DRS_WRAP0,
+        mtld3d_types::D3DRS_WRAP7,
+        mtld3d_types::D3DRS_WRAP8,
+        mtld3d_types::D3DRS_WRAP15,
+    ];
+    for index in gaps {
+        assert!(
+            matches!(rs_classify(index, 0), RsClass::NotImplemented),
+            "D3DRS_{index} is not classified NotImplemented"
+        );
+    }
+}
