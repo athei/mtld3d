@@ -140,6 +140,36 @@ and render buffers on the queue when the pending present had to be copied. Every
 registers at its commit and never before, so a submission that fails midway leaves nothing
 registered that never commits.
 
+## Retirement counters are exact
+
+Every command buffer retains the Metal objects it references, so no wrapper, texture or
+pipeline is deallocated while a buffer that names it runs. What a retaining buffer does not
+keep is PE-owned memory under a `bytesNoCopy` wrapper: the `PageBox` pages behind staging,
+vertex, index and visibility buffers belong to the PE side, which recycles them once the
+retirement counters say the frames that read them retired. The invariant: such memory is
+recycled only once every command buffer that read it has individually ended.
+
+Metal documents that one queue executes its buffers in commit order, and consecutive
+buffers may overlap on the GPU; it documents nothing about the order their completions are
+reported in. So no counter may stand for a buffer that has not itself ended. Each
+registered buffer, draw, upload or present, stays in the device's in-flight map until
+`command::retire_finished` retires it: from the oldest entry of its counter, each one only
+once its own status is `Completed` or `Error`, recording an abort before the counter moves
+past it, all under the map's lock. A counter's value is therefore the highest sequence up
+to which every registered buffer of that counter has ended, whichever order the handlers
+ran in, and a late handler of an entry already retired writes no PE memory. A buffer
+released uncommitted, on a failed encode, runs its completion handlers too; they return at
+once, since it never ran.
+
+The waits follow the same rule. `wait_for_gpu_retire` waits for every registered draw
+buffer up to its target and every upload buffer up to the same sequence, each by itself,
+and publishes only what ended; the presenter's idle wait and a failed submission's cleanup
+do the same for their counters. The encoder's retention drain gates on the lower of
+`coherent_seq` and `upload_coherent_seq`, since a staging wrapper or repack plane may be
+read by the upload buffer alone; a submission that has no upload buffer is published on the
+upload counter as soon as no upload buffer is in flight, so the lower counter keeps moving
+through frames that upload nothing.
+
 ## Texture attachment and sampling views
 
 `TextureViews` carries linear and sRGB attachment handles separately from

@@ -1045,12 +1045,14 @@ pub struct FrameEncoder {
     /// Pointer to the shared `upload_coherent_seq` atomic, copied from `FrameData`.
     ///
     /// The upload command buffer is the one that actually carries an
-    /// upload's copy, and its own completion handler is the only thing that
-    /// ever moves this counter. `coherent_seq` can be hand-advanced by
-    /// `wait_for_gpu_retire` before that handler has run, so an upload is
-    /// only settled once both counters have reached its seq. 0 means "not
-    /// yet seeded", or the defensive path where the leading blits rode the
-    /// draw command buffer instead.
+    /// upload's copy, and the draw buffer's completion does not stand for
+    /// it, so an upload, and every retention entry, is only settled once
+    /// both counters have reached its seq. The unix side moves this one as
+    /// each upload buffer ends in order, and publishes a submission without
+    /// an upload buffer once none up to it is in flight, at submit time or
+    /// at the end of a retirement wait. 0 means "not yet seeded", or the
+    /// defensive path where the leading blits rode the draw command buffer
+    /// instead.
     upload_coherent_seq_ptr: u64,
     /// `Staged` VB/IB dirty-range uploads the GPU has not acknowledged yet.
     ///
@@ -7012,13 +7014,13 @@ impl FrameEncoder {
     /// `settled_seq` is the lower of the two retirement counters: `coherent_seq`
     /// for the draw command buffer and `upload_coherent_seq` for the upload
     /// command buffer that actually carries the copies. Both matter because
-    /// `wait_for_gpu_retire` advances `coherent_seq` by hand so its caller sees
-    /// the advance synchronously, and that hand-advance can outrun the upload
-    /// handler which is the only thing that records an aborted upload. Taking
-    /// the minimum means an entry is never freed before the handler that would
-    /// have condemned it has reported in. `None` before the encoder is wired
-    /// up; the upload counter is skipped on the defensive path where the
-    /// leading blits rode the draw command buffer.
+    /// each counter names only buffers of its own kind that ended, and an
+    /// upload buffer's end, with the abort it may record, is not implied by
+    /// the draw buffer's. Taking the minimum means an entry is never freed
+    /// before the buffer that read it, or the record that would have
+    /// condemned it, is in. `None` before the encoder is wired up; the upload
+    /// counter is skipped on the defensive path where the leading blits rode
+    /// the draw command buffer. The retention drain uses the same pair.
     ///
     /// `coherent_seq` is read first: the unix side records a failure before
     /// bumping either retirement counter and both stores are `Release`, so a
@@ -7262,13 +7264,14 @@ impl FrameEncoder {
     /// return to the allocator. Safe to call with a 0 `coherent_seq_ptr`
     /// (no-op before first frame).
     fn drain_retired_resource_retention(&mut self) {
-        if self.coherent_seq_ptr == 0 {
+        // Both counters: an entry may be a staging wrapper or a repack plane
+        // only the frame's upload command buffer reads, and the draw buffer
+        // completing does not stand for the upload buffer's completion. The
+        // unix side publishes a frame that uploads nothing on the upload
+        // counter too, so the lower of the two keeps moving without uploads.
+        let Some((coh, _)) = self.upload_gate() else {
             return;
-        }
-        // SAFETY: `coherent_seq_ptr` is a PE-heap `Arc<AtomicU64>` raw
-        // pointer kept alive by the device-side `Arc`; nonzero here
-        // (checked above) means the encoder has been wired up.
-        let coh = unsafe { SharedCounter::new(self.coherent_seq_ptr) }.load(Ordering::Acquire);
+        };
         let mut buffers: Vec<u64> = Vec::new();
         let mut textures: Vec<u64> = Vec::new();
         let mut drained: Vec<PendingResourceRetention> = Vec::new();
@@ -9023,9 +9026,12 @@ impl FrameEncoder {
     ///
     /// A target of 0 names no frame. The unix side also skips an already
     /// retired target; otherwise it waits for the smallest registered sequence
-    /// at or beyond the target, or the latest earlier entry if none exists.
-    /// Only the sequence actually waited for is published, so a missing target
-    /// may remain above the retirement counter when this call returns.
+    /// at or beyond the target, or the latest earlier entry if none exists,
+    /// and for every registered draw buffer before it. It then waits for every
+    /// upload buffer up to the same sequence, each by itself, since the draw
+    /// buffer's completion does not stand for the upload buffer's. Only
+    /// buffers that ended are published, so a missing target may remain above
+    /// the retirement counter when this call returns.
     fn wait_for_gpu_retire(&self, target_seq: u64) {
         if self.coherent_seq_ptr == 0 || target_seq == 0 {
             return;
@@ -9034,6 +9040,7 @@ impl FrameEncoder {
             record_handle: self.record_handle,
             target_seq,
             coherent_seq_ptr: self.coherent_seq_ptr,
+            upload_coherent_seq_ptr: self.upload_coherent_seq_ptr,
             failed_submit_seq_ptr: self.failed_seq_ptr,
         };
         let status = unix_call(&mut params);
@@ -9990,6 +9997,9 @@ fn encoder_thread_main(
                             record_handle: enc.record_handle,
                             target_seq,
                             coherent_seq_ptr: enc.coherent_seq_ptr,
+                            // Query results are written by the draw buffer
+                            // alone, and nothing is destroyed on this wait.
+                            upload_coherent_seq_ptr: 0,
                             failed_submit_seq_ptr: enc.failed_seq_ptr,
                         };
                         mtld3d_shared::crumb!("vis:retirebeg", target_seq, coh);

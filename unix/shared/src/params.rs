@@ -404,9 +404,13 @@ pub struct WaitForGpuRetireParams {
     pub record_handle: DeviceRecordHandle, // in
     pub target_seq: u64,       // in
     pub coherent_seq_ptr: u64, // in: PE-side AtomicU64 backing
+    /// The upload buffers' counter; its buffers up to the retired sequence are waited for too.
+    ///
+    /// 0 when the device has none, and then only the draw buffers are.
+    pub upload_coherent_seq_ptr: u64, // in: PE-side AtomicU64 backing
     /// Where an aborted command buffer is recorded, mirroring `SubmitFrameParams`.
     ///
-    /// The wait bumps `coherent_seq` itself so the caller observes the
+    /// The wait publishes the counters itself so the caller observes the
     /// advance synchronously, which would otherwise launder a command
     /// buffer the GPU killed into "retired cleanly". 0 disables the
     /// check.
@@ -1001,23 +1005,25 @@ pub struct SubmitFrameParams {
     /// Texture-upload completion fence.
     ///
     /// When non-zero, the frame-leading blits and `upload_pass_count`
-    /// descriptors are encoded into a command buffer committed before the draw CB; that
-    /// CB's `addCompletedHandler` `fetch_max`es `submit_seq` into
-    /// `*(upload_coherent_seq_ptr as *const AtomicU64)`. Because the queue
+    /// descriptors are encoded into a command buffer committed before the draw CB; the
+    /// counter at `*(upload_coherent_seq_ptr as *const AtomicU64)` reaches
+    /// `submit_seq` once that CB and every earlier upload CB ended, and a
+    /// frame without one is published once no earlier one is in flight. Because the queue
     /// is in-order the uploads still finish before any same-frame draw
     /// samples them, but this CB retires ~a frame earlier than the draw
     /// CB — so the next frame's texture `LockRect` sees the staging retired
     /// and skips the synchronous preserve memcpy. Every submitted frame
     /// carries the real pointer; 0 (a defensive null guard) falls back to
     /// encoding the leading blits and all passes on the draw CB. Distinct from
-    /// `coherent_seq_ptr`, which tracks full-frame (draw) retirement for
-    /// VB/IB.
+    /// `coherent_seq_ptr`, which tracks full-frame (draw) retirement; the PE
+    /// retention drain gates on the lower of the two.
     pub upload_coherent_seq_ptr: u64, // in: *const AtomicU64 (PE heap, stable)
     /// Highest submit seq whose CPU encoding or GPU execution failed.
     ///
-    /// Both completion handlers `fetch_max` `submit_seq` into
-    /// `*(failed_submit_seq_ptr as *const AtomicU64)` when the command
-    /// buffer reaches `MTLCommandBufferStatus::Error`. A CPU encoding
+    /// `submit_seq` is `fetch_max`ed into
+    /// `*(failed_submit_seq_ptr as *const AtomicU64)` as a draw or upload
+    /// command buffer that reached `MTLCommandBufferStatus::Error` is
+    /// retired, before its retirement counter passes it. A CPU encoding
     /// failure first drains all committed draw/upload buffers and their
     /// handlers, then records the failed sequence before advancing retirement
     /// to that sequence. Deliberately a second counter rather than a gate on
