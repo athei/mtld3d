@@ -57,7 +57,8 @@ const _: () = {
     assert!(core::mem::size_of::<DetachMetalLayerParams>() == 8);
     assert!(core::mem::size_of::<CreateBackbufferParams>() == 64);
     assert!(core::mem::size_of::<DestroyCommandQueueParams>() == 40);
-    assert!(core::mem::size_of::<SubmitFrameParams>() == 120);
+    assert!(core::mem::offset_of!(SubmitFrameParams, timings) == 120);
+    assert!(core::mem::size_of::<SubmitFrameParams>() == 192);
     assert!(core::mem::size_of::<SetCursorOverlayParams>() == 56);
     assert!(core::mem::size_of::<PassDescriptor>() == 208);
 };
@@ -1060,6 +1061,12 @@ pub struct SubmitFrameParams {
     /// read-back, and no waits unless the ring is too small for the workload.
     pub snapshot_flags: SnapshotFlags, // out
     pub pad0: u32,
+    /// The submit thread's encode and commit split, and the GPU time of finished buffers.
+    ///
+    /// Durations in nanoseconds, for the same reason as `drawable_wait_ns`,
+    /// plus the number of buffers behind each GPU sum; all zero outside a
+    /// `PERF=1` build or while the perf target is off.
+    pub timings: super::perf::SubmitTimings, // out
 }
 
 impl Thunk for SubmitFrameParams {

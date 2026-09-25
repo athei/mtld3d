@@ -27,6 +27,7 @@ use mtld3d_shared::{
 use super::{
     command::PendingCmdBufs,
     depth_transfer::PlanePool,
+    gpu_time::GpuTime,
     handle::ReleaseRetain,
     presenter::{PresentState, Presented},
     transient::UploadRing,
@@ -53,6 +54,8 @@ pub struct DeviceRecord {
     upload_ring: Mutex<UploadRing>,
     /// The private planes depth transfers stage through, locked like the ring.
     depth_planes: Mutex<PlanePool>,
+    /// GPU time of this device's finished command buffers, until a submission reports it.
+    gpu_time: GpuTime,
 }
 
 impl Drop for DeviceRecord {
@@ -76,6 +79,7 @@ impl DeviceRecord {
             pending: PendingCmdBufs::new(),
             upload_ring: Mutex::new(UploadRing::default()),
             depth_planes: Mutex::new(PlanePool::default()),
+            gpu_time: GpuTime::new(),
         })
     }
 
@@ -102,6 +106,11 @@ impl DeviceRecord {
     /// The device's in-flight command buffers, by counter and sequence.
     pub const fn pending(&self) -> &PendingCmdBufs {
         &self.pending
+    }
+
+    /// The GPU time the device's completion handlers add and its submissions drain.
+    pub const fn gpu_time(&self) -> &GpuTime {
+        &self.gpu_time
     }
 
     /// The device's upload ring, for the length of one submission.

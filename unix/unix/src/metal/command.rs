@@ -20,6 +20,7 @@ use mtld3d_shared::{
         MTLBufferKind, MTLDepthStencilStateKind, MTLDeviceKind, MTLRenderPipelineStateKind,
         MTLSamplerStateKind, MTLTextureKind,
     },
+    perf::{CommandBufferRole, NanosSetTimer, SubmitTimings},
 };
 use objc2::{Message, rc::Retained, runtime::ProtocolObject};
 use objc2_foundation::{NSError, NSRange};
@@ -448,6 +449,9 @@ fn encode_frame(record: &Arc<DeviceRecord>, params: &mut SubmitFrameParams) -> b
     params.drawable_wait_ns = 0;
     params.present_wait_ns = 0;
     params.snapshot_flags = mtld3d_shared::mtl::SnapshotFlags::empty();
+    params.timings = SubmitTimings::new();
+    // First, so a submission that fails below still reports what finished.
+    record.gpu_time().drain(&mut params.timings.gpu);
     let queue_handle = record.queue();
     mtld3d_shared::crumb!("submit:enter", queue_handle.raw(), params.pass_count);
     mtld3d_shared::crumb!("submit:queueret", queue_handle.raw());
@@ -539,25 +543,35 @@ fn encode_frame(record: &Arc<DeviceRecord>, params: &mut SubmitFrameParams) -> b
         upload_pass_count
     } else {
         ctx.stamp = SubmitStamp::new(params);
-        if !blits.is_empty()
-            && !encode_leading_blits(
-                &cmd_buf,
-                blits,
-                params.blit_commands_need_encoder != 0,
-                BlitSite::FrameLeading,
-                &mut ctx,
-            )
-        {
-            return false;
+        if !blits.is_empty() {
+            let encoded = {
+                let _blits = NanosSetTimer::start(&raw mut params.timings.leading_blits_ns);
+                encode_leading_blits(
+                    &cmd_buf,
+                    blits,
+                    params.blit_commands_need_encoder != 0,
+                    BlitSite::FrameLeading,
+                    &mut ctx,
+                )
+            };
+            if !encoded {
+                return false;
+            }
         }
         0
     };
     ctx.stamp = stamp;
-    for (pass_idx, pass) in passes.iter().enumerate().skip(draw_pass_start) {
-        if !encode_pass(&cmd_buf, pass, pass_idx, &mut ctx) {
-            return false;
+    // The upload buffer's passes already set `passes_ns`; the draw passes add to it.
+    let mut draw_passes_ns: u64 = 0;
+    {
+        let _passes = NanosSetTimer::start(&raw mut draw_passes_ns);
+        for (pass_idx, pass) in passes.iter().enumerate().skip(draw_pass_start) {
+            if !encode_pass(&cmd_buf, pass, pass_idx, &mut ctx) {
+                return false;
+            }
         }
     }
+    params.timings.passes_ns = params.timings.passes_ns.saturating_add(draw_passes_ns);
     ctx.ring.end_submission(&ctx.stamp);
     ctx.planes.end_submission(&ctx.stamp);
 
@@ -597,6 +611,8 @@ fn encode_frame(record: &Arc<DeviceRecord>, params: &mut SubmitFrameParams) -> b
 
     super::upscale::retire_evicted(&cmd_buf, record.upscale());
 
+    // Spans the frame buffer's handler install and both commits.
+    let commit = NanosSetTimer::start(&raw mut params.timings.commit_ns);
     // Register an addCompletedHandler that bumps the PE-side
     // `coherent_seq` atomic when this frame retires on the GPU. The
     // block runs on a Metal-internal dispatch thread. `fetch_max` makes
@@ -630,6 +646,7 @@ fn encode_frame(record: &Arc<DeviceRecord>, params: &mut SubmitFrameParams) -> b
                 // SAFETY: Metal invokes the block with the completed command
                 // buffer; the pointer is valid for the handler's duration.
                 let cb = unsafe { cb_ptr.as_ref() };
+                retiring.gpu_time().record(CommandBufferRole::Frame, cb);
                 // The failure is recorded before the retirement bump below:
                 // both stores are `Release`, so a PE-side `Acquire` load of
                 // `coherent_seq` that observes this seq observes the failure
@@ -681,6 +698,7 @@ fn encode_frame(record: &Arc<DeviceRecord>, params: &mut SubmitFrameParams) -> b
         params.coherent_seq_ptr,
         params.submit_seq,
     );
+    drop(commit);
     if let Some(packet) = packet {
         mtld3d_shared::crumb!("submit:push", params.submit_seq);
         params.drawable_wait_ns = super::presenter::push(record.present(), packet);
@@ -949,7 +967,7 @@ fn encode_upload_cmd_buf(
     queue: &ProtocolObject<dyn MTLCommandQueue>,
     blits: &[BlitCommand],
     passes: &[PassDescriptor],
-    params: &SubmitFrameParams,
+    params: &mut SubmitFrameParams,
     ctx: &mut EncodeContext<'_>,
 ) -> Option<Retained<ProtocolObject<dyn MTLCommandBuffer>>> {
     let submit_seq = params.submit_seq;
@@ -963,20 +981,27 @@ fn encode_upload_cmd_buf(
         let label = objc2_foundation::NSString::from_str(&format!("mtld3d-upload-{submit_seq:#x}"));
         upload_cb.setLabel(Some(&label));
     }
-    if !blits.is_empty()
-        && !encode_leading_blits(
-            &upload_cb,
-            blits,
-            params.blit_commands_need_encoder != 0,
-            BlitSite::FrameLeading,
-            ctx,
-        )
-    {
-        return None;
-    }
-    for (pass_idx, pass) in passes.iter().enumerate() {
-        if !encode_pass(&upload_cb, pass, pass_idx, ctx) {
+    if !blits.is_empty() {
+        let encoded = {
+            let _blits = NanosSetTimer::start(&raw mut params.timings.leading_blits_ns);
+            encode_leading_blits(
+                &upload_cb,
+                blits,
+                params.blit_commands_need_encoder != 0,
+                BlitSite::FrameLeading,
+                ctx,
+            )
+        };
+        if !encoded {
             return None;
+        }
+    }
+    {
+        let _passes = NanosSetTimer::start(&raw mut params.timings.passes_ns);
+        for (pass_idx, pass) in passes.iter().enumerate() {
+            if !encode_pass(&upload_cb, pass, pass_idx, ctx) {
+                return None;
+            }
         }
     }
     if submit_seq > 0 {
@@ -1000,6 +1025,7 @@ fn encode_upload_cmd_buf(
                 // SAFETY: Metal invokes the block with the completed command
                 // buffer; the pointer is valid for the handler's duration.
                 let cb = unsafe { cb_ptr.as_ref() };
+                retiring.gpu_time().record(CommandBufferRole::Upload, cb);
                 if let Some((code, desc)) =
                     record_failed_submit(cb, seq, failed_seq_ptr, "upload-callback")
                 {
