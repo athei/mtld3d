@@ -38,14 +38,17 @@ const PERF_HEADER: &str = "── perf  window=";
 
 /// The blocks of a perf window a report copies, by the words their first row starts with.
 ///
-/// Each block runs to the next blank row. The rest of the grid (resource
-/// renames, keys gating, allocator footprint) is left in the log.
-const PERF_BLOCKS: [&str; 9] = [
+/// Each block runs to the next blank row, and only a row at [`BLOCK_INDENT`]
+/// opens one. The rest of the grid (resource renames, keys gating,
+/// allocator footprint) is left in the log. A block a build's grid does not
+/// have is skipped.
+const PERF_BLOCKS: [&str; 10] = [
     "buckets:",
     "API thread",
     "Encoder thread",
     "Submit thread",
     "Present thread",
+    "GPU",
     "Frame total",
     "Caches",
     "Commands / passes",
@@ -62,6 +65,15 @@ pub const TEXTURED_DECL: [D3DVERTEXELEMENT9; 4] = [
     element(16, D3DDECLTYPE_FLOAT2, D3DDECLUSAGE_TEXCOORD),
     D3DDECL_END,
 ];
+
+/// The indent of the first row of a block in the perf grid.
+///
+/// Deeper rows that happen to start with a block's words (`GPU copy` under
+/// a resource row) belong to the block they sit in and open nothing.
+const BLOCK_INDENT: usize = 4;
+
+/// The block of a perf window that [`LayerLog::compilation_rows`] copies.
+const COMPILATION_BLOCK: [&str; 1] = ["Compilation"];
 
 /// Edge of every pattern texture, in texels.
 const TEXTURE_EDGE: u32 = 64;
@@ -237,9 +249,27 @@ impl LayerLog {
             .collect();
         match headers.as_slice() {
             [] => PerfRows::Absent,
-            [only] => PerfRows::Partial(window_rows(&lines, *only)),
-            [.., last] => PerfRows::Full(window_rows(&lines, *last)),
+            [only] => PerfRows::Partial(window_rows(&lines, *only, &PERF_BLOCKS)),
+            [.., last] => PerfRows::Full(window_rows(&lines, *last, &PERF_BLOCKS)),
         }
+    }
+
+    /// The title and Compilation rows of every perf window written between `from` and `to`.
+    ///
+    /// The windows follow each other, so together they account for every
+    /// compile in the span. None outside a `PERF=1` build.
+    pub fn compilation_rows(&self, from: u64, to: u64) -> Vec<String> {
+        let Some(bytes) = self.path.as_deref().and_then(|path| fs::read(path).ok()) else {
+            return Vec::new();
+        };
+        let start = usize::try_from(from).map_or(bytes.len(), |at| at.min(bytes.len()));
+        let end = usize::try_from(to).map_or(bytes.len(), |at| at.min(bytes.len()));
+        let text = String::from_utf8_lossy(&bytes[start..end.max(start)]);
+        let lines: Vec<&str> = text.lines().collect();
+        (0..lines.len())
+            .filter(|&at| lines[at].contains(PERF_HEADER))
+            .map(|header| window_rows(&lines, header, &COMPILATION_BLOCK))
+            .collect()
     }
 
     /// Where the log is, for the report; `None` when no log was found.
@@ -299,15 +329,16 @@ pub fn log_dir() -> PathBuf {
 
 /// Write `body` as the report `bench-<name>.txt` in the log directory, and print it.
 ///
-/// The header names the architecture and the suite-wide `MTLD3D_CONFIG`, so
-/// a report says which build and which extra configuration it measured.
+/// The header names the architecture, the build and the suite-wide
+/// `MTLD3D_CONFIG`, so a report says what it measured.
 ///
 /// # Panics
 /// Panics if the report cannot be written.
 pub fn write_report(name: &str, log: &LayerLog, body: &str) {
     let mut report = format!(
-        "bench: {name} ({arch})\nMTLD3D_CONFIG: {config}\nlayer log: {log}\n",
+        "bench: {name} ({arch})\nbuild: {build}\nMTLD3D_CONFIG: {config}\nlayer log: {log}\n",
         arch = std::env::consts::ARCH,
+        build = build(),
         config = config_var().unwrap_or_default(),
         log = log
             .path()
@@ -319,6 +350,23 @@ pub fn write_report(name: &str, log: &LayerLog, body: &str) {
     let path = dir.join(format!("bench-{name}.txt"));
     fs::write(&path, &report).expect("the benchmark report can be written");
     println!("{report}");
+}
+
+/// The cargo profile this benchmark was built with, and whether debug assertions were on.
+///
+/// `make bench` builds the benchmark with the layer's profile, so this is
+/// the layer's build too. The profile is the directory cargo put the
+/// executable under, `target/<triple>/<profile>/deps`.
+fn build() -> String {
+    let profile = std::env::current_exe()
+        .ok()
+        .and_then(|exe| {
+            let dir = exe.parent()?.parent()?;
+            Some(dir.file_name()?.to_string_lossy().into_owned())
+        })
+        .unwrap_or_else(|| "unknown".to_owned());
+    let assertions = if cfg!(debug_assertions) { "on" } else { "off" };
+    format!("{profile} profile, debug assertions {assertions}")
 }
 
 /// An `n`x`n` grid of quads over the unit square at `z = 0`, with its 16-bit index list.
@@ -517,8 +565,8 @@ pub const IDENTITY_ROWS: [f32; 16] = [
     0.0, 0.0, 0.0, 1.0,
 ];
 
-/// The copied rows of the window whose header is `lines[header]`.
-fn window_rows(lines: &[&str], header: usize) -> String {
+/// The title and the `blocks` of the window whose header is `lines[header]`.
+fn window_rows(lines: &[&str], header: usize, blocks: &[&str]) -> String {
     let mut out = String::new();
     let title = lines[header];
     let title = title.split_once("] ").map_or(title, |(_, rest)| rest);
@@ -533,14 +581,19 @@ fn window_rows(lines: &[&str], header: usize) -> String {
             copying = false;
             continue;
         }
-        if PERF_BLOCKS.iter().any(|block| row.starts_with(block)) {
-            copying = true;
+        if line.len() - row.len() == BLOCK_INDENT {
+            copying = blocks.iter().any(|block| row.starts_with(block)) || (copying && !opens(row));
         }
         if copying {
             let _ = writeln!(out, "{line}");
         }
     }
     out
+}
+
+/// Whether `row`, at block indent, is the first row of any block the grid has a title for.
+fn opens(row: &str) -> bool {
+    PERF_BLOCKS.iter().any(|block| row.starts_with(block))
 }
 
 fn ms(duration: Duration) -> f64 {

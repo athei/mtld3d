@@ -83,8 +83,9 @@ WINEBUILD  := $(WINE_SDK)/bin/winebuild
 WINESERVER := $(WINE_SDK)/bin/wineserver
 
 # Distribution bundles default to the production profile; PROD=0 overrides
-# for a quick release-profile bundle.
-ifneq ($(filter bundle,$(MAKECMDGOALS)),)
+# for a quick release-profile bundle. So does `make bench`: `release` carries
+# debug assertions, whose checks would be most of what it measures.
+ifneq ($(filter bundle bench,$(MAKECMDGOALS)),)
 PROD ?= 1
 endif
 
@@ -808,7 +809,7 @@ E2E_FLAGS := --jobs $(JOBS) --timeout $(TIMEOUT) $(if $(filter 0,$(FAIL_FAST))$(
 # builds. --tests excludes examples, including the visible cursor probe, which
 # are not libtest executables. Expanded inside a recipe, where the `$$(...)` is
 # the shell's. From a stage the binaries are the staged ones. $(2) is extra
-# cargo arguments (`make bench` builds `--release`).
+# cargo arguments (`make bench` names its profile).
 define E2E_EXES_BUILD
 cd windows && cargo +$(RUST_STABLE) test --tests --no-run -p mtld3d-tests --target $(1) --message-format=json-render-diagnostics
 endef
@@ -959,9 +960,12 @@ conformance-isolate: install-windows-$(ARCH) install-unix-$(SDK_UNIX_ARCH)
 # (ARCH, default i686, the arch the game ships). They measure and never assert
 # on a time, so a run is red only when a device call fails.
 #
-# The binary is built `--release`, so the harness's own code is not what gets
-# measured, and the Metal validation layer and HUD are off: both cost frame
-# time and neither is under test. The configuration is the suite's without the
+# The layer and the benchmark binary are built with the production profile,
+# the one that ships, since `release` compiles in debug assertions whose
+# checks cost the encoder more than the frame does; PROD=0 measures `release`
+# instead, and each report states the profile and whether debug assertions
+# were on. The Metal validation layer and HUD are off: both cost frame time
+# and neither is under test. The configuration is the suite's without the
 # Main Thread Checker, then BENCH_CONFIG='key=value;key=value', appended last
 # the way SCALE is, so its entries win over the ones before it (the stutter
 # benchmark's own `shaderCache.enable=false` still wins over them). PERF=1
@@ -973,7 +977,7 @@ conformance-isolate: install-windows-$(ARCH) install-unix-$(SDK_UNIX_ARCH)
 BENCH_DIR := $(or $(LOG_DIR),$(CURDIR)/.codex/evidence/bench)
 BENCH_TIMEOUT ?= 300
 BENCH_TARGET := $(if $(filter x86_64,$(ARCH)),$(PE_x64),$(PE_i386))
-BENCH_EXES = $(if $(STAGE),$(STAGE)/tests/$(ARCH)/*.exe,$(call E2E_EXES,$(BENCH_TARGET),--release))
+BENCH_EXES = $(if $(STAGE),$(STAGE)/tests/$(ARCH)/*.exe,$(call E2E_EXES,$(BENCH_TARGET),--profile $(PROFILE)))
 MTLD3D_CONF_BENCH := shaderCache.enable=false;color.hdr.enable=false;log.dir=Z:$(BENCH_DIR)$(if $(BENCH_CONFIG),;$(BENCH_CONFIG))
 bench: install-windows-$(ARCH) install-unix-$(SDK_UNIX_ARCH)
 	$(MAKE) configure-test-prefix

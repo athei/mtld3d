@@ -1,12 +1,16 @@
 //! A synthetic frame shaped like World of Warcraft 3.3.5a's busy frame, timed over many frames.
 //!
-//! One frame asks for ten render passes and about 1400 draws: four shadow-cascade
-//! passes of depth-only draws into a 2048x2048 depth target (INTZ, sampled
-//! by the scene's receivers, or D24S8 where INTZ is not offered), the scene
-//! on the back buffer (900 draws in 36 material runs, two particle batches
-//! among them), a full back-buffer `StretchRect`, three one-draw glow passes
-//! ping-ponging between two offscreen targets, and a UI pass of 300 small
-//! alpha-blended quads, then `Present`.
+//! One frame is about 1400 draws in nine render passes: four shadow-cascade
+//! passes of depth-only draws, each into a 2048x2048 depth target of its own
+//! (INTZ, sampled by the scene's receivers, or D24S8 where INTZ is not
+//! offered), the scene on the back buffer (900 draws in 36 material runs,
+//! two particle batches among them), three one-draw glow passes ping-ponging
+//! between two offscreen targets, and a UI pass of 300 small alpha-blended
+//! quads, then `Present`. The full back-buffer `StretchRect` between the
+//! scene and the glow is a blit, not a pass. Each cascade clears and fills
+//! its own target, as the game's do, so the layer keeps the four passes
+//! apart; cascades sharing one target through viewport quadrants would be
+//! joined into one depth-only pass.
 //!
 //! Per draw the bind mix follows the game's: about one `SetTexture`, one
 //! `SetVertexShaderConstantF` of 4 to 16 rows, a fifth of a
@@ -39,7 +43,7 @@ use mtld3d_types::{
     D3DTA_TEXTURE, D3DTEXF_LINEAR, D3DTEXF_NONE, D3DTOP_ADD, D3DTOP_MODULATE, D3DTOP_MODULATE2X,
     D3DTOP_SELECTARG1, D3DTS_PROJECTION, D3DTS_VIEW, D3DTS_WORLD, D3DTSS_COLORARG1,
     D3DTSS_COLORARG2, D3DTSS_COLOROP, D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_DYNAMIC,
-    D3DUSAGE_RENDERTARGET, D3DUSAGE_WRITEONLY, D3DVERTEXELEMENT9, D3DVIEWPORT9,
+    D3DUSAGE_RENDERTARGET, D3DUSAGE_WRITEONLY, D3DVERTEXELEMENT9,
 };
 
 use crate::bench::{
@@ -50,7 +54,7 @@ use crate::bench::{
 /// The back buffer, about the size of a windowed game.
 const WIDTH: u32 = 1280;
 const HEIGHT: u32 = 720;
-/// Edge of the shadow depth target; each cascade renders one quadrant of it.
+/// Edge of each cascade's shadow depth target.
 const SHADOW_EDGE: u32 = 2048;
 const CASCADES: u32 = 4;
 const CASTERS_PER_CASCADE: u32 = 50;
@@ -97,6 +101,8 @@ fn wow_335a_busy_frame() {
         presentation_interval: D3DPRESENT_INTERVAL_IMMEDIATE,
         ..HarnessConfig::default()
     });
+    let log = LayerLog::find();
+    let created = log.mark();
     let started = Instant::now();
     let frame = Frame::new(&h);
     for tick in 0..WARM_UP_FRAMES {
@@ -106,7 +112,6 @@ fn wow_335a_busy_frame() {
     }
     let warm_up = started.elapsed();
 
-    let log = LayerLog::find();
     let from = log.mark();
     let mut clock = FrameClock::start(MEASURED_FRAMES * 4);
     let mut tick = WARM_UP_FRAMES;
@@ -119,14 +124,14 @@ fn wow_335a_busy_frame() {
     let to = log.mark();
 
     let stats = clock.stats();
-    let shadow = if frame.shadow.texture.is_some() {
+    let shadow = if frame.shadows[0].texture.is_some() {
         "INTZ, sampled by the receivers"
     } else {
         "D24S8, INTZ not offered"
     };
     let body = format!(
-        "shape: back buffer {WIDTH}x{HEIGHT} X8R8G8B8 + D24S8; shadow depth \
-         {SHADOW_EDGE}x{SHADOW_EDGE} {shadow}\n\
+        "shape: back buffer {WIDTH}x{HEIGHT} X8R8G8B8 + D24S8; {CASCADES} shadow depth \
+         targets {SHADOW_EDGE}x{SHADOW_EDGE} {shadow}\n\
          per frame: {draws} draws (casters {casters} in {CASCADES} passes, scene {scene}, \
          glow 3 in 3 passes, UI {ui}), one StretchRect, {locks} DISCARD locks\n\
          programs: {SM2_MATERIALS} ps_2_0 + {SM3_MATERIALS} ps_3_0 scene pairs, {ff} \
@@ -135,7 +140,7 @@ fn wow_335a_busy_frame() {
          measured: {frames} frames in {elapsed:.2?} (at least {MEASURED_FRAMES} frames \
          and {MIN_MEASURED:?})\n\
          frame time (Present to Present): {row}\n\
-         API work (Present return to Present call): {work}\n{perf}",
+         API work (Present return to Present call): {work}\n{perf}{warm_up_compiles}",
         draws = DRAWS_PER_FRAME,
         casters = CASCADES * CASTERS_PER_CASCADE,
         scene = SCENE_RUNS * DRAWS_PER_RUN + 2,
@@ -147,8 +152,38 @@ fn wow_335a_busy_frame() {
         row = stats.row(),
         work = clock.work_stats().row(),
         perf = log.perf_rows(from, to).section(),
+        warm_up_compiles =
+            log.compilation_rows(created, to)
+                .first()
+                .map_or_else(String::new, |rows| format!(
+                    "perf: first window after device creation, its warm-up compiles\n{rows}"
+                ),),
     );
     write_report("frame_shape", &log, &body);
+}
+
+/// A shadow depth target: an INTZ texture's level when `intz`, else a D24S8 surface.
+fn shadow(h: &Harness, intz: bool) -> Shadow<'_> {
+    if intz {
+        let texture = h.create_texture(
+            SHADOW_EDGE,
+            SHADOW_EDGE,
+            1,
+            D3DUSAGE_DEPTHSTENCIL,
+            D3DFMT_INTZ,
+            D3DPOOL_DEFAULT,
+        );
+        let surface = texture.surface_level(0);
+        Shadow {
+            texture: Some(texture),
+            surface,
+        }
+    } else {
+        Shadow {
+            texture: None,
+            surface: h.create_depth_stencil_surface(SHADOW_EDGE, SHADOW_EDGE, D3DFMT_D24S8),
+        }
+    }
 }
 
 /// Draws per frame: casters, scene with its particle batches, glow, the glow composite and UI.
@@ -161,8 +196,8 @@ enum Material<'h> {
         vs: VertexShader<'h>,
         ps: PixelShader<'h>,
         tint: [f32; 4],
-        /// Samples the shadow map on stage 1.
-        receiver: bool,
+        /// The cascade whose shadow map a receiver samples on stage 1.
+        shadow_map: Option<u32>,
     },
     Fixed(u32),
 }
@@ -175,7 +210,7 @@ struct Mesh<'h> {
     triangles: u32,
 }
 
-/// The shadow depth target, and the texture behind it when it can be sampled.
+/// A cascade's shadow depth target, and the texture behind it when it can be sampled.
 struct Shadow<'h> {
     texture: Option<Texture<'h>>,
     surface: Surface<'h>,
@@ -192,9 +227,10 @@ struct Frame<'h> {
     h: &'h Harness,
     back_buffer: Surface<'h>,
     scene_depth: Surface<'h>,
-    shadow: Shadow<'h>,
-    /// The colour targets the depth-only cascades render beside, alternated so each is a pass.
-    placeholders: [Surface<'h>; 2],
+    /// One depth target per cascade.
+    shadows: Vec<Shadow<'h>>,
+    /// The colour target the depth-only cascades render beside, which their draws never write.
+    placeholder: Surface<'h>,
     scene_copy: Target<'h>,
     glow: [Target<'h>; 2],
     textures: Vec<Texture<'h>>,
@@ -220,34 +256,14 @@ impl<'h> Frame<'h> {
         let scene_depth = h
             .depth_stencil_surface()
             .expect("the device has an auto depth-stencil");
-        let shadow = if h.check_device_format(
+        let intz = h.check_device_format(
             D3DFMT_X8R8G8B8,
             D3DUSAGE_DEPTHSTENCIL,
             D3DRTYPE_TEXTURE,
             D3DFMT_INTZ,
-        ) == D3D_OK
-        {
-            let texture = h.create_texture(
-                SHADOW_EDGE,
-                SHADOW_EDGE,
-                1,
-                D3DUSAGE_DEPTHSTENCIL,
-                D3DFMT_INTZ,
-                D3DPOOL_DEFAULT,
-            );
-            let surface = texture.surface_level(0);
-            Shadow {
-                texture: Some(texture),
-                surface,
-            }
-        } else {
-            Shadow {
-                texture: None,
-                surface: h.create_depth_stencil_surface(SHADOW_EDGE, SHADOW_EDGE, D3DFMT_D24S8),
-            }
-        };
-        let placeholders =
-            [0, 1].map(|_| h.create_render_target(SHADOW_EDGE, SHADOW_EDGE, D3DFMT_A8R8G8B8));
+        ) == D3D_OK;
+        let shadows = (0..CASCADES).map(|_| shadow(h, intz)).collect();
+        let placeholder = h.create_render_target(SHADOW_EDGE, SHADOW_EDGE, D3DFMT_A8R8G8B8);
         let target = |width, height, format| {
             let texture = h.create_texture(
                 width,
@@ -275,8 +291,8 @@ impl<'h> Frame<'h> {
             h,
             back_buffer,
             scene_depth,
-            shadow,
-            placeholders,
+            shadows,
+            placeholder,
             scene_copy,
             glow,
             textures,
@@ -326,11 +342,12 @@ impl<'h> Frame<'h> {
         ok(h.end_scene(), "EndScene");
     }
 
-    /// Four depth-only caster passes, one quadrant of the shadow target each.
+    /// Four depth-only caster passes, one shadow target each.
     fn cascades(&self, tick: u32) {
         let h = self.h;
-        // The receivers left the shadow map on stage 1; it is the depth target now.
+        // The receivers left a shadow map on stage 1; it is a depth target now.
         ok(h.clear_texture(1), "unbind the shadow map");
+        ok(h.set_render_target(0, &self.placeholder), "caster target");
         rs(h, D3DRS_ALPHABLENDENABLE, 0);
         rs(h, D3DRS_ZENABLE, 1);
         rs(h, D3DRS_ZWRITEENABLE, 1);
@@ -343,25 +360,8 @@ impl<'h> Frame<'h> {
             h.set_vertex_shader_constant_f(0, &IDENTITY_ROWS),
             "caster view-projection",
         );
-        let quadrant = SHADOW_EDGE / 2;
-        for cascade in 0..CASCADES {
-            let placeholder = &self.placeholders[usize::from(cascade % 2 == 1)];
-            ok(h.set_render_target(0, placeholder), "caster target");
-            ok(
-                h.set_depth_stencil_surface(&self.shadow.surface),
-                "shadow depth",
-            );
-            ok(
-                h.set_viewport(&D3DVIEWPORT9 {
-                    x: (cascade % 2) * quadrant,
-                    y: (cascade / 2) * quadrant,
-                    width: quadrant,
-                    height: quadrant,
-                    min_z: 0.0,
-                    max_z: 1.0,
-                }),
-                "cascade viewport",
-            );
+        for (cascade, shadow) in (0..CASCADES).zip(&self.shadows) {
+            ok(h.set_depth_stencil_surface(&shadow.surface), "shadow depth");
             ok(h.clear(D3DCLEAR_ZBUFFER, 0, 1.0, 0), "cascade depth clear");
             rs(
                 h,
@@ -513,13 +513,14 @@ impl<'h> Frame<'h> {
                 vs,
                 ps,
                 tint,
-                receiver,
+                shadow_map,
             } => {
                 ok(h.set_vertex_shader(vs), "material VS");
                 ok(h.set_pixel_shader(ps), "material PS");
                 ok(h.set_pixel_shader_constant_f(0, tint), "material tint");
-                if *receiver {
-                    let shadow = self.shadow.texture.as_ref().unwrap_or(&self.textures[0]);
+                if let Some(cascade) = shadow_map {
+                    let cascade = &self.shadows[slot(*cascade)];
+                    let shadow = cascade.texture.as_ref().unwrap_or(&self.textures[0]);
                     ok(h.set_texture(1, shadow), "shadow map");
                 }
             }
@@ -736,21 +737,21 @@ const POSITION_DECL: [D3DVERTEXELEMENT9; 2] = [
 
 /// The 36 scene materials: `ps_2_0` pairs (every other one a receiver), `ps_3_0` pairs, then FF.
 fn materials(h: &Harness) -> Vec<Material<'_>> {
-    let programmable = |model: &Model, at: u32, receiver: bool| {
+    let programmable = |model: &Model, at: u32, shadow_map: Option<u32>| {
         let shade = ratio(at, SM2_MATERIALS + SM3_MATERIALS);
         let tint = [shade * 0.1, 0.05, shade.mul_add(-0.1, 0.1), 0.0];
         Material::Programmable {
             vs: h.create_vertex_shader(&material_vs(model, shade * 1.0e-3)),
-            ps: h.create_pixel_shader(&material_ps(model, tint, receiver)),
+            ps: h.create_pixel_shader(&material_ps(model, tint, shadow_map.is_some())),
             tint: [1.0 - shade, 0.8, shade, 1.0],
-            receiver,
+            shadow_map,
         }
     };
     let mut materials: Vec<Material<'_>> = (0..SM2_MATERIALS)
-        .map(|at| programmable(&Model::Sm2, at, at % 2 == 1))
+        .map(|at| programmable(&Model::Sm2, at, (at % 2 == 1).then_some(at / 2 % CASCADES)))
         .collect();
     materials
-        .extend((0..SM3_MATERIALS).map(|at| programmable(&Model::Sm3, SM2_MATERIALS + at, false)));
+        .extend((0..SM3_MATERIALS).map(|at| programmable(&Model::Sm3, SM2_MATERIALS + at, None)));
     materials.extend(FF_OPS.iter().map(|&op| Material::Fixed(op)));
     materials
 }
