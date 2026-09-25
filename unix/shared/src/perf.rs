@@ -27,6 +27,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 #[cfg(perf_tracking)]
 use log::{Level, log_enabled};
+use strum::EnumCount;
 
 #[cfg(perf_tracking)]
 use crate::tsc::rdtsc;
@@ -150,6 +151,85 @@ impl PipelineTimings {
 }
 
 impl Default for PipelineTimings {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// A device's command buffers by what they carry, as the GPU-time counters name them.
+///
+/// Indexes [`SubmitTimings::gpu`] and the unix-side accumulator behind it.
+#[derive(EnumCount)]
+#[repr(u32)]
+pub enum CommandBufferRole {
+    /// The frame's render passes, and its leading blits when it has no upload buffer.
+    Frame = 0,
+    /// The frame's uploads, committed ahead of its frame buffer.
+    Upload,
+    /// The presenter's copy or resample of the back buffer into the drawable.
+    Present,
+}
+
+/// GPU execution time of one role's command buffers, in nanoseconds.
+///
+/// `ns` sums `GPUEndTime - GPUStartTime` over `buffers` command buffers.
+/// Buffers of one queue can overlap on the GPU, so sums of different roles
+/// add up to more than the wall time the GPU was busy.
+#[repr(C)]
+pub struct GpuBusy {
+    pub ns: u64,
+    pub buffers: u32,
+    pub pad0: u32,
+}
+
+impl GpuBusy {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            ns: 0,
+            buffers: 0,
+            pad0: 0,
+        }
+    }
+}
+
+impl Default for GpuBusy {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Where one `SubmitFrame` spent its time, in nanoseconds; all zero without PERF.
+///
+/// The three CPU spans split the submit thread's encode and commit. The GPU
+/// entries are the command buffers of this device that completed since the
+/// previous submission reported, whichever frame they belong to, so each
+/// completion is reported exactly once.
+#[repr(C)]
+pub struct SubmitTimings {
+    /// Encoding the frame-leading blits, in whichever buffer carries them.
+    pub leading_blits_ns: u64,
+    /// Replaying every pass descriptor, upload and draw, including each pass's own blits.
+    pub passes_ns: u64,
+    /// Installing the frame buffer's completion handler and committing both buffers.
+    pub commit_ns: u64,
+    /// Indexed by [`CommandBufferRole`].
+    pub gpu: [GpuBusy; CommandBufferRole::COUNT],
+}
+
+impl SubmitTimings {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            leading_blits_ns: 0,
+            passes_ns: 0,
+            commit_ns: 0,
+            gpu: [const { GpuBusy::new() }; CommandBufferRole::COUNT],
+        }
+    }
+}
+
+impl Default for SubmitTimings {
     fn default() -> Self {
         Self::new()
     }

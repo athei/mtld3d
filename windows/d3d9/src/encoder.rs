@@ -73,7 +73,7 @@ use mtld3d_shared::{
         CAMetalLayerKind, MTLBufferKind, MTLDepthStencilStateKind, MTLDeviceKind, MTLFunctionKind,
         MTLRenderPipelineStateKind, MTLSamplerStateKind, MTLTextureKind, NSViewKind,
     },
-    perf::{NanosSetTimer, ShaderTimings},
+    perf::{NanosSetTimer, ShaderTimings, SubmitTimings},
     record_handle::DeviceRecordHandle,
     texture_views::TextureViews,
     tsc::{ns_to_cycles, rdtsc, secs_to_cycles},
@@ -786,6 +786,8 @@ struct SubmitOutcome {
     present_wait_ns: u64,
     /// Whether the submit copied the pending present's frame into a slot, and waited for one.
     snapshot: SnapshotFlags,
+    /// The encode and commit split, and the GPU time of the buffers that finished meanwhile.
+    timings: SubmitTimings,
 }
 
 /// A finished frame coming back from the submit thread.
@@ -2694,6 +2696,7 @@ impl FrameEncoder {
         if outcome.snapshot.contains(SnapshotFlags::SLOT_WAITED) {
             self.perf.bump_slot_wait();
         }
+        self.perf.fold_submit_timings(&outcome.timings);
     }
 
     /// Hand a finalized packet to the submit thread (`Async` mode).
@@ -10425,6 +10428,7 @@ fn finalize_submit(enc: &mut FrameEncoder, frame: &FrameData) -> (SubmitFramePar
         present_wait_ns: 0,
         snapshot_flags: SnapshotFlags::empty(),
         pad0: 0,
+        timings: SubmitTimings::new(),
     };
 
     // Retention bookkeeping is keyed by `submit_seq` and only needs the
@@ -10455,6 +10459,7 @@ fn execute_submit(
         drawable_wait_ns: params.drawable_wait_ns,
         present_wait_ns: params.present_wait_ns,
         snapshot: params.snapshot_flags,
+        timings: params.timings,
     };
     (payload, outcome)
 }

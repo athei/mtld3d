@@ -847,7 +847,7 @@ fn encode_test_upload(
     record: &Arc<DeviceRecord>,
     queue: &ProtocolObject<dyn MTLCommandQueue>,
     passes: &[PassDescriptor],
-    params: &SubmitFrameParams,
+    params: &mut SubmitFrameParams,
 ) -> Option<Retained<ProtocolObject<dyn MTLCommandBuffer>>> {
     let device = queue.device();
     let mut ring = UploadRing::default();
@@ -909,6 +909,7 @@ fn test_submit_params(
         present_wait_ns: 0,
         snapshot_flags: mtld3d_shared::mtl::SnapshotFlags::empty(),
         pad0: 0,
+        timings: mtld3d_shared::perf::SubmitTimings::new(),
     }
 }
 
@@ -975,10 +976,10 @@ fn upload_prefix_finishes_before_its_retirement_signal() {
     let coherent = AtomicU64::new(0);
     let upload = AtomicU64::new(0);
     let failed = AtomicU64::new(0);
-    let params = test_submit_params(&coherent, &upload, &failed);
+    let mut params = test_submit_params(&coherent, &upload, &failed);
     let record = test_record(&queue);
     let upload_cb =
-        encode_test_upload(&record, &queue, &[pass], &params).expect("an upload buffer");
+        encode_test_upload(&record, &queue, &[pass], &mut params).expect("an upload buffer");
     commit_registered(
         record.pending(),
         &upload_cb,

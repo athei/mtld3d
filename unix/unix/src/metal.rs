@@ -6,6 +6,7 @@ mod command;
 pub mod depth_transfer;
 mod device;
 mod gamma;
+mod gpu_time;
 pub mod handle;
 mod macdrv;
 mod null_texture;

@@ -45,7 +45,9 @@ use mtld3d_shared::{
     CommandType,
     tsc::{cycles_to_ms, rdtsc, secs_to_cycles},
 };
-use mtld3d_shared::{MetalHandle, mtl_handle::MTLTextureKind};
+use mtld3d_shared::{MetalHandle, mtl_handle::MTLTextureKind, perf::SubmitTimings};
+#[cfg(perf_tracking)]
+use mtld3d_shared::{perf::CommandBufferRole, tsc::ns_to_cycles};
 #[cfg(perf_tracking)]
 use rustc_hash::FxHashMap;
 // Brings `OpSub::COUNT` (the `strum::EnumCount` associated const) into scope
@@ -1060,6 +1062,25 @@ struct EncoderFrameCounters {
     /// drawable and commits. Measured on the unix side, folded back with the
     /// payload, lagged ≤1 frame under async; part of `submit_exec_cycles`.
     present_wait_cycles: u64,
+    /// Submit-thread encode of the frame-leading blits, a child of `Encode+commit`.
+    ///
+    /// Folded back and overwritten per returning payload like
+    /// `submit_exec_cycles`, so a frame's children and their parent always
+    /// come from the same submission.
+    submit_blits_cycles: u64,
+    /// Submit-thread replay of every pass descriptor, upload and draw; as `submit_blits_cycles`.
+    submit_passes_cycles: u64,
+    /// Submit-thread completion-handler install and commit; as `submit_blits_cycles`.
+    submit_commit_cycles: u64,
+    /// GPU execution time per [`CommandBufferRole`], summed over the completions reported.
+    ///
+    /// Each returning payload reports the buffers that finished since the
+    /// previous one, so these add rather than overwrite, and they are sticky
+    /// like `snapshots`: a report folded between a summary and the next
+    /// reset still counts.
+    gpu_cycles: [u64; CommandBufferRole::COUNT],
+    /// Command buffers behind `gpu_cycles`, per role; sticky the same way.
+    gpu_buffers: [u32; CommandBufferRole::COUNT],
     /// Presents that went out from a copy of the back buffer.
     ///
     /// A barrier hurried a submit past its wait, or a mid-frame flush found
@@ -1118,6 +1139,11 @@ impl EncoderFrameCounters {
             submit_exec_cycles: 0,
             submit_stall_cycles: 0,
             present_wait_cycles: 0,
+            submit_blits_cycles: 0,
+            submit_passes_cycles: 0,
+            submit_commit_cycles: 0,
+            gpu_cycles: [0; CommandBufferRole::COUNT],
+            gpu_buffers: [0; CommandBufferRole::COUNT],
             snapshots: 0,
             slot_waits: 0,
             pagebox_pool_recycled: 0,
@@ -1898,9 +1924,13 @@ impl EncoderPerfState {
         // the barriers between the last summary and this reset.
         let snapshots = self.enc.snapshots;
         let slot_waits = self.enc.slot_waits;
+        let gpu_cycles = self.enc.gpu_cycles;
+        let gpu_buffers = self.enc.gpu_buffers;
         self.enc = EncoderFrameCounters::default();
         self.enc.snapshots = snapshots;
         self.enc.slot_waits = slot_waits;
+        self.enc.gpu_cycles = gpu_cycles;
+        self.enc.gpu_buffers = gpu_buffers;
         self.per_pair_stats.clear();
     }
 
@@ -1980,6 +2010,25 @@ impl EncoderPerfState {
 
     pub const fn set_present_wait_cycles(&mut self, cycles: u64) {
         self.enc.present_wait_cycles = cycles;
+    }
+
+    /// Fold one `SubmitFrame`'s timings: the encode split overwrites, the GPU time adds.
+    ///
+    /// The unix side measures nanoseconds, since its counter is not ours, so
+    /// every value converts into our cycles here.
+    pub fn fold_submit_timings(&mut self, timings: &SubmitTimings) {
+        self.enc.submit_blits_cycles = ns_to_cycles(timings.leading_blits_ns);
+        self.enc.submit_passes_cycles = ns_to_cycles(timings.passes_ns);
+        self.enc.submit_commit_cycles = ns_to_cycles(timings.commit_ns);
+        let sums = self
+            .enc
+            .gpu_cycles
+            .iter_mut()
+            .zip(self.enc.gpu_buffers.iter_mut());
+        for ((cycles, buffers), busy) in sums.zip(&timings.gpu) {
+            *cycles = cycles.saturating_add(ns_to_cycles(busy.ns));
+            *buffers = buffers.saturating_add(busy.buffers);
+        }
     }
 
     /// Bumped once per submit that copied the pending present's frame into a slot.
@@ -2229,6 +2278,8 @@ impl EncoderPerfState {
         // Sampled: the barriers that bump them run before the next reset.
         self.enc.snapshots = 0;
         self.enc.slot_waits = 0;
+        self.enc.gpu_cycles = [0; CommandBufferRole::COUNT];
+        self.enc.gpu_buffers = [0; CommandBufferRole::COUNT];
         self.compilation.finish_frame(
             compilation::cycles_to_ns(self.enc.op_sub_cycles[OpSub::Resolve as usize]),
             compilation::cycles_to_ns(self.enc.op_sub_cycles[OpSub::Pipeline as usize]),
@@ -2417,6 +2468,8 @@ impl EncoderPerfState {
     pub const fn add_submit_stall_cycles(&mut self, _cycles: u64) {}
     #[inline]
     pub const fn set_present_wait_cycles(&mut self, _cycles: u64) {}
+    #[inline]
+    pub const fn fold_submit_timings(&mut self, _timings: &SubmitTimings) {}
     #[inline]
     pub const fn bump_snapshot(&mut self) {}
     #[inline]
@@ -2662,6 +2715,16 @@ struct PerfWindow {
     submit_exec: Stat,
     submit_stall: Stat,
     present_wait: Stat,
+    /// The three measured children of `Encode+commit`.
+    submit_blits: Stat,
+    submit_passes: Stat,
+    submit_commit: Stat,
+    /// GPU execution time per [`CommandBufferRole`]: window sum + per-frame peak.
+    gpu: [Stat; CommandBufferRole::COUNT],
+    /// Command buffers behind `gpu`, per role (sum only).
+    gpu_buffers: [Stat; CommandBufferRole::COUNT],
+    /// Peak only: the per-frame sum over every role of `gpu`.
+    gpu_total: Stat,
     /// Window total of presents that went out from a copy (sum only).
     snapshots: Stat,
     /// Window total of copies that first waited for a slot (sum only).
@@ -2808,6 +2871,8 @@ struct PerfWindow {
     ///
     /// Encode+commit CPU, excluding the wait for the previous present.
     encode_commit: Stat,
+    /// Peak only: `encode_commit` less its three measured children.
+    submit_resid: Stat,
     /// Peak only: `vb_rename + ib_rename` on any single frame.
     vbib_rename: Stat,
     /// Process-wide minor-fault delta for this window (set at emit, not accumulated).
@@ -2902,6 +2967,19 @@ impl PerfWindow {
         self.drawable_wait.add(s.enc.drawable_wait_cycles);
         self.submit_exec.add(s.enc.submit_exec_cycles);
         self.present_wait.add(s.enc.present_wait_cycles);
+        self.submit_blits.add(s.enc.submit_blits_cycles);
+        self.submit_passes.add(s.enc.submit_passes_cycles);
+        self.submit_commit.add(s.enc.submit_commit_cycles);
+        for i in 0..CommandBufferRole::COUNT {
+            self.gpu[i].add(s.enc.gpu_cycles[i]);
+            self.gpu_buffers[i].add(u64::from(s.enc.gpu_buffers[i]));
+        }
+        self.gpu_total.peak(
+            s.enc
+                .gpu_cycles
+                .iter()
+                .fold(0, |sum, &c| sum.saturating_add(c)),
+        );
         self.snapshots.add(u64::from(s.enc.snapshots));
         self.slot_waits.add(u64::from(s.enc.slot_waits));
         for i in 0..ApiCategory::COUNT {
@@ -3044,10 +3122,16 @@ impl PerfWindow {
                 .submit_cycles
                 .saturating_sub(s.enc.submit_stall_cycles),
         );
-        self.encode_commit.peak(
-            s.enc
-                .submit_exec_cycles
-                .saturating_sub(s.enc.present_wait_cycles),
+        let encode_commit = s
+            .enc
+            .submit_exec_cycles
+            .saturating_sub(s.enc.present_wait_cycles);
+        self.encode_commit.peak(encode_commit);
+        self.submit_resid.peak(
+            encode_commit
+                .saturating_sub(s.enc.submit_blits_cycles)
+                .saturating_sub(s.enc.submit_passes_cycles)
+                .saturating_sub(s.enc.submit_commit_cycles),
         );
         self.vbib_rename
             .peak(u64::from(s.counters.vb_rename) + u64::from(s.counters.ib_rename));
@@ -3487,6 +3571,7 @@ impl<'a> Summary<'a> {
         self.write_encoder_thread(&mut out, enc_cyc_ms, op_ms, finalize_ms, stall_ms);
         self.write_submit_thread(&mut out, submit_exec_ms, encode_commit_ms, pw_ms);
         self.write_present_thread(&mut out, dw_ms);
+        self.write_gpu(&mut out);
         self.write_frame_total(&mut out, frame_total_ms);
         self.write_resources_vbib(&mut out);
         self.write_resources_textures(&mut out);
@@ -4243,7 +4328,10 @@ impl<'a> Summary<'a> {
     /// the wait for the previous present, then commit) off the encoder
     /// thread. `Present wait` is the display's cadence as the submit thread
     /// sees it and is broken out; `Encode+commit` is the submit thread's own
-    /// CPU. Reported lagged ≤1 frame (folded back when a payload returns).
+    /// CPU, split into the leading blits, the pass replay and the commit, with
+    /// a `resid` row (command-buffer setup, the present settle less its wait,
+    /// the thunk crossing) so the children add up to it. Reported lagged ≤1
+    /// frame (folded back when a payload returns).
     fn write_submit_thread(
         &self,
         out: &mut String,
@@ -4253,6 +4341,7 @@ impl<'a> Summary<'a> {
     ) {
         let w = self.w;
         let s = &self.s;
+        let f = u64::from(self.frames);
         let _ = writeln!(out);
         write_row(
             out,
@@ -4276,6 +4365,48 @@ impl<'a> Summary<'a> {
                 aux: None,
                 desc: Some("command-walk → Metal"),
                 peak: Some(cycles_to_ms(w.encode_commit.max)),
+            },
+        );
+        let children = [
+            (
+                "│  ├─ leading blits",
+                "frame-leading blits",
+                &w.submit_blits,
+            ),
+            ("│  ├─ passes", "render-pass replay", &w.submit_passes),
+            ("│  ├─ commit", "handlers + commit", &w.submit_commit),
+        ];
+        let mut child_sum = 0u64;
+        for (label, desc, stat) in children {
+            child_sum = child_sum.saturating_add(stat.sum);
+            write_row(
+                out,
+                s,
+                &Row {
+                    label,
+                    bold_label: false,
+                    ms: Some(cycles_to_ms(stat.sum / f)),
+                    aux: None,
+                    desc: Some(desc),
+                    peak: Some(cycles_to_ms(stat.max)),
+                },
+            );
+        }
+        let resid = w
+            .submit_exec
+            .sum
+            .saturating_sub(w.present_wait.sum)
+            .saturating_sub(child_sum);
+        write_row(
+            out,
+            s,
+            &Row {
+                label: "│  └─ resid",
+                bold_label: false,
+                ms: Some(cycles_to_ms(resid / f)),
+                aux: None,
+                desc: Some("setup, settle, thunk"),
+                peak: Some(cycles_to_ms(w.submit_resid.max)),
             },
         );
         write_row(
@@ -4354,6 +4485,68 @@ impl<'a> Summary<'a> {
                 peak: None,
             },
         );
+    }
+
+    /// GPU execution time of the device's command buffers, per role.
+    ///
+    /// Each row is the window's sum of `GPUEndTime - GPUStartTime` over the
+    /// buffers of that role, per frame; the count is the buffers behind it.
+    /// A buffer is reported by the submission after it completes, so the
+    /// block lags like the submit-thread rows. Buffers of one queue can
+    /// overlap on the GPU, which the top row's label says: its sum is busy
+    /// time, not wall time.
+    fn write_gpu(&self, out: &mut String) {
+        let w = self.w;
+        let s = &self.s;
+        let f = u64::from(self.frames);
+        let total = w
+            .gpu
+            .iter()
+            .fold(0u64, |sum, stat| sum.saturating_add(stat.sum));
+        let _ = writeln!(out);
+        write_row(
+            out,
+            s,
+            &Row {
+                label: "GPU (CBs may overlap)",
+                bold_label: true,
+                ms: Some(cycles_to_ms(total / f)),
+                aux: None,
+                desc: Some("GPUEnd - GPUStart"),
+                peak: Some(cycles_to_ms(w.gpu_total.max)),
+            },
+        );
+        let roles = [
+            (
+                "├─ Frame CBs",
+                "render passes",
+                CommandBufferRole::Frame as usize,
+            ),
+            (
+                "├─ Upload CBs",
+                "uploads + blits",
+                CommandBufferRole::Upload as usize,
+            ),
+            (
+                "└─ Present CBs",
+                "drawable present",
+                CommandBufferRole::Present as usize,
+            ),
+        ];
+        for (label, desc, role) in roles {
+            write_row(
+                out,
+                s,
+                &Row {
+                    label,
+                    bold_label: false,
+                    ms: Some(cycles_to_ms(w.gpu[role].sum / f)),
+                    aux: Some(format!("({:>10})", w.gpu_buffers[role].sum)),
+                    desc: Some(desc),
+                    peak: Some(cycles_to_ms(w.gpu[role].max)),
+                },
+            );
+        }
     }
 
     fn write_frame_total(&self, out: &mut String, frame_total_ms: f64) {

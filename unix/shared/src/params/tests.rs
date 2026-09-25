@@ -141,8 +141,9 @@ fn frame_param_layouts_match_wow64() {
     //   + 8 failed_submit_seq_ptr
     //   + 8 drawable_wait_ns + 8 present_view
     //   + 8 present_wait_ns + 4 snapshot_flags + 4 pad0
-    //   = 120
-    assert_eq!(core::mem::size_of::<SubmitFrameParams>(), 120);
+    //   + 72 timings (3 * 8 CPU spans + 3 * 16 GPU roles)
+    //   = 192
+    assert_eq!(core::mem::size_of::<SubmitFrameParams>(), 192);
     assert_eq!(
         core::mem::offset_of!(SubmitFrameParams, upload_pass_count),
         36
@@ -156,6 +157,7 @@ fn frame_param_layouts_match_wow64() {
         core::mem::offset_of!(SubmitFrameParams, snapshot_flags),
         112
     );
+    assert_eq!(core::mem::offset_of!(SubmitFrameParams, timings), 120);
 
     // CreateTexturesBatchParams:
     //   8 device_handle + 8 record_handle + 4 count + 4 _pad0 + 8 descs_ptr

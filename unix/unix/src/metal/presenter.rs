@@ -45,7 +45,7 @@ use mtld3d_shared::{
     SubmitFrameParams,
     mtl::{PRESENT_PIPELINE_DEPTH, PresentWaitPolicy, SnapshotFlags},
     mtl_handle::{CAMetalLayerKind, MTLCommandQueueKind, MTLTextureKind, MetalHandle},
-    perf::NanosSetTimer,
+    perf::{CommandBufferRole, NanosSetTimer},
 };
 use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_metal::{
@@ -833,6 +833,7 @@ fn present_frame(record: &Arc<DeviceRecord>, queue: &ProtocolObject<dyn MTLComma
             // SAFETY: Metal invokes the block with the completed command
             // buffer; the pointer is valid for the handler's duration.
             let cb = unsafe { cb_ptr.as_ref() };
+            owner.gpu_time().record(CommandBufferRole::Present, cb);
             let status = cb.status();
             diagnostics::completion(cb, status, Some(seq), "present-callback");
             if status == MTLCommandBufferStatus::Error {

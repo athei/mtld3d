@@ -113,6 +113,72 @@ fn snapshots_survive_begin_frame_until_sampled() {
     assert_eq!(state.enc.op_cycles, 0, "every other counter was reset");
 }
 
+/// A submission's encode split replaces the last one's, and its GPU time adds to what came before.
+///
+/// The GPU sums also outlive the per-frame reset, like the snapshots: a
+/// report folded between a summary and the next frame still counts.
+#[test]
+fn submit_timings_fold_split_replaces_and_gpu_time_adds() {
+    let frame = CommandBufferRole::Frame as usize;
+    let upload = CommandBufferRole::Upload as usize;
+    let present = CommandBufferRole::Present as usize;
+    let mut first = SubmitTimings::new();
+    first.leading_blits_ns = 1_000;
+    first.passes_ns = 2_000;
+    first.commit_ns = 3_000;
+    first.gpu[frame].ns = 4_000_000;
+    first.gpu[frame].buffers = 1;
+    let mut second = SubmitTimings::new();
+    second.passes_ns = 5_000;
+    second.gpu[frame].ns = 6_000_000;
+    second.gpu[frame].buffers = 1;
+    second.gpu[present].ns = 1_000_000;
+    second.gpu[present].buffers = 2;
+
+    let mut state = EncoderPerfState::new();
+    state.fold_submit_timings(&first);
+    state.fold_submit_timings(&second);
+    assert_eq!(state.enc.submit_blits_cycles, 0, "the later split replaces");
+    assert_eq!(state.enc.submit_passes_cycles, ns_to_cycles(5_000));
+    assert_eq!(state.enc.submit_commit_cycles, 0);
+    let frame_cycles = ns_to_cycles(4_000_000) + ns_to_cycles(6_000_000);
+    assert_eq!(state.enc.gpu_cycles[frame], frame_cycles, "GPU time adds");
+    assert_eq!(state.enc.gpu_cycles[upload], 0);
+    assert_eq!(state.enc.gpu_cycles[present], ns_to_cycles(1_000_000));
+    assert_eq!(state.enc.gpu_buffers, [2, 0, 2]);
+
+    state.begin_frame(&FramePerfPayload::default());
+    assert_eq!(
+        state.enc.gpu_cycles[frame], frame_cycles,
+        "sticky across the reset"
+    );
+    assert_eq!(state.enc.gpu_buffers, [2, 0, 2]);
+    assert_eq!(state.enc.submit_passes_cycles, 0, "the split is per frame");
+}
+
+/// The encode children and their residual partition `Encode+commit` on every frame.
+#[test]
+fn perf_window_submit_children_leave_a_residual() {
+    let mut w = PerfWindow::new();
+    let mut s = sample_submit(0, 1_000, 100);
+    s.enc.submit_blits_cycles = 200;
+    s.enc.submit_passes_cycles = 300;
+    s.enc.submit_commit_cycles = 100;
+    s.enc.gpu_cycles = [700, 200, 100];
+    w.accumulate(&s);
+    let mut over = sample_submit(0, 500, 0);
+    // Children over their parent, as a sync submit with no execute reports.
+    over.enc.submit_passes_cycles = 900;
+    w.accumulate(&over);
+    assert_eq!(
+        w.submit_resid.max, 300,
+        "900 - 200 - 300 - 100, and never negative"
+    );
+    assert_eq!(w.submit_passes.sum, 1_200);
+    assert_eq!(w.gpu[CommandBufferRole::Frame as usize].sum, 700);
+    assert_eq!(w.gpu_total.max, 1_000);
+}
+
 /// Upload outcome totals partition successful renames and survive only their reporting window.
 #[test]
 fn staged_upload_outcomes_partition_bytes_and_reset_per_device() {
@@ -425,12 +491,21 @@ fn summary_golden_layout() {
         "\n",
         "Submit thread           6.10 ms                                             peak  6.10 ms\n",
         "├─ Encode+commit        0.10 ms                       command-walk → Metal  peak  0.10 ms\n",
+        "│  ├─ leading blits     0.01 ms                       frame-leading blits   peak  0.01 ms\n",
+        "│  ├─ passes            0.05 ms                       render-pass replay    peak  0.05 ms\n",
+        "│  ├─ commit            0.02 ms                       handlers + commit     peak  0.02 ms\n",
+        "│  └─ resid             0.02 ms                       setup, settle, thunk  peak  0.02 ms\n",
         "└─ Present wait         6.00 ms                       prior present commit  peak  6.00 ms\n",
         "\n",
         "Present thread          6.00 ms                                             peak  6.00 ms\n",
         "├─ Drawable wait        6.00 ms                       nextDrawable GPU+comp peak  6.00 ms\n",
         "├─ Snapshots                      (         1)        presented from a copy\n",
         "└─ Slot waits                     (         0)        copy waited for a present\n",
+        "\n",
+        "GPU (CBs may overlap)   4.50 ms                       GPUEnd - GPUStart     peak  4.50 ms\n",
+        "├─ Frame CBs            4.00 ms   (         1)        render passes         peak  4.00 ms\n",
+        "├─ Upload CBs           0.30 ms   (         1)        uploads + blits       peak  0.30 ms\n",
+        "└─ Present CBs          0.20 ms   (         1)        drawable present      peak  0.20 ms\n",
         "\n",
         "Frame total            10.00 ms                                             peak 10.00 ms\n",
         "submit_status=0x0   (API, Encoder, Submit, Present run in parallel; frame_total ≥ max(api_cpu, enc_cpu, submit_cpu + present_wait, gpu_wait))\n",
@@ -527,11 +602,19 @@ fn summary_contains_expected_sections() {
         "└─ Submit stall",
         "Submit thread",
         "├─ Encode+commit",
+        "│  ├─ leading blits",
+        "│  ├─ passes",
+        "│  ├─ commit",
+        "│  └─ resid",
         "└─ Present wait",
         "Present thread",
         "├─ Drawable wait",
         "├─ Snapshots",
         "└─ Slot waits",
+        "GPU (CBs may overlap)",
+        "├─ Frame CBs",
+        "├─ Upload CBs",
+        "└─ Present CBs",
         "Frame total",
         "submit_status=0x0",
         "Resources (VB/IB)",
@@ -751,6 +834,15 @@ fn sample_window() -> PerfWindow {
             // 0.2M backpressure stall → Finalize 0.10M, stall 0.20M.
             submit_stall_cycles: 200_000,
             present_wait_cycles: 6_000_000,
+            // Encode+commit 0.1M = blits 0.01M + passes 0.05M + commit
+            // 0.02M + resid 0.02M.
+            submit_blits_cycles: 10_000,
+            submit_passes_cycles: 50_000,
+            submit_commit_cycles: 20_000,
+            // One buffer of each role finished: frame 4.0M, upload 0.3M,
+            // present 0.2M, 4.5M in all.
+            gpu_cycles: [4_000_000, 300_000, 200_000],
+            gpu_buffers: [1, 1, 1],
             // One read-back in the window presented its frame from a copy,
             // and no copy waited for a slot.
             snapshots: 1,

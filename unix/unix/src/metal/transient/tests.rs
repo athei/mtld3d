@@ -130,6 +130,7 @@ fn an_unstamped_use_never_retires() {
         present_wait_ns: 0,
         snapshot_flags: mtld3d_shared::mtl::SnapshotFlags::empty(),
         pad0: 0,
+        timings: mtld3d_shared::perf::SubmitTimings::new(),
     };
     let unstamped = SubmitStamp::new(&params);
     assert!(!unstamped.persistent());
