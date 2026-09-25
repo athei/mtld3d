@@ -7,12 +7,13 @@
 //! never toggled, and under HDR the sprite goes through the same tone map as
 //! the frame, so the cursor is as bright as the UI it hovers over.
 //!
-//! The window never moves with the pointer: it covers the whole screen the
-//! game window is on, and the sprite is an image layer moved inside it. A
-//! window frame change makes `AppKit` re-resolve the cursor for the pointer's
-//! location, and with no cursor of our own to offer it lands on the arrow over
-//! the game's blank cursor on every mouse move; a layer moving inside a fixed
-//! window is invisible to that machinery. Show and hide swap the layer's
+//! The window never moves with the pointer: it has the game window's frame
+//! and moves with it as a child, and the sprite is an image layer moved inside
+//! it, clipped at the game window's edges. A window frame change makes
+//! `AppKit` re-resolve the cursor for the pointer's location, and with no
+//! cursor of our own to offer it lands on the arrow over the game's blank
+//! cursor on every mouse move; a layer moving inside a fixed window is
+//! invisible to that machinery. Show and hide swap the layer's
 //! pixels, a sprite or a transparent image, so its surface stays in the
 //! window's scene: taking a surface out from above the game layer is free,
 //! putting one back costs the game's next present a refresh, and a game
@@ -31,15 +32,15 @@
 //! and EDR headroom. Those objects live in a main-thread `thread_local`, which
 //! makes the split sound without a lock around `Retained` handles.
 //!
-//! Nothing about the game window is latched: the game `NSWindow`, its level,
-//! its client rectangle and its screen are read when the sprite can be shown,
-//! from the view of the attachment record the overlay follows, so in-game resolution
-//! changes, windowed/fullscreen switches and display moves need no signal
-//! from the PE side. There is one system cursor and one overlay window for
-//! the process, and they follow the device whose `SetCursorOverlay` arrived
-//! most recently (under [`SHARED`]): `SetCursorProperties` and `ShowCursor`
-//! are per-device calls, so the device that last spoke is the device the
-//! game means.
+//! Nothing about the game window is latched: the game `NSWindow` and its
+//! frame are read at every apply, its level and client rectangle when the
+//! sprite can be shown, from the view of the attachment record the overlay
+//! follows, so in-game resolution changes, windowed/fullscreen switches and
+//! display moves need no signal from the PE side. There is one system cursor
+//! and one overlay window for the process, and they follow the device whose
+//! `SetCursorOverlay` arrived most recently (under [`SHARED`]):
+//! `SetCursorProperties` and `ShowCursor` are per-device calls, so the device
+//! that last spoke is the device the game means.
 //!
 //! The sprite's position and its pixels reach the compositor together. The
 //! completed image is assigned in the Core Animation transaction, so a hide
@@ -828,7 +829,7 @@ impl Overlay {
         // SAFETY: objc2 typed binding; the dictionary is copied by the layer.
         unsafe { layer.setDeveloperHUDProperties(Some(&hud)) };
 
-        let frame = screen_frame(game_screen(mtm, wanted.owner.as_ref()));
+        let frame = game_frame(mtm, game_window(mtm, wanted).as_deref());
         // SAFETY: standard NSWindow initialiser on a fresh allocation; the
         // borderless mask and buffered backing are the documented values for
         // an overlay, and `defer = false` gives the window its server-side
@@ -931,11 +932,7 @@ impl Overlay {
     /// reference is weak, so this relationship cannot retain a destroyed game
     /// window. Detaching a device removes the child before its next owner arrives.
     fn follow_window(&self, mtm: MainThreadMarker, wanted: &WantedSnapshot) {
-        let window = wanted
-            .owner
-            .as_ref()
-            .and_then(|att| attachment::retain_view(att, mtm))
-            .and_then(|view| view.window());
+        let window = game_window(mtm, wanted);
         let parent = self.window.parentWindow();
         if parent.as_deref() != window.as_deref() {
             if let Some(parent) = parent {
@@ -948,6 +945,23 @@ impl Overlay {
                 unsafe { window.addChildWindow_ordered(&self.window, NSWindowOrderingMode::Above) };
                 debug!(target: LOG_TARGET, "cursor: overlay {} follows game window {}",
                     self.window.windowNumber(), window.windowNumber());
+            }
+        }
+        if let Some(window) = window.as_deref() {
+            // Mission Control outlines a window together with its children, so
+            // the overlay takes the game window's frame, not its screen's. A
+            // child moves with its parent; only a size change or a new game
+            // window re-frames it. A frame change costs one cursor re-resolution
+            // by AppKit, which the native blank repair undoes at the next pass.
+            let frame = window.frame();
+            if self.window.frame() != frame {
+                self.window.setFrame_display(frame, false);
+                // Debug: a live resize re-frames once per reconciled drag step.
+                debug!(
+                    target: LOG_TARGET,
+                    "cursor: overlay window re-framed to the game window at ({:.0},{:.0}) {:.0}x{:.0}",
+                    frame.origin.x, frame.origin.y, frame.size.width, frame.size.height,
+                );
             }
         }
         if window.is_some_and(|window| window.isVisible()) {
@@ -1202,18 +1216,6 @@ impl Overlay {
         let level = hit.window.level() + 1;
         if self.window.level() != level {
             self.window.setLevel(level);
-        }
-        // Follow the game window onto another screen. A window frame change
-        // costs one cursor re-resolution by AppKit, which is why it is done
-        // only here and never per event.
-        let frame = screen_frame(hit.window.screen().or_else(|| NSScreen::mainScreen(mtm)));
-        if self.window.frame() != frame {
-            self.window.setFrame_display(frame, false);
-            info!(
-                target: LOG_TARGET,
-                "cursor: overlay window moved over ({:.0},{:.0}) {:.0}x{:.0}",
-                frame.origin.x, frame.origin.y, frame.size.width, frame.size.height,
-            );
         }
         inputs.set(VisibilityInputs::POINTER_INSIDE, hit.over_game);
         inputs.set(VisibilityInputs::OCCLUDED, att.window_occluded());
@@ -1470,33 +1472,31 @@ fn window_under_pointer(point: CGPoint, mtm: MainThreadMarker) -> NSInteger {
     NSWindow::windowNumberAtPoint_belowWindowWithWindowNumber(point, 0, mtm)
 }
 
-/// The screen the game window is on; the main screen when it is on none or none is followed.
-fn game_screen(
-    mtm: MainThreadMarker,
-    owner: Option<&Arc<Attachment>>,
-) -> Option<Retained<NSScreen>> {
-    owner
+/// The live game window of the followed attachment, if its view still has one.
+fn game_window(mtm: MainThreadMarker, wanted: &WantedSnapshot) -> Option<Retained<NSWindow>> {
+    wanted
+        .owner
+        .as_ref()
         .and_then(|att| attachment::retain_view(att, mtm))
         .and_then(|view| view.window())
-        .and_then(|window| window.screen())
-        .or_else(|| NSScreen::mainScreen(mtm))
 }
 
-/// The frame the overlay window covers: the screen the game window is on.
+/// The frame the overlay window takes: the game window's.
 ///
-/// A unit rectangle when there is no screen at all; the window follows on the
-/// next pass that finds one.
-fn screen_frame(screen: Option<Retained<NSScreen>>) -> CGRect {
-    screen.map_or(
-        CGRect {
+/// The main screen's frame when no game window is followed, and a unit
+/// rectangle when there is no screen either; the window follows on the next
+/// pass that finds the game window.
+fn game_frame(mtm: MainThreadMarker, window: Option<&NSWindow>) -> CGRect {
+    window
+        .map(NSWindow::frame)
+        .or_else(|| NSScreen::mainScreen(mtm).map(|screen| screen.frame()))
+        .unwrap_or(CGRect {
             origin: CGPoint { x: 0.0, y: 0.0 },
             size: CGSize {
                 width: 1.0,
                 height: 1.0,
             },
-        },
-        |screen| screen.frame(),
-    )
+        })
 }
 
 /// Upload the owned snapshot's sprite outside the shared mutex.

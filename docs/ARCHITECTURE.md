@@ -204,8 +204,8 @@ cursor on rejected input.
 An identical accepted request preserves pending retries but does not dispatch
 another apply once that state has completed. The pre-commit observer and the
 display observers continue reconciling it.
-The overlay still reconciles its layer configuration while hidden or inactive,
-but defers window and pointer geometry queries until it can show a sprite. The
+The overlay still reconciles its layer configuration and its window frame while
+hidden or inactive, but defers pointer geometry queries until it can show a sprite. The
 show resolves current geometry before presenting pixels and position together.
 Hardware-only processes publish cursor visibility without creating an overlay;
 a native hide still wakes the main-thread pointer watch. After any software sprite
@@ -236,10 +236,14 @@ mirrors the game layer's actual pixel
 format, colorspace and EDR setting, including handoffs within the same HDR/SDR
 class. A device change rebuilds the command queue and texture cache. Changes to
 sprite geometry, layer configuration, owner or relevant headroom invalidate the
-rendered content. The overlay window covers the followed screen and only changes
-frame when that screen changes; pointer motion changes the sprite layer position.
-Moving the window itself per event would make AppKit resolve the cursor again and
-replace the game's blank cursor with an arrow.
+rendered content. The overlay window has the game window's frame, not its
+screen's: Mission Control outlines a window together with its children, and a
+screen-sized child made that outline cover the screen. As a child it moves with
+the game window, so only a size change or a new game window re-frames it; the
+sprite is clipped at the game window's edges. Pointer motion changes the sprite
+layer position. Moving the window itself per event would make AppKit resolve the
+cursor again and replace the game's blank cursor with an arrow; the one
+re-resolution a re-frame costs is undone by the native blank repair below.
 
 The main-run-loop observer at before-waiting and exit, ahead of Core Animation's
 commit, is the one place the cursor is reconciled. It reads the pointer position
