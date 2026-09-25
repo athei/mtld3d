@@ -8001,9 +8001,6 @@ fn emit_stretch_rect_blit(
     // surface's retained handle, both of which are `MTLTexture` handles.
     let src_texture = unsafe { MetalHandle::<MTLTextureKind>::new(src_handle) };
     enc.note_msaa_read(src_texture);
-    // What the copy writes may be kept for good, so a draw left out of the
-    // source would be baked into it.
-    enc.note_copy_source(src_texture);
     // A source with a multisampled companion is a resolve target, and a
     // resolve the last submission stored into it must have completed before
     // this copy reads it on a device that does not order that itself.
@@ -8014,6 +8011,22 @@ fn emit_stretch_rect_blit(
         StretchKind::Texture(info) => enc.get_or_create_texture(info),
         StretchKind::Backbuffer(h) | StretchKind::DepthStencil(h) => h.raw(),
     };
+    // What the copy writes may be kept for good, and a draw left out of the
+    // source would then be baked into it. A copy over a whole colour target
+    // rebuilds that target as a clear does.
+    // SAFETY: `dst_handle` came from the encoder's texture cache or from a
+    // surface's retained handle, both of which are `MTLTexture` handles.
+    let dst_texture = unsafe { MetalHandle::<MTLTextureKind>::new(dst_handle) };
+    enc.note_stretch_copy(&crate::encoder::StretchCopyTargets {
+        src: src_texture,
+        dst: dst_texture,
+        dst_subresource: dst_info.slice.unwrap_or(0) | (dst_info.mip_level << 16),
+        whole_color_dst: !matches!(dst_info.kind, StretchKind::DepthStencil(_))
+            && dst_region.x == 0
+            && dst_region.y == 0
+            && dst_region.w == dst_info.width
+            && dst_region.h == dst_info.height,
+    });
     if src_handle == 0 || dst_handle == 0 {
         mtld3d_shared::log_once_warn!(
             target: crate::LOG_TARGET,

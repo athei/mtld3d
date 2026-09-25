@@ -103,6 +103,7 @@ const DRAW_TRACE_TARGET: &str = "mtld3d::d3d9::draw";
 
 mod compile;
 mod depth;
+pub use compile::StretchCopyTargets;
 pub use depth::DepthTransfer;
 
 /// Sub-target for the once-per-distinct sampler-state diagnostic.
@@ -1318,12 +1319,13 @@ pub struct FrameEncoder {
     /// the one before. Advanced at `begin_frame` unless the previous submit
     /// was a mid-frame flush, whose frame goes on.
     cleared_targets: ClearHistory,
-    /// The last answer of `draw_targets_rebuilt`, for the targets it was asked about.
+    /// Whether the open pass writes into kept targets, memoised by `note_draw_reads`.
     ///
-    /// Consecutive draws share their targets, so the reader walk of
-    /// `note_draw_reads` asks the history once per target change rather than
-    /// once per draw.
-    rebuilt_memo: Option<(compile::TargetsKey, bool)>,
+    /// The draws of one pass share their targets, so the history is asked
+    /// once per pass and history change rather than once per draw.
+    pass_verdict: Option<(compile::PassVerdictKey, bool)>,
+    /// The bindings the last `note_draw_reads` walk marked, cleared when a vertex binding changes.
+    reads_walked: Option<compile::ReadsWalked>,
     /// Pointer to the most recently shipped `CurrentSnapshot`.
     ///
     /// Lives in the per-frame `ScratchArena`. Set by
@@ -1758,7 +1760,8 @@ impl FrameEncoder {
             compile_in_flight: FxHashSet::default(),
             compile_tickets: TicketSource::new(),
             cleared_targets: ClearHistory::new(),
-            rebuilt_memo: None,
+            pass_verdict: None,
+            reads_walked: None,
             current_snapshot: None,
             vs_constants_mirror: Box::new([[0.0; 4]; CONSTANT_ROWS]),
             ps_constants_mirror: Box::new([[0.0; 4]; CONSTANT_ROWS]),
@@ -3875,7 +3878,6 @@ impl FrameEncoder {
     /// `GetRenderTargetData` blit.
     pub fn note_color_read_back(&mut self, handle: MetalHandle<MTLTextureKind>) {
         self.pass_state.note_color_read_back(handle);
-        self.note_copy_source(handle);
     }
 
     /// Resolve `handle` now, because a blit is about to read it.
@@ -5649,6 +5651,7 @@ impl FrameEncoder {
         id: Option<mtld3d_core::ids::TextureId>,
     ) {
         self.vertex_tex_bindings[slot].texture_id = id;
+        self.reads_walked = None;
     }
 
     /// Update one mirrored vertex sampler state (`SetSamplerState` on 257..=260).

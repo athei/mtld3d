@@ -7,7 +7,9 @@
 //! under the discard swap effect, or a target cleared in this frame and the
 //! one before, and read by nothing kept) and no occlusion query is
 //! counting; a draw into any other target waits for its build. The rest of
-//! the suite runs with the option off, where every such draw waits.
+//! the suite runs with the option off, where every such draw waits. Each
+//! device first makes one build and two frames, since the first two frames
+//! of a burst of builds always wait.
 
 use std::time::{Duration, Instant};
 
@@ -56,10 +58,27 @@ fn async_device() -> Harness {
     device_with(ASYNC)
 }
 
-/// A device under `entries` set up for unlit vertex-colour draws.
+/// A device under `entries` set up for unlit vertex-colour draws, past its first builds.
+///
+/// A draw is left out only once the reads of the whole previous frame are on
+/// record, and the layer watches reads only after a build was queued, so the
+/// first two frames of a burst of builds wait. One lit draw starts that
+/// watch and two empty frames complete it; the unlit draws the tests make
+/// afterwards need a vertex shader library of their own, still unbuilt.
 fn device_with(entries: &'static str) -> Harness {
     let h = Harness::with_config(entries);
     assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE), D3D_OK, "SetFVF");
+    assert_eq!(h.set_render_state(D3DRS_LIGHTING, 1), D3D_OK, "lighting on");
+    let tri = covering_triangle(RED);
+    h.render_once(BLUE, |dev| {
+        assert_eq!(
+            dev.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &tri),
+            D3D_OK,
+            "warm-up DrawPrimitiveUP"
+        );
+    });
+    h.render_once(BLUE, |_| {});
+    h.render_once(BLUE, |_| {});
     assert_eq!(
         h.set_render_state(D3DRS_LIGHTING, 0),
         D3D_OK,
@@ -248,12 +267,16 @@ fn a_draw_counted_by_an_occlusion_query_waits_for_its_build() {
     );
 }
 
-/// A scratch target copied into a kept one every frame is kept too, so its draw waits.
+/// A scratch target copied into part of a kept one every frame is kept too, so its draw waits.
+///
+/// The copy covers a corner of the kept target only: a copy over a whole
+/// target rebuilds it as a clear does, and the kept target would then be
+/// rebuilt every frame itself.
 #[test]
 fn a_draw_into_a_scratch_target_copied_into_a_kept_one_waits_for_its_build() {
     let h = async_device();
     let scratch = h.create_render_target(64, 64, D3DFMT_A8R8G8B8);
-    let kept = h.create_render_target(64, 64, D3DFMT_A8R8G8B8);
+    let kept = h.create_render_target(128, 128, D3DFMT_A8R8G8B8);
     let tri = covering_triangle(RED);
     let frame = |draw: bool| {
         let backbuffer = h.render_target(0);
@@ -275,9 +298,15 @@ fn a_draw_into_a_scratch_target_copied_into_a_kept_one_waits_for_its_build() {
             "restore the back buffer"
         );
         assert_eq!(
-            h.stretch_rect(&scratch, &kept, D3DTEXF_NONE),
+            h.stretch_rect_rects(
+                &scratch,
+                (0, 0, 64, 64),
+                &kept,
+                (0, 0, 64, 64),
+                D3DTEXF_NONE
+            ),
             D3D_OK,
-            "copy scratch into the kept target"
+            "copy scratch into a corner of the kept target"
         );
         assert_eq!(h.end_scene(), D3D_OK, "EndScene");
         assert_eq!(h.present(), D3D_OK, "Present");

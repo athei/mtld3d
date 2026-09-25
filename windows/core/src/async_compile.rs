@@ -170,8 +170,8 @@ pub fn may_skip_draw(color: &[bool], depth: Option<bool>, stencil: Option<bool>)
 /// a whole clear reached it and of the frame before that, which is all
 /// "cleared this frame and the one before" needs; a clear of one face, level
 /// or plane says nothing about another. It also keeps the last frame its
-/// content was read into something kept (a copy out of it, a read-back, a
-/// draw into a kept target sampling it), which holds for that frame and the
+/// content was read into something kept (a copy out of it into a kept
+/// target, a draw into a kept target sampling it), which holds for that frame and the
 /// next. A texture neither cleared nor read that way in the current or the
 /// previous frame is dropped when the next frame begins, so the map holds
 /// only what was touched recently. Texture handles are addresses Metal hands
@@ -182,6 +182,10 @@ pub struct ClearHistory {
     frame: u64,
     /// Bumped by every change an answer of this history can depend on.
     generation: u64,
+    /// First frame of the current span in which sampling reads are watched; 0 while none is.
+    reads_since: u64,
+    /// Last frame of that span.
+    reads_until: u64,
     textures: FxHashMap<MetalHandle<MTLTextureKind>, TextureHistory>,
 }
 
@@ -210,6 +214,8 @@ impl ClearHistory {
         Self {
             frame: 1,
             generation: 0,
+            reads_since: 0,
+            reads_until: 0,
             textures: FxHashMap::default(),
         }
     }
@@ -237,6 +243,9 @@ impl ClearHistory {
         self.frame += 1;
         self.generation += 1;
         let frame = self.frame;
+        if frame > self.reads_until {
+            self.reads_since = 0;
+        }
         self.textures.retain(|_, history| {
             history
                 .clears
@@ -314,8 +323,8 @@ impl ClearHistory {
 
     /// Remember that `texture`'s content was just read into something kept.
     ///
-    /// A copy out of it (`StretchRect`, `GetRenderTargetData`), or a draw into
-    /// a target that is not rebuilt every frame sampling it. A draw left out
+    /// A `StretchRect` out of it into a target that is not rebuilt every
+    /// frame, or a draw into such a target sampling it. A draw left out
     /// of `texture` would then be baked into that kept content, so none is
     /// for this frame and the next. A null texture is ignored.
     pub fn mark_feeds_persistent(&mut self, texture: MetalHandle<MTLTextureKind>) {
@@ -336,6 +345,36 @@ impl ClearHistory {
         self.textures
             .get(&texture)
             .is_some_and(|history| history.fed_kept != 0 && history.fed_kept + 1 >= self.frame)
+    }
+
+    /// Watch sampling reads into kept content for this frame and the `frames` after it.
+    ///
+    /// Recording which draws read what costs every draw of a kept pass, so
+    /// it runs only while builds are happening: every build queued extends
+    /// the span. A span that lapsed starts over from this frame.
+    pub fn watch_reads(&mut self, frames: u64) {
+        if self.reads_since == 0 {
+            self.reads_since = self.frame;
+            self.generation += 1;
+        }
+        self.reads_until = self.reads_until.max(self.frame + frames);
+    }
+
+    /// Whether sampling reads into kept content are being recorded now.
+    #[must_use]
+    pub const fn reads_watched(&self) -> bool {
+        self.reads_since != 0 && self.frame <= self.reads_until
+    }
+
+    /// Whether the reads of the whole previous frame and of this one so far are on record.
+    ///
+    /// Only then does a texture without a mark vouch for having fed nothing
+    /// kept, since a mark holds for the frame it was made in and the next.
+    /// A span that begins in the middle of a frame covers it from the next
+    /// frame but one.
+    #[must_use]
+    pub const fn reads_known(&self) -> bool {
+        self.reads_watched() && self.reads_since + 1 < self.frame
     }
 
     /// Forget everything about `texture`, which is being destroyed.
