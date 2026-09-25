@@ -1810,6 +1810,9 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
             }
         }
     };
+    // The draw is emitted from here on. What it samples feeds whatever its
+    // targets keep, so a texture a kept target reads may not lose a draw.
+    enc.note_draw_reads(stage_bindings, ps_sampled_mask, depth_used, stencil_used);
     let depth_stencil = render_state
         .depth_stencil_state
         .gated_on_stencil_attachment(has_stencil);

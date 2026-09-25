@@ -133,8 +133,11 @@ bitflags::bitflags! {
     /// The planes of one attachment a clear reached.
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
     pub struct ClearPlanes: u8 {
+        /// A colour target.
         const COLOR = 1 << 0;
+        /// The depth plane of a depth-stencil attachment.
         const DEPTH = 1 << 1;
+        /// The stencil plane of a depth-stencil attachment, tracked apart from its depth.
         const STENCIL = 1 << 2;
     }
 }
@@ -143,35 +146,51 @@ bitflags::bitflags! {
 ///
 /// Leaving a draw out is safe only when every attachment its result lands
 /// in, or that later draws read it back through, is rebuilt from scratch
-/// every frame, so the frame after the build lands shows the draw. Each
-/// argument answers that for one attachment plane: `color` for every colour
-/// target the pass attaches (a draw that writes only depth still shapes what
-/// a later depth-tested draw writes into them), `depth` and `stencil` for
-/// the planes the draw tests or writes, `None` for a plane it leaves alone.
-/// A target cleared once and drawn once, at load, is exactly the one a skip
-/// would lose for good, so a clear in this frame alone does not qualify; see
-/// [`ClearHistory::regenerated`].
+/// every frame and read only by work rebuilt every frame, so the frame after
+/// the build lands shows the draw. Each argument answers that for one
+/// attachment plane: `color` for every colour target the pass attaches (a
+/// draw that writes only depth still shapes what a later depth-tested draw
+/// writes into them), `depth` and `stencil` for the planes the draw tests or
+/// writes, `None` for a plane it leaves alone. A target cleared once and
+/// drawn once, at load, is exactly the one a skip would lose for good, so a
+/// clear in this frame alone does not qualify; see
+/// [`ClearHistory::regenerated`] and [`ClearHistory::feeds_persistent`].
 #[must_use]
 pub fn may_skip_draw(color: &[bool], depth: Option<bool>, stencil: Option<bool>) -> bool {
-    color.iter().all(|&regenerated| regenerated)
-        && depth.is_none_or(|regenerated| regenerated)
-        && stencil.is_none_or(|regenerated| regenerated)
+    color.iter().all(|&rebuilt| rebuilt)
+        && depth.is_none_or(|rebuilt| rebuilt)
+        && stencil.is_none_or(|rebuilt| rebuilt)
 }
 
-/// Per attachment plane, the presented frames whose whole-target `Clear` reached it.
+/// Per texture, the recent frames that cleared its planes, and whether it feeds kept content.
 ///
-/// Keyed by the texture's identity handle, the subresource (slice in the
-/// low half, level in the high half for colour, the level for depth and
-/// stencil) and the plane, so a clear of one face, level or plane says
-/// nothing about another. Each entry keeps the index of the last frame that
-/// cleared it and of the frame that cleared it before that, which is all
-/// "cleared this frame and the one before" needs. An entry no clear reached
-/// in the current or the previous frame is dropped when the next frame
-/// begins, so the map holds only the attachments cleared recently.
+/// Keyed by the texture's identity handle. Each texture keeps, per
+/// subresource (slice in the low half, level in the high half for colour,
+/// the level for depth and stencil) and plane, the index of the last frame
+/// a whole clear reached it and of the frame before that, which is all
+/// "cleared this frame and the one before" needs; a clear of one face, level
+/// or plane says nothing about another. It also keeps the last frame its
+/// content was read into something kept (a copy out of it, a read-back, a
+/// draw into a kept target sampling it), which holds for that frame and the
+/// next. A texture neither cleared nor read that way in the current or the
+/// previous frame is dropped when the next frame begins, so the map holds
+/// only what was touched recently. Texture handles are addresses Metal hands
+/// out again, so a texture that is destroyed is forgotten
+/// ([`Self::forget`]) before its address can name another.
 pub struct ClearHistory {
     /// Index of the current presented frame; starts at 1, so 0 means "never".
     frame: u64,
-    entries: FxHashMap<(MetalHandle<MTLTextureKind>, u32, u8), ClearRecord>,
+    /// Bumped by every change an answer of this history can depend on.
+    generation: u64,
+    textures: FxHashMap<MetalHandle<MTLTextureKind>, TextureHistory>,
+}
+
+#[derive(Default)]
+struct TextureHistory {
+    /// `(subresource, plane bit, record)` per plane a recent clear reached.
+    clears: Vec<(u32, u8, ClearRecord)>,
+    /// Last frame the texture's content was read into kept content; 0 for never.
+    fed_kept: u64,
 }
 
 struct ClearRecord {
@@ -190,18 +209,40 @@ impl ClearHistory {
     pub fn new() -> Self {
         Self {
             frame: 1,
-            entries: FxHashMap::default(),
+            generation: 0,
+            textures: FxHashMap::default(),
         }
     }
 
-    /// Start the next presented frame, forgetting attachments no recent frame cleared.
+    /// A counter that changes whenever an answer of this history may have.
+    ///
+    /// Lets a caller cache an answer for the targets it has bound and trust
+    /// it until the counter moves.
+    #[must_use]
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Whether any texture has a recent clear or read on record.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.textures.is_empty()
+    }
+
+    /// Start the next presented frame, forgetting textures no recent frame cleared or read.
     ///
     /// A mid-frame flush is not a new frame: the application's frame goes
     /// on, and so do its clears.
     pub fn begin_frame(&mut self) {
         self.frame += 1;
+        self.generation += 1;
         let frame = self.frame;
-        self.entries.retain(|_, record| record.last + 1 >= frame);
+        self.textures.retain(|_, history| {
+            history
+                .clears
+                .retain(|(_, _, record)| record.last + 1 >= frame);
+            !history.clears.is_empty() || history.fed_kept + 1 >= frame
+        });
     }
 
     /// Remember that `planes` of `texture` at `subresource` were cleared whole this frame.
@@ -216,14 +257,25 @@ impl ClearHistory {
         if texture.is_null() {
             return;
         }
+        let frame = self.frame;
+        let history = self.textures.entry(texture).or_default();
         for plane in planes.iter() {
-            let record = self
-                .entries
-                .entry((texture, subresource, plane.bits()))
-                .or_insert(ClearRecord { last: 0, before: 0 });
-            if record.last != self.frame {
+            let bit = plane.bits();
+            let position = history
+                .clears
+                .iter()
+                .position(|(sub, plane, _)| *sub == subresource && *plane == bit);
+            let index = position.unwrap_or_else(|| {
+                history
+                    .clears
+                    .push((subresource, bit, ClearRecord { last: 0, before: 0 }));
+                history.clears.len() - 1
+            });
+            let record = &mut history.clears[index].2;
+            if record.last != frame {
                 record.before = record.last;
-                record.last = self.frame;
+                record.last = frame;
+                self.generation += 1;
             }
         }
     }
@@ -240,14 +292,70 @@ impl ClearHistory {
         subresource: u32,
         plane: ClearPlanes,
     ) -> bool {
-        if texture.is_null() {
+        let Some(history) = self.textures.get(&texture) else {
             return false;
-        }
-        self.entries
-            .get(&(texture, subresource, plane.bits()))
-            .is_some_and(|record| {
+        };
+        history
+            .clears
+            .iter()
+            .find(|(sub, bit, _)| *sub == subresource && *bit == plane.bits())
+            .is_some_and(|(_, _, record)| {
                 record.last == self.frame && record.before != 0 && record.before + 1 == self.frame
             })
+    }
+
+    /// Whether `texture` has a recent clear on record, so a draw into it could ever be skipped.
+    #[must_use]
+    pub fn tracks(&self, texture: MetalHandle<MTLTextureKind>) -> bool {
+        self.textures
+            .get(&texture)
+            .is_some_and(|history| !history.clears.is_empty())
+    }
+
+    /// Remember that `texture`'s content was just read into something kept.
+    ///
+    /// A copy out of it (`StretchRect`, `GetRenderTargetData`), or a draw into
+    /// a target that is not rebuilt every frame sampling it. A draw left out
+    /// of `texture` would then be baked into that kept content, so none is
+    /// for this frame and the next. A null texture is ignored.
+    pub fn mark_feeds_persistent(&mut self, texture: MetalHandle<MTLTextureKind>) {
+        if texture.is_null() {
+            return;
+        }
+        let frame = self.frame;
+        let history = self.textures.entry(texture).or_default();
+        if history.fed_kept != frame {
+            history.fed_kept = frame;
+            self.generation += 1;
+        }
+    }
+
+    /// Whether `texture`'s content was read into kept content in this frame or the last.
+    #[must_use]
+    pub fn feeds_persistent(&self, texture: MetalHandle<MTLTextureKind>) -> bool {
+        self.textures
+            .get(&texture)
+            .is_some_and(|history| history.fed_kept != 0 && history.fed_kept + 1 >= self.frame)
+    }
+
+    /// Forget everything about `texture`, which is being destroyed.
+    ///
+    /// Its address can name the next texture Metal creates, which must not
+    /// inherit this one's clears.
+    pub fn forget(&mut self, texture: MetalHandle<MTLTextureKind>) {
+        if self.textures.remove(&texture).is_some() {
+            self.generation += 1;
+        }
+    }
+
+    /// Forget every texture, at a device `Reset`.
+    ///
+    /// A `Reset` recreates the implicit surfaces and ends the application's
+    /// frame without a `Present`, so no clear before it vouches for a frame
+    /// after it.
+    pub fn clear(&mut self) {
+        self.textures.clear();
+        self.generation += 1;
     }
 }
 

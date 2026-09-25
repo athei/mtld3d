@@ -288,9 +288,10 @@ record. A knob, where one makes sense, is named with its default.
   so the draw appears once its build lands. One clear does not qualify,
   because a target cleared and drawn once, at load, is cleared exactly when
   its shaders are cold. A draw into any other target, and every draw while
-  an occlusion query counts, waits for its build. A skipped back-buffer draw
-  the application copies into a texture of its own in the same frame is
-  missing from that copy. The runner pins the knob off, so no site observes
+  an occlusion query counts, waits for its build, and so does a draw into a
+  target that was copied, read back or sampled into kept content in this or
+  the previous frame. Only the first frame of such a read can miss a skipped
+  draw. The runner pins the knob off, so no site observes
   it. Knob: `shader.asyncCompile`, default `true`.
 
 ## Range-fog coverage

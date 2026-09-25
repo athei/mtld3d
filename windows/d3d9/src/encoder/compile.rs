@@ -37,7 +37,7 @@ use mtld3d_core::{
 use mtld3d_shared::{
     MetalHandle, VertexAttrDesc,
     mtl::StageTag,
-    mtl_handle::{MTLDeviceKind, MTLRenderPipelineStateKind},
+    mtl_handle::{MTLDeviceKind, MTLRenderPipelineStateKind, MTLTextureKind},
     perf::{NanosSetTimer, PipelineTimings, ShaderTimings},
     tsc::rdtsc,
 };
@@ -47,7 +47,7 @@ use super::{
     open_or_create_cache_file,
 };
 use crate::{
-    draw::{PsSource, ShaderRef, VsSource},
+    draw::{PsSource, ShaderRef, StageBindingsPtr, VsSource},
     unix_call::unix_call,
 };
 
@@ -58,15 +58,16 @@ use crate::{
 /// the API, encoder and submit threads.
 const COMPILE_WORKERS: usize = 4;
 
-/// Stack reserved for each compile worker, a quarter of the thread default.
+/// Stack reserved for each compile worker: 1 MiB, half the thread default.
 ///
 /// A 32-bit guest's address space is what runs out first, and four workers
-/// at the default 2 MiB would reserve 8 MiB of it per device. A worker's
-/// stack holds the MSL emission and the thunk's PE half; the `unix_call`
-/// itself runs on Wine's kernel stack. The whole conformance suite built its
-/// shaders on workers with 128 KiB stacks without an overflow on either
-/// architecture, so this leaves four times that.
-const COMPILE_WORKER_STACK: usize = 512 * 1024;
+/// at the default 2 MiB would reserve 8 MiB of it per device. Wine raises
+/// every thread's stack reservation to at least 1 MiB, so asking for less
+/// would change nothing but what this constant claims; this asks for the
+/// floor explicitly, and four workers cost 4 MiB per device. The stack holds
+/// the MSL emission and the PE half of the thunk; the `unix_call` itself
+/// runs on Wine's kernel stack.
+const COMPILE_WORKER_STACK: usize = 1024 * 1024;
 
 /// The jobs waiting for a worker, and the workers' wake-up.
 ///
@@ -510,6 +511,16 @@ fn reference_tag(reference: ShaderRecordRef) -> String {
         hash: reference.key(),
     }
     .tag()
+}
+
+/// The bound targets a `draw_targets_rebuilt` answer holds for, with the history state it read.
+#[derive(PartialEq, Eq)]
+pub struct TargetsKey {
+    color: [(MetalHandle<MTLTextureKind>, u32); 4],
+    color_count: u8,
+    depth: (MetalHandle<MTLTextureKind>, u32),
+    planes: ClearPlanes,
+    generation: u64,
 }
 
 /// How the cold half of a library resolve ended on the encoder thread.
@@ -992,49 +1003,19 @@ impl FrameEncoder {
     /// Whether a draw whose build is in flight is left out of this frame.
     ///
     /// Only under `shader.asyncCompile`, never while an occlusion query
-    /// counts (the application reads that count back), and only when every
-    /// attachment the draw depends on is rebuilt each frame: each colour
-    /// target the pass attaches, and the depth and stencil planes when
-    /// `depth_used` / `stencil_used` say the draw tests or writes them. A
-    /// colour target qualifies when it is the back buffer under the discard
-    /// swap effect, which starts every frame undefined, or when a whole
-    /// clear reached it in this frame and the one before; a depth or stencil
-    /// plane only by the clears. A skip is counted and logged once; the
-    /// caller drops the draw.
+    /// counts, and only when [`Self::draw_targets_rebuilt`] holds for the
+    /// draw. A skip is counted and logged once; the caller drops the draw.
     ///
-    /// Not guarded: a skipped back-buffer draw that the application copies
-    /// into a texture of its own later in the same frame (`StretchRect` or
-    /// `GetRenderTargetData` from the back buffer) and keeps is missing
-    /// from that copy.
+    /// The occlusion guard keeps a counted draw in its count. A depth-only
+    /// draw left out before the query begins (a depth prepass) still makes
+    /// the counted draws after it pass depth tests they would have failed,
+    /// so that frame's count is high, never low: the application sees the
+    /// object as more visible for one frame.
     pub fn skip_pending_draw(&mut self, depth_used: bool, stencil_used: bool) -> bool {
         if !self.flags.contains(FrameEncoderFlags::ASYNC_COMPILE)
             || self.visibility.active_count() != 0
+            || !self.draw_targets_rebuilt(depth_used, stencil_used)
         {
-            return false;
-        }
-        let mut color = [false; 4];
-        let mut count = 0;
-        for (texture, subresource) in self.pass_state.attached_color_targets() {
-            let Some(slot) = color.get_mut(count) else {
-                break;
-            };
-            *slot = self.pass_state.is_discarded_back_buffer(texture)
-                || self
-                    .cleared_targets
-                    .regenerated(texture, subresource, ClearPlanes::COLOR);
-            count += 1;
-        }
-        let depth_texture = self.pass_state.current_depth_texture();
-        let depth_level = self.pass_state.current_depth_level();
-        let depth = depth_used.then(|| {
-            self.cleared_targets
-                .regenerated(depth_texture, depth_level, ClearPlanes::DEPTH)
-        });
-        let stencil = stencil_used.then(|| {
-            self.cleared_targets
-                .regenerated(depth_texture, depth_level, ClearPlanes::STENCIL)
-        });
-        if !may_skip_draw(&color[..count], depth, stencil) {
             return false;
         }
         mtld3d_shared::log_once_info!(
@@ -1045,6 +1026,134 @@ impl FrameEncoder {
         self.compile_stats.record_skipped_draw();
         self.perf.compilation_mut().note_skipped_draw();
         true
+    }
+
+    /// Whether everything a draw into the bound targets lands in is rebuilt every frame.
+    ///
+    /// Each colour target the pass attaches, and the depth and stencil
+    /// planes when `depth_used` / `stencil_used` say the draw tests or
+    /// writes them, has to be rebuilt every frame and read only by work that
+    /// is rebuilt every frame too. A colour target is rebuilt when it is the
+    /// back buffer under the discard swap effect, which starts every frame
+    /// undefined, or when a whole clear reached it in this frame and the one
+    /// before; a depth or stencil plane only by the clears. It is read into
+    /// kept content when this frame or the last copied out of it
+    /// (`StretchRect`, `GetRenderTargetData`) or sampled it in a draw whose
+    /// own targets are not rebuilt ([`Self::note_draw_reads`]).
+    ///
+    /// Not covered: the first frame such a kept read happens in. A draw
+    /// left out of a scratch target earlier in the same frame, before the
+    /// read that marks it, is missing from what that read makes, so a
+    /// back-buffer or scratch-target draw copied or sampled into a texture
+    /// the application keeps loses that one frame's contribution to it.
+    fn draw_targets_rebuilt(&mut self, depth_used: bool, stencil_used: bool) -> bool {
+        let key = self.targets_key(depth_used, stencil_used);
+        if let Some((memo_key, rebuilt)) = &self.rebuilt_memo
+            && *memo_key == key
+        {
+            return *rebuilt;
+        }
+        let history = &self.cleared_targets;
+        let mut color = [false; 4];
+        let count = usize::from(key.color_count);
+        for (slot, &(texture, subresource)) in color.iter_mut().zip(&key.color[..count]) {
+            *slot = (self.pass_state.is_discarded_back_buffer(texture)
+                || history.regenerated(texture, subresource, ClearPlanes::COLOR))
+                && !history.feeds_persistent(texture);
+        }
+        let (depth_texture, depth_level) = key.depth;
+        let plane_rebuilt = |plane| {
+            history.regenerated(depth_texture, depth_level, plane)
+                && !history.feeds_persistent(depth_texture)
+        };
+        let depth = depth_used.then(|| plane_rebuilt(ClearPlanes::DEPTH));
+        let stencil = stencil_used.then(|| plane_rebuilt(ClearPlanes::STENCIL));
+        let rebuilt = may_skip_draw(&color[..count], depth, stencil);
+        self.rebuilt_memo = Some((key, rebuilt));
+        rebuilt
+    }
+
+    fn targets_key(&self, depth_used: bool, stencil_used: bool) -> TargetsKey {
+        let mut color = [(MetalHandle::NULL, 0); 4];
+        let mut color_count = 0u8;
+        for (slot, target) in color
+            .iter_mut()
+            .zip(self.pass_state.attached_color_targets())
+        {
+            *slot = target;
+            color_count += 1;
+        }
+        let mut planes = ClearPlanes::empty();
+        planes.set(ClearPlanes::DEPTH, depth_used);
+        planes.set(ClearPlanes::STENCIL, stencil_used);
+        TargetsKey {
+            color,
+            color_count,
+            depth: (
+                self.pass_state.current_depth_texture(),
+                self.pass_state.current_depth_level(),
+            ),
+            planes,
+            generation: self.cleared_targets.generation(),
+        }
+    }
+
+    /// Mark the textures a draw that is not rebuilt every frame samples as feeding kept content.
+    ///
+    /// Called for every draw that is emitted, but it walks the bindings only
+    /// under `shader.asyncCompile`, while some texture has a recent clear on
+    /// record, and when the draw's own targets are not rebuilt every frame;
+    /// the answer to the last is memoised per bound target set. Only a
+    /// texture with a recent clear is marked, since no other can ever have a
+    /// draw left out of it.
+    pub fn note_draw_reads(
+        &mut self,
+        stages: &StageBindingsPtr,
+        sampled_mask: u16,
+        depth_used: bool,
+        stencil_used: bool,
+    ) {
+        if !self.flags.contains(FrameEncoderFlags::ASYNC_COMPILE)
+            || self.cleared_targets.is_empty()
+            || self.draw_targets_rebuilt(depth_used, stencil_used)
+        {
+            return;
+        }
+        let fragment = stages
+            .iter()
+            .filter(|(stage, _)| sampled_mask & (1u16 << stage) != 0)
+            .map(|(_, binding)| Some(binding.texture_id));
+        let vertex = self.vertex_tex_bindings.iter().map(|b| b.texture_id);
+        // Every fragment stage and vertex slot, so the walk allocates nothing.
+        let mut read = [MetalHandle::NULL;
+            crate::stage_bindings::STAGE_COUNT + mtld3d_core::passes::VERTEX_SAMPLER_SLOTS];
+        let mut count = 0;
+        for texture in fragment
+            .chain(vertex)
+            .flatten()
+            .filter_map(|id| self.texture_cache.get(&id).map(|state| state.views.linear))
+            .filter(|&texture| self.cleared_targets.tracks(texture))
+        {
+            let Some(slot) = read.get_mut(count) else {
+                break;
+            };
+            *slot = texture;
+            count += 1;
+        }
+        for &texture in &read[..count] {
+            self.cleared_targets.mark_feeds_persistent(texture);
+        }
+    }
+
+    /// Mark `texture` as copied into content the application may keep.
+    ///
+    /// For the source of a `StretchRect` and of a read-back. A no-op unless
+    /// `shader.asyncCompile` is on.
+    pub fn note_copy_source(&mut self, texture: MetalHandle<MTLTextureKind>) {
+        if self.flags.contains(FrameEncoderFlags::ASYNC_COMPILE) {
+            let identity = self.pass_state.identity_of(texture);
+            self.cleared_targets.mark_feeds_persistent(identity);
+        }
     }
 
     /// Block until the builds behind `tickets` are installed, doing the work where it can.

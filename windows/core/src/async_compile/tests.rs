@@ -136,10 +136,7 @@ fn a_skipped_clear_restarts_the_streak() {
     assert!(history.regenerated(rt, 0, ClearPlanes::COLOR));
     history.begin_frame();
     history.begin_frame();
-    assert!(
-        history.entries.is_empty(),
-        "stale attachments are forgotten"
-    );
+    assert!(history.is_empty(), "stale attachments are forgotten");
 }
 
 /// Planes and subresources are tracked apart, and a null texture never counts.
@@ -161,4 +158,90 @@ fn planes_and_subresources_are_separate() {
     assert!(history.regenerated(ds, 1, ClearPlanes::STENCIL));
     assert!(!history.regenerated(ds, 2, ClearPlanes::DEPTH));
     assert!(!history.regenerated(MetalHandle::NULL, 0, ClearPlanes::COLOR));
+}
+
+/// A destroyed texture's address names a new one, which inherits none of its clears.
+#[test]
+fn a_forgotten_texture_starts_over_at_its_address() {
+    let mut history = ClearHistory::new();
+    let rt = texture(0x300);
+    history.record(rt, 0, ClearPlanes::COLOR);
+    history.begin_frame();
+    history.record(rt, 0, ClearPlanes::COLOR);
+    assert!(history.regenerated(rt, 0, ClearPlanes::COLOR));
+    let before = history.generation();
+    history.forget(rt);
+    assert_ne!(
+        history.generation(),
+        before,
+        "cached answers are invalidated"
+    );
+    history.record(rt, 0, ClearPlanes::COLOR);
+    assert!(
+        !history.regenerated(rt, 0, ClearPlanes::COLOR),
+        "a one-off target at a reused address is not rebuilt every frame"
+    );
+    assert!(history.tracks(rt));
+}
+
+/// A `Reset` forgets every texture at once.
+#[test]
+fn clearing_forgets_every_texture() {
+    let mut history = ClearHistory::new();
+    let rt = texture(0x300);
+    let ds = texture(0x400);
+    for _ in 0..2 {
+        history.begin_frame();
+        history.record(rt, 0, ClearPlanes::COLOR);
+        history.record(ds, 0, ClearPlanes::DEPTH);
+    }
+    history.mark_feeds_persistent(rt);
+    history.clear();
+    assert!(history.is_empty());
+    assert!(!history.regenerated(rt, 0, ClearPlanes::COLOR));
+    assert!(!history.regenerated(ds, 0, ClearPlanes::DEPTH));
+    assert!(!history.feeds_persistent(rt));
+}
+
+/// A read into kept content holds for the frame it happened in and the next, then lapses.
+#[test]
+fn feeding_kept_content_lasts_this_frame_and_the_next() {
+    let mut history = ClearHistory::new();
+    let scratch = texture(0x500);
+    assert!(!history.feeds_persistent(scratch));
+    assert!(!history.tracks(scratch));
+    history.mark_feeds_persistent(scratch);
+    assert!(history.feeds_persistent(scratch));
+    assert!(!history.tracks(scratch), "a read is not a clear");
+    history.begin_frame();
+    assert!(history.feeds_persistent(scratch), "still the next frame");
+    history.begin_frame();
+    assert!(!history.feeds_persistent(scratch));
+    assert!(history.is_empty(), "and the texture is forgotten");
+    history.mark_feeds_persistent(MetalHandle::NULL);
+    assert!(history.is_empty());
+}
+
+/// Every change an answer depends on moves the generation; a repeat does not.
+#[test]
+fn the_generation_moves_with_every_answer_change() {
+    let mut history = ClearHistory::new();
+    let rt = texture(0x600);
+    let start = history.generation();
+    history.record(rt, 0, ClearPlanes::COLOR);
+    let recorded = history.generation();
+    assert_ne!(recorded, start);
+    history.record(rt, 0, ClearPlanes::COLOR);
+    assert_eq!(
+        history.generation(),
+        recorded,
+        "a second clear in one frame changes nothing"
+    );
+    history.mark_feeds_persistent(rt);
+    let marked = history.generation();
+    assert_ne!(marked, recorded);
+    history.mark_feeds_persistent(rt);
+    assert_eq!(history.generation(), marked);
+    history.begin_frame();
+    assert_ne!(history.generation(), marked);
 }

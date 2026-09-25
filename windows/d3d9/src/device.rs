@@ -7999,7 +7999,11 @@ fn emit_stretch_rect_blit(
     }
     // SAFETY: `src_handle` came from the encoder's texture cache or from a
     // surface's retained handle, both of which are `MTLTexture` handles.
-    enc.note_msaa_read(unsafe { MetalHandle::<MTLTextureKind>::new(src_handle) });
+    let src_texture = unsafe { MetalHandle::<MTLTextureKind>::new(src_handle) };
+    enc.note_msaa_read(src_texture);
+    // What the copy writes may be kept for good, so a draw left out of the
+    // source would be baked into it.
+    enc.note_copy_source(src_texture);
     // A source with a multisampled companion is a resolve target, and a
     // resolve the last submission stored into it must have completed before
     // this copy reads it on a device that does not order that itself.

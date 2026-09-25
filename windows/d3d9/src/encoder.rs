@@ -1318,6 +1318,12 @@ pub struct FrameEncoder {
     /// the one before. Advanced at `begin_frame` unless the previous submit
     /// was a mid-frame flush, whose frame goes on.
     cleared_targets: ClearHistory,
+    /// The last answer of `draw_targets_rebuilt`, for the targets it was asked about.
+    ///
+    /// Consecutive draws share their targets, so the reader walk of
+    /// `note_draw_reads` asks the history once per target change rather than
+    /// once per draw.
+    rebuilt_memo: Option<(compile::TargetsKey, bool)>,
     /// Pointer to the most recently shipped `CurrentSnapshot`.
     ///
     /// Lives in the per-frame `ScratchArena`. Set by
@@ -1752,6 +1758,7 @@ impl FrameEncoder {
             compile_in_flight: FxHashSet::default(),
             compile_tickets: TicketSource::new(),
             cleared_targets: ClearHistory::new(),
+            rebuilt_memo: None,
             current_snapshot: None,
             vs_constants_mirror: Box::new([[0.0; 4]; CONSTANT_ROWS]),
             ps_constants_mirror: Box::new([[0.0; 4]; CONSTANT_ROWS]),
@@ -3868,6 +3875,7 @@ impl FrameEncoder {
     /// `GetRenderTargetData` blit.
     pub fn note_color_read_back(&mut self, handle: MetalHandle<MTLTextureKind>) {
         self.pass_state.note_color_read_back(handle);
+        self.note_copy_source(handle);
     }
 
     /// Resolve `handle` now, because a blit is about to read it.
@@ -6611,9 +6619,12 @@ impl FrameEncoder {
     fn retire_texture_handle(&mut self, handle: u64) {
         // SAFETY: a `DestroyKind::Texture` retention entry carries the `.raw()`
         // of a `MetalHandle<MTLTextureKind>`, so the value is an `MTLTexture`
-        // handle. `unregister_texture` only hashes it.
-        self.pass_state
-            .unregister_texture(unsafe { MetalHandle::<MTLTextureKind>::new(handle) });
+        // handle. `unregister_texture` and `forget` only hash it.
+        let texture = unsafe { MetalHandle::<MTLTextureKind>::new(handle) };
+        self.pass_state.unregister_texture(texture);
+        // The address can name the next texture Metal creates, which must not
+        // inherit this one's clears.
+        self.cleared_targets.forget(texture);
     }
 
     /// Drain resource-retention entries whose seq has retired on the GPU.
@@ -8274,6 +8285,10 @@ impl FrameEncoder {
         // A build in flight lands before the caches' failures are forgotten
         // below, so its outcome is the one the next draw sees.
         self.finish_compiles(false);
+        // A Reset ends the application's frame without a `Present` and
+        // recreates the implicit surfaces, so no clear before it vouches for
+        // a frame after it.
+        self.cleared_targets.clear();
         let mut buffers: Vec<u64> = Vec::new();
         let mut textures: Vec<u64> = Vec::new();
         let held = self.drain_retention_and_wait(&mut buffers, &mut textures);

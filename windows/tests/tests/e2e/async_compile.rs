@@ -5,9 +5,9 @@
 //! build on a worker. A draw whose build is still in flight is left out of
 //! the frame only when its target is rebuilt every frame (the back buffer
 //! under the discard swap effect, or a target cleared in this frame and the
-//! one before) and no occlusion query is counting; a draw into any other
-//! target waits for its build. The rest of the suite runs with the option
-//! off, where every such draw waits.
+//! one before, and read by nothing kept) and no occlusion query is
+//! counting; a draw into any other target waits for its build. The rest of
+//! the suite runs with the option off, where every such draw waits.
 
 use std::time::{Duration, Instant};
 
@@ -15,7 +15,7 @@ use mtld3d_tests::{Harness, Surface, Vertex, assert_pixel_eq};
 use mtld3d_types::{
     D3D_OK, D3DFMT_A8R8G8B8, D3DFVF_DIFFUSE, D3DFVF_XYZ, D3DGETDATA_FLUSH, D3DISSUE_BEGIN,
     D3DISSUE_END, D3DLOCK_READONLY, D3DPOOL_SYSTEMMEM, D3DPT_TRIANGLELIST, D3DQUERYTYPE_OCCLUSION,
-    D3DRS_LIGHTING,
+    D3DRS_LIGHTING, D3DTEXF_NONE,
 };
 
 const ASYNC: &str = "shader.asyncCompile=true;shaderCache.enable=false";
@@ -245,5 +245,51 @@ fn a_draw_counted_by_an_occlusion_query_waits_for_its_build() {
     assert_ne!(
         samples, 0,
         "a draw the application counts is never left out of the count"
+    );
+}
+
+/// A scratch target copied into a kept one every frame is kept too, so its draw waits.
+#[test]
+fn a_draw_into_a_scratch_target_copied_into_a_kept_one_waits_for_its_build() {
+    let h = async_device();
+    let scratch = h.create_render_target(64, 64, D3DFMT_A8R8G8B8);
+    let kept = h.create_render_target(64, 64, D3DFMT_A8R8G8B8);
+    let tri = covering_triangle(RED);
+    let frame = |draw: bool| {
+        let backbuffer = h.render_target(0);
+        assert!(h.pump(), "WM_QUIT before render");
+        assert_eq!(h.begin_scene(), D3D_OK, "BeginScene");
+        assert_eq!(h.clear_target(BLUE), D3D_OK, "clear the back buffer");
+        assert_eq!(h.set_render_target(0, &scratch), D3D_OK, "bind scratch");
+        assert_eq!(h.clear_target(GREEN), D3D_OK, "clear scratch");
+        if draw {
+            assert_eq!(
+                h.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &tri),
+                D3D_OK,
+                "DrawPrimitiveUP"
+            );
+        }
+        assert_eq!(
+            h.set_render_target(0, &backbuffer),
+            D3D_OK,
+            "restore the back buffer"
+        );
+        assert_eq!(
+            h.stretch_rect(&scratch, &kept, D3DTEXF_NONE),
+            D3D_OK,
+            "copy scratch into the kept target"
+        );
+        assert_eq!(h.end_scene(), D3D_OK, "EndScene");
+        assert_eq!(h.present(), D3D_OK, "Present");
+    };
+    // Two frames make the scratch target one that is cleared every frame,
+    // and their copies make it one whose content is kept.
+    frame(false);
+    frame(false);
+    frame(true);
+    assert_pixel_eq(
+        read_rt_pixel(&h, &kept, 32, 32),
+        RED,
+        "a draw whose target is copied into kept content is never left out",
     );
 }

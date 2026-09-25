@@ -2119,6 +2119,18 @@ impl PassState {
             && matches!(self.backbuffer_contents, BackbufferContents::Undefined)
     }
 
+    /// The identity handle a view of a texture is known by: its base texture, else itself.
+    ///
+    /// An sRGB twin or a sampling view names the storage of the texture it
+    /// was made from; every record keyed on a surface uses that base.
+    #[must_use]
+    pub fn identity_of(&self, texture: MetalHandle<MTLTextureKind>) -> MetalHandle<MTLTextureKind> {
+        self.texture_view_to_base
+            .get(&texture)
+            .copied()
+            .unwrap_or(texture)
+    }
+
     /// Render target 0 and every extra target the next pass attaches, as `(texture, subresource)`.
     ///
     /// The subresource packs the slice in the low half and the level in the
