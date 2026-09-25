@@ -26,7 +26,7 @@ use mtld3d_core::{
     ff_state::{FF_VS_PALETTE_BASE_ROW, MAX_VERTEX_BLEND_MATRIX_INDEX},
     format::map_d3d_format,
     gpu_caps::GpuCaps,
-    ids::{BufferId, DepthStencilKey, ProgramId, SamplerKey, TextureId, VertexAttrsHash},
+    ids::{BufferId, DepthStencilKey, ProgramId, SamplerKey, TextureId},
     page_box::{PageBox, PageBoxRead},
     passes::{
         BackbufferContents, ColorClearOutcome, ColorLoad, DepthClearOutcome, DepthLoad, DrawWrites,
@@ -6396,18 +6396,12 @@ impl FrameEncoder {
         shaders: &ShaderRef<'_>,
         sibling: bool,
     ) -> MetalHandle<MTLRenderPipelineStateKind> {
-        let key = pipeline_state::key_from_snapshot(snapshot);
+        let key = pipeline_state::key_from_snapshot(snapshot, vertex_attrs);
         match self.pipeline_cache.lookup(&key) {
             BuildLookup::Ready(handle) => return handle,
             BuildLookup::Failed => return MetalHandle::NULL,
             BuildLookup::Unknown => {}
         }
-        // The key stands in for `vertex_attrs` by this hash alone; a caller
-        // passing another slice would build a pipeline under a colliding key.
-        debug_assert_eq!(
-            snapshot.vertex_attrs_hash,
-            VertexAttrsHash::from_attrs(vertex_attrs)
-        );
         let mut total_ns = 0;
         let total = NanosSetTimer::start(&raw mut total_ns);
         // One wire layout per used stream; lives on this frame until the

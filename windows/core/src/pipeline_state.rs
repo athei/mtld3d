@@ -214,30 +214,29 @@ impl PipelineRsBits {
 ///
 /// Not `Copy`: at 48 B this is wide enough that accidental whole-struct
 /// reads should be compile errors. `emit_draw` builds one snapshot per
-/// draw and passes it by reference to `key_from_snapshot` and
-/// `get_or_create_pipeline`. `Clone` stays for the rare explicit
-/// duplication path (currently just the no-color twin in
-/// `get_or_create_pipeline`).
+/// draw and passes it by reference to `get_or_create_pipeline`, which
+/// hands it with the draw's attribute list to `key_from_snapshot`.
+/// `Clone` stays for the rare explicit duplication path (currently just
+/// the no-color twin in `get_or_create_pipeline`).
 ///
 /// `PartialEq`/`Eq` back the encoder's single-entry resolve memo: comparing
 /// two 48 B snapshots is cheaper than rebuilding the [`PipelineKey`] (its
 /// D3D→Metal translations + the cache probe), and equality implies an
-/// identical key — [`key_from_snapshot`] is a pure function of the snapshot —
-/// so the memo can return the cached handle directly.
+/// identical key, so the memo can return the cached handle directly. The
+/// key is a pure function of the snapshot and the attribute list, and the
+/// list is a function of the declaration (`vdecl_hash`) and the vertex
+/// shader it was resolved against, whose identity `vs_fn` carries.
 #[derive(Clone, PartialEq, Eq)]
 pub struct PipelineSnapshot {
     pub vs_fn: MetalHandle<MTLFunctionKind>,
     pub ps_fn: MetalHandle<MTLFunctionKind>,
     /// Declaration identity: the FVF code, or the declaration's element hash.
     ///
-    /// Not keyed; the persisted recipe and the build diagnostics carry it.
+    /// Not keyed: the key hashes the resolved attribute list instead, since
+    /// the vertex descriptor is built from it and `stream_layouts` alone, so
+    /// two declarations that resolve alike share a pipeline. The resolve
+    /// memo, the persisted recipe and the build diagnostics read it.
     pub vdecl_hash: u64,
-    /// Hash of the attributes the draw's declaration resolves to.
-    ///
-    /// Keyed in place of `vdecl_hash`: the vertex descriptor is built from
-    /// these attributes and `stream_layouts` alone, so two declarations that
-    /// resolve alike share a pipeline.
-    pub vertex_attrs_hash: VertexAttrsHash,
     /// Vertex buffer layout per D3D9 stream, indexed by stream.
     ///
     /// Canonical: a stream the draw does not read is
@@ -464,13 +463,17 @@ pub fn vertex_layouts_from_snapshot(s: &PipelineSnapshot) -> Vec<VertexBufferLay
         .collect()
 }
 
+/// The cache key of a draw with pipeline state `s` reading `vertex_attrs`.
+///
+/// Called on a resolve-memo miss only, so the attribute hash and the blend
+/// canonicalization stay off the per-draw path.
 #[must_use]
-pub fn key_from_snapshot(s: &PipelineSnapshot) -> PipelineKey {
+pub fn key_from_snapshot(s: &PipelineSnapshot, vertex_attrs: &[VertexAttrDesc]) -> PipelineKey {
     let blend = effective_blend(&s.rs);
     PipelineKey {
         vs_fn: s.vs_fn,
         ps_fn: s.ps_fn,
-        vertex_attrs_hash: s.vertex_attrs_hash,
+        vertex_attrs_hash: VertexAttrsHash::from_attrs(vertex_attrs),
         stream_layouts: s.stream_layouts,
         blend_enable: u32::from(s.rs.blend_enable()),
         src_blend: d3d_to_metal_blend_rt(blend.src, s.color_has_alpha()),

@@ -23,7 +23,7 @@ use mtld3d_core::{
         FormatMapping, compute_mip_count, compute_mip_size, compute_volume_mip_count,
         is_dxt_format, linear_mip_size, linear_row_pitch, map_d3d_format, resolve_mip_levels,
     },
-    ids::{BufferId, ProgramId, TextureId, VertexAttrsHash},
+    ids::{BufferId, ProgramId, TextureId},
     page_box::PageBox,
     passes::{BackbufferContents, ExtraColorSlot},
     perf::{
@@ -878,7 +878,7 @@ bitflags::bitflags! {
         const STAGES      = 1 << 1;
         /// `has_depth` + `has_stencil` on the current render target.
         const RT_DS       = 1 << 3;
-        /// Vertex attribute layout (`AttrSnapshot`: attrs slice, stride, vdecl and attrs hashes).
+        /// Vertex attribute layout (`AttrSnapshot`: attrs slice, stride, vdecl hash).
         const VDECL       = 1 << 4;
         /// Pipeline variant key.
         const VARIANT     = 1 << 5;
@@ -12174,7 +12174,6 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) -> Option<CurrentSnapshotPtr> {
             extents: resolved.extents,
             used_streams: resolved.used_streams,
             vdecl_hash,
-            attrs_hash: VertexAttrsHash::from_attrs(&resolved.attrs),
         });
     }
     if let Some(v) = vs_value {

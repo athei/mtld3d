@@ -100,7 +100,6 @@ fn sample_recipe() -> PipelineRecipe {
         vs_fn: MetalHandle::NULL,
         ps_fn: MetalHandle::NULL,
         vdecl_hash: 0x1234,
-        vertex_attrs_hash: VertexAttrsHash::from_attrs(&[]),
         stream_layouts,
         color_format: PixelFormat::Bgra8Unorm,
         attach: PipelineAttachFlags::HAS_COLOR_OUTPUT | PipelineAttachFlags::COLOR_HAS_ALPHA,
@@ -334,7 +333,6 @@ fn resolved_recipe_keys_like_the_live_draw_it_recorded() {
     live.vs_fn = unsafe { MetalHandle::new(0x10) };
     // SAFETY: tests; opaque values never dereferenced.
     live.ps_fn = unsafe { MetalHandle::new(0x20) };
-    live.vertex_attrs_hash = VertexAttrsHash::from_attrs(&attrs);
     let entries = sample_entries();
     let recipe = PipelineRecipe::from_snapshot(
         ShaderRecordRef::new(entries[0].kind, entries[0].key),
@@ -346,8 +344,11 @@ fn resolved_recipe_keys_like_the_live_draw_it_recorded() {
     recipe.encode(&mut bytes);
     let decoded = PipelineRecipe::decode(&bytes).expect("decode recipe");
     assert_eq!(
-        crate::pipeline_state::key_from_snapshot(&decoded.resolve(live.vs_fn, live.ps_fn)),
-        crate::pipeline_state::key_from_snapshot(&live)
+        crate::pipeline_state::key_from_snapshot(
+            &decoded.resolve(live.vs_fn, live.ps_fn),
+            decoded.vertex_attrs()
+        ),
+        crate::pipeline_state::key_from_snapshot(&live, &attrs)
     );
 }
 
