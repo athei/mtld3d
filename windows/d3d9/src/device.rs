@@ -467,29 +467,31 @@ pub struct DeviceInner {
     /// Shared with the encoder thread and the unix completion handler.
     ///
     /// The frame's submit seq is stamped in `stamp_and_swap`; this atomic
-    /// is the *retired* seq, raised on the unix side only: the draw
-    /// command buffer's completion handler, and `wait_for_gpu_retire`
-    /// once its `waitUntilCompleted` returns, both with a `Release`
-    /// `fetch_max`. Every PE-side reader only `Acquire`-loads it, so a
-    /// read that misses a concurrent retirement is a lower bound on GPU
-    /// progress: it can make a caller more conservative, never less.
+    /// is the *retired* seq, raised on the unix side only, with a `Release`
+    /// `fetch_max`, as draw command buffers end in sequence order, each
+    /// observed by its own status (from their completion handlers and the
+    /// retirement waits), and by a failed submission's cleanup. Every
+    /// PE-side reader only `Acquire`-loads it, so a read that misses a
+    /// concurrent retirement is a lower bound on GPU progress: it can make a
+    /// caller more conservative, never less.
     coherent_seq: Arc<AtomicU64>,
     /// Texture-upload retirement seq.
     ///
-    /// `fetch_max`'d by the *upload* command buffer's completion handler (a
-    /// separate CB committed before the draw CB; see
-    /// `SubmitFrameParams::upload_coherent_seq_ptr`). Because that CB retires
-    /// ~a frame earlier than the draw CB tracked by `coherent_seq`, a texture
-    /// mip's staging reads as retired sooner, so a contended whole-mip
-    /// `LockRect` can write in place instead of renaming + preserving.
-    /// Texture-staging contention reads this; VB/IB stays on `coherent_seq`
-    /// (their backings are consumed by draws, which live in the draw CB).
+    /// Raised as the *upload* command buffers (a separate CB committed before
+    /// the draw CB; see `SubmitFrameParams::upload_coherent_seq_ptr`) end in
+    /// sequence order, and for a submission without one once no upload
+    /// buffer up to it is in flight. Because that CB retires ~a frame earlier
+    /// than the draw CB tracked by `coherent_seq`, a texture mip's staging
+    /// reads as retired sooner, so a contended whole-mip `LockRect` can write
+    /// in place instead of renaming + preserving. Texture-staging contention
+    /// reads this alone; the retention drain, VB/IB backings included, reads
+    /// the lower of the two.
     upload_coherent_seq: Arc<AtomicU64>,
     /// Highest submit seq whose command buffer the GPU aborted.
     ///
-    /// `fetch_max`'d by both completion handlers (and by
-    /// `wait_for_gpu_retire`) when a command buffer reaches
-    /// `MTLCommandBufferStatus::Error`. Kept separate from `coherent_seq`
+    /// `fetch_max`'d as a draw or upload command buffer that reached
+    /// `MTLCommandBufferStatus::Error` is retired, before the retirement
+    /// counter passes it. Kept separate from `coherent_seq`
     /// because an aborted command buffer is genuinely finished with its
     /// source memory: withholding the retirement bump instead would pin
     /// every seq-gated queue behind a seq that never retires, and

@@ -845,12 +845,10 @@ fn present_frame(record: &Arc<DeviceRecord>, queue: &ProtocolObject<dyn MTLComma
                 return;
             }
             owner.gpu_time().record(CommandBufferRole::Present, cb);
-            let status = cb.status();
-            diagnostics::completion(cb, status, Some(seq), "present-callback");
-            if status == MTLCommandBufferStatus::Error {
-                let error = cb.error();
-                diagnostics::failure(cb, Some(seq), "present-callback", error.as_deref());
-                let (code, desc) = command::command_buffer_error(error.as_deref());
+            // The completion and failure records are `retire_finished`'s,
+            // once per buffer; this names the failure for the log once.
+            if cb.status() == MTLCommandBufferStatus::Error {
+                let (code, desc) = command::command_buffer_error(cb.error().as_deref());
                 mtld3d_shared::log_once_warn_by!(
                     target: LOG_TARGET,
                     key: code,

@@ -1519,3 +1519,41 @@ fn a_counter_never_passes_a_buffer_still_running() {
     assert_eq!(coherent.load(Ordering::Acquire), 2);
     assert!(record.pending().lock().is_empty());
 }
+
+/// A wait publishes a frame without uploads that the submit-time publication had to skip.
+///
+/// The previous frame's upload buffer is still registered when a mid-frame
+/// submission with no upload buffer commits, so that submission leaves the
+/// upload counter behind. The retirement wait that follows proves every
+/// upload buffer up to the draw it waited for, so the upload counter reaches
+/// the same sequence and a gate on both counters does not stop at the older
+/// upload.
+#[test]
+fn a_retirement_wait_publishes_uploads_through_the_draw_it_waited_for() {
+    let queue = test_queue();
+    let record = test_record(&queue);
+    let coherent = AtomicU64::new(0);
+    let upload = AtomicU64::new(0);
+    let failed = AtomicU64::new(0);
+    let (draw_counter, upload_counter) = (atomic_address(&coherent), atomic_address(&upload));
+    for (counter, seq) in [(upload_counter, 1), (draw_counter, 1), (draw_counter, 2)] {
+        let cb = queue.commandBuffer().expect("buffer");
+        cb.commit();
+        record
+            .pending()
+            .lock()
+            .insert((counter, seq), PendingCmdBuf(cb));
+    }
+    publish_idle_upload(record.pending(), upload_counter, 2);
+    assert_eq!(upload.load(Ordering::Acquire), 0);
+    wait_for_gpu_retire(
+        record.pending(),
+        2,
+        draw_counter,
+        upload_counter,
+        atomic_address(&failed),
+    );
+    assert_eq!(coherent.load(Ordering::Acquire), 2);
+    assert_eq!(upload.load(Ordering::Acquire), 2);
+    assert!(record.pending().lock().is_empty());
+}

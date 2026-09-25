@@ -1045,12 +1045,14 @@ pub struct FrameEncoder {
     /// Pointer to the shared `upload_coherent_seq` atomic, copied from `FrameData`.
     ///
     /// The upload command buffer is the one that actually carries an
-    /// upload's copy, and its own completion handler is the only thing that
-    /// ever moves this counter. `coherent_seq` can be hand-advanced by
-    /// `wait_for_gpu_retire` before that handler has run, so an upload is
-    /// only settled once both counters have reached its seq. 0 means "not
-    /// yet seeded", or the defensive path where the leading blits rode the
-    /// draw command buffer instead.
+    /// upload's copy, and the draw buffer's completion does not stand for
+    /// it, so an upload, and every retention entry, is only settled once
+    /// both counters have reached its seq. The unix side moves this one as
+    /// each upload buffer ends in order, and publishes a submission without
+    /// an upload buffer once none up to it is in flight, at submit time or
+    /// at the end of a retirement wait. 0 means "not yet seeded", or the
+    /// defensive path where the leading blits rode the draw command buffer
+    /// instead.
     upload_coherent_seq_ptr: u64,
     /// `Staged` VB/IB dirty-range uploads the GPU has not acknowledged yet.
     ///
@@ -7012,13 +7014,13 @@ impl FrameEncoder {
     /// `settled_seq` is the lower of the two retirement counters: `coherent_seq`
     /// for the draw command buffer and `upload_coherent_seq` for the upload
     /// command buffer that actually carries the copies. Both matter because
-    /// `wait_for_gpu_retire` advances `coherent_seq` by hand so its caller sees
-    /// the advance synchronously, and that hand-advance can outrun the upload
-    /// handler which is the only thing that records an aborted upload. Taking
-    /// the minimum means an entry is never freed before the handler that would
-    /// have condemned it has reported in. `None` before the encoder is wired
-    /// up; the upload counter is skipped on the defensive path where the
-    /// leading blits rode the draw command buffer.
+    /// each counter names only buffers of its own kind that ended, and an
+    /// upload buffer's end, with the abort it may record, is not implied by
+    /// the draw buffer's. Taking the minimum means an entry is never freed
+    /// before the buffer that read it, or the record that would have
+    /// condemned it, is in. `None` before the encoder is wired up; the upload
+    /// counter is skipped on the defensive path where the leading blits rode
+    /// the draw command buffer. The retention drain uses the same pair.
     ///
     /// `coherent_seq` is read first: the unix side records a failure before
     /// bumping either retirement counter and both stores are `Release`, so a

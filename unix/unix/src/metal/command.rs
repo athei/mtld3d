@@ -242,7 +242,9 @@ fn register_presented_probe(
 /// `failed_submit_seq_ptr` gets the same `fetch_max` they do.
 ///
 /// A non-zero `upload_coherent_seq_ptr` extends the wait to the upload
-/// buffers up to the same sequence, waited for the same way.
+/// buffers up to the same sequence, waited for the same way, and then
+/// publishes that sequence on the upload counter once no upload buffer at or
+/// below it is registered (see [`publish_upload_through`]).
 pub fn wait_for_gpu_retire(
     pending: &PendingCmdBufs,
     target_seq: u64,
@@ -263,8 +265,17 @@ pub fn wait_for_gpu_retire(
         let found =
             first_pending(&pending.lock(), coherent_seq_ptr, target_seq).map(|(&(_, seq), _)| seq);
         let Some(through) = found else {
-            // No registered work remains for this counter. A CPU submission
-            // failure drains both counters before publishing its missing seq.
+            // No registered draw work remains, so the draw counter already
+            // stands for every draw buffer committed; the upload leg below
+            // runs up to that value. A CPU submission failure drains both
+            // counters before publishing its missing seq.
+            let through = atomic.load(Ordering::Acquire);
+            wait_for_uploads(
+                pending,
+                upload_coherent_seq_ptr,
+                through,
+                failed_submit_seq_ptr,
+            );
             return;
         };
         mtld3d_shared::crumb!("gpuretirebeg", target_seq, atomic.load(Ordering::Acquire));
@@ -278,14 +289,42 @@ pub fn wait_for_gpu_retire(
         mtld3d_shared::crumb!("gpuretireend", target_seq);
         through
     };
-    if upload_coherent_seq_ptr != 0 {
-        wait_registered(
-            pending,
-            upload_coherent_seq_ptr,
-            through,
-            failed_submit_seq_ptr,
-            "upload-retirement-wait",
-        );
+    wait_for_uploads(
+        pending,
+        upload_coherent_seq_ptr,
+        through,
+        failed_submit_seq_ptr,
+    );
+}
+
+/// The upload leg of a retirement wait: every upload buffer up to `through`, then the counter.
+fn wait_for_uploads(pending: &PendingCmdBufs, counter: u64, through: u64, failed: u64) {
+    if counter == 0 || through == 0 {
+        return;
+    }
+    wait_registered(pending, counter, through, failed, "upload-retirement-wait");
+    publish_upload_through(pending, counter, through);
+}
+
+/// Publish `through` on the upload counter once no upload buffer at or below it is registered.
+///
+/// The caller has seen every draw buffer up to `through` end or the draw
+/// counter reach it, so every submission up to `through` committed. A
+/// submission's upload buffer registers before its draw buffer, on the one
+/// thread that registers either, so every upload buffer up to `through` has
+/// registered too; none left in the map means each of them ended. Submissions
+/// in that range that had no upload buffer are then covered, which the
+/// submit-time publication skips while an earlier upload buffer is in flight.
+/// Without this a retention gate on both counters would stay at that earlier
+/// upload's sequence after a wait that proved everything up to `through`.
+fn publish_upload_through(pending: &PendingCmdBufs, counter: u64, through: u64) {
+    let map = pending.lock();
+    if map
+        .range((counter, 0)..=(counter, through))
+        .next()
+        .is_none()
+    {
+        advance_counter(counter, through);
     }
 }
 
@@ -351,45 +390,47 @@ pub fn ended(cb: &ProtocolObject<dyn MTLCommandBuffer>) -> bool {
 /// the PE side may free the counters; a second retirer, a late handler of an
 /// entry another one already retired, then finds the entry gone and writes
 /// nothing.
+///
+/// The diagnostics of what was retired are logged after the lock is released.
 pub fn retire_finished(
     pending: &PendingCmdBufs,
     counter: u64,
     failed_submit_seq_ptr: u64,
     site: &str,
 ) {
-    let mut map = pending.lock();
-    loop {
-        let Some((&key, entry)) = map.range((counter, 0)..=(counter, u64::MAX)).next() else {
-            return;
-        };
-        if !ended(&entry.0) {
-            return;
+    let mut retired = Vec::new();
+    {
+        let mut map = pending.lock();
+        while let Some((&key, entry)) = map.range((counter, 0)..=(counter, u64::MAX)).next() {
+            if !ended(&entry.0) {
+                break;
+            }
+            record_failed_submit(&entry.0, key.1, failed_submit_seq_ptr);
+            advance_counter(counter, key.1);
+            if let Some(entry) = map.remove(&key) {
+                retired.push((key.1, entry.0));
+            }
         }
-        let _ = record_failed_submit(&entry.0, key.1, failed_submit_seq_ptr, site);
-        advance_counter(counter, key.1);
-        let _ = map.remove(&key);
+    }
+    for (seq, cb) in &retired {
+        let status = cb.status();
+        diagnostics::completion(cb, status, Some(*seq), site);
+        if status == MTLCommandBufferStatus::Error {
+            diagnostics::failure(cb, Some(*seq), site, cb.error().as_deref());
+        }
     }
 }
 
 /// `fetch_max` an aborted command buffer's seq into the PE-side failed-submit counter.
 ///
-/// Returns the Metal error's `(code, localizedDescription)` when the
-/// command buffer failed, so the caller can name it in its own tripwire,
-/// and `None` when it completed normally. A `failed_submit_seq_ptr` of 0
-/// (a frame stamped before the atomic was wired) records nothing and
-/// still reports the error.
+/// Nothing for a buffer that completed normally. A `failed_submit_seq_ptr`
+/// of 0 (a frame stamped before the atomic was wired) records nothing.
 fn record_failed_submit(
     cb: &ProtocolObject<dyn MTLCommandBuffer>,
     seq: u64,
     failed_submit_seq_ptr: u64,
-    site: &str,
-) -> Option<(u64, String)> {
-    let status = cb.status();
-    diagnostics::completion(cb, status, Some(seq), site);
-    if status != MTLCommandBufferStatus::Error {
-        return None;
-    }
-    if failed_submit_seq_ptr != 0 {
+) {
+    if cb.status() == MTLCommandBufferStatus::Error && failed_submit_seq_ptr != 0 {
         // SAFETY: the PE side allocated an `Arc<AtomicU64>` and passed its
         // pointer. The Arc is kept alive for the device's lifetime, and all
         // command buffers that reference it are drained on device teardown
@@ -397,9 +438,6 @@ fn record_failed_submit(
         let atomic = unsafe { &*(failed_submit_seq_ptr as *const AtomicU64) };
         atomic.fetch_max(seq, Ordering::Release);
     }
-    let error = cb.error();
-    diagnostics::failure(cb, Some(seq), site, error.as_deref());
-    Some(command_buffer_error(error.as_deref()))
 }
 
 /// Preserve the driver description shared by frame and readback failure diagnostics.
