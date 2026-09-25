@@ -224,3 +224,28 @@ fn params_translate_the_default_state() {
     assert_eq!(params.front, params.back, "one-sided default");
     assert_eq!(params.id, key_from_snapshot(&s).raw());
 }
+
+#[test]
+fn only_a_test_that_can_fail_or_a_write_uses_depth() {
+    let with = |enable: u32, write: u32, func: u32| DepthStencilSnapshot {
+        depth_enable: narrow(enable),
+        depth_write: narrow(write),
+        depth_func: narrow(func),
+        ..DepthStencilSnapshot::inert()
+    };
+    assert!(!DepthStencilSnapshot::inert().uses_depth(), "depth off");
+    assert!(
+        !with(0, 1, D3DCMP_LESSEQUAL).uses_depth(),
+        "ZENABLE off gates the rest"
+    );
+    assert!(
+        !with(1, 0, D3DCMP_ALWAYS).uses_depth(),
+        "always passes, writes nothing"
+    );
+    assert!(with(1, 1, D3DCMP_ALWAYS).uses_depth(), "writes depth");
+    assert!(with(1, 0, D3DCMP_LESSEQUAL).uses_depth(), "reads depth");
+    assert!(
+        DepthStencilSnapshot::depth_overwrite().uses_depth(),
+        "depth clear-quad"
+    );
+}

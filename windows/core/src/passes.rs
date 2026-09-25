@@ -134,8 +134,12 @@ const ENABLE_FIRST_USE_STENCIL_DONTCARE: bool = true;
 /// bandwidth it saves on a tile-based GPU; a game that tests against depth
 /// or stencil left from an earlier frame without clearing it reads undefined
 /// values. Depth that is sampleable or has been bound as a texture keeps
-/// `Store`. The rationale and the sites it costs are in the Kept divergences
-/// section of `unix/conformance/CONFORMANCE.md`. Flipping this alone does not
+/// `Store`. The same discard reaches back over the texture's trailing passes
+/// that neither read nor write depth or stencil (an interface pass with the
+/// depth test off or always passing), since nothing in the frame reads what
+/// the pass before them stores; that part is not a divergence. The rationale
+/// and the sites it costs are in the Kept divergences section of
+/// `unix/conformance/CONFORMANCE.md`. Flipping this alone does not
 /// carry depth across `Present`: [`ENABLE_FIRST_USE_DONTCARE`] and
 /// [`ENABLE_FIRST_USE_STENCIL_DONTCARE`] discard it again on the next frame's
 /// first use.
@@ -178,11 +182,13 @@ const ENABLE_UNWRITTEN_STENCIL_DONTCARE: bool = true;
 
 /// Compile-time gate for discarding the depth loads of a pass that never uses depth.
 ///
-/// A pass whose draws and clear-quads neither test nor write depth or
+/// A pass whose draws and clear-quads neither read nor write depth or
 /// stencil, and whose store of a plane is already `DontCare`, loads that
 /// plane `DontCare` instead of `Load`: nothing inside the pass reads it and
-/// nothing after it can. Typical case: an interface pass drawn over the scene
-/// with the depth test off, on the depth surface's last pass of the frame.
+/// nothing after it can. A depth test that always passes with depth writes
+/// off reads nothing. Typical case: an interface pass drawn over the scene
+/// with the depth test off or always passing, on the depth surface's last
+/// pass of the frame.
 /// Flip to `false` if a game surfaces that reads depth in a pass through a
 /// draw path that does not report its depth-stencil state.
 const ENABLE_UNUSED_DEPTH_LOAD_DONTCARE: bool = true;
@@ -3016,21 +3022,23 @@ impl PassState {
     /// `depth_stencil` is the state the draw runs with, already gated on the
     /// stencil plane the pass attaches, and `attach` carries the planes the
     /// pipeline declares (`HAS_DEPTH`, `HAS_STENCIL`). Tags the pass `USED`
-    /// when the draw enables the depth or the stencil test on a plane it
-    /// attaches, and `STENCIL_WRITTEN` when it can change stencil. Opens a
-    /// pass first if none is live (mirrors the `emit_command` contract).
+    /// when the draw reads or writes depth (`DepthStencilSnapshot::uses_depth`:
+    /// a test that always passes without a depth write does neither) or
+    /// enables the stencil test on a plane it attaches, and `STENCIL_WRITTEN`
+    /// when it can change stencil. Opens a pass first if none is live (mirrors
+    /// the `emit_command` contract).
     pub fn note_draw_depth_stencil(
         &mut self,
         depth_stencil: &DepthStencilSnapshot,
         attach: PipelineAttachFlags,
     ) {
         self.ensure_pass_open();
-        let tests_depth =
-            attach.contains(PipelineAttachFlags::HAS_DEPTH) && depth_stencil.depth_enable != 0;
+        let uses_depth =
+            attach.contains(PipelineAttachFlags::HAS_DEPTH) && depth_stencil.uses_depth();
         let tests_stencil =
             attach.contains(PipelineAttachFlags::HAS_STENCIL) && depth_stencil.stencil_enable != 0;
         if let Some(pass) = self.passes.last_mut() {
-            if tests_depth || tests_stencil {
+            if uses_depth || tests_stencil {
                 pass.depth_flags.insert(PassDepthFlags::USED);
             }
             if draw_writes_stencil(depth_stencil, attach) {
@@ -5524,7 +5532,7 @@ impl PassState {
         }
     }
 
-    /// Rule B — flip `depth_store` to `DontCare` on each depth attachment's *last* pass.
+    /// Rules B and C: discard the stores nothing later reads.
     ///
     /// Scoped to this frame. D3D9 keeps depth and stencil across `Present`
     /// unless the game set `D3DPRESENTFLAG_DISCARD_DEPTHSTENCIL` or created
@@ -5548,8 +5556,10 @@ impl PassState {
     /// the unix-side thunk is dispatched.
     ///
     /// Each rule is one reverse walk over `passes`:
-    /// - Rule B: the first pass we see with a given `depth_texture` is
-    ///   the last in forward order; flip and mark handled.
+    /// - Rule B (`discard_last_depth_stores`): the first pass we see with a
+    ///   given `depth_texture` is the last in forward order; flip it, and
+    ///   keep flipping earlier passes on the texture while every pass after
+    ///   them uses neither depth nor stencil.
     /// - Rule C: maintain `next_color_use: HashMap<u64, usize>` from
     ///   color texture to the most-recently-seen pass (i.e. the next
     ///   in forward order). For pass `i`, if `next_color_use[i.color]`
@@ -5574,42 +5584,7 @@ impl PassState {
     /// resolves, which on a presenting submit also drop the back buffer's samples.
     pub fn finalize_store_actions(&mut self, frame_continues: bool) {
         if ENABLE_LAST_USE_DEPTH_DONTCARE && !frame_continues {
-            let mut handled: FxHashSet<MetalHandle<MTLTextureKind>> =
-                FxHashSet::with_capacity_and_hasher(self.seen_depth_rts.len(), FxBuildHasher);
-            for pass in self.passes.iter_mut().rev() {
-                if pass.depth_texture.is_null() {
-                    continue;
-                }
-                if handled.insert(pass.depth_texture) {
-                    if pass.depth_flags.contains(PassDepthFlags::SAMPLEABLE) {
-                        if log_enabled!(target: TRACE_TARGET, Level::Trace) {
-                            trace!(
-                                target: TRACE_TARGET,
-                                "pass-store depth={:#x} → keep Store (sampleable shadow map)",
-                                pass.depth_texture,
-                            );
-                        }
-                    } else if self.seen_sampled_textures.contains(&pass.depth_texture) {
-                        if log_enabled!(target: TRACE_TARGET, Level::Trace) {
-                            trace!(
-                                target: TRACE_TARGET,
-                                "pass-store depth={:#x} → keep Store (ever sampled)",
-                                pass.depth_texture,
-                            );
-                        }
-                    } else {
-                        pass.depth_store = StoreAction::DontCare;
-                        pass.stencil_store = StoreAction::DontCare;
-                        if log_enabled!(target: TRACE_TARGET, Level::Trace) {
-                            trace!(
-                                target: TRACE_TARGET,
-                                "pass-store depth={:#x} → DontCare (last-use)",
-                                pass.depth_texture,
-                            );
-                        }
-                    }
-                }
-            }
+            self.discard_last_depth_stores();
         }
         if ENABLE_NEXT_CLEAR_COLOR_DONTCARE {
             // Value: `(pass index, attachment slot)` of the next use in
@@ -5651,6 +5626,71 @@ impl PassState {
             self.discard_unused_depth_loads();
         }
         self.assign_multisample_resolves(!frame_continues);
+    }
+
+    /// Rule B: discard the depth and stencil stores nothing later in the frame reads.
+    ///
+    /// Walked back to front. A depth texture's last pass discards both
+    /// stores. So does an earlier pass on it when every later pass on the
+    /// texture discards its stores and leaves depth and stencil unused (not
+    /// tagged `USED`), and nothing running in between touches the texture
+    /// (`depth_touched_between`): those later passes read nothing of what it
+    /// stores, and `discard_unused_depth_loads` then drops their loads too.
+    /// The chain stops at the first pass from the end that uses a plane,
+    /// which keeps its `Store` for the passes before it. Sampleable and
+    /// ever-sampled textures keep every store: a sampler, a blit source or a
+    /// readback reads device memory. The caller skips this on a mid-frame
+    /// flush, where the frame goes on.
+    fn discard_last_depth_stores(&mut self) {
+        // Value: the next pass on the texture in forward order while every
+        // pass on it from there on discards its stores and uses neither plane,
+        // `None` once one of them keeps a store or uses a plane.
+        let mut unused_tail: FxHashMap<MetalHandle<MTLTextureKind>, Option<usize>> =
+            FxHashMap::with_capacity_and_hasher(self.seen_depth_rts.len(), FxBuildHasher);
+        for i in (0..self.passes.len()).rev() {
+            let texture = self.passes[i].depth_texture;
+            if texture.is_null() {
+                continue;
+            }
+            let reason = match unused_tail.get(&texture) {
+                None => Some("last-use"),
+                Some(&Some(next)) if !self.depth_touched_between(i, next, texture) => {
+                    Some("later passes never use depth")
+                }
+                Some(_) => None,
+            };
+            let pass = &mut self.passes[i];
+            let mut discarded = false;
+            if let Some(reason) = reason {
+                if pass.depth_flags.contains(PassDepthFlags::SAMPLEABLE) {
+                    if log_enabled!(target: TRACE_TARGET, Level::Trace) {
+                        trace!(
+                            target: TRACE_TARGET,
+                            "pass-store depth={texture:#x} → keep Store (sampleable shadow map)",
+                        );
+                    }
+                } else if self.seen_sampled_textures.contains(&texture) {
+                    if log_enabled!(target: TRACE_TARGET, Level::Trace) {
+                        trace!(
+                            target: TRACE_TARGET,
+                            "pass-store depth={texture:#x} → keep Store (ever sampled)",
+                        );
+                    }
+                } else {
+                    pass.depth_store = StoreAction::DontCare;
+                    pass.stencil_store = StoreAction::DontCare;
+                    discarded = true;
+                    if log_enabled!(target: TRACE_TARGET, Level::Trace) {
+                        trace!(
+                            target: TRACE_TARGET,
+                            "pass-store idx={i} depth={texture:#x} → DontCare ({reason})",
+                        );
+                    }
+                }
+            }
+            let unused = discarded && !pass.depth_flags.contains(PassDepthFlags::USED);
+            unused_tail.insert(texture, unused.then_some(i));
+        }
     }
 
     /// Rule C's depth arm: discard a depth or stencil store the next pass on that plane clears.
