@@ -1247,6 +1247,9 @@ fn resolve_libraries_slow(
     shaders: &ShaderRef<'_>,
     planes: ClearPlanes,
 ) -> Option<(StageLibHandles, StageLibHandles)> {
+    // A build finished since the last frame began may be the one this draw
+    // needs; the probes below see it once installed.
+    enc.drain_compile_results();
     let mut waited = false;
     loop {
         let vs_resolved = enc.resolve_vs_library(shaders.vs);
@@ -1339,6 +1342,11 @@ fn resolve_pipeline_slow(
         planes,
     } = retry;
     let mut resolved = first;
+    if matches!(resolved, Resolution::Pending(_)) {
+        // As for the libraries: install what finished, then look again.
+        enc.drain_compile_results();
+        resolved = enc.get_or_create_pipeline(snapshot, attrs, shaders);
+    }
     let mut waited = false;
     loop {
         match resolved {
@@ -1807,10 +1815,9 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
     // 2. Resolve the VS and PS libraries. The hot path is a borrow-probe of
     //    the source-keyed index (no per-draw content hash, no clone); the
     //    `disk_key` Xxh3 + warm-cache bridge + enqueue happen lazily inside,
-    //    only on a miss (~once per shader). Builds finished since the last
-    //    draw are installed first, so the probes see them.
+    //    only on a miss (~once per shader). A build still in flight sends
+    //    the draw to the slow path, which installs finished builds first.
     let t_lookup = CycleAddTimer::start(enc.op_sub_detail_ptr(OpSubDetail::RLookup));
-    enc.drain_compile_results();
     let libraries = match enc.resolve_vs_library(vs) {
         Resolution::Ready(vs_handles) => match enc.resolve_ps_library(ps, ps_variant) {
             Resolution::Ready(ps_handles) => Some((vs_handles, ps_handles)),

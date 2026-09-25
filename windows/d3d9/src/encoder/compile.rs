@@ -19,7 +19,9 @@ use std::{
 
 use log::{Level, debug, error, log_enabled, trace, warn};
 use mtld3d_core::{
-    async_compile::{ClearPlanes, CompileLanes, JobTicket, Resolution, may_skip_draw},
+    async_compile::{
+        ClearPlanes, CompileLanes, JobTicket, Resolution, mark_kept_reads, may_skip_draw,
+    },
     build_index::BuildLookup,
     dxso::{
         DxsoProgram, FfPsKey, FfVsKey, LOG_TARGET as MSL_TRACE_TARGET, VariantKey, VsSamplerKinds,
@@ -39,7 +41,7 @@ use mtld3d_shared::{
     mtl::StageTag,
     mtl_handle::{MTLDeviceKind, MTLRenderPipelineStateKind, MTLTextureKind},
     perf::{NanosSetTimer, PipelineTimings, ShaderTimings},
-    tsc::rdtsc,
+    tsc::{rdtsc, secs_to_cycles},
 };
 
 use super::{
@@ -57,6 +59,9 @@ use crate::{
 /// keep a burst's libraries compiling side by side while leaving cores for
 /// the API, encoder and submit threads.
 const COMPILE_WORKERS: usize = 4;
+
+/// Seconds a build may stay in flight before the encoder warns that it looks stuck.
+const STALLED_BUILD_SECS: u64 = 5;
 
 /// Stack reserved for each compile worker: 1 MiB, half the thread default.
 ///
@@ -527,8 +532,10 @@ pub struct StretchCopyTargets {
 enum Begun {
     /// The warm cache already holds the library.
     Bridged(StageLibHandles),
-    /// A worker is building it under this ticket.
+    /// A worker is building it under this ticket, queued by this miss.
     Queued(JobTicket),
+    /// A worker was already building it under this ticket.
+    Pending(JobTicket),
     /// It cannot be built at all.
     Failed,
 }
@@ -566,7 +573,6 @@ impl FrameEncoder {
         match known {
             BuildLookup::Ready(handles) => return Resolution::Ready(handles),
             BuildLookup::Failed => return Resolution::Failed,
-            BuildLookup::Pending(ticket) => return Resolution::Pending(ticket),
             BuildLookup::Unknown => {}
         }
         self.resolve_vs_library_miss(source)
@@ -593,29 +599,7 @@ impl FrameEncoder {
                 self.record_vs_library(source, None);
                 Resolution::Failed
             }
-            Begun::Queued(ticket) => {
-                match source {
-                    VsSource::FixedFunction { key, .. } => {
-                        self.ff_vs_libs.mark_pending(key.clone(), ticket);
-                    }
-                    VsSource::Programmable {
-                        vs_id,
-                        provided_input_mask,
-                        clip_plane_count,
-                        sampler_kinds,
-                        ..
-                    } => self.prog_vs_libs.mark_pending(
-                        (
-                            *vs_id,
-                            *provided_input_mask,
-                            *clip_plane_count,
-                            *sampler_kinds,
-                        ),
-                        ticket,
-                    ),
-                }
-                Resolution::Pending(ticket)
-            }
+            Begun::Queued(ticket) | Begun::Pending(ticket) => Resolution::Pending(ticket),
         };
         drop(miss);
         self.perf.compilation_mut().note_miss(miss_ns);
@@ -676,6 +660,9 @@ impl FrameEncoder {
             return Begun::Failed;
         };
         let reference = ShaderRecordRef::new(kind, disk_key);
+        if let Some(&ticket) = self.pending_libs.get(&reference) {
+            return Begun::Pending(ticket);
+        }
         if let Some(&handles) = self.lib_cache.get(&reference) {
             return Begun::Bridged(handles);
         }
@@ -727,7 +714,6 @@ impl FrameEncoder {
         match known {
             BuildLookup::Ready(handles) => return Resolution::Ready(handles),
             BuildLookup::Failed => return Resolution::Failed,
-            BuildLookup::Pending(ticket) => return Resolution::Pending(ticket),
             BuildLookup::Unknown => {}
         }
         self.resolve_ps_library_miss(source, variant)
@@ -758,19 +744,7 @@ impl FrameEncoder {
                 self.record_ps_library(source, variant, None);
                 Resolution::Failed
             }
-            Begun::Queued(ticket) => {
-                match source {
-                    PsSource::FixedFunction { key, .. } => self
-                        .ff_ps_libs
-                        .entry(key.clone())
-                        .or_default()
-                        .mark_pending(variant, ticket),
-                    PsSource::Programmable { ps_id, .. } => {
-                        self.prog_ps_libs.mark_pending((*ps_id, variant), ticket);
-                    }
-                }
-                Resolution::Pending(ticket)
-            }
+            Begun::Queued(ticket) | Begun::Pending(ticket) => Resolution::Pending(ticket),
         };
         drop(miss);
         self.perf.compilation_mut().note_miss(miss_ns);
@@ -822,6 +796,9 @@ impl FrameEncoder {
             return Begun::Failed;
         };
         let reference = ShaderRecordRef::new(kind, disk_key);
+        if let Some(&ticket) = self.pending_libs.get(&reference) {
+            return Begun::Pending(ticket);
+        }
         if let Some(&handles) = self.lib_cache.get(&reference) {
             return Begun::Bridged(handles);
         }
@@ -847,7 +824,9 @@ impl FrameEncoder {
             device: self.device_handle,
             persist: self.cache_persists(),
         };
-        self.enqueue(CompileJob::Library(job))
+        let ticket = self.enqueue(CompileJob::Library(job));
+        self.pending_libs.insert(reference, ticket);
+        ticket
     }
 
     /// Look up or queue an `MTLRenderPipelineState` for the given pipeline state snapshot.
@@ -929,8 +908,10 @@ impl FrameEncoder {
         match self.pipeline_cache.lookup(&key) {
             BuildLookup::Ready(handle) => return Resolution::Ready(handle),
             BuildLookup::Failed => return Resolution::Failed,
-            BuildLookup::Pending(ticket) => return Resolution::Pending(ticket),
             BuildLookup::Unknown => {}
+        }
+        if let Some(&ticket) = self.pending_pipelines.get(&key) {
+            return Resolution::Pending(ticket);
         }
         let mut miss_ns = 0;
         let miss = NanosSetTimer::start(&raw mut miss_ns);
@@ -951,7 +932,7 @@ impl FrameEncoder {
             persist: self.cache_persists(),
         };
         let ticket = self.enqueue(CompileJob::Pipeline(Box::new(job)));
-        self.pipeline_cache.mark_pending(key, ticket);
+        self.pending_pipelines.insert(key, ticket);
         drop(miss);
         self.perf.compilation_mut().note_miss(miss_ns);
         Resolution::Pending(ticket)
@@ -992,14 +973,10 @@ impl FrameEncoder {
 
     fn enqueue(&mut self, job: CompileJob) -> JobTicket {
         let ticket = self.compile_tickets.issue();
-        self.compile_in_flight.insert(ticket);
-        self.compile_queue.push(
-            ticket,
-            QueuedJob {
-                job,
-                enqueued_tsc: rdtsc(),
-            },
-        );
+        let enqueued_tsc = rdtsc();
+        self.compile_in_flight.insert(ticket, enqueued_tsc);
+        self.compile_queue
+            .push(ticket, QueuedJob { job, enqueued_tsc });
         let pending = self.compile_in_flight.len();
         self.perf.compilation_mut().note_pending(pending);
         ticket
@@ -1007,14 +984,35 @@ impl FrameEncoder {
 
     /// Install every build the workers have finished, without waiting.
     ///
-    /// Called at `begin_frame` and at the top of every draw while a build is
-    /// in flight, so a finished build serves the very next draw that needs
-    /// it. Installing is bookkeeping only; the slow work happened on the
+    /// Called at `begin_frame` and by a draw whose probe found a build in
+    /// flight, before it decides, so a finished build serves the next draw
+    /// that needs it and a draw whose builds are done never pays for the
+    /// check. Installing is bookkeeping only; the slow work happened on the
     /// worker.
     #[inline]
     pub fn drain_compile_results(&mut self) {
         if !self.compile_in_flight.is_empty() {
             self.drain_compile_results_pending();
+        }
+    }
+
+    /// Warn once when a build has been in flight for longer than any compile takes.
+    ///
+    /// Called at `begin_frame`, and costs nothing while no build is in
+    /// flight. A compiler service that hangs would otherwise leave the draws
+    /// that need its build out of every frame with only the one info line
+    /// that announced the first skip.
+    pub fn check_stalled_compiles(&self) {
+        let Some(&oldest) = self.compile_in_flight.values().min() else {
+            return;
+        };
+        if rdtsc().saturating_sub(oldest) > secs_to_cycles(STALLED_BUILD_SECS) {
+            mtld3d_shared::log_once_warn!(
+                target: LOG_TARGET,
+                "encoder: a shader or pipeline build has been in flight for over \
+                 {STALLED_BUILD_SECS} s; the draws that need it are left out or wait \
+                 until it lands"
+            );
         }
     }
 
@@ -1066,17 +1064,15 @@ impl FrameEncoder {
     /// when it is the back buffer under the discard swap effect, which
     /// starts every frame undefined, or when a whole clear reached it in
     /// this frame and the one before; a depth or stencil plane only by the
-    /// clears. It is read into kept content when this frame or the last
-    /// copied out of it with a `StretchRect` into a target that is not
-    /// rebuilt, or sampled it in a pass whose own targets are not rebuilt
-    /// ([`Self::note_frame_reads`]). A read-back to system memory is not such
-    /// a read ([`Self::note_copy_source`] says why).
+    /// clears. It is read into kept content when one of the last
+    /// `FEED_MEMORY_FRAMES` copied out of it with a `StretchRect` into a
+    /// target that is not rebuilt, or sampled it in a pass whose own targets
+    /// are not rebuilt ([`Self::note_frame_reads`]). A read-back to system
+    /// memory is not such a read ([`Self::note_copy_source`] says why).
     ///
-    /// Not covered: the first frame such a kept read happens in. A draw
-    /// left out of a scratch target earlier in the same frame, before the
-    /// read that marks it, is missing from what that read makes, so a
-    /// back-buffer or scratch-target draw copied or sampled into a texture
-    /// the application keeps loses that one frame's contribution to it.
+    /// Not covered: the first frame such a kept read happens in. Its marks
+    /// are made when the frame is submitted, so a draw left out of a scratch
+    /// target in that frame is missing from what the read makes.
     fn targets_rebuilt(&self, planes: ClearPlanes) -> bool {
         let history = &self.cleared_targets;
         let mut color = [false; 4];
@@ -1107,79 +1103,17 @@ impl FrameEncoder {
 
     /// Mark the textures the passes of this submission read into kept targets.
     ///
-    /// Called once per submission, before its passes are taken. The pass
-    /// state records every texture bind with the pass it belongs to while
-    /// `shader.asyncCompile` is on; a pass whose colour targets or depth
-    /// plane are not rebuilt every frame is kept, and each texture it read
-    /// that has a recent clear is marked as feeding kept content, for this
-    /// frame and the next. No other texture can ever have a draw left out
-    /// of it. The work is per bind and per pass, never per draw, and a
-    /// frame's marks are made at its end, so the frame after a kept read
-    /// first appears is the first one they protect.
+    /// Called once per submission, after its last pass closed and before
+    /// any pass rule removes or merges a pass, so the recorded bind-to-pass
+    /// indices still name the passes they were recorded against. The pass
+    /// state records every texture bind with its pass while
+    /// `shader.asyncCompile` is on (one push per bind command, never per
+    /// draw); `mtld3d_core::async_compile::mark_kept_reads` judges them.
+    /// A frame's marks are made at its end, so a kept read protects the
+    /// frames after the one it first happens in.
     pub fn note_frame_reads(&mut self) {
-        if self.pass_state.pass_reads().is_empty() {
-            return;
-        }
-        if self.cleared_targets.is_empty() {
-            self.pass_state.clear_pass_reads();
-            return;
-        }
-        let mut marks = core::mem::take(&mut self.read_marks);
-        marks.clear();
-        let mut verdict: Option<(usize, bool)> = None;
-        for &(pass, texture) in self.pass_state.pass_reads() {
-            if !self.cleared_targets.tracks(texture) {
-                continue;
-            }
-            let kept = match verdict {
-                Some((judged, kept)) if judged == pass => kept,
-                _ => {
-                    let kept = self.pass_is_kept(pass);
-                    verdict = Some((pass, kept));
-                    kept
-                }
-            };
-            if kept {
-                marks.push(texture);
-            }
-        }
-        for &texture in &marks {
-            self.cleared_targets.mark_feeds_persistent(texture);
-        }
-        self.read_marks = marks;
+        mark_kept_reads(&self.pass_state, &mut self.cleared_targets);
         self.pass_state.clear_pass_reads();
-    }
-
-    /// Whether the recorded pass `index` writes into a target that is not rebuilt every frame.
-    fn pass_is_kept(&self, index: usize) -> bool {
-        let Some(pass) = self.pass_state.passes().get(index) else {
-            return false;
-        };
-        let history = &self.cleared_targets;
-        let color_rebuilt = |texture: MetalHandle<MTLTextureKind>, subresource: u32| {
-            (self.pass_state.is_discarded_back_buffer(texture)
-                || history.regenerated(texture, subresource, ClearPlanes::COLOR))
-                && !history.feeds_persistent(texture)
-        };
-        let rt0 = pass.color_texture();
-        if !rt0.is_null() && !color_rebuilt(rt0, pass.color_slice() | (pass.color_level() << 16)) {
-            return true;
-        }
-        let extra_kept = pass
-            .extra_color()
-            .iter()
-            .filter(|attachment| attachment.is_bound())
-            .any(|attachment| {
-                !color_rebuilt(
-                    attachment.texture(),
-                    attachment.slice() | (attachment.level() << 16),
-                )
-            });
-        let depth = pass.depth_texture();
-        let depth_rebuilt = depth.is_null()
-            || (history.regenerated(depth, pass.depth_level(), ClearPlanes::DEPTH)
-                && !history.feeds_persistent(depth));
-        extra_kept || !depth_rebuilt
     }
 
     /// Account a `StretchRect` from `copy.src` into `copy.dst`.
@@ -1238,13 +1172,13 @@ impl FrameEncoder {
         let timer = NanosSetTimer::start(&raw mut wait_ns);
         let mut stolen = 0u64;
         for &ticket in tickets {
-            if self.compile_in_flight.contains(&ticket) {
+            if self.compile_in_flight.contains_key(&ticket) {
                 self.compile_queue.promote(ticket);
             }
         }
         while tickets
             .iter()
-            .any(|ticket| self.compile_in_flight.contains(ticket))
+            .any(|ticket| self.compile_in_flight.contains_key(ticket))
         {
             let unstarted = tickets
                 .iter()
@@ -1260,7 +1194,7 @@ impl FrameEncoder {
                 let waited = tickets.contains(&result.ticket);
                 self.install_compile(result, waited);
             } else {
-                error!(
+                mtld3d_shared::log_once_warn!(
                     target: LOG_TARGET,
                     "encoder: every compile worker is gone with {} build(s) in flight; \
                      the draws that need them are dropped",
@@ -1390,29 +1324,26 @@ impl FrameEncoder {
                 identity,
             );
         }
+        self.pending_libs.remove(&reference);
         match input {
-            LibraryInput::FixedFunctionVs { key } => {
-                self.ff_vs_libs.complete(&key, handles);
-            }
+            LibraryInput::FixedFunctionVs { key } => self.ff_vs_libs.record(key, handles),
             LibraryInput::ProgrammableVs {
                 vs_id,
                 provided_input_mask,
                 clip_plane_count,
                 sampler_kinds,
                 ..
-            } => {
-                self.prog_vs_libs.complete(
-                    &(vs_id, provided_input_mask, clip_plane_count, sampler_kinds),
-                    handles,
-                );
-            }
-            LibraryInput::FixedFunctionPs { key, variant } => {
-                if let Some(variants) = self.ff_ps_libs.get_mut(&key) {
-                    variants.complete(&variant, handles);
-                }
-            }
+            } => self.prog_vs_libs.record(
+                (vs_id, provided_input_mask, clip_plane_count, sampler_kinds),
+                handles,
+            ),
+            LibraryInput::FixedFunctionPs { key, variant } => self
+                .ff_ps_libs
+                .entry(key)
+                .or_default()
+                .record(variant, handles),
             LibraryInput::ProgrammablePs { ps_id, variant, .. } => {
-                self.prog_ps_libs.complete(&(ps_id, variant), handles);
+                self.prog_ps_libs.record((ps_id, variant), handles);
             }
         }
     }
@@ -1500,7 +1431,8 @@ impl FrameEncoder {
                 ps.tag()
             );
         }
-        self.pipeline_cache.complete(&key, handle);
+        self.pending_pipelines.remove(&key);
+        self.pipeline_cache.record(key, handle);
     }
 
     /// Latch the shader cache off after a worker's append failed.

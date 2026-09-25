@@ -13,6 +13,17 @@ use std::collections::VecDeque;
 use mtld3d_shared::{MetalHandle, mtl_handle::MTLTextureKind};
 use rustc_hash::FxHashMap;
 
+use crate::passes::PassState;
+
+/// Presented frames a texture stays marked as feeding kept content after its last such read.
+///
+/// A read into kept content that happens every few frames or less (a
+/// periodic impostor or environment-map refresh) must not lose its mark
+/// between reads, so the mark outlasts many frames; a target that fed kept
+/// content once waits for its builds rather than skip them for a long
+/// while after, and forever while it keeps feeding. Ten seconds at 60 Hz.
+pub const FEED_MEMORY_FRAMES: u64 = 600;
+
 /// Identity of one queued build, unique within the encoder that queued it.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct JobTicket(u64);
@@ -164,24 +175,22 @@ pub fn may_skip_draw(color: &[bool], depth: Option<bool>, stencil: Option<bool>)
 
 /// Per texture, the recent frames that cleared its planes, and whether it feeds kept content.
 ///
-/// Keyed by the texture's identity handle. Each texture keeps, per
-/// subresource (slice in the low half, level in the high half for colour,
-/// the level for depth and stencil) and plane, the index of the last frame
-/// a whole clear reached it and of the frame before that, which is all
-/// "cleared this frame and the one before" needs; a clear of one face, level
-/// or plane says nothing about another. It also keeps the last frame its
-/// content was read into something kept (a copy out of it into a kept
-/// target, a draw into a kept target sampling it), which holds for that frame and the
-/// next. A texture neither cleared nor read that way in the current or the
-/// previous frame is dropped when the next frame begins, so the map holds
+/// Keyed by the texture's identity handle. Each texture keeps, per subresource
+/// (slice in the low half, level in the high half for colour, the level for
+/// depth and stencil) and plane, the index of the last frame a whole clear
+/// reached it and of the frame before that, which is all "cleared this frame
+/// and the one before" needs; a clear of one face, level or plane says nothing
+/// about another. It also keeps the last frame its content was read into
+/// something kept (a copy out of it into a kept target, a pass into a kept
+/// target sampling it), which holds for [`FEED_MEMORY_FRAMES`] after it. A
+/// texture neither cleared in the current or the previous frame nor read that
+/// way within that span is dropped when the next frame begins, so the map holds
 /// only what was touched recently. Texture handles are addresses Metal hands
-/// out again, so a texture that is destroyed is forgotten
-/// ([`Self::forget`]) before its address can name another.
+/// out again, so a texture that is destroyed is forgotten ([`Self::forget`])
+/// before its address can name another.
 pub struct ClearHistory {
     /// Index of the current presented frame; starts at 1, so 0 means "never".
     frame: u64,
-    /// Bumped by every change an answer of this history can depend on.
-    generation: u64,
     textures: FxHashMap<MetalHandle<MTLTextureKind>, TextureHistory>,
 }
 
@@ -209,18 +218,8 @@ impl ClearHistory {
     pub fn new() -> Self {
         Self {
             frame: 1,
-            generation: 0,
             textures: FxHashMap::default(),
         }
-    }
-
-    /// A counter that changes whenever an answer of this history may have.
-    ///
-    /// Lets a caller cache an answer for the targets it has bound and trust
-    /// it until the counter moves.
-    #[must_use]
-    pub const fn generation(&self) -> u64 {
-        self.generation
     }
 
     /// Whether any texture has a recent clear or read on record.
@@ -235,13 +234,12 @@ impl ClearHistory {
     /// on, and so do its clears.
     pub fn begin_frame(&mut self) {
         self.frame += 1;
-        self.generation += 1;
         let frame = self.frame;
         self.textures.retain(|_, history| {
             history
                 .clears
                 .retain(|(_, _, record)| record.last + 1 >= frame);
-            !history.clears.is_empty() || history.fed_kept + 1 >= frame
+            !history.clears.is_empty() || history.fed_within(frame)
         });
     }
 
@@ -275,7 +273,6 @@ impl ClearHistory {
             if record.last != frame {
                 record.before = record.last;
                 record.last = frame;
-                self.generation += 1;
             }
         }
     }
@@ -315,27 +312,28 @@ impl ClearHistory {
     /// Remember that `texture`'s content was just read into something kept.
     ///
     /// A `StretchRect` out of it into a target that is not rebuilt every
-    /// frame, or a draw into such a target sampling it. A draw left out
-    /// of `texture` would then be baked into that kept content, so none is
-    /// for this frame and the next. A null texture is ignored.
-    pub fn mark_feeds_persistent(&mut self, texture: MetalHandle<MTLTextureKind>) {
+    /// frame, or a pass into such a target sampling it. A draw left out of
+    /// `texture` would then be baked into that kept content, so none is for
+    /// the next [`FEED_MEMORY_FRAMES`]. Answers whether the texture was not
+    /// marked before, so a caller propagating marks knows when to stop. A
+    /// null texture is ignored.
+    pub fn mark_feeds_persistent(&mut self, texture: MetalHandle<MTLTextureKind>) -> bool {
         if texture.is_null() {
-            return;
+            return false;
         }
         let frame = self.frame;
         let history = self.textures.entry(texture).or_default();
-        if history.fed_kept != frame {
-            history.fed_kept = frame;
-            self.generation += 1;
-        }
+        let newly = !history.fed_within(frame);
+        history.fed_kept = frame;
+        newly
     }
 
-    /// Whether `texture`'s content was read into kept content in this frame or the last.
+    /// Whether `texture`'s content was read into kept content in the last [`FEED_MEMORY_FRAMES`].
     #[must_use]
     pub fn feeds_persistent(&self, texture: MetalHandle<MTLTextureKind>) -> bool {
         self.textures
             .get(&texture)
-            .is_some_and(|history| history.fed_kept != 0 && history.fed_kept + 1 >= self.frame)
+            .is_some_and(|history| history.fed_within(self.frame))
     }
 
     /// Forget everything about `texture`, which is being destroyed.
@@ -343,9 +341,7 @@ impl ClearHistory {
     /// Its address can name the next texture Metal creates, which must not
     /// inherit this one's clears.
     pub fn forget(&mut self, texture: MetalHandle<MTLTextureKind>) {
-        if self.textures.remove(&texture).is_some() {
-            self.generation += 1;
-        }
+        self.textures.remove(&texture);
     }
 
     /// Forget every texture, at a device `Reset`.
@@ -355,8 +351,92 @@ impl ClearHistory {
     /// after it.
     pub fn clear(&mut self) {
         self.textures.clear();
-        self.generation += 1;
     }
+}
+
+impl TextureHistory {
+    /// Whether a read into kept content happened within [`FEED_MEMORY_FRAMES`] of `frame`.
+    const fn fed_within(&self, frame: u64) -> bool {
+        self.fed_kept != 0 && self.fed_kept + FEED_MEMORY_FRAMES >= frame
+    }
+}
+
+/// Mark every recently cleared texture a kept pass of this submission sampled.
+///
+/// `passes` holds the submission's passes and the texture binds recorded
+/// with them ([`PassState::pass_reads`]), judged before any pass rule
+/// removes or merges a pass. A pass is kept when a colour target it
+/// attaches or its depth plane is not rebuilt every frame, which includes a
+/// target already marked as feeding kept content; each texture it sampled
+/// that has a recent clear (no other can ever have a draw left out of it)
+/// is marked. Marking a texture can make a pass that writes into it kept,
+/// so the walk repeats until nothing new is marked, and a chain of scratch
+/// targets feeding a kept one is marked whole in the submission that reads
+/// it.
+pub fn mark_kept_reads(passes: &PassState, history: &mut ClearHistory) {
+    let reads = passes.pass_reads();
+    if reads.is_empty() || history.is_empty() {
+        return;
+    }
+    // Each round that marks something marks at least one more texture, so
+    // the reads bound the rounds.
+    for _ in 0..=reads.len() {
+        let mut marked = false;
+        let mut verdict: Option<(usize, bool)> = None;
+        for &(pass, texture) in reads {
+            if !history.tracks(texture) {
+                continue;
+            }
+            let kept = match verdict {
+                Some((judged, kept)) if judged == pass => kept,
+                _ => {
+                    let kept = pass_is_kept(passes, history, pass);
+                    verdict = Some((pass, kept));
+                    kept
+                }
+            };
+            if kept {
+                marked |= history.mark_feeds_persistent(texture);
+            }
+        }
+        if !marked {
+            break;
+        }
+    }
+}
+
+/// Whether recorded pass `index` writes into a target that is not rebuilt every frame.
+///
+/// A pass that cannot be found is kept: answering rebuilt for it would let
+/// what it read lose its draws.
+fn pass_is_kept(passes: &PassState, history: &ClearHistory, index: usize) -> bool {
+    let Some(pass) = passes.pass_of_read(index) else {
+        return true;
+    };
+    let color_rebuilt = |texture: MetalHandle<MTLTextureKind>, subresource: u32| {
+        (passes.is_discarded_back_buffer(texture)
+            || history.regenerated(texture, subresource, ClearPlanes::COLOR))
+            && !history.feeds_persistent(texture)
+    };
+    let rt0 = pass.color_texture();
+    if !rt0.is_null() && !color_rebuilt(rt0, pass.color_slice() | (pass.color_level() << 16)) {
+        return true;
+    }
+    let extra_kept = pass
+        .extra_color()
+        .iter()
+        .filter(|attachment| attachment.is_bound())
+        .any(|attachment| {
+            !color_rebuilt(
+                attachment.texture(),
+                attachment.slice() | (attachment.level() << 16),
+            )
+        });
+    let depth = pass.depth_texture();
+    let depth_rebuilt = depth.is_null()
+        || (history.regenerated(depth, pass.depth_level(), ClearPlanes::DEPTH)
+            && !history.feeds_persistent(depth));
+    extra_kept || !depth_rebuilt
 }
 
 /// What resolving a library or pipeline for a draw found.

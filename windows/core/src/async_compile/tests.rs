@@ -1,6 +1,13 @@
-use mtld3d_shared::{MetalHandle, mtl_handle::MTLTextureKind};
+use mtld3d_shared::{Command, MetalHandle, mtl::PixelFormat, mtl_handle::MTLTextureKind};
 
-use super::{ClearHistory, ClearPlanes, CompileLanes, TicketSource, may_skip_draw};
+use super::{
+    ClearHistory, ClearPlanes, CompileLanes, FEED_MEMORY_FRAMES, TicketSource, mark_kept_reads,
+    may_skip_draw,
+};
+use crate::{
+    passes::{BackbufferContents, FrameReset, PassState, UploadPassTarget},
+    render_scale::RenderScale,
+};
 
 fn texture(raw: u64) -> MetalHandle<MTLTextureKind> {
     // SAFETY: the value is an opaque test identity; nothing dereferences it.
@@ -169,13 +176,7 @@ fn a_forgotten_texture_starts_over_at_its_address() {
     history.begin_frame();
     history.record(rt, 0, ClearPlanes::COLOR);
     assert!(history.regenerated(rt, 0, ClearPlanes::COLOR));
-    let before = history.generation();
     history.forget(rt);
-    assert_ne!(
-        history.generation(),
-        before,
-        "cached answers are invalidated"
-    );
     history.record(rt, 0, ClearPlanes::COLOR);
     assert!(
         !history.regenerated(rt, 0, ClearPlanes::COLOR),
@@ -203,45 +204,138 @@ fn clearing_forgets_every_texture() {
     assert!(!history.feeds_persistent(rt));
 }
 
-/// A read into kept content holds for the frame it happened in and the next, then lapses.
+/// A read into kept content holds for many frames after it, then lapses.
 #[test]
-fn feeding_kept_content_lasts_this_frame_and_the_next() {
+fn feeding_kept_content_lasts_the_feed_memory_then_lapses() {
     let mut history = ClearHistory::new();
     let scratch = texture(0x500);
     assert!(!history.feeds_persistent(scratch));
     assert!(!history.tracks(scratch));
-    history.mark_feeds_persistent(scratch);
+    assert!(
+        history.mark_feeds_persistent(scratch),
+        "a first mark is new"
+    );
+    assert!(!history.mark_feeds_persistent(scratch), "a repeat is not");
     assert!(history.feeds_persistent(scratch));
     assert!(!history.tracks(scratch), "a read is not a clear");
-    history.begin_frame();
-    assert!(history.feeds_persistent(scratch), "still the next frame");
+    for _ in 0..FEED_MEMORY_FRAMES {
+        history.begin_frame();
+    }
+    assert!(
+        history.feeds_persistent(scratch),
+        "a periodic kept read keeps its mark between reads"
+    );
     history.begin_frame();
     assert!(!history.feeds_persistent(scratch));
     assert!(history.is_empty(), "and the texture is forgotten");
-    history.mark_feeds_persistent(MetalHandle::NULL);
+    assert!(!history.mark_feeds_persistent(MetalHandle::NULL));
     assert!(history.is_empty());
 }
 
-/// Every change an answer depends on moves the generation; a repeat does not.
-#[test]
-fn the_generation_moves_with_every_answer_change() {
+/// A pass state recording texture binds, on a discard-effect back buffer.
+fn recording_passes() -> PassState {
+    let mut passes = PassState::new();
+    passes.reset_frame(&FrameReset {
+        backbuffer: texture(0x1000),
+        backbuffer_srgb: MetalHandle::NULL,
+        backbuffer_msaa: MetalHandle::NULL,
+        backbuffer_msaa_srgb: MetalHandle::NULL,
+        backbuffer_sample_count: 1,
+        backbuffer_size: (64, 64),
+        backbuffer_format: PixelFormat::Bgra8Unorm,
+        backbuffer_contents: BackbufferContents::Undefined,
+        depth_texture: MetalHandle::NULL,
+        depth_size: (0, 0),
+        depth_has_stencil: false,
+        render_scale: RenderScale::IDENTITY,
+        continues_frame: false,
+    });
+    passes.record_pass_reads(true);
+    passes
+}
+
+/// A history in which each of `targets` was cleared in this frame and the one before.
+fn rebuilt(targets: &[MetalHandle<MTLTextureKind>]) -> ClearHistory {
     let mut history = ClearHistory::new();
-    let rt = texture(0x600);
-    let start = history.generation();
-    history.record(rt, 0, ClearPlanes::COLOR);
-    let recorded = history.generation();
-    assert_ne!(recorded, start);
-    history.record(rt, 0, ClearPlanes::COLOR);
-    assert_eq!(
-        history.generation(),
-        recorded,
-        "a second clear in one frame changes nothing"
+    for _ in 0..2 {
+        history.begin_frame();
+        for &target in targets {
+            history.record(target, 0, ClearPlanes::COLOR);
+        }
+    }
+    history
+}
+
+/// Bind `target` as render target 0 and sample `read` in the pass that opens.
+fn sample_into(passes: &mut PassState, target: MetalHandle<MTLTextureKind>, read: u64) {
+    passes.set_color_render_target(
+        target,
+        64,
+        64,
+        PixelFormat::Bgra8Unorm,
+        RenderScale::IDENTITY,
     );
-    history.mark_feeds_persistent(rt);
-    let marked = history.generation();
-    assert_ne!(marked, recorded);
-    history.mark_feeds_persistent(rt);
-    assert_eq!(history.generation(), marked);
-    history.begin_frame();
-    assert_ne!(history.generation(), marked);
+    passes.emit_command(Command::set_fragment_texture(read, 0));
+}
+
+/// A kept pass marks the scratch target it samples; a rebuilt pass marks nothing.
+#[test]
+fn a_kept_pass_marks_what_it_samples() {
+    let scratch = texture(0x2000);
+    let kept = texture(0x3000);
+    let mut history = rebuilt(&[scratch]);
+    let mut passes = recording_passes();
+    sample_into(&mut passes, texture(0x1000), scratch.raw());
+    mark_kept_reads(&passes, &mut history);
+    assert!(
+        !history.feeds_persistent(scratch),
+        "the back buffer is rebuilt every frame"
+    );
+    sample_into(&mut passes, kept, scratch.raw());
+    mark_kept_reads(&passes, &mut history);
+    assert!(history.feeds_persistent(scratch));
+}
+
+/// An upload pass spliced in ahead of the application passes does not shift a recorded read.
+#[test]
+fn an_upload_pass_spliced_ahead_leaves_recorded_reads_on_their_pass() {
+    let scratch = texture(0x2000);
+    let kept = texture(0x3000);
+    let mut history = rebuilt(&[scratch]);
+    let mut passes = recording_passes();
+    sample_into(&mut passes, kept, scratch.raw());
+    // The upload writes the scratch target, which is rebuilt: were the read
+    // shifted onto it, the kept pass's read would go unmarked.
+    passes.push_upload_pass(
+        &UploadPassTarget {
+            texture: scratch,
+            subresource: (0, 0),
+            size: (64, 64),
+            format: PixelFormat::Bgra8Unorm,
+            rect: (0, 0, 64, 64),
+        },
+        &[Command::set_fragment_texture(0, 0)],
+        Vec::new(),
+    );
+    assert_eq!(passes.passes().len(), 2, "the upload pass went in first");
+    mark_kept_reads(&passes, &mut history);
+    assert!(history.feeds_persistent(scratch));
+}
+
+/// A chain of scratch targets feeding a kept one is marked whole in one submission.
+#[test]
+fn a_chain_of_scratch_targets_is_marked_in_one_submission() {
+    let first = texture(0x2000);
+    let second = texture(0x2100);
+    let kept = texture(0x3000);
+    let mut history = rebuilt(&[first, second]);
+    let mut passes = recording_passes();
+    sample_into(&mut passes, second, first.raw());
+    sample_into(&mut passes, kept, second.raw());
+    mark_kept_reads(&passes, &mut history);
+    assert!(history.feeds_persistent(second));
+    assert!(
+        history.feeds_persistent(first),
+        "marking the second makes the pass writing it kept, and it read the first"
+    );
 }

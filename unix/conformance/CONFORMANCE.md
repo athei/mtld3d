@@ -289,9 +289,8 @@ record. A knob, where one makes sense, is named with its default.
   because a target cleared and drawn once, at load, is cleared exactly when
   its shaders are cold. A draw into any other target, and every draw while
   an occlusion query counts, waits for its build, and so does a draw into a
-  target that was copied or sampled into kept content in this or the
-  previous frame. Only the first frame of such a read can miss a skipped
-  draw, and a read-back to system memory, such as a screenshot, sees the
+  target that was copied or sampled into kept content in the last 600
+  frames. Only the first frame of such a read can miss a skipped draw, and a read-back to system memory, such as a screenshot, sees the
   frame as drawn, skipped draws included. The runner pins the knob off, so no site observes
   it. Knob: `shader.asyncCompile`, default `true`.
 

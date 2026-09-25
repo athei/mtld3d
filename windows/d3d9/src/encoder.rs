@@ -1136,11 +1136,11 @@ pub struct FrameEncoder {
     /// and the record is what names that queue.
     record_handle: DeviceRecordHandle,
     depth_stencil_cache: FxHashMap<DepthStencilKey, MetalHandle<MTLDepthStencilStateKind>>,
-    /// Every render pipeline build by key, failures and builds in flight included.
+    /// Every render pipeline build by key, failures included.
     ///
     /// A key Metal refused is remembered as failed, so its later draws are
-    /// dropped on the probe instead of repeating the build, and a key a
-    /// worker is building answers pending with its job's ticket. The
+    /// dropped on the probe instead of repeating the build; a key a worker
+    /// is building is in `pending_pipelines` until its outcome lands here. The
     /// no-color sibling has a key of its own and is remembered the same way.
     /// `reset_cleanup` forgets the failures; a Reset at unchanged back-buffer
     /// dimensions never reaches it.
@@ -1251,8 +1251,8 @@ pub struct FrameEncoder {
     /// `disk_key` is computed only on a miss here, to bridge `lib_cache`
     /// (warm-load) and address the on-disk cache. A key whose build failed is
     /// recorded too: the same key yields the same source, so its later draws
-    /// are dropped on the probe instead of compiling again. A key a worker is
-    /// building answers pending until its outcome is installed.
+    /// are dropped on the probe instead of compiling again. A library a
+    /// worker is building is in `pending_libs` until its outcome lands here.
     /// `reset_cleanup` forgets the failures (a Reset at unchanged back-buffer
     /// dimensions never reaches it), shutdown forgets everything.
     ff_vs_libs: BuildIndex<FfVsKey, StageLibHandles>,
@@ -1309,8 +1309,17 @@ pub struct FrameEncoder {
     compile_queue: Arc<compile::CompileQueue>,
     /// Finished builds coming back from the workers, installed by `drain_compile_results`.
     compile_results: mpsc::Receiver<compile::CompileResult>,
-    /// Tickets of the builds queued or running, cleared as each is installed.
-    compile_in_flight: FxHashSet<JobTicket>,
+    /// The shader records a worker is building, by the ticket of the job building each.
+    ///
+    /// Kept apart from the source-keyed indices, which hold only outcomes:
+    /// a draw whose library is built probes those alone, as it did before
+    /// builds went to workers, and only a miss computes the record and
+    /// probes here.
+    pending_libs: FxHashMap<ShaderRecordRef, JobTicket>,
+    /// The render pipelines a worker is building, by key, apart from `pipeline_cache` likewise.
+    pending_pipelines: FxHashMap<PipelineKey, JobTicket>,
+    /// Tickets of the builds queued or running, with the TSC reading at their enqueue.
+    compile_in_flight: FxHashMap<JobTicket, u64>,
     compile_tickets: TicketSource,
     /// Per attachment plane, the recent presented frames a whole-target `Clear` reached it in.
     ///
@@ -1319,8 +1328,6 @@ pub struct FrameEncoder {
     /// the one before. Advanced at `begin_frame` unless the previous submit
     /// was a mid-frame flush, whose frame goes on.
     cleared_targets: ClearHistory,
-    /// Scratch for the textures `note_frame_reads` marks, kept for its capacity.
-    read_marks: Vec<MetalHandle<MTLTextureKind>>,
     /// Pointer to the most recently shipped `CurrentSnapshot`.
     ///
     /// Lives in the per-frame `ScratchArena`. Set by
@@ -1758,10 +1765,11 @@ impl FrameEncoder {
             compile_stats: CompileStats::new(),
             compile_queue,
             compile_results,
-            compile_in_flight: FxHashSet::default(),
+            pending_libs: FxHashMap::default(),
+            pending_pipelines: FxHashMap::default(),
+            compile_in_flight: FxHashMap::default(),
             compile_tickets: TicketSource::new(),
             cleared_targets: ClearHistory::new(),
-            read_marks: Vec::new(),
             current_snapshot: None,
             vs_constants_mirror: Box::new([[0.0; 4]; CONSTANT_ROWS]),
             ps_constants_mirror: Box::new([[0.0; 4]; CONSTANT_ROWS]),
@@ -2498,6 +2506,7 @@ impl FrameEncoder {
             self.cleared_targets.begin_frame();
         }
         self.drain_compile_results();
+        self.check_stalled_compiles();
         mtld3d_shared::crumb!("phase:BfRecl");
         self.reclaim_retired_blit_retention();
         if frame.coherent_seq_ptr != 0 {
@@ -8163,6 +8172,8 @@ impl FrameEncoder {
         // dropped. The workers exit once the queue closes.
         self.finish_compiles(true);
         self.compile_queue.close();
+        self.pending_libs.clear();
+        self.pending_pipelines.clear();
         // 1. Collect live-cache handles into local Vecs. Pure-Rust walks
         //    overlap the GPU's final command buffers finishing up.
         let mut buffers: Vec<u64> = Vec::new();
@@ -9722,6 +9733,9 @@ fn finalize_submit(enc: &mut FrameEncoder, frame: &FrameData) -> (SubmitFramePar
     // surviving draw sees.
     #[cfg(debug_assertions)]
     let draw_states = enc.pass_state.debug_record_draw_states();
+    // Before any pass rule removes or merges a pass: the recorded
+    // bind-to-pass indices name the passes as they were built.
+    enc.note_frame_reads();
     apply_pass_rules(enc, no_present);
     #[cfg(debug_assertions)]
     enc.pass_state
@@ -9745,7 +9759,6 @@ fn finalize_submit(enc: &mut FrameEncoder, frame: &FrameData) -> (SubmitFramePar
     // `commands` the descriptors point into) can outlive this frame's
     // encoder state. `apply_pass_rules` above has already rewritten them
     // in place, so the descriptors built from the taken vec are final.
-    enc.note_frame_reads();
     let passes = enc.pass_state.take_finished_passes();
 
     let visibility_buffer_handle = enc.visibility.current_buffer_handle();

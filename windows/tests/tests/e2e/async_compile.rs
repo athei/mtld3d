@@ -11,11 +11,12 @@
 
 use std::time::{Duration, Instant};
 
-use mtld3d_tests::{Harness, Surface, Vertex, assert_pixel_eq};
+use mtld3d_tests::{Harness, Surface, TexturedVertex, Vertex, assert_pixel_eq};
 use mtld3d_types::{
-    D3D_OK, D3DFMT_A8R8G8B8, D3DFVF_DIFFUSE, D3DFVF_XYZ, D3DGETDATA_FLUSH, D3DISSUE_BEGIN,
-    D3DISSUE_END, D3DLOCK_READONLY, D3DPOOL_SYSTEMMEM, D3DPT_TRIANGLELIST, D3DQUERYTYPE_OCCLUSION,
-    D3DRS_LIGHTING, D3DTEXF_NONE,
+    D3D_OK, D3DFMT_A8R8G8B8, D3DFVF_DIFFUSE, D3DFVF_TEX1, D3DFVF_XYZ, D3DGETDATA_FLUSH,
+    D3DISSUE_BEGIN, D3DISSUE_END, D3DLOCK_READONLY, D3DPOOL_DEFAULT, D3DPOOL_SYSTEMMEM,
+    D3DPT_TRIANGLELIST, D3DQUERYTYPE_OCCLUSION, D3DRS_LIGHTING, D3DTEXF_NONE,
+    D3DUSAGE_RENDERTARGET,
 };
 
 const ASYNC: &str = "shader.asyncCompile=true;shaderCache.enable=false";
@@ -301,5 +302,97 @@ fn a_draw_into_a_scratch_target_copied_into_a_kept_one_waits_for_its_build() {
         read_rt_pixel(&h, &kept, 32, 32),
         RED,
         "a draw whose target is copied into kept content is never left out",
+    );
+}
+
+/// A scratch target sampled into a kept one stays kept when a dropped clear-only pass precedes it.
+///
+/// Each frame clears a target nothing reads, a clear-only pass the pass
+/// rules drop, then clears the scratch texture and samples it into a kept
+/// target. Which pass sampled what is judged before those rules remove a
+/// pass, so the dropped pass cannot shift the read off the kept pass, and
+/// the draw into the scratch texture waits for its builds.
+#[test]
+fn a_scratch_texture_sampled_into_a_kept_target_after_a_dropped_clear_waits() {
+    let h = async_device();
+    let unread = h.create_render_target(64, 64, D3DFMT_A8R8G8B8);
+    let scratch = h.create_texture(
+        64,
+        64,
+        1,
+        D3DUSAGE_RENDERTARGET,
+        D3DFMT_A8R8G8B8,
+        D3DPOOL_DEFAULT,
+    );
+    let scratch_surface = scratch.surface_level(0);
+    let kept = h.create_render_target(128, 128, D3DFMT_A8R8G8B8);
+    let tri = covering_triangle(RED);
+    let textured = covering_triangle(0xFFFF_FFFF).map(|v| TexturedVertex {
+        x: v.x,
+        y: v.y,
+        z: v.z,
+        color: v.color,
+        u: v.x.mul_add(0.5, 0.5),
+        v: v.y.mul_add(-0.5, 0.5),
+    });
+    let frame = |draw: bool| {
+        let backbuffer = h.render_target(0);
+        assert!(h.pump(), "WM_QUIT before render");
+        assert_eq!(h.begin_scene(), D3D_OK, "BeginScene");
+        assert_eq!(h.clear_target(BLUE), D3D_OK, "clear the back buffer");
+        assert_eq!(
+            h.set_render_target(0, &unread),
+            D3D_OK,
+            "bind the unread target"
+        );
+        assert_eq!(h.clear_target(GREEN), D3D_OK, "a clear nothing reads");
+        assert_eq!(
+            h.set_render_target(0, &scratch_surface),
+            D3D_OK,
+            "bind scratch"
+        );
+        assert_eq!(h.clear_target(GREEN), D3D_OK, "clear scratch");
+        if draw {
+            assert_eq!(
+                h.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &tri),
+                D3D_OK,
+                "draw into scratch"
+            );
+        }
+        assert_eq!(
+            h.set_render_target(0, &kept),
+            D3D_OK,
+            "bind the kept target"
+        );
+        assert_eq!(
+            h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1),
+            D3D_OK,
+            "textured FVF"
+        );
+        assert_eq!(h.set_texture(0, &scratch), D3D_OK, "sample scratch");
+        h.select_texture_stage(0);
+        assert_eq!(
+            h.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &textured),
+            D3D_OK,
+            "sample scratch into the kept target"
+        );
+        assert_eq!(h.clear_texture(0), D3D_OK, "unbind scratch");
+        h.select_diffuse_stage(0);
+        assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE), D3D_OK, "SetFVF");
+        assert_eq!(
+            h.set_render_target(0, &backbuffer),
+            D3D_OK,
+            "restore the back buffer"
+        );
+        assert_eq!(h.end_scene(), D3D_OK, "EndScene");
+        assert_eq!(h.present(), D3D_OK, "Present");
+    };
+    frame(false);
+    frame(false);
+    frame(true);
+    assert_pixel_eq(
+        read_rt_pixel(&h, &kept, 64, 64),
+        RED,
+        "a draw into a texture a kept target samples is never left out",
     );
 }
