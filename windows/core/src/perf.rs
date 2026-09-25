@@ -2000,10 +2000,6 @@ impl EncoderPerfState {
         self.enc.drawable_wait_cycles = cycles;
     }
 
-    pub const fn set_submit_exec_cycles(&mut self, cycles: u64) {
-        self.enc.submit_exec_cycles = cycles;
-    }
-
     pub const fn add_submit_stall_cycles(&mut self, cycles: u64) {
         self.enc.submit_stall_cycles = self.enc.submit_stall_cycles.saturating_add(cycles);
     }
@@ -2012,11 +2008,16 @@ impl EncoderPerfState {
         self.enc.present_wait_cycles = cycles;
     }
 
-    /// Fold one `SubmitFrame`'s timings: the encode split overwrites, the GPU time adds.
+    /// Fold one `SubmitFrame`: its execute and encode split overwrite, its GPU time adds.
     ///
-    /// The unix side measures nanoseconds, since its counter is not ours, so
-    /// every value converts into our cycles here.
-    pub fn fold_submit_timings(&mut self, timings: &SubmitTimings) {
+    /// `submit_exec_cycles` is the caller's own measure of the thunk, taken
+    /// on whichever thread ran it; setting it here with the children keeps
+    /// `Encode+commit` and its split from the same submission, whether that
+    /// was an async payload or a synchronous submit behind a barrier. The
+    /// unix side measures nanoseconds, since its counter is not ours, so its
+    /// values convert into our cycles here.
+    pub fn fold_submit_timings(&mut self, timings: &SubmitTimings, submit_exec_cycles: u64) {
+        self.enc.submit_exec_cycles = submit_exec_cycles;
         self.enc.submit_blits_cycles = ns_to_cycles(timings.leading_blits_ns);
         self.enc.submit_passes_cycles = ns_to_cycles(timings.passes_ns);
         self.enc.submit_commit_cycles = ns_to_cycles(timings.commit_ns);
@@ -2463,13 +2464,11 @@ impl EncoderPerfState {
     #[inline]
     pub const fn set_drawable_wait_cycles(&mut self, _cycles: u64) {}
     #[inline]
-    pub const fn set_submit_exec_cycles(&mut self, _cycles: u64) {}
-    #[inline]
     pub const fn add_submit_stall_cycles(&mut self, _cycles: u64) {}
     #[inline]
     pub const fn set_present_wait_cycles(&mut self, _cycles: u64) {}
     #[inline]
-    pub const fn fold_submit_timings(&mut self, _timings: &SubmitTimings) {}
+    pub const fn fold_submit_timings(&mut self, _timings: &SubmitTimings, _submit_exec: u64) {}
     #[inline]
     pub const fn bump_snapshot(&mut self) {}
     #[inline]
@@ -2719,12 +2718,14 @@ struct PerfWindow {
     submit_blits: Stat,
     submit_passes: Stat,
     submit_commit: Stat,
-    /// GPU execution time per [`CommandBufferRole`]: window sum + per-frame peak.
+    /// GPU execution time per [`CommandBufferRole`] (sum only).
+    ///
+    /// A report covers the buffers finished between two submissions, not
+    /// one frame's work, so a per-frame peak would measure how the reports
+    /// fell across frames; the summary renders no peak for it.
     gpu: [Stat; CommandBufferRole::COUNT],
     /// Command buffers behind `gpu`, per role (sum only).
     gpu_buffers: [Stat; CommandBufferRole::COUNT],
-    /// Peak only: the per-frame sum over every role of `gpu`.
-    gpu_total: Stat,
     /// Window total of presents that went out from a copy (sum only).
     snapshots: Stat,
     /// Window total of copies that first waited for a slot (sum only).
@@ -2974,12 +2975,6 @@ impl PerfWindow {
             self.gpu[i].add(s.enc.gpu_cycles[i]);
             self.gpu_buffers[i].add(u64::from(s.enc.gpu_buffers[i]));
         }
-        self.gpu_total.peak(
-            s.enc
-                .gpu_cycles
-                .iter()
-                .fold(0, |sum, &c| sum.saturating_add(c)),
-        );
         self.snapshots.add(u64::from(s.enc.snapshots));
         self.slot_waits.add(u64::from(s.enc.slot_waits));
         for i in 0..ApiCategory::COUNT {
@@ -4487,14 +4482,21 @@ impl<'a> Summary<'a> {
         );
     }
 
-    /// GPU execution time of the device's command buffers, per role.
+    /// GPU execution time of the device's frame, upload and present command buffers.
     ///
     /// Each row is the window's sum of `GPUEndTime - GPUStartTime` over the
-    /// buffers of that role, per frame; the count is the buffers behind it.
-    /// A buffer is reported by the submission after it completes, so the
-    /// block lags like the submit-thread rows. Buffers of one queue can
-    /// overlap on the GPU, which the top row's label says: its sum is busy
-    /// time, not wall time.
+    /// buffers of that role, divided by the window's frames; the count is the
+    /// buffers behind it. A buffer is reported by the submission after it
+    /// completes, so the block lags like the submit-thread rows, and a report
+    /// does not line up with one frame, which is why no row has a peak.
+    ///
+    /// It is not the device's whole GPU time: snapshot copies, read-backs,
+    /// creation-time clears, the cursor overlay and the shutdown fence run in
+    /// buffers of their own that are not counted, and neither is a frame or
+    /// upload buffer submitted before its sequence or counters were wired,
+    /// since it installs no completion handler. The top row's description
+    /// names the three roles. Buffers of one queue can overlap on the GPU,
+    /// which its label says: the sum is busy time, not wall time.
     fn write_gpu(&self, out: &mut String) {
         let w = self.w;
         let s = &self.s;
@@ -4512,8 +4514,8 @@ impl<'a> Summary<'a> {
                 bold_label: true,
                 ms: Some(cycles_to_ms(total / f)),
                 aux: None,
-                desc: Some("GPUEnd - GPUStart"),
-                peak: Some(cycles_to_ms(w.gpu_total.max)),
+                desc: Some("frame/upload/present"),
+                peak: None,
             },
         );
         let roles = [
@@ -4543,7 +4545,7 @@ impl<'a> Summary<'a> {
                     ms: Some(cycles_to_ms(w.gpu[role].sum / f)),
                     aux: Some(format!("({:>10})", w.gpu_buffers[role].sum)),
                     desc: Some(desc),
-                    peak: Some(cycles_to_ms(w.gpu[role].max)),
+                    peak: None,
                 },
             );
         }

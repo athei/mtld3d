@@ -136,8 +136,8 @@ fn submit_timings_fold_split_replaces_and_gpu_time_adds() {
     second.gpu[present].buffers = 2;
 
     let mut state = EncoderPerfState::new();
-    state.fold_submit_timings(&first);
-    state.fold_submit_timings(&second);
+    state.fold_submit_timings(&first, 7_000);
+    state.fold_submit_timings(&second, 8_000);
     assert_eq!(state.enc.submit_blits_cycles, 0, "the later split replaces");
     assert_eq!(state.enc.submit_passes_cycles, ns_to_cycles(5_000));
     assert_eq!(state.enc.submit_commit_cycles, 0);
@@ -176,7 +176,39 @@ fn perf_window_submit_children_leave_a_residual() {
     );
     assert_eq!(w.submit_passes.sum, 1_200);
     assert_eq!(w.gpu[CommandBufferRole::Frame as usize].sum, 700);
-    assert_eq!(w.gpu_total.max, 1_000);
+}
+
+/// A synchronous submit behind a barrier reports its own execute with its own split.
+///
+/// The async payload folded first carries a larger execute and a different
+/// split; the barrier's submit replaces both, so `Encode+commit` and its
+/// children describe one submission and the residual is that submission's.
+#[test]
+fn barrier_submit_keeps_parent_and_children_together() {
+    let mut async_timings = SubmitTimings::new();
+    async_timings.leading_blits_ns = 4_000;
+    async_timings.passes_ns = 9_000;
+    async_timings.commit_ns = 2_000;
+    let mut sync_timings = SubmitTimings::new();
+    sync_timings.passes_ns = 1_000;
+
+    let mut state = EncoderPerfState::new();
+    state.fold_submit_timings(&async_timings, 900_000);
+    state.fold_submit_timings(&sync_timings, 300_000);
+    assert_eq!(
+        state.enc.submit_exec_cycles, 300_000,
+        "the barrier's own execute"
+    );
+    assert_eq!(state.enc.submit_blits_cycles, 0);
+    assert_eq!(state.enc.submit_passes_cycles, ns_to_cycles(1_000));
+    assert_eq!(state.enc.submit_commit_cycles, 0);
+
+    let mut w = PerfWindow::new();
+    let mut s = sample(0, 0);
+    s.enc = state.enc;
+    w.accumulate(&s);
+    assert_eq!(w.submit_exec.sum, 300_000);
+    assert_eq!(w.submit_resid.max, 300_000 - ns_to_cycles(1_000));
 }
 
 /// Upload outcome totals partition successful renames and survive only their reporting window.
@@ -502,10 +534,10 @@ fn summary_golden_layout() {
         "├─ Snapshots                      (         1)        presented from a copy\n",
         "└─ Slot waits                     (         0)        copy waited for a present\n",
         "\n",
-        "GPU (CBs may overlap)   4.50 ms                       GPUEnd - GPUStart     peak  4.50 ms\n",
-        "├─ Frame CBs            4.00 ms   (         1)        render passes         peak  4.00 ms\n",
-        "├─ Upload CBs           0.30 ms   (         1)        uploads + blits       peak  0.30 ms\n",
-        "└─ Present CBs          0.20 ms   (         1)        drawable present      peak  0.20 ms\n",
+        "GPU (CBs may overlap)   4.50 ms                       frame/upload/present\n",
+        "├─ Frame CBs            4.00 ms   (         1)        render passes\n",
+        "├─ Upload CBs           0.30 ms   (         1)        uploads + blits\n",
+        "└─ Present CBs          0.20 ms   (         1)        drawable present\n",
         "\n",
         "Frame total            10.00 ms                                             peak 10.00 ms\n",
         "submit_status=0x0   (API, Encoder, Submit, Present run in parallel; frame_total ≥ max(api_cpu, enc_cpu, submit_cpu + present_wait, gpu_wait))\n",

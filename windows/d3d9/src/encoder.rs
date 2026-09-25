@@ -2667,8 +2667,7 @@ impl FrameEncoder {
     /// buffers.
     fn reclaim_returned(&mut self, returned: ReturnedPayload) {
         self.submit_in_flight = self.submit_in_flight.saturating_sub(1);
-        self.fold_submit_outcome(&returned.outcome);
-        self.perf.set_submit_exec_cycles(returned.submit_exec_tsc);
+        self.fold_submit_outcome(&returned.outcome, returned.submit_exec_tsc);
         if returned.outcome.status != 0 {
             error!(
                 target: LOG_TARGET,
@@ -2684,7 +2683,7 @@ impl FrameEncoder {
     /// The unix side measures its durations in nanoseconds (its counter is
     /// not ours), so they convert to our cycles here, where every other perf
     /// bucket is denominated.
-    fn fold_submit_outcome(&mut self, outcome: &SubmitOutcome) {
+    fn fold_submit_outcome(&mut self, outcome: &SubmitOutcome, submit_exec_tsc: u64) {
         self.last_submit_status = outcome.status;
         self.perf
             .set_drawable_wait_cycles(ns_to_cycles(outcome.drawable_wait_ns));
@@ -2696,7 +2695,8 @@ impl FrameEncoder {
         if outcome.snapshot.contains(SnapshotFlags::SLOT_WAITED) {
             self.perf.bump_slot_wait();
         }
-        self.perf.fold_submit_timings(&outcome.timings);
+        self.perf
+            .fold_submit_timings(&outcome.timings, submit_exec_tsc);
     }
 
     /// Hand a finalized packet to the submit thread (`Async` mode).
@@ -10266,8 +10266,14 @@ fn submit_sync(enc: &mut FrameEncoder, frame: Box<FrameData>) {
     let (payload, status) = {
         let _submit = mtld3d_core::perf::CycleSetTimer::start(enc.perf.submit_cycles_ptr());
         let (params, payload) = finalize_submit(enc, &frame);
-        let (payload, outcome) = execute_submit(params, payload);
-        enc.fold_submit_outcome(&outcome);
+        // Timed on its own as well, so the submit-thread rows describe this
+        // submission rather than the last async one.
+        let mut submit_exec_tsc: u64 = 0;
+        let (payload, outcome) = {
+            let _exec = mtld3d_core::perf::CycleSetTimer::start(&raw mut submit_exec_tsc);
+            execute_submit(params, payload)
+        };
+        enc.fold_submit_outcome(&outcome, submit_exec_tsc);
         (payload, outcome.status)
     };
     if status != 0 {

@@ -1063,8 +1063,9 @@ pub struct SubmitFrameParams {
     pub pad0: u32,
     /// The submit thread's encode and commit split, and the GPU time of finished buffers.
     ///
-    /// Nanoseconds for the same reason as `drawable_wait_ns`; all zero
-    /// outside a `PERF=1` build or while the perf target is off.
+    /// Durations in nanoseconds, for the same reason as `drawable_wait_ns`,
+    /// plus the number of buffers behind each GPU sum; all zero outside a
+    /// `PERF=1` build or while the perf target is off.
     pub timings: super::perf::SubmitTimings, // out
 }
 
