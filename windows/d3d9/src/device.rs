@@ -1676,21 +1676,22 @@ impl DeviceInner {
         sample_count: u8,
     ) {
         self.push_op(Box::new(move |enc| {
-            let (depth_texture, level, desc) = match binding {
+            let (depth_texture, level, desc, unscaled) = match binding {
                 DepthBinding::None => (
                     MetalHandle::NULL,
                     0,
                     (0, 0, mtld3d_shared::mtl::PixelFormat::Depth32Float),
+                    false,
                 ),
-                DepthBinding::Eager(h, (w, hgt)) => {
+                DepthBinding::Eager(h, (w, hgt), scale) => {
                     let format = if depth_has_stencil {
                         mtld3d_shared::mtl::PixelFormat::Depth32FloatStencil8
                     } else {
                         mtld3d_shared::mtl::PixelFormat::Depth32Float
                     };
-                    (h, 0, (w, hgt, format))
+                    (h, 0, (w, hgt, format), scale.is_identity())
                 }
-                DepthBinding::Lazy(info, level) => {
+                DepthBinding::Lazy(info, level, scale) => {
                     // SAFETY: `get_or_create_texture` returns a Metal texture
                     // handle from the typed `texture_cache` via `.raw()`.
                     let handle = unsafe {
@@ -1701,7 +1702,7 @@ impl DeviceInner {
                         (info.height >> level).max(1),
                         info.pixel_format,
                     );
-                    (handle, level, desc)
+                    (handle, level, desc, scale.is_identity())
                 }
             };
             enc.set_depth_attachment_desc(desc.0, desc.1, desc.2);
@@ -1716,6 +1717,9 @@ impl DeviceInner {
             // surface that disagrees with render target 0 is dropped at pass
             // open rather than handed to Metal.
             enc.set_depth_sample_count(sample_count);
+            // In lockstep too: the bind clears it, and only an unscaled depth
+            // surface may set a pass's extent in place of render target 0.
+            enc.set_depth_unscaled(unscaled);
         }));
     }
 
@@ -9232,10 +9236,14 @@ extern "system" fn device_get_render_target(
 #[derive(Clone)]
 enum DepthBinding {
     None,
-    /// A standalone depth surface: its Metal handle and the texture's real extent.
-    Eager(MetalHandle<MTLTextureKind>, (u32, u32)),
-    /// A texture-backed depth surface: the parent's info and the mip level bound.
-    Lazy(TextureInfo, u32),
+    /// A standalone depth surface: its Metal handle, the texture's real extent and its scale.
+    Eager(
+        MetalHandle<MTLTextureKind>,
+        (u32, u32),
+        mtld3d_core::render_scale::RenderScale,
+    ),
+    /// A texture-backed depth surface: the parent's info, the mip level and the parent's scale.
+    Lazy(TextureInfo, u32, mtld3d_core::render_scale::RenderScale),
 }
 
 extern "system" fn device_set_depth_stencil_surface(
@@ -9356,7 +9364,14 @@ extern "system" fn device_set_depth_stencil_surface(
             }
             dev.last_sized_depth = Some((info.texture_id, mip_w, mip_h));
         }
-        DepthBinding::Lazy(info, mip)
+        // The parent texture carries the scale its Metal texture was created
+        // at, as it does for a colour target.
+        // SAFETY: `depth_texture_info` answered, so `surf` is texture-backed
+        // and its parent texture is live while the surface is.
+        let parent = unsafe { (*surf).parent_texture() };
+        // SAFETY: `parent` is non-null and live (see above).
+        let scale = unsafe { &*parent }.inner().render_scale();
+        DepthBinding::Lazy(info, mip, scale)
     } else {
         // SAFETY: `surf` is non-null (else-if branch) and points to a
         // live surface.
@@ -9382,6 +9397,7 @@ extern "system" fn device_set_depth_stencil_surface(
                 scale.dimension(reported_size.0),
                 scale.dimension(reported_size.1),
             ),
+            scale,
         )
     };
     // `is_sampleable` distinguishes a sampleable shadow map

@@ -20,8 +20,8 @@ use mtld3d_core::{
     },
     ids::{BufferId, ProgramId},
     passes::{
-        NULL_TEXTURE_SAMPLER_SENTINEL, VertexBufferBind, null_texture_tex_sentinel,
-        sampler_cache_key,
+        NULL_TEXTURE_SAMPLER_SENTINEL, Rt0DropCandidate, VertexBufferBind,
+        null_texture_tex_sentinel, sampler_cache_key,
     },
     perf::{CycleAddTimer, OpSub, OpSubDetail, PairShaderId},
     pipeline_state::{PipelineAttachFlags, PipelineSnapshot, StreamLayout},
@@ -1287,6 +1287,26 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
         PsSource::Programmable { color_out_mask, .. } => *color_out_mask,
         PsSource::FixedFunction { .. } => 1,
     };
+    // Whether this draw leaves render target 0 out of its pass, so the depth
+    // surface sets the extent (`PassState::rt0_drop_candidate`). Only asked
+    // here: the pass is told right before it opens, because the path between
+    // can still end the pass or return. A draw that writes render target 0
+    // stops at the first test and any target other than a 1x1 one at the
+    // candidate's first compare.
+    let mut rt0_drop = !render_state.pipeline_rs.writes_rt0(ps_color_out_mask)
+        && has_depth
+        && match enc.rt0_drop_candidate() {
+            Rt0DropCandidate::Yes => true,
+            Rt0DropCandidate::No => false,
+            Rt0DropCandidate::ScaledDepth => {
+                mtld3d_shared::log_once_warn!(
+                    target: crate::LOG_TARGET,
+                    "render target 0 is a 1x1 target left unwritten over a larger depth surface \
+                     that render.scale reduces: drawing at render target 0's extent"
+                );
+                false
+            }
+        };
     // A draw that can write nothing is left out before it emits or resolves
     // anything, so the pass list and `last_bound` stay exactly as they were
     // and no bind of it reads a texture. `PassState::skip_dead_draw` owns the
@@ -1677,7 +1697,7 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
         PipelineAttachFlags::COLOR_HAS_ALPHA,
         enc.current_color_rt_has_alpha(),
     );
-    let pipeline_snapshot = PipelineSnapshot {
+    let mut pipeline_snapshot = PipelineSnapshot {
         vs_fn: vs_handles.func,
         ps_fn: ps_handles.func,
         vdecl_hash,
@@ -1689,7 +1709,25 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
         ps_color_out_mask,
         sample_count: enc.current_color_sample_count(),
     };
-    let pipeline = enc.get_or_create_pipeline(&pipeline_snapshot, attrs_ref, &shaders);
+    if rt0_drop {
+        pipeline_snapshot.remove_color_output();
+    }
+    let mut pipeline = enc.get_or_create_pipeline(&pipeline_snapshot, attrs_ref, &shaders);
+    if pipeline == 0 && rt0_drop {
+        // The pass keeps render target 0 instead, so the draw still runs,
+        // at render target 0's extent, with the pipeline that declares it.
+        mtld3d_shared::log_once_warn!(
+            target: crate::LOG_TARGET,
+            "no-colour pipeline for a draw leaving a 1x1 render target 0 out failed: \
+             drawing with render target 0 attached"
+        );
+        rt0_drop = false;
+        pipeline_snapshot
+            .attach
+            .insert(PipelineAttachFlags::HAS_COLOR_OUTPUT);
+        pipeline_snapshot.extra = extra_attachments;
+        pipeline = enc.get_or_create_pipeline(&pipeline_snapshot, attrs_ref, &shaders);
+    }
     if pipeline == 0 {
         // Pipeline build failed — e.g. a vertex-declaration/shader attribute
         // mismatch (a shader reads `v0` the bound decl never supplies) or a
@@ -1716,7 +1754,15 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
     drop(t_pipeline);
 
     let t_state = CycleAddTimer::start(enc.op_sub_cycles_ptr(OpSub::State));
+    // After every return and every call that can end the pass, so the pass
+    // opened or continued next is the one the decision describes.
+    enc.set_rt0_dropped(rt0_drop);
     enc.begin_render_pass_if_needed();
+    debug_assert_eq!(
+        enc.rt0_dropped(),
+        !pipeline_snapshot.has_color_output(),
+        "the pass leaves render target 0 out exactly when the pipeline declares no colour"
+    );
     // Tag the pass with "this draw wants to write color" iff
     // COLORWRITEENABLE is non-zero. When every draw in the pass closes
     // with this still false, Rule H strips the color attachment + swaps

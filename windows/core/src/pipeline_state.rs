@@ -180,6 +180,15 @@ impl PipelineRsBits {
         }
     }
 
+    /// `true` when render target 0 receives a write under these states.
+    ///
+    /// The write mask must be non-zero and the pixel shader, whose `oCn`
+    /// outputs `ps_color_out_mask` lists, must write `oC0`.
+    #[must_use]
+    pub const fn writes_rt0(&self, ps_color_out_mask: u8) -> bool {
+        self.color_write_mask != 0 && ps_color_out_mask & 1 != 0
+    }
+
     /// `true` when no colour target of the pass receives a write under these states.
     ///
     /// Render target 0 by its D3D9 mask, targets 1..3 by their effective
@@ -269,6 +278,15 @@ impl PipelineSnapshot {
     #[must_use]
     pub fn writes_no_color(&self) -> bool {
         self.rs.writes_no_color(&self.extra, self.ps_color_out_mask)
+    }
+
+    /// Turn this into the snapshot of the same draw in a pass without colour attachments.
+    ///
+    /// Clears `HAS_COLOR_OUTPUT` and the extra targets, the only fields a
+    /// pass without colour attachments changes.
+    pub fn remove_color_output(&mut self) {
+        self.attach.remove(PipelineAttachFlags::HAS_COLOR_OUTPUT);
+        self.extra = ExtraColorAttachments::NONE;
     }
 
     /// Metal format keyed for extra target `extra_index`, normalised when absent.

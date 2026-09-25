@@ -110,6 +110,10 @@ unless its entry says otherwise.
   including dynamic depth attachments, remain unavailable. Depth textures
   have no vertex sampling. Automatic mip-generation requests use the
   single-level `D3DOK_NOAUTOGEN` fallback.
+- A 1x1 render target 0 left unwritten over a larger depth surface that
+  `render.scale` reduces keeps render target 0's 1x1 area, warned once. At
+  the identity scale such a pass takes the depth surface's extent, as D3D9
+  does.
 - Timestamp, timestamp frequency, timestamp disjoint and other niche query
   types: capability probes and creation report `D3DERR_NOTAVAILABLE`.
 - Fixed-function bump-environment mapping: `D3DTOP_BUMPENVMAP` and

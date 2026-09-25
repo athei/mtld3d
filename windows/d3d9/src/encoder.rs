@@ -3649,6 +3649,27 @@ impl FrameEncoder {
         self.pass_state.set_srgb_write_enabled(enabled);
     }
 
+    /// Whether the bindings let the next draw leave render target 0 out.
+    ///
+    /// See `PassState::rt0_drop_candidate`. Pure: the draw path asks it before
+    /// anything that can end the pass, and applies the answer with
+    /// [`Self::set_rt0_dropped`] only right before the pass opens.
+    pub const fn rt0_drop_candidate(&self) -> mtld3d_core::passes::Rt0DropCandidate {
+        self.pass_state.rt0_drop_candidate()
+    }
+
+    /// Decide whether the draw about to open or continue its pass leaves render target 0 out.
+    ///
+    /// See `PassState::set_rt0_dropped`.
+    pub fn set_rt0_dropped(&mut self, drop: bool) {
+        self.pass_state.set_rt0_dropped(drop);
+    }
+
+    /// Whether the open pass, or the one about to open, leaves render target 0 out.
+    pub const fn rt0_dropped(&self) -> bool {
+        self.pass_state.rt0_dropped()
+    }
+
     /// Whether the pass binds sRGB views, so the hardware encodes post-blend.
     ///
     /// Read at draw time: when it is set the pixel shader must NOT also
@@ -3718,6 +3739,7 @@ impl FrameEncoder {
         let prev_depth_sampleable = self.pass_state.current_depth_is_sampleable();
         let prev_depth_has_stencil = self.pass_state.current_depth_has_stencil();
         let prev_depth_sample_count = self.pass_state.current_depth_sample_count();
+        let prev_depth_unscaled = self.pass_state.current_depth_unscaled();
         for slot in 1..4usize {
             if saved.extra_matches_rt0(slot) {
                 continue;
@@ -3758,6 +3780,9 @@ impl FrameEncoder {
         // declared single-sampled and be dropped at the next pass open.
         self.pass_state
             .set_depth_sample_count(prev_depth_sample_count);
+        // The unscaled bit was reset with the count and comes back the same
+        // way; left cleared, the device's depth surface would read as scaled.
+        self.pass_state.set_depth_unscaled(prev_depth_unscaled);
         self.pass_state.restore_color_attachments(saved);
     }
 
@@ -3829,6 +3854,14 @@ impl FrameEncoder {
     /// resets it to 1.
     pub const fn set_depth_sample_count(&mut self, sample_count: u8) {
         self.pass_state.set_depth_sample_count(sample_count);
+    }
+
+    /// Declare whether the bound depth attachment is rasterized at the size D3D9 reports.
+    ///
+    /// Called in lockstep with `set_depth_stencil_attachment_level`, which
+    /// clears it.
+    pub fn set_depth_unscaled(&mut self, unscaled: bool) {
+        self.pass_state.set_depth_unscaled(unscaled);
     }
 
     /// Apply a whole-target colour `Clear` whose viewport covers target 0.
@@ -3906,6 +3939,16 @@ impl FrameEncoder {
         )
     }
 
+    /// End an open pass that leaves render target 0 out, ahead of a colour `Clear`.
+    ///
+    /// A colour clear writes render target 0, so every decision it makes
+    /// (coverage, the viewport it clips to, the pass it folds into) has to
+    /// see render target 0 attached. The next draw that leaves it unwritten
+    /// opens a pass without it again, landing the clear first.
+    fn end_rt0_dropped_pass_for_color_clear(&mut self) {
+        self.pass_state.end_rt0_dropped_pass("rt0_drop_color_clear");
+    }
+
     /// `Clear(pRects = NULL)` for colour: D3D9 bounds it to the current viewport ∩ RT.
     ///
     /// A viewport that covers the whole attachment folds to a fast
@@ -3925,6 +3968,7 @@ impl FrameEncoder {
         a: u32,
         srgb_write: bool,
     ) {
+        self.end_rt0_dropped_pass_for_color_clear();
         if self.pass_state.viewport_covers_color_attachment() {
             self.clear_color(r, g, b, a, srgb_write);
         } else {
@@ -3965,6 +4009,7 @@ impl FrameEncoder {
         srgb_write: bool,
         rects: &[(i32, i32, i32, i32)],
     ) {
+        self.end_rt0_dropped_pass_for_color_clear();
         // `rects` are the game's own; the viewport they clip against is already
         // the bound texture's, so convert before clipping rather than after, or
         // the intersection is taken between two different spaces.
@@ -4689,6 +4734,7 @@ impl FrameEncoder {
         let prev_depth_sampleable = self.pass_state.current_depth_is_sampleable();
         let prev_depth_has_stencil = self.pass_state.current_depth_has_stencil();
         let prev_depth_sample_count = self.pass_state.current_depth_sample_count();
+        let prev_depth_unscaled = self.pass_state.current_depth_unscaled();
         let prev_viewport = self.pass_state.viewport();
         let (prev_min_z, prev_max_z) = self.pass_state.viewport_depth_range();
 
@@ -4786,6 +4832,9 @@ impl FrameEncoder {
         // declared single-sampled and be dropped at the next pass open.
         self.pass_state
             .set_depth_sample_count(prev_depth_sample_count);
+        // The unscaled bit was reset with the count and comes back the same
+        // way; left cleared, the device's depth surface would read as scaled.
+        self.pass_state.set_depth_unscaled(prev_depth_unscaled);
         let (pvx, pvy, pvw, pvh) = prev_viewport;
         self.pass_state
             .set_viewport(pvx, pvy, pvw, pvh, prev_min_z, prev_max_z);
@@ -4831,6 +4880,7 @@ impl FrameEncoder {
         let prev_depth_sampleable = self.pass_state.current_depth_is_sampleable();
         let prev_depth_has_stencil = self.pass_state.current_depth_has_stencil();
         let prev_depth_sample_count = self.pass_state.current_depth_sample_count();
+        let prev_depth_unscaled = self.pass_state.current_depth_unscaled();
         let prev_viewport = self.pass_state.viewport();
         let (prev_min_z, prev_max_z) = self.pass_state.viewport_depth_range();
 
@@ -4885,6 +4935,9 @@ impl FrameEncoder {
         // declared single-sampled and be dropped at the next pass open.
         self.pass_state
             .set_depth_sample_count(prev_depth_sample_count);
+        // The unscaled bit was reset with the count and comes back the same
+        // way; left cleared, the device's depth surface would read as scaled.
+        self.pass_state.set_depth_unscaled(prev_depth_unscaled);
         let (pvx, pvy, pvw, pvh) = prev_viewport;
         self.pass_state
             .set_viewport(pvx, pvy, pvw, pvh, prev_min_z, prev_max_z);
@@ -6320,9 +6373,7 @@ impl FrameEncoder {
             // 0). Explicit `.clone()` because PipelineSnapshot is no longer
             // Copy; fires on L0 misses until the sibling has a mapping.
             let mut alt = snapshot.clone();
-            alt.attach
-                .remove(mtld3d_core::pipeline_state::PipelineAttachFlags::HAS_COLOR_OUTPUT);
-            alt.extra = mtld3d_core::pipeline_state::ExtraColorAttachments::NONE;
+            alt.remove_color_output();
             let no_color = self.resolve_pipeline(&alt, vertex_attrs, shaders, true);
             if !no_color.is_null() {
                 self.no_color_pipeline_alt
