@@ -170,3 +170,24 @@ fn burst_tracker_disarms_after_emit() {
     assert!(!t.poll([1, 0, 0, 0], 3000, 1000));
     assert!(t.poll([1, 0, 0, 0], 4500, 1000));
 }
+
+/// The asynchronous tail prints only when there is something to say, and draining zeroes it.
+#[test]
+fn async_counts_print_once_and_drain_to_zero() {
+    let mut stats = CompileStats::new();
+    assert_eq!(format_async_suffix(&stats.take_async()), "");
+    stats.record_async_compile();
+    stats.record_async_compile();
+    stats.record_skipped_draw();
+    assert_eq!(
+        format_async_suffix(&stats.take_async()),
+        ", 2 compiled async, 1 draws skipped"
+    );
+    assert_eq!(format_async_suffix(&stats.take_async()), "");
+    stats.record_skipped_draw();
+    assert_eq!(
+        format_async_suffix(&stats.take_async()),
+        ", 0 compiled async, 1 draws skipped",
+        "a skip alone is never silent"
+    );
+}

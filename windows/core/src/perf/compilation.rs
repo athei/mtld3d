@@ -71,6 +71,8 @@ pub struct CompilationPerf {
     slow: Vec<SlowOperation>,
     #[cfg(perf_tracking)]
     frame_serial: u64,
+    #[cfg(perf_tracking)]
+    asynchronous: AsyncMetrics,
 }
 
 impl CompilationPerf {
@@ -85,8 +87,78 @@ impl CompilationPerf {
             slow: Vec::new(),
             #[cfg(perf_tracking)]
             frame_serial: 0,
+            #[cfg(perf_tracking)]
+            asynchronous: AsyncMetrics::new(),
         }
     }
+
+    /// Count a draw left out of its frame because its build was still in flight.
+    #[cfg(perf_tracking)]
+    pub fn note_skipped_draw(&mut self) {
+        if perf_enabled() {
+            self.asynchronous.skipped = self.asynchronous.skipped.saturating_add(1);
+        }
+    }
+
+    #[cfg(not(perf_tracking))]
+    pub const fn note_skipped_draw(&mut self) {}
+
+    /// Sample how many builds are queued or running, keeping the window's peak.
+    #[cfg(perf_tracking)]
+    pub fn note_pending(&mut self, pending: usize) {
+        if perf_enabled() {
+            let pending = u64::try_from(pending).unwrap_or(u64::MAX);
+            self.asynchronous.pending_peak = self.asynchronous.pending_peak.max(pending);
+        }
+    }
+
+    #[cfg(not(perf_tracking))]
+    pub const fn note_pending(&mut self, _pending: usize) {}
+
+    /// Count one installed build and the TSC cycles from its enqueue to its install.
+    #[cfg(perf_tracking)]
+    pub fn note_install(&mut self, enqueued_tsc: u64, installed_tsc: u64) {
+        if perf_enabled() {
+            let ns = cycles_to_ns(installed_tsc.saturating_sub(enqueued_tsc));
+            let metrics = &mut self.asynchronous;
+            metrics.installs = metrics.installs.saturating_add(1);
+            metrics.latency_ns = metrics.latency_ns.saturating_add(ns);
+            metrics.latency_peak_ns = metrics.latency_peak_ns.max(ns);
+        }
+    }
+
+    #[cfg(not(perf_tracking))]
+    pub const fn note_install(&mut self, _enqueued_tsc: u64, _installed_tsc: u64) {}
+
+    /// Count one wait of the encoder for builds a draw could not do without.
+    ///
+    /// `stolen` is how many of the jobs the encoder ran on its own thread
+    /// while it waited, rather than waiting for a worker to reach them.
+    #[cfg(perf_tracking)]
+    pub fn note_urgent_wait(&mut self, ns: u64, stolen: u64) {
+        if perf_enabled() {
+            let metrics = &mut self.asynchronous;
+            metrics.urgent_waits = metrics.urgent_waits.saturating_add(1);
+            metrics.urgent_wait_ns = metrics.urgent_wait_ns.saturating_add(ns);
+            metrics.stolen = metrics.stolen.saturating_add(stolen);
+        }
+    }
+
+    #[cfg(not(perf_tracking))]
+    pub const fn note_urgent_wait(&mut self, _ns: u64, _stolen: u64) {}
+
+    /// Count the encoder's own share of one miss: the probe, the key and the enqueue.
+    #[cfg(perf_tracking)]
+    pub fn note_miss(&mut self, ns: u64) {
+        if perf_enabled() {
+            let metrics = &mut self.asynchronous;
+            metrics.misses = metrics.misses.saturating_add(1);
+            metrics.miss_ns = metrics.miss_ns.saturating_add(ns);
+        }
+    }
+
+    #[cfg(not(perf_tracking))]
+    pub const fn note_miss(&mut self, _ns: u64) {}
 
     /// Record elapsed work, evaluating identity only for a retained slow event.
     pub fn record(
@@ -233,19 +305,22 @@ impl CompilationPerf {
     /// Render once with the existing PERF summary, then clear the window.
     #[cfg(perf_tracking)]
     pub fn append_window(&mut self, output: &mut String, frames: u32) {
-        if self.window.iter().all(|metric| metric.calls == 0) {
+        if self.window.iter().all(|metric| metric.calls == 0) && self.asynchronous.is_idle() {
             self.window = [const { Metric::new() }; Kind::COUNT];
             self.slow.clear();
+            self.asynchronous = AsyncMetrics::new();
             return;
         }
         let _ = writeln!(
             output,
-            "\nCompilation (included in resolve/pipeline; nested rows are not additive)"
+            "\nCompilation (worker time for asynchronous builds; nested rows are not additive)"
         );
         self.write_metrics(output, frames.max(1));
         self.write_slow(output);
+        self.asynchronous.write(output);
         self.window = [const { Metric::new() }; Kind::COUNT];
         self.slow.clear();
+        self.asynchronous = AsyncMetrics::new();
     }
 
     /// Emit startup work separately; no gameplay frame denominator applies.
@@ -341,6 +416,73 @@ impl Metric {
             failures: 0,
             peak_ns: 0,
         }
+    }
+}
+
+/// The asynchronous-build rows of one PERF window.
+#[cfg(perf_tracking)]
+#[derive(Default)]
+struct AsyncMetrics {
+    /// Draws left out of their frame while a build they needed was in flight.
+    skipped: u64,
+    /// Most builds queued or running at once.
+    pending_peak: u64,
+    /// Builds installed, and their summed and longest enqueue-to-install latency.
+    installs: u64,
+    latency_ns: u64,
+    latency_peak_ns: u64,
+    /// Encoder waits for builds a draw could not skip, their time, and the jobs it ran itself.
+    urgent_waits: u64,
+    urgent_wait_ns: u64,
+    stolen: u64,
+    /// Misses and the encoder time they cost before their jobs were queued.
+    misses: u64,
+    miss_ns: u64,
+}
+
+#[cfg(perf_tracking)]
+impl AsyncMetrics {
+    const fn new() -> Self {
+        Self {
+            skipped: 0,
+            pending_peak: 0,
+            installs: 0,
+            latency_ns: 0,
+            latency_peak_ns: 0,
+            urgent_waits: 0,
+            urgent_wait_ns: 0,
+            stolen: 0,
+            misses: 0,
+            miss_ns: 0,
+        }
+    }
+
+    const fn is_idle(&self) -> bool {
+        self.skipped == 0 && self.installs == 0 && self.urgent_waits == 0 && self.misses == 0
+    }
+
+    fn write(&self, output: &mut String) {
+        if self.is_idle() {
+            return;
+        }
+        let _ = writeln!(
+            output,
+            "  async: draws skipped={}  pending peak={}  installs={}  latency avg {:.3} ms  max {:.3} ms",
+            self.skipped,
+            self.pending_peak,
+            self.installs,
+            ms(self.latency_ns) / mtld3d_shared::tsc::u64_to_f64_exact(self.installs.max(1)),
+            ms(self.latency_peak_ns),
+        );
+        let _ = writeln!(
+            output,
+            "  async: urgent waits={}  waited {:.3} ms  stolen={}  encoder per miss {:.3} ms  misses={}",
+            self.urgent_waits,
+            ms(self.urgent_wait_ns),
+            self.stolen,
+            ms(self.miss_ns) / mtld3d_shared::tsc::u64_to_f64_exact(self.misses.max(1)),
+            self.misses,
+        );
     }
 }
 

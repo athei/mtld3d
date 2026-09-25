@@ -610,6 +610,11 @@ stage: all
 # E2E test environment overrides (the global exports above target the game):
 #   - shaderCache.enable=false  — the on-disk cache would serve stale MSL across
 #     runs, and the suite's processes must not race it.
+#   - shader.asyncCompile=false: a draw whose build is in flight waits for it
+#     instead of being left out of its frame, so a test's first frame shows
+#     every draw it made. The builds still run on the worker threads, which
+#     the waiting encoder steals from, so the suite exercises them either way;
+#     `async_compile.rs` turns the option on for the frames it leaves out.
 #   - color.hdr.enable=false    the shipped default is on, and it resolves off
 #     the running machine's panel, so leaving it would make the suite take the
 #     HDR present route on an EDR Mac and the SDR one elsewhere. Pin it so the
@@ -648,7 +653,7 @@ stage: all
 # and exit status together in a .process-log file, without changing verdicts.
 # Ten files of each kind are kept per directory.
 INTEL_CONF := intel.expandPacked16=true;intel.denyFloat32Filtering=true;intel.managedMemory=true;intel.linearAlign256=true
-MTLD3D_CONF_TEST := shaderCache.enable=false;color.hdr.enable=false;debug.mainThreadChecker=true$(if $(SCALE),;render.scale=$(SCALE))$(if $(INTEL),;$(INTEL_CONF))$(if $(LOG_DIR),;log.dir=Z:$(LOG_DIR))
+MTLD3D_CONF_TEST := shaderCache.enable=false;shader.asyncCompile=false;color.hdr.enable=false;debug.mainThreadChecker=true$(if $(SCALE),;render.scale=$(SCALE))$(if $(INTEL),;$(INTEL_CONF))$(if $(LOG_DIR),;log.dir=Z:$(LOG_DIR))
 # Quoted: the config separator is `;`, which the shell would otherwise read as
 # a command separator and run the rest of the line as its own command.
 MTLD3D_TEST_ENV := MTLD3D_CONFIG='$(MTLD3D_CONF_TEST)' WINEDEBUG=

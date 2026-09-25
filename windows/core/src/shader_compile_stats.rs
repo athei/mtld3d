@@ -84,6 +84,10 @@ impl CompileBucket {
 pub struct CompileStats {
     counts: [u32; BUCKET_COUNT],
     duration_ns: [u64; BUCKET_COUNT],
+    /// Libraries a worker thread built with no draw waiting on them, since the last drain.
+    async_compiled: u32,
+    /// Draws left out of their frame because a build they needed was still in flight.
+    draws_skipped: u32,
     burst: BurstTracker,
 }
 
@@ -99,8 +103,34 @@ impl CompileStats {
         Self {
             counts: [0; BUCKET_COUNT],
             duration_ns: [0; BUCKET_COUNT],
+            async_compiled: 0,
+            draws_skipped: 0,
             burst: BurstTracker::new(),
         }
+    }
+
+    /// Count one library a worker built while no draw waited for it.
+    pub const fn record_async_compile(&mut self) {
+        self.async_compiled = self.async_compiled.saturating_add(1);
+    }
+
+    /// Count one draw left out of its frame for a build still in flight.
+    pub const fn record_skipped_draw(&mut self) {
+        self.draws_skipped = self.draws_skipped.saturating_add(1);
+    }
+
+    /// Take the asynchronous-build counts, leaving both at zero.
+    ///
+    /// Called when [`Self::poll_drain`] answers, so the counts ride the same
+    /// debounced summary line as the compiles they belong to.
+    pub const fn take_async(&mut self) -> AsyncCounts {
+        let counts = AsyncCounts {
+            compiled: self.async_compiled,
+            skipped: self.draws_skipped,
+        };
+        self.async_compiled = 0;
+        self.draws_skipped = 0;
+        counts
     }
 
     /// Record one finished compile.
@@ -132,6 +162,14 @@ impl CompileStats {
         self.duration_ns = [0; BUCKET_COUNT];
         Some(snap)
     }
+}
+
+/// The asynchronous-build side of one summary, from [`CompileStats::take_async`].
+pub struct AsyncCounts {
+    /// Libraries a worker built while no draw waited for them.
+    pub compiled: u32,
+    /// Draws left out of their frame while a build they needed was in flight.
+    pub skipped: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -216,6 +254,18 @@ pub fn format_summary(snap: &Snapshot, verb: &str, total: u32) -> String {
     }
     let _ = write!(out, ", {total:>5} total)");
     out
+}
+
+/// The `, N compiled async, M draws skipped` tail of a summary, empty when both are zero.
+#[must_use]
+pub fn format_async_suffix(counts: &AsyncCounts) -> String {
+    if counts.compiled == 0 && counts.skipped == 0 {
+        return String::new();
+    }
+    format!(
+        ", {} compiled async, {} draws skipped",
+        counts.compiled, counts.skipped
+    )
 }
 
 #[cfg(test)]

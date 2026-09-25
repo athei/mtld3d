@@ -808,6 +808,11 @@ fn exit_trailer(status: ExitStatus) -> String {
 /// `SHADER_CACHE_SCHEMA` bump) is always reflected without having to delete a
 /// stale cache by hand.
 ///
+/// `shader.asyncCompile=false`: a draw whose shader or pipeline is still
+/// building waits for it rather than being left out of its frame. The suite
+/// reads back the frame a check draws, usually its first, and the answer has
+/// to be the draw's, not the clear's.
+///
 /// `color.hdr.enable=false`: the shipped default is on, but it resolves off
 /// the running machine's panel, so an EDR Mac would present through the
 /// tone-mapping shader while another machine blits. The baseline has to mean
@@ -819,7 +824,7 @@ fn exit_trailer(status: ExitStatus) -> String {
 /// its raw output.
 fn config_entries(leg: Leg, raw: Option<&RawTarget>) -> String {
     let mut entries = format!(
-        "shaderCache.enable=false;color.hdr.enable=false{}",
+        "shaderCache.enable=false;shader.asyncCompile=false;color.hdr.enable=false{}",
         leg.variant.config_entries()
     );
     if let Some(raw) = raw {

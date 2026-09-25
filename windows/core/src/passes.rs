@@ -1690,6 +1690,15 @@ pub struct PassState {
     /// `passes` went through `emit_command`, so a target missing here is read
     /// by no pass's commands.
     frame_sampled_textures: FxHashSet<MetalHandle<MTLTextureKind>>,
+    /// Every texture bind of the passes recorded so far, as `(application pass index, identity)`.
+    ///
+    /// The index counts from the first application pass, past the upload
+    /// passes, which a later upload can insert more of ahead of it. `None`
+    /// unless [`Self::record_pass_reads`] turned it on. One push per
+    /// bind command, which the per-pass bind dedup already keeps to one per
+    /// texture change; the encoder reads it once per submission to learn
+    /// which passes read which textures, then clears it.
+    pass_reads: Option<Vec<(usize, MetalHandle<MTLTextureKind>)>>,
     /// Sampling or attachment view to resource identity, through native retirement.
     ///
     /// Draw bindings use the existing single alias lookup to mark the resource
@@ -1851,6 +1860,7 @@ impl PassState {
             seen_sampled_textures: FxHashSet::with_capacity_and_hasher(8, FxBuildHasher),
             stencil_written_textures: FxHashSet::with_capacity_and_hasher(2, FxBuildHasher),
             frame_sampled_textures: FxHashSet::with_capacity_and_hasher(64, FxBuildHasher),
+            pass_reads: None,
             texture_view_to_base: FxHashMap::with_capacity_and_hasher(8, FxBuildHasher),
             srgb_base_to_twin: FxHashMap::with_capacity_and_hasher(8, FxBuildHasher),
             srgb_write_enabled: false,
@@ -1999,6 +2009,7 @@ impl PassState {
         self.frame_caster_writes.clear();
         self.frame_cascade_samples.clear();
         self.frame_sampled_textures.clear();
+        self.clear_pass_reads();
         self.drawn_ranges.clear();
         self.frame_seq = self.frame_seq.wrapping_add(1);
         // Safety net: `take_cmd_vec_realloc_bytes` should already have
@@ -2042,7 +2053,37 @@ impl PassState {
     /// allocation to the caller, so the next frame's pass list grows again
     /// from zero capacity.
     pub fn take_finished_passes(&mut self) -> Vec<Pass> {
+        self.clear_pass_reads();
         core::mem::take(&mut self.passes)
+    }
+
+    /// Record which pass binds which texture, or stop recording and forget.
+    pub fn record_pass_reads(&mut self, on: bool) {
+        self.pass_reads = on.then(Vec::new);
+    }
+
+    /// The texture binds recorded since the passes were last taken, as `(pass index, identity)`.
+    ///
+    /// Empty unless recording is on. The index is that of an application
+    /// pass, for [`Self::pass_of_read`], and holds only until a pass rule
+    /// removes or merges a pass; the identity is the base texture of an sRGB
+    /// twin or sampling view.
+    #[must_use]
+    pub fn pass_reads(&self) -> &[(usize, MetalHandle<MTLTextureKind>)] {
+        self.pass_reads.as_deref().unwrap_or(&[])
+    }
+
+    /// The pass a recorded texture bind belongs to, by the index [`Self::pass_reads`] gave.
+    #[must_use]
+    pub fn pass_of_read(&self, index: usize) -> Option<&Pass> {
+        self.passes.get(self.upload_pass_end.checked_add(index)?)
+    }
+
+    /// Forget the recorded texture binds, keeping the list's capacity.
+    pub fn clear_pass_reads(&mut self) {
+        if let Some(reads) = &mut self.pass_reads {
+            reads.clear();
+        }
     }
 
     /// Drain finished passes' `commands` vecs back into the recycle pool.
@@ -2103,6 +2144,50 @@ impl PassState {
     #[must_use]
     pub const fn current_color_texture(&self) -> MetalHandle<MTLTextureKind> {
         self.current_color_texture
+    }
+
+    /// Whether `texture` is this frame's back buffer and the frame started it undefined.
+    ///
+    /// True under the discard swap effect only: under `FLIP` and `COPY` the
+    /// back buffer keeps its contents into the next frame, like any other
+    /// target. A multisampled back buffer is bound through its companion but
+    /// keeps the resolve target as its identity, so the companion answers
+    /// through the base handle too.
+    #[must_use]
+    pub fn is_discarded_back_buffer(&self, texture: MetalHandle<MTLTextureKind>) -> bool {
+        !texture.is_null()
+            && texture == self.backbuffer_texture
+            && matches!(self.backbuffer_contents, BackbufferContents::Undefined)
+    }
+
+    /// The identity handle a view of a texture is known by: its base texture, else itself.
+    ///
+    /// An sRGB twin or a sampling view names the storage of the texture it
+    /// was made from; every record keyed on a surface uses that base.
+    #[must_use]
+    pub fn identity_of(&self, texture: MetalHandle<MTLTextureKind>) -> MetalHandle<MTLTextureKind> {
+        self.texture_view_to_base
+            .get(&texture)
+            .copied()
+            .unwrap_or(texture)
+    }
+
+    /// Render target 0 and every extra target the next pass attaches, as `(texture, subresource)`.
+    ///
+    /// The subresource packs the slice in the low half and the level in the
+    /// high half, the key a colour clear is remembered under. An extra target
+    /// sized unlike render target 0 is attached to no pass and is left out.
+    pub fn attached_color_targets(
+        &self,
+    ) -> impl Iterator<Item = (MetalHandle<MTLTextureKind>, u32)> + '_ {
+        let rt0 = (self.current_color_texture, self.current_color_subresource);
+        let extras = self
+            .current_extra_color
+            .iter()
+            .enumerate()
+            .filter(|(i, slot)| slot.is_bound() && self.current_extra_present_mask & (1 << i) != 0)
+            .map(|(_, slot)| (slot.texture, slot.subresource));
+        core::iter::once(rt0).chain(extras)
     }
 
     #[must_use]
@@ -3181,9 +3266,18 @@ impl PassState {
             // An sRGB twin bind reads its base texture's storage — record the
             // base too so rename-at-overlap and the store-action rules see the
             // read under the handle they key on.
-            if let Some(&base) = self.texture_view_to_base.get(&tex) {
+            let base = self.texture_view_to_base.get(&tex).copied();
+            if let Some(base) = base {
                 self.seen_sampled_textures.insert(base);
                 self.frame_sampled_textures.insert(base);
+            }
+            if let Some(reads) = &mut self.pass_reads {
+                let pass = self
+                    .passes
+                    .len()
+                    .saturating_sub(1)
+                    .saturating_sub(self.upload_pass_end);
+                reads.push((pass, base.unwrap_or(tex)));
             }
             // Cascade-sample counter: gated on the probe target so the
             // HashMap inc is skipped at default `RUST_LOG`. The map

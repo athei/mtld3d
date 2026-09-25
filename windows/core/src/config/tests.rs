@@ -32,6 +32,7 @@ fn defaults_match_documented_values() {
     assert_eq!(d.cursor_scale, CursorScale::Auto);
     assert_eq!(d.cursor_software, SoftwareCursorPolicy::Auto);
     assert!(d.shader_cache_enable);
+    assert!(d.shader_async_compile);
     assert!(d.log_dir.is_empty());
     assert!(d.bytecode_dump_dir.is_empty());
     assert!(d.skip_shaders.is_empty());
@@ -352,13 +353,14 @@ fn boolean_keys_round_trip_both_values() {
         "debug.capsAll = true\ncolor.hdr.enable = false\nshaderCache.enable = false\n\
          intel.expandPacked16 = true\nintel.denyFloat32Filtering = true\n\
          intel.managedMemory = true\nintel.linearAlign256 = true\n\
-         debug.mainThreadChecker = true\n",
+         debug.mainThreadChecker = true\nshader.asyncCompile = false\n",
         None,
     );
     assert!(cfg.caps_all);
     assert!(cfg.main_thread_checker);
     assert!(!cfg.hdr_enable);
     assert!(!cfg.shader_cache_enable);
+    assert!(!cfg.shader_async_compile);
     assert!(cfg.expand_packed16);
     assert!(cfg.deny_float32_filtering);
     assert!(cfg.managed_memory);

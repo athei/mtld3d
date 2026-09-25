@@ -9833,3 +9833,64 @@ fn a_colour_clear_ends_a_dropped_pass_first() {
     s.end_rt0_dropped_pass("test");
     assert!(!s.current_pass_closed());
 }
+
+/// The back buffer answers by identity, and the attached targets list render target 0 first.
+#[test]
+fn attached_color_targets_name_rt0_and_the_extras_the_pass_attaches() {
+    let mut s = fresh();
+    assert!(s.is_discarded_back_buffer(backbuffer()));
+    assert!(!s.is_discarded_back_buffer(MetalHandle::NULL));
+    assert_eq!(
+        s.attached_color_targets().collect::<Vec<_>>(),
+        [(backbuffer(), 0)]
+    );
+    s.set_extra_color_render_target(1, Some(slot(tex(0x3000), BB_SIZE)));
+    s.set_extra_color_render_target(2, Some(slot(tex(0x4000), (64, 64))));
+    assert_eq!(
+        s.attached_color_targets().collect::<Vec<_>>(),
+        [(backbuffer(), 0), (tex(0x3000), 0)],
+        "a target sized unlike render target 0 is attached to no pass"
+    );
+    s.set_color_render_target(tex(0x5000), 640, 480, RT_FORMAT, RenderScale::IDENTITY);
+    assert!(!s.is_discarded_back_buffer(s.current_color_texture()));
+}
+
+/// A back buffer kept across `Present` is not rewritten every frame.
+#[test]
+fn a_kept_back_buffer_is_not_a_discarded_one() {
+    let mut s = PassState::new();
+    s.reset_frame(&FrameReset {
+        backbuffer: backbuffer(),
+        backbuffer_srgb: backbuffer_srgb(),
+        backbuffer_msaa: MetalHandle::NULL,
+        backbuffer_msaa_srgb: MetalHandle::NULL,
+        backbuffer_sample_count: 1,
+        backbuffer_size: BB_SIZE,
+        backbuffer_format: BB_FORMAT,
+        backbuffer_contents: BackbufferContents::Preserved,
+        depth_texture: depth(),
+        depth_size: BB_SIZE,
+        depth_has_stencil: false,
+        render_scale: RenderScale::IDENTITY,
+        continues_frame: false,
+    });
+    assert!(!s.is_discarded_back_buffer(backbuffer()));
+}
+
+/// Texture binds are recorded per pass only while recording is on, and leave with their passes.
+#[test]
+fn pass_reads_follow_the_passes_that_bind_them() {
+    let mut s = fresh();
+    s.emit_command(Command::set_fragment_texture(tex(0x7000).raw(), 0));
+    assert!(s.pass_reads().is_empty(), "off by default");
+    s.record_pass_reads(true);
+    s.emit_command(Command::set_fragment_texture(tex(0x7001).raw(), 0));
+    s.set_color_render_target(tex(0x5000), 640, 480, RT_FORMAT, RenderScale::IDENTITY);
+    s.emit_command(Command::set_fragment_texture(tex(0x7002).raw(), 1));
+    assert_eq!(s.pass_reads(), [(0, tex(0x7001)), (1, tex(0x7002))]);
+    let _ = s.take_finished_passes();
+    assert!(s.pass_reads().is_empty(), "taken with their passes");
+    s.record_pass_reads(false);
+    s.emit_command(Command::set_fragment_texture(tex(0x7003).raw(), 0));
+    assert!(s.pass_reads().is_empty());
+}

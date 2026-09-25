@@ -125,6 +125,13 @@ pub struct Mtld3dConfig {
     ///
     /// Default: `true`. File key: `shaderCache.enable`.
     pub shader_cache_enable: bool,
+    /// Build first-seen shader libraries and render pipelines on worker threads.
+    ///
+    /// A draw whose build is still in flight is left out of the frame when
+    /// its target is the back buffer or was cleared earlier in the frame, and
+    /// waited for otherwise. `false` waits for every build, as a synchronous
+    /// compile would. Default: `true`. File key: `shader.asyncCompile`.
+    pub shader_async_compile: bool,
     /// Directory the process's log file and GPU traces go into.
     ///
     /// Resolved against the executable's directory; an absolute path stands
@@ -356,6 +363,7 @@ impl Default for Mtld3dConfig {
             cursor_scale: CursorScale::Auto,
             cursor_software: SoftwareCursorPolicy::Auto,
             shader_cache_enable: true,
+            shader_async_compile: true,
             log_dir: String::new(),
             bytecode_dump_dir: String::new(),
             skip_shaders: Vec::new(),
@@ -498,6 +506,10 @@ pub fn log_options(cfg: &Mtld3dConfig) {
         target: crate::LOG_TARGET,
         "config: shaderCache.enable = {}", cfg.shader_cache_enable
     );
+    info!(
+        target: crate::LOG_TARGET,
+        "config: shader.asyncCompile = {}", cfg.shader_async_compile
+    );
     info!(target: crate::LOG_TARGET, "config: log.dir = {:?}", cfg.log_dir);
     info!(
         target: crate::LOG_TARGET,
@@ -602,6 +614,7 @@ fn apply(cfg: &mut Mtld3dConfig, source: &str, key: &str, value: &str) {
         "cursor.scale" => assign_cursor_scale(source, value, &mut cfg.cursor_scale),
         "cursor.software" => assign_cursor_software(source, value, &mut cfg.cursor_software),
         "shaderCache.enable" => assign_bool(source, key, value, &mut cfg.shader_cache_enable),
+        "shader.asyncCompile" => assign_bool(source, key, value, &mut cfg.shader_async_compile),
         "log.dir" => value.clone_into(&mut cfg.log_dir),
         "debug.bytecodeDumpDir" => value.clone_into(&mut cfg.bytecode_dump_dir),
         "debug.skipShaders" => cfg.skip_shaders = parse_hex_list(value),

@@ -7,22 +7,19 @@ use std::{
         mpsc,
     },
     thread,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
-use log::{Level, debug, error, log_enabled, trace, warn};
+use log::{Level, debug, error, log_enabled, trace};
 use mtld3d_core::{
+    async_compile::{ClearHistory, ClearPlanes, JobTicket, TicketSource},
     buffer_rename::{BufferMapMode, stage_upload_needs_preserve},
-    build_index::{BuildIndex, BuildLookup},
+    build_index::BuildIndex,
     config::Mtld3dConfig,
     convert::{FAN_PATTERN_MAX_TRIANGLES, fan_pattern_bytes, fill_fan_pattern_u16},
     depth_stencil_state::{DepthStencilSnapshot, key_from_snapshot, params_from_snapshot},
     dirty_rect::DirtyRect,
-    dxso::{
-        DxsoProgram, FfPsKey, FfVsKey, LOG_TARGET as MSL_TRACE_TARGET, VariantKey, VsSamplerKinds,
-        declared_ps_samplers, emit_ps_ff_named, emit_ps_programmable_named, emit_vs_ff_named,
-        emit_vs_programmable_named,
-    },
+    dxso::{DxsoProgram, FfPsKey, FfVsKey, VariantKey, VsSamplerKinds, declared_ps_samplers},
     ff_state::{FF_VS_PALETTE_BASE_ROW, MAX_VERTEX_BLEND_MATRIX_INDEX},
     format::map_d3d_format,
     gpu_caps::GpuCaps,
@@ -39,13 +36,13 @@ use mtld3d_core::{
         compilation::{Identity as CompileIdentity, Kind as CompileKind},
         perf_enabled,
     },
-    pipeline_state::{self, PipelineBuildInputs, PipelineKey, PipelineSnapshot},
+    pipeline_state::{PipelineKey, PipelineSnapshot},
     present::LayerPacing,
     render_scale::{RenderScale, TargetExtent},
     sampler_state,
     scratch::ScratchArena,
-    shader_cache::{self, CachedKind, PipelineRecipe, ShaderRecordRef},
-    shader_compile_stats::{self, CompileBucket, CompileStats},
+    shader_cache::{self, ShaderRecordRef},
+    shader_compile_stats::{self, CompileStats},
     storage_policy::{buffer_storage_mode, gpu_written_buffer_storage_mode},
     stretch_rect::StretchRegion,
     upload_pass::UploadDecode,
@@ -61,8 +58,8 @@ use mtld3d_shared::{
     CreateTextureSliceViewParams, CreateTexturesBatchParams, DestroyResourcesBulkParams,
     EnsureBlitPipelineParams, EnsureClearQuadPipelineParams, ExtraColorDesc, GetTaskFaultsParams,
     MetalHandle, PassDescriptor, SetDisplaySyncEnabledParams, SetGammaRampParams,
-    SetPresentWaitPolicyParams, SubmitFrameParams, TextureCreateDesc, VertexAttrDesc,
-    WaitForGpuRetireParams, WaitForPresentIdleParams,
+    SetPresentWaitPolicyParams, SubmitFrameParams, TextureCreateDesc, WaitForGpuRetireParams,
+    WaitForPresentIdleParams,
     mtl::{
         BufferKind, ClearQuadFlags, CullMode, DestroyKind, LoadAction, PRESENT_PIPELINE_DEPTH,
         PixelFormat, PresentWaitPolicy, PrimitiveType, QuadPipelineKind, SnapshotFlags, StageTag,
@@ -89,8 +86,7 @@ use super::{
     LOG_TARGET,
     device::PendingVbibRetention,
     draw::{
-        self, CurrentSnapshotPtr, DrawOp, IndexSource, PsKey, PsSource, ScratchSlice, ShaderRef,
-        VertexSource, VsSource,
+        self, CurrentSnapshotPtr, DrawOp, IndexSource, PsKey, ScratchSlice, ShaderRef, VertexSource,
     },
     shader_bindings::CONSTANT_ROWS,
     unix_call::unix_call,
@@ -100,11 +96,14 @@ use super::{
 ///
 /// Sits under `mtld3d::d3d9::*` so `RUST_LOG=mtld3d::d3d9::draw=trace`
 /// opts in granularly without flipping the rest of the d3d9 logger. MSL
-/// dumps reuse `mtld3d_core::dxso::LOG_TARGET` (re-exported above as
-/// `MSL_TRACE_TARGET`) so the emitter and its output share one knob.
+/// dumps reuse `mtld3d_core::dxso::LOG_TARGET` (imported as
+/// `MSL_TRACE_TARGET` by the compile module, which emits them) so the
+/// emitter and its output share one knob.
 const DRAW_TRACE_TARGET: &str = "mtld3d::d3d9::draw";
 
+mod compile;
 mod depth;
+pub use compile::StretchCopyTargets;
 pub use depth::DepthTransfer;
 
 /// Sub-target for the once-per-distinct sampler-state diagnostic.
@@ -875,6 +874,12 @@ bitflags::bitflags! {
         /// whole run execute inline on the encoder thread between the
         /// `StartGpuCapture` and `StopGpuCapture` thunks.
         const GPU_CAPTURING = 1 << 3;
+        /// `shader.asyncCompile` is on and a compile worker started.
+        ///
+        /// A draw whose build is in flight may then be left out of its frame
+        /// (`FrameEncoder::skip_pending_draw`); without it every such draw
+        /// waits for its build.
+        const ASYNC_COMPILE = 1 << 4;
     }
 }
 
@@ -1134,7 +1139,8 @@ pub struct FrameEncoder {
     /// Every render pipeline build by key, failures included.
     ///
     /// A key Metal refused is remembered as failed, so its later draws are
-    /// dropped on the probe instead of repeating the synchronous build. The
+    /// dropped on the probe instead of repeating the build; a key a worker
+    /// is building is in `pending_pipelines` until its outcome lands here. The
     /// no-color sibling has a key of its own and is remembered the same way.
     /// `reset_cleanup` forgets the failures; a Reset at unchanged back-buffer
     /// dimensions never reaches it.
@@ -1185,10 +1191,11 @@ pub struct FrameEncoder {
     dc_write_back_scratch_key: (u32, u32, PixelFormat),
     /// `with-color-handle → no-color-handle` side-map.
     ///
-    /// Populated by `get_or_create_pipeline` whenever a draw arrives with
-    /// `color_write_mask == 0`: both pipeline variants are built (cached in
-    /// `pipeline_cache` under their respective keys), and the no-color
-    /// sibling of the emitted handle is recorded here. Consumed at submit
+    /// Populated whenever a draw arrives with `color_write_mask == 0`:
+    /// `get_or_create_pipeline` queues the no-color variant beside the one it
+    /// draws with (both cached in `pipeline_cache` under their own keys), and
+    /// the sibling of the emitted handle is recorded here when its build is
+    /// installed, or on a later draw that finds it built. Consumed at submit
     /// time by `PassState::strip_color_from_no_color_draw_passes` (Rule H)
     /// to retroactively rewrite the pass's `SetRenderPipelineState`
     /// commands, and queried by later draws before rebuilding a known
@@ -1209,7 +1216,8 @@ pub struct FrameEncoder {
     /// successful (non-null) resolves are stored; a failing snapshot goes to
     /// `pipeline_cache`, which remembers the failure.
     last_pipeline_memo: Option<(PipelineSnapshot, u64)>,
-    program_cache: FxHashMap<ProgramId, Box<DxsoProgram>>,
+    /// Parsed programs by content-hash id, shared with the compile jobs that emit from them.
+    program_cache: FxHashMap<ProgramId, Arc<DxsoProgram>>,
     /// Per-PS declared sampler slots + types, computed once at registration.
     ///
     /// Read on every programmable draw to bind an opaque-black fallback to any
@@ -1241,9 +1249,10 @@ pub struct FrameEncoder {
     /// (a programmable VS compiles one library per count), PS keys fold the
     /// variant in. The Xxh3
     /// `disk_key` is computed only on a miss here, to bridge `lib_cache`
-    /// (warm-load) and address the on-disk cache. A key whose cold resolve
-    /// failed is recorded too: the same key yields the same source, so its
-    /// later draws are dropped on the probe instead of compiling again.
+    /// (warm-load) and address the on-disk cache. A key whose build failed is
+    /// recorded too: the same key yields the same source, so its later draws
+    /// are dropped on the probe instead of compiling again. A library a
+    /// worker is building is in `pending_libs` until its outcome lands here.
     /// `reset_cleanup` forgets the failures (a Reset at unchanged back-buffer
     /// dimensions never reaches it), shutdown forgets everything.
     ff_vs_libs: BuildIndex<FfVsKey, StageLibHandles>,
@@ -1289,19 +1298,36 @@ pub struct FrameEncoder {
     /// `visibility.reset_frame()` after queries retiring on the GPU have
     /// been finalized.
     visibility: VisibilityQueryState,
-    /// Append-only writer for `mtld3d_shaders.bin`.
-    ///
-    /// `None` until the pre-warm thread signals readiness via the
-    /// dedicated prewarm channel (or the disk cache is permanently
-    /// disabled). After that, shader and pipeline cache misses append their
-    /// successful compiles.
-    cache_writer: Option<shader_cache::CacheWriter>,
     /// This device's shader-compile counters and their burst debounce.
     ///
-    /// Bumped by the cold path of `resolve_vs_library` / `resolve_ps_library`
-    /// and polled once per frame from `run_frame`; emits when the counts have
-    /// been stable + nonzero for ≥1 second of TSC cycles.
+    /// Bumped when a library build is installed and when a draw is left out
+    /// for one still in flight, and polled once per frame from `run_frame`;
+    /// emits when the counts have been stable + nonzero for ≥1 second of TSC
+    /// cycles.
     compile_stats: CompileStats,
+    /// The builds waiting for a compile worker, shared with this encoder's workers.
+    compile_queue: Arc<compile::CompileQueue>,
+    /// Finished builds coming back from the workers, installed by `drain_compile_results`.
+    compile_results: mpsc::Receiver<compile::CompileResult>,
+    /// The shader records a worker is building, by the ticket of the job building each.
+    ///
+    /// Kept apart from the source-keyed indices, which hold only outcomes:
+    /// a draw whose library is built probes those alone, as it did before
+    /// builds went to workers, and only a miss computes the record and
+    /// probes here.
+    pending_libs: FxHashMap<ShaderRecordRef, JobTicket>,
+    /// The render pipelines a worker is building, by key, apart from `pipeline_cache` likewise.
+    pending_pipelines: FxHashMap<PipelineKey, JobTicket>,
+    /// Tickets of the builds queued or running, with the TSC reading at their enqueue.
+    compile_in_flight: FxHashMap<JobTicket, u64>,
+    compile_tickets: TicketSource,
+    /// Per attachment plane, the recent presented frames a whole-target `Clear` reached it in.
+    ///
+    /// Read by `skip_pending_draw`: a draw may be left out while its build is
+    /// in flight only when what it depends on was cleared in this frame and
+    /// the one before. Advanced at `begin_frame` unless the previous submit
+    /// was a mid-frame flush, whose frame goes on.
+    cleared_targets: ClearHistory,
     /// Pointer to the most recently shipped `CurrentSnapshot`.
     ///
     /// Lives in the per-frame `ScratchArena`. Set by
@@ -1645,19 +1671,41 @@ impl FrameEncoder {
             .name("mtld3d-submit".into())
             .spawn(move || submit_thread_main(&submit_work_rx, &submit_return_tx))
             .expect("mtld3d: failed to spawn submit thread");
+        let compile_queue = Arc::new(compile::CompileQueue::new());
+        let (compile_results_tx, compile_results) = mpsc::channel();
+        let workers = compile::spawn_workers(&compile_queue, &compile_results_tx);
+        drop(compile_results_tx);
+        let mut flags = if config.shader_cache_enable {
+            FrameEncoderFlags::empty()
+        } else {
+            FrameEncoderFlags::CACHE_DISABLED
+        };
+        if config.shader_async_compile {
+            if workers == 0 {
+                mtld3d_shared::log_once_warn!(
+                    target: LOG_TARGET,
+                    "encoder: no compile worker started, shader.asyncCompile off: \
+                     every build runs on the encoder thread"
+                );
+            } else {
+                flags.insert(FrameEncoderFlags::ASYNC_COMPILE);
+            }
+        }
         Self {
-            pass_state: PassState::new(),
+            pass_state: {
+                // Which pass reads which texture is what keeps a draw into a
+                // target feeding kept content from being left out.
+                let mut pass_state = PassState::new();
+                pass_state.record_pass_reads(flags.contains(FrameEncoderFlags::ASYNC_COMPILE));
+                pass_state
+            },
             last_bound: LastBoundCache::new(),
             lod_bias_table: sampler_state::LodBiasTableCache::new(),
             vs_bound_constants: SnapshotBytesCache::new(),
             ps_bound_constants: SnapshotBytesCache::new(),
             scratch: ScratchArena::new(),
             frame_blit_commands: Vec::new(),
-            flags: if config.shader_cache_enable {
-                FrameEncoderFlags::empty()
-            } else {
-                FrameEncoderFlags::CACHE_DISABLED
-            },
+            flags,
             config,
             payload_pool: Vec::new(),
             submit_work_tx,
@@ -1714,8 +1762,14 @@ impl FrameEncoder {
             pending_resource_retention: VecDeque::new(),
             fan_index_buffer: FanIndexBuffer::EMPTY,
             visibility: VisibilityQueryState::new(),
-            cache_writer: None,
             compile_stats: CompileStats::new(),
+            compile_queue,
+            compile_results,
+            pending_libs: FxHashMap::default(),
+            pending_pipelines: FxHashMap::default(),
+            compile_in_flight: FxHashMap::default(),
+            compile_tickets: TicketSource::new(),
+            cleared_targets: ClearHistory::new(),
             current_snapshot: None,
             vs_constants_mirror: Box::new([[0.0; 4]; CONSTANT_ROWS]),
             ps_constants_mirror: Box::new([[0.0; 4]; CONSTANT_ROWS]),
@@ -2446,6 +2500,13 @@ impl FrameEncoder {
         self.frame_blit_commands.clear();
         self.flags.remove(FrameEncoderFlags::BLIT_CMDS_NEED_ENCODER);
         self.dump_draw = None;
+        // A mid-frame flush does not end the D3D9 frame, so its clears still
+        // stand for the draws after it.
+        if !self.prev_submit_no_present {
+            self.cleared_targets.begin_frame();
+        }
+        self.drain_compile_results();
+        self.check_stalled_compiles();
         mtld3d_shared::crumb!("phase:BfRecl");
         self.reclaim_retired_blit_retention();
         if frame.coherent_seq_ptr != 0 {
@@ -3895,6 +3956,7 @@ impl FrameEncoder {
     /// the pass are the caller's to reach.
     fn clear_color_in_pass(&mut self, r: u32, g: u32, b: u32, a: u32, srgb_write: bool) {
         self.pass_state.set_srgb_write_enabled(srgb_write);
+        self.note_color_targets_cleared();
         let resolved = self.resolved_clear_rgba(r, g, b, a, srgb_write);
         let passes_before = self.pass_state.passes().len();
         match self
@@ -4195,6 +4257,10 @@ impl FrameEncoder {
     ///
     /// The caller has decided the clear covers the depth attachment.
     fn clear_depth_stencil_planes(&mut self, depth: Option<u32>, stencil: Option<u32>) {
+        let mut planes = ClearPlanes::empty();
+        planes.set(ClearPlanes::DEPTH, depth.is_some());
+        planes.set(ClearPlanes::STENCIL, stencil.is_some());
+        self.note_depth_stencil_cleared(planes);
         match (depth, stencil) {
             (Some(depth), Some(stencil)) => self.clear_depth_stencil(depth, stencil),
             (Some(depth), None) => self.clear_depth(depth),
@@ -5564,7 +5630,7 @@ impl FrameEncoder {
         }
         self.program_cache
             .entry(shader_id)
-            .or_insert_with(|| Box::new(program));
+            .or_insert_with(|| Arc::new(program));
     }
 
     /// True when the pixel shader `ps_id` declares `vPos`.
@@ -5666,490 +5732,13 @@ impl FrameEncoder {
             return;
         };
         let total = self.shader_cache_total();
+        let asynchronous = self.compile_stats.take_async();
         log::info!(
             target: LOG_TARGET,
-            "{}",
+            "{}{}",
             shader_compile_stats::format_summary(&snap, "compiled", total),
+            shader_compile_stats::format_async_suffix(&asynchronous),
         );
-    }
-
-    /// Append one freshly-compiled MSL record to `mtld3d_shaders.bin`.
-    ///
-    /// Best-effort: any I/O failure latches `cache_disabled` so the rest of
-    /// the session stops trying.
-    fn cache_write_record(&mut self, entry: &shader_cache::CacheEntry) {
-        if self.flags.contains(FrameEncoderFlags::CACHE_DISABLED)
-            || !self.flags.contains(FrameEncoderFlags::CACHE_READY)
-        {
-            return;
-        }
-        if self.cache_writer.is_none() {
-            match open_or_create_cache_file() {
-                Ok(file) => self.cache_writer = Some(file),
-                Err(e) => {
-                    mtld3d_shared::log_once_warn!(
-                        target: LOG_TARGET,
-                        "shader_cache: open mtld3d_shaders.bin failed → cache disabled: {e}"
-                    );
-                    self.flags.insert(FrameEncoderFlags::CACHE_DISABLED);
-                    return;
-                }
-            }
-        }
-        if let Some(writer) = &self.cache_writer
-            && let Err(e) = writer.append_shader(entry)
-        {
-            mtld3d_shared::log_once_warn!(
-                target: LOG_TARGET,
-                "shader_cache: write mtld3d_shaders.bin failed → cache disabled: {e}"
-            );
-            self.flags.insert(FrameEncoderFlags::CACHE_DISABLED);
-            self.cache_writer = None;
-        }
-    }
-
-    /// Append one successfully-created pipeline recipe to the cache.
-    fn cache_write_pipeline(&mut self, recipe: &PipelineRecipe) {
-        if self.flags.contains(FrameEncoderFlags::CACHE_DISABLED)
-            || !self.flags.contains(FrameEncoderFlags::CACHE_READY)
-        {
-            return;
-        }
-        if self.cache_writer.is_none() {
-            match open_or_create_cache_file() {
-                Ok(writer) => self.cache_writer = Some(writer),
-                Err(e) => {
-                    mtld3d_shared::log_once_warn!(
-                        target: LOG_TARGET,
-                        "shader_cache: open mtld3d_shaders.bin failed, cache disabled: {e}"
-                    );
-                    self.flags.insert(FrameEncoderFlags::CACHE_DISABLED);
-                    return;
-                }
-            }
-        }
-        if let Some(writer) = &self.cache_writer
-            && let Err(e) = writer.append_pipeline(recipe)
-        {
-            mtld3d_shared::log_once_warn!(
-                target: LOG_TARGET,
-                "shader_cache: write pipeline recipe failed, cache disabled: {e}"
-            );
-            self.flags.insert(FrameEncoderFlags::CACHE_DISABLED);
-            self.cache_writer = None;
-        }
-    }
-
-    /// Resolve the VS library for a draw.
-    ///
-    /// Hot path: borrow-probe the source-keyed index (`ff_vs_libs` /
-    /// `prog_vs_libs`) — `FxHash` + exact `Eq`, no per-draw content hash,
-    /// no clone. VS variants share one `MTLLibrary`, so the index key
-    /// excludes `variant`. On a miss (≈ once per shader) the cold path
-    /// computes the `disk_key`. Returns `None` if no program was registered
-    /// or emit/compile fails, and records that outcome under the key, so a
-    /// failure costs one cold resolve and its log lines however often the
-    /// key is drawn. Programs register before the first draw that names
-    /// them and are never removed, so a missing program is as final as a
-    /// rejected one.
-    pub fn resolve_vs_library(&mut self, source: &VsSource) -> Option<StageLibHandles> {
-        let known = match source {
-            VsSource::FixedFunction { key, .. } => self.ff_vs_libs.lookup(key),
-            VsSource::Programmable {
-                vs_id,
-                provided_input_mask,
-                clip_plane_count,
-                sampler_kinds,
-                ..
-            } => self.prog_vs_libs.lookup(&(
-                *vs_id,
-                *provided_input_mask,
-                *clip_plane_count,
-                *sampler_kinds,
-            )),
-        };
-        match known {
-            BuildLookup::Ready(handles) => return Some(handles),
-            BuildLookup::Failed => return None,
-            BuildLookup::Unknown => {}
-        }
-        let outcome = self.resolve_vs_library_cold(source);
-        if outcome.is_none() {
-            warn!(
-                target: LOG_TARGET,
-                "encoder: VS library {} failed to build, its draws are dropped without another attempt",
-                shader_source_tag_vs(source)
-            );
-        }
-        match source {
-            VsSource::FixedFunction { key, .. } => {
-                self.ff_vs_libs.record(key.clone(), outcome);
-            }
-            VsSource::Programmable {
-                vs_id,
-                provided_input_mask,
-                clip_plane_count,
-                sampler_kinds,
-                ..
-            } => {
-                self.prog_vs_libs.record(
-                    (
-                        *vs_id,
-                        *provided_input_mask,
-                        *clip_plane_count,
-                        *sampler_kinds,
-                    ),
-                    outcome,
-                );
-            }
-        }
-        outcome
-    }
-
-    /// Cold path of [`resolve_vs_library`] — index miss.
-    ///
-    /// Computes the Xxh3 `disk_key` (the only content hash, ~once per
-    /// shader), bridges the warm-loaded disk-keyed `lib_cache`, else
-    /// emits + compiles + writes the on-disk cache. The `disk_key` is the
-    /// on-disk content identity; every `VsKey` variant of a shader maps
-    /// to it.
-    fn resolve_vs_library_cold(&mut self, source: &VsSource) -> Option<StageLibHandles> {
-        let disk_key = source.disk_key();
-        let kind = match source {
-            VsSource::Programmable { vs_id, .. } => {
-                let Some(program) = self.program_cache.get(vs_id) else {
-                    error!(target: LOG_TARGET, "VS {vs_id:#x} missing from program_cache");
-                    return None;
-                };
-                CachedKind::from_programmable(program.major, false)
-            }
-            VsSource::FixedFunction { .. } => Some(CachedKind::FfVs),
-        };
-        // `lib_cache` owns every library compiled below, and device teardown
-        // destroys what it holds. A shader with no cache kind would compile
-        // into the non-owning indexes alone and outlive its device, so it is
-        // not compiled; the parser admits no such model today.
-        let Some(kind) = kind else {
-            mtld3d_shared::log_once_warn!(
-                target: LOG_TARGET,
-                "VS {disk_key:#x}: shader model has no cache kind, not compiled"
-            );
-            return None;
-        };
-        let reference = ShaderRecordRef::new(kind, disk_key);
-        if let Some(&handles) = self.lib_cache.get(&reference) {
-            return Some(handles);
-        }
-        let mut total_ns = 0;
-        let mut emit_ns = 0;
-        let mut persist_ns = 0;
-        let mut timings = ShaderTimings::new();
-        let total_timer = NanosSetTimer::start(&raw mut total_ns);
-        let result = (|| {
-            let entry_name = vs_entry_name(source, &self.program_cache, disk_key);
-            let started = Instant::now();
-            let emission = NanosSetTimer::start(&raw mut emit_ns);
-            let (msl, bucket) = match source {
-                VsSource::Programmable {
-                    vs_id,
-                    provided_input_mask,
-                    clip_plane_count,
-                    sampler_kinds,
-                    ..
-                } => {
-                    let Some(program) = self.program_cache.get(vs_id) else {
-                        error!(target: LOG_TARGET, "VS {vs_id:#x} missing from program_cache");
-                        return None;
-                    };
-                    let bucket = CompileBucket::from_sm_major(program.major);
-                    let msl = match emit_vs_programmable_named(
-                        program,
-                        &entry_name,
-                        *provided_input_mask,
-                        *clip_plane_count,
-                        *sampler_kinds,
-                    ) {
-                        Ok(s) => s,
-                        Err(e) => {
-                            error!(target: LOG_TARGET, "emit_vs_programmable failed: {e:?}");
-                            return None;
-                        }
-                    };
-                    (msl, bucket)
-                }
-                VsSource::FixedFunction { key, .. } => {
-                    mtld3d_shared::crumb!(
-                        "ffvs:emit",
-                        self.current_submit_seq,
-                        u64::from(key.tex_coord_count),
-                    );
-                    (emit_vs_ff_named(key, &entry_name), Some(CompileBucket::Ff))
-                }
-            };
-            drop(emission);
-            if log_enabled!(target: MSL_TRACE_TARGET, Level::Trace) {
-                let tag = shader_source_tag_vs(source);
-                trace!(target: MSL_TRACE_TARGET, "── VS MSL {tag} ──\n{msl}\n── /VS MSL {tag} ──");
-            }
-            let handles = compile_stage_library(
-                self.device_handle,
-                StageTag::Vertex,
-                &msl,
-                &entry_name,
-                &mut timings,
-            )?;
-            if let Some(b) = bucket {
-                self.compile_stats.record(b, started.elapsed());
-            }
-            if self.flags.contains(FrameEncoderFlags::CACHE_READY)
-                && !self.flags.contains(FrameEncoderFlags::CACHE_DISABLED)
-            {
-                let _persist = NanosSetTimer::start(&raw mut persist_ns);
-                let retained = match source {
-                    VsSource::Programmable {
-                        vs_id,
-                        provided_input_mask,
-                        clip_plane_count,
-                        sampler_kinds,
-                        ..
-                    } => self.program_cache.get(vs_id).map(|program| {
-                        shader_cache::ShaderSource::vertex(
-                            program,
-                            *provided_input_mask,
-                            *clip_plane_count,
-                            *sampler_kinds,
-                        )
-                    }),
-                    VsSource::FixedFunction { .. } => None,
-                };
-                self.cache_write_record(&shader_cache::CacheEntry::new(
-                    kind, disk_key, msl, retained,
-                ));
-            }
-            self.lib_cache.insert(reference, handles);
-            Some(handles)
-        })();
-        drop(total_timer);
-        let device = self.device_handle.raw();
-        let seq = self.current_submit_seq;
-        let identity = || CompileIdentity::Shader {
-            device,
-            stage: "VS",
-            shader: PairShaderId {
-                is_programmable: matches!(source, VsSource::Programmable { .. }),
-                hash: disk_key,
-            },
-        };
-        let perf = self.perf.compilation_mut();
-        perf.record(
-            CompileKind::ShaderVs,
-            total_ns,
-            result.is_some(),
-            seq,
-            identity,
-        );
-        perf.record(
-            CompileKind::EmitVs,
-            emit_ns,
-            timings.preparation_ns != 0 || result.is_some(),
-            seq,
-            identity,
-        );
-        perf.shader_parts(&timings, result.is_some(), seq, identity);
-        if persist_ns != 0 {
-            perf.record(
-                CompileKind::CacheWrite,
-                persist_ns,
-                !self.flags.contains(FrameEncoderFlags::CACHE_DISABLED),
-                seq,
-                identity,
-            );
-        }
-        result
-    }
-
-    /// Resolve the PS library for a draw.
-    ///
-    /// Hot path: borrow-probe the source-keyed index. PS MSL depends on
-    /// `variant`, so the key folds it in — `ff_ps_libs` nests
-    /// `FfPsKey → variant → handles` (borrow the `FfPsKey`, no clone),
-    /// `prog_ps_libs` uses a `(ProgramId, VariantKey)` `Copy` tuple. On a
-    /// miss the cold path computes the `disk_key`, and its outcome is
-    /// recorded under the key either way, as for the vertex stage.
-    pub fn resolve_ps_library(
-        &mut self,
-        source: &PsSource,
-        variant: VariantKey,
-    ) -> Option<StageLibHandles> {
-        let known = match source {
-            PsSource::FixedFunction { key, .. } => self
-                .ff_ps_libs
-                .get(key)
-                .map_or(BuildLookup::Unknown, |variants| variants.lookup(&variant)),
-            PsSource::Programmable { ps_id, .. } => self.prog_ps_libs.lookup(&(*ps_id, variant)),
-        };
-        match known {
-            BuildLookup::Ready(handles) => return Some(handles),
-            BuildLookup::Failed => return None,
-            BuildLookup::Unknown => {}
-        }
-        let outcome = self.resolve_ps_library_cold(source, variant);
-        if outcome.is_none() {
-            warn!(
-                target: LOG_TARGET,
-                "encoder: PS library {} failed to build, its draws are dropped without another attempt",
-                shader_source_tag_ps(source, variant)
-            );
-        }
-        match source {
-            PsSource::FixedFunction { key, .. } => {
-                self.ff_ps_libs
-                    .entry(key.clone())
-                    .or_default()
-                    .record(variant, outcome);
-            }
-            PsSource::Programmable { ps_id, .. } => {
-                self.prog_ps_libs.record((*ps_id, variant), outcome);
-            }
-        }
-        outcome
-    }
-
-    /// Cold path of [`resolve_ps_library`] — index miss.
-    ///
-    /// Mirror of `resolve_vs_library_cold`; the `disk_key` folds in
-    /// `variant`.
-    fn resolve_ps_library_cold(
-        &mut self,
-        source: &PsSource,
-        variant: VariantKey,
-    ) -> Option<StageLibHandles> {
-        let disk_key = source.disk_key(variant);
-        let kind = match source {
-            PsSource::Programmable { ps_id, .. } => {
-                let Some(program) = self.program_cache.get(ps_id) else {
-                    error!(target: LOG_TARGET, "PS {ps_id:#x} missing from program_cache");
-                    return None;
-                };
-                CachedKind::from_programmable(program.major, true)
-            }
-            PsSource::FixedFunction { .. } => Some(CachedKind::FfPs),
-        };
-        // `lib_cache` owns every library compiled below, and device teardown
-        // destroys what it holds. A shader with no cache kind would compile
-        // into the non-owning indexes alone and outlive its device, so it is
-        // not compiled; the parser admits no such model today.
-        let Some(kind) = kind else {
-            mtld3d_shared::log_once_warn!(
-                target: LOG_TARGET,
-                "PS {disk_key:#x}: shader model has no cache kind, not compiled"
-            );
-            return None;
-        };
-        let reference = ShaderRecordRef::new(kind, disk_key);
-        if let Some(&handles) = self.lib_cache.get(&reference) {
-            return Some(handles);
-        }
-        let mut total_ns = 0;
-        let mut emit_ns = 0;
-        let mut persist_ns = 0;
-        let mut timings = ShaderTimings::new();
-        let total_timer = NanosSetTimer::start(&raw mut total_ns);
-        let result = (|| {
-            let entry_name = ps_entry_name(source, &self.program_cache, disk_key);
-            let started = Instant::now();
-            let emission = NanosSetTimer::start(&raw mut emit_ns);
-            let (msl, bucket) = match source {
-                PsSource::Programmable { ps_id, .. } => {
-                    let Some(program) = self.program_cache.get(ps_id) else {
-                        error!(target: LOG_TARGET, "PS {ps_id:#x} missing from program_cache");
-                        return None;
-                    };
-                    let bucket = CompileBucket::from_sm_major(program.major);
-                    let msl = match emit_ps_programmable_named(program, variant, &entry_name) {
-                        Ok(s) => s,
-                        Err(e) => {
-                            error!(target: LOG_TARGET, "emit_ps_programmable failed: {e:?}");
-                            return None;
-                        }
-                    };
-                    (msl, bucket)
-                }
-                PsSource::FixedFunction { key, .. } => (
-                    emit_ps_ff_named(key, variant, &entry_name),
-                    Some(CompileBucket::Ff),
-                ),
-            };
-            drop(emission);
-            if log_enabled!(target: MSL_TRACE_TARGET, Level::Trace) {
-                let tag = shader_source_tag_ps(source, variant);
-                trace!(target: MSL_TRACE_TARGET, "── PS MSL {tag} ──\n{msl}\n── /PS MSL {tag} ──");
-            }
-            let handles = compile_stage_library(
-                self.device_handle,
-                StageTag::Fragment,
-                &msl,
-                &entry_name,
-                &mut timings,
-            )?;
-            if let Some(b) = bucket {
-                self.compile_stats.record(b, started.elapsed());
-            }
-            if self.flags.contains(FrameEncoderFlags::CACHE_READY)
-                && !self.flags.contains(FrameEncoderFlags::CACHE_DISABLED)
-            {
-                let _persist = NanosSetTimer::start(&raw mut persist_ns);
-                let retained = match source {
-                    PsSource::Programmable { ps_id, .. } => self
-                        .program_cache
-                        .get(ps_id)
-                        .map(|program| shader_cache::ShaderSource::pixel(program, variant)),
-                    PsSource::FixedFunction { .. } => None,
-                };
-                self.cache_write_record(&shader_cache::CacheEntry::new(
-                    kind, disk_key, msl, retained,
-                ));
-            }
-            self.lib_cache.insert(reference, handles);
-            Some(handles)
-        })();
-        drop(total_timer);
-        let device = self.device_handle.raw();
-        let seq = self.current_submit_seq;
-        let identity = || CompileIdentity::Shader {
-            device,
-            stage: "PS",
-            shader: PairShaderId {
-                is_programmable: matches!(source, PsSource::Programmable { .. }),
-                hash: disk_key,
-            },
-        };
-        let perf = self.perf.compilation_mut();
-        perf.record(
-            CompileKind::ShaderPs,
-            total_ns,
-            result.is_some(),
-            seq,
-            identity,
-        );
-        perf.record(
-            CompileKind::EmitPs,
-            emit_ns,
-            timings.preparation_ns != 0 || result.is_some(),
-            seq,
-            identity,
-        );
-        perf.shader_parts(&timings, result.is_some(), seq, identity);
-        if persist_ns != 0 {
-            perf.record(
-                CompileKind::CacheWrite,
-                persist_ns,
-                !self.flags.contains(FrameEncoderFlags::CACHE_DISABLED),
-                seq,
-                identity,
-            );
-        }
-        result
     }
 
     /// One-shot `debug!` per unique `(rt_handle, vs_key, ps_key)` seen by `emit_draw`.
@@ -6325,215 +5914,6 @@ impl FrameEncoder {
             alpha_func,
             cull_mode,
         });
-    }
-
-    /// Look up or create an `MTLRenderPipelineState` for the given pipeline state snapshot.
-    ///
-    /// Translation from D3D9 state to Metal enums happens in
-    /// `mtld3d_core::pipeline_state` — the per-field invariant test there
-    /// guards against "classified Consumed but value silently dropped".
-    pub fn get_or_create_pipeline(
-        &mut self,
-        snapshot: &PipelineSnapshot,
-        vertex_attrs: &[VertexAttrDesc],
-        shaders: &ShaderRef<'_>,
-    ) -> u64 {
-        self.perf.bump_pipeline_memo_call();
-        // L0 memo: a draw whose pipeline snapshot is identical to the
-        // previous one returns the cached handle without rebuilding the
-        // `PipelineKey` (its D3D→Metal translations) or probing
-        // `pipeline_cache`. It also skips the no-color twin's second resolve
-        // below. A successful sibling mapping is process-lifetime. Only
-        // successful primary resolves are memoised: a failing snapshot goes
-        // on to `resolve_pipeline`, whose cache remembers the failure and
-        // answers null on the probe. The `match` copies the handle out so the
-        // memo borrow ends before the `&mut perf` bump.
-        let memo_hit = match &self.last_pipeline_memo {
-            Some((prev, handle)) if *prev == *snapshot => Some(*handle),
-            _ => None,
-        };
-        if let Some(handle) = memo_hit {
-            self.perf.bump_pipeline_memo_hit();
-            return handle;
-        }
-        let with_color = self.resolve_pipeline(snapshot, vertex_attrs, shaders, false);
-        // Dual-build for zero-mask draws: build the matching no-color
-        // variant up-front so pass-finalisation (Rule H) can swap to it
-        // retroactively if every draw in the pass had `mask == 0`.
-        // Rule H keeps color when there is no depth attachment. Its unused
-        // sibling would have no attachments, which Mac2 Metal rejects.
-        // A successful sibling mapping stays valid as long as the pipeline
-        // cache, so an L0 miss can reuse it without rebuilding the alternate
-        // snapshot and key. A failed sibling build leaves no mapping, so the
-        // next L0 miss rebuilds the alternate key and `resolve_pipeline`
-        // answers null from its cache without another build.
-        if !with_color.is_null()
-            && snapshot.has_depth()
-            && snapshot.writes_no_color()
-            && snapshot.has_color_output()
-            && !self.no_color_pipeline_alt.contains_key(&with_color.raw())
-        {
-            // No-color twin: same identity except the attach flag (and no
-            // render targets 1..3, which Rule H strips together with target
-            // 0). Explicit `.clone()` because PipelineSnapshot is no longer
-            // Copy; fires on L0 misses until the sibling has a mapping.
-            let mut alt = snapshot.clone();
-            alt.remove_color_output();
-            let no_color = self.resolve_pipeline(&alt, vertex_attrs, shaders, true);
-            if !no_color.is_null() {
-                self.no_color_pipeline_alt
-                    .insert(with_color.raw(), no_color);
-            }
-        }
-        if !with_color.is_null() {
-            self.last_pipeline_memo = Some((snapshot.clone(), with_color.raw()));
-        }
-        with_color.raw()
-    }
-
-    fn resolve_pipeline(
-        &mut self,
-        snapshot: &PipelineSnapshot,
-        vertex_attrs: &[VertexAttrDesc],
-        shaders: &ShaderRef<'_>,
-        sibling: bool,
-    ) -> MetalHandle<MTLRenderPipelineStateKind> {
-        let key = pipeline_state::key_from_snapshot(snapshot, vertex_attrs);
-        match self.pipeline_cache.lookup(&key) {
-            BuildLookup::Ready(handle) => return handle,
-            BuildLookup::Failed => return MetalHandle::NULL,
-            BuildLookup::Unknown => {}
-        }
-        let mut total_ns = 0;
-        let total = NanosSetTimer::start(&raw mut total_ns);
-        // One wire layout per used stream; lives on this frame until the
-        // synchronous thunk below has read it.
-        let vertex_layouts = pipeline_state::vertex_layouts_from_snapshot(snapshot);
-        let mut params = pipeline_state::params_from_snapshot(&PipelineBuildInputs {
-            snapshot,
-            vertex_attrs,
-            vertex_layouts: &vertex_layouts,
-            device_handle: self.device_handle,
-        });
-        let status = unix_call(&mut params);
-        let pipeline = params.pipeline_handle;
-        let timings = params.timings.into_inner();
-        debug!(
-            target: LOG_TARGET,
-            "encoder: live CreateRenderPipeline status={status:#x} sibling={sibling}"
-        );
-        let success = status == 0 && !pipeline.is_null();
-        let mut persist_ns = 0;
-        if success
-            && self.flags.contains(FrameEncoderFlags::CACHE_READY)
-            && !self.flags.contains(FrameEncoderFlags::CACHE_DISABLED)
-        {
-            let persist = NanosSetTimer::start(&raw mut persist_ns);
-            if let Some((vs, ps)) = self.pipeline_shader_refs(shaders) {
-                let recipe = PipelineRecipe::from_snapshot(vs, ps, snapshot, vertex_attrs);
-                self.cache_write_pipeline(&recipe);
-            } else {
-                mtld3d_shared::log_once_warn_by!(
-                    target: LOG_TARGET,
-                    key: snapshot.vdecl_hash,
-                    "shader_cache: pipeline has an unsupported shader reference, recipe skipped"
-                );
-            }
-            drop(persist);
-        }
-        drop(total);
-        let device = self.device_handle.raw();
-        let identity = || CompileIdentity::Pipeline {
-            device,
-            vs: PairShaderId {
-                is_programmable: matches!(shaders.vs, VsSource::Programmable { .. }),
-                hash: shaders.vs.disk_key(),
-            },
-            ps: PairShaderId {
-                is_programmable: matches!(shaders.ps, PsSource::Programmable { .. }),
-                hash: shaders.ps.disk_key(shaders.variant),
-            },
-            snapshot: Box::new(snapshot.clone()),
-            sibling,
-        };
-        let perf = self.perf.compilation_mut();
-        let seq = self.current_submit_seq;
-        perf.record(
-            if sibling {
-                CompileKind::Sibling
-            } else {
-                CompileKind::Pipeline
-            },
-            total_ns,
-            success,
-            seq,
-            identity,
-        );
-        perf.record(
-            CompileKind::PipelinePreparation,
-            timings.preparation_ns,
-            success || timings.build_ns != 0,
-            seq,
-            identity,
-        );
-        if timings.build_ns != 0 {
-            perf.record(
-                CompileKind::PipelineBuild,
-                timings.build_ns,
-                success,
-                seq,
-                identity,
-            );
-        }
-        if persist_ns != 0 {
-            perf.record(
-                CompileKind::PipelineCacheWrite,
-                persist_ns,
-                !self.flags.contains(FrameEncoderFlags::CACHE_DISABLED),
-                seq,
-                identity,
-            );
-        }
-        if !success {
-            error!(target: LOG_TARGET, "encoder: CreateRenderPipeline failed");
-            let consequence = if sibling {
-                "its passes keep their color attachment"
-            } else {
-                "its draws are dropped"
-            };
-            warn!(
-                target: LOG_TARGET,
-                "encoder: render pipeline (VS {}, PS {}, sibling={sibling}) failed to build, {consequence} without another attempt",
-                shader_source_tag_vs(shaders.vs),
-                shader_source_tag_ps(shaders.ps, shaders.variant)
-            );
-        }
-        self.pipeline_cache.record(key, success.then_some(pipeline));
-        if success { pipeline } else { MetalHandle::NULL }
-    }
-
-    fn pipeline_shader_refs(
-        &self,
-        shaders: &ShaderRef<'_>,
-    ) -> Option<(ShaderRecordRef, ShaderRecordRef)> {
-        let vs_kind = match shaders.vs {
-            VsSource::FixedFunction { .. } => CachedKind::FfVs,
-            VsSource::Programmable { vs_id, .. } => {
-                let major = self.program_cache.get(vs_id)?.major;
-                CachedKind::from_programmable(major, false)?
-            }
-        };
-        let ps_kind = match shaders.ps {
-            PsSource::FixedFunction { .. } => CachedKind::FfPs,
-            PsSource::Programmable { ps_id, .. } => {
-                let major = self.program_cache.get(ps_id)?.major;
-                CachedKind::from_programmable(major, true)?
-            }
-        };
-        Some((
-            ShaderRecordRef::new(vs_kind, shaders.vs.disk_key()),
-            ShaderRecordRef::new(ps_kind, shaders.ps.disk_key(shaders.variant)),
-        ))
     }
 
     /// Look up the Metal texture handle for a previously-warmed-up `TextureId`.
@@ -7250,9 +6630,12 @@ impl FrameEncoder {
     fn retire_texture_handle(&mut self, handle: u64) {
         // SAFETY: a `DestroyKind::Texture` retention entry carries the `.raw()`
         // of a `MetalHandle<MTLTextureKind>`, so the value is an `MTLTexture`
-        // handle. `unregister_texture` only hashes it.
-        self.pass_state
-            .unregister_texture(unsafe { MetalHandle::<MTLTextureKind>::new(handle) });
+        // handle. `unregister_texture` and `forget` only hash it.
+        let texture = unsafe { MetalHandle::<MTLTextureKind>::new(handle) };
+        self.pass_state.unregister_texture(texture);
+        // The address can name the next texture Metal creates, which must not
+        // inherit this one's clears.
+        self.cleared_targets.forget(texture);
     }
 
     /// Drain resource-retention entries whose seq has retired on the GPU.
@@ -8784,6 +8167,13 @@ impl FrameEncoder {
     /// before returning.
     fn shutdown_cleanup(&mut self) {
         mtld3d_shared::crumb!("phase:SdEnter");
+        // Every build a worker runs lands in the caches collected below, or
+        // its handles would outlive the device; one no worker started is
+        // dropped. The workers exit once the queue closes.
+        self.finish_compiles(true);
+        self.compile_queue.close();
+        self.pending_libs.clear();
+        self.pending_pipelines.clear();
         // 1. Collect live-cache handles into local Vecs. Pure-Rust walks
         //    overlap the GPU's final command buffers finishing up.
         let mut buffers: Vec<u64> = Vec::new();
@@ -8890,9 +8280,6 @@ impl FrameEncoder {
         self.sampler_cache.clear();
         self.depth_stencil_cache.clear();
         self.program_cache.clear();
-
-        // 6. Close the disk shader cache writer; File's Drop flushes.
-        self.cache_writer = None;
         mtld3d_shared::crumb!("phase:SdDone");
     }
 
@@ -8908,6 +8295,13 @@ impl FrameEncoder {
     /// already slated for release once the GPU finished, and Reset's GPU
     /// idle wait is exactly that signal.
     fn reset_cleanup(&mut self, retired_textures: &[u64]) {
+        // A build in flight lands before the caches' failures are forgotten
+        // below, so its outcome is the one the next draw sees.
+        self.finish_compiles(false);
+        // A Reset ends the application's frame without a `Present` and
+        // recreates the implicit surfaces, so no clear before it vouches for
+        // a frame after it.
+        self.cleared_targets.clear();
         let mut buffers: Vec<u64> = Vec::new();
         let mut textures: Vec<u64> = Vec::new();
         let held = self.drain_retention_and_wait(&mut buffers, &mut textures);
@@ -10339,6 +9733,9 @@ fn finalize_submit(enc: &mut FrameEncoder, frame: &FrameData) -> (SubmitFramePar
     // surviving draw sees.
     #[cfg(debug_assertions)]
     let draw_states = enc.pass_state.debug_record_draw_states();
+    // Before any pass rule removes or merges a pass: the recorded
+    // bind-to-pass indices name the passes as they were built.
+    enc.note_frame_reads();
     apply_pass_rules(enc, no_present);
     #[cfg(debug_assertions)]
     enc.pass_state
@@ -10799,85 +10196,6 @@ fn retire_blit_reads(enc: &mut FrameEncoder, submit_seq: u64) {
         enc.pending_blit_retention
             .push_back(PendingBlitRead::new(submit_seq, read));
     }
-}
-
-/// Banner tag for a compiled shader in MSL trace dumps.
-///
-/// The hash is the on-disk shader-cache `disk_key` so the banner
-/// identifier matches the pass×shader log line, the truncated hex in the
-/// Xcode pipeline label (`mtld3d_vs_*_<8hex>`), and (for programmable
-/// shaders) the `debug.bytecodeDumpDir` `vs_<hash>.dxso` filename.
-fn shader_source_tag_vs(source: &VsSource) -> String {
-    match source {
-        VsSource::Programmable {
-            vs_id,
-            provided_input_mask,
-            clip_plane_count,
-            sampler_kinds,
-            ..
-        } => {
-            format!(
-                "prog {:#x}",
-                draw::vs_source_disk_key_programmable(
-                    *vs_id,
-                    *provided_input_mask,
-                    *clip_plane_count,
-                    *sampler_kinds
-                )
-            )
-        }
-        VsSource::FixedFunction { key, .. } => {
-            format!("ff {:#x}", draw::vs_source_disk_key_ff(key))
-        }
-    }
-}
-
-fn shader_source_tag_ps(source: &PsSource, variant: VariantKey) -> String {
-    match source {
-        PsSource::Programmable { ps_id, .. } => format!(
-            "prog {:#x}",
-            draw::ps_source_disk_key_programmable(*ps_id, variant)
-        ),
-        PsSource::FixedFunction { key, .. } => {
-            format!("ff {:#x}", draw::ps_source_disk_key_ff(key, variant))
-        }
-    }
-}
-
-/// Resolve the `CachedKind` for a live-path VS source.
-///
-/// The entry name is derived from it via `CachedKind::entry_name`. Falls
-/// back to `Sm2Vs` for programmable shaders with an out-of-range major
-/// (the live path will fail compile elsewhere; this just keeps the name
-/// well-formed).
-fn vs_entry_name(
-    source: &VsSource,
-    program_cache: &FxHashMap<ProgramId, Box<DxsoProgram>>,
-    disk_key: u64,
-) -> String {
-    let kind = match source {
-        VsSource::Programmable { vs_id, .. } => {
-            let major = program_cache.get(vs_id).map_or(2, |p| p.major);
-            CachedKind::from_programmable(major, false).unwrap_or(CachedKind::Sm2Vs)
-        }
-        VsSource::FixedFunction { .. } => CachedKind::FfVs,
-    };
-    kind.entry_name(disk_key)
-}
-
-fn ps_entry_name(
-    source: &PsSource,
-    program_cache: &FxHashMap<ProgramId, Box<DxsoProgram>>,
-    disk_key: u64,
-) -> String {
-    let kind = match source {
-        PsSource::Programmable { ps_id, .. } => {
-            let major = program_cache.get(ps_id).map_or(2, |p| p.major);
-            CachedKind::from_programmable(major, true).unwrap_or(CachedKind::Sm2Ps)
-        }
-        PsSource::FixedFunction { .. } => CachedKind::FfPs,
-    };
-    kind.entry_name(disk_key)
 }
 
 /// Zero the full backing of a `PageBox`.
