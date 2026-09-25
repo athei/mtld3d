@@ -5,13 +5,32 @@
 //! normalisation and the wire format: an absent extra target drops out of the key, an extra target
 //! the shader never writes gets an empty write mask while target 0 keeps its render-state mask,
 //! destination-alpha factors clamp on an alpha-less target, and the wire params match the key.
+//! Blend factors left over while blending is off, and declarations that resolve to the same
+//! vertex attributes, collapse onto one key.
 
+use mtld3d_shared::mtl::VertexFormat;
 use mtld3d_types::{
     D3DBLEND_DESTALPHA, D3DBLEND_INVDESTALPHA, D3DBLEND_INVSRCALPHA, D3DBLEND_ONE,
-    D3DBLEND_SRCALPHA, D3DBLEND_ZERO, D3DBLENDOP_ADD,
+    D3DBLEND_SRCALPHA, D3DBLEND_ZERO, D3DBLENDOP_ADD, D3DBLENDOP_REVSUBTRACT, D3DDECLTYPE_FLOAT2,
+    D3DDECLTYPE_FLOAT3, D3DDECLUSAGE_NORMAL, D3DDECLUSAGE_POSITION, D3DDECLUSAGE_TEXCOORD,
+    D3DFVF_TEX1, D3DFVF_XYZ, D3DVERTEXELEMENT9,
 };
 
 use super::*;
+use crate::convert::{fvf_to_elements, hash_elements, resolve_attrs_for_ff};
+
+/// A position-shaped attribute: register 0, stream 0, offset 0, three floats.
+const FLOAT3_AT_0: VertexAttrDesc = VertexAttrDesc {
+    attr_index: 0,
+    buffer_index: 0,
+    offset: 0,
+    format: VertexFormat::Float3,
+};
+
+/// Key of `s` for a draw reading [`FLOAT3_AT_0`] alone.
+fn key_of(s: &PipelineSnapshot) -> PipelineKey {
+    key_from_snapshot(s, &[FLOAT3_AT_0])
+}
 
 /// D3D enum constant at the snapshot's narrow width.
 fn narrow(v: u32) -> u8 {
@@ -81,12 +100,12 @@ fn with_rt1() -> PipelineSnapshot {
 
 #[test]
 fn extra_targets_key_presence_format_mask_and_alpha() {
-    let k1 = key_from_snapshot(&with_rt1());
-    assert_ne!(key_from_snapshot(&base()), k1, "presence");
+    let k1 = key_of(&with_rt1());
+    assert_ne!(key_of(&base()), k1, "presence");
     let mutate = |f: fn(&mut PipelineSnapshot)| {
         let mut s = with_rt1();
         f(&mut s);
-        key_from_snapshot(&s)
+        key_of(&s)
     };
     assert_ne!(
         k1,
@@ -126,16 +145,13 @@ fn unwritten_extra_target_gets_an_empty_write_mask() {
     unwritten.ps_color_out_mask = 0b01;
     let mut masked = with_rt1();
     masked.rs.color_write_mask_ext[0] = 0;
-    assert_eq!(key_from_snapshot(&unwritten), key_from_snapshot(&masked));
+    assert_eq!(key_of(&unwritten), key_of(&masked));
     assert_eq!(
-        key_from_snapshot(&unwritten).extra_write_masks[0],
+        key_of(&unwritten).extra_write_masks[0],
         ColorWriteMask::empty()
     );
     // Target 0 keeps the RS mask regardless of the written bit.
-    assert_eq!(
-        key_from_snapshot(&unwritten).color_write_mask,
-        ColorWriteMask::ALL
-    );
+    assert_eq!(key_of(&unwritten).color_write_mask, ColorWriteMask::ALL);
 }
 
 #[test]
@@ -175,11 +191,11 @@ fn extra_target_blend_factors_clamp_on_their_own_alpha() {
 /// the fallback).
 #[test]
 fn key_changes_on_every_field() {
-    let k0 = key_from_snapshot(&base());
+    let k0 = key_of(&base());
     let mutate = |f: fn(&mut PipelineSnapshot)| {
         let mut s = base();
         f(&mut s);
-        key_from_snapshot(&s)
+        key_of(&s)
     };
 
     assert_ne!(
@@ -194,7 +210,12 @@ fn key_changes_on_every_field() {
         mutate(|s| s.ps_fn = unsafe { MetalHandle::new(0xFACE) }),
         "ps_fn"
     );
-    assert_ne!(k0, mutate(|s| s.vdecl_hash = 0xFACE), "vdecl_hash");
+    assert_ne!(k0, key_from_snapshot(&base(), &[]), "vertex attributes");
+    assert_eq!(
+        k0,
+        mutate(|s| s.vdecl_hash = 0xFACE),
+        "vdecl_hash is not keyed"
+    );
     assert_ne!(
         k0,
         mutate(|s| s.stream_layouts[0].stride = 64),
@@ -267,11 +288,11 @@ fn key_changes_on_every_field() {
     // RGB and mutating them is a no-op (correct — nothing to key).
     let mut s_sep = base();
     s_sep.rs.flags.insert(PipelineRsFlags::SEPARATE_ALPHA_BLEND);
-    let k_sep = key_from_snapshot(&s_sep);
+    let k_sep = key_of(&s_sep);
     let mutate_sep = |f: fn(&mut PipelineSnapshot)| {
         let mut s = s_sep.clone();
         f(&mut s);
-        key_from_snapshot(&s)
+        key_of(&s)
     };
     assert_ne!(
         k_sep,
@@ -301,13 +322,13 @@ fn destination_alpha_clamps_on_no_alpha_rt() {
     let mut with_alpha = base();
     with_alpha.rs.src_blend = narrow(D3DBLEND_DESTALPHA);
     with_alpha.rs.dst_blend = narrow(D3DBLEND_INVDESTALPHA);
-    let k_alpha = key_from_snapshot(&with_alpha);
+    let k_alpha = key_of(&with_alpha);
     assert_eq!(k_alpha.src_blend, BlendFactor::DestinationAlpha);
     assert_eq!(k_alpha.dst_blend, BlendFactor::OneMinusDestinationAlpha);
 
     let mut no_alpha = with_alpha;
     no_alpha.attach.remove(PipelineAttachFlags::COLOR_HAS_ALPHA);
-    let k_no_alpha = key_from_snapshot(&no_alpha);
+    let k_no_alpha = key_of(&no_alpha);
     assert_eq!(k_no_alpha.src_blend, BlendFactor::One);
     assert_eq!(k_no_alpha.dst_blend, BlendFactor::Zero);
 
@@ -317,12 +338,12 @@ fn destination_alpha_clamps_on_no_alpha_rt() {
     // Non-destination-alpha factors are unaffected by the RT alpha bit.
     let mut src_alpha = base();
     src_alpha.rs.src_blend = narrow(D3DBLEND_SRCALPHA);
-    let k_src = key_from_snapshot(&src_alpha);
+    let k_src = key_of(&src_alpha);
     let mut src_alpha_no_a = src_alpha;
     src_alpha_no_a
         .attach
         .remove(PipelineAttachFlags::COLOR_HAS_ALPHA);
-    assert_eq!(k_src, key_from_snapshot(&src_alpha_no_a));
+    assert_eq!(k_src, key_of(&src_alpha_no_a));
 }
 
 #[test]
@@ -331,7 +352,7 @@ fn params_match_key_on_default_snapshot() {
     // values than key_from_snapshot. Any downstream divergence on
     // these fields would be a silent bug.
     let s = base();
-    let k = key_from_snapshot(&s);
+    let k = key_of(&s);
     let attrs: [VertexAttrDesc; 0] = [];
     let layouts = vertex_layouts_from_snapshot(&s);
     // SAFETY: tests; opaque values never dereferenced.
@@ -392,14 +413,14 @@ fn alpha_to_coverage_keys_only_multisampled_pipelines_and_reaches_wire() {
     let mut off = base();
     let mut on = base();
     on.rs.flags.insert(PipelineRsFlags::ALPHA_TO_COVERAGE);
-    assert_eq!(key_from_snapshot(&on), key_from_snapshot(&off));
+    assert_eq!(key_of(&on), key_of(&off));
     for count in [2, 4, 8] {
         off.sample_count = count;
         on.sample_count = count;
         on.attach = off.attach;
-        assert_ne!(key_from_snapshot(&on), key_from_snapshot(&off));
+        assert_ne!(key_of(&on), key_of(&off));
         for snapshot in [&off, &on] {
-            let key = key_from_snapshot(snapshot);
+            let key = key_of(snapshot);
             let params = params_from_snapshot(&PipelineBuildInputs {
                 snapshot,
                 vertex_attrs: &[],
@@ -410,7 +431,7 @@ fn alpha_to_coverage_keys_only_multisampled_pipelines_and_reaches_wire() {
         }
         on.attach.remove(PipelineAttachFlags::HAS_COLOR_OUTPUT);
         assert!(
-            key_from_snapshot(&on).alpha_to_coverage,
+            key_of(&on).alpha_to_coverage,
             "depth-only sibling keeps coverage"
         );
     }
@@ -441,4 +462,200 @@ fn removing_the_colour_output_matches_a_pass_without_colour_attachments() {
     snapshot.remove_color_output();
     assert!(!snapshot.has_color_output());
     assert_eq!(snapshot.extra, ExtraColorAttachments::NONE);
+}
+
+/// Wire params of `s` with no vertex input, for comparing blend fields.
+fn params_of(s: &PipelineSnapshot) -> CreateRenderPipelineParams {
+    params_from_snapshot(&PipelineBuildInputs {
+        snapshot: s,
+        vertex_attrs: &[],
+        vertex_layouts: &[],
+        device_handle: MetalHandle::NULL,
+    })
+}
+
+/// The blend fields of the wire params, target 0 then targets 1..3.
+fn blend_fields(p: &CreateRenderPipelineParams) -> Vec<u32> {
+    let mut fields = vec![
+        p.blend_enable,
+        p.src_blend as u32,
+        p.dst_blend as u32,
+        p.blend_op as u32,
+        p.src_blend_alpha as u32,
+        p.dst_blend_alpha as u32,
+        p.blend_op_alpha as u32,
+        p.separate_alpha_blend_enable,
+    ];
+    for extra in &p.extra {
+        fields.extend([
+            extra.src_blend as u32,
+            extra.dst_blend as u32,
+            extra.src_blend_alpha as u32,
+            extra.dst_blend_alpha as u32,
+        ]);
+    }
+    fields
+}
+
+#[test]
+fn blend_off_ignores_stale_factors_in_key_and_params() {
+    let mut plain = with_rt1();
+    plain.rs.flags.remove(PipelineRsFlags::BLEND_ENABLE);
+    let mut stale = plain.clone();
+    stale.rs.src_blend = narrow(D3DBLEND_DESTALPHA);
+    stale.rs.dst_blend = narrow(D3DBLEND_INVDESTALPHA);
+    stale.rs.blend_op = narrow(D3DBLENDOP_REVSUBTRACT);
+    stale.rs.src_blend_alpha = narrow(D3DBLEND_SRCALPHA);
+    stale.rs.dst_blend_alpha = narrow(D3DBLEND_INVSRCALPHA);
+    stale.rs.blend_op_alpha = narrow(D3DBLENDOP_REVSUBTRACT);
+    stale.rs.flags.insert(PipelineRsFlags::SEPARATE_ALPHA_BLEND);
+    // The per-target alpha clamp only changes blend factors.
+    stale.extra.has_alpha_mask = 0;
+    stale.attach.remove(PipelineAttachFlags::COLOR_HAS_ALPHA);
+    assert_eq!(key_of(&plain), key_of(&stale));
+    assert_eq!(
+        blend_fields(&params_of(&plain)),
+        blend_fields(&params_of(&stale))
+    );
+    let p = params_of(&stale);
+    assert_eq!(p.blend_enable, 0);
+    assert_eq!(p.src_blend, BlendFactor::One);
+    assert_eq!(p.dst_blend, BlendFactor::Zero);
+    assert_eq!(p.blend_op, BlendOperation::Add);
+    assert_eq!(p.src_blend_alpha, BlendFactor::One);
+    assert_eq!(p.dst_blend_alpha, BlendFactor::Zero);
+    assert_eq!(p.blend_op_alpha, BlendOperation::Add);
+    assert_eq!(p.separate_alpha_blend_enable, 0);
+    assert_eq!(p.extra[0].src_blend, BlendFactor::One);
+    assert_eq!(p.extra[0].dst_blend, BlendFactor::Zero);
+}
+
+#[test]
+fn blend_on_keys_every_factor_difference() {
+    let on = with_rt1();
+    let k = key_of(&on);
+    let mutate = |f: fn(&mut PipelineSnapshot)| {
+        let mut s = with_rt1();
+        f(&mut s);
+        key_of(&s)
+    };
+    assert_ne!(k, mutate(|s| s.rs.src_blend = narrow(D3DBLEND_ONE)), "src");
+    assert_ne!(k, mutate(|s| s.rs.dst_blend = narrow(D3DBLEND_ZERO)), "dst");
+    assert_ne!(
+        k,
+        mutate(|s| s.rs.blend_op = narrow(D3DBLENDOP_REVSUBTRACT)),
+        "op"
+    );
+    assert_ne!(
+        k,
+        mutate(|s| {
+            s.rs.flags.insert(PipelineRsFlags::SEPARATE_ALPHA_BLEND);
+            s.rs.src_blend_alpha = narrow(D3DBLEND_SRCALPHA);
+        }),
+        "separate alpha"
+    );
+    let mut dest_alpha = with_rt1();
+    dest_alpha.rs.src_blend = narrow(D3DBLEND_DESTALPHA);
+    let mut dest_alpha_rt1_no_alpha = dest_alpha.clone();
+    dest_alpha_rt1_no_alpha.extra.has_alpha_mask = 0;
+    assert_ne!(
+        key_of(&dest_alpha),
+        key_of(&dest_alpha_rt1_no_alpha),
+        "render target 1 alpha clamp"
+    );
+    assert_ne!(
+        blend_fields(&params_of(&dest_alpha)),
+        blend_fields(&params_of(&dest_alpha_rt1_no_alpha))
+    );
+}
+
+/// Key of `base()` for `elements`, resolved under the fixed-function convention.
+fn key_for_decl(elements: &[D3DVERTEXELEMENT9], vdecl_hash: u64) -> PipelineKey {
+    let mut s = base();
+    s.vdecl_hash = vdecl_hash;
+    key_from_snapshot(&s, &resolve_attrs_for_ff(elements).attrs)
+}
+
+const fn element(offset: u16, type_: u8, usage: u8) -> D3DVERTEXELEMENT9 {
+    D3DVERTEXELEMENT9 {
+        stream: 0,
+        offset,
+        type_,
+        method: 0,
+        usage,
+        usage_index: 0,
+    }
+}
+
+#[test]
+fn declarations_resolving_to_the_same_attributes_share_a_key() {
+    // An FVF and the declaration spelling out the same elements.
+    let (fvf_elements, _) = fvf_to_elements(D3DFVF_XYZ | D3DFVF_TEX1);
+    let decl = [
+        element(0, D3DDECLTYPE_FLOAT3, D3DDECLUSAGE_POSITION),
+        element(12, D3DDECLTYPE_FLOAT2, D3DDECLUSAGE_TEXCOORD),
+    ];
+    let fvf_hash = u64::from(D3DFVF_XYZ | D3DFVF_TEX1);
+    assert_ne!(fvf_hash, hash_elements(&decl));
+    let from_decl = key_for_decl(&decl, hash_elements(&decl));
+    assert_eq!(key_for_decl(&fvf_elements, fvf_hash), from_decl);
+
+    // A texcoord moved to another offset, and one with another format, do not.
+    let moved = [
+        decl[0],
+        element(16, D3DDECLTYPE_FLOAT2, D3DDECLUSAGE_TEXCOORD),
+    ];
+    let widened = [
+        decl[0],
+        element(12, D3DDECLTYPE_FLOAT3, D3DDECLUSAGE_TEXCOORD),
+    ];
+    let with_normal = [
+        decl[0],
+        decl[1],
+        element(20, D3DDECLTYPE_FLOAT3, D3DDECLUSAGE_NORMAL),
+    ];
+    for (other, what) in [
+        (&moved[..], "offset"),
+        (&widened[..], "format"),
+        (&with_normal[..], "extra attribute"),
+    ] {
+        assert_ne!(
+            from_decl,
+            key_for_decl(other, hash_elements(other)),
+            "{what}"
+        );
+    }
+}
+
+#[test]
+fn attrs_hash_covers_every_attribute_field() {
+    let attr = FLOAT3_AT_0;
+    let h = VertexAttrsHash::from_attrs(&[attr]);
+    for (changed, what) in [
+        (
+            VertexAttrDesc {
+                attr_index: 1,
+                ..attr
+            },
+            "attr_index",
+        ),
+        (
+            VertexAttrDesc {
+                buffer_index: 1,
+                ..attr
+            },
+            "buffer_index",
+        ),
+        (VertexAttrDesc { offset: 4, ..attr }, "offset"),
+        (
+            VertexAttrDesc {
+                format: VertexFormat::Float2,
+                ..attr
+            },
+            "format",
+        ),
+    ] {
+        assert_ne!(h, VertexAttrsHash::from_attrs(&[changed]), "{what}");
+    }
+    assert_ne!(h, VertexAttrsHash::from_attrs(&[attr, attr]), "count");
 }

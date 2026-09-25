@@ -321,6 +321,38 @@ fn recipes_preserve_instancing_constant_streams_mrt_and_siblings() {
 }
 
 #[test]
+fn resolved_recipe_keys_like_the_live_draw_it_recorded() {
+    let attrs = [VertexAttrDesc {
+        attr_index: 0,
+        buffer_index: 0,
+        offset: 0,
+        format: VertexFormat::Float3,
+    }];
+    let mut live = sample_recipe().resolve(MetalHandle::NULL, MetalHandle::NULL);
+    // SAFETY: tests; opaque values never dereferenced.
+    live.vs_fn = unsafe { MetalHandle::new(0x10) };
+    // SAFETY: tests; opaque values never dereferenced.
+    live.ps_fn = unsafe { MetalHandle::new(0x20) };
+    let entries = sample_entries();
+    let recipe = PipelineRecipe::from_snapshot(
+        ShaderRecordRef::new(entries[0].kind, entries[0].key),
+        ShaderRecordRef::new(entries[2].kind, entries[2].key),
+        &live,
+        &attrs,
+    );
+    let mut bytes = Vec::new();
+    recipe.encode(&mut bytes);
+    let decoded = PipelineRecipe::decode(&bytes).expect("decode recipe");
+    assert_eq!(
+        crate::pipeline_state::key_from_snapshot(
+            &decoded.resolve(live.vs_fn, live.ps_fn),
+            decoded.vertex_attrs()
+        ),
+        crate::pipeline_state::key_from_snapshot(&live, &attrs)
+    );
+}
+
+#[test]
 fn duplicate_recipes_share_shader_records_after_compaction() {
     let dir = scratch_dir("recipe-dedup");
     let path = dir.join("mtld3d_shaders.bin");

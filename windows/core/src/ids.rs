@@ -11,7 +11,8 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-use xxhash_rust::xxh3::Xxh3;
+use mtld3d_shared::VertexAttrDesc;
+use xxhash_rust::xxh3::{Xxh3, xxh3_64};
 
 pub use crate::{depth_stencil_state::DepthStencilKey, sampler_state::SamplerKey};
 
@@ -34,6 +35,13 @@ pub struct TextureId(u64);
 /// survives across draws. Minted once at Create and never reused.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct BufferId(u64);
+
+/// Content-hash identity of a resolved vertex attribute list.
+///
+/// Stands in for the list in the render-pipeline key with no compare behind
+/// it, so it is an xxh3 content hash.
+#[derive(PartialEq, Eq, Hash, Debug)]
+pub struct VertexAttrsHash(u64);
 
 impl ProgramId {
     /// Mint from a DXSO token stream.
@@ -97,6 +105,31 @@ impl BufferId {
     }
 }
 
+impl VertexAttrsHash {
+    /// Hash the attributes a vertex descriptor is built from.
+    ///
+    /// Runs on every pipeline key build, so a list of up to sixteen
+    /// attributes is hashed in one shot from a stack copy: the streaming
+    /// hasher's setup costs more than the hash itself. A longer list streams
+    /// the same bytes, which gives the same digest.
+    #[must_use]
+    pub fn from_attrs(attrs: &[VertexAttrDesc]) -> Self {
+        const INLINE_ATTRS: usize = 16;
+        let mut inline = [0u8; ATTR_BYTES * INLINE_ATTRS];
+        if attrs.len() <= INLINE_ATTRS {
+            for (chunk, attr) in inline.as_chunks_mut::<ATTR_BYTES>().0.iter_mut().zip(attrs) {
+                *chunk = attr_bytes(attr);
+            }
+            return Self(xxh3_64(&inline[..attrs.len() * ATTR_BYTES]));
+        }
+        let mut hash = Xxh3::new();
+        for attr in attrs {
+            hash.update(&attr_bytes(attr));
+        }
+        Self(hash.digest())
+    }
+}
+
 impl fmt::LowerHex for ProgramId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::LowerHex::fmt(&self.0, f)
@@ -113,6 +146,25 @@ impl fmt::LowerHex for BufferId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::LowerHex::fmt(&self.0, f)
     }
+}
+
+impl fmt::LowerHex for VertexAttrsHash {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::LowerHex::fmt(&self.0, f)
+    }
+}
+
+/// Bytes one attribute contributes to a [`VertexAttrsHash`].
+const ATTR_BYTES: usize = 16;
+
+/// The four fields of `attr`, little-endian, in declaration order.
+fn attr_bytes(attr: &VertexAttrDesc) -> [u8; ATTR_BYTES] {
+    let mut bytes = [0u8; ATTR_BYTES];
+    bytes[0..4].copy_from_slice(&attr.attr_index.to_le_bytes());
+    bytes[4..8].copy_from_slice(&attr.buffer_index.to_le_bytes());
+    bytes[8..12].copy_from_slice(&attr.offset.to_le_bytes());
+    bytes[12..16].copy_from_slice(&(attr.format as u32).to_le_bytes());
+    bytes
 }
 
 static NEXT_TEXTURE_ID: AtomicU64 = AtomicU64::new(1);

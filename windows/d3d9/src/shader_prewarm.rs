@@ -201,7 +201,7 @@ fn run(
                 continue;
             };
             let snapshot = recipe.resolve(vs.func, ps.func);
-            let key = pipeline_state::key_from_snapshot(&snapshot);
+            let key = pipeline_state::key_from_snapshot(&snapshot, recipe.vertex_attrs());
             // One attempt per resolved key in this startup, including failures.
             // Retained recipes remain available for a later startup or live miss.
             if scheduled.insert(key) {
@@ -237,18 +237,21 @@ fn run(
             continue;
         }
         if snapshot.has_depth() && snapshot.writes_no_color() && snapshot.has_color_output() {
-            primary_candidates.push((snapshot.clone(), pipeline.raw()));
+            primary_candidates.push((snapshot.clone(), recipe.vertex_attrs(), pipeline.raw()));
         }
-        pipelines.insert(pipeline_state::key_from_snapshot(snapshot), pipeline);
+        pipelines.insert(
+            pipeline_state::key_from_snapshot(snapshot, recipe.vertex_attrs()),
+            pipeline,
+        );
     }
 
     let mut no_color_siblings = Vec::new();
-    for (mut snapshot, primary) in primary_candidates {
+    for (mut snapshot, vertex_attrs, primary) in primary_candidates {
         snapshot
             .attach
             .remove(mtld3d_core::pipeline_state::PipelineAttachFlags::HAS_COLOR_OUTPUT);
         snapshot.extra = mtld3d_core::pipeline_state::ExtraColorAttachments::NONE;
-        let key = pipeline_state::key_from_snapshot(&snapshot);
+        let key = pipeline_state::key_from_snapshot(&snapshot, vertex_attrs);
         if let Some(&sibling) = pipelines.get(&key) {
             no_color_siblings.push((primary, sibling));
         }

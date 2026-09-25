@@ -6398,7 +6398,7 @@ impl FrameEncoder {
         shaders: &ShaderRef<'_>,
         sibling: bool,
     ) -> MetalHandle<MTLRenderPipelineStateKind> {
-        let key = pipeline_state::key_from_snapshot(snapshot);
+        let key = pipeline_state::key_from_snapshot(snapshot, vertex_attrs);
         match self.pipeline_cache.lookup(&key) {
             BuildLookup::Ready(handle) => return handle,
             BuildLookup::Failed => return MetalHandle::NULL,

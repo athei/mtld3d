@@ -121,9 +121,9 @@ pub fn create_render_pipeline(
             // D3D9 spec: separate alpha factors/ops only apply when
             // D3DRS_SEPARATEALPHABLENDENABLE is TRUE. Otherwise the RGB
             // values mirror onto alpha. The PE side pre-resolves this in
-            // `pipeline_state::effective_alpha_blend` — by the time the
-            // thunk arrives the alpha fields already carry the correct
-            // effective values, so we just apply them unconditionally.
+            // `pipeline_state::effective_blend`: by the time the thunk
+            // arrives the alpha fields already carry the correct effective
+            // values, so we just apply them unconditionally.
             color0.setBlendingEnabled(true);
             color0.setSourceRGBBlendFactor(mtl_blend_factor(params.src_blend));
             color0.setDestinationRGBBlendFactor(mtl_blend_factor(params.dst_blend));
