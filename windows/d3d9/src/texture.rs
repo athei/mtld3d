@@ -251,13 +251,13 @@ pub struct TextureInner {
     dirty_mask: u32,
     /// Sub-rect a dirty 2D level's upload may narrow to (`None` = whole mip).
     ///
-    /// A partial copy into a level whose staging was dropped after its
-    /// upload re-creates the staging uninitialized outside the copied
-    /// region; a whole-mip upload would then push that garbage over GPU
-    /// content the copy never touched. Tracking the written union lets the
-    /// flush upload only what the copies wrote. A partial `LockRect` narrows
-    /// the same way: its `UnlockRect` publishes the rect the lock named, so a
-    /// glyph written into a font atlas costs a glyph-sized blit. Whole-mip
+    /// The bounding box of every write since the last flush, so a glyph
+    /// written into a font atlas costs a glyph-sized blit rather than a
+    /// whole-mip one; a partial `LockRect` narrows the same way through the
+    /// rect its `UnlockRect` publishes. The box also spans texels between the
+    /// writes, which is sound only because a present staging holds every
+    /// texel the GPU was given: a partial write into a released level reads
+    /// it back first ([`TextureInner::ensure_staging_for_write`]). Whole-mip
     /// writes reset the entry to `None`.
     pending_upload_rects: Vec<Option<DirtyRect>>,
     /// Levels whose staging was released after their upload retired (bit N = level N).
@@ -266,6 +266,13 @@ pub struct TextureInner {
     /// [`TextureInner::staging_droppable`]; `staging[N]` then holds the
     /// shared placeholder page until a write re-creates the level.
     dropped_staging: u32,
+    /// Levels that keep their staging for good once re-created (bit N = level N).
+    ///
+    /// Set when a partial write lands in a released level and reads it back
+    /// from the GPU. A level the game re-writes in part after its release is
+    /// one it keeps writing, and releasing it again would cost that blocking
+    /// read on every later write.
+    kept_staging: u32,
     /// Per-level union of the writes that landed since the level's staging was allocated.
     ///
     /// The staging can only be released once the GPU holds every byte of the
@@ -591,10 +598,11 @@ impl TextureInner {
     /// textures, cubes and volumes keep theirs (their copies serve other
     /// paths); so do the lockable pools. A level a `LockRect` or a `GetDC`
     /// holds keeps its staging either way: both hand out a pointer into those
-    /// pages that stays live until the map is released.
+    /// pages that stays live until the map is released. So does a level in
+    /// `kept_staging`, which the game writes in part after a release.
     fn staging_droppable(&self, level: usize) -> bool {
         self.staging_droppable_class()
-            && self.dropped_staging & (1u32 << level) == 0
+            && (self.dropped_staging | self.kept_staging) & (1u32 << level) == 0
             && !self.locked[level]
             && !self.level_dc_open(level)
     }
@@ -674,11 +682,12 @@ impl TextureInner {
 
     /// Give `level` a staging buffer again before a write lands in it.
     ///
-    /// The fresh buffer holds no pixels, so a partial write into it leaves
-    /// everything outside its region not matching the GPU copy; the upload that
-    /// write schedules is narrowed to the written rect for exactly that reason.
-    /// A `LockRect`, which D3D9 promises the level's current contents, goes
-    /// through [`Self::ensure_staging_for_lock`] instead.
+    /// The fresh buffer holds no pixels, so it serves only a caller that
+    /// defines every byte it will upload: a whole-level write, a level the GPU
+    /// never received, or a read back of the level. A partial CPU write goes
+    /// through [`Self::ensure_staging_for_write`] and a `LockRect`, which D3D9
+    /// promises the level's current contents, through
+    /// [`Self::ensure_staging_for_lock`].
     fn ensure_staging(&mut self, level: usize) {
         if self.dropped_staging & (1u32 << level) == 0 {
             return;
@@ -715,8 +724,8 @@ impl TextureInner {
         }
         let readback = mtld3d_core::texture_staging::released_level_lock_needs_readback(flags)
             && self.was_uploaded[level];
-        self.ensure_staging(level);
         if !readback {
+            self.ensure_staging(level);
             mtld3d_shared::log_once_info_by!(
                 target: crate::LOG_TARGET,
                 key: self.texture_id.raw(),
@@ -727,13 +736,7 @@ impl TextureInner {
             );
             return true;
         }
-        if self.read_level_from_gpu(level) {
-            // The staging is a byte-for-byte copy of what the GPU holds, so
-            // every texel of the level is accounted for and the next upload may
-            // release it again.
-            if let Some(coverage) = self.staging_coverage.get_mut(level) {
-                coverage.mark_full();
-            }
+        if self.read_released_level_back(level) {
             mtld3d_shared::log_once_warn_by!(
                 target: crate::LOG_TARGET,
                 key: self.texture_id.raw(),
@@ -743,9 +746,6 @@ impl TextureInner {
             );
             return true;
         }
-        // Reallocation cleared the dropped bit; keep the readback obligation
-        // on the GPU claim so a later map or partial write retries it.
-        self.level_authority.gpu_wrote(0, level);
         mtld3d_shared::log_once_warn_by!(
             target: crate::LOG_TARGET,
             key: self.texture_id.raw(),
@@ -754,6 +754,67 @@ impl TextureInner {
             self.texture_id.raw()
         );
         false
+    }
+
+    /// Re-create released `level`'s staging for a partial CPU write of it.
+    ///
+    /// The upload the write schedules is the bounding box of every write since
+    /// the last flush, which is sound only over a staging holding the whole
+    /// level, so the level is read back from the GPU before the write lands.
+    /// It then keeps its staging (`kept_staging`): a level written in part
+    /// after its release is written again, and each release would cost the
+    /// same blocking read at the next write. A whole-level write and a level
+    /// the GPU never received take the pages as allocated. Returns false when
+    /// the read back fails, which rejects the write.
+    fn ensure_staging_for_write(&mut self, level: usize, whole_level: bool) -> bool {
+        if self.dropped_staging & (1u32 << level) == 0 {
+            return true;
+        }
+        if !mtld3d_core::texture_staging::released_level_write_needs_readback(
+            whole_level,
+            self.was_uploaded[level],
+        ) {
+            self.ensure_staging(level);
+            return true;
+        }
+        if self.read_released_level_back(level) {
+            self.kept_staging |= 1u32 << level;
+            mtld3d_shared::log_once_info_by!(
+                target: crate::LOG_TARGET,
+                key: self.texture_id.raw(),
+                "texture {:#x}: partial write of level {level} after its staging was released; \
+                 the level is read back from the GPU once and keeps its staging from now on",
+                self.texture_id.raw()
+            );
+            return true;
+        }
+        mtld3d_shared::log_once_warn_by!(
+            target: crate::LOG_TARGET,
+            key: self.texture_id.raw(),
+            "texture {:#x}: partial write of level {level} after its staging was released and \
+             the read back of it failed; the write is rejected",
+            self.texture_id.raw()
+        );
+        false
+    }
+
+    /// Re-create released `level`'s staging and fill it from the GPU copy.
+    ///
+    /// On success the staging is a byte-for-byte copy of what the GPU holds,
+    /// so every texel of the level is accounted for. On failure the
+    /// reallocation has still cleared the dropped bit, so the read back
+    /// obligation moves to the GPU claim, and a later map or partial write
+    /// retries it.
+    fn read_released_level_back(&mut self, level: usize) -> bool {
+        self.ensure_staging(level);
+        if !self.read_level_from_gpu(level) {
+            self.level_authority.gpu_wrote(0, level);
+            return false;
+        }
+        if let Some(coverage) = self.staging_coverage.get_mut(level) {
+            coverage.mark_full();
+        }
+        true
     }
 
     /// Make a subresource's current pixels available in staging for a CPU read.
@@ -1200,7 +1261,9 @@ impl TextureInner {
         if !self.move_subresource_to_staging(0, dst_level, whole) {
             return false;
         }
-        self.ensure_staging(dst_level);
+        if !self.ensure_staging_for_write(dst_level, whole) {
+            return false;
+        }
         self.prepare_volume_staging_write(dst_level);
         let (Some(dst_box), Some(src_box)) =
             (self.staging.get(dst_level), src.staging.get(src_level))
@@ -1488,7 +1551,9 @@ impl TextureInner {
         if !self.move_subresource_to_staging(0, dst_level, whole) {
             return false;
         }
-        self.ensure_staging(dst_level);
+        if !self.ensure_staging_for_write(dst_level, whole) {
+            return false;
+        }
         if !self.flags.contains(TextureFlags::VOLUME_TEXTURE)
             && self.staging[dst_level].has_readers()
         {
@@ -1712,7 +1777,9 @@ impl TextureInner {
         if !self.move_subresource_to_staging(0, dst_level, whole) {
             return false;
         }
-        self.ensure_staging(dst_level);
+        if !self.ensure_staging_for_write(dst_level, whole) {
+            return false;
+        }
         let Some(dst_box) = self.staging.get(dst_level) else {
             return false;
         };
@@ -1915,7 +1982,9 @@ impl TextureInner {
         if !self.move_subresource_to_staging(0, dst_level, whole) {
             return false;
         }
-        self.ensure_staging(dst_level);
+        if !self.ensure_staging_for_write(dst_level, whole) {
+            return false;
+        }
         let Some(dst_box) = self.staging.get(dst_level) else {
             return false;
         };
@@ -3044,6 +3113,7 @@ fn build_texture_inner(info: TextureCreateInfo) -> *mut TextureInner {
         priority: 0,
         staging,
         dropped_staging: 0,
+        kept_staging: 0,
         staging_coverage: Vec::new(),
         upload_generation: Vec::new(),
         dc_open: 0,

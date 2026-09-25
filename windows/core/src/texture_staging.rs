@@ -250,6 +250,22 @@ pub const fn released_level_lock_needs_readback(flags: u32) -> bool {
     flags & D3DLOCK_DISCARD == 0
 }
 
+/// Whether a CPU write into a released level has to read the level back first.
+///
+/// A re-created staging holds nothing until the write lands, and the upload
+/// that follows is the bounding box of every write since the last flush. That
+/// box is only safe to upload while the staging holds the whole level: two
+/// writes before a flush otherwise push uninitialised bytes over the texels
+/// between them, which the GPU copy is the only holder of.
+///
+/// A write covering the whole level defines every byte itself, and a level
+/// the GPU never received has nothing on the GPU to preserve, so neither
+/// reads back. Every other write does.
+#[must_use]
+pub const fn released_level_write_needs_readback(whole_level: bool, was_uploaded: bool) -> bool {
+    !whole_level && was_uploaded
+}
+
 /// Whether a texture's class ever lets a level release its staging after an upload.
 ///
 /// A default-pool texture without `D3DUSAGE_DYNAMIC` cannot be locked in D3D9,
