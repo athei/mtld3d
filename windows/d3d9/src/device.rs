@@ -30,6 +30,7 @@ use mtld3d_core::{
         ApiPerfState, ApiPerfStorage, ApiTimer, BindSubCategory, CycleAddTimer, CycleSetTimer,
         DeviceSubCategory, KeysGate,
     },
+    pipeline_state::vertex_attrs_hash,
     present::LayerPacing,
     readback::{ReadbackDestination, ReadbackReject, ReadbackSource},
     render_scale::TargetExtent,
@@ -878,7 +879,7 @@ bitflags::bitflags! {
         const STAGES      = 1 << 1;
         /// `has_depth` + `has_stencil` on the current render target.
         const RT_DS       = 1 << 3;
-        /// Vertex attribute layout (`AttrSnapshot`: attrs slice, stride, vdecl hash).
+        /// Vertex attribute layout (`AttrSnapshot`: attrs slice, stride, vdecl and attrs hashes).
         const VDECL       = 1 << 4;
         /// Pipeline variant key.
         const VARIANT     = 1 << 5;
@@ -12174,6 +12175,7 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) -> Option<CurrentSnapshotPtr> {
             extents: resolved.extents,
             used_streams: resolved.used_streams,
             vdecl_hash,
+            attrs_hash: vertex_attrs_hash(&resolved.attrs),
         });
     }
     if let Some(v) = vs_value {

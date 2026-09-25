@@ -350,6 +350,8 @@ pub struct AttrSnapshot {
     /// Bit `s` set: stream `s` feeds a consumed attribute.
     pub used_streams: u16,
     pub vdecl_hash: u64,
+    /// `pipeline_state::vertex_attrs_hash` of the slice, the pipeline key's vertex input.
+    pub attrs_hash: u64,
 }
 
 // SAFETY: AttrSnapshot.ptr aliases bytes in the per-frame ScratchArena
@@ -1701,6 +1703,7 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
         vs_fn: vs_handles.func,
         ps_fn: ps_handles.func,
         vdecl_hash,
+        vertex_attrs_hash: attrs.attrs_hash,
         stream_layouts: layouts,
         color_format,
         attach,

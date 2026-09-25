@@ -5,13 +5,19 @@
 //! normalisation and the wire format: an absent extra target drops out of the key, an extra target
 //! the shader never writes gets an empty write mask while target 0 keeps its render-state mask,
 //! destination-alpha factors clamp on an alpha-less target, and the wire params match the key.
+//! Blend factors left over while blending is off, and declarations that resolve to the same
+//! vertex attributes, collapse onto one key.
 
+use mtld3d_shared::mtl::VertexFormat;
 use mtld3d_types::{
     D3DBLEND_DESTALPHA, D3DBLEND_INVDESTALPHA, D3DBLEND_INVSRCALPHA, D3DBLEND_ONE,
-    D3DBLEND_SRCALPHA, D3DBLEND_ZERO, D3DBLENDOP_ADD,
+    D3DBLEND_SRCALPHA, D3DBLEND_ZERO, D3DBLENDOP_ADD, D3DBLENDOP_REVSUBTRACT, D3DDECLTYPE_FLOAT2,
+    D3DDECLTYPE_FLOAT3, D3DDECLUSAGE_NORMAL, D3DDECLUSAGE_POSITION, D3DDECLUSAGE_TEXCOORD,
+    D3DFVF_TEX1, D3DFVF_XYZ, D3DVERTEXELEMENT9,
 };
 
 use super::*;
+use crate::convert::{fvf_to_elements, hash_elements, resolve_attrs_for_ff};
 
 /// D3D enum constant at the snapshot's narrow width.
 fn narrow(v: u32) -> u8 {
@@ -42,6 +48,7 @@ fn base() -> PipelineSnapshot {
         // SAFETY: tests; opaque values never dereferenced.
         ps_fn: unsafe { MetalHandle::new(0x2000) },
         vdecl_hash: 0x3000,
+        vertex_attrs_hash: 0x4000,
         stream_layouts: stream0(32),
         color_format: PixelFormat::Bgra8Unorm,
         // Bgra8Unorm here models an A8R8G8B8 RT, so the default (has-alpha)
@@ -194,7 +201,11 @@ fn key_changes_on_every_field() {
         mutate(|s| s.ps_fn = unsafe { MetalHandle::new(0xFACE) }),
         "ps_fn"
     );
-    assert_ne!(k0, mutate(|s| s.vdecl_hash = 0xFACE), "vdecl_hash");
+    assert_ne!(
+        k0,
+        mutate(|s| s.vertex_attrs_hash = 0xFACE),
+        "vertex_attrs_hash"
+    );
     assert_ne!(
         k0,
         mutate(|s| s.stream_layouts[0].stride = 64),
@@ -441,4 +452,206 @@ fn removing_the_colour_output_matches_a_pass_without_colour_attachments() {
     snapshot.remove_color_output();
     assert!(!snapshot.has_color_output());
     assert_eq!(snapshot.extra, ExtraColorAttachments::NONE);
+}
+
+/// Wire params of `s` with no vertex input, for comparing blend fields.
+fn params_of(s: &PipelineSnapshot) -> CreateRenderPipelineParams {
+    params_from_snapshot(&PipelineBuildInputs {
+        snapshot: s,
+        vertex_attrs: &[],
+        vertex_layouts: &[],
+        device_handle: MetalHandle::NULL,
+    })
+}
+
+/// The blend fields of the wire params, target 0 then targets 1..3.
+fn blend_fields(p: &CreateRenderPipelineParams) -> Vec<u32> {
+    let mut fields = vec![
+        p.blend_enable,
+        p.src_blend as u32,
+        p.dst_blend as u32,
+        p.blend_op as u32,
+        p.src_blend_alpha as u32,
+        p.dst_blend_alpha as u32,
+        p.blend_op_alpha as u32,
+        p.separate_alpha_blend_enable,
+    ];
+    for extra in &p.extra {
+        fields.extend([
+            extra.src_blend as u32,
+            extra.dst_blend as u32,
+            extra.src_blend_alpha as u32,
+            extra.dst_blend_alpha as u32,
+        ]);
+    }
+    fields
+}
+
+#[test]
+fn blend_off_ignores_stale_factors_in_key_and_params() {
+    let mut plain = with_rt1();
+    plain.rs.flags.remove(PipelineRsFlags::BLEND_ENABLE);
+    let mut stale = plain.clone();
+    stale.rs.src_blend = narrow(D3DBLEND_DESTALPHA);
+    stale.rs.dst_blend = narrow(D3DBLEND_INVDESTALPHA);
+    stale.rs.blend_op = narrow(D3DBLENDOP_REVSUBTRACT);
+    stale.rs.src_blend_alpha = narrow(D3DBLEND_SRCALPHA);
+    stale.rs.dst_blend_alpha = narrow(D3DBLEND_INVSRCALPHA);
+    stale.rs.blend_op_alpha = narrow(D3DBLENDOP_REVSUBTRACT);
+    stale.rs.flags.insert(PipelineRsFlags::SEPARATE_ALPHA_BLEND);
+    // The per-target alpha clamp only changes blend factors.
+    stale.extra.has_alpha_mask = 0;
+    stale.attach.remove(PipelineAttachFlags::COLOR_HAS_ALPHA);
+    assert_eq!(key_from_snapshot(&plain), key_from_snapshot(&stale));
+    assert_eq!(
+        blend_fields(&params_of(&plain)),
+        blend_fields(&params_of(&stale))
+    );
+    let p = params_of(&stale);
+    assert_eq!(p.blend_enable, 0);
+    assert_eq!(p.src_blend, BlendFactor::One);
+    assert_eq!(p.dst_blend, BlendFactor::Zero);
+    assert_eq!(p.blend_op, BlendOperation::Add);
+    assert_eq!(p.src_blend_alpha, BlendFactor::One);
+    assert_eq!(p.dst_blend_alpha, BlendFactor::Zero);
+    assert_eq!(p.blend_op_alpha, BlendOperation::Add);
+    assert_eq!(p.separate_alpha_blend_enable, 0);
+    assert_eq!(p.extra[0].src_blend, BlendFactor::One);
+    assert_eq!(p.extra[0].dst_blend, BlendFactor::Zero);
+}
+
+#[test]
+fn blend_on_keys_every_factor_difference() {
+    let on = with_rt1();
+    let k = key_from_snapshot(&on);
+    let mutate = |f: fn(&mut PipelineSnapshot)| {
+        let mut s = with_rt1();
+        f(&mut s);
+        key_from_snapshot(&s)
+    };
+    assert_ne!(k, mutate(|s| s.rs.src_blend = narrow(D3DBLEND_ONE)), "src");
+    assert_ne!(k, mutate(|s| s.rs.dst_blend = narrow(D3DBLEND_ZERO)), "dst");
+    assert_ne!(
+        k,
+        mutate(|s| s.rs.blend_op = narrow(D3DBLENDOP_REVSUBTRACT)),
+        "op"
+    );
+    assert_ne!(
+        k,
+        mutate(|s| {
+            s.rs.flags.insert(PipelineRsFlags::SEPARATE_ALPHA_BLEND);
+            s.rs.src_blend_alpha = narrow(D3DBLEND_SRCALPHA);
+        }),
+        "separate alpha"
+    );
+    let mut dest_alpha = with_rt1();
+    dest_alpha.rs.src_blend = narrow(D3DBLEND_DESTALPHA);
+    let mut dest_alpha_rt1_no_alpha = dest_alpha.clone();
+    dest_alpha_rt1_no_alpha.extra.has_alpha_mask = 0;
+    assert_ne!(
+        key_from_snapshot(&dest_alpha),
+        key_from_snapshot(&dest_alpha_rt1_no_alpha),
+        "render target 1 alpha clamp"
+    );
+    assert_ne!(
+        blend_fields(&params_of(&dest_alpha)),
+        blend_fields(&params_of(&dest_alpha_rt1_no_alpha))
+    );
+}
+
+/// `base()` keyed on the attributes `elements` resolve to under the fixed-function convention.
+fn snapshot_for_decl(elements: &[D3DVERTEXELEMENT9], vdecl_hash: u64) -> PipelineSnapshot {
+    let mut s = base();
+    s.vdecl_hash = vdecl_hash;
+    s.vertex_attrs_hash = vertex_attrs_hash(&resolve_attrs_for_ff(elements).attrs);
+    s
+}
+
+const fn element(offset: u16, type_: u8, usage: u8) -> D3DVERTEXELEMENT9 {
+    D3DVERTEXELEMENT9 {
+        stream: 0,
+        offset,
+        type_,
+        method: 0,
+        usage,
+        usage_index: 0,
+    }
+}
+
+#[test]
+fn declarations_resolving_to_the_same_attributes_share_a_key() {
+    // An FVF and the declaration spelling out the same elements.
+    let (fvf_elements, _) = fvf_to_elements(D3DFVF_XYZ | D3DFVF_TEX1);
+    let decl = [
+        element(0, D3DDECLTYPE_FLOAT3, D3DDECLUSAGE_POSITION),
+        element(12, D3DDECLTYPE_FLOAT2, D3DDECLUSAGE_TEXCOORD),
+    ];
+    let from_fvf = snapshot_for_decl(&fvf_elements, u64::from(D3DFVF_XYZ | D3DFVF_TEX1));
+    let from_decl = snapshot_for_decl(&decl, hash_elements(&decl));
+    assert_ne!(from_fvf.vdecl_hash, from_decl.vdecl_hash);
+    assert_eq!(key_from_snapshot(&from_fvf), key_from_snapshot(&from_decl));
+
+    // A texcoord moved to another offset, and one with another format, do not.
+    let moved = [
+        decl[0],
+        element(16, D3DDECLTYPE_FLOAT2, D3DDECLUSAGE_TEXCOORD),
+    ];
+    let widened = [
+        decl[0],
+        element(12, D3DDECLTYPE_FLOAT3, D3DDECLUSAGE_TEXCOORD),
+    ];
+    let with_normal = [
+        decl[0],
+        decl[1],
+        element(20, D3DDECLTYPE_FLOAT3, D3DDECLUSAGE_NORMAL),
+    ];
+    for (other, what) in [
+        (&moved[..], "offset"),
+        (&widened[..], "format"),
+        (&with_normal[..], "extra attribute"),
+    ] {
+        assert_ne!(
+            key_from_snapshot(&from_decl),
+            key_from_snapshot(&snapshot_for_decl(other, hash_elements(other))),
+            "{what}"
+        );
+    }
+}
+
+#[test]
+fn attrs_hash_covers_every_attribute_field() {
+    let attr = VertexAttrDesc {
+        attr_index: 0,
+        buffer_index: 0,
+        offset: 0,
+        format: VertexFormat::Float3,
+    };
+    let h = vertex_attrs_hash(&[attr]);
+    for (changed, what) in [
+        (
+            VertexAttrDesc {
+                attr_index: 1,
+                ..attr
+            },
+            "attr_index",
+        ),
+        (
+            VertexAttrDesc {
+                buffer_index: 1,
+                ..attr
+            },
+            "buffer_index",
+        ),
+        (VertexAttrDesc { offset: 4, ..attr }, "offset"),
+        (
+            VertexAttrDesc {
+                format: VertexFormat::Float2,
+                ..attr
+            },
+            "format",
+        ),
+    ] {
+        assert_ne!(h, vertex_attrs_hash(&[changed]), "{what}");
+    }
+    assert_ne!(h, vertex_attrs_hash(&[attr, attr]), "count");
 }

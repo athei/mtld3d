@@ -17,7 +17,8 @@ use mtld3d_shared::{
     mtl::{BlendFactor, BlendOperation, ColorWriteMask, PixelFormat, VertexStepFunction},
     mtl_handle::MTLFunctionKind,
 };
-use mtld3d_types::MAX_STREAMS;
+use mtld3d_types::{D3DBLEND_ONE, D3DBLEND_ZERO, D3DBLENDOP_ADD, MAX_STREAMS};
+use xxhash_rust::xxh3::Xxh3;
 
 use crate::convert::{d3d_to_metal_blend_op, d3d_to_metal_blend_rt, d3d_to_metal_write_mask};
 
@@ -225,7 +226,16 @@ impl PipelineRsBits {
 pub struct PipelineSnapshot {
     pub vs_fn: MetalHandle<MTLFunctionKind>,
     pub ps_fn: MetalHandle<MTLFunctionKind>,
+    /// Declaration identity: the FVF code, or the declaration's element hash.
+    ///
+    /// Not keyed; the persisted recipe and the build diagnostics carry it.
     pub vdecl_hash: u64,
+    /// [`vertex_attrs_hash`] of the attributes the draw's declaration resolves to.
+    ///
+    /// Keyed in place of `vdecl_hash`: the vertex descriptor is built from
+    /// these attributes and `stream_layouts` alone, so two declarations that
+    /// resolve alike share a pipeline.
+    pub vertex_attrs_hash: u64,
     /// Vertex buffer layout per D3D9 stream, indexed by stream.
     ///
     /// Canonical: a stream the draw does not read is
@@ -304,15 +314,15 @@ impl PipelineSnapshot {
     /// target 0 (D3D9 has one blend state).
     fn extra_blend_factors(
         &self,
+        blend: &EffectiveBlend,
         extra_index: usize,
     ) -> (BlendFactor, BlendFactor, BlendFactor, BlendFactor) {
         let has_alpha = self.extra.is_present(extra_index) && self.extra.has_alpha(extra_index);
-        let (src_a, dst_a, _) = effective_alpha_blend(self);
         (
-            d3d_to_metal_blend_rt(u32::from(self.rs.src_blend), has_alpha),
-            d3d_to_metal_blend_rt(u32::from(self.rs.dst_blend), has_alpha),
-            d3d_to_metal_blend_rt(src_a, has_alpha),
-            d3d_to_metal_blend_rt(dst_a, has_alpha),
+            d3d_to_metal_blend_rt(blend.src, has_alpha),
+            d3d_to_metal_blend_rt(blend.dst, has_alpha),
+            d3d_to_metal_blend_rt(blend.src_alpha, has_alpha),
+            d3d_to_metal_blend_rt(blend.dst_alpha, has_alpha),
         )
     }
 
@@ -355,7 +365,7 @@ impl PipelineSnapshot {
 pub struct PipelineKey {
     vs_fn: MetalHandle<MTLFunctionKind>,
     ps_fn: MetalHandle<MTLFunctionKind>,
-    vdecl_hash: u64,
+    vertex_attrs_hash: u64,
     stream_layouts: [StreamLayout; MAX_STREAMS as usize],
     blend_enable: u32,
     src_blend: BlendFactor,
@@ -374,7 +384,8 @@ pub struct PipelineKey {
     ///
     /// The alpha bit stands in for the per-target blend factors: they differ
     /// from target 0's only through the destination-alpha clamp, which is a
-    /// pure function of this bit, so keying the bit keys the factors.
+    /// pure function of this bit, so keying the bit keys the factors. It is
+    /// zero while blending is off, when no factor reaches Metal.
     extra_present_mask: u8,
     extra_has_alpha_mask: u8,
     extra_formats: [PixelFormat; 3],
@@ -451,30 +462,52 @@ pub fn vertex_layouts_from_snapshot(s: &PipelineSnapshot) -> Vec<VertexBufferLay
         .collect()
 }
 
+/// Content identity of a resolved vertex attribute list.
+///
+/// Stands in for the list in [`PipelineKey`] with no compare behind it, so
+/// it is an xxh3 content hash. The draw path computes it once per resolved
+/// declaration, the recipe loader once per recipe.
+#[must_use]
+pub fn vertex_attrs_hash(attrs: &[VertexAttrDesc]) -> u64 {
+    let mut hash = Xxh3::new();
+    for attr in attrs {
+        hash.update(&attr.attr_index.to_le_bytes());
+        hash.update(&attr.buffer_index.to_le_bytes());
+        hash.update(&attr.offset.to_le_bytes());
+        hash.update(&(attr.format as u32).to_le_bytes());
+    }
+    hash.digest()
+}
+
 #[must_use]
 pub fn key_from_snapshot(s: &PipelineSnapshot) -> PipelineKey {
-    let (src_a, dst_a, op_a) = effective_alpha_blend(s);
+    let blend = effective_blend(&s.rs);
     PipelineKey {
         vs_fn: s.vs_fn,
         ps_fn: s.ps_fn,
-        vdecl_hash: s.vdecl_hash,
+        vertex_attrs_hash: s.vertex_attrs_hash,
         stream_layouts: s.stream_layouts,
         blend_enable: u32::from(s.rs.blend_enable()),
-        src_blend: d3d_to_metal_blend_rt(u32::from(s.rs.src_blend), s.color_has_alpha()),
-        dst_blend: d3d_to_metal_blend_rt(u32::from(s.rs.dst_blend), s.color_has_alpha()),
-        blend_op: d3d_to_metal_blend_op(u32::from(s.rs.blend_op)),
-        src_blend_alpha: d3d_to_metal_blend_rt(src_a, s.color_has_alpha()),
-        dst_blend_alpha: d3d_to_metal_blend_rt(dst_a, s.color_has_alpha()),
-        blend_op_alpha: d3d_to_metal_blend_op(op_a),
-        separate_alpha_blend_enable: u32::from(s.rs.separate_alpha_blend_enable()),
+        src_blend: d3d_to_metal_blend_rt(blend.src, s.color_has_alpha()),
+        dst_blend: d3d_to_metal_blend_rt(blend.dst, s.color_has_alpha()),
+        blend_op: d3d_to_metal_blend_op(blend.op),
+        src_blend_alpha: d3d_to_metal_blend_rt(blend.src_alpha, s.color_has_alpha()),
+        dst_blend_alpha: d3d_to_metal_blend_rt(blend.dst_alpha, s.color_has_alpha()),
+        blend_op_alpha: d3d_to_metal_blend_op(blend.op_alpha),
+        separate_alpha_blend_enable: u32::from(blend.separate_alpha),
         color_write_mask: d3d_to_metal_write_mask(u32::from(s.rs.color_write_mask)),
         has_depth: u32::from(s.has_depth()),
         has_stencil: u32::from(s.has_stencil()),
         color_format: s.color_format,
         has_color_output: u32::from(s.has_color_output()),
         extra_present_mask: s.extra.present_mask,
-        // Absent slots drop their alpha bit so the key stays canonical.
-        extra_has_alpha_mask: s.extra.has_alpha_mask & s.extra.present_mask,
+        // Absent slots drop their alpha bit so the key stays canonical, and
+        // so do all slots while blending is off.
+        extra_has_alpha_mask: if s.rs.blend_enable() {
+            s.extra.has_alpha_mask & s.extra.present_mask
+        } else {
+            0
+        },
         extra_formats: core::array::from_fn(|i| s.extra_format(i)),
         extra_write_masks: core::array::from_fn(|i| s.extra_write_mask(i)),
         sample_count: s.sample_count.max(1),
@@ -491,7 +524,7 @@ pub fn key_from_snapshot(s: &PipelineSnapshot) -> PipelineKey {
 #[must_use]
 pub fn params_from_snapshot(inputs: &PipelineBuildInputs<'_>) -> CreateRenderPipelineParams {
     let s = inputs.snapshot;
-    let (src_a, dst_a, op_a) = effective_alpha_blend(s);
+    let blend = effective_blend(&s.rs);
     let vertex_attr_count =
         u32::try_from(inputs.vertex_attrs.len()).expect("vertex attr count ≤ D3D9 max 16");
     let vertex_layout_count =
@@ -505,13 +538,13 @@ pub fn params_from_snapshot(inputs: &PipelineBuildInputs<'_>) -> CreateRenderPip
         vertex_attr_count,
         vertex_layout_count,
         blend_enable: u32::from(s.rs.blend_enable()),
-        src_blend: d3d_to_metal_blend_rt(u32::from(s.rs.src_blend), s.color_has_alpha()),
-        dst_blend: d3d_to_metal_blend_rt(u32::from(s.rs.dst_blend), s.color_has_alpha()),
-        blend_op: d3d_to_metal_blend_op(u32::from(s.rs.blend_op)),
-        src_blend_alpha: d3d_to_metal_blend_rt(src_a, s.color_has_alpha()),
-        dst_blend_alpha: d3d_to_metal_blend_rt(dst_a, s.color_has_alpha()),
-        blend_op_alpha: d3d_to_metal_blend_op(op_a),
-        separate_alpha_blend_enable: u32::from(s.rs.separate_alpha_blend_enable()),
+        src_blend: d3d_to_metal_blend_rt(blend.src, s.color_has_alpha()),
+        dst_blend: d3d_to_metal_blend_rt(blend.dst, s.color_has_alpha()),
+        blend_op: d3d_to_metal_blend_op(blend.op),
+        src_blend_alpha: d3d_to_metal_blend_rt(blend.src_alpha, s.color_has_alpha()),
+        dst_blend_alpha: d3d_to_metal_blend_rt(blend.dst_alpha, s.color_has_alpha()),
+        blend_op_alpha: d3d_to_metal_blend_op(blend.op_alpha),
+        separate_alpha_blend_enable: u32::from(blend.separate_alpha),
         color_write_mask: d3d_to_metal_write_mask(u32::from(s.rs.color_write_mask)),
         has_depth: u32::from(s.has_depth()),
         has_stencil: u32::from(s.has_stencil()),
@@ -521,7 +554,8 @@ pub fn params_from_snapshot(inputs: &PipelineBuildInputs<'_>) -> CreateRenderPip
         sample_count: u32::from(s.sample_count.max(1)),
         alpha_to_coverage: u32::from(s.rs.alpha_to_coverage(s.sample_count)),
         extra: core::array::from_fn(|i| {
-            let (src_blend, dst_blend, src_blend_alpha, dst_blend_alpha) = s.extra_blend_factors(i);
+            let (src_blend, dst_blend, src_blend_alpha, dst_blend_alpha) =
+                s.extra_blend_factors(&blend, i);
             ExtraColorAttachmentParams {
                 format: s.extra_format(i),
                 write_mask: s.extra_write_mask(i),
@@ -536,24 +570,65 @@ pub fn params_from_snapshot(inputs: &PipelineBuildInputs<'_>) -> CreateRenderPip
     }
 }
 
-/// D3D9 spec: the alpha-side blend factors / op are conditional.
+/// The blend factors and operations a compiled pipeline sees, as D3D9 enum values.
 ///
-/// They only take effect when `D3DRS_SEPARATEALPHABLENDENABLE` is TRUE.
-/// Otherwise the RGB values apply to alpha too. Resolve here once so both
-/// the key and the thunk params see the same effective alpha state.
-fn effective_alpha_blend(s: &PipelineSnapshot) -> (u32, u32, u32) {
-    if s.rs.separate_alpha_blend_enable() {
+/// Built only by [`effective_blend`], which both the key and the wire params
+/// read, so the two cannot drift.
+struct EffectiveBlend {
+    src: u32,
+    dst: u32,
+    op: u32,
+    src_alpha: u32,
+    dst_alpha: u32,
+    op_alpha: u32,
+    /// `D3DRS_SEPARATEALPHABLENDENABLE`, cleared while blending is off.
+    separate_alpha: bool,
+}
+
+/// Resolve the blend state that reaches Metal.
+///
+/// Metal ignores the factors and operations of an attachment whose blending
+/// is off, so with `D3DRS_ALPHABLENDENABLE` clear they collapse to src
+/// `ONE`, dst `ZERO`, op `ADD` with separate alpha off, and draws that differ
+/// only in stale blend states share a pipeline. With blending on, the alpha
+/// factors and operation take effect only when
+/// `D3DRS_SEPARATEALPHABLENDENABLE` is TRUE (D3D9 spec); otherwise the RGB
+/// values apply to alpha too.
+fn effective_blend(rs: &PipelineRsBits) -> EffectiveBlend {
+    if !rs.blend_enable() {
+        return EffectiveBlend {
+            src: D3DBLEND_ONE,
+            dst: D3DBLEND_ZERO,
+            op: D3DBLENDOP_ADD,
+            src_alpha: D3DBLEND_ONE,
+            dst_alpha: D3DBLEND_ZERO,
+            op_alpha: D3DBLENDOP_ADD,
+            separate_alpha: false,
+        };
+    }
+    let (src, dst, op) = (
+        u32::from(rs.src_blend),
+        u32::from(rs.dst_blend),
+        u32::from(rs.blend_op),
+    );
+    let separate_alpha = rs.separate_alpha_blend_enable();
+    let (src_alpha, dst_alpha, op_alpha) = if separate_alpha {
         (
-            u32::from(s.rs.src_blend_alpha),
-            u32::from(s.rs.dst_blend_alpha),
-            u32::from(s.rs.blend_op_alpha),
+            u32::from(rs.src_blend_alpha),
+            u32::from(rs.dst_blend_alpha),
+            u32::from(rs.blend_op_alpha),
         )
     } else {
-        (
-            u32::from(s.rs.src_blend),
-            u32::from(s.rs.dst_blend),
-            u32::from(s.rs.blend_op),
-        )
+        (src, dst, op)
+    };
+    EffectiveBlend {
+        src,
+        dst,
+        op,
+        src_alpha,
+        dst_alpha,
+        op_alpha,
+        separate_alpha,
     }
 }
 
