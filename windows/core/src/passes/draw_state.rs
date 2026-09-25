@@ -21,7 +21,7 @@ use mtld3d_shared::{
     mtl_handle::MTLRenderPipelineStateKind,
 };
 use rustc_hash::FxHashMap;
-use xxhash_rust::xxh3::Xxh3;
+use xxhash_rust::xxh3::xxh3_64_with_seed;
 
 use super::{LAST_BOUND_MAX_STAGES, Pass, PassState, VERTEX_SAMPLER_SLOTS, sets_fresh_value};
 
@@ -47,6 +47,13 @@ const SLOT_COUNT: usize = VERTEX_SAMPLERS + VERTEX_SAMPLER_SLOTS;
 
 /// The classes from this one on hold bindings, compared only where they were bound before.
 const FIRST_BINDING_CLASS: usize = 9;
+
+/// Bit `n` set for every slot `n` a binding class holds.
+const BINDING_SLOTS: u128 =
+    (u128::MAX >> (u128::BITS as usize - SLOT_COUNT)) & !((1 << VERTEX_BUFFERS) - 1);
+
+/// The class each slot belongs to, indexed by slot.
+const SLOT_CLASS: [usize; SLOT_COUNT] = slot_classes();
 
 const _: () = assert!(SLOT_COUNT <= u128::BITS as usize, "one mask bit per slot");
 const _: () = assert!(CLASSES[FIRST_BINDING_CLASS].1 == VERTEX_BUFFERS);
@@ -94,7 +101,7 @@ pub struct DrawStateLedger {
     draws: Vec<DrawState>,
 }
 
-/// What one draw saw: its pipeline, and a hash of every other state class.
+/// What one draw saw: its pipeline, and a fingerprint of every other state class.
 struct DrawState {
     /// Where the draw sat, as `(pass index, command index)`, for the panic message.
     location: (usize, usize),
@@ -106,16 +113,20 @@ struct DrawState {
 
 /// The state one Metal render encoder holds while its commands replay.
 ///
-/// Each slot keeps the bits of the command that last set it, zero while unset (command types
-/// start at 1, so a set slot is never all zero). The class hashes are refreshed lazily, only
-/// for the classes a command touched since the previous draw.
+/// Each slot keeps an xxh3 fingerprint of the command that last set it, zero while unset
+/// (command types start at 1, so a set slot is never all zero bits). The fingerprint is seeded
+/// with the slot index, so a slot's position is part of it even where one command sets two slots
+/// with the same bits, as the null texture binds do. A class's fingerprint is the wrapping sum of
+/// its slots', kept current as each command lands: a draw copies it without rehashing anything,
+/// and leaving a slot out of a comparison is one subtraction. Two different states of a class
+/// differ by a sum of fingerprints of distinct inputs, which is zero by chance about once in 2^64
+/// compares, the same odds as one hash over the whole class.
 struct EncoderReplay {
     pipeline: u64,
-    slots: [[u64; 4]; SLOT_COUNT],
+    slot_fingerprints: [u64; SLOT_COUNT],
     /// Bit `n` set while slot `n` holds a value.
     set: u128,
-    class_hashes: [u64; CLASSES.len()],
-    dirty: u16,
+    class_fingerprints: [u64; CLASSES.len()],
 }
 
 impl PassState {
@@ -131,7 +142,7 @@ impl PassState {
                     location: (pass_index, command_index),
                     pipeline: encoder.pipeline,
                     set: encoder.set,
-                    classes: *encoder.class_hashes(),
+                    classes: encoder.class_fingerprints,
                 });
             });
         }
@@ -166,7 +177,7 @@ impl PassState {
                 };
                 let (was_pass, was_command) = recorded.location;
                 let pipeline = encoder.pipeline;
-                let classes = encoder.compared_hashes(recorded.set);
+                let classes = encoder.compared_fingerprints(recorded.set);
                 assert!(
                     pipeline == recorded.pipeline
                         || alt.get(&recorded.pipeline).map(|h| h.raw()) == Some(pipeline),
@@ -197,14 +208,13 @@ impl PassState {
 }
 
 impl EncoderReplay {
-    /// A fresh encoder: nothing bound, every class due for a hash.
+    /// A fresh encoder: nothing bound.
     const fn new() -> Self {
         Self {
             pipeline: 0,
-            slots: [[0; 4]; SLOT_COUNT],
+            slot_fingerprints: [0; SLOT_COUNT],
             set: 0,
-            class_hashes: [0; CLASSES.len()],
-            dirty: u16::MAX,
+            class_fingerprints: [0; CLASSES.len()],
         }
     }
 
@@ -297,59 +307,33 @@ impl EncoderReplay {
     }
 
     fn set(&mut self, slot: usize, bits: [u64; 4]) {
-        self.slots[slot] = bits;
-        if bits == [0; 4] {
+        let fingerprint = if bits == [0; 4] {
             self.set &= !(1 << slot);
+            0
         } else {
             self.set |= 1 << slot;
-        }
-        let class = CLASSES
-            .iter()
-            .position(|&(_, start, end)| (start..end).contains(&slot))
-            .expect("every slot belongs to a class");
-        self.dirty |= 1 << class;
+            slot_fingerprint(slot, bits)
+        };
+        let class = &mut self.class_fingerprints[SLOT_CLASS[slot]];
+        *class = class
+            .wrapping_sub(self.slot_fingerprints[slot])
+            .wrapping_add(fingerprint);
+        self.slot_fingerprints[slot] = fingerprint;
     }
 
-    /// The per-class hashes of the current state, refreshing the classes touched since last time.
-    fn class_hashes(&mut self) -> &[u64; CLASSES.len()] {
-        for (class, &(_, start, end)) in CLASSES.iter().enumerate() {
-            if self.dirty & (1 << class) != 0 {
-                let mut hasher = Xxh3::new();
-                for word in self.slots[start..end].iter().flatten() {
-                    hasher.update(&word.to_le_bytes());
-                }
-                self.class_hashes[class] = hasher.digest();
-            }
-        }
-        self.dirty = 0;
-        &self.class_hashes
-    }
-
-    /// The per-class hashes to compare with a recorded draw whose set slots were `recorded`.
+    /// The per-class fingerprints to compare with a recorded draw whose set slots were `recorded`.
     ///
-    /// A binding class is hashed over the slots bound at the recorded draw only, the rest read as
-    /// unset; every other class is hashed whole. When no binding slot is set here that was unset
-    /// there, those are the ordinary hashes.
-    fn compared_hashes(&mut self, recorded: u128) -> [u64; CLASSES.len()] {
-        let mut compared = *self.class_hashes();
-        let extra = self.set & !recorded;
-        for (class, &(_, start, end)) in CLASSES.iter().enumerate().skip(FIRST_BINDING_CLASS) {
-            let class_mask = ((1u128 << (end - start)) - 1) << start;
-            if extra & class_mask == 0 {
-                continue;
-            }
-            let mut hasher = Xxh3::new();
-            for (slot, words) in self.slots[start..end].iter().enumerate() {
-                let words = if recorded & (1 << (start + slot)) == 0 {
-                    &[0; 4]
-                } else {
-                    words
-                };
-                for word in words {
-                    hasher.update(&word.to_le_bytes());
-                }
-            }
-            compared[class] = hasher.digest();
+    /// A binding class counts only the slots bound at the recorded draw, the rest read as unset;
+    /// every other class counts whole. When no binding slot is set here that was unset there,
+    /// those are the ordinary fingerprints.
+    const fn compared_fingerprints(&self, recorded: u128) -> [u64; CLASSES.len()] {
+        let mut compared = self.class_fingerprints;
+        let mut extra = self.set & !recorded & BINDING_SLOTS;
+        while extra != 0 {
+            let slot = extra.trailing_zeros() as usize;
+            let class = &mut compared[SLOT_CLASS[slot]];
+            *class = class.wrapping_sub(self.slot_fingerprints[slot]);
+            extra &= extra - 1;
         }
         compared
     }
@@ -358,7 +342,7 @@ impl EncoderReplay {
 /// Replay `pass` on a fresh encoder, calling `on_draw` for each draw outside its clear-quad blocks.
 ///
 /// `on_draw` receives the draw's command index and the encoder state the draw runs with.
-fn replay_pass(pass: &Pass, mut on_draw: impl FnMut(usize, &mut EncoderReplay)) {
+fn replay_pass(pass: &Pass, mut on_draw: impl FnMut(usize, &EncoderReplay)) {
     let mut encoder = EncoderReplay::new();
     for (index, cmd) in pass.commands.iter().enumerate() {
         if !cmd.is_draw() {
@@ -370,9 +354,39 @@ fn replay_pass(pass: &Pass, mut on_draw: impl FnMut(usize, &mut EncoderReplay)) 
             .iter()
             .any(|&(start, end)| (start..end).contains(&index));
         if !in_clear_quad {
-            on_draw(index, &mut encoder);
+            on_draw(index, &encoder);
         }
     }
+}
+
+/// The fingerprint of a slot holding `bits`: one `xxh3_64` over its 32 bytes, seeded by the slot.
+fn slot_fingerprint(slot: usize, bits: [u64; 4]) -> u64 {
+    let mut bytes = [0u8; 32];
+    for (chunk, word) in bytes.as_chunks_mut::<8>().0.iter_mut().zip(bits) {
+        *chunk = word.to_le_bytes();
+    }
+    xxh3_64_with_seed(&bytes, slot as u64)
+}
+
+/// Build [`SLOT_CLASS`] from [`CLASSES`], failing the build if a slot has no class.
+const fn slot_classes() -> [usize; SLOT_COUNT] {
+    let mut table = [usize::MAX; SLOT_COUNT];
+    let mut class = 0;
+    while class < CLASSES.len() {
+        let (_, start, end) = CLASSES[class];
+        let mut slot = start;
+        while slot < end {
+            table[slot] = class;
+            slot += 1;
+        }
+        class += 1;
+    }
+    let mut slot = 0;
+    while slot < SLOT_COUNT {
+        assert!(table[slot] != usize::MAX, "every slot belongs to a class");
+        slot += 1;
+    }
+    table
 }
 
 /// The whole command as four words, so two binds compare equal only when every field does.
@@ -384,3 +398,6 @@ fn command_bits(cmd: &Command) -> [u64; 4] {
         cmd.param_d,
     ]
 }
+
+#[cfg(test)]
+mod tests;
