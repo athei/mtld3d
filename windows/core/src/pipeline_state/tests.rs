@@ -19,6 +19,14 @@ use mtld3d_types::{
 use super::*;
 use crate::convert::{fvf_to_elements, hash_elements, resolve_attrs_for_ff};
 
+/// A position-shaped attribute: register 0, stream 0, offset 0, three floats.
+const FLOAT3_AT_0: VertexAttrDesc = VertexAttrDesc {
+    attr_index: 0,
+    buffer_index: 0,
+    offset: 0,
+    format: VertexFormat::Float3,
+};
+
 /// D3D enum constant at the snapshot's narrow width.
 fn narrow(v: u32) -> u8 {
     u8::try_from(v).expect("D3D9 enum render-state value ≤ u8::MAX")
@@ -48,7 +56,7 @@ fn base() -> PipelineSnapshot {
         // SAFETY: tests; opaque values never dereferenced.
         ps_fn: unsafe { MetalHandle::new(0x2000) },
         vdecl_hash: 0x3000,
-        vertex_attrs_hash: 0x4000,
+        vertex_attrs_hash: VertexAttrsHash::from_attrs(&[FLOAT3_AT_0]),
         stream_layouts: stream0(32),
         color_format: PixelFormat::Bgra8Unorm,
         // Bgra8Unorm here models an A8R8G8B8 RT, so the default (has-alpha)
@@ -203,7 +211,7 @@ fn key_changes_on_every_field() {
     );
     assert_ne!(
         k0,
-        mutate(|s| s.vertex_attrs_hash = 0xFACE),
+        mutate(|s| s.vertex_attrs_hash = VertexAttrsHash::from_attrs(&[])),
         "vertex_attrs_hash"
     );
     assert_ne!(
@@ -563,7 +571,7 @@ fn blend_on_keys_every_factor_difference() {
 fn snapshot_for_decl(elements: &[D3DVERTEXELEMENT9], vdecl_hash: u64) -> PipelineSnapshot {
     let mut s = base();
     s.vdecl_hash = vdecl_hash;
-    s.vertex_attrs_hash = vertex_attrs_hash(&resolve_attrs_for_ff(elements).attrs);
+    s.vertex_attrs_hash = VertexAttrsHash::from_attrs(&resolve_attrs_for_ff(elements).attrs);
     s
 }
 
@@ -620,13 +628,8 @@ fn declarations_resolving_to_the_same_attributes_share_a_key() {
 
 #[test]
 fn attrs_hash_covers_every_attribute_field() {
-    let attr = VertexAttrDesc {
-        attr_index: 0,
-        buffer_index: 0,
-        offset: 0,
-        format: VertexFormat::Float3,
-    };
-    let h = vertex_attrs_hash(&[attr]);
+    let attr = FLOAT3_AT_0;
+    let h = VertexAttrsHash::from_attrs(&[attr]);
     for (changed, what) in [
         (
             VertexAttrDesc {
@@ -651,7 +654,7 @@ fn attrs_hash_covers_every_attribute_field() {
             "format",
         ),
     ] {
-        assert_ne!(h, vertex_attrs_hash(&[changed]), "{what}");
+        assert_ne!(h, VertexAttrsHash::from_attrs(&[changed]), "{what}");
     }
-    assert_ne!(h, vertex_attrs_hash(&[attr, attr]), "count");
+    assert_ne!(h, VertexAttrsHash::from_attrs(&[attr, attr]), "count");
 }

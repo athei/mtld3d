@@ -18,9 +18,11 @@ use mtld3d_shared::{
     mtl_handle::MTLFunctionKind,
 };
 use mtld3d_types::{D3DBLEND_ONE, D3DBLEND_ZERO, D3DBLENDOP_ADD, MAX_STREAMS};
-use xxhash_rust::xxh3::Xxh3;
 
-use crate::convert::{d3d_to_metal_blend_op, d3d_to_metal_blend_rt, d3d_to_metal_write_mask};
+use crate::{
+    convert::{d3d_to_metal_blend_op, d3d_to_metal_blend_rt, d3d_to_metal_write_mask},
+    ids::VertexAttrsHash,
+};
 
 bitflags::bitflags! {
     /// Boolean RS bits that affect pipeline identity.
@@ -230,12 +232,12 @@ pub struct PipelineSnapshot {
     ///
     /// Not keyed; the persisted recipe and the build diagnostics carry it.
     pub vdecl_hash: u64,
-    /// [`vertex_attrs_hash`] of the attributes the draw's declaration resolves to.
+    /// Hash of the attributes the draw's declaration resolves to.
     ///
     /// Keyed in place of `vdecl_hash`: the vertex descriptor is built from
     /// these attributes and `stream_layouts` alone, so two declarations that
     /// resolve alike share a pipeline.
-    pub vertex_attrs_hash: u64,
+    pub vertex_attrs_hash: VertexAttrsHash,
     /// Vertex buffer layout per D3D9 stream, indexed by stream.
     ///
     /// Canonical: a stream the draw does not read is
@@ -365,7 +367,7 @@ impl PipelineSnapshot {
 pub struct PipelineKey {
     vs_fn: MetalHandle<MTLFunctionKind>,
     ps_fn: MetalHandle<MTLFunctionKind>,
-    vertex_attrs_hash: u64,
+    vertex_attrs_hash: VertexAttrsHash,
     stream_layouts: [StreamLayout; MAX_STREAMS as usize],
     blend_enable: u32,
     src_blend: BlendFactor,
@@ -460,23 +462,6 @@ pub fn vertex_layouts_from_snapshot(s: &PipelineSnapshot) -> Vec<VertexBufferLay
             step_rate: l.step_rate,
         })
         .collect()
-}
-
-/// Content identity of a resolved vertex attribute list.
-///
-/// Stands in for the list in [`PipelineKey`] with no compare behind it, so
-/// it is an xxh3 content hash. The draw path computes it once per resolved
-/// declaration, the recipe loader once per recipe.
-#[must_use]
-pub fn vertex_attrs_hash(attrs: &[VertexAttrDesc]) -> u64 {
-    let mut hash = Xxh3::new();
-    for attr in attrs {
-        hash.update(&attr.attr_index.to_le_bytes());
-        hash.update(&attr.buffer_index.to_le_bytes());
-        hash.update(&attr.offset.to_le_bytes());
-        hash.update(&(attr.format as u32).to_le_bytes());
-    }
-    hash.digest()
 }
 
 #[must_use]

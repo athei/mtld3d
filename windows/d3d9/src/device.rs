@@ -23,14 +23,13 @@ use mtld3d_core::{
         FormatMapping, compute_mip_count, compute_mip_size, compute_volume_mip_count,
         is_dxt_format, linear_mip_size, linear_row_pitch, map_d3d_format, resolve_mip_levels,
     },
-    ids::{BufferId, ProgramId, TextureId},
+    ids::{BufferId, ProgramId, TextureId, VertexAttrsHash},
     page_box::PageBox,
     passes::{BackbufferContents, ExtraColorSlot},
     perf::{
         ApiPerfState, ApiPerfStorage, ApiTimer, BindSubCategory, CycleAddTimer, CycleSetTimer,
         DeviceSubCategory, KeysGate,
     },
-    pipeline_state::vertex_attrs_hash,
     present::LayerPacing,
     readback::{ReadbackDestination, ReadbackReject, ReadbackSource},
     render_scale::TargetExtent,
@@ -12175,7 +12174,7 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) -> Option<CurrentSnapshotPtr> {
             extents: resolved.extents,
             used_streams: resolved.used_streams,
             vdecl_hash,
-            attrs_hash: vertex_attrs_hash(&resolved.attrs),
+            attrs_hash: VertexAttrsHash::from_attrs(&resolved.attrs),
         });
     }
     if let Some(v) = vs_value {

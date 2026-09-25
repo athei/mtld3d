@@ -62,9 +62,10 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use xxhash_rust::xxh3::Xxh3;
 
 use crate::{
+    ids::VertexAttrsHash,
     pipeline_state::{
         ExtraColorAttachments, PipelineAttachFlags, PipelineRsBits, PipelineRsFlags,
-        PipelineSnapshot, StreamLayout, vertex_attrs_hash,
+        PipelineSnapshot, StreamLayout,
     },
     shader_compile_stats::CompileBucket,
 };
@@ -628,8 +629,8 @@ impl ShaderRecordRef {
 
 /// Persistent description of one successfully-created render pipeline.
 ///
-/// The stored snapshot always has null function handles and a zero
-/// attribute hash. [`Self::resolve`] installs functions compiled for the
+/// The stored snapshot always has null function handles and the attribute
+/// hash of an empty list. [`Self::resolve`] installs functions compiled for the
 /// current Metal device and the hash of the stored attributes before the
 /// ordinary pipeline-state builder consumes it.
 #[derive(PartialEq, Eq)]
@@ -652,7 +653,7 @@ impl PipelineRecipe {
         let mut stored = snapshot.clone();
         stored.vs_fn = MetalHandle::NULL;
         stored.ps_fn = MetalHandle::NULL;
-        stored.vertex_attrs_hash = 0;
+        stored.vertex_attrs_hash = VertexAttrsHash::from_attrs(&[]);
         stored.sample_count = stored.sample_count.max(1);
         stored.extra.has_alpha_mask &= stored.extra.present_mask;
         for index in 0..stored.extra.formats.len() {
@@ -693,7 +694,7 @@ impl PipelineRecipe {
         let mut snapshot = self.snapshot.clone();
         snapshot.vs_fn = vs_fn;
         snapshot.ps_fn = ps_fn;
-        snapshot.vertex_attrs_hash = vertex_attrs_hash(&self.vertex_attrs);
+        snapshot.vertex_attrs_hash = VertexAttrsHash::from_attrs(&self.vertex_attrs);
         snapshot
     }
 
@@ -818,7 +819,7 @@ impl PipelineRecipe {
                 vs_fn: MetalHandle::NULL,
                 ps_fn: MetalHandle::NULL,
                 vdecl_hash,
-                vertex_attrs_hash: 0,
+                vertex_attrs_hash: VertexAttrsHash::from_attrs(&[]),
                 stream_layouts,
                 color_format,
                 attach,

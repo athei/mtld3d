@@ -11,6 +11,7 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
+use mtld3d_shared::VertexAttrDesc;
 use xxhash_rust::xxh3::Xxh3;
 
 pub use crate::{depth_stencil_state::DepthStencilKey, sampler_state::SamplerKey};
@@ -34,6 +35,14 @@ pub struct TextureId(u64);
 /// survives across draws. Minted once at Create and never reused.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct BufferId(u64);
+
+/// Content-hash identity of a resolved vertex attribute list.
+///
+/// Stands in for the list in the render-pipeline key with no compare behind
+/// it, so it is an xxh3 content hash. `Copy` because the per-draw attribute
+/// snapshot that carries it is `Copy`.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct VertexAttrsHash(u64);
 
 impl ProgramId {
     /// Mint from a DXSO token stream.
@@ -97,6 +106,24 @@ impl BufferId {
     }
 }
 
+impl VertexAttrsHash {
+    /// Hash the attributes a vertex descriptor is built from.
+    ///
+    /// The draw path computes it once per resolved declaration, the recipe
+    /// loader once per recipe.
+    #[must_use]
+    pub fn from_attrs(attrs: &[VertexAttrDesc]) -> Self {
+        let mut hash = Xxh3::new();
+        for attr in attrs {
+            hash.update(&attr.attr_index.to_le_bytes());
+            hash.update(&attr.buffer_index.to_le_bytes());
+            hash.update(&attr.offset.to_le_bytes());
+            hash.update(&(attr.format as u32).to_le_bytes());
+        }
+        Self(hash.digest())
+    }
+}
+
 impl fmt::LowerHex for ProgramId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::LowerHex::fmt(&self.0, f)
@@ -110,6 +137,12 @@ impl fmt::LowerHex for TextureId {
 }
 
 impl fmt::LowerHex for BufferId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::LowerHex::fmt(&self.0, f)
+    }
+}
+
+impl fmt::LowerHex for VertexAttrsHash {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::LowerHex::fmt(&self.0, f)
     }

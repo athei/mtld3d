@@ -18,7 +18,7 @@ use mtld3d_core::{
     dxso::{
         FfPsKey, FfVsKey, TextureType, VariantFlags, VariantKey, VsSamplerKinds, bound_sampler_type,
     },
-    ids::{BufferId, ProgramId},
+    ids::{BufferId, ProgramId, VertexAttrsHash},
     passes::{
         NULL_TEXTURE_SAMPLER_SENTINEL, Rt0DropCandidate, VertexBufferBind,
         null_texture_tex_sentinel, sampler_cache_key,
@@ -350,8 +350,8 @@ pub struct AttrSnapshot {
     /// Bit `s` set: stream `s` feeds a consumed attribute.
     pub used_streams: u16,
     pub vdecl_hash: u64,
-    /// `pipeline_state::vertex_attrs_hash` of the slice, the pipeline key's vertex input.
-    pub attrs_hash: u64,
+    /// Hash of the slice, the pipeline key's vertex input.
+    pub attrs_hash: VertexAttrsHash,
 }
 
 // SAFETY: AttrSnapshot.ptr aliases bytes in the per-frame ScratchArena
