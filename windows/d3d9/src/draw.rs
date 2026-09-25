@@ -1929,10 +1929,6 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
     // opened or continued next is the one the decision describes.
     enc.set_rt0_dropped(rt0_drop);
     enc.begin_render_pass_if_needed();
-    // The draw is emitted from here on. What it samples feeds whatever its
-    // pass's targets keep, so a texture a kept target reads may not lose a
-    // draw.
-    enc.note_draw_reads(stage_bindings, ps_sampled_mask);
     debug_assert_eq!(
         enc.rt0_dropped(),
         !pipeline_snapshot.has_color_output(),

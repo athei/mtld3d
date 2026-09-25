@@ -47,7 +47,7 @@ use super::{
     open_or_create_cache_file,
 };
 use crate::{
-    draw::{PsSource, ShaderRef, StageBindingsPtr, VsSource},
+    draw::{PsSource, ShaderRef, VsSource},
     unix_call::unix_call,
 };
 
@@ -57,15 +57,6 @@ use crate::{
 /// keep a burst's libraries compiling side by side while leaving cores for
 /// the API, encoder and submit threads.
 const COMPILE_WORKERS: usize = 4;
-
-/// Frames after the last queued build during which sampling reads are watched.
-///
-/// Watching costs the draws of passes into kept targets a walk of their
-/// bindings, so it runs only around builds. A skip needs the reads of the
-/// previous frame on record, so the first two frames of a burst after a
-/// quiet spell wait for their builds instead; a span a few seconds long at
-/// a game's frame rate keeps a scene change's burst of builds inside one.
-const READ_WATCH_FRAMES: u64 = 600;
 
 /// Stack reserved for each compile worker: 1 MiB, half the thread default.
 ///
@@ -530,25 +521,6 @@ pub struct StretchCopyTargets {
     pub dst_subresource: u32,
     /// The copy covers the whole of a colour destination.
     pub whole_color_dst: bool,
-}
-
-/// The bindings the last reader walk covered, so a draw sharing them skips it.
-#[derive(PartialEq, Eq)]
-pub struct ReadsWalked {
-    submit_seq: u64,
-    pass: usize,
-    /// Address of the snapshot's packed stage bindings, an identity only.
-    bindings: usize,
-    mask: u16,
-    sampled_mask: u16,
-}
-
-/// What a memoised pass verdict holds for: the submission, the pass, the history state.
-#[derive(PartialEq, Eq)]
-pub struct PassVerdictKey {
-    submit_seq: u64,
-    pass: usize,
-    generation: u64,
 }
 
 /// How the cold half of a library resolve ended on the encoder thread.
@@ -1019,7 +991,6 @@ impl FrameEncoder {
     }
 
     fn enqueue(&mut self, job: CompileJob) -> JobTicket {
-        self.cleared_targets.watch_reads(READ_WATCH_FRAMES);
         let ticket = self.compile_tickets.issue();
         self.compile_in_flight.insert(ticket);
         self.compile_queue.push(
@@ -1058,11 +1029,9 @@ impl FrameEncoder {
     /// Whether a draw whose build is in flight is left out of this frame.
     ///
     /// Only under `shader.asyncCompile`, never while an occlusion query
-    /// counts, only once the reads of the whole previous frame are on record
-    /// ([`Self::note_draw_reads`] watches them only around builds, so the
-    /// first two frames of a burst wait), and only when
-    /// [`Self::targets_rebuilt`] holds for the bound targets and the depth
-    /// and stencil planes in `planes`, the ones the draw tests or writes.
+    /// counts, and only when [`Self::targets_rebuilt`] holds for the bound
+    /// targets and the depth and stencil planes in `planes`, the ones the
+    /// draw tests or writes.
     /// Reached only from a pending resolve, so none of it costs a draw whose
     /// builds are done. A skip is counted and logged
     /// once; the caller drops the draw.
@@ -1075,7 +1044,6 @@ impl FrameEncoder {
     pub fn skip_pending_draw(&mut self, planes: ClearPlanes) -> bool {
         if !self.flags.contains(FrameEncoderFlags::ASYNC_COMPILE)
             || self.visibility.active_count() != 0
-            || !self.cleared_targets.reads_known()
             || !self.targets_rebuilt(planes)
         {
             return false;
@@ -1101,7 +1069,7 @@ impl FrameEncoder {
     /// clears. It is read into kept content when this frame or the last
     /// copied out of it with a `StretchRect` into a target that is not
     /// rebuilt, or sampled it in a pass whose own targets are not rebuilt
-    /// ([`Self::note_draw_reads`]). A read-back to system memory is not such
+    /// ([`Self::note_frame_reads`]). A read-back to system memory is not such
     /// a read ([`Self::note_copy_source`] says why).
     ///
     /// Not covered: the first frame such a kept read happens in. A draw
@@ -1137,95 +1105,81 @@ impl FrameEncoder {
         may_skip_draw(&color[..count], depth, stencil)
     }
 
-    /// Mark the textures a draw into kept targets samples as feeding kept content.
+    /// Mark the textures the passes of this submission read into kept targets.
     ///
-    /// Called for every emitted draw, after its pass opened. It does
-    /// anything only under `shader.asyncCompile`, while reads are watched
-    /// (for [`READ_WATCH_FRAMES`] after a build was queued) and some
-    /// texture has a recent clear on record; outside a burst of builds a
-    /// draw pays two flag tests. Then the pass's verdict (whether its colour
-    /// targets and depth plane are kept) is worked out once per pass and
-    /// history change and memoised. Only a draw in a kept pass walks its
-    /// bindings, a run of draws sharing their bindings walks once, and only
-    /// a texture with a recent clear is marked, since no other can ever have
-    /// a draw left out of it.
-    #[inline]
-    pub fn note_draw_reads(&mut self, stages: &StageBindingsPtr, sampled_mask: u16) {
-        if self.flags.contains(FrameEncoderFlags::ASYNC_COMPILE)
-            && self.cleared_targets.reads_watched()
-            && !self.cleared_targets.is_empty()
-            && self.pass_is_kept()
-        {
-            self.mark_draw_reads(stages, sampled_mask);
-        }
-    }
-
-    /// Whether the open pass writes into a target that is not rebuilt every frame.
-    #[inline]
-    fn pass_is_kept(&mut self) -> bool {
-        let key = PassVerdictKey {
-            submit_seq: self.current_submit_seq,
-            pass: self.pass_state.current_pass_index(),
-            generation: self.cleared_targets.generation(),
-        };
-        match &self.pass_verdict {
-            Some((cached, kept)) if *cached == key => *kept,
-            _ => self.judge_pass(key),
-        }
-    }
-
-    #[cold]
-    #[inline(never)]
-    fn judge_pass(&mut self, key: PassVerdictKey) -> bool {
-        let planes = if self.pass_state.pass_binds_depth() {
-            ClearPlanes::DEPTH
-        } else {
-            ClearPlanes::empty()
-        };
-        let kept = !self.targets_rebuilt(planes);
-        self.pass_verdict = Some((key, kept));
-        kept
-    }
-
-    #[inline(never)]
-    fn mark_draw_reads(&mut self, stages: &StageBindingsPtr, sampled_mask: u16) {
-        // A run of draws in one pass sharing their bindings marks the same
-        // textures; only the first of them walks.
-        let walked = ReadsWalked {
-            submit_seq: self.current_submit_seq,
-            pass: self.pass_state.current_pass_index(),
-            bindings: stages.bindings.as_ptr().addr(),
-            mask: stages.mask,
-            sampled_mask,
-        };
-        if self.reads_walked.as_ref() == Some(&walked) {
+    /// Called once per submission, before its passes are taken. The pass
+    /// state records every texture bind with the pass it belongs to while
+    /// `shader.asyncCompile` is on; a pass whose colour targets or depth
+    /// plane are not rebuilt every frame is kept, and each texture it read
+    /// that has a recent clear is marked as feeding kept content, for this
+    /// frame and the next. No other texture can ever have a draw left out
+    /// of it. The work is per bind and per pass, never per draw, and a
+    /// frame's marks are made at its end, so the frame after a kept read
+    /// first appears is the first one they protect.
+    pub fn note_frame_reads(&mut self) {
+        if self.pass_state.pass_reads().is_empty() {
             return;
         }
-        self.reads_walked = Some(walked);
-        let fragment = stages
-            .iter()
-            .filter(|(stage, _)| sampled_mask & (1u16 << stage) != 0)
-            .map(|(_, binding)| Some(binding.texture_id));
-        let vertex = self.vertex_tex_bindings.iter().map(|b| b.texture_id);
-        // Every fragment stage and vertex slot, so the walk allocates nothing.
-        let mut read = [MetalHandle::NULL;
-            crate::stage_bindings::STAGE_COUNT + mtld3d_core::passes::VERTEX_SAMPLER_SLOTS];
-        let mut count = 0;
-        for texture in fragment
-            .chain(vertex)
-            .flatten()
-            .filter_map(|id| self.texture_cache.get(&id).map(|state| state.views.linear))
-            .filter(|&texture| self.cleared_targets.tracks(texture))
-        {
-            let Some(slot) = read.get_mut(count) else {
-                break;
-            };
-            *slot = texture;
-            count += 1;
+        if self.cleared_targets.is_empty() {
+            self.pass_state.clear_pass_reads();
+            return;
         }
-        for &texture in &read[..count] {
+        let mut marks = core::mem::take(&mut self.read_marks);
+        marks.clear();
+        let mut verdict: Option<(usize, bool)> = None;
+        for &(pass, texture) in self.pass_state.pass_reads() {
+            if !self.cleared_targets.tracks(texture) {
+                continue;
+            }
+            let kept = match verdict {
+                Some((judged, kept)) if judged == pass => kept,
+                _ => {
+                    let kept = self.pass_is_kept(pass);
+                    verdict = Some((pass, kept));
+                    kept
+                }
+            };
+            if kept {
+                marks.push(texture);
+            }
+        }
+        for &texture in &marks {
             self.cleared_targets.mark_feeds_persistent(texture);
         }
+        self.read_marks = marks;
+        self.pass_state.clear_pass_reads();
+    }
+
+    /// Whether the recorded pass `index` writes into a target that is not rebuilt every frame.
+    fn pass_is_kept(&self, index: usize) -> bool {
+        let Some(pass) = self.pass_state.passes().get(index) else {
+            return false;
+        };
+        let history = &self.cleared_targets;
+        let color_rebuilt = |texture: MetalHandle<MTLTextureKind>, subresource: u32| {
+            (self.pass_state.is_discarded_back_buffer(texture)
+                || history.regenerated(texture, subresource, ClearPlanes::COLOR))
+                && !history.feeds_persistent(texture)
+        };
+        let rt0 = pass.color_texture();
+        if !rt0.is_null() && !color_rebuilt(rt0, pass.color_slice() | (pass.color_level() << 16)) {
+            return true;
+        }
+        let extra_kept = pass
+            .extra_color()
+            .iter()
+            .filter(|attachment| attachment.is_bound())
+            .any(|attachment| {
+                !color_rebuilt(
+                    attachment.texture(),
+                    attachment.slice() | (attachment.level() << 16),
+                )
+            });
+        let depth = pass.depth_texture();
+        let depth_rebuilt = depth.is_null()
+            || (history.regenerated(depth, pass.depth_level(), ClearPlanes::DEPTH)
+                && !history.feeds_persistent(depth));
+        extra_kept || !depth_rebuilt
     }
 
     /// Account a `StretchRect` from `copy.src` into `copy.dst`.

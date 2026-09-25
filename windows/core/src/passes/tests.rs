@@ -9876,3 +9876,21 @@ fn a_kept_back_buffer_is_not_a_discarded_one() {
     });
     assert!(!s.is_discarded_back_buffer(backbuffer()));
 }
+
+/// Texture binds are recorded per pass only while recording is on, and leave with their passes.
+#[test]
+fn pass_reads_follow_the_passes_that_bind_them() {
+    let mut s = fresh();
+    s.emit_command(Command::set_fragment_texture(tex(0x7000).raw(), 0));
+    assert!(s.pass_reads().is_empty(), "off by default");
+    s.record_pass_reads(true);
+    s.emit_command(Command::set_fragment_texture(tex(0x7001).raw(), 0));
+    s.set_color_render_target(tex(0x5000), 640, 480, RT_FORMAT, RenderScale::IDENTITY);
+    s.emit_command(Command::set_fragment_texture(tex(0x7002).raw(), 1));
+    assert_eq!(s.pass_reads(), [(0, tex(0x7001)), (1, tex(0x7002))]);
+    let _ = s.take_finished_passes();
+    assert!(s.pass_reads().is_empty(), "taken with their passes");
+    s.record_pass_reads(false);
+    s.emit_command(Command::set_fragment_texture(tex(0x7003).raw(), 0));
+    assert!(s.pass_reads().is_empty());
+}

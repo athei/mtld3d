@@ -292,9 +292,7 @@ record. A knob, where one makes sense, is named with its default.
   target that was copied or sampled into kept content in this or the
   previous frame. Only the first frame of such a read can miss a skipped
   draw, and a read-back to system memory, such as a screenshot, sees the
-  frame as drawn, skipped draws included. Which textures feed kept content
-  is watched only while shaders build, so the first two frames of a burst
-  of builds after a quiet spell wait. The runner pins the knob off, so no site observes
+  frame as drawn, skipped draws included. The runner pins the knob off, so no site observes
   it. Knob: `shader.asyncCompile`, default `true`.
 
 ## Range-fog coverage

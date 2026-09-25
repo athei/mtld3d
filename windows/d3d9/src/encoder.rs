@@ -1319,13 +1319,8 @@ pub struct FrameEncoder {
     /// the one before. Advanced at `begin_frame` unless the previous submit
     /// was a mid-frame flush, whose frame goes on.
     cleared_targets: ClearHistory,
-    /// Whether the open pass writes into kept targets, memoised by `note_draw_reads`.
-    ///
-    /// The draws of one pass share their targets, so the history is asked
-    /// once per pass and history change rather than once per draw.
-    pass_verdict: Option<(compile::PassVerdictKey, bool)>,
-    /// The bindings the last `note_draw_reads` walk marked, cleared when a vertex binding changes.
-    reads_walked: Option<compile::ReadsWalked>,
+    /// Scratch for the textures `note_frame_reads` marks, kept for its capacity.
+    read_marks: Vec<MetalHandle<MTLTextureKind>>,
     /// Pointer to the most recently shipped `CurrentSnapshot`.
     ///
     /// Lives in the per-frame `ScratchArena`. Set by
@@ -1690,7 +1685,13 @@ impl FrameEncoder {
             }
         }
         Self {
-            pass_state: PassState::new(),
+            pass_state: {
+                // Which pass reads which texture is what keeps a draw into a
+                // target feeding kept content from being left out.
+                let mut pass_state = PassState::new();
+                pass_state.record_pass_reads(flags.contains(FrameEncoderFlags::ASYNC_COMPILE));
+                pass_state
+            },
             last_bound: LastBoundCache::new(),
             lod_bias_table: sampler_state::LodBiasTableCache::new(),
             vs_bound_constants: SnapshotBytesCache::new(),
@@ -1760,8 +1761,7 @@ impl FrameEncoder {
             compile_in_flight: FxHashSet::default(),
             compile_tickets: TicketSource::new(),
             cleared_targets: ClearHistory::new(),
-            pass_verdict: None,
-            reads_walked: None,
+            read_marks: Vec::new(),
             current_snapshot: None,
             vs_constants_mirror: Box::new([[0.0; 4]; CONSTANT_ROWS]),
             ps_constants_mirror: Box::new([[0.0; 4]; CONSTANT_ROWS]),
@@ -5651,7 +5651,6 @@ impl FrameEncoder {
         id: Option<mtld3d_core::ids::TextureId>,
     ) {
         self.vertex_tex_bindings[slot].texture_id = id;
-        self.reads_walked = None;
     }
 
     /// Update one mirrored vertex sampler state (`SetSamplerState` on 257..=260).
@@ -9746,6 +9745,7 @@ fn finalize_submit(enc: &mut FrameEncoder, frame: &FrameData) -> (SubmitFramePar
     // `commands` the descriptors point into) can outlive this frame's
     // encoder state. `apply_pass_rules` above has already rewritten them
     // in place, so the descriptors built from the taken vec are final.
+    enc.note_frame_reads();
     let passes = enc.pass_state.take_finished_passes();
 
     let visibility_buffer_handle = enc.visibility.current_buffer_handle();

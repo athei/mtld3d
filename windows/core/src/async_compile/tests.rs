@@ -245,33 +245,3 @@ fn the_generation_moves_with_every_answer_change() {
     history.begin_frame();
     assert_ne!(history.generation(), marked);
 }
-
-/// Reads are on record only from the second full frame of a watch span, until it lapses.
-#[test]
-fn reads_are_known_from_the_second_frame_of_a_watch_and_lapse_after_it() {
-    let mut history = ClearHistory::new();
-    assert!(!history.reads_watched());
-    assert!(!history.reads_known());
-    history.watch_reads(2);
-    assert!(history.reads_watched());
-    assert!(
-        !history.reads_known(),
-        "this frame was not watched from its start"
-    );
-    history.begin_frame();
-    assert!(
-        !history.reads_known(),
-        "the previous frame was only partly watched"
-    );
-    history.begin_frame();
-    assert!(history.reads_known());
-    history.watch_reads(2);
-    history.begin_frame();
-    history.begin_frame();
-    assert!(history.reads_known(), "a later build extends the span");
-    history.begin_frame();
-    assert!(!history.reads_watched(), "the span lapses");
-    assert!(!history.reads_known());
-    history.watch_reads(2);
-    assert!(!history.reads_known(), "a lapsed span starts over");
-}
