@@ -11,6 +11,7 @@
 
 mod a2b10g10r10;
 mod a2r10g10b10;
+mod async_compile;
 mod bench;
 mod bench_frame_shape;
 mod bench_shader_stutter;

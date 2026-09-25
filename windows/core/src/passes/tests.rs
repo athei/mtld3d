@@ -9833,3 +9833,24 @@ fn a_colour_clear_ends_a_dropped_pass_first() {
     s.end_rt0_dropped_pass("test");
     assert!(!s.current_pass_closed());
 }
+
+/// The back buffer answers by identity, and the attached targets list render target 0 first.
+#[test]
+fn attached_color_targets_name_rt0_and_the_extras_the_pass_attaches() {
+    let mut s = fresh();
+    assert!(s.is_back_buffer(backbuffer()));
+    assert!(!s.is_back_buffer(MetalHandle::NULL));
+    assert_eq!(
+        s.attached_color_targets().collect::<Vec<_>>(),
+        [(backbuffer(), 0)]
+    );
+    s.set_extra_color_render_target(1, Some(slot(tex(0x3000), BB_SIZE)));
+    s.set_extra_color_render_target(2, Some(slot(tex(0x4000), (64, 64))));
+    assert_eq!(
+        s.attached_color_targets().collect::<Vec<_>>(),
+        [(backbuffer(), 0), (tex(0x3000), 0)],
+        "a target sized unlike render target 0 is attached to no pass"
+    );
+    s.set_color_render_target(tex(0x5000), 640, 480, RT_FORMAT, RenderScale::IDENTITY);
+    assert!(!s.is_back_buffer(s.current_color_texture()));
+}

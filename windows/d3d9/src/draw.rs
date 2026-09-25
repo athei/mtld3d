@@ -12,6 +12,7 @@ pub use mtld3d_core::shader_cache::{
     ps_source_disk_key_programmable, vs_source_disk_key_programmable,
 };
 use mtld3d_core::{
+    async_compile::{JobTicket, Resolution},
     convert::{d3d_depth_bias_to_clip, d3d_to_metal_cull, d3d_to_metal_fill},
     depth_stencil_state::{DepthStencilSnapshot, STENCIL_MASK_BITS},
     dirty_range::{indexed_vb_range_lower_bound, nonindexed_vb_range},
@@ -1624,28 +1625,77 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
     drop(t_keys);
     // 2. Resolve the VS and PS libraries. The hot path is a borrow-probe of
     //    the source-keyed index (no per-draw content hash, no clone); the
-    //    `disk_key` Xxh3 + warm-cache bridge + compile happen lazily inside,
-    //    only on a miss (~once per shader).
+    //    `disk_key` Xxh3 + warm-cache bridge + enqueue happen lazily inside,
+    //    only on a miss (~once per shader). Builds finished since the last
+    //    draw are installed first, so the probes see them.
     let t_lookup = CycleAddTimer::start(enc.op_sub_detail_ptr(OpSubDetail::RLookup));
-    let Some(vs_handles) = enc.resolve_vs_library(vs) else {
-        let dk = vs.disk_key();
-        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET, "draw dropped: resolve_vs_library returned None");
-        mtld3d_shared::log_once_trace_by!(
-            target: crate::LOG_TARGET,
-            key: dk,
-            "drop: VS {dk:#x} did not resolve",
-        );
-        return;
-    };
-    let Some(ps_handles) = enc.resolve_ps_library(ps, ps_variant) else {
-        let dk = ps.disk_key(ps_variant);
-        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET, "draw dropped: resolve_ps_library returned None");
-        mtld3d_shared::log_once_trace_by!(
-            target: crate::LOG_TARGET,
-            key: dk,
-            "drop: PS {dk:#x} did not resolve",
-        );
-        return;
+    enc.drain_compile_results();
+    // Whether the draw writes a colour target, which decides whether a
+    // pending build may skip it on the colour targets' account or only on
+    // the depth attachment's.
+    let color_written = !rt0_drop
+        && !render_state
+            .pipeline_rs
+            .writes_no_color(&extra_attachments, ps_color_out_mask);
+    let mut waited = false;
+    let (vs_handles, ps_handles) = loop {
+        // Both stages resolve before any decision, so a draw missing both
+        // queues both builds at once.
+        let vs_resolved = enc.resolve_vs_library(vs);
+        if matches!(vs_resolved, Resolution::Failed) {
+            let dk = vs.disk_key();
+            mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET, "draw dropped: the VS library failed to build");
+            mtld3d_shared::log_once_trace_by!(
+                target: crate::LOG_TARGET,
+                key: dk,
+                "drop: VS {dk:#x} did not resolve",
+            );
+            return;
+        }
+        let ps_resolved = enc.resolve_ps_library(ps, ps_variant);
+        if matches!(ps_resolved, Resolution::Failed) {
+            let dk = ps.disk_key(ps_variant);
+            mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET, "draw dropped: the PS library failed to build");
+            mtld3d_shared::log_once_trace_by!(
+                target: crate::LOG_TARGET,
+                key: dk,
+                "drop: PS {dk:#x} did not resolve",
+            );
+            return;
+        }
+        let mut pending = [None; 2];
+        let vs_handles = match vs_resolved {
+            Resolution::Ready(handles) => Some(handles),
+            Resolution::Pending(ticket) => {
+                pending[0] = Some(ticket);
+                None
+            }
+            Resolution::Failed => None,
+        };
+        let ps_handles = match ps_resolved {
+            Resolution::Ready(handles) => Some(handles),
+            Resolution::Pending(ticket) => {
+                pending[1] = Some(ticket);
+                None
+            }
+            Resolution::Failed => None,
+        };
+        if let (Some(vs_handles), Some(ps_handles)) = (vs_handles, ps_handles) {
+            break (vs_handles, ps_handles);
+        }
+        if waited {
+            mtld3d_shared::log_once_warn!(
+                target: crate::LOG_TARGET,
+                "draw dropped: its shader library was still unbuilt after waiting for it"
+            );
+            return;
+        }
+        if enc.skip_pending_draw(color_written) {
+            return;
+        }
+        let tickets: Vec<JobTicket> = pending.into_iter().flatten().collect();
+        enc.wait_for_compiles(&tickets);
+        waited = true;
     };
     drop(t_lookup);
     let shaders = ShaderRef {
@@ -1712,36 +1762,59 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
     if rt0_drop {
         pipeline_snapshot.remove_color_output();
     }
-    let mut pipeline = enc.get_or_create_pipeline(&pipeline_snapshot, attrs_ref, &shaders);
-    if pipeline == 0 && rt0_drop {
-        // The pass keeps render target 0 instead, so the draw still runs,
-        // at render target 0's extent, with the pipeline that declares it.
-        mtld3d_shared::log_once_warn!(
-            target: crate::LOG_TARGET,
-            "no-colour pipeline for a draw leaving a 1x1 render target 0 out failed: \
-             drawing with render target 0 attached"
-        );
-        rt0_drop = false;
-        pipeline_snapshot
-            .attach
-            .insert(PipelineAttachFlags::HAS_COLOR_OUTPUT);
-        pipeline_snapshot.extra = extra_attachments;
-        pipeline = enc.get_or_create_pipeline(&pipeline_snapshot, attrs_ref, &shaders);
-    }
-    if pipeline == 0 {
-        // Pipeline build failed — e.g. a vertex-declaration/shader attribute
-        // mismatch (a shader reads `v0` the bound decl never supplies) or a
-        // shader that did not compile. Drop the draw, mirroring the VS/PS
-        // resolve-failure drops above: a render pass that issues
-        // `drawPrimitives` with no pipeline bound is undefined in Metal and
-        // faults hard at submit (a process-killing SIGSEGV with no recovery),
-        // so the draw must never be emitted.
-        mtld3d_shared::log_once_warn!(
-            target: crate::LOG_TARGET,
-            "draw dropped: pipeline creation failed (no pipeline bound)"
-        );
-        return;
-    }
+    let mut waited = false;
+    let pipeline = loop {
+        match enc.get_or_create_pipeline(&pipeline_snapshot, attrs_ref, &shaders) {
+            Resolution::Ready(handle) => break handle,
+            Resolution::Pending(ticket) => {
+                let color_written =
+                    pipeline_snapshot.has_color_output() && !pipeline_snapshot.writes_no_color();
+                if waited {
+                    mtld3d_shared::log_once_warn!(
+                        target: crate::LOG_TARGET,
+                        "draw dropped: its pipeline was still unbuilt after waiting for it"
+                    );
+                    return;
+                }
+                if enc.skip_pending_draw(color_written) {
+                    return;
+                }
+                enc.wait_for_compiles(&[ticket]);
+                waited = true;
+            }
+            Resolution::Failed if rt0_drop => {
+                // The pass keeps render target 0 instead, so the draw still
+                // runs, at render target 0's extent, with the pipeline that
+                // declares it.
+                mtld3d_shared::log_once_warn!(
+                    target: crate::LOG_TARGET,
+                    "no-colour pipeline for a draw leaving a 1x1 render target 0 out failed: \
+                     drawing with render target 0 attached"
+                );
+                rt0_drop = false;
+                waited = false;
+                pipeline_snapshot
+                    .attach
+                    .insert(PipelineAttachFlags::HAS_COLOR_OUTPUT);
+                pipeline_snapshot.extra = extra_attachments;
+            }
+            Resolution::Failed => {
+                // Pipeline build failed, e.g. a vertex-declaration/shader
+                // attribute mismatch (a shader reads `v0` the bound decl
+                // never supplies) or a shader that did not compile. Drop the
+                // draw, mirroring the VS/PS resolve-failure drops above: a
+                // render pass that issues `drawPrimitives` with no pipeline
+                // bound is undefined in Metal and faults hard at submit (a
+                // process-killing SIGSEGV with no recovery), so the draw must
+                // never be emitted.
+                mtld3d_shared::log_once_warn!(
+                    target: crate::LOG_TARGET,
+                    "draw dropped: pipeline creation failed (no pipeline bound)"
+                );
+                return;
+            }
+        }
+    };
     let depth_stencil = render_state
         .depth_stencil_state
         .gated_on_stencil_attachment(has_stencil);

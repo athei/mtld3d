@@ -209,3 +209,8 @@ is in [`CONFORMANCE.md`](../unix/conformance/CONFORMANCE.md#kept-divergences).
 - A windowed device's `SetGammaRamp` is stored and reported back but changes
   nothing on screen, where D3D9 ramps the whole desktop. Only the implicit
   swap chain carries a ramp. No knob.
+- A draw whose shader library or render pipeline is still building is left
+  out of its frame when its target is the back buffer or was cleared earlier
+  in the frame, and appears once the build lands; D3D9 draws every call in
+  its frame. Building inline stalls the frame for the length of a Metal
+  compile. `shader.asyncCompile`, on by default.

@@ -2105,6 +2105,34 @@ impl PassState {
         self.current_color_texture
     }
 
+    /// Whether `texture` is this frame's back buffer, by identity.
+    ///
+    /// A multisampled back buffer is bound through its companion but keeps
+    /// the resolve target as its identity, so the companion answers through
+    /// the base handle too.
+    #[must_use]
+    pub fn is_back_buffer(&self, texture: MetalHandle<MTLTextureKind>) -> bool {
+        !texture.is_null() && texture == self.backbuffer_texture
+    }
+
+    /// Render target 0 and every extra target the next pass attaches, as `(texture, subresource)`.
+    ///
+    /// The subresource packs the slice in the low half and the level in the
+    /// high half, the key a colour clear is remembered under. An extra target
+    /// sized unlike render target 0 is attached to no pass and is left out.
+    pub fn attached_color_targets(
+        &self,
+    ) -> impl Iterator<Item = (MetalHandle<MTLTextureKind>, u32)> + '_ {
+        let rt0 = (self.current_color_texture, self.current_color_subresource);
+        let extras = self
+            .current_extra_color
+            .iter()
+            .enumerate()
+            .filter(|(i, slot)| slot.is_bound() && self.current_extra_present_mask & (1 << i) != 0)
+            .map(|(_, slot)| (slot.texture, slot.subresource));
+        core::iter::once(rt0).chain(extras)
+    }
+
     #[must_use]
     pub const fn current_depth_texture(&self) -> MetalHandle<MTLTextureKind> {
         self.current_depth_texture

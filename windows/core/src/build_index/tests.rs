@@ -1,4 +1,5 @@
 use super::{BuildIndex, BuildLookup};
+use crate::async_compile::TicketSource;
 
 /// A resolver whose compile is counted and fails for the keys it is told to.
 struct CountingResolver {
@@ -20,7 +21,7 @@ impl CountingResolver {
     fn draw(&mut self, key: &str) -> Option<u64> {
         match self.index.lookup(key) {
             BuildLookup::Ready(handles) => return Some(handles),
-            BuildLookup::Failed => return None,
+            BuildLookup::Failed | BuildLookup::Pending(_) => return None,
             BuildLookup::Unknown => {}
         }
         self.compiles += 1;
@@ -119,4 +120,47 @@ fn ready_skips_failures_and_len_counts_them() {
     resolver.index.forget_failures();
     assert_eq!(resolver.index.len(), 2);
     assert_eq!(resolver.index.ready().count(), 2);
+}
+
+/// A pending key answers with its ticket until its outcome is recorded over it.
+#[test]
+fn a_pending_key_answers_its_ticket_until_completed() {
+    let mut tickets = TicketSource::new();
+    let mut index: BuildIndex<String, u64> = BuildIndex::default();
+    let ticket = tickets.issue();
+    index.mark_pending("vs".to_owned(), ticket);
+    assert_eq!(index.lookup("vs"), BuildLookup::Pending(ticket));
+    assert_eq!(index.ready().count(), 0, "a pending key has no handle yet");
+    assert_eq!(index.len(), 1, "but it has an entry");
+    assert!(index.complete("vs", Some(7)));
+    assert_eq!(index.lookup("vs"), BuildLookup::Ready(7));
+    let failing = tickets.issue();
+    assert_ne!(failing, ticket, "every ticket is new");
+    index.mark_pending("ps".to_owned(), failing);
+    assert!(index.complete("ps", None));
+    assert_eq!(index.lookup("ps"), BuildLookup::Failed);
+}
+
+/// Completing a key the index never marked pending leaves it unknown.
+#[test]
+fn completing_an_unmarked_key_records_nothing() {
+    let mut index: BuildIndex<String, u64> = BuildIndex::default();
+    assert!(!index.complete("never queued", Some(1)));
+    assert_eq!(index.lookup("never queued"), BuildLookup::Unknown);
+    assert!(index.is_empty());
+}
+
+/// Forgetting failures keeps the builds still in flight, so their jobs still land.
+#[test]
+fn forgetting_failures_keeps_pending_builds() {
+    let mut tickets = TicketSource::new();
+    let mut index: BuildIndex<String, u64> = BuildIndex::default();
+    let ticket = tickets.issue();
+    index.mark_pending("in flight".to_owned(), ticket);
+    index.record("broken".to_owned(), None);
+    index.forget_failures();
+    assert_eq!(index.lookup("in flight"), BuildLookup::Pending(ticket));
+    assert_eq!(index.lookup("broken"), BuildLookup::Unknown);
+    assert!(index.complete("in flight", Some(3)));
+    assert_eq!(index.lookup("in flight"), BuildLookup::Ready(3));
 }

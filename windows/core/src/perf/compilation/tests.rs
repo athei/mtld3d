@@ -77,6 +77,31 @@ fn empty_windows_reset_remainders() {
 }
 
 #[test]
+#[cfg(perf_tracking)]
+fn async_rows_print_with_no_compilation_row_and_reset_with_the_window() {
+    let mut perf = CompilationPerf::new();
+    perf.asynchronous.skipped = 3;
+    perf.asynchronous.pending_peak = 2;
+    perf.asynchronous.installs = 2;
+    perf.asynchronous.latency_ns = 30_000_000;
+    perf.asynchronous.latency_peak_ns = 20_000_000;
+    perf.asynchronous.urgent_waits = 1;
+    perf.asynchronous.urgent_wait_ns = 5_000_000;
+    perf.asynchronous.stolen = 1;
+    perf.asynchronous.misses = 4;
+    perf.asynchronous.miss_ns = 400_000;
+    let mut output = String::new();
+    perf.append_window(&mut output, 1);
+    assert!(output.contains("draws skipped=3  pending peak=2  installs=2"));
+    assert!(output.contains("latency avg 15.000 ms  max 20.000 ms"));
+    assert!(output.contains("urgent waits=1  waited 5.000 ms  stolen=1"));
+    assert!(output.contains("encoder per miss 0.100 ms  misses=4"));
+    let mut again = String::new();
+    perf.append_window(&mut again, 1);
+    assert!(again.is_empty(), "the window resets the async rows too");
+}
+
+#[test]
 #[cfg(not(perf_tracking))]
 fn disabled_perf_has_no_storage_or_identity_work() {
     let mut perf = super::CompilationPerf::new();

@@ -276,6 +276,19 @@ record. A knob, where one makes sense, is named with its default.
   reason: macOS composites it and no API ramps it. Wine's suite has no
   `GammaRamp` coverage, so no site observes any of this. No knob: the
   behaviour a knob would restore is one we cannot implement, not a trade.
+- **A draw whose shader library or render pipeline is still building can be
+  left out of its frame.** D3D9 draws every call in the frame that makes it.
+  A first-use Metal compile takes tens of milliseconds, and building it
+  inline stalls that frame by as much; building it on a worker thread and
+  leaving the draw out until it lands trades one or two frames of a missing
+  draw for no stall. Only a draw whose colour targets are the back buffer or
+  were cleared whole earlier in the frame, or a draw writing no colour whose
+  depth attachment was, is left out: those are redrawn every frame, so the
+  draw appears once its build lands. A draw into any other target waits for
+  its build, because the target may be drawn once and read for the rest of
+  its life. A target cleared and drawn only once, at load, can still lose a
+  draw for good. The runner pins the knob off, so no site observes it. Knob:
+  `shader.asyncCompile`, default `true`.
 
 ## Range-fog coverage
 

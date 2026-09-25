@@ -13,6 +13,7 @@ const LOG_TARGET: &str = "mtld3d::d3d9";
 
 pub mod api_lock;
 pub mod app_profile;
+pub mod async_compile;
 pub mod buffer_backing;
 pub mod buffer_rename;
 pub mod build_index;

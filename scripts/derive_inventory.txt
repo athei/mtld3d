@@ -74,6 +74,9 @@ unix/unix/src/metal/present.rs PresentPipelines Clone,Copy
 unix/unix/src/metal/presenter.rs PresenterFlags Clone,Copy,Debug,Default,PartialEq,Eq
 unix/unix/src/metal/upscale.rs ScalerKey Clone,Copy,PartialEq,Eq,Hash
 unix/unix/src/metal/upscale.rs ScratchKey Clone,Copy,PartialEq,Eq,Hash
+windows/core/src/async_compile.rs JobTicket Clone,Copy,PartialEq,Eq,Hash,Debug
+windows/core/src/async_compile.rs Lane Clone,Copy
+windows/core/src/async_compile.rs TargetFlags Clone,Copy,Debug,Default,PartialEq,Eq
 windows/core/src/buffer_backing.rs BackingClass Debug,Clone,Copy,PartialEq,Eq
 windows/core/src/buffer_backing.rs BackingState Debug,Clone,Copy,PartialEq,Eq
 windows/core/src/buffer_rename.rs BufferMapMode Debug,Clone,Copy,PartialEq,Eq
