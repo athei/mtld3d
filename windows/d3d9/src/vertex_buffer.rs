@@ -911,9 +911,9 @@ fn release_backing_after_upload(inner: &mut VertexBufferInner) {
     {
         return;
     }
-    mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
-        "releasing the CPU backing of uploaded D3DPOOL_DEFAULT D3DUSAGE_WRITEONLY buffers; \
-         their bytes then live on the GPU alone and a device recreate cannot restore them");
+    // The release is this class's ordinary path and logs nothing. What would
+    // be a bug is a read of the bytes afterwards, and the one read a lock
+    // declares, `D3DLOCK_READONLY`, warns in `vb_lock`.
     drop(inner.backing.release());
 }
 
