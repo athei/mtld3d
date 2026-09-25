@@ -24,7 +24,7 @@
 //! glow pair and two UI stages) is created up front and first drawn in the
 //! warm-up, so the measured frames compile nothing.
 
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use mtld3d_tests::{
     Harness, HarnessConfig, IndexBuffer, PixelShader, Surface, Texture, TexturedVertex,
@@ -101,8 +101,7 @@ fn wow_335a_busy_frame() {
         presentation_interval: D3DPRESENT_INTERVAL_IMMEDIATE,
         ..HarnessConfig::default()
     });
-    let log = LayerLog::find();
-    let created = log.mark();
+    let since = SystemTime::now();
     let started = Instant::now();
     let frame = Frame::new(&h);
     for tick in 0..WARM_UP_FRAMES {
@@ -110,6 +109,7 @@ fn wow_335a_busy_frame() {
         frame.render(tick);
         ok(h.present(), "Present");
     }
+    let log = LayerLog::find(since);
     let warm_up = started.elapsed();
 
     let from = log.mark();
@@ -152,12 +152,11 @@ fn wow_335a_busy_frame() {
         row = stats.row(),
         work = clock.work_stats().row(),
         perf = log.perf_rows(from, to).section(),
-        warm_up_compiles =
-            log.compilation_rows(created, to)
-                .first()
-                .map_or_else(String::new, |rows| format!(
-                    "perf: first window after device creation, its warm-up compiles\n{rows}"
-                ),),
+        warm_up_compiles = log
+            .first_window_rows(to)
+            .map_or_else(String::new, |rows| format!(
+                "perf: this device's first window, its warm-up compiles\n{rows}"
+            )),
     );
     write_report("frame_shape", &log, &body);
 }

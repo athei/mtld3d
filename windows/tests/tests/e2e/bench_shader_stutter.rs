@@ -46,7 +46,7 @@ use mtld3d_types::{
 
 use crate::bench::{
     FrameClock, IDENTITY_ROWS, LayerLog, Model, STRIDE, TEXTURED_DECL, grid, material_ps,
-    material_vs, ok, pattern_texture, ratio, world_rows, write_report,
+    material_vs, nearest_rank, ok, pattern_texture, ratio, world_rows, write_report,
 };
 
 const WIDTH: u32 = 1280;
@@ -95,6 +95,7 @@ fn stutter(name: &str, per_frame: u32, offscreen: bool) {
         config_entries: "shaderCache.enable=false",
         ..HarnessConfig::default()
     });
+    let since = SystemTime::now();
     let mut bench = Stutter::new(&h);
     for _ in 0..WARM_UP_FRAMES {
         assert!(h.pump(), "WM_QUIT during warm-up");
@@ -103,7 +104,7 @@ fn stutter(name: &str, per_frame: u32, offscreen: bool) {
         ok(h.present(), "Present");
     }
 
-    let log = LayerLog::find();
+    let log = LayerLog::find(since);
     let from = log.mark();
     let started = Instant::now();
     let mut clock = FrameClock::start(usize::try_from(MEASURED_FRAMES).expect("fits usize"));
@@ -413,11 +414,11 @@ impl<'h> Stutter<'h> {
         if late > 0 {
             skipped_frames.sort_unstable();
             skipped_times.sort_unstable();
-            let pick = |percent: usize| (late * percent / 100).min(late - 1);
+            let pick = |percent| nearest_rank(late, percent);
             let _ = writeln!(
                 report,
                 "frames to land (skipped then drawn): p50 {} p90 {} max {}; time to land: \
-                 p50 {:.3} ms p90 {:.3} ms max {:.3} ms",
+                 p50 {:.3} ms p90 {:.3} ms max {:.3} ms (nearest-rank)",
                 skipped_frames[pick(50)],
                 skipped_frames[pick(90)],
                 skipped_frames[late - 1],

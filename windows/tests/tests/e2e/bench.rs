@@ -23,7 +23,7 @@ use core::fmt::Write as _;
 use std::{
     fs,
     path::{Path, PathBuf},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 use mtld3d_tests::{Harness, Texture, TexturedVertex, config_value, config_var};
@@ -166,16 +166,16 @@ impl FrameStats {
         Self {
             frames,
             mean: sorted.iter().sum::<Duration>() / count,
-            p50: sorted[frames / 2],
-            p99: sorted[(frames * 99 / 100).min(frames - 1)],
+            p50: sorted[nearest_rank(frames, 50)],
+            p99: sorted[nearest_rank(frames, 99)],
             max: sorted[frames - 1],
         }
     }
 
-    /// One report row: `mean ... p50 ... p99 ... max ...` in milliseconds.
+    /// One report row: mean, nearest-rank p50 and p99, and max, in milliseconds.
     pub fn row(&self) -> String {
         format!(
-            "mean {:.3} ms  p50 {:.3} ms  p99 {:.3} ms  max {:.3} ms",
+            "mean {:.3} ms  p50 {:.3} ms  p99 {:.3} ms  max {:.3} ms (nearest-rank)",
             ms(self.mean),
             ms(self.p50),
             ms(self.p99),
@@ -188,15 +188,22 @@ impl FrameStats {
 ///
 /// The layer names the file `<exe stem>-<host pid>.log`, and the host pid is
 /// not visible from inside Wine, so the file is the newest log of this
-/// executable in the log directory: `make bench` runs one process at a time
-/// into a directory of its own, and this process is writing its log.
+/// executable in the log directory, and it must have been written since the
+/// benchmark started: `make bench` runs one process at a time into a
+/// directory of its own, and this process is writing its log. The layer
+/// creates the file on its log thread's first write, so it is looked for
+/// after the warm-up, by which time the device has logged.
 pub struct LayerLog {
     path: Option<PathBuf>,
 }
 
 impl LayerLog {
-    /// Find this process's log; call once a device exists, since its first line creates the file.
-    pub fn find() -> Self {
+    /// Find this process's log, the newest of this executable's written at or after `since`.
+    ///
+    /// # Panics
+    /// Panics when no such log exists: every number the report would copy
+    /// from the log would then be another run's, or missing without saying so.
+    pub fn find(since: SystemTime) -> Self {
         let stem = std::env::current_exe()
             .ok()
             .and_then(|exe| {
@@ -217,8 +224,14 @@ impl LayerLog {
                 log && entry.file_name().to_string_lossy().starts_with(&prefix)
             })
             .filter_map(|entry| Some((entry.metadata().ok()?.modified().ok()?, entry.path())))
+            .filter(|(modified, _)| *modified >= since)
             .max_by_key(|(modified, _)| *modified)
             .map(|(_, path)| path);
+        assert!(
+            path.is_some(),
+            "no layer log of {stem} written since the benchmark started in {}",
+            log_dir().display()
+        );
         Self { path }
     }
 
@@ -252,6 +265,30 @@ impl LayerLog {
             [only] => PerfRows::Partial(window_rows(&lines, *only, &PERF_BLOCKS)),
             [.., last] => PerfRows::Full(window_rows(&lines, *last, &PERF_BLOCKS)),
         }
+    }
+
+    /// The Compilation rows of the first perf window of the device that wrote the last before `to`.
+    ///
+    /// Each device's encoder thread names itself in its window titles and
+    /// opens its first window when the device is created, so that window holds
+    /// the device's warm-up compiles, however long the warm-up took. `None`
+    /// outside a `PERF=1` build.
+    pub fn first_window_rows(&self, to: u64) -> Option<String> {
+        let bytes = fs::read(self.path.as_deref()?).ok()?;
+        let end = usize::try_from(to).map_or(bytes.len(), |at| at.min(bytes.len()));
+        let text = String::from_utf8_lossy(&bytes[..end]);
+        let lines: Vec<&str> = text.lines().collect();
+        let encoder = |line: &str| {
+            line.split_whitespace()
+                .find(|word| word.starts_with("encoder="))
+                .map(str::to_owned)
+        };
+        let last = lines.iter().rev().find(|line| line.contains(PERF_HEADER))?;
+        let this = encoder(last)?;
+        let first = (0..lines.len()).find(|&at| {
+            lines[at].contains(PERF_HEADER) && encoder(lines[at]).as_ref() == Some(&this)
+        })?;
+        Some(window_rows(&lines, first, &COMPILATION_BLOCK))
     }
 
     /// The title and Compilation rows of every perf window written between `from` and `to`.
@@ -356,17 +393,23 @@ pub fn write_report(name: &str, log: &LayerLog, body: &str) {
 ///
 /// `make bench` builds the benchmark with the layer's profile, so this is
 /// the layer's build too. The profile is the directory cargo put the
-/// executable under, `target/<triple>/<profile>/deps`.
+/// executable under, `target/<triple>/<profile>/deps`; a binary anywhere
+/// else (a stage) names none, and the debug-assertion state still says
+/// which kind of build it is.
 fn build() -> String {
     let profile = std::env::current_exe()
         .ok()
         .and_then(|exe| {
-            let dir = exe.parent()?.parent()?;
-            Some(dir.file_name()?.to_string_lossy().into_owned())
+            let deps = exe.parent()?;
+            (deps.file_name()? == "deps").then_some(())?;
+            Some(deps.parent()?.file_name()?.to_string_lossy().into_owned())
         })
-        .unwrap_or_else(|| "unknown".to_owned());
+        .map_or_else(
+            || "profile unknown (not in a cargo target directory)".to_owned(),
+            |profile| format!("{profile} profile"),
+        );
     let assertions = if cfg!(debug_assertions) { "on" } else { "off" };
-    format!("{profile} profile, debug assertions {assertions}")
+    format!("{profile}, debug assertions {assertions}")
 }
 
 /// An `n`x`n` grid of quads over the unit square at `z = 0`, with its 16-bit index list.
@@ -589,6 +632,18 @@ fn window_rows(lines: &[&str], header: usize, blocks: &[&str]) -> String {
         }
     }
     out
+}
+
+/// The index of the nearest-rank `percent`-th percentile among `count` sorted values.
+///
+/// The smallest value with at least `percent` % of the values at or below
+/// it: rank `ceil(percent / 100 * count)`, index one less.
+///
+/// # Panics
+/// Panics if `count` is zero.
+pub const fn nearest_rank(count: usize, percent: usize) -> usize {
+    assert!(count > 0, "a percentile of no values");
+    (count * percent).div_ceil(100).saturating_sub(1)
 }
 
 /// Whether `row`, at block indent, is the first row of any block the grid has a title for.

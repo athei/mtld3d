@@ -84,8 +84,16 @@ WINESERVER := $(WINE_SDK)/bin/wineserver
 
 # Distribution bundles default to the production profile; PROD=0 overrides
 # for a quick release-profile bundle. So does `make bench`: `release` carries
-# debug assertions, whose checks would be most of what it measures.
-ifneq ($(filter bundle bench,$(MAKECMDGOALS)),)
+# debug assertions, whose checks would be most of what it measures. The
+# default holds for every goal of the invocation, so `bench` runs alone:
+# beside `test` it would build the suite's layer without debug assertions.
+ifneq ($(filter bundle,$(MAKECMDGOALS)),)
+PROD ?= 1
+endif
+ifneq ($(filter bench,$(MAKECMDGOALS)),)
+ifneq ($(filter-out bench,$(MAKECMDGOALS)),)
+$(error `make bench` runs alone: its PROD=1 default would also apply to $(filter-out bench,$(MAKECMDGOALS)))
+endif
 PROD ?= 1
 endif
 
@@ -988,7 +996,8 @@ bench: install-windows-$(ARCH) install-unix-$(SDK_UNIX_ARCH)
 	cd $(E2E_RUNNER_DIR) && MTLD3D_CONFIG='$(MTLD3D_CONF_BENCH)' WINEDEBUG= MTL_DEBUG_LAYER=0 MTL_HUD_ENABLED=0 \
 		$(E2E_RUNNER) --wine $(WINE) --jobs 1 --timeout $(BENCH_TIMEOUT) --ignored \
 		$(if $(FILTER),--filter '$(FILTER)') --log-dir '$(BENCH_DIR)' -- $$suite
-	cat '$(BENCH_DIR)'/bench-*.txt
+	if ls '$(BENCH_DIR)'/bench-*.txt >/dev/null 2>&1; then cat '$(BENCH_DIR)'/bench-*.txt; \
+	else echo "make bench: no benchmark ran; FILTER='$(FILTER)' matches none of them"; fi
 
 fmt:
 	cd windows && cargo +$(RUST_NIGHTLY) fmt

@@ -2,10 +2,10 @@
 
 Every test is one `#[test]` driving the real `d3d9.dll` through the shared
 [`Harness`](src/harness.rs), verified by pixel readback, `HRESULT`, or a
-getter round-trip — no manual inspection. The benchmarks in `bench_*.rs` are
-the exception: `#[ignore]`d, so the suite reports them ignored, they run only
-under `make bench`, and they report frame times rather than assert on them. The files under `tests/e2e/` are
-the modules of one test binary, `tests/e2e/main.rs`, and `make test` runs it
+getter round-trip, with no manual inspection. The benchmarks in `bench_*.rs`
+are the exception: `#[ignore]`d, so the suite reports them ignored, they run
+only under `make bench`, and they report frame times rather than assert on
+them. The files under `tests/e2e/` are the modules of one test binary, `tests/e2e/main.rs`, and `make test` runs it
 once per PE arch (`i686`/`x86_64` windows-msvc), its tests on `JOBS` threads
 of that one Wine process, each test with its own device and window;
 `exit_code.rs`, `unload.rs` and `snmalloc_drift.rs` beside it are their own
