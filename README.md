@@ -141,10 +141,11 @@ target and variable is documented in the Makefile beside its definition.
 
 ## Architecture
 
-```
-game.exe → d3d9.dll → mtld3d.dll → mtld3d.so
-(PE, i386 or x64: one chain per arch)  (Mach-O, Wine's own arch)
-```
+![Component diagram: game.exe calls d3d9.dll through the D3D9 COM API;
+d3d9.dll, which links mtld3d-core, calls mtld3d.dll through unix_call;
+mtld3d.dll crosses the Wine PE/Unix boundary into mtld3d.so, which drives
+Metal. The PE side is i386 or x86_64, one chain per architecture; the host
+side is Mach-O in Wine's own architecture.](docs/architecture.svg)
 
 `d3d9.dll` implements the API and holds every piece of D3D9 knowledge,
 `mtld3d.dll` is the PE shim that owns Wine's unix-call globals, and

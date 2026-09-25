@@ -1,0 +1,92 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1090 356" width="1090" height="356" role="img" aria-labelledby="title desc">
+  <title id="title">mtld3d component diagram</title>
+  <desc id="desc">game.exe calls d3d9.dll through the D3D9 COM API. d3d9.dll links mtld3d-core and calls mtld3d.dll through unix_call. mtld3d.dll crosses the Wine PE/Unix boundary into mtld3d.so, which drives the Metal framework. The PE side is i386 or x86_64, one chain per architecture; the host side is Mach-O in Wine's own architecture.</desc>
+  <style>
+    text { fill: #768390; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: 12px; }
+    .mono { fill: #6e7b8b; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 14px; font-weight: 700; }
+    .stereo { font-size: 11px; font-style: italic; }
+    .muted { font-size: 11px; }
+    .tab { font-weight: 700; font-size: 12px; }
+    .label { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 11.5px; }
+    .frame { fill: #8b949e; fill-opacity: 0.06; stroke: #8b949e; stroke-width: 1.2; }
+    .box, .icon { fill: #8b949e; fill-opacity: 0.10; stroke: #768390; stroke-width: 1.4; }
+    .icon { stroke-width: 1; }
+    .ext { fill: #4493f8; fill-opacity: 0.14; stroke: #4493f8; stroke-width: 1.4; }
+    .edge { fill: none; stroke: #768390; stroke-width: 1.4; stroke-dasharray: 6 4; }
+    .head { fill: none; stroke: #768390; stroke-width: 1.4; }
+  </style>
+  <defs>
+    <marker id="open" viewBox="0 0 12 12" refX="11" refY="6" markerWidth="11" markerHeight="11" orient="auto-start-reverse" markerUnits="userSpaceOnUse">
+      <path class="head" d="M1 1 L11 6 L1 11"/>
+    </marker>
+    <g id="cmp">
+      <rect class="icon" x="0" y="0" width="14" height="16"/>
+      <rect class="icon" x="-4" y="3" width="8" height="3.5"/>
+      <rect class="icon" x="-4" y="9.5" width="8" height="3.5"/>
+    </g>
+  </defs>
+
+  <!-- PE side package -->
+  <path class="frame" d="M12 40 H116 V26 H12 Z"/>
+  <text class="tab" x="20" y="37">Wine PE side</text>
+  <rect class="frame" x="12" y="40" width="654" height="300"/>
+  <text class="muted" x="26" y="62">i386 or x86_64, one chain per architecture</text>
+
+  <!-- Host side package -->
+  <path class="frame" d="M780 40 H866 V26 H780 Z"/>
+  <text class="tab" x="788" y="37">Host side</text>
+  <rect class="frame" x="780" y="40" width="298" height="300"/>
+  <text class="muted" x="794" y="62">Mach-O, Wine's own architecture</text>
+  <text class="muted" x="794" y="77">(x86_64 or arm64)</text>
+
+  <!-- game.exe -->
+  <rect class="box" x="32" y="110" width="150" height="84"/>
+  <use href="#cmp" x="160" y="118"/>
+  <text class="stereo" x="107" y="136" text-anchor="middle">«executable»</text>
+  <text class="mono" x="107" y="158" text-anchor="middle">game.exe</text>
+  <text class="muted" x="107" y="178" text-anchor="middle">the game</text>
+
+  <!-- d3d9.dll with nested mtld3d-core -->
+  <rect class="box" x="254" y="96" width="170" height="160"/>
+  <use href="#cmp" x="402" y="104"/>
+  <text class="stereo" x="339" y="122" text-anchor="middle">«library»</text>
+  <text class="mono" x="339" y="144" text-anchor="middle">d3d9.dll</text>
+  <text class="muted" x="339" y="163" text-anchor="middle">D3D9 API, COM, state</text>
+  <rect class="box" x="270" y="180" width="138" height="60"/>
+  <text class="stereo" x="339" y="201" text-anchor="middle">«rlib»</text>
+  <text class="mono" x="339" y="223" text-anchor="middle" style="font-size:13px">mtld3d-core</text>
+
+  <!-- mtld3d.dll -->
+  <rect class="box" x="496" y="110" width="150" height="84"/>
+  <use href="#cmp" x="624" y="118"/>
+  <text class="stereo" x="571" y="136" text-anchor="middle">«library»</text>
+  <text class="mono" x="571" y="158" text-anchor="middle">mtld3d.dll</text>
+  <text class="muted" x="571" y="178" text-anchor="middle">PE shim</text>
+
+  <!-- mtld3d.so -->
+  <rect class="box" x="860" y="110" width="160" height="84"/>
+  <use href="#cmp" x="998" y="118"/>
+  <text class="stereo" x="940" y="136" text-anchor="middle">«library»</text>
+  <text class="mono" x="940" y="158" text-anchor="middle">mtld3d.so</text>
+  <text class="muted" x="940" y="178" text-anchor="middle">Metal abstraction</text>
+
+  <!-- Metal -->
+  <rect class="ext" x="860" y="250" width="160" height="70"/>
+  <text class="stereo" x="940" y="276" text-anchor="middle">«framework»</text>
+  <text class="mono" x="940" y="298" text-anchor="middle">Metal</text>
+
+  <!-- dependencies -->
+  <path class="edge" d="M182 152 H252" marker-end="url(#open)"/>
+  <text class="label" x="218" y="144" text-anchor="middle">D3D9 COM</text>
+
+  <path class="edge" d="M424 152 H494" marker-end="url(#open)"/>
+  <text class="label" x="460" y="144" text-anchor="middle">unix_call</text>
+
+  <path class="edge" d="M646 152 H858" marker-end="url(#open)"/>
+  <text class="label" x="723" y="144" text-anchor="middle">Wine unix call</text>
+  <text class="muted" x="723" y="172" text-anchor="middle">PE/Unix</text>
+  <text class="muted" x="723" y="186" text-anchor="middle">boundary</text>
+
+  <path class="edge" d="M940 194 V248" marker-end="url(#open)"/>
+  <text class="label" x="948" y="226">Metal API</text>
+</svg>
