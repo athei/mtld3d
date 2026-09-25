@@ -10,7 +10,8 @@
 use std::fmt;
 
 use mtld3d_shared::{
-    CreateDepthStencilStateParams, MetalHandle, StencilFaceParams, mtl_handle::MTLDeviceKind,
+    CreateDepthStencilStateParams, MetalHandle, StencilFaceParams, mtl::CompareFunc,
+    mtl_handle::MTLDeviceKind,
 };
 use mtld3d_types::{
     D3DCMP_ALWAYS, D3DRS_CCW_STENCILFAIL, D3DRS_CCW_STENCILFUNC, D3DRS_CCW_STENCILPASS,
@@ -198,6 +199,18 @@ impl DepthStencilSnapshot {
             self.stencil_enable = 0;
         }
         self
+    }
+
+    /// Whether a draw under this state reads or writes the depth plane.
+    ///
+    /// `D3DRS_ZENABLE` alone does not decide it: a test that always passes
+    /// with `D3DRS_ZWRITEENABLE` off reads no depth value and changes none,
+    /// the state `WoW` draws its interface and glow passes with.
+    #[must_use]
+    pub fn uses_depth(&self) -> bool {
+        self.depth_enable != 0
+            && (self.depth_write != 0
+                || d3d_to_metal_cmp(u32::from(self.depth_func)) != CompareFunc::Always)
     }
 }
 

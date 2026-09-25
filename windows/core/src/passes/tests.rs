@@ -1599,15 +1599,15 @@ fn rule_b_three_passes_same_depth_only_last_is_dontcare() {
     let rt_a = tex(0x3000);
     let rt_b = tex(0x4000);
     let mut s = fresh();
-    s.emit_command(dummy_draw());
+    depth_draw(&mut s);
     s.set_color_render_target(rt_a, 256, 256, RT_FORMAT, RenderScale::IDENTITY);
-    s.emit_command(dummy_draw());
+    depth_draw(&mut s);
     s.set_color_render_target(rt_b, 256, 256, RT_FORMAT, RenderScale::IDENTITY);
-    s.emit_command(dummy_draw());
+    depth_draw(&mut s);
     s.end_current_pass("test");
     s.finalize_store_actions(false);
     assert_eq!(s.passes().len(), 3);
-    // All three share depth(); only the last pass's depth_store is DontCare.
+    // All three share depth() and test it; only the last pass's depth_store is DontCare.
     assert_eq!(s.passes()[0].depth_store(), StoreAction::Store);
     assert_eq!(s.passes()[1].depth_store(), StoreAction::Store);
     assert_eq!(s.passes()[2].depth_store(), StoreAction::DontCare);
@@ -1622,16 +1622,16 @@ fn rule_b_alternating_depth_each_gets_last_use_dontcare() {
     // earlier passes (0, 1) keep Store.
     let mut s = fresh();
     // Pass 0: backbuffer() + d1
-    s.emit_command(dummy_draw());
+    depth_draw(&mut s);
     // Pass 1: backbuffer() + d2
     s.set_depth_stencil_attachment(d2, BB_SIZE, false, false);
-    s.emit_command(dummy_draw());
+    depth_draw(&mut s);
     // Pass 2: backbuffer() + d1
     s.set_depth_stencil_attachment(d1, BB_SIZE, false, false);
-    s.emit_command(dummy_draw());
+    depth_draw(&mut s);
     // Pass 3: backbuffer() + d2
     s.set_depth_stencil_attachment(d2, BB_SIZE, false, false);
-    s.emit_command(dummy_draw());
+    depth_draw(&mut s);
     s.end_current_pass("test");
     s.finalize_store_actions(false);
     assert_eq!(s.passes().len(), 4);
@@ -1796,14 +1796,14 @@ fn rule_c_csm_cluster_intra_frame_stores_drop() {
 fn rule_c_color_walk_independent_of_depth_walk() {
     // Two passes share backbuffer() + depth(), second pass starts with a
     // color clear. Rule C flips pass 0's color store, Rule B flips
-    // pass 1's depth store, and pass 0's depth keeps Store (Rule B
-    // only flips the LAST pass per depth texture).
+    // pass 1's depth store, and pass 0's depth keeps Store (every pass
+    // tests depth, so Rule B only flips the LAST pass per depth texture).
     let rt = tex(0x3000);
     let mut s = fresh();
-    s.emit_command(dummy_draw());
+    depth_draw(&mut s);
     // Force a pass break with a pending color clear on backbuffer().
     s.set_color_render_target(rt, 256, 256, RT_FORMAT, RenderScale::IDENTITY);
-    s.emit_command(dummy_draw());
+    depth_draw(&mut s);
     s.set_color_render_target(
         backbuffer(),
         BB_SIZE.0,
@@ -1812,13 +1812,13 @@ fn rule_c_color_walk_independent_of_depth_walk() {
         s.render_scale,
     );
     s.clear_color(1, 1, 1, 1);
-    s.emit_command(dummy_draw());
+    depth_draw(&mut s);
     s.end_current_pass("test");
     s.finalize_store_actions(false);
     assert_eq!(s.passes().len(), 3);
     // Pass 0 backbuffer() → next backbuffer() is pass 2 Clear → flip color.
     assert_eq!(s.passes()[0].color_store(), StoreAction::DontCare);
-    // All three share depth(); only pass 2's depth_store flips.
+    // All three share depth() and test it; only pass 2's depth_store flips.
     assert_eq!(s.passes()[0].depth_store(), StoreAction::Store);
     assert_eq!(s.passes()[1].depth_store(), StoreAction::Store);
     assert_eq!(s.passes()[2].depth_store(), StoreAction::DontCare);
@@ -8336,7 +8336,9 @@ fn a_last_pass_that_never_uses_depth_discards_its_loads() {
     assert_eq!(last.depth_load(), DepthLoad::DontCare);
     assert_eq!(last.stencil_load(), StencilLoad::DontCare);
     assert_eq!(s.passes()[0].depth_load(), DepthLoad::DontCare, "Rule A");
-    assert_eq!(s.passes()[0].depth_store(), StoreAction::Store);
+    // Nothing after pass 0 uses depth or stencil, so its stores go as well.
+    assert_eq!(s.passes()[0].depth_store(), StoreAction::DontCare);
+    assert_eq!(s.passes()[0].stencil_store(), StoreAction::DontCare);
 }
 
 #[test]
@@ -8424,6 +8426,137 @@ fn an_unused_pass_keeps_a_clear_load() {
         s.passes()[0].stencil_load(),
         StencilLoad::Clear { value: 0 }
     );
+}
+
+/// A draw with the depth test on but always passing, depth writes off: a `WoW` interface draw.
+fn always_passing_draw(s: &mut PassState) {
+    s.note_draw_depth_stencil(
+        &DepthStencilSnapshot {
+            depth_enable: 1,
+            ..DepthStencilSnapshot::inert()
+        },
+        BOTH_PLANES,
+    );
+    s.emit_command(dummy_draw());
+}
+
+/// A draw that tests depth `LESSEQUAL` without writing it.
+fn depth_testing_draw(s: &mut PassState) {
+    s.note_draw_depth_stencil(
+        &DepthStencilSnapshot {
+            depth_enable: 1,
+            depth_func: 4,
+            ..DepthStencilSnapshot::inert()
+        },
+        BOTH_PLANES,
+    );
+    s.emit_command(dummy_draw());
+}
+
+/// Record the `WoW` 3.3.5a frame end: the scene, a glow pass, then the interface.
+///
+/// The scene tests and writes `depth()`; the glow pass on another target and
+/// the interface pass on the back buffer keep `depth()` bound and draw with
+/// `after`'s depth state.
+fn scene_glow_interface(s: &mut PassState, after: fn(&mut PassState)) {
+    depth_draw(s);
+    s.set_color_render_target(tex(0x3000), 256, 256, RT_FORMAT, RenderScale::IDENTITY);
+    after(s);
+    s.set_color_render_target(
+        backbuffer(),
+        BB_SIZE.0,
+        BB_SIZE.1,
+        BB_FORMAT,
+        s.render_scale,
+    );
+    after(s);
+    s.end_current_pass("test");
+}
+
+#[test]
+fn an_always_passing_depth_test_leaves_the_depth_unused() {
+    let mut s = fresh();
+    scene_glow_interface(&mut s, always_passing_draw);
+    s.finalize_store_actions(false);
+    assert_eq!(s.passes().len(), 3);
+    assert_eq!(s.passes()[0].depth_store(), StoreAction::DontCare, "scene");
+    for (i, pass) in s.passes().iter().enumerate().skip(1) {
+        assert_eq!(pass.depth_load(), DepthLoad::DontCare, "pass {i}");
+        assert_eq!(pass.depth_store(), StoreAction::DontCare, "pass {i}");
+    }
+}
+
+#[test]
+fn a_later_depth_test_keeps_the_stores_before_it() {
+    let mut s = fresh();
+    scene_glow_interface(&mut s, depth_testing_draw);
+    s.finalize_store_actions(false);
+    assert_eq!(s.passes()[0].depth_store(), StoreAction::Store);
+    assert_eq!(s.passes()[1].depth_store(), StoreAction::Store);
+    assert_eq!(s.passes()[2].depth_store(), StoreAction::DontCare, "Rule B");
+    assert_eq!(s.passes()[2].depth_load(), DepthLoad::Load);
+}
+
+#[test]
+fn an_unused_pass_before_a_depth_test_carries_the_depth_through() {
+    let mut s = fresh();
+    depth_draw(&mut s);
+    s.set_color_render_target(tex(0x3000), 256, 256, RT_FORMAT, RenderScale::IDENTITY);
+    always_passing_draw(&mut s);
+    s.set_color_render_target(
+        backbuffer(),
+        BB_SIZE.0,
+        BB_SIZE.1,
+        BB_FORMAT,
+        s.render_scale,
+    );
+    depth_testing_draw(&mut s);
+    s.end_current_pass("test");
+    s.finalize_store_actions(false);
+    assert_eq!(s.passes()[0].depth_store(), StoreAction::Store);
+    assert_eq!(s.passes()[1].depth_load(), DepthLoad::Load);
+    assert_eq!(s.passes()[1].depth_store(), StoreAction::Store);
+}
+
+#[test]
+fn a_later_stencil_test_keeps_the_stores_before_it() {
+    let mut s = fresh_with_stencil();
+    stencil_writing_draw(&mut s);
+    s.set_color_render_target(tex(0x3000), 256, 256, RT_FORMAT, RenderScale::IDENTITY);
+    s.note_draw_depth_stencil(
+        &DepthStencilSnapshot {
+            stencil_enable: 1,
+            ..DepthStencilSnapshot::inert()
+        },
+        BOTH_PLANES,
+    );
+    s.emit_command(dummy_draw());
+    s.end_current_pass("test");
+    s.finalize_store_actions(false);
+    assert_eq!(s.passes()[0].depth_store(), StoreAction::Store);
+    assert_eq!(s.passes()[0].stencil_store(), StoreAction::Store);
+}
+
+#[test]
+fn a_sampled_depth_keeps_its_stores_before_unused_passes() {
+    let mut s = fresh();
+    s.note_texture_read(depth());
+    scene_glow_interface(&mut s, always_passing_draw);
+    s.finalize_store_actions(false);
+    for (i, pass) in s.passes().iter().enumerate() {
+        assert_eq!(pass.depth_store(), StoreAction::Store, "pass {i}");
+    }
+}
+
+#[test]
+fn a_mid_frame_flush_keeps_the_stores_before_unused_passes() {
+    let mut s = fresh();
+    scene_glow_interface(&mut s, always_passing_draw);
+    s.finalize_store_actions(true);
+    for (i, pass) in s.passes().iter().enumerate() {
+        assert_eq!(pass.depth_store(), StoreAction::Store, "pass {i}");
+        assert_eq!(pass.depth_load() == DepthLoad::DontCare, i == 0, "pass {i}");
+    }
 }
 
 // The presented multisampled back buffer.

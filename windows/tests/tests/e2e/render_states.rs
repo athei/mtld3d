@@ -746,6 +746,61 @@ fn depth_bias_is_an_absolute_offset_at_every_depth() {
 }
 
 #[test]
+fn a_pass_that_never_uses_depth_carries_it_to_a_later_depth_test() {
+    // The scene stores depth 0.25 on the left half and 0.75 on the right. A
+    // pass on another render target keeps the depth surface bound and draws
+    // with the test on but `ALWAYS` and no depth write, so it uses no depth.
+    // A later pass on the back buffer tests a red quad at 0.5 with `LESS`: it
+    // must lose on the left and win on the right, so the unused pass may not
+    // take the scene's depth store or its own load and store with it.
+    let h = Harness::with_depth();
+    arm_diffuse(&h);
+    let back = h.render_target(0);
+    let other = h.create_render_target(64, 64, D3DFMT_A8R8G8B8);
+    let half = |color: u32, z: f32, right: bool| {
+        let mut q = quad_at_depth(color, z);
+        for v in &mut q {
+            v.x = if right { v.x.max(0.0) } else { v.x.min(0.0) };
+        }
+        q
+    };
+    h.render_once(BLACK, |d| {
+        assert_eq!(d.clear(D3DCLEAR_ZBUFFER, 0, 1.0, 0), 0, "depth clear");
+        assert_eq!(d.set_render_state(D3DRS_ZENABLE, 1), 0);
+        assert_eq!(d.set_render_state(D3DRS_ZWRITEENABLE, 1), 0);
+        assert_eq!(d.set_render_state(D3DRS_ZFUNC, D3DCMP_LESS), 0);
+        for (z, right) in [(0.25, false), (0.75, true)] {
+            assert_eq!(
+                d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &half(GREEN, z, right)),
+                0,
+                "scene half"
+            );
+        }
+        assert_eq!(d.set_render_target(0, &other), 0, "unused pass");
+        assert_eq!(d.set_render_state(D3DRS_ZWRITEENABLE, 0), 0);
+        assert_eq!(d.set_render_state(D3DRS_ZFUNC, D3DCMP_ALWAYS), 0);
+        assert_eq!(
+            d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &fill_quad(BLUE)),
+            0,
+            "always-passing draw"
+        );
+        assert_eq!(d.set_render_target(0, &back), 0, "back buffer");
+        assert_eq!(d.set_render_state(D3DRS_ZFUNC, D3DCMP_LESS), 0);
+        assert_eq!(
+            d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad_at_depth(RED, 0.5)),
+            0,
+            "depth-tested draw"
+        );
+    });
+    assert_eq!(
+        h.read_pixel(160, 240),
+        GREEN,
+        "0.5 loses to the stored 0.25"
+    );
+    assert_eq!(h.read_pixel(480, 240), RED, "0.5 wins over the stored 0.75");
+}
+
+#[test]
 fn depth_bias_never_clips_geometry_on_a_depth_plane() {
     // D3D9 biases a fragment after clipping and clamps the result to the depth
     // range, so a quad lying on the far plane under a positive bias, or on the
