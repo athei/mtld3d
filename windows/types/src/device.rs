@@ -375,6 +375,12 @@ pub const D3DFMT_RESZ: u32 = 0x5A53_4552;
 /// Capability token for alpha-to-coverage, also written to `D3DRS_ADAPTIVETESS_Y`.
 pub const D3DFMT_ATOC: u32 = u32::from_le_bytes(*b"ATOC");
 
+/// Depth-bounds-test switch, written to `D3DRS_ADAPTIVETESS_X`.
+///
+/// `ADAPTIVETESS_Z` and `ADAPTIVETESS_W` then carry the bounds as floats.
+/// mtld3d does not advertise it: no format mapping exists for the token.
+pub const D3DFMT_NVDB: u32 = u32::from_le_bytes(*b"NVDB");
+
 /// POINTSIZE control tokens for the independent AMD alpha-to-coverage latch.
 pub const D3DFMT_A2M1: u32 = u32::from_le_bytes(*b"A2M1");
 /// Disable the AMD alpha-to-coverage latch without changing numeric point size.

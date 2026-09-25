@@ -19,11 +19,11 @@ use mtld3d_shared::{
     CreateSamplerStateParams, MetalHandle, mtl::BorderColor, mtl_handle::MTLDeviceKind,
 };
 use mtld3d_types::{
-    D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_ADDRESSW, D3DSAMP_BORDERCOLOR, D3DSAMP_MAGFILTER,
-    D3DSAMP_MAXANISOTROPY, D3DSAMP_MAXMIPLEVEL, D3DSAMP_MINFILTER, D3DSAMP_MIPFILTER,
-    D3DSAMP_MIPMAPLODBIAS, D3DSAMP_SRGBTEXTURE, D3DTADDRESS_MIRRORONCE, D3DTADDRESS_WRAP,
-    D3DTEXF_CONVOLUTIONMONO, D3DTEXF_NONE, D3DTEXF_POINT, SAMPLER_STATE_COUNT,
-    sampler_state_defaults,
+    D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_ADDRESSW, D3DSAMP_BORDERCOLOR, D3DSAMP_DMAPOFFSET,
+    D3DSAMP_ELEMENTINDEX, D3DSAMP_MAGFILTER, D3DSAMP_MAXANISOTROPY, D3DSAMP_MAXMIPLEVEL,
+    D3DSAMP_MINFILTER, D3DSAMP_MIPFILTER, D3DSAMP_MIPMAPLODBIAS, D3DSAMP_SRGBTEXTURE,
+    D3DTADDRESS_MIRRORONCE, D3DTADDRESS_WRAP, D3DTEXF_CONVOLUTIONMONO, D3DTEXF_NONE, D3DTEXF_POINT,
+    SAMPLER_STATE_COUNT, sampler_state_defaults,
 };
 
 use crate::{
@@ -105,6 +105,75 @@ bitflags::bitflags! {
         /// bind (linear vs. sRGB view) stays in sync with the sampler's
         /// intent.
         const SRGB_TEXTURE = 1 << 1;
+    }
+}
+
+/// How the silent-write audit treats a non-default `SetSamplerState` write.
+///
+/// The sampler bindings keep one warn latch per (sampler, type) and ask
+/// [`samp_classify`] the first time a slot receives a value other than its
+/// D3D9 default. Same three classes as `render_state::RsClass`.
+pub enum SampClass {
+    /// A consumer reads the slot, so the write is honoured and nothing is logged.
+    Consumed,
+    /// A no-op by design, logged once at info with the reason.
+    ///
+    /// The slot belongs to a feature Metal has no analog for or that is
+    /// obsolete on every modern driver, so the no-op is the complete correct
+    /// behaviour and not a port candidate.
+    Obsolete(&'static str),
+    /// Nothing reads the slot, so the write is lost and warned once.
+    NotImplemented,
+}
+
+/// Classify a non-default write to sampler state `type_`.
+///
+/// A slot is `Consumed` only while the sampler translation or the draw-time
+/// bind reads it; the comment on each group names that reader.
+#[must_use]
+pub const fn samp_classify(type_: u32) -> SampClass {
+    match type_ {
+        // Address, filter and anisotropy: `snapshot_from_state`, packed by
+        // `key_from_snapshot` and built by `params_from_snapshot`.
+        D3DSAMP_ADDRESSU
+        | D3DSAMP_ADDRESSV
+        | D3DSAMP_ADDRESSW
+        | D3DSAMP_MAGFILTER
+        | D3DSAMP_MINFILTER
+        | D3DSAMP_MIPFILTER
+        | D3DSAMP_MAXANISOTROPY
+        // MAXMIPLEVEL: `snapshot_from_state`, plumbed to `setLodMinClamp`
+        // on the unix side.
+        | D3DSAMP_MAXMIPLEVEL
+        // SRGBTEXTURE is consumed at the draw-time bind: the stage's texture
+        // handle resolves to the eager sRGB twin view so the hardware
+        // decodes sRGB to linear at sample time. It also feeds the sampler
+        // key (`SamplerFlags::SRGB_TEXTURE`) so distinct samplers stay
+        // distinct.
+        | D3DSAMP_SRGBTEXTURE
+        // BORDERCOLOR: `params_from_snapshot` picks the nearest Metal border
+        // preset (transparent black, opaque black, opaque white; other
+        // colours fall back to opaque black with a once-per-colour warn from
+        // `convert::d3d_border_color_to_metal`).
+        | D3DSAMP_BORDERCOLOR
+        // MIPMAPLODBIAS is consumed at draw time: Metal has no sampler-level
+        // LOD bias, so `lod_bias` decodes the slot into the per-draw fragment
+        // uniform and the pixel-shader emitters put `bias(...)` on every
+        // implicit-LOD sample (`VariantFlags::LOD_BIAS`), or `fetch4` latches
+        // the GET4/GET1 commands.
+        | D3DSAMP_MIPMAPLODBIAS => SampClass::Consumed,
+
+        // DMAPOFFSET addresses the displacement map of N-patch tessellation
+        // (`D3DDMAPSAMPLER`, which `SetSamplerState` rejects), and
+        // ELEMENTINDEX an element of a multi-element texture, which no
+        // creation entry point can make.
+        D3DSAMP_DMAPOFFSET => {
+            SampClass::Obsolete("displacement-mapped N-patch tessellation is obsolete")
+        }
+        D3DSAMP_ELEMENTINDEX => SampClass::Obsolete("multi-element textures do not exist in D3D9"),
+
+        // Nothing reads the slot.
+        _ => SampClass::NotImplemented,
     }
 }
 

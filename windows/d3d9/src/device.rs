@@ -33,6 +33,7 @@ use mtld3d_core::{
     present::LayerPacing,
     readback::{ReadbackDestination, ReadbackReject, ReadbackSource},
     render_scale::TargetExtent,
+    render_state::{RsClass, rs_classify},
     streams::validate_stream_freq,
     texture_flags::TextureFlags,
     upload_redirty::RedirtyQueue,
@@ -57,26 +58,21 @@ use mtld3d_types::{
     D3DPRESENTFLAG_LOCKABLE_BACKBUFFER, D3DPT_TRIANGLEFAN, D3DPT_TRIANGLELIST,
     D3DRS_ALPHABLENDENABLE, D3DRS_ALPHAFUNC, D3DRS_ALPHAREF, D3DRS_ALPHATESTENABLE, D3DRS_AMBIENT,
     D3DRS_AMBIENTMATERIALSOURCE, D3DRS_BLENDFACTOR, D3DRS_BLENDOP, D3DRS_BLENDOPALPHA,
-    D3DRS_CCW_STENCILFAIL, D3DRS_CCW_STENCILFUNC, D3DRS_CCW_STENCILPASS, D3DRS_CCW_STENCILZFAIL,
     D3DRS_CLIPPING, D3DRS_CLIPPLANEENABLE, D3DRS_COLORVERTEX, D3DRS_COLORWRITEENABLE,
     D3DRS_COLORWRITEENABLE1, D3DRS_COLORWRITEENABLE2, D3DRS_COLORWRITEENABLE3, D3DRS_CULLMODE,
-    D3DRS_DEBUGMONITORTOKEN, D3DRS_DEPTHBIAS, D3DRS_DESTBLEND, D3DRS_DESTBLENDALPHA,
-    D3DRS_DIFFUSEMATERIALSOURCE, D3DRS_EMISSIVEMATERIALSOURCE, D3DRS_FILLMODE, D3DRS_FOGCOLOR,
-    D3DRS_FOGDENSITY, D3DRS_FOGENABLE, D3DRS_FOGEND, D3DRS_FOGSTART, D3DRS_FOGTABLEMODE,
-    D3DRS_FOGVERTEXMODE, D3DRS_INDEXEDVERTEXBLENDENABLE, D3DRS_LIGHTING, D3DRS_LOCALVIEWER,
-    D3DRS_MULTISAMPLEANTIALIAS, D3DRS_MULTISAMPLEMASK, D3DRS_NORMALDEGREE, D3DRS_NORMALIZENORMALS,
-    D3DRS_PATCHEDGESTYLE, D3DRS_POINTSCALE_A, D3DRS_POINTSCALE_B, D3DRS_POINTSCALE_C,
+    D3DRS_DEPTHBIAS, D3DRS_DESTBLEND, D3DRS_DESTBLENDALPHA, D3DRS_DIFFUSEMATERIALSOURCE,
+    D3DRS_EMISSIVEMATERIALSOURCE, D3DRS_FILLMODE, D3DRS_FOGCOLOR, D3DRS_FOGDENSITY,
+    D3DRS_FOGENABLE, D3DRS_FOGEND, D3DRS_FOGSTART, D3DRS_FOGTABLEMODE, D3DRS_FOGVERTEXMODE,
+    D3DRS_INDEXEDVERTEXBLENDENABLE, D3DRS_LIGHTING, D3DRS_LOCALVIEWER, D3DRS_MULTISAMPLEMASK,
+    D3DRS_NORMALIZENORMALS, D3DRS_POINTSCALE_A, D3DRS_POINTSCALE_B, D3DRS_POINTSCALE_C,
     D3DRS_POINTSCALEENABLE, D3DRS_POINTSIZE, D3DRS_POINTSIZE_MAX, D3DRS_POINTSIZE_MIN,
-    D3DRS_POINTSPRITEENABLE, D3DRS_POSITIONDEGREE, D3DRS_RANGEFOGENABLE, D3DRS_SCISSORTESTENABLE,
+    D3DRS_POINTSPRITEENABLE, D3DRS_RANGEFOGENABLE, D3DRS_SCISSORTESTENABLE,
     D3DRS_SEPARATEALPHABLENDENABLE, D3DRS_SHADEMODE, D3DRS_SLOPESCALEDEPTHBIAS,
     D3DRS_SPECULARENABLE, D3DRS_SPECULARMATERIALSOURCE, D3DRS_SRCBLEND, D3DRS_SRCBLENDALPHA,
-    D3DRS_SRGBWRITEENABLE, D3DRS_STENCILENABLE, D3DRS_STENCILFAIL, D3DRS_STENCILFUNC,
-    D3DRS_STENCILMASK, D3DRS_STENCILPASS, D3DRS_STENCILREF, D3DRS_STENCILWRITEMASK,
-    D3DRS_STENCILZFAIL, D3DRS_TEXTUREFACTOR, D3DRS_TWEENFACTOR, D3DRS_TWOSIDEDSTENCILMODE,
-    D3DRS_VERTEXBLEND, D3DRS_ZENABLE, D3DRS_ZFUNC, D3DRS_ZWRITEENABLE, D3DRTYPE_CUBETEXTURE,
-    D3DSAMP_MAXMIPLEVEL, D3DSAMP_MIPFILTER, D3DTEXF_LINEAR, D3DTEXF_NONE, D3DTEXF_POINT,
-    D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_DMAP, D3DUSAGE_DONOTCLIP,
-    D3DUSAGE_DYNAMIC, D3DUSAGE_NONSECURE, D3DUSAGE_NPATCHES, D3DUSAGE_POINTS,
+    D3DRS_SRGBWRITEENABLE, D3DRS_STENCILREF, D3DRS_TEXTUREFACTOR, D3DRS_VERTEXBLEND,
+    D3DRTYPE_CUBETEXTURE, D3DSAMP_MAXMIPLEVEL, D3DSAMP_MIPFILTER, D3DTEXF_LINEAR, D3DTEXF_NONE,
+    D3DTEXF_POINT, D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_DMAP,
+    D3DUSAGE_DONOTCLIP, D3DUSAGE_DYNAMIC, D3DUSAGE_NONSECURE, D3DUSAGE_NPATCHES, D3DUSAGE_POINTS,
     D3DUSAGE_QUERY_FILTER, D3DUSAGE_RENDERTARGET, D3DUSAGE_RTPATCHES, D3DUSAGE_SOFTWAREPROCESSING,
     D3DUSAGE_WRITEONLY, D3DVIEWPORT9, Guid, IDirect3DDevice9Vtbl, RENDER_STATE_COUNT,
     SAMPLER_STATE_COUNT, TEXTURE_STAGE_STATE_COUNT, render_state_defaults,
@@ -13959,178 +13955,6 @@ extern "system" fn device_create_query(
     // SAFETY: vtable out-param; `query` is *mut *mut c_void per the ABI.
     unsafe { OutPtr::write_opt(query, query_ptr.cast::<c_void>()) };
     D3D_OK
-}
-
-// ── Silent-write audit: D3DRS_* classifier ──
-// Closes the class of bug where a silently-ignored render-state hides a
-// feature gap. Per-slot latches live on `DeviceInner.rs_warn_fired`;
-// this table classifies each slot so the warn message is targeted.
-// Slots that are obsolete or have no Metal analog route to `Obsolete`;
-// unknown slots are `NotImplemented`.
-
-enum RsClass {
-    Consumed,
-    /// Done-by-design no-op.
-    ///
-    /// Metal has no analog or the feature is
-    /// obsolete on every modern Windows driver. Logged at info so the
-    /// first write is still visible for triage, but off the warn surface
-    /// (these are not port candidates). Mirrors the `log_once_info!`
-    /// info-vs-warn cut line: obsolete no-ops are not port candidates.
-    Obsolete(&'static str),
-    NotImplemented,
-}
-
-const fn rs_classify(index: u32, value: u32) -> RsClass {
-    match index {
-        mtld3d_types::D3DRS_ADAPTIVETESS_Y if matches!(value, 0 | mtld3d_types::D3DFMT_ATOC) => RsClass::Consumed,
-        // Bucket A — consumed by mtld3d (draw-path snapshot + FF pipeline).
-        D3DRS_ZENABLE
-        | D3DRS_ZWRITEENABLE
-        | D3DRS_ZFUNC
-        | D3DRS_ALPHABLENDENABLE
-        | D3DRS_SRCBLEND
-        | D3DRS_DESTBLEND
-        // BLENDOP / BLENDOPALPHA / separate-alpha / *_BLENDALPHA are
-        // consumed by pipeline_state::key_from_snapshot (mtld3d-core).
-        // The per-field tests there assert the invariant that mutating
-        // any of these in the snapshot produces a different
-        // PipelineKey — if someone silently drops the value in the
-        // builder path, those tests fail.
-        | D3DRS_BLENDOP
-        | D3DRS_BLENDOPALPHA
-        | D3DRS_SEPARATEALPHABLENDENABLE
-        | D3DRS_SRCBLENDALPHA
-        | D3DRS_DESTBLENDALPHA
-        // SRGBWRITEENABLE binds the colour attachment's sRGB twin view for
-        // the pass, so Metal encodes after the blender. A target with no
-        // sRGB Metal view falls back to the pixel-shader OETF variant
-        // (`VariantFlags::SRGB_WRITE`, windows/core/src/dxso/emit.rs) with
-        // `Clear` converting its colour through the same curve.
-        | D3DRS_SRGBWRITEENABLE
-        | D3DRS_COLORWRITEENABLE
-        | D3DRS_COLORWRITEENABLE1
-        | D3DRS_COLORWRITEENABLE2
-        | D3DRS_COLORWRITEENABLE3
-        | D3DRS_CULLMODE
-        | D3DRS_FILLMODE
-        | D3DRS_SCISSORTESTENABLE
-        | D3DRS_LIGHTING
-        | D3DRS_ALPHATESTENABLE
-        | D3DRS_ALPHAFUNC
-        | D3DRS_ALPHAREF
-        | D3DRS_AMBIENT
-        | D3DRS_TEXTUREFACTOR
-        | D3DRS_FOGENABLE
-        | D3DRS_FOGVERTEXMODE
-        | D3DRS_FOGTABLEMODE
-        | D3DRS_RANGEFOGENABLE
-        | D3DRS_FOGCOLOR
-        | D3DRS_FOGSTART
-        | D3DRS_FOGEND
-        | D3DRS_FOGDENSITY
-        // COLORVERTEX + DIFFUSE/AMBIENTMATERIALSOURCE feed the DXSO FF emitter's
-        // resolve_mat helper; see crates/dxso/src/ff.rs.
-        | D3DRS_COLORVERTEX
-        | D3DRS_DIFFUSEMATERIALSOURCE
-        | D3DRS_AMBIENTMATERIALSOURCE
-        // NORMALIZENORMALS is effectively on — ff.rs always normalizes
-        // the eye-space normal regardless of the render-state bit.
-        | D3DRS_NORMALIZENORMALS
-        // SPECULARENABLE gates Blinn-Phong color1 emission in ff.rs;
-        // SPECULAR/EMISSIVEMATERIALSOURCE feed the DXSO FF emitter's
-        // resolve_mat for the specular / emissive accumulation sites.
-        | D3DRS_SPECULARENABLE
-        | D3DRS_SPECULARMATERIALSOURCE
-        | D3DRS_EMISSIVEMATERIALSOURCE
-        // LOCALVIEWER selects the specular view-vector model (per-vertex
-        // normalize(-posEye) vs the constant infinite-viewer direction);
-        // feeds FfVsFlags::LOCAL_VIEWER.
-        | D3DRS_LOCALVIEWER
-        // VERTEXBLEND + INDEXEDVERTEXBLENDENABLE feed FfState::build_vs_key →
-        // FfVsKey::vertex_blend_count / vertex_blend_indexed → emit_vs blends
-        // position + normal across the world-matrix palette. See
-        // core/src/ff_state.rs::resolve_vertex_blend_count.
-        | D3DRS_VERTEXBLEND
-        | D3DRS_INDEXEDVERTEXBLENDENABLE
-        // POINTSIZE / POINTSIZE_MIN / POINTSIZE_MAX / POINTSCALE_A..C ride
-        // the per-draw VsDraw uniform (core/src/vs_draw.rs) that every vertex
-        // shader clamps `[[point_size]]` from; POINTSCALEENABLE is the
-        // FfVsFlags::POINT_SCALE key bit; POINTSPRITEENABLE is the
-        // VariantFlags::POINT_SPRITE PS variant that samples
-        // `[[point_coord]]`.
-        | D3DRS_POINTSIZE
-        | D3DRS_POINTSIZE_MIN
-        | D3DRS_POINTSIZE_MAX
-        | D3DRS_POINTSCALE_A
-        | D3DRS_POINTSCALE_B
-        | D3DRS_POINTSCALE_C
-        | D3DRS_POINTSCALEENABLE
-        | D3DRS_POINTSPRITEENABLE
-        // CLIPPING is the master clipping switch: it gates the user clip
-        // planes (`vs_draw::clip_plane_count`); its frustum half is a no-op, Metal always
-        // clips to the viewport. CLIPPLANEENABLE selects which of the
-        // `SetClipPlane` planes the VsDraw uniform packs and keys the
-        // `[[clip_distance]]` lane count of both vertex-shader sources.
-        | D3DRS_CLIPPING
-        | D3DRS_CLIPPLANEENABLE
-        // BLENDFACTOR feeds the per-encoder constant blend color via
-        // `Command::set_blend_color`, emitted in `emit_draw` whenever
-        // the value differs from the one bound on the encoder.
-        | D3DRS_BLENDFACTOR
-        // DEPTHBIAS feeds the vertex shaders' `pos_fixup.depth_bias`
-        // and SLOPESCALEDEPTHBIAS Metal's per-encoder rasterizer offset
-        // (`Command::set_depth_bias`), both resolved per draw. Without these, ground-projected
-        // decals (shadows, projectors, alpha overlays) z-fight with
-        // the surface they sit on.
-        | D3DRS_DEPTHBIAS
-        | D3DRS_SLOPESCALEDEPTHBIAS
-        // The stencil states reach Metal through
-        // depth_stencil_state::snapshot_from_state, whose per-field tests
-        // assert that mutating any of them produces a different
-        // DepthStencilKey. STENCILREF is the exception by design: it rides
-        // the encoder as SetStencilReference, not the state object.
-        | D3DRS_STENCILENABLE
-        | D3DRS_STENCILFAIL
-        | D3DRS_STENCILZFAIL
-        | D3DRS_STENCILPASS
-        | D3DRS_STENCILFUNC
-        | D3DRS_STENCILMASK
-        | D3DRS_STENCILWRITEMASK
-        | D3DRS_STENCILREF
-        | D3DRS_TWOSIDEDSTENCILMODE
-        | D3DRS_CCW_STENCILFAIL
-        | D3DRS_CCW_STENCILZFAIL
-        | D3DRS_CCW_STENCILPASS
-        | D3DRS_CCW_STENCILFUNC
-        // MULTISAMPLEMASK narrows the samples a draw covers; the pixel-shader
-        // variant writes it to a `[[sample_mask]]` output, which is where
-        // Metal takes a coverage mask.
-        | D3DRS_MULTISAMPLEMASK => RsClass::Consumed,
-
-        // Bucket D — obsolete / no Metal analog. Info-level (not warn)
-        // because the no-op IS the correct behaviour on every modern
-        // driver.
-        // MULTISAMPLEANTIALIAS asks the rasterizer to drop to one sample for
-        // a draw on a multisampled target. Metal ties the pipeline's
-        // `rasterSampleCount` to the attachment's, so there is no per-draw
-        // switch to honour it with.
-        D3DRS_MULTISAMPLEANTIALIAS => {
-            RsClass::Obsolete("Metal has no per-draw multisample toggle (D3DPRASTERCAPS_MULTISAMPLE_TOGGLE is not advertised)")
-        }
-        D3DRS_PATCHEDGESTYLE | D3DRS_POSITIONDEGREE | D3DRS_NORMALDEGREE => {
-            RsClass::Obsolete("N-patch tessellation is obsolete — every modern driver ignores")
-        }
-        D3DRS_TWEENFACTOR => {
-            RsClass::Obsolete("fixed-function vertex tweening is obsolete")
-        }
-        D3DRS_DEBUGMONITORTOKEN => {
-            RsClass::Obsolete("debug-only token with no rendering effect")
-        }
-
-        // Bucket C — not implemented (no consumer in mtld3d).
-        _ => RsClass::NotImplemented,
-    }
 }
 
 // ── Silent-field audit: CreateTexture / CreateVertexBuffer / CreateIndexBuffer

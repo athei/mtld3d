@@ -10,11 +10,8 @@
 //! `MaxSimultaneousTextures = 8` cap advertisement is kept independent
 //! of the programmable-PS slot count.
 
-use mtld3d_types::{
-    D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_ADDRESSW, D3DSAMP_BORDERCOLOR, D3DSAMP_MAGFILTER,
-    D3DSAMP_MAXANISOTROPY, D3DSAMP_MAXMIPLEVEL, D3DSAMP_MINFILTER, D3DSAMP_MIPFILTER,
-    D3DSAMP_MIPMAPLODBIAS, D3DSAMP_SRGBTEXTURE, SAMPLER_STATE_COUNT, sampler_state_defaults,
-};
+use mtld3d_core::sampler_state::{SampClass, samp_classify};
+use mtld3d_types::{SAMPLER_STATE_COUNT, sampler_state_defaults};
 
 use super::{
     com_ref::{Bound, CachedComPtr},
@@ -319,6 +316,12 @@ impl StageBindings {
         let default = SAMP_DEFAULTS[type_];
         match class {
             SampClass::Consumed => {} // unreachable
+            SampClass::Obsolete(reason) => {
+                log::info!(
+                    target: LOG_TARGET,
+                    "D3DSAMP_{type_} (sampler {sampler}) = {value:#x} (default {default:#x}) no Metal analog: {reason}"
+                );
+            }
             SampClass::NotImplemented => {
                 log::warn!(
                     target: LOG_TARGET,
@@ -374,47 +377,4 @@ impl StageBindings {
 /// Shared by the cached-mask updates in [`StageBindings::replace_texture`].
 const fn with_bit(mask: u16, bit: u16, on: bool) -> u16 {
     if on { mask | bit } else { mask & !bit }
-}
-
-// ── Silent-write audit: D3DSAMP_* classifier ──
-// Per-(sampler, type_) latch lives on `StageBindings.samp_warn_fired`. This
-// table classifies each type so the warn message is targeted.
-
-enum SampClass {
-    Consumed,
-    NotImplemented,
-}
-
-const fn samp_classify(type_: u32) -> SampClass {
-    match type_ {
-        D3DSAMP_ADDRESSU
-        | D3DSAMP_ADDRESSV
-        | D3DSAMP_ADDRESSW
-        | D3DSAMP_MAGFILTER
-        | D3DSAMP_MINFILTER
-        | D3DSAMP_MIPFILTER
-        | D3DSAMP_MAXANISOTROPY
-        // MAXMIPLEVEL consumed by sampler_state::key_from_snapshot (mtld3d-core),
-        // plumbed to setLodMinClamp on the unix side.
-        | D3DSAMP_MAXMIPLEVEL
-        // SRGBTEXTURE consumed at draw-time bind: the stage's texture
-        // handle resolves to the eager sRGB twin view
-        // (`Encoder::get_texture_handle_by_id_srgb`) so the hardware
-        // decodes sRGB→linear at sample time. Also feeds the
-        // sampler-key hash (bit 38) so distinct samplers stay distinct.
-        | D3DSAMP_SRGBTEXTURE
-        // BORDERCOLOR consumed by sampler_state::params_from_snapshot as
-        // the nearest Metal border preset (transparent black, opaque black,
-        // opaque white; other colours fall back to opaque black with a
-        // once-per-colour warn from convert::d3d_border_color_to_metal).
-        | D3DSAMP_BORDERCOLOR
-        // MIPMAPLODBIAS consumed at draw time: Metal has no sampler-level
-        // LOD bias, so `sampler_state::lod_bias` decodes the slot into the
-        // per-draw fragment uniform and the pixel-shader emitters put
-        // `bias(...)` on every implicit-LOD sample
-        // (`VariantFlags::LOD_BIAS`), or latches GET4/GET1 Fetch4 commands.
-        | D3DSAMP_MIPMAPLODBIAS => SampClass::Consumed,
-
-        _ => SampClass::NotImplemented,
-    }
 }
