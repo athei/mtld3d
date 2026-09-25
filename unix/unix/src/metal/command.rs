@@ -53,23 +53,27 @@ pub mod diagnostics;
 
 /// `Retained<ProtocolObject<dyn MTLCommandBuffer>>` is not `Send`/`Sync` in objc2.
 ///
-/// Apple does not categorically mark its APIs thread-safe. The operations
-/// we perform on this handle from the completion-handler thread
-/// (`Retained` drop = refcount decrement) and from the wait thread
-/// (`clone` = refcount increment, `waitUntilCompleted`) are all documented
-/// thread-safe by Apple. Wrap and assert.
+/// Apple does not categorically mark its APIs thread-safe. What is done with
+/// this handle away from the thread that committed it: refcount changes
+/// (`clone`, `Drop`), `waitUntilCompleted` from a waiting thread, and, from
+/// any completion handler that retires the entry, the read-only property
+/// getters `status`, `error`, and under the debug log `label`,
+/// `commandQueue`, `device` and `errorOptions`. The buffer is committed and
+/// no longer mutated by then; Apple documents a command buffer's status and
+/// completion as observable from any thread, which is what
+/// `waitUntilCompleted` and the handlers exist for. Wrap and assert.
 struct PendingCmdBuf(Retained<ProtocolObject<dyn MTLCommandBuffer>>);
 // allow: chosen narrow exception. The structural alternatives — `SendWrapper`
 // (panics on cross-thread access, but Metal's completion-handler runs on its
 // own thread) or storing as `usize` + `Retained::retain(ptr)` on every access
 // (multiplies the unsafe-block count across the file for no safety gain) —
 // both make the code worse. The `unsafe impl Send`/`Sync` here is correct per
-// Apple's documented thread-safety for the three ops we actually perform
-// (`clone` = refcount inc, `Drop` = refcount dec, `waitUntilCompleted` = block).
-// SAFETY rationale lives in the doc comment on `PendingCmdBuf` above.
-// SAFETY: see the `PendingCmdBuf` doc comment above — `clone`, `Drop`,
-// and `waitUntilCompleted` are documented thread-safe by Apple for
-// `MTLCommandBuffer`, which is the only API surface we touch.
+// Apple's documented thread-safety for the operations the doc comment above
+// lists: refcount changes, `waitUntilCompleted`, and read-only getters on a
+// committed buffer.
+// SAFETY: see the `PendingCmdBuf` doc comment above: refcount changes,
+// `waitUntilCompleted` and the read-only getters of a committed buffer are
+// the only `MTLCommandBuffer` surface touched away from its thread.
 #[allow(clippy::non_send_fields_in_send_ty)]
 unsafe impl Send for PendingCmdBuf {}
 // SAFETY: as above.
@@ -88,13 +92,14 @@ unsafe impl Sync for PendingCmdBuf {}
 /// `present_retired`. Each has a stable address across the device's
 /// submissions and its own sequence of retirements.
 ///
-/// `submit_frame` inserts before `commit()`; the `addCompletedHandler` block
-/// removes after the GPU retires; `wait_for_gpu_retire` looks up by range to
-/// do a kernel-blocked wait. The retain held here is what keeps the cmdbuf
-/// addressable after `commit()` returns ownership to Metal: Metal's queue
-/// keeps its own refcount, but we need a stable pointer to call
-/// `waitUntilCompleted` on. The completion handler always removes, so the map
-/// is bounded by the frames in flight.
+/// `submit_frame` inserts before `commit()`; entries leave through
+/// [`retire_finished`], in sequence order and only once each has ended, which
+/// is also what publishes the counter; `wait_for_gpu_retire` looks up by
+/// range to do a kernel-blocked wait. The retain held here is what keeps the
+/// cmdbuf addressable after `commit()` returns ownership to Metal: Metal's
+/// queue keeps its own refcount, but we need a stable pointer to call
+/// `waitUntilCompleted` on. Every completion handler retires what has ended,
+/// so the map is bounded by the frames in flight.
 pub struct PendingCmdBufs(Mutex<BTreeMap<(u64, u64), PendingCmdBuf>>);
 
 impl Default for PendingCmdBufs {
@@ -223,19 +228,26 @@ fn register_presented_probe(
 ///
 /// The wait targets the registered buffer for the smallest in-flight seq
 /// at or beyond the target on this device, falling back to its latest earlier
-/// buffer. Metal executes the queue in order. `waitUntilCompleted` also waits
-/// for the buffer's completion handlers. Only the sequence actually waited
-/// for is published: a missing target is not evidence of GPU retirement.
+/// buffer, and waits for every registered buffer of the counter up to that
+/// one, each by itself: Metal documents the order one queue executes its
+/// buffers in, not the order they complete in, so one buffer's completion is
+/// never taken to stand for another's. The counter is then published by
+/// [`retire_finished`], so it names only buffers that ended; a missing target
+/// is not evidence of GPU retirement.
 ///
-/// Bumping `coherent_seq` by hand is also why this has to inspect the
-/// status: a command buffer the GPU killed is finished, so the bump is
-/// right, but recording it as retired and nothing else would hide the
-/// abort from the PE-side upload recovery that the completion handlers
-/// feed. `failed_submit_seq_ptr` gets the same `fetch_max` they do.
+/// Publishing by hand is also why this has to inspect the status: a command
+/// buffer the GPU killed is finished, so the publication is right, but
+/// recording it as retired and nothing else would hide the abort from the
+/// PE-side upload recovery that the completion handlers feed.
+/// `failed_submit_seq_ptr` gets the same `fetch_max` they do.
+///
+/// A non-zero `upload_coherent_seq_ptr` extends the wait to the upload
+/// buffers up to the same sequence, waited for the same way.
 pub fn wait_for_gpu_retire(
     pending: &PendingCmdBufs,
     target_seq: u64,
     coherent_seq_ptr: u64,
+    upload_coherent_seq_ptr: u64,
     failed_submit_seq_ptr: u64,
 ) {
     if coherent_seq_ptr == 0 || target_seq == 0 {
@@ -245,42 +257,118 @@ pub fn wait_for_gpu_retire(
     // outlives every in-flight command buffer that references it (device
     // teardown drains pending cmdbufs before dropping the Arc).
     let atomic = unsafe { &*(coherent_seq_ptr as *const AtomicU64) };
-    if atomic.load(Ordering::Acquire) >= target_seq {
-        return;
-    }
-    let cmdbuf = {
-        // Lock dropped before `waitUntilCompleted`; the completion
-        // handler removes from the same map and would deadlock if we
-        // held the lock across the kernel sleep.
-        let map = pending.lock();
-        first_pending(&map, coherent_seq_ptr, target_seq).map(|(&(_, seq), cb)| (seq, cb.0.clone()))
+    let through = if atomic.load(Ordering::Acquire) >= target_seq {
+        target_seq
+    } else {
+        let found =
+            first_pending(&pending.lock(), coherent_seq_ptr, target_seq).map(|(&(_, seq), _)| seq);
+        let Some(through) = found else {
+            // No registered work remains for this counter. A CPU submission
+            // failure drains both counters before publishing its missing seq.
+            return;
+        };
+        mtld3d_shared::crumb!("gpuretirebeg", target_seq, atomic.load(Ordering::Acquire));
+        wait_registered(
+            pending,
+            coherent_seq_ptr,
+            through,
+            failed_submit_seq_ptr,
+            "retirement-wait",
+        );
+        mtld3d_shared::crumb!("gpuretireend", target_seq);
+        through
     };
-    let Some((retired_seq, cmdbuf)) = cmdbuf else {
-        // No registered work remains for this counter. A CPU submission
-        // failure drains both counters before publishing its missing seq.
-        return;
-    };
-    mtld3d_shared::crumb!("gpuretirebeg", target_seq, atomic.load(Ordering::Acquire));
-    cmdbuf.waitUntilCompleted();
-    mtld3d_shared::crumb!("gpuretireend", target_seq);
-    // Record the abort before the retirement bump: both stores are
-    // `Release`, so a PE-side `Acquire` load of `coherent_seq` that sees
-    // this seq is guaranteed to see the failure too.
-    if let Some((code, desc)) = record_failed_submit(
-        &cmdbuf,
-        retired_seq,
-        failed_submit_seq_ptr,
-        "retirement-wait",
-    ) {
-        mtld3d_shared::crumb!("gpuretirecberr", target_seq);
-        mtld3d_shared::log_once_warn_by!(
-            target: LOG_TARGET,
-            key: code,
-            "wait_for_gpu_retire: command buffer for frame seq={target_seq} failed on the \
-             GPU (code {code}: {desc}); everything it carried was discarded",
+    if upload_coherent_seq_ptr != 0 {
+        wait_registered(
+            pending,
+            upload_coherent_seq_ptr,
+            through,
+            failed_submit_seq_ptr,
+            "upload-retirement-wait",
         );
     }
-    atomic.fetch_max(retired_seq, Ordering::Release);
+}
+
+/// Wait for every registered buffer of `counter` up to `through`, each by itself, then retire them.
+///
+/// The lock is dropped before the waits: a completion handler takes the same
+/// map and would deadlock if it were held across the kernel sleep. What the
+/// counter publishes is left to [`retire_finished`], so only buffers that
+/// ended are named, whatever order Metal reported them in.
+fn wait_registered(
+    pending: &PendingCmdBufs,
+    counter: u64,
+    through: u64,
+    failed_submit_seq_ptr: u64,
+    site: &str,
+) {
+    let waited: Vec<(u64, Retained<ProtocolObject<dyn MTLCommandBuffer>>)> = pending
+        .lock()
+        .range((counter, 0)..=(counter, through))
+        .map(|(&(_, seq), cb)| (seq, cb.0.clone()))
+        .collect();
+    for (seq, cb) in &waited {
+        cb.waitUntilCompleted();
+        if cb.status() == MTLCommandBufferStatus::Error {
+            let (code, desc) = command_buffer_error(cb.error().as_deref());
+            mtld3d_shared::crumb!("gpuretirecberr", *seq);
+            mtld3d_shared::log_once_warn_by!(
+                target: LOG_TARGET,
+                key: code,
+                "{site}: command buffer for frame seq={seq} failed on the GPU (code {code}: \
+                 {desc}); everything it carried was discarded",
+            );
+        }
+    }
+    retire_finished(pending, counter, failed_submit_seq_ptr, site);
+}
+
+/// Whether a command buffer ran to its end, as opposed to being released uncommitted.
+///
+/// Metal runs the completed handlers of a buffer released without a commit
+/// too, and that buffer never executed; nothing it would have published is
+/// true.
+pub fn ended(cb: &ProtocolObject<dyn MTLCommandBuffer>) -> bool {
+    matches!(
+        cb.status(),
+        MTLCommandBufferStatus::Completed | MTLCommandBufferStatus::Error
+    )
+}
+
+/// Retire the ended buffers of `counter` from the oldest, up to the first still running.
+///
+/// A counter's value is the highest sequence up to which every registered
+/// buffer of that counter has ended, each observed by its own status, so a
+/// gate reading it never infers one buffer's completion from another's. Each
+/// retired buffer records its abort before the counter moves past it (both
+/// stores `Release`), and leaves the map after that, so an empty range means
+/// everything registered is published. Any completion handler of the counter
+/// and any wait may run this.
+///
+/// This is the one place a completion handler writes PE memory, and it does
+/// so only for an entry it still finds in the map, holding the map's lock from
+/// that check to the removal. Once the counter passes the device's last entry
+/// the PE side may free the counters; a second retirer, a late handler of an
+/// entry another one already retired, then finds the entry gone and writes
+/// nothing.
+pub fn retire_finished(
+    pending: &PendingCmdBufs,
+    counter: u64,
+    failed_submit_seq_ptr: u64,
+    site: &str,
+) {
+    let mut map = pending.lock();
+    loop {
+        let Some((&key, entry)) = map.range((counter, 0)..=(counter, u64::MAX)).next() else {
+            return;
+        };
+        if !ended(&entry.0) {
+            return;
+        }
+        let _ = record_failed_submit(&entry.0, key.1, failed_submit_seq_ptr, site);
+        advance_counter(counter, key.1);
+        let _ = map.remove(&key);
+    }
 }
 
 /// `fetch_max` an aborted command buffer's seq into the PE-side failed-submit counter.
@@ -389,43 +477,43 @@ struct EncodeContext<'a> {
 /// against this frame's writes, commits, and hands the presenter what it
 /// needs to show the frame once a drawable is available.
 pub fn submit_frame(record: &Arc<DeviceRecord>, params: &mut SubmitFrameParams) -> bool {
-    submit_frame_with(record.pending(), params, |params| {
-        encode_frame(record, params)
-    })
+    submit_frame_with(record, params, |params| encode_frame(record, params))
 }
 
 /// Keep CPU encoding failures inside the same retirement boundary as GPU failures.
 fn submit_frame_with(
-    pending: &PendingCmdBufs,
+    record: &DeviceRecord,
     params: &mut SubmitFrameParams,
     encode: impl FnOnce(&mut SubmitFrameParams) -> bool,
 ) -> bool {
     let success = encode(params);
     if !success {
-        retire_failed_submit(pending, params);
+        retire_failed_submit(record, params);
     }
     success
 }
 
 /// Retire every committed buffer before publishing a failed CPU submission as finished.
-fn retire_failed_submit(pending: &PendingCmdBufs, params: &SubmitFrameParams) {
+///
+/// The registered buffers of both counters are waited for one by one, since
+/// they are the buffers that read PE pages through `bytesNoCopy` wrappers,
+/// which a retaining buffer keeps as objects but not as memory. The buffers
+/// the queue carries without registering, creation-time clears and snapshot
+/// copies, read only textures they retain. So what the PE side stamped with
+/// this frame's sequence can be recycled once it is published, even though no
+/// command buffer of the frame itself ran.
+fn retire_failed_submit(record: &DeviceRecord, params: &SubmitFrameParams) {
     // SubmitFrame is serialized per device. Nothing can insert a later buffer
     // for either counter while this call drains the failed frame's work.
     for counter in [params.coherent_seq_ptr, params.upload_coherent_seq_ptr] {
-        loop {
-            let oldest = pending
-                .lock()
-                .range((counter, 0)..=(counter, params.submit_seq))
-                .next()
-                .map(|(&key, cb)| (key, cb.0.clone()));
-            let Some((key, cb)) = oldest else {
-                break;
-            };
-            // This waits for completion handlers too, protecting the PE sink
-            // atomics as well as the backing pages read by the GPU.
-            cb.waitUntilCompleted();
-            let _ = record_failed_submit(&cb, key.1, params.failed_submit_seq_ptr, "cpu-cleanup");
-            let _ = pending.lock().remove(&key);
+        if counter != 0 {
+            wait_registered(
+                record.pending(),
+                counter,
+                params.submit_seq,
+                params.failed_submit_seq_ptr,
+                "cpu-cleanup",
+            );
         }
     }
     // Recovery can inspect failed_seq before retirement and abandon retries.
@@ -433,6 +521,29 @@ fn retire_failed_submit(pending: &PendingCmdBufs, params: &SubmitFrameParams) {
     advance_counter(params.failed_submit_seq_ptr, params.submit_seq);
     advance_counter(params.upload_coherent_seq_ptr, params.submit_seq);
     advance_counter(params.coherent_seq_ptr, params.submit_seq);
+}
+
+/// Publish a submission without an upload buffer on the upload counter.
+///
+/// The upload counter says every upload buffer up to its value retired. A
+/// submission that has none moves it only when no upload buffer is in flight,
+/// which the in-flight map shows: [`retire_finished`] publishes a buffer
+/// before it takes it out of the map, and only this submitting thread
+/// registers one. With one in flight the counter stays, and a later
+/// submission publishes past it. That keeps a gate on both counters moving
+/// through frames that upload nothing.
+fn publish_idle_upload(pending: &PendingCmdBufs, counter: u64, seq: u64) {
+    if counter == 0 || seq == 0 {
+        return;
+    }
+    let map = pending.lock();
+    if map
+        .range((counter, 0)..=(counter, u64::MAX))
+        .next()
+        .is_none()
+    {
+        advance_counter(counter, seq);
+    }
 }
 
 /// Publish a sequence into one of the stable PE-side retirement counters.
@@ -613,70 +724,7 @@ fn encode_frame(record: &Arc<DeviceRecord>, params: &mut SubmitFrameParams) -> b
 
     // Spans the frame buffer's handler install and both commits.
     let commit = NanosSetTimer::start(&raw mut params.timings.commit_ns);
-    // Register an addCompletedHandler that bumps the PE-side
-    // `coherent_seq` atomic when this frame retires on the GPU. The
-    // block runs on a Metal-internal dispatch thread. `fetch_max` makes
-    // out-of-order retirement safe. Consumers on the encoder thread
-    // read the atomic directly to drain retention queues. The same
-    // handler also removes our `PENDING_CMDBUFS` entry — the registry
-    // keeps the cmdbuf reachable for `wait_for_gpu_retire`'s
-    // `waitUntilCompleted` call until Metal signals completion. The entry
-    // is keyed by this device (its `coherent_seq_ptr`) as well as the seq,
-    // so another device's frame at the same seq is a different entry.
-    if params.coherent_seq_ptr != 0 && params.submit_seq > 0 {
-        let device = params.coherent_seq_ptr;
-        // The handler outlives this call, so it holds the record whose map
-        // it takes its entry out of.
-        let retiring = Arc::clone(record);
-        let atomic_ptr = usize::try_from(device)
-            .expect("PE wire pointer fits host address space (unix is 64-bit)");
-        let seq = params.submit_seq;
-        let failed_seq_ptr = params.failed_submit_seq_ptr;
-        let handler = RcBlock::new(
-            move |cb_ptr: core::ptr::NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
-                // Tripwire: a command buffer the GPU rejected discards every
-                // encode it carried, but a queued `presentDrawable` still
-                // fires, so the drawable reaches the screen with undefined
-                // contents (magenta on the RGBA16Float HDR layer). There is
-                // no way to un-queue the present at this point; what this
-                // buys is that the otherwise silent one-frame flash leaves a
-                // log line naming the actual GPU error. Keyed per error code
-                // so distinct failure kinds each surface once.
-                //
-                // SAFETY: Metal invokes the block with the completed command
-                // buffer; the pointer is valid for the handler's duration.
-                let cb = unsafe { cb_ptr.as_ref() };
-                retiring.gpu_time().record(CommandBufferRole::Frame, cb);
-                // The failure is recorded before the retirement bump below:
-                // both stores are `Release`, so a PE-side `Acquire` load of
-                // `coherent_seq` that observes this seq observes the failure
-                // too, and the upload recovery never reads a stale "clean".
-                if let Some((code, desc)) =
-                    record_failed_submit(cb, seq, failed_seq_ptr, "frame-callback")
-                {
-                    mtld3d_shared::crumb!("submit:cberr", seq);
-                    mtld3d_shared::log_once_warn_by!(
-                        target: LOG_TARGET,
-                        key: code,
-                        "submit_frame: command buffer for frame seq={seq} failed on the GPU \
-                         (code {code}: {desc}); its rendering was discarded, so a queued \
-                         present showed undefined memory",
-                    );
-                }
-                // SAFETY: the PE side allocated an `Arc<AtomicU64>` and
-                // passed its pointer. The Arc is kept alive for the
-                // device's lifetime, and all command buffers that reference
-                // it are drained on device teardown before the Arc drops.
-                let atomic = unsafe { &*(atomic_ptr as *const AtomicU64) };
-                atomic.fetch_max(seq, Ordering::Release);
-                mtld3d_shared::crumb!("submit:retire", seq);
-                unregister_pending(retiring.pending(), device, seq);
-            },
-        );
-        // SAFETY: objc2 typed binding; `handler` is kept alive on the stack
-        // until the commit below, at which point Metal has retained the block.
-        unsafe { cmd_buf.addCompletedHandler(RcBlock::as_ptr(&handler)) };
-    }
+    install_frame_handler(&cmd_buf, record, params);
 
     // The upload buffer goes first on the queue, so the render work that
     // samples its uploads runs after them; both register for the retirement
@@ -687,6 +735,12 @@ fn encode_frame(record: &Arc<DeviceRecord>, params: &mut SubmitFrameParams) -> b
         commit_registered(
             record.pending(),
             &upload_cb,
+            params.upload_coherent_seq_ptr,
+            params.submit_seq,
+        );
+    } else {
+        publish_idle_upload(
+            record.pending(),
             params.upload_coherent_seq_ptr,
             params.submit_seq,
         );
@@ -939,9 +993,63 @@ fn register_pending(
     pending.lock().insert((counter, seq), PendingCmdBuf(cb));
 }
 
-/// Take `(counter, seq)` out of the in-flight map, if it is there.
-pub fn unregister_pending(pending: &PendingCmdBufs, counter: u64, seq: u64) {
-    let _ = pending.lock().remove(&(counter, seq));
+/// Retire the render buffer from its completion handler: record an abort, publish in order.
+///
+/// The block runs on a Metal-internal dispatch thread and holds the record,
+/// whose in-flight map it retires from. A buffer released uncommitted, on a
+/// failed encode, runs the handler too and returns at once: it never ran, so
+/// it neither records nor publishes. Otherwise the counter moves only through
+/// [`retire_finished`], over the buffers that have ended. The entry is keyed
+/// by this device (its `coherent_seq_ptr`) as well as the seq, so another
+/// device's frame at the same seq is a different entry. A frame without a
+/// sequence or counter gets no handler.
+fn install_frame_handler(
+    cmd_buf: &ProtocolObject<dyn MTLCommandBuffer>,
+    record: &Arc<DeviceRecord>,
+    params: &SubmitFrameParams,
+) {
+    if params.coherent_seq_ptr == 0 || params.submit_seq == 0 {
+        return;
+    }
+    let counter = params.coherent_seq_ptr;
+    let retiring = Arc::clone(record);
+    let seq = params.submit_seq;
+    let failed_seq_ptr = params.failed_submit_seq_ptr;
+    let handler = RcBlock::new(
+        move |cb_ptr: core::ptr::NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
+            // SAFETY: Metal invokes the block with the buffer it ended; the
+            // pointer is valid for the handler's duration.
+            let cb = unsafe { cb_ptr.as_ref() };
+            if !ended(cb) {
+                return;
+            }
+            retiring.gpu_time().record(CommandBufferRole::Frame, cb);
+            // Tripwire: a command buffer the GPU rejected discards every
+            // encode it carried, but a queued `presentDrawable` still fires,
+            // so the drawable reaches the screen with undefined contents
+            // (magenta on the RGBA16Float HDR layer). What this buys is that
+            // the otherwise silent one-frame flash leaves a log line naming
+            // the actual GPU error, once per error code.
+            // Logged from the buffer alone: recording the failure writes PE
+            // memory, which `retire_finished` does for an entry it still holds.
+            if cb.status() == MTLCommandBufferStatus::Error {
+                let (code, desc) = command_buffer_error(cb.error().as_deref());
+                mtld3d_shared::crumb!("submit:cberr", seq);
+                mtld3d_shared::log_once_warn_by!(
+                    target: LOG_TARGET,
+                    key: code,
+                    "submit_frame: command buffer for frame seq={seq} failed on the GPU \
+                     (code {code}: {desc}); its rendering was discarded, so a queued \
+                     present showed undefined memory",
+                );
+            }
+            retire_finished(retiring.pending(), counter, failed_seq_ptr, "frame-retire");
+            mtld3d_shared::crumb!("submit:retire", seq);
+        },
+    );
+    // SAFETY: objc2 typed binding; Metal copies the block on registration, so
+    // the local `handler` may drop when this returns.
+    unsafe { cmd_buf.addCompletedHandler(RcBlock::as_ptr(&handler)) };
 }
 
 /// Encode the frame-leading (texture-upload) blits into a dedicated command buffer.
@@ -1005,8 +1113,6 @@ fn encode_upload_cmd_buf(
         }
     }
     if submit_seq > 0 {
-        let atomic_ptr = usize::try_from(upload_coherent_seq_ptr)
-            .expect("PE wire pointer fits host address space (unix is 64-bit)");
         let seq = submit_seq;
         let failed_seq_ptr = params.failed_submit_seq_ptr;
         // As the render buffer's handler: the record outlives the block.
@@ -1020,15 +1126,19 @@ fn encode_upload_cmd_buf(
                 // permanent unless the PE side replays it: record the seq
                 // before the retirement bump (both `Release`, so a reader
                 // that sees the retirement sees the failure) and let the
-                // encoder's upload-recovery queues re-issue.
+                // encoder's upload-recovery queues re-issue. A buffer
+                // released uncommitted never ran and returns at once.
                 //
-                // SAFETY: Metal invokes the block with the completed command
-                // buffer; the pointer is valid for the handler's duration.
+                // SAFETY: Metal invokes the block with the buffer it ended;
+                // the pointer is valid for the handler's duration.
                 let cb = unsafe { cb_ptr.as_ref() };
+                if !ended(cb) {
+                    return;
+                }
                 retiring.gpu_time().record(CommandBufferRole::Upload, cb);
-                if let Some((code, desc)) =
-                    record_failed_submit(cb, seq, failed_seq_ptr, "upload-callback")
-                {
+                // Logged from the buffer alone; see the render buffer's handler.
+                if cb.status() == MTLCommandBufferStatus::Error {
+                    let (code, desc) = command_buffer_error(cb.error().as_deref());
                     mtld3d_shared::crumb!("submit:upcberr", seq);
                     mtld3d_shared::log_once_warn_by!(
                         target: LOG_TARGET,
@@ -1038,15 +1148,13 @@ fn encode_upload_cmd_buf(
                          carried was discarded and will be re-issued",
                     );
                 }
-                // SAFETY: the PE side allocated an `Arc<AtomicU64>` and
-                // passed its pointer. The Arc is kept alive for the
-                // device's lifetime, and all command buffers that
-                // reference it are drained on device teardown before the
-                // Arc drops.
-                let atomic = unsafe { &*(atomic_ptr as *const AtomicU64) };
-                atomic.fetch_max(seq, Ordering::Release);
+                retire_finished(
+                    retiring.pending(),
+                    upload_coherent_seq_ptr,
+                    failed_seq_ptr,
+                    "upload-retire",
+                );
                 mtld3d_shared::crumb!("submit:upretire", seq);
-                unregister_pending(retiring.pending(), upload_coherent_seq_ptr, seq);
             },
         );
         // SAFETY: objc2 typed binding; Metal copies the block on

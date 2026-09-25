@@ -52,7 +52,8 @@ use super::{
     PendingCmdBuf, PresentGeometry, PresentRoute, SETTLED_PRESENTS, command_buffer_error,
     commit_registered, copy_buffer_to_texture_reject, copy_texture_reject,
     copy_texture_to_buffer_reject, encode_upload_cmd_buf, first_pending, geometry_settled,
-    present_route, readback_completed, submit_frame, submit_frame_with, wait_for_gpu_retire,
+    install_frame_handler, present_route, publish_idle_upload, readback_completed, retire_finished,
+    submit_frame, submit_frame_with, wait_for_gpu_retire,
 };
 use crate::metal::{
     depth_transfer::PlanePool,
@@ -713,7 +714,7 @@ fn missing_final_submit_waits_for_earlier_work() {
         .insert((counter, 1), PendingCmdBuf(cb.clone()));
     cb.commit();
     let (done, watchdog) = release_event_after_wait(event);
-    wait_for_gpu_retire(record.pending(), 2, counter, atomic_address(&failed));
+    wait_for_gpu_retire(record.pending(), 2, counter, 0, atomic_address(&failed));
     let status_at_return = cb.status();
     let retired_at_return = coherent.load(Ordering::Acquire);
     let _ = done.send(());
@@ -780,7 +781,7 @@ fn cpu_submit_failure_drain(upload_committed: bool) {
     let upload_pass = upload_test_pass(&texture);
     let (done, watchdog) = release_event_after_wait(event);
     let mut committed_upload = None;
-    let success = submit_frame_with(record.pending(), &mut params, |params| {
+    let success = submit_frame_with(&record, &mut params, |params| {
         if upload_committed {
             let upload_cb =
                 encode_test_upload(&record, &queue, core::slice::from_ref(&upload_pass), params)
@@ -990,6 +991,7 @@ fn upload_prefix_finishes_before_its_retirement_signal() {
         record.pending(),
         params.submit_seq,
         atomic_address(&upload),
+        0,
         atomic_address(&failed),
     );
     assert_eq!(upload.load(Ordering::Acquire), params.submit_seq);
@@ -1024,21 +1026,16 @@ fn frame_submission_accepts_empty_no_upload_and_all_upload_prefixes() {
             record.pending(),
             params.submit_seq,
             atomic_address(&coherent),
+            params.upload_coherent_seq_ptr,
             atomic_address(&failed),
         );
-        if separate_upload && upload_count != 0 {
-            wait_for_gpu_retire(
-                record.pending(),
-                params.submit_seq,
-                atomic_address(&upload),
-                atomic_address(&failed),
-            );
-        }
         assert_eq!(coherent.load(Ordering::Acquire), params.submit_seq);
         assert_eq!(failed.load(Ordering::Acquire), 0);
+        // A frame without an upload buffer is published on the upload counter
+        // too, since none is in flight.
         assert_eq!(
             upload.load(Ordering::Acquire),
-            if separate_upload && upload_count != 0 {
+            if separate_upload {
                 params.submit_seq
             } else {
                 0
@@ -1421,4 +1418,104 @@ fn depth_plane_failure_aborts_the_pair_and_retry_retains_sources() {
         assert_eq!(cb.status(), MTLCommandBufferStatus::Completed);
         assert_eq!(read(), (depths, stencil));
     }
+}
+
+/// A frame without uploads moves the upload counter only while no upload buffer is in flight.
+#[test]
+fn an_idle_upload_counter_follows_frames_that_upload_nothing() {
+    let queue = test_queue();
+    let record = test_record(&queue);
+    let upload = AtomicU64::new(1);
+    let counter = atomic_address(&upload);
+    publish_idle_upload(record.pending(), counter, 4);
+    assert_eq!(upload.load(Ordering::Acquire), 4);
+    let cb = queue.commandBuffer().expect("buffer");
+    record
+        .pending()
+        .lock()
+        .insert((counter, 5), PendingCmdBuf(cb));
+    publish_idle_upload(record.pending(), counter, 6);
+    assert_eq!(upload.load(Ordering::Acquire), 4);
+    record.pending().lock().remove(&(counter, 5));
+    publish_idle_upload(record.pending(), counter, 7);
+    assert_eq!(upload.load(Ordering::Acquire), 7);
+}
+
+/// A buffer released uncommitted runs its handlers and still moves neither counter.
+///
+/// An ended buffer sits registered at seq 1 on both counters, so a handler
+/// that went on to retire would publish it: only the early return keeps the
+/// counters at 0.
+#[test]
+fn a_buffer_released_uncommitted_never_advances_a_counter() {
+    let queue = test_queue();
+    let record = test_record(&queue);
+    let coherent = AtomicU64::new(0);
+    let upload = AtomicU64::new(0);
+    let failed = AtomicU64::new(0);
+    let mut params = test_submit_params(&coherent, &upload, &failed);
+    for counter in [params.coherent_seq_ptr, params.upload_coherent_seq_ptr] {
+        let ended = queue.commandBuffer().expect("ended");
+        ended.commit();
+        ended.waitUntilCompleted();
+        record
+            .pending()
+            .lock()
+            .insert((counter, 1), PendingCmdBuf(ended));
+    }
+    let texture = upload_test_texture(&queue);
+    let upload_pass = upload_test_pass(&texture);
+    objc2::rc::autoreleasepool(|_| {
+        let frame = queue.commandBuffer().expect("frame");
+        install_frame_handler(&frame, &record, &params);
+        let upload_cb = encode_test_upload(
+            &record,
+            &queue,
+            core::slice::from_ref(&upload_pass),
+            &mut params,
+        )
+        .expect("an upload buffer");
+        drop((frame, upload_cb));
+    });
+    assert_eq!(coherent.load(Ordering::Acquire), 0);
+    assert_eq!(upload.load(Ordering::Acquire), 0);
+    assert_eq!(failed.load(Ordering::Acquire), 0);
+    for counter in [params.coherent_seq_ptr, params.upload_coherent_seq_ptr] {
+        retire_finished(record.pending(), counter, 0, "test");
+    }
+    assert_eq!(coherent.load(Ordering::Acquire), 1);
+    assert_eq!(upload.load(Ordering::Acquire), 1);
+}
+
+/// A counter moves over ended buffers from the oldest and stops at the first still running.
+///
+/// The later buffer ends first: the counter must not name it while the
+/// earlier one still runs, and names both once that one ends.
+#[test]
+fn a_counter_never_passes_a_buffer_still_running() {
+    let queue = test_queue();
+    let record = test_record(&queue);
+    let coherent = AtomicU64::new(0);
+    let counter = atomic_address(&coherent);
+    let event = queue.device().newSharedEvent().expect("gate");
+    let first = queue.commandBuffer().expect("first");
+    first.encodeWaitForEvent_value(ProtocolObject::from_ref(&*event), 1);
+    first.commit();
+    // A second queue, so the later buffer does not queue behind the parked one.
+    let other = test_queue();
+    let second = other.commandBuffer().expect("second");
+    second.commit();
+    second.waitUntilCompleted();
+    {
+        let mut map = record.pending().lock();
+        map.insert((counter, 1), PendingCmdBuf(first.clone()));
+        map.insert((counter, 2), PendingCmdBuf(second));
+    }
+    retire_finished(record.pending(), counter, 0, "test");
+    assert_eq!(coherent.load(Ordering::Acquire), 0);
+    event.setSignaledValue(1);
+    first.waitUntilCompleted();
+    retire_finished(record.pending(), counter, 0, "test");
+    assert_eq!(coherent.load(Ordering::Acquire), 2);
+    assert!(record.pending().lock().is_empty());
 }

@@ -476,7 +476,13 @@ pub fn wait_for_present_idle(record: &DeviceRecord) {
             .unwrap_or_else(PoisonError::into_inner);
         inner.presented_seq
     };
-    command::wait_for_gpu_retire(record.pending(), presented, state.present_retired_ptr(), 0);
+    command::wait_for_gpu_retire(
+        record.pending(),
+        presented,
+        state.present_retired_ptr(),
+        0,
+        0,
+    );
 }
 
 /// Hand a frame's presentation to the presenter; returns the last drawable wait.
@@ -830,9 +836,14 @@ fn present_frame(record: &Arc<DeviceRecord>, queue: &ProtocolObject<dyn MTLComma
     let owner = Arc::clone(record);
     let handler = RcBlock::new(
         move |cb_ptr: core::ptr::NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
-            // SAFETY: Metal invokes the block with the completed command
-            // buffer; the pointer is valid for the handler's duration.
+            // SAFETY: Metal invokes the block with the buffer it ended; the
+            // pointer is valid for the handler's duration.
             let cb = unsafe { cb_ptr.as_ref() };
+            // A buffer released uncommitted runs its handlers too, and never
+            // ran: nothing to record or publish.
+            if !command::ended(cb) {
+                return;
+            }
             owner.gpu_time().record(CommandBufferRole::Present, cb);
             let status = cb.status();
             diagnostics::completion(cb, status, Some(seq), "present-callback");
@@ -847,11 +858,7 @@ fn present_frame(record: &Arc<DeviceRecord>, queue: &ProtocolObject<dyn MTLComma
                      {code}: {desc}); the drawable showed undefined memory",
                 );
             }
-            owner
-                .present()
-                .present_retired
-                .fetch_max(seq, Ordering::Release);
-            command::unregister_pending(owner.pending(), present_ptr, seq);
+            command::retire_finished(owner.pending(), present_ptr, 0, "present-retire");
         },
     );
     // SAFETY: objc2 typed binding; Metal retains the block on registration,

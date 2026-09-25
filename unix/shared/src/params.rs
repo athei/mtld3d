@@ -404,6 +404,10 @@ pub struct WaitForGpuRetireParams {
     pub record_handle: DeviceRecordHandle, // in
     pub target_seq: u64,       // in
     pub coherent_seq_ptr: u64, // in: PE-side AtomicU64 backing
+    /// The upload buffers' counter; its buffers up to the retired sequence are waited for too.
+    ///
+    /// 0 when the device has none, and then only the draw buffers are.
+    pub upload_coherent_seq_ptr: u64, // in: PE-side AtomicU64 backing
     /// Where an aborted command buffer is recorded, mirroring `SubmitFrameParams`.
     ///
     /// The wait bumps `coherent_seq` itself so the caller observes the

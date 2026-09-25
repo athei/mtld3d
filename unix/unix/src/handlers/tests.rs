@@ -61,6 +61,7 @@ fn wait_thunks_without_a_record_report_failure() {
         record_handle: mtld3d_shared::record_handle::DeviceRecordHandle::NULL,
         target_seq: 1,
         coherent_seq_ptr: 0,
+        upload_coherent_seq_ptr: 0,
         failed_submit_seq_ptr: 0,
     };
     assert_eq!(
