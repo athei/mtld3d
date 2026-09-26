@@ -42,6 +42,20 @@ use mtld3d_types::{
     D3DFMT_A8R8G8B8, D3DPOOL_MANAGED, D3DVERTEXELEMENT9,
 };
 
+/// The `meta` keys every metrics file carries, which [`Metrics::meta`] may not repeat.
+const COMMON_META: [&str; 10] = [
+    "layer",
+    "layer_image",
+    "layer_unix_image",
+    "arch",
+    "profile",
+    "debug_assertions",
+    "config",
+    "config_entries",
+    "tsc_hz",
+    "tsc_granularity_ns",
+];
+
 /// Back-to-back counter reads whose smallest nonzero step [`TscClock`] reports as its granularity.
 const GRANULARITY_READS: u32 = 100_000;
 
@@ -726,7 +740,8 @@ pub struct PassShape {
 ///   (or `none`), so the two together are the settings the layer ran with.
 ///   `tsc_hz` and `tsc_granularity_ns` describe the clock the times were
 ///   read with (see [`TscClock`]): its calibrated rate and the smallest step
-///   it was seen to take.
+///   it was seen to take. A benchmark may add keys of its own
+///   ([`Metrics::meta`]) after these.
 ///   `layer_unix_image` is the image ID on the unix library's `mtld3d.so`
 ///   line (or `unknown`), since most of the layer is in that library.
 /// - `metric <bench> <name> <value> <unit> <direction> <class>`: a name of
@@ -742,6 +757,8 @@ pub struct PassShape {
 /// by changing one.
 pub struct Metrics {
     bench: String,
+    /// The benchmark's own `meta` records, written after the ones every file carries.
+    extra_meta: Vec<(String, String)>,
     /// The `tsc_*` meta values: the clock's rate and its finest step.
     tsc: [String; 2],
     /// The harness's own configuration entries, `none` when it has none.
@@ -763,6 +780,7 @@ impl Metrics {
         let entries = h.config_entries().trim();
         Self {
             bench: bench.to_owned(),
+            extra_meta: Vec::new(),
             tsc: [clock.hz.to_string(), format!("{:.2}", clock.granularity_ns)],
             config_entries: if entries.is_empty() {
                 "none".to_owned()
@@ -772,6 +790,26 @@ impl Metrics {
             records: String::new(),
             shapes: String::new(),
         }
+    }
+
+    /// Add a `meta` record of the benchmark's own, such as which of two paths it took.
+    ///
+    /// # Panics
+    /// Panics if `key` is not one word of `[a-z0-9_]`, or is a key every file carries.
+    pub fn meta(&mut self, key: &str, value: &str) {
+        assert!(
+            !key.is_empty()
+                && key
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_'),
+            "a meta key is [a-z0-9_]+: {key:?}"
+        );
+        assert!(
+            !COMMON_META.contains(&key),
+            "meta {key} is one every metrics file carries"
+        );
+        self.extra_meta
+            .push((key.to_owned(), value.replace(['\r', '\n'], " ")));
     }
 
     /// Add one `metric` record.
@@ -1012,6 +1050,9 @@ impl Metrics {
             ("tsc_hz", self.tsc[0].clone()),
             ("tsc_granularity_ns", self.tsc[1].clone()),
         ] {
+            let _ = writeln!(file, "meta {bench} {key} {value}");
+        }
+        for (key, value) in &self.extra_meta {
             let _ = writeln!(file, "meta {bench} {key} {value}");
         }
         file.push_str(&self.records);
