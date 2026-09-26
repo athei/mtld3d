@@ -188,14 +188,7 @@ fn wow_335a_busy_frame() {
         Class::Info,
     );
     metrics.memory(&warm, &end);
-    // The last window wholly inside the measured frames, the one the report copies.
-    let kv = log.perf_kv(from, to);
-    let last_full: &[Option<String>] = if kv.len() > 1 {
-        &kv[kv.len() - 1..]
-    } else {
-        &[]
-    };
-    metrics.perf(last_full, &FrameWork::Fixed);
+    metrics.perf(&log.perf_kv_last_full(from, to), &FrameWork::Fixed);
     metrics.shapes(&pass_shapes());
     write_report(&metrics, &log, &body);
 }

@@ -15,6 +15,7 @@ mod async_compile;
 mod bench;
 mod bench_frame_shape;
 mod bench_shader_stutter;
+mod bench_wow112;
 mod buffers;
 mod clip_planes;
 mod d3d9ex;

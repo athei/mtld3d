@@ -376,6 +376,18 @@ impl LayerLog {
         windows
     }
 
+    /// The `perf-kv` pairs of the last window wholly inside the span, as `perf_rows` picks it.
+    ///
+    /// Empty when the span holds fewer than two windows: the first window
+    /// written after `from` began before it.
+    pub fn perf_kv_last_full(&self, from: u64, to: u64) -> Vec<Option<String>> {
+        let mut windows = self.perf_kv(from, to);
+        if windows.len() < 2 {
+            return Vec::new();
+        }
+        windows.split_off(windows.len() - 1)
+    }
+
     /// The build stamp and image ID on the layer's `d3d9.dll` load line, if the log has one.
     ///
     /// Two builds of one commit share the stamp; the image ID, which the

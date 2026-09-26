@@ -987,8 +987,9 @@ conformance-isolate: install-windows-$(ARCH) install-unix-$(SDK_UNIX_ARCH)
 	$(call conformance_leg,$(ARCH),--only $(ONLY) --repeat $(REPEAT) --variant $(VARIANT))
 
 # The synthetic benchmarks (NOT part of `make test`): `bench_frame_shape.rs`, a
-# frame shaped like World of Warcraft 3.3.5a's busy frame, and
-# `bench_shader_stutter.rs`, frames that each meet pixel shaders never seen
+# frame shaped like World of Warcraft 3.3.5a's busy frame, `bench_wow112.rs`,
+# one shaped like 1.12's fixed-function-heavy busy frame (`wow_112_busy_frame`),
+# and `bench_shader_stutter.rs`, frames that each meet pixel shaders never seen
 # before with the shader cache off. They are `#[ignore]`d tests of the e2e
 # binary, so the suite reports them ignored; this runs them alone, one at a
 # time in one process, through the runner's `--ignored`, for one PE arch
