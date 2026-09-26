@@ -99,6 +99,7 @@ levels and the F12 mechanics are in
 | World of Warcraft 1.12 | Plays, `wow` profile, the primary target |
 | World of Warcraft 3.3.5a | Plays, `wow` profile |
 | Half-Life 2 | Plays |
+| Team Fortress 2 | Plays, 64-bit, D3D9 renderer (launched without `-vulkan`) |
 | Grand Theft Auto IV | Plays, `gta-iv` profile |
 | 3DMark05 | Runs end to end |
 | Unigine Tropics | Runs |
