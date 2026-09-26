@@ -45,6 +45,11 @@ fn a_good_file_reads_every_meta_and_metric() {
     assert_eq!(file.metrics["fps"].direction, Direction::Higher);
     assert_eq!(file.metrics["perf.draws_pf"].class, Class::Exact);
     assert_eq!(file.metrics["mem.end.committed_mib"].unit, Unit::Mib);
+    assert_eq!(
+        file.shape,
+        ["pass 0 1920x1080 draws=12 ff_vs=0 ff_ps=0 tex_per_draw=1.50"],
+        "a shape line is kept as the text after the benchmark's name"
+    );
 }
 
 #[test]

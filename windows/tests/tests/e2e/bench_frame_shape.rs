@@ -399,6 +399,7 @@ fn wow_335a_busy_frame() {
     metrics.meta("depth_path", depth_path);
     metrics.memory(&warm, &end);
     metrics.perf(&log.perf_kv_last_full(from, to), &FrameWork::Fixed);
+    metrics.meta("backbuffer", &format!("{WIDTH}x{HEIGHT}"));
     metrics.shapes(&pass_shapes());
     write_report(&metrics, &log, &body);
 }

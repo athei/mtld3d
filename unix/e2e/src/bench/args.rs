@@ -26,6 +26,37 @@ pub struct CompareConfig {
     pub report: Option<PathBuf>,
 }
 
+/// A parsed `bench-shape` invocation.
+#[derive(Debug)]
+pub struct ShapeConfig {
+    /// `--game-log`: a layer log holding at least one complete F12 frame dump.
+    pub game_log: PathBuf,
+    /// `--metrics`: the benchmark's `bench-<name>.metrics`, whose `shape` lines are compared.
+    pub metrics: PathBuf,
+}
+
+/// Parse `bench-shape --game-log <log> --metrics <bench-x.metrics>`.
+///
+/// # Errors
+///
+/// Returns a message on an unknown flag, a flag without its value, or either
+/// file missing from the arguments.
+pub fn parse_shape(mut args: impl Iterator<Item = String>) -> Result<ShapeConfig, String> {
+    let mut game_log = None;
+    let mut metrics = None;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--game-log" => game_log = Some(PathBuf::from(value(&mut args, &arg)?)),
+            "--metrics" => metrics = Some(PathBuf::from(value(&mut args, &arg)?)),
+            other => return Err(format!("unknown argument {other:?}")),
+        }
+    }
+    Ok(ShapeConfig {
+        game_log: game_log.ok_or_else(|| "missing --game-log <layer log>".to_owned())?,
+        metrics: metrics.ok_or_else(|| "missing --metrics <bench-x.metrics>".to_owned())?,
+    })
+}
+
 /// Parse `bench-compare <ab_dir> [--accept a,b] [--report <file>] [--allow-same-image]`.
 ///
 /// # Errors

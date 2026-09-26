@@ -17,8 +17,10 @@
 //! change in it is judged (see `compare`). The metric line is a contract with
 //! the benchmarks, so anything it does not name is an error that points at
 //! the file and line, never a line skipped: a unit or a class misread here
-//! would judge a number by the wrong rule without saying so. `shape` lines
-//! are read by nothing yet and are skipped.
+//! would judge a number by the wrong rule without saying so. A `shape` line
+//! is kept as the text after its benchmark's name: an A/B comparison reads
+//! nothing from it, and `bench-shape`, which compares it with a game's frame,
+//! parses it (see `dump`).
 
 use std::{collections::BTreeMap, fs, path::Path};
 
@@ -185,6 +187,8 @@ pub struct MetricsFile {
     pub meta: BTreeMap<String, String>,
     /// The `metric` lines, by name.
     pub metrics: BTreeMap<String, Metric>,
+    /// The `shape` lines in file order, each the text after the benchmark's name.
+    pub shape: Vec<String>,
 }
 
 /// The benchmark a metrics file's name names: `bench-<name>.metrics`.
@@ -255,7 +259,16 @@ fn parse_line(line: &str, bench: &str, file: &mut MetricsFile) -> Result<(), Str
             parse_meta(key, rest, file)
         }
         "metric" => parse_metric(trimmed, file),
-        _ => Ok(()),
+        _ => {
+            file.shape.push(
+                fields
+                    .get(2)
+                    .map_or_else(String::new, |first| format!("{first} {rest}"))
+                    .trim_end()
+                    .to_owned(),
+            );
+            Ok(())
+        }
     }
 }
 

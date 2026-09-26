@@ -426,6 +426,7 @@ fn wow_112_busy_frame() {
     );
     metrics.memory(&warm, &end);
     metrics.perf(&log.perf_kv_last_full(from, to), &FrameWork::Fixed);
+    metrics.meta("backbuffer", &format!("{WIDTH}x{HEIGHT}"));
     metrics.shapes(&pass_shapes());
     write_report(&metrics, &log, &body);
 }

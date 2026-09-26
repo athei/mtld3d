@@ -233,6 +233,28 @@ other difference in what a benchmark ran, such as its own configuration
 entries or the depth path it took, stops the comparison: only the build and
 the run may differ between the legs.
 
+After its timed rounds, each scene benchmark (one whose metrics declare its
+frame in `shape` lines) runs once more per leg with the pass trace on
+(`RUST_LOG=mtld3d=warn,mtld3d::d3d9::passes=trace`), untimed, into
+`<leg>/shape/` of the run's directory; a benchmark without `shape` lines, such
+as the shader-stutter one, gets a note instead. That costs one extra
+full-length run per leg per scene benchmark and tens of MB of trace in the
+directory. The report compares the most common pass shape of the last thirty
+complete submissions between the legs, with every load and store action the
+load/store rules decided on those passes, and a leg in which fewer than 80 %
+of them agree is an untrustworthy run, exit 2. A rule that drops a store a
+later pass needs makes the frame faster, not slower, so the timings cannot
+catch it and this comparison does: any difference is a shape change, which
+fails the run like a changed exact metric unless `ACCEPT` names `shape` or
+`shape:<bench>`.
+
+`make bench-shape GAME_LOG=<layer log> BENCH_METRICS=<bench-<name>.metrics>`
+checks a benchmark's scene against a frame a game dumped with F12: the pass
+count, and per pass the draw count, the fixed-function share and the
+textures per draw, with render-target sizes shown relative to each side's
+back buffer. Run it by hand when building or reshaping a scene that stands
+for a game; it is no gate.
+
 Bench numbers come from `PROD=1 PERF=1` builds only; `make bench-ab` builds
 both legs that way and refuses any other profile, since `release` carries
 debug assertions that cost more than the frame does. Nothing else may run on
@@ -250,7 +272,8 @@ World of Warcraft frames, the EVENT-query throttle under the game's settings
 and under the D3D9 defaults, the per-call API cost, and the buffer-lock and
 texture-streaming benchmarks at the game's rates: seven benchmarks of about
 15 to 25 s each, so with the default five rounds of both legs expect about
-half an hour of runs on top of the two production builds (an estimate from
+half an hour of runs, and the two scene benchmarks' shape runs, on top of
+the two production builds (an estimate from
 the benchmarks' minimum spans; the first run's timestamps say what it is on
 your machine). `BENCH_SET=full` runs every benchmark, the shader-stutter and
 cold-start ones included, and takes about twice as long.

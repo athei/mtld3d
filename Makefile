@@ -343,7 +343,7 @@ TAG          ?= $(shell git describe --tags --exact-match 2>/dev/null)
 	install install-windows-i686 install-windows-x86_64 install-unix-x64 install-unix-arm64 \
 	bundle version-check stage clean-isolated clean-isolated-orphans \
 	configure-test-prefix configure-test-prefix-locked configure-test-prefix-session \
-	test test-unit test-e2e-i686 test-e2e-x86_64 bench bench-ab bench-compare clean-bench-ab bench-host bench-host-build \
+	test test-unit test-e2e-i686 test-e2e-x86_64 bench bench-ab bench-compare bench-shape clean-bench-ab bench-host bench-host-build \
 	conformance conformance-i686 conformance-x86_64 \
 	conformance-baseline conformance-baseline-i686 conformance-baseline-x86_64 \
 	conformance-intel conformance-intel-i686 conformance-intel-x86_64 \
@@ -1110,9 +1110,15 @@ bench: install-windows-$(ARCH) install-unix-$(SDK_UNIX_ARCH)
 # The runs, their layer logs and the report go to a directory of their own,
 # `<base>-vs-<candidate>-<time>` under LOG_DIR (default
 # `.codex/evidence/bench-ab` in the main checkout, so the results outlive the
-# worktree that made them). Exit 1 is a regression, 2 a run or a directory
-# that cannot be trusted. `make bench-compare AB_DIR=<that directory>` judges
-# it again, with another ACCEPT for instance, into a report of its own
+# worktree that made them). After its timed rounds every benchmark whose
+# metrics declare `shape` lines runs once more per leg with
+# RUST_LOG=mtld3d=warn,mtld3d::d3d9::passes=trace, untimed, into
+# `<leg>/shape/`, and the report compares the passes and load/store decisions
+# of its steady submission between the legs; a difference fails the run
+# unless ACCEPT names `shape` or `shape:<bench>`. Exit 1 is a regression
+# or a shape change, 2 a run or a directory that cannot be trusted. `make
+# bench-compare AB_DIR=<that directory>` judges it again, shapes included,
+# with another ACCEPT for instance, into a report of its own
 # (`report-compare-<time>.txt`) beside the one the run wrote.
 #
 # The host emitter benchmark (`make bench-host`) runs in the same rounds,
@@ -1212,6 +1218,19 @@ bench-compare:
 	test -n '$(AB_DIR)' || { echo "make bench-compare needs AB_DIR=<a directory make bench-ab wrote>" >&2; exit 2; }
 	cd $(E2E_RUNNER_DIR) && $(E2E_RUNNER) bench-compare '$(abspath $(AB_DIR))' \
 		$(if $(ACCEPT),--accept '$(ACCEPT)') --report '$(abspath $(AB_DIR))/report-compare-$(shell date +%Y%m%d-%H%M%S).txt'
+
+# `make bench-shape GAME_LOG=<layer log> BENCH_METRICS=<bench-<name>.metrics>`
+# calibrates a benchmark's scene against a game: it reads the last complete
+# frame the game dumped with F12 into passes and prints them beside the
+# benchmark's `shape` lines, flagging draw counts off by more than 10 %,
+# fixed-function shares off by more than 10 points, textures per draw off by
+# more than 1.0, and a different pass count. Exit 1 when anything is flagged.
+# It runs nothing under Wine and judges no build; it is run by hand.
+bench-shape:
+	test -n '$(GAME_LOG)' -a -n '$(BENCH_METRICS)' || \
+		{ echo "make bench-shape needs GAME_LOG=<a layer log with an F12 dump> and BENCH_METRICS=<a bench-<name>.metrics>" >&2; exit 2; }
+	cd $(E2E_RUNNER_DIR) && $(E2E_RUNNER) bench-shape --game-log '$(abspath $(GAME_LOG))' \
+		--metrics '$(abspath $(BENCH_METRICS))'
 
 # The base worktrees `make bench-ab` keeps, each with its isolated Wine session
 # and clones, taken down the way `clean-isolated` takes down a checkout's own.

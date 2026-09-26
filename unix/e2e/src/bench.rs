@@ -20,19 +20,29 @@
 //! by doing the same. A run of one clean commit against itself also leaves
 //! a `same-image-allowed` file there (see `compare::check_builds`), so a later
 //! `bench-compare` judges it the way `bench-ab` did, and a `wine.txt` naming
-//! the one Wine both legs ran, which the report quotes.
+//! the one Wine both legs ran, which the report quotes. After its timed
+//! rounds every benchmark whose metrics declare `shape` lines also runs once
+//! per leg with the layer's pass trace on, into `<leg>/shape/<test>/`; that
+//! run is not timed, and its log is what the pass-shape comparison reads
+//! (see `shape`).
 //!
-//! Exit code 0 when nothing regressed, 1 when something did, and 2 when the
-//! run or the analysis could not be trusted: a failed benchmark, a build
-//! that is not the one the leg expected, a malformed metrics file, rounds
-//! that do not pair up.
+//! `bench-shape` is the odd one out: it checks a benchmark's declared frame
+//! against a frame a game dumped with F12, by hand, to calibrate a scene
+//! (see `dump`). It runs nothing and judges no build.
+//!
+//! Exit code 0 when nothing regressed, 1 when something did (a pass shape
+//! that changed included), and 2 when the run or the analysis could not be
+//! trusted: a failed benchmark, a build that is not the one the leg
+//! expected, a malformed metrics file, rounds that do not pair up.
 
 use std::process::ExitCode;
 
 mod ab;
 mod args;
 mod compare;
+mod dump;
 mod metrics;
+mod shape;
 mod stats;
 
 /// The subcommand that runs an A/B comparison.
@@ -40,6 +50,12 @@ pub const AB: &str = "bench-ab";
 
 /// The subcommand that judges a finished A/B directory.
 pub const COMPARE: &str = "bench-compare";
+
+/// The subcommand that checks a benchmark's frame against a game's dumped frame.
+pub const SHAPE: &str = "bench-shape";
+
+/// The directory of a leg that holds its untimed pass-trace runs, beside its rounds.
+const SHAPE_DIR: &str = "shape";
 
 /// The file in an A/B directory that allows both legs one `d3d9.dll` image.
 const SAME_IMAGE_FILE: &str = "same-image-allowed";
@@ -87,4 +103,15 @@ pub fn ab_main(args: impl Iterator<Item = String>) -> Result<ExitCode, String> {
 pub fn compare_main(args: impl Iterator<Item = String>) -> Result<ExitCode, String> {
     let config = args::parse_compare(args)?;
     compare::judge_dir(&config.dir, &config.options, config.report.as_deref())
+}
+
+/// Run `bench-shape` with the arguments after the subcommand's name.
+///
+/// # Errors
+///
+/// Returns a message when the arguments are wrong or either file cannot be
+/// read or parsed; the caller exits with code 2.
+pub fn shape_main(args: impl Iterator<Item = String>) -> Result<ExitCode, String> {
+    let config = args::parse_shape(args)?;
+    dump::check(&config.game_log, &config.metrics)
 }

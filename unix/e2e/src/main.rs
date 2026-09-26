@@ -14,7 +14,8 @@
 //! Two subcommands, named as the first argument, compare two builds of the
 //! layer on the suite's benchmarks instead (see `bench`): `bench-ab` runs
 //! them against both builds and judges the result, `bench-compare` judges a
-//! directory `bench-ab` left behind.
+//! directory `bench-ab` left behind. A third, `bench-shape`, checks one
+//! benchmark's frame against a frame a game dumped.
 
 mod attribute;
 mod bench;
@@ -52,6 +53,7 @@ fn real_main() -> Result<ExitCode, String> {
     match args.peek().map(String::as_str) {
         Some(bench::AB) => return bench::ab_main(args.skip(1)),
         Some(bench::COMPARE) => return bench::compare_main(args.skip(1)),
+        Some(bench::SHAPE) => return bench::shape_main(args.skip(1)),
         _ => {}
     }
     let config = cli::parse_args(args)?;

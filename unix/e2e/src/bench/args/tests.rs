@@ -238,3 +238,23 @@ fn ab_takes_the_staged_corpus_directory() {
         Some(std::path::Path::new("/ab/corpus"))
     );
 }
+
+#[test]
+fn shape_takes_the_game_log_and_the_metrics_file() {
+    let config = parse_shape(args(&[
+        "--metrics",
+        "/b/bench-wow_335a.metrics",
+        "--game-log",
+        "/logs/WoW-1.log",
+    ]))
+    .unwrap();
+    assert_eq!(config.game_log, PathBuf::from("/logs/WoW-1.log"));
+    assert_eq!(config.metrics, PathBuf::from("/b/bench-wow_335a.metrics"));
+
+    let reason = parse_shape(args(&["--game-log", "/logs/WoW-1.log"])).unwrap_err();
+    assert!(reason.contains("missing --metrics"), "{reason}");
+    let reason = parse_shape(args(&["--metrics", "/m", "--frame", "2"])).unwrap_err();
+    assert!(reason.contains("unknown argument \"--frame\""), "{reason}");
+    let reason = parse_shape(args(&["--game-log"])).unwrap_err();
+    assert!(reason.contains("--game-log needs a value"), "{reason}");
+}

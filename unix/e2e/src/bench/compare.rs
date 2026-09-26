@@ -24,6 +24,12 @@
 //!   different work.
 //! - `info`: reported, never judged.
 //!
+//! Beside the numbers, each scene benchmark's untimed shape runs are
+//! compared: the passes of its steady submission and every load/store
+//! decision on them must be the same in both legs, and a difference fails
+//! the comparison like an exact metric does unless `shape` or
+//! `shape:<bench>` is accepted (see `shape`).
+//!
 //! Before any of that the directory has to be trustworthy: both legs hold
 //! the same rounds, every benchmark wrote a file in every round of its leg,
 //! the metrics keep their definitions, each leg ran one build of each kind
@@ -40,8 +46,9 @@ use std::{
 };
 
 use super::{
-    Leg, SAME_IMAGE_FILE, WINE_FILE,
+    Leg, SAME_IMAGE_FILE, SHAPE_DIR, WINE_FILE,
     metrics::{self, Class, Direction, Metric, MetricsFile, Unit},
+    shape::{self, ShapeReport},
     stats::{MAD_SIGMA, mad, median},
 };
 
@@ -189,7 +196,7 @@ impl Kind {
 /// What changes a comparison's verdicts beyond the numbers.
 #[derive(Debug, Default)]
 pub struct Options {
-    /// Exact metrics whose change is expected, by name.
+    /// Exact metrics whose change is expected, by name; `shape` or `shape:<bench>` for shapes.
     pub accept: Vec<String>,
     /// Both legs build one commit from a clean tree, so they may load one image.
     pub allow_same_image: bool,
@@ -280,15 +287,17 @@ pub struct Comparison {
     /// What was compared: the two builds, the profile, the pairs.
     pub header: Vec<String>,
     pub benches: Vec<BenchReport>,
+    /// Each benchmark's pass shape in the two legs.
+    pub shapes: Vec<ShapeReport>,
     /// Remarks that are no verdict, such as an accepted name nothing matched.
     pub notes: Vec<String>,
 }
 
 impl Comparison {
-    /// Whether any verdict fails the comparison.
+    /// Whether any verdict fails the comparison, a changed pass shape included.
     #[must_use]
     pub fn failed(&self) -> bool {
-        self.rows().any(|row| row.verdict.fails())
+        self.rows().any(|row| row.verdict.fails()) || self.shapes.iter().any(ShapeReport::fails)
     }
 
     fn rows(&self) -> impl Iterator<Item = &Row> {
@@ -306,6 +315,24 @@ impl Comparison {
             out.push('\n');
             let _ = writeln!(out, "== {}", bench.bench);
             render_table(&mut out, &bench.rows);
+        }
+        for shape in &self.shapes {
+            out.push('\n');
+            let _ = writeln!(out, "== shape {}", shape.bench);
+            let _ = writeln!(out, "{}", shape.summary);
+            if shape.changed() {
+                for line in &shape.diff {
+                    let _ = writeln!(out, "  {line}");
+                }
+                let verdict = if shape.accepted {
+                    "shape changed, accepted"
+                } else {
+                    "SHAPE CHANGE"
+                };
+                let _ = writeln!(out, "{verdict}");
+            } else {
+                let _ = writeln!(out, "shape unchanged");
+            }
         }
         if !self.notes.is_empty() {
             out.push('\n');
@@ -332,11 +359,19 @@ impl Comparison {
         let added = count(|v| *v == Verdict::Added);
         let removed = count(|v| *v == Verdict::Removed);
         let verdict = if self.failed() { "FAIL" } else { "PASS" };
+        let shapes_changed = self.shapes.iter().filter(|s| s.changed()).count();
+        let shapes_accepted = self
+            .shapes
+            .iter()
+            .filter(|s| s.changed() && s.accepted)
+            .count();
         format!(
             "bench-compare: {verdict}: {judged} benchmarks, {} metrics: {regressions} regressed, \
              {improvements} improved, {changes} exact changed ({accepted} accepted), {added} \
-             added, {removed} removed",
-            self.rows().count()
+             added, {removed} removed; {shapes_changed} of {} shapes changed ({shapes_accepted} \
+             accepted)",
+            self.rows().count(),
+            self.shapes.len()
         )
     }
 }
@@ -398,6 +433,12 @@ pub fn evaluate(dir: &Path, options: &Options) -> Result<Comparison, String> {
         return Err(format!("{}: neither leg has a metrics file", dir.display()));
     }
     let mut comparison = compare(&base, &cand, options)?;
+    let shapes = shape::compare_dir(dir, &options.accept)?;
+    if shapes.present {
+        check_shape_runs(&base[0], &shapes.reports, &mut comparison.notes)?;
+    }
+    comparison.shapes = shapes.reports;
+    comparison.notes.extend(shapes.notes);
     let mut header = vec![format!("bench-compare: {}", dir.display())];
     for (kind, builds) in kinds {
         comparison.notes.extend(builds.notes);
@@ -449,6 +490,8 @@ pub struct Loaded {
 /// Read one leg's directory: rounds `0..N`, each a directory of `bench-<name>.metrics`.
 ///
 /// What it returns holds, per round, each benchmark's file by benchmark name.
+/// The `shape` directory beside the rounds holds the untimed shape runs,
+/// whose numbers are no round's.
 ///
 /// # Errors
 ///
@@ -465,6 +508,9 @@ pub fn load_leg(dir: &Path) -> Result<Vec<BTreeMap<String, Loaded>>, String> {
             continue;
         }
         let name = entry.file_name();
+        if name == SHAPE_DIR {
+            continue;
+        }
         let round = name
             .to_str()
             .filter(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))
@@ -744,6 +790,39 @@ fn leg_meta(
         .collect())
 }
 
+/// Check that every benchmark whose metrics declare `shape` lines has a shape run.
+///
+/// `round` is one round of the base leg. A benchmark without `shape` lines
+/// gets no shape run by design, which the report notes.
+///
+/// # Errors
+///
+/// Returns a message naming a benchmark that declares its frame and has no
+/// shape run: the run did not finish.
+fn check_shape_runs(
+    round: &BTreeMap<String, Loaded>,
+    reports: &[ShapeReport],
+    notes: &mut Vec<String>,
+) -> Result<(), String> {
+    for (bench, loaded) in round {
+        let has_run = reports
+            .iter()
+            .any(|report| report.bench.split('+').any(|name| name == bench));
+        match (loaded.file.shape.is_empty(), has_run) {
+            (false, false) => {
+                return Err(format!(
+                    "incomplete run: benchmark {bench} declares shape lines and has no shape run"
+                ));
+            }
+            (true, false) => notes.push(format!(
+                "{bench}: no shape run; its metrics declare no shape lines"
+            )),
+            (_, true) => {}
+        }
+    }
+    Ok(())
+}
+
 /// Compare the two legs benchmark by benchmark and metric by metric.
 ///
 /// # Errors
@@ -784,7 +863,11 @@ pub fn compare(
             rows: bench_rows(bench, base, cand, options)?,
         });
     }
-    for name in &options.accept {
+    for name in options
+        .accept
+        .iter()
+        .filter(|name| !shape::is_accept_name(name))
+    {
         let matched = benches.iter().flat_map(|b| b.rows.iter()).any(|row| {
             row.metric == *name && matches!(row.verdict, Verdict::Changed { accepted: true, .. })
         });
@@ -797,6 +880,7 @@ pub fn compare(
     Ok(Comparison {
         header: Vec::new(),
         benches,
+        shapes: Vec::new(),
         notes,
     })
 }

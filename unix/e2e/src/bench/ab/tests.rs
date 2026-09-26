@@ -15,21 +15,27 @@ fn file(text: &str) -> MetricsFile {
 }
 
 #[test]
-fn the_leg_that_goes_first_alternates_by_round() {
+fn the_shape_runs_follow_the_rounds_and_the_leg_that_goes_first_alternates_by_round() {
+    let timed = |bench, round, leg| Step::Timed { bench, round, leg };
+    let shape = |bench, leg| Step::Shape { bench, leg };
     let order = schedule(2, 3);
     let expected = [
-        (0, 0, Leg::Base),
-        (0, 0, Leg::Cand),
-        (0, 1, Leg::Cand),
-        (0, 1, Leg::Base),
-        (0, 2, Leg::Base),
-        (0, 2, Leg::Cand),
-        (1, 0, Leg::Base),
-        (1, 0, Leg::Cand),
-        (1, 1, Leg::Cand),
-        (1, 1, Leg::Base),
-        (1, 2, Leg::Base),
-        (1, 2, Leg::Cand),
+        timed(0, 0, Leg::Base),
+        timed(0, 0, Leg::Cand),
+        timed(0, 1, Leg::Cand),
+        timed(0, 1, Leg::Base),
+        timed(0, 2, Leg::Base),
+        timed(0, 2, Leg::Cand),
+        shape(0, Leg::Base),
+        shape(0, Leg::Cand),
+        timed(1, 0, Leg::Base),
+        timed(1, 0, Leg::Cand),
+        timed(1, 1, Leg::Cand),
+        timed(1, 1, Leg::Base),
+        timed(1, 2, Leg::Base),
+        timed(1, 2, Leg::Cand),
+        shape(1, Leg::Base),
+        shape(1, Leg::Cand),
     ];
     assert_eq!(order, expected);
 }

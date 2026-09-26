@@ -1130,3 +1130,133 @@ fn a_workload_meta_that_changes_within_a_leg_is_rejected() {
         "{reason}"
     );
 }
+
+/// A two-submission pass trace whose first pass stores its colour target, or discards it.
+fn shape_log(color_store_dropped: bool) -> String {
+    let prefix = "[2026-09-26T00:00:00Z TRACE mtld3d::d3d9::passes]";
+    let open = format!(
+        "{prefix} pass-open  idx=0 color=0x10 srgb=0x0 depth=0x0 size=64x64 color_load=Load \
+         depth_load=DontCare viewport=0,0+64x64 extra=0x0\n"
+    );
+    let store = if color_store_dropped {
+        format!("{prefix} pass-store idx=0 color=0x10 → DontCare (last-use)\n")
+    } else {
+        String::new()
+    };
+    format!(
+        "{open}{prefix} pass-close idx=0 caller=submit color=0x10 depth=0x0 cmds=3 draws=1\n{store}{open}"
+    )
+}
+
+#[test]
+fn a_changed_pass_shape_fails_the_directory_unless_accepted() {
+    let fixture = Fixture::new("shape");
+    fixture.standard(3, 1.0);
+    fixture.declare_shape();
+    for (leg, dropped) in [("base", false), ("cand", true)] {
+        fixture.shape_run(leg, &shape_log(dropped));
+    }
+    let comparison = evaluate(&fixture.root, &Options::default()).unwrap();
+    assert!(comparison.failed());
+    let report = comparison.render();
+    assert!(
+        report.contains("  pass #0: color_store store -> dontcare (last-use)\nSHAPE CHANGE"),
+        "{report}"
+    );
+    assert!(
+        comparison
+            .summary()
+            .ends_with("1 of 1 shapes changed (0 accepted)"),
+        "{}",
+        comparison.summary()
+    );
+
+    let options = Options {
+        accept: vec!["shape:e2e.frame_shape".to_owned()],
+        ..Options::default()
+    };
+    let comparison = evaluate(&fixture.root, &options).unwrap();
+    assert!(!comparison.failed(), "{}", comparison.render());
+    assert!(
+        !comparison
+            .notes
+            .iter()
+            .any(|note| note.contains("--accept")),
+        "a shape name is not reported as an unmatched metric: {:?}",
+        comparison.notes
+    );
+}
+
+impl Fixture {
+    /// Add a `shape` line to every round's `bench-frame_shape.metrics`.
+    fn declare_shape(&self) {
+        for leg in ["base", "cand"] {
+            for round in fs::read_dir(self.root.join(leg)).unwrap() {
+                let path = round.unwrap().path().join("bench-frame_shape.metrics");
+                let mut text = fs::read_to_string(&path).unwrap();
+                text.push_str(
+                    "shape frame_shape pass 0 64x64 draws=1 ff_vs=0 ff_ps=0 tex_per_draw=0\n",
+                );
+                fs::write(&path, text).unwrap();
+            }
+        }
+    }
+
+    /// Write `leg`'s shape run of `frame_shape` with `log` as its layer log.
+    fn shape_run(&self, leg: &str, log: &str) {
+        let dir = self.root.join(leg).join("shape").join("e2e.frame_shape");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("e2e-7.log"), log).unwrap();
+        fs::write(
+            dir.join("bench-frame_shape.metrics"),
+            "meta frame_shape layer v1\n",
+        )
+        .unwrap();
+    }
+}
+
+#[test]
+fn only_a_benchmark_that_declares_its_frame_needs_a_shape_run() {
+    let fixture = Fixture::new("shape-declared");
+    fixture.standard(3, 1.0);
+    fixture.declare_shape();
+    for round in 0..3 {
+        for (leg, image) in [("base", "AAAA"), ("cand", "BBBB")] {
+            fixture.write(
+                leg,
+                round,
+                "stutter",
+                &meta("v0.11.0-3-g66e4114", image),
+                &[("x", 1.0, "ms lower time")],
+            );
+        }
+    }
+    for leg in ["base", "cand"] {
+        fixture.shape_run(leg, &shape_log(false));
+    }
+    let comparison = evaluate(&fixture.root, &Options::default()).unwrap();
+    assert!(!comparison.failed(), "{}", comparison.render());
+    assert!(
+        comparison
+            .notes
+            .iter()
+            .any(|note| note == "stutter: no shape run; its metrics declare no shape lines"),
+        "{:?}",
+        comparison.notes
+    );
+
+    for leg in ["base", "cand"] {
+        let dir = fixture.root.join(leg).join("shape");
+        fs::rename(dir.join("e2e.frame_shape"), dir.join("e2e.other")).unwrap();
+        fs::rename(
+            dir.join("e2e.other").join("bench-frame_shape.metrics"),
+            dir.join("e2e.other").join("bench-other.metrics"),
+        )
+        .unwrap();
+    }
+    let reason = error_of(&fixture);
+    assert!(
+        reason.contains("benchmark frame_shape declares shape lines and has no shape run"),
+        "{reason}"
+    );
+}
