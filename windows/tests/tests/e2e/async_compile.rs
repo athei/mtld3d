@@ -700,7 +700,9 @@ fn stencil_sample_dependency(entries: &'static str) {
         u: 0.5,
         v: 0.5,
     });
-    // Establish depth regeneration before the consumer starts sampling scratch.
+    // Clear both planes twice: depth, cleared again every frame below, is
+    // regenerated from the first consumer frame on, while stencil is never
+    // cleared again and so is retained.
     for _ in 0..2 {
         assert_eq!(h.begin_scene(), D3D_OK);
         assert_eq!(h.set_depth_stencil_surface(&ds_surface), D3D_OK);
@@ -712,7 +714,8 @@ fn stencil_sample_dependency(entries: &'static str) {
         assert_eq!(h.present(), D3D_OK);
         let _ = h.read_pixel(320, 240);
     }
-    // Two reads establish the dependency before the cold producer writes its mask.
+    // The first read marks scratch when its frame is submitted; the second is
+    // margin before the cold producer writes its mask.
     for frame in 0..3 {
         assert_eq!(h.begin_scene(), D3D_OK);
         assert_eq!(h.clear_depth_stencil_surface(), D3D_OK);

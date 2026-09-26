@@ -5,7 +5,9 @@ use super::{
     FEED_MEMORY_FRAMES, JobTicket, LibrarySlot, TicketSource, mark_kept_reads, may_skip_draw,
 };
 use crate::{
+    depth_stencil_state::DepthStencilSnapshot,
     passes::{BackbufferContents, FrameReset, PassState, UploadPassTarget},
+    pipeline_state::PipelineAttachFlags,
     render_scale::RenderScale,
 };
 
@@ -282,6 +284,14 @@ fn sample_into(passes: &mut PassState, target: MetalHandle<MTLTextureKind>, read
     passes.emit_command(Command::set_fragment_texture(read, 0));
 }
 
+/// Record a draw in the open pass that overwrites the stencil plane it attaches.
+fn write_stencil(passes: &mut PassState) {
+    passes.note_draw_depth_stencil(
+        &DepthStencilSnapshot::stencil_overwrite(),
+        PipelineAttachFlags::HAS_DEPTH | PipelineAttachFlags::HAS_STENCIL,
+    );
+}
+
 /// A kept pass marks the scratch target it samples; a rebuilt pass marks nothing.
 #[test]
 fn a_kept_pass_marks_what_it_samples() {
@@ -357,11 +367,7 @@ fn retained_stencil_marks_its_sampled_source() {
     let mut passes = recording_passes();
     passes.set_depth_stencil_attachment(depth, (64, 64), true, true);
     sample_into(&mut passes, texture(0x1000), scratch.raw());
-    passes.note_draw_depth_stencil(
-        &crate::depth_stencil_state::DepthStencilSnapshot::stencil_overwrite(),
-        crate::pipeline_state::PipelineAttachFlags::HAS_DEPTH
-            | crate::pipeline_state::PipelineAttachFlags::HAS_STENCIL,
-    );
+    write_stencil(&mut passes);
     assert!(history.regenerated(depth, 0, ClearPlanes::DEPTH));
     assert!(!history.regenerated(depth, 0, ClearPlanes::STENCIL));
     mark_kept_reads(&passes, &mut history);
@@ -391,11 +397,7 @@ fn regenerated_depth_and_stencil_leave_sampled_sources_skippable() {
         passes.set_depth_stencil_attachment_level(depth, 1, (64, 64), true, has_stencil);
         sample_into(&mut passes, texture(0x1000), scratch.raw());
         if writes_stencil {
-            passes.note_draw_depth_stencil(
-                &crate::depth_stencil_state::DepthStencilSnapshot::stencil_overwrite(),
-                crate::pipeline_state::PipelineAttachFlags::HAS_DEPTH
-                    | crate::pipeline_state::PipelineAttachFlags::HAS_STENCIL,
-            );
+            write_stencil(&mut passes);
         }
         mark_kept_reads(&passes, &mut history);
         assert!(!history.feeds_persistent(scratch));
@@ -417,11 +419,7 @@ fn retained_stencil_is_tracked_at_the_attached_mip() {
     let mut passes = recording_passes();
     passes.set_depth_stencil_attachment_level(depth, 1, (64, 64), true, true);
     sample_into(&mut passes, texture(0x1000), scratch.raw());
-    passes.note_draw_depth_stencil(
-        &crate::depth_stencil_state::DepthStencilSnapshot::stencil_overwrite(),
-        crate::pipeline_state::PipelineAttachFlags::HAS_DEPTH
-            | crate::pipeline_state::PipelineAttachFlags::HAS_STENCIL,
-    );
+    write_stencil(&mut passes);
     mark_kept_reads(&passes, &mut history);
     assert!(history.feeds_persistent(scratch));
 }
