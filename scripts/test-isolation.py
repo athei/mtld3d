@@ -13,7 +13,9 @@ FIELDS = ("WINE_SDK", "WINE_INSTALL_DIR", "WINEPREFIX", "WINE",
           "WINEBUILD", "WINESERVER", "INSTALL_DIRS", "TEST_PREFIX")
 
 
-class IsolationTests(unittest.TestCase):
+class MakeTestCase(unittest.TestCase):
+    """The Makefile included by a wrapper, run in a scratch tree with its Wine inputs faked."""
+
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory(prefix="mtld3d-isolation-")
         self.addCleanup(self.temporary.cleanup)
@@ -45,7 +47,7 @@ class IsolationTests(unittest.TestCase):
             self.environment.pop(name, None)
         self.environment.update(self.sources)
 
-    def run_make(self, *arguments):
+    def run_make(self, *arguments, succeeds=True):
         isolation_root = self.work / ".wine-isolated"
         result = subprocess.run(
             ["make", "--no-print-directory", "-f", str(self.wrapper),
@@ -54,9 +56,11 @@ class IsolationTests(unittest.TestCase):
             cwd=MAKEFILE.parent, env=self.environment, text=True,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=30,
         )
-        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(result.returncode == 0, succeeds, result.stdout)
         return result.stdout
 
+
+class IsolationTests(MakeTestCase):
     def assert_paths(self, output, isolated, copies=1):
         sdk = str(self.work / ".wine-isolated/sdk") if isolated else self.sources["WINE_SDK"]
         prefix = str(self.work / ".wine-isolated/prefix") if isolated else self.sources["WINEPREFIX"]
@@ -103,6 +107,78 @@ class IsolationTests(unittest.TestCase):
             with self.subTest(goals=goals):
                 self.run_make("-n", "ISOLATED=1", *arguments, *goals)
                 self.assertFalse((self.work / ".wine-isolated").exists())
+
+
+USER_REG = """WINE REGISTRY Version 2
+;; All keys relative to \\\\User\\\\S-1-5-21-0-0-0-1000
+
+#arch=win64
+
+[Software\\\\Wine\\\\Mac Driver] 1787051437
+#time=1dd2f02325c1100
+"RetinaMode"="{retina}"
+
+[Software\\\\Wine\\\\WineDbg] 1787047719
+#time=1dd2ef98a532d16
+"ShowCrashDialog"=dword:00000000
+
+[Software\\\\Wine\\\\X11 Driver] 1787051373
+#time=1dd2f020c8a89fc
+"EmulateModeset"="Y"
+"""
+
+
+class ConfigureTests(MakeTestCase):
+    """Which way `configure-test-prefix-locked` goes, with Wine played by scripts."""
+
+    def configure_decision(self, server_running, user_reg):
+        prefix = Path(self.sources["WINEPREFIX"])
+        if user_reg is not None:
+            (prefix / "user.reg").write_text(user_reg)
+        wineserver = self.work / "wineserver"
+        wineserver.write_text(f"#!/bin/sh\n[ \"$1\" = -k0 ] && exit {0 if server_running else 1}\nexit 0\n")
+        wine = self.work / "wine"
+        wine.write_text("#!/bin/sh\nexit 1\n")
+        for script in (wineserver, wine):
+            script.chmod(0o755)
+        output = self.run_make(f"WINESERVER={wineserver}", f"WINE={wine}", "MAKE=echo sub-make",
+                               "configure-test-prefix-locked")
+        return [line for line in output.splitlines() if line.startswith("sub-make ")]
+
+    def test_a_prefix_whose_file_holds_the_keys_only_boots(self):
+        self.assertEqual(self.configure_decision(False, USER_REG.format(retina="Y")),
+                         ["sub-make configure-test-prefix-boot"])
+
+    def test_a_prefix_missing_a_key_or_its_file_is_configured(self):
+        self.assertEqual(self.configure_decision(False, USER_REG.format(retina="N")),
+                         ["sub-make configure-test-prefix-session"])
+        (Path(self.sources["WINEPREFIX"]) / "user.reg").unlink()
+        self.assertEqual(self.configure_decision(False, None),
+                         ["sub-make configure-test-prefix-session"])
+
+    def fake_wine(self, wineboot_status, server_after):
+        wineserver = self.work / "wineserver"
+        wineserver.write_text(f"#!/bin/sh\n[ \"$1\" = -k0 ] && exit {0 if server_after else 1}\nexit 0\n")
+        wine = self.work / "wine"
+        wine.write_text(f"#!/bin/sh\necho 'wineboot said this'\nexit {wineboot_status}\n")
+        for script in (wineserver, wine):
+            script.chmod(0o755)
+        return [f"WINESERVER={wineserver}", f"WINE={wine}"]
+
+    def test_the_boot_alone_fails_loudly(self):
+        self.run_make(*self.fake_wine(0, True), "configure-test-prefix-boot")
+        for status, server in ((1, True), (0, False)):
+            with self.subTest(wineboot=status, server=server):
+                output = self.run_make(*self.fake_wine(status, server),
+                                       "configure-test-prefix-boot", succeeds=False)
+                self.assertIn("failed or left no server", output)
+                self.assertIn("wineboot said this", output)
+
+    def test_a_running_server_is_asked_rather_than_its_file(self):
+        # The server's keys do not read back (the fake `reg query` fails), and the
+        # file is not trusted while a server may be about to rewrite it.
+        self.assertEqual(self.configure_decision(True, USER_REG.format(retina="Y")),
+                         ["sub-make configure-test-prefix-session"])
 
 
 if __name__ == "__main__":

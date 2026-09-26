@@ -275,13 +275,21 @@ merging a change to the render, encoder, submit or shader path, and put the
 summary line in the pull request's verification. The `wow` set is the two
 World of Warcraft frames, the EVENT-query throttle under the game's settings
 and under the D3D9 defaults, the per-call API cost, and the buffer-lock and
-texture-streaming benchmarks at the game's rates: seven benchmarks of about
-15 to 25 s each, so with the default five rounds of both legs expect about
-half an hour of runs, and the two scene benchmarks' shape runs, on top of
-the two production builds (an estimate from
-the benchmarks' minimum spans; the first run's timestamps say what it is on
-your machine). `BENCH_SET=full` runs every benchmark, the shader-stutter and
-cold-start ones included, and takes about twice as long.
+texture-streaming benchmarks at the game's rates. A run of one of them takes
+about 11.5 s: Wine's start, the warm-up, untimed frames until the layer's
+second perf window opens five seconds after the first frame, and that one
+window measured. So the default five rounds of both legs take about 13 to 14
+minutes, the four shape runs about half a minute and the host emitter's
+rounds about 20 s. Before the first run the two legs build at the same time
+and their prefixes boot while the benchmark binary builds: about a minute and
+a half with a new base worktree and a changed candidate, well under a minute
+when neither needs a build, longer when a change rebuilds the production
+layer in both legs. An A/A run of one commit against itself should take
+about 16 minutes in all, down from the 20 an earlier layout of the run took
+(an estimate from that run's timestamps and the new spans; the first run's
+timestamps say what it is on your machine). `BENCH_SET=full` runs every
+benchmark, the shader-stutter and cold-start ones included, and takes about
+twice as long.
 
 ## Which suite is right when they disagree
 

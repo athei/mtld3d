@@ -343,6 +343,7 @@ TAG          ?= $(shell git describe --tags --exact-match 2>/dev/null)
 	install install-windows-i686 install-windows-x86_64 install-unix-x64 install-unix-arm64 \
 	bundle version-check stage clean-isolated clean-isolated-orphans \
 	configure-test-prefix configure-test-prefix-locked configure-test-prefix-session \
+	configure-test-prefix-boot \
 	test test-unit test-e2e-i686 test-e2e-x86_64 bench bench-ab bench-compare bench-shape clean-bench-ab bench-host bench-host-build \
 	conformance conformance-i686 conformance-x86_64 \
 	conformance-baseline conformance-baseline-i686 conformance-baseline-x86_64 \
@@ -701,6 +702,19 @@ define WINE_REG_IS
 $(WINE) reg query $(1) /v $(2) 2>/dev/null | grep -qE '^[[:space:]]*$(2)[[:space:]]+REG_[A-Z]+[[:space:]]+$(3)[[:space:]]*$$'
 endef
 
+# Reads one value out of the prefix's registry file instead, with no wineserver
+# at all, so it is the prefix's answer only while no server holds the prefix:
+# a running server writes the file when it likes. Wine keeps HKCU in `user.reg`,
+# one section per key opening with the key's name in brackets, its backslashes
+# doubled, and the time it was written, then one `"<name>"=<data>` line per
+# value. The key and the line reach awk through the environment, which leaves
+# backslashes as they are. False when the file or the value is absent.
+# $(1) = the key under HKCU as the file spells it, $(2) = the whole value line.
+define WINE_REG_FILE_IS
+KEY='[$(1)]' LINE='$(2)' awk 'substr($$0, 1, 1) == "[" { here = ($$0 == ENVIRON["KEY"] || index($$0, ENVIRON["KEY"] " ") == 1) } here && $$0 == ENVIRON["LINE"] { found = 1 } END { exit !found }' '$(TEST_PREFIX)/user.reg' 2>/dev/null
+endef
+
+
 # Pin the prefix's display state for the tests, once per prefix rather than
 # once per leg.
 #
@@ -726,13 +740,37 @@ configure-test-prefix:
 # it ends and reboots a server, so nothing can be mid-boot here, and a probe
 # that finds no server also proves this prefix has no test process attached to
 # one.
+#
+# A prefix with no server whose registry file already holds the three values
+# (a clone of a configured prefix, or one whose server a finished run stopped)
+# needs no session to write them and so no restart: the server it boots reads
+# them before it enumerates the display. It only needs its persistent server
+# started, which saves the reg-add session and the restart after it, the
+# larger part of configuring on a fresh clone.
 configure-test-prefix-locked:
 	if $(WINESERVER) -k0 >/dev/null 2>&1 \
 		&& $(call WINE_REG_IS,'HKCU\Software\Wine\WineDbg',ShowCrashDialog,0x0) \
 		&& $(call WINE_REG_IS,'HKCU\Software\Wine\X11 Driver',EmulateModeset,Y) \
 		&& $(call WINE_REG_IS,'HKCU\Software\Wine\Mac Driver',RetinaMode,Y); \
 	then exit 0; fi; \
+	if ! $(WINESERVER) -k0 >/dev/null 2>&1 \
+		&& $(call WINE_REG_FILE_IS,Software\\Wine\\WineDbg,"ShowCrashDialog"=dword:00000000) \
+		&& $(call WINE_REG_FILE_IS,Software\\Wine\\X11 Driver,"EmulateModeset"="Y") \
+		&& $(call WINE_REG_FILE_IS,Software\\Wine\\Mac Driver,"RetinaMode"="Y"); \
+	then $(MAKE) configure-test-prefix-boot; exit; fi; \
 	$(MAKE) configure-test-prefix-session
+
+# The persistent server and the boot the session ends with, alone and loud:
+# on this path no `reg add` has shown that Wine runs in the prefix, so a boot
+# that fails, or leaves no server behind, fails the target with what wineboot
+# said. Its output goes to a file rather than a pipe, since the residents
+# wineboot leaves behind inherit it and would hold a pipe open forever.
+configure-test-prefix-boot:
+	$(WINESERVER) -p >/dev/null 2>&1 || { echo "wineserver -p for $(TEST_PREFIX) failed" >&2; exit 1; }
+	log=$$(mktemp "$${TMPDIR:-/tmp}/mtld3d-wineboot.XXXXXX") || exit 1; \
+	$(WINE) wineboot </dev/null >"$$log" 2>&1 && $(WINESERVER) -k0 >/dev/null 2>&1; status=$$?; \
+	[ $$status -eq 0 ] || { echo "wine wineboot in $(TEST_PREFIX) failed or left no server:" >&2; cat "$$log" >&2; }; \
+	rm -f "$$log"; exit $$status
 
 configure-test-prefix-session:
 	# Keep automated tests non-interactive and independent of mutable prefix
@@ -867,6 +905,8 @@ E2E_EXES_x86_64 = $(if $(STAGE),$(STAGE)/tests/x86_64/*.exe,$(call E2E_EXES,$(PE
 # binary for this machine's arch (compare `CONFORMANCE_BIN`).
 E2E_RUNNER_DIR := $(if $(STAGE),.,unix)
 E2E_RUNNER     := $(if $(STAGE),$(STAGE)/e2e/$(HOST_ARCH)/mtld3d-e2e,cargo +$(RUST_STABLE) run --profile $(PROFILE) -p mtld3d-e2e --)
+# Builds that runner without running it, in its directory; nothing to build from a stage.
+E2E_RUNNER_BUILD := $(if $(STAGE),true,cargo +$(RUST_STABLE) build --profile $(PROFILE) -p mtld3d-e2e)
 
 test-e2e-i686: install-windows-i686 install-unix-$(SDK_UNIX_ARCH)
 	$(MAKE) configure-test-prefix
@@ -1095,9 +1135,16 @@ bench: install-windows-$(ARCH) install-unix-$(SDK_UNIX_ARCH)
 # own `.wine-isolated`. Both trees are taken down and cloned again from the
 # SDK and the prefix this invocation would otherwise use on every run, and
 # both prefixes are configured by this checkout's `configure-test-prefix`, so
-# a Wine rebuilt since the last run or an older BASE's prefix settings cannot
-# make the legs differ in more than the layer; the runner checks that both
-# run one Wine before it starts, and the report names it. The persistent
+# a Wine rebuilt since the last run, an older BASE's prefix settings or a test
+# run in this checkout's prefix cannot make the legs differ in more than the
+# layer; the runner checks that both run one Wine before it starts, and the
+# report names it. The clones cost about a second a tree; what costs is a
+# prefix's first boot, and a clone of a configured prefix only boots once
+# (see `configure-test-prefix-locked`). The two legs build at the same time,
+# the base's output going to `build-base.log` in the run's directory, and the
+# two prefixes are configured at the same time while the benchmark binary and
+# the runner build, each prefix's output going to `configure-<leg>.log` there
+# and shown when it fails. The persistent
 # wineservers of both prefixes are stopped when the run ends, however it
 # ends. The candidate's
 # benchmark binary drives both legs: it links `d3d9` by name and nothing of
@@ -1148,6 +1195,17 @@ BENCH_SDK_SOURCE := $(if $(filter 1,$(ISOLATED)),$(ISOLATED_SDK_SOURCE),$(WINE_S
 BENCH_PREFIX_SOURCE := $(if $(filter 1,$(ISOLATED)),$(ISOLATED_PREFIX_SOURCE),$(or $(WINEPREFIX),$(HOME)/.wine))
 BENCH_LEG_MAKE = ISOLATED=1 PROD=1 PERF=1 WINE_SDK='$(BENCH_SDK_SOURCE)' WINEPREFIX='$(BENCH_PREFIX_SOURCE)'
 BENCH_LEG_INSTALL = install-windows-$(ARCH) install-unix-$(SDK_UNIX_ARCH)
+# `make` for the sub-makes that run beside each other in one bench-ab recipe
+# line. A line that names `$(MAKE)` itself runs even under `make -n`, and these
+# lines also build the benchmark binary and boot the prefixes, which a dry run
+# must only print.
+BENCH_SUBMAKE = $(MAKE)
+# What each leg's sub-make builds: its install, and its host emitter benchmark
+# when BASE has one.
+BENCH_LEG_BUILD = $(BENCH_LEG_INSTALL) $(if $(BENCH_HOST_AB),bench-host-build)
+# Says, in a recipe's shell, that the step $(2) failed when the status $(1) is
+# not zero, and shows the end of its log $(3) in the run's directory.
+bench_leg_failed = [ $(1) -eq 0 ] || { echo "make bench-ab: the $(2) failed; the end of $(BENCH_AB_OUT)/$(3):" >&2; tail -n 40 '$(BENCH_AB_OUT)/$(3)' >&2; }
 # This checkout's `configure-test-prefix` on the isolated tree $(1), not
 # isolated again: the tree is the leg's clone.
 BENCH_LEG_CONFIGURE = ISOLATED= WINE_SDK='$(1)/sdk' WINE_INSTALL_DIR= WINEPREFIX='$(1)/prefix' configure-test-prefix
@@ -1196,14 +1254,22 @@ bench-ab:
 		{ echo "make bench-ab: $(BENCH_BASE_DIR) is not at $(BENCH_BASE_SHA); make clean-bench-ab removes it" >&2; exit 2; }
 	$(call clean_isolated_at,$(BENCH_BASE_ISO))
 	$(call clean_isolated_at,$(ISOLATED_ROOT))
-	$(MAKE) -C '$(BENCH_BASE_DIR)' $(BENCH_LEG_MAKE) $(BENCH_LEG_INSTALL)
-	$(MAKE) $(BENCH_LEG_MAKE) $(BENCH_LEG_INSTALL)
-	$(if $(BENCH_HOST_AB),$(MAKE) -C '$(BENCH_BASE_DIR)' $(BENCH_LEG_MAKE) bench-host-build,\
-		@echo "make bench-ab: BASE $(BENCH_BASE_SHORT) has no host emitter benchmark; neither leg runs it")
-	$(if $(BENCH_HOST_AB),$(MAKE) $(BENCH_LEG_MAKE) bench-host-build)
-	$(MAKE) $(call BENCH_LEG_CONFIGURE,$(BENCH_BASE_ISO)) || { $(BENCH_STOP_SERVERS); stop_servers; exit 2; }
-	$(MAKE) $(call BENCH_LEG_CONFIGURE,$(ISOLATED_ROOT)) || { $(BENCH_STOP_SERVERS); stop_servers; exit 2; }
-	$(if $(BENCH_CORPUS),mkdir -p '$(BENCH_AB_OUT)' && $(call bench_stage_corpus,$(BENCH_AB_OUT)))
+	mkdir -p '$(BENCH_AB_OUT)'
+	$(if $(BENCH_HOST_AB),,@echo "make bench-ab: BASE $(BENCH_BASE_SHORT) has no host emitter benchmark; neither leg runs it")
+	$(BENCH_SUBMAKE) -C '$(BENCH_BASE_DIR)' $(BENCH_LEG_MAKE) $(BENCH_LEG_BUILD) > '$(BENCH_AB_OUT)/build-base.log' 2>&1 & base=$$!; \
+		$(BENCH_SUBMAKE) $(BENCH_LEG_MAKE) $(BENCH_LEG_BUILD); cand=$$?; \
+		wait $$base; base=$$?; \
+		$(call bench_leg_failed,$$base,base leg's build,build-base.log); \
+		[ $$base -eq 0 ] && [ $$cand -eq 0 ] || exit 2; \
+		echo "make bench-ab: base leg built; its output is in $(BENCH_AB_OUT)/build-base.log"
+	$(BENCH_SUBMAKE) $(call BENCH_LEG_CONFIGURE,$(BENCH_BASE_ISO)) > '$(BENCH_AB_OUT)/configure-base.log' 2>&1 & base=$$!; \
+		$(BENCH_SUBMAKE) $(call BENCH_LEG_CONFIGURE,$(ISOLATED_ROOT)) > '$(BENCH_AB_OUT)/configure-cand.log' 2>&1 & cand=$$!; \
+		( $(BENCH_SUITE_ASSIGN) && cd $(E2E_RUNNER_DIR) && $(E2E_RUNNER_BUILD) ); built=$$?; \
+		wait $$base; base=$$?; wait $$cand; cand=$$?; \
+		$(call bench_leg_failed,$$base,base prefix's configure-test-prefix,configure-base.log); \
+		$(call bench_leg_failed,$$cand,candidate prefix's configure-test-prefix,configure-cand.log); \
+		[ $$base -eq 0 ] && [ $$cand -eq 0 ] && [ $$built -eq 0 ] || { $(BENCH_STOP_SERVERS); stop_servers; exit 2; }
+	$(if $(BENCH_CORPUS),$(call bench_stage_corpus,$(BENCH_AB_OUT)))
 	$(BENCH_STOP_SERVERS); trap stop_servers EXIT; \
 	$(BENCH_SUITE_ASSIGN); \
 	cd $(E2E_RUNNER_DIR) && WINEDEBUG= MTL_DEBUG_LAYER=0 MTL_HUD_ENABLED=0 \
