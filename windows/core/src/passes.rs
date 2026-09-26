@@ -16,6 +16,7 @@ use mtld3d_types::D3DSWAPEFFECT_DISCARD;
 use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 
 use crate::{
+    async_compile::DeferredPipelineId,
     convert::d3d_to_metal_stencil_op,
     depth_stencil_state::{DepthStencilSnapshot, STENCIL_MASK_BITS, StencilFaceState},
     dirty_range::DirtyRange,
@@ -1067,6 +1068,58 @@ impl Pass {
             next.depth_flags & (PassDepthFlags::USED | PassDepthFlags::STENCIL_WRITTEN);
         self.has_counting_visibility |= next.has_counting_visibility;
         self.color_writes_observed |= next.color_writes_observed;
+    }
+    /// The per-pass half of [`PassState::resolve_pending_pipelines`].
+    fn resolve_pending_pipelines(
+        &mut self,
+        answer: &impl Fn(&DeferredPipelineId) -> Option<MetalHandle<MTLRenderPipelineStateKind>>,
+    ) -> u32 {
+        let set_pipeline = CommandType::SetRenderPipelineState as u32;
+        if !self
+            .commands
+            .iter()
+            .any(|c| c.cmd == set_pipeline && DeferredPipelineId::is_placeholder(c.param_b))
+        {
+            return 0;
+        }
+        // `kept[i]` is how many commands before index `i` stay, which is
+        // where a clear-quad range boundary at `i` moves to.
+        let mut kept = Vec::with_capacity(self.commands.len() + 1);
+        let mut removed = 0;
+        let mut dropping = false;
+        let mut index = 0;
+        self.commands.retain_mut(|command| {
+            kept.push(index);
+            let keep = if command.cmd == set_pipeline {
+                match DeferredPipelineId::from_placeholder(command.param_b) {
+                    None => {
+                        dropping = false;
+                        true
+                    }
+                    Some(id) => {
+                        let pipeline = answer(&id);
+                        if let Some(pipeline) = pipeline {
+                            command.param_b = pipeline.raw();
+                        }
+                        dropping = pipeline.is_none();
+                        !dropping
+                    }
+                }
+            } else if dropping && command.is_draw() {
+                removed += 1;
+                false
+            } else {
+                true
+            };
+            index += usize::from(keep);
+            keep
+        });
+        kept.push(index);
+        for (start, end) in &mut self.color_clear_quad_ranges {
+            *start = kept[*start];
+            *end = kept[*end];
+        }
+        removed
     }
     /// Render targets 1..3 of this pass, unbound entries included.
     #[must_use]
@@ -4841,6 +4894,36 @@ impl PassState {
             pass.viewport = (sx, sy, sw, sh);
             self.last_emitted_viewport = Some(key);
         }
+    }
+
+    /// Bind the real pipeline in place of every placeholder, or remove what a failed one binds.
+    ///
+    /// A draw whose pipeline was still building when it was encoded binds a
+    /// placeholder ([`DeferredPipelineId::placeholder`]) instead of a
+    /// handle. Once the submission has waited for those builds, `answer`
+    /// names the pipeline each placeholder stands for, and the placeholder
+    /// becomes that handle. For a placeholder `answer` has no pipeline for
+    /// (its build failed, or it names no record) the bind and every draw
+    /// bound under it, up to the next pipeline bind, are removed: a draw
+    /// with no pipeline bound faults at submit. Every other command stays,
+    /// the binds such a draw emitted included, since later draws rely on
+    /// them through the dedup, and so do the pass's tags, which then
+    /// overstate what the pass does and cost at most a kept load or store.
+    /// The colour clear-quad ranges are re-indexed over the removal.
+    /// Answers how many draws were removed.
+    ///
+    /// Must run before every pass rule and before the debug replay of the
+    /// draw states: Rule H looks up a pipeline's no-colour sibling by its
+    /// real handle, and Rules H and J move command indices.
+    pub fn resolve_pending_pipelines(
+        &mut self,
+        answer: impl Fn(&DeferredPipelineId) -> Option<MetalHandle<MTLRenderPipelineStateKind>>,
+    ) -> u32 {
+        let mut removed = 0;
+        for pass in &mut self.passes {
+            removed += pass.resolve_pending_pipelines(&answer);
+        }
+        removed
     }
 
     /// Rule G: strip the colour attachments a clear-only pass leaves unchanged.

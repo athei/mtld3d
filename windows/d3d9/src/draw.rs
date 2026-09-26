@@ -12,7 +12,7 @@ pub use mtld3d_core::shader_cache::{
     ps_source_disk_key_programmable, vs_source_disk_key_programmable,
 };
 use mtld3d_core::{
-    async_compile::{ClearPlanes, JobTicket, Resolution},
+    async_compile::{ClearPlanes, DeferredState, JobTicket, LibrarySlot, Resolution},
     convert::{d3d_depth_bias_to_clip, d3d_to_metal_cull, d3d_to_metal_fill},
     depth_stencil_state::{DepthStencilSnapshot, STENCIL_MASK_BITS},
     dirty_range::{indexed_vb_range_lower_bound, nonindexed_vb_range},
@@ -35,12 +35,13 @@ use mtld3d_core::{
     vs_draw::{MAX_CLIP_PLANES, VS_DRAW_BYTES, VsDrawState},
 };
 use mtld3d_shared::{
-    Command, NullTextureKind, VertexAttrDesc,
+    Command, MetalHandle, NullTextureKind, VertexAttrDesc,
     mtl::{
         IndexType, PS_BOOL_CONST_SLOT, PS_DRAW_SLOT, PS_INT_CONST_SLOT, PS_LOD_BIAS_SLOT,
         PrimitiveType, SET_BYTES_MAX, VS_BOOL_CONST_SLOT, VS_DRAW_SLOT, VS_FLOAT_CONST_SLOT,
         VS_INT_CONST_SLOT, VS_POS_FIXUP_SLOT, VertexStepFunction,
     },
+    mtl_handle::MTLFunctionKind,
 };
 use mtld3d_types::{
     D3DCMP_ALWAYS, D3DCMP_NEVER, D3DMATRIX, MAX_STREAMS, SAMPLER_STATE_COUNT, render_state_defaults,
@@ -1238,14 +1239,20 @@ fn planes_used(
 ///
 /// Out of line, so the draw that finds both built pays for nothing here.
 /// Both stages resolve before any decision, so a draw missing both queues
-/// both builds at once. A pending build is then skipped or waited for
-/// (`FrameEncoder::skip_pending_draw`); `None` drops the draw.
+/// both builds at once. A pending build is then skipped
+/// (`FrameEncoder::skip_pending_draw`), deferred to the submission when
+/// `may_defer` holds, and waited for otherwise; `None` drops the draw. A
+/// deferred draw gets null handles for the libraries still building, and
+/// the encoder keeps what they wait for
+/// (`FrameEncoder::note_pending_libraries`), so the pipeline resolve that
+/// follows binds a placeholder instead.
 #[cold]
 #[inline(never)]
 fn resolve_libraries_slow(
     enc: &mut FrameEncoder,
     shaders: &ShaderRef<'_>,
     planes: ClearPlanes,
+    may_defer: bool,
 ) -> Option<(StageLibHandles, StageLibHandles)> {
     // A build finished since the last frame began may be the one this draw
     // needs; the probes below see it once installed.
@@ -1253,7 +1260,7 @@ fn resolve_libraries_slow(
     let mut waited = false;
     loop {
         let vs_resolved = enc.resolve_vs_library(shaders.vs);
-        if matches!(vs_resolved, Resolution::Failed) {
+        let Some(vs) = library_slot(&vs_resolved) else {
             let dk = shaders.vs.disk_key();
             mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET, "draw dropped: the VS library failed to build");
             mtld3d_shared::log_once_trace_by!(
@@ -1262,9 +1269,9 @@ fn resolve_libraries_slow(
                 "drop: VS {dk:#x} did not resolve",
             );
             return None;
-        }
+        };
         let ps_resolved = enc.resolve_ps_library(shaders.ps, shaders.variant);
-        if matches!(ps_resolved, Resolution::Failed) {
+        let Some(ps) = library_slot(&ps_resolved) else {
             let dk = shaders.ps.disk_key(shaders.variant);
             mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET, "draw dropped: the PS library failed to build");
             mtld3d_shared::log_once_trace_by!(
@@ -1273,26 +1280,16 @@ fn resolve_libraries_slow(
                 "drop: PS {dk:#x} did not resolve",
             );
             return None;
-        }
-        let mut pending = [None; 2];
-        let vs_handles = match vs_resolved {
-            Resolution::Ready(handles) => Some(handles),
-            Resolution::Pending(ticket) => {
-                pending[0] = Some(ticket);
-                None
-            }
-            Resolution::Failed => None,
         };
-        let ps_handles = match ps_resolved {
-            Resolution::Ready(handles) => Some(handles),
-            Resolution::Pending(ticket) => {
-                pending[1] = Some(ticket);
-                None
-            }
-            Resolution::Failed => None,
+        let handles = |resolved: &Resolution<StageLibHandles>| match resolved {
+            Resolution::Ready(handles) => *handles,
+            Resolution::Pending(_) | Resolution::Failed => StageLibHandles {
+                library: MetalHandle::NULL,
+                func: MetalHandle::NULL,
+            },
         };
-        if let (Some(vs_handles), Some(ps_handles)) = (vs_handles, ps_handles) {
-            return Some((vs_handles, ps_handles));
+        if let (LibrarySlot::Ready(_), LibrarySlot::Ready(_)) = (&vs, &ps) {
+            return Some((handles(&vs_resolved), handles(&ps_resolved)));
         }
         if waited {
             mtld3d_shared::log_once_warn!(
@@ -1304,9 +1301,31 @@ fn resolve_libraries_slow(
         if enc.skip_pending_draw(planes) {
             return None;
         }
-        let tickets: Vec<JobTicket> = pending.into_iter().flatten().collect();
+        if may_defer {
+            let pending = (handles(&vs_resolved), handles(&ps_resolved));
+            enc.note_pending_libraries(vs, ps);
+            return Some(pending);
+        }
+        let tickets: Vec<JobTicket> = [vs, ps]
+            .into_iter()
+            .filter_map(|slot| match slot {
+                LibrarySlot::Pending(ticket) => Some(ticket),
+                LibrarySlot::Ready(_) => None,
+            })
+            .collect();
         enc.wait_for_compiles(&tickets);
         waited = true;
+    }
+}
+
+/// A library resolve as the draw records it; `None` for a failed one.
+const fn library_slot(
+    resolved: &Resolution<StageLibHandles>,
+) -> Option<LibrarySlot<MetalHandle<MTLFunctionKind>>> {
+    match resolved {
+        Resolution::Ready(handles) => Some(LibrarySlot::Ready(handles.func)),
+        Resolution::Pending(ticket) => Some(LibrarySlot::Pending(*ticket)),
+        Resolution::Failed => None,
     }
 }
 
@@ -1323,8 +1342,10 @@ struct PipelineRetry<'a> {
 /// The pipeline of a draw whose first resolve was pending or failed.
 ///
 /// Out of line for the same reason as [`resolve_libraries_slow`]. A pending
-/// build is skipped or waited for; a failed no-colour pipeline for a draw
-/// leaving render target 0 out retries with render target 0 attached.
+/// build is skipped, or bound as a placeholder whose build the submission
+/// waits for; the answer is then the placeholder. A draw leaving render
+/// target 0 out waits instead, since the pass it opens is fixed by then and
+/// its failed no-colour pipeline retries with render target 0 attached.
 /// `None` drops the draw.
 #[cold]
 #[inline(never)]
@@ -1361,6 +1382,15 @@ fn resolve_pipeline_slow(
                 }
                 if enc.skip_pending_draw(planes) {
                     return None;
+                }
+                if !*rt0_drop {
+                    let id = enc.defer_pipeline(
+                        DeferredState::Pipeline(ticket),
+                        snapshot,
+                        attrs,
+                        shaders,
+                    );
+                    return Some(id.placeholder());
                 }
                 enc.wait_for_compiles(&[ticket]);
                 waited = true;
@@ -1834,6 +1864,7 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
                 variant: ps_variant,
             },
             planes_used(render_state, target_planes),
+            !rt0_drop,
         )
     }) else {
         return;

@@ -6,7 +6,9 @@
 //! turns on whether leaving it out can lose content for good. This module
 //! holds the logic that choice and the queue rest on, without the threads:
 //! the job tickets, the two-lane queue, the record of which attachments
-//! recent frames cleared, and the skip predicate.
+//! recent frames cleared, the skip predicate, and the records of the draws
+//! whose pipeline is bound as a placeholder until their submission waits
+//! for it.
 
 use std::collections::VecDeque;
 
@@ -23,6 +25,12 @@ use crate::passes::PassState;
 /// content once waits for its builds rather than skip them for a long
 /// while after, and forever while it keeps feeding. Ten seconds at 60 Hz.
 pub const FEED_MEMORY_FRAMES: u64 = 600;
+
+/// The bit a placeholder pipeline bind carries in its handle, and no real handle can.
+///
+/// A real pipeline handle is a user-space address, below 2^47 on every
+/// macOS host, so its top bit is always clear.
+const PENDING_PIPELINE_BIT: u64 = 1 << 63;
 
 /// Identity of one queued build, unique within the encoder that queued it.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -114,17 +122,27 @@ impl<J> CompileLanes<J> {
     }
 
     /// Take the unstarted urgent job `ticket`, so its caller can run it instead of a worker.
-    pub fn steal(&mut self, ticket: JobTicket) -> Option<J> {
+    ///
+    /// `idle` workers are waiting for a job, and each takes the oldest
+    /// urgent one as soon as it runs, so the `idle` oldest urgent jobs are
+    /// left to them: the caller building one of those would only run it
+    /// in series with a worker that could have built it beside the caller.
+    pub fn steal(&mut self, ticket: JobTicket, idle: usize) -> Option<J> {
         let position = self
             .urgent
             .iter()
             .position(|(queued, _)| *queued == ticket)?;
+        if position < idle {
+            return None;
+        }
         self.urgent.remove(position).map(|(_, job)| job)
     }
 
-    /// Take the oldest unstarted urgent job, whichever it is.
-    pub fn steal_urgent(&mut self) -> Option<(JobTicket, J)> {
-        self.urgent.pop_front()
+    /// Take the oldest unstarted urgent job no idle worker is about to take.
+    ///
+    /// The `idle` oldest are left to the idle workers, as for [`Self::steal`].
+    pub fn steal_urgent(&mut self, idle: usize) -> Option<(JobTicket, J)> {
+        self.urgent.remove(idle)
     }
 
     /// How many jobs wait in both lanes together.
@@ -450,6 +468,254 @@ pub enum Resolution<H> {
     Pending(JobTicket),
     /// The build failed; the draw is dropped.
     Failed,
+}
+
+/// A draw's pipeline that is still building, bound as a placeholder until its submission.
+///
+/// Names one record of a [`DeferredPipelines`], valid only within the
+/// submission that made it. The draw's `SetRenderPipelineState` carries
+/// [`Self::placeholder`] in place of a handle, and the submission rewrites
+/// it to the real handle, or removes it and the draws bound under it,
+/// before any pass rule reads the commands.
+pub struct DeferredPipelineId(u32);
+
+impl DeferredPipelineId {
+    /// The value the placeholder `SetRenderPipelineState` carries in place of a handle.
+    #[must_use]
+    pub const fn placeholder(&self) -> u64 {
+        PENDING_PIPELINE_BIT | self.0 as u64
+    }
+
+    /// The record a pipeline bind names, `None` for a real handle.
+    #[must_use]
+    pub fn from_placeholder(raw: u64) -> Option<Self> {
+        if raw & PENDING_PIPELINE_BIT == 0 {
+            return None;
+        }
+        u32::try_from(raw & !PENDING_PIPELINE_BIT).ok().map(Self)
+    }
+
+    /// Whether a pipeline bind carries a placeholder rather than a handle.
+    #[must_use]
+    pub const fn is_placeholder(raw: u64) -> bool {
+        raw & PENDING_PIPELINE_BIT != 0
+    }
+}
+
+/// One shader stage's library as a deferred draw knows it.
+#[derive(PartialEq, Eq, Debug)]
+pub enum LibrarySlot<F> {
+    /// Built, with this function.
+    Ready(F),
+    /// Queued or building under this ticket.
+    Pending(JobTicket),
+}
+
+/// How far a deferred draw's pipeline has come.
+#[derive(PartialEq, Eq, Debug)]
+pub enum DeferredState<F, P> {
+    /// At least one of the two libraries is still building.
+    Libraries {
+        vs: LibrarySlot<F>,
+        ps: LibrarySlot<F>,
+    },
+    /// Both libraries are built and the pipeline builds under this ticket.
+    Pipeline(JobTicket),
+    /// Built, with this pipeline.
+    Ready(P),
+    /// A library or the pipeline failed to build; the draw is removed.
+    Failed,
+}
+
+/// The draws of one submission whose pipeline was bound as a placeholder.
+///
+/// `F` is a library's function, `P` a pipeline, and `R` what the caller
+/// needs to build the pipeline once both libraries are in. Each record
+/// moves from [`DeferredState::Libraries`] through
+/// [`DeferredState::Pipeline`] to [`DeferredState::Ready`] or
+/// [`DeferredState::Failed`] as the builds it names land; the submission
+/// waits for [`Self::pending_tickets`] until none is left, reads each
+/// record's answer, and clears them all, so no record outlives it.
+pub struct DeferredPipelines<F, P, R> {
+    records: Vec<(DeferredState<F, P>, R)>,
+}
+
+impl<F, P, R> Default for DeferredPipelines<F, P, R> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<F, P, R> DeferredPipelines<F, P, R> {
+    /// No deferred draw yet.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            records: Vec::new(),
+        }
+    }
+
+    /// Whether no draw of this submission is deferred.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.records.is_empty()
+    }
+
+    /// Forget every record, once the submission's placeholders are resolved.
+    pub fn clear(&mut self) {
+        self.records.clear();
+    }
+}
+
+impl<F: Copy + PartialEq, P: Copy + PartialEq, R> DeferredPipelines<F, P, R> {
+    /// Record a deferred draw and answer the id its placeholder names.
+    ///
+    /// The previous record serves again when it is in `state` and
+    /// `same_template` accepts its template, so a run of identical draws
+    /// shares one id, and the bind dedup emits one placeholder for all of
+    /// them. `template` builds the record otherwise.
+    pub fn defer(
+        &mut self,
+        state: DeferredState<F, P>,
+        same_template: impl FnOnce(&R) -> bool,
+        template: impl FnOnce() -> R,
+    ) -> DeferredPipelineId {
+        if let Some(last) = self.records.len().checked_sub(1) {
+            let (last_state, last_template) = &self.records[last];
+            if *last_state == state && same_template(last_template) {
+                return Self::id(last);
+            }
+        }
+        self.records.push((state, template()));
+        Self::id(self.records.len() - 1)
+    }
+
+    fn id(index: usize) -> DeferredPipelineId {
+        DeferredPipelineId(u32::try_from(index).expect("deferred draws per submission fit u32"))
+    }
+
+    /// A library build landed: `Some(function)` when it built, `None` when it failed.
+    pub fn on_library(&mut self, ticket: JobTicket, outcome: Option<F>) {
+        for (state, _) in &mut self.records {
+            let DeferredState::Libraries { vs, ps } = state else {
+                continue;
+            };
+            let waits =
+                |slot: &LibrarySlot<F>| matches!(slot, LibrarySlot::Pending(t) if *t == ticket);
+            if !waits(vs) && !waits(ps) {
+                continue;
+            }
+            let Some(function) = outcome else {
+                *state = DeferredState::Failed;
+                continue;
+            };
+            for slot in [&mut *vs, &mut *ps] {
+                if waits(slot) {
+                    *slot = LibrarySlot::Ready(function);
+                }
+            }
+        }
+    }
+
+    /// Move every record whose two libraries are in to the state `resolve` answers for it.
+    ///
+    /// `resolve` gets the record's template and the vertex and pixel
+    /// functions, and answers [`DeferredState::Pipeline`],
+    /// [`DeferredState::Ready`] or [`DeferredState::Failed`].
+    pub fn advance(&mut self, mut resolve: impl FnMut(&mut R, F, F) -> DeferredState<F, P>) {
+        for (state, template) in &mut self.records {
+            if let DeferredState::Libraries {
+                vs: LibrarySlot::Ready(vs),
+                ps: LibrarySlot::Ready(ps),
+            } = *state
+            {
+                *state = resolve(template, vs, ps);
+            }
+        }
+    }
+
+    /// A pipeline build landed: `Some(pipeline)` when it built, `None` when it failed.
+    pub fn on_pipeline(&mut self, ticket: JobTicket, outcome: Option<P>) {
+        for (state, _) in &mut self.records {
+            if *state == DeferredState::Pipeline(ticket) {
+                *state = outcome.map_or(DeferredState::Failed, DeferredState::Ready);
+            }
+        }
+    }
+
+    /// Every ticket a record still waits for, each once.
+    #[must_use]
+    pub fn pending_tickets(&self) -> Vec<JobTicket> {
+        let mut tickets = Vec::new();
+        let mut note = |ticket: JobTicket| {
+            if !tickets.contains(&ticket) {
+                tickets.push(ticket);
+            }
+        };
+        for (state, _) in &self.records {
+            match state {
+                DeferredState::Libraries { vs, ps } => {
+                    for slot in [vs, ps] {
+                        if let LibrarySlot::Pending(ticket) = slot {
+                            note(*ticket);
+                        }
+                    }
+                }
+                DeferredState::Pipeline(ticket) => note(*ticket),
+                DeferredState::Ready(_) | DeferredState::Failed => {}
+            }
+        }
+        tickets
+    }
+
+    /// Act on the records waiting for any of `lost`, builds that can never land.
+    ///
+    /// Every compile worker is gone, and the jobs they had taken went with
+    /// them. A record whose pipeline was lost moves to the state `retry`
+    /// answers for its template, which already names both functions; one
+    /// whose library was lost fails, since a library cannot be rebuilt from
+    /// a record.
+    pub fn retry_lost(
+        &mut self,
+        lost: &[JobTicket],
+        mut retry: impl FnMut(&mut R) -> DeferredState<F, P>,
+    ) {
+        for (state, template) in &mut self.records {
+            match state {
+                DeferredState::Libraries { vs, ps } => {
+                    if [vs, ps]
+                        .into_iter()
+                        .any(|slot| matches!(slot, LibrarySlot::Pending(t) if lost.contains(t)))
+                    {
+                        *state = DeferredState::Failed;
+                    }
+                }
+                DeferredState::Pipeline(ticket) if lost.contains(ticket) => {
+                    *state = retry(template);
+                }
+                DeferredState::Pipeline(_) | DeferredState::Ready(_) | DeferredState::Failed => {}
+            }
+        }
+    }
+
+    /// Visit the template and pipeline of every record that built.
+    pub fn for_each_ready(&self, mut visit: impl FnMut(&R, P)) {
+        for (state, template) in &self.records {
+            if let DeferredState::Ready(pipeline) = state {
+                visit(template, *pipeline);
+            }
+        }
+    }
+
+    /// The pipeline the placeholder `id` stands for; `None` when it failed or is unknown.
+    #[must_use]
+    pub fn answer(&self, id: &DeferredPipelineId) -> Option<P> {
+        let index = usize::try_from(id.0).ok()?;
+        match self.records.get(index)? {
+            (DeferredState::Ready(pipeline), _) => Some(*pipeline),
+            _ => None,
+        }
+    }
 }
 
 #[cfg(test)]

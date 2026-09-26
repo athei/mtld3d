@@ -9894,3 +9894,165 @@ fn pass_reads_follow_the_passes_that_bind_them() {
     s.emit_command(Command::set_fragment_texture(tex(0x7003).raw(), 0));
     assert!(s.pass_reads().is_empty());
 }
+
+/// The placeholder bind of deferred record `index`, as `DeferredPipelineId::placeholder` makes it.
+fn placeholder(index: u32) -> u64 {
+    (1 << 63) | u64::from(index)
+}
+
+/// The pipeline handles a pass binds, in command order.
+fn bound_pipelines(pass: &Pass) -> Vec<u64> {
+    pass.commands()
+        .iter()
+        .filter(|c| c.cmd == CommandType::SetRenderPipelineState as u32)
+        .map(|c| c.param_b)
+        .collect()
+}
+
+fn draw_count(pass: &Pass) -> usize {
+    pass.commands().iter().filter(|c| c.is_draw()).count()
+}
+
+/// A placeholder whose build landed binds the real pipeline, and every command stays.
+#[test]
+fn a_resolved_placeholder_binds_the_real_pipeline() {
+    let mut s = fresh();
+    s.emit_command(set_pso(placeholder(0)));
+    s.emit_command(Command::set_fragment_texture(tex(0x7001).raw(), 0));
+    s.emit_command(dummy_draw());
+    s.emit_command(dummy_draw());
+    s.end_current_pass("test");
+    let before = s.passes()[0].commands().len();
+    let removed = s.resolve_pending_pipelines(|id| {
+        assert_eq!(id.placeholder(), placeholder(0));
+        Some(pso(PSO_WITH))
+    });
+    assert_eq!(removed, 0);
+    let pass = &s.passes()[0];
+    assert_eq!(pass.commands().len(), before, "nothing is removed");
+    assert_eq!(bound_pipelines(pass), [PSO_WITH]);
+    assert_eq!(draw_count(pass), 2);
+}
+
+/// A failed placeholder takes its bind and the draws under it, and leaves binds and other draws.
+#[test]
+fn a_failed_placeholder_removes_its_draws_and_keeps_the_binds() {
+    let mut s = fresh();
+    s.emit_command(set_pso(PSO_WITH));
+    s.emit_command(dummy_draw());
+    s.emit_command(set_pso(placeholder(0)));
+    s.emit_command(Command::set_fragment_texture(tex(0x7001).raw(), 0));
+    s.emit_command(dummy_draw());
+    s.emit_command(Command::set_fragment_texture(tex(0x7002).raw(), 1));
+    s.emit_command(dummy_draw());
+    s.emit_command(set_pso(PSO_NO_COLOR));
+    s.emit_command(dummy_draw());
+    s.end_current_pass("test");
+    let before = s.passes()[0].commands().len();
+    let removed = s.resolve_pending_pipelines(|_| None);
+    assert_eq!(
+        removed, 2,
+        "the two draws bound under the failed placeholder"
+    );
+    let pass = &s.passes()[0];
+    assert_eq!(
+        pass.commands().len(),
+        before - 3,
+        "the bind and its two draws"
+    );
+    assert_eq!(bound_pipelines(pass), [PSO_WITH, PSO_NO_COLOR]);
+    assert_eq!(draw_count(pass), 2, "the draws under real pipelines stay");
+    let textures = pass
+        .commands()
+        .iter()
+        .filter(|c| c.cmd == CommandType::SetFragmentTexture as u32)
+        .count();
+    assert_eq!(
+        textures, 2,
+        "later draws may rely on the binds through the dedup"
+    );
+}
+
+/// Only the failed one of two placeholders loses its draws.
+#[test]
+fn each_placeholder_is_answered_on_its_own() {
+    let mut s = fresh();
+    s.emit_command(set_pso(placeholder(0)));
+    s.emit_command(dummy_draw());
+    s.emit_command(set_pso(placeholder(1)));
+    s.emit_command(dummy_draw());
+    s.emit_command(dummy_draw());
+    s.emit_command(set_pso(placeholder(0)));
+    s.emit_command(dummy_draw());
+    s.end_current_pass("test");
+    let removed = s.resolve_pending_pipelines(|id| {
+        (id.placeholder() == placeholder(0)).then(|| pso(PSO_WITH))
+    });
+    assert_eq!(removed, 2);
+    let pass = &s.passes()[0];
+    assert_eq!(bound_pipelines(pass), [PSO_WITH, PSO_WITH]);
+    assert_eq!(draw_count(pass), 2);
+}
+
+/// Removing commands ahead of a colour clear-quad block moves its range with it.
+#[test]
+fn a_removal_re_indexes_the_clear_quad_ranges() {
+    let mut s = fresh();
+    s.emit_command(set_pso(placeholder(0)));
+    s.emit_command(dummy_draw());
+    s.emit_command(dummy_draw());
+    let start = s.open_color_clear_quad_block();
+    s.emit_command(set_pso(0xCAFE_BABE));
+    s.emit_command(dummy_draw());
+    s.close_color_clear_quad_block(start);
+    s.emit_command(set_pso(placeholder(0)));
+    s.emit_command(dummy_draw());
+    s.end_current_pass("test");
+    s.resolve_pending_pipelines(|_| None);
+    let pass = &s.passes()[0];
+    let &[(start, end)] = pass.color_clear_quad_ranges() else {
+        panic!("one clear-quad block: {:?}", pass.color_clear_quad_ranges());
+    };
+    let block = &pass.commands()[start..end];
+    assert_eq!(block.len(), 2, "the block keeps its bind and its draw");
+    assert_eq!(block[0].param_b, 0xCAFE_BABE);
+    assert!(block[1].is_draw());
+    assert_eq!(draw_count(pass), 1, "only the clear quad's draw is left");
+}
+
+/// A pass without placeholders is left exactly as it was, and the answer is never asked.
+#[test]
+fn a_pass_without_placeholders_is_untouched() {
+    let mut s = fresh();
+    s.emit_command(set_pso(PSO_WITH));
+    s.emit_command(dummy_draw());
+    s.end_current_pass("test");
+    let commands = s.passes()[0].commands().as_ptr();
+    let removed = s.resolve_pending_pipelines(|_| panic!("no placeholder to answer"));
+    assert_eq!(removed, 0);
+    assert_eq!(s.passes()[0].commands().as_ptr(), commands);
+    assert_eq!(bound_pipelines(&s.passes()[0]), [PSO_WITH]);
+}
+
+/// Rule H finds the no-colour sibling of a placeholder once the placeholder is resolved.
+#[test]
+fn rule_h_strips_a_pass_whose_placeholders_were_resolved() {
+    let mut s = fresh();
+    for _ in 0..3 {
+        s.note_draw_color_write_mask(0);
+        s.emit_command(set_pso(placeholder(0)));
+        s.emit_command(dummy_draw());
+    }
+    s.end_current_pass("test");
+    s.resolve_pending_pipelines(|_| Some(pso(PSO_WITH)));
+    let mut alt = FxHashMap::default();
+    alt.insert(PSO_WITH, pso(PSO_NO_COLOR));
+    s.strip_color_from_no_color_draw_passes(&alt);
+    let pass = &s.passes()[0];
+    assert_eq!(pass.color_texture(), MetalHandle::NULL, "colour stripped");
+    assert!(
+        bound_pipelines(pass).iter().all(|&h| h == PSO_NO_COLOR),
+        "every bind swapped to the sibling: {:?}",
+        bound_pipelines(pass)
+    );
+}

@@ -85,6 +85,7 @@ fn async_rows_print_with_no_compilation_row_and_reset_with_the_window() {
     perf.asynchronous.installs = 2;
     perf.asynchronous.latency_ns = 30_000_000;
     perf.asynchronous.latency_peak_ns = 20_000_000;
+    perf.asynchronous.deferred = 2;
     perf.asynchronous.urgent_waits = 1;
     perf.asynchronous.urgent_wait_ns = 5_000_000;
     perf.asynchronous.stolen = 1;
@@ -94,7 +95,7 @@ fn async_rows_print_with_no_compilation_row_and_reset_with_the_window() {
     perf.append_window(&mut output, 1);
     assert!(output.contains("draws skipped=3  pending peak=2  installs=2"));
     assert!(output.contains("latency avg 15.000 ms  max 20.000 ms"));
-    assert!(output.contains("urgent waits=1  waited 5.000 ms  stolen=1"));
+    assert!(output.contains("draws deferred=2  urgent waits=1  waited 5.000 ms  stolen=1"));
     assert!(output.contains("encoder per miss 0.100 ms  misses=4"));
     let mut again = String::new();
     perf.append_window(&mut again, 1);

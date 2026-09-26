@@ -2,9 +2,9 @@
 //!
 //! Every measured frame draws a fixed base workload and then creates and
 //! draws never-seen programmable pixel shaders: `K` on the back buffer, one
-//! quad each, and, in the variant that asks for it, one more into an
+//! quad each, and, in the variants that ask for it, more in one pass into an
 //! offscreen target that is cleared once and never again, so its pass loads
-//! what the previous frame left and the draw must keep its content. Each
+//! what the previous frame left and the draws must keep their content. Each
 //! shader's bytecode is unique (its `def c7` carries a running count and a
 //! per-run salt), so neither the layer nor Metal's own compiler cache can
 //! have seen it, on this run or an earlier one. The interface is created
@@ -26,7 +26,7 @@
 //! colour, until every one does or [`VERIFY_FRAMES`] have gone by. A layer
 //! that skips a draw for a pipeline still building has had the settle
 //! frames to build it, so a cell left black is a shader that was never
-//! drawn. `K` and the offscreen shader are fixed per test; `make bench
+//! drawn. `K` and the offscreen count are fixed per test; `make bench
 //! FILTER=<test name>` picks one.
 
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -69,18 +69,31 @@ const VERIFY_FRAMES: u32 = 100;
 #[test]
 #[ignore = "benchmark, run by `make bench`"]
 fn one_new_shader_per_frame() {
-    stutter("shader_stutter_k1", 1, false);
+    stutter("shader_stutter_k1", 1, 0);
 }
 
 /// Two new pixel shaders per frame on the back buffer and one into an uncleared offscreen target.
 #[test]
 #[ignore = "benchmark, run by `make bench`"]
 fn two_new_shaders_per_frame_and_one_offscreen() {
-    stutter("shader_stutter_k2_offscreen", 2, true);
+    stutter("shader_stutter_k2_offscreen", 2, 1);
 }
 
-/// Run the measured frames, `per_frame` new shaders each, and write the report `name`.
-fn stutter(name: &str, per_frame: u32, offscreen: bool) {
+/// Three new pixel shaders per frame, all in one pass into an uncleared offscreen target.
+///
+/// None of the three may be left out of its frame, so each frame's stall
+/// is what building three shaders the frame cannot do without costs.
+#[test]
+#[ignore = "benchmark, run by `make bench`"]
+fn three_new_shaders_per_frame_offscreen() {
+    stutter("shader_stutter_offscreen3", 0, 3);
+}
+
+/// Run the measured frames and write the report `name`.
+///
+/// Each measured frame draws `per_frame` new shaders on the back buffer and
+/// `offscreen` more in one pass into the uncleared offscreen target.
+fn stutter(name: &str, per_frame: u32, offscreen: u32) {
     let h = Harness::create(&HarnessConfig {
         width: WIDTH,
         height: HEIGHT,
@@ -140,10 +153,10 @@ fn stutter(name: &str, per_frame: u32, offscreen: bool) {
          API work (Present return to Present call): {work}\n\
          frames over 2x the median ({limit:.3} ms): {spikes}\n\
          {verified}{perf}{compiles}",
-        offscreen = if offscreen {
-            " + 1 into an offscreen target never cleared after the first frame"
+        offscreen = if offscreen == 0 {
+            String::new()
         } else {
-            ""
+            format!(" + {offscreen} into an offscreen target never cleared after the first frame")
         },
         frames = stats.frames,
         shaders = bench.shaders.len(),
@@ -262,7 +275,7 @@ impl<'h> Stutter<'h> {
     }
 
     /// Create this frame's new shaders and draw each once on the back buffer, or offscreen.
-    fn introduce(&mut self, frame: u32, per_frame: u32, offscreen: bool) {
+    fn introduce(&mut self, frame: u32, per_frame: u32, offscreen: u32) {
         let h = self.h;
         for at in 0..per_frame {
             let ps = self.new_shader();
@@ -270,13 +283,15 @@ impl<'h> Stutter<'h> {
             self.draw(0.1, spot(BASE_DRAWS + at + frame % 7));
             self.shaders.push(ps);
         }
-        if offscreen {
-            let ps = self.new_shader();
+        if offscreen != 0 {
             ok(h.set_render_target(0, &self.offscreen), "offscreen target");
-            ok(h.set_pixel_shader(&ps), "offscreen PS");
-            self.draw(0.1, spot(frame % 40));
+            for at in 0..offscreen {
+                let ps = self.new_shader();
+                ok(h.set_pixel_shader(&ps), "offscreen PS");
+                self.draw(0.1, spot((frame + at * 13) % 40));
+                self.shaders.push(ps);
+            }
             ok(h.set_render_target(0, &self.back_buffer), "back buffer");
-            self.shaders.push(ps);
         }
     }
 
