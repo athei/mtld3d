@@ -530,7 +530,9 @@ fn a_benchmark_missing_from_one_round_is_rejected() {
 }
 
 #[test]
-fn a_metric_that_comes_and_goes_within_a_leg_is_rejected() {
+fn a_metric_that_comes_and_goes_within_a_leg_is_reported_not_judged() {
+    // Round 1 of the base leaves perf.draws_pf out, as a window without a
+    // fault sample leaves out perf.faults_major_pf.
     let fixture = Fixture::new("flaky-metric");
     fixture.standard(3, 1.0);
     fixture.write(
@@ -540,10 +542,27 @@ fn a_metric_that_comes_and_goes_within_a_leg_is_rejected() {
         &meta("v0.11.0-3-g66e4114", "AAAA"),
         &[("frame.p50", 10.0, "ms lower time")],
     );
-    let reason = error_of(&fixture);
+    let comparison = evaluate(&fixture.root, &Options::default()).unwrap();
+    let row = comparison
+        .rows()
+        .find(|row| row.metric == "perf.draws_pf")
+        .expect("the row is reported");
+    assert_eq!(row.verdict, Verdict::Incomplete);
+    assert!(!row.verdict.fails());
+    assert_eq!(row.change, "in 2 of 3 base rounds, 3 of 3 cand rounds");
+    assert!(!comparison.failed());
     assert!(
-        reason.contains("metric perf.draws_pf is in one of"),
-        "{reason}"
+        comparison
+            .notes
+            .iter()
+            .any(|note| note.contains("frame_shape: perf.draws_pf is in some rounds")),
+        "{:?}",
+        comparison.notes
+    );
+    assert!(
+        comparison.summary().contains("1 incomplete"),
+        "{}",
+        comparison.summary()
     );
 }
 

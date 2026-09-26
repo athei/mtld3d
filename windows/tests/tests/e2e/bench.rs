@@ -1520,7 +1520,9 @@ impl Metrics {
     ///   totals grow with the frame rate.
     ///
     /// A key a window leaves out (`docs/ARCHITECTURE.md` names the three that
-    /// can be) is aggregated over the windows that carry it.
+    /// can be) is recorded only when every window read carries it, so each
+    /// value covers the same windows; a comparison reports a key some rounds
+    /// of a leg carry and others do not as incomplete, not judged.
     pub fn perf(&mut self, windows: &[Option<String>], work: &FrameWork) {
         let missing = windows.iter().filter(|window| window.is_none()).count();
         if windows.is_empty() {
@@ -1574,6 +1576,9 @@ impl Metrics {
             }
         }
         for (rule, fold) in folds.into_values() {
+            if fold.windows != windows.len() {
+                continue;
+            }
             let value = fold.value(&rule.fold);
             self.metric(
                 &rule.name,
@@ -1876,6 +1881,8 @@ enum Fold {
 /// The running sums one key's values fold into.
 #[derive(Default)]
 struct PerfFold {
+    /// The windows that carried the key.
+    windows: usize,
     sum: f64,
     weighted: f64,
     weight: f64,
@@ -1884,6 +1891,7 @@ struct PerfFold {
 
 impl PerfFold {
     fn add(&mut self, value: f64, weight: f64) {
+        self.windows += 1;
         self.sum += value;
         self.weighted = value.mul_add(weight, self.weighted);
         self.weight += weight;

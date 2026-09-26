@@ -27,6 +27,12 @@
 //!   different work.
 //! - `info`: reported, never judged.
 //!
+//! A metric some rounds of a leg carry and others do not has no pairs to
+//! judge: it is reported as incomplete with a note, never judged, since the
+//! `perf-kv` line may leave out a few keys in a window (the fault counts
+//! when no fault sample was taken, the copies of a pool with none), and a
+//! benchmark reads one window a round.
+//!
 //! Beside the numbers, each scene benchmark's untimed shape runs are
 //! compared: the passes of its steady submission and every load/store
 //! decision on them must be the same in both legs, and a difference fails
@@ -245,6 +251,8 @@ pub enum Verdict {
     Added,
     /// Only the base has it.
     Removed,
+    /// Some rounds of a leg have it and others do not, so it has no pairs to judge.
+    Incomplete,
 }
 
 impl Verdict {
@@ -267,6 +275,7 @@ impl Verdict {
             Self::Info => "info",
             Self::Added => "added",
             Self::Removed => "removed",
+            Self::Incomplete => "incomplete, not judged",
         }
     }
 
@@ -379,6 +388,7 @@ impl Comparison {
         let accepted = count(|v| matches!(v, Verdict::Changed { accepted: true, .. }));
         let added = count(|v| *v == Verdict::Added);
         let removed = count(|v| *v == Verdict::Removed);
+        let incomplete = count(|v| *v == Verdict::Incomplete);
         let verdict = if self.failed() { "FAIL" } else { "PASS" };
         let shapes_changed = self.shapes.iter().filter(|s| s.changed()).count();
         let shapes_accepted = self
@@ -389,7 +399,8 @@ impl Comparison {
         format!(
             "bench-compare: {verdict}: {judged} benchmarks, {} metrics: {regressions} regressed, \
              {improvements} improved, {changes} exact changed ({accepted} accepted), {added} \
-             added, {removed} removed; {shapes_changed} of {} shapes changed ({shapes_accepted} \
+             added, {removed} removed, {incomplete} incomplete; {shapes_changed} of {} shapes \
+             changed ({shapes_accepted} \
              accepted)",
             self.rows().count(),
             self.shapes.len()
@@ -879,9 +890,17 @@ pub fn compare(
     }
     for bench in base_benches.intersection(&cand_benches) {
         check_workload(bench, base, cand)?;
+        let rows = bench_rows(bench, base, cand, options)?;
+        for row in rows.iter().filter(|row| row.verdict == Verdict::Incomplete) {
+            notes.push(format!(
+                "{bench}: {} is in some rounds of a leg and not in others ({}), as a key the \
+                 perf-kv line may leave out can be; it is not judged",
+                row.metric, row.change
+            ));
+        }
         benches.push(BenchReport {
             bench: bench.clone(),
-            rows: bench_rows(bench, base, cand, options)?,
+            rows,
         });
     }
     for name in options
@@ -1009,7 +1028,38 @@ fn bench_rows(
         .collect();
     let mut rows = Vec::new();
     for name in names {
-        let row = match (base_series.get(name), cand_series.get(name)) {
+        let (in_base, in_cand) = (base_series.get(name), cand_series.get(name));
+        let partial = |series: Option<&(&Metric, Vec<f64>)>, rounds: usize| {
+            series.is_some_and(|(_, values)| values.len() != rounds)
+        };
+        if partial(in_base, base.len()) || partial(in_cand, cand.len()) {
+            let counted = |series: Option<&(&Metric, Vec<f64>)>, rounds: usize, leg: &str| {
+                format!(
+                    "{} of {rounds} {leg} rounds",
+                    series.map_or(0, |(_, values)| values.len())
+                )
+            };
+            let shown = |series: Option<&(&Metric, Vec<f64>)>| {
+                series.map_or_else(
+                    || "-".to_owned(),
+                    |(definition, values)| with_unit(median(values), definition),
+                )
+            };
+            rows.push(Row {
+                metric: name.clone(),
+                base: shown(in_base),
+                cand: shown(in_cand),
+                change: format!(
+                    "in {}, {}",
+                    counted(in_base, base.len(), "base"),
+                    counted(in_cand, cand.len(), "cand")
+                ),
+                noise: String::new(),
+                verdict: Verdict::Incomplete,
+            });
+            continue;
+        }
+        let row = match (in_base, in_cand) {
             (Some((definition, base_values)), Some((cand_definition, cand_values))) => {
                 if !definition.same_definition(cand_definition) {
                     return Err(format!(
@@ -1035,29 +1085,17 @@ fn bench_rows(
     Ok(rows)
 }
 
-/// One benchmark's metrics in one leg: each metric's definition and its value per round.
+/// One benchmark's metrics in one leg: each one's definition and its value in each round with it.
+///
+/// A metric some rounds lack has fewer values than the leg has rounds;
+/// `bench_rows` reports it as [`Verdict::Incomplete`].
 fn leg_series<'a>(
     bench: &str,
     rounds: &'a [BTreeMap<String, Loaded>],
 ) -> Result<BTreeMap<&'a String, (&'a Metric, Vec<f64>)>, String> {
     let mut series: BTreeMap<&String, (&Metric, Vec<f64>)> = BTreeMap::new();
-    let mut first: Option<&Loaded> = None;
     for round in rounds {
         let loaded = &round[bench];
-        if let Some(first) = first {
-            let names = |l: &Loaded| l.file.metrics.keys().cloned().collect::<BTreeSet<String>>();
-            let (had, has) = (names(first), names(loaded));
-            if let Some(name) = had.symmetric_difference(&has).next() {
-                return Err(format!(
-                    "metric {name} is in one of {} and {} but not the other: the rounds of a \
-                     leg must carry the same metrics",
-                    first.path.display(),
-                    loaded.path.display()
-                ));
-            }
-        } else {
-            first = Some(loaded);
-        }
         for (name, metric) in &loaded.file.metrics {
             let entry = series.entry(name).or_insert_with(|| (metric, Vec::new()));
             if !entry.0.same_definition(metric) {
