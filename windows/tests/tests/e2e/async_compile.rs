@@ -16,10 +16,11 @@ use std::time::{Duration, Instant};
 
 use mtld3d_tests::{Harness, Surface, TexturedVertex, Vertex, assert_pixel_eq};
 use mtld3d_types::{
-    D3D_OK, D3DFMT_A8R8G8B8, D3DFVF_DIFFUSE, D3DFVF_TEX1, D3DFVF_XYZ, D3DGETDATA_FLUSH,
-    D3DISSUE_BEGIN, D3DISSUE_END, D3DLOCK_READONLY, D3DPOOL_DEFAULT, D3DPOOL_SYSTEMMEM,
-    D3DPT_TRIANGLELIST, D3DQUERYTYPE_OCCLUSION, D3DRS_LIGHTING, D3DTEXF_NONE,
-    D3DUSAGE_RENDERTARGET,
+    D3D_OK, D3DBLEND_INVSRCALPHA, D3DBLEND_ONE, D3DBLEND_SRCALPHA, D3DBLEND_ZERO, D3DFMT_A8R8G8B8,
+    D3DFVF_DIFFUSE, D3DFVF_TEX1, D3DFVF_XYZ, D3DGETDATA_FLUSH, D3DISSUE_BEGIN, D3DISSUE_END,
+    D3DLOCK_READONLY, D3DPOOL_DEFAULT, D3DPOOL_SYSTEMMEM, D3DPT_TRIANGLELIST,
+    D3DQUERYTYPE_OCCLUSION, D3DRS_ALPHABLENDENABLE, D3DRS_COLORWRITEENABLE, D3DRS_DESTBLEND,
+    D3DRS_LIGHTING, D3DRS_SRCBLEND, D3DTEXF_NONE, D3DUSAGE_RENDERTARGET,
 };
 
 const ASYNC: &str = "shader.asyncCompile=true;shaderCache.enable=false";
@@ -582,4 +583,82 @@ fn a_read_back_in_the_frame_of_a_first_seen_draw_sees_it() {
     );
     assert_eq!(h.end_scene(), D3D_OK, "EndScene");
     assert_eq!(h.present(), D3D_OK, "Present");
+}
+
+/// Draw the three bands of `shaders` into `rt`, uncleared, in one frame, applying `state` first.
+fn frame_of_bands(
+    h: &Harness,
+    rt: &Surface<'_>,
+    shaders: &[mtld3d_tests::PixelShader<'_>; 3],
+    state: impl Fn(&Harness, usize),
+) {
+    let backbuffer = h.render_target(0);
+    assert!(h.pump(), "WM_QUIT before render");
+    assert_eq!(h.begin_scene(), D3D_OK, "BeginScene");
+    assert_eq!(h.set_render_target(0, rt), D3D_OK, "bind the target");
+    for (third, ps) in shaders.iter().enumerate() {
+        state(h, third);
+        draw_bands(h, &[(third, ps)]);
+    }
+    assert_eq!(
+        h.set_render_target(0, &backbuffer),
+        D3D_OK,
+        "restore the back buffer"
+    );
+    assert_eq!(h.end_scene(), D3D_OK, "EndScene");
+    assert_eq!(h.present(), D3D_OK, "Present");
+}
+
+/// Built shaders drawn under render states they never met show in the first frame that draws them.
+///
+/// A first frame builds the three pixel shaders and their pipelines under
+/// the default state. The next frame draws each into an uncleared target
+/// under a blend or write-mask state of its own, each of which writes the
+/// shader's colour: the libraries are built and only the pipeline is new,
+/// so each draw binds a placeholder for the pipeline alone.
+fn built_shaders_under_new_pipeline_states(entries: &'static str) {
+    let h = device_with(entries);
+    let warm = h.create_render_target(96, 32, D3DFMT_A8R8G8B8);
+    let rt = h.create_render_target(96, 32, D3DFMT_A8R8G8B8);
+    let shaders = [RED, GREEN, YELLOW].map(|color| h.create_pixel_shader(&solid_ps(color)));
+    frame_of_bands(&h, &warm, &shaders, |_, _| {});
+    frame_of_bands(&h, &rt, &shaders, |dev, third| {
+        let set = |state, value| {
+            assert_eq!(dev.set_render_state(state, value), D3D_OK, "SetRenderState");
+        };
+        match third {
+            0 => {
+                set(D3DRS_ALPHABLENDENABLE, 1);
+                set(D3DRS_SRCBLEND, D3DBLEND_ONE);
+                set(D3DRS_DESTBLEND, D3DBLEND_ZERO);
+            }
+            1 => {
+                set(D3DRS_SRCBLEND, D3DBLEND_SRCALPHA);
+                set(D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA);
+            }
+            _ => {
+                set(D3DRS_ALPHABLENDENABLE, 0);
+                set(D3DRS_COLORWRITEENABLE, 0x7);
+            }
+        }
+    });
+    for (x, color) in [(16, RED), (48, GREEN), (80, YELLOW)] {
+        assert_pixel_eq(
+            read_rt_pixel(&h, &rt, x, 16) | 0xFF00_0000,
+            color,
+            "a draw whose pipeline alone is new shows in its frame",
+        );
+    }
+}
+
+/// With the option off, built shaders under new pipeline states show in their frame.
+#[test]
+fn built_shaders_under_new_pipeline_states_show_in_their_frame() {
+    built_shaders_under_new_pipeline_states(SYNC);
+}
+
+/// With the option on, built shaders under new pipeline states into an uncleared target show too.
+#[test]
+fn built_shaders_under_new_pipeline_states_into_an_uncleared_target_show_in_their_frame() {
+    built_shaders_under_new_pipeline_states(ASYNC);
 }
