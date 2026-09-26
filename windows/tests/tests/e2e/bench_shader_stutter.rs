@@ -200,7 +200,10 @@ fn stutter(name: &str, per_frame: u32, offscreen: u32) {
     let count = |n: usize| Value::Count(u64::try_from(n).expect("a count fits u64"));
     let mut metrics = Metrics::new(name);
     metrics.frame_rows("frame", &stats);
-    metrics.frame_rows("api", &work);
+    // The API thread's share of these frames is tens of microseconds, which
+    // two runs of one build move by more than a relative rule allows; the
+    // spikes, the extra time per shader and the frame times are the verdict.
+    metrics.context_rows("api", &work);
     metrics.metric(
         "frame.spikes",
         count(spikes),

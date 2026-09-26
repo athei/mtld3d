@@ -690,10 +690,23 @@ impl Metrics {
     /// The three that summarise the run are compared as times; the worst
     /// frame, one sample, is reported alone.
     pub fn frame_rows(&mut self, prefix: &str, stats: &FrameStats) {
+        self.percentile_rows(prefix, stats, || Class::Time);
+    }
+
+    /// The same four records as [`Self::frame_rows`], all reported for context and none compared.
+    ///
+    /// For a run whose times are too short, or too dependent on how the
+    /// frames fall, to judge by a relative rule.
+    pub fn context_rows(&mut self, prefix: &str, stats: &FrameStats) {
+        self.percentile_rows(prefix, stats, || Class::Info);
+    }
+
+    /// The four percentile records, the three that summarise the run of class `summary`.
+    fn percentile_rows(&mut self, prefix: &str, stats: &FrameStats, summary: impl Fn() -> Class) {
         for (row, value, class) in [
-            ("p50", stats.p50, Class::Time),
-            ("mean", stats.mean, Class::Time),
-            ("p99", stats.p99, Class::Time),
+            ("p50", stats.p50, summary()),
+            ("mean", stats.mean, summary()),
+            ("p99", stats.p99, summary()),
             ("max", stats.max, Class::Info),
         ] {
             self.metric(
@@ -708,6 +721,9 @@ impl Metrics {
     /// The `mem.*` records of the samples taken after the warm-up and at the end.
     ///
     /// The peak working set is the end sample's, the peak of the whole run.
+    /// All of them are of class `bytes`: a change has to clear the absolute
+    /// floor as well as the relative one, since two runs of one build can
+    /// differ by a MiB or so in a figure of a few MiB.
     pub fn memory(&mut self, warm: &MemorySample, end: &MemorySample) {
         for (phase, sample) in [("warm", warm), ("end", end)] {
             for (row, bytes, direction) in [
@@ -719,7 +735,7 @@ impl Metrics {
                     &format!("mem.{phase}.{row}"),
                     Value::Mib(bytes),
                     direction,
-                    Class::Noisy,
+                    Class::Bytes,
                 );
             }
         }
@@ -727,7 +743,7 @@ impl Metrics {
             "mem.peak_ws_mib",
             Value::Mib(end.peak_working_set()),
             Direction::Lower,
-            Class::Noisy,
+            Class::Bytes,
         );
     }
 
