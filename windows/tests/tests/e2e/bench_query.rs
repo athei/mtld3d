@@ -102,6 +102,10 @@ fn query_poll_spec() {
 
 /// Warm up, time the throttled frames under `keys`, and write the report `name`.
 fn poll(name: &str, keys: &'static str, answering: &Answering) {
+    // Before the device: its creation logs, so the layer log is written after
+    // this mark whatever the benchmark's warm-up logs.
+    let tsc = TscClock::calibrated();
+    let since = SystemTime::now();
     let h = Harness::create(&HarnessConfig {
         width: WIDTH,
         height: HEIGHT,
@@ -110,8 +114,6 @@ fn poll(name: &str, keys: &'static str, answering: &Answering) {
         config_entries: keys,
         ..HarnessConfig::default()
     });
-    let tsc = TscClock::calibrated();
-    let since = SystemTime::now();
     let mut scene = Scene::new(&h);
     let mut frame = 0;
     for _ in 0..WARM_UP_FRAMES {

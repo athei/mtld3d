@@ -100,6 +100,10 @@ fn three_new_shaders_per_frame_offscreen() {
 /// Each measured frame draws `per_frame` new shaders on the back buffer and
 /// `offscreen` more in one pass into the uncleared offscreen target.
 fn stutter(name: &str, per_frame: u32, offscreen: u32) {
+    // Before the device: its creation logs, so the layer log is written after
+    // this mark whatever the benchmark's warm-up logs.
+    let tsc = TscClock::calibrated();
+    let since = SystemTime::now();
     let h = Harness::create(&HarnessConfig {
         width: WIDTH,
         height: HEIGHT,
@@ -108,8 +112,6 @@ fn stutter(name: &str, per_frame: u32, offscreen: u32) {
         config_entries: "shaderCache.enable=false",
         ..HarnessConfig::default()
     });
-    let tsc = TscClock::calibrated();
-    let since = SystemTime::now();
     let mut bench = Stutter::new(&h);
     for _ in 0..WARM_UP_FRAMES {
         assert!(h.pump(), "WM_QUIT during warm-up");

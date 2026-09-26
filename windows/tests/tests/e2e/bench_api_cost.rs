@@ -184,14 +184,16 @@ impl Kind {
 #[test]
 #[ignore = "benchmark, run by `make bench`"]
 fn api_call_cost() {
+    // Before the device: its creation logs, so the layer log is written after
+    // this mark whatever the benchmark's warm-up logs.
+    let tsc = TscClock::calibrated();
+    let since = SystemTime::now();
     let h = Harness::create(&HarnessConfig {
         width: EDGE,
         height: EDGE,
         presentation_interval: D3DPRESENT_INTERVAL_IMMEDIATE,
         ..HarnessConfig::default()
     });
-    let tsc = TscClock::calibrated();
-    let since = SystemTime::now();
     let bench = Bench::new(&h);
     for _ in 0..WARM_UP_ROUNDS {
         for kind in &KINDS {

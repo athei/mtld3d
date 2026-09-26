@@ -284,6 +284,10 @@ const EVENT_DEADLINE: Duration = Duration::from_secs(5);
 #[test]
 #[ignore = "benchmark, run by `make bench`"]
 fn wow_112_busy_frame() {
+    // Before the device: its creation logs, so the layer log is written after
+    // this mark whatever the benchmark's warm-up logs.
+    let tsc = TscClock::calibrated();
+    let since = SystemTime::now();
     let h = Harness::create(&HarnessConfig {
         width: WIDTH,
         height: HEIGHT,
@@ -292,8 +296,6 @@ fn wow_112_busy_frame() {
         config_entries: GAME_CONFIG,
         ..HarnessConfig::default()
     });
-    let tsc = TscClock::calibrated();
-    let since = SystemTime::now();
     let started = TscClock::now();
     let frame = Frame::new(&h);
     for tick in 0..WARM_UP_FRAMES {

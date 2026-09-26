@@ -426,6 +426,12 @@ pub struct LayerLog {
 impl LayerLog {
     /// Find this process's log, the newest of this executable's written at or after `since`.
     ///
+    /// `since` is taken before the benchmark creates its device: device
+    /// creation always logs, so the file's modification time passes it
+    /// however quiet the warm-up is. A mark taken after the device can
+    /// precede the last line the layer's log thread writes, and a warm-up
+    /// that logs nothing then leaves no log written since it.
+    ///
     /// # Panics
     /// Panics when no such log exists: every number the report would copy
     /// from the log would then be another run's, or missing without saying so.

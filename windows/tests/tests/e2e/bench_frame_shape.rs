@@ -287,6 +287,10 @@ const GLOW_SCISSOR: D3DRECT = rect(0, 0, GLOW_WIDTH.cast_signed(), GLOW_HEIGHT.c
 #[test]
 #[ignore = "benchmark, run by `make bench`"]
 fn wow_335a_busy_frame() {
+    // Before the device: its creation logs, so the layer log is written after
+    // this mark whatever the benchmark's warm-up logs.
+    let tsc = TscClock::calibrated();
+    let since = SystemTime::now();
     let h = Harness::create(&HarnessConfig {
         width: WIDTH,
         height: HEIGHT,
@@ -294,8 +298,6 @@ fn wow_335a_busy_frame() {
         presentation_interval: D3DPRESENT_INTERVAL_IMMEDIATE,
         ..HarnessConfig::default()
     });
-    let tsc = TscClock::calibrated();
-    let since = SystemTime::now();
     let started = TscClock::now();
     let frame = Frame::new(&h);
     for tick in 0..WARM_UP_FRAMES {

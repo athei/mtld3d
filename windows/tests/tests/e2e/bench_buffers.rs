@@ -89,14 +89,16 @@ const FVF: u32 = D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1;
 #[test]
 #[ignore = "benchmark, run by `make bench`"]
 fn dynamic_buffer_churn() {
+    // Before the device: its creation logs, so the layer log is written after
+    // this mark whatever the benchmark's warm-up logs.
+    let tsc = TscClock::calibrated();
+    let since = SystemTime::now();
     let h = Harness::create(&HarnessConfig {
         width: WIDTH,
         height: HEIGHT,
         presentation_interval: D3DPRESENT_INTERVAL_IMMEDIATE,
         ..HarnessConfig::default()
     });
-    let tsc = TscClock::calibrated();
-    let since = SystemTime::now();
     let started = TscClock::now();
     let mut scene = Scene::new(&h);
     for tick in 0..WARM_UP_FRAMES {
