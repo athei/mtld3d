@@ -1171,8 +1171,9 @@ bench: install-windows-$(ARCH) install-unix-$(SDK_UNIX_ARCH)
 # with another ACCEPT for instance, into a report of its own
 # (`report-compare-<time>.txt`) beside the one the run wrote.
 #
-# The host emitter benchmark (`make bench-host`) runs in the same rounds,
-# after the end-to-end benchmarks and whatever BENCH_SET names. It is host
+# The host emitter benchmark (`make bench-host`) runs in rounds of its own,
+# before the end-to-end benchmarks and whatever BENCH_SET names, so that no
+# Wine process of theirs is still exiting while it times host code. It is host
 # code, so each leg builds and runs its own tree's `emit_corpus` with the
 # leg's profile, and BENCH_CORPUS names the shader caches both legs read
 # (none: the synthetic corpora alone); the same staged copies are linked into

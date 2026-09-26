@@ -226,10 +226,11 @@ gives the rules): the per-frame counts of work the API calls fix, such as
 parsing and MSL emission on this machine over two synthetic corpora and any
 shader cache `BENCH_CORPUS` names, and writes its metrics into the `host`
 directory beside the reports of `make bench`. `make bench-ab` runs it too, in
-rounds of its own after the others and their shape runs: each leg builds and runs its own tree's
-emitter, both read the same `BENCH_CORPUS`, and its MSL byte counts are
-exact, so a change that alters the emitted code shows up there even when its
-time per shader stays inside the noise. A `BASE` older than the host
+rounds of its own before the others, while no Wine process of theirs can
+still be exiting on the cores it times: each leg builds and runs its own
+tree's emitter, both read the same `BENCH_CORPUS`, and its MSL byte counts
+are exact, so a change that alters the emitted code shows up there even when
+its time per shader stays inside the noise. A `BASE` older than the host
 benchmark runs neither leg's, and the run says so. The same caches are what
 `cold_start` measures in both legs. A cache only one build can read (a
 format change between them) is skipped for both with a note, while any

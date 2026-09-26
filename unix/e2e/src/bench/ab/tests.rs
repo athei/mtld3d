@@ -15,11 +15,19 @@ fn file(text: &str) -> MetricsFile {
 }
 
 #[test]
-fn every_round_runs_each_binary_in_both_legs_and_the_first_leg_alternates() {
+fn the_host_rounds_come_first_then_each_round_runs_each_binary_in_both_legs() {
     let round = |group, round, leg| Step::Round { group, round, leg };
     let shape = |bench, leg| Step::Shape { bench, leg };
     let host = |round, leg| Step::Host { round, leg };
-    let expected = [
+    let hosts = [
+        host(0, Leg::Base),
+        host(0, Leg::Cand),
+        host(1, Leg::Cand),
+        host(1, Leg::Base),
+        host(2, Leg::Base),
+        host(2, Leg::Cand),
+    ];
+    let rest = [
         round(0, 0, Leg::Base),
         round(0, 0, Leg::Cand),
         round(1, 0, Leg::Base),
@@ -38,15 +46,11 @@ fn every_round_runs_each_binary_in_both_legs_and_the_first_leg_alternates() {
         shape(1, Leg::Cand),
         shape(2, Leg::Base),
         shape(2, Leg::Cand),
-        host(0, Leg::Base),
-        host(0, Leg::Cand),
-        host(1, Leg::Cand),
-        host(1, Leg::Base),
-        host(2, Leg::Base),
-        host(2, Leg::Cand),
     ];
-    assert_eq!(schedule(2, 3, true, 3), expected);
-    assert_eq!(schedule(2, 3, false, 3), expected[..18]);
+    let order = schedule(2, 3, true, 3);
+    assert_eq!(order[..6], hosts);
+    assert_eq!(order[6..], rest);
+    assert_eq!(schedule(2, 3, false, 3), rest);
 }
 
 #[test]

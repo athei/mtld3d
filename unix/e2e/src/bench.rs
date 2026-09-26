@@ -10,8 +10,8 @@
 //! to round, so a machine that drifts (thermals, a background job) moves
 //! both legs alike instead of charging the drift to one of them.
 //!
-//! When both trees carry it, the host emitter benchmark runs in the same
-//! rounds, each leg its own tree's `emit_corpus`, since it is host code the
+//! When both trees carry it, the host emitter benchmark runs in rounds of
+//! its own before the others, each leg its own tree's `emit_corpus`, since it is host code the
 //! candidate's binary cannot stand in for; its files say `meta kind host`,
 //! and `compare` checks them apart from the layer's.
 //!
