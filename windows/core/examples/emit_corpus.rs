@@ -38,7 +38,11 @@
 //!
 //! `--metrics DIR` writes one `bench-host_emit_<corpus>.metrics` file per corpus
 //! in the bench metrics format: `meta <bench> <key> <value...>` and
-//! `metric <bench> <name> <value> <unit> <direction> <class>` lines.
+//! `metric <bench> <name> <value> <unit> <direction> <class>` lines. The meta
+//! lines carry `kind host`, which tells a comparison of two builds that this
+//! file names a native binary of its own rather than the layer the end-to-end
+//! benchmarks load, and `host_image`, this binary's Mach-O UUID (or
+//! `unknown`), beside the build stamp, arch, profile and debug assertions.
 
 use std::{
     env, fmt, fs,
@@ -343,6 +347,7 @@ struct Args {
 /// Which build the numbers came from, written as the `meta` lines of every metrics file.
 struct BuildMeta {
     layer: &'static str,
+    image: String,
     arch: &'static str,
     profile: String,
 }
@@ -374,6 +379,7 @@ fn main() -> ExitCode {
     }
     let meta = BuildMeta {
         layer: mtld3d_shared::identity::BUILD,
+        image: mtld3d_shared::identity::image_id().unwrap_or_else(|| "unknown".to_owned()),
         arch: env::consts::ARCH,
         profile: profile(),
     };
@@ -613,7 +619,9 @@ fn write_metrics(
     let mut line = |args: fmt::Arguments<'_>| {
         writeln!(out, "{args}").expect("formatting into a String cannot fail");
     };
+    line(format_args!("meta {bench} kind host"));
     line(format_args!("meta {bench} layer {}", meta.layer));
+    line(format_args!("meta {bench} host_image {}", meta.image));
     line(format_args!("meta {bench} arch {}", meta.arch));
     line(format_args!("meta {bench} profile {}", meta.profile));
     line(format_args!(

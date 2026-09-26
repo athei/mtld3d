@@ -884,3 +884,108 @@ fn the_unix_image_follows_the_d3d9_image_rules() {
         "{reason}"
     );
 }
+
+/// The meta of a host benchmark file: its own arch and profile, and its binary's image.
+fn meta_host<'a>(layer: &'a str, image: &'a str) -> Vec<(&'a str, &'a str)> {
+    vec![
+        ("kind", "host"),
+        ("layer", layer),
+        ("host_image", image),
+        ("arch", "aarch64"),
+        ("profile", "production"),
+        ("debug_assertions", "off"),
+    ]
+}
+
+/// Three rounds of `frame_shape` beside a host benchmark with the given base and cand meta.
+fn with_host(tag: &str, base: &[(&str, &str)], cand: &[(&str, &str)]) -> Fixture {
+    let fixture = Fixture::new(tag);
+    fixture.standard(3, 1.0);
+    for round in 0..3 {
+        let metrics = [
+            ("emit.us_per_shader", 3.0, "us lower time"),
+            ("msl.bytes_total", 4096.0, "bytes lower exact"),
+        ];
+        fixture.write("base", round, "host_emit_synthetic_ff", base, &metrics);
+        fixture.write("cand", round, "host_emit_synthetic_ff", cand, &metrics);
+    }
+    fixture
+}
+
+#[test]
+fn host_benchmarks_are_checked_apart_from_the_layers_benchmarks() {
+    let fixture = with_host(
+        "host-ok",
+        &meta_host("v0.11.0-3-g66e4114", "H1"),
+        &meta_host("v0.11.0-3-g66e4114", "H2"),
+    );
+    let comparison = evaluate(&fixture.root, &Options::default()).unwrap();
+    assert!(!comparison.failed(), "{}", comparison.render());
+    let report = comparison.render();
+    assert!(
+        report.contains("images (base / cand): d3d9.dll AAAA / BBBB"),
+        "{report}"
+    );
+    assert!(
+        report.contains(
+            "host benchmarks: base v0.11.0-3-g66e4114   cand v0.11.0-3-g66e4114; \
+                         images (base / cand): emit_corpus H1 / H2; production profile, \
+                         debug assertions off, aarch64"
+        ),
+        "{report}"
+    );
+    assert!(report.contains("msl.bytes_total"), "{report}");
+}
+
+#[test]
+fn one_host_image_in_both_legs_is_a_note_not_an_error() {
+    let fixture = with_host("host-same", &meta_host("v1", "H1"), &meta_host("v1", "H1"));
+    let comparison = evaluate(&fixture.root, &Options::default()).unwrap();
+    assert!(
+        comparison
+            .notes
+            .iter()
+            .any(|note| note.contains("both legs ran emit_corpus image H1")),
+        "{:?}",
+        comparison.notes
+    );
+}
+
+#[test]
+fn host_builds_must_match_across_legs_and_appear_in_both() {
+    let mut other = meta_host("v1", "H2");
+    other[4] = ("profile", "release");
+    let fixture = with_host("host-profile", &meta_host("v1", "H1"), &other);
+    let reason = error_of(&fixture);
+    assert!(
+        reason.contains("meta profile is \"production\" in base"),
+        "{reason}"
+    );
+
+    let fixture = Fixture::new("host-one-leg");
+    fixture.standard(3, 1.0);
+    for round in 0..3 {
+        let metrics = [("emit.us_per_shader", 3.0, "us lower time")];
+        fixture.write(
+            "cand",
+            round,
+            "host_emit_x",
+            &meta_host("v1", "H1"),
+            &metrics,
+        );
+    }
+    let reason = error_of(&fixture);
+    assert!(
+        reason.contains("the cand leg has host benchmark files and the base leg none"),
+        "{reason}"
+    );
+}
+
+#[test]
+fn a_file_of_an_unknown_kind_is_rejected() {
+    let mut odd = meta_host("v1", "H1");
+    odd[0] = ("kind", "gpu");
+    let fixture = with_host("host-kind", &odd, &odd);
+    let reason = error_of(&fixture);
+    assert!(reason.contains("meta kind \"gpu\" is no kind"), "{reason}");
+}

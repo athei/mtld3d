@@ -8,20 +8,28 @@
 //! is odd. A run that fails, writes no metrics file, or reports a layer
 //! stamp other than its leg's ends the whole A/B run at once: every number
 //! after it would be measured against the wrong build or none.
+//!
+//! The host emitter benchmark, when the run has one, comes after the
+//! end-to-end benchmarks in the same order. It is host code, so each leg
+//! runs its own tree's `emit_corpus`, built with that leg's profile, with
+//! `--metrics` pointed at the same round directory, and the run is checked
+//! the same way.
 
 use std::{
     collections::BTreeMap,
+    ffi::OsString,
     fmt::Write as _,
     fs,
     path::{Path, PathBuf},
     process::{Command, ExitCode, Stdio},
-    time::{Duration, SystemTime},
+    thread,
+    time::{Duration, Instant, SystemTime},
 };
 
 use super::{
     Leg, SAME_IMAGE_FILE, WINE_FILE,
     compare::{self, Options},
-    metrics::{self, MetricsFile},
+    metrics::{self, Class, MetricsFile},
 };
 use crate::{
     attribute::{self, BinaryOutcome, Launcher as _, Report, TestResult, Verdict},
@@ -31,6 +39,18 @@ use crate::{
 
 /// The metric a progress line shows, when the benchmark reports it.
 const PROGRESS_METRIC: &str = "frame.p50";
+
+/// How progress lines and errors name the host emitter benchmark.
+const HOST_ID: &str = "host::emit_corpus";
+
+/// The file in a round directory that keeps what the host benchmark printed.
+const HOST_LOG: &str = "host-emit.log";
+
+/// How long to sleep between two looks at a running host benchmark.
+const HOST_POLL: Duration = Duration::from_millis(50);
+
+/// How many of its last lines a failed host benchmark's error quotes.
+const HOST_TAIL_LINES: usize = 15;
 
 /// One leg: the Wine that runs it, its prefix, and the layer stamp its runs must report.
 #[derive(Debug)]
@@ -63,6 +83,19 @@ pub struct AbConfig {
     pub options: Options,
     /// Where the report is written besides stdout.
     pub report: Option<PathBuf>,
+    /// The host emitter benchmark, when both trees have one.
+    pub host: Option<HostBench>,
+}
+
+/// The host emitter benchmark: each leg's own `emit_corpus`, and the caches both read.
+#[derive(Debug)]
+pub struct HostBench {
+    /// The base tree's `emit_corpus`.
+    pub base: PathBuf,
+    /// The candidate tree's `emit_corpus`.
+    pub cand: PathBuf,
+    /// Shader caches both legs time besides the synthetic corpora.
+    pub corpora: Vec<PathBuf>,
 }
 
 /// One benchmark to run: the binary that carries it and its libtest path.
@@ -110,25 +143,42 @@ pub fn run(config: &AbConfig) -> Result<ExitCode, String> {
         )
         .map_err(|e| format!("{}: {e}", marker.display()))?;
     }
+    let jobs: Vec<Job> = benches
+        .iter()
+        .map(Job::Bench)
+        .chain(config.host.as_ref().map(Job::Host))
+        .collect();
     println!(
-        "bench-ab: {} benchmarks, {} rounds, both legs each round, into {}",
+        "bench-ab: {} benchmarks{}, {} rounds, both legs each round, into {}",
         benches.len(),
+        if config.host.is_some() {
+            " and the host emitter benchmark"
+        } else {
+            ""
+        },
         config.runs,
         out.display()
     );
-    for (bench, round, leg) in schedule(benches.len(), config.runs) {
-        let bench = &benches[bench];
+    for (job, round, leg) in schedule(jobs.len(), config.runs) {
         let spec = match leg {
             Leg::Base => &config.base,
             Leg::Cand => &config.cand,
         };
         let dir = out.join(leg.dir()).join(round.to_string());
-        let written = run_one(config, spec, bench, &dir)?;
+        let (id, written) = match jobs[job] {
+            Job::Bench(bench) => (bench.id.as_str(), run_one(config, spec, bench, &dir)?),
+            Job::Host(host) => {
+                let exe = match leg {
+                    Leg::Base => &host.base,
+                    Leg::Cand => &host.cand,
+                };
+                (HOST_ID, run_host(exe, &host.corpora, &dir, config.timeout)?)
+            }
+        };
         for (path, file) in &written {
             check_stamp(path, file, spec)?;
             println!(
-                "bench-ab: {} round {}/{} {}: {}",
-                bench.id,
+                "bench-ab: {id} round {}/{} {}: {}",
                 round + 1,
                 config.runs,
                 leg.dir(),
@@ -322,11 +372,7 @@ fn run_one(
             outcome.notes()
         ));
     }
-    let written: Vec<PathBuf> = metrics_files(dir)?
-        .into_iter()
-        .filter(|(path, stamp)| before.get(path) != Some(stamp))
-        .map(|(path, _)| path)
-        .collect();
+    let written = new_files(dir, &before)?;
     if written.is_empty() {
         return Err(format!(
             "{what} passed but wrote no bench-<name>.metrics into {}",
@@ -337,6 +383,100 @@ fn run_one(
         .into_iter()
         .map(|path| metrics::read(&path).map(|file| (path, file)))
         .collect()
+}
+
+/// The arguments of one host benchmark run writing into `dir`.
+#[must_use]
+pub fn host_args(dir: &Path, corpora: &[PathBuf]) -> Vec<OsString> {
+    let mut args = vec![OsString::from("--metrics"), dir.as_os_str().to_owned()];
+    args.extend(corpora.iter().map(|corpus| corpus.as_os_str().to_owned()));
+    args
+}
+
+/// Run the host benchmark `exe` once into `dir`, and read the metrics files it wrote there.
+///
+/// What it prints goes to [`HOST_LOG`] in `dir`. It fails the run when it
+/// exits unsuccessfully, runs longer than `timeout`, or writes no metrics.
+///
+/// # Errors
+///
+/// Returns a message naming the executable and quoting the end of its output.
+pub fn run_host(
+    exe: &Path,
+    corpora: &[PathBuf],
+    dir: &Path,
+    timeout: Duration,
+) -> Result<Vec<(PathBuf, MetricsFile)>, String> {
+    fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let before = metrics_files(dir)?;
+    let log_path = dir.join(HOST_LOG);
+    let log = fs::File::create(&log_path).map_err(|e| format!("{}: {e}", log_path.display()))?;
+    let log_err = log
+        .try_clone()
+        .map_err(|e| format!("{}: {e}", log_path.display()))?;
+    let what = format!("{HOST_ID} ({}) into {}", exe.display(), dir.display());
+    let mut child = Command::new(exe)
+        .args(host_args(dir, corpora))
+        .stdin(Stdio::null())
+        .stdout(log)
+        .stderr(log_err)
+        .spawn()
+        .map_err(|e| format!("{what}: {e}"))?;
+    let started = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().map_err(|e| format!("{what}: {e}"))? {
+            break status;
+        }
+        if started.elapsed() > timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!(
+                "{what} ran longer than {timeout:?}{}",
+                tail(&log_path)
+            ));
+        }
+        thread::sleep(HOST_POLL);
+    };
+    if !status.success() {
+        return Err(format!("{what} ended with {status}{}", tail(&log_path)));
+    }
+    let written = new_files(dir, &before)?;
+    if written.is_empty() {
+        return Err(format!(
+            "{what} succeeded but wrote no bench-<name>.metrics{}",
+            tail(&log_path)
+        ));
+    }
+    written
+        .into_iter()
+        .map(|path| metrics::read(&path).map(|file| (path, file)))
+        .collect()
+}
+
+/// The last lines of the file at `path`, each on a line of its own, for an error message.
+fn tail(path: &Path) -> String {
+    let text = fs::read_to_string(path).unwrap_or_default();
+    let lines: Vec<&str> = text.lines().collect();
+    let start = lines.len().saturating_sub(HOST_TAIL_LINES);
+    lines[start..].iter().fold(
+        format!("; the end of {}:", path.display()),
+        |mut out, line| {
+            let _ = write!(out, "\n{line}");
+            out
+        },
+    )
+}
+
+/// The metrics files in `dir` that are new or changed since `before` was taken.
+fn new_files(
+    dir: &Path,
+    before: &BTreeMap<PathBuf, (SystemTime, u64)>,
+) -> Result<Vec<PathBuf>, String> {
+    Ok(metrics_files(dir)?
+        .into_iter()
+        .filter(|(path, stamp)| before.get(path) != Some(stamp))
+        .map(|(path, _)| path)
+        .collect())
 }
 
 /// Every metrics file in `dir`, with its modification time and length.
@@ -383,22 +523,36 @@ pub fn check_stamp(path: &Path, file: &MetricsFile, spec: &LegSpec) -> Result<()
 }
 
 /// The progress text of one metrics file: its benchmark and its median frame time.
+///
+/// A file without a frame time (the host benchmark's) shows its first
+/// time metric instead.
 fn progress(path: &Path, file: &MetricsFile) -> String {
     let bench = path
         .file_name()
         .and_then(|name| name.to_str())
         .and_then(metrics::bench_of)
         .unwrap_or_default();
-    file.metrics.get(PROGRESS_METRIC).map_or_else(
+    let shown = file.metrics.get_key_value(PROGRESS_METRIC).or_else(|| {
+        file.metrics
+            .iter()
+            .find(|(_, metric)| metric.class == Class::Time)
+    });
+    shown.map_or_else(
         || format!("{bench}: no {PROGRESS_METRIC}"),
-        |metric| {
+        |(name, metric)| {
             format!(
-                "{bench}: {PROGRESS_METRIC} {:.3} {}",
+                "{bench}: {name} {:.3} {}",
                 metric.value,
                 metric.unit.as_str()
             )
         },
     )
+}
+
+/// One entry of the run order: an end-to-end benchmark, or the host benchmark.
+enum Job<'a> {
+    Bench(&'a Bench),
+    Host(&'a HostBench),
 }
 
 /// What one benchmark process reported.

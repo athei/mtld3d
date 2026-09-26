@@ -218,6 +218,16 @@ read from the `perf-kv` line of its perf windows as `perf.*` (`bench.rs`
 gives the rules): the per-frame counts of work the API calls fix, such as
 `perf.draws_pf` and `perf.passes_pf`, are the exact ones.
 
+`make bench-host` is the one benchmark that needs no Wine: it times DXSO
+parsing and MSL emission on this machine over two synthetic corpora and any
+shader cache `BENCH_CORPUS` names, and writes its metrics into the `host`
+directory beside the reports of `make bench`. `make bench-ab` runs it too, in
+the same rounds after the others: each leg builds and runs its own tree's
+emitter, both read the same `BENCH_CORPUS`, and its MSL byte counts are
+exact, so a change that alters the emitted code shows up there even when its
+time per shader stays inside the noise. A `BASE` older than the host
+benchmark runs neither leg's, and the run says so.
+
 Bench numbers come from `PROD=1 PERF=1` builds only; `make bench-ab` builds
 both legs that way and refuses any other profile, since `release` carries
 debug assertions that cost more than the frame does. Nothing else may run on

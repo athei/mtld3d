@@ -343,7 +343,7 @@ TAG          ?= $(shell git describe --tags --exact-match 2>/dev/null)
 	install install-windows-i686 install-windows-x86_64 install-unix-x64 install-unix-arm64 \
 	bundle version-check stage clean-isolated clean-isolated-orphans \
 	configure-test-prefix configure-test-prefix-locked configure-test-prefix-session \
-	test test-unit test-e2e-i686 test-e2e-x86_64 bench bench-ab bench-compare clean-bench-ab bench-host \
+	test test-unit test-e2e-i686 test-e2e-x86_64 bench bench-ab bench-compare clean-bench-ab bench-host bench-host-build \
 	conformance conformance-i686 conformance-x86_64 \
 	conformance-baseline conformance-baseline-i686 conformance-baseline-x86_64 \
 	conformance-intel conformance-intel-i686 conformance-intel-x86_64 \
@@ -1079,6 +1079,13 @@ bench: install-windows-$(ARCH) install-unix-$(SDK_UNIX_ARCH)
 # it again, with another ACCEPT for instance, into a report of its own
 # (`report-compare-<time>.txt`) beside the one the run wrote.
 #
+# The host emitter benchmark (`make bench-host`) runs in the same rounds,
+# after the end-to-end benchmarks and whatever BENCH_SET names. It is host
+# code, so each leg builds and runs its own tree's `emit_corpus` with the
+# leg's profile, and BENCH_CORPUS names the shader caches both legs read
+# (none: the synthetic corpora alone). A BASE whose Makefile has no
+# `bench-host-build` predates the benchmark, and then neither leg runs it.
+#
 # Nothing else may run on the machine meanwhile, tests, builds and games
 # included: the verdicts are only as good as the quiet of the machine.
 RUNS ?= 5
@@ -1128,6 +1135,11 @@ BENCH_BASE_ISO := $(BENCH_BASE_DIR)/.wine-isolated
 BENCH_BASE_STAMP := $(shell git describe --tags --always $(BENCH_BASE_SHA))
 BENCH_CAND_STAMP := $(shell git describe --tags --always)
 BENCH_AB_OUT := $(BENCH_AB_ROOT)/$(BENCH_BASE_SHORT)-vs-$(BENCH_CAND_SHORT)-$(shell date +%Y%m%d-%H%M%S)
+# Whether BASE carries the host emitter benchmark, read from its Makefile in
+# git, since its worktree may not exist yet.
+BENCH_HOST_AB := $(shell git show $(BENCH_BASE_SHA):Makefile 2>/dev/null | grep -q '^bench-host-build:' && echo 1)
+BENCH_HOST_FLAGS = $(if $(BENCH_HOST_AB),--base-host '$(call BENCH_HOST_EXE,$(BENCH_BASE_DIR))' \
+	--cand-host '$(call BENCH_HOST_EXE,$(CURDIR))' $(foreach path,$(BENCH_CORPUS),--host-corpus '$(abspath $(path))'))
 endif
 bench-ab:
 	git -C '$(BENCH_CHECKOUT)' check-ignore -q '$(BENCH_BASE_DIR)' || \
@@ -1139,6 +1151,9 @@ bench-ab:
 	$(call clean_isolated_at,$(ISOLATED_ROOT))
 	$(MAKE) -C '$(BENCH_BASE_DIR)' $(BENCH_LEG_MAKE) $(BENCH_LEG_INSTALL)
 	$(MAKE) $(BENCH_LEG_MAKE) $(BENCH_LEG_INSTALL)
+	$(if $(BENCH_HOST_AB),$(MAKE) -C '$(BENCH_BASE_DIR)' $(BENCH_LEG_MAKE) bench-host-build,\
+		@echo "make bench-ab: BASE $(BENCH_BASE_SHORT) has no host emitter benchmark; neither leg runs it")
+	$(if $(BENCH_HOST_AB),$(MAKE) $(BENCH_LEG_MAKE) bench-host-build)
 	$(MAKE) $(call BENCH_LEG_CONFIGURE,$(BENCH_BASE_ISO)) || { $(BENCH_STOP_SERVERS); stop_servers; exit 2; }
 	$(MAKE) $(call BENCH_LEG_CONFIGURE,$(ISOLATED_ROOT)) || { $(BENCH_STOP_SERVERS); stop_servers; exit 2; }
 	$(BENCH_STOP_SERVERS); trap stop_servers EXIT; \
@@ -1150,6 +1165,7 @@ bench-ab:
 		--cand-wine '$(ISOLATED_ROOT)/sdk/bin/wine' \
 		--cand-prefix '$(ISOLATED_ROOT)/prefix' --cand-stamp '$(BENCH_CAND_STAMP)' \
 		--config '$(BENCH_CONF_AB)' $(if $(BENCH_SET_$(BENCH_SET)),--bench '$(BENCH_SET_$(BENCH_SET))') \
+		$(BENCH_HOST_FLAGS) \
 		$(if $(ACCEPT),--accept '$(ACCEPT)') $(BENCH_SAME_IMAGE) --report '$(BENCH_AB_OUT)/report.txt' -- $$suite
 
 bench-compare:
@@ -1179,12 +1195,21 @@ clean-bench-ab:
 # for this machine's own arch and needs no install and no Wine; like `bench` it
 # builds with the production profile unless PROD=0 asks for `release`. The
 # table goes to stdout, and each corpus writes `bench-host_emit_<corpus>.metrics`
-# into LOG_DIR (default `.codex/evidence/bench`).
-bench-host:
-	mkdir -p '$(BENCH_DIR)' && rm -f '$(BENCH_DIR)'/bench-host_emit_*.metrics
-	cd windows && cargo +$(RUST_STABLE) run --profile $(PROFILE) -p mtld3d-core \
-		--target $(UNIX_NATIVE_TARGET) --example emit_corpus -- \
-		--metrics '$(abspath $(BENCH_DIR))' $(foreach path,$(BENCH_CORPUS),'$(abspath $(path))')
+# into the `host` directory under LOG_DIR (default `.codex/evidence/bench`),
+# apart from the files `make bench` writes and deletes. `bench-host-build`
+# builds the benchmark without running it, which is how `make bench-ab` gets
+# each leg's own.
+BENCH_HOST_DIR := $(BENCH_DIR)/host
+# The benchmark `bench-host-build` builds in the checkout $(1).
+BENCH_HOST_EXE = $(1)/windows/target/$(UNIX_NATIVE_TARGET)/$(PROFILE)/examples/emit_corpus
+bench-host-build:
+	cd windows && cargo +$(RUST_STABLE) build --profile $(PROFILE) -p mtld3d-core \
+		--target $(UNIX_NATIVE_TARGET) --example emit_corpus
+
+bench-host: bench-host-build
+	mkdir -p '$(BENCH_HOST_DIR)' && rm -f '$(BENCH_HOST_DIR)'/bench-host_emit_*.metrics
+	'$(call BENCH_HOST_EXE,$(CURDIR))' --metrics '$(abspath $(BENCH_HOST_DIR))' \
+		$(foreach path,$(BENCH_CORPUS),'$(abspath $(path))')
 
 fmt:
 	cd windows && cargo +$(RUST_NIGHTLY) fmt

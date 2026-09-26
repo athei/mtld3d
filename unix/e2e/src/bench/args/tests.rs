@@ -168,3 +168,55 @@ fn ab_needs_three_rounds_at_least() {
         }
     }
 }
+
+#[test]
+fn ab_takes_both_host_emitters_and_their_corpora() {
+    let mut tokens = LEGS.to_vec();
+    tokens.extend([
+        "--out",
+        "/ab",
+        "--base-host",
+        "/b/emit_corpus",
+        "--cand-host",
+        "/c/emit_corpus",
+        "--host-corpus",
+        "/caches/a.bin",
+        "--host-corpus",
+        "/caches/b.bin",
+        "--",
+        "/e2e.exe",
+    ]);
+    let host = parse_ab(args(&tokens)).unwrap().host.expect("a host bench");
+    assert_eq!(host.base.to_str(), Some("/b/emit_corpus"));
+    assert_eq!(host.cand.to_str(), Some("/c/emit_corpus"));
+    assert_eq!(
+        host.corpora,
+        [
+            PathBuf::from("/caches/a.bin"),
+            PathBuf::from("/caches/b.bin")
+        ]
+    );
+
+    let mut tokens = LEGS.to_vec();
+    tokens.extend(["--out", "/ab", "--", "/e2e.exe"]);
+    assert!(parse_ab(args(&tokens)).unwrap().host.is_none());
+}
+
+#[test]
+fn ab_rejects_a_host_emitter_for_one_leg_or_corpora_without_one() {
+    for extra in [
+        &["--base-host", "/b/emit_corpus"][..],
+        &["--cand-host", "/c/emit_corpus"][..],
+    ] {
+        let mut tokens = LEGS.to_vec();
+        tokens.extend(["--out", "/ab"]);
+        tokens.extend(extra);
+        tokens.extend(["--", "/e2e.exe"]);
+        let reason = parse_ab(args(&tokens)).unwrap_err();
+        assert!(reason.contains("go together"), "{reason}");
+    }
+    let mut tokens = LEGS.to_vec();
+    tokens.extend(["--out", "/ab", "--host-corpus", "/a.bin", "--", "/e2e.exe"]);
+    let reason = parse_ab(args(&tokens)).unwrap_err();
+    assert!(reason.contains("--host-corpus without"), "{reason}");
+}

@@ -113,3 +113,70 @@ fn both_legs_have_to_run_one_wine() {
         let _ = fs::remove_dir_all(spec.wine.parent().unwrap());
     }
 }
+
+#[test]
+fn progress_falls_back_to_the_first_time_metric() {
+    let path = Path::new("/ab/cand/1/bench-b.metrics");
+    let host = file(
+        "metric b shaders 10 count higher info\nmetric b emit.us_per_shader 12.5 us lower time\n",
+    );
+    assert_eq!(progress(path, &host), "b: emit.us_per_shader 12.500 us");
+}
+
+#[test]
+fn the_host_benchmark_writes_into_the_round_and_reads_every_corpus() {
+    let args = host_args(
+        Path::new("/ab/base/0"),
+        &[PathBuf::from("/a.bin"), PathBuf::from("/b c.bin")],
+    );
+    assert_eq!(args, ["--metrics", "/ab/base/0", "/a.bin", "/b c.bin"]);
+    assert_eq!(host_args(Path::new("/d"), &[]), ["--metrics", "/d"]);
+}
+
+/// A fake `emit_corpus` in a temporary directory running `script` with its arguments.
+fn fake_host(tag: &str, script: &str) -> (PathBuf, PathBuf) {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = std::env::temp_dir().join(format!("mtld3d-bench-host-{}-{tag}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let exe = dir.join("emit_corpus");
+    fs::write(&exe, format!("#!/bin/sh\n{script}\n")).unwrap();
+    fs::set_permissions(&exe, fs::Permissions::from_mode(0o755)).unwrap();
+    (exe, dir.join("round"))
+}
+
+#[test]
+fn a_host_run_reads_back_the_files_it_wrote() {
+    let (exe, round) = fake_host(
+        "ok",
+        "[ \"$1\" = --metrics ] || exit 3\necho timing\n\
+         printf 'meta host_emit_x kind host\\nmeta host_emit_x layer v1\\n\
+         metric host_emit_x emit.us_per_shader 3.5 us lower time\\n' > \"$2/bench-host_emit_x.metrics\"",
+    );
+    let written = run_host(&exe, &[], &round, Duration::from_secs(10)).unwrap();
+    assert_eq!(written.len(), 1);
+    assert_eq!(written[0].1.meta["kind"], "host");
+    assert!(check_stamp(&written[0].0, &written[0].1, &spec("v1")).is_ok());
+    let log = fs::read_to_string(round.join(HOST_LOG)).unwrap();
+    assert_eq!(log, "timing\n");
+    let _ = fs::remove_dir_all(exe.parent().unwrap());
+}
+
+#[test]
+fn a_host_run_that_fails_hangs_or_writes_nothing_is_an_error() {
+    let (exe, round) = fake_host("fail", "echo 'emit failed' >&2\nexit 1");
+    let reason = run_host(&exe, &[], &round, Duration::from_secs(10)).unwrap_err();
+    assert!(reason.contains("ended with"), "{reason}");
+    assert!(reason.contains("emit failed"), "{reason}");
+    let _ = fs::remove_dir_all(exe.parent().unwrap());
+
+    let (exe, round) = fake_host("silent", "exit 0");
+    let reason = run_host(&exe, &[], &round, Duration::from_secs(10)).unwrap_err();
+    assert!(reason.contains("wrote no bench-<name>.metrics"), "{reason}");
+    let _ = fs::remove_dir_all(exe.parent().unwrap());
+
+    let (exe, round) = fake_host("hang", "exec sleep 30");
+    let reason = run_host(&exe, &[], &round, Duration::from_millis(200)).unwrap_err();
+    assert!(reason.contains("ran longer than"), "{reason}");
+    let _ = fs::remove_dir_all(exe.parent().unwrap());
+}

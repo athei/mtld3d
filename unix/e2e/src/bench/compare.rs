@@ -26,7 +26,8 @@
 //!
 //! Before any of that the directory has to be trustworthy: both legs hold
 //! the same rounds, every benchmark wrote a file in every round of its leg,
-//! the metrics keep their definitions, each leg ran one build throughout,
+//! the metrics keep their definitions, each leg ran one build of each kind
+//! of benchmark binary throughout ([`Kind`]),
 //! the two legs ran two different `d3d9.dll` images, and both ran the same
 //! profile. Anything else is an error, exit code 2, not a verdict.
 
@@ -85,6 +86,76 @@ const SAME_IMAGE_NOTE: &str = "legs loaded identical binaries (A/A)";
 
 /// The meta keys both legs have to agree on: comparing two profiles measures the profiles.
 const MATCHING_META: [&str; 3] = ["arch", "profile", "debug_assertions"];
+
+/// The meta key that names the kind of binary a metrics file came from.
+///
+/// Absent in the end-to-end benchmarks' files, which run the layer under
+/// Wine; `host` in the host emitter benchmark's, a native binary of each
+/// leg's own tree with an architecture and a profile of its own.
+const KIND_META: &str = "kind";
+
+/// The meta keys every host benchmark file has to carry: it loads no layer image.
+const HOST_REQUIRED_META: [&str; 4] = ["layer", "arch", "profile", "debug_assertions"];
+
+/// The image key of the host benchmark and the binary it names.
+const HOST_IMAGE_META: [(&str, &str); 1] = [("host_image", "emit_corpus")];
+
+/// The kinds of benchmark binary, each with the checks its builds get.
+const KINDS: [Kind; 2] = [
+    Kind {
+        tag: None,
+        label: "layer",
+        required: &REQUIRED_META,
+        images: &IMAGE_META,
+        distinct_images: true,
+    },
+    Kind {
+        tag: Some("host"),
+        label: "host",
+        required: &HOST_REQUIRED_META,
+        images: &HOST_IMAGE_META,
+        distinct_images: false,
+    },
+];
+
+/// A kind of benchmark binary, told apart by the `kind` meta value its files carry.
+///
+/// Each kind's files are checked among themselves: a leg runs one build of
+/// each kind throughout, and the two legs run builds of one profile. The
+/// kinds differ in what names a build. The end-to-end files name the images
+/// the layer loaded, which must differ between the legs, since each leg is
+/// told apart from the other only by the layer it installed. The host files
+/// name the benchmark binary itself, which each leg builds out of its own
+/// tree and runs by path, and which a change outside the code it links
+/// leaves byte for byte the same, so one image in both legs is a note there.
+pub struct Kind {
+    /// The `kind` meta value, `None` for files that carry none.
+    tag: Option<&'static str>,
+    /// How the report names the kind.
+    label: &'static str,
+    /// The meta keys each of its files has to carry.
+    required: &'static [&'static str],
+    /// The meta keys naming an image, each with the binary it names.
+    images: &'static [(&'static str, &'static str)],
+    /// Whether one image in both legs outside an A/A run is an error rather than a note.
+    distinct_images: bool,
+}
+
+impl Kind {
+    /// Whether `file` is of this kind.
+    fn holds(&self, file: &MetricsFile) -> bool {
+        file.meta.get(KIND_META).map(String::as_str) == self.tag
+    }
+
+    /// The files of this kind among a leg's rounds.
+    fn files<'a>(&self, rounds: &'a [BTreeMap<String, Loaded>]) -> Vec<&'a Loaded> {
+        rounds
+            .iter()
+            .flat_map(BTreeMap::values)
+            .filter(|loaded| self.holds(&loaded.file))
+            .collect()
+    }
+}
 
 /// What changes a comparison's verdicts beyond the numbers.
 #[derive(Debug, Default)]
@@ -287,23 +358,46 @@ pub fn evaluate(dir: &Path, options: &Options) -> Result<Comparison, String> {
         ));
     }
     let allow_same_image = options.allow_same_image || dir.join(SAME_IMAGE_FILE).exists();
-    let builds = check_builds(&base, &cand, allow_same_image)?;
+    check_kinds(&base, &cand)?;
+    let mut kinds = Vec::new();
+    for kind in &KINDS {
+        if let Some(builds) = check_builds(&base, &cand, allow_same_image, kind)? {
+            kinds.push((kind, builds));
+        }
+    }
+    if kinds.is_empty() {
+        return Err(format!("{}: neither leg has a metrics file", dir.display()));
+    }
     let mut comparison = compare(&base, &cand, options)?;
-    comparison.notes.extend(builds.notes);
-    comparison.header = vec![
-        format!("bench-compare: {}", dir.display()),
-        format!(
-            "layer: base {}   cand {}",
-            builds.base_layer, builds.cand_layer
-        ),
-        format!("images (base / cand): {}", builds.images.join("; ")),
-        format!(
-            "{} profile, debug assertions {}, {}; {} round pairs",
-            builds.profile,
-            builds.debug_assertions,
-            builds.arch,
-            base.len()
-        ),
+    let mut header = vec![format!("bench-compare: {}", dir.display())];
+    for (kind, builds) in kinds {
+        comparison.notes.extend(builds.notes);
+        let build = format!(
+            "{} profile, debug assertions {}, {}",
+            builds.profile, builds.debug_assertions, builds.arch
+        );
+        if kind.tag.is_none() {
+            header.push(format!(
+                "layer: base {}   cand {}",
+                builds.base_layer, builds.cand_layer
+            ));
+            header.push(format!(
+                "images (base / cand): {}",
+                builds.images.join("; ")
+            ));
+            header.push(format!("{build}; {} round pairs", base.len()));
+        } else {
+            header.push(format!(
+                "{} benchmarks: base {}   cand {}; images (base / cand): {}; {build}",
+                kind.label,
+                builds.base_layer,
+                builds.cand_layer,
+                builds.images.join("; ")
+            ));
+        }
+    }
+    comparison.header = header;
+    comparison.header.extend([
         format!(
             "wine: {}",
             fs::read_to_string(dir.join(WINE_FILE))
@@ -312,7 +406,7 @@ pub fn evaluate(dir: &Path, options: &Options) -> Result<Comparison, String> {
         "change: + is worse whichever way the metric is better; noise: sigma of the pair ratios, \
          the MAD of spike differences, or how many exact pairs differ"
             .to_owned(),
-    ];
+    ]);
     Ok(comparison)
 }
 
@@ -395,30 +489,76 @@ pub struct Builds {
     pub notes: Vec<String>,
 }
 
-/// Check that each leg ran one build throughout, and the two legs two builds of one profile.
-///
-/// Within a leg every file has to name the same layer stamp, image IDs,
-/// profile, debug-assertion state and architecture. Across the legs the last
-/// three have to match, and the image IDs have to differ: the two legs are
-/// separate builds, so one image in both means one binary was loaded twice.
-/// That holds for `layer_image` and for `layer_unix_image` when both legs
-/// carry it, while a leg carrying it alone is an error. The
-/// release stamps may be equal, since a candidate with uncommitted changes
-/// carries the stamp of the commit it sits on. The one exception is a true
-/// A/A run, one commit against itself from a clean tree, where a
-/// deterministic build gives both legs the same image: `allow_same_image`
-/// says the refs are that, and equal stamps confirm it.
+/// Check that every metrics file names a kind this comparison knows.
 ///
 /// # Errors
 ///
-/// Returns a message naming the files or values that disagree.
+/// Returns a message naming the first file whose `kind` is none of [`KINDS`].
+pub fn check_kinds(
+    base: &[BTreeMap<String, Loaded>],
+    cand: &[BTreeMap<String, Loaded>],
+) -> Result<(), String> {
+    let unknown = base
+        .iter()
+        .chain(cand)
+        .flat_map(BTreeMap::values)
+        .find(|loaded| !KINDS.iter().any(|kind| kind.holds(&loaded.file)));
+    if let Some(loaded) = unknown {
+        return Err(format!(
+            "{}: meta {KIND_META} {:?} is no kind of benchmark this comparison knows",
+            loaded.path.display(),
+            loaded.file.meta.get(KIND_META).map_or("", String::as_str)
+        ));
+    }
+    Ok(())
+}
+
+/// Check that each leg ran one build of `kind` throughout, and the legs two of one profile.
+///
+/// Within a leg every file of the kind has to name the same layer stamp,
+/// image IDs, profile, debug-assertion state and architecture. Across the
+/// legs the last three have to match, and for a kind with
+/// `distinct_images` the image IDs have to differ: the two legs are
+/// separate builds, so one image in both means one binary was loaded twice.
+/// That holds for every image key both legs carry, while a leg carrying
+/// one alone is an error. The release stamps may be equal, since a
+/// candidate with uncommitted changes carries the stamp of the commit it
+/// sits on. The one exception is a true A/A run, one commit against itself
+/// from a clean tree, where a deterministic build gives both legs the same
+/// image: `allow_same_image` says the refs are that, and equal stamps
+/// confirm it. `None` when neither leg has a file of the kind.
+///
+/// # Errors
+///
+/// Returns a message naming the files or values that disagree, or the leg
+/// that has files of the kind when the other has none.
 pub fn check_builds(
     base: &[BTreeMap<String, Loaded>],
     cand: &[BTreeMap<String, Loaded>],
     allow_same_image: bool,
-) -> Result<Builds, String> {
-    let base_meta = leg_meta(&Leg::Base, base)?;
-    let cand_meta = leg_meta(&Leg::Cand, cand)?;
+    kind: &Kind,
+) -> Result<Option<Builds>, String> {
+    let (base_files, cand_files) = (kind.files(base), kind.files(cand));
+    match (base_files.is_empty(), cand_files.is_empty()) {
+        (true, true) => return Ok(None),
+        (false, false) => {}
+        (base_empty, _) => {
+            let (has, lacks) = if base_empty {
+                (Leg::Cand, Leg::Base)
+            } else {
+                (Leg::Base, Leg::Cand)
+            };
+            return Err(format!(
+                "the {} leg has {} benchmark files and the {} leg none: the legs did not run \
+                 the same benchmarks",
+                has.dir(),
+                kind.label,
+                lacks.dir()
+            ));
+        }
+    }
+    let base_meta = leg_meta(&Leg::Base, &base_files, kind.required)?;
+    let cand_meta = leg_meta(&Leg::Cand, &cand_files, kind.required)?;
     for key in MATCHING_META {
         if base_meta[key] != cand_meta[key] {
             return Err(format!(
@@ -431,17 +571,24 @@ pub fn check_builds(
     let a_a = allow_same_image && base_meta["layer"] == cand_meta["layer"];
     let mut notes = Vec::new();
     let mut images = Vec::new();
-    for (key, binary) in IMAGE_META {
+    for &(key, binary) in kind.images {
         let pair = (
-            leg_optional(&Leg::Base, base, key)?,
-            leg_optional(&Leg::Cand, cand, key)?,
+            leg_optional(&Leg::Base, &base_files, key)?,
+            leg_optional(&Leg::Cand, &cand_files, key)?,
         );
-        check_image(key, binary, &pair, a_a, &mut notes)?;
+        let same = if a_a {
+            SameImage::AA
+        } else if kind.distinct_images {
+            SameImage::Error
+        } else {
+            SameImage::Unchanged
+        };
+        check_image(key, binary, &pair, &same, &mut notes)?;
         if let (Some(base_image), Some(cand_image)) = pair {
             images.push(format!("{binary} {base_image} / {cand_image}"));
         }
     }
-    Ok(Builds {
+    Ok(Some(Builds {
         base_layer: base_meta["layer"].clone(),
         cand_layer: cand_meta["layer"].clone(),
         images,
@@ -449,7 +596,17 @@ pub fn check_builds(
         debug_assertions: base_meta["debug_assertions"].clone(),
         arch: base_meta["arch"].clone(),
         notes,
-    })
+    }))
+}
+
+/// What one image in both legs means.
+enum SameImage {
+    /// A true A/A run, where a deterministic build gives both legs one image: a note.
+    AA,
+    /// A kind whose binary a change may leave as it was: a note.
+    Unchanged,
+    /// A kind whose legs must run two binaries: an error.
+    Error,
 }
 
 /// Check one image key across the legs, see [`check_builds`].
@@ -457,7 +614,7 @@ fn check_image(
     key: &str,
     binary: &str,
     pair: &(Option<String>, Option<String>),
-    a_a: bool,
+    same: &SameImage,
     notes: &mut Vec<String>,
 ) -> Result<(), String> {
     let (base_image, cand_image) = match pair {
@@ -474,27 +631,31 @@ fn check_image(
         notes.push(format!(
             "a leg's {binary} carries no image ID, so nothing shows the legs ran two builds of it"
         ));
-    } else if base_image == cand_image && a_a {
-        if !notes.iter().any(|note| note == SAME_IMAGE_NOTE) {
-            notes.push(SAME_IMAGE_NOTE.to_owned());
-        }
     } else if base_image == cand_image {
-        return Err(format!(
-            "both legs loaded {binary} image {base_image}: one binary ran twice, so one leg did \
-             not run the build it was meant to"
-        ));
+        let note = match same {
+            SameImage::AA => SAME_IMAGE_NOTE.to_owned(),
+            SameImage::Unchanged => format!(
+                "both legs ran {binary} image {base_image}: the change leaves the code it links \
+                 unchanged"
+            ),
+            SameImage::Error => {
+                return Err(format!(
+                    "both legs loaded {binary} image {base_image}: one binary ran twice, so one \
+                     leg did not run the build it was meant to"
+                ));
+            }
+        };
+        if !notes.contains(&note) {
+            notes.push(note);
+        }
     }
     Ok(())
 }
 
 /// An optional meta value of one leg, checked to be the same, or absent, in every file.
-fn leg_optional(
-    leg: &Leg,
-    rounds: &[BTreeMap<String, Loaded>],
-    key: &str,
-) -> Result<Option<String>, String> {
+fn leg_optional(leg: &Leg, files: &[&Loaded], key: &str) -> Result<Option<String>, String> {
     let mut first: Option<(Option<&String>, &Path)> = None;
-    for loaded in rounds.iter().flat_map(BTreeMap::values) {
+    for loaded in files {
         let value = loaded.file.meta.get(key);
         match first {
             None => first = Some((value, &loaded.path)),
@@ -520,11 +681,12 @@ fn leg_optional(
 /// The required meta values of one leg, checked to be the same in every file.
 fn leg_meta(
     leg: &Leg,
-    rounds: &[BTreeMap<String, Loaded>],
+    files: &[&Loaded],
+    required: &[&'static str],
 ) -> Result<BTreeMap<&'static str, String>, String> {
     let mut seen: BTreeMap<&'static str, (String, &Path)> = BTreeMap::new();
-    for loaded in rounds.iter().flat_map(BTreeMap::values) {
-        for key in REQUIRED_META {
+    for loaded in files {
+        for &key in required {
             let value = loaded
                 .file
                 .meta
@@ -546,9 +708,6 @@ fn leg_meta(
                 Some(_) => {}
             }
         }
-    }
-    if seen.is_empty() {
-        return Err(format!("the {} leg has no metrics file", leg.dir()));
     }
     Ok(seen
         .into_iter()

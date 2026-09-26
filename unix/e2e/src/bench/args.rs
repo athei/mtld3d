@@ -3,7 +3,7 @@
 use std::{path::PathBuf, time::Duration};
 
 use super::{
-    ab::{AbConfig, LegSpec},
+    ab::{AbConfig, HostBench, LegSpec},
     compare::Options,
 };
 
@@ -63,7 +63,10 @@ pub fn parse_compare(mut args: impl Iterator<Item = String>) -> Result<CompareCo
 /// <patterns>` (whitespace-separated, repeatable; none means every
 /// benchmark), `--config <MTLD3D_CONFIG>`, `--timeout <secs>` (default 300),
 /// `--accept a,b`, `--report <file>` and `--allow-same-image` (the legs are
-/// one commit from a clean tree) as for `bench-compare`.
+/// one commit from a clean tree) as for `bench-compare`. `--base-host <exe>`
+/// and `--cand-host <exe>`, given together, add the host emitter benchmark,
+/// each leg running its own tree's `emit_corpus`, and `--host-corpus
+/// <file>` (repeatable) adds a shader cache for both of them to read.
 ///
 /// # Errors
 ///
@@ -80,8 +83,13 @@ pub fn parse_ab(mut args: impl Iterator<Item = String>) -> Result<AbConfig, Stri
     let mut options = Options::default();
     let mut report = None;
     let mut exes = Vec::new();
+    let (mut base_host, mut cand_host) = (None, None);
+    let mut corpora = Vec::new();
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            "--base-host" => base_host = Some(PathBuf::from(value(&mut args, &arg)?)),
+            "--cand-host" => cand_host = Some(PathBuf::from(value(&mut args, &arg)?)),
+            "--host-corpus" => corpora.push(PathBuf::from(value(&mut args, &arg)?)),
             "--base-wine" => base.wine = Some(PathBuf::from(value(&mut args, &arg)?)),
             "--base-prefix" => base.prefix = Some(PathBuf::from(value(&mut args, &arg)?)),
             "--base-stamp" => base.stamp = Some(value(&mut args, &arg)?),
@@ -120,6 +128,22 @@ pub fn parse_ab(mut args: impl Iterator<Item = String>) -> Result<AbConfig, Stri
     if exes.is_empty() {
         return Err("no test binary given after --".to_owned());
     }
+    let host = match (base_host, cand_host) {
+        (Some(base), Some(cand)) => Some(HostBench {
+            base,
+            cand,
+            corpora,
+        }),
+        (None, None) if corpora.is_empty() => None,
+        (None, None) => {
+            return Err("--host-corpus without --base-host and --cand-host".to_owned());
+        }
+        (Some(_), None) | (None, Some(_)) => {
+            return Err(
+                "--base-host and --cand-host go together: each leg runs its own emitter".to_owned(),
+            );
+        }
+    };
     Ok(AbConfig {
         base: base.finish("base")?,
         cand: cand.finish("cand")?,
@@ -131,6 +155,7 @@ pub fn parse_ab(mut args: impl Iterator<Item = String>) -> Result<AbConfig, Stri
         timeout,
         options,
         report,
+        host,
     })
 }
 
