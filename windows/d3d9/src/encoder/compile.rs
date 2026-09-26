@@ -623,6 +623,29 @@ enum Begun {
 }
 
 impl FrameEncoder {
+    /// Probe the VS source-key index without starting or waiting for a build.
+    ///
+    /// Kept separate from async resolution so a warm draw can inline its
+    /// borrow-probe without carrying a pending build's ticket or cold work.
+    #[inline]
+    pub fn lookup_vs_library(&self, source: &VsSource) -> BuildLookup<StageLibHandles> {
+        match source {
+            VsSource::FixedFunction { key, .. } => self.ff_vs_libs.lookup(key),
+            VsSource::Programmable {
+                vs_id,
+                provided_input_mask,
+                clip_plane_count,
+                sampler_kinds,
+                ..
+            } => self.prog_vs_libs.lookup(&(
+                *vs_id,
+                *provided_input_mask,
+                *clip_plane_count,
+                *sampler_kinds,
+            )),
+        }
+    }
+
     /// Resolve the VS library for a draw.
     ///
     /// Hot path: borrow-probe the source-keyed index (`ff_vs_libs` /
@@ -637,21 +660,7 @@ impl FrameEncoder {
     /// as final as a rejected one.
     #[inline]
     pub fn resolve_vs_library(&mut self, source: &VsSource) -> Resolution<StageLibHandles> {
-        let known = match source {
-            VsSource::FixedFunction { key, .. } => self.ff_vs_libs.lookup(key),
-            VsSource::Programmable {
-                vs_id,
-                provided_input_mask,
-                clip_plane_count,
-                sampler_kinds,
-                ..
-            } => self.prog_vs_libs.lookup(&(
-                *vs_id,
-                *provided_input_mask,
-                *clip_plane_count,
-                *sampler_kinds,
-            )),
-        };
+        let known = self.lookup_vs_library(source);
         match known {
             BuildLookup::Ready(handles) => return Resolution::Ready(handles),
             BuildLookup::Failed => return Resolution::Failed,
@@ -773,6 +782,24 @@ impl FrameEncoder {
         Begun::Queued(self.enqueue_library(input, reference))
     }
 
+    /// Probe the PS source-key and variant index without async resolution.
+    ///
+    /// The same borrowed keys serve warm draws and the full slow resolver.
+    #[inline]
+    pub fn lookup_ps_library(
+        &self,
+        source: &PsSource,
+        variant: VariantKey,
+    ) -> BuildLookup<StageLibHandles> {
+        match source {
+            PsSource::FixedFunction { key, .. } => self
+                .ff_ps_libs
+                .get(key)
+                .map_or(BuildLookup::Unknown, |variants| variants.lookup(&variant)),
+            PsSource::Programmable { ps_id, .. } => self.prog_ps_libs.lookup(&(*ps_id, variant)),
+        }
+    }
+
     /// Resolve the PS library for a draw.
     ///
     /// Hot path: borrow-probe the source-keyed index. PS MSL depends on
@@ -786,13 +813,7 @@ impl FrameEncoder {
         source: &PsSource,
         variant: VariantKey,
     ) -> Resolution<StageLibHandles> {
-        let known = match source {
-            PsSource::FixedFunction { key, .. } => self
-                .ff_ps_libs
-                .get(key)
-                .map_or(BuildLookup::Unknown, |variants| variants.lookup(&variant)),
-            PsSource::Programmable { ps_id, .. } => self.prog_ps_libs.lookup(&(*ps_id, variant)),
-        };
+        let known = self.lookup_ps_library(source, variant);
         match known {
             BuildLookup::Ready(handles) => return Resolution::Ready(handles),
             BuildLookup::Failed => return Resolution::Failed,
