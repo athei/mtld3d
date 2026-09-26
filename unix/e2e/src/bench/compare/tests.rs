@@ -567,7 +567,7 @@ fn an_optional_perf_key_that_comes_and_goes_is_reported_not_judged() {
         .expect("the row is reported");
     assert_eq!(row.verdict, Verdict::Incomplete);
     assert!(!row.verdict.fails());
-    assert_eq!(row.change, "in 2 of 3 base rounds, 3 of 3 cand rounds");
+    assert_eq!(row.change, "in 2 of 3 base rounds, in 3 of 3 cand rounds");
     assert!(!comparison.failed());
     assert!(
         comparison
@@ -686,6 +686,18 @@ fn an_optional_perf_key_the_candidate_lacks_is_incomplete_not_removed() {
         .find(|row| row.metric == "perf.faults_minor_pf")
         .unwrap();
     assert_eq!(row.verdict, Verdict::Incomplete);
+    assert_eq!(
+        row.change,
+        "in 3 of 3 base rounds, missing from the whole cand leg"
+    );
+    assert!(
+        comparison
+            .notes
+            .iter()
+            .any(|note| note.contains("missing from the whole cand leg")),
+        "{:?}",
+        comparison.notes
+    );
 }
 
 #[test]
@@ -708,6 +720,11 @@ fn different_window_lengths_leave_the_span_scaled_rows_unjudged() {
                     ("frame.p99", (20.0 + jitter) * scale, "ms lower time"),
                     ("frame.spikes", 10.0 * scale, "count lower spikes"),
                     ("perf.draws_pf", 500.0, "count lower exact"),
+                    (
+                        "mem.delta.end.committed_mib",
+                        40.0 * scale,
+                        "mib lower bytes",
+                    ),
                 ],
             );
         }
@@ -723,13 +740,14 @@ fn different_window_lengths_leave_the_span_scaled_rows_unjudged() {
     };
     assert_eq!(*verdict("frame.p99"), Verdict::Info);
     assert_eq!(*verdict("frame.spikes"), Verdict::Info);
+    assert_eq!(*verdict("mem.delta.end.committed_mib"), Verdict::Info);
     assert_eq!(*verdict("frame.p50"), Verdict::Neutral);
     assert_eq!(*verdict("perf.draws_pf"), Verdict::Neutral);
     assert!(
         comparison
             .notes
             .iter()
-            .any(|note| note.contains("different lengths (base 5.0, cand 2.0 s)")),
+            .any(|note| note.contains("different lengths (base 5, cand 2 s)")),
         "{:?}",
         comparison.notes
     );
@@ -1446,4 +1464,39 @@ fn the_time_step_follows_the_unit_and_the_source() {
     assert!(past_floor(0.012 - 0.006, 0.001));
     assert!(!past_floor(-0.005, 0.001));
     assert!(past_floor(-0.006, 0.001));
+}
+
+#[test]
+fn window_lengths_that_round_to_one_second_count_as_one_length() {
+    // A hitch stretched two windows of the base; older files wrote tenths.
+    let fixture = Fixture::new("span-jitter");
+    for round in 0..5 {
+        let jitter = [0.0, 0.05, -0.05, 0.02, -0.02][round];
+        let base_window = ["2.0", "2.1", "2", "1.9", "2.2"][round];
+        for (leg, image, window) in [("base", "AAAA", base_window), ("cand", "BBBB", "2")] {
+            let mut meta = meta("v1", image);
+            meta.push(("window_s", window));
+            fixture.write(
+                leg,
+                round,
+                "b",
+                &meta,
+                &[("frame.p99", 20.0 + jitter, "ms lower time")],
+            );
+        }
+    }
+    let comparison = evaluate(&fixture.root, &Options::default()).unwrap();
+    let row = comparison
+        .rows()
+        .find(|row| row.metric == "frame.p99")
+        .unwrap();
+    assert_eq!(row.verdict, Verdict::Neutral);
+    assert!(
+        !comparison
+            .notes
+            .iter()
+            .any(|note| note.contains("different lengths")),
+        "{:?}",
+        comparison.notes
+    );
 }

@@ -1080,8 +1080,8 @@ fn bench_rows(
     if spans_differ {
         notes.push(format!(
             "{bench}: the legs measured perf windows of different lengths (base {}, cand {} \
-             s), so its p99, max and spike rows, which grow with the span, are reported and \
-             not judged",
+             s), so its p99, max, spike and memory-growth rows, which grow with the span, are \
+             reported and not judged",
             listed(&base_spans),
             listed(&cand_spans)
         ));
@@ -1113,9 +1113,9 @@ fn bench_rows(
         }
         if partly || (optional && (in_base.is_none() || in_cand.is_none())) {
             let counted = |series: Option<&(&Metric, Vec<f64>)>, rounds: usize, leg: &str| {
-                format!(
-                    "{} of {rounds} {leg} rounds",
-                    series.map_or(0, |(_, values)| values.len())
+                series.map_or_else(
+                    || format!("missing from the whole {leg} leg"),
+                    |(_, values)| format!("in {} of {rounds} {leg} rounds", values.len()),
                 )
             };
             let shown = |series: Option<&(&Metric, Vec<f64>)>| {
@@ -1129,7 +1129,7 @@ fn bench_rows(
                 base: shown(in_base),
                 cand: shown(in_cand),
                 change: format!(
-                    "in {}, {}",
+                    "{}, {}",
                     counted(in_base, base.len(), "base"),
                     counted(in_cand, cand.len(), "cand")
                 ),
@@ -1200,10 +1200,23 @@ fn leg_series<'a>(
 }
 
 /// The window lengths the rounds of one leg name for `bench` (`window_s`), empty for files without.
+///
+/// Each value is read as a number of whole seconds, rounded: the windows of
+/// one build close at the end of a frame, so one that a hitch stretched
+/// reads a tenth or so long, and the builds' intervals, 2 s and 5 s, are
+/// whole. `none` (no window to align to) and anything unreadable stay a
+/// value of their own.
 fn spans(bench: &str, rounds: &[BTreeMap<String, Loaded>]) -> BTreeSet<String> {
     rounds
         .iter()
-        .filter_map(|round| round.get(bench)?.file.meta.get(SPAN_META).cloned())
+        .filter_map(|round| round.get(bench)?.file.meta.get(SPAN_META))
+        .map(|value| {
+            value
+                .parse::<f64>()
+                .ok()
+                .filter(|secs| secs.is_finite())
+                .map_or_else(|| value.clone(), |secs| format!("{secs:.0}"))
+        })
         .collect()
 }
 
@@ -1219,14 +1232,16 @@ fn listed(spans: &BTreeSet<String>) -> String {
 /// Whether a metric's value grows with the span it was measured over.
 ///
 /// A tail percentile, a worst value and a count of spikes all see more of
-/// the rare slow frames in a longer span. An exact metric is fixed by the
-/// workload whatever the span, and a median, a mean or a per-frame count is
-/// not tied to it.
+/// the rare slow frames in a longer span, and a benchmark's memory growth
+/// is measured to the end of a span of that length. An exact metric is
+/// fixed by the workload whatever the span, and a median, a mean or a
+/// per-frame count is not tied to it.
 fn span_scaled(name: &str, definition: &Metric) -> bool {
     definition.class != Class::Exact
         && (definition.class == Class::Spikes
             || name.contains("p99")
-            || name.rsplit('.').next() == Some("max"))
+            || name.rsplit('.').next() == Some("max")
+            || name.starts_with("mem.delta."))
 }
 
 /// The row of a metric only one leg has.

@@ -215,6 +215,12 @@ pub fn run(config: &AbConfig) -> Result<ExitCode, String> {
     // rounds wrote that the shape runs are checked against.
     let mut declares_shape = vec![false; benches.len()];
     let mut timed: Vec<Timed> = benches.iter().map(|_| Timed::default()).collect();
+    // The Wine installs the legs boot from, whose processes the machine
+    // samples count as the run's own.
+    let wines: Vec<PathBuf> = [&config.base.wine, &config.cand.wine]
+        .into_iter()
+        .filter_map(|wine| Some(wine.parent()?.parent()?.to_path_buf()))
+        .collect();
     for step in schedule(
         groups.len(),
         benches.len(),
@@ -232,7 +238,11 @@ pub fn run(config: &AbConfig) -> Result<ExitCode, String> {
             Step::Round { group, round, leg } => {
                 let members: Vec<&Bench> = groups[group].iter().map(|&at| &benches[at]).collect();
                 let dir = out.join(leg.dir()).join(round.to_string());
-                machine::keep(&dir, machine::MACHINE_FILES[0].0, &machine::sample())?;
+                machine::keep(
+                    &dir,
+                    &binary_name(&members[0].exe),
+                    &machine::sample(&wines),
+                )?;
                 for (member, path, file) in run_round(config, spec, &members, &dir)? {
                     let at = groups[group][member];
                     check_stamp(&path, &file, spec)?;
@@ -289,7 +299,7 @@ pub fn run(config: &AbConfig) -> Result<ExitCode, String> {
                     Leg::Cand => &host.cand,
                 };
                 let dir = out.join(leg.dir()).join(round.to_string());
-                machine::keep(&dir, machine::MACHINE_FILES[1].0, &machine::sample())?;
+                machine::keep(&dir, "host", &machine::sample(&wines))?;
                 for (path, file) in &run_host(exe, &host.corpora, &dir, config.timeout)? {
                     check_stamp(path, file, spec)?;
                     println!(

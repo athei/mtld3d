@@ -871,13 +871,14 @@ impl Span {
 
     /// The `window_s` meta value: the length of the window the span aligned to, `none` without one.
     ///
-    /// To a tenth of a second, so the windows of one build, which close at
-    /// the end of a frame, name one length; a comparison of two legs whose
-    /// windows differ (a base older than the 2 s interval) reads it to leave
-    /// the rows that grow with the span unjudged.
+    /// In whole seconds, rounded, since the builds' intervals are whole (2 s,
+    /// and 5 s before) and a window that closes at the end of a hitched frame
+    /// reads a tenth or so long; a comparison of two legs whose windows
+    /// differ (a base older than the 2 s interval) reads it to leave the rows
+    /// that grow with the span unjudged.
     pub fn window_s(&self) -> String {
         if self.aligned {
-            format!("{:.1}", self.length.as_secs_f64())
+            format!("{:.0}", self.length.as_secs_f64())
         } else {
             "none".to_owned()
         }
