@@ -461,6 +461,11 @@ impl LayerLog {
         Self { path }
     }
 
+    /// The log at `path`: another process's, whose file the benchmark that ran it knows.
+    pub const fn at(path: PathBuf) -> Self {
+        Self { path: Some(path) }
+    }
+
     /// The log's current length, the position a measured phase starts or ends at.
     pub fn mark(&self) -> u64 {
         self.path
@@ -869,11 +874,27 @@ impl Metrics {
     /// # Panics
     /// Panics if `bench` is empty or holds whitespace.
     pub fn new(bench: &str, h: &Harness, clock: &TscClock) -> Self {
+        Self::for_entries(bench, h.config_entries(), clock)
+    }
+
+    /// No records yet, for the benchmark `bench` whose layer ran with the entries `entries`.
+    ///
+    /// For a benchmark whose measured processes are not its own, such as
+    /// children that each create their own device. A `log.dir` entry is a
+    /// location, not a layer setting, and is left out.
+    ///
+    /// # Panics
+    /// Panics if `bench` is empty or holds whitespace.
+    pub fn for_entries(bench: &str, entries: &str, clock: &TscClock) -> Self {
         assert!(
             !bench.is_empty() && !bench.contains(char::is_whitespace),
             "a benchmark name is one word: {bench:?}"
         );
-        let entries = h.config_entries().trim();
+        let entries: Vec<&str> = entries
+            .split(';')
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty() && !entry.starts_with("log.dir="))
+            .collect();
         Self {
             bench: bench.to_owned(),
             extra_meta: Vec::new(),
@@ -881,7 +902,7 @@ impl Metrics {
             config_entries: if entries.is_empty() {
                 "none".to_owned()
             } else {
-                entries.replace(['\r', '\n'], " ")
+                entries.join(";").replace(['\r', '\n'], " ")
             },
             records: String::new(),
             shapes: String::new(),
@@ -1584,8 +1605,17 @@ pub fn nanos(duration: Duration) -> f64 {
     duration.as_secs_f64() * 1e9
 }
 
-fn ms(duration: Duration) -> f64 {
+/// `duration` in milliseconds.
+pub fn ms(duration: Duration) -> f64 {
     duration.as_secs_f64() * 1e3
+}
+
+/// Set a render state, asserting that the call succeeded.
+///
+/// # Panics
+/// Panics when `SetRenderState` fails.
+pub fn rs(h: &Harness, state: u32, value: u32) {
+    ok(h.set_render_state(state, value), "SetRenderState");
 }
 
 /// `bytes` in MiB with two decimals, truncated.

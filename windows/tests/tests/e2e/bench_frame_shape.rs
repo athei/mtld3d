@@ -82,7 +82,7 @@ use mtld3d_types::{
 use crate::bench::{
     Class, Direction, FrameClock, FrameWork, IDENTITY_ROWS, LayerLog, Metrics, Model, PassShape,
     STRIDE, TEXTURED_DECL, TscClock, Value, def, grid, material_ps, material_vs, memory_section,
-    ok, pattern_texture, ratio, transform, world_rows, write_report,
+    ok, pattern_texture, ratio, rs, transform, world_rows, write_report,
 };
 
 /// The back buffer, about the size of a windowed game.
@@ -1970,8 +1970,4 @@ fn shade(at: usize, of: usize) -> f32 {
 /// `value` as an index into one of the frame's resource lists.
 fn slot(value: u32) -> usize {
     usize::try_from(value).expect("a resource index fits usize")
-}
-
-fn rs(h: &Harness, state: u32, value: u32) {
-    ok(h.set_render_state(state, value), "SetRenderState");
 }

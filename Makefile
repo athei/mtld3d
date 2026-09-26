@@ -992,8 +992,11 @@ conformance-isolate: install-windows-$(ARCH) install-unix-$(SDK_UNIX_ARCH)
 # frames (`wow_112_busy_frame`, `wow_335a_busy_frame`), frames that each meet
 # pixel shaders never seen before with the shader cache off, an EVENT-query
 # throttle under the `wow` profile's query keys and under the D3D9 defaults
-# (`query_poll_wow`, `query_poll_spec`), and the API thread's cost of one call
-# of each kind (`api_call_cost`). They are `#[ignore]`d tests of the e2e
+# (`query_poll_wow`, `query_poll_spec`), the API thread's cost of one call
+# of each kind (`api_call_cost`), buffer locks and texture streaming at a
+# game's rates (`dynamic_buffer_churn`, `texture_streaming`), and fresh
+# processes from launch to their first frame on a populated shader cache
+# (`cold_start`). They are `#[ignore]`d tests of the e2e
 # binary, so the suite reports them ignored; this runs them alone, one at a
 # time in one process, through the runner's `--ignored`, for one PE arch
 # (ARCH, default i686, the arch the game ships). They measure and never assert
@@ -1019,7 +1022,35 @@ conformance-isolate: install-windows-$(ARCH) install-unix-$(SDK_UNIX_ARCH)
 # before, prints the reports at the end and says where the metrics files
 # are. FILTER='<patterns>' narrows the run as it does for `make test`, e.g.
 # `FILTER=stutter`.
+#
+# BENCH_CORPUS='<path> <path>' names real shader caches (`mtld3d_shaders.bin`)
+# for the benchmarks that read them: `cold_start` under `make bench` and the
+# host emitter under `make bench-host` and `make bench-ab`, which name a corpus
+# the same way. Its name is the name of the directory its file sits in, the
+# path resolved first (a relative one against this checkout, so a bare file
+# name is named after the checkout's directory, and `~` is not expanded), with
+# every character other than an ASCII letter or digit turned into `_`. Each
+# target copies the caches into a `corpus` directory of its own output, one
+# `<name>/mtld3d_shaders.bin` apiece, and the benchmark takes the name from
+# that directory; the directory is emptied first, so a run without BENCH_CORPUS
+# measures none. Paths may not contain spaces. Two paths of one name, or a
+# file at the filesystem root, stop the run before it builds.
 BENCH_DIR := $(or $(LOG_DIR),$(CURDIR)/.codex/evidence/bench)
+bench_corpus_name = $(shell printf '%s' '$(notdir $(patsubst %/,%,$(dir $(abspath $(1)))))' | tr -c 'A-Za-z0-9' '_')
+BENCH_CORPUS_NAMES := $(foreach f,$(BENCH_CORPUS),$(call bench_corpus_name,$(f)))
+BENCH_CORPUS_DUPLICATES := $(strip $(foreach n,$(sort $(BENCH_CORPUS_NAMES)),$(if $(filter-out 1,$(words $(filter $(n),$(BENCH_CORPUS_NAMES)))),$(n))))
+ifneq ($(filter bench bench-host bench-ab,$(MAKECMDGOALS)),)
+ifneq ($(words $(BENCH_CORPUS)),$(words $(BENCH_CORPUS_NAMES)))
+$(error BENCH_CORPUS: a file at the filesystem root has no directory to name its corpus after)
+endif
+ifneq ($(BENCH_CORPUS_DUPLICATES),)
+$(error BENCH_CORPUS: each corpus is named after its directory, and more than one path is named: $(BENCH_CORPUS_DUPLICATES))
+endif
+endif
+# The staged copy of the corpus at path $(2) under the output directory $(1).
+bench_corpus_copy = $(1)/corpus/$(call bench_corpus_name,$(2))/mtld3d_shaders.bin
+# Empty $(1)/corpus and copy every BENCH_CORPUS entry into it.
+bench_stage_corpus = rm -rf '$(1)/corpus'$(foreach f,$(BENCH_CORPUS), && mkdir -p '$(dir $(call bench_corpus_copy,$(1),$(f)))' && cp '$(abspath $(f))' '$(call bench_corpus_copy,$(1),$(f))')
 BENCH_TIMEOUT ?= 300
 BENCH_TARGET := $(if $(filter x86_64,$(ARCH)),$(PE_x64),$(PE_i386))
 BENCH_EXES = $(if $(STAGE),$(STAGE)/tests/$(ARCH)/*.exe,$(call E2E_EXES,$(BENCH_TARGET),--profile $(PROFILE)))
@@ -1035,6 +1066,7 @@ endef
 bench: install-windows-$(ARCH) install-unix-$(SDK_UNIX_ARCH)
 	$(MAKE) configure-test-prefix
 	mkdir -p '$(BENCH_DIR)' && rm -f '$(BENCH_DIR)'/bench-*.txt '$(BENCH_DIR)'/bench-*.metrics
+	$(call bench_stage_corpus,$(BENCH_DIR))
 	$(BENCH_SUITE_ASSIGN); \
 	cd $(E2E_RUNNER_DIR) && MTLD3D_CONFIG='$(MTLD3D_CONF_BENCH)' WINEDEBUG= MTL_DEBUG_LAYER=0 MTL_HUD_ENABLED=0 \
 		$(E2E_RUNNER) --wine $(WINE) --jobs 1 --timeout $(BENCH_TIMEOUT) --ignored \
@@ -1143,7 +1175,7 @@ BENCH_AB_OUT := $(BENCH_AB_ROOT)/$(BENCH_BASE_SHORT)-vs-$(BENCH_CAND_SHORT)-$(sh
 # git, since its worktree may not exist yet.
 BENCH_HOST_AB := $(shell git show $(BENCH_BASE_SHA):Makefile 2>/dev/null | grep -q '^bench-host-build:' && echo 1)
 BENCH_HOST_FLAGS = $(if $(BENCH_HOST_AB),--base-host '$(call BENCH_HOST_EXE,$(BENCH_BASE_DIR))' \
-	--cand-host '$(call BENCH_HOST_EXE,$(CURDIR))' $(foreach path,$(BENCH_CORPUS),--host-corpus '$(abspath $(path))'))
+	--cand-host '$(call BENCH_HOST_EXE,$(CURDIR))' $(foreach f,$(BENCH_CORPUS),--host-corpus '$(call bench_corpus_copy,$(BENCH_AB_OUT),$(f))'))
 endif
 bench-ab:
 	git -C '$(BENCH_CHECKOUT)' check-ignore -q '$(BENCH_BASE_DIR)' || \
@@ -1160,6 +1192,7 @@ bench-ab:
 	$(if $(BENCH_HOST_AB),$(MAKE) $(BENCH_LEG_MAKE) bench-host-build)
 	$(MAKE) $(call BENCH_LEG_CONFIGURE,$(BENCH_BASE_ISO)) || { $(BENCH_STOP_SERVERS); stop_servers; exit 2; }
 	$(MAKE) $(call BENCH_LEG_CONFIGURE,$(ISOLATED_ROOT)) || { $(BENCH_STOP_SERVERS); stop_servers; exit 2; }
+	$(if $(BENCH_HOST_AB),mkdir -p '$(BENCH_AB_OUT)' && $(call bench_stage_corpus,$(BENCH_AB_OUT)))
 	$(BENCH_STOP_SERVERS); trap stop_servers EXIT; \
 	$(BENCH_SUITE_ASSIGN); \
 	cd $(E2E_RUNNER_DIR) && WINEDEBUG= MTL_DEBUG_LAYER=0 MTL_HUD_ENABLED=0 \
@@ -1191,11 +1224,10 @@ clean-bench-ab:
 # `windows/core/examples/emit_corpus.rs` times DXSO parsing and MSL emission
 # and totals the size of the MSL, which is what Metal's compile time and so a
 # first-use stutter grows with. It always runs a synthetic fixed-function
-# corpus and a synthetic SM1-SM3 one; BENCH_CORPUS='<path> <path>' adds each
-# named `mtld3d_shaders.bin`, whose programmable records keep their DXSO, as a
-# corpus named after the directory holding it. The list is split on spaces, so
-# a path in it cannot contain one (or a quote). Game caches stay out of the
-# tree, so this is how their shaders get measured. Like `test-unit` it builds
+# corpus and a synthetic SM1-SM3 one; BENCH_CORPUS (above) adds each named
+# `mtld3d_shaders.bin`, whose programmable records keep their DXSO, as a
+# corpus of its own, staged under the `host` directory's `corpus`. Game
+# caches stay out of the tree, so this is how their shaders get measured. Like `test-unit` it builds
 # for this machine's own arch and needs no install and no Wine; like `bench` it
 # builds with the production profile unless PROD=0 asks for `release`. The
 # table goes to stdout, and each corpus writes `bench-host_emit_<corpus>.metrics`
@@ -1212,8 +1244,9 @@ bench-host-build:
 
 bench-host: bench-host-build
 	mkdir -p '$(BENCH_HOST_DIR)' && rm -f '$(BENCH_HOST_DIR)'/bench-host_emit_*.metrics
+	$(call bench_stage_corpus,$(BENCH_HOST_DIR))
 	'$(call BENCH_HOST_EXE,$(CURDIR))' --metrics '$(abspath $(BENCH_HOST_DIR))' \
-		$(foreach path,$(BENCH_CORPUS),'$(abspath $(path))')
+		$(foreach f,$(BENCH_CORPUS),'$(call bench_corpus_copy,$(BENCH_HOST_DIR),$(f))')
 
 fmt:
 	cd windows && cargo +$(RUST_NIGHTLY) fmt
