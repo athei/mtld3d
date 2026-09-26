@@ -1,8 +1,8 @@
 use mtld3d_shared::{Command, MetalHandle, mtl::PixelFormat, mtl_handle::MTLTextureKind};
 
 use super::{
-    ClearHistory, ClearPlanes, CompileLanes, FEED_MEMORY_FRAMES, TicketSource, mark_kept_reads,
-    may_skip_draw,
+    ClearHistory, ClearPlanes, CompileLanes, DeferredPipelineId, DeferredPipelines, DeferredState,
+    FEED_MEMORY_FRAMES, JobTicket, LibrarySlot, TicketSource, mark_kept_reads, may_skip_draw,
 };
 use crate::{
     passes::{BackbufferContents, FrameReset, PassState, UploadPassTarget},
@@ -58,7 +58,7 @@ fn a_started_job_is_neither_promoted_nor_stolen() {
     lanes.push_normal(started, ());
     assert_eq!(lanes.pop(), Some((started, ())));
     assert!(!lanes.promote(started));
-    assert_eq!(lanes.steal(started), None);
+    assert_eq!(lanes.steal(started, 0), None);
 }
 
 /// Stealing takes an unstarted urgent job by ticket and leaves the rest queued.
@@ -72,11 +72,15 @@ fn steal_takes_only_the_named_urgent_job() {
     lanes.push_normal(normal, "normal");
     lanes.push_urgent(urgent, "urgent");
     lanes.push_urgent(other, "other");
-    assert_eq!(lanes.steal(normal), None, "a normal job is promoted first");
-    assert_eq!(lanes.steal(other), Some("other"));
-    assert_eq!(lanes.steal(other), None, "a job leaves the lanes once");
-    assert_eq!(lanes.steal_urgent(), Some((urgent, "urgent")));
-    assert_eq!(lanes.steal_urgent(), None);
+    assert_eq!(
+        lanes.steal(normal, 0),
+        None,
+        "a normal job is promoted first"
+    );
+    assert_eq!(lanes.steal(other, 0), Some("other"));
+    assert_eq!(lanes.steal(other, 0), None, "a job leaves the lanes once");
+    assert_eq!(lanes.steal_urgent(0), Some((urgent, "urgent")));
+    assert_eq!(lanes.steal_urgent(0), None);
     assert_eq!(lanes.pop(), Some((normal, "normal")));
 }
 
@@ -337,5 +341,224 @@ fn a_chain_of_scratch_targets_is_marked_in_one_submission() {
     assert!(
         history.feeds_persistent(first),
         "marking the second makes the pass writing it kept, and it read the first"
+    );
+}
+
+/// The oldest urgent jobs are left to the idle workers, and only the rest may be stolen.
+#[test]
+fn stealing_leaves_the_idle_workers_their_jobs() {
+    let mut tickets = TicketSource::new();
+    let mut lanes = CompileLanes::new();
+    let (first, second, third) = (tickets.issue(), tickets.issue(), tickets.issue());
+    lanes.push_urgent(first, "first");
+    lanes.push_urgent(second, "second");
+    lanes.push_urgent(third, "third");
+    assert_eq!(lanes.steal(first, 2), None, "an idle worker takes it next");
+    assert_eq!(lanes.steal(second, 2), None, "so does the other one");
+    assert_eq!(
+        lanes.steal_urgent(3),
+        None,
+        "every job has a worker waiting for it"
+    );
+    assert_eq!(lanes.steal_urgent(2), Some((third, "third")));
+    assert_eq!(
+        lanes.pop(),
+        Some((first, "first")),
+        "the workers' jobs stay queued"
+    );
+    assert_eq!(lanes.steal(second, 0), Some("second"));
+}
+
+/// Deferred records over plain numbers: functions and pipelines are `u32`, templates `&str`.
+const fn records() -> DeferredPipelines<u32, u32, &'static str> {
+    DeferredPipelines::new()
+}
+
+fn libraries(vs: LibrarySlot<u32>, ps: LibrarySlot<u32>) -> DeferredState<u32, u32> {
+    DeferredState::Libraries { vs, ps }
+}
+
+/// Queue the pipeline of every record whose libraries are in, as `ticket`.
+fn queue_pipelines(deferred: &mut DeferredPipelines<u32, u32, &'static str>, ticket: JobTicket) {
+    deferred.advance(|_, _, _| DeferredState::Pipeline(ticket));
+}
+
+/// A placeholder carries the top bit no handle has, and round-trips its record.
+#[test]
+fn a_placeholder_never_equals_a_real_handle() {
+    let mut deferred = records();
+    let mut tickets = TicketSource::new();
+    let id = deferred.defer(
+        DeferredState::Pipeline(tickets.issue()),
+        |_| false,
+        || "draw",
+    );
+    let raw = id.placeholder();
+    assert!(DeferredPipelineId::is_placeholder(raw));
+    assert_eq!(
+        DeferredPipelineId::from_placeholder(raw).map(|id| id.placeholder()),
+        Some(raw)
+    );
+    // The highest user-space address a macOS process maps.
+    let real = 0x0000_7FFF_FFFF_FFFF_u64;
+    assert!(!DeferredPipelineId::is_placeholder(real));
+    assert!(DeferredPipelineId::from_placeholder(real).is_none());
+    assert!(DeferredPipelineId::from_placeholder(0).is_none());
+}
+
+/// Libraries landing in either order both lead to the pipeline build and its answer.
+#[test]
+fn libraries_landing_in_either_order_reach_the_pipeline() {
+    for vs_first in [true, false] {
+        let mut tickets = TicketSource::new();
+        let (vs, ps, pipeline) = (tickets.issue(), tickets.issue(), tickets.issue());
+        let mut deferred = records();
+        let id = deferred.defer(
+            libraries(LibrarySlot::Pending(vs), LibrarySlot::Pending(ps)),
+            |_| false,
+            || "draw",
+        );
+        assert_eq!(deferred.pending_tickets(), [vs, ps]);
+        let (first, second) = if vs_first { (vs, ps) } else { (ps, vs) };
+        deferred.on_library(first, Some(7));
+        let mut asked = 0;
+        deferred.advance(|_, _, _| {
+            asked += 1;
+            DeferredState::Failed
+        });
+        assert_eq!(asked, 0, "one library is still building");
+        deferred.on_library(second, Some(7));
+        deferred.advance(|template, vs_fn, ps_fn| {
+            assert_eq!((*template, vs_fn, ps_fn), ("draw", 7, 7));
+            DeferredState::Pipeline(pipeline)
+        });
+        assert_eq!(deferred.pending_tickets(), [pipeline]);
+        assert_eq!(deferred.answer(&id), None, "no answer while it builds");
+        deferred.on_pipeline(pipeline, Some(42));
+        assert!(deferred.pending_tickets().is_empty());
+        assert_eq!(deferred.answer(&id), Some(42));
+    }
+}
+
+/// A failed library fails the record, and so does a failed pipeline.
+#[test]
+fn a_failed_library_or_pipeline_fails_the_record() {
+    let mut tickets = TicketSource::new();
+    let (vs, ps, pipeline) = (tickets.issue(), tickets.issue(), tickets.issue());
+    let mut deferred = records();
+    let by_library = deferred.defer(
+        libraries(LibrarySlot::Ready(1), LibrarySlot::Pending(ps)),
+        |_| false,
+        || "library",
+    );
+    let by_pipeline = deferred.defer(DeferredState::Pipeline(pipeline), |_| false, || "pipeline");
+    deferred.on_library(vs, None);
+    assert_eq!(
+        deferred.pending_tickets(),
+        [ps, pipeline],
+        "an unrelated failure changes nothing"
+    );
+    deferred.on_library(ps, None);
+    deferred.on_pipeline(pipeline, None);
+    assert!(deferred.pending_tickets().is_empty());
+    assert_eq!(deferred.answer(&by_library), None);
+    assert_eq!(deferred.answer(&by_pipeline), None);
+}
+
+/// Records waiting on one ticket all advance when it lands.
+#[test]
+fn records_sharing_a_ticket_advance_together() {
+    let mut tickets = TicketSource::new();
+    let (ps, pipeline) = (tickets.issue(), tickets.issue());
+    let mut deferred = records();
+    let first = deferred.defer(
+        libraries(LibrarySlot::Ready(1), LibrarySlot::Pending(ps)),
+        |_| false,
+        || "first",
+    );
+    let second = deferred.defer(
+        libraries(LibrarySlot::Ready(2), LibrarySlot::Pending(ps)),
+        |_| false,
+        || "second",
+    );
+    assert_eq!(deferred.pending_tickets(), [ps], "one ticket, named once");
+    deferred.on_library(ps, Some(3));
+    queue_pipelines(&mut deferred, pipeline);
+    deferred.on_pipeline(pipeline, Some(9));
+    assert_eq!(deferred.answer(&first), Some(9));
+    assert_eq!(deferred.answer(&second), Some(9));
+    let mut ready = Vec::new();
+    deferred.for_each_ready(|template, pipeline| ready.push((*template, pipeline)));
+    assert_eq!(ready, [("first", 9), ("second", 9)]);
+}
+
+/// Consecutive identical draws share a record; a different template or state gets its own.
+#[test]
+fn consecutive_identical_draws_share_one_record() {
+    let mut tickets = TicketSource::new();
+    let (ps, other) = (tickets.issue(), tickets.issue());
+    let mut deferred = records();
+    let state = || libraries(LibrarySlot::Ready(1), LibrarySlot::Pending(ps));
+    let first = deferred.defer(state(), |_| false, || "draw");
+    let mut built = false;
+    let again = deferred.defer(
+        state(),
+        |template| *template == "draw",
+        || {
+            built = true;
+            "draw"
+        },
+    );
+    assert!(!built, "a reused record builds no template");
+    assert_eq!(first.placeholder(), again.placeholder());
+    let other_template = deferred.defer(state(), |template| *template == "other", || "other");
+    assert_ne!(first.placeholder(), other_template.placeholder());
+    let other_state = deferred.defer(
+        libraries(LibrarySlot::Ready(1), LibrarySlot::Pending(other)),
+        |_| true,
+        || "other",
+    );
+    assert_ne!(other_template.placeholder(), other_state.placeholder());
+}
+
+/// A lost pipeline is retried from its template, a lost library fails, and the rest stay.
+#[test]
+fn lost_tickets_retry_pipelines_and_fail_libraries() {
+    let mut tickets = TicketSource::new();
+    let (built, stuck, library, other, again) = (
+        tickets.issue(),
+        tickets.issue(),
+        tickets.issue(),
+        tickets.issue(),
+        tickets.issue(),
+    );
+    let mut deferred = records();
+    let done = deferred.defer(DeferredState::Pipeline(built), |_| false, || "done");
+    let waiting = deferred.defer(DeferredState::Pipeline(stuck), |_| false, || "waiting");
+    let by_library = deferred.defer(
+        libraries(LibrarySlot::Ready(1), LibrarySlot::Pending(library)),
+        |_| false,
+        || "library",
+    );
+    let unaffected = deferred.defer(DeferredState::Pipeline(other), |_| false, || "other");
+    deferred.on_pipeline(built, Some(5));
+    let mut retried = Vec::new();
+    deferred.retry_lost(&[stuck, library], |template| {
+        retried.push(*template);
+        DeferredState::Pipeline(again)
+    });
+    assert_eq!(retried, ["waiting"], "only the lost pipeline is retried");
+    assert_eq!(deferred.pending_tickets(), [again, other]);
+    deferred.on_pipeline(again, Some(6));
+    assert_eq!(deferred.answer(&done), Some(5));
+    assert_eq!(deferred.answer(&waiting), Some(6));
+    assert_eq!(deferred.answer(&by_library), None);
+    assert_eq!(deferred.answer(&unaffected), None, "still building");
+    deferred.clear();
+    assert!(deferred.is_empty());
+    assert_eq!(
+        deferred.answer(&done),
+        None,
+        "a cleared record names nothing"
     );
 }

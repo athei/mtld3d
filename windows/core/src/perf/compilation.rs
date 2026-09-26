@@ -103,6 +103,17 @@ impl CompilationPerf {
     #[cfg(not(perf_tracking))]
     pub const fn note_skipped_draw(&mut self) {}
 
+    /// Count a draw encoded with a placeholder pipeline, its builds waited for at submission.
+    #[cfg(perf_tracking)]
+    pub fn note_deferred_draw(&mut self) {
+        if perf_enabled() {
+            self.asynchronous.deferred = self.asynchronous.deferred.saturating_add(1);
+        }
+    }
+
+    #[cfg(not(perf_tracking))]
+    pub const fn note_deferred_draw(&mut self) {}
+
     /// Sample how many builds are queued or running, keeping the window's peak.
     #[cfg(perf_tracking)]
     pub fn note_pending(&mut self, pending: usize) {
@@ -431,6 +442,8 @@ struct AsyncMetrics {
     installs: u64,
     latency_ns: u64,
     latency_peak_ns: u64,
+    /// Draws encoded with a placeholder pipeline, whose builds their submission waited for.
+    deferred: u64,
     /// Encoder waits for builds a draw could not skip, their time, and the jobs it ran itself.
     urgent_waits: u64,
     urgent_wait_ns: u64,
@@ -449,6 +462,7 @@ impl AsyncMetrics {
             installs: 0,
             latency_ns: 0,
             latency_peak_ns: 0,
+            deferred: 0,
             urgent_waits: 0,
             urgent_wait_ns: 0,
             stolen: 0,
@@ -458,7 +472,11 @@ impl AsyncMetrics {
     }
 
     const fn is_idle(&self) -> bool {
-        self.skipped == 0 && self.installs == 0 && self.urgent_waits == 0 && self.misses == 0
+        self.skipped == 0
+            && self.deferred == 0
+            && self.installs == 0
+            && self.urgent_waits == 0
+            && self.misses == 0
     }
 
     fn write(&self, output: &mut String) {
@@ -476,7 +494,8 @@ impl AsyncMetrics {
         );
         let _ = writeln!(
             output,
-            "  async: urgent waits={}  waited {:.3} ms  stolen={}  encoder per miss {:.3} ms  misses={}",
+            "  async: draws deferred={}  urgent waits={}  waited {:.3} ms  stolen={}  encoder per miss {:.3} ms  misses={}",
+            self.deferred,
             self.urgent_waits,
             ms(self.urgent_wait_ns),
             self.stolen,

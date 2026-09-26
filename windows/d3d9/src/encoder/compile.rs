@@ -8,8 +8,10 @@
 //! pipeline build and the cache append, and the encoder installs what they
 //! hand back at the top of its next frame or draw. The draws that need a
 //! build still in flight are left out of the frame when that loses nothing a
-//! later frame does not redraw, and wait for the build otherwise
-//! (`mtld3d_core::async_compile::may_skip_draw`).
+//! later frame does not redraw (`mtld3d_core::async_compile::may_skip_draw`).
+//! The others bind a placeholder pipeline and the encoder keeps encoding;
+//! the submission waits for exactly the builds its placeholders name, and
+//! swaps the real pipelines in before any pass rule reads the commands.
 
 use std::{
     sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, mpsc},
@@ -20,7 +22,8 @@ use std::{
 use log::{Level, debug, error, log_enabled, trace, warn};
 use mtld3d_core::{
     async_compile::{
-        ClearPlanes, CompileLanes, JobTicket, Resolution, mark_kept_reads, may_skip_draw,
+        ClearPlanes, CompileLanes, DeferredPipelineId, DeferredPipelines, DeferredState, JobTicket,
+        LibrarySlot, Resolution, mark_kept_reads, may_skip_draw,
     },
     build_index::BuildLookup,
     dxso::{
@@ -39,10 +42,11 @@ use mtld3d_core::{
 use mtld3d_shared::{
     MetalHandle, VertexAttrDesc,
     mtl::StageTag,
-    mtl_handle::{MTLDeviceKind, MTLRenderPipelineStateKind, MTLTextureKind},
+    mtl_handle::{MTLDeviceKind, MTLFunctionKind, MTLRenderPipelineStateKind, MTLTextureKind},
     perf::{NanosSetTimer, PipelineTimings, ShaderTimings},
     tsc::{rdtsc, secs_to_cycles},
 };
+use rustc_hash::FxHashMap;
 
 use super::{
     FrameEncoder, FrameEncoderFlags, LOG_TARGET, StageLibHandles, compile_stage_library,
@@ -85,6 +89,8 @@ pub struct CompileQueue {
 
 struct QueueState {
     lanes: CompileLanes<QueuedJob>,
+    /// Workers waiting for a job; each takes the oldest urgent job next.
+    idle: usize,
     /// Set once at encoder teardown; a worker that finds the lanes empty then exits.
     closed: bool,
 }
@@ -94,6 +100,7 @@ impl CompileQueue {
         Self {
             state: Mutex::new(QueueState {
                 lanes: CompileLanes::new(),
+                idle: 0,
                 closed: false,
             }),
             ready: Condvar::new(),
@@ -116,12 +123,18 @@ impl CompileQueue {
         self.lock().lanes.promote(ticket)
     }
 
-    fn steal(&self, ticket: JobTicket) -> Option<QueuedJob> {
-        self.lock().lanes.steal(ticket)
+    /// Take the unstarted urgent job `ticket`; `share` leaves the idle workers theirs.
+    fn steal(&self, ticket: JobTicket, share: bool) -> Option<QueuedJob> {
+        let mut state = self.lock();
+        let idle = if share { state.idle } else { 0 };
+        state.lanes.steal(ticket, idle)
     }
 
-    fn steal_urgent(&self) -> Option<(JobTicket, QueuedJob)> {
-        self.lock().lanes.steal_urgent()
+    /// Take the oldest unstarted urgent job; `share` leaves the idle workers theirs.
+    fn steal_urgent(&self, share: bool) -> Option<(JobTicket, QueuedJob)> {
+        let mut state = self.lock();
+        let idle = if share { state.idle } else { 0 };
+        state.lanes.steal_urgent(idle)
     }
 
     fn take_any(&self) -> Option<(JobTicket, QueuedJob)> {
@@ -144,10 +157,14 @@ impl CompileQueue {
             if state.closed {
                 return None;
             }
+            // Counted until this worker holds the lock again, so a job
+            // queued meanwhile is left to it rather than stolen.
+            state.idle += 1;
             state = self
                 .ready
                 .wait(state)
                 .unwrap_or_else(PoisonError::into_inner);
+            state.idle -= 1;
         }
     }
 }
@@ -259,14 +276,76 @@ impl LibraryInput {
 struct PipelineJob {
     snapshot: PipelineSnapshot,
     vertex_attrs: Vec<VertexAttrDesc>,
-    /// The two shader records the recipe names; `None` when a shader has no cache kind.
-    shader_refs: Option<(ShaderRecordRef, ShaderRecordRef)>,
-    vs: PairShaderId,
-    ps: PairShaderId,
+    identity: PipelineIdentity,
     /// The with-colour pipeline this one is the no-colour sibling of, as a raw handle.
     sibling_of: Option<u64>,
     device: MetalHandle<MTLDeviceKind>,
     persist: bool,
+}
+
+/// The shader identities a pipeline build records, taken from the draw's two sources.
+pub struct PipelineIdentity {
+    /// The two shader records the recipe names; `None` when a shader has no cache kind.
+    shader_refs: Option<(ShaderRecordRef, ShaderRecordRef)>,
+    vs: PairShaderId,
+    ps: PairShaderId,
+}
+
+impl PipelineIdentity {
+    /// The same identities, for one more job; every field is a plain value.
+    const fn copied(&self) -> Self {
+        Self {
+            shader_refs: self.shader_refs,
+            vs: self.vs,
+            ps: self.ps,
+        }
+    }
+}
+
+/// What a deferred draw's pipeline build needs besides its two functions.
+///
+/// Kept from the draw's encoding to its submission, since the draw's
+/// sources are not: `VsSource` and `PsSource` live in the frame's scratch
+/// and are neither `Clone` nor `Copy`.
+pub struct DeferredTemplate {
+    /// The draw's pipeline snapshot; its functions are filled in as its libraries land.
+    snapshot: PipelineSnapshot,
+    vertex_attrs: Vec<VertexAttrDesc>,
+    identity: PipelineIdentity,
+}
+
+/// The draws of the submission being encoded that bound a placeholder pipeline.
+///
+/// Boxed on the encoder, so the draw path's encoder state keeps the layout
+/// it has without it: nothing on that path touches these unless a build is
+/// pending.
+pub struct DeferredDraws {
+    /// One record per placeholder; `resolve_deferred_draws` empties it every submission.
+    pipelines: DeferredPipelines<
+        MetalHandle<MTLFunctionKind>,
+        MetalHandle<MTLRenderPipelineStateKind>,
+        DeferredTemplate,
+    >,
+    /// The libraries the draw being encoded waits for, from its library resolve to its pipeline's.
+    ///
+    /// Always [`DeferredState::Libraries`] when set.
+    libraries: Option<
+        DeferredState<MetalHandle<MTLFunctionKind>, MetalHandle<MTLRenderPipelineStateKind>>,
+    >,
+}
+
+impl DeferredDraws {
+    pub const fn new() -> Self {
+        Self {
+            pipelines: DeferredPipelines::new(),
+            libraries: None,
+        }
+    }
+
+    /// Whether nothing of the submission being encoded is deferred.
+    pub const fn is_empty(&self) -> bool {
+        self.pipelines.is_empty() && self.libraries.is_none()
+    }
 }
 
 /// A finished build on its way back to the encoder.
@@ -449,9 +528,12 @@ fn build_pipeline(job: PipelineJob) -> PipelineOutcome {
     let PipelineJob {
         snapshot,
         vertex_attrs,
-        shader_refs,
-        vs,
-        ps,
+        identity:
+            PipelineIdentity {
+                shader_refs,
+                vs,
+                ps,
+            },
         sibling_of,
         device,
         persist,
@@ -831,6 +913,10 @@ impl FrameEncoder {
 
     /// Look up or queue an `MTLRenderPipelineState` for the given pipeline state snapshot.
     ///
+    /// A snapshot naming a library still building answers `Ready` with a
+    /// placeholder (`defer_pending_libraries`), which the draw binds as it
+    /// would a pipeline.
+    ///
     /// Translation from D3D9 state to Metal enums happens in
     /// `mtld3d_core::pipeline_state`; the per-field invariant test there
     /// guards against "classified Consumed but value silently dropped".
@@ -858,23 +944,47 @@ impl FrameEncoder {
             self.perf.bump_pipeline_memo_hit();
             return Resolution::Ready(handle);
         }
-        let with_color = match self.resolve_pipeline(snapshot, vertex_attrs, shaders, None) {
+        // A library still building leaves a null function in the snapshot,
+        // which no memoised pipeline has: the draw binds a placeholder.
+        if snapshot.vs_fn.is_null() || snapshot.ps_fn.is_null() {
+            return self.defer_pending_libraries(snapshot, vertex_attrs, shaders);
+        }
+        let with_color = match self.resolve_pipeline(snapshot, vertex_attrs, None, |enc| {
+            pipeline_identity(&enc.program_cache, shaders)
+        }) {
             Resolution::Ready(handle) => handle,
             Resolution::Pending(ticket) => return Resolution::Pending(ticket),
             Resolution::Failed => return Resolution::Failed,
         };
-        // Dual-build for zero-mask draws: queue the matching no-color
-        // variant up-front so pass-finalisation (Rule H) can swap to it
-        // retroactively if every draw in the pass had `mask == 0`.
-        // Rule H keeps color when there is no depth attachment. Its unused
-        // sibling would have no attachments, which Mac2 Metal rejects.
-        // A successful sibling mapping stays valid as long as the pipeline
-        // cache, so an L0 miss can reuse it without rebuilding the alternate
-        // snapshot and key. The sibling builds asynchronously and nothing
-        // waits for it: until its mapping lands (at install, or on an L0 miss
-        // that finds it built), Rule H keeps the pass's color. A failed
-        // sibling leaves no mapping, and `resolve_pipeline` answers failed
-        // from its cache without another build.
+        self.queue_no_color_sibling(snapshot, vertex_attrs, with_color, |enc| {
+            pipeline_identity(&enc.program_cache, shaders)
+        });
+        self.last_pipeline_memo = Some((snapshot.clone(), with_color.raw()));
+        Resolution::Ready(with_color.raw())
+    }
+
+    /// Queue the no-colour sibling of a built pipeline whose draws may all write no colour.
+    ///
+    /// Dual-build for zero-mask draws: queue the matching no-color
+    /// variant up-front so pass-finalisation (Rule H) can swap to it
+    /// retroactively if every draw in the pass had `mask == 0`.
+    /// Rule H keeps color when there is no depth attachment. Its unused
+    /// sibling would have no attachments, which Mac2 Metal rejects.
+    /// A successful sibling mapping stays valid as long as the pipeline
+    /// cache, so an L0 miss can reuse it without rebuilding the alternate
+    /// snapshot and key. The sibling builds asynchronously and nothing
+    /// waits for it: until its mapping lands (at install, or on an L0 miss
+    /// that finds it built), Rule H keeps the pass's color. A failed
+    /// sibling leaves no mapping, and `resolve_pipeline` answers failed
+    /// from its cache without another build.
+    #[inline]
+    fn queue_no_color_sibling(
+        &mut self,
+        snapshot: &PipelineSnapshot,
+        vertex_attrs: &[VertexAttrDesc],
+        with_color: MetalHandle<MTLRenderPipelineStateKind>,
+        identity: impl FnOnce(&Self) -> PipelineIdentity,
+    ) {
         if snapshot.has_depth()
             && snapshot.writes_no_color()
             && snapshot.has_color_output()
@@ -887,22 +997,63 @@ impl FrameEncoder {
             let mut alt = snapshot.clone();
             alt.remove_color_output();
             if let Resolution::Ready(no_color) =
-                self.resolve_pipeline(&alt, vertex_attrs, shaders, Some(with_color.raw()))
+                self.resolve_pipeline(&alt, vertex_attrs, Some(with_color.raw()), identity)
             {
                 self.no_color_pipeline_alt
                     .insert(with_color.raw(), no_color);
             }
         }
-        self.last_pipeline_memo = Some((snapshot.clone(), with_color.raw()));
-        Resolution::Ready(with_color.raw())
     }
 
-    fn resolve_pipeline(
+    /// Bind a placeholder for a draw whose libraries are still building.
+    ///
+    /// The draw's library resolve left what they wait for
+    /// (`note_pending_libraries`); the answer is `Ready` with the
+    /// placeholder, which the draw binds as it would a pipeline.
+    #[cold]
+    #[inline(never)]
+    fn defer_pending_libraries(
         &mut self,
         snapshot: &PipelineSnapshot,
         vertex_attrs: &[VertexAttrDesc],
         shaders: &ShaderRef<'_>,
+    ) -> Resolution<u64> {
+        let Some(libraries) = self.deferred.libraries.take() else {
+            mtld3d_shared::log_once_warn!(
+                target: LOG_TARGET,
+                "encoder: a draw's pipeline names no function and no library it waits for \
+                 is on record; the draw is dropped"
+            );
+            return Resolution::Failed;
+        };
+        let id = self.defer_pipeline(libraries, snapshot, vertex_attrs, shaders);
+        Resolution::Ready(id.placeholder())
+    }
+
+    /// Remember the libraries the draw being encoded waits for, until its pipeline resolve.
+    #[cold]
+    pub fn note_pending_libraries(
+        &mut self,
+        vs: LibrarySlot<MetalHandle<MTLFunctionKind>>,
+        ps: LibrarySlot<MetalHandle<MTLFunctionKind>>,
+    ) {
+        debug_assert!(
+            self.deferred.libraries.is_none(),
+            "the previous draw's pending libraries were never taken"
+        );
+        self.deferred.libraries = Some(DeferredState::Libraries { vs, ps });
+    }
+
+    /// The pipeline for `snapshot`, built, failed, or queued now under a new ticket.
+    ///
+    /// `identity` names the job's shaders; it runs only when the pipeline
+    /// has to be queued, since it hashes the sources.
+    fn resolve_pipeline(
+        &mut self,
+        snapshot: &PipelineSnapshot,
+        vertex_attrs: &[VertexAttrDesc],
         sibling_of: Option<u64>,
+        identity: impl FnOnce(&Self) -> PipelineIdentity,
     ) -> Resolution<MetalHandle<MTLRenderPipelineStateKind>> {
         let key = pipeline_state::key_from_snapshot(snapshot, vertex_attrs);
         match self.pipeline_cache.lookup(&key) {
@@ -918,15 +1069,7 @@ impl FrameEncoder {
         let job = PipelineJob {
             snapshot: snapshot.clone(),
             vertex_attrs: vertex_attrs.to_vec(),
-            shader_refs: self.pipeline_shader_refs(shaders),
-            vs: PairShaderId {
-                is_programmable: matches!(shaders.vs, VsSource::Programmable { .. }),
-                hash: shaders.vs.disk_key(),
-            },
-            ps: PairShaderId {
-                is_programmable: matches!(shaders.ps, PsSource::Programmable { .. }),
-                hash: shaders.ps.disk_key(shaders.variant),
-            },
+            identity: identity(self),
             sibling_of,
             device: self.device_handle,
             persist: self.cache_persists(),
@@ -936,30 +1079,6 @@ impl FrameEncoder {
         drop(miss);
         self.perf.compilation_mut().note_miss(miss_ns);
         Resolution::Pending(ticket)
-    }
-
-    fn pipeline_shader_refs(
-        &self,
-        shaders: &ShaderRef<'_>,
-    ) -> Option<(ShaderRecordRef, ShaderRecordRef)> {
-        let vs_kind = match shaders.vs {
-            VsSource::FixedFunction { .. } => CachedKind::FfVs,
-            VsSource::Programmable { vs_id, .. } => {
-                let major = self.program_cache.get(vs_id)?.major;
-                CachedKind::from_programmable(major, false)?
-            }
-        };
-        let ps_kind = match shaders.ps {
-            PsSource::FixedFunction { .. } => CachedKind::FfPs,
-            PsSource::Programmable { ps_id, .. } => {
-                let major = self.program_cache.get(ps_id)?.major;
-                CachedKind::from_programmable(major, true)?
-            }
-        };
-        Some((
-            ShaderRecordRef::new(vs_kind, shaders.vs.disk_key()),
-            ShaderRecordRef::new(ps_kind, shaders.ps.disk_key(shaders.variant)),
-        ))
     }
 
     /// Whether a build queued now appends its record to the shader cache.
@@ -1170,6 +1289,20 @@ impl FrameEncoder {
     pub fn wait_for_compiles(&mut self, tickets: &[JobTicket]) {
         let mut wait_ns = 0;
         let timer = NanosSetTimer::start(&raw mut wait_ns);
+        let stolen = self.wait_until_installed(tickets, false);
+        drop(timer);
+        self.perf
+            .compilation_mut()
+            .note_urgent_wait(wait_ns, stolen);
+    }
+
+    /// The body of [`Self::wait_for_compiles`]; answers how many jobs this thread built itself.
+    ///
+    /// With `share`, the oldest urgent jobs, one per idle worker, are left
+    /// to those workers rather than taken back: a submission waiting for
+    /// many builds then has them built side by side. A draw waiting for its
+    /// own builds takes them back first, whichever workers are idle.
+    fn wait_until_installed(&mut self, tickets: &[JobTicket], share: bool) -> u64 {
         let mut stolen = 0u64;
         for &ticket in tickets {
             if self.compile_in_flight.contains_key(&ticket) {
@@ -1182,8 +1315,12 @@ impl FrameEncoder {
         {
             let unstarted = tickets
                 .iter()
-                .find_map(|&ticket| self.compile_queue.steal(ticket).map(|job| (ticket, job)))
-                .or_else(|| self.compile_queue.steal_urgent());
+                .find_map(|&ticket| {
+                    self.compile_queue
+                        .steal(ticket, share)
+                        .map(|job| (ticket, job))
+                })
+                .or_else(|| self.compile_queue.steal_urgent(share));
             if let Some((ticket, job)) = unstarted {
                 stolen += 1;
                 let result = run_job(ticket, job, false);
@@ -1198,10 +1335,7 @@ impl FrameEncoder {
                 break;
             }
         }
-        drop(timer);
-        self.perf
-            .compilation_mut()
-            .note_urgent_wait(wait_ns, stolen);
+        stolen
     }
 
     /// Wait until no build is in flight, before a `Reset` or teardown touches the caches.
@@ -1269,10 +1403,217 @@ impl FrameEncoder {
                 if on_worker && !waited && outcome.handles.is_some() {
                     self.compile_stats.record_async_compile();
                 }
+                let function = outcome.handles.map(|handles| handles.func);
                 self.install_library(outcome);
+                if !self.deferred.pipelines.is_empty() {
+                    self.advance_deferred(|deferred| deferred.on_library(ticket, function));
+                }
             }
-            Outcome::Pipeline(outcome) => self.install_pipeline(*outcome),
+            Outcome::Pipeline(outcome) => {
+                let pipeline = outcome.handle;
+                self.install_pipeline(*outcome);
+                if !self.deferred.pipelines.is_empty() {
+                    self.advance_deferred(|deferred| deferred.on_pipeline(ticket, pipeline));
+                }
+            }
         }
+    }
+
+    /// Bind a placeholder for a draw whose builds are pending, and answer the id it names.
+    ///
+    /// For a draw that may not be left out of its frame: it is encoded
+    /// with the placeholder in place of its pipeline, and the submission
+    /// waits for its builds and binds the real pipeline
+    /// ([`Self::resolve_deferred_draws`]). The jobs it waits for move to
+    /// the urgent lane now, so the workers start them ahead of the builds
+    /// nothing waits for. `state` names what is still building;
+    /// `snapshot` is the draw's pipeline snapshot, whose functions are
+    /// filled in as the libraries land.
+    #[cold]
+    #[inline(never)]
+    pub fn defer_pipeline(
+        &mut self,
+        state: DeferredState<MetalHandle<MTLFunctionKind>, MetalHandle<MTLRenderPipelineStateKind>>,
+        snapshot: &PipelineSnapshot,
+        vertex_attrs: &[VertexAttrDesc],
+        shaders: &ShaderRef<'_>,
+    ) -> DeferredPipelineId {
+        let queue = &self.compile_queue;
+        let program_cache = &self.program_cache;
+        let promote = |ticket: &JobTicket| {
+            queue.promote(*ticket);
+        };
+        match &state {
+            DeferredState::Libraries { vs, ps } => {
+                for slot in [vs, ps] {
+                    if let LibrarySlot::Pending(ticket) = slot {
+                        promote(ticket);
+                    }
+                }
+            }
+            DeferredState::Pipeline(ticket) => promote(ticket),
+            DeferredState::Ready(_) | DeferredState::Failed => {}
+        }
+        let id = self.deferred.pipelines.defer(
+            state,
+            |template| template.snapshot == *snapshot && template.vertex_attrs == vertex_attrs,
+            || DeferredTemplate {
+                snapshot: snapshot.clone(),
+                vertex_attrs: vertex_attrs.to_vec(),
+                identity: pipeline_identity(program_cache, shaders),
+            },
+        );
+        self.perf.compilation_mut().note_deferred_draw();
+        id
+    }
+
+    /// Feed one landed build to the deferred draws and queue the pipelines it completes.
+    ///
+    /// `land` records the outcome. A record whose two libraries are now in
+    /// gets its functions and resolves its pipeline: built, failed, or
+    /// queued, in which case the job goes to the urgent lane at once, so a
+    /// submission waiting on the libraries has its pipelines building
+    /// before it waits on them.
+    #[cold]
+    #[inline(never)]
+    fn advance_deferred(
+        &mut self,
+        land: impl FnOnce(
+            &mut DeferredPipelines<
+                MetalHandle<MTLFunctionKind>,
+                MetalHandle<MTLRenderPipelineStateKind>,
+                DeferredTemplate,
+            >,
+        ),
+    ) {
+        let mut deferred = core::mem::take(&mut self.deferred.pipelines);
+        land(&mut deferred);
+        deferred.advance(|template, vs, ps| {
+            template.snapshot.vs_fn = vs;
+            template.snapshot.ps_fn = ps;
+            self.resolve_recorded_pipeline(template)
+        });
+        self.deferred.pipelines = deferred;
+    }
+
+    /// Resolve the pipeline of a deferred draw whose functions are both known.
+    ///
+    /// A pipeline queued here goes to the urgent lane at once, since the
+    /// submission waits for it.
+    fn resolve_recorded_pipeline(
+        &mut self,
+        template: &DeferredTemplate,
+    ) -> DeferredState<MetalHandle<MTLFunctionKind>, MetalHandle<MTLRenderPipelineStateKind>> {
+        let identity = &template.identity;
+        match self.resolve_pipeline(&template.snapshot, &template.vertex_attrs, None, |_| {
+            identity.copied()
+        }) {
+            Resolution::Ready(pipeline) => DeferredState::Ready(pipeline),
+            Resolution::Pending(ticket) => {
+                self.compile_queue.promote(ticket);
+                DeferredState::Pipeline(ticket)
+            }
+            Resolution::Failed => DeferredState::Failed,
+        }
+    }
+
+    /// Rebuild the pipelines lost with every compile worker, on this thread; fail the rest.
+    ///
+    /// Every worker is gone, and the pending maps forgot the builds they
+    /// had taken (`abandon_lost_builds`). A record whose pipeline was lost
+    /// has its template and both functions, so it resolves its pipeline
+    /// again, which queues a job no worker takes and the wait that follows
+    /// builds inline. A record whose library was lost fails: the draw's
+    /// sources are gone with its frame's scratch. `retried` fails every lost
+    /// record, so a build lost a second time cannot loop.
+    #[cold]
+    #[inline(never)]
+    fn retry_lost_builds(&mut self, lost: &[JobTicket], retried: bool) {
+        let mut deferred = core::mem::take(&mut self.deferred.pipelines);
+        deferred.retry_lost(lost, |template| {
+            if retried {
+                DeferredState::Failed
+            } else {
+                self.resolve_recorded_pipeline(template)
+            }
+        });
+        self.deferred.pipelines = deferred;
+    }
+
+    /// Wait for the builds this submission's placeholders name, and bind the real pipelines.
+    ///
+    /// Called once per submission, after its last pass closed and before
+    /// anything reads the commands: the debug replay of the draw states
+    /// and every pass rule see real handles only. The wait installs each
+    /// library as it lands, which queues the pipelines it completes, so
+    /// the stall is the slowest library plus the slowest pipeline rather
+    /// than their sum over the deferred draws. A draw whose library or
+    /// pipeline failed is removed with its placeholder. A pipeline that
+    /// built queues its no-colour sibling, which nothing waits for, as a
+    /// draw that found it built does. No record survives the call.
+    #[inline]
+    pub fn resolve_deferred_draws(&mut self) {
+        if !self.deferred.pipelines.is_empty() {
+            self.resolve_deferred_draws_pending();
+        }
+    }
+
+    /// The body of [`Self::resolve_deferred_draws`], out of line for the submissions with none.
+    #[cold]
+    #[inline(never)]
+    fn resolve_deferred_draws_pending(&mut self) {
+        let mut wait_ns = 0;
+        let timer = NanosSetTimer::start(&raw mut wait_ns);
+        let mut stolen = 0;
+        let mut retried = false;
+        loop {
+            let tickets = self.deferred.pipelines.pending_tickets();
+            if tickets.is_empty() {
+                break;
+            }
+            stolen += self.wait_until_installed(&tickets, true);
+            // The wait returns once none of `tickets` is in flight, or when
+            // every worker is gone; a ticket a record still names then went
+            // with the workers and can never land.
+            let lost: Vec<JobTicket> = self
+                .deferred
+                .pipelines
+                .pending_tickets()
+                .into_iter()
+                .filter(|ticket| tickets.contains(ticket))
+                .collect();
+            if !lost.is_empty() {
+                self.retry_lost_builds(&lost, retried);
+                retried = true;
+            }
+        }
+        drop(timer);
+        self.perf
+            .compilation_mut()
+            .note_urgent_wait(wait_ns, stolen);
+        let deferred = core::mem::take(&mut self.deferred.pipelines);
+        deferred.for_each_ready(|template, pipeline| {
+            let identity = &template.identity;
+            self.queue_no_color_sibling(
+                &template.snapshot,
+                &template.vertex_attrs,
+                pipeline,
+                |_| identity.copied(),
+            );
+        });
+        let removed = self
+            .pass_state
+            .resolve_pending_pipelines(|id| deferred.answer(id));
+        if removed != 0 {
+            mtld3d_shared::log_once_warn!(
+                target: LOG_TARGET,
+                "draw dropped: its library or pipeline failed to build after the draw was \
+                 encoded, so the submission removed it"
+            );
+        }
+        let mut deferred = deferred;
+        deferred.clear();
+        self.deferred.pipelines = deferred;
     }
 
     fn install_library(&mut self, outcome: LibraryOutcome) {
@@ -1490,4 +1831,49 @@ fn ps_source_tag(source: &PsSource, variant: VariantKey) -> String {
         hash: source.disk_key(variant),
     }
     .tag()
+}
+
+/// The shader identities a pipeline built for `shaders` records.
+///
+/// Computes the two `disk_key` hashes, so it runs only when a pipeline has
+/// to be built or a draw is deferred, never on a pipeline cache hit.
+fn pipeline_identity(
+    program_cache: &FxHashMap<ProgramId, Arc<DxsoProgram>>,
+    shaders: &ShaderRef<'_>,
+) -> PipelineIdentity {
+    PipelineIdentity {
+        shader_refs: pipeline_shader_refs(program_cache, shaders),
+        vs: PairShaderId {
+            is_programmable: matches!(shaders.vs, VsSource::Programmable { .. }),
+            hash: shaders.vs.disk_key(),
+        },
+        ps: PairShaderId {
+            is_programmable: matches!(shaders.ps, PsSource::Programmable { .. }),
+            hash: shaders.ps.disk_key(shaders.variant),
+        },
+    }
+}
+
+fn pipeline_shader_refs(
+    program_cache: &FxHashMap<ProgramId, Arc<DxsoProgram>>,
+    shaders: &ShaderRef<'_>,
+) -> Option<(ShaderRecordRef, ShaderRecordRef)> {
+    let vs_kind = match shaders.vs {
+        VsSource::FixedFunction { .. } => CachedKind::FfVs,
+        VsSource::Programmable { vs_id, .. } => {
+            let major = program_cache.get(vs_id)?.major;
+            CachedKind::from_programmable(major, false)?
+        }
+    };
+    let ps_kind = match shaders.ps {
+        PsSource::FixedFunction { .. } => CachedKind::FfPs,
+        PsSource::Programmable { ps_id, .. } => {
+            let major = program_cache.get(ps_id)?.major;
+            CachedKind::from_programmable(major, true)?
+        }
+    };
+    Some((
+        ShaderRecordRef::new(vs_kind, shaders.vs.disk_key()),
+        ShaderRecordRef::new(ps_kind, shaders.ps.disk_key(shaders.variant)),
+    ))
 }

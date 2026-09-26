@@ -610,10 +610,11 @@ stage: all
 # E2E test environment overrides (the global exports above target the game):
 #   - shaderCache.enable=false  — the on-disk cache would serve stale MSL across
 #     runs, and the suite's processes must not race it.
-#   - shader.asyncCompile=false: a draw whose build is in flight waits for it
-#     instead of being left out of its frame, so a test's first frame shows
-#     every draw it made. The builds still run on the worker threads, which
-#     the waiting encoder steals from, so the suite exercises them either way;
+#   - shader.asyncCompile=false: a draw whose build is in flight is kept in
+#     its frame, whose submission waits for the build, instead of being left
+#     out, so a test's first frame shows every draw it made. The builds still
+#     run on the worker threads, which the waiting encoder steals from, so
+#     the suite exercises them either way;
 #     `async_compile.rs` turns the option on for the frames it leaves out.
 #   - color.hdr.enable=false    the shipped default is on, and it resolves off
 #     the running machine's panel, so leaving it would make the suite take the

@@ -12,7 +12,7 @@ use std::{
 
 use log::{Level, debug, error, log_enabled, trace};
 use mtld3d_core::{
-    async_compile::{ClearHistory, ClearPlanes, JobTicket, TicketSource},
+    async_compile::{ClearHistory, ClearPlanes, DeferredPipelineId, JobTicket, TicketSource},
     buffer_rename::{BufferMapMode, stage_upload_needs_preserve},
     build_index::BuildIndex,
     config::Mtld3dConfig,
@@ -53,13 +53,13 @@ use mtld3d_core::{
     },
 };
 use mtld3d_shared::{
-    BlitCommand, BlitCommandType, BufferCreateDesc, Command, CompileShaderLibraryParams,
-    CopyBufferToBufferInfo, CopyBufferToTextureInfo, CreateBuffersBatchParams,
-    CreateTextureSliceViewParams, CreateTexturesBatchParams, DestroyResourcesBulkParams,
-    EnsureBlitPipelineParams, EnsureClearQuadPipelineParams, ExtraColorDesc, GetTaskFaultsParams,
-    MetalHandle, PassDescriptor, SetDisplaySyncEnabledParams, SetGammaRampParams,
-    SetPresentWaitPolicyParams, SubmitFrameParams, TextureCreateDesc, WaitForGpuRetireParams,
-    WaitForPresentIdleParams,
+    BlitCommand, BlitCommandType, BufferCreateDesc, Command, CommandType,
+    CompileShaderLibraryParams, CopyBufferToBufferInfo, CopyBufferToTextureInfo,
+    CreateBuffersBatchParams, CreateTextureSliceViewParams, CreateTexturesBatchParams,
+    DestroyResourcesBulkParams, EnsureBlitPipelineParams, EnsureClearQuadPipelineParams,
+    ExtraColorDesc, GetTaskFaultsParams, MetalHandle, PassDescriptor, SetDisplaySyncEnabledParams,
+    SetGammaRampParams, SetPresentWaitPolicyParams, SubmitFrameParams, TextureCreateDesc,
+    WaitForGpuRetireParams, WaitForPresentIdleParams,
     mtl::{
         BufferKind, ClearQuadFlags, CullMode, DestroyKind, LoadAction, PRESENT_PIPELINE_DEPTH,
         PixelFormat, PresentWaitPolicy, PrimitiveType, QuadPipelineKind, SnapshotFlags, StageTag,
@@ -878,7 +878,7 @@ bitflags::bitflags! {
         ///
         /// A draw whose build is in flight may then be left out of its frame
         /// (`FrameEncoder::skip_pending_draw`); without it every such draw
-        /// waits for its build.
+        /// is kept, and its submission waits for its build.
         const ASYNC_COMPILE = 1 << 4;
     }
 }
@@ -1321,6 +1321,13 @@ pub struct FrameEncoder {
     /// Tickets of the builds queued or running, with the TSC reading at their enqueue.
     compile_in_flight: FxHashMap<JobTicket, u64>,
     compile_tickets: TicketSource,
+    /// The draws of the submission being encoded that bound a placeholder pipeline.
+    ///
+    /// Filled by draws whose builds are pending and that may not be left
+    /// out; emptied by `resolve_deferred_draws` in `finalize_submit`, which
+    /// waits for their builds and binds the real pipelines, so it is empty
+    /// between submissions.
+    deferred: Box<compile::DeferredDraws>,
     /// Per attachment plane, the recent presented frames a whole-target `Clear` reached it in.
     ///
     /// Read by `skip_pending_draw`: a draw may be left out while its build is
@@ -1768,6 +1775,7 @@ impl FrameEncoder {
             pending_libs: FxHashMap::default(),
             pending_pipelines: FxHashMap::default(),
             compile_in_flight: FxHashMap::default(),
+            deferred: Box::new(compile::DeferredDraws::new()),
             compile_tickets: TicketSource::new(),
             cleared_targets: ClearHistory::new(),
             current_snapshot: None,
@@ -2486,6 +2494,12 @@ impl FrameEncoder {
     }
 
     fn begin_frame(&mut self, frame: &FrameData) {
+        // Every submission resolves its placeholders, so none names a
+        // record of an earlier one.
+        debug_assert!(
+            self.deferred.is_empty(),
+            "a deferred draw outlived its submission"
+        );
         self.reset_bound_constants();
         self.scratch.clear();
         // Cached const-slice pointers alias the previous frame's
@@ -9710,6 +9724,10 @@ fn finalize_submit(enc: &mut FrameEncoder, frame: &FrameData) -> (SubmitFramePar
     // whatever is open.
     enc.pass_state.flush_pending_clears();
     enc.end_current_pass("submit");
+    // Before anything reads the commands: the debug replay below and every
+    // pass rule see real pipeline handles, and the draws of a failed build
+    // are already gone.
+    enc.resolve_deferred_draws();
     // The frame's slot array retires with this submit, so a span still open
     // (a readback flush between BEGIN and END, or a query held across
     // Present) contributes what it has counted so far and is reopened
@@ -9904,6 +9922,15 @@ fn pass_to_descriptor(
     p: &Pass,
     visibility_buffer_handle: MetalHandle<MTLBufferKind>,
 ) -> PassDescriptor {
+    // The unix side resolves every pipeline bind to a retained object, so a
+    // placeholder reaching it would be a dangling pointer.
+    debug_assert!(
+        !p.commands()
+            .iter()
+            .any(|c| c.cmd == CommandType::SetRenderPipelineState as u32
+                && DeferredPipelineId::is_placeholder(c.param_b)),
+        "a placeholder pipeline bind reached a pass descriptor"
+    );
     let color_load_action = match p.color_load() {
         ColorLoad::Load => LoadAction::Load,
         ColorLoad::Clear { .. } => LoadAction::Clear,

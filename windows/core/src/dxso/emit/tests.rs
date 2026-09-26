@@ -5342,3 +5342,25 @@ fn ff_disabled_alpha_keeping_the_register_alpha_compiles() {
     key.stages[1].set_result(FfStageResult::Temp);
     metal_compile_or_fail(&emit_ps_ff(&key, VariantKey::default()));
 }
+
+/// A pixel shader reading `oDepth` as a source parses, and the emitter rejects it.
+///
+/// The end-to-end suite draws this shader as the one whose library fails to
+/// build, so the parser must keep accepting it.
+#[test]
+fn a_ps_reading_its_depth_output_parses_but_does_not_emit() {
+    const TYPE_DEPTHOUT: u32 = 9;
+    let bytecode = [
+        PS_HEADER,
+        opcode_token(OP_MOV, 2),
+        dst_token(TYPE_COLOROUT, 0, 0xF, false),
+        src_token(TYPE_DEPTHOUT, 0, SWIZ_IDENTITY, 0),
+        END_TOKEN,
+    ];
+    assert_eq!(
+        bytecode[3], 0x90E4_0800,
+        "the token the end-to-end suite spells out"
+    );
+    let ps = parse(&bytecode).expect("the parser accepts a depth-output source");
+    assert!(emit_ps_programmable(&ps, VariantKey::default()).is_err());
+}

@@ -128,9 +128,9 @@ pub struct Mtld3dConfig {
     /// Build first-seen shader libraries and render pipelines on worker threads.
     ///
     /// A draw whose build is still in flight is left out of the frame when
-    /// its target is the back buffer or was cleared earlier in the frame, and
-    /// waited for otherwise. `false` waits for every build, as a synchronous
-    /// compile would. Default: `true`. File key: `shader.asyncCompile`.
+    /// every target it depends on is rebuilt every frame, and kept otherwise,
+    /// its submission waiting for the build. `false` keeps every such draw.
+    /// Default: `true`. File key: `shader.asyncCompile`.
     pub shader_async_compile: bool,
     /// Directory the process's log file and GPU traces go into.
     ///
