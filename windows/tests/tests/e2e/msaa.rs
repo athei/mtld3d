@@ -562,9 +562,6 @@ fn a_multisampled_device_releases_after_an_srgb_write_present() {
             "sRGB write on (round {round})"
         );
         for frame in 0..FRAMES {
-            // Not `render_once`: each round's window posts `WM_QUIT` to the
-            // thread queue as it is destroyed, which the pump inside it reads
-            // as the end of the run. Nothing here needs a pumped queue.
             assert_eq!(
                 h.begin_scene(),
                 0,

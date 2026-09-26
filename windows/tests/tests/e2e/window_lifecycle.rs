@@ -9,11 +9,13 @@
 //! times over, so that a rule the layer's attach and detach break shows up
 //! here rather than as a rare death of a whole-suite run.
 //!
-//! Every round runs on a thread of its own, as every test of the suite does:
-//! the harness window's `WM_DESTROY` posts `WM_QUIT` to its thread's queue,
-//! so a thread that destroyed one window cannot render on the next.
+//! Every round runs on a thread of its own, as every test of the suite does.
+//! One thread can also render through harness after harness: a window the
+//! harness destroys leaves no `WM_QUIT` behind for the next one to pump.
 
-use mtld3d_tests::{Harness, HarnessConfig, WindowStyle, spawn_scoped};
+use mtld3d_tests::{
+    Harness, HarnessConfig, WindowStyle, assert_pixel_eq, post_quit_message, spawn_scoped,
+};
 
 /// Lanes creating and destroying at once.
 const LANES: usize = 6;
@@ -47,4 +49,52 @@ fn devices_and_windows_come_and_go_on_several_threads_at_once() {
             });
         }
     });
+}
+
+/// A thread that dropped a harness renders on the next one it creates.
+///
+/// Dropping the first harness releases its device and destroys its window on
+/// this thread, whose window procedure answers `WM_DESTROY` with a quit; the
+/// second harness pumps the same queue before its first frame and must find
+/// no quit there.
+#[test]
+fn a_thread_renders_on_a_second_harness_after_dropping_the_first() {
+    const RED: u32 = 0xFFFF_0000;
+    const BLUE: u32 = 0xFF00_00FF;
+
+    let first = Harness::new();
+    first.render_once(RED, |_| {});
+    assert_pixel_eq(first.read_pixel(1, 1), RED, "first harness");
+    drop(first);
+
+    let second = Harness::new();
+    second.render_once(BLUE, |_| {});
+    assert_pixel_eq(
+        second.read_pixel(1, 1),
+        BLUE,
+        "second harness on the same thread",
+    );
+}
+
+/// A quit posted before a harness is dropped still ends the next pump on that thread.
+///
+/// The window destruction takes back only the quit it posted itself, so a
+/// quit that was already pending reaches the next harness's pump, which
+/// removes it, and the frame after that renders.
+#[test]
+fn a_quit_pending_before_a_harness_drop_reaches_the_next_pump() {
+    const GREEN: u32 = 0xFF00_FF00;
+
+    let first = Harness::new();
+    post_quit_message();
+    drop(first);
+
+    let second = Harness::new();
+    assert!(!second.pump(), "the pending quit reaches the pump");
+    second.render_once(GREEN, |_| {});
+    assert_pixel_eq(
+        second.read_pixel(1, 1),
+        GREEN,
+        "second harness after the quit",
+    );
 }

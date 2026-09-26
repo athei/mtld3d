@@ -64,8 +64,7 @@ fn two_live_devices_present_independently() {
         "second device beside the first",
     );
 
-    // The window outlives the device it served: destroying it here would post
-    // WM_QUIT into the thread queue the other devices then pump.
+    // The window outlives the device it served.
     assert_eq!(
         first.release_device(),
         0,

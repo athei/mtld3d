@@ -143,6 +143,10 @@ pub struct Msg {
 
 const WM_DESTROY: u32 = 0x0002;
 const WM_QUIT: u32 = 0x0012;
+/// `PM_NOREMOVE`: `PeekMessageA` leaves the message it finds in the queue.
+const PM_NOREMOVE: u32 = 0;
+/// `PM_REMOVE`: `PeekMessageA` takes the message it finds out of the queue.
+const PM_REMOVE: u32 = 1;
 const CW_USEDEFAULT: i32 = 0x8000_0000_u32.cast_signed();
 /// `WS_OVERLAPPEDWINDOW` — a normal framed window, initially hidden.
 const WS_OVERLAPPEDWINDOW: u32 = 0x00CF_0000;
@@ -172,6 +176,8 @@ pub enum WindowStyle {
 
 extern "system" fn wnd_proc(hwnd: usize, msg: u32, wparam: usize, lparam: isize) -> isize {
     if msg == WM_DESTROY {
+        // A window that `destroy_window` destroys takes this quit back out, so
+        // only a window destroyed from outside the harness ends the pump.
         // SAFETY: Win32 message-loop thunk with no preconditions.
         unsafe { PostQuitMessage(0) };
         return 0;
@@ -598,25 +604,45 @@ pub fn dc_set_pixel(hdc: usize, x: i32, y: i32, color: u32) -> u32 {
 /// time, they cannot.
 static DESTROY_WINDOW: Mutex<()> = Mutex::new(());
 
-/// Destroy a window created by [`create_window`].
+/// Destroy a window created by [`create_window`], leaving no `WM_QUIT` of its own behind.
+///
+/// The window procedure answers `WM_DESTROY` with `PostQuitMessage`, so a
+/// window destroyed from outside the harness ends the next
+/// [`Harness::pump`](crate::Harness::pump) on its thread. A window destroyed
+/// here takes that quit back out of the calling thread's queue, or the next
+/// window the thread creates would read it as the end of the run. A quit that
+/// was pending before the call stays pending: this destruction did not post
+/// it, and the pump still has to see it.
 ///
 /// # Panics
 ///
 /// Panics if the call fails, which for a window this process created means
 /// the handle is already destroyed.
 pub fn destroy_window(hwnd: usize) {
-    let _one_at_a_time = DESTROY_WINDOW
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner);
-    // SAFETY: Win32 thunk; `hwnd` is a window this process created.
-    let ret = unsafe { DestroyWindow(hwnd) };
-    assert!(ret != 0, "DestroyWindow failed");
+    let quit_was_pending = peek_quit(PM_NOREMOVE);
+    {
+        let _one_at_a_time = DESTROY_WINDOW
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        // SAFETY: Win32 thunk; `hwnd` is a window this process created.
+        let ret = unsafe { DestroyWindow(hwnd) };
+        assert!(ret != 0, "DestroyWindow failed");
+    }
+    if !quit_was_pending {
+        peek_quit(PM_REMOVE);
+    }
+}
+
+/// Post `WM_QUIT` to the calling thread's queue, as a window procedure does.
+pub fn post_quit_message() {
+    // SAFETY: Win32 thunk with no preconditions.
+    unsafe { PostQuitMessage(0) };
 }
 
 /// Drain the message queue. Returns `false` once `WM_QUIT` is seen.
 pub fn pump_messages(msg: &mut Msg) -> bool {
     // SAFETY: Win32 thunk; `msg` is a valid &mut MSG, hwnd 0 pumps the thread queue.
-    while unsafe { PeekMessageA(msg, 0, 0, 0, 1) } != 0 {
+    while unsafe { PeekMessageA(msg, 0, 0, 0, PM_REMOVE) } != 0 {
         if msg.message == WM_QUIT {
             return false;
         }
@@ -665,4 +691,12 @@ pub fn capture_mouse(hwnd: usize, captured: bool) -> usize {
 pub fn foreground_window(hwnd: usize) -> bool {
     // SAFETY: the harness owns the live window handle.
     unsafe { SetForegroundWindow(hwnd) != 0 }
+}
+
+/// Whether the calling thread's queue holds a `WM_QUIT`, taken out when `remove` is `PM_REMOVE`.
+fn peek_quit(remove: u32) -> bool {
+    let mut msg = zeroed_msg();
+    // SAFETY: Win32 thunk; `msg` is a valid &mut MSG, and hwnd 0 with a
+    // `WM_QUIT`-only filter peeks the thread queue's quit message alone.
+    unsafe { PeekMessageA(&raw mut msg, 0, WM_QUIT, WM_QUIT, remove) != 0 }
 }
