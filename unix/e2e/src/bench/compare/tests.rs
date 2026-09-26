@@ -1260,3 +1260,60 @@ fn only_a_benchmark_that_declares_its_frame_needs_a_shape_run() {
         "{reason}"
     );
 }
+
+#[test]
+fn a_time_of_a_few_printed_steps_needs_more_than_one_step_to_move() {
+    // The A/A case: perf.submit_commit_ms read 0.005 ms in the base and
+    // 0.004 ms in the candidate on every pair, -20 % at a sigma of zero,
+    // one step of the perf-kv line's three decimals apart.
+    let spec = "ms lower time";
+    let row = judge(
+        "perf.submit_commit_ms",
+        &def(spec),
+        &[0.005; 5],
+        &[0.004; 5],
+        false,
+    );
+    assert_eq!(row.verdict, Verdict::Neutral);
+    assert!(
+        row.change.contains("within five steps of 0.001"),
+        "{}",
+        row.change
+    );
+    assert_eq!(
+        verdict_of("perf.submit_commit_ms", spec, &[0.004; 5], &[0.005; 5]),
+        Verdict::Neutral
+    );
+    // Exactly five steps is within it, whatever the subtraction rounds to.
+    assert_eq!(
+        verdict_of("perf.submit_commit_ms", spec, &[0.006; 5], &[0.011; 5]),
+        Verdict::Neutral
+    );
+    // Past the floor both ways.
+    assert_eq!(
+        verdict_of("perf.submit_commit_ms", spec, &[0.005; 5], &[0.011; 5]),
+        Verdict::Regression
+    );
+    assert_eq!(
+        verdict_of("perf.submit_commit_ms", spec, &[0.011; 5], &[0.005; 5]),
+        Verdict::Improvement
+    );
+    // A benchmark's own time has four decimals, so its floor is a tenth of that.
+    assert_eq!(
+        verdict_of("frame.p50", spec, &[0.1340; 5], &[0.1400; 5]),
+        Verdict::Regression
+    );
+}
+
+#[test]
+fn the_time_step_follows_the_unit_and_the_source() {
+    assert_eq!(time_step("perf.api_outside_ms", &Unit::Ms), Some(0.001));
+    assert_eq!(time_step("frame.p50", &Unit::Ms), Some(0.0001));
+    assert_eq!(time_step("emit.us_per_shader", &Unit::Us), Some(0.001));
+    assert_eq!(time_step("ns_per_call.draw_clean", &Unit::Ns), Some(0.1));
+    assert_eq!(time_step("fps", &Unit::Count), None);
+    assert!(!past_floor(0.011 - 0.006, 0.001));
+    assert!(past_floor(0.012 - 0.006, 0.001));
+    assert!(!past_floor(-0.005, 0.001));
+    assert!(past_floor(-0.006, 0.001));
+}

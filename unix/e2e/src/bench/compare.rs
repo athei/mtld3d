@@ -10,7 +10,10 @@
 //!   median ratio above `1 + max(T, 3 sigma)`, sigma being 1.4826 times the
 //!   MAD of the finite ratios, with at least 80 % of the pairs worse. `T` is
 //!   8 % for a tail percentile (a name with `p99`), which moves more between
-//!   runs, and 3 % otherwise. An improvement is the mirror image. A metric
+//!   runs, and 3 % otherwise. An improvement is the mirror image. A `time`
+//!   metric's median difference must also exceed five steps of the
+//!   resolution its value is printed with ([`time_step`]), since a value of
+//!   a few steps moves by tens of percent when it crosses one. A metric
 //!   whose base median is zero has no ratio and is judged by its median
 //!   difference against a small absolute floor instead.
 //! - `bytes`: the same with `T` at 3 % whatever the name, and the median
@@ -66,6 +69,24 @@ const SPIKE_FLOOR: f64 = 2.0;
 
 /// The floor of a zero-base difference in a time: 0.1 ms, in the metric's own unit.
 const ZERO_BASE_FLOOR_MS: f64 = 0.1;
+
+/// How many steps of its printed resolution a `time` metric's median difference has to clear.
+const RESOLUTION_STEPS: f64 = 5.0;
+
+/// The step of a `perf.*` time in ms: the layer's `perf-kv` line prints three decimals.
+const PERF_MS_STEP: f64 = 0.001;
+
+/// The step of a benchmark's own time in ms: `Value::Ms` prints four decimals.
+const MS_STEP: f64 = 0.0001;
+
+/// The step of a time in us: the host emitter benchmark prints three decimals.
+const US_STEP: f64 = 0.001;
+
+/// The step of a time in ns: `Value::Ns` prints one decimal.
+const NS_STEP: f64 = 0.1;
+
+/// The prefix of the metrics a benchmark copies from the layer's `perf-kv` line.
+const PERF_PREFIX: &str = "perf.";
 
 /// The meta keys every metrics file has to carry for the sanity checks.
 const REQUIRED_META: [&str; 5] = [
@@ -1128,6 +1149,23 @@ pub fn judge(name: &str, definition: &Metric, base: &[f64], cand: &[f64], accept
             let mut improved = center < 1.0 - threshold && most(better, ratios.len());
             row.change = format!("{:+.2}%", (center - 1.0) * 100.0);
             row.noise = format!("sigma {:.2}%", sigma * 100.0);
+            if definition.class == Class::Time
+                && let Some(step) = time_step(name, &definition.unit)
+            {
+                let delta = median(&worse_by);
+                let past = past_floor(delta, step);
+                if (regressed || improved) && !past {
+                    let _ = write!(
+                        row.change,
+                        " ({:+} {}, within five steps of {})",
+                        number(delta),
+                        definition.unit.as_str(),
+                        number(step)
+                    );
+                }
+                regressed &= past && delta > 0.0;
+                improved &= past && delta < 0.0;
+            }
             if definition.class == Class::Bytes {
                 let delta = median(&worse_by);
                 let min = definition.unit.four_mib().unwrap_or(0.0);
@@ -1201,6 +1239,37 @@ fn zero_base_floor(unit: &Unit) -> f64 {
         Unit::Ratio => RATIO_FLOOR,
         Unit::Mib | Unit::Bytes => unit.four_mib().unwrap_or_default(),
     }
+}
+
+/// The resolution a `time` metric's value is printed with, in its own unit; `None` for no time.
+///
+/// A `time` metric's median difference has to exceed five of these steps
+/// ([`past_floor`]), so that a value only a few steps large cannot pass the
+/// ratio rule by crossing one step: a `perf-kv` time of 0.005 ms that reads
+/// 0.004 ms in the candidate is 20 % better and one step apart. The
+/// `perf.*` times come from that line, three decimals of a millisecond, so
+/// their step is 0.001 ms; a benchmark's own times in ms have four decimals
+/// (0.0001 ms), the host emitter's in us three (0.001 us) and the times in
+/// ns one (0.1 ns).
+#[must_use]
+pub fn time_step(name: &str, unit: &Unit) -> Option<f64> {
+    match unit {
+        Unit::Ms if name.starts_with(PERF_PREFIX) => Some(PERF_MS_STEP),
+        Unit::Ms => Some(MS_STEP),
+        Unit::Us => Some(US_STEP),
+        Unit::Ns => Some(NS_STEP),
+        Unit::Count | Unit::Mib | Unit::Bytes | Unit::Ratio => None,
+    }
+}
+
+/// Whether the difference `delta` is more than five steps of `step`, counted in whole steps.
+///
+/// The difference is rounded to the nearest step before it is compared, so
+/// one printed as exactly five steps stays within the floor however the
+/// subtraction rounds: 0.011 - 0.006 is 0.005000000000000001.
+#[must_use]
+pub fn past_floor(delta: f64, step: f64) -> bool {
+    (delta.abs() / step).round() > RESOLUTION_STEPS
 }
 
 /// `numerator / denominator`, with two zeros equal and a zero denominator infinitely worse.
