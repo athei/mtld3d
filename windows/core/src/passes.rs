@@ -1207,6 +1207,11 @@ impl Pass {
     pub const fn depth_texture(&self) -> MetalHandle<MTLTextureKind> {
         self.depth_texture
     }
+    /// Whether a draw or clear-quad in the pass can write its stencil plane.
+    #[must_use]
+    pub const fn writes_stencil(&self) -> bool {
+        self.depth_flags.contains(PassDepthFlags::STENCIL_WRITTEN)
+    }
     /// Mip level of `depth_texture` the pass renders depth into.
     #[must_use]
     pub const fn depth_level(&self) -> u32 {
