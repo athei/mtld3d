@@ -144,3 +144,20 @@ fn layout_stride_widens_below_the_consumed_extent() {
     // Zero is the declaration extent for the inline (UP) path.
     assert_eq!(layout_stride(0, 28), 28);
 }
+
+#[test]
+fn expand_short_stride_overlaps_the_next_vertex() {
+    use super::expand_short_stride;
+
+    // Three 4-byte vertices. An attribute that ends at byte 6 of each vertex
+    // reads two bytes into the next one; the last vertex has none left.
+    let src = [0_u8, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
+    assert_eq!(
+        expand_short_stride(&src, 4, 6),
+        vec![0, 1, 2, 3, 4, 5, 4, 5, 6, 7, 8, 9, 8, 9, 10, 11, 0, 0]
+    );
+    // Nothing to widen, or no source: the caller keeps the original bytes.
+    assert!(expand_short_stride(&src, 4, 4).is_empty());
+    assert!(expand_short_stride(&src, 0, 6).is_empty());
+    assert!(expand_short_stride(&[], 4, 6).is_empty());
+}

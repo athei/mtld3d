@@ -149,9 +149,10 @@ pub const fn instanced_stream_read_bytes(
 /// vertex struct carries fields past them). A zero stride returns the extent:
 /// the inline (UP) path has no other span, and [`bound_stream_layout`] pairs it
 /// with a `Constant` step. A non-zero stride smaller than the consumed extent
-/// means the shader reads an attribute past the end of each vertex, which
-/// Metal rejects as a pipeline, so the layout is widened to the extent with a
-/// warning; the affected draw fetches wrong data either way.
+/// is not a legal Metal layout: an attribute would extend past the step. The
+/// layout is widened to the extent, and the draw copies each vertex out to
+/// that step with [`expand_short_stride`] so the fetch still addresses
+/// `base + index * app_stride + attribute_offset`.
 #[must_use]
 pub fn layout_stride(app_stride: u32, extent: u32) -> u32 {
     if app_stride == 0 {
@@ -164,6 +165,46 @@ pub fn layout_stride(app_stride: u32, extent: u32) -> u32 {
         return extent;
     }
     app_stride
+}
+
+/// Copy a short-stride vertex buffer out to the widened layout step.
+///
+/// Vertex `i` is addressed at `i * stride`. An attribute whose declaration
+/// extends past that stride still reads `base + i * stride + offset`, which
+/// crosses into the next vertex. Metal rejects that descriptor, and
+/// [`layout_stride`] therefore steps by `extent`. Slot `i` of the returned
+/// buffer holds the `extent` bytes at source offset `i * stride`, zero where
+/// the source ends first, so the widened step fetches those bytes.
+///
+/// `stride` must be non-zero and less than `extent`. Otherwise there is
+/// nothing to widen and the function returns an empty buffer. An empty
+/// source, or a product of vertex count and `extent` that overflows, does
+/// the same.
+#[must_use]
+pub fn expand_short_stride(src: &[u8], stride: u32, extent: u32) -> Vec<u8> {
+    let Some(stride_us) = usize::try_from(stride).ok().filter(|s| *s > 0) else {
+        return Vec::new();
+    };
+    let Some(extent_us) = usize::try_from(extent).ok().filter(|e| *e > stride_us) else {
+        return Vec::new();
+    };
+    if src.is_empty() {
+        return Vec::new();
+    }
+    let verts = src.len() / stride_us;
+    let Some(bytes) = verts.checked_mul(extent_us) else {
+        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+            "short-stride expand overflowed: {verts} vertices x {extent} bytes"
+        );
+        return Vec::new();
+    };
+    let mut dst = vec![0_u8; bytes];
+    for i in 0..verts {
+        let src_off = i * stride_us;
+        let n = extent_us.min(src.len() - src_off);
+        dst[i * extent_us..i * extent_us + n].copy_from_slice(&src[src_off..src_off + n]);
+    }
+    dst
 }
 
 /// The vertex buffer layout of a stream with a vertex buffer bound.
