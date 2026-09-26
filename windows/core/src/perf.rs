@@ -68,6 +68,7 @@ use super::passes::Pass;
 use super::passes::{ColorLoad, DepthLoad};
 
 pub mod compilation;
+pub mod window_line;
 
 /// Window length for the averaged `mtld3d::perf=debug` summary.
 ///

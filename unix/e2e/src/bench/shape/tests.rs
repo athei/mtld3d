@@ -454,7 +454,7 @@ fn the_shape_run_keeps_the_identity_lines_and_the_pass_trace() {
         level_for(SHAPE_RUST_LOG, "mtld3d::d3d9::passes"),
         Some("trace")
     );
-    assert_eq!(level_for(SHAPE_RUST_LOG, "mtld3d::perf"), Some("warn"));
+    assert_eq!(level_for(SHAPE_RUST_LOG, "mtld3d::perf"), Some("info"));
     assert_eq!(level_for(SHAPE_RUST_LOG, "mtld3d::core"), Some("warn"));
 }
 

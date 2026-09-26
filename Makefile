@@ -1160,9 +1160,9 @@ bench: install-windows-$(ARCH) install-unix-$(SDK_UNIX_ARCH)
 # `.codex/evidence/bench-ab` in the main checkout, so the results outlive the
 # worktree that made them). After its timed rounds every benchmark whose
 # metrics declare `shape` lines runs once more per leg with the pass trace on
-# (the rest of the layer at warn but for the lines that name its build,
-# `shape.rs` has the filter), untimed and stopped once its log holds the
-# steady submissions, into
+# (the rest of the layer at warn but for the lines that name its build and
+# the perf windows, `shape.rs` has the filter), untimed and stopped once its
+# log holds the steady submissions, into
 # `<leg>/shape/`, and the report compares the passes and load/store decisions
 # of its steady submission between the legs; a difference fails the run
 # unless ACCEPT names `shape` or `shape:<bench>`. Exit 1 is a regression

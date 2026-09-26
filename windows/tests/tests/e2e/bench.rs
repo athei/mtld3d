@@ -23,28 +23,33 @@
 //! `Present` return to the next `Present` call, the API thread's own work on
 //! the frame, which tells a frame bound by the API thread from one bound
 //! behind `Present`. Each benchmark also samples the process's address space
-//! after its warm-up and at the end of its measured frames, and its peak
-//! working set.
+//! before it creates its interface, after its warm-up and at the end of its
+//! measured frames, and its peak working set; what it adds since the first
+//! sample is what a comparison judges ([`Metrics::memory`]).
 //!
 //! The measured frames start where a perf window opens and last one window
-//! ([`MEASURED_SPAN`]), so a `PERF=1` build's metrics come from one whole
-//! window with no warm-up frame in it, covering approximately the measured
-//! frames: the span starts when the window's opening shows in the log, a
-//! poll and the log thread's latency after it, and a frame floor can make
-//! it outlast the window. The layer opens a device's
-//! first window at its first frame and closes each after two seconds, so
-//! after its warm-up a benchmark runs unmeasured frames until the log shows
-//! the `perf-kv` line that closes the window the warm-up began in
-//! ([`LayerLog::start_span`]), measures from there, and after the span runs
+//! ([`SpanStart::length`]), so a `PERF=1` build's metrics come from one
+//! whole window with no warm-up frame in it, covering approximately the
+//! measured frames: the span starts when the window's opening shows in the
+//! log, a poll and the log thread's latency after it, and a frame floor can
+//! make it outlast the window. The layer opens a device's first window at
+//! its first frame and closes each after its interval, so after its warm-up
+//! a benchmark runs unmeasured frames until the log shows the grid of the
+//! window the warm-up began in ([`LayerLog::start_span`]), measures from
+//! there for as long as that window lasted, and after the span runs
 //! unmeasured frames again until the window it measured has written its own
-//! line ([`SpanStart::end`]). A log that already holds perf windows is
-//! waited on for up to two windows, and a line that does not come then fails
-//! the benchmark, since a round without its window would lack the metrics
-//! the others carry. A log with none two windows and a grace after the first
-//! frame belongs to a build that writes none (or a run whose filter hides
-//! them), which then measures the same length from wherever the wait stopped.
+//! ([`SpanStart::end`]). The length is read from the log, the `perf-kv`
+//! line's `window_s` or the grid header's `window=`, not from this binary's
+//! own layer build: `make bench-ab` runs this binary against a base whose
+//! windows may be longer (5 s before they became 2 s). A log that already
+//! holds perf windows is waited on for up to two of its windows, and one
+//! that does not close then fails the benchmark, since a round without its
+//! window would lack the metrics the others carry. A log with none
+//! [`NO_WINDOW_WAIT`] after the first frame belongs to a build that writes
+//! none (or a run whose filter hides them), which then measures
+//! [`PERF_WINDOW`] from wherever the wait stopped.
 
-use core::fmt::Write as _;
+use core::{cell::OnceCell, fmt::Write as _};
 use std::{
     collections::BTreeMap,
     fs,
@@ -79,26 +84,33 @@ const COMMON_META: [&str; 11] = [
 /// Back-to-back counter reads whose smallest nonzero step [`TscClock`] reports as its granularity.
 const GRANULARITY_READS: u32 = 100_000;
 
-/// How long one perf window of the layer lasts, the one number both sides read.
+/// The interval of this binary's own layer build, the span of a run with no window to align to.
+///
+/// A run with windows measures the length its log's windows have, which a
+/// base build of `make bench-ab` may have set otherwise. At the frame rates
+/// the frame benchmarks run (0.8 ms a frame or less) 2 s is 2500 frames or
+/// more, 25 in their p99's tail; `api_call_cost`, whose rounds take about
+/// 35 ms, gets about 57 rounds, a sample of every call kind each, where its
+/// median needs 15.
 pub const PERF_WINDOW: Duration = Duration::from_secs(mtld3d_core::perf::SUMMARY_INTERVAL_SECS);
 
-/// How long a benchmark's measured frames last at least: one perf window.
-///
-/// Started where a window opens ([`LayerLog::start_span`]), the span holds
-/// that one window whole and approximately no more. At the frame rates the
-/// frame benchmarks run (0.8 ms a frame or less) it is 2500 frames or more,
-/// 25 in their p99's tail; `api_call_cost`, whose rounds take about 35 ms,
-/// gets about 57 rounds, a sample of every call kind each, where its median
-/// needs 15.
-pub const MEASURED_SPAN: Duration = PERF_WINDOW;
+/// The longest window a layer build has written: 5 s, the interval before it became 2 s.
+const LONGEST_WINDOW: Duration = Duration::from_secs(5);
 
-/// How long a window's `perf-kv` line may take past its due time before a wait counts it late.
+/// How long a window's lines may take past its due time before a wait counts them late.
 ///
 /// The encoder closes a window at the end of the first frame past its
-/// length and the log thread writes the line a moment later. A wait allows
+/// length and the log thread writes the lines a moment later. A wait allows
 /// a whole window on top of this before it gives up (see
 /// [`LayerLog::start_span`]).
 const WINDOW_GRACE: Duration = Duration::from_secs(1);
+
+/// How long after its first frame a log with no perf window counts as one whose build writes none.
+///
+/// Past the longest window any build has written and two graces, so a
+/// build's first window, however long, has closed and been written by then.
+pub const NO_WINDOW_WAIT: Duration =
+    Duration::from_secs(LONGEST_WINDOW.as_secs() + 2 * WINDOW_GRACE.as_secs());
 
 /// How often a wait for a perf window reads what the layer log has gained.
 const LOG_POLL: Duration = Duration::from_millis(10);
@@ -549,49 +561,63 @@ impl LayerLog {
     /// `started` is the counter reading taken before the warm-up's first
     /// frame, the frame that opened the device's first window. `frame`
     /// renders and presents one frame the benchmark does not time. The
-    /// wait ends at the first `perf-kv` line written after the call: the
+    /// wait ends at the first window grid written after the call: the
     /// window it closes held the warm-up, the one that opens with it holds
-    /// none. With no such line two windows and [`WINDOW_GRACE`] after
-    /// `started` and none anywhere in the log, the build writes no perf
-    /// windows (or the run's filter hides them), and the span starts where
-    /// the wait stopped, with nothing to align to. The span's start is
-    /// announced on stdout ([`MEASURING`]).
+    /// none, and its length is the span's. With no perf window in the log
+    /// at all [`NO_WINDOW_WAIT`] after `started`, the build writes none (or
+    /// the run's filter hides them), and the span starts where the wait
+    /// stopped, [`PERF_WINDOW`] long, with nothing to align to. The span's
+    /// start is announced on stdout ([`MEASURING`]).
     ///
     /// # Panics
     ///
-    /// Panics when the log holds perf windows and none closes within two
-    /// windows and the grace of the warm-up's end: a round of a `PERF=1`
-    /// build without its window would lack the `perf.*` metrics its other
-    /// rounds carry, which a comparison cannot pair.
+    /// Panics when the log holds perf windows from before the call and none
+    /// closes within two of their length and [`WINDOW_GRACE`] after the
+    /// warm-up: a round of a `PERF=1` build without its window would lack the
+    /// `perf.*` metrics its other rounds carry, which a comparison cannot
+    /// pair.
     pub fn start_span(&self, started: u64, mut frame: impl FnMut()) -> SpanStart {
         let mut watch = WindowWatch::new(self, self.mark());
         let warmed = TscClock::now();
-        let limit = PERF_WINDOW * 2 + WINDOW_GRACE;
+        let prior = watch.prior_length();
         let start = loop {
             if watch.look() > 0 {
                 break SpanStart {
                     from: watch.last_end,
+                    length: watch.length.unwrap_or(PERF_WINDOW),
                     aligned: true,
                 };
             }
-            if TscClock::since(started) > limit && !watch.log_has_windows() {
-                break SpanStart {
-                    from: self.mark(),
-                    aligned: false,
-                };
+            match prior {
+                Some(length) => {
+                    let limit = length * 2 + WINDOW_GRACE;
+                    assert!(
+                        TscClock::since(warmed) <= limit,
+                        "no perf window closed in {limit:?} after the warm-up, though the layer \
+                         log {} holds {length:?} windows",
+                        self.shown()
+                    );
+                }
+                None if TscClock::since(started) > NO_WINDOW_WAIT => {
+                    break SpanStart {
+                        from: self.mark(),
+                        length: PERF_WINDOW,
+                        aligned: false,
+                    };
+                }
+                None => {}
             }
-            assert!(
-                TscClock::since(warmed) <= limit,
-                "no perf window closed in {limit:?} after the warm-up, though the layer log {} \
-                 holds perf windows",
-                self.path
-                    .as_deref()
-                    .map_or_else(String::new, |path| path.display().to_string())
-            );
             frame();
         };
         println!("{MEASURING}");
         start
+    }
+
+    /// The log's path for a message, empty when none was found.
+    fn shown(&self) -> String {
+        self.path
+            .as_deref()
+            .map_or_else(String::new, |path| path.display().to_string())
     }
 
     /// The perf window rows between `from` and `to`; `first_whole` when the first began at `from`.
@@ -746,49 +772,57 @@ impl LayerLog {
 /// Where a benchmark's measured frames start in its layer log, and whether a window opens there.
 pub struct SpanStart {
     from: u64,
+    /// How long the measured frames last at least: the window's length, or [`PERF_WINDOW`].
+    length: Duration,
     aligned: bool,
 }
 
 impl SpanStart {
+    /// How long the measured frames last at least: one window of the run's own log.
+    pub const fn length(&self) -> Duration {
+        self.length
+    }
+
     /// End the measured frames: run unmeasured ones until the window they started on has closed.
     ///
-    /// The span has lasted at least [`MEASURED_SPAN`], so the window that
+    /// The span has lasted at least [`Self::length`], so the window that
     /// opened at its start closes within a frame of its end; `frame`
-    /// renders and presents one more frame until that window's `perf-kv`
-    /// line is in the log. The span then ends at the last such line
-    /// written, so every window it holds has its line. A span with no
-    /// window to align to ends where the log is.
+    /// renders and presents one more frame until that window's grid is in
+    /// the log. The span then ends after the last grid written, and after
+    /// its `perf-kv` line when that came with it, so every window it holds
+    /// is whole. A span with no window to align to ends where the log is.
     ///
     /// # Panics
     ///
-    /// Panics when the line has not come a window and [`WINDOW_GRACE`]
-    /// after the measured frames: the round would lack its `perf.*` metrics.
+    /// Panics when the window has not closed two of its lengths and
+    /// [`WINDOW_GRACE`] after the measured frames: the round would lack its
+    /// `perf.*` metrics.
     pub fn end(self, log: &LayerLog, mut frame: impl FnMut()) -> Span {
         if !self.aligned {
             return Span {
                 from: self.from,
                 to: log.mark(),
+                length: self.length,
                 aligned: false,
             };
         }
         let mut watch = WindowWatch::new(log, self.from);
         let ended = TscClock::now();
+        let limit = self.length * 2 + WINDOW_GRACE;
         loop {
             if watch.look() > 0 {
                 return Span {
                     from: self.from,
                     to: watch.last_end,
+                    length: self.length,
                     aligned: true,
                 };
             }
             assert!(
-                TscClock::since(ended) <= PERF_WINDOW + WINDOW_GRACE,
-                "the perf window the measured frames started on did not close in {:?} after \
+                TscClock::since(ended) <= limit,
+                "the perf window the measured frames started on did not close in {limit:?} after \
                  them (layer log {})",
-                PERF_WINDOW + WINDOW_GRACE,
-                log.path
-                    .as_deref()
-                    .map_or_else(String::new, |path| path.display().to_string())
+                log.shown()
             );
             frame();
         }
@@ -799,6 +833,8 @@ impl SpanStart {
 pub struct Span {
     from: u64,
     to: u64,
+    /// How long the measured frames lasted at least.
+    length: Duration,
     /// The span started where a perf window opened, so every window in it is whole.
     aligned: bool,
 }
@@ -809,6 +845,11 @@ impl Span {
         self.to
     }
 
+    /// How long the measured frames lasted at least, for a report's measured row.
+    pub const fn length(&self) -> Duration {
+        self.length
+    }
+
     /// The perf window rows the report copies: the last window wholly inside the span.
     pub fn perf_rows(&self, log: &LayerLog) -> PerfRows {
         log.window_rows_between(self.from, self.to, self.aligned)
@@ -817,9 +858,9 @@ impl Span {
     /// The `perf-kv` pairs the metrics take: every window of an aligned span, else the last whole.
     ///
     /// An aligned span holds one window, or more when its frame floor
-    /// outlasted [`MEASURED_SPAN`], and none of them began before it. A
-    /// span with nothing to align to holds a whole window only when it is
-    /// longer than two windows, which [`LayerLog::perf_kv_last_full`] picks.
+    /// outlasted the window, and none of them began before it. A span with
+    /// nothing to align to holds a whole window only when it is longer than
+    /// two windows, which [`LayerLog::perf_kv_last_full`] picks.
     pub fn perf_kv(&self, log: &LayerLog) -> Vec<Option<String>> {
         if self.aligned {
             log.perf_kv(self.from, self.to)
@@ -838,25 +879,36 @@ impl Span {
     }
 }
 
-/// The `perf-kv` lines a layer log gains after a mark, counted as they arrive.
+/// The perf windows a layer log gains after a mark, counted as their grids arrive.
 ///
-/// Each look reads only what the log gained since the one before, from the
-/// start of the line the previous look stopped in, so a log that grows fast
-/// (a shape run's pass trace) is read once however long the wait. Looks are
-/// at most [`LOG_POLL`] apart; a call in between answers from the last one,
-/// so a caller asks every frame and pays a counter read.
+/// A window closes when the layer writes its grid: a header line naming
+/// the window's length (`── perf  window=<s>s`), indented rows, and in
+/// builds that have it the `perf-kv` line, whose `window_s` gives the
+/// length more exactly. Every build with perf windows writes the grid, so
+/// the grid, not the `perf-kv` line, is what is counted. Each look reads
+/// only what the log gained since the one before, from the start of the
+/// line the previous look stopped in, so a log that grows fast (a shape
+/// run's pass trace) is read once however long the wait. Looks are at most
+/// [`LOG_POLL`] apart; a call in between answers from the last one, so a
+/// caller asks every frame and pays a counter read.
 pub struct WindowWatch<'l> {
     log: &'l LayerLog,
+    /// Where the watch starts in the log.
+    mark: u64,
     /// Where the next look reads from, the start of a line.
     at: u64,
-    /// `perf-kv` lines seen after the mark.
+    /// Window grids seen after the mark.
     windows: usize,
-    /// The end of the last `perf-kv` line seen, the mark until there is one.
+    /// The end of the last grid seen, or of the `perf-kv` line after it; the mark until then.
     last_end: u64,
+    /// The last line read belongs to a grid, so a `perf-kv` line next still belongs to it.
+    in_grid: bool,
+    /// The length of the last window seen after the mark.
+    length: Option<Duration>,
     /// The counter reading of the last look, `None` before the first.
     looked: Option<u64>,
-    /// Whether the log held a `perf-kv` line before the mark, read the first time it matters.
-    before: Option<bool>,
+    /// The length of the last window before the mark, read the first time it matters.
+    prior: OnceCell<Option<Duration>>,
 }
 
 impl<'l> WindowWatch<'l> {
@@ -864,27 +916,31 @@ impl<'l> WindowWatch<'l> {
     pub const fn new(log: &'l LayerLog, from: u64) -> Self {
         Self {
             log,
+            mark: from,
             at: from,
             windows: 0,
             last_end: from,
+            in_grid: false,
+            length: None,
             looked: None,
-            before: None,
+            prior: OnceCell::new(),
         }
     }
 
     /// Whether the span from the mark holds a whole perf window yet, or none can come.
     ///
-    /// The first `perf-kv` line after the mark closes a window that began
-    /// before it and the second one wholly inside it. A build that writes
-    /// no windows has shown none two windows and [`WINDOW_GRACE`] after
-    /// `started`, a counter reading taken before the mark.
+    /// The first grid after the mark closes a window that began before it
+    /// and the second one wholly inside it. A build that writes no windows
+    /// has shown none [`NO_WINDOW_WAIT`] after `started`, a counter reading
+    /// taken before the mark.
     pub fn whole_window(&mut self, started: u64) -> bool {
         self.look() >= 2
-            || (TscClock::since(started) > PERF_WINDOW * 2 + WINDOW_GRACE
-                && !self.log_has_windows())
+            || (TscClock::since(started) > NO_WINDOW_WAIT
+                && self.look() == 0
+                && self.prior_length().is_none())
     }
 
-    /// The `perf-kv` lines seen after the mark, reading the log if the last look is old enough.
+    /// The window grids seen after the mark, reading the log if the last look is old enough.
     fn look(&mut self) -> usize {
         if self
             .looked
@@ -903,30 +959,44 @@ impl<'l> WindowWatch<'l> {
         let mut at = self.at;
         for line in bytes[..=whole].split_inclusive(|&byte| byte == b'\n') {
             at += u64::try_from(line.len()).expect("a line length fits u64");
-            if contains(line, PERF_KV.as_bytes()) {
+            let text = String::from_utf8_lossy(line);
+            if text.contains(PERF_HEADER) {
                 self.windows += 1;
                 self.last_end = at;
+                self.in_grid = true;
+                self.note_length(&text);
+            } else if self.in_grid && text.contains(PERF_KV) {
+                self.last_end = at;
+                self.in_grid = false;
+                self.note_length(&text);
+            } else if self.in_grid && !text.starts_with('[') {
+                self.last_end = at;
+            } else {
+                self.in_grid = false;
             }
         }
         self.at = at;
         self.windows
     }
 
-    /// Whether the log holds any `perf-kv` line, before the mark or after it.
-    fn log_has_windows(&mut self) -> bool {
-        if self.look() > 0 {
-            return true;
+    /// Take the window length `line` names, if it names one.
+    fn note_length(&mut self, line: &str) {
+        if let Some(secs) = mtld3d_core::perf::window_line::window_secs(line) {
+            self.length = Some(Duration::from_secs_f64(secs));
         }
-        let mark = self.last_end;
-        *self.before.get_or_insert_with(|| {
-            self.log
-                .path
-                .as_deref()
-                .and_then(|path| fs::read(path).ok())
-                .is_some_and(|bytes| {
-                    let end = usize::try_from(mark).map_or(bytes.len(), |at| at.min(bytes.len()));
-                    contains(&bytes[..end], PERF_KV.as_bytes())
-                })
+    }
+
+    /// The length of the last window the log holds before the mark, `None` when it holds none.
+    fn prior_length(&self) -> Option<Duration> {
+        let (mark, log) = (self.mark, self.log);
+        *self.prior.get_or_init(|| {
+            let bytes = log.path.as_deref().and_then(|path| fs::read(path).ok())?;
+            let end = usize::try_from(mark).map_or(bytes.len(), |at| at.min(bytes.len()));
+            String::from_utf8_lossy(&bytes[..end])
+                .lines()
+                .rev()
+                .find_map(mtld3d_core::perf::window_line::window_secs)
+                .map(Duration::from_secs_f64)
         })
     }
 }
@@ -1337,13 +1407,22 @@ impl Metrics {
         );
     }
 
-    /// The `mem.*` records of the samples taken after the warm-up and at the end.
+    /// The `mem.*` records: the samples after the warm-up and at the end, absolute and as growth.
     ///
-    /// The peak working set is the end sample's, the peak of the whole run.
-    /// All of them are of class `bytes`: a change has to clear the absolute
-    /// floor as well as the relative one, since two runs of one build can
-    /// differ by a MiB or so in a figure of a few MiB.
-    pub fn memory(&mut self, warm: &MemorySample, end: &MemorySample) {
+    /// `before` is taken right before the benchmark creates its interface.
+    /// `make bench-ab` runs a leg's benchmarks in one process, so the
+    /// absolute figures (`mem.warm.*`, `mem.end.*`, and `mem.peak_ws_mib`,
+    /// the process's peak so far) carry whatever the benchmarks before this
+    /// one left, and are reported as `info`. What this benchmark adds is its
+    /// growth since `before`, `mem.delta.warm.*` and `mem.delta.end.*`, of
+    /// class `bytes`, so a change has to clear the absolute floor as well as
+    /// the relative one, since two runs of one build can differ by a MiB or
+    /// so in a figure of a few MiB: the committed and the reserved growth,
+    /// lower better, and the largest free region's loss
+    /// (`largest_free_lost_mib`, lower better, the free region's direction
+    /// turned so that every growth is a size that is better small). A figure
+    /// that shrank since `before` grew by zero.
+    pub fn memory(&mut self, before: &MemorySample, warm: &MemorySample, end: &MemorySample) {
         for (phase, sample) in [("warm", warm), ("end", end)] {
             for (row, bytes, direction) in [
                 ("committed_mib", sample.committed(), Direction::Lower),
@@ -1354,6 +1433,27 @@ impl Metrics {
                     &format!("mem.{phase}.{row}"),
                     Value::Mib(bytes),
                     direction,
+                    Class::Info,
+                );
+            }
+            for (row, bytes) in [
+                (
+                    "committed_mib",
+                    sample.committed().saturating_sub(before.committed()),
+                ),
+                (
+                    "reserved_mib",
+                    sample.reserved().saturating_sub(before.reserved()),
+                ),
+                (
+                    "largest_free_lost_mib",
+                    before.largest_free().saturating_sub(sample.largest_free()),
+                ),
+            ] {
+                self.metric(
+                    &format!("mem.delta.{phase}.{row}"),
+                    Value::Mib(bytes),
+                    Direction::Lower,
                     Class::Bytes,
                 );
             }
@@ -1362,7 +1462,7 @@ impl Metrics {
             "mem.peak_ws_mib",
             Value::Mib(end.peak_working_set()),
             Direction::Lower,
-            Class::Bytes,
+            Class::Info,
         );
     }
 
@@ -1535,8 +1635,8 @@ impl Metrics {
     }
 }
 
-/// The report rows of the memory samples taken after the warm-up and at the end.
-pub fn memory_section(warm: &MemorySample, end: &MemorySample) -> String {
+/// The report rows of the memory samples: before the device, after the warm-up, at the end.
+pub fn memory_section(before: &MemorySample, warm: &MemorySample, end: &MemorySample) -> String {
     let row = |sample: &MemorySample| {
         format!(
             "committed {} MiB, reserved {} MiB, largest free region {} MiB",
@@ -1546,8 +1646,10 @@ pub fn memory_section(warm: &MemorySample, end: &MemorySample) -> String {
         )
     };
     format!(
-        "address space after the warm-up: {warm}\naddress space at the end: {end}\n\
+        "address space before the device: {before}\naddress space after the warm-up: {warm}\n\
+         address space at the end: {end}\n\
          peak working set (under Wine the host process's peak RSS): {peak} MiB\n",
+        before = row(before),
         warm = row(warm),
         end = row(end),
         peak = mib(end.peak_working_set()),
@@ -1749,13 +1851,6 @@ pub const IDENTITY_ROWS: [f32; 16] = [
     0.0, 0.0, 1.0, 0.0, //
     0.0, 0.0, 0.0, 1.0,
 ];
-
-/// Whether `needle` occurs in `haystack`.
-fn contains(haystack: &[u8], needle: &[u8]) -> bool {
-    haystack
-        .windows(needle.len())
-        .any(|window| window == needle)
-}
 
 /// How [`Metrics::perf`] records one `perf-kv` key.
 struct PerfRule {

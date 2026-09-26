@@ -105,6 +105,9 @@ fn stutter(name: &str, per_frame: u32, offscreen: u32) {
     // this mark whatever the benchmark's warm-up logs.
     let tsc = TscClock::calibrated();
     let since = SystemTime::now();
+    // Before the interface: what this benchmark adds to the address space
+    // is measured from here, whatever an earlier one in the process left.
+    let before = MemorySample::now();
     let h = Harness::create(&HarnessConfig {
         width: WIDTH,
         height: HEIGHT,
@@ -198,7 +201,7 @@ fn stutter(name: &str, per_frame: u32, offscreen: u32) {
         limit = limit.as_secs_f64() * 1e3,
         settle_row = settled.row(),
         extra_ms = extra.as_secs_f64() * 1e3,
-        memory = memory_section(&warm, &end),
+        memory = memory_section(&before, &warm, &end),
         attempts = verified.attempts,
         missing = verified.missing,
         perf = log.perf_rows(from, to).section(),
@@ -261,7 +264,7 @@ fn stutter(name: &str, per_frame: u32, offscreen: u32) {
         Direction::Lower,
         Class::Exact,
     );
-    metrics.memory(&warm, &end);
+    metrics.memory(&before, &warm, &end);
     metrics.perf(&log.perf_kv(from, to), &FrameWork::Varying);
     write_report(&metrics, &log, &body);
 }

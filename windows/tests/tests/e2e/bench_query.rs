@@ -48,9 +48,9 @@ use mtld3d_types::{
 };
 
 use crate::bench::{
-    Class, Direction, FrameClock, FrameStats, FrameWork, IDENTITY_ROWS, LayerLog, MEASURED_SPAN,
-    Metrics, Model, STRIDE, TEXTURED_DECL, TscClock, Value, grid, material_ps, material_vs,
-    memory_section, nearest_rank, ok, pattern_texture, ratio, world_rows, write_report,
+    Class, Direction, FrameClock, FrameStats, FrameWork, IDENTITY_ROWS, LayerLog, Metrics, Model,
+    STRIDE, TEXTURED_DECL, TscClock, Value, grid, material_ps, material_vs, memory_section,
+    nearest_rank, ok, pattern_texture, ratio, world_rows, write_report,
 };
 
 const WIDTH: u32 = 1280;
@@ -64,7 +64,7 @@ const FLARES: usize = 2;
 /// Frames of queries in flight: a frame's queries are read by the next frame.
 const QUERY_SETS: usize = 2;
 const WARM_UP_FRAMES: u32 = 60;
-/// The measured phase is at least this many frames and at least [`MEASURED_SPAN`] long.
+/// The measured phase is at least this many frames and at least one perf window long.
 const MEASURED_FRAMES: usize = 600;
 /// The longest one EVENT query may be polled before the benchmark fails.
 const POLL_LIMIT: Duration = Duration::from_secs(5);
@@ -102,6 +102,9 @@ fn poll(name: &str, keys: &'static str, answering: &Answering) {
     // this mark whatever the benchmark's warm-up logs.
     let tsc = TscClock::calibrated();
     let since = SystemTime::now();
+    // Before the interface: what this benchmark adds to the address space
+    // is measured from here, whatever an earlier one in the process left.
+    let before = MemorySample::now();
     let h = Harness::create(&HarnessConfig {
         width: WIDTH,
         height: HEIGHT,
@@ -132,14 +135,14 @@ fn poll(name: &str, keys: &'static str, answering: &Answering) {
         ok(h.present(), "Present");
         frame += 1;
     });
-    let capacity = usize::try_from(MEASURED_SPAN.as_micros() / FRAME_FLOOR.as_micros())
+    let capacity = usize::try_from(start.length().as_micros() / FRAME_FLOOR.as_micros())
         .expect("frame capacity fits usize")
         .max(MEASURED_FRAMES);
     let mut clock = FrameClock::start(capacity);
     let mut polls = Vec::with_capacity(capacity);
     let mut latencies = Vec::with_capacity(capacity);
     let (mut ready, mut pending) = (0, 0);
-    while clock.frames() < MEASURED_FRAMES || clock.elapsed() < MEASURED_SPAN {
+    while clock.frames() < MEASURED_FRAMES || clock.elapsed() < start.length() {
         assert!(h.pump(), "WM_QUIT during the measured frames");
         let occlusion = scene.read_occlusion(frame);
         ready += occlusion.ready;
@@ -183,7 +186,7 @@ fn poll(name: &str, keys: &'static str, answering: &Answering) {
          occlusion queries once with GetData(0)\n\
          warm-up: {WARM_UP_FRAMES} frames\n\
          measured: {frames} frames in {elapsed:.2?} (at least {MEASURED_FRAMES} frames \
-         and {MEASURED_SPAN:?}, {start})\n\
+         and {length:?}, {start})\n\
          frame time (Present to Present): {row}\n\
          API work (Present return to Present call, the polls included): {work}\n\
          EVENT Issue to S_OK, one frame between: {latency}\n\
@@ -197,8 +200,9 @@ fn poll(name: &str, keys: &'static str, answering: &Answering) {
         work = work.row(),
         latency = latency.row(),
         polls_mean = mean(polls_total, frames),
-        memory = memory_section(&warm, &end),
+        memory = memory_section(&before, &warm, &end),
         start = span.start(),
+        length = span.length(),
         perf = span.perf_rows(&log).section(),
     );
 
@@ -243,7 +247,7 @@ fn poll(name: &str, keys: &'static str, answering: &Answering) {
         Direction::Lower,
         Class::Info,
     );
-    metrics.memory(&warm, &end);
+    metrics.memory(&before, &warm, &end);
     // Answered at once, every frame polls once and issues the same calls;
     // answered from retirement, the poll count and so the query calls vary.
     let frame_work = match answering {

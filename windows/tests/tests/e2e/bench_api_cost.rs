@@ -32,7 +32,7 @@
 //!
 //! The kinds run interleaved, one batch of each per round, so a drift in
 //! the machine's speed over the run touches every kind alike. The rounds
-//! run until there are at least [`ROUNDS`] of them and [`MEASURED_SPAN`]
+//! run until there are at least [`ROUNDS`] of them and one perf window
 //! has passed, starting where a perf window opens, which puts one whole
 //! window of a `PERF=1` build's summary in the measured span.
 
@@ -52,9 +52,9 @@ use mtld3d_types::{
 };
 
 use crate::bench::{
-    Class, Direction, FrameWork, IDENTITY_ROWS, LayerLog, MEASURED_SPAN, Metrics, Model, STRIDE,
-    TEXTURED_DECL, TscClock, Value, material_ps, material_vs, memory_section, nearest_rank, ok,
-    pattern_texture, world_rows, write_report,
+    Class, Direction, FrameWork, IDENTITY_ROWS, LayerLog, Metrics, Model, STRIDE, TEXTURED_DECL,
+    TscClock, Value, material_ps, material_vs, memory_section, nearest_rank, ok, pattern_texture,
+    world_rows, write_report,
 };
 
 /// Edge of the back buffer, which every draw lands in.
@@ -187,6 +187,9 @@ fn api_call_cost() {
     // this mark whatever the benchmark's warm-up logs.
     let tsc = TscClock::calibrated();
     let since = SystemTime::now();
+    // Before the interface: what this benchmark adds to the address space
+    // is measured from here, whatever an earlier one in the process left.
+    let before = MemorySample::now();
     let h = Harness::create(&HarnessConfig {
         width: EDGE,
         height: EDGE,
@@ -211,7 +214,7 @@ fn api_call_cost() {
     let started = TscClock::now();
     let mut samples: Vec<Vec<f64>> = KINDS.iter().map(|_| Vec::new()).collect();
     let mut rounds = 0;
-    while rounds < ROUNDS || TscClock::since(started) < MEASURED_SPAN {
+    while rounds < ROUNDS || TscClock::since(started) < start.length() {
         for (kind, samples) in KINDS.iter().zip(&mut samples) {
             let batch = bench.frame(kind);
             samples.push(TscClock::ticks_ns(batch) / f64::from(CALLS));
@@ -257,12 +260,13 @@ fn api_call_cost() {
          batches: {CALLS} calls (pairs where marked) of one kind between two Presents, \
          timed around the calls alone; median, min and max batch per kind\n\
          warm-up: {WARM_UP_ROUNDS} rounds; measured: {rounds} rounds of {kinds} kinds in \
-         {measured:.2?} (at least {ROUNDS} rounds and {MEASURED_SPAN:?}, {start}), \
+         {measured:.2?} (at least {ROUNDS} rounds and {length:?}, {start}), \
          {calls_total} COM calls timed\n\
          {table}{memory}{perf}",
         kinds = KINDS.len(),
-        memory = memory_section(&warm, &end),
+        memory = memory_section(&before, &warm, &end),
         start = span.start(),
+        length = span.length(),
         perf = span.perf_rows(&log).section(),
     );
     metrics.metric(
@@ -283,7 +287,7 @@ fn api_call_cost() {
         Direction::Lower,
         Class::Info,
     );
-    metrics.memory(&warm, &end);
+    metrics.memory(&before, &warm, &end);
     // Each frame is one batch of one call kind, so a window's per-frame
     // counts depend on where in the rotation it starts and ends.
     metrics.perf(&span.perf_kv(&log), &FrameWork::Varying);

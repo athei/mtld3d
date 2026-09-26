@@ -58,10 +58,14 @@ use super::{Leg, SHAPE_DIR, metrics};
 /// needs: `mtld3d::d3d9` (the `d3d9.dll <build> <id> loaded at` line) and
 /// `mtld3d::unix` (the `mtld3d.so <build> <id> initialized` line). The pass
 /// trace, under `mtld3d::d3d9`, is the more specific directive and stays at
-/// trace. `mtld3d::perf` stays at warn: the run's timings and `perf-kv`
-/// lines are never judged.
-pub const SHAPE_RUST_LOG: &str =
-    "mtld3d=warn,mtld3d::d3d9=info,mtld3d::unix=info,mtld3d::d3d9::passes=trace";
+/// trace. `mtld3d::perf` is at info too, though the run's timings and
+/// `perf-kv` lines are never judged: the benchmark starts its measured
+/// frames, where the runner starts counting, at a perf window's opening,
+/// and a log without windows would make it wait out
+/// the time a build without them takes to show it. The shape reader skips
+/// the perf lines, whose target is not the trace's.
+pub const SHAPE_RUST_LOG: &str = "mtld3d=warn,mtld3d::d3d9=info,mtld3d::unix=info,\
+                                  mtld3d::perf=info,mtld3d::d3d9::passes=trace";
 
 /// How many of a log's last complete submissions the compared shape is chosen from.
 pub const WINDOW: usize = 30;

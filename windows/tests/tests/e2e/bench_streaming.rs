@@ -48,8 +48,8 @@ use mtld3d_types::{
 };
 
 use crate::bench::{
-    CallTimes, Class, Direction, FrameClock, FrameWork, LayerLog, MEASURED_SPAN, Metrics, STRIDE,
-    TscClock, Value, memory_section, nanos, ok, ratio, write_report,
+    CallTimes, Class, Direction, FrameClock, FrameWork, LayerLog, Metrics, STRIDE, TscClock, Value,
+    memory_section, nanos, ok, ratio, write_report,
 };
 
 /// The back buffer, about the size of a windowed game.
@@ -89,7 +89,7 @@ const SLOTS: u32 = 64;
 /// Bytes of fill pattern, enough for the largest level at the largest offset.
 const PATTERN_BYTES: usize = 320 * 1024;
 const WARM_UP_FRAMES: u32 = 60;
-/// The measured phase is at least this many frames and at least [`MEASURED_SPAN`] long.
+/// The measured phase is at least this many frames and at least one perf window long.
 const MEASURED_FRAMES: usize = 600;
 const FVF: u32 = D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1;
 
@@ -101,6 +101,9 @@ fn texture_streaming() {
     // this mark whatever the benchmark's warm-up logs.
     let tsc = TscClock::calibrated();
     let since = SystemTime::now();
+    // Before the interface: what this benchmark adds to the address space
+    // is measured from here, whatever an earlier one in the process left.
+    let before = MemorySample::now();
     let h = Harness::create(&HarnessConfig {
         width: WIDTH,
         height: HEIGHT,
@@ -132,7 +135,7 @@ fn texture_streaming() {
     });
     scene.times = Times::default();
     let mut clock = FrameClock::start(MEASURED_FRAMES * 4);
-    while clock.frames() < MEASURED_FRAMES || clock.elapsed() < MEASURED_SPAN {
+    while clock.frames() < MEASURED_FRAMES || clock.elapsed() < start.length() {
         assert!(h.pump(), "WM_QUIT during the measured frames");
         scene.render(tick);
         clock.present(&h);
@@ -167,7 +170,7 @@ fn texture_streaming() {
          warm-up: {LIVE_TEXTURES} textures loaded {LOAD_PER_FRAME} a frame, then \
          {WARM_UP_FRAMES} frames, in {warm_up:.2?}\n\
          measured: {frames} frames in {elapsed:.2?} (at least {MEASURED_FRAMES} frames \
-         and {MEASURED_SPAN:?}, {start}), {locks_per_frame:.1} timed LockRect a frame, event \
+         and {length:?}, {start}), {locks_per_frame:.1} timed LockRect a frame, event \
          query \
          complete at its one read on {complete} frames\n\
          frame time (Present to Present): {row}\n\
@@ -188,8 +191,9 @@ fn texture_streaming() {
         limit = limit.as_nanos(),
         preserve_row = times.preserve.row(),
         create_row = times.create.row(),
-        memory = memory_section(&warm, &end),
+        memory = memory_section(&before, &warm, &end),
         start = span.start(),
+        length = span.length(),
         perf = span.perf_rows(&log).section(),
     );
     let mut metrics = Metrics::new("streaming", &h, &tsc);
@@ -235,7 +239,7 @@ fn texture_streaming() {
         Direction::Lower,
         Class::Info,
     );
-    metrics.memory(&warm, &end);
+    metrics.memory(&before, &warm, &end);
     // The frames lock the same kinds at the same rates, but a ring's wrap or
     // a preserving lock falls on some frames and not others, so a window's
     // per-frame counts depend on where it starts.

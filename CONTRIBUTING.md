@@ -240,7 +240,8 @@ the run may differ between the legs.
 After its timed rounds, each scene benchmark (one whose metrics declare its
 frame in `shape` lines) runs once more per leg with the pass trace on
 (`mtld3d::d3d9::passes=trace`, the rest of the layer at warn but for the
-lines that name its build), untimed, into
+lines that name its build and the perf windows its measured frames start
+on), untimed, into
 `<leg>/shape/` of the run's directory; a benchmark without `shape` lines, such
 as the shader-stutter one, gets a note instead. The runner stops that run
 once its log holds 33 submissions after the line the benchmark prints where

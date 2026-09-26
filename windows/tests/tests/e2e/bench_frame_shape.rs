@@ -77,9 +77,9 @@ use mtld3d_types::{
 };
 
 use crate::bench::{
-    Class, Direction, FrameClock, FrameWork, IDENTITY_ROWS, LayerLog, MEASURED_SPAN, Metrics,
-    Model, PassShape, STRIDE, TEXTURED_DECL, TscClock, Value, def, grid, material_ps, material_vs,
-    memory_section, ok, pattern_texture, ratio, rs, transform, world_rows, write_report,
+    Class, Direction, FrameClock, FrameWork, IDENTITY_ROWS, LayerLog, Metrics, Model, PassShape,
+    STRIDE, TEXTURED_DECL, TscClock, Value, def, grid, material_ps, material_vs, memory_section,
+    ok, pattern_texture, ratio, rs, transform, world_rows, write_report,
 };
 
 /// The back buffer, about the size of a windowed game.
@@ -261,7 +261,7 @@ const UI_TEXTURES: u32 = 8;
 /// Grid sizes of the static meshes, one vertex buffer each.
 const MESH_GRIDS: [u16; 4] = [4, 6, 8, 10];
 const WARM_UP_FRAMES: u32 = 60;
-/// The measured phase is at least this many frames and at least [`MEASURED_SPAN`] long.
+/// The measured phase is at least this many frames and at least one perf window long.
 const MEASURED_FRAMES: usize = 600;
 /// The scene's viewport; the sky draws alone use the far end of the depth range.
 const SCENE_VIEWPORT: D3DVIEWPORT9 = viewport(0, 0, WIDTH, HEIGHT, 0.0, 0.94);
@@ -283,6 +283,9 @@ fn wow_335a_busy_frame() {
     // this mark whatever the benchmark's warm-up logs.
     let tsc = TscClock::calibrated();
     let since = SystemTime::now();
+    // Before the interface: what this benchmark adds to the address space
+    // is measured from here, whatever an earlier one in the process left.
+    let before = MemorySample::now();
     let h = Harness::create(&HarnessConfig {
         width: WIDTH,
         height: HEIGHT,
@@ -309,7 +312,7 @@ fn wow_335a_busy_frame() {
         tick += 1;
     });
     let mut clock = FrameClock::start(MEASURED_FRAMES * 4);
-    while clock.frames() < MEASURED_FRAMES || clock.elapsed() < MEASURED_SPAN {
+    while clock.frames() < MEASURED_FRAMES || clock.elapsed() < start.length() {
         assert!(h.pump(), "WM_QUIT during the measured frames");
         frame.render(tick);
         clock.present(&h);
@@ -344,7 +347,7 @@ fn wow_335a_busy_frame() {
          function for the sky, the glow and composite vertices and the minimap\n\
          warm-up: {WARM_UP_FRAMES} frames in {warm_up:.2?}\n\
          measured: {frames} frames in {elapsed:.2?} (at least {MEASURED_FRAMES} frames \
-         and {MEASURED_SPAN:?}, {start})\n\
+         and {length:?}, {start})\n\
          frame time (Present to Present): {row}\n\
          API work (Present return to Present call): {work}\n{memory}{perf}{warm_up_compiles}",
         draws = DRAWS_PER_FRAME,
@@ -364,8 +367,9 @@ fn wow_335a_busy_frame() {
         elapsed = clock.elapsed(),
         row = stats.row(),
         work = work.row(),
-        memory = memory_section(&warm, &end),
+        memory = memory_section(&before, &warm, &end),
         start = span.start(),
+        length = span.length(),
         perf = span.perf_rows(&log).section(),
         warm_up_compiles = log
             .first_window_rows(span.to())
@@ -400,7 +404,7 @@ fn wow_335a_busy_frame() {
         "dxt_standin"
     };
     metrics.meta("depth_path", depth_path);
-    metrics.memory(&warm, &end);
+    metrics.memory(&before, &warm, &end);
     metrics.perf(&span.perf_kv(&log), &FrameWork::Fixed);
     metrics.meta("backbuffer", &format!("{WIDTH}x{HEIGHT}"));
     metrics.shapes(&pass_shapes());

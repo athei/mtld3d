@@ -49,8 +49,8 @@ use mtld3d_types::{
 };
 
 use crate::bench::{
-    CallTimes, Class, Direction, FrameClock, FrameWork, LayerLog, MEASURED_SPAN, Metrics, STRIDE,
-    TscClock, Value, grid, memory_section, ok, ratio, write_report,
+    CallTimes, Class, Direction, FrameClock, FrameWork, LayerLog, Metrics, STRIDE, TscClock, Value,
+    grid, memory_section, ok, ratio, write_report,
 };
 
 /// The back buffer, about the size of a windowed game.
@@ -80,7 +80,7 @@ const CHUNK_QUADS: u32 = 448;
 /// Distinct contents each kind of write cycles through.
 const VARIANTS: u32 = 8;
 const WARM_UP_FRAMES: u32 = 60;
-/// The measured phase is at least this many frames and at least [`MEASURED_SPAN`] long.
+/// The measured phase is at least this many frames and at least one perf window long.
 const MEASURED_FRAMES: usize = 600;
 const FVF: u32 = D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1;
 
@@ -92,6 +92,9 @@ fn dynamic_buffer_churn() {
     // this mark whatever the benchmark's warm-up logs.
     let tsc = TscClock::calibrated();
     let since = SystemTime::now();
+    // Before the interface: what this benchmark adds to the address space
+    // is measured from here, whatever an earlier one in the process left.
+    let before = MemorySample::now();
     let h = Harness::create(&HarnessConfig {
         width: WIDTH,
         height: HEIGHT,
@@ -118,7 +121,7 @@ fn dynamic_buffer_churn() {
     });
     scene.times = LockTimes::default();
     let mut clock = FrameClock::start(MEASURED_FRAMES * 4);
-    while clock.frames() < MEASURED_FRAMES || clock.elapsed() < MEASURED_SPAN {
+    while clock.frames() < MEASURED_FRAMES || clock.elapsed() < start.length() {
         assert!(h.pump(), "WM_QUIT during the measured frames");
         scene.render(tick);
         clock.present(&h);
@@ -145,7 +148,7 @@ fn dynamic_buffer_churn() {
          whole-buffer-locked dynamic buffer {cache} KiB, static buffers {statics} KiB each\n\
          warm-up: {WARM_UP_FRAMES} frames in {warm_up:.2?}\n\
          measured: {frames} frames in {elapsed:.2?} (at least {MEASURED_FRAMES} frames \
-         and {MEASURED_SPAN:?}, {start}), {wraps} ring wraps, {preserves} preserving locks\n\
+         and {length:?}, {start}), {wraps} ring wraps, {preserves} preserving locks\n\
          frame time (Present to Present): {row}\n\
          API work (Present return to Present call): {work_row}\n\
          NOOVERWRITE append (Lock, copy, Unlock): {append_row}\n\
@@ -172,8 +175,9 @@ fn dynamic_buffer_churn() {
         preserve_row = times.preserve.row(),
         rewrite_row = times.rewrite.row(),
         overlap_row = times.overlap.row(),
-        memory = memory_section(&warm, &end),
+        memory = memory_section(&before, &warm, &end),
         start = span.start(),
+        length = span.length(),
         perf = span.perf_rows(&log).section(),
     );
     let mut metrics = Metrics::new("buffers", &h, &tsc);
@@ -209,7 +213,7 @@ fn dynamic_buffer_churn() {
         Direction::Lower,
         Class::Info,
     );
-    metrics.memory(&warm, &end);
+    metrics.memory(&before, &warm, &end);
     // The frames lock the same kinds at the same rates, but a ring's wrap or
     // a preserving lock falls on some frames and not others, so a window's
     // per-frame counts depend on where it starts.

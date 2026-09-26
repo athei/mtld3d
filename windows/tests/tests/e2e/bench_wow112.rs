@@ -67,9 +67,9 @@ use mtld3d_types::{
 };
 
 use crate::bench::{
-    Class, Direction, FrameClock, FrameWork, IDENTITY_ROWS, LayerLog, MEASURED_SPAN, Metrics,
-    PassShape, STRIDE, TEXTURED_DECL, TscClock, Value, def, element, grid, memory_section, ok,
-    pattern_texture, ratio, transform, world_rows, write_report,
+    Class, Direction, FrameClock, FrameWork, IDENTITY_ROWS, LayerLog, Metrics, PassShape, STRIDE,
+    TEXTURED_DECL, TscClock, Value, def, element, grid, memory_section, ok, pattern_texture, ratio,
+    transform, world_rows, write_report,
 };
 
 /// The back buffer and the scene target, the size of a windowed game.
@@ -271,7 +271,7 @@ const MODEL_DECL: [D3DVERTEXELEMENT9; 4] = [
     D3DDECL_END,
 ];
 const WARM_UP_FRAMES: u32 = 60;
-/// The measured phase is at least this many frames and at least [`MEASURED_SPAN`] long.
+/// The measured phase is at least this many frames and at least one perf window long.
 const MEASURED_FRAMES: usize = 600;
 /// The longest the last frame's EVENT query may stay pending before the benchmark fails.
 const EVENT_DEADLINE: Duration = Duration::from_secs(5);
@@ -284,6 +284,9 @@ fn wow_112_busy_frame() {
     // this mark whatever the benchmark's warm-up logs.
     let tsc = TscClock::calibrated();
     let since = SystemTime::now();
+    // Before the interface: what this benchmark adds to the address space
+    // is measured from here, whatever an earlier one in the process left.
+    let before = MemorySample::now();
     let h = Harness::create(&HarnessConfig {
         width: WIDTH,
         height: HEIGHT,
@@ -315,7 +318,7 @@ fn wow_112_busy_frame() {
     let pending_from = frame.calls.pending_polls.get();
     let mut clock = FrameClock::start(MEASURED_FRAMES * 4);
     let mut one_frame = Vec::new();
-    while clock.frames() < MEASURED_FRAMES || clock.elapsed() < MEASURED_SPAN {
+    while clock.frames() < MEASURED_FRAMES || clock.elapsed() < start.length() {
         assert!(h.pump(), "WM_QUIT during the measured frames");
         let before = one_frame.is_empty().then(|| frame.calls.rows());
         frame.render(tick);
@@ -369,7 +372,7 @@ fn wow_112_busy_frame() {
          one or two lights, fog\n\
          warm-up: {WARM_UP_FRAMES} frames in {warm_up:.2?}\n\
          measured: {frames} frames in {elapsed:.2?} (at least {MEASURED_FRAMES} frames \
-         and {MEASURED_SPAN:?}, {start})\n\
+         and {length:?}, {start})\n\
          frame time (Present to Present): {row}\n\
          API work (Present return to Present call): {work_row}\n\
          API work per draw: {per_draw_ns} ns (mean API work over {DRAWS_PER_FRAME} draws)\n\
@@ -383,8 +386,9 @@ fn wow_112_busy_frame() {
         row = stats.row(),
         work_row = work.row(),
         calls_per_draw = f64::from(total) / f64::from(DRAWS_PER_FRAME),
-        memory = memory_section(&warm, &end),
+        memory = memory_section(&before, &warm, &end),
         start = span.start(),
+        length = span.length(),
         perf = span.perf_rows(&log).section(),
         warm_up_compiles = log
             .first_window_rows(span.to())
@@ -433,7 +437,7 @@ fn wow_112_busy_frame() {
         Direction::Lower,
         Class::Info,
     );
-    metrics.memory(&warm, &end);
+    metrics.memory(&before, &warm, &end);
     metrics.perf(&span.perf_kv(&log), &FrameWork::Fixed);
     metrics.meta("backbuffer", &format!("{WIDTH}x{HEIGHT}"));
     metrics.shapes(&pass_shapes());
