@@ -2,19 +2,24 @@
 //!
 //! Nothing else may run while `bench-ab` measures, and nothing enforced it:
 //! a game played during a run moved the numbers with no trace in the
-//! report. So before every round process the runner samples the 1-minute
-//! load average, `kernel_task`'s CPU share (which rises when macOS holds the
-//! CPUs back for heat) and the processes using the most CPU that are not
-//! the run's own, and keeps them in the round's directory, one file per
-//! process ([`file_name`]: `machine-<binary>.txt` before a test binary's
-//! benchmarks, `machine-host.txt` before the host emitter). The report then
-//! warns about each round that started on a busy machine; a warning never
-//! changes a verdict, and such rounds are for running again.
+//! report. So before every round process the runner records the 1-minute
+//! load average and measures, over [`INTERVAL`], the CPU `kernel_task` takes
+//! (which rises when macOS holds the CPUs back for heat) and the CPU of the
+//! processes that are not the run's own, and keeps them in the round's
+//! directory, one file per process ([`file_name`]: `machine-<binary>.txt`
+//! before a test binary's benchmarks, `machine-host.txt` before the host
+//! emitter). The report then warns about each round that started on a busy
+//! machine; a warning never changes a verdict, and such rounds are for
+//! running again.
 //!
-//! A file is a `load1 <x>` line, a `kernel_task <cpu%>` line and up to
-//! [`TOP`] `top <cpu%> <pid> <command line>` lines. A round is busy when the
-//! load was over [`LOAD_THRESHOLD`], `kernel_task` held [`KERNEL_TASK_CPU`]
-//! % of a core, or a foreign process held [`HEAVY_CPU`] %.
+//! A file holds a `load1 <x>` line, a `kernel_task <cpu%>` line, a `foreign
+//! <cpu%>` line (every foreign process together) and up to [`TOP`] `top
+//! <cpu%> <pid> <command line>` lines, CPU in percent of one core. A round
+//! is busy when one foreign process held [`HEAVY_CPU`] %, the foreign
+//! processes together [`FOREIGN_CPU`] %, or `kernel_task`
+//! [`KERNEL_TASK_CPU`] %. The load average is recorded and never warned on:
+//! it lags a minute behind, so it still holds the run's own builds and the
+//! round before.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -22,24 +27,28 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    thread,
+    time::Duration,
 };
 
 /// How many of the busiest foreign processes a sample keeps.
 pub const TOP: usize = 3;
 
-/// The 1-minute load average above which a round started on a busy machine.
+/// How long a sample measures the processes' CPU over: the time between two reads of it.
 ///
-/// The run itself keeps the load near two or three: a benchmark keeps its
-/// API, encoder and submit threads busy for most of every round, and the
-/// average still holds the round before when the next one starts. Anything
-/// past four is something else.
-pub const LOAD_THRESHOLD: f64 = 4.0;
+/// Long enough for `ps`'s hundredths of a second to give a share to 2 %,
+/// short enough that a sample before each of a run's twenty-odd processes
+/// costs seconds, not minutes.
+pub const INTERVAL: Duration = Duration::from_millis(500);
 
-/// The CPU share, in percent of one core, from which a foreign process counts as heavy.
+/// The CPU share, in percent of one core, from which one foreign process makes a round busy.
 ///
-/// `ps` reports a decaying average; a quarter of a core held over the last
-/// minute is a game, a build or an indexer, not a background daemon's blip.
+/// A quarter of a core held while the run is between processes is a game,
+/// a build or an indexer, not a background daemon's blip.
 pub const HEAVY_CPU: f64 = 25.0;
+
+/// The CPU share, in percent of one core, from which the foreign processes together do.
+pub const FOREIGN_CPU: f64 = 50.0;
 
 /// The CPU share, in percent of one core, from which `kernel_task` says the machine is throttled.
 ///
@@ -47,17 +56,28 @@ pub const HEAVY_CPU: f64 = 25.0;
 /// running when it holds them back for heat, so half a core is throttling.
 pub const KERNEL_TASK_CPU: f64 = 50.0;
 
-/// The processes the run's own work starts outside its process tree: Metal's shader compiler
-/// service and the window server that composites its windows.
+/// The least CPU share, in percent of one core, a process counts with.
+///
+/// Below it a process is neither in the top nor in the sum, which spares
+/// asking `lsof` about every idle Wine process whether it is the run's.
+const COUNTED_CPU: f64 = 1.0;
+
+/// The processes the run's own work keeps busy outside its process tree.
+///
+/// Metal's shader compiler service and the window server that composites
+/// the benchmarks' windows.
 const SIDE_EFFECTS: [&str; 2] = ["MTLCompilerService", "WindowServer"];
 
 /// The name `ps` gives the kernel's own process.
 const KERNEL_TASK: &str = "kernel_task";
 
+/// The line of a round's file that sums the foreign processes' CPU.
+const FOREIGN: &str = "foreign";
+
 /// The longest command line a sample keeps, in characters.
 const COMMAND_CHARS: usize = 200;
 
-/// One process from a `ps` sample.
+/// One process from a sample.
 #[derive(Debug, PartialEq)]
 pub struct Process {
     pub cpu: f64,
@@ -66,13 +86,15 @@ pub struct Process {
     pub command: String,
 }
 
-/// What a sample saw: the load average, `kernel_task`'s share and the busiest foreign processes.
+/// What a sample saw: the load average, `kernel_task`'s share and the foreign processes'.
 #[derive(Debug, Default, PartialEq)]
 pub struct Sample {
     /// The 1-minute load average, `None` when it could not be read.
     pub load1: Option<f64>,
     /// `kernel_task`'s CPU share, in percent of one core, `None` when `ps` did not list it.
     pub kernel_task: Option<f64>,
+    /// Every foreign process's CPU share together, in percent of one core.
+    pub foreign: f64,
     pub top: Vec<Process>,
 }
 
@@ -87,6 +109,7 @@ impl Sample {
         if let Some(cpu) = self.kernel_task {
             let _ = writeln!(out, "{KERNEL_TASK} {cpu:.1}");
         }
+        let _ = writeln!(out, "{FOREIGN} {:.1}", self.foreign);
         for process in &self.top {
             let _ = writeln!(
                 out,
@@ -100,15 +123,21 @@ impl Sample {
     /// Read a sample back from the text of a round's file; lines it does not know are skipped.
     #[must_use]
     pub fn parse(text: &str) -> Self {
+        let value = |line: &str, key: &str| {
+            line.strip_prefix(key)?
+                .strip_prefix(' ')?
+                .trim()
+                .parse::<f64>()
+                .ok()
+        };
         let mut sample = Self::default();
         for line in text.lines() {
-            if let Some(load) = line.strip_prefix("load1 ") {
-                sample.load1 = load.trim().parse().ok();
-            } else if let Some(cpu) = line
-                .strip_prefix(KERNEL_TASK)
-                .and_then(|rest| rest.strip_prefix(' '))
-            {
-                sample.kernel_task = cpu.trim().parse().ok();
+            if let Some(load) = value(line, "load1") {
+                sample.load1 = Some(load);
+            } else if let Some(cpu) = value(line, KERNEL_TASK) {
+                sample.kernel_task = Some(cpu);
+            } else if let Some(cpu) = value(line, FOREIGN) {
+                sample.foreign = cpu;
             } else if let Some(rest) = line.strip_prefix("top ") {
                 sample.top.extend(top_line(rest));
             }
@@ -117,43 +146,56 @@ impl Sample {
     }
 
     /// Why the round this sample precedes started on a busy machine; `None` when it did not.
+    ///
+    /// The load average is not a reason: it lags a minute behind the run's
+    /// own work.
     #[must_use]
     pub fn busy(&self) -> Option<String> {
         let mut reasons = Vec::new();
-        if let Some(load) = self.load1.filter(|load| *load > LOAD_THRESHOLD) {
-            reasons.push(format!(
-                "1-minute load {load:.2} (over {LOAD_THRESHOLD:.1})"
-            ));
-        }
         if let Some(cpu) = self.kernel_task.filter(|cpu| *cpu >= KERNEL_TASK_CPU) {
             reasons.push(format!(
                 "{KERNEL_TASK} at {cpu:.0} % of a core (macOS holding the CPUs back for heat)"
             ));
         }
-        for process in self.top.iter().filter(|process| process.cpu >= HEAVY_CPU) {
+        let heavy: Vec<&Process> = self
+            .top
+            .iter()
+            .filter(|process| process.cpu >= HEAVY_CPU)
+            .collect();
+        for process in &heavy {
             reasons.push(format!(
                 "{} (pid {}) at {:.0} % of a core",
                 process.command, process.pid, process.cpu
+            ));
+        }
+        if heavy.is_empty() && self.foreign >= FOREIGN_CPU {
+            reasons.push(format!(
+                "other processes at {:.0} % of a core together",
+                self.foreign
             ));
         }
         (!reasons.is_empty()).then(|| reasons.join("; "))
     }
 }
 
-/// What [`classify`] makes of a `ps` listing: `kernel_task`'s share and the foreign top.
+/// What [`classify`] makes of a listing: `kernel_task`'s share and the foreign processes'.
 #[derive(Debug, Default, PartialEq)]
 pub struct Classified {
     pub kernel_task: Option<f64>,
+    /// Every counted foreign process's share together.
+    pub foreign: f64,
     pub top: Vec<Process>,
 }
 
-/// Sample the machine: its load average, `kernel_task` and the busiest processes not the run's.
+/// Sample the machine: its load average, `kernel_task` and the processes that are not the run's.
 ///
 /// `legs` are the Wine installs the run's two legs boot from (the isolated
 /// SDK clones); a Wine process that maps its image from one of them is the
-/// run's, any other Wine process (a game under another Wine) is foreign. A
-/// sample that cannot be taken is empty rather than an error: the numbers
-/// the run measures do not depend on it.
+/// run's, any other Wine process (a game under another Wine) is foreign.
+/// The CPU is measured over [`INTERVAL`] ([`measured_listing`]); when that
+/// cannot be read the sample falls back to `ps`'s own `%cpu`, a decaying
+/// average of the last minute. A sample that cannot be taken is empty
+/// rather than an error: the numbers the run measures do not depend on it.
 #[must_use]
 pub fn sample(legs: &[PathBuf]) -> Sample {
     let mut averages = [0.0f64; 3];
@@ -161,7 +203,8 @@ pub fn sample(legs: &[PathBuf]) -> Sample {
     // getloadavg writes at most that many.
     let read = unsafe { libc::getloadavg(averages.as_mut_ptr(), 3) };
     let load1 = (read >= 1).then_some(averages[0]);
-    let listing = ps(&["-A", "-r", "-o", "pcpu=,pid=,ppid=,comm="]);
+    let listing =
+        measured_listing().unwrap_or_else(|| ps(&["-A", "-r", "-o", "pcpu=,pid=,ppid=,comm="]));
     let mut classified = classify(&listing, std::process::id(), legs, |pid| {
         maps_a_leg(pid, legs)
     });
@@ -175,20 +218,21 @@ pub fn sample(legs: &[PathBuf]) -> Sample {
     Sample {
         load1,
         kernel_task: classified.kernel_task,
+        foreign: classified.foreign,
         top: classified.top,
     }
 }
 
-/// Sort a `ps -r -o pcpu=,pid=,ppid=,comm=` listing into `kernel_task` and the foreign top.
+/// Sort a `<cpu%> <pid> <ppid> <command>` listing, busiest first, into `kernel_task` and the rest.
 ///
 /// The run's own processes are left out: the process `own` and its
 /// ancestors (the cargo and make that started it) and children (`ps`), the
 /// [`SIDE_EFFECTS`] of its Metal work, a process whose executable lies in one
 /// of `legs`, and a Wine process (a Windows path, an `.exe`, or `wine` in
 /// its name) that `maps_leg` says maps its image from one of them: the legs'
-/// wineservers and their resident Windows processes. Every other process,
-/// another Wine's included, is foreign. `ps -r` lists by CPU already; the
-/// order is kept.
+/// wineservers and their resident Windows processes. Every other process
+/// at [`COUNTED_CPU`] or more, another Wine's included, is foreign: all of
+/// them are summed and the busiest [`TOP`] kept, in the listing's order.
 #[must_use]
 pub fn classify(
     listing: &str,
@@ -217,7 +261,7 @@ pub fn classify(
             classified.kernel_task.get_or_insert(row.cpu);
             continue;
         }
-        if classified.top.len() == TOP
+        if row.cpu < COUNTED_CPU
             || run.contains(&row.pid)
             || row.ppid == own
             || SIDE_EFFECTS.contains(&name)
@@ -228,11 +272,14 @@ pub fn classify(
         {
             continue;
         }
-        classified.top.push(Process {
-            cpu: row.cpu,
-            pid: row.pid,
-            command: row.command,
-        });
+        classified.foreign += row.cpu;
+        if classified.top.len() < TOP {
+            classified.top.push(Process {
+                cpu: row.cpu,
+                pid: row.pid,
+                command: row.command,
+            });
+        }
     }
     classified
 }
@@ -290,7 +337,7 @@ pub fn warnings(dir: &Path, legs: &[&str], rounds: usize) -> Vec<String> {
     out
 }
 
-/// One process of a `ps` listing, before it is classified.
+/// One process of a listing, before it is classified.
 struct Row {
     cpu: f64,
     pid: u32,
@@ -298,16 +345,16 @@ struct Row {
     command: String,
 }
 
-/// One `<cpu> <pid> <ppid> <command>` line of `ps`, the command running to the end.
+/// One `<cpu> <pid> <ppid> <command>` line of a listing, the command running to the end.
 fn ps_row(line: &str) -> Option<Row> {
     let (cpu, rest) = line.trim_start().split_once(char::is_whitespace)?;
     let (pid, rest) = rest.trim_start().split_once(char::is_whitespace)?;
-    let (ppid, command) = rest.trim_start().split_once(char::is_whitespace)?;
+    let (parent, command) = rest.trim_start().split_once(char::is_whitespace)?;
     let command = command.trim();
     Some(Row {
         cpu: cpu.parse().ok().filter(|cpu: &f64| cpu.is_finite())?,
         pid: pid.parse().ok()?,
-        ppid: ppid.parse().ok()?,
+        ppid: parent.parse().ok()?,
         command: (!command.is_empty()).then(|| command.to_owned())?,
     })
 }
@@ -358,6 +405,55 @@ fn maps_a_leg(pid: u32, legs: &[PathBuf]) -> bool {
         .lines()
         .filter_map(|line| line.strip_prefix('n'))
         .any(|path| legs.iter().any(|leg| Path::new(path).starts_with(leg)))
+}
+
+/// Every process's CPU over [`INTERVAL`], busiest first, as a listing [`classify`] reads.
+///
+/// Two reads of the CPU time each process has used, [`INTERVAL`] apart,
+/// rather than `ps`'s own `%cpu`, a decaying average of the last minute
+/// that still holds a load that has gone. A process that started between
+/// the reads counts all its time. `None` when `ps` gives nothing.
+fn measured_listing() -> Option<String> {
+    let before: BTreeMap<u32, f64> = ps(&["-A", "-o", "pid=,cputime="])
+        .lines()
+        .filter_map(|line| {
+            let (pid, time) = line.trim_start().split_once(char::is_whitespace)?;
+            Some((pid.parse().ok()?, cpu_seconds(time.trim())?))
+        })
+        .collect();
+    if before.is_empty() {
+        return None;
+    }
+    thread::sleep(INTERVAL);
+    let mut rows: Vec<(f64, String)> = ps(&["-A", "-o", "pid=,ppid=,cputime=,comm="])
+        .lines()
+        .filter_map(|line| {
+            let (pid, rest) = line.trim_start().split_once(char::is_whitespace)?;
+            let (parent, rest) = rest.trim_start().split_once(char::is_whitespace)?;
+            let (time, command) = rest.trim_start().split_once(char::is_whitespace)?;
+            let pid: u32 = pid.parse().ok()?;
+            let used = cpu_seconds(time)? - before.get(&pid).copied().unwrap_or(0.0);
+            let cpu = used.max(0.0) / INTERVAL.as_secs_f64() * 100.0;
+            Some((cpu, format!("{cpu:.1} {pid} {parent} {}", command.trim())))
+        })
+        .collect();
+    rows.sort_by(|a, b| b.0.total_cmp(&a.0));
+    Some(rows.into_iter().fold(String::new(), |mut out, (_, line)| {
+        let _ = writeln!(out, "{line}");
+        out
+    }))
+}
+
+/// The seconds of a `ps` CPU time, `[[dd-]hh:]mm:ss.ss`.
+fn cpu_seconds(time: &str) -> Option<f64> {
+    let (days, clock) = time.split_once('-').unwrap_or(("0", time));
+    let mut seconds = days.parse::<f64>().ok()? * 86_400.0;
+    let mut scale = 1.0;
+    for part in clock.rsplit(':') {
+        seconds = part.parse::<f64>().ok()?.mul_add(scale, seconds);
+        scale *= 60.0;
+    }
+    Some(seconds)
 }
 
 /// What `ps` prints with `args`, empty when it cannot run.

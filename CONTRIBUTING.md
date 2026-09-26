@@ -217,9 +217,11 @@ some of the later one's growth, which one process a round cannot avoid.
 The two runs of one benchmark in a round are therefore a whole round
 process apart, about 33 s with the `wow` set, rather than back to back, and
 with an odd `RUNS` one leg goes first in one round more than the other (3
-to 2 with the default five). Before each round's process the run notes the
-machine's load and its busiest other processes, and the report warns about
-every round that started on a busy machine; run those again. It
+to 2 with the default five). Before each round's process the run measures
+for half a second the CPU its busiest other processes take, and the report
+warns about every round that started on a busy machine (one other process
+at a quarter of a core, all of them at half, or macOS throttling for heat);
+run those again. It
 exits 1 on a regression and 2 when the run itself cannot be trusted, which
 includes the two legs running different Wines. The runs and the report stay
 in a directory under the main checkout's `.codex/evidence/bench-ab`, and
