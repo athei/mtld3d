@@ -452,27 +452,56 @@ fn select_benches(config: &AbConfig) -> Result<Vec<Bench>, String> {
             }
         }
     }
-    for pattern in &config.benches {
-        let for_host = config.host.is_some() && names_host(pattern);
-        if !for_host
-            && !found
-                .iter()
-                .any(|bench| bench.id.contains(pattern.as_str()))
-        {
-            println!("bench-ab: no benchmark matches {pattern:?}; skipped");
-        }
-    }
-    // A selection of the host emitter benchmark alone runs its rounds only.
-    if found.is_empty() && config.host.is_none() {
-        return Err("no benchmark selected: nothing to compare".to_owned());
+    let ids: Vec<&str> = found.iter().map(|bench| bench.id.as_str()).collect();
+    for note in check_selection(&config.benches, &ids, config.host.is_some())? {
+        println!("{note}");
     }
     Ok(found)
 }
 
-/// Whether the filter `pattern` names the host emitter benchmark, which `make bench-ab` runs.
+/// Check a selection: the end-to-end benchmarks `ids` the `patterns` found, with or without `host`.
+///
+/// Returns the notes to print: one per filter that matches nothing, once
+/// however often it repeats, leaving out a filter that names the host
+/// emitter benchmark when the run has it. A selection without end-to-end
+/// benchmarks runs only when some filter names the host emitter and the
+/// run has it: the host rounds alone.
+///
+/// # Errors
+///
+/// Returns a message when the selection holds nothing to compare.
+pub fn check_selection(
+    patterns: &[String],
+    ids: &[&str],
+    host: bool,
+) -> Result<Vec<String>, String> {
+    let for_host = |pattern: &str| host && names_host(pattern);
+    let mut notes = Vec::new();
+    let mut seen = BTreeSet::new();
+    for pattern in patterns {
+        if !seen.insert(pattern.as_str()) || for_host(pattern) {
+            continue;
+        }
+        if !ids.iter().any(|id| id.contains(pattern.as_str())) {
+            notes.push(format!(
+                "bench-ab: no benchmark matches {pattern:?}; skipped"
+            ));
+        }
+    }
+    if ids.is_empty() && !patterns.iter().any(|pattern| for_host(pattern)) {
+        return Err("no benchmark selected: nothing to compare".to_owned());
+    }
+    Ok(notes)
+}
+
+/// Whether the filter `pattern` selects the host emitter benchmark, as filters select test paths.
+///
+/// A filter selects a benchmark whose id contains it, and the host
+/// emitter's id is [`HOST_ID`], so `host`, `emit` and `emit_corpus` select
+/// it and `emissive` does not.
 #[must_use]
 pub fn names_host(pattern: &str) -> bool {
-    pattern.contains("host") || pattern.contains("emit")
+    !pattern.is_empty() && HOST_ID.contains(pattern)
 }
 
 /// A launcher for `exe` under `spec`'s Wine and prefix, running the `#[ignore]`d tests.

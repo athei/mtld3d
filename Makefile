@@ -1132,8 +1132,8 @@ bench: install-windows-$(ARCH) install-unix-$(SDK_UNIX_ARCH)
 # whose test path contains it (BENCH_SET=dynamic_buffer_churn rechecks one),
 # the words mixing freely (`wow cold_start`); a name the checkout does not
 # carry yet is skipped with a note. The host emitter benchmark runs with a
-# named set or a filter naming `host` or `emit`, not with a subset of the
-# end-to-end ones. ACCEPT=a,b names the
+# named set or a filter that is part of `host::emit_corpus`, not with a
+# subset of the end-to-end ones. ACCEPT=a,b names the
 # exact metrics (draw counts and the like, which the workload fixes) whose
 # change is expected, and BENCH_CONFIG is appended to both legs' configuration
 # as it is for `make bench`. BASE=HEAD is an A/A run, the way to see how much
@@ -1206,9 +1206,10 @@ BENCH_SET_full :=
 BENCH_FILTER_WORDS = $(strip $(foreach w,$(BENCH_SET),$(if $(filter wow full,$(w)),$(BENCH_SET_$(w)),$(w))))
 BENCH_FILTERS = $(if $(filter full,$(BENCH_SET)),,--bench '$(BENCH_FILTER_WORDS)')
 # Whether BENCH_SET asks for the host emitter benchmark: a named set does, and
-# so does a filter naming `host` or `emit`; a subset of end-to-end benchmarks
-# does not.
-BENCH_HOST_WANTED = $(strip $(filter wow full,$(BENCH_SET))$(foreach w,$(BENCH_SET),$(findstring host,$(w))$(findstring emit,$(w))))
+# so does a filter that selects it the way filters select test paths, by
+# being part of its id `host::emit_corpus` (`host`, `emit`); a subset of
+# end-to-end benchmarks does not.
+BENCH_HOST_WANTED = $(strip $(filter wow full,$(BENCH_SET))$(foreach w,$(BENCH_SET),$(findstring $(w),host::emit_corpus)))
 BENCH_CHECKOUT = $(patsubst %/,%,$(dir $(shell git rev-parse --path-format=absolute --git-common-dir)))
 BENCH_AB_ROOT = $(abspath $(or $(LOG_DIR),$(BENCH_CHECKOUT)/.codex/evidence/bench-ab))
 BENCH_CONF_AB := $(BENCH_CONF)$(if $(BENCH_CONFIG),;$(BENCH_CONFIG))

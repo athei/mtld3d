@@ -374,8 +374,45 @@ fn the_timed_rounds_record_the_benchmarks_and_each_legs_images() {
 }
 
 #[test]
-fn a_filter_naming_host_or_emit_selects_the_host_emitter() {
+fn a_filter_selects_the_host_emitter_the_way_filters_select_test_paths() {
     assert!(names_host("host"));
     assert!(names_host("emit_corpus"));
+    assert!(names_host("host::emit"));
+    assert!(!names_host("emissive"));
+    assert!(!names_host("ghost"));
     assert!(!names_host("dynamic_buffer_churn"));
+}
+
+#[test]
+fn a_selection_notes_each_unmatched_filter_once_and_needs_something_to_compare() {
+    let patterns = |words: &[&str]| words.iter().map(|w| (*w).to_owned()).collect::<Vec<_>>();
+    let churn = ["e2e::bench_buffers::dynamic_buffer_churn"];
+    let notes = check_selection(
+        &patterns(&[
+            "dynamic_buffer_churn",
+            "nope",
+            "nope",
+            "dynamic_buffer_churn",
+        ]),
+        &churn,
+        false,
+    )
+    .unwrap();
+    assert_eq!(notes, ["bench-ab: no benchmark matches \"nope\"; skipped"]);
+    // The host emitter alone, when a filter names it and the run has it.
+    assert_eq!(
+        check_selection(&patterns(&["emit"]), &[], true),
+        Ok(Vec::new())
+    );
+    // Host flags with filters that match nothing are nothing to compare.
+    let reason = check_selection(&patterns(&["nope"]), &[], true).unwrap_err();
+    assert!(reason.contains("no benchmark selected"), "{reason}");
+    assert!(check_selection(&patterns(&["emissive"]), &[], true).is_err());
+    // A filter naming the host emitter in a run without it matches nothing.
+    assert!(check_selection(&patterns(&["host"]), &[], false).is_err());
+    // The host filter is not reported unmatched when the run has the host emitter.
+    assert_eq!(
+        check_selection(&patterns(&["dynamic_buffer_churn", "host"]), &churn, true),
+        Ok(Vec::new())
+    );
 }

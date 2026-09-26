@@ -314,7 +314,8 @@ twice as long. `BENCH_SET` may also be a space-separated list of test-name
 filters, each selecting the benchmarks whose test path contains it, mixed
 with the set names (`wow cold_start`), so `BENCH_SET=dynamic_buffer_churn`
 rechecks one suspicious benchmark without the rest of the set; the host
-emitter's rounds run with a set name or a filter naming `host` or `emit`.
+emitter's rounds run with a set name or a filter that is part of
+`host::emit_corpus`.
 
 ## Which suite is right when they disagree
 
