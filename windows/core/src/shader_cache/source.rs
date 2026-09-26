@@ -44,6 +44,12 @@ impl ShaderSource {
         }
     }
 
+    /// The retained DXSO token stream, header through end token.
+    #[must_use]
+    pub fn tokens(&self) -> &[u32] {
+        &self.tokens
+    }
+
     #[must_use]
     pub fn disk_key(&self) -> u64 {
         let id = ProgramId::from_tokens(&self.tokens);

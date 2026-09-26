@@ -286,6 +286,8 @@ pub struct Harness {
     present_flags: u32,
     /// `D3DMULTISAMPLE_TYPE` the swap chain was created with, carried into `reset`.
     multi_sample_type: u32,
+    /// The entries the interface was created with on top of the suite-wide configuration.
+    config_entries: String,
 }
 
 /// `Direct3DCreate9` under the environment lock.
@@ -410,6 +412,7 @@ impl Harness {
             behavior_flags: 0,
             present_flags: 0,
             multi_sample_type: 0,
+            config_entries: entries.to_owned(),
         }
     }
 
@@ -483,6 +486,7 @@ impl Harness {
             behavior_flags: cfg.behavior_flags,
             present_flags: cfg.present_flags,
             multi_sample_type: cfg.multi_sample_type,
+            config_entries: cfg.config_entries.to_owned(),
         }
     }
 
@@ -504,6 +508,14 @@ impl Harness {
     #[must_use]
     pub const fn hwnd(&self) -> usize {
         self.hwnd
+    }
+
+    /// The configuration entries this harness's interface resolved on top of the suite-wide ones.
+    ///
+    /// Empty when it asked for none ([`HarnessConfig::config_entries`]).
+    #[must_use]
+    pub fn config_entries(&self) -> &str {
+        &self.config_entries
     }
 
     /// The `CreateDevice` behaviour flags (`D3DCREATE_*`) the device was created with.

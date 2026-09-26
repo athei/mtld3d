@@ -330,6 +330,7 @@ version = "0.11.0"
 dependencies = [
  "bitflags 2.13.1",
  "mtld3d-core",
+ "mtld3d-shared",
  "mtld3d-types",
  "snmalloc-rs",
  "xxhash-rust",

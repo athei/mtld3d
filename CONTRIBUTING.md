@@ -197,6 +197,126 @@ Tests of window-style changes use `HarnessConfig::window_style` with
 `WindowStyle::Framed`, as does the window-lifecycle stress test. Keep that
 choice explicit when a test needs the non-client frame.
 
+## Benchmarks
+
+The synthetic benchmarks are `#[ignore]`d tests of the end-to-end binary, so
+`make test` lists them as ignored and never runs them. `make bench` runs them
+once against this checkout and writes a report per benchmark. `make bench-ab
+BASE=<ref>` is the one that answers whether a change made things slower: it
+builds `BASE` in a worktree of its own and this checkout, each into its own
+isolated Wine tree, runs every benchmark against both in alternating order
+for `RUNS` rounds (five by default, three at least), and judges each metric
+pair by pair against the noise those rounds show. A leg's round is one
+process running every benchmark in libtest's order, which is the same in
+both legs, so what one benchmark leaves in the process (the process-wide
+pipeline cache, the page-box pool) reaches the next alike on both sides of
+each pair; the memory rows a comparison judges are each benchmark's growth
+from a sample taken before its interface. That growth is clamped at zero,
+and memory an earlier benchmark frees late, inside a later one, can hide
+some of the later one's growth, which one process a round cannot avoid.
+The two runs of one benchmark in a round are therefore a whole round
+process apart, about 33 s with the `wow` set, rather than back to back, and
+with an odd `RUNS` one leg goes first in one round more than the other (3
+to 2 with the default five). Before each round's process the run measures
+for half a second the CPU its busiest other processes take, and the report
+warns about every round that started on a busy machine (one other process
+at a quarter of a core, all of them at half, or macOS throttling for heat);
+run those again. It
+exits 1 on a regression and 2 when the run itself cannot be trusted, which
+includes the two legs running different Wines. The runs and the report stay
+in a directory under the main checkout's `.codex/evidence/bench-ab`, and
+`make bench-compare AB_DIR=<dir>` judges one again into a report of its own,
+for instance with `ACCEPT=<metric>,...` naming an exact count (a draw count,
+a pass count) that the change is meant to move. `make clean-bench-ab`
+removes the kept base worktrees. The metrics a benchmark writes include the
+layer's own counters, read from the `perf-kv` line of its perf windows as
+`perf.*` (`bench.rs` gives the rules): the per-frame counts of work the API
+calls fix, such as `perf.draws_pf` and `perf.passes_pf`, are the exact ones.
+
+`make bench-host` is the one benchmark that needs no Wine: it times DXSO
+parsing and MSL emission on this machine over two synthetic corpora and any
+shader cache `BENCH_CORPUS` names, and writes its metrics into the `host`
+directory beside the reports of `make bench`. `make bench-ab` runs it too, in
+rounds of its own before the others, the run's first benchmark processes
+(only the short Wine process that lists the benchmarks comes before), so no
+benchmark's Wine process can still be exiting on the cores it times: each
+leg builds and runs its own
+tree's emitter, both read the same `BENCH_CORPUS`, and its MSL byte counts
+are exact, so a change that alters the emitted code shows up there even when
+its time per shader stays inside the noise. A `BASE` older than the host
+benchmark runs neither leg's, and the run says so. The same caches are what
+`cold_start` measures in both legs. A cache only one build can read (a
+format change between them) is skipped for both with a note, while any
+other difference in what a benchmark ran, such as its own configuration
+entries or the depth path it took, stops the comparison: only the build and
+the run may differ between the legs.
+
+After its timed rounds, each scene benchmark (one whose metrics declare its
+frame in `shape` lines) runs once more per leg with the pass trace on
+(`mtld3d::d3d9::passes=trace`, the rest of the layer at warn but for the
+lines that name its build and the perf windows its measured frames start
+on), untimed, into
+`<leg>/shape/` of the run's directory; a benchmark without `shape` lines, such
+as the shader-stutter one, gets a note instead. The runner stops that run
+once its log holds 33 submissions after the line the benchmark prints where
+its measured frames start, so it writes no metrics: its stamp and images are
+read from the log's identity lines and held to the leg's stamp and to the
+images of the leg's timed rounds. That costs a run of about six seconds per
+leg per scene benchmark and some MB of trace in the directory. The report
+compares the most common pass shape of the last thirty complete submissions
+between the legs, with every load and store action the load/store rules
+decided on those passes, and a leg in which fewer than 80 % of them agree is
+an untrustworthy run, exit 2. A rule that drops a store a
+later pass needs makes the frame faster, not slower, so the timings cannot
+catch it and this comparison does: any difference is a shape change, which
+fails the run like a changed exact metric unless `ACCEPT` names `shape` or
+`shape:<bench>`.
+
+`make bench-shape GAME_LOG=<layer log> BENCH_METRICS=<bench-<name>.metrics>`
+checks a benchmark's scene against a frame a game dumped with F12: the pass
+count, and per pass the draw count, the fixed-function share and the
+textures per draw, with render-target sizes shown relative to each side's
+back buffer. Run it by hand when building or reshaping a scene that stands
+for a game; it is no gate.
+
+Bench numbers come from `PROD=1 PERF=1` builds only; `make bench-ab` builds
+both legs that way and refuses any other profile, since `release` carries
+debug assertions that cost more than the frame does. Nothing else may run on
+the machine during a benchmark: no test leg, no conformance run, no build in
+another worktree, no game. Each of them takes the same cores and GPU the
+numbers measure, and a verdict is only as good as the quiet it was measured
+in. `BASE=HEAD` is an A/A run of one commit against itself (or of your
+uncommitted changes against the commit they sit on) and shows how far the
+machine moves the numbers by itself; run it when a verdict looks surprising.
+
+Run `make bench-ab BASE=origin/main` with the default `BENCH_SET=wow` before
+merging a change to the render, encoder, submit or shader path, and put the
+summary line in the pull request's verification. The `wow` set is the two
+World of Warcraft frames, the EVENT-query throttle under the game's settings
+and under the D3D9 defaults, the per-call API cost, and the buffer-lock and
+texture-streaming benchmarks at the game's rates. A leg's round is one
+process that runs all seven in libtest's order, the same in both legs, each
+on a device of its own: about a second for Wine's start, then per benchmark
+about 4.5 s for its device, the warm-up, untimed frames until its second perf
+window opens two seconds after its first frame, and that one window
+measured. So a round of one leg takes about 33 s and the default five rounds
+of both legs about 5.5 minutes, the four shape runs under half a minute and
+the host emitter's rounds about 20 s. Before the first run the two legs build at the same time
+and their prefixes boot while the benchmark binary builds: about a minute and
+a half with a new base worktree and a changed candidate, well under a minute
+when neither needs a build, longer when a change rebuilds the production
+layer in both legs. An A/A run of one commit against itself should take
+about 8 minutes in all, down from the 20 an earlier layout of the run took
+(an estimate from that run's timestamps and the new spans; the first run's
+timestamps say what it is on your machine). `BENCH_SET=full` runs every
+benchmark, the shader-stutter and cold-start ones included, and takes about
+twice as long. `BENCH_SET` may also be a space-separated list of test-name
+filters, each selecting the benchmarks whose test path contains it, mixed
+with the set names (`wow cold_start`), so `BENCH_SET=dynamic_buffer_churn`
+rechecks one suspicious benchmark without the rest of the set; the host
+emitter's rounds run with a set name or a filter that is part of
+`host::emit_corpus`.
+
 ## Which suite is right when they disagree
 
 Wine's d3d9 test suite is the spec oracle. The end-to-end suite is our own
@@ -426,6 +546,12 @@ touching four files. Refresh each lock with `cargo metadata --format-version 1
 --manifest-path <workspace>/Cargo.toml > /dev/null`, which rewrites the version
 lines without the dependency churn `cargo update` would bring, and check the bump
 before tagging with `make version-check TAG=vX.Y.Z`.
+
+Before the bump, measure the release against the previous one on a quiet
+machine with `make bench-ab BASE=<previous tag> BENCH_SET=full
+LOG_DIR=$PWD/.codex/evidence/bench-release/<version>`, which archives the runs
+and the report there. A regression it reports is fixed before the tag or named
+in the notes.
 
 Land that commit, wait for its run on `main` to go green, then push the tag. The
 release job refuses a tag whose version disagrees with either workspace, and

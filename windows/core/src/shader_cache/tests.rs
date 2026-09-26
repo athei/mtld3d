@@ -435,12 +435,17 @@ fn mixed_bundle_plus_singles_round_trip() {
 fn torn_trailing_chunk_dropped_and_flags_compaction() {
     let entries = sample_entries();
     let mut buf = write_file(std::slice::from_ref(&entries), false);
+    assert_eq!(read_records(&buf).valid_len(), buf.len(), "an intact file");
     // Truncate mid-frame of the final chunk.
     buf.truncate(buf.len() - 5);
     let (read, needs_compaction) = read_shaders(&buf);
     // Dropped the torn last chunk.
     assert_eq!(read.len(), entries.len() - 1);
     assert!(needs_compaction);
+    assert!(
+        read_records(&buf).valid_len() < buf.len(),
+        "the valid prefix ends before the torn chunk"
+    );
 }
 
 #[test]
@@ -939,6 +944,13 @@ fn emitter_change_retains_and_rebuilds_every_programmable_stage_and_model() {
             assert_eq!(records.shaders.len(), 1);
             let entry = &mut records.shaders[0];
             assert_eq!(entry.source, expected.source, "all emission inputs survive");
+            let tokens = entry.source().map(ShaderSource::tokens);
+            assert_eq!(
+                tokens,
+                expected.source().map(ShaderSource::tokens),
+                "the accessor hands back the retained DXSO"
+            );
+            assert_eq!(tokens.and_then(<[u32]>::last), Some(&0x0000_FFFF));
             assert!(entry.refresh_msl().expect("rebuild stale MSL"));
             assert_eq!(*entry, expected, "same specialization, name, and key");
             assert!(!entry.refresh_msl().expect("current MSL reuses its source"));

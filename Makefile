@@ -43,9 +43,9 @@ ISOLATED_REGISTRY := $(patsubst %,%/mtld3d-isolated-roots,$(shell git rev-parse 
 # Cleaning is the one goal that must not make what it is about to delete: the
 # clones below are seeded at parse time, before any recipe runs, so `make
 # ISOLATED=1 clean-isolated` would re-clone the SDK and the prefix and then
-# remove them. Skipped only when every goal named is one of the two cleaners,
-# so a mixed command line still gets its clones.
-ISOLATED_CLEANING := $(if $(MAKECMDGOALS),$(if $(filter-out clean-isolated clean-isolated-orphans,$(MAKECMDGOALS)),,1))
+# remove them. Skipped only when every goal named is one of the cleaners, so a
+# mixed command line still gets its clones.
+ISOLATED_CLEANING := $(if $(MAKECMDGOALS),$(if $(filter-out clean-isolated clean-isolated-orphans clean-bench-ab,$(MAKECMDGOALS)),,1))
 
 ifeq ($(ISOLATED),1)
 ISOLATED_SDK_SOURCE := $(WINE_SDK)
@@ -83,16 +83,37 @@ WINEBUILD  := $(WINE_SDK)/bin/winebuild
 WINESERVER := $(WINE_SDK)/bin/wineserver
 
 # Distribution bundles default to the production profile; PROD=0 overrides
-# for a quick release-profile bundle. So does `make bench`: `release` carries
-# debug assertions, whose checks would be most of what it measures. The
-# default holds for every goal of the invocation, so `bench` runs alone:
-# beside `test` it would build the suite's layer without debug assertions.
+# for a quick release-profile bundle. So do `make bench` and `make bench-host`:
+# `release` carries debug assertions, whose checks would be most of what they
+# measure. The default holds for every goal of the invocation, so each runs
+# alone: beside `test` it would build the suite's layer without debug
+# assertions.
 ifneq ($(filter bundle,$(MAKECMDGOALS)),)
 PROD ?= 1
 endif
 ifneq ($(filter bench,$(MAKECMDGOALS)),)
 ifneq ($(filter-out bench,$(MAKECMDGOALS)),)
 $(error `make bench` runs alone: its PROD=1 default would also apply to $(filter-out bench,$(MAKECMDGOALS)))
+endif
+PROD ?= 1
+endif
+# `make bench-ab` compares two builds of the profile the numbers are measured
+# in, production with the perf summary, and both legs build exactly that: a
+# leg of another profile would put the difference between the profiles into
+# every verdict. So the defaults are fixed rather than defaults.
+ifneq ($(filter bench-ab,$(MAKECMDGOALS)),)
+ifneq ($(filter-out bench-ab,$(MAKECMDGOALS)),)
+$(error `make bench-ab` runs alone: its PROD=1 PERF=1 would also apply to $(filter-out bench-ab,$(MAKECMDGOALS)))
+endif
+PROD ?= 1
+PERF ?= 1
+ifneq ($(PROD) $(PERF),1 1)
+$(error `make bench-ab` builds both legs with PROD=1 PERF=1; PROD=$(PROD) PERF=$(PERF) would compare another profile)
+endif
+endif
+ifneq ($(filter bench-host,$(MAKECMDGOALS)),)
+ifneq ($(filter-out bench-host,$(MAKECMDGOALS)),)
+$(error `make bench-host` runs alone: its PROD=1 default would also apply to $(filter-out bench-host,$(MAKECMDGOALS)))
 endif
 PROD ?= 1
 endif
@@ -322,7 +343,8 @@ TAG          ?= $(shell git describe --tags --exact-match 2>/dev/null)
 	install install-windows-i686 install-windows-x86_64 install-unix-x64 install-unix-arm64 \
 	bundle version-check stage clean-isolated clean-isolated-orphans \
 	configure-test-prefix configure-test-prefix-locked configure-test-prefix-session \
-	test test-unit test-e2e-i686 test-e2e-x86_64 bench \
+	configure-test-prefix-boot \
+	test test-unit test-e2e-i686 test-e2e-x86_64 bench bench-ab bench-compare bench-shape clean-bench-ab bench-host bench-host-build \
 	conformance conformance-i686 conformance-x86_64 \
 	conformance-baseline conformance-baseline-i686 conformance-baseline-x86_64 \
 	conformance-intel conformance-intel-i686 conformance-intel-x86_64 \
@@ -680,6 +702,19 @@ define WINE_REG_IS
 $(WINE) reg query $(1) /v $(2) 2>/dev/null | grep -qE '^[[:space:]]*$(2)[[:space:]]+REG_[A-Z]+[[:space:]]+$(3)[[:space:]]*$$'
 endef
 
+# Reads one value out of the prefix's registry file instead, with no wineserver
+# at all, so it is the prefix's answer only while no server holds the prefix:
+# a running server writes the file when it likes. Wine keeps HKCU in `user.reg`,
+# one section per key opening with the key's name in brackets, its backslashes
+# doubled, and the time it was written, then one `"<name>"=<data>` line per
+# value. The key and the line reach awk through the environment, which leaves
+# backslashes as they are. False when the file or the value is absent.
+# $(1) = the key under HKCU as the file spells it, $(2) = the whole value line.
+define WINE_REG_FILE_IS
+KEY='[$(1)]' LINE='$(2)' awk 'substr($$0, 1, 1) == "[" { here = ($$0 == ENVIRON["KEY"] || index($$0, ENVIRON["KEY"] " ") == 1) } here && $$0 == ENVIRON["LINE"] { found = 1 } END { exit !found }' '$(TEST_PREFIX)/user.reg' 2>/dev/null
+endef
+
+
 # Pin the prefix's display state for the tests, once per prefix rather than
 # once per leg.
 #
@@ -705,13 +740,37 @@ configure-test-prefix:
 # it ends and reboots a server, so nothing can be mid-boot here, and a probe
 # that finds no server also proves this prefix has no test process attached to
 # one.
+#
+# A prefix with no server whose registry file already holds the three values
+# (a clone of a configured prefix, or one whose server a finished run stopped)
+# needs no session to write them and so no restart: the server it boots reads
+# them before it enumerates the display. It only needs its persistent server
+# started, which saves the reg-add session and the restart after it, the
+# larger part of configuring on a fresh clone.
 configure-test-prefix-locked:
 	if $(WINESERVER) -k0 >/dev/null 2>&1 \
 		&& $(call WINE_REG_IS,'HKCU\Software\Wine\WineDbg',ShowCrashDialog,0x0) \
 		&& $(call WINE_REG_IS,'HKCU\Software\Wine\X11 Driver',EmulateModeset,Y) \
 		&& $(call WINE_REG_IS,'HKCU\Software\Wine\Mac Driver',RetinaMode,Y); \
 	then exit 0; fi; \
+	if ! $(WINESERVER) -k0 >/dev/null 2>&1 \
+		&& $(call WINE_REG_FILE_IS,Software\\Wine\\WineDbg,"ShowCrashDialog"=dword:00000000) \
+		&& $(call WINE_REG_FILE_IS,Software\\Wine\\X11 Driver,"EmulateModeset"="Y") \
+		&& $(call WINE_REG_FILE_IS,Software\\Wine\\Mac Driver,"RetinaMode"="Y"); \
+	then $(MAKE) configure-test-prefix-boot; exit; fi; \
 	$(MAKE) configure-test-prefix-session
+
+# The persistent server and the boot the session ends with, alone and loud:
+# on this path no `reg add` has shown that Wine runs in the prefix, so a boot
+# that fails, or leaves no server behind, fails the target with what wineboot
+# said. Its output goes to a file rather than a pipe, since the residents
+# wineboot leaves behind inherit it and would hold a pipe open forever.
+configure-test-prefix-boot:
+	$(WINESERVER) -p >/dev/null 2>&1 || { echo "wineserver -p for $(TEST_PREFIX) failed" >&2; exit 1; }
+	log=$$(mktemp "$${TMPDIR:-/tmp}/mtld3d-wineboot.XXXXXX") || exit 1; \
+	$(WINE) wineboot </dev/null >"$$log" 2>&1 && $(WINESERVER) -k0 >/dev/null 2>&1; status=$$?; \
+	[ $$status -eq 0 ] || { echo "wine wineboot in $(TEST_PREFIX) failed or left no server:" >&2; cat "$$log" >&2; }; \
+	rm -f "$$log"; exit $$status
 
 configure-test-prefix-session:
 	# Keep automated tests non-interactive and independent of mutable prefix
@@ -846,6 +905,8 @@ E2E_EXES_x86_64 = $(if $(STAGE),$(STAGE)/tests/x86_64/*.exe,$(call E2E_EXES,$(PE
 # binary for this machine's arch (compare `CONFORMANCE_BIN`).
 E2E_RUNNER_DIR := $(if $(STAGE),.,unix)
 E2E_RUNNER     := $(if $(STAGE),$(STAGE)/e2e/$(HOST_ARCH)/mtld3d-e2e,cargo +$(RUST_STABLE) run --profile $(PROFILE) -p mtld3d-e2e --)
+# Builds that runner without running it, in its directory; nothing to build from a stage.
+E2E_RUNNER_BUILD := $(if $(STAGE),true,cargo +$(RUST_STABLE) build --profile $(PROFILE) -p mtld3d-e2e)
 
 test-e2e-i686: install-windows-i686 install-unix-$(SDK_UNIX_ARCH)
 	$(MAKE) configure-test-prefix
@@ -965,10 +1026,17 @@ VARIANT ?= native
 conformance-isolate: install-windows-$(ARCH) install-unix-$(SDK_UNIX_ARCH)
 	$(call conformance_leg,$(ARCH),--only $(ONLY) --repeat $(REPEAT) --variant $(VARIANT))
 
-# The synthetic benchmarks (NOT part of `make test`): `bench_frame_shape.rs`, a
-# frame shaped like World of Warcraft 3.3.5a's busy frame, and
-# `bench_shader_stutter.rs`, frames that each meet pixel shaders never seen
-# before with the shader cache off. They are `#[ignore]`d tests of the e2e
+# The synthetic benchmarks (NOT part of `make test`), the `#[ignore]`d tests of
+# `windows/tests/tests/e2e/bench_*.rs` (`windows/tests/COVERAGE.md` has a row
+# for each file): frames shaped like World of Warcraft 1.12's and 3.3.5a's busy
+# frames (`wow_112_busy_frame`, `wow_335a_busy_frame`), frames that each meet
+# pixel shaders never seen before with the shader cache off, an EVENT-query
+# throttle under the `wow` profile's query keys and under the D3D9 defaults
+# (`query_poll_wow`, `query_poll_spec`), the API thread's cost of one call
+# of each kind (`api_call_cost`), buffer locks and texture streaming at a
+# game's rates (`dynamic_buffer_churn`, `texture_streaming`), and fresh
+# processes from launch to their first frame on a populated shader cache
+# (`cold_start`). They are `#[ignore]`d tests of the e2e
 # binary, so the suite reports them ignored; this runs them alone, one at a
 # time in one process, through the runner's `--ignored`, for one PE arch
 # (ARCH, default i686, the arch the game ships). They measure and never assert
@@ -985,25 +1053,316 @@ conformance-isolate: install-windows-$(ARCH) install-unix-$(SDK_UNIX_ARCH)
 # benchmark's own `shaderCache.enable=false` still wins over them). PERF=1
 # builds the layer with its perf summary. Each benchmark writes
 # `bench-<name>.txt` into LOG_DIR (default `.codex/evidence/bench`), beside
-# the layer's log that a PERF=1 build's summary rows are copied from, and the
-# reports are printed at the end. FILTER='<patterns>' narrows the run as it
-# does for `make test`, e.g. `FILTER=stutter`.
+# the layer's log that a PERF=1 build's summary rows are copied from, and
+# `bench-<name>.metrics` next to it, the same numbers plus the build's
+# identity, its address-space samples, a scene's per-pass shape and, from a
+# PERF=1 build, the counters of the layer's `perf-kv` lines as `perf.*`, one
+# record per line for a program comparing two builds (`bench.rs` documents
+# the format). A run first deletes both kinds of file left by the one
+# before, prints the reports at the end and says where the metrics files
+# are. FILTER='<patterns>' narrows the run as it does for `make test`, e.g.
+# `FILTER=stutter`.
+#
+# BENCH_CORPUS='<path> <path>' names real shader caches (`mtld3d_shaders.bin`)
+# for the benchmarks that read them: `cold_start` under `make bench` and the
+# host emitter under `make bench-host` and `make bench-ab`, which name a corpus
+# the same way. Its name is the name of the directory its file sits in, the
+# path resolved first (a relative one against this checkout, so a bare file
+# name is named after the checkout's directory, and `~` is not expanded), with
+# every character other than an ASCII letter or digit turned into `_`. Each
+# target copies the caches into a `corpus` directory of its own output, one
+# `<name>/mtld3d_shaders.bin` apiece, and the benchmark takes the name from
+# that directory; the directory is emptied first, so a run without BENCH_CORPUS
+# measures none. Paths may not contain spaces. Two paths of one name, or a
+# file at the filesystem root, stop the run before it builds.
 BENCH_DIR := $(or $(LOG_DIR),$(CURDIR)/.codex/evidence/bench)
+bench_corpus_name = $(shell printf '%s' '$(notdir $(patsubst %/,%,$(dir $(abspath $(1)))))' | tr -c 'A-Za-z0-9' '_')
+BENCH_CORPUS_NAMES := $(foreach f,$(BENCH_CORPUS),$(call bench_corpus_name,$(f)))
+BENCH_CORPUS_DUPLICATES := $(strip $(foreach n,$(sort $(BENCH_CORPUS_NAMES)),$(if $(filter-out 1,$(words $(filter $(n),$(BENCH_CORPUS_NAMES)))),$(n))))
+ifneq ($(filter bench bench-host bench-ab,$(MAKECMDGOALS)),)
+ifneq ($(words $(BENCH_CORPUS)),$(words $(BENCH_CORPUS_NAMES)))
+$(error BENCH_CORPUS: a file at the filesystem root has no directory to name its corpus after)
+endif
+ifneq ($(BENCH_CORPUS_DUPLICATES),)
+$(error BENCH_CORPUS: each corpus is named after its directory, and more than one path is named: $(BENCH_CORPUS_DUPLICATES))
+endif
+endif
+# The staged copy of the corpus at path $(2) under the output directory $(1).
+bench_corpus_copy = $(1)/corpus/$(call bench_corpus_name,$(2))/mtld3d_shaders.bin
+# Empty $(1)/corpus and copy every BENCH_CORPUS entry into it.
+bench_stage_corpus = rm -rf '$(1)/corpus'$(foreach f,$(BENCH_CORPUS), && mkdir -p '$(dir $(call bench_corpus_copy,$(1),$(f)))' && cp '$(abspath $(f))' '$(call bench_corpus_copy,$(1),$(f))')
+# How long a benchmark process may print nothing before the runner kills it
+# as hung. It bounds silence, not a process: `make bench` and a `make bench-ab`
+# round run every benchmark in one process, and each benchmark prints a line
+# where its measured frames start and another when it reports, so a round of
+# many benchmarks is bounded per benchmark and never by their sum.
 BENCH_TIMEOUT ?= 300
 BENCH_TARGET := $(if $(filter x86_64,$(ARCH)),$(PE_x64),$(PE_i386))
 BENCH_EXES = $(if $(STAGE),$(STAGE)/tests/$(ARCH)/*.exe,$(call E2E_EXES,$(BENCH_TARGET),--profile $(PROFILE)))
-MTLD3D_CONF_BENCH := shaderCache.enable=false;color.hdr.enable=false;log.dir=Z:$(BENCH_DIR)$(if $(BENCH_CONFIG),;$(BENCH_CONFIG))
+BENCH_CONF := shaderCache.enable=false;color.hdr.enable=false
+MTLD3D_CONF_BENCH := $(BENCH_CONF);log.dir=Z:$(BENCH_DIR)$(if $(BENCH_CONFIG),;$(BENCH_CONFIG))
+# Builds the benchmark binaries and names the one that carries the benchmarks,
+# the one-process suite, in the shell variable `suite`.
+define BENCH_SUITE_ASSIGN
+$(call E2E_EXES_ASSIGN,$(BENCH_EXES)); suite=; \
+	for exe in $$exes; do case $$exe in */e2e-*.exe|*/e2e.exe) suite=$$exe;; esac; done; \
+	[ -n "$$suite" ] || { echo "no e2e test binary among: $$exes" >&2; exit 2; }
+endef
 bench: install-windows-$(ARCH) install-unix-$(SDK_UNIX_ARCH)
 	$(MAKE) configure-test-prefix
-	mkdir -p '$(BENCH_DIR)' && rm -f '$(BENCH_DIR)'/bench-*.txt
-	$(call E2E_EXES_ASSIGN,$(BENCH_EXES)); suite=; \
-	for exe in $$exes; do case $$exe in */e2e-*.exe|*/e2e.exe) suite=$$exe;; esac; done; \
-	[ -n "$$suite" ] || { echo "no e2e test binary among: $$exes" >&2; exit 2; }; \
+	mkdir -p '$(BENCH_DIR)' && rm -f '$(BENCH_DIR)'/bench-*.txt '$(BENCH_DIR)'/bench-*.metrics
+	$(call bench_stage_corpus,$(BENCH_DIR))
+	$(BENCH_SUITE_ASSIGN); \
 	cd $(E2E_RUNNER_DIR) && MTLD3D_CONFIG='$(MTLD3D_CONF_BENCH)' WINEDEBUG= MTL_DEBUG_LAYER=0 MTL_HUD_ENABLED=0 \
 		$(E2E_RUNNER) --wine $(WINE) --jobs 1 --timeout $(BENCH_TIMEOUT) --ignored \
 		$(if $(FILTER),--filter '$(FILTER)') --log-dir '$(BENCH_DIR)' -- $$suite
 	if ls '$(BENCH_DIR)'/bench-*.txt >/dev/null 2>&1; then cat '$(BENCH_DIR)'/bench-*.txt; \
+		echo "make bench: metrics in:"; ls -1 '$(BENCH_DIR)'/bench-*.metrics 2>/dev/null || echo "  none"; \
 	else echo "make bench: no benchmark ran; FILTER='$(FILTER)' matches none of them"; fi
+
+# `make bench-ab BASE=<ref>` measures a change: the same benchmarks against
+# two builds of the layer, BASE and this checkout, interleaved, and then a
+# verdict per metric. RUNS (default 5) is how many rounds each benchmark gets,
+# a round being one run of either build back to back, the one that goes first
+# alternating, and each build's run one process running every benchmark in
+# libtest's order, the same in both.
+# BENCH_SET picks the benchmarks: `wow` (the default) the ones that stand for
+# the game this layer serves first, `full` every benchmark, and anything else
+# a space-separated list of test-name filters, each selecting the benchmarks
+# whose test path contains it (BENCH_SET=dynamic_buffer_churn rechecks one),
+# the words mixing freely (`wow cold_start`); a name the checkout does not
+# carry yet is skipped with a note. The host emitter benchmark runs with a
+# named set or a filter that is part of `host::emit_corpus`, not with a
+# subset of the end-to-end ones. ACCEPT=a,b names the
+# exact metrics (draw counts and the like, which the workload fixes) whose
+# change is expected, and BENCH_CONFIG is appended to both legs' configuration
+# as it is for `make bench`. BASE=HEAD is an A/A run, the way to see how much
+# the machine moves the numbers by itself, and with uncommitted changes it
+# compares them against the commit they sit on.
+#
+# Both legs build PROD=1 PERF=1 into ISOLATED=1 trees of their own: BASE in a
+# detached worktree under the main checkout's `.codex/worktrees`, kept for
+# the next run and removed by `make clean-bench-ab`, and this checkout in its
+# own `.wine-isolated`. Both trees are taken down and cloned again from the
+# SDK and the prefix this invocation would otherwise use on every run, and
+# both prefixes are configured by this checkout's `configure-test-prefix`, so
+# a Wine rebuilt since the last run, an older BASE's prefix settings or a test
+# run in this checkout's prefix cannot make the legs differ in more than the
+# layer; the runner checks that both run one Wine before it starts, and the
+# report names it. The clones cost about a second a tree; what costs is a
+# prefix's first boot, and a clone of a configured prefix only boots once
+# (see `configure-test-prefix-locked`). The two legs build at the same time,
+# the base's output going to `build-base.log` in the run's directory, and the
+# two prefixes are configured at the same time while the benchmark binary and
+# the runner build, each prefix's output going to `configure-<leg>.log` there
+# and shown when it fails. The persistent
+# wineservers of both prefixes are stopped when the run ends, however it
+# ends. The candidate's
+# benchmark binary drives both legs: it links `d3d9` by name and nothing of
+# the layer's, so the workload is the same on either side. Every run checks
+# that the layer it loaded carries its leg's `git describe` stamp, computed
+# here the way `unix/shared/build.rs` stamps it. The two legs must also load
+# two different `d3d9.dll` images, except in a true A/A run (BASE is HEAD and
+# the tree is clean), where a deterministic build may give both the same one.
+#
+# The runs, their layer logs and the report go to a directory of their own,
+# `<base>-vs-<candidate>-<time>` under LOG_DIR (default
+# `.codex/evidence/bench-ab` in the main checkout, so the results outlive the
+# worktree that made them). After its timed rounds every benchmark whose
+# metrics declare `shape` lines runs once more per leg with the pass trace on
+# (the rest of the layer at warn but for the lines that name its build and
+# the perf windows, `shape.rs` has the filter), untimed and stopped once its
+# log holds the steady submissions, into
+# `<leg>/shape/`, and the report compares the passes and load/store decisions
+# of its steady submission between the legs; a difference fails the run
+# unless ACCEPT names `shape` or `shape:<bench>`. Exit 1 is a regression
+# or a shape change, 2 a run or a directory that cannot be trusted. `make
+# bench-compare AB_DIR=<that directory>` judges it again, shapes included,
+# with another ACCEPT for instance, into a report of its own
+# (`report-compare-<time>.txt`) beside the one the run wrote.
+#
+# The host emitter benchmark (`make bench-host`) runs in rounds of its own,
+# the first benchmark processes of the run, before the end-to-end benchmarks
+# and whatever BENCH_SET names (only their short `--list` under Wine comes
+# before it), so that no benchmark's Wine process is still exiting while it
+# times host code. It is host
+# code, so each leg builds and runs its own tree's `emit_corpus` with the
+# leg's profile, and BENCH_CORPUS names the shader caches both legs read
+# (none: the synthetic corpora alone); the same staged copies are linked into
+# every end-to-end run's directory, so `cold_start` measures them as it does
+# under `make bench`. A BASE whose Makefile has no
+# `bench-host-build` predates the benchmark, and then neither leg runs it.
+#
+# Nothing else may run on the machine meanwhile, tests, builds and games
+# included: the verdicts are only as good as the quiet of the machine.
+RUNS ?= 5
+BENCH_SET ?= wow
+BENCH_SET_wow := wow_112_busy_frame wow_335a_busy_frame query_poll_wow query_poll_spec api_call_cost \
+	dynamic_buffer_churn texture_streaming
+BENCH_SET_full :=
+# The runner's --bench filters for BENCH_SET, each word on its own: a set's
+# name stands for its list and any other word for itself, and `full` anywhere
+# means every benchmark, so no filter at all.
+BENCH_FILTER_WORDS = $(strip $(foreach w,$(BENCH_SET),$(if $(filter wow full,$(w)),$(BENCH_SET_$(w)),$(w))))
+BENCH_FILTERS = $(if $(filter full,$(BENCH_SET)),,--bench '$(BENCH_FILTER_WORDS)')
+# Whether BENCH_SET asks for the host emitter benchmark: a named set does, and
+# so does a filter that selects it the way filters select test paths, by
+# being part of its id `host::emit_corpus` (`host`, `emit`); a subset of
+# end-to-end benchmarks does not.
+BENCH_HOST_WANTED = $(strip $(filter wow full,$(BENCH_SET))$(foreach w,$(BENCH_SET),$(findstring $(w),host::emit_corpus)))
+BENCH_CHECKOUT = $(patsubst %/,%,$(dir $(shell git rev-parse --path-format=absolute --git-common-dir)))
+BENCH_AB_ROOT = $(abspath $(or $(LOG_DIR),$(BENCH_CHECKOUT)/.codex/evidence/bench-ab))
+BENCH_CONF_AB := $(BENCH_CONF)$(if $(BENCH_CONFIG),;$(BENCH_CONFIG))
+# What each leg's isolated clones are taken from: the SDK and prefix this
+# invocation names, before an ISOLATED=1 of its own pointed them at clones.
+BENCH_SDK_SOURCE := $(if $(filter 1,$(ISOLATED)),$(ISOLATED_SDK_SOURCE),$(WINE_SDK))
+BENCH_PREFIX_SOURCE := $(if $(filter 1,$(ISOLATED)),$(ISOLATED_PREFIX_SOURCE),$(or $(WINEPREFIX),$(HOME)/.wine))
+BENCH_LEG_MAKE = ISOLATED=1 PROD=1 PERF=1 WINE_SDK='$(BENCH_SDK_SOURCE)' WINEPREFIX='$(BENCH_PREFIX_SOURCE)'
+BENCH_LEG_INSTALL = install-windows-$(ARCH) install-unix-$(SDK_UNIX_ARCH)
+# `make` for the sub-makes that run beside each other in one bench-ab recipe
+# line. A line that names `$(MAKE)` itself runs even under `make -n`, and these
+# lines also build the benchmark binary and boot the prefixes, which a dry run
+# must only print.
+BENCH_SUBMAKE = $(MAKE)
+# What each leg's sub-make builds: its install, and its host emitter benchmark
+# when BASE has one.
+BENCH_LEG_BUILD = $(BENCH_LEG_INSTALL) $(if $(BENCH_HOST_RUN),bench-host-build)
+# Says, in a recipe's shell, that the step $(2) failed when the status $(1) is
+# not zero, and shows the end of its log $(3) in the run's directory.
+bench_leg_failed = [ $(1) -eq 0 ] || { echo "make bench-ab: the $(2) failed; the end of $(BENCH_AB_OUT)/$(3):" >&2; tail -n 40 '$(BENCH_AB_OUT)/$(3)' >&2; }
+# This checkout's `configure-test-prefix` on the isolated tree $(1), not
+# isolated again: the tree is the leg's clone.
+BENCH_LEG_CONFIGURE = ISOLATED= WINE_SDK='$(1)/sdk' WINE_INSTALL_DIR= WINEPREFIX='$(1)/prefix' configure-test-prefix
+# Stops the persistent wineservers of both legs' prefixes, whatever state
+# the run left them in; a leg that has no server is left as it is.
+define BENCH_STOP_SERVERS
+stop_servers() { for leg in '$(BENCH_BASE_ISO)' '$(ISOLATED_ROOT)'; do \
+	[ -x "$$leg/sdk/bin/wineserver" ] && WINEPREFIX="$$leg/prefix" "$$leg/sdk/bin/wineserver" -k >/dev/null 2>&1 ; \
+	done ; true ; }
+endef
+ifneq ($(filter bench-ab,$(MAKECMDGOALS)),)
+ifeq ($(strip $(BENCH_SET)),)
+$(error BENCH_SET is wow, full or a list of test-name filters, not empty)
+endif
+BENCH_BASE_SHA := $(shell git rev-parse --verify --quiet '$(BASE)^{commit}')
+ifeq ($(BENCH_BASE_SHA),)
+$(error `make bench-ab` needs BASE=<ref>, the commit to compare this checkout against$(if $(BASE),; $(BASE) names none))
+endif
+BENCH_BASE_SHORT := $(shell git rev-parse --short=12 $(BENCH_BASE_SHA))
+# Whether the checkout differs from its commit. Untracked files do not count,
+# the same as for the layer stamp: the build compiles what the tree tracks,
+# and a file nothing tracks is not part of it.
+BENCH_DIRTY := $(shell git status --porcelain --untracked-files=no)
+BENCH_CAND_SHORT := $(shell git rev-parse --short=12 HEAD)$(if $(BENCH_DIRTY),-dirty)
+# A true A/A run: BASE is this checkout's commit and nothing in the tree differs.
+BENCH_SAME_IMAGE := $(if $(filter $(BENCH_BASE_SHA),$(shell git rev-parse HEAD)),$(if $(BENCH_DIRTY),,--allow-same-image))
+BENCH_BASE_DIR := $(BENCH_CHECKOUT)/.codex/worktrees/bench-base-$(BENCH_BASE_SHORT)
+BENCH_BASE_ISO := $(BENCH_BASE_DIR)/.wine-isolated
+# The stamp `unix/shared/build.rs` compiles in: `git describe --tags --always`
+# of the commit, never `--dirty`, so a candidate with uncommitted changes
+# carries its commit's stamp.
+BENCH_BASE_STAMP := $(shell git describe --tags --always $(BENCH_BASE_SHA))
+BENCH_CAND_STAMP := $(shell git describe --tags --always)
+BENCH_AB_OUT := $(BENCH_AB_ROOT)/$(BENCH_BASE_SHORT)-vs-$(BENCH_CAND_SHORT)-$(shell date +%Y%m%d-%H%M%S)
+# Whether BASE carries the host emitter benchmark, read from its Makefile in
+# git, since its worktree may not exist yet.
+BENCH_HOST_AB := $(shell git show $(BENCH_BASE_SHA):Makefile 2>/dev/null | grep -q '^bench-host-build:' && echo 1)
+# Whether this run runs it: BASE carries it and BENCH_SET asks for it.
+BENCH_HOST_RUN = $(and $(BENCH_HOST_AB),$(BENCH_HOST_WANTED))
+BENCH_HOST_FLAGS = $(if $(BENCH_HOST_RUN),--base-host '$(call BENCH_HOST_EXE,$(BENCH_BASE_DIR))' \
+	--cand-host '$(call BENCH_HOST_EXE,$(CURDIR))' $(foreach f,$(BENCH_CORPUS),--host-corpus '$(call bench_corpus_copy,$(BENCH_AB_OUT),$(f))'))
+endif
+bench-ab:
+	git -C '$(BENCH_CHECKOUT)' check-ignore -q '$(BENCH_BASE_DIR)' || \
+		{ echo "make bench-ab: $(BENCH_CHECKOUT)/.codex is not ignored; add .codex/ to .git/info/exclude" >&2; exit 2; }
+	[ -d '$(BENCH_BASE_DIR)' ] || git worktree add --detach '$(BENCH_BASE_DIR)' $(BENCH_BASE_SHA)
+	test "$$(git -C '$(BENCH_BASE_DIR)' rev-parse HEAD)" = $(BENCH_BASE_SHA) || \
+		{ echo "make bench-ab: $(BENCH_BASE_DIR) is not at $(BENCH_BASE_SHA); make clean-bench-ab removes it" >&2; exit 2; }
+	$(call clean_isolated_at,$(BENCH_BASE_ISO))
+	$(call clean_isolated_at,$(ISOLATED_ROOT))
+	mkdir -p '$(BENCH_AB_OUT)'
+	$(if $(BENCH_HOST_WANTED),$(if $(BENCH_HOST_AB),,@echo "make bench-ab: BASE $(BENCH_BASE_SHORT) has no host emitter benchmark; neither leg runs it"))
+	$(BENCH_SUBMAKE) -C '$(BENCH_BASE_DIR)' $(BENCH_LEG_MAKE) $(BENCH_LEG_BUILD) > '$(BENCH_AB_OUT)/build-base.log' 2>&1 & base=$$!; \
+		$(BENCH_SUBMAKE) $(BENCH_LEG_MAKE) $(BENCH_LEG_BUILD); cand=$$?; \
+		wait $$base; base=$$?; \
+		$(call bench_leg_failed,$$base,base leg's build,build-base.log); \
+		[ $$base -eq 0 ] && [ $$cand -eq 0 ] || exit 2; \
+		echo "make bench-ab: base leg built; its output is in $(BENCH_AB_OUT)/build-base.log"
+	$(BENCH_SUBMAKE) $(call BENCH_LEG_CONFIGURE,$(BENCH_BASE_ISO)) > '$(BENCH_AB_OUT)/configure-base.log' 2>&1 & base=$$!; \
+		$(BENCH_SUBMAKE) $(call BENCH_LEG_CONFIGURE,$(ISOLATED_ROOT)) > '$(BENCH_AB_OUT)/configure-cand.log' 2>&1 & cand=$$!; \
+		( $(BENCH_SUITE_ASSIGN) && cd $(E2E_RUNNER_DIR) && $(E2E_RUNNER_BUILD) ); built=$$?; \
+		wait $$base; base=$$?; wait $$cand; cand=$$?; \
+		$(call bench_leg_failed,$$base,base prefix's configure-test-prefix,configure-base.log); \
+		$(call bench_leg_failed,$$cand,candidate prefix's configure-test-prefix,configure-cand.log); \
+		[ $$base -eq 0 ] && [ $$cand -eq 0 ] && [ $$built -eq 0 ] || { $(BENCH_STOP_SERVERS); stop_servers; exit 2; }
+	$(if $(BENCH_CORPUS),$(call bench_stage_corpus,$(BENCH_AB_OUT)))
+	$(BENCH_STOP_SERVERS); trap stop_servers EXIT; \
+	$(BENCH_SUITE_ASSIGN); \
+	cd $(E2E_RUNNER_DIR) && WINEDEBUG= MTL_DEBUG_LAYER=0 MTL_HUD_ENABLED=0 \
+		$(E2E_RUNNER) bench-ab --out '$(BENCH_AB_OUT)' --runs $(RUNS) --timeout $(BENCH_TIMEOUT) \
+		--base-wine '$(BENCH_BASE_ISO)/sdk/bin/wine' \
+		--base-prefix '$(BENCH_BASE_ISO)/prefix' --base-stamp '$(BENCH_BASE_STAMP)' \
+		--cand-wine '$(ISOLATED_ROOT)/sdk/bin/wine' \
+		--cand-prefix '$(ISOLATED_ROOT)/prefix' --cand-stamp '$(BENCH_CAND_STAMP)' \
+		--config '$(BENCH_CONF_AB)' $(BENCH_FILTERS) \
+		$(BENCH_HOST_FLAGS) $(if $(BENCH_CORPUS),--corpus-dir '$(BENCH_AB_OUT)/corpus') \
+		$(if $(ACCEPT),--accept '$(ACCEPT)') $(BENCH_SAME_IMAGE) --report '$(BENCH_AB_OUT)/report.txt' -- $$suite
+
+bench-compare:
+	test -n '$(AB_DIR)' || { echo "make bench-compare needs AB_DIR=<a directory make bench-ab wrote>" >&2; exit 2; }
+	cd $(E2E_RUNNER_DIR) && $(E2E_RUNNER) bench-compare '$(abspath $(AB_DIR))' \
+		$(if $(ACCEPT),--accept '$(ACCEPT)') --report '$(abspath $(AB_DIR))/report-compare-$(shell date +%Y%m%d-%H%M%S).txt'
+
+# `make bench-shape GAME_LOG=<layer log> BENCH_METRICS=<bench-<name>.metrics>`
+# calibrates a benchmark's scene against a game: it reads the last complete
+# frame the game dumped with F12 into passes and prints them beside the
+# benchmark's `shape` lines, flagging draw counts off by more than 10 %,
+# fixed-function shares off by more than 10 points, textures per draw off by
+# more than 1.0, and a different pass count. Exit 1 when anything is flagged.
+# It runs nothing under Wine and judges no build; it is run by hand.
+bench-shape:
+	test -n '$(GAME_LOG)' -a -n '$(BENCH_METRICS)' || \
+		{ echo "make bench-shape needs GAME_LOG=<a layer log with an F12 dump> and BENCH_METRICS=<a bench-<name>.metrics>" >&2; exit 2; }
+	cd $(E2E_RUNNER_DIR) && $(E2E_RUNNER) bench-shape --game-log '$(abspath $(GAME_LOG))' \
+		--metrics '$(abspath $(BENCH_METRICS))'
+
+# The base worktrees `make bench-ab` keeps, each with its isolated Wine session
+# and clones, taken down the way `clean-isolated` takes down a checkout's own.
+clean-bench-ab:
+	for wt in '$(BENCH_CHECKOUT)'/.codex/worktrees/bench-base-*; do \
+		[ -d "$$wt" ] || continue ; \
+		echo "==> $$wt" ; \
+		$(call clean_isolated_at,$$wt/.wine-isolated) ; \
+		git worktree remove --force "$$wt" ; \
+	done
+
+# The host emitter benchmark (NOT part of `make test` either):
+# `windows/core/examples/emit_corpus.rs` times DXSO parsing and MSL emission
+# and totals the size of the MSL, which is what Metal's compile time and so a
+# first-use stutter grows with. It always runs a synthetic fixed-function
+# corpus and a synthetic SM1-SM3 one; BENCH_CORPUS (above) adds each named
+# `mtld3d_shaders.bin`, whose programmable records keep their DXSO, as a
+# corpus of its own, staged under the `host` directory's `corpus`. Game
+# caches stay out of the tree, so this is how their shaders get measured. Like `test-unit` it builds
+# for this machine's own arch and needs no install and no Wine; like `bench` it
+# builds with the production profile unless PROD=0 asks for `release`. The
+# table goes to stdout, and each corpus writes `bench-host_emit_<corpus>.metrics`
+# into the `host` directory under LOG_DIR (default `.codex/evidence/bench`),
+# apart from the files `make bench` writes and deletes. `bench-host-build`
+# builds the benchmark without running it, which is how `make bench-ab` gets
+# each leg's own.
+BENCH_HOST_DIR := $(BENCH_DIR)/host
+# The benchmark `bench-host-build` builds in the checkout $(1).
+BENCH_HOST_EXE = $(1)/windows/target/$(UNIX_NATIVE_TARGET)/$(PROFILE)/examples/emit_corpus
+bench-host-build:
+	cd windows && cargo +$(RUST_STABLE) build --profile $(PROFILE) -p mtld3d-core \
+		--target $(UNIX_NATIVE_TARGET) --example emit_corpus
+
+bench-host: bench-host-build
+	mkdir -p '$(BENCH_HOST_DIR)' && rm -f '$(BENCH_HOST_DIR)'/bench-host_emit_*.metrics
+	$(call bench_stage_corpus,$(BENCH_HOST_DIR))
+	'$(call BENCH_HOST_EXE,$(CURDIR))' --metrics '$(abspath $(BENCH_HOST_DIR))' \
+		$(foreach f,$(BENCH_CORPUS),'$(call bench_corpus_copy,$(BENCH_HOST_DIR),$(f))')
 
 fmt:
 	cd windows && cargo +$(RUST_NIGHTLY) fmt
@@ -1121,7 +1480,11 @@ clean:
 #
 # The clones therefore only go once nothing is running out of them, and the one
 # thing executed out of a directory that is about to be deleted is the bounded
-# `-k` above. One logical shell line, so a caller that found a root of its own
+# `-k` above. A delete can still meet files written into the tree meanwhile
+# (a helper process on its way out, or macOS writing a `.DS_Store`), so it is
+# tried again every half second for five seconds; a root still there after
+# that fails the call, naming the processes that hold files under it (an
+# `lsof +D` walk, affordable only on that path) or saying that none does. One logical shell line, so a caller that found a root of its own
 # can run it inside a loop; $(1) arrives unquoted and is quoted here.
 define clean_isolated_at
 iso_root="$(1)" ; \
@@ -1162,7 +1525,20 @@ done ; \
 for pid in $$alive; do \
 	holds_isolated $$pid && kill -9 $$pid 2>/dev/null || true ; \
 done ; \
-rm -rf "$$iso_root"
+removed= ; \
+for i in 1 2 3 4 5 6 7 8 9 10; do \
+	rm -rf "$$iso_root" 2>/dev/null ; \
+	[ -e "$$iso_root" ] || { removed=1 ; break ; } ; \
+	sleep 0.5 ; \
+done ; \
+[ -n "$$removed" ] || { \
+	holders=$$(lsof -n -P -w +D "$$iso_root" 2>/dev/null) ; \
+	echo "cannot remove $$iso_root: files kept appearing under it for 5 s" >&2 ; \
+	if [ -n "$$holders" ]; then echo "processes holding files under it:" >&2 ; echo "$$holders" >&2 ; \
+	else echo "no process holds a file open under it; something writes into it between deletes (Finder's .DS_Store, Spotlight)" >&2 ; fi ; \
+	rm -rf "$$iso_root" ; \
+	false ; \
+}
 endef
 
 # The clones and the server of this checkout. Named after the knob rather than

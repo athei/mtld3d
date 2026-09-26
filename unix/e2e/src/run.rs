@@ -45,6 +45,8 @@ pub enum ExitKind {
     TimedOut(Duration),
     /// It closed stdout and was killed after this long without exiting.
     Hung(Duration),
+    /// The caller ended it: the process had given it what it was run for.
+    Stopped,
 }
 
 impl ExitKind {
@@ -58,6 +60,7 @@ impl ExitKind {
             Self::Hung(after) => {
                 format!("no exit for {} s after its last line", after.as_secs())
             }
+            Self::Stopped => "stopped by the runner".to_owned(),
         }
     }
 }
@@ -111,8 +114,10 @@ const STDERR_GRACE: Duration = Duration::from_secs(1);
 /// without a stdout line; killed, and reported as [`ExitKind::Hung`], once
 /// it passes after stdout closed without the process exiting. stderr is
 /// what arrived before the end plus [`STDERR_GRACE`] after it. The
-/// environment is inherited whole: the caller owns `MTLD3D_CONFIG` and the
-/// Wine variables.
+/// environment is inherited whole, so the caller owns `MTLD3D_CONFIG` and
+/// the Wine variables, with `env` set on top: an A/B benchmark runs its two
+/// builds from one runner, each leg under a prefix and a log directory of
+/// its own.
 ///
 /// # Errors
 ///
@@ -121,13 +126,37 @@ pub fn run(
     wine: &Path,
     exe: &Path,
     args: &[String],
+    env: &[(String, String)],
     timeout: Duration,
     on_line: &mut dyn FnMut(&str),
+) -> Result<Exit, String> {
+    run_until(wine, exe, args, env, timeout, on_line, &mut |_| false)
+}
+
+/// [`run`], ending the process early once `done` says the caller has what it ran it for.
+///
+/// `done` is asked with the process's pid after every stdout line and at
+/// least every [`EXIT_POLL`] while the process runs; once it answers
+/// `true` the process group is killed and the run reports
+/// [`ExitKind::Stopped`], whatever the kill made of its exit status.
+///
+/// # Errors
+///
+/// Returns a message when the process cannot be spawned or waited for.
+pub fn run_until(
+    wine: &Path,
+    exe: &Path,
+    args: &[String],
+    env: &[(String, String)],
+    timeout: Duration,
+    on_line: &mut dyn FnMut(&str),
+    done: &mut dyn FnMut(u32) -> bool,
 ) -> Result<Exit, String> {
     let cwd = exe.parent().unwrap_or_else(|| Path::new("."));
     let child = Command::new(wine)
         .arg(exe)
         .args(args)
+        .envs(env.iter().map(|(key, value)| (key, value)))
         .current_dir(cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -136,7 +165,7 @@ pub fn run(
         .spawn()
         .map_err(|e| format!("failed to spawn {} {}: {e}", wine.display(), exe.display()))?;
 
-    collect(ProcessGroup::new(child), timeout, on_line, |reader| {
+    collect(ProcessGroup::new(child), timeout, on_line, done, |reader| {
         thread::Builder::new().spawn(reader)
     })
 }
@@ -146,6 +175,7 @@ fn collect(
     mut group: ProcessGroup,
     timeout: Duration,
     on_line: &mut dyn FnMut(&str),
+    done: &mut dyn FnMut(u32) -> bool,
     mut spawn_reader: impl FnMut(Box<dyn FnOnce() + Send>) -> std::io::Result<thread::JoinHandle<()>>,
 ) -> Result<Exit, String> {
     let child = group.child.as_mut().expect("just spawned group leader");
@@ -194,6 +224,7 @@ fn collect(
     })?;
 
     let mut timed_out = false;
+    let mut stopped = false;
     let mut reported_gpu_hang = false;
     let mut last_line = Instant::now();
     loop {
@@ -202,6 +233,13 @@ fn collect(
                 .kill()
                 .map_err(|e| format!("stop {pid} failed: {e}"))?;
             reported_gpu_hang = true;
+            break;
+        }
+        if done(pid) {
+            group
+                .kill()
+                .map_err(|e| format!("stop {pid} failed: {e}"))?;
+            stopped = true;
             break;
         }
         let since_line = last_line.elapsed();
@@ -224,7 +262,7 @@ fn collect(
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
-    let hung = if reported_gpu_hang || timed_out {
+    let hung = if reported_gpu_hang || timed_out || stopped {
         group
             .wait_killed()
             .map_err(|e| format!("wait on {pid} after stop failed: {e}"))?;
@@ -276,6 +314,8 @@ fn collect(
     let stderr = stderr.text;
     let kind = if timed_out {
         ExitKind::TimedOut(timeout)
+    } else if stopped {
+        ExitKind::Stopped
     } else if hung {
         ExitKind::Hung(timeout)
     } else if let Some(signal) = status.signal() {

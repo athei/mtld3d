@@ -1106,7 +1106,7 @@ pub struct FrameEncoder {
     /// Every per-frame and rolling telemetry field.
     ///
     /// TSC buckets, per-category API timers, Lock / wrap / destroy
-    /// counters, and the 5-second `PerfWindow` aggregator. See
+    /// counters, and the 2-second `PerfWindow` aggregator. See
     /// `mtld3d_core::perf` for the full field list.
     perf: EncoderPerfState,
 
@@ -2642,7 +2642,7 @@ impl FrameEncoder {
     fn log_perf_summary(&mut self, payload: &FramePayload, ctx: &FrameSummaryContext, status: i32) {
         let caches = self.cache_sizes(payload);
         let cmd_vec_realloc_bytes = self.pass_state.take_cmd_vec_realloc_bytes();
-        // One getrusage unix_call per 5 s window, only when the summary is
+        // One getrusage unix_call per 2 s window, only when the summary is
         // both enabled and about to emit; every other frame passes None.
         let task_faults = (perf_enabled() && self.perf.window_due()).then(|| {
             #[cfg(perf_tracking)]

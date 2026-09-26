@@ -58,6 +58,25 @@ impl Kind {
         "resolve remainder",
         "pipeline remainder",
     ];
+    /// Key base of each row in the `perf-kv` line, parallel to `LABELS`.
+    const KEYS: [&'static str; Self::COUNT] = [
+        "comp_vs_miss",
+        "comp_ps_miss",
+        "comp_emit_vs",
+        "comp_emit_ps",
+        "comp_shader_setup",
+        "comp_metal_library",
+        "comp_function_lookup",
+        "comp_shader_cache_persist",
+        "comp_pso_primary",
+        "comp_pso_sibling",
+        "comp_pso_setup",
+        "comp_pso_build",
+        "comp_pso_cache_persist",
+        "comp_depth_state",
+        "comp_resolve_remainder",
+        "comp_pipeline_remainder",
+    ];
 }
 
 /// Per-device compilation accounting; storage vanishes without PERF.
@@ -311,6 +330,40 @@ impl CompilationPerf {
             }
         }
         self.frame_serial = self.frame_serial.wrapping_add(1);
+    }
+
+    /// Append the window's compilation keys to the `perf-kv` line.
+    ///
+    /// Every key is written whether or not the window compiled anything, so
+    /// the key set stays the same from one line to the next. Call before
+    /// [`Self::append_window`], which clears the window. The two remainder
+    /// rows are computed, never counted, so they carry no calls or failures.
+    #[cfg(perf_tracking)]
+    pub(super) fn append_kv(&self, kv: &mut super::KvLine) {
+        for ((index, base), metric) in Kind::KEYS.iter().enumerate().zip(&self.window) {
+            kv.per_frame_ms(base, ms(metric.ns));
+            kv.peak_ms(base, ms(metric.peak_ns));
+            if index != Kind::ResolveOther as usize && index != Kind::PipelineOther as usize {
+                kv.total(format_args!("{base}_calls"), metric.calls);
+                kv.total(format_args!("{base}_failed"), metric.failures);
+            }
+        }
+        let metrics = &self.asynchronous;
+        kv.total("comp_async_skipped_draws", metrics.skipped);
+        kv.count("comp_async_pending_peak", metrics.pending_peak);
+        kv.total("comp_async_installs", metrics.installs);
+        kv.per_event_ms(
+            "comp_async_latency",
+            ms(metrics.latency_ns),
+            metrics.installs,
+        );
+        kv.peak_ms("comp_async_latency", ms(metrics.latency_peak_ns));
+        kv.total("comp_async_deferred_draws", metrics.deferred);
+        kv.total("comp_async_urgent_waits", metrics.urgent_waits);
+        kv.per_frame_ms("comp_async_urgent_wait", ms(metrics.urgent_wait_ns));
+        kv.total("comp_async_stolen", metrics.stolen);
+        kv.total("comp_async_misses", metrics.misses);
+        kv.per_frame_ms("comp_async_miss", ms(metrics.miss_ns));
     }
 
     /// Render once with the existing PERF summary, then clear the window.
