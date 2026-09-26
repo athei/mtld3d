@@ -130,10 +130,12 @@ const COMPILATION_BLOCK: [&str; 1] = ["Compilation"];
 
 /// The least time the calls of one [`CallTimes`] sample add up to.
 ///
-/// At least a hundred times the clock's step: each metrics file's
-/// `tsc_granularity_ns` says what the step was, and a floor chosen for the
-/// 100 ns `QueryPerformanceCounter` tick is far above any `rdtsc` step.
-pub const SAMPLE_FLOOR: Duration = Duration::from_micros(20);
+/// At least a hundred times the clock's step, so one step is under 1 % of a
+/// sample. Under Rosetta `rdtsc` steps by 41 ns (a run's
+/// `tsc_granularity_ns`), which puts the floor at 4.1 us; 5 us keeps a
+/// margin over it. A clock whose metrics report a coarser step needs a
+/// higher floor.
+pub const SAMPLE_FLOOR: Duration = Duration::from_micros(5);
 
 /// The least time a single call takes to count as a spike, whatever the median.
 ///
@@ -333,7 +335,7 @@ impl FrameStats {
 /// layer. A sample here is the mean time per call over whole frames
 /// instead: [`Self::add`] sums a frame's calls, and
 /// [`Self::end_frame`] closes a sample once the frames it spans add up to
-/// at least [`SAMPLE_FLOOR`], so one tick is under 1 % of it. Frequent
+/// at least [`SAMPLE_FLOOR`], so one clock step is under 1 % of it. Frequent
 /// calls give one sample a frame, rare ones one per several frames. The
 /// slowest single call is kept, and so is every single call of at least
 /// [`SPIKE_FLOOR`], the calls [`Self::spikes`] counts.
