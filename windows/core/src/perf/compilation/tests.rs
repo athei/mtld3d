@@ -1,5 +1,7 @@
 #[cfg(perf_tracking)]
 use super::{CompilationPerf, Identity, Kind};
+#[cfg(perf_tracking)]
+use crate::perf::KvLine;
 
 #[cfg(perf_tracking)]
 fn identity() -> Identity {
@@ -100,6 +102,48 @@ fn async_rows_print_with_no_compilation_row_and_reset_with_the_window() {
     let mut again = String::new();
     perf.append_window(&mut again, 1);
     assert!(again.is_empty(), "the window resets the async rows too");
+}
+
+#[test]
+#[cfg(perf_tracking)]
+fn kv_values_follow_the_window_and_keys_stay_when_it_is_idle() {
+    let keys = |line: &str| {
+        line.split(' ')
+            .filter_map(|field| field.split_once('=').map(|(key, _)| key.to_owned()))
+            .collect::<Vec<_>>()
+    };
+    let mut perf = CompilationPerf::new();
+    let mut idle = KvLine::new(5.0, 2);
+    perf.append_kv(&mut idle);
+    let idle = idle.finish();
+    perf.record_enabled(Kind::Library, 3_000_000, true, 1, identity);
+    perf.finish_frame(0, 0, 0);
+    perf.record_enabled(Kind::Library, 1_000_000, false, 2, identity);
+    perf.finish_frame(0, 0, 0);
+    perf.asynchronous.skipped = 3;
+    perf.asynchronous.installs = 2;
+    perf.asynchronous.latency_ns = 30_000_000;
+    perf.asynchronous.latency_peak_ns = 20_000_000;
+    perf.asynchronous.urgent_wait_ns = 5_000_000;
+    let mut busy = KvLine::new(5.0, 2);
+    perf.append_kv(&mut busy);
+    let busy = busy.finish();
+    assert!(busy.contains(
+        " comp_metal_library_ms=2.000 comp_metal_library_peak_ms=3.000 \
+         comp_metal_library_calls_total=2 comp_metal_library_failed_total=1 "
+    ));
+    assert!(
+        busy.contains(" comp_resolve_remainder_ms=0.000 comp_resolve_remainder_peak_ms=0.000 ")
+    );
+    assert!(!busy.contains("comp_resolve_remainder_calls_total"));
+    assert!(busy.contains(" comp_async_skipped_draws_total=3 "));
+    assert!(busy.contains(" comp_async_latency_avg_ms=15.000 comp_async_latency_peak_ms=20.000 "));
+    assert!(busy.contains(" comp_async_urgent_wait_ms=2.500 "));
+    assert_eq!(
+        keys(&idle),
+        keys(&busy),
+        "an idle window writes the same keys"
+    );
 }
 
 #[test]

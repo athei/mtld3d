@@ -4,7 +4,10 @@
 //! the API-to-encoder counter drain with its per-frame reset, window accumulation keeping
 //! encoder CPU separate from submit-thread drawable wait, exclusive-time accounting for
 //! nested timers (self-times partition the outer span), every `Bottleneck::classify`
-//! branch, and a golden snapshot of the summary grid in both plain and ANSI form.
+//! branch, a golden snapshot of the summary grid in both plain and ANSI form, and a
+//! golden snapshot of the `perf-kv` line with its key-naming contract.
+
+use rustc_hash::FxHashSet;
 
 use super::*;
 
@@ -433,6 +436,11 @@ fn staged_upload_summary_marks_saturated_derived_counts() {
         }
         let summary = Summary::render_with_ansi(&window, &sample_caches(), 5.01, false);
         assert!(summary.contains("  GPU copy  count=saturated bytes=49152"));
+        let kv = render_kv(&window, &sample_caches(), 5.01).finish();
+        assert!(
+            !kv.contains(" vbib_gpu_copy_total="),
+            "an unknown count is left out"
+        );
     }
 }
 
@@ -609,6 +617,220 @@ fn summary_golden_layout() {
         "faults      minflt=4200  majflt=3   4200.0 min/frame            process-wide getrusage delta this window (all threads); zero-fill faults on fresh pages land here",
     );
     assert_eq!(got, want, "perf summary drifted — diff above");
+}
+
+/// Golden snapshot of the `perf-kv v1` line on the grid golden's fixture.
+///
+/// Pins every key, its order and its value format. Each value is the one
+/// the grid golden above shows for the same window, at the kv line's own
+/// precision.
+#[test]
+fn kv_golden_line() {
+    let got = render_kv(&sample_window(), &sample_caches(), 5.01).finish();
+    let want = concat!(
+        "perf-kv v1 window_s=5.010 frames=1",
+        " frame_ms=10.000 frame_peak_ms=10.000 api_d3d9_ms=2.800 api_d3d9_peak_ms=2.800",
+        " api_outside_ms=3.000 api_outside_peak_ms=3.000 enc_work_ms=1.500",
+        " enc_work_peak_ms=1.500 submit_work_ms=0.100 submit_work_peak_ms=0.100",
+        " gpu_wait_ms=6.000 gpu_wait_peak_ms=6.000 api_calls_ms=4.000",
+        " api_calls_peak_ms=4.000 api_calls_total=263 api_device_ms=0.300",
+        " api_device_peak_ms=0.300 api_device_calls_total=123 api_vertex_buffer_ms=0.200",
+        " api_vertex_buffer_peak_ms=0.200 api_vertex_buffer_calls_total=88",
+        " api_index_buffer_ms=0.080 api_index_buffer_peak_ms=0.080",
+        " api_index_buffer_calls_total=32 api_texture_ms=0.000 api_texture_peak_ms=0.000",
+        " api_texture_calls_total=0 api_surface_ms=0.040 api_surface_peak_ms=0.040",
+        " api_surface_calls_total=20 api_query_ms=0.000 api_query_peak_ms=0.000",
+        " api_query_calls_total=0 api_state_block_ms=0.000 api_state_block_peak_ms=0.000",
+        " api_state_block_calls_total=0 api_vertex_decl_ms=0.000",
+        " api_vertex_decl_peak_ms=0.000 api_vertex_decl_calls_total=0",
+        " api_vertex_shader_ms=0.000 api_vertex_shader_peak_ms=0.000",
+        " api_vertex_shader_calls_total=0 api_pixel_shader_ms=0.000",
+        " api_pixel_shader_peak_ms=0.000 api_pixel_shader_calls_total=0",
+        " query_wait_ms=0.000 query_wait_peak_ms=0.000 dev_frame_ms=0.040",
+        " dev_frame_peak_ms=0.040 dev_frame_calls_total=3 dev_draws_ms=0.120",
+        " dev_draws_peak_ms=0.120 dev_draws_calls_total=100 dev_render_state_ms=0.060",
+        " dev_render_state_peak_ms=0.060 dev_render_state_calls_total=30",
+        " dev_tex_stage_state_ms=0.030 dev_tex_stage_state_peak_ms=0.030",
+        " dev_tex_stage_state_calls_total=18 dev_sampler_state_ms=0.020",
+        " dev_sampler_state_peak_ms=0.020 dev_sampler_state_calls_total=12",
+        " dev_shader_const_ms=0.020 dev_shader_const_peak_ms=0.020",
+        " dev_shader_const_calls_total=8 dev_bind_ms=0.010 dev_bind_peak_ms=0.010",
+        " dev_bind_calls_total=6 dev_state_block_ms=0.000 dev_state_block_peak_ms=0.000",
+        " dev_state_block_calls_total=0 dev_misc_ms=0.000 dev_misc_peak_ms=0.000",
+        " dev_misc_calls_total=0 present_stall_ms=3.200 present_stall_peak_ms=3.200",
+        " dev_frame_other_ms=0.000 dev_frame_other_peak_ms=0.000 draw_snapshot_ms=0.090",
+        " draw_snapshot_peak_ms=0.090 draw_snapshot_stages_ms=0.020",
+        " draw_snapshot_stages_peak_ms=0.020 draw_snapshot_c_ff_ms=0.020",
+        " draw_snapshot_c_ff_peak_ms=0.020 draw_snapshot_c_pr_ms=0.010",
+        " draw_snapshot_c_pr_peak_ms=0.010 draw_snapshot_keys_ms=0.020",
+        " draw_snapshot_keys_peak_ms=0.020 draw_snapshot_bumps_ms=0.010",
+        " draw_snapshot_bumps_peak_ms=0.010 draw_snapshot_resid_ms=0.010",
+        " draw_snapshot_resid_peak_ms=0.010 draw_push_op_ms=0.020",
+        " draw_push_op_peak_ms=0.020 bind_texture_ms=0.004 bind_texture_peak_ms=0.004",
+        " bind_texture_calls_total=2 bind_buffer_ms=0.002 bind_buffer_peak_ms=0.002",
+        " bind_buffer_calls_total=1 bind_shader_ms=0.002 bind_shader_peak_ms=0.002",
+        " bind_shader_calls_total=1 bind_rt_ds_ms=0.001 bind_rt_ds_peak_ms=0.001",
+        " bind_rt_ds_calls_total=1 bind_ff_fixed_ms=0.001 bind_ff_fixed_peak_ms=0.001",
+        " bind_ff_fixed_calls_total=1 bind_view_scissor_ms=0.000",
+        " bind_view_scissor_peak_ms=0.000 bind_view_scissor_calls_total=0",
+        " surf_lock_rect_ms=0.020 surf_lock_rect_peak_ms=0.020",
+        " surf_lock_rect_calls_total=2 surf_unlock_rect_ms=0.010",
+        " surf_unlock_rect_peak_ms=0.010 surf_unlock_rect_calls_total=2",
+        " surf_get_dc_ms=0.010 surf_get_dc_peak_ms=0.010 surf_get_dc_calls_total=1",
+        " surf_release_dc_ms=0.000 surf_release_dc_peak_ms=0.000",
+        " surf_release_dc_calls_total=0 surf_misc_ms=0.000 surf_misc_peak_ms=0.000",
+        " surf_misc_calls_total=15 enc_ms=1.700 enc_peak_ms=1.700 enc_op_ms=1.400",
+        " enc_op_peak_ms=1.400 enc_op_resolve_ms=0.300 enc_op_resolve_peak_ms=0.300",
+        " enc_op_pipeline_ms=0.400 enc_op_pipeline_peak_ms=0.400 enc_op_state_ms=0.100",
+        " enc_op_state_peak_ms=0.100 enc_op_probe_ms=0.200 enc_op_probe_peak_ms=0.200",
+        " enc_op_samplers_ms=0.150 enc_op_samplers_peak_ms=0.150 enc_op_binds_ms=0.200",
+        " enc_op_binds_peak_ms=0.200 enc_op_tex_raw_ms=0.010",
+        " enc_op_tex_raw_peak_ms=0.010 enc_op_stage_up_ms=0.010",
+        " enc_op_stage_up_peak_ms=0.010 enc_op_const_rng_ms=0.010",
+        " enc_op_const_rng_peak_ms=0.010 enc_op_resolve_consts_ms=0.150",
+        " enc_op_resolve_consts_peak_ms=0.150 enc_op_resolve_skip_ms=0.090",
+        " enc_op_resolve_skip_peak_ms=0.090 enc_op_resolve_lookup_ms=0.030",
+        " enc_op_resolve_lookup_peak_ms=0.030 enc_op_binds_cbind_ms=0.120",
+        " enc_op_binds_cbind_peak_ms=0.120 enc_op_binds_vbib_ms=0.050",
+        " enc_op_binds_vbib_peak_ms=0.050 enc_op_binds_draw_ms=0.020",
+        " enc_op_binds_draw_peak_ms=0.020 enc_op_resolve_resid_ms=0.030",
+        " enc_op_resolve_resid_peak_ms=0.030 enc_op_binds_resid_ms=0.010",
+        " enc_op_binds_resid_peak_ms=0.010 enc_op_resid_ms=0.020",
+        " enc_op_resid_peak_ms=0.020 enc_finalize_ms=0.100 enc_finalize_peak_ms=0.100",
+        " enc_submit_stall_ms=0.200 enc_submit_stall_peak_ms=0.200 submit_ms=6.100",
+        " submit_peak_ms=6.100 submit_blits_ms=0.010 submit_blits_peak_ms=0.010",
+        " submit_passes_ms=0.050 submit_passes_peak_ms=0.050 submit_commit_ms=0.020",
+        " submit_commit_peak_ms=0.020 submit_resid_ms=0.020 submit_resid_peak_ms=0.020",
+        " present_wait_ms=6.000 present_wait_peak_ms=6.000 snapshots_total=1",
+        " slot_waits_total=0 gpu_ms=4.500 gpu_frame_ms=4.000 gpu_frame_cbs_total=1",
+        " gpu_upload_ms=0.300 gpu_upload_cbs_total=1 gpu_present_ms=0.200",
+        " gpu_present_cbs_total=1 vb_rename_total=12 ib_rename_total=3",
+        " vb_discard_total=10 ib_discard_total=3 vbib_preserve_cpu_total=2",
+        " vbib_rename_bytes_total=737280 vbib_in_place_total=3",
+        " vbib_staging_uploads_total=4 vbib_reorder_total=3 vbib_full_skip_total=1",
+        " vbib_full_skip_bytes_total=16384 vbib_gpu_copy_total=2",
+        " vbib_gpu_copy_bytes_total=49152 vbib_alloc_fail_total=1 vbib_destroy_total=1",
+        " vbib_ret_cap_drain_total=2 vbib_ret_cap_submit_total=1",
+        " vbib_retention_peak_count=6 vbib_retained_bytes=3670016 vbib_pool_hit_total=14",
+        " vbib_pool_miss_total=1 pagebox_pool_recycled_total=14",
+        " pagebox_pool_recycled_bytes_total=688128 pagebox_pool_parked_bytes=1048576",
+        " tex_rename_total=2 tex_discard_total=1 tex_preserve_cpu_total=1",
+        " tex_in_place_total=0 tex_uploads_total=2 tex_uploads_raw_total=2",
+        " tex_uploads_padded_total=0 tex_uploads_pass_total=0 tex_reorder_total=1",
+        " tex_destroy_total=1 tex_retention_peak_count=0 tex_staging_retained_bytes=0",
+        " tex_dirtyrect_calls_total=4 tex_dirtyrect_partial_total=3",
+        " cache_textures_count=48 cache_pipelines_count=12 cache_samplers_count=6",
+        " cache_programs_count=8 cache_libs_count=8 cache_depth_states_count=4",
+        " passes_total=4 commands_total=140 draws_total=100 pipeline_memo_hits_total=97",
+        " pipeline_memo_calls_total=100 fan_generated_total=0 up_indexed_total=3",
+        " up_oversized_total=2 keys_set_texture_calls_total=0",
+        " keys_set_texture_skips_total=0 keys_set_render_state_calls_total=0",
+        " keys_set_render_state_skips_total=0 keys_set_tex_stage_state_calls_total=0",
+        " keys_set_tex_stage_state_skips_total=0 keys_set_fvf_calls_total=0",
+        " keys_set_fvf_skips_total=0 keys_set_vertex_decl_calls_total=0",
+        " keys_set_vertex_decl_skips_total=0 keys_set_vertex_shader_calls_total=0",
+        " keys_set_vertex_shader_skips_total=0 keys_set_pixel_shader_calls_total=0",
+        " keys_set_pixel_shader_skips_total=0 keys_set_vs_const_calls_total=0",
+        " keys_set_vs_const_skips_total=0 keys_set_ps_const_calls_total=0",
+        " keys_set_ps_const_skips_total=0 inverse_bypass_total=0 inverse_hit_total=0",
+        " inverse_recompute_total=0 scratch_small_peak_count=24",
+        " scratch_oversized_peak_count=0 scratch_bytes=2097152",
+        " op_vec_capacity_bytes=73728 op_vec_realloc_bytes_total=32768",
+        " cmd_vec_capacity_bytes=65536 cmd_vec_realloc_bytes_total=196608",
+        " pagebox_alloc_total=17 pagebox_alloc_bytes_total=4980736 pagebox_free_total=15",
+        " pagebox_free_bytes_total=4849664 pagebox_uncached_total=1",
+        " faults_minor_total=4200 faults_major_total=3",
+    );
+    assert_eq!(got, want, "perf-kv line drifted");
+}
+
+/// Over two unequal frames, `_ms` averages, `_peak_ms` takes the worst frame and `_total` sums.
+///
+/// A one-frame window cannot tell the three apart. Gauges take the peak,
+/// and the fault keys stay out of a window that measured no faults.
+#[test]
+fn kv_aggregates_average_peak_and_total_over_frames() {
+    let mut light = sample(0, 0);
+    light.timing.frame_total_cycles = 4_000_000;
+    light.counters.vb_rename = 1;
+    light.counters.api_call_counts_by_category[ApiCategory::Device as usize] = 10;
+    light.draws = 100;
+    light.vbib_retained_bytes = 1_000;
+    let mut heavy = sample(0, 0);
+    heavy.timing.frame_total_cycles = 8_000_000;
+    heavy.counters.api_call_counts_by_category[ApiCategory::Device as usize] = 30;
+    heavy.draws = 300;
+    heavy.vbib_retained_bytes = 3_000;
+    let mut w = PerfWindow::new();
+    w.accumulate(&light);
+    w.accumulate(&heavy);
+    let line = render_kv(&w, &sample_caches(), 5.0).finish();
+    let expected = [
+        "perf-kv v1 window_s=5.000 frames=2 ".to_owned(),
+        format!(" frame_ms={:.3} ", cycles_to_ms(12_000_000) / 2.0),
+        format!(" frame_peak_ms={:.3} ", cycles_to_ms(8_000_000)),
+        " api_device_calls_total=40 ".to_owned(),
+        " vb_rename_total=1 ".to_owned(),
+        " draws_total=400 ".to_owned(),
+        " vbib_retained_bytes=3000 ".to_owned(),
+    ];
+    for pair in &expected {
+        assert!(line.contains(pair.as_str()), "missing {pair:?} in {line}");
+    }
+    assert!(!line.contains("faults_"), "no fault sample, no fault keys");
+}
+
+/// Every key is a unit-suffixed `[a-z0-9_]+` name that appears once.
+///
+/// Runs on the full line a window logs, compilation keys included, so a
+/// key added anywhere is held to the naming contract `docs/ARCHITECTURE.md`
+/// states: the suffix names the unit, and the value format follows it
+/// (three decimals for `_ms`, `_avg_ms` and `_peak_ms`, a bare integer
+/// otherwise).
+#[test]
+fn kv_keys_are_unique_and_unit_suffixed() {
+    const FLOAT_SUFFIXES: [&str; 1] = ["_ms"];
+    const INTEGER_SUFFIXES: [&str; 3] = ["_total", "_bytes", "_count"];
+    let mut kv = render_kv(&sample_window(), &sample_caches(), 5.01);
+    compilation::CompilationPerf::new().append_kv(&mut kv);
+    let line = kv.finish();
+    assert!(
+        !line.contains('\x1b') && !line.contains('\n'),
+        "one plain line: {line:?}"
+    );
+    let mut fields = line.split(' ');
+    assert_eq!(
+        fields.by_ref().take(4).collect::<Vec<_>>(),
+        ["perf-kv", "v1", "window_s=5.010", "frames=1"]
+    );
+    let mut seen = FxHashSet::default();
+    for field in fields {
+        let (key, value) = field
+            .split_once('=')
+            .unwrap_or_else(|| panic!("{field:?} is not key=value"));
+        assert!(
+            !key.is_empty()
+                && key
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_'),
+            "{key:?} is not [a-z0-9_]+"
+        );
+        let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+        if FLOAT_SUFFIXES.iter().any(|suffix| key.ends_with(suffix)) {
+            let (whole, fraction) = value
+                .split_once('.')
+                .unwrap_or_else(|| panic!("{key}={value} lacks three decimals"));
+            assert!(
+                digits(whole) && digits(fraction) && fraction.len() == 3,
+                "{key}={value} is not a plain three-decimal number"
+            );
+        } else if INTEGER_SUFFIXES.iter().any(|suffix| key.ends_with(suffix)) {
+            assert!(digits(value), "{key}={value} is not a bare integer");
+        } else {
+            panic!("{key} carries no unit suffix");
+        }
+        assert!(seen.insert(key), "{key} repeats");
+    }
 }
 
 /// Sanity snapshot of the rendered summary.
@@ -927,8 +1149,10 @@ fn sample_window() -> PerfWindow {
     w.accumulate(&s);
     // Emit-time fields (not part of accumulate): the once-per-window
     // fault sample delta, as `log_frame_summary` would set it.
-    w.minor_faults_window = 4200;
-    w.major_faults_window = 3;
+    w.faults_window = Some(TaskFaults {
+        minor: 4200,
+        major: 3,
+    });
     w
 }
 

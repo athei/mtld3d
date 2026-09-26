@@ -619,12 +619,93 @@ compile out without `PERF=1`. Use normal builds for timing comparisons.
 Counter aggregation — mixing these up misreads the log:
 
 - **Time counters** (anything ending in `ms`): per-frame averages.
-- **Event counters** (passes, commands, draws, fresh, discards, wraps, …): raw window totals — divide by `frames=N` for a rate. Never average an event counter — silently rounds rare signals to zero.
+- **Event counters** (passes, commands, draws, calls, fresh, discards, wraps, …): raw window totals; divide by `frames=N` for a rate. Never average an event counter: that silently rounds rare signals to zero. The `perf-kv` line below follows the same rule: every count is a `_total`.
 - **Depth counters** (retention depth, retention KB): f64 averages, formatted `.1`.
 - **Cache-size snapshots**: point-in-time at window emit, neither averaged nor summed.
 - **Peak counters** (`peak …` cells): max value on any single frame in the window.
 
 No ANSI colour anywhere: every line goes to the process's log file, and `env_logger` is told so (`WriteStyle::Never`) rather than left to auto-detect a terminal, which under Wine would be wrong in both directions.
+
+### The `perf-kv` line
+
+The grid is for a reader; a tool comparing two builds reads the line logged
+right after it, at `info!` on the same `mtld3d::perf` target, once per window:
+
+```text
+perf-kv v1 window_s=5.010 frames=312 frame_ms=6.412 frame_peak_ms=9.870 ...
+```
+
+It is one line of space-separated `key=value` pairs after the `perf-kv v1`
+tag, never styled, rendered by `render_kv` and `CompilationPerf::append_kv`
+from the same window and the same derived sums the grid reads, so the two never
+disagree. `window_s` (seconds) and `frames` always come first; after them the
+order is fixed but a parser should not rely on it. Keys are `[a-z0-9_]+`.
+Values are plain decimal numbers with a `.` point, no units and no separators:
+floats carry three decimals, integers none. The suffix names the unit and how
+the value aggregates:
+
+| Suffix | Value |
+| --- | --- |
+| `_ms` | Milliseconds per frame, the window's total over its frames. |
+| `_avg_ms` | Milliseconds per occurrence of the event the key names, the window's total over its count; 0 with none. |
+| `_peak_ms` | Milliseconds on the window's worst single frame for that timer (for `comp_*` rows, its worst submission; for `comp_async_latency`, its longest install). |
+| `_total` | The window total of a count: calls, draws, passes, uploads, renames, builds, faults. Never averaged, per the rule above; a consumer divides by `frames` for a rate. |
+| `_bytes` | A size gauge, the window's peak. |
+| `_count` | A count gauge: the window's peak where the key says `peak`, otherwise sampled at the summary (the cache sizes). |
+
+Compatibility: keys are only ever added. A key whose meaning, unit or
+aggregation changes gets a new name and the old one goes away rather than
+changing under a tool that compares builds across it. The `v1` tag changes only
+when the line's own format does (the separators, the value syntax, the header).
+A consumer ignores keys it does not know and treats a missing key as not
+measured. Three keys can be missing: `vbib_gpu_copy_total` is left out when one
+of its inputs saturated, where the grid prints `saturated`, and
+`faults_minor_total` and `faults_major_total` are left out of a window that
+sampled no faults (the first window, which has no baseline, or one closed
+before a sample arrived), where the grid prints 0.
+
+Every key, with the grid row it mirrors. A `<x>` stands for each name listed
+in its row, and every family carries the suffixes its row names.
+
+| Keys | Meaning |
+| --- | --- |
+| `frame_ms`, `frame_peak_ms` | `Frame total`, the API thread's frame. |
+| `api_d3d9_ms`, `api_outside_ms`, `enc_work_ms`, `submit_work_ms`, `gpu_wait_ms`, each with `_peak_ms` | The `buckets:` line: D3D9 calls less the present stall, game code (`Outside d3d9`), encoder CPU less its submit stall, `Encode+commit`, and `Drawable wait`. |
+| `api_calls_ms`, `api_calls_peak_ms`, `api_calls_total` | `D3D9 calls`: its time (present stall included) and its calls. |
+| `api_<x>_ms`, `_peak_ms`, `api_<x>_calls_total` | The category rows: `device`, `vertex_buffer`, `index_buffer`, `texture`, `surface`, `query`, `state_block`, `vertex_decl`, `vertex_shader`, `pixel_shader`. |
+| `query_wait_ms`, `_peak_ms` | `Wait for GPU` under `Query`. |
+| `dev_<x>_ms`, `_peak_ms`, `dev_<x>_calls_total` | The `Device` sub-buckets: `frame`, `draws`, `render_state`, `tex_stage_state`, `sampler_state`, `shader_const`, `bind`, `state_block`, `misc`. |
+| `present_stall_ms`, `dev_frame_other_ms`, each with `_peak_ms` | `Send stall` and `other` under `Frame`. |
+| `draw_snapshot_ms`, `draw_snapshot_<x>_ms`, `draw_push_op_ms`, each with `_peak_ms` | `snapshot` and its parts under `Draws` (`stages`, `c_ff`, `c_pr`, `keys`, `bumps`, `resid`), and `push_op`. |
+| `bind_<x>_ms`, `_peak_ms`, `bind_<x>_calls_total` | The `Bind` sub-buckets: `texture`, `buffer`, `shader`, `rt_ds`, `ff_fixed`, `view_scissor`. |
+| `surf_<x>_ms`, `_peak_ms`, `surf_<x>_calls_total` | The `Surface` sub-buckets: `lock_rect`, `unlock_rect`, `get_dc`, `release_dc`, `misc`. |
+| `enc_ms`, `enc_op_ms`, `enc_finalize_ms`, `enc_submit_stall_ms`, each with `_peak_ms` | `Encoder thread`, `Closures (op)`, `Finalize`, `Submit stall`. |
+| `enc_op_<x>_ms`, `_peak_ms` | The op phases: `resolve`, `pipeline`, `state`, `probe`, `samplers`, `binds`, `tex_raw`, `stage_up`, `const_rng`, and `resid`. |
+| `enc_op_resolve_<x>_ms`, `enc_op_binds_<y>_ms`, each with `_peak_ms` | The nested phases: `consts`, `skip`, `lookup`, `resid` under `resolve`; `cbind`, `vbib`, `draw`, `resid` under `binds`. |
+| `submit_ms`, `submit_<x>_ms`, `present_wait_ms`, each with `_peak_ms` | `Submit thread` (present wait included), its `Encode+commit` children (`blits`, `passes`, `commit`, `resid`) and `Present wait`. |
+| `snapshots_total`, `slot_waits_total` | `Snapshots` and `Slot waits`. |
+| `gpu_ms`, `gpu_<x>_ms`, `gpu_<x>_cbs_total` | `GPU` time in all and per role (`frame`, `upload`, `present`), and the command buffers behind each role. No peak, as in the grid. |
+| `vb_rename_total`, `ib_rename_total`, `vb_discard_total`, `ib_discard_total`, `vbib_preserve_cpu_total`, `vbib_rename_bytes_total`, `vbib_in_place_total` | VB/IB `rename`, its `discards`, `preserve` and `bytes`, and `in-place`. |
+| `vbib_staging_uploads_total` | `staging up`. |
+| `vbib_reorder_total`, `vbib_full_skip_total`, `vbib_full_skip_bytes_total`, `vbib_gpu_copy_total`, `vbib_gpu_copy_bytes_total`, `vbib_alloc_fail_total` | `reorder`, `full skip`, `GPU copy`, `allocfail`. |
+| `vbib_destroy_total`, `vbib_ret_cap_drain_total`, `vbib_ret_cap_submit_total` | VB/IB `destroys` and `ret cap`. |
+| `vbib_retention_peak_count`, `vbib_retained_bytes` | VB/IB `retention`: peak depth and peak bytes. |
+| `vbib_pool_hit_total`, `vbib_pool_miss_total`, `pagebox_pool_recycled_total`, `pagebox_pool_recycled_bytes_total`, `pagebox_pool_parked_bytes` | `pool` and `parked` (peak). |
+| `tex_rename_total`, `tex_discard_total`, `tex_preserve_cpu_total`, `tex_in_place_total`, `tex_reorder_total`, `tex_destroy_total` | Texture `rename`, `discards`, `preserve`, `in-place`, `reorder`, `destroys`. |
+| `tex_uploads_total`, `tex_uploads_<x>_total` | Texture `uploads` and their paths: `raw`, `padded`, `pass`. |
+| `tex_retention_peak_count`, `tex_staging_retained_bytes` | Texture `retention`: peak depth and peak bytes. |
+| `tex_dirtyrect_calls_total`, `tex_dirtyrect_partial_total` | `dirtyrect` calls and the partial ones. |
+| `cache_<x>_count` | `Caches` at the summary: `textures`, `pipelines`, `samplers`, `programs`, `libs`, `depth_states`. |
+| `passes_total`, `commands_total`, `draws_total`, `pipeline_memo_hits_total`, `pipeline_memo_calls_total`, `fan_generated_total`, `up_indexed_total`, `up_oversized_total` | `Commands / passes`. |
+| `keys_<x>_calls_total`, `keys_<x>_skips_total` | `Keys gating`: `set_texture`, `set_render_state`, `set_tex_stage_state`, `set_fvf`, `set_vertex_decl`, `set_vertex_shader`, `set_pixel_shader`, `set_vs_const`, `set_ps_const`. |
+| `inverse_bypass_total`, `inverse_hit_total`, `inverse_recompute_total` | The `inverse-view` rows, summed over the window's reset epochs. |
+| `scratch_small_peak_count`, `scratch_oversized_peak_count`, `scratch_bytes` | `scratch`: peak blocks and peak bytes. |
+| `op_vec_capacity_bytes`, `op_vec_realloc_bytes_total`, `cmd_vec_capacity_bytes`, `cmd_vec_realloc_bytes_total` | `op_vec` and `cmd_vec`: peak `size` and window `realloc` bytes. |
+| `pagebox_alloc_total`, `pagebox_alloc_bytes_total`, `pagebox_free_total`, `pagebox_free_bytes_total`, `pagebox_uncached_total` | `pagebox` and `uncached`. |
+| `faults_minor_total`, `faults_major_total` | `faults`; absent when nothing was sampled. |
+| `comp_<x>_ms`, `_peak_ms`, `comp_<x>_calls_total`, `comp_<x>_failed_total` | The `Compilation` rows: `vs_miss`, `ps_miss`, `emit_vs`, `emit_ps`, `shader_setup`, `metal_library`, `function_lookup`, `shader_cache_persist`, `pso_primary`, `pso_sibling`, `pso_setup`, `pso_build`, `pso_cache_persist`, `depth_state`; and `resolve_remainder`, `pipeline_remainder` with `_ms` and `_peak_ms` only, since they are computed rather than counted. Written in every window, idle or not. |
+| `comp_async_skipped_draws_total`, `comp_async_pending_peak_count`, `comp_async_installs_total`, `comp_async_latency_avg_ms`, `comp_async_latency_peak_ms` | The first `async:` row: skipped draws, most builds in flight, installs, and the average and longest enqueue-to-install latency. |
+| `comp_async_deferred_draws_total`, `comp_async_urgent_waits_total`, `comp_async_urgent_wait_ms`, `comp_async_stolen_total`, `comp_async_misses_total`, `comp_async_miss_ms` | The second `async:` row: deferred draws, urgent waits and their time, stolen jobs, misses and the encoder time they cost. Unlike that row, which prints the wait as a window total and the miss cost per miss, both `_ms` keys are per-frame averages. |
 
 ### Buffer recycle-pool diagnostics
 
