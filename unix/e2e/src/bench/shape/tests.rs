@@ -431,3 +431,29 @@ fn only_shape_names_are_shape_accepts() {
         "bench_frame_shape.wow_335a_busy_frame"
     );
 }
+
+/// The level `filter`, a `RUST_LOG` of `target=level` directives, gives `target`.
+///
+/// The most specific directive whose module path is `target` or a parent of
+/// it wins, as `env_logger` picks it.
+fn level_for<'a>(filter: &'a str, target: &str) -> Option<&'a str> {
+    filter
+        .split(',')
+        .filter_map(|directive| directive.split_once('='))
+        .filter(|(path, _)| target == *path || target.starts_with(&format!("{path}::")))
+        .max_by_key(|(path, _)| path.len())
+        .map(|(_, level)| level)
+}
+
+#[test]
+fn the_shape_run_keeps_the_identity_lines_and_the_pass_trace() {
+    // The `d3d9.dll ... loaded at` and `mtld3d.so ... initialized` lines, at info.
+    assert_eq!(level_for(SHAPE_RUST_LOG, "mtld3d::d3d9"), Some("info"));
+    assert_eq!(level_for(SHAPE_RUST_LOG, "mtld3d::unix"), Some("info"));
+    assert_eq!(
+        level_for(SHAPE_RUST_LOG, "mtld3d::d3d9::passes"),
+        Some("trace")
+    );
+    assert_eq!(level_for(SHAPE_RUST_LOG, "mtld3d::perf"), Some("warn"));
+    assert_eq!(level_for(SHAPE_RUST_LOG, "mtld3d::core"), Some("warn"));
+}

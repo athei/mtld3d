@@ -45,7 +45,16 @@ use std::{
 use super::{Leg, SHAPE_DIR, metrics};
 
 /// The `RUST_LOG` of a shape run: the pass trace, and warnings from the rest of the layer.
-pub const SHAPE_RUST_LOG: &str = "mtld3d=warn,mtld3d::d3d9::passes=trace";
+///
+/// Except the two targets that log the build's identity at info, which the
+/// run's metrics read its stamp and image IDs from and the leg's stamp check
+/// needs: `mtld3d::d3d9` (the `d3d9.dll <build> <id> loaded at` line) and
+/// `mtld3d::unix` (the `mtld3d.so <build> <id> initialized` line). The pass
+/// trace, under `mtld3d::d3d9`, is the more specific directive and stays at
+/// trace. `mtld3d::perf` stays at warn: the run's timings and `perf-kv`
+/// lines are never judged.
+pub const SHAPE_RUST_LOG: &str =
+    "mtld3d=warn,mtld3d::d3d9=info,mtld3d::unix=info,mtld3d::d3d9::passes=trace";
 
 /// How many of a log's last complete submissions the compared shape is chosen from.
 pub const WINDOW: usize = 30;

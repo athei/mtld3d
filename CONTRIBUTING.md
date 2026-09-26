@@ -235,7 +235,8 @@ the run may differ between the legs.
 
 After its timed rounds, each scene benchmark (one whose metrics declare its
 frame in `shape` lines) runs once more per leg with the pass trace on
-(`RUST_LOG=mtld3d=warn,mtld3d::d3d9::passes=trace`), untimed, into
+(`mtld3d::d3d9::passes=trace`, the rest of the layer at warn but for the
+lines that name its build), untimed, into
 `<leg>/shape/` of the run's directory; a benchmark without `shape` lines, such
 as the shader-stutter one, gets a note instead. That costs one extra
 full-length run per leg per scene benchmark and tens of MB of trace in the
