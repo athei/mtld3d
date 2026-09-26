@@ -1008,7 +1008,8 @@ conformance-isolate: install-windows-$(ARCH) install-unix-$(SDK_UNIX_ARCH)
 # `bench-<name>.txt` into LOG_DIR (default `.codex/evidence/bench`), beside
 # the layer's log that a PERF=1 build's summary rows are copied from, and
 # `bench-<name>.metrics` next to it, the same numbers plus the build's
-# identity, its address-space samples and a scene's per-pass shape, one
+# identity, its address-space samples, a scene's per-pass shape and, from a
+# PERF=1 build, the counters of the layer's `perf-kv` lines as `perf.*`, one
 # record per line for a program comparing two builds (`bench.rs` documents
 # the format). A run first deletes both kinds of file left by the one
 # before, prints the reports at the end and says where the metrics files

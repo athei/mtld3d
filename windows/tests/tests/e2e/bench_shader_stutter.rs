@@ -43,9 +43,9 @@ use mtld3d_types::{
 };
 
 use crate::bench::{
-    Class, Direction, FrameClock, IDENTITY_ROWS, LayerLog, Metrics, Model, STRIDE, TEXTURED_DECL,
-    Value, grid, material_ps, material_vs, memory_section, ok, pattern_texture, ratio, world_rows,
-    write_report,
+    Class, Direction, FrameClock, FrameWork, IDENTITY_ROWS, LayerLog, Metrics, Model, STRIDE,
+    TEXTURED_DECL, Value, grid, material_ps, material_vs, memory_section, ok, pattern_texture,
+    ratio, world_rows, write_report,
 };
 
 const WIDTH: u32 = 1280;
@@ -252,6 +252,7 @@ fn stutter(name: &str, per_frame: u32, offscreen: u32) {
         Class::Exact,
     );
     metrics.memory(&warm, &end);
+    metrics.perf(&log.perf_kv(from, to), &FrameWork::Varying);
     write_report(&metrics, &log, &body);
 }
 

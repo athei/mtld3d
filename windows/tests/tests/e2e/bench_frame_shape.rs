@@ -50,8 +50,8 @@ use mtld3d_types::{
 };
 
 use crate::bench::{
-    Class, Direction, FrameClock, IDENTITY_ROWS, LayerLog, Metrics, Model, PassShape, STRIDE,
-    TEXTURED_DECL, Value, def, element, grid, material_ps, material_vs, memory_section, ok,
+    Class, Direction, FrameClock, FrameWork, IDENTITY_ROWS, LayerLog, Metrics, Model, PassShape,
+    STRIDE, TEXTURED_DECL, Value, def, element, grid, material_ps, material_vs, memory_section, ok,
     pattern_texture, ratio, transform, world_rows, write_report,
 };
 
@@ -188,6 +188,14 @@ fn wow_335a_busy_frame() {
         Class::Info,
     );
     metrics.memory(&warm, &end);
+    // The last window wholly inside the measured frames, the one the report copies.
+    let kv = log.perf_kv(from, to);
+    let last_full: &[Option<String>] = if kv.len() > 1 {
+        &kv[kv.len() - 1..]
+    } else {
+        &[]
+    };
+    metrics.perf(last_full, &FrameWork::Fixed);
     metrics.shapes(&pass_shapes());
     write_report(&metrics, &log, &body);
 }

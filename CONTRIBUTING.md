@@ -211,7 +211,11 @@ the run itself cannot be trusted. The runs and the report stay in a directory
 under the main checkout's `.codex/evidence/bench-ab`, and `make bench-compare AB_DIR=<dir>` judges
 one again, for instance with `ACCEPT=<metric>,...` naming an exact count (a
 draw count, a pass count) that the change is meant to move. `make
-clean-bench-ab` removes the kept base worktrees.
+clean-bench-ab` removes the kept base worktrees. The metrics a benchmark
+writes include the layer's own counters, read from the `perf-kv` line of
+its perf windows as `perf.*` (`bench.rs` gives the rules): the per-frame
+counts of work the API calls fix, such as `perf.draws_pf` and
+`perf.passes_pf`, are the exact ones.
 
 Bench numbers come from `PROD=1 PERF=1` builds only; `make bench-ab` builds
 both legs that way and refuses any other profile, since `release` carries

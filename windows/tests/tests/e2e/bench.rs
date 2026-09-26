@@ -13,18 +13,21 @@
 //! the same numbers one record per line for a program to compare (see
 //! [`Metrics`]). On a `PERF=1` build the report carries
 //! the rows of the layer's five-second `mtld3d::perf` summary that cover the
-//! measured frames, copied out of that log. Frame times are taken on the API
-//! thread from one `Present` return to the next with `Instant`, which on
-//! Windows reads `QueryPerformanceCounter`, and the device presents with
-//! `D3DPRESENT_INTERVAL_IMMEDIATE` so the display does not pace it. Beside
-//! that the report gives the time from a `Present` return to the next
-//! `Present` call, the API thread's own work on the frame, which tells a
-//! frame bound by the API thread from one bound behind `Present`. Each
-//! benchmark also samples the process's address space after its warm-up
-//! and at the end of its measured frames, and its peak working set.
+//! measured frames, copied out of that log, and the metrics file the
+//! counters of the `perf-kv` line the layer logs after each of them. Frame
+//! times are taken on the API thread from one `Present` return to the next
+//! with `Instant`, which on Windows reads `QueryPerformanceCounter`, and the
+//! device presents with `D3DPRESENT_INTERVAL_IMMEDIATE` so the display does
+//! not pace it. Beside that the report gives the time from a `Present`
+//! return to the next `Present` call, the API thread's own work on the
+//! frame, which tells a frame bound by the API thread from one bound behind
+//! `Present`. Each benchmark also samples the process's address space after
+//! its warm-up and at the end of its measured frames, and its peak working
+//! set.
 
 use core::fmt::Write as _;
 use std::{
+    collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
     time::{Duration, Instant, SystemTime},
@@ -39,6 +42,13 @@ use mtld3d_types::{
 
 /// The marker that opens one window of the `mtld3d::perf` summary in the layer log.
 const PERF_HEADER: &str = "── perf  window=";
+
+/// What precedes the pairs of the machine-read `perf-kv` line the layer logs after each window.
+///
+/// The line is `perf-kv v1 window_s=<x> frames=<n> key=value ...` after the
+/// logger's prefix; `docs/ARCHITECTURE.md` lists the keys and what each
+/// suffix means.
+const PERF_KV: &str = "] perf-kv v1 ";
 
 /// The blocks of a perf window a report copies, by the words their first row starts with.
 ///
@@ -85,6 +95,16 @@ const LAYER_STAMP: &str = "] d3d9.dll ";
 
 /// What follows the build stamp and the image ID on the layer's load line.
 const LAYER_LOADED: &str = " loaded at ";
+
+/// What precedes the build stamp on the line the layer's unix library logs when it starts.
+///
+/// The line is `mtld3d.so <build> <image id> initialized`, the unix side's
+/// counterpart of the `d3d9.dll` load line, and most of the layer's code is
+/// in that library.
+const UNIX_STAMP: &str = "] mtld3d.so ";
+
+/// What follows the build stamp and the image ID on the unix library's line.
+const UNIX_INITIALIZED: &str = " initialized";
 
 /// The block of a perf window that [`LayerLog::compilation_rows`] copies.
 const COMPILATION_BLOCK: [&str; 1] = ["Compilation"];
@@ -323,15 +343,62 @@ impl LayerLog {
             .collect()
     }
 
+    /// The `perf-kv` pairs of every perf window whose grid was written between `from` and `to`.
+    ///
+    /// One entry per window, in order, holding what follows `perf-kv v1 ` on
+    /// the line the layer logs after that window's grid, or `None` for a
+    /// window the line never followed (a layer older than the line). The line
+    /// is looked for after its grid up to the next window's, past `to` when
+    /// it has to be, since the log thread may write it after the span ended.
+    /// Empty outside a `PERF=1` build.
+    pub fn perf_kv(&self, from: u64, to: u64) -> Vec<Option<String>> {
+        let Some(bytes) = self.path.as_deref().and_then(|path| fs::read(path).ok()) else {
+            return Vec::new();
+        };
+        let start = usize::try_from(from).map_or(bytes.len(), |at| at.min(bytes.len()));
+        let end = usize::try_from(to).map_or(bytes.len(), |at| at.min(bytes.len()));
+        let mut windows: Vec<Option<String>> = Vec::new();
+        let mut at = start;
+        for line in bytes[start..].split(|&byte| byte == b'\n') {
+            let text = String::from_utf8_lossy(line);
+            if text.contains(PERF_HEADER) {
+                if at >= end {
+                    break;
+                }
+                windows.push(None);
+            } else if let Some((_, pairs)) = text.split_once(PERF_KV)
+                && let Some(window) = windows.last_mut()
+            {
+                window.get_or_insert_with(|| pairs.trim_end().to_owned());
+            }
+            at += line.len() + 1;
+        }
+        windows
+    }
+
     /// The build stamp and image ID on the layer's `d3d9.dll` load line, if the log has one.
     ///
     /// Two builds of one commit share the stamp; the image ID, which the
     /// linker derives from the binary's contents, tells them apart.
     pub fn layer_identity(&self) -> Option<(String, String)> {
+        self.identity(LAYER_STAMP, LAYER_LOADED)
+    }
+
+    /// The image ID on the unix library's `mtld3d.so` line, if the log has one.
+    ///
+    /// The `d3d9.dll` image ID alone cannot tell two builds apart whose
+    /// difference is all in the unix library.
+    pub fn unix_image(&self) -> Option<String> {
+        self.identity(UNIX_STAMP, UNIX_INITIALIZED)
+            .map(|(_, image)| image)
+    }
+
+    /// The build stamp and image ID of the first line holding `<stamp><build> <image><after>`.
+    fn identity(&self, stamp: &str, after: &str) -> Option<(String, String)> {
         let bytes = fs::read(self.path.as_deref()?).ok()?;
         String::from_utf8_lossy(&bytes).lines().find_map(|line| {
-            let (_, rest) = line.split_once(LAYER_STAMP)?;
-            let (identity, _) = rest.split_once(LAYER_LOADED)?;
+            let (_, rest) = line.split_once(stamp)?;
+            let (identity, _) = rest.split_once(after)?;
             let (build, image) = identity.split_once(' ')?;
             Some((build.to_owned(), image.to_owned()))
         })
@@ -449,6 +516,8 @@ pub enum Class {
     Exact,
     /// A number that moves between runs of the same build.
     Noisy,
+    /// A memory figure, compared like a time with an absolute floor on top.
+    Bytes,
     /// Reported for the reader, not compared.
     Info,
 }
@@ -460,6 +529,7 @@ impl Class {
             Self::Spikes => "spikes",
             Self::Exact => "exact",
             Self::Noisy => "noisy",
+            Self::Bytes => "bytes",
             Self::Info => "info",
         }
     }
@@ -473,6 +543,12 @@ pub enum Value {
     Count(u64),
     /// Bytes, written as MiB with two decimals.
     Mib(u64),
+    /// A number from the layer's `perf-kv` line, in `unit`, written with `decimals` places.
+    Perf {
+        value: f64,
+        unit: PerfUnit,
+        decimals: usize,
+    },
 }
 
 impl Value {
@@ -482,8 +558,42 @@ impl Value {
             Self::Ms(duration) => (format!("{:.4}", ms(duration)), "ms"),
             Self::Count(count) => (count.to_string(), "count"),
             Self::Mib(bytes) => (mib(bytes), "mib"),
+            Self::Perf {
+                value,
+                unit,
+                decimals,
+            } => (format!("{value:.decimals$}"), unit.word()),
         }
     }
+}
+
+/// The unit of a metric read from the `perf-kv` line.
+pub enum PerfUnit {
+    Ms,
+    Count,
+    Bytes,
+}
+
+impl PerfUnit {
+    const fn word(&self) -> &'static str {
+        match self {
+            Self::Ms => "ms",
+            Self::Count => "count",
+            Self::Bytes => "bytes",
+        }
+    }
+}
+
+/// Whether every frame of a benchmark's perf windows issues the same calls.
+///
+/// It decides whether a per-frame count the calls fix is compared exactly:
+/// it is when every frame is alike, and only reported when the windows mix
+/// frames of different kinds in proportions the machine's speed decides.
+pub enum FrameWork {
+    /// Every frame issues the same calls.
+    Fixed,
+    /// The frames differ.
+    Varying,
 }
 
 /// One render pass of a frame, as the benchmark that draws it defines it.
@@ -517,9 +627,13 @@ pub struct PassShape {
 ///   entries a benchmark's harness adds on top of it, such as the stutter
 ///   benchmark's `shaderCache.enable=false`; the report's shape line names
 ///   those.
+///   `layer_unix_image` is the image ID on the unix library's `mtld3d.so`
+///   line (or `unknown`), since most of the layer is in that library.
 /// - `metric <bench> <name> <value> <unit> <direction> <class>`: a name of
-///   `[a-z0-9_.]`, a unit of `ms`, `count` or `mib`, a [`Direction`] and a
-///   [`Class`].
+///   `[a-z0-9_.]`, a unit of `ms`, `count`, `mib` or `bytes`, a
+///   [`Direction`] and a [`Class`]. The `perf.*` metrics come from the
+///   layer's `perf-kv` lines ([`Self::perf`] has the rules); a file without
+///   them says why in a `# no perf-kv line` comment.
 /// - `shape <bench> pass <i> <W>x<H> draws=<n> ff_vs=<n> ff_ps=<n>
 ///   tex_per_draw=<x.xx>`, one per [`PassShape`] of a scene benchmark.
 ///
@@ -639,6 +753,106 @@ impl Metrics {
         }
     }
 
+    /// The `perf.*` records of the `perf-kv` lines of `windows`, or a comment saying why not.
+    ///
+    /// `windows` is what [`LayerLog::perf_kv`] returned for the windows the
+    /// benchmark reads. Nothing is recorded when there are none or when any
+    /// of them lacks its line; the file then says so in a `# no perf-kv
+    /// line` comment and the benchmark goes on. Otherwise every key but
+    /// `window_s` and `frames` becomes one metric, all of them lower-is-better,
+    /// by its suffix ([`perf_rule`]):
+    ///
+    /// - `_peak_ms`, the worst frame: `perf.<key>` in ms, `info`, the largest
+    ///   of the windows.
+    /// - `_ms`, a per-frame average: `perf.<key>` in ms, `time`, the windows'
+    ///   mean weighted by their frames. `_avg_ms`, an average per event, is
+    ///   weighted by the event's count where the line carries it
+    ///   (`comp_async_latency_avg_ms` by `comp_async_installs_total`) and by
+    ///   frames otherwise.
+    /// - `_bytes`, a peak size: `perf.<key>` in bytes, `bytes`, the largest.
+    /// - `_count`, a count gauge: `perf.<key>` in counts, the largest; `exact`
+    ///   for a cache size (`cache_*_count`) when the frames are
+    ///   [`FrameWork::Fixed`], `noisy` otherwise.
+    /// - `_total`, a window's count: `perf.<key less _total>_pf`, the
+    ///   windows' totals over their frames to three places, in bytes for a
+    ///   `_bytes_total` and in counts otherwise. A count the API calls fix
+    ///   ([`structural`]) is `exact` over [`FrameWork::Fixed`] frames and
+    ///   `info` over varying ones; a count that depends on how the CPU and
+    ///   the GPU overlap (renames, copies, retention, pools, faults, slot
+    ///   waits, compiles, command buffers, whose GPU time arrives with a
+    ///   later submit) is `noisy`. A window's count is divided by its frames
+    ///   because a window lasts five seconds, not a number of frames, so its
+    ///   totals grow with the frame rate.
+    ///
+    /// A key a window leaves out (`docs/ARCHITECTURE.md` names the three that
+    /// can be) is aggregated over the windows that carry it.
+    pub fn perf(&mut self, windows: &[Option<String>], work: &FrameWork) {
+        let missing = windows.iter().filter(|window| window.is_none()).count();
+        if windows.is_empty() {
+            let _ = writeln!(
+                self.records,
+                "# no perf-kv line: no perf window in the span these metrics cover \
+                 (not a PERF=1 build?)"
+            );
+            return;
+        }
+        if missing > 0 {
+            let _ = writeln!(
+                self.records,
+                "# no perf-kv line after {missing} of the {count} perf windows in the span \
+                 (a layer older than the line?)",
+                count = windows.len()
+            );
+            return;
+        }
+        let mut folds: BTreeMap<&str, (PerfRule, PerfFold)> = BTreeMap::new();
+        for line in windows.iter().flatten() {
+            let pairs: Vec<(&str, f64)> = line
+                .split_whitespace()
+                .filter_map(|pair| {
+                    let (key, value) = pair.split_once('=')?;
+                    Some((key, value.parse::<f64>().ok().filter(|v| v.is_finite())?))
+                })
+                .collect();
+            let find = |wanted: &str| {
+                pairs
+                    .iter()
+                    .find_map(|&(key, value)| (key == wanted).then_some(value))
+            };
+            let frames = find("frames").unwrap_or(0.0);
+            for &(key, value) in &pairs {
+                if key == "window_s" || key == "frames" {
+                    continue;
+                }
+                let Some(rule) = perf_rule(key, work) else {
+                    continue;
+                };
+                let weight = match rule.fold {
+                    Fold::EventMean(events) => find(events).unwrap_or(0.0),
+                    Fold::FrameMean | Fold::Max | Fold::PerFrame => frames,
+                };
+                folds
+                    .entry(key)
+                    .or_insert_with(|| (rule, PerfFold::default()))
+                    .1
+                    .add(value, weight);
+            }
+        }
+        for (rule, fold) in folds.into_values() {
+            let value = fold.value(&rule.fold);
+            self.metric(
+                &rule.name,
+                Value::Perf {
+                    value,
+                    unit: rule.unit,
+                    decimals: rule.decimals,
+                },
+                Direction::Lower,
+                rule.class,
+            );
+        }
+    }
+
     /// The whole file: a comment, the `meta` records, then the metrics and the shapes.
     fn file(&self, log: &LayerLog) -> String {
         let bench = &self.bench;
@@ -650,9 +864,11 @@ impl Metrics {
         let (layer, layer_image) = log
             .layer_identity()
             .unwrap_or_else(|| ("unknown".to_owned(), "unknown".to_owned()));
+        let layer_unix_image = log.unix_image().unwrap_or_else(|| "unknown".to_owned());
         for (key, value) in [
             ("layer", layer),
             ("layer_image", layer_image),
+            ("layer_unix_image", layer_unix_image),
             ("arch", arch.to_owned()),
             ("profile", profile().unwrap_or_else(|| "unknown".to_owned())),
             ("debug_assertions", cfg!(debug_assertions).to_string()),
@@ -888,6 +1104,132 @@ pub const IDENTITY_ROWS: [f32; 16] = [
     0.0, 0.0, 1.0, 0.0, //
     0.0, 0.0, 0.0, 1.0,
 ];
+
+/// How [`Metrics::perf`] records one `perf-kv` key.
+struct PerfRule {
+    name: String,
+    fold: Fold,
+    unit: PerfUnit,
+    decimals: usize,
+    class: Class,
+}
+
+/// How the values one key takes in several windows become one.
+enum Fold {
+    /// The mean of per-frame values, weighted by each window's frames.
+    FrameMean,
+    /// The mean of per-event values, weighted by each window's count of the event, the key named.
+    EventMean(&'static str),
+    /// The largest value of any window.
+    Max,
+    /// The windows' totals summed, over their frames summed.
+    PerFrame,
+}
+
+/// The running sums one key's values fold into.
+#[derive(Default)]
+struct PerfFold {
+    sum: f64,
+    weighted: f64,
+    weight: f64,
+    max: f64,
+}
+
+impl PerfFold {
+    fn add(&mut self, value: f64, weight: f64) {
+        self.sum += value;
+        self.weighted = value.mul_add(weight, self.weighted);
+        self.weight += weight;
+        self.max = self.max.max(value);
+    }
+
+    fn value(&self, fold: &Fold) -> f64 {
+        let over = |numerator: f64| {
+            if self.weight > 0.0 {
+                numerator / self.weight
+            } else {
+                0.0
+            }
+        };
+        match fold {
+            Fold::FrameMean | Fold::EventMean(_) => over(self.weighted),
+            Fold::Max => self.max,
+            Fold::PerFrame => over(self.sum),
+        }
+    }
+}
+
+/// The metric one `perf-kv` key becomes, by its suffix; `None` for a key with no known suffix.
+///
+/// [`Metrics::perf`] states the rules this applies.
+fn perf_rule(key: &str, work: &FrameWork) -> Option<PerfRule> {
+    let fixed = matches!(work, FrameWork::Fixed);
+    let rule = |name: String, fold, unit, decimals, class| {
+        Some(PerfRule {
+            name,
+            fold,
+            unit,
+            decimals,
+            class,
+        })
+    };
+    let own = || format!("perf.{key}");
+    if key.ends_with("_peak_ms") {
+        return rule(own(), Fold::Max, PerfUnit::Ms, 3, Class::Info);
+    }
+    if key == "comp_async_latency_avg_ms" {
+        let events = Fold::EventMean("comp_async_installs_total");
+        return rule(own(), events, PerfUnit::Ms, 4, Class::Time);
+    }
+    if key.ends_with("_ms") {
+        return rule(own(), Fold::FrameMean, PerfUnit::Ms, 4, Class::Time);
+    }
+    if key.ends_with("_bytes") {
+        return rule(own(), Fold::Max, PerfUnit::Bytes, 0, Class::Bytes);
+    }
+    if key.ends_with("_count") {
+        let class = if fixed && key.starts_with("cache_") {
+            Class::Exact
+        } else {
+            Class::Noisy
+        };
+        return rule(own(), Fold::Max, PerfUnit::Count, 0, class);
+    }
+    let base = key.strip_suffix("_total")?;
+    let unit = if base.ends_with("_bytes") {
+        PerfUnit::Bytes
+    } else {
+        PerfUnit::Count
+    };
+    let class = match (structural(base), fixed) {
+        (true, true) => Class::Exact,
+        (true, false) => Class::Info,
+        (false, _) => Class::Noisy,
+    };
+    rule(format!("perf.{base}_pf"), Fold::PerFrame, unit, 3, class)
+}
+
+/// Whether the `_total` named `<base>_total` counts work the API calls alone fix.
+///
+/// Draws, passes, commands, the calls of every API, device, bind, surface
+/// and keys-gating row and the keys gate's skips, texture uploads and
+/// dirty rects, user-pointer draws, generated fans and staging uploads: a
+/// frame that repeats the calls of the one before repeats these. Anything
+/// else counts events that depend on how the CPU and the GPU overlap.
+fn structural(base: &str) -> bool {
+    const WHOLE: [&str; 5] = [
+        "draws",
+        "passes",
+        "commands",
+        "fan_generated",
+        "vbib_staging_uploads",
+    ];
+    const PREFIX: [&str; 4] = ["tex_uploads", "tex_dirtyrect", "up_", "keys_"];
+    const CALLS: [&str; 4] = ["api_", "dev_", "bind_", "surf_"];
+    WHOLE.contains(&base)
+        || PREFIX.iter().any(|prefix| base.starts_with(prefix))
+        || (base.ends_with("_calls") && CALLS.iter().any(|prefix| base.starts_with(prefix)))
+}
 
 /// The title and the `blocks` of the window whose header is `lines[header]`.
 fn window_rows(lines: &[&str], header: usize, blocks: &[&str]) -> String {
