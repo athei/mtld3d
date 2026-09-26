@@ -188,7 +188,7 @@ fn poll(name: &str, keys: &'static str, answering: &Answering) {
     );
 
     let count = |n: usize| Value::Count(u64::try_from(n).expect("a count fits u64"));
-    let mut metrics = Metrics::new(name);
+    let mut metrics = Metrics::new(name, &h);
     metrics.frame_rows("frame", &stats);
     metrics.frame_rows("api", &work);
     metrics.frame_rows("event.latency", &latency);

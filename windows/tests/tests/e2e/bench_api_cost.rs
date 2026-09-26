@@ -221,7 +221,7 @@ fn api_call_cost() {
         .map(|kind| kind.calls() * u64::from(CALLS) * rounds_u64)
         .sum();
     let mut table = String::new();
-    let mut metrics = Metrics::new("api_call_cost");
+    let mut metrics = Metrics::new("api_call_cost", &h);
     for (kind, samples) in KINDS.iter().zip(&mut samples) {
         samples.sort_unstable_by(f64::total_cmp);
         let median = samples[nearest_rank(samples.len(), 50)];

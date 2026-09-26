@@ -94,29 +94,35 @@ const MATCHING_META: [&str; 3] = ["arch", "profile", "debug_assertions"];
 /// leg's own tree with an architecture and a profile of its own.
 const KIND_META: &str = "kind";
 
+/// The host emitter's own corpora, which every build of it runs.
+const HOST_SYNTHETIC: [&str; 2] = ["host_emit_synthetic_ff", "host_emit_synthetic_sm"];
+
 /// The meta keys every host benchmark file has to carry: it loads no layer image.
 const HOST_REQUIRED_META: [&str; 4] = ["layer", "arch", "profile", "debug_assertions"];
 
 /// The image key of the host benchmark and the binary it names.
 const HOST_IMAGE_META: [(&str, &str); 1] = [("host_image", "emit_corpus")];
 
+/// The end-to-end benchmarks, which run the layer under Wine.
+const LAYER_KIND: Kind = Kind {
+    tag: None,
+    label: "layer",
+    required: &REQUIRED_META,
+    images: &IMAGE_META,
+    distinct_images: true,
+};
+
+/// The host emitter benchmark, a native binary of each leg's own tree.
+const HOST_KIND: Kind = Kind {
+    tag: Some("host"),
+    label: "host",
+    required: &HOST_REQUIRED_META,
+    images: &HOST_IMAGE_META,
+    distinct_images: false,
+};
+
 /// The kinds of benchmark binary, each with the checks its builds get.
-const KINDS: [Kind; 2] = [
-    Kind {
-        tag: None,
-        label: "layer",
-        required: &REQUIRED_META,
-        images: &IMAGE_META,
-        distinct_images: true,
-    },
-    Kind {
-        tag: Some("host"),
-        label: "host",
-        required: &HOST_REQUIRED_META,
-        images: &HOST_IMAGE_META,
-        distinct_images: false,
-    },
-];
+const KINDS: [Kind; 2] = [LAYER_KIND, HOST_KIND];
 
 /// A kind of benchmark binary, told apart by the `kind` meta value its files carry.
 ///
@@ -730,24 +736,30 @@ pub fn compare(
     let base_benches = leg_benches(&Leg::Base, base)?;
     let cand_benches = leg_benches(&Leg::Cand, cand)?;
     let mut benches = Vec::new();
-    if let Some(bench) = base_benches.symmetric_difference(&cand_benches).next() {
-        let ran = if base_benches.contains(bench) {
-            "base"
+    let mut notes = Vec::new();
+    for bench in base_benches.symmetric_difference(&cand_benches) {
+        let (ran, rounds) = if base_benches.contains(bench) {
+            ("base", base)
         } else {
-            "cand"
+            ("cand", cand)
         };
-        return Err(format!(
-            "incomplete run: benchmark {bench} ran only in the {ran} leg; both legs have to run \
-             every benchmark for the run to be judged"
+        if !host_corpus(bench, rounds) {
+            return Err(format!(
+                "incomplete run: benchmark {bench} ran only in the {ran} leg; both legs have to \
+                 run every benchmark for the run to be judged"
+            ));
+        }
+        notes.push(format!(
+            "{bench} skipped: only the {ran} leg's emitter could read that shader cache (a cache \
+             format one of the builds does not read), so there is nothing to pair"
         ));
     }
-    for bench in &base_benches {
+    for bench in base_benches.intersection(&cand_benches) {
         benches.push(BenchReport {
             bench: bench.clone(),
             rows: bench_rows(bench, base, cand, options)?,
         });
     }
-    let mut notes = Vec::new();
     for name in &options.accept {
         let matched = benches.iter().flat_map(|b| b.rows.iter()).any(|row| {
             row.metric == *name && matches!(row.verdict, Verdict::Changed { accepted: true, .. })
@@ -763,6 +775,20 @@ pub fn compare(
         benches,
         notes,
     })
+}
+
+/// Whether `bench` is a host emitter benchmark of a shader cache, going by its files in `rounds`.
+///
+/// The emitter skips a cache whose format its build does not read and
+/// writes no file for it, so a cache that a format change between the two
+/// builds makes readable to one leg only leaves its benchmark in that leg
+/// alone. The synthetic corpora are the emitter's own and always run.
+fn host_corpus(bench: &str, rounds: &[BTreeMap<String, Loaded>]) -> bool {
+    !HOST_SYNTHETIC.contains(&bench)
+        && rounds
+            .iter()
+            .filter_map(|round| round.get(bench))
+            .all(|loaded| HOST_KIND.holds(&loaded.file))
 }
 
 /// The benchmarks of one leg, each checked to have a file in every round.

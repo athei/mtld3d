@@ -986,11 +986,14 @@ VARIANT ?= native
 conformance-isolate: install-windows-$(ARCH) install-unix-$(SDK_UNIX_ARCH)
 	$(call conformance_leg,$(ARCH),--only $(ONLY) --repeat $(REPEAT) --variant $(VARIANT))
 
-# The synthetic benchmarks (NOT part of `make test`): `bench_frame_shape.rs`, a
-# frame shaped like World of Warcraft 3.3.5a's busy frame, `bench_wow112.rs`,
-# one shaped like 1.12's fixed-function-heavy busy frame (`wow_112_busy_frame`),
-# and `bench_shader_stutter.rs`, frames that each meet pixel shaders never seen
-# before with the shader cache off. They are `#[ignore]`d tests of the e2e
+# The synthetic benchmarks (NOT part of `make test`), the `#[ignore]`d tests of
+# `windows/tests/tests/e2e/bench_*.rs` (`windows/tests/COVERAGE.md` has a row
+# for each file): frames shaped like World of Warcraft 1.12's and 3.3.5a's busy
+# frames (`wow_112_busy_frame`, `wow_335a_busy_frame`), frames that each meet
+# pixel shaders never seen before with the shader cache off, an EVENT-query
+# throttle under the `wow` profile's query keys and under the D3D9 defaults
+# (`query_poll_wow`, `query_poll_spec`), and the API thread's cost of one call
+# of each kind (`api_call_cost`). They are `#[ignore]`d tests of the e2e
 # binary, so the suite reports them ignored; this runs them alone, one at a
 # time in one process, through the runner's `--ignored`, for one PE arch
 # (ARCH, default i686, the arch the game ships). They measure and never assert
@@ -1091,7 +1094,7 @@ bench: install-windows-$(ARCH) install-unix-$(SDK_UNIX_ARCH)
 # included: the verdicts are only as good as the quiet of the machine.
 RUNS ?= 5
 BENCH_SET ?= wow
-BENCH_SET_wow := wow_112_busy_frame wow_335a_busy_frame query_poll api_call_cost
+BENCH_SET_wow := wow_112_busy_frame wow_335a_busy_frame query_poll_wow query_poll_spec api_call_cost
 BENCH_SET_full :=
 BENCH_CHECKOUT = $(patsubst %/,%,$(dir $(shell git rev-parse --path-format=absolute --git-common-dir)))
 BENCH_AB_ROOT = $(abspath $(or $(LOG_DIR),$(BENCH_CHECKOUT)/.codex/evidence/bench-ab))

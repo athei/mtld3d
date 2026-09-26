@@ -380,7 +380,7 @@ fn wow_112_busy_frame() {
                 "perf: this device's first window, its warm-up compiles\n{rows}"
             )),
     );
-    let mut metrics = Metrics::new("wow112");
+    let mut metrics = Metrics::new("wow112", &h);
     metrics.frame_rows("frame", &stats);
     metrics.frame_rows("api", &work);
     metrics.metric(

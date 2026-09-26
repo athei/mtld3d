@@ -166,7 +166,7 @@ fn wow_335a_busy_frame() {
                 "perf: this device's first window, its warm-up compiles\n{rows}"
             )),
     );
-    let mut metrics = Metrics::new("frame_shape");
+    let mut metrics = Metrics::new("frame_shape", &h);
     metrics.frame_rows("frame", &stats);
     metrics.frame_rows("api", &work);
     metrics.metric(

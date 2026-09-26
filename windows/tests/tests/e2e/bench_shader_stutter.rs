@@ -198,7 +198,7 @@ fn stutter(name: &str, per_frame: u32, offscreen: u32) {
     );
 
     let count = |n: usize| Value::Count(u64::try_from(n).expect("a count fits u64"));
-    let mut metrics = Metrics::new(name);
+    let mut metrics = Metrics::new(name, &h);
     metrics.frame_rows("frame", &stats);
     // The API thread's share of these frames is tens of microseconds, which
     // two runs of one build move by more than a relative rule allows; the

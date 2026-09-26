@@ -989,3 +989,70 @@ fn a_file_of_an_unknown_kind_is_rejected() {
     let reason = error_of(&fixture);
     assert!(reason.contains("meta kind \"gpu\" is no kind"), "{reason}");
 }
+
+#[test]
+fn a_cache_corpus_only_one_leg_could_read_is_skipped_with_a_note() {
+    let fixture = with_host(
+        "host-corpus",
+        &meta_host("v1", "H1"),
+        &meta_host("v1", "H2"),
+    );
+    for round in 0..3 {
+        let metrics = [("parse_emit.us_per_shader", 9.0, "us lower time")];
+        fixture.write(
+            "base",
+            round,
+            "host_emit_game",
+            &meta_host("v1", "H1"),
+            &metrics,
+        );
+    }
+    let comparison = evaluate(&fixture.root, &Options::default()).unwrap();
+    assert!(!comparison.failed(), "{}", comparison.render());
+    assert!(
+        comparison
+            .benches
+            .iter()
+            .all(|bench| bench.bench != "host_emit_game"),
+        "{}",
+        comparison.render()
+    );
+    assert!(
+        comparison
+            .notes
+            .iter()
+            .any(|note| note.starts_with("host_emit_game skipped: only the base leg")),
+        "{:?}",
+        comparison.notes
+    );
+}
+
+#[test]
+fn a_synthetic_host_corpus_in_one_leg_is_still_an_incomplete_run() {
+    let fixture = Fixture::new("host-synthetic-one-leg");
+    fixture.standard(3, 1.0);
+    for round in 0..3 {
+        let metrics = [("emit.us_per_shader", 3.0, "us lower time")];
+        for leg in ["base", "cand"] {
+            fixture.write(
+                leg,
+                round,
+                "host_emit_synthetic_ff",
+                &meta_host("v1", "H1"),
+                &metrics,
+            );
+        }
+        fixture.write(
+            "cand",
+            round,
+            "host_emit_synthetic_sm",
+            &meta_host("v1", "H1"),
+            &metrics,
+        );
+    }
+    let reason = error_of(&fixture);
+    assert!(
+        reason.contains("host_emit_synthetic_sm ran only in the cand leg"),
+        "{reason}"
+    );
+}

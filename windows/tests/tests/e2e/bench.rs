@@ -1,7 +1,7 @@
 //! Support shared by the synthetic benchmarks, which `make bench` runs and `make test` skips.
 //!
-//! No test of its own. The benchmarks in `bench_frame_shape.rs` and
-//! `bench_shader_stutter.rs` are `#[ignore]`d: they take seconds each and
+//! No test of its own. The benchmarks, one or more in each `bench_*.rs`
+//! beside this file, are `#[ignore]`d: they take seconds each and
 //! their numbers depend on the machine and on whatever else it is running,
 //! so they measure and report instead of asserting, and the ordinary suite
 //! lists them as ignored. `make bench` runs them alone, one at a time in one
@@ -644,8 +644,8 @@ pub struct PassShape {
 ///   `profile` and `debug_assertions` describe the benchmark binary, which
 ///   `make bench` builds with the layer's profile. `config` leaves out the
 ///   entries a benchmark's harness adds on top of it, such as the stutter
-///   benchmark's `shaderCache.enable=false`; the report's shape line names
-///   those.
+///   benchmark's `shaderCache.enable=false`; `config_entries` names those
+///   (or `none`), so the two together are the settings the layer ran with.
 ///   `layer_unix_image` is the image ID on the unix library's `mtld3d.so`
 ///   line (or `unknown`), since most of the layer is in that library.
 /// - `metric <bench> <name> <value> <unit> <direction> <class>`: a name of
@@ -661,22 +661,30 @@ pub struct PassShape {
 /// by changing one.
 pub struct Metrics {
     bench: String,
+    /// The harness's own configuration entries, `none` when it has none.
+    config_entries: String,
     records: String,
     shapes: String,
 }
 
 impl Metrics {
-    /// No records yet, for the benchmark `bench`, which also names both files.
+    /// No records yet, for the benchmark `bench` measured on `h`; `bench` also names both files.
     ///
     /// # Panics
     /// Panics if `bench` is empty or holds whitespace.
-    pub fn new(bench: &str) -> Self {
+    pub fn new(bench: &str, h: &Harness) -> Self {
         assert!(
             !bench.is_empty() && !bench.contains(char::is_whitespace),
             "a benchmark name is one word: {bench:?}"
         );
+        let entries = h.config_entries().trim();
         Self {
             bench: bench.to_owned(),
+            config_entries: if entries.is_empty() {
+                "none".to_owned()
+            } else {
+                entries.replace(['\r', '\n'], " ")
+            },
             records: String::new(),
             shapes: String::new(),
         }
@@ -916,6 +924,7 @@ impl Metrics {
                         |config| config.replace(['\r', '\n'], " "),
                     ),
             ),
+            ("config_entries", self.config_entries.clone()),
         ] {
             let _ = writeln!(file, "meta {bench} {key} {value}");
         }
