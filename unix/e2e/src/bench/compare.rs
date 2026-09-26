@@ -1,0 +1,829 @@
+//! Judge a finished A/B directory: pair the legs round by round and give every metric a verdict.
+//!
+//! Round `i` of the base and round `i` of the candidate ran back to back, so
+//! each pair saw the same machine state and the comparison is made pair by
+//! pair, never between the two legs' pooled numbers. Every rule turns a
+//! metric's pairs into a value where more is worse whichever way the metric
+//! is better, so one threshold serves both directions:
+//!
+//! - `time` and `noisy`: the ratio `cand / base` per pair. A regression is a
+//!   median ratio above `1 + max(T, 3 sigma)`, sigma being 1.4826 times the
+//!   MAD of the ratios, with at least 80 % of the pairs worse. `T` is 8 % for
+//!   a tail percentile (a name with `p99`), which moves more between runs,
+//!   and 3 % otherwise. An improvement is the mirror image.
+//! - `bytes`: the same, and the median difference must also exceed 4 MiB,
+//!   since a few percent of a small footprint is allocator noise.
+//! - `spikes`: the difference per pair. A regression is a median difference
+//!   above `max(2, 3 MAD)`.
+//! - `exact`: any pair that differs is a change, worse or better, and a
+//!   change fails the comparison unless it is accepted by name, because the
+//!   workload fixes these numbers and a change means the layer does
+//!   different work.
+//! - `info`: reported, never judged.
+//!
+//! Before any of that the directory has to be trustworthy: both legs hold
+//! the same rounds, every benchmark wrote a file in every round of its leg,
+//! the metrics keep their definitions, each leg ran one build throughout,
+//! the two legs ran two different `d3d9.dll` images, and both ran the same
+//! profile. Anything else is an error, exit code 2, not a verdict.
+
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt::Write as _,
+    fs,
+    path::{Path, PathBuf},
+    process::ExitCode,
+};
+
+use super::{
+    Leg, SAME_IMAGE_FILE,
+    metrics::{self, Class, Direction, Metric, MetricsFile},
+    stats::{MAD_SIGMA, mad, median},
+};
+
+/// The noise floor of a ratio-judged metric, as a fraction.
+const RATIO_FLOOR: f64 = 0.03;
+
+/// The noise floor of a ratio-judged tail percentile, which moves more from run to run.
+const RATIO_FLOOR_TAIL: f64 = 0.08;
+
+/// How many estimated standard deviations a median has to clear.
+const SIGMA_FACTOR: f64 = 3.0;
+
+/// The floor of a spike count's median difference, in events.
+const SPIKE_FLOOR: f64 = 2.0;
+
+/// The meta keys every metrics file has to carry for the sanity checks.
+const REQUIRED_META: [&str; 5] = [
+    "layer",
+    "layer_image",
+    "arch",
+    "profile",
+    "debug_assertions",
+];
+
+/// The `layer_image` value of a `d3d9.dll` that carries no image ID.
+const UNKNOWN_IMAGE: &str = "unknown";
+
+/// The meta keys both legs have to agree on: comparing two profiles measures the profiles.
+const MATCHING_META: [&str; 3] = ["arch", "profile", "debug_assertions"];
+
+/// What changes a comparison's verdicts beyond the numbers.
+#[derive(Debug, Default)]
+pub struct Options {
+    /// Exact metrics whose change is expected, by name.
+    pub accept: Vec<String>,
+    /// Both legs build one commit from a clean tree, so they may load one image.
+    pub allow_same_image: bool,
+}
+
+/// What became of one metric.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Verdict {
+    /// Within the noise.
+    Neutral,
+    /// Worse beyond the noise.
+    Regression,
+    /// Better beyond the noise.
+    Improvement,
+    /// An exact metric that moved.
+    Changed {
+        /// Some pair moved the worse way.
+        worse: bool,
+        /// Its name was given to `--accept`.
+        accepted: bool,
+    },
+    /// An `info` metric, reported only.
+    Info,
+    /// Only the candidate has it.
+    Added,
+    /// Only the base has it.
+    Removed,
+}
+
+impl Verdict {
+    /// The verdict column of the report.
+    #[must_use]
+    pub const fn label(&self) -> &'static str {
+        match self {
+            Self::Neutral => "ok",
+            Self::Regression => "REGRESSION",
+            Self::Improvement => "improved",
+            Self::Changed { accepted: true, .. } => "changed, accepted",
+            Self::Changed {
+                worse: true,
+                accepted: false,
+            } => "CHANGED (worse)",
+            Self::Changed {
+                worse: false,
+                accepted: false,
+            } => "CHANGED (better)",
+            Self::Info => "info",
+            Self::Added => "added",
+            Self::Removed => "removed",
+        }
+    }
+
+    /// Whether this verdict fails the comparison.
+    #[must_use]
+    pub const fn fails(&self) -> bool {
+        matches!(
+            self,
+            Self::Regression
+                | Self::Changed {
+                    accepted: false,
+                    ..
+                }
+        )
+    }
+}
+
+/// One metric's row in a benchmark's table.
+#[derive(Debug)]
+pub struct Row {
+    pub metric: String,
+    pub base: String,
+    pub cand: String,
+    pub change: String,
+    pub noise: String,
+    pub verdict: Verdict,
+}
+
+/// One benchmark's part of the report.
+#[derive(Debug)]
+pub struct BenchReport {
+    pub bench: String,
+    /// `None` when both legs ran it, otherwise the one leg that did.
+    pub only: Option<Leg>,
+    pub rows: Vec<Row>,
+}
+
+/// The whole judgement of an A/B directory.
+#[derive(Debug)]
+pub struct Comparison {
+    /// What was compared: the two builds, the profile, the pairs.
+    pub header: Vec<String>,
+    pub benches: Vec<BenchReport>,
+    /// Remarks that are no verdict, such as an accepted name nothing matched.
+    pub notes: Vec<String>,
+}
+
+impl Comparison {
+    /// Whether any verdict fails the comparison.
+    #[must_use]
+    pub fn failed(&self) -> bool {
+        self.rows().any(|row| row.verdict.fails())
+    }
+
+    fn rows(&self) -> impl Iterator<Item = &Row> {
+        self.benches.iter().flat_map(|bench| bench.rows.iter())
+    }
+
+    /// The report: the header, a table per benchmark, the notes and the summary line.
+    #[must_use]
+    pub fn render(&self) -> String {
+        let mut out = String::new();
+        for line in &self.header {
+            let _ = writeln!(out, "{line}");
+        }
+        for bench in &self.benches {
+            out.push('\n');
+            match bench.only {
+                Some(Leg::Base) => {
+                    let _ = writeln!(out, "== {} (removed: only the base ran it)", bench.bench);
+                    continue;
+                }
+                Some(Leg::Cand) => {
+                    let _ = writeln!(out, "== {} (added: only the candidate ran it)", bench.bench);
+                    continue;
+                }
+                None => {
+                    let _ = writeln!(out, "== {}", bench.bench);
+                }
+            }
+            render_table(&mut out, &bench.rows);
+        }
+        if !self.notes.is_empty() {
+            out.push('\n');
+            for note in &self.notes {
+                let _ = writeln!(out, "note: {note}");
+            }
+        }
+        out.push('\n');
+        out.push_str(&self.summary());
+        out.push('\n');
+        out
+    }
+
+    /// The one-line summary that ends the report.
+    #[must_use]
+    pub fn summary(&self) -> String {
+        let count =
+            |test: fn(&Verdict) -> bool| self.rows().filter(|row| test(&row.verdict)).count();
+        let judged = self
+            .benches
+            .iter()
+            .filter(|bench| bench.only.is_none())
+            .count();
+        let regressions = count(|v| *v == Verdict::Regression);
+        let improvements = count(|v| *v == Verdict::Improvement);
+        let changes = count(|v| matches!(v, Verdict::Changed { .. }));
+        let accepted = count(|v| matches!(v, Verdict::Changed { accepted: true, .. }));
+        let added = count(|v| *v == Verdict::Added)
+            + self
+                .benches
+                .iter()
+                .filter(|b| b.only == Some(Leg::Cand))
+                .count();
+        let removed = count(|v| *v == Verdict::Removed)
+            + self
+                .benches
+                .iter()
+                .filter(|b| b.only == Some(Leg::Base))
+                .count();
+        let verdict = if self.failed() { "FAIL" } else { "PASS" };
+        format!(
+            "bench-compare: {verdict}: {judged} benchmarks, {} metrics: {regressions} regressed, \
+             {improvements} improved, {changes} exact changed ({accepted} accepted), {added} \
+             added, {removed} removed",
+            self.rows().count()
+        )
+    }
+}
+
+/// Judge the A/B directory `dir`, print the report, and write it to `report` too.
+///
+/// # Errors
+///
+/// Returns a message when the directory cannot be read or trusted, or the
+/// report cannot be written.
+pub fn judge_dir(dir: &Path, options: &Options, report: Option<&Path>) -> Result<ExitCode, String> {
+    let comparison = evaluate(dir, options)?;
+    let text = comparison.render();
+    print!("{text}");
+    if let Some(path) = report {
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
+        }
+        fs::write(path, &text).map_err(|e| format!("{}: {e}", path.display()))?;
+        println!("bench-compare: report written to {}", path.display());
+    }
+    Ok(if comparison.failed() {
+        ExitCode::from(1)
+    } else {
+        ExitCode::SUCCESS
+    })
+}
+
+/// Judge the A/B directory `dir`.
+///
+/// `options.allow_same_image` also holds when the directory carries the
+/// file `bench-ab` leaves for a run of one clean commit against itself.
+///
+/// # Errors
+///
+/// Returns a message when the directory cannot be read, a metrics file is
+/// malformed, the rounds do not pair up, or the builds are not the ones an
+/// A/B comparison needs.
+pub fn evaluate(dir: &Path, options: &Options) -> Result<Comparison, String> {
+    let base = load_leg(&dir.join(Leg::Base.dir()))?;
+    let cand = load_leg(&dir.join(Leg::Cand.dir()))?;
+    if base.len() != cand.len() {
+        return Err(format!(
+            "mismatched rounds in {}: base has {}, cand has {}",
+            dir.display(),
+            base.len(),
+            cand.len()
+        ));
+    }
+    let allow_same_image = options.allow_same_image || dir.join(SAME_IMAGE_FILE).exists();
+    let builds = check_builds(&base, &cand, allow_same_image)?;
+    let mut comparison = compare(&base, &cand, options)?;
+    comparison.notes.extend(builds.notes);
+    comparison.header = vec![
+        format!("bench-compare: {}", dir.display()),
+        format!(
+            "base: layer {} image {}   cand: layer {} image {}",
+            builds.base_layer, builds.base_image, builds.cand_layer, builds.cand_image
+        ),
+        format!(
+            "{} profile, debug assertions {}, {}; {} round pairs",
+            builds.profile,
+            builds.debug_assertions,
+            builds.arch,
+            base.len()
+        ),
+        "change: + is worse whichever way the metric is better; noise: sigma of the pair ratios, \
+         the MAD of spike differences, or how many exact pairs differ"
+            .to_owned(),
+    ];
+    Ok(comparison)
+}
+
+/// A metrics file and where it came from.
+#[derive(Debug)]
+pub struct Loaded {
+    pub path: PathBuf,
+    pub file: MetricsFile,
+}
+
+/// Read one leg's directory: rounds `0..N`, each a directory of `bench-<name>.metrics`.
+///
+/// What it returns holds, per round, each benchmark's file by benchmark name.
+///
+/// # Errors
+///
+/// Returns a message when the directory is missing or unreadable, a
+/// subdirectory is not a round number, the rounds are not `0..N`, or a
+/// metrics file cannot be read or parsed.
+pub fn load_leg(dir: &Path) -> Result<Vec<BTreeMap<String, Loaded>>, String> {
+    let entries = fs::read_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let mut rounds: BTreeMap<usize, PathBuf> = BTreeMap::new();
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("{}: {e}", dir.display()))?;
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let name = entry.file_name();
+        let round = name
+            .to_str()
+            .filter(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))
+            .and_then(|n| n.parse::<usize>().ok())
+            .ok_or_else(|| format!("{}: not a round number", path.display()))?;
+        rounds.insert(round, path);
+    }
+    if rounds.is_empty() {
+        return Err(format!("{}: no rounds", dir.display()));
+    }
+    if rounds.keys().copied().ne(0..rounds.len()) {
+        let found: Vec<String> = rounds.keys().map(ToString::to_string).collect();
+        return Err(format!(
+            "{}: the rounds are {}, not 0..{}",
+            dir.display(),
+            found.join(", "),
+            rounds.len()
+        ));
+    }
+    rounds.values().map(|round| load_round(round)).collect()
+}
+
+/// Read every `bench-<name>.metrics` in one round's directory.
+fn load_round(dir: &Path) -> Result<BTreeMap<String, Loaded>, String> {
+    let entries = fs::read_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let mut files = BTreeMap::new();
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("{}: {e}", dir.display()))?;
+        let name = entry.file_name();
+        let Some(bench) = name.to_str().and_then(metrics::bench_of) else {
+            continue;
+        };
+        let path = entry.path();
+        let file = metrics::read(&path)?;
+        files.insert(bench.to_owned(), Loaded { path, file });
+    }
+    Ok(files)
+}
+
+/// What the two legs ran, once the checks passed.
+#[derive(Debug)]
+pub struct Builds {
+    pub base_layer: String,
+    pub base_image: String,
+    pub cand_layer: String,
+    pub cand_image: String,
+    pub profile: String,
+    pub debug_assertions: String,
+    pub arch: String,
+    /// What the checks could not establish, for the report.
+    pub notes: Vec<String>,
+}
+
+/// Check that each leg ran one build throughout, and the two legs two builds of one profile.
+///
+/// Within a leg every file has to name the same layer stamp, image ID,
+/// profile, debug-assertion state and architecture. Across the legs the last
+/// three have to match, and the image IDs have to differ: the two legs are
+/// separate builds, so one image in both means one DLL was loaded twice. The
+/// release stamps may be equal, since a candidate with uncommitted changes
+/// carries the stamp of the commit it sits on. The one exception is a true
+/// A/A run, one commit against itself from a clean tree, where a
+/// deterministic build gives both legs the same image: `allow_same_image`
+/// says the refs are that, and equal stamps confirm it.
+///
+/// # Errors
+///
+/// Returns a message naming the files or values that disagree.
+pub fn check_builds(
+    base: &[BTreeMap<String, Loaded>],
+    cand: &[BTreeMap<String, Loaded>],
+    allow_same_image: bool,
+) -> Result<Builds, String> {
+    let base_meta = leg_meta(&Leg::Base, base)?;
+    let cand_meta = leg_meta(&Leg::Cand, cand)?;
+    for key in MATCHING_META {
+        if base_meta[key] != cand_meta[key] {
+            return Err(format!(
+                "the legs ran different builds: meta {key} is {:?} in base, {:?} in cand; \
+                 comparing two {key}s measures the {key}s, not the change",
+                base_meta[key], cand_meta[key]
+            ));
+        }
+    }
+    let (base_image, cand_image) = (&base_meta["layer_image"], &cand_meta["layer_image"]);
+    let mut notes = Vec::new();
+    if base_image == UNKNOWN_IMAGE || cand_image == UNKNOWN_IMAGE {
+        notes.push(
+            "a leg's d3d9.dll carries no image ID, so nothing shows the legs ran two builds"
+                .to_owned(),
+        );
+    } else if base_image == cand_image
+        && allow_same_image
+        && base_meta["layer"] == cand_meta["layer"]
+    {
+        notes.push("legs loaded identical binaries (A/A)".to_owned());
+    } else if base_image == cand_image {
+        return Err(format!(
+            "both legs loaded d3d9.dll image {base_image}: one DLL ran twice, so one leg did not \
+             run the build it was meant to"
+        ));
+    }
+    Ok(Builds {
+        base_layer: base_meta["layer"].clone(),
+        base_image: base_image.clone(),
+        cand_layer: cand_meta["layer"].clone(),
+        cand_image: cand_image.clone(),
+        profile: base_meta["profile"].clone(),
+        debug_assertions: base_meta["debug_assertions"].clone(),
+        arch: base_meta["arch"].clone(),
+        notes,
+    })
+}
+
+/// The required meta values of one leg, checked to be the same in every file.
+fn leg_meta(
+    leg: &Leg,
+    rounds: &[BTreeMap<String, Loaded>],
+) -> Result<BTreeMap<&'static str, String>, String> {
+    let mut seen: BTreeMap<&'static str, (String, &Path)> = BTreeMap::new();
+    for loaded in rounds.iter().flat_map(BTreeMap::values) {
+        for key in REQUIRED_META {
+            let value = loaded
+                .file
+                .meta
+                .get(key)
+                .ok_or_else(|| format!("{}: no meta {key} line", loaded.path.display()))?;
+            match seen.get(key) {
+                None => {
+                    seen.insert(key, (value.clone(), &loaded.path));
+                }
+                Some((first, first_path)) if first != value => {
+                    return Err(format!(
+                        "the {} leg did not run one build: meta {key} is {first:?} in {} and \
+                         {value:?} in {}",
+                        leg.dir(),
+                        first_path.display(),
+                        loaded.path.display()
+                    ));
+                }
+                Some(_) => {}
+            }
+        }
+    }
+    if seen.is_empty() {
+        return Err(format!("the {} leg has no metrics file", leg.dir()));
+    }
+    Ok(seen
+        .into_iter()
+        .map(|(key, (value, _))| (key, value))
+        .collect())
+}
+
+/// Compare the two legs benchmark by benchmark and metric by metric.
+///
+/// # Errors
+///
+/// Returns a message when a benchmark is missing from some rounds of a leg
+/// or a metric changes its definition or comes and goes between rounds.
+pub fn compare(
+    base: &[BTreeMap<String, Loaded>],
+    cand: &[BTreeMap<String, Loaded>],
+    options: &Options,
+) -> Result<Comparison, String> {
+    let base_benches = leg_benches(&Leg::Base, base)?;
+    let cand_benches = leg_benches(&Leg::Cand, cand)?;
+    let mut benches = Vec::new();
+    for bench in base_benches.union(&cand_benches) {
+        let only = match (base_benches.contains(bench), cand_benches.contains(bench)) {
+            (true, false) => Some(Leg::Base),
+            (false, true) => Some(Leg::Cand),
+            _ => None,
+        };
+        let rows = if only.is_none() {
+            bench_rows(bench, base, cand, options)?
+        } else {
+            Vec::new()
+        };
+        benches.push(BenchReport {
+            bench: bench.clone(),
+            only,
+            rows,
+        });
+    }
+    let mut notes = Vec::new();
+    for name in &options.accept {
+        let matched = benches.iter().flat_map(|b| b.rows.iter()).any(|row| {
+            row.metric == *name && matches!(row.verdict, Verdict::Changed { accepted: true, .. })
+        });
+        if !matched {
+            notes.push(format!(
+                "--accept {name}: no exact metric of that name changed"
+            ));
+        }
+    }
+    Ok(Comparison {
+        header: Vec::new(),
+        benches,
+        notes,
+    })
+}
+
+/// The benchmarks of one leg, each checked to have a file in every round.
+fn leg_benches(leg: &Leg, rounds: &[BTreeMap<String, Loaded>]) -> Result<BTreeSet<String>, String> {
+    let all: BTreeSet<String> = rounds.iter().flat_map(BTreeMap::keys).cloned().collect();
+    for (index, round) in rounds.iter().enumerate() {
+        if let Some(missing) = all.iter().find(|bench| !round.contains_key(*bench)) {
+            return Err(format!(
+                "mismatched rounds: {}/{index} has no bench-{missing}.metrics, which other \
+                 rounds of that leg have",
+                leg.dir()
+            ));
+        }
+    }
+    Ok(all)
+}
+
+/// The rows of one benchmark both legs ran.
+fn bench_rows(
+    bench: &str,
+    base: &[BTreeMap<String, Loaded>],
+    cand: &[BTreeMap<String, Loaded>],
+    options: &Options,
+) -> Result<Vec<Row>, String> {
+    let base_series = leg_series(bench, base)?;
+    let cand_series = leg_series(bench, cand)?;
+    let names: BTreeSet<&String> = base_series
+        .keys()
+        .chain(cand_series.keys())
+        .copied()
+        .collect();
+    let mut rows = Vec::new();
+    for name in names {
+        let row = match (base_series.get(name), cand_series.get(name)) {
+            (Some((definition, base_values)), Some((cand_definition, cand_values))) => {
+                if !definition.same_definition(cand_definition) {
+                    return Err(format!(
+                        "{bench}: metric {name} is {} in base and {} in cand; the legs cannot \
+                         be compared on it",
+                        definition.definition(),
+                        cand_definition.definition()
+                    ));
+                }
+                let accepted = options.accept.iter().any(|accepted| accepted == name);
+                judge(name, definition, base_values, cand_values, accepted)
+            }
+            (Some((definition, values)), None) => {
+                presence_row(name, definition, values, Verdict::Removed)
+            }
+            (None, Some((definition, values))) => {
+                presence_row(name, definition, values, Verdict::Added)
+            }
+            (None, None) => continue,
+        };
+        rows.push(row);
+    }
+    Ok(rows)
+}
+
+/// One benchmark's metrics in one leg: each metric's definition and its value per round.
+fn leg_series<'a>(
+    bench: &str,
+    rounds: &'a [BTreeMap<String, Loaded>],
+) -> Result<BTreeMap<&'a String, (&'a Metric, Vec<f64>)>, String> {
+    let mut series: BTreeMap<&String, (&Metric, Vec<f64>)> = BTreeMap::new();
+    let mut first: Option<&Loaded> = None;
+    for round in rounds {
+        let loaded = &round[bench];
+        if let Some(first) = first {
+            let names = |l: &Loaded| l.file.metrics.keys().cloned().collect::<BTreeSet<String>>();
+            let (had, has) = (names(first), names(loaded));
+            if let Some(name) = had.symmetric_difference(&has).next() {
+                return Err(format!(
+                    "metric {name} is in one of {} and {} but not the other: the rounds of a \
+                     leg must carry the same metrics",
+                    first.path.display(),
+                    loaded.path.display()
+                ));
+            }
+        } else {
+            first = Some(loaded);
+        }
+        for (name, metric) in &loaded.file.metrics {
+            let entry = series.entry(name).or_insert_with(|| (metric, Vec::new()));
+            if !entry.0.same_definition(metric) {
+                return Err(format!(
+                    "{}: metric {name} is {} here and {} in an earlier round",
+                    loaded.path.display(),
+                    metric.definition(),
+                    entry.0.definition()
+                ));
+            }
+            entry.1.push(metric.value);
+        }
+    }
+    Ok(series)
+}
+
+/// The row of a metric only one leg has.
+fn presence_row(name: &str, definition: &Metric, values: &[f64], verdict: Verdict) -> Row {
+    let shown = with_unit(median(values), definition);
+    let (base, cand) = if verdict == Verdict::Added {
+        ("-".to_owned(), shown)
+    } else {
+        (shown, "-".to_owned())
+    };
+    Row {
+        metric: name.to_owned(),
+        base,
+        cand,
+        change: String::new(),
+        noise: String::new(),
+        verdict,
+    }
+}
+
+/// Judge one metric over its round pairs.
+///
+/// `base[i]` and `cand[i]` are round `i` of either leg; `accepted` says the
+/// metric's name was given to `--accept`.
+#[must_use]
+pub fn judge(name: &str, definition: &Metric, base: &[f64], cand: &[f64], accepted: bool) -> Row {
+    let mut row = Row {
+        metric: name.to_owned(),
+        base: with_unit(median(base), definition),
+        cand: with_unit(median(cand), definition),
+        change: String::new(),
+        noise: String::new(),
+        verdict: Verdict::Info,
+    };
+    let lower = definition.direction == Direction::Lower;
+    let pairs = base.iter().zip(cand);
+    let worse_by: Vec<f64> = pairs
+        .clone()
+        .map(|(&b, &c)| if lower { c - b } else { b - c })
+        .collect();
+    match definition.class {
+        Class::Info => {}
+        Class::Time | Class::Noisy | Class::Bytes => {
+            let ratios: Vec<f64> = pairs
+                .map(|(&b, &c)| if lower { ratio(c, b) } else { ratio(b, c) })
+                .collect();
+            let center = median(&ratios);
+            let sigma = MAD_SIGMA * mad(&ratios);
+            let floor = if name.contains("p99") {
+                RATIO_FLOOR_TAIL
+            } else {
+                RATIO_FLOOR
+            };
+            let threshold = floor.max(SIGMA_FACTOR * sigma);
+            let worse = ratios.iter().filter(|&&r| r > 1.0).count();
+            let better = ratios.iter().filter(|&&r| r < 1.0).count();
+            let mut regressed = center > 1.0 + threshold && most(worse, ratios.len());
+            let mut improved = center < 1.0 - threshold && most(better, ratios.len());
+            row.change = format!("{:+.2}%", (center - 1.0) * 100.0);
+            row.noise = format!("sigma {:.2}%", sigma * 100.0);
+            if definition.class == Class::Bytes {
+                let delta = median(&worse_by);
+                let min = definition.unit.four_mib().unwrap_or(0.0);
+                regressed &= delta > min;
+                improved &= delta < -min;
+                let _ = write!(
+                    row.change,
+                    " ({:+} {})",
+                    number(delta),
+                    definition.unit.as_str()
+                );
+            }
+            row.verdict = verdict(regressed, improved);
+        }
+        Class::Spikes => {
+            let center = median(&worse_by);
+            let spread = mad(&worse_by);
+            let threshold = SPIKE_FLOOR.max(SIGMA_FACTOR * spread);
+            row.change = format!("{:+}", number(center));
+            row.noise = format!("MAD {}", number(spread));
+            row.verdict = verdict(center > threshold, center < -threshold);
+        }
+        Class::Exact => {
+            let differ = worse_by.iter().filter(|&&d| d != 0.0).count();
+            let worse = worse_by.iter().any(|&d| d > 0.0);
+            row.change = format!("{:+}", number(median(&worse_by)));
+            row.noise = format!("{differ}/{} pairs differ", worse_by.len());
+            row.verdict = if differ == 0 {
+                Verdict::Neutral
+            } else {
+                Verdict::Changed { worse, accepted }
+            };
+        }
+    }
+    row
+}
+
+/// `numerator / denominator`, with two zeros equal and a zero denominator infinitely worse.
+fn ratio(numerator: f64, denominator: f64) -> f64 {
+    if denominator != 0.0 {
+        numerator / denominator
+    } else if numerator != 0.0 {
+        f64::INFINITY
+    } else {
+        1.0
+    }
+}
+
+/// Whether `count` of `pairs` is at least 80 % of them.
+const fn most(count: usize, pairs: usize) -> bool {
+    count * 5 >= pairs * 4
+}
+
+const fn verdict(regressed: bool, improved: bool) -> Verdict {
+    if regressed {
+        Verdict::Regression
+    } else if improved {
+        Verdict::Improvement
+    } else {
+        Verdict::Neutral
+    }
+}
+
+/// A value and its unit, the way the report shows a median.
+fn with_unit(value: f64, definition: &Metric) -> String {
+    format!("{} {}", number(value), definition.unit.as_str())
+}
+
+/// A value as the report shows it: a whole number plain, anything else to three places.
+const fn number(value: f64) -> Number {
+    Number(value)
+}
+
+/// A value formatted for the report, see [`number`].
+struct Number(f64);
+
+impl std::fmt::Display for Number {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let value = self.0;
+        let precision = if value.fract() == 0.0 { 0 } else { 3 };
+        if f.sign_plus() {
+            write!(f, "{value:+.precision$}")
+        } else {
+            write!(f, "{value:.precision$}")
+        }
+    }
+}
+
+/// Append one benchmark's table: a header and a row per metric, columns padded to fit.
+fn render_table(out: &mut String, rows: &[Row]) {
+    let header = ["metric", "base", "cand", "change", "noise", "verdict"];
+    let cells: Vec<[&str; 6]> = rows
+        .iter()
+        .map(|row| {
+            [
+                row.metric.as_str(),
+                row.base.as_str(),
+                row.cand.as_str(),
+                row.change.as_str(),
+                row.noise.as_str(),
+                row.verdict.label(),
+            ]
+        })
+        .collect();
+    let mut widths = header.map(str::len);
+    for line in &cells {
+        for (width, cell) in widths.iter_mut().zip(line) {
+            *width = (*width).max(cell.len());
+        }
+    }
+    for line in std::iter::once(&header).chain(&cells) {
+        let mut text = String::new();
+        for (index, (cell, width)) in line.iter().zip(widths).enumerate() {
+            if index + 1 == line.len() {
+                text.push_str(cell);
+            } else {
+                let _ = write!(text, "{cell:<width$}  ");
+            }
+        }
+        let _ = writeln!(out, "{}", text.trim_end());
+    }
+}
+
+#[cfg(test)]
+mod tests;

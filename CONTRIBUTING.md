@@ -197,6 +197,37 @@ Tests of window-style changes use `HarnessConfig::window_style` with
 `WindowStyle::Framed`, as does the window-lifecycle stress test. Keep that
 choice explicit when a test needs the non-client frame.
 
+## Benchmarks
+
+The synthetic benchmarks are `#[ignore]`d tests of the end-to-end binary, so
+`make test` lists them as ignored and never runs them. `make bench` runs them
+once against this checkout and writes a report per benchmark. `make bench-ab
+BASE=<ref>` is the one that answers whether a change made things slower: it
+builds `BASE` in a worktree of its own and this checkout, each into its own
+isolated Wine tree, runs every benchmark against both in alternating order
+for `RUNS` rounds (five by default), and judges each metric pair by pair
+against the noise those rounds show. It exits 1 on a regression and 2 when
+the run itself cannot be trusted. The runs and the report stay in a directory
+under the main checkout's `.codex/evidence/bench-ab`, and `make bench-compare AB_DIR=<dir>` judges
+one again, for instance with `ACCEPT=<metric>,...` naming an exact count (a
+draw count, a pass count) that the change is meant to move. `make
+clean-bench-ab` removes the kept base worktrees.
+
+Bench numbers come from `PROD=1 PERF=1` builds only; `make bench-ab` builds
+both legs that way and refuses any other profile, since `release` carries
+debug assertions that cost more than the frame does. Nothing else may run on
+the machine during a benchmark: no test leg, no conformance run, no build in
+another worktree, no game. Each of them takes the same cores and GPU the
+numbers measure, and a verdict is only as good as the quiet it was measured
+in. `BASE=HEAD` is an A/A run of one commit against itself (or of your
+uncommitted changes against the commit they sit on) and shows how far the
+machine moves the numbers by itself; run it when a verdict looks surprising.
+
+Run `make bench-ab BASE=origin/main` with the default `BENCH_SET=wow` before
+merging a change to the render, encoder, submit or shader path, and put the
+summary line in the pull request's verification. `BENCH_SET=full` runs every
+benchmark.
+
 ## Which suite is right when they disagree
 
 Wine's d3d9 test suite is the spec oracle. The end-to-end suite is our own
@@ -426,6 +457,12 @@ touching four files. Refresh each lock with `cargo metadata --format-version 1
 --manifest-path <workspace>/Cargo.toml > /dev/null`, which rewrites the version
 lines without the dependency churn `cargo update` would bring, and check the bump
 before tagging with `make version-check TAG=vX.Y.Z`.
+
+Before the bump, measure the release against the previous one on a quiet
+machine with `make bench-ab BASE=<previous tag> BENCH_SET=full
+LOG_DIR=$PWD/.codex/evidence/bench-release/<version>`, which archives the runs
+and the report there. A regression it reports is fixed before the tag or named
+in the notes.
 
 Land that commit, wait for its run on `main` to go green, then push the tag. The
 release job refuses a tag whose version disagrees with either workspace, and

@@ -10,8 +10,14 @@
 //! Exit code 0 when every selected test passed, 1 when any failed or was
 //! left unrun by a failure, 2 when the runner itself could not do its job,
 //! and 3 when a GPU hang stopped the leg without a verdict.
+//!
+//! Two subcommands, named as the first argument, compare two builds of the
+//! layer on the suite's benchmarks instead (see `bench`): `bench-ab` runs
+//! them against both builds and judges the result, `bench-compare` judges a
+//! directory `bench-ab` left behind.
 
 mod attribute;
+mod bench;
 mod binary;
 mod cli;
 mod libtest;
@@ -42,7 +48,13 @@ fn main() -> ExitCode {
 }
 
 fn real_main() -> Result<ExitCode, String> {
-    let config = cli::parse_args(std::env::args().skip(1))?;
+    let mut args = std::env::args().skip(1).peekable();
+    match args.peek().map(String::as_str) {
+        Some(bench::AB) => return bench::ab_main(args.skip(1)),
+        Some(bench::COMPARE) => return bench::compare_main(args.skip(1)),
+        _ => {}
+    }
+    let config = cli::parse_args(args)?;
     let mut tally = Tally::default();
     let mut stopped_at: Option<String> = None;
     let mut gpu_hang_at: Option<String> = None;

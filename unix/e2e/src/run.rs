@@ -111,8 +111,10 @@ const STDERR_GRACE: Duration = Duration::from_secs(1);
 /// without a stdout line; killed, and reported as [`ExitKind::Hung`], once
 /// it passes after stdout closed without the process exiting. stderr is
 /// what arrived before the end plus [`STDERR_GRACE`] after it. The
-/// environment is inherited whole: the caller owns `MTLD3D_CONFIG` and the
-/// Wine variables.
+/// environment is inherited whole, so the caller owns `MTLD3D_CONFIG` and
+/// the Wine variables, with `env` set on top: an A/B benchmark runs its two
+/// builds from one runner, each leg under a prefix and a log directory of
+/// its own.
 ///
 /// # Errors
 ///
@@ -121,6 +123,7 @@ pub fn run(
     wine: &Path,
     exe: &Path,
     args: &[String],
+    env: &[(String, String)],
     timeout: Duration,
     on_line: &mut dyn FnMut(&str),
 ) -> Result<Exit, String> {
@@ -128,6 +131,7 @@ pub fn run(
     let child = Command::new(wine)
         .arg(exe)
         .args(args)
+        .envs(env.iter().map(|(key, value)| (key, value)))
         .current_dir(cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

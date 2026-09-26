@@ -75,6 +75,8 @@ pub struct WineLauncher {
     timeout: Duration,
     /// Whether every process runs the `#[ignore]` tests only (libtest's `--ignored`).
     ignored: bool,
+    /// Variables every process gets on top of the runner's own environment.
+    env: Vec<(String, String)>,
     /// A line as the process printed it, for the progress a caller shows.
     on_line: Box<dyn FnMut(&str)>,
 }
@@ -112,6 +114,7 @@ impl WineLauncher {
             log_dir,
             timeout,
             ignored: false,
+            env: Vec::new(),
             on_line,
         })
     }
@@ -120,6 +123,13 @@ impl WineLauncher {
     #[must_use]
     pub const fn ignored_only(mut self, ignored: bool) -> Self {
         self.ignored = ignored;
+        self
+    }
+
+    /// Set `key` to `value` in every process this launcher starts, listing included.
+    #[must_use]
+    pub fn with_env(mut self, key: &str, value: &str) -> Self {
+        self.env.push((key.to_owned(), value.to_owned()));
         self
     }
 }
@@ -138,14 +148,21 @@ impl Launcher for WineLauncher {
         let args = test_arguments(names, threads, self.ignored);
         let mut parser = Parser::default();
         let mut stdout = String::new();
-        let exit = run::run(&self.wine, &self.exe, &args, self.timeout, &mut |line| {
-            (self.on_line)(line);
-            stdout.push_str(line);
-            stdout.push('\n');
-            for event in parser.line(line) {
-                on_event(event);
-            }
-        })?;
+        let exit = run::run(
+            &self.wine,
+            &self.exe,
+            &args,
+            &self.env,
+            self.timeout,
+            &mut |line| {
+                (self.on_line)(line);
+                stdout.push_str(line);
+                stdout.push('\n');
+                for event in parser.line(line) {
+                    on_event(event);
+                }
+            },
+        )?;
         let layer_gpu_hang = self.layer_reported_gpu_hang(exit.pid)?;
         Ok(ProcessEnd {
             pid: exit.pid,
@@ -162,10 +179,17 @@ impl Launcher for WineLauncher {
         if self.ignored {
             args.push("--ignored".to_owned());
         }
-        let exit = run::run(&self.wine, &self.exe, &args, self.timeout, &mut |line| {
-            stdout.push_str(line);
-            stdout.push('\n');
-        })?;
+        let exit = run::run(
+            &self.wine,
+            &self.exe,
+            &args,
+            &self.env,
+            self.timeout,
+            &mut |line| {
+                stdout.push_str(line);
+                stdout.push('\n');
+            },
+        )?;
         if exit.kind != ExitKind::Code(0) {
             return Err(format!(
                 "{} --list ended with {}:\n{}",

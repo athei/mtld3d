@@ -28,9 +28,16 @@ fn script(name: &str, body: &str) -> PathBuf {
 fn run_script(path: &Path, timeout: Duration) -> (super::Exit, Duration, Vec<String>) {
     let mut lines = Vec::new();
     let started = Instant::now();
-    let exit = run(&PathBuf::from("/bin/sh"), path, &[], timeout, &mut |line| {
-        lines.push(line.to_owned());
-    })
+    let exit = run(
+        &PathBuf::from("/bin/sh"),
+        path,
+        &[],
+        &[],
+        timeout,
+        &mut |line| {
+            lines.push(line.to_owned());
+        },
+    )
     .expect("spawn sh");
     (exit, started.elapsed(), lines)
 }
