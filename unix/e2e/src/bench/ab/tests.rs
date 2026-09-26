@@ -15,34 +15,121 @@ fn file(text: &str) -> MetricsFile {
 }
 
 #[test]
-fn the_shape_runs_follow_the_rounds_and_the_leg_that_goes_first_alternates_by_round() {
-    let timed = |bench, round, leg| Step::Timed { bench, round, leg };
+fn every_round_runs_each_binary_in_both_legs_and_the_first_leg_alternates() {
+    let round = |group, round, leg| Step::Round { group, round, leg };
     let shape = |bench, leg| Step::Shape { bench, leg };
-    let order = schedule(2, 3);
+    let host = |round, leg| Step::Host { round, leg };
     let expected = [
-        timed(0, 0, Leg::Base),
-        timed(0, 0, Leg::Cand),
-        timed(0, 1, Leg::Cand),
-        timed(0, 1, Leg::Base),
-        timed(0, 2, Leg::Base),
-        timed(0, 2, Leg::Cand),
+        round(0, 0, Leg::Base),
+        round(0, 0, Leg::Cand),
+        round(1, 0, Leg::Base),
+        round(1, 0, Leg::Cand),
+        round(0, 1, Leg::Cand),
+        round(0, 1, Leg::Base),
+        round(1, 1, Leg::Cand),
+        round(1, 1, Leg::Base),
+        round(0, 2, Leg::Base),
+        round(0, 2, Leg::Cand),
+        round(1, 2, Leg::Base),
+        round(1, 2, Leg::Cand),
         shape(0, Leg::Base),
         shape(0, Leg::Cand),
-        timed(1, 0, Leg::Base),
-        timed(1, 0, Leg::Cand),
-        timed(1, 1, Leg::Cand),
-        timed(1, 1, Leg::Base),
-        timed(1, 2, Leg::Base),
-        timed(1, 2, Leg::Cand),
         shape(1, Leg::Base),
         shape(1, Leg::Cand),
+        shape(2, Leg::Base),
+        shape(2, Leg::Cand),
+        host(0, Leg::Base),
+        host(0, Leg::Cand),
+        host(1, Leg::Cand),
+        host(1, Leg::Base),
+        host(2, Leg::Base),
+        host(2, Leg::Cand),
     ];
-    assert_eq!(order, expected);
+    assert_eq!(schedule(2, 3, true, 3), expected);
+    assert_eq!(schedule(2, 3, false, 3), expected[..18]);
 }
 
 #[test]
 fn nothing_to_run_is_an_empty_schedule() {
-    assert!(schedule(0, 5).is_empty());
+    assert!(schedule(0, 0, false, 5).is_empty());
+}
+
+fn bench(exe: &str, name: &str) -> Bench {
+    Bench {
+        exe: PathBuf::from(exe),
+        name: name.to_owned(),
+        id: format!("e2e::{name}"),
+    }
+}
+
+#[test]
+fn benchmarks_group_by_the_binary_that_carries_them() {
+    let benches = [
+        bench("/t/e2e.exe", "a::x"),
+        bench("/t/other.exe", "b::y"),
+        bench("/t/e2e.exe", "a::z"),
+    ];
+    assert_eq!(group_by_binary(&benches), [vec![0, 2], vec![1]]);
+}
+
+#[test]
+fn a_round_fails_naming_each_benchmark_that_did_not_pass() {
+    let (x, y) = (bench("/t/e2e.exe", "a::x"), bench("/t/e2e.exe", "a::y"));
+    let benches = [&x, &y];
+    let dir = Path::new("/ab/base/0");
+    let passed = |name: &str| TestResult {
+        name: name.to_owned(),
+        verdict: Verdict::Passed,
+    };
+    assert!(check_verdicts(&benches, &[passed("a::x"), passed("a::y")], false, dir).is_ok());
+    let failed = TestResult {
+        name: "a::x".to_owned(),
+        verdict: Verdict::Failed("Present: 0x8876086C".to_owned()),
+    };
+    let reason = check_verdicts(&benches, &[failed], true, dir).unwrap_err();
+    assert!(
+        reason.contains("e2e::a::x: Failed(\"Present: 0x8876086C\")"),
+        "{reason}"
+    );
+    assert!(reason.contains("e2e::a::y: no result"), "{reason}");
+    let reason =
+        check_verdicts(&benches, &[passed("a::x"), passed("a::y")], true, dir).unwrap_err();
+    assert!(reason.contains("the process failed"), "{reason}");
+}
+
+#[test]
+fn each_file_goes_to_the_benchmark_it_names() {
+    let (x, y) = (bench("/t/e2e.exe", "a::x"), bench("/t/e2e.exe", "a::y"));
+    let benches = [&x, &y];
+    let dir = Path::new("/ab/base/0");
+    let named = |bench: &str, test: &str| {
+        (
+            PathBuf::from(format!("/ab/base/0/bench-{bench}.metrics")),
+            metrics::parse(&format!("meta {bench} test {test}\n"), bench).unwrap(),
+        )
+    };
+    let assigned = assign(
+        &benches,
+        vec![named("y", "a::y"), named("x", "a::x"), named("x2", "a::x")],
+        dir,
+    )
+    .unwrap();
+    let owners: Vec<usize> = assigned.iter().map(|(at, _, _)| *at).collect();
+    assert_eq!(owners, [1, 0, 0]);
+
+    let reason = assign(&benches, vec![named("x", "a::x")], dir).unwrap_err();
+    assert!(reason.contains("e2e::a::y passed but wrote no"), "{reason}");
+    let reason = assign(&benches, vec![named("z", "a::z")], dir).unwrap_err();
+    assert!(
+        reason.contains("written by a::z, which the round"),
+        "{reason}"
+    );
+    let unnamed = (
+        PathBuf::from("/ab/base/0/bench-x.metrics"),
+        metrics::parse("meta x layer v1\n", "x").unwrap(),
+    );
+    let reason = assign(&benches, vec![unnamed], dir).unwrap_err();
+    assert!(reason.contains("no meta test line"), "{reason}");
 }
 
 #[test]
@@ -267,17 +354,13 @@ fn the_timed_rounds_record_the_benchmarks_and_each_legs_images() {
     };
     timed.note(
         &Leg::Base,
-        &[(
-            PathBuf::from("/ab/base/0/bench-wow112.metrics"),
-            file_of("B"),
-        )],
+        Path::new("/ab/base/0/bench-wow112.metrics"),
+        &file_of("B"),
     );
     timed.note(
         &Leg::Cand,
-        &[(
-            PathBuf::from("/ab/cand/0/bench-wow112.metrics"),
-            file_of("C"),
-        )],
+        Path::new("/ab/cand/0/bench-wow112.metrics"),
+        &file_of("C"),
     );
     assert_eq!(timed.benches.iter().collect::<Vec<_>>(), ["wow112"]);
     assert_eq!(timed.images(&Leg::Base), Some(&images("B", "U")));

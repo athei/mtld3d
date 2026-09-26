@@ -62,7 +62,8 @@ use mtld3d_types::{
 };
 
 /// The `meta` keys every metrics file carries, which [`Metrics::meta`] may not repeat.
-const COMMON_META: [&str; 10] = [
+const COMMON_META: [&str; 11] = [
+    "test",
     "layer",
     "layer_image",
     "layer_unix_image",
@@ -1141,7 +1142,10 @@ pub struct PassShape {
 /// opening a comment line. The records are, in this order:
 ///
 /// - `meta <bench> <key> <value...>`, the value running to the end of the
-///   line: `layer` (the build stamp the layer logged, or `unknown`),
+///   line: `test` (the libtest path of the test that wrote the file, the
+///   name libtest gives its thread, or `unknown`; `bench-ab` runs a leg's
+///   benchmarks in one process a round and tells their files apart by it),
+///   `layer` (the build stamp the layer logged, or `unknown`),
 ///   `layer_image` (the image ID on the same line, or `unknown`), `arch`
 ///   (`i686` or `x86_64`), `profile` and `debug_assertions` (`true` or
 ///   `false`), and `config` (the suite-wide `MTLD3D_CONFIG`, or `none`).
@@ -1496,7 +1500,11 @@ impl Metrics {
             .layer_identity()
             .unwrap_or_else(|| ("unknown".to_owned(), "unknown".to_owned()));
         let layer_unix_image = log.unix_image().unwrap_or_else(|| "unknown".to_owned());
+        let test = std::thread::current()
+            .name()
+            .map_or_else(|| "unknown".to_owned(), str::to_owned);
         for (key, value) in [
+            ("test", test),
             ("layer", layer),
             ("layer_image", layer_image),
             ("layer_unix_image", layer_unix_image),

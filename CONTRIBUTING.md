@@ -206,7 +206,11 @@ BASE=<ref>` is the one that answers whether a change made things slower: it
 builds `BASE` in a worktree of its own and this checkout, each into its own
 isolated Wine tree, runs every benchmark against both in alternating order
 for `RUNS` rounds (five by default, three at least), and judges each metric
-pair by pair against the noise those rounds show. It exits 1 on a regression
+pair by pair against the noise those rounds show. A leg's round is one
+process running every benchmark in libtest's order, which is the same in
+both legs, so what one benchmark leaves in the process (the process-wide
+pipeline cache, the page-box pool, the address space its memory rows
+sample) reaches the next alike on both sides of each pair. It exits 1 on a regression
 and 2 when the run itself cannot be trusted, which includes the two legs
 running different Wines. The runs and the report stay in a directory under
 the main checkout's `.codex/evidence/bench-ab`, and `make bench-compare
@@ -222,7 +226,7 @@ gives the rules): the per-frame counts of work the API calls fix, such as
 parsing and MSL emission on this machine over two synthetic corpora and any
 shader cache `BENCH_CORPUS` names, and writes its metrics into the `host`
 directory beside the reports of `make bench`. `make bench-ab` runs it too, in
-the same rounds after the others: each leg builds and runs its own tree's
+rounds of its own after the others and their shape runs: each leg builds and runs its own tree's
 emitter, both read the same `BENCH_CORPUS`, and its MSL byte counts are
 exact, so a change that alters the emitted code shows up there even when its
 time per shader stays inside the noise. A `BASE` older than the host
@@ -275,17 +279,19 @@ merging a change to the render, encoder, submit or shader path, and put the
 summary line in the pull request's verification. The `wow` set is the two
 World of Warcraft frames, the EVENT-query throttle under the game's settings
 and under the D3D9 defaults, the per-call API cost, and the buffer-lock and
-texture-streaming benchmarks at the game's rates. A run of one of them takes
-about 5.5 s: Wine's start, the warm-up, untimed frames until the layer's
-second perf window opens two seconds after the first frame, and that one
-window measured. So the default five rounds of both legs take about 6.5
-minutes, the four shape runs under half a minute and the host emitter's
-rounds about 20 s. Before the first run the two legs build at the same time
+texture-streaming benchmarks at the game's rates. A leg's round is one
+process that runs all seven in libtest's order, the same in both legs, each
+on a device of its own: about a second for Wine's start, then per benchmark
+about 4.5 s for its device, the warm-up, untimed frames until its second perf
+window opens two seconds after its first frame, and that one window
+measured. So a round of one leg takes about 33 s and the default five rounds
+of both legs about 5.5 minutes, the four shape runs under half a minute and
+the host emitter's rounds about 20 s. Before the first run the two legs build at the same time
 and their prefixes boot while the benchmark binary builds: about a minute and
 a half with a new base worktree and a changed candidate, well under a minute
 when neither needs a build, longer when a change rebuilds the production
 layer in both legs. An A/A run of one commit against itself should take
-about 9 minutes in all, down from the 20 an earlier layout of the run took
+about 8 minutes in all, down from the 20 an earlier layout of the run took
 (an estimate from that run's timestamps and the new spans; the first run's
 timestamps say what it is on your machine). `BENCH_SET=full` runs every
 benchmark, the shader-stutter and cold-start ones included, and takes about

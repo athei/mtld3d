@@ -1,11 +1,18 @@
 //! Run the benchmarks against the two legs, interleaved, and check every run as it lands.
 //!
-//! Each run is one process of the candidate's test binary running one
-//! benchmark with libtest's `--ignored`, under the leg's Wine loader and
-//! prefix and with `log.dir` pointed at `<out>/<leg>/<round>`, where the
-//! benchmark writes its `bench-<name>.metrics`. For each benchmark, round
-//! `r` runs the base first when `r` is even and the candidate first when it
-//! is odd. After its rounds, a benchmark whose metrics declare `shape` lines
+//! A round of a leg is one process of the candidate's test binary running
+//! every selected benchmark it carries, with libtest's `--ignored` on one
+//! thread, under the leg's Wine loader and prefix and with `log.dir` pointed
+//! at `<out>/<leg>/<round>`, where each benchmark writes its
+//! `bench-<name>.metrics` and names itself in it (`meta test`). Round `r`
+//! runs the base first when `r` is even and the candidate first when it is
+//! odd. The benchmarks run in libtest's order, by test path, the same in
+//! both legs and every round, so what one leaves in the process for the
+//! next (the process-wide pipeline cache, the page-box pool, the address
+//! space its memory rows sample) is the same on both sides of each pair;
+//! each still creates its own device, whose first perf window opens with
+//! it, and warms up and aligns its span as it does alone. After the last
+//! round, each benchmark whose metrics declare `shape` lines
 //! runs once more in either leg with the pass trace on, into
 //! `<out>/<leg>/shape/<test>`; that run is never timed (the trace costs
 //! frame time), and its layer log is the pass shape `compare` diffs between
@@ -13,13 +20,15 @@
 //! (`shape::Watch`), so it writes no metrics: its build is checked from the
 //! log's identity lines instead, against the leg's stamp and the images the
 //! leg's timed rounds loaded. A benchmark without `shape` lines gets no
-//! shape run, with a note: its frame is not meant to be steady. A run that
-//! fails, writes no metrics file, or reports a layer stamp other than its
-//! leg's ends the whole A/B run at once: every number after it would be
-//! measured against the wrong build or none.
+//! shape run, with a note: its frame is not meant to be steady. A
+//! benchmark that fails or writes no metrics file, or a process whose files
+//! report a layer stamp other than its leg's, ends the whole A/B run at
+//! once, naming the benchmark: every number after it would be measured
+//! against the wrong build or none.
 //!
 //! The host emitter benchmark, when the run has one, comes after the
-//! end-to-end benchmarks in the same order, without a shape run. It is host
+//! end-to-end benchmarks and their shape runs, in rounds of its own, without
+//! a shape run. It is host
 //! code, so each leg runs its own tree's `emit_corpus`, built with that
 //! leg's profile, with `--metrics` pointed at the same round directory, and
 //! the run is checked the same way.
@@ -68,6 +77,9 @@ const HOST_TAIL_LINES: usize = 15;
 
 /// The image value of a binary whose log line names none, as the metrics files write it.
 const UNKNOWN_IMAGE: &str = "unknown";
+
+/// The meta key in which a benchmark names the libtest path of the test that wrote the file.
+const TEST_META: &str = "test";
 
 /// One leg: the Wine that runs it, its prefix, and the layer stamp its runs must report.
 #[derive(Debug)]
@@ -127,10 +139,12 @@ pub struct Images {
 /// One run of the A/B schedule.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Step {
+    /// Round `round` in `leg` of the benchmarks of test binary `group`, one process for all.
+    Round { group: usize, round: u32, leg: Leg },
     /// The untimed run of benchmark `bench` in `leg` under the pass trace.
     Shape { bench: usize, leg: Leg },
-    /// Round `round` of benchmark `bench` in `leg`.
-    Timed { bench: usize, round: u32, leg: Leg },
+    /// Round `round` of the host emitter benchmark in `leg`.
+    Host { round: u32, leg: Leg },
 }
 
 /// One benchmark to run: the binary that carries it and its libtest path.
@@ -178,16 +192,15 @@ pub fn run(config: &AbConfig) -> Result<ExitCode, String> {
         )
         .map_err(|e| format!("{}: {e}", marker.display()))?;
     }
-    let jobs: Vec<Job> = benches
-        .iter()
-        .map(Job::Bench)
-        .chain(config.host.as_ref().map(Job::Host))
-        .collect();
+    let groups = group_by_binary(&benches);
     println!(
-        "bench-ab: {} benchmarks{}, {} rounds, both legs each round, into {}",
+        "bench-ab: {} benchmarks in {} process{} a leg a round{}, {} rounds, both legs each \
+         round, into {}",
         benches.len(),
+        groups.len(),
+        if groups.len() == 1 { "" } else { "es" },
         if config.host.is_some() {
-            " and the host emitter benchmark"
+            ", and the host emitter benchmark"
         } else {
             ""
         },
@@ -195,75 +208,94 @@ pub fn run(config: &AbConfig) -> Result<ExitCode, String> {
         out.display()
     );
     // Whether each benchmark's metrics declare its frame in `shape` lines,
-    // which is what earns it a shape run after its rounds, and what its
+    // which is what earns it a shape run after the rounds, and what its
     // rounds wrote that the shape runs are checked against.
-    let mut declares_shape = vec![false; jobs.len()];
-    let mut timed: Vec<Timed> = jobs.iter().map(|_| Timed::default()).collect();
-    for step in schedule(jobs.len(), config.runs) {
-        let (index, leg, round) = match step {
-            Step::Shape { bench, leg } => (bench, leg, None),
-            Step::Timed { bench, round, leg } => (bench, leg, Some(round)),
+    let mut declares_shape = vec![false; benches.len()];
+    let mut timed: Vec<Timed> = benches.iter().map(|_| Timed::default()).collect();
+    for step in schedule(
+        groups.len(),
+        benches.len(),
+        config.host.is_some(),
+        config.runs,
+    ) {
+        let leg = match &step {
+            Step::Round { leg, .. } | Step::Shape { leg, .. } | Step::Host { leg, .. } => leg,
         };
         let spec = match leg {
             Leg::Base => &config.base,
             Leg::Cand => &config.cand,
         };
-        let Some(round) = round else {
-            // The host benchmark times code, not a frame: it has no pass shape.
-            let Job::Bench(bench) = jobs[index] else {
-                continue;
-            };
-            if !declares_shape[index] {
-                if leg == Leg::Base {
+        match step {
+            Step::Round { group, round, leg } => {
+                let members: Vec<&Bench> = groups[group].iter().map(|&at| &benches[at]).collect();
+                let dir = out.join(leg.dir()).join(round.to_string());
+                for (member, path, file) in run_round(config, spec, &members, &dir)? {
+                    let at = groups[group][member];
+                    check_stamp(&path, &file, spec)?;
+                    declares_shape[at] |= !file.shape.is_empty();
+                    timed[at].note(&leg, &path, &file);
                     println!(
-                        "bench-ab: {}: its metrics declare no shape lines, so it gets no shape run",
-                        bench.id
+                        "bench-ab: {} round {}/{} {}: {}",
+                        benches[at].id,
+                        round + 1,
+                        config.runs,
+                        leg.dir(),
+                        progress(&path, &file)
                     );
                 }
-                continue;
             }
-            let dir = out
-                .join(leg.dir())
-                .join(SHAPE_DIR)
-                .join(shape::run_dir_name(&bench.name));
-            let (log, kind) = run_shape(config, spec, bench, &dir, &timed[index].benches)?;
-            let identity = shape::identity(&log)?;
-            check_shape_build(&log, &identity, spec, timed[index].images(&leg))?;
-            println!(
-                "bench-ab: {} shape run {}: pass trace in {}{}",
-                bench.id,
-                leg.dir(),
-                dir.display(),
-                if kind == ExitKind::Stopped {
-                    ", stopped once it held the steady submissions"
-                } else {
-                    ""
+            Step::Shape { bench: at, leg } => {
+                let bench = &benches[at];
+                if !declares_shape[at] {
+                    if leg == Leg::Base {
+                        println!(
+                            "bench-ab: {}: its metrics declare no shape lines, so it gets no \
+                             shape run",
+                            bench.id
+                        );
+                    }
+                    continue;
                 }
-            );
-            continue;
-        };
-        let dir = out.join(leg.dir()).join(round.to_string());
-        let (id, written) = match jobs[index] {
-            Job::Bench(bench) => (bench.id.as_str(), run_one(config, spec, bench, &dir)?),
-            Job::Host(host) => {
+                let dir = out
+                    .join(leg.dir())
+                    .join(SHAPE_DIR)
+                    .join(shape::run_dir_name(&bench.name));
+                let (log, kind) = run_shape(config, spec, bench, &dir, &timed[at].benches)?;
+                let identity = shape::identity(&log)?;
+                check_shape_build(&log, &identity, spec, timed[at].images(&leg))?;
+                println!(
+                    "bench-ab: {} shape run {}: pass trace in {}{}",
+                    bench.id,
+                    leg.dir(),
+                    dir.display(),
+                    if kind == ExitKind::Stopped {
+                        ", stopped once it held the steady submissions"
+                    } else {
+                        ""
+                    }
+                );
+            }
+            Step::Host { round, leg } => {
+                // The schedule has host steps only when the run has the benchmark.
+                let Some(host) = &config.host else {
+                    continue;
+                };
                 let exe = match leg {
                     Leg::Base => &host.base,
                     Leg::Cand => &host.cand,
                 };
-                (HOST_ID, run_host(exe, &host.corpora, &dir, config.timeout)?)
+                let dir = out.join(leg.dir()).join(round.to_string());
+                for (path, file) in &run_host(exe, &host.corpora, &dir, config.timeout)? {
+                    check_stamp(path, file, spec)?;
+                    println!(
+                        "bench-ab: {HOST_ID} round {}/{} {}: {}",
+                        round + 1,
+                        config.runs,
+                        leg.dir(),
+                        progress(path, file)
+                    );
+                }
             }
-        };
-        declares_shape[index] |= written.iter().any(|(_, file)| !file.shape.is_empty());
-        timed[index].note(&leg, &written);
-        for (path, file) in &written {
-            check_stamp(path, file, spec)?;
-            println!(
-                "bench-ab: {id} round {}/{} {}: {}",
-                round + 1,
-                config.runs,
-                leg.dir(),
-                progress(path, file)
-            );
         }
     }
     compare::judge_dir(&out, &config.options, config.report.as_deref())
@@ -271,40 +303,59 @@ pub fn run(config: &AbConfig) -> Result<ExitCode, String> {
 
 /// The order of the runs, the leg that goes first alternating from round to round.
 ///
-/// Every benchmark runs all its rounds and then its shape runs, the base's
-/// first, before the next benchmark starts; within a round both legs run
-/// back to back, the base first on even rounds.
+/// Every round runs each of the `groups` test binaries' processes in both
+/// legs back to back, the base first on even rounds; after the last round
+/// each of the `benches` gets its shape runs, the base's first; the host
+/// emitter benchmark, when there is one (`host`), then runs its own rounds
+/// the same way.
 #[must_use]
-pub fn schedule(benches: usize, runs: u32) -> Vec<Step> {
-    let mut order = Vec::new();
-    for bench in 0..benches {
-        for round in 0..runs {
-            let (first, second) = if round % 2 == 0 {
-                (Leg::Base, Leg::Cand)
-            } else {
-                (Leg::Cand, Leg::Base)
-            };
-            order.push(Step::Timed {
-                bench,
-                round,
-                leg: first,
-            });
-            order.push(Step::Timed {
-                bench,
-                round,
-                leg: second,
-            });
+pub fn schedule(groups: usize, benches: usize, host: bool, runs: u32) -> Vec<Step> {
+    let legs = |round: u32| {
+        if round.is_multiple_of(2) {
+            [Leg::Base, Leg::Cand]
+        } else {
+            [Leg::Cand, Leg::Base]
         }
-        order.push(Step::Shape {
-            bench,
-            leg: Leg::Base,
-        });
-        order.push(Step::Shape {
-            bench,
-            leg: Leg::Cand,
-        });
+    };
+    let mut order = Vec::new();
+    for round in 0..runs {
+        for group in 0..groups {
+            for leg in legs(round) {
+                order.push(Step::Round { group, round, leg });
+            }
+        }
+    }
+    for bench in 0..benches {
+        for leg in [Leg::Base, Leg::Cand] {
+            order.push(Step::Shape { bench, leg });
+        }
+    }
+    if host {
+        for round in 0..runs {
+            for leg in legs(round) {
+                order.push(Step::Host { round, leg });
+            }
+        }
     }
     order
+}
+
+/// The benchmarks grouped by the test binary that carries them, in the order they were found.
+///
+/// Each group is one process a leg a round; its members are indices into `benches`.
+#[must_use]
+pub fn group_by_binary(benches: &[Bench]) -> Vec<Vec<usize>> {
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    for (at, bench) in benches.iter().enumerate() {
+        match groups
+            .iter_mut()
+            .find(|group| benches[group[0]].exe == bench.exe)
+        {
+            Some(group) => group.push(at),
+            None => groups.push(vec![at]),
+        }
+    }
+    groups
 }
 
 /// Check that both legs run one Wine, and name it.
@@ -423,66 +474,130 @@ pub fn run_config(base: &str, dir: &Path) -> String {
     }
 }
 
-/// Run `bench` once under `spec`, and read the metrics files it wrote into `dir`.
-fn run_one(
+/// Run one round of `benches`, all carried by one test binary, in one process under `spec`.
+///
+/// Returns every metrics file the process wrote into `dir`, each with the
+/// index in `benches` of the benchmark that names itself in it.
+///
+/// # Errors
+///
+/// Returns a message naming the benchmarks that did not pass, or one that
+/// passed and wrote no metrics, or a file that names no selected benchmark;
+/// and one when the driver reported a GPU hang.
+fn run_round(
     config: &AbConfig,
     spec: &LegSpec,
-    bench: &Bench,
+    benches: &[&Bench],
     dir: &Path,
-) -> Result<Vec<(PathBuf, MetricsFile)>, String> {
+) -> Result<Vec<(usize, PathBuf, MetricsFile)>, String> {
+    let Some(first) = benches.first() else {
+        return Ok(Vec::new());
+    };
     fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     if let Some(corpus) = &config.corpus_dir {
         link_corpus(corpus, dir)?;
     }
     let before = metrics_files(dir)?;
-    let mut launcher = leg_launcher(spec, &bench.exe, Some(dir), config.timeout)?
+    let mut launcher = leg_launcher(spec, &first.exe, Some(dir), config.timeout)?
         .with_env("MTLD3D_CONFIG", &run_config(&config.config, dir));
+    let names: Vec<String> = benches.iter().map(|bench| bench.name.clone()).collect();
     let mut outcome = Outcome::default();
-    let run = attribute::run_binary(
-        &mut launcher,
-        Some(vec![bench.name.clone()]),
-        1,
-        true,
-        &mut outcome,
-    )?;
-    let what = format!("{} under {}", bench.id, dir.display());
+    let run = attribute::run_binary(&mut launcher, Some(names), 1, true, &mut outcome)?;
     if run.outcome == BinaryOutcome::GpuHang {
         return Err(format!(
-            "{what}: the driver reported a GPU hang; no number after it can be trusted{}",
+            "the round under {}: the driver reported a GPU hang; no number after it can be \
+             trusted{}",
+            dir.display(),
             outcome.notes()
         ));
     }
-    let passed = outcome
-        .results
-        .iter()
-        .any(|result| result.name == bench.name && result.verdict == Verdict::Passed);
-    if !passed || run.failed {
-        let verdicts: Vec<String> = outcome
-            .results
+    check_verdicts(benches, &outcome.results, run.failed, dir)
+        .map_err(|reason| format!("{reason}{}", outcome.notes()))?;
+    let written = new_files(dir, &before)?
+        .into_iter()
+        .map(|path| metrics::read(&path).map(|file| (path, file)))
+        .collect::<Result<Vec<_>, String>>()?;
+    assign(benches, written, dir)
+}
+
+/// Check that every one of `benches` passed in a round process that reported `results`.
+///
+/// # Errors
+///
+/// Returns a message naming each benchmark that did not pass, with what
+/// became of it, when any did not or the process failed.
+pub fn check_verdicts(
+    benches: &[&Bench],
+    results: &[TestResult],
+    failed: bool,
+    dir: &Path,
+) -> Result<(), String> {
+    let mut not_passed = Vec::new();
+    for bench in benches {
+        match results.iter().find(|result| result.name == bench.name) {
+            Some(result) if result.verdict == Verdict::Passed => {}
+            Some(result) => not_passed.push(format!("{}: {:?}", bench.id, result.verdict)),
+            None => not_passed.push(format!("{}: no result", bench.id)),
+        }
+    }
+    if not_passed.is_empty() && !failed {
+        return Ok(());
+    }
+    Err(format!(
+        "the round under {} did not pass: {}",
+        dir.display(),
+        if not_passed.is_empty() {
+            "the process failed after every benchmark passed".to_owned()
+        } else {
+            not_passed.join("; ")
+        }
+    ))
+}
+
+/// The benchmark of `benches` that wrote each file of `written`, by the test its `meta test` names.
+///
+/// # Errors
+///
+/// Returns a message for a file that names no test or one not in the
+/// round, and for a benchmark that wrote no file.
+pub fn assign(
+    benches: &[&Bench],
+    written: Vec<(PathBuf, MetricsFile)>,
+    dir: &Path,
+) -> Result<Vec<(usize, PathBuf, MetricsFile)>, String> {
+    let mut assigned = Vec::with_capacity(written.len());
+    for (path, file) in written {
+        let test = file.meta.get(TEST_META).ok_or_else(|| {
+            format!(
+                "{}: no meta {TEST_META} line names the benchmark that wrote it",
+                path.display()
+            )
+        })?;
+        let at = benches
             .iter()
-            .map(|result| format!("{} {:?}", result.name, result.verdict))
-            .collect();
-        return Err(format!(
-            "{what} did not pass: {}{}",
-            if verdicts.is_empty() {
-                "no result".to_owned()
-            } else {
-                verdicts.join("; ")
-            },
-            outcome.notes()
-        ));
+            .position(|bench| bench.name == *test)
+            .ok_or_else(|| {
+                format!(
+                    "{}: written by {test}, which the round under {} did not run",
+                    path.display(),
+                    dir.display()
+                )
+            })?;
+        assigned.push((at, path, file));
     }
-    let written = new_files(dir, &before)?;
-    if written.is_empty() {
+    if let Some(bench) = benches
+        .iter()
+        .enumerate()
+        .find(|(at, _)| !assigned.iter().any(|(owner, _, _)| owner == at))
+        .map(|(_, bench)| bench)
+    {
         return Err(format!(
-            "{what} passed but wrote no bench-<name>.metrics into {}",
+            "{} passed but wrote no bench-<name>.metrics into {}",
+            bench.id,
             dir.display()
         ));
     }
-    written
-        .into_iter()
-        .map(|path| metrics::read(&path).map(|file| (path, file)))
-        .collect()
+    Ok(assigned)
 }
 
 /// Run `bench`'s shape run under `spec` into `dir`, stopped once its log holds the steady frame.
@@ -813,30 +928,28 @@ struct Timed {
 }
 
 impl Timed {
-    /// Take note of one round of `leg`: the benchmarks it wrote and the images it loaded.
-    fn note(&mut self, leg: &Leg, written: &[(PathBuf, MetricsFile)]) {
-        for (path, file) in written {
-            if let Some(bench) = path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .and_then(metrics::bench_of)
-            {
-                self.benches.insert(bench.to_owned());
-            }
-            let image = |key: &str| {
-                file.meta
-                    .get(key)
-                    .cloned()
-                    .unwrap_or_else(|| UNKNOWN_IMAGE.to_owned())
-            };
-            let images = Images {
-                layer: image("layer_image"),
-                unix: image("layer_unix_image"),
-            };
-            match leg {
-                Leg::Base => self.base = Some(images),
-                Leg::Cand => self.cand = Some(images),
-            }
+    /// Take note of one file a round of `leg` wrote: its benchmark and the images it loaded.
+    fn note(&mut self, leg: &Leg, path: &Path, file: &MetricsFile) {
+        if let Some(bench) = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(metrics::bench_of)
+        {
+            self.benches.insert(bench.to_owned());
+        }
+        let image = |key: &str| {
+            file.meta
+                .get(key)
+                .cloned()
+                .unwrap_or_else(|| UNKNOWN_IMAGE.to_owned())
+        };
+        let images = Images {
+            layer: image("layer_image"),
+            unix: image("layer_unix_image"),
+        };
+        match leg {
+            Leg::Base => self.base = Some(images),
+            Leg::Cand => self.cand = Some(images),
         }
     }
 
@@ -847,12 +960,6 @@ impl Timed {
             Leg::Cand => self.cand.as_ref(),
         }
     }
-}
-
-/// One entry of the run order: an end-to-end benchmark, or the host benchmark.
-enum Job<'a> {
-    Bench(&'a Bench),
-    Host(&'a HostBench),
 }
 
 /// What one benchmark process reported.

@@ -4,10 +4,11 @@
 //! against two installs of the layer, the base and the candidate, each under
 //! a Wine tree and a prefix of its own. The binary links `d3d9` by name and
 //! depends on nothing of the layer's, so the one binary drives both legs and
-//! the workload is the same on either side. Every run is a fresh process
-//! running exactly one benchmark, and the legs alternate which goes first
-//! from round to round, so a machine that drifts (thermals, a background
-//! job) moves both legs alike instead of charging the drift to one of them.
+//! the workload is the same on either side. A round of a leg is one fresh
+//! process running every selected benchmark in libtest's order, the same
+//! order in both legs, and the legs alternate which goes first from round
+//! to round, so a machine that drifts (thermals, a background job) moves
+//! both legs alike instead of charging the drift to one of them.
 //!
 //! When both trees carry it, the host emitter benchmark runs in the same
 //! rounds, each leg its own tree's `emit_corpus`, since it is host code the

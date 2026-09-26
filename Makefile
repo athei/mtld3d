@@ -1119,7 +1119,8 @@ bench: install-windows-$(ARCH) install-unix-$(SDK_UNIX_ARCH)
 # two builds of the layer, BASE and this checkout, interleaved, and then a
 # verdict per metric. RUNS (default 5) is how many rounds each benchmark gets,
 # a round being one run of either build back to back, the one that goes first
-# alternating, and every run a process of its own running one benchmark.
+# alternating, and each build's run one process running every benchmark in
+# libtest's order, the same in both.
 # BENCH_SET picks the benchmarks: `wow` (the default) the ones that stand for
 # the game this layer serves first, `full` every benchmark; a name the
 # checkout does not carry yet is skipped with a note. ACCEPT=a,b names the
