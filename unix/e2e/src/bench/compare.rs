@@ -94,8 +94,31 @@ const MATCHING_META: [&str; 3] = ["arch", "profile", "debug_assertions"];
 /// leg's own tree with an architecture and a profile of its own.
 const KIND_META: &str = "kind";
 
-/// The host emitter's own corpora, which every build of it runs.
-const HOST_SYNTHETIC: [&str; 2] = ["host_emit_synthetic_ff", "host_emit_synthetic_sm"];
+/// The meta keys that may differ between the legs, and between the rounds of one leg.
+///
+/// They name the build or the run, not the workload: which binaries ran
+/// (the release stamp and image IDs, the host emitter's version), the suite
+/// configuration (which carries each run's own `log.dir`), and the clock's
+/// calibration, which every process measures afresh. Every other key
+/// defines what a benchmark did, so it has to be the same in every file of
+/// that benchmark in both legs; a key a later benchmark adds is held to
+/// that without a change here.
+const RUN_META: [&str; 8] = [
+    "layer",
+    "layer_image",
+    "layer_unix_image",
+    "host_image",
+    "emitter",
+    "config",
+    "tsc_hz",
+    "tsc_granularity_ns",
+];
+
+/// The meta key a benchmark of a real shader cache carries, naming the cache.
+///
+/// A build that cannot read the cache's format writes no file for it, so
+/// such a benchmark may be in one leg alone.
+const CORPUS_META: &str = "corpus";
 
 /// The meta keys every host benchmark file has to carry: it loads no layer image.
 const HOST_REQUIRED_META: [&str; 4] = ["layer", "arch", "profile", "debug_assertions"];
@@ -743,18 +766,19 @@ pub fn compare(
         } else {
             ("cand", cand)
         };
-        if !host_corpus(bench, rounds) {
+        if !cache_corpus(bench, rounds) {
             return Err(format!(
                 "incomplete run: benchmark {bench} ran only in the {ran} leg; both legs have to \
                  run every benchmark for the run to be judged"
             ));
         }
         notes.push(format!(
-            "{bench} skipped: only the {ran} leg's emitter could read that shader cache (a cache \
+            "{bench} skipped: only the {ran} leg's build could read that shader cache (a cache \
              format one of the builds does not read), so there is nothing to pair"
         ));
     }
     for bench in base_benches.intersection(&cand_benches) {
+        check_workload(bench, base, cand)?;
         benches.push(BenchReport {
             bench: bench.clone(),
             rows: bench_rows(bench, base, cand, options)?,
@@ -777,18 +801,76 @@ pub fn compare(
     })
 }
 
-/// Whether `bench` is a host emitter benchmark of a shader cache, going by its files in `rounds`.
+/// Whether `bench` measures a real shader cache, going by its files in `rounds`.
 ///
-/// The emitter skips a cache whose format its build does not read and
-/// writes no file for it, so a cache that a format change between the two
-/// builds makes readable to one leg only leaves its benchmark in that leg
-/// alone. The synthetic corpora are the emitter's own and always run.
-fn host_corpus(bench: &str, rounds: &[BTreeMap<String, Loaded>]) -> bool {
-    !HOST_SYNTHETIC.contains(&bench)
-        && rounds
+/// Its files carry [`CORPUS_META`]. The host emitter and the cold-start
+/// benchmark skip a cache whose format their build does not read and write
+/// no file for it, so a cache that a format change between the two builds
+/// makes readable to one leg only leaves its benchmark in that leg alone.
+fn cache_corpus(bench: &str, rounds: &[BTreeMap<String, Loaded>]) -> bool {
+    let mut files = rounds
+        .iter()
+        .filter_map(|round| round.get(bench))
+        .peekable();
+    files.peek().is_some() && files.all(|loaded| loaded.file.meta.contains_key(CORPUS_META))
+}
+
+/// Check that `bench` ran one workload in every file of both legs.
+///
+/// Every meta key outside [`RUN_META`] defines the workload, such as the
+/// entries the benchmark's harness added (`config_entries`) or the path it
+/// took (`depth_path`), and has the same value, or is absent, in every file
+/// of the benchmark.
+///
+/// # Errors
+///
+/// Returns a message naming the key and the two values that differ.
+pub fn check_workload(
+    bench: &str,
+    base: &[BTreeMap<String, Loaded>],
+    cand: &[BTreeMap<String, Loaded>],
+) -> Result<(), String> {
+    let files: Vec<(&Leg, &Loaded)> = [(&Leg::Base, base), (&Leg::Cand, cand)]
+        .into_iter()
+        .flat_map(|(leg, rounds)| {
+            rounds
+                .iter()
+                .filter_map(|round| round.get(bench))
+                .map(move |loaded| (leg, loaded))
+        })
+        .collect();
+    let keys: BTreeSet<&String> = files
+        .iter()
+        .flat_map(|(_, loaded)| loaded.file.meta.keys())
+        .filter(|key| !RUN_META.contains(&key.as_str()))
+        .collect();
+    let shown =
+        |value: Option<&String>| value.map_or_else(|| "absent".to_owned(), |v| format!("{v:?}"));
+    for key in keys {
+        let Some(((first_leg, first), rest)) = files.split_first().map(|(f, r)| (*f, r)) else {
+            continue;
+        };
+        let expected = first.file.meta.get(key);
+        if let Some((leg, loaded)) = rest
             .iter()
-            .filter_map(|round| round.get(bench))
-            .all(|loaded| HOST_KIND.holds(&loaded.file))
+            .find(|(_, loaded)| loaded.file.meta.get(key) != expected)
+        {
+            let within = if *leg == first_leg {
+                format!("the {} leg changed it between rounds", leg.dir())
+            } else {
+                "the legs ran different workloads".to_owned()
+            };
+            return Err(format!(
+                "{bench}: meta {key} is {} in {} and {} in {}; {within}, so the numbers \
+                 cannot be compared",
+                shown(expected),
+                first.path.display(),
+                shown(loaded.file.meta.get(key)),
+                loaded.path.display()
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// The benchmarks of one leg, each checked to have a file in every round.

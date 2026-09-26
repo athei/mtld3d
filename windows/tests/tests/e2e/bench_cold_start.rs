@@ -1094,12 +1094,16 @@ fn report(name: &str, shape: &str, measured: &Measured, kind: &Kind) {
                 Class::Info,
             );
         }
-        Kind::Corpus => metrics.metric(
-            "corpus.regenerated",
-            Value::Count(u64::from(settled.regenerated)),
-            Direction::Lower,
-            Class::Info,
-        ),
+        Kind::Corpus => {
+            // Tells a comparison that a build unable to read the cache lacks this file.
+            metrics.meta("corpus", name.strip_prefix("cold_start_").unwrap_or(name));
+            metrics.metric(
+                "corpus.regenerated",
+                Value::Count(u64::from(settled.regenerated)),
+                Direction::Lower,
+                Class::Info,
+            );
+        }
     }
     write_report(&metrics, &log, &body);
 }

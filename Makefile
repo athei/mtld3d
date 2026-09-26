@@ -1119,14 +1119,17 @@ bench: install-windows-$(ARCH) install-unix-$(SDK_UNIX_ARCH)
 # after the end-to-end benchmarks and whatever BENCH_SET names. It is host
 # code, so each leg builds and runs its own tree's `emit_corpus` with the
 # leg's profile, and BENCH_CORPUS names the shader caches both legs read
-# (none: the synthetic corpora alone). A BASE whose Makefile has no
+# (none: the synthetic corpora alone); the same staged copies are linked into
+# every end-to-end run's directory, so `cold_start` measures them as it does
+# under `make bench`. A BASE whose Makefile has no
 # `bench-host-build` predates the benchmark, and then neither leg runs it.
 #
 # Nothing else may run on the machine meanwhile, tests, builds and games
 # included: the verdicts are only as good as the quiet of the machine.
 RUNS ?= 5
 BENCH_SET ?= wow
-BENCH_SET_wow := wow_112_busy_frame wow_335a_busy_frame query_poll_wow query_poll_spec api_call_cost
+BENCH_SET_wow := wow_112_busy_frame wow_335a_busy_frame query_poll_wow query_poll_spec api_call_cost \
+	dynamic_buffer_churn texture_streaming
 BENCH_SET_full :=
 BENCH_CHECKOUT = $(patsubst %/,%,$(dir $(shell git rev-parse --path-format=absolute --git-common-dir)))
 BENCH_AB_ROOT = $(abspath $(or $(LOG_DIR),$(BENCH_CHECKOUT)/.codex/evidence/bench-ab))
@@ -1192,7 +1195,7 @@ bench-ab:
 	$(if $(BENCH_HOST_AB),$(MAKE) $(BENCH_LEG_MAKE) bench-host-build)
 	$(MAKE) $(call BENCH_LEG_CONFIGURE,$(BENCH_BASE_ISO)) || { $(BENCH_STOP_SERVERS); stop_servers; exit 2; }
 	$(MAKE) $(call BENCH_LEG_CONFIGURE,$(ISOLATED_ROOT)) || { $(BENCH_STOP_SERVERS); stop_servers; exit 2; }
-	$(if $(BENCH_HOST_AB),mkdir -p '$(BENCH_AB_OUT)' && $(call bench_stage_corpus,$(BENCH_AB_OUT)))
+	$(if $(BENCH_CORPUS),mkdir -p '$(BENCH_AB_OUT)' && $(call bench_stage_corpus,$(BENCH_AB_OUT)))
 	$(BENCH_STOP_SERVERS); trap stop_servers EXIT; \
 	$(BENCH_SUITE_ASSIGN); \
 	cd $(E2E_RUNNER_DIR) && WINEDEBUG= MTL_DEBUG_LAYER=0 MTL_HUD_ENABLED=0 \
@@ -1202,7 +1205,7 @@ bench-ab:
 		--cand-wine '$(ISOLATED_ROOT)/sdk/bin/wine' \
 		--cand-prefix '$(ISOLATED_ROOT)/prefix' --cand-stamp '$(BENCH_CAND_STAMP)' \
 		--config '$(BENCH_CONF_AB)' $(if $(BENCH_SET_$(BENCH_SET)),--bench '$(BENCH_SET_$(BENCH_SET))') \
-		$(BENCH_HOST_FLAGS) \
+		$(BENCH_HOST_FLAGS) $(if $(BENCH_CORPUS),--corpus-dir '$(BENCH_AB_OUT)/corpus') \
 		$(if $(ACCEPT),--accept '$(ACCEPT)') $(BENCH_SAME_IMAGE) --report '$(BENCH_AB_OUT)/report.txt' -- $$suite
 
 bench-compare:

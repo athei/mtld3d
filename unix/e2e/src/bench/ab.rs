@@ -40,6 +40,9 @@ use crate::{
 /// The metric a progress line shows, when the benchmark reports it.
 const PROGRESS_METRIC: &str = "frame.p50";
 
+/// The name under a run directory where a benchmark finds the staged shader caches.
+const CORPUS_LINK: &str = "corpus";
+
 /// How progress lines and errors name the host emitter benchmark.
 const HOST_ID: &str = "host::emit_corpus";
 
@@ -85,6 +88,8 @@ pub struct AbConfig {
     pub report: Option<PathBuf>,
     /// The host emitter benchmark, when both trees have one.
     pub host: Option<HostBench>,
+    /// The staged shader caches, linked into every end-to-end run's directory as `corpus`.
+    pub corpus_dir: Option<PathBuf>,
 }
 
 /// The host emitter benchmark: each leg's own `emit_corpus`, and the caches both read.
@@ -334,6 +339,9 @@ fn run_one(
     dir: &Path,
 ) -> Result<Vec<(PathBuf, MetricsFile)>, String> {
     fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    if let Some(corpus) = &config.corpus_dir {
+        link_corpus(corpus, dir)?;
+    }
     let before = metrics_files(dir)?;
     let mut launcher = leg_launcher(spec, &bench.exe, Some(dir), config.timeout)?
         .with_env("MTLD3D_CONFIG", &run_config(&config.config, dir));
@@ -383,6 +391,35 @@ fn run_one(
         .into_iter()
         .map(|path| metrics::read(&path).map(|file| (path, file)))
         .collect()
+}
+
+/// Link the staged caches at `corpus` into the run directory `dir` as `corpus`, once.
+///
+/// A benchmark reads real caches from `corpus` under its log directory, as
+/// `make bench` stages them. Both legs' runs link the one staged copy, which
+/// the benchmark only copies from, so no leg sees a cache the other did not.
+///
+/// # Errors
+///
+/// Returns a message when the link cannot be made, or `dir` already holds a
+/// `corpus` that is not a link to `corpus`.
+pub fn link_corpus(corpus: &Path, dir: &Path) -> Result<(), String> {
+    let link = dir.join(CORPUS_LINK);
+    match fs::read_link(&link) {
+        Ok(target) if target == corpus => Ok(()),
+        Ok(target) => Err(format!(
+            "{} links to {}, not to the staged caches in {}",
+            link.display(),
+            target.display(),
+            corpus.display()
+        )),
+        Err(_) if link.symlink_metadata().is_ok() => Err(format!(
+            "{} exists and is not a link to the staged caches",
+            link.display()
+        )),
+        Err(_) => std::os::unix::fs::symlink(corpus, &link)
+            .map_err(|e| format!("{}: {e}", link.display())),
+    }
 }
 
 /// The arguments of one host benchmark run writing into `dir`.

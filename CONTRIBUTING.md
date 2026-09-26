@@ -226,7 +226,12 @@ the same rounds after the others: each leg builds and runs its own tree's
 emitter, both read the same `BENCH_CORPUS`, and its MSL byte counts are
 exact, so a change that alters the emitted code shows up there even when its
 time per shader stays inside the noise. A `BASE` older than the host
-benchmark runs neither leg's, and the run says so.
+benchmark runs neither leg's, and the run says so. The same caches are what
+`cold_start` measures in both legs. A cache only one build can read (a
+format change between them) is skipped for both with a note, while any
+other difference in what a benchmark ran, such as its own configuration
+entries or the depth path it took, stops the comparison: only the build and
+the run may differ between the legs.
 
 Bench numbers come from `PROD=1 PERF=1` builds only; `make bench-ab` builds
 both legs that way and refuses any other profile, since `release` carries
@@ -240,8 +245,15 @@ machine moves the numbers by itself; run it when a verdict looks surprising.
 
 Run `make bench-ab BASE=origin/main` with the default `BENCH_SET=wow` before
 merging a change to the render, encoder, submit or shader path, and put the
-summary line in the pull request's verification. `BENCH_SET=full` runs every
-benchmark.
+summary line in the pull request's verification. The `wow` set is the two
+World of Warcraft frames, the EVENT-query throttle under the game's settings
+and under the D3D9 defaults, the per-call API cost, and the buffer-lock and
+texture-streaming benchmarks at the game's rates: seven benchmarks of about
+15 to 25 s each, so with the default five rounds of both legs expect about
+half an hour of runs on top of the two production builds (an estimate from
+the benchmarks' minimum spans; the first run's timestamps say what it is on
+your machine). `BENCH_SET=full` runs every benchmark, the shader-stutter and
+cold-start ones included, and takes about twice as long.
 
 ## Which suite is right when they disagree
 

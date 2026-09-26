@@ -180,3 +180,29 @@ fn a_host_run_that_fails_hangs_or_writes_nothing_is_an_error() {
     assert!(reason.contains("ran longer than"), "{reason}");
     let _ = fs::remove_dir_all(exe.parent().unwrap());
 }
+
+#[test]
+fn every_run_directory_links_the_one_staged_corpus() {
+    let root = std::env::temp_dir().join(format!("mtld3d-bench-corpus-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    let staged = root.join("corpus");
+    fs::create_dir_all(staged.join("game")).unwrap();
+    fs::write(staged.join("game").join("mtld3d_shaders.bin"), b"cache").unwrap();
+    let round = root.join("base").join("0");
+    fs::create_dir_all(&round).unwrap();
+    link_corpus(&staged, &round).unwrap();
+    link_corpus(&staged, &round).unwrap();
+    assert_eq!(
+        fs::read(round.join("corpus").join("game").join("mtld3d_shaders.bin")).unwrap(),
+        b"cache"
+    );
+
+    let other = root.join("cand").join("0");
+    fs::create_dir_all(other.join("corpus")).unwrap();
+    let reason = link_corpus(&staged, &other).unwrap_err();
+    assert!(
+        reason.contains("is not a link to the staged caches"),
+        "{reason}"
+    );
+    let _ = fs::remove_dir_all(&root);
+}

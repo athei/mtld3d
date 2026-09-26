@@ -43,6 +43,8 @@
 //! file names a native binary of its own rather than the layer the end-to-end
 //! benchmarks load, and `host_image`, this binary's Mach-O UUID (or
 //! `unknown`), beside the build stamp, arch, profile and debug assertions.
+//! A cache corpus's file also carries `corpus <name>`, which tells a
+//! comparison that a build unable to read that cache may lack the file.
 
 use std::{
     env, fmt, fs,
@@ -631,6 +633,10 @@ fn write_metrics(
     line(format_args!(
         "meta {bench} emitter {SHADER_EMITTER_VERSION:016x}"
     ));
+    if emit == "parse_emit" {
+        // A cache corpus, not one of the synthetic ones every build writes.
+        line(format_args!("meta {bench} corpus {}", corpus.name));
+    }
     if let Some(parse) = &report.parse {
         line(format_args!(
             "metric {bench} parse.us_per_shader {:.3} us lower time",

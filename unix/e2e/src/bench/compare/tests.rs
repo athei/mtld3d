@@ -997,14 +997,18 @@ fn a_cache_corpus_only_one_leg_could_read_is_skipped_with_a_note() {
         &meta_host("v1", "H1"),
         &meta_host("v1", "H2"),
     );
+    let mut corpus = meta_host("v1", "H1");
+    corpus.push(("corpus", "game"));
     for round in 0..3 {
         let metrics = [("parse_emit.us_per_shader", 9.0, "us lower time")];
+        fixture.write("base", round, "host_emit_game", &corpus, &metrics);
+        let ready = [("ready.p50", 9.0, "ms lower time")];
         fixture.write(
             "base",
             round,
-            "host_emit_game",
-            &meta_host("v1", "H1"),
-            &metrics,
+            "cold_start_game",
+            &corpus_meta_layer(),
+            &ready,
         );
     }
     let comparison = evaluate(&fixture.root, &Options::default()).unwrap();
@@ -1017,14 +1021,16 @@ fn a_cache_corpus_only_one_leg_could_read_is_skipped_with_a_note() {
         "{}",
         comparison.render()
     );
-    assert!(
-        comparison
-            .notes
-            .iter()
-            .any(|note| note.starts_with("host_emit_game skipped: only the base leg")),
-        "{:?}",
-        comparison.notes
-    );
+    for bench in ["host_emit_game", "cold_start_game"] {
+        assert!(
+            comparison
+                .notes
+                .iter()
+                .any(|note| note.starts_with(&format!("{bench} skipped: only the base leg"))),
+            "{:?}",
+            comparison.notes
+        );
+    }
 }
 
 #[test]
@@ -1053,6 +1059,74 @@ fn a_synthetic_host_corpus_in_one_leg_is_still_an_incomplete_run() {
     let reason = error_of(&fixture);
     assert!(
         reason.contains("host_emit_synthetic_sm ran only in the cand leg"),
+        "{reason}"
+    );
+}
+
+/// The standard layer meta of a cold-start file over the cache `game`.
+fn corpus_meta_layer() -> Vec<(&'static str, &'static str)> {
+    let mut meta = meta("v0.11.0-3-g66e4114", "AAAA");
+    meta.push(("corpus", "game"));
+    meta
+}
+
+/// Three rounds of `frame_shape` whose workload meta `key` is `base` and `cand` in the two legs.
+fn with_workload(tag: &str, key: &'static str, base: &'static str, cand: &'static str) -> Fixture {
+    let fixture = Fixture::new(tag);
+    for round in 0..3 {
+        for (leg, image, value) in [("base", "AAAA", base), ("cand", "BBBB", cand)] {
+            let mut meta = meta("v0.11.0-3-g66e4114", image);
+            meta.push((key, value));
+            meta.push(("tsc_hz", if round == 1 { "1000" } else { "999" }));
+            let metrics = [("frame.p50", 10.0, "ms lower time")];
+            fixture.write(leg, round, "frame_shape", &meta, &metrics);
+        }
+    }
+    fixture
+}
+
+#[test]
+fn a_workload_meta_that_differs_between_the_legs_is_rejected() {
+    let reason = error_of(&with_workload(
+        "depth-path",
+        "depth_path",
+        "d24x8",
+        "dxt_standin",
+    ));
+    assert!(reason.contains("meta depth_path is \"d24x8\""), "{reason}");
+    assert!(reason.contains("\"dxt_standin\""), "{reason}");
+    assert!(
+        reason.contains("the legs ran different workloads"),
+        "{reason}"
+    );
+
+    let fixture = with_workload(
+        "entries",
+        "config_entries",
+        "none",
+        "query.eventImmediate=true",
+    );
+    let reason = error_of(&fixture);
+    assert!(reason.contains("meta config_entries"), "{reason}");
+}
+
+#[test]
+fn run_meta_may_differ_and_a_matching_workload_passes() {
+    let fixture = with_workload("same-workload", "depth_path", "d24x8", "d24x8");
+    let comparison = evaluate(&fixture.root, &Options::default()).unwrap();
+    assert!(!comparison.failed(), "{}", comparison.render());
+}
+
+#[test]
+fn a_workload_meta_that_changes_within_a_leg_is_rejected() {
+    let fixture = with_workload("within", "depth_path", "d24x8", "d24x8");
+    let mut meta = meta("v0.11.0-3-g66e4114", "AAAA");
+    meta.push(("depth_path", "dxt_standin"));
+    let metrics = [("frame.p50", 10.0, "ms lower time")];
+    fixture.write("base", 2, "frame_shape", &meta, &metrics);
+    let reason = error_of(&fixture);
+    assert!(
+        reason.contains("the base leg changed it between rounds"),
         "{reason}"
     );
 }

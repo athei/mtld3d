@@ -67,6 +67,9 @@ pub fn parse_compare(mut args: impl Iterator<Item = String>) -> Result<CompareCo
 /// and `--cand-host <exe>`, given together, add the host emitter benchmark,
 /// each leg running its own tree's `emit_corpus`, and `--host-corpus
 /// <file>` (repeatable) adds a shader cache for both of them to read.
+/// `--corpus-dir <dir>` names the staged shader caches every end-to-end run
+/// sees as `corpus` in its log directory, where the cold-start benchmark
+/// looks for them.
 ///
 /// # Errors
 ///
@@ -85,11 +88,13 @@ pub fn parse_ab(mut args: impl Iterator<Item = String>) -> Result<AbConfig, Stri
     let mut exes = Vec::new();
     let (mut base_host, mut cand_host) = (None, None);
     let mut corpora = Vec::new();
+    let mut corpus_dir = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--base-host" => base_host = Some(PathBuf::from(value(&mut args, &arg)?)),
             "--cand-host" => cand_host = Some(PathBuf::from(value(&mut args, &arg)?)),
             "--host-corpus" => corpora.push(PathBuf::from(value(&mut args, &arg)?)),
+            "--corpus-dir" => corpus_dir = Some(PathBuf::from(value(&mut args, &arg)?)),
             "--base-wine" => base.wine = Some(PathBuf::from(value(&mut args, &arg)?)),
             "--base-prefix" => base.prefix = Some(PathBuf::from(value(&mut args, &arg)?)),
             "--base-stamp" => base.stamp = Some(value(&mut args, &arg)?),
@@ -156,6 +161,7 @@ pub fn parse_ab(mut args: impl Iterator<Item = String>) -> Result<AbConfig, Stri
         options,
         report,
         host,
+        corpus_dir,
     })
 }
 

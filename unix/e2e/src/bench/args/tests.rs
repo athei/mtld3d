@@ -220,3 +220,21 @@ fn ab_rejects_a_host_emitter_for_one_leg_or_corpora_without_one() {
     let reason = parse_ab(args(&tokens)).unwrap_err();
     assert!(reason.contains("--host-corpus without"), "{reason}");
 }
+
+#[test]
+fn ab_takes_the_staged_corpus_directory() {
+    let mut tokens = LEGS.to_vec();
+    tokens.extend([
+        "--out",
+        "/ab",
+        "--corpus-dir",
+        "/ab/corpus",
+        "--",
+        "/e2e.exe",
+    ]);
+    let config = parse_ab(args(&tokens)).unwrap();
+    assert_eq!(
+        config.corpus_dir.as_deref(),
+        Some(std::path::Path::new("/ab/corpus"))
+    );
+}
