@@ -1091,6 +1091,11 @@ endif
 bench_corpus_copy = $(1)/corpus/$(call bench_corpus_name,$(2))/mtld3d_shaders.bin
 # Empty $(1)/corpus and copy every BENCH_CORPUS entry into it.
 bench_stage_corpus = rm -rf '$(1)/corpus'$(foreach f,$(BENCH_CORPUS), && mkdir -p '$(dir $(call bench_corpus_copy,$(1),$(f)))' && cp '$(abspath $(f))' '$(call bench_corpus_copy,$(1),$(f))')
+# How long a benchmark process may print nothing before the runner kills it
+# as hung. It bounds silence, not a process: `make bench` and a `make bench-ab`
+# round run every benchmark in one process, and each benchmark prints as it
+# starts, where its measured frames start and when it reports, so a round of
+# many benchmarks is bounded per benchmark and never by their sum.
 BENCH_TIMEOUT ?= 300
 BENCH_TARGET := $(if $(filter x86_64,$(ARCH)),$(PE_x64),$(PE_i386))
 BENCH_EXES = $(if $(STAGE),$(STAGE)/tests/$(ARCH)/*.exe,$(call E2E_EXES,$(BENCH_TARGET),--profile $(PROFILE)))

@@ -2,9 +2,10 @@
 //!
 //! The shape follows a frame the game drew under the layer, taken from the
 //! layer's F12 `[dump]` of one 2026-09 session (three dumped frames, each
-//! the same 1323 draws), and the call mix follows a busy five-second window
-//! of the layer's `PERF=1` summary from another session of the same build
-//! (601 frames of about 1420 draws and ten passes each).
+//! the same 1323 draws), and the call mix follows a busy window of the
+//! layer's `PERF=1` summary from another session of the same build, a
+//! five-second window as the summary had then (601 frames of about 1420
+//! draws and ten passes each).
 //!
 //! One frame is 1323 draws in ten render passes. Five shadow-cascade passes
 //! of 8, 120, 158, 382 and 143 caster draws render into one shared 2048x2048
