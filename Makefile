@@ -1386,7 +1386,11 @@ clean:
 #
 # The clones therefore only go once nothing is running out of them, and the one
 # thing executed out of a directory that is about to be deleted is the bounded
-# `-k` above. One logical shell line, so a caller that found a root of its own
+# `-k` above. A delete can still meet files written into the tree meanwhile
+# (a helper process on its way out, or macOS writing a `.DS_Store`), so it is
+# tried again every half second for five seconds; a root still there after
+# that fails the call, naming the processes that hold files under it (an
+# `lsof +D` walk, affordable only on that path) or saying that none does. One logical shell line, so a caller that found a root of its own
 # can run it inside a loop; $(1) arrives unquoted and is quoted here.
 define clean_isolated_at
 iso_root="$(1)" ; \
@@ -1427,7 +1431,20 @@ done ; \
 for pid in $$alive; do \
 	holds_isolated $$pid && kill -9 $$pid 2>/dev/null || true ; \
 done ; \
-rm -rf "$$iso_root"
+removed= ; \
+for i in 1 2 3 4 5 6 7 8 9 10; do \
+	rm -rf "$$iso_root" 2>/dev/null ; \
+	[ -e "$$iso_root" ] || { removed=1 ; break ; } ; \
+	sleep 0.5 ; \
+done ; \
+[ -n "$$removed" ] || { \
+	holders=$$(lsof -n -P -w +D "$$iso_root" 2>/dev/null) ; \
+	echo "cannot remove $$iso_root: files kept appearing under it for 5 s" >&2 ; \
+	if [ -n "$$holders" ]; then echo "processes holding files under it:" >&2 ; echo "$$holders" >&2 ; \
+	else echo "no process holds a file open under it; something writes into it between deletes (Finder's .DS_Store, Spotlight)" >&2 ; fi ; \
+	rm -rf "$$iso_root" ; \
+	false ; \
+}
 endef
 
 # The clones and the server of this checkout. Named after the knob rather than
