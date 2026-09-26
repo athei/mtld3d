@@ -211,27 +211,34 @@ process running every benchmark in libtest's order, which is the same in
 both legs, so what one benchmark leaves in the process (the process-wide
 pipeline cache, the page-box pool) reaches the next alike on both sides of
 each pair; the memory rows a comparison judges are each benchmark's growth
-from a sample taken before its interface. The two runs of one benchmark in
-a round are therefore a whole round process apart, about 33 s with the
-`wow` set, rather than back to back, and with an odd `RUNS` one leg goes
-first in one round more than the other (3 to 2 with the default five). It
+from a sample taken before its interface. That growth is clamped at zero,
+and memory an earlier benchmark frees late, inside a later one, can hide
+some of the later one's growth, which one process a round cannot avoid.
+The two runs of one benchmark in a round are therefore a whole round
+process apart, about 33 s with the `wow` set, rather than back to back, and
+with an odd `RUNS` one leg goes first in one round more than the other (3
+to 2 with the default five). Before each round's process the run notes the
+machine's load and its busiest other processes, and the report warns about
+every round that started on a busy machine; run those again. It
 exits 1 on a regression and 2 when the run itself cannot be trusted, which
 includes the two legs running different Wines. The runs and the report stay
 in a directory under the main checkout's `.codex/evidence/bench-ab`, and
 `make bench-compare AB_DIR=<dir>` judges one again into a report of its own,
 for instance with `ACCEPT=<metric>,...` naming an exact count (a draw count,
 a pass count) that the change is meant to move. `make clean-bench-ab`
-removes the kept base worktrees. The metrics a benchmark writes include the layer's own counters,
-read from the `perf-kv` line of its perf windows as `perf.*` (`bench.rs`
-gives the rules): the per-frame counts of work the API calls fix, such as
-`perf.draws_pf` and `perf.passes_pf`, are the exact ones.
+removes the kept base worktrees. The metrics a benchmark writes include the
+layer's own counters, read from the `perf-kv` line of its perf windows as
+`perf.*` (`bench.rs` gives the rules): the per-frame counts of work the API
+calls fix, such as `perf.draws_pf` and `perf.passes_pf`, are the exact ones.
 
 `make bench-host` is the one benchmark that needs no Wine: it times DXSO
 parsing and MSL emission on this machine over two synthetic corpora and any
 shader cache `BENCH_CORPUS` names, and writes its metrics into the `host`
 directory beside the reports of `make bench`. `make bench-ab` runs it too, in
-rounds of its own before the others, while no Wine process of theirs can
-still be exiting on the cores it times: each leg builds and runs its own
+rounds of its own before the others, the run's first benchmark processes
+(only the short Wine process that lists the benchmarks comes before), so no
+benchmark's Wine process can still be exiting on the cores it times: each
+leg builds and runs its own
 tree's emitter, both read the same `BENCH_CORPUS`, and its MSL byte counts
 are exact, so a change that alters the emitted code shows up there even when
 its time per shader stays inside the noise. A `BASE` older than the host

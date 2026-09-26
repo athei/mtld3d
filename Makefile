@@ -1093,8 +1093,8 @@ bench_corpus_copy = $(1)/corpus/$(call bench_corpus_name,$(2))/mtld3d_shaders.bi
 bench_stage_corpus = rm -rf '$(1)/corpus'$(foreach f,$(BENCH_CORPUS), && mkdir -p '$(dir $(call bench_corpus_copy,$(1),$(f)))' && cp '$(abspath $(f))' '$(call bench_corpus_copy,$(1),$(f))')
 # How long a benchmark process may print nothing before the runner kills it
 # as hung. It bounds silence, not a process: `make bench` and a `make bench-ab`
-# round run every benchmark in one process, and each benchmark prints as it
-# starts, where its measured frames start and when it reports, so a round of
+# round run every benchmark in one process, and each benchmark prints a line
+# where its measured frames start and another when it reports, so a round of
 # many benchmarks is bounded per benchmark and never by their sum.
 BENCH_TIMEOUT ?= 300
 BENCH_TARGET := $(if $(filter x86_64,$(ARCH)),$(PE_x64),$(PE_i386))
@@ -1177,8 +1177,10 @@ bench: install-windows-$(ARCH) install-unix-$(SDK_UNIX_ARCH)
 # (`report-compare-<time>.txt`) beside the one the run wrote.
 #
 # The host emitter benchmark (`make bench-host`) runs in rounds of its own,
-# before the end-to-end benchmarks and whatever BENCH_SET names, so that no
-# Wine process of theirs is still exiting while it times host code. It is host
+# the first benchmark processes of the run, before the end-to-end benchmarks
+# and whatever BENCH_SET names (only their short `--list` under Wine comes
+# before it), so that no benchmark's Wine process is still exiting while it
+# times host code. It is host
 # code, so each leg builds and runs its own tree's `emit_corpus` with the
 # leg's profile, and BENCH_CORPUS names the shader caches both legs read
 # (none: the synthetic corpora alone); the same staged copies are linked into

@@ -26,13 +26,14 @@
 //! once, naming the benchmark: every number after it would be measured
 //! against the wrong build or none.
 //!
-//! The host emitter benchmark, when the run has one, comes before the
-//! end-to-end benchmarks, in rounds of its own, so that no Wine process of
-//! theirs is still exiting while it times host code, and without a shape
-//! run. It is host
-//! code, so each leg runs its own tree's `emit_corpus`, built with that
-//! leg's profile, with `--metrics` pointed at the same round directory, and
-//! the run is checked the same way.
+//! The host emitter benchmark, when the run has one, runs the first
+//! benchmark processes, in rounds of its own before the end-to-end
+//! benchmarks (only the short Wine process that lists them comes before),
+//! so that no benchmark's Wine process is still exiting while it times host
+//! code, and without a shape run. It is host code, so each leg runs its own
+//! tree's `emit_corpus`, built with that leg's profile, with `--metrics`
+//! pointed at the same round directory, and the run is checked the same
+//! way.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -48,6 +49,7 @@ use std::{
 use super::{
     Leg, SAME_IMAGE_FILE, SHAPE_DIR, WINE_FILE,
     compare::{self, Options},
+    machine,
     metrics::{self, Class, MetricsFile},
     shape::{self, Identity, SHAPE_RUST_LOG},
 };
@@ -230,6 +232,7 @@ pub fn run(config: &AbConfig) -> Result<ExitCode, String> {
             Step::Round { group, round, leg } => {
                 let members: Vec<&Bench> = groups[group].iter().map(|&at| &benches[at]).collect();
                 let dir = out.join(leg.dir()).join(round.to_string());
+                machine::keep(&dir, machine::MACHINE_FILES[0].0, &machine::sample())?;
                 for (member, path, file) in run_round(config, spec, &members, &dir)? {
                     let at = groups[group][member];
                     check_stamp(&path, &file, spec)?;
@@ -286,6 +289,7 @@ pub fn run(config: &AbConfig) -> Result<ExitCode, String> {
                     Leg::Cand => &host.cand,
                 };
                 let dir = out.join(leg.dir()).join(round.to_string());
+                machine::keep(&dir, machine::MACHINE_FILES[1].0, &machine::sample())?;
                 for (path, file) in &run_host(exe, &host.corpora, &dir, config.timeout)? {
                     check_stamp(path, file, spec)?;
                     println!(
@@ -305,10 +309,12 @@ pub fn run(config: &AbConfig) -> Result<ExitCode, String> {
 /// The order of the runs, the leg that goes first alternating from round to round.
 ///
 /// The host emitter benchmark, when there is one (`host`), runs its rounds
-/// first, both legs back to back, the base first on even rounds: it times
-/// host code, and before any benchmark's Wine process has run no Wine
-/// process of one is still exiting (its session tearing down, the kill of
-/// a stopped shape run) on the cores it measures. Then every round runs each
+/// first, both legs back to back, the base first on even rounds, as the
+/// run's first benchmark processes: it times host code, and before any
+/// end-to-end benchmark's process has run none is still exiting (its
+/// session tearing down, the kill of a stopped shape run) on the cores it
+/// measures; only the short `--list` of the benchmarks runs under Wine
+/// before it. Then every round runs each
 /// of the `groups` test binaries' processes in both legs the same way, and
 /// after the last round each of the `benches` gets its shape runs, the
 /// base's first.

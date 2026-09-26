@@ -27,11 +27,22 @@
 //!   different work.
 //! - `info`: reported, never judged.
 //!
-//! A metric some rounds of a leg carry and others do not has no pairs to
-//! judge: it is reported as incomplete with a note, never judged, since the
-//! `perf-kv` line may leave out a few keys in a window (the fault counts
-//! when no fault sample was taken, the copies of a pool with none), and a
-//! benchmark reads one window a round.
+//! Both legs run the candidate's benchmark binary, so a metric only the base
+//! has was made to vanish by the candidate's layer: it fails the comparison
+//! like an exact change unless it is accepted by name. One only the
+//! candidate has (the `perf.*` metrics against a base without the `perf-kv`
+//! line) is listed as added. A metric some rounds of a leg carry and others
+//! do not is an error, except the three the `perf-kv` line may leave out of
+//! a window ([`OPTIONAL_METRICS`]: the fault counts without a fault sample,
+//! the pool's GPU copies without any): with one window a round those come
+//! and go, and are reported as incomplete with a note, never judged. When
+//! the legs measured perf windows of different lengths (`meta window_s`, a
+//! base older than the 2 s interval), the rows whose value grows with the
+//! span, tail percentiles, worst values and spike counts, are reported, not
+//! judged, with a note.
+//!
+//! Rounds whose process started on a busy machine (see `machine`) are
+//! listed as warnings above the notes; a warning never changes a verdict.
 //!
 //! Beside the numbers, each scene benchmark's untimed shape runs are
 //! compared: the passes of its steady submission and every load/store
@@ -55,7 +66,7 @@ use std::{
 };
 
 use super::{
-    Leg, SAME_IMAGE_FILE, SHAPE_DIR, WINE_FILE,
+    Leg, SAME_IMAGE_FILE, SHAPE_DIR, WINE_FILE, machine,
     metrics::{self, Class, Direction, Metric, MetricsFile, Unit},
     shape::{self, ShapeReport},
     stats::{MAD_SIGMA, mad, median},
@@ -130,6 +141,9 @@ const KIND_META: &str = "kind";
 
 /// The meta keys that may differ between the legs, and between the rounds of one leg.
 ///
+/// `window_s` is the length of the layer's perf window the run measured,
+/// which a base older than the 2 s interval sets at 5 s; the comparison
+/// reads it apart (see [`SPAN_META`]).
 /// They name the build or the run, not the workload: which binaries ran
 /// (the release stamp and image IDs, the host emitter's version), the suite
 /// configuration (which carries each run's own `log.dir`), and the clock's
@@ -137,7 +151,8 @@ const KIND_META: &str = "kind";
 /// defines what a benchmark did, so it has to be the same in every file of
 /// that benchmark in both legs; a key a later benchmark adds is held to
 /// that without a change here.
-const RUN_META: [&str; 8] = [
+const RUN_META: [&str; 9] = [
+    "window_s",
     "layer",
     "layer_image",
     "layer_unix_image",
@@ -146,6 +161,25 @@ const RUN_META: [&str; 8] = [
     "config",
     "tsc_hz",
     "tsc_granularity_ns",
+];
+
+/// The meta key naming the seconds of the perf window a run measured, `none` without one.
+///
+/// When the legs measured windows of different lengths, the metrics whose
+/// value grows with the span (see [`span_scaled`]) are reported, not judged.
+const SPAN_META: &str = "window_s";
+
+/// The metrics a round may lack, from the keys the `perf-kv` line may leave out of a window.
+///
+/// `docs/ARCHITECTURE.md` names the three keys: the fault counts, absent
+/// from a window without a fault sample, and the GPU copies of the vertex
+/// and index buffer pool, absent when it has none to count. A benchmark
+/// reads one window a round, so a round lacks them now and then. Any other
+/// metric a round lacks is an error.
+const OPTIONAL_METRICS: [&str; 3] = [
+    "perf.faults_minor_pf",
+    "perf.faults_major_pf",
+    "perf.vbib_gpu_copy_pf",
 ];
 
 /// The meta key a benchmark of a real shader cache carries, naming the cache.
@@ -249,8 +283,11 @@ pub enum Verdict {
     Info,
     /// Only the candidate has it.
     Added,
-    /// Only the base has it.
-    Removed,
+    /// Only the base has it: the candidate's layer made it vanish, since both legs run one binary.
+    Removed {
+        /// Its name was given to `--accept`.
+        accepted: bool,
+    },
     /// Some rounds of a leg have it and others do not, so it has no pairs to judge.
     Incomplete,
 }
@@ -274,7 +311,8 @@ impl Verdict {
             } => "CHANGED (better)",
             Self::Info => "info",
             Self::Added => "added",
-            Self::Removed => "removed",
+            Self::Removed { accepted: true } => "removed, accepted",
+            Self::Removed { accepted: false } => "REMOVED",
             Self::Incomplete => "incomplete, not judged",
         }
     }
@@ -289,6 +327,7 @@ impl Verdict {
                     accepted: false,
                     ..
                 }
+                | Self::Removed { accepted: false }
         )
     }
 }
@@ -321,6 +360,8 @@ pub struct Comparison {
     pub shapes: Vec<ShapeReport>,
     /// Remarks that are no verdict, such as an accepted name nothing matched.
     pub notes: Vec<String>,
+    /// Rounds that started on a busy machine, which never change a verdict.
+    pub warnings: Vec<String>,
 }
 
 impl Comparison {
@@ -364,6 +405,12 @@ impl Comparison {
                 let _ = writeln!(out, "shape unchanged");
             }
         }
+        if !self.warnings.is_empty() {
+            out.push('\n');
+            for warning in &self.warnings {
+                let _ = writeln!(out, "WARNING: {warning}");
+            }
+        }
         if !self.notes.is_empty() {
             out.push('\n');
             for note in &self.notes {
@@ -387,7 +434,7 @@ impl Comparison {
         let changes = count(|v| matches!(v, Verdict::Changed { .. }));
         let accepted = count(|v| matches!(v, Verdict::Changed { accepted: true, .. }));
         let added = count(|v| *v == Verdict::Added);
-        let removed = count(|v| *v == Verdict::Removed);
+        let removed = count(|v| matches!(v, Verdict::Removed { .. }));
         let incomplete = count(|v| *v == Verdict::Incomplete);
         let verdict = if self.failed() { "FAIL" } else { "PASS" };
         let shapes_changed = self.shapes.iter().filter(|s| s.changed()).count();
@@ -470,6 +517,7 @@ pub fn evaluate(dir: &Path, options: &Options) -> Result<Comparison, String> {
         check_shape_runs(&base[0], &shapes.reports, &mut comparison.notes)?;
     }
     comparison.shapes = shapes.reports;
+    comparison.warnings = machine::warnings(dir, &[Leg::Base.dir(), Leg::Cand.dir()], base.len());
     comparison.notes.extend(shapes.notes);
     let mut header = vec![format!("bench-compare: {}", dir.display())];
     for (kind, builds) in kinds {
@@ -890,7 +938,7 @@ pub fn compare(
     }
     for bench in base_benches.intersection(&cand_benches) {
         check_workload(bench, base, cand)?;
-        let rows = bench_rows(bench, base, cand, options)?;
+        let rows = bench_rows(bench, base, cand, options, &mut notes)?;
         for row in rows.iter().filter(|row| row.verdict == Verdict::Incomplete) {
             notes.push(format!(
                 "{bench}: {} is in some rounds of a leg and not in others ({}), as a key the \
@@ -909,11 +957,15 @@ pub fn compare(
         .filter(|name| !shape::is_accept_name(name))
     {
         let matched = benches.iter().flat_map(|b| b.rows.iter()).any(|row| {
-            row.metric == *name && matches!(row.verdict, Verdict::Changed { accepted: true, .. })
+            row.metric == *name
+                && matches!(
+                    row.verdict,
+                    Verdict::Changed { accepted: true, .. } | Verdict::Removed { accepted: true }
+                )
         });
         if !matched {
             notes.push(format!(
-                "--accept {name}: no exact metric of that name changed"
+                "--accept {name}: no exact metric of that name changed or was removed"
             ));
         }
     }
@@ -922,6 +974,7 @@ pub fn compare(
         benches,
         shapes: Vec::new(),
         notes,
+        warnings: Vec::new(),
     })
 }
 
@@ -1018,9 +1071,21 @@ fn bench_rows(
     base: &[BTreeMap<String, Loaded>],
     cand: &[BTreeMap<String, Loaded>],
     options: &Options,
+    notes: &mut Vec<String>,
 ) -> Result<Vec<Row>, String> {
     let base_series = leg_series(bench, base)?;
     let cand_series = leg_series(bench, cand)?;
+    let (base_spans, cand_spans) = (spans(bench, base), spans(bench, cand));
+    let spans_differ = base_spans != cand_spans;
+    if spans_differ {
+        notes.push(format!(
+            "{bench}: the legs measured perf windows of different lengths (base {}, cand {} \
+             s), so its p99, max and spike rows, which grow with the span, are reported and \
+             not judged",
+            listed(&base_spans),
+            listed(&cand_spans)
+        ));
+    }
     let names: BTreeSet<&String> = base_series
         .keys()
         .chain(cand_series.keys())
@@ -1032,7 +1097,21 @@ fn bench_rows(
         let partial = |series: Option<&(&Metric, Vec<f64>)>, rounds: usize| {
             series.is_some_and(|(_, values)| values.len() != rounds)
         };
-        if partial(in_base, base.len()) || partial(in_cand, cand.len()) {
+        let optional = OPTIONAL_METRICS.contains(&name.as_str());
+        let partly = partial(in_base, base.len()) || partial(in_cand, cand.len());
+        if partly && !optional {
+            let leg = if partial(in_base, base.len()) {
+                "base"
+            } else {
+                "cand"
+            };
+            return Err(format!(
+                "{bench}: metric {name} is in some rounds of the {leg} leg and not in others; \
+                 the rounds of a leg must carry the same metrics (only {} may come and go)",
+                OPTIONAL_METRICS.join(", ")
+            ));
+        }
+        if partly || (optional && (in_base.is_none() || in_cand.is_none())) {
             let counted = |series: Option<&(&Metric, Vec<f64>)>, rounds: usize, leg: &str| {
                 format!(
                     "{} of {rounds} {leg} rounds",
@@ -1070,10 +1149,18 @@ fn bench_rows(
                     ));
                 }
                 let accepted = options.accept.iter().any(|accepted| accepted == name);
-                judge(name, definition, base_values, cand_values, accepted)
+                if spans_differ && span_scaled(name, definition) {
+                    let mut row = judge(name, definition, base_values, cand_values, accepted);
+                    "window lengths differ".clone_into(&mut row.noise);
+                    row.verdict = Verdict::Info;
+                    row
+                } else {
+                    judge(name, definition, base_values, cand_values, accepted)
+                }
             }
             (Some((definition, values)), None) => {
-                presence_row(name, definition, values, Verdict::Removed)
+                let accepted = options.accept.iter().any(|accepted| accepted == name);
+                presence_row(name, definition, values, Verdict::Removed { accepted })
             }
             (None, Some((definition, values))) => {
                 presence_row(name, definition, values, Verdict::Added)
@@ -1110,6 +1197,36 @@ fn leg_series<'a>(
         }
     }
     Ok(series)
+}
+
+/// The window lengths the rounds of one leg name for `bench` (`window_s`), empty for files without.
+fn spans(bench: &str, rounds: &[BTreeMap<String, Loaded>]) -> BTreeSet<String> {
+    rounds
+        .iter()
+        .filter_map(|round| round.get(bench)?.file.meta.get(SPAN_META).cloned())
+        .collect()
+}
+
+/// A set of window lengths as a note lists them.
+fn listed(spans: &BTreeSet<String>) -> String {
+    if spans.is_empty() {
+        "unnamed".to_owned()
+    } else {
+        spans.iter().cloned().collect::<Vec<_>>().join("/")
+    }
+}
+
+/// Whether a metric's value grows with the span it was measured over.
+///
+/// A tail percentile, a worst value and a count of spikes all see more of
+/// the rare slow frames in a longer span. An exact metric is fixed by the
+/// workload whatever the span, and a median, a mean or a per-frame count is
+/// not tied to it.
+fn span_scaled(name: &str, definition: &Metric) -> bool {
+    definition.class != Class::Exact
+        && (definition.class == Class::Spikes
+            || name.contains("p99")
+            || name.rsplit('.').next() == Some("max"))
 }
 
 /// The row of a metric only one leg has.

@@ -217,6 +217,7 @@ fn dynamic_buffer_churn() {
     // The frames lock the same kinds at the same rates, but a ring's wrap or
     // a preserving lock falls on some frames and not others, so a window's
     // per-frame counts depend on where it starts.
+    metrics.meta("window_s", &span.window_s());
     metrics.perf(&span.perf_kv(&log), &FrameWork::Varying);
     write_report(&metrics, &log, &body);
 }

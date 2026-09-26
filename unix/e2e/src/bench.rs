@@ -11,9 +11,9 @@
 //! both legs alike instead of charging the drift to one of them.
 //!
 //! When both trees carry it, the host emitter benchmark runs in rounds of
-//! its own before the others, each leg its own tree's `emit_corpus`, since it is host code the
-//! candidate's binary cannot stand in for; its files say `meta kind host`,
-//! and `compare` checks them apart from the layer's.
+//! its own before the others, each leg its own tree's `emit_corpus`, since
+//! it is host code the candidate's binary cannot stand in for; its files
+//! say `meta kind host`, and `compare` checks them apart from the layer's.
 //!
 //! A finished A/B directory holds `<leg>/<round>/bench-<name>.metrics`, the
 //! leg `base` or `cand` and the round `0..N`. `bench-compare` reads that
@@ -42,6 +42,7 @@ mod ab;
 mod args;
 mod compare;
 mod dump;
+mod machine;
 mod metrics;
 mod shape;
 mod stats;

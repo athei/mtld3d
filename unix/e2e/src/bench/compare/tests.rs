@@ -530,9 +530,7 @@ fn a_benchmark_missing_from_one_round_is_rejected() {
 }
 
 #[test]
-fn a_metric_that_comes_and_goes_within_a_leg_is_reported_not_judged() {
-    // Round 1 of the base leaves perf.draws_pf out, as a window without a
-    // fault sample leaves out perf.faults_major_pf.
+fn a_metric_that_comes_and_goes_within_a_leg_is_rejected() {
     let fixture = Fixture::new("flaky-metric");
     fixture.standard(3, 1.0);
     fixture.write(
@@ -542,10 +540,30 @@ fn a_metric_that_comes_and_goes_within_a_leg_is_reported_not_judged() {
         &meta("v0.11.0-3-g66e4114", "AAAA"),
         &[("frame.p50", 10.0, "ms lower time")],
     );
+    let reason = error_of(&fixture);
+    assert!(
+        reason.contains("metric perf.draws_pf is in some rounds of the base leg"),
+        "{reason}"
+    );
+}
+
+#[test]
+fn an_optional_perf_key_that_comes_and_goes_is_reported_not_judged() {
+    // Round 1 of the base has no fault sample, so its window left the key out.
+    let fixture = Fixture::new("flaky-optional");
+    for round in 0..3 {
+        let faults: &[(&str, f64, &str)] = &[
+            ("frame.p50", 10.0, "ms lower time"),
+            ("perf.faults_major_pf", 0.5, "count lower noisy"),
+        ];
+        let base = if round == 1 { &faults[..1] } else { faults };
+        fixture.write("base", round, "b", &meta("v1", "AAAA"), base);
+        fixture.write("cand", round, "b", &meta("v1", "BBBB"), faults);
+    }
     let comparison = evaluate(&fixture.root, &Options::default()).unwrap();
     let row = comparison
         .rows()
-        .find(|row| row.metric == "perf.draws_pf")
+        .find(|row| row.metric == "perf.faults_major_pf")
         .expect("the row is reported");
     assert_eq!(row.verdict, Verdict::Incomplete);
     assert!(!row.verdict.fails());
@@ -555,7 +573,7 @@ fn a_metric_that_comes_and_goes_within_a_leg_is_reported_not_judged() {
         comparison
             .notes
             .iter()
-            .any(|note| note.contains("frame_shape: perf.draws_pf is in some rounds")),
+            .any(|note| note.contains("b: perf.faults_major_pf is in some rounds")),
         "{:?}",
         comparison.notes
     );
@@ -593,7 +611,7 @@ fn a_metric_redefined_between_legs_is_rejected() {
 }
 
 #[test]
-fn added_and_removed_metrics_are_listed_not_failed() {
+fn a_removed_metric_fails_unless_accepted_and_an_added_one_is_listed() {
     let fixture = Fixture::new("added");
     for round in 0..3 {
         fixture.write(
@@ -615,13 +633,106 @@ fn added_and_removed_metrics_are_listed_not_failed() {
         );
     }
     let comparison = evaluate(&fixture.root, &Options::default()).unwrap();
-    assert!(!comparison.failed());
+    assert!(comparison.failed());
     let rows = &comparison.benches[0].rows;
     let verdict = |name: &str| &rows.iter().find(|row| row.metric == name).unwrap().verdict;
-    assert_eq!(*verdict("gone"), Verdict::Removed);
+    assert_eq!(*verdict("gone"), Verdict::Removed { accepted: false });
     assert_eq!(*verdict("new"), Verdict::Added);
     let summary = comparison.summary();
     assert!(summary.contains("1 added, 1 removed"), "{summary}");
+
+    let accepted = Options {
+        accept: vec!["gone".to_owned()],
+        ..Options::default()
+    };
+    let comparison = evaluate(&fixture.root, &accepted).unwrap();
+    assert!(!comparison.failed());
+    assert!(
+        !comparison
+            .notes
+            .iter()
+            .any(|note| note.contains("--accept")),
+        "{:?}",
+        comparison.notes
+    );
+}
+
+#[test]
+fn an_optional_perf_key_the_candidate_lacks_is_incomplete_not_removed() {
+    let fixture = Fixture::new("optional-gone");
+    for round in 0..3 {
+        fixture.write(
+            "base",
+            round,
+            "b",
+            &meta("v1", "AAAA"),
+            &[
+                ("x", 1.0, "ms lower time"),
+                ("perf.faults_minor_pf", 2.0, "count lower noisy"),
+            ],
+        );
+        fixture.write(
+            "cand",
+            round,
+            "b",
+            &meta("v2", "BBBB"),
+            &[("x", 1.0, "ms lower time")],
+        );
+    }
+    let comparison = evaluate(&fixture.root, &Options::default()).unwrap();
+    assert!(!comparison.failed());
+    let row = comparison
+        .rows()
+        .find(|row| row.metric == "perf.faults_minor_pf")
+        .unwrap();
+    assert_eq!(row.verdict, Verdict::Incomplete);
+}
+
+#[test]
+fn different_window_lengths_leave_the_span_scaled_rows_unjudged() {
+    let fixture = Fixture::new("spans");
+    for round in 0..5 {
+        let jitter = [0.0, 0.05, -0.05, 0.02, -0.02][round];
+        for (leg, image, window, scale) in
+            [("base", "AAAA", "5.0", 1.0), ("cand", "BBBB", "2.0", 1.5)]
+        {
+            let mut meta = meta("v1", image);
+            meta.push(("window_s", window));
+            fixture.write(
+                leg,
+                round,
+                "b",
+                &meta,
+                &[
+                    ("frame.p50", 10.0 + jitter, "ms lower time"),
+                    ("frame.p99", (20.0 + jitter) * scale, "ms lower time"),
+                    ("frame.spikes", 10.0 * scale, "count lower spikes"),
+                    ("perf.draws_pf", 500.0, "count lower exact"),
+                ],
+            );
+        }
+    }
+    let comparison = evaluate(&fixture.root, &Options::default()).unwrap();
+    assert!(!comparison.failed(), "{}", comparison.render());
+    let verdict = |name: &str| {
+        &comparison
+            .rows()
+            .find(|row| row.metric == name)
+            .unwrap()
+            .verdict
+    };
+    assert_eq!(*verdict("frame.p99"), Verdict::Info);
+    assert_eq!(*verdict("frame.spikes"), Verdict::Info);
+    assert_eq!(*verdict("frame.p50"), Verdict::Neutral);
+    assert_eq!(*verdict("perf.draws_pf"), Verdict::Neutral);
+    assert!(
+        comparison
+            .notes
+            .iter()
+            .any(|note| note.contains("different lengths (base 5.0, cand 2.0 s)")),
+        "{:?}",
+        comparison.notes
+    );
 }
 
 #[test]

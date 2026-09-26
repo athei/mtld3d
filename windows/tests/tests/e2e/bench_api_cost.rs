@@ -290,6 +290,7 @@ fn api_call_cost() {
     metrics.memory(&before, &warm, &end);
     // Each frame is one batch of one call kind, so a window's per-frame
     // counts depend on where in the rotation it starts and ends.
+    metrics.meta("window_s", &span.window_s());
     metrics.perf(&span.perf_kv(&log), &FrameWork::Varying);
     write_report(&metrics, &log, &body);
 }

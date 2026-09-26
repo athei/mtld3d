@@ -254,6 +254,7 @@ fn poll(name: &str, keys: &'static str, answering: &Answering) {
         Answering::Immediate => FrameWork::Fixed,
         Answering::Retirement => FrameWork::Varying,
     };
+    metrics.meta("window_s", &span.window_s());
     metrics.perf(&span.perf_kv(&log), &frame_work);
     write_report(&metrics, &log, &body);
 }

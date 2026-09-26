@@ -406,6 +406,7 @@ fn wow_335a_busy_frame() {
     };
     metrics.meta("depth_path", depth_path);
     metrics.memory(&before, &warm, &end);
+    metrics.meta("window_s", &span.window_s());
     metrics.perf(&span.perf_kv(&log), &FrameWork::Fixed);
     metrics.meta("backbuffer", &format!("{WIDTH}x{HEIGHT}"));
     metrics.shapes(&pass_shapes());
