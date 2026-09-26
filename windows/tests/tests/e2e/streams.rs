@@ -7,15 +7,40 @@
 
 use mtld3d_tests::{Harness, PosVertex};
 use mtld3d_types::{
-    D3D_OK, D3DDECL_END_STREAM, D3DDECLTYPE_D3DCOLOR, D3DDECLTYPE_FLOAT3, D3DDECLTYPE_UNUSED,
-    D3DDECLUSAGE_COLOR, D3DDECLUSAGE_POSITION, D3DDECLUSAGE_TEXCOORD, D3DERR_INVALIDCALL,
-    D3DFMT_INDEX16, D3DPOOL_DEFAULT, D3DPT_TRIANGLELIST, D3DSBT_ALL, D3DSTREAMSOURCE_INDEXEDDATA,
-    D3DSTREAMSOURCE_INSTANCEDATA, D3DUSAGE_WRITEONLY, D3DVERTEXELEMENT9,
+    D3D_OK, D3DDECL_END_STREAM, D3DDECLTYPE_D3DCOLOR, D3DDECLTYPE_FLOAT2, D3DDECLTYPE_FLOAT3,
+    D3DDECLTYPE_UNUSED, D3DDECLUSAGE_COLOR, D3DDECLUSAGE_POSITION, D3DDECLUSAGE_TEXCOORD,
+    D3DERR_INVALIDCALL, D3DFMT_INDEX16, D3DPOOL_DEFAULT, D3DPT_TRIANGLELIST, D3DSBT_ALL,
+    D3DSTREAMSOURCE_INDEXEDDATA, D3DSTREAMSOURCE_INSTANCEDATA, D3DUSAGE_DYNAMIC,
+    D3DUSAGE_WRITEONLY, D3DVERTEXELEMENT9,
 };
 
 const RED: u32 = 0xFFFF_0000;
 const GREEN: u32 = 0xFF00_FF00;
 const BLUE: u32 = 0xFF00_00FF;
+
+/// `vs_2_0`: `dcl_position v0; dcl_color v1; dcl_texcoord v2; mov oPos, v0; mov oD0, v1;`
+///
+/// The texcoord is declared and unread. It still consumes a declaration
+/// element, which is what stretches a layout past a packed stream.
+const VS_POS_COLOR_TEXCOORD: [u32; 17] = [
+    0xFFFE_0200,
+    (31) | (2 << 24),
+    0x0000_0000,
+    (1 << 28) | (0xF << 16),
+    (31) | (2 << 24),
+    u32::from_ne_bytes([D3DDECLUSAGE_COLOR, 0, 0, 0]),
+    (1 << 28) | (0xF << 16) | 1,
+    (31) | (2 << 24),
+    u32::from_ne_bytes([D3DDECLUSAGE_TEXCOORD, 0, 0, 0]),
+    (1 << 28) | (0xF << 16) | 2,
+    (1) | (2 << 24),
+    (4 << 28) | (0xF << 16),
+    (1 << 28) | (0xE4 << 16),
+    (1) | (2 << 24),
+    (5 << 28) | (0xF << 16),
+    (1 << 28) | (0xE4 << 16) | 1,
+    0x0000_FFFF,
+];
 
 /// `vs_2_0`: `dcl_position v0; dcl_color v1; mov oPos, v0; mov oD0, v1;`
 const VS_POS_COLOR: [u32; 14] = [
@@ -255,6 +280,95 @@ fn stride_below_an_unconsumed_decl_tail_still_fetches_vertices() {
         h.read_pixel(320, 280),
         GREEN,
         "vertices step by the bound stride, not the unconsumed tail's extent"
+    );
+}
+
+/// A stride shorter than a consumed attribute still places every vertex.
+///
+/// Position and colour are packed at 16 bytes. The shader also declares a
+/// texcoord whose element ends at byte 24, so the layout has to step by 24
+/// while the stream steps by 16. Stepping the packed buffer by 24 reads
+/// every vertex past the first from the wrong offset and the triangle misses
+/// the centre. The same mesh through `DrawPrimitiveUP` takes the same path.
+#[test]
+fn stride_below_a_consumed_attribute_still_places_the_triangle() {
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct PackedVertex {
+        x: f32,
+        y: f32,
+        z: f32,
+        color: u32,
+    }
+
+    let elements = [
+        element(0, D3DDECLTYPE_FLOAT3, D3DDECLUSAGE_POSITION),
+        D3DVERTEXELEMENT9 {
+            stream: 0,
+            offset: 12,
+            type_: D3DDECLTYPE_D3DCOLOR,
+            method: 0,
+            usage: D3DDECLUSAGE_COLOR,
+            usage_index: 0,
+        },
+        D3DVERTEXELEMENT9 {
+            stream: 0,
+            offset: 16,
+            type_: D3DDECLTYPE_FLOAT2,
+            method: 0,
+            usage: D3DDECLUSAGE_TEXCOORD,
+            usage_index: 0,
+        },
+        end(),
+    ];
+
+    let h = Harness::new();
+    let decl = h.create_vertex_declaration(&elements);
+    let vs = h.create_vertex_shader(&VS_POS_COLOR_TEXCOORD);
+    let ps = h.create_pixel_shader(&PS_DIFFUSE);
+    assert_eq!(h.set_vertex_declaration(&decl), 0, "SetVertexDeclaration");
+    assert_eq!(h.set_vertex_shader(&vs), 0, "SetVertexShader");
+    assert_eq!(h.set_pixel_shader(&ps), 0, "SetPixelShader");
+
+    let packed: Vec<PackedVertex> = centered_triangle()
+        .iter()
+        .map(|p| PackedVertex {
+            x: p.x,
+            y: p.y,
+            z: p.z,
+            color: GREEN,
+        })
+        .collect();
+    let stride = stride_of::<PackedVertex>();
+    let vb = h.create_vertex_buffer(
+        stride * 3,
+        D3DUSAGE_WRITEONLY | D3DUSAGE_DYNAMIC,
+        0,
+        D3DPOOL_DEFAULT,
+    );
+    vb.lock(0, 0, 0).write(packed.as_slice());
+    assert_eq!(h.set_stream_source(0, &vb, 0, stride), D3D_OK);
+
+    h.render_once(BLUE, |d| {
+        assert_eq!(d.draw_primitive(D3DPT_TRIANGLELIST, 0, 1), 0, "bound draw");
+    });
+    assert_eq!(
+        h.read_pixel(320, 280),
+        GREEN,
+        "bound vertices keep their positions when a consumed attribute hangs past the stride"
+    );
+
+    h.render_once(BLUE, |d| {
+        assert_eq!(
+            d.draw_primitive_up(D3DPT_TRIANGLELIST, 1, packed.as_slice()),
+            0,
+            "UP draw"
+        );
+    });
+    assert_eq!(
+        h.read_pixel(320, 280),
+        GREEN,
+        "inline vertices keep their positions when a consumed attribute hangs past the stride"
     );
 }
 

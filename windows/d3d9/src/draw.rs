@@ -28,8 +28,8 @@ use mtld3d_core::{
     scratch::ScratchArena,
     shader_cache,
     streams::{
-        bound_stream_layout, instance_count, instanced_stream_read_bytes, is_instance_data,
-        layout_stride,
+        bound_stream_layout, expand_short_stride, instance_count, instanced_stream_read_bytes,
+        is_instance_data, layout_stride,
     },
     vs_draw::{MAX_CLIP_PLANES, VS_DRAW_BYTES, VsDrawState},
 };
@@ -182,6 +182,84 @@ impl VertexSource {
 /// declaration whose extent on one stream exceeds it is not something a
 /// 16-element declaration can produce.
 static NULL_STREAM_ZEROS: [u8; 4096] = [0; 4096];
+
+/// Vertex bytes widened to `layout_stride_bytes` when `stride` is shorter.
+///
+/// `None` when the stream already covers the layout, so the caller binds the
+/// original bytes. `Some` of an empty buffer means the copy could not be
+/// built; the caller drops the draw rather than fetching at the widened step
+/// from the packed source.
+fn widened_vertices(src: &[u8], stride: u32, layout_stride_bytes: u32) -> Option<Vec<u8>> {
+    if stride == 0 || layout_stride_bytes <= stride {
+        return None;
+    }
+    Some(expand_short_stride(src, stride, layout_stride_bytes))
+}
+
+/// CPU bytes of one bound stream, from its offset through the backing.
+///
+/// The slice starts at the `SetStreamSource` offset. `None` when the
+/// snapshot has no backing, or the offset is past its end.
+fn bound_stream_bytes(binding: &StreamBinding) -> Option<&[u8]> {
+    let offset = usize::try_from(binding.offset).ok()?;
+    if binding.backing_ptr == 0 || binding.backing_len <= offset {
+        return None;
+    }
+    let len = binding.backing_len - offset;
+    // SAFETY: `backing_ptr` is the stream's page box, stamped with this
+    // frame's submit seq at the draw snapshot, so the allocation outlives
+    // encoding. `offset` is the `SetStreamSource` offset and `len` is the
+    // bytes of that allocation after it.
+    Some(unsafe { core::slice::from_raw_parts((binding.backing_ptr + offset) as *const u8, len) })
+}
+
+/// Prefix of `src` that holds every vertex a per-vertex draw can address.
+///
+/// Indexed draws keep the whole tail: the highest index is not known here.
+/// A per-instance stream is not addressed by these vertex indices, so the
+/// caller does not use this cut for one.
+fn per_vertex_prefix<'a>(src: &'a [u8], stride: u32, index_source: &IndexSource) -> &'a [u8] {
+    let verts = match index_source {
+        IndexSource::None {
+            start_vertex,
+            vertex_count,
+        } => start_vertex.saturating_add(*vertex_count),
+        IndexSource::Fan {
+            start_vertex,
+            primitive_count,
+        } => start_vertex.saturating_add(primitive_count.saturating_add(2)),
+        IndexSource::Generated { max_vertex, .. } => max_vertex.saturating_add(1),
+        // The highest index is not known without scanning the index bytes.
+        IndexSource::Bound { .. } | IndexSource::Up { .. } => return src,
+    };
+    let Some(stride_us) = usize::try_from(stride).ok().filter(|step| *step > 0) else {
+        return src;
+    };
+    let Some(bytes) = usize::try_from(verts)
+        .ok()
+        .and_then(|count| count.checked_mul(stride_us))
+    else {
+        return src;
+    };
+    &src[..bytes.min(src.len())]
+}
+
+/// Bind `bytes` as stream `slot` and forget any buffer previously cached there.
+///
+/// Inline bytes replace the Metal binding the dedup cache still names, so the
+/// next draw of the original buffer must emit its own `setVertexBuffer`.
+fn bind_widened_vertices(enc: &mut FrameEncoder, bytes: &[u8], slot: u32) -> bool {
+    let Ok(size) = u32::try_from(bytes.len()) else {
+        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+            "short-stride vertex copy does not fit a binding; draw dropped"
+        );
+        return false;
+    };
+    let scratch_ptr = enc.alloc_scratch(bytes);
+    enc.emit_command(Command::set_vertex_bytes(scratch_ptr, size, slot));
+    enc.last_bound().invalidate_vertex_buffer_slot(slot);
+    true
+}
 
 /// The vertex buffer layouts of a draw, one per stream the declaration reads.
 ///
@@ -2227,16 +2305,33 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
     //    and churns only when the game renames.
     let t_vbib = CycleAddTimer::start(enc.op_sub_detail_ptr(OpSubDetail::BVbib));
     match &vertex_source {
-        VertexSource::Up { bytes, size, .. } => {
-            let scratch_ptr = enc.alloc_scratch(bytes);
-            if usize::try_from(*size).is_ok_and(|size| size > SET_BYTES_MAX) {
-                enc.bump_up_vertex_oversized();
+        VertexSource::Up {
+            bytes,
+            size,
+            stride,
+        } => {
+            let logical = usize::try_from(*size)
+                .unwrap_or(bytes.len())
+                .min(bytes.len());
+            let src = &bytes[..logical];
+            if let Some(expanded) = widened_vertices(src, *stride, layouts[0].stride) {
+                if expanded.is_empty() || !bind_widened_vertices(enc, &expanded, 0) {
+                    mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+                        "draw dropped: short-stride UP vertices could not be widened"
+                    );
+                    return;
+                }
+            } else {
+                let scratch_ptr = enc.alloc_scratch(bytes);
+                if usize::try_from(*size).is_ok_and(|size| size > SET_BYTES_MAX) {
+                    enc.bump_up_vertex_oversized();
+                }
+                enc.emit_command(Command::set_vertex_bytes(scratch_ptr, *size, 0));
+                // Inline slot-0 bind clobbers the real Metal vertex-buffer
+                // binding; drop the cached bound-VB so the next bound draw
+                // re-emits its `setVertexBuffer` instead of reading these bytes.
+                enc.last_bound().invalidate_vertex_buffer();
             }
-            enc.emit_command(Command::set_vertex_bytes(scratch_ptr, *size, 0));
-            // Inline slot-0 bind clobbers the real Metal vertex-buffer
-            // binding; drop the cached bound-VB so the next bound draw
-            // re-emits its `setVertexBuffer` instead of reading these bytes.
-            enc.last_bound().invalidate_vertex_buffer();
         }
         VertexSource::Bound { .. } => {
             for b in vertex_source.bindings() {
@@ -2245,6 +2340,32 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
                 if !layout.is_used() {
                     // Bound but not read by the declaration's consumed
                     // attributes: nothing to bind.
+                    continue;
+                }
+                if layout.stride > b.stride && b.stride > 0 {
+                    let Some(src) = bound_stream_bytes(b) else {
+                        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+                            "draw dropped: short-stride stream {slot} has no CPU backing to widen"
+                        );
+                        return;
+                    };
+                    let src = if layout.step == VertexStepFunction::PerVertex {
+                        per_vertex_prefix(src, b.stride, &index_source)
+                    } else {
+                        src
+                    };
+                    let Some(expanded) = widened_vertices(src, b.stride, layout.stride) else {
+                        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+                            "draw dropped: short-stride stream {slot} could not be widened"
+                        );
+                        return;
+                    };
+                    if expanded.is_empty() || !bind_widened_vertices(enc, &expanded, slot) {
+                        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+                            "draw dropped: short-stride stream {slot} could not be widened"
+                        );
+                        return;
+                    }
                     continue;
                 }
                 let (buffer_handle, staged) = enc.ensure_vbib_mtl_buffer(
