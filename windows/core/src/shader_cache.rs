@@ -514,6 +514,12 @@ impl CacheEntry {
         }
     }
 
+    /// The retained DXSO and specialization inputs; `None` for fixed-function records.
+    #[must_use]
+    pub const fn source(&self) -> Option<&ShaderSource> {
+        self.source.as_ref()
+    }
+
     #[must_use]
     pub const fn needs_regeneration(&self) -> bool {
         self.emitter_version != SHADER_EMITTER_VERSION
@@ -907,6 +913,14 @@ pub struct CacheRecords {
     pub needs_compaction: bool,
     /// End of the last complete, checksum-verified chunk.
     valid_len: usize,
+}
+
+impl CacheRecords {
+    /// End of the last complete, checksum-verified chunk; short of the file length when torn.
+    #[must_use]
+    pub const fn valid_len(&self) -> usize {
+        self.valid_len
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]

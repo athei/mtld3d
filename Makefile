@@ -83,10 +83,11 @@ WINEBUILD  := $(WINE_SDK)/bin/winebuild
 WINESERVER := $(WINE_SDK)/bin/wineserver
 
 # Distribution bundles default to the production profile; PROD=0 overrides
-# for a quick release-profile bundle. So does `make bench`: `release` carries
-# debug assertions, whose checks would be most of what it measures. The
-# default holds for every goal of the invocation, so `bench` runs alone:
-# beside `test` it would build the suite's layer without debug assertions.
+# for a quick release-profile bundle. So do `make bench` and `make bench-host`:
+# `release` carries debug assertions, whose checks would be most of what they
+# measure. The default holds for every goal of the invocation, so each runs
+# alone: beside `test` it would build the suite's layer without debug
+# assertions.
 ifneq ($(filter bundle,$(MAKECMDGOALS)),)
 PROD ?= 1
 endif
@@ -109,6 +110,12 @@ PERF ?= 1
 ifneq ($(PROD) $(PERF),1 1)
 $(error `make bench-ab` builds both legs with PROD=1 PERF=1; PROD=$(PROD) PERF=$(PERF) would compare another profile)
 endif
+endif
+ifneq ($(filter bench-host,$(MAKECMDGOALS)),)
+ifneq ($(filter-out bench-host,$(MAKECMDGOALS)),)
+$(error `make bench-host` runs alone: its PROD=1 default would also apply to $(filter-out bench-host,$(MAKECMDGOALS)))
+endif
+PROD ?= 1
 endif
 
 ifeq ($(PROD),1)
@@ -336,7 +343,7 @@ TAG          ?= $(shell git describe --tags --exact-match 2>/dev/null)
 	install install-windows-i686 install-windows-x86_64 install-unix-x64 install-unix-arm64 \
 	bundle version-check stage clean-isolated clean-isolated-orphans \
 	configure-test-prefix configure-test-prefix-locked configure-test-prefix-session \
-	test test-unit test-e2e-i686 test-e2e-x86_64 bench bench-ab bench-compare clean-bench-ab \
+	test test-unit test-e2e-i686 test-e2e-x86_64 bench bench-ab bench-compare clean-bench-ab bench-host \
 	conformance conformance-i686 conformance-x86_64 \
 	conformance-baseline conformance-baseline-i686 conformance-baseline-x86_64 \
 	conformance-intel conformance-intel-i686 conformance-intel-x86_64 \
@@ -1133,6 +1140,25 @@ clean-bench-ab:
 		$(call clean_isolated_at,$$wt/.wine-isolated) ; \
 		git worktree remove --force "$$wt" ; \
 	done
+
+# The host emitter benchmark (NOT part of `make test` either):
+# `windows/core/examples/emit_corpus.rs` times DXSO parsing and MSL emission
+# and totals the size of the MSL, which is what Metal's compile time and so a
+# first-use stutter grows with. It always runs a synthetic fixed-function
+# corpus and a synthetic SM1-SM3 one; BENCH_CORPUS='<path> <path>' adds each
+# named `mtld3d_shaders.bin`, whose programmable records keep their DXSO, as a
+# corpus named after the directory holding it. The list is split on spaces, so
+# a path in it cannot contain one (or a quote). Game caches stay out of the
+# tree, so this is how their shaders get measured. Like `test-unit` it builds
+# for this machine's own arch and needs no install and no Wine; like `bench` it
+# builds with the production profile unless PROD=0 asks for `release`. The
+# table goes to stdout, and each corpus writes `bench-host_emit_<corpus>.metrics`
+# into LOG_DIR (default `.codex/evidence/bench`).
+bench-host:
+	mkdir -p '$(BENCH_DIR)' && rm -f '$(BENCH_DIR)'/bench-host_emit_*.metrics
+	cd windows && cargo +$(RUST_STABLE) run --profile $(PROFILE) -p mtld3d-core \
+		--target $(UNIX_NATIVE_TARGET) --example emit_corpus -- \
+		--metrics '$(abspath $(BENCH_DIR))' $(foreach path,$(BENCH_CORPUS),'$(abspath $(path))')
 
 fmt:
 	cd windows && cargo +$(RUST_NIGHTLY) fmt
