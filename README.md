@@ -54,7 +54,10 @@ at a fraction of the presented size and lets MetalFX upscale (with
 `render.lodBias` keeping texture detail at the presented size), `present.maxFps`
 caps the frame rate, and `color.hdr.enable` and `cursor.software` govern the
 HDR present path and the cursor overlay that comes with it, both on by default
-on a display with EDR headroom.
+on a display with EDR headroom. On such a display the HDR path expands the
+game's SDR frame into the headroom with an inverse tone map whose peak follows
+the display's live headroom, so a D3D9 game reads brighter than the SDR windows
+beside it; `color.hdr.enable = false` presents the plain SDR frame instead.
 
 Below the file and the environment sits a third layer. A few games need
 options nobody should have to discover, so mtld3d ships profiles for them,
