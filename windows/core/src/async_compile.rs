@@ -384,16 +384,16 @@ impl TextureHistory {
 /// `passes` holds the submission's passes and the texture binds recorded
 /// with them ([`PassState::pass_reads`]), judged before any pass rule
 /// removes or merges a pass. A pass is kept when a colour target it
-/// attaches or its depth plane is not rebuilt every frame, which includes a
-/// target already marked as feeding kept content; each texture it sampled
-/// that has a recent clear (no other can ever have a draw left out of it)
-/// is marked. Marking a texture can make a pass that writes into it kept,
-/// so the walk repeats until nothing new is marked, and a chain of scratch
-/// targets that sample each other into a kept one is marked whole in the
-/// submission that reads it. A link of the chain made by a `StretchRect` is
-/// judged when the copy runs, against what is marked by then, and a link
-/// across a mid-frame flush is judged in the later submission, so each such
-/// link can leave one more frame unprotected.
+/// attaches, its depth plane, or a stencil plane it writes is not rebuilt
+/// every frame, which includes a target already marked as feeding kept
+/// content; each texture it sampled that has a recent clear (no other can
+/// ever have a draw left out of it) is marked. Marking a texture can make a
+/// pass that writes into it kept, so the walk repeats until nothing new is
+/// marked, and a chain of scratch targets that sample each other into a
+/// kept one is marked whole in the submission that reads it. A link of the
+/// chain made by a `StretchRect` is judged when the copy runs, against what
+/// is marked by then, and a link across a mid-frame flush is judged in the
+/// later submission, so each such link can leave one more frame unprotected.
 pub fn mark_kept_reads(passes: &PassState, history: &mut ClearHistory) {
     let reads = passes.pass_reads();
     if reads.is_empty() || history.is_empty() {
@@ -457,7 +457,11 @@ fn pass_is_kept(passes: &PassState, history: &ClearHistory, index: usize) -> boo
     let depth_rebuilt = depth.is_null()
         || (history.regenerated(depth, pass.depth_level(), ClearPlanes::DEPTH)
             && !history.feeds_persistent(depth));
-    extra_kept || !depth_rebuilt
+    let stencil_rebuilt = depth.is_null()
+        || !pass.writes_stencil()
+        || (history.regenerated(depth, pass.depth_level(), ClearPlanes::STENCIL)
+            && !history.feeds_persistent(depth));
+    extra_kept || !depth_rebuilt || !stencil_rebuilt
 }
 
 /// What resolving a library or pipeline for a draw found.

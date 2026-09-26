@@ -662,3 +662,136 @@ fn built_shaders_under_new_pipeline_states_show_in_their_frame() {
 fn built_shaders_under_new_pipeline_states_into_an_uncleared_target_show_in_their_frame() {
     built_shaders_under_new_pipeline_states(ASYNC);
 }
+
+/// Sampling scratch content into retained stencil must protect the scratch producer.
+fn stencil_sample_dependency(entries: &'static str) {
+    use mtld3d_types::{
+        D3DCLEAR_STENCIL, D3DCLEAR_ZBUFFER, D3DCMP_ALWAYS, D3DCMP_EQUAL, D3DCMP_GREATER,
+        D3DFMT_INTZ, D3DRS_ALPHAFUNC, D3DRS_ALPHAREF, D3DRS_ALPHATESTENABLE, D3DRS_STENCILENABLE,
+        D3DRS_STENCILFUNC, D3DRS_STENCILPASS, D3DRS_STENCILREF, D3DRS_ZENABLE, D3DSTENCILOP_KEEP,
+        D3DSTENCILOP_REPLACE, D3DUSAGE_DEPTHSTENCIL,
+    };
+    let h = device_with(entries);
+    let scratch = h.create_texture(
+        64,
+        64,
+        1,
+        D3DUSAGE_RENDERTARGET,
+        D3DFMT_A8R8G8B8,
+        D3DPOOL_DEFAULT,
+    );
+    let scratch_rt = scratch.surface_level(0);
+    let ds = h.create_texture(
+        640,
+        480,
+        1,
+        D3DUSAGE_DEPTHSTENCIL,
+        D3DFMT_INTZ,
+        D3DPOOL_DEFAULT,
+    );
+    let ds_surface = ds.surface_level(0);
+    let backbuffer = h.render_target(0);
+    let cold = h.create_pixel_shader(&solid_ps(RED));
+    let textured = covering_triangle(0xFFFF_FFFF).map(|v| TexturedVertex {
+        x: v.x,
+        y: v.y,
+        z: v.z,
+        color: v.color,
+        u: 0.5,
+        v: 0.5,
+    });
+    // Clear both planes twice: depth, cleared again every frame below, is
+    // regenerated from the first consumer frame on, while stencil is never
+    // cleared again and so is retained.
+    for _ in 0..2 {
+        assert_eq!(h.begin_scene(), D3D_OK);
+        assert_eq!(h.set_depth_stencil_surface(&ds_surface), D3D_OK);
+        assert_eq!(
+            h.clear(D3DCLEAR_ZBUFFER | D3DCLEAR_STENCIL, 0, 1.0, 0),
+            D3D_OK
+        );
+        assert_eq!(h.end_scene(), D3D_OK);
+        assert_eq!(h.present(), D3D_OK);
+        let _ = h.read_pixel(320, 240);
+    }
+    // The first read marks scratch when its frame is submitted; the second is
+    // margin before the cold producer writes its mask.
+    for frame in 0..3 {
+        assert_eq!(h.begin_scene(), D3D_OK);
+        assert_eq!(h.clear_depth_stencil_surface(), D3D_OK);
+        assert_eq!(h.set_render_state(D3DRS_STENCILENABLE, 0), D3D_OK);
+        assert_eq!(h.set_render_state(D3DRS_ALPHATESTENABLE, 0), D3D_OK);
+        assert_eq!(h.set_render_state(D3DRS_ZENABLE, 0), D3D_OK);
+        assert_eq!(h.set_render_state(D3DRS_COLORWRITEENABLE, 15), D3D_OK);
+        assert_eq!(h.set_render_target(0, &scratch_rt), D3D_OK);
+        assert_eq!(h.clear_target(0), D3D_OK);
+        if frame == 2 {
+            assert_eq!(h.set_pixel_shader(&cold), D3D_OK);
+            assert_eq!(
+                h.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &covering_triangle(RED)),
+                D3D_OK
+            );
+        }
+        assert_eq!(h.clear_pixel_shader(), D3D_OK);
+        assert_eq!(h.set_render_target(0, &backbuffer), D3D_OK);
+        assert_eq!(h.set_depth_stencil_surface(&ds_surface), D3D_OK);
+        assert_eq!(h.clear_target(BLUE), D3D_OK);
+        assert_eq!(h.clear(D3DCLEAR_ZBUFFER, 0, 1.0, 0), D3D_OK);
+        assert_eq!(h.set_render_state(D3DRS_STENCILENABLE, 1), D3D_OK);
+        assert_eq!(h.set_render_state(D3DRS_STENCILFUNC, D3DCMP_ALWAYS), D3D_OK);
+        assert_eq!(
+            h.set_render_state(D3DRS_STENCILPASS, D3DSTENCILOP_REPLACE),
+            D3D_OK
+        );
+        assert_eq!(h.set_render_state(D3DRS_STENCILREF, 1), D3D_OK);
+        assert_eq!(h.set_render_state(D3DRS_ALPHATESTENABLE, 1), D3D_OK);
+        assert_eq!(h.set_render_state(D3DRS_ALPHAFUNC, D3DCMP_GREATER), D3D_OK);
+        assert_eq!(h.set_render_state(D3DRS_ALPHAREF, 127), D3D_OK);
+        assert_eq!(h.set_render_state(D3DRS_COLORWRITEENABLE, 0), D3D_OK);
+        assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1), D3D_OK);
+        assert_eq!(h.set_texture(0, &scratch), D3D_OK);
+        h.select_texture_stage(0);
+        assert_eq!(
+            h.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &textured),
+            D3D_OK
+        );
+        assert_eq!(h.clear_texture(0), D3D_OK);
+        h.select_diffuse_stage(0);
+        assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE), D3D_OK);
+        assert_eq!(h.end_scene(), D3D_OK);
+        assert_eq!(h.present(), D3D_OK);
+        let _ = h.read_pixel(320, 240);
+    }
+    assert_eq!(h.begin_scene(), D3D_OK);
+    assert_eq!(h.clear_target(BLUE), D3D_OK);
+    assert_eq!(h.set_render_state(D3DRS_ALPHATESTENABLE, 0), D3D_OK);
+    assert_eq!(h.set_render_state(D3DRS_STENCILFUNC, D3DCMP_EQUAL), D3D_OK);
+    assert_eq!(
+        h.set_render_state(D3DRS_STENCILPASS, D3DSTENCILOP_KEEP),
+        D3D_OK
+    );
+    assert_eq!(h.set_render_state(D3DRS_COLORWRITEENABLE, 15), D3D_OK);
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &covering_triangle(GREEN)),
+        D3D_OK
+    );
+    assert_eq!(h.end_scene(), D3D_OK);
+    assert_eq!(h.present(), D3D_OK);
+    assert_pixel_eq(
+        h.read_pixel(320, 240),
+        GREEN,
+        "the retained stencil includes the scratch producer",
+    );
+}
+
+/// A scratch draw contributing to retained stencil is kept with async compilation enabled.
+#[test]
+fn retained_stencil_keeps_its_sampled_scratch_producer() {
+    stencil_sample_dependency(ASYNC);
+}
+
+/// The same retained-stencil workload renders with draw skipping disabled.
+#[test]
+fn retained_stencil_sample_dependency_with_skipping_disabled() {
+    stencil_sample_dependency(SYNC);
+}

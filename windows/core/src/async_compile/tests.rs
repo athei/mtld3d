@@ -5,7 +5,9 @@ use super::{
     FEED_MEMORY_FRAMES, JobTicket, LibrarySlot, TicketSource, mark_kept_reads, may_skip_draw,
 };
 use crate::{
+    depth_stencil_state::DepthStencilSnapshot,
     passes::{BackbufferContents, FrameReset, PassState, UploadPassTarget},
+    pipeline_state::PipelineAttachFlags,
     render_scale::RenderScale,
 };
 
@@ -282,6 +284,14 @@ fn sample_into(passes: &mut PassState, target: MetalHandle<MTLTextureKind>, read
     passes.emit_command(Command::set_fragment_texture(read, 0));
 }
 
+/// Record a draw in the open pass that overwrites the stencil plane it attaches.
+fn write_stencil(passes: &mut PassState) {
+    passes.note_draw_depth_stencil(
+        &DepthStencilSnapshot::stencil_overwrite(),
+        PipelineAttachFlags::HAS_DEPTH | PipelineAttachFlags::HAS_STENCIL,
+    );
+}
+
 /// A kept pass marks the scratch target it samples; a rebuilt pass marks nothing.
 #[test]
 fn a_kept_pass_marks_what_it_samples() {
@@ -342,6 +352,76 @@ fn a_chain_of_scratch_targets_is_marked_in_one_submission() {
         history.feeds_persistent(first),
         "marking the second makes the pass writing it kept, and it read the first"
     );
+}
+
+/// A pass writing retained stencil keeps the scratch texture that controls its fragments.
+#[test]
+fn retained_stencil_marks_its_sampled_source() {
+    let scratch = texture(0x2000);
+    let depth = texture(0x4000);
+    let mut history = rebuilt(&[scratch]);
+    history.record(depth, 0, ClearPlanes::DEPTH);
+    history.begin_frame();
+    history.record(scratch, 0, ClearPlanes::COLOR);
+    history.record(depth, 0, ClearPlanes::DEPTH);
+    let mut passes = recording_passes();
+    passes.set_depth_stencil_attachment(depth, (64, 64), true, true);
+    sample_into(&mut passes, texture(0x1000), scratch.raw());
+    write_stencil(&mut passes);
+    assert!(history.regenerated(depth, 0, ClearPlanes::DEPTH));
+    assert!(!history.regenerated(depth, 0, ClearPlanes::STENCIL));
+    mark_kept_reads(&passes, &mut history);
+    assert!(
+        history.feeds_persistent(scratch),
+        "the stencil plane is retained even though depth and color are rebuilt"
+    );
+}
+
+/// Absent, inactive and fully rebuilt stencil leave scratch producers skippable.
+#[test]
+fn regenerated_depth_and_stencil_leave_sampled_sources_skippable() {
+    let scratch = texture(0x2000);
+    let depth = texture(0x4000);
+    for (has_stencil, writes_stencil) in [(false, false), (true, false), (true, true)] {
+        let mut history = rebuilt(&[scratch]);
+        let planes = if writes_stencil {
+            ClearPlanes::DEPTH | ClearPlanes::STENCIL
+        } else {
+            ClearPlanes::DEPTH
+        };
+        history.record(depth, 1, planes);
+        history.begin_frame();
+        history.record(scratch, 0, ClearPlanes::COLOR);
+        history.record(depth, 1, planes);
+        let mut passes = recording_passes();
+        passes.set_depth_stencil_attachment_level(depth, 1, (64, 64), true, has_stencil);
+        sample_into(&mut passes, texture(0x1000), scratch.raw());
+        if writes_stencil {
+            write_stencil(&mut passes);
+        }
+        mark_kept_reads(&passes, &mut history);
+        assert!(!history.feeds_persistent(scratch));
+    }
+}
+
+/// A stencil clear on a different mip does not regenerate the attached plane.
+#[test]
+fn retained_stencil_is_tracked_at_the_attached_mip() {
+    let scratch = texture(0x2000);
+    let depth = texture(0x4000);
+    let mut history = rebuilt(&[scratch]);
+    for _ in 0..2 {
+        history.begin_frame();
+        history.record(scratch, 0, ClearPlanes::COLOR);
+        history.record(depth, 1, ClearPlanes::DEPTH);
+        history.record(depth, 0, ClearPlanes::STENCIL);
+    }
+    let mut passes = recording_passes();
+    passes.set_depth_stencil_attachment_level(depth, 1, (64, 64), true, true);
+    sample_into(&mut passes, texture(0x1000), scratch.raw());
+    write_stencil(&mut passes);
+    mark_kept_reads(&passes, &mut history);
+    assert!(history.feeds_persistent(scratch));
 }
 
 /// The oldest urgent jobs are left to the idle workers, and only the rest may be stolen.
