@@ -13,7 +13,6 @@ pub use mtld3d_core::shader_cache::{
 };
 use mtld3d_core::{
     async_compile::{ClearPlanes, DeferredState, JobTicket, LibrarySlot, Resolution},
-    build_index::BuildLookup,
     convert::{d3d_depth_bias_to_clip, d3d_to_metal_cull, d3d_to_metal_fill},
     depth_stencil_state::{DepthStencilSnapshot, STENCIL_MASK_BITS},
     dirty_range::{indexed_vb_range_lower_bound, nonindexed_vb_range},
@@ -1851,11 +1850,11 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
     //    deciding whether to wait, defer or skip the draw.
     let t_lookup = CycleAddTimer::start(enc.op_sub_detail_ptr(OpSubDetail::RLookup));
     let libraries = match enc.lookup_vs_library(vs) {
-        BuildLookup::Ready(vs_handles) => match enc.lookup_ps_library(ps, ps_variant) {
-            BuildLookup::Ready(ps_handles) => Some((vs_handles, ps_handles)),
-            BuildLookup::Unknown | BuildLookup::Failed => None,
+        Some(Some(vs_handles)) => match enc.lookup_ps_library(ps, ps_variant) {
+            Some(Some(ps_handles)) => Some((*vs_handles, *ps_handles)),
+            None | Some(None) => None,
         },
-        BuildLookup::Unknown | BuildLookup::Failed => None,
+        None | Some(None) => None,
     };
     let Some((vs_handles, ps_handles)) = libraries.or_else(|| {
         resolve_libraries_slow(

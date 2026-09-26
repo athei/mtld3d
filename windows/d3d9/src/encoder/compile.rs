@@ -625,19 +625,19 @@ enum Begun {
 impl FrameEncoder {
     /// Probe the VS source-key index without starting or waiting for a build.
     ///
-    /// Kept separate from async resolution so a warm draw can inline its
-    /// borrow-probe without carrying a pending build's ticket or cold work.
+    /// The borrowed outcome is one pointer: unknown, recorded failure, or
+    /// ready handles. It stays borrowed until both warm stages are known.
     #[inline]
-    pub fn lookup_vs_library(&self, source: &VsSource) -> BuildLookup<StageLibHandles> {
+    pub fn lookup_vs_library(&self, source: &VsSource) -> Option<&Option<StageLibHandles>> {
         match source {
-            VsSource::FixedFunction { key, .. } => self.ff_vs_libs.lookup(key),
+            VsSource::FixedFunction { key, .. } => self.ff_vs_libs.lookup_entry(key),
             VsSource::Programmable {
                 vs_id,
                 provided_input_mask,
                 clip_plane_count,
                 sampler_kinds,
                 ..
-            } => self.prog_vs_libs.lookup(&(
+            } => self.prog_vs_libs.lookup_entry(&(
                 *vs_id,
                 *provided_input_mask,
                 *clip_plane_count,
@@ -660,11 +660,10 @@ impl FrameEncoder {
     /// as final as a rejected one.
     #[inline]
     pub fn resolve_vs_library(&mut self, source: &VsSource) -> Resolution<StageLibHandles> {
-        let known = self.lookup_vs_library(source);
-        match known {
-            BuildLookup::Ready(handles) => return Resolution::Ready(handles),
-            BuildLookup::Failed => return Resolution::Failed,
-            BuildLookup::Unknown => {}
+        match self.lookup_vs_library(source) {
+            Some(Some(handles)) => return Resolution::Ready(*handles),
+            Some(None) => return Resolution::Failed,
+            None => {}
         }
         self.resolve_vs_library_miss(source)
     }
@@ -784,19 +783,22 @@ impl FrameEncoder {
 
     /// Probe the PS source-key and variant index without async resolution.
     ///
-    /// The same borrowed keys serve warm draws and the full slow resolver.
+    /// Preserve the recorded failure inside the borrowed outcome, so the
+    /// full resolver distinguishes it from a key it still needs to build.
     #[inline]
     pub fn lookup_ps_library(
         &self,
         source: &PsSource,
         variant: VariantKey,
-    ) -> BuildLookup<StageLibHandles> {
+    ) -> Option<&Option<StageLibHandles>> {
         match source {
             PsSource::FixedFunction { key, .. } => self
                 .ff_ps_libs
                 .get(key)
-                .map_or(BuildLookup::Unknown, |variants| variants.lookup(&variant)),
-            PsSource::Programmable { ps_id, .. } => self.prog_ps_libs.lookup(&(*ps_id, variant)),
+                .and_then(|variants| variants.lookup_entry(&variant)),
+            PsSource::Programmable { ps_id, .. } => {
+                self.prog_ps_libs.lookup_entry(&(*ps_id, variant))
+            }
         }
     }
 
@@ -813,11 +815,10 @@ impl FrameEncoder {
         source: &PsSource,
         variant: VariantKey,
     ) -> Resolution<StageLibHandles> {
-        let known = self.lookup_ps_library(source, variant);
-        match known {
-            BuildLookup::Ready(handles) => return Resolution::Ready(handles),
-            BuildLookup::Failed => return Resolution::Failed,
-            BuildLookup::Unknown => {}
+        match self.lookup_ps_library(source, variant) {
+            Some(Some(handles)) => return Resolution::Ready(*handles),
+            Some(None) => return Resolution::Failed,
+            None => {}
         }
         self.resolve_ps_library_miss(source, variant)
     }

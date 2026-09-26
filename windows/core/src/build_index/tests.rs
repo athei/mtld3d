@@ -120,3 +120,22 @@ fn ready_skips_failures_and_len_counts_them() {
     assert_eq!(resolver.index.len(), 2);
     assert_eq!(resolver.index.ready().count(), 2);
 }
+
+/// Borrowed probes preserve every outcome and follow the same reset policy as copied probes.
+#[test]
+fn borrowed_entries_distinguish_unknown_failure_and_ready_handles() {
+    let mut index = BuildIndex::<String, [u64; 2]>::default();
+    assert_eq!(index.lookup_entry("unknown"), None);
+    index.record("ready".to_owned(), Some([11, 23]));
+    index.record("failed".to_owned(), None);
+    assert_eq!(index.lookup_entry("ready"), Some(&Some([11, 23])));
+    assert_eq!(index.lookup_entry("failed"), Some(&None));
+    assert_eq!(index.lookup("ready"), BuildLookup::Ready([11, 23]));
+    assert_eq!(index.lookup("failed"), BuildLookup::Failed);
+    assert_eq!(index.lookup("unknown"), BuildLookup::Unknown);
+    index.forget_failures();
+    assert_eq!(index.lookup_entry("failed"), None);
+    assert_eq!(index.lookup_entry("ready"), Some(&Some([11, 23])));
+    index.clear();
+    assert_eq!(index.lookup_entry("ready"), None);
+}

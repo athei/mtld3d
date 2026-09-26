@@ -41,13 +41,26 @@ impl<K, H> Default for BuildIndex<K, H> {
 }
 
 impl<K: Eq + Hash, H: Copy> BuildIndex<K, H> {
+    /// Borrow the recorded outcome of `key` in one probe without copying its handles.
+    ///
+    /// `None` means the key is unknown, `Some(None)` is a recorded failure,
+    /// and `Some(Some(handles))` is a successful build. The borrowed outcome
+    /// cannot outlive this index or be held across a mutation of it.
+    pub fn lookup_entry<Q>(&self, key: &Q) -> Option<&Option<H>>
+    where
+        K: Borrow<Q>,
+        Q: Eq + Hash + ?Sized,
+    {
+        self.entries.get(key)
+    }
+
     /// What is known about `key`, in one probe and without cloning it.
     pub fn lookup<Q>(&self, key: &Q) -> BuildLookup<H>
     where
         K: Borrow<Q>,
         Q: Eq + Hash + ?Sized,
     {
-        match self.entries.get(key) {
+        match self.lookup_entry(key) {
             Some(Some(handles)) => BuildLookup::Ready(*handles),
             Some(None) => BuildLookup::Failed,
             None => BuildLookup::Unknown,
