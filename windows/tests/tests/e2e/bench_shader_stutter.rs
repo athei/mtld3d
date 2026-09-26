@@ -14,9 +14,10 @@
 //!
 //! The measured frames are the `MEASURED_FRAMES` that introduce shaders.
 //! Base frames follow until [`IDLE_TAIL`] has passed without a new shader
-//! and the whole span has run [`MIN_SPAN`], so a `PERF=1` build writes at
-//! least one whole summary window, and any account of compiles that waits
-//! for a quiet spell has had one; the report copies the Compilation rows of
+//! and a `PERF=1` build has written one whole summary window inside the span
+//! (a build that writes none has shown none within a window of the span's
+//! start), or at most until the span has run [`MIN_SPAN`], so any account of
+//! compiles that waits for a quiet spell has had one; the report copies the Compilation rows of
 //! every window in the span, which is where a layer that skips draws whose
 //! pipeline is not ready says how many it skipped and how long installs
 //! took. Nothing the measured frames draw is there to be checked, so the
@@ -44,8 +45,8 @@ use mtld3d_types::{
 
 use crate::bench::{
     Class, Direction, FrameClock, FrameWork, IDENTITY_ROWS, LayerLog, Metrics, Model, STRIDE,
-    TEXTURED_DECL, TscClock, Value, grid, material_ps, material_vs, memory_section, ok,
-    pattern_texture, ratio, world_rows, write_report,
+    TEXTURED_DECL, TscClock, Value, WindowWatch, grid, material_ps, material_vs, memory_section,
+    ok, pattern_texture, ratio, world_rows, write_report,
 };
 
 const WIDTH: u32 = 1280;
@@ -61,7 +62,7 @@ const WARM_UP_FRAMES: u32 = 30;
 const MEASURED_FRAMES: u32 = 200;
 /// Time without a new shader before the run ends.
 const IDLE_TAIL: Duration = Duration::from_secs(2);
-/// The least time from the first measured frame to the end of the run.
+/// The longest the span waits for a whole perf window, from the first measured frame.
 const MIN_SPAN: Duration = Duration::from_secs(12);
 /// The most verification frames before a black cell counts as never drawn.
 const VERIFY_FRAMES: u32 = 100;
@@ -134,7 +135,10 @@ fn stutter(name: &str, per_frame: u32, offscreen: u32) {
     }
     let introduced = TscClock::now();
     let mut settle = FrameClock::start(SETTLE_CAPACITY);
-    while TscClock::since(introduced) < IDLE_TAIL || TscClock::since(started) < MIN_SPAN {
+    let mut windows = WindowWatch::new(&log, from);
+    while TscClock::since(introduced) < IDLE_TAIL
+        || !(windows.whole_window(started) || TscClock::since(started) >= MIN_SPAN)
+    {
         assert!(h.pump(), "WM_QUIT while the frames settle");
         bench.base_frame();
         ok(h.end_scene(), "EndScene");

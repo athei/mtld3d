@@ -49,8 +49,8 @@ use mtld3d_types::{
 };
 
 use crate::bench::{
-    CallTimes, Class, Direction, FrameClock, FrameWork, LayerLog, Metrics, STRIDE, TscClock, Value,
-    grid, memory_section, ok, ratio, write_report,
+    CallTimes, Class, Direction, FrameClock, FrameWork, LayerLog, MEASURED_SPAN, Metrics, STRIDE,
+    TscClock, Value, grid, memory_section, ok, ratio, write_report,
 };
 
 /// The back buffer, about the size of a windowed game.
@@ -80,9 +80,8 @@ const CHUNK_QUADS: u32 = 448;
 /// Distinct contents each kind of write cycles through.
 const VARIANTS: u32 = 8;
 const WARM_UP_FRAMES: u32 = 60;
-/// The measured phase is at least this many frames and at least [`MIN_MEASURED`] long.
+/// The measured phase is at least this many frames and at least [`MEASURED_SPAN`] long.
 const MEASURED_FRAMES: usize = 600;
-const MIN_MEASURED: Duration = Duration::from_secs(12);
 const FVF: u32 = D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1;
 
 /// Dynamic ring appends, wraps, static rewrites and preserving locks, repeatedly: warm up, time.
@@ -109,23 +108,33 @@ fn dynamic_buffer_churn() {
     let log = LayerLog::find(since);
     let warm_up = TscClock::since(started);
     let warm = MemorySample::now();
-    scene.times = LockTimes::default();
 
-    let from = log.mark();
-    let mut clock = FrameClock::start(MEASURED_FRAMES * 4);
     let mut tick = WARM_UP_FRAMES;
-    while clock.frames() < MEASURED_FRAMES || clock.elapsed() < MIN_MEASURED {
+    let start = log.start_span(started, || {
+        assert!(h.pump(), "WM_QUIT outside the measured frames");
+        scene.render(tick);
+        ok(h.present(), "Present");
+        tick += 1;
+    });
+    scene.times = LockTimes::default();
+    let mut clock = FrameClock::start(MEASURED_FRAMES * 4);
+    while clock.frames() < MEASURED_FRAMES || clock.elapsed() < MEASURED_SPAN {
         assert!(h.pump(), "WM_QUIT during the measured frames");
         scene.render(tick);
         clock.present(&h);
         tick += 1;
     }
-    let to = log.mark();
     let end = MemorySample::now();
+    let times = std::mem::take(&mut scene.times);
+    let span = start.end(&log, || {
+        assert!(h.pump(), "WM_QUIT outside the measured frames");
+        scene.render(tick);
+        ok(h.present(), "Present");
+        tick += 1;
+    });
 
     let stats = clock.stats();
     let work = clock.work_stats();
-    let times = &scene.times;
     let body = format!(
         "shape: back buffer {WIDTH}x{HEIGHT} X8R8G8B8, fixed-function quads\n\
          per frame: {vb} vertex-buffer locks ({PARTICLE_LOCKS} particle, {UI_LOCKS} UI and \
@@ -136,7 +145,7 @@ fn dynamic_buffer_churn() {
          whole-buffer-locked dynamic buffer {cache} KiB, static buffers {statics} KiB each\n\
          warm-up: {WARM_UP_FRAMES} frames in {warm_up:.2?}\n\
          measured: {frames} frames in {elapsed:.2?} (at least {MEASURED_FRAMES} frames \
-         and {MIN_MEASURED:?}), {wraps} ring wraps, {preserves} preserving locks\n\
+         and {MEASURED_SPAN:?}, {start}), {wraps} ring wraps, {preserves} preserving locks\n\
          frame time (Present to Present): {row}\n\
          API work (Present return to Present call): {work_row}\n\
          NOOVERWRITE append (Lock, copy, Unlock): {append_row}\n\
@@ -164,7 +173,8 @@ fn dynamic_buffer_churn() {
         rewrite_row = times.rewrite.row(),
         overlap_row = times.overlap.row(),
         memory = memory_section(&warm, &end),
-        perf = log.perf_rows(from, to).section(),
+        start = span.start(),
+        perf = span.perf_rows(&log).section(),
     );
     let mut metrics = Metrics::new("buffers", &h, &tsc);
     metrics.frame_rows("frame", &stats);
@@ -203,7 +213,7 @@ fn dynamic_buffer_churn() {
     // The frames lock the same kinds at the same rates, but a ring's wrap or
     // a preserving lock falls on some frames and not others, so a window's
     // per-frame counts depend on where it starts.
-    metrics.perf(&log.perf_kv_last_full(from, to), &FrameWork::Varying);
+    metrics.perf(&span.perf_kv(&log), &FrameWork::Varying);
     write_report(&metrics, &log, &body);
 }
 

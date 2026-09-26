@@ -53,10 +53,7 @@
 //! The metrics file carries one `shape` record per pass, computed from the
 //! constants and the run list below rather than read back from the layer.
 
-use std::{
-    cell::Cell,
-    time::{Duration, SystemTime},
-};
+use std::{cell::Cell, time::SystemTime};
 
 use mtld3d_tests::{
     Harness, HarnessConfig, IndexBuffer, MemorySample, PixelShader, Surface, Texture,
@@ -80,9 +77,9 @@ use mtld3d_types::{
 };
 
 use crate::bench::{
-    Class, Direction, FrameClock, FrameWork, IDENTITY_ROWS, LayerLog, Metrics, Model, PassShape,
-    STRIDE, TEXTURED_DECL, TscClock, Value, def, grid, material_ps, material_vs, memory_section,
-    ok, pattern_texture, ratio, rs, transform, world_rows, write_report,
+    Class, Direction, FrameClock, FrameWork, IDENTITY_ROWS, LayerLog, MEASURED_SPAN, Metrics,
+    Model, PassShape, STRIDE, TEXTURED_DECL, TscClock, Value, def, grid, material_ps, material_vs,
+    memory_section, ok, pattern_texture, ratio, rs, transform, world_rows, write_report,
 };
 
 /// The back buffer, about the size of a windowed game.
@@ -264,13 +261,8 @@ const UI_TEXTURES: u32 = 8;
 /// Grid sizes of the static meshes, one vertex buffer each.
 const MESH_GRIDS: [u16; 4] = [4, 6, 8, 10];
 const WARM_UP_FRAMES: u32 = 60;
-/// The measured phase is at least this many frames and at least [`MIN_MEASURED`] long.
-///
-/// The duration floor is what puts one whole five-second window of a
-/// `PERF=1` build's summary inside the measured frames: the first window
-/// written after they start began before them.
+/// The measured phase is at least this many frames and at least [`MEASURED_SPAN`] long.
 const MEASURED_FRAMES: usize = 600;
-const MIN_MEASURED: Duration = Duration::from_secs(12);
 /// The scene's viewport; the sky draws alone use the far end of the depth range.
 const SCENE_VIEWPORT: D3DVIEWPORT9 = viewport(0, 0, WIDTH, HEIGHT, 0.0, 0.94);
 const SKY_VIEWPORT: D3DVIEWPORT9 = viewport(0, 0, WIDTH, HEIGHT, 0.999_023_44, 1.0);
@@ -309,17 +301,27 @@ fn wow_335a_busy_frame() {
     let warm_up = TscClock::since(started);
     let warm = MemorySample::now();
 
-    let from = log.mark();
-    let mut clock = FrameClock::start(MEASURED_FRAMES * 4);
     let mut tick = WARM_UP_FRAMES;
-    while clock.frames() < MEASURED_FRAMES || clock.elapsed() < MIN_MEASURED {
+    let start = log.start_span(started, || {
+        assert!(h.pump(), "WM_QUIT outside the measured frames");
+        frame.render(tick);
+        ok(h.present(), "Present");
+        tick += 1;
+    });
+    let mut clock = FrameClock::start(MEASURED_FRAMES * 4);
+    while clock.frames() < MEASURED_FRAMES || clock.elapsed() < MEASURED_SPAN {
         assert!(h.pump(), "WM_QUIT during the measured frames");
         frame.render(tick);
         clock.present(&h);
         tick += 1;
     }
-    let to = log.mark();
     let end = MemorySample::now();
+    let span = start.end(&log, || {
+        assert!(h.pump(), "WM_QUIT outside the measured frames");
+        frame.render(tick);
+        ok(h.present(), "Present");
+        tick += 1;
+    });
 
     let stats = clock.stats();
     let work = clock.work_stats();
@@ -342,7 +344,7 @@ fn wow_335a_busy_frame() {
          function for the sky, the glow and composite vertices and the minimap\n\
          warm-up: {WARM_UP_FRAMES} frames in {warm_up:.2?}\n\
          measured: {frames} frames in {elapsed:.2?} (at least {MEASURED_FRAMES} frames \
-         and {MIN_MEASURED:?})\n\
+         and {MEASURED_SPAN:?}, {start})\n\
          frame time (Present to Present): {row}\n\
          API work (Present return to Present call): {work}\n{memory}{perf}{warm_up_compiles}",
         draws = DRAWS_PER_FRAME,
@@ -363,9 +365,10 @@ fn wow_335a_busy_frame() {
         row = stats.row(),
         work = work.row(),
         memory = memory_section(&warm, &end),
-        perf = log.perf_rows(from, to).section(),
+        start = span.start(),
+        perf = span.perf_rows(&log).section(),
         warm_up_compiles = log
-            .first_window_rows(to)
+            .first_window_rows(span.to())
             .map_or_else(String::new, |rows| format!(
                 "perf: this device's first window, its warm-up compiles\n{rows}"
             )),
@@ -398,7 +401,7 @@ fn wow_335a_busy_frame() {
     };
     metrics.meta("depth_path", depth_path);
     metrics.memory(&warm, &end);
-    metrics.perf(&log.perf_kv_last_full(from, to), &FrameWork::Fixed);
+    metrics.perf(&span.perf_kv(&log), &FrameWork::Fixed);
     metrics.meta("backbuffer", &format!("{WIDTH}x{HEIGHT}"));
     metrics.shapes(&pass_shapes());
     write_report(&metrics, &log, &body);

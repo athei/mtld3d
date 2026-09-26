@@ -25,11 +25,30 @@
 //! behind `Present`. Each benchmark also samples the process's address space
 //! after its warm-up and at the end of its measured frames, and its peak
 //! working set.
+//!
+//! The measured frames start where a perf window opens and last one window
+//! ([`MEASURED_SPAN`]), so a `PERF=1` build's metrics come from one whole
+//! window with no warm-up frame in it, covering approximately the measured
+//! frames: the span starts when the window's opening shows in the log, a
+//! poll and the log thread's latency after it, and a frame floor can make
+//! it outlast the window. The layer opens a device's
+//! first window at its first frame and closes each after five seconds, so
+//! after its warm-up a benchmark runs unmeasured frames until the log shows
+//! the `perf-kv` line that closes the window the warm-up began in
+//! ([`LayerLog::start_span`]), measures from there, and after the span runs
+//! unmeasured frames again until the window it measured has written its own
+//! line ([`SpanStart::end`]). A log that already holds perf windows is
+//! waited on for up to two windows, and a line that does not come then fails
+//! the benchmark, since a round without its window would lack the metrics
+//! the others carry. A log with none two windows and a grace after the first
+//! frame belongs to a build that writes none (or a run whose filter hides
+//! them), which then measures the same length from wherever the wait stopped.
 
 use core::fmt::Write as _;
 use std::{
     collections::BTreeMap,
     fs,
+    io::{Read as _, Seek as _, SeekFrom},
     path::{Path, PathBuf},
     time::{Duration, SystemTime},
 };
@@ -58,6 +77,28 @@ const COMMON_META: [&str; 10] = [
 
 /// Back-to-back counter reads whose smallest nonzero step [`TscClock`] reports as its granularity.
 const GRANULARITY_READS: u32 = 100_000;
+
+/// How long one perf window of the layer lasts, the one number both sides read.
+pub const PERF_WINDOW: Duration = Duration::from_secs(mtld3d_core::perf::SUMMARY_INTERVAL_SECS);
+
+/// How long a benchmark's measured frames last at least: one perf window.
+///
+/// Started where a window opens ([`LayerLog::start_span`]), the span holds
+/// that one window whole and approximately no more. At the frame rates the benchmarks run (a
+/// millisecond a frame or less) it is thousands of frames, far more than a
+/// p99 needs.
+pub const MEASURED_SPAN: Duration = PERF_WINDOW;
+
+/// How long a window's `perf-kv` line may take past its due time before a wait counts it late.
+///
+/// The encoder closes a window at the end of the first frame past its
+/// length and the log thread writes the line a moment later. A wait allows
+/// a whole window on top of this before it gives up (see
+/// [`LayerLog::start_span`]).
+const WINDOW_GRACE: Duration = Duration::from_secs(1);
+
+/// How often a wait for a perf window reads what the layer log has gained.
+const LOG_POLL: Duration = Duration::from_millis(10);
 
 /// The marker that opens one window of the `mtld3d::perf` summary in the layer log.
 const PERF_HEADER: &str = "── perf  window=";
@@ -489,6 +530,58 @@ impl LayerLog {
     /// lies wholly inside and is [`PerfRows::Full`]. The last such window is
     /// the one returned.
     pub fn perf_rows(&self, from: u64, to: u64) -> PerfRows {
+        self.window_rows_between(from, to, false)
+    }
+
+    /// Run unmeasured frames until a perf window opens after the warm-up, and start the span there.
+    ///
+    /// `started` is the counter reading taken before the warm-up's first
+    /// frame, the frame that opened the device's first window. `frame`
+    /// renders and presents one frame the benchmark does not time. The
+    /// wait ends at the first `perf-kv` line written after the call: the
+    /// window it closes held the warm-up, the one that opens with it holds
+    /// none. With no such line two windows and [`WINDOW_GRACE`] after
+    /// `started` and none anywhere in the log, the build writes no perf
+    /// windows (or the run's filter hides them), and the span starts where
+    /// the wait stopped, with nothing to align to.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the log holds perf windows and none closes within two
+    /// windows and the grace of the warm-up's end: a round of a `PERF=1`
+    /// build without its window would lack the `perf.*` metrics its other
+    /// rounds carry, which a comparison cannot pair.
+    pub fn start_span(&self, started: u64, mut frame: impl FnMut()) -> SpanStart {
+        let mut watch = WindowWatch::new(self, self.mark());
+        let warmed = TscClock::now();
+        let limit = PERF_WINDOW * 2 + WINDOW_GRACE;
+        loop {
+            if watch.look() > 0 {
+                return SpanStart {
+                    from: watch.last_end,
+                    aligned: true,
+                };
+            }
+            if TscClock::since(started) > limit && !watch.log_has_windows() {
+                return SpanStart {
+                    from: self.mark(),
+                    aligned: false,
+                };
+            }
+            assert!(
+                TscClock::since(warmed) <= limit,
+                "no perf window closed in {limit:?} after the warm-up, though the layer log {} \
+                 holds perf windows",
+                self.path
+                    .as_deref()
+                    .map_or_else(String::new, |path| path.display().to_string())
+            );
+            frame();
+        }
+    }
+
+    /// The perf window rows between `from` and `to`; `first_whole` when the first began at `from`.
+    fn window_rows_between(&self, from: u64, to: u64, first_whole: bool) -> PerfRows {
         let Some(bytes) = self.path.as_deref().and_then(|path| fs::read(path).ok()) else {
             return PerfRows::Absent;
         };
@@ -501,7 +594,7 @@ impl LayerLog {
             .collect();
         match headers.as_slice() {
             [] => PerfRows::Absent,
-            [only] => PerfRows::Partial(window_rows(&lines, *only, &PERF_BLOCKS)),
+            [only] if !first_whole => PerfRows::Partial(window_rows(&lines, *only, &PERF_BLOCKS)),
             [.., last] => PerfRows::Full(window_rows(&lines, *last, &PERF_BLOCKS)),
         }
     }
@@ -624,6 +717,203 @@ impl LayerLog {
     /// Where the log is, for the report; `None` when no log was found.
     pub fn path(&self) -> Option<&Path> {
         self.path.as_deref()
+    }
+
+    /// The bytes of the log from `at` to its current end, `None` when it cannot be read.
+    fn read_from(&self, at: u64) -> Option<Vec<u8>> {
+        let mut file = fs::File::open(self.path.as_deref()?).ok()?;
+        file.seek(SeekFrom::Start(at)).ok()?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).ok()?;
+        Some(bytes)
+    }
+}
+
+/// Where a benchmark's measured frames start in its layer log, and whether a window opens there.
+pub struct SpanStart {
+    from: u64,
+    aligned: bool,
+}
+
+impl SpanStart {
+    /// End the measured frames: run unmeasured ones until the window they started on has closed.
+    ///
+    /// The span has lasted at least [`MEASURED_SPAN`], so the window that
+    /// opened at its start closes within a frame of its end; `frame`
+    /// renders and presents one more frame until that window's `perf-kv`
+    /// line is in the log. The span then ends at the last such line
+    /// written, so every window it holds has its line. A span with no
+    /// window to align to ends where the log is.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the line has not come a window and [`WINDOW_GRACE`]
+    /// after the measured frames: the round would lack its `perf.*` metrics.
+    pub fn end(self, log: &LayerLog, mut frame: impl FnMut()) -> Span {
+        if !self.aligned {
+            return Span {
+                from: self.from,
+                to: log.mark(),
+                aligned: false,
+            };
+        }
+        let mut watch = WindowWatch::new(log, self.from);
+        let ended = TscClock::now();
+        loop {
+            if watch.look() > 0 {
+                return Span {
+                    from: self.from,
+                    to: watch.last_end,
+                    aligned: true,
+                };
+            }
+            assert!(
+                TscClock::since(ended) <= PERF_WINDOW + WINDOW_GRACE,
+                "the perf window the measured frames started on did not close in {:?} after \
+                 them (layer log {})",
+                PERF_WINDOW + WINDOW_GRACE,
+                log.path
+                    .as_deref()
+                    .map_or_else(String::new, |path| path.display().to_string())
+            );
+            frame();
+        }
+    }
+}
+
+/// The part of the layer log a benchmark's measured frames cover.
+pub struct Span {
+    from: u64,
+    to: u64,
+    /// The span started where a perf window opened, so every window in it is whole.
+    aligned: bool,
+}
+
+impl Span {
+    /// Where the span ends in the log.
+    pub const fn to(&self) -> u64 {
+        self.to
+    }
+
+    /// The perf window rows the report copies: the last window wholly inside the span.
+    pub fn perf_rows(&self, log: &LayerLog) -> PerfRows {
+        log.window_rows_between(self.from, self.to, self.aligned)
+    }
+
+    /// The `perf-kv` pairs the metrics take: every window of an aligned span, else the last whole.
+    ///
+    /// An aligned span holds one window, or more when its frame floor
+    /// outlasted [`MEASURED_SPAN`], and none of them began before it. A
+    /// span with nothing to align to holds a whole window only when it is
+    /// longer than two windows, which [`LayerLog::perf_kv_last_full`] picks.
+    pub fn perf_kv(&self, log: &LayerLog) -> Vec<Option<String>> {
+        if self.aligned {
+            log.perf_kv(self.from, self.to)
+        } else {
+            log.perf_kv_last_full(self.from, self.to)
+        }
+    }
+
+    /// Where the span started, for a report's measured row.
+    pub const fn start(&self) -> &'static str {
+        if self.aligned {
+            "from the opening of a perf window"
+        } else {
+            "no perf window to start on"
+        }
+    }
+}
+
+/// The `perf-kv` lines a layer log gains after a mark, counted as they arrive.
+///
+/// Each look reads only what the log gained since the one before, from the
+/// start of the line the previous look stopped in, so a log that grows fast
+/// (a shape run's pass trace) is read once however long the wait. Looks are
+/// at most [`LOG_POLL`] apart; a call in between answers from the last one,
+/// so a caller asks every frame and pays a counter read.
+pub struct WindowWatch<'l> {
+    log: &'l LayerLog,
+    /// Where the next look reads from, the start of a line.
+    at: u64,
+    /// `perf-kv` lines seen after the mark.
+    windows: usize,
+    /// The end of the last `perf-kv` line seen, the mark until there is one.
+    last_end: u64,
+    /// The counter reading of the last look, `None` before the first.
+    looked: Option<u64>,
+    /// Whether the log held a `perf-kv` line before the mark, read the first time it matters.
+    before: Option<bool>,
+}
+
+impl<'l> WindowWatch<'l> {
+    /// A watch on what `log` gains after `from`.
+    pub const fn new(log: &'l LayerLog, from: u64) -> Self {
+        Self {
+            log,
+            at: from,
+            windows: 0,
+            last_end: from,
+            looked: None,
+            before: None,
+        }
+    }
+
+    /// Whether the span from the mark holds a whole perf window yet, or none can come.
+    ///
+    /// The first `perf-kv` line after the mark closes a window that began
+    /// before it and the second one wholly inside it. A build that writes
+    /// no windows has shown none two windows and [`WINDOW_GRACE`] after
+    /// `started`, a counter reading taken before the mark.
+    pub fn whole_window(&mut self, started: u64) -> bool {
+        self.look() >= 2
+            || (TscClock::since(started) > PERF_WINDOW * 2 + WINDOW_GRACE
+                && !self.log_has_windows())
+    }
+
+    /// The `perf-kv` lines seen after the mark, reading the log if the last look is old enough.
+    fn look(&mut self) -> usize {
+        if self
+            .looked
+            .is_some_and(|looked| TscClock::since(looked) < LOG_POLL)
+        {
+            return self.windows;
+        }
+        self.looked = Some(TscClock::now());
+        let Some(bytes) = self.log.read_from(self.at) else {
+            return self.windows;
+        };
+        // Only whole lines: the last may still be half written.
+        let Some(whole) = bytes.iter().rposition(|&byte| byte == b'\n') else {
+            return self.windows;
+        };
+        let mut at = self.at;
+        for line in bytes[..=whole].split_inclusive(|&byte| byte == b'\n') {
+            at += u64::try_from(line.len()).expect("a line length fits u64");
+            if contains(line, PERF_KV.as_bytes()) {
+                self.windows += 1;
+                self.last_end = at;
+            }
+        }
+        self.at = at;
+        self.windows
+    }
+
+    /// Whether the log holds any `perf-kv` line, before the mark or after it.
+    fn log_has_windows(&mut self) -> bool {
+        if self.look() > 0 {
+            return true;
+        }
+        let mark = self.last_end;
+        *self.before.get_or_insert_with(|| {
+            self.log
+                .path
+                .as_deref()
+                .and_then(|path| fs::read(path).ok())
+                .is_some_and(|bytes| {
+                    let end = usize::try_from(mark).map_or(bytes.len(), |at| at.min(bytes.len()));
+                    contains(&bytes[..end], PERF_KV.as_bytes())
+                })
+        })
     }
 }
 
@@ -1438,6 +1728,13 @@ pub const IDENTITY_ROWS: [f32; 16] = [
     0.0, 0.0, 1.0, 0.0, //
     0.0, 0.0, 0.0, 1.0,
 ];
+
+/// Whether `needle` occurs in `haystack`.
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
+}
 
 /// How [`Metrics::perf`] records one `perf-kv` key.
 struct PerfRule {

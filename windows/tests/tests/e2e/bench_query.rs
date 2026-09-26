@@ -48,9 +48,9 @@ use mtld3d_types::{
 };
 
 use crate::bench::{
-    Class, Direction, FrameClock, FrameStats, FrameWork, IDENTITY_ROWS, LayerLog, Metrics, Model,
-    STRIDE, TEXTURED_DECL, TscClock, Value, grid, material_ps, material_vs, memory_section,
-    nearest_rank, ok, pattern_texture, ratio, world_rows, write_report,
+    Class, Direction, FrameClock, FrameStats, FrameWork, IDENTITY_ROWS, LayerLog, MEASURED_SPAN,
+    Metrics, Model, STRIDE, TEXTURED_DECL, TscClock, Value, grid, material_ps, material_vs,
+    memory_section, nearest_rank, ok, pattern_texture, ratio, world_rows, write_report,
 };
 
 const WIDTH: u32 = 1280;
@@ -64,12 +64,8 @@ const FLARES: usize = 2;
 /// Frames of queries in flight: a frame's queries are read by the next frame.
 const QUERY_SETS: usize = 2;
 const WARM_UP_FRAMES: u32 = 60;
-/// The measured phase is at least this many frames and at least [`MIN_MEASURED`] long.
-///
-/// The duration floor puts one whole window of a `PERF=1` build's summary
-/// inside the measured frames.
+/// The measured phase is at least this many frames and at least [`MEASURED_SPAN`] long.
 const MEASURED_FRAMES: usize = 600;
-const MIN_MEASURED: Duration = Duration::from_secs(12);
 /// The longest one EVENT query may be polled before the benchmark fails.
 const POLL_LIMIT: Duration = Duration::from_secs(5);
 /// The shortest frame the sample buffers are sized for, so they never grow while measuring.
@@ -114,6 +110,7 @@ fn poll(name: &str, keys: &'static str, answering: &Answering) {
         config_entries: keys,
         ..HarnessConfig::default()
     });
+    let started = TscClock::now();
     let mut scene = Scene::new(&h);
     let mut frame = 0;
     for _ in 0..WARM_UP_FRAMES {
@@ -127,15 +124,22 @@ fn poll(name: &str, keys: &'static str, answering: &Answering) {
     let log = LayerLog::find(since);
     let warm = MemorySample::now();
 
-    let from = log.mark();
-    let capacity = usize::try_from(MIN_MEASURED.as_micros() / FRAME_FLOOR.as_micros())
+    let start = log.start_span(started, || {
+        assert!(h.pump(), "WM_QUIT outside the measured frames");
+        scene.read_occlusion(frame);
+        scene.draw(frame);
+        scene.throttle(frame);
+        ok(h.present(), "Present");
+        frame += 1;
+    });
+    let capacity = usize::try_from(MEASURED_SPAN.as_micros() / FRAME_FLOOR.as_micros())
         .expect("frame capacity fits usize")
         .max(MEASURED_FRAMES);
     let mut clock = FrameClock::start(capacity);
     let mut polls = Vec::with_capacity(capacity);
     let mut latencies = Vec::with_capacity(capacity);
     let (mut ready, mut pending) = (0, 0);
-    while clock.frames() < MEASURED_FRAMES || clock.elapsed() < MIN_MEASURED {
+    while clock.frames() < MEASURED_FRAMES || clock.elapsed() < MEASURED_SPAN {
         assert!(h.pump(), "WM_QUIT during the measured frames");
         let occlusion = scene.read_occlusion(frame);
         ready += occlusion.ready;
@@ -149,8 +153,15 @@ fn poll(name: &str, keys: &'static str, answering: &Answering) {
         clock.present(&h);
         frame += 1;
     }
-    let to = log.mark();
     let end = MemorySample::now();
+    let span = start.end(&log, || {
+        assert!(h.pump(), "WM_QUIT outside the measured frames");
+        scene.read_occlusion(frame);
+        scene.draw(frame);
+        scene.throttle(frame);
+        ok(h.present(), "Present");
+        frame += 1;
+    });
 
     let stats = clock.stats();
     let work = clock.work_stats();
@@ -172,7 +183,7 @@ fn poll(name: &str, keys: &'static str, answering: &Answering) {
          occlusion queries once with GetData(0)\n\
          warm-up: {WARM_UP_FRAMES} frames\n\
          measured: {frames} frames in {elapsed:.2?} (at least {MEASURED_FRAMES} frames \
-         and {MIN_MEASURED:?})\n\
+         and {MEASURED_SPAN:?}, {start})\n\
          frame time (Present to Present): {row}\n\
          API work (Present return to Present call, the polls included): {work}\n\
          EVENT Issue to S_OK, one frame between: {latency}\n\
@@ -187,7 +198,8 @@ fn poll(name: &str, keys: &'static str, answering: &Answering) {
         latency = latency.row(),
         polls_mean = mean(polls_total, frames),
         memory = memory_section(&warm, &end),
-        perf = log.perf_rows(from, to).section(),
+        start = span.start(),
+        perf = span.perf_rows(&log).section(),
     );
 
     let count = |n: usize| Value::Count(u64::try_from(n).expect("a count fits u64"));
@@ -238,7 +250,7 @@ fn poll(name: &str, keys: &'static str, answering: &Answering) {
         Answering::Immediate => FrameWork::Fixed,
         Answering::Retirement => FrameWork::Varying,
     };
-    metrics.perf(&log.perf_kv_last_full(from, to), &frame_work);
+    metrics.perf(&span.perf_kv(&log), &frame_work);
     write_report(&metrics, &log, &body);
 }
 

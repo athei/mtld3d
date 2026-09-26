@@ -34,10 +34,7 @@
 //! call reported beside it; a spike is a single `LockRect` over twice that
 //! median and over 50 us, since the stalls a game shows take milliseconds.
 
-use std::{
-    collections::VecDeque,
-    time::{Duration, SystemTime},
-};
+use std::{collections::VecDeque, time::SystemTime};
 
 use mtld3d_tests::{
     Harness, HarnessConfig, MemorySample, Query, Texture, TexturedVertex, VertexBuffer,
@@ -51,8 +48,8 @@ use mtld3d_types::{
 };
 
 use crate::bench::{
-    CallTimes, Class, Direction, FrameClock, FrameWork, LayerLog, Metrics, STRIDE, TscClock, Value,
-    memory_section, nanos, ok, ratio, write_report,
+    CallTimes, Class, Direction, FrameClock, FrameWork, LayerLog, MEASURED_SPAN, Metrics, STRIDE,
+    TscClock, Value, memory_section, nanos, ok, ratio, write_report,
 };
 
 /// The back buffer, about the size of a windowed game.
@@ -92,9 +89,8 @@ const SLOTS: u32 = 64;
 /// Bytes of fill pattern, enough for the largest level at the largest offset.
 const PATTERN_BYTES: usize = 320 * 1024;
 const WARM_UP_FRAMES: u32 = 60;
-/// The measured phase is at least this many frames and at least [`MIN_MEASURED`] long.
+/// The measured phase is at least this many frames and at least [`MEASURED_SPAN`] long.
 const MEASURED_FRAMES: usize = 600;
-const MIN_MEASURED: Duration = Duration::from_secs(12);
 const FVF: u32 = D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1;
 
 /// Create, fill, draw and release textures every frame against a full live set: warm up, time.
@@ -126,23 +122,33 @@ fn texture_streaming() {
     let log = LayerLog::find(since);
     let warm_up = TscClock::since(started);
     let warm = MemorySample::now();
-    scene.times = Times::default();
 
-    let from = log.mark();
-    let mut clock = FrameClock::start(MEASURED_FRAMES * 4);
     let mut tick = WARM_UP_FRAMES;
-    while clock.frames() < MEASURED_FRAMES || clock.elapsed() < MIN_MEASURED {
+    let start = log.start_span(started, || {
+        assert!(h.pump(), "WM_QUIT outside the measured frames");
+        scene.render(tick);
+        ok(h.present(), "Present");
+        tick += 1;
+    });
+    scene.times = Times::default();
+    let mut clock = FrameClock::start(MEASURED_FRAMES * 4);
+    while clock.frames() < MEASURED_FRAMES || clock.elapsed() < MEASURED_SPAN {
         assert!(h.pump(), "WM_QUIT during the measured frames");
         scene.render(tick);
         clock.present(&h);
         tick += 1;
     }
-    let to = log.mark();
     let end = MemorySample::now();
+    let times = std::mem::take(&mut scene.times);
+    let span = start.end(&log, || {
+        assert!(h.pump(), "WM_QUIT outside the measured frames");
+        scene.render(tick);
+        ok(h.present(), "Present");
+        tick += 1;
+    });
 
     let stats = clock.stats();
     let work = clock.work_stats();
-    let times = &scene.times;
     let (spikes, limit) = times.lock.spikes();
     let per_frame = |count: u64| {
         let count = u32::try_from(count).expect("count fits u32");
@@ -161,7 +167,8 @@ fn texture_streaming() {
          warm-up: {LIVE_TEXTURES} textures loaded {LOAD_PER_FRAME} a frame, then \
          {WARM_UP_FRAMES} frames, in {warm_up:.2?}\n\
          measured: {frames} frames in {elapsed:.2?} (at least {MEASURED_FRAMES} frames \
-         and {MIN_MEASURED:?}), {locks_per_frame:.1} timed LockRect a frame, event query \
+         and {MEASURED_SPAN:?}, {start}), {locks_per_frame:.1} timed LockRect a frame, event \
+         query \
          complete at its one read on {complete} frames\n\
          frame time (Present to Present): {row}\n\
          API work (Present return to Present call): {work_row}\n\
@@ -182,7 +189,8 @@ fn texture_streaming() {
         preserve_row = times.preserve.row(),
         create_row = times.create.row(),
         memory = memory_section(&warm, &end),
-        perf = log.perf_rows(from, to).section(),
+        start = span.start(),
+        perf = span.perf_rows(&log).section(),
     );
     let mut metrics = Metrics::new("streaming", &h, &tsc);
     metrics.frame_rows("frame", &stats);
@@ -231,7 +239,7 @@ fn texture_streaming() {
     // The frames lock the same kinds at the same rates, but a ring's wrap or
     // a preserving lock falls on some frames and not others, so a window's
     // per-frame counts depend on where it starts.
-    metrics.perf(&log.perf_kv_last_full(from, to), &FrameWork::Varying);
+    metrics.perf(&span.perf_kv(&log), &FrameWork::Varying);
     write_report(&metrics, &log, &body);
 }
 

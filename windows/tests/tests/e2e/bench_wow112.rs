@@ -67,9 +67,9 @@ use mtld3d_types::{
 };
 
 use crate::bench::{
-    Class, Direction, FrameClock, FrameWork, IDENTITY_ROWS, LayerLog, Metrics, PassShape, STRIDE,
-    TEXTURED_DECL, TscClock, Value, def, element, grid, memory_section, ok, pattern_texture, ratio,
-    transform, world_rows, write_report,
+    Class, Direction, FrameClock, FrameWork, IDENTITY_ROWS, LayerLog, MEASURED_SPAN, Metrics,
+    PassShape, STRIDE, TEXTURED_DECL, TscClock, Value, def, element, grid, memory_section, ok,
+    pattern_texture, ratio, transform, world_rows, write_report,
 };
 
 /// The back buffer and the scene target, the size of a windowed game.
@@ -271,12 +271,8 @@ const MODEL_DECL: [D3DVERTEXELEMENT9; 4] = [
     D3DDECL_END,
 ];
 const WARM_UP_FRAMES: u32 = 60;
-/// The measured phase is at least this many frames and at least [`MIN_MEASURED`] long.
-///
-/// The duration floor is what puts one whole five-second window of a
-/// `PERF=1` build's summary inside the measured frames.
+/// The measured phase is at least this many frames and at least [`MEASURED_SPAN`] long.
 const MEASURED_FRAMES: usize = 600;
-const MIN_MEASURED: Duration = Duration::from_secs(12);
 /// The longest the last frame's EVENT query may stay pending before the benchmark fails.
 const EVENT_DEADLINE: Duration = Duration::from_secs(5);
 
@@ -308,12 +304,18 @@ fn wow_112_busy_frame() {
     let warm_up = TscClock::since(started);
     let warm = MemorySample::now();
 
-    let from = log.mark();
+    let mut tick = WARM_UP_FRAMES;
+    let start = log.start_span(started, || {
+        assert!(h.pump(), "WM_QUIT outside the measured frames");
+        frame.render(tick);
+        frame.count_present();
+        ok(h.present(), "Present");
+        tick += 1;
+    });
     let pending_from = frame.calls.pending_polls.get();
     let mut clock = FrameClock::start(MEASURED_FRAMES * 4);
-    let mut tick = WARM_UP_FRAMES;
     let mut one_frame = Vec::new();
-    while clock.frames() < MEASURED_FRAMES || clock.elapsed() < MIN_MEASURED {
+    while clock.frames() < MEASURED_FRAMES || clock.elapsed() < MEASURED_SPAN {
         assert!(h.pump(), "WM_QUIT during the measured frames");
         let before = one_frame.is_empty().then(|| frame.calls.rows());
         frame.render(tick);
@@ -324,9 +326,15 @@ fn wow_112_busy_frame() {
         }
         tick += 1;
     }
-    let to = log.mark();
     let end = MemorySample::now();
     let pending = frame.calls.pending_polls.get() - pending_from;
+    let span = start.end(&log, || {
+        assert!(h.pump(), "WM_QUIT outside the measured frames");
+        frame.render(tick);
+        frame.count_present();
+        ok(h.present(), "Present");
+        tick += 1;
+    });
 
     let draws = one_frame
         .iter()
@@ -361,7 +369,7 @@ fn wow_112_busy_frame() {
          one or two lights, fog\n\
          warm-up: {WARM_UP_FRAMES} frames in {warm_up:.2?}\n\
          measured: {frames} frames in {elapsed:.2?} (at least {MEASURED_FRAMES} frames \
-         and {MIN_MEASURED:?})\n\
+         and {MEASURED_SPAN:?}, {start})\n\
          frame time (Present to Present): {row}\n\
          API work (Present return to Present call): {work_row}\n\
          API work per draw: {per_draw_ns} ns (mean API work over {DRAWS_PER_FRAME} draws)\n\
@@ -376,9 +384,10 @@ fn wow_112_busy_frame() {
         work_row = work.row(),
         calls_per_draw = f64::from(total) / f64::from(DRAWS_PER_FRAME),
         memory = memory_section(&warm, &end),
-        perf = log.perf_rows(from, to).section(),
+        start = span.start(),
+        perf = span.perf_rows(&log).section(),
         warm_up_compiles = log
-            .first_window_rows(to)
+            .first_window_rows(span.to())
             .map_or_else(String::new, |rows| format!(
                 "perf: this device's first window, its warm-up compiles\n{rows}"
             )),
@@ -425,7 +434,7 @@ fn wow_112_busy_frame() {
         Class::Info,
     );
     metrics.memory(&warm, &end);
-    metrics.perf(&log.perf_kv_last_full(from, to), &FrameWork::Fixed);
+    metrics.perf(&span.perf_kv(&log), &FrameWork::Fixed);
     metrics.meta("backbuffer", &format!("{WIDTH}x{HEIGHT}"));
     metrics.shapes(&pass_shapes());
     write_report(&metrics, &log, &body);
