@@ -38,5 +38,5 @@ pub use vertex::{
 pub use win32::{
     Rect, WM_ACTIVATEAPP, WS_CAPTION, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE, WindowStyle,
     create_window, cursor_is_live, cursor_mask_bits, destroy_window, enumerate_display_sizes,
-    send_message, set_window_pos, window_rect,
+    post_quit_message, send_message, set_window_pos, window_rect,
 };

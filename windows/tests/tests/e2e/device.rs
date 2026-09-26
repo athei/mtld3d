@@ -3729,8 +3729,7 @@ fn a_second_device_renders_after_the_first_is_destroyed() {
         first.render_once(RED, |_| {});
     }
     assert_pixel_eq(first.read_pixel(1, 1), RED, "first device");
-    // The window outlives the device it served: destroying it here would post
-    // WM_QUIT into the thread queue the second device then pumps.
+    // The window outlives the device it served.
     assert_eq!(
         first.release_device(),
         0,
@@ -3796,8 +3795,7 @@ fn a_device_on_a_new_window_presents_through_the_metal_view_a_destroyed_window_l
     // window's destruction leaves that view without a window, so the second
     // device's window, which has no kept view of its own, takes it, layer
     // and all, and the second device presents through it and reads back its
-    // own colour. The window's destruction posts `WM_QUIT` to the thread
-    // that destroyed it, so the second device runs on a thread of its own.
+    // own colour.
     const PRESENTS: u32 = 40;
     const RED: u32 = 0xFFFF_0000;
     const BLUE: u32 = 0xFF00_00FF;
@@ -3942,8 +3940,7 @@ fn device_recreation_releases_every_pipeline_it_built() {
 
 /// Recreate a device four times, as a game does on each mode switch, matching creates to releases.
 ///
-/// Each cycle is one device on a window of its own, on a thread of its own
-/// (a destroyed window posts `WM_QUIT` to the thread that destroyed it),
+/// Each cycle is one device on a window of its own, on a thread of its own,
 /// drawing the same quad with colour writes on and then off, so the draw's
 /// pipeline and its no-colour sibling are both built. The shader cache is on
 /// and starts empty beside the private executable, so the first device
