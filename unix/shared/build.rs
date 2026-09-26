@@ -41,12 +41,24 @@ fn build_id() -> String {
     // switch and stays put on a commit. Everything a ref names lives in the
     // common gitdir instead, and resolving one against the worktree gitdir
     // yields a path that does not exist, which the filter below silently drops.
+    //
+    // The branch's loose ref is not enough on its own: a ref that only lives
+    // in `packed-refs` when the build runs has no loose file to watch, and the
+    // next commit writes that loose file without touching anything watched, so
+    // the stamp would keep naming the packed commit on every later build. The
+    // worktree's reflog, `logs/HEAD` in its own gitdir, is appended on every
+    // commit, reset, cherry-pick and checkout in that worktree, packed ref or
+    // not, and only in that worktree, so commits elsewhere rebuild nothing
+    // here. (Watching all of `refs/heads` would rebuild every worktree on any
+    // commit in any of them.) A checkout without reflogs has no such file and
+    // falls back to the watches above.
     if let (Some(git_dir), Some(common_dir)) = (
         git(&["rev-parse", "--absolute-git-dir"]).map(PathBuf::from),
         common_dir(),
     ) {
         let mut watch = vec![
             git_dir.join("HEAD"),
+            git_dir.join("logs").join("HEAD"),
             common_dir.join("packed-refs"),
             common_dir.join("refs").join("tags"),
         ];
