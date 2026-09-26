@@ -1056,8 +1056,14 @@ bench: install-windows-$(ARCH) install-unix-$(SDK_UNIX_ARCH)
 # Both legs build PROD=1 PERF=1 into ISOLATED=1 trees of their own: BASE in a
 # detached worktree under the main checkout's `.codex/worktrees`, kept for
 # the next run and removed by `make clean-bench-ab`, and this checkout in its
-# own `.wine-isolated`. Each clones the SDK and the prefix this invocation
-# would otherwise use, so the two differ only in the layer. The candidate's
+# own `.wine-isolated`. Both trees are taken down and cloned again from the
+# SDK and the prefix this invocation would otherwise use on every run, and
+# both prefixes are configured by this checkout's `configure-test-prefix`, so
+# a Wine rebuilt since the last run or an older BASE's prefix settings cannot
+# make the legs differ in more than the layer; the runner checks that both
+# run one Wine before it starts, and the report names it. The persistent
+# wineservers of both prefixes are stopped when the run ends, however it
+# ends. The candidate's
 # benchmark binary drives both legs: it links `d3d9` by name and nothing of
 # the layer's, so the workload is the same on either side. Every run checks
 # that the layer it loaded carries its leg's `git describe` stamp, computed
@@ -1070,7 +1076,8 @@ bench: install-windows-$(ARCH) install-unix-$(SDK_UNIX_ARCH)
 # `.codex/evidence/bench-ab` in the main checkout, so the results outlive the
 # worktree that made them). Exit 1 is a regression, 2 a run or a directory
 # that cannot be trusted. `make bench-compare AB_DIR=<that directory>` judges
-# it again, with another ACCEPT for instance.
+# it again, with another ACCEPT for instance, into a report of its own
+# (`report-compare-<time>.txt`) beside the one the run wrote.
 #
 # Nothing else may run on the machine meanwhile, tests, builds and games
 # included: the verdicts are only as good as the quiet of the machine.
@@ -1087,6 +1094,16 @@ BENCH_SDK_SOURCE := $(if $(filter 1,$(ISOLATED)),$(ISOLATED_SDK_SOURCE),$(WINE_S
 BENCH_PREFIX_SOURCE := $(if $(filter 1,$(ISOLATED)),$(ISOLATED_PREFIX_SOURCE),$(or $(WINEPREFIX),$(HOME)/.wine))
 BENCH_LEG_MAKE = ISOLATED=1 PROD=1 PERF=1 WINE_SDK='$(BENCH_SDK_SOURCE)' WINEPREFIX='$(BENCH_PREFIX_SOURCE)'
 BENCH_LEG_INSTALL = install-windows-$(ARCH) install-unix-$(SDK_UNIX_ARCH)
+# This checkout's `configure-test-prefix` on the isolated tree $(1), not
+# isolated again: the tree is the leg's clone.
+BENCH_LEG_CONFIGURE = ISOLATED= WINE_SDK='$(1)/sdk' WINE_INSTALL_DIR= WINEPREFIX='$(1)/prefix' configure-test-prefix
+# Stops the persistent wineservers of both legs' prefixes, whatever state
+# the run left them in; a leg that has no server is left as it is.
+define BENCH_STOP_SERVERS
+stop_servers() { for leg in '$(BENCH_BASE_ISO)' '$(ISOLATED_ROOT)'; do \
+	[ -x "$$leg/sdk/bin/wineserver" ] && WINEPREFIX="$$leg/prefix" "$$leg/sdk/bin/wineserver" -k >/dev/null 2>&1 ; \
+	done ; true ; }
+endef
 ifneq ($(filter bench-ab,$(MAKECMDGOALS)),)
 ifeq ($(filter wow full,$(BENCH_SET)),)
 $(error BENCH_SET is wow or full, not $(BENCH_SET))
@@ -1096,10 +1113,15 @@ ifeq ($(BENCH_BASE_SHA),)
 $(error `make bench-ab` needs BASE=<ref>, the commit to compare this checkout against$(if $(BASE),; $(BASE) names none))
 endif
 BENCH_BASE_SHORT := $(shell git rev-parse --short=12 $(BENCH_BASE_SHA))
-BENCH_CAND_SHORT := $(shell git rev-parse --short=12 HEAD)$(if $(shell git status --porcelain --untracked-files=no),-dirty)
+# Whether the checkout differs from its commit. Untracked files do not count,
+# the same as for the layer stamp: the build compiles what the tree tracks,
+# and a file nothing tracks is not part of it.
+BENCH_DIRTY := $(shell git status --porcelain --untracked-files=no)
+BENCH_CAND_SHORT := $(shell git rev-parse --short=12 HEAD)$(if $(BENCH_DIRTY),-dirty)
 # A true A/A run: BASE is this checkout's commit and nothing in the tree differs.
-BENCH_SAME_IMAGE := $(if $(filter $(BENCH_BASE_SHA),$(shell git rev-parse HEAD)),$(if $(shell git status --porcelain),,--allow-same-image))
+BENCH_SAME_IMAGE := $(if $(filter $(BENCH_BASE_SHA),$(shell git rev-parse HEAD)),$(if $(BENCH_DIRTY),,--allow-same-image))
 BENCH_BASE_DIR := $(BENCH_CHECKOUT)/.codex/worktrees/bench-base-$(BENCH_BASE_SHORT)
+BENCH_BASE_ISO := $(BENCH_BASE_DIR)/.wine-isolated
 # The stamp `unix/shared/build.rs` compiles in: `git describe --tags --always`
 # of the commit, never `--dirty`, so a candidate with uncommitted changes
 # carries its commit's stamp.
@@ -1113,15 +1135,18 @@ bench-ab:
 	[ -d '$(BENCH_BASE_DIR)' ] || git worktree add --detach '$(BENCH_BASE_DIR)' $(BENCH_BASE_SHA)
 	test "$$(git -C '$(BENCH_BASE_DIR)' rev-parse HEAD)" = $(BENCH_BASE_SHA) || \
 		{ echo "make bench-ab: $(BENCH_BASE_DIR) is not at $(BENCH_BASE_SHA); make clean-bench-ab removes it" >&2; exit 2; }
+	$(call clean_isolated_at,$(BENCH_BASE_ISO))
+	$(call clean_isolated_at,$(ISOLATED_ROOT))
 	$(MAKE) -C '$(BENCH_BASE_DIR)' $(BENCH_LEG_MAKE) $(BENCH_LEG_INSTALL)
-	$(MAKE) -C '$(BENCH_BASE_DIR)' $(BENCH_LEG_MAKE) configure-test-prefix
 	$(MAKE) $(BENCH_LEG_MAKE) $(BENCH_LEG_INSTALL)
-	$(MAKE) $(BENCH_LEG_MAKE) configure-test-prefix
+	$(MAKE) $(call BENCH_LEG_CONFIGURE,$(BENCH_BASE_ISO)) || { $(BENCH_STOP_SERVERS); stop_servers; exit 2; }
+	$(MAKE) $(call BENCH_LEG_CONFIGURE,$(ISOLATED_ROOT)) || { $(BENCH_STOP_SERVERS); stop_servers; exit 2; }
+	$(BENCH_STOP_SERVERS); trap stop_servers EXIT; \
 	$(BENCH_SUITE_ASSIGN); \
 	cd $(E2E_RUNNER_DIR) && WINEDEBUG= MTL_DEBUG_LAYER=0 MTL_HUD_ENABLED=0 \
 		$(E2E_RUNNER) bench-ab --out '$(BENCH_AB_OUT)' --runs $(RUNS) --timeout $(BENCH_TIMEOUT) \
-		--base-wine '$(BENCH_BASE_DIR)/.wine-isolated/sdk/bin/wine' \
-		--base-prefix '$(BENCH_BASE_DIR)/.wine-isolated/prefix' --base-stamp '$(BENCH_BASE_STAMP)' \
+		--base-wine '$(BENCH_BASE_ISO)/sdk/bin/wine' \
+		--base-prefix '$(BENCH_BASE_ISO)/prefix' --base-stamp '$(BENCH_BASE_STAMP)' \
 		--cand-wine '$(ISOLATED_ROOT)/sdk/bin/wine' \
 		--cand-prefix '$(ISOLATED_ROOT)/prefix' --cand-stamp '$(BENCH_CAND_STAMP)' \
 		--config '$(BENCH_CONF_AB)' $(if $(BENCH_SET_$(BENCH_SET)),--bench '$(BENCH_SET_$(BENCH_SET))') \
@@ -1130,7 +1155,7 @@ bench-ab:
 bench-compare:
 	test -n '$(AB_DIR)' || { echo "make bench-compare needs AB_DIR=<a directory make bench-ab wrote>" >&2; exit 2; }
 	cd $(E2E_RUNNER_DIR) && $(E2E_RUNNER) bench-compare '$(abspath $(AB_DIR))' \
-		$(if $(ACCEPT),--accept '$(ACCEPT)') --report '$(abspath $(AB_DIR))/report.txt'
+		$(if $(ACCEPT),--accept '$(ACCEPT)') --report '$(abspath $(AB_DIR))/report-compare-$(shell date +%Y%m%d-%H%M%S).txt'
 
 # The base worktrees `make bench-ab` keeps, each with its isolated Wine session
 # and clones, taken down the way `clean-isolated` takes down a checkout's own.

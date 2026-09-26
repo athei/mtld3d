@@ -224,7 +224,7 @@ fn an_info_metric_is_reported_and_never_judged() {
 }
 
 #[test]
-fn a_zero_base_is_infinitely_worse_and_two_zeros_are_equal() {
+fn a_clear_difference_on_a_zero_base_regresses_and_two_zeros_are_equal() {
     let spec = "ms lower time";
     assert_eq!(
         verdict_of("frame.p50", spec, &[0.0; 5], &[0.0; 5]),
@@ -574,7 +574,7 @@ fn a_metric_redefined_between_legs_is_rejected() {
 }
 
 #[test]
-fn added_and_removed_metrics_and_benchmarks_are_listed_not_failed() {
+fn added_and_removed_metrics_are_listed_not_failed() {
     let fixture = Fixture::new("added");
     for round in 0..3 {
         fixture.write(
@@ -583,13 +583,6 @@ fn added_and_removed_metrics_and_benchmarks_are_listed_not_failed() {
             "b",
             &meta("v1", "AAAA"),
             &[("x", 1.0, "ms lower time"), ("gone", 2.0, "ms lower time")],
-        );
-        fixture.write(
-            "base",
-            round,
-            "old",
-            &meta("v1", "AAAA"),
-            &[("y", 1.0, "ms lower time")],
         );
         fixture.write(
             "cand",
@@ -604,28 +597,32 @@ fn added_and_removed_metrics_and_benchmarks_are_listed_not_failed() {
     }
     let comparison = evaluate(&fixture.root, &Options::default()).unwrap();
     assert!(!comparison.failed());
-    let b = comparison
-        .benches
-        .iter()
-        .find(|bench| bench.bench == "b")
-        .unwrap();
-    let verdict = |name: &str| {
-        &b.rows
-            .iter()
-            .find(|row| row.metric == name)
-            .unwrap()
-            .verdict
-    };
+    let rows = &comparison.benches[0].rows;
+    let verdict = |name: &str| &rows.iter().find(|row| row.metric == name).unwrap().verdict;
     assert_eq!(*verdict("gone"), Verdict::Removed);
     assert_eq!(*verdict("new"), Verdict::Added);
-    let old = comparison
-        .benches
-        .iter()
-        .find(|bench| bench.bench == "old")
-        .unwrap();
-    assert_eq!(old.only, Some(Leg::Base));
     let summary = comparison.summary();
-    assert!(summary.contains("1 added, 2 removed"), "{summary}");
+    assert!(summary.contains("1 added, 1 removed"), "{summary}");
+}
+
+#[test]
+fn a_benchmark_only_one_leg_ran_is_an_incomplete_run() {
+    let fixture = Fixture::new("one-leg-bench");
+    fixture.standard(3, 1.0);
+    for round in 0..3 {
+        fixture.write(
+            "base",
+            round,
+            "old",
+            &meta("v0.11.0-3-g66e4114", "AAAA"),
+            &[("y", 1.0, "ms lower time")],
+        );
+    }
+    let reason = error_of(&fixture);
+    assert!(
+        reason.contains("incomplete run: benchmark old ran only in the base leg"),
+        "{reason}"
+    );
 }
 
 #[test]
@@ -749,6 +746,141 @@ fn one_image_under_two_stamps_stays_an_error_even_when_allowed() {
     let reason = evaluate(&fixture.root, &allowed).unwrap_err();
     assert!(
         reason.contains("both legs loaded d3d9.dll image SAME"),
+        "{reason}"
+    );
+}
+
+#[test]
+fn a_zero_base_is_judged_by_the_absolute_difference() {
+    let spec = "ms lower time";
+    // Under the 0.1 ms floor: reported, not failed.
+    let row = judge("frame.stall", &def(spec), &[0.0; 5], &[0.05; 5], false);
+    assert_eq!(row.verdict, Verdict::Neutral);
+    assert!(row.change.contains("zero base"), "{}", row.change);
+    // Past it, on every pair.
+    assert_eq!(
+        verdict_of("frame.stall", spec, &[0.0; 5], &[0.5; 5]),
+        Verdict::Regression
+    );
+    assert_eq!(
+        verdict_of("frame.stall", spec, &[0.0; 5], &[0.0; 5]),
+        Verdict::Neutral
+    );
+    // The floor is in the metric's unit.
+    assert_eq!(
+        verdict_of("frame.stall", "us lower time", &[0.0; 5], &[50.0; 5]),
+        Verdict::Neutral
+    );
+    assert_eq!(
+        verdict_of("frame.stall", "us lower time", &[0.0; 5], &[500.0; 5]),
+        Verdict::Regression
+    );
+}
+
+#[test]
+fn a_zero_base_pair_leaves_no_nan_in_the_verdict() {
+    // One base round of zero: its ratio is infinite, the sigma of the rest is finite.
+    let base = [0.0, 10.0, 10.0, 10.0, 10.0];
+    let row = judge("frame.p50", &def("ms lower time"), &base, &[10.0; 5], false);
+    assert_eq!(row.verdict, Verdict::Neutral);
+    assert!(!row.noise.contains("NaN"), "{}", row.noise);
+    assert!(!row.change.contains("NaN"), "{}", row.change);
+    let base = [0.0, 0.0, 0.0, 10.0, 10.0];
+    let row = judge("frame.p50", &def("ms lower time"), &base, &[10.0; 5], false);
+    assert!(!row.noise.contains("NaN"), "{}", row.noise);
+}
+
+#[test]
+fn a_bytes_metric_keeps_the_narrow_floor_whatever_its_name() {
+    // A 5 % rise of 100 MiB: under the 8 % tail floor, over the 3 % one.
+    let spec = "mib lower bytes";
+    assert_eq!(
+        verdict_of("mem.p99", spec, &[100.0; 5], &[105.0; 5]),
+        Verdict::Regression
+    );
+    assert_eq!(
+        verdict_of("frame.p99", "ms lower time", &[100.0; 5], &[105.0; 5]),
+        Verdict::Neutral
+    );
+}
+
+/// The standard meta with `layer_unix_image` set to `unix`.
+fn meta_unix<'a>(layer: &'a str, image: &'a str, unix: &'a str) -> Vec<(&'a str, &'a str)> {
+    let mut meta = meta(layer, image);
+    meta.push(("layer_unix_image", unix));
+    meta
+}
+
+#[test]
+fn the_unix_image_follows_the_d3d9_image_rules() {
+    let write = |fixture: &Fixture, base: &[(&str, &str)], cand: &[(&str, &str)]| {
+        for round in 0..3 {
+            fixture.write("base", round, "b", base, &[("x", 1.0, "ms lower time")]);
+            fixture.write("cand", round, "b", cand, &[("x", 1.0, "ms lower time")]);
+        }
+    };
+    let fixture = Fixture::new("unix-image-ok");
+    write(
+        &fixture,
+        &meta_unix("v1", "AAAA", "U1"),
+        &meta_unix("v1", "BBBB", "U2"),
+    );
+    let comparison = evaluate(&fixture.root, &Options::default()).unwrap();
+    assert!(
+        comparison
+            .header
+            .iter()
+            .any(|line| line.contains("mtld3d.so U1 / U2"))
+    );
+
+    let fixture = Fixture::new("unix-image-same");
+    write(
+        &fixture,
+        &meta_unix("v1", "AAAA", "U1"),
+        &meta_unix("v1", "BBBB", "U1"),
+    );
+    let reason = error_of(&fixture);
+    assert!(
+        reason.contains("both legs loaded mtld3d.so image U1"),
+        "{reason}"
+    );
+    let allowed = Options {
+        allow_same_image: true,
+        ..Options::default()
+    };
+    assert!(
+        evaluate(&fixture.root, &allowed).is_ok(),
+        "an A/A run may load one image"
+    );
+
+    let fixture = Fixture::new("unix-image-one-leg");
+    write(
+        &fixture,
+        &meta_unix("v1", "AAAA", "U1"),
+        &meta("v1", "BBBB"),
+    );
+    let reason = error_of(&fixture);
+    assert!(
+        reason.contains("meta layer_unix_image is in one leg's metrics only"),
+        "{reason}"
+    );
+
+    let fixture = Fixture::new("unix-image-changed");
+    write(
+        &fixture,
+        &meta_unix("v1", "AAAA", "U1"),
+        &meta_unix("v1", "BBBB", "U2"),
+    );
+    fixture.write(
+        "cand",
+        2,
+        "b",
+        &meta_unix("v1", "BBBB", "U3"),
+        &[("x", 1.0, "ms lower time")],
+    );
+    let reason = error_of(&fixture);
+    assert!(
+        reason.contains("the cand leg did not run one build: meta layer_unix_image"),
         "{reason}"
     );
 }

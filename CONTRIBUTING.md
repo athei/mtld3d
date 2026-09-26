@@ -205,17 +205,18 @@ once against this checkout and writes a report per benchmark. `make bench-ab
 BASE=<ref>` is the one that answers whether a change made things slower: it
 builds `BASE` in a worktree of its own and this checkout, each into its own
 isolated Wine tree, runs every benchmark against both in alternating order
-for `RUNS` rounds (five by default), and judges each metric pair by pair
-against the noise those rounds show. It exits 1 on a regression and 2 when
-the run itself cannot be trusted. The runs and the report stay in a directory
-under the main checkout's `.codex/evidence/bench-ab`, and `make bench-compare AB_DIR=<dir>` judges
-one again, for instance with `ACCEPT=<metric>,...` naming an exact count (a
-draw count, a pass count) that the change is meant to move. `make
-clean-bench-ab` removes the kept base worktrees. The metrics a benchmark
-writes include the layer's own counters, read from the `perf-kv` line of
-its perf windows as `perf.*` (`bench.rs` gives the rules): the per-frame
-counts of work the API calls fix, such as `perf.draws_pf` and
-`perf.passes_pf`, are the exact ones.
+for `RUNS` rounds (five by default, three at least), and judges each metric
+pair by pair against the noise those rounds show. It exits 1 on a regression
+and 2 when the run itself cannot be trusted, which includes the two legs
+running different Wines. The runs and the report stay in a directory under
+the main checkout's `.codex/evidence/bench-ab`, and `make bench-compare
+AB_DIR=<dir>` judges one again into a report of its own, for instance with
+`ACCEPT=<metric>,...` naming an exact count (a draw count, a pass count) that
+the change is meant to move. `make clean-bench-ab` removes the kept base
+worktrees. The metrics a benchmark writes include the layer's own counters,
+read from the `perf-kv` line of its perf windows as `perf.*` (`bench.rs`
+gives the rules): the per-frame counts of work the API calls fix, such as
+`perf.draws_pf` and `perf.passes_pf`, are the exact ones.
 
 Bench numbers come from `PROD=1 PERF=1` builds only; `make bench-ab` builds
 both legs that way and refuses any other profile, since `release` carries

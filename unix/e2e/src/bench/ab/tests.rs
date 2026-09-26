@@ -72,3 +72,44 @@ fn progress_shows_the_median_frame_when_there_is_one() {
     assert_eq!(progress(path, &with), "b: frame.p50 16.667 ms");
     assert_eq!(progress(path, &file("")), "b: no frame.p50");
 }
+
+/// A fake Wine tree in a temporary directory: a `wine` that prints `version`, and a `wineserver`.
+fn fake_wine(tag: &str, version: &str, server: &str) -> LegSpec {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = std::env::temp_dir().join(format!("mtld3d-bench-ab-{}-{tag}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    let wine = dir.join("wine");
+    fs::write(&wine, format!("#!/bin/sh\necho '{version}'\n")).unwrap();
+    fs::set_permissions(&wine, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::write(dir.join("wineserver"), server).unwrap();
+    LegSpec {
+        wine,
+        prefix: dir.join("prefix"),
+        stamp: "v1".to_owned(),
+    }
+}
+
+#[test]
+fn both_legs_have_to_run_one_wine() {
+    let base = fake_wine("base", "wine-10.0", "server-a");
+    let same = fake_wine("same", "wine-10.0", "server-a");
+    assert_eq!(
+        check_wine(&base, &same).unwrap(),
+        "wine-10.0, one wineserver"
+    );
+
+    let other_version = fake_wine("version", "wine-9.0", "server-a");
+    let reason = check_wine(&base, &other_version).unwrap_err();
+    assert!(
+        reason.contains("different Wines: base wine-10.0"),
+        "{reason}"
+    );
+
+    let other_server = fake_wine("server", "wine-10.0", "server-b");
+    let reason = check_wine(&base, &other_server).unwrap_err();
+    assert!(reason.contains("different wineservers"), "{reason}");
+
+    for spec in [base, same, other_version, other_server] {
+        let _ = fs::remove_dir_all(spec.wine.parent().unwrap());
+    }
+}

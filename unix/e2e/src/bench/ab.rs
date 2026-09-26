@@ -14,12 +14,12 @@ use std::{
     fmt::Write as _,
     fs,
     path::{Path, PathBuf},
-    process::ExitCode,
+    process::{Command, ExitCode, Stdio},
     time::{Duration, SystemTime},
 };
 
 use super::{
-    Leg, SAME_IMAGE_FILE,
+    Leg, SAME_IMAGE_FILE, WINE_FILE,
     compare::{self, Options},
     metrics::{self, MetricsFile},
 };
@@ -93,11 +93,16 @@ pub fn run(config: &AbConfig) -> Result<ExitCode, String> {
             ));
         }
     }
+    let wine = check_wine(&config.base, &config.cand)?;
+    fs::create_dir_all(&out).map_err(|e| format!("{}: {e}", out.display()))?;
+    let wine_file = out.join(WINE_FILE);
+    fs::write(&wine_file, format!("{wine}\n"))
+        .map_err(|e| format!("{}: {e}", wine_file.display()))?;
+    println!("bench-ab: both legs run {wine}");
     let benches = select_benches(config)?;
     if config.options.allow_same_image {
         // Recorded in the directory so that a later `bench-compare` of it
         // allows what this run allowed.
-        fs::create_dir_all(&out).map_err(|e| format!("{}: {e}", out.display()))?;
         let marker = out.join(SAME_IMAGE_FILE);
         fs::write(
             &marker,
@@ -153,6 +158,59 @@ pub fn schedule(benches: usize, runs: u32) -> Vec<(usize, u32, Leg)> {
         }
     }
     order
+}
+
+/// Check that both legs run one Wine, and name it.
+///
+/// The legs differ only in the layer, or the comparison measures Wine too:
+/// the loaders have to report the same `--version` and the wineservers
+/// beside them have to be the same file, byte for byte, since two builds of
+/// one Wine version can still differ.
+///
+/// # Errors
+///
+/// Returns a message when a loader cannot be run or the two differ.
+pub fn check_wine(base: &LegSpec, cand: &LegSpec) -> Result<String, String> {
+    let base_version = wine_version(&base.wine)?;
+    let cand_version = wine_version(&cand.wine)?;
+    if base_version != cand_version {
+        return Err(format!(
+            "the legs run different Wines: base {base_version} ({}), cand {cand_version} ({})",
+            base.wine.display(),
+            cand.wine.display()
+        ));
+    }
+    let server = |spec: &LegSpec| {
+        let path = spec.wine.with_file_name("wineserver");
+        fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))
+    };
+    if server(base)? != server(cand)? {
+        return Err(format!(
+            "the legs run different wineservers beside {} and {}, though both report \
+             {base_version}",
+            base.wine.display(),
+            cand.wine.display()
+        ));
+    }
+    Ok(format!("{base_version}, one wineserver"))
+}
+
+/// What `wine --version` prints, which the loader answers without a prefix or a server.
+fn wine_version(wine: &Path) -> Result<String, String> {
+    let output = Command::new(wine)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| format!("{} --version: {e}", wine.display()))?;
+    let version = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    if !output.status.success() || version.is_empty() {
+        return Err(format!(
+            "{} --version ended with {} and printed {version:?}",
+            wine.display(),
+            output.status
+        ));
+    }
+    Ok(version)
 }
 
 /// The benchmarks the patterns select, listed out of each binary under the candidate leg.

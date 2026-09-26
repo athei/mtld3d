@@ -155,3 +155,16 @@ fn ab_names_the_missing_flag() {
     tokens.extend(["--out", "/ab", "--runs", "0", "--", "/e2e.exe"]);
     assert!(parse_ab(args(&tokens)).unwrap_err().contains("count >= 1"));
 }
+
+#[test]
+fn ab_needs_three_rounds_at_least() {
+    for (runs, ok) in [("2", false), ("3", true)] {
+        let mut tokens = LEGS.to_vec();
+        tokens.extend(["--out", "/ab", "--runs", runs, "--", "/e2e.exe"]);
+        let parsed = parse_ab(args(&tokens));
+        assert_eq!(parsed.is_ok(), ok, "--runs {runs}");
+        if let Err(reason) = parsed {
+            assert!(reason.contains("at least 3"), "{reason}");
+        }
+    }
+}

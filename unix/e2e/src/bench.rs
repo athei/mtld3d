@@ -14,7 +14,8 @@
 //! directory back and pairs the two legs round by round, and `bench-ab` ends
 //! by doing the same. A run of one clean commit against itself also leaves
 //! a `same-image-allowed` file there (see `compare::check_builds`), so a later
-//! `bench-compare` judges it the way `bench-ab` did.
+//! `bench-compare` judges it the way `bench-ab` did, and a `wine.txt` naming
+//! the one Wine both legs ran, which the report quotes.
 //!
 //! Exit code 0 when nothing regressed, 1 when something did, and 2 when the
 //! run or the analysis could not be trusted: a failed benchmark, a build
@@ -37,6 +38,9 @@ pub const COMPARE: &str = "bench-compare";
 
 /// The file in an A/B directory that allows both legs one `d3d9.dll` image.
 const SAME_IMAGE_FILE: &str = "same-image-allowed";
+
+/// The file in an A/B directory that names the one Wine both legs ran.
+const WINE_FILE: &str = "wine.txt";
 
 /// One of the two builds an A/B run compares, and the directory its runs write into.
 #[derive(Debug, PartialEq, Eq)]

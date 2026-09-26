@@ -8,11 +8,14 @@
 //!
 //! - `time` and `noisy`: the ratio `cand / base` per pair. A regression is a
 //!   median ratio above `1 + max(T, 3 sigma)`, sigma being 1.4826 times the
-//!   MAD of the ratios, with at least 80 % of the pairs worse. `T` is 8 % for
-//!   a tail percentile (a name with `p99`), which moves more between runs,
-//!   and 3 % otherwise. An improvement is the mirror image.
-//! - `bytes`: the same, and the median difference must also exceed 4 MiB,
-//!   since a few percent of a small footprint is allocator noise.
+//!   MAD of the finite ratios, with at least 80 % of the pairs worse. `T` is
+//!   8 % for a tail percentile (a name with `p99`), which moves more between
+//!   runs, and 3 % otherwise. An improvement is the mirror image. A metric
+//!   whose base median is zero has no ratio and is judged by its median
+//!   difference against a small absolute floor instead.
+//! - `bytes`: the same with `T` at 3 % whatever the name, and the median
+//!   difference must also exceed 4 MiB, since a few percent of a small
+//!   footprint is allocator noise.
 //! - `spikes`: the difference per pair. A regression is a median difference
 //!   above `max(2, 3 MAD)`.
 //! - `exact`: any pair that differs is a change, worse or better, and a
@@ -36,8 +39,8 @@ use std::{
 };
 
 use super::{
-    Leg, SAME_IMAGE_FILE,
-    metrics::{self, Class, Direction, Metric, MetricsFile},
+    Leg, SAME_IMAGE_FILE, WINE_FILE,
+    metrics::{self, Class, Direction, Metric, MetricsFile, Unit},
     stats::{MAD_SIGMA, mad, median},
 };
 
@@ -53,6 +56,9 @@ const SIGMA_FACTOR: f64 = 3.0;
 /// The floor of a spike count's median difference, in events.
 const SPIKE_FLOOR: f64 = 2.0;
 
+/// The floor of a zero-base difference in a time: 0.1 ms, in the metric's own unit.
+const ZERO_BASE_FLOOR_MS: f64 = 0.1;
+
 /// The meta keys every metrics file has to carry for the sanity checks.
 const REQUIRED_META: [&str; 5] = [
     "layer",
@@ -62,8 +68,20 @@ const REQUIRED_META: [&str; 5] = [
     "debug_assertions",
 ];
 
-/// The `layer_image` value of a `d3d9.dll` that carries no image ID.
+/// The meta keys naming a loaded image, each with the binary it names.
+///
+/// `layer_image` is required, `layer_unix_image` optional: a key absent in
+/// both legs is no evidence either way.
+const IMAGE_META: [(&str, &str); 2] = [
+    ("layer_image", "d3d9.dll"),
+    ("layer_unix_image", "mtld3d.so"),
+];
+
+/// The image value of a binary that carries no image ID.
 const UNKNOWN_IMAGE: &str = "unknown";
+
+/// The note of an A/A run whose legs loaded one image.
+const SAME_IMAGE_NOTE: &str = "legs loaded identical binaries (A/A)";
 
 /// The meta keys both legs have to agree on: comparing two profiles measures the profiles.
 const MATCHING_META: [&str; 3] = ["arch", "profile", "debug_assertions"];
@@ -153,8 +171,6 @@ pub struct Row {
 #[derive(Debug)]
 pub struct BenchReport {
     pub bench: String,
-    /// `None` when both legs ran it, otherwise the one leg that did.
-    pub only: Option<Leg>,
     pub rows: Vec<Row>,
 }
 
@@ -188,19 +204,7 @@ impl Comparison {
         }
         for bench in &self.benches {
             out.push('\n');
-            match bench.only {
-                Some(Leg::Base) => {
-                    let _ = writeln!(out, "== {} (removed: only the base ran it)", bench.bench);
-                    continue;
-                }
-                Some(Leg::Cand) => {
-                    let _ = writeln!(out, "== {} (added: only the candidate ran it)", bench.bench);
-                    continue;
-                }
-                None => {
-                    let _ = writeln!(out, "== {}", bench.bench);
-                }
-            }
+            let _ = writeln!(out, "== {}", bench.bench);
             render_table(&mut out, &bench.rows);
         }
         if !self.notes.is_empty() {
@@ -220,27 +224,13 @@ impl Comparison {
     pub fn summary(&self) -> String {
         let count =
             |test: fn(&Verdict) -> bool| self.rows().filter(|row| test(&row.verdict)).count();
-        let judged = self
-            .benches
-            .iter()
-            .filter(|bench| bench.only.is_none())
-            .count();
+        let judged = self.benches.len();
         let regressions = count(|v| *v == Verdict::Regression);
         let improvements = count(|v| *v == Verdict::Improvement);
         let changes = count(|v| matches!(v, Verdict::Changed { .. }));
         let accepted = count(|v| matches!(v, Verdict::Changed { accepted: true, .. }));
-        let added = count(|v| *v == Verdict::Added)
-            + self
-                .benches
-                .iter()
-                .filter(|b| b.only == Some(Leg::Cand))
-                .count();
-        let removed = count(|v| *v == Verdict::Removed)
-            + self
-                .benches
-                .iter()
-                .filter(|b| b.only == Some(Leg::Base))
-                .count();
+        let added = count(|v| *v == Verdict::Added);
+        let removed = count(|v| *v == Verdict::Removed);
         let verdict = if self.failed() { "FAIL" } else { "PASS" };
         format!(
             "bench-compare: {verdict}: {judged} benchmarks, {} metrics: {regressions} regressed, \
@@ -303,15 +293,21 @@ pub fn evaluate(dir: &Path, options: &Options) -> Result<Comparison, String> {
     comparison.header = vec![
         format!("bench-compare: {}", dir.display()),
         format!(
-            "base: layer {} image {}   cand: layer {} image {}",
-            builds.base_layer, builds.base_image, builds.cand_layer, builds.cand_image
+            "layer: base {}   cand {}",
+            builds.base_layer, builds.cand_layer
         ),
+        format!("images (base / cand): {}", builds.images.join("; ")),
         format!(
             "{} profile, debug assertions {}, {}; {} round pairs",
             builds.profile,
             builds.debug_assertions,
             builds.arch,
             base.len()
+        ),
+        format!(
+            "wine: {}",
+            fs::read_to_string(dir.join(WINE_FILE))
+                .map_or_else(|_| "not recorded".to_owned(), |wine| wine.trim().to_owned())
         ),
         "change: + is worse whichever way the metric is better; noise: sigma of the pair ratios, \
          the MAD of spike differences, or how many exact pairs differ"
@@ -389,9 +385,9 @@ fn load_round(dir: &Path) -> Result<BTreeMap<String, Loaded>, String> {
 #[derive(Debug)]
 pub struct Builds {
     pub base_layer: String,
-    pub base_image: String,
     pub cand_layer: String,
-    pub cand_image: String,
+    /// Each image key both legs carry: `<binary> <base image> / <cand image>`.
+    pub images: Vec<String>,
     pub profile: String,
     pub debug_assertions: String,
     pub arch: String,
@@ -401,10 +397,12 @@ pub struct Builds {
 
 /// Check that each leg ran one build throughout, and the two legs two builds of one profile.
 ///
-/// Within a leg every file has to name the same layer stamp, image ID,
+/// Within a leg every file has to name the same layer stamp, image IDs,
 /// profile, debug-assertion state and architecture. Across the legs the last
 /// three have to match, and the image IDs have to differ: the two legs are
-/// separate builds, so one image in both means one DLL was loaded twice. The
+/// separate builds, so one image in both means one binary was loaded twice.
+/// That holds for `layer_image` and for `layer_unix_image` when both legs
+/// carry it, while a leg carrying it alone is an error. The
 /// release stamps may be equal, since a candidate with uncommitted changes
 /// carries the stamp of the commit it sits on. The one exception is a true
 /// A/A run, one commit against itself from a clean tree, where a
@@ -430,34 +428,93 @@ pub fn check_builds(
             ));
         }
     }
-    let (base_image, cand_image) = (&base_meta["layer_image"], &cand_meta["layer_image"]);
+    let a_a = allow_same_image && base_meta["layer"] == cand_meta["layer"];
     let mut notes = Vec::new();
-    if base_image == UNKNOWN_IMAGE || cand_image == UNKNOWN_IMAGE {
-        notes.push(
-            "a leg's d3d9.dll carries no image ID, so nothing shows the legs ran two builds"
-                .to_owned(),
+    let mut images = Vec::new();
+    for (key, binary) in IMAGE_META {
+        let pair = (
+            leg_optional(&Leg::Base, base, key)?,
+            leg_optional(&Leg::Cand, cand, key)?,
         );
-    } else if base_image == cand_image
-        && allow_same_image
-        && base_meta["layer"] == cand_meta["layer"]
-    {
-        notes.push("legs loaded identical binaries (A/A)".to_owned());
-    } else if base_image == cand_image {
-        return Err(format!(
-            "both legs loaded d3d9.dll image {base_image}: one DLL ran twice, so one leg did not \
-             run the build it was meant to"
-        ));
+        check_image(key, binary, &pair, a_a, &mut notes)?;
+        if let (Some(base_image), Some(cand_image)) = pair {
+            images.push(format!("{binary} {base_image} / {cand_image}"));
+        }
     }
     Ok(Builds {
         base_layer: base_meta["layer"].clone(),
-        base_image: base_image.clone(),
         cand_layer: cand_meta["layer"].clone(),
-        cand_image: cand_image.clone(),
+        images,
         profile: base_meta["profile"].clone(),
         debug_assertions: base_meta["debug_assertions"].clone(),
         arch: base_meta["arch"].clone(),
         notes,
     })
+}
+
+/// Check one image key across the legs, see [`check_builds`].
+fn check_image(
+    key: &str,
+    binary: &str,
+    pair: &(Option<String>, Option<String>),
+    a_a: bool,
+    notes: &mut Vec<String>,
+) -> Result<(), String> {
+    let (base_image, cand_image) = match pair {
+        (None, None) => return Ok(()),
+        (Some(base_image), Some(cand_image)) => (base_image, cand_image),
+        (Some(_), None) | (None, Some(_)) => {
+            return Err(format!(
+                "meta {key} is in one leg's metrics only: the legs did not run the same \
+                 benchmark binary"
+            ));
+        }
+    };
+    if base_image == UNKNOWN_IMAGE || cand_image == UNKNOWN_IMAGE {
+        notes.push(format!(
+            "a leg's {binary} carries no image ID, so nothing shows the legs ran two builds of it"
+        ));
+    } else if base_image == cand_image && a_a {
+        if !notes.iter().any(|note| note == SAME_IMAGE_NOTE) {
+            notes.push(SAME_IMAGE_NOTE.to_owned());
+        }
+    } else if base_image == cand_image {
+        return Err(format!(
+            "both legs loaded {binary} image {base_image}: one binary ran twice, so one leg did \
+             not run the build it was meant to"
+        ));
+    }
+    Ok(())
+}
+
+/// An optional meta value of one leg, checked to be the same, or absent, in every file.
+fn leg_optional(
+    leg: &Leg,
+    rounds: &[BTreeMap<String, Loaded>],
+    key: &str,
+) -> Result<Option<String>, String> {
+    let mut first: Option<(Option<&String>, &Path)> = None;
+    for loaded in rounds.iter().flat_map(BTreeMap::values) {
+        let value = loaded.file.meta.get(key);
+        match first {
+            None => first = Some((value, &loaded.path)),
+            Some((seen, seen_path)) if seen != value => {
+                let shown = |v: Option<&String>| {
+                    v.map_or_else(|| "absent".to_owned(), |v| format!("{v:?}"))
+                };
+                return Err(format!(
+                    "the {} leg did not run one build: meta {key} is {} in {} and {} in {}",
+                    leg.dir(),
+                    shown(seen),
+                    seen_path.display(),
+                    shown(value),
+                    loaded.path.display()
+                ));
+            }
+            Some(_) => {}
+        }
+    }
+    Ok(first.and_then(|(value, _)| value.cloned()))
 }
 
 /// The required meta values of one leg, checked to be the same in every file.
@@ -504,7 +561,8 @@ fn leg_meta(
 /// # Errors
 ///
 /// Returns a message when a benchmark is missing from some rounds of a leg
-/// or a metric changes its definition or comes and goes between rounds.
+/// or from the other leg altogether, or a metric changes its definition or
+/// comes and goes between rounds.
 pub fn compare(
     base: &[BTreeMap<String, Loaded>],
     cand: &[BTreeMap<String, Loaded>],
@@ -513,21 +571,21 @@ pub fn compare(
     let base_benches = leg_benches(&Leg::Base, base)?;
     let cand_benches = leg_benches(&Leg::Cand, cand)?;
     let mut benches = Vec::new();
-    for bench in base_benches.union(&cand_benches) {
-        let only = match (base_benches.contains(bench), cand_benches.contains(bench)) {
-            (true, false) => Some(Leg::Base),
-            (false, true) => Some(Leg::Cand),
-            _ => None,
-        };
-        let rows = if only.is_none() {
-            bench_rows(bench, base, cand, options)?
+    if let Some(bench) = base_benches.symmetric_difference(&cand_benches).next() {
+        let ran = if base_benches.contains(bench) {
+            "base"
         } else {
-            Vec::new()
+            "cand"
         };
+        return Err(format!(
+            "incomplete run: benchmark {bench} ran only in the {ran} leg; both legs have to run \
+             every benchmark for the run to be judged"
+        ));
+    }
+    for bench in &base_benches {
         benches.push(BenchReport {
             bench: bench.clone(),
-            only,
-            rows,
+            rows: bench_rows(bench, base, cand, options)?,
         });
     }
     let mut notes = Vec::new();
@@ -688,9 +746,21 @@ pub fn judge(name: &str, definition: &Metric, base: &[f64], cand: &[f64], accept
             let ratios: Vec<f64> = pairs
                 .map(|(&b, &c)| if lower { ratio(c, b) } else { ratio(b, c) })
                 .collect();
+            if median(base) == 0.0 {
+                judge_zero_base(&mut row, definition, &worse_by);
+                return row;
+            }
             let center = median(&ratios);
-            let sigma = MAD_SIGMA * mad(&ratios);
-            let floor = if name.contains("p99") {
+            // A pair on a zero base has an infinite ratio: it counts toward
+            // the median and the 80 % rule, but a spread has to be finite.
+            let finite: Vec<f64> = ratios.iter().copied().filter(|r| r.is_finite()).collect();
+            let spread = mad(&finite);
+            let sigma = if spread.is_finite() {
+                MAD_SIGMA * spread
+            } else {
+                0.0
+            };
+            let floor = if name.contains("p99") && definition.class != Class::Bytes {
                 RATIO_FLOOR_TAIL
             } else {
                 RATIO_FLOOR
@@ -698,6 +768,11 @@ pub fn judge(name: &str, definition: &Metric, base: &[f64], cand: &[f64], accept
             let threshold = floor.max(SIGMA_FACTOR * sigma);
             let worse = ratios.iter().filter(|&&r| r > 1.0).count();
             let better = ratios.iter().filter(|&&r| r < 1.0).count();
+            if center.is_nan() {
+                row.change.push_str("undefined");
+                row.verdict = Verdict::Neutral;
+                return row;
+            }
             let mut regressed = center > 1.0 + threshold && most(worse, ratios.len());
             let mut improved = center < 1.0 - threshold && most(better, ratios.len());
             row.change = format!("{:+.2}%", (center - 1.0) * 100.0);
@@ -737,6 +812,44 @@ pub fn judge(name: &str, definition: &Metric, base: &[f64], cand: &[f64], accept
         }
     }
     row
+}
+
+/// Judge a ratio-judged metric whose base median is zero, which has no ratio to judge by.
+///
+/// The median difference decides, against a floor in the metric's unit
+/// (see [`zero_base_floor`]), with the same 80 % rule as a ratio: a time
+/// the base did not spend at all and the candidate spends a little of is
+/// reported, and fails only past the floor.
+fn judge_zero_base(row: &mut Row, definition: &Metric, worse_by: &[f64]) {
+    let center = median(worse_by);
+    let floor = zero_base_floor(&definition.unit);
+    let worse = worse_by.iter().filter(|&&d| d > 0.0).count();
+    let better = worse_by.iter().filter(|&&d| d < 0.0).count();
+    row.change = format!(
+        "{:+} {} (zero base)",
+        number(center),
+        definition.unit.as_str()
+    );
+    row.noise = format!("floor {}", number(floor));
+    row.verdict = verdict(
+        center > floor && most(worse, worse_by.len()),
+        center < -floor && most(better, worse_by.len()),
+    );
+}
+
+/// The least difference a zero-base metric has to move by, in its own unit.
+///
+/// 0.1 ms for a time, two for a count (the spike floor), 0.03 for a ratio
+/// (the ratio floor), and 4 MiB for memory.
+fn zero_base_floor(unit: &Unit) -> f64 {
+    match unit {
+        Unit::Ms => ZERO_BASE_FLOOR_MS,
+        Unit::Us => ZERO_BASE_FLOOR_MS * 1e3,
+        Unit::Ns => ZERO_BASE_FLOOR_MS * 1e6,
+        Unit::Count => SPIKE_FLOOR,
+        Unit::Ratio => RATIO_FLOOR,
+        Unit::Mib | Unit::Bytes => unit.four_mib().unwrap_or_default(),
+    }
 }
 
 /// `numerator / denominator`, with two zeros equal and a zero denominator infinitely worse.

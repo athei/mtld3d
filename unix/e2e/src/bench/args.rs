@@ -13,6 +13,9 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_mins(5);
 /// How many rounds a run has when `--runs` is not given.
 const DEFAULT_RUNS: u32 = 5;
 
+/// The fewest rounds a run may have: under three, a median is one pair or the mean of two.
+const MIN_RUNS: u32 = 3;
+
 /// A parsed `bench-compare` invocation.
 #[derive(Debug)]
 pub struct CompareConfig {
@@ -56,7 +59,7 @@ pub fn parse_compare(mut args: impl Iterator<Item = String>) -> Result<CompareCo
 /// Mandatory: `--out <dir>`, and for each leg (`base`, `cand`) the Wine
 /// loader `--<leg>-wine <path>`, the prefix `--<leg>-prefix <dir>` and the
 /// layer stamp the leg's runs must report, `--<leg>-stamp <stamp>`; then
-/// `--` and the test binaries. Optional: `--runs <n>` (default 5), `--bench
+/// `--` and the test binaries. Optional: `--runs <n>` (default 5, at least 3), `--bench
 /// <patterns>` (whitespace-separated, repeatable; none means every
 /// benchmark), `--config <MTLD3D_CONFIG>`, `--timeout <secs>` (default 300),
 /// `--accept a,b`, `--report <file>` and `--allow-same-image` (the legs are
@@ -86,7 +89,15 @@ pub fn parse_ab(mut args: impl Iterator<Item = String>) -> Result<AbConfig, Stri
             "--cand-prefix" => cand.prefix = Some(PathBuf::from(value(&mut args, &arg)?)),
             "--cand-stamp" => cand.stamp = Some(value(&mut args, &arg)?),
             "--out" => out = Some(PathBuf::from(value(&mut args, &arg)?)),
-            "--runs" => runs = count(&value(&mut args, &arg)?, &arg)?,
+            "--runs" => {
+                runs = count(&value(&mut args, &arg)?, &arg)?;
+                if runs < MIN_RUNS {
+                    return Err(format!(
+                        "--runs must be at least {MIN_RUNS}: fewer rounds give the median and \
+                         the MAD nothing to work with"
+                    ));
+                }
+            }
             "--bench" => {
                 benches.extend(
                     value(&mut args, &arg)?
