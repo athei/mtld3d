@@ -129,7 +129,7 @@ fn poll(name: &str, keys: &'static str, answering: &Answering) {
     let capacity = usize::try_from(MIN_MEASURED.as_micros() / FRAME_FLOOR.as_micros())
         .expect("frame capacity fits usize")
         .max(MEASURED_FRAMES);
-    let mut clock = FrameClock::start(&tsc, capacity);
+    let mut clock = FrameClock::start(capacity);
     let mut polls = Vec::with_capacity(capacity);
     let mut latencies = Vec::with_capacity(capacity);
     let (mut ready, mut pending) = (0, 0);
@@ -143,7 +143,7 @@ fn poll(name: &str, keys: &'static str, answering: &Answering) {
             .throttle(frame)
             .expect("the previous frame issued its EVENT query");
         polls.push(answer.polls);
-        latencies.push(tsc.duration(answer.latency));
+        latencies.push(TscClock::duration(answer.latency));
         clock.present(&h);
         frame += 1;
     }

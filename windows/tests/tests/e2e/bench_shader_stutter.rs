@@ -122,7 +122,7 @@ fn stutter(name: &str, per_frame: u32, offscreen: u32) {
     let warm = MemorySample::now();
     let from = log.mark();
     let started = TscClock::now();
-    let mut clock = FrameClock::start(&tsc, usize::try_from(MEASURED_FRAMES).expect("fits usize"));
+    let mut clock = FrameClock::start(usize::try_from(MEASURED_FRAMES).expect("fits usize"));
     for frame in 0..MEASURED_FRAMES {
         assert!(h.pump(), "WM_QUIT during the measured frames");
         bench.base_frame();
@@ -131,8 +131,8 @@ fn stutter(name: &str, per_frame: u32, offscreen: u32) {
         clock.present(&h);
     }
     let introduced = TscClock::now();
-    let mut settle = FrameClock::start(&tsc, SETTLE_CAPACITY);
-    while tsc.since(introduced) < IDLE_TAIL || tsc.since(started) < MIN_SPAN {
+    let mut settle = FrameClock::start(SETTLE_CAPACITY);
+    while TscClock::since(introduced) < IDLE_TAIL || TscClock::since(started) < MIN_SPAN {
         assert!(h.pump(), "WM_QUIT while the frames settle");
         bench.base_frame();
         ok(h.end_scene(), "EndScene");
@@ -140,7 +140,7 @@ fn stutter(name: &str, per_frame: u32, offscreen: u32) {
     }
     let settle_frames = settle.frames();
     let to = log.mark();
-    let span = tsc.since(started);
+    let span = TscClock::since(started);
     let end = MemorySample::now();
     let verified = bench.verify();
 

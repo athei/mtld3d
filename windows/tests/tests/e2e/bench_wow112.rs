@@ -303,12 +303,12 @@ fn wow_112_busy_frame() {
         ok(h.present(), "Present");
     }
     let log = LayerLog::find(since);
-    let warm_up = tsc.since(started);
+    let warm_up = TscClock::since(started);
     let warm = MemorySample::now();
 
     let from = log.mark();
     let pending_from = frame.calls.pending_polls.get();
-    let mut clock = FrameClock::start(&tsc, MEASURED_FRAMES * 4);
+    let mut clock = FrameClock::start(MEASURED_FRAMES * 4);
     let mut tick = WARM_UP_FRAMES;
     let mut one_frame = Vec::new();
     while clock.frames() < MEASURED_FRAMES || clock.elapsed() < MIN_MEASURED {

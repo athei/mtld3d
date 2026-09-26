@@ -205,14 +205,14 @@ fn api_call_cost() {
     let started = TscClock::now();
     let mut samples: Vec<Vec<f64>> = KINDS.iter().map(|_| Vec::new()).collect();
     let mut rounds = 0;
-    while rounds < ROUNDS || tsc.since(started) < MIN_MEASURED {
+    while rounds < ROUNDS || TscClock::since(started) < MIN_MEASURED {
         for (kind, samples) in KINDS.iter().zip(&mut samples) {
             let batch = bench.frame(kind);
-            samples.push(tsc.nanos(batch) / f64::from(CALLS));
+            samples.push(TscClock::ticks_ns(batch) / f64::from(CALLS));
         }
         rounds += 1;
     }
-    let measured = tsc.since(started);
+    let measured = TscClock::since(started);
     let to = log.mark();
     let end = MemorySample::now();
 

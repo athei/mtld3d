@@ -128,6 +128,22 @@ const UNIX_INITIALIZED: &str = " initialized";
 /// The block of a perf window that [`LayerLog::compilation_rows`] copies.
 const COMPILATION_BLOCK: [&str; 1] = ["Compilation"];
 
+/// The least time the calls of one [`CallTimes`] sample add up to.
+///
+/// At least a hundred times the clock's step: each metrics file's
+/// `tsc_granularity_ns` says what the step was, and a floor chosen for the
+/// 100 ns `QueryPerformanceCounter` tick is far above any `rdtsc` step.
+pub const SAMPLE_FLOOR: Duration = Duration::from_micros(20);
+
+/// The least time a single call takes to count as a spike, whatever the median.
+///
+/// The `LockRect` stalls a game shows take milliseconds; this keeps a
+/// median of a few ticks from turning every third-tick call into one.
+pub const SPIKE_FLOOR: Duration = Duration::from_micros(50);
+
+/// The fewest samples whose p99 a comparison reads as a time rather than as context.
+pub const MIN_P99_SAMPLES: usize = 50;
+
 /// Edge of every pattern texture, in texels.
 const TEXTURE_EDGE: u32 = 64;
 
@@ -143,9 +159,11 @@ pub enum Model {
 ///
 /// `mtld3d_shared::tsc` is what the layer's perf counters read, so a
 /// benchmark's times and the layer's own divide by one calibration. The rate
-/// is latched once per process by its first reader, so [`Self::calibrated`]
-/// runs before anything is timed and a later conversion never waits for it.
-/// A count is comparable only within one process.
+/// is latched once per process by its first reader: a benchmark calls
+/// [`Self::calibrated`] before it times anything, so no conversion made
+/// while it measures waits for the calibration, and the conversions read
+/// the latched rate from anywhere. A count is comparable only within one
+/// process.
 pub struct TscClock {
     hz: u64,
     granularity_ns: f64,
@@ -169,16 +187,12 @@ impl TscClock {
             }
             last = now;
         }
-        let mut clock = Self {
-            hz,
-            granularity_ns: 0.0,
-        };
-        clock.granularity_ns = if smallest == u64::MAX {
+        let granularity_ns = if smallest == u64::MAX {
             0.0
         } else {
-            clock.nanos(smallest)
+            Self::ticks_ns(smallest)
         };
-        clock
+        Self { hz, granularity_ns }
     }
 
     /// The counter now.
@@ -189,37 +203,35 @@ impl TscClock {
 
     /// The time from `start`, a [`Self::now`] reading, to now.
     #[inline]
-    pub fn since(&self, start: u64) -> Duration {
-        self.duration(Self::now().saturating_sub(start))
+    pub fn since(start: u64) -> Duration {
+        Self::duration(Self::now().saturating_sub(start))
     }
 
     /// `ticks` of the counter as a duration, to the nanosecond.
-    pub fn duration(&self, ticks: u64) -> Duration {
-        let nanos = u128::from(ticks) * 1_000_000_000 / u128::from(self.hz);
+    pub fn duration(ticks: u64) -> Duration {
+        let nanos = u128::from(ticks) * 1_000_000_000 / u128::from(tsc_hz());
         Duration::from_nanos(u64::try_from(nanos).unwrap_or(u64::MAX))
     }
 
     /// `ticks` of the counter in nanoseconds, with the fraction.
-    pub fn nanos(&self, ticks: u64) -> f64 {
-        u64_to_f64_exact(ticks) * 1e9 / u64_to_f64_exact(self.hz)
+    pub fn ticks_ns(ticks: u64) -> f64 {
+        u64_to_f64_exact(ticks) * 1e9 / u64_to_f64_exact(tsc_hz())
     }
 }
 
 /// Present-to-Present frame times, and the API thread's work before each `Present`.
 ///
-/// Read with `rdtsc` through the benchmark's [`TscClock`].
-pub struct FrameClock<'c> {
-    clock: &'c TscClock,
+/// Read with [`TscClock`], which the benchmark calibrated before it started this.
+pub struct FrameClock {
     last: u64,
     times: Vec<Duration>,
     work: Vec<Duration>,
 }
 
-impl<'c> FrameClock<'c> {
+impl FrameClock {
     /// A clock whose first frame ends at the next [`Self::present`].
-    pub fn start(clock: &'c TscClock, capacity: usize) -> Self {
+    pub fn start(capacity: usize) -> Self {
         Self {
-            clock,
             last: TscClock::now(),
             times: Vec::with_capacity(capacity),
             work: Vec::with_capacity(capacity),
@@ -235,9 +247,9 @@ impl<'c> FrameClock<'c> {
         ok(h.present(), "Present");
         let now = TscClock::now();
         self.work
-            .push(self.clock.duration(called.saturating_sub(self.last)));
+            .push(TscClock::duration(called.saturating_sub(self.last)));
         self.times
-            .push(self.clock.duration(now.saturating_sub(self.last)));
+            .push(TscClock::duration(now.saturating_sub(self.last)));
         self.last = now;
     }
 
@@ -310,6 +322,90 @@ impl FrameStats {
             ms(self.p50),
             ms(self.p99),
             ms(self.max)
+        )
+    }
+}
+
+/// The times of one kind of call a benchmark makes itself, summarised well above the clock's tick.
+///
+/// A call far shorter than a frame is timed within a few steps of the
+/// clock, and its single time moves with the machine more than with the
+/// layer. A sample here is the mean time per call over whole frames
+/// instead: [`Self::add`] sums a frame's calls, and
+/// [`Self::end_frame`] closes a sample once the frames it spans add up to
+/// at least [`SAMPLE_FLOOR`], so one tick is under 1 % of it. Frequent
+/// calls give one sample a frame, rare ones one per several frames. The
+/// slowest single call is kept, and so is every single call of at least
+/// [`SPIKE_FLOOR`], the calls [`Self::spikes`] counts.
+#[derive(Default)]
+pub struct CallTimes {
+    open: Duration,
+    open_calls: u32,
+    samples: Vec<Duration>,
+    calls: u64,
+    max: Duration,
+    slow: Vec<Duration>,
+}
+
+impl CallTimes {
+    /// Count one call that took `took`.
+    pub fn add(&mut self, took: Duration) {
+        self.open += took;
+        self.open_calls += 1;
+        self.calls += 1;
+        self.max = self.max.max(took);
+        if took >= SPIKE_FLOOR {
+            self.slow.push(took);
+        }
+    }
+
+    /// End a frame: close the open sample if its calls add up to [`SAMPLE_FLOOR`].
+    pub fn end_frame(&mut self) {
+        if self.open >= SAMPLE_FLOOR {
+            self.samples.push(self.open / self.open_calls);
+            self.open = Duration::ZERO;
+            self.open_calls = 0;
+        }
+    }
+
+    /// Calls counted.
+    pub const fn calls(&self) -> u64 {
+        self.calls
+    }
+
+    /// The summary of the per-call samples, or `None` when no sample was closed.
+    pub fn stats(&self) -> Option<FrameStats> {
+        (!self.samples.is_empty()).then(|| FrameStats::of(&self.samples))
+    }
+
+    /// Single calls slower than twice the median sample and than [`SPIKE_FLOOR`], and that limit.
+    ///
+    /// With no sample closed the limit is [`SPIKE_FLOOR`] alone.
+    pub fn spikes(&self) -> (usize, Duration) {
+        let limit = self
+            .stats()
+            .map_or(SPIKE_FLOOR, |stats| (stats.p50 * 2).max(SPIKE_FLOOR));
+        let count = self.slow.iter().filter(|&&took| took > limit).count();
+        (count, limit)
+    }
+
+    /// One report row: the samples' p50 and p99 per call, and the slowest single call, in ns.
+    pub fn row(&self) -> String {
+        let summary = self.stats().map_or_else(
+            || "no sample closed".to_owned(),
+            |stats| {
+                format!(
+                    "per call p50 {} ns  p99 {} ns (nearest-rank over {} samples of whole frames)",
+                    stats.p50.as_nanos(),
+                    stats.p99.as_nanos(),
+                    stats.frames
+                )
+            },
+        );
+        format!(
+            "{summary}, {} calls, slowest single call {} ns",
+            self.calls,
+            self.max.as_nanos()
         )
     }
 }
@@ -618,7 +714,7 @@ impl Direction {
 pub enum Class {
     /// A time a build's speed decides.
     Time,
-    /// A count of frames that took too long.
+    /// A count of frames or calls that exceed a spike limit.
     Spikes,
     /// A count that must not change: any difference is a real one.
     Exact,
@@ -865,6 +961,44 @@ impl Metrics {
                 class,
             );
         }
+    }
+
+    /// The `<prefix>.samples`, `.p50`, `.p99` and `.max` records of one kind of call.
+    ///
+    /// The percentiles, of the per-call samples and in nanoseconds, are
+    /// compared as times, the p99 only from [`MIN_P99_SAMPLES`] samples up,
+    /// since below that it is one of the few slowest samples; the sample
+    /// count and the slowest single call are reported alone. With no sample
+    /// closed there are no percentiles to write, and the count says so.
+    pub fn call_rows(&mut self, prefix: &str, calls: &CallTimes) {
+        let samples = u64::try_from(calls.samples.len()).expect("sample count fits u64");
+        self.metric(
+            &format!("{prefix}.samples"),
+            Value::Count(samples),
+            Direction::Higher,
+            Class::Info,
+        );
+        if let Some(stats) = calls.stats() {
+            let p99 = if stats.frames < MIN_P99_SAMPLES {
+                Class::Info
+            } else {
+                Class::Time
+            };
+            for (row, value, class) in [("p50", stats.p50, Class::Time), ("p99", stats.p99, p99)] {
+                self.metric(
+                    &format!("{prefix}.{row}"),
+                    Value::Ns(nanos(value)),
+                    Direction::Lower,
+                    class,
+                );
+            }
+        }
+        self.metric(
+            &format!("{prefix}.max"),
+            Value::Ns(nanos(calls.max)),
+            Direction::Lower,
+            Class::Info,
+        );
     }
 
     /// The `mem.*` records of the samples taken after the warm-up and at the end.
@@ -1443,6 +1577,11 @@ pub const fn nearest_rank(count: usize, percent: usize) -> usize {
 /// Whether `row`, at block indent, is the first row of any block the grid has a title for.
 fn opens(row: &str) -> bool {
     PERF_BLOCKS.iter().any(|block| row.starts_with(block))
+}
+
+/// `duration` in nanoseconds, with the fraction a `Duration` carries (none below one).
+pub fn nanos(duration: Duration) -> f64 {
+    duration.as_secs_f64() * 1e9
 }
 
 fn ms(duration: Duration) -> f64 {

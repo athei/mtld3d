@@ -2128,30 +2128,42 @@ impl LockedRect<'_> {
         // (caller's contract) and lives until this guard drops.
         unsafe { core::slice::from_raw_parts(self.bits.cast::<u16>(), count) }
     }
-}
 
-impl Drop for LockedRect<'_> {
-    fn drop(&mut self) {
+    /// Unlock now and return the `UnlockRect` hr, which the drop would discard.
+    #[must_use]
+    pub fn unlock(self) -> i32 {
+        let hr = self.unlock_rect();
+        core::mem::forget(self);
+        hr
+    }
+
+    fn unlock_rect(&self) -> i32 {
         match self.owner {
             LockOwner::Texture { this, level } => {
                 // SAFETY: `this` is the live texture this guard locked.
                 let vtbl = unsafe { deref_vtbl::<IDirect3DTexture9Vtbl>(this) };
                 // SAFETY: vtable thunk; `this` is the matching live texture.
-                unsafe { (vtbl.unlock_rect)(this, level) };
+                unsafe { (vtbl.unlock_rect)(this, level) }
             }
             LockOwner::Cube { this, face, level } => {
                 // SAFETY: `this` is the live cube texture this guard locked.
                 let vtbl = unsafe { deref_vtbl::<IDirect3DCubeTexture9Vtbl>(this) };
                 // SAFETY: vtable thunk; face and level match the lock.
-                unsafe { (vtbl.unlock_rect)(this, face, level) };
+                unsafe { (vtbl.unlock_rect)(this, face, level) }
             }
             LockOwner::Surface { this } => {
                 // SAFETY: `this` is the live surface this guard locked.
                 let vtbl = unsafe { deref_vtbl::<IDirect3DSurface9Vtbl>(this) };
                 // SAFETY: vtable thunk; `this` is the matching live surface.
-                unsafe { (vtbl.unlock_rect)(this) };
+                unsafe { (vtbl.unlock_rect)(this) }
             }
         }
+    }
+}
+
+impl Drop for LockedRect<'_> {
+    fn drop(&mut self) {
+        self.unlock_rect();
     }
 }
 
@@ -2190,6 +2202,17 @@ impl BufferLock<'_> {
         // SAFETY: the copy above initialised `count` elements.
         unsafe { out.set_len(count) };
         out
+    }
+
+    /// Unlock now and return the `Unlock` hr, which the drop would discard.
+    #[must_use]
+    pub fn unlock(self) -> i32 {
+        // SAFETY: `self.unlock` is this buffer's unlock thunk and `self.this` is
+        // the live buffer it came from; forgetting the guard keeps the drop from
+        // unlocking a second time.
+        let hr = unsafe { (self.unlock)(self.this) };
+        core::mem::forget(self);
+        hr
     }
 }
 
