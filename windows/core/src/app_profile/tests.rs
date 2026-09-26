@@ -1,4 +1,4 @@
-use super::{AppIdentity, AppProfile, PROFILES, lookup};
+use super::{AppIdentity, AppProfile, PROFILES, builtin, lookup};
 use crate::config::{AdapterSpoof, CursorScale, parse};
 
 /// The three fields read out of the shipped `GTAIV.exe`.
@@ -227,4 +227,15 @@ fn a_malformed_profile_entry_does_not_derail_the_rest() {
     };
     let cfg = parse(Some(&broken), "", None);
     assert_eq!(cfg.present_max_fps, 45);
+}
+
+#[test]
+fn a_builtin_profile_is_found_by_name_alone() {
+    let wow = builtin("wow").expect("the wow profile ships");
+    assert_eq!(wow.name(), "wow");
+    assert!(wow.settings().contains("query.eventImmediate=true"));
+    assert!(
+        builtin("WoW.exe").is_none(),
+        "an executable name is not a profile name"
+    );
 }

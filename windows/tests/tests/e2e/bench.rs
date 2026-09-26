@@ -191,7 +191,11 @@ pub struct FrameStats {
 }
 
 impl FrameStats {
-    fn of(times: &[Duration]) -> Self {
+    /// The summary of `times`, which need not be sorted.
+    ///
+    /// # Panics
+    /// Panics if `times` is empty.
+    pub fn of(times: &[Duration]) -> Self {
         let mut sorted = times.to_vec();
         sorted.sort_unstable();
         let frames = sorted.len();
@@ -555,6 +559,8 @@ pub enum Value {
     Count(u64),
     /// Bytes, written as MiB with two decimals.
     Mib(u64),
+    /// Nanoseconds, one decimal.
+    Ns(f64),
     /// A number from the layer's `perf-kv` line, in `unit`, written with `decimals` places.
     Perf {
         value: f64,
@@ -570,6 +576,7 @@ impl Value {
             Self::Ms(duration) => (format!("{:.4}", ms(duration)), "ms"),
             Self::Count(count) => (count.to_string(), "count"),
             Self::Mib(bytes) => (mib(bytes), "mib"),
+            Self::Ns(nanos) => (format!("{nanos:.1}"), "ns"),
             Self::Perf {
                 value,
                 unit,
@@ -642,7 +649,7 @@ pub struct PassShape {
 ///   `layer_unix_image` is the image ID on the unix library's `mtld3d.so`
 ///   line (or `unknown`), since most of the layer is in that library.
 /// - `metric <bench> <name> <value> <unit> <direction> <class>`: a name of
-///   `[a-z0-9_.]`, a unit of `ms`, `count`, `mib` or `bytes`, a
+///   `[a-z0-9_.]`, a unit of `ms`, `ns`, `count`, `mib` or `bytes`, a
 ///   [`Direction`] and a [`Class`]. The `perf.*` metrics come from the
 ///   layer's `perf-kv` lines ([`Self::perf`] has the rules); a file without
 ///   them says why in a `# no perf-kv line` comment.

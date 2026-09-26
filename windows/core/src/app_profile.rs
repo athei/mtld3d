@@ -171,6 +171,15 @@ pub fn lookup(id: &AppIdentity) -> Option<&'static AppProfile> {
     profile
 }
 
+/// The built-in profile called `name`, whatever application it matches.
+///
+/// For a caller that runs a profile's options without being its
+/// application, such as a benchmark that must follow what the profile sets.
+#[must_use]
+pub fn builtin(name: &str) -> Option<&'static AppProfile> {
+    PROFILES.iter().find(|p| p.name == name)
+}
+
 /// Whether an optional substring constraint holds, case-insensitively.
 ///
 /// A profile that leaves the field unset places no constraint at all.
