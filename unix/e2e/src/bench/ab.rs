@@ -7,13 +7,16 @@
 //! `r` runs the base first when `r` is even and the candidate first when it
 //! is odd. After its rounds, a benchmark whose metrics declare `shape` lines
 //! runs once more in either leg with the pass trace on, into
-//! `<out>/<leg>/shape/<test>`; that run's numbers are never judged (the
-//! trace costs frame time), and its layer log is the pass shape `compare`
-//! diffs between the legs. A benchmark without `shape` lines gets no shape
-//! run, with a note: its frame is not meant to be steady. A run that fails,
-//! writes no metrics file, or reports a layer stamp other than its leg's
-//! ends the whole A/B run at once: every number after it would be measured
-//! against the wrong build or none.
+//! `<out>/<leg>/shape/<test>`; that run is never timed (the trace costs
+//! frame time), and its layer log is the pass shape `compare` diffs between
+//! the legs. It is stopped once the log holds enough steady submissions
+//! (`shape::Watch`), so it writes no metrics: its build is checked from the
+//! log's identity lines instead, against the leg's stamp and the images the
+//! leg's timed rounds loaded. A benchmark without `shape` lines gets no
+//! shape run, with a note: its frame is not meant to be steady. A run that
+//! fails, writes no metrics file, or reports a layer stamp other than its
+//! leg's ends the whole A/B run at once: every number after it would be
+//! measured against the wrong build or none.
 //!
 //! The host emitter benchmark, when the run has one, comes after the
 //! end-to-end benchmarks in the same order, without a shape run. It is host
@@ -22,7 +25,7 @@
 //! the run is checked the same way.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     ffi::OsString,
     fmt::Write as _,
     fs,
@@ -36,11 +39,12 @@ use super::{
     Leg, SAME_IMAGE_FILE, SHAPE_DIR, WINE_FILE,
     compare::{self, Options},
     metrics::{self, Class, MetricsFile},
-    shape::{self, SHAPE_RUST_LOG},
+    shape::{self, Identity, SHAPE_RUST_LOG},
 };
 use crate::{
     attribute::{self, BinaryOutcome, Launcher as _, Report, TestResult, Verdict},
-    binary::{WineLauncher, binary_name},
+    binary::{WineLauncher, binary_name, stderr_tail},
+    run::ExitKind,
     select::{selected, test_id},
 };
 
@@ -61,6 +65,9 @@ const HOST_POLL: Duration = Duration::from_millis(50);
 
 /// How many of its last lines a failed host benchmark's error quotes.
 const HOST_TAIL_LINES: usize = 15;
+
+/// The image value of a binary whose log line names none, as the metrics files write it.
+const UNKNOWN_IMAGE: &str = "unknown";
 
 /// One leg: the Wine that runs it, its prefix, and the layer stamp its runs must report.
 #[derive(Debug)]
@@ -108,6 +115,13 @@ pub struct HostBench {
     pub cand: PathBuf,
     /// Shader caches both legs time besides the synthetic corpora.
     pub corpora: Vec<PathBuf>,
+}
+
+/// The images a run loaded: the `d3d9.dll` and the `mtld3d.so`, as the metrics files name them.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Images {
+    pub layer: String,
+    pub unix: String,
 }
 
 /// One run of the A/B schedule.
@@ -181,8 +195,10 @@ pub fn run(config: &AbConfig) -> Result<ExitCode, String> {
         out.display()
     );
     // Whether each benchmark's metrics declare its frame in `shape` lines,
-    // which is what earns it a shape run after its rounds.
+    // which is what earns it a shape run after its rounds, and what its
+    // rounds wrote that the shape runs are checked against.
     let mut declares_shape = vec![false; jobs.len()];
+    let mut timed: Vec<Timed> = jobs.iter().map(|_| Timed::default()).collect();
     for step in schedule(jobs.len(), config.runs) {
         let (index, leg, round) = match step {
             Step::Shape { bench, leg } => (bench, leg, None),
@@ -210,20 +226,25 @@ pub fn run(config: &AbConfig) -> Result<ExitCode, String> {
                 .join(leg.dir())
                 .join(SHAPE_DIR)
                 .join(shape::run_dir_name(&bench.name));
-            for (path, file) in &run_one(config, spec, bench, &dir, Some(SHAPE_RUST_LOG))? {
-                check_stamp(path, file, spec)?;
-            }
+            let (log, kind) = run_shape(config, spec, bench, &dir, &timed[index].benches)?;
+            let identity = shape::identity(&log)?;
+            check_shape_build(&log, &identity, spec, timed[index].images(&leg))?;
             println!(
-                "bench-ab: {} shape run {}: pass trace in {}",
+                "bench-ab: {} shape run {}: pass trace in {}{}",
                 bench.id,
                 leg.dir(),
-                dir.display()
+                dir.display(),
+                if kind == ExitKind::Stopped {
+                    ", stopped once it held the steady submissions"
+                } else {
+                    ""
+                }
             );
             continue;
         };
         let dir = out.join(leg.dir()).join(round.to_string());
         let (id, written) = match jobs[index] {
-            Job::Bench(bench) => (bench.id.as_str(), run_one(config, spec, bench, &dir, None)?),
+            Job::Bench(bench) => (bench.id.as_str(), run_one(config, spec, bench, &dir)?),
             Job::Host(host) => {
                 let exe = match leg {
                     Leg::Base => &host.base,
@@ -233,6 +254,7 @@ pub fn run(config: &AbConfig) -> Result<ExitCode, String> {
             }
         };
         declares_shape[index] |= written.iter().any(|(_, file)| !file.shape.is_empty());
+        timed[index].note(&leg, &written);
         for (path, file) in &written {
             check_stamp(path, file, spec)?;
             println!(
@@ -402,14 +424,11 @@ pub fn run_config(base: &str, dir: &Path) -> String {
 }
 
 /// Run `bench` once under `spec`, and read the metrics files it wrote into `dir`.
-///
-/// `rust_log` replaces the `RUST_LOG` the process inherits, for the shape run.
 fn run_one(
     config: &AbConfig,
     spec: &LegSpec,
     bench: &Bench,
     dir: &Path,
-    rust_log: Option<&str>,
 ) -> Result<Vec<(PathBuf, MetricsFile)>, String> {
     fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     if let Some(corpus) = &config.corpus_dir {
@@ -418,9 +437,6 @@ fn run_one(
     let before = metrics_files(dir)?;
     let mut launcher = leg_launcher(spec, &bench.exe, Some(dir), config.timeout)?
         .with_env("MTLD3D_CONFIG", &run_config(&config.config, dir));
-    if let Some(filter) = rust_log {
-        launcher = launcher.with_env("RUST_LOG", filter);
-    }
     let mut outcome = Outcome::default();
     let run = attribute::run_binary(
         &mut launcher,
@@ -467,6 +483,64 @@ fn run_one(
         .into_iter()
         .map(|path| metrics::read(&path).map(|file| (path, file)))
         .collect()
+}
+
+/// Run `bench`'s shape run under `spec` into `dir`, stopped once its log holds the steady frame.
+///
+/// The process runs under [`SHAPE_RUST_LOG`] and is ended as soon as
+/// [`shape::Watch`] has [`shape::STOP_AFTER`] submissions after the
+/// benchmark's measured frames start; one that ends first ends on its own.
+/// `benches`, the benchmarks the test's timed rounds wrote, go into
+/// [`shape::BENCHES_FILE`] beside the log. Returns the layer log the run
+/// wrote and how the process ended.
+///
+/// # Errors
+///
+/// Returns a message when the directory cannot be written, the process
+/// cannot be run, the driver reported a GPU hang, or the process ended on
+/// its own with anything but success.
+fn run_shape(
+    config: &AbConfig,
+    spec: &LegSpec,
+    bench: &Bench,
+    dir: &Path,
+    benches: &BTreeSet<String>,
+) -> Result<(PathBuf, ExitKind), String> {
+    fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    if let Some(corpus) = &config.corpus_dir {
+        link_corpus(corpus, dir)?;
+    }
+    let names = dir.join(shape::BENCHES_FILE);
+    let text = benches.iter().fold(String::new(), |mut text, name| {
+        let _ = writeln!(text, "{name}");
+        text
+    });
+    fs::write(&names, text).map_err(|e| format!("{}: {e}", names.display()))?;
+    let mut launcher = leg_launcher(spec, &bench.exe, Some(dir), config.timeout)?
+        .with_env("MTLD3D_CONFIG", &run_config(&config.config, dir))
+        .with_env("RUST_LOG", SHAPE_RUST_LOG);
+    let mut watch = shape::Watch::default();
+    let end = launcher.run_until(&bench.name, &mut |log, stdout| watch.look(log, stdout))?;
+    let what = format!("the shape run of {} under {}", bench.id, dir.display());
+    if end.gpu_hang {
+        return Err(format!(
+            "{what}: the driver reported a GPU hang; no number after it can be trusted"
+        ));
+    }
+    if !matches!(end.kind, ExitKind::Stopped | ExitKind::Code(0)) {
+        return Err(format!(
+            "{what} ended with {}:\n{}",
+            end.kind.describe(),
+            stderr_tail(&end.stderr)
+        ));
+    }
+    let stem = bench
+        .exe
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let log = dir.join(mtld3d_shared::log_paths::log_file_name(&stem, end.pid));
+    Ok((log, end.kind))
 }
 
 /// Link the staged caches at `corpus` into the run directory `dir` as `corpus`, once.
@@ -623,15 +697,80 @@ fn metrics_files(dir: &Path) -> Result<BTreeMap<PathBuf, (SystemTime, u64)>, Str
 ///
 /// Returns a message when `meta layer` is missing or is another stamp.
 pub fn check_stamp(path: &Path, file: &MetricsFile, spec: &LegSpec) -> Result<(), String> {
-    match file.meta.get("layer") {
-        Some(layer) if *layer == spec.stamp => Ok(()),
+    check_layer(
+        path,
+        file.meta.get("layer").map(String::as_str),
+        spec,
+        "no meta layer line",
+    )
+}
+
+/// Check that a shape run's log names the build its leg installed and its timed rounds loaded.
+///
+/// The stamp is held to the leg's as [`check_stamp`] holds a metrics
+/// file's, and the `d3d9.dll` and `mtld3d.so` images to the ones the leg's
+/// timed rounds reported, when it has any: a shape run of another build than
+/// the numbers it sits beside would compare that build's passes.
+///
+/// # Errors
+///
+/// Returns a message when the log names no build, another stamp, or other
+/// images than the timed rounds.
+pub fn check_shape_build(
+    log: &Path,
+    identity: &Identity,
+    spec: &LegSpec,
+    timed: Option<&Images>,
+) -> Result<(), String> {
+    check_layer(
+        log,
+        identity.layer.as_deref(),
+        spec,
+        "no d3d9.dll load line names the layer's build",
+    )?;
+    let Some(timed) = timed else {
+        return Ok(());
+    };
+    let ran = Images {
+        layer: identity
+            .layer_image
+            .clone()
+            .unwrap_or_else(|| UNKNOWN_IMAGE.to_owned()),
+        unix: identity
+            .unix_image
+            .clone()
+            .unwrap_or_else(|| UNKNOWN_IMAGE.to_owned()),
+    };
+    if ran == *timed {
+        return Ok(());
+    }
+    Err(format!(
+        "{}: the shape run loaded d3d9.dll {} and mtld3d.so {}, the leg's timed rounds {} and \
+         {}; the shape would be another build's",
+        log.display(),
+        ran.layer,
+        ran.unix,
+        timed.layer,
+        timed.unix
+    ))
+}
+
+/// Hold `layer`, the stamp a run names, to its leg's; `missing` says what is absent without one.
+fn check_layer(
+    path: &Path,
+    layer: Option<&str>,
+    spec: &LegSpec,
+    missing: &str,
+) -> Result<(), String> {
+    match layer {
+        Some(layer) if layer == spec.stamp => Ok(()),
         Some(layer) => Err(format!(
             "{}: the run loaded layer {layer}, the leg installed {}; the prefix or the Wine \
              tree is not the one the leg was built into, or the build is stale",
             path.display(),
             spec.stamp
         )),
-        None => Err(format!("{}: no meta layer line", path.display())),
+        None => Err(format!("{}: {missing}", path.display())),
     }
 }
 
@@ -660,6 +799,54 @@ fn progress(path: &Path, file: &MetricsFile) -> String {
             )
         },
     )
+}
+
+/// What a benchmark's timed rounds reported that its shape runs are checked against.
+#[derive(Default)]
+struct Timed {
+    /// The benchmarks its metrics files are named after.
+    benches: BTreeSet<String>,
+    /// The images the base leg's rounds loaded.
+    base: Option<Images>,
+    /// The images the candidate leg's rounds loaded.
+    cand: Option<Images>,
+}
+
+impl Timed {
+    /// Take note of one round of `leg`: the benchmarks it wrote and the images it loaded.
+    fn note(&mut self, leg: &Leg, written: &[(PathBuf, MetricsFile)]) {
+        for (path, file) in written {
+            if let Some(bench) = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(metrics::bench_of)
+            {
+                self.benches.insert(bench.to_owned());
+            }
+            let image = |key: &str| {
+                file.meta
+                    .get(key)
+                    .cloned()
+                    .unwrap_or_else(|| UNKNOWN_IMAGE.to_owned())
+            };
+            let images = Images {
+                layer: image("layer_image"),
+                unix: image("layer_unix_image"),
+            };
+            match leg {
+                Leg::Base => self.base = Some(images),
+                Leg::Cand => self.cand = Some(images),
+            }
+        }
+    }
+
+    /// The images `leg`'s rounds loaded, `None` before its first round.
+    const fn images(&self, leg: &Leg) -> Option<&Images> {
+        match leg {
+            Leg::Base => self.base.as_ref(),
+            Leg::Cand => self.cand.as_ref(),
+        }
+    }
 }
 
 /// One entry of the run order: an end-to-end benchmark, or the host benchmark.

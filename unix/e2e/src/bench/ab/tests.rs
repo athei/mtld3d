@@ -212,3 +212,76 @@ fn every_run_directory_links_the_one_staged_corpus() {
     );
     let _ = fs::remove_dir_all(&root);
 }
+
+fn images(layer: &str, unix: &str) -> Images {
+    Images {
+        layer: layer.to_owned(),
+        unix: unix.to_owned(),
+    }
+}
+
+#[test]
+fn a_shape_run_must_name_its_legs_stamp_and_the_images_its_rounds_loaded() {
+    let log = Path::new("/ab/base/shape/e2e.b/e2e-42.log");
+    let ran = Identity {
+        layer: Some("v1".to_owned()),
+        layer_image: Some("F708".to_owned()),
+        unix_image: Some("EA96".to_owned()),
+    };
+    let timed = images("F708", "EA96");
+    assert!(check_shape_build(log, &ran, &spec("v1"), Some(&timed)).is_ok());
+    assert!(check_shape_build(log, &ran, &spec("v1"), None).is_ok());
+
+    let reason = check_shape_build(log, &ran, &spec("v2"), Some(&timed)).unwrap_err();
+    assert!(
+        reason.contains("loaded layer v1, the leg installed v2"),
+        "{reason}"
+    );
+
+    let reason =
+        check_shape_build(log, &Identity::default(), &spec("v1"), Some(&timed)).unwrap_err();
+    assert!(reason.contains("no d3d9.dll load line"), "{reason}");
+
+    let reason =
+        check_shape_build(log, &ran, &spec("v1"), Some(&images("F708", "0000"))).unwrap_err();
+    assert!(
+        reason.contains("mtld3d.so EA96, the leg's timed rounds F708 and 0000"),
+        "{reason}"
+    );
+
+    // A layer that names no unix image matches rounds that wrote `unknown`.
+    let old = Identity {
+        unix_image: None,
+        ..ran
+    };
+    assert!(check_shape_build(log, &old, &spec("v1"), Some(&images("F708", "unknown"))).is_ok());
+}
+
+#[test]
+fn the_timed_rounds_record_the_benchmarks_and_each_legs_images() {
+    let mut timed = Timed::default();
+    let file_of = |image: &str| {
+        file(&format!(
+            "meta b layer v1\nmeta b layer_image {image}\nmeta b layer_unix_image U\n"
+        ))
+    };
+    timed.note(
+        &Leg::Base,
+        &[(
+            PathBuf::from("/ab/base/0/bench-wow112.metrics"),
+            file_of("B"),
+        )],
+    );
+    timed.note(
+        &Leg::Cand,
+        &[(
+            PathBuf::from("/ab/cand/0/bench-wow112.metrics"),
+            file_of("C"),
+        )],
+    );
+    assert_eq!(timed.benches.iter().collect::<Vec<_>>(), ["wow112"]);
+    assert_eq!(timed.images(&Leg::Base), Some(&images("B", "U")));
+    assert_eq!(timed.images(&Leg::Cand), Some(&images("C", "U")));
+    let fresh = Timed::default();
+    assert_eq!(fresh.images(&Leg::Base), None);
+}

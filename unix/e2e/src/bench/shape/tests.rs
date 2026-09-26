@@ -457,3 +457,106 @@ fn the_shape_run_keeps_the_identity_lines_and_the_pass_trace() {
     assert_eq!(level_for(SHAPE_RUST_LOG, "mtld3d::perf"), Some("warn"));
     assert_eq!(level_for(SHAPE_RUST_LOG, "mtld3d::core"), Some("warn"));
 }
+
+/// A layer log's first lines, naming its build the way the layer logs it.
+const IDENTITY_LINES: &str = "\
+[2026-09-26T06:36:25Z INFO  mtld3d::shim] mtld3d.dll v1-3-gabc F9E4 unix call initialized
+[2026-09-26T06:36:25Z INFO  mtld3d::unix] mtld3d.so v1-3-gabc EA96 initialized
+[2026-09-26T06:36:25Z INFO  mtld3d::d3d9] d3d9.dll v1-3-gabc F708 loaded at 0x7b6e0000
+";
+
+/// A file under the temp dir holding `text`, removed with the returned guard's directory.
+fn temp_log(tag: &str, text: &str) -> (Fixture, PathBuf) {
+    let fixture = Fixture::new(tag);
+    let path = fixture.root.join("e2e-42.log");
+    fs::write(&path, text).unwrap();
+    (fixture, path)
+}
+
+#[test]
+fn the_identity_lines_name_the_stamp_and_both_images() {
+    let (_fixture, path) = temp_log("identity", &format!("{IDENTITY_LINES}{}", trace(&steady())));
+    assert_eq!(
+        identity(&path).unwrap(),
+        Identity {
+            layer: Some("v1-3-gabc".to_owned()),
+            layer_image: Some("F708".to_owned()),
+            unix_image: Some("EA96".to_owned()),
+        }
+    );
+    let (_fixture, path) = temp_log("no-identity", &trace(&steady()));
+    assert_eq!(identity(&path).unwrap(), Identity::default());
+    assert!(identity(&path.with_file_name("absent.log")).is_err());
+}
+
+/// Append `text` to the file at `path`.
+fn append(path: &Path, text: &str) {
+    use std::io::Write as _;
+    let mut file = fs::OpenOptions::new().append(true).open(path).unwrap();
+    file.write_all(text.as_bytes()).unwrap();
+}
+
+#[test]
+fn a_shape_run_stops_only_after_enough_submissions_follow_the_marker() {
+    let warm = trace(&steady_of(&submission(), 40));
+    let (_fixture, path) = temp_log("watch", &format!("{IDENTITY_LINES}{warm}"));
+    let mut watch = Watch::default();
+    // Forty submissions of warm-up are in the log, but the benchmark has not
+    // said its measured frames start: none of them counts.
+    assert!(!watch.look(&path, "test e2e::b ... "));
+    assert!(!watch.look(&path, "test e2e::b ... "));
+    // The marker: the log is skipped to where it stands.
+    let stdout = format!("test e2e::b ... {MEASURING}\n");
+    assert!(!watch.look(&path, &stdout));
+    // A half-written line and a few submissions are not enough.
+    append(
+        &path,
+        "[2026-09-26T00:00:00Z TRACE mtld3d::d3d9::passes] pass-cl",
+    );
+    assert!(!watch.look(&path, &stdout));
+    append(
+        &path,
+        &format!("ose idx=0\n{}", trace(&submission().repeat(10))),
+    );
+    assert!(!watch.look(&path, &stdout));
+    // STOP_AFTER submissions after the marker, counting the one cut short.
+    append(&path, &trace(&submission().repeat(STOP_AFTER - 11)));
+    assert!(!watch.look(&path, &stdout));
+    append(&path, &trace(&[OPEN_SHADOW]));
+    assert!(watch.look(&path, &stdout));
+    // What the comparison then reads: the last WINDOW complete submissions all
+    // follow the marker, and they agree.
+    let frame = read_trace(&path).unwrap().finish().unwrap();
+    assert_eq!(frame.considered, WINDOW);
+    assert_eq!(frame.agreeing, WINDOW);
+}
+
+#[test]
+fn a_marker_before_the_log_exists_waits_for_the_log() {
+    let fixture = Fixture::new("watch-late-log");
+    let path = fixture.root.join("e2e-42.log");
+    let stdout = format!("{MEASURING}\n");
+    let mut watch = Watch::default();
+    assert!(!watch.look(&path, &stdout));
+    // Written after the marker was seen: the warm-up in it still does not count.
+    fs::write(&path, trace(&steady_of(&submission(), 40))).unwrap();
+    assert!(!watch.look(&path, &stdout));
+    assert!(!watch.look(&path, &stdout));
+}
+
+#[test]
+fn a_stopped_run_is_named_after_the_benchmarks_its_rounds_wrote() {
+    let fixture = Fixture::new("benches-file");
+    for leg in ["base", "cand"] {
+        let dir = fixture.root.join(leg).join(SHAPE_DIR).join("e2e.b");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("e2e-42.log"), trace(&steady())).unwrap();
+        fs::write(dir.join(BENCHES_FILE), "wow112\n").unwrap();
+    }
+    let comparison = compare_dir(&fixture.root, &["shape:wow112".to_owned()]).unwrap();
+    let [report] = comparison.reports.as_slice() else {
+        panic!("one report: {comparison:?}");
+    };
+    assert_eq!(report.bench, "wow112");
+    assert!(report.accepted);
+}

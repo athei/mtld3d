@@ -238,12 +238,16 @@ frame in `shape` lines) runs once more per leg with the pass trace on
 (`mtld3d::d3d9::passes=trace`, the rest of the layer at warn but for the
 lines that name its build), untimed, into
 `<leg>/shape/` of the run's directory; a benchmark without `shape` lines, such
-as the shader-stutter one, gets a note instead. That costs one extra
-full-length run per leg per scene benchmark and tens of MB of trace in the
-directory. The report compares the most common pass shape of the last thirty
-complete submissions between the legs, with every load and store action the
-load/store rules decided on those passes, and a leg in which fewer than 80 %
-of them agree is an untrustworthy run, exit 2. A rule that drops a store a
+as the shader-stutter one, gets a note instead. The runner stops that run
+once its log holds 33 submissions after the line the benchmark prints where
+its measured frames start, so it writes no metrics: its stamp and images are
+read from the log's identity lines and held to the leg's stamp and to the
+images of the leg's timed rounds. That costs a run of about twelve seconds per
+leg per scene benchmark and some MB of trace in the directory. The report
+compares the most common pass shape of the last thirty complete submissions
+between the legs, with every load and store action the load/store rules
+decided on those passes, and a leg in which fewer than 80 % of them agree is
+an untrustworthy run, exit 2. A rule that drops a store a
 later pass needs makes the frame faster, not slower, so the timings cannot
 catch it and this comparison does: any difference is a shape change, which
 fails the run like a changed exact metric unless `ACCEPT` names `shape` or

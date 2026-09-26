@@ -100,6 +100,14 @@ const WINDOW_GRACE: Duration = Duration::from_secs(1);
 /// How often a wait for a perf window reads what the layer log has gained.
 const LOG_POLL: Duration = Duration::from_millis(10);
 
+/// The line a benchmark prints on stdout where its measured frames start.
+///
+/// `bench-ab` stops a benchmark's untimed shape run once the layer log holds
+/// enough submissions after it, the frames the timed runs measure; the
+/// runner (`unix/e2e/src/bench/shape.rs`) shares no crate with this binary
+/// and writes the same text.
+const MEASURING: &str = "[bench] measured frames start";
+
 /// The marker that opens one window of the `mtld3d::perf` summary in the layer log.
 const PERF_HEADER: &str = "── perf  window=";
 
@@ -543,7 +551,8 @@ impl LayerLog {
     /// none. With no such line two windows and [`WINDOW_GRACE`] after
     /// `started` and none anywhere in the log, the build writes no perf
     /// windows (or the run's filter hides them), and the span starts where
-    /// the wait stopped, with nothing to align to.
+    /// the wait stopped, with nothing to align to. The span's start is
+    /// announced on stdout ([`MEASURING`]).
     ///
     /// # Panics
     ///
@@ -555,15 +564,15 @@ impl LayerLog {
         let mut watch = WindowWatch::new(self, self.mark());
         let warmed = TscClock::now();
         let limit = PERF_WINDOW * 2 + WINDOW_GRACE;
-        loop {
+        let start = loop {
             if watch.look() > 0 {
-                return SpanStart {
+                break SpanStart {
                     from: watch.last_end,
                     aligned: true,
                 };
             }
             if TscClock::since(started) > limit && !watch.log_has_windows() {
-                return SpanStart {
+                break SpanStart {
                     from: self.mark(),
                     aligned: false,
                 };
@@ -577,7 +586,9 @@ impl LayerLog {
                     .map_or_else(String::new, |path| path.display().to_string())
             );
             frame();
-        }
+        };
+        println!("{MEASURING}");
+        start
     }
 
     /// The perf window rows between `from` and `to`; `first_whole` when the first began at `from`.

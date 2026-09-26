@@ -3,7 +3,14 @@
 //! After its timed rounds, `bench-ab` runs every benchmark whose metrics
 //! declare `shape` lines (the scene benchmarks) once more in each leg with
 //! the pass trace on ([`SHAPE_RUST_LOG`]) and keeps that run's layer log
-//! under `<leg>/shape/<test>/`; nothing of that run is timed. A benchmark
+//! under `<leg>/shape/<test>/`; nothing of that run is timed. The run is
+//! stopped as soon as its log holds enough steady submissions ([`Watch`]):
+//! once the benchmark has printed [`MEASURING`], the line it prints where
+//! its measured frames start, and [`STOP_AFTER`] submissions have started
+//! since, so the last [`WINDOW`] complete ones all come after it. The
+//! run's build is read from the identity lines of that log ([`identity`]),
+//! and the benchmarks the timed rounds named go into a file of their own
+//! beside it ([`BENCHES_FILE`]), since a stopped run writes no metrics. A benchmark
 //! without `shape` lines, such as one that meets new shaders by design and
 //! whose submissions depend on how often it retries, gets no shape run. The trace
 //! names every pass the encoder opens and closes and the decisions the
@@ -38,7 +45,7 @@
 use std::{
     collections::{BTreeMap, VecDeque},
     fs::{self, File},
-    io::{BufRead as _, BufReader},
+    io::{BufRead as _, BufReader, Read as _, Seek as _, SeekFrom},
     path::{Path, PathBuf},
 };
 
@@ -58,6 +65,39 @@ pub const SHAPE_RUST_LOG: &str =
 
 /// How many of a log's last complete submissions the compared shape is chosen from.
 pub const WINDOW: usize = 30;
+
+/// Submissions started after a benchmark's [`MEASURING`] line before its shape run is stopped.
+///
+/// The first of them may have begun before the line and the last is cut
+/// short by the stop, so [`WINDOW`] plus these two plus one to spare leave
+/// the last [`WINDOW`] complete submissions of the log all after the line.
+pub const STOP_AFTER: usize = WINDOW + 3;
+
+/// The line a benchmark prints on stdout where its measured frames start.
+///
+/// The frames after it are the steady ones the timed runs measure. The
+/// benchmarks print it from `windows/tests/tests/e2e/bench.rs`, which has
+/// no crate in common with this runner, so the text is written there too.
+pub const MEASURING: &str = "[bench] measured frames start";
+
+/// The file in a shape run's directory naming the benchmarks the run's test wrote, one a line.
+///
+/// A stopped run writes no metrics file, so the runner writes the names the
+/// test's timed rounds wrote; the report names the shape after them and an
+/// `--accept shape:<bench>` finds it by them.
+pub const BENCHES_FILE: &str = "benches";
+
+/// What precedes the build stamp on the line the layer's `d3d9.dll` logs when it loads.
+const LAYER_STAMP: &str = "d3d9.dll ";
+
+/// What follows the build stamp and the image ID on that line.
+const LAYER_LOADED: &str = " loaded at ";
+
+/// What precedes the build stamp on the line the layer's unix library logs when it starts.
+const UNIX_STAMP: &str = "mtld3d.so ";
+
+/// What follows the build stamp and the image ID on that line.
+const UNIX_INITIALIZED: &str = " initialized";
 
 /// The log target of the pass trace.
 const TRACE_TARGET: &str = "mtld3d::d3d9::passes";
@@ -229,6 +269,118 @@ pub struct ShapeComparison {
     pub notes: Vec<String>,
     /// The directory holds shape runs at all.
     pub present: bool,
+}
+
+/// The build a layer log names: the stamp and image ID of `d3d9.dll`, and the image of `mtld3d.so`.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Identity {
+    /// The build stamp on the `d3d9.dll <build> <image> loaded at` line.
+    pub layer: Option<String>,
+    /// The image ID on that line.
+    pub layer_image: Option<String>,
+    /// The image ID on the `mtld3d.so <build> <image> initialized` line.
+    pub unix_image: Option<String>,
+}
+
+/// Read the build a layer log names, from its first lines that name one.
+///
+/// The benchmarks' metrics take the same three values from the same lines
+/// (`meta layer`, `layer_image`, `layer_unix_image`), so a shape run that
+/// wrote no metrics file is checked against its leg the way a timed run is.
+/// The log is read only as far as both lines.
+///
+/// # Errors
+///
+/// Returns a message when the log cannot be read.
+pub fn identity(path: &Path) -> Result<Identity, String> {
+    let file = File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let mut reader = BufReader::new(file);
+    let mut found = Identity::default();
+    let mut bytes = Vec::new();
+    while found.layer.is_none() || found.unix_image.is_none() {
+        bytes.clear();
+        let read = reader
+            .read_until(b'\n', &mut bytes)
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        let text = String::from_utf8_lossy(&bytes);
+        let Some((_, message)) = log_message(text.trim_end()) else {
+            continue;
+        };
+        if found.layer.is_none()
+            && let Some((build, image)) = stamped(message, LAYER_STAMP, LAYER_LOADED)
+        {
+            found.layer = Some(build);
+            found.layer_image = Some(image);
+        } else if found.unix_image.is_none()
+            && let Some((_, image)) = stamped(message, UNIX_STAMP, UNIX_INITIALIZED)
+        {
+            found.unix_image = Some(image);
+        }
+    }
+    Ok(found)
+}
+
+/// Watches a running shape run's layer log and says when it holds enough steady submissions.
+///
+/// Nothing is read before the benchmark prints [`MEASURING`]; from then on
+/// each look reads what the log gained, whole lines only, and counts the
+/// submissions that start. The first look after the line skips to the end
+/// of the log, so what is counted was written after it.
+#[derive(Default)]
+pub struct Watch {
+    /// Where the next look reads from.
+    at: u64,
+    /// The benchmark has printed [`MEASURING`] and the log was skipped to where it stood.
+    marked: bool,
+    /// What `at` points into is the middle of a line, to be skipped up to its end.
+    mid_line: bool,
+    /// The submissions of the lines read since the mark.
+    trace: Trace,
+}
+
+impl Watch {
+    /// Look at the run again: `stdout` is everything it printed so far, `log` its layer log.
+    ///
+    /// `true` once [`STOP_AFTER`] submissions have started in the log since
+    /// the benchmark printed [`MEASURING`]. A log that cannot be read yet
+    /// (the layer creates it on its first line) is looked at again later.
+    pub fn look(&mut self, log: &Path, stdout: &str) -> bool {
+        if !self.marked {
+            if !stdout.contains(MEASURING) {
+                return false;
+            }
+            let Ok(meta) = fs::metadata(log) else {
+                return false;
+            };
+            self.marked = true;
+            self.at = meta.len();
+            self.mid_line = self.at > 0;
+            return false;
+        }
+        let Ok(mut file) = File::open(log) else {
+            return false;
+        };
+        let mut bytes = Vec::new();
+        if file.seek(SeekFrom::Start(self.at)).is_err() || file.read_to_end(&mut bytes).is_err() {
+            return false;
+        }
+        let Some(whole) = bytes.iter().rposition(|&byte| byte == b'\n') else {
+            return false;
+        };
+        let mut lines = bytes[..=whole].split_inclusive(|&byte| byte == b'\n');
+        if std::mem::take(&mut self.mid_line) {
+            lines.next();
+        }
+        for line in lines {
+            self.trace
+                .line(String::from_utf8_lossy(line).trim_end_matches(['\n', '\r']));
+        }
+        self.at += u64::try_from(whole + 1).expect("a read length fits u64");
+        self.trace.submissions >= STOP_AFTER
+    }
 }
 
 /// The target and message of one line of the layer's log: `[<time> <LEVEL> <target>] <message>`.
@@ -424,7 +576,18 @@ fn shape_run(dir: &Path) -> Result<ShapeRun, String> {
             logs.push(entry.path());
         }
     }
+    let named = dir.join(BENCHES_FILE);
+    if named.exists() {
+        let text = fs::read_to_string(&named).map_err(|e| format!("{}: {e}", named.display()))?;
+        benches.extend(
+            text.lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .map(str::to_owned),
+        );
+    }
     benches.sort();
+    benches.dedup();
     logs.sort();
     // The test binary's listing may leave a log of its own; the run's is
     // the one with the trace in it.
@@ -472,6 +635,13 @@ fn read_trace(path: &Path) -> Result<Trace, String> {
         }
         trace.line(String::from_utf8_lossy(&bytes).trim_end_matches(['\n', '\r']));
     }
+}
+
+/// The build and image of `message` when it opens with `stamp`: `<stamp><build> <image><after>`.
+fn stamped(message: &str, stamp: &str, after: &str) -> Option<(String, String)> {
+    let (identity, _) = message.strip_prefix(stamp)?.split_once(after)?;
+    let (build, image) = identity.split_once(' ')?;
+    Some((build.to_owned(), image.to_owned()))
 }
 
 /// One line of the pass trace that the shape reads.

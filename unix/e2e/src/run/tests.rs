@@ -11,7 +11,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use super::{ExitKind, ProcessGroup, run};
+use super::{ExitKind, ProcessGroup, run, run_until};
 
 const DRIVER_HANG: &str = "Caused GPU Hang Error \
     (00000003:kIOAccelCommandBufferCallbackErrorHang)";
@@ -92,6 +92,58 @@ fn unrelated_gpu_errors_are_not_hang_reports() {
     ] {
         assert!(!super::is_gpu_hang_report(stderr), "{stderr}");
     }
+}
+
+#[test]
+fn a_caller_that_has_what_it_wanted_stops_the_process_at_once() {
+    // The script says it is ready and would then run for half a minute; the
+    // caller stops it once the line is in, long before the timeout.
+    let path = script("stopped", "echo warm\necho ready\nsleep 30\n");
+    let mut lines = Vec::new();
+    let ready = std::cell::Cell::new(false);
+    let mut asked_with = None;
+    let started = Instant::now();
+    let exit = run_until(
+        &PathBuf::from("/bin/sh"),
+        &path,
+        &[],
+        &[],
+        Duration::from_secs(20),
+        &mut |line| {
+            ready.set(ready.get() || line == "ready");
+            lines.push(line.to_owned());
+        },
+        &mut |pid| {
+            asked_with = Some(pid);
+            ready.get()
+        },
+    )
+    .expect("spawn sh");
+    assert_eq!(exit.kind, ExitKind::Stopped);
+    assert_eq!(lines, ["warm", "ready"]);
+    assert_eq!(asked_with, Some(exit.pid));
+    assert!(!exit.gpu_hang);
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "took {:?}: the runner waited instead of stopping the process",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn a_process_that_ends_before_the_caller_is_done_reports_its_own_exit() {
+    let path = script("early-end", "echo warm\nexit 4\n");
+    let exit = run_until(
+        &PathBuf::from("/bin/sh"),
+        &path,
+        &[],
+        &[],
+        Duration::from_secs(5),
+        &mut |_| {},
+        &mut |_| false,
+    )
+    .expect("spawn sh");
+    assert_eq!(exit.kind, ExitKind::Code(4));
 }
 
 #[test]
@@ -568,9 +620,13 @@ fn fatal_cleanup_fixture() {
             panic!("reap returned after failed cleanup: {error}");
         }
         "spawn" => {
-            let error = super::collect(group, Duration::from_millis(10), &mut |_| {}, |_| {
-                Err(std::io::Error::from_raw_os_error(libc::EAGAIN))
-            })
+            let error = super::collect(
+                group,
+                Duration::from_millis(10),
+                &mut |_| {},
+                &mut |_| false,
+                |_| Err(std::io::Error::from_raw_os_error(libc::EAGAIN)),
+            )
             .err();
             panic!("reader spawn returned after failed cleanup: {error:?}");
         }
@@ -795,6 +851,7 @@ fn failure_to_start_either_reader_stops_and_reaps_the_owned_child() {
             ProcessGroup::new(child),
             Duration::from_secs(1),
             &mut |_| {},
+            &mut |_| false,
             |reader| {
                 if starts == fail_at {
                     Err(std::io::Error::from_raw_os_error(libc::EAGAIN))

@@ -223,6 +223,53 @@ impl Launcher for WineLauncher {
 }
 
 impl WineLauncher {
+    /// Run the one test `name`, ending its process once `done` has what the caller wanted.
+    ///
+    /// `done` is asked, while the process runs, with the path of the log
+    /// the layer writes for it and with everything it has printed on stdout
+    /// so far (see [`run::run_until`]). A process `done` ended reports
+    /// [`ExitKind::Stopped`]; no test result is read from it.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when the process cannot be spawned, or its layer
+    /// log cannot be checked for a GPU hang after it ended.
+    pub fn run_until(
+        &mut self,
+        name: &str,
+        done: &mut dyn FnMut(&Path, &str) -> bool,
+    ) -> Result<ProcessEnd, String> {
+        let args = test_arguments(Some(&[name.to_owned()]), 1, self.ignored);
+        let stdout = std::cell::RefCell::new(String::new());
+        let log_dir = self.log_dir.clone();
+        let stem = self.exe_stem().to_owned();
+        let exit = run::run_until(
+            &self.wine,
+            &self.exe,
+            &args,
+            &self.env,
+            self.timeout,
+            &mut |line| {
+                (self.on_line)(line);
+                let mut stdout = stdout.borrow_mut();
+                stdout.push_str(line);
+                stdout.push('\n');
+            },
+            &mut |pid| {
+                let log = log_dir.join(mtld3d_shared::log_paths::log_file_name(&stem, pid));
+                done(&log, &stdout.borrow())
+            },
+        )?;
+        let layer_gpu_hang = self.layer_reported_gpu_hang(exit.pid)?;
+        Ok(ProcessEnd {
+            pid: exit.pid,
+            kind: exit.kind,
+            stdout: stdout.into_inner(),
+            stderr: exit.stderr,
+            gpu_hang: exit.gpu_hang || layer_gpu_hang,
+        })
+    }
+
     /// The executable stem the layer uses in its per-process log name.
     fn exe_stem(&self) -> &str {
         self.exe
