@@ -27,6 +27,9 @@ mtld3d-types = { workspace = true }
 zstd = { workspace = true }
 xxhash-rust = { workspace = true }
 mtld3d-core = { workspace = true }
+# The benchmarks time with the layer's own `rdtsc` primitive and calibrated rate
+# (`mtld3d_shared::tsc`) rather than a copy of either.
+mtld3d-shared = { workspace = true }
 snmalloc-rs = { workspace = true }
 
 [lints]

@@ -11,34 +11,39 @@
 //! directory the layer writes its log to (`log.dir`, which `make bench`
 //! points at its output directory), and beside it `bench-<name>.metrics`,
 //! the same numbers one record per line for a program to compare (see
-//! [`Metrics`]). On a `PERF=1` build the report carries
-//! the rows of the layer's five-second `mtld3d::perf` summary that cover the
-//! measured frames, copied out of that log, and the metrics file the
-//! counters of the `perf-kv` line the layer logs after each of them. Frame
-//! times are taken on the API thread from one `Present` return to the next
-//! with `Instant`, which on Windows reads `QueryPerformanceCounter`, and the
-//! device presents with `D3DPRESENT_INTERVAL_IMMEDIATE` so the display does
-//! not pace it. Beside that the report gives the time from a `Present`
-//! return to the next `Present` call, the API thread's own work on the
-//! frame, which tells a frame bound by the API thread from one bound behind
-//! `Present`. Each benchmark also samples the process's address space after
-//! its warm-up and at the end of its measured frames, and its peak working
-//! set.
+//! [`Metrics`]). On a `PERF=1` build the report carries the rows of the
+//! layer's five-second `mtld3d::perf` summary that cover the measured frames,
+//! copied out of that log, and the metrics file the counters of the `perf-kv`
+//! line the layer logs after each of them. Frame times are taken on the API
+//! thread from one `Present` return to the next with [`TscClock`], the
+//! layer's own `rdtsc` primitive at its calibrated rate (under Wine
+//! `QueryPerformanceCounter` ticks at 100 ns and costs a call into `ntdll`),
+//! and the device presents with `D3DPRESENT_INTERVAL_IMMEDIATE` so the
+//! display does not pace it. Beside that the report gives the time from a
+//! `Present` return to the next `Present` call, the API thread's own work on
+//! the frame, which tells a frame bound by the API thread from one bound
+//! behind `Present`. Each benchmark also samples the process's address space
+//! after its warm-up and at the end of its measured frames, and its peak
+//! working set.
 
 use core::fmt::Write as _;
 use std::{
     collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
-    time::{Duration, Instant, SystemTime},
+    time::{Duration, SystemTime},
 };
 
+use mtld3d_shared::tsc::{rdtsc, tsc_hz, u64_to_f64_exact};
 use mtld3d_tests::{Harness, MemorySample, Texture, TexturedVertex, config_value, config_var};
 use mtld3d_types::{
     D3D_OK, D3DDECL_END, D3DDECLMETHOD_DEFAULT, D3DDECLTYPE_D3DCOLOR, D3DDECLTYPE_FLOAT2,
     D3DDECLTYPE_FLOAT3, D3DDECLUSAGE_COLOR, D3DDECLUSAGE_POSITION, D3DDECLUSAGE_TEXCOORD,
     D3DFMT_A8R8G8B8, D3DPOOL_MANAGED, D3DVERTEXELEMENT9,
 };
+
+/// Back-to-back counter reads whose smallest nonzero step [`TscClock`] reports as its granularity.
+const GRANULARITY_READS: u32 = 100_000;
 
 /// The marker that opens one window of the `mtld3d::perf` summary in the layer log.
 const PERF_HEADER: &str = "── perf  window=";
@@ -120,18 +125,88 @@ pub enum Model {
     Sm3,
 }
 
+/// The benchmarks' clock: the layer's `rdtsc` primitive, its calibrated rate, its finest step.
+///
+/// `mtld3d_shared::tsc` is what the layer's perf counters read, so a
+/// benchmark's times and the layer's own divide by one calibration. The rate
+/// is latched once per process by its first reader, so [`Self::calibrated`]
+/// runs before anything is timed and a later conversion never waits for it.
+/// A count is comparable only within one process.
+pub struct TscClock {
+    hz: u64,
+    granularity_ns: f64,
+}
+
+impl TscClock {
+    /// Latch the calibrated rate and measure the smallest step between back-to-back reads.
+    ///
+    /// # Panics
+    /// Panics if the rate is zero.
+    pub fn calibrated() -> Self {
+        let hz = tsc_hz();
+        assert!(hz > 0, "the rdtsc rate is not zero");
+        let mut smallest = u64::MAX;
+        let mut last = rdtsc();
+        for _ in 0..GRANULARITY_READS {
+            let now = rdtsc();
+            let step = now.wrapping_sub(last);
+            if step > 0 {
+                smallest = smallest.min(step);
+            }
+            last = now;
+        }
+        let mut clock = Self {
+            hz,
+            granularity_ns: 0.0,
+        };
+        clock.granularity_ns = if smallest == u64::MAX {
+            0.0
+        } else {
+            clock.nanos(smallest)
+        };
+        clock
+    }
+
+    /// The counter now.
+    #[inline]
+    pub fn now() -> u64 {
+        rdtsc()
+    }
+
+    /// The time from `start`, a [`Self::now`] reading, to now.
+    #[inline]
+    pub fn since(&self, start: u64) -> Duration {
+        self.duration(Self::now().saturating_sub(start))
+    }
+
+    /// `ticks` of the counter as a duration, to the nanosecond.
+    pub fn duration(&self, ticks: u64) -> Duration {
+        let nanos = u128::from(ticks) * 1_000_000_000 / u128::from(self.hz);
+        Duration::from_nanos(u64::try_from(nanos).unwrap_or(u64::MAX))
+    }
+
+    /// `ticks` of the counter in nanoseconds, with the fraction.
+    pub fn nanos(&self, ticks: u64) -> f64 {
+        u64_to_f64_exact(ticks) * 1e9 / u64_to_f64_exact(self.hz)
+    }
+}
+
 /// Present-to-Present frame times, and the API thread's work before each `Present`.
-pub struct FrameClock {
-    last: Instant,
+///
+/// Read with `rdtsc` through the benchmark's [`TscClock`].
+pub struct FrameClock<'c> {
+    clock: &'c TscClock,
+    last: u64,
     times: Vec<Duration>,
     work: Vec<Duration>,
 }
 
-impl FrameClock {
+impl<'c> FrameClock<'c> {
     /// A clock whose first frame ends at the next [`Self::present`].
-    pub fn start(capacity: usize) -> Self {
+    pub fn start(clock: &'c TscClock, capacity: usize) -> Self {
         Self {
-            last: Instant::now(),
+            clock,
+            last: TscClock::now(),
             times: Vec::with_capacity(capacity),
             work: Vec::with_capacity(capacity),
         }
@@ -142,10 +217,13 @@ impl FrameClock {
     /// # Panics
     /// Panics if `Present` fails.
     pub fn present(&mut self, h: &Harness) {
-        self.work.push(self.last.elapsed());
+        let called = TscClock::now();
         ok(h.present(), "Present");
-        let now = Instant::now();
-        self.times.push(now - self.last);
+        let now = TscClock::now();
+        self.work
+            .push(self.clock.duration(called.saturating_sub(self.last)));
+        self.times
+            .push(self.clock.duration(now.saturating_sub(self.last)));
         self.last = now;
     }
 
@@ -646,6 +724,9 @@ pub struct PassShape {
 ///   entries a benchmark's harness adds on top of it, such as the stutter
 ///   benchmark's `shaderCache.enable=false`; `config_entries` names those
 ///   (or `none`), so the two together are the settings the layer ran with.
+///   `tsc_hz` and `tsc_granularity_ns` describe the clock the times were
+///   read with (see [`TscClock`]): its calibrated rate and the smallest step
+///   it was seen to take.
 ///   `layer_unix_image` is the image ID on the unix library's `mtld3d.so`
 ///   line (or `unknown`), since most of the layer is in that library.
 /// - `metric <bench> <name> <value> <unit> <direction> <class>`: a name of
@@ -661,6 +742,8 @@ pub struct PassShape {
 /// by changing one.
 pub struct Metrics {
     bench: String,
+    /// The `tsc_*` meta values: the clock's rate and its finest step.
+    tsc: [String; 2],
     /// The harness's own configuration entries, `none` when it has none.
     config_entries: String,
     records: String,
@@ -672,7 +755,7 @@ impl Metrics {
     ///
     /// # Panics
     /// Panics if `bench` is empty or holds whitespace.
-    pub fn new(bench: &str, h: &Harness) -> Self {
+    pub fn new(bench: &str, h: &Harness, clock: &TscClock) -> Self {
         assert!(
             !bench.is_empty() && !bench.contains(char::is_whitespace),
             "a benchmark name is one word: {bench:?}"
@@ -680,6 +763,7 @@ impl Metrics {
         let entries = h.config_entries().trim();
         Self {
             bench: bench.to_owned(),
+            tsc: [clock.hz.to_string(), format!("{:.2}", clock.granularity_ns)],
             config_entries: if entries.is_empty() {
                 "none".to_owned()
             } else {
@@ -925,6 +1009,8 @@ impl Metrics {
                     ),
             ),
             ("config_entries", self.config_entries.clone()),
+            ("tsc_hz", self.tsc[0].clone()),
+            ("tsc_granularity_ns", self.tsc[1].clone()),
         ] {
             let _ = writeln!(file, "meta {bench} {key} {value}");
         }

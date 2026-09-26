@@ -17,7 +17,7 @@
 //! the game reads its lens-flare queries. At the end of every frame, before
 //! `Present`, the frame issues its EVENT query and then polls the previous
 //! frame's with `D3DGETDATA_FLUSH` until it answers `S_OK`, counting the
-//! calls and timing, with `Instant` (`QueryPerformanceCounter`), the span
+//! calls and timing, with the benchmarks' `rdtsc` clock (`TscClock`), the span
 //! from that query's `Issue` to the answer. The span includes the frame
 //! between them, so under the `wow` keys, where the first poll answers, it
 //! is about one frame; on the spec path it runs to the GPU's retirement of
@@ -49,8 +49,8 @@ use mtld3d_types::{
 
 use crate::bench::{
     Class, Direction, FrameClock, FrameStats, FrameWork, IDENTITY_ROWS, LayerLog, Metrics, Model,
-    STRIDE, TEXTURED_DECL, Value, grid, material_ps, material_vs, memory_section, nearest_rank, ok,
-    pattern_texture, ratio, world_rows, write_report,
+    STRIDE, TEXTURED_DECL, TscClock, Value, grid, material_ps, material_vs, memory_section,
+    nearest_rank, ok, pattern_texture, ratio, world_rows, write_report,
 };
 
 const WIDTH: u32 = 1280;
@@ -110,6 +110,7 @@ fn poll(name: &str, keys: &'static str, answering: &Answering) {
         config_entries: keys,
         ..HarnessConfig::default()
     });
+    let tsc = TscClock::calibrated();
     let since = SystemTime::now();
     let mut scene = Scene::new(&h);
     let mut frame = 0;
@@ -128,7 +129,7 @@ fn poll(name: &str, keys: &'static str, answering: &Answering) {
     let capacity = usize::try_from(MIN_MEASURED.as_micros() / FRAME_FLOOR.as_micros())
         .expect("frame capacity fits usize")
         .max(MEASURED_FRAMES);
-    let mut clock = FrameClock::start(capacity);
+    let mut clock = FrameClock::start(&tsc, capacity);
     let mut polls = Vec::with_capacity(capacity);
     let mut latencies = Vec::with_capacity(capacity);
     let (mut ready, mut pending) = (0, 0);
@@ -142,7 +143,7 @@ fn poll(name: &str, keys: &'static str, answering: &Answering) {
             .throttle(frame)
             .expect("the previous frame issued its EVENT query");
         polls.push(answer.polls);
-        latencies.push(answer.latency);
+        latencies.push(tsc.duration(answer.latency));
         clock.present(&h);
         frame += 1;
     }
@@ -188,7 +189,7 @@ fn poll(name: &str, keys: &'static str, answering: &Answering) {
     );
 
     let count = |n: usize| Value::Count(u64::try_from(n).expect("a count fits u64"));
-    let mut metrics = Metrics::new(name, &h);
+    let mut metrics = Metrics::new(name, &h, &tsc);
     metrics.frame_rows("frame", &stats);
     metrics.frame_rows("api", &work);
     metrics.frame_rows("event.latency", &latency);
@@ -257,8 +258,8 @@ struct OcclusionReads {
 struct Answer {
     /// `GetData` calls up to and including the one that answered `S_OK`.
     polls: u64,
-    /// From the return of that query's `Issue` to the return of the `S_OK`.
-    latency: Duration,
+    /// From the return of that query's `Issue` to the return of the `S_OK`, in `rdtsc` ticks.
+    latency: u64,
 }
 
 /// The frame's device objects and its queries.
@@ -272,8 +273,8 @@ struct Scene<'h> {
     triangles: u32,
     /// One EVENT query per frame in flight, by frame parity.
     events: [Query<'h>; QUERY_SETS],
-    /// When each EVENT query was last issued.
-    issued: [Option<Instant>; QUERY_SETS],
+    /// When each EVENT query was last issued, an `rdtsc` reading.
+    issued: [Option<u64>; QUERY_SETS],
     /// The flares' occlusion queries, one set per frame in flight.
     occlusion: [[Query<'h>; FLARES]; QUERY_SETS],
     /// Whether each set of occlusion queries has been issued.
@@ -407,7 +408,7 @@ impl<'h> Scene<'h> {
     fn throttle(&mut self, frame: u32) -> Option<Answer> {
         let set = set_of(frame);
         ok(self.events[set].issue(D3DISSUE_END), "EVENT Issue(END)");
-        self.issued[set] = Some(Instant::now());
+        self.issued[set] = Some(TscClock::now());
 
         let previous = set_of(frame + 1);
         let issued = self.issued[previous]?;
@@ -418,7 +419,7 @@ impl<'h> Scene<'h> {
             polls += 1;
             match event.data_u32(D3DGETDATA_FLUSH) {
                 (D3D_OK, signalled) => {
-                    let latency = issued.elapsed();
+                    let latency = TscClock::now().saturating_sub(issued);
                     assert_eq!(
                         signalled, 1,
                         "an EVENT query that answers S_OK reports TRUE"

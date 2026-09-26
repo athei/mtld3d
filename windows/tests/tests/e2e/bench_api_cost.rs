@@ -6,9 +6,9 @@
 //! is paid on that thread, so a few nanoseconds more per call is frame time
 //! a frame benchmark would spread too thin to see. This one isolates each
 //! kind: a batch is [`CALLS`] calls of one kind between two `Present`s,
-//! timed with `Instant` (`QueryPerformanceCounter`) around the calls alone,
-//! and the figure a kind reports is the median batch's nanoseconds per
-//! iteration.
+//! timed with the benchmarks' `rdtsc` clock (`TscClock`) around the calls
+//! alone, and the figure a kind reports is the median batch's nanoseconds
+//! per iteration.
 //!
 //! State calls alternate between two values, so that none is a redundant
 //! set the layer may drop, except in the `_same` kinds, which repeat the
@@ -37,7 +37,7 @@
 //! in the measured span.
 
 use core::fmt::Write as _;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, SystemTime};
 
 use mtld3d_tests::{
     Harness, HarnessConfig, IndexBuffer, MemorySample, PixelShader, Texture, TexturedVertex,
@@ -53,8 +53,8 @@ use mtld3d_types::{
 
 use crate::bench::{
     Class, Direction, FrameWork, IDENTITY_ROWS, LayerLog, Metrics, Model, STRIDE, TEXTURED_DECL,
-    Value, material_ps, material_vs, memory_section, nearest_rank, ok, pattern_texture, world_rows,
-    write_report,
+    TscClock, Value, material_ps, material_vs, memory_section, nearest_rank, ok, pattern_texture,
+    world_rows, write_report,
 };
 
 /// Edge of the back buffer, which every draw lands in.
@@ -190,6 +190,7 @@ fn api_call_cost() {
         presentation_interval: D3DPRESENT_INTERVAL_IMMEDIATE,
         ..HarnessConfig::default()
     });
+    let tsc = TscClock::calibrated();
     let since = SystemTime::now();
     let bench = Bench::new(&h);
     for _ in 0..WARM_UP_ROUNDS {
@@ -201,17 +202,17 @@ fn api_call_cost() {
     let warm = MemorySample::now();
 
     let from = log.mark();
-    let started = Instant::now();
+    let started = TscClock::now();
     let mut samples: Vec<Vec<f64>> = KINDS.iter().map(|_| Vec::new()).collect();
     let mut rounds = 0;
-    while rounds < ROUNDS || started.elapsed() < MIN_MEASURED {
+    while rounds < ROUNDS || tsc.since(started) < MIN_MEASURED {
         for (kind, samples) in KINDS.iter().zip(&mut samples) {
             let batch = bench.frame(kind);
-            samples.push(batch.as_secs_f64() * 1e9 / f64::from(CALLS));
+            samples.push(tsc.nanos(batch) / f64::from(CALLS));
         }
         rounds += 1;
     }
-    let measured = started.elapsed();
+    let measured = tsc.since(started);
     let to = log.mark();
     let end = MemorySample::now();
 
@@ -221,7 +222,7 @@ fn api_call_cost() {
         .map(|kind| kind.calls() * u64::from(CALLS) * rounds_u64)
         .sum();
     let mut table = String::new();
-    let mut metrics = Metrics::new("api_call_cost", &h);
+    let mut metrics = Metrics::new("api_call_cost", &h, &tsc);
     for (kind, samples) in KINDS.iter().zip(&mut samples) {
         samples.sort_unstable_by(f64::total_cmp);
         let median = samples[nearest_rank(samples.len(), 50)];
@@ -355,8 +356,8 @@ impl<'h> Bench<'h> {
         bench
     }
 
-    /// One frame: a timed batch of `kind` inside a scene, then `Present`.
-    fn frame(&self, kind: &Kind) -> Duration {
+    /// One frame: a timed batch of `kind` inside a scene, then `Present`; the batch in ticks.
+    fn frame(&self, kind: &Kind) -> u64 {
         let h = self.h;
         assert!(h.pump(), "WM_QUIT during the batches");
         ok(h.begin_scene(), "BeginScene");
@@ -366,8 +367,8 @@ impl<'h> Bench<'h> {
         batch
     }
 
-    /// [`CALLS`] iterations of `kind`, timed around the iterations alone.
-    fn batch(&self, kind: &Kind) -> Duration {
+    /// [`CALLS`] iterations of `kind`, timed around the iterations alone, in ticks.
+    fn batch(&self, kind: &Kind) -> u64 {
         let h = self.h;
         let rows = |count: usize| {
             let end = count * 4;
@@ -490,7 +491,7 @@ impl<'h> Bench<'h> {
     }
 
     /// Run `batch` with both shaders cleared, the fixed-function pipeline bound, then rebind them.
-    fn fixed_function(&self, batch: impl FnOnce() -> Duration) -> Duration {
+    fn fixed_function(&self, batch: impl FnOnce() -> u64) -> u64 {
         let h = self.h;
         ok(h.clear_vertex_shader(), "fixed-function VS");
         ok(h.clear_pixel_shader(), "fixed-function PS");
@@ -510,14 +511,14 @@ impl<'h> Bench<'h> {
     }
 }
 
-/// Run `body` [`CALLS`] times and return how long the calls took.
+/// Run `body` [`CALLS`] times and return how long the calls took, in `rdtsc` ticks.
 ///
 /// `body` is told whether the iteration is odd, which selects the second of
 /// an alternating pair; the last iteration is odd.
-fn timed(mut body: impl FnMut(bool)) -> Duration {
-    let started = Instant::now();
+fn timed(mut body: impl FnMut(bool)) -> u64 {
+    let started = TscClock::now();
     for at in 0..CALLS {
         body(at % 2 == 1);
     }
-    started.elapsed()
+    TscClock::now().saturating_sub(started)
 }

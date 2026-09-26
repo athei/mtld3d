@@ -29,7 +29,7 @@
 //! drawn. `K` and the offscreen count are fixed per test; `make bench
 //! FILTER=<test name>` picks one.
 
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use mtld3d_tests::{
     Harness, HarnessConfig, IndexBuffer, MemorySample, PixelShader, Surface, Texture, VertexBuffer,
@@ -44,8 +44,8 @@ use mtld3d_types::{
 
 use crate::bench::{
     Class, Direction, FrameClock, FrameWork, IDENTITY_ROWS, LayerLog, Metrics, Model, STRIDE,
-    TEXTURED_DECL, Value, grid, material_ps, material_vs, memory_section, ok, pattern_texture,
-    ratio, world_rows, write_report,
+    TEXTURED_DECL, TscClock, Value, grid, material_ps, material_vs, memory_section, ok,
+    pattern_texture, ratio, world_rows, write_report,
 };
 
 const WIDTH: u32 = 1280;
@@ -108,6 +108,7 @@ fn stutter(name: &str, per_frame: u32, offscreen: u32) {
         config_entries: "shaderCache.enable=false",
         ..HarnessConfig::default()
     });
+    let tsc = TscClock::calibrated();
     let since = SystemTime::now();
     let mut bench = Stutter::new(&h);
     for _ in 0..WARM_UP_FRAMES {
@@ -120,8 +121,8 @@ fn stutter(name: &str, per_frame: u32, offscreen: u32) {
     let log = LayerLog::find(since);
     let warm = MemorySample::now();
     let from = log.mark();
-    let started = Instant::now();
-    let mut clock = FrameClock::start(usize::try_from(MEASURED_FRAMES).expect("fits usize"));
+    let started = TscClock::now();
+    let mut clock = FrameClock::start(&tsc, usize::try_from(MEASURED_FRAMES).expect("fits usize"));
     for frame in 0..MEASURED_FRAMES {
         assert!(h.pump(), "WM_QUIT during the measured frames");
         bench.base_frame();
@@ -129,9 +130,9 @@ fn stutter(name: &str, per_frame: u32, offscreen: u32) {
         ok(h.end_scene(), "EndScene");
         clock.present(&h);
     }
-    let introduced = Instant::now();
-    let mut settle = FrameClock::start(SETTLE_CAPACITY);
-    while introduced.elapsed() < IDLE_TAIL || started.elapsed() < MIN_SPAN {
+    let introduced = TscClock::now();
+    let mut settle = FrameClock::start(&tsc, SETTLE_CAPACITY);
+    while tsc.since(introduced) < IDLE_TAIL || tsc.since(started) < MIN_SPAN {
         assert!(h.pump(), "WM_QUIT while the frames settle");
         bench.base_frame();
         ok(h.end_scene(), "EndScene");
@@ -139,7 +140,7 @@ fn stutter(name: &str, per_frame: u32, offscreen: u32) {
     }
     let settle_frames = settle.frames();
     let to = log.mark();
-    let span = started.elapsed();
+    let span = tsc.since(started);
     let end = MemorySample::now();
     let verified = bench.verify();
 
@@ -198,7 +199,7 @@ fn stutter(name: &str, per_frame: u32, offscreen: u32) {
     );
 
     let count = |n: usize| Value::Count(u64::try_from(n).expect("a count fits u64"));
-    let mut metrics = Metrics::new(name, &h);
+    let mut metrics = Metrics::new(name, &h, &tsc);
     metrics.frame_rows("frame", &stats);
     // The API thread's share of these frames is tens of microseconds, which
     // two runs of one build move by more than a relative rule allows; the

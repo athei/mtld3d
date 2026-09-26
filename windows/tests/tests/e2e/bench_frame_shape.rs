@@ -27,7 +27,7 @@
 //! The metrics file carries one `shape` record per pass, computed from the
 //! constants and the material list below rather than read back from the layer.
 
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, SystemTime};
 
 use mtld3d_tests::{
     Harness, HarnessConfig, IndexBuffer, MemorySample, PixelShader, Surface, Texture,
@@ -51,8 +51,8 @@ use mtld3d_types::{
 
 use crate::bench::{
     Class, Direction, FrameClock, FrameWork, IDENTITY_ROWS, LayerLog, Metrics, Model, PassShape,
-    STRIDE, TEXTURED_DECL, Value, def, element, grid, material_ps, material_vs, memory_section, ok,
-    pattern_texture, ratio, transform, world_rows, write_report,
+    STRIDE, TEXTURED_DECL, TscClock, Value, def, element, grid, material_ps, material_vs,
+    memory_section, ok, pattern_texture, ratio, transform, world_rows, write_report,
 };
 
 /// The back buffer, about the size of a windowed game.
@@ -105,8 +105,9 @@ fn wow_335a_busy_frame() {
         presentation_interval: D3DPRESENT_INTERVAL_IMMEDIATE,
         ..HarnessConfig::default()
     });
+    let tsc = TscClock::calibrated();
     let since = SystemTime::now();
-    let started = Instant::now();
+    let started = TscClock::now();
     let frame = Frame::new(&h);
     for tick in 0..WARM_UP_FRAMES {
         assert!(h.pump(), "WM_QUIT during warm-up");
@@ -114,11 +115,11 @@ fn wow_335a_busy_frame() {
         ok(h.present(), "Present");
     }
     let log = LayerLog::find(since);
-    let warm_up = started.elapsed();
+    let warm_up = tsc.since(started);
     let warm = MemorySample::now();
 
     let from = log.mark();
-    let mut clock = FrameClock::start(MEASURED_FRAMES * 4);
+    let mut clock = FrameClock::start(&tsc, MEASURED_FRAMES * 4);
     let mut tick = WARM_UP_FRAMES;
     while clock.frames() < MEASURED_FRAMES || clock.elapsed() < MIN_MEASURED {
         assert!(h.pump(), "WM_QUIT during the measured frames");
@@ -166,7 +167,7 @@ fn wow_335a_busy_frame() {
                 "perf: this device's first window, its warm-up compiles\n{rows}"
             )),
     );
-    let mut metrics = Metrics::new("frame_shape", &h);
+    let mut metrics = Metrics::new("frame_shape", &h, &tsc);
     metrics.frame_rows("frame", &stats);
     metrics.frame_rows("api", &work);
     metrics.metric(
