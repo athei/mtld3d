@@ -69,6 +69,16 @@ unsafe extern "system" {
     fn GetCurrentProcess() -> *mut c_void;
     fn TerminateProcess(process: *mut c_void, exit_code: u32) -> i32;
     fn GetLastError() -> u32;
+    fn VirtualQuery(
+        address: *const c_void,
+        buffer: *mut MemoryBasicInformation,
+        length: usize,
+    ) -> usize;
+    fn K32GetProcessMemoryInfo(
+        process: *mut c_void,
+        counters: *mut ProcessMemoryCounters,
+        size: u32,
+    ) -> i32;
 }
 
 #[link(name = "gdi32")]
@@ -78,6 +88,13 @@ unsafe extern "system" {
     fn GetBitmapBits(bitmap: *mut c_void, count: i32, bits: *mut c_void) -> i32;
     fn DeleteObject(object: *mut c_void) -> i32;
 }
+
+/// `MEM_COMMIT`: the region's pages are committed.
+const MEM_COMMIT: u32 = 0x1000;
+/// `MEM_RESERVE`: the region is reserved and not committed.
+const MEM_RESERVE: u32 = 0x2000;
+/// `MEM_FREE`: the region belongs to no allocation.
+const MEM_FREE: u32 = 0x1_0000;
 
 static FAILURE_EXIT_HOOK: Once = Once::new();
 
@@ -111,6 +128,140 @@ pub fn install_failure_exit_hook() {
             unsafe { TerminateProcess(process, TEST_FAILURE_EXIT_CODE) };
         }));
     });
+}
+
+/// This process's address space by region state, and its peak working set, in bytes.
+///
+/// The address space is one `VirtualQuery` walk from address zero to the end
+/// of the user range, so committed, reserved and free add up to all of it.
+/// On i686 the largest free region is what a 32-bit process runs out of
+/// first: an allocation or a DLL load fails when no single hole fits it,
+/// however much free space the holes add up to.
+///
+/// The address space is the PE view of the process. The peak working set
+/// is not: under Wine the counters are read from the host process, so it is
+/// most likely the peak resident size of the whole macOS process, the unix
+/// side, the translator and Metal's allocations included.
+pub struct MemorySample {
+    committed: u64,
+    reserved: u64,
+    largest_free: u64,
+    peak_working_set: u64,
+}
+
+impl MemorySample {
+    /// Walk the address space and read the working-set counters now.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `K32GetProcessMemoryInfo` fails, which for the current
+    /// process means the harness declared the counters with the wrong size.
+    #[must_use]
+    pub fn now() -> Self {
+        let mut committed = 0_u64;
+        let mut reserved = 0_u64;
+        let mut largest_free = 0_u64;
+        let mut addr = 0_usize;
+        loop {
+            let mut info = MemoryBasicInformation::default();
+            let size = size_of::<MemoryBasicInformation>();
+            // SAFETY: kernel32 export; any address is accepted (one past the
+            // user range fails), and `info` is an owned local of the size passed.
+            let written =
+                unsafe { VirtualQuery(core::ptr::without_provenance(addr), &raw mut info, size) };
+            if written == 0 || info.region_size == 0 {
+                break;
+            }
+            let region = u64::try_from(info.region_size).expect("a region size fits u64");
+            match info.state {
+                MEM_COMMIT => committed += region,
+                MEM_RESERVE => reserved += region,
+                MEM_FREE => largest_free = largest_free.max(region),
+                other => panic!("VirtualQuery reported region state {other:#x}"),
+            }
+            // The region starts at `base_address`, the query address rounded
+            // down to a page, so the next one starts where this one ends.
+            match info.base_address.checked_add(info.region_size) {
+                Some(next) if next > addr => addr = next,
+                _ => break,
+            }
+        }
+        let mut counters = ProcessMemoryCounters::default();
+        let size = u32::try_from(size_of::<ProcessMemoryCounters>())
+            .expect("PROCESS_MEMORY_COUNTERS size fits u32");
+        counters.cb = size;
+        // SAFETY: Win32 GetCurrentProcess returns a pseudo-handle for the
+        // current process.
+        let process = unsafe { GetCurrentProcess() };
+        // SAFETY: kernel32 export; the current process's pseudo-handle and an
+        // owned `PROCESS_MEMORY_COUNTERS` whose `cb` is the size passed.
+        let ok = unsafe { K32GetProcessMemoryInfo(process, &raw mut counters, size) };
+        assert!(ok != 0, "K32GetProcessMemoryInfo failed");
+        Self {
+            committed,
+            reserved,
+            largest_free,
+            peak_working_set: u64::try_from(counters.peak_working_set_size)
+                .expect("a working set fits u64"),
+        }
+    }
+
+    /// Bytes in committed regions.
+    #[must_use]
+    pub const fn committed(&self) -> u64 {
+        self.committed
+    }
+
+    /// Bytes in regions reserved and not committed.
+    #[must_use]
+    pub const fn reserved(&self) -> u64 {
+        self.reserved
+    }
+
+    /// Bytes in the largest free region.
+    #[must_use]
+    pub const fn largest_free(&self) -> u64 {
+        self.largest_free
+    }
+
+    /// The peak working set so far, `PeakWorkingSetSize`; under Wine, the host process's peak RSS.
+    #[must_use]
+    pub const fn peak_working_set(&self) -> u64 {
+        self.peak_working_set
+    }
+}
+
+/// `MEMORY_BASIC_INFORMATION`, correct on both PE targets.
+///
+/// Pointer and `SIZE_T` fields are `usize`, so `repr(C)` lays out the
+/// 28-byte i686 form and the 48-byte x64 form (with its two alignment
+/// holes) without a per-target definition.
+#[repr(C)]
+#[derive(Default)]
+struct MemoryBasicInformation {
+    base_address: usize,
+    allocation_base: usize,
+    allocation_protect: u32,
+    region_size: usize,
+    state: u32,
+    protect: u32,
+    mem_type: u32,
+}
+
+/// `PROCESS_MEMORY_COUNTERS`, the `SIZE_T` fields as `usize` for both PE targets.
+#[repr(C)]
+#[derive(Default)]
+struct ProcessMemoryCounters {
+    cb: u32,
+    page_fault_count: u32,
+    peak_working_set_size: usize,
+    working_set_size: usize,
+    quota_peak_paged_pool_usage: usize,
+    quota_paged_pool_usage: usize,
+    quota_peak_non_paged_pool_usage: usize,
+    quota_non_paged_pool_usage: usize,
+    pagefile_usage: usize,
+    peak_pagefile_usage: usize,
 }
 
 #[repr(C)]

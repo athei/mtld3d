@@ -9,7 +9,9 @@
 //!
 //! Each benchmark writes a plain-text report, `bench-<name>.txt`, into the
 //! directory the layer writes its log to (`log.dir`, which `make bench`
-//! points at its output directory). On a `PERF=1` build the report carries
+//! points at its output directory), and beside it `bench-<name>.metrics`,
+//! the same numbers one record per line for a program to compare (see
+//! [`Metrics`]). On a `PERF=1` build the report carries
 //! the rows of the layer's five-second `mtld3d::perf` summary that cover the
 //! measured frames, copied out of that log. Frame times are taken on the API
 //! thread from one `Present` return to the next with `Instant`, which on
@@ -17,7 +19,9 @@
 //! `D3DPRESENT_INTERVAL_IMMEDIATE` so the display does not pace it. Beside
 //! that the report gives the time from a `Present` return to the next
 //! `Present` call, the API thread's own work on the frame, which tells a
-//! frame bound by the API thread from one bound behind `Present`.
+//! frame bound by the API thread from one bound behind `Present`. Each
+//! benchmark also samples the process's address space after its warm-up
+//! and at the end of its measured frames, and its peak working set.
 
 use core::fmt::Write as _;
 use std::{
@@ -26,7 +30,7 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
-use mtld3d_tests::{Harness, Texture, TexturedVertex, config_value, config_var};
+use mtld3d_tests::{Harness, MemorySample, Texture, TexturedVertex, config_value, config_var};
 use mtld3d_types::{
     D3D_OK, D3DDECL_END, D3DDECLMETHOD_DEFAULT, D3DDECLTYPE_D3DCOLOR, D3DDECLTYPE_FLOAT2,
     D3DDECLTYPE_FLOAT3, D3DDECLUSAGE_COLOR, D3DDECLUSAGE_POSITION, D3DDECLUSAGE_TEXCOORD,
@@ -71,6 +75,16 @@ pub const TEXTURED_DECL: [D3DVERTEXELEMENT9; 4] = [
 /// Deeper rows that happen to start with a block's words (`GPU copy` under
 /// a resource row) belong to the block they sit in and open nothing.
 const BLOCK_INDENT: usize = 4;
+
+/// What precedes the build stamp on the line the layer's `d3d9.dll` logs when it loads.
+///
+/// The line is `d3d9.dll <build> <image id> loaded at <base>`, after the
+/// logger's `[<time> <level> <target>] ` prefix; `<build>` is the release
+/// identity the build stamped in from `git describe`.
+const LAYER_STAMP: &str = "] d3d9.dll ";
+
+/// What follows the build stamp and the image ID on the layer's load line.
+const LAYER_LOADED: &str = " loaded at ";
 
 /// The block of a perf window that [`LayerLog::compilation_rows`] copies.
 const COMPILATION_BLOCK: [&str; 1] = ["Compilation"];
@@ -309,6 +323,20 @@ impl LayerLog {
             .collect()
     }
 
+    /// The build stamp and image ID on the layer's `d3d9.dll` load line, if the log has one.
+    ///
+    /// Two builds of one commit share the stamp; the image ID, which the
+    /// linker derives from the binary's contents, tells them apart.
+    pub fn layer_identity(&self) -> Option<(String, String)> {
+        let bytes = fs::read(self.path.as_deref()?).ok()?;
+        String::from_utf8_lossy(&bytes).lines().find_map(|line| {
+            let (_, rest) = line.split_once(LAYER_STAMP)?;
+            let (identity, _) = rest.split_once(LAYER_LOADED)?;
+            let (build, image) = identity.split_once(' ')?;
+            Some((build.to_owned(), image.to_owned()))
+        })
+    }
+
     /// Where the log is, for the report; `None` when no log was found.
     pub fn path(&self) -> Option<&Path> {
         self.path.as_deref()
@@ -364,14 +392,17 @@ pub fn log_dir() -> PathBuf {
         )
 }
 
-/// Write `body` as the report `bench-<name>.txt` in the log directory, and print it.
+/// Write `body` as the report `bench-<name>.txt` in the log directory, `metrics` beside it.
 ///
 /// The header names the architecture, the build and the suite-wide
-/// `MTLD3D_CONFIG`, so a report says what it measured.
+/// `MTLD3D_CONFIG`, so a report says what it measured. The name is the one
+/// `metrics` was created with, and the records go to `bench-<name>.metrics`.
+/// The report is printed as well.
 ///
 /// # Panics
-/// Panics if the report cannot be written.
-pub fn write_report(name: &str, log: &LayerLog, body: &str) {
+/// Panics if either file cannot be written.
+pub fn write_report(metrics: &Metrics, log: &LayerLog, body: &str) {
+    let name = &metrics.bench;
     let mut report = format!(
         "bench: {name} ({arch})\nbuild: {build}\nMTLD3D_CONFIG: {config}\nlayer log: {log}\n",
         arch = std::env::consts::ARCH,
@@ -386,30 +417,280 @@ pub fn write_report(name: &str, log: &LayerLog, body: &str) {
     fs::create_dir_all(&dir).expect("the report directory can be created");
     let path = dir.join(format!("bench-{name}.txt"));
     fs::write(&path, &report).expect("the benchmark report can be written");
+    let path = dir.join(format!("bench-{name}.metrics"));
+    fs::write(&path, metrics.file(log)).expect("the benchmark metrics can be written");
     println!("{report}");
 }
 
-/// The cargo profile this benchmark was built with, and whether debug assertions were on.
+/// Which way a metric is better.
+pub enum Direction {
+    /// A smaller value is better.
+    Lower,
+    /// A larger value is better.
+    Higher,
+}
+
+impl Direction {
+    const fn word(self) -> &'static str {
+        match self {
+            Self::Lower => "lower",
+            Self::Higher => "higher",
+        }
+    }
+}
+
+/// How a comparison of two builds reads a metric.
+pub enum Class {
+    /// A time a build's speed decides.
+    Time,
+    /// A count of frames that took too long.
+    Spikes,
+    /// A count that must not change: any difference is a real one.
+    Exact,
+    /// A number that moves between runs of the same build.
+    Noisy,
+    /// Reported for the reader, not compared.
+    Info,
+}
+
+impl Class {
+    const fn word(self) -> &'static str {
+        match self {
+            Self::Time => "time",
+            Self::Spikes => "spikes",
+            Self::Exact => "exact",
+            Self::Noisy => "noisy",
+            Self::Info => "info",
+        }
+    }
+}
+
+/// A metric's value, in the unit its variant names.
+pub enum Value {
+    /// Milliseconds, four decimals.
+    Ms(Duration),
+    /// A plain count.
+    Count(u64),
+    /// Bytes, written as MiB with two decimals.
+    Mib(u64),
+}
+
+impl Value {
+    /// The value as the file writes it, and its unit.
+    fn text(self) -> (String, &'static str) {
+        match self {
+            Self::Ms(duration) => (format!("{:.4}", ms(duration)), "ms"),
+            Self::Count(count) => (count.to_string(), "count"),
+            Self::Mib(bytes) => (mib(bytes), "mib"),
+        }
+    }
+}
+
+/// One render pass of a frame, as the benchmark that draws it defines it.
+pub struct PassShape {
+    /// Width of the pass's render target, in pixels.
+    pub width: u32,
+    /// Height of the pass's render target, in pixels.
+    pub height: u32,
+    /// Draw calls in the pass each frame.
+    pub draws: u32,
+    /// Draws through the fixed-function vertex pipeline.
+    pub ff_vs: u32,
+    /// Draws through the fixed-function texture stages.
+    pub ff_ps: u32,
+    /// Textures the pass's draws sample, summed over the draws.
+    pub textures: u32,
+}
+
+/// A benchmark's numbers in the machine-read form of `bench-<name>.metrics`.
 ///
-/// `make bench` builds the benchmark with the layer's profile, so this is
-/// the layer's build too. The profile is the directory cargo put the
-/// executable under, `target/<triple>/<profile>/deps`; a binary anywhere
-/// else (a stage) names none, and the debug-assertion state still says
-/// which kind of build it is.
-fn build() -> String {
-    let profile = std::env::current_exe()
-        .ok()
-        .and_then(|exe| {
-            let deps = exe.parent()?;
-            (deps.file_name()? == "deps").then_some(())?;
-            Some(deps.parent()?.file_name()?.to_string_lossy().into_owned())
-        })
-        .map_or_else(
-            || "profile unknown (not in a cargo target directory)".to_owned(),
-            |profile| format!("{profile} profile"),
+/// UTF-8, one record per line, fields separated by one space, and `#`
+/// opening a comment line. The records are, in this order:
+///
+/// - `meta <bench> <key> <value...>`, the value running to the end of the
+///   line: `layer` (the build stamp the layer logged, or `unknown`),
+///   `layer_image` (the image ID on the same line, or `unknown`), `arch`
+///   (`i686` or `x86_64`), `profile` and `debug_assertions` (`true` or
+///   `false`), and `config` (the suite-wide `MTLD3D_CONFIG`, or `none`).
+///   `profile` and `debug_assertions` describe the benchmark binary, which
+///   `make bench` builds with the layer's profile. `config` leaves out the
+///   entries a benchmark's harness adds on top of it, such as the stutter
+///   benchmark's `shaderCache.enable=false`; the report's shape line names
+///   those.
+/// - `metric <bench> <name> <value> <unit> <direction> <class>`: a name of
+///   `[a-z0-9_.]`, a unit of `ms`, `count` or `mib`, a [`Direction`] and a
+///   [`Class`].
+/// - `shape <bench> pass <i> <W>x<H> draws=<n> ff_vs=<n> ff_ps=<n>
+///   tex_per_draw=<x.xx>`, one per [`PassShape`] of a scene benchmark.
+///
+/// A program comparing a base build with a candidate reads these, so the
+/// format is a contract: a record changes by adding a key or a metric, never
+/// by changing one.
+pub struct Metrics {
+    bench: String,
+    records: String,
+    shapes: String,
+}
+
+impl Metrics {
+    /// No records yet, for the benchmark `bench`, which also names both files.
+    ///
+    /// # Panics
+    /// Panics if `bench` is empty or holds whitespace.
+    pub fn new(bench: &str) -> Self {
+        assert!(
+            !bench.is_empty() && !bench.contains(char::is_whitespace),
+            "a benchmark name is one word: {bench:?}"
         );
-    let assertions = if cfg!(debug_assertions) { "on" } else { "off" };
-    format!("{profile}, debug assertions {assertions}")
+        Self {
+            bench: bench.to_owned(),
+            records: String::new(),
+            shapes: String::new(),
+        }
+    }
+
+    /// Add one `metric` record.
+    ///
+    /// # Panics
+    /// Panics if `name` is empty or holds a byte outside `[a-z0-9_.]`.
+    pub fn metric(&mut self, name: &str, value: Value, direction: Direction, class: Class) {
+        assert!(
+            !name.is_empty()
+                && name.bytes().all(|byte| {
+                    byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"_.".contains(&byte)
+                }),
+            "a metric name is [a-z0-9_.]+: {name:?}"
+        );
+        let (value, unit) = value.text();
+        let _ = writeln!(
+            self.records,
+            "metric {bench} {name} {value} {unit} {direction} {class}",
+            bench = self.bench,
+            direction = direction.word(),
+            class = class.word(),
+        );
+    }
+
+    /// The `<prefix>.p50`, `.mean`, `.p99` and `.max` records of a run of frame times.
+    ///
+    /// The three that summarise the run are compared as times; the worst
+    /// frame, one sample, is reported alone.
+    pub fn frame_rows(&mut self, prefix: &str, stats: &FrameStats) {
+        for (row, value, class) in [
+            ("p50", stats.p50, Class::Time),
+            ("mean", stats.mean, Class::Time),
+            ("p99", stats.p99, Class::Time),
+            ("max", stats.max, Class::Info),
+        ] {
+            self.metric(
+                &format!("{prefix}.{row}"),
+                Value::Ms(value),
+                Direction::Lower,
+                class,
+            );
+        }
+    }
+
+    /// The `mem.*` records of the samples taken after the warm-up and at the end.
+    ///
+    /// The peak working set is the end sample's, the peak of the whole run.
+    pub fn memory(&mut self, warm: &MemorySample, end: &MemorySample) {
+        for (phase, sample) in [("warm", warm), ("end", end)] {
+            for (row, bytes, direction) in [
+                ("committed_mib", sample.committed(), Direction::Lower),
+                ("reserved_mib", sample.reserved(), Direction::Lower),
+                ("largest_free_mib", sample.largest_free(), Direction::Higher),
+            ] {
+                self.metric(
+                    &format!("mem.{phase}.{row}"),
+                    Value::Mib(bytes),
+                    direction,
+                    Class::Noisy,
+                );
+            }
+        }
+        self.metric(
+            "mem.peak_ws_mib",
+            Value::Mib(end.peak_working_set()),
+            Direction::Lower,
+            Class::Noisy,
+        );
+    }
+
+    /// One `shape` record per pass, numbered in the order the frame draws them.
+    ///
+    /// # Panics
+    /// Panics if a pass has no draws.
+    pub fn shapes(&mut self, passes: &[PassShape]) {
+        for (at, pass) in passes.iter().enumerate() {
+            assert!(pass.draws > 0, "pass {at} of a scene has draws");
+            let _ = writeln!(
+                self.shapes,
+                "shape {bench} pass {at} {width}x{height} draws={draws} ff_vs={ff_vs} \
+                 ff_ps={ff_ps} tex_per_draw={per_draw:.2}",
+                bench = self.bench,
+                width = pass.width,
+                height = pass.height,
+                draws = pass.draws,
+                ff_vs = pass.ff_vs,
+                ff_ps = pass.ff_ps,
+                per_draw = f64::from(pass.textures) / f64::from(pass.draws),
+            );
+        }
+    }
+
+    /// The whole file: a comment, the `meta` records, then the metrics and the shapes.
+    fn file(&self, log: &LayerLog) -> String {
+        let bench = &self.bench;
+        let mut file = format!("# bench-{bench}.metrics: meta, metric and shape records\n");
+        let arch = match std::env::consts::ARCH {
+            "x86" => "i686",
+            other => other,
+        };
+        let (layer, layer_image) = log
+            .layer_identity()
+            .unwrap_or_else(|| ("unknown".to_owned(), "unknown".to_owned()));
+        for (key, value) in [
+            ("layer", layer),
+            ("layer_image", layer_image),
+            ("arch", arch.to_owned()),
+            ("profile", profile().unwrap_or_else(|| "unknown".to_owned())),
+            ("debug_assertions", cfg!(debug_assertions).to_string()),
+            (
+                "config",
+                config_var()
+                    .filter(|config| !config.is_empty())
+                    .map_or_else(
+                        || "none".to_owned(),
+                        |config| config.replace(['\r', '\n'], " "),
+                    ),
+            ),
+        ] {
+            let _ = writeln!(file, "meta {bench} {key} {value}");
+        }
+        file.push_str(&self.records);
+        file.push_str(&self.shapes);
+        file
+    }
+}
+
+/// The report rows of the memory samples taken after the warm-up and at the end.
+pub fn memory_section(warm: &MemorySample, end: &MemorySample) -> String {
+    let row = |sample: &MemorySample| {
+        format!(
+            "committed {} MiB, reserved {} MiB, largest free region {} MiB",
+            mib(sample.committed()),
+            mib(sample.reserved()),
+            mib(sample.largest_free())
+        )
+    };
+    format!(
+        "address space after the warm-up: {warm}\naddress space at the end: {end}\n\
+         peak working set (under Wine the host process's peak RSS): {peak} MiB\n",
+        warm = row(warm),
+        end = row(end),
+        peak = mib(end.peak_working_set()),
+    )
 }
 
 /// An `n`x`n` grid of quads over the unit square at `z = 0`, with its 16-bit index list.
@@ -653,4 +934,33 @@ fn opens(row: &str) -> bool {
 
 fn ms(duration: Duration) -> f64 {
     duration.as_secs_f64() * 1e3
+}
+
+/// `bytes` in MiB with two decimals, truncated.
+fn mib(bytes: u64) -> String {
+    let hundredths = bytes.saturating_mul(100) >> 20;
+    format!("{}.{:02}", hundredths / 100, hundredths % 100)
+}
+
+/// The cargo profile this benchmark was built with, and whether debug assertions were on.
+///
+/// `make bench` builds the benchmark with the layer's profile, so this is
+/// the layer's build too. A binary outside a cargo target directory (a
+/// stage) names no profile, and the debug-assertion state still says which
+/// kind of build it is.
+fn build() -> String {
+    let profile = profile().map_or_else(
+        || "profile unknown (not in a cargo target directory)".to_owned(),
+        |profile| format!("{profile} profile"),
+    );
+    let assertions = if cfg!(debug_assertions) { "on" } else { "off" };
+    format!("{profile}, debug assertions {assertions}")
+}
+
+/// The cargo profile, the directory the executable's `deps` sits in under `target/<triple>`.
+fn profile() -> Option<String> {
+    let exe = std::env::current_exe().ok()?;
+    let deps = exe.parent()?;
+    (deps.file_name()? == "deps").then_some(())?;
+    Some(deps.parent()?.file_name()?.to_string_lossy().into_owned())
 }

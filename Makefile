@@ -985,9 +985,14 @@ conformance-isolate: install-windows-$(ARCH) install-unix-$(SDK_UNIX_ARCH)
 # benchmark's own `shaderCache.enable=false` still wins over them). PERF=1
 # builds the layer with its perf summary. Each benchmark writes
 # `bench-<name>.txt` into LOG_DIR (default `.codex/evidence/bench`), beside
-# the layer's log that a PERF=1 build's summary rows are copied from, and the
-# reports are printed at the end. FILTER='<patterns>' narrows the run as it
-# does for `make test`, e.g. `FILTER=stutter`.
+# the layer's log that a PERF=1 build's summary rows are copied from, and
+# `bench-<name>.metrics` next to it, the same numbers plus the build's
+# identity, its address-space samples and a scene's per-pass shape, one
+# record per line for a program comparing two builds (`bench.rs` documents
+# the format). A run first deletes both kinds of file left by the one
+# before, prints the reports at the end and says where the metrics files
+# are. FILTER='<patterns>' narrows the run as it does for `make test`, e.g.
+# `FILTER=stutter`.
 BENCH_DIR := $(or $(LOG_DIR),$(CURDIR)/.codex/evidence/bench)
 BENCH_TIMEOUT ?= 300
 BENCH_TARGET := $(if $(filter x86_64,$(ARCH)),$(PE_x64),$(PE_i386))
@@ -995,7 +1000,7 @@ BENCH_EXES = $(if $(STAGE),$(STAGE)/tests/$(ARCH)/*.exe,$(call E2E_EXES,$(BENCH_
 MTLD3D_CONF_BENCH := shaderCache.enable=false;color.hdr.enable=false;log.dir=Z:$(BENCH_DIR)$(if $(BENCH_CONFIG),;$(BENCH_CONFIG))
 bench: install-windows-$(ARCH) install-unix-$(SDK_UNIX_ARCH)
 	$(MAKE) configure-test-prefix
-	mkdir -p '$(BENCH_DIR)' && rm -f '$(BENCH_DIR)'/bench-*.txt
+	mkdir -p '$(BENCH_DIR)' && rm -f '$(BENCH_DIR)'/bench-*.txt '$(BENCH_DIR)'/bench-*.metrics
 	$(call E2E_EXES_ASSIGN,$(BENCH_EXES)); suite=; \
 	for exe in $$exes; do case $$exe in */e2e-*.exe|*/e2e.exe) suite=$$exe;; esac; done; \
 	[ -n "$$suite" ] || { echo "no e2e test binary among: $$exes" >&2; exit 2; }; \
@@ -1003,6 +1008,7 @@ bench: install-windows-$(ARCH) install-unix-$(SDK_UNIX_ARCH)
 		$(E2E_RUNNER) --wine $(WINE) --jobs 1 --timeout $(BENCH_TIMEOUT) --ignored \
 		$(if $(FILTER),--filter '$(FILTER)') --log-dir '$(BENCH_DIR)' -- $$suite
 	if ls '$(BENCH_DIR)'/bench-*.txt >/dev/null 2>&1; then cat '$(BENCH_DIR)'/bench-*.txt; \
+		echo "make bench: metrics in:"; ls -1 '$(BENCH_DIR)'/bench-*.metrics 2>/dev/null || echo "  none"; \
 	else echo "make bench: no benchmark ran; FILTER='$(FILTER)' matches none of them"; fi
 
 fmt:

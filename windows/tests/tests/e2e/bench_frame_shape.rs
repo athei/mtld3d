@@ -23,12 +23,15 @@
 //! and `ps_3_0`, four fixed-function scene stages, two caster pairs, the
 //! glow pair and two UI stages) is created up front and first drawn in the
 //! warm-up, so the measured frames compile nothing.
+//!
+//! The metrics file carries one `shape` record per pass, computed from the
+//! constants and the material list below rather than read back from the layer.
 
 use std::time::{Duration, Instant, SystemTime};
 
 use mtld3d_tests::{
-    Harness, HarnessConfig, IndexBuffer, PixelShader, Surface, Texture, TexturedVertex,
-    VertexBuffer, VertexDeclaration, VertexShader,
+    Harness, HarnessConfig, IndexBuffer, MemorySample, PixelShader, Surface, Texture,
+    TexturedVertex, VertexBuffer, VertexDeclaration, VertexShader,
 };
 use mtld3d_types::{
     D3D_OK, D3DBLEND_INVSRCALPHA, D3DBLEND_ONE, D3DBLEND_SRCALPHA, D3DCLEAR_STENCIL,
@@ -47,8 +50,9 @@ use mtld3d_types::{
 };
 
 use crate::bench::{
-    FrameClock, IDENTITY_ROWS, LayerLog, Model, STRIDE, TEXTURED_DECL, def, element, grid,
-    material_ps, material_vs, ok, pattern_texture, ratio, transform, world_rows, write_report,
+    Class, Direction, FrameClock, IDENTITY_ROWS, LayerLog, Metrics, Model, PassShape, STRIDE,
+    TEXTURED_DECL, Value, def, element, grid, material_ps, material_vs, memory_section, ok,
+    pattern_texture, ratio, transform, world_rows, write_report,
 };
 
 /// The back buffer, about the size of a windowed game.
@@ -111,6 +115,7 @@ fn wow_335a_busy_frame() {
     }
     let log = LayerLog::find(since);
     let warm_up = started.elapsed();
+    let warm = MemorySample::now();
 
     let from = log.mark();
     let mut clock = FrameClock::start(MEASURED_FRAMES * 4);
@@ -122,8 +127,10 @@ fn wow_335a_busy_frame() {
         tick += 1;
     }
     let to = log.mark();
+    let end = MemorySample::now();
 
     let stats = clock.stats();
+    let work = clock.work_stats();
     let shadow = if frame.shadows[0].texture.is_some() {
         "INTZ, sampled by the receivers"
     } else {
@@ -140,7 +147,7 @@ fn wow_335a_busy_frame() {
          measured: {frames} frames in {elapsed:.2?} (at least {MEASURED_FRAMES} frames \
          and {MIN_MEASURED:?})\n\
          frame time (Present to Present): {row}\n\
-         API work (Present return to Present call): {work}\n{perf}{warm_up_compiles}",
+         API work (Present return to Present call): {work}\n{memory}{perf}{warm_up_compiles}",
         draws = DRAWS_PER_FRAME,
         casters = CASCADES * CASTERS_PER_CASCADE,
         scene = SCENE_RUNS * DRAWS_PER_RUN + 2,
@@ -150,7 +157,8 @@ fn wow_335a_busy_frame() {
         frames = stats.frames,
         elapsed = clock.elapsed(),
         row = stats.row(),
-        work = clock.work_stats().row(),
+        work = work.row(),
+        memory = memory_section(&warm, &end),
         perf = log.perf_rows(from, to).section(),
         warm_up_compiles = log
             .first_window_rows(to)
@@ -158,7 +166,101 @@ fn wow_335a_busy_frame() {
                 "perf: this device's first window, its warm-up compiles\n{rows}"
             )),
     );
-    write_report("frame_shape", &log, &body);
+    let mut metrics = Metrics::new("frame_shape");
+    metrics.frame_rows("frame", &stats);
+    metrics.frame_rows("api", &work);
+    metrics.metric(
+        "warmup.ms",
+        Value::Ms(warm_up),
+        Direction::Lower,
+        Class::Info,
+    );
+    metrics.metric(
+        "measured.frames",
+        Value::Count(u64::try_from(stats.frames).expect("frame count fits u64")),
+        Direction::Higher,
+        Class::Info,
+    );
+    metrics.metric(
+        "measured.ms",
+        Value::Ms(clock.elapsed()),
+        Direction::Lower,
+        Class::Info,
+    );
+    metrics.memory(&warm, &end);
+    metrics.shapes(&pass_shapes());
+    write_report(&metrics, &log, &body);
+}
+
+/// The nine passes of one frame, in the order [`Frame::render`] draws them.
+///
+/// A draw's textures are the ones its shaders or stages sample: none for
+/// an opaque caster, one for an alpha-tested caster, two for a receiver
+/// (its pattern and its cascade's shadow map, or the stand-in pattern where
+/// INTZ is not offered), and one for every other draw. The fixed-function
+/// draws are the fixed scene materials, the particle batches and the UI
+/// quads, which use both the fixed vertex pipeline and the texture stages.
+///
+/// # Panics
+/// Panics if the passes do not add up to [`DRAWS_PER_FRAME`].
+fn pass_shapes() -> Vec<PassShape> {
+    let screen = |draws, fixed, textures| PassShape {
+        width: WIDTH,
+        height: HEIGHT,
+        draws,
+        ff_vs: fixed,
+        ff_ps: fixed,
+        textures,
+    };
+    let mut passes: Vec<PassShape> = (0..CASCADES)
+        .map(|_| PassShape {
+            width: SHADOW_EDGE,
+            height: SHADOW_EDGE,
+            draws: CASTERS_PER_CASCADE,
+            ff_vs: 0,
+            ff_ps: 0,
+            textures: CASTERS_PER_CASCADE - CASTERS_PER_CASCADE / 2,
+        })
+        .collect();
+
+    let mut scene = screen(0, 0, 0);
+    for run in 0..SCENE_RUNS {
+        if PARTICLE_RUNS.contains(&run) {
+            scene.draws += 1;
+            scene.ff_vs += 1;
+            scene.ff_ps += 1;
+            scene.textures += 1;
+        }
+        let at = material_of_run(run);
+        let fixed = at >= SM2_MATERIALS + SM3_MATERIALS;
+        let textures = if at < SM2_MATERIALS && receives_shadow(at) {
+            2
+        } else {
+            1
+        };
+        scene.draws += DRAWS_PER_RUN;
+        scene.textures += textures * DRAWS_PER_RUN;
+        if fixed {
+            scene.ff_vs += DRAWS_PER_RUN;
+            scene.ff_ps += DRAWS_PER_RUN;
+        }
+    }
+    passes.push(scene);
+
+    passes.extend((0..3).map(|_| PassShape {
+        width: WIDTH / 2,
+        height: HEIGHT / 2,
+        draws: 1,
+        ff_vs: 0,
+        ff_ps: 0,
+        textures: 1,
+    }));
+    // The glow composite, still on the glow program, then the fixed-function quads.
+    passes.push(screen(1 + UI_QUADS, UI_QUADS, 1 + UI_QUADS));
+
+    let draws: u32 = passes.iter().map(|pass| pass.draws).sum();
+    assert_eq!(draws, DRAWS_PER_FRAME, "the pass shapes cover every draw");
+    passes
 }
 
 /// A shadow depth target: an INTZ texture's level when `intz`, else a D24S8 surface.
@@ -472,10 +574,9 @@ impl<'h> Frame<'h> {
                     self.particles(tick, run, blend);
                 }
                 ok(h.set_indices(&self.mesh_ib), "SetIndices");
-                // Coprime with the run count, so every material comes up once, shuffled.
-                self.bind_material(&self.materials[slot((run * 7) % SCENE_RUNS)]);
+                self.bind_material(&self.materials[slot(material_of_run(run))]);
             }
-            let material = &self.materials[slot((draw / DRAWS_PER_RUN * 7) % SCENE_RUNS)];
+            let material = &self.materials[slot(material_of_run(draw / DRAWS_PER_RUN))];
             self.scene_draw(tick, draw, material);
             match draw % 5 {
                 1 => {
@@ -747,12 +848,30 @@ fn materials(h: &Harness) -> Vec<Material<'_>> {
         }
     };
     let mut materials: Vec<Material<'_>> = (0..SM2_MATERIALS)
-        .map(|at| programmable(&Model::Sm2, at, (at % 2 == 1).then_some(at / 2 % CASCADES)))
+        .map(|at| {
+            programmable(
+                &Model::Sm2,
+                at,
+                receives_shadow(at).then_some(at / 2 % CASCADES),
+            )
+        })
         .collect();
     materials
         .extend((0..SM3_MATERIALS).map(|at| programmable(&Model::Sm3, SM2_MATERIALS + at, None)));
     materials.extend(FF_OPS.iter().map(|&op| Material::Fixed(op)));
     materials
+}
+
+/// The material the scene's `run`-th run draws with.
+///
+/// Seven is coprime with the run count, so every material comes up once, shuffled.
+const fn material_of_run(run: u32) -> u32 {
+    (run * 7) % SCENE_RUNS
+}
+
+/// Whether the `ps_2_0` material `at` is a receiver, sampling a cascade's shadow map on stage 1.
+const fn receives_shadow(at: u32) -> bool {
+    at % 2 == 1
 }
 
 /// The static meshes, each in a vertex buffer of its own, and the index buffer they share.

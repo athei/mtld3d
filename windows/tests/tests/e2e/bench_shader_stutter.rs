@@ -32,7 +32,7 @@
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use mtld3d_tests::{
-    Harness, HarnessConfig, IndexBuffer, PixelShader, Surface, Texture, VertexBuffer,
+    Harness, HarnessConfig, IndexBuffer, MemorySample, PixelShader, Surface, Texture, VertexBuffer,
     VertexDeclaration, VertexShader,
 };
 use mtld3d_types::{
@@ -43,8 +43,9 @@ use mtld3d_types::{
 };
 
 use crate::bench::{
-    FrameClock, IDENTITY_ROWS, LayerLog, Model, STRIDE, TEXTURED_DECL, grid, material_ps,
-    material_vs, ok, pattern_texture, ratio, world_rows, write_report,
+    Class, Direction, FrameClock, IDENTITY_ROWS, LayerLog, Metrics, Model, STRIDE, TEXTURED_DECL,
+    Value, grid, material_ps, material_vs, memory_section, ok, pattern_texture, ratio, world_rows,
+    write_report,
 };
 
 const WIDTH: u32 = 1280;
@@ -64,6 +65,11 @@ const IDLE_TAIL: Duration = Duration::from_secs(2);
 const MIN_SPAN: Duration = Duration::from_secs(12);
 /// The most verification frames before a black cell counts as never drawn.
 const VERIFY_FRAMES: u32 = 100;
+/// Settle frames the settle clock has room for before it grows.
+///
+/// Base frames can take well under a millisecond, so the tail runs to tens
+/// of thousands of them.
+const SETTLE_CAPACITY: usize = 1 << 16;
 
 /// One new pixel shader per frame on the back buffer.
 #[test]
@@ -112,6 +118,7 @@ fn stutter(name: &str, per_frame: u32, offscreen: u32) {
     }
 
     let log = LayerLog::find(since);
+    let warm = MemorySample::now();
     let from = log.mark();
     let started = Instant::now();
     let mut clock = FrameClock::start(usize::try_from(MEASURED_FRAMES).expect("fits usize"));
@@ -123,20 +130,32 @@ fn stutter(name: &str, per_frame: u32, offscreen: u32) {
         clock.present(&h);
     }
     let introduced = Instant::now();
-    let mut settle_frames = 0_u32;
+    let mut settle = FrameClock::start(SETTLE_CAPACITY);
     while introduced.elapsed() < IDLE_TAIL || started.elapsed() < MIN_SPAN {
         assert!(h.pump(), "WM_QUIT while the frames settle");
         bench.base_frame();
         ok(h.end_scene(), "EndScene");
-        ok(h.present(), "Present");
-        settle_frames += 1;
+        settle.present(&h);
     }
+    let settle_frames = settle.frames();
     let to = log.mark();
     let span = started.elapsed();
+    let end = MemorySample::now();
     let verified = bench.verify();
 
     let stats = clock.stats();
-    let spikes = clock.over(stats.p50 * 2);
+    let work = clock.work_stats();
+    let limit = stats.p50 * 2;
+    let spikes = clock.over(limit);
+    let shaders = bench.shaders.len();
+    let drawn = shaders - verified.missing;
+    let settled = settle.stats();
+    // What the measured frames cost beyond as many base frames at the settle
+    // median, spread over the new shaders: the new shaders' own cost, apart
+    // from a change in the cost of the frame around them. Clamped at zero.
+    let base = settled.p50 * u32::try_from(stats.frames).expect("frame count fits u32");
+    let extra = clock.elapsed().saturating_sub(base)
+        / u32::try_from(shaders).expect("shader count fits u32");
     let mut compiles = String::new();
     for rows in log.compilation_rows(from, to) {
         compiles.push_str("perf: window in the span, its compiles\n");
@@ -152,21 +171,96 @@ fn stutter(name: &str, per_frame: u32, offscreen: u32) {
          frame time (Present to Present): {row}\n\
          API work (Present return to Present call): {work}\n\
          frames over 2x the median ({limit:.3} ms): {spikes}\n\
-         {verified}{perf}{compiles}",
+         settle frame time (Present to Present): {settle_row}\n\
+         extra time per new shader (measured frames less as many at the settle median): \
+         {extra_ms:.3} ms\n\
+         {memory}\
+         drawn (readback of a probe target cleared every verification frame): {drawn} of \
+         {shaders} new shaders show their colour after {attempts} verification frame(s), \
+         {missing} never drawn\n\
+         {perf}{compiles}",
         offscreen = if offscreen == 0 {
             String::new()
         } else {
             format!(" + {offscreen} into an offscreen target never cleared after the first frame")
         },
         frames = stats.frames,
-        shaders = bench.shaders.len(),
         elapsed = clock.elapsed(),
         row = stats.row(),
-        work = clock.work_stats().row(),
-        limit = (stats.p50 * 2).as_secs_f64() * 1e3,
+        work = work.row(),
+        limit = limit.as_secs_f64() * 1e3,
+        settle_row = settled.row(),
+        extra_ms = extra.as_secs_f64() * 1e3,
+        memory = memory_section(&warm, &end),
+        attempts = verified.attempts,
+        missing = verified.missing,
         perf = log.perf_rows(from, to).section(),
     );
-    write_report(name, &log, &body);
+
+    let count = |n: usize| Value::Count(u64::try_from(n).expect("a count fits u64"));
+    let mut metrics = Metrics::new(name);
+    metrics.frame_rows("frame", &stats);
+    metrics.frame_rows("api", &work);
+    metrics.metric(
+        "frame.spikes",
+        count(spikes),
+        Direction::Lower,
+        Class::Spikes,
+    );
+    metrics.metric(
+        "frame.spike_limit",
+        Value::Ms(limit),
+        Direction::Lower,
+        Class::Info,
+    );
+    metrics.metric(
+        "measured.ms",
+        Value::Ms(clock.elapsed()),
+        Direction::Lower,
+        Class::Info,
+    );
+    metrics.metric(
+        "new_shader.extra",
+        Value::Ms(extra),
+        Direction::Lower,
+        Class::Time,
+    );
+    metrics.metric(
+        "new_shaders",
+        count(shaders),
+        Direction::Higher,
+        Class::Info,
+    );
+    metrics.metric(
+        "settle.frames",
+        count(settle_frames),
+        Direction::Higher,
+        Class::Info,
+    );
+    metrics.metric("span.ms", Value::Ms(span), Direction::Lower, Class::Info);
+    metrics.metric(
+        "verify.frames",
+        Value::Count(u64::from(verified.attempts)),
+        Direction::Lower,
+        Class::Info,
+    );
+    metrics.metric("verify.drawn", count(drawn), Direction::Higher, Class::Info);
+    metrics.metric(
+        "verify.never_drawn",
+        count(verified.missing),
+        Direction::Lower,
+        Class::Exact,
+    );
+    metrics.memory(&warm, &end);
+    write_report(&metrics, &log, &body);
+}
+
+/// What the verification frames found.
+struct Verification {
+    /// Verification frames drawn, up to [`VERIFY_FRAMES`].
+    attempts: u32,
+    /// New shaders whose probe cell still showed the clear colour after the last of them.
+    missing: usize,
 }
 
 /// The benchmark's device objects and the shaders it has introduced.
@@ -295,8 +389,8 @@ impl<'h> Stutter<'h> {
         }
     }
 
-    /// Draw every new shader into its cleared probe cell until each cell shows it, and report.
-    fn verify(&self) -> String {
+    /// Draw every new shader into its cleared probe cell until each cell shows it.
+    fn verify(&self) -> Verification {
         let h = self.h;
         let mut attempts = 0;
         let missing = loop {
@@ -328,13 +422,7 @@ impl<'h> Stutter<'h> {
                 break missing;
             }
         };
-        format!(
-            "drawn (readback of a probe target cleared every verification frame): {drawn} of \
-             {total} new shaders show their colour after {attempts} verification frame(s), \
-             {missing} never drawn\n",
-            total = self.shaders.len(),
-            drawn = self.shaders.len() - missing,
-        )
+        Verification { attempts, missing }
     }
 
     /// How many new shaders' probe cells are still the clear colour.
