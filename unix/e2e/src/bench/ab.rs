@@ -453,17 +453,26 @@ fn select_benches(config: &AbConfig) -> Result<Vec<Bench>, String> {
         }
     }
     for pattern in &config.benches {
-        if !found
-            .iter()
-            .any(|bench| bench.id.contains(pattern.as_str()))
+        let for_host = config.host.is_some() && names_host(pattern);
+        if !for_host
+            && !found
+                .iter()
+                .any(|bench| bench.id.contains(pattern.as_str()))
         {
             println!("bench-ab: no benchmark matches {pattern:?}; skipped");
         }
     }
-    if found.is_empty() {
+    // A selection of the host emitter benchmark alone runs its rounds only.
+    if found.is_empty() && config.host.is_none() {
         return Err("no benchmark selected: nothing to compare".to_owned());
     }
     Ok(found)
+}
+
+/// Whether the filter `pattern` names the host emitter benchmark, which `make bench-ab` runs.
+#[must_use]
+pub fn names_host(pattern: &str) -> bool {
+    pattern.contains("host") || pattern.contains("emit")
 }
 
 /// A launcher for `exe` under `spec`'s Wine and prefix, running the `#[ignore]`d tests.

@@ -1129,8 +1129,11 @@ bench: install-windows-$(ARCH) install-unix-$(SDK_UNIX_ARCH)
 # BENCH_SET picks the benchmarks: `wow` (the default) the ones that stand for
 # the game this layer serves first, `full` every benchmark, and anything else
 # a space-separated list of test-name filters, each selecting the benchmarks
-# whose test path contains it (BENCH_SET=dynamic_buffer_churn rechecks one);
-# a name the checkout does not carry yet is skipped with a note. ACCEPT=a,b names the
+# whose test path contains it (BENCH_SET=dynamic_buffer_churn rechecks one),
+# the words mixing freely (`wow cold_start`); a name the checkout does not
+# carry yet is skipped with a note. The host emitter benchmark runs with a
+# named set or a filter naming `host` or `emit`, not with a subset of the
+# end-to-end ones. ACCEPT=a,b names the
 # exact metrics (draw counts and the like, which the workload fixes) whose
 # change is expected, and BENCH_CONFIG is appended to both legs' configuration
 # as it is for `make bench`. BASE=HEAD is an A/A run, the way to see how much
@@ -1197,9 +1200,15 @@ BENCH_SET ?= wow
 BENCH_SET_wow := wow_112_busy_frame wow_335a_busy_frame query_poll_wow query_poll_spec api_call_cost \
 	dynamic_buffer_churn texture_streaming
 BENCH_SET_full :=
-# The runner's --bench filters for BENCH_SET: a named set's list (none for
-# `full`), or BENCH_SET itself when it names no set.
-BENCH_FILTERS = $(if $(filter wow full,$(BENCH_SET)),$(if $(BENCH_SET_$(BENCH_SET)),--bench '$(BENCH_SET_$(BENCH_SET))'),--bench '$(BENCH_SET)')
+# The runner's --bench filters for BENCH_SET, each word on its own: a set's
+# name stands for its list and any other word for itself, and `full` anywhere
+# means every benchmark, so no filter at all.
+BENCH_FILTER_WORDS = $(strip $(foreach w,$(BENCH_SET),$(if $(filter wow full,$(w)),$(BENCH_SET_$(w)),$(w))))
+BENCH_FILTERS = $(if $(filter full,$(BENCH_SET)),,--bench '$(BENCH_FILTER_WORDS)')
+# Whether BENCH_SET asks for the host emitter benchmark: a named set does, and
+# so does a filter naming `host` or `emit`; a subset of end-to-end benchmarks
+# does not.
+BENCH_HOST_WANTED = $(strip $(filter wow full,$(BENCH_SET))$(foreach w,$(BENCH_SET),$(findstring host,$(w))$(findstring emit,$(w))))
 BENCH_CHECKOUT = $(patsubst %/,%,$(dir $(shell git rev-parse --path-format=absolute --git-common-dir)))
 BENCH_AB_ROOT = $(abspath $(or $(LOG_DIR),$(BENCH_CHECKOUT)/.codex/evidence/bench-ab))
 BENCH_CONF_AB := $(BENCH_CONF)$(if $(BENCH_CONFIG),;$(BENCH_CONFIG))
@@ -1216,7 +1225,7 @@ BENCH_LEG_INSTALL = install-windows-$(ARCH) install-unix-$(SDK_UNIX_ARCH)
 BENCH_SUBMAKE = $(MAKE)
 # What each leg's sub-make builds: its install, and its host emitter benchmark
 # when BASE has one.
-BENCH_LEG_BUILD = $(BENCH_LEG_INSTALL) $(if $(BENCH_HOST_AB),bench-host-build)
+BENCH_LEG_BUILD = $(BENCH_LEG_INSTALL) $(if $(BENCH_HOST_RUN),bench-host-build)
 # Says, in a recipe's shell, that the step $(2) failed when the status $(1) is
 # not zero, and shows the end of its log $(3) in the run's directory.
 bench_leg_failed = [ $(1) -eq 0 ] || { echo "make bench-ab: the $(2) failed; the end of $(BENCH_AB_OUT)/$(3):" >&2; tail -n 40 '$(BENCH_AB_OUT)/$(3)' >&2; }
@@ -1257,7 +1266,9 @@ BENCH_AB_OUT := $(BENCH_AB_ROOT)/$(BENCH_BASE_SHORT)-vs-$(BENCH_CAND_SHORT)-$(sh
 # Whether BASE carries the host emitter benchmark, read from its Makefile in
 # git, since its worktree may not exist yet.
 BENCH_HOST_AB := $(shell git show $(BENCH_BASE_SHA):Makefile 2>/dev/null | grep -q '^bench-host-build:' && echo 1)
-BENCH_HOST_FLAGS = $(if $(BENCH_HOST_AB),--base-host '$(call BENCH_HOST_EXE,$(BENCH_BASE_DIR))' \
+# Whether this run runs it: BASE carries it and BENCH_SET asks for it.
+BENCH_HOST_RUN = $(and $(BENCH_HOST_AB),$(BENCH_HOST_WANTED))
+BENCH_HOST_FLAGS = $(if $(BENCH_HOST_RUN),--base-host '$(call BENCH_HOST_EXE,$(BENCH_BASE_DIR))' \
 	--cand-host '$(call BENCH_HOST_EXE,$(CURDIR))' $(foreach f,$(BENCH_CORPUS),--host-corpus '$(call bench_corpus_copy,$(BENCH_AB_OUT),$(f))'))
 endif
 bench-ab:
@@ -1269,7 +1280,7 @@ bench-ab:
 	$(call clean_isolated_at,$(BENCH_BASE_ISO))
 	$(call clean_isolated_at,$(ISOLATED_ROOT))
 	mkdir -p '$(BENCH_AB_OUT)'
-	$(if $(BENCH_HOST_AB),,@echo "make bench-ab: BASE $(BENCH_BASE_SHORT) has no host emitter benchmark; neither leg runs it")
+	$(if $(BENCH_HOST_WANTED),$(if $(BENCH_HOST_AB),,@echo "make bench-ab: BASE $(BENCH_BASE_SHORT) has no host emitter benchmark; neither leg runs it"))
 	$(BENCH_SUBMAKE) -C '$(BENCH_BASE_DIR)' $(BENCH_LEG_MAKE) $(BENCH_LEG_BUILD) > '$(BENCH_AB_OUT)/build-base.log' 2>&1 & base=$$!; \
 		$(BENCH_SUBMAKE) $(BENCH_LEG_MAKE) $(BENCH_LEG_BUILD); cand=$$?; \
 		wait $$base; base=$$?; \

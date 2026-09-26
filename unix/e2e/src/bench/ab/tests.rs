@@ -372,3 +372,10 @@ fn the_timed_rounds_record_the_benchmarks_and_each_legs_images() {
     let fresh = Timed::default();
     assert_eq!(fresh.images(&Leg::Base), None);
 }
+
+#[test]
+fn a_filter_naming_host_or_emit_selects_the_host_emitter() {
+    assert!(names_host("host"));
+    assert!(names_host("emit_corpus"));
+    assert!(!names_host("dynamic_buffer_churn"));
+}

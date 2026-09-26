@@ -169,10 +169,11 @@ fn shares_divide_the_time_used_by_the_time_measured() {
         later(13, 3.0),
     ];
     // 12 exited between the reads and is not listed.
-    let listing = shares(&before, &after, Duration::from_millis(500));
+    // Measured at 625 ms, not the nominal INTERVAL: 0.25 s used is 40 %.
+    let listing = shares(&before, &after, Duration::from_millis(625));
     assert_eq!(
         listing,
-        "50.0 10 1 p10\n40.0 14 1 p14\n0.0 11 1 p11\n0.0 13 1 p13\n"
+        "40.0 10 1 p10\n32.0 14 1 p14\n0.0 11 1 p11\n0.0 13 1 p13\n"
     );
     assert_eq!(
         cputime_rows("  10     1   0:05.25 /bin/p10\nbad line\n").len(),
