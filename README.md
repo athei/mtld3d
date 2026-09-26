@@ -103,6 +103,7 @@ levels and the F12 mechanics are in
 | 3DMark05 | Runs end to end |
 | Unigine Tropics | Runs |
 | Gunmetal | Starts and benchmarks |
+| XCOM: Enemy Within | Menu and a tactical mission on an M1 Max. The `xcom-ew` profile reports NVIDIA and presents SDR, which this Unreal Engine 3 title needs for depth-copied lights. Fog of war and the move highlight were fans until the short-stride copy; the in-game picture of that copy is not confirmed yet |
 
 Games that fail are tracked as `game-compat` issues in the
 [tracker](https://github.com/athei/mtld3d/issues); reports are welcome.

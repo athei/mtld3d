@@ -81,6 +81,25 @@ static PROFILES: &[AppProfile] = &[
         original_filename: None,
         settings: "query.flushImmediate=true;query.eventImmediate=true",
     },
+    // XCOM: Enemy Within. The executable on disk is XComEW.exe; its version
+    // resource still names OriginalFilename XComGame.exe. Unreal Engine 3
+    // copies scene depth only for an NVIDIA or AMD adapter (INTZ and the RESZ
+    // draw). Reported as Apple, dynamic lights, light shafts, ambient
+    // occlusion and depth of field sample a buffer nothing writes. The NVIDIA
+    // identity is the path this layer implements. The game tonemaps to an SDR
+    // frame, so the default HDR present, which inverse-tone-maps into an
+    // extended range, blows the highlights out. SDR present with an sRGB tag
+    // matches the art. Fog of war and the move highlight pack vertices shorter
+    // than a consumed attribute; that fetch is the short-stride copy, not a
+    // profile key.
+    AppProfile {
+        name: "xcom-ew",
+        exe: "XComEW.exe",
+        company: Some("Firaxis Games"),
+        product: Some("XCOM: Enemy Within"),
+        original_filename: Some("XComGame.exe"),
+        settings: "adapter.spoof=nvidia;color.hdr.enable=false;color.space=accurate",
+    },
 ];
 
 /// One built-in profile: what it matches, and the options it sets.

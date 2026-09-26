@@ -1,3 +1,5 @@
+use mtld3d_shared::mtl::ColorSpacePolicy;
+
 use super::{AppIdentity, AppProfile, PROFILES, lookup};
 use crate::config::{AdapterSpoof, CursorScale, parse};
 
@@ -71,6 +73,29 @@ fn the_wow_profile_matches_both_clients_and_keeps_the_immediate_answers() {
         assert!(profiled.query_event_immediate);
     }
     let nameless = AppIdentity::new("WoW.exe".to_owned(), None);
+    assert!(lookup(&nameless).is_none());
+}
+
+#[test]
+fn the_xcom_ew_profile_spoofs_nvidia_and_presents_sdr() {
+    let resource = blob(&[
+        ("CompanyName", "Firaxis Games"),
+        ("ProductName", "XCOM: Enemy Within"),
+        ("OriginalFilename", "XComGame.exe"),
+    ]);
+    let id = AppIdentity::new("XComEW.exe".to_owned(), Some(&resource));
+    let profile = lookup(&id).expect("the xcom profile matches");
+    assert_eq!(profile.name(), "xcom-ew");
+    let stock = parse(None, "", None);
+    assert_eq!(stock.adapter_spoof, AdapterSpoof::None);
+    assert!(stock.hdr_enable);
+    assert_eq!(stock.color_space, ColorSpacePolicy::Passthrough);
+    let profiled = parse(Some(profile), "", None);
+    assert_eq!(profiled.adapter_spoof, AdapterSpoof::Nvidia);
+    assert!(!profiled.hdr_enable);
+    assert_eq!(profiled.color_space, ColorSpacePolicy::Accurate);
+    // A file of the same name without Firaxis's version resource is not this game.
+    let nameless = AppIdentity::new("XComEW.exe".to_owned(), None);
     assert!(lookup(&nameless).is_none());
 }
 
