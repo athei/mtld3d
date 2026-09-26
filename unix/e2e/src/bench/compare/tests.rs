@@ -570,10 +570,9 @@ fn an_optional_perf_key_that_comes_and_goes_is_reported_not_judged() {
     assert_eq!(row.change, "in 2 of 3 base rounds, in 3 of 3 cand rounds");
     assert!(!comparison.failed());
     assert!(
-        comparison
-            .notes
-            .iter()
-            .any(|note| note.contains("b: perf.faults_major_pf is in some rounds")),
+        comparison.notes.iter().any(|note| note.contains(
+            "in 2 of 3 base rounds, in 3 of 3 cand rounds, are not judged; b: perf.faults_major_pf"
+        )),
         "{:?}",
         comparison.notes
     );
@@ -747,7 +746,7 @@ fn different_window_lengths_leave_the_span_scaled_rows_unjudged() {
         comparison
             .notes
             .iter()
-            .any(|note| note.contains("different lengths (base 5, cand 2 s)")),
+            .any(|note| note.contains("different lengths (base 5, cand 2 s) in b:")),
         "{:?}",
         comparison.notes
     );
@@ -1498,5 +1497,65 @@ fn window_lengths_that_round_to_one_second_count_as_one_length() {
             .any(|note| note.contains("different lengths")),
         "{:?}",
         comparison.notes
+    );
+}
+
+#[test]
+fn notes_many_benchmarks_share_print_once() {
+    // An old base without perf-kv lines: the optional key and the window
+    // length differ the same way in two benchmarks.
+    let fixture = Fixture::new("shared-notes");
+    for round in 0..3 {
+        for bench in ["a", "b"] {
+            let mut base = meta("v1", "AAAA");
+            base.push(("window_s", "5"));
+            fixture.write(
+                "base",
+                round,
+                bench,
+                &base,
+                &[("frame.p50", 10.0, "ms lower time")],
+            );
+            let mut cand = meta("v2", "BBBB");
+            cand.push(("window_s", "2"));
+            fixture.write(
+                "cand",
+                round,
+                bench,
+                &cand,
+                &[
+                    ("frame.p50", 10.0, "ms lower time"),
+                    ("perf.faults_minor_pf", 1.0, "count lower noisy"),
+                    ("perf.faults_major_pf", 0.0, "count lower noisy"),
+                ],
+            );
+        }
+    }
+    let comparison = evaluate(&fixture.root, &Options::default()).unwrap();
+    let spans: Vec<&String> = comparison
+        .notes
+        .iter()
+        .filter(|note| note.contains("different lengths"))
+        .collect();
+    assert_eq!(spans.len(), 1, "{:?}", comparison.notes);
+    assert!(
+        spans[0].contains("(base 5, cand 2 s) in a, b:"),
+        "{}",
+        spans[0]
+    );
+    let keys: Vec<&String> = comparison
+        .notes
+        .iter()
+        .filter(|note| note.contains("leave out of a window"))
+        .collect();
+    assert_eq!(keys.len(), 1, "{:?}", comparison.notes);
+    assert!(
+        keys[0].contains(
+            "missing from the whole base leg, in 3 of 3 cand rounds, are not judged; a: \
+             perf.faults_major_pf, perf.faults_minor_pf; b: perf.faults_major_pf, \
+             perf.faults_minor_pf"
+        ),
+        "{}",
+        keys[0]
     );
 }

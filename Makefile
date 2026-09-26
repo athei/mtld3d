@@ -1127,8 +1127,10 @@ bench: install-windows-$(ARCH) install-unix-$(SDK_UNIX_ARCH)
 # alternating, and each build's run one process running every benchmark in
 # libtest's order, the same in both.
 # BENCH_SET picks the benchmarks: `wow` (the default) the ones that stand for
-# the game this layer serves first, `full` every benchmark; a name the
-# checkout does not carry yet is skipped with a note. ACCEPT=a,b names the
+# the game this layer serves first, `full` every benchmark, and anything else
+# a space-separated list of test-name filters, each selecting the benchmarks
+# whose test path contains it (BENCH_SET=dynamic_buffer_churn rechecks one);
+# a name the checkout does not carry yet is skipped with a note. ACCEPT=a,b names the
 # exact metrics (draw counts and the like, which the workload fixes) whose
 # change is expected, and BENCH_CONFIG is appended to both legs' configuration
 # as it is for `make bench`. BASE=HEAD is an A/A run, the way to see how much
@@ -1195,6 +1197,9 @@ BENCH_SET ?= wow
 BENCH_SET_wow := wow_112_busy_frame wow_335a_busy_frame query_poll_wow query_poll_spec api_call_cost \
 	dynamic_buffer_churn texture_streaming
 BENCH_SET_full :=
+# The runner's --bench filters for BENCH_SET: a named set's list (none for
+# `full`), or BENCH_SET itself when it names no set.
+BENCH_FILTERS = $(if $(filter wow full,$(BENCH_SET)),$(if $(BENCH_SET_$(BENCH_SET)),--bench '$(BENCH_SET_$(BENCH_SET))'),--bench '$(BENCH_SET)')
 BENCH_CHECKOUT = $(patsubst %/,%,$(dir $(shell git rev-parse --path-format=absolute --git-common-dir)))
 BENCH_AB_ROOT = $(abspath $(or $(LOG_DIR),$(BENCH_CHECKOUT)/.codex/evidence/bench-ab))
 BENCH_CONF_AB := $(BENCH_CONF)$(if $(BENCH_CONFIG),;$(BENCH_CONFIG))
@@ -1226,8 +1231,8 @@ stop_servers() { for leg in '$(BENCH_BASE_ISO)' '$(ISOLATED_ROOT)'; do \
 	done ; true ; }
 endef
 ifneq ($(filter bench-ab,$(MAKECMDGOALS)),)
-ifeq ($(filter wow full,$(BENCH_SET)),)
-$(error BENCH_SET is wow or full, not $(BENCH_SET))
+ifeq ($(strip $(BENCH_SET)),)
+$(error BENCH_SET is wow, full or a list of test-name filters, not empty)
 endif
 BENCH_BASE_SHA := $(shell git rev-parse --verify --quiet '$(BASE)^{commit}')
 ifeq ($(BENCH_BASE_SHA),)
@@ -1287,7 +1292,7 @@ bench-ab:
 		--base-prefix '$(BENCH_BASE_ISO)/prefix' --base-stamp '$(BENCH_BASE_STAMP)' \
 		--cand-wine '$(ISOLATED_ROOT)/sdk/bin/wine' \
 		--cand-prefix '$(ISOLATED_ROOT)/prefix' --cand-stamp '$(BENCH_CAND_STAMP)' \
-		--config '$(BENCH_CONF_AB)' $(if $(BENCH_SET_$(BENCH_SET)),--bench '$(BENCH_SET_$(BENCH_SET))') \
+		--config '$(BENCH_CONF_AB)' $(BENCH_FILTERS) \
 		$(BENCH_HOST_FLAGS) $(if $(BENCH_CORPUS),--corpus-dir '$(BENCH_AB_OUT)/corpus') \
 		$(if $(ACCEPT),--accept '$(ACCEPT)') $(BENCH_SAME_IMAGE) --report '$(BENCH_AB_OUT)/report.txt' -- $$suite
 

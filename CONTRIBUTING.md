@@ -310,7 +310,10 @@ about 8 minutes in all, down from the 20 an earlier layout of the run took
 (an estimate from that run's timestamps and the new spans; the first run's
 timestamps say what it is on your machine). `BENCH_SET=full` runs every
 benchmark, the shader-stutter and cold-start ones included, and takes about
-twice as long.
+twice as long. Any other `BENCH_SET` is a space-separated list of test-name
+filters, each selecting the benchmarks whose test path contains it, so
+`BENCH_SET=dynamic_buffer_churn` rechecks one suspicious benchmark without
+the rest of the set.
 
 ## Which suite is right when they disagree
 

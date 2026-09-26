@@ -936,20 +936,46 @@ pub fn compare(
              format one of the builds does not read), so there is nothing to pair"
         ));
     }
+    // The notes many benchmarks share, collected so that each prints once:
+    // the window lengths of the legs, and the optional keys by how they are missing.
+    let mut spans_by_pair: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut incomplete: BTreeMap<String, BTreeMap<String, Vec<String>>> = BTreeMap::new();
     for bench in base_benches.intersection(&cand_benches) {
         check_workload(bench, base, cand)?;
-        let rows = bench_rows(bench, base, cand, options, &mut notes)?;
+        let (rows, spans) = bench_rows(bench, base, cand, options)?;
+        if let Some(pair) = spans {
+            spans_by_pair.entry(pair).or_default().push(bench.clone());
+        }
         for row in rows.iter().filter(|row| row.verdict == Verdict::Incomplete) {
-            notes.push(format!(
-                "{bench}: {} is in some rounds of a leg and not in others ({}), as a key the \
-                 perf-kv line may leave out can be; it is not judged",
-                row.metric, row.change
-            ));
+            incomplete
+                .entry(row.change.clone())
+                .or_default()
+                .entry(bench.clone())
+                .or_default()
+                .push(row.metric.clone());
         }
         benches.push(BenchReport {
             bench: bench.clone(),
             rows,
         });
+    }
+    for (pair, names) in spans_by_pair {
+        notes.push(format!(
+            "the legs measured perf windows of different lengths ({pair}) in {}: their p99, \
+             max, spike and end memory-growth rows, which grow with the span, are reported and \
+             not judged",
+            names.join(", ")
+        ));
+    }
+    for (change, by_bench) in incomplete {
+        let listed: Vec<String> = by_bench
+            .into_iter()
+            .map(|(bench, metrics)| format!("{bench}: {}", metrics.join(", ")))
+            .collect();
+        notes.push(format!(
+            "keys the perf-kv line may leave out of a window, {change}, are not judged; {}",
+            listed.join("; ")
+        ));
     }
     for name in options
         .accept
@@ -1065,27 +1091,24 @@ fn leg_benches(leg: &Leg, rounds: &[BTreeMap<String, Loaded>]) -> Result<BTreeSe
     Ok(all)
 }
 
-/// The rows of one benchmark both legs ran.
+/// The rows of one benchmark both legs ran, and the legs' window lengths when they differ.
 fn bench_rows(
     bench: &str,
     base: &[BTreeMap<String, Loaded>],
     cand: &[BTreeMap<String, Loaded>],
     options: &Options,
-    notes: &mut Vec<String>,
-) -> Result<Vec<Row>, String> {
+) -> Result<(Vec<Row>, Option<String>), String> {
     let base_series = leg_series(bench, base)?;
     let cand_series = leg_series(bench, cand)?;
     let (base_spans, cand_spans) = (spans(bench, base), spans(bench, cand));
     let spans_differ = base_spans != cand_spans;
-    if spans_differ {
-        notes.push(format!(
-            "{bench}: the legs measured perf windows of different lengths (base {}, cand {} \
-             s), so its p99, max, spike and memory-growth rows, which grow with the span, are \
-             reported and not judged",
+    let span_pair = spans_differ.then(|| {
+        format!(
+            "base {}, cand {} s",
             listed(&base_spans),
             listed(&cand_spans)
-        ));
-    }
+        )
+    });
     let names: BTreeSet<&String> = base_series
         .keys()
         .chain(cand_series.keys())
@@ -1169,7 +1192,7 @@ fn bench_rows(
         };
         rows.push(row);
     }
-    Ok(rows)
+    Ok((rows, span_pair))
 }
 
 /// One benchmark's metrics in one leg: each one's definition and its value in each round with it.
