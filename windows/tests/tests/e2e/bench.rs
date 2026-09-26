@@ -12,7 +12,7 @@
 //! points at its output directory), and beside it `bench-<name>.metrics`,
 //! the same numbers one record per line for a program to compare (see
 //! [`Metrics`]). On a `PERF=1` build the report carries the rows of the
-//! layer's five-second `mtld3d::perf` summary that cover the measured frames,
+//! layer's two-second `mtld3d::perf` summary that cover the measured frames,
 //! copied out of that log, and the metrics file the counters of the `perf-kv`
 //! line the layer logs after each of them. Frame times are taken on the API
 //! thread from one `Present` return to the next with [`TscClock`], the
@@ -32,7 +32,7 @@
 //! frames: the span starts when the window's opening shows in the log, a
 //! poll and the log thread's latency after it, and a frame floor can make
 //! it outlast the window. The layer opens a device's
-//! first window at its first frame and closes each after five seconds, so
+//! first window at its first frame and closes each after two seconds, so
 //! after its warm-up a benchmark runs unmeasured frames until the log shows
 //! the `perf-kv` line that closes the window the warm-up began in
 //! ([`LayerLog::start_span`]), measures from there, and after the span runs
@@ -84,9 +84,11 @@ pub const PERF_WINDOW: Duration = Duration::from_secs(mtld3d_core::perf::SUMMARY
 /// How long a benchmark's measured frames last at least: one perf window.
 ///
 /// Started where a window opens ([`LayerLog::start_span`]), the span holds
-/// that one window whole and approximately no more. At the frame rates the benchmarks run (a
-/// millisecond a frame or less) it is thousands of frames, far more than a
-/// p99 needs.
+/// that one window whole and approximately no more. At the frame rates the
+/// frame benchmarks run (0.8 ms a frame or less) it is 2500 frames or more,
+/// 25 in their p99's tail; `api_call_cost`, whose rounds take about 35 ms,
+/// gets about 57 rounds, a sample of every call kind each, where its median
+/// needs 15.
 pub const MEASURED_SPAN: Duration = PERF_WINDOW;
 
 /// How long a window's `perf-kv` line may take past its due time before a wait counts it late.
@@ -1410,7 +1412,7 @@ impl Metrics {
     ///   the GPU overlap (renames, copies, retention, pools, faults, slot
     ///   waits, compiles, command buffers, whose GPU time arrives with a
     ///   later submit) is `noisy`. A window's count is divided by its frames
-    ///   because a window lasts five seconds, not a number of frames, so its
+    ///   because a window lasts two seconds, not a number of frames, so its
     ///   totals grow with the frame rate.
     ///
     /// A key a window leaves out (`docs/ARCHITECTURE.md` names the three that

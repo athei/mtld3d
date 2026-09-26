@@ -1769,7 +1769,7 @@ fn addref_parent_direct3d9(this: *mut c_void) {
 
 /// Warm the TSC calibration in the background.
 ///
-/// The encoder thread's first 5-second-window check then finds a ready
+/// The encoder thread's first 2-second-window check then finds a ready
 /// `tsc_hz()` value instead of paying the 50 ms calibration sleep itself.
 /// Deliberately not spawned from `DllMain` or `Direct3DCreate9`: mod /
 /// launcher DLLs commonly probe-call `Direct3DCreate9` early enough that the

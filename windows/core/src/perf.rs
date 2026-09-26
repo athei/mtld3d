@@ -1,6 +1,6 @@
 //! Performance-counter and telemetry plumbing.
 //!
-//! Every TSC timer, per-frame counter, and the 5-second `info!` summary
+//! Every TSC timer, per-frame counter, and the 2-second `info!` summary
 //! lives here so it is visibly separate from the D3D9 / Metal runtime
 //! state. None of the fields here exist for the game — they exist for the
 //! developer who built with `PERF=1` (the summary then prints by default
@@ -15,7 +15,7 @@
 //!   API-thread counters that crosses the API→encoder channel.
 //! * `EncoderPerfState` — embedded on `FrameEncoder`. Per-frame
 //!   encoder counters + the rolling `PerfWindow` aggregator.
-//! * `PerfWindow` + `FrameSample` (private) — 5-second rolling window
+//! * `PerfWindow` + `FrameSample` (private): 2-second rolling window
 //!   that aggregates per-frame samples for the summary log. Time
 //!   counters are emitted as per-frame averages (ms/frame); event
 //!   counters as raw window totals; depth snapshots as decimal
@@ -74,7 +74,7 @@ pub mod compilation;
 /// The per-pass / present-texture / per-pair detail rides on a separate
 /// switch — `mtld3d::d3d9::passes=trace` — so the default
 /// `RUST_LOG=info` never sees either.
-pub const SUMMARY_INTERVAL_SECS: u64 = 5;
+pub const SUMMARY_INTERVAL_SECS: u64 = 2;
 
 #[cfg(not(perf_tracking))]
 const _: () = {
@@ -82,7 +82,7 @@ const _: () = {
     assert!(size_of::<ApiTimer>() == 0);
 };
 
-/// Perf telemetry has its own `log` target so the 5-second summary can be silenced.
+/// Perf telemetry has its own `log` target so the 2-second summary can be silenced.
 ///
 /// Silencing it does not lose other COM-layer logging —
 /// `RUST_LOG=mtld3d::perf=warn` mutes only this module.
@@ -120,7 +120,7 @@ pub enum ApiCategory {
 /// Sub-bucket inside the `Device` `ApiCategory`.
 ///
 /// Every `extern "system"` `IDirect3DDevice9` entry point tags its
-/// `ApiTimer` with a `DeviceSubCategory` so the 5-second summary can
+/// `ApiTimer` with a `DeviceSubCategory` so the 2-second summary can
 /// decompose the `Device` row into "where did the cycles actually go" —
 /// draws vs the per-batch state-setter storms (`RenderState` /
 /// `TexStageState` / `SamplerState` / `ShaderConst`) vs binds vs
@@ -146,7 +146,7 @@ pub enum DeviceSubCategory {
 ///
 /// Every `IDirect3DDevice9` entry point whose `device_timer` tag is
 /// `Bind` instead uses `bind_timer` and supplies a `BindSubCategory`,
-/// so the 5-second summary can decompose the 0.15 ms/frame `Bind` row
+/// so the 2-second summary can decompose the 0.15 ms/frame `Bind` row
 /// into "which Setter family ate the cycles": resource bindings
 /// (`Texture` / `Buffer` / `Shader`), render-target swaps (`RtDs`),
 /// fixed-function state (`FfFixed`), and viewport/scissor (`ViewScissor`).
@@ -180,7 +180,7 @@ pub enum BindSubCategory {
 /// Sub-bucket inside the `Surface` `ApiCategory`.
 ///
 /// Every `IDirect3DSurface9` vtable thunk tags its `ApiTimer` with a
-/// `SurfaceSubCategory` (via `surf_timer`), so the 5-second summary can
+/// `SurfaceSubCategory` (via `surf_timer`), so the 2-second summary can
 /// decompose the `Surface` row the way `Bind` decomposes. The row mixes
 /// a getter storm (tens of thousands of near-free calls per window) with
 /// the few entry points that can block for milliseconds — `LockRect`
@@ -247,7 +247,7 @@ pub enum KeysGate {
 
 /// Per-draw phase of the encoder op loop (the "Closures (op)" bucket).
 ///
-/// Each variant indexes the `op_sub_cycles` accumulator so the 5-second
+/// Each variant indexes the `op_sub_cycles` accumulator so the 2-second
 /// summary can decompose `emit_draw`'s per-draw cost — the way
 /// `DeviceSubCategory` decomposes the API-thread `Device` row. The six
 /// phases tile `emit_draw` end to end; whatever the timers don't cover (the
@@ -1793,7 +1793,7 @@ pub struct CacheSizes {
 ///
 /// The encoder thread fills this from the `GetTaskFaults` `unix_call`
 /// (`getrusage(RUSAGE_SELF)`, cumulative since process start) when
-/// `window_due()` says the 5 s summary window has expired;
+/// `window_due()` says the 2 s summary window has expired;
 /// `log_frame_summary` deltas consecutive samples into the `faults` row.
 pub struct TaskFaults {
     pub minor: u64,
@@ -1817,12 +1817,12 @@ pub struct FrameSummaryContext {
 /// methods (`begin_frame`, `set_*`, `*_cycles_ptr`, `bump_*`,
 /// `bump_pair_stats`, `log_frame_summary`) become `const fn` no-ops or
 /// return `null_mut()`. Together with the `PerfWindow` / `Summary`
-/// items below it (also cfg-gated) the entire 5-second summary pipeline
+/// items below it (also cfg-gated) the entire 2-second summary pipeline
 /// is compile-time-elided.
 #[cfg(perf_tracking)]
 pub struct EncoderPerfState {
     compilation: compilation::CompilationPerf,
-    /// Rolling aggregator for the 5-second `info!` summary.
+    /// Rolling aggregator for the 2-second `info!` summary.
     perf_window: PerfWindow,
 
     /// API-thread counters seeded from `FramePerfPayload` in `begin_frame`.
@@ -1899,7 +1899,7 @@ impl EncoderPerfState {
         }
     }
 
-    /// True when the 5 s summary window has expired and the next `log_frame_summary` will emit.
+    /// True when the 2 s summary window has expired and the next `log_frame_summary` will emit.
     ///
     /// Mirrors the expiry check inside `log_frame_summary` so the encoder
     /// can gather once-per-window data (the `GetTaskFaults` `unix_call`)
@@ -2176,7 +2176,7 @@ impl EncoderPerfState {
         entry.cull_mode = cull_mode;
     }
 
-    /// Accumulate this frame into the rolling 5-second window.
+    /// Accumulate this frame into the rolling 2-second window.
     ///
     /// Once the window has spanned `SUMMARY_INTERVAL_SECS`, emit the
     /// averaged `info!` summary on `mtld3d::perf`. The per-pass breakdown,
@@ -2657,7 +2657,7 @@ struct InverseEpoch {
     saturated: bool,
 }
 
-/// Rolling 5-second window that folds per-frame counters into a [`Stat`] per metric.
+/// Rolling 2-second window that folds per-frame counters into a [`Stat`] per metric.
 ///
 /// Each [`Stat`] is a window sum + per-frame peak. On emit, time sums
 /// divide by `frames` to give ms/frame, event sums surface as raw window
@@ -3248,7 +3248,7 @@ impl PerfWindow {
     }
 }
 
-/// Cached decision for emitting ANSI escape sequences in the 5-second summary.
+/// Cached decision for emitting ANSI escape sequences in the 2-second summary.
 ///
 /// `NO_COLOR=1` wins (<https://no-color.org>); `CLICOLOR_FORCE=1` wins next;
 /// otherwise ANSI is on by default. Auto detection on stderr is not used
@@ -3382,7 +3382,7 @@ impl Bottleneck {
     }
 }
 
-/// Multi-line renderer for the 5-second summary.
+/// Multi-line renderer for the 2-second summary.
 ///
 /// Pure: takes a `PerfWindow` snapshot plus the live cache sizes and produces
 /// a `String`. Kept off `log_frame_summary` so it's host-testable under
@@ -5170,7 +5170,7 @@ impl<'a> Summary<'a> {
         );
         // Scratch arena: per-frame live (cleared at begin_frame). Avg
         // block counts carry one decimal (sub-frame precision matters when
-        // averaging across a 5 s window); peak counts are integers.
+        // averaging across a 2 s window); peak counts are integers.
         let scratch_avg_small = u64_to_f64_exact(w.scratch_small_blocks.sum) / f;
         let scratch_avg_over = u64_to_f64_exact(w.scratch_oversized_blocks.sum) / f;
         let scratch_avg_kb = u64_to_f64_exact(w.scratch_bytes.sum) / f / 1024.0;

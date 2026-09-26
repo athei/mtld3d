@@ -444,7 +444,7 @@ Every crate logs via `log` + `env_logger`. All targets sit under `mtld3d::*` and
 | `mtld3d::d3d9::caster`    | one row per unique shadow-caster pipeline state (trace)                  |
 | `mtld3d::d3d9::decal`     | the depth bias applied per (VS, PS) pair and depth state (trace)         |
 | `mtld3d::dxso`            | DXSO to MSL emitter (`trace` dumps the MSL)                              |
-| `mtld3d::perf`            | 5-second averaged performance summary (`PERF=1` builds only)             |
+| `mtld3d::perf`            | 2-second averaged performance summary (`PERF=1` builds only)             |
 | `mtld3d::shim`            | Wine unix-call PE shim DLL                                               |
 | `mtld3d::unix`            | Metal-side `.so`                                                         |
 | `mtld3d::unix::command`   | command-buffer completion/error and backbuffer allocation/view records (debug) |
@@ -588,7 +588,7 @@ AppKit's views, windows and screens belong to the main thread, and the layer tou
 
 ## Perf infrastructure
 
-The `mtld3d::perf` summary in `windows/core/src/perf.rs` is compiled in only on a `PERF=1` build (`cfg(perf_tracking)`) and emits a multi-line report every 5 s at `info!` under `RUST_LOG=mtld3d::perf=info`. Counters group by which thread owns them (API, encoder, submit, presenter); subtimers indent under their parent. The `Submit thread` block reports `Encode+commit` (the thunk's execute less the wait) and `Present wait`, the wait for the previous present to commit; the `Present thread` block reports `Drawable wait`, still the `gpu_wait` bucket, and `Snapshots`, an event count of the presents that went out from a copy of the back buffer: none in steady state, one per read-back; `Slot waits` counts the copies that first waited for a slot, a wait on the display and the tripwire for the ring's size, 0 being the goal. Both blocks come back with the next payload, lagged one frame, and a barrier's snapshot carries over to the next sample rather than being reset. Banner shows `bottleneck=…` based on `present_block` share + `gpu_wait` vs `enc_cpu`; the four terminal buckets are echoed on a `buckets:` line for auditability. The same Info gate also enables the per-call cycle accounting — single switch. Pass / workload shape (per-pass dump, `present_texture=…` audit line, per-RT pair stats) lives on the separate `mtld3d::d3d9::passes=trace` switch — those are diagnostics, not perf metrics.
+The `mtld3d::perf` summary in `windows/core/src/perf.rs` is compiled in only on a `PERF=1` build (`cfg(perf_tracking)`) and emits a multi-line report every 2 s at `info!` under `RUST_LOG=mtld3d::perf=info`. Counters group by which thread owns them (API, encoder, submit, presenter); subtimers indent under their parent. The `Submit thread` block reports `Encode+commit` (the thunk's execute less the wait) and `Present wait`, the wait for the previous present to commit; the `Present thread` block reports `Drawable wait`, still the `gpu_wait` bucket, and `Snapshots`, an event count of the presents that went out from a copy of the back buffer: none in steady state, one per read-back; `Slot waits` counts the copies that first waited for a slot, a wait on the display and the tripwire for the ring's size, 0 being the goal. Both blocks come back with the next payload, lagged one frame, and a barrier's snapshot carries over to the next sample rather than being reset. Banner shows `bottleneck=…` based on `present_block` share + `gpu_wait` vs `enc_cpu`; the four terminal buckets are echoed on a `buckets:` line for auditability. The same Info gate also enables the per-call cycle accounting: one switch. Pass / workload shape (per-pass dump, `present_texture=…` audit line, per-RT pair stats) lives on the separate `mtld3d::d3d9::passes=trace` switch; those are diagnostics, not perf metrics.
 
 `Encode+commit` splits into three children the unix side times with `NanosSetTimer` inside `SubmitFrame`: the frame-leading blits, the replay of every pass descriptor (upload and draw, each pass's own blits included), and the frame buffer's completion-handler install plus both commits. A `resid` row takes what is left (command-buffer creation, the present settle less its wait, the upload buffer's handler, the thunk crossing), so the children add up to their parent. The `GPU` block reports `GPUEndTime - GPUStartTime` per command-buffer role (frame, upload, present) as ms per frame, with the number of buffers behind each and no peak, since a report does not line up with one frame. It is not the device's whole GPU time: snapshot copies, read-backs, creation-time clears, the cursor overlay and the shutdown fence are not counted, nor a frame or upload buffer submitted before its sequence or counters were wired. A synchronous submit behind a barrier is timed and folded like an async one, so `Encode+commit` and its children always describe the same submission. Each completion handler adds its buffer's time to the device record, and the next `SubmitFrame` of that device moves the sums into its `SubmitTimings` output and leaves zero behind, so every buffer is reported once, one submission after it finished. Buffers of one queue can overlap on the GPU, so the roles add up to busy time, not wall time, which the block's label says. All of it travels as nanoseconds in the fixed `SubmitFrameParams.timings` output; outside a `PERF=1` build, or with the perf target off, the handlers read no time and every field stays zero.
 
@@ -632,7 +632,7 @@ The grid is for a reader; a tool comparing two builds reads the line logged
 right after it, at `info!` on the same `mtld3d::perf` target, once per window:
 
 ```text
-perf-kv v1 window_s=5.010 frames=312 frame_ms=6.412 frame_peak_ms=9.870 ...
+perf-kv v1 window_s=2.004 frames=312 frame_ms=6.412 frame_peak_ms=9.870 ...
 ```
 
 It is one line of space-separated `key=value` pairs after the `perf-kv v1`
@@ -710,7 +710,7 @@ in its row, and every family carries the suffixes its row names.
 ### Buffer recycle-pool diagnostics
 
 `PERF=1` and `RUST_LOG=mtld3d::perf=info` emit a `pagebox-pool cumulative`
-line with the existing five-second performance summary. These totals cover the
+line with the existing two-second performance summary. These totals cover the
 process-wide pool, including all devices, and survive device resets. Multiple
 devices can therefore report overlapping totals; do not add their reports.
 
@@ -759,7 +759,7 @@ submission before taking a window maximum. They include cache lookup,
 bookkeeping, thunk overhead, and telemetry overhead; they are not a separate
 Metal compilation phase.
 
-Each five-second window retains at most five individual operations taking at
+Each two-second window retains at most five individual operations taking at
 least 2 ms. Parent totals do not compete with their children for these slots.
 Owned metadata is captured only for a retained operation and formatted with
 the summary: device, encoder submission sequence, shader disk identities, and

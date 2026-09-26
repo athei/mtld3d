@@ -415,8 +415,8 @@ fn bottleneck_balanced_when_buckets_even() {
 fn summary_ansi_off_matches_stripped_ansi_on() {
     let w = sample_window();
     let caches = sample_caches();
-    let plain = Summary::render_with_ansi(&w, &caches, 5.01, false);
-    let colored = Summary::render_with_ansi(&w, &caches, 5.01, true);
+    let plain = Summary::render_with_ansi(&w, &caches, 2.01, false);
+    let colored = Summary::render_with_ansi(&w, &caches, 2.01, true);
     let stripped = strip_ansi(&colored);
     assert_eq!(
         plain, stripped,
@@ -434,9 +434,9 @@ fn staged_upload_summary_marks_saturated_derived_counts() {
             2 => window.vbib_mid_pass_reorders.sum = u64::MAX,
             _ => window.vbib_full_upload_skips.sum = u64::MAX,
         }
-        let summary = Summary::render_with_ansi(&window, &sample_caches(), 5.01, false);
+        let summary = Summary::render_with_ansi(&window, &sample_caches(), 2.01, false);
         assert!(summary.contains("  GPU copy  count=saturated bytes=49152"));
-        let kv = render_kv(&window, &sample_caches(), 5.01).finish();
+        let kv = render_kv(&window, &sample_caches(), 2.01).finish();
         assert!(
             !kv.contains(" vbib_gpu_copy_total="),
             "an unknown count is left out"
@@ -455,9 +455,9 @@ fn staged_upload_summary_marks_saturated_derived_counts() {
 fn summary_golden_layout() {
     let w = sample_window();
     let caches = sample_caches();
-    let got = Summary::render_with_ansi(&w, &caches, 5.01, false);
+    let got = Summary::render_with_ansi(&w, &caches, 2.01, false);
     let want = concat!(
-        "── perf  window=5.01s  frames=1  bottleneck=ENCODER (GPU) ──\n",
+        "── perf  window=2.01s  frames=1  bottleneck=ENCODER (GPU) ──\n",
         "reset epochs=0..0; inverse/upload counts are interval totals (not cumulative)\n",
         "buckets: api_d3d9=2.80  api_outside=3.00  enc_work=1.50  submit_work=0.10  gpu_wait=6.00  (ms/frame, avg)\n",
         "\n",
@@ -626,9 +626,9 @@ fn summary_golden_layout() {
 /// precision.
 #[test]
 fn kv_golden_line() {
-    let got = render_kv(&sample_window(), &sample_caches(), 5.01).finish();
+    let got = render_kv(&sample_window(), &sample_caches(), 2.01).finish();
     let want = concat!(
-        "perf-kv v1 window_s=5.010 frames=1",
+        "perf-kv v1 window_s=2.010 frames=1",
         " frame_ms=10.000 frame_peak_ms=10.000 api_d3d9_ms=2.800 api_d3d9_peak_ms=2.800",
         " api_outside_ms=3.000 api_outside_peak_ms=3.000 enc_work_ms=1.500",
         " enc_work_peak_ms=1.500 submit_work_ms=0.100 submit_work_peak_ms=0.100",
@@ -764,9 +764,9 @@ fn kv_aggregates_average_peak_and_total_over_frames() {
     let mut w = PerfWindow::new();
     w.accumulate(&light);
     w.accumulate(&heavy);
-    let line = render_kv(&w, &sample_caches(), 5.0).finish();
+    let line = render_kv(&w, &sample_caches(), 2.0).finish();
     let expected = [
-        "perf-kv v1 window_s=5.000 frames=2 ".to_owned(),
+        "perf-kv v1 window_s=2.000 frames=2 ".to_owned(),
         format!(" frame_ms={:.3} ", cycles_to_ms(12_000_000) / 2.0),
         format!(" frame_peak_ms={:.3} ", cycles_to_ms(8_000_000)),
         " api_device_calls_total=40 ".to_owned(),
@@ -791,7 +791,7 @@ fn kv_aggregates_average_peak_and_total_over_frames() {
 fn kv_keys_are_unique_and_unit_suffixed() {
     const FLOAT_SUFFIXES: [&str; 1] = ["_ms"];
     const INTEGER_SUFFIXES: [&str; 3] = ["_total", "_bytes", "_count"];
-    let mut kv = render_kv(&sample_window(), &sample_caches(), 5.01);
+    let mut kv = render_kv(&sample_window(), &sample_caches(), 2.01);
     compilation::CompilationPerf::new().append_kv(&mut kv);
     let line = kv.finish();
     assert!(
@@ -801,7 +801,7 @@ fn kv_keys_are_unique_and_unit_suffixed() {
     let mut fields = line.split(' ');
     assert_eq!(
         fields.by_ref().take(4).collect::<Vec<_>>(),
-        ["perf-kv", "v1", "window_s=5.010", "frames=1"]
+        ["perf-kv", "v1", "window_s=2.010", "frames=1"]
     );
     let mut seen = FxHashSet::default();
     for field in fields {
@@ -842,9 +842,9 @@ fn kv_keys_are_unique_and_unit_suffixed() {
 fn summary_contains_expected_sections() {
     let w = sample_window();
     let caches = sample_caches();
-    let out = Summary::render_with_ansi(&w, &caches, 5.01, false);
+    let out = Summary::render_with_ansi(&w, &caches, 2.01, false);
     for expected in [
-        "── perf  window=5.01s",
+        "── perf  window=2.01s",
         "bottleneck=ENCODER (GPU)",
         "API thread",
         "├─ D3D9 calls",

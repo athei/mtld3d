@@ -242,7 +242,7 @@ as the shader-stutter one, gets a note instead. The runner stops that run
 once its log holds 33 submissions after the line the benchmark prints where
 its measured frames start, so it writes no metrics: its stamp and images are
 read from the log's identity lines and held to the leg's stamp and to the
-images of the leg's timed rounds. That costs a run of about twelve seconds per
+images of the leg's timed rounds. That costs a run of about six seconds per
 leg per scene benchmark and some MB of trace in the directory. The report
 compares the most common pass shape of the last thirty complete submissions
 between the legs, with every load and store action the load/store rules
@@ -276,16 +276,16 @@ summary line in the pull request's verification. The `wow` set is the two
 World of Warcraft frames, the EVENT-query throttle under the game's settings
 and under the D3D9 defaults, the per-call API cost, and the buffer-lock and
 texture-streaming benchmarks at the game's rates. A run of one of them takes
-about 11.5 s: Wine's start, the warm-up, untimed frames until the layer's
-second perf window opens five seconds after the first frame, and that one
-window measured. So the default five rounds of both legs take about 13 to 14
-minutes, the four shape runs about half a minute and the host emitter's
+about 5.5 s: Wine's start, the warm-up, untimed frames until the layer's
+second perf window opens two seconds after the first frame, and that one
+window measured. So the default five rounds of both legs take about 6.5
+minutes, the four shape runs under half a minute and the host emitter's
 rounds about 20 s. Before the first run the two legs build at the same time
 and their prefixes boot while the benchmark binary builds: about a minute and
 a half with a new base worktree and a changed candidate, well under a minute
 when neither needs a build, longer when a change rebuilds the production
 layer in both legs. An A/A run of one commit against itself should take
-about 16 minutes in all, down from the 20 an earlier layout of the run took
+about 9 minutes in all, down from the 20 an earlier layout of the run took
 (an estimate from that run's timestamps and the new spans; the first run's
 timestamps say what it is on your machine). `BENCH_SET=full` runs every
 benchmark, the shader-stutter and cold-start ones included, and takes about

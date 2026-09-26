@@ -242,7 +242,7 @@ impl Default for SubmitTimings {
 /// construction — a single `Relaxed` atomic load instead of the
 /// `env_logger` filter walk that `log_enabled!` would run per call.
 ///
-/// Latched at `Info` so `PERF=1` builds print the 5-second summary by
+/// Latched at `Info` so `PERF=1` builds print the 2-second summary by
 /// default — the gate already requires an opt-in build, so the runtime
 /// cost is paid only by users who explicitly asked for the dashboard.
 /// Silence with `RUST_LOG=mtld3d::perf=warn`.

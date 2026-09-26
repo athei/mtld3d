@@ -3500,7 +3500,7 @@ pub fn device_api_lock(this: *mut c_void) -> ApiGuard {
 /// thunks in `cursor.rs` included. `#[inline]` suffices — release uses
 /// thin-LTO so the null-check + handoff folds into the caller. The `sub`
 /// arg picks which `DeviceSubCategory` bucket the elapsed cycles land in
-/// for the per-sub breakdown in the 5-second summary; the top-level
+/// for the per-sub breakdown in the 2-second summary; the top-level
 /// `Device` bucket is bumped in parallel under one `rdtsc()` delta.
 #[inline]
 pub fn device_timer(this: *mut c_void, sub: DeviceSubCategory) -> ApiTimer {
@@ -3514,7 +3514,7 @@ pub fn device_timer(this: *mut c_void, sub: DeviceSubCategory) -> ApiTimer {
 
 /// Same shape as `device_timer` but for entry points whose `DeviceSubCategory` would be `Bind`.
 ///
-/// Tags the timer with a `BindSubCategory` so the 5-second summary can
+/// Tags the timer with a `BindSubCategory` so the 2-second summary can
 /// decompose the `Bind` row into per-Setter-family rows. The single
 /// `rdtsc()` delta bumps Device top + `Bind` device-sub + the chosen
 /// `BindSubCategory` in one pass.
