@@ -28,7 +28,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Command, Stdio},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 /// How many of the busiest foreign processes a sample keeps.
@@ -67,6 +67,14 @@ const COUNTED_CPU: f64 = 1.0;
 /// Metal's shader compiler service and the window server that composites
 /// the benchmarks' windows.
 const SIDE_EFFECTS: [&str; 2] = ["MTLCompilerService", "WindowServer"];
+
+/// The commands between the runner and whoever started the run: cargo, make and their shells.
+///
+/// The ancestors the run leaves out of the foreign processes are the chain
+/// of these above the runner, up to the first that is none of them (a
+/// terminal's shell, tmux, an IDE, launchd), which is foreign like any
+/// other process.
+const STARTERS: [&str; 5] = ["cargo", "make", "gmake", "gnumake", "sh"];
 
 /// The name `ps` gives the kernel's own process.
 const KERNEL_TASK: &str = "kernel_task";
@@ -206,7 +214,7 @@ pub fn sample(legs: &[PathBuf]) -> Sample {
     let listing =
         measured_listing().unwrap_or_else(|| ps(&["-A", "-r", "-o", "pcpu=,pid=,ppid=,comm="]));
     let mut classified = classify(&listing, std::process::id(), legs, |pid| {
-        maps_a_leg(pid, legs)
+        image_origin(pid, legs)
     });
     for process in &mut classified.top {
         let line = ps(&["-o", "command=", "-p", &process.pid.to_string()]);
@@ -225,38 +233,43 @@ pub fn sample(legs: &[PathBuf]) -> Sample {
 
 /// Sort a `<cpu%> <pid> <ppid> <command>` listing, busiest first, into `kernel_task` and the rest.
 ///
-/// The run's own processes are left out: the process `own` and its
-/// ancestors (the cargo and make that started it) and children (`ps`), the
-/// [`SIDE_EFFECTS`] of its Metal work, a process whose executable lies in one
-/// of `legs`, and a Wine process (a Windows path, an `.exe`, or `wine` in
-/// its name) that `maps_leg` says maps its image from one of them: the legs'
-/// wineservers and their resident Windows processes. Every other process
-/// at [`COUNTED_CPU`] or more, another Wine's included, is foreign: all of
-/// them are summed and the busiest [`TOP`] kept, in the listing's order.
+/// The run's own processes are left out: the process `own`, the chain of
+/// [`STARTERS`] above it (the cargo, make and shells that started it) and
+/// its children (`ps`), the [`SIDE_EFFECTS`] of its Metal work, a process
+/// whose executable lies in one of `legs`, and a Wine process (a Windows
+/// path, an `.exe`, or `wine` in its name) whose image `origin` finds in one
+/// of them (`Some(true)`): the legs' wineservers and their resident Windows
+/// processes. A Wine process `origin` cannot tell (`None`: it exited, or
+/// `lsof` could not read it) is dropped rather than called foreign. Every
+/// other process at [`COUNTED_CPU`] or more, another Wine's included, is
+/// foreign: all of them are summed and the busiest [`TOP`] kept, in the
+/// listing's order.
 #[must_use]
 pub fn classify(
     listing: &str,
     own: u32,
     legs: &[PathBuf],
-    mut maps_leg: impl FnMut(u32) -> bool,
+    mut origin: impl FnMut(u32) -> Option<bool>,
 ) -> Classified {
     let rows: Vec<Row> = listing.lines().filter_map(ps_row).collect();
-    let parents: BTreeMap<u32, u32> = rows.iter().map(|row| (row.pid, row.ppid)).collect();
+    let parents: BTreeMap<u32, (u32, &str)> = rows
+        .iter()
+        .map(|row| (row.pid, (row.ppid, command_name(&row.command))))
+        .collect();
     let mut run = BTreeSet::from([own]);
     let mut at = own;
-    while let Some(&parent) = parents.get(&at) {
-        if parent == 0 || !run.insert(parent) {
+    while let Some(&(parent, _)) = parents.get(&at) {
+        let Some(&(_, name)) = parents.get(&parent) else {
+            break;
+        };
+        if !STARTERS.contains(&name) || !run.insert(parent) {
             break;
         }
         at = parent;
     }
     let mut classified = Classified::default();
     for row in rows {
-        let name = row
-            .command
-            .rsplit(['/', '\\'])
-            .next()
-            .unwrap_or(&row.command);
+        let name = command_name(&row.command);
         if name == KERNEL_TASK {
             classified.kernel_task.get_or_insert(row.cpu);
             continue;
@@ -268,7 +281,7 @@ pub fn classify(
             || legs
                 .iter()
                 .any(|leg| Path::new(&row.command).starts_with(leg))
-            || (wine_like(&row.command) && maps_leg(row.pid))
+            || (wine_like(&row.command) && origin(row.pid) != Some(false))
         {
             continue;
         }
@@ -381,10 +394,20 @@ fn wine_like(command: &str) -> bool {
             .is_some_and(|extension| extension == "exe")
 }
 
-/// Whether the process `pid` maps an image from one of the Wine installs `legs`.
-fn maps_a_leg(pid: u32, legs: &[PathBuf]) -> bool {
+/// The executable's name in a command: what follows its last `/` or `\`.
+fn command_name(command: &str) -> &str {
+    command.rsplit(['/', '\\']).next().unwrap_or(command)
+}
+
+/// Whether the process `pid` maps its images from one of the Wine installs `legs`.
+///
+/// `None` when `lsof` names no image for it: the process has exited, it
+/// cannot be read, or `lsof` itself failed. `-b` keeps `lsof` from calls
+/// that can block in the kernel.
+fn image_origin(pid: u32, legs: &[PathBuf]) -> Option<bool> {
     let listing = Command::new("lsof")
         .args([
+            "-b",
             "-n",
             "-P",
             "-w",
@@ -401,18 +424,24 @@ fn maps_a_leg(pid: u32, legs: &[PathBuf]) -> bool {
         .output()
         .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
         .unwrap_or_default();
-    listing
+    let images: Vec<&str> = listing
         .lines()
         .filter_map(|line| line.strip_prefix('n'))
-        .any(|path| legs.iter().any(|leg| Path::new(path).starts_with(leg)))
+        .collect();
+    (!images.is_empty()).then(|| {
+        images
+            .iter()
+            .any(|path| legs.iter().any(|leg| Path::new(path).starts_with(leg)))
+    })
 }
 
-/// Every process's CPU over [`INTERVAL`], busiest first, as a listing [`classify`] reads.
+/// Every process's CPU over about [`INTERVAL`], busiest first, as a listing [`classify`] reads.
 ///
-/// Two reads of the CPU time each process has used, [`INTERVAL`] apart,
-/// rather than `ps`'s own `%cpu`, a decaying average of the last minute
-/// that still holds a load that has gone. A process that started between
-/// the reads counts all its time. `None` when `ps` gives nothing.
+/// Two reads of the CPU time each process has used rather than `ps`'s own
+/// `%cpu`, a decaying average of the last minute that still holds a load
+/// that has gone ([`shares`]); the share divides by the time measured
+/// between the reads returning. `None` when either read gives nothing, so
+/// the caller falls back to `%cpu` instead of reading a quiet machine.
 fn measured_listing() -> Option<String> {
     let before: BTreeMap<u32, f64> = ps(&["-A", "-o", "pid=,cputime="])
         .lines()
@@ -421,27 +450,76 @@ fn measured_listing() -> Option<String> {
             Some((pid.parse().ok()?, cpu_seconds(time.trim())?))
         })
         .collect();
+    let first = Instant::now();
     if before.is_empty() {
         return None;
     }
     thread::sleep(INTERVAL);
-    let mut rows: Vec<(f64, String)> = ps(&["-A", "-o", "pid=,ppid=,cputime=,comm="])
+    let after = cputime_rows(&ps(&["-A", "-o", "pid=,ppid=,cputime=,comm="]));
+    let elapsed = first.elapsed();
+    if after.is_empty() {
+        return None;
+    }
+    Some(shares(&before, &after, elapsed))
+}
+
+/// One process of the second CPU-time read: its pid, its parent's, its CPU seconds, its command.
+pub struct CpuTime {
+    pub pid: u32,
+    pub ppid: u32,
+    pub seconds: f64,
+    pub command: String,
+}
+
+/// The `<pid> <ppid> <cputime> <command>` lines of a `ps` listing.
+#[must_use]
+pub fn cputime_rows(listing: &str) -> Vec<CpuTime> {
+    listing
         .lines()
         .filter_map(|line| {
             let (pid, rest) = line.trim_start().split_once(char::is_whitespace)?;
             let (parent, rest) = rest.trim_start().split_once(char::is_whitespace)?;
             let (time, command) = rest.trim_start().split_once(char::is_whitespace)?;
-            let pid: u32 = pid.parse().ok()?;
-            let used = cpu_seconds(time)? - before.get(&pid).copied().unwrap_or(0.0);
-            let cpu = used.max(0.0) / INTERVAL.as_secs_f64() * 100.0;
-            Some((cpu, format!("{cpu:.1} {pid} {parent} {}", command.trim())))
+            Some(CpuTime {
+                pid: pid.parse().ok()?,
+                ppid: parent.parse().ok()?,
+                seconds: cpu_seconds(time)?,
+                command: command.trim().to_owned(),
+            })
+        })
+        .collect()
+}
+
+/// The listing [`classify`] reads, from CPU seconds `before` and `after` `elapsed` apart.
+///
+/// Each process's share is the CPU time it used between the reads over
+/// `elapsed`, in percent of one core, busiest first. A process the first
+/// read did not see (it started between them) counts all its time; one
+/// whose time went down (its pid was reused by a process younger than the
+/// first read) counts none; one only the first read saw has exited and is
+/// not listed.
+#[must_use]
+pub fn shares(before: &BTreeMap<u32, f64>, after: &[CpuTime], elapsed: Duration) -> String {
+    let secs = elapsed.as_secs_f64().max(f64::EPSILON);
+    let mut rows: Vec<(f64, String)> = after
+        .iter()
+        .map(|process| {
+            let used = process.seconds - before.get(&process.pid).copied().unwrap_or(0.0);
+            let cpu = used.max(0.0) / secs * 100.0;
+            (
+                cpu,
+                format!(
+                    "{cpu:.1} {} {} {}",
+                    process.pid, process.ppid, process.command
+                ),
+            )
         })
         .collect();
     rows.sort_by(|a, b| b.0.total_cmp(&a.0));
-    Some(rows.into_iter().fold(String::new(), |mut out, (_, line)| {
+    rows.into_iter().fold(String::new(), |mut out, (_, line)| {
         let _ = writeln!(out, "{line}");
         out
-    }))
+    })
 }
 
 /// The seconds of a `ps` CPU time, `[[dd-]hh:]mm:ss.ss`.

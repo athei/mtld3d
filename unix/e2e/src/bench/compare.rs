@@ -1233,7 +1233,8 @@ fn listed(spans: &BTreeSet<String>) -> String {
 ///
 /// A tail percentile, a worst value and a count of spikes all see more of
 /// the rare slow frames in a longer span, and a benchmark's memory growth
-/// is measured to the end of a span of that length. An exact metric is
+/// to the end of its measured frames covers a span of that length (the
+/// growth after the warm-up is taken before the span and is not). An exact metric is
 /// fixed by the workload whatever the span, and a median, a mean or a
 /// per-frame count is not tied to it.
 fn span_scaled(name: &str, definition: &Metric) -> bool {
@@ -1241,7 +1242,7 @@ fn span_scaled(name: &str, definition: &Metric) -> bool {
         && (definition.class == Class::Spikes
             || name.contains("p99")
             || name.rsplit('.').next() == Some("max")
-            || name.starts_with("mem.delta."))
+            || name.starts_with("mem.delta.end."))
 }
 
 /// The row of a metric only one leg has.
