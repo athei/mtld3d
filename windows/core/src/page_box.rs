@@ -18,6 +18,7 @@ use std::{
     sync::{Arc, atomic::AtomicU32},
 };
 
+#[cfg(not(windows))]
 use mtld3d_shared::encoder_wire::{LeaseCompletion, LeaseCompletionPtr};
 
 /// Bytes held by live `PageBox`es, always on: one add per alloc, one sub per free.
@@ -262,6 +263,7 @@ pub struct PageBox {
 /// The runtime responsible for releasing a page allocation.
 enum PageOwnership {
     Native(Layout),
+    #[cfg(not(windows))]
     Guest {
         completion: LeaseCompletionPtr,
         readers: u64,
@@ -362,6 +364,7 @@ impl PageBox {
     /// stays alive for the same lease. A read guard must already exist before
     /// publication whenever the native consumer will acquire a new read.
     #[must_use]
+    #[cfg(not(windows))]
     pub const unsafe fn from_guest_lease(
         ptr: NonNull<u8>,
         len: usize,
@@ -398,6 +401,7 @@ impl PageBox {
     const fn reader_count(&self) -> &AtomicU32 {
         match &self.ownership {
             PageOwnership::Native(_) => &self.readers,
+            #[cfg(not(windows))]
             PageOwnership::Guest { readers, .. } => {
                 // SAFETY: from_guest_lease pins the original aligned counter until Drop.
                 unsafe { &*(*readers as *const AtomicU32) }
@@ -507,6 +511,7 @@ impl Drop for PageBox {
     fn drop(&mut self) {
         let layout = match &self.ownership {
             PageOwnership::Native(layout) => *layout,
+            #[cfg(not(windows))]
             PageOwnership::Guest { completion, .. } => {
                 // SAFETY: from_guest_lease keeps this cell alive until this final acknowledgment.
                 let completion = unsafe { &*(completion.raw() as *const LeaseCompletion) };

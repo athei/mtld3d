@@ -149,7 +149,8 @@ pub struct SnapshotAttributes<'a> {
 
 /// Changes built by the API's existing dirty-state gates.
 ///
-/// Byte bindings use outer `None` for unchanged and `Some(None)` for cleared.
+/// An absent byte group leaves every binding unchanged. Inside a present group,
+/// each binding uses `None` for unchanged and `Some(None)` for cleared.
 /// Their order is VS constants, PS constants, alpha, fog, bump environment,
 /// VS integer, VS boolean, PS integer, PS boolean, and per-draw VS uniforms.
 #[derive(Default)]
@@ -160,7 +161,7 @@ pub struct SnapshotDelta<'a> {
     pub vs: Option<VsSourceView<'a>>,
     pub ps: Option<PsSourceView<'a>>,
     pub variant: Option<VariantKey>,
-    pub bytes: [Option<Option<ScratchSlice>>; 10],
+    pub bytes: Option<&'a [Option<Option<ScratchSlice>>; 10]>,
     pub depth_stencil: Option<DepthStencilFlags>,
 }
 
@@ -288,10 +289,12 @@ fn write_snapshot_delta(
         )?;
         changed |= 32;
     }
-    for (index, value) in delta.bytes.iter().enumerate() {
-        if let Some(value) = value {
-            write_optional_bytes(*value, writer)?;
-            changed |= 1 << (index + 6);
+    if let Some(bytes) = delta.bytes {
+        for (index, value) in bytes.iter().enumerate() {
+            if let Some(value) = value {
+                write_optional_bytes(*value, writer)?;
+                changed |= 1 << (index + 6);
+            }
         }
     }
     if let Some(value) = delta.depth_stencil {
@@ -317,7 +320,9 @@ fn write_snapshot_delta(
 fn align_snapshot_leaf(writer: &mut SnapshotWriter<'_>) -> Result<(), WireError> {
     let address = writer.reserve_bytes(0)?.as_ptr() as usize;
     let padding = address.wrapping_neg() & 7;
-    writer.reserve_bytes(padding)?.fill(0);
+    if padding != 0 {
+        writer.reserve_bytes(padding)?.fill(0);
+    }
     Ok(())
 }
 

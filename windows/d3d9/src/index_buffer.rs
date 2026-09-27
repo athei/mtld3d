@@ -596,7 +596,10 @@ extern "system" fn ib_lock(
         mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET, "ib_lock: device_inner null on rename path");
     }
 
-    if matches!(inner.map_mode, BufferMapMode::Direct) && !inner.device_inner.is_null() {
+    if matches!(inner.map_mode, BufferMapMode::Direct)
+        && !bypass_rename
+        && !inner.device_inner.is_null()
+    {
         // SAFETY: `inner.device_inner` was stamped at `Self::new` from a
         // live `DeviceInner`; the device outlives all its child
         // resources per D3D9 lifetime rules.

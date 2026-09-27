@@ -238,9 +238,16 @@ impl ScratchArena {
         let used = payload_used + COMMAND_HEADER_BYTES;
         let aligned_used = (used + alignment_mask) & !alignment_mask;
         let padding = pointer.wrapping_add(used);
-        if aligned_used != used {
-            // SAFETY: all padding bytes lie within this exclusive reservation.
-            unsafe { padding.write_bytes(0, aligned_used - used) };
+        match aligned_used - used {
+            0 => {}
+            4 => {
+                // SAFETY: these four padding bytes lie within the exclusive reservation.
+                unsafe { padding.write_bytes(0, 4) };
+            }
+            count => {
+                // SAFETY: all padding bytes lie within this exclusive reservation.
+                unsafe { padding.write_bytes(0, count) };
+            }
         }
         let record_bytes = u32::try_from(used).map_err(|_| WireError::TooLarge)?;
         let header_pointer = pointer as usize as *mut CommandHeader;

@@ -3,11 +3,15 @@
 //! Only fixed-width addresses cross the runtime boundary. PE owns every original allocation,
 //! reader guard and acknowledgment cell; native wrappers borrow them without running PE drops.
 
-use std::{ptr::NonNull, sync::Arc};
+#[cfg(not(windows))]
+use std::ptr::NonNull;
+use std::sync::Arc;
 
+#[cfg(not(windows))]
+use mtld3d_shared::encoder_wire::LeaseCompletionPtr;
 use mtld3d_shared::{
     InPtr,
-    encoder_wire::{LeaseCompletion, LeaseCompletionPtr, WireError, WireReader, WireWriter},
+    encoder_wire::{LeaseCompletion, WireError, WireReader, WireWriter},
 };
 
 use crate::{
@@ -214,6 +218,7 @@ impl GuestPageDescriptor {
     /// # Errors
     ///
     /// Rejects invalid descriptor ranges or a descriptor that requests a read handoff.
+    #[cfg(not(windows))]
     pub unsafe fn adopt_owned(&self) -> Result<PageBox, WireError> {
         if self.read_acquired != 0 {
             return Err(WireError::InvalidValue);
@@ -232,6 +237,7 @@ impl GuestPageDescriptor {
     /// # Errors
     ///
     /// Rejects the same invalid ranges and read handoff as `adopt_owned`.
+    #[cfg(not(windows))]
     pub unsafe fn adopt_shared(&self) -> Result<Arc<PageBox>, WireError> {
         // SAFETY: the caller supplies the same retained lease required by adopt_owned.
         unsafe { self.adopt_owned() }.map(Arc::new)
@@ -252,6 +258,7 @@ impl GuestPageDescriptor {
     /// # Panics
     ///
     /// Panics if the allocation's shared reader count is exhausted.
+    #[cfg(not(windows))]
     pub unsafe fn adopt_read(&self) -> Result<PageBoxRead, WireError> {
         if self.read_acquired == 0 {
             return Err(WireError::InvalidValue);
@@ -289,6 +296,7 @@ impl GuestPageDescriptor {
         Ok(())
     }
 
+    #[cfg(not(windows))]
     unsafe fn adopt_page(&self) -> Result<PageBox, WireError> {
         self.validate()?;
         let source = NonNull::new(self.source as *mut u8).ok_or(WireError::InvalidValue)?;

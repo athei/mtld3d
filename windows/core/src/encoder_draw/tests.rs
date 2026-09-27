@@ -59,6 +59,47 @@ fn encode_snapshot<'a>(arena: &'a mut ScratchArena, delta: &SnapshotDelta<'_>) -
 }
 
 #[test]
+fn leaf_alignment_preserves_zero_padding_bounds_and_every_residue() {
+    for residue in 0..8 {
+        let mut bytes = [0xa5; 32];
+        let aligned = bytes.as_ptr().addr().wrapping_neg() & 7;
+        let start = aligned + residue;
+        let padding = (8 - residue) & 7;
+        let mut writer = super::SnapshotWriter {
+            destination: &mut bytes[start..start + 16],
+            used: 0,
+        };
+        super::align_snapshot_leaf(&mut writer).unwrap();
+        assert_eq!(writer.used, padding);
+        assert_eq!(&bytes[start..start + padding], &[0; 7][..padding]);
+        assert!(bytes[..start].iter().all(|&byte| byte == 0xa5));
+        assert!(bytes[start + padding..].iter().all(|&byte| byte == 0xa5));
+
+        if padding != 0 {
+            bytes.fill(0xa5);
+            let mut truncated = super::SnapshotWriter {
+                destination: &mut bytes[start..start + padding - 1],
+                used: 0,
+            };
+            assert_eq!(
+                super::align_snapshot_leaf(&mut truncated),
+                Err(WireError::TooLarge)
+            );
+            assert_eq!(truncated.used, 0);
+            assert_eq!(bytes, [0xa5; 32]);
+        }
+    }
+    let mut invalid = super::SnapshotWriter {
+        destination: &mut [],
+        used: 1,
+    };
+    assert_eq!(
+        super::align_snapshot_leaf(&mut invalid),
+        Err(WireError::TooLarge)
+    );
+}
+
+#[test]
 fn partial_deltas_preserve_structural_referents_and_clear_only_changed_bytes() {
     let source = VsSource::Programmable(crate::draw_data::ProgrammableVsSource {
         vs_id: ProgramId::from_tokens(&[0xfffe_0300, 0xffff]),
@@ -73,14 +114,20 @@ fn partial_deltas_preserve_structural_referents_and_clear_only_changed_bytes() {
             | crate::draw_data::ShaderSourceFlags::BOOLEAN,
     });
     let uniform = captured(&[1, 2, 3, 4]);
-    let mut initial = SnapshotDelta {
+    let mut initial_bindings = [None; 10];
+    initial_bindings[1] = Some(Some(uniform));
+    initial_bindings[2] = Some(Some(uniform));
+    let initial = SnapshotDelta {
         vs: Some(source.as_view()),
+        bytes: Some(&initial_bindings),
         ..SnapshotDelta::default()
     };
-    initial.bytes[1] = Some(Some(uniform));
-    initial.bytes[2] = Some(Some(uniform));
-    let mut clearing = SnapshotDelta::default();
-    clearing.bytes[1] = Some(None);
+    let mut clearing_bindings = [None; 10];
+    clearing_bindings[1] = Some(None);
+    let clearing = SnapshotDelta {
+        bytes: Some(&clearing_bindings),
+        ..SnapshotDelta::default()
+    };
     let mut initial_arena = ScratchArena::new();
     let initial_bytes = encode_snapshot(&mut initial_arena, &initial);
     let mut clearing_arena = ScratchArena::new();
@@ -132,6 +179,21 @@ fn invalid_delta_mask_poisoning_prevents_partial_replay() {
     ));
 }
 
+fn full_bindings(snapshot: &CurrentSnapshot) -> [Option<ScratchSlice>; 10] {
+    [
+        snapshot.vs_constants,
+        snapshot.ps_constants,
+        snapshot.alpha_ref_bytes,
+        snapshot.fog_color_bytes,
+        snapshot.bump_env_bytes,
+        snapshot.vs_int_const_bytes,
+        snapshot.vs_bool_const_bytes,
+        snapshot.ps_int_const_bytes,
+        snapshot.ps_bool_const_bytes,
+        snapshot.vs_draw_bytes,
+    ]
+}
+
 fn full_delta(snapshot: &CurrentSnapshot) -> SnapshotDelta<'_> {
     let stages = snapshot.stage_bindings.as_ref().map(|value| {
         // SAFETY: fixture bindings occupy exactly the initialized mask-sized scratch prefix.
@@ -161,19 +223,7 @@ fn full_delta(snapshot: &CurrentSnapshot) -> SnapshotDelta<'_> {
             .as_ref()
             .map(crate::draw_data::PsSourcePtr::as_ref),
         variant: snapshot.variant,
-        bytes: [
-            snapshot.vs_constants,
-            snapshot.ps_constants,
-            snapshot.alpha_ref_bytes,
-            snapshot.fog_color_bytes,
-            snapshot.bump_env_bytes,
-            snapshot.vs_int_const_bytes,
-            snapshot.vs_bool_const_bytes,
-            snapshot.ps_int_const_bytes,
-            snapshot.ps_bool_const_bytes,
-            snapshot.vs_draw_bytes,
-        ]
-        .map(Some),
+        bytes: None,
         depth_stencil: Some(snapshot.depth_stencil),
     }
 }
@@ -307,9 +357,11 @@ fn complete_snapshot_borrows_canonical_leaves_and_reconstructs_only_native_roots
         vs_draw_bytes: Some(uniform),
         depth_stencil: DepthStencilFlags::HAS_DEPTH,
     };
+    let bindings = full_bindings(&snapshot).map(Some);
     for bit in 0..17 {
         let mut full = full_delta(&snapshot);
         let mut delta = SnapshotDelta::default();
+        let mut single_binding = [None; 10];
         match bit {
             0 => delta.render_state = full.render_state,
             1 => delta.stages = full.stages,
@@ -317,7 +369,10 @@ fn complete_snapshot_borrows_canonical_leaves_and_reconstructs_only_native_roots
             3 => delta.vs = full.vs,
             4 => delta.ps = full.ps,
             5 => delta.variant = full.variant,
-            6..=15 => delta.bytes[bit - 6] = full.bytes[bit - 6],
+            6..=15 => {
+                single_binding[bit - 6] = bindings[bit - 6];
+                delta.bytes = Some(&single_binding);
+            }
             16 => delta.depth_stencil = full.depth_stencil,
             _ => unreachable!(),
         }
@@ -329,7 +384,9 @@ fn complete_snapshot_borrows_canonical_leaves_and_reconstructs_only_native_roots
         assert_eq!(header.reserved, 0);
     }
     let mut first = ScratchArena::new();
-    let payload = encode_snapshot(&mut first, &full_delta(&snapshot));
+    let mut full = full_delta(&snapshot);
+    full.bytes = Some(&bindings);
+    let payload = encode_snapshot(&mut first, &full);
     assert!(payload.len() <= super::SNAPSHOT_DELTA_MAX_BYTES);
     for length in 0..payload.len() {
         let mut truncated_scratch = ScratchArena::new();
@@ -384,7 +441,10 @@ fn complete_snapshot_borrows_canonical_leaves_and_reconstructs_only_native_roots
     let mut second = ScratchArena::new();
     let prefix = second.write_command(1, 0, 0, |_| Ok(0)).unwrap();
     assert_eq!(prefix.region_bytes, COMMAND_HEADER_BYTES);
-    let second_payload = encode_snapshot(&mut second, &full_delta(restored));
+    let restored_bindings = full_bindings(restored).map(Some);
+    let mut restored_delta = full_delta(restored);
+    restored_delta.bytes = Some(&restored_bindings);
+    let second_payload = encode_snapshot(&mut second, &restored_delta);
     assert_eq!(payload.as_ptr() as usize % 16, 8);
     assert_eq!(second_payload.as_ptr() as usize % 16, 0);
     assert_eq!(payload, second_payload);
@@ -426,11 +486,31 @@ fn captured(bytes: &'static [u8]) -> ScratchSlice {
 }
 
 #[test]
+fn absent_byte_group_matches_all_unchanged_bindings() {
+    let mut absent_arena = ScratchArena::new();
+    let absent = encode_snapshot(&mut absent_arena, &SnapshotDelta::default());
+    let mut unchanged_arena = ScratchArena::new();
+    let unchanged = encode_snapshot(
+        &mut unchanged_arena,
+        &SnapshotDelta {
+            bytes: Some(&[None; 10]),
+            ..SnapshotDelta::default()
+        },
+    );
+    assert_eq!(absent, unchanged);
+    assert_eq!(absent, &[0; 8]);
+}
+
+#[test]
 fn every_byte_binding_preserves_clear_empty_and_nonempty_values() {
     for index in 0..10 {
         for value in [None, Some(ScratchSlice::EMPTY), Some(captured(&[1, 2, 3]))] {
-            let mut delta = SnapshotDelta::default();
-            delta.bytes[index] = Some(value);
+            let mut bindings = [None; 10];
+            bindings[index] = Some(value);
+            let delta = SnapshotDelta {
+                bytes: Some(&bindings),
+                ..SnapshotDelta::default()
+            };
             let mut arena = ScratchArena::new();
             let payload = encode_snapshot(&mut arena, &delta);
             assert_eq!(payload.len(), 24);

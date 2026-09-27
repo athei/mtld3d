@@ -2145,6 +2145,48 @@ impl DeviceInner {
         self.render_states[index]
     }
 
+    /// Resolve the explicit RESZ request without enlarging ordinary render-state calls.
+    ///
+    /// This rare extension captures texture-transfer records and diagnostic temporaries.
+    #[cold]
+    #[inline(never)]
+    fn resolve_resz_depth(&mut self) {
+        let bindings = self.stage_bindings();
+        let tex = bindings.texture(0);
+        if tex.is_null() {
+            mtld3d_shared::log_once_warn!(
+                target: LOG_TARGET,
+                "RESZ resolve requested with no stage-0 texture bound — skipped"
+            );
+        } else {
+            // SAFETY: a bound stage holds a live texture reference until it
+            // is rebound or released, both on this thread.
+            let tex = unsafe { &mut *tex };
+            let inner = tex.inner();
+            // The resolve is a texture-to-texture copy, so the destination is
+            // measured where its Metal texture lives: a depth texture created
+            // at the reported back-buffer size is rasterized at
+            // `render.scale` of it, exactly like the depth attachment the
+            // resolve compares it against.
+            let (w, h) = inner.render_extent();
+            let id = tex.texture_id();
+            if self.frame_dump.active {
+                self.frame_dump_event(&format!("RESZ resolve → {id:?} {w}x{h}"));
+            }
+            let dynamic_depth = inner.d3d_usage() & D3DUSAGE_DYNAMIC != 0 && tex.is_depth_format();
+            if dynamic_depth && self.depth_stencil_bound() {
+                let inner = tex.inner_mut();
+                crate::texture::flush_dirty_mips(inner, self);
+                let info = inner.texture_info();
+                inner.mark_subresource_gpu_authoritative(0, 0);
+                self.push_control(crate::device::ResolveDynamicDepthOp { id, info });
+            } else if !dynamic_depth {
+                let format = tex.metal_pixel_format();
+                self.push_control(crate::device::ResolveDepthTextureOp { id, w, h, format });
+            }
+        }
+    }
+
     /// Returns whether raw or derived state changed.
     ///
     /// Callers gate `mark_snapshot_dirty` on this. POINTSIZE also compares
@@ -9309,40 +9351,7 @@ extern "system" fn device_set_render_state(this: *mut c_void, state: u32, value:
     // engines on the matching vendor path use it as their only way to
     // hand scene depth to a second depth consumer.
     if state == D3DRS_POINTSIZE && value == 0x7fa0_5000 {
-        let bindings = dev.stage_bindings();
-        let tex = bindings.texture(0);
-        if tex.is_null() {
-            mtld3d_shared::log_once_warn!(
-                target: LOG_TARGET,
-                "RESZ resolve requested with no stage-0 texture bound — skipped"
-            );
-        } else {
-            // SAFETY: a bound stage holds a live texture reference until it
-            // is rebound or released, both on this thread.
-            let tex = unsafe { &mut *tex };
-            let inner = tex.inner();
-            // The resolve is a texture-to-texture copy, so the destination is
-            // measured where its Metal texture lives: a depth texture created
-            // at the reported back-buffer size is rasterized at
-            // `render.scale` of it, exactly like the depth attachment the
-            // resolve compares it against.
-            let (w, h) = inner.render_extent();
-            let id = tex.texture_id();
-            if dev.frame_dump.active {
-                dev.frame_dump_event(&format!("RESZ resolve → {id:?} {w}x{h}"));
-            }
-            let dynamic_depth = inner.d3d_usage() & D3DUSAGE_DYNAMIC != 0 && tex.is_depth_format();
-            if dynamic_depth && dev.depth_stencil_bound() {
-                let inner = tex.inner_mut();
-                crate::texture::flush_dirty_mips(inner, dev);
-                let info = inner.texture_info();
-                inner.mark_subresource_gpu_authoritative(0, 0);
-                dev.push_control(crate::device::ResolveDynamicDepthOp { id, info });
-            } else if !dynamic_depth {
-                let format = tex.metal_pixel_format();
-                dev.push_control(crate::device::ResolveDepthTextureOp { id, w, h, format });
-            }
-        }
+        dev.resolve_resz_depth();
     }
     if let Some(rec) = dev.recording_state_block_mut() {
         if state == D3DRS_POINTSIZE {
@@ -11329,50 +11338,67 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
 
     // Capture each changed structural value directly from its builder output.
     // Only uniform bytes need an initial copy into retained guest scratch.
-    let scratch = dev.current_frame.scratch_mut();
-    let mut bytes = [None; 10];
-    if dirty.contains(SnapshotDirty::VS_CONST) {
-        bytes[0] = Some(None);
-    }
-    if dirty.contains(SnapshotDirty::PS_CONST) {
-        // SAFETY: frame scratch remains immutable and retained through submit replay.
-        bytes[1] = Some(
-            ps_stage_constants
-                .or_else(|| ps_const_buf.map(|b| unsafe { arena_alloc_bytes(scratch, &b) })),
-        );
-    }
-    if let Some((buf, len)) = alpha_ref_buf {
-        // SAFETY: frame scratch remains immutable and retained through submit replay.
-        bytes[2] = Some(Some(unsafe { arena_alloc_bytes(scratch, &buf[..len]) }));
-    }
-    if let Some((buf, len)) = fog_color_buf {
-        // SAFETY: frame scratch remains immutable and retained through submit replay.
-        bytes[3] = Some(Some(unsafe { arena_alloc_bytes(scratch, &buf[..len]) }));
-    }
-    if let Some(buf) = bump_env_buf {
-        // SAFETY: frame scratch remains immutable and retained through submit replay.
-        bytes[4] = Some(Some(unsafe { arena_alloc_bytes(scratch, &buf) }));
-    }
-    if let Some(buf) = vs_int_const_buf {
-        // SAFETY: frame scratch remains immutable and retained through submit replay.
-        bytes[5] = Some(Some(unsafe { arena_alloc_bytes(scratch, &buf) }));
-    }
-    if let Some(buf) = vs_bool_const_buf {
-        // SAFETY: frame scratch remains immutable and retained through submit replay.
-        bytes[6] = Some(Some(unsafe { arena_alloc_bytes(scratch, &buf) }));
-    }
-    if let Some(buf) = ps_int_const_buf {
-        // SAFETY: frame scratch remains immutable and retained through submit replay.
-        bytes[7] = Some(Some(unsafe { arena_alloc_bytes(scratch, &buf) }));
-    }
-    if let Some(buf) = ps_bool_const_buf {
-        // SAFETY: frame scratch remains immutable and retained through submit replay.
-        bytes[8] = Some(Some(unsafe { arena_alloc_bytes(scratch, &buf) }));
-    }
-    if let Some(buf) = vs_draw_buf {
-        // SAFETY: frame scratch remains immutable and retained through submit replay.
-        bytes[9] = Some(Some(unsafe { arena_alloc_bytes(scratch, &buf) }));
-    }
+    let mut byte_bindings;
+    let bytes = if dirty.intersects(
+        SnapshotDirty::VS_CONST
+            | SnapshotDirty::PS_CONST
+            | SnapshotDirty::ALPHA_REF
+            | SnapshotDirty::FOG_COLOR
+            | SnapshotDirty::BUMP_ENV
+            | SnapshotDirty::VS_CONST_I
+            | SnapshotDirty::VS_CONST_B
+            | SnapshotDirty::PS_CONST_I
+            | SnapshotDirty::PS_CONST_B
+            | SnapshotDirty::VS_DRAW,
+    ) {
+        let scratch = dev.current_frame.scratch_mut();
+        byte_bindings = [None; 10];
+        if dirty.contains(SnapshotDirty::VS_CONST) {
+            byte_bindings[0] = Some(None);
+        }
+        if dirty.contains(SnapshotDirty::PS_CONST) {
+            // SAFETY: frame scratch remains immutable and retained through submit replay.
+            byte_bindings[1] = Some(
+                ps_stage_constants
+                    .or_else(|| ps_const_buf.map(|b| unsafe { arena_alloc_bytes(scratch, &b) })),
+            );
+        }
+        if let Some((buf, len)) = alpha_ref_buf {
+            // SAFETY: frame scratch remains immutable and retained through submit replay.
+            byte_bindings[2] = Some(Some(unsafe { arena_alloc_bytes(scratch, &buf[..len]) }));
+        }
+        if let Some((buf, len)) = fog_color_buf {
+            // SAFETY: frame scratch remains immutable and retained through submit replay.
+            byte_bindings[3] = Some(Some(unsafe { arena_alloc_bytes(scratch, &buf[..len]) }));
+        }
+        if let Some(buf) = bump_env_buf {
+            // SAFETY: frame scratch remains immutable and retained through submit replay.
+            byte_bindings[4] = Some(Some(unsafe { arena_alloc_bytes(scratch, &buf) }));
+        }
+        if let Some(buf) = vs_int_const_buf {
+            // SAFETY: frame scratch remains immutable and retained through submit replay.
+            byte_bindings[5] = Some(Some(unsafe { arena_alloc_bytes(scratch, &buf) }));
+        }
+        if let Some(buf) = vs_bool_const_buf {
+            // SAFETY: frame scratch remains immutable and retained through submit replay.
+            byte_bindings[6] = Some(Some(unsafe { arena_alloc_bytes(scratch, &buf) }));
+        }
+        if let Some(buf) = ps_int_const_buf {
+            // SAFETY: frame scratch remains immutable and retained through submit replay.
+            byte_bindings[7] = Some(Some(unsafe { arena_alloc_bytes(scratch, &buf) }));
+        }
+        if let Some(buf) = ps_bool_const_buf {
+            // SAFETY: frame scratch remains immutable and retained through submit replay.
+            byte_bindings[8] = Some(Some(unsafe { arena_alloc_bytes(scratch, &buf) }));
+        }
+        if let Some(buf) = vs_draw_buf {
+            // SAFETY: frame scratch remains immutable and retained through submit replay.
+            byte_bindings[9] = Some(Some(unsafe { arena_alloc_bytes(scratch, &buf) }));
+        }
+        Some(&byte_bindings)
+    } else {
+        None
+    };
     drop(consts_timer);
     let bumps_timer =
         CycleAddTimer::start(draw_snapshot_bumps_ptr(DeviceInner::perf_ptr_of(obj.inner)));
