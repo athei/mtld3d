@@ -1,6 +1,44 @@
 use super::{CompletionDrain, CompletionPool};
 
 #[test]
+fn unused_acquisition_reuses_queued_slot_without_publishing_an_event() {
+    let pool = CompletionPool::new();
+    let mut cursor = CompletionDrain::default();
+    let mut token = None;
+    for needs_acquire in [false, true, false] {
+        let slot = pool.allocate(needs_acquire);
+        assert_eq!(*token.get_or_insert_with(|| slot.token()), slot.token());
+        assert_eq!(slot.acquired().is_complete(), !needs_acquire);
+        assert!(!slot.completion().is_complete());
+
+        slot.acquired().publish();
+        slot.acquired().publish();
+        let mut events = Vec::new();
+        pool.drain(&mut cursor, 8, |event| events.push(event));
+        if needs_acquire {
+            assert_eq!(events, [slot.token() * 2]);
+        } else {
+            assert!(events.is_empty(), "unused acquisition must remain unqueued");
+        }
+        assert!(slot.acquired().is_complete());
+        assert!(
+            !slot.completion().is_complete(),
+            "final owner still retains the slot"
+        );
+        slot.completion().publish();
+        assert!(
+            !slot.completion().is_complete(),
+            "publication alone cannot recycle"
+        );
+        events.clear();
+        pool.drain(&mut cursor, 8, |event| events.push(event));
+        assert_eq!(events, [slot.token() * 2 + 1]);
+        assert!(slot.completion().is_complete());
+        pool.recycle(slot);
+    }
+}
+
+#[test]
 fn queued_cells_require_consumption_and_ignore_duplicate_publish() {
     let pool = CompletionPool::new();
     let slot = pool.allocate(true);

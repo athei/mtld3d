@@ -206,23 +206,10 @@ fn write_snapshot_delta(
     delta: &SnapshotDelta<'_>,
     writer: &mut SnapshotWriter<'_>,
 ) -> Result<(), WireError> {
-    let mut mask = u32::from(delta.render_state.is_some())
-        | (u32::from(delta.stages.is_some()) << 1)
-        | (u32::from(delta.attrs.is_some()) << 2)
-        | (u32::from(delta.vs.is_some()) << 3)
-        | (u32::from(delta.ps.is_some()) << 4)
-        | (u32::from(delta.variant.is_some()) << 5)
-        | (u32::from(delta.depth_stencil.is_some()) << 16);
-    for (index, value) in delta.bytes.iter().enumerate() {
-        mask |= u32::from(value.is_some()) << (index + 6);
-    }
-    capture_record(
-        writer,
-        SnapshotHeader {
-            changed: mask,
-            reserved: 0,
-        },
-    )?;
+    align_snapshot_leaf(writer)?;
+    let header_offset = writer.used;
+    writer.reserve_bytes(size_of::<SnapshotHeader>())?;
+    let mut changed = 0;
     if let Some(value) = delta.render_state {
         if value.reserved != 0 {
             return Err(WireError::InvalidValue);
@@ -233,6 +220,7 @@ fn write_snapshot_delta(
         let bytes =
             unsafe { core::slice::from_raw_parts(core::ptr::from_ref(value).cast::<u8>(), 60) };
         writer.bytes(bytes)?;
+        changed |= 1;
     }
     if let Some((mask, values)) = delta.stages {
         if mask.count_ones() as usize != values.len() {
@@ -255,6 +243,7 @@ fn write_snapshot_delta(
             )
         };
         writer.bytes(bytes)?;
+        changed |= 2;
     }
     if let Some(value) = &delta.attrs {
         if value.attrs.len() > 16 {
@@ -279,12 +268,15 @@ fn write_snapshot_delta(
             )
         };
         writer.bytes(bytes)?;
+        changed |= 4;
     }
     if let Some(value) = delta.vs {
         shader_record::write_vs(value, writer)?;
+        changed |= 8;
     }
     if let Some(value) = delta.ps {
         shader_record::write_ps(value, writer)?;
+        changed |= 16;
     }
     if let Some(value) = delta.variant {
         capture_record(
@@ -294,9 +286,13 @@ fn write_snapshot_delta(
                 reserved: [0; 2],
             },
         )?;
+        changed |= 32;
     }
-    for value in delta.bytes.iter().flatten() {
-        write_optional_bytes(*value, writer)?;
+    for (index, value) in delta.bytes.iter().enumerate() {
+        if let Some(value) = value {
+            write_optional_bytes(*value, writer)?;
+            changed |= 1 << (index + 6);
+        }
     }
     if let Some(value) = delta.depth_stencil {
         capture_record(
@@ -306,8 +302,15 @@ fn write_snapshot_delta(
                 reserved: 0,
             },
         )?;
+        changed |= 1 << 16;
     }
-    Ok(())
+    crate::encoder_records::write(
+        &mut writer.destination[header_offset..header_offset + size_of::<SnapshotHeader>()],
+        SnapshotHeader {
+            changed,
+            reserved: 0,
+        },
+    )
 }
 
 /// Keep canonical leaves aligned inside the reserved command payload.

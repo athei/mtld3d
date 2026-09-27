@@ -307,6 +307,27 @@ fn complete_snapshot_borrows_canonical_leaves_and_reconstructs_only_native_roots
         vs_draw_bytes: Some(uniform),
         depth_stencil: DepthStencilFlags::HAS_DEPTH,
     };
+    for bit in 0..17 {
+        let mut full = full_delta(&snapshot);
+        let mut delta = SnapshotDelta::default();
+        match bit {
+            0 => delta.render_state = full.render_state,
+            1 => delta.stages = full.stages,
+            2 => delta.attrs = full.attrs.take(),
+            3 => delta.vs = full.vs,
+            4 => delta.ps = full.ps,
+            5 => delta.variant = full.variant,
+            6..=15 => delta.bytes[bit - 6] = full.bytes[bit - 6],
+            16 => delta.depth_stencil = full.depth_stencil,
+            _ => unreachable!(),
+        }
+        let mut arena = ScratchArena::new();
+        let payload = encode_snapshot(&mut arena, &delta);
+        let header =
+            crate::encoder_records::borrow::<super::SnapshotHeader>(&payload[..8]).unwrap();
+        assert_eq!(header.changed, 1 << bit);
+        assert_eq!(header.reserved, 0);
+    }
     let mut first = ScratchArena::new();
     let payload = encode_snapshot(&mut first, &full_delta(&snapshot));
     assert!(payload.len() <= super::SNAPSHOT_DELTA_MAX_BYTES);
@@ -402,6 +423,90 @@ fn captured(bytes: &'static [u8]) -> ScratchSlice {
             u32::try_from(bytes.len()).unwrap(),
         )
     }
+}
+
+#[test]
+fn every_byte_binding_preserves_clear_empty_and_nonempty_values() {
+    for index in 0..10 {
+        for value in [None, Some(ScratchSlice::EMPTY), Some(captured(&[1, 2, 3]))] {
+            let mut delta = SnapshotDelta::default();
+            delta.bytes[index] = Some(value);
+            let mut arena = ScratchArena::new();
+            let payload = encode_snapshot(&mut arena, &delta);
+            assert_eq!(payload.len(), 24);
+            let header =
+                crate::encoder_records::borrow::<super::SnapshotHeader>(&payload[..8]).unwrap();
+            assert_eq!(header.changed, 1 << (index + 6));
+            assert_eq!(header.reserved, 0);
+            let binding =
+                crate::encoder_records::borrow::<super::ByteBindingRecord>(&payload[8..]).unwrap();
+            let expected = value.map_or((0, 0), |value| value.as_raw());
+            assert_eq!((binding.address, binding.length), expected);
+            assert_eq!(binding.present, u32::from(value.is_some()));
+        }
+    }
+}
+
+#[test]
+fn late_capture_failure_keeps_header_unpublished_and_previous_command_intact() {
+    use mtld3d_shared::{VertexAttrDesc, encoder_protocol::EncoderOpcode, mtl::VertexFormat};
+
+    let attributes: [VertexAttrDesc; 17] = std::array::from_fn(|_| VertexAttrDesc {
+        attr_index: 0,
+        buffer_index: 0,
+        format: VertexFormat::Float4,
+        offset: 0,
+    });
+    let delta = SnapshotDelta {
+        stages: Some((0, &[])),
+        attrs: Some(SnapshotAttributes {
+            attrs: &attributes,
+            extents: &[0; 16],
+            used_streams: 0,
+            vdecl_hash: 0,
+        }),
+        ..SnapshotDelta::default()
+    };
+    let mut arena = ScratchArena::with_chunk_size(128);
+    let opcode = u16::from(EncoderOpcode::SetSnapshot);
+    let first = arena
+        .write_command(opcode, 0, 8, |destination| {
+            DrawWriter::new().capture_snapshot(&SnapshotDelta::default(), destination)
+        })
+        .unwrap();
+    // SAFETY: the successful command initialized all 16 bytes retained by arena.
+    let committed = unsafe { *(first.address as *const [u8; 16]) };
+    let used = arena.bytes_used();
+    let mut writer = DrawWriter::new();
+    assert!(matches!(
+        arena.write_command(opcode, 0, 64, |destination| {
+            destination.fill(0xa5);
+            let result = writer.capture_snapshot(&delta, destination);
+            assert_eq!(result, Err(WireError::InvalidValue));
+            assert_eq!(&destination[..8], &[0xa5; 8]);
+            assert_eq!(&destination[8..16], &[0; 8]);
+            result
+        }),
+        Err(WireError::InvalidValue)
+    ));
+    assert_eq!(arena.bytes_used(), used);
+    assert!(matches!(
+        arena.write_command(opcode, 0, 8, |destination| {
+            writer.capture_snapshot(&SnapshotDelta::default(), destination)
+        }),
+        Err(WireError::InvalidValue)
+    ));
+    assert_eq!(arena.bytes_used(), used);
+    let next = arena
+        .write_command(opcode, 0, 8, |destination| {
+            DrawWriter::new().capture_snapshot(&SnapshotDelta::default(), destination)
+        })
+        .unwrap();
+    assert_eq!(next.address, first.address + 16);
+    assert_eq!(next.region_bytes, 32);
+    // SAFETY: subsequent reservations leave the first committed, retained command live.
+    let retained = unsafe { *(first.address as *const [u8; 16]) };
+    assert_eq!(retained, committed);
 }
 
 #[test]

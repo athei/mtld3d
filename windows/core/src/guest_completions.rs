@@ -74,14 +74,16 @@ impl CompletionPool {
         let token = u64::try_from(index).expect("slot index fits u64");
         let address = Arc::as_ptr(&block.queue) as u64;
         let cells = &block.cells[index % SLOTS_PER_BLOCK];
-        // SAFETY: a fresh slot or a recycled slot has no old publisher or consumer.
-        // Its block retains the queue until every slot handle is released.
-        unsafe { cells[0].reset_queued(if needs_acquire { address } else { 0 }, token * 2) };
+        if needs_acquire {
+            // SAFETY: a fresh or recycled slot has no old publisher or consumer.
+            // Its block retains the queue until every slot handle is released.
+            unsafe { cells[0].reset_queued(address, token * 2) };
+        } else {
+            // SAFETY: this exclusive, unexposed slot has no old publisher or consumer.
+            unsafe { cells[0].reset_completed() };
+        }
         // SAFETY: the same exclusive slot reservation retains the queue and final cell.
         unsafe { cells[1].reset_queued(address, token * 2 + 1) };
-        if !needs_acquire {
-            cells[0].publish();
-        }
         CompletionSlot { block, index }
     }
 

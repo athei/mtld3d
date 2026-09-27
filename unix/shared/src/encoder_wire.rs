@@ -582,6 +582,20 @@ impl LeaseCompletion {
         self.token.store(token, Ordering::Relaxed);
     }
 
+    /// Initialize an unused, unqueued cell as complete without publishing an event.
+    ///
+    /// This does not synchronize with an observer. The old next/token fields cannot
+    /// be consumed while unqueued and complete; `reset_queued` replaces them on reuse.
+    ///
+    /// # Safety
+    ///
+    /// Every previous publisher and consumer has finished, and no descriptor or
+    /// observer exposes this cell during this exclusive initialization.
+    pub unsafe fn reset_completed(&self) {
+        self.queue.store(0, Ordering::Relaxed);
+        self.complete.store(1, Ordering::Relaxed);
+    }
+
     pub fn publish(&self) {
         self.publish_state(1);
     }
