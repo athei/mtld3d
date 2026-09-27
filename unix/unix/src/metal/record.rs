@@ -139,7 +139,7 @@ impl DeviceRecord {
         unsafe { DeviceRecordHandle::new(raw) }
     }
 
-    /// Borrow the record a handle names, for the duration of one thunk.
+    /// Clone ownership of the record a handle names.
     ///
     /// `None` for the null handle, which is a device whose creation failed
     /// or one already destroyed; every caller warns once and returns.

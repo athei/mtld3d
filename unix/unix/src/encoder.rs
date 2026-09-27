@@ -54,10 +54,10 @@ use mtld3d_core::{
 };
 use mtld3d_shared::{
     BlitCommand, BlitCommandType, BufferCreateDesc, Command, CommandType, CopyBufferToBufferInfo,
-    CopyBufferToTextureInfo, CreateTextureSliceViewParams, CreateTexturesBatchParams,
-    DestroyResourcesBulkParams, EnsureBlitPipelineParams, EnsureClearQuadPipelineParams,
-    ExtraColorDesc, GetTaskFaultsParams, MetalHandle, PassDescriptor, SetPresentWaitPolicyParams,
-    SubmitFrameParams, TextureCreateDesc, WaitForGpuRetireParams, WaitForPresentIdleParams,
+    CopyBufferToTextureInfo, CreateTextureSliceViewParams, DestroyResourcesBulkParams,
+    EnsureBlitPipelineParams, EnsureClearQuadPipelineParams, ExtraColorDesc, GetTaskFaultsParams,
+    MetalHandle, PassDescriptor, SetPresentWaitPolicyParams, SubmitFrameParams, TextureCreateDesc,
+    WaitForGpuRetireParams, WaitForPresentIdleParams,
     encoder_protocol::EncoderSubmitMode,
     mtl::{
         BufferKind, ClearQuadFlags, CullMode, DestroyKind, LoadAction, PRESENT_PIPELINE_DEPTH,
@@ -849,12 +849,10 @@ pub struct FrameEncoder {
     // Persistent caches (survive across frames)
     device: Retained<ProtocolObject<dyn MTLDevice>>,
     device_handle: MetalHandle<MTLDeviceKind>,
-    /// The device's unix-side record, adopted from each frame alongside `device_handle`.
-    ///
-    /// Carried into `CreateTexturesBatch`: a creation-time clear has to be
-    /// encoded on the queue the frames run on to be ordered ahead of them,
-    /// and the record is what names that queue.
+    /// Device identity for synchronous control calls.
     record_handle: DeviceRecordHandle,
+    /// Keeps the frame queue alive for creation-time clears through encoder cleanup.
+    record: Option<Arc<crate::metal::DeviceRecord>>,
     depth_stencil_cache: FxHashMap<DepthStencilKey, MetalHandle<MTLDepthStencilStateKind>>,
     /// Every render pipeline build by key, failures included.
     ///
@@ -1498,6 +1496,9 @@ impl FrameEncoder {
             device,
             device_handle: context.device_handle,
             record_handle: context.record_handle,
+            // SAFETY: native destruction joins this worker before consuming the
+            // device record supplied at startup. A failed creation may be null.
+            record: unsafe { crate::metal::DeviceRecord::borrow(context.record_handle) },
             depth_stencil_cache: FxHashMap::default(),
             pipeline_cache: BuildIndex::default(),
             clear_quad_pipeline_cache: FxHashMap::default(),
@@ -1562,30 +1563,30 @@ impl FrameEncoder {
         self.current_snapshot
     }
 
-    /// Issue one batched `CreateTexturesBatch` thunk.
+    /// Create textures directly on the encoder's retained Metal device.
     ///
-    /// The descriptor and view slices outlive the synchronous thunk. Each
-    /// successful slot owns one retain per distinct handle; failed slots are empty.
+    /// Initialization and each encoder work item supply a bounded autorelease pool.
+    /// Each successful slot owns one retain per distinct handle; failed slots are empty.
     fn batch_create_textures(
         &self,
         descs: &[TextureCreateDesc],
         views_out: &mut [TextureViews],
     ) -> i32 {
-        debug_assert_eq!(descs.len(), views_out.len());
         if descs.is_empty() {
             return 0;
         }
-        let count =
-            u32::try_from(descs.len()).expect("batch_create_textures: descs.len() exceeds u32");
-        let mut params = CreateTexturesBatchParams {
-            device_handle: self.device_handle,
-            record_handle: self.record_handle,
-            count,
-            pad0: 0,
-            descs_ptr: descs.as_ptr() as u64,
-            views_out_ptr: views_out.as_mut_ptr() as u64,
+        let Some(record) = &self.record else {
+            mtld3d_shared::log_once_warn!(
+                target: LOG_TARGET,
+                "CreateTexturesBatch: no device record for handle {:#x}; the call is dropped",
+                self.record_handle,
+            );
+            return 0xC000_0001_u32.cast_signed();
         };
-        native_call(&mut params)
+        if crate::metal::create_textures(&self.device, record.queue(), descs, views_out) {
+            return 0;
+        }
+        0xC000_0001_u32.cast_signed()
     }
 
     /// Create buffers directly on the encoder's retained Metal device.
@@ -5586,11 +5587,8 @@ impl FrameEncoder {
 
     /// Look up or create an `MTLTexture` for the given texture ID (deferred creation).
     ///
-    /// Cache hit returns immediately; cache miss goes through a one-element
-    /// batched `CreateTexturesBatch` thunk — same wire path used by
-    /// `drain_texture_warmups` when the API thread queued the texture at
-    /// `CreateTexture` time.
-    /// Execute a retained texture record against the native cache.
+    /// Cache hits return immediately; cache misses use the same native batch
+    /// helper as texture warmups recorded at `CreateTexture` time.
     ///
     /// # Errors
     /// Rejects unknown format, creation, usage or channel values.

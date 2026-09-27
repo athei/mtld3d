@@ -57,6 +57,73 @@ const ALL: [PixelFormat; 34] = [
 ];
 
 #[test]
+fn batch_creation_keeps_views_and_ordered_clears_after_pool_drain() {
+    use mtld3d_shared::{
+        TextureCreateDesc,
+        mtl::{StorageMode, Swizzle, TextureCreateFlags, TextureUsage},
+        texture_views::TextureViews,
+    };
+    use objc2::rc::autoreleasepool;
+
+    use crate::metal::handle::IntoRetained;
+
+    autoreleasepool(|_| {
+        let device = MTLCreateSystemDefaultDevice().expect("Metal device for texture batch");
+        let queue = device.newCommandQueue().expect("texture batch queue");
+        // SAFETY: queue stays retained through creation and all ordered readbacks.
+        let queue_handle = unsafe { MetalHandle::new(Retained::as_ptr(&queue) as u64) };
+        let descriptors = [false, true].map(|cube| TextureCreateDesc {
+            tex_id: 1 + u64::from(cube),
+            width: 16,
+            height: 16,
+            depth: 1,
+            levels: 3,
+            pixel_format: PixelFormat::Bgra8Unorm,
+            storage_mode: StorageMode::Private,
+            flags: TextureCreateFlags::CLEAR_ON_CREATE
+                | if cube {
+                    TextureCreateFlags::TYPE_CUBE
+                } else {
+                    TextureCreateFlags::empty()
+                },
+            swizzle_r: Swizzle::Red,
+            swizzle_g: Swizzle::Green,
+            swizzle_b: Swizzle::Blue,
+            swizzle_a: Swizzle::Alpha,
+            usage_flags: TextureUsage::RENDER_TARGET,
+        });
+        let mut views = [TextureViews::EMPTY; 2];
+        assert!(autoreleasepool(|_| super::create_textures(
+            &device,
+            queue_handle,
+            &descriptors,
+            &mut views,
+        )));
+        for (index, view) in views.iter().enumerate() {
+            let texture = view
+                .linear
+                .into_retained()
+                .expect("batch texture survives pool");
+            assert_eq!(texture.mipmapLevelCount(), 3);
+            for slice in 0..if index == 0 { 1 } else { 6 } {
+                for level in 0..3 {
+                    assert_eq!(read_first_pixel(&queue, &texture, slice, level), [0; 4]);
+                }
+            }
+            for handle in view.owned_handles() {
+                super::destroy_texture(handle.raw());
+            }
+        }
+        assert!(super::create_textures(
+            &device,
+            MetalHandle::NULL,
+            &[],
+            &mut []
+        ));
+    });
+}
+
+#[test]
 fn creation_clear_writes_every_cube_face_and_mip() {
     check_color_clears(MTLTextureType::TypeCube, 3, 6);
 }

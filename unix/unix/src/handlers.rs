@@ -14,7 +14,7 @@ use mtld3d_shared::{
     SetGammaRampParams, SetPresentWaitPolicyParams, StartGpuCaptureParams, SubmitFrameParams,
     TextureCreateDesc, VertexAttrDesc, VertexBufferLayoutDesc, WaitForGpuRetireParams,
     WaitForPresentIdleParams, WriteLogParams, identity,
-    mtl::{CursorOverlayFlags, DestroyKind, QuadPipelineKind, TextureCreateFlags},
+    mtl::{CursorOverlayFlags, DestroyKind, QuadPipelineKind},
     mtl_handle::{MTLBufferKind, MTLTextureKind},
     record_handle::DeviceRecordHandle,
 };
@@ -1024,31 +1024,10 @@ pub extern "C" fn create_textures_batch_handler(args: *mut c_void) -> i32 {
             params.count as usize,
         )
     };
-    let mut any_failed = false;
-    // Collected rather than cleared per element, so the batch costs one
-    // command buffer instead of one each.
-    let mut clear_on_create: Vec<MetalHandle<MTLTextureKind>> = Vec::new();
-    for (desc, slot) in descs.iter().zip(views) {
-        if let Some(created) = metal::create_texture(&device, desc) {
-            *slot = created;
-            if desc.flags.contains(TextureCreateFlags::CLEAR_ON_CREATE) {
-                clear_on_create.push(slot.linear);
-            }
-        } else {
-            *slot = mtld3d_shared::texture_views::TextureViews::EMPTY;
-            any_failed = true;
-            error!(
-                target: LOG_TARGET,
-                "failed to create texture tex_id={:#x}",
-                desc.tex_id
-            );
-        }
-    }
-    metal::clear_new_color_textures(record.queue(), &clear_on_create, metal::TRANSPARENT_BLACK);
-    if any_failed {
-        STATUS_UNSUCCESSFUL
-    } else {
+    if metal::create_textures(&device, record.queue(), descs, views) {
         STATUS_SUCCESS
+    } else {
+        STATUS_UNSUCCESSFUL
     }
 }
 

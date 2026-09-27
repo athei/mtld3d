@@ -677,6 +677,45 @@ pub const fn mtl_blend_factor(wire: WireBlendFactor) -> MTLBlendFactor {
     }
 }
 
+/// Create texture views, keeping successful slots when another creation fails.
+///
+/// The caller supplies an autorelease pool. Each distinct returned handle owns
+/// one retain. Creation-time clears share one command buffer on the frame queue.
+/// Returns whether every creation succeeded.
+///
+/// # Panics
+/// Panics when the descriptor and output counts differ.
+pub fn create_textures(
+    device: &ProtocolObject<dyn MTLDevice>,
+    queue: MetalHandle<MTLCommandQueueKind>,
+    descs: &[TextureCreateDesc],
+    views: &mut [TextureViews],
+) -> bool {
+    assert_eq!(descs.len(), views.len());
+    let mut any_failed = false;
+    // Collected rather than cleared per element, so the batch costs one
+    // command buffer instead of one each.
+    let mut clear_on_create: Vec<MetalHandle<MTLTextureKind>> = Vec::new();
+    for (desc, slot) in descs.iter().zip(views) {
+        if let Some(created) = create_texture(device, desc) {
+            *slot = created;
+            if desc.flags.contains(TextureCreateFlags::CLEAR_ON_CREATE) {
+                clear_on_create.push(slot.linear);
+            }
+        } else {
+            *slot = TextureViews::EMPTY;
+            any_failed = true;
+            log::error!(
+                target: crate::LOG_TARGET,
+                "failed to create texture tex_id={:#x}",
+                desc.tex_id
+            );
+        }
+    }
+    clear_new_color_textures(queue, &clear_on_create, TRANSPARENT_BLACK);
+    !any_failed
+}
+
 /// Creates a texture for sampling.
 ///
 /// Pixel format and swizzle are Metal-level values (already translated from
