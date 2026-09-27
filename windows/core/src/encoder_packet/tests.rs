@@ -729,6 +729,8 @@ fn retired_buffer_outlives_replay_and_recording_storage_reuse() {
             last_submit_seq: 42,
         },
     );
+    let allocation = recorder.owned_pages.as_ptr();
+    let capacity = recorder.owned_pages.capacity();
     let mut owner = seal(frame, recorder);
     let mut packet = admit(&mut owner);
     let mut native = None;
@@ -752,7 +754,10 @@ fn retired_buffer_outlives_replay_and_recording_storage_reuse() {
     );
     let mut leases: Vec<_> = owner.take_leases().collect();
     assert_eq!(leases.len(), 1);
-    assert!(owner.take_recording_storage().is_some());
+    let (_, recorder) = owner.take_recording_storage().expect("completed recording");
+    assert!(recorder.owned_pages.is_empty());
+    assert_eq!(recorder.owned_pages.capacity(), capacity);
+    assert_eq!(recorder.owned_pages.as_ptr(), allocation);
     assert!(owner.maintain());
     drop(owner);
     assert!(pool.acquire(12).is_none());
@@ -776,6 +781,29 @@ fn retired_buffer_outlives_replay_and_recording_storage_reuse() {
         pool.acquire(12).expect("retired original pages").as_ptr(),
         address
     );
+}
+
+#[test]
+fn recording_storage_reuse_keeps_untransferred_owners_on_packet() {
+    let (mut owner, weak) = packet_with_leases();
+    let cells = owner.recorder.as_ref().unwrap().completion_pool.clone();
+    let allocation = owner.owned_pages.as_ptr();
+    // SAFETY: this fixture was never admitted and none of its owners has native users.
+    unsafe { owner.cancel_unadopted() };
+    let (_, recorder) = owner.take_recording_storage().expect("cancelled recording");
+    assert!(recorder.owned_pages.is_empty());
+    assert_eq!(recorder.owned_pages.capacity(), 0);
+    assert_eq!(owner.owned_pages.len(), 2);
+    assert_eq!(owner.owned_pages.as_ptr(), allocation);
+    assert!(!owner.maintain(), "notifications still require consumption");
+    assert!(weak.upgrade().is_some());
+    cells.drain(
+        &mut crate::guest_completions::CompletionDrain::default(),
+        16,
+        |_| {},
+    );
+    assert!(owner.maintain());
+    assert!(weak.upgrade().is_none());
 }
 
 #[test]
@@ -805,6 +833,7 @@ fn failed_recording_retirement_waits_for_explicit_quiescence() {
     let Err((_, mut owner)) = FramePacket::new(frame) else {
         panic!("sticky recording failure")
     };
+    assert!(owner.take_recording_storage().is_none());
     assert!(!owner.maintain());
     assert_eq!(owner.take_leases().count(), 0);
     assert!(pool.acquire(12).is_none());

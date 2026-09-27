@@ -262,6 +262,11 @@ impl FramePacket {
         let mut frame = self.frame.take()?;
         let mut recorder = self.recorder.take()?;
         recorder.reset();
+        // Replay completion lets owners move to the registry before storage recovery.
+        // Reuse only the empty allocation, never a lease still owned by this packet.
+        if self.owned_pages.is_empty() {
+            recorder.owned_pages = core::mem::take(&mut self.owned_pages);
+        }
         recorder.metadata = core::mem::take(&mut self.metadata);
         recorder.metadata.clear();
         Some((frame.take_recording_scratch(), recorder))
