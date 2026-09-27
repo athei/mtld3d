@@ -1840,6 +1840,12 @@ impl DeviceInner {
     }
 
     pub fn encoder_status(&self) -> Result<(), i32> {
+        self.recording_status()?;
+        self.encoder.status()
+    }
+
+    /// Report capture failures without polling workers again within the same draw.
+    fn recording_status(&self) -> Result<(), i32> {
         if let Some(error) = self.current_frame.recording_error() {
             let status = match error {
                 mtld3d_shared::encoder_wire::WireError::AllocationFailed => {
@@ -1849,7 +1855,7 @@ impl DeviceInner {
             };
             return Err(self.encoder.record_failure(status));
         }
-        self.encoder.status()
+        Ok(())
     }
 
     pub fn try_push_control<T: mtld3d_core::encoder_packet::CaptureControl>(
@@ -10103,7 +10109,7 @@ extern "system" fn device_draw_primitive(
         },
     });
     obj.inner()
-        .encoder_status()
+        .recording_status()
         .map_or_else(|hr| hr, |()| D3D_OK)
 }
 
@@ -10175,7 +10181,7 @@ fn draw_bound_triangle_fan(
         index_source,
     });
     obj.inner()
-        .encoder_status()
+        .recording_status()
         .map_or_else(|hr| hr, |()| D3D_OK)
 }
 
@@ -10366,7 +10372,7 @@ extern "system" fn device_draw_indexed_primitive(
         // render, so skip the draw and report success.
         return obj
             .inner()
-            .encoder_status()
+            .recording_status()
             .map_or_else(|hr| hr, |()| D3D_OK);
     };
     let Some(index_source) =
@@ -10388,7 +10394,7 @@ extern "system" fn device_draw_indexed_primitive(
         index_source,
     });
     obj.inner()
-        .encoder_status()
+        .recording_status()
         .map_or_else(|hr| hr, |()| D3D_OK)
 }
 

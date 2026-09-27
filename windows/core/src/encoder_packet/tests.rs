@@ -318,6 +318,80 @@ fn invalid_constant_capture_latches_error_without_publishing_a_command() {
 }
 
 #[test]
+fn capture_failure_survives_later_snapshot_draw_and_owned_control() {
+    use crate::draw_data::{DrawOp, ExtraStreams, IndexSource, StreamBinding, VertexSource};
+
+    for first_error in [WireError::AllocationFailed, WireError::InvalidValue] {
+        let mut recorder = FrameRecorder::new();
+        let mut scratch = ScratchArena::new();
+        recorder
+            .record_constant_bytes(&mut scratch, EncoderOpcode::SetPsConstRange, 0, 1, &[0; 16])
+            .unwrap();
+        let committed_bytes = scratch.bytes_used();
+        // Model an allocator or capture failure at the recorder's existing completion point.
+        assert_eq!(recorder.finish_record(Err(first_error)), Err(first_error));
+        assert_eq!(
+            recorder.record_snapshot_delta(
+                &mut scratch,
+                &crate::encoder_draw::SnapshotDelta::default()
+            ),
+            Err(first_error)
+        );
+        let draw = DrawOp {
+            metal_prim: mtld3d_shared::mtl::PrimitiveType::Triangle,
+            vertex_source: VertexSource::Bound {
+                first: StreamBinding {
+                    stream: 0,
+                    buffer_id: BufferId::new_unique(),
+                    backing_ptr: 0,
+                    backing_len: 4096,
+                    backing_generation: 1,
+                    offset: 0,
+                    stride: 16,
+                    freq: 1,
+                },
+                extra: ExtraStreams::EMPTY,
+                stream0_freq: 1,
+            },
+            index_source: IndexSource::None {
+                start_vertex: 0,
+                vertex_count: 3,
+            },
+        };
+        assert_eq!(recorder.record_draw(&mut scratch, &draw), Err(first_error));
+        // A later invalid input must not replace an earlier allocation failure.
+        assert_eq!(
+            recorder.record_constant_bytes(
+                &mut scratch,
+                EncoderOpcode::SetVsConstRange,
+                255,
+                2,
+                &[0; 32]
+            ),
+            Err(first_error)
+        );
+        let query = VisibilityQueryCore::new();
+        let weak = Arc::downgrade(&query);
+        assert_eq!(
+            recorder.record_typed(
+                &mut scratch,
+                BeginVisibilityOp {
+                    generation: 1,
+                    c: query
+                }
+            ),
+            Err(first_error)
+        );
+        assert_eq!(recorder.recording_error(), Some(first_error));
+        assert_eq!(recorder.count, 1);
+        assert_eq!(scratch.bytes_used(), committed_bytes);
+        assert!(weak.upgrade().is_some());
+        drop(recorder);
+        assert!(weak.upgrade().is_none());
+    }
+}
+
+#[test]
 fn canceled_packet_returns_completion_slots_to_its_pool() {
     let (mut packet, query) = packet_with_leases();
     let pool = packet
