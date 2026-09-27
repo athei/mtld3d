@@ -440,3 +440,85 @@ fn a_selection_notes_each_unmatched_filter_once_and_needs_something_to_compare()
         Ok(Vec::new())
     );
 }
+
+#[test]
+fn benchmark_children_override_hostile_inherited_logging() {
+    for (pe, unix) in [
+        (Some("warn"), Some("off")),
+        (Some("off"), Some("mtld3d::perf=off")),
+        (None, Some("off")),
+        (Some("mtld3d=off"), None),
+    ] {
+        let mut child = Command::new(std::env::current_exe().expect("test executable"));
+        child.args([
+            "--exact",
+            "bench::ab::tests::benchmark_log_environment_fixture",
+            "--ignored",
+            "--nocapture",
+        ]);
+        for (key, value) in [("RUST_LOG", pe), ("__CX_UNIX_RUST_LOG", unix)] {
+            if let Some(value) = value {
+                child.env(key, value);
+            } else {
+                child.env_remove(key);
+            }
+        }
+        let result = child.output().expect("run fixture with inherited filters");
+        assert!(
+            result.status.success(),
+            "{pe:?}/{unix:?}: {}{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+}
+
+/// A separate test process owns the hostile environment, so parallel tests cannot race it.
+#[test]
+#[ignore = "spawned with inherited filters by the parent regression test"]
+fn benchmark_log_environment_fixture() {
+    let common = Command::new("git")
+        .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .expect("resolve primary checkout");
+    assert!(common.status.success());
+    let common = PathBuf::from(String::from_utf8(common.stdout).unwrap().trim());
+    let dir = common
+        .parent()
+        .expect("git directory parent")
+        .join(".codex/evidence/benchmark-log-environment/tests")
+        .join(std::process::id().to_string());
+    fs::create_dir_all(&dir).unwrap();
+    let script = dir.join("logging.sh");
+    fs::write(
+        &script,
+        "printf '%s|%s: test\n' \"${RUST_LOG-unset}\" \"${__CX_UNIX_RUST_LOG-unset}\"\n",
+    )
+    .unwrap();
+    let expected_inherited = format!(
+        "{}|{}",
+        std::env::var("RUST_LOG").unwrap_or_else(|_| "unset".to_owned()),
+        std::env::var("__CX_UNIX_RUST_LOG").unwrap_or_else(|_| "unset".to_owned())
+    );
+    let timeout = Duration::from_secs(5);
+    let mut ordinary = WineLauncher::new(
+        Path::new("/bin/sh"),
+        &script,
+        Some(&dir),
+        timeout,
+        Box::new(|_| {}),
+    )
+    .unwrap();
+    assert_eq!(ordinary.list().unwrap(), [expected_inherited]);
+    for name in ["base", "cand"] {
+        let mut leg = spec(name);
+        leg.wine = PathBuf::from("/bin/sh");
+        leg.prefix = dir.join(name);
+        for filter in ["info", SHAPE_RUST_LOG] {
+            let mut launcher = leg_launcher(&leg, &script, Some(&dir), timeout, filter).unwrap();
+            assert_eq!(launcher.list().unwrap(), [format!("{filter}|{filter}")]);
+        }
+    }
+    fs::remove_dir_all(dir).unwrap();
+}

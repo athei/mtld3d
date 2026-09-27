@@ -445,7 +445,7 @@ fn select_benches(config: &AbConfig) -> Result<Vec<Bench>, String> {
     let mut found: Vec<Bench> = Vec::new();
     for exe in &config.exes {
         let binary = binary_name(exe);
-        let mut launcher = leg_launcher(&config.cand, exe, None, config.timeout)?;
+        let mut launcher = leg_launcher(&config.cand, exe, None, config.timeout, "info")?;
         for name in launcher.list()? {
             let id = test_id(&binary, &name);
             if selected(&id, &config.benches) {
@@ -509,17 +509,24 @@ pub fn names_host(pattern: &str) -> bool {
     !pattern.is_empty() && HOST_ID.contains(pattern)
 }
 
-/// A launcher for `exe` under `spec`'s Wine and prefix, running the `#[ignore]`d tests.
+/// A benchmark launcher with the same explicit log filter on both sides of Wine.
+///
+/// Timed runs need INFO identity and perf records even if the caller disabled
+/// logging. Shape runs supply their trace filter instead. Set the Unix-side
+/// override too, so an inherited Wine setting cannot suppress either account.
 fn leg_launcher(
     spec: &LegSpec,
     exe: &Path,
     log_dir: Option<&Path>,
     timeout: Duration,
+    log_filter: &str,
 ) -> Result<WineLauncher, String> {
     Ok(
         WineLauncher::new(&spec.wine, exe, log_dir, timeout, Box::new(|_| {}))?
             .ignored_only(true)
-            .with_env("WINEPREFIX", &spec.prefix.to_string_lossy()),
+            .with_env("WINEPREFIX", &spec.prefix.to_string_lossy())
+            .with_env("RUST_LOG", log_filter)
+            .with_env("__CX_UNIX_RUST_LOG", log_filter),
     )
 }
 
@@ -562,7 +569,7 @@ fn run_round(
         link_corpus(corpus, dir)?;
     }
     let before = metrics_files(dir)?;
-    let mut launcher = leg_launcher(spec, &first.exe, Some(dir), config.timeout)?
+    let mut launcher = leg_launcher(spec, &first.exe, Some(dir), config.timeout, "info")?
         .with_env("MTLD3D_CONFIG", &run_config(&config.config, spec, dir));
     let names: Vec<String> = benches.iter().map(|bench| bench.name.clone()).collect();
     let mut outcome = Outcome::default();
@@ -695,9 +702,8 @@ fn run_shape(
         text
     });
     fs::write(&names, text).map_err(|e| format!("{}: {e}", names.display()))?;
-    let mut launcher = leg_launcher(spec, &bench.exe, Some(dir), config.timeout)?
-        .with_env("MTLD3D_CONFIG", &run_config(&config.config, spec, dir))
-        .with_env("RUST_LOG", SHAPE_RUST_LOG);
+    let mut launcher = leg_launcher(spec, &bench.exe, Some(dir), config.timeout, SHAPE_RUST_LOG)?
+        .with_env("MTLD3D_CONFIG", &run_config(&config.config, spec, dir));
     let mut watch = shape::Watch::default();
     let end = launcher.run_until(&bench.name, &mut |log, stdout| watch.look(log, stdout))?;
     let what = format!("the shape run of {} under {}", bench.id, dir.display());

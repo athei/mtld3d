@@ -199,6 +199,12 @@ choice explicit when a test needs the non-client frame.
 
 ## Benchmarks
 
+The benchmark launchers set `RUST_LOG=info` and `__CX_UNIX_RUST_LOG=info`
+for timed Wine processes, independent of the shell's filters: startup identity
+and perf records are required inputs, even when no warning occurs. Untimed
+shape processes set both variables to the pass-trace filter described below.
+Ordinary test runs keep the caller's logging settings.
+
 The synthetic benchmarks are `#[ignore]`d tests of the end-to-end binary, so
 `make test` lists them as ignored and never runs them. `make bench` runs them
 once against this checkout and writes a report per benchmark. `make bench-ab

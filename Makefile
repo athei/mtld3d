@@ -1114,6 +1114,7 @@ bench: install-windows-$(ARCH) install-unix-$(SDK_UNIX_ARCH)
 	$(call bench_stage_corpus,$(BENCH_DIR))
 	$(BENCH_SUITE_ASSIGN); \
 	cd $(E2E_RUNNER_DIR) && MTLD3D_CONFIG='$(MTLD3D_CONF_BENCH)' WINEDEBUG= MTL_DEBUG_LAYER=0 MTL_HUD_ENABLED=0 \
+		RUST_LOG=info __CX_UNIX_RUST_LOG=info \
 		$(E2E_RUNNER) --wine $(WINE) --jobs 1 --timeout $(BENCH_TIMEOUT) --ignored \
 		$(if $(FILTER),--filter '$(FILTER)') --log-dir '$(BENCH_DIR)' -- $$suite
 	if ls '$(BENCH_DIR)'/bench-*.txt >/dev/null 2>&1; then cat '$(BENCH_DIR)'/bench-*.txt; \
