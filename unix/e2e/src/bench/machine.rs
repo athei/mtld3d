@@ -31,6 +31,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+mod idle;
+
 /// How many of the busiest foreign processes a sample keeps.
 pub const TOP: usize = 3;
 
@@ -84,6 +86,8 @@ const FOREIGN: &str = "foreign";
 
 /// The longest command line a sample keeps, in characters.
 const COMMAND_CHARS: usize = 200;
+
+pub use idle::keep_when_ready;
 
 /// One process from a sample.
 #[derive(Debug, PartialEq)]
@@ -206,14 +210,28 @@ pub struct Classified {
 /// rather than an error: the numbers the run measures do not depend on it.
 #[must_use]
 pub fn sample(legs: &[PathBuf]) -> Sample {
+    let listing =
+        measured_listing().unwrap_or_else(|| ps(&["-A", "-r", "-o", "pcpu=,pid=,ppid=,comm="]));
+    sample_listing(legs, &listing)
+}
+
+/// A measured sample for an idle gate, unavailable if CPU timing cannot be validated.
+///
+/// Unlike [`sample`], this never falls back to the decaying `%cpu` value or
+/// treats a failed process listing as an idle machine.
+fn measured_sample(legs: &[PathBuf]) -> Option<Sample> {
+    let listing = measured_listing()?;
+    Some(sample_listing(legs, &listing))
+}
+
+/// Classify a CPU listing and attach the current load and full command lines.
+fn sample_listing(legs: &[PathBuf], listing: &str) -> Sample {
     let mut averages = [0.0f64; 3];
     // SAFETY: `averages` has room for the three averages asked for, and
     // getloadavg writes at most that many.
     let read = unsafe { libc::getloadavg(averages.as_mut_ptr(), 3) };
     let load1 = (read >= 1).then_some(averages[0]);
-    let listing =
-        measured_listing().unwrap_or_else(|| ps(&["-A", "-r", "-o", "pcpu=,pid=,ppid=,comm="]));
-    let mut classified = classify(&listing, std::process::id(), legs, |pid| {
+    let mut classified = classify(listing, std::process::id(), legs, |pid| {
         image_origin(pid, legs)
     });
     for process in &mut classified.top {
@@ -440,10 +458,11 @@ fn image_origin(pid: u32, legs: &[PathBuf]) -> Option<bool> {
 /// Two reads of the CPU time each process has used rather than `ps`'s own
 /// `%cpu`, a decaying average of the last minute that still holds a load
 /// that has gone ([`shares`]); the share divides by the time measured
-/// between the reads returning. `None` when either read gives nothing, so
-/// the caller falls back to `%cpu` instead of reading a quiet machine.
+/// between the reads returning. Both reads must succeed and contain the
+/// sampler itself, with nondecreasing CPU time. The kernel process is
+/// optional because macOS does not always expose it to `ps`.
 fn measured_listing() -> Option<String> {
-    let before: BTreeMap<u32, f64> = ps(&["-A", "-o", "pid=,cputime="])
+    let before: BTreeMap<u32, f64> = checked_ps(&["-A", "-o", "pid=,cputime="])?
         .lines()
         .filter_map(|line| {
             let (pid, time) = line.trim_start().split_once(char::is_whitespace)?;
@@ -451,16 +470,28 @@ fn measured_listing() -> Option<String> {
         })
         .collect();
     let first = Instant::now();
-    if before.is_empty() {
+    if !before.contains_key(&std::process::id()) {
         return None;
     }
     thread::sleep(INTERVAL);
-    let after = cputime_rows(&ps(&["-A", "-o", "pid=,ppid=,cputime=,comm="]));
+    let after = cputime_rows(&checked_ps(&["-A", "-o", "pid=,ppid=,cputime=,comm="])?);
     let elapsed = first.elapsed();
-    if after.is_empty() {
+    validated_shares(&before, &after, elapsed, std::process::id())
+}
+
+/// Reject missing or inconsistent snapshots instead of calling their empty difference quiet.
+fn validated_shares(
+    before: &BTreeMap<u32, f64>,
+    after: &[CpuTime],
+    elapsed: Duration,
+    own: u32,
+) -> Option<String> {
+    let first = before.get(&own)?;
+    let last = after.iter().find(|row| row.pid == own)?;
+    if last.seconds < *first || elapsed.is_zero() {
         return None;
     }
-    Some(shares(&before, &after, elapsed))
+    Some(shares(before, after, elapsed))
 }
 
 /// One process of the second CPU-time read: its pid, its parent's, its CPU seconds, its command.
@@ -531,7 +562,21 @@ fn cpu_seconds(time: &str) -> Option<f64> {
         seconds = part.parse::<f64>().ok()?.mul_add(scale, seconds);
         scale *= 60.0;
     }
-    Some(seconds)
+    (seconds.is_finite() && seconds >= 0.0).then_some(seconds)
+}
+
+/// What a successful `ps` prints, unavailable on execution or exit failure.
+fn checked_ps(args: &[&str]) -> Option<String> {
+    let output = Command::new("ps")
+        .args(args)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 /// What `ps` prints with `args`, empty when it cannot run.

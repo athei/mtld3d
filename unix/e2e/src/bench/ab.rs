@@ -93,6 +93,8 @@ pub struct LegSpec {
     pub prefix: PathBuf,
     /// The `meta layer` value every metrics file of the leg must carry.
     pub stamp: String,
+    /// Replace the shared `--config` for this leg when supplied, including an empty value.
+    pub config: Option<String>,
 }
 
 /// A parsed `bench-ab` invocation.
@@ -108,10 +110,12 @@ pub struct AbConfig {
     pub runs: u32,
     /// The A/B directory the runs write into.
     pub out: PathBuf,
-    /// The `MTLD3D_CONFIG` of every run, before the run's own `log.dir`.
+    /// The default `MTLD3D_CONFIG`, used when a leg has no override, before its `log.dir`.
     pub config: String,
     /// How long a run may go without a line before it counts as hung.
     pub timeout: Duration,
+    /// Maximum wait for three quiet machine samples before each timed process; zero disables it.
+    pub wait_idle: Duration,
     pub options: Options,
     /// Where the report is written besides stdout.
     pub report: Option<PathBuf>,
@@ -238,10 +242,11 @@ pub fn run(config: &AbConfig) -> Result<ExitCode, String> {
             Step::Round { group, round, leg } => {
                 let members: Vec<&Bench> = groups[group].iter().map(|&at| &benches[at]).collect();
                 let dir = out.join(leg.dir()).join(round.to_string());
-                machine::keep(
+                machine::keep_when_ready(
                     &dir,
                     &binary_name(&members[0].exe),
-                    &machine::sample(&wines),
+                    &wines,
+                    config.wait_idle,
                 )?;
                 for (member, path, file) in run_round(config, spec, &members, &dir)? {
                     let at = groups[group][member];
@@ -299,7 +304,7 @@ pub fn run(config: &AbConfig) -> Result<ExitCode, String> {
                     Leg::Cand => &host.cand,
                 };
                 let dir = out.join(leg.dir()).join(round.to_string());
-                machine::keep(&dir, "host", &machine::sample(&wines))?;
+                machine::keep_when_ready(&dir, "host", &wines, config.wait_idle)?;
                 for (path, file) in &run_host(exe, &host.corpora, &dir, config.timeout)? {
                     check_stamp(path, file, spec)?;
                     println!(
@@ -518,12 +523,13 @@ fn leg_launcher(
     )
 }
 
-/// The `MTLD3D_CONFIG` of a run writing into `dir`: the base config, then its `log.dir`.
+/// The `MTLD3D_CONFIG` of a run: the leg override or shared config, then its `log.dir`.
 ///
 /// The layer reads the path on the PE side, where the unix root is drive
 /// `Z:`. It comes last so that it wins over any `log.dir` in the base.
 #[must_use]
-pub fn run_config(base: &str, dir: &Path) -> String {
+pub fn run_config(shared: &str, leg: &LegSpec, dir: &Path) -> String {
+    let base = leg.config.as_deref().unwrap_or(shared);
     let log_dir = format!("log.dir=Z:{}", dir.display());
     if base.is_empty() {
         log_dir
@@ -557,7 +563,7 @@ fn run_round(
     }
     let before = metrics_files(dir)?;
     let mut launcher = leg_launcher(spec, &first.exe, Some(dir), config.timeout)?
-        .with_env("MTLD3D_CONFIG", &run_config(&config.config, dir));
+        .with_env("MTLD3D_CONFIG", &run_config(&config.config, spec, dir));
     let names: Vec<String> = benches.iter().map(|bench| bench.name.clone()).collect();
     let mut outcome = Outcome::default();
     let run = attribute::run_binary(&mut launcher, Some(names), 1, true, &mut outcome)?;
@@ -690,7 +696,7 @@ fn run_shape(
     });
     fs::write(&names, text).map_err(|e| format!("{}: {e}", names.display()))?;
     let mut launcher = leg_launcher(spec, &bench.exe, Some(dir), config.timeout)?
-        .with_env("MTLD3D_CONFIG", &run_config(&config.config, dir))
+        .with_env("MTLD3D_CONFIG", &run_config(&config.config, spec, dir))
         .with_env("RUST_LOG", SHAPE_RUST_LOG);
     let mut watch = shape::Watch::default();
     let end = launcher.run_until(&bench.name, &mut |log, stdout| watch.look(log, stdout))?;

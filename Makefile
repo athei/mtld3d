@@ -1196,6 +1196,9 @@ bench: install-windows-$(ARCH) install-unix-$(SDK_UNIX_ARCH)
 # Nothing else may run on the machine meanwhile, tests, builds and games
 # included: the verdicts are only as good as the quiet of the machine.
 RUNS ?= 5
+# Optional seconds to wait for three quiet machine samples before every timed
+# process. Zero keeps advisory sampling; a timeout ends the run without a verdict.
+BENCH_WAIT_IDLE ?= 0
 BENCH_SET ?= wow
 BENCH_SET_wow := wow_112_busy_frame wow_335a_busy_frame query_poll_wow query_poll_spec api_call_cost \
 	dynamic_buffer_churn texture_streaming
@@ -1300,6 +1303,7 @@ bench-ab:
 	$(BENCH_SUITE_ASSIGN); \
 	cd $(E2E_RUNNER_DIR) && WINEDEBUG= MTL_DEBUG_LAYER=0 MTL_HUD_ENABLED=0 \
 		$(E2E_RUNNER) bench-ab --out '$(BENCH_AB_OUT)' --runs $(RUNS) --timeout $(BENCH_TIMEOUT) \
+		--wait-idle $(BENCH_WAIT_IDLE) \
 		--base-wine '$(BENCH_BASE_ISO)/sdk/bin/wine' \
 		--base-prefix '$(BENCH_BASE_ISO)/prefix' --base-stamp '$(BENCH_BASE_STAMP)' \
 		--cand-wine '$(ISOLATED_ROOT)/sdk/bin/wine' \

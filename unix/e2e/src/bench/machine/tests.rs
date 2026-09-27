@@ -180,3 +180,49 @@ fn shares_divide_the_time_used_by_the_time_measured() {
         1
     );
 }
+
+#[test]
+fn measured_snapshots_are_valid_without_a_visible_kernel_process() {
+    let before = BTreeMap::from([(42, 1.0), (1, 2.0)]);
+    let after = cputime_rows("42 1 0:01.00 runner\n1 0 0:02.01 launchd\n");
+    let listing = validated_shares(&before, &after, INTERVAL, 42).unwrap();
+    let result = classify(&listing, 42, &[], |_| None);
+    assert_eq!(result.kernel_task, None);
+    assert!((result.foreign - 2.0).abs() < f64::EPSILON);
+}
+
+#[test]
+fn measured_snapshots_require_a_stable_sampler_in_both_reads() {
+    let before = BTreeMap::from([(42, 1.0)]);
+    let valid = cputime_rows("42 1 0:01.00 runner\n");
+    assert!(validated_shares(&BTreeMap::new(), &valid, INTERVAL, 42).is_none());
+    assert!(validated_shares(&before, &[], INTERVAL, 42).is_none());
+    let missing = cputime_rows("1 0 0:02.00 launchd\n");
+    assert!(validated_shares(&before, &missing, INTERVAL, 42).is_none());
+    let backwards = cputime_rows("42 1 0:00.50 runner\n");
+    assert!(validated_shares(&before, &backwards, INTERVAL, 42).is_none());
+    assert!(validated_shares(&before, &valid, Duration::ZERO, 42).is_none());
+    for invalid in ["NaN", "inf", "-1:00"] {
+        assert!(cpu_seconds(invalid).is_none());
+    }
+}
+
+#[test]
+fn failed_process_listing_is_unavailable() {
+    assert!(checked_ps(&["--invalid-benchmark-sampling-option"]).is_none());
+}
+
+/// Run explicitly to verify the host's real process listings, without a benchmark or GPU work.
+#[test]
+#[ignore = "samples the live host; run separately from timed workloads"]
+fn strict_sampler_live_smoke() {
+    for number in 1..=3 {
+        let sample = measured_sample(&[]).expect("valid measured process snapshots");
+        println!(
+            "sample {number}\n{}kernel_visible {}\nbusy {:?}",
+            sample.text(),
+            sample.kernel_task.is_some(),
+            sample.busy()
+        );
+    }
+}

@@ -857,7 +857,7 @@ fn a_clean_a_a_run_may_load_one_image_in_both_legs() {
         comparison
             .notes
             .iter()
-            .any(|note| note == "legs loaded identical binaries (A/A)"),
+            .any(|note| note == "legs loaded identical binaries"),
         "{:?}",
         comparison.notes
     );

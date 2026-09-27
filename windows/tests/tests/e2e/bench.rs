@@ -290,6 +290,8 @@ impl TscClock {
 /// Read with [`TscClock`], which the benchmark calibrated before it started this.
 pub struct FrameClock {
     last: u64,
+    /// Sum of the recorded frame intervals, so the stopping check is constant time.
+    elapsed: Duration,
     times: Vec<Duration>,
     work: Vec<Duration>,
 }
@@ -299,6 +301,7 @@ impl FrameClock {
     pub fn start(capacity: usize) -> Self {
         Self {
             last: TscClock::now(),
+            elapsed: Duration::ZERO,
             times: Vec::with_capacity(capacity),
             work: Vec::with_capacity(capacity),
         }
@@ -312,10 +315,16 @@ impl FrameClock {
         let called = TscClock::now();
         ok(h.present(), "Present");
         let now = TscClock::now();
+        self.record_present(called, now);
+    }
+
+    /// Record the timestamps around a completed Present without reading another clock.
+    pub(super) fn record_present(&mut self, called: u64, now: u64) {
         self.work
             .push(TscClock::duration(called.saturating_sub(self.last)));
-        self.times
-            .push(TscClock::duration(now.saturating_sub(self.last)));
+        let frame = TscClock::duration(now.saturating_sub(self.last));
+        self.times.push(frame);
+        self.elapsed += frame;
         self.last = now;
     }
 
@@ -325,8 +334,8 @@ impl FrameClock {
     }
 
     /// Wall time the timed frames add up to.
-    pub fn elapsed(&self) -> Duration {
-        self.times.iter().sum()
+    pub const fn elapsed(&self) -> Duration {
+        self.elapsed
     }
 
     /// Mean, median, 99th percentile and worst frame of the timed frames.

@@ -7,6 +7,7 @@ fn spec(stamp: &str) -> LegSpec {
         wine: PathBuf::from("/wine"),
         prefix: PathBuf::from("/prefix"),
         stamp: stamp.to_owned(),
+        config: None,
     }
 }
 
@@ -140,10 +141,32 @@ fn each_file_goes_to_the_benchmark_it_names() {
 fn the_run_directory_is_appended_as_the_last_log_dir() {
     let dir = Path::new("/ab/base/0");
     assert_eq!(
-        run_config("shaderCache.enable=false;log.dir=Z:/elsewhere", dir),
+        run_config(
+            "shaderCache.enable=false;log.dir=Z:/elsewhere",
+            &spec("v1"),
+            dir
+        ),
         "shaderCache.enable=false;log.dir=Z:/elsewhere;log.dir=Z:/ab/base/0"
     );
-    assert_eq!(run_config("", dir), "log.dir=Z:/ab/base/0");
+    assert_eq!(run_config("", &spec("v1"), dir), "log.dir=Z:/ab/base/0");
+}
+
+#[test]
+fn leg_config_replaces_shared_entries_and_keeps_the_run_log_directory() {
+    let dir = Path::new("/ab/cand/0");
+    let shared = "shaderCache.enable=false;shader.asyncCompile=false";
+    let mut leg = spec("v1");
+    assert_eq!(
+        run_config(shared, &leg, dir),
+        format!("{shared};log.dir=Z:/ab/cand/0")
+    );
+    leg.config = Some("shader.asyncCompile=true;log.dir=Z:/elsewhere".to_owned());
+    assert_eq!(
+        run_config(shared, &leg, dir),
+        "shader.asyncCompile=true;log.dir=Z:/elsewhere;log.dir=Z:/ab/cand/0"
+    );
+    leg.config = Some(String::new());
+    assert_eq!(run_config(shared, &leg, dir), "log.dir=Z:/ab/cand/0");
 }
 
 #[test]
@@ -183,6 +206,7 @@ fn fake_wine(tag: &str, version: &str, server: &str) -> LegSpec {
         wine,
         prefix: dir.join("prefix"),
         stamp: "v1".to_owned(),
+        config: None,
     }
 }
 

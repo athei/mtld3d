@@ -127,7 +127,7 @@ const IMAGE_META: [(&str, &str); 2] = [
 const UNKNOWN_IMAGE: &str = "unknown";
 
 /// The note of an A/A run whose legs loaded one image.
-const SAME_IMAGE_NOTE: &str = "legs loaded identical binaries (A/A)";
+const SAME_IMAGE_NOTE: &str = "legs loaded identical binaries";
 
 /// The meta keys both legs have to agree on: comparing two profiles measures the profiles.
 const MATCHING_META: [&str; 3] = ["arch", "profile", "debug_assertions"];

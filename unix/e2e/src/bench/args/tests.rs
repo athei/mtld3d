@@ -85,8 +85,11 @@ fn ab_defaults_fill_in_behind_the_mandatory_flags() {
     assert_eq!(config.cand.stamp, "v2");
     assert_eq!(config.runs, 5);
     assert_eq!(config.timeout, Duration::from_mins(5));
+    assert_eq!(config.wait_idle, Duration::ZERO);
     assert!(config.benches.is_empty());
     assert!(config.config.is_empty());
+    assert!(config.base.config.is_none());
+    assert!(config.cand.config.is_none());
     assert!(config.report.is_none());
     assert!(!config.options.allow_same_image);
     assert_eq!(config.exes.len(), 1);
@@ -108,6 +111,8 @@ fn ab_reads_every_optional_flag() {
         "a=1;b=2",
         "--timeout",
         "90",
+        "--wait-idle",
+        "120",
         "--accept",
         "perf.draws_pf",
         "--report",
@@ -121,8 +126,66 @@ fn ab_reads_every_optional_flag() {
     assert_eq!(config.benches, ["wow_112", "wow_335a", "query_poll"]);
     assert_eq!(config.config, "a=1;b=2");
     assert_eq!(config.timeout, Duration::from_secs(90));
+    assert_eq!(config.wait_idle, Duration::from_secs(120));
     assert_eq!(config.options.accept, ["perf.draws_pf"]);
     assert!(config.options.allow_same_image);
+}
+
+#[test]
+fn ab_keeps_leg_configs_separate_from_shared_config_in_either_argument_order() {
+    for shared_first in [false, true] {
+        for (base, cand) in [
+            (None, Some("on")),
+            (Some("off"), None),
+            (Some("off"), Some("on")),
+            (Some(""), Some("on")),
+        ] {
+            let mut tokens = LEGS.to_vec();
+            if shared_first {
+                tokens.extend(["--config", "common"]);
+            }
+            if let Some(value) = base {
+                tokens.extend(["--base-config", value]);
+            }
+            if let Some(value) = cand {
+                tokens.extend(["--cand-config", value]);
+            }
+            if !shared_first {
+                tokens.extend(["--config", "common"]);
+            }
+            tokens.extend(["--out", "/ab", "--", "/e2e.exe"]);
+            let config = parse_ab(args(&tokens)).unwrap();
+            assert_eq!(config.config, "common");
+            assert_eq!(config.base.config.as_deref(), base);
+            assert_eq!(config.cand.config.as_deref(), cand);
+        }
+    }
+    for flag in ["--base-config", "--cand-config"] {
+        let mut tokens = LEGS.to_vec();
+        tokens.push(flag);
+        assert!(
+            parse_ab(args(&tokens))
+                .unwrap_err()
+                .contains("needs a value")
+        );
+    }
+}
+
+#[test]
+fn ab_idle_wait_accepts_disabled_and_rejects_invalid_durations() {
+    for value in ["0", "1", "300"] {
+        let mut tokens = LEGS.to_vec();
+        tokens.extend(["--out", "/ab", "--wait-idle", value, "--", "/e2e.exe"]);
+        assert_eq!(
+            parse_ab(args(&tokens)).unwrap().wait_idle,
+            Duration::from_secs(value.parse().unwrap())
+        );
+    }
+    for value in ["-1", "1.5", "never", "4294967296"] {
+        let mut tokens = LEGS.to_vec();
+        tokens.extend(["--out", "/ab", "--wait-idle", value, "--", "/e2e.exe"]);
+        assert!(parse_ab(args(&tokens)).unwrap_err().contains("--wait-idle"));
+    }
 }
 
 #[test]

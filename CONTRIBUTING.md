@@ -221,7 +221,31 @@ to 2 with the default five). Before each round's process the run measures
 for half a second the CPU its busiest other processes take, and the report
 warns about every round that started on a busy machine (one other process
 at a quarter of a core, all of them at half, or macOS throttling for heat);
-run those again. It
+run those again. `BENCH_WAIT_IDLE=120` optionally waits up to 120 seconds
+before each timed process for three consecutive quiet half-second CPU
+samples, using those same thresholds. The default `0` keeps advisory
+sampling. A failed CPU sample cannot count as quiet: both process reads
+must succeed and include the sampler itself. Some macOS hosts do not expose
+`kernel_task` to `ps`; its CPU share then remains unavailable, explicitly
+recorded in each idle sample, and only the foreign-process thresholds can
+be checked. Each attempt stays in
+the round's `idle-<binary>/sample-*.txt` files (or `idle-host/`), including
+rejected samples, and `idle-<binary>.txt` records the wait and its outcome.
+The final accepted sample is the ordinary `machine-<binary>.txt` that the
+report reads. A timeout ends the run with exit 2 and no performance verdict,
+preserving completed rounds. This checks the machine before a process
+starts; it cannot promise that background work stays idle during it. The
+runner exposes the same option as `bench-ab --wait-idle <seconds>`, alongside
+its explicit Wine, prefix, stamp and binary paths, so a rebuilt runner can
+compare existing installed product builds without rebuilding those legs.
+`--base-config` and `--cand-config` replace the shared `--config` for the
+named leg, including an explicitly empty value; the other leg keeps the
+shared config. These apply to timed tests and their untimed shape runs,
+with the run's own `log.dir` appended last. For a configuration comparison
+of one clean build, `--allow-same-image` permits the same recorded image
+identities on both legs; use complete config strings and retain their
+runtime logs so the intended difference can be checked. The host emitter
+does not load the renderer and does not use these runtime settings. The runner
 exits 1 on a regression and 2 when the run itself cannot be trusted, which
 includes the two legs running different Wines. The runs and the report stay
 in a directory under the main checkout's `.codex/evidence/bench-ab`, and
