@@ -138,15 +138,6 @@ impl BoundBuffers {
         self.streams[stream].freq = setting;
     }
 
-    /// Bit `s` set: a vertex buffer is bound at stream `s`.
-    pub fn bound_mask(&self) -> u16 {
-        self.streams
-            .iter()
-            .enumerate()
-            .filter(|(_, slot)| !slot.vb.raw().is_null())
-            .fold(0u16, |m, (s, _)| m | (1 << s))
-    }
-
     /// Bind `new` as the indexed-draw source with COM `AddRef`/`Release`.
     pub fn replace_index_buffer(&mut self, new: *mut Direct3DIndexBuffer9) {
         // SAFETY: `new` came from the IDirect3DDevice9 vtable layer; the

@@ -10436,7 +10436,7 @@ fn snapshot_bound_vertex_source(dev: &DeviceInner) -> Option<VertexSource> {
         unsafe { &*decl_ptr }.inner().stream_mask()
     };
     let bound = dev.bound_buffers();
-    let mut mask = decl_mask & bound.bound_mask();
+    let mut mask = decl_mask;
     if mask == 0 {
         return None;
     }
@@ -10446,7 +10446,9 @@ fn snapshot_bound_vertex_source(dev: &DeviceInner) -> Option<VertexSource> {
     while mask != 0 {
         let stream = mask.trailing_zeros();
         mask &= mask - 1;
-        let binding = snapshot_stream_binding(bound, stream, seq);
+        let Some(binding) = snapshot_stream_binding(bound, stream, seq) else {
+            continue;
+        };
         if first.is_none() {
             first = Some(binding);
         } else {
@@ -10460,17 +10462,16 @@ fn snapshot_bound_vertex_source(dev: &DeviceInner) -> Option<VertexSource> {
     })
 }
 
-/// Snapshot one bound stream, stamping its buffer with `seq`.
-fn snapshot_stream_binding(bound: &BoundBuffers, stream: u32, seq: u64) -> StreamBinding {
+/// Snapshot a declared stream if bound, stamping its buffer with `seq`.
+fn snapshot_stream_binding(bound: &BoundBuffers, stream: u32, seq: u64) -> Option<StreamBinding> {
     let s = stream as usize;
     let ptr = bound.stream_vertex_buffer(s);
-    // SAFETY: the caller selected `stream` from the bound mask, so `ptr` is a
-    // live `Direct3DVertexBuffer9` whose refcount keeps it alive while bound
-    // on the device.
-    let vb = unsafe { &mut *ptr };
+    // SAFETY: a non-null slot holds a live buffer by its bound refcount. The
+    // device API lock serializes access; an unbound declared stream is skipped.
+    let vb = unsafe { ptr.as_mut() }?;
     let inner = vb.inner_mut();
     inner.stamp_submit_seq(seq);
-    StreamBinding {
+    Some(StreamBinding {
         stream: u8::try_from(stream).expect("stream index below MAX_STREAMS"),
         buffer_id: inner.buffer_id(),
         backing_ptr: inner.current_backing_ptr(),
@@ -10479,7 +10480,7 @@ fn snapshot_stream_binding(bound: &BoundBuffers, stream: u32, seq: u64) -> Strea
         offset: bound.stream_offset(s),
         stride: bound.stream_stride(s),
         freq: bound.stream_freq(s),
-    }
+    })
 }
 
 /// Snapshot the bound index buffer into `IndexSource::Bound`.

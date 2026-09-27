@@ -184,6 +184,66 @@ fn two_stream_declaration_drives_programmable_draw() {
     );
 }
 
+/// Sparse declaration streams skip missing bindings and ignore undeclared ones.
+#[test]
+fn sparse_declared_streams_preserve_missing_binding_behavior() {
+    let h = Harness::new();
+    let decl = h.create_vertex_declaration(&[
+        element(0, D3DDECLTYPE_FLOAT3, D3DDECLUSAGE_TEXCOORD),
+        element(3, D3DDECLTYPE_FLOAT3, D3DDECLUSAGE_POSITION),
+        element(7, D3DDECLTYPE_D3DCOLOR, D3DDECLUSAGE_COLOR),
+        end(),
+    ]);
+    let vs = h.create_vertex_shader(&VS_POS_COLOR);
+    let ps = h.create_pixel_shader(&PS_DIFFUSE);
+    assert_eq!(h.set_vertex_declaration(&decl), D3D_OK);
+    assert_eq!(h.set_vertex_shader(&vs), D3D_OK);
+    assert_eq!(h.set_pixel_shader(&ps), D3D_OK);
+    let positions = h.create_vertex_buffer(
+        stride_of::<PosVertex>() * 3,
+        D3DUSAGE_WRITEONLY,
+        0,
+        D3DPOOL_DEFAULT,
+    );
+    positions.lock(0, 0, 0).write(&centered_triangle());
+    let diffuse = h.create_vertex_buffer(4 * 3, D3DUSAGE_WRITEONLY, 0, D3DPOOL_DEFAULT);
+    diffuse.lock(0, 0, 0).write(&[GREEN; 3]);
+    assert_eq!(
+        h.set_stream_source(3, &positions, 0, stride_of::<PosVertex>()),
+        D3D_OK
+    );
+    assert_eq!(h.set_stream_source(7, &diffuse, 0, 4), D3D_OK);
+    // Stream 0 is declared but unbound; stream 15 is bound but undeclared.
+    assert_eq!(h.set_stream_source_null(0, 0, 0), D3D_OK);
+    assert_eq!(
+        h.set_stream_source(15, &positions, 0, stride_of::<PosVertex>()),
+        D3D_OK
+    );
+    h.render_once(BLUE, |d| {
+        assert_eq!(d.draw_primitive(D3DPT_TRIANGLELIST, 0, 1), D3D_OK);
+    });
+    assert_eq!(h.read_pixel(320, 280), GREEN);
+
+    assert_eq!(h.set_stream_source_null(7, 0, 0), D3D_OK);
+    h.render_once(BLUE, |d| {
+        assert_eq!(d.draw_primitive(D3DPT_TRIANGLELIST, 0, 1), D3D_OK);
+    });
+    assert_eq!(h.read_pixel(320, 280), 0, "missing colour reads zeros");
+
+    assert_eq!(h.set_stream_source_null(3, 0, 0), D3D_OK);
+    h.render_once(BLUE, |d| {
+        assert_eq!(
+            d.draw_primitive(D3DPT_TRIANGLELIST, 0, 1),
+            D3DERR_INVALIDCALL
+        );
+        assert_eq!(
+            d.draw_indexed_primitive(D3DPT_TRIANGLELIST, 0, 0, 3, 0, 1),
+            D3D_OK
+        );
+    });
+    assert_eq!(h.read_pixel(320, 280), BLUE, "no declared stream is bound");
+}
+
 /// A stride below an unconsumed declaration tail still fetches every vertex.
 ///
 /// A shared declaration can carry trailing elements only other shaders read;
