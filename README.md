@@ -140,11 +140,17 @@ exported by mtld3d.dll; mtld3d.dll crosses the Wine PE/Unix boundary into mtld3d
 Metal. The PE side is i386 or x86_64, one chain per architecture; the host
 side is Mach-O in Wine's own architecture.](docs/architecture.svg)
 
-`d3d9.dll` implements the API and holds every piece of D3D9 knowledge,
+`d3d9.dll` implements the COM API and application-facing state,
 `mtld3d.dll` is the PE shim that owns Wine's unix-call globals, and
-`mtld3d.so` is a Metal abstraction layer on the host.
-[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) has the boundary contract, the
-threading model and the debugging toolkits.
+`mtld3d.so` provides the native runtime and Metal integration. Deferred D3D9
+work and private storage belong on Unix when measurements show no performance
+regression; the API thread stays cheap and frame work stays batched. A frame
+flows through four threads: the game's PE API thread records a batch, a native
+encoder translates it into Metal commands, a native submit thread replays and
+commits, and a native presenter thread acquires the drawable and presents.
+Compilation and prewarm workers also run on Unix. [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) has the
+boundary contract, the threading model, the workspace layout and the
+debugging toolkits.
 
 ## Contributing
 

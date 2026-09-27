@@ -500,9 +500,11 @@ The full set is in `docs/CONVENTIONS.md`. These are the ones a newcomer trips:
 - No `pub(crate)`, no `mod.rs`, no type aliases, no glob imports, no raw
   Objective-C selectors.
 - Hash maps use `FxHashMap`; content hashing uses xxh3.
-- Pure logic belongs in `mtld3d-core`; `windows/d3d9` is COM wiring. A COM
-  wrapper carries a vtable pointer, a refcount and an opaque inner pointer, and
-  every other field lives on the inner struct.
+- Pure logic belongs in `mtld3d-core`; `windows/d3d9` is COM wiring. Runtime
+  placement follows the Unix-first policy in `docs/ARCHITECTURE.md`; native
+  orchestration reuses core logic. A COM wrapper carries a vtable pointer, a
+  refcount and an opaque inner pointer, and every other field lives on the
+  inner struct.
 - Every integer with symbolic meaning that crosses the boundary is a typed value
   in `unix/shared`, never a bare `u32` and never a locally restated constant.
 - Comments state the invariant, not the history that produced it: no incident

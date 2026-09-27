@@ -6,7 +6,7 @@
 //!   their own storage reuse on this answer, so it comes from the GPU,
 //!   unless `query.eventImmediate` answers every poll as completed.
 //! - `OCCLUSION`: real Metal visibility-result query. `Issue(BEGIN/END)`
-//!   pushes closures onto the current frame that bump the encoder's
+//!   pushes operations onto the current frame that bump the encoder's
 //!   visibility offset allocator and emit
 //!   `setVisibilityResultMode:offset:` commands; `GetData` polls the
 //!   shared `VisibilityQueryCore` for the finalized pixel count.
@@ -94,7 +94,7 @@ struct QueryInner {
     data_size: u32,
     /// For OCCLUSION queries: the shared counter behind the COM wrapper.
     ///
-    /// BEGIN/END closures on the encoder thread mutate this via atomics;
+    /// BEGIN/END operations on the encoder thread mutate this via atomics;
     /// `intake_visibility` finalizes it post-GPU. `None` for
     /// EVENT.
     core: Option<Arc<VisibilityQueryCore>>,
@@ -125,6 +125,9 @@ fn event_status(inner: &QueryInner) -> i32 {
     // SAFETY: `inner.device_inner` was stamped at `Self::new` from a live
     // `DeviceInner` and is kept alive by the device.
     let dev = unsafe { &mut *inner.device_inner };
+    if let Err(hr) = dev.encoder_status() {
+        return hr;
+    }
     if mtld3d_core::query_fence::event_completed(
         end_seq,
         dev.coherent_seq_arc().load(Ordering::Acquire),
@@ -135,7 +138,9 @@ fn event_status(inner: &QueryInner) -> i32 {
         // Only bounded channel admission can stall here. Encoding and
         // submission continue independently of this readiness poll.
         let _wait = mtld3d_core::perf::CycleAddTimer::start(dev.perf_mut().query_wait_cycles_ptr());
-        dev.flush_current_frame_async();
+        if let Err(hr) = dev.flush_current_frame_async() {
+            return hr;
+        }
         if mtld3d_core::query_fence::event_completed(
             end_seq,
             dev.coherent_seq_arc().load(Ordering::Acquire),
@@ -274,6 +279,10 @@ extern "system" fn query_issue(this: *mut c_void, flags: u32) -> i32 {
         return D3DERR_INVALIDCALL;
     };
     let inner = obj.inner();
+    // SAFETY: the query retains its owning device throughout this call.
+    if let Err(hr) = unsafe { &*inner.device_inner }.encoder_status() {
+        return hr;
+    }
     if inner.query_type == D3DQUERYTYPE_EVENT {
         if flags & D3DISSUE_END != 0 {
             // SAFETY: `inner.device_inner` was stamped at `Self::new` from a
@@ -316,21 +325,31 @@ extern "system" fn query_issue(this: *mut c_void, flags: u32) -> i32 {
         // Reflect "query armed" synchronously so a no-Present
         // `GetData(D3DGETDATA_FLUSH)` sees `Pending` (and, under the
         // blocking config, flushes the recording frame to run this
-        // closure) rather than hitting the initial `NeverIssued`
-        // short-circuit. The closure resets the accumulator + slot as
+        // operation) rather than hitting the initial `NeverIssued`
+        // short-circuit. The operation resets the accumulator + slot as
         // usual when the encoder drains it.
-        core.mark_armed();
+        let generation = core.mark_armed();
         let c = core.clone();
-        dev.push_op(Box::new(move |enc| enc.begin_visibility_query(&c)));
+        dev.push_op(crate::encoder::Op::BeginVisibility(
+            mtld3d_core::encoder_data::capture_op(crate::device::BeginVisibilityOp {
+                c,
+                generation,
+            }),
+        ));
     }
     if flags & D3DISSUE_END != 0 {
         // Mark "end issued" synchronously so a no-Present `GetData(FLUSH)`
         // knows the span is closed and there is a result to wait for (an
         // *open* query has none however far the GPU has got).
-        core.mark_end_requested();
-        dev.push_op(Box::new(move |enc| enc.end_visibility_query(core)));
+        let generation = core.mark_end_requested();
+        dev.push_op(crate::encoder::Op::EndVisibility(
+            mtld3d_core::encoder_data::capture_op(crate::device::EndVisibilityOp {
+                core,
+                generation,
+            }),
+        ));
     }
-    D3D_OK
+    dev.encoder_status().map_or_else(|hr| hr, |()| D3D_OK)
 }
 
 /// Write the low `min(size, 8)` bytes of a 64-bit occlusion result.
@@ -359,6 +378,12 @@ extern "system" fn query_get_data(
         return D3DERR_INVALIDCALL;
     };
     let inner = obj.inner();
+    // SAFETY: the query's device reference keeps its owning DeviceInner alive.
+    let device = unsafe { &*inner.device_inner };
+    if let Err(hr) = device.encoder_status() {
+        return hr;
+    }
+
     let has_output = !data.is_null() && size != 0;
     if inner.query_type == D3DQUERYTYPE_EVENT {
         // SAFETY: `inner.device_inner` was stamped at `Self::new` from a
@@ -475,10 +500,10 @@ extern "system" fn query_get_data(
                         }
                         // Spec-correct fallback (config off). The
                         // Present-driven encoder may not have run this
-                        // query's BEGIN/END closures yet (a D3D9 app can
+                        // query's BEGIN/END operations yet (a D3D9 app can
                         // poll a query with no intervening Present), so
                         // first flush the current recording frame: that
-                        // drains the closures (assigning the visibility
+                        // drains the operations (assigning the visibility
                         // slots + `seq_end`) and submits the counting
                         // pass to the GPU. Then block on the GPU retiring
                         // `seq_end` so intake folds the per-fragment
@@ -504,8 +529,14 @@ extern "system" fn query_get_data(
                                 let _wait = mtld3d_core::perf::CycleAddTimer::start(
                                     dev.perf_mut().query_wait_cycles_ptr(),
                                 );
-                                dev.flush_current_frame_blocking();
-                                dev.encoder_intake_visibility_for(core.seq_end_loaded());
+                                if let Err(hr) = dev.flush_current_frame_blocking() {
+                                    return hr;
+                                }
+                                if let Err(hr) =
+                                    dev.encoder_intake_visibility_for(core.seq_end_loaded())
+                                {
+                                    return hr;
+                                }
                             }
                             if core.status() == QueryStatus::Issued {
                                 dump_event(&|| {

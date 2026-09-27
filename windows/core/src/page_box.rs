@@ -15,8 +15,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::{
     alloc::{self, Layout},
     ptr::NonNull,
-    sync::{Arc, atomic::AtomicUsize},
+    sync::{Arc, atomic::AtomicU32},
 };
+
+use mtld3d_shared::encoder_wire::{LeaseCompletion, LeaseCompletionPtr};
 
 /// Bytes held by live `PageBox`es, always on: one add per alloc, one sub per free.
 ///
@@ -249,17 +251,26 @@ pub struct PageBox {
     len: usize,
     /// Original request from the caller. Game's visible buffer length.
     logical_len: usize,
-    /// Layout used for `alloc` — stored so `Drop` can match `dealloc`.
-    layout: Layout,
+    /// Allocator ownership or a guest lease acknowledged when the last native reader leaves.
+    ownership: PageOwnership,
     /// This allocation's [`PAGE_BOX_GENERATION`] stamp.
     generation: u64,
     /// Upload jobs and emitted reads, excluding cached buffer-wrapper owners.
-    readers: AtomicUsize,
+    readers: AtomicU32,
 }
 
-// SAFETY: PageBox owns a heap allocation with no interior sharing. Transferring
-// ownership across threads is sound — callers must externally synchronize to
-// prevent simultaneous reads/writes, the same contract as `Box<[u8]>`.
+/// The runtime responsible for releasing a page allocation.
+enum PageOwnership {
+    Native(Layout),
+    Guest {
+        completion: LeaseCompletionPtr,
+        readers: u64,
+    },
+}
+
+// SAFETY: The allocation is owned here or pinned by a guest lease until Drop.
+// The constructors require externally synchronized access to its bytes, and
+// the guest completion cell is atomic. Moving the owner preserves that contract.
 unsafe impl Send for PageBox {}
 // SAFETY: same as Send above — `&PageBox` only exposes the raw pointer, so
 // `Sync` requires the same caller-synchronized contract.
@@ -293,9 +304,9 @@ impl PageBox {
             ptr,
             len,
             logical_len,
-            layout,
+            ownership: PageOwnership::Native(layout),
             generation: PAGE_BOX_GENERATION.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1,
-            readers: AtomicUsize::new(0),
+            readers: AtomicU32::new(0),
         }
     }
 
@@ -320,16 +331,78 @@ impl PageBox {
             ptr,
             len,
             logical_len,
-            layout,
+            ownership: PageOwnership::Native(layout),
             generation: PAGE_BOX_GENERATION.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1,
-            readers: AtomicUsize::new(0),
+            readers: AtomicU32::new(0),
         }
     }
 
     /// Whether a queued, replayable or in-flight upload still reads these pages.
     #[must_use]
     pub fn has_readers(&self) -> bool {
-        self.readers.load(core::sync::atomic::Ordering::Acquire) != 0
+        self.reader_count()
+            .load(core::sync::atomic::Ordering::Acquire)
+            != 0
+    }
+
+    /// Borrow pages retained by the guest until this lease is acknowledged.
+    ///
+    /// Native wrappers may retain the resulting box but cannot recycle its allocation.
+    ///
+    /// # Safety
+    ///
+    /// `ptr` names a `len`-byte allocation with `PAGE_SIZE` alignment, `len` is a
+    /// nonzero page multiple, and `logical_len <= len`. Every range the consumer
+    /// reads must be initialized, as with an owned `new_uninit` allocation;
+    /// transferring a lease does not initialize unused pages or padding. The caller keeps the
+    /// allocation and the aligned completion cell alive until the completion is
+    /// observed with Acquire ordering. The lease grants the same externally
+    /// synchronized access as an owned box, and this is its sole native owner.
+    /// `readers` names the original box's aligned `AtomicU32` reader count and
+    /// stays alive for the same lease. A read guard must already exist before
+    /// publication whenever the native consumer will acquire a new read.
+    #[must_use]
+    pub const unsafe fn from_guest_lease(
+        ptr: NonNull<u8>,
+        len: usize,
+        logical_len: usize,
+        generation: u64,
+        completion: LeaseCompletionPtr,
+        readers: u64,
+    ) -> Self {
+        Self {
+            ptr,
+            len,
+            logical_len,
+            ownership: PageOwnership::Guest {
+                completion,
+                readers,
+            },
+            generation,
+            readers: AtomicU32::new(0),
+        }
+    }
+
+    /// Whether the allocating runtime can park this box in its recycle pool.
+    #[must_use]
+    pub const fn is_native_owned(&self) -> bool {
+        matches!(self.ownership, PageOwnership::Native(_))
+    }
+
+    /// Address of the fixed-width reader count kept alive by a page lease.
+    #[must_use]
+    pub fn reader_count_ptr(&self) -> u64 {
+        core::ptr::from_ref(self.reader_count()) as u64
+    }
+
+    const fn reader_count(&self) -> &AtomicU32 {
+        match &self.ownership {
+            PageOwnership::Native(_) => &self.readers,
+            PageOwnership::Guest { readers, .. } => {
+                // SAFETY: from_guest_lease pins the original aligned counter until Drop.
+                unsafe { &*(*readers as *const AtomicU32) }
+            }
+        }
     }
 
     #[must_use]
@@ -353,8 +426,8 @@ impl PageBox {
     /// see exactly the same byte range.
     #[must_use]
     pub const fn as_slice(&self) -> &[u8] {
-        // SAFETY: ptr is non-null, valid for `len` bytes (we allocated
-        // it that way), and the lifetime is tied to `&self`.
+        // SAFETY: The allocator or guest lease keeps these initialized bytes
+        // alive through this borrow, under the constructor's access contract.
         unsafe { core::slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
     }
 
@@ -362,8 +435,8 @@ impl PageBox {
     ///
     /// Caller takes the unique-borrow guarantee from `&mut self`.
     pub const fn as_mut_slice(&mut self) -> &mut [u8] {
-        // SAFETY: ptr is non-null, valid for `len` bytes, and the
-        // unique borrow on `&mut self` keeps the slice exclusive.
+        // SAFETY: The allocator or guest lease keeps these bytes alive and
+        // the constructor's access contract makes this mutable borrow exclusive.
         unsafe { core::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
     }
 
@@ -432,11 +505,20 @@ impl PageBox {
 
 impl Drop for PageBox {
     fn drop(&mut self) {
+        let layout = match &self.ownership {
+            PageOwnership::Native(layout) => *layout,
+            PageOwnership::Guest { completion, .. } => {
+                // SAFETY: from_guest_lease keeps this cell alive until this final acknowledgment.
+                let completion = unsafe { &*(completion.raw() as *const LeaseCompletion) };
+                completion.publish();
+                return;
+            }
+        };
         note_free(self.len);
         PAGEBOX_LIVE_BYTES.fetch_sub(self.len as u64, core::sync::atomic::Ordering::Relaxed);
         // SAFETY: same layout used to alloc; pointer came from that
         // allocator; nothing else owns this allocation.
-        unsafe { alloc::dealloc(self.ptr.as_ptr(), self.layout) };
+        unsafe { alloc::dealloc(self.ptr.as_ptr(), layout) };
     }
 }
 
@@ -451,13 +533,23 @@ pub struct PageBoxRead {
 }
 
 impl PageBoxRead {
+    /// Acquire one published read of an allocation.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the fixed-width shared reader count is exhausted.
     #[must_use]
     pub fn new(backing: Arc<PageBox>) -> Self {
-        // Every reader owns an Arc before incrementing, so this count never
-        // exceeds Arc's bounded strong count and cannot overflow.
+        // The fixed-width count is shared across PE and native runtimes. Reject
+        // exhaustion rather than publishing a wrapped zero to a guest writer.
         backing
-            .readers
-            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            .reader_count()
+            .fetch_update(
+                core::sync::atomic::Ordering::Relaxed,
+                core::sync::atomic::Ordering::Relaxed,
+                |count| count.checked_add(1),
+            )
+            .expect("PageBox reader count exhausted");
         Self { backing }
     }
 
@@ -472,7 +564,7 @@ impl Drop for PageBoxRead {
         // Construction increments once and the guard is move-only,
         // so every drop has exactly one outstanding increment to release.
         self.backing
-            .readers
+            .reader_count()
             .fetch_sub(1, core::sync::atomic::Ordering::Release);
     }
 }

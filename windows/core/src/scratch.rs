@@ -96,6 +96,16 @@ impl ScratchArena {
         }
     }
 
+    /// Allocation ranges pinned by this arena until its next clear or destruction.
+    ///
+    /// Frame admission publishes these ranges for validating borrowed byte slices.
+    pub fn allocation_ranges(&self) -> impl Iterator<Item = (u64, u64)> + '_ {
+        self.small_chunks
+            .iter()
+            .chain(&self.oversized)
+            .map(|chunk| (chunk.as_ptr() as u64, chunk.len() as u64))
+    }
+
     /// Reserve `size` bytes in the arena and return an uninitialised pointer.
     ///
     /// Underpins both `alloc` (which then memcpys data in) and
@@ -108,6 +118,7 @@ impl ScratchArena {
     /// fat LTO, and every bump then pays a full call.
     #[inline]
     fn reserve(&mut self, size: usize) -> *mut u8 {
+        self.cursor = align_up(self.cursor, ALIGN);
         let aligned = align_up(size, ALIGN);
         // Fast path: current chunk has room.
         if aligned <= self.chunk_size
@@ -161,6 +172,50 @@ impl ScratchArena {
         let ptr = chunk.as_mut_ptr();
         self.oversized.push(chunk);
         ptr
+    }
+
+    /// Write a command directly beside this frame's captured payloads.
+    ///
+    /// The conservative bound reserves one contiguous window. The unused tail
+    /// is reclaimed immediately, so consecutive commands pack without padding.
+    /// Typed payload allocations realign the cursor before their next write.
+    ///
+    /// # Errors
+    /// Returns the encoder's write error without publishing a partial record.
+    pub fn write_record(
+        &mut self,
+        tag: u16,
+        bound: usize,
+        write: impl FnOnce(
+            &mut mtld3d_shared::encoder_wire::WireWriter<'_>,
+        ) -> Result<(), mtld3d_shared::encoder_wire::WireError>,
+    ) -> Result<(u64, usize, u64), mtld3d_shared::encoder_wire::WireError> {
+        use mtld3d_shared::encoder_wire::{WireError, WireWriter};
+        if bound < 6 || bound > u32::MAX as usize {
+            return Err(WireError::TooLarge);
+        }
+        let pointer = if bound <= self.chunk_size
+            && !self.small_chunks.is_empty()
+            && self.cursor + bound <= self.hot_chunk_len()
+        {
+            self.bump_in_current_chunk(bound)
+        } else {
+            self.reserve_slow(bound)
+        };
+        // SAFETY: the arena just reserved this exclusive initialized byte window.
+        // The callback cannot allocate through this same mutable arena borrow.
+        let destination = unsafe { core::slice::from_raw_parts_mut(pointer, bound) };
+        let result = WireWriter::record_into(destination, tag, write);
+        if bound <= self.chunk_size {
+            let used = result.as_ref().copied().unwrap_or(0);
+            self.cursor -= bound - used;
+        }
+        let allocation = if bound <= self.chunk_size {
+            self.small_chunks[self.current_chunk_idx].as_ptr() as u64
+        } else {
+            pointer as u64
+        };
+        result.map(|used| (pointer as u64, used, allocation))
     }
 
     /// Copy `data` into the arena and return a stable pointer cast to `u64`.

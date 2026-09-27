@@ -24,10 +24,15 @@
 //! and the encoder-side wiring; mtld3d-unix owns the Metal descriptor
 //! binding and command dispatch.
 
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::Ordering;
 use std::{collections::VecDeque, sync::Arc};
 
-use mtld3d_shared::{MetalHandle, mtl_handle::MTLBufferKind};
+use mtld3d_shared::{
+    MetalHandle,
+    encoder_wire::{LeaseCompletion, LeaseCompletionPtr},
+    mtl_handle::MTLBufferKind,
+    query_mailbox::QueryMailbox,
+};
 
 use crate::page_box::PageBox;
 
@@ -62,95 +67,69 @@ pub enum QueryStatus {
 /// Held by `Arc` so the encoder-side pending list can keep the core alive
 /// past the COM wrapper's refcount reaching zero.
 pub struct VisibilityQueryCore {
-    /// Identity of the most recent BEGIN processed by the encoder.
-    ///
-    /// Even at one billion BEGINs per second, a `u64` lasts more than 584
-    /// years. Overflow panics instead of recycling an identity that an older
-    /// pending segment could still carry.
-    issue_generation: AtomicU64,
-    /// Frame submit-seq at `Issue(BEGIN)`.
-    ///
-    /// Only valid once `status` leaves `NeverIssued`.
-    seq_begin: AtomicU64,
-    /// Frame submit-seq at `Issue(END)`.
-    ///
-    /// Valid once `status` reaches `Pending` following an END. It is the
-    /// seq the closing segment retires at, which is the seq `GetData`
-    /// waits on.
-    seq_end: AtomicU64,
-    /// First slot index of the segment currently open.
-    ///
-    /// Set at BEGIN and again every time a frame boundary reopens the
-    /// span in the continuation frame.
-    offset_begin: AtomicU32,
-    /// Sample count of every segment of this span already summed.
-    ///
-    /// The closing segment adds its own sum and publishes the total.
-    carried: AtomicU64,
-    /// u64 running sum; clamped to `u32::MAX` on `get_u32`.
-    accumulated: AtomicU64,
-    /// `QueryStatus` encoded as u8.
-    ///
-    /// Atomic so `GetData` can observe transitions without locking.
-    status: AtomicU64,
-    /// Pixel area of the target the query began against, as D3D9 reports it.
-    ///
-    /// Latched at BEGIN with [`Self::render_area`] and applied at finalize:
-    /// Metal counts the samples the rasterizer produced on the render grid,
-    /// which under a reduced `render.scale` holds fewer pixels than D3D9
-    /// reports, so the count is scaled back up by the ratio of the two areas
-    /// before the game reads it. The areas rather than the nominal scale,
-    /// because a dimension the scale does not divide rounds to a whole texel
-    /// on the render grid, and only the actual ratio makes a full-frame count
-    /// exact.
-    logical_area: AtomicU64,
-    /// Pixel area of the same target's render grid.
-    render_area: AtomicU64,
-    /// Set the instant `Issue(D3DISSUE_END)` is recorded (API thread).
-    ///
-    /// Cleared on `Issue(D3DISSUE_BEGIN)`. Lets the blocking
-    /// `GetData(FLUSH)` tell an *ended* query (whose count the flush can
-    /// make available) from one still *open*, which has no result to
-    /// report however far the GPU has got.
-    end_requested: AtomicBool,
-    /// Set when any part of the span could not be counted.
-    ///
-    /// The published result is then the permissive `u32::MAX` ("fully
-    /// visible") rather than a partial sum, so a title reading it draws
-    /// the geometry it would otherwise cull. A span with no draw in it is
-    /// the exception: zero is its exact answer, slots or no slots.
-    uncounted: AtomicBool,
-    /// Draws the encoder had issued when this span opened.
-    draws_at_begin: AtomicU64,
-    /// Draws issued inside the span, filled in at END.
-    draws_in_span: AtomicU64,
+    mailbox: QueryStorage,
+}
+
+/// A query owns its mailbox locally or borrows it under a guest allocation lease.
+enum QueryStorage {
+    Owned(QueryMailbox),
+    Guest {
+        pointer: u64,
+        completion: LeaseCompletionPtr,
+    },
 }
 
 impl VisibilityQueryCore {
     #[must_use]
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
-            issue_generation: AtomicU64::new(0),
-            seq_begin: AtomicU64::new(0),
-            seq_end: AtomicU64::new(0),
-            offset_begin: AtomicU32::new(0),
-            carried: AtomicU64::new(0),
-            accumulated: AtomicU64::new(0),
-            status: AtomicU64::new(QueryStatus::NeverIssued as u64),
-            end_requested: AtomicBool::new(false),
-            uncounted: AtomicBool::new(false),
-            draws_at_begin: AtomicU64::new(0),
-            draws_in_span: AtomicU64::new(0),
-            logical_area: AtomicU64::new(0),
-            render_area: AtomicU64::new(0),
+            mailbox: QueryStorage::Owned(QueryMailbox::new()),
         })
     }
 
+    /// Borrow one query mailbox pinned by its guest lease.
+    ///
+    /// # Safety
+    ///
+    /// `pointer` names a live, aligned mailbox. The guest retains both it and
+    /// `completion` until the final native core publishes completion from Drop.
+    #[must_use]
+    pub const unsafe fn from_guest(pointer: u64, completion: LeaseCompletionPtr) -> Self {
+        Self {
+            mailbox: QueryStorage::Guest {
+                pointer,
+                completion,
+            },
+        }
+    }
+
+    /// Address passed with a query lease, never ownership of its Rust wrapper.
+    #[must_use]
+    pub fn mailbox_address(&self) -> u64 {
+        core::ptr::from_ref(self.mailbox()) as u64
+    }
+
+    const fn mailbox(&self) -> &QueryMailbox {
+        match &self.mailbox {
+            QueryStorage::Owned(mailbox) => mailbox,
+            QueryStorage::Guest { pointer, .. } => {
+                // SAFETY: from_guest pins the aligned mailbox through the final native core drop.
+                unsafe { &*(*pointer as *const QueryMailbox) }
+            }
+        }
+    }
+
     pub fn status(&self) -> QueryStatus {
-        match self.status.load(Ordering::Acquire) {
-            x if x == QueryStatus::Pending as u64 => QueryStatus::Pending,
-            x if x == QueryStatus::Issued as u64 => QueryStatus::Issued,
-            _ => QueryStatus::NeverIssued,
+        let requested = self.mailbox().requested_generation.load(Ordering::Acquire);
+        let status = self.mailbox().status.load(Ordering::Acquire);
+        if status == QueryStatus::Issued as u32
+            && self.mailbox().result_generation.load(Ordering::Acquire) == requested
+        {
+            QueryStatus::Issued
+        } else if requested == 0 && status == QueryStatus::NeverIssued as u32 {
+            QueryStatus::NeverIssued
+        } else {
+            QueryStatus::Pending
         }
     }
 
@@ -173,24 +152,47 @@ impl VisibilityQueryCore {
         render: (u32, u32),
         draws_seen: u64,
     ) {
-        self.issue_generation
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |generation| {
-                generation.checked_add(1)
-            })
-            .expect("visibility query issue generation exhausted");
-        self.seq_begin.store(seq, Ordering::Release);
-        self.offset_begin.store(offset, Ordering::Release);
-        self.logical_area.store(area(logical), Ordering::Release);
-        self.render_area.store(area(render), Ordering::Release);
-        self.draws_at_begin.store(draws_seen, Ordering::Release);
-        self.draws_in_span.store(0, Ordering::Release);
+        let generation = self.mark_armed();
+        self.begin_recorded(generation, seq, offset, logical, render, draws_seen);
+    }
+
+    /// Execute the BEGIN generation captured by the API thread.
+    ///
+    /// Queued brackets use their recorded identities even if the API has already requested a
+    /// later bracket. Only completion of the currently requested generation is visible to
+    /// `GetData`.
+    pub fn begin_recorded(
+        &self,
+        generation: u64,
+        seq: u64,
+        offset: u32,
+        logical: (u32, u32),
+        render: (u32, u32),
+        draws_seen: u64,
+    ) {
+        self.mailbox()
+            .issue_generation
+            .store(generation, Ordering::Release);
+        self.mailbox().seq_begin.store(seq, Ordering::Release);
+        self.mailbox().offset_begin.store(offset, Ordering::Release);
+        self.mailbox()
+            .logical_area
+            .store(area(logical), Ordering::Release);
+        self.mailbox()
+            .render_area
+            .store(area(render), Ordering::Release);
+        self.mailbox()
+            .draws_at_begin
+            .store(draws_seen, Ordering::Release);
+        self.mailbox().draws_in_span.store(0, Ordering::Release);
         // Reset the accumulators in case this core was previously issued
         // and the app is re-issuing.
-        self.carried.store(0, Ordering::Release);
-        self.uncounted.store(false, Ordering::Release);
-        self.accumulated.store(0, Ordering::Release);
-        self.status
-            .store(QueryStatus::Pending as u64, Ordering::Release);
+        self.mailbox().carried.store(0, Ordering::Release);
+        self.mailbox().uncounted.store(0, Ordering::Release);
+        self.mailbox().accumulated.store(0, Ordering::Release);
+        self.mailbox()
+            .status
+            .store(QueryStatus::Pending as u32, Ordering::Release);
     }
 
     /// Reopen the span in the continuation of a frame that ended mid-span.
@@ -200,8 +202,8 @@ impl VisibilityQueryCore {
     /// frame's allocator. The running total and the areas the count is
     /// reported in both carry over.
     pub fn resume(&self, seq: u64, offset: u32) {
-        self.seq_begin.store(seq, Ordering::Release);
-        self.offset_begin.store(offset, Ordering::Release);
+        self.mailbox().seq_begin.store(seq, Ordering::Release);
+        self.mailbox().offset_begin.store(offset, Ordering::Release);
     }
 
     /// Called by the encoder thread on the END closure.
@@ -209,9 +211,17 @@ impl VisibilityQueryCore {
     /// Records the submit seq the closing segment retires at, which is what
     /// `GetData(D3DGETDATA_FLUSH)` waits on, and how many draws the span held.
     pub fn end(&self, seq: u64, draws_seen: u64) {
-        self.seq_end.store(seq, Ordering::Release);
-        self.draws_in_span.store(
-            draws_seen.wrapping_sub(self.draws_at_begin.load(Ordering::Acquire)),
+        self.end_recorded(self.issue_generation(), seq, draws_seen);
+    }
+
+    /// Execute END using the API-captured bracket identity.
+    pub fn end_recorded(&self, generation: u64, seq: u64, draws_seen: u64) {
+        self.mailbox().seq_end.store(seq, Ordering::Release);
+        self.mailbox()
+            .end_generation
+            .store(generation, Ordering::Release);
+        self.mailbox().draws_in_span.store(
+            draws_seen.wrapping_sub(self.mailbox().draws_at_begin.load(Ordering::Acquire)),
             Ordering::Release,
         );
     }
@@ -222,7 +232,7 @@ impl VisibilityQueryCore {
     /// counted into is gone. The published result is then `u32::MAX` rather
     /// than the partial sum the slots that did exist add up to.
     pub fn mark_uncounted(&self) {
-        self.uncounted.store(true, Ordering::Release);
+        self.mailbox().uncounted.store(1, Ordering::Release);
     }
 
     /// `GetData` result: DWORD visible-pixel count clamped at `u32::MAX`.
@@ -232,7 +242,7 @@ impl VisibilityQueryCore {
     /// Panics if the clamped accumulator overflows `u32::MAX` — unreachable
     /// because the `.min(u32::MAX)` directly above bounds it.
     pub fn get_u32(&self) -> u32 {
-        let v = self.accumulated.load(Ordering::Acquire);
+        let v = self.get_u64();
         u32::try_from(v.min(u64::from(u32::MAX))).expect("clamped above to u32::MAX")
     }
 
@@ -242,7 +252,13 @@ impl VisibilityQueryCore {
     /// exceeds the advertised DWORD size, matching the runtime's internal
     /// UINT64 counter.
     pub fn get_u64(&self) -> u64 {
-        self.accumulated.load(Ordering::Acquire)
+        if self.mailbox().result_generation.load(Ordering::Acquire)
+            == self.mailbox().requested_generation.load(Ordering::Acquire)
+        {
+            self.mailbox().accumulated.load(Ordering::Acquire)
+        } else {
+            0
+        }
     }
 
     /// Mark the query armed (`Pending`) the instant `Issue(D3DISSUE_BEGIN)` fires.
@@ -254,10 +270,24 @@ impl VisibilityQueryCore {
     /// `NeverIssued` state and short-circuit to the permissive stub instead
     /// of flushing. The `begin` closure still resets the accumulator and
     /// assigns the slot when it eventually runs.
-    pub fn mark_armed(&self) {
-        self.end_requested.store(false, Ordering::Release);
-        self.status
-            .store(QueryStatus::Pending as u64, Ordering::Release);
+    ///
+    /// # Panics
+    ///
+    /// Panics after `u64::MAX` brackets rather than reusing an outstanding identity.
+    pub fn mark_armed(&self) -> u64 {
+        let generation = self
+            .mailbox()
+            .requested_generation
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+                value.checked_add(1)
+            })
+            .expect("visibility query requested generation exhausted")
+            + 1;
+        self.mailbox().end_requested.store(0, Ordering::Release);
+        self.mailbox()
+            .status
+            .store(QueryStatus::Pending as u32, Ordering::Release);
+        generation
     }
 
     /// Record that `Issue(D3DISSUE_END)` was called on the API thread.
@@ -265,15 +295,16 @@ impl VisibilityQueryCore {
     /// Set before the encoder-side `end` closure runs. Read by the
     /// blocking `GetData(FLUSH)` to decide whether the query is safe to
     /// flush + read (ended) or must report `S_FALSE` (still open).
-    pub fn mark_end_requested(&self) {
-        self.end_requested.store(true, Ordering::Release);
+    pub fn mark_end_requested(&self) -> u64 {
+        self.mailbox().end_requested.store(1, Ordering::Release);
+        self.mailbox().requested_generation.load(Ordering::Acquire)
     }
 
     /// Whether an `Issue(D3DISSUE_END)` has been recorded since the last `Issue(D3DISSUE_BEGIN)`.
     ///
     /// See [`Self::mark_end_requested`].
     pub fn end_requested(&self) -> bool {
-        self.end_requested.load(Ordering::Acquire)
+        self.mailbox().end_requested.load(Ordering::Acquire) != 0
     }
 
     /// Slot where Metal started counting the segment currently open.
@@ -281,7 +312,7 @@ impl VisibilityQueryCore {
     /// Paired with the allocator's next index to make the half-open span
     /// a segment covers.
     pub fn offset_begin(&self) -> u32 {
-        self.offset_begin.load(Ordering::Acquire)
+        self.mailbox().offset_begin.load(Ordering::Acquire)
     }
 
     /// Submit-seq the encoder will retire this query at, set when the END closure runs.
@@ -291,12 +322,18 @@ impl VisibilityQueryCore {
     /// skip the encoder round-trip when intake provably can't finalize
     /// this query yet.
     pub fn seq_end_loaded(&self) -> u64 {
-        self.seq_end.load(Ordering::Acquire)
+        if self.mailbox().end_generation.load(Ordering::Acquire)
+            == self.mailbox().requested_generation.load(Ordering::Acquire)
+        {
+            self.mailbox().seq_end.load(Ordering::Acquire)
+        } else {
+            0
+        }
     }
 
     /// Identity of the bracket whose BEGIN the encoder processed most recently.
     fn issue_generation(&self) -> u64 {
-        self.issue_generation.load(Ordering::Acquire)
+        self.mailbox().issue_generation.load(Ordering::Acquire)
     }
 
     /// Fold one retired segment's sample count into the span's running total.
@@ -304,8 +341,9 @@ impl VisibilityQueryCore {
     /// Used only from `VisibilityQueryState::intake_completed` in this
     /// module.
     fn accumulate_segment(&self, summed: u64) {
-        let carried = self.carried.load(Ordering::Acquire);
-        self.carried
+        let carried = self.mailbox().carried.load(Ordering::Acquire);
+        self.mailbox()
+            .carried
             .store(carried.saturating_add(summed), Ordering::Release);
     }
 
@@ -317,20 +355,34 @@ impl VisibilityQueryCore {
         // A span with no draw in it counted nothing, whatever became of its
         // slots, so its sum is exact and the permissive answer would be
         // invented.
-        let unknown = self.uncounted.load(Ordering::Acquire)
-            && self.draws_in_span.load(Ordering::Acquire) != 0;
+        let unknown = self.mailbox().uncounted.load(Ordering::Acquire) != 0
+            && self.mailbox().draws_in_span.load(Ordering::Acquire) != 0;
         let result = if unknown {
             u64::from(u32::MAX)
         } else {
             logical_samples(
-                self.carried.load(Ordering::Acquire),
-                self.render_area.load(Ordering::Acquire),
-                self.logical_area.load(Ordering::Acquire),
+                self.mailbox().carried.load(Ordering::Acquire),
+                self.mailbox().render_area.load(Ordering::Acquire),
+                self.mailbox().logical_area.load(Ordering::Acquire),
             )
         };
-        self.accumulated.store(result, Ordering::Release);
-        self.status
-            .store(QueryStatus::Issued as u64, Ordering::Release);
+        self.mailbox().accumulated.store(result, Ordering::Release);
+        self.mailbox()
+            .result_generation
+            .store(self.issue_generation(), Ordering::Release);
+        self.mailbox()
+            .status
+            .store(QueryStatus::Issued as u32, Ordering::Release);
+    }
+}
+
+impl Drop for VisibilityQueryCore {
+    fn drop(&mut self) {
+        if let QueryStorage::Guest { completion, .. } = &self.mailbox {
+            // SAFETY: from_guest retains the acknowledgment cell until this final publication.
+            let completion = unsafe { &*(completion.raw() as *const LeaseCompletion) };
+            completion.publish();
+        }
     }
 }
 

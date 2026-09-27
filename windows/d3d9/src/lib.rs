@@ -24,7 +24,6 @@ mod pixel_shader;
 mod private_data;
 mod query;
 mod shader_bindings;
-mod shader_prewarm;
 mod shader_validator;
 mod stage_bindings;
 mod state_block;
@@ -285,7 +284,12 @@ fn init_logger(instance: *mut c_void) {
     mtld3d_shared::crumb::init();
     crash::install(instance);
     mtld3d_shared::crumb::set_write_sink(log_sink::write_raw);
-    let mut params = InitLoggerParams { reserved: 0 };
+    let filter = std::env::var("RUST_LOG").unwrap_or_default();
+    let mut params = InitLoggerParams {
+        filter_ptr: filter.as_ptr() as u64,
+        filter_len: u32::try_from(filter.len()).unwrap_or(0),
+        reserved: 0,
+    };
     unix_call(&mut params);
 }
 

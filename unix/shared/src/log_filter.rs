@@ -9,7 +9,8 @@
 /// no target ever colours: `WriteStyle::Never` on all three linkage units
 /// keeps escape sequences out of the file.
 pub fn init_logger() {
-    init(None);
+    let user = std::env::var("RUST_LOG").ok();
+    init(None, user.as_deref());
 }
 
 /// Register `env_logger` writing every formatted line into `sink`.
@@ -18,12 +19,20 @@ pub fn init_logger() {
 /// owns the process's log file; the unix side uses it with the file itself.
 /// Filter and style match [`init_logger`].
 pub fn init_logger_to(sink: Box<dyn std::io::Write + Send + 'static>) {
-    init(Some(sink));
+    let user = std::env::var("RUST_LOG").ok();
+    init(Some(sink), user.as_deref());
 }
 
-fn init(sink: Option<Box<dyn std::io::Write + Send + 'static>>) {
-    let user = std::env::var("RUST_LOG").ok();
-    let filter = resolved_log_filter(user.as_deref());
+/// Register the native logger with the filter supplied by the PE process environment.
+///
+/// Wine child process environment changes are not reflected in the Unix environment.
+/// Passing the filter explicitly keeps logging consistent across the boundary.
+pub fn init_logger_to_filter(sink: Box<dyn std::io::Write + Send + 'static>, user: Option<&str>) {
+    init(Some(sink), user);
+}
+
+fn init(sink: Option<Box<dyn std::io::Write + Send + 'static>>, user: Option<&str>) {
+    let filter = resolved_log_filter(user);
     let mut builder = env_logger::Builder::new();
     builder
         .parse_filters(&filter)

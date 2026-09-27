@@ -33,12 +33,16 @@
 
 use std::sync::{
     Mutex,
-    atomic::{AtomicBool, AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
 };
 
 use rustc_hash::FxHashMap;
 
 use crate::{dirty_rect::DirtyRect, ids::TextureId};
+
+mod guest;
+
+pub use guest::{GuestRedirtyDescriptor, GuestRedirtyLease};
 
 /// Times one subresource is re-marked dirty before the layer stops retrying.
 ///
@@ -100,6 +104,10 @@ pub struct EmittedUpload {
 /// `tracked` and returns while no subresource carries a decline record, which
 /// is the whole of a run that never declines an upload.
 pub struct RedirtyQueue {
+    native_feedback: Option<guest::NativeFeedback>,
+    feedback_sequence: AtomicU64,
+    feedback_order: Mutex<guest::FeedbackOrder>,
+    feedback_records: Mutex<guest::FeedbackRecords>,
     /// Set while a declined upload waits to be marked dirty again.
     declined_pending: AtomicBool,
     /// Set while an emitted upload waits for its staging to be released.
@@ -119,6 +127,10 @@ impl RedirtyQueue {
     #[must_use]
     pub fn new() -> Self {
         Self {
+            native_feedback: None,
+            feedback_sequence: AtomicU64::new(0),
+            feedback_order: Mutex::new(guest::FeedbackOrder::new()),
+            feedback_records: Mutex::new(guest::FeedbackRecords::default()),
             declined_pending: AtomicBool::new(false),
             released_pending: AtomicBool::new(false),
             tracked: AtomicUsize::new(0),
@@ -132,6 +144,9 @@ impl RedirtyQueue {
 
     /// Record an upload the encoder did not emit; report whether it will be retried.
     ///
+    /// A native feedback proxy returns true after recording the answer; the PE owner applies
+    /// the shared retry budget and reports exhaustion during maintenance.
+    ///
     /// `false` means the subresource has spent its budget: the caller warns
     /// and the region stays as the texture holds it. The entry is not queued
     /// in that case, so a spent subresource costs nothing per attempt beyond
@@ -141,6 +156,10 @@ impl RedirtyQueue {
     ///
     /// If a previous caller panicked while holding the queue's lock.
     pub fn decline(&self, entry: RedirtyEntry) -> bool {
+        if let Some(feedback) = &self.native_feedback {
+            feedback.publish(&mtld3d_shared::upload_feedback::UploadOutcome::Declined);
+            return true;
+        }
         let (retry, tracked) = {
             let mut inner = self.inner.lock().expect("redirty queue mutex poisoned");
             let subresource = entry.subresource;
@@ -178,6 +197,10 @@ impl RedirtyQueue {
     ///
     /// If a previous caller panicked while holding the queue's lock.
     pub fn note_emitted(&self, emitted: EmittedUpload) {
+        if let Some(feedback) = &self.native_feedback {
+            feedback.publish(&mtld3d_shared::upload_feedback::UploadOutcome::Emitted);
+            return;
+        }
         if !emitted.releases_staging && self.tracked.load(Ordering::Relaxed) == 0 {
             return;
         }

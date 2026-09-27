@@ -1,10 +1,21 @@
 use core::{ffi::c_void, mem::MaybeUninit, ops::DerefMut, ptr::NonNull};
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
+    atomic::{AtomicU32, AtomicU64, Ordering},
 };
 
 use log::{debug, error, info, trace, warn};
+pub use mtld3d_core::encoder_data::{
+    BeginVisibilityOp, BindColorOp, BindDepthOp, BindDepthOpFlags, CarryDepthOp, ClearColorOp,
+    ClearColorRectsOp, ClearDepthStencilOp, ClearDepthStencilRectsOp, ColorFillOp, DepthBinding,
+    DestroyTextureOp, EndVisibilityOp, GenerateMipmapsOp, GenerateMipmapsOrderedOp,
+    NoteColorReadOp, PendingVbibRetention, ReadColorHandleOp, ReadDeviceBufferOp,
+    ReadTextureColorHandleOp, ReadTextureHandleOp, ResolveDepthSurfaceOp, ResolveDepthTextureOp,
+    ResolveDynamicDepthOp, RetireColorOp, RetireDepthOp, RtBinding, SetDumpDrawOp,
+    SetVertexSamplerOp, SetVertexTextureOp, SetViewportOp, StretchBlitOp, StretchKind,
+    StretchSurfaceFlags, StretchSurfaceInfo, UnbindExtraColorOp, UploadColorOp, UploadResampledOp,
+    UploadTextureAndMipsOp, UploadTextureOp, UploadTextureOpFlags,
+};
 
 mod frame_dump;
 mod mem_watch;
@@ -18,6 +29,7 @@ use mtld3d_core::{
     },
     dirty_rect::DirtyRect,
     dxso::{VsSamplerKinds, operand_token_count},
+    encoder_draw::{ApiSnapshotCache, SnapshotAttributes, SnapshotDelta},
     ff_state::{FfState, FfVsDirty, TssWriteFeeds, tss_write_feeds},
     format::{
         FormatMapping, compute_mip_count, compute_mip_size, compute_volume_mip_count,
@@ -25,7 +37,7 @@ use mtld3d_core::{
     },
     ids::{BufferId, ProgramId, TextureId},
     page_box::PageBox,
-    passes::{BackbufferContents, ExtraColorSlot},
+    passes::BackbufferContents,
     perf::{
         ApiPerfState, ApiPerfStorage, ApiTimer, BindSubCategory, CycleAddTimer, CycleSetTimer,
         DeviceSubCategory, KeysGate,
@@ -86,14 +98,13 @@ use super::{
     cursor::{self, CursorState},
     direct3d9::{depth_format_has_stencil, is_depth_stencil_format},
     draw::{
-        AttrSnapshot, CurrentSnapshot, CurrentSnapshotPtr, DepthScissorFlags, DepthStencilFlags,
-        DrawOp, IndexSource, PsSource, PsSourcePtr, RenderStatePtr, RenderStateSnapshot,
-        ScratchSlice, StageBinding, StreamBinding, VertexSource, VsSource, VsSourcePtr,
-        arena_alloc_bytes, build_alpha_ref_bytes, bump_packed_stage_bindings,
+        DepthScissorFlags, DepthStencilFlags, DrawOp, IndexSource, PsSource, RenderStateSnapshot,
+        ScratchSlice, StageBinding, StreamBinding, VertexSource, VsSource, arena_alloc_bytes,
+        build_alpha_ref_bytes,
     },
     encoder::{
-        BlitSide, ColorFillTarget, EncoderThread, FrameData, FrameEncoder, FrameInit, Op,
-        StagingWarmupEntry, SubmitFence, TextureInfo, VbibWarmupEntry,
+        ColorFillTarget, EncoderThread, FrameData, FrameInit, Op, StagingWarmupEntry, SubmitFence,
+        TextureInfo, VbibWarmupEntry,
     },
     index_buffer::{Direct3DIndexBuffer9, IndexBufferCreateInfo},
     null_out,
@@ -114,12 +125,6 @@ use super::{
     vertex_decl::{Direct3DVertexDeclaration9, VertexDeclCreateInfo},
     vertex_shader::Direct3DVertexShader9,
 };
-
-/// Sub-target for accepted-`StretchRect` blit traces.
-///
-/// Sits under `mtld3d::d3d9::*` so `RUST_LOG=mtld3d::d3d9::blit=trace` opts
-/// in granularly without flipping the rest of the d3d9 logger.
-const BLIT_TRACE_TARGET: &str = "mtld3d::d3d9::blit";
 
 /// Sub-target for the once-per-distinct texture-create diagnostic in `device_create_texture`.
 ///
@@ -268,17 +273,6 @@ static DIRECT3D_DEVICE9_VTBL: IDirect3DDevice9Vtbl = IDirect3DDevice9Vtbl {
 const CLIP_PLANE_SLOTS: usize = mtld3d_core::vs_draw::MAX_CLIP_PLANES;
 
 // ── DeviceInner — non-repr(C) state behind the inner pointer ──
-
-/// One VB/IB backing queued for seq-gated destruction.
-///
-/// Pushed by the API thread on Lock-rename and on VB/IB release; drained
-/// into `FrameData` at `present()` and handed to the encoder for final
-/// cleanup.
-pub struct PendingVbibRetention {
-    pub buffer_id: BufferId,
-    pub page_box: PageBox,
-    pub last_submit_seq: u64,
-}
 
 bitflags::bitflags! {
     /// Assorted per-device boolean state.
@@ -456,13 +450,6 @@ pub struct DeviceInner {
 
     // Encoder + frame state.
     encoder: EncoderThread,
-    /// Lifetime handle for the detached shader-cache prewarm thread.
-    ///
-    /// Stored here so `device_release` can stop it before any teardown
-    /// step — otherwise an in-flight prewarm `CompileShaderLibrary`
-    /// thunk would race with `shutdown_cleanup`'s destroy thunks on
-    /// the same `MTLDevice`.
-    prewarm: mtld3d_core::shader_prewarm::PrewarmHandle,
     current_frame: FrameData,
     /// Shared with the encoder thread and the unix completion handler.
     ///
@@ -740,21 +727,11 @@ pub struct DeviceInner {
     /// touch it). `emit_snapshot_deltas` walks the bits, rebuilds only the
     /// dirty pieces, and clears the flag.
     ///
-    /// `stamp_and_swap` sets this to `SnapshotDirty::all()` on frame
-    /// rotation so the first draw of each new frame re-emits every
-    /// piece — the cached scratch pointers in `snapshot_cache` all
-    /// alias into the previous frame's `ScratchArena`, which is about
-    /// to drop.
+    /// Frame rotation sets all dirty bits so native state is initialized before
+    /// the first draw in each frame.
     snapshot_dirty: SnapshotDirty,
-    /// Cached `CurrentSnapshot` pieces from the most recent `emit_snapshot_deltas`.
-    ///
-    /// Each changed snapshot shipped with a draw is built from
-    /// this cache: dirty pieces are rebuilt + the cache field is updated; clean
-    /// pieces reuse the cached scratch pointer (same per-frame arena, still
-    /// valid). Initial state is `default()` (all `None`); the first draw of
-    /// every frame starts with `snapshot_dirty == all()` so every field is
-    /// freshly populated before the cached state is composed.
-    snapshot_cache: CurrentSnapshot,
+    /// Owned keys retained only for subsequent API-side dirty-state builders and dumps.
+    snapshot_cache: ApiSnapshotCache,
     /// The F12 draw-state dump, see `frame_dump`.
     frame_dump: frame_dump::FrameDump,
     /// Cached `bound_texture_mask` from the most recent `STAGES` rebuild.
@@ -774,13 +751,6 @@ pub struct DeviceInner {
     /// and folded into a programmable `VsSource` so a shader reading an
     /// unprovided input compiles a distinct, zero-filled variant.
     cached_vs_provided_mask: u16,
-    /// Running high-water mark of `FrameData.ops.len()`.
-    ///
-    /// Covers every frame this device has rotated through `stamp_and_swap`.
-    /// Used to pre-reserve the new frame's ops Vec so steady-state and
-    /// post-burst frames never pay a realloc. Monotonically grows;
-    /// memory cost = peak × `size_of::<Op>()`.
-    peak_ops_count: usize,
 }
 
 /// Per-RS-index dirty mask.
@@ -1027,9 +997,16 @@ impl DeviceInner {
         let (x, y, width, height) = (v.x, v.y, v.width, v.height);
         let min_z = v.min_z;
         let max_z = v.max_z.max(v.min_z + 0.001);
-        self.push_op(Box::new(move |enc| {
-            enc.set_viewport(x, y, width, height, min_z, max_z);
-        }));
+        self.push_op(crate::encoder::Op::SetViewport(
+            mtld3d_core::encoder_data::capture_op(crate::device::SetViewportOp {
+                x,
+                y,
+                width,
+                height,
+                min_z,
+                max_z,
+            }),
+        ));
         // Viewport feeds XYZRHW row 0 (`[vp_w, vp_h, vp_x, vp_y]`). Mark
         // WV — `emit_snapshot_deltas` dispatches the XYZRHW row 0 write
         // unconditionally when `ff_dirty` is non-empty and `key.has_rhw`,
@@ -1240,9 +1217,12 @@ impl DeviceInner {
     pub fn set_vertex_sampler_slot_state(&mut self, slot: usize, type_: usize, value: u32) {
         self.vertex_sampler_states[slot][type_] = value;
         let state = self.vertex_sampler_states[slot];
-        self.push_op(Box::new(move |enc| {
-            enc.set_vertex_sampler_binding(slot, state);
-        }));
+        self.push_op(crate::encoder::Op::SetVertexSampler(
+            mtld3d_core::encoder_data::capture_op(crate::device::SetVertexSamplerOp {
+                slot: u8::try_from(slot).expect("validated attachment or vertex sampler slot"),
+                state,
+            }),
+        ));
     }
 
     /// Bind `tex` to vertex texture fetch slot `slot` (0..4).
@@ -1286,9 +1266,12 @@ impl DeviceInner {
             crate::texture::flush_dirty_mips(bound.inner_mut(), self);
             Some(bound.texture_id())
         };
-        self.push_op(Box::new(move |enc| {
-            enc.set_vertex_texture_binding(slot, id);
-        }));
+        self.push_op(crate::encoder::Op::SetVertexTexture(
+            mtld3d_core::encoder_data::capture_op(crate::device::SetVertexTextureOp {
+                slot: u8::try_from(slot).expect("validated attachment or vertex sampler slot"),
+                id,
+            }),
+        ));
     }
 
     pub const fn stage_bindings(&self) -> &StageBindings {
@@ -1314,8 +1297,8 @@ impl DeviceInner {
 
     /// Mark all snapshot pieces as dirty.
     ///
-    /// Used by `stamp_and_swap` (arena rotation invalidates every cached
-    /// scratch pointer), `reset_to_defaults` (every input reset), and
+    /// Used by `stamp_and_swap` (a new native frame starts with empty state),
+    /// `reset_to_defaults` (every input reset), and
     /// state-block `apply_to` (touches many pieces — coarse is fine).
     pub fn mark_snapshot_dirty_all(&mut self) {
         self.snapshot_dirty.insert(SnapshotDirty::all());
@@ -1324,8 +1307,7 @@ impl DeviceInner {
     /// Insert specific dirty bits for a Set* on the live state path.
     ///
     /// Cheaper than `mark_snapshot_dirty_all` — only the listed pieces
-    /// get rebuilt on the next draw; clean pieces reuse the cached
-    /// scratch pointers in `snapshot_cache`.
+    /// get rebuilt on the next draw; clean pieces retain the native state.
     pub fn mark_snapshot_dirty(&mut self, bits: SnapshotDirty) {
         self.snapshot_dirty.insert(bits);
     }
@@ -1488,8 +1470,8 @@ impl DeviceInner {
     /// `flush_current_frame_blocking`. A pending `PresentationInterval` change
     /// is not put here but on the frame `stamp_and_swap` hands to the encoder,
     /// so it rides the next submission rather than the one after it.
-    pub const fn fresh_frame(&self) -> FrameData {
-        FrameData::new(&FrameInit {
+    pub fn fresh_frame(&self) -> FrameData {
+        let mut frame = FrameData::new(&FrameInit {
             device_handle: self.device_handle,
             record_handle: self.record_handle,
             backbuffer_handle: self.backbuffer_handle,
@@ -1511,7 +1493,9 @@ impl DeviceInner {
             ),
             depth_texture: self.depth_stencil_handle,
             depth_has_stencil: depth_format_has_stencil(self.depth_stencil_format),
-        })
+        });
+        self.encoder.reuse_recording_storage(&mut frame);
+        frame
     }
 
     /// Stamp per-frame counters + `submit_seq` onto `frame`, swap it in for `current_frame`.
@@ -1545,22 +1529,8 @@ impl DeviceInner {
             let carried = frame.take_carried_capture_marks(true);
             self.current_frame.mark_gpu_capture(carried);
         }
-        // Pre-reserve the new frame's ops Vec to the running peak so
-        // it never reallocs in steady-state — and so that a post-burst
-        // dip doesn't shrink capacity (causing the next burst to
-        // realloc again). High-water mark monotonically grows; memory
-        // cost is one Op slot (~72 B) per peak op. The first frame
-        // sees `peak_ops_count = 0` and pays the initial doubling;
-        // every subsequent frame reuses the peak.
-        self.peak_ops_count = self.peak_ops_count.max(frame.ops_len());
-        self.current_frame.reserve_ops(self.peak_ops_count);
-        // Sample the API→encoder Vec<Op> footprint *before* draining
-        // the perf state — capacity is read off the outgoing frame and
-        // the realloc counter is taken (drained to 0) from the same
-        // frame. Plumbs through `FramePerfPayload` so the encoder
-        // thread's `log_frame_summary` can surface them in the
-        // `Per-frame allocator footprint` section alongside the
-        // encoder-side `cmd_vec` row.
+        // Preserve the existing perf payload fields while command bytes and UP data
+        // share the recycled frame arena.
         let op_vec_capacity_bytes = frame.op_vec_capacity_bytes();
         let op_vec_realloc_bytes = frame.take_op_vec_realloc_bytes();
         self.perf.state_mut().drain_into_payload(frame.perf_mut());
@@ -1569,8 +1539,8 @@ impl DeviceInner {
             .set_op_vec_metrics(op_vec_capacity_bytes, op_vec_realloc_bytes);
         frame.set_vbib_retentions(core::mem::take(&mut self.vbib_retention_pending));
         // `Staged` uploads ride the op stream (inline `Op::StageUpload`),
-        // so they were already moved into `frame.ops` at `Unlock`. Handed
-        // off — the encoder now owns counting their `PageBox` bytes into
+        // so their page leases were recorded at `Unlock`. The encoder owns
+        // counting their `PageBox` bytes into
         // the shared `vbib_retained_bytes` at intake.
         self.pending_retention_bytes = 0;
         frame.set_no_present(no_present);
@@ -1622,11 +1592,12 @@ impl DeviceInner {
     /// every draw issued this frame before the readback blit samples the
     /// backbuffer. Present is suppressed for this submission so the drawable
     /// is not consumed.
-    pub fn flush_current_frame_blocking(&mut self) {
-        self.hurry_presentation();
+    pub fn flush_current_frame_blocking(&mut self) -> Result<(), i32> {
+        self.encoder.status()?;
+        self.hurry_presentation()?;
         let fresh = self.fresh_frame();
         let (frame, _) = self.stamp_and_swap(fresh, true);
-        self.encoder.mid_frame_submit(frame);
+        self.encoder.mid_frame_submit(frame)
     }
 
     /// Let the submits in flight copy the present they wait for, ahead of a flush.
@@ -1639,16 +1610,21 @@ impl DeviceInner {
     /// puts the policy back once its own submission has committed. The one
     /// thunk this side issues off the device lifecycle, and only on a path
     /// that is already a synchronous read-back.
-    fn hurry_presentation(&self) {
+    fn hurry_presentation(&self) -> Result<(), i32> {
         if self.record_handle.is_null() {
-            return;
+            return Ok(());
         }
         let mut params = SetPresentWaitPolicyParams {
             record_handle: self.record_handle,
             policy: PresentWaitPolicy::SnapshotPending,
             pad0: 0,
         };
-        unix_call(&mut params);
+        let status = unix_call(&mut params);
+        if status != D3D_OK {
+            error!(target: LOG_TARGET, "encoder: presentation barrier failed {status:#x}");
+            return Err(self.encoder.record_failure(status));
+        }
+        Ok(())
     }
 
     /// Queue the current frame without presenting or waiting for its submission to finish.
@@ -1656,10 +1632,11 @@ impl DeviceInner {
     /// EVENT queries observe GPU retirement separately. They only need to
     /// hand off the open frame, with the same bounded channel backpressure
     /// as Present, while the API starts recording its continuation.
-    pub fn flush_current_frame_async(&mut self) {
+    pub fn flush_current_frame_async(&mut self) -> Result<(), i32> {
+        self.encoder.status()?;
         let fresh = self.fresh_frame();
         let (frame, _) = self.stamp_and_swap(fresh, true);
-        self.encoder.send_frame(frame);
+        self.encoder.send_frame(frame)
     }
 
     /// Push the encoder op that binds `binding` as the depth/stencil attachment.
@@ -1673,52 +1650,18 @@ impl DeviceInner {
         depth_has_stencil: bool,
         sample_count: u8,
     ) {
-        self.push_op(Box::new(move |enc| {
-            let (depth_texture, level, desc, unscaled) = match binding {
-                DepthBinding::None => (
-                    MetalHandle::NULL,
-                    0,
-                    (0, 0, mtld3d_shared::mtl::PixelFormat::Depth32Float),
-                    false,
-                ),
-                DepthBinding::Eager(h, (w, hgt), scale) => {
-                    let format = if depth_has_stencil {
-                        mtld3d_shared::mtl::PixelFormat::Depth32FloatStencil8
-                    } else {
-                        mtld3d_shared::mtl::PixelFormat::Depth32Float
-                    };
-                    (h, 0, (w, hgt, format), scale.is_identity())
-                }
-                DepthBinding::Lazy(info, level, scale) => {
-                    // SAFETY: `get_or_create_texture` returns a Metal texture
-                    // handle from the typed `texture_cache` via `.raw()`.
-                    let handle = unsafe {
-                        MetalHandle::<MTLTextureKind>::new(enc.get_or_create_texture(&info))
-                    };
-                    let desc = (
-                        (info.width >> level).max(1),
-                        (info.height >> level).max(1),
-                        info.pixel_format,
-                    );
-                    (handle, level, desc, scale.is_identity())
-                }
-            };
-            enc.set_depth_attachment_desc(desc.0, desc.1, desc.2);
-            enc.set_depth_stencil_attachment_level(
-                depth_texture,
-                level,
-                (desc.0, desc.1),
-                is_sampleable,
-                depth_has_stencil,
-            );
-            // In lockstep with the bind, which resets the count: a depth
-            // surface that disagrees with render target 0 is dropped at pass
-            // open rather than handed to Metal.
-            enc.set_depth_sample_count(sample_count);
-            // In lockstep too: the bind clears it, and only an unscaled depth
-            // surface may set a pass's extent in place of render target 0.
-            enc.set_depth_unscaled(unscaled);
-        }));
+        self.push_op(crate::encoder::Op::BindDepth(
+            mtld3d_core::encoder_data::capture_op(crate::device::BindDepthOp {
+                binding,
+                sample_count,
+                flags: {
+                    let mut flags = BindDepthOpFlags::empty();
+                    flags.set(BindDepthOpFlags::SAMPLEABLE, is_sampleable);
+                    flags.set(BindDepthOpFlags::HAS_STENCIL, depth_has_stencil);
+                    flags
+                },
+            }),
+        ));
     }
 
     /// Push the encoder op that binds `info` as colour render target `slot` (0..=3).
@@ -1727,7 +1670,7 @@ impl DeviceInner {
     /// blocking` can re-assert the persistent binding into the fresh frame.
     /// Every variant of `info` carries the size D3D9 reports for the target;
     /// `scale` is what the bound resource itself is rasterized at, taken from
-    /// the resource on the API thread because the closure runs on the encoder
+    /// the resource on the API thread because the operation runs on the encoder
     /// thread, which cannot reach it.
     fn push_color_rt_binding_op(
         &mut self,
@@ -1735,123 +1678,13 @@ impl DeviceInner {
         info: RtBinding,
         scale: mtld3d_core::render_scale::RenderScale,
     ) {
-        self.push_op(Box::new(move |enc| {
-            let (handle, msaa, msaa_srgb, sample_count, extent, fmt, has_alpha, slice, level) =
-                match info {
-                    RtBinding::Backbuffer {
-                        handle,
-                        msaa,
-                        msaa_srgb,
-                        sample_count,
-                        width,
-                        height,
-                    } => (
-                        handle,
-                        msaa,
-                        msaa_srgb,
-                        sample_count,
-                        TargetExtent::whole(scale, (width, height)),
-                        mtld3d_shared::mtl::PixelFormat::Bgra8Unorm,
-                        // The backbuffer is an alpha-bearing A8R8G8B8 target
-                        // (see `PassState::reset_frame`), so its destination-alpha
-                        // blend factors resolve unclamped.
-                        true,
-                        0,
-                        0,
-                    ),
-                    RtBinding::StandaloneColor {
-                        handle,
-                        srgb,
-                        msaa,
-                        msaa_srgb,
-                        sample_count,
-                        format,
-                        has_alpha,
-                        width,
-                        height,
-                    } => {
-                        enc.register_srgb_twin(srgb, handle);
-                        (
-                            handle,
-                            msaa,
-                            msaa_srgb,
-                            sample_count,
-                            TargetExtent::whole(scale, (width, height)),
-                            format,
-                            has_alpha,
-                            0,
-                            0,
-                        )
-                    }
-                    RtBinding::Texture {
-                        info,
-                        has_alpha,
-                        width,
-                        height,
-                        slice,
-                        level,
-                    } => {
-                        let fmt = info.pixel_format;
-                        // `info` measures the base level in render texels, the
-                        // extent the Metal texture was created at; the level
-                        // bound is Metal's own halving of that.
-                        let extent = TargetExtent::mip_level(
-                            scale,
-                            (width, height),
-                            (info.width, info.height),
-                            level,
-                        );
-                        let h = enc.get_or_create_texture(&info);
-                        // SAFETY: `get_or_create_texture` returns a Metal texture
-                        // handle from the encoder's typed `texture_cache` via `.raw()`.
-                        (
-                            unsafe { MetalHandle::<MTLTextureKind>::new(h) },
-                            // D3D9 has no multisampled texture: only a surface
-                            // from `CreateRenderTarget` or the swap chain can
-                            // carry samples, so a texture-backed bind is always
-                            // single-sampled.
-                            MetalHandle::NULL,
-                            MetalHandle::NULL,
-                            1,
-                            extent,
-                            fmt,
-                            has_alpha,
-                            slice,
-                            level,
-                        )
-                    }
-                };
-            if slot != 0 {
-                enc.set_extra_color_render_target(
-                    slot,
-                    Some(ExtraColorSlot {
-                        texture: handle,
-                        msaa_texture: msaa,
-                        msaa_srgb_texture: msaa_srgb,
-                        sample_count,
-                        subresource: slice | (level << 16),
-                        size: extent.texture(),
-                        logical_size: extent.logical(),
-                        format: fmt,
-                        scale,
-                        has_alpha,
-                    }),
-                );
-            } else {
-                enc.set_color_render_target(&crate::encoder::ColorRtBinding {
-                    texture: handle,
-                    msaa_texture: msaa,
-                    msaa_srgb_texture: msaa_srgb,
-                    sample_count,
-                    logical_size: extent.logical(),
-                    size: extent.texture(),
-                    format: fmt,
-                    has_alpha,
-                    scale,
-                    subresource: (slice, level),
-                });
-            }
-        }));
+        self.push_op(crate::encoder::Op::BindColor(
+            mtld3d_core::encoder_data::capture_op(crate::device::BindColorOp {
+                slot: u8::try_from(slot).expect("validated attachment or vertex sampler slot"),
+                info,
+                scale,
+            }),
+        ));
     }
 
     /// Unbind render target `slot` (1..=3): `SetRenderTarget(slot, NULL)`.
@@ -1860,16 +1693,20 @@ impl DeviceInner {
     /// drops the persistent binding and tells the encoder.
     fn unbind_extra_render_target(&mut self, slot: usize) {
         if let Some(old_id) = self.cur_autogen_rt_ids[slot].take() {
-            self.push_op(Box::new(move |enc| {
-                enc.run_generate_mipmaps_ordered(old_id);
-            }));
+            self.push_op(crate::encoder::Op::GenerateMipmapsOrdered(
+                mtld3d_core::encoder_data::capture_op(crate::device::GenerateMipmapsOrderedOp {
+                    old_id,
+                }),
+            ));
         }
         self.bound_rt_mut()
             .replace_render_target(slot, core::ptr::null_mut(), 0, 0);
         self.last_extra_rt_bindings[slot - 1] = None;
-        self.push_op(Box::new(move |enc| {
-            enc.set_extra_color_render_target(slot, None);
-        }));
+        self.push_op(crate::encoder::Op::UnbindExtraColor(
+            mtld3d_core::encoder_data::capture_op(crate::device::UnbindExtraColorOp {
+                slot: u8::try_from(slot).expect("validated extra color slot"),
+            }),
+        ));
     }
 
     /// Cheap retention-cap tier.
@@ -1878,8 +1715,8 @@ impl DeviceInner {
     /// retention items whose seq has already retired. No submit, no GPU
     /// wait — only useful when the encoder is sitting on drainable
     /// retention between frames. Returns when the drain completes.
-    pub fn drain_retention_now(&self) {
-        self.encoder.drain_retired_now();
+    pub fn drain_retention_now(&self) -> Result<(), i32> {
+        self.encoder.drain_retired_now()
     }
 
     /// Heavy retention-cap tier.
@@ -1890,11 +1727,12 @@ impl DeviceInner {
     /// returning — so on return the global allocator has freed bytes that
     /// include same-frame retentions which `drain_retention_now` couldn't
     /// release.
-    pub fn mid_frame_submit_for_retention(&mut self) {
-        self.hurry_presentation();
+    pub fn mid_frame_submit_for_retention(&mut self) -> Result<(), i32> {
+        self.encoder.status()?;
+        self.hurry_presentation()?;
         let fresh = self.fresh_frame();
         let (frame, _) = self.stamp_and_swap(fresh, true);
-        self.encoder.mid_frame_submit_for_retention(frame);
+        self.encoder.mid_frame_submit_for_retention(frame)
     }
 
     /// Allocate a rename backing under the VB/IB retention cap.
@@ -1905,14 +1743,15 @@ impl DeviceInner {
     /// process the allocator never fails cleanly — the process thrashes or
     /// dies long before `alloc` returns null, so reacting to a null was
     /// always too late to be the fix.
-    pub fn alloc_pagebox_capped(&mut self, logical_len: usize) -> PageBox {
+    pub fn alloc_pagebox_capped(&mut self, logical_len: usize) -> Result<PageBox, i32> {
+        self.encoder.status()?;
         // Recycle-pool fast path: a hit is a warm, still-committed box of
         // the same padded size, allocates nothing, and therefore skips the
         // retention-cap check below (which exists to bound allocations).
         let pool = &*crate::page_box_pool::PAGEBOX_POOL;
         if let Some(b) = pool.acquire(logical_len) {
             self.perf.state_mut().bump_vbib_pool_hit();
-            return b;
+            return Ok(b);
         }
         if pool.enabled() {
             // Misses count only while the pool is on, so the A/B baseline
@@ -1928,21 +1767,21 @@ impl DeviceInner {
                 self.vbib_retained_bytes.load(Ordering::Acquire) + self.pending_retention_bytes;
             if retained >= self.retention_cap_bytes {
                 self.perf.state_mut().bump_retention_cap_drain();
-                self.drain_retention_now();
+                self.drain_retention_now()?;
                 let after =
                     self.vbib_retained_bytes.load(Ordering::Acquire) + self.pending_retention_bytes;
                 if after >= self.retention_cap_bytes {
                     self.perf.state_mut().bump_retention_cap_submit();
-                    self.mid_frame_submit_for_retention();
+                    self.mid_frame_submit_for_retention()?;
                 }
             }
         }
-        PageBox::new_uninit(logical_len)
+        Ok(PageBox::new_uninit(logical_len))
     }
 
     /// Swap in a fresh frame and send the full op list to the encoder.
     ///
-    /// Clears and attachment changes flow through `push_op` closures inside
+    /// Clears and attachment changes flow through `push_op` operations inside
     /// the frame itself, so no per-Device clear snapshot is needed.
     ///
     /// This is also where the per-frame perf counters are published:
@@ -1951,6 +1790,9 @@ impl DeviceInner {
     /// Present's `send_frame`) is stashed into the incoming fresh frame so
     /// the encoder's next summary can read it.
     pub fn present(&mut self) -> i32 {
+        if let Err(hr) = self.encoder.status() {
+            return hr;
+        }
         // Both `IDirect3DDevice9::Present` and the swap chain's land here, so
         // the diagnostics that run once per frame poll from this point.
         crate::capture::poll();
@@ -1975,7 +1817,9 @@ impl DeviceInner {
         // `CycleSetTimer` writes into that frame's `present_block_cycles`
         // when it drops at end of scope.
         let _stall = CycleSetTimer::start(self.current_frame.perf_mut().present_block_cycles_ptr());
-        self.encoder.send_frame(frame);
+        if let Err(hr) = self.encoder.send_frame(frame) {
+            return hr;
+        }
         self.frame_dump_present(crate::capture::take_request(), seq);
         self.mem_watch_present();
         mtld3d_types::D3D_OK
@@ -2010,11 +1854,43 @@ impl DeviceInner {
         }
     }
 
-    pub fn shutdown(&mut self) {
-        self.encoder.shutdown();
+    pub const fn encoder_runtime(&self) -> u64 {
+        self.encoder.runtime()
     }
 
-    pub fn push_op(&mut self, op: Box<dyn FnOnce(&mut FrameEncoder) + Send>) {
+    pub fn shutdown(&mut self) -> Result<(), i32> {
+        self.encoder.shutdown()
+    }
+
+    pub fn encoder_status(&self) -> Result<(), i32> {
+        if let Some(error) = self.current_frame.recording_error() {
+            let status = match error {
+                mtld3d_shared::encoder_wire::WireError::AllocationFailed => {
+                    mtld3d_types::E_OUTOFMEMORY
+                }
+                _ => mtld3d_types::D3DERR_DEVICELOST,
+            };
+            return Err(self.encoder.record_failure(status));
+        }
+        self.encoder.status()
+    }
+
+    pub fn try_push_op(&mut self, op: Op) -> Result<(), mtld3d_shared::encoder_wire::WireError> {
+        self.current_frame.try_push_op(op)
+    }
+
+    /// Capture mutable API input once for replay from the shared frame arena.
+    ///
+    /// # Safety
+    ///
+    /// Keep the returned token within this frame's operations. No copy of the
+    /// token may be read after native replay releases the frame arena.
+    pub unsafe fn capture_frame_bytes(&mut self, bytes: &[u8]) -> ScratchSlice {
+        // SAFETY: frame ownership keeps this immutable capture live through replay.
+        unsafe { arena_alloc_bytes(self.current_frame.scratch_mut(), bytes) }
+    }
+
+    pub fn push_op(&mut self, op: Op) {
         self.current_frame.push_op(op);
     }
 
@@ -2029,7 +1905,7 @@ impl DeviceInner {
     /// Queue an eager `MTLTexture` create on the current frame.
     ///
     /// The encoder drains the queue at `run_frame`'s head into one batched
-    /// `CreateTexturesBatch` thunk, so subsequent draw closures hit the
+    /// `CreateTexturesBatch` thunk, so subsequent draw operations hit the
     /// texture cache instead of cache-missing on first bind.
     pub fn push_texture_warmup(&mut self, info: TextureInfo) {
         self.current_frame.push_texture_warmup(info);
@@ -2158,7 +2034,7 @@ impl DeviceInner {
     ///
     /// Walks the live-textures registry, marks every previously-uploaded mip
     /// of a `D3DPOOL_MANAGED` texture dirty (via `texture::evict_mark_dirty`),
-    /// and pushes one `destroy_cached_texture` closure per affected texture.
+    /// and pushes one `destroy_cached_texture` operation per affected texture.
     /// The next bind-time `flush_dirty_mips` repopulates fresh `MTLTextures`
     /// from the still-alive PE-side staging Arc, which is the spec contract
     /// "evict from VRAM, runtime re-uploads on next use". A texture of any
@@ -2184,9 +2060,9 @@ impl DeviceInner {
         }
         let evicted_count = to_evict.len();
         for tex_id in to_evict {
-            self.push_op(Box::new(move |enc: &mut FrameEncoder| {
-                enc.destroy_cached_texture(tex_id);
-            }));
+            self.push_op(crate::encoder::Op::DestroyTexture(
+                mtld3d_core::encoder_data::capture_op(crate::device::DestroyTextureOp { tex_id }),
+            ));
         }
         mtld3d_shared::log_once_info!(
             target: TEX_TRACE_TARGET,
@@ -2268,14 +2144,15 @@ impl DeviceInner {
     ///
     /// The encoder waits (via `WaitForGpuRetire` thunk → Metal
     /// `waitUntilCompleted`) only when `coherent_seq < target_seq`;
-    /// otherwise it just runs intake locally. `target_seq == 0` (END closure
+    /// otherwise it just runs intake locally. `target_seq == 0` (END operation
     /// not yet processed: game called `Issue(END)` but not Present) skips the
     /// round-trip entirely so the FLUSH poll loop can return `S_FALSE` fast.
-    pub fn encoder_intake_visibility_for(&self, target_seq: u64) {
+    pub fn encoder_intake_visibility_for(&self, target_seq: u64) -> Result<(), i32> {
+        self.encoder.status()?;
         if target_seq == 0 {
-            return;
+            return Ok(());
         }
-        self.encoder.intake_visibility_for(target_seq);
+        self.encoder.intake_visibility_for(target_seq)
     }
 
     pub const fn render_state(&self, index: usize) -> u32 {
@@ -2462,9 +2339,11 @@ impl DeviceInner {
         self.last_color_rt_binding = None;
         for slot in 1..RENDER_TARGET_SLOTS {
             if self.last_extra_rt_bindings[slot - 1].take().is_some() {
-                self.push_op(Box::new(move |enc| {
-                    enc.set_extra_color_render_target(slot, None);
-                }));
+                self.push_op(crate::encoder::Op::UnbindExtraColor(
+                    mtld3d_core::encoder_data::capture_op(crate::device::UnbindExtraColorOp {
+                        slot: u8::try_from(slot).expect("validated extra color slot"),
+                    }),
+                ));
             }
         }
         self.cur_autogen_rt_ids = [None; RENDER_TARGET_SLOTS];
@@ -2602,8 +2481,8 @@ impl DeviceInner {
     /// handles the caller destroys once this returns, so the encoder can
     /// forget them: they never reach the retention queue that prunes every
     /// other texture. Returns when the encoder has acknowledged.
-    pub fn encoder_reset(&self, retired_textures: Vec<u64>) {
-        self.encoder.reset(retired_textures);
+    pub fn encoder_reset(&self, retired_textures: &[u64]) -> Result<(), i32> {
+        self.encoder.reset(retired_textures)
     }
 
     /// Drop the empty `current_frame` left behind by `flush_current_frame_blocking`.
@@ -2743,7 +2622,9 @@ impl DeviceInner {
             self.backbuffer_width, self.backbuffer_height,
         );
 
-        self.flush_current_frame_blocking();
+        if self.flush_current_frame_blocking().is_err() {
+            return;
+        }
         let old_handles: [u64; 5] = [
             self.backbuffer_handle.raw(),
             self.backbuffer_srgb_handle.raw(),
@@ -2754,7 +2635,9 @@ impl DeviceInner {
         let live: Vec<u64> = old_handles.iter().copied().filter(|&h| h != 0).collect();
         // The same five leave through the same direct destroy a `Reset` uses,
         // so the encoder is told about them for the same reason.
-        self.encoder_reset(live.clone());
+        if self.encoder_reset(&live).is_err() {
+            return;
+        }
         if !live.is_empty() {
             let mut destroy = mtld3d_shared::DestroyResourcesBulkParams {
                 kind: mtld3d_shared::mtl::DestroyKind::Texture,
@@ -2891,7 +2774,6 @@ pub struct DeviceCreateInfo {
     /// Resolved `render.scale`, already forced to identity where unusable.
     pub render_scale: mtld3d_core::render_scale::RenderScale,
     pub encoder: EncoderThread,
-    pub prewarm: mtld3d_core::shader_prewarm::PrewarmHandle,
     pub current_frame: FrameData,
     pub render_states: [u32; RENDER_STATE_COUNT],
     pub sampler_states: [[u32; SAMPLER_STATE_COUNT]; STAGE_COUNT],
@@ -2944,7 +2826,9 @@ pub struct Direct3DDevice9 {
 }
 
 impl Direct3DDevice9 {
-    pub fn new(info: DeviceCreateInfo) -> Self {
+    pub fn new(mut info: DeviceCreateInfo) -> Self {
+        info.encoder
+            .reuse_recording_storage(&mut info.current_frame);
         let viewport = D3DVIEWPORT9 {
             x: 0,
             y: 0,
@@ -2993,7 +2877,6 @@ impl Direct3DDevice9 {
             implicit_render_target: 0,
             implicit_depth_stencil: 0,
             encoder: info.encoder,
-            prewarm: info.prewarm,
             current_frame: info.current_frame,
             coherent_seq,
             upload_coherent_seq,
@@ -3048,12 +2931,11 @@ impl Direct3DDevice9 {
             live_textures: Mutex::new(rustc_hash::FxHashMap::default()),
             upload_redirty: Arc::new(RedirtyQueue::new()),
             snapshot_dirty: SnapshotDirty::all(),
-            snapshot_cache: CurrentSnapshot::EMPTY,
+            snapshot_cache: ApiSnapshotCache::EMPTY,
             frame_dump: frame_dump::FrameDump::IDLE,
             cached_bound_texture_mask: 0,
             cached_ff_vs_layout: FfVsLayout::default(),
             cached_vs_provided_mask: u16::MAX,
-            peak_ops_count: 0,
         }));
         Self {
             vtbl: &raw const DIRECT3D_DEVICE9_VTBL,
@@ -3408,63 +3290,11 @@ impl DeviceInner {
 
 // ── RtBinding — attachment info captured on API thread for pass break ──
 //
-// The `SetRenderTarget` closure runs on the encoder thread and needs to
+// The `SetRenderTarget` operation runs on the encoder thread and needs to
 // either (1) create/fetch a Metal texture for a texture-backed RT surface,
 // or (2) restore the backbuffer handle for a standalone surface. We
 // capture everything it needs at call time since the surface pointer may
-// be released before the closure runs.
-
-#[derive(Clone)]
-enum RtBinding {
-    Backbuffer {
-        handle: MetalHandle<MTLTextureKind>,
-        /// Multisampled companion of the back buffer, NULL when there is none.
-        msaa: MetalHandle<MTLTextureKind>,
-        /// sRGB twin view of that companion, NULL whenever the companion is.
-        msaa_srgb: MetalHandle<MTLTextureKind>,
-        sample_count: u8,
-        width: u32,
-        height: u32,
-    },
-    /// A standalone `CreateRenderTarget` colour surface.
-    ///
-    /// `parent_texture` is null (so it is not texture-backed) but it
-    /// carries its own persistent `metal_color_handle` distinct from the
-    /// backbuffer, plus its own format and dimensions. Bound directly —
-    /// unlike `Backbuffer`, the format is the surface's actual format, not
-    /// the hard-wired backbuffer `Bgra8Unorm`.
-    StandaloneColor {
-        handle: MetalHandle<MTLTextureKind>,
-        /// sRGB twin view of `handle`, or null when the format has none.
-        ///
-        /// Registered with the pass state when the target is bound, so a
-        /// `D3DRS_SRGBWRITEENABLE` draw onto it attaches the twin.
-        srgb: MetalHandle<MTLTextureKind>,
-        /// Multisampled companion of the surface, NULL when there is none.
-        msaa: MetalHandle<MTLTextureKind>,
-        /// sRGB twin view of that companion, NULL whenever the companion is.
-        msaa_srgb: MetalHandle<MTLTextureKind>,
-        sample_count: u8,
-        format: mtld3d_shared::mtl::PixelFormat,
-        /// Whether the surface's D3D format has a real alpha channel.
-        ///
-        /// Carried separately because the Metal `format` can't distinguish
-        /// X8R8G8B8 (no alpha) from A8R8G8B8 (both `Bgra8Unorm`). Feeds
-        /// the pipeline snapshot's `COLOR_HAS_ALPHA` bit.
-        has_alpha: bool,
-        width: u32,
-        height: u32,
-    },
-    Texture {
-        info: TextureInfo,
-        /// See `StandaloneColor::has_alpha`.
-        has_alpha: bool,
-        width: u32,
-        height: u32,
-        slice: u32,
-        level: u32,
-    },
-}
+// be released before the operation runs.
 
 // ── IUnknown implementation (IDirect3DDevice9) ──
 
@@ -3692,11 +3522,6 @@ extern "system" fn device_release(this: *mut c_void) -> u32 {
         // no other reference can survive a zero refcount.
         let mut device_inner = unsafe { Box::from_raw(obj.inner) };
 
-        // Stop the detached shader-prewarm worker before anything else.
-        // Its loop calls `unix_call(CompileShaderLibrary)` which would
-        // otherwise race with the encoder's destroy thunks on the same
-        // `MTLDevice` during `shutdown_cleanup`.
-        device_inner.prewarm.cancel_and_join();
         // From here on a window message that reaches the cursor subclass
         // finds a device being torn down, and the resize it may ask for
         // must not rebuild what the steps below destroy.
@@ -3780,13 +3605,13 @@ extern "system" fn device_release(this: *mut c_void) -> u32 {
         unsafe { crate::surface::finalize_implicit_surface(implicit_ds) };
 
         // Flush any ops queued on `current_frame` since the last Present —
-        // most importantly the texture/VB destroy closures `texture_release`
+        // most importantly the texture/VB destroy operations `texture_release`
         // and `buffer_release` push when the game releases its resources
         // ahead of the device. Without this flush they die with
         // `current_frame` on `drop(device_inner)` and the matching
         // MTLBuffers leak; the next CreateDevice fails to wrap the same
         // `bytesNoCopy` pages because Metal still considers them in-use.
-        device_inner.flush_current_frame_blocking();
+        let _flush = device_inner.flush_current_frame_blocking();
 
         // Shut down encoder thread before destroying Metal resources.
         // The `Shutdown` message triggers `FrameEncoder::shutdown_cleanup`
@@ -3802,7 +3627,11 @@ extern "system" fn device_release(this: *mut c_void) -> u32 {
         // layer once they go. By the time `shutdown` returns here every
         // MTLBuffer wrapping a `PageBox` the game ever Locked has been
         // released.
-        device_inner.shutdown();
+        if device_inner.shutdown().is_err() {
+            // An unacknowledged shutdown may still read device-owned sinks and GPU resources.
+            std::mem::forget(device_inner);
+            return rc;
+        }
 
         if !implicit_handles.is_empty() {
             let mut destroy = mtld3d_shared::DestroyResourcesBulkParams {
@@ -3934,8 +3763,13 @@ extern "system" fn device_test_cooperative_level(this: *mut c_void) -> i32 {
     // The device is never lost (no exclusive mode is ever taken), so the only
     // non-OK answer is the latch a failed implicit-resource rebuild leaves behind.
     // SAFETY: vtable thunk; `this` is *mut Direct3DDevice9 per IDirect3DDevice9 ABI.
-    let not_reset = (unsafe { InPtr::<Direct3DDevice9>::opt(this) })
-        .is_some_and(|obj| obj.inner().needs_reset());
+    let object = unsafe { InPtr::<Direct3DDevice9>::opt(this) };
+    if let Some(obj) = &object
+        && let Err(hr) = obj.inner().encoder_status()
+    {
+        return hr;
+    }
+    let not_reset = object.is_some_and(|obj| obj.inner().needs_reset());
     if not_reset {
         mtld3d_types::D3DERR_DEVICENOTRESET
     } else {
@@ -4219,6 +4053,9 @@ extern "system" fn device_reset(this: *mut c_void, present_params: *mut c_void) 
         return D3DERR_INVALIDCALL;
     };
     let dev = obj.inner();
+    if let Err(hr) = dev.encoder_status() {
+        return hr;
+    }
 
     // Resolve the request on a local copy. A windowed Reset may pass zero
     // dimensions ("use the device window's client rect") and
@@ -4341,7 +4178,9 @@ extern "system" fn device_reset(this: *mut c_void, present_params: *mut c_void) 
         // the device is leaving. The fresh attach receives this Reset's
         // pacing directly.
         dev.pending_pacing = None;
-        retarget_device_window(dev, &pp, target_window);
+        if let Err(hr) = retarget_device_window(dev, &pp, target_window) {
+            return hr;
+        }
         // The fresh attach's layer carries no gamma table either.
         dev.reapply_gamma();
     }
@@ -4385,7 +4224,9 @@ extern "system" fn device_reset(this: *mut c_void, present_params: *mut c_void) 
         // same-size windowed/fullscreen Reset, which is issue #76's garbled
         // menu text. The resized path flushes inside
         // `reset_recreate_resources`.
-        dev.flush_current_frame_blocking();
+        if let Err(hr) = dev.flush_current_frame_blocking() {
+            return hr;
+        }
         debug!(
             target: LOG_TARGET,
             "Reset: dims unchanged ({}x{}), flushed pending ops, skipping the texture recreate cycle",
@@ -4508,13 +4349,13 @@ fn retarget_device_window(
     dev: &mut DeviceInner,
     pp: &mtld3d_types::D3DPRESENT_PARAMETERS,
     hwnd: usize,
-) {
+) -> Result<(), i32> {
     // Ops already queued name the layer that is about to go, and the encoder
     // waits for GPU idle, so nothing in flight references the view once the
     // detach releases it. No texture is destroyed here, so the encoder is
     // handed no retired handles.
-    dev.flush_current_frame_blocking();
-    dev.encoder_reset(Vec::new());
+    dev.flush_current_frame_blocking()?;
+    dev.encoder_reset(&[])?;
     if !dev.view_handle.is_null() {
         let mut detach = mtld3d_shared::DetachMetalLayerParams {
             view_handle: dev.view_handle,
@@ -4552,6 +4393,7 @@ fn retarget_device_window(
         layer_params.view_handle.raw(),
         layer_params.layer_handle.raw(),
     );
+    Ok(())
 }
 
 /// Steps 1-6 of the Reset protocol.
@@ -4571,7 +4413,7 @@ fn reset_recreate_resources(
     //    Reset handler waits for GPU idle, so by the time it returns,
     //    no in-flight command buffer references the old backbuffer or
     //    depth/stencil textures we're about to destroy.
-    dev.flush_current_frame_blocking();
+    dev.flush_current_frame_blocking()?;
     // 2. Destroy the old backbuffer + depth/stencil. Bulk thunk so the
     //    two handles cross the PE/Unix boundary in one call. The encoder is
     //    handed the same list: these five leave without passing through the
@@ -4585,7 +4427,7 @@ fn reset_recreate_resources(
         dev.depth_stencil_handle.raw(),
     ];
     let live: Vec<u64> = old_handles.iter().copied().filter(|&h| h != 0).collect();
-    dev.encoder_reset(live.clone());
+    dev.encoder_reset(&live)?;
     if !live.is_empty() {
         let mut destroy = mtld3d_shared::DestroyResourcesBulkParams {
             kind: mtld3d_shared::mtl::DestroyKind::Texture,
@@ -4697,7 +4539,7 @@ fn reconcile_implicit_depth(dev: &mut DeviceInner, new_depth_format: u32) -> Res
     }
     // The depth texture is about to change — drain so no in-flight command
     // buffer references it (matching reset_recreate_resources steps 1-2).
-    dev.flush_current_frame_blocking();
+    dev.flush_current_frame_blocking()?;
     // The old surface leaves without passing through the retention queue, so
     // the encoder is told about it here for the same reason the resizing path
     // tells it: nothing else prunes the records keyed on its handle.
@@ -4707,7 +4549,7 @@ fn reconcile_implicit_depth(dev: &mut DeviceInner, new_depth_format: u32) -> Res
     } else {
         Vec::new()
     };
-    dev.encoder_reset(retired);
+    dev.encoder_reset(&retired)?;
     if had_depth {
         let handles = [old_depth];
         let mut destroy = mtld3d_shared::DestroyResourcesBulkParams {
@@ -5213,7 +5055,7 @@ fn create_texture_path(info: &TextureCreateArgs) -> i32 {
 
     // Allocate per-mip staging buffers as independent page-aligned
     // heap blocks. Each becomes an `Arc<PageBox>` inside `TextureInner`
-    // so the upload closure can hand the encoder thread a refcount bump
+    // so the upload operation can hand the encoder thread a refcount bump
     // (no memcpy) at `UnlockRect` time. Contents are uninitialized —
     // the blit upload only copies the dirty sub-rect the game writes,
     // and a draw that references a never-Locked MTLTexture samples
@@ -5987,7 +5829,7 @@ extern "system" fn device_create_vertex_buffer(
         fvf,
         pool,
     });
-    // Queue the eager `MTLBuffer` wrap so subsequent draw closures hit
+    // Queue the eager `MTLBuffer` wrap so subsequent draw operations hit
     // the buffer cache instead of cache-missing inside
     // `ensure_vbib_mtl_buffer` on first bind.
     let inner = buffer.inner();
@@ -7119,17 +6961,16 @@ fn readback_from_texture_rt(
     // `Direct3DTexture9` whose refcount keeps it alive while the surface is.
     crate::texture::flush_dirty_mips(unsafe { (*parent).inner_mut() }, dev.inner());
     let slot = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let slot_op = std::sync::Arc::clone(&slot);
-    dev.inner().push_op(Box::new(move |enc| {
-        let h = enc.get_texture_handle_by_id(texture_id);
-        if h != 0 {
-            // SAFETY: `h` is a live retained MTLTexture handle from the
-            // encoder texture cache.
-            enc.note_color_read_back(unsafe { MetalHandle::new(h) });
-        }
-        slot_op.store(h, std::sync::atomic::Ordering::Release);
-    }));
-    dev.inner().flush_current_frame_blocking();
+    let slot_op = std::sync::Arc::clone(&slot).into();
+    dev.inner().push_op(crate::encoder::Op::ReadColorHandle(
+        mtld3d_core::encoder_data::capture_op(crate::device::ReadColorHandleOp {
+            texture_id,
+            slot_op,
+        }),
+    ));
+    if let Err(hr) = dev.inner().flush_current_frame_blocking() {
+        return hr;
+    }
     let h = slot.load(std::sync::atomic::Ordering::Acquire);
     if h == 0 {
         mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
@@ -7183,8 +7024,12 @@ fn blit_texture_to_systemmem(device_inner: &mut DeviceInner, read: &SystemMemRea
     // This blit reads the RT right after the flush. Mark it read-back BEFORE
     // the flush so the store-action rules treat it as live and never discard
     // its colour store.
-    device_inner.push_op(Box::new(move |enc| enc.note_color_read_back(src)));
-    device_inner.flush_current_frame_blocking();
+    device_inner.push_op(crate::encoder::Op::NoteColorRead(
+        mtld3d_core::encoder_data::capture_op(crate::device::NoteColorReadOp { src }),
+    ));
+    if let Err(hr) = device_inner.flush_current_frame_blocking() {
+        return hr;
+    }
     blit_handle_to_systemmem(device_inner, read)
 }
 
@@ -7461,9 +7306,11 @@ extern "system" fn device_stretch_rect(
             if dev.frame_dump.active {
                 dev.frame_dump_event("StretchRect: multisampled depth resolve queued");
             }
-            dev.push_op(Box::new(move |enc| {
-                enc.resolve_depth_surface(&transfer);
-            }));
+            dev.push_op(crate::encoder::Op::ResolveDepthSurface(
+                mtld3d_core::encoder_data::capture_op(crate::device::ResolveDepthSurfaceOp {
+                    transfer,
+                }),
+            ));
             return D3D_OK;
         }
         // Same-format Private→Private depth copy on the 1:1 blit path. The
@@ -7476,20 +7323,17 @@ extern "system" fn device_stretch_rect(
         if dev.frame_dump.active {
             dev.frame_dump_event("StretchRect: full-surface depth copy queued");
         }
-        dev.push_op(Box::new(move |enc| {
-            emit_stretch_rect_blit(
-                enc,
-                &src_info,
-                &dst_info,
-                &StretchBlitParams {
-                    src_region,
-                    dst_region,
-                    mip_level,
-                    render_quad: false,
-                    filter,
-                },
-            );
-        }));
+        dev.push_op(crate::encoder::Op::StretchBlit(
+            mtld3d_core::encoder_data::capture_op(crate::device::StretchBlitOp {
+                src_info,
+                dst_info,
+                src_region,
+                dst_region,
+                mip_level,
+                render_quad: false,
+                filter,
+            }),
+        ));
         return D3D_OK;
     }
 
@@ -7669,20 +7513,17 @@ extern "system" fn device_stretch_rect(
             }
         ));
     }
-    dev.push_op(Box::new(move |enc| {
-        emit_stretch_rect_blit(
-            enc,
-            &src_info,
-            &dst_info,
-            &StretchBlitParams {
-                src_region,
-                dst_region,
-                mip_level,
-                render_quad,
-                filter,
-            },
-        );
-    }));
+    dev.push_op(crate::encoder::Op::StretchBlit(
+        mtld3d_core::encoder_data::capture_op(crate::device::StretchBlitOp {
+            src_info,
+            dst_info,
+            src_region,
+            dst_region,
+            mip_level,
+            render_quad,
+            filter,
+        }),
+    ));
     D3D_OK
 }
 
@@ -7918,556 +7759,6 @@ fn parse_stretch_regions(
     Some((src_region, dst_region))
 }
 
-/// Convert a `StretchRect` region into the space of the texture it addresses.
-///
-/// A no-op for anything but a surface rasterized at a non-default
-/// `render.scale`, and an exact identity at the default. A region spanning
-/// the surface spans the subresource Metal allocated for it.
-fn scale_stretch_region(
-    info: &StretchSurfaceInfo,
-    region: mtld3d_core::stretch_rect::StretchRegion,
-) -> mtld3d_core::stretch_rect::StretchRegion {
-    if info.scale.is_identity() {
-        return region;
-    }
-    let extent = TargetExtent::new(info.scale, (info.width, info.height), info.texture_size);
-    let (x, y, w, h) = extent.rect(region.x, region.y, region.w, region.h);
-    mtld3d_core::stretch_rect::StretchRegion { x, y, w, h }
-}
-
-/// Blit geometry + mode for [`emit_stretch_rect_blit`].
-struct StretchBlitParams {
-    src_region: mtld3d_core::stretch_rect::StretchRegion,
-    dst_region: mtld3d_core::stretch_rect::StretchRegion,
-    mip_level: u32,
-    render_quad: bool,
-    filter: u32,
-}
-
-/// Geometry for a `StretchRect` whose source and destination are one texture.
-///
-/// Regions and dimensions are already in the texture's own space; `src_mip` and
-/// `src_slice` address the source subresource, while the destination level,
-/// slice, format and surface class come from the accompanying
-/// [`StretchSurfaceInfo`].
-struct SameTextureBlitParams {
-    handle: u64,
-    src_region: mtld3d_core::stretch_rect::StretchRegion,
-    dst_region: mtld3d_core::stretch_rect::StretchRegion,
-    src_mip: u32,
-    /// Array slice the source surface addresses, `None` for a single-slice texture.
-    src_slice: Option<u32>,
-    dst_dims: (u32, u32),
-    render_quad: bool,
-    filter: u32,
-}
-
-/// Encoder-thread body of `StretchRect`.
-///
-/// Resolves both endpoint handles via the texture cache, then either queues a
-/// 1:1 sub-rect copy (same-size, same-format blit) or runs the render-quad path
-/// (`render_quad` — sizes differ and/or formats differ; the destination is
-/// guaranteed a render target by `device_stretch_rect`).
-fn emit_stretch_rect_blit(
-    enc: &mut FrameEncoder,
-    src_info: &StretchSurfaceInfo,
-    dst_info: &StretchSurfaceInfo,
-    params: &StretchBlitParams,
-) {
-    use mtld3d_shared::{BlitCommand, CopyTextureSubRectInfo};
-
-    let &StretchBlitParams {
-        src_region,
-        dst_region,
-        mip_level,
-        render_quad,
-        filter,
-    } = params;
-    let src_handle = match &src_info.kind {
-        StretchKind::Texture(info) => enc.get_or_create_texture(info),
-        StretchKind::Backbuffer(h) | StretchKind::DepthStencil(h) => h.raw(),
-    };
-    // D3D9 resolves implicitly when a `StretchRect` reads a multisampled
-    // surface. The blit runs after the passes recorded so far, so the last of
-    // them that rendered into the multisampled companion takes the resolve;
-    // for a single-sampled source this finds nothing and does nothing.
-    // A `Clear` still waiting for a pass is one of those passes: D3D9 ordered
-    // it before the copy, so it becomes a pass first and takes the resolve,
-    // rather than an older pass handing the copy pre-clear content.
-    if !src_info.msaa.is_null() {
-        enc.flush_pending_clears();
-    }
-    // SAFETY: `src_handle` came from the encoder's texture cache or from a
-    // surface's retained handle, both of which are `MTLTexture` handles.
-    let src_texture = unsafe { MetalHandle::<MTLTextureKind>::new(src_handle) };
-    enc.note_msaa_read(src_texture);
-    // A source with a multisampled companion is a resolve target, and a
-    // resolve the last submission stored into it must have completed before
-    // this copy reads it on a device that does not order that itself.
-    if !src_info.msaa.is_null() {
-        enc.wait_for_resolve_retire();
-    }
-    let dst_handle = match &dst_info.kind {
-        StretchKind::Texture(info) => enc.get_or_create_texture(info),
-        StretchKind::Backbuffer(h) | StretchKind::DepthStencil(h) => h.raw(),
-    };
-    // What the copy writes may be kept for good, and a draw left out of the
-    // source would then be baked into it. A copy over a whole colour target
-    // rebuilds that target as a clear does.
-    // SAFETY: `dst_handle` came from the encoder's texture cache or from a
-    // surface's retained handle, both of which are `MTLTexture` handles.
-    let dst_texture = unsafe { MetalHandle::<MTLTextureKind>::new(dst_handle) };
-    enc.note_stretch_copy(&crate::encoder::StretchCopyTargets {
-        src: src_texture,
-        dst: dst_texture,
-        dst_subresource: dst_info.slice.unwrap_or(0) | (dst_info.mip_level << 16),
-        whole_color_dst: !matches!(dst_info.kind, StretchKind::DepthStencil(_))
-            && dst_region.x == 0
-            && dst_region.y == 0
-            && dst_region.w == dst_info.width
-            && dst_region.h == dst_info.height,
-    });
-    if src_handle == 0 || dst_handle == 0 {
-        mtld3d_shared::log_once_warn!(
-            target: crate::LOG_TARGET,
-            "StretchRect: failed to resolve Metal texture (src={src_handle:#x}, dst={dst_handle:#x})"
-        );
-        return;
-    }
-    // `render.scale` shrinks the back buffer, so an endpoint that *is* the back
-    // buffer has both its region and its extent converted; the ratio the blit
-    // VS builds from the two is preserved, while the destination rect (which
-    // drives an absolute viewport and scissor) lands on real pixels. An
-    // endpoint the game created keeps its own coordinates.
-    let src_region = scale_stretch_region(src_info, src_region);
-    let dst_region = scale_stretch_region(dst_info, dst_region);
-    let (src_dims, dst_dims) = (src_info.texture_size, dst_info.texture_size);
-
-    // The API thread decided this from the game's own rects. Scaling only one
-    // endpoint can turn a logically 1:1 copy into a physical resize, which the
-    // blit encoder cannot do, so the transport choice is re-made here on the
-    // sizes that actually reach Metal.
-    // A multisampled destination has to go through the render quad whatever
-    // the sizes: `MTLBlitCommandEncoder` cannot write a multisampled texture,
-    // and the quad writes every sample of each pixel it covers, which is the
-    // spread D3D9 defines for a copy into a multisampled surface.
-    let render_quad = render_quad
-        || dst_info.sample_count > 1
-        || src_region.w != dst_region.w
-        || src_region.h != dst_region.h;
-    if src_handle == dst_handle {
-        emit_same_texture_stretch(
-            enc,
-            dst_info,
-            &SameTextureBlitParams {
-                handle: src_handle,
-                src_region,
-                dst_region,
-                src_mip: mip_level,
-                src_slice: src_info.slice,
-                dst_dims,
-                render_quad,
-                filter,
-            },
-        );
-        return;
-    }
-    if render_quad
-        && !dst_info
-            .flags
-            .contains(StretchSurfaceFlags::IS_RENDER_TARGET)
-    {
-        // Only reachable with a non-default `render.scale`: the pair was 1:1
-        // in the game's coordinates (so D3D9 accepted it against a
-        // non-render-target destination) and only the back-buffer side shrank.
-        // The render-quad path would have to bind a surface that cannot be a
-        // colour attachment, so copy the overlapping region instead and say so
-        // rather than silently corrupting the destination.
-        mtld3d_shared::log_once_warn!(
-            target: crate::LOG_TARGET,
-            "StretchRect: render.scale made a 1:1 copy into a non-render-target destination a \
-             {}x{} → {}x{} resize, which a Metal blit cannot do; copying the overlap instead. \
-             Set render.scale = 1.0 if this surface's contents matter",
-            src_region.w, src_region.h, dst_region.w, dst_region.h,
-        );
-        enc.flush_pending_clears();
-        enc.end_current_pass("stretch_rect");
-        let region_w = src_region.w.min(dst_region.w);
-        let region_h = src_region.h.min(dst_region.h);
-        enc.push_stretch_rect_blit(BlitCommand::copy_texture_to_texture_sub_rect(
-            &CopyTextureSubRectInfo {
-                src_texture: src_handle,
-                dst_texture: dst_handle,
-                mip_level,
-                dst_mip_level: dst_info.mip_level,
-                src_origin_x: src_region.x,
-                src_origin_y: src_region.y,
-                dst_origin_x: dst_region.x,
-                dst_origin_y: dst_region.y,
-                src_slice: src_info.slice.unwrap_or(0),
-                dst_slice: dst_info.slice.unwrap_or(0),
-                region_w,
-                region_h,
-            },
-        ));
-        if dst_info.autogen_texture_id.is_some() {
-            enc.push_stretch_rect_blit(BlitCommand::generate_mipmaps(dst_handle));
-        }
-        return;
-    }
-    if render_quad {
-        // Render-quad path (a size change and/or a format conversion): render
-        // the source onto a quad covering the destination rect. The
-        // destination's Metal colour format keys the blit pipeline and the pass
-        // colour attachment; the source is sampled in its own format (a packed
-        // YUV source is decoded to RGB by the fragment function), so this path
-        // also converts a cross-format pair. `device_stretch_rect` guarantees
-        // the destination is a render target here.
-        // Device-aware: the pipeline's colour format must match the attachment
-        // texture as created on this device (BGRA8 for an expanded 16-bit dst).
-        let Some(dst_format) =
-            crate::direct3d9::map_for_device(dst_info.format, enc.config().expand_packed16)
-                .map(|m| m.metal_pixel_format())
-        else {
-            mtld3d_shared::log_once_warn!(
-                target: crate::LOG_TARGET,
-                "StretchRect: scaling dst format 0x{:x} unmapped → drop",
-                dst_info.format
-            );
-            return;
-        };
-        enc.stretch_blit_scaled(
-            &BlitSide {
-                handle: src_handle,
-                rect: src_region,
-                dims: src_dims,
-                mip: src_info.mip_level,
-                slice: src_info.slice,
-                msaa: MetalHandle::NULL,
-                msaa_srgb: MetalHandle::NULL,
-                sample_count: 1,
-            },
-            &BlitSide {
-                handle: dst_handle,
-                rect: dst_region,
-                dims: dst_dims,
-                mip: dst_info.mip_level,
-                slice: dst_info.slice,
-                msaa: dst_info.msaa,
-                msaa_srgb: dst_info.msaa_srgb,
-                sample_count: dst_info.sample_count,
-            },
-            dst_format,
-            mtld3d_core::stretch_rect::blit_decode(src_info.format),
-            filter,
-        );
-        if dst_info.autogen_texture_id.is_some() {
-            enc.push_stretch_rect_blit(BlitCommand::generate_mipmaps(dst_handle));
-        }
-        return;
-    }
-    // A `Clear` on either endpoint that is still waiting for a pass must land
-    // before the copy: D3D9 ordered it first.
-    enc.flush_pending_clears();
-    enc.end_current_pass("stretch_rect");
-    enc.push_stretch_rect_blit(BlitCommand::copy_texture_to_texture_sub_rect(
-        &CopyTextureSubRectInfo {
-            src_texture: src_handle,
-            dst_texture: dst_handle,
-            mip_level,
-            dst_mip_level: dst_info.mip_level,
-            src_origin_x: src_region.x,
-            src_origin_y: src_region.y,
-            dst_origin_x: dst_region.x,
-            dst_origin_y: dst_region.y,
-            src_slice: src_info.slice.unwrap_or(0),
-            dst_slice: dst_info.slice.unwrap_or(0),
-            region_w: src_region.w,
-            region_h: src_region.h,
-        },
-    ));
-    // A StretchRect into an autogen texture's level 0 regenerates the mip chain.
-    // It MUST run after the copy and in the SAME blit stream — the encoder's
-    // leading `frame_blit_commands` (used by `run_generate_mipmaps`) would
-    // execute before this copy and regenerate from an empty level 0 → black.
-    if dst_info.autogen_texture_id.is_some() {
-        enc.push_stretch_rect_blit(BlitCommand::generate_mipmaps(dst_handle));
-    }
-    trace!(
-        target: BLIT_TRACE_TARGET,
-        "StretchRect src={src_handle:#x} {sw}x{sh} src_rect={sx},{sy}+{rw}x{rh} \
-         dst={dst_handle:#x} {dw}x{dh} dst_rect={dx},{dy}+{rw}x{rh} mip={mip_level}",
-        sw = src_dims.0, sh = src_dims.1,
-        sx = src_region.x, sy = src_region.y,
-        dw = dst_dims.0, dh = dst_dims.1,
-        dx = dst_region.x, dy = dst_region.y,
-        rw = src_region.w, rh = src_region.h,
-    );
-}
-
-/// Land a `Clear` still waiting for a pass, then close the pass, before a blit.
-///
-/// D3D9 ordered the clear first, so a copy queued ahead of it would either
-/// read the pre-clear source or be wiped by the clear.
-fn flush_clears_before_stretch(enc: &mut FrameEncoder) {
-    enc.flush_pending_clears();
-    enc.end_current_pass("stretch_rect");
-}
-
-/// Encoder-thread body of a `StretchRect` between two rects of one texture.
-///
-/// D3D9 performs the copy and reads the whole source region before writing any
-/// of the destination, so an overlapping or scaled pair stages through a
-/// scratch texture. Disjoint 1:1 rects, two mip levels and two cube faces
-/// included, go straight through the blit encoder: Metal allows a copy inside a
-/// single texture as long as the two subresource regions do not overlap.
-fn emit_same_texture_stretch(
-    enc: &mut FrameEncoder,
-    dst_info: &StretchSurfaceInfo,
-    params: &SameTextureBlitParams,
-) {
-    use mtld3d_core::stretch_rect::{SameSurfaceRoute, StretchRegion, same_surface_route};
-    use mtld3d_shared::{BlitCommand, CopyTextureSubRectInfo};
-
-    let &SameTextureBlitParams {
-        handle,
-        src_region,
-        dst_region,
-        src_mip,
-        src_slice,
-        dst_dims,
-        render_quad,
-        filter,
-    } = params;
-    let dst_mip = dst_info.mip_level;
-    // A cube's faces are slices of the one texture, so the two endpoints can
-    // name different faces of it; every other texture kind holds a single
-    // slice and both sides read 0.
-    let src_face = src_slice.unwrap_or(0);
-    let dst_face = dst_info.slice.unwrap_or(0);
-    let route = same_surface_route(src_region, dst_region, src_mip, dst_mip, src_face, dst_face);
-    if route == SameSurfaceRoute::Skip {
-        mtld3d_shared::log_once_info!(
-            target: crate::LOG_TARGET,
-            "StretchRect: source and destination name the same texels of one surface, \
-             so the copy leaves it as it is"
-        );
-        return;
-    }
-    if route == SameSurfaceRoute::Direct {
-        flush_clears_before_stretch(enc);
-        enc.push_stretch_rect_blit(BlitCommand::copy_texture_to_texture_sub_rect(
-            &CopyTextureSubRectInfo {
-                src_texture: handle,
-                dst_texture: handle,
-                mip_level: src_mip,
-                dst_mip_level: dst_mip,
-                src_origin_x: src_region.x,
-                src_origin_y: src_region.y,
-                dst_origin_x: dst_region.x,
-                dst_origin_y: dst_region.y,
-                src_slice: src_face,
-                dst_slice: dst_face,
-                region_w: src_region.w,
-                region_h: src_region.h,
-            },
-        ));
-        if dst_info.autogen_texture_id.is_some() {
-            enc.push_stretch_rect_blit(BlitCommand::generate_mipmaps(handle));
-        }
-        return;
-    }
-    // Device-aware mapping: the scratch has to carry the Metal format the one
-    // texture was actually created with, and the render quad keys its pipeline
-    // and colour attachment off the same value.
-    let Some(format) =
-        crate::direct3d9::map_for_device(dst_info.format, enc.config().expand_packed16)
-            .map(|m| m.metal_pixel_format())
-    else {
-        mtld3d_shared::log_once_warn!(
-            target: crate::LOG_TARGET,
-            "StretchRect: format 0x{:x} unmapped → a copy inside that surface is dropped",
-            dst_info.format
-        );
-        return;
-    };
-    if render_quad
-        && !dst_info
-            .flags
-            .contains(StretchSurfaceFlags::IS_RENDER_TARGET)
-    {
-        // Only reachable under a non-default `render.scale` that rounds a
-        // logically 1:1 pair to two different extents; the render quad would
-        // have to bind a surface that cannot be a colour attachment.
-        mtld3d_shared::log_once_warn!(
-            target: crate::LOG_TARGET,
-            "StretchRect: a resizing copy inside one non-render-target surface has no Metal \
-             path; the copy is dropped. Set render.scale = 1.0 if this surface's contents matter"
-        );
-        return;
-    }
-    let Some((scratch, scratch_w, scratch_h)) =
-        enc.stretch_scratch_texture(handle, (src_region.w, src_region.h), format)
-    else {
-        return;
-    };
-    flush_clears_before_stretch(enc);
-    enc.push_stretch_rect_blit(BlitCommand::copy_texture_to_texture_sub_rect(
-        &CopyTextureSubRectInfo {
-            src_texture: handle,
-            dst_texture: scratch,
-            mip_level: src_mip,
-            dst_mip_level: 0,
-            src_origin_x: src_region.x,
-            src_origin_y: src_region.y,
-            dst_origin_x: 0,
-            dst_origin_y: 0,
-            src_slice: src_face,
-            dst_slice: 0,
-            region_w: src_region.w,
-            region_h: src_region.h,
-        },
-    ));
-    if render_quad {
-        enc.stretch_blit_scaled(
-            &BlitSide {
-                handle: scratch,
-                rect: StretchRegion {
-                    x: 0,
-                    y: 0,
-                    w: src_region.w,
-                    h: src_region.h,
-                },
-                dims: (scratch_w, scratch_h),
-                mip: 0,
-                slice: None,
-                msaa: MetalHandle::NULL,
-                msaa_srgb: MetalHandle::NULL,
-                sample_count: 1,
-            },
-            &BlitSide {
-                handle,
-                rect: dst_region,
-                dims: dst_dims,
-                mip: dst_mip,
-                slice: dst_info.slice,
-                msaa: dst_info.msaa,
-                msaa_srgb: dst_info.msaa_srgb,
-                sample_count: dst_info.sample_count,
-            },
-            format,
-            mtld3d_core::stretch_rect::blit_decode(dst_info.format),
-            filter,
-        );
-    } else {
-        enc.push_stretch_rect_blit(BlitCommand::copy_texture_to_texture_sub_rect(
-            &CopyTextureSubRectInfo {
-                src_texture: scratch,
-                dst_texture: handle,
-                mip_level: 0,
-                dst_mip_level: dst_mip,
-                src_origin_x: 0,
-                src_origin_y: 0,
-                dst_origin_x: dst_region.x,
-                dst_origin_y: dst_region.y,
-                src_slice: 0,
-                dst_slice: dst_face,
-                region_w: dst_region.w,
-                region_h: dst_region.h,
-            },
-        ));
-    }
-    if dst_info.autogen_texture_id.is_some() {
-        enc.push_stretch_rect_blit(BlitCommand::generate_mipmaps(handle));
-    }
-}
-
-bitflags::bitflags! {
-    /// `StretchRect`-eligibility classification of a surface.
-    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-    pub struct StretchSurfaceFlags: u8 {
-        /// The surface is a render target.
-        ///
-        /// Either a standalone backbuffer/RT, or a
-        /// texture-level surface whose texture carries `D3DUSAGE_RENDERTARGET`.
-        const IS_RENDER_TARGET = 1 << 0;
-        /// The surface is a `CreateOffscreenPlainSurface(D3DPOOL_DEFAULT)` surface.
-        ///
-        /// A valid `StretchRect` destination, unlike an ordinary
-        /// texture-level surface.
-        const IS_OFFSCREEN_PLAIN_DEFAULT = 1 << 1;
-        /// The surface is a standalone depth-stencil surface (`CreateDepthStencilSurface`).
-        ///
-        /// `StretchRect` allows only a 1:1
-        /// depth→depth copy between two such surfaces.
-        const IS_DEPTH_STENCIL = 1 << 2;
-    }
-}
-
-/// API-thread snapshot of a `StretchRect` source / destination surface.
-///
-/// `kind` carries enough info for the encoder closure to resolve the
-/// underlying Metal texture handle without holding the surface pointer
-/// (which may be released before the closure runs).
-struct StretchSurfaceInfo {
-    kind: StretchKind,
-    /// Surface width as D3D9 reports it.
-    width: u32,
-    /// Surface height as D3D9 reports it.
-    height: u32,
-    /// Extent Metal allocated for the addressed subresource.
-    ///
-    /// `scale` of `width`/`height` for a surface or level 0, and Metal's own
-    /// halving of the scaled base for a deeper level, which can differ from
-    /// the scale of that level's reported size by a texel.
-    texture_size: (u32, u32),
-    /// What this endpoint's texture is rasterized at relative to `width`/`height`.
-    ///
-    /// Resolved on the API thread, where the backing resource is reachable, so
-    /// the encoder-thread body can convert each endpoint without having to
-    /// re-derive which surfaces `render.scale` applies to.
-    scale: mtld3d_core::render_scale::RenderScale,
-    format: u32,
-    mip_level: u32,
-    /// Array slice the surface addresses within its backing texture.
-    ///
-    /// `Some(face)` is a cube face's `D3DCUBEMAP_FACES` index; `None` is every
-    /// other surface kind, whose backing texture holds a single slice.
-    slice: Option<u32>,
-    /// D3DPOOL_* of the backing resource.
-    ///
-    /// `StretchRect` requires both surfaces in `D3DPOOL_DEFAULT`.
-    pool: u32,
-    /// Surface-kind classification.
-    ///
-    /// One of `IS_RENDER_TARGET` / `IS_OFFSCREEN_PLAIN_DEFAULT` /
-    /// `IS_DEPTH_STENCIL`. See [`StretchSurfaceFlags`].
-    flags: StretchSurfaceFlags,
-    /// `Some(texture id)` when the backing texture carries `D3DUSAGE_AUTOGENMIPMAP`.
-    ///
-    /// A `StretchRect` or a `ColorFill` into level 0 must
-    /// regenerate the mip chain afterwards, the same way a
-    /// level-0 `UnlockRect` does.
-    autogen_texture_id: Option<TextureId>,
-    /// Multisampled companion of the surface's texture, or null.
-    ///
-    /// A multisampled source is read through the single-sample texture the
-    /// resolve fills; a multisampled destination is written through this one
-    /// by the render-quad path and resolved back at pass end.
-    msaa: MetalHandle<MTLTextureKind>,
-    /// sRGB twin view of that companion, or null whenever the companion is.
-    msaa_srgb: MetalHandle<MTLTextureKind>,
-    /// Sample count of the surface, 1 when it is single-sampled.
-    sample_count: u8,
-}
-
-enum StretchKind {
-    Texture(crate::encoder::TextureInfo),
-    Backbuffer(MetalHandle<MTLTextureKind>),
-    /// A standalone depth-stencil surface's retained `Private` depth texture.
-    DepthStencil(MetalHandle<MTLTextureKind>),
-}
-
 fn resolve_stretch_surface(
     surf: *mut crate::surface::Direct3DSurface9,
 ) -> Option<StretchSurfaceInfo> {
@@ -8640,7 +7931,7 @@ fn color_fill_block_aligned(region: DirtyRect, extent: (u32, u32), block: (u32, 
 /// one-off render pass through the clear machinery and the API thread writes
 /// no pixels at all. A fill into level 0 of an `D3DUSAGE_AUTOGENMIPMAP`
 /// texture carries the mip-chain regeneration with it. `info` is consumed
-/// because the destination kind travels into the encoder closure, which
+/// because the destination kind travels into the encoder operation, which
 /// cannot reach the surface.
 fn color_fill_render_target(
     dev: &mut DeviceInner,
@@ -8659,7 +7950,7 @@ fn color_fill_render_target(
     };
     let [r, g, b, a] = convert::d3dcolor_to_rgba_f32(color);
     let fill = ColorFillTarget {
-        // Resolved in the closure below: a texture destination only creates
+        // Resolved in the operation below: a texture destination only creates
         // its `MTLTexture` on the encoder thread.
         texture: MetalHandle::NULL,
         logical_size: (info.width, info.height),
@@ -8675,19 +7966,9 @@ fn color_fill_render_target(
         regenerate_mipmaps: info.autogen_texture_id.is_some(),
     };
     let kind = info.kind;
-    dev.push_op(Box::new(move |enc: &mut FrameEncoder| {
-        let texture = match kind {
-            // SAFETY: `get_or_create_texture` returns a Metal texture handle
-            // from the encoder's typed `texture_cache` via `.raw()`.
-            StretchKind::Texture(ti) => unsafe {
-                MetalHandle::<MTLTextureKind>::new(enc.get_or_create_texture(&ti))
-            },
-            // A depth-stencil surface never reaches here (`device_color_fill`
-            // rejects it), so both arms carry the colour handle.
-            StretchKind::Backbuffer(handle) | StretchKind::DepthStencil(handle) => handle,
-        };
-        enc.color_fill_target(&ColorFillTarget { texture, ..fill });
-    }));
+    dev.push_op(crate::encoder::Op::ColorFill(
+        mtld3d_core::encoder_data::capture_op(crate::device::ColorFillOp { kind, fill }),
+    ));
     D3D_OK
 }
 
@@ -9145,9 +8426,11 @@ extern "system" fn device_set_render_target(
     if let Some(old_id) = dev.cur_autogen_rt_ids[slot].take()
         && Some(old_id) != new_autogen
     {
-        dev.push_op(Box::new(move |enc| {
-            enc.run_generate_mipmaps_ordered(old_id);
-        }));
+        dev.push_op(crate::encoder::Op::GenerateMipmapsOrdered(
+            mtld3d_core::encoder_data::capture_op(crate::device::GenerateMipmapsOrderedOp {
+                old_id,
+            }),
+        ));
     }
     dev.cur_autogen_rt_ids[slot] = new_autogen;
 
@@ -9239,26 +8522,6 @@ extern "system" fn device_get_render_target(
     // SAFETY: `surface` is the caller's out-pointer per the D3D9 ABI.
     unsafe { *surface = surf.cast::<c_void>() };
     D3D_OK
-}
-
-/// `SetDepthStencilSurface` capture shape, owned by the closure pushed to the encoder thread.
-///
-/// `Lazy` defers the `MTLTexture` lookup to the encoder so a sampleable
-/// shadow map's Metal handle is created (or reused from the cache) on
-/// first bind, mirroring how `SetRenderTarget` handles texture-backed
-/// render targets. `Eager` is the standalone-surface path
-/// (`CreateDepthStencilSurface`) where the handle is known up-front.
-#[derive(Clone)]
-enum DepthBinding {
-    None,
-    /// A standalone depth surface: its Metal handle, the texture's real extent and its scale.
-    Eager(
-        MetalHandle<MTLTextureKind>,
-        (u32, u32),
-        mtld3d_core::render_scale::RenderScale,
-    ),
-    /// A texture-backed depth surface: the parent's info, the mip level and the parent's scale.
-    Lazy(TextureInfo, u32, mtld3d_core::render_scale::RenderScale),
 }
 
 extern "system" fn device_set_depth_stencil_surface(
@@ -9373,9 +8636,14 @@ extern "system" fn device_set_depth_stencil_surface(
                         "depth-alias carry {prev_id:?} → {cur_id:?} {mip_w}x{mip_h}"
                     ));
                 }
-                dev.push_op(Box::new(move |enc| {
-                    enc.carry_depth_contents(prev_id, cur_id, mip_w, mip_h);
-                }));
+                dev.push_op(crate::encoder::Op::CarryDepth(
+                    mtld3d_core::encoder_data::capture_op(crate::device::CarryDepthOp {
+                        prev_id,
+                        cur_id,
+                        mip_w,
+                        mip_h,
+                    }),
+                ));
             }
             dev.last_sized_depth = Some((info.texture_id, mip_w, mip_h));
         }
@@ -9695,15 +8963,28 @@ extern "system" fn device_clear(
         // paints a scissored clear-quad. Independent of which other planes
         // this Clear names, exactly as the depth side below is.
         match &regions {
-            None => dev.push_op(Box::new(move |enc| {
-                enc.clear_color_bounded_to_viewport(r_bits, g_bits, b_bits, a_bits, srgb_write);
-            })),
+            None => dev.push_op(crate::encoder::Op::ClearColor(
+                mtld3d_core::encoder_data::capture_op(crate::device::ClearColorOp {
+                    r_bits,
+                    g_bits,
+                    b_bits,
+                    a_bits,
+                    srgb_write,
+                }),
+            )),
             Some(list) if list.is_empty() => {}
             Some(list) => {
                 let rects = list.clone();
-                dev.push_op(Box::new(move |enc| {
-                    enc.clear_color_rects(r_bits, g_bits, b_bits, a_bits, srgb_write, &rects);
-                }));
+                dev.push_op(crate::encoder::Op::ClearColorRects(
+                    mtld3d_core::encoder_data::capture_op(crate::device::ClearColorRectsOp {
+                        r_bits,
+                        g_bits,
+                        b_bits,
+                        a_bits,
+                        srgb_write,
+                        rects,
+                    }),
+                ));
             }
         }
     }
@@ -9720,9 +9001,15 @@ extern "system" fn device_clear(
         // exactly as they bound the colour clear: one scissored quad per rect.
         (Some(list), depth, stencil) => {
             if !list.is_empty() {
-                dev.push_op(Box::new(move |enc| {
-                    enc.clear_depth_stencil_rects(depth, stencil, &list);
-                }));
+                dev.push_op(crate::encoder::Op::ClearDepthStencilRects(
+                    mtld3d_core::encoder_data::capture_op(
+                        crate::device::ClearDepthStencilRectsOp {
+                            depth,
+                            stencil,
+                            list,
+                        },
+                    ),
+                ));
             }
         }
         // The whole target, which D3D9 still bounds by the viewport. Both
@@ -9730,9 +9017,12 @@ extern "system" fn device_clear(
         // (or folds into one pair of load actions) rather than two:
         // shadow-volume renderers clear depth and stencil together between
         // lights.
-        (None, depth, stencil) => dev.push_op(Box::new(move |enc| {
-            enc.clear_depth_stencil_bounded_to_viewport(depth, stencil);
-        })),
+        (None, depth, stencil) => dev.push_op(crate::encoder::Op::ClearDepthStencil(
+            mtld3d_core::encoder_data::capture_op(crate::device::ClearDepthStencilOp {
+                depth,
+                stencil,
+            }),
+        )),
     }
 
     0 // S_OK
@@ -10094,16 +9384,22 @@ extern "system" fn device_set_render_state(this: *mut c_void, state: u32, value:
                 crate::texture::flush_dirty_mips(inner, dev);
                 let info = inner.texture_info();
                 inner.mark_subresource_gpu_authoritative(0, 0);
-                dev.push_op(Box::new(move |enc| {
-                    let dst = enc.get_texture_handle_by_id(id);
-                    enc.resolve_dynamic_depth(dst, &info);
-                }));
+                dev.push_op(crate::encoder::Op::ResolveDynamicDepth(
+                    mtld3d_core::encoder_data::capture_op(crate::device::ResolveDynamicDepthOp {
+                        id,
+                        info,
+                    }),
+                ));
             } else if !dynamic_depth {
                 let format = tex.metal_pixel_format();
-                dev.push_op(Box::new(move |enc| {
-                    let dst = enc.get_texture_handle_by_id(id);
-                    enc.resolve_depth_to_texture(dst, w, h, format);
-                }));
+                dev.push_op(crate::encoder::Op::ResolveDepthTexture(
+                    mtld3d_core::encoder_data::capture_op(crate::device::ResolveDepthTextureOp {
+                        id,
+                        w,
+                        h,
+                        format,
+                    }),
+                ));
             }
         }
     }
@@ -10854,6 +10150,9 @@ extern "system" fn device_draw_primitive(
     // Flush any bound buffer that's drawn while still mapped, before the draw
     // snapshot reads it.
     flush_mapped_bound_buffers(obj.inner());
+    if let Err(hr) = obj.inner().encoder_status() {
+        return hr;
+    }
     let perf_ptr = DeviceInner::perf_ptr_of(obj.inner);
     let snap = CycleAddTimer::start(draw_snapshot_ptr(perf_ptr));
     let Some(vertex_source) = snapshot_bound_vertex_source(dev) else {
@@ -10863,21 +10162,20 @@ extern "system" fn device_draw_primitive(
         );
         return D3DERR_INVALIDCALL;
     };
-    let snapshot = emit_snapshot_deltas(&obj);
+    emit_snapshot_deltas(&obj);
     drop(snap);
     let _push = CycleAddTimer::start(draw_push_op_ptr(perf_ptr));
-    obj.inner().push_op_inline(Op::draw(
-        DrawOp {
-            metal_prim,
-            vertex_source,
-            index_source: IndexSource::None {
-                start_vertex,
-                vertex_count: vtx_count,
-            },
+    obj.inner().push_op_inline(Op::Draw(DrawOp {
+        metal_prim,
+        vertex_source,
+        index_source: IndexSource::None {
+            start_vertex,
+            vertex_count: vtx_count,
         },
-        snapshot,
-    ));
-    D3D_OK
+    }));
+    obj.inner()
+        .encoder_status()
+        .map_or_else(|hr| hr, |()| D3D_OK)
 }
 
 /// The `IndexSource` for a fan rewritten into an explicit index list.
@@ -10895,10 +10193,13 @@ fn generated_fan_source(dev: &mut DeviceInner, fan: &convert::FanRewrite) -> Ind
     // frame arena, and nothing else holds a reference to that block yet.
     let out = unsafe { core::slice::from_raw_parts_mut(ptr, byte_len) };
     fan.write(out);
-    let data = ScratchSlice::from_raw_parts(
-        NonNull::new(ptr).expect("ScratchArena alloc returned non-null"),
-        u32::try_from(byte_len).expect("fan index list fits u32"),
-    );
+    // SAFETY: frame scratch remains immutable and retained through submit replay.
+    let data = unsafe {
+        ScratchSlice::from_raw_parts(
+            NonNull::new(ptr).expect("ScratchArena alloc returned non-null"),
+            u32::try_from(byte_len).expect("fan index list fits u32"),
+        )
+    };
     IndexSource::Generated {
         data,
         index_count: fan.index_count(),
@@ -10924,6 +10225,9 @@ fn draw_bound_triangle_fan(
     // Flush any bound buffer that's drawn while still mapped, before the draw
     // snapshot reads it.
     flush_mapped_bound_buffers(obj.inner());
+    if let Err(hr) = obj.inner().encoder_status() {
+        return hr;
+    }
     let perf_ptr = DeviceInner::perf_ptr_of(obj.inner);
     let snap = CycleAddTimer::start(draw_snapshot_ptr(perf_ptr));
     let Some(vertex_source) = snapshot_bound_vertex_source(obj.inner()) else {
@@ -10933,18 +10237,17 @@ fn draw_bound_triangle_fan(
         );
         return no_vertex_buffer_hr;
     };
-    let snapshot = emit_snapshot_deltas(obj);
+    emit_snapshot_deltas(obj);
     drop(snap);
     let _push = CycleAddTimer::start(draw_push_op_ptr(perf_ptr));
-    obj.inner().push_op_inline(Op::draw(
-        DrawOp {
-            metal_prim: mtld3d_shared::mtl::PrimitiveType::Triangle,
-            vertex_source,
-            index_source,
-        },
-        snapshot,
-    ));
-    D3D_OK
+    obj.inner().push_op_inline(Op::Draw(DrawOp {
+        metal_prim: mtld3d_shared::mtl::PrimitiveType::Triangle,
+        vertex_source,
+        index_source,
+    }));
+    obj.inner()
+        .encoder_status()
+        .map_or_else(|hr| hr, |()| D3D_OK)
 }
 
 /// Complete an index buffer's CPU mirror from its device buffer.
@@ -10979,18 +10282,24 @@ fn materialise_index_backing(dev: &mut DeviceInner, ib: *mut Direct3DIndexBuffer
         "DrawIndexedPrimitive(D3DPT_TRIANGLEFAN) from an index buffer whose CPU copy was released: \
          reading the indices back off the GPU costs one mid-frame submit and one GPU wait per buffer"
     );
-    let read = Arc::new(AtomicBool::new(false));
-    let done = Arc::clone(&read);
-    dev.push_op(Box::new(move |enc| {
-        done.store(
-            enc.readback_device_buffer(buffer_id, dst_ptr, dst_len),
-            Ordering::Release,
-        );
-    }));
+    let read = Arc::new(AtomicU32::new(0));
+    let done = Arc::clone(&read).into();
+    dev.push_op(crate::encoder::Op::ReadDeviceBuffer(
+        mtld3d_core::encoder_data::capture_op(crate::device::ReadDeviceBufferOp {
+            done,
+            buffer_id,
+            dst_ptr,
+            dst_len,
+        }),
+    ));
     // Submits the frame the copy rides and waits for the GPU to finish it,
     // which is what makes the destination pages readable here.
-    dev.mid_frame_submit_for_retention();
-    if !read.load(Ordering::Acquire) {
+    if dev.mid_frame_submit_for_retention().is_err() {
+        // Admission may have succeeded even when the synchronous acknowledgment was lost.
+        std::mem::forget(page_box);
+        return false;
+    }
+    if read.load(Ordering::Acquire) == 0 {
         warn!(
             target: LOG_TARGET,
             "DrawIndexedPrimitive: triangle fan could not read its indices back off the GPU"
@@ -11117,6 +10426,9 @@ extern "system" fn device_draw_indexed_primitive(
     // Flush any bound buffer that's drawn while still mapped, before the draw
     // snapshot reads it.
     flush_mapped_bound_buffers(obj.inner());
+    if let Err(hr) = obj.inner().encoder_status() {
+        return hr;
+    }
     let perf_ptr = DeviceInner::perf_ptr_of(obj.inner);
     let snap = CycleAddTimer::start(draw_snapshot_ptr(perf_ptr));
     let Some(vertex_source) = snapshot_bound_vertex_source(dev) else {
@@ -11125,7 +10437,10 @@ extern "system" fn device_draw_indexed_primitive(
         // INVALIDCALL — unlike the non-indexed DrawPrimitive. With no vertex
         // data there is nothing to
         // render, so skip the draw and report success.
-        return D3D_OK;
+        return obj
+            .inner()
+            .encoder_status()
+            .map_or_else(|hr| hr, |()| D3D_OK);
     };
     let Some(index_source) =
         snapshot_bound_index_source(dev, start_index, index_count, base_vertex_index)
@@ -11137,18 +10452,17 @@ extern "system" fn device_draw_indexed_primitive(
         return D3DERR_INVALIDCALL;
     };
 
-    let snapshot = emit_snapshot_deltas(&obj);
+    emit_snapshot_deltas(&obj);
     drop(snap);
     let _push = CycleAddTimer::start(draw_push_op_ptr(perf_ptr));
-    obj.inner().push_op_inline(Op::draw(
-        DrawOp {
-            metal_prim,
-            vertex_source,
-            index_source,
-        },
-        snapshot,
-    ));
-    D3D_OK
+    obj.inner().push_op_inline(Op::Draw(DrawOp {
+        metal_prim,
+        vertex_source,
+        index_source,
+    }));
+    obj.inner()
+        .encoder_status()
+        .map_or_else(|hr| hr, |()| D3D_OK)
 }
 
 /// Upload any still-mapped `Staged` VB/IB dirty span before a draw reads it.
@@ -11289,17 +10603,15 @@ fn snapshot_bound_index_source(
 ///
 /// `vertex_data` must be readable for `len` bytes for the duration of the
 /// call, which the D3D9 ABI makes the caller's contract.
-unsafe fn copy_up_vertices(vertex_data: *const c_void, len: usize) -> Vec<u8> {
-    let mut copy = Vec::<u8>::with_capacity(len);
-    // SAFETY: the caller guarantees `len` readable bytes at `vertex_data`;
-    // `copy` was just allocated with matching capacity.
-    unsafe {
-        core::ptr::copy_nonoverlapping(vertex_data.cast::<u8>(), copy.as_mut_ptr(), len);
-    }
-    // SAFETY: `len <= copy.capacity()` and bytes `0..len` were just
-    // initialised by the copy above.
-    unsafe { copy.set_len(len) };
-    copy
+unsafe fn copy_up_vertices(
+    dev: &mut DeviceInner,
+    vertex_data: *const c_void,
+    len: usize,
+) -> ScratchSlice {
+    // SAFETY: the caller guarantees `len` readable bytes at `vertex_data`.
+    let source = unsafe { core::slice::from_raw_parts(vertex_data.cast::<u8>(), len) };
+    // SAFETY: current_frame retains immutable scratch through native submit replay.
+    unsafe { arena_alloc_bytes(dev.current_frame.scratch_mut(), source) }
 }
 
 extern "system" fn device_draw_primitive_up(
@@ -11330,7 +10642,7 @@ extern "system" fn device_draw_primitive_up(
         let fan_bytes = (primitive_count as usize + 2) * vertex_stride as usize;
         // SAFETY: per the D3D9 ABI the caller guarantees `(primitive_count + 2)`
         // vertices of `vertex_stride` bytes are readable from `vertex_data`.
-        let vertex_copy = unsafe { copy_up_vertices(vertex_data, fan_bytes) };
+        let vertex_copy = unsafe { copy_up_vertices(dev, vertex_data, fan_bytes) };
         // The encoder's shared 16-bit pattern is relative to the fan's first
         // vertex, which the inline stream starts at, so it covers every fan a
         // 16-bit index can address; anything longer gets a generated list.
@@ -11347,26 +10659,26 @@ extern "system" fn device_draw_primitive_up(
         };
         let perf_ptr = DeviceInner::perf_ptr_of(obj.inner);
         let snap = CycleAddTimer::start(draw_snapshot_ptr(perf_ptr));
-        let snapshot = emit_snapshot_deltas(&obj);
+        emit_snapshot_deltas(&obj);
         drop(snap);
         let _push = CycleAddTimer::start(draw_push_op_ptr(perf_ptr));
         let metal_prim =
             d3d_to_metal_primitive(D3DPT_TRIANGLELIST).expect("triangle list is supported");
-        dev.push_op_inline(Op::draw(
-            DrawOp {
-                metal_prim,
-                vertex_source: VertexSource::Up {
-                    bytes: vertex_copy,
-                    size: u32::try_from(fan_bytes).expect("triangle-fan UP size fits u32"),
-                    stride: vertex_stride,
-                },
-                index_source,
+        dev.push_op_inline(Op::Draw(DrawOp {
+            metal_prim,
+            vertex_source: VertexSource::Up {
+                bytes: vertex_copy,
+                size: u32::try_from(fan_bytes).expect("triangle-fan UP size fits u32"),
+                stride: vertex_stride,
             },
-            snapshot,
-        ));
+            index_source,
+        }));
         // D3D9 resets stream source 0 to (NULL, 0, 0) after DrawPrimitiveUP.
         dev.bound_buffers_mut().reset_stream0();
-        return D3D_OK;
+        return obj
+            .inner()
+            .encoder_status()
+            .map_or_else(|hr| hr, |()| D3D_OK);
     }
 
     let Some(metal_prim) = d3d_to_metal_primitive(primitive_type) else {
@@ -11383,29 +10695,28 @@ extern "system" fn device_draw_primitive_up(
     let data_size = (vtx_count * vertex_stride) as usize;
     // SAFETY: `vertex_data` covers `data_size` bytes per the caller's stride
     // contract.
-    let vertex_copy = unsafe { copy_up_vertices(vertex_data, data_size) };
+    let vertex_copy = unsafe { copy_up_vertices(dev, vertex_data, data_size) };
 
-    let snapshot = emit_snapshot_deltas(&obj);
+    emit_snapshot_deltas(&obj);
     drop(snap);
     let _push = CycleAddTimer::start(draw_push_op_ptr(perf_ptr));
-    dev.push_op_inline(Op::draw(
-        DrawOp {
-            metal_prim,
-            vertex_source: VertexSource::Up {
-                bytes: vertex_copy,
-                size: u32::try_from(data_size).expect("DrawPrimitiveUP data size fits u32"),
-                stride: vertex_stride,
-            },
-            index_source: IndexSource::None {
-                start_vertex: 0,
-                vertex_count: vtx_count,
-            },
+    dev.push_op_inline(Op::Draw(DrawOp {
+        metal_prim,
+        vertex_source: VertexSource::Up {
+            bytes: vertex_copy,
+            size: u32::try_from(data_size).expect("DrawPrimitiveUP data size fits u32"),
+            stride: vertex_stride,
         },
-        snapshot,
-    ));
+        index_source: IndexSource::None {
+            start_vertex: 0,
+            vertex_count: vtx_count,
+        },
+    }));
     // D3D9 resets stream source 0 to (NULL, 0, 0) after DrawPrimitiveUP.
     dev.bound_buffers_mut().reset_stream0();
-    D3D_OK
+    obj.inner()
+        .encoder_status()
+        .map_or_else(|hr| hr, |()| D3D_OK)
 }
 
 /// Clamp `max_const_used` (reported as `u32` by the parsed shader) to the 256-row mirror.
@@ -11481,7 +10792,8 @@ fn bump_const_delta(
         )
     };
     let scratch = dev.current_frame.scratch_mut();
-    let data = arena_alloc_bytes(scratch, bytes);
+    // SAFETY: frame scratch remains immutable and retained through submit replay.
+    let data = unsafe { arena_alloc_bytes(scratch, bytes) };
     // start ≤ CONSTANT_ROWS ≤ u16::MAX and rows ≤ CONSTANT_ROWS, so
     // both fit `u16` trivially.
     let start_row = u16::try_from(start).expect("start_row ≤ 256 fits u16");
@@ -11489,18 +10801,11 @@ fn bump_const_delta(
     Some((start_row, rows_u16, data))
 }
 
-/// Rebuild the dirty pieces of `DeviceInner::snapshot_cache` into a fresh `CurrentSnapshot`.
+/// Record changed state directly from the dirty-state builders.
 ///
-/// The snapshot combines rebuilt and cached scratch pointers in the
-/// per-frame arena. The returned pointer travels with the following draw,
-/// which installs it before the encoder reads the draw state.
-///
-/// Gated on `DeviceInner::snapshot_dirty`: clean draws return
-/// immediately (encoder's `current_snapshot` already valid). Dirty
-/// draws rebuild ONLY the pieces whose bits fired — clean pieces
-/// reuse their cached scratch pointers (same per-frame arena, still
-/// valid until `stamp_and_swap` sets `all()`).
-fn emit_snapshot_deltas(obj: &Direct3DDevice9) -> Option<CurrentSnapshotPtr> {
+/// Clean draws retain the native encoder's current snapshot. Dirty draws emit
+/// only the changed fields, then the following Draw consumes the native state.
+fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
     let dirty = obj.inner().snapshot_dirty;
     if dirty.is_empty() {
         // A draw with the same state as its predecessor still gets its dump
@@ -11508,7 +10813,7 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) -> Option<CurrentSnapshotPtr> {
         if obj.inner().frame_dump.active {
             obj.inner().frame_dump_draw();
         }
-        return None;
+        return;
     }
 
     let stages_ptr = draw_snapshot_stages_ptr(DeviceInner::perf_ptr_of(obj.inner));
@@ -11866,18 +11171,9 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) -> Option<CurrentSnapshotPtr> {
     if dirty.contains(SnapshotDirty::VS_CONST)
         && (bound_vertex_shader.is_null() || dev.cached_ff_vs_layout.has_rhw())
     {
-        // FF VS const builder needs the FF key — pull from
-        // newly-rebuilt or cached vs. Both halves borrow; we
-        // `.clone()` the FF key once on the borrowed-from-cache
-        // path because `VsSource` is not Copy and the FF
-        // section helpers take `&FfVsKey`. The cache fallback derefs
-        // the scratch `VsSourcePtr` lazily (`or_else`): it's only
-        // reached when VS_SOURCE wasn't dirty this draw, which never
-        // happens on the first draw of a frame (`all()`), so the
-        // cached pointer is always current-frame valid before deref.
-        let key_ref = vs_value
-            .as_ref()
-            .or_else(|| dev.snapshot_cache.vs.as_ref().map(VsSourcePtr::as_ref));
+        // FF VS constants borrow the new source or the owned cached key.
+        // The existing section builders clone only the FF key they consume.
+        let key_ref = vs_value.as_ref().or(dev.snapshot_cache.vs.as_ref());
         let key = match key_ref {
             Some(VsSource::FixedFunction { key, .. }) => key.clone(),
             _ => dev
@@ -11904,7 +11200,8 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) -> Option<CurrentSnapshotPtr> {
                 |frame: &mut crate::encoder::FrameData, start_row: u16, rows: u16, ptr: *mut u8| {
                     let nn = NonNull::new(ptr).expect("ScratchArena alloc returned non-null");
                     let byte_len = u32::from(rows) * 16;
-                    let data = ScratchSlice::from_raw_parts(nn, byte_len);
+                    // SAFETY: frame scratch remains immutable and retained through submit replay.
+                    let data = unsafe { ScratchSlice::from_raw_parts(nn, byte_len) };
                     frame.push_op_inline(crate::encoder::Op::SetFfVsConstRange {
                         start_row,
                         rows,
@@ -11987,10 +11284,7 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) -> Option<CurrentSnapshotPtr> {
     // PS_CONST source. Same routing as VS_CONST: programmable PS uses
     // the encoder mirror; only FF runs here.
     let ps_rows = if dirty.contains(SnapshotDirty::PS_CONST) && bound_pixel_shader.is_null() {
-        match ps_value
-            .as_ref()
-            .or_else(|| dev.snapshot_cache.ps.as_ref().map(PsSourcePtr::as_ref))
-        {
+        match ps_value.as_ref().or(dev.snapshot_cache.ps.as_ref()) {
             Some(PsSource::FixedFunction { constant_rows, .. }) => *constant_rows,
             _ => 0,
         }
@@ -12002,10 +11296,13 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) -> Option<CurrentSnapshotPtr> {
             let ptr =
                 dev.ff_state
                     .build_ps_stage_constants(rs, ps_rows, dev.current_frame.scratch_mut());
-            Some(ScratchSlice::from_raw_parts(
-                NonNull::new(ptr).expect("stage constants scratch is non-null"),
-                u32::from(ps_rows) * 16,
-            ))
+            // SAFETY: frame scratch remains immutable and retained through submit replay.
+            Some(unsafe {
+                ScratchSlice::from_raw_parts(
+                    NonNull::new(ptr).expect("stage constants scratch is non-null"),
+                    u32::from(ps_rows) * 16,
+                )
+            })
         } else {
             None
         };
@@ -12099,141 +11396,102 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) -> Option<CurrentSnapshotPtr> {
         None
     };
 
-    // Phase 2: take scratch + bump dirty pieces + update cache. The
-    // ordinary const payloads above are fixed stack buffers. The optional
-    // stage-constant prefix is already immutable in frame scratch. Direct field access on
-    // `dev.current_frame.scratch` splits the borrow off
-    // `dev.snapshot_cache`, letting both be mutated/read in turn.
+    // Capture each changed structural value directly from its builder output.
+    // Only uniform bytes need an initial copy into retained guest scratch.
     let scratch = dev.current_frame.scratch_mut();
-
-    // ── consts_timer SCOPE: VS/PS const + alpha/fog bumps. Matches
-    //    baseline `snapshot_shared` scoping so the summary's `consts`
-    //    row stays comparable. RS/stages/attrs
-    //    bumps + wrapper bump + scalar cache updates fall into
-    //    "other" (snapshot total - stages - consts).
-    //
-    // FF VS const bytes flow through the encoder's
-    // `ff_vs_constants_mirror`; the API-side `snapshot_cache.vs_constants`
-    // is not consulted for FF (or programmable — that's mirror-only too).
-    // Clear the cached pointer so a stale cached entry doesn't leak.
+    let mut bytes = [None; 10];
     if dirty.contains(SnapshotDirty::VS_CONST) {
-        dev.snapshot_cache.vs_constants = None;
+        bytes[0] = Some(None);
     }
     if dirty.contains(SnapshotDirty::PS_CONST) {
-        dev.snapshot_cache.ps_constants =
-            ps_stage_constants.or_else(|| ps_const_buf.map(|b| arena_alloc_bytes(scratch, &b)));
+        // SAFETY: frame scratch remains immutable and retained through submit replay.
+        bytes[1] = Some(
+            ps_stage_constants
+                .or_else(|| ps_const_buf.map(|b| unsafe { arena_alloc_bytes(scratch, &b) })),
+        );
     }
     if let Some((buf, len)) = alpha_ref_buf {
-        dev.snapshot_cache.alpha_ref_bytes = Some(arena_alloc_bytes(scratch, &buf[..len]));
+        // SAFETY: frame scratch remains immutable and retained through submit replay.
+        bytes[2] = Some(Some(unsafe { arena_alloc_bytes(scratch, &buf[..len]) }));
     }
     if let Some((buf, len)) = fog_color_buf {
-        dev.snapshot_cache.fog_color_bytes = Some(arena_alloc_bytes(scratch, &buf[..len]));
+        // SAFETY: frame scratch remains immutable and retained through submit replay.
+        bytes[3] = Some(Some(unsafe { arena_alloc_bytes(scratch, &buf[..len]) }));
     }
     if let Some(buf) = bump_env_buf {
-        dev.snapshot_cache.bump_env_bytes = Some(arena_alloc_bytes(scratch, &buf));
+        // SAFETY: frame scratch remains immutable and retained through submit replay.
+        bytes[4] = Some(Some(unsafe { arena_alloc_bytes(scratch, &buf) }));
     }
     if let Some(buf) = vs_int_const_buf {
-        dev.snapshot_cache.vs_int_const_bytes = Some(arena_alloc_bytes(scratch, &buf));
+        // SAFETY: frame scratch remains immutable and retained through submit replay.
+        bytes[5] = Some(Some(unsafe { arena_alloc_bytes(scratch, &buf) }));
     }
     if let Some(buf) = vs_bool_const_buf {
-        dev.snapshot_cache.vs_bool_const_bytes = Some(arena_alloc_bytes(scratch, &buf));
+        // SAFETY: frame scratch remains immutable and retained through submit replay.
+        bytes[6] = Some(Some(unsafe { arena_alloc_bytes(scratch, &buf) }));
     }
     if let Some(buf) = ps_int_const_buf {
-        dev.snapshot_cache.ps_int_const_bytes = Some(arena_alloc_bytes(scratch, &buf));
+        // SAFETY: frame scratch remains immutable and retained through submit replay.
+        bytes[7] = Some(Some(unsafe { arena_alloc_bytes(scratch, &buf) }));
     }
     if let Some(buf) = ps_bool_const_buf {
-        dev.snapshot_cache.ps_bool_const_bytes = Some(arena_alloc_bytes(scratch, &buf));
+        // SAFETY: frame scratch remains immutable and retained through submit replay.
+        bytes[8] = Some(Some(unsafe { arena_alloc_bytes(scratch, &buf) }));
     }
     if let Some(buf) = vs_draw_buf {
-        dev.snapshot_cache.vs_draw_bytes = Some(arena_alloc_bytes(scratch, &buf));
+        // SAFETY: frame scratch remains immutable and retained through submit replay.
+        bytes[9] = Some(Some(unsafe { arena_alloc_bytes(scratch, &buf) }));
     }
     drop(consts_timer);
-    // ── END consts_timer SCOPE ──
-
-    // `bumps_timer` wraps the remaining phase-2 work: RS / stage_bindings
-    // / attrs scratch bumps, scalar cache assignments, and the
-    // snapshot-wrapper bump. Closes the prior "other" residual so the
-    // sum stages + consts + keys + bumps ≈ snapshot total.
     let bumps_timer =
         CycleAddTimer::start(draw_snapshot_bumps_ptr(DeviceInner::perf_ptr_of(obj.inner)));
-    // Non-const bumps + scalar cache updates.
-    if let Some(rs_val) = render_state_value {
-        // SAFETY: RenderStateSnapshot fields are all primitives /
-        // small Copy types with trivial Drop; bytewise scratch copy
-        // is sound.
-        let ptr = NonNull::new(unsafe { scratch.alloc_from(&rs_val) })
-            .expect("ScratchArena returned non-null");
-        dev.snapshot_cache.render_state = Some(RenderStatePtr(ptr));
-    }
-    if let Some((packed, packed_mask)) = stage_bindings_arr_opt {
-        // SAFETY: `snapshot_stage_bindings` initialised the first
-        // `popcount(packed_mask)` slots of `packed` (its returned mask
-        // agrees with the entries written), so the prefix reinterpret
-        // is sound.
+    let stages = stage_bindings_arr_opt.as_ref().map(|(packed, mask)| {
+        // SAFETY: snapshot_stage_bindings initialized exactly popcount(mask)
+        // entries. The borrowed prefix is consumed synchronously by capture.
         let prefix = unsafe {
             core::slice::from_raw_parts(
                 packed.as_ptr().cast::<StageBinding>(),
-                packed_mask.count_ones() as usize,
+                mask.count_ones() as usize,
             )
         };
-        // SAFETY: StageBinding fields are TextureId + sampler_state
-        // [u32; N] — trivial Drop, bytewise scratch copy is sound (same
-        // contract as the prior flat-array bump). The packed form only
-        // memcpys the bound slots, collapsing the per-draw bump from
-        // ~2 KB to ~120-360 B for typical WoW workloads.
-        let ptr = unsafe { bump_packed_stage_bindings(scratch, packed_mask, prefix) };
-        dev.snapshot_cache.stage_bindings = Some(ptr);
+        (*mask, prefix)
+    });
+    let delta = SnapshotDelta {
+        render_state: render_state_value.as_ref(),
+        stages,
+        attrs: vdecl_value
+            .as_ref()
+            .map(|(resolved, hash)| SnapshotAttributes {
+                attrs: &resolved.attrs,
+                extents: &resolved.extents,
+                used_streams: resolved.used_streams,
+                vdecl_hash: *hash,
+            }),
+        vs: vs_value.as_ref(),
+        ps: ps_value.as_ref(),
+        variant: variant_value,
+        bytes,
+        depth_stencil: depth_stencil_value,
+    };
+    // Failure stays latched in the frame recorder and rejects the entire frame.
+    dev.current_frame.record_snapshot_delta(&delta);
+    if let Some(value) = vs_value {
+        dev.snapshot_cache.vs = Some(value);
     }
-    if let Some((resolved, vdecl_hash)) = vdecl_value {
-        let (raw_ptr, len) = scratch.alloc_slice(&resolved.attrs);
-        let ptr = NonNull::new(raw_ptr).expect("ScratchArena alloc_slice returned non-null");
-        dev.snapshot_cache.attrs = Some(AttrSnapshot {
-            ptr,
-            len,
-            extents: resolved.extents,
-            used_streams: resolved.used_streams,
-            vdecl_hash,
-        });
+    if let Some(value) = ps_value {
+        dev.snapshot_cache.ps = Some(value);
     }
-    if let Some(v) = vs_value {
-        // Bump the VS source behind a scratch pointer so the per-draw
-        // wrapper memcpy doesn't carry the embedded FfVsKey — done only
-        // when VS_SOURCE is dirty (rare post-gating).
-        // SAFETY: VsSource is trivial-Drop (FfVsKey + scalars), so the
-        // bytewise scratch copy is sound; the pointer lives in the
-        // current frame's scratch, consumed by emit_draw before reset.
-        let raw = unsafe { scratch.alloc_from(&v) };
-        let ptr = NonNull::new(raw).expect("ScratchArena returned non-null");
-        dev.snapshot_cache.vs = Some(VsSourcePtr(ptr));
+    if let Some(value) = variant_value {
+        dev.snapshot_cache.variant = Some(value);
     }
-    if let Some(p) = ps_value {
-        // SAFETY: PsSource is trivial-Drop (FfPsKey + scalars); same
-        // lifetime contract as the VS bump above.
-        let raw = unsafe { scratch.alloc_from(&p) };
-        let ptr = NonNull::new(raw).expect("ScratchArena returned non-null");
-        dev.snapshot_cache.ps = Some(PsSourcePtr(ptr));
+    if let Some(value) = depth_stencil_value {
+        dev.snapshot_cache.depth_stencil = value;
     }
-    if let Some(v) = variant_value {
-        dev.snapshot_cache.variant = Some(v);
-    }
-    if let Some(ds) = depth_stencil_value {
-        dev.snapshot_cache.depth_stencil = ds;
-    }
-
-    // Cache is now the assembled snapshot — memcpy it once into
-    // scratch as the wrapper for the Op. SAFETY: CurrentSnapshot
-    // fields are all `Copy` with trivial Drop (Option<NonNull>,
-    // scalar, enum) so the bit-identical scratch copy never needs
-    // its own drop run.
-    let snap_ptr = unsafe { scratch.alloc_from(&dev.snapshot_cache) };
-
-    let snap_nn = NonNull::new(snap_ptr).expect("ScratchArena returned non-null");
     dev.snapshot_dirty = SnapshotDirty::empty();
     if dev.frame_dump.active {
         dev.frame_dump_draw();
     }
     drop(bumps_timer);
-    Some(CurrentSnapshotPtr(snap_nn))
 }
 
 /// Give a system-memory texture the Metal texture its pool withheld.
@@ -12317,8 +11575,8 @@ fn snapshot_stage_bindings(
         }
         let mut sampler_state = dev.stage_bindings().sampler_states(stage);
         // Lazy texture upload: flush any per-mip `dirty` flags before
-        // capturing TextureInfo. Closures pushed by `schedule_upload`
-        // precede the Draw closure on the encoder thread, so the
+        // capturing TextureInfo. Operations pushed by `schedule_upload`
+        // precede the Draw operation on the encoder thread, so the
         // upload runs before the bind reads.
         // Cross-device migration handler — must run before flush_dirty_mips
         // so the re-marked dirty bits drive an upload against the new
@@ -12422,7 +11680,7 @@ extern "system" fn device_draw_indexed_primitive_up(
     let vtx_bytes = vtx_upload * vertex_stride as usize;
     // SAFETY: per the D3D9 ABI `vertex_data` covers at least
     // `(min_vertex_index + num_vertices) * vertex_stride` bytes.
-    let vertex_copy = unsafe { copy_up_vertices(vertex_data, vtx_bytes) };
+    let vertex_copy = unsafe { copy_up_vertices(dev, vertex_data, vtx_bytes) };
 
     // Build the index stream. Triangle fan has no Metal primitive, so the
     // inline indices are gathered into a triangle list (fan vertices
@@ -12449,18 +11707,10 @@ extern "system" fn device_draw_indexed_primitive_up(
             return D3DERR_INVALIDCALL;
         }
         let idx_bytes = index_count as usize * index_size;
-        let mut index_copy = Vec::<u8>::with_capacity(idx_bytes);
-        // SAFETY: per the D3D9 ABI `index_data` covers `index_count` indices of
-        // `index_size` bytes; `index_copy` was just allocated to match.
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                index_data.cast::<u8>(),
-                index_copy.as_mut_ptr(),
-                idx_bytes,
-            );
-        }
-        // SAFETY: the leading `idx_bytes` were just initialised by the copy above.
-        unsafe { index_copy.set_len(idx_bytes) };
+        // SAFETY: the D3D9 caller supplies `idx_bytes` readable index data;
+        // current_frame retains the captured immutable bytes through replay.
+        let index_copy = unsafe { copy_up_vertices(dev, index_data, idx_bytes) };
+
         (
             metal_prim,
             IndexSource::Up {
@@ -12473,28 +11723,26 @@ extern "system" fn device_draw_indexed_primitive_up(
 
     let perf_ptr = DeviceInner::perf_ptr_of(obj.inner);
     let snap = CycleAddTimer::start(draw_snapshot_ptr(perf_ptr));
-    let snapshot = emit_snapshot_deltas(&obj);
+    emit_snapshot_deltas(&obj);
     drop(snap);
     let _push = CycleAddTimer::start(draw_push_op_ptr(perf_ptr));
-    dev.push_op_inline(Op::draw(
-        DrawOp {
-            metal_prim,
-            vertex_source: VertexSource::Up {
-                bytes: vertex_copy,
-                size: u32::try_from(vtx_bytes)
-                    .expect("DrawIndexedPrimitiveUP vertex size fits u32"),
-                stride: vertex_stride,
-            },
-            index_source,
+    dev.push_op_inline(Op::Draw(DrawOp {
+        metal_prim,
+        vertex_source: VertexSource::Up {
+            bytes: vertex_copy,
+            size: u32::try_from(vtx_bytes).expect("DrawIndexedPrimitiveUP vertex size fits u32"),
+            stride: vertex_stride,
         },
-        snapshot,
-    ));
+        index_source,
+    }));
     // D3D9 resets stream source 0 to (NULL, 0, 0) AND the index buffer to NULL
     // after a successful DrawIndexedPrimitiveUP.
     let bound = dev.bound_buffers_mut();
     bound.reset_stream0();
     bound.replace_index_buffer(core::ptr::null_mut());
-    D3D_OK
+    obj.inner()
+        .encoder_status()
+        .map_or_else(|hr| hr, |()| D3D_OK)
 }
 
 extern "system" fn device_process_vertices(
@@ -12602,7 +11850,7 @@ extern "system" fn device_process_vertices(
     dst_obj
         .inner_mut()
         .write_processed(dst_offset, &processed, dev);
-    D3D_OK
+    dev.encoder_status().map_or_else(|hr| hr, |()| D3D_OK)
 }
 
 extern "system" fn device_create_vertex_declaration(
@@ -12950,9 +12198,6 @@ extern "system" fn device_create_vertex_shader(
 ) -> i32 {
     let _api = device_api_lock(this);
     let _timer = device_timer(this, DeviceSubCategory::Misc);
-    // Null `*ppShader` before any failure return — see `device_create_pixel_shader`:
-    // callers (the conformance suite, real apps) ignore the HRESULT and bind the
-    // out-param, so an uninitialised slot becomes a wild shader pointer.
     null_out(shader);
     if function.is_null() || shader.is_null() {
         return D3DERR_INVALIDCALL;
@@ -12960,100 +12205,184 @@ extern "system" fn device_create_vertex_shader(
     let Some(bytecode) = read_shader_bytecode(function) else {
         return D3DERR_INVALIDCALL;
     };
-    // Dump before parse so unsupported-shader-model attempts (e.g. SM3
-    // bytecode under SM2 caps) still land in `debug.bytecodeDumpDir` for
-    // offline analysis. `ProgramId::from_tokens` is content-derived, so
-    // the id is stable without a successful parse.
-    let shader_id = ProgramId::from_tokens(&bytecode);
-    // SAFETY: vtable thunk; `this` is *mut Direct3DDevice9 per IDirect3DDevice9 ABI.
+    // SAFETY: vtable thunk; this is a live Direct3DDevice9 per the D3D9 ABI.
     let Some(obj) = (unsafe { InPtrMut::<Direct3DDevice9>::opt(this) }) else {
         return D3DERR_INVALIDCALL;
     };
-    maybe_dump_bytecode(
-        &obj.inner().config().bytecode_dump_dir,
-        "vs",
-        shader_id,
+    let mut created = match create_native_shader(
+        obj.inner(),
         &bytecode,
-    );
-    let program = match mtld3d_core::dxso::parse(&bytecode) {
-        Ok(p) => p,
-        Err(e) => {
-            warn!(target: LOG_TARGET, "CreateVertexShader parse failed: {e:?}");
-            return D3DERR_INVALIDCALL;
-        }
+        mtld3d_shared::shader_create::ShaderStage::Vertex,
+    ) {
+        Ok(created) => created,
+        Err(result) => return result,
     };
-    if program.shader_type != mtld3d_core::dxso::ShaderType::Vertex {
-        return D3DERR_INVALIDCALL;
-    }
-    // Reject bytecode that addresses a constant register past the model's
-    // file (vs float file is 256; int/bool files are 16 and exist from
-    // vs_2_0 on). The D3D9 validator fails these at create time.
-    if program.violates_constant_register_limits() {
-        warn!(target: LOG_TARGET, "reject CreateVertexShader: constant register out of range → INVALIDCALL");
-        return D3DERR_INVALIDCALL;
-    }
-    let max_const_used = program.max_const_reg().map_or(0, |m| u32::from(m) + 1);
     let mut const_usage = crate::vertex_shader::VsConstUsage::empty();
     const_usage.set(
         crate::vertex_shader::VsConstUsage::USES_REL_CONST,
-        program.uses_relative_const_addressing(),
+        created
+            .usage
+            .contains(mtld3d_shared::shader_create::ShaderUsage::RELATIVE_CONST),
     );
     const_usage.set(
         crate::vertex_shader::VsConstUsage::USES_INT_CONST,
-        program.uses_dynamic_int_constants(),
+        created
+            .usage
+            .contains(mtld3d_shared::shader_create::ShaderUsage::INT_CONST),
     );
     const_usage.set(
         crate::vertex_shader::VsConstUsage::USES_BOOL_CONST,
-        program.uses_dynamic_bool_constants(),
+        created
+            .usage
+            .contains(mtld3d_shared::shader_create::ShaderUsage::BOOL_CONST),
     );
-    // Extract the input-register semantics so `snapshot_shared` can resolve
-    // a bound vertex declaration's elements → `[[attribute(N)]]` indices
-    // without a trip to the encoder thread.
-    let input_semantics = extract_input_semantics(&program);
-    // The parsed program moves into an op bound for the encoder's program
-    // cache; both it and the wrapper share the tokens used by `GetFunction`.
-    let bytecode = program.bytecode().clone();
-    obj.inner().push_op(Box::new(move |enc| {
-        enc.register_program(shader_id, program);
-    }));
+    if let Err(result) = created.adopt(obj.inner()) {
+        return result;
+    }
     let shader_obj = Direct3DVertexShader9::new(
         obj.inner_ptr(),
-        shader_id,
-        max_const_used,
+        created.shader_id,
+        created.max_const_used,
         const_usage,
-        input_semantics,
-        bytecode,
+        core::mem::take(&mut created.input_semantics),
+        Arc::from(bytecode),
     );
     let shader_ptr = Box::into_raw(Box::new(shader_obj));
-    // SAFETY: `shader_ptr` is a freshly created, live shader at refcount 1.
+    // SAFETY: shader_ptr is a freshly created live shader at refcount one.
     unsafe { crate::com_ref::com_register_child(shader_ptr) };
-    // SAFETY: vtable out-param; `shader` is *mut *mut c_void per IDirect3DDevice9 ABI.
+    // SAFETY: the D3D9 ABI supplies a writable shader out pointer, checked non-null above.
     unsafe { OutPtr::write_opt(shader, shader_ptr.cast::<c_void>()) };
-    0
+    D3D_OK
 }
 
-/// Walk the VS's `dcl_*` declarations and collect the input-register semantics.
-///
-/// Non-Input declarations (samplers in PS, outputs like `oPos`)
-/// are filtered out — only `v0..vN` entries land here.
-fn extract_input_semantics(program: &mtld3d_core::dxso::DxsoProgram) -> Vec<InputSemantic> {
-    program
-        .declarations
-        .iter()
-        .filter_map(|decl| match decl {
-            mtld3d_core::dxso::Declaration::Semantic {
-                usage,
-                usage_index,
-                reg,
-            } if reg.kind == mtld3d_core::dxso::RegKind::Input => Some(InputSemantic {
-                usage: *usage,
-                usage_index: u8::try_from(*usage_index)
-                    .expect("D3D9 usage_index ≤ 15 (4-bit DXSO field)"),
-                register_index: reg.index,
-            }),
-            _ => None,
-        })
-        .collect()
+/// Parsed-program ownership until an ordered frame operation accepts it.
+struct CreatedNativeShader {
+    runtime: u64,
+    registration: u64,
+    shader_id: ProgramId,
+    max_const_used: u32,
+    usage: mtld3d_shared::shader_create::ShaderUsage,
+    color_out_mask: u8,
+    input_semantics: Vec<InputSemantic>,
+}
+
+impl CreatedNativeShader {
+    fn adopt(&mut self, dev: &mut DeviceInner) -> Result<(), i32> {
+        dev.try_push_op(Op::AdoptProgram(mtld3d_core::encoder_data::capture_op(
+            mtld3d_core::encoder_data::AdoptProgramOp {
+                registration: self.registration,
+            },
+        )))
+        .map_err(|error| {
+            error!(target: LOG_TARGET, "shader creation: cannot record adoption: {error:?}");
+            mtld3d_types::E_OUTOFMEMORY
+        })?;
+        // The frame now retains the registration through rejection or submission.
+        self.registration = 0;
+        Ok(())
+    }
+}
+
+impl Drop for CreatedNativeShader {
+    fn drop(&mut self) {
+        if self.registration != 0 {
+            let mut cancel = mtld3d_shared::shader_create::CancelShaderProgramParams {
+                runtime: self.runtime,
+                registration: self.registration,
+            };
+            if unix_call(&mut cancel) != D3D_OK {
+                error!(target: LOG_TARGET, "shader creation: pending-program cancellation failed");
+            }
+        }
+    }
+}
+
+fn create_native_shader(
+    dev: &DeviceInner,
+    bytecode: &[u32],
+    stage: mtld3d_shared::shader_create::ShaderStage,
+) -> Result<CreatedNativeShader, i32> {
+    use mtld3d_shared::shader_create::{
+        CreateShaderProgramParams, ShaderInputSemantic, ShaderStage, ShaderUsage,
+    };
+
+    if !dev.config().bytecode_dump_dir.is_empty() {
+        let prefix = match stage {
+            ShaderStage::Vertex => "vs",
+            ShaderStage::Pixel => "ps",
+        };
+        // Rejected programs are dumped too, before native validation.
+        maybe_dump_bytecode(
+            &dev.config().bytecode_dump_dir,
+            prefix,
+            ProgramId::from_tokens(bytecode),
+            bytecode,
+        );
+    }
+    // Each semantic requires at least one token, so this bounds repeated declarations too.
+    let capacity = if stage == ShaderStage::Vertex {
+        bytecode.len()
+    } else {
+        0
+    };
+    let mut semantics = Vec::<MaybeUninit<ShaderInputSemantic>>::new();
+    semantics
+        .try_reserve_exact(capacity)
+        .map_err(|_| mtld3d_types::E_OUTOFMEMORY)?;
+    semantics.resize_with(capacity, MaybeUninit::uninit);
+    let mut params = CreateShaderProgramParams {
+        runtime: dev.encoder_runtime(),
+        tokens_ptr: bytecode.as_ptr() as u64,
+        semantics_ptr: semantics.as_mut_ptr() as u64,
+        stage,
+        token_count: u32::try_from(bytecode.len()).expect("shader token walk is bounded by 65536"),
+        semantic_capacity: u32::try_from(capacity)
+            .expect("semantic capacity is bounded by token count"),
+        result: D3DERR_INVALIDCALL,
+        program_id: 0,
+        registration: 0,
+        max_const_used: 0,
+        semantic_count: 0,
+        usage: ShaderUsage::empty(),
+        color_out_mask: 0,
+        padding: [0; 6],
+    };
+    let status = unix_call(&mut params);
+    if status != D3D_OK || params.result != D3D_OK {
+        return Err(if status == D3D_OK {
+            params.result
+        } else {
+            status
+        });
+    }
+    let mut created = CreatedNativeShader {
+        runtime: params.runtime,
+        registration: params.registration,
+        shader_id: ProgramId::from_shader_reply(params.program_id),
+        max_const_used: params.max_const_used,
+        usage: params.usage,
+        color_out_mask: params.color_out_mask,
+        input_semantics: Vec::new(),
+    };
+    let count = params.semantic_count as usize;
+    if count > semantics.len() || created.registration == 0 {
+        error!(target: LOG_TARGET, "shader creation: invalid native metadata reply");
+        return Err(D3DERR_INVALIDCALL);
+    }
+    created
+        .input_semantics
+        .try_reserve_exact(count)
+        .map_err(|_| mtld3d_types::E_OUTOFMEMORY)?;
+    for semantic in &semantics[..count] {
+        // SAFETY: successful native validation initialized exactly semantic_count output slots.
+        let semantic = unsafe { semantic.assume_init_ref() };
+        created.input_semantics.push(InputSemantic {
+            usage: semantic.usage,
+            usage_index: semantic.usage_index,
+            register_index: semantic.register_index,
+        });
+    }
+    Ok(created)
 }
 
 extern "system" fn device_set_vertex_shader(this: *mut c_void, shader: *mut c_void) -> i32 {
@@ -13558,11 +12887,6 @@ extern "system" fn device_create_pixel_shader(
 ) -> i32 {
     let _api = device_api_lock(this);
     let _timer = device_timer(this, DeviceSubCategory::Misc);
-    // D3D9 nulls `*ppShader` on every failure path. Some apps ignore a failed
-    // HRESULT and then `SetPixelShader(*ppShader)` regardless — an
-    // uninitialised slot is a bogus
-    // shader pointer that the bind path adopts (a wild `Bound` write), so null
-    // it up front and let success overwrite it.
     null_out(shader);
     if function.is_null() || shader.is_null() {
         return D3DERR_INVALIDCALL;
@@ -13570,82 +12894,60 @@ extern "system" fn device_create_pixel_shader(
     let Some(bytecode) = read_shader_bytecode(function) else {
         return D3DERR_INVALIDCALL;
     };
-    // See `device_create_vertex_shader` — dump before parse so failed
-    // attempts still get captured.
-    let shader_id = ProgramId::from_tokens(&bytecode);
-    // SAFETY: vtable thunk; `this` is *mut Direct3DDevice9 per IDirect3DDevice9 ABI.
+    // SAFETY: vtable thunk; this is a live Direct3DDevice9 per the D3D9 ABI.
     let Some(obj) = (unsafe { InPtrMut::<Direct3DDevice9>::opt(this) }) else {
         return D3DERR_INVALIDCALL;
     };
-    maybe_dump_bytecode(
-        &obj.inner().config().bytecode_dump_dir,
-        "ps",
-        shader_id,
+    let mut created = match create_native_shader(
+        obj.inner(),
         &bytecode,
-    );
-    let program = match mtld3d_core::dxso::parse(&bytecode) {
-        Ok(p) => p,
-        Err(e) => {
-            warn!(target: LOG_TARGET, "CreatePixelShader parse failed: {e:?}");
-            return D3DERR_INVALIDCALL;
-        }
+        mtld3d_shared::shader_create::ShaderStage::Pixel,
+    ) {
+        Ok(created) => created,
+        Err(result) => return result,
     };
-    if program.shader_type != mtld3d_core::dxso::ShaderType::Pixel {
-        return D3DERR_INVALIDCALL;
-    }
-    // Reject a pixel shader that declares a `v#` input with the POSITION0 usage —
-    // the D3D9 validator (and the native assembler) forbid it; the rasterizer
-    // position is `vPos`, not a `v#` input. Higher position indices are valid
-    // user semantics.
-    if program.has_invalid_pixel_input_decl() {
-        warn!(target: LOG_TARGET, "reject CreatePixelShader: POSITION0 on a pixel-shader input register → INVALIDCALL");
-        return D3DERR_INVALIDCALL;
-    }
-    // Reject bytecode that addresses a constant register past the model's
-    // file (ps float file is 8 / 32 / 224 for ps_1 / ps_2 / ps_3; int/bool
-    // files are 16 and exist only from ps_3_0, so any int/bool use in ps_2_0
-    // is out of range). The D3D9 validator fails these at create time.
-    if program.violates_constant_register_limits() {
-        warn!(target: LOG_TARGET, "reject CreatePixelShader: constant register out of range → INVALIDCALL");
-        return D3DERR_INVALIDCALL;
-    }
-    let max_const_used = program.max_const_reg().map_or(0, |m| u32::from(m) + 1);
     let mut usage = crate::pixel_shader::PsUsage::empty();
     usage.set(
         crate::pixel_shader::PsUsage::AUTOMATIC_FOG,
-        program.major < 3,
+        created
+            .usage
+            .contains(mtld3d_shared::shader_create::ShaderUsage::AUTOMATIC_FOG),
     );
     usage.set(
         crate::pixel_shader::PsUsage::USES_BUMP_ENV,
-        program.uses_bump_env(),
+        created
+            .usage
+            .contains(mtld3d_shared::shader_create::ShaderUsage::BUMP_ENV),
     );
     usage.set(
         crate::pixel_shader::PsUsage::USES_INT_CONST,
-        program.uses_dynamic_int_constants(),
+        created
+            .usage
+            .contains(mtld3d_shared::shader_create::ShaderUsage::INT_CONST),
     );
     usage.set(
         crate::pixel_shader::PsUsage::USES_BOOL_CONST,
-        program.uses_dynamic_bool_constants(),
+        created
+            .usage
+            .contains(mtld3d_shared::shader_create::ShaderUsage::BOOL_CONST),
     );
-    let color_out_mask = program.color_out_mask();
-    let bytecode = program.bytecode().clone();
-    obj.inner().push_op(Box::new(move |enc| {
-        enc.register_program(shader_id, program);
-    }));
+    if let Err(result) = created.adopt(obj.inner()) {
+        return result;
+    }
     let shader_obj = Direct3DPixelShader9::new(
         obj.inner_ptr(),
-        shader_id,
-        max_const_used,
+        created.shader_id,
+        created.max_const_used,
         usage,
-        color_out_mask,
-        bytecode,
+        created.color_out_mask,
+        Arc::from(bytecode),
     );
     let shader_ptr = Box::into_raw(Box::new(shader_obj));
-    // SAFETY: `shader_ptr` is a freshly created, live shader at refcount 1.
+    // SAFETY: shader_ptr is a freshly created live shader at refcount one.
     unsafe { crate::com_ref::com_register_child(shader_ptr) };
-    // SAFETY: vtable out-param; `shader` is *mut *mut c_void per IDirect3DDevice9 ABI.
+    // SAFETY: the D3D9 ABI supplies a writable shader out pointer, checked non-null above.
     unsafe { OutPtr::write_opt(shader, shader_ptr.cast::<c_void>()) };
-    0
+    D3D_OK
 }
 
 extern "system" fn device_set_pixel_shader(this: *mut c_void, shader: *mut c_void) -> i32 {

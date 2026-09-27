@@ -167,6 +167,9 @@ impl PageBoxPool {
     /// Panics if the pool mutex was poisoned, same as [`Self::acquire`].
     #[must_use]
     pub fn recycle(&self, pb: PageBox) -> Option<PageBox> {
+        if !pb.is_native_owned() {
+            return Some(pb);
+        }
         let cap_bytes = self.cap_bytes();
         if cap_bytes == 0 {
             #[cfg(perf_tracking)]

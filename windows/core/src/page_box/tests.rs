@@ -179,3 +179,56 @@ fn drop_does_not_panic() {
         drop(PageBox::new_zeroed(8 * 1024));
     }
 }
+
+#[test]
+fn guest_lease_shares_reader_count_and_never_enters_native_pool() {
+    use core::ptr::NonNull;
+
+    use mtld3d_shared::encoder_wire::{LeaseCompletion, LeaseCompletionPtr};
+
+    let owner = Arc::new(PageBox::new_zeroed(64));
+    let publication_read = PageBoxRead::new(Arc::clone(&owner));
+    let completion = LeaseCompletion::new();
+    // SAFETY: The stack cell remains alive until the native owner is dropped below.
+    let completion_ptr =
+        unsafe { LeaseCompletionPtr::new(core::ptr::from_ref(&completion) as u64) };
+    // SAFETY: The original Arc pins the initialized pages and counter through
+    // native destruction; the publication read predates the native reader.
+    let native = unsafe {
+        PageBox::from_guest_lease(
+            NonNull::new(owner.as_ptr().cast_mut()).expect("allocated pages"),
+            owner.len(),
+            owner.logical_len(),
+            owner.generation(),
+            completion_ptr,
+            owner.reader_count_ptr(),
+        )
+    };
+    let native = Arc::new(native);
+    let native_read = PageBoxRead::new(Arc::clone(&native));
+    drop(publication_read);
+    assert!(
+        owner.has_readers(),
+        "native upload still protects guest writes"
+    );
+    assert!(!completion.is_complete());
+    drop(native_read);
+    assert!(
+        !owner.has_readers(),
+        "cached native owner alone is not a reader"
+    );
+    let native = Arc::try_unwrap(native).unwrap_or_else(|_| panic!("sole native owner"));
+    let pool = crate::page_box_pool::PageBoxPool::new(PAGE_SIZE * 2);
+    let rejected = pool
+        .recycle(native)
+        .expect("guest pages must not be recycled natively");
+    assert_eq!(pool.pooled_bytes(), 0);
+    assert!(!completion.is_complete());
+    drop(rejected);
+    assert!(completion.is_complete());
+    assert_eq!(
+        owner.as_slice()[0],
+        0,
+        "guest allocation still belongs to its owner"
+    );
+}

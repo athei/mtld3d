@@ -4,10 +4,15 @@ use mtld3d_shared::Thunks;
 use strum::{EnumCount, VariantArray};
 
 mod crash;
+mod draw;
+mod encoder;
+mod encoder_service;
 mod handlers;
 mod log_file;
 mod main_thread_checker;
 mod metal;
+mod shader_prewarm;
+mod shader_programs;
 
 /// `log` target used by every call inside this crate.
 ///
@@ -52,6 +57,12 @@ macro_rules! arp {
 
 const fn dispatch(code: Thunks) -> UnixCallFn {
     match code {
+        Thunks::CreateShaderProgram => arp!(shader_programs::create_handler),
+        Thunks::CancelShaderProgram => arp!(shader_programs::cancel_handler),
+        Thunks::SubmitEncoderFrame => arp!(encoder_service::submit_handler),
+        Thunks::EncoderControl => arp!(encoder_service::control_handler),
+        Thunks::CreateEncoder => arp!(encoder_service::create_handler),
+        Thunks::DestroyEncoder => arp!(encoder_service::destroy_handler),
         Thunks::InitLogger => arp!(handlers::init_logger_handler),
         Thunks::GetDeviceInfo => arp!(handlers::get_device_info_handler),
         Thunks::CreateCommandQueue => arp!(handlers::create_command_queue_handler),
@@ -103,4 +114,11 @@ const fn build_dispatch_table() -> [UnixCallFn; Thunks::COUNT] {
         i += 1;
     }
     table
+}
+
+/// Call a native backend handler without crossing Wine's PE boundary.
+fn native_call<T: mtld3d_shared::Thunk>(params: &mut T) -> i32 {
+    // SAFETY: Thunk associates the parameter layout with its dispatch entry;
+    // the live exclusive borrow lasts until the handler has returned.
+    unsafe { DISPATCH_TABLE[T::CODE as usize](std::ptr::from_mut(params).cast()) }
 }

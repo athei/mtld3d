@@ -186,3 +186,41 @@ fn bytes_used_tracks_cursor() {
     arena.alloc(&[0u8; 16]);
     assert_eq!(arena.bytes_used(), ALIGN as u64 * 3);
 }
+
+#[test]
+fn command_windows_share_payload_chunks_without_copy_or_unused_tail() {
+    let mut arena = ScratchArena::with_chunk_size(TEST_CHUNK);
+    let (first, first_len, _) = arena.write_record(1, 128, |writer| writer.u8(3)).unwrap();
+    let (second, second_len, _) = arena.write_record(2, 128, |writer| writer.u32(7)).unwrap();
+    assert_eq!(second, first + first_len as u64);
+    assert_eq!(first_len + second_len, 17);
+    let payload = arena.alloc(&[9; 16]);
+    assert_eq!(payload % 16, 0);
+    assert!(payload >= second + second_len as u64);
+    assert_eq!(arena.chunk_count(), 1);
+    let capacity = arena.capacity_bytes();
+    // SAFETY: the arena retains the first record unchanged across subsequent allocations.
+    let bytes = unsafe { core::slice::from_raw_parts(first as *const u8, first_len) };
+    let mut reader = mtld3d_shared::encoder_wire::WireReader::new(bytes);
+    assert_eq!(
+        reader.next_record().unwrap().unwrap().payload.u8().unwrap(),
+        3
+    );
+    arena.clear();
+    let (reused, _, _) = arena.write_record(3, 128, |writer| writer.u8(5)).unwrap();
+    assert_eq!(reused, first);
+    assert_eq!(arena.capacity_bytes(), capacity);
+}
+
+#[test]
+fn failed_command_window_does_not_consume_arena_space() {
+    let mut arena = ScratchArena::with_chunk_size(TEST_CHUNK);
+    let before = arena.bytes_used();
+    assert_eq!(
+        arena.write_record(1, 6, |writer| writer.u8(2)),
+        Err(mtld3d_shared::encoder_wire::WireError::TooLarge)
+    );
+    assert_eq!(arena.bytes_used(), before);
+    let (_, len, _) = arena.write_record(2, 128, |writer| writer.u32(3)).unwrap();
+    assert_eq!(arena.bytes_used(), len as u64);
+}

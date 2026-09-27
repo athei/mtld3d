@@ -1421,3 +1421,43 @@ fn inverse_rates_are_undefined_for_empty_or_saturated_counts() {
     assert_eq!(payload.counters.reset_epoch, u64::MAX);
     assert!(payload.counters.reset_epoch_saturated);
 }
+
+#[test]
+fn dispatch_trace_excludes_logger_and_separates_shader_validation_from_compile() {
+    use mtld3d_shared::Thunks;
+
+    assert_eq!(unix_dispatch_kind(Thunks::WriteLog as u32), None);
+    assert_eq!(
+        unix_dispatch_kind(Thunks::SubmitEncoderFrame as u32),
+        Some("enqueue")
+    );
+    for thunk in [
+        Thunks::SubmitFrame,
+        Thunks::CreateDepthStencilState,
+        Thunks::CreateTexturesBatch,
+        Thunks::CreateSamplerState,
+        Thunks::CreateBuffersBatch,
+        Thunks::CreateTextureSliceView,
+    ] {
+        assert_eq!(unix_dispatch_kind(thunk as u32), Some("replay"));
+    }
+    for thunk in [
+        Thunks::CompileShaderLibrary,
+        Thunks::CreateRenderPipeline,
+        Thunks::EnsureClearQuadPipeline,
+        Thunks::EnsureBlitPipeline,
+        Thunks::CreateDepthTransferPipeline,
+    ] {
+        assert_eq!(unix_dispatch_kind(thunk as u32), Some("compile"));
+    }
+    // Shader validation and resource creation remain necessary synchronous calls.
+    for thunk in [
+        Thunks::CreateShaderProgram,
+        Thunks::CreateEncoder,
+        Thunks::EncoderControl,
+        Thunks::CreateBackbuffer,
+        Thunks::DestroyEncoder,
+    ] {
+        assert_eq!(unix_dispatch_kind(thunk as u32), Some("sync"));
+    }
+}

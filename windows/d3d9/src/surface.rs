@@ -1627,8 +1627,9 @@ unsafe fn finalize_surface(this: *mut Direct3DSurface9) {
         );
         // SAFETY: a standalone surface forwards a device reference for its
         // public lifetime, so the device outlives this finalize.
-        unsafe { &mut *inner.device_inner }
-            .push_op(Box::new(move |enc| enc.retire_color_target(&retired)));
+        unsafe { &mut *inner.device_inner }.push_op(crate::encoder::Op::RetireColor(
+            mtld3d_core::encoder_data::capture_op(crate::device::RetireColorOp { retired }),
+        ));
     }
     // A standalone depth-stencil target owns its Metal depth texture the same
     // way, and retires it the same way. The implicit auto depth-stencil
@@ -1651,8 +1652,9 @@ unsafe fn finalize_surface(this: *mut Direct3DSurface9) {
         );
         // SAFETY: a standalone surface forwards a device reference for its
         // public lifetime, so the device outlives this finalize.
-        unsafe { &mut *inner.device_inner }
-            .push_op(Box::new(move |enc| enc.retire_depth_target(depth)));
+        unsafe { &mut *inner.device_inner }.push_op(crate::encoder::Op::RetireDepth(
+            mtld3d_core::encoder_data::capture_op(crate::device::RetireDepthOp { depth }),
+        ));
     }
     // A texture shell has nothing of the texture to give back here. The
     // reference `GetSurfaceLevel` / `GetCubeMapSurface` took on it is dropped by
@@ -2423,7 +2425,9 @@ fn backbuffer_lock_readback(
     // live `DeviceInner`; non-null here, and the device outlives all
     // its child resources per D3D9 lifetime rules.
     let device_inner = unsafe { &mut *inner.device_inner };
-    device_inner.flush_current_frame_blocking();
+    if let Err(hr) = device_inner.flush_current_frame_blocking() {
+        return hr;
+    }
 
     let mut params = BlitTextureToBufferParams {
         planes: mtld3d_shared::mtl::ReadbackPlanes::Color,
@@ -2499,7 +2503,7 @@ fn readback_full_backbuffer(inner: &mut SurfaceInner) -> Option<(u32, u32, u32)>
     // SAFETY: `device_inner` is non-null (checked) and points to the live owning
     // device, which outlives its child surfaces per D3D9 lifetime rules.
     let device_inner = unsafe { &mut *inner.device_inner };
-    device_inner.flush_current_frame_blocking();
+    device_inner.flush_current_frame_blocking().ok()?;
     let mut params = BlitTextureToBufferParams {
         planes: mtld3d_shared::mtl::ReadbackPlanes::Color,
         stencil_bytes_per_row: 0,
@@ -2567,19 +2571,24 @@ fn backbuffer_dc_upload(inner: &mut SurfaceInner) {
     if page.len() < needed {
         return;
     }
-    // Copy the snapshot into a buffer the pushed op owns: the encoder thread
-    // reads it long after this returns, so it must not borrow the page (which
-    // the caller drops as soon as the DC is gone).
-    let bytes: Vec<u8> = page.as_slice()[..needed].to_vec();
+    // Capture into frame-owned bytes before the caller can drop the DC page.
     // SAFETY: `inner.device_inner` is non-null (checked above) and points to
     // the live owning device, a different allocation from the page above.
     let device_inner = unsafe { &mut *inner.device_inner };
+    // SAFETY: the captured token moves directly into this frame's upload operation.
+    let bytes = unsafe { device_inner.capture_frame_bytes(&page.as_slice()[..needed]) };
     // The snapshot page is tightly packed, so a row is exactly `width` pixels.
     let src_stride = width * bpp;
     if scale.is_identity() {
-        device_inner.push_op(Box::new(move |enc| {
-            enc.upload_bytes_to_color_handle(color_handle, &bytes, width, height, src_stride);
-        }));
+        device_inner.push_op(crate::encoder::Op::UploadColor(
+            mtld3d_core::encoder_data::capture_op(crate::device::UploadColorOp {
+                color_handle,
+                bytes,
+                width,
+                height,
+                src_stride,
+            }),
+        ));
         return;
     }
     let target = ResampledUpload {
@@ -2592,9 +2601,9 @@ fn backbuffer_dc_upload(inner: &mut SurfaceInner) {
         msaa_srgb: inner.live_msaa_srgb_handle(),
         sample_count: inner.live_multi_sample().sample_count,
     };
-    device_inner.push_op(Box::new(move |enc| {
-        enc.upload_bytes_resampled(&target, &bytes);
-    }));
+    device_inner.push_op(crate::encoder::Op::UploadResampled(
+        mtld3d_core::encoder_data::capture_op(crate::device::UploadResampledOp { target, bytes }),
+    ));
 }
 
 /// `LockRect` for a system-memory offscreen surface.
@@ -2819,8 +2828,12 @@ fn lockable_rt_readback_fill(inner: &mut SurfaceInner, bpp: u32) -> bool {
     // This blit reads the RT right after the flush. Mark it read-back BEFORE
     // the flush so the store-action rules treat it as live and never discard
     // its colour store.
-    device_inner.push_op(Box::new(move |enc| enc.note_color_read_back(tex_handle)));
-    device_inner.flush_current_frame_blocking();
+    device_inner.push_op(crate::encoder::Op::NoteColorRead(
+        mtld3d_core::encoder_data::capture_op(crate::device::NoteColorReadOp { src: tex_handle }),
+    ));
+    if device_inner.flush_current_frame_blocking().is_err() {
+        return false;
+    }
     let mut params = BlitTextureToBufferParams {
         planes: mtld3d_shared::mtl::ReadbackPlanes::Color,
         stencil_bytes_per_row: 0,
@@ -2862,7 +2875,7 @@ fn lockable_rt_readback_fill(inner: &mut SurfaceInner, bpp: u32) -> bool {
 /// Push the CPU staging buffer up to the renderable colour `MTLTexture` so a
 /// subsequent `StretchRect` / sample observes the just-written pixels. The
 /// staging rows are *copied* into the pushed encoder op (a `Vec<u8>` the
-/// closure owns, at the staging's own row pitch) so the surface's `PageBox` is
+/// operation owns, at the staging's own row pitch) so the surface's `PageBox` is
 /// never aliased across the API/encoder boundary.
 ///
 /// The staging is laid out at the extent D3D9 reports and the colour texture
@@ -2901,10 +2914,7 @@ fn lockable_rt_upload(inner: &mut SurfaceInner) {
         );
         return;
     }
-    // Copy the `pitch * height` bytes the lock just received into a heap buffer
-    // the op owns: the encoder thread reads it long after this returns, so it
-    // must not borrow the surface's staging (no-thunk rule).
-    let bytes: Vec<u8> = page.as_slice()[..needed].to_vec();
+    // Capture into the frame arena before the application can rewrite staging.
     if inner.device_inner.is_null() {
         mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
             "lockable RT staging upload skipped: surface has no owning device (colour texture left as-is)"
@@ -2917,10 +2927,18 @@ fn lockable_rt_upload(inner: &mut SurfaceInner) {
     // resources per D3D9 lifetime rules. It is a different allocation from the
     // surface, so the borrows below never overlap.
     let device_inner = unsafe { &mut *inner.device_inner };
+    // SAFETY: the captured token moves directly into this frame's upload operation.
+    let bytes = unsafe { device_inner.capture_frame_bytes(&page.as_slice()[..needed]) };
     if scale.is_identity() {
-        device_inner.push_op(Box::new(move |enc| {
-            enc.upload_bytes_to_color_handle(color_handle, &bytes, width, height, pitch);
-        }));
+        device_inner.push_op(crate::encoder::Op::UploadColor(
+            mtld3d_core::encoder_data::capture_op(crate::device::UploadColorOp {
+                color_handle,
+                bytes,
+                width,
+                height,
+                src_stride: pitch,
+            }),
+        ));
         return;
     }
     let target = ResampledUpload {
@@ -2933,9 +2951,9 @@ fn lockable_rt_upload(inner: &mut SurfaceInner) {
         msaa_srgb: inner.live_msaa_srgb_handle(),
         sample_count: inner.live_multi_sample().sample_count,
     };
-    device_inner.push_op(Box::new(move |enc| {
-        enc.upload_bytes_resampled(&target, &bytes);
-    }));
+    device_inner.push_op(crate::encoder::Op::UploadResampled(
+        mtld3d_core::encoder_data::capture_op(crate::device::UploadResampledOp { target, bytes }),
+    ));
 }
 
 /// Parse a `RECT*` pointer passed to `LockRect` and clamp it against `(full_w, full_h)`.

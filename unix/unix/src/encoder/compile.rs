@@ -54,8 +54,11 @@ use super::{
 };
 use crate::{
     draw::{PsSource, ShaderRef, VsSource},
-    unix_call::unix_call,
+    native_call,
 };
+
+#[cfg(test)]
+mod tests;
 
 /// Worker threads each encoder builds with.
 ///
@@ -67,15 +70,10 @@ const COMPILE_WORKERS: usize = 4;
 /// Seconds a build may stay in flight before the encoder warns that it looks stuck.
 const STALLED_BUILD_SECS: u64 = 5;
 
-/// Stack reserved for each compile worker: 1 MiB, half the thread default.
+/// Stack reserved for each native compile worker.
 ///
-/// A 32-bit guest's address space is what runs out first, and four workers
-/// at the default 2 MiB would reserve 8 MiB of it per device. Wine raises
-/// every thread's stack reservation to at least 1 MiB, so asking for less
-/// would change nothing but what this constant claims; this asks for the
-/// floor explicitly, and four workers cost 4 MiB per device. The stack holds
-/// the MSL emission and the PE half of the thunk; the `unix_call` itself
-/// runs on Wine's kernel stack.
+/// MSL emission and backend compilation run on this Unix stack. It is not
+/// allocated from the guest's 32-bit address space.
 const COMPILE_WORKER_STACK: usize = 1024 * 1024;
 
 /// The jobs waiting for a worker, and the workers' wake-up.
@@ -169,14 +167,14 @@ impl CompileQueue {
     }
 }
 
-/// Start the encoder's compile workers; answers how many started.
+/// Start the encoder's native compile workers and retain their join handles.
 ///
-/// Called from the encoder thread's startup, never from `DllMain`. Each
-/// worker is detached: like the submit thread it is never joined (Wine can
-/// fail the wait on its handle), and it exits when the queue closes at
-/// encoder teardown or the encoder drops the result channel.
-pub fn spawn_workers(queue: &Arc<CompileQueue>, results: &mpsc::Sender<CompileResult>) -> usize {
-    let mut started = 0;
+/// The encoder closes the queue and joins these workers before device teardown.
+pub fn spawn_workers(
+    queue: &Arc<CompileQueue>,
+    results: &mpsc::Sender<CompileResult>,
+) -> Vec<thread::JoinHandle<()>> {
+    let mut started = Vec::new();
     for _ in 0..COMPILE_WORKERS {
         let queue = Arc::clone(queue);
         let results = results.clone();
@@ -185,7 +183,7 @@ pub fn spawn_workers(queue: &Arc<CompileQueue>, results: &mpsc::Sender<CompileRe
             .stack_size(COMPILE_WORKER_STACK)
             .spawn(move || worker_main(&queue, &results))
         {
-            Ok(_detached) => started += 1,
+            Ok(handle) => started.push(handle),
             Err(e) => {
                 mtld3d_shared::log_once_warn!(
                     target: LOG_TARGET,
@@ -199,8 +197,15 @@ pub fn spawn_workers(queue: &Arc<CompileQueue>, results: &mpsc::Sender<CompileRe
 
 fn worker_main(queue: &CompileQueue, results: &mpsc::Sender<CompileResult>) {
     mtld3d_shared::crumb::init();
+    worker_main_with(queue, |ticket, job| {
+        results.send(run_job(ticket, job, true)).is_ok()
+    });
+}
+
+/// Consume the real queue while keeping job execution outside its lock.
+fn worker_main_with(queue: &CompileQueue, mut execute: impl FnMut(JobTicket, QueuedJob) -> bool) {
     while let Some((ticket, job)) = queue.next_for_worker() {
-        if results.send(run_job(ticket, job, true)).is_err() {
+        if !execute(ticket, job) {
             break;
         }
     }
@@ -227,6 +232,7 @@ struct LibraryJob {
     device: MetalHandle<MTLDeviceKind>,
     /// Whether to append the record to the shader cache.
     persist: bool,
+    cache_path: Option<std::path::PathBuf>,
 }
 
 /// The emitter input of one library, and the index key its outcome lands under.
@@ -281,6 +287,7 @@ struct PipelineJob {
     sibling_of: Option<u64>,
     device: MetalHandle<MTLDeviceKind>,
     persist: bool,
+    cache_path: Option<std::path::PathBuf>,
 }
 
 /// The shader identities a pipeline build records, taken from the draw's two sources.
@@ -412,6 +419,7 @@ fn build_library(job: LibraryJob) -> LibraryOutcome {
         reference,
         device,
         persist,
+        cache_path,
     } = job;
     let mut total_ns = 0;
     let mut emit_ns = 0;
@@ -502,7 +510,7 @@ fn build_library(job: LibraryJob) -> LibraryOutcome {
             };
             let entry =
                 shader_cache::CacheEntry::new(reference.kind(), reference.key(), msl, retained);
-            persist_error = open_or_create_cache_file()
+            persist_error = open_or_create_cache_file(cache_path.as_deref())
                 .and_then(|writer| writer.append_shader(&entry))
                 .err();
         }
@@ -537,6 +545,7 @@ fn build_pipeline(job: PipelineJob) -> PipelineOutcome {
         sibling_of,
         device,
         persist,
+        cache_path,
     } = job;
     let mut total_ns = 0;
     let mut persist_ns = 0;
@@ -552,7 +561,7 @@ fn build_pipeline(job: PipelineJob) -> PipelineOutcome {
         vertex_layouts: &vertex_layouts,
         device_handle: device,
     });
-    let status = unix_call(&mut params);
+    let status = native_call(&mut params);
     let pipeline = params.pipeline_handle;
     let native = params.timings.into_inner();
     debug!(
@@ -565,7 +574,7 @@ fn build_pipeline(job: PipelineJob) -> PipelineOutcome {
         let _persist = NanosSetTimer::start(&raw mut persist_ns);
         if let Some((vs_ref, ps_ref)) = shader_refs {
             let recipe = PipelineRecipe::from_snapshot(vs_ref, ps_ref, &snapshot, &vertex_attrs);
-            persist_error = open_or_create_cache_file()
+            persist_error = open_or_create_cache_file(cache_path.as_deref())
                 .and_then(|writer| writer.append_pipeline(&recipe))
                 .err();
         } else {
@@ -927,6 +936,7 @@ impl FrameEncoder {
             reference,
             device: self.device_handle,
             persist: self.cache_persists(),
+            cache_path: self.cache_path.clone(),
         };
         let ticket = self.enqueue(CompileJob::Library(job));
         self.pending_libs.insert(reference, ticket);
@@ -1095,6 +1105,7 @@ impl FrameEncoder {
             sibling_of,
             device: self.device_handle,
             persist: self.cache_persists(),
+            cache_path: self.cache_path.clone(),
         };
         let ticket = self.enqueue(CompileJob::Pipeline(Box::new(job)));
         self.pending_pipelines.insert(key, ticket);

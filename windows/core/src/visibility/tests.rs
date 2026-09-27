@@ -645,3 +645,58 @@ fn finalize_reports_the_count_in_reported_pixels_of_the_target_begun_against() {
     assert_eq!(core.get_u64(), 307_200);
     assert_eq!(core.status(), QueryStatus::Issued);
 }
+
+#[test]
+fn api_reissue_hides_old_completion_before_recorded_begin_executes() {
+    let core = VisibilityQueryCore::new();
+    let first = core.mark_armed();
+    core.begin_recorded(first, 1, 0, (1, 1), (1, 1), 0);
+    assert_eq!(core.mark_end_requested(), first);
+    core.end_recorded(first, 1, 1);
+    let mut state = super::VisibilityQueryState::new();
+    let mut buffer = dummy_buf(1);
+    write_slot(&mut buffer, 0, 123);
+    state.pool.retire(buffer);
+    state.push_pending(1, core.clone(), (0, 1), true);
+    let second = core.mark_armed();
+    assert_eq!(core.mark_end_requested(), second);
+    assert_eq!(core.seq_end_loaded(), 0);
+    state.intake_completed(1);
+    assert_eq!(core.status(), super::QueryStatus::Pending);
+    assert_eq!(core.get_u64(), 0);
+    assert_eq!(core.seq_end_loaded(), 0);
+    core.begin_recorded(second, 2, 0, (1, 1), (1, 1), 0);
+    core.end_recorded(second, 2, 1);
+    let mut replacement = dummy_buf(2);
+    write_slot(&mut replacement, 0, 7);
+    state.pool.retire(replacement);
+    state.push_pending(2, core.clone(), (0, 1), true);
+    state.intake_completed(2);
+    assert_eq!(core.status(), super::QueryStatus::Issued);
+    assert_eq!(core.get_u64(), 7);
+    assert_eq!(core.seq_end_loaded(), 2);
+}
+
+#[test]
+fn queued_brackets_execute_their_recorded_generation() {
+    let core = VisibilityQueryCore::new();
+    let first = core.mark_armed();
+    assert_eq!(core.mark_end_requested(), first);
+    let second = core.mark_armed();
+    assert_eq!(core.mark_end_requested(), second);
+    core.begin_recorded(first, 1, 0, (1, 1), (1, 1), 0);
+    core.end_recorded(first, 1, 1);
+    assert_eq!(core.issue_generation(), first);
+    assert_eq!(core.seq_end_loaded(), 0);
+    core.accumulate_segment(123);
+    core.publish_span();
+    assert_eq!(core.status(), super::QueryStatus::Pending);
+    core.begin_recorded(second, 2, 0, (1, 1), (1, 1), 1);
+    core.end_recorded(second, 2, 2);
+    assert_eq!(core.issue_generation(), second);
+    core.accumulate_segment(7);
+    core.publish_span();
+    assert_eq!(core.status(), super::QueryStatus::Issued);
+    assert_eq!(core.get_u64(), 7);
+    assert_eq!(core.seq_end_loaded(), 2);
+}

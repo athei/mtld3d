@@ -37,7 +37,7 @@ use super::{
     D3D_OK, D3DERR_INVALIDCALL, E_NOINTERFACE,
     com_ref::{ComChild, ComUnknown},
     device::DeviceInner,
-    encoder::{FrameEncoder, TextureInfo, TextureUploadJob},
+    encoder::{TextureInfo, TextureUploadJob},
     null_out,
     private_data::PrivateDataStore,
     surface::{DcLockState, Direct3DSurface9},
@@ -215,7 +215,7 @@ pub struct TextureInner {
     /// page-sized allocation so the encoder can wrap it via
     /// `newBufferWithBytesNoCopy:` (which on non-UMA Macs requires page
     /// alignment for both pointer and length). The game writes through the
-    /// pointer returned by `lock_region_ptr`. At `Unlock`, the upload closure
+    /// pointer returned by `lock_region_ptr`. At `Unlock`, the upload operation
     /// clones the `Arc` — refcount bump, no memcpy — and hands the pointer to
     /// the encoder thread. `lock_region_ptr` decides between `WriteInPlace`
     /// (cast `as_ptr()` to `*mut u8` even when retention queues hold clones —
@@ -855,11 +855,16 @@ impl TextureInner {
         let texture_id = self.texture_id;
         let dev = DeviceInner::from_ptr(self.device_inner);
         let slot = Arc::new(core::sync::atomic::AtomicU64::new(0));
-        let slot_op = Arc::clone(&slot);
-        dev.push_op(Box::new(move |enc| {
-            slot_op.store(enc.get_texture_handle_by_id(texture_id), Ordering::Release);
-        }));
-        dev.flush_current_frame_blocking();
+        let slot_op = Arc::clone(&slot).into();
+        dev.push_op(crate::encoder::Op::ReadTextureHandle(
+            mtld3d_core::encoder_data::capture_op(crate::device::ReadTextureHandleOp {
+                texture_id,
+                slot_op,
+            }),
+        ));
+        if dev.flush_current_frame_blocking().is_err() {
+            return false;
+        }
         let handle = slot.load(Ordering::Acquire);
         if handle == 0 {
             return false;
@@ -2198,7 +2203,7 @@ impl TextureInner {
         seq.load(Ordering::Acquire)
     }
 
-    /// Build a `TextureInfo` snapshot for upload closures and draw-time stage binding capture.
+    /// Build a `TextureInfo` snapshot for upload operations and draw-time stage binding capture.
     pub fn texture_info(&self) -> TextureInfo {
         // Render space: this snapshot is what creates and addresses the Metal
         // texture. `self.width`/`self.height` stay logical for `GetLevelDesc`
@@ -2242,7 +2247,7 @@ impl TextureInner {
 
     /// Clone the staging `Arc` for this mip.
     ///
-    /// Cheap (refcount bump) — used by the upload closure to keep the bytes
+    /// Cheap (refcount bump) — used by the upload operation to keep the bytes
     /// alive until the encoder thread blits them to the texture, and by
     /// `push_texture_warmups` (device.rs) to populate
     /// `StagingWarmupEntry.keepalive` so the staging `MTLBuffer` wrapper
@@ -2654,7 +2659,7 @@ impl TextureInner {
                 // No rename, no preserve — same primitive as the
                 // READONLY fast-path above. `PageBox` exposes only
                 // raw-pointer accessors, so no Rust `&[u8]` borrow of
-                // the bytes lives across this cast. Encoder closures
+                // the bytes lives across this cast. Encoder operations
                 // hold Arc clones to keep the staging alive while
                 // they construct `newBufferWithBytesNoCopy:` MTLBuffer
                 // wrappers; they never borrow the bytes themselves.
@@ -3371,14 +3376,16 @@ unsafe fn finalize_texture(this: *mut Direct3DTexture9) {
     // `device_inner == 0` after `detach_from_device` — the owning
     // device has already been released and torn down (its
     // `shutdown_cleanup` already drained the texture cache + freed
-    // the matching `MTLTexture`). No closure to push, no live
+    // the matching `MTLTexture`). No operation to push, no live
     // registry to drop from. Just free the PE-side allocations.
     if dev_inner_raw != 0 {
         let dev = DeviceInner::from_ptr(dev_inner_raw);
-        // Push cleanup closure to encoder thread — it owns the Metal handle
-        dev.push_op(Box::new(move |enc| {
-            enc.destroy_cached_texture(texture_id);
-        }));
+        // Push cleanup operation to encoder thread — it owns the Metal handle
+        dev.push_op(crate::encoder::Op::DestroyTexture(
+            mtld3d_core::encoder_data::capture_op(crate::device::DestroyTextureOp {
+                tex_id: texture_id,
+            }),
+        ));
         // Drop from the live-textures registry before freeing the
         // inner Box so `evict_managed_resources` never sees a dangling
         // pointer.
@@ -3720,9 +3727,9 @@ extern "system" fn texture_generate_mip_sub_levels(this: *mut c_void) {
     if upload_regenerates {
         return;
     }
-    dev.push_op(Box::new(move |enc: &mut FrameEncoder| {
-        enc.run_generate_mipmaps(texture_id);
-    }));
+    dev.push_op(crate::encoder::Op::GenerateMipmaps(
+        mtld3d_core::encoder_data::capture_op(crate::device::GenerateMipmapsOp { texture_id }),
+    ));
 }
 
 // ── IDirect3DTexture9 ──
@@ -3867,18 +3874,16 @@ fn materialize_subresource_from_gpu(ti: &mut TextureInner, face: u32, level: usi
     // handle inside an op and read it back through an atomic slot once the
     // flush has drained the queue.
     let slot = Arc::new(core::sync::atomic::AtomicU64::new(0));
-    let slot_op = Arc::clone(&slot);
-    dev.push_op(Box::new(move |enc| {
-        let handle = enc.get_texture_handle_by_id(texture_id);
-        slot_op.store(handle, Ordering::Release);
-        // The store-action optimiser would drop the colour store of a pass
-        // nothing samples in-frame, and the claim this read resolves is exactly
-        // what such a pass wrote, so note the read before the flush decides.
-        // SAFETY: `handle` is a live retained `MTLTexture` handle from the
-        // encoder texture cache, or zero, which the note ignores.
-        enc.note_color_read_back(unsafe { MetalHandle::<MTLTextureKind>::new(handle) });
-    }));
-    dev.flush_current_frame_blocking();
+    let slot_op = Arc::clone(&slot).into();
+    dev.push_op(crate::encoder::Op::ReadTextureColorHandle(
+        mtld3d_core::encoder_data::capture_op(crate::device::ReadTextureColorHandleOp {
+            texture_id,
+            slot_op,
+        }),
+    ));
+    if dev.flush_current_frame_blocking().is_err() {
+        return false;
+    }
     let handle = slot.load(Ordering::Acquire);
     if handle == 0 {
         mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
@@ -4382,11 +4387,11 @@ fn parse_rect(rect: *const c_void, mip_w: u32, mip_h: u32) -> Option<DirtyRect> 
     })
 }
 
-/// Build the upload closure and push it onto the current frame's op list.
+/// Build the upload operation and push it onto the current frame's op list.
 ///
-/// The closure holds an `Arc` clone of the staging mip plus a snapshot of
+/// The operation holds an `Arc` clone of the staging mip plus a snapshot of
 /// the D3D9 format / pitch / bpp — refcount bump, zero memcpy on the API
-/// thread. The encoder thread runs it in order relative to draw closures.
+/// thread. The encoder thread runs it in order relative to draw operations.
 ///
 /// Also stamps the current submit seq onto the mip's `last_submit_seq`
 /// so a later `LockRect` can detect GPU-in-flight contention the same
@@ -4480,16 +4485,21 @@ fn schedule_upload_with_order<const ORDERED: bool>(
         rect.w,
         rect.h
     );
-    dev.push_op(Box::new(move |enc: &mut FrameEncoder| {
-        if ORDERED {
-            enc.run_ordered_texture_upload(job);
-        } else {
-            enc.run_texture_upload(job);
-        }
-        if regen_mipmaps {
-            enc.run_generate_mipmaps(texture_id);
-        }
-    }));
+    dev.push_op(crate::encoder::Op::UploadTextureAndMips(
+        mtld3d_core::encoder_data::capture_op(crate::device::UploadTextureAndMipsOp {
+            job,
+            texture_id,
+            flags: {
+                let mut flags = crate::device::UploadTextureOpFlags::empty();
+                flags.set(crate::device::UploadTextureOpFlags::ORDERED, ORDERED);
+                flags.set(
+                    crate::device::UploadTextureOpFlags::REGENERATE_MIPMAPS,
+                    regen_mipmaps,
+                );
+                flags
+            },
+        }),
+    ));
 }
 
 fn schedule_cube_upload(
@@ -4541,9 +4551,9 @@ fn schedule_cube_upload(
         release_staging: false,
         upload_generation: 0,
     };
-    dev.push_op(Box::new(move |enc: &mut FrameEncoder| {
-        enc.run_texture_upload(job);
-    }));
+    dev.push_op(crate::encoder::Op::UploadTexture(
+        mtld3d_core::encoder_data::capture_op(crate::device::UploadTextureOp { job }),
+    ));
 }
 
 /// Re-mark a subresource whose upload the encoder emitted nothing for.
@@ -4855,9 +4865,11 @@ fn flush_dirty_mips_slow<const ORDERED: bool>(ti: &mut TextureInner, dev: &mut D
         }
         let texture_id = ti.texture_id;
         if regenerate_mipmaps {
-            dev.push_op(Box::new(move |enc: &mut FrameEncoder| {
-                enc.run_generate_mipmaps(texture_id);
-            }));
+            dev.push_op(crate::encoder::Op::GenerateMipmaps(
+                mtld3d_core::encoder_data::capture_op(crate::device::GenerateMipmapsOp {
+                    texture_id,
+                }),
+            ));
         }
         mtld3d_shared::log_once_trace_by!(
             target: TEX_TRACE_TARGET, key: texture_id.raw(),

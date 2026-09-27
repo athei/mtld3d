@@ -65,17 +65,22 @@ const _: () = {
 
 /// One-shot "register `env_logger` on the unix side" thunk.
 ///
-/// Fired once from d3d9.dll's `init_logger` on DLL load, before any other
-/// thunk that might want to log. No payload — the `reserved` field keeps the
-/// struct non-zero-sized so the pointer handed across the boundary is
-/// distinct.
+/// Fired once from d3d9.dll on load, before other thunks can log.
+/// The UTF-8 filter comes from the PE process environment and is borrowed for the call.
 #[repr(C, align(8))]
 pub struct InitLoggerParams {
-    // Keeps the struct non-zero-sized so the pointer handed across the
-    // PE/Unix boundary is distinct. Constructed by name across crates,
-    // hence pub.
-    pub reserved: u64,
+    pub filter_ptr: u64,
+    pub filter_len: u32,
+    pub reserved: u32,
 }
+
+const _: () = {
+    assert!(size_of::<InitLoggerParams>() == 16);
+    assert!(align_of::<InitLoggerParams>() == 8);
+    assert!(core::mem::offset_of!(InitLoggerParams, filter_ptr) == 0);
+    assert!(core::mem::offset_of!(InitLoggerParams, filter_len) == 8);
+    assert!(core::mem::offset_of!(InitLoggerParams, reserved) == 12);
+};
 
 impl Thunk for InitLoggerParams {
     const CODE: u32 = Thunks::InitLogger as u32;

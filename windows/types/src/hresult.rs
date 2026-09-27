@@ -36,3 +36,9 @@ pub const D3DERR_DEVICENOTRESET: i32 = 0x8876_0869_u32.cast_signed();
 /// The format is valid but cannot auto-generate mipmaps because it is not
 /// render-targetable. `MAKE_D3DSTATUS(2159)`.
 pub const D3DOK_NOAUTOGEN: i32 = 0x0876_086F;
+
+/// Insufficient memory or native resources to complete the operation.
+pub const E_OUTOFMEMORY: i32 = 0x8007_000e_u32.cast_signed();
+
+/// `D3DERR_DEVICELOST`: native device work failed and rendering cannot continue.
+pub const D3DERR_DEVICELOST: i32 = 0x8876_0868_u32.cast_signed();

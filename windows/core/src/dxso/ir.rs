@@ -2,6 +2,8 @@
 //!
 //! Covers the subset of Shader Model 2.0 we actually need.
 
+pub use mtld3d_shared::shader_create::DeclUsage;
+
 use super::opcode::Opcode;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -41,24 +43,6 @@ pub enum RegKind {
 pub struct Register {
     pub kind: RegKind,
     pub index: u16,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DeclUsage {
-    Position,
-    BlendWeight,
-    BlendIndices,
-    Normal,
-    PSize,
-    Texcoord,
-    Tangent,
-    Binormal,
-    TessFactor,
-    PositionT,
-    Color,
-    Fog,
-    Depth,
-    Sample,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

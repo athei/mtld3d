@@ -62,6 +62,7 @@ mod table_fog;
 mod texture_stages;
 mod textures;
 mod transforms_ff;
+mod unix_encoder;
 mod vertex_decl;
 mod wide_stretch;
 mod window_lifecycle;

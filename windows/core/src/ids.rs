@@ -2,8 +2,8 @@
 //!
 //! Each newtype wraps a private `u64` and is constructed only through a
 //! domain-specific factory that takes authentic source material — there is no
-//! raw-u64 constructor, so miswiring (e.g. passing a Metal handle where a
-//! `TextureId` is expected) is a compile error.
+//! raw-u64 constructor. The encoder wire codec reconstructs existing minted
+//! identities field by field without exposing their representation to callers.
 
 use std::{
     fmt,
@@ -44,6 +44,12 @@ pub struct BufferId(u64);
 pub struct VertexAttrsHash(u64);
 
 impl ProgramId {
+    /// Recover the content identity returned by native shader creation.
+    #[must_use]
+    pub const fn from_shader_reply(raw: u64) -> Self {
+        Self(raw)
+    }
+
     /// Mint from a DXSO token stream.
     ///
     /// The token bytes are hashed into a stable u64 that survives
@@ -169,3 +175,57 @@ fn attr_bytes(attr: &VertexAttrDesc) -> [u8; ATTR_BYTES] {
 
 static NEXT_TEXTURE_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_BUFFER_ID: AtomicU64 = AtomicU64::new(1);
+
+impl crate::encoder_value::WireValue for ProgramId {
+    const MIN_WIRE_BYTES: usize = 8;
+
+    fn write_wire(
+        &self,
+        writer: &mut mtld3d_shared::encoder_wire::WireWriter<'_>,
+    ) -> Result<(), mtld3d_shared::encoder_wire::WireError> {
+        writer.u64(self.0)
+    }
+
+    fn read_wire(
+        reader: &mut mtld3d_shared::encoder_wire::WireReader<'_>,
+    ) -> Result<Self, mtld3d_shared::encoder_wire::WireError> {
+        // Logical cache keys carry no dereferenceable address or allocator ownership.
+        reader.u64().map(Self)
+    }
+}
+
+impl crate::encoder_value::WireValue for TextureId {
+    const MIN_WIRE_BYTES: usize = 8;
+
+    fn write_wire(
+        &self,
+        writer: &mut mtld3d_shared::encoder_wire::WireWriter<'_>,
+    ) -> Result<(), mtld3d_shared::encoder_wire::WireError> {
+        writer.u64(self.0)
+    }
+
+    fn read_wire(
+        reader: &mut mtld3d_shared::encoder_wire::WireReader<'_>,
+    ) -> Result<Self, mtld3d_shared::encoder_wire::WireError> {
+        // Logical cache keys carry no dereferenceable address or allocator ownership.
+        reader.u64().map(Self)
+    }
+}
+
+impl crate::encoder_value::WireValue for BufferId {
+    const MIN_WIRE_BYTES: usize = 8;
+
+    fn write_wire(
+        &self,
+        writer: &mut mtld3d_shared::encoder_wire::WireWriter<'_>,
+    ) -> Result<(), mtld3d_shared::encoder_wire::WireError> {
+        writer.u64(self.0)
+    }
+
+    fn read_wire(
+        reader: &mut mtld3d_shared::encoder_wire::WireReader<'_>,
+    ) -> Result<Self, mtld3d_shared::encoder_wire::WireError> {
+        // Logical cache keys carry no dereferenceable address or allocator ownership.
+        reader.u64().map(Self)
+    }
+}

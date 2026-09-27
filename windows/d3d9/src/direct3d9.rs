@@ -1643,9 +1643,27 @@ extern "system" fn d3d9_create_device(
         render_states[mtld3d_types::D3DRS_ZENABLE as usize] = 0;
     }
 
+    let encoder = match spawn_native_encoder(&cq_params, cfg) {
+        Ok(encoder) => encoder,
+        Err(result) => {
+            if !depth_handle.is_null() {
+                let handles = [depth_handle.raw()];
+                let mut destroy = mtld3d_shared::DestroyResourcesBulkParams {
+                    kind: mtld3d_shared::mtl::DestroyKind::Texture,
+                    pad0: 0,
+                    handles_ptr: handles.as_ptr() as u64,
+                    count: 1,
+                    pad1: 0,
+                };
+                unix_call(&mut destroy);
+            }
+            destroy_partial_device(&cq_params, layer_params.view_handle, Some(&bb_params));
+            restore_from_fullscreen(fullscreen.as_ref());
+            return result;
+        }
+    };
     addref_parent_direct3d9(this);
     spawn_tsc_warmup();
-    let (encoder, prewarm) = spawn_encoder_and_prewarm(&cq_params, cfg);
 
     let dev = Direct3DDevice9::new(crate::device::DeviceCreateInfo {
         device_handle: cq_params.device_handle,
@@ -1668,7 +1686,6 @@ extern "system" fn d3d9_create_device(
         backbuffer_height: pp.back_buffer_height,
         render_scale,
         encoder,
-        prewarm,
         current_frame: FrameData::new(&FrameInit {
             device_handle: cq_params.device_handle,
             record_handle: cq_params.record_handle,
@@ -1815,16 +1832,16 @@ fn addref_parent_direct3d9(this: *mut c_void) {
     }
 }
 
-/// Warm the TSC calibration in the background.
+/// Warm the API runtime's TSC calibration in the background.
 ///
-/// The encoder thread's first 2-second-window check then finds a ready
-/// `tsc_hz()` value instead of paying the 50 ms calibration sleep itself.
+/// API telemetry converts cycles to nanoseconds before handing a frame to Unix.
+/// Warming here keeps its first conversion from paying the calibration sleep.
 /// Deliberately not spawned from `DllMain` or `Direct3DCreate9`: mod /
 /// launcher DLLs commonly probe-call `Direct3DCreate9` early enough that the
 /// spawned thread's stdlib thread-entry (TLS, `env_logger` lazy init) still
 /// races the host process's own init and can blow a 2 MB Wine stack or fault
 /// with a corrupt TEB. `CreateDevice` runs past all of that.
-/// `tsc_hz()` is internally latched by a `OnceLock`, so a second
+/// `tsc_hz()` is internally latched by a `LazyLock`, so a second
 /// `CreateDevice` call just returns the cached value.
 fn spawn_tsc_warmup() {
     let _ = std::thread::Builder::new()
@@ -1834,32 +1851,19 @@ fn spawn_tsc_warmup() {
         });
 }
 
-/// Spawn the encoder thread plus the shader-cache pre-warm thread.
-///
-/// Reads `<host-exe-dir>/mtld3d_shaders.bin`, compiles every cached MSL
-/// via the existing `CompileShaderLibrary` thunk, and ships the
-/// `MTLLibrary` handles to the encoder over the dedicated prewarm
-/// channel. The encoder blocks on that channel before draining its first
-/// `EncoderMessage`, so live miss-compiles can never race the prewarm.
-/// Cold launch (no file) sends an empty payload — that's still the
-/// "cache file is fresh, you may start writing" signal the encoder needs
-/// to flip `cache_ready`.
-fn spawn_encoder_and_prewarm(
+/// Create native encoder, submit, compile and shader-cache prewarm workers.
+fn spawn_native_encoder(
     cq: &CreateCommandQueueParams,
     cfg: &Arc<Mtld3dConfig>,
-) -> (EncoderThread, mtld3d_core::shader_prewarm::PrewarmHandle) {
-    // The only place the snapshot is built: the `intel.*` overrides fold in
-    // here so the encoder and `DeviceInner::gpu_caps()` see one answer.
+) -> Result<EncoderThread, i32> {
+    // Resolve overrides once so both runtime sides use identical GPU capabilities.
     let gpu_caps = mtld3d_core::gpu_caps::GpuCaps {
         unified_memory: cq.unified_memory != 0,
         min_linear_texture_align: cq.min_linear_texture_align,
         device_caps: device_caps_flags(),
     }
     .with_intel_overrides(cfg.managed_memory, cfg.linear_align256);
-    let (prewarm, prewarm_rx) =
-        crate::shader_prewarm::spawn(cq.device_handle, cfg.shader_cache_enable);
-    let encoder = EncoderThread::spawn(gpu_caps, Arc::clone(cfg), prewarm_rx);
-    (encoder, prewarm)
+    EncoderThread::spawn(cq.device_handle, gpu_caps, cfg)
 }
 
 /// `CAMetalLayer.pixelFormat` and the backbuffer are hardcoded to `BGRA8Unorm` on the unix side.

@@ -37,8 +37,8 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::{
     LOG_TARGET,
-    encoder::{StageLibHandles, WarmCache, compile_stage_library, shader_cache_path},
-    unix_call::unix_call,
+    encoder::{StageLibHandles, WarmCache, compile_stage_library},
+    native_call,
 };
 
 /// Start prewarm for one device and return its startup barrier.
@@ -48,8 +48,9 @@ use crate::{
 pub fn spawn(
     device_handle: MetalHandle<MTLDeviceKind>,
     shader_cache: bool,
+    cache_path: Option<std::path::PathBuf>,
 ) -> (PrewarmHandle, Receiver<Option<WarmCache>>) {
-    PrewarmHandle::spawn(move |stop| run(device_handle, stop, shader_cache))
+    PrewarmHandle::spawn(move |stop| run(device_handle, stop, shader_cache, cache_path))
 }
 
 /// The pre-warm body; `shader_cache` is the interface's `shaderCache.enable`.
@@ -57,6 +58,7 @@ fn run(
     device_handle: MetalHandle<MTLDeviceKind>,
     stop: &AtomicBool,
     shader_cache: bool,
+    cache_path: Option<std::path::PathBuf>,
 ) -> Option<WarmCache> {
     if !shader_cache {
         info!(
@@ -67,7 +69,8 @@ fn run(
     }
     let started = Instant::now();
 
-    let Some(path) = shader_cache_path() else {
+    let Some(path) = cache_path else {
+        mtld3d_shared::log_once_warn!(target: LOG_TARGET, "shader_cache: no translated game cache path, prewarm disabled");
         return Some(WarmCache::empty());
     };
 
@@ -335,7 +338,7 @@ fn compile_pipeline(
         vertex_layouts: &vertex_layouts,
         device_handle,
     });
-    let status = unix_call(&mut params);
+    let status = native_call(&mut params);
     let pipeline = params.pipeline_handle;
     let timings = params.timings.into_inner();
     drop(timer);

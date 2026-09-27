@@ -32,15 +32,39 @@ const STATUS_UNSUCCESSFUL: i32 = 0xC000_0001_u32.cast_signed();
 /// d3d9.dll dispatches this as its first thunk after it has wired up its
 /// own PE-side `env_logger`. `mtld3d_shared` owns the init policy; this
 /// handler just forwards to it so all three cdylibs stay byte-identical.
-pub extern "C" fn init_logger_handler(_args: *mut c_void) -> i32 {
+pub extern "C" fn init_logger_handler(args: *mut c_void) -> i32 {
     // The PE side can replay this first-thunk init (a second `Direct3DCreate9`
     // re-runs it), so the one-time process setup runs under a single `Once`
     // here rather than each callee carrying its own idempotency flag.
     static INIT: std::sync::Once = std::sync::Once::new();
+    // SAFETY: the dispatcher supplies this request's borrowed parameter record.
+    let Some(params) = (unsafe { InPtr::<mtld3d_shared::InitLoggerParams>::opt(args) }) else {
+        return STATUS_UNSUCCESSFUL;
+    };
+    let filter = if params.filter_len == 0 {
+        None
+    } else {
+        if params.filter_ptr == 0
+            || params
+                .filter_ptr
+                .checked_add(u64::from(params.filter_len))
+                .is_none()
+        {
+            return STATUS_UNSUCCESSFUL;
+        }
+        // SAFETY: the PE caller retains the byte-aligned UTF-8 buffer through this call.
+        let bytes = unsafe {
+            std::slice::from_raw_parts(params.filter_ptr as *const u8, params.filter_len as usize)
+        };
+        let Ok(filter) = std::str::from_utf8(bytes) else {
+            return STATUS_UNSUCCESSFUL;
+        };
+        Some(filter)
+    };
     INIT.call_once(|| {
         // Every line goes to the process's log file once `OpenLog` names
         // it; the file sink keeps the lines logged before that.
-        mtld3d_shared::init_logger_to(Box::new(crate::log_file::FileSink));
+        mtld3d_shared::init_logger_to_filter(Box::new(crate::log_file::FileSink), filter);
         log_identity();
         // Latch the unix-side perf-tracking gate (`PERF_TRACKING_ENABLED`)
         // from `RUST_LOG`. Per-cdylib because each cdylib has its own

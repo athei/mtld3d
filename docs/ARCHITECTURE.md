@@ -19,12 +19,44 @@ test.exe → d3d9.dll → mtld3d.dll → mtld3d.so
 (x64 PE)   (ARM64X)   (ARM64X)   (Mach-O arm64, EC=1 only)
 ```
 
-- `d3d9.dll` — D3D9 API implementation. COM vtables, caps, state management. Calls Metal-level thunks via its internal `unix_call` caller stub (`windows/d3d9/src/unix_call.rs`).
+- `d3d9.dll`: D3D9 API implementation. COM vtables, caps, state management
+  and application-facing memory. Calls the native runtime through its internal
+  `unix_call` caller stub (`windows/d3d9/src/unix_call.rs`).
 - `mtld3d.dll` — PE shim. Links winecrt0, owns Wine unix-call globals, exports `mtld3d_unix_call()`. Forwards every cross-boundary call from `d3d9.dll` into `mtld3d.so`.
-- `mtld3d.so` — native macOS side. Pure Metal abstraction layer: thunks expose Metal operations only, no D3D9 knowledge.
-- `mtld3d-core` — pure-Rust rlib linked into `d3d9.dll`. Host-testable.
+- `mtld3d.so`: native macOS runtime. Owns Metal integration and is the preferred
+  home for deferred D3D9 translation, encoding, compilation, caching and submission.
+- `mtld3d-core`: host-testable Rust logic linked into both runtimes.
 - `shared` — PE↔Unix wire-format definitions plus cross-linkage-unit helpers.
 - `types` — D3D9 type definitions (vtables, caps structs) shared between d3d9 and tests.
+
+## Runtime placement policy
+
+Run as much work as possible on the Unix side, provided matched measurements
+show no performance regression. D3D9 knowledge is not restricted to PE code.
+The Unix runtime executes in the architecture of the Wine host, independently
+of the game's PE architecture. Storage private to Unix need not occupy the
+32-bit guest address space.
+
+Keep COM entry points, application-visible object semantics, Win32 integration
+and the state capture needed by API calls on the PE side. Keep those calls
+cheap: moving work to Unix must not add per-draw crossings, repeated data copies
+or waits that serialize the API, encoder, submit and presenter stages. Prefer
+one batched handoff for an ordinary frame. Lifecycle operations, synchronous
+readbacks, mid-frame flushes and other operations with synchronous API results
+retain explicit control paths.
+
+Allocate and release private native caches, command storage and worker state
+in the Unix runtime. Memory dereferenced by PE code or returned to the game
+must remain guest-addressable. Each cross-boundary reference has an explicit
+owner and lifetime; sharing an address does not transfer allocator ownership.
+Deferred work crosses as data with a fixed layout, never as a Rust closure,
+trait object, function pointer or owning collection from the other runtime.
+
+Placement changes preserve bounded queue capacity, ordering, cancellation,
+resource retirement and per-device isolation. The threading sections below
+describe the implemented path. Performance acceptance follows the matched A/B procedure
+in [`CONTRIBUTING.md`](../CONTRIBUTING.md#benchmarks), including API cost,
+frame time, compilation stalls and memory pressure.
 
 ## Workspaces and crates
 
@@ -34,7 +66,7 @@ Two Cargo workspaces, one per target platform: `windows/` builds the PE side for
 |---------------------|------------|--------------------------------------------------------|
 | `d3d9`              | `windows/` | `d3d9.dll`                                             |
 | `mtld3d`            | `windows/` | `mtld3d.dll`, the shim                                 |
-| `mtld3d-core`       | `windows/` | rlib linked into `d3d9.dll`                            |
+| `mtld3d-core`       | `windows/` | rlib linked into `d3d9.dll` and `mtld3d.so`            |
 | `mtld3d-types`      | `windows/` | rlib, D3D9 type definitions shared with the tests      |
 | `mtld3d-tests`      | `windows/` | the end-to-end suite                                   |
 | `mtld3d-unix`       | `unix/`    | `mtld3d.so`                                            |
@@ -47,15 +79,43 @@ Two Cargo workspaces, one per target platform: `windows/` builds the PE side for
 
 ## Threading model
 
-The API thread (the game's calling thread) is the bottleneck and must be unblocked fast. Every D3D9 call snapshots the relevant state (cheap u32 copies, vertex memcpy) into a closure and pushes it onto the current frame's op list — no translation, no Metal lookup, no encoding.
+The API thread (the game's calling thread) is the bottleneck and must be
+unblocked fast. It records typed operations and changed draw snapshots directly
+into the frame's `ScratchArena`. Commands and variable payloads share the same
+64 KiB chunked bump allocator; ordinary chunks are retained for reuse after
+replay. Metadata describes immutable command spans rather than concatenating
+or serializing the whole frame at `Present`.
 
-A dedicated **encoder thread** (one per device, `sync_channel(1)` backpressure) does the real work. On `Present()`, the API thread sends the accumulated frame and immediately starts collecting the next. The encoder thread runs each closure with mutable access to a `FrameEncoder` that owns persistent caches (pipeline states, depth/stencil states) and translates D3D9 → Metal commands into a fixed-size array.
+A native encoder thread per device receives one `SubmitEncoderFrame` handoff
+for an ordinary frame through a capacity-one queue. Admission retains the PE
+packet; the encoder validates its complete stream before replay, reconstructs
+native values and translates D3D9 operations into Metal commands. The PE side
+starts collecting the next frame after admission. `FrameEncoder`, its caches,
+command lists and private staging belong to Unix. COM pointers, Rust closures,
+allocator owners and PE function pointers are never executed or destroyed by
+the native worker.
 
-A dedicated **submit thread** (one per device) executes the `SubmitFrame` thunk — the cross-boundary command replay and the commit of the frame's upload and render command buffers — overlapping the encoder's build of the next frame. The frame crosses as an owned `FramePayload` holding every buffer the thunk aliases by raw pointer; two payloads ping-pong over a cap-1 work channel, so render-ahead is bounded at one frame. Rare synchronous submits (`Reset`, mid-frame flushes, GPU capture) first drain the submit thread to idle, then run the thunk inline on the encoder thread — the two paths never call `SubmitFrame` concurrently.
+A native submit thread per device replays and commits the encoder's finished
+`FramePayload`, overlapping the next frame's encoding. Two payloads ping-pong
+over a capacity-one work channel. Backend calls use the native dispatch
+helpers directly, preserving each handler's autorelease pool without entering
+Wine's PE/Unix dispatcher. Rare synchronous submits (`Reset`, mid-frame
+flushes and GPU capture) first drain the submit worker and then submit inline
+on the native encoder; the two paths never submit concurrently.
+
+PE-owned packet storage is reusable after replay has stopped borrowing its
+bytes. Resource leases have independent lifetimes: native wrappers and GPU
+work can retain guest-addressable pages after frame replay. Device-local
+pooled mailbox pairs report acquisition and final release. Publication state
+is `AtomicU32`; a separate aligned `AtomicU64` intrusive queue carries fixed-width
+addresses. Producers never wait for queue capacity. The API drains completed
+notifications with a bounded budget and releases the corresponding PE owners,
+without scanning every live resource. Slots are reused only after every
+notification has been consumed. Native code never invokes a PE destructor.
 
 A native **presenter thread** (one per device, owned by `mtld3d.so`, `metal/presenter.rs`) presents what the submit thread committed. A present-bearing frame leaves a packet behind its commit: the layer, the texture to present, its sequence. The presenter takes the packets in order, acquires the drawable, encodes the present route into a command buffer of its own and commits it, so a frame's render work never waits for a drawable and present order is the packet order. The split creates one hazard, a later render overwriting the back buffer before a pending present has read it, and the submit thread resolves it before it commits: a present-bearing submit waits for every pending present to have committed, whether the newest reads the back buffer or a copy, which is the cadence the display already set, costs no copy and keeps the queue one deep except behind a barrier; a submit that must not wait, a no-present mid-frame flush or one a barrier hurried, copies the pending present's frame into a slot and retargets the packet at it; the slot array is as deep as the pipeline (`PRESENT_PIPELINE_DEPTH` in `mtld3d-shared`, which the encoder asserts against its channel and payload caps at compile time), since a barrier hurries every frame the pipeline holds and each copies once, and its textures are allocated only when a copy needs them. So a read-back waits for committed render work and the GPU, never for the display. A backlog a barrier leaves behind the presenter is shown frame by frame at the display's cadence, never skipped or hurried: the pipeline refills on the API thread's side, which keeps the presented cadence even. Barriers (`drain_submit_thread`) set the hurry through `SetPresentWaitPolicy` around their wait for the submits in flight; `Reset`, shutdown and the GPU capture additionally wait for the presenter to go idle and its last present to retire (`WaitForPresentIdle`) before the back buffer or the layer can go. `debug.presentGateFile` parks the presenter before each drawable while the named file exists, the seam the test suite holds a read-back against.
 
-Four **compile workers** (`mtld3d-compile`, per device, `encoder/compile.rs`) build the shader libraries and render pipelines a draw names for the first time. The encoder keeps the part of a miss that has to be answered at once: the probe of the source-keyed index, the content key, the warm-cache bridge that answers from what prewarm built, and the enqueue, which records the build as pending under its job's ticket in a map of its own, apart from the source-keyed indices, so a draw whose library is built probes exactly what it did before builds went to workers. A worker does the rest: the MSL emission (from an `Arc` of the parsed program, or its own copy of the fixed-function key), the `CompileShaderLibrary` or `CreateRenderPipeline` thunk, and the cache append through `CacheWriter`, whose sidecar lock serializes it against every other writer. Its result comes back over a channel and the encoder installs it, bookkeeping only, at `begin_frame` and when a draw's probe finds a build in flight, before it decides; an append that failed latches the cache off there. Whether a job appends is decided when it is queued, so jobs queued before a failure still append afterwards, and each failure after the first is absorbed without another warning. The unix side of both thunks holds no shared state, the same property the prewarm threads already rely on. Each worker reserves 1 MiB of stack rather than the 2 MiB default, since a 32-bit guest's address space is the scarce resource here: Wine raises every thread's reservation to at least 1 MiB, so that is the floor, and four workers cost 4 MiB of address space per device, plus the heap of the jobs in flight. The stack holds the MSL emission and the PE half of the thunk; the `unix_call` itself runs on Wine's kernel stack.
+Four native compile workers (`mtld3d-compile`, per device, `encoder/compile.rs`) build the shader libraries and render pipelines a draw names for the first time. The encoder keeps the part of a miss that has to be answered at once: the probe of the source-keyed index, the content key, the warm-cache bridge that answers from what prewarm built, and the enqueue, which records the build as pending under its job's ticket in a map of its own, apart from the source-keyed indices, so a draw whose library is built probes exactly what it did before builds went to workers. A worker does the rest: the MSL emission (from an `Arc` of the parsed program, or its own copy of the fixed-function key), direct native `CompileShaderLibrary` or `CreateRenderPipeline` backend call, and the cache append through `CacheWriter`, whose sidecar lock serializes it against every other writer. Its result comes back over a channel and the encoder installs it, bookkeeping only, at `begin_frame` and when a draw's probe finds a build in flight, before it decides; an append that failed latches the cache off there. Whether a job appends is decided when it is queued, so jobs queued before a failure still append afterwards, and each failure after the first is absorbed without another warning. Each worker owns its native stack and temporary allocations; the existing 1 MiB stack reservation no longer consumes a guest thread stack. Startup prewarm and its bounded compilation workers also run on Unix. The PE creation path resolves the game-relative cache path once and passes its native path to the device runtime. Native logs write through the native logger; these workers do not use the PE logging queue.
 
 A draw whose library or pipeline is pending is left out of its frame only when leaving it out loses nothing for good, which `mtld3d_core::async_compile::may_skip_draw` decides from what the draw depends on: every colour target the pass attaches has to be the back buffer under the discard swap effect (or its multisampled companion), which starts every frame undefined, or a target a whole `Clear` reached in this presented frame and the one before; and the depth and stencil planes the draw tests or writes have to have been cleared in both frames too, each plane on its own. The encoder's clear paths record into a `ClearHistory`, which keeps per texture, subresource and plane the last two frames that cleared it and forgets an attachment once a frame goes by without its clear. Texture handles are addresses Metal hands out again, so a texture is forgotten when it is retired, and a `Reset` forgets them all. One clear is not enough: a target cleared and drawn once (a baked shadow map, an impostor, a UI cache, a thumbnail read back later) is cleared exactly when its shaders are cold, and a skip would lose it for good. A back buffer the swap chain keeps across `Present` (`FLIP`, `COPY`) is judged by its clears like any other target. A rebuilt target also has to be read only by work that is rebuilt: the history marks a texture as feeding kept content, for the next 600 presented frames (`FEED_MEMORY_FRAMES`, so a periodic kept read keeps its mark between reads), when it is the source of a `StretchRect` into a destination that is not itself rebuilt (a `StretchRect` over a whole colour target counts toward that target's streak as a clear does), or when a pass whose own targets are not rebuilt samples it; such a texture counts as kept. Which pass samples which texture is recorded by the pass state as one push per texture bind (the bind dedup keeps that to one per texture change), indexed from the first application pass so an upload pass spliced in ahead does not shift it, and judged once per submission (`mark_kept_reads`) before any pass rule removes or merges a pass: a pass whose colour targets, depth plane, or a stencil plane it writes are kept marks each texture it read that has a recent clear, and marking repeats until nothing new is marked, so a chain of scratch targets that sample each other into a kept one is marked in the submission that reads it. A `StretchRect` link is judged when the copy runs, against the marks made by then, and a link across a mid-frame flush is judged in the later submission, so each such link in a chain can leave one more frame unprotected. `UpdateSurface` and `UpdateTexture` need no mark: their source is system memory, which no draw writes. A read-back to system memory (`GetRenderTargetData`, `GetFrontBufferData`, a back-buffer `LockRect`) marks nothing either: a mark protects only later frames, a one-off read-back (a screenshot) sees its own frame's skipped draws whether or not it marks, and a read-back repeated every frame (a probe or picking buffer) takes a fresh copy each time, so marking would only cost such a target its skipping. None of this is on the path of a draw whose builds are done: the skip test runs only on a pending resolve, and the miss and slow paths of the library and pipeline resolves are out of line. The residual is the first frame of a kept read: marks are made at the end of the submission that reads, so a draw left out of the back buffer or a scratch target in that frame, or in the frames before a periodic read first happens, is missing from the kept copy that frame makes. No draw is left out while an occlusion query is counting, since the application reads that count back; a depth prepass left out before the query began can still make that one frame's count high, never low. Any draw that fails the test is kept, and its builds are waited for at the end of the submission rather than at the draw. The draw is encoded with a placeholder in its `SetRenderPipelineState`: the top bit of the handle, which no user-space address has, over a per-submission `DeferredPipelineId` naming a record (`mtld3d_core::async_compile::DeferredPipelines`) of what is still building, and its jobs move to the urgent lane at once. A library that lands, at a draw's drain or later, queues the pipeline it completes. `finalize_submit`, the one producer of every submission's payload, then waits for exactly the tickets its records still name, installing each build as it lands, so the stall is the slowest library plus the slowest pipeline instead of their sum over the draws, and rewrites every placeholder to its real handle before the debug replay of the draw states and before any pass rule reads the commands (Rule H looks up a no-colour sibling by the real handle, Rules H and J move command indices). A placeholder whose library or pipeline failed is removed together with the draws bound under it, up to the next pipeline bind; the binds they emitted stay, since later draws rely on them through the dedup. The records are cleared with the sweep, so none crosses a submission. A draw that leaves render target 0 out (`rt0_drop`) still waits at the draw, because its failed no-colour pipeline retries with render target 0 attached, which has to be decided before its pass opens. A wait moves its jobs to the urgent lane of the queue, takes back any a worker has not started and builds it on the encoder thread, and blocks on the result channel only for a job a worker is already running. The submission's wait leaves the oldest urgent jobs, as many as there are idle workers, to those workers rather than taking them back, so the pipelines of several landed libraries build side by side instead of one after another on the encoder; a draw's own wait takes its jobs back first, as it always did. `shader.asyncCompile = false` makes every pending draw keep its frame this way; the same queue and workers serve both modes. The no-colour sibling of a pipeline builds asynchronously and nothing waits for it: until its mapping lands, Rule H keeps the pass's colour. `Reset` builds whatever is still queued, inline on the encoder thread, before it forgets the failures, and teardown drops the jobs no worker started and waits for the running ones, so every handle a worker made reaches the caches that destroy it. The workers are spawned from the encoder thread's startup, never from `DllMain`, are never joined, and exit when teardown closes the queue.
 
@@ -78,34 +138,29 @@ A **log thread** (one per process) is the only thread that thunks for logging. d
 **Application multithreading.** A device created with `D3DCREATE_MULTITHREADED` may be called from any application thread, and so may every object it created. Every `IDirect3DDevice9` entry point, and every entry point of every child object, holds the device's `ApiLock` (`windows/core/src/api_lock.rs`) for its duration: a reentrant lock, an owner thread plus a depth, so `Reset` applying state through the setters an application calls, or a child `Release` reaching the device's own release, re-enter freely, and the outermost return releases. The guard is the first statement of the thunk, ahead of its `ApiTimer`, so a wait for the lock counts as API time, and `make audit` checks that placement. The lock is the outermost lock in the PE side: `live_textures` and the cursor module's `DEVICE_INSTANCES` are leaf mutexes taken under it. It is held across `Present`, so a second thread waits up to one frame behind the presenter, as it does on native. The encoder, submit, prewarm, compile and log threads never take it: none of them calls back into the device, so a thread that holds it while waiting on them cannot form a cycle. The lock lives outside `DeviceInner` (leaked at creation) because a child `Release` can free the inner while the guard its thunk took is still live. A device created without the flag has no lock and pays a null test and a refcount load per entry point. The cursor window procedure does not take the lock: it runs on the window thread, and a `Reset` or fullscreen transition holding the lock sends that thread synchronous messages, so a window thread waiting for the lock would deadlock the thunk. Native D3D9 has the same hole and applications keep the window thread out of D3D calls during `Reset`. What the procedure touches unlocked is the cursor latches and the auto-resize on `WM_SIZE`, so a user resize on the window thread while another thread draws under the flag is the documented residual.
 
 ```
-API thread                  Encoder thread           Submit thread              Presenter (unix)
-──────────                  ──────────────           ─────────────              ────────────────
-D3D9 call → snapshot state  (blocked on channel)     (blocked on channel)       (blocked on packets)
-         → push closure
-         ...
-Present() → send frame ───→ run closures
-          → start next      translate D3D9 → Metal
-            frame           finalize payload ──────→ SubmitFrame unix call:
-                                                     replay commands,
-                                                     wait for prior present
-                                                     (or snapshot it),
-                                                     commit upload + render,
-                                                     queue packet ──────────→ nextDrawable,
-                                                                              present buffer
-                                                                              (blit / MetalFX / HDR),
-                                                                              presentDrawable + commit
+API thread (PE)            Encoder (Unix)          Submit (Unix)         Presenter (Unix)
+───────────────            ──────────────          ─────────────         ────────────────
+D3D call → record bytes
+Present → enqueue ───────→ validate and replay
+        → next frame       translate D3D9 → Metal
+                           finalize payload ────→ replay and commit
+                                                 queue present ────→ drawable and present
 ```
 
 ## Thunk vs Command
 
-Two paths cross the PE/Unix boundary:
+The ordinary frame boundary carries typed D3D9 operations through
+`SubmitEncoderFrame`, not individual Metal calls. The native encoder builds
+`Command` records for Metal replay, and resource creation, uploads and
+compilation call native handlers without another PE crossing.
 
-- **Command** = `MTLRenderCommandEncoder` method. Closures accumulate commands into a fixed-size array; `submit()` sends the whole array in one `unix_call(SubmitCommandBuffer)` and the unix side replays them inside a render pass. Examples: `setRenderPipelineState`, `setViewport`, `drawPrimitives`, `setFragmentTexture`.
-- **Thunk** = everything else (object creation/destruction, texture upload, blit). Individual `unix_call()`.
+Lifecycle, shader registration, synchronous controls and readbacks have
+explicit thunks. `SetCursorOverlay` retains its coalesced main-queue update;
+`SetPresentWaitPolicy` can wake presentation before an API-side synchronous
+flush waits behind the encoder. These controls do not justify per-draw
+crossings or moving native translation back onto the API thread.
 
-API-thread thunks are restricted to device lifecycle only (`CreateCommandQueue`, `AttachMetalLayer`, `CreateBackbuffer`, `DestroyCommandQueue`), with two exceptions: `SetCursorOverlay`, whose handler is a store plus a coalesced main-queue dispatch (about 1-2 µs) and which replaces the `SetCursor` wineserver round trip (~100 µs) a show, hide or cursor change costs on the hardware path; and `SetPresentWaitPolicy` at the head of a synchronous flush, a flag store that wakes the submit thread out of its present wait before the flush queues behind the encoder, on a path that is already a read-back. Everything else — texture/sampler/pipeline creation, texture upload, resource destruction — runs on the encoder thread. Metal textures are created lazily on first draw via `FrameEncoder.texture_cache`. Resource cleanup uses closures pushed to the current frame.
-
-Thunks are Metal-level operations, not D3D9 calls. Name thunks after what they do in Metal (`GetDeviceInfo`, `CreateCommandQueue`), not after D3D9 methods. D3D9 logic stays in `d3d9.dll`. Objects with no Metal state (like `IDirect3D9`) are PE-only.
+Thunks describe the work crossing the runtime boundary, including batched D3D9 work and lifecycle or synchronization controls. Name them after that work rather than mechanically mirroring COM methods. Internal native calls do not need a thunk. Keep COM identities and application-visible reference counting on the PE side; D3D9 translation and native resource ownership may live on Unix.
 
 ## Upload order and retirement
 
@@ -155,10 +210,12 @@ registered that never commits.
 
 Every command buffer retains the Metal objects it references, so no wrapper, texture or
 pipeline is deallocated while a buffer that names it runs. What a retaining buffer does not
-keep is PE-owned memory under a `bytesNoCopy` wrapper: the `PageBox` pages behind staging,
-vertex, index and visibility buffers belong to the PE side, which recycles them once the
-retirement counters say the frames that read them retired. The invariant: such memory is
-recycled only once every command buffer that read it has individually ended.
+keep is the allocation under a `bytesNoCopy` wrapper. Game-accessible vertex,
+index and texture staging pages remain PE-owned; private repacks, visibility
+buffers and encoder scratch are native-owned. The owning runtime recycles
+backing only after every command buffer that read it has individually ended.
+A native wrapper's final guest-lease notification permits PE to release its
+original owner; it never transfers allocator ownership to Unix.
 
 Metal documents that one queue executes its buffers in commit order, and consecutive
 buffers may overlap on the GPU; it documents nothing about the order their completions are
@@ -372,7 +429,7 @@ sprite and completion log must be checked separately from the game backbuffer.
 
 ## Raw pointers across the boundary need stable backing
 
-Commands carry `u64` param fields the unix side dereferences (`setVertexBytes` ptrs, `commands_ptr` inside `PassDescriptor`, the `PassDescriptor` array itself). The backing must not move between hand-out and `unix_call` return.
+Commands carry `u64` param fields the unix side dereferences (`setVertexBytes` ptrs, `commands_ptr` inside `PassDescriptor`, the `PassDescriptor` array itself). The backing must not move while the receiver can read it. A synchronous handler finishes its borrows before `unix_call` returns. An asynchronous handoff must retain its backing until an explicit consumption acknowledgement; storage the GPU still reads remains retained until GPU retirement. Returning from an enqueue call alone does not release either obligation.
 
 A growing `Vec<u8>` silently reallocates on capacity growth, invalidating every previously-returned pointer; the unix side then dereferences freed memory, Wine's SEH shim translates SIGSEGV to `STATUS_ACCESS_VIOLATION` (`0xc0000005`), and the PE side sees `unix_call` return non-zero. Prefer `Vec<Box<[u8]>>` (one heap block per allocation) or a chunked bump allocator where chunks never move. `FrameEncoder.scratch` is the canonical example.
 
@@ -380,17 +437,25 @@ A growing `Vec<u8>` silently reallocates on capacity growth, invalidating every 
 
 Wine's unix-call dispatcher wraps each handler in a SEH-translation shim. Any `0xc0000005` means the unix side crashed mid-call — the PE side's own early-return error logs (`queue retain failed`, `renderCommandEncoderWithDescriptor returned nil`, …) will **not** fire. Diagnose by instrumenting each step of the unix-side path with a log line keyed to what it's doing; the last line printed before the PE-side error is the crash site.
 
-## Shared wire values are typed in `unix/shared/src/mtl.rs`
+## Shared wire values are typed in `unix/shared`
 
-Any integer crossing the boundary with *symbolic* meaning — Metal enum codes (storage mode, pixel format, compare func, blend factor, primitive type, sampler filter/address, …), bitflag masks (texture usage, color write mask), stage selectors — is declared **once** in `mtl.rs` as a `#[repr(u32)]` enum (single-choice) or `bitflags!` struct (multi-bit). Param fields in `params.rs` use that type directly, *not* `u32`.
+Every symbolic wire value has one typed definition in `mtld3d-shared`. Metal enum codes, masks and stage selectors live in `mtl.rs`; frame-operation tags and transport controls belong beside their protocol definitions. Use fixed-representation enums or `bitflags!` fields rather than locally restated integers. Keep D3D9 ABI constants in `mtld3d-types`.
 
 **Never** restate the encoding as a local `const`. **Never** write an integer literal at a call site or decode arm.
 
-The three cdylibs are separate linkage units. An untyped integer is a silent-drift risk: PE adds a variant, Unix decode forgets, a `log_once_warn!` covers it. Typed fields move the contract into the shared crate; exhaustive `match` becomes a compile error the instant a variant is added. Sound because `make` / `make install` rebuild and copy all three together — the "unknown variant" UB bit pattern never appears on the wire.
+The three cdylibs are separate linkage units. Shared definitions and exhaustive
+matches catch protocol drift at compile time, and `make` / `make install`
+rebuild and copy all three together. Matching binaries do not prove that an
+incoming packet is well formed. Existing typed thunk parameters rely on their
+caller's valid-value contract. A serialized frame record carries a raw tag:
+validate tags, lengths, offsets, alignment and referenced ranges before
+constructing typed values or references. Validate the complete packet before
+replaying any operation, so a malformed later record cannot leave a partially
+applied frame.
 
 How to apply:
-- New thunk field with symbolic meaning → `mtl::` type. Sizes/offsets/counts/`!= 0` booleans → `u32`.
-- Adding a value: extend `mtl.rs`, extend `d3d_to_metal_*` if one exists, the compiler points at every Unix-side match site.
+- New thunk field with symbolic meaning → its shared protocol type. Sizes/offsets/counts/`!= 0` booleans → `u32`.
+- Adding a value: extend its shared protocol definition and any conversion helpers. The compiler points at every exhaustive consumer match.
 - Bit-flag fields use `bitflags!` (`TextureUsage`, `ColorWriteMask`).
 - `Command::param_a/b/c/d` carry polymorphic `u32`s whose meaning depends on `Command::cmd`. Stay `u32` on the struct; encode via `Enum::Variant as u32` in the `Command::foo` constructor and decode via `Enum::from_repr(raw)` (strum `FromRepr`) in the dispatcher — never a bare `match raw { 0 => …, 1 => …, … }`.
 
@@ -412,7 +477,7 @@ So every back-buffer-to-drawable difference is resolved by the presenter's prese
 ## Adding new thunks
 
 1. Add variant to `Thunks` enum in `mtld3d-shared` `lib.rs` (count and iteration via strum).
-2. Add param struct in `mtld3d-shared` `params.rs` (`#[repr(C, align(8))]`). Field types: `u64`, `u32`, `#[repr(u32)]` enums from `mtl::`, or `bitflags!` structs from `mtl::`. Symbolic-meaning integers must use `mtl::`. `impl Thunk` with the matching code.
+2. Add param struct in `mtld3d-shared` `params.rs` (`#[repr(C, align(8))]`). Field types have fixed width and explicit representation. Symbolic values use the corresponding shared protocol enum or flags. Assert size, alignment and offsets on every PE and Unix target. Rust-owned collections, references and callbacks are not wire fields. `impl Thunk` with the matching code.
 3. Add handler in `mtld3d-unix`, add arm to `dispatch()` (exhaustive match = compile error if forgotten).
 4. Call via `unix_call(&mut params)` from `d3d9`.
 
@@ -893,7 +958,7 @@ Slot layout (8 bytes each, 128-byte map):
 | `0x28` | any | `unix_call` `params` pointer at entry |
 | `0x30` | API | `(seq << 32) \| (tcc_max << 16) \| tcc_last` — `FfVsKey::tex_coord_count` at draw-snapshot capture |
 | `0x38` | encoder | same shape — same field at `emit_vs_ff` dispatch |
-| `0x40` | API | address of the captured `&FfVsKey` (PE-side closure storage) |
+| `0x40` | API | address of the captured `&FfVsKey` (PE frame storage) |
 | `0x48` | encoder | address of the dispatched `&FfVsKey` |
 | `0x50` | API | wrapping byte-sum + rotate fingerprint of all FfVsKey bytes at capture |
 | `0x58` | encoder | same fingerprint at dispatch — mismatch ⇒ at least one byte changed in transit |

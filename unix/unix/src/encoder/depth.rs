@@ -2,6 +2,7 @@
 
 use mtld3d_core::{
     depth_texture::{PackedDepth, PlaneLayout},
+    encoder_data::DepthTransfer,
     page_box::{PageBox, PageBoxRead},
     storage_policy::buffer_storage_mode,
 };
@@ -165,25 +166,6 @@ impl TransferState {
     }
 }
 
-/// One whole-level depth transfer between two depth textures.
-///
-/// `source_size` is the extent of the source level and `destination_size` that
-/// of the destination's level 0. The two may differ, in which case each
-/// destination texel takes the nearest source texel. A multisampled source
-/// contributes sample zero, which is what the D3D9 RESZ hack and a
-/// depth-to-depth `StretchRect` resolve deliver. The stencil plane travels
-/// when both ends carry one.
-pub struct DepthTransfer {
-    pub source: MetalHandle<MTLTextureKind>,
-    pub source_level: u32,
-    pub source_size: (u32, u32),
-    pub source_format: PixelFormat,
-    pub source_samples: u8,
-    pub destination: MetalHandle<MTLTextureKind>,
-    pub destination_size: (u32, u32),
-    pub destination_format: PixelFormat,
-}
-
 impl FrameEncoder {
     /// Queue `transfer` after the passes recorded so far and ahead of the next one.
     ///
@@ -246,8 +228,7 @@ impl FrameEncoder {
                     kind,
                     pad: 0,
                 };
-                if crate::unix_call::unix_call(&mut params) != 0 || params.pipeline_handle.is_null()
-                {
+                if crate::native_call(&mut params) != 0 || params.pipeline_handle.is_null() {
                     log::error!(target: super::LOG_TARGET, "depth transfer: pipeline creation failed");
                     return false;
                 }
