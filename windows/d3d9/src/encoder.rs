@@ -5,7 +5,7 @@
 
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering},
+    atomic::{AtomicI32, AtomicU32, AtomicU64},
 };
 
 pub use mtld3d_core::encoder_data::{
@@ -257,28 +257,19 @@ impl EncoderThread {
     ///
     /// Returns the latched HRESULT until the device is destroyed.
     pub fn status(&self) -> Result<(), i32> {
-        if self.native_failure.load(Ordering::Acquire) != 0 {
-            return Err(self.record_failure(D3DERR_DEVICELOST));
-        }
-        match self.failure.load(Ordering::Acquire) {
-            D3D_OK => Ok(()),
-            failure => Err(failure),
-        }
+        mtld3d_core::encoder_failure::status(&self.failure, &self.native_failure)
+    }
+
+    /// Report a failure already observed by PE without polling native work.
+    ///
+    /// # Errors
+    /// Returns the first latched HRESULT, if any.
+    pub fn known_status(&self) -> Result<(), i32> {
+        mtld3d_core::encoder_failure::known_status(&self.failure)
     }
 
     pub fn record_failure(&self, status: i32) -> i32 {
-        let failure = if status == E_OUTOFMEMORY {
-            status
-        } else {
-            D3DERR_DEVICELOST
-        };
-        match self
-            .failure
-            .compare_exchange(D3D_OK, failure, Ordering::AcqRel, Ordering::Acquire)
-        {
-            Ok(_) => failure,
-            Err(previous) => previous,
-        }
+        mtld3d_core::encoder_failure::record_failure(&self.failure, status)
     }
 
     fn maintain_pending(&self) {

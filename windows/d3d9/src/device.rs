@@ -1844,6 +1844,12 @@ impl DeviceInner {
         self.encoder.status()
     }
 
+    /// Stop capture after a known failure without polling native work per draw.
+    fn known_encoder_status(&self) -> Result<(), i32> {
+        self.recording_status()?;
+        self.encoder.known_status()
+    }
+
     /// Report capture failures without polling workers again within the same draw.
     fn recording_status(&self) -> Result<(), i32> {
         if let Some(error) = self.current_frame.recording_error() {
@@ -10085,7 +10091,7 @@ extern "system" fn device_draw_primitive(
     // Flush any bound buffer that's drawn while still mapped, before the draw
     // snapshot reads it.
     flush_mapped_bound_buffers(obj.inner());
-    if let Err(hr) = obj.inner().encoder_status() {
+    if let Err(hr) = obj.inner().known_encoder_status() {
         return hr;
     }
     let perf_ptr = DeviceInner::perf_ptr_of(obj.inner);
@@ -10160,7 +10166,7 @@ fn draw_bound_triangle_fan(
     // Flush any bound buffer that's drawn while still mapped, before the draw
     // snapshot reads it.
     flush_mapped_bound_buffers(obj.inner());
-    if let Err(hr) = obj.inner().encoder_status() {
+    if let Err(hr) = obj.inner().known_encoder_status() {
         return hr;
     }
     let perf_ptr = DeviceInner::perf_ptr_of(obj.inner);
@@ -10359,7 +10365,7 @@ extern "system" fn device_draw_indexed_primitive(
     // Flush any bound buffer that's drawn while still mapped, before the draw
     // snapshot reads it.
     flush_mapped_bound_buffers(obj.inner());
-    if let Err(hr) = obj.inner().encoder_status() {
+    if let Err(hr) = obj.inner().known_encoder_status() {
         return hr;
     }
     let perf_ptr = DeviceInner::perf_ptr_of(obj.inner);
