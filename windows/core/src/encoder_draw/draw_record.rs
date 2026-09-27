@@ -347,10 +347,14 @@ fn fixed_ref<T: DrawPod>(bytes: &[u8]) -> Result<&T, WireError> {
 }
 
 impl<'a> DrawView<'a> {
-    /// Borrow a draw from its immutable aligned command payload.
+    /// Split an immutable draw payload into its prefix and borrowed record ranges.
+    ///
+    /// The accessors validate the primitive and typed vertex/index records before
+    /// the native consumer changes encoder state. Construction does not repeat them.
     ///
     /// # Errors
-    /// Returns an error for an invalid tag, record count, size or alignment.
+    /// Returns an error for a truncated or unaligned prefix, an invalid vertex kind
+    /// or stream count, or a truncated vertex range.
     pub fn new(bytes: &'a [u8]) -> Result<Self, WireError> {
         let (prefix, rest) = bytes
             .split_at_checked(size_of::<DrawPrefix>())
@@ -366,15 +370,11 @@ impl<'a> DrawView<'a> {
         let (vertices, indices) = rest
             .split_at_checked(vertex_bytes)
             .ok_or(WireError::Truncated)?;
-        let value = Self {
+        Ok(Self {
             prefix,
             vertices,
             indices,
-        };
-        value.metal_primitive()?;
-        value.vertices()?;
-        value.indices()?;
-        Ok(value)
+        })
     }
 
     /// Read the primitive type.

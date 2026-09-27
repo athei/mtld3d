@@ -58,6 +58,14 @@ fn bound(indices: IndexSource) -> DrawOp {
     }
 }
 
+fn checked_draw_fields(bytes: &[u8]) -> Result<(), WireError> {
+    let view = DrawView::new(bytes)?;
+    view.metal_primitive()?;
+    view.vertices()?;
+    view.indices()?;
+    Ok(())
+}
+
 #[test]
 fn all_index_sources_use_actual_fixed_views() {
     let fixtures = [
@@ -156,7 +164,7 @@ fn all_index_sources_use_actual_fixed_views() {
                 _ => panic!("wrong fixed index variant"),
             }
             for length in 0..payload.len() {
-                assert!(DrawView::new(&payload[..length]).is_err());
+                assert!(checked_draw_fields(&payload[..length]).is_err());
             }
         }
     }
@@ -251,6 +259,20 @@ fn padding_is_initialized_and_unknown_fixed_tags_are_rejected() {
         let address = arena.alloc(&changed);
         // SAFETY: arena owns the initialized malformed scalar fixture through validation.
         let changed = unsafe { core::slice::from_raw_parts(address as *const u8, changed.len()) };
-        assert!(DrawView::new(changed).is_err());
+        assert_eq!(checked_draw_fields(changed), Err(WireError::InvalidValue));
+        match offset {
+            0 => assert_eq!(
+                DrawView::new(changed).unwrap().metal_primitive(),
+                Err(WireError::InvalidValue)
+            ),
+            2 => assert!(matches!(
+                DrawView::new(changed).unwrap().indices(),
+                Err(WireError::InvalidValue)
+            )),
+            _ => assert!(matches!(
+                DrawView::new(changed),
+                Err(WireError::InvalidValue)
+            )),
+        }
     }
 }
