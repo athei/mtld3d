@@ -843,6 +843,54 @@ fn ff_vs_layout_single_tex0_yields_1() {
 }
 
 #[test]
+fn declaration_rhw_matches_full_layout_across_streams_and_texcoord_extents() {
+    assert!(!vertex_decl_has_rhw(&[]));
+    assert!(!vertex_decl_has_rhw(&[pos3(), tex0(12)]));
+    for stream in [0, 15, 16, u16::MAX] {
+        for usage_index in [0, 7, 8, u8::MAX] {
+            let position = D3DVERTEXELEMENT9 {
+                stream,
+                usage: D3DDECLUSAGE_POSITIONT,
+                ..pos3()
+            };
+            let texcoord = D3DVERTEXELEMENT9 {
+                stream,
+                usage_index,
+                ..tex0(12)
+            };
+            // A malformed TEXCOORD after POSITIONT must still reach diagnostics.
+            // Reversing the order must preserve both the flag and maximum extent.
+            for elements in [
+                [position, texcoord, tex0(16)],
+                [tex0(16), texcoord, position],
+            ] {
+                let expected_rhw = u32::from(stream) < MAX_STREAMS;
+                assert_eq!(vertex_decl_has_rhw(&elements), expected_rhw);
+                let full = ff_vs_layout_from_elements(&elements, true);
+                assert_eq!(full.has_rhw(), expected_rhw);
+                let expected_extent = if expected_rhw {
+                    usage_index.saturating_add(1).min(8)
+                } else {
+                    1
+                };
+                assert_eq!(full.tex_coord_count, expected_extent);
+            }
+        }
+    }
+}
+
+#[test]
+fn texcoord_extent_clamp_covers_all_diagnostic_keys() {
+    assert_eq!(checked_tex_coord_count(None), 0);
+    for index in 0..=u8::MAX {
+        assert_eq!(
+            checked_tex_coord_count(Some(index)),
+            index.saturating_add(1).min(8)
+        );
+    }
+}
+
+#[test]
 fn d3d_depth_bias_reaches_clip_space_unscaled_over_the_full_depth_range() {
     // D3D9 states the bias in the depth range itself, and the vertex shader
     // adds it times `w`, so over a 0..1 viewport the raw value is the offset.

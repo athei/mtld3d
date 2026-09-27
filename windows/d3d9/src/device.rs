@@ -5268,8 +5268,6 @@ fn push_texture_warmups(dev: &mut DeviceInner, inner: &crate::texture::TextureIn
         dev.push_staging_warmup(StagingWarmupEntry {
             texture_id,
             level,
-            backing_ptr: inner.staging_backing_ptr(level as usize),
-            backing_len: inner.staging_backing_len(level as usize),
             keepalive: inner.staging_arc(level as usize),
         });
     }
@@ -11963,8 +11961,7 @@ extern "system" fn device_set_vertex_declaration(this: *mut c_void, decl: *mut c
         // unconditionally.
         let new_rhw = !new.is_null()
             // SAFETY: non-null checked; the slot adopted a ref above.
-            && convert::ff_vs_layout_from_elements(unsafe { (*new).inner().elements() }, true)
-                .has_rhw();
+            && convert::vertex_decl_has_rhw(unsafe { (*new).inner().elements() });
         if new_rhw || dev.cached_ff_vs_layout.has_rhw() {
             mask |= SnapshotDirty::VS_CONST | SnapshotDirty::VARIANT;
         }

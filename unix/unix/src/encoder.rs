@@ -2051,9 +2051,11 @@ impl FrameEncoder {
     ) -> Result<(), WireError> {
         // SAFETY: this command uniquely adopts the publication retained by the frame owner.
         let keepalive = unsafe { warmup.page.adopt_shared()? };
+        let backing_ptr = keepalive.as_ptr() as u64;
+        let backing_len = keepalive.len() as u64;
         let desc = BufferCreateDesc {
-            backing_ptr: warmup.backing_ptr,
-            length: warmup.backing_len,
+            backing_ptr,
+            length: backing_len,
             id: warmup.texture_id,
             storage_mode: buffer_storage_mode(self.gpu_caps.unified_memory),
             kind: BufferKind::TexStaging,
@@ -2098,8 +2100,8 @@ impl FrameEncoder {
         if state.mip_staging_buffers[level].handle.is_null() {
             state.mip_staging_buffers[level] = MipStagingBuffer {
                 handle,
-                backing_ptr: warmup.backing_ptr,
-                length: warmup.backing_len,
+                backing_ptr,
+                length: backing_len,
                 keepalive: Some(keepalive),
             };
         } else {

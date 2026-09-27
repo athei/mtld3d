@@ -949,8 +949,6 @@ pub struct VbibWarmupEntry {
 pub struct StagingWarmupEntry {
     pub texture_id: TextureId,
     pub level: u32,
-    pub backing_ptr: u64,
-    pub backing_len: u64,
     pub keepalive: Arc<PageBox>,
 }
 

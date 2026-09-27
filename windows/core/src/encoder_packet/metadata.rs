@@ -26,8 +26,6 @@ pub struct BufferWarmupRecord {
 #[repr(C, align(8))]
 pub struct StagingWarmupRecord {
     pub texture_id: u64,
-    pub backing_ptr: u64,
-    pub backing_len: u64,
     pub page: GuestPageDescriptor,
     pub level: u32,
     pub reserved: u32,
@@ -206,8 +204,6 @@ impl FrameRecorder {
             mtld3d_shared::encoder_protocol::EncoderOpcode::WarmupStaging,
             StagingWarmupRecord {
                 texture_id: entry.texture_id.raw(),
-                backing_ptr: entry.backing_ptr,
-                backing_len: entry.backing_len,
                 page,
                 level: entry.level,
                 reserved: 0,
@@ -487,14 +483,12 @@ const _: () = {
     assert!(core::mem::offset_of!(BufferWarmupRecord, backing_generation) == 24);
     assert!(core::mem::offset_of!(BufferWarmupRecord, map_mode) == 32);
     assert!(core::mem::offset_of!(BufferWarmupRecord, reserved) == 36);
-    assert!(size_of::<StagingWarmupRecord>() == 88);
+    assert!(size_of::<StagingWarmupRecord>() == 72);
     assert!(align_of::<StagingWarmupRecord>() == 8);
     assert!(core::mem::offset_of!(StagingWarmupRecord, texture_id) == 0);
-    assert!(core::mem::offset_of!(StagingWarmupRecord, backing_ptr) == 8);
-    assert!(core::mem::offset_of!(StagingWarmupRecord, backing_len) == 16);
-    assert!(core::mem::offset_of!(StagingWarmupRecord, page) == 24);
-    assert!(core::mem::offset_of!(StagingWarmupRecord, level) == 80);
-    assert!(core::mem::offset_of!(StagingWarmupRecord, reserved) == 84);
+    assert!(core::mem::offset_of!(StagingWarmupRecord, page) == 8);
+    assert!(core::mem::offset_of!(StagingWarmupRecord, level) == 64);
+    assert!(core::mem::offset_of!(StagingWarmupRecord, reserved) == 68);
     assert!(size_of::<VbibRetentionRecord>() == 72);
     assert!(align_of::<VbibRetentionRecord>() == 8);
     assert!(core::mem::offset_of!(VbibRetentionRecord, buffer_id) == 0);

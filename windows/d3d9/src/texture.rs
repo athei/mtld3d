@@ -2254,21 +2254,6 @@ impl TextureInner {
         Arc::clone(&self.staging[level])
     }
 
-    /// Raw backing pointer of mip `level`'s staging `PageBox`.
-    ///
-    /// For `CreateTexture`-time staging-buffer warmup. Address stays valid
-    /// until the next Lock(DISCARD) rename swaps the Arc.
-    pub fn staging_backing_ptr(&self, level: usize) -> u64 {
-        self.staging[level].as_ptr() as u64
-    }
-
-    /// Page-aligned length of mip `level`'s staging `PageBox`.
-    ///
-    /// Pairs with `staging_backing_ptr` for `BufferCreateDesc::length`.
-    pub fn staging_backing_len(&self, level: usize) -> u64 {
-        self.staging[level].len() as u64
-    }
-
     /// Base, page-aligned length and row stride of one subresource's staging.
     ///
     /// `face` selects a cube subresource, `None` the 2D mip chain. The

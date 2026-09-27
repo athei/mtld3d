@@ -1221,6 +1221,7 @@ impl FfVsLayout {
 ///
 /// Panics if `tex_coord_count` exceeds the `u8` range (clamped to ≤8 by the
 /// loop, so unreachable).
+#[must_use]
 pub fn ff_vs_layout_from_elements(elements: &[D3DVERTEXELEMENT9], uses_decl: bool) -> FfVsLayout {
     let mut flags = FfVsLayoutFlags::empty();
     flags.set(FfVsLayoutFlags::USES_VERTEX_DECL, uses_decl);
@@ -1270,33 +1271,38 @@ pub fn ff_vs_layout_from_elements(elements: &[D3DVERTEXELEMENT9], uses_decl: boo
             _ => {}
         }
     }
-    // D3D9 spec caps TEXCOORD usage_index at 7 (D3DDP_MAXTEXCOORD = 8).
-    // FfVsKey's per-stage arrays (tci_modes, tci_coord_indices, tt_flags)
-    // are sized [u8; 8]; a larger usage_index would index out of bounds on
-    // the encoder thread. Clamp at the source and surface the offending raw
-    // value once per distinct usage_index.
-    let tex_coord_count = match max_texcoord_index {
-        Some(m) if m >= 8 => {
-            mtld3d_shared::log_once_warn_by!(
-                target: crate::LOG_TARGET,
-                key: u64::from(m),
-                "ff_vs_layout: TEXCOORD usage_index {m} exceeds D3DDP_MAXTEXCOORD (8) — clamping"
-            );
-            8
-        }
-        Some(m) => m + 1,
-        None => 0,
-    };
-    assert!(
-        tex_coord_count <= 8,
-        "ff_vs_layout_from_elements clamp violated: tex_coord_count={tex_coord_count}"
-    );
+    let tex_coord_count = checked_tex_coord_count(max_texcoord_index);
     FfVsLayout {
         flags,
         tex_coord_count,
         tex_coord_dims,
         declared_weights_count,
     }
+}
+
+/// Whether a declaration contains an in-range pre-transformed position.
+///
+/// Binding needs only this flag. Scan every element so TEXCOORD diagnostics
+/// retain the same maximum-index key and timing as full layout resolution.
+#[must_use]
+pub fn vertex_decl_has_rhw(elements: &[D3DVERTEXELEMENT9]) -> bool {
+    let mut has_rhw = false;
+    let mut max_texcoord_index: Option<u8> = None;
+    for e in elements {
+        if u32::from(e.stream) >= MAX_STREAMS {
+            continue;
+        }
+        match e.usage {
+            D3DDECLUSAGE_POSITIONT => has_rhw = true,
+            D3DDECLUSAGE_TEXCOORD => {
+                max_texcoord_index =
+                    Some(max_texcoord_index.map_or(e.usage_index, |prev| prev.max(e.usage_index)));
+            }
+            _ => {}
+        }
+    }
+    checked_tex_coord_count(max_texcoord_index);
+    has_rhw
 }
 
 /// Same as [`resolve_attrs_for_vs`] but uses the FF VS's attribute convention.
@@ -1415,6 +1421,39 @@ const fn decl_usage_to_byte(u: crate::dxso::DeclUsage) -> u8 {
         crate::dxso::DeclUsage::Depth => 12,
         crate::dxso::DeclUsage::Sample => 13,
     }
+}
+
+/// Clamp the declaration's TEXCOORD extent and diagnose the largest invalid index.
+fn checked_tex_coord_count(max_texcoord_index: Option<u8>) -> u8 {
+    // D3D9 spec caps TEXCOORD usage_index at 7 (D3DDP_MAXTEXCOORD = 8).
+    // FfVsKey's per-stage arrays (tci_modes, tci_coord_indices, tt_flags)
+    // are sized [u8; 8]; a larger usage_index would index out of bounds on
+    // the encoder thread. Clamp at the source and surface the offending raw
+    // value once per distinct usage_index.
+    let tex_coord_count = match max_texcoord_index {
+        Some(m) if m >= 8 => {
+            warn_texcoord_extent(m);
+            8
+        }
+        Some(m) => m + 1,
+        None => 0,
+    };
+    assert!(
+        tex_coord_count <= 8,
+        "ff_vs_layout_from_elements clamp violated: tex_coord_count={tex_coord_count}"
+    );
+    tex_coord_count
+}
+
+/// Keep invalid-declaration logging outside the ordinary binding and draw paths.
+#[cold]
+#[inline(never)]
+fn warn_texcoord_extent(m: u8) {
+    mtld3d_shared::log_once_warn_by!(
+        target: crate::LOG_TARGET,
+        key: u64::from(m),
+        "ff_vs_layout: TEXCOORD usage_index {m} exceeds D3DDP_MAXTEXCOORD (8) — clamping"
+    );
 }
 
 #[cfg(test)]
