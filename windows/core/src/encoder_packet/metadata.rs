@@ -10,7 +10,7 @@ use crate::{
     encoder_data::{FrameData, PendingVbibRetention, StagingWarmupEntry, VbibWarmupEntry},
     encoder_records::TextureRecord,
     guest_pages::{
-        GuestPageDescriptor, GuestPageLease, GuestRetirementLease, RetiredPageDescriptor,
+        GuestOwnedPageDescriptor, GuestOwnedPageLease, GuestPageDescriptor, GuestPageLease,
     },
     perf::FramePerfPayload,
 };
@@ -37,7 +37,7 @@ pub struct StagingWarmupRecord {
 pub struct VbibRetentionRecord {
     pub buffer_id: u64,
     pub last_submit_seq: u64,
-    pub page: RetiredPageDescriptor,
+    pub page: GuestOwnedPageDescriptor,
 }
 
 #[repr(C, align(8))]
@@ -227,9 +227,9 @@ impl FrameRecorder {
         entry: PendingVbibRetention,
     ) {
         let lease =
-            GuestRetirementLease::new(entry.page_box, &self.completion_pool, self.pagebox_pool);
+            GuestOwnedPageLease::new(entry.page_box, &self.completion_pool, self.pagebox_pool);
         let page = lease.descriptor();
-        self.retirements.push(lease);
+        self.owned_pages.push(lease);
         self.metadata_command(
             scratch,
             mtld3d_shared::encoder_protocol::EncoderOpcode::RetainVbib,

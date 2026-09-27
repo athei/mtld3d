@@ -341,8 +341,8 @@ fn execute_control(
         }
         EncoderOpcode::StageUpload => {
             let r = borrow::<records::StageUploadRecord>(payload)?;
-            // SAFETY: the frame owns this publication until the native page's final reader retires.
-            let page = unsafe { r.page.adopt_owned()? };
+            // SAFETY: the PE lease retains this unique snapshot through upload completion and retries.
+            let page = unsafe { r.page.adopt()? };
             enc.apply_stage_upload(
                 BufferId::from_raw(r.id),
                 page,

@@ -23,7 +23,7 @@ use mtld3d_core::{
     ff_state::{FF_VS_PALETTE_BASE_ROW, MAX_VERTEX_BLEND_MATRIX_INDEX},
     format::map_d3d_format,
     gpu_caps::GpuCaps,
-    guest_pages::RetiredPage,
+    guest_pages::GuestOwnedPage,
     ids::{BufferId, DepthStencilKey, ProgramId, SamplerKey, TextureId},
     page_box::{PageBox, PageBoxRead},
     passes::{
@@ -1243,14 +1243,14 @@ impl FanIndexBuffer {
 /// Backing held until its Metal wrapper and GPU users have retired.
 enum RetainedPages {
     Page(PageBox),
-    Retirement(RetiredPage),
+    GuestLease(GuestOwnedPage),
 }
 
 impl RetainedPages {
     const fn len(&self) -> usize {
         match self {
             Self::Page(page) => page.len(),
-            Self::Retirement(page) => page.len(),
+            Self::GuestLease(page) => page.len(),
         }
     }
 }
@@ -1332,7 +1332,7 @@ struct PendingResourceRetention {
 struct StagedUploadRetry {
     buffer_id: BufferId,
     transient: MetalHandle<MTLBufferKind>,
-    page_box: PageBox,
+    page_box: GuestOwnedPage,
     dst_offset: u32,
     size: u32,
 }
@@ -1798,7 +1798,7 @@ impl FrameEncoder {
     fn apply_stage_upload(
         &mut self,
         buffer_id: BufferId,
-        page_box: PageBox,
+        page_box: GuestOwnedPage,
         dst_offset: u32,
         size: u32,
     ) {
@@ -6049,7 +6049,7 @@ impl FrameEncoder {
             .push_back(PendingResourceRetention {
                 kind: DestroyKind::Buffer,
                 handle: mtl_buffer.raw(),
-                page_box: Some(RetainedPages::Retirement(page_box)),
+                page_box: Some(RetainedPages::GuestLease(page_box)),
                 staging_arc: None,
                 seq,
                 from_texture: false,
@@ -6181,7 +6181,7 @@ impl FrameEncoder {
             return;
         }
         let mut wrappers: Vec<u64> = Vec::new();
-        let mut backings: Vec<PageBox> = Vec::new();
+        let mut backings: Vec<GuestOwnedPage> = Vec::new();
         for retry in retries {
             if !retry.transient.is_null() {
                 wrappers.push(retry.transient.raw());
@@ -6192,13 +6192,8 @@ impl FrameEncoder {
             backings.push(retry.page_box);
         }
         destroy_resources_bulk(DestroyKind::Buffer, &wrappers);
-        let pool = &self.pagebox_pool;
-        for pb in backings {
-            let len = pb.len();
-            if pool.recycle(pb).is_none() {
-                self.perf.bump_pagebox_pool_recycled(len);
-            }
-        }
+        // Acknowledge the original PE owners only after every no-copy wrapper is destroyed.
+        drop(backings);
     }
 
     /// Free every upload the GPU acknowledged, without replaying anything.
@@ -7947,7 +7942,8 @@ impl FrameEncoder {
             }
             self.perf.bump_vbib_retained_sub(retry.page_box.len());
             self.sub_retained_bytes(retry.page_box.len());
-            held.pageboxes.push(RetainedPages::Page(retry.page_box));
+            held.pageboxes
+                .push(RetainedPages::GuestLease(retry.page_box));
         }
         // Park the jobs' guards with the other staging keepalives until
         // the bulk destroy releases every wrapper around their pages.

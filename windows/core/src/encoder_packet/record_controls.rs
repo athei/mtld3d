@@ -19,7 +19,7 @@ use crate::{
         TextureRecord, TextureUploadRecord, UploadColorRecord, UploadResampledRecord,
     },
     encoder_reply::{ReplyBool, ReplyU64},
-    guest_pages::GuestPageLease,
+    guest_pages::{GuestOwnedPageLease, GuestPageLease},
     guest_queries::GuestQueryLease,
     scratch::ScratchArena,
     upload_redirty::GuestRedirtyLease,
@@ -756,6 +756,7 @@ capture_control!(SetDumpDrawOp, SetDumpDraw, v, recorder, scratch, tag, {
 
 struct CaptureOwners<'a> {
     pages: &'a mut Vec<GuestPageLease>,
+    owned_pages: &'a mut Vec<GuestOwnedPageLease>,
     queries: &'a mut Vec<GuestQueryLease>,
     redirties: &'a mut Vec<GuestRedirtyLease>,
     replies_u64: &'a mut Vec<ReplyU64>,
@@ -774,6 +775,7 @@ impl FrameRecorder {
         let mut pending = Some(value);
         let mut owners = CaptureOwners {
             pages: &mut self.pages,
+            owned_pages: &mut self.owned_pages,
             queries: &mut self.queries,
             redirties: &mut self.redirties,
             replies_u64: &mut self.replies_u64,
@@ -830,13 +832,10 @@ impl CaptureControl for crate::encoder_data::StageUploadOp {
             EncoderOpcode::StageUpload,
             self,
             |v, destination, owners| {
-                let lease = GuestPageLease::for_recyclable_pooled(
-                    v.page_box,
-                    owners.completion_pool,
-                    recycle_pool,
-                );
+                let lease =
+                    GuestOwnedPageLease::new(v.page_box, owners.completion_pool, recycle_pool);
                 let page = lease.descriptor();
-                owners.pages.push(lease);
+                owners.owned_pages.push(lease);
                 crate::encoder_records::write(
                     destination,
                     StageUploadRecord {

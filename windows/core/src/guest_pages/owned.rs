@@ -1,4 +1,4 @@
-//! Unique guest buffer backing retained until native and GPU consumers retire.
+//! Unique guest pages retained until native and GPU consumers retire.
 
 #[cfg(not(windows))]
 use mtld3d_shared::encoder_wire::WireError;
@@ -17,17 +17,17 @@ use crate::{
     page_box_pool::PageBoxPool,
 };
 
-/// PE ownership of retired VB/IB bytes and their final acknowledgment.
+/// PE ownership of unique buffer backing or upload snapshots and their final acknowledgment.
 ///
 /// Moving this owner never moves the allocation or the pooled completion cell. Unlike shared
 /// staging leases, it publishes no pointer into its `PageBox` metadata and needs no metadata Arc.
-pub struct GuestRetirementLease {
+pub struct GuestOwnedPageLease {
     owner: PageBox,
     slot: CompletionSlot,
     recycle_pool: Option<&'static PageBoxPool>,
 }
 
-impl GuestRetirementLease {
+impl GuestOwnedPageLease {
     #[must_use]
     pub fn new(
         owner: PageBox,
@@ -48,8 +48,8 @@ impl GuestRetirementLease {
 
     /// Publish only independently allocated storage, never movable owner metadata.
     #[must_use]
-    pub fn descriptor(&self) -> RetiredPageDescriptor {
-        RetiredPageDescriptor {
+    pub fn descriptor(&self) -> GuestOwnedPageDescriptor {
+        GuestOwnedPageDescriptor {
             source: self.owner.as_ptr() as u64,
             padded_len: self.owner.len() as u64,
             generation: self.owner.generation(),
@@ -80,7 +80,7 @@ impl GuestRetirementLease {
     ///
     /// # Safety
     /// No native decoder, cache, worker, callback or GPU work can access these bytes or adopt
-    /// this descriptor later. This includes consumers from frames preceding this retirement.
+    /// this descriptor later. A retired backing can have consumers from preceding frames.
     pub unsafe fn cancel_unadopted(&self) {
         self.slot.completion().publish();
     }
@@ -88,7 +88,7 @@ impl GuestRetirementLease {
 
 /// Ownership-only wire descriptor. It cannot expose or acquire a shared reader counter.
 #[repr(C, align(8))]
-pub struct RetiredPageDescriptor {
+pub struct GuestOwnedPageDescriptor {
     source: u64,
     padded_len: u64,
     generation: u64,
@@ -96,25 +96,25 @@ pub struct RetiredPageDescriptor {
 }
 
 const _: () = {
-    assert!(size_of::<RetiredPageDescriptor>() == 32);
-    assert!(align_of::<RetiredPageDescriptor>() == 8);
-    assert!(core::mem::offset_of!(RetiredPageDescriptor, source) == 0);
-    assert!(core::mem::offset_of!(RetiredPageDescriptor, padded_len) == 8);
-    assert!(core::mem::offset_of!(RetiredPageDescriptor, generation) == 16);
-    assert!(core::mem::offset_of!(RetiredPageDescriptor, completion) == 24);
+    assert!(size_of::<GuestOwnedPageDescriptor>() == 32);
+    assert!(align_of::<GuestOwnedPageDescriptor>() == 8);
+    assert!(core::mem::offset_of!(GuestOwnedPageDescriptor, source) == 0);
+    assert!(core::mem::offset_of!(GuestOwnedPageDescriptor, padded_len) == 8);
+    assert!(core::mem::offset_of!(GuestOwnedPageDescriptor, generation) == 16);
+    assert!(core::mem::offset_of!(GuestOwnedPageDescriptor, completion) == 24);
 };
 
-impl RetiredPageDescriptor {
-    /// Adopt a single native retirement guard without borrowing PE owner metadata.
+impl GuestOwnedPageDescriptor {
+    /// Adopt a single native ownership guard without borrowing PE owner metadata.
     ///
     /// # Safety
-    /// The unique PE retirement lease retains its bytes and cell until this guard drops.
-    /// This is the descriptor's only adoption. No writer can modify the retired allocation.
+    /// The unique PE lease retains its bytes and cell until this guard drops.
+    /// This is the descriptor's only adoption. No writer can modify the published allocation.
     ///
     /// # Errors
     /// Rejects an invalid page extent or completion address before accessing either.
     #[cfg(not(windows))]
-    pub unsafe fn adopt(&self) -> Result<RetiredPage, WireError> {
+    pub unsafe fn adopt(&self) -> Result<GuestOwnedPage, WireError> {
         let len = usize::try_from(self.padded_len).map_err(|_| WireError::TooLarge)?;
         if len == 0
             || !len.is_multiple_of(PAGE_SIZE)
@@ -125,7 +125,7 @@ impl RetiredPageDescriptor {
         }
         // SAFETY: validation checks the cell address; the caller retains it until final drop.
         let completion = unsafe { LeaseCompletionPtr::new(self.completion) };
-        Ok(RetiredPage {
+        Ok(GuestOwnedPage {
             source: self.source,
             len,
             generation: self.generation,
@@ -135,14 +135,14 @@ impl RetiredPageDescriptor {
 }
 
 /// Native ownership guard with no reader-count or allocator access.
-pub struct RetiredPage {
+pub struct GuestOwnedPage {
     source: u64,
     len: usize,
     generation: u64,
     completion: LeaseCompletionPtr,
 }
 
-impl RetiredPage {
+impl GuestOwnedPage {
     #[must_use]
     pub const fn as_ptr(&self) -> *const u8 {
         self.source as *const u8
@@ -161,7 +161,7 @@ impl RetiredPage {
     }
 }
 
-impl Drop for RetiredPage {
+impl Drop for GuestOwnedPage {
     fn drop(&mut self) {
         // SAFETY: adoption retains this initialized cell until the sole guard's final drop.
         let completion =

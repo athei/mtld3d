@@ -3,7 +3,7 @@ use mtld3d_shared::encoder_wire::{LeaseCompletion, WireError};
 use super::{FrameRecorder, metadata::MetadataStorage};
 use crate::{
     encoder_data::FrameData,
-    guest_pages::{GuestPageLease, GuestRetirementLease},
+    guest_pages::{GuestOwnedPageLease, GuestPageLease},
     guest_queries::GuestQueryLease,
     scratch::ScratchArena,
     upload_redirty::GuestRedirtyLease,
@@ -20,7 +20,7 @@ bitflags::bitflags! {
 /// Resource lease moved into the device completion registry after admission.
 pub enum PacketLease {
     Page(GuestPageLease),
-    Retirement(GuestRetirementLease),
+    OwnedPage(GuestOwnedPageLease),
     Query(GuestQueryLease),
     Redirty(GuestRedirtyLease),
 }
@@ -30,7 +30,7 @@ impl PacketLease {
     pub fn tokens(&self) -> [Option<u64>; 2] {
         match self {
             Self::Page(lease) => [lease.token(), None],
-            Self::Retirement(lease) => [Some(lease.token()), None],
+            Self::OwnedPage(lease) => [Some(lease.token()), None],
             Self::Query(lease) => [lease.token(), None],
             Self::Redirty(lease) => lease.tokens(),
         }
@@ -40,7 +40,7 @@ impl PacketLease {
     pub fn maintain(&mut self) -> bool {
         match self {
             Self::Page(lease) => lease.maintain(),
-            Self::Retirement(lease) => lease.completed(),
+            Self::OwnedPage(lease) => lease.completed(),
             Self::Query(lease) => lease.completed(),
             Self::Redirty(lease) => lease.maintain(),
         }
@@ -49,7 +49,7 @@ impl PacketLease {
     pub fn into_slots(self) -> [Option<crate::guest_completions::CompletionSlot>; 2] {
         match self {
             Self::Page(lease) => [lease.into_slot(), None],
-            Self::Retirement(lease) => [Some(lease.into_slot()), None],
+            Self::OwnedPage(lease) => [Some(lease.into_slot()), None],
             Self::Query(lease) => [lease.into_slot(), None],
             Self::Redirty(lease) => lease.into_slots(),
         }
@@ -63,7 +63,7 @@ pub struct FramePacket {
     pub(super) frame: Option<FrameData>,
     pub(super) recorder: Option<FrameRecorder>,
     pub(super) pages: Vec<GuestPageLease>,
-    retirements: Vec<GuestRetirementLease>,
+    pub(super) owned_pages: Vec<GuestOwnedPageLease>,
     pub(super) queries: Vec<GuestQueryLease>,
     redirties: Vec<GuestRedirtyLease>,
     completion: Option<Box<LeaseCompletion>>,
@@ -94,7 +94,7 @@ impl FramePacket {
             frame: Some(frame),
             recorder: Some(recorder),
             pages: Vec::new(),
-            retirements: Vec::new(),
+            owned_pages: Vec::new(),
             queries: Vec::new(),
             redirties: Vec::new(),
             completion: Some(Box::default()),
@@ -116,7 +116,7 @@ impl FramePacket {
         };
         if let Some(recorder) = &mut packet.recorder {
             packet.pages = core::mem::take(&mut recorder.pages);
-            packet.retirements = core::mem::take(&mut recorder.retirements);
+            packet.owned_pages = core::mem::take(&mut recorder.owned_pages);
             packet.queries = core::mem::take(&mut recorder.queries);
             packet.redirties = core::mem::take(&mut recorder.redirties);
         }
@@ -185,9 +185,9 @@ impl FramePacket {
             .extract_if(.., |lease| lease.token().is_some())
             .map(PacketLease::Page)
             .chain(
-                self.retirements
+                self.owned_pages
                     .extract_if(.., |_| true)
-                    .map(PacketLease::Retirement),
+                    .map(PacketLease::OwnedPage),
             )
             .chain(
                 self.queries
@@ -226,7 +226,7 @@ impl FramePacket {
                 page.cancel_unadopted();
             }
         }
-        for page in &self.retirements {
+        for page in &self.owned_pages {
             // SAFETY: the caller guarantees all native and GPU references have ended.
             unsafe { page.cancel_unadopted() };
         }
@@ -314,7 +314,7 @@ impl FramePacket {
                 self.completion_pool.recycle(slot);
             }
         }
-        for page in self.retirements.extract_if(.., |page| page.completed()) {
+        for page in self.owned_pages.extract_if(.., |page| page.completed()) {
             self.completion_pool.recycle(page.into_slot());
         }
         for query in self.queries.extract_if(.., |query| query.completed()) {
@@ -329,7 +329,7 @@ impl FramePacket {
         }
         replay_complete
             && self.pages.is_empty()
-            && self.retirements.is_empty()
+            && self.owned_pages.is_empty()
             && self.queries.is_empty()
             && self.redirties.is_empty()
     }
@@ -344,7 +344,7 @@ impl Drop for FramePacket {
             core::mem::forget(self.frame.take());
             core::mem::forget(self.recorder.take());
             core::mem::forget(core::mem::take(&mut self.pages));
-            core::mem::forget(core::mem::take(&mut self.retirements));
+            core::mem::forget(core::mem::take(&mut self.owned_pages));
             core::mem::forget(core::mem::take(&mut self.queries));
             core::mem::forget(core::mem::take(&mut self.redirties));
             core::mem::forget(self.completion.take());

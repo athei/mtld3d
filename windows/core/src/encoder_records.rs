@@ -6,7 +6,8 @@
 use mtld3d_shared::encoder_wire::WireError;
 
 use crate::{
-    guest_pages::GuestPageDescriptor, guest_queries::GuestQueryDescriptor,
+    guest_pages::{GuestOwnedPageDescriptor, GuestPageDescriptor},
+    guest_queries::GuestQueryDescriptor,
     upload_redirty::GuestRedirtyDescriptor,
 };
 
@@ -306,8 +307,12 @@ record!(StageUploadRecord {
     id: u64,
     offset: u64,
     size: u64,
-    page: GuestPageDescriptor
+    page: GuestOwnedPageDescriptor
 });
+const _: () = {
+    assert!(size_of::<StageUploadRecord>() == 56);
+    assert!(align_of::<StageUploadRecord>() == 8);
+};
 record!(TextureUploadRecord {
     texture: TextureRecord,
     page: GuestPageDescriptor,

@@ -5,12 +5,12 @@ use std::ptr::NonNull;
 use mtld3d_shared::frame_metadata::FrameMetadata;
 
 use super::{ReplayCompletion, metadata::FrameView};
-use crate::{guest_pages::RetiredPage, ids::BufferId, scratch::ScratchArena};
+use crate::{guest_pages::GuestOwnedPage, ids::BufferId, scratch::ScratchArena};
 
 /// Native retirement of a uniquely owned PE buffer allocation.
 pub struct NativeVbibRetention {
     pub buffer_id: BufferId,
-    pub page_box: RetiredPage,
+    pub page_box: GuestOwnedPage,
     pub last_submit_seq: u64,
 }
 

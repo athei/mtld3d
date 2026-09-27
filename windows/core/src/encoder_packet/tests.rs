@@ -9,6 +9,7 @@ use crate::{
         UploadTextureOp,
     },
     encoder_records::{QueryRecord, StageUploadRecord, borrow},
+    guest_pages::GuestOwnedPage,
     guest_queries::QueryLeaseCache,
     ids::BufferId,
     page_box::PageBox,
@@ -101,20 +102,20 @@ fn replay(
 
 fn consume_leases(
     command: &CommandView<'_>,
-    pages: &mut Vec<PageBox>,
+    pages: &mut Vec<GuestOwnedPage>,
     queries: &mut Vec<Arc<VisibilityQueryCore>>,
     cache: &mut QueryLeaseCache,
 ) -> Result<(), WireError> {
     match command.opcode() {
         EncoderOpcode::StageUpload => {
+            assert_eq!(command.payload().len(), 56);
             let record = borrow::<StageUploadRecord>(command.payload())?;
             assert_eq!((record.offset, record.size), (0, 4));
             // SAFETY: the real producer retained this unique owned page descriptor.
-            let page = unsafe { record.page.adopt_owned()? };
-            assert_eq!(
-                &page.as_slice()[..4],
-                &[if pages.is_empty() { 17 } else { 29 }; 4]
-            );
+            let page = unsafe { record.page.adopt()? };
+            // SAFETY: the fixture initialized the first four bytes and the guard retains them.
+            let bytes = unsafe { core::slice::from_raw_parts(page.as_ptr(), 4) };
+            assert_eq!(bytes, &[if pages.is_empty() { 17 } else { 29 }; 4]);
             pages.push(page);
         }
         EncoderOpcode::BeginVisibility => {
@@ -494,6 +495,7 @@ fn canceled_packet_returns_completion_slots_to_its_pool() {
         .pages
         .iter()
         .filter_map(GuestPageLease::token)
+        .chain(packet.owned_pages.iter().map(GuestOwnedPageLease::token))
         .chain(packet.queries.iter().filter_map(GuestQueryLease::token))
         .collect();
     original.sort_unstable();
