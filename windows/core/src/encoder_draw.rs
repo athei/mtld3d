@@ -710,8 +710,18 @@ pub const fn draw_payload_size(draw: &DrawOp) -> Result<usize, WireError> {
 
 /// Fill one final draw payload reservation without temporary operation storage.
 ///
+/// `payload_bytes` is the result of [`draw_payload_size`] for the same draw.
+///
 /// # Errors
-/// Rejects an incorrect destination size or excessive stream count.
-pub fn write_draw_into(draw: &DrawOp, destination: &mut [u8]) -> Result<(), WireError> {
-    draw_record::write_into(draw, destination)
+/// Rejects a destination-size mismatch, an incomplete write or a stream count
+/// that cannot fit in the record. [`draw_payload_size`] enforces the stream limit.
+///
+/// # Panics
+/// Panics if an incorrect supplied size is too small for the draw's fields.
+pub fn write_draw_into(
+    draw: &DrawOp,
+    destination: &mut [u8],
+    payload_bytes: usize,
+) -> Result<(), WireError> {
+    draw_record::write_into(draw, destination, payload_bytes)
 }

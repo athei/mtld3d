@@ -35,7 +35,7 @@ fn decoded_extra_streams_borrow_command_bytes_and_preserve_order() {
     let size = draw_payload_size(&draw).unwrap();
     let first = arena
         .write_command(4, 0, size, |destination| {
-            write_draw_into(&draw, destination)?;
+            write_draw_into(&draw, destination, size)?;
             Ok(size)
         })
         .unwrap();
@@ -57,7 +57,7 @@ fn decoded_extra_streams_borrow_command_bytes_and_preserve_order() {
     );
     let second = arena
         .write_command(4, 0, size, |destination| {
-            write_draw_into(&draw, destination)?;
+            write_draw_into(&draw, destination, size)?;
             Ok(size)
         })
         .unwrap();

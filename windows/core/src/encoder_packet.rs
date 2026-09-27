@@ -357,7 +357,7 @@ impl FrameRecorder {
                 u16::from(EncoderOpcode::Draw),
                 0,
                 length,
-                |destination| crate::encoder_draw::write_draw_into(draw, destination),
+                |destination| crate::encoder_draw::write_draw_into(draw, destination, length),
             )
         });
         self.finish_record(result)

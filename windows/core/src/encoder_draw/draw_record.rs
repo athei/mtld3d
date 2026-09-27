@@ -159,8 +159,12 @@ pub(super) const fn payload_size(draw: &DrawOp) -> Result<usize, WireError> {
     Ok(16 + vertices + indices)
 }
 
-pub(super) fn write_into(draw: &DrawOp, destination: &mut [u8]) -> Result<(), WireError> {
-    if destination.len() != payload_size(draw)? {
+pub(super) fn write_into(
+    draw: &DrawOp,
+    destination: &mut [u8],
+    payload_bytes: usize,
+) -> Result<(), WireError> {
+    if destination.len() != payload_bytes {
         return Err(WireError::InvalidValue);
     }
     let (vertex_kind, stream_count, stride_or_frequency) = match &draw.vertex_source {
@@ -288,6 +292,10 @@ pub(super) fn write_into(draw: &DrawOp, destination: &mut [u8]) -> Result<(), Wi
             );
         }
         IndexSource::None { .. } | IndexSource::Fan { .. } => {}
+    }
+    // Never publish a reservation whose supplied size exceeds the initialized fields.
+    if at != destination.len() {
+        return Err(WireError::InvalidValue);
     }
     Ok(())
 }

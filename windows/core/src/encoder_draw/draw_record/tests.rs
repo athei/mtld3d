@@ -20,7 +20,7 @@ fn encode<'a>(draw: &DrawOp, arena: &'a mut ScratchArena) -> &'a [u8] {
     let size = payload_size(draw).unwrap();
     let command = arena
         .write_command(4, 0, size, |destination| {
-            write_into(draw, destination)?;
+            write_into(draw, destination, size)?;
             Ok(size)
         })
         .unwrap();
@@ -55,6 +55,68 @@ fn bound(indices: IndexSource) -> DrawOp {
             stream0_freq: 1,
         },
         index_source: indices,
+    }
+}
+
+#[test]
+fn incorrect_supplied_size_cannot_publish_unwritten_command_bytes() {
+    let draw = bound(IndexSource::None {
+        start_vertex: 0,
+        vertex_count: 3,
+    });
+    let size = payload_size(&draw).unwrap();
+    let mut arena = ScratchArena::new();
+    let first = encode(&draw, &mut arena).to_vec();
+    let committed = arena.bytes_used();
+    let error = arena.write_command(4, 0, size + 8, |destination| {
+        write_into(&draw, destination, size + 8)?;
+        Ok(size + 8)
+    });
+    assert!(matches!(error, Err(WireError::InvalidValue)));
+    assert_eq!(arena.bytes_used(), committed);
+    assert_eq!(encode(&draw, &mut arena), first);
+}
+
+#[test]
+fn undersized_supplied_reservation_cannot_commit_a_partial_draw() {
+    let draw = bound(IndexSource::None {
+        start_vertex: 0,
+        vertex_count: 3,
+    });
+    let size = payload_size(&draw).unwrap();
+    let mut arena = ScratchArena::new();
+    let prefix = encode(&draw, &mut arena);
+    let pointer = prefix.as_ptr();
+    let first = prefix.to_vec();
+    let committed = arena.bytes_used();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        arena.write_command(4, 0, size - 1, |destination| {
+            write_into(&draw, destination, size - 1)?;
+            Ok(size - 1)
+        })
+    }));
+    assert!(result.is_err());
+    assert_eq!(arena.bytes_used(), committed);
+    // SAFETY: the arena retains the earlier immutable command across failed writes.
+    let prefix = unsafe { core::slice::from_raw_parts(pointer, first.len()) };
+    assert_eq!(prefix, first);
+    assert_eq!(encode(&draw, &mut arena), first);
+}
+
+#[test]
+fn destination_mismatch_is_rejected_before_writing() {
+    let draw = bound(IndexSource::None {
+        start_vertex: 0,
+        vertex_count: 3,
+    });
+    let size = payload_size(&draw).unwrap();
+    for length in [size - 1, size + 1] {
+        let mut bytes = vec![0xa5; length];
+        assert_eq!(
+            write_into(&draw, &mut bytes, size),
+            Err(WireError::InvalidValue)
+        );
+        assert!(bytes.iter().all(|byte| *byte == 0xa5));
     }
 }
 
