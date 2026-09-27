@@ -47,16 +47,14 @@ use mtld3d_shared::{
     perf::{NanosSetTimer, PipelineTimings, ShaderTimings},
     tsc::rdtsc,
 };
+use objc2::rc::autoreleasepool;
 use rustc_hash::FxHashMap;
 
 use super::{
     FrameEncoder, FrameEncoderFlags, LOG_TARGET, StageLibHandles, compile_stage_library,
     open_or_create_cache_file,
 };
-use crate::{
-    draw::{PsSourceView, ShaderRef, VsSourceView},
-    native_call,
-};
+use crate::draw::{PsSourceView, ShaderRef, VsSourceView};
 
 #[cfg(test)]
 mod tests;
@@ -553,24 +551,30 @@ fn build_pipeline(job: PipelineJob) -> PipelineOutcome {
     let mut persist_error = None;
     let total = NanosSetTimer::start(&raw mut total_ns);
     let key = pipeline_state::key_from_snapshot(&snapshot, &vertex_attrs);
-    // One wire layout per used stream; lives until the synchronous thunk
-    // below has read it.
+    // One layout per used stream, borrowed through the synchronous build.
     let vertex_layouts = pipeline_state::vertex_layouts_from_snapshot(&snapshot);
-    let mut params = pipeline_state::params_from_snapshot(&PipelineBuildInputs {
+    let params = pipeline_state::params_from_snapshot(&PipelineBuildInputs {
         snapshot: &snapshot,
         vertex_attrs: &vertex_attrs,
         vertex_layouts: &vertex_layouts,
         device_handle: device,
     });
-    let status = native_call(&mut params);
-    let pipeline = params.pipeline_handle;
-    let native = params.timings.into_inner();
+    let mut native = PipelineTimings::new();
+    let pipeline = autoreleasepool(|_| {
+        crate::metal::create_render_pipeline(&params, &vertex_attrs, &vertex_layouts, &mut native)
+    });
+    let status = if pipeline.is_some() {
+        0
+    } else {
+        error!(target: LOG_TARGET, "failed to create render pipeline");
+        0xC000_0001_u32.cast_signed()
+    };
     debug!(
         target: LOG_TARGET,
         "encoder: live CreateRenderPipeline status={status:#x} sibling={}",
         sibling_of.is_some()
     );
-    let success = status == 0 && !pipeline.is_null();
+    let success = pipeline.is_some();
     if success && persist {
         let _persist = NanosSetTimer::start(&raw mut persist_ns);
         if let Some((vs_ref, ps_ref)) = shader_refs {
@@ -593,7 +597,7 @@ fn build_pipeline(job: PipelineJob) -> PipelineOutcome {
         vs,
         ps,
         sibling_of,
-        handle: success.then_some(pipeline),
+        handle: pipeline,
         total_ns,
         persist_ns,
         native,

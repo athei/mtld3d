@@ -169,3 +169,64 @@ fn adopted_prewarm_retains_transfer_once_and_release_in_dependency_order() {
         );
     });
 }
+
+#[test]
+fn native_shader_build_resets_empty_inputs_and_retains_outputs_after_pool_drain() {
+    use mtld3d_shared::{mtl::StageTag, perf::ShaderTimings};
+
+    use crate::metal::handle::IntoRetained;
+
+    objc2::rc::autoreleasepool(|_| {
+        for (source, entry) in [("", "probe"), ("invalid MSL", "")] {
+            let mut timings = ShaderTimings {
+                preparation_ns: u64::MAX,
+                library_ns: u64::MAX,
+                function_ns: u64::MAX,
+            };
+            assert!(
+                super::compile_stage_library(
+                    MetalHandle::NULL,
+                    StageTag::Vertex,
+                    source,
+                    entry,
+                    &mut timings,
+                )
+                .is_none()
+            );
+            assert_eq!(
+                (
+                    timings.preparation_ns,
+                    timings.library_ns,
+                    timings.function_ns
+                ),
+                (0, 0, 0),
+                "empty input resets all phases before native compilation"
+            );
+        }
+
+        let device = MTLCreateSystemDefaultDevice().expect("Metal device for shader lifetime test");
+        // SAFETY: device owns this live Metal device until the build completes.
+        let device_handle = unsafe { MetalHandle::new(Retained::as_ptr(&device) as u64) };
+        let source = "#include <metal_stdlib>\nusing namespace metal;\nvertex float4 probe(uint id [[vertex_id]]) { return float4(float(id), 0, 0, 1); }";
+        let handles = super::compile_stage_library(
+            device_handle,
+            StageTag::Vertex,
+            source,
+            "probe",
+            &mut ShaderTimings::new(),
+        )
+        .expect("native shader build succeeds");
+        // The build's inner pool has drained; only canonical output retains remain.
+        let library = handles
+            .library
+            .into_retained()
+            .expect("live library output");
+        let function = handles.func.into_retained().expect("live function output");
+        assert_eq!(library.label().expect("library label").to_string(), "probe");
+        assert_eq!(function.name().to_string(), "probe");
+        drop(function);
+        drop(library);
+        destroy_resources_bulk(DestroyKind::ShaderFunction, &[handles.func.raw()]);
+        destroy_resources_bulk(DestroyKind::ShaderLibrary, &[handles.library.raw()]);
+    });
+}

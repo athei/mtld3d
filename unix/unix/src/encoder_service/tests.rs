@@ -210,9 +210,14 @@ fn failed_startup_retires_started_workers(reject_submit: bool) {
                     drop(native_clock);
                     return Err(std::io::Error::other("injected encoder launch failure"));
                 }
+                let device = objc2_metal::MTLCreateSystemDefaultDevice()
+                    .expect("Metal device for late startup failure");
+                // SAFETY: device remains retained through the encoder startup result.
+                let device_handle =
+                    unsafe { MetalHandle::new(objc2::rc::Retained::as_ptr(&device) as u64) };
                 let startup = super::EncoderStartup {
                     context: super::EncoderContext {
-                        device_handle: MetalHandle::NULL,
+                        device_handle,
                         record_handle: DeviceRecordHandle::NULL,
                         coherent_seq_ptr: 0,
                         upload_coherent_seq_ptr: 0,
@@ -225,7 +230,7 @@ fn failed_startup_retires_started_workers(reject_submit: bool) {
                         source: 0,
                     },
                 };
-                // Submit launch fails before any Metal or shared-pointer access.
+                // The device is retained first, then the submit launch fails before replay.
                 crate::encoder::EncoderThread::spawn_with_submit(
                     GpuCaps::apple_silicon_default(),
                     Arc::new(Mtld3dConfig::default()),
@@ -283,4 +288,45 @@ fn encoder_spawn_failure_retires_started_service_workers() {
 #[test]
 fn submit_spawn_failure_joins_encoder_and_service_workers() {
     failed_startup_retires_started_workers(true);
+}
+
+#[test]
+fn null_device_rejects_encoder_startup_before_submit_spawn() {
+    use std::sync::{Arc, mpsc};
+
+    use mtld3d_shared::{MetalHandle, record_handle::DeviceRecordHandle};
+
+    let (prewarm, receiver) = mpsc::channel();
+    drop(prewarm);
+    let (entered, submit_start) = mpsc::channel();
+    let startup = super::EncoderStartup {
+        context: super::EncoderContext {
+            device_handle: MetalHandle::NULL,
+            record_handle: DeviceRecordHandle::NULL,
+            coherent_seq_ptr: 0,
+            upload_coherent_seq_ptr: 0,
+            failed_submit_seq_ptr: 0,
+            retained_bytes_ptr: 0,
+        },
+        clocks: super::EncoderClocks {
+            native: Arc::new(mtld3d_shared::clock_calibration::ClockCalibration::new()),
+            #[cfg(perf_tracking)]
+            source: 0,
+        },
+    };
+    let error = crate::encoder::EncoderThread::spawn_with_submit(
+        GpuCaps::apple_silicon_default(),
+        Arc::new(Mtld3dConfig::default()),
+        receiver,
+        None,
+        startup,
+        RejectedSubmit { entered },
+    )
+    .err()
+    .expect("null device must fail startup");
+    assert_eq!(error.to_string(), "encoder: missing Metal device");
+    assert_eq!(
+        submit_start.try_recv(),
+        Err(mpsc::TryRecvError::Disconnected)
+    );
 }

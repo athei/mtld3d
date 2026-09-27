@@ -33,12 +33,12 @@ use mtld3d_shared::{
     mtl_handle::{MTLDeviceKind, MTLRenderPipelineStateKind},
     perf::NanosSetTimer,
 };
+use objc2::rc::autoreleasepool;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::{
     LOG_TARGET,
     encoder::{StageLibHandles, WarmCache, compile_stage_library},
-    native_call,
 };
 
 /// Start prewarm for one device and return its startup barrier.
@@ -332,21 +332,31 @@ fn compile_pipeline(
     let mut total_ns = 0;
     let timer = NanosSetTimer::start(&raw mut total_ns);
     let vertex_layouts = pipeline_state::vertex_layouts_from_snapshot(snapshot);
-    let mut params = pipeline_state::params_from_snapshot(&PipelineBuildInputs {
+    let params = pipeline_state::params_from_snapshot(&PipelineBuildInputs {
         snapshot,
         vertex_attrs: recipe.vertex_attrs(),
         vertex_layouts: &vertex_layouts,
         device_handle,
     });
-    let status = native_call(&mut params);
-    let pipeline = params.pipeline_handle;
-    let timings = params.timings.into_inner();
+    let mut timings = mtld3d_shared::perf::PipelineTimings::new();
+    let pipeline = autoreleasepool(|_| {
+        crate::metal::create_render_pipeline(
+            &params,
+            recipe.vertex_attrs(),
+            &vertex_layouts,
+            &mut timings,
+        )
+    });
+    if pipeline.is_none() {
+        error!(target: LOG_TARGET, "failed to create render pipeline");
+    }
+    let success = pipeline.is_some();
     drop(timer);
     PipelineCompilation {
-        pipeline,
+        pipeline: pipeline.unwrap_or(MetalHandle::NULL),
         timings,
         total_ns,
-        success: status == 0 && !pipeline.is_null(),
+        success,
     }
 }
 

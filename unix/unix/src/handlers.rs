@@ -1090,23 +1090,10 @@ pub extern "C" fn create_buffers_batch_handler(args: *mut c_void) -> i32 {
             params.count as usize,
         )
     };
-    let mut any_failed = false;
-    // `metal::create_buffer` logs the precise reason (length=0, backing_ptr=0,
-    // newBufferWithBytesNoCopy nil) before returning None.
-    for (desc, slot) in descs.iter().zip(handles.iter_mut()) {
-        if let Some(handle) = metal::create_buffer(&device, desc) {
-            // SAFETY: `create_buffer` returns the raw u64 of a freshly
-            // retained MTLBuffer; adopt it as canonical.
-            *slot = unsafe { MetalHandle::<MTLBufferKind>::new(handle) };
-        } else {
-            *slot = MetalHandle::NULL;
-            any_failed = true;
-        }
-    }
-    if any_failed {
-        STATUS_UNSUCCESSFUL
-    } else {
+    if metal::create_buffers(&device, descs, handles) {
         STATUS_SUCCESS
+    } else {
+        STATUS_UNSUCCESSFUL
     }
 }
 

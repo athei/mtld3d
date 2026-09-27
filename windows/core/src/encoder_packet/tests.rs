@@ -360,6 +360,32 @@ fn capture_failure_survives_later_snapshot_draw_and_owned_control() {
             },
         };
         assert_eq!(recorder.record_draw(&mut scratch, &draw), Err(first_error));
+        let VertexSource::Bound {
+            first,
+            extra,
+            stream0_freq,
+        } = draw.vertex_source
+        else {
+            unreachable!()
+        };
+        let vertices = crate::encoder_draw::draw_record::BoundVertices {
+            first,
+            extra,
+            stream0_freq,
+        };
+        assert_eq!(
+            recorder.record_bound_draw(
+                &mut scratch,
+                crate::encoder_draw::draw_record::DrawPrefix::nonindexed(
+                    mtld3d_shared::mtl::PrimitiveType::Triangle,
+                    0,
+                    3,
+                ),
+                &vertices,
+                None,
+            ),
+            Err(first_error)
+        );
         // A later invalid input must not replace an earlier allocation failure.
         assert_eq!(
             recorder.record_constant_bytes(

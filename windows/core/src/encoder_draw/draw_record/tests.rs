@@ -338,3 +338,137 @@ fn padding_is_initialized_and_unknown_fixed_tags_are_rejected() {
         }
     }
 }
+
+#[test]
+fn ordinary_bound_capture_matches_generic_bytes_for_sparse_and_full_streams() {
+    for stream_ids in [vec![7], vec![2, 7, 15], (0..16).collect()] {
+        for index_kind in [None, Some(IndexType::UInt16), Some(IndexType::UInt32)] {
+            let mut bindings = stream_ids.iter().copied().map(stream);
+            let draw = DrawOp {
+                metal_prim: PrimitiveType::Triangle,
+                vertex_source: VertexSource::Bound {
+                    first: bindings.next().unwrap(),
+                    extra: ExtraStreams::Owned(bindings.collect()),
+                    stream0_freq: 0x4000_0011,
+                },
+                index_source: index_kind.map_or(
+                    IndexSource::None {
+                        start_vertex: u32::MAX - 9,
+                        vertex_count: 9,
+                    },
+                    |index_type| IndexSource::Bound {
+                        buffer_id: BufferId::new_unique(),
+                        backing_ptr: 0x1234,
+                        backing_len: 8192,
+                        backing_generation: 123,
+                        offset: 12,
+                        index_count: 9,
+                        index_type,
+                        base_vertex: i32::MIN,
+                    },
+                ),
+            };
+            let expected = encode(&draw, &mut ScratchArena::new()).to_vec();
+            let VertexSource::Bound {
+                first,
+                extra,
+                stream0_freq,
+            } = draw.vertex_source
+            else {
+                unreachable!()
+            };
+            let vertices = BoundVertices {
+                first,
+                extra,
+                stream0_freq,
+            };
+            let (prefix, index) = match draw.index_source {
+                IndexSource::None {
+                    start_vertex,
+                    vertex_count,
+                } => (
+                    DrawPrefix::nonindexed(draw.metal_prim, start_vertex, vertex_count),
+                    None,
+                ),
+                IndexSource::Bound {
+                    buffer_id,
+                    backing_ptr,
+                    backing_len,
+                    backing_generation,
+                    offset,
+                    index_count,
+                    index_type,
+                    base_vertex,
+                } => (
+                    DrawPrefix::indexed(draw.metal_prim, base_vertex, index_count),
+                    Some(IndexBuffer {
+                        buffer: buffer_id.raw(),
+                        address: backing_ptr as u64,
+                        length: backing_len as u64,
+                        generation: backing_generation,
+                        offset,
+                        kind: index_type as u8,
+                        reserved: [0; 3],
+                    }),
+                ),
+                _ => unreachable!(),
+            };
+            let length = bound_payload_size(&vertices, index.as_ref()).unwrap();
+            let mut actual = vec![0xcc; length];
+            write_bound_into(prefix, &vertices, index.as_ref(), &mut actual, length).unwrap();
+            assert_eq!(actual, expected);
+        }
+    }
+}
+
+#[test]
+fn ordinary_bound_capture_rejects_bad_extents_and_stream_counts_before_publication() {
+    let mut vertices = BoundVertices {
+        first: stream(0),
+        extra: ExtraStreams::EMPTY,
+        stream0_freq: 1,
+    };
+    let length = bound_payload_size(&vertices, None).unwrap();
+    let mut arena = ScratchArena::new();
+    let prefix = || DrawPrefix::nonindexed(PrimitiveType::Triangle, 0, 3);
+    for extra_bytes in [0, 8] {
+        let used = arena.bytes_used();
+        let result = arena.write_command(4, 0, length + extra_bytes, |destination| {
+            // The indexed prefix has no index tail; an oversized reservation has
+            // unwritten bytes. Neither failure may publish a command.
+            let header = if extra_bytes == 0 {
+                DrawPrefix::indexed(PrimitiveType::Triangle, -1, 3)
+            } else {
+                prefix()
+            };
+            write_bound_into(header, &vertices, None, destination, length + extra_bytes)?;
+            Ok(length + extra_bytes)
+        });
+        assert!(matches!(result, Err(WireError::InvalidValue)));
+        assert_eq!(arena.bytes_used(), used);
+    }
+    let used = arena.bytes_used();
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = arena.write_command(4, 0, length - 8, |destination| {
+            write_bound_into(prefix(), &vertices, None, destination, length - 8)?;
+            Ok(length - 8)
+        });
+    }));
+    assert!(panic.is_err());
+    assert_eq!(arena.bytes_used(), used);
+    arena
+        .write_command(4, 0, length, |destination| {
+            write_bound_into(prefix(), &vertices, None, destination, length)?;
+            Ok(length)
+        })
+        .unwrap();
+    assert_eq!(
+        arena.bytes_used(),
+        used + u64::try_from(COMMAND_HEADER_BYTES + length).unwrap()
+    );
+    vertices.extra = ExtraStreams::Owned((0..16).map(stream).collect());
+    assert_eq!(
+        bound_payload_size(&vertices, None),
+        Err(WireError::InvalidValue)
+    );
+}

@@ -1306,13 +1306,27 @@ impl FrameData {
         }
     }
 
-    /// Serialize a borrowed draw directly into the PE frame capture.
+    /// Write a borrowed draw directly into the PE frame capture.
     #[cfg(windows)]
     pub fn record_draw(&mut self, draw: &crate::draw_data::DrawOp) {
         let _ = self
             .recorder
             .get_or_insert_with(crate::encoder_packet::FrameRecorder::new)
             .record_draw(&mut self.scratch, draw);
+    }
+
+    /// Write a bound draw directly from its borrowed stream and index snapshots.
+    #[cfg(windows)]
+    pub fn record_bound_draw(
+        &mut self,
+        prefix: crate::encoder_draw::draw_record::DrawPrefix,
+        vertices: &crate::encoder_draw::draw_record::BoundVertices,
+        indices: Option<&crate::encoder_draw::draw_record::IndexBuffer>,
+    ) {
+        let _ = self
+            .recorder
+            .get_or_insert_with(crate::encoder_packet::FrameRecorder::new)
+            .record_bound_draw(&mut self.scratch, prefix, vertices, indices);
     }
 
     /// Retain an owned draw for native replay.

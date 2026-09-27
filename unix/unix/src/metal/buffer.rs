@@ -11,13 +11,43 @@ use core::{ffi::c_void, ptr::NonNull};
 
 use log::warn;
 use mtld3d_shared::{
-    BufferCreateDesc,
+    BufferCreateDesc, MetalHandle,
     mtl::{BufferKind, StorageMode},
+    mtl_handle::MTLBufferKind,
 };
 use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_metal::{MTLBuffer, MTLDevice, MTLResource, MTLResourceOptions};
 
 use crate::LOG_TARGET;
+
+/// Create each buffer, preserving successful outputs when another descriptor fails.
+///
+/// The caller supplies an autorelease pool and retains every backing allocation
+/// through its returned buffer's lifetime. Returns whether every creation succeeded.
+///
+/// # Panics
+/// Panics when the descriptor and output counts differ.
+pub fn create_buffers(
+    device: &ProtocolObject<dyn MTLDevice>,
+    descs: &[BufferCreateDesc],
+    handles: &mut [MetalHandle<MTLBufferKind>],
+) -> bool {
+    assert_eq!(descs.len(), handles.len());
+    let mut succeeded = true;
+    for (desc, slot) in descs.iter().zip(handles.iter_mut()) {
+        *slot = create_buffer(device, desc).map_or_else(
+            || {
+                succeeded = false;
+                MetalHandle::NULL
+            },
+            |handle| {
+                // SAFETY: create_buffer returns a freshly retained MTLBuffer.
+                unsafe { MetalHandle::new(handle) }
+            },
+        );
+    }
+    succeeded
+}
 
 /// Wrap `backing_ptr` (caller-owned, page-aligned, PE-heap) in an `MTLBuffer`.
 ///
@@ -125,3 +155,6 @@ pub fn destroy_buffer(buffer_handle: u64) {
         ));
     }
 }
+
+#[cfg(test)]
+mod tests;

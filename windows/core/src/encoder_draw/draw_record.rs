@@ -7,10 +7,20 @@ use mtld3d_shared::{
     mtl::{IndexType, PrimitiveType},
 };
 
-use crate::draw_data::{DrawOp, IndexSource, ScratchSlice, StreamBinding, VertexSource};
+use crate::draw_data::{
+    DrawOp, ExtraStreams, IndexSource, ScratchSlice, StreamBinding, VertexSource,
+};
 
+/// Bound streams captured once on PE and borrowed while writing their command.
+pub struct BoundVertices {
+    pub first: StreamBinding,
+    pub extra: ExtraStreams,
+    pub stream0_freq: u32,
+}
+
+/// Fixed draw header. Constructors preserve unsigned starts and signed index bases.
 #[repr(C, align(8))]
-struct DrawPrefix {
+pub struct DrawPrefix {
     primitive: u8,
     vertex_kind: u8,
     index_kind: u8,
@@ -18,6 +28,32 @@ struct DrawPrefix {
     stride_or_frequency: u32,
     first_or_base: u32,
     count: u32,
+}
+
+impl DrawPrefix {
+    /// Header for an ordinary nonindexed bound draw.
+    #[must_use]
+    pub const fn nonindexed(primitive: PrimitiveType, start_vertex: u32, count: u32) -> Self {
+        Self {
+            primitive: primitive as u8,
+            vertex_kind: 1,
+            index_kind: 0,
+            stream_count: 0,
+            stride_or_frequency: 0,
+            first_or_base: start_vertex,
+            count,
+        }
+    }
+
+    /// Header for an ordinary indexed bound draw.
+    #[must_use]
+    pub const fn indexed(primitive: PrimitiveType, base_vertex: i32, count: u32) -> Self {
+        Self {
+            index_kind: 1,
+            first_or_base: base_vertex.cast_unsigned(),
+            ..Self::nonindexed(primitive, 0, count)
+        }
+    }
 }
 
 #[repr(C, align(8))]
@@ -141,6 +177,106 @@ const fn stream_record(value: &StreamBinding) -> StreamRecord {
     }
 }
 
+fn put_prefix(
+    destination: &mut [u8],
+    mut prefix: DrawPrefix,
+    stream_count: u8,
+    stride_or_frequency: u32,
+) -> usize {
+    prefix.stream_count = stream_count;
+    prefix.stride_or_frequency = stride_or_frequency;
+    let mut at = 0;
+    put(destination, &mut at, prefix);
+    at
+}
+
+fn put_bound_index(destination: &mut [u8], at: &mut usize, index: &IndexBuffer) {
+    put(
+        destination,
+        at,
+        IndexBuffer {
+            buffer: index.buffer,
+            address: index.address,
+            length: index.length,
+            generation: index.generation,
+            offset: index.offset,
+            kind: index.kind,
+            reserved: [0; 3],
+        },
+    );
+}
+
+const fn finish_payload(destination: &[u8], at: usize) -> Result<(), WireError> {
+    // Never publish a reservation whose size exceeds the initialized fields.
+    if at != destination.len() {
+        return Err(WireError::InvalidValue);
+    }
+    Ok(())
+}
+
+fn put_bound_vertices(
+    destination: &mut [u8],
+    at: &mut usize,
+    first: &StreamBinding,
+    extra: &ExtraStreams,
+) {
+    put(destination, at, stream_record(first));
+    for value in extra {
+        put(destination, at, stream_record(&value));
+    }
+}
+
+/// Extent of an ordinary bound draw, without generic vertex or index dispatch.
+///
+/// # Errors
+/// Returns an error when more than sixteen streams were supplied.
+pub const fn bound_payload_size(
+    vertices: &BoundVertices,
+    indices: Option<&IndexBuffer>,
+) -> Result<usize, WireError> {
+    if vertices.extra.len() > 15 {
+        return Err(WireError::InvalidValue);
+    }
+    Ok(size_of::<DrawPrefix>()
+        + (1 + vertices.extra.len()) * size_of::<StreamRecord>()
+        + if indices.is_some() {
+            size_of::<IndexBuffer>()
+        } else {
+            0
+        })
+}
+
+/// Write an ordinary bound draw into its already sized reservation.
+///
+/// The caller must compute `payload_bytes` with `bound_payload_size` first.
+/// Individual stores remain bounded, and unwritten bytes cannot be published.
+///
+/// # Errors
+/// Returns an error for a mismatched prefix/index tail, destination extent,
+/// unrepresentable stream count, or a supplied size larger than the fields written.
+///
+/// # Panics
+/// Panics if the supplied reservation is too small for its fields.
+pub fn write_bound_into(
+    prefix: DrawPrefix,
+    vertices: &BoundVertices,
+    indices: Option<&IndexBuffer>,
+    destination: &mut [u8],
+    payload_bytes: usize,
+) -> Result<(), WireError> {
+    if destination.len() != payload_bytes || (prefix.index_kind == 1) != indices.is_some() {
+        return Err(WireError::InvalidValue);
+    }
+    let stream_count =
+        u8::try_from(vertices.extra.len() + 1).map_err(|_| WireError::InvalidValue)?;
+    let mut at = put_prefix(destination, prefix, stream_count, vertices.stream0_freq);
+    put_bound_vertices(destination, &mut at, &vertices.first, &vertices.extra);
+    if let Some(index) = indices {
+        put_bound_index(destination, &mut at, index);
+    }
+    finish_payload(destination, at)
+}
+
 pub(super) const fn payload_size(draw: &DrawOp) -> Result<usize, WireError> {
     let vertices = match &draw.vertex_source {
         VertexSource::Up { .. } => 16,
@@ -200,19 +336,19 @@ pub(super) fn write_into(
         } => (3, min_vertex, index_count),
         IndexSource::Up { index_count, .. } => (4, 0, index_count),
     };
-    let mut at = 0;
-    put(
+    let mut at = put_prefix(
         destination,
-        &mut at,
         DrawPrefix {
             primitive: draw.metal_prim as u8,
             vertex_kind,
             index_kind,
-            stream_count,
-            stride_or_frequency,
+            stream_count: 0,
+            stride_or_frequency: 0,
             first_or_base,
             count,
         },
+        stream_count,
+        stride_or_frequency,
     );
     match &draw.vertex_source {
         VertexSource::Up { bytes, size, .. } => {
@@ -228,10 +364,7 @@ pub(super) fn write_into(
             );
         }
         VertexSource::Bound { first, extra, .. } => {
-            put(destination, &mut at, stream_record(first));
-            for value in extra {
-                put(destination, &mut at, stream_record(&value));
-            }
+            put_bound_vertices(destination, &mut at, first, extra);
         }
     }
     match &draw.index_source {
@@ -243,10 +376,10 @@ pub(super) fn write_into(
             offset,
             index_type,
             ..
-        } => put(
+        } => put_bound_index(
             destination,
             &mut at,
-            IndexBuffer {
+            &IndexBuffer {
                 buffer: buffer_id.raw(),
                 address: *backing_ptr as u64,
                 length: *backing_len as u64,
@@ -293,11 +426,7 @@ pub(super) fn write_into(
         }
         IndexSource::None { .. } | IndexSource::Fan { .. } => {}
     }
-    // Never publish a reservation whose supplied size exceeds the initialized fields.
-    if at != destination.len() {
-        return Err(WireError::InvalidValue);
-    }
-    Ok(())
+    finish_payload(destination, at)
 }
 
 /// Borrowed fixed draw fields. The containing command allocation owns every record.

@@ -29,7 +29,10 @@ use mtld3d_core::{
     },
     dirty_rect::DirtyRect,
     dxso::{VsSamplerKinds, operand_token_count},
-    encoder_draw::{ApiSnapshotCache, SnapshotAttributes, SnapshotDelta},
+    encoder_draw::{
+        ApiSnapshotCache, SnapshotAttributes, SnapshotDelta,
+        draw_record::{BoundVertices, DrawPrefix, IndexBuffer},
+    },
     ff_state::{FfState, FfVsDirty, TssWriteFeeds, tss_write_feeds},
     format::{
         FormatMapping, compute_mip_count, compute_mip_size, compute_volume_mip_count,
@@ -10107,14 +10110,11 @@ extern "system" fn device_draw_primitive(
     emit_snapshot_deltas(&obj);
     drop(snap);
     let _push = CycleAddTimer::start(draw_push_op_ptr(perf_ptr));
-    obj.inner().record_draw(&DrawOp {
-        metal_prim,
-        vertex_source,
-        index_source: IndexSource::None {
-            start_vertex,
-            vertex_count: vtx_count,
-        },
-    });
+    obj.inner().current_frame.record_bound_draw(
+        DrawPrefix::nonindexed(metal_prim, start_vertex, vtx_count),
+        &vertex_source,
+        None,
+    );
     obj.inner()
         .recording_status()
         .map_or_else(|hr| hr, |()| D3D_OK)
@@ -10184,7 +10184,11 @@ fn draw_bound_triangle_fan(
     let _push = CycleAddTimer::start(draw_push_op_ptr(perf_ptr));
     obj.inner().record_draw(&DrawOp {
         metal_prim: mtld3d_shared::mtl::PrimitiveType::Triangle,
-        vertex_source,
+        vertex_source: VertexSource::Bound {
+            first: vertex_source.first,
+            extra: vertex_source.extra,
+            stream0_freq: vertex_source.stream0_freq,
+        },
         index_source,
     });
     obj.inner()
@@ -10382,9 +10386,7 @@ extern "system" fn device_draw_indexed_primitive(
             .recording_status()
             .map_or_else(|hr| hr, |()| D3D_OK);
     };
-    let Some(index_source) =
-        snapshot_bound_index_source(dev, start_index, index_count, base_vertex_index)
-    else {
+    let Some(index_source) = snapshot_bound_index_source(dev, start_index) else {
         mtld3d_shared::log_once_warn!(
             target: LOG_TARGET,
             "DrawIndexedPrimitive: no index buffer bound"
@@ -10395,11 +10397,11 @@ extern "system" fn device_draw_indexed_primitive(
     emit_snapshot_deltas(&obj);
     drop(snap);
     let _push = CycleAddTimer::start(draw_push_op_ptr(perf_ptr));
-    obj.inner().record_draw(&DrawOp {
-        metal_prim,
-        vertex_source,
-        index_source,
-    });
+    obj.inner().current_frame.record_bound_draw(
+        DrawPrefix::indexed(metal_prim, base_vertex_index, index_count),
+        &vertex_source,
+        Some(&index_source),
+    );
     obj.inner()
         .recording_status()
         .map_or_else(|hr| hr, |()| D3D_OK)
@@ -10425,7 +10427,7 @@ fn flush_mapped_bound_buffers(dev: &mut DeviceInner) {
     }
 }
 
-/// Snapshot the bound vertex streams the declaration reads into `VertexSource::Bound`.
+/// Snapshot the bound vertex streams the declaration reads for borrowed capture.
 ///
 /// Only streams the bound declaration names are snapshotted (an implicit
 /// FVF declaration names stream 0 alone), so a single-stream draw pays for
@@ -10433,7 +10435,7 @@ fn flush_mapped_bound_buffers(dev: &mut DeviceInner) {
 /// the retention pipeline keeps its `PageBox` alive until that seq retires; a
 /// named stream with nothing bound is left out and reads zeros at draw time.
 /// `None` when no named stream has a buffer. Runs on the API thread.
-fn snapshot_bound_vertex_source(dev: &DeviceInner) -> Option<VertexSource> {
+fn snapshot_bound_vertex_source(dev: &DeviceInner) -> Option<BoundVertices> {
     let decl_ptr = dev.vertex_decl();
     let decl_mask = if decl_ptr.is_null() {
         1
@@ -10462,7 +10464,7 @@ fn snapshot_bound_vertex_source(dev: &DeviceInner) -> Option<VertexSource> {
             extra.push(binding);
         }
     }
-    Some(VertexSource::Bound {
+    Some(BoundVertices {
         first: first?,
         extra: mtld3d_core::draw_data::ExtraStreams::Owned(extra.into_boxed_slice()),
         stream0_freq: bound.stream_freq(0),
@@ -10490,16 +10492,11 @@ fn snapshot_stream_binding(bound: &BoundBuffers, stream: u32, seq: u64) -> Optio
     })
 }
 
-/// Snapshot the bound index buffer into `IndexSource::Bound`.
+/// Snapshot the bound index buffer directly into its fixed draw record.
 ///
 /// Mirrors `snapshot_bound_vertex_source`: stamps the current submit seq and
 /// collapses the draw's `start_index` into a byte offset.
-fn snapshot_bound_index_source(
-    dev: &DeviceInner,
-    start_index: u32,
-    index_count: u32,
-    base_vertex: i32,
-) -> Option<IndexSource> {
+fn snapshot_bound_index_source(dev: &DeviceInner, start_index: u32) -> Option<IndexBuffer> {
     let ptr = dev.bound_buffers().index_buffer();
     if ptr.is_null() {
         return None;
@@ -10523,15 +10520,14 @@ fn snapshot_bound_index_source(
         }
     };
     inner.stamp_submit_seq(seq);
-    Some(IndexSource::Bound {
-        buffer_id: inner.buffer_id(),
-        backing_ptr: inner.current_backing_ptr(),
-        backing_len: inner.current_backing_len(),
-        backing_generation: inner.current_backing_generation(),
+    Some(IndexBuffer {
+        buffer: inner.buffer_id().raw(),
+        address: inner.current_backing_ptr() as u64,
+        length: inner.current_backing_len() as u64,
+        generation: inner.current_backing_generation(),
         offset: start_index * index_stride,
-        index_count,
-        index_type,
-        base_vertex,
+        kind: index_type as u8,
+        reserved: [0; 3],
     })
 }
 

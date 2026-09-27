@@ -365,6 +365,34 @@ impl FrameRecorder {
         self.finish_record(result)
     }
 
+    /// Capture an ordinary bound draw from borrowed stream and index snapshots.
+    ///
+    /// # Errors
+    /// Returns the latched frame error or a wire capture failure.
+    pub fn record_bound_draw(
+        &mut self,
+        scratch: &mut ScratchArena,
+        prefix: crate::encoder_draw::draw_record::DrawPrefix,
+        vertices: &crate::encoder_draw::draw_record::BoundVertices,
+        indices: Option<&crate::encoder_draw::draw_record::IndexBuffer>,
+    ) -> Result<(), WireError> {
+        use crate::encoder_draw::draw_record::{bound_payload_size, write_bound_into};
+
+        if let Some(error) = self.error {
+            return Err(error);
+        }
+        let result = bound_payload_size(vertices, indices).and_then(|length| {
+            self.slab.push_fixed_record(
+                scratch,
+                u16::from(EncoderOpcode::Draw),
+                0,
+                length,
+                |destination| write_bound_into(prefix, vertices, indices, destination, length),
+            )
+        });
+        self.finish_record(result)
+    }
+
     /// Capture a VS constant delta without constructing an operation enum.
     ///
     /// # Errors

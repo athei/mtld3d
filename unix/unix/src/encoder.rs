@@ -53,9 +53,8 @@ use mtld3d_core::{
     },
 };
 use mtld3d_shared::{
-    BlitCommand, BlitCommandType, BufferCreateDesc, Command, CommandType,
-    CompileShaderLibraryParams, CopyBufferToBufferInfo, CopyBufferToTextureInfo,
-    CreateBuffersBatchParams, CreateTextureSliceViewParams, CreateTexturesBatchParams,
+    BlitCommand, BlitCommandType, BufferCreateDesc, Command, CommandType, CopyBufferToBufferInfo,
+    CopyBufferToTextureInfo, CreateTextureSliceViewParams, CreateTexturesBatchParams,
     DestroyResourcesBulkParams, EnsureBlitPipelineParams, EnsureClearQuadPipelineParams,
     ExtraColorDesc, GetTaskFaultsParams, MetalHandle, PassDescriptor, SetPresentWaitPolicyParams,
     SubmitFrameParams, TextureCreateDesc, WaitForGpuRetireParams, WaitForPresentIdleParams,
@@ -76,6 +75,11 @@ use mtld3d_shared::{
     tsc::rdtsc,
 };
 use mtld3d_types::{D3DSAMP_MIPMAPLODBIAS, SAMPLER_STATE_COUNT};
+use objc2::{
+    rc::{Retained, autoreleasepool},
+    runtime::ProtocolObject,
+};
+use objc2_metal::MTLDevice;
 // Fast non-cryptographic hasher for the per-draw resource caches below
 // (texture/lib/pipeline/sampler/buffer/...). Keys are small trusted integers
 // or fixed structs; SipHash's DoS resistance buys nothing here and its
@@ -87,6 +91,7 @@ use super::{
     draw::{self, CurrentSnapshotPtr, PsKey, ScratchSlice, ShaderRef},
     native_call,
 };
+use crate::metal::handle::IntoRetained;
 
 /// Sub-target for the per-draw breadcrumb emitted by `FrameEncoder::maybe_emit_draw_trace`.
 ///
@@ -842,6 +847,7 @@ pub struct FrameEncoder {
     config: Arc<Mtld3dConfig>,
 
     // Persistent caches (survive across frames)
+    device: Retained<ProtocolObject<dyn MTLDevice>>,
     device_handle: MetalHandle<MTLDeviceKind>,
     /// The device's unix-side record, adopted from each frame alongside `device_handle`.
     ///
@@ -1388,6 +1394,10 @@ impl FrameEncoder {
         context: &crate::encoder_service::EncoderContext,
         submit: impl SubmitSpawner,
     ) -> std::io::Result<Self> {
+        let device = context
+            .device_handle
+            .into_retained()
+            .ok_or_else(|| std::io::Error::other("encoder: missing Metal device"))?;
         let apple = GpuCaps::apple_silicon_default();
         if !gpu_caps.unified_memory
             || gpu_caps.min_linear_texture_align != apple.min_linear_texture_align
@@ -1485,6 +1495,7 @@ impl FrameEncoder {
             perf: EncoderPerfState::new(),
             pass_shader_log_fired: FxHashSet::default(),
             gpu_caps,
+            device,
             device_handle: context.device_handle,
             record_handle: context.record_handle,
             depth_stencil_cache: FxHashMap::default(),
@@ -1577,28 +1588,18 @@ impl FrameEncoder {
         native_call(&mut params)
     }
 
-    /// Issue one batched `CreateBuffersBatch` thunk.
+    /// Create buffers directly on the encoder's retained Metal device.
     ///
-    /// Same wire-backing rules as `batch_create_textures`.
+    /// Initialization and each encoder work item supply a bounded autorelease pool.
     fn batch_create_buffers(
         &self,
         descs: &[BufferCreateDesc],
         handles_out: &mut [MetalHandle<MTLBufferKind>],
     ) -> i32 {
-        debug_assert_eq!(descs.len(), handles_out.len());
-        if descs.is_empty() {
+        if crate::metal::create_buffers(&self.device, descs, handles_out) {
             return 0;
         }
-        let count =
-            u32::try_from(descs.len()).expect("batch_create_buffers: descs.len() exceeds u32");
-        let mut params = CreateBuffersBatchParams {
-            device_handle: self.device_handle,
-            count,
-            pad0: 0,
-            descs_ptr: descs.as_ptr() as u64,
-            handles_out_ptr: handles_out.as_mut_ptr() as u64,
-        };
-        native_call(&mut params)
+        0xC000_0001_u32.cast_signed()
     }
 
     /// Build a backend texture descriptor from its borrowed creation fields.
@@ -8402,11 +8403,11 @@ enum EncoderMessage {
     Shutdown,
 }
 
-/// Compile one stage's MSL into an `MTLLibrary` via the unix-side `CompileShaderLibrary` thunk.
+/// Compile one stage's MSL into a native library and entry function.
 ///
-/// `entry` must match the function name in the MSL source (the unix side
-/// passes it to `newFunctionWithName:`). Returns `None` on UTF-8 / Metal
-/// compile failure.
+/// `entry` must match the function name in the MSL source. This build has a
+/// bounded autorelease pool; returned handles own canonical retains.
+/// Returns `None` on empty input, missing entry or Metal compile failure.
 pub fn compile_stage_library(
     device_handle: MetalHandle<MTLDeviceKind>,
     stage_tag: StageTag,
@@ -8414,28 +8415,23 @@ pub fn compile_stage_library(
     entry: &str,
     timings: &mut ShaderTimings,
 ) -> Option<StageLibHandles> {
-    let mut params = CompileShaderLibraryParams {
-        device_handle,
-        msl_ptr: msl.as_ptr() as u64,
-        msl_len: u32::try_from(msl.len()).expect("MSL source ≤ u32::MAX bytes"),
-        stage_tag,
-        entry_ptr: entry.as_ptr() as u64,
-        entry_len: u32::try_from(entry.len()).expect("entry name ≤ u32::MAX bytes"),
-        pad0: 0,
-        library_handle: MetalHandle::NULL,
-        fn_handle: MetalHandle::NULL,
-        timings: mtld3d_shared::perf::TimingOutput::new(),
-    };
-    let status = native_call(&mut params);
-    *timings = params.timings.into_inner();
-    if status != 0 || params.library_handle.is_null() || params.fn_handle.is_null() {
+    let result = autoreleasepool(|_| {
+        *timings = ShaderTimings::new();
+        if msl.is_empty() {
+            log::warn!(target: LOG_TARGET, "CompileShaderLibrary: empty source");
+            None
+        } else if entry.is_empty() {
+            log::warn!(target: LOG_TARGET, "CompileShaderLibrary: empty entry name");
+            None
+        } else {
+            crate::metal::compile_shader_library(device_handle, msl, stage_tag, entry, timings)
+        }
+    });
+    let Some((library, func)) = result else {
         error!(target: LOG_TARGET, "encoder: CompileShaderLibrary failed (stage={stage_tag:?}, entry={entry})");
         return None;
-    }
-    Some(StageLibHandles {
-        library: params.library_handle,
-        func: params.fn_handle,
-    })
+    };
+    Some(StageLibHandles { library, func })
 }
 
 /// Issue a single bulk-destroy thunk.
@@ -8467,7 +8463,7 @@ fn encoder_thread_main(
     startup: &crate::encoder_service::EncoderStartup,
     initialize: impl FnOnce(&crate::encoder_service::EncoderStartup) -> std::io::Result<FrameEncoder>,
 ) {
-    let mut enc = match initialize(startup) {
+    let mut enc = match autoreleasepool(|_| initialize(startup)) {
         Ok(enc) => enc,
         Err(error) => {
             let _ = ready.send(Err(error));
@@ -8496,166 +8492,182 @@ fn encoder_thread_main(
     // miss-compiles can therefore never duplicate a shader the prewarm
     // is about to deliver. Disconnection releases the barrier but cannot
     // authorize writes: prewarm may never have validated the cache file.
-    if let Some(warm) = mtld3d_core::shader_prewarm::receive(prewarm_rx) {
-        enc.ingest_warm_cache(warm, false);
-    } else {
-        enc.ingest_warm_cache(WarmCache::empty(), true);
-    }
+    let warm = mtld3d_core::shader_prewarm::receive(prewarm_rx);
+    autoreleasepool(|_| {
+        if let Some(warm) = warm {
+            enc.ingest_warm_cache(warm, false);
+        } else {
+            enc.ingest_warm_cache(WarmCache::empty(), true);
+        }
+    });
 
     loop {
-        match receiver.recv() {
-            Ok(EncoderMessage::Encoded { frame, done }) => {
-                if enc.failed_replay.is_some() {
-                    frame.report_failure();
-                    if let Some(done) = done {
-                        let _ = done.send(mtld3d_types::D3DERR_INVALIDCALL);
-                    }
-                    continue;
-                }
-                // SAFETY: admission retained the immutable PE packet until its decoder's
-                // final replay guard or rejection guard publishes completion.
-                let mut decode_cycles = 0;
-                let decoded = {
-                    let _decode = mtld3d_core::perf::CycleSetTimer::start(&raw mut decode_cycles);
-                    // SAFETY: the admitted packet retains every borrowed range through replay.
-                    unsafe { frame.decode() }
-                };
-                let status = match decoded {
-                    Ok(decoded) => {
-                        enc.runtime_failure_ptr = frame.failure_ptr;
-                        frame_counter += 1;
-                        if frame.mode != EncoderSubmitMode::Queue {
-                            enc.drain_submit_thread();
+        let message = receiver.recv();
+        let shutdown = autoreleasepool(|_| {
+            match message {
+                Ok(EncoderMessage::Encoded { frame, done }) => {
+                    if enc.failed_replay.is_some() {
+                        frame.report_failure();
+                        if let Some(done) = done {
+                            let _ = done.send(mtld3d_types::D3DERR_INVALIDCALL);
                         }
-                        let replay = run_frame_bracketed(
-                            &mut enc,
-                            decoded,
-                            frame_counter,
-                            decode_cycles,
-                            &mut queries,
-                            &frame,
-                            if frame.mode == EncoderSubmitMode::Queue {
-                                SubmitMode::Async
-                            } else {
-                                SubmitMode::Sync
-                            },
-                        );
-                        if let Err(error) = replay {
-                            error!(target: LOG_TARGET, "encoder: internal command replay failed: {error:?}");
-                            mtld3d_types::D3DERR_INVALIDCALL
-                        } else {
+                        return false;
+                    }
+                    // SAFETY: admission retained the immutable PE packet until its decoder's
+                    // final replay guard or rejection guard publishes completion.
+                    let mut decode_cycles = 0;
+                    let decoded = {
+                        let _decode =
+                            mtld3d_core::perf::CycleSetTimer::start(&raw mut decode_cycles);
+                        // SAFETY: the admitted packet retains every borrowed range through replay.
+                        unsafe { frame.decode() }
+                    };
+                    let status = match decoded {
+                        Ok(decoded) => {
+                            enc.runtime_failure_ptr = frame.failure_ptr;
+                            frame_counter += 1;
                             if frame.mode != EncoderSubmitMode::Queue {
-                                enc.set_present_wait_policy(PresentWaitPolicy::WaitForCommit);
+                                enc.drain_submit_thread();
                             }
-                            if frame.mode == EncoderSubmitMode::WaitForGpu {
-                                enc.wait_for_gpu_idle();
-                                enc.drain_retired_resource_retention();
-                                enc.release_acknowledged_uploads();
-                            }
-                            if frame.mode == EncoderSubmitMode::Queue {
-                                mtld3d_types::D3D_OK
-                            } else {
-                                enc.last_submit_status
-                            }
-                        }
-                    }
-                    Err(error) => {
-                        error!(target: LOG_TARGET, "encoder: rejecting invalid frame packet: {error:?}");
-                        mtld3d_types::D3DERR_INVALIDCALL
-                    }
-                };
-                if status != mtld3d_types::D3D_OK {
-                    frame.report_failure();
-                }
-                if let Some(done) = done {
-                    let _ = done.send(status);
-                }
-            }
-            Ok(EncoderMessage::DrainRetiredNow(done)) => {
-                if enc.failed_replay.is_some() {
-                    drop(done);
-                    continue;
-                }
-                mtld3d_shared::crumb!("phase:RecvDrain");
-                // Cheap tier: no barrier needed. A resource retired at seq N
-                // whose async submit is still in flight has seq > coherent
-                // (coherent only advances on GPU completion of committed
-                // work), so the seq-gated drain can't free it early.
-                enc.drain_retired_resource_retention();
-                enc.release_acknowledged_uploads();
-                let _ = done.send(());
-            }
-            Ok(EncoderMessage::IntakeVisibilityFor { target_seq, done }) => {
-                if enc.failed_replay.is_some() {
-                    drop(done);
-                    continue;
-                }
-                mtld3d_shared::crumb!("phase:RecvVisIn");
-                mtld3d_shared::crumb!("vis:drainbeg", target_seq);
-                // The cmdbuf carrying the END query must be committed (in the
-                // unix-side PENDING_CMDBUFS registry) before WaitForGpuRetire,
-                // so drain any in-flight async submits first.
-                enc.drain_submit_thread();
-                mtld3d_shared::crumb!("vis:drainend", target_seq);
-                if target_seq != 0 && enc.coherent_seq_ptr != 0 {
-                    // SAFETY: `coherent_seq_ptr` is a PE-heap
-                    // `Arc<AtomicU64>` raw pointer kept alive by the
-                    // device-side `Arc`; nonzero here means the
-                    // encoder has been wired up.
-                    let coh =
-                        unsafe { SharedCounter::new(enc.coherent_seq_ptr) }.load(Ordering::Acquire);
-                    if coh < target_seq {
-                        let mut params = WaitForGpuRetireParams {
-                            record_handle: enc.record_handle,
-                            target_seq,
-                            coherent_seq_ptr: enc.coherent_seq_ptr,
-                            // Query results are written by the draw buffer
-                            // alone, and nothing is destroyed on this wait.
-                            upload_coherent_seq_ptr: 0,
-                            failed_submit_seq_ptr: enc.failed_seq_ptr,
-                        };
-                        mtld3d_shared::crumb!("vis:retirebeg", target_seq, coh);
-                        let status = native_call(&mut params);
-                        if status != 0 {
-                            error!(
-                                target: LOG_TARGET,
-                                "encoder: WaitForGpuRetire(target_seq={target_seq}) failed status={status:#x}; the visibility counts read next may miss the queries of that frame"
+                            let replay = run_frame_bracketed(
+                                &mut enc,
+                                decoded,
+                                frame_counter,
+                                decode_cycles,
+                                &mut queries,
+                                &frame,
+                                if frame.mode == EncoderSubmitMode::Queue {
+                                    SubmitMode::Async
+                                } else {
+                                    SubmitMode::Sync
+                                },
                             );
+                            if let Err(error) = replay {
+                                error!(target: LOG_TARGET, "encoder: internal command replay failed: {error:?}");
+                                mtld3d_types::D3DERR_INVALIDCALL
+                            } else {
+                                if frame.mode != EncoderSubmitMode::Queue {
+                                    enc.set_present_wait_policy(PresentWaitPolicy::WaitForCommit);
+                                }
+                                if frame.mode == EncoderSubmitMode::WaitForGpu {
+                                    enc.wait_for_gpu_idle();
+                                    enc.drain_retired_resource_retention();
+                                    enc.release_acknowledged_uploads();
+                                }
+                                if frame.mode == EncoderSubmitMode::Queue {
+                                    mtld3d_types::D3D_OK
+                                } else {
+                                    enc.last_submit_status
+                                }
+                            }
                         }
-                        mtld3d_shared::crumb!("vis:retireend", target_seq);
+                        Err(error) => {
+                            error!(target: LOG_TARGET, "encoder: rejecting invalid frame packet: {error:?}");
+                            mtld3d_types::D3DERR_INVALIDCALL
+                        }
+                    };
+                    if status != mtld3d_types::D3D_OK {
+                        frame.report_failure();
+                    }
+                    if let Some(done) = done {
+                        let _ = done.send(status);
                     }
                 }
-                enc.intake_visibility();
-                let _ = done.send(());
-            }
-            Ok(EncoderMessage::Reset {
-                retired_textures,
-                ack,
-            }) => {
-                if enc.failed_replay.is_some() {
-                    drop(ack);
-                    continue;
+                Ok(EncoderMessage::DrainRetiredNow(done)) => {
+                    if enc.failed_replay.is_some() {
+                        drop(done);
+                        return false;
+                    }
+                    mtld3d_shared::crumb!("phase:RecvDrain");
+                    // Cheap tier: no barrier needed. A resource retired at seq N
+                    // whose async submit is still in flight has seq > coherent
+                    // (coherent only advances on GPU completion of committed
+                    // work), so the seq-gated drain can't free it early.
+                    enc.drain_retired_resource_retention();
+                    enc.release_acknowledged_uploads();
+                    let _ = done.send(());
                 }
-                mtld3d_shared::crumb!("phase:RecvReset");
-                // Commit every in-flight async frame, and present every
-                // frame already queued, before the reset tears down /
-                // recreates the backbuffer + depth they reference.
-                enc.drain_submit_thread();
-                enc.drain_presentation();
-                enc.reset_cleanup(&retired_textures);
-                let _ = ack.send(());
+                Ok(EncoderMessage::IntakeVisibilityFor { target_seq, done }) => {
+                    if enc.failed_replay.is_some() {
+                        drop(done);
+                        return false;
+                    }
+                    mtld3d_shared::crumb!("phase:RecvVisIn");
+                    mtld3d_shared::crumb!("vis:drainbeg", target_seq);
+                    // The cmdbuf carrying the END query must be committed (in the
+                    // unix-side PENDING_CMDBUFS registry) before WaitForGpuRetire,
+                    // so drain any in-flight async submits first.
+                    enc.drain_submit_thread();
+                    mtld3d_shared::crumb!("vis:drainend", target_seq);
+                    if target_seq != 0 && enc.coherent_seq_ptr != 0 {
+                        // SAFETY: `coherent_seq_ptr` is a PE-heap
+                        // `Arc<AtomicU64>` raw pointer kept alive by the
+                        // device-side `Arc`; nonzero here means the
+                        // encoder has been wired up.
+                        let coh = unsafe { SharedCounter::new(enc.coherent_seq_ptr) }
+                            .load(Ordering::Acquire);
+                        if coh < target_seq {
+                            let mut params = WaitForGpuRetireParams {
+                                record_handle: enc.record_handle,
+                                target_seq,
+                                coherent_seq_ptr: enc.coherent_seq_ptr,
+                                // Query results are written by the draw buffer
+                                // alone, and nothing is destroyed on this wait.
+                                upload_coherent_seq_ptr: 0,
+                                failed_submit_seq_ptr: enc.failed_seq_ptr,
+                            };
+                            mtld3d_shared::crumb!("vis:retirebeg", target_seq, coh);
+                            let status = native_call(&mut params);
+                            if status != 0 {
+                                error!(
+                                    target: LOG_TARGET,
+                                    "encoder: WaitForGpuRetire(target_seq={target_seq}) failed status={status:#x}; the visibility counts read next may miss the queries of that frame"
+                                );
+                            }
+                            mtld3d_shared::crumb!("vis:retireend", target_seq);
+                        }
+                    }
+                    enc.intake_visibility();
+                    let _ = done.send(());
+                }
+                Ok(EncoderMessage::Reset {
+                    retired_textures,
+                    ack,
+                }) => {
+                    if enc.failed_replay.is_some() {
+                        drop(ack);
+                        return false;
+                    }
+                    mtld3d_shared::crumb!("phase:RecvReset");
+                    // Commit every in-flight async frame, and present every
+                    // frame already queued, before the reset tears down /
+                    // recreates the backbuffer + depth they reference.
+                    enc.drain_submit_thread();
+                    enc.drain_presentation();
+                    enc.reset_cleanup(&retired_textures);
+                    let _ = ack.send(());
+                }
+                Ok(EncoderMessage::Shutdown) | Err(_) => {
+                    mtld3d_shared::crumb!("phase:RecvSd");
+                    // Commit every in-flight async frame, and present every
+                    // frame already queued, before destroying resources the
+                    // submit thread or the presenter may still be reading. The
+                    // submit thread itself exits when `enc` (and its work-channel
+                    // sender) drops on return from this function.
+                    enc.drain_submit_thread();
+                    enc.drain_presentation();
+                    enc.shutdown_cleanup();
+                    enc.perf.finish_deferred();
+                    return true;
+                }
             }
-            Ok(EncoderMessage::Shutdown) | Err(_) => {
-                mtld3d_shared::crumb!("phase:RecvSd");
-                // Commit every in-flight async frame, and present every
-                // frame already queued, before destroying resources the
-                // submit thread or the presenter may still be reading. The
-                // submit thread itself exits when `enc` (and its work-channel
-                // sender) drops on return from this function.
-                enc.drain_submit_thread();
-                enc.drain_presentation();
-                enc.shutdown_cleanup();
-                enc.perf.finish_deferred();
+            false
+        });
+        if shutdown {
+            autoreleasepool(|_| {
+                // Closing the sender lets the drained submit worker exit. Keep the
+                // device retained until that worker has joined as well.
+                let device = Retained::clone(&enc.device);
                 let submit_thread = enc.submit_thread.take();
                 drop(enc);
                 if let Some(handle) = submit_thread
@@ -8663,8 +8675,9 @@ fn encoder_thread_main(
                 {
                     error!(target: LOG_TARGET, "encoder: submit worker panicked during shutdown");
                 }
-                return;
-            }
+                drop(device);
+            });
+            return;
         }
     }
 }
