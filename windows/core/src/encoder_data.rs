@@ -1539,16 +1539,6 @@ impl FrameData {
             .capture_buffer_warmup(&mut self.scratch, entry);
     }
 
-    /// Queue a texture-staging `MTLBuffer` wrap.
-    ///
-    /// Called per mip from `IDirect3DDevice9::CreateTexture` on the API
-    /// thread for textures that go through the blit-upload path.
-    pub fn push_staging_warmup(&mut self, entry: StagingWarmupEntry) {
-        self.recorder
-            .get_or_insert_with(crate::encoder_packet::FrameRecorder::new)
-            .capture_staging_warmup(&mut self.scratch, entry);
-    }
-
     pub fn push_vbib_retention(&mut self, entry: PendingVbibRetention) {
         self.recorder
             .get_or_insert_with(crate::encoder_packet::FrameRecorder::new)

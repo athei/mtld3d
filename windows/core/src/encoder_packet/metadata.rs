@@ -151,13 +151,22 @@ impl FrameRecorder {
         tag: mtld3d_shared::encoder_protocol::EncoderOpcode,
         value: T,
     ) {
+        const {
+            assert!(align_of::<T>() <= mtld3d_shared::command_header::COMMAND_ALIGNMENT);
+        }
         if self.error.is_some() {
             return;
         }
         let result =
             self.slab
                 .push_fixed_record(scratch, tag.into(), 0, size_of::<T>(), |destination| {
-                    crate::encoder_records::write(destination, value)
+                    debug_assert_eq!(destination.len(), size_of::<T>());
+                    debug_assert!(destination.as_ptr().cast::<T>().is_aligned());
+                    // SAFETY: write_command reserves exactly this payload size at command
+                    // alignment. The assertion above bounds T's alignment, and CommandRecord
+                    // requires every byte of value to be initialized, with no implicit padding.
+                    unsafe { destination.as_mut_ptr().cast::<T>().write(value) };
+                    Ok(())
                 });
         match result {
             Ok(()) => self.count += 1,

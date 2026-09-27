@@ -1905,14 +1905,6 @@ impl DeviceInner {
         self.current_frame.push_buffer_warmup(entry);
     }
 
-    /// Queue an eager texture-staging `MTLBuffer` wrap.
-    ///
-    /// Drained after the texture warmup so the parent's `texture_cache`
-    /// entry exists.
-    pub fn push_staging_warmup(&mut self, entry: StagingWarmupEntry) {
-        self.current_frame.push_staging_warmup(entry);
-    }
-
     /// Register a freshly-created `TextureInner` in the live-texture registry.
     ///
     /// So `evict_managed_resources` can iterate live textures. The pointer
@@ -5256,7 +5248,11 @@ fn push_texture_warmups(dev: &mut DeviceInner, inner: &crate::texture::TextureIn
     let info = inner.texture_info();
     let texture_id = info.texture_id;
     let usage_flags = info.usage_flags;
-    dev.push_texture_warmup(&info);
+    let frame = &mut dev.current_frame;
+    let recorder = frame
+        .recorder
+        .get_or_insert_with(mtld3d_core::encoder_packet::FrameRecorder::new);
+    recorder.capture_texture_warmup(&mut frame.scratch, &info);
     if usage_flags.contains(mtld3d_shared::mtl::TextureUsage::RENDER_TARGET) {
         return;
     }
@@ -5264,11 +5260,14 @@ fn push_texture_warmups(dev: &mut DeviceInner, inner: &crate::texture::TextureIn
         if inner.staging_is_dropped(level as usize) {
             continue;
         }
-        dev.push_staging_warmup(StagingWarmupEntry {
-            texture_id,
-            level,
-            keepalive: inner.staging_arc(level as usize),
-        });
+        recorder.capture_staging_warmup(
+            &mut frame.scratch,
+            StagingWarmupEntry {
+                texture_id,
+                level,
+                keepalive: inner.staging_arc(level as usize),
+            },
+        );
     }
 }
 

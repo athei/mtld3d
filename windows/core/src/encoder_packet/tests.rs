@@ -906,3 +906,51 @@ fn failed_recording_retirement_waits_for_explicit_quiescence() {
         address
     );
 }
+
+#[test]
+fn fixed_metadata_records_keep_alignment_across_chunk_rollover() {
+    use crate::{encoder_packet::metadata::LayerPacingRecord, present::LayerPacing};
+
+    let mut frame = empty_frame();
+    frame.scratch = ScratchArena::with_chunk_size(64);
+    let mut recorder = FrameRecorder::new();
+    for layer in 1..=3 {
+        recorder.capture_pacing(
+            &mut frame.scratch,
+            layer,
+            LayerPacing {
+                display_sync: true,
+                max_fps: 60,
+            },
+        );
+    }
+    let mut owner = seal(frame, recorder);
+    assert!(
+        owner.operation_bytes().len() > 16,
+        "fixture crosses command chunks"
+    );
+    let mut packet = admit(&mut owner);
+    let mut seen = 0;
+    let mut alignment_residues = 0;
+    while replay(&mut packet, |command, _, _| {
+        assert!(matches!(command.opcode(), EncoderOpcode::SetLayerPacing));
+        let record = borrow::<LayerPacingRecord>(command.payload())?;
+        seen += 1;
+        assert_eq!(
+            (record.layer, record.display_sync, record.max_fps),
+            (seen, 1, 60)
+        );
+        alignment_residues |= 1 << (command.payload().as_ptr() as usize % 16);
+        Ok(())
+    })
+    .unwrap()
+    {}
+    assert_eq!(seen, 3);
+    assert_eq!(alignment_residues, 1 | (1 << 8));
+    drop(
+        packet
+            .into_frame()
+            .unwrap_or_else(|(error, _)| panic!("complete: {error:?}")),
+    );
+    assert!(owner.maintain());
+}
