@@ -830,10 +830,20 @@ pub extern "C" fn submit_frame_handler(args: *mut c_void) -> i32 {
         return -1;
     };
 
+    submit_frame(&mut params)
+}
+
+/// Submit a finalized frame through the shared native implementation.
+///
+/// Callers keep the storage referenced by `SubmitFrameParams` live until this
+/// synchronous call returns.
+/// The caller supplies an autorelease pool. Keep device-record lookup and status
+/// mapping shared with the PE handler so native submission has the same failure path.
+pub fn submit_frame(params: &mut SubmitFrameParams) -> i32 {
     let Some(record) = device_record(params.record_handle, "SubmitFrame") else {
         return STATUS_UNSUCCESSFUL;
     };
-    if metal::submit_frame(&record, &mut params) {
+    if metal::submit_frame(&record, params) {
         STATUS_SUCCESS
     } else {
         STATUS_UNSUCCESSFUL

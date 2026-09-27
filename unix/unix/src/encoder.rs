@@ -8882,13 +8882,13 @@ fn run_frame(
     Ok(())
 }
 
-/// Finalize the frame, issue the `SubmitFrame` thunk, and recycle the payload.
+/// Finalize the frame, submit it through the native backend, and recycle the payload.
 ///
 /// Split into three seams so the submit stage can run on its own thread:
 ///   * [`finalize_submit`] — encoder-thread work: close passes, apply the
 ///     load/store rules, build descriptors, and swap the per-frame buffers
 ///     out of the encoder into an owned [`FramePayload`] + `params`.
-///   * [`execute_submit`] — the `native_call(SubmitFrame)` itself; reads the
+///   * [`execute_submit`] calls the native backend, reads the
 ///     payload's pointers, returns it for recycling.
 ///   * [`reclaim_payload`] — drain the passes' command vecs back into the
 ///     pool and return the cleared buffers to `payload_pool`.
@@ -8920,7 +8920,7 @@ const fn frame_summary_ctx(owner: &NativeFrame) -> FrameSummaryContext {
 /// from the still-live payload (status / present-wait / drawable-wait are
 /// the most recent submit's — lagged ≤1 frame), then hand the payload to
 /// the submit thread and return so the next frame's build overlaps the
-/// `SubmitFrame` thunk. The `submit_cycles` timer captures only the
+/// native submission. The `submit_cycles` timer captures only the
 /// encoder-side finalize (plus any backpressure wait inside
 /// `acquire_clean_payload`); the unix command-walk and commit are on the
 /// submit thread, the present on the presenter.
@@ -8943,7 +8943,7 @@ fn submit_async(enc: &mut FrameEncoder, frame: Box<NativeFrame>) {
     });
 }
 
-/// Synchronous submit: run the `SubmitFrame` thunk inline and block until it commits.
+/// Submit through the native backend inline and block until it commits.
 ///
 /// Used after a `drain_submit_thread` barrier for the rare paths that need
 /// the command buffer committed before they proceed. The `submit_cycles`
@@ -9147,11 +9147,11 @@ fn finalize_submit(
     (params, payload)
 }
 
-/// Issue the `SubmitFrame` thunk for one finalized frame.
+/// Submit one finalized frame through the native backend.
 ///
 /// `params` carries raw pointers aliasing into `payload`; both are taken
-/// by value so the payload stays alive for the whole thunk, then handed
-/// back for recycling along with what the thunk reported through `params`.
+/// by value so the payload stays alive for the whole submission, then handed
+/// back for recycling along with what the backend reported through `params`.
 /// This is the only part of submit that runs on the dedicated submit thread
 /// in `Async` mode.
 fn execute_submit(
@@ -9159,7 +9159,7 @@ fn execute_submit(
     payload: FramePayload,
     failure_ptr: u64,
 ) -> (FramePayload, SubmitOutcome) {
-    let status = native_call(&mut params);
+    let status = autoreleasepool(|_| crate::handlers::submit_frame(&mut params));
     if status != 0 {
         // SAFETY: the device retains its mailbox until the submit worker joins.
         unsafe {

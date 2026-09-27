@@ -214,6 +214,7 @@ const fn finish_payload(destination: &[u8], at: usize) -> Result<(), WireError> 
     Ok(())
 }
 
+#[inline]
 fn put_bound_vertices(
     destination: &mut [u8],
     at: &mut usize,
