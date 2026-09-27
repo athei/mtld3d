@@ -227,6 +227,58 @@ fn put_bound_vertices(
     }
 }
 
+/// Exact payload extent for one bound vertex stream without indices.
+pub const SINGLE_BOUND_BYTES: usize = size_of::<DrawPrefix>() + size_of::<StreamRecord>();
+/// Exact payload extent for one bound vertex stream with a bound index buffer.
+pub const SINGLE_INDEXED_BOUND_BYTES: usize = SINGLE_BOUND_BYTES + size_of::<IndexBuffer>();
+
+fn put_single_bound(
+    destination: &mut [u8],
+    prefix: DrawPrefix,
+    first: &StreamBinding,
+    stream0_freq: u32,
+) {
+    let mut at = put_prefix(destination, prefix, 1, stream0_freq);
+    put(destination, &mut at, stream_record(first));
+}
+
+/// Write one bound vertex stream directly into its exact final reservation.
+///
+/// # Errors
+/// Returns an error if the prefix requires an index tail.
+pub fn write_single_bound_into(
+    prefix: DrawPrefix,
+    first: &StreamBinding,
+    stream0_freq: u32,
+    destination: &mut [u8; SINGLE_BOUND_BYTES],
+) -> Result<(), WireError> {
+    if prefix.index_kind == 1 {
+        return Err(WireError::InvalidValue);
+    }
+    put_single_bound(destination, prefix, first, stream0_freq);
+    Ok(())
+}
+
+/// Write one bound vertex stream and index buffer into their exact reservation.
+///
+/// # Errors
+/// Returns an error if the prefix does not require an index tail.
+pub fn write_single_indexed_bound_into(
+    prefix: DrawPrefix,
+    first: &StreamBinding,
+    stream0_freq: u32,
+    index: &IndexBuffer,
+    destination: &mut [u8; SINGLE_INDEXED_BOUND_BYTES],
+) -> Result<(), WireError> {
+    if prefix.index_kind != 1 {
+        return Err(WireError::InvalidValue);
+    }
+    let (vertices, indices) = destination.split_at_mut(SINGLE_BOUND_BYTES);
+    put_single_bound(vertices, prefix, first, stream0_freq);
+    put_bound_index(indices, &mut 0, index);
+    Ok(())
+}
+
 /// Extent of an ordinary bound draw, without generic vertex or index dispatch.
 ///
 /// # Errors

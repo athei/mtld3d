@@ -319,6 +319,134 @@ fn invalid_constant_capture_latches_error_without_publishing_a_command() {
 }
 
 #[test]
+fn single_stream_records_match_checked_writer_and_reuse_failed_rollover() {
+    use mtld3d_shared::mtl::{IndexType, PrimitiveType};
+
+    use crate::{
+        draw_data::{ExtraStreams, StreamBinding},
+        encoder_draw::draw_record::{
+            BoundVertices, DrawPrefix, IndexBuffer, bound_payload_size, write_bound_into,
+        },
+    };
+
+    for index_kind in [None, Some(IndexType::UInt16), Some(IndexType::UInt32)] {
+        for owned_empty in [false, true] {
+            let vertices = BoundVertices {
+                first: StreamBinding {
+                    stream: 7,
+                    buffer_id: BufferId::new_unique(),
+                    backing_ptr: 0x1234,
+                    backing_len: 8192,
+                    backing_generation: 91,
+                    offset: 12,
+                    stride: 24,
+                    freq: 0x4000_0011,
+                },
+                extra: if owned_empty {
+                    ExtraStreams::Owned(Box::new([]))
+                } else {
+                    ExtraStreams::EMPTY
+                },
+                stream0_freq: 0x8000_0003,
+            };
+            let index = index_kind.map(|kind| IndexBuffer {
+                buffer: BufferId::new_unique().raw(),
+                address: 0x5678,
+                length: 4096,
+                generation: 123,
+                offset: 16,
+                kind: kind as u8,
+                reserved: [0; 3],
+            });
+            let prefix = |indexed| {
+                if indexed {
+                    DrawPrefix::indexed(PrimitiveType::Triangle, i32::MIN, 9)
+                } else {
+                    DrawPrefix::nonindexed(PrimitiveType::Triangle, u32::MAX - 9, 9)
+                }
+            };
+            let length = bound_payload_size(&vertices, index.as_ref()).unwrap();
+            let mut expected = vec![0xcc; length];
+            write_bound_into(
+                prefix(index.is_some()),
+                &vertices,
+                index.as_ref(),
+                &mut expected,
+                length,
+            )
+            .unwrap();
+            let command_bytes = length + mtld3d_shared::command_header::COMMAND_HEADER_BYTES;
+            let mut scratch = ScratchArena::with_chunk_size(command_bytes);
+            let mut recorder = FrameRecorder::new();
+            recorder
+                .record_bound_draw(
+                    &mut scratch,
+                    prefix(index.is_some()),
+                    &vertices,
+                    index.as_ref(),
+                )
+                .unwrap();
+            let committed: Vec<_> = recorder.slab.ranges().collect();
+            assert_eq!(committed.len(), 1);
+            let used = scratch.bytes_used();
+            assert_eq!(
+                recorder.record_bound_draw(
+                    &mut scratch,
+                    prefix(index.is_none()),
+                    &vertices,
+                    index.as_ref(),
+                ),
+                Err(WireError::InvalidValue)
+            );
+            assert_eq!(scratch.bytes_used(), used);
+            assert_eq!(recorder.slab.ranges().collect::<Vec<_>>(), committed);
+            assert_eq!(recorder.len(), 1);
+            // SAFETY: the live recorder and arena retain this unchanged committed region.
+            let mut cursor =
+                unsafe { replay::CommandCursor::new(recorder.slab.descriptor_bytes()) }.unwrap();
+            // SAFETY: the initialized region remains owned and immutable through this read.
+            let record = unsafe { cursor.next_record() }.unwrap().unwrap();
+            assert_eq!(record.payload, expected);
+            assert_eq!(
+                recorder.record_bound_draw(
+                    &mut scratch,
+                    prefix(index.is_some()),
+                    &vertices,
+                    index.as_ref(),
+                ),
+                Err(WireError::InvalidValue)
+            );
+            assert_eq!(scratch.bytes_used(), used);
+            recorder.reset();
+            scratch.clear();
+            for _ in 0..2 {
+                recorder
+                    .record_bound_draw(
+                        &mut scratch,
+                        prefix(index.is_some()),
+                        &vertices,
+                        index.as_ref(),
+                    )
+                    .unwrap();
+            }
+            let reused: Vec<_> = recorder.slab.ranges().collect();
+            assert_eq!(reused.len(), 2);
+            assert_eq!(reused[0], committed[0]);
+            assert_eq!(scratch.chunk_count(), 2);
+            // SAFETY: both completed records remain owned by the live recorder and arena.
+            let mut cursor =
+                unsafe { replay::CommandCursor::new(recorder.slab.descriptor_bytes()) }.unwrap();
+            for _ in 0..2 {
+                // SAFETY: the same immutable command regions remain retained during iteration.
+                let record = unsafe { cursor.next_record() }.unwrap().unwrap();
+                assert_eq!(record.payload, expected);
+            }
+            assert!(cursor.is_complete());
+        }
+    }
+}
+
+#[test]
 fn capture_failure_survives_later_snapshot_draw_and_owned_control() {
     use crate::draw_data::{DrawOp, ExtraStreams, IndexSource, StreamBinding, VertexSource};
 

@@ -376,20 +376,62 @@ impl FrameRecorder {
         vertices: &crate::encoder_draw::draw_record::BoundVertices,
         indices: Option<&crate::encoder_draw::draw_record::IndexBuffer>,
     ) -> Result<(), WireError> {
-        use crate::encoder_draw::draw_record::{bound_payload_size, write_bound_into};
+        use crate::encoder_draw::draw_record::{
+            SINGLE_BOUND_BYTES, SINGLE_INDEXED_BOUND_BYTES, bound_payload_size, write_bound_into,
+            write_single_bound_into, write_single_indexed_bound_into,
+        };
 
         if let Some(error) = self.error {
             return Err(error);
         }
-        let result = bound_payload_size(vertices, indices).and_then(|length| {
-            self.slab.push_fixed_record(
-                scratch,
-                u16::from(EncoderOpcode::Draw),
-                0,
-                length,
-                |destination| write_bound_into(prefix, vertices, indices, destination, length),
-            )
-        });
+        let result = if vertices.extra.is_empty() {
+            if let Some(index) = indices {
+                self.slab.push_fixed_record(
+                    scratch,
+                    u16::from(EncoderOpcode::Draw),
+                    0,
+                    SINGLE_INDEXED_BOUND_BYTES,
+                    |destination| {
+                        write_single_indexed_bound_into(
+                            prefix,
+                            &vertices.first,
+                            vertices.stream0_freq,
+                            index,
+                            destination
+                                .try_into()
+                                .map_err(|_| WireError::InvalidValue)?,
+                        )
+                    },
+                )
+            } else {
+                self.slab.push_fixed_record(
+                    scratch,
+                    u16::from(EncoderOpcode::Draw),
+                    0,
+                    SINGLE_BOUND_BYTES,
+                    |destination| {
+                        write_single_bound_into(
+                            prefix,
+                            &vertices.first,
+                            vertices.stream0_freq,
+                            destination
+                                .try_into()
+                                .map_err(|_| WireError::InvalidValue)?,
+                        )
+                    },
+                )
+            }
+        } else {
+            bound_payload_size(vertices, indices).and_then(|length| {
+                self.slab.push_fixed_record(
+                    scratch,
+                    u16::from(EncoderOpcode::Draw),
+                    0,
+                    length,
+                    |destination| write_bound_into(prefix, vertices, indices, destination, length),
+                )
+            })
+        };
         self.finish_record(result)
     }
 
