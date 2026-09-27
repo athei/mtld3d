@@ -4,13 +4,12 @@
 ///
 /// `record_bytes` excludes alignment padding. Only the allocating runtime writes
 /// records before admission seals the frame. The next record begins at the
-/// following 16-byte boundary within the same retained command region.
-#[repr(C, align(16))]
+/// following eight-byte boundary within the same retained command region.
+#[repr(C)]
 pub struct CommandHeader {
     pub opcode: u16,
     pub operand: u16,
     pub record_bytes: u32,
-    pub reserved: u64,
 }
 
 /// One contiguous command region, borrowed until the frame lease ends.
@@ -21,13 +20,17 @@ pub struct CommandRegion {
     pub reserved: u32,
 }
 
-pub const COMMAND_HEADER_BYTES: usize = 16;
+/// Command storage aligns the payload independently of the four-byte header alignment.
+pub const COMMAND_ALIGNMENT: usize = 8;
+pub const COMMAND_HEADER_BYTES: usize = 8;
 pub const COMMAND_REGION_BYTES: usize = 16;
 
 const _: () = {
     assert!(cfg!(target_endian = "little"));
     assert!(size_of::<CommandHeader>() == COMMAND_HEADER_BYTES);
-    assert!(align_of::<CommandHeader>() == 16);
+    assert!(align_of::<CommandHeader>() == 4);
+    assert!(COMMAND_ALIGNMENT.is_power_of_two());
+    assert!(COMMAND_HEADER_BYTES.is_multiple_of(COMMAND_ALIGNMENT));
     assert!(size_of::<CommandRegion>() == COMMAND_REGION_BYTES);
     assert!(align_of::<CommandRegion>() == 8);
     assert!(core::mem::offset_of!(CommandRegion, address) == 0);
@@ -36,5 +39,4 @@ const _: () = {
     assert!(core::mem::offset_of!(CommandHeader, opcode) == 0);
     assert!(core::mem::offset_of!(CommandHeader, operand) == 2);
     assert!(core::mem::offset_of!(CommandHeader, record_bytes) == 4);
-    assert!(core::mem::offset_of!(CommandHeader, reserved) == 8);
 };

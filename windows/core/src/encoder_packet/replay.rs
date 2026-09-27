@@ -1,6 +1,8 @@
 //! Replay of matched-producer command records while their frame lease remains live.
 
-use mtld3d_shared::command_header::{COMMAND_HEADER_BYTES, CommandHeader, CommandRegion};
+use mtld3d_shared::command_header::{
+    COMMAND_ALIGNMENT, COMMAND_HEADER_BYTES, CommandHeader, CommandRegion,
+};
 
 use super::{DrawReader, EncoderOpcode, NativeFrame, ReplayCompletion, WireError};
 
@@ -194,11 +196,11 @@ impl CommandCursor {
             let length = descriptor.used_bytes;
             if descriptor.reserved != 0
                 || length == 0
-                || !(length as usize).is_multiple_of(align_of::<CommandHeader>())
+                || !(length as usize).is_multiple_of(COMMAND_ALIGNMENT)
             {
                 return Err(WireError::InvalidValue);
             }
-            super::validate_range(address, u64::from(length), align_of::<CommandHeader>())?;
+            super::validate_range(address, u64::from(length), COMMAND_ALIGNMENT)?;
             self.table_offset += mtld3d_shared::command_header::COMMAND_REGION_BYTES;
             self.region_address = address;
             self.region_bytes = length;
@@ -213,11 +215,11 @@ impl CommandCursor {
         // the matched producer retains its initialized typed allocation through final submit.
         let header = unsafe { &*(address as *const CommandHeader) };
         let length = header.record_bytes;
-        if (length as usize) < COMMAND_HEADER_BYTES || header.reserved != 0 {
+        if (length as usize) < COMMAND_HEADER_BYTES {
             return Err(WireError::InvalidValue);
         }
         let alignment_mask =
-            u32::try_from(align_of::<CommandHeader>() - 1).map_err(|_| WireError::TooLarge)?;
+            u32::try_from(COMMAND_ALIGNMENT - 1).map_err(|_| WireError::TooLarge)?;
         let stride = length
             .checked_add(alignment_mask)
             .ok_or(WireError::TooLarge)?

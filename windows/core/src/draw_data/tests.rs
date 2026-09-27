@@ -1,3 +1,5 @@
+use mtld3d_shared::command_header::COMMAND_HEADER_BYTES;
+
 use super::*;
 use crate::encoder_draw::{
     draw_payload_size,
@@ -38,7 +40,12 @@ fn decoded_extra_streams_borrow_command_bytes_and_preserve_order() {
         })
         .unwrap();
     // SAFETY: the arena retains this initialized fixed payload through every view below.
-    let bytes = unsafe { core::slice::from_raw_parts((first.address + 16) as *const u8, size) };
+    let bytes = unsafe {
+        core::slice::from_raw_parts(
+            (first.address + COMMAND_HEADER_BYTES as u64) as *const u8,
+            size,
+        )
+    };
     let restored = DrawView::new(bytes).unwrap();
     let VertexView::Bound { records, .. } = restored.vertices().unwrap() else {
         unreachable!()

@@ -1,3 +1,5 @@
+use mtld3d_shared::command_header::COMMAND_HEADER_BYTES;
+
 use super::*;
 use crate::{draw_data::ExtraStreams, ids::BufferId, scratch::ScratchArena};
 
@@ -23,7 +25,12 @@ fn encode<'a>(draw: &DrawOp, arena: &'a mut ScratchArena) -> &'a [u8] {
         })
         .unwrap();
     // SAFETY: arena owns the complete initialized payload until this borrow ends.
-    unsafe { core::slice::from_raw_parts((command.address + 16) as *const u8, size) }
+    unsafe {
+        core::slice::from_raw_parts(
+            (command.address + COMMAND_HEADER_BYTES as u64) as *const u8,
+            size,
+        )
+    }
 }
 
 fn stream(index: u8) -> StreamBinding {
@@ -86,62 +93,71 @@ fn all_index_sources_use_actual_fixed_views() {
         },
     ];
     for (kind, indices) in fixtures.into_iter().enumerate() {
-        let mut arena = ScratchArena::new();
         let draw = bound(indices);
-        let payload = encode(&draw, &mut arena);
-        let view = DrawView::new(payload).unwrap();
-        assert_eq!(view.metal_primitive().unwrap(), PrimitiveType::Triangle);
-        match (kind, view.indices().unwrap()) {
-            (
-                0,
-                IndexView::None {
-                    start_vertex,
-                    vertex_count,
-                },
-            ) => assert_eq!((start_vertex, vertex_count), (2, 3)),
-            (
-                1,
-                IndexView::Bound {
-                    record,
-                    index_count,
-                    base_vertex,
-                },
-            ) => {
-                assert_eq!(
-                    (record.generation, record.offset, index_count, base_vertex),
-                    (9, 4, 3, -2)
-                );
-                assert_eq!(record.index_type().unwrap(), IndexType::UInt16);
+        for prefix_commands in 0..2 {
+            let mut arena = ScratchArena::new();
+            if prefix_commands != 0 {
+                arena.write_command(1, 0, 0, |_| Ok(0)).unwrap();
             }
-            (
-                2,
-                IndexView::Fan {
-                    start_vertex,
-                    primitive_count,
-                },
-            ) => assert_eq!((start_vertex, primitive_count), (5, 2)),
-            (
-                3,
-                IndexView::Generated {
-                    record,
-                    index_count,
-                    min_vertex,
-                },
-            ) => assert_eq!((record.maximum, index_count, min_vertex), (2, 3, 0)),
-            (
-                4,
-                IndexView::Up {
-                    record,
-                    index_count,
-                },
-            ) => {
-                assert_eq!(record.length, 6);
-                assert_eq!(index_count, 3);
+            let payload = encode(&draw, &mut arena);
+            assert_eq!(
+                payload.as_ptr() as usize % 16,
+                (prefix_commands + 1) % 2 * 8
+            );
+            let view = DrawView::new(payload).unwrap();
+            assert_eq!(view.metal_primitive().unwrap(), PrimitiveType::Triangle);
+            match (kind, view.indices().unwrap()) {
+                (
+                    0,
+                    IndexView::None {
+                        start_vertex,
+                        vertex_count,
+                    },
+                ) => assert_eq!((start_vertex, vertex_count), (2, 3)),
+                (
+                    1,
+                    IndexView::Bound {
+                        record,
+                        index_count,
+                        base_vertex,
+                    },
+                ) => {
+                    assert_eq!(
+                        (record.generation, record.offset, index_count, base_vertex),
+                        (9, 4, 3, -2)
+                    );
+                    assert_eq!(record.index_type().unwrap(), IndexType::UInt16);
+                }
+                (
+                    2,
+                    IndexView::Fan {
+                        start_vertex,
+                        primitive_count,
+                    },
+                ) => assert_eq!((start_vertex, primitive_count), (5, 2)),
+                (
+                    3,
+                    IndexView::Generated {
+                        record,
+                        index_count,
+                        min_vertex,
+                    },
+                ) => assert_eq!((record.maximum, index_count, min_vertex), (2, 3, 0)),
+                (
+                    4,
+                    IndexView::Up {
+                        record,
+                        index_count,
+                    },
+                ) => {
+                    assert_eq!(record.length, 6);
+                    assert_eq!(index_count, 3);
+                }
+                _ => panic!("wrong fixed index variant"),
             }
-            _ => panic!("wrong fixed index variant"),
-        }
-        for length in 0..payload.len() {
-            assert!(DrawView::new(&payload[..length]).is_err());
+            for length in 0..payload.len() {
+                assert!(DrawView::new(&payload[..length]).is_err());
+            }
         }
     }
 }

@@ -1,4 +1,7 @@
-use mtld3d_shared::encoder_wire::{WireError, WireReader};
+use mtld3d_shared::{
+    command_header::COMMAND_HEADER_BYTES,
+    encoder_wire::{WireError, WireReader},
+};
 
 use super::{DrawReader, DrawWriter, SnapshotAttributes, SnapshotDelta};
 use crate::{
@@ -47,7 +50,12 @@ fn encode_snapshot<'a>(arena: &'a mut ScratchArena, delta: &SnapshotDelta<'_>) -
         .unwrap();
     let pointer = usize::try_from(allocation.address).unwrap() as *const u8;
     // SAFETY: the arena retains this initialized immutable payload for the returned borrow.
-    unsafe { std::slice::from_raw_parts(pointer.wrapping_add(16), allocation.record_bytes - 16) }
+    unsafe {
+        std::slice::from_raw_parts(
+            pointer.wrapping_add(COMMAND_HEADER_BYTES),
+            allocation.record_bytes - COMMAND_HEADER_BYTES,
+        )
+    }
 }
 
 #[test]
@@ -353,8 +361,34 @@ fn complete_snapshot_borrows_canonical_leaves_and_reconstructs_only_native_roots
     assert_eq!(&payload[4..8], &[0; 4]);
     assert_eq!(payload[8 + 35], 0);
     let mut second = ScratchArena::new();
+    let prefix = second.write_command(1, 0, 0, |_| Ok(0)).unwrap();
+    assert_eq!(prefix.region_bytes, COMMAND_HEADER_BYTES);
     let second_payload = encode_snapshot(&mut second, &full_delta(restored));
+    assert_eq!(payload.as_ptr() as usize % 16, 8);
+    assert_eq!(second_payload.as_ptr() as usize % 16, 0);
     assert_eq!(payload, second_payload);
+    let mut second_native = ScratchArena::new();
+    // SAFETY: both source arenas retain all referenced bytes and records throughout the decode.
+    let mut second_decoder = unsafe { DrawReader::new() };
+    // SAFETY: the second arena retains the complete typed snapshot after an eight-byte command.
+    let second_snapshot =
+        unsafe { second_decoder.decode_snapshot(second_payload, &mut second_native) }.unwrap();
+    // SAFETY: second_native retains the initialized root through the following token reads.
+    let second_snapshot = unsafe { &*second_snapshot.as_ptr() };
+    assert_eq!(
+        second_snapshot
+            .stage_bindings
+            .as_ref()
+            .unwrap()
+            .iter()
+            .count(),
+        16
+    );
+    assert_eq!(second_snapshot.attrs.as_ref().unwrap().as_slice().len(), 16);
+    assert_eq!(
+        vs_address(second_snapshot.vs.unwrap().as_ref()) as usize % 8,
+        0
+    );
 }
 
 fn captured(bytes: &'static [u8]) -> ScratchSlice {

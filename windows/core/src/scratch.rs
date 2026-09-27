@@ -199,7 +199,7 @@ impl ScratchArena {
         fill: impl FnOnce(&mut [u8]) -> Result<usize, mtld3d_shared::encoder_wire::WireError>,
     ) -> Result<CommandAllocation, mtld3d_shared::encoder_wire::WireError> {
         use mtld3d_shared::{
-            command_header::{COMMAND_HEADER_BYTES, CommandHeader},
+            command_header::{COMMAND_ALIGNMENT, COMMAND_HEADER_BYTES, CommandHeader},
             encoder_wire::WireError,
         };
         let bound = payload_bound
@@ -208,7 +208,11 @@ impl ScratchArena {
         if bound > u32::MAX as usize || bound > isize::MAX as usize {
             return Err(WireError::TooLarge);
         }
-        let reserved = bound.checked_add(15).ok_or(WireError::TooLarge)? & !15;
+        let alignment_mask = COMMAND_ALIGNMENT - 1;
+        let reserved = bound
+            .checked_add(alignment_mask)
+            .ok_or(WireError::TooLarge)?
+            & !alignment_mask;
         let index = if let Some(index) = self.command_chunk
             && reserved <= self.chunks[index].len() - self.chunks[index].used
         {
@@ -232,20 +236,11 @@ impl ScratchArena {
             return Err(WireError::TooLarge);
         }
         let used = payload_used + COMMAND_HEADER_BYTES;
-        let aligned_used = (used + 15) & !15;
+        let aligned_used = (used + alignment_mask) & !alignment_mask;
         let padding = pointer.wrapping_add(used);
-        // Fixed command fields are eight-byte aligned. Keep their usual padding
-        // stores inline instead of calling memset for zero or eight bytes.
-        match aligned_used - used {
-            0 => {}
-            8 => {
-                // SAFETY: exactly eight padding bytes lie within this exclusive reservation.
-                unsafe { padding.write_bytes(0, 8) };
-            }
-            length => {
-                // SAFETY: all remaining padding bytes lie within this exclusive reservation.
-                unsafe { padding.write_bytes(0, length) };
-            }
+        if aligned_used != used {
+            // SAFETY: all padding bytes lie within this exclusive reservation.
+            unsafe { padding.write_bytes(0, aligned_used - used) };
         }
         let record_bytes = u32::try_from(used).map_err(|_| WireError::TooLarge)?;
         let header_pointer = pointer as usize as *mut CommandHeader;
@@ -256,7 +251,6 @@ impl ScratchArena {
                 opcode,
                 operand,
                 record_bytes,
-                reserved: 0,
             });
         };
         chunk.used += aligned_used;

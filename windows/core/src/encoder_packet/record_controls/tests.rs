@@ -1,5 +1,7 @@
 use std::sync::Arc;
 
+use mtld3d_shared::command_header::COMMAND_HEADER_BYTES;
+
 use super::*;
 use crate::{
     encoder_data::{BeginVisibilityOp, SetViewportOp},
@@ -8,11 +10,15 @@ use crate::{
 
 fn first_payload<T: CommandRecord>(recorder: &FrameRecorder) -> &T {
     let (address, length) = recorder.slab.ranges().next().unwrap();
-    assert!(length >= 16 + size_of::<T>() as u64);
+    assert!(length >= COMMAND_HEADER_BYTES as u64 + size_of::<T>() as u64);
     // SAFETY: the test retains the recorder's scratch arena and this exact initialized
-    // command region. Its fixed header is 16 bytes and its payload has the asserted size.
-    let payload =
-        unsafe { core::slice::from_raw_parts((address + 16) as *const u8, size_of::<T>()) };
+    // command region. Its fixed header precedes a payload with the asserted size.
+    let payload = unsafe {
+        core::slice::from_raw_parts(
+            (address + COMMAND_HEADER_BYTES as u64) as *const u8,
+            size_of::<T>(),
+        )
+    };
     crate::encoder_records::borrow(payload).unwrap()
 }
 

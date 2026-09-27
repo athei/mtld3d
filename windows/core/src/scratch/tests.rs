@@ -2,8 +2,9 @@
 //!
 //! The arena hands raw pointers to another thread, so these pin the invariants
 //! that make that sound: an earlier pointer stays valid and readable after later
-//! allocations, every allocation is 16-byte aligned, and an oversized request
-//! gets its own chunk without displacing the hot cursor. The `clear` cases pin
+//! allocations, payload allocations are 16-byte aligned, command storage is
+//! eight-byte aligned, and an oversized request gets its own chunk without
+//! displacing the hot cursor. The `clear` cases pin
 //! high-water retention, the reason steady-state frames never call the allocator.
 
 use super::*;
@@ -201,15 +202,15 @@ fn command_regions_ignore_interleaved_payload_allocations_and_reuse_capacity() {
             Ok(4)
         })
         .unwrap();
-    assert_eq!(second.address, first.address + 32);
+    assert_eq!(second.address, first.address + 16);
     assert_eq!(second.region_address, first.region_address);
-    assert_eq!((first.record_bytes, second.record_bytes), (17, 20));
+    assert_eq!((first.record_bytes, second.record_bytes), (9, 12));
     assert_eq!(payload % 16, 0);
     assert_eq!(arena.chunk_count(), 2);
     let capacity = arena.capacity_bytes();
     // SAFETY: committed headers are aligned and retained by the arena.
     let header = unsafe { &*(first.address as *const CommandHeader) };
-    assert_eq!(header.reserved, 0);
+    assert_eq!(header.record_bytes, 9);
     arena.clear();
     let reused = arena
         .write_command(3, 0, 1, |payload| {
@@ -234,7 +235,7 @@ fn flat_command_commit_preserves_previous_region_on_failure_and_rollover() {
         })
         .unwrap();
     assert_eq!(first.address % 16, 0);
-    assert_eq!(first.record_bytes, 19);
+    assert_eq!(first.record_bytes, 11);
     let used = arena.bytes_used();
     assert!(matches!(
         arena.write_command(8, 0, 16, |_| Err(WireError::InvalidValue)),
@@ -244,21 +245,16 @@ fn flat_command_commit_preserves_previous_region_on_failure_and_rollover() {
     // SAFETY: the successful command is aligned and retained by this arena.
     let header = unsafe { &*(first.address as *const CommandHeader) };
     assert_eq!(
-        (
-            header.opcode,
-            header.operand,
-            header.record_bytes,
-            header.reserved
-        ),
-        (7, 9, 19, 0)
+        (header.opcode, header.operand, header.record_bytes),
+        (7, 9, 11)
     );
     let second = arena
-        .write_command(8, 0, 16, |payload| {
+        .write_command(8, 0, 40, |payload| {
             payload.fill(0x5a);
-            Ok(16)
+            Ok(40)
         })
         .unwrap();
-    assert_eq!(second.address, first.address + 32);
+    assert_eq!(second.address, first.address + 16);
     assert_eq!(second.region_bytes, 64);
     let third = arena
         .write_command(9, 0, 1, |payload| {
@@ -268,19 +264,19 @@ fn flat_command_commit_preserves_previous_region_on_failure_and_rollover() {
         .unwrap();
     assert_ne!(third.region_address, first.region_address);
     assert_eq!(third.address % 16, 0);
-    assert_eq!(third.region_bytes, 32);
+    assert_eq!(third.region_bytes, 16);
     // SAFETY: the entire first region stays alive after rollover.
-    let bytes = unsafe { core::slice::from_raw_parts(first.address as *const u8, 32) };
-    assert_eq!(&bytes[16..19], &[1, 2, 3]);
-    assert!(bytes[19..].iter().all(|&byte| byte == 0));
+    let bytes = unsafe { core::slice::from_raw_parts(first.address as *const u8, 16) };
+    assert_eq!(&bytes[8..11], &[1, 2, 3]);
+    assert!(bytes[11..].iter().all(|&byte| byte == 0));
 }
 
 #[test]
 fn reused_command_padding_is_zero_for_every_alignment_residue() {
-    use mtld3d_shared::command_header::{COMMAND_HEADER_BYTES, CommandHeader};
+    use mtld3d_shared::command_header::{COMMAND_ALIGNMENT, COMMAND_HEADER_BYTES, CommandHeader};
 
     let mut arena = ScratchArena::with_chunk_size(TEST_CHUNK);
-    for payload_bytes in 0..16 {
+    for payload_bytes in 0..COMMAND_ALIGNMENT {
         arena.clear();
         let dirty = arena
             .write_command(1, 0, TEST_CHUNK - COMMAND_HEADER_BYTES, |payload| {
@@ -297,7 +293,7 @@ fn reused_command_padding_is_zero_for_every_alignment_residue() {
             .unwrap();
         assert_eq!(first.address, dirty.address);
         let used = COMMAND_HEADER_BYTES + payload_bytes;
-        let aligned = (used + 15) & !15;
+        let aligned = (used + COMMAND_ALIGNMENT - 1) & !(COMMAND_ALIGNMENT - 1);
         // SAFETY: this retained chunk was fully initialized above. The committed
         // record occupies its prefix, and the next sixteen bytes retain the sentinel.
         let bytes =
@@ -311,7 +307,7 @@ fn reused_command_padding_is_zero_for_every_alignment_residue() {
         assert!(bytes[aligned..].iter().all(|&byte| byte == 0xff));
         // SAFETY: the command begins at an aligned address and has an initialized header.
         let header = unsafe { &*(first.address as *const CommandHeader) };
-        assert_eq!((header.opcode, header.operand, header.reserved), (2, 3, 0));
+        assert_eq!((header.opcode, header.operand), (2, 3));
         assert_eq!(header.record_bytes as usize, used);
         let next = arena
             .write_command(4, 0, 1, |payload| {
@@ -320,6 +316,6 @@ fn reused_command_padding_is_zero_for_every_alignment_residue() {
             })
             .unwrap();
         assert_eq!(next.address, first.address + aligned as u64);
-        assert_eq!(next.address % 16, 0);
+        assert_eq!(next.address % COMMAND_ALIGNMENT as u64, 0);
     }
 }
