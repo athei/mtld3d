@@ -1092,6 +1092,10 @@ pub struct FrameEncoder {
     /// epoch" between deltas guarantee the per-draw isolation invariant
     /// Metal's submit-time setVertexBytes copy depends on.
     ff_vs_const_scratch_cache: Option<(ScratchSlice, u16)>,
+    /// Failed replay storage remains live through cleanup of all native snapshot users.
+    ///
+    /// Last field so cached snapshot tokens and deferred draws drop before their arenas.
+    failed_replay: Option<Box<mtld3d_core::encoder_packet::ReplayPacket>>,
 }
 
 /// Shared body for `apply_{vs,ps}_const_range`.
@@ -1486,6 +1490,7 @@ impl FrameEncoder {
             ps_const_scratch_cache: None,
             ff_vs_constants_mirror: Box::new([[0.0; 4]; CONSTANT_ROWS]),
             ff_vs_const_scratch_cache: None,
+            failed_replay: None,
         })
     }
 
@@ -8544,13 +8549,20 @@ fn encoder_thread_main(
     loop {
         match receiver.recv() {
             Ok(EncoderMessage::Encoded { frame, done }) => {
+                if enc.failed_replay.is_some() {
+                    frame.report_failure();
+                    if let Some(done) = done {
+                        let _ = done.send(mtld3d_types::D3DERR_INVALIDCALL);
+                    }
+                    continue;
+                }
                 // SAFETY: admission retained the immutable PE packet until its decoder's
                 // final replay guard or rejection guard publishes completion.
                 let mut decode_cycles = 0;
                 let decoded = {
                     let _decode = mtld3d_core::perf::CycleSetTimer::start(&raw mut decode_cycles);
                     // SAFETY: the admitted packet retains every borrowed range through replay.
-                    unsafe { frame.decode(&mut queries) }
+                    unsafe { frame.decode() }
                 };
                 let status = match decoded {
                     Ok(decoded) => {
@@ -8559,29 +8571,35 @@ fn encoder_thread_main(
                         if frame.mode != EncoderSubmitMode::Queue {
                             enc.drain_submit_thread();
                         }
-                        run_frame_bracketed(
+                        let replay = run_frame_bracketed(
                             &mut enc,
-                            Box::new(decoded),
+                            decoded,
                             frame_counter,
                             decode_cycles,
+                            &mut queries,
                             if frame.mode == EncoderSubmitMode::Queue {
                                 SubmitMode::Async
                             } else {
                                 SubmitMode::Sync
                             },
                         );
-                        if frame.mode != EncoderSubmitMode::Queue {
-                            enc.set_present_wait_policy(PresentWaitPolicy::WaitForCommit);
-                        }
-                        if frame.mode == EncoderSubmitMode::WaitForGpu {
-                            enc.wait_for_gpu_idle();
-                            enc.drain_retired_resource_retention();
-                            enc.release_acknowledged_uploads();
-                        }
-                        if frame.mode == EncoderSubmitMode::Queue {
-                            mtld3d_types::D3D_OK
+                        if let Err(error) = replay {
+                            error!(target: LOG_TARGET, "encoder: internal command replay failed: {error:?}");
+                            mtld3d_types::D3DERR_INVALIDCALL
                         } else {
-                            enc.last_submit_status
+                            if frame.mode != EncoderSubmitMode::Queue {
+                                enc.set_present_wait_policy(PresentWaitPolicy::WaitForCommit);
+                            }
+                            if frame.mode == EncoderSubmitMode::WaitForGpu {
+                                enc.wait_for_gpu_idle();
+                                enc.drain_retired_resource_retention();
+                                enc.release_acknowledged_uploads();
+                            }
+                            if frame.mode == EncoderSubmitMode::Queue {
+                                mtld3d_types::D3D_OK
+                            } else {
+                                enc.last_submit_status
+                            }
                         }
                     }
                     Err(error) => {
@@ -8597,6 +8615,10 @@ fn encoder_thread_main(
                 }
             }
             Ok(EncoderMessage::DrainRetiredNow(done)) => {
+                if enc.failed_replay.is_some() {
+                    drop(done);
+                    continue;
+                }
                 mtld3d_shared::crumb!("phase:RecvDrain");
                 // Cheap tier: no barrier needed. A resource retired at seq N
                 // whose async submit is still in flight has seq > coherent
@@ -8607,6 +8629,10 @@ fn encoder_thread_main(
                 let _ = done.send(());
             }
             Ok(EncoderMessage::IntakeVisibilityFor { target_seq, done }) => {
+                if enc.failed_replay.is_some() {
+                    drop(done);
+                    continue;
+                }
                 mtld3d_shared::crumb!("phase:RecvVisIn");
                 mtld3d_shared::crumb!("vis:drainbeg", target_seq);
                 // The cmdbuf carrying the END query must be committed (in the
@@ -8649,6 +8675,10 @@ fn encoder_thread_main(
                 retired_textures,
                 ack,
             }) => {
+                if enc.failed_replay.is_some() {
+                    drop(ack);
+                    continue;
+                }
                 mtld3d_shared::crumb!("phase:RecvReset");
                 // Commit every in-flight async frame, and present every
                 // frame already queued, before the reset tears down /
@@ -8696,12 +8726,13 @@ fn encoder_thread_main(
 /// frame arms go through here.
 fn run_frame_bracketed(
     enc: &mut FrameEncoder,
-    frame: Box<FrameData>,
+    packet: mtld3d_core::encoder_packet::ReplayPacket,
     fc: u64,
     decode_cycles: u64,
+    queries: &mut mtld3d_core::guest_queries::QueryLeaseCache,
     mode: SubmitMode,
-) {
-    let marks = frame.gpu_capture_marks();
+) -> Result<(), mtld3d_shared::encoder_wire::WireError> {
+    let marks = packet.frame().gpu_capture_marks();
     if marks.contains(FrameDataFlags::GPU_CAPTURE_START) {
         enc.drain_submit_thread();
         enc.drain_presentation();
@@ -8716,13 +8747,14 @@ fn run_frame_bracketed(
     } else {
         mode
     };
-    run_frame(enc, frame, fc, decode_cycles, mode);
+    let result = run_frame(enc, packet, fc, decode_cycles, queries, mode);
     if marks.contains(FrameDataFlags::GPU_CAPTURE_STOP) {
         enc.drain_presentation();
         let mut p = mtld3d_shared::StopGpuCaptureParams { pad0: 0 };
         let _ = native_call(&mut p);
         enc.flags.remove(FrameEncoderFlags::GPU_CAPTURING);
     }
+    result
 }
 
 /// Drain one frame's ops, submit the resulting command buffer, and log.
@@ -8732,11 +8764,14 @@ fn run_frame_bracketed(
 /// barrier).
 fn run_frame(
     enc: &mut FrameEncoder,
-    mut frame: Box<FrameData>,
+    mut packet: mtld3d_core::encoder_packet::ReplayPacket,
     fc: u64,
     decode_cycles: u64,
+    queries: &mut mtld3d_core::guest_queries::QueryLeaseCache,
     mode: SubmitMode,
-) {
+) -> Result<(), mtld3d_shared::encoder_wire::WireError> {
+    // SAFETY: intake moves warmup queues only; snapshot scratch stays owned by the packet.
+    let frame = unsafe { packet.frame_mut() };
     if let Some(pacing) = frame.apply_pacing.take()
         && !frame.layer_handle.is_null()
     {
@@ -8773,7 +8808,7 @@ fn run_frame(
     // snapshot with the first draw of a new frame (driven by
     // SnapshotDirty::all() after arena rotation).
     enc.current_snapshot = None;
-    enc.begin_frame(&frame);
+    enc.begin_frame(frame);
     // Reclaim any payloads the submit thread finished so their command vecs
     // are back in the pool before this frame's op loop, and the returned
     // drawable-wait / status land in this frame's `Async` summary. Runs
@@ -8794,12 +8829,21 @@ fn run_frame(
     // Staging buffers slot into texture_cache entries created above —
     // must run after `drain_texture_warmups`.
     enc.drain_staging_warmups(core::mem::take(&mut frame.pending_staging_warmups));
-    let ops = core::mem::take(&mut frame.ops);
     mtld3d_shared::crumb!("phase:OpLoop");
     {
         let _ops = mtld3d_core::perf::CycleSetTimer::start(enc.perf.op_cycles_ptr());
-        for (idx, op) in ops.into_iter().enumerate() {
+        let mut idx = 0usize;
+        loop {
+            let op = match packet.next_op(queries) {
+                Ok(Some(op)) => op,
+                Ok(None) => break,
+                Err(error) => {
+                    enc.failed_replay = Some(Box::new(packet));
+                    return Err(error);
+                }
+            };
             let idx_u32 = u32::try_from(idx).expect("per-frame op count fits u32");
+            idx += 1;
             mtld3d_shared::crumb!("enc_op", fc, u64::from(idx_u32));
             match op {
                 Op::SetVsConstRange {
@@ -8885,11 +8929,19 @@ fn run_frame(
     // stage includes them once without changing the PE timing payload or subtimers.
     enc.perf.add_op_cycles(decode_cycles);
     mtld3d_shared::crumb!("phase:OpLoopDn");
+    let mut frame = match packet.into_frame() {
+        Ok(frame) => frame,
+        Err((error, packet)) => {
+            enc.failed_replay = Some(packet);
+            return Err(error);
+        }
+    };
     enc.intake_vbib_retentions(&mut frame);
     mtld3d_shared::crumb!("phase:IntakeVbib");
     submit(enc, frame, mode);
     mtld3d_shared::crumb!("phase:Submit");
     mtld3d_shared::crumb!("phase:FrameDone");
+    Ok(())
 }
 
 /// Finalize the frame, issue the `SubmitFrame` thunk, and recycle the payload.

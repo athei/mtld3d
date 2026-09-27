@@ -14,7 +14,7 @@ use crate::{
     draw_data::{
         AttrSnapshot, CurrentSnapshot, CurrentSnapshotPtr, DepthStencilFlags, DrawOp, IndexSource,
         PsSource, PsSourcePtr, RenderStatePtr, RenderStateSnapshot, ScratchSlice, StageBinding,
-        StreamBinding, VertexSource, VsSource, VsSourcePtr, bump_packed_stage_bindings,
+        StageBindingsPtr, StreamBinding, VertexSource, VsSource, VsSourcePtr,
     },
     dxso::VariantKey,
     encoder_value::WireValue,
@@ -256,31 +256,25 @@ impl DrawReader {
         }
         if mask & 2 != 0 {
             let stage_mask = reader.u16()?;
-            let mut values = Vec::with_capacity(stage_mask.count_ones() as usize);
-            for _ in 0..stage_mask.count_ones() {
-                values.push(StageBinding::read_wire(reader)?);
-            }
-            // SAFETY: values contains exactly the mask-sized prefix and native scratch stays live.
+            let values =
+                read_arena_slice::<StageBinding>(reader, scratch, stage_mask.count_ones())?;
+            // SAFETY: every mask-sized element is initialized in ascending stage order;
+            // the frame retains this final arena storage unchanged through replay.
             self.current.stage_bindings =
-                Some(unsafe { bump_packed_stage_bindings(scratch, stage_mask, &values) });
+                Some(unsafe { StageBindingsPtr::from_raw_parts(stage_mask, values) });
         }
         if mask & 4 != 0 {
             let count = reader.u32()?;
             if count > 16 {
                 return Err(WireError::InvalidValue);
             }
-            let mut values = Vec::with_capacity(count as usize);
-            for _ in 0..count {
-                values.push(VertexAttrDesc::read_wire(reader)?);
-            }
+            let ptr = read_arena_slice::<VertexAttrDesc>(reader, scratch, count)?;
             let extents = WireValue::read_wire(reader)?;
             let used_streams = WireValue::read_wire(reader)?;
             let vdecl_hash = WireValue::read_wire(reader)?;
-            let (ptr, length) = scratch.alloc_slice(&values);
-            let ptr = NonNull::new(ptr).ok_or(WireError::InvalidValue)?;
             // SAFETY: the frame retains the initialized descriptor array through replay.
             self.current.attrs =
-                Some(unsafe { AttrSnapshot::new(ptr, length, extents, used_streams, vdecl_hash) });
+                Some(unsafe { AttrSnapshot::new(ptr, count, extents, used_streams, vdecl_hash) });
         }
         if mask & 8 != 0 {
             let ptr = store(scratch, VsSource::read_wire(reader)?);
@@ -322,6 +316,32 @@ impl DrawReader {
         // SAFETY: the initialized snapshot and its referents remain live through replay.
         Ok(unsafe { CurrentSnapshotPtr::new(ptr) })
     }
+}
+
+// Decode directly into the final native array. A failed element leaves an unreachable
+// initialized prefix, which needs no destruction and is reclaimed with the frame arena.
+fn read_arena_slice<T: WireValue>(
+    reader: &mut WireReader<'_>,
+    scratch: &mut ScratchArena,
+    count: u32,
+) -> Result<NonNull<T>, WireError> {
+    const {
+        assert!(!std::mem::needs_drop::<T>());
+        assert!(std::mem::align_of::<T>() <= 16);
+    }
+    if count == 0 {
+        return Ok(NonNull::dangling());
+    }
+    let destination = scratch.alloc_uninit_slice::<T>(count as usize);
+    for index in 0..count {
+        let value = T::read_wire(reader)?;
+        // SAFETY: index is strictly within the count aligned slots reserved above.
+        let slot = unsafe { destination.add(index as usize) };
+        // SAFETY: each exclusive slot is initialized exactly once before the
+        // completed array is exposed to any reader.
+        unsafe { slot.write(value) };
+    }
+    NonNull::new(destination).ok_or(WireError::InvalidValue)
 }
 
 fn store<T>(scratch: &mut ScratchArena, value: T) -> NonNull<T> {

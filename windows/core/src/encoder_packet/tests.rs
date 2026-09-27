@@ -11,7 +11,7 @@ use crate::{
     visibility::VisibilityQueryCore,
 };
 
-fn frame_with_leases() -> (FrameData, Weak<VisibilityQueryCore>) {
+pub(super) fn frame_with_leases() -> (FrameData, Weak<VisibilityQueryCore>) {
     let mut frame = FrameData::new(&FrameInit {
         device_handle: MetalHandle::NULL,
         record_handle: DeviceRecordHandle::NULL,
@@ -844,20 +844,315 @@ fn parsed_metadata_moves_into_frame_without_reading_metadata_again() {
     let parsed = unsafe { parse_metadata(&bytes) }.unwrap();
     assert_eq!(parsed.frame.submit_seq, 91);
     drop(bytes);
-    let decoded = decode_validated_chunks(
+    let replay = prepare_chunks(
         parsed,
-        &[],
+        Vec::new(),
         ReplayCompletion {
             address: packet.completion_address(),
             rejected: true,
         },
-        &mut QueryLeaseCache::default(),
         |_| Err(WireError::InvalidValue),
     )
     .unwrap();
+    let decoded = reconstruct_packet(replay, &mut QueryLeaseCache::default()).unwrap();
     assert_eq!(decoded.submit_seq, 91);
     // SAFETY: decoding succeeded and this test owns the sole native frame.
     unsafe { packet.mark_admitted() };
     drop(decoded);
     assert!(packet.maintain());
+}
+
+#[test]
+fn borrowed_draw_and_constant_records_preserve_order_and_payload_leases() {
+    use mtld3d_shared::mtl::PrimitiveType;
+
+    use crate::draw_data::{DrawOp, IndexSource, VertexSource, arena_alloc_bytes};
+
+    let (mut frame, _) = frame_with_leases();
+    frame.ops.clear();
+    // SAFETY: frame owns this immutable capture through packet and decoded-frame teardown.
+    let data = unsafe { arena_alloc_bytes(frame.scratch_mut(), &[0x5a; 64]) };
+    frame.ops.extend([
+        Op::SetVsConstRange {
+            start_row: 3,
+            rows: 4,
+            data,
+        },
+        Op::SetPsConstRange {
+            start_row: 5,
+            rows: 4,
+            data,
+        },
+        Op::SetFfVsConstRange {
+            start_row: 7,
+            rows: 4,
+            data,
+        },
+        Op::Draw(DrawOp {
+            metal_prim: PrimitiveType::Triangle,
+            vertex_source: VertexSource::Up {
+                bytes: data,
+                size: 64,
+                stride: 16,
+            },
+            index_source: IndexSource::None {
+                start_vertex: 0,
+                vertex_count: 3,
+            },
+        }),
+    ]);
+    let mut packet = FramePacket::new(frame)
+        .unwrap_or_else(|(error, _)| panic!("valid borrowed records: {error:?}"));
+    let mut queries = QueryLeaseCache::default();
+    // SAFETY: the fixture retains this sole packet through its native consumer.
+    unsafe { packet.mark_admitted() };
+    // SAFETY: packet retains all authentic metadata, command and payload allocations.
+    let decoded = unsafe {
+        decode_packet(
+            packet.metadata_bytes(),
+            packet.operation_bytes(),
+            packet.completion_address(),
+            &mut queries,
+            |_| panic!("no program registration"),
+        )
+    }
+    .unwrap();
+    assert_eq!(decoded.ops.len(), 4);
+    for (op, expected_row) in decoded.ops[..3].iter().zip([3, 5, 7]) {
+        let (start_row, rows, captured) = match op {
+            Op::SetVsConstRange {
+                start_row,
+                rows,
+                data,
+            }
+            | Op::SetPsConstRange {
+                start_row,
+                rows,
+                data,
+            }
+            | Op::SetFfVsConstRange {
+                start_row,
+                rows,
+                data,
+            } => (*start_row, *rows, data),
+            _ => panic!("constant operation expected"),
+        };
+        assert_eq!((start_row, rows), (expected_row, 4));
+        assert_eq!(captured.as_raw(), data.as_raw());
+        assert_eq!(captured.as_slice(), &[0x5a; 64]);
+    }
+    assert!(matches!(decoded.ops[0], Op::SetVsConstRange { .. }));
+    assert!(matches!(decoded.ops[1], Op::SetPsConstRange { .. }));
+    assert!(matches!(decoded.ops[2], Op::SetFfVsConstRange { .. }));
+    let Op::Draw(draw) = &decoded.ops[3] else {
+        panic!("draw expected")
+    };
+    let VertexSource::Up {
+        bytes,
+        size,
+        stride,
+    } = &draw.vertex_source
+    else {
+        panic!("UP source expected")
+    };
+    assert_eq!((*size, *stride), (64, 16));
+    assert_eq!(bytes.as_raw(), data.as_raw());
+    assert!(!packet.maintain());
+    drop(decoded);
+    assert!(packet.maintain());
+}
+
+#[test]
+fn streamed_packet_retains_recording_until_submit_owner_drops() {
+    let (mut frame, weak) = frame_with_leases();
+    frame.ops.retain(|op| !matches!(op, Op::AdoptProgram(_)));
+    let mut owner =
+        FramePacket::new(frame).unwrap_or_else(|(error, _)| panic!("fixture: {error:?}"));
+    // SAFETY: the admitted fixture owner retains all immutable command bytes and leases.
+    unsafe {
+        owner.mark_admitted();
+    }
+    // SAFETY: owner retains the immutable matched-producer packet until completion.
+    let mut packet = unsafe {
+        prepare_packet(
+            owner.metadata_bytes(),
+            owner.operation_bytes(),
+            owner.completion_address(),
+            |_| unreachable!(),
+        )
+        .unwrap()
+    };
+    assert!(
+        packet.frame().ops.is_empty(),
+        "native stream must not materialize an op vector"
+    );
+    let mut queries = QueryLeaseCache::default();
+    let mut count = 0;
+    while let Some(op) = packet.next_op(&mut queries).unwrap() {
+        count += 1;
+        drop(op);
+    }
+    assert_eq!(count, 3);
+    assert!(
+        !owner.maintain(),
+        "encoder completion does not retire submit's borrowed bytes"
+    );
+    let submit_frame = packet
+        .into_frame()
+        .unwrap_or_else(|(error, _)| panic!("replay finished: {error:?}"));
+    assert!(
+        !owner.maintain(),
+        "submit owner still retains the recording lease"
+    );
+    drop(submit_frame);
+    let mut completions = crate::guest_completions::CompletionDrain::default();
+    owner.drain_test_completions(&mut completions);
+    assert!(owner.maintain());
+    assert!(weak.upgrade().is_none());
+}
+
+#[test]
+fn typed_constant_capture_rejects_invalid_extent_and_latches_failure() {
+    let mut recorder = FrameRecorder::new();
+    let mut scratch = ScratchArena::new();
+    // SAFETY: this local arena remains alive through every use of the capture.
+    let data = unsafe { crate::draw_data::arena_alloc_bytes(&mut scratch, &[0; 16]) };
+    assert_eq!(
+        recorder.record_vs_constants(&mut scratch, 255, 2, data),
+        Err(WireError::InvalidValue)
+    );
+    assert_eq!(recorder.recording_error(), Some(WireError::InvalidValue));
+    assert_eq!(
+        recorder.record_ps_constants(&mut scratch, 0, 1, data),
+        Err(WireError::InvalidValue)
+    );
+    assert_eq!(recorder.count, 0);
+    let mut recorder = FrameRecorder::new();
+    assert_eq!(
+        recorder.record_ff_vs_constants(&mut scratch, 0, 2, data),
+        Err(WireError::InvalidValue)
+    );
+    assert_eq!(recorder.count, 0);
+}
+
+#[test]
+fn typed_draw_and_constant_capture_roundtrips_without_owned_operations() {
+    use mtld3d_shared::mtl::PrimitiveType;
+
+    use crate::draw_data::{DrawOp, IndexSource, VertexSource, arena_alloc_bytes};
+
+    let (mut frame, _) = frame_with_leases();
+    frame.ops.clear();
+    // SAFETY: the packet retains this arena through decoded frame teardown.
+    let data = unsafe { arena_alloc_bytes(frame.scratch_mut(), &[0x5a; 64]) };
+    let mut recorder = FrameRecorder::new();
+    recorder
+        .record_vs_constants(frame.scratch_mut(), 1, 4, data)
+        .unwrap();
+    recorder
+        .record_ps_constants(frame.scratch_mut(), 2, 4, data)
+        .unwrap();
+    recorder
+        .record_ff_vs_constants(frame.scratch_mut(), 3, 4, data)
+        .unwrap();
+    recorder
+        .record_draw(
+            frame.scratch_mut(),
+            &DrawOp {
+                metal_prim: PrimitiveType::Triangle,
+                vertex_source: VertexSource::Up {
+                    bytes: data,
+                    size: 64,
+                    stride: 16,
+                },
+                index_source: IndexSource::None {
+                    start_vertex: 0,
+                    vertex_count: 3,
+                },
+            },
+        )
+        .unwrap();
+    assert_eq!(recorder.count, 4);
+    frame.recorder = Some(recorder);
+    let mut packet = FramePacket::new(frame)
+        .unwrap_or_else(|(error, _)| panic!("valid typed records: {error:?}"));
+    // SAFETY: this test owns the sole packet and retains it through replay.
+    unsafe { packet.mark_admitted() };
+    // SAFETY: packet retains authentic command, metadata and payload allocations.
+    let decoded = unsafe {
+        decode_packet(
+            packet.metadata_bytes(),
+            packet.operation_bytes(),
+            packet.completion_address(),
+            &mut QueryLeaseCache::default(),
+            |_| panic!("no registration"),
+        )
+    }
+    .unwrap();
+    assert_eq!(decoded.ops.len(), 4);
+    for (op, expected) in decoded.ops[..3].iter().zip([1, 2, 3]) {
+        let (start_row, rows, bytes) = match op {
+            Op::SetVsConstRange {
+                start_row,
+                rows,
+                data,
+            }
+            | Op::SetPsConstRange {
+                start_row,
+                rows,
+                data,
+            }
+            | Op::SetFfVsConstRange {
+                start_row,
+                rows,
+                data,
+            } => (*start_row, *rows, data),
+            _ => panic!("constant expected"),
+        };
+        assert_eq!((start_row, rows), (expected, 4));
+        assert_eq!(bytes.as_slice(), &[0x5a; 64]);
+    }
+    assert!(matches!(decoded.ops[3], Op::Draw(_)));
+    drop(decoded);
+    assert!(packet.maintain());
+}
+
+#[test]
+fn unfinished_replay_returns_storage_for_native_quarantine() {
+    let (mut frame, _) = frame_with_leases();
+    frame.ops.retain(|op| !matches!(op, Op::AdoptProgram(_)));
+    let mut owner =
+        FramePacket::new(frame).unwrap_or_else(|(error, _)| panic!("fixture: {error:?}"));
+    // SAFETY: this test keeps the immutable packet alive through native quarantine.
+    unsafe { owner.mark_admitted() };
+    // SAFETY: the fixture is an authentic retained matched-producer packet.
+    let mut packet = unsafe {
+        prepare_packet(
+            owner.metadata_bytes(),
+            owner.operation_bytes(),
+            owner.completion_address(),
+            |_| unreachable!(),
+        )
+    }
+    .unwrap();
+    let mut queries = QueryLeaseCache::default();
+    drop(packet.next_op(&mut queries).unwrap().unwrap());
+    // SAFETY: allocating a snapshot does not invalidate existing arena allocations.
+    let snapshot = unsafe { packet.frame_mut() }
+        .scratch
+        .alloc_value(0x1234_u32);
+    let Err((error, quarantined)) = packet.into_frame() else {
+        panic!("an unfinished stream must retain its owner");
+    };
+    assert_eq!(error, WireError::InvalidValue);
+    assert!(!owner.maintain());
+    // SAFETY: quarantine retains the native snapshot until its last cached user is gone.
+    assert_eq!(unsafe { *snapshot }, 0x1234);
+    drop(quarantined);
+    assert!(owner.was_rejected());
+    // SAFETY: all native readers and owners are now gone, as after encoder shutdown.
+    unsafe { owner.cancel_unadopted() };
+    let mut completions = crate::guest_completions::CompletionDrain::default();
+    owner.drain_test_completions(&mut completions);
+    assert!(owner.maintain());
 }

@@ -53,6 +53,7 @@ macro_rules! scalar_codec {
                 writer.$scalar(*self)
             }
 
+            #[inline]
             fn read_wire(reader: &mut WireReader<'_>) -> Result<Self, WireError> {
                 reader.$scalar()
             }

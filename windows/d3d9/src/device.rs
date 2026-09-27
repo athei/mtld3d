@@ -1879,6 +1879,10 @@ impl DeviceInner {
         self.current_frame.try_push_op(op)
     }
 
+    pub fn record_draw(&mut self, draw: &DrawOp) {
+        self.current_frame.record_draw(draw);
+    }
+
     /// Capture mutable API input once for replay from the shared frame arena.
     ///
     /// # Safety
@@ -10165,14 +10169,14 @@ extern "system" fn device_draw_primitive(
     emit_snapshot_deltas(&obj);
     drop(snap);
     let _push = CycleAddTimer::start(draw_push_op_ptr(perf_ptr));
-    obj.inner().push_op_inline(Op::Draw(DrawOp {
+    obj.inner().record_draw(&DrawOp {
         metal_prim,
         vertex_source,
         index_source: IndexSource::None {
             start_vertex,
             vertex_count: vtx_count,
         },
-    }));
+    });
     obj.inner()
         .encoder_status()
         .map_or_else(|hr| hr, |()| D3D_OK)
@@ -10240,11 +10244,11 @@ fn draw_bound_triangle_fan(
     emit_snapshot_deltas(obj);
     drop(snap);
     let _push = CycleAddTimer::start(draw_push_op_ptr(perf_ptr));
-    obj.inner().push_op_inline(Op::Draw(DrawOp {
+    obj.inner().record_draw(&DrawOp {
         metal_prim: mtld3d_shared::mtl::PrimitiveType::Triangle,
         vertex_source,
         index_source,
-    }));
+    });
     obj.inner()
         .encoder_status()
         .map_or_else(|hr| hr, |()| D3D_OK)
@@ -10455,11 +10459,11 @@ extern "system" fn device_draw_indexed_primitive(
     emit_snapshot_deltas(&obj);
     drop(snap);
     let _push = CycleAddTimer::start(draw_push_op_ptr(perf_ptr));
-    obj.inner().push_op_inline(Op::Draw(DrawOp {
+    obj.inner().record_draw(&DrawOp {
         metal_prim,
         vertex_source,
         index_source,
-    }));
+    });
     obj.inner()
         .encoder_status()
         .map_or_else(|hr| hr, |()| D3D_OK)
@@ -10664,7 +10668,7 @@ extern "system" fn device_draw_primitive_up(
         let _push = CycleAddTimer::start(draw_push_op_ptr(perf_ptr));
         let metal_prim =
             d3d_to_metal_primitive(D3DPT_TRIANGLELIST).expect("triangle list is supported");
-        dev.push_op_inline(Op::Draw(DrawOp {
+        dev.record_draw(&DrawOp {
             metal_prim,
             vertex_source: VertexSource::Up {
                 bytes: vertex_copy,
@@ -10672,7 +10676,7 @@ extern "system" fn device_draw_primitive_up(
                 stride: vertex_stride,
             },
             index_source,
-        }));
+        });
         // D3D9 resets stream source 0 to (NULL, 0, 0) after DrawPrimitiveUP.
         dev.bound_buffers_mut().reset_stream0();
         return obj
@@ -10700,7 +10704,7 @@ extern "system" fn device_draw_primitive_up(
     emit_snapshot_deltas(&obj);
     drop(snap);
     let _push = CycleAddTimer::start(draw_push_op_ptr(perf_ptr));
-    dev.push_op_inline(Op::Draw(DrawOp {
+    dev.record_draw(&DrawOp {
         metal_prim,
         vertex_source: VertexSource::Up {
             bytes: vertex_copy,
@@ -10711,7 +10715,7 @@ extern "system" fn device_draw_primitive_up(
             start_vertex: 0,
             vertex_count: vtx_count,
         },
-    }));
+    });
     // D3D9 resets stream source 0 to (NULL, 0, 0) after DrawPrimitiveUP.
     dev.bound_buffers_mut().reset_stream0();
     obj.inner()
@@ -10742,22 +10746,14 @@ pub fn propagate_vs_const_delta(dev: &mut DeviceInner, start_register: u32, slic
     let Some((start_row, rows, data)) = bump_const_delta(dev, start_register, slice) else {
         return;
     };
-    dev.push_op_inline(Op::SetVsConstRange {
-        start_row,
-        rows,
-        data,
-    });
+    dev.current_frame.record_vs_constants(start_row, rows, data);
 }
 
 pub fn propagate_ps_const_delta(dev: &mut DeviceInner, start_register: u32, slice: &[[f32; 4]]) {
     let Some((start_row, rows, data)) = bump_const_delta(dev, start_register, slice) else {
         return;
     };
-    dev.push_op_inline(Op::SetPsConstRange {
-        start_row,
-        rows,
-        data,
-    });
+    dev.current_frame.record_ps_constants(start_row, rows, data);
 }
 
 /// Shared body for [`propagate_vs_const_delta`] / [`propagate_ps_const_delta`].
@@ -11202,11 +11198,7 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
                     let byte_len = u32::from(rows) * 16;
                     // SAFETY: frame scratch remains immutable and retained through submit replay.
                     let data = unsafe { ScratchSlice::from_raw_parts(nn, byte_len) };
-                    frame.push_op_inline(crate::encoder::Op::SetFfVsConstRange {
-                        start_row,
-                        rows,
-                        data,
-                    });
+                    frame.record_ff_vs_constants(start_row, rows, data);
                 };
 
             if key.has_rhw() {
@@ -11726,7 +11718,7 @@ extern "system" fn device_draw_indexed_primitive_up(
     emit_snapshot_deltas(&obj);
     drop(snap);
     let _push = CycleAddTimer::start(draw_push_op_ptr(perf_ptr));
-    dev.push_op_inline(Op::Draw(DrawOp {
+    dev.record_draw(&DrawOp {
         metal_prim,
         vertex_source: VertexSource::Up {
             bytes: vertex_copy,
@@ -11734,7 +11726,7 @@ extern "system" fn device_draw_indexed_primitive_up(
             stride: vertex_stride,
         },
         index_source,
-    }));
+    });
     // D3D9 resets stream source 0 to (NULL, 0, 0) AND the index buffer to NULL
     // after a successful DrawIndexedPrimitiveUP.
     let bound = dev.bound_buffers_mut();

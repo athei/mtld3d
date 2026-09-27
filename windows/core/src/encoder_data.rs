@@ -892,6 +892,10 @@ bitflags::bitflags! {
         /// continuation, so the capture ends with the piece the closing
         /// `Present` submits rather than with the process.
         const GPU_CAPTURE_STOP = 1 << 3;
+        /// Internal packet footer contains diagnostic provenance inventories.
+        ///
+        /// The paired decoder consumes this transport bit before rendering.
+        const VALIDATION_INVENTORY = 1 << 4;
     }
 }
 
@@ -1344,6 +1348,87 @@ impl FrameData {
             self.ops.push(op);
             Ok(())
         }
+    }
+
+    /// Serialize a borrowed draw directly into the PE frame capture.
+    #[cfg(windows)]
+    pub fn record_draw(&mut self, draw: &crate::draw_data::DrawOp) {
+        let _ = self
+            .recorder
+            .get_or_insert_with(crate::encoder_packet::FrameRecorder::new)
+            .record_draw(&mut self.scratch, draw);
+    }
+
+    /// Retain an owned draw for native replay.
+    #[cfg(not(windows))]
+    pub fn record_draw(&mut self, draw: crate::draw_data::DrawOp) {
+        self.push_op(Op::Draw(draw));
+    }
+
+    /// Record a constant delta directly on PE, or retain its operation on Unix.
+    pub fn record_vs_constants(
+        &mut self,
+        start_row: u16,
+        rows: u16,
+        data: crate::draw_data::ScratchSlice,
+    ) {
+        #[cfg(windows)]
+        {
+            let _ = self
+                .recorder
+                .get_or_insert_with(crate::encoder_packet::FrameRecorder::new)
+                .record_vs_constants(&mut self.scratch, start_row, rows, data);
+        }
+        #[cfg(not(windows))]
+        self.push_op(Op::SetVsConstRange {
+            start_row,
+            rows,
+            data,
+        });
+    }
+
+    /// Record a constant delta directly on PE, or retain its operation on Unix.
+    pub fn record_ps_constants(
+        &mut self,
+        start_row: u16,
+        rows: u16,
+        data: crate::draw_data::ScratchSlice,
+    ) {
+        #[cfg(windows)]
+        {
+            let _ = self
+                .recorder
+                .get_or_insert_with(crate::encoder_packet::FrameRecorder::new)
+                .record_ps_constants(&mut self.scratch, start_row, rows, data);
+        }
+        #[cfg(not(windows))]
+        self.push_op(Op::SetPsConstRange {
+            start_row,
+            rows,
+            data,
+        });
+    }
+
+    /// Record a constant delta directly on PE, or retain its operation on Unix.
+    pub fn record_ff_vs_constants(
+        &mut self,
+        start_row: u16,
+        rows: u16,
+        data: crate::draw_data::ScratchSlice,
+    ) {
+        #[cfg(windows)]
+        {
+            let _ = self
+                .recorder
+                .get_or_insert_with(crate::encoder_packet::FrameRecorder::new)
+                .record_ff_vs_constants(&mut self.scratch, start_row, rows, data);
+        }
+        #[cfg(not(windows))]
+        self.push_op(Op::SetFfVsConstRange {
+            start_row,
+            rows,
+            data,
+        });
     }
 
     #[must_use]

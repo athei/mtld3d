@@ -394,6 +394,7 @@ impl<'a> WireReader<'a> {
     /// # Errors
     ///
     /// Returns `Truncated` without advancing when the field is incomplete.
+    #[inline]
     pub fn u8(&mut self) -> Result<u8, WireError> {
         Ok(u8::from_le_bytes(self.array()?))
     }
@@ -403,6 +404,7 @@ impl<'a> WireReader<'a> {
     /// # Errors
     ///
     /// Returns `Truncated` without advancing when the field is incomplete.
+    #[inline]
     pub fn u16(&mut self) -> Result<u16, WireError> {
         Ok(u16::from_le_bytes(self.array()?))
     }
@@ -412,6 +414,7 @@ impl<'a> WireReader<'a> {
     /// # Errors
     ///
     /// Returns `Truncated` without advancing when the field is incomplete.
+    #[inline]
     pub fn u32(&mut self) -> Result<u32, WireError> {
         Ok(u32::from_le_bytes(self.array()?))
     }
@@ -421,6 +424,7 @@ impl<'a> WireReader<'a> {
     /// # Errors
     ///
     /// Returns `Truncated` without advancing when the field is incomplete.
+    #[inline]
     pub fn u64(&mut self) -> Result<u64, WireError> {
         Ok(u64::from_le_bytes(self.array()?))
     }
@@ -430,6 +434,7 @@ impl<'a> WireReader<'a> {
     /// # Errors
     ///
     /// Returns `Truncated` without advancing when the field is incomplete.
+    #[inline]
     pub fn i32(&mut self) -> Result<i32, WireError> {
         Ok(i32::from_le_bytes(self.array()?))
     }
@@ -439,6 +444,7 @@ impl<'a> WireReader<'a> {
     /// # Errors
     ///
     /// Returns `Truncated` without advancing when the field is incomplete.
+    #[inline]
     pub fn f32(&mut self) -> Result<f32, WireError> {
         Ok(f32::from_le_bytes(self.array()?))
     }
@@ -458,6 +464,7 @@ impl<'a> WireReader<'a> {
         Ok(result)
     }
 
+    #[inline]
     fn array<const N: usize>(&mut self) -> Result<[u8; N], WireError> {
         let (result, remaining) = self
             .remaining

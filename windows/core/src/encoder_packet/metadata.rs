@@ -5,7 +5,8 @@ use mtld3d_shared::encoder_wire::{WireError, WireReader, WireWriter};
 use super::FrameRecorder;
 use crate::{
     encoder_data::{
-        FrameData, FrameInit, PendingVbibRetention, StagingWarmupEntry, VbibWarmupEntry,
+        FrameData, FrameDataFlags, FrameInit, PendingVbibRetention, StagingWarmupEntry,
+        VbibWarmupEntry,
     },
     encoder_value::WireValue,
     guest_pages::{GuestPageDescriptor, GuestPageLease},
@@ -13,15 +14,24 @@ use crate::{
 
 /// Published address ranges and exact single-adoption descriptors.
 pub struct PacketInventory {
+    #[cfg(any(test, debug_assertions))]
     pub ranges: Vec<(u64, u64)>,
+    #[cfg(any(test, debug_assertions))]
     pub pages: Vec<[u64; 7]>,
+    #[cfg(any(test, debug_assertions))]
     pub queries: Vec<[u64; 2]>,
     pub registrations: Vec<u64>,
+    #[cfg(any(test, debug_assertions))]
     pub redirties: Vec<[u64; 2]>,
+    #[cfg(any(test, debug_assertions))]
     pub replies_u64: Vec<u64>,
+    #[cfg(any(test, debug_assertions))]
     pub replies_bool: Vec<u64>,
+    #[cfg(any(test, debug_assertions))]
     pub readbacks: Vec<(u64, u64)>,
+    #[cfg(any(test, debug_assertions))]
     pub command_spans: Vec<(u64, u64)>,
+    #[cfg(any(test, debug_assertions))]
     pub backings: Vec<(u64, u64)>,
 }
 
@@ -29,6 +39,16 @@ pub fn write_metadata(
     frame: &mut FrameData,
     writer: &mut WireWriter<'_>,
     recorder: &mut FrameRecorder,
+) -> Result<(), WireError> {
+    write_metadata_with_inventory(frame, writer, recorder, cfg!(any(test, debug_assertions)))
+}
+
+// The explicit argument lets host tests exercise the release producer's identical wire shape.
+fn write_metadata_with_inventory(
+    frame: &mut FrameData,
+    writer: &mut WireWriter<'_>,
+    recorder: &mut FrameRecorder,
+    has_inventory: bool,
 ) -> Result<(), WireError> {
     frame.device_handle.write_wire(writer)?;
     frame.record_handle.write_wire(writer)?;
@@ -45,7 +65,9 @@ pub fn write_metadata(
     frame.render_scale.write_wire(writer)?;
     frame.backbuffer_contents.write_wire(writer)?;
     frame.depth_texture.write_wire(writer)?;
-    frame.flags.write_wire(writer)?;
+    let mut flags = frame.flags;
+    flags.set(FrameDataFlags::VALIDATION_INVENTORY, has_inventory);
+    flags.write_wire(writer)?;
     frame.perf.write_wire(writer)?;
     frame.submit_seq.write_wire(writer)?;
     frame.coherent_seq_ptr.write_wire(writer)?;
@@ -107,6 +129,19 @@ pub fn write_metadata(
             frame.vbib_retentions.extend(retained);
             return Err(error);
         }
+    }
+    if !has_inventory {
+        writer.u32(0)?; // Scratch ranges.
+        writer.u32(0)?; // Page provenance.
+        writer.u32(0)?; // Query provenance.
+        recorder.registrations.write_wire(writer)?;
+        writer.u32(0)?; // Redirty provenance.
+        writer.u32(0)?; // U64 reply provenance.
+        writer.u32(0)?; // Boolean reply provenance.
+        writer.u32(0)?; // Readback provenance.
+        writer.u32(0)?; // Command provenance; the actual command table remains separate.
+        writer.u32(0)?; // Buffer backing provenance.
+        return Ok(());
     }
     u32::try_from(frame.scratch.allocation_ranges().count())
         .map_err(|_| WireError::TooLarge)?
@@ -172,6 +207,8 @@ pub fn write_metadata(
 
 /// Metadata parsed once, with guest ownership held back until complete validation.
 pub(super) struct ParsedMetadata {
+    #[cfg(any(test, debug_assertions))]
+    pub has_inventory: bool,
     pub frame: FrameData,
     pub inventory: PacketInventory,
     staging: Vec<(crate::ids::TextureId, u32, u64, u64, GuestPageDescriptor)>,
@@ -213,6 +250,7 @@ impl ParsedMetadata {
 
 /// Parse scalar metadata and descriptors without adopting or touching guest memory.
 pub(super) fn read_metadata(reader: &mut WireReader<'_>) -> Result<ParsedMetadata, WireError> {
+    #[cfg(any(test, debug_assertions))]
     let mut metadata_pages = Vec::new();
     let init = FrameInit {
         device_handle: WireValue::read_wire(reader)?,
@@ -234,6 +272,9 @@ pub(super) fn read_metadata(reader: &mut WireReader<'_>) -> Result<ParsedMetadat
     };
     let mut frame = FrameData::new(&init);
     frame.flags = WireValue::read_wire(reader)?;
+    #[cfg(any(test, debug_assertions))]
+    let has_inventory = frame.flags.contains(FrameDataFlags::VALIDATION_INVENTORY);
+    frame.flags.remove(FrameDataFlags::VALIDATION_INVENTORY);
     frame.perf = WireValue::read_wire(reader)?;
     frame.submit_seq = WireValue::read_wire(reader)?;
     frame.coherent_seq_ptr = read_counter(reader)?;
@@ -283,7 +324,10 @@ pub(super) fn read_metadata(reader: &mut WireReader<'_>) -> Result<ParsedMetadat
         if fields[0] != backing_ptr || fields[1] != backing_len {
             return Err(WireError::InvalidValue);
         }
-        metadata_pages.push(fields);
+        #[cfg(any(test, debug_assertions))]
+        if has_inventory {
+            metadata_pages.push(fields);
+        }
         staging_descriptors.push((texture_id, level, backing_ptr, backing_len, descriptor));
     }
     let retained = bounded_count(reader, 72)?;
@@ -303,9 +347,31 @@ pub(super) fn read_metadata(reader: &mut WireReader<'_>) -> Result<ParsedMetadat
         if fields[6] != 0 {
             return Err(WireError::InvalidValue);
         }
-        metadata_pages.push(fields);
+        #[cfg(any(test, debug_assertions))]
+        if has_inventory {
+            metadata_pages.push(fields);
+        }
         retained_descriptors.push((buffer_id, last_submit_seq, descriptor));
     }
+    #[cfg(any(test, debug_assertions))]
+    let inventory = read_inventory(reader, metadata_pages)?;
+    #[cfg(not(any(test, debug_assertions)))]
+    let inventory = read_inventory(reader)?;
+    Ok(ParsedMetadata {
+        #[cfg(any(test, debug_assertions))]
+        has_inventory,
+        frame,
+        staging: staging_descriptors,
+        retained: retained_descriptors,
+        inventory,
+    })
+}
+
+#[cfg(any(test, debug_assertions))]
+fn read_inventory(
+    reader: &mut WireReader<'_>,
+    metadata_pages: Vec<[u64; 7]>,
+) -> Result<PacketInventory, WireError> {
     let count = bounded_count(reader, 16)?;
     let mut ranges = Vec::new();
     ranges
@@ -340,25 +406,65 @@ pub(super) fn read_metadata(reader: &mut WireReader<'_>) -> Result<ParsedMetadat
             .ok_or(WireError::InvalidValue)?;
         pages.swap_remove(index);
     }
-    Ok(ParsedMetadata {
-        frame,
-        staging: staging_descriptors,
-        retained: retained_descriptors,
-        inventory: PacketInventory {
-            ranges,
-            pages,
-            queries,
-            registrations,
-            redirties,
-            replies_u64,
-            replies_bool,
-            readbacks,
-            command_spans,
-            backings,
-        },
+    Ok(PacketInventory {
+        ranges,
+        pages,
+        queries,
+        registrations,
+        redirties,
+        replies_u64,
+        replies_bool,
+        readbacks,
+        command_spans,
+        backings,
     })
 }
 
+#[cfg(not(any(test, debug_assertions)))]
+fn read_inventory(reader: &mut WireReader<'_>) -> Result<PacketInventory, WireError> {
+    Ok(PacketInventory {
+        registrations: read_inventory_registrations(reader)?,
+    })
+}
+
+#[cfg(any(test, not(debug_assertions)))]
+fn read_inventory_registrations(reader: &mut WireReader<'_>) -> Result<Vec<u64>, WireError> {
+    // Consume the diagnostic footer from a debug producer without allocating storage
+    // for it. The actual command table and every owning descriptor are independent.
+    discard_ranges(reader)?;
+    discard_list::<[u64; 7]>(reader)?;
+    discard_list::<[u64; 2]>(reader)?;
+    let registrations = Vec::<u64>::read_wire(reader)?;
+    discard_list::<[u64; 2]>(reader)?;
+    discard_list::<u64>(reader)?;
+    discard_list::<u64>(reader)?;
+    discard_list::<[u64; 2]>(reader)?;
+    discard_list::<[u64; 2]>(reader)?;
+    discard_list::<[u64; 2]>(reader)?;
+    Ok(registrations)
+}
+
+#[cfg(any(test, not(debug_assertions)))]
+fn discard_ranges(reader: &mut WireReader<'_>) -> Result<(), WireError> {
+    let count = bounded_count(reader, 16)?;
+    for _ in 0..count {
+        let address = reader.u64()?;
+        let length = reader.u64()?;
+        validate_range(reader, address, length, 1)?;
+    }
+    Ok(())
+}
+
+#[cfg(any(test, not(debug_assertions)))]
+fn discard_list<T: WireValue>(reader: &mut WireReader<'_>) -> Result<(), WireError> {
+    let count = bounded_count(reader, T::MIN_WIRE_BYTES)?;
+    for _ in 0..count {
+        T::read_wire(reader)?;
+    }
+    Ok(())
+}
+
+#[cfg(any(test, debug_assertions))]
 fn read_spans(reader: &mut WireReader<'_>) -> Result<Vec<(u64, u64)>, WireError> {
     let count = bounded_count(reader, 16)?;
     let mut spans = Vec::new();
@@ -404,3 +510,6 @@ fn validate_range(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests;

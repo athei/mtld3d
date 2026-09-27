@@ -88,8 +88,8 @@ or serializing the whole frame at `Present`.
 
 A native encoder thread per device receives one `SubmitEncoderFrame` handoff
 for an ordinary frame through a capacity-one queue. Admission retains the PE
-packet; the encoder validates its complete stream before replay, reconstructs
-native values and translates D3D9 operations into Metal commands. The PE side
+packet; the encoder decodes its stream once during replay, reconstructs native
+values and translates D3D9 operations into Metal commands. The PE side
 starts collecting the next frame after admission. `FrameEncoder`, its caches,
 command lists and private staging belong to Unix. COM pointers, Rust closures,
 allocator owners and PE function pointers are never executed or destroyed by
@@ -141,7 +141,7 @@ A **log thread** (one per process) is the only thread that thunks for logging. d
 API thread (PE)            Encoder (Unix)          Submit (Unix)         Presenter (Unix)
 ───────────────            ──────────────          ─────────────         ────────────────
 D3D call → record bytes
-Present → enqueue ───────→ validate and replay
+Present → enqueue ───────→ decode and replay
         → next frame       translate D3D9 → Metal
                            finalize payload ────→ replay and commit
                                                  queue present ────→ drawable and present
@@ -445,13 +445,26 @@ Every symbolic wire value has one typed definition in `mtld3d-shared`. Metal enu
 
 The three cdylibs are separate linkage units. Shared definitions and exhaustive
 matches catch protocol drift at compile time, and `make` / `make install`
-rebuild and copy all three together. Matching binaries do not prove that an
-incoming packet is well formed. Existing typed thunk parameters rely on their
-caller's valid-value contract. A serialized frame record carries a raw tag:
-validate tags, lengths, offsets, alignment and referenced ranges before
-constructing typed values or references. Validate the complete packet before
-replaying any operation, so a malformed later record cannot leave a partially
-applied frame.
+rebuild and copy all three together. The internal typed producer's unsafe
+contract requires fully formed, finalized immutable packets and retained backing
+leases. Matching binaries alone do not establish these lifetime and value
+requirements. Public D3D input validation remains at the API boundary.
+
+Production checks the packet envelope, address ranges, submission mode and
+admission, then performs one checked decode during replay. Matching ABI and
+device identity belong to the caller contract; the device queue serializes reset
+with frame submission. The bounded reader checks raw
+tags, field lengths, offsets, alignment and address arithmetic before constructing
+typed values or references. Allocation membership and unique ownership adoption
+rely on the producer contract. Fallible pending-program registration finishes
+before any operation replays. Exhaustive structural and lease-inventory preflight
+runs in tests and debug builds when the producer supplies `VALIDATION_INVENTORY`;
+a production PE producer can also feed a debug native runtime without it. This
+has no runtime setting. A late internal contract violation can occur after
+earlier operations have replayed: it latches device failure and quarantines
+native and PE storage through cleanup. Subsequent controls reject work except
+shutdown. It does not promise atomic rejection of a malformed packet or roll
+back an already applied operation.
 
 How to apply:
 - New thunk field with symbolic meaning → its shared protocol type. Sizes/offsets/counts/`!= 0` booleans → `u32`.

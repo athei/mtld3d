@@ -18,12 +18,7 @@ use mtld3d_shared::{
 };
 use mtld3d_types::{D3D_OK, D3DERR_INVALIDCALL, E_OUTOFMEMORY};
 
-use crate::{
-    LOG_TARGET,
-    encoder::{EncoderThread, FrameData},
-    shader_prewarm,
-    shader_programs::ProgramRegistry,
-};
+use crate::{LOG_TARGET, encoder::EncoderThread, shader_prewarm, shader_programs::ProgramRegistry};
 
 #[cfg(test)]
 mod tests;
@@ -275,12 +270,10 @@ impl EncodedFrame {
     ///
     /// # Safety
     ///
-    /// Creation must come from an admitted request whose packet owner retains its buffers
-    /// and completion mailbox until decoder rejection or final replay completion.
-    pub unsafe fn decode(
-        &self,
-        queries: &mut mtld3d_core::guest_queries::QueryLeaseCache,
-    ) -> Result<FrameData, WireError> {
+    /// Creation must come from the matched PE recorder: complete, semantically valid typed
+    /// records and unique ownership descriptors. Its admitted packet owner retains immutable
+    /// buffers and completion mailbox until rejection or final submit replay completion.
+    pub unsafe fn decode(&self) -> Result<mtld3d_core::encoder_packet::ReplayPacket, WireError> {
         // SAFETY: the admitted packet contract retains this immutable byte range.
         let metadata = unsafe {
             std::slice::from_raw_parts(self.metadata_ptr as *const u8, self.metadata_len as usize)
@@ -294,11 +287,10 @@ impl EncodedFrame {
         };
         // SAFETY: both ranges and every lease descriptor remain retained by the PE packet.
         unsafe {
-            mtld3d_core::encoder_packet::decode_packet(
+            mtld3d_core::encoder_packet::prepare_packet(
                 metadata,
                 operations,
                 self.completion,
-                queries,
                 |registration| {
                     self.programs
                         .take(registration)

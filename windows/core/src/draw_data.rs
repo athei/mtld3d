@@ -487,6 +487,18 @@ pub struct StageBindingsPtr {
 unsafe impl Send for StageBindingsPtr {}
 
 impl StageBindingsPtr {
+    /// Reference an initialized packed stage array without copying it.
+    ///
+    /// # Safety
+    /// `bindings` must point to `mask.count_ones()` initialized `StageBinding`s,
+    /// ordered by ascending set bit. Keep that storage immutable and allocated
+    /// until every copy of this token is forgotten. An empty mask permits a
+    /// dangling pointer because iteration never dereferences it.
+    #[must_use]
+    pub const unsafe fn from_raw_parts(mask: u16, bindings: NonNull<StageBinding>) -> Self {
+        Self { mask, bindings }
+    }
+
     #[must_use]
     pub const fn mask(&self) -> u16 {
         self.mask

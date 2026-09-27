@@ -48,11 +48,14 @@ const FRAME_CHUNK_TAG: u16 = 1;
 mod owner;
 mod recording;
 use recording::RecordedSpans;
+mod replay;
 #[cfg(test)]
 mod tests;
+#[cfg(any(test, debug_assertions))]
 mod validation;
 use metadata::write_metadata;
 pub use owner::{FramePacket, PacketLease};
+pub use replay::ReplayPacket;
 
 /// API-side operation bytes and owners awaiting native acknowledgment.
 pub struct FrameRecorder {
@@ -127,6 +130,7 @@ impl FrameRecorder {
             self.rejected_ops.push(op);
             return Err(error);
         }
+        #[cfg(any(test, debug_assertions))]
         capture_ranges(&op, &mut self.ranges);
         if let Op::ReadDeviceBuffer(value) = &op {
             self.readbacks.push((value.dst_ptr, value.dst_len));
@@ -137,30 +141,53 @@ impl FrameRecorder {
         };
         let tag = op_tag(&op);
         let bound = op_record_bound(&op);
-        let mut op = Some(op);
-        let result = tag.and_then(|tag| {
-            self.slab
-                .push_record(scratch, u16::from(tag), bound?, |writer| {
-                    let op = op.take().ok_or(WireError::InvalidValue)?;
-                    write_operation(
-                        op,
-                        writer,
-                        &mut WriteContext {
-                            draws: &mut self.draws,
-                            pages: &mut self.pages,
-                            queries: &mut self.queries,
-                            replies_u64: &mut self.replies_u64,
-                            replies_bool: &mut self.replies_bool,
-                            redirties: &mut self.redirties,
-                            pool: &self.completion_pool,
-                            pagebox_pool: self.pagebox_pool,
-                        },
-                    )
-                })
-        });
-        if let Some(op) = op {
-            self.rejected_ops.push(op);
-        }
+        // Draws and constant updates lend their fields to the writer. Moving the
+        // entire operation through the ownership callback copies the large enum
+        // twice even though these records transfer no Rust-owned values.
+        let result = if matches!(
+            op,
+            Op::Draw(_)
+                | Op::SetVsConstRange { .. }
+                | Op::SetPsConstRange { .. }
+                | Op::SetFfVsConstRange { .. }
+        ) {
+            let result = tag.and_then(|tag| {
+                self.slab
+                    .push_record(scratch, u16::from(tag), bound?, |writer| {
+                        write_draw_or_constants(&op, writer, &mut self.draws)
+                    })
+            });
+            if result.is_err() {
+                self.rejected_ops.push(op);
+            }
+            result
+        } else {
+            let mut op = Some(op);
+            let result = tag.and_then(|tag| {
+                self.slab
+                    .push_record(scratch, u16::from(tag), bound?, |writer| {
+                        let op = op.take().ok_or(WireError::InvalidValue)?;
+                        write_operation(
+                            op,
+                            writer,
+                            &mut WriteContext {
+                                draws: &mut self.draws,
+                                pages: &mut self.pages,
+                                queries: &mut self.queries,
+                                replies_u64: &mut self.replies_u64,
+                                replies_bool: &mut self.replies_bool,
+                                redirties: &mut self.redirties,
+                                pool: &self.completion_pool,
+                                pagebox_pool: self.pagebox_pool,
+                            },
+                        )
+                    })
+            });
+            if let Some(op) = op {
+                self.rejected_ops.push(op);
+            }
+            result
+        };
         if let Err(reason) = result {
             mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET, "encoder operation recording failed: {reason:?}; rejecting frame");
             self.error = Some(reason);
@@ -169,6 +196,115 @@ impl FrameRecorder {
             if let Some(registration) = registration {
                 self.registrations.push(registration);
             }
+        }
+        result
+    }
+
+    /// Capture a draw without constructing the larger operation enum.
+    ///
+    /// # Errors
+    /// Returns the latched frame error or a wire capture failure.
+    pub fn record_draw(
+        &mut self,
+        scratch: &mut ScratchArena,
+        draw: &crate::draw_data::DrawOp,
+    ) -> Result<(), WireError> {
+        if let Some(error) = self.error {
+            return Err(error);
+        }
+        #[cfg(any(test, debug_assertions))]
+        capture_draw_ranges(draw, &mut self.ranges);
+        let result =
+            self.slab
+                .push_record(scratch, u16::from(EncoderOpcode::Draw), 4096, |writer| {
+                    self.draws.encode_draw(draw, writer)
+                });
+        self.finish_record(result)
+    }
+
+    /// Capture a VS constant delta without constructing an operation enum.
+    ///
+    /// # Errors
+    /// Returns the latched frame error or a wire capture failure.
+    pub fn record_vs_constants(
+        &mut self,
+        scratch: &mut ScratchArena,
+        start_row: u16,
+        rows: u16,
+        data: crate::draw_data::ScratchSlice,
+    ) -> Result<(), WireError> {
+        self.record_constants(
+            scratch,
+            EncoderOpcode::SetVsConstRange,
+            start_row,
+            rows,
+            data,
+        )
+    }
+
+    /// Capture a PS constant delta without constructing an operation enum.
+    ///
+    /// # Errors
+    /// Returns the latched frame error or a wire capture failure.
+    pub fn record_ps_constants(
+        &mut self,
+        scratch: &mut ScratchArena,
+        start_row: u16,
+        rows: u16,
+        data: crate::draw_data::ScratchSlice,
+    ) -> Result<(), WireError> {
+        self.record_constants(
+            scratch,
+            EncoderOpcode::SetPsConstRange,
+            start_row,
+            rows,
+            data,
+        )
+    }
+
+    /// Capture a fixed-function VS constant delta without an operation enum.
+    ///
+    /// # Errors
+    /// Returns the latched frame error or a wire capture failure.
+    pub fn record_ff_vs_constants(
+        &mut self,
+        scratch: &mut ScratchArena,
+        start_row: u16,
+        rows: u16,
+        data: crate::draw_data::ScratchSlice,
+    ) -> Result<(), WireError> {
+        self.record_constants(
+            scratch,
+            EncoderOpcode::SetFfVsConstRange,
+            start_row,
+            rows,
+            data,
+        )
+    }
+
+    fn record_constants(
+        &mut self,
+        scratch: &mut ScratchArena,
+        opcode: EncoderOpcode,
+        start_row: u16,
+        rows: u16,
+        data: crate::draw_data::ScratchSlice,
+    ) -> Result<(), WireError> {
+        if let Some(error) = self.error {
+            return Err(error);
+        }
+        let result = self
+            .slab
+            .push_record(scratch, u16::from(opcode), 22, |writer| {
+                write_const_range(start_row, rows, data, writer)
+            });
+        self.finish_record(result)
+    }
+
+    const fn finish_record(&mut self, result: Result<(), WireError>) -> Result<(), WireError> {
+        match result {
+            Ok(()) => self.count += 1,
+            Err(error) => self.error = Some(error),
         }
         result
     }
@@ -301,26 +437,10 @@ fn write_operation(
         pool,
     } = context;
     match op {
-        Op::SetVsConstRange {
-            start_row,
-            rows,
-            data,
-        }
-        | Op::SetPsConstRange {
-            start_row,
-            rows,
-            data,
-        }
-        | Op::SetFfVsConstRange {
-            start_row,
-            rows,
-            data,
-        } => {
-            start_row.write_wire(writer)?;
-            rows.write_wire(writer)?;
-            write_scratch_slice(data, writer)
-        }
-        Op::Draw(draw) => draws.encode_draw(&draw, writer),
+        op @ (Op::SetVsConstRange { .. }
+        | Op::SetPsConstRange { .. }
+        | Op::SetFfVsConstRange { .. }
+        | Op::Draw(_)) => write_draw_or_constants(&op, writer, draws),
         Op::SetViewport(value) => value.write_wire(writer),
         Op::SetVertexSampler(value) => value.write_wire(writer),
         Op::SetVertexTexture(value) => value.write_wire(writer),
@@ -411,6 +531,49 @@ fn write_operation(
             descriptor.write_wire(writer)
         }
     }
+}
+
+/// Serialize borrowed hot-operation fields without moving the owning enum.
+fn write_draw_or_constants(
+    op: &Op,
+    writer: &mut WireWriter<'_>,
+    draws: &mut DrawWriter,
+) -> Result<(), WireError> {
+    match op {
+        Op::SetVsConstRange {
+            start_row,
+            rows,
+            data,
+        }
+        | Op::SetPsConstRange {
+            start_row,
+            rows,
+            data,
+        }
+        | Op::SetFfVsConstRange {
+            start_row,
+            rows,
+            data,
+        } => write_const_range(*start_row, *rows, *data, writer),
+        Op::Draw(draw) => draws.encode_draw(draw, writer),
+        _ => Err(WireError::InvalidValue),
+    }
+}
+
+fn write_const_range(
+    start_row: u16,
+    rows: u16,
+    data: crate::draw_data::ScratchSlice,
+    writer: &mut WireWriter<'_>,
+) -> Result<(), WireError> {
+    if usize::from(start_row) + usize::from(rows) > crate::draw_data::CONSTANT_ROWS
+        || data.as_raw().1 < u32::from(rows) * 16
+    {
+        return Err(WireError::InvalidValue);
+    }
+    start_row.write_wire(writer)?;
+    rows.write_wire(writer)?;
+    write_scratch_slice(data, writer)
 }
 
 fn write_query(
@@ -822,22 +985,28 @@ impl Drop for ReplayCompletion {
     }
 }
 
+#[cfg(any(test, debug_assertions))]
 fn capture_ranges(op: &Op, ranges: &mut Vec<(u64, u64)>) {
-    use crate::draw_data::{IndexSource, VertexSource};
     if let Op::Draw(draw) = op {
-        if let VertexSource::Bound { first, extra, .. } = &draw.vertex_source {
-            for stream in core::iter::once(first).chain(extra.iter()) {
-                ranges.push((stream.backing_ptr as u64, stream.backing_len as u64));
-            }
+        capture_draw_ranges(draw, ranges);
+    }
+}
+
+#[cfg(any(test, debug_assertions))]
+fn capture_draw_ranges(draw: &crate::draw_data::DrawOp, ranges: &mut Vec<(u64, u64)>) {
+    use crate::draw_data::{IndexSource, VertexSource};
+    if let VertexSource::Bound { first, extra, .. } = &draw.vertex_source {
+        for stream in core::iter::once(first).chain(extra.iter()) {
+            ranges.push((stream.backing_ptr as u64, stream.backing_len as u64));
         }
-        if let IndexSource::Bound {
-            backing_ptr,
-            backing_len,
-            ..
-        } = &draw.index_source
-        {
-            ranges.push((*backing_ptr as u64, *backing_len as u64));
-        }
+    }
+    if let IndexSource::Bound {
+        backing_ptr,
+        backing_len,
+        ..
+    } = &draw.index_source
+    {
+        ranges.push((*backing_ptr as u64, *backing_len as u64));
     }
 }
 
@@ -865,18 +1034,20 @@ fn op_record_bound(op: &Op) -> Result<usize, WireError> {
 /// The metadata inventory must describe authentic retained allocations from the paired PE
 /// recorder. Metadata, chunk table, chunks, all inventoried owners and the completion cell must
 /// remain immutable and live until completion. This is the packet's only native decoder.
+/// Every record must be a complete, semantically valid typed record produced by the matching
+/// recorder, and each ownership descriptor must occur exactly once. Production replay
+/// relies on this internal producer contract rather than an independent preflight walk.
 ///
 /// # Errors
 ///
-/// Rejects malformed records before adoption. Ownership reconstruction failures reject the
-/// packet after releasing partial native owners; no operation is replayed on either path.
-pub unsafe fn decode_packet(
+/// Rejects invalid metadata, command spans or missing shader registrations. Diagnostic
+/// builds also audit every operation against the matched producer contract.
+pub unsafe fn prepare_packet(
     metadata: &[u8],
     operations: &[u8],
     completion: u64,
-    queries: &mut QueryLeaseCache,
     resolve_program: impl FnMut(u64) -> Result<(ProgramId, DxsoProgram), WireError>,
-) -> Result<FrameData, WireError> {
+) -> Result<ReplayPacket, WireError> {
     validate_range(
         completion,
         size_of::<LeaseCompletion>() as u64,
@@ -890,6 +1061,9 @@ pub unsafe fn decode_packet(
     let parsed = unsafe { parse_metadata(metadata)? };
     let mut table = WireReader::new(operations);
     let mut chunks = Vec::new();
+    #[cfg(any(test, debug_assertions))]
+    let diagnostic_inventory = parsed.has_inventory;
+    #[cfg(any(test, debug_assertions))]
     let mut command_spans = parsed.inventory.command_spans.iter();
     while let Some(mut record) = table.next_record()? {
         if record.tag != FRAME_CHUNK_TAG {
@@ -903,16 +1077,19 @@ pub unsafe fn decode_packet(
         if !record.payload.is_empty() {
             return Err(WireError::InvalidValue);
         }
-        if command_spans.next() != Some(&(address, u64::from(length))) {
+        validate_range(address, u64::from(length), 1)?;
+        #[cfg(any(test, debug_assertions))]
+        if diagnostic_inventory && command_spans.next() != Some(&(address, u64::from(length))) {
             return Err(WireError::InvalidValue);
         }
         // SAFETY: the caller retains inventoried immutable chunks; the full extent was checked.
-        chunks.push(unsafe { core::slice::from_raw_parts(address as *const u8, length as usize) });
+        chunks.push((address, length as usize));
     }
-    if command_spans.next().is_some() {
+    #[cfg(any(test, debug_assertions))]
+    if diagnostic_inventory && command_spans.next().is_some() {
         return Err(WireError::InvalidValue);
     }
-    decode_validated_chunks(parsed, &chunks, guard, queries, resolve_program)
+    prepare_chunks(parsed, chunks, guard, resolve_program)
 }
 
 #[cfg(test)]
@@ -934,49 +1111,84 @@ unsafe fn decode_chunks(
     };
     // SAFETY: the test caller supplies the same retained metadata contract.
     let parsed = unsafe { parse_metadata(metadata)? };
-    decode_validated_chunks(parsed, chunks, guard, queries, resolve_program)
+    if !parsed.has_inventory {
+        return Err(WireError::InvalidValue);
+    }
+    let chunks = chunks
+        .iter()
+        .map(|chunk| (chunk.as_ptr() as u64, chunk.len()))
+        .collect();
+    let packet = prepare_chunks(parsed, chunks, guard, resolve_program)?;
+    reconstruct_packet(packet, queries)
 }
 
-fn decode_validated_chunks(
+fn prepare_chunks(
     mut parsed: metadata::ParsedMetadata,
-    chunks: &[&[u8]],
-    mut guard: ReplayCompletion,
-    queries: &mut QueryLeaseCache,
+    chunks: Vec<(u64, usize)>,
+    guard: ReplayCompletion,
     mut resolve_program: impl FnMut(u64) -> Result<(ProgramId, DxsoProgram), WireError>,
-) -> Result<FrameData, WireError> {
+) -> Result<ReplayPacket, WireError> {
     let inventory = &mut parsed.inventory;
-    let ranges = std::mem::take(&mut inventory.ranges);
-    let mut validator = validation::Validation::new(inventory)?;
-    for bytes in chunks {
-        // SAFETY: validation only borrows pointers contained by the retained frame inventory.
-        let mut reader = unsafe { WireReader::new_trusted_with_ranges(bytes, &ranges) };
-        while let Some(mut record) = reader.next_record()? {
-            validator.operation(&EncoderOpcode::try_from(record.tag)?, &mut record.payload)?;
+    let registrations = std::mem::take(&mut inventory.registrations);
+    #[cfg(any(test, debug_assertions))]
+    if parsed.has_inventory {
+        // Diagnostic builds audit the matched producer contract before any adoption.
+        inventory.registrations.clone_from(&registrations);
+        let ranges = std::mem::take(&mut inventory.ranges);
+        let mut validator = validation::Validation::new(inventory)?;
+        for &(address, length) in &chunks {
+            // SAFETY: the retained command table contains authentic immutable producer spans.
+            let bytes = unsafe { core::slice::from_raw_parts(address as *const u8, length) };
+            // SAFETY: producer metadata describes the typed allocation inventory.
+            let mut reader = unsafe { WireReader::new_trusted_with_ranges(bytes, &ranges) };
+            while let Some(mut record) = reader.next_record()? {
+                validator.operation(&EncoderOpcode::try_from(record.tag)?, &mut record.payload)?;
+            }
         }
+        validator.finish()?;
     }
-    validator.finish()?;
-    // SAFETY: every record and single-adoption descriptor was validated without side effects.
-    let mut frame = unsafe { parsed.adopt()? };
-    // SAFETY: this second pass reconstructs the already-validated immutable draw stream.
-    let mut draws = unsafe { DrawReader::new() };
-    for bytes in chunks {
-        // SAFETY: the prevalidated inventory and immutable chunks remain retained by the caller.
-        let mut reader = unsafe { WireReader::new_trusted_with_ranges(bytes, &ranges) };
-        while let Some(mut record) = reader.next_record()? {
-            let op = read_operation(
-                &EncoderOpcode::try_from(record.tag)?,
-                &mut record.payload,
-                &mut draws,
-                &mut frame.scratch,
-                queries,
-                &mut resolve_program,
-            )?;
-            frame.ops.push(op);
-        }
+    let mut programs = Vec::with_capacity(registrations.len());
+    for registration in registrations {
+        programs.push((registration, resolve_program(registration)?));
     }
-    guard.rejected = false;
-    frame.replay_completion = Some(guard);
-    Ok(frame)
+    // SAFETY: the paired producer constructs well-formed records with unique descriptors;
+    // diagnostic builds additionally audit that contract before adoption.
+    let frame = unsafe { parsed.adopt()? };
+    // SAFETY: the frame's final completion guard retains the matched producer's immutable ranges.
+    Ok(unsafe { ReplayPacket::new(frame, chunks, programs, guard) })
+}
+
+/// Reconstruct a validated packet for core clients that need an owned operation list.
+///
+/// # Safety
+/// The complete semantically valid matched-producer packet and all inventoried allocations
+/// stay immutable and live through final completion, with unique ownership descriptors.
+/// # Errors
+/// Reports metadata, shader-registration or checked record-decoding failures.
+pub unsafe fn decode_packet(
+    metadata: &[u8],
+    operations: &[u8],
+    completion: u64,
+    queries: &mut QueryLeaseCache,
+    resolve_program: impl FnMut(u64) -> Result<(ProgramId, DxsoProgram), WireError>,
+) -> Result<FrameData, WireError> {
+    // SAFETY: the caller supplies the same retained immutable packet contract.
+    let packet = unsafe { prepare_packet(metadata, operations, completion, resolve_program)? };
+    reconstruct_packet(packet, queries)
+}
+
+fn reconstruct_packet(
+    mut packet: ReplayPacket,
+    queries: &mut QueryLeaseCache,
+) -> Result<FrameData, WireError> {
+    while let Some(op) = packet.next_op(queries)? {
+        // SAFETY: only the operation list changes; all snapshot scratch remains retained.
+        unsafe { packet.frame_mut() }.ops.push(op);
+    }
+    packet
+        .into_frame()
+        .map(|frame| *frame)
+        .map_err(|(error, _packet)| error)
 }
 
 unsafe fn parse_metadata(bytes: &[u8]) -> Result<metadata::ParsedMetadata, WireError> {

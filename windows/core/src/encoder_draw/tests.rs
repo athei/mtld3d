@@ -702,3 +702,77 @@ fn maximum_bound_stream_draw_validation_matches_reconstruction() {
         assert_draw_rejected(&payload[..length]);
     }
 }
+
+#[test]
+fn packed_stage_and_attribute_arrays_decode_empty_and_publish_only_when_complete() {
+    use crate::{draw_data::StageBinding, ids::TextureId};
+
+    let stages = [
+        StageBinding {
+            texture_id: TextureId::new_unique(),
+            sampler_state: [7; mtld3d_types::SAMPLER_STATE_COUNT],
+        },
+        StageBinding {
+            texture_id: TextureId::new_unique(),
+            sampler_state: [9; mtld3d_types::SAMPLER_STATE_COUNT],
+        },
+    ];
+    let delta = SnapshotDelta {
+        stages: Some((3, &stages)),
+        ..SnapshotDelta::default()
+    };
+    let mut slab = FrameSlab::new();
+    let mut writer = DrawWriter::new();
+    slab.push_record(1, |output| writer.encode_snapshot_delta(&delta, output))
+        .unwrap();
+    let payload = &slab.as_bytes()[6..];
+    let mut scratch = ScratchArena::new();
+    // SAFETY: this fixture contains only scalar stage fields, no borrowed byte ranges.
+    let mut decoder = unsafe { DrawReader::new() };
+    assert!(
+        decoder
+            .decode_snapshot_delta(
+                &mut WireReader::new(&payload[..payload.len() - 1]),
+                &mut scratch,
+            )
+            .is_err()
+    );
+    assert!(decoder.current.stage_bindings.is_none());
+    decoder.clear();
+    let first = decoder
+        .decode_snapshot_delta(&mut WireReader::new(payload), &mut scratch)
+        .unwrap();
+
+    let empty = SnapshotDelta {
+        stages: Some((0, &[])),
+        attrs: Some(SnapshotAttributes {
+            attrs: &[],
+            extents: &[0; 16],
+            used_streams: 0,
+            vdecl_hash: 0,
+        }),
+        ..SnapshotDelta::default()
+    };
+    let mut empty_slab = FrameSlab::new();
+    empty_slab
+        .push_record(1, |output| writer.encode_snapshot_delta(&empty, output))
+        .unwrap();
+    let second = decoder
+        .decode_snapshot_delta(
+            &mut WireReader::new(&empty_slab.as_bytes()[6..]),
+            &mut scratch,
+        )
+        .unwrap();
+    // SAFETY: scratch remains live and unchanged; subsequent allocations cannot move its chunks.
+    let first = unsafe { &*first.as_ptr() };
+    // SAFETY: same arena lifetime covers the second snapshot and its empty arrays.
+    let second = unsafe { &*second.as_ptr() };
+    let first_stages = first.stage_bindings.as_ref().unwrap();
+    assert_eq!(first_stages.iter().count(), 2);
+    for ((_, actual), expected) in first_stages.iter().zip(&stages) {
+        assert_eq!(actual.texture_id, expected.texture_id);
+        assert_eq!(actual.sampler_state, expected.sampler_state);
+    }
+    assert_eq!(second.stage_bindings.as_ref().unwrap().iter().count(), 0);
+    assert!(second.attrs.as_ref().unwrap().as_slice().is_empty());
+}
