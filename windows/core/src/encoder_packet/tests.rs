@@ -797,3 +797,112 @@ fn indexed_up_borrows_original_arena_payload_through_region_reuse_and_submit() {
     drop(submitted);
     assert!(owner.maintain());
 }
+
+#[test]
+fn retired_buffer_outlives_replay_and_recording_storage_reuse() {
+    use crate::{encoder_data::PendingVbibRetention, page_box_pool::PageBoxPool};
+
+    let pool = Box::leak(Box::new(PageBoxPool::new(65536)));
+    let cells = crate::guest_completions::CompletionPool::new();
+    let mut recorder = FrameRecorder::with_completion_pool(cells.clone());
+    recorder.pagebox_pool = Some(pool);
+    let mut frame = empty_frame();
+    let page = PageBox::new_zeroed(12);
+    let address = page.as_ptr();
+    recorder.capture_vbib_retention(
+        &mut frame.scratch,
+        PendingVbibRetention {
+            buffer_id: BufferId::new_unique(),
+            page_box: page,
+            last_submit_seq: 42,
+        },
+    );
+    let mut owner = seal(frame, recorder);
+    let mut packet = admit(&mut owner);
+    let mut native = None;
+    assert!(
+        replay(&mut packet, |command, _, _| {
+            assert!(matches!(command.opcode(), EncoderOpcode::RetainVbib));
+            assert_eq!(command.payload().len(), 48);
+            let record = borrow::<metadata::VbibRetentionRecord>(command.payload())?;
+            assert_eq!(record.last_submit_seq, 42);
+            // SAFETY: this packet retains the sole owner until the native guard retires.
+            native = Some(unsafe { record.page.adopt()? });
+            Ok(())
+        })
+        .unwrap()
+    );
+    assert!(!replay(&mut packet, |_, _, _| panic!("one retirement")).unwrap());
+    drop(
+        packet
+            .into_frame()
+            .unwrap_or_else(|(error, _)| panic!("complete replay: {error:?}")),
+    );
+    let mut leases: Vec<_> = owner.take_leases().collect();
+    assert_eq!(leases.len(), 1);
+    assert!(owner.take_recording_storage().is_some());
+    assert!(owner.maintain());
+    drop(owner);
+    assert!(pool.acquire(12).is_none());
+    assert!(!leases[0].maintain());
+    drop(native);
+    assert!(
+        !leases[0].maintain(),
+        "queued acknowledgment is not consumed"
+    );
+    cells.drain(
+        &mut crate::guest_completions::CompletionDrain::default(),
+        16,
+        |_| {},
+    );
+    let mut lease = leases.pop().unwrap();
+    assert!(lease.maintain());
+    for slot in lease.into_slots().into_iter().flatten() {
+        cells.recycle(slot);
+    }
+    assert_eq!(
+        pool.acquire(12).expect("retired original pages").as_ptr(),
+        address
+    );
+}
+
+#[test]
+fn failed_recording_retirement_waits_for_explicit_quiescence() {
+    use crate::{encoder_data::PendingVbibRetention, page_box_pool::PageBoxPool};
+
+    let pool = Box::leak(Box::new(PageBoxPool::new(65536)));
+    let mut recorder = FrameRecorder::new();
+    recorder.pagebox_pool = Some(pool);
+    assert!(
+        recorder
+            .finish_record(Err(WireError::AllocationFailed))
+            .is_err()
+    );
+    let mut frame = empty_frame();
+    let page = PageBox::new_zeroed(12);
+    let address = page.as_ptr();
+    recorder.capture_vbib_retention(
+        &mut frame.scratch,
+        PendingVbibRetention {
+            buffer_id: BufferId::new_unique(),
+            page_box: page,
+            last_submit_seq: 42,
+        },
+    );
+    frame.recorder = Some(recorder);
+    let Err((_, mut owner)) = FramePacket::new(frame) else {
+        panic!("sticky recording failure")
+    };
+    assert!(!owner.maintain());
+    assert_eq!(owner.take_leases().count(), 0);
+    assert!(pool.acquire(12).is_none());
+    // SAFETY: the fixture has no earlier GPU work or native users of this retired allocation.
+    unsafe { owner.cancel_unadopted() };
+    assert!(!owner.maintain());
+    owner.drain_test_completions(&mut crate::guest_completions::CompletionDrain::default());
+    assert!(owner.maintain());
+    assert_eq!(
+        pool.acquire(12).expect("canceled original pages").as_ptr(),
+        address
+    );
+}

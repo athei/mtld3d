@@ -14,7 +14,8 @@ use mtld3d_shared::{
 };
 
 use super::{
-    FrameEncoder, FrameEncoderFlags, PendingResourceRetention, destroy_resources_bulk,
+    FrameEncoder, FrameEncoderFlags, PendingResourceRetention, RetainedPages,
+    destroy_resources_bulk,
     upload_view::{TextureView, UploadView},
 };
 
@@ -129,7 +130,7 @@ impl FrameEncoder {
                 .push_back(PendingResourceRetention {
                     kind: DestroyKind::Buffer,
                     handle: handle.raw(),
-                    page_box: Some(page),
+                    page_box: Some(RetainedPages::Page(page)),
                     staging_arc: None,
                     seq: self.current_submit_seq,
                     from_texture: true,

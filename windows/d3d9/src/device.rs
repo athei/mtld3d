@@ -1307,9 +1307,8 @@ impl DeviceInner {
     /// bound shader is programmable, those pieces don't depend on FF state.
     ///
     /// Do NOT use for Set* sites that change the source path itself
-    /// (`SetVertexShader`, `SetPixelShader`) or write directly to the
-    /// shader-binding constants (`SetVertexShaderConstantF`,
-    /// `SetPixelShaderConstantF`) — those dirties are unconditional.
+    /// (`SetVertexShader`, `SetPixelShader`): those dirties are unconditional.
+    /// Float constant setters emit ordered mirror deltas without snapshot dirties.
     pub fn ff_aware_mask(&self, mask: SnapshotDirty) -> SnapshotDirty {
         let mut result = mask;
         // A pre-transformed (POSITIONT/XYZRHW) layout bypasses a bound VS —
@@ -12450,7 +12449,7 @@ extern "system" fn device_set_vertex_shader_constant_f(
     }
     // Redundant-set elimination: a write that leaves every mirror row
     // unchanged yields a byte-identical encoder delta, so skip the delta
-    // push + dirty mark when nothing changed. WoW re-uploads identical
+    // push when nothing changed. WoW re-uploads identical
     // constant rows frequently; this is the ShaderConst analogue of the
     // RenderState / VDECL gates.
     let changed = dev
@@ -12462,10 +12461,9 @@ extern "system" fn device_set_vertex_shader_constant_f(
         // VS const state, so emit_snapshot_deltas does not need to bump
         // `vs_constants` into the API-thread arena (the encoder snapshots
         // from its own mirror at emit_draw time).
+        // The delta invalidates the encoder's constant scratch cache directly.
+        // Programmable float registers do not change the captured snapshot.
         propagate_vs_const_delta(dev, start_register, slice);
-        // M2 skinning hot path: per-draw VS const update only needs the
-        // VS constants slice re-bumped; everything else stays cached.
-        dev.mark_snapshot_dirty(SnapshotDirty::VS_CONST);
     }
     dev.perf_mut()
         .record_keys_gate(KeysGate::SetVsConst, !changed);
@@ -13020,7 +13018,6 @@ extern "system" fn device_set_pixel_shader_constant_f(
         .write_ps_constants(start_register, slice);
     if changed {
         propagate_ps_const_delta(dev, start_register, slice);
-        dev.mark_snapshot_dirty(SnapshotDirty::PS_CONST);
     }
     dev.perf_mut()
         .record_keys_gate(KeysGate::SetPsConst, !changed);

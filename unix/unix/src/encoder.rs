@@ -10,7 +10,7 @@ use std::{
 };
 
 use log::{Level, debug, error, log_enabled, trace};
-pub use mtld3d_core::encoder_data::{FrameDataFlags, PendingVbibRetention};
+pub use mtld3d_core::encoder_data::FrameDataFlags;
 use mtld3d_core::{
     async_compile::{ClearHistory, ClearPlanes, DeferredPipelineId, JobTicket, TicketSource},
     buffer_rename::{BufferMapMode, stage_upload_needs_preserve},
@@ -19,9 +19,11 @@ use mtld3d_core::{
     convert::{FAN_PATTERN_MAX_TRIANGLES, fan_pattern_bytes, fill_fan_pattern_u16},
     depth_stencil_state::{DepthStencilSnapshot, key_from_snapshot, params_from_snapshot},
     dxso::{DxsoProgram, FfPsKey, FfVsKey, VariantKey, VsSamplerKinds, declared_ps_samplers},
+    encoder_packet::NativeVbibRetention,
     ff_state::{FF_VS_PALETTE_BASE_ROW, MAX_VERTEX_BLEND_MATRIX_INDEX},
     format::map_d3d_format,
     gpu_caps::GpuCaps,
+    guest_pages::RetiredPage,
     ids::{BufferId, DepthStencilKey, ProgramId, SamplerKey, TextureId},
     page_box::{PageBox, PageBoxRead},
     passes::{
@@ -1238,6 +1240,21 @@ impl FanIndexBuffer {
     };
 }
 
+/// Backing held until its Metal wrapper and GPU users have retired.
+enum RetainedPages {
+    Page(PageBox),
+    Retirement(RetiredPage),
+}
+
+impl RetainedPages {
+    const fn len(&self) -> usize {
+        match self {
+            Self::Page(page) => page.len(),
+            Self::Retirement(page) => page.len(),
+        }
+    }
+}
+
 /// One deferred Metal-handle retention entry owned by the encoder thread.
 ///
 /// On drain: `destroy_resources_bulk(kind, &[handle])` if `handle != 0`,
@@ -1276,12 +1293,12 @@ impl FanIndexBuffer {
 struct PendingResourceRetention {
     kind: DestroyKind,
     handle: u64,
-    /// Owned `PageBox` carried via unique ownership transfer.
+    /// Page-backed resources or an ownership-only retired guest allocation.
     ///
     /// VB/IB rename, visibility eviction, padded-blit transient. Released
     /// when this entry drops at drain time, after the wrapping `MTLBuffer`
     /// is destroyed.
-    page_box: Option<PageBox>,
+    page_box: Option<RetainedPages>,
     /// Shared `Arc<PageBox>` keepalive used by texture-staging entries.
     ///
     /// The PE-side staging is `Vec<Arc<PageBox>>` on `TextureInner` —
@@ -1330,7 +1347,7 @@ struct StagedUploadRetry {
 /// dangling pointer.
 #[derive(Default)]
 struct HeldBackings {
-    pageboxes: Vec<PageBox>,
+    pageboxes: Vec<RetainedPages>,
     staging_arcs: Vec<Arc<PageBox>>,
     staging_reads: Vec<PageBoxRead>,
 }
@@ -2767,7 +2784,7 @@ impl FrameEncoder {
                 .push_back(PendingResourceRetention {
                     kind: DestroyKind::Buffer,
                     handle: grown_out.handle.raw(),
-                    page_box: grown_out.backing,
+                    page_box: grown_out.backing.map(RetainedPages::Page),
                     staging_arc: None,
                     seq: self.current_submit_seq,
                     from_texture: false,
@@ -5977,8 +5994,8 @@ impl FrameEncoder {
     /// newer backing (mid-frame rename happened inside `ensure_vb`), the
     /// wrapper was already queued there, so only the `PageBox` is attached
     /// here.
-    fn intake_vbib_retention(&mut self, entry: PendingVbibRetention) {
-        let PendingVbibRetention {
+    fn intake_vbib_retention(&mut self, entry: NativeVbibRetention) {
+        let NativeVbibRetention {
             buffer_id,
             page_box,
             last_submit_seq,
@@ -6032,7 +6049,7 @@ impl FrameEncoder {
             .push_back(PendingResourceRetention {
                 kind: DestroyKind::Buffer,
                 handle: mtl_buffer.raw(),
-                page_box: Some(page_box),
+                page_box: Some(RetainedPages::Retirement(page_box)),
                 staging_arc: None,
                 seq,
                 from_texture: false,
@@ -6395,6 +6412,10 @@ impl FrameEncoder {
             if entry.from_texture {
                 continue;
             }
+            let RetainedPages::Page(pb) = pb else {
+                // The guest guard acknowledges only here, after every wrapper was destroyed.
+                continue;
+            };
             let len = pb.len();
             if pool.recycle(pb).is_none() {
                 self.perf.bump_pagebox_pool_recycled(len);
@@ -7456,7 +7477,7 @@ impl FrameEncoder {
             .push_back(PendingResourceRetention {
                 kind: DestroyKind::Buffer,
                 handle: padded_handle.raw(),
-                page_box: Some(padded),
+                page_box: Some(RetainedPages::Page(padded)),
                 staging_arc: None,
                 seq: self.current_submit_seq,
                 from_texture: true,
@@ -7582,7 +7603,7 @@ impl FrameEncoder {
             .push_back(PendingResourceRetention {
                 kind: DestroyKind::Buffer,
                 handle: staging_handle.raw(),
-                page_box: Some(staging),
+                page_box: Some(RetainedPages::Page(staging)),
                 staging_arc: None,
                 seq: self.current_submit_seq,
                 from_texture: true,
@@ -7926,7 +7947,7 @@ impl FrameEncoder {
             }
             self.perf.bump_vbib_retained_sub(retry.page_box.len());
             self.sub_retained_bytes(retry.page_box.len());
-            held.pageboxes.push(retry.page_box);
+            held.pageboxes.push(RetainedPages::Page(retry.page_box));
         }
         // Park the jobs' guards with the other staging keepalives until
         // the bulk destroy releases every wrapper around their pages.
@@ -8087,7 +8108,7 @@ impl FrameEncoder {
             buffers.push(fan.handle.raw());
         }
         if let Some(page_box) = fan.backing {
-            held.pageboxes.push(page_box);
+            held.pageboxes.push(RetainedPages::Page(page_box));
         }
         self.wait_for_gpu_idle();
         // Finalize before the pool goes: the wait has retired the frame that
@@ -8100,7 +8121,7 @@ impl FrameEncoder {
             if !handle.is_null() {
                 buffers.push(handle.raw());
             }
-            held.pageboxes.push(page_box);
+            held.pageboxes.push(RetainedPages::Page(page_box));
         }
         held
     }
@@ -8886,8 +8907,8 @@ fn run_frame(
                                 mtld3d_core::encoder_packet::metadata::VbibRetentionRecord,
                             >(command.payload())?;
                             // SAFETY: this is the sole ordered adoption of the retained page descriptor.
-                            let page_box = unsafe { record.page.adopt_owned()? };
-                            frame.retain_vbib(PendingVbibRetention {
+                            let page_box = unsafe { record.page.adopt()? };
+                            frame.retain_vbib(NativeVbibRetention {
                                 buffer_id: mtld3d_core::ids::BufferId::from_raw(record.buffer_id),
                                 page_box,
                                 last_submit_seq: record.last_submit_seq,
@@ -9536,7 +9557,7 @@ fn retire_visibility_buffer(enc: &mut FrameEncoder, submit_seq: u64) {
         .push_back(PendingResourceRetention {
             kind: DestroyKind::Buffer,
             handle: mtl_buffer.raw(),
-            page_box: Some(page_box),
+            page_box: Some(RetainedPages::Page(page_box)),
             staging_arc: None,
             seq: release_seq,
             from_texture: false,

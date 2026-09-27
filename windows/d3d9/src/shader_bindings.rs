@@ -111,8 +111,8 @@ impl ShaderBindings {
     ///
     /// Redundant-set elimination: a same-value constant write produces a
     /// byte-identical mirror (and so a byte-identical encoder delta), so
-    /// callers gate the encoder propagation + snapshot dirty-mark on the
-    /// returned bool. The comparison preserves exact float bits, including
+    /// callers gate encoder propagation on the returned bool.
+    /// The comparison preserves exact float bits, including
     /// NaN payloads and signed zero.
     pub fn write_vs_constants(&mut self, start: u32, data: &[[f32; 4]]) -> bool {
         let start = start as usize;

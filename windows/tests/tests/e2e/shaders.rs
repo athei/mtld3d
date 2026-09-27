@@ -1990,7 +1990,7 @@ fn constant_snapshots_survive_readback_and_fixed_function_transition() {
     assert_eq!(h.clear_vertex_shader(), 0);
     assert_eq!(h.clear_pixel_shader(), 0);
     assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE), 0);
-    for position in [-0.5, 0.0] {
+    for (index, position) in [-0.5, 0.0].into_iter().enumerate() {
         let ff = triangle_at(position).map(|v| PosColorVertex {
             x: v.x,
             y: v.y,
@@ -1998,14 +1998,20 @@ fn constant_snapshots_survive_readback_and_fixed_function_transition() {
             color: 0xFF00_FF00,
         });
         assert_eq!(h.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &ff), 0);
+        if index == 0 {
+            // Updating programmable registers with a clean FF snapshot must
+            // leave its constants unchanged until the programmable rebind.
+            assert_eq!(h.set_vertex_shader_constant_f(0, &[0.5, 0.0, 0.0, 0.0]), 0);
+            assert_eq!(h.set_pixel_shader_constant_f(0, &[0.0, 0.0, 1.0, 1.0]), 0);
+        }
     }
     assert_eq!(h.set_vertex_shader(&vs), 0);
     assert_eq!(h.set_pixel_shader(&ps), 0);
     assert_eq!(h.set_fvf(D3DFVF_XYZ), 0);
-    // Restore the same programmable bytes after FF bound different constants.
+    // Rebinding consumes the programmable registers updated during FF.
     assert_eq!(h.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &tri), 0);
-    assert_eq!(h.set_vertex_shader_constant_f(0, &[0.5, 0.0, 0.0, 0.0]), 0);
-    assert_eq!(h.set_pixel_shader_constant_f(0, &[0.0, 0.0, 1.0, 1.0]), 0);
+    assert_eq!(h.set_vertex_shader_constant_f(0, &[-0.5, 0.0, 0.0, 0.0]), 0);
+    assert_eq!(h.set_pixel_shader_constant_f(0, &[1.0, 0.0, 0.0, 1.0]), 0);
     assert_eq!(h.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &tri), 0);
     assert_eq!(h.end_scene(), 0);
     assert_eq!(h.present(), 0);

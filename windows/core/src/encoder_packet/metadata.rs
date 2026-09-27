@@ -9,7 +9,9 @@ use super::FrameRecorder;
 use crate::{
     encoder_data::{FrameData, PendingVbibRetention, StagingWarmupEntry, VbibWarmupEntry},
     encoder_records::TextureRecord,
-    guest_pages::{GuestPageDescriptor, GuestPageLease},
+    guest_pages::{
+        GuestPageDescriptor, GuestPageLease, GuestRetirementLease, RetiredPageDescriptor,
+    },
     perf::FramePerfPayload,
 };
 
@@ -35,7 +37,7 @@ pub struct StagingWarmupRecord {
 pub struct VbibRetentionRecord {
     pub buffer_id: u64,
     pub last_submit_seq: u64,
-    pub page: GuestPageDescriptor,
+    pub page: RetiredPageDescriptor,
 }
 
 #[repr(C, align(8))]
@@ -215,13 +217,10 @@ impl FrameRecorder {
         scratch: &mut crate::scratch::ScratchArena,
         entry: PendingVbibRetention,
     ) {
-        let lease = GuestPageLease::for_recyclable_pooled(
-            entry.page_box,
-            &self.completion_pool,
-            self.pagebox_pool,
-        );
+        let lease =
+            GuestRetirementLease::new(entry.page_box, &self.completion_pool, self.pagebox_pool);
         let page = lease.descriptor();
-        self.pages.push(lease);
+        self.retirements.push(lease);
         self.metadata_command(
             scratch,
             mtld3d_shared::encoder_protocol::EncoderOpcode::RetainVbib,
@@ -489,7 +488,7 @@ const _: () = {
     assert!(core::mem::offset_of!(StagingWarmupRecord, page) == 8);
     assert!(core::mem::offset_of!(StagingWarmupRecord, level) == 64);
     assert!(core::mem::offset_of!(StagingWarmupRecord, reserved) == 68);
-    assert!(size_of::<VbibRetentionRecord>() == 72);
+    assert!(size_of::<VbibRetentionRecord>() == 48);
     assert!(align_of::<VbibRetentionRecord>() == 8);
     assert!(core::mem::offset_of!(VbibRetentionRecord, buffer_id) == 0);
     assert!(core::mem::offset_of!(VbibRetentionRecord, last_submit_seq) == 8);

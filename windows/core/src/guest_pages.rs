@@ -21,6 +21,9 @@ use crate::{
     page_box_pool::PageBoxPool,
 };
 
+mod retirement;
+pub use retirement::{GuestRetirementLease, RetiredPage, RetiredPageDescriptor};
+
 /// PE-owned allocation and acknowledgment storage for one published native lease.
 ///
 /// Retain this value until `maintain` returns true, or cancel it before native adoption. Native

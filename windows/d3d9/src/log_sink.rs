@@ -1,9 +1,10 @@
 //! The PE-side logger's sink: a queue drained by one logging thread.
 //!
-//! `env_logger` hands every formatted line to [`Sink::write`], which only
-//! pushes the bytes onto an unbounded channel: no unix call and no blocking,
-//! so the API and encoder threads pay an allocation and a queue push per line
-//! and nothing else. One logging thread drains the queue and forwards each
+//! `env_logger` hands every formatted line to [`Sink::write`], which copies
+//! the bytes into an unbounded channel without a Unix call or a queue-capacity
+//! wait. PE callers pay formatting, a line allocation and a queue push. Native
+//! encoder workers use the Unix logger directly instead of this sink.
+//! One logging thread drains the queue and forwards each
 //! line through the `WriteLog` thunk into the process's log file, which the
 //! unix side owns. Lines logged while no thread runs wait in the queue; the
 //! queue keeps their order.

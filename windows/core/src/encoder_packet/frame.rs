@@ -5,13 +5,20 @@ use std::ptr::NonNull;
 use mtld3d_shared::frame_metadata::FrameMetadata;
 
 use super::{ReplayCompletion, metadata::FrameView};
-use crate::scratch::ScratchArena;
+use crate::{guest_pages::RetiredPage, ids::BufferId, scratch::ScratchArena};
+
+/// Native retirement of a uniquely owned PE buffer allocation.
+pub struct NativeVbibRetention {
+    pub buffer_id: BufferId,
+    pub page_box: RetiredPage,
+    pub last_submit_seq: u64,
+}
 
 /// Native allocations and the immutable metadata lease retained through final submit reads.
 pub struct NativeFrame {
     header: NonNull<FrameMetadata>,
     scratch: ScratchArena,
-    pending_vbib_retentions: Vec<crate::encoder_data::PendingVbibRetention>,
+    pending_vbib_retentions: Vec<NativeVbibRetention>,
     // Last: publish only after every native scratch reference has become unreachable.
     pub(super) replay_completion: Option<ReplayCompletion>,
 }
@@ -40,11 +47,11 @@ impl NativeFrame {
         unsafe { FrameView::from_validated_header(header) }
     }
 
-    pub fn retain_vbib(&mut self, entry: crate::encoder_data::PendingVbibRetention) {
+    pub fn retain_vbib(&mut self, entry: NativeVbibRetention) {
         self.pending_vbib_retentions.push(entry);
     }
 
-    pub fn take_vbib_retentions(&mut self) -> Vec<crate::encoder_data::PendingVbibRetention> {
+    pub fn take_vbib_retentions(&mut self) -> Vec<NativeVbibRetention> {
         core::mem::take(&mut self.pending_vbib_retentions)
     }
 
