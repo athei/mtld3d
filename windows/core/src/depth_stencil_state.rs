@@ -52,6 +52,7 @@ impl DepthStencilKey {
 /// D3D9 stores these as DWORDs but every value is a small enum, so the
 /// snapshot narrows them to `u8` and stays cheap to carry per draw.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(C)]
 pub struct StencilFaceState {
     pub func: u8,
     pub fail_op: u8,
@@ -104,6 +105,7 @@ const REPLACE_FACE: StencilFaceState = StencilFaceState {
 /// (`setStencilReferenceValue`), not on the state object, so folding it in
 /// here would mint a distinct Metal object per reference value.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(C, align(4))]
 pub struct DepthStencilSnapshot {
     pub depth_enable: u8,
     pub depth_write: u8,

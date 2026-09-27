@@ -55,6 +55,12 @@ pub enum EncoderOpcode {
     SetDumpDraw = 39,
     StageUpload = 40,
     SetSnapshot = 41,
+    WarmupTexture = 42,
+    WarmupBuffer = 43,
+    WarmupStaging = 44,
+    RetainVbib = 45,
+    SetLayerPacing = 46,
+    SetGamma = 47,
 }
 
 /// How far a frame submission waits on the native pipeline.

@@ -40,6 +40,7 @@ use super::{
 bitflags::bitflags! {
     /// Per-variant boolean features folded into the PS shader cache key.
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+    #[repr(transparent)]
     pub struct VariantFlags: u8 {
         /// Table-fog source select, only meaningful when `fog_table_mode != 0`.
         ///
@@ -128,7 +129,8 @@ bitflags::bitflags! {
 /// emitted).
 // Copy is required by the encoder's pass-specific key adjustment and cache-key probes.
 // The key contains only narrow masks and flags; no resource or heap storage is copied.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(C)]
 pub struct VariantKey {
     pub alpha_func: u8,
     pub fog_mode: u8,
@@ -141,6 +143,8 @@ pub struct VariantKey {
     /// params arrive in `fog_data[1]` = (start, end, density, depth-bias) on
     /// buffer 13.
     pub fog_table_mode: u8,
+    /// Initialized padding in the canonical capture record.
+    pub reserved: u8,
     /// Bit `i` set ⇒ sampler slot `i` is bound to a depth-format texture.
     ///
     /// The PS emitter outputs `depth2d<float>` for that slot and wraps
@@ -209,6 +213,26 @@ pub struct VariantKey {
     pub flags: VariantFlags,
 }
 
+// Preserve the existing cache identity: canonical padding is not shader state.
+impl core::hash::Hash for VariantKey {
+    fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
+        core::hash::Hash::hash(&self.alpha_func, state);
+        core::hash::Hash::hash(&self.fog_mode, state);
+        core::hash::Hash::hash(&self.fog_table_mode, state);
+        core::hash::Hash::hash(&self.depth_sampler_mask, state);
+        core::hash::Hash::hash(&self.depth_fetch_mask, state);
+        core::hash::Hash::hash(&self.fetch4_mask, state);
+        core::hash::Hash::hash(&self.fetch4_alpha_mask, state);
+        core::hash::Hash::hash(&self.raw_depth_red_mask, state);
+        core::hash::Hash::hash(&self.volume_sampler_mask, state);
+        core::hash::Hash::hash(&self.cube_sampler_mask, state);
+        core::hash::Hash::hash(&self.tt_projected_mask, state);
+        core::hash::Hash::hash(&self.color_out_mask, state);
+        core::hash::Hash::hash(&self.sample_mask, state);
+        core::hash::Hash::hash(&self.flags, state);
+    }
+}
+
 /// Emit the Fetch4 texel ordering through one native gather.
 ///
 /// Fetch4 selects the point-addressed texel and its right/bottom neighbours.
@@ -240,6 +264,7 @@ pub(super) fn fetch4_sample(slot: u16, uv: &str, depth: bool, alpha: bool) -> St
 /// neither bit set is 2D, which is also what an unbound slot gets: the black
 /// fallback the draw path binds there is 2D as well.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[repr(C)]
 pub struct VsSamplerKinds {
     /// Bit `i` set ⇒ vertex slot `i` binds a volume (3D) texture.
     pub volume_mask: u8,

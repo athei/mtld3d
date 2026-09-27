@@ -964,10 +964,11 @@ fn sample_window() -> PerfWindow {
     scalls[SurfaceSubCategory::Misc as usize] = 15;
     let s = FrameSample {
         counters: FrameCounters {
+            reserved: 0,
             reset_epoch: 0,
-            reset_epoch_saturated: false,
+            reset_epoch_saturated: 0,
             inverse_view: [0; 3],
-            inverse_view_saturated: false,
+            inverse_view_saturated: 0,
             api_cycles_by_category: cats,
             api_call_counts_by_category: calls,
             vb_rename: 12,
@@ -1402,7 +1403,7 @@ fn inverse_rates_are_undefined_for_empty_or_saturated_counts() {
     assert!(out.contains("enabled-hit=n/a saturated=false"));
     api.counters.inverse_view[1] = u64::MAX;
     api.record_inverse_view(&InverseViewUse::Hit);
-    assert!(api.counters.inverse_view_saturated);
+    assert!(api.counters.inverse_view_saturated != 0);
     assert_eq!(api.counters.inverse_view[1], u64::MAX);
     api.drain_into_payload(&mut payload);
     s.counters = payload.counters;
@@ -1411,7 +1412,7 @@ fn inverse_rates_are_undefined_for_empty_or_saturated_counts() {
     assert!(out.contains("enabled-hit=n/a saturated=true"));
     // Aggregation overflow is also visible even if each frame fit individually.
     w.reset();
-    s.counters.inverse_view_saturated = false;
+    s.counters.inverse_view_saturated = 0;
     w.accumulate(&s);
     w.accumulate(&s);
     assert!(w.inverse_epochs[0].saturated);
@@ -1419,7 +1420,7 @@ fn inverse_rates_are_undefined_for_empty_or_saturated_counts() {
     api.advance_reset_epoch();
     api.drain_into_payload(&mut payload);
     assert_eq!(payload.counters.reset_epoch, u64::MAX);
-    assert!(payload.counters.reset_epoch_saturated);
+    assert!(payload.counters.reset_epoch_saturated != 0);
 }
 
 #[test]

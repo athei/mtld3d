@@ -1,115 +1,116 @@
-use mtld3d_shared::encoder_wire::{FrameSlab, LeaseCompletion};
+use mtld3d_shared::{MetalHandle, mtl::PixelFormat, record_handle::DeviceRecordHandle};
 
 use super::*;
-use crate::{encoder_packet, guest_queries::QueryLeaseCache, ids::ProgramId, page_box::PageBox};
+use crate::{encoder_data::FrameInit, passes::BackbufferContents, render_scale::RenderScale};
 
-#[test]
-fn release_footer_is_accepted_by_debug_decoder_without_dropping_owners() {
-    let (mut frame, weak_query) = encoder_packet::tests::frame_with_leases();
-    frame.flags.insert(FrameDataFlags::NO_PRESENT);
-    frame.vbib_retentions.push(PendingVbibRetention {
-        buffer_id: crate::ids::BufferId::new_unique(),
-        page_box: PageBox::new_zeroed(4),
-        last_submit_seq: 1,
-    });
-    let mut recorder = FrameRecorder::new();
-    for op in core::mem::take(&mut frame.ops) {
-        recorder.try_record(&mut frame.scratch, op).unwrap();
-    }
-    let mut metadata = FrameSlab::new();
-    metadata
-        .push_record(encoder_packet::FRAME_METADATA_TAG, |writer| {
-            write_metadata_with_inventory(&mut frame, writer, &mut recorder, false)
-        })
-        .unwrap();
-    assert_eq!(recorder.pages.len(), 3);
-    assert_eq!(recorder.queries.len(), 1);
-    assert_eq!(recorder.registrations, [41]);
-    assert!(weak_query.upgrade().is_some());
-    // SAFETY: frame and recorder retain authentic immutable producer allocations.
-    let parsed = unsafe { encoder_packet::parse_metadata(metadata.as_bytes()) }.unwrap();
-    assert!(!parsed.has_inventory);
-    assert_eq!(parsed.frame.flags, FrameDataFlags::NO_PRESENT);
-    assert!(parsed.inventory.ranges.is_empty());
-    assert!(parsed.inventory.pages.is_empty());
-    assert!(parsed.inventory.queries.is_empty());
-    assert!(parsed.inventory.redirties.is_empty());
-    assert!(parsed.inventory.replies_u64.is_empty());
-    assert!(parsed.inventory.replies_bool.is_empty());
-    assert!(parsed.inventory.readbacks.is_empty());
-    assert!(parsed.inventory.command_spans.is_empty());
-    assert!(parsed.inventory.backings.is_empty());
-    assert_eq!(parsed.inventory.registrations, [41]);
-    assert_eq!(parsed.retained.len(), 1);
-    drop(parsed);
-
-    let completion = LeaseCompletion::new();
-    let mut queries = QueryLeaseCache::default();
-    let tokens = [
-        0xFFFF_0200,
-        0x0200_0001,
-        0x800F_0800,
-        0xA0E4_0000,
-        0x0000_FFFF,
-    ];
-    let mut resolutions = 0;
-    // SAFETY: the typed recorder created every command and unique descriptor;
-    // frame, recorder, metadata and completion outlive all native consumers.
-    let decoded = unsafe {
-        encoder_packet::decode_packet(
-            metadata.as_bytes(),
-            recorder.slab.descriptor_bytes(),
-            std::ptr::from_ref(&completion) as u64,
-            &mut queries,
-            |registration| {
-                assert_eq!(registration, 41);
-                resolutions += 1;
-                Ok((
-                    ProgramId::from_tokens(&tokens),
-                    crate::dxso::parse(&tokens).unwrap(),
-                ))
-            },
-        )
-    }
-    .unwrap();
-    assert_eq!(resolutions, 1);
-    assert_eq!(decoded.ops.len(), 4);
-    assert_eq!(decoded.vbib_retentions.len(), 1);
-    assert!(!completion.is_complete());
-    drop(decoded);
-    assert!(completion.is_complete());
-    drop(queries);
-    drop(recorder);
-    assert!(weak_query.upgrade().is_none());
+fn frame() -> FrameData {
+    FrameData::new(&FrameInit {
+        device_handle: MetalHandle::NULL,
+        record_handle: DeviceRecordHandle::NULL,
+        backbuffer_handle: MetalHandle::NULL,
+        backbuffer_srgb_handle: MetalHandle::NULL,
+        backbuffer_msaa_handle: MetalHandle::NULL,
+        backbuffer_msaa_srgb_handle: MetalHandle::NULL,
+        backbuffer_sample_count: 1,
+        layer_handle: MetalHandle::NULL,
+        view_handle: MetalHandle::NULL,
+        backbuffer_width: 320,
+        backbuffer_height: 200,
+        backbuffer_format: PixelFormat::Bgra8Unorm,
+        render_scale: RenderScale::IDENTITY,
+        backbuffer_contents: BackbufferContents::Undefined,
+        depth_texture: MetalHandle::NULL,
+        depth_has_stencil: false,
+    })
 }
 
 #[test]
-fn release_reader_consumes_debug_footer_and_keeps_only_registrations() {
-    let backing = [0u8; 16];
-    let mut slab = FrameSlab::new();
-    slab.push_record(1, |writer| {
-        writer.u32(1)?;
-        writer.u64(backing.as_ptr() as u64)?;
-        writer.u64(backing.len() as u64)?;
-        vec![[1_u64; 7]].write_wire(writer)?;
-        vec![[2_u64; 2]].write_wire(writer)?;
-        vec![41_u64, 42].write_wire(writer)?;
-        vec![[3_u64; 2]].write_wire(writer)?;
-        vec![4_u64].write_wire(writer)?;
-        vec![5_u64].write_wire(writer)?;
-        vec![[6_u64; 2]].write_wire(writer)?;
-        vec![[7_u64; 2]].write_wire(writer)?;
-        vec![[8_u64; 2]].write_wire(writer)
-    })
-    .unwrap();
-    let payload = &slab.as_bytes()[6..];
-    // SAFETY: the only byte range names backing, retained unchanged through this test.
-    let mut reader = unsafe { WireReader::new_trusted(payload) };
-    assert_eq!(read_inventory_registrations(&mut reader).unwrap(), [41, 42]);
-    assert!(reader.is_empty());
-    for length in 0..payload.len() {
-        // SAFETY: any complete range in this prefix names the same retained backing.
-        let mut truncated = unsafe { WireReader::new_trusted(&payload[..length]) };
-        assert!(read_inventory_registrations(&mut truncated).is_err());
+fn header_borrows_the_original_arena_payload() {
+    let mut frame = frame();
+    frame.perf_mut().set_present_block_cycles(77);
+    let payload = core::ptr::from_ref(frame.perf());
+    let recorder = FrameRecorder::new();
+    let mut metadata = MetadataStorage::new();
+    metadata.seal(&mut frame, &recorder).unwrap();
+    // SAFETY: frame and recorder retain the initialized header and its only optional payload.
+    let bytes = unsafe { metadata.as_bytes() };
+    // SAFETY: the retained frame contains the initialized canonical header.
+    let view = unsafe { FrameView::from_bytes(bytes) }.unwrap();
+    assert_eq!(view.header().backbuffer_width, 320);
+    assert_eq!(view.header().backbuffer_height, 200);
+    assert_eq!(size_of_val(view.header()), size_of::<FrameMetadata>());
+    #[cfg(perf_tracking)]
+    assert!(core::ptr::eq(view.perf().unwrap().unwrap(), payload));
+    #[cfg(not(perf_tracking))]
+    {
+        let _ = payload;
+        assert!(view.perf().unwrap().is_none());
     }
+}
+
+#[test]
+fn warmup_capture_is_already_a_command_before_frame_sealing() {
+    let mut frame = frame();
+    frame.push_buffer_warmup(VbibWarmupEntry {
+        buffer_id: crate::ids::BufferId::new_unique(),
+        backing_ptr: 0x1000,
+        backing_len: 4096,
+        backing_generation: 7,
+        map_mode: crate::buffer_rename::BufferMapMode::Direct,
+    });
+    let recorder = frame.recorder.as_ref().unwrap();
+    assert_eq!(recorder.len(), 1);
+    assert_eq!(recorder.metadata.header, 0);
+}
+
+#[test]
+fn multiple_gamma_changes_retain_each_original_lut_until_replay() {
+    let mut frame = frame();
+    let first = Box::new([17; crate::gamma::LUT_LANES]);
+    let second = Box::new([29; crate::gamma::LUT_LANES]);
+    let first_pointer = first.as_ptr();
+    let second_pointer = second.as_ptr();
+    frame.set_apply_gamma(Some(crate::gamma::Change::Apply(first)));
+    frame.set_apply_gamma(Some(crate::gamma::Change::Apply(second)));
+    frame.set_apply_gamma(Some(crate::gamma::Change::Remove));
+    let recorder = frame.recorder.as_ref().unwrap();
+    assert_eq!(recorder.len(), 3);
+    assert_eq!(recorder.gamma_tables.len(), 2);
+    assert_eq!(recorder.gamma_tables[0].table.as_ptr(), first_pointer);
+    assert_eq!(recorder.gamma_tables[1].table.as_ptr(), second_pointer);
+    assert_eq!(recorder.gamma_tables[0].table[0], 17);
+    assert_eq!(recorder.gamma_tables[1].table[0], 29);
+}
+
+#[test]
+fn retired_scratch_forgets_its_perf_pointer_before_reuse() {
+    let mut frame = frame();
+    frame.perf_mut().set_present_block_cycles(19);
+    let previous = core::ptr::from_ref(frame.perf());
+    let scratch = frame.take_recording_scratch();
+    #[cfg(perf_tracking)]
+    assert!(!core::ptr::eq(previous, frame.perf()));
+    #[cfg(not(perf_tracking))]
+    let _ = previous;
+    frame.scratch = scratch;
+    frame.perf_mut().set_present_block_cycles(31);
+    assert!(frame.scratch.bytes_used() > 0 || !cfg!(perf_tracking));
+}
+
+#[cfg(perf_tracking)]
+#[test]
+fn telemetry_follows_safe_arena_swaps_and_direct_clear() {
+    let mut frame = frame();
+    frame.perf_mut().set_present_block_cycles(3);
+    let original = core::ptr::from_ref(frame.perf());
+    let mut other = crate::scratch::ScratchArena::new();
+    other.perf_mut().set_present_block_cycles(5);
+    let replacement = core::ptr::from_ref(other.perf());
+    core::mem::swap(&mut frame.scratch, &mut other);
+    assert!(core::ptr::eq(frame.perf(), replacement));
+    assert!(core::ptr::eq(other.perf(), original));
+    frame.scratch.clear();
+    assert!(!core::ptr::eq(frame.perf(), replacement));
+    drop(other);
+    frame.perf_mut().set_present_block_cycles(7);
 }

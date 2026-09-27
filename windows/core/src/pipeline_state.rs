@@ -31,6 +31,7 @@ bitflags::bitflags! {
     /// d3d9 layer's `RenderStateSnapshot` (per-draw RS capture). Packed
     /// into a u8; bits encode boolean pipeline controls derived from D3D9 RS.
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+    #[repr(transparent)]
     pub struct PipelineRsFlags: u8 {
         const BLEND_ENABLE = 1 << 0;
         const SEPARATE_ALPHA_BLEND = 1 << 1;
@@ -77,6 +78,7 @@ bitflags::bitflags! {
 /// blend-factor / depth-bias (per-encoder runtime state set via Metal
 /// command API).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[repr(C)]
 pub struct PipelineRsBits {
     pub flags: PipelineRsFlags,
     /// `D3DRS_SRCBLEND` (raw D3DBLEND value, fits u8: 1..=19).

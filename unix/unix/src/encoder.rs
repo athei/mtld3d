@@ -10,9 +10,7 @@ use std::{
 };
 
 use log::{Level, debug, error, log_enabled, trace};
-pub use mtld3d_core::encoder_data::{
-    FrameData, FrameDataFlags, PendingVbibRetention, StagingWarmupEntry, VbibWarmupEntry,
-};
+pub use mtld3d_core::encoder_data::{FrameDataFlags, PendingVbibRetention};
 use mtld3d_core::{
     async_compile::{ClearHistory, ClearPlanes, DeferredPipelineId, JobTicket, TicketSource},
     buffer_rename::{BufferMapMode, stage_upload_needs_preserve},
@@ -57,9 +55,8 @@ use mtld3d_shared::{
     CompileShaderLibraryParams, CopyBufferToBufferInfo, CopyBufferToTextureInfo,
     CreateBuffersBatchParams, CreateTextureSliceViewParams, CreateTexturesBatchParams,
     DestroyResourcesBulkParams, EnsureBlitPipelineParams, EnsureClearQuadPipelineParams,
-    ExtraColorDesc, GetTaskFaultsParams, MetalHandle, PassDescriptor, SetDisplaySyncEnabledParams,
-    SetGammaRampParams, SetPresentWaitPolicyParams, SubmitFrameParams, TextureCreateDesc,
-    WaitForGpuRetireParams, WaitForPresentIdleParams,
+    ExtraColorDesc, GetTaskFaultsParams, MetalHandle, PassDescriptor, SetPresentWaitPolicyParams,
+    SubmitFrameParams, TextureCreateDesc, WaitForGpuRetireParams, WaitForPresentIdleParams,
     encoder_protocol::EncoderSubmitMode,
     mtl::{
         BufferKind, ClearQuadFlags, CullMode, DestroyKind, LoadAction, PRESENT_PIPELINE_DEPTH,
@@ -85,7 +82,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::{
     LOG_TARGET,
-    draw::{self, CurrentSnapshotPtr, IndexSource, PsKey, ScratchSlice, ShaderRef, VertexSource},
+    draw::{self, CurrentSnapshotPtr, PsKey, ScratchSlice, ShaderRef},
     native_call,
 };
 
@@ -103,12 +100,19 @@ const CONSTANT_ROWS: usize = 256;
 
 mod compile;
 mod depth;
+mod upload_view;
 pub use compile::StretchCopyTargets;
 pub use mtld3d_core::encoder_data::{
-    BlitSide, ColorFillTarget, ColorRtBinding, DepthTransfer, Op, ResampledUpload,
-    RetiredColorTarget, TextureInfo, TextureUploadJob,
+    BlitSide, ColorFillTarget, ColorRtBinding, DepthTransfer, ResampledUpload, RetiredColorTarget,
+    TextureUploadJob,
 };
-use ops::ExecuteOp;
+use mtld3d_core::{
+    encoder_draw::draw_record::{IndexView, VertexView},
+    encoder_packet::NativeFrame,
+    encoder_records::{TextureRecord, TextureUploadRecord},
+};
+use mtld3d_shared::encoder_wire::WireError;
+use upload_view::{TextureView, UploadView};
 mod ops;
 
 /// Sub-target for the once-per-distinct sampler-state diagnostic.
@@ -195,15 +199,15 @@ const RGBA_BYTE_LEN: u32 = 16;
 /// texels again. The queue carries the rectangle back and the next bind
 /// retries. `reason` names the emit path that produced nothing, so a
 /// subresource that spends its retry budget says which one on the way out.
-fn decline_texture_upload(job: &TextureUploadJob, reason: &str) {
+fn decline_texture_upload(job: &UploadView<'_>, reason: &str) {
     let subresource = job.redirty_subresource();
     let entry = RedirtyEntry {
         subresource,
-        face: job.destination_slice,
-        level: job.level,
+        face: job.destination_slice(),
+        level: job.level(),
         rect: job.redirty_rect(),
     };
-    if job.redirty.decline(entry) {
+    if job.redirty().decline(entry) {
         return;
     }
     mtld3d_shared::log_once_warn_by!(
@@ -449,16 +453,11 @@ struct SubmitPacket {
     failure_ptr: u64,
     params: SubmitFrameParams,
     payload: FramePayload,
-    /// The frame's `FrameData`, kept alive until the replay finishes.
+    /// Native snapshot storage and the immutable PE command lease.
     ///
-    /// Several per-draw fragment-bytes Commands (fog color, alpha ref, FF
-    /// pixel constants) point into `FrameData::scratch` — bumped by the API
-    /// thread, not copied into the encoder's payload-isolated scratch — and
-    /// the unix-side replay reads those pointers at encode time. Dropped on
-    /// the submit thread only after `execute_submit` returns. (Inline draw
-    /// data — UP vertices, VS/PS const slices — is copied into the payload's
-    /// scratch and isn't affected.)
-    frame: Box<FrameData>,
+    /// They remain live until `execute_submit` returns. Commands can borrow leaves
+    /// from either arena.
+    frame: Box<NativeFrame>,
 }
 
 /// What one `SubmitFrame` thunk reported back.
@@ -527,8 +526,8 @@ fn submit_thread_main(
             let _exec = mtld3d_core::perf::CycleSetTimer::start(&raw mut submit_exec_tsc);
             execute_submit(params, payload, failure_ptr)
         };
-        // The replay copied every `FrameData::scratch`-resident byte into
-        // the command buffer at encode time, so the frame can drop now.
+        // The final CPU reader has finished with both retained command regions and
+        // native snapshot storage. GPU resource leases retire independently.
         drop(frame);
         if return_tx
             .send(ReturnedPayload {
@@ -739,20 +738,24 @@ pub struct FrameEncoder {
     ///
     /// Entries drop when their seq is ≤ the latest `coherent_seq`.
     pending_blit_retention: VecDeque<PendingBlitRead>,
-    /// Pointer to the shared `coherent_seq` atomic, copied from `FrameData` in `begin_frame`.
+    /// Pointer to the shared `coherent_seq` atomic, established by the device creation context.
     ///
     /// Read on the encoder thread to drain `pending_blit_retention`. 0
     /// means "not yet seeded" — the very first frame has no retention to
     /// drain.
     coherent_seq_ptr: u64,
-    /// Pointer to the shared `failed_submit_seq` atomic, copied from `FrameData` in `begin_frame`.
+    /// Pointer to the shared `failed_submit_seq` atomic.
+    ///
+    /// Established by the device creation context.
     ///
     /// Read next to `coherent_seq_ptr` when the upload-recovery queues
     /// settle: a seq that retired at or below this one had its command
     /// buffer discarded, so its upload has to be re-issued rather than
     /// freed. 0 means "not yet seeded".
     failed_seq_ptr: u64,
-    /// Pointer to the shared `upload_coherent_seq` atomic, copied from `FrameData`.
+    /// Pointer to the shared `upload_coherent_seq` atomic.
+    ///
+    /// Established by the device creation context.
     ///
     /// The upload command buffer is the one that actually carries an
     /// upload's copy, and the draw buffer's completion does not stand for
@@ -781,7 +784,7 @@ pub struct FrameEncoder {
     pending_texture_uploads: UploadRecoveryQueue<TextureUploadJob>,
     /// Pointer to the shared `vbib_retained_bytes` atomic (device-owned).
     ///
-    /// Copied from `FrameData` in `begin_frame`. `fetch_add`'d when a
+    /// Established by the device creation context. `fetch_add`'d when a
     /// `PageBox` enters retention and `fetch_sub`'d when one drains, so
     /// the API thread can cap retention. 0 means "not yet seeded".
     retained_bytes_ptr: u64,
@@ -994,7 +997,7 @@ pub struct FrameEncoder {
     /// `begin_frame`. See `PendingResourceRetention` for the producer
     /// list.
     pending_resource_retention: VecDeque<PendingResourceRetention>,
-    /// The shared triangle-fan index pattern every `IndexSource::Fan` draw binds.
+    /// The shared triangle-fan index pattern every `IndexView::Fan` draw binds.
     fan_index_buffer: FanIndexBuffer,
     /// D3D9 occlusion-query state.
     ///
@@ -1361,9 +1364,10 @@ impl FrameEncoder {
         config: Arc<Mtld3dConfig>,
         cache_path: Option<PathBuf>,
         clock: Arc<mtld3d_shared::clock_calibration::ClockCalibration>,
+        context: &crate::encoder_service::EncoderContext,
     ) -> std::io::Result<Self> {
-        // Spawn the dedicated submit thread. It issues the `SubmitFrame`
-        // thunk for `Async` frames so the unix command-walk + present
+        // Spawn the dedicated submit thread. It invokes the native backend
+        // for `Async` frames so the command walk and presentation
         // overlaps the encoder's next build. The work channel is cap-1 so
         // the encoder can queue at most one packet ahead of an in-progress
         // submit; the return channel is unbounded so the submit thread
@@ -1427,12 +1431,12 @@ impl FrameEncoder {
             dump_draw: None,
             current_blit_retention: Vec::new(),
             pending_blit_retention: VecDeque::new(),
-            coherent_seq_ptr: 0,
-            failed_seq_ptr: 0,
-            upload_coherent_seq_ptr: 0,
+            coherent_seq_ptr: context.coherent_seq_ptr,
+            failed_seq_ptr: context.failed_submit_seq_ptr,
+            upload_coherent_seq_ptr: context.upload_coherent_seq_ptr,
             pending_stage_uploads: UploadRecoveryQueue::new(),
             pending_texture_uploads: UploadRecoveryQueue::new(),
-            retained_bytes_ptr: 0,
+            retained_bytes_ptr: context.retained_bytes_ptr,
             current_submit_seq: 0,
             backbuffer_width: 0,
             backbuffer_height: 0,
@@ -1443,8 +1447,8 @@ impl FrameEncoder {
             perf: EncoderPerfState::new(),
             pass_shader_log_fired: FxHashSet::default(),
             gpu_caps,
-            device_handle: MetalHandle::NULL,
-            record_handle: DeviceRecordHandle::NULL,
+            device_handle: context.device_handle,
+            record_handle: context.record_handle,
             depth_stencil_cache: FxHashMap::default(),
             pipeline_cache: BuildIndex::default(),
             clear_quad_pipeline_cache: FxHashMap::default(),
@@ -1559,12 +1563,12 @@ impl FrameEncoder {
         native_call(&mut params)
     }
 
-    /// Pack a `TextureInfo` snapshot into the per-element wire descriptor.
+    /// Build a backend texture descriptor from its borrowed creation fields.
     ///
     /// The single source for both the load-phase warmup batch
     /// (`drain_texture_warmups`) and the one-off lazy fallback
     /// (`get_or_create_texture`), so both emit byte-identical descriptors.
-    fn texture_desc_from_info(&self, info: &TextureInfo) -> TextureCreateDesc {
+    fn texture_desc_from_view(&self, info: &TextureView<'_>) -> TextureCreateDesc {
         // Every texture created here is `Private`. Nothing CPU-writes a
         // texture directly: render targets are GPU output, and all uploads
         // (including the A4R4G4B4 / R5G6B5 / A1R5G5B5 → BGRA8 expansion path)
@@ -1580,245 +1584,150 @@ impl FrameEncoder {
         // destination to be an attachment. The predicate is a superset of
         // what the upload path selects per upload, so an upload never finds a
         // texture without the usage.
-        let mut usage_flags = info.usage_flags;
+        let mut usage_flags = info.usage_flags();
         // Read from the application's own usage, before the OR below: that
         // one marks a texture whose upload needs an attachment, and an upload
         // defines the pixels it writes. Depth is excluded although its usage
         // carries the render-target bit, since D3D9 leaves depth contents
         // undefined and the frame-end discard already takes that licence.
-        let mut flags = info.create_flags;
+        let mut flags = info.create_flags();
         flags.set(
             TextureCreateFlags::CLEAR_ON_CREATE,
             usage_flags.contains(TextureUsage::RENDER_TARGET)
                 && !usage_flags.contains(TextureUsage::DEPTH_STENCIL),
         );
         if mtld3d_core::upload_pass::needs_render_target(
-            info.d3d_format,
-            info.pixel_format,
-            info.width,
-            info.levels,
+            info.d3d_format(),
+            info.pixel_format(),
+            info.width(),
+            info.levels(),
             self.gpu_caps.min_linear_texture_align,
         ) {
             usage_flags |= TextureUsage::RENDER_TARGET;
         }
         TextureCreateDesc {
-            tex_id: info.texture_id.raw(),
-            width: info.width,
-            height: info.height,
-            depth: info.depth,
-            levels: info.levels,
-            pixel_format: info.pixel_format,
+            tex_id: info.texture_id().raw(),
+            width: info.width(),
+            height: info.height(),
+            depth: info.depth(),
+            levels: info.levels(),
+            pixel_format: info.pixel_format(),
             storage_mode,
             flags,
-            swizzle_r: info.swizzle[0],
-            swizzle_g: info.swizzle[1],
-            swizzle_b: info.swizzle[2],
-            swizzle_a: info.swizzle[3],
+            swizzle_r: info.swizzle()[0],
+            swizzle_g: info.swizzle()[1],
+            swizzle_b: info.swizzle()[2],
+            swizzle_a: info.swizzle()[3],
             usage_flags,
         }
     }
 
-    const fn texture_staging_slot_count(info: &TextureInfo) -> usize {
-        let faces = if info.create_flags.contains(TextureCreateFlags::TYPE_CUBE) {
-            6
-        } else {
-            1
+    /// Create a buffer from its borrowed declaration before its first use.
+    ///
+    /// A failed staged create keeps a placeholder so later uploads preserve the buffer model.
+    fn warmup_buffer_record(
+        &mut self,
+        warmup: &mtld3d_core::encoder_packet::metadata::BufferWarmupRecord,
+    ) -> Result<(), WireError> {
+        let mode = match warmup.map_mode {
+            value if value == BufferMapMode::Direct as u32 => BufferMapMode::Direct,
+            value if value == BufferMapMode::Staged as u32 => BufferMapMode::Staged,
+            _ => return Err(WireError::InvalidValue),
         };
-        info.levels as usize * faces
-    }
-
-    /// Drain the API-thread-queued texture warmups into one batched `CreateTexturesBatch` thunk.
-    ///
-    /// Called at the head of `run_frame` before the op loop, so
-    /// subsequent draw closures hit the cache instead of cache-missing
-    /// on first bind.
-    ///
-    /// Cache-collision case: a `TextureId` already in `texture_cache`
-    /// (e.g. rehydration ran the lazy path between push and drain) gets
-    /// its freshly-created handle queued for seq-gated destroy. The
-    /// existing cache entry stays untouched.
-    fn drain_texture_warmups(&mut self, infos: Vec<TextureInfo>) {
-        if infos.is_empty() {
-            return;
-        }
-        let descs: Vec<TextureCreateDesc> = infos
-            .iter()
-            .map(|info| self.texture_desc_from_info(info))
-            .collect();
-        let mut views: Vec<_> = (0..descs.len()).map(|_| TextureViews::EMPTY).collect();
-        let status = self.batch_create_textures(&descs, &mut views);
+        let staged = matches!(mode, BufferMapMode::Staged);
+        let desc = BufferCreateDesc {
+            backing_ptr: if staged { 0 } else { warmup.backing_ptr },
+            length: warmup.backing_len,
+            id: warmup.buffer_id,
+            storage_mode: buffer_storage_mode(self.gpu_caps.unified_memory),
+            kind: if staged {
+                BufferKind::VbIbDevice
+            } else {
+                BufferKind::VbIb
+            },
+        };
+        let mut handles = [MetalHandle::<MTLBufferKind>::NULL];
+        let status = self.batch_create_buffers(std::slice::from_ref(&desc), &mut handles);
         if status != 0 {
+            error!(target: LOG_TARGET, "warmup_buffer: CreateBuffersBatch status={status:#x}");
+        }
+        let [handle] = handles;
+        let current_seq = self.current_submit_seq;
+        if handle.is_null() {
             error!(
                 target: LOG_TARGET,
-                "drain_texture_warmups: CreateTexturesBatch status={status:#x} (count={})",
-                infos.len()
+                "warmup_buffer: CreateBuffer failed \
+                 (id={:#x}, len={}, staged={staged})",
+                warmup.buffer_id,
+                warmup.backing_len,
             );
-        }
-        let current_seq = self.current_submit_seq;
-        for (info, views) in infos.into_iter().zip(views) {
-            if views.linear.is_null() {
-                continue;
-            }
-            match self.texture_cache.entry(info.texture_id) {
-                Entry::Vacant(v) => {
-                    self.pass_state.register_texture_views(&views);
-                    v.insert(TextureGpuState {
-                        views,
-                        mip_staging_buffers: vec![
-                            MipStagingBuffer::default();
-                            Self::texture_staging_slot_count(&info)
-                        ],
-                    });
-                }
-                Entry::Occupied(_) => {
-                    mtld3d_shared::log_once_warn!(
-                        target: LOG_TARGET,
-                        "drain_texture_warmups: cache collision for tex_id, queueing orphan handle for retire"
-                    );
-                    for orphan in views.owned_handles() {
-                        self.pending_resource_retention
-                            .push_back(PendingResourceRetention {
-                                kind: DestroyKind::Texture,
-                                handle: orphan.raw(),
-                                page_box: None,
-                                staging_arc: None,
-                                seq: current_seq,
-                                from_texture: false,
-                            });
-                    }
-                }
-            }
-        }
-    }
-
-    /// Drain the API-thread-queued VB/IB warmups into one batched `CreateBuffersBatch` thunk.
-    ///
-    /// Called at the head of `run_frame` alongside
-    /// `drain_texture_warmups`.
-    ///
-    /// Only the load-phase create case is queued here (initial
-    /// `CreateVertexBuffer` / `CreateIndexBuffer`); mid-frame
-    /// Lock(DISCARD) renames stay on the lazy path inside
-    /// `ensure_vbib_mtl_buffer` to avoid mid-frame cache collision
-    /// (an old-backing draw closure would otherwise mismatch the
-    /// freshly-installed new wrapper and trigger redundant churn).
-    ///
-    /// A failed `Direct` create leaves no cache entry: the ensure tail is
-    /// a complete lazy retry for that shape. A failed `Staged` create must
-    /// NOT do the same: with no entry the ensure tail would rebuild the
-    /// buffer as `Direct` over its CPU staging while the PE side keeps
-    /// sending `Op::StageUpload`s, silently switching buffer models. It
-    /// instead inserts a placeholder entry (`is_staged: true`, NULL
-    /// `device_buffer`) so staged-ness survives; the device buffer is
-    /// recreated lazily by `apply_stage_upload` / `ensure_vbib_mtl_buffer`
-    /// on the buffer's next touch.
-    fn drain_buffer_warmups(&mut self, warmups: Vec<VbibWarmupEntry>) {
-        if warmups.is_empty() {
-            return;
-        }
-        let storage_mode = buffer_storage_mode(self.gpu_caps.unified_memory);
-        // `Staged` buffers get a `StorageModePrivate` device buffer (no
-        // CPU backing — `backing_ptr` ignored unix-side); `Direct` buffers
-        // get the `bytesNoCopy` wrap over their CPU backing. Mixed kinds in
-        // one batch are fine — the unix handler branches per descriptor.
-        let descs: Vec<BufferCreateDesc> = warmups
-            .iter()
-            .map(|w| {
-                let staged = matches!(w.map_mode, BufferMapMode::Staged);
-                BufferCreateDesc {
-                    backing_ptr: if staged { 0 } else { w.backing_ptr },
-                    length: w.backing_len,
-                    id: w.buffer_id.raw(),
-                    storage_mode,
-                    kind: if staged {
-                        BufferKind::VbIbDevice
-                    } else {
-                        BufferKind::VbIb
-                    },
-                }
-            })
-            .collect();
-        let mut handles = vec![MetalHandle::<MTLBufferKind>::NULL; descs.len()];
-        let status = self.batch_create_buffers(&descs, &mut handles);
-        if status != 0 {
-            error!(
-                target: LOG_TARGET,
-                "drain_buffer_warmups: CreateBuffersBatch status={status:#x} (count={})",
-                warmups.len()
-            );
-        }
-        let current_seq = self.current_submit_seq;
-        for (warmup, handle) in warmups.into_iter().zip(handles) {
-            let staged = matches!(warmup.map_mode, BufferMapMode::Staged);
-            if handle.is_null() {
-                error!(
-                    target: LOG_TARGET,
-                    "drain_buffer_warmups: CreateBuffer failed \
-                     (id={:#x}, len={}, staged={staged})",
-                    warmup.buffer_id.raw(),
-                    warmup.backing_len,
-                );
-                if staged {
-                    // Keep the staged identity alive: the device buffer is
-                    // recreated lazily on the buffer's next touch. Occupied
-                    // is unreachable (ids are minted once and warmups are
-                    // pushed once per Create), and there is no handle to
-                    // orphan here anyway.
-                    if let Entry::Vacant(v) = self.buffer_cache.entry(warmup.buffer_id) {
-                        v.insert(BufferGpuState {
-                            mtl_buffer: MetalHandle::NULL,
-                            device_buffer: MetalHandle::NULL,
-                            is_staged: true,
-                            backing_ptr: 0,
-                            length: warmup.backing_len,
-                            backing_generation: 0,
-                            last_submit_seq: current_seq,
-                        });
-                    }
-                }
-                continue;
-            }
-            match self.buffer_cache.entry(warmup.buffer_id) {
-                Entry::Vacant(v) => {
+            if staged {
+                // Keep the staged identity alive: the device buffer is
+                // recreated lazily on the buffer's next touch. Occupied
+                // is unreachable (ids are minted once and warmups are
+                // pushed once per Create), and there is no handle to
+                // orphan here anyway.
+                if let Entry::Vacant(v) = self
+                    .buffer_cache
+                    .entry(BufferId::from_raw(warmup.buffer_id))
+                {
                     v.insert(BufferGpuState {
-                        mtl_buffer: if staged { MetalHandle::NULL } else { handle },
-                        device_buffer: if staged { handle } else { MetalHandle::NULL },
-                        is_staged: staged,
-                        backing_ptr: if staged { 0 } else { warmup.backing_ptr },
+                        mtl_buffer: MetalHandle::NULL,
+                        device_buffer: MetalHandle::NULL,
+                        is_staged: true,
+                        backing_ptr: 0,
                         length: warmup.backing_len,
-                        backing_generation: if staged { 0 } else { warmup.backing_generation },
+                        backing_generation: 0,
                         last_submit_seq: current_seq,
                     });
-                    // `Direct`: fresh `bytesNoCopy` wrapper — notify the
-                    // GPU about every byte the CPU may have written since
-                    // the backing was allocated (no-op on UMA). `Staged`:
-                    // the device buffer is `Private`, never CPU-written,
-                    // so no notify — its contents arrive via upload blits.
-                    if !staged {
-                        self.enqueue_notify_buffer_did_modify_range(
-                            handle.raw(),
-                            0,
-                            warmup.backing_len,
-                        );
-                    }
-                }
-                Entry::Occupied(_) => {
-                    mtld3d_shared::log_once_warn!(
-                        target: LOG_TARGET,
-                        "drain_buffer_warmups: cache collision for buffer_id, queueing orphan handle for retire"
-                    );
-                    self.pending_resource_retention
-                        .push_back(PendingResourceRetention {
-                            kind: DestroyKind::Buffer,
-                            handle: handle.raw(),
-                            page_box: None,
-                            staging_arc: None,
-                            seq: current_seq,
-                            from_texture: false,
-                        });
                 }
             }
+            return Ok(());
         }
+        match self
+            .buffer_cache
+            .entry(BufferId::from_raw(warmup.buffer_id))
+        {
+            Entry::Vacant(v) => {
+                v.insert(BufferGpuState {
+                    mtl_buffer: if staged { MetalHandle::NULL } else { handle },
+                    device_buffer: if staged { handle } else { MetalHandle::NULL },
+                    is_staged: staged,
+                    backing_ptr: if staged { 0 } else { warmup.backing_ptr },
+                    length: warmup.backing_len,
+                    backing_generation: if staged { 0 } else { warmup.backing_generation },
+                    last_submit_seq: current_seq,
+                });
+                // `Direct`: fresh `bytesNoCopy` wrapper — notify the
+                // GPU about every byte the CPU may have written since
+                // the backing was allocated (no-op on UMA). `Staged`:
+                // the device buffer is `Private`, never CPU-written,
+                // so no notify — its contents arrive via upload blits.
+                if !staged {
+                    self.enqueue_notify_buffer_did_modify_range(
+                        handle.raw(),
+                        0,
+                        warmup.backing_len,
+                    );
+                }
+            }
+            Entry::Occupied(_) => {
+                mtld3d_shared::log_once_warn!(
+                    target: LOG_TARGET,
+                    "warmup_buffer: cache collision for buffer_id, queueing orphan handle for retire"
+                );
+                self.pending_resource_retention
+                    .push_back(PendingResourceRetention {
+                        kind: DestroyKind::Buffer,
+                        handle: handle.raw(),
+                        page_box: None,
+                        staging_arc: None,
+                        seq: current_seq,
+                        from_texture: false,
+                    });
+            }
+        }
+        Ok(())
     }
 
     /// Apply one inline `Staged` VB/IB upload in op-stream order.
@@ -1882,7 +1791,7 @@ impl FrameEncoder {
             return;
         };
 
-        // A NULL device buffer is the placeholder `drain_buffer_warmups`
+        // A NULL device buffer is the placeholder `warmup_buffer_record`
         // leaves behind when the warmup create failed: recreate it here so
         // the upload lands. Warmups drain before the op loop, so the first
         // post-failure upload passes through this recreate and nothing is
@@ -2114,90 +2023,84 @@ impl FrameEncoder {
         Some(handle)
     }
 
-    /// Drain API-thread-queued texture-staging warmups into one batched `CreateBuffersBatch` thunk.
-    ///
-    /// Must run after `drain_texture_warmups` — each entry's handle
-    /// slots into the matching `TextureGpuState` already inserted by
-    /// texture drain.
-    fn drain_staging_warmups(&mut self, warmups: Vec<StagingWarmupEntry>) {
-        if warmups.is_empty() {
-            return;
-        }
-        let storage_mode = buffer_storage_mode(self.gpu_caps.unified_memory);
-        let descs: Vec<BufferCreateDesc> = warmups
-            .iter()
-            .map(|w| BufferCreateDesc {
-                backing_ptr: w.backing_ptr,
-                length: w.backing_len,
-                id: w.texture_id.raw(),
-                storage_mode,
-                kind: BufferKind::TexStaging,
-            })
-            .collect();
-        let mut handles = vec![MetalHandle::<MTLBufferKind>::NULL; descs.len()];
-        let status = self.batch_create_buffers(&descs, &mut handles);
+    /// Attach a texture staging wrapper while adopting its independent backing lease.
+    fn warmup_staging_record(
+        &mut self,
+        warmup: &mtld3d_core::encoder_packet::metadata::StagingWarmupRecord,
+    ) -> Result<(), WireError> {
+        // SAFETY: this command uniquely adopts the publication retained by the frame owner.
+        let keepalive = unsafe { warmup.page.adopt_shared()? };
+        let desc = BufferCreateDesc {
+            backing_ptr: warmup.backing_ptr,
+            length: warmup.backing_len,
+            id: warmup.texture_id,
+            storage_mode: buffer_storage_mode(self.gpu_caps.unified_memory),
+            kind: BufferKind::TexStaging,
+        };
+        let mut handles = [MetalHandle::<MTLBufferKind>::NULL];
+        let status = self.batch_create_buffers(std::slice::from_ref(&desc), &mut handles);
         if status != 0 {
-            error!(
-                target: LOG_TARGET,
-                "drain_staging_warmups: CreateBuffersBatch status={status:#x} (count={})",
-                warmups.len()
-            );
+            error!(target: LOG_TARGET, "warmup_staging: CreateBuffersBatch status={status:#x}");
         }
+        let [handle] = handles;
         let current_seq = self.current_submit_seq;
-        for (warmup, handle) in warmups.into_iter().zip(handles) {
-            if handle.is_null() {
-                continue;
-            }
-            let level = warmup.level as usize;
-            let Some(state) = self.texture_cache.get_mut(&warmup.texture_id) else {
-                // Texture warmup must have failed; orphan the staging
-                // wrapper to keep refcounts straight. The Arc keepalive
-                // travels with the retention entry so the wrapper
-                // outlives the page-backing it was created against.
-                mtld3d_shared::log_once_warn!(
-                    target: LOG_TARGET,
-                    "drain_staging_warmups: parent texture missing from cache, orphaning staging handle"
-                );
-                self.pending_resource_retention
-                    .push_back(PendingResourceRetention {
-                        kind: DestroyKind::Buffer,
-                        handle: handle.raw(),
-                        page_box: None,
-                        staging_arc: Some(warmup.keepalive),
-                        seq: current_seq,
-                        from_texture: true,
-                    });
-                continue;
-            };
-            // Slot vacant by construction (we just installed it with
-            // `MipStagingBuffer::default()` in `drain_texture_warmups`).
-            // Anything else means a lazy create raced us — orphan.
-            if state.mip_staging_buffers[level].handle.is_null() {
-                state.mip_staging_buffers[level] = MipStagingBuffer {
-                    handle,
-                    backing_ptr: warmup.backing_ptr,
-                    length: warmup.backing_len,
-                    keepalive: Some(warmup.keepalive),
-                };
-            } else {
-                mtld3d_shared::log_once_warn!(
-                    target: LOG_TARGET,
-                    "drain_staging_warmups: staging slot already populated, orphaning fresh handle"
-                );
-                self.pending_resource_retention
-                    .push_back(PendingResourceRetention {
-                        kind: DestroyKind::Buffer,
-                        handle: handle.raw(),
-                        page_box: None,
-                        staging_arc: Some(warmup.keepalive),
-                        seq: current_seq,
-                        from_texture: true,
-                    });
-            }
+        if handle.is_null() {
+            return Ok(());
         }
+        let level = warmup.level as usize;
+        let Some(state) = self
+            .texture_cache
+            .get_mut(&TextureId::from_raw(warmup.texture_id))
+        else {
+            // Texture warmup must have failed; orphan the staging
+            // wrapper to keep refcounts straight. The Arc keepalive
+            // travels with the retention entry so the wrapper
+            // outlives the page-backing it was created against.
+            mtld3d_shared::log_once_warn!(
+                target: LOG_TARGET,
+                "warmup_staging: parent texture missing from cache, orphaning staging handle"
+            );
+            self.pending_resource_retention
+                .push_back(PendingResourceRetention {
+                    kind: DestroyKind::Buffer,
+                    handle: handle.raw(),
+                    page_box: None,
+                    staging_arc: Some(keepalive),
+                    seq: current_seq,
+                    from_texture: true,
+                });
+            return Ok(());
+        };
+        // Slot vacant by construction (we just installed it with
+        // `MipStagingBuffer::default()` during texture creation).
+        // Anything else means a lazy create raced us — orphan.
+        if state.mip_staging_buffers[level].handle.is_null() {
+            state.mip_staging_buffers[level] = MipStagingBuffer {
+                handle,
+                backing_ptr: warmup.backing_ptr,
+                length: warmup.backing_len,
+                keepalive: Some(keepalive),
+            };
+        } else {
+            mtld3d_shared::log_once_warn!(
+                target: LOG_TARGET,
+                "warmup_staging: staging slot already populated, orphaning fresh handle"
+            );
+            self.pending_resource_retention
+                .push_back(PendingResourceRetention {
+                    kind: DestroyKind::Buffer,
+                    handle: handle.raw(),
+                    page_box: None,
+                    staging_arc: Some(keepalive),
+                    seq: current_seq,
+                    from_texture: true,
+                });
+        }
+        Ok(())
     }
 
-    fn begin_frame(&mut self, frame: &FrameData) {
+    fn begin_frame(&mut self, owner: &NativeFrame) {
+        let frame = owner.view();
         // Every submission resolves its placeholders, so none names a
         // record of an earlier one.
         debug_assert!(
@@ -2227,31 +2130,19 @@ impl FrameEncoder {
         self.check_stalled_compiles();
         mtld3d_shared::crumb!("phase:BfRecl");
         self.reclaim_retired_blit_retention();
-        if frame.coherent_seq_ptr != 0 {
-            self.coherent_seq_ptr = frame.coherent_seq_ptr;
-        }
-        if frame.retained_bytes_ptr != 0 {
-            self.retained_bytes_ptr = frame.retained_bytes_ptr;
-        }
-        if frame.failed_submit_seq_ptr != 0 {
-            self.failed_seq_ptr = frame.failed_submit_seq_ptr;
-        }
-        if frame.upload_coherent_seq_ptr != 0 {
-            self.upload_coherent_seq_ptr = frame.upload_coherent_seq_ptr;
-        }
-        self.current_submit_seq = frame.submit_seq;
-        self.backbuffer_width = frame.backbuffer_width;
-        self.backbuffer_height = frame.backbuffer_height;
-        self.device_handle = frame.device_handle;
-        // Sticky like the counters above, and for the same reason: the record
-        // is the device's identity for its whole life, and the retirement
-        // waits key off it. A frame that arrived without one must not leave
-        // the encoder unable to name its device, which would turn a wait into
-        // a warn and let a read-back run ahead of the GPU.
-        if !frame.record_handle.is_null() {
-            self.record_handle = frame.record_handle;
-        }
-        self.perf.begin_frame(frame.perf());
+        self.current_submit_seq = frame.header().submit_seq;
+        self.backbuffer_width = frame.header().backbuffer_width;
+        self.backbuffer_height = frame.header().backbuffer_height;
+        #[cfg(perf_tracking)]
+        self.perf.begin_frame(
+            frame
+                .perf()
+                .expect("validated frame PERF payload")
+                .expect("PERF frame payload"),
+        );
+        #[cfg(not(perf_tracking))]
+        self.perf
+            .begin_frame(&mtld3d_core::perf::FramePerfPayload::new());
         // Drain VB/IB retention entries whose seq has retired on the
         // GPU. Intake of *this* frame's entries is deferred to
         // `intake_vbib_retentions`, called after the op loop in
@@ -2274,28 +2165,35 @@ impl FrameEncoder {
         // flag by the time this reads it.
         self.pass_state
             .reset_frame(&mtld3d_core::passes::FrameReset {
-                backbuffer: frame.backbuffer_handle,
-                backbuffer_srgb: frame.backbuffer_srgb_handle,
-                backbuffer_msaa: frame.backbuffer_msaa_handle,
-                backbuffer_msaa_srgb: frame.backbuffer_msaa_srgb_handle,
-                backbuffer_sample_count: frame.backbuffer_sample_count,
-                backbuffer_size: (frame.backbuffer_width, frame.backbuffer_height),
-                backbuffer_format: frame.backbuffer_format,
-                backbuffer_contents: frame.backbuffer_contents,
-                depth_texture: frame.depth_texture,
+                backbuffer: frame.backbuffer_handle(),
+                backbuffer_srgb: frame.backbuffer_srgb_handle(),
+                backbuffer_msaa: frame.backbuffer_msaa_handle(),
+                backbuffer_msaa_srgb: frame.backbuffer_msaa_srgb_handle(),
+                backbuffer_sample_count: frame.sample_count(),
+                backbuffer_size: (
+                    frame.header().backbuffer_width,
+                    frame.header().backbuffer_height,
+                ),
+                backbuffer_format: frame.backbuffer_format(),
+                backbuffer_contents: frame.backbuffer_contents(),
+                depth_texture: frame.depth_texture(),
                 // The frame's default depth attachment is created at the
                 // rasterized back-buffer size so it matches the colour one
                 // exactly, and `Clear` measures the viewport against that.
-                depth_size: if frame.depth_texture.is_null() {
+                depth_size: if frame.depth_texture().is_null() {
                     (0, 0)
                 } else {
                     (
-                        frame.render_scale.dimension(frame.backbuffer_width),
-                        frame.render_scale.dimension(frame.backbuffer_height),
+                        frame
+                            .render_scale()
+                            .dimension(frame.header().backbuffer_width),
+                        frame
+                            .render_scale()
+                            .dimension(frame.header().backbuffer_height),
                     )
                 },
-                depth_has_stencil: frame.flags.contains(FrameDataFlags::DEPTH_HAS_STENCIL),
-                render_scale: frame.render_scale,
+                depth_has_stencil: frame.flags().contains(FrameDataFlags::DEPTH_HAS_STENCIL),
+                render_scale: frame.render_scale(),
                 continues_frame: self.prev_submit_no_present,
             });
         // After `reset_frame`: a replayed upload is a frame-leading blit,
@@ -3775,7 +3673,7 @@ impl FrameEncoder {
             // Derived from `effective_viewport`, so already in the bound
             // texture's space — goes to the resolved entry point, not the
             // converting one.
-            self.clear_color_rects_resolved(r, g, b, a, srgb_write, &[rect]);
+            self.clear_color_rects_resolved(r, g, b, a, srgb_write, std::iter::once(rect));
             // A target outside the pass bounds the clear to its own extent.
             if self.pass_state.has_extra_color_targets_outside_pass() {
                 self.clear_targets_outside_pass(|enc| {
@@ -3800,7 +3698,7 @@ impl FrameEncoder {
         b: u32,
         a: u32,
         srgb_write: bool,
-        rects: &[(i32, i32, i32, i32)],
+        rects: &(impl Iterator<Item = (i32, i32, i32, i32)> + Clone),
     ) {
         self.end_rt0_dropped_pass_for_color_clear();
         // `rects` are the game's own; the viewport they clip against is already
@@ -3808,11 +3706,16 @@ impl FrameEncoder {
         // the intersection is taken between two different spaces.
         let extent = self.pass_state.target_extent();
         if extent.scale().is_identity() {
-            self.clear_color_rects_resolved(r, g, b, a, srgb_write, rects);
+            self.clear_color_rects_resolved(r, g, b, a, srgb_write, (*rects).clone());
         } else {
-            let scaled: Vec<(i32, i32, i32, i32)> =
-                rects.iter().map(|&rc| extent.rect_edges_i32(rc)).collect();
-            self.clear_color_rects_resolved(r, g, b, a, srgb_write, &scaled);
+            self.clear_color_rects_resolved(
+                r,
+                g,
+                b,
+                a,
+                srgb_write,
+                (*rects).clone().map(|rc| extent.rect_edges_i32(rc)),
+            );
         }
         // A target outside the pass clips the rects against its own viewport
         // and converts them at its own scale.
@@ -3837,13 +3740,12 @@ impl FrameEncoder {
         b: u32,
         a: u32,
         srgb_write: bool,
-        rects: &[(i32, i32, i32, i32)],
+        rects: impl Iterator<Item = (i32, i32, i32, i32)> + Clone,
     ) {
         self.pass_state.set_srgb_write_enabled(srgb_write);
         let vp = self.pass_state.effective_viewport();
         let regions: Vec<(u32, u32, u32, u32)> = rects
-            .iter()
-            .filter_map(|&rc| clip_rect_to_viewport(rc, vp))
+            .filter_map(|rc| clip_rect_to_viewport(rc, vp))
             .collect();
         if regions.is_empty() {
             return;
@@ -3877,15 +3779,17 @@ impl FrameEncoder {
         &mut self,
         depth: Option<u32>,
         stencil: Option<u32>,
-        rects: &[(i32, i32, i32, i32)],
+        rects: impl Iterator<Item = (i32, i32, i32, i32)> + Clone,
     ) {
         let extent = self.pass_state.target_extent();
         if extent.scale().is_identity() {
             self.clear_depth_stencil_rects_resolved(depth, stencil, rects);
         } else {
-            let scaled: Vec<(i32, i32, i32, i32)> =
-                rects.iter().map(|&rc| extent.rect_edges_i32(rc)).collect();
-            self.clear_depth_stencil_rects_resolved(depth, stencil, &scaled);
+            self.clear_depth_stencil_rects_resolved(
+                depth,
+                stencil,
+                rects.map(|rc| extent.rect_edges_i32(rc)),
+            );
         }
     }
 
@@ -3900,13 +3804,12 @@ impl FrameEncoder {
         &mut self,
         depth: Option<u32>,
         stencil: Option<u32>,
-        rects: &[(i32, i32, i32, i32)],
+        rects: impl Iterator<Item = (i32, i32, i32, i32)> + Clone,
     ) {
         self.bump_depth_write_epoch();
         let vp = self.pass_state.effective_viewport();
         let regions: Vec<(u32, u32, u32, u32)> = rects
-            .iter()
-            .filter_map(|&rc| clip_rect_to_viewport(rc, vp))
+            .filter_map(|rc| clip_rect_to_viewport(rc, vp))
             .collect();
         if regions.is_empty() {
             return;
@@ -3976,7 +3879,7 @@ impl FrameEncoder {
         );
         // Derived from `effective_viewport`, so already in the bound texture's
         // space: it goes to the resolved entry point, not the converting one.
-        self.clear_depth_stencil_rects_resolved(depth, stencil, &[rect]);
+        self.clear_depth_stencil_rects_resolved(depth, stencil, std::iter::once(rect));
     }
 
     /// Apply a whole-target depth and/or stencil `Clear` to the planes named.
@@ -5535,8 +5438,8 @@ impl FrameEncoder {
         &self,
         shaders: ShaderRef,
         metal_prim: PrimitiveType,
-        vertex_source: &VertexSource,
-        index_source: &IndexSource,
+        vertex_source: &VertexView<'_>,
+        index_source: &IndexView<'_>,
         stride: u32,
     ) {
         if !log_enabled!(target: DRAW_TRACE_TARGET, Level::Trace) {
@@ -5554,44 +5457,47 @@ impl FrameEncoder {
             PsKey::FixedFunction { .. } => String::new(),
         };
         let vb = match vertex_source {
-            VertexSource::Up { size, .. } => format!("vb=UP({size})"),
-            VertexSource::Bound { first, extra, .. } => format!(
+            VertexView::Up { record, .. } => format!("vb=UP({})", record.size),
+            VertexView::Bound { records, .. } => format!(
                 "vb={:#x}+{} streams={}",
-                first.buffer_id,
-                first.offset,
-                extra.len() + 1
+                records[0].buffer,
+                records[0].offset,
+                records.len()
             ),
         };
         let idx = match index_source {
-            IndexSource::None {
+            IndexView::None {
                 start_vertex,
                 vertex_count,
             } => format!("verts={vertex_count}@{start_vertex}"),
-            IndexSource::Bound {
-                buffer_id,
-                offset,
+            IndexView::Bound {
+                record,
                 index_count,
                 base_vertex,
-                ..
-            } => format!("ib={buffer_id:#x}+{offset} idx={index_count} basevtx={base_vertex}"),
-            IndexSource::Up {
+            } => format!(
+                "ib={:#x}+{} idx={index_count} basevtx={base_vertex}",
+                record.buffer, record.offset
+            ),
+            IndexView::Up {
+                record,
                 index_count,
-                index_type,
-                ..
-            } => format!("ib=UP idx={index_count} {index_type:?}"),
-            IndexSource::Fan {
+            } => format!(
+                "ib=UP idx={index_count} {:?}",
+                record.index_type().expect("validated index type")
+            ),
+            IndexView::Fan {
                 start_vertex,
                 primitive_count,
             } => format!("ib=fan-pattern tris={primitive_count} verts@{start_vertex}"),
-            IndexSource::Generated {
+            IndexView::Generated {
+                record,
                 index_count,
-                index_type,
                 min_vertex,
-                max_vertex,
-                ..
-            } => {
-                format!("ib=fan idx={index_count} {index_type:?} verts={min_vertex}..={max_vertex}")
-            }
+            } => format!(
+                "ib=fan idx={index_count} {:?} verts={min_vertex}..={}",
+                record.index_type().expect("validated index type"),
+                record.maximum
+            ),
         };
         trace!(
             target: DRAW_TRACE_TARGET,
@@ -5721,14 +5627,28 @@ impl FrameEncoder {
     /// batched `CreateTexturesBatch` thunk — same wire path used by
     /// `drain_texture_warmups` when the API thread queued the texture at
     /// `CreateTexture` time.
-    pub fn get_or_create_texture(&mut self, info: &TextureInfo) -> u64 {
-        let texture_id = info.texture_id;
-        let staging_slots = Self::texture_staging_slot_count(info);
+    /// Execute a retained texture record against the native cache.
+    ///
+    /// # Errors
+    /// Rejects unknown format, creation, usage or channel values.
+    pub fn get_or_create_texture_record(&mut self, info: &TextureRecord) -> Result<u64, WireError> {
+        let view = TextureView::Record(info);
+        view.validate()?;
+        Ok(self.get_or_create_texture_view(&view))
+    }
+    fn get_or_create_texture_view(&mut self, info: &TextureView<'_>) -> u64 {
+        let texture_id = info.texture_id();
+        let staging_slots = info.levels() as usize
+            * if info.create_flags().contains(TextureCreateFlags::TYPE_CUBE) {
+                6
+            } else {
+                1
+            };
         if let Some(state) = self.texture_cache.get(&texture_id) {
             return state.views.linear.raw();
         }
 
-        let desc = self.texture_desc_from_info(info);
+        let desc = self.texture_desc_from_view(info);
         let mut views = TextureViews::EMPTY;
         let status = self.batch_create_textures(
             core::slice::from_ref(&desc),
@@ -5996,8 +5916,8 @@ impl FrameEncoder {
     /// rename path. Running intake here means the cache entry we match on
     /// is the one that's genuinely retired, not one that's about to be
     /// re-created in the same frame.
-    fn intake_vbib_retentions(&mut self, frame: &mut FrameData) {
-        for entry in core::mem::take(&mut frame.vbib_retentions) {
+    fn intake_vbib_retentions(&mut self, frame: &mut NativeFrame) {
+        for entry in frame.take_vbib_retentions() {
             self.intake_vbib_retention(entry);
         }
     }
@@ -6319,7 +6239,7 @@ impl FrameEncoder {
                 // texture that is gone is dropped at the drain.
                 UploadFate::Reissue => {
                     decline_texture_upload(
-                        entry.payload(),
+                        &UploadView::Owned(entry.payload()),
                         "the aborted-submit replay emitted nothing",
                     );
                 }
@@ -6338,18 +6258,19 @@ impl FrameEncoder {
     /// blit path declined to emit anything, both of which make the upload
     /// moot.
     fn reissue_texture_upload(&mut self, job: &TextureUploadJob) -> bool {
+        let job = UploadView::Owned(job);
         let Some(handle) = self
             .texture_cache
-            .get(&job.info.texture_id)
+            .get(&job.info().texture_id())
             .map(|state| state.views.linear.raw())
             .filter(|handle| *handle != 0)
         else {
             return false;
         };
-        if job.depth > 1 {
-            self.run_volume_upload_blit(job, handle)
+        if job.depth() > 1 {
+            self.run_volume_upload_blit(&job, handle)
         } else {
-            self.run_texture_upload_blit::<false>(job, handle)
+            self.run_texture_upload_blit::<false>(&job, handle)
         }
     }
 
@@ -6593,44 +6514,67 @@ impl FrameEncoder {
         handle.raw()
     }
 
-    /// Full upload flow for one dirty sub-rect of a texture mip.
+    /// Execute borrowed upload fields, retaining owned recovery state after emission.
     ///
-    /// Every path wraps the staging Box in a Shared `MTLBuffer` (lazy on
-    /// first upload, cached per mip); the blit paths emit a
-    /// `BlitCopyBufferToTexture` into `frame_blit_commands`.
-    /// A staging read is retained in `current_blit_retention` so the
-    /// Box stays alive until the GPU retires the frame — blit reads
-    /// happen at command-buffer execution time, long after this
-    /// function returns.
+    /// # Safety
+    /// The record must come from the authentic admitted frame. Its page and feedback
+    /// descriptors are adopted exactly once, and their PE owners remain retained until
+    /// native completion. The record remains immutable throughout this call.
     ///
-    /// The uploads a blit cannot express (A4R4G4B4 / R5G6B5 / A1R5G5B5 →
-    /// BGRA8, and any mip whose row pitch is under the linear texture
-    /// alignment) are written by a render pass over the same wrapped
-    /// staging instead, spliced into the head of the frame. Every upload is
-    /// on the command stream — there is deliberately no CPU-timeline
-    /// `replaceRegion` path, which would race a texture referenced by an
-    /// in-flight frame.
-    pub fn run_texture_upload(&mut self, job: TextureUploadJob) {
-        self.run_texture_upload_with_order::<false>(job);
+    /// # Errors
+    /// Rejects invalid texture fields, upload flags or retained lease descriptors.
+    pub unsafe fn run_texture_record_upload(
+        &mut self,
+        record: &TextureUploadRecord,
+    ) -> Result<(), WireError> {
+        use mtld3d_core::encoder_data::UploadTextureOpFlags;
+        TextureView::Record(&record.texture).validate()?;
+        let flags = u8::try_from(record.mip_flags)
+            .ok()
+            .and_then(UploadTextureOpFlags::from_bits)
+            .ok_or(WireError::InvalidValue)?;
+        if record.release_staging > 1 || record.reserved != 0 {
+            return Err(WireError::InvalidValue);
+        }
+        // SAFETY: the admitted frame retains the unique page lease through final completion.
+        let staging = unsafe { record.page.adopt_read()? };
+        // SAFETY: this command uniquely adopts the retained feedback and completion cells.
+        let redirty = unsafe { record.redirty.adopt()? };
+        let view = UploadView::Record {
+            record,
+            staging: &staging,
+            redirty: &redirty,
+        };
+        let ordered = flags.contains(UploadTextureOpFlags::ORDERED);
+        let emitted = if ordered {
+            self.emit_texture_upload::<true>(&view)
+        } else {
+            self.emit_texture_upload::<false>(&view)
+        };
+        if emitted {
+            // Recovery outlives the borrowed command region, so retain only its required state.
+            let info = view.info().to_owned();
+            let job = UploadView::record_recovery(record, info, staging, redirty);
+            self.pending_texture_uploads
+                .push(record.texture.id, self.current_submit_seq, job);
+        }
+        if flags.contains(UploadTextureOpFlags::REGENERATE_MIPMAPS) {
+            self.run_generate_mipmaps(TextureId::from_raw(record.mip_texture));
+        }
+        Ok(())
     }
 
-    /// Upload a CPU `StretchRect` result after prior ordered destination writes.
-    pub fn run_ordered_texture_upload(&mut self, job: TextureUploadJob) {
-        self.run_texture_upload_with_order::<true>(job);
-    }
-
-    /// Common upload lifetime, with placement selected before entering its loop.
-    fn run_texture_upload_with_order<const ORDERED: bool>(&mut self, job: TextureUploadJob) {
-        let mut handle = self.get_or_create_texture(&job.info);
+    fn emit_texture_upload<const ORDERED: bool>(&mut self, job: &UploadView<'_>) -> bool {
+        let mut handle = self.get_or_create_texture_view(&job.info());
         if handle == 0 {
             mtld3d_shared::log_once_warn_by!(
                 target: LOG_TARGET,
-                key: job.info.texture_id.raw(),
+                key: job.info().texture_id().raw(),
                 "run_texture_upload: texture {:#x} handle creation failed",
-                job.info.texture_id.raw(),
+                job.info().texture_id().raw(),
             );
-            decline_texture_upload(&job, "no destination texture");
-            return;
+            decline_texture_upload(job, "no destination texture");
+            return false;
         }
         // Per-draw texture versioning: this blit lands in the frame-head
         // leading phase, so if a draw earlier this frame already sampled
@@ -6657,22 +6601,22 @@ impl FrameEncoder {
                     unsafe { MetalHandle::new(handle) },
                 ));
         let ordered_color = ordered
-            && mtld3d_core::depth_texture::PackedDepth::from_d3d(job.src_d3d_format).is_none();
+            && mtld3d_core::depth_texture::PackedDepth::from_d3d(job.src_d3d_format()).is_none();
         if !ORDERED && sampled && !ordered_color {
-            handle = self.rename_sampled_texture(&job, handle, ordered);
+            handle = self.rename_sampled_texture(job, handle, ordered);
             if handle == 0 {
-                decline_texture_upload(&job, "the sampled-texture rename found no destination");
-                return;
+                decline_texture_upload(job, "the sampled-texture rename found no destination");
+                return false;
             }
         }
         // Volume (3D) textures take a dedicated full-box path; 2D textures
         // keep the original hot-path blit untouched.
-        let emitted = if job.depth > 1 {
-            self.run_volume_upload_blit(&job, handle)
+        let emitted = if job.depth() > 1 {
+            self.run_volume_upload_blit(job, handle)
         } else if ordered {
-            self.run_texture_upload_blit::<true>(&job, handle)
+            self.run_texture_upload_blit::<true>(job, handle)
         } else {
-            self.run_texture_upload_blit::<false>(&job, handle)
+            self.run_texture_upload_blit::<false>(job, handle)
         };
         if emitted {
             if ordered_color {
@@ -6684,18 +6628,11 @@ impl FrameEncoder {
             // record (if it had one) has served its purpose and its retry
             // budget goes back, and a level that was holding its staging for
             // this answer may let it go.
-            job.redirty.note_emitted(job.emitted_answer());
-            // Keep the job so an aborted upload command buffer can replay
-            // it. Its guard keeps writable whole-level locks renaming while
-            // the job remains replayable, even after its first submit retires.
-            self.pending_texture_uploads.push(
-                job.info.texture_id.raw(),
-                self.current_submit_seq,
-                job,
-            );
+            job.redirty().note_emitted(job.emitted_answer());
         } else {
-            decline_texture_upload(&job, "the blit path emitted nothing");
+            decline_texture_upload(job, "the blit path emitted nothing");
         }
+        emitted
     }
 
     /// Redirect an upload that hit an already-sampled texture to a fresh `MTLTexture`.
@@ -6716,12 +6653,12 @@ impl FrameEncoder {
     /// 0 only if the caller should abort.
     fn rename_sampled_texture(
         &mut self,
-        job: &TextureUploadJob,
+        job: &UploadView<'_>,
         old_handle: u64,
         ordered: bool,
     ) -> u64 {
-        let info = &job.info;
-        let desc = self.texture_desc_from_info(info);
+        let info = job.info();
+        let desc = self.texture_desc_from_view(&info);
         let mut views = TextureViews::EMPTY;
         let status = self.batch_create_textures(
             core::slice::from_ref(&desc),
@@ -6729,7 +6666,7 @@ impl FrameEncoder {
         );
         let fresh = views.linear;
         if status != 0 || fresh.is_null() {
-            if mtld3d_core::depth_texture::PackedDepth::from_d3d(job.src_d3d_format).is_some() {
+            if mtld3d_core::depth_texture::PackedDepth::from_d3d(job.src_d3d_format()).is_some() {
                 error!(target: LOG_TARGET, "rename_sampled_texture: depth allocation failed, upload deferred");
                 return 0;
             }
@@ -6741,7 +6678,7 @@ impl FrameEncoder {
             return old_handle;
         }
 
-        let Some(state) = self.texture_cache.get_mut(&info.texture_id) else {
+        let Some(state) = self.texture_cache.get_mut(&info.texture_id()) else {
             error!(target: LOG_TARGET, "rename_sampled_texture: missing cache entry");
             self.retire_texture_views(&views, MetalHandle::NULL);
             return old_handle;
@@ -6753,16 +6690,16 @@ impl FrameEncoder {
         // A cube rename replaces every face and mip, so preserve each
         // subresource except the one this job fully rewrites. A partial
         // rectangle needs the old content underneath on its own face too.
-        let mip_w = (info.width.max(1) >> job.level).max(1);
-        let mip_h = (info.height.max(1) >> job.level).max(1);
-        let is_volume = info.create_flags.contains(TextureCreateFlags::TYPE_3D);
-        let mip_depth = (info.depth.max(1) >> job.level).max(1);
-        let full_cover = (!is_volume || job.depth >= mip_depth)
-            && job.origin_x == 0
-            && job.origin_y == 0
-            && job.region_w >= mip_w
-            && job.region_h >= mip_h;
-        let slices = if info.create_flags.contains(TextureCreateFlags::TYPE_CUBE) {
+        let mip_w = (info.width().max(1) >> job.level()).max(1);
+        let mip_h = (info.height().max(1) >> job.level()).max(1);
+        let is_volume = info.create_flags().contains(TextureCreateFlags::TYPE_3D);
+        let mip_depth = (info.depth().max(1) >> job.level()).max(1);
+        let full_cover = (!is_volume || job.depth() >= mip_depth)
+            && job.origin_x() == 0
+            && job.origin_y() == 0
+            && job.region_w() >= mip_w
+            && job.region_h() >= mip_h;
+        let slices = if info.create_flags().contains(TextureCreateFlags::TYPE_CUBE) {
             6
         } else {
             1
@@ -6774,12 +6711,12 @@ impl FrameEncoder {
             self.end_current_pass("ordered_texture_preserve");
         }
         for slice in 0..slices {
-            for level in 0..info.levels {
-                if slice == job.destination_slice && level == job.level && full_cover {
+            for level in 0..info.levels() {
+                if slice == job.destination_slice() && level == job.level() && full_cover {
                     continue;
                 }
-                let lw = (info.width.max(1) >> level).max(1);
-                let lh = (info.height.max(1) >> level).max(1);
+                let lw = (info.width().max(1) >> level).max(1);
+                let lh = (info.height().max(1) >> level).max(1);
                 let mut preserve = if is_volume {
                     BlitCommand::copy_texture_to_texture_full_volume_mip(
                         old_handle,
@@ -6787,7 +6724,7 @@ impl FrameEncoder {
                         level,
                         lw,
                         lh,
-                        (info.depth.max(1) >> level).max(1),
+                        (info.depth().max(1) >> level).max(1),
                     )
                 } else {
                     BlitCommand::copy_texture_to_texture_full_mip(
@@ -6875,10 +6812,11 @@ impl FrameEncoder {
     /// leading blit pass.
     fn run_texture_upload_blit<const ORDERED: bool>(
         &mut self,
-        job: &TextureUploadJob,
+        job: &UploadView<'_>,
         texture_handle: u64,
     ) -> bool {
-        if let Some(format) = mtld3d_core::depth_texture::PackedDepth::from_d3d(job.src_d3d_format)
+        if let Some(format) =
+            mtld3d_core::depth_texture::PackedDepth::from_d3d(job.src_d3d_format())
         {
             return self.run_depth_upload_blit(job, texture_handle, &format);
         }
@@ -6887,7 +6825,7 @@ impl FrameEncoder {
         }
         let notify_start = self.frame_blit_commands.len();
         let _t = mtld3d_core::perf::CycleAddTimer::start(self.op_sub_cycles_ptr(OpSub::TexRaw));
-        let backing_length = job.staging.backing().len() as u64;
+        let backing_length = job.staging().backing().len() as u64;
         if backing_length == 0 {
             return false;
         }
@@ -6899,46 +6837,46 @@ impl FrameEncoder {
         // actually reads, both for the alignment-pad repack below and for
         // the slice size the copy is given.
         let staging_buffer_handle = self.get_or_create_staging_buffer(
-            job.info.texture_id,
-            job.staging_index,
-            job.staging.backing(),
+            job.info().texture_id(),
+            job.staging_index(),
+            job.staging().backing(),
         );
         if staging_buffer_handle == 0 {
             return false;
         }
 
-        let (info, block_height) = if job.bytes_per_pixel == 0 {
+        let (info, block_height) = if job.bytes_per_pixel() == 0 {
             // Compressed (BC1/2/3). Sub-rect must land on the block
             // grid; otherwise fall back to a full-mip blit from the
             // start of the staging buffer. Both variants are correct
             // because the staging preserves every byte the game wrote.
-            let fmt = map_d3d_format(job.src_d3d_format)
+            let fmt = map_d3d_format(job.src_d3d_format())
                 .expect("compressed format already mapped at CreateTexture");
             let bw = fmt.block_width();
             let bh = fmt.block_height();
             let bb = fmt.block_bytes();
-            let mip_w = (job.info.width.max(1) >> job.level).max(1);
-            let mip_h = (job.info.height.max(1) >> job.level).max(1);
-            let aligned = job.origin_x.is_multiple_of(bw)
-                && job.origin_y.is_multiple_of(bh)
-                && (job.region_w.is_multiple_of(bw) || job.origin_x + job.region_w == mip_w)
-                && (job.region_h.is_multiple_of(bh) || job.origin_y + job.region_h == mip_h);
+            let mip_w = (job.info().width().max(1) >> job.level()).max(1);
+            let mip_h = (job.info().height().max(1) >> job.level()).max(1);
+            let aligned = job.origin_x().is_multiple_of(bw)
+                && job.origin_y().is_multiple_of(bh)
+                && (job.region_w().is_multiple_of(bw) || job.origin_x() + job.region_w() == mip_w)
+                && (job.region_h().is_multiple_of(bh) || job.origin_y() + job.region_h() == mip_h);
             if aligned {
-                let block_x = job.origin_x / bw;
-                let block_y = job.origin_y / bh;
-                let buffer_offset = u64::from(block_y) * u64::from(job.src_pitch)
+                let block_x = job.origin_x() / bw;
+                let block_y = job.origin_y() / bh;
+                let buffer_offset = u64::from(block_y) * u64::from(job.src_pitch())
                     + u64::from(block_x) * u64::from(bb);
                 let info = CopyBufferToTextureInfo {
                     buffer_handle: staging_buffer_handle,
                     buffer_offset,
-                    bytes_per_row: job.src_pitch,
+                    bytes_per_row: job.src_pitch(),
                     texture_handle,
-                    destination_slice: job.destination_slice,
-                    mip_level: job.level,
-                    origin_x: job.origin_x,
-                    origin_y: job.origin_y,
-                    region_w: job.region_w,
-                    region_h: job.region_h,
+                    destination_slice: job.destination_slice(),
+                    mip_level: job.level(),
+                    origin_x: job.origin_x(),
+                    origin_y: job.origin_y(),
+                    region_w: job.region_w(),
+                    region_h: job.region_h(),
                     depth: 1,
                     bytes_per_image: 0,
                 };
@@ -6946,20 +6884,20 @@ impl FrameEncoder {
             } else {
                 mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
                     "run_texture_upload_blit: compressed sub-rect ({}+{},{}+{}) unaligned to {}×{} block grid → full-mip fallback",
-                    job.origin_x,
-                    job.region_w,
-                    job.origin_y,
-                    job.region_h,
+                    job.origin_x(),
+                    job.region_w(),
+                    job.origin_y(),
+                    job.region_h(),
                     bw,
                     bh,
                 );
                 let info = CopyBufferToTextureInfo {
                     buffer_handle: staging_buffer_handle,
                     buffer_offset: 0,
-                    bytes_per_row: job.src_pitch,
+                    bytes_per_row: job.src_pitch(),
                     texture_handle,
-                    destination_slice: job.destination_slice,
-                    mip_level: job.level,
+                    destination_slice: job.destination_slice(),
+                    mip_level: job.level(),
                     origin_x: 0,
                     origin_y: 0,
                     region_w: mip_w,
@@ -6972,19 +6910,19 @@ impl FrameEncoder {
         } else {
             // Uncompressed path. Sub-rect offset is
             // origin_y * pitch + origin_x * bpp bytes into the Box.
-            let buffer_offset = u64::from(job.origin_y) * u64::from(job.src_pitch)
-                + u64::from(job.origin_x) * u64::from(job.bytes_per_pixel);
+            let buffer_offset = u64::from(job.origin_y()) * u64::from(job.src_pitch())
+                + u64::from(job.origin_x()) * u64::from(job.bytes_per_pixel());
             let info = CopyBufferToTextureInfo {
                 buffer_handle: staging_buffer_handle,
                 buffer_offset,
-                bytes_per_row: job.src_pitch,
+                bytes_per_row: job.src_pitch(),
                 texture_handle,
-                destination_slice: job.destination_slice,
-                mip_level: job.level,
-                origin_x: job.origin_x,
-                origin_y: job.origin_y,
-                region_w: job.region_w,
-                region_h: job.region_h,
+                destination_slice: job.destination_slice(),
+                mip_level: job.level(),
+                origin_x: job.origin_x(),
+                origin_y: job.origin_y(),
+                region_w: job.region_w(),
+                region_h: job.region_h(),
                 depth: 1,
                 bytes_per_image: 0,
             };
@@ -7000,7 +6938,7 @@ impl FrameEncoder {
         // behaviour is officially undefined. Repack the affected rows
         // into a transient padded MTLBuffer and aim the blit there.
         let info = if info.bytes_per_row < self.gpu_caps.min_linear_texture_align {
-            match self.repack_blit_source_padded(job.staging.backing(), &info, num_blit_rows) {
+            match self.repack_blit_source_padded(job.staging().backing(), &info, num_blit_rows) {
                 Some(padded_info) => padded_info,
                 None => return false,
             }
@@ -7047,7 +6985,7 @@ impl FrameEncoder {
         // `pending_texture_uploads` outlives it by however long the
         // upload takes to be acknowledged.
         self.current_blit_retention
-            .push(PageBoxRead::new(Arc::clone(job.staging.backing())));
+            .push(PageBoxRead::new(Arc::clone(job.staging().backing())));
         true
     }
 
@@ -7070,31 +7008,31 @@ impl FrameEncoder {
     /// every row across every slice repacked to the padded stride (the rows
     /// being contiguous makes this a single `region_rows * depth` repack),
     /// and `bytes_per_image` widens to `padded_pitch * region_rows`.
-    fn run_volume_upload_blit(&mut self, job: &TextureUploadJob, texture_handle: u64) -> bool {
+    fn run_volume_upload_blit(&mut self, job: &UploadView<'_>, texture_handle: u64) -> bool {
         if let Some(outcome) = self.try_texture_upload_pass::<false>(job, texture_handle) {
             return outcome;
         }
         let _t = mtld3d_core::perf::CycleAddTimer::start(self.op_sub_cycles_ptr(OpSub::TexRaw));
-        let backing_length = job.staging.backing().len() as u64;
+        let backing_length = job.staging().backing().len() as u64;
         if backing_length == 0 {
             return false;
         }
-        let src_pitch = job.src_pitch;
-        let slice_pitch = job.slice_pitch;
-        let depth = job.depth.max(1);
+        let src_pitch = job.src_pitch();
+        let slice_pitch = job.slice_pitch();
+        let depth = job.depth().max(1);
         // Rows per slice (block-rows for compressed): `slice_pitch` is
         // exactly `src_pitch * block_rows`, so recover it by division.
         let region_rows = slice_pitch.checked_div(src_pitch).unwrap_or(0);
         if region_rows == 0 {
             return false;
         }
-        let mip_w = (job.info.width.max(1) >> job.level).max(1);
-        let mip_h = (job.info.height.max(1) >> job.level).max(1);
+        let mip_w = (job.info().width().max(1) >> job.level()).max(1);
+        let mip_h = (job.info().height().max(1) >> job.level()).max(1);
 
         let staging_buffer_handle = self.get_or_create_staging_buffer(
-            job.info.texture_id,
-            job.staging_index,
-            job.staging.backing(),
+            job.info().texture_id(),
+            job.staging_index(),
+            job.staging().backing(),
         );
         if staging_buffer_handle == 0 {
             return false;
@@ -7106,7 +7044,7 @@ impl FrameEncoder {
             bytes_per_row: src_pitch,
             texture_handle,
             destination_slice: 0,
-            mip_level: job.level,
+            mip_level: job.level(),
             origin_x: 0,
             origin_y: 0,
             region_w: mip_w,
@@ -7121,7 +7059,7 @@ impl FrameEncoder {
         // widen the slice stride to the padded row stride.
         let info = if info.bytes_per_row < self.gpu_caps.min_linear_texture_align {
             let total_rows = region_rows.saturating_mul(depth);
-            match self.repack_blit_source_padded(job.staging.backing(), &info, total_rows) {
+            match self.repack_blit_source_padded(job.staging().backing(), &info, total_rows) {
                 Some(mut padded_info) => {
                     padded_info.bytes_per_image =
                         padded_info.bytes_per_row.saturating_mul(region_rows);
@@ -7139,7 +7077,7 @@ impl FrameEncoder {
         self.flags.insert(FrameEncoderFlags::BLIT_CMDS_NEED_ENCODER);
         self.perf.bump_texture_blit_upload();
         self.current_blit_retention
-            .push(PageBoxRead::new(Arc::clone(job.staging.backing())));
+            .push(PageBoxRead::new(Arc::clone(job.staging().backing())));
         true
     }
 
@@ -7149,11 +7087,13 @@ impl FrameEncoder {
     /// copy takes it only when the staging row pitch is under Metal's linear
     /// texture alignment, which is what a blit copy cannot accept; above it
     /// the blit is the cheaper write.
-    fn upload_pass_decode(&self, job: &TextureUploadJob) -> Option<UploadDecode> {
-        let decode =
-            mtld3d_core::upload_pass::upload_decode(job.src_d3d_format, job.info.pixel_format)?;
+    fn upload_pass_decode(&self, job: &UploadView<'_>) -> Option<UploadDecode> {
+        let decode = mtld3d_core::upload_pass::upload_decode(
+            job.src_d3d_format(),
+            job.info().pixel_format(),
+        )?;
         (mtld3d_core::upload_pass::is_expansion(decode)
-            || job.src_pitch < self.gpu_caps.min_linear_texture_align)
+            || job.src_pitch() < self.gpu_caps.min_linear_texture_align)
             .then_some(decode)
     }
 
@@ -7166,7 +7106,7 @@ impl FrameEncoder {
     /// because no blit can widen those texels.
     fn try_texture_upload_pass<const ORDERED: bool>(
         &mut self,
-        job: &TextureUploadJob,
+        job: &UploadView<'_>,
         texture_handle: u64,
     ) -> Option<bool> {
         let decode = self.upload_pass_decode(job)?;
@@ -7176,11 +7116,11 @@ impl FrameEncoder {
         if mtld3d_core::upload_pass::is_expansion(decode) {
             mtld3d_shared::log_once_warn_by!(
                 target: LOG_TARGET,
-                key: job.info.texture_id.raw(),
+                key: job.info().texture_id().raw(),
                 "run_texture_upload: the upload pass declined a texel-widening expansion for \
                  texture {:#x}; no blit can widen those texels, so the mip keeps its previous \
                  contents until the upload is retried",
-                job.info.texture_id.raw(),
+                job.info().texture_id().raw(),
             );
             return Some(false);
         }
@@ -7203,40 +7143,40 @@ impl FrameEncoder {
     /// replay both read it) and is wrapped in the same cached per-mip
     /// `MTLBuffer` the blit path uses. Handles the 2D dirty-rect shape and
     /// a cube face in one pass, and the volume whole-box shape
-    /// (`job.depth > 1`) in one pass per slice.
+    /// (`job.depth() > 1`) in one pass per slice.
     fn run_texture_upload_pass<const ORDERED: bool>(
         &mut self,
-        job: &TextureUploadJob,
+        job: &UploadView<'_>,
         texture_handle: u64,
         decode: UploadDecode,
     ) -> bool {
         let _t = mtld3d_core::perf::CycleAddTimer::start(self.op_sub_cycles_ptr(OpSub::TexRaw));
-        let backing_length = job.staging.backing().len() as u64;
-        if backing_length == 0 || job.bytes_per_pixel != decode.bytes_per_texel() {
+        let backing_length = job.staging().backing().len() as u64;
+        if backing_length == 0 || job.bytes_per_pixel() != decode.bytes_per_texel() {
             return false;
         }
         // One pass per depth plane, and `pass_flags` carries the plane: a
         // deeper volume would wrap onto the planes below it.
-        if job.depth > PassDescriptor::MAX_COLOR_SLICE + 1 {
+        if job.depth() > PassDescriptor::MAX_COLOR_SLICE + 1 {
             mtld3d_shared::log_once_warn_by!(
                 target: LOG_TARGET,
-                key: job.info.texture_id.raw(),
+                key: job.info().texture_id().raw(),
                 "run_texture_upload_pass: volume {:#x} is {} planes deep, past the {} an upload \
                  pass can address; declining the upload",
-                job.info.texture_id.raw(),
-                job.depth,
+                job.info().texture_id().raw(),
+                job.depth(),
                 PassDescriptor::MAX_COLOR_SLICE + 1,
             );
             return false;
         }
-        let pipeline = self.get_or_create_upload_pipeline(job.info.pixel_format);
+        let pipeline = self.get_or_create_upload_pipeline(job.info().pixel_format());
         if pipeline == 0 {
             return false;
         }
         let staging_buffer_handle = self.get_or_create_staging_buffer(
-            job.info.texture_id,
-            job.staging_index,
-            job.staging.backing(),
+            job.info().texture_id(),
+            job.staging_index(),
+            job.staging().backing(),
         );
         if staging_buffer_handle == 0 {
             return false;
@@ -7246,18 +7186,18 @@ impl FrameEncoder {
         let notify_start = self.frame_blit_commands.len();
         self.enqueue_notify_buffer_did_modify_range(staging_buffer_handle, 0, backing_length);
 
-        let mip_w = (job.info.width.max(1) >> job.level).max(1);
-        let mip_h = (job.info.height.max(1) >> job.level).max(1);
-        let depth = job.depth.max(1);
+        let mip_w = (job.info().width().max(1) >> job.level()).max(1);
+        let mip_h = (job.info().height().max(1) >> job.level()).max(1);
+        let depth = job.depth().max(1);
         let emit = UploadPassInputs {
             pipeline,
             depth_state: self.get_or_create_depth_stencil(&DepthStencilSnapshot::inert(), false),
             staging_buffer_handle,
             texture_handle,
-            format: job.info.pixel_format,
-            level: job.level,
+            format: job.info().pixel_format(),
+            level: job.level(),
             mip_size: (mip_w, mip_h),
-            src_pitch: job.src_pitch,
+            src_pitch: job.src_pitch(),
             decode,
         };
         if depth > 1 {
@@ -7268,19 +7208,19 @@ impl FrameEncoder {
                     &emit,
                     slice,
                     (0, 0, mip_w, mip_h),
-                    slice.saturating_mul(job.slice_pitch),
+                    slice.saturating_mul(job.slice_pitch()),
                     notify_start,
                 );
             }
         } else {
             // Clamp the dirty rect into the mip: the viewport is not clamped
             // on the unix side the way the scissor is.
-            let w = job.region_w.min(mip_w.saturating_sub(job.origin_x));
-            let h = job.region_h.min(mip_h.saturating_sub(job.origin_y));
+            let w = job.region_w().min(mip_w.saturating_sub(job.origin_x()));
+            let h = job.region_h().min(mip_h.saturating_sub(job.origin_y()));
             self.emit_upload_pass::<ORDERED>(
                 &emit,
-                job.destination_slice,
-                (job.origin_x, job.origin_y, w, h),
+                job.destination_slice(),
+                (job.origin_x(), job.origin_y(), w, h),
                 0,
                 notify_start,
             );
@@ -7297,7 +7237,7 @@ impl FrameEncoder {
         // The pass reads the staging at command-buffer execution time, long
         // after this returns; hold the Box for the GPU's view of the frame.
         self.current_blit_retention
-            .push(PageBoxRead::new(Arc::clone(job.staging.backing())));
+            .push(PageBoxRead::new(Arc::clone(job.staging().backing())));
         true
     }
 
@@ -8241,7 +8181,7 @@ impl EncoderThread {
         config: Arc<Mtld3dConfig>,
         prewarm_rx: mpsc::Receiver<Option<WarmCache>>,
         cache_path: Option<PathBuf>,
-        clocks: crate::encoder_service::EncoderClocks,
+        startup: crate::encoder_service::EncoderStartup,
     ) -> std::io::Result<Self> {
         let (sender, receiver) = mpsc::sync_channel::<EncoderMessage>(API_FRAME_CHANNEL_CAP);
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
@@ -8255,7 +8195,7 @@ impl EncoderThread {
                     config,
                     cache_path,
                     ready_tx,
-                    clocks,
+                    startup,
                 );
             })?;
         match ready_rx.recv() {
@@ -8492,7 +8432,7 @@ fn encoder_thread_main(
     config: Arc<Mtld3dConfig>,
     cache_path: Option<PathBuf>,
     ready: mpsc::SyncSender<std::io::Result<()>>,
-    clocks: crate::encoder_service::EncoderClocks,
+    startup: crate::encoder_service::EncoderStartup,
 ) {
     let apple = GpuCaps::apple_silicon_default();
     if !gpu_caps.unified_memory
@@ -8511,7 +8451,13 @@ fn encoder_thread_main(
             cfg.linear_align256,
         );
     }
-    let mut enc = match FrameEncoder::new(gpu_caps, config, cache_path, clocks.native) {
+    let mut enc = match FrameEncoder::new(
+        gpu_caps,
+        config,
+        cache_path,
+        startup.clocks.native,
+        &startup.context,
+    ) {
         Ok(enc) => enc,
         Err(error) => {
             let _ = ready.send(Err(error));
@@ -8522,7 +8468,7 @@ fn encoder_thread_main(
     // SAFETY: PE retains source calibration until native destruction completes.
     unsafe {
         enc.perf
-            .set_clock_domains(clocks.source, Arc::clone(&enc.clock));
+            .set_clock_domains(startup.clocks.source, Arc::clone(&enc.clock));
     }
     let _ = ready.send(Ok(()));
     drop(ready);
@@ -8577,6 +8523,7 @@ fn encoder_thread_main(
                             frame_counter,
                             decode_cycles,
                             &mut queries,
+                            &frame,
                             if frame.mode == EncoderSubmitMode::Queue {
                                 SubmitMode::Async
                             } else {
@@ -8730,9 +8677,10 @@ fn run_frame_bracketed(
     fc: u64,
     decode_cycles: u64,
     queries: &mut mtld3d_core::guest_queries::QueryLeaseCache,
+    admitted: &crate::encoder_service::EncodedFrame,
     mode: SubmitMode,
 ) -> Result<(), mtld3d_shared::encoder_wire::WireError> {
-    let marks = packet.frame().gpu_capture_marks();
+    let marks = packet.frame().view().flags();
     if marks.contains(FrameDataFlags::GPU_CAPTURE_START) {
         enc.drain_submit_thread();
         enc.drain_presentation();
@@ -8747,7 +8695,7 @@ fn run_frame_bracketed(
     } else {
         mode
     };
-    let result = run_frame(enc, packet, fc, decode_cycles, queries, mode);
+    let result = run_frame(enc, packet, fc, decode_cycles, queries, admitted, mode);
     if marks.contains(FrameDataFlags::GPU_CAPTURE_STOP) {
         enc.drain_presentation();
         let mut p = mtld3d_shared::StopGpuCaptureParams { pad0: 0 };
@@ -8768,159 +8716,126 @@ fn run_frame(
     fc: u64,
     decode_cycles: u64,
     queries: &mut mtld3d_core::guest_queries::QueryLeaseCache,
+    admitted: &crate::encoder_service::EncodedFrame,
     mode: SubmitMode,
 ) -> Result<(), mtld3d_shared::encoder_wire::WireError> {
-    // SAFETY: intake moves warmup queues only; snapshot scratch stays owned by the packet.
-    let frame = unsafe { packet.frame_mut() };
-    if let Some(pacing) = frame.apply_pacing.take()
-        && !frame.layer_handle.is_null()
-    {
-        let mut params = SetDisplaySyncEnabledParams {
-            layer_handle: frame.layer_handle,
-            display_sync_enabled: u32::from(pacing.display_sync),
-            max_fps: pacing.max_fps,
-        };
-        native_call(&mut params);
-    }
-    if let Some(change) = frame.apply_gamma.take()
-        && !frame.layer_handle.is_null()
-    {
-        let table = match &change {
-            mtld3d_core::gamma::Change::Apply(table) => Some(&**table),
-            mtld3d_core::gamma::Change::Remove => None,
-        };
-        let mut params = SetGammaRampParams {
-            layer_handle: frame.layer_handle,
-            entries_ptr: table.map_or(0, |table| core::ptr::from_ref::<u16>(&table[0]) as u64),
-            entries_len: table.map_or(0, |table| {
-                u32::try_from(table.len()).expect("the gamma table has 1024 lanes")
-            }),
-            pad0: 0,
-        };
-        native_call(&mut params);
-        // The thunk copies the entries, so the table may go here.
-        drop(change);
-    }
     mtld3d_shared::crumb!("phase:BfEnter");
-    // Reset encoder-side state cache before draining ops: the pointer
-    // it holds aliases into the *previous* frame's ScratchArena, which
-    // is about to drop. The API thread always re-emits a fresh
-    // snapshot with the first draw of a new frame (driven by
-    // SnapshotDirty::all() after arena rotation).
     enc.current_snapshot = None;
-    enc.begin_frame(frame);
-    // Reclaim any payloads the submit thread finished so their command vecs
-    // are back in the pool before this frame's op loop, and the returned
-    // drawable-wait / status land in this frame's `Async` summary. Runs
-    // after `begin_frame` so its `drawable_wait` reset doesn't clobber the
-    // folded value.
+    enc.begin_frame(packet.frame());
     enc.drain_returned_payloads();
-    // Eager Metal-object creation: drain API-thread-queued texture +
-    // VB/IB warmups into batched thunks before any draw closure runs.
-    // The closures snapshotted these resources at their D3D9-Create
-    // time; running drain first means subsequent ops hit `texture_cache`
-    // / `buffer_cache` and skip the per-resource lazy thunk crossing.
-    enc.drain_texture_warmups(core::mem::take(&mut frame.pending_texture_warmups));
-    enc.drain_buffer_warmups(core::mem::take(&mut frame.pending_buffer_warmups));
-    // `Staged` VB/IB dirty-range uploads are no longer drained here — they
-    // are inline `Op::StageUpload`s processed in op-stream order (so the
-    // encoder can rename-at-overlap), handled in the op loop below.
-    // `drain_buffer_warmups` above still creates the device buffers first.
-    // Staging buffers slot into texture_cache entries created above —
-    // must run after `drain_texture_warmups`.
-    enc.drain_staging_warmups(core::mem::take(&mut frame.pending_staging_warmups));
     mtld3d_shared::crumb!("phase:OpLoop");
     {
         let _ops = mtld3d_core::perf::CycleSetTimer::start(enc.perf.op_cycles_ptr());
         let mut idx = 0usize;
         loop {
-            let op = match packet.next_op(queries) {
-                Ok(Some(op)) => op,
-                Ok(None) => break,
+            let consume =
+                |command: mtld3d_core::encoder_packet::CommandView<'_>,
+                 frame: &mut NativeFrame,
+                 state: &mut mtld3d_core::encoder_packet::ReplayState| {
+                    use mtld3d_shared::{encoder_protocol::EncoderOpcode, encoder_wire::WireError};
+                    let idx_u32 = u32::try_from(idx).map_err(|_| WireError::TooLarge)?;
+                    idx += 1;
+                    mtld3d_shared::crumb!("enc_op", fc, u64::from(idx_u32));
+                    // SAFETY: ReplayPacket supplies authentic immutable producer records and
+                    // retains their allocations through submission or failed-replay quarantine.
+                    // This callback executes each publication once; adopted native owners retain
+                    // their PE leases until the final reader acknowledges completion.
+                    if unsafe {
+                        ops::execute_command(
+                            enc,
+                            command.opcode(),
+                            command.operand(),
+                            command.payload(),
+                            queries,
+                        )?
+                    } {
+                        return Ok(());
+                    }
+                    match command.opcode() {
+                        EncoderOpcode::SetVsConstRange
+                        | EncoderOpcode::SetPsConstRange
+                        | EncoderOpcode::SetFfVsConstRange => {
+                            let _timer = mtld3d_core::perf::CycleAddTimer::start(
+                                enc.op_sub_cycles_ptr(OpSub::ConstRange),
+                            );
+                            let range = command.constants()?;
+                            match command.opcode() {
+                                EncoderOpcode::SetVsConstRange => {
+                                    enc.apply_vs_const_range(
+                                        range.start_row,
+                                        range.rows,
+                                        range.data,
+                                    );
+                                }
+                                EncoderOpcode::SetPsConstRange => {
+                                    enc.apply_ps_const_range(
+                                        range.start_row,
+                                        range.rows,
+                                        range.data,
+                                    );
+                                }
+                                EncoderOpcode::SetFfVsConstRange => {
+                                    enc.apply_ff_vs_const_range(
+                                        range.start_row,
+                                        range.rows,
+                                        range.data,
+                                    );
+                                }
+                                _ => unreachable!(),
+                            }
+                        }
+                        EncoderOpcode::SetSnapshot => {
+                            // SAFETY: scratch is only appended and remains owned by this frame.
+                            let scratch = unsafe { frame.scratch_mut() };
+                            // SAFETY: this frame retains every canonical snapshot leaf through submit.
+                            let snapshot = unsafe {
+                                state
+                                    .draw_reader()
+                                    .decode_snapshot(command.payload(), scratch)?
+                            };
+                            enc.current_snapshot = Some(snapshot);
+                        }
+                        EncoderOpcode::Draw => {
+                            let draw = mtld3d_core::encoder_draw::draw_record::DrawView::new(
+                                command.payload(),
+                            )?;
+                            // SAFETY: this packet retains authentic capture and backing addresses
+                            // through the final submit CPU reader, including failure quarantine.
+                            unsafe { draw::emit_draw(enc, &draw)? };
+                        }
+                        EncoderOpcode::AdoptProgram => {
+                            let record = mtld3d_core::encoder_records::borrow::<
+                                mtld3d_core::encoder_records::IdRecord,
+                            >(command.payload())?;
+                            let (id, program) = admitted.take_program(record.id)?;
+                            enc.register_program(id, program);
+                        }
+                        EncoderOpcode::RetainVbib => {
+                            let record = mtld3d_core::encoder_records::borrow::<
+                                mtld3d_core::encoder_packet::metadata::VbibRetentionRecord,
+                            >(command.payload())?;
+                            // SAFETY: this is the sole ordered adoption of the retained page descriptor.
+                            let page_box = unsafe { record.page.adopt_owned()? };
+                            frame.retain_vbib(PendingVbibRetention {
+                                buffer_id: mtld3d_core::ids::BufferId::from_raw(record.buffer_id),
+                                page_box,
+                                last_submit_seq: record.last_submit_seq,
+                            });
+                        }
+                        _ => return Err(WireError::InvalidValue),
+                    }
+                    Ok(())
+                };
+            // SAFETY: dispatch only appends native snapshot storage and genuine owners.
+            // The whole frame remains retained through submit or failure quarantine.
+            let result = unsafe { packet.replay_one(consume) };
+            match result {
+                Ok(true) => {}
+                Ok(false) => break,
                 Err(error) => {
                     enc.failed_replay = Some(Box::new(packet));
                     return Err(error);
                 }
-            };
-            let idx_u32 = u32::try_from(idx).expect("per-frame op count fits u32");
-            idx += 1;
-            mtld3d_shared::crumb!("enc_op", fc, u64::from(idx_u32));
-            match op {
-                Op::SetVsConstRange {
-                    start_row,
-                    rows,
-                    data,
-                } => {
-                    let _t = mtld3d_core::perf::CycleAddTimer::start(
-                        enc.op_sub_cycles_ptr(OpSub::ConstRange),
-                    );
-                    enc.apply_vs_const_range(start_row, rows, data);
-                }
-                Op::SetPsConstRange {
-                    start_row,
-                    rows,
-                    data,
-                } => {
-                    let _t = mtld3d_core::perf::CycleAddTimer::start(
-                        enc.op_sub_cycles_ptr(OpSub::ConstRange),
-                    );
-                    enc.apply_ps_const_range(start_row, rows, data);
-                }
-                Op::SetFfVsConstRange {
-                    start_row,
-                    rows,
-                    data,
-                } => {
-                    let _t = mtld3d_core::perf::CycleAddTimer::start(
-                        enc.op_sub_cycles_ptr(OpSub::ConstRange),
-                    );
-                    enc.apply_ff_vs_const_range(start_row, rows, data);
-                }
-                Op::SetSnapshot(snapshot) => enc.current_snapshot = Some(snapshot),
-                Op::Draw(draw) => draw::emit_draw(enc, draw),
-                Op::SetViewport(op) => op.execute(enc),
-                Op::SetVertexSampler(op) => op.execute(enc),
-                Op::SetVertexTexture(op) => op.execute(enc),
-                Op::BindDepth(op) => op.execute(enc),
-                Op::BindColor(op) => op.execute(enc),
-                Op::GenerateMipmapsOrdered(op) => op.execute(enc),
-                Op::UnbindExtraColor(op) => op.execute(enc),
-                Op::DestroyTexture(op) => op.execute(enc),
-                Op::ReadColorHandle(op) => op.execute(enc),
-                Op::NoteColorRead(op) => op.execute(enc),
-                Op::ResolveDepthSurface(op) => op.execute(enc),
-                Op::StretchBlit(op) => op.execute(enc),
-                Op::ColorFill(op) => op.execute(enc),
-                Op::CarryDepth(op) => op.execute(enc),
-                Op::ClearColor(op) => op.execute(enc),
-                Op::ClearColorRects(op) => op.execute(enc),
-                Op::ClearDepthStencilRects(op) => op.execute(enc),
-                Op::ClearDepthStencil(op) => op.execute(enc),
-                Op::ResolveDynamicDepth(op) => op.execute(enc),
-                Op::ResolveDepthTexture(op) => op.execute(enc),
-                Op::ReadDeviceBuffer(op) => op.execute(enc),
-                Op::RegisterProgram(op) => op.execute(enc),
-                Op::AdoptProgram(_) => {
-                    log::error!(target: LOG_TARGET, "unresolved shader adoption reached native replay");
-                }
-                Op::BeginVisibility(op) => op.execute(enc),
-                Op::EndVisibility(op) => op.execute(enc),
-                Op::RetireColor(op) => op.execute(enc),
-                Op::RetireDepth(op) => op.execute(enc),
-                Op::UploadColor(op) => op.execute(enc),
-                Op::UploadResampled(op) => op.execute(enc),
-                Op::ReadTextureHandle(op) => op.execute(enc),
-                Op::GenerateMipmaps(op) => op.execute(enc),
-                Op::ReadTextureColorHandle(op) => op.execute(enc),
-                Op::UploadTextureAndMips(op) => op.execute(enc),
-                Op::UploadTexture(op) => op.execute(enc),
-                Op::SetDumpDraw(op) => op.execute(enc),
-                Op::StageUpload {
-                    buffer_id,
-                    page_box,
-                    dst_offset,
-                    size,
-                } => enc.apply_stage_upload(buffer_id, page_box, dst_offset, size),
             }
         }
     }
@@ -8958,7 +8873,7 @@ fn run_frame(
 /// In `Async` mode `execute_submit` runs on the dedicated submit thread and
 /// the payload is recycled when it returns; in `Sync` mode all three run
 /// inline on the encoder thread.
-fn submit(enc: &mut FrameEncoder, frame: Box<FrameData>, mode: SubmitMode) {
+fn submit(enc: &mut FrameEncoder, frame: Box<NativeFrame>, mode: SubmitMode) {
     match mode {
         SubmitMode::Async => submit_async(enc, frame),
         SubmitMode::Sync => submit_sync(enc, frame),
@@ -8966,12 +8881,13 @@ fn submit(enc: &mut FrameEncoder, frame: Box<FrameData>, mode: SubmitMode) {
 }
 
 /// Build a frame summary context from the frame's backbuffer attachment.
-const fn frame_summary_ctx(frame: &FrameData) -> FrameSummaryContext {
+const fn frame_summary_ctx(owner: &NativeFrame) -> FrameSummaryContext {
+    let frame = owner.view();
     FrameSummaryContext {
-        backbuffer_handle: frame.backbuffer_handle,
-        depth_texture: frame.depth_texture,
-        backbuffer_width: frame.backbuffer_width,
-        backbuffer_height: frame.backbuffer_height,
+        backbuffer_handle: frame.backbuffer_handle(),
+        depth_texture: frame.depth_texture(),
+        backbuffer_width: frame.header().backbuffer_width,
+        backbuffer_height: frame.header().backbuffer_height,
     }
 }
 
@@ -8985,7 +8901,7 @@ const fn frame_summary_ctx(frame: &FrameData) -> FrameSummaryContext {
 /// encoder-side finalize (plus any backpressure wait inside
 /// `acquire_clean_payload`); the unix command-walk and commit are on the
 /// submit thread, the present on the presenter.
-fn submit_async(enc: &mut FrameEncoder, frame: Box<FrameData>) {
+fn submit_async(enc: &mut FrameEncoder, frame: Box<NativeFrame>) {
     let (params, payload) = {
         let _submit = mtld3d_core::perf::CycleSetTimer::start(enc.perf.submit_cycles_ptr());
         finalize_submit(enc, &frame)
@@ -9011,7 +8927,7 @@ fn submit_async(enc: &mut FrameEncoder, frame: Box<FrameData>) {
 /// timer wraps finalize + execute so the per-frame summary (emitted after,
 /// from the still-live payload) reads a settled value; the payload is
 /// recycled only once the summary has read its passes / scratch.
-fn submit_sync(enc: &mut FrameEncoder, frame: Box<FrameData>) {
+fn submit_sync(enc: &mut FrameEncoder, frame: Box<NativeFrame>) {
     let (payload, status) = {
         let _submit = mtld3d_core::perf::CycleSetTimer::start(enc.perf.submit_cycles_ptr());
         let (params, payload) = finalize_submit(enc, &frame);
@@ -9030,7 +8946,7 @@ fn submit_sync(enc: &mut FrameEncoder, frame: Box<FrameData>) {
             target: LOG_TARGET,
             "encoder: SubmitFrame failed (status={status:#x}, passes={}, present_tex={:#x})",
             payload.descriptors.len(),
-            frame.backbuffer_handle,
+            frame.view().backbuffer_handle(),
         );
     }
     let ctx = frame_summary_ctx(&frame);
@@ -9048,7 +8964,11 @@ fn submit_sync(enc: &mut FrameEncoder, frame: Box<FrameData>) {
 /// and detach the frame's read payload from the encoder. Returns the
 /// `params` (with raw pointers aliasing into the payload) plus the owned
 /// [`FramePayload`] that backs them.
-fn finalize_submit(enc: &mut FrameEncoder, frame: &FrameData) -> (SubmitFrameParams, FramePayload) {
+fn finalize_submit(
+    enc: &mut FrameEncoder,
+    owner: &NativeFrame,
+) -> (SubmitFrameParams, FramePayload) {
+    let frame = owner.view();
     // If the game called `Clear()` without any subsequent draw this frame
     // (or after the last draw), the pending clear still needs to
     // materialize so the RT actually gets cleared this frame. Then close
@@ -9063,13 +8983,13 @@ fn finalize_submit(enc: &mut FrameEncoder, frame: &FrameData) -> (SubmitFramePar
     // (a readback flush between BEGIN and END, or a query held across
     // Present) contributes what it has counted so far and is reopened
     // against the continuation frame's allocator at the next `begin_frame`.
-    enc.visibility.split_open_spans(frame.submit_seq);
+    enc.visibility.split_open_spans(frame.header().submit_seq);
 
     // A readback flush is not a frame end: the frame continues and its depth
     // surface may still be tested against, so Rule B (last-use depth/stencil
     // `DontCare`) is suppressed. Remember it so the next `begin_frame` keeps
     // the seen-rt sets for the continuation's Rule A.
-    let no_present = frame.flags.contains(FrameDataFlags::NO_PRESENT);
+    let no_present = frame.flags().contains(FrameDataFlags::NO_PRESENT);
     enc.prev_submit_no_present = no_present;
     let mut upload_pass_count = enc.pass_state.upload_pass_count();
     #[cfg(debug_assertions)]
@@ -9149,7 +9069,7 @@ fn finalize_submit(enc: &mut FrameEncoder, frame: &FrameData) -> (SubmitFramePar
     payload.trailing_blits = trailing_blits;
 
     let params = SubmitFrameParams {
-        record_handle: frame.record_handle,
+        record_handle: enc.record_handle,
         blit_commands_ptr: if has_upload_passes || payload.frame_blit_commands.is_empty() {
             0
         } else {
@@ -9167,25 +9087,25 @@ fn finalize_submit(enc: &mut FrameEncoder, frame: &FrameData) -> (SubmitFramePar
         passes_ptr: payload.descriptors.as_ptr() as u64,
         pass_count: u32::try_from(payload.descriptors.len()).expect("pass count fits u32"),
         upload_pass_count: u32::try_from(upload_pass_count).expect("upload pass count fits u32"),
-        present_layer: if frame.flags.contains(FrameDataFlags::NO_PRESENT) {
+        present_layer: if frame.flags().contains(FrameDataFlags::NO_PRESENT) {
             MetalHandle::NULL
         } else {
-            frame.layer_handle
+            frame.layer_handle()
         },
-        present_texture: if frame.flags.contains(FrameDataFlags::NO_PRESENT) {
+        present_texture: if frame.flags().contains(FrameDataFlags::NO_PRESENT) {
             MetalHandle::NULL
         } else {
-            frame.backbuffer_handle
+            frame.backbuffer_handle()
         },
-        submit_seq: frame.submit_seq,
-        coherent_seq_ptr: frame.coherent_seq_ptr,
-        upload_coherent_seq_ptr: frame.upload_coherent_seq_ptr,
-        failed_submit_seq_ptr: frame.failed_submit_seq_ptr,
+        submit_seq: frame.header().submit_seq,
+        coherent_seq_ptr: enc.coherent_seq_ptr,
+        upload_coherent_seq_ptr: enc.upload_coherent_seq_ptr,
+        failed_submit_seq_ptr: enc.failed_seq_ptr,
         drawable_wait_ns: 0,
-        present_view: if frame.flags.contains(FrameDataFlags::NO_PRESENT) {
+        present_view: if frame.flags().contains(FrameDataFlags::NO_PRESENT) {
             MetalHandle::NULL
         } else {
-            frame.view_handle
+            frame.view_handle()
         },
         present_wait_ns: 0,
         snapshot_flags: SnapshotFlags::empty(),
@@ -9198,8 +9118,8 @@ fn finalize_submit(enc: &mut FrameEncoder, frame: &FrameData) -> (SubmitFramePar
     // them from `current_blit_retention` into `pending_blit_retention`
     // keeps them alive regardless of which thread later runs the blits, so
     // this is safe to do here before handing the payload off.
-    retire_visibility_buffer(enc, frame.submit_seq);
-    retire_blit_reads(enc, frame.submit_seq);
+    retire_visibility_buffer(enc, frame.header().submit_seq);
+    retire_blit_reads(enc, frame.header().submit_seq);
 
     (params, payload)
 }

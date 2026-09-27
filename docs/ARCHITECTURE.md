@@ -83,13 +83,15 @@ The API thread (the game's calling thread) is the bottleneck and must be
 unblocked fast. It records typed operations and changed draw snapshots directly
 into the frame's `ScratchArena`. Commands and variable payloads share the same
 64 KiB chunked bump allocator; ordinary chunks are retained for reuse after
-replay. Metadata describes immutable command spans rather than concatenating
-or serializing the whole frame at `Present`.
+replay. Command and external-payload cursors use the same retained chunk pool.
+A region descriptor is appended only when a command region fills; external
+payload allocations do not interrupt that region. `Present` hands off the
+retained region table without concatenating or serializing the frame.
 
 A native encoder thread per device receives one `SubmitEncoderFrame` handoff
 for an ordinary frame through a capacity-one queue. Admission retains the PE
-packet; the encoder decodes its stream once during replay, reconstructs native
-values and translates D3D9 operations into Metal commands. The PE side
+packet; the encoder walks aligned records in region order, borrows their typed
+payloads and translates D3D9 operations into Metal commands. The PE side
 starts collecting the next frame after admission. `FrameEncoder`, its caches,
 command lists and private staging belong to Unix. COM pointers, Rust closures,
 allocator owners and PE function pointers are never executed or destroyed by
@@ -443,28 +445,38 @@ Every symbolic wire value has one typed definition in `mtld3d-shared`. Metal enu
 
 **Never** restate the encoding as a local `const`. **Never** write an integer literal at a call site or decode arm.
 
-The three cdylibs are separate linkage units. Shared definitions and exhaustive
-matches catch protocol drift at compile time, and `make` / `make install`
-rebuild and copy all three together. The internal typed producer's unsafe
-contract requires fully formed, finalized immutable packets and retained backing
-leases. Matching binaries alone do not establish these lifetime and value
-requirements. Public D3D input validation remains at the API boundary.
+The three cdylibs are separate linkage units, but they are bundled and trust
+one another. They share a private ABI for matching builds. Do not design the
+frame command stream as a general transport with mixed-version compatibility,
+field serialization or deserialization, or a defensive whole-frame validation
+pass. Public D3D input validation remains at the API boundary.
 
-Production checks the packet envelope, address ranges, submission mode and
-admission, then performs one checked decode during replay. Matching ABI and
-device identity belong to the caller contract; the device queue serializes reset
-with frame submission. The bounded reader checks raw
-tags, field lengths, offsets, alignment and address arithmetic before constructing
-typed values or references. Allocation membership and unique ownership adoption
-rely on the producer contract. Fallible pending-program registration finishes
-before any operation replays. Exhaustive structural and lease-inventory preflight
-runs in tests and debug builds when the producer supplies `VALIDATION_INVENTORY`;
-a production PE producer can also feed a debug native runtime without it. This
-has no runtime setting. A late internal contract violation can occur after
-earlier operations have replayed: it latches device failure and quarantines
-native and PE storage through cleanup. Subsequent controls reject work except
-shutdown. It does not promise atomic rejection of a malformed packet or roll
-back an already applied operation.
+PE constructs the final canonical command records directly. Unix reads those
+same immutable records. Each record has an explicit fixed-width layout,
+alignment and initialized padding, with size and field-offset assertions on all
+PE and Unix targets. Variable data uses aligned inline arrays or retained
+spans. Command tags select the corresponding record type; they do not require
+reconstructing an owned Rust operation. Keep derived command semantics and dirty
+suppression unchanged unless a separate change justifies altering them.
+
+The producer contract still requires initialized values, stable backing and
+correct ownership. Matching binaries do not establish those lifetime rules.
+Retain actual synchronization, query generations, reset ordering, admission and
+failure handling. Test and assert construction and layout invariants without
+adding generic diagnostic inventories to ordinary frames. An internal contract
+failure poisons the affected runtime and preserves storage until cleanup; it
+must not cause a dangling reference or a wait that can never complete.
+
+API recording cost is the primary performance constraint. A native improvement
+does not justify slower API calls. Do not add per-command allocations, extra
+payload copies, frame serialization at `Present`, or waits to simplify the
+native consumer. Keep PE cancellation owners local and native runtime owners
+native. Include a handoff field only when its actual consumer needs it.
+
+The encoder migration is still being optimized and validated. Its fixed-record
+conversion is in progress; the policy above is the required endpoint, not a
+claim that every current frame path already satisfies it or has passed the
+performance gates.
 
 How to apply:
 - New thunk field with symbolic meaning → its shared protocol type. Sizes/offsets/counts/`!= 0` booleans → `u32`.

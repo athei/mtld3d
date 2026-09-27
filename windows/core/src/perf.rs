@@ -67,11 +67,12 @@ use super::passes::Pass;
 #[cfg(perf_tracking)]
 use super::passes::{ColorLoad, DepthLoad};
 
+#[cfg(perf_tracking)]
+mod clock_scale;
 pub mod compilation;
 #[cfg(perf_tracking)]
 mod deferred;
 pub mod window_line;
-mod wire;
 
 /// Classify actual PE dispatches for a separate, opt-in diagnostic trace.
 ///
@@ -670,23 +671,17 @@ impl Drop for ApiTimer {
 /// new counter is one field here instead of one in every stage.
 #[cfg(perf_tracking)]
 #[derive(Clone, Copy)]
+#[repr(C, align(8))]
 struct FrameCounters {
     /// Device reset epoch, copied at drain after the previous frame was flushed.
     reset_epoch: u64,
-    reset_epoch_saturated: bool,
     /// Uniform builds partitioned into no-clip bypass, cache hit, and recompute.
     inverse_view: [u64; 3],
-    inverse_view_saturated: bool,
     /// TSC cycles this frame, bucketed by `ApiCategory`.
     ///
     /// Accumulated on the API thread inside every D3D9 COM vtable entry
     /// point.
     api_cycles_by_category: [u64; ApiCategory::COUNT],
-    /// Per-category call counts for the same frame window.
-    api_call_counts_by_category: [u32; ApiCategory::COUNT],
-    /// `PageBox` allocations from VB/IB Lock-rename this frame.
-    vb_rename: u32,
-    ib_rename: u32,
     /// Padded bytes of the fresh `PageBox`es behind `vb_rename` + `ib_rename`.
     ///
     /// Sized via `PageBox::len()` (16 KiB page multiples), not the D3D9
@@ -694,6 +689,79 @@ struct FrameCounters {
     /// actually served. The byte volume is what decides whether rename
     /// churn can drive allocator page-return oscillation.
     vbib_rename_bytes: u64,
+    /// TSC cycles the API thread spent blocked in `IDirect3DQuery9::GetData(D3DGETDATA_FLUSH)`.
+    ///
+    /// Waiting on Metal's `MTLCommandBuffer::waitUntilCompleted` —
+    /// accumulated by `CycleAddTimer` because a single frame can contain
+    /// multiple FLUSH polls that each block.
+    query_wait_cycles: u64,
+    /// Per-sub-category cycle bucket inside the `Device` `ApiCategory`.
+    ///
+    /// Bumped by `ApiTimer::start_device` on every `IDirect3DDevice9`
+    /// vtable thunk; sums to `api_cycles_by_category[Device]` within
+    /// the same frame.
+    device_sub_cycles: [u64; DeviceSubCategory::COUNT],
+    /// Per-sub-category cycle bucket inside `Bind`.
+    ///
+    /// Bumped by `ApiTimer::start_bind` on every `IDirect3DDevice9`
+    /// Bind-family vtable thunk; sums to `device_sub_cycles[Bind]` within
+    /// the same frame. Decomposes the Bind row into resource swaps vs
+    /// RT/DS vs FF-state vs viewport/scissor so the next optimisation can
+    /// target the dominant Setter family.
+    bind_sub_cycles: [u64; BindSubCategory::COUNT],
+    /// Per-sub-category cycle bucket inside the `Surface` `ApiCategory`.
+    ///
+    /// Bumped by `ApiTimer::start_surface` on every `IDirect3DSurface9`
+    /// vtable thunk; sums to `api_cycles_by_category[Surface]` within the
+    /// same frame. Splits the getter storm from the entry points that can
+    /// block (`LockRect` readback, `UnlockRect` upload, the GDI DC pair).
+    surface_sub_cycles: [u64; SurfaceSubCategory::COUNT],
+    /// TSC cycles inside the Draw methods spent in the snapshot phase.
+    ///
+    /// The phase: `snapshot_bound_vertex_source`,
+    /// `snapshot_bound_index_source`, `snapshot_shared`. Accumulated by
+    /// `CycleAddTimer` so all Draw entry points share a single bucket.
+    draw_snapshot_cycles: u64,
+    /// Sub-component of `draw_snapshot_cycles` covering the per-stage binding walk.
+    ///
+    /// Just the walk inside `snapshot_shared` (`snapshot_stage_bindings` —
+    /// 8 stages × {texture, sampler state, TSS slots} with lazy upload
+    /// dispatch).
+    draw_snapshot_stages_cycles: u64,
+    /// Sub-component of `draw_snapshot_cycles` covering the consts snapshot for FF draws.
+    ///
+    /// The block runs for draws where at least one shader stage is
+    /// Fixed-Function (i.e. `bound_vs.is_null() || bound_ps.is_null()`).
+    /// `c_ff + c_pr` sums to what the old `consts` row did.
+    draw_snapshot_c_ff_cycles: u64,
+    /// Sub-component of `draw_snapshot_cycles` covering the consts snapshot block.
+    ///
+    /// The programmable peer of `draw_snapshot_c_ff_cycles`: the block
+    /// runs for draws where both VS and PS are programmable.
+    draw_snapshot_c_pr_cycles: u64,
+    /// Sub-component of `draw_snapshot_cycles` covering the shader-key resolution block.
+    ///
+    /// In `snapshot_shared`: `VDECL` → attrs/stride, `RS` snapshot struct
+    /// build, `RT_DS` resolve, `VARIANT` key, `VS_SOURCE` (FF key build
+    /// or programmable `shader_id`), and `PS_SOURCE`.
+    draw_snapshot_keys_cycles: u64,
+    /// Sub-component of `draw_snapshot_cycles` covering the post-consts bumps.
+    ///
+    /// The scratch bumps + cache assignments + snapshot-wrapper bump in
+    /// `snapshot_shared` (the work after `drop(consts_timer)`).
+    draw_snapshot_bumps_cycles: u64,
+    /// TSC cycles inside the Draw methods spent in the push-op phase.
+    ///
+    /// `Box::new` of the `emit_draw` closure plus `push_op` append onto
+    /// the current frame's op list. Closure-build cost.
+    draw_push_op_cycles: u64,
+    reset_epoch_saturated: u32,
+    inverse_view_saturated: u32,
+    /// Per-category call counts for the same frame window.
+    api_call_counts_by_category: [u32; ApiCategory::COUNT],
+    /// `PageBox` allocations from VB/IB Lock-rename this frame.
+    vb_rename: u32,
+    ib_rename: u32,
     /// Lock-rename allocs served warm from the `PageBox` recycle pool.
     ///
     /// A hit allocates nothing; with `vbib_pool_misses` this renders the
@@ -790,40 +858,13 @@ struct FrameCounters {
     /// Whole-mip / `None` = 10000. Divided by `texture_add_dirty_calls`
     /// at render to report average coverage.
     texture_add_dirty_area_bp: u32,
-    /// TSC cycles the API thread spent blocked in `IDirect3DQuery9::GetData(D3DGETDATA_FLUSH)`.
-    ///
-    /// Waiting on Metal's `MTLCommandBuffer::waitUntilCompleted` —
-    /// accumulated by `CycleAddTimer` because a single frame can contain
-    /// multiple FLUSH polls that each block.
-    query_wait_cycles: u64,
-    /// Per-sub-category cycle bucket inside the `Device` `ApiCategory`.
-    ///
-    /// Bumped by `ApiTimer::start_device` on every `IDirect3DDevice9`
-    /// vtable thunk; sums to `api_cycles_by_category[Device]` within
-    /// the same frame.
-    device_sub_cycles: [u64; DeviceSubCategory::COUNT],
     /// Companion call-count array for `device_sub_cycles`.
     ///
     /// One bump per Device entry per call, regardless of which sub-bucket
     /// fires. Drives the per-sub-row `( N calls)` aux cell in the summary.
     device_sub_calls: [u32; DeviceSubCategory::COUNT],
-    /// Per-sub-category cycle bucket inside `Bind`.
-    ///
-    /// Bumped by `ApiTimer::start_bind` on every `IDirect3DDevice9`
-    /// Bind-family vtable thunk; sums to `device_sub_cycles[Bind]` within
-    /// the same frame. Decomposes the Bind row into resource swaps vs
-    /// RT/DS vs FF-state vs viewport/scissor so the next optimisation can
-    /// target the dominant Setter family.
-    bind_sub_cycles: [u64; BindSubCategory::COUNT],
     /// Companion call-count array for `bind_sub_cycles`.
     bind_sub_calls: [u32; BindSubCategory::COUNT],
-    /// Per-sub-category cycle bucket inside the `Surface` `ApiCategory`.
-    ///
-    /// Bumped by `ApiTimer::start_surface` on every `IDirect3DSurface9`
-    /// vtable thunk; sums to `api_cycles_by_category[Surface]` within the
-    /// same frame. Splits the getter storm from the entry points that can
-    /// block (`LockRect` readback, `UnlockRect` upload, the GDI DC pair).
-    surface_sub_cycles: [u64; SurfaceSubCategory::COUNT],
     /// Companion call-count array for `surface_sub_cycles`.
     surface_sub_calls: [u32; SurfaceSubCategory::COUNT],
     /// Per-[`KeysGate`] live setter-call count this frame.
@@ -834,45 +875,7 @@ struct FrameCounters {
     ///
     /// So they skipped the snapshot rebuild (the `keys` bucket work).
     keys_gate_skips: [u32; KeysGate::COUNT],
-    /// TSC cycles inside the Draw methods spent in the snapshot phase.
-    ///
-    /// The phase: `snapshot_bound_vertex_source`,
-    /// `snapshot_bound_index_source`, `snapshot_shared`. Accumulated by
-    /// `CycleAddTimer` so all Draw entry points share a single bucket.
-    draw_snapshot_cycles: u64,
-    /// Sub-component of `draw_snapshot_cycles` covering the per-stage binding walk.
-    ///
-    /// Just the walk inside `snapshot_shared` (`snapshot_stage_bindings` —
-    /// 8 stages × {texture, sampler state, TSS slots} with lazy upload
-    /// dispatch).
-    draw_snapshot_stages_cycles: u64,
-    /// Sub-component of `draw_snapshot_cycles` covering the consts snapshot for FF draws.
-    ///
-    /// The block runs for draws where at least one shader stage is
-    /// Fixed-Function (i.e. `bound_vs.is_null() || bound_ps.is_null()`).
-    /// `c_ff + c_pr` sums to what the old `consts` row did.
-    draw_snapshot_c_ff_cycles: u64,
-    /// Sub-component of `draw_snapshot_cycles` covering the consts snapshot block.
-    ///
-    /// The programmable peer of `draw_snapshot_c_ff_cycles`: the block
-    /// runs for draws where both VS and PS are programmable.
-    draw_snapshot_c_pr_cycles: u64,
-    /// Sub-component of `draw_snapshot_cycles` covering the shader-key resolution block.
-    ///
-    /// In `snapshot_shared`: `VDECL` → attrs/stride, `RS` snapshot struct
-    /// build, `RT_DS` resolve, `VARIANT` key, `VS_SOURCE` (FF key build
-    /// or programmable `shader_id`), and `PS_SOURCE`.
-    draw_snapshot_keys_cycles: u64,
-    /// Sub-component of `draw_snapshot_cycles` covering the post-consts bumps.
-    ///
-    /// The scratch bumps + cache assignments + snapshot-wrapper bump in
-    /// `snapshot_shared` (the work after `drop(consts_timer)`).
-    draw_snapshot_bumps_cycles: u64,
-    /// TSC cycles inside the Draw methods spent in the push-op phase.
-    ///
-    /// `Box::new` of the `emit_draw` closure plus `push_op` append onto
-    /// the current frame's op list. Closure-build cost.
-    draw_push_op_cycles: u64,
+    reserved: u32,
 }
 
 #[cfg(perf_tracking)]
@@ -886,10 +889,11 @@ impl Default for FrameCounters {
 impl FrameCounters {
     const fn new() -> Self {
         Self {
+            reserved: 0,
             reset_epoch: 0,
-            reset_epoch_saturated: false,
+            reset_epoch_saturated: 0,
             inverse_view: [0; 3],
-            inverse_view_saturated: false,
+            inverse_view_saturated: 0,
             api_cycles_by_category: [0; ApiCategory::COUNT],
             api_call_counts_by_category: [0; ApiCategory::COUNT],
             vb_rename: 0,
@@ -936,6 +940,7 @@ impl FrameCounters {
 /// carried encoder-side into the sample.
 #[cfg(perf_tracking)]
 #[derive(Clone, Copy)]
+#[repr(C, align(8))]
 struct FrameTiming {
     /// TSC cycles the API thread spent blocked on `sync_channel(1).send()`.
     ///
@@ -1263,7 +1268,7 @@ impl ApiPerfState {
             InverseViewUse::Recompute => 2,
         };
         let count = &mut self.counters.inverse_view[index];
-        self.counters.inverse_view_saturated |= *count == u64::MAX;
+        self.counters.inverse_view_saturated |= (*count == u64::MAX) as u32;
         *count = count.saturating_add(1);
     }
 
@@ -1561,7 +1566,7 @@ impl ApiPerfState {
         // clobbers them.
         payload.counters = core::mem::take(&mut self.counters);
         payload.counters.reset_epoch = self.reset_epoch;
-        payload.counters.reset_epoch_saturated = self.reset_epoch_saturated;
+        payload.counters.reset_epoch_saturated = u32::from(self.reset_epoch_saturated);
         payload.timing.frame_total_cycles = if prev == 0 { 0 } else { now - prev };
     }
 }
@@ -1671,6 +1676,7 @@ impl ApiPerfState {
 /// Under `cfg(not(perf_tracking))` this is a unit struct; all setters
 /// become `const fn` no-ops.
 #[cfg(perf_tracking)]
+#[repr(C, align(8))]
 pub struct FramePerfPayload {
     /// The API-thread counters moved across the channel (see [`FrameCounters`]).
     ///
@@ -2015,17 +2021,17 @@ impl EncoderPerfState {
             }
             self.compilation.finish_deferred_frame(
                 compilation,
-                wire::scale_ticks(
+                clock_scale::scale_ticks(
                     sample.enc.op_sub_cycles[OpSub::Resolve as usize],
                     hz,
                     1_000_000_000,
                 ),
-                wire::scale_ticks(
+                clock_scale::scale_ticks(
                     sample.enc.op_sub_cycles[OpSub::Pipeline as usize],
                     hz,
                     1_000_000_000,
                 ),
-                wire::scale_ticks(sample.enc.op_cycles, hz, 1_000_000_000),
+                clock_scale::scale_ticks(sample.enc.op_cycles, hz, 1_000_000_000),
             );
             self.perf_window.accumulate(&sample);
         }
@@ -3077,7 +3083,7 @@ impl PerfWindow {
             });
         }
         if let Some(epoch) = self.inverse_epochs.last_mut() {
-            epoch.saturated |= c.inverse_view_saturated || c.reset_epoch_saturated;
+            epoch.saturated |= c.inverse_view_saturated != 0 || c.reset_epoch_saturated != 0;
             for (total, count) in epoch.counts.iter_mut().zip(c.inverse_view) {
                 epoch.saturated |= total.checked_add(count).is_none();
                 *total = total.saturating_add(count);
@@ -5816,3 +5822,60 @@ fn render_kv(w: &PerfWindow, caches: &CacheSizes, window_secs: f64) -> KvLine {
 
 #[cfg(all(test, perf_tracking))]
 mod tests;
+
+#[cfg(perf_tracking)]
+const _: () = {
+    assert!(size_of::<FrameCounters>() == 616);
+    assert!(align_of::<FrameCounters>() == 8);
+    assert!(core::mem::offset_of!(FrameCounters, reset_epoch) == 0);
+    assert!(core::mem::offset_of!(FrameCounters, inverse_view) == 8);
+    assert!(core::mem::offset_of!(FrameCounters, api_cycles_by_category) == 32);
+    assert!(core::mem::offset_of!(FrameCounters, vbib_rename_bytes) == 112);
+    assert!(core::mem::offset_of!(FrameCounters, query_wait_cycles) == 120);
+    assert!(core::mem::offset_of!(FrameCounters, device_sub_cycles) == 128);
+    assert!(core::mem::offset_of!(FrameCounters, bind_sub_cycles) == 200);
+    assert!(core::mem::offset_of!(FrameCounters, surface_sub_cycles) == 248);
+    assert!(core::mem::offset_of!(FrameCounters, draw_snapshot_cycles) == 288);
+    assert!(core::mem::offset_of!(FrameCounters, draw_snapshot_stages_cycles) == 296);
+    assert!(core::mem::offset_of!(FrameCounters, draw_snapshot_c_ff_cycles) == 304);
+    assert!(core::mem::offset_of!(FrameCounters, draw_snapshot_c_pr_cycles) == 312);
+    assert!(core::mem::offset_of!(FrameCounters, draw_snapshot_keys_cycles) == 320);
+    assert!(core::mem::offset_of!(FrameCounters, draw_snapshot_bumps_cycles) == 328);
+    assert!(core::mem::offset_of!(FrameCounters, draw_push_op_cycles) == 336);
+    assert!(core::mem::offset_of!(FrameCounters, reset_epoch_saturated) == 344);
+    assert!(core::mem::offset_of!(FrameCounters, inverse_view_saturated) == 348);
+    assert!(core::mem::offset_of!(FrameCounters, api_call_counts_by_category) == 352);
+    assert!(core::mem::offset_of!(FrameCounters, vb_rename) == 392);
+    assert!(core::mem::offset_of!(FrameCounters, ib_rename) == 396);
+    assert!(core::mem::offset_of!(FrameCounters, vbib_pool_hits) == 400);
+    assert!(core::mem::offset_of!(FrameCounters, vbib_pool_misses) == 404);
+    assert!(core::mem::offset_of!(FrameCounters, vb_discards) == 408);
+    assert!(core::mem::offset_of!(FrameCounters, ib_discards) == 412);
+    assert!(core::mem::offset_of!(FrameCounters, vbib_preserve_cpu) == 416);
+    assert!(core::mem::offset_of!(FrameCounters, vbib_write_in_place_contended) == 420);
+    assert!(core::mem::offset_of!(FrameCounters, retention_cap_drain) == 424);
+    assert!(core::mem::offset_of!(FrameCounters, retention_cap_submit) == 428);
+    assert!(core::mem::offset_of!(FrameCounters, texture_renames) == 432);
+    assert!(core::mem::offset_of!(FrameCounters, texture_discards) == 436);
+    assert!(core::mem::offset_of!(FrameCounters, texture_preserve_cpu) == 440);
+    assert!(core::mem::offset_of!(FrameCounters, texture_write_in_place_contended) == 444);
+    assert!(core::mem::offset_of!(FrameCounters, texture_add_dirty_calls) == 448);
+    assert!(core::mem::offset_of!(FrameCounters, texture_add_dirty_partial) == 452);
+    assert!(core::mem::offset_of!(FrameCounters, texture_add_dirty_area_bp) == 456);
+    assert!(core::mem::offset_of!(FrameCounters, device_sub_calls) == 460);
+    assert!(core::mem::offset_of!(FrameCounters, bind_sub_calls) == 496);
+    assert!(core::mem::offset_of!(FrameCounters, surface_sub_calls) == 520);
+    assert!(core::mem::offset_of!(FrameCounters, keys_gate_calls) == 540);
+    assert!(core::mem::offset_of!(FrameCounters, keys_gate_skips) == 576);
+    assert!(core::mem::offset_of!(FrameCounters, reserved) == 612);
+    assert!(size_of::<FrameTiming>() == 32);
+    assert!(align_of::<FrameTiming>() == 8);
+    assert!(core::mem::offset_of!(FrameTiming, present_block_cycles) == 0);
+    assert!(core::mem::offset_of!(FrameTiming, frame_total_cycles) == 8);
+    assert!(core::mem::offset_of!(FrameTiming, op_vec_capacity_bytes) == 16);
+    assert!(core::mem::offset_of!(FrameTiming, op_vec_realloc_bytes) == 24);
+    assert!(size_of::<FramePerfPayload>() == 648);
+    assert!(align_of::<FramePerfPayload>() == 8);
+    assert!(core::mem::offset_of!(FramePerfPayload, counters) == 0);
+    assert!(core::mem::offset_of!(FramePerfPayload, timing) == 616);
+};

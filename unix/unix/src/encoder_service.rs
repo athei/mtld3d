@@ -15,6 +15,7 @@ use mtld3d_shared::{
     encoder_runtime::{CONFIG_RECORD, CreateEncoderParams, DestroyEncoderParams},
     encoder_wire::{WireError, WireReader},
     mtl_handle::MTLDeviceKind,
+    record_handle::DeviceRecordHandle,
 };
 use mtld3d_types::{D3D_OK, D3DERR_INVALIDCALL, E_OUTOFMEMORY};
 
@@ -39,7 +40,7 @@ impl EncoderService {
     ///
     /// Returns the OS error when an encoder or submit worker cannot start.
     pub fn new(
-        device: MetalHandle<MTLDeviceKind>,
+        context: EncoderContext,
         config: Mtld3dConfig,
         caps: GpuCaps,
         cache_path: Option<PathBuf>,
@@ -54,9 +55,13 @@ impl EncoderService {
         #[cfg(not(perf_tracking))]
         let _ = source_clock_ptr;
         let config = Arc::new(config);
-        let (mut prewarm, receiver) =
-            shader_prewarm::spawn(device, config.shader_cache_enable, cache_path.clone());
-        match EncoderThread::spawn(caps, Arc::clone(&config), receiver, cache_path, clocks) {
+        let (mut prewarm, receiver) = shader_prewarm::spawn(
+            context.device_handle,
+            config.shader_cache_enable,
+            cache_path.clone(),
+        );
+        let startup = EncoderStartup { context, clocks };
+        match EncoderThread::spawn(caps, Arc::clone(&config), receiver, cache_path, startup) {
             Ok(encoder) => Ok(Self {
                 encoder,
                 programs: Arc::new(ProgramRegistry::new()),
@@ -89,6 +94,22 @@ impl Drop for EncoderService {
         self.calibration.join();
         self.encoder.shutdown();
     }
+}
+
+/// Stable device identity and PE counters retained until native destruction joins workers.
+pub struct EncoderContext {
+    pub device_handle: MetalHandle<MTLDeviceKind>,
+    pub record_handle: DeviceRecordHandle,
+    pub coherent_seq_ptr: u64,
+    pub upload_coherent_seq_ptr: u64,
+    pub failed_submit_seq_ptr: u64,
+    pub retained_bytes_ptr: u64,
+}
+
+/// Inputs consumed once by the native encoder worker before admitting frames.
+pub struct EncoderStartup {
+    pub context: EncoderContext,
+    pub clocks: EncoderClocks,
 }
 
 /// Device-owned calibration uses this native linkage unit's clock domain.
@@ -188,6 +209,15 @@ pub extern "C" fn create_handler(args: *mut core::ffi::c_void) -> i32 {
     params.runtime = 0;
     params.result = D3DERR_INVALIDCALL;
     if params.device.is_null()
+        || params.record_handle.is_null()
+        || [
+            params.coherent_seq_ptr,
+            params.upload_coherent_seq_ptr,
+            params.failed_submit_seq_ptr,
+            params.retained_bytes_ptr,
+        ]
+        .into_iter()
+        .any(|pointer| pointer == 0 || pointer % 8 != 0)
         || params.failure_ptr == 0
         || params.failure_ptr % 4 != 0
         || (cfg!(perf_tracking)
@@ -214,7 +244,15 @@ pub extern "C" fn create_handler(args: *mut core::ffi::c_void) -> i32 {
             return params.result;
         }
     };
-    match EncoderService::new(params.device, config, caps, path, params.source_clock_ptr) {
+    let context = EncoderContext {
+        device_handle: params.device,
+        record_handle: params.record_handle,
+        coherent_seq_ptr: params.coherent_seq_ptr,
+        upload_coherent_seq_ptr: params.upload_coherent_seq_ptr,
+        failed_submit_seq_ptr: params.failed_submit_seq_ptr,
+        retained_bytes_ptr: params.retained_bytes_ptr,
+    };
+    match EncoderService::new(context, config, caps, path, params.source_clock_ptr) {
         Ok(mut service) => {
             service.failure_ptr = params.failure_ptr;
             params.runtime = Box::into_raw(Box::new(service)) as u64;
@@ -266,6 +304,15 @@ impl EncodedFrame {
         }
     }
 
+    pub fn take_program(
+        &self,
+        registration: u64,
+    ) -> Result<(mtld3d_core::ids::ProgramId, mtld3d_core::dxso::DxsoProgram), WireError> {
+        self.programs
+            .take(registration)
+            .ok_or(WireError::InvalidValue)
+    }
+
     /// Decode only on the native encoder thread while the PE packet lease remains live.
     ///
     /// # Safety
@@ -287,16 +334,7 @@ impl EncodedFrame {
         };
         // SAFETY: both ranges and every lease descriptor remain retained by the PE packet.
         unsafe {
-            mtld3d_core::encoder_packet::prepare_packet(
-                metadata,
-                operations,
-                self.completion,
-                |registration| {
-                    self.programs
-                        .take(registration)
-                        .ok_or(WireError::InvalidValue)
-                },
-            )
+            mtld3d_core::encoder_packet::prepare_packet(metadata, operations, self.completion)
         }
     }
 }

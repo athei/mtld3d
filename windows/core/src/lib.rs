@@ -33,6 +33,7 @@ pub mod encoder_controls;
 pub mod encoder_data;
 pub mod encoder_draw;
 pub mod encoder_packet;
+pub mod encoder_records;
 pub mod encoder_reply;
 pub mod encoder_value;
 pub mod fetch4;

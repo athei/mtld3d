@@ -11,7 +11,7 @@ use mtld3d_shared::{
 
 use crate::{
     depth_stencil_state::{DepthStencilSnapshot, StencilFaceState},
-    draw_data::{DepthScissorFlags, DepthStencilFlags, RenderStateSnapshot, StageBinding},
+    draw_data::{DepthScissorFlags, DepthStencilFlags},
     dxso::{
         FfPsKey, FfStage, FfStageFlags, FfVsFlags, FfVsKey, VariantFlags, VariantKey,
         VsSamplerKinds,
@@ -238,6 +238,7 @@ metal_enum_codec!(
 );
 
 fields_codec!(FfVsKey {
+    reserved,
     flags,
     input_tex_coord_count,
     tex_coord_count,
@@ -275,6 +276,7 @@ fields_codec!(FfPsKey {
 });
 
 fields_codec!(VariantKey {
+    reserved,
     alpha_func,
     fog_mode,
     fog_table_mode,
@@ -343,23 +345,4 @@ fields_codec!(VertexAttrDesc {
     buffer_index,
     format,
     offset
-});
-
-fields_codec!(StageBinding {
-    texture_id,
-    sampler_state
-});
-
-fields_codec!(RenderStateSnapshot {
-    pipeline_rs,
-    depth_scissor,
-    depth_stencil_state,
-    cull_mode,
-    fill_mode,
-    scissor_rect,
-    blend_factor,
-    depth_bias,
-    slope_scale_depth_bias,
-    stencil_ref,
-    sample_mask
 });

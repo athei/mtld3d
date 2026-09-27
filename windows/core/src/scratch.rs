@@ -1,17 +1,15 @@
 //! Per-frame bump arena for payloads handed from the API thread to the encoder thread.
 //!
-//! Payloads cross via `Op` variants in `windows/d3d9/src/encoder.rs`.
+//! Captured commands and payloads share one arena owned by the PE frame packet.
 //!
 //! # Lifetime precondition
 //!
-//! Every allocation shares the frame's lifetime: the API thread writes
-//! before `stamp_and_swap`, the encoder thread reads while running the
-//! frame's op stream, and `clear()` frees in bulk at the next
-//! `begin_frame`. Pointer stability across that window is load-bearing —
-//! the unix submit thread dereferences scratch pointers during
-//! `SubmitFrame`. Work that doesn't fit this uniform-lifetime invariant
-//! (cmd-buf-spanning ownership, retained Metal handles, etc.) goes
-//! through `Op::Closure(Box<dyn FnOnce>)` instead.
+//! The API thread completes command headers and regions before admission seals
+//! the packet. Native replay and submit retain the storage lease while any
+//! borrowed payload may still be read. Only a successful replay acknowledgment
+//! permits arena reuse; rejected or uncertain submissions remain quarantined
+//! until the runtime has quiesced. `clear` resets both logical cursors before
+//! the next frame records into this storage.
 //!
 //! # Why chunked instead of flat
 //!
@@ -39,8 +37,8 @@
 //!
 //! # High-water retention
 //!
-//! `clear()` keeps the small-chunk vec intact and only resets the
-//! cursor + current-chunk index, so steady-state frames after warm-up
+//! `clear()` keeps standard-size chunks in the shared pool and resets both
+//! cursors plus the next unused chunk index, so steady-state frames after warm-up
 //! touch the allocator zero times on the small path. RSS impact is
 //! bounded by peak-frame demand (the small-chunk vec retains its
 //! high-water length forever within a session). See
@@ -52,31 +50,30 @@ pub const DEFAULT_CHUNK_SIZE: usize = 64 * 1024;
 
 const ALIGN: usize = 16;
 
-/// Per-frame scratch arena.
+/// One frame owner for stable command and external payload allocations.
 ///
-/// Small allocations bump-pack into default-sized chunks; when the current
-/// small chunk is full, the cursor walks forward to the next retained
-/// chunk (or appends a new one if past the high-water mark). Requests
-/// larger than `chunk_size` go to `oversized`, dedicated chunks sized to
-/// the exact request, so they never displace the hot cursor.
-///
-/// `clear()` resets the cursor + chunk index without dropping any small
-/// chunks. After warm-up, steady-state frames touch the allocator zero
-/// times on the small path; `oversized` (if ever used) is dropped each
-/// frame because per-chunk-per-request can't be re-used as bump space.
+/// A shared reusable chunk pool supplies two independent bump cursors. Payload
+/// capture never interrupts a flat command region. Clear is permitted only after
+/// the packet's replay lease ends; it resets both cursors and drops oversized
+/// chunks while preserving the standard-size high-water capacity.
 pub struct ScratchArena {
-    small_chunks: Vec<Box<[u8]>>,
-    oversized: Vec<Box<[u8]>>,
-    /// Index of the small chunk the cursor is currently inside.
-    ///
-    /// `clear()` resets this to 0 without dropping any chunks, so
-    /// subsequent frames re-fill `small_chunks` from the start.
-    /// `reserve()` advances it (and allocates a new chunk only when it
-    /// walks past the end) — the high-water `Vec` length is retained
-    /// across frames.
-    current_chunk_idx: usize,
-    cursor: usize,
+    #[cfg(perf_tracking)]
+    perf_address: u64,
+    #[cfg(not(perf_tracking))]
+    perf: crate::perf::FramePerfPayload,
+    chunks: Vec<AlignedChunk>,
+    next_chunk: usize,
+    payload_chunk: Option<usize>,
+    command_chunk: Option<usize>,
     chunk_size: usize,
+}
+
+/// A completed command and the contiguous region that now contains it.
+pub struct CommandAllocation {
+    pub address: u64,
+    pub record_bytes: usize,
+    pub region_address: u64,
+    pub region_bytes: usize,
 }
 
 impl ScratchArena {
@@ -88,134 +85,179 @@ impl ScratchArena {
     #[must_use]
     pub const fn with_chunk_size(chunk_size: usize) -> Self {
         Self {
-            small_chunks: Vec::new(),
-            oversized: Vec::new(),
-            current_chunk_idx: 0,
-            cursor: 0,
+            #[cfg(perf_tracking)]
+            perf_address: 0,
+            #[cfg(not(perf_tracking))]
+            perf: crate::perf::FramePerfPayload::new(),
+            chunks: Vec::new(),
+            next_chunk: 0,
+            payload_chunk: None,
+            command_chunk: None,
             chunk_size,
         }
     }
 
-    /// Allocation ranges pinned by this arena until its next clear or destruction.
-    ///
-    /// Frame admission publishes these ranges for validating borrowed byte slices.
+    /// Borrow this arena's source-clock telemetry, or immutable zero telemetry before first use.
+    #[must_use]
+    pub const fn perf(&self) -> &crate::perf::FramePerfPayload {
+        #[cfg(perf_tracking)]
+        {
+            if self.perf_address == 0 {
+                const EMPTY: crate::perf::FramePerfPayload = crate::perf::FramePerfPayload::new();
+                return &EMPTY;
+            }
+            // SAFETY: perf_mut initializes this arena slot; clear resets the token before reuse.
+            unsafe { &*(self.perf_address as *const crate::perf::FramePerfPayload) }
+        }
+        #[cfg(not(perf_tracking))]
+        {
+            &self.perf
+        }
+    }
+
+    /// Initialize telemetry directly in its final arena slot on first use.
+    #[cfg(perf_tracking)]
+    pub fn perf_mut(&mut self) -> &mut crate::perf::FramePerfPayload {
+        if self.perf_address == 0 {
+            let payload = self.alloc_uninit::<crate::perf::FramePerfPayload>();
+            // SAFETY: the fresh aligned slot is exclusive and contains a destructor-free value.
+            unsafe {
+                payload.write(crate::perf::FramePerfPayload::new());
+            }
+            self.perf_address = payload as u64;
+        }
+        // SAFETY: the exclusive arena borrow excludes clear, replacement and another payload borrow.
+        unsafe { &mut *(self.perf_address as *mut crate::perf::FramePerfPayload) }
+    }
+
+    /// Borrow the zero-sized local payload when telemetry is disabled.
+    #[cfg(not(perf_tracking))]
+    pub const fn perf_mut(&mut self) -> &mut crate::perf::FramePerfPayload {
+        &mut self.perf
+    }
+
+    /// Allocation ranges retained by the single arena owner through frame replay.
     pub fn allocation_ranges(&self) -> impl Iterator<Item = (u64, u64)> + '_ {
-        self.small_chunks
+        self.chunks
             .iter()
-            .chain(&self.oversized)
             .map(|chunk| (chunk.as_ptr() as u64, chunk.len() as u64))
     }
 
-    /// Reserve `size` bytes in the arena and return an uninitialised pointer.
-    ///
-    /// Underpins both `alloc` (which then memcpys data in) and
-    /// `alloc_uninit` (which lets the caller write via raw ptr).
-    ///
-    /// The in-chunk bump is a compare and an add; keeping it inline (and
-    /// the refill/oversized tail outlined `#[cold]`) is what lets the
-    /// per-draw snapshot bumps avoid a call per allocation. Unsplit, the
-    /// body is large enough that LLVM declines to inline it even under
-    /// fat LTO, and every bump then pays a full call.
     #[inline]
     fn reserve(&mut self, size: usize) -> *mut u8 {
-        self.cursor = align_up(self.cursor, ALIGN);
         let aligned = align_up(size, ALIGN);
-        // Fast path: current chunk has room.
-        if aligned <= self.chunk_size
-            && !self.small_chunks.is_empty()
-            && self.cursor + aligned <= self.hot_chunk_len()
-        {
-            return self.bump_in_current_chunk(aligned);
+        if let Some(index) = self.payload_chunk {
+            let chunk = &mut self.chunks[index];
+            if aligned <= chunk.len() - chunk.used {
+                let pointer = chunk.as_mut_ptr().wrapping_add(chunk.used);
+                chunk.used += aligned;
+                return pointer;
+            }
         }
         self.reserve_slow(aligned)
     }
 
-    /// Refill tail of [`Self::reserve`]: oversized requests, cold arena, full chunk.
-    ///
-    /// Outlined and `#[cold]` so the chunk-allocation machinery does not
-    /// count against the inline cost of the fast path above.
     #[cold]
     #[inline(never)]
     fn reserve_slow(&mut self, aligned: usize) -> *mut u8 {
-        if aligned > self.chunk_size {
-            return self.reserve_oversized(aligned);
+        let index = self.acquire_chunk(aligned);
+        if aligned <= self.chunk_size {
+            self.payload_chunk = Some(index);
         }
-        // Cursor doesn't fit (or arena is cold). Walk forward to the next
-        // retained chunk if there is one; otherwise grow the vec.
-        if self.small_chunks.is_empty() {
-            self.small_chunks
-                .push(alloc_zeroed_chunk(self.chunk_size).into_boxed_slice());
-            self.current_chunk_idx = 0;
-        } else {
-            self.current_chunk_idx += 1;
-            if self.current_chunk_idx >= self.small_chunks.len() {
-                self.small_chunks
-                    .push(alloc_zeroed_chunk(self.chunk_size).into_boxed_slice());
-            }
+        let chunk = &mut self.chunks[index];
+        chunk.used = aligned;
+        chunk.as_mut_ptr()
+    }
+
+    #[cold]
+    fn acquire_chunk(&mut self, required: usize) -> usize {
+        let index = self.next_chunk;
+        let capacity = required.max(self.chunk_size);
+        if index == self.chunks.len() {
+            self.chunks.push(alloc_zeroed_chunk(capacity));
+        } else if self.chunks[index].len() < capacity {
+            self.chunks[index] = alloc_zeroed_chunk(capacity);
         }
-        self.cursor = 0;
-        self.bump_in_current_chunk(aligned)
+        self.chunks[index].used = 0;
+        self.next_chunk += 1;
+        index
     }
 
-    #[inline]
-    fn bump_in_current_chunk(&mut self, aligned: usize) -> *mut u8 {
-        let chunk = &mut self.small_chunks[self.current_chunk_idx];
-        // SAFETY: caller (`reserve`) verified `self.cursor + aligned`
-        // fits within `chunk.len()`.
-        let ptr = unsafe { chunk.as_mut_ptr().add(self.cursor) };
-        self.cursor += aligned;
-        ptr
-    }
-
-    fn reserve_oversized(&mut self, aligned: usize) -> *mut u8 {
-        let mut chunk = alloc_zeroed_chunk(aligned).into_boxed_slice();
-        let ptr = chunk.as_mut_ptr();
-        self.oversized.push(chunk);
-        ptr
-    }
-
-    /// Write a command directly beside this frame's captured payloads.
+    /// Initialize a command in a contiguous command region of this arena.
     ///
-    /// The conservative bound reserves one contiguous window. The unused tail
-    /// is reclaimed immediately, so consecutive commands pack without padding.
-    /// Typed payload allocations realign the cursor before their next write.
+    /// Payload allocations use a separate cursor into the same owned chunk pool.
+    /// A failed callback leaves the committed region length unchanged. Successful
+    /// records contain an exact logical length and zero alignment padding.
     ///
     /// # Errors
-    /// Returns the encoder's write error without publishing a partial record.
-    pub fn write_record(
+    /// Returns overflow, invalid callback length or the callback's error.
+    pub fn write_command(
         &mut self,
-        tag: u16,
-        bound: usize,
-        write: impl FnOnce(
-            &mut mtld3d_shared::encoder_wire::WireWriter<'_>,
-        ) -> Result<(), mtld3d_shared::encoder_wire::WireError>,
-    ) -> Result<(u64, usize, u64), mtld3d_shared::encoder_wire::WireError> {
-        use mtld3d_shared::encoder_wire::{WireError, WireWriter};
-        if bound < 6 || bound > u32::MAX as usize {
+        opcode: u16,
+        operand: u16,
+        payload_bound: usize,
+        fill: impl FnOnce(&mut [u8]) -> Result<usize, mtld3d_shared::encoder_wire::WireError>,
+    ) -> Result<CommandAllocation, mtld3d_shared::encoder_wire::WireError> {
+        use mtld3d_shared::{
+            command_header::{COMMAND_HEADER_BYTES, CommandHeader},
+            encoder_wire::WireError,
+        };
+        let bound = payload_bound
+            .checked_add(COMMAND_HEADER_BYTES)
+            .ok_or(WireError::TooLarge)?;
+        if bound > u32::MAX as usize || bound > isize::MAX as usize {
             return Err(WireError::TooLarge);
         }
-        let pointer = if bound <= self.chunk_size
-            && !self.small_chunks.is_empty()
-            && self.cursor + bound <= self.hot_chunk_len()
+        let reserved = bound.checked_add(15).ok_or(WireError::TooLarge)? & !15;
+        let index = if let Some(index) = self.command_chunk
+            && reserved <= self.chunks[index].len() - self.chunks[index].used
         {
-            self.bump_in_current_chunk(bound)
+            index
         } else {
-            self.reserve_slow(bound)
+            let index = self.acquire_chunk(reserved);
+            self.command_chunk = Some(index);
+            index
         };
-        // SAFETY: the arena just reserved this exclusive initialized byte window.
-        // The callback cannot allocate through this same mutable arena borrow.
-        let destination = unsafe { core::slice::from_raw_parts_mut(pointer, bound) };
-        let result = WireWriter::record_into(destination, tag, write);
-        if bound <= self.chunk_size {
-            let used = result.as_ref().copied().unwrap_or(0);
-            self.cursor -= bound - used;
+        let chunk = &mut self.chunks[index];
+        let pointer = chunk.as_mut_ptr().wrapping_add(chunk.used);
+        // SAFETY: the exclusive aligned reservation contains this payload window.
+        let destination = unsafe {
+            core::slice::from_raw_parts_mut(
+                pointer.wrapping_add(COMMAND_HEADER_BYTES),
+                payload_bound,
+            )
+        };
+        let payload_used = fill(destination)?;
+        if payload_used > payload_bound {
+            return Err(WireError::TooLarge);
         }
-        let allocation = if bound <= self.chunk_size {
-            self.small_chunks[self.current_chunk_idx].as_ptr() as u64
-        } else {
-            pointer as u64
+        let used = payload_used + COMMAND_HEADER_BYTES;
+        let aligned_used = (used + 15) & !15;
+        // SAFETY: padding lies within the exclusive reservation.
+        unsafe {
+            pointer
+                .wrapping_add(used)
+                .write_bytes(0, aligned_used - used);
         };
-        result.map(|used| (pointer as u64, used, allocation))
+        let record_bytes = u32::try_from(used).map_err(|_| WireError::TooLarge)?;
+        let header_pointer = pointer as usize as *mut CommandHeader;
+        // SAFETY: aligned chunk storage and cursor establish header alignment;
+        // this exclusive reservation holds a complete initialized command.
+        unsafe {
+            header_pointer.write(CommandHeader {
+                opcode,
+                operand,
+                record_bytes,
+                reserved: 0,
+            });
+        };
+        chunk.used += aligned_used;
+        Ok(CommandAllocation {
+            address: pointer as u64,
+            record_bytes: used,
+            region_address: chunk.as_ptr() as u64,
+            region_bytes: chunk.used,
+        })
     }
 
     /// Copy `data` into the arena and return a stable pointer cast to `u64`.
@@ -320,101 +362,71 @@ impl ScratchArena {
         (ptr, len)
     }
 
-    /// Reset the bump cursor to the start of `small_chunks[0]` without dropping any small chunks.
+    /// Reuse the single retained pool after all frame readers have released it.
     ///
-    /// The high-water-mark `Vec` length is retained across frames. Once
-    /// the workload stabilises, subsequent frames touch the allocator
-    /// zero times on the small path.
-    ///
-    /// `oversized` chunks are sized to a one-shot request and can't be
-    /// reused as bump space (each is fully consumed by a single
-    /// allocation), so they are dropped — keeping them would require a
-    /// free-list, not a bump arena. In d3d9 the oversized path is
-    /// effectively unused (max scratch payload ~4 KB ≪ 64 KB chunk).
+    /// Oversized regions are discarded; both logical cursors start unassigned.
     pub fn clear(&mut self) {
-        self.current_chunk_idx = 0;
-        self.cursor = 0;
-        self.oversized.clear();
+        #[cfg(perf_tracking)]
+        {
+            self.perf_address = 0;
+        }
+        self.chunks.retain(|chunk| chunk.len() <= self.chunk_size);
+        for chunk in &mut self.chunks {
+            chunk.used = 0;
+        }
+        self.next_chunk = 0;
+        self.payload_chunk = None;
+        self.command_chunk = None;
     }
 
-    /// Total chunk count across small + oversized arenas. Diagnostic only.
+    /// Number of owned chunks, including oversized allocations.
     ///
     /// # Panics
-    ///
-    /// Panics if the total exceeds `u32::MAX` — unreachable, the arena would
-    /// have run out of address space first.
+    /// Panics if the chunk count cannot fit u32.
     #[must_use]
     pub fn chunk_count(&self) -> u32 {
-        u32::try_from(self.small_chunks.len() + self.oversized.len())
-            .expect("chunk count ≤ u32::MAX in any realistic workload")
+        u32::try_from(self.chunks.len()).expect("chunk count fits u32")
     }
 
-    /// Count of bump-packed chunks.
-    ///
-    /// Subset of `chunk_count()` that excludes oversized one-shot chunks;
-    /// surfaces separately in the perf diag so a reader can tell whether
-    /// the arena's footprint is dominated by reusable bump space (small)
-    /// or by request-sized one-offs (oversized).
+    /// Number of reusable chunks within the standard chunk-size budget.
     ///
     /// # Panics
-    ///
-    /// Panics if the count exceeds `u32::MAX` — see `chunk_count`.
+    /// Panics if the chunk count cannot fit u32.
     #[must_use]
     pub fn small_chunk_count(&self) -> u32 {
-        u32::try_from(self.small_chunks.len())
-            .expect("small chunk count ≤ u32::MAX in any realistic workload")
+        u32::try_from(
+            self.chunks
+                .iter()
+                .filter(|chunk| chunk.len() <= self.chunk_size)
+                .count(),
+        )
+        .expect("chunk count fits u32")
     }
 
-    /// Count of dedicated chunks allocated for requests larger than `chunk_size`.
-    ///
-    /// In d3d9 this is normally 0 (max scratch payload is ~4 KB, well
-    /// under the 64 KB chunk size) — a non-zero value here is the signal
-    /// that some payload is overflowing and motivating its own chunk
-    /// every frame.
+    /// Number of oversized chunks that will be dropped on clear.
     ///
     /// # Panics
-    ///
-    /// Panics if the count exceeds `u32::MAX` — see `chunk_count`.
+    /// Panics if the chunk count cannot fit u32.
     #[must_use]
     pub fn oversized_chunk_count(&self) -> u32 {
-        u32::try_from(self.oversized.len())
-            .expect("oversized chunk count ≤ u32::MAX in any realistic workload")
+        u32::try_from(
+            self.chunks
+                .iter()
+                .filter(|chunk| chunk.len() > self.chunk_size)
+                .count(),
+        )
+        .expect("chunk count fits u32")
     }
 
     #[must_use]
     pub fn capacity_bytes(&self) -> u64 {
-        let small: u64 = self.small_chunks.iter().map(|c| c.len() as u64).sum();
-        let over: u64 = self.oversized.iter().map(|c| c.len() as u64).sum();
-        small + over
+        self.chunks.iter().map(|chunk| chunk.len() as u64).sum()
     }
 
-    /// Bytes actually written this frame.
-    ///
-    /// Every chunk before `current_chunk_idx` is fully consumed, plus
-    /// `cursor` worth of the current chunk, plus oversized chunks (which
-    /// are always fully used — each is sized to its one request).
-    /// Retained chunks past the cursor are excluded; they are reserved
-    /// capacity, not live use.
+    /// Sum of committed or allocated bytes in both logical cursors this frame.
     #[must_use]
     pub fn bytes_used(&self) -> u64 {
-        let small_full: u64 = if self.small_chunks.is_empty() {
-            0
-        } else {
-            self.small_chunks[..self.current_chunk_idx]
-                .iter()
-                .map(|c| c.len() as u64)
-                .sum::<u64>()
-                + self.cursor as u64
-        };
-        let over: u64 = self.oversized.iter().map(|c| c.len() as u64).sum();
-        small_full + over
-    }
-
-    #[inline]
-    fn hot_chunk_len(&self) -> usize {
-        self.small_chunks
-            .get(self.current_chunk_idx)
-            .map_or(0, |c| c.len())
+        self.chunks.iter().map(|chunk| chunk.used as u64).sum()
     }
 }
 
@@ -428,8 +440,39 @@ const fn align_up(n: usize, align: usize) -> usize {
     (n + align - 1) & !(align - 1)
 }
 
-fn alloc_zeroed_chunk(size: usize) -> Vec<u8> {
-    vec![0u8; size]
+#[repr(C, align(16))]
+struct ArenaWord {
+    _bytes: [u8; 16],
+}
+
+struct AlignedChunk {
+    words: Box<[ArenaWord]>,
+    length: usize,
+    used: usize,
+}
+
+impl AlignedChunk {
+    fn as_ptr(&self) -> *const u8 {
+        self.words.as_ptr().cast::<u8>()
+    }
+    fn as_mut_ptr(&mut self) -> *mut u8 {
+        self.words.as_mut_ptr().cast::<u8>()
+    }
+    const fn len(&self) -> usize {
+        self.length
+    }
+}
+
+fn alloc_zeroed_chunk(size: usize) -> AlignedChunk {
+    let words = std::iter::repeat_with(|| ArenaWord { _bytes: [0; 16] })
+        .take(size.div_ceil(16).max(1))
+        .collect::<Vec<_>>()
+        .into_boxed_slice();
+    AlignedChunk {
+        words,
+        length: size,
+        used: 0,
+    }
 }
 
 #[cfg(test)]

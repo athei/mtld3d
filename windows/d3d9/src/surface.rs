@@ -1627,9 +1627,7 @@ unsafe fn finalize_surface(this: *mut Direct3DSurface9) {
         );
         // SAFETY: a standalone surface forwards a device reference for its
         // public lifetime, so the device outlives this finalize.
-        unsafe { &mut *inner.device_inner }.push_op(crate::encoder::Op::RetireColor(
-            mtld3d_core::encoder_data::capture_op(crate::device::RetireColorOp { retired }),
-        ));
+        unsafe { &mut *inner.device_inner }.push_control(crate::device::RetireColorOp { retired });
     }
     // A standalone depth-stencil target owns its Metal depth texture the same
     // way, and retires it the same way. The implicit auto depth-stencil
@@ -1652,9 +1650,7 @@ unsafe fn finalize_surface(this: *mut Direct3DSurface9) {
         );
         // SAFETY: a standalone surface forwards a device reference for its
         // public lifetime, so the device outlives this finalize.
-        unsafe { &mut *inner.device_inner }.push_op(crate::encoder::Op::RetireDepth(
-            mtld3d_core::encoder_data::capture_op(crate::device::RetireDepthOp { depth }),
-        ));
+        unsafe { &mut *inner.device_inner }.push_control(crate::device::RetireDepthOp { depth });
     }
     // A texture shell has nothing of the texture to give back here. The
     // reference `GetSurfaceLevel` / `GetCubeMapSurface` took on it is dropped by
@@ -2580,15 +2576,13 @@ fn backbuffer_dc_upload(inner: &mut SurfaceInner) {
     // The snapshot page is tightly packed, so a row is exactly `width` pixels.
     let src_stride = width * bpp;
     if scale.is_identity() {
-        device_inner.push_op(crate::encoder::Op::UploadColor(
-            mtld3d_core::encoder_data::capture_op(crate::device::UploadColorOp {
-                color_handle,
-                bytes,
-                width,
-                height,
-                src_stride,
-            }),
-        ));
+        device_inner.push_control(crate::device::UploadColorOp {
+            color_handle,
+            bytes,
+            width,
+            height,
+            src_stride,
+        });
         return;
     }
     let target = ResampledUpload {
@@ -2601,9 +2595,7 @@ fn backbuffer_dc_upload(inner: &mut SurfaceInner) {
         msaa_srgb: inner.live_msaa_srgb_handle(),
         sample_count: inner.live_multi_sample().sample_count,
     };
-    device_inner.push_op(crate::encoder::Op::UploadResampled(
-        mtld3d_core::encoder_data::capture_op(crate::device::UploadResampledOp { target, bytes }),
-    ));
+    device_inner.push_control(crate::device::UploadResampledOp { target, bytes });
 }
 
 /// `LockRect` for a system-memory offscreen surface.
@@ -2828,9 +2820,7 @@ fn lockable_rt_readback_fill(inner: &mut SurfaceInner, bpp: u32) -> bool {
     // This blit reads the RT right after the flush. Mark it read-back BEFORE
     // the flush so the store-action rules treat it as live and never discard
     // its colour store.
-    device_inner.push_op(crate::encoder::Op::NoteColorRead(
-        mtld3d_core::encoder_data::capture_op(crate::device::NoteColorReadOp { src: tex_handle }),
-    ));
+    device_inner.push_control(crate::device::NoteColorReadOp { src: tex_handle });
     if device_inner.flush_current_frame_blocking().is_err() {
         return false;
     }
@@ -2930,15 +2920,13 @@ fn lockable_rt_upload(inner: &mut SurfaceInner) {
     // SAFETY: the captured token moves directly into this frame's upload operation.
     let bytes = unsafe { device_inner.capture_frame_bytes(&page.as_slice()[..needed]) };
     if scale.is_identity() {
-        device_inner.push_op(crate::encoder::Op::UploadColor(
-            mtld3d_core::encoder_data::capture_op(crate::device::UploadColorOp {
-                color_handle,
-                bytes,
-                width,
-                height,
-                src_stride: pitch,
-            }),
-        ));
+        device_inner.push_control(crate::device::UploadColorOp {
+            color_handle,
+            bytes,
+            width,
+            height,
+            src_stride: pitch,
+        });
         return;
     }
     let target = ResampledUpload {
@@ -2951,9 +2939,7 @@ fn lockable_rt_upload(inner: &mut SurfaceInner) {
         msaa_srgb: inner.live_msaa_srgb_handle(),
         sample_count: inner.live_multi_sample().sample_count,
     };
-    device_inner.push_op(crate::encoder::Op::UploadResampled(
-        mtld3d_core::encoder_data::capture_op(crate::device::UploadResampledOp { target, bytes }),
-    ));
+    device_inner.push_control(crate::device::UploadResampledOp { target, bytes });
 }
 
 /// Parse a `RECT*` pointer passed to `LockRect` and clamp it against `(full_w, full_h)`.

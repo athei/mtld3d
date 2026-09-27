@@ -65,7 +65,7 @@ fn clear_retains_high_water() {
     // not in a new chunk past the peak.
     let post_clear = arena.alloc(&[0u8; 16]);
     let chunk0_start = arena
-        .small_chunks
+        .chunks
         .first()
         .map(|c| c.as_ptr() as u64)
         .expect("chunk 0 retained");
@@ -91,11 +91,7 @@ fn reserve_walks_existing_chunks_after_clear() {
         peak >= 3,
         "test setup expects at least 3 chunks, got {peak}"
     );
-    let chunk_ptrs: Vec<u64> = arena
-        .small_chunks
-        .iter()
-        .map(|c| c.as_ptr() as u64)
-        .collect();
+    let chunk_ptrs: Vec<u64> = arena.chunks.iter().map(|c| c.as_ptr() as u64).collect();
 
     arena.clear();
     assert_eq!(
@@ -188,39 +184,93 @@ fn bytes_used_tracks_cursor() {
 }
 
 #[test]
-fn command_windows_share_payload_chunks_without_copy_or_unused_tail() {
+fn command_regions_ignore_interleaved_payload_allocations_and_reuse_capacity() {
+    use mtld3d_shared::command_header::CommandHeader;
+
     let mut arena = ScratchArena::with_chunk_size(TEST_CHUNK);
-    let (first, first_len, _) = arena.write_record(1, 128, |writer| writer.u8(3)).unwrap();
-    let (second, second_len, _) = arena.write_record(2, 128, |writer| writer.u32(7)).unwrap();
-    assert_eq!(second, first + first_len as u64);
-    assert_eq!(first_len + second_len, 17);
+    let first = arena
+        .write_command(1, 0, 1, |payload| {
+            payload[0] = 3;
+            Ok(1)
+        })
+        .unwrap();
     let payload = arena.alloc(&[9; 16]);
+    let second = arena
+        .write_command(2, 0, 4, |payload| {
+            payload.copy_from_slice(&7u32.to_le_bytes());
+            Ok(4)
+        })
+        .unwrap();
+    assert_eq!(second.address, first.address + 32);
+    assert_eq!(second.region_address, first.region_address);
+    assert_eq!((first.record_bytes, second.record_bytes), (17, 20));
     assert_eq!(payload % 16, 0);
-    assert!(payload >= second + second_len as u64);
-    assert_eq!(arena.chunk_count(), 1);
+    assert_eq!(arena.chunk_count(), 2);
     let capacity = arena.capacity_bytes();
-    // SAFETY: the arena retains the first record unchanged across subsequent allocations.
-    let bytes = unsafe { core::slice::from_raw_parts(first as *const u8, first_len) };
-    let mut reader = mtld3d_shared::encoder_wire::WireReader::new(bytes);
-    assert_eq!(
-        reader.next_record().unwrap().unwrap().payload.u8().unwrap(),
-        3
-    );
+    // SAFETY: committed headers are aligned and retained by the arena.
+    let header = unsafe { &*(first.address as *const CommandHeader) };
+    assert_eq!(header.reserved, 0);
     arena.clear();
-    let (reused, _, _) = arena.write_record(3, 128, |writer| writer.u8(5)).unwrap();
-    assert_eq!(reused, first);
+    let reused = arena
+        .write_command(3, 0, 1, |payload| {
+            payload[0] = 5;
+            Ok(1)
+        })
+        .unwrap();
+    assert_eq!(reused.address, first.address);
+    arena.alloc(&[2; 16]);
     assert_eq!(arena.capacity_bytes(), capacity);
 }
 
 #[test]
-fn failed_command_window_does_not_consume_arena_space() {
-    let mut arena = ScratchArena::with_chunk_size(TEST_CHUNK);
-    let before = arena.bytes_used();
+fn flat_command_commit_preserves_previous_region_on_failure_and_rollover() {
+    use mtld3d_shared::{command_header::CommandHeader, encoder_wire::WireError};
+
+    let mut arena = ScratchArena::with_chunk_size(64);
+    let first = arena
+        .write_command(7, 9, 3, |payload| {
+            payload.copy_from_slice(&[1, 2, 3]);
+            Ok(3)
+        })
+        .unwrap();
+    assert_eq!(first.address % 16, 0);
+    assert_eq!(first.record_bytes, 19);
+    let used = arena.bytes_used();
+    assert!(matches!(
+        arena.write_command(8, 0, 16, |_| Err(WireError::InvalidValue)),
+        Err(WireError::InvalidValue)
+    ));
+    assert_eq!(arena.bytes_used(), used);
+    // SAFETY: the successful command is aligned and retained by this arena.
+    let header = unsafe { &*(first.address as *const CommandHeader) };
     assert_eq!(
-        arena.write_record(1, 6, |writer| writer.u8(2)),
-        Err(mtld3d_shared::encoder_wire::WireError::TooLarge)
+        (
+            header.opcode,
+            header.operand,
+            header.record_bytes,
+            header.reserved
+        ),
+        (7, 9, 19, 0)
     );
-    assert_eq!(arena.bytes_used(), before);
-    let (_, len, _) = arena.write_record(2, 128, |writer| writer.u32(3)).unwrap();
-    assert_eq!(arena.bytes_used(), len as u64);
+    let second = arena
+        .write_command(8, 0, 16, |payload| {
+            payload.fill(0x5a);
+            Ok(16)
+        })
+        .unwrap();
+    assert_eq!(second.address, first.address + 32);
+    assert_eq!(second.region_bytes, 64);
+    let third = arena
+        .write_command(9, 0, 1, |payload| {
+            payload[0] = 6;
+            Ok(1)
+        })
+        .unwrap();
+    assert_ne!(third.region_address, first.region_address);
+    assert_eq!(third.address % 16, 0);
+    assert_eq!(third.region_bytes, 32);
+    // SAFETY: the entire first region stays alive after rollover.
+    let bytes = unsafe { core::slice::from_raw_parts(first.address as *const u8, 32) };
+    assert_eq!(&bytes[16..19], &[1, 2, 3]);
+    assert!(bytes[19..].iter().all(|&byte| byte == 0));
 }

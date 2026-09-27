@@ -11,7 +11,12 @@ use mtld3d_core::{
     convert::{d3d_depth_bias_to_clip, d3d_to_metal_cull, d3d_to_metal_fill},
     depth_stencil_state::STENCIL_MASK_BITS,
     dirty_range::{indexed_vb_range_lower_bound, nonindexed_vb_range},
+    draw_data::{FixedPsSource, FixedVsSource, ProgrammablePsSource, ProgrammableVsSource},
     dxso::{VariantFlags, VariantKey, bound_sampler_type},
+    encoder_draw::draw_record::{
+        DrawView, IndexView, StreamViewFeed as VertexFeed, VertexView, stream_layouts_view,
+    },
+    ids::BufferId,
     passes::{
         NULL_TEXTURE_SAMPLER_SENTINEL, Rt0DropCandidate, VertexBufferBind,
         null_texture_tex_sentinel, sampler_cache_key,
@@ -23,6 +28,7 @@ use mtld3d_core::{
 };
 use mtld3d_shared::{
     Command, MetalHandle, VertexAttrDesc,
+    encoder_wire::WireError,
     mtl::{
         IndexType, PS_BOOL_CONST_SLOT, PS_DRAW_SLOT, PS_INT_CONST_SLOT, PS_LOD_BIAS_SLOT,
         PrimitiveType, SET_BYTES_MAX, VS_BOOL_CONST_SLOT, VS_DRAW_SLOT, VS_FLOAT_CONST_SLOT,
@@ -66,9 +72,9 @@ const DECAL_TRACE_TARGET: &str = "mtld3d::d3d9::decal";
 const CASTER_TRACE_TARGET: &str = "mtld3d::d3d9::caster";
 
 pub use mtld3d_core::draw_data::{
-    CurrentSnapshot, CurrentSnapshotPtr, DepthStencilFlags, DrawOp, IndexSource, NULL_STREAM_ZEROS,
-    PsKey, PsSource, RenderStateSnapshot, ScratchSlice, ShaderRef, StageBindingsPtr, StreamFeed,
-    VertexSource, VsSource, arena_alloc_bytes, null_texture_kind, stream_layouts,
+    CurrentSnapshot, CurrentSnapshotPtr, DepthStencilFlags, NULL_STREAM_ZEROS, PsKey, PsSourceView,
+    RenderStateSnapshot, ScratchSlice, ShaderRef, StageBindingsPtr, VsSourceView,
+    arena_alloc_bytes, null_texture_kind,
 };
 
 /// Close the `draw N` debug group `emit_draw` opened for a dumped draw.
@@ -299,12 +305,38 @@ fn resolve_pipeline_slow(
     }
 }
 
-pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
-    let DrawOp {
-        metal_prim,
-        vertex_source,
-        index_source,
-    } = draw;
+/// Execute a draw directly from its retained command record.
+///
+/// # Safety
+/// The view must belong to the authentic admitted packet. Its captured bytes and
+/// backing allocations remain immutable and retained until submit completion. The
+/// encoder snapshot cache must name initialized snapshots retained by that packet.
+///
+/// # Errors
+/// Rejects malformed draw fields before changing encoder state.
+pub unsafe fn emit_draw(enc: &mut FrameEncoder, draw: &DrawView<'_>) -> Result<(), WireError> {
+    let metal_prim = draw.metal_primitive()?;
+    let vertex_source = draw.vertices()?;
+    let index_source = draw.indices()?;
+    match &index_source {
+        IndexView::Bound { record, .. } => {
+            record.index_type()?;
+        }
+        IndexView::Up { record, .. } | IndexView::Generated { record, .. } => {
+            record.index_type()?;
+        }
+        _ => {}
+    }
+    emit_draw_view(enc, metal_prim, &vertex_source, &index_source);
+    Ok(())
+}
+
+fn emit_draw_view(
+    enc: &mut FrameEncoder,
+    metal_prim: PrimitiveType,
+    vertex_source: &VertexView<'_>,
+    index_source: &IndexView<'_>,
+) {
     // Taken up front: a draw dropped below must not leave its frame-dump
     // index for the next draw to wear.
     let dump_draw = enc.take_dump_draw();
@@ -318,17 +350,17 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
     let t_resolve = CycleAddTimer::start(enc.op_sub_cycles_ptr(OpSub::Resolve));
     // Lifetime-launder the scratch-resident snapshot ptr off `enc` so
     // the rest of emit_draw can freely reborrow `&mut enc`. SAFETY:
-    // the pointee lives in `FrameData::scratch` which the encoder
-    // owns for the full op-drain duration; the pointer was set by
-    // this draw or an earlier draw in the same frame.
+    // the pointee lives in `NativeFrame::scratch`, retained through
+    // submission or failure quarantine. A snapshot command in this
+    // frame installed the pointer before this draw.
     let snap_ptr = enc
         .current_snapshot_ptr()
         .expect("emit_draw: snapshot not supplied")
         .as_ptr();
     // SAFETY: snap_ptr is non-null (NonNull invariant) and points to
-    // a live CurrentSnapshot in FrameData::scratch. The pointee
-    // outlives the entire op-drain loop in run_frame, well past every
-    // `enc` reborrow below.
+    // a live CurrentSnapshot in NativeFrame::scratch. Its frame owner
+    // retains the allocation through submission or failure quarantine,
+    // beyond every `enc` reborrow below.
     let snap: &CurrentSnapshot = unsafe { &*snap_ptr };
     // Every Option must be Some by the time a Draw runs — the API
     // thread populates every field before queuing the changed snapshot.
@@ -342,12 +374,12 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
         .as_ref()
         .expect("emit_draw: stage_bindings not populated");
     let attrs = snap.attrs.expect("emit_draw: attrs not populated");
-    let vs: &VsSource = snap
+    let vs: VsSourceView<'_> = snap
         .vs
         .as_ref()
         .expect("emit_draw: vs not populated")
         .as_ref();
-    let ps: &PsSource = snap
+    let ps: PsSourceView<'_> = snap
         .ps
         .as_ref()
         .expect("emit_draw: ps not populated")
@@ -372,8 +404,8 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
     let has_stencil = target_planes.contains(PipelineAttachFlags::HAS_STENCIL);
     // Bit `i` set ⇒ the pixel shader writes `oCi`; the FF PS writes one output.
     let ps_color_out_mask = match ps {
-        PsSource::Programmable { color_out_mask, .. } => *color_out_mask,
-        PsSource::FixedFunction { .. } => 1,
+        PsSourceView::Programmable(ProgrammablePsSource { color_out_mask, .. }) => *color_out_mask,
+        PsSourceView::FixedFunction(_) => 1,
     };
     // Whether this draw leaves render target 0 out of its pass, so the depth
     // surface sets the extent (`PassState::rt0_drop_candidate`). Only asked
@@ -414,10 +446,12 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
     // the game bound a texture to that the shader never samples has no
     // argument in the emitted function, so binding it only adds encoder work.
     let ps_sampled_mask = match ps {
-        PsSource::Programmable { ps_id, .. } => enc.ps_declared_samplers(*ps_id).mask(),
-        PsSource::FixedFunction {
+        PsSourceView::Programmable(ProgrammablePsSource { ps_id, .. }) => {
+            enc.ps_declared_samplers(*ps_id).mask()
+        }
+        PsSourceView::FixedFunction(FixedPsSource {
             sampled_stage_mask, ..
-        } => *sampled_stage_mask,
+        }) => *sampled_stage_mask,
     };
     // `D3DSAMP_MIPMAPLODBIAS` has no Metal sampler equivalent, so the bias
     // reaches the GPU as a fragment uniform the sample sites read. Resolving
@@ -458,11 +492,11 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
     // output and keeps the default so its library index never fragments.
     let extra_attachments = enc.current_extra_color_attachments();
     let mut ps_variant = match ps {
-        PsSource::Programmable { .. } => VariantKey {
+        PsSourceView::Programmable(_) => VariantKey {
             color_out_mask: extra_attachments.present_mask << 1,
             ..variant
         },
-        PsSource::FixedFunction { .. } => variant,
+        PsSourceView::FixedFunction(_) => variant,
     };
     // Coverage consumes the fragment alpha instead of applying ALPHAFUNC.
     // Resolve from the current target so switching back to one sample restores
@@ -490,7 +524,7 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
     // depth attachment is a Metal pipeline error, so a programmable PS drops
     // its depth export when no depth buffer is bound (D3D9 discards the
     // write). The FF PS never writes depth and keeps the default key.
-    if matches!(ps, PsSource::Programmable { .. }) {
+    if matches!(ps, PsSourceView::Programmable(_)) {
         ps_variant.flags.set(
             VariantFlags::NO_DEPTH_ATTACHMENT,
             !snap.depth_stencil.contains(DepthStencilFlags::HAS_DEPTH),
@@ -509,7 +543,7 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
     // took the flag can only ever be bound the bytes that came with it.
     let vpos_target_scale = enc.target_scale();
     let ps_draw_bytes = (!vpos_target_scale.is_identity()
-        && matches!(ps, PsSource::Programmable { ps_id, .. } if enc.ps_reads_vpos(*ps_id)))
+        && matches!(ps, PsSourceView::Programmable(ProgrammablePsSource { ps_id, .. }) if enc.ps_reads_vpos(*ps_id)))
     .then(|| mtld3d_core::ps_draw::build_ps_draw_bytes(vpos_target_scale));
     ps_variant
         .flags
@@ -532,38 +566,32 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
     // one.
     let t_consts = CycleAddTimer::start(enc.op_sub_detail_ptr(OpSubDetail::RConsts));
     let vs_constants = match vs {
-        VsSource::Programmable {
-            max_const_used,
-            uses_rel_const,
-            ..
-        } => {
-            let rows = if *uses_rel_const {
+        VsSourceView::Programmable(value) => {
+            let rows = if value.uses_rel_const() {
                 enc.vs_constants_populated_rows()
             } else {
-                *max_const_used
+                value.max_const_used
             };
             enc.vs_const_scratch(rows)
         }
-        VsSource::FixedFunction { max_row_count, .. } => enc.ff_vs_const_scratch(*max_row_count),
+        VsSourceView::FixedFunction(FixedVsSource { max_row_count, .. }) => {
+            enc.ff_vs_const_scratch(*max_row_count)
+        }
     };
     let ps_constants = match ps {
-        PsSource::Programmable { max_const_used, .. } => enc.ps_const_scratch(*max_const_used),
-        PsSource::FixedFunction { constant_rows, .. } if *constant_rows != 0 => {
+        PsSourceView::Programmable(ProgrammablePsSource { max_const_used, .. }) => {
+            enc.ps_const_scratch(*max_const_used)
+        }
+        PsSourceView::FixedFunction(FixedPsSource { constant_rows, .. }) if *constant_rows != 0 => {
             snap.ps_constants.unwrap_or(ScratchSlice::EMPTY)
         }
-        PsSource::FixedFunction { .. } => ScratchSlice::EMPTY,
+        PsSourceView::FixedFunction(_) => ScratchSlice::EMPTY,
     };
     let alpha_ref_slice = snap.alpha_ref_bytes.unwrap_or(ScratchSlice::EMPTY);
     let fog_color_slice = snap.fog_color_bytes.unwrap_or(ScratchSlice::EMPTY);
     // SM1 texbem bump-env uniform (slot 12). Only the bound PS knowing it uses
     // a bem-family op pulls the slice — every other draw skips it entirely.
-    let ps_uses_bump_env = matches!(
-        ps,
-        PsSource::Programmable {
-            uses_bump_env: true,
-            ..
-        }
-    );
+    let ps_uses_bump_env = matches!(ps, PsSourceView::Programmable(value) if value.uses_bump_env());
     let bump_env_slice = if ps_uses_bump_env {
         snap.bump_env_bytes.unwrap_or(ScratchSlice::EMPTY)
     } else {
@@ -571,26 +599,16 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
     };
     // VS integer constants (vertex slot 14). Only a VS that reads a dynamic
     // integer constant pulls the slice; every other draw skips it entirely.
-    let vs_uses_int_const = matches!(
-        vs,
-        VsSource::Programmable {
-            uses_int_const: true,
-            ..
-        }
-    );
+    let vs_uses_int_const =
+        matches!(vs, VsSourceView::Programmable(value) if value.uses_int_const());
     let vs_int_const_slice = if vs_uses_int_const {
         snap.vs_int_const_bytes.unwrap_or(ScratchSlice::EMPTY)
     } else {
         ScratchSlice::EMPTY
     };
     // VS boolean constants (vertex slot 26), gated the same way.
-    let vs_uses_bool_const = matches!(
-        vs,
-        VsSource::Programmable {
-            uses_bool_const: true,
-            ..
-        }
-    );
+    let vs_uses_bool_const =
+        matches!(vs, VsSourceView::Programmable(value) if value.uses_bool_const());
     let vs_bool_const_slice = if vs_uses_bool_const {
         snap.vs_bool_const_bytes.unwrap_or(ScratchSlice::EMPTY)
     } else {
@@ -598,25 +616,15 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
     };
     // PS integer / boolean constants (fragment slots 11 / 10), gated by the
     // bound PS the same way.
-    let ps_uses_int_const = matches!(
-        ps,
-        PsSource::Programmable {
-            uses_int_const: true,
-            ..
-        }
-    );
+    let ps_uses_int_const =
+        matches!(ps, PsSourceView::Programmable(value) if value.uses_int_const());
     let ps_int_const_slice = if ps_uses_int_const {
         snap.ps_int_const_bytes.unwrap_or(ScratchSlice::EMPTY)
     } else {
         ScratchSlice::EMPTY
     };
-    let ps_uses_bool_const = matches!(
-        ps,
-        PsSource::Programmable {
-            uses_bool_const: true,
-            ..
-        }
-    );
+    let ps_uses_bool_const =
+        matches!(ps, PsSourceView::Programmable(value) if value.uses_bool_const());
     let ps_bool_const_slice = if ps_uses_bool_const {
         snap.ps_bool_const_bytes.unwrap_or(ScratchSlice::EMPTY)
     } else {
@@ -688,12 +696,12 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
         // files, so a dump line's id can go straight into the skip list
         // without a debug-log run to harvest variant-mixed disk keys.
         let vs_raw = match vs {
-            VsSource::Programmable { vs_id, .. } => vs_id.raw(),
-            VsSource::FixedFunction { .. } => 0,
+            VsSourceView::Programmable(ProgrammableVsSource { vs_id, .. }) => vs_id.raw(),
+            VsSourceView::FixedFunction(_) => 0,
         };
         let ps_raw = match ps {
-            PsSource::Programmable { ps_id, .. } => ps_id.raw(),
-            PsSource::FixedFunction { .. } => 0,
+            PsSourceView::Programmable(ProgrammablePsSource { ps_id, .. }) => ps_id.raw(),
+            PsSourceView::FixedFunction(_) => 0,
         };
         if skip_set.contains(&vs_h)
             || skip_set.contains(&ps_h)
@@ -749,12 +757,12 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
     // step function from the binding (a zero stride is one constant element,
     // the rest step per the stream's `SetStreamSourceFreq`), a constant zero
     // feed where nothing is bound. Part of the pipeline identity.
-    let layouts = stream_layouts(&vertex_source, &attrs);
+    let layouts = stream_layouts_view(vertex_source, &attrs);
     enc.maybe_emit_draw_trace(
         shaders,
         metal_prim,
-        &vertex_source,
-        &index_source,
+        vertex_source,
+        index_source,
         layouts[0].stride,
     );
     drop(t_resolve);
@@ -764,16 +772,16 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
     // Instances of an indexed draw: stream 0's frequency count, but only when
     // a stream this draw reads is per-instance; non-indexed draws never
     // instance (D3D9 ignores the frequency state for them).
-    let instances = match (&vertex_source, &index_source) {
-        (_, IndexSource::None { .. } | IndexSource::Fan { .. }) | (VertexSource::Up { .. }, _) => 1,
-        (VertexSource::Bound { stream0_freq, .. }, _) => {
-            let any_instanced = vertex_source
-                .bindings()
-                .any(|b| attrs.used_streams & (1 << b.stream) != 0 && is_instance_data(b.freq));
+    let instances = match (vertex_source, index_source) {
+        (_, IndexView::None { .. } | IndexView::Fan { .. }) | (VertexView::Up { .. }, _) => 1,
+        (VertexView::Bound { stream0_freq, .. }, _) => {
+            let any_instanced = vertex_source.bindings().any(|b| {
+                attrs.used_streams() & (1 << b.stream) != 0 && is_instance_data(b.frequency)
+            });
             instance_count(*stream0_freq, any_instanced)
         }
     };
-    let vdecl_hash = attrs.vdecl_hash;
+    let vdecl_hash = attrs.vdecl_hash();
     let alpha_ref_bytes = alpha_ref_slice.as_slice();
     let fog_color_bytes = fog_color_slice.as_slice();
     let bump_env_bytes = bump_env_slice.as_slice();
@@ -900,7 +908,8 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
     // every Metal device (a GitHub runner's paravirtual GPU clips
     // regardless), while the clamp in the FF vertex shader behaves
     // identically on all of them.
-    let position_transformed = matches!(vs, VsSource::FixedFunction { key, .. } if key.has_rhw());
+    let position_transformed =
+        matches!(vs, VsSourceView::FixedFunction(FixedVsSource { key, .. }) if key.has_rhw());
     let depth_clamp_z = position_transformed && !(has_depth && render_state.depth_enable());
     drop(t_state);
 
@@ -1076,7 +1085,7 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
     // black texture (of the declared type) plus a default sampler to each such
     // slot. Only the programmable path can declare-without-binding; the FF PS
     // only declares samplers for stages it actually samples a bound texture on.
-    if let PsSource::Programmable { ps_id, .. } = ps {
+    if let PsSourceView::Programmable(ProgrammablePsSource { ps_id, .. }) = ps {
         let decls = enc.ps_declared_samplers(*ps_id);
         let mut unbound = decls.unbound(bound_mask);
         while unbound != 0 {
@@ -1106,11 +1115,11 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
     // `SetSamplerState` on `D3DVERTEXTEXTURESAMPLER0..3` and live on the
     // encoder rather than the per-draw snapshot; a declared slot the game
     // never bound gets the shared black fallback, as on the fragment side.
-    if let VsSource::Programmable {
+    if let VsSourceView::Programmable(ProgrammableVsSource {
         vs_id,
         sampler_kinds,
         ..
-    } = vs
+    }) = vs
     {
         let decls = enc.ps_declared_samplers(*vs_id);
         let mut mask = decls.unbound(0) & 0xF;
@@ -1304,19 +1313,20 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
     //    MTLBuffer lazily — the cache hits after the first draw post-rename
     //    and churns only when the game renames.
     let t_vbib = CycleAddTimer::start(enc.op_sub_detail_ptr(OpSubDetail::BVbib));
-    match &vertex_source {
-        VertexSource::Up { bytes, size, .. } => {
-            let (scratch_ptr, _) = bytes.as_raw();
-            if usize::try_from(*size).is_ok_and(|size| size > SET_BYTES_MAX) {
+    match vertex_source {
+        VertexView::Up { record, .. } => {
+            let scratch_ptr = record.address;
+            let size = record.size;
+            if usize::try_from(size).is_ok_and(|size| size > SET_BYTES_MAX) {
                 enc.bump_up_vertex_oversized();
             }
-            enc.emit_command(Command::set_vertex_bytes(scratch_ptr, *size, 0));
+            enc.emit_command(Command::set_vertex_bytes(scratch_ptr, size, 0));
             // Inline slot-0 bind clobbers the real Metal vertex-buffer
             // binding; drop the cached bound-VB so the next bound draw
             // re-emits its `setVertexBuffer` instead of reading these bytes.
             enc.last_bound().invalidate_vertex_buffer();
         }
-        VertexSource::Bound { .. } => {
+        VertexView::Bound { .. } => {
             for b in vertex_source.bindings() {
                 let slot = u32::from(b.stream);
                 let layout = layouts[b.stream as usize];
@@ -1326,18 +1336,18 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
                     continue;
                 }
                 let (buffer_handle, staged) = enc.ensure_vbib_mtl_buffer(
-                    b.buffer_id,
-                    b.backing_ptr as u64,
-                    b.backing_len as u64,
-                    b.backing_generation,
+                    BufferId::from_raw(b.buffer),
+                    b.address,
+                    b.length,
+                    b.generation,
                 );
                 if buffer_handle == 0 {
                     mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET, "draw dropped: ensure_vbib_mtl_buffer returned 0 for VB");
                     mtld3d_shared::log_once_trace_by!(
                         target: crate::LOG_TARGET,
-                        key: b.buffer_id.raw(),
+                        key: b.buffer,
                         "drop: VB buffer {:#x} (stream {slot}) wrap failed",
-                        b.buffer_id.raw(),
+                        b.buffer,
                     );
                     return;
                 }
@@ -1345,7 +1355,7 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
                     slot,
                     buffer_handle,
                     b.offset,
-                    b.backing_generation,
+                    b.generation,
                 );
                 if bind == VertexBufferBind::ReusedHandle {
                     // The dedup would have kept the wrapper this address used
@@ -1355,8 +1365,8 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
                         target: crate::LOG_TARGET,
                         "vertex buffer handle {buffer_handle:#x} reused within a pass for \
                          buffer {:#x} generation {}: rebinding instead of deduplicating",
-                        b.buffer_id.raw(),
-                        b.backing_generation
+                        b.buffer,
+                        b.generation
                     );
                 }
                 let vb_emitted = bind != VertexBufferBind::Same;
@@ -1379,18 +1389,18 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
                 // reads one element per `step_rate` instances. All may
                 // over-cover but never under-cover; overflow falls back to the
                 // whole tail. `None` = the draw reads nothing → record nothing.
-                let logical_len = u32::try_from(b.backing_len).unwrap_or(u32::MAX);
-                let read_range = match (layout.step, &index_source) {
+                let logical_len = u32::try_from(b.length).unwrap_or(u32::MAX);
+                let read_range = match (layout.step, index_source) {
                     (
                         VertexStepFunction::PerVertex,
-                        IndexSource::None {
+                        IndexView::None {
                             start_vertex,
                             vertex_count,
                         },
                     ) => nonindexed_vb_range(b.offset, layout.stride, *start_vertex, *vertex_count),
                     (
                         VertexStepFunction::PerVertex,
-                        IndexSource::Bound {
+                        IndexView::Bound {
                             base_vertex,
                             index_count,
                             ..
@@ -1405,7 +1415,7 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
                     // vertices from its start, like a non-indexed draw.
                     (
                         VertexStepFunction::PerVertex,
-                        IndexSource::Fan {
+                        IndexView::Fan {
                             start_vertex,
                             primitive_count,
                         },
@@ -1420,21 +1430,19 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
                     // draw's.
                     (
                         VertexStepFunction::PerVertex,
-                        IndexSource::Generated {
-                            min_vertex,
-                            max_vertex,
-                            ..
+                        IndexView::Generated {
+                            min_vertex, record, ..
                         },
                     ) => nonindexed_vb_range(
                         b.offset,
                         layout.stride,
                         *min_vertex,
-                        max_vertex - min_vertex + 1,
+                        record.maximum - min_vertex + 1,
                     ),
-                    // `Up` indices only ever pair with `VertexSource::Up`,
+                    // `Up` indices only ever pair with `VertexView::Up`,
                     // never a bound VB, so this arm is unreachable in
                     // practice; record no read range.
-                    (VertexStepFunction::PerVertex, IndexSource::Up { .. }) => None,
+                    (VertexStepFunction::PerVertex, IndexView::Up { .. }) => None,
                     (VertexStepFunction::PerInstance | VertexStepFunction::Constant, _) => Some((
                         b.offset,
                         instanced_stream_read_bytes(
@@ -1446,12 +1454,7 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
                     )),
                 };
                 if let Some((range_off, range_size)) = read_range {
-                    enc.note_buffer_draw_range(
-                        b.buffer_id.raw(),
-                        range_off,
-                        range_size,
-                        logical_len,
-                    );
+                    enc.note_buffer_draw_range(b.buffer, range_off, range_size, logical_len);
                 }
             }
         }
@@ -1459,11 +1462,11 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
     // Streams the declaration reads with nothing bound: feed zeros inline
     // under the constant layout built above. The inline bind clobbers that
     // slot's real Metal binding, so forget it in the cache too.
-    let mut null_streams = attrs.used_streams;
+    let mut null_streams = attrs.used_streams();
     while null_streams != 0 {
         let stream = null_streams.trailing_zeros();
         null_streams &= null_streams - 1;
-        if !matches!(vertex_source.feed(stream), StreamFeed::Null) {
+        if !matches!(vertex_source.feed(stream), VertexFeed::Null) {
             continue;
         }
         let extent = layouts[stream as usize].stride;
@@ -1491,7 +1494,7 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
     let t_draw = CycleAddTimer::start(enc.op_sub_detail_ptr(OpSubDetail::BDraw));
     // The generated-index fan is the slow path (per-draw rewrite plus an
     // upload-ring copy); the PERF grid counts it as a tripwire.
-    if matches!(index_source, IndexSource::Generated { .. }) {
+    if matches!(index_source, IndexView::Generated { .. }) {
         enc.bump_fan_generated();
     }
     // While the F12 dump runs, the Metal draw sits in a `draw N` debug group
@@ -1499,8 +1502,8 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
     if let Some(index) = dump_draw {
         enc.emit_command(Command::push_debug_group(index));
     }
-    let verts = match index_source {
-        IndexSource::None {
+    let verts = match *index_source {
+        IndexView::None {
             start_vertex,
             vertex_count,
         } => {
@@ -1511,22 +1514,19 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
             ));
             vertex_count
         }
-        IndexSource::Bound {
-            buffer_id,
-            backing_ptr,
-            backing_len,
-            backing_generation,
-            offset,
+        IndexView::Bound {
+            record,
             index_count,
-            index_type,
             base_vertex,
         } => {
-            let (buffer_handle, staged) = enc.ensure_vbib_mtl_buffer(
-                buffer_id,
-                backing_ptr as u64,
-                backing_len as u64,
-                backing_generation,
-            );
+            let buffer_id = BufferId::from_raw(record.buffer);
+            let backing_ptr = record.address;
+            let backing_len = record.length;
+            let backing_generation = record.generation;
+            let offset = record.offset;
+            let index_type = record.index_type().expect("validated index type");
+            let (buffer_handle, staged) =
+                enc.ensure_vbib_mtl_buffer(buffer_id, backing_ptr, backing_len, backing_generation);
             if buffer_handle == 0 {
                 mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET, "draw dropped: ensure_vbib_mtl_buffer returned 0 for IB");
                 mtld3d_shared::log_once_trace_by!(
@@ -1561,7 +1561,7 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
             ));
             index_count
         }
-        IndexSource::Fan {
+        IndexView::Fan {
             start_vertex,
             primitive_count,
         } => {
@@ -1595,16 +1595,16 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
             ));
             index_count
         }
-        IndexSource::Up {
-            bytes,
+        IndexView::Up {
+            record,
             index_count,
-            index_type,
         } => {
+            let index_type = record.index_type().expect("validated index type");
             // The retained API capture stays live through submit replay, which
             // copies indices into the Metal upload ring. No intermediate native
             // CPU allocation is needed.
             enc.bump_up_indexed();
-            let (scratch_ptr, byte_len) = bytes.as_raw();
+            let (scratch_ptr, byte_len) = (record.address, record.length);
             enc.emit_command(Command::draw_indexed_primitives_up(
                 metal_prim,
                 index_count,
@@ -1615,17 +1615,17 @@ pub fn emit_draw(enc: &mut FrameEncoder, draw: DrawOp) {
             ));
             index_count
         }
-        IndexSource::Generated {
-            data,
+        IndexView::Generated {
+            record,
             index_count,
-            index_type,
             ..
         } => {
+            let index_type = record.index_type().expect("validated index type");
             // The list is already in the frame arena the unix side reads at
             // replay time, so it goes to the same inline-index draw form
             // without a second copy. The vertices were bound above: the
-            // caller's buffers, or `VertexSource::Up` bytes.
-            let (index_ptr, byte_len) = data.as_raw();
+            // caller's buffers, or `VertexView::Up` bytes.
+            let (index_ptr, byte_len) = (record.address, record.length);
             enc.emit_command(Command::draw_indexed_primitives_up(
                 metal_prim,
                 index_count,

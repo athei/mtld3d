@@ -1843,7 +1843,7 @@ fn spawn_native_encoder(
         device_caps: device_caps_flags(),
     }
     .with_intel_overrides(cfg.managed_memory, cfg.linear_align256);
-    EncoderThread::spawn(cq.device_handle, gpu_caps, cfg)
+    EncoderThread::spawn(cq.device_handle, cq.record_handle, gpu_caps, cfg)
 }
 
 /// `CAMetalLayer.pixelFormat` and the backbuffer are hardcoded to `BGRA8Unorm` on the unix side.

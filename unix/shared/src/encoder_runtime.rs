@@ -3,7 +3,9 @@
 //! Only the PE device owning the opaque runtime handle may destroy it. Its API lock
 //! excludes concurrent calls while native shutdown drains every queued operation.
 
-use crate::{MetalHandle, Thunk, Thunks, mtl_handle::MTLDeviceKind};
+use crate::{
+    MetalHandle, Thunk, Thunks, mtl_handle::MTLDeviceKind, record_handle::DeviceRecordHandle,
+};
 
 #[cfg(all(test, perf_tracking))]
 mod tests;
@@ -22,6 +24,12 @@ pub struct CreateEncoderParams {
     pub runtime: u64,
     /// PERF source calibration retained through native destruction, or zero.
     pub source_clock_ptr: u64,
+    pub record_handle: DeviceRecordHandle,
+    /// PE-owned aligned `AtomicU64` counters retained through native destruction.
+    pub coherent_seq_ptr: u64,
+    pub upload_coherent_seq_ptr: u64,
+    pub failed_submit_seq_ptr: u64,
+    pub retained_bytes_ptr: u64,
 }
 
 #[repr(C, align(8))]
@@ -38,10 +46,15 @@ impl Thunk for DestroyEncoderParams {
 }
 
 const _: () = {
-    assert!(size_of::<CreateEncoderParams>() == 48);
+    assert!(size_of::<CreateEncoderParams>() == 88);
     assert!(align_of::<CreateEncoderParams>() == 8);
     assert!(core::mem::offset_of!(CreateEncoderParams, runtime) == 32);
     assert!(core::mem::offset_of!(CreateEncoderParams, source_clock_ptr) == 40);
+    assert!(core::mem::offset_of!(CreateEncoderParams, record_handle) == 48);
+    assert!(core::mem::offset_of!(CreateEncoderParams, coherent_seq_ptr) == 56);
+    assert!(core::mem::offset_of!(CreateEncoderParams, upload_coherent_seq_ptr) == 64);
+    assert!(core::mem::offset_of!(CreateEncoderParams, failed_submit_seq_ptr) == 72);
+    assert!(core::mem::offset_of!(CreateEncoderParams, retained_bytes_ptr) == 80);
     assert!(size_of::<DestroyEncoderParams>() == 8);
 };
 

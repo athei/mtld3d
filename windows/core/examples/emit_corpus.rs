@@ -849,6 +849,7 @@ fn vs_key(shape: &VsShape) -> FfVsKey {
         tex
     };
     let mut key = FfVsKey {
+        reserved: 0,
         flags,
         input_tex_coord_count: sets,
         tex_coord_count: tex,

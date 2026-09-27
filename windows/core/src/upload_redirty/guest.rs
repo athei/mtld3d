@@ -171,10 +171,18 @@ impl GuestRedirtyLease {
 }
 
 /// Two fixed-width addresses, never a PE queue or Arc representation.
+#[repr(C, align(8))]
 pub struct GuestRedirtyDescriptor {
     feedback: u64,
     completion: u64,
 }
+
+const _: () = {
+    assert!(size_of::<GuestRedirtyDescriptor>() == 16);
+    assert!(align_of::<GuestRedirtyDescriptor>() == 8);
+    assert!(core::mem::offset_of!(GuestRedirtyDescriptor, feedback) == 0);
+    assert!(core::mem::offset_of!(GuestRedirtyDescriptor, completion) == 8);
+};
 
 impl GuestRedirtyDescriptor {
     #[must_use]
@@ -193,10 +201,15 @@ impl GuestRedirtyDescriptor {
     /// # Errors
     ///
     /// Rejects invalid numeric address ranges before dereferencing either cell.
-    pub unsafe fn adopt(self) -> Result<Arc<RedirtyQueue>, WireError> {
+    pub unsafe fn adopt(&self) -> Result<Arc<RedirtyQueue>, WireError> {
         self.validate()?;
         let mut queue = RedirtyQueue::new();
-        queue.native_feedback = Some(NativeFeedback { descriptor: self });
+        queue.native_feedback = Some(NativeFeedback {
+            descriptor: Self {
+                feedback: self.feedback,
+                completion: self.completion,
+            },
+        });
         Ok(Arc::new(queue))
     }
 

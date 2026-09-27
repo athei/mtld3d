@@ -21,12 +21,14 @@ pub use crate::{depth_stencil_state::DepthStencilKey, sampler_state::SamplerKey}
 /// Stable across destroy/recreate of shader COM objects carrying
 /// identical bytecode.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[repr(transparent)]
 pub struct ProgramId(u64);
 
 /// Process-unique id for an `IDirect3DTexture9`.
 ///
 /// Keys the encoder's `texture_cache` and survives across draws.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[repr(transparent)]
 pub struct TextureId(u64);
 
 /// Process-unique id for an `IDirect3DVertexBuffer9` / `IDirect3DIndexBuffer9`.
@@ -79,6 +81,12 @@ impl ProgramId {
 }
 
 impl TextureId {
+    /// Recover a logical texture identity, without acquiring resource ownership.
+    #[must_use]
+    pub const fn from_raw(value: u64) -> Self {
+        Self(value)
+    }
+
     /// Mint the next process-wide unique texture id.
     pub fn new_unique() -> Self {
         Self(NEXT_TEXTURE_ID.fetch_add(1, Ordering::Relaxed))
@@ -95,6 +103,14 @@ impl TextureId {
 }
 
 impl BufferId {
+    /// Recover a logical buffer key from the paired encoder record.
+    ///
+    /// This value is an identity, not a memory address or ownership token.
+    #[must_use]
+    pub const fn from_raw(value: u64) -> Self {
+        Self(value)
+    }
+
     /// Mint the next process-wide unique buffer id.
     pub fn new_unique() -> Self {
         Self(NEXT_BUFFER_ID.fetch_add(1, Ordering::Relaxed))

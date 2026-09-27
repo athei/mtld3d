@@ -1227,6 +1227,7 @@ impl FfState {
         );
 
         FfVsKey {
+            reserved: 0,
             flags,
             input_tex_coord_count: layout.tex_coord_count,
             tex_coord_count,
@@ -1364,6 +1365,7 @@ impl FfState {
             render_states[D3DRS_POINTSPRITEENABLE as usize] != 0,
         );
         VariantKey {
+            reserved: 0,
             alpha_func: if alpha_test_on {
                 crate::render_state::enum_value(render_states, D3DRS_ALPHAFUNC)
             } else {
@@ -1492,14 +1494,25 @@ impl FfState {
     ///
     /// `viewport` is `(x, y, width, height)` in pixels.
     pub fn build_xyzrhw_row(viewport: (f32, f32, f32, f32), scratch: &mut ScratchArena) -> *mut u8 {
-        let dst_ptr = scratch.alloc_uninit_slice::<core::mem::MaybeUninit<[f32; 4]>>(1);
-        // SAFETY: `alloc_uninit_slice` reserved one 16-byte-aligned
-        // `MaybeUninit<[f32; 4]>` slot; treating it as a `&mut` slice of
-        // `MaybeUninit` lets the per-slot writes below be safe.
-        let dst: &mut [core::mem::MaybeUninit<[f32; 4]>] =
-            unsafe { core::slice::from_raw_parts_mut(dst_ptr, 1) };
-        dst[0].write([viewport.2, viewport.3, viewport.0, viewport.1]);
+        let rows: u16 = 1;
+        let dst_ptr =
+            scratch.alloc_uninit_slice::<core::mem::MaybeUninit<[f32; 4]>>(usize::from(rows));
+        // SAFETY: the arena exclusively reserved this many aligned rows.
+        let dst = unsafe { core::slice::from_raw_parts_mut(dst_ptr, usize::from(rows)) };
+        Self::fill_xyzrhw_row(viewport, dst);
         dst_ptr.cast::<u8>()
+    }
+
+    /// Fill the supplied final constant-row destination without allocating.
+    ///
+    /// # Panics
+    /// Panics when the destination length does not match this section's row count.
+    pub fn fill_xyzrhw_row(
+        viewport: (f32, f32, f32, f32),
+        dst: &mut [core::mem::MaybeUninit<[f32; 4]>],
+    ) {
+        assert_eq!(dst.len(), 1);
+        dst[0].write([viewport.2, viewport.3, viewport.0, viewport.1]);
     }
 
     /// Bump-copy the row 0..4 WV section into the scratch arena.
@@ -1507,27 +1520,46 @@ impl FfState {
     /// The section holds `transpose(world_palette[0] × view)`. Returns
     /// `(start_row=0, rows=4, ptr)`.
     pub fn build_wv_section(&self, scratch: &mut ScratchArena) -> (u16, u16, *mut u8) {
-        let wv_t = Self::transpose(&Self::mat_mul(&self.world_palette[0], &self.view));
-        let dst_ptr = scratch.alloc_uninit_slice::<core::mem::MaybeUninit<[f32; 4]>>(4);
-        // SAFETY: see `build_xyzrhw_row`. Single boundary unsafe op;
-        // subsequent slice writes are safe.
-        let dst: &mut [core::mem::MaybeUninit<[f32; 4]>] =
-            unsafe { core::slice::from_raw_parts_mut(dst_ptr, 4) };
-        write_matrix_rows(dst, &wv_t);
+        let rows: u16 = 4;
+        let dst_ptr =
+            scratch.alloc_uninit_slice::<core::mem::MaybeUninit<[f32; 4]>>(usize::from(rows));
+        // SAFETY: the arena exclusively reserved this many aligned rows.
+        let dst = unsafe { core::slice::from_raw_parts_mut(dst_ptr, usize::from(rows)) };
+        self.fill_wv_section(dst);
         (0, 4, dst_ptr.cast::<u8>())
+    }
+
+    /// Fill the supplied final constant-row destination without allocating.
+    ///
+    /// # Panics
+    /// Panics when the destination length does not match this section's row count.
+    pub fn fill_wv_section(&self, dst: &mut [core::mem::MaybeUninit<[f32; 4]>]) {
+        let wv_t = Self::transpose(&Self::mat_mul(&self.world_palette[0], &self.view));
+        assert_eq!(dst.len(), 4);
+        write_matrix_rows(dst, &wv_t);
     }
 
     /// Bump-copy the row 4..8 PROJ section (`transpose(projection)`) into the scratch arena.
     ///
     /// Returns `(start_row=4, rows=4, ptr)`.
     pub fn build_proj_section(&self, scratch: &mut ScratchArena) -> (u16, u16, *mut u8) {
-        let proj_t = Self::transpose(&self.projection);
-        let dst_ptr = scratch.alloc_uninit_slice::<core::mem::MaybeUninit<[f32; 4]>>(4);
-        // SAFETY: see `build_xyzrhw_row`.
-        let dst: &mut [core::mem::MaybeUninit<[f32; 4]>] =
-            unsafe { core::slice::from_raw_parts_mut(dst_ptr, 4) };
-        write_matrix_rows(dst, &proj_t);
+        let rows: u16 = 4;
+        let dst_ptr =
+            scratch.alloc_uninit_slice::<core::mem::MaybeUninit<[f32; 4]>>(usize::from(rows));
+        // SAFETY: the arena exclusively reserved this many aligned rows.
+        let dst = unsafe { core::slice::from_raw_parts_mut(dst_ptr, usize::from(rows)) };
+        self.fill_proj_section(dst);
         (4, 4, dst_ptr.cast::<u8>())
+    }
+
+    /// Fill the supplied final constant-row destination without allocating.
+    ///
+    /// # Panics
+    /// Panics when the destination length does not match this section's row count.
+    pub fn fill_proj_section(&self, dst: &mut [core::mem::MaybeUninit<[f32; 4]>]) {
+        let proj_t = Self::transpose(&self.projection);
+        assert_eq!(dst.len(), 4);
+        write_matrix_rows(dst, &proj_t);
     }
 
     /// Bump-copy the row 8 FOG section into the scratch arena.
@@ -1540,6 +1572,24 @@ impl FfState {
         fog_mode: u8,
         scratch: &mut ScratchArena,
     ) -> (u16, u16, *mut u8) {
+        let rows: u16 = 1;
+        let dst_ptr =
+            scratch.alloc_uninit_slice::<core::mem::MaybeUninit<[f32; 4]>>(usize::from(rows));
+        // SAFETY: the arena exclusively reserved this many aligned rows.
+        let dst = unsafe { core::slice::from_raw_parts_mut(dst_ptr, usize::from(rows)) };
+        Self::fill_fog_section(render_states, fog_mode, dst);
+        (8, 1, dst_ptr.cast::<u8>())
+    }
+
+    /// Fill the supplied final constant-row destination without allocating.
+    ///
+    /// # Panics
+    /// Panics when the destination length does not match this section's row count.
+    pub fn fill_fog_section(
+        render_states: &[u32; RENDER_STATE_COUNT],
+        fog_mode: u8,
+        dst: &mut [core::mem::MaybeUninit<[f32; 4]>],
+    ) {
         let row = if fog_mode != 0 {
             [
                 f32::from_bits(render_states[D3DRS_FOGSTART as usize]),
@@ -1550,12 +1600,8 @@ impl FfState {
         } else {
             [0.0; 4]
         };
-        let dst_ptr = scratch.alloc_uninit_slice::<core::mem::MaybeUninit<[f32; 4]>>(1);
-        // SAFETY: see `build_xyzrhw_row`.
-        let dst: &mut [core::mem::MaybeUninit<[f32; 4]>] =
-            unsafe { core::slice::from_raw_parts_mut(dst_ptr, 1) };
+        assert_eq!(dst.len(), 1);
         dst[0].write(row);
-        (8, 1, dst_ptr.cast::<u8>())
     }
 
     /// Bump-copy the row 9 AMBIENT section (global ambient color from `D3DRS_AMBIENT`).
@@ -1565,13 +1611,26 @@ impl FfState {
         render_states: &[u32; RENDER_STATE_COUNT],
         scratch: &mut ScratchArena,
     ) -> (u16, u16, *mut u8) {
-        let row = d3dcolor_to_rgba(render_states[D3DRS_AMBIENT as usize]);
-        let dst_ptr = scratch.alloc_uninit_slice::<core::mem::MaybeUninit<[f32; 4]>>(1);
-        // SAFETY: see `build_xyzrhw_row`.
-        let dst: &mut [core::mem::MaybeUninit<[f32; 4]>] =
-            unsafe { core::slice::from_raw_parts_mut(dst_ptr, 1) };
-        dst[0].write(row);
+        let rows: u16 = 1;
+        let dst_ptr =
+            scratch.alloc_uninit_slice::<core::mem::MaybeUninit<[f32; 4]>>(usize::from(rows));
+        // SAFETY: the arena exclusively reserved this many aligned rows.
+        let dst = unsafe { core::slice::from_raw_parts_mut(dst_ptr, usize::from(rows)) };
+        Self::fill_ambient_section(render_states, dst);
         (9, 1, dst_ptr.cast::<u8>())
+    }
+
+    /// Fill the supplied final constant-row destination without allocating.
+    ///
+    /// # Panics
+    /// Panics when the destination length does not match this section's row count.
+    pub fn fill_ambient_section(
+        render_states: &[u32; RENDER_STATE_COUNT],
+        dst: &mut [core::mem::MaybeUninit<[f32; 4]>],
+    ) {
+        let row = d3dcolor_to_rgba(render_states[D3DRS_AMBIENT as usize]);
+        assert_eq!(dst.len(), 1);
+        dst[0].write(row);
     }
 
     /// Bump-copy the row 10..14 MATERIAL section.
@@ -1589,6 +1648,24 @@ impl FfState {
         vs_key: &FfVsKey,
         scratch: &mut ScratchArena,
     ) -> (u16, u16, *mut u8) {
+        let rows: u16 = Self::material_section_rows(vs_key);
+        let dst_ptr =
+            scratch.alloc_uninit_slice::<core::mem::MaybeUninit<[f32; 4]>>(usize::from(rows));
+        // SAFETY: the arena exclusively reserved this many aligned rows.
+        let dst = unsafe { core::slice::from_raw_parts_mut(dst_ptr, usize::from(rows)) };
+        self.fill_material_section(vs_key, dst);
+        (10, rows, dst_ptr.cast::<u8>())
+    }
+
+    /// Fill the supplied final constant-row destination without allocating.
+    ///
+    /// # Panics
+    /// Panics when the destination length does not match this section's row count.
+    pub fn fill_material_section(
+        &self,
+        vs_key: &FfVsKey,
+        dst: &mut [core::mem::MaybeUninit<[f32; 4]>],
+    ) {
         let rows: u16 = if !vs_key.lighting_enabled() {
             1
         } else if vs_key.specular_enable() {
@@ -1597,11 +1674,7 @@ impl FfState {
             4
         };
         let rows_usize = rows as usize;
-        let dst_ptr = scratch.alloc_uninit_slice::<core::mem::MaybeUninit<[f32; 4]>>(rows_usize);
-        // SAFETY: see `build_xyzrhw_row`. Slice length matches the
-        // `rows_usize` reservation.
-        let dst: &mut [core::mem::MaybeUninit<[f32; 4]>] =
-            unsafe { core::slice::from_raw_parts_mut(dst_ptr, rows_usize) };
+        assert_eq!(dst.len(), rows_usize);
         dst[0].write(colorvalue_to_rgba(&self.material.diffuse));
         if rows_usize > 1 {
             dst[1].write(colorvalue_to_rgba(&self.material.ambient));
@@ -1611,7 +1684,6 @@ impl FfState {
         if rows_usize > 4 {
             dst[4].write([self.material.power, 0.0, 0.0, 0.0]);
         }
-        (10, rows, dst_ptr.cast::<u8>())
     }
 
     /// Bump-copy the row 15..62 LIGHTS section, one 6-row block per compacted active light.
@@ -1632,9 +1704,30 @@ impl FfState {
         vs_key: &FfVsKey,
         scratch: &mut ScratchArena,
     ) -> Option<(u16, u16, *mut u8)> {
+        let rows: u16 = Self::lights_section_rows(vs_key);
+        if rows == 0 {
+            return None;
+        }
+        let dst_ptr =
+            scratch.alloc_uninit_slice::<core::mem::MaybeUninit<[f32; 4]>>(usize::from(rows));
+        // SAFETY: the arena exclusively reserved this many aligned rows.
+        let dst = unsafe { core::slice::from_raw_parts_mut(dst_ptr, usize::from(rows)) };
+        self.fill_lights_section(vs_key, dst);
+        Some((15, rows, dst_ptr.cast::<u8>()))
+    }
+
+    /// Fill the supplied final constant-row destination without allocating.
+    ///
+    /// # Panics
+    /// Panics when the destination length does not match this section's row count.
+    pub fn fill_lights_section(
+        &self,
+        vs_key: &FfVsKey,
+        dst: &mut [core::mem::MaybeUninit<[f32; 4]>],
+    ) {
         let active = vs_key.light_active_mask;
         if active == 0 {
-            return None;
+            return;
         }
         // The compacted active-light list IS the shader-slot order; its length
         // must agree with `vs_key.light_active_mask` (both derive from
@@ -1650,11 +1743,7 @@ impl FfState {
             "LIGHTS slot count must match the compacted active-light list"
         );
         let rows_usize = slots * 6;
-        let rows = u16::try_from(rows_usize).expect("LIGHTS rows ≤ 48 fits u16");
-        let dst_ptr = scratch.alloc_uninit_slice::<core::mem::MaybeUninit<[f32; 4]>>(rows_usize);
-        // SAFETY: see `build_xyzrhw_row`.
-        let dst: &mut [core::mem::MaybeUninit<[f32; 4]>] =
-            unsafe { core::slice::from_raw_parts_mut(dst_ptr, rows_usize) };
+        assert_eq!(dst.len(), rows_usize);
         for (i, active_light) in compacted.as_slice().iter().enumerate() {
             let base = i * 6;
             let light = &active_light.light;
@@ -1729,7 +1818,6 @@ impl FfState {
             let spec = colorvalue_to_rgba(&light.specular);
             dst[base + 5].write([spec[0], spec[1], spec[2], spot_scale]);
         }
-        Some((15, rows, dst_ptr.cast::<u8>()))
     }
 
     /// Bump-copy the row 63..94 TT section (per-stage texture transform).
@@ -1745,24 +1833,36 @@ impl FfState {
     /// Panics if `tt_active_mask.leading_zeros()` exceeds `u8::MAX` —
     /// unreachable (the mask is a `u8` so the count is ≤ 8).
     pub fn build_tt_section(&self, scratch: &mut ScratchArena) -> Option<(u16, u16, *mut u8)> {
+        let rows: u16 = self.tt_section_rows();
+        if rows == 0 {
+            return None;
+        }
+        let dst_ptr =
+            scratch.alloc_uninit_slice::<core::mem::MaybeUninit<[f32; 4]>>(usize::from(rows));
+        // SAFETY: the arena exclusively reserved this many aligned rows.
+        let dst = unsafe { core::slice::from_raw_parts_mut(dst_ptr, usize::from(rows)) };
+        self.fill_tt_section(dst);
+        Some((63, rows, dst_ptr.cast::<u8>()))
+    }
+
+    /// Fill the supplied final constant-row destination without allocating.
+    ///
+    /// # Panics
+    /// Panics when the destination length does not match this section's row count.
+    pub fn fill_tt_section(&self, dst: &mut [core::mem::MaybeUninit<[f32; 4]>]) {
         let mask = self.tt_active_mask;
         if mask == 0 {
-            return None;
+            return;
         }
         let lz = u8::try_from(mask.leading_zeros()).expect("u8::leading_zeros ≤ 8 fits u8");
         let hi = 7usize - lz as usize;
         let stages = hi + 1;
         let rows_usize = stages * 4;
-        let rows = u16::try_from(rows_usize).expect("TT rows ≤ 32 fits u16");
-        let dst_ptr = scratch.alloc_uninit_slice::<core::mem::MaybeUninit<[f32; 4]>>(rows_usize);
-        // SAFETY: see `build_xyzrhw_row`.
-        let dst: &mut [core::mem::MaybeUninit<[f32; 4]>] =
-            unsafe { core::slice::from_raw_parts_mut(dst_ptr, rows_usize) };
+        assert_eq!(dst.len(), rows_usize);
         for (s, chunk) in dst.as_chunks_mut::<4>().0.iter_mut().enumerate() {
             let m_t = Self::transpose(&self.texture_transforms[s]);
             write_matrix_rows(chunk, &m_t);
         }
-        Some((63, rows, dst_ptr.cast::<u8>()))
     }
 
     /// Bump-copy the row 95+ PALETTE section (world-matrix palette × view).
@@ -1780,22 +1880,85 @@ impl FfState {
         vs_key: &FfVsKey,
         scratch: &mut ScratchArena,
     ) -> Option<(u16, u16, *mut u8)> {
-        if vs_key.vertex_blend_count == 0 {
+        let rows: u16 = self.palette_section_rows(vs_key);
+        if rows == 0 {
             return None;
+        }
+        let dst_ptr =
+            scratch.alloc_uninit_slice::<core::mem::MaybeUninit<[f32; 4]>>(usize::from(rows));
+        // SAFETY: the arena exclusively reserved this many aligned rows.
+        let dst = unsafe { core::slice::from_raw_parts_mut(dst_ptr, usize::from(rows)) };
+        self.fill_palette_section(vs_key, dst);
+        Some((FF_VS_PALETTE_BASE_ROW, rows, dst_ptr.cast::<u8>()))
+    }
+
+    /// Fill the supplied final constant-row destination without allocating.
+    ///
+    /// # Panics
+    /// Panics when the destination length does not match this section's row count.
+    pub fn fill_palette_section(
+        &self,
+        vs_key: &FfVsKey,
+        dst: &mut [core::mem::MaybeUninit<[f32; 4]>],
+    ) {
+        if vs_key.vertex_blend_count == 0 {
+            return;
         }
         let used = self.world_palette_uploaded();
         let rows_usize = used * 4;
-        let rows = u16::try_from(rows_usize).expect("PALETTE rows ≤ 40*4 fits u16");
-        let dst_ptr = scratch.alloc_uninit_slice::<core::mem::MaybeUninit<[f32; 4]>>(rows_usize);
-        // SAFETY: see `build_xyzrhw_row`.
-        let dst: &mut [core::mem::MaybeUninit<[f32; 4]>] =
-            unsafe { core::slice::from_raw_parts_mut(dst_ptr, rows_usize) };
+        assert_eq!(dst.len(), rows_usize);
         for (bone, chunk) in dst.as_chunks_mut::<4>().0.iter_mut().enumerate() {
             let bone_view_t =
                 Self::transpose(&Self::mat_mul(&self.world_palette[bone], &self.view));
             write_matrix_rows(chunk, &bone_view_t);
         }
-        Some((FF_VS_PALETTE_BASE_ROW, rows, dst_ptr.cast::<u8>()))
+    }
+
+    /// Number of rows in the material section for this shader key.
+    #[must_use]
+    pub const fn material_section_rows(vs_key: &FfVsKey) -> u16 {
+        if !vs_key.lighting_enabled() {
+            1
+        } else if vs_key.specular_enable() {
+            5
+        } else {
+            4
+        }
+    }
+
+    /// Number of rows in the active-light prefix, without building light data.
+    ///
+    /// # Panics
+    /// Panics if the internally bounded section exceeds its row budget.
+    #[must_use]
+    pub fn lights_section_rows(vs_key: &FfVsKey) -> u16 {
+        u16::try_from(8 - vs_key.light_active_mask.leading_zeros())
+            .expect("light mask has at most eight bits")
+            * 6
+    }
+
+    /// Number of rows in the active texture-transform prefix.
+    ///
+    /// # Panics
+    /// Panics if the internally bounded section exceeds its row budget.
+    #[must_use]
+    pub fn tt_section_rows(&self) -> u16 {
+        u16::try_from(8 - self.tt_active_mask.leading_zeros())
+            .expect("texture mask has at most eight bits")
+            * 4
+    }
+
+    /// Number of rows in the uploaded palette used by this shader key.
+    ///
+    /// # Panics
+    /// Panics if the internally bounded section exceeds its row budget.
+    #[must_use]
+    pub fn palette_section_rows(&self, vs_key: &FfVsKey) -> u16 {
+        if vs_key.vertex_blend_count == 0 {
+            0
+        } else {
+            u16::try_from(self.world_palette_uploaded() * 4).expect("palette has at most 160 rows")
+        }
     }
 
     /// Pack a used stage-constant prefix directly into immutable frame scratch.

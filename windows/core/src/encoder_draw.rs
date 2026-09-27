@@ -1,28 +1,119 @@
 //! Dirty draw state captured directly into the frame wire buffer.
 //!
-//! Structural values decode into native scratch. Immutable uniform bytes retain
-//! their PE backing through submit replay; their addresses never transfer ownership.
+//! Canonical state and shader-source leaves borrow the retained command arena.
+//! Immutable aggregate roots use native scratch; both owners remain live
+//! through submit replay. Borrowed addresses never transfer allocation ownership.
 
 use std::ptr::NonNull;
 
-use mtld3d_shared::{
-    VertexAttrDesc,
-    encoder_wire::{WireError, WireReader, WireWriter},
-};
+use mtld3d_shared::{VertexAttrDesc, encoder_wire::WireError};
 
 use crate::{
     draw_data::{
-        AttrSnapshot, CurrentSnapshot, CurrentSnapshotPtr, DepthStencilFlags, DrawOp, IndexSource,
-        PsSource, PsSourcePtr, RenderStatePtr, RenderStateSnapshot, ScratchSlice, StageBinding,
-        StageBindingsPtr, StreamBinding, VertexSource, VsSource, VsSourcePtr,
+        AttrSnapshot, CurrentSnapshot, CurrentSnapshotPtr, DeclarationHeader, DepthStencilFlags,
+        DrawOp, PsSource, PsSourceView, RenderStatePtr, RenderStateSnapshot, ScratchSlice,
+        StageBinding, StageBindingsPtr, VsSource, VsSourceView,
     },
     dxso::VariantKey,
-    encoder_value::WireValue,
     scratch::ScratchArena,
 };
 
+mod shader_record;
+
 #[cfg(test)]
 mod tests;
+
+/// Cursor over already initialized canonical snapshot records.
+struct SnapshotReader<'a> {
+    remaining: &'a [u8],
+}
+impl<'a> SnapshotReader<'a> {
+    fn bytes(&mut self, count: u32) -> Result<&'a [u8], WireError> {
+        let (value, tail) = self
+            .remaining
+            .split_at_checked(count as usize)
+            .ok_or(WireError::Truncated)?;
+        self.remaining = tail;
+        Ok(value)
+    }
+}
+
+/// Exclusive reservation cursor; it has no scalar encoding operations.
+struct SnapshotWriter<'a> {
+    destination: &'a mut [u8],
+    used: usize,
+}
+impl SnapshotWriter<'_> {
+    fn reserve_bytes(&mut self, count: usize) -> Result<&mut [u8], WireError> {
+        let end = self.used.checked_add(count).ok_or(WireError::TooLarge)?;
+        let value = self
+            .destination
+            .get_mut(self.used..end)
+            .ok_or(WireError::TooLarge)?;
+        self.used = end;
+        Ok(value)
+    }
+    fn bytes(&mut self, value: &[u8]) -> Result<(), WireError> {
+        self.reserve_bytes(value.len())?.copy_from_slice(value);
+        Ok(())
+    }
+}
+
+#[repr(C, align(8))]
+struct SnapshotHeader {
+    changed: u32,
+    reserved: u32,
+}
+#[repr(C, align(8))]
+struct StageHeader {
+    mask: u16,
+    count: u16,
+    reserved: u32,
+}
+#[repr(C, align(8))]
+struct VariantRecord {
+    key: VariantKey,
+    reserved: [u8; 2],
+}
+#[repr(C, align(8))]
+struct ByteBindingRecord {
+    address: u64,
+    length: u32,
+    present: u32,
+}
+#[repr(C, align(8))]
+struct DepthFlagsRecord {
+    flags: u32,
+    reserved: u32,
+}
+
+// SAFETY: all fields are padding-free initialized integer or transparent bitflag records.
+unsafe impl crate::encoder_records::CommandRecord for SnapshotHeader {}
+// SAFETY: every field is an initialized integer and all eight bytes are occupied.
+unsafe impl crate::encoder_records::CommandRecord for StageHeader {}
+// SAFETY: canonical VariantKey has no invalid bit patterns or implicit padding.
+unsafe impl crate::encoder_records::CommandRecord for VariantRecord {}
+// SAFETY: every byte belongs to an integer field with every bit pattern valid.
+unsafe impl crate::encoder_records::CommandRecord for ByteBindingRecord {}
+// SAFETY: every byte belongs to an integer field with every bit pattern valid.
+unsafe impl crate::encoder_records::CommandRecord for DepthFlagsRecord {}
+
+fn capture_record<T: crate::encoder_records::CommandRecord>(
+    writer: &mut SnapshotWriter<'_>,
+    value: T,
+) -> Result<(), WireError> {
+    align_snapshot_leaf(writer)?;
+    crate::encoder_records::write(writer.reserve_bytes(size_of::<T>())?, value)
+}
+fn borrow_record<'a, T: crate::encoder_records::CommandRecord>(
+    reader: &mut SnapshotReader<'a>,
+) -> Result<&'a T, WireError> {
+    crate::encoder_records::borrow(read_aligned_bytes(
+        reader,
+        u32::try_from(size_of::<T>()).map_err(|_| WireError::TooLarge)?,
+        8,
+    )?)
+}
 
 /// Reserved upper bound for a delta with every structural field and byte binding.
 ///
@@ -66,8 +157,8 @@ pub struct SnapshotDelta<'a> {
     pub render_state: Option<&'a RenderStateSnapshot>,
     pub stages: Option<(u16, &'a [StageBinding])>,
     pub attrs: Option<SnapshotAttributes<'a>>,
-    pub vs: Option<&'a VsSource>,
-    pub ps: Option<&'a PsSource>,
+    pub vs: Option<VsSourceView<'a>>,
+    pub ps: Option<PsSourceView<'a>>,
     pub variant: Option<VariantKey>,
     pub bytes: [Option<Option<ScratchSlice>>; 10],
     pub depth_stencil: Option<DepthStencilFlags>,
@@ -89,36 +180,23 @@ impl DrawWriter {
         self.poisoned = false;
     }
 
-    /// Encode varying draw inputs.
-    ///
-    /// # Errors
-    /// Returns malformed-field, size, allocation, or previous capture errors.
-    pub fn encode_draw(
-        &mut self,
-        draw: &DrawOp,
-        writer: &mut WireWriter<'_>,
-    ) -> Result<(), WireError> {
-        if self.poisoned {
-            return Err(WireError::InvalidValue);
-        }
-        let result = write_draw(draw, writer);
-        self.poisoned = result.is_err();
-        result
-    }
-
     /// Capture only changed state, directly from its API builder output.
     ///
     /// # Errors
     /// Returns malformed-field, size, allocation, or previous capture errors.
-    pub fn encode_snapshot_delta(
+    pub fn capture_snapshot(
         &mut self,
         delta: &SnapshotDelta<'_>,
-        writer: &mut WireWriter<'_>,
-    ) -> Result<(), WireError> {
+        destination: &mut [u8],
+    ) -> Result<usize, WireError> {
         if self.poisoned {
             return Err(WireError::InvalidValue);
         }
-        let result = write_snapshot_delta(delta, writer);
+        let mut writer = SnapshotWriter {
+            destination,
+            used: 0,
+        };
+        let result = write_snapshot_delta(delta, &mut writer).map(|()| writer.used);
         self.poisoned = result.is_err();
         result
     }
@@ -126,7 +204,7 @@ impl DrawWriter {
 
 fn write_snapshot_delta(
     delta: &SnapshotDelta<'_>,
-    writer: &mut WireWriter<'_>,
+    writer: &mut SnapshotWriter<'_>,
 ) -> Result<(), WireError> {
     let mut mask = u32::from(delta.render_state.is_some())
         | (u32::from(delta.stages.is_some()) << 1)
@@ -138,48 +216,200 @@ fn write_snapshot_delta(
     for (index, value) in delta.bytes.iter().enumerate() {
         mask |= u32::from(value.is_some()) << (index + 6);
     }
-    writer.u32(mask)?;
+    capture_record(
+        writer,
+        SnapshotHeader {
+            changed: mask,
+            reserved: 0,
+        },
+    )?;
     if let Some(value) = delta.render_state {
-        value.write_wire(writer)?;
+        if value.reserved != 0 {
+            return Err(WireError::InvalidValue);
+        }
+        align_snapshot_leaf(writer)?;
+        // SAFETY: the canonical C layout is pinned below with no implicit padding.
+        // All fields, including its explicit reserved byte, are initialized scalars.
+        let bytes =
+            unsafe { core::slice::from_raw_parts(core::ptr::from_ref(value).cast::<u8>(), 60) };
+        writer.bytes(bytes)?;
     }
     if let Some((mask, values)) = delta.stages {
         if mask.count_ones() as usize != values.len() {
             return Err(WireError::InvalidValue);
         }
-        writer.u16(mask)?;
-        for value in values {
-            value.write_wire(writer)?;
-        }
+        capture_record(
+            writer,
+            StageHeader {
+                mask,
+                count: u16::try_from(values.len()).map_err(|_| WireError::TooLarge)?,
+                reserved: 0,
+            },
+        )?;
+        // SAFETY: StageBinding has a pinned, padding-free canonical layout. The
+        // borrowed slice contains initialized IDs and scalar sampler fields only.
+        let bytes = unsafe {
+            core::slice::from_raw_parts(
+                values.as_ptr().cast::<u8>(),
+                core::mem::size_of_val(values),
+            )
+        };
+        writer.bytes(bytes)?;
     }
     if let Some(value) = &delta.attrs {
         if value.attrs.len() > 16 {
             return Err(WireError::InvalidValue);
         }
-        writer.u32(u32::try_from(value.attrs.len()).map_err(|_| WireError::TooLarge)?)?;
-        for attr in value.attrs {
-            attr.write_wire(writer)?;
-        }
-        value.extents.write_wire(writer)?;
-        value.used_streams.write_wire(writer)?;
-        value.vdecl_hash.write_wire(writer)?;
+        capture_record(
+            writer,
+            DeclarationHeader {
+                vdecl_hash: value.vdecl_hash,
+                extents: *value.extents,
+                count: u32::try_from(value.attrs.len()).map_err(|_| WireError::TooLarge)?,
+                used_streams: value.used_streams,
+                reserved: 0,
+            },
+        )?;
+        // SAFETY: VertexAttrDesc has four initialized 32-bit fields and no padding.
+        // Its enum field is already valid because capture accepts typed descriptors.
+        let bytes = unsafe {
+            core::slice::from_raw_parts(
+                value.attrs.as_ptr().cast::<u8>(),
+                core::mem::size_of_val(value.attrs),
+            )
+        };
+        writer.bytes(bytes)?;
     }
     if let Some(value) = delta.vs {
-        value.write_wire(writer)?;
+        shader_record::write_vs(value, writer)?;
     }
     if let Some(value) = delta.ps {
-        value.write_wire(writer)?;
+        shader_record::write_ps(value, writer)?;
     }
     if let Some(value) = delta.variant {
-        value.write_wire(writer)?;
+        capture_record(
+            writer,
+            VariantRecord {
+                key: value,
+                reserved: [0; 2],
+            },
+        )?;
     }
     for value in delta.bytes.iter().flatten() {
         write_optional_bytes(*value, writer)?;
     }
     if let Some(value) = delta.depth_stencil {
-        value.write_wire(writer)?;
+        capture_record(
+            writer,
+            DepthFlagsRecord {
+                flags: u32::from(value.bits()),
+                reserved: 0,
+            },
+        )?;
     }
     Ok(())
 }
+
+/// Keep canonical leaves aligned inside the reserved command payload.
+fn align_snapshot_leaf(writer: &mut SnapshotWriter<'_>) -> Result<(), WireError> {
+    let address = writer.reserve_bytes(0)?.as_ptr() as usize;
+    let padding = address.wrapping_neg() & 7;
+    writer.reserve_bytes(padding)?.fill(0);
+    Ok(())
+}
+
+// These assertions run on every supported PE and Unix target. The complete field
+// offsets rule out implicit padding before exposing canonical values as bytes.
+const _: () = {
+    use core::mem::{align_of, offset_of, size_of};
+
+    use crate::{
+        depth_stencil_state::{DepthStencilSnapshot, StencilFaceState},
+        draw_data::DepthScissorFlags,
+        pipeline_state::{PipelineRsBits, PipelineRsFlags},
+    };
+    assert!(cfg!(target_endian = "little"));
+    assert!(size_of::<crate::ids::TextureId>() == 8);
+    assert!(size_of::<PipelineRsFlags>() == 1);
+    assert!(align_of::<PipelineRsFlags>() == 1);
+    assert!(size_of::<DepthScissorFlags>() == 1);
+    assert!(align_of::<DepthScissorFlags>() == 1);
+    assert!(size_of::<PipelineRsBits>() == 11);
+    assert!(align_of::<PipelineRsBits>() == 1);
+    assert!(offset_of!(PipelineRsBits, flags) == 0);
+    assert!(offset_of!(PipelineRsBits, src_blend) == 1);
+    assert!(offset_of!(PipelineRsBits, dst_blend) == 2);
+    assert!(offset_of!(PipelineRsBits, blend_op) == 3);
+    assert!(offset_of!(PipelineRsBits, src_blend_alpha) == 4);
+    assert!(offset_of!(PipelineRsBits, dst_blend_alpha) == 5);
+    assert!(offset_of!(PipelineRsBits, blend_op_alpha) == 6);
+    assert!(offset_of!(PipelineRsBits, color_write_mask) == 7);
+    assert!(offset_of!(PipelineRsBits, color_write_mask_ext) == 8);
+    assert!(size_of::<StencilFaceState>() == 4);
+    assert!(align_of::<StencilFaceState>() == 1);
+    assert!(offset_of!(StencilFaceState, func) == 0);
+    assert!(offset_of!(StencilFaceState, fail_op) == 1);
+    assert!(offset_of!(StencilFaceState, depth_fail_op) == 2);
+    assert!(offset_of!(StencilFaceState, pass_op) == 3);
+    assert!(size_of::<DepthStencilSnapshot>() == 20);
+    assert!(align_of::<DepthStencilSnapshot>() == 4);
+    assert!(offset_of!(DepthStencilSnapshot, depth_enable) == 0);
+    assert!(offset_of!(DepthStencilSnapshot, depth_write) == 1);
+    assert!(offset_of!(DepthStencilSnapshot, depth_func) == 2);
+    assert!(offset_of!(DepthStencilSnapshot, stencil_enable) == 3);
+    assert!(offset_of!(DepthStencilSnapshot, front) == 4);
+    assert!(offset_of!(DepthStencilSnapshot, back) == 8);
+    assert!(offset_of!(DepthStencilSnapshot, read_mask) == 12);
+    assert!(offset_of!(DepthStencilSnapshot, write_mask) == 16);
+    assert!(size_of::<RenderStateSnapshot>() == 60);
+    assert!(align_of::<RenderStateSnapshot>() == 4);
+    assert!(offset_of!(RenderStateSnapshot, pipeline_rs) == 0);
+    assert!(offset_of!(RenderStateSnapshot, depth_scissor) == 11);
+    assert!(offset_of!(RenderStateSnapshot, depth_stencil_state) == 12);
+    assert!(offset_of!(RenderStateSnapshot, cull_mode) == 32);
+    assert!(offset_of!(RenderStateSnapshot, fill_mode) == 33);
+    assert!(offset_of!(RenderStateSnapshot, sample_mask) == 34);
+    assert!(offset_of!(RenderStateSnapshot, reserved) == 35);
+    assert!(offset_of!(RenderStateSnapshot, scissor_rect) == 36);
+    assert!(offset_of!(RenderStateSnapshot, blend_factor) == 44);
+    assert!(offset_of!(RenderStateSnapshot, depth_bias) == 48);
+    assert!(offset_of!(RenderStateSnapshot, slope_scale_depth_bias) == 52);
+    assert!(offset_of!(RenderStateSnapshot, stencil_ref) == 56);
+    assert!(size_of::<StageBinding>() == 64);
+    assert!(align_of::<StageBinding>() == 8);
+    assert!(offset_of!(StageBinding, texture_id) == 0);
+    assert!(offset_of!(StageBinding, sampler_state) == 8);
+    assert!(size_of::<DeclarationHeader>() == 80);
+    assert!(align_of::<DeclarationHeader>() == 8);
+    assert!(offset_of!(DeclarationHeader, vdecl_hash) == 0);
+    assert!(offset_of!(DeclarationHeader, extents) == 8);
+    assert!(offset_of!(DeclarationHeader, count) == 72);
+    assert!(offset_of!(DeclarationHeader, used_streams) == 76);
+    assert!(offset_of!(DeclarationHeader, reserved) == 78);
+    assert!(size_of::<SnapshotHeader>() == 8);
+    assert!(offset_of!(SnapshotHeader, changed) == 0);
+    assert!(offset_of!(SnapshotHeader, reserved) == 4);
+    assert!(size_of::<StageHeader>() == 8);
+    assert!(offset_of!(StageHeader, mask) == 0);
+    assert!(offset_of!(StageHeader, count) == 2);
+    assert!(offset_of!(StageHeader, reserved) == 4);
+    assert!(size_of::<VariantRecord>() == 24);
+    assert!(offset_of!(VariantRecord, key) == 0);
+    assert!(offset_of!(VariantRecord, reserved) == 22);
+    assert!(size_of::<ByteBindingRecord>() == 16);
+    assert!(offset_of!(ByteBindingRecord, address) == 0);
+    assert!(offset_of!(ByteBindingRecord, length) == 8);
+    assert!(offset_of!(ByteBindingRecord, present) == 12);
+    assert!(size_of::<DepthFlagsRecord>() == 8);
+    assert!(offset_of!(DepthFlagsRecord, flags) == 0);
+    assert!(offset_of!(DepthFlagsRecord, reserved) == 4);
+    assert!(size_of::<VertexAttrDesc>() == 16);
+    assert!(align_of::<VertexAttrDesc>() == 4);
+    assert!(offset_of!(VertexAttrDesc, attr_index) == 0);
+    assert!(offset_of!(VertexAttrDesc, buffer_index) == 4);
+    assert!(offset_of!(VertexAttrDesc, format) == 12);
+    assert!(offset_of!(VertexAttrDesc, offset) == 8);
+};
 
 /// Native decoder for one retained frame lease.
 ///
@@ -193,8 +423,8 @@ impl DrawReader {
     /// Establish the immutable backing contract for decoded byte ranges.
     ///
     /// # Safety
-    /// Every encoded nonempty byte range must name initialized immutable storage
-    /// retained through submit replay. Keep every arena passed to decoding alive
+    /// Every command byte slice and nonempty byte range must name initialized,
+    /// immutable storage retained through submit replay. Keep every arena alive
     /// and unchanged until all returned tokens and their copies are forgotten.
     /// The contract applies to every frame after `clear` as well.
     #[must_use]
@@ -210,84 +440,62 @@ impl DrawReader {
         self.poisoned = false;
     }
 
-    /// Decode a draw without copying guest bytes.
+    /// Apply changed canonical records and retain an immutable native snapshot root.
+    ///
+    /// # Safety
+    /// The paired typed producer must construct every canonical record with valid fields.
+    /// Keep that initialized payload and every referenced byte range immutable
+    /// and allocated through every returned token use, including submit replay.
     ///
     /// # Errors
-    /// Returns malformed-field or previous decode errors.
-    pub fn decode_draw(&mut self, reader: &mut WireReader<'_>) -> Result<DrawOp, WireError> {
-        if self.poisoned {
-            return Err(WireError::InvalidValue);
-        }
-        let result = read_draw(reader);
-        self.poisoned = result.is_err();
-        result
-    }
-
-    /// Apply changed state and retain one immutable native snapshot for replay.
-    ///
-    /// # Errors
-    /// Returns malformed-field or previous decode errors.
-    pub fn decode_snapshot_delta(
+    /// Returns a truncated, malformed, or previously poisoned capture error.
+    pub unsafe fn decode_snapshot(
         &mut self,
-        reader: &mut WireReader<'_>,
+        payload: &[u8],
         scratch: &mut ScratchArena,
     ) -> Result<CurrentSnapshotPtr, WireError> {
         if self.poisoned {
             return Err(WireError::InvalidValue);
         }
-        let result = self.read_snapshot_delta(reader, scratch);
+        let mut reader = SnapshotReader { remaining: payload };
+        let result = self
+            .read_snapshot_delta(&mut reader, scratch)
+            .and_then(|snapshot| {
+                if reader.remaining.is_empty() {
+                    Ok(snapshot)
+                } else {
+                    Err(WireError::InvalidValue)
+                }
+            });
         self.poisoned = result.is_err();
         result
     }
 
     fn read_snapshot_delta(
         &mut self,
-        reader: &mut WireReader<'_>,
+        reader: &mut SnapshotReader<'_>,
         scratch: &mut ScratchArena,
     ) -> Result<CurrentSnapshotPtr, WireError> {
-        let mask = reader.u32()?;
-        if mask & !0x1ffff != 0 {
-            return Err(WireError::InvalidValue);
-        }
+        let mask = read_snapshot_mask(reader)?;
         if mask & 1 != 0 {
-            let ptr = store(scratch, RenderStateSnapshot::read_wire(reader)?);
-            // SAFETY: the frame owner retains initialized native scratch through replay.
+            let ptr = read_borrowed_render_state(reader)?;
+            // SAFETY: the admitted immutable command arena retains this canonical leaf.
             self.current.render_state = Some(unsafe { RenderStatePtr::new(ptr) });
         }
         if mask & 2 != 0 {
-            let stage_mask = reader.u16()?;
-            let values =
-                read_arena_slice::<StageBinding>(reader, scratch, stage_mask.count_ones())?;
-            // SAFETY: every mask-sized element is initialized in ascending stage order;
-            // the frame retains this final arena storage unchanged through replay.
-            self.current.stage_bindings =
-                Some(unsafe { StageBindingsPtr::from_raw_parts(stage_mask, values) });
+            self.current.stage_bindings = Some(read_borrowed_stages(reader)?);
         }
         if mask & 4 != 0 {
-            let count = reader.u32()?;
-            if count > 16 {
-                return Err(WireError::InvalidValue);
-            }
-            let ptr = read_arena_slice::<VertexAttrDesc>(reader, scratch, count)?;
-            let extents = WireValue::read_wire(reader)?;
-            let used_streams = WireValue::read_wire(reader)?;
-            let vdecl_hash = WireValue::read_wire(reader)?;
-            // SAFETY: the frame retains the initialized descriptor array through replay.
-            self.current.attrs =
-                Some(unsafe { AttrSnapshot::new(ptr, count, extents, used_streams, vdecl_hash) });
+            self.current.attrs = Some(read_borrowed_attrs(reader)?);
         }
         if mask & 8 != 0 {
-            let ptr = store(scratch, VsSource::read_wire(reader)?);
-            // SAFETY: the frame retains the initialized source in scratch through replay.
-            self.current.vs = Some(unsafe { VsSourcePtr::new(ptr) });
+            self.current.vs = Some(shader_record::read_vs(reader)?);
         }
         if mask & 16 != 0 {
-            let ptr = store(scratch, PsSource::read_wire(reader)?);
-            // SAFETY: the frame retains the initialized source in scratch through replay.
-            self.current.ps = Some(unsafe { PsSourcePtr::new(ptr) });
+            self.current.ps = Some(shader_record::read_ps(reader)?);
         }
         if mask & 32 != 0 {
-            self.current.variant = Some(WireValue::read_wire(reader)?);
+            self.current.variant = Some(read_variant(reader)?);
         }
         let byte_fields = [
             &mut self.current.vs_constants,
@@ -307,7 +515,7 @@ impl DrawReader {
             }
         }
         if mask & (1 << 16) != 0 {
-            self.current.depth_stencil = WireValue::read_wire(reader)?;
+            self.current.depth_stencil = read_depth_flags(reader)?;
         }
         // SAFETY: CurrentSnapshot contains only trivial-Drop tokens and scalar values;
         // native scratch and every borrowed PE range remain retained through replay.
@@ -318,516 +526,192 @@ impl DrawReader {
     }
 }
 
-// Decode directly into the final native array. A failed element leaves an unreachable
-// initialized prefix, which needs no destruction and is reclaimed with the frame arena.
-fn read_arena_slice<T: WireValue>(
-    reader: &mut WireReader<'_>,
-    scratch: &mut ScratchArena,
-    count: u32,
-) -> Result<NonNull<T>, WireError> {
-    const {
-        assert!(!std::mem::needs_drop::<T>());
-        assert!(std::mem::align_of::<T>() <= 16);
+fn read_snapshot_mask(reader: &mut SnapshotReader<'_>) -> Result<u32, WireError> {
+    let header: &SnapshotHeader = borrow_record(reader)?;
+    if header.changed & !0x1ffff != 0 || header.reserved != 0 {
+        return Err(WireError::InvalidValue);
     }
-    if count == 0 {
-        return Ok(NonNull::dangling());
-    }
-    let destination = scratch.alloc_uninit_slice::<T>(count as usize);
-    for index in 0..count {
-        let value = T::read_wire(reader)?;
-        // SAFETY: index is strictly within the count aligned slots reserved above.
-        let slot = unsafe { destination.add(index as usize) };
-        // SAFETY: each exclusive slot is initialized exactly once before the
-        // completed array is exposed to any reader.
-        unsafe { slot.write(value) };
-    }
-    NonNull::new(destination).ok_or(WireError::InvalidValue)
+    Ok(header.changed)
 }
 
-fn store<T>(scratch: &mut ScratchArena, value: T) -> NonNull<T> {
-    const {
-        assert!(!std::mem::needs_drop::<T>());
+// Inline canonical leaves are aligned relative to the command arena, not a Rust enum.
+fn read_aligned_bytes<'a>(
+    reader: &mut SnapshotReader<'a>,
+    count: u32,
+    alignment: usize,
+) -> Result<&'a [u8], WireError> {
+    let address = reader.bytes(0)?.as_ptr() as usize;
+    let padding = address.wrapping_neg() & (alignment - 1);
+    if reader
+        .bytes(u32::try_from(padding).map_err(|_| WireError::TooLarge)?)?
+        .iter()
+        .any(|&byte| byte != 0)
+    {
+        return Err(WireError::InvalidValue);
     }
-    let ptr = scratch.alloc_uninit::<T>();
-    // SAFETY: the arena reserved aligned, exclusive space for one T.
-    unsafe { ptr.write(value) };
-    NonNull::new(ptr).expect("arena allocation is non-null")
+    reader.bytes(count)
+}
+
+fn read_borrowed_render_state(
+    reader: &mut SnapshotReader<'_>,
+) -> Result<NonNull<RenderStateSnapshot>, WireError> {
+    let bytes = read_aligned_bytes(
+        reader,
+        u32::try_from(size_of::<RenderStateSnapshot>()).map_err(|_| WireError::TooLarge)?,
+        8,
+    )?;
+    let ptr = NonNull::new(
+        std::ptr::with_exposed_provenance_mut::<RenderStateSnapshot>(
+            bytes.as_ptr().expose_provenance(),
+        ),
+    )
+    .ok_or(WireError::InvalidValue)?;
+    // SAFETY: the canonical record contains only integer/bitflag fields; all bit patterns
+    // are valid Rust values, and the aligned immutable packet retains the reference.
+    #[cfg(debug_assertions)]
+    let state = unsafe { ptr.as_ref() };
+    #[cfg(debug_assertions)]
+    if state.reserved != 0
+        || crate::pipeline_state::PipelineRsFlags::from_bits(state.pipeline_rs.flags.bits())
+            .is_none()
+        || crate::draw_data::DepthScissorFlags::from_bits(state.depth_scissor.bits()).is_none()
+    {
+        return Err(WireError::InvalidValue);
+    }
+    Ok(ptr)
+}
+
+fn read_borrowed_stages(reader: &mut SnapshotReader<'_>) -> Result<StageBindingsPtr, WireError> {
+    let header: &StageHeader = borrow_record(reader)?;
+    let mask = header.mask;
+    let count = header.count;
+    if u32::from(count) != mask.count_ones() || header.reserved != 0 {
+        return Err(WireError::InvalidValue);
+    }
+    let values = read_aligned_bytes(
+        reader,
+        u32::from(count)
+            * u32::try_from(size_of::<StageBinding>()).map_err(|_| WireError::TooLarge)?,
+        8,
+    )?;
+    let ptr = if count == 0 {
+        NonNull::dangling()
+    } else {
+        NonNull::new(std::ptr::with_exposed_provenance_mut::<StageBinding>(
+            values.as_ptr().expose_provenance(),
+        ))
+        .ok_or(WireError::InvalidValue)?
+    };
+    // SAFETY: StageBinding's canonical fields admit every bit pattern. The mask-sized
+    // array is aligned and retained by the immutable command arena through submission.
+    Ok(unsafe { StageBindingsPtr::from_raw_parts(mask, ptr) })
+}
+
+fn read_borrowed_attrs(reader: &mut SnapshotReader<'_>) -> Result<AttrSnapshot, WireError> {
+    let header: &DeclarationHeader = borrow_record(reader)?;
+    let count = header.count;
+    if count > 16 || header.reserved != 0 {
+        return Err(WireError::InvalidValue);
+    }
+    let bytes = read_aligned_bytes(
+        reader,
+        count * u32::try_from(size_of::<VertexAttrDesc>()).map_err(|_| WireError::TooLarge)?,
+        8,
+    )?;
+    #[cfg(debug_assertions)]
+    for attr in bytes.as_chunks::<{ size_of::<VertexAttrDesc>() }>().0 {
+        let format = u32::from_le_bytes(attr[12..16].try_into().map_err(|_| WireError::Truncated)?);
+        mtld3d_shared::mtl::VertexFormat::from_repr(format).ok_or(WireError::InvalidValue)?;
+    }
+    let ptr = if count == 0 {
+        NonNull::dangling()
+    } else {
+        NonNull::new(std::ptr::with_exposed_provenance_mut::<VertexAttrDesc>(
+            bytes.as_ptr().expose_provenance(),
+        ))
+        .ok_or(WireError::InvalidValue)?
+    };
+    // SAFETY: the paired typed producer initialized valid attributes; debug builds check
+    // discriminants before borrowing. Immutable command storage outlives every token use.
+    Ok(unsafe { AttrSnapshot::new(ptr, NonNull::from(header)) })
 }
 
 fn write_optional_bytes(
     value: Option<ScratchSlice>,
-    writer: &mut WireWriter<'_>,
+    writer: &mut SnapshotWriter<'_>,
 ) -> Result<(), WireError> {
-    value.is_some().write_wire(writer)?;
-    if let Some(value) = value {
-        write_scratch_slice(value, writer)?;
-    }
-    Ok(())
+    let (address, length) = value.map_or((0, 0), |value| value.as_raw());
+    capture_record(
+        writer,
+        ByteBindingRecord {
+            address,
+            length,
+            present: u32::from(value.is_some()),
+        },
+    )
 }
 
-fn read_optional_bytes(reader: &mut WireReader<'_>) -> Result<Option<ScratchSlice>, WireError> {
-    if bool::read_wire(reader)? {
-        read_scratch_slice(reader).map(Some)
-    } else {
-        Ok(None)
+fn read_optional_bytes(reader: &mut SnapshotReader<'_>) -> Result<Option<ScratchSlice>, WireError> {
+    let record: &ByteBindingRecord = borrow_record(reader)?;
+    if record.present == 0 && record.address == 0 && record.length == 0 {
+        return Ok(None);
     }
-}
-
-/// Encode a borrowed byte range without copying its contents.
-///
-/// # Errors
-///
-/// Returns the wire writer's allocation or size error.
-pub fn write_scratch_slice(
-    value: ScratchSlice,
-    writer: &mut WireWriter<'_>,
-) -> Result<(), WireError> {
-    let (address, length) = value.as_raw();
-    writer.u64(address)?;
-    writer.u32(length)
-}
-
-/// Decode a borrowed byte range from an explicitly trusted frame reader.
-///
-/// # Errors
-///
-/// Returns an error for truncated, untrusted, null or overflowing nonempty ranges.
-pub fn read_scratch_slice(reader: &mut WireReader<'_>) -> Result<ScratchSlice, WireError> {
-    let address = reader.u64()?;
-    let length = reader.u32()?;
-    if length == 0 {
-        return Ok(ScratchSlice::EMPTY);
-    }
-    if !reader.permits_range(address, u64::from(length)) {
+    if record.present != 1 {
         return Err(WireError::InvalidValue);
     }
-    let address = usize::try_from(address).map_err(|_| WireError::InvalidValue)?;
+    if record.length == 0 {
+        return Ok(Some(ScratchSlice::EMPTY));
+    }
+    if usize::try_from(record.length).map_err(|_| WireError::InvalidValue)? > isize::MAX as usize {
+        return Err(WireError::InvalidValue);
+    }
+    let address = usize::try_from(record.address).map_err(|_| WireError::InvalidValue)?;
     address
-        .checked_add(length as usize)
+        .checked_add(record.length as usize)
         .ok_or(WireError::InvalidValue)?;
-    if usize::try_from(length).map_err(|_| WireError::TooLarge)? > isize::MAX as usize {
-        return Err(WireError::InvalidValue);
-    }
-    let ptr = NonNull::new(address as *mut u8).ok_or(WireError::InvalidValue)?;
-    // SAFETY: DrawReader construction requires immutable, retained storage for every wire range.
-    Ok(unsafe { ScratchSlice::from_raw_parts(ptr, length) })
+    let pointer = NonNull::new(address as *mut u8).ok_or(WireError::InvalidValue)?;
+    // SAFETY: the trusted frame producer retains this immutable range through every consumer.
+    Ok(Some(unsafe {
+        ScratchSlice::from_raw_parts(pointer, record.length)
+    }))
 }
 
-fn write_stream(value: &StreamBinding, writer: &mut WireWriter<'_>) -> Result<(), WireError> {
-    value.stream.write_wire(writer)?;
-    value.buffer_id.write_wire(writer)?;
-    writer.u64(u64::try_from(value.backing_ptr).map_err(|_| WireError::TooLarge)?)?;
-    writer.u64(u64::try_from(value.backing_len).map_err(|_| WireError::TooLarge)?)?;
-    value.backing_generation.write_wire(writer)?;
-    value.offset.write_wire(writer)?;
-    value.stride.write_wire(writer)?;
-    value.freq.write_wire(writer)
-}
-
-fn read_address(reader: &mut WireReader<'_>) -> Result<usize, WireError> {
-    let address = reader.u64()?;
-    if address != 0 && !reader.has_trusted_addresses() {
-        return Err(WireError::InvalidValue);
-    }
-    usize::try_from(address).map_err(|_| WireError::InvalidValue)
-}
-
-fn read_stream(reader: &mut WireReader<'_>) -> Result<StreamBinding, WireError> {
-    Ok(StreamBinding {
-        stream: WireValue::read_wire(reader)?,
-        buffer_id: WireValue::read_wire(reader)?,
-        backing_ptr: read_address(reader)?,
-        backing_len: usize::try_from(reader.u64()?).map_err(|_| WireError::TooLarge)?,
-        backing_generation: WireValue::read_wire(reader)?,
-        offset: WireValue::read_wire(reader)?,
-        stride: WireValue::read_wire(reader)?,
-        freq: WireValue::read_wire(reader)?,
-    })
-}
-
-fn write_draw(draw: &DrawOp, writer: &mut WireWriter<'_>) -> Result<(), WireError> {
-    draw.metal_prim.write_wire(writer)?;
-    match &draw.vertex_source {
-        VertexSource::Up {
-            bytes,
-            size,
-            stride,
-        } => {
-            writer.u8(0)?;
-            write_scratch_slice(*bytes, writer)?;
-            size.write_wire(writer)?;
-            stride.write_wire(writer)?;
-        }
-        VertexSource::Bound {
-            first,
-            extra,
-            stream0_freq,
-        } => {
-            writer.u8(1)?;
-            write_stream(first, writer)?;
-            writer.u32(u32::try_from(extra.len()).map_err(|_| WireError::TooLarge)?)?;
-            for stream in extra {
-                write_stream(stream, writer)?;
-            }
-            stream0_freq.write_wire(writer)?;
-        }
-    }
-    match &draw.index_source {
-        IndexSource::None {
-            start_vertex,
-            vertex_count,
-        } => {
-            writer.u8(0)?;
-            start_vertex.write_wire(writer)?;
-            vertex_count.write_wire(writer)?;
-        }
-        IndexSource::Bound {
-            buffer_id,
-            backing_ptr,
-            backing_len,
-            backing_generation,
-            offset,
-            index_count,
-            index_type,
-            base_vertex,
-        } => {
-            writer.u8(1)?;
-            buffer_id.write_wire(writer)?;
-            writer.u64(u64::try_from(*backing_ptr).map_err(|_| WireError::TooLarge)?)?;
-            writer.u64(u64::try_from(*backing_len).map_err(|_| WireError::TooLarge)?)?;
-            backing_generation.write_wire(writer)?;
-            offset.write_wire(writer)?;
-            index_count.write_wire(writer)?;
-            index_type.write_wire(writer)?;
-            base_vertex.write_wire(writer)?;
-        }
-        IndexSource::Fan {
-            start_vertex,
-            primitive_count,
-        } => {
-            writer.u8(2)?;
-            start_vertex.write_wire(writer)?;
-            primitive_count.write_wire(writer)?;
-        }
-        IndexSource::Generated {
-            data,
-            index_count,
-            index_type,
-            min_vertex,
-            max_vertex,
-        } => {
-            writer.u8(3)?;
-            write_scratch_slice(*data, writer)?;
-            index_count.write_wire(writer)?;
-            index_type.write_wire(writer)?;
-            min_vertex.write_wire(writer)?;
-            max_vertex.write_wire(writer)?;
-        }
-        IndexSource::Up {
-            bytes,
-            index_count,
-            index_type,
-        } => {
-            writer.u8(4)?;
-            write_scratch_slice(*bytes, writer)?;
-            index_count.write_wire(writer)?;
-            index_type.write_wire(writer)?;
-        }
-    }
-    Ok(())
-}
-
-fn read_draw(reader: &mut WireReader<'_>) -> Result<DrawOp, WireError> {
-    let metal_prim = WireValue::read_wire(reader)?;
-    let vertex_source = match reader.u8()? {
-        0 => VertexSource::Up {
-            bytes: read_scratch_slice(reader)?,
-            size: WireValue::read_wire(reader)?,
-            stride: WireValue::read_wire(reader)?,
-        },
-        1 => {
-            let first = read_stream(reader)?;
-            let count = reader.u32()?;
-            if count > 15 {
-                return Err(WireError::InvalidValue);
-            }
-            let mut extra = Vec::with_capacity(count as usize);
-            for _ in 0..count {
-                extra.push(read_stream(reader)?);
-            }
-            VertexSource::Bound {
-                first,
-                extra: extra.into_boxed_slice(),
-                stream0_freq: WireValue::read_wire(reader)?,
-            }
-        }
-        _ => return Err(WireError::InvalidValue),
-    };
-    let index_source = read_indices(reader)?;
-    validate_draw(&vertex_source, &index_source)?;
-    // Bound resources remain numeric descriptors here. Packet validation checks their
-    // exact published identities before replay; only ScratchSlice forms borrowed bytes.
-    Ok(DrawOp {
-        metal_prim,
-        vertex_source,
-        index_source,
-    })
-}
-
-fn read_indices(reader: &mut WireReader<'_>) -> Result<IndexSource, WireError> {
-    Ok(match reader.u8()? {
-        0 => IndexSource::None {
-            start_vertex: WireValue::read_wire(reader)?,
-            vertex_count: WireValue::read_wire(reader)?,
-        },
-        1 => IndexSource::Bound {
-            buffer_id: WireValue::read_wire(reader)?,
-            backing_ptr: read_address(reader)?,
-            backing_len: usize::try_from(reader.u64()?).map_err(|_| WireError::TooLarge)?,
-            backing_generation: WireValue::read_wire(reader)?,
-            offset: WireValue::read_wire(reader)?,
-            index_count: WireValue::read_wire(reader)?,
-            index_type: WireValue::read_wire(reader)?,
-            base_vertex: WireValue::read_wire(reader)?,
-        },
-        2 => IndexSource::Fan {
-            start_vertex: WireValue::read_wire(reader)?,
-            primitive_count: WireValue::read_wire(reader)?,
-        },
-        3 => IndexSource::Generated {
-            data: read_scratch_slice(reader)?,
-            index_count: WireValue::read_wire(reader)?,
-            index_type: WireValue::read_wire(reader)?,
-            min_vertex: WireValue::read_wire(reader)?,
-            max_vertex: WireValue::read_wire(reader)?,
-        },
-        4 => IndexSource::Up {
-            bytes: read_scratch_slice(reader)?,
-            index_count: WireValue::read_wire(reader)?,
-            index_type: WireValue::read_wire(reader)?,
-        },
-        _ => return Err(WireError::InvalidValue),
-    })
-}
-
-macro_rules! source_codec {
-    ($source:ty { $($tag:literal => $variant:ident { $($field:ident),+ $(,)? }),+ $(,)? }) => {
-        impl WireValue for $source {
-            fn write_wire(&self, writer: &mut WireWriter<'_>) -> Result<(), WireError> {
-                match self { $(Self::$variant { $($field),+ } => {
-                    writer.u8($tag)?;
-                    $($field.write_wire(writer)?;)+
-                }),+ }
-                Ok(())
-            }
-            fn read_wire(reader: &mut WireReader<'_>) -> Result<Self, WireError> {
-                match reader.u8()? {
-                    $($tag => Ok(Self::$variant { $($field: WireValue::read_wire(reader)?,)+ }),)+
-                    _ => Err(WireError::InvalidValue),
-                }
-            }
-        }
-    };
-}
-
-source_codec!(VsSource {
-    0 => Programmable { vs_id, max_const_used, uses_rel_const, provided_input_mask,
-        uses_int_const, uses_bool_const, clip_plane_count, sampler_kinds },
-    1 => FixedFunction { key, max_row_count },
-});
-
-source_codec!(PsSource {
-    0 => Programmable { ps_id, max_const_used, uses_bump_env, uses_int_const,
-        uses_bool_const, color_out_mask },
-    1 => FixedFunction { key, sampled_stage_mask, constant_rows },
-});
-
-fn validate_draw(vertices: &VertexSource, indices: &IndexSource) -> Result<(), WireError> {
-    match vertices {
-        VertexSource::Up { bytes, size, .. } => {
-            if usize::try_from(*size).map_err(|_| WireError::TooLarge)? > bytes.as_slice().len() {
-                return Err(WireError::InvalidValue);
-            }
-        }
-        VertexSource::Bound { first, extra, .. } => {
-            let mut used = 0u16;
-            for stream in std::iter::once(first).chain(extra.iter()) {
-                if stream.stream >= 16 || used & (1 << stream.stream) != 0 {
-                    return Err(WireError::InvalidValue);
-                }
-                used |= 1 << stream.stream;
-                validate_backing(stream.backing_ptr, stream.backing_len)?;
-            }
-        }
-    }
-    validate_indices(indices)
-}
-
-fn validate_indices(indices: &IndexSource) -> Result<(), WireError> {
-    match indices {
-        IndexSource::Bound {
-            backing_ptr,
-            backing_len,
-            ..
-        } => {
-            validate_backing(*backing_ptr, *backing_len)?;
-        }
-        IndexSource::Up {
-            bytes,
-            index_count,
-            index_type,
-        } => {
-            validate_index_bytes(*index_count, *index_type, bytes.as_slice().len())?;
-        }
-        IndexSource::Generated {
-            data,
-            index_count,
-            index_type,
-            min_vertex,
-            max_vertex,
-        } => {
-            validate_index_bytes(*index_count, *index_type, data.as_raw().1 as usize)?;
-            if min_vertex > max_vertex {
-                return Err(WireError::InvalidValue);
-            }
-        }
-        IndexSource::None { .. } | IndexSource::Fan { .. } => {}
-    }
-    Ok(())
-}
-
-fn validate_backing(address: usize, length: usize) -> Result<(), WireError> {
-    // A staged WRITEONLY buffer can release its CPU allocation after upload. Its
-    // zero address and generation still carry the padded GPU buffer length.
-    // Bound descriptors stay numeric here; native staged buffers ignore absent
-    // CPU backing and use their persistent GPU allocation.
-    if length > isize::MAX as usize {
-        return Err(WireError::InvalidValue);
-    }
-    address.checked_add(length).ok_or(WireError::InvalidValue)?;
-    Ok(())
-}
-
-fn validate_index_bytes(
-    count: u32,
-    kind: mtld3d_shared::mtl::IndexType,
-    length: usize,
-) -> Result<(), WireError> {
-    let stride = match kind {
-        mtld3d_shared::mtl::IndexType::UInt16 => 2,
-        mtld3d_shared::mtl::IndexType::UInt32 => 4,
-    };
-    let required = usize::try_from(count)
-        .map_err(|_| WireError::TooLarge)?
-        .checked_mul(stride)
-        .ok_or(WireError::TooLarge)?;
-    if required > length {
-        return Err(WireError::InvalidValue);
-    }
-    Ok(())
-}
-
-/// Validate a draw without constructing stream storage or borrowing backing bytes.
-///
-/// # Errors
-/// Rejects malformed fields, invalid byte extents, or a backing identity rejected by
-/// the caller's retained-inventory check.
-pub fn validate_wire_draw(
-    reader: &mut WireReader<'_>,
-    mut backing: impl FnMut(u64, u64) -> Result<(), WireError>,
-) -> Result<(), WireError> {
-    mtld3d_shared::mtl::PrimitiveType::read_wire(reader)?;
-    match reader.u8()? {
-        0 => {
-            let bytes = read_scratch_slice(reader)?;
-            let size = reader.u32()?;
-            reader.u32()?;
-            if size > bytes.as_raw().1 {
-                return Err(WireError::InvalidValue);
-            }
-        }
-        1 => {
-            let mut used = 0u16;
-            let mut stream = |reader: &mut WireReader<'_>| -> Result<(), WireError> {
-                let value = read_stream(reader)?;
-                if value.stream >= 16 || used & (1 << value.stream) != 0 {
-                    return Err(WireError::InvalidValue);
-                }
-                used |= 1 << value.stream;
-                validate_backing(value.backing_ptr, value.backing_len)?;
-                backing(value.backing_ptr as u64, value.backing_len as u64)
-            };
-            stream(reader)?;
-            let count = reader.u32()?;
-            if count > 15 {
-                return Err(WireError::InvalidValue);
-            }
-            for _ in 0..count {
-                stream(reader)?;
-            }
-            reader.u32()?;
-        }
-        _ => return Err(WireError::InvalidValue),
-    }
-    let indices = read_indices(reader)?;
-    validate_indices(&indices)?;
-    if let IndexSource::Bound {
-        backing_ptr,
-        backing_len,
-        ..
-    } = indices
+fn read_variant(reader: &mut SnapshotReader<'_>) -> Result<VariantKey, WireError> {
+    let record: &VariantRecord = borrow_record(reader)?;
+    #[cfg(debug_assertions)]
+    if record.reserved != [0; 2]
+        || record.key.reserved != 0
+        || crate::dxso::VariantFlags::from_bits(record.key.flags.bits()).is_none()
     {
-        backing(backing_ptr as u64, backing_len as u64)?;
-    }
-    Ok(())
-}
-
-/// Validate dirty snapshot values without building native snapshots or allocating scratch.
-///
-/// # Errors
-/// Rejects malformed masks, fields, or byte ranges outside the reader's retained inventory.
-pub fn validate_wire_snapshot(reader: &mut WireReader<'_>) -> Result<(), WireError> {
-    let mask = reader.u32()?;
-    if mask & !0x1ffff != 0 {
         return Err(WireError::InvalidValue);
     }
-    if mask & 1 != 0 {
-        RenderStateSnapshot::read_wire(reader)?;
+    Ok(record.key)
+}
+
+fn read_depth_flags(reader: &mut SnapshotReader<'_>) -> Result<DepthStencilFlags, WireError> {
+    let record: &DepthFlagsRecord = borrow_record(reader)?;
+    if record.reserved != 0 {
+        return Err(WireError::InvalidValue);
     }
-    if mask & 2 != 0 {
-        let stages = reader.u16()?;
-        for _ in 0..stages.count_ones() {
-            StageBinding::read_wire(reader)?;
-        }
-    }
-    if mask & 4 != 0 {
-        let count = reader.u32()?;
-        if count > 16 {
-            return Err(WireError::InvalidValue);
-        }
-        for _ in 0..count {
-            VertexAttrDesc::read_wire(reader)?;
-        }
-        <[u32; 16]>::read_wire(reader)?;
-        reader.u16()?;
-        reader.u64()?;
-    }
-    if mask & 8 != 0 {
-        VsSource::read_wire(reader)?;
-    }
-    if mask & 16 != 0 {
-        PsSource::read_wire(reader)?;
-    }
-    if mask & 32 != 0 {
-        VariantKey::read_wire(reader)?;
-    }
-    for index in 0..10 {
-        if mask & (1 << (index + 6)) != 0 {
-            read_optional_bytes(reader)?;
-        }
-    }
-    if mask & (1 << 16) != 0 {
-        DepthStencilFlags::read_wire(reader)?;
-    }
-    Ok(())
+    DepthStencilFlags::from_bits(u8::try_from(record.flags).map_err(|_| WireError::InvalidValue)?)
+        .ok_or(WireError::InvalidValue)
+}
+
+/// Canonical fixed-layout draw payloads and retained stream views.
+pub mod draw_record;
+
+/// Exact fixed-record payload size, excluding the flat command header.
+///
+/// # Errors
+/// Rejects more than sixteen bound vertex streams.
+pub const fn draw_payload_size(draw: &DrawOp) -> Result<usize, WireError> {
+    draw_record::payload_size(draw)
+}
+
+/// Fill one final draw payload reservation without temporary operation storage.
+///
+/// # Errors
+/// Rejects an incorrect destination size or excessive stream count.
+pub fn write_draw_into(draw: &DrawOp, destination: &mut [u8]) -> Result<(), WireError> {
+    draw_record::write_into(draw, destination)
 }

@@ -1,6 +1,8 @@
 //! Captured draw state shared by API recording and native encoding.
 //!
-//! These are local Rust owners and borrowed arena tokens, not the PE/Unix wire layout.
+//! Canonical render, stage, declaration and shader-source leaves have fixed layouts
+//! shared by PE and Unix.
+//! Other values remain local Rust owners and borrowed arena tokens.
 
 use core::ptr::NonNull;
 
@@ -9,6 +11,12 @@ use mtld3d_shared::{
     mtl::{IndexType, PrimitiveType, VertexStepFunction},
 };
 use mtld3d_types::{MAX_STREAMS, SAMPLER_STATE_COUNT};
+
+mod shader_source;
+pub use shader_source::{
+    FixedPsSource, FixedVsSource, ProgrammablePsSource, ProgrammableVsSource, PsSource,
+    PsSourcePtr, PsSourceView, ShaderSourceFlags, VsSource, VsSourcePtr, VsSourceView,
+};
 
 pub use crate::shader_cache::{ps_source_disk_key_programmable, vs_source_disk_key_programmable};
 use crate::{
@@ -50,11 +58,11 @@ pub enum VertexSource {
     /// One [`StreamBinding`] per stream the declaration reads that has a
     /// buffer bound; a read stream with nothing bound is absent and feeds
     /// zeros at draw time. `first` is the lowest such stream and `extra` the
-    /// rest, so the single-stream case carries no heap allocation (an empty
-    /// boxed slice does not allocate).
+    /// rest. The single-stream case carries no heap allocation; native replay
+    /// borrows additional fixed stream records from the retained command arena.
     Bound {
         first: StreamBinding,
-        extra: Box<[StreamBinding]>,
+        extra: ExtraStreams,
         /// Raw `SetStreamSourceFreq` word of stream 0.
         ///
         /// The instance count of an indexed draw comes from here even when
@@ -86,19 +94,87 @@ pub struct StreamBinding {
     pub freq: u32,
 }
 
+impl StreamBinding {
+    /// Copy the scalar semantic view without duplicating allocation ownership.
+    #[must_use]
+    pub const fn copy_value(&self) -> Self {
+        Self {
+            stream: self.stream,
+            buffer_id: self.buffer_id,
+            backing_ptr: self.backing_ptr,
+            backing_len: self.backing_len,
+            backing_generation: self.backing_generation,
+            offset: self.offset,
+            stride: self.stride,
+            freq: self.freq,
+        }
+    }
+}
+
+/// Additional API-captured vertex streams. Native execution borrows canonical records instead.
+pub enum ExtraStreams {
+    Empty,
+    Owned(Box<[StreamBinding]>),
+}
+
+impl ExtraStreams {
+    pub const EMPTY: Self = Self::Empty;
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        match self {
+            Self::Empty => 0,
+            Self::Owned(values) => values.len(),
+        }
+    }
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+    #[must_use]
+    pub fn iter(&self) -> ExtraStreamsIter<'_> {
+        ExtraStreamsIter {
+            values: match self {
+                Self::Empty => [].iter(),
+                Self::Owned(values) => values.iter(),
+            },
+        }
+    }
+}
+impl<'a> IntoIterator for &'a ExtraStreams {
+    type Item = StreamBinding;
+    type IntoIter = ExtraStreamsIter<'a>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+pub struct ExtraStreamsIter<'a> {
+    values: core::slice::Iter<'a, StreamBinding>,
+}
+impl ExtraStreamsIter<'_> {
+    fn empty() -> Self {
+        Self { values: [].iter() }
+    }
+}
+impl Iterator for ExtraStreamsIter<'_> {
+    type Item = StreamBinding;
+    fn next(&mut self) -> Option<Self::Item> {
+        self.values.next().map(StreamBinding::copy_value)
+    }
+}
+
 /// How one stream is fed for a draw.
-pub enum StreamFeed<'a> {
+pub enum StreamFeed {
     /// Stream 0 of a UP draw: inline bytes at the call's stride.
     Inline { stride: u32 },
     /// A bound vertex buffer.
-    Buffer(&'a StreamBinding),
+    Buffer(StreamBinding),
     /// Read by the declaration, nothing bound: zeros.
     Null,
 }
 
 impl VertexSource {
     /// How `stream` is fed, for a stream the declaration reads.
-    pub fn feed(&self, stream: u32) -> StreamFeed<'_> {
+    pub fn feed(&self, stream: u32) -> StreamFeed {
         match self {
             Self::Up { stride, .. } => {
                 if stream == 0 {
@@ -107,7 +183,7 @@ impl VertexSource {
                     StreamFeed::Null
                 }
             }
-            Self::Bound { first, extra, .. } => core::iter::once(first)
+            Self::Bound { first, extra, .. } => core::iter::once(first.copy_value())
                 .chain(extra.iter())
                 .find(|b| u32::from(b.stream) == stream)
                 .map_or(StreamFeed::Null, StreamFeed::Buffer),
@@ -115,12 +191,12 @@ impl VertexSource {
     }
 
     /// Every bound stream of the draw, lowest first.
-    pub fn bindings(&self) -> impl Iterator<Item = &StreamBinding> {
+    pub fn bindings(&self) -> impl Iterator<Item = StreamBinding> {
         let (first, extra) = match self {
-            Self::Up { .. } => (None, &[][..]),
-            Self::Bound { first, extra, .. } => (Some(first), &extra[..]),
+            Self::Up { .. } => (None, ExtraStreamsIter::empty()),
+            Self::Bound { first, extra, .. } => (Some(first.copy_value()), extra.iter()),
         };
-        first.into_iter().chain(extra.iter())
+        first.into_iter().chain(extra)
     }
 }
 
@@ -142,25 +218,33 @@ pub fn stream_layouts(
     source: &VertexSource,
     attrs: &AttrSnapshot,
 ) -> [StreamLayout; MAX_STREAMS as usize] {
+    stream_layouts_with(attrs, |stream, extent| match source.feed(stream) {
+        StreamFeed::Inline { stride } => StreamLayout {
+            stride: layout_stride(stride, extent),
+            step: VertexStepFunction::PerVertex,
+            step_rate: 1,
+        },
+        StreamFeed::Buffer(b) => bound_stream_layout(b.stride, extent, b.freq),
+        StreamFeed::Null => StreamLayout {
+            stride: extent,
+            step: VertexStepFunction::Constant,
+            step_rate: 0,
+        },
+    })
+}
+
+/// Compute declaration layouts while borrowing stream fields from their capture owner.
+#[must_use]
+pub fn stream_layouts_with(
+    attrs: &AttrSnapshot,
+    mut layout: impl FnMut(u32, u32) -> StreamLayout,
+) -> [StreamLayout; MAX_STREAMS as usize] {
     let mut layouts = [StreamLayout::UNUSED; MAX_STREAMS as usize];
-    let mut used = attrs.used_streams;
+    let mut used = attrs.used_streams();
     while used != 0 {
         let stream = used.trailing_zeros();
         used &= used - 1;
-        let extent = attrs.extents[stream as usize];
-        layouts[stream as usize] = match source.feed(stream) {
-            StreamFeed::Inline { stride } => StreamLayout {
-                stride: layout_stride(stride, extent),
-                step: VertexStepFunction::PerVertex,
-                step_rate: 1,
-            },
-            StreamFeed::Buffer(b) => bound_stream_layout(b.stride, extent, b.freq),
-            StreamFeed::Null => StreamLayout {
-                stride: extent,
-                step: VertexStepFunction::Constant,
-                step_rate: 0,
-            },
-        };
+        layouts[stream as usize] = layout(stream, attrs.extents()[stream as usize]);
     }
     layouts
 }
@@ -232,6 +316,7 @@ pub enum IndexSource {
     },
 }
 
+#[repr(C, align(8))]
 pub struct StageBinding {
     pub texture_id: crate::ids::TextureId,
     pub sampler_state: [u32; SAMPLER_STATE_COUNT],
@@ -283,7 +368,7 @@ const _: () = {
 
 /// Cached vertex-attribute layout.
 ///
-/// A pointer into the frame's scratch plus the metadata `emit_draw` needs
+/// A pointer into retained command storage or native scratch plus the metadata `emit_draw` needs
 /// to pipeline-key against. Updated via `Op::SetVertexAttrs` when the
 /// vertex declaration or FVF changes; reused across draws otherwise.
 ///
@@ -295,16 +380,24 @@ const _: () = {
 #[derive(Clone, Copy)]
 pub struct AttrSnapshot {
     ptr: NonNull<VertexAttrDesc>,
-    len: u32,
-    /// Per stream, the declaration's `max(offset + size)`; see `ResolvedAttrs`.
-    pub extents: [u32; MAX_STREAMS as usize],
-    /// Bit `s` set: stream `s` feeds a consumed attribute.
-    pub used_streams: u16,
-    pub vdecl_hash: u64,
+    header: NonNull<DeclarationHeader>,
 }
 
-// SAFETY: AttrSnapshot.ptr aliases bytes in the per-frame ScratchArena
-// owned by the FrameData currently being processed by the encoder.
+/// Canonical declaration metadata followed by its packed attribute records.
+#[repr(C, align(8))]
+pub struct DeclarationHeader {
+    pub vdecl_hash: u64,
+    pub extents: [u32; 16],
+    pub count: u32,
+    pub used_streams: u16,
+    pub reserved: u16,
+}
+
+// SAFETY: fields are initialized integers; the assertions in encoder_draw pin all offsets.
+unsafe impl crate::encoder_records::CommandRecord for DeclarationHeader {}
+
+// SAFETY: AttrSnapshot.ptr aliases immutable bytes in the retained command arena
+// or native per-frame ScratchArena owned by the frame being encoded.
 // CurrentSnapshot lives on FrameEncoder (encoder-thread-only). Send is
 // permitted but never actually crossed.
 unsafe impl Send for AttrSnapshot {}
@@ -314,30 +407,42 @@ impl AttrSnapshot {
     ///
     /// # Safety
     ///
-    /// `ptr` addresses `len` initialized attributes. Keep them immutable and
-    /// allocated until every copy of the returned token is forgotten.
+    /// `ptr` addresses `header.count` initialized attributes. Keep the header and attributes
+    /// immutable and allocated until every copy of the returned token is forgotten.
     #[must_use]
     pub const unsafe fn new(
         ptr: NonNull<VertexAttrDesc>,
-        len: u32,
-        extents: [u32; MAX_STREAMS as usize],
-        used_streams: u16,
-        vdecl_hash: u64,
+        header: NonNull<DeclarationHeader>,
     ) -> Self {
-        Self {
-            ptr,
-            len,
-            extents,
-            used_streams,
-            vdecl_hash,
-        }
+        Self { ptr, header }
+    }
+
+    #[must_use]
+    pub const fn header(&self) -> &DeclarationHeader {
+        // SAFETY: the token retains an initialized immutable declaration header.
+        unsafe { self.header.as_ref() }
+    }
+
+    #[must_use]
+    pub const fn extents(&self) -> &[u32; 16] {
+        &self.header().extents
+    }
+
+    #[must_use]
+    pub const fn used_streams(&self) -> u16 {
+        self.header().used_streams
+    }
+
+    #[must_use]
+    pub const fn vdecl_hash(&self) -> u64 {
+        self.header().vdecl_hash
     }
 
     #[must_use]
     pub const fn as_slice(&self) -> &[VertexAttrDesc] {
         // SAFETY: per type invariant the (ptr, len) refer to a live
         // slice in the current frame's ScratchArena.
-        unsafe { core::slice::from_raw_parts(self.ptr.as_ptr(), self.len as usize) }
+        unsafe { core::slice::from_raw_parts(self.ptr.as_ptr(), self.header().count as usize) }
     }
 }
 
@@ -376,8 +481,9 @@ impl CurrentSnapshotPtr {
     }
 }
 
-/// Cached pointer to a scratch-allocated `RenderStateSnapshot`.
+/// Cached pointer to an immutable canonical `RenderStateSnapshot`.
 ///
+/// The native scratch or retained PE command arena owns the storage.
 /// Wrapped in a newtype so it can be `Copy` while making the unsafe deref
 /// site explicit at the read.
 #[derive(Clone, Copy)]
@@ -406,68 +512,7 @@ impl RenderStatePtr {
     }
 }
 
-/// Cached pointer to a scratch-allocated [`VsSource`].
-///
-/// Wrapped in a Copy newtype so the per-draw `CurrentSnapshot` carries an
-/// 8-byte pointer instead of the ~48-byte enum (which embeds `FfVsKey`);
-/// the source is bumped into scratch only when `VS_SOURCE` is dirty.
-#[derive(Clone, Copy)]
-pub struct VsSourcePtr(NonNull<VsSource>);
-
-// SAFETY: see `AttrSnapshot`.
-unsafe impl Send for VsSourcePtr {}
-
-impl VsSourcePtr {
-    /// Bind a snapshot to its frame-retained arena.
-    ///
-    /// # Safety
-    ///
-    /// `ptr` addresses an initialized `VsSource`. Keep it and all referenced
-    /// storage immutable and allocated until every copy of this token is forgotten.
-    #[must_use]
-    pub const unsafe fn new(ptr: NonNull<VsSource>) -> Self {
-        Self(ptr)
-    }
-
-    #[must_use]
-    pub const fn as_ref(&self) -> &VsSource {
-        // SAFETY: per type invariant the pointer refers to a live
-        // value in the current frame's ScratchArena.
-        unsafe { self.0.as_ref() }
-    }
-}
-
-/// Cached pointer to a scratch-allocated [`PsSource`].
-///
-/// Same rationale as [`VsSourcePtr`] — keeps the ~56-byte `FfPsKey` out of
-/// the per-draw wrapper memcpy.
-#[derive(Clone, Copy)]
-pub struct PsSourcePtr(NonNull<PsSource>);
-
-// SAFETY: see `AttrSnapshot`.
-unsafe impl Send for PsSourcePtr {}
-
-impl PsSourcePtr {
-    /// Bind a snapshot to its frame-retained arena.
-    ///
-    /// # Safety
-    ///
-    /// `ptr` addresses an initialized `PsSource`. Keep it and all referenced
-    /// storage immutable and allocated until every copy of this token is forgotten.
-    #[must_use]
-    pub const unsafe fn new(ptr: NonNull<PsSource>) -> Self {
-        Self(ptr)
-    }
-
-    #[must_use]
-    pub const fn as_ref(&self) -> &PsSource {
-        // SAFETY: per type invariant the pointer refers to a live
-        // value in the current frame's ScratchArena.
-        unsafe { self.0.as_ref() }
-    }
-}
-
-/// Cached pointer to a scratch-allocated, mask-packed stage-bindings payload.
+/// Cached pointer to an immutable canonical, mask-packed stage-bindings payload.
 ///
 /// The pointee is `[StageBinding; mask.count_ones()]` — only the bound
 /// slots are bumped. `mask` bit `b` set means stage `b` is bound; the
@@ -644,7 +689,7 @@ bitflags::bitflags! {
 ///
 /// Intentionally NOT `Copy` / `Clone` — accidental whole-struct copies
 /// would be a per-draw pessimisation. The large FF keys (`FfVsKey` /
-/// `FfPsKey`) live behind `VsSourcePtr` / `PsSourcePtr` scratch pointers
+/// `FfPsKey`) live behind lease-bound `VsSourcePtr` / `PsSourcePtr` tokens
 /// rather than inline, so the wrapper that gets memcpy'd per draw is
 /// ~160 B (pointers + scalars) and the FF source is only bumped when
 /// `VS_SOURCE` / `PS_SOURCE` is dirty.
@@ -662,27 +707,27 @@ pub struct CurrentSnapshot {
     /// Per-stage bump-environment matrix + luminance (PS slot 12).
     ///
     /// Consumed by SM1 `texbem`/`texbeml`/`bem`. Bound only for a PS that
-    /// uses one of those ops (`PsSource::Programmable::uses_bump_env`).
+    /// uses one of those ops (`ProgrammablePsSource::uses_bump_env`).
     pub bump_env_bytes: Option<ScratchSlice>,
     /// VS integer-constant file (vertex slot 14).
     ///
     /// Bound only for a VS that reads a dynamic integer constant
-    /// (`VsSource::Programmable::uses_int_const`).
+    /// (`ProgrammableVsSource::uses_int_const`).
     pub vs_int_const_bytes: Option<ScratchSlice>,
     /// VS boolean-constant bitmask (vertex slot 26).
     ///
     /// Bound only for a VS that reads a dynamic boolean constant
-    /// (`VsSource::Programmable::uses_bool_const`).
+    /// (`ProgrammableVsSource::uses_bool_const`).
     pub vs_bool_const_bytes: Option<ScratchSlice>,
     /// PS integer-constant file (fragment slot 11).
     ///
     /// Bound only for a PS that reads a dynamic integer constant
-    /// (`PsSource::Programmable::uses_int_const`).
+    /// (`ProgrammablePsSource::uses_int_const`).
     pub ps_int_const_bytes: Option<ScratchSlice>,
     /// PS boolean-constant bitmask (fragment slot 10).
     ///
     /// Bound only for a PS that reads a dynamic boolean constant
-    /// (`PsSource::Programmable::uses_bool_const`).
+    /// (`ProgrammablePsSource::uses_bool_const`).
     pub ps_bool_const_bytes: Option<ScratchSlice>,
     /// Per-draw `VsDraw` uniform (`crate::vs_draw`): point size state.
     ///
@@ -695,7 +740,7 @@ pub struct CurrentSnapshot {
 impl CurrentSnapshot {
     /// Initial all-`None` state.
     ///
-    /// Used to seed `DeviceInner::snapshot_cache` before any rebuild has
+    /// Used to seed native encoder state before any captured delta has
     /// populated the fields.
     pub const EMPTY: Self = Self {
         render_state: None,
@@ -734,11 +779,11 @@ pub enum VsKey {
         variant: VariantKey,
         /// Part of the key so a missing-attribute variant gets its own compiled library.
         ///
-        /// See `VsSource::Programmable::provided_input_mask`.
+        /// See `ProgrammableVsSource::provided_input_mask`.
         provided_input_mask: u16,
-        /// See `VsSource::Programmable::clip_plane_count`.
+        /// See `ProgrammableVsSource::clip_plane_count`.
         clip_plane_count: u8,
-        /// See `VsSource::Programmable::sampler_kinds`.
+        /// See `ProgrammableVsSource::sampler_kinds`.
         sampler_kinds: VsSamplerKinds,
     },
     FixedFunction {
@@ -849,214 +894,6 @@ pub fn ps_source_disk_key_ff(ff: &FfPsKey, variant: VariantKey) -> u64 {
     shader_cache::ff_key_hash(&(ff, variant))
 }
 
-/// Source for the VS stage of a draw.
-///
-/// `Programmable` carries only the `shader_id`; the parsed `DxsoProgram`
-/// lives in the encoder's `program_cache`, populated by the
-/// `register_program` op pushed at `CreateVertexShader`. `FixedFunction`
-/// carries the FF key.
-///
-/// Neither `Copy` nor `Clone`: the `FixedFunction` variant carries a 38 B
-/// `FfVsKey` and `VsSource` is stored by value in `CurrentSnapshot`. `Copy`
-/// would have turned every `let vs = snap.vs.unwrap()` into a silent ~38 B
-/// memcpy off scratch. Duplication into scratch goes through
-/// `ScratchArena::alloc_from` (a bytewise copy with no `Clone` bound), and
-/// `VsSource::key` clones only the embedded `FfVsKey`.
-pub enum VsSource {
-    Programmable {
-        vs_id: ProgramId,
-        /// `max_const_used` from the bound shader (rows of `c[]` referenced by static analysis).
-        ///
-        /// Carried in the snapshot so the encoder can snapshot exactly
-        /// `rows × 16` bytes out of its VS const mirror at `emit_draw` time
-        /// without going through the encoder-side `program_cache` lookup.
-        /// Capped at 256.
-        max_const_used: u16,
-        /// `true` when the bound shader reads `c[a0.x+N]` (relative addressing).
-        ///
-        /// Static analysis can't bound the index, so the encoder must bind
-        /// the full populated prefix
-        /// (`FrameEncoder::vs_constants_populated_rows`) rather than
-        /// `max_const_used`.
-        uses_rel_const: bool,
-        /// Bit `i` set ⇒ VS input register `vi` is provided by the bound vertex declaration.
-        ///
-        /// Folds into the VS library + disk keys so a shader reading an
-        /// unprovided input (read as `float4(0)`) compiles a distinct
-        /// variant. All-ones for a fully-provided decl, so real workloads
-        /// keep a single variant.
-        provided_input_mask: u16,
-        /// Shader reads a dynamic integer constant → bind the integer-constant buffer.
-        ///
-        /// Dynamic here means a non-`defi` `iN`, e.g. a `loop`/`rep` counter
-        /// fed by `SetVertexShaderConstantI`; the buffer goes to vertex slot
-        /// 14. False for the vast majority of shaders, which then pay no
-        /// slot-14 bind.
-        uses_int_const: bool,
-        /// Whether the VS reads a dynamic boolean constant.
-        ///
-        /// A non-`defb` `bN`, typically a static `if` condition fed by
-        /// `SetVertexShaderConstantB`; the bitmask goes to vertex slot 26.
-        uses_bool_const: bool,
-        /// User clip planes the draw applies (`vs_draw::clip_plane_count`), 0..=6.
-        ///
-        /// Folds into the VS library + disk keys: the shader declares one
-        /// `[[clip_distance]]` lane per plane and computes it in the
-        /// epilogue, so each count is a distinct variant. Zero for every
-        /// draw that never enables a plane, which keeps the common case at
-        /// one variant.
-        clip_plane_count: u8,
-        /// Texture kind bound at each of the four vertex texture fetch slots.
-        ///
-        /// Folds into the VS library + disk keys: the emitter types each
-        /// `[[texture(n)]]` argument and its sample coordinate swizzle from
-        /// the bound kind rather than from the shader's `dcl_*`, because
-        /// Metal type-checks the binding against the signature. Zero for
-        /// every shader without vertex texture fetch and for the ordinary
-        /// case of a 2D texture in every slot, which keeps one variant.
-        sampler_kinds: VsSamplerKinds,
-    },
-    FixedFunction {
-        key: FfVsKey,
-        /// Highest row of the FF VS const blob the shader reads, plus 1.
-        ///
-        /// I.e. the number of rows to snapshot from the encoder's
-        /// `ff_vs_constants_mirror` and bind via `setVertexBytes`. Computed
-        /// on the API thread from `key` + `FfState` masks at snapshot time;
-        /// the same derivation lives inside `build_vs_constants` but is
-        /// replicated on the source so `emit_draw` can read it without
-        /// re-walking the masks.
-        max_row_count: u16,
-    },
-}
-
-impl VsSource {
-    /// Build the `VsKey` (cache lookup identity) for a draw.
-    ///
-    /// Takes `self` as the source and `variant` as the variant. Clones the
-    /// embedded `FfVsKey` once per construction; the resulting `VsKey` owns
-    /// the FF key and lives until cache-insert or trace logging consumes it.
-    #[must_use]
-    pub fn key(&self, variant: VariantKey) -> VsKey {
-        match self {
-            Self::Programmable {
-                vs_id,
-                provided_input_mask,
-                clip_plane_count,
-                sampler_kinds,
-                ..
-            } => VsKey::Programmable {
-                vs_id: *vs_id,
-                variant,
-                provided_input_mask: *provided_input_mask,
-                clip_plane_count: *clip_plane_count,
-                sampler_kinds: *sampler_kinds,
-            },
-            Self::FixedFunction { key, .. } => VsKey::FixedFunction {
-                ff: key.clone(),
-                variant,
-            },
-        }
-    }
-
-    /// On-disk content-hash key for this source (variant-independent).
-    ///
-    /// VS variants share one library. Computed only on a cache miss /
-    /// gated-diagnostic path, never per draw. Mirrors `VsKey::disk_key`.
-    #[must_use]
-    pub fn disk_key(&self) -> u64 {
-        match self {
-            Self::Programmable {
-                vs_id,
-                provided_input_mask,
-                clip_plane_count,
-                sampler_kinds,
-                ..
-            } => vs_source_disk_key_programmable(
-                *vs_id,
-                *provided_input_mask,
-                *clip_plane_count,
-                *sampler_kinds,
-            ),
-            Self::FixedFunction { key, .. } => vs_source_disk_key_ff(key),
-        }
-    }
-}
-
-/// Source for the PS stage of a draw.
-///
-/// Symmetric to `VsSource`; same Copy / Clone rationale.
-pub enum PsSource {
-    Programmable {
-        ps_id: ProgramId,
-        /// See [`VsSource::Programmable::max_const_used`].
-        max_const_used: u16,
-        /// Shader uses `texbem`/`texbeml`/`bem` → bind the bump-environment uniform.
-        ///
-        /// The per-stage uniform goes to PS slot 12. False for the vast
-        /// majority of shaders, which then pay no slot-12 bind.
-        uses_bump_env: bool,
-        /// Whether the PS reads a dynamic integer constant.
-        ///
-        /// A non-`defi` `iN`, typically a `rep`/`loop` counter fed by
-        /// `SetPixelShaderConstantI`; the file goes to fragment slot 11.
-        uses_int_const: bool,
-        /// Whether the PS reads a dynamic boolean constant.
-        ///
-        /// A non-`defb` `bN`, typically a static `if` condition fed by
-        /// `SetPixelShaderConstantB`; the bitmask goes to fragment slot 10.
-        uses_bool_const: bool,
-        /// Bit `i` set ⇒ the bytecode writes `oCi`.
-        ///
-        /// Feeds the pipeline key so a render target the shader never
-        /// writes gets an empty write mask and keeps its contents.
-        color_out_mask: u8,
-    },
-    FixedFunction {
-        key: FfPsKey,
-        /// Stages the emitted shader declares a texture and sampler for.
-        ///
-        /// `FfPsKey::sampled_stage_mask`, resolved on the API thread so
-        /// `emit_draw` never re-walks the stage array. The draw binds a
-        /// texture only inside the mask; a stage outside it is one the
-        /// combiner cascade never samples.
-        sampled_stage_mask: u16,
-        /// Used fragment constant rows, cached from `FfPsKey::constant_rows`.
-        ///
-        /// Zero skips slot 15; one is texture factor only. Larger extents
-        /// include stage constants without enlarging the snapshot or key.
-        constant_rows: u8,
-    },
-}
-
-impl PsSource {
-    #[must_use]
-    pub fn key(&self, variant: VariantKey) -> PsKey {
-        match self {
-            Self::Programmable { ps_id, .. } => PsKey::Programmable {
-                ps_id: *ps_id,
-                variant,
-            },
-            Self::FixedFunction { key, .. } => PsKey::FixedFunction {
-                ff: key.clone(),
-                variant,
-            },
-        }
-    }
-
-    /// On-disk content-hash key for this source + `variant` (PS MSL depends on the variant).
-    ///
-    /// Computed only on a cache miss / gated-diagnostic path, never per
-    /// draw. Mirrors `PsKey::disk_key`.
-    #[must_use]
-    pub fn disk_key(&self, variant: VariantKey) -> u64 {
-        match self {
-            Self::Programmable { ps_id, .. } => ps_source_disk_key_programmable(*ps_id, variant),
-            Self::FixedFunction { key, .. } => ps_source_disk_key_ff(key, variant),
-        }
-    }
-}
-
 /// The shader identity for one draw — the VS/PS sources + `variant`, which travel together.
 ///
 /// Passed as a unit to the gated diagnostic / telemetry consumers
@@ -1066,8 +903,8 @@ impl PsSource {
 /// `VariantKey`).
 #[derive(Clone, Copy)]
 pub struct ShaderRef<'a> {
-    pub vs: &'a VsSource,
-    pub ps: &'a PsSource,
+    pub vs: VsSourceView<'a>,
+    pub ps: PsSourceView<'a>,
     pub variant: VariantKey,
 }
 
@@ -1179,6 +1016,7 @@ bitflags::bitflags! {
     /// inside `PipelineRsBits.flags`. Split this way so the cache key
     /// (`PipelineSnapshot`) only hashes pipeline-relevant bits.
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    #[repr(transparent)]
     pub struct DepthScissorFlags: u8 {
         const DEPTH_ENABLE = 1 << 0;
         const DEPTH_WRITE = 1 << 1;
@@ -1200,6 +1038,7 @@ bitflags::bitflags! {
 /// is `[u16; 4]` (D3D9 max texture/RT dim is 16384). `blend_factor` /
 /// `depth_bias` / `slope_scale_depth_bias` keep `u32` (D3DCOLOR or
 /// f32 bit pattern).
+#[repr(C, align(4))]
 pub struct RenderStateSnapshot {
     pub pipeline_rs: crate::pipeline_state::PipelineRsBits,
     pub depth_scissor: DepthScissorFlags,
@@ -1210,6 +1049,16 @@ pub struct RenderStateSnapshot {
     pub depth_stencil_state: DepthStencilSnapshot,
     pub cull_mode: u8,
     pub fill_mode: u8,
+    /// `D3DRS_MULTISAMPLEMASK` narrowed against the bound render target.
+    ///
+    /// `crate::multisample::SAMPLE_MASK_ALL` when the state has no
+    /// effect, which is every single-sampled draw. Resolved here rather than
+    /// on the encoder thread because it needs the target's
+    /// `D3DMULTISAMPLE_TYPE`, and the render-state section is re-snapshotted
+    /// whenever the render target changes.
+    pub sample_mask: u8,
+    /// Initialized padding in the canonical shared layout.
+    pub reserved: u8,
     pub scissor_rect: [u16; 4],
     /// Constant RGBA referenced by `MTLBlendFactor::BlendColor` / `OneMinusBlendColor`.
     ///
@@ -1230,14 +1079,6 @@ pub struct RenderStateSnapshot {
     /// on the encoder, so folding it into the state key would mint one
     /// `MTLDepthStencilState` per reference value.
     pub stencil_ref: u32,
-    /// `D3DRS_MULTISAMPLEMASK` narrowed against the bound render target.
-    ///
-    /// `crate::multisample::SAMPLE_MASK_ALL` when the state has no
-    /// effect, which is every single-sampled draw. Resolved here rather than
-    /// on the encoder thread because it needs the target's
-    /// `D3DMULTISAMPLE_TYPE`, and the render-state section is re-snapshotted
-    /// whenever the render target changes.
-    pub sample_mask: u8,
 }
 
 impl RenderStateSnapshot {
@@ -1275,3 +1116,6 @@ pub const fn build_alpha_ref_bytes(variant: VariantKey, alpha_ref: f32) -> ([u8;
     }
     (alpha_ref.to_le_bytes(), 4)
 }
+
+#[cfg(test)]
+mod tests;

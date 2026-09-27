@@ -119,6 +119,52 @@ impl WireWriter<'_> {
         }
     }
 
+    /// Write only payload fields into an already reserved command destination.
+    ///
+    /// # Errors
+    /// Returns the callback error or a bounds failure.
+    pub fn payload_into(
+        destination: &mut [u8],
+        write: impl FnOnce(&mut WireWriter<'_>) -> Result<(), WireError>,
+    ) -> Result<usize, WireError> {
+        let mut writer = WireWriter {
+            storage: WireStorage::Slice {
+                bytes: destination,
+                used: 0,
+            },
+        };
+        write(&mut writer)?;
+        Ok(writer.len())
+    }
+
+    /// Reserve an initialized byte window for an explicit fixed-layout payload.
+    ///
+    /// # Errors
+    /// Returns an allocation or bounds failure.
+    pub fn reserve_bytes(&mut self, length: usize) -> Result<&mut [u8], WireError> {
+        match &mut self.storage {
+            WireStorage::Vector(bytes) => {
+                let start = bytes.len();
+                let end = start.checked_add(length).ok_or(WireError::TooLarge)?;
+                if end > u32::MAX as usize {
+                    return Err(WireError::TooLarge);
+                }
+                bytes
+                    .try_reserve(length)
+                    .map_err(|_| WireError::AllocationFailed)?;
+                bytes.resize(end, 0);
+                Ok(&mut bytes[start..end])
+            }
+            WireStorage::Slice { bytes, used } => {
+                let start = *used;
+                let end = start.checked_add(length).ok_or(WireError::TooLarge)?;
+                let destination = bytes.get_mut(start..end).ok_or(WireError::TooLarge)?;
+                *used = end;
+                Ok(destination)
+            }
+        }
+    }
+
     /// Write a record directly into a reserved arena window without allocating.
     ///
     /// # Errors

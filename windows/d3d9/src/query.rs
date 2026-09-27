@@ -330,24 +330,14 @@ extern "system" fn query_issue(this: *mut c_void, flags: u32) -> i32 {
         // usual when the encoder drains it.
         let generation = core.mark_armed();
         let c = core.clone();
-        dev.push_op(crate::encoder::Op::BeginVisibility(
-            mtld3d_core::encoder_data::capture_op(crate::device::BeginVisibilityOp {
-                c,
-                generation,
-            }),
-        ));
+        dev.push_control(crate::device::BeginVisibilityOp { c, generation });
     }
     if flags & D3DISSUE_END != 0 {
         // Mark "end issued" synchronously so a no-Present `GetData(FLUSH)`
         // knows the span is closed and there is a result to wait for (an
         // *open* query has none however far the GPU has got).
         let generation = core.mark_end_requested();
-        dev.push_op(crate::encoder::Op::EndVisibility(
-            mtld3d_core::encoder_data::capture_op(crate::device::EndVisibilityOp {
-                core,
-                generation,
-            }),
-        ));
+        dev.push_control(crate::device::EndVisibilityOp { core, generation });
     }
     dev.encoder_status().map_or_else(|hr| hr, |()| D3D_OK)
 }

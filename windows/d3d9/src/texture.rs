@@ -856,12 +856,10 @@ impl TextureInner {
         let dev = DeviceInner::from_ptr(self.device_inner);
         let slot = Arc::new(core::sync::atomic::AtomicU64::new(0));
         let slot_op = Arc::clone(&slot).into();
-        dev.push_op(crate::encoder::Op::ReadTextureHandle(
-            mtld3d_core::encoder_data::capture_op(crate::device::ReadTextureHandleOp {
-                texture_id,
-                slot_op,
-            }),
-        ));
+        dev.push_control(crate::device::ReadTextureHandleOp {
+            texture_id,
+            slot_op,
+        });
         if dev.flush_current_frame_blocking().is_err() {
             return false;
         }
@@ -3381,11 +3379,7 @@ unsafe fn finalize_texture(this: *mut Direct3DTexture9) {
     if dev_inner_raw != 0 {
         let dev = DeviceInner::from_ptr(dev_inner_raw);
         // Push cleanup operation to encoder thread — it owns the Metal handle
-        dev.push_op(crate::encoder::Op::DestroyTexture(
-            mtld3d_core::encoder_data::capture_op(crate::device::DestroyTextureOp {
-                tex_id: texture_id,
-            }),
-        ));
+        dev.push_control(crate::device::DestroyTextureOp { tex_id: texture_id });
         // Drop from the live-textures registry before freeing the
         // inner Box so `evict_managed_resources` never sees a dangling
         // pointer.
@@ -3727,9 +3721,7 @@ extern "system" fn texture_generate_mip_sub_levels(this: *mut c_void) {
     if upload_regenerates {
         return;
     }
-    dev.push_op(crate::encoder::Op::GenerateMipmaps(
-        mtld3d_core::encoder_data::capture_op(crate::device::GenerateMipmapsOp { texture_id }),
-    ));
+    dev.push_control(crate::device::GenerateMipmapsOp { texture_id });
 }
 
 // ── IDirect3DTexture9 ──
@@ -3875,12 +3867,10 @@ fn materialize_subresource_from_gpu(ti: &mut TextureInner, face: u32, level: usi
     // flush has drained the queue.
     let slot = Arc::new(core::sync::atomic::AtomicU64::new(0));
     let slot_op = Arc::clone(&slot).into();
-    dev.push_op(crate::encoder::Op::ReadTextureColorHandle(
-        mtld3d_core::encoder_data::capture_op(crate::device::ReadTextureColorHandleOp {
-            texture_id,
-            slot_op,
-        }),
-    ));
+    dev.push_control(crate::device::ReadTextureColorHandleOp {
+        texture_id,
+        slot_op,
+    });
     if dev.flush_current_frame_blocking().is_err() {
         return false;
     }
@@ -4485,21 +4475,19 @@ fn schedule_upload_with_order<const ORDERED: bool>(
         rect.w,
         rect.h
     );
-    dev.push_op(crate::encoder::Op::UploadTextureAndMips(
-        mtld3d_core::encoder_data::capture_op(crate::device::UploadTextureAndMipsOp {
-            job,
-            texture_id,
-            flags: {
-                let mut flags = crate::device::UploadTextureOpFlags::empty();
-                flags.set(crate::device::UploadTextureOpFlags::ORDERED, ORDERED);
-                flags.set(
-                    crate::device::UploadTextureOpFlags::REGENERATE_MIPMAPS,
-                    regen_mipmaps,
-                );
-                flags
-            },
-        }),
-    ));
+    dev.push_control(crate::device::UploadTextureAndMipsOp {
+        job,
+        texture_id,
+        flags: {
+            let mut flags = crate::device::UploadTextureOpFlags::empty();
+            flags.set(crate::device::UploadTextureOpFlags::ORDERED, ORDERED);
+            flags.set(
+                crate::device::UploadTextureOpFlags::REGENERATE_MIPMAPS,
+                regen_mipmaps,
+            );
+            flags
+        },
+    });
 }
 
 fn schedule_cube_upload(
@@ -4551,9 +4539,7 @@ fn schedule_cube_upload(
         release_staging: false,
         upload_generation: 0,
     };
-    dev.push_op(crate::encoder::Op::UploadTexture(
-        mtld3d_core::encoder_data::capture_op(crate::device::UploadTextureOp { job }),
-    ));
+    dev.push_control(crate::device::UploadTextureOp { job });
 }
 
 /// Re-mark a subresource whose upload the encoder emitted nothing for.
@@ -4759,7 +4745,7 @@ fn rehydrate_for_device_slow(tex: &mut Direct3DTexture9, dev: &mut DeviceInner, 
     // triggered this rehydrate call. A system-memory texture has no Metal
     // texture on any device, so it seeds nothing.
     if !ti.is_cpu_only() {
-        dev.push_texture_warmup(ti.texture_info());
+        dev.push_texture_warmup(&ti.texture_info());
     }
     let adopted = if pinned {
         tex.device_forward_target()
@@ -4865,11 +4851,7 @@ fn flush_dirty_mips_slow<const ORDERED: bool>(ti: &mut TextureInner, dev: &mut D
         }
         let texture_id = ti.texture_id;
         if regenerate_mipmaps {
-            dev.push_op(crate::encoder::Op::GenerateMipmaps(
-                mtld3d_core::encoder_data::capture_op(crate::device::GenerateMipmapsOp {
-                    texture_id,
-                }),
-            ));
+            dev.push_control(crate::device::GenerateMipmapsOp { texture_id });
         }
         mtld3d_shared::log_once_trace_by!(
             target: TEX_TRACE_TARGET, key: texture_id.raw(),

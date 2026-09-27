@@ -215,9 +215,7 @@ impl DeviceInner {
     pub fn frame_dump_draw(&mut self) {
         let seq = self.frame_dump.draws;
         self.frame_dump.draws += 1;
-        self.push_op(crate::encoder::Op::SetDumpDraw(
-            mtld3d_core::encoder_data::capture_op(crate::device::SetDumpDrawOp { seq }),
-        ));
+        self.push_control(crate::device::SetDumpDrawOp { seq });
         let vp = self.viewport();
         let rs = |i: u32| self.render_state(i as usize);
 
@@ -225,15 +223,15 @@ impl DeviceInner {
         let vs = self.snapshot_cache.vs.as_ref().map_or_else(
             || String::from("none"),
             |p| match p {
-                VsSource::Programmable { vs_id, .. } => format!("{vs_id:?}"),
-                VsSource::FixedFunction { .. } => String::from("ff"),
+                VsSource::Programmable(value) => format!("{:?}", value.vs_id),
+                VsSource::FixedFunction(_) => String::from("ff"),
             },
         );
         let ps = self.snapshot_cache.ps.as_ref().map_or_else(
             || String::from("none"),
             |p| match p {
-                PsSource::Programmable { ps_id, .. } => format!("{ps_id:?}"),
-                PsSource::FixedFunction { .. } => String::from("ff"),
+                PsSource::Programmable(value) => format!("{:?}", value.ps_id),
+                PsSource::FixedFunction(_) => String::from("ff"),
             },
         );
 

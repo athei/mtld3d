@@ -1189,6 +1189,7 @@ fn ps2_vreg_input_maps_to_color_not_position() {
 #[test]
 fn programmable_ps_emits_fog_blend_when_variant_fog_mode_set() {
     let variant = VariantKey {
+        reserved: 0,
         alpha_func: 0,
         fog_mode: narrow(D3DFOG_LINEAR),
         fog_table_mode: 0,
@@ -3632,6 +3633,7 @@ fn vertex_blend_msl_compiles_under_metal() {
     // discipline as `every_emitted_msl_compiles_under_metal` for the SM3
     // corpus.
     let mut sequential = FfVsKey {
+        reserved: 0,
         flags: FfVsFlags::HAS_NORMAL | FfVsFlags::COLOR_VERTEX,
         input_tex_coord_count: 0,
         tex_coord_count: 0,
@@ -3676,6 +3678,7 @@ fn ff_vs_lit_specular_msl_compiles_under_metal() {
     // through a real Metal compile — covers the Blinn-Phong block, the
     // per-light specular-row reads, and the spot cone factor.
     let key = FfVsKey {
+        reserved: 0,
         flags: FfVsFlags::HAS_NORMAL
             | FfVsFlags::COLOR_VERTEX
             | FfVsFlags::LIGHTING_ENABLED
@@ -3709,6 +3712,7 @@ fn ff_vs_with_clip_planes_emits_clip_distances_and_compiles() {
     // position comes back through the inverse view, and one distance is
     // written per plane. The PS struct must stay free of the member.
     let key = FfVsKey {
+        reserved: 0,
         flags: FfVsFlags::HAS_COLOR0 | FfVsFlags::COLOR_VERTEX,
         input_tex_coord_count: 0,
         tex_coord_count: 0,

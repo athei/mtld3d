@@ -103,7 +103,7 @@ use super::{
         build_alpha_ref_bytes,
     },
     encoder::{
-        ColorFillTarget, EncoderThread, FrameData, FrameInit, Op, StagingWarmupEntry, SubmitFence,
+        ColorFillTarget, EncoderThread, FrameData, FrameInit, StagingWarmupEntry, SubmitFence,
         TextureInfo, VbibWarmupEntry,
     },
     index_buffer::{Direct3DIndexBuffer9, IndexBufferCreateInfo},
@@ -527,14 +527,7 @@ pub struct DeviceInner {
     /// See `mtld3d_core::perf` for the field list. Drained into
     /// `FrameData::perf` at `Present`.
     perf: ApiPerfStorage,
-    /// Retention pipeline for VB/IB `PageBox`es whose in-flight frame hasn't yet retired.
-    ///
-    /// API thread pushes on Lock-rename and Release; drained into `FrameData`
-    /// at `present()` and from there into the encoder's
-    /// `pending_vbib_retention` for seq-gated destruction of the Metal wrapper
-    /// + drop of the Box.
-    vbib_retention_pending: Vec<PendingVbibRetention>,
-    /// Byte total of `vbib_retention_pending` queued this frame.
+    /// Byte total of VB/IB retirement commands captured in the current frame.
     ///
     /// Not yet handed to the encoder (and thus not yet in
     /// `vbib_retained_bytes`). Added to the shared total when reading the
@@ -606,7 +599,7 @@ pub struct DeviceInner {
     /// Texture kind bound at each vertex fetch slot.
     ///
     /// Maintained by `set_vertex_texture_slot` alongside the slot write and
-    /// folded into `VsSource::Programmable::sampler_kinds`, so the vertex
+    /// folded into `ProgrammableVsSource::sampler_kinds`, so the vertex
     /// emitter types each `[[texture(n)]]` argument from the texture the
     /// draw binds rather than from the shader's `dcl_*`.
     vertex_texture_kinds: VsSamplerKinds,
@@ -997,16 +990,14 @@ impl DeviceInner {
         let (x, y, width, height) = (v.x, v.y, v.width, v.height);
         let min_z = v.min_z;
         let max_z = v.max_z.max(v.min_z + 0.001);
-        self.push_op(crate::encoder::Op::SetViewport(
-            mtld3d_core::encoder_data::capture_op(crate::device::SetViewportOp {
-                x,
-                y,
-                width,
-                height,
-                min_z,
-                max_z,
-            }),
-        ));
+        self.push_control(crate::device::SetViewportOp {
+            x,
+            y,
+            width,
+            height,
+            min_z,
+            max_z,
+        });
         // Viewport feeds XYZRHW row 0 (`[vp_w, vp_h, vp_x, vp_y]`). Mark
         // WV — `emit_snapshot_deltas` dispatches the XYZRHW row 0 write
         // unconditionally when `ff_dirty` is non-empty and `key.has_rhw`,
@@ -1217,12 +1208,10 @@ impl DeviceInner {
     pub fn set_vertex_sampler_slot_state(&mut self, slot: usize, type_: usize, value: u32) {
         self.vertex_sampler_states[slot][type_] = value;
         let state = self.vertex_sampler_states[slot];
-        self.push_op(crate::encoder::Op::SetVertexSampler(
-            mtld3d_core::encoder_data::capture_op(crate::device::SetVertexSamplerOp {
-                slot: u8::try_from(slot).expect("validated attachment or vertex sampler slot"),
-                state,
-            }),
-        ));
+        self.push_control(crate::device::SetVertexSamplerOp {
+            slot: u8::try_from(slot).expect("validated attachment or vertex sampler slot"),
+            state,
+        });
     }
 
     /// Bind `tex` to vertex texture fetch slot `slot` (0..4).
@@ -1266,12 +1255,10 @@ impl DeviceInner {
             crate::texture::flush_dirty_mips(bound.inner_mut(), self);
             Some(bound.texture_id())
         };
-        self.push_op(crate::encoder::Op::SetVertexTexture(
-            mtld3d_core::encoder_data::capture_op(crate::device::SetVertexTextureOp {
-                slot: u8::try_from(slot).expect("validated attachment or vertex sampler slot"),
-                id,
-            }),
-        ));
+        self.push_control(crate::device::SetVertexTextureOp {
+            slot: u8::try_from(slot).expect("validated attachment or vertex sampler slot"),
+            id,
+        });
     }
 
     pub const fn stage_bindings(&self) -> &StageBindings {
@@ -1403,11 +1390,12 @@ impl DeviceInner {
         // before the encoder intakes them into `vbib_retained_bytes`.
         // Reset at `stamp_and_swap` when the queue is handed off.
         self.pending_retention_bytes += page_box.len() as u64;
-        self.vbib_retention_pending.push(PendingVbibRetention {
-            buffer_id,
-            page_box,
-            last_submit_seq,
-        });
+        self.current_frame
+            .push_vbib_retention(PendingVbibRetention {
+                buffer_id,
+                page_box,
+                last_submit_seq,
+            });
     }
 
     /// Push an inline, op-stream-ordered `Staged` VB/IB dirty-range upload.
@@ -1415,12 +1403,12 @@ impl DeviceInner {
     /// `page_box` is a transient snapshot of the dirtied bytes taken on the
     /// API thread at `Unlock`; the encoder wraps it and uploads `[0, size)`
     /// into the buffer's device buffer at `dst_offset` (renaming first if a
-    /// draw earlier in the open pass already read the range — see
-    /// `FrameEncoder::apply_stage_upload`). Pushing as an `Op` (rather than
-    /// a frame-head drain) is what lets the encoder see the upload in draw
-    /// order. Counts into `pending_retention_bytes` so the retention cap
-    /// sees the transient before the encoder intakes it. No Metal thunk
-    /// runs on the API thread here — just a `PageBox` move + `Vec::push`.
+    /// draw earlier in the open pass already read the range, see
+    /// `FrameEncoder::apply_stage_upload`). The control record preserves
+    /// upload order relative to draws. Counts into `pending_retention_bytes`
+    /// so the retention cap sees the transient before the encoder intakes it.
+    /// Capture retains the `PageBox` and appends its fixed record without a
+    /// Metal thunk on the API thread.
     pub fn push_stage_upload(
         &mut self,
         buffer_id: BufferId,
@@ -1429,7 +1417,7 @@ impl DeviceInner {
         size: u32,
     ) {
         self.pending_retention_bytes += page_box.len() as u64;
-        self.push_op_inline(crate::encoder::Op::StageUpload {
+        self.push_control(mtld3d_core::encoder_data::StageUploadOp {
             buffer_id,
             page_box,
             dst_offset,
@@ -1537,7 +1525,6 @@ impl DeviceInner {
         frame
             .perf_mut()
             .set_op_vec_metrics(op_vec_capacity_bytes, op_vec_realloc_bytes);
-        frame.set_vbib_retentions(core::mem::take(&mut self.vbib_retention_pending));
         // `Staged` uploads ride the op stream (inline `Op::StageUpload`),
         // so their page leases were recorded at `Unlock`. The encoder owns
         // counting their `PageBox` bytes into
@@ -1650,18 +1637,16 @@ impl DeviceInner {
         depth_has_stencil: bool,
         sample_count: u8,
     ) {
-        self.push_op(crate::encoder::Op::BindDepth(
-            mtld3d_core::encoder_data::capture_op(crate::device::BindDepthOp {
-                binding,
-                sample_count,
-                flags: {
-                    let mut flags = BindDepthOpFlags::empty();
-                    flags.set(BindDepthOpFlags::SAMPLEABLE, is_sampleable);
-                    flags.set(BindDepthOpFlags::HAS_STENCIL, depth_has_stencil);
-                    flags
-                },
-            }),
-        ));
+        self.push_control(crate::device::BindDepthOp {
+            binding,
+            sample_count,
+            flags: {
+                let mut flags = BindDepthOpFlags::empty();
+                flags.set(BindDepthOpFlags::SAMPLEABLE, is_sampleable);
+                flags.set(BindDepthOpFlags::HAS_STENCIL, depth_has_stencil);
+                flags
+            },
+        });
     }
 
     /// Push the encoder op that binds `info` as colour render target `slot` (0..=3).
@@ -1678,13 +1663,11 @@ impl DeviceInner {
         info: RtBinding,
         scale: mtld3d_core::render_scale::RenderScale,
     ) {
-        self.push_op(crate::encoder::Op::BindColor(
-            mtld3d_core::encoder_data::capture_op(crate::device::BindColorOp {
-                slot: u8::try_from(slot).expect("validated attachment or vertex sampler slot"),
-                info,
-                scale,
-            }),
-        ));
+        self.push_control(crate::device::BindColorOp {
+            slot: u8::try_from(slot).expect("validated attachment or vertex sampler slot"),
+            info,
+            scale,
+        });
     }
 
     /// Unbind render target `slot` (1..=3): `SetRenderTarget(slot, NULL)`.
@@ -1693,20 +1676,14 @@ impl DeviceInner {
     /// drops the persistent binding and tells the encoder.
     fn unbind_extra_render_target(&mut self, slot: usize) {
         if let Some(old_id) = self.cur_autogen_rt_ids[slot].take() {
-            self.push_op(crate::encoder::Op::GenerateMipmapsOrdered(
-                mtld3d_core::encoder_data::capture_op(crate::device::GenerateMipmapsOrderedOp {
-                    old_id,
-                }),
-            ));
+            self.push_control(crate::device::GenerateMipmapsOrderedOp { old_id });
         }
         self.bound_rt_mut()
             .replace_render_target(slot, core::ptr::null_mut(), 0, 0);
         self.last_extra_rt_bindings[slot - 1] = None;
-        self.push_op(crate::encoder::Op::UnbindExtraColor(
-            mtld3d_core::encoder_data::capture_op(crate::device::UnbindExtraColorOp {
-                slot: u8::try_from(slot).expect("validated extra color slot"),
-            }),
-        ));
+        self.push_control(crate::device::UnbindExtraColorOp {
+            slot: u8::try_from(slot).expect("validated extra color slot"),
+        });
     }
 
     /// Cheap retention-cap tier.
@@ -1875,8 +1852,15 @@ impl DeviceInner {
         self.encoder.status()
     }
 
-    pub fn try_push_op(&mut self, op: Op) -> Result<(), mtld3d_shared::encoder_wire::WireError> {
-        self.current_frame.try_push_op(op)
+    pub fn try_push_control<T: mtld3d_core::encoder_packet::CaptureControl>(
+        &mut self,
+        value: T,
+    ) -> Result<(), mtld3d_shared::encoder_wire::WireError> {
+        self.current_frame.try_push_control(value)
+    }
+
+    pub fn push_control<T: mtld3d_core::encoder_packet::CaptureControl>(&mut self, value: T) {
+        let _ = self.current_frame.try_push_control(value);
     }
 
     pub fn record_draw(&mut self, draw: &DrawOp) {
@@ -1894,24 +1878,12 @@ impl DeviceInner {
         unsafe { arena_alloc_bytes(self.current_frame.scratch_mut(), bytes) }
     }
 
-    pub fn push_op(&mut self, op: Op) {
-        self.current_frame.push_op(op);
-    }
-
-    /// Forwarder for `FrameData::push_op_inline`.
-    ///
-    /// Used by the hot draw path to emit `Op::Set*` + `Op::Draw` without
-    /// per-op heap alloc.
-    pub fn push_op_inline(&mut self, op: crate::encoder::Op) {
-        self.current_frame.push_op_inline(op);
-    }
-
     /// Queue an eager `MTLTexture` create on the current frame.
     ///
     /// The encoder drains the queue at `run_frame`'s head into one batched
     /// `CreateTexturesBatch` thunk, so subsequent draw operations hit the
     /// texture cache instead of cache-missing on first bind.
-    pub fn push_texture_warmup(&mut self, info: TextureInfo) {
+    pub fn push_texture_warmup(&mut self, info: &TextureInfo) {
         self.current_frame.push_texture_warmup(info);
     }
 
@@ -2064,9 +2036,7 @@ impl DeviceInner {
         }
         let evicted_count = to_evict.len();
         for tex_id in to_evict {
-            self.push_op(crate::encoder::Op::DestroyTexture(
-                mtld3d_core::encoder_data::capture_op(crate::device::DestroyTextureOp { tex_id }),
-            ));
+            self.push_control(crate::device::DestroyTextureOp { tex_id });
         }
         mtld3d_shared::log_once_info!(
             target: TEX_TRACE_TARGET,
@@ -2343,11 +2313,9 @@ impl DeviceInner {
         self.last_color_rt_binding = None;
         for slot in 1..RENDER_TARGET_SLOTS {
             if self.last_extra_rt_bindings[slot - 1].take().is_some() {
-                self.push_op(crate::encoder::Op::UnbindExtraColor(
-                    mtld3d_core::encoder_data::capture_op(crate::device::UnbindExtraColorOp {
-                        slot: u8::try_from(slot).expect("validated extra color slot"),
-                    }),
-                ));
+                self.push_control(crate::device::UnbindExtraColorOp {
+                    slot: u8::try_from(slot).expect("validated extra color slot"),
+                });
             }
         }
         self.cur_autogen_rt_ids = [None; RENDER_TARGET_SLOTS];
@@ -2842,10 +2810,11 @@ impl Direct3DDevice9 {
             max_z: 1.0,
         };
 
-        let coherent_seq = Arc::new(AtomicU64::new(0));
-        let upload_coherent_seq = Arc::new(AtomicU64::new(0));
-        let failed_submit_seq = Arc::new(AtomicU64::new(0));
-        let vbib_retained_bytes = Arc::new(AtomicU64::new(0));
+        let counters = info.encoder.counters();
+        let coherent_seq = counters.coherent_seq();
+        let upload_coherent_seq = counters.upload_coherent_seq();
+        let failed_submit_seq = counters.failed_submit_seq();
+        let vbib_retained_bytes = counters.retained_bytes();
 
         let inner = Box::into_raw(Box::new(DeviceInner {
             device_handle: info.device_handle,
@@ -2892,7 +2861,6 @@ impl Direct3DDevice9 {
             // Start at 1 so `current_seq - 1` never underflows.
             current_seq: 1,
             perf: ApiPerfStorage::new(),
-            vbib_retention_pending: Vec::new(),
             pending_retention_bytes: 0,
             retention_cap_bytes: info.config.vbib_retention_cap_bytes,
             config: info.config,
@@ -5216,7 +5184,7 @@ fn push_texture_warmups(dev: &mut DeviceInner, inner: &crate::texture::TextureIn
     let info = inner.texture_info();
     let texture_id = info.texture_id;
     let usage_flags = info.usage_flags;
-    dev.push_texture_warmup(info);
+    dev.push_texture_warmup(&info);
     if usage_flags.contains(mtld3d_shared::mtl::TextureUsage::RENDER_TARGET) {
         return;
     }
@@ -5427,7 +5395,7 @@ fn create_depth_texture_path(info: &DepthTextureCreateInfo) -> i32 {
 
     // Queue the eager `MTLTexture` create (sampleable shadow map path).
     let info = tex.inner().texture_info();
-    obj.inner().push_texture_warmup(info);
+    obj.inner().push_texture_warmup(&info);
 
     let tex_ptr = Box::into_raw(Box::new(tex));
     // SAFETY: `tex_ptr` is a freshly created, live texture at refcount 1.
@@ -5591,7 +5559,7 @@ extern "system" fn device_create_volume_texture(
     // CPU-side and the volume samples as cleared until upload lands. A
     // system-memory volume gets no Metal texture at all.
     if !mtld3d_core::pool::is_cpu_only(pool) {
-        obj.inner().push_texture_warmup(tex.inner().texture_info());
+        obj.inner().push_texture_warmup(&tex.inner().texture_info());
     }
     let tex_ptr = Box::into_raw(Box::new(tex));
     // SAFETY: `tex_ptr` is a freshly created, live volume texture at refcount 1;
@@ -5768,7 +5736,7 @@ extern "system" fn device_create_cube_texture(
         mip_bytes_per_row,
     });
     if !mtld3d_core::pool::is_cpu_only(pool) {
-        obj.inner().push_texture_warmup(tex.inner().texture_info());
+        obj.inner().push_texture_warmup(&tex.inner().texture_info());
     }
     let tex_ptr = Box::into_raw(Box::new(tex));
     // SAFETY: `tex_ptr` is a freshly created, live cube texture at refcount 1;
@@ -6966,12 +6934,10 @@ fn readback_from_texture_rt(
     crate::texture::flush_dirty_mips(unsafe { (*parent).inner_mut() }, dev.inner());
     let slot = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let slot_op = std::sync::Arc::clone(&slot).into();
-    dev.inner().push_op(crate::encoder::Op::ReadColorHandle(
-        mtld3d_core::encoder_data::capture_op(crate::device::ReadColorHandleOp {
-            texture_id,
-            slot_op,
-        }),
-    ));
+    dev.inner().push_control(crate::device::ReadColorHandleOp {
+        texture_id,
+        slot_op,
+    });
     if let Err(hr) = dev.inner().flush_current_frame_blocking() {
         return hr;
     }
@@ -7028,9 +6994,7 @@ fn blit_texture_to_systemmem(device_inner: &mut DeviceInner, read: &SystemMemRea
     // This blit reads the RT right after the flush. Mark it read-back BEFORE
     // the flush so the store-action rules treat it as live and never discard
     // its colour store.
-    device_inner.push_op(crate::encoder::Op::NoteColorRead(
-        mtld3d_core::encoder_data::capture_op(crate::device::NoteColorReadOp { src }),
-    ));
+    device_inner.push_control(crate::device::NoteColorReadOp { src });
     if let Err(hr) = device_inner.flush_current_frame_blocking() {
         return hr;
     }
@@ -7310,11 +7274,7 @@ extern "system" fn device_stretch_rect(
             if dev.frame_dump.active {
                 dev.frame_dump_event("StretchRect: multisampled depth resolve queued");
             }
-            dev.push_op(crate::encoder::Op::ResolveDepthSurface(
-                mtld3d_core::encoder_data::capture_op(crate::device::ResolveDepthSurfaceOp {
-                    transfer,
-                }),
-            ));
+            dev.push_control(crate::device::ResolveDepthSurfaceOp { transfer });
             return D3D_OK;
         }
         // Same-format Private→Private depth copy on the 1:1 blit path. The
@@ -7327,17 +7287,15 @@ extern "system" fn device_stretch_rect(
         if dev.frame_dump.active {
             dev.frame_dump_event("StretchRect: full-surface depth copy queued");
         }
-        dev.push_op(crate::encoder::Op::StretchBlit(
-            mtld3d_core::encoder_data::capture_op(crate::device::StretchBlitOp {
-                src_info,
-                dst_info,
-                src_region,
-                dst_region,
-                mip_level,
-                render_quad: false,
-                filter,
-            }),
-        ));
+        dev.push_control(crate::device::StretchBlitOp {
+            src_info,
+            dst_info,
+            src_region,
+            dst_region,
+            mip_level,
+            render_quad: false,
+            filter,
+        });
         return D3D_OK;
     }
 
@@ -7517,17 +7475,15 @@ extern "system" fn device_stretch_rect(
             }
         ));
     }
-    dev.push_op(crate::encoder::Op::StretchBlit(
-        mtld3d_core::encoder_data::capture_op(crate::device::StretchBlitOp {
-            src_info,
-            dst_info,
-            src_region,
-            dst_region,
-            mip_level,
-            render_quad,
-            filter,
-        }),
-    ));
+    dev.push_control(crate::device::StretchBlitOp {
+        src_info,
+        dst_info,
+        src_region,
+        dst_region,
+        mip_level,
+        render_quad,
+        filter,
+    });
     D3D_OK
 }
 
@@ -7970,9 +7926,7 @@ fn color_fill_render_target(
         regenerate_mipmaps: info.autogen_texture_id.is_some(),
     };
     let kind = info.kind;
-    dev.push_op(crate::encoder::Op::ColorFill(
-        mtld3d_core::encoder_data::capture_op(crate::device::ColorFillOp { kind, fill }),
-    ));
+    dev.push_control(crate::device::ColorFillOp { kind, fill });
     D3D_OK
 }
 
@@ -8430,11 +8384,7 @@ extern "system" fn device_set_render_target(
     if let Some(old_id) = dev.cur_autogen_rt_ids[slot].take()
         && Some(old_id) != new_autogen
     {
-        dev.push_op(crate::encoder::Op::GenerateMipmapsOrdered(
-            mtld3d_core::encoder_data::capture_op(crate::device::GenerateMipmapsOrderedOp {
-                old_id,
-            }),
-        ));
+        dev.push_control(crate::device::GenerateMipmapsOrderedOp { old_id });
     }
     dev.cur_autogen_rt_ids[slot] = new_autogen;
 
@@ -8640,14 +8590,12 @@ extern "system" fn device_set_depth_stencil_surface(
                         "depth-alias carry {prev_id:?} → {cur_id:?} {mip_w}x{mip_h}"
                     ));
                 }
-                dev.push_op(crate::encoder::Op::CarryDepth(
-                    mtld3d_core::encoder_data::capture_op(crate::device::CarryDepthOp {
-                        prev_id,
-                        cur_id,
-                        mip_w,
-                        mip_h,
-                    }),
-                ));
+                dev.push_control(crate::device::CarryDepthOp {
+                    prev_id,
+                    cur_id,
+                    mip_w,
+                    mip_h,
+                });
             }
             dev.last_sized_depth = Some((info.texture_id, mip_w, mip_h));
         }
@@ -8967,28 +8915,24 @@ extern "system" fn device_clear(
         // paints a scissored clear-quad. Independent of which other planes
         // this Clear names, exactly as the depth side below is.
         match &regions {
-            None => dev.push_op(crate::encoder::Op::ClearColor(
-                mtld3d_core::encoder_data::capture_op(crate::device::ClearColorOp {
+            None => dev.push_control(crate::device::ClearColorOp {
+                r_bits,
+                g_bits,
+                b_bits,
+                a_bits,
+                srgb_write,
+            }),
+            Some(list) if list.is_empty() => {}
+            Some(list) => {
+                let rects = list.clone();
+                dev.push_control(crate::device::ClearColorRectsOp {
                     r_bits,
                     g_bits,
                     b_bits,
                     a_bits,
                     srgb_write,
-                }),
-            )),
-            Some(list) if list.is_empty() => {}
-            Some(list) => {
-                let rects = list.clone();
-                dev.push_op(crate::encoder::Op::ClearColorRects(
-                    mtld3d_core::encoder_data::capture_op(crate::device::ClearColorRectsOp {
-                        r_bits,
-                        g_bits,
-                        b_bits,
-                        a_bits,
-                        srgb_write,
-                        rects,
-                    }),
-                ));
+                    rects,
+                });
             }
         }
     }
@@ -9005,15 +8949,11 @@ extern "system" fn device_clear(
         // exactly as they bound the colour clear: one scissored quad per rect.
         (Some(list), depth, stencil) => {
             if !list.is_empty() {
-                dev.push_op(crate::encoder::Op::ClearDepthStencilRects(
-                    mtld3d_core::encoder_data::capture_op(
-                        crate::device::ClearDepthStencilRectsOp {
-                            depth,
-                            stencil,
-                            list,
-                        },
-                    ),
-                ));
+                dev.push_control(crate::device::ClearDepthStencilRectsOp {
+                    depth,
+                    stencil,
+                    list,
+                });
             }
         }
         // The whole target, which D3D9 still bounds by the viewport. Both
@@ -9021,12 +8961,9 @@ extern "system" fn device_clear(
         // (or folds into one pair of load actions) rather than two:
         // shadow-volume renderers clear depth and stencil together between
         // lights.
-        (None, depth, stencil) => dev.push_op(crate::encoder::Op::ClearDepthStencil(
-            mtld3d_core::encoder_data::capture_op(crate::device::ClearDepthStencilOp {
-                depth,
-                stencil,
-            }),
-        )),
+        (None, depth, stencil) => {
+            dev.push_control(crate::device::ClearDepthStencilOp { depth, stencil });
+        }
     }
 
     0 // S_OK
@@ -9388,22 +9325,10 @@ extern "system" fn device_set_render_state(this: *mut c_void, state: u32, value:
                 crate::texture::flush_dirty_mips(inner, dev);
                 let info = inner.texture_info();
                 inner.mark_subresource_gpu_authoritative(0, 0);
-                dev.push_op(crate::encoder::Op::ResolveDynamicDepth(
-                    mtld3d_core::encoder_data::capture_op(crate::device::ResolveDynamicDepthOp {
-                        id,
-                        info,
-                    }),
-                ));
+                dev.push_control(crate::device::ResolveDynamicDepthOp { id, info });
             } else if !dynamic_depth {
                 let format = tex.metal_pixel_format();
-                dev.push_op(crate::encoder::Op::ResolveDepthTexture(
-                    mtld3d_core::encoder_data::capture_op(crate::device::ResolveDepthTextureOp {
-                        id,
-                        w,
-                        h,
-                        format,
-                    }),
-                ));
+                dev.push_control(crate::device::ResolveDepthTextureOp { id, w, h, format });
             }
         }
     }
@@ -10288,14 +10213,12 @@ fn materialise_index_backing(dev: &mut DeviceInner, ib: *mut Direct3DIndexBuffer
     );
     let read = Arc::new(AtomicU32::new(0));
     let done = Arc::clone(&read).into();
-    dev.push_op(crate::encoder::Op::ReadDeviceBuffer(
-        mtld3d_core::encoder_data::capture_op(crate::device::ReadDeviceBufferOp {
-            done,
-            buffer_id,
-            dst_ptr,
-            dst_len,
-        }),
-    ));
+    dev.push_control(crate::device::ReadDeviceBufferOp {
+        done,
+        buffer_id,
+        dst_ptr,
+        dst_len,
+    });
     // Submits the frame the copy rides and waits for the GPU to finish it,
     // which is what makes the destination pages readable here.
     if dev.mid_frame_submit_for_retention().is_err() {
@@ -10526,7 +10449,7 @@ fn snapshot_bound_vertex_source(dev: &DeviceInner) -> Option<VertexSource> {
     }
     Some(VertexSource::Bound {
         first: first?,
-        extra: extra.into_boxed_slice(),
+        extra: mtld3d_core::draw_data::ExtraStreams::Owned(extra.into_boxed_slice()),
         stream0_freq: bound.stream_freq(0),
     })
 }
@@ -10743,58 +10666,37 @@ fn clamp_const_rows(max_const_used: u32) -> u16 {
 /// records only the delta rather than bumping
 /// `vs_constants[..max_const_used]` per draw.
 pub fn propagate_vs_const_delta(dev: &mut DeviceInner, start_register: u32, slice: &[[f32; 4]]) {
-    let Some((start_row, rows, data)) = bump_const_delta(dev, start_register, slice) else {
-        return;
-    };
-    dev.current_frame.record_vs_constants(start_row, rows, data);
+    propagate_const_delta(
+        dev,
+        mtld3d_shared::encoder_protocol::EncoderOpcode::SetVsConstRange,
+        start_register,
+        slice,
+    );
 }
 
 pub fn propagate_ps_const_delta(dev: &mut DeviceInner, start_register: u32, slice: &[[f32; 4]]) {
-    let Some((start_row, rows, data)) = bump_const_delta(dev, start_register, slice) else {
-        return;
-    };
-    dev.current_frame.record_ps_constants(start_row, rows, data);
+    propagate_const_delta(
+        dev,
+        mtld3d_shared::encoder_protocol::EncoderOpcode::SetPsConstRange,
+        start_register,
+        slice,
+    );
 }
 
-/// Shared body for [`propagate_vs_const_delta`] / [`propagate_ps_const_delta`].
-///
-/// Clamps the (start, count) range to the
-/// 256-row mirror, bumps the bytes into the per-frame scratch arena,
-/// and returns `(start_row_u16, rows_u16, scratch_slice)` ready to fold
-/// into a `Set*ConstRange` op. Returns `None` when the input range is
-/// entirely outside the mirror (or empty after clamping); the caller
-/// then skips the op push.
-fn bump_const_delta(
+fn propagate_const_delta(
     dev: &mut DeviceInner,
+    opcode: mtld3d_shared::encoder_protocol::EncoderOpcode,
     start_register: u32,
     slice: &[[f32; 4]],
-) -> Option<(u16, u16, ScratchSlice)> {
+) {
     let start = start_register as usize;
     if start >= CONSTANT_ROWS || slice.is_empty() {
-        return None;
+        return;
     }
     let rows = (CONSTANT_ROWS - start).min(slice.len());
-    if rows == 0 {
-        return None;
-    }
-    // SAFETY: `[f32; 4]` is POD with no padding; reinterpreting the
-    // first `rows` entries as `rows * 16` bytes is sound, and the
-    // borrow lifetime is local to this function (consumed by
-    // `arena_alloc_bytes` below).
-    let bytes = unsafe {
-        core::slice::from_raw_parts(
-            slice.as_ptr().cast::<u8>(),
-            rows * core::mem::size_of::<[f32; 4]>(),
-        )
-    };
-    let scratch = dev.current_frame.scratch_mut();
-    // SAFETY: frame scratch remains immutable and retained through submit replay.
-    let data = unsafe { arena_alloc_bytes(scratch, bytes) };
-    // start ≤ CONSTANT_ROWS ≤ u16::MAX and rows ≤ CONSTANT_ROWS, so
-    // both fit `u16` trivially.
-    let start_row = u16::try_from(start).expect("start_row ≤ 256 fits u16");
-    let rows_u16 = u16::try_from(rows).expect("rows ≤ 256 fits u16");
-    Some((start_row, rows_u16, data))
+    let start_row = u16::try_from(start).expect("start row is within constant mirror");
+    dev.current_frame
+        .record_constant_source(opcode, start_row, &slice[..rows]);
 }
 
 /// Record changed state directly from the dirty-state builders.
@@ -10996,6 +10898,7 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
             unsafe { (*rt0).multi_sample() }
         };
         Some(RenderStateSnapshot {
+            reserved: 0,
             pipeline_rs,
             depth_scissor,
             depth_stencil_state,
@@ -11089,20 +10992,41 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
                 u64::from(key.tex_coord_count),
             );
             let max_row_count = dev.ff_state().ff_vs_row_count(&key);
-            Some(VsSource::FixedFunction { key, max_row_count })
+            Some(VsSource::FixedFunction(
+                mtld3d_core::draw_data::FixedVsSource {
+                    key,
+                    max_row_count,
+                    reserved: [0; 6],
+                },
+            ))
         } else {
             // SAFETY: non-null check; refcount holds it live.
             let vs_obj = unsafe { &*bound_vertex_shader };
-            Some(VsSource::Programmable {
-                vs_id: vs_obj.shader_id(),
-                max_const_used: clamp_const_rows(vs_obj.max_const_used()),
-                uses_rel_const: vs_obj.uses_rel_const(),
-                provided_input_mask: dev.cached_vs_provided_mask,
-                uses_int_const: vs_obj.uses_int_const(),
-                uses_bool_const: vs_obj.uses_bool_const(),
-                clip_plane_count: mtld3d_core::vs_draw::clip_plane_count(rs),
-                sampler_kinds: dev.vertex_texture_kinds(),
-            })
+            Some(VsSource::Programmable(
+                mtld3d_core::draw_data::ProgrammableVsSource {
+                    vs_id: vs_obj.shader_id(),
+                    max_const_used: clamp_const_rows(vs_obj.max_const_used()),
+
+                    provided_input_mask: dev.cached_vs_provided_mask,
+
+                    clip_plane_count: mtld3d_core::vs_draw::clip_plane_count(rs),
+                    sampler_kinds: dev.vertex_texture_kinds(),
+
+                    flags: (if vs_obj.uses_rel_const() {
+                        mtld3d_core::draw_data::ShaderSourceFlags::RELATIVE
+                    } else {
+                        mtld3d_core::draw_data::ShaderSourceFlags::empty()
+                    }) | (if vs_obj.uses_int_const() {
+                        mtld3d_core::draw_data::ShaderSourceFlags::INTEGER
+                    } else {
+                        mtld3d_core::draw_data::ShaderSourceFlags::empty()
+                    }) | (if vs_obj.uses_bool_const() {
+                        mtld3d_core::draw_data::ShaderSourceFlags::BOOLEAN
+                    } else {
+                        mtld3d_core::draw_data::ShaderSourceFlags::empty()
+                    }),
+                },
+            ))
         }
     } else {
         None
@@ -11114,22 +11038,42 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
             let key = dev.ff_state().build_ps_key(rs, bound_mask);
             let sampled_stage_mask = key.sampled_stage_mask();
             let constant_rows = key.constant_rows();
-            Some(PsSource::FixedFunction {
-                key,
-                sampled_stage_mask,
-                constant_rows,
-            })
+            Some(PsSource::FixedFunction(
+                mtld3d_core::draw_data::FixedPsSource {
+                    key,
+                    sampled_stage_mask,
+                    constant_rows,
+
+                    reserved: [0; 3],
+                },
+            ))
         } else {
             // SAFETY: non-null check; refcount holds it live.
             let ps_obj = unsafe { &*bound_pixel_shader };
-            Some(PsSource::Programmable {
-                ps_id: ps_obj.shader_id(),
-                max_const_used: clamp_const_rows(ps_obj.max_const_used()),
-                uses_bump_env: ps_obj.uses_bump_env(),
-                uses_int_const: ps_obj.uses_int_const(),
-                uses_bool_const: ps_obj.uses_bool_const(),
-                color_out_mask: ps_obj.color_out_mask(),
-            })
+            Some(PsSource::Programmable(
+                mtld3d_core::draw_data::ProgrammablePsSource {
+                    ps_id: ps_obj.shader_id(),
+                    max_const_used: clamp_const_rows(ps_obj.max_const_used()),
+
+                    color_out_mask: ps_obj.color_out_mask(),
+
+                    flags: (if ps_obj.uses_int_const() {
+                        mtld3d_core::draw_data::ShaderSourceFlags::INTEGER
+                    } else {
+                        mtld3d_core::draw_data::ShaderSourceFlags::empty()
+                    }) | (if ps_obj.uses_bool_const() {
+                        mtld3d_core::draw_data::ShaderSourceFlags::BOOLEAN
+                    } else {
+                        mtld3d_core::draw_data::ShaderSourceFlags::empty()
+                    }) | (if ps_obj.uses_bump_env() {
+                        mtld3d_core::draw_data::ShaderSourceFlags::BUMP_ENV
+                    } else {
+                        mtld3d_core::draw_data::ShaderSourceFlags::empty()
+                    }),
+
+                    reserved: [0; 4],
+                },
+            ))
         }
     } else {
         None
@@ -11171,100 +11115,82 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
         // The existing section builders clone only the FF key they consume.
         let key_ref = vs_value.as_ref().or(dev.snapshot_cache.vs.as_ref());
         let key = match key_ref {
-            Some(VsSource::FixedFunction { key, .. }) => key.clone(),
+            Some(VsSource::FixedFunction(value)) => value.key.clone(),
             _ => dev
                 .ff_state()
                 .build_vs_key(rs, dev.cached_ff_vs_layout, bound_mask),
         };
         let ff_dirty = dev.ff_state.take_ff_vs_dirty();
         if !ff_dirty.is_empty() {
-            // Each set bit emits one `Op::SetFfVsConstRange` for its
-            // owning section. The encoder mirror persists across
-            // frames; rows untouched by a given emit retain their
-            // previously-written values, so unchanged sections don't
-            // need to re-bump.
-            //
-            // SAFETY contract for every section helper below: the
-            // returned `*mut u8` points into the per-frame scratch
-            // arena and stays alive until end-of-frame. `ScratchSlice`
-            // wraps it; the encoder copies the bytes into
-            // `ff_vs_constants_mirror` at `apply_ff_vs_const_range`
-            // time. Per-draw isolation is preserved by
-            // `ff_vs_const_scratch` bumping a fresh slice from the
-            // mirror after every apply.
-            let push_section =
-                |frame: &mut crate::encoder::FrameData, start_row: u16, rows: u16, ptr: *mut u8| {
-                    let nn = NonNull::new(ptr).expect("ScratchArena alloc returned non-null");
-                    let byte_len = u32::from(rows) * 16;
-                    // SAFETY: frame scratch remains immutable and retained through submit replay.
-                    let data = unsafe { ScratchSlice::from_raw_parts(nn, byte_len) };
-                    frame.record_ff_vs_constants(start_row, rows, data);
-                };
-
             if key.has_rhw() {
-                // XYZRHW: only row 0 (viewport) matters. Other sections
-                // are never read by the shader on this path; their
-                // dirty bits, if set, are absorbed without emit since
-                // `take_ff_vs_dirty` already cleared the mask.
                 let v = dev.viewport();
                 let to_f32 = |n: u32| {
                     f32::from(u16::try_from(n).expect("D3D9 viewport dim ≤ 16384 fits u16"))
                 };
                 let viewport = (to_f32(v.x), to_f32(v.y), to_f32(v.width), to_f32(v.height));
-                let ptr = FfState::build_xyzrhw_row(viewport, dev.current_frame.scratch_mut());
-                push_section(&mut dev.current_frame, 0, 1, ptr);
+                dev.current_frame
+                    .record_ff_vs_destination(0, 1, |destination| {
+                        FfState::fill_xyzrhw_row(viewport, destination);
+                    });
             } else {
                 if ff_dirty.contains(FfVsDirty::WV) {
-                    let (s, r, p) = dev
-                        .ff_state
-                        .build_wv_section(dev.current_frame.scratch_mut());
-                    push_section(&mut dev.current_frame, s, r, p);
+                    dev.current_frame
+                        .record_ff_vs_destination(0, 4, |destination| {
+                            dev.ff_state.fill_wv_section(destination);
+                        });
                 }
                 if ff_dirty.contains(FfVsDirty::PROJ) {
-                    let (s, r, p) = dev
-                        .ff_state
-                        .build_proj_section(dev.current_frame.scratch_mut());
-                    push_section(&mut dev.current_frame, s, r, p);
+                    dev.current_frame
+                        .record_ff_vs_destination(4, 4, |destination| {
+                            dev.ff_state.fill_proj_section(destination);
+                        });
                 }
                 if ff_dirty.contains(FfVsDirty::FOG) {
-                    let (s, r, p) = FfState::build_fog_section(
-                        rs,
-                        key.fog_mode,
-                        dev.current_frame.scratch_mut(),
-                    );
-                    push_section(&mut dev.current_frame, s, r, p);
+                    dev.current_frame
+                        .record_ff_vs_destination(8, 1, |destination| {
+                            FfState::fill_fog_section(rs, key.fog_mode, destination);
+                        });
                 }
                 if ff_dirty.contains(FfVsDirty::AMBIENT) {
-                    let (s, r, p) =
-                        FfState::build_ambient_section(rs, dev.current_frame.scratch_mut());
-                    push_section(&mut dev.current_frame, s, r, p);
+                    dev.current_frame
+                        .record_ff_vs_destination(9, 1, |destination| {
+                            FfState::fill_ambient_section(rs, destination);
+                        });
                 }
                 if ff_dirty.contains(FfVsDirty::MATERIAL) {
-                    let (s, r, p) = dev
-                        .ff_state
-                        .build_material_section(&key, dev.current_frame.scratch_mut());
-                    push_section(&mut dev.current_frame, s, r, p);
+                    let rows = FfState::material_section_rows(&key);
+                    dev.current_frame
+                        .record_ff_vs_destination(10, rows, |destination| {
+                            dev.ff_state.fill_material_section(&key, destination);
+                        });
                 }
-                if ff_dirty.contains(FfVsDirty::LIGHTS)
-                    && let Some((s, r, p)) = dev
-                        .ff_state
-                        .build_lights_section(&key, dev.current_frame.scratch_mut())
-                {
-                    push_section(&mut dev.current_frame, s, r, p);
+                if ff_dirty.contains(FfVsDirty::LIGHTS) {
+                    let rows = FfState::lights_section_rows(&key);
+                    if rows != 0 {
+                        dev.current_frame
+                            .record_ff_vs_destination(15, rows, |destination| {
+                                dev.ff_state.fill_lights_section(&key, destination);
+                            });
+                    }
                 }
-                if ff_dirty.contains(FfVsDirty::TT)
-                    && let Some((s, r, p)) = dev
-                        .ff_state
-                        .build_tt_section(dev.current_frame.scratch_mut())
-                {
-                    push_section(&mut dev.current_frame, s, r, p);
+                if ff_dirty.contains(FfVsDirty::TT) {
+                    let rows = dev.ff_state.tt_section_rows();
+                    if rows != 0 {
+                        dev.current_frame
+                            .record_ff_vs_destination(63, rows, |destination| {
+                                dev.ff_state.fill_tt_section(destination);
+                            });
+                    }
                 }
-                if ff_dirty.contains(FfVsDirty::PALETTE)
-                    && let Some((s, r, p)) = dev
-                        .ff_state
-                        .build_palette_section(&key, dev.current_frame.scratch_mut())
-                {
-                    push_section(&mut dev.current_frame, s, r, p);
+                if ff_dirty.contains(FfVsDirty::PALETTE) {
+                    let rows = dev.ff_state.palette_section_rows(&key);
+                    if rows != 0 {
+                        dev.current_frame.record_ff_vs_destination(
+                            mtld3d_core::ff_state::FF_VS_PALETTE_BASE_ROW,
+                            rows,
+                            |destination| dev.ff_state.fill_palette_section(&key, destination),
+                        );
+                    }
                 }
             }
         }
@@ -11277,7 +11203,7 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
     // the encoder mirror; only FF runs here.
     let ps_rows = if dirty.contains(SnapshotDirty::PS_CONST) && bound_pixel_shader.is_null() {
         match ps_value.as_ref().or(dev.snapshot_cache.ps.as_ref()) {
-            Some(PsSource::FixedFunction { constant_rows, .. }) => *constant_rows,
+            Some(PsSource::FixedFunction(value)) => value.constant_rows,
             _ => 0,
         }
     } else {
@@ -11459,8 +11385,8 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
                 used_streams: resolved.used_streams,
                 vdecl_hash: *hash,
             }),
-        vs: vs_value.as_ref(),
-        ps: ps_value.as_ref(),
+        vs: vs_value.as_ref().map(VsSource::as_view),
+        ps: ps_value.as_ref().map(PsSource::as_view),
         variant: variant_value,
         bytes,
         depth_stencil: depth_stencil_value,
@@ -12260,11 +12186,9 @@ struct CreatedNativeShader {
 
 impl CreatedNativeShader {
     fn adopt(&mut self, dev: &mut DeviceInner) -> Result<(), i32> {
-        dev.try_push_op(Op::AdoptProgram(mtld3d_core::encoder_data::capture_op(
-            mtld3d_core::encoder_data::AdoptProgramOp {
-                registration: self.registration,
-            },
-        )))
+        dev.try_push_control(mtld3d_core::encoder_data::AdoptProgramOp {
+            registration: self.registration,
+        })
         .map_err(|error| {
             error!(target: LOG_TARGET, "shader creation: cannot record adoption: {error:?}");
             mtld3d_types::E_OUTOFMEMORY

@@ -205,6 +205,7 @@ enum Specialization {
 
 fn encode_variant(variant: VariantKey, out: &mut Vec<u8>) {
     let VariantKey {
+        reserved: _,
         alpha_func,
         fog_mode,
         fog_table_mode,
@@ -237,6 +238,7 @@ fn encode_variant(variant: VariantKey, out: &mut Vec<u8>) {
 
 fn decode_variant(reader: &mut RecipeReader<'_>) -> Option<VariantKey> {
     Some(VariantKey {
+        reserved: 0,
         alpha_func: reader.u8()?,
         fog_mode: reader.u8()?,
         fog_table_mode: reader.u8()?,

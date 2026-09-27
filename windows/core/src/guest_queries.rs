@@ -79,10 +79,18 @@ impl GuestQueryLease {
 ///
 /// Each descriptor is adopted once. Repeated operations use distinct leases even when their
 /// mailbox addresses agree. No Arc representation or destructor crosses the boundary.
+#[repr(C, align(8))]
 pub struct GuestQueryDescriptor {
     mailbox: u64,
     completion: u64,
 }
+
+const _: () = {
+    assert!(size_of::<GuestQueryDescriptor>() == 16);
+    assert!(align_of::<GuestQueryDescriptor>() == 8);
+    assert!(core::mem::offset_of!(GuestQueryDescriptor, mailbox) == 0);
+    assert!(core::mem::offset_of!(GuestQueryDescriptor, completion) == 8);
+};
 
 impl GuestQueryDescriptor {
     /// Exact fixed-width descriptor fields used by packet publication validation.
@@ -91,7 +99,7 @@ impl GuestQueryDescriptor {
         [self.mailbox, self.completion]
     }
 
-    const fn into_parts(self) -> (u64, u64) {
+    const fn parts(&self) -> (u64, u64) {
         (self.mailbox, self.completion)
     }
 
@@ -146,10 +154,11 @@ impl QueryLeaseCache {
     /// Rejects invalid numeric address ranges before accessing either cell.
     pub unsafe fn adopt(
         &mut self,
-        descriptor: GuestQueryDescriptor,
+        descriptor: impl core::borrow::Borrow<GuestQueryDescriptor>,
     ) -> Result<Arc<VisibilityQueryCore>, WireError> {
+        let descriptor = descriptor.borrow();
         descriptor.validate()?;
-        let (mailbox, completion_address) = descriptor.into_parts();
+        let (mailbox, completion_address) = descriptor.parts();
         if let Some(core) = self.cores.get(&mailbox).and_then(Weak::upgrade) {
             // SAFETY: this distinct lease's cell is retained by PE. The upgraded native core
             // already pins the original mailbox through its first lease, so this lease can end.

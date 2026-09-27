@@ -14,34 +14,34 @@ use mtld3d_shared::{
 };
 
 use super::{
-    FrameEncoder, FrameEncoderFlags, PendingResourceRetention, TextureUploadJob,
-    destroy_resources_bulk,
+    FrameEncoder, FrameEncoderFlags, PendingResourceRetention, destroy_resources_bulk,
+    upload_view::{TextureView, UploadView},
 };
 
 impl FrameEncoder {
     /// Convert one packed rectangle and enqueue both native planes atomically.
-    pub fn run_depth_upload_blit(
+    pub(super) fn run_depth_upload_blit(
         &mut self,
-        job: &TextureUploadJob,
+        job: &UploadView<'_>,
         texture: u64,
         format: &PackedDepth,
     ) -> bool {
         let Some(layout) = PlaneLayout::new(
-            job.region_w,
-            job.region_h,
+            job.region_w(),
+            job.region_h(),
             self.gpu_caps.min_linear_texture_align,
         ) else {
             log::error!(target: super::LOG_TARGET, "depth upload: plane geometry overflow");
             return false;
         };
-        let Some(offset) = (job.origin_y as usize)
-            .checked_mul(job.src_pitch as usize)
-            .and_then(|n| n.checked_add(job.origin_x as usize * format.bytes_per_pixel()))
+        let Some(offset) = (job.origin_y() as usize)
+            .checked_mul(job.src_pitch() as usize)
+            .and_then(|n| n.checked_add(job.origin_x() as usize * format.bytes_per_pixel()))
         else {
             log::error!(target: super::LOG_TARGET, "depth upload: packed offset overflow");
             return false;
         };
-        let Some(source) = job.staging.backing().as_slice().get(offset..) else {
+        let Some(source) = job.staging().backing().as_slice().get(offset..) else {
             log::error!(target: super::LOG_TARGET, "depth upload: packed offset outside staging");
             return false;
         };
@@ -52,7 +52,7 @@ impl FrameEncoder {
         if !layout.unpack(
             format,
             source,
-            job.src_pitch as usize,
+            job.src_pitch() as usize,
             depth.as_mut_slice(),
             stencil.as_mut().map_or(&mut [], PageBox::as_mut_slice),
         ) {
@@ -76,7 +76,7 @@ impl FrameEncoder {
             .map(|(page, _, _)| BufferCreateDesc {
                 backing_ptr: page.as_ptr() as u64,
                 length: page.len() as u64,
-                id: job.info.texture_id.raw(),
+                id: job.info().texture_id().raw(),
                 storage_mode: buffer_storage_mode(self.gpu_caps.unified_memory),
                 kind: BufferKind::Repack,
             })
@@ -108,11 +108,11 @@ impl FrameEncoder {
                 bytes_per_row: u32::try_from(pitch).expect("depth plane pitch fits u32"),
                 texture_handle: texture,
                 destination_slice: 0,
-                mip_level: job.level,
-                origin_x: job.origin_x,
-                origin_y: job.origin_y,
-                region_w: job.region_w,
-                region_h: job.region_h,
+                mip_level: job.level(),
+                origin_x: job.origin_x(),
+                origin_y: job.origin_y(),
+                region_w: job.region_w(),
+                region_h: job.region_h(),
                 depth: 1,
                 bytes_per_image: 0,
             });
@@ -140,7 +140,7 @@ impl FrameEncoder {
         }
         self.current_blit_retention
             .push(PageBoxRead::new(std::sync::Arc::clone(
-                job.staging.backing(),
+                job.staging().backing(),
             )));
         self.perf.bump_texture_blit_upload();
         true
@@ -242,8 +242,24 @@ impl FrameEncoder {
         true
     }
 
+    /// Resolve dynamic depth using the borrowed destination description.
+    ///
     /// Queue a common-plane transfer without making CPU staging authoritative.
-    pub fn resolve_dynamic_depth(&mut self, destination: u64, info: &super::TextureInfo) {
+    ///
+    /// # Errors
+    /// Rejects invalid destination texture fields.
+    pub fn resolve_dynamic_depth_record(
+        &mut self,
+        destination: u64,
+        info: &mtld3d_core::encoder_records::TextureRecord,
+    ) -> Result<(), mtld3d_shared::encoder_wire::WireError> {
+        let view = TextureView::Record(info);
+        view.validate()?;
+        self.resolve_dynamic_depth_view(destination, &view);
+        Ok(())
+    }
+
+    fn resolve_dynamic_depth_view(&mut self, destination: u64, info: &TextureView<'_>) {
         let source = self.pass_state.current_depth_texture();
         if source.is_null() || destination == 0 {
             mtld3d_shared::log_once_warn!(target: super::LOG_TARGET, "dynamic depth transfer: missing endpoint");
@@ -264,8 +280,8 @@ impl FrameEncoder {
             source_format,
             source_samples: self.pass_state.current_depth_sample_count(),
             destination,
-            destination_size: (info.width, info.height),
-            destination_format: info.pixel_format,
+            destination_size: (info.width(), info.height()),
+            destination_format: info.pixel_format(),
         });
     }
 }

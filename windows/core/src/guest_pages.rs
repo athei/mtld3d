@@ -165,6 +165,7 @@ impl GuestPageLease {
 /// All addresses are `u64` regardless of guest pointer width. Lengths count bytes. `read_acquired`
 /// is zero for ownership-only publication; otherwise it addresses a separate acquisition cell.
 /// A descriptor has exactly one terminal consumer: native adoption or cancellation.
+#[repr(C, align(8))]
 pub struct GuestPageDescriptor {
     source: u64,
     padded_len: u64,
@@ -174,6 +175,18 @@ pub struct GuestPageDescriptor {
     completion: u64,
     read_acquired: u64,
 }
+
+const _: () = {
+    assert!(size_of::<GuestPageDescriptor>() == 56);
+    assert!(align_of::<GuestPageDescriptor>() == 8);
+    assert!(core::mem::offset_of!(GuestPageDescriptor, source) == 0);
+    assert!(core::mem::offset_of!(GuestPageDescriptor, padded_len) == 8);
+    assert!(core::mem::offset_of!(GuestPageDescriptor, logical_len) == 16);
+    assert!(core::mem::offset_of!(GuestPageDescriptor, generation) == 24);
+    assert!(core::mem::offset_of!(GuestPageDescriptor, readers) == 32);
+    assert!(core::mem::offset_of!(GuestPageDescriptor, completion) == 40);
+    assert!(core::mem::offset_of!(GuestPageDescriptor, read_acquired) == 48);
+};
 
 impl GuestPageDescriptor {
     /// Exact fixed-width descriptor fields used by packet publication validation.
@@ -201,12 +214,12 @@ impl GuestPageDescriptor {
     /// # Errors
     ///
     /// Rejects invalid descriptor ranges or a descriptor that requests a read handoff.
-    pub unsafe fn adopt_owned(self) -> Result<PageBox, WireError> {
+    pub unsafe fn adopt_owned(&self) -> Result<PageBox, WireError> {
         if self.read_acquired != 0 {
             return Err(WireError::InvalidValue);
         }
         // SAFETY: the caller supplies the unique retained lease and access contract above.
-        unsafe { self.into_page() }
+        unsafe { self.adopt_page() }
     }
 
     /// Adopt shared ownership without treating a cached wrapper as a read.
@@ -219,7 +232,7 @@ impl GuestPageDescriptor {
     /// # Errors
     ///
     /// Rejects the same invalid ranges and read handoff as `adopt_owned`.
-    pub unsafe fn adopt_shared(self) -> Result<Arc<PageBox>, WireError> {
+    pub unsafe fn adopt_shared(&self) -> Result<Arc<PageBox>, WireError> {
         // SAFETY: the caller supplies the same retained lease required by adopt_owned.
         unsafe { self.adopt_owned() }.map(Arc::new)
     }
@@ -239,7 +252,7 @@ impl GuestPageDescriptor {
     /// # Panics
     ///
     /// Panics if the allocation's shared reader count is exhausted.
-    pub unsafe fn adopt_read(self) -> Result<PageBoxRead, WireError> {
+    pub unsafe fn adopt_read(&self) -> Result<PageBoxRead, WireError> {
         if self.read_acquired == 0 {
             return Err(WireError::InvalidValue);
         }
@@ -247,7 +260,7 @@ impl GuestPageDescriptor {
         // SAFETY: validation checks alignment and the caller retains this initialized cell.
         let acquired = unsafe { InPtr::<LeaseCompletion>::new(self.read_acquired as *const _) };
         // SAFETY: the caller retains the sole lease and its original read until acquisition.
-        let backing = Arc::new(unsafe { self.into_page()? });
+        let backing = Arc::new(unsafe { self.adopt_page()? });
         let read = PageBoxRead::new(backing);
         acquired.publish();
         Ok(read)
@@ -276,7 +289,7 @@ impl GuestPageDescriptor {
         Ok(())
     }
 
-    unsafe fn into_page(self) -> Result<PageBox, WireError> {
+    unsafe fn adopt_page(&self) -> Result<PageBox, WireError> {
         self.validate()?;
         let source = NonNull::new(self.source as *mut u8).ok_or(WireError::InvalidValue)?;
         // SAFETY: validate checks the fixed-layout cell, and adoption retains it until final drop.

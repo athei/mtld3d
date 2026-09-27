@@ -622,6 +622,13 @@ pub struct UploadTextureOp {
     pub job: TextureUploadJob,
 }
 
+pub struct StageUploadOp {
+    pub buffer_id: BufferId,
+    pub page_box: PageBox,
+    pub dst_offset: u32,
+    pub size: u32,
+}
+
 pub struct SetDumpDrawOp {
     pub seq: u32,
 }
@@ -950,23 +957,6 @@ pub struct StagingWarmupEntry {
 pub struct FrameData {
     pub recorder: Option<crate::encoder_packet::FrameRecorder>,
     pub ops: Vec<Op>,
-    /// Texture creates pushed by the API thread at `IDirect3DDevice9::CreateTexture` time.
-    ///
-    /// Drained into one batched `CreateTexturesBatch` thunk at the head of
-    /// `run_frame` so the `MTLTexture` exists before any draw operation
-    /// references it.
-    pub pending_texture_warmups: Vec<TextureInfo>,
-    /// VB/IB wraps pushed at `CreateVertexBuffer` / `CreateIndexBuffer` time.
-    ///
-    /// Drained alongside the texture warmups via one batched
-    /// `CreateBuffersBatch` thunk.
-    pub pending_buffer_warmups: Vec<VbibWarmupEntry>,
-    /// Per-mip staging `MTLBuffer` wraps pushed alongside texture warmups.
-    ///
-    /// One per mip for non-RT / non-depth / non-expansion textures. Drained
-    /// after `drain_texture_warmups` so the `texture_cache` slot already
-    /// exists.
-    pub pending_staging_warmups: Vec<StagingWarmupEntry>,
     pub device_handle: MetalHandle<MTLDeviceKind>,
     pub record_handle: DeviceRecordHandle,
     pub backbuffer_handle: MetalHandle<MTLTextureKind>,
@@ -1010,15 +1000,6 @@ pub struct FrameData {
     ///
     /// See [`FrameDataFlags`].
     pub flags: FrameDataFlags,
-    /// All per-frame telemetry drained from `ApiPerfState` by `DeviceInner::present`.
-    ///
-    /// Plus the `present_block_cycles` field set on the *next* frame right
-    /// after `send_frame` returns. See `crate::perf::FramePerfPayload`.
-    pub perf: FramePerfPayload,
-    /// Per-frame VB/IB backings + submit seqs queued for GPU-retire-gated destruction.
-    ///
-    /// Destroyed on the encoder thread; consumed in `begin_frame`.
-    pub vbib_retentions: Vec<PendingVbibRetention>,
     /// Monotonic submit seq stamped by `DeviceInner::present` before the encoder handoff.
     ///
     /// Carried into `SubmitFrameParams` so the unix `addCompletedHandler`
@@ -1051,25 +1032,6 @@ pub struct FrameData {
     /// Same lifetime guarantee as `coherent_seq_ptr`. The encoder
     /// `fetch_add`/`fetch_sub`s it as `PageBox`es enter/leave retention.
     pub retained_bytes_ptr: u64,
-    /// `Some(v)` if `IDirect3DDevice9::Reset` changed `PresentationInterval` since the last frame.
-    ///
-    /// Put here by `stamp_and_swap` on the frame it hands to the encoder, so
-    /// the Present that follows the Reset is the one that carries it. The
-    /// encoder applies it via `SetDisplaySyncEnabledParams` at the top of
-    /// `run_frame` so the new pacing takes effect on this frame's
-    /// `nextDrawable`, matching the spec's "next Present" timing rather than
-    /// the previous behaviour of mutating the layer property synchronously
-    /// from the API thread mid-frame. The ceiling it carries is the effective
-    /// one, the interval's folded with `present.maxFps`.
-    pub apply_pacing: Option<LayerPacing>,
-    /// `Some(t)` if `SetGammaRamp` changed what the layer should carry since the last frame.
-    ///
-    /// `Some(Some(table))` applies that table, `Some(None)` removes the one
-    /// the layer has. Put here by `stamp_and_swap`, like `apply_pacing`, and
-    /// sent by the encoder at the top of `run_frame` so the ramp is live for
-    /// this frame's own present rather than the one after it. A `Box` so a
-    /// frame carrying no change costs a pointer.
-    pub apply_gamma: Option<crate::gamma::Change>,
     /// API-thread bump arena.
     ///
     /// Used by `snapshot_shared` to allocate per-draw VS/PS constants +
@@ -1174,9 +1136,6 @@ impl FrameData {
             recorder: None,
             replay_completion: None,
             ops: Vec::new(),
-            pending_texture_warmups: Vec::new(),
-            pending_buffer_warmups: Vec::new(),
-            pending_staging_warmups: Vec::new(),
             device_handle: init.device_handle,
             record_handle: init.record_handle,
             backbuffer_handle: init.backbuffer_handle,
@@ -1197,15 +1156,11 @@ impl FrameData {
             } else {
                 FrameDataFlags::empty()
             },
-            perf: FramePerfPayload::new(),
-            vbib_retentions: Vec::new(),
             submit_seq: 0,
             coherent_seq_ptr: 0,
             upload_coherent_seq_ptr: 0,
             failed_submit_seq_ptr: 0,
             retained_bytes_ptr: 0,
-            apply_pacing: None,
-            apply_gamma: None,
             scratch: ScratchArena::new(),
             op_vec_realloc_bytes: 0,
         }
@@ -1256,13 +1211,25 @@ impl FrameData {
         self.backbuffer_format
     }
 
-    #[must_use]
-    pub const fn perf(&self) -> &FramePerfPayload {
-        &self.perf
+    /// Return retired frame storage after all borrowed frame values have been consumed.
+    pub fn take_recording_scratch(&mut self) -> ScratchArena {
+        self.scratch.clear();
+        core::mem::take(&mut self.scratch)
     }
 
+    #[must_use]
+    pub const fn perf(&self) -> &FramePerfPayload {
+        self.scratch.perf()
+    }
+
+    #[cfg(perf_tracking)]
+    pub fn perf_mut(&mut self) -> &mut FramePerfPayload {
+        self.scratch.perf_mut()
+    }
+
+    #[cfg(not(perf_tracking))]
     pub const fn perf_mut(&mut self) -> &mut FramePerfPayload {
-        &mut self.perf
+        self.scratch.perf_mut()
     }
 
     pub const fn set_no_present(&mut self, no_present: bool) {
@@ -1325,6 +1292,22 @@ impl FrameData {
             .recorder
             .get_or_insert_with(crate::encoder_packet::FrameRecorder::new)
             .record_snapshot_delta(&mut self.scratch, delta);
+    }
+
+    /// Capture a typed control without constructing the operation enum on the API path.
+    ///
+    /// # Errors
+    /// Returns the frame's capture error.
+    pub fn try_push_control<T: crate::encoder_packet::CaptureControl>(
+        &mut self,
+        value: T,
+    ) -> Result<(), mtld3d_shared::encoder_wire::WireError> {
+        if let Some(recorder) = &mut self.recorder {
+            recorder.record_typed(&mut self.scratch, value)
+        } else {
+            self.ops.push(value.into_rejected());
+            Ok(())
+        }
     }
 
     pub fn push_op(&mut self, op: Op) {
@@ -1431,6 +1414,40 @@ impl FrameData {
         });
     }
 
+    /// Capture API constant rows directly into the command payload.
+    pub fn record_constant_source(
+        &mut self,
+        opcode: mtld3d_shared::encoder_protocol::EncoderOpcode,
+        start_row: u16,
+        rows: &[[f32; 4]],
+    ) {
+        let count = u16::try_from(rows.len()).unwrap_or(u16::MAX);
+        // SAFETY: f32 rows have no padding and every supported runtime is little endian.
+        let bytes = unsafe {
+            core::slice::from_raw_parts(rows.as_ptr().cast::<u8>(), core::mem::size_of_val(rows))
+        };
+        let _ = self
+            .recorder
+            .get_or_insert_with(crate::encoder_packet::FrameRecorder::new)
+            .record_constant_bytes(&mut self.scratch, opcode, start_row, count, bytes);
+    }
+
+    /// Build FF rows once in their final command allocation.
+    pub fn record_ff_vs_destination(
+        &mut self,
+        start_row: u16,
+        rows: u16,
+        fill: impl FnOnce(&mut [core::mem::MaybeUninit<[f32; 4]>]),
+    ) {
+        let _ = self
+            .recorder
+            .get_or_insert_with(crate::encoder_packet::FrameRecorder::new)
+            .record_ff_vs_destination(&mut self.scratch, start_row, rows, |destination| {
+                fill(destination);
+                Ok(())
+            });
+    }
+
     #[must_use]
     pub fn recording_error(&self) -> Option<mtld3d_shared::encoder_wire::WireError> {
         self.recorder
@@ -1477,8 +1494,12 @@ impl FrameData {
     /// Called from `stamp_and_swap` for the frame being handed to the
     /// encoder. `None` is the normal case and leaves the frame carrying
     /// nothing.
-    pub const fn set_apply_pacing(&mut self, pacing: Option<LayerPacing>) {
-        self.apply_pacing = pacing;
+    pub fn set_apply_pacing(&mut self, pacing: Option<LayerPacing>) {
+        if let Some(pacing) = pacing {
+            self.recorder
+                .get_or_insert_with(crate::encoder_packet::FrameRecorder::new)
+                .capture_pacing(&mut self.scratch, self.layer_handle.raw(), pacing);
+        }
     }
 
     /// Put a queued gamma-ramp change on this frame.
@@ -1486,7 +1507,11 @@ impl FrameData {
     /// Called from `stamp_and_swap` for the frame being handed to the
     /// encoder, the same way the queued pacing is.
     pub fn set_apply_gamma(&mut self, change: Option<crate::gamma::Change>) {
-        self.apply_gamma = change;
+        if let Some(change) = change {
+            self.recorder
+                .get_or_insert_with(crate::encoder_packet::FrameRecorder::new)
+                .capture_gamma(&mut self.scratch, self.layer_handle.raw(), change);
+        }
     }
 
     /// Drain the per-frame `Vec<Op>` realloc-byte counter into the caller and zero it.
@@ -1500,8 +1525,10 @@ impl FrameData {
     /// Queue a texture for eager `MTLTexture` creation at the head of the next `run_frame`.
     ///
     /// Called from `IDirect3DDevice9::CreateTexture` on the API thread.
-    pub fn push_texture_warmup(&mut self, info: TextureInfo) {
-        self.pending_texture_warmups.push(info);
+    pub fn push_texture_warmup(&mut self, info: &TextureInfo) {
+        self.recorder
+            .get_or_insert_with(crate::encoder_packet::FrameRecorder::new)
+            .capture_texture_warmup(&mut self.scratch, info);
     }
 
     /// Queue a VB/IB for eager `MTLBuffer` wrap at the head of the next `run_frame`.
@@ -1509,7 +1536,9 @@ impl FrameData {
     /// Called from `CreateVertexBuffer` / `CreateIndexBuffer` on the API
     /// thread.
     pub fn push_buffer_warmup(&mut self, entry: VbibWarmupEntry) {
-        self.pending_buffer_warmups.push(entry);
+        self.recorder
+            .get_or_insert_with(crate::encoder_packet::FrameRecorder::new)
+            .capture_buffer_warmup(&mut self.scratch, entry);
     }
 
     /// Queue a texture-staging `MTLBuffer` wrap.
@@ -1517,11 +1546,15 @@ impl FrameData {
     /// Called per mip from `IDirect3DDevice9::CreateTexture` on the API
     /// thread for textures that go through the blit-upload path.
     pub fn push_staging_warmup(&mut self, entry: StagingWarmupEntry) {
-        self.pending_staging_warmups.push(entry);
+        self.recorder
+            .get_or_insert_with(crate::encoder_packet::FrameRecorder::new)
+            .capture_staging_warmup(&mut self.scratch, entry);
     }
 
-    pub fn set_vbib_retentions(&mut self, retentions: Vec<PendingVbibRetention>) {
-        self.vbib_retentions = retentions;
+    pub fn push_vbib_retention(&mut self, entry: PendingVbibRetention) {
+        self.recorder
+            .get_or_insert_with(crate::encoder_packet::FrameRecorder::new)
+            .capture_vbib_retention(&mut self.scratch, entry);
     }
 }
 

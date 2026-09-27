@@ -4,12 +4,12 @@
 //! replay and every borrowed resource lease acknowledge completion.
 
 use std::sync::{
-    Mutex,
-    atomic::{AtomicI32, AtomicU32, Ordering},
+    Arc, Mutex,
+    atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering},
 };
 
 pub use mtld3d_core::encoder_data::{
-    ColorFillTarget, DepthTransfer, FrameData, FrameDataFlags, FrameInit, Op, ResampledUpload,
+    ColorFillTarget, DepthTransfer, FrameData, FrameDataFlags, FrameInit, ResampledUpload,
     RetiredColorTarget, StagingWarmupEntry, SubmitFence, TextureInfo, TextureUploadJob,
     VbibWarmupEntry,
 };
@@ -30,6 +30,7 @@ use mtld3d_shared::{
     },
     encoder_wire::FrameSlab,
     mtl_handle::MTLDeviceKind,
+    record_handle::DeviceRecordHandle,
     shader_create::CancelShaderProgramParams,
 };
 use mtld3d_types::{D3D_OK, D3DERR_DEVICELOST, E_OUTOFMEMORY};
@@ -111,8 +112,52 @@ impl LeaseRegistry {
     }
 }
 
+/// PE owners of counters borrowed by native workers for the runtime's lifetime.
+pub struct EncoderCounters {
+    coherent_seq: Arc<AtomicU64>,
+    upload_coherent_seq: Arc<AtomicU64>,
+    failed_submit_seq: Arc<AtomicU64>,
+    retained_bytes: Arc<AtomicU64>,
+}
+
+impl EncoderCounters {
+    pub fn coherent_seq(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.coherent_seq)
+    }
+
+    pub fn upload_coherent_seq(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.upload_coherent_seq)
+    }
+
+    pub fn failed_submit_seq(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.failed_submit_seq)
+    }
+
+    pub fn retained_bytes(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.retained_bytes)
+    }
+
+    fn new() -> Self {
+        Self {
+            coherent_seq: Arc::new(AtomicU64::new(0)),
+            upload_coherent_seq: Arc::new(AtomicU64::new(0)),
+            failed_submit_seq: Arc::new(AtomicU64::new(0)),
+            retained_bytes: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    fn retain_after_failed_destroy(&self) {
+        // An unacknowledged destruction cannot prove native counter access stopped.
+        let _coherent = Arc::into_raw(Arc::clone(&self.coherent_seq));
+        let _upload = Arc::into_raw(Arc::clone(&self.upload_coherent_seq));
+        let _failed = Arc::into_raw(Arc::clone(&self.failed_submit_seq));
+        let _retained = Arc::into_raw(Arc::clone(&self.retained_bytes));
+    }
+}
+
 pub struct EncoderThread {
     runtime: u64,
+    counters: EncoderCounters,
     #[cfg(perf_tracking)]
     source_clock: calibration::SourceClock,
     gpu_caps: GpuCaps,
@@ -127,6 +172,7 @@ pub struct EncoderThread {
 impl EncoderThread {
     pub fn spawn(
         device: MetalHandle<MTLDeviceKind>,
+        record_handle: DeviceRecordHandle,
         gpu_caps: GpuCaps,
         config: &Mtld3dConfig,
     ) -> Result<Self, i32> {
@@ -145,12 +191,18 @@ impl EncoderThread {
                 cache_path.write_wire(writer)
             })
             .map_err(|_| E_OUTOFMEMORY)?;
+        let counters = EncoderCounters::new();
         let native_failure = Box::new(AtomicU32::new(0));
         #[cfg(perf_tracking)]
         let source_clock = calibration::SourceClock::new();
         let mut params = CreateEncoderParams {
             failure_ptr: core::ptr::from_ref(native_failure.as_ref()) as u64,
             device,
+            record_handle,
+            coherent_seq_ptr: Arc::as_ptr(&counters.coherent_seq) as u64,
+            upload_coherent_seq_ptr: Arc::as_ptr(&counters.upload_coherent_seq) as u64,
+            failed_submit_seq_ptr: Arc::as_ptr(&counters.failed_submit_seq) as u64,
+            retained_bytes_ptr: Arc::as_ptr(&counters.retained_bytes) as u64,
             config_ptr: settings.as_bytes().as_ptr() as u64,
             config_len: u32::try_from(settings.as_bytes().len()).map_err(|_| E_OUTOFMEMORY)?,
             result: E_OUTOFMEMORY,
@@ -172,6 +224,7 @@ impl EncoderThread {
         }
         Ok(Self {
             runtime: params.runtime,
+            counters,
             #[cfg(perf_tracking)]
             source_clock,
             gpu_caps,
@@ -182,6 +235,10 @@ impl EncoderThread {
             completions: CompletionPool::new(),
             leases: Mutex::default(),
         })
+    }
+
+    pub const fn counters(&self) -> &EncoderCounters {
+        &self.counters
     }
 
     #[must_use]
@@ -412,6 +469,7 @@ impl Drop for EncoderThread {
     fn drop(&mut self) {
         let _shutdown = self.shutdown();
         if self.runtime != 0 {
+            self.counters.retain_after_failed_destroy();
             #[cfg(perf_tracking)]
             self.source_clock.retain_after_failed_destroy();
             std::mem::forget(std::mem::replace(

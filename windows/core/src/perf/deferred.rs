@@ -5,7 +5,7 @@ use std::{collections::VecDeque, sync::Arc};
 use mtld3d_shared::clock_calibration::ClockCalibration;
 use strum::EnumCount;
 
-use super::{CommandBufferRole, FrameSample, wire::scale_ticks};
+use super::{CommandBufferRole, FrameSample, clock_scale::scale_ticks};
 
 const MAX_PENDING_SAMPLES: usize = 4096;
 

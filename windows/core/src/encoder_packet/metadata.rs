@@ -1,515 +1,520 @@
-//! Metadata fields accompanying an immutable recorded operation stream.
+//! Fixed metadata and immutable typed arrays retained by the publishing runtime.
 
-use mtld3d_shared::encoder_wire::{WireError, WireReader, WireWriter};
+use mtld3d_shared::{
+    encoder_wire::WireError,
+    frame_metadata::{ArrayRef, FrameMetadata},
+};
 
 use super::FrameRecorder;
 use crate::{
-    encoder_data::{
-        FrameData, FrameDataFlags, FrameInit, PendingVbibRetention, StagingWarmupEntry,
-        VbibWarmupEntry,
-    },
-    encoder_value::WireValue,
+    encoder_data::{FrameData, PendingVbibRetention, StagingWarmupEntry, VbibWarmupEntry},
+    encoder_records::TextureRecord,
     guest_pages::{GuestPageDescriptor, GuestPageLease},
+    perf::FramePerfPayload,
 };
 
-/// Published address ranges and exact single-adoption descriptors.
-pub struct PacketInventory {
-    #[cfg(any(test, debug_assertions))]
-    pub ranges: Vec<(u64, u64)>,
-    #[cfg(any(test, debug_assertions))]
-    pub pages: Vec<[u64; 7]>,
-    #[cfg(any(test, debug_assertions))]
-    pub queries: Vec<[u64; 2]>,
-    pub registrations: Vec<u64>,
-    #[cfg(any(test, debug_assertions))]
-    pub redirties: Vec<[u64; 2]>,
-    #[cfg(any(test, debug_assertions))]
-    pub replies_u64: Vec<u64>,
-    #[cfg(any(test, debug_assertions))]
-    pub replies_bool: Vec<u64>,
-    #[cfg(any(test, debug_assertions))]
-    pub readbacks: Vec<(u64, u64)>,
-    #[cfg(any(test, debug_assertions))]
-    pub command_spans: Vec<(u64, u64)>,
-    #[cfg(any(test, debug_assertions))]
-    pub backings: Vec<(u64, u64)>,
+#[repr(C, align(8))]
+pub struct BufferWarmupRecord {
+    pub buffer_id: u64,
+    pub backing_ptr: u64,
+    pub backing_len: u64,
+    pub backing_generation: u64,
+    pub map_mode: u32,
+    pub reserved: u32,
 }
 
-pub fn write_metadata(
-    frame: &mut FrameData,
-    writer: &mut WireWriter<'_>,
-    recorder: &mut FrameRecorder,
-) -> Result<(), WireError> {
-    write_metadata_with_inventory(frame, writer, recorder, cfg!(any(test, debug_assertions)))
+#[repr(C, align(8))]
+pub struct StagingWarmupRecord {
+    pub texture_id: u64,
+    pub backing_ptr: u64,
+    pub backing_len: u64,
+    pub page: GuestPageDescriptor,
+    pub level: u32,
+    pub reserved: u32,
 }
 
-// The explicit argument lets host tests exercise the release producer's identical wire shape.
-fn write_metadata_with_inventory(
-    frame: &mut FrameData,
-    writer: &mut WireWriter<'_>,
-    recorder: &mut FrameRecorder,
-    has_inventory: bool,
-) -> Result<(), WireError> {
-    frame.device_handle.write_wire(writer)?;
-    frame.record_handle.write_wire(writer)?;
-    frame.backbuffer_handle.write_wire(writer)?;
-    frame.backbuffer_srgb_handle.write_wire(writer)?;
-    frame.backbuffer_msaa_handle.write_wire(writer)?;
-    frame.backbuffer_msaa_srgb_handle.write_wire(writer)?;
-    frame.backbuffer_sample_count.write_wire(writer)?;
-    frame.layer_handle.write_wire(writer)?;
-    frame.view_handle.write_wire(writer)?;
-    frame.backbuffer_width.write_wire(writer)?;
-    frame.backbuffer_height.write_wire(writer)?;
-    frame.backbuffer_format.write_wire(writer)?;
-    frame.render_scale.write_wire(writer)?;
-    frame.backbuffer_contents.write_wire(writer)?;
-    frame.depth_texture.write_wire(writer)?;
-    let mut flags = frame.flags;
-    flags.set(FrameDataFlags::VALIDATION_INVENTORY, has_inventory);
-    flags.write_wire(writer)?;
-    frame.perf.write_wire(writer)?;
-    frame.submit_seq.write_wire(writer)?;
-    frame.coherent_seq_ptr.write_wire(writer)?;
-    frame.upload_coherent_seq_ptr.write_wire(writer)?;
-    frame.failed_submit_seq_ptr.write_wire(writer)?;
-    frame.retained_bytes_ptr.write_wire(writer)?;
-    frame.apply_pacing.write_wire(writer)?;
-    frame.apply_gamma.write_wire(writer)?;
-    frame.op_vec_realloc_bytes.write_wire(writer)?;
-    frame.pending_texture_warmups.write_wire(writer)?;
-    u32::try_from(frame.pending_buffer_warmups.len())
-        .map_err(|_| WireError::TooLarge)?
-        .write_wire(writer)?;
-    for entry in &frame.pending_buffer_warmups {
-        entry.buffer_id.write_wire(writer)?;
-        entry.backing_ptr.write_wire(writer)?;
-        entry.backing_len.write_wire(writer)?;
-        entry.backing_generation.write_wire(writer)?;
-        entry.map_mode.write_wire(writer)?;
-    }
-    u32::try_from(frame.pending_staging_warmups.len())
-        .map_err(|_| WireError::TooLarge)?
-        .write_wire(writer)?;
-    let mut staging = core::mem::take(&mut frame.pending_staging_warmups).into_iter();
-    while let Some(entry) = staging.next() {
-        let lease = GuestPageLease::for_shared_pooled(entry.keepalive, &recorder.completion_pool);
-        let descriptor = lease.descriptor();
-        recorder.pages.push(lease);
-        let result = (|| {
-            entry.texture_id.write_wire(writer)?;
-            entry.level.write_wire(writer)?;
-            entry.backing_ptr.write_wire(writer)?;
-            entry.backing_len.write_wire(writer)?;
-            descriptor.write_wire(writer)
-        })();
-        if let Err(error) = result {
-            frame.pending_staging_warmups.extend(staging);
-            return Err(error);
-        }
-    }
-    u32::try_from(frame.vbib_retentions.len())
-        .map_err(|_| WireError::TooLarge)?
-        .write_wire(writer)?;
-    let mut retained = core::mem::take(&mut frame.vbib_retentions).into_iter();
-    while let Some(entry) = retained.next() {
-        let lease = GuestPageLease::for_recyclable_pooled(
-            entry.page_box,
-            &recorder.completion_pool,
-            recorder.pagebox_pool,
-        );
-        let descriptor = lease.descriptor();
-        recorder.pages.push(lease);
-        let result = (|| {
-            entry.buffer_id.write_wire(writer)?;
-            entry.last_submit_seq.write_wire(writer)?;
-            descriptor.write_wire(writer)
-        })();
-        if let Err(error) = result {
-            frame.vbib_retentions.extend(retained);
-            return Err(error);
-        }
-    }
-    if !has_inventory {
-        writer.u32(0)?; // Scratch ranges.
-        writer.u32(0)?; // Page provenance.
-        writer.u32(0)?; // Query provenance.
-        recorder.registrations.write_wire(writer)?;
-        writer.u32(0)?; // Redirty provenance.
-        writer.u32(0)?; // U64 reply provenance.
-        writer.u32(0)?; // Boolean reply provenance.
-        writer.u32(0)?; // Readback provenance.
-        writer.u32(0)?; // Command provenance; the actual command table remains separate.
-        writer.u32(0)?; // Buffer backing provenance.
-        return Ok(());
-    }
-    u32::try_from(frame.scratch.allocation_ranges().count())
-        .map_err(|_| WireError::TooLarge)?
-        .write_wire(writer)?;
-    for (address, length) in frame.scratch.allocation_ranges() {
-        address.write_wire(writer)?;
-        length.write_wire(writer)?;
-    }
-    u32::try_from(recorder.pages.len())
-        .map_err(|_| WireError::TooLarge)?
-        .write_wire(writer)?;
-    for page in &recorder.pages {
-        page.descriptor().wire_fields().write_wire(writer)?;
-    }
-    u32::try_from(recorder.queries.len())
-        .map_err(|_| WireError::TooLarge)?
-        .write_wire(writer)?;
-    for query in &recorder.queries {
-        query.descriptor().wire_fields().write_wire(writer)?;
-    }
-    recorder.registrations.write_wire(writer)?;
-    u32::try_from(recorder.redirties.len())
-        .map_err(|_| WireError::TooLarge)?
-        .write_wire(writer)?;
-    for redirty in &recorder.redirties {
-        redirty.descriptor().wire_fields().write_wire(writer)?;
-    }
-    u32::try_from(recorder.replies_u64.len())
-        .map_err(|_| WireError::TooLarge)?
-        .write_wire(writer)?;
-    for reply in &recorder.replies_u64 {
-        reply.address().write_wire(writer)?;
-    }
-    u32::try_from(recorder.replies_bool.len())
-        .map_err(|_| WireError::TooLarge)?
-        .write_wire(writer)?;
-    for reply in &recorder.replies_bool {
-        reply.address().write_wire(writer)?;
-    }
-    u32::try_from(recorder.readbacks.len())
-        .map_err(|_| WireError::TooLarge)?
-        .write_wire(writer)?;
-    for (address, length) in &recorder.readbacks {
-        address.write_wire(writer)?;
-        length.write_wire(writer)?;
-    }
-    u32::try_from(recorder.slab.ranges().count())
-        .map_err(|_| WireError::TooLarge)?
-        .write_wire(writer)?;
-    for (address, length) in recorder.slab.ranges() {
-        address.write_wire(writer)?;
-        length.write_wire(writer)?;
-    }
-    u32::try_from(recorder.ranges.len())
-        .map_err(|_| WireError::TooLarge)?
-        .write_wire(writer)?;
-    for (address, length) in &recorder.ranges {
-        address.write_wire(writer)?;
-        length.write_wire(writer)?;
-    }
-    Ok(())
+#[repr(C, align(8))]
+pub struct VbibRetentionRecord {
+    pub buffer_id: u64,
+    pub last_submit_seq: u64,
+    pub page: GuestPageDescriptor,
 }
 
-/// Metadata parsed once, with guest ownership held back until complete validation.
-pub(super) struct ParsedMetadata {
-    #[cfg(any(test, debug_assertions))]
-    pub has_inventory: bool,
-    pub frame: FrameData,
-    pub inventory: PacketInventory,
-    staging: Vec<(crate::ids::TextureId, u32, u64, u64, GuestPageDescriptor)>,
-    retained: Vec<(crate::ids::BufferId, u64, GuestPageDescriptor)>,
+#[repr(C, align(8))]
+pub struct LayerPacingRecord {
+    pub layer: u64,
+    pub display_sync: u32,
+    pub max_fps: u32,
+}
+#[repr(C, align(8))]
+pub struct GammaRecord {
+    pub layer: u64,
+    pub entries_ptr: u64,
+    pub entries_len: u32,
+    pub mode: u32,
 }
 
-impl ParsedMetadata {
-    /// Adopt descriptors only after all operation records and inventories have passed.
+// SAFETY: these canonical records contain only fixed integers and descriptors, and all offsets
+// and sizes are asserted below. No field has invalid bit patterns or owns a Rust allocation.
+unsafe impl crate::encoder_records::CommandRecord for BufferWarmupRecord {}
+// SAFETY: the descriptor is seven u64 fields and all surrounding padding is explicit.
+unsafe impl crate::encoder_records::CommandRecord for StagingWarmupRecord {}
+// SAFETY: every byte belongs to initialized u64 fields, including the page descriptor.
+unsafe impl crate::encoder_records::CommandRecord for VbibRetentionRecord {}
+// SAFETY: this 16-byte integer record has no padding or invalid bit patterns.
+unsafe impl crate::encoder_records::CommandRecord for LayerPacingRecord {}
+// SAFETY: this 24-byte integer record has no padding or invalid bit patterns.
+unsafe impl crate::encoder_records::CommandRecord for GammaRecord {}
+
+/// The one fixed header lives in the existing frame arena.
+pub struct MetadataStorage {
+    header: u64,
+}
+impl MetadataStorage {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self { header: 0 }
+    }
+    pub const fn clear(&mut self) {
+        self.header = 0;
+    }
+    /// Borrow the initialized header from its retained frame arena.
     ///
     /// # Safety
-    /// Each descriptor is uniquely retained by the immutable packet until acknowledgment.
-    pub unsafe fn adopt(mut self) -> Result<FrameData, WireError> {
-        for (texture_id, level, backing_ptr, backing_len, descriptor) in self.staging {
-            // SAFETY: whole-packet validation established this unique retained descriptor.
-            let keepalive = unsafe { descriptor.adopt_shared()? };
-            if keepalive.as_ptr() as u64 != backing_ptr || keepalive.len() as u64 != backing_len {
-                return Err(WireError::InvalidValue);
-            }
-            self.frame.pending_staging_warmups.push(StagingWarmupEntry {
-                texture_id,
-                level,
-                backing_ptr,
-                backing_len,
-                keepalive,
-            });
+    ///
+    /// The frame arena passed to seal remains alive and has not been cleared or reused for
+    /// the returned borrow. The packet owner clears this token before returning that arena.
+    #[must_use]
+    pub const unsafe fn as_bytes(&self) -> &[u8] {
+        if self.header == 0 {
+            return &[];
         }
-        for (buffer_id, last_submit_seq, descriptor) in self.retained {
-            // SAFETY: whole-packet validation established this unique retained descriptor.
-            let page_box = unsafe { descriptor.adopt_owned()? };
-            self.frame.vbib_retentions.push(PendingVbibRetention {
-                buffer_id,
-                page_box,
-                last_submit_seq,
-            });
-        }
-        Ok(self.frame)
+        // SAFETY: seal initializes every byte in the retained scratch allocation.
+        unsafe { core::slice::from_raw_parts(self.header as *const u8, size_of::<FrameMetadata>()) }
     }
-}
-
-/// Parse scalar metadata and descriptors without adopting or touching guest memory.
-pub(super) fn read_metadata(reader: &mut WireReader<'_>) -> Result<ParsedMetadata, WireError> {
-    #[cfg(any(test, debug_assertions))]
-    let mut metadata_pages = Vec::new();
-    let init = FrameInit {
-        device_handle: WireValue::read_wire(reader)?,
-        record_handle: WireValue::read_wire(reader)?,
-        backbuffer_handle: WireValue::read_wire(reader)?,
-        backbuffer_srgb_handle: WireValue::read_wire(reader)?,
-        backbuffer_msaa_handle: WireValue::read_wire(reader)?,
-        backbuffer_msaa_srgb_handle: WireValue::read_wire(reader)?,
-        backbuffer_sample_count: WireValue::read_wire(reader)?,
-        layer_handle: WireValue::read_wire(reader)?,
-        view_handle: WireValue::read_wire(reader)?,
-        backbuffer_width: WireValue::read_wire(reader)?,
-        backbuffer_height: WireValue::read_wire(reader)?,
-        backbuffer_format: WireValue::read_wire(reader)?,
-        render_scale: WireValue::read_wire(reader)?,
-        backbuffer_contents: WireValue::read_wire(reader)?,
-        depth_texture: WireValue::read_wire(reader)?,
-        depth_has_stencil: false,
-    };
-    let mut frame = FrameData::new(&init);
-    frame.flags = WireValue::read_wire(reader)?;
-    #[cfg(any(test, debug_assertions))]
-    let has_inventory = frame.flags.contains(FrameDataFlags::VALIDATION_INVENTORY);
-    frame.flags.remove(FrameDataFlags::VALIDATION_INVENTORY);
-    frame.perf = WireValue::read_wire(reader)?;
-    frame.submit_seq = WireValue::read_wire(reader)?;
-    frame.coherent_seq_ptr = read_counter(reader)?;
-    frame.upload_coherent_seq_ptr = read_counter(reader)?;
-    frame.failed_submit_seq_ptr = read_counter(reader)?;
-    frame.retained_bytes_ptr = read_counter(reader)?;
-    frame.apply_pacing = WireValue::read_wire(reader)?;
-    frame.apply_gamma = WireValue::read_wire(reader)?;
-    frame.op_vec_realloc_bytes = WireValue::read_wire(reader)?;
-    frame.pending_texture_warmups = WireValue::read_wire(reader)?;
-    let buffers = bounded_count(reader, 33)?;
-    frame
-        .pending_buffer_warmups
-        .try_reserve(buffers)
-        .map_err(|_| WireError::AllocationFailed)?;
-    for _ in 0..buffers {
-        let entry = VbibWarmupEntry {
-            buffer_id: WireValue::read_wire(reader)?,
-            backing_ptr: reader.u64()?,
-            backing_len: reader.u64()?,
-            backing_generation: reader.u64()?,
-            map_mode: WireValue::read_wire(reader)?,
+    /// Initialize one header in the existing frame arena without copying payload arrays.
+    ///
+    /// # Errors
+    ///
+    /// The current fixed header has no recoverable construction errors.
+    pub fn seal(
+        &mut self,
+        frame: &mut FrameData,
+        _recorder: &FrameRecorder,
+    ) -> Result<(), WireError> {
+        #[cfg(perf_tracking)]
+        let perf = ArrayRef {
+            address: core::ptr::from_ref(frame.perf_mut()) as u64,
+            count: 1,
+            reserved: 0,
         };
-        validate_range(reader, entry.backing_ptr, entry.backing_len, 1)?;
-        frame.pending_buffer_warmups.push(entry);
+        #[cfg(not(perf_tracking))]
+        let perf = ArrayRef::default();
+        let value = FrameMetadata {
+            backbuffer_handle: frame.backbuffer_handle.raw(),
+            backbuffer_srgb_handle: frame.backbuffer_srgb_handle.raw(),
+            backbuffer_msaa_handle: frame.backbuffer_msaa_handle.raw(),
+            backbuffer_msaa_srgb_handle: frame.backbuffer_msaa_srgb_handle.raw(),
+            layer_handle: frame.layer_handle.raw(),
+            view_handle: frame.view_handle.raw(),
+            depth_texture: frame.depth_texture.raw(),
+            submit_seq: frame.submit_seq,
+            perf,
+            flags: u32::from(frame.flags.bits()),
+            backbuffer_width: frame.backbuffer_width,
+            backbuffer_height: frame.backbuffer_height,
+            backbuffer_format: frame.backbuffer_format as u32,
+            render_scale_percent: frame.render_scale.percent(),
+            backbuffer_sample_count: u32::from(frame.backbuffer_sample_count),
+            backbuffer_contents: frame.backbuffer_contents as u32,
+            ..FrameMetadata::default()
+        };
+        let target = frame.scratch.alloc_uninit::<FrameMetadata>();
+        // SAFETY: every scalar and explicit reserved field is initialized, and the arena retains it.
+        unsafe {
+            target.write(value);
+        }
+        self.header = target as u64;
+        Ok(())
     }
-    let staging = bounded_count(reader, 84)?;
-    let mut staging_descriptors = Vec::new();
-    staging_descriptors
-        .try_reserve(staging)
-        .map_err(|_| WireError::AllocationFailed)?;
-    frame
-        .pending_staging_warmups
-        .try_reserve(staging)
-        .map_err(|_| WireError::AllocationFailed)?;
-    for _ in 0..staging {
-        let texture_id = WireValue::read_wire(reader)?;
-        let level = reader.u32()?;
-        let backing_ptr = reader.u64()?;
-        let backing_len = reader.u64()?;
-        validate_range(reader, backing_ptr, backing_len, 1)?;
-        let descriptor = GuestPageDescriptor::read_wire(reader)?;
-        let fields = descriptor.wire_fields();
-        if fields[6] != 0 {
+}
+impl Default for MetadataStorage {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FrameRecorder {
+    fn metadata_command<T: crate::encoder_records::CommandRecord>(
+        &mut self,
+        scratch: &mut crate::scratch::ScratchArena,
+        tag: mtld3d_shared::encoder_protocol::EncoderOpcode,
+        value: T,
+    ) {
+        if self.error.is_some() {
+            return;
+        }
+        let result =
+            self.slab
+                .push_fixed_record(scratch, tag.into(), 0, size_of::<T>(), |destination| {
+                    crate::encoder_records::write(destination, value)
+                });
+        match result {
+            Ok(()) => self.count += 1,
+            Err(error) => self.error = Some(error),
+        }
+    }
+    pub fn capture_texture_warmup(
+        &mut self,
+        scratch: &mut crate::scratch::ScratchArena,
+        info: &crate::encoder_data::TextureInfo,
+    ) {
+        self.metadata_command(
+            scratch,
+            mtld3d_shared::encoder_protocol::EncoderOpcode::WarmupTexture,
+            TextureRecord::capture(info),
+        );
+    }
+    pub fn capture_buffer_warmup(
+        &mut self,
+        scratch: &mut crate::scratch::ScratchArena,
+        entry: VbibWarmupEntry,
+    ) {
+        self.metadata_command(
+            scratch,
+            mtld3d_shared::encoder_protocol::EncoderOpcode::WarmupBuffer,
+            BufferWarmupRecord {
+                buffer_id: entry.buffer_id.raw(),
+                backing_ptr: entry.backing_ptr,
+                backing_len: entry.backing_len,
+                backing_generation: entry.backing_generation,
+                map_mode: entry.map_mode as u32,
+                reserved: 0,
+            },
+        );
+    }
+    pub fn capture_staging_warmup(
+        &mut self,
+        scratch: &mut crate::scratch::ScratchArena,
+        entry: StagingWarmupEntry,
+    ) {
+        let lease = GuestPageLease::for_shared_pooled(entry.keepalive, &self.completion_pool);
+        let page = lease.descriptor();
+        self.pages.push(lease);
+        self.metadata_command(
+            scratch,
+            mtld3d_shared::encoder_protocol::EncoderOpcode::WarmupStaging,
+            StagingWarmupRecord {
+                texture_id: entry.texture_id.raw(),
+                backing_ptr: entry.backing_ptr,
+                backing_len: entry.backing_len,
+                page,
+                level: entry.level,
+                reserved: 0,
+            },
+        );
+    }
+    pub fn capture_vbib_retention(
+        &mut self,
+        scratch: &mut crate::scratch::ScratchArena,
+        entry: PendingVbibRetention,
+    ) {
+        let lease = GuestPageLease::for_recyclable_pooled(
+            entry.page_box,
+            &self.completion_pool,
+            self.pagebox_pool,
+        );
+        let page = lease.descriptor();
+        self.pages.push(lease);
+        self.metadata_command(
+            scratch,
+            mtld3d_shared::encoder_protocol::EncoderOpcode::RetainVbib,
+            VbibRetentionRecord {
+                buffer_id: entry.buffer_id.raw(),
+                last_submit_seq: entry.last_submit_seq,
+                page,
+            },
+        );
+    }
+    pub fn capture_pacing(
+        &mut self,
+        scratch: &mut crate::scratch::ScratchArena,
+        layer: u64,
+        pacing: crate::present::LayerPacing,
+    ) {
+        self.metadata_command(
+            scratch,
+            mtld3d_shared::encoder_protocol::EncoderOpcode::SetLayerPacing,
+            LayerPacingRecord {
+                layer,
+                display_sync: u32::from(pacing.display_sync),
+                max_fps: pacing.max_fps,
+            },
+        );
+    }
+    /// Capture a gamma change and retain its original LUT until replay finishes.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the fixed LUT extent cannot fit the command's u32 count.
+    pub fn capture_gamma(
+        &mut self,
+        scratch: &mut crate::scratch::ScratchArena,
+        layer: u64,
+        change: crate::gamma::Change,
+    ) {
+        let (mode, entries_ptr, entries_len) = match change {
+            crate::gamma::Change::Remove => (1, 0, 0),
+            crate::gamma::Change::Apply(table) => {
+                let table = super::GammaTableOwner { table };
+                let address = table.table.as_ptr() as u64;
+                let length = u32::try_from(table.table.len()).expect("gamma LUT has fixed extent");
+                self.gamma_tables.push(table);
+                (2, address, length)
+            }
+        };
+        self.metadata_command(
+            scratch,
+            mtld3d_shared::encoder_protocol::EncoderOpcode::SetGamma,
+            GammaRecord {
+                layer,
+                entries_ptr,
+                entries_len,
+                mode,
+            },
+        );
+    }
+}
+
+/// A validated borrow, bounded by the immutable packet's replay lifetime.
+pub struct FrameView<'a> {
+    header: &'a FrameMetadata,
+}
+
+impl<'a> FrameView<'a> {
+    /// Borrow one matched producer's fixed header and optional telemetry.
+    ///
+    /// # Safety
+    ///
+    /// Header and every referenced initialized typed array are authentic, immutable and retained
+    /// by the matched producer for this borrow. Numeric validation does not prove pointer validity.
+    ///
+    /// # Errors
+    ///
+    /// Rejects invalid scalar values, alignment or array extents.
+    pub unsafe fn from_bytes(bytes: &'a [u8]) -> Result<Self, WireError> {
+        if bytes.len() != size_of::<FrameMetadata>() || !(bytes.as_ptr() as usize).is_multiple_of(8)
+        {
             return Err(WireError::InvalidValue);
         }
-        if fields[0] != backing_ptr || fields[1] != backing_len {
+        // SAFETY: the contract retains initialized header bytes; this conversion checks
+        // alignment without constructing a pointer with stronger alignment by casting.
+        let (prefix, headers, suffix) = unsafe { bytes.align_to::<FrameMetadata>() };
+        if !prefix.is_empty() || !suffix.is_empty() {
             return Err(WireError::InvalidValue);
         }
-        #[cfg(any(test, debug_assertions))]
-        if has_inventory {
-            metadata_pages.push(fields);
-        }
-        staging_descriptors.push((texture_id, level, backing_ptr, backing_len, descriptor));
-    }
-    let retained = bounded_count(reader, 72)?;
-    let mut retained_descriptors = Vec::new();
-    retained_descriptors
-        .try_reserve(retained)
-        .map_err(|_| WireError::AllocationFailed)?;
-    frame
-        .vbib_retentions
-        .try_reserve(retained)
-        .map_err(|_| WireError::AllocationFailed)?;
-    for _ in 0..retained {
-        let buffer_id = WireValue::read_wire(reader)?;
-        let last_submit_seq = reader.u64()?;
-        let descriptor = GuestPageDescriptor::read_wire(reader)?;
-        let fields = descriptor.wire_fields();
-        if fields[6] != 0 {
+        let header = headers.first().ok_or(WireError::InvalidValue)?;
+        if header.reserved != 0 {
             return Err(WireError::InvalidValue);
         }
-        #[cfg(any(test, debug_assertions))]
-        if has_inventory {
-            metadata_pages.push(fields);
+        if mtld3d_shared::mtl::PixelFormat::from_repr(header.backbuffer_format).is_none()
+            || header.backbuffer_contents > 1
+            || header.backbuffer_sample_count > 255
+            || header.render_scale_percent == 0
+            || header.render_scale_percent > 100
+            || u8::try_from(header.flags)
+                .ok()
+                .and_then(crate::encoder_data::FrameDataFlags::from_bits)
+                .is_none()
+        {
+            return Err(WireError::InvalidValue);
         }
-        retained_descriptors.push((buffer_id, last_submit_seq, descriptor));
+        let view = Self { header };
+        view.perf()?;
+        Ok(view)
     }
-    #[cfg(any(test, debug_assertions))]
-    let inventory = read_inventory(reader, metadata_pages)?;
-    #[cfg(not(any(test, debug_assertions)))]
-    let inventory = read_inventory(reader)?;
-    Ok(ParsedMetadata {
-        #[cfg(any(test, debug_assertions))]
-        has_inventory,
-        frame,
-        staging: staging_descriptors,
-        retained: retained_descriptors,
-        inventory,
-    })
+    /// Reborrow a header already checked for this packet.
+    ///
+    /// # Safety
+    ///
+    /// This exact immutable header and all its arrays passed `from_bytes` and remain retained.
+    #[must_use]
+    pub const unsafe fn from_validated_header(header: &'a FrameMetadata) -> Self {
+        Self { header }
+    }
+
+    #[must_use]
+    pub const fn backbuffer_handle(
+        &self,
+    ) -> mtld3d_shared::MetalHandle<mtld3d_shared::mtl_handle::MTLTextureKind> {
+        // SAFETY: the matched producer supplies the live handle with its declared object kind.
+        unsafe { mtld3d_shared::MetalHandle::new(self.header.backbuffer_handle) }
+    }
+    #[must_use]
+    pub const fn backbuffer_srgb_handle(
+        &self,
+    ) -> mtld3d_shared::MetalHandle<mtld3d_shared::mtl_handle::MTLTextureKind> {
+        // SAFETY: the matched producer supplies the live handle with its declared object kind.
+        unsafe { mtld3d_shared::MetalHandle::new(self.header.backbuffer_srgb_handle) }
+    }
+    #[must_use]
+    pub const fn backbuffer_msaa_handle(
+        &self,
+    ) -> mtld3d_shared::MetalHandle<mtld3d_shared::mtl_handle::MTLTextureKind> {
+        // SAFETY: the matched producer supplies the live handle with its declared object kind.
+        unsafe { mtld3d_shared::MetalHandle::new(self.header.backbuffer_msaa_handle) }
+    }
+    #[must_use]
+    pub const fn backbuffer_msaa_srgb_handle(
+        &self,
+    ) -> mtld3d_shared::MetalHandle<mtld3d_shared::mtl_handle::MTLTextureKind> {
+        // SAFETY: the matched producer supplies the live handle with its declared object kind.
+        unsafe { mtld3d_shared::MetalHandle::new(self.header.backbuffer_msaa_srgb_handle) }
+    }
+    #[must_use]
+    pub const fn layer_handle(
+        &self,
+    ) -> mtld3d_shared::MetalHandle<mtld3d_shared::mtl_handle::CAMetalLayerKind> {
+        // SAFETY: the matched producer supplies the live handle with its declared object kind.
+        unsafe { mtld3d_shared::MetalHandle::new(self.header.layer_handle) }
+    }
+    #[must_use]
+    pub const fn view_handle(
+        &self,
+    ) -> mtld3d_shared::MetalHandle<mtld3d_shared::mtl_handle::NSViewKind> {
+        // SAFETY: the matched producer supplies the live handle with its declared object kind.
+        unsafe { mtld3d_shared::MetalHandle::new(self.header.view_handle) }
+    }
+    #[must_use]
+    pub const fn depth_texture(
+        &self,
+    ) -> mtld3d_shared::MetalHandle<mtld3d_shared::mtl_handle::MTLTextureKind> {
+        // SAFETY: the matched producer supplies the live handle with its declared object kind.
+        unsafe { mtld3d_shared::MetalHandle::new(self.header.depth_texture) }
+    }
+
+    /// Read the corresponding validated frame value.
+    ///
+    /// # Panics
+    ///
+    /// Panics if an unsafe caller supplied a header that did not pass validation.
+    #[must_use]
+    pub const fn backbuffer_format(&self) -> mtld3d_shared::mtl::PixelFormat {
+        mtld3d_shared::mtl::PixelFormat::from_repr(self.header.backbuffer_format)
+            .expect("validated pixel format")
+    }
+    #[must_use]
+    pub const fn render_scale(&self) -> crate::render_scale::RenderScale {
+        crate::render_scale::RenderScale::from_percent(self.header.render_scale_percent)
+    }
+    #[must_use]
+    pub const fn backbuffer_contents(&self) -> crate::passes::BackbufferContents {
+        if self.header.backbuffer_contents == 0 {
+            crate::passes::BackbufferContents::Undefined
+        } else {
+            crate::passes::BackbufferContents::Preserved
+        }
+    }
+    /// Read the corresponding validated frame value.
+    ///
+    /// # Panics
+    ///
+    /// Panics if an unsafe caller supplied a header that did not pass validation.
+    #[must_use]
+    pub fn sample_count(&self) -> u8 {
+        u8::try_from(self.header.backbuffer_sample_count).expect("validated sample count")
+    }
+    /// Read the corresponding validated frame value.
+    ///
+    /// # Panics
+    ///
+    /// Panics if an unsafe caller supplied a header that did not pass validation.
+    #[must_use]
+    pub fn flags(&self) -> crate::encoder_data::FrameDataFlags {
+        crate::encoder_data::FrameDataFlags::from_bits_retain(
+            u8::try_from(self.header.flags).expect("validated flags"),
+        )
+    }
+    #[must_use]
+    pub const fn header(&self) -> &'a FrameMetadata {
+        self.header
+    }
+    /// Borrow the original source-clock telemetry retained by this frame.
+    ///
+    /// # Errors
+    ///
+    /// Rejects invalid telemetry alignment, count or extent.
+    #[cfg(perf_tracking)]
+    pub fn perf(&self) -> Result<Option<&'a FramePerfPayload>, WireError> {
+        let source = &self.header.perf;
+        let address = usize::try_from(source.address).map_err(|_| WireError::TooLarge)?;
+        if source.reserved != 0
+            || source.count != 1
+            || address == 0
+            || !address.is_multiple_of(align_of::<FramePerfPayload>())
+            || address.checked_add(size_of::<FramePerfPayload>()).is_none()
+        {
+            return Err(WireError::InvalidValue);
+        }
+        // SAFETY: from_bytes grants this initialized retained canonical payload for 'a;
+        // the fixed count, alignment and extent were checked before constructing its borrow.
+        Ok(Some(unsafe { &*(address as *const FramePerfPayload) }))
+    }
+
+    /// PERF-disabled frames have no telemetry attachment.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a nonempty attachment in this matched PERF-disabled build.
+    #[cfg(not(perf_tracking))]
+    pub const fn perf(&self) -> Result<Option<&'a FramePerfPayload>, WireError> {
+        if self.header.perf.count != 0
+            || self.header.perf.address != 0
+            || self.header.perf.reserved != 0
+        {
+            return Err(WireError::InvalidValue);
+        }
+        Ok(None)
+    }
 }
 
-#[cfg(any(test, debug_assertions))]
-fn read_inventory(
-    reader: &mut WireReader<'_>,
-    metadata_pages: Vec<[u64; 7]>,
-) -> Result<PacketInventory, WireError> {
-    let count = bounded_count(reader, 16)?;
-    let mut ranges = Vec::new();
-    ranges
-        .try_reserve(count)
-        .map_err(|_| WireError::AllocationFailed)?;
-    for _ in 0..count {
-        let address = reader.u64()?;
-        let length = reader.u64()?;
-        validate_range(reader, address, length, 1)?;
-        ranges.push((address, length));
-    }
-    let mut pages = Vec::<[u64; 7]>::read_wire(reader)?;
-    let queries = Vec::<[u64; 2]>::read_wire(reader)?;
-    let registrations = Vec::<u64>::read_wire(reader)?;
-    let redirties = Vec::<[u64; 2]>::read_wire(reader)?;
-    let replies_u64 = Vec::<u64>::read_wire(reader)?;
-    let replies_bool = Vec::<u64>::read_wire(reader)?;
-    let readback_count = bounded_count(reader, 16)?;
-    let mut readbacks = Vec::new();
-    readbacks
-        .try_reserve(readback_count)
-        .map_err(|_| WireError::TooLarge)?;
-    for _ in 0..readback_count {
-        readbacks.push((u64::read_wire(reader)?, u64::read_wire(reader)?));
-    }
-    let command_spans = read_spans(reader)?;
-    let backings = read_spans(reader)?;
-    for fields in metadata_pages {
-        let index = pages
-            .iter()
-            .position(|page| *page == fields)
-            .ok_or(WireError::InvalidValue)?;
-        pages.swap_remove(index);
-    }
-    Ok(PacketInventory {
-        ranges,
-        pages,
-        queries,
-        registrations,
-        redirties,
-        replies_u64,
-        replies_bool,
-        readbacks,
-        command_spans,
-        backings,
-    })
-}
+const _: () = {
+    assert!(size_of::<BufferWarmupRecord>() == 40);
+    assert!(align_of::<BufferWarmupRecord>() == 8);
+    assert!(core::mem::offset_of!(BufferWarmupRecord, buffer_id) == 0);
+    assert!(core::mem::offset_of!(BufferWarmupRecord, backing_ptr) == 8);
+    assert!(core::mem::offset_of!(BufferWarmupRecord, backing_len) == 16);
+    assert!(core::mem::offset_of!(BufferWarmupRecord, backing_generation) == 24);
+    assert!(core::mem::offset_of!(BufferWarmupRecord, map_mode) == 32);
+    assert!(core::mem::offset_of!(BufferWarmupRecord, reserved) == 36);
+    assert!(size_of::<StagingWarmupRecord>() == 88);
+    assert!(align_of::<StagingWarmupRecord>() == 8);
+    assert!(core::mem::offset_of!(StagingWarmupRecord, texture_id) == 0);
+    assert!(core::mem::offset_of!(StagingWarmupRecord, backing_ptr) == 8);
+    assert!(core::mem::offset_of!(StagingWarmupRecord, backing_len) == 16);
+    assert!(core::mem::offset_of!(StagingWarmupRecord, page) == 24);
+    assert!(core::mem::offset_of!(StagingWarmupRecord, level) == 80);
+    assert!(core::mem::offset_of!(StagingWarmupRecord, reserved) == 84);
+    assert!(size_of::<VbibRetentionRecord>() == 72);
+    assert!(align_of::<VbibRetentionRecord>() == 8);
+    assert!(core::mem::offset_of!(VbibRetentionRecord, buffer_id) == 0);
+    assert!(core::mem::offset_of!(VbibRetentionRecord, last_submit_seq) == 8);
+    assert!(core::mem::offset_of!(VbibRetentionRecord, page) == 16);
+};
 
-#[cfg(not(any(test, debug_assertions)))]
-fn read_inventory(reader: &mut WireReader<'_>) -> Result<PacketInventory, WireError> {
-    Ok(PacketInventory {
-        registrations: read_inventory_registrations(reader)?,
-    })
-}
-
-#[cfg(any(test, not(debug_assertions)))]
-fn read_inventory_registrations(reader: &mut WireReader<'_>) -> Result<Vec<u64>, WireError> {
-    // Consume the diagnostic footer from a debug producer without allocating storage
-    // for it. The actual command table and every owning descriptor are independent.
-    discard_ranges(reader)?;
-    discard_list::<[u64; 7]>(reader)?;
-    discard_list::<[u64; 2]>(reader)?;
-    let registrations = Vec::<u64>::read_wire(reader)?;
-    discard_list::<[u64; 2]>(reader)?;
-    discard_list::<u64>(reader)?;
-    discard_list::<u64>(reader)?;
-    discard_list::<[u64; 2]>(reader)?;
-    discard_list::<[u64; 2]>(reader)?;
-    discard_list::<[u64; 2]>(reader)?;
-    Ok(registrations)
-}
-
-#[cfg(any(test, not(debug_assertions)))]
-fn discard_ranges(reader: &mut WireReader<'_>) -> Result<(), WireError> {
-    let count = bounded_count(reader, 16)?;
-    for _ in 0..count {
-        let address = reader.u64()?;
-        let length = reader.u64()?;
-        validate_range(reader, address, length, 1)?;
-    }
-    Ok(())
-}
-
-#[cfg(any(test, not(debug_assertions)))]
-fn discard_list<T: WireValue>(reader: &mut WireReader<'_>) -> Result<(), WireError> {
-    let count = bounded_count(reader, T::MIN_WIRE_BYTES)?;
-    for _ in 0..count {
-        T::read_wire(reader)?;
-    }
-    Ok(())
-}
-
-#[cfg(any(test, debug_assertions))]
-fn read_spans(reader: &mut WireReader<'_>) -> Result<Vec<(u64, u64)>, WireError> {
-    let count = bounded_count(reader, 16)?;
-    let mut spans = Vec::new();
-    spans
-        .try_reserve(count)
-        .map_err(|_| WireError::AllocationFailed)?;
-    for _ in 0..count {
-        spans.push((reader.u64()?, reader.u64()?));
-    }
-    Ok(spans)
-}
-
-fn bounded_count(reader: &mut WireReader<'_>, minimum_bytes: usize) -> Result<usize, WireError> {
-    let count = usize::try_from(reader.u32()?).map_err(|_| WireError::TooLarge)?;
-    if count > reader.remaining_len() / minimum_bytes {
-        return Err(WireError::Truncated);
-    }
-    Ok(count)
-}
-
-fn read_counter(reader: &mut WireReader<'_>) -> Result<u64, WireError> {
-    let address = reader.u64()?;
-    if address != 0 {
-        validate_range(reader, address, 8, 8)?;
-    }
-    Ok(address)
-}
-
-fn validate_range(
-    reader: &WireReader<'_>,
-    address: u64,
-    length: u64,
-    alignment: u64,
-) -> Result<(), WireError> {
-    if !reader.has_trusted_addresses()
-        || address == 0
-        || !address.is_multiple_of(alignment)
-        || usize::try_from(address).is_err()
-        || isize::try_from(length).is_err()
-        || address.checked_add(length).is_none()
-    {
-        return Err(WireError::InvalidValue);
-    }
-    Ok(())
-}
+const _: () = {
+    assert!(size_of::<LayerPacingRecord>() == 16);
+    assert!(align_of::<LayerPacingRecord>() == 8);
+    assert!(core::mem::offset_of!(LayerPacingRecord, layer) == 0);
+    assert!(core::mem::offset_of!(LayerPacingRecord, display_sync) == 8);
+    assert!(core::mem::offset_of!(LayerPacingRecord, max_fps) == 12);
+    assert!(size_of::<GammaRecord>() == 24);
+    assert!(align_of::<GammaRecord>() == 8);
+    assert!(core::mem::offset_of!(GammaRecord, layer) == 0);
+    assert!(core::mem::offset_of!(GammaRecord, entries_ptr) == 8);
+    assert!(core::mem::offset_of!(GammaRecord, entries_len) == 16);
+    assert!(core::mem::offset_of!(GammaRecord, mode) == 20);
+};
 
 #[cfg(test)]
 mod tests;

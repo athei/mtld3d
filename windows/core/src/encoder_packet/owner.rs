@@ -1,6 +1,6 @@
-use mtld3d_shared::encoder_wire::{FrameSlab, LeaseCompletion, WireError};
+use mtld3d_shared::encoder_wire::{LeaseCompletion, WireError};
 
-use super::{FrameRecorder, write_metadata};
+use super::{FrameRecorder, metadata::MetadataStorage};
 use crate::{
     encoder_data::FrameData, guest_pages::GuestPageLease, guest_queries::GuestQueryLease,
     scratch::ScratchArena, upload_redirty::GuestRedirtyLease,
@@ -51,7 +51,7 @@ impl PacketLease {
 
 /// PE-owned frame bytes and leases retained until native acknowledgment.
 pub struct FramePacket {
-    metadata: FrameSlab,
+    metadata: MetadataStorage,
     completion_pool: crate::guest_completions::CompletionPool,
     pub(super) frame: Option<FrameData>,
     pub(super) recorder: Option<FrameRecorder>,
@@ -92,7 +92,6 @@ impl FramePacket {
             flags: PacketFlags::empty(),
             recording_error: None,
         };
-        packet.metadata.clear();
         let result = {
             let Self {
                 metadata,
@@ -102,15 +101,7 @@ impl FramePacket {
             } = &mut packet;
             let recorder = recorder.as_mut().expect("new packet owns recorder");
             recorder.error.take().map_or_else(
-                || {
-                    metadata.push_record(super::FRAME_METADATA_TAG, |writer| {
-                        write_metadata(
-                            frame.as_mut().expect("new packet owns frame"),
-                            writer,
-                            recorder,
-                        )
-                    })
-                },
+                || metadata.seal(frame.as_mut().expect("new packet owns frame"), recorder),
                 Err,
             )
         };
@@ -129,8 +120,10 @@ impl FramePacket {
     }
 
     #[must_use]
-    pub fn metadata_bytes(&self) -> &[u8] {
-        self.metadata.as_bytes()
+    pub const fn metadata_bytes(&self) -> &[u8] {
+        // SAFETY: this packet retains the sealed frame arena until take_recording_storage
+        // moves the metadata out and clears its token before returning the arena for reuse.
+        unsafe { self.metadata.as_bytes() }
     }
 
     #[must_use]
@@ -252,8 +245,7 @@ impl FramePacket {
         recorder.reset();
         recorder.metadata = core::mem::take(&mut self.metadata);
         recorder.metadata.clear();
-        frame.scratch.clear();
-        Some((core::mem::take(&mut frame.scratch), recorder))
+        Some((frame.take_recording_scratch(), recorder))
     }
 
     /// Consume test-fixture notifications through the production device queue.
@@ -325,7 +317,7 @@ impl Drop for FramePacket {
         if !self.maintain() {
             mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
                 "dropping an active frame packet; retaining guest backing still in use");
-            core::mem::forget(core::mem::take(&mut self.metadata));
+            self.metadata.clear();
             core::mem::forget(self.frame.take());
             core::mem::forget(self.recorder.take());
             core::mem::forget(core::mem::take(&mut self.pages));

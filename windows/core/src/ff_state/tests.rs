@@ -774,6 +774,7 @@ fn set_texture_stage_state_reports_value_change() {
 
 fn make_vs_key(flags: super::FfVsFlags, fog_mode: u8) -> super::FfVsKey {
     super::FfVsKey {
+        reserved: 0,
         flags,
         input_tex_coord_count: 0,
         tex_coord_count: 0,
@@ -1519,5 +1520,58 @@ fn build_palette_section_packs_no_matrix_past_the_advertised_index() {
             (packed[cap * 4][0] - 9.0).abs() < f32::EPSILON,
             "the last matrix the block holds was not packed"
         );
+    }
+}
+
+#[test]
+fn inline_variable_sections_fill_exact_queried_rows() {
+    use core::mem::MaybeUninit;
+
+    fn destination(rows: u16) -> Vec<MaybeUninit<[f32; 4]>> {
+        vec![MaybeUninit::new([f32::from_bits(0x7fc1_2345); 4]); usize::from(rows)]
+    }
+    fn assert_filled(rows: &[MaybeUninit<[f32; 4]>]) {
+        for row in rows {
+            // SAFETY: every test destination was initialized before the fill.
+            let row = unsafe { row.assume_init_ref() };
+            assert!(row.iter().all(|value| value.to_bits() != 0x7fc1_2345));
+        }
+    }
+    for count in 0..=8 {
+        let mut state = FfState::new();
+        for slot in 0..count {
+            state.set_light(
+                slot,
+                &mtld3d_types::D3DLIGHT9 {
+                    type_: mtld3d_types::D3DLIGHT_DIRECTIONAL,
+                    ..mtld3d_types::D3DLIGHT9::default()
+                },
+            );
+            state.set_light_enabled(slot, true);
+        }
+        let key = lit_vs_key(&state);
+        let rows = FfState::lights_section_rows(&key);
+        assert_eq!(usize::from(rows), count * 6);
+        let mut dst = destination(rows);
+        state.fill_lights_section(&key, &mut dst);
+        assert_filled(&dst);
+    }
+    for high in 0..8 {
+        let mut state = FfState::new();
+        state.tt_active_mask = 1 << high;
+        let rows = state.tt_section_rows();
+        assert_eq!(usize::from(rows), (high + 1) * 4);
+        let mut dst = destination(rows);
+        state.fill_tt_section(&mut dst);
+        assert_filled(&dst);
+    }
+    for index in [0, 1, 7, 39] {
+        let state = state_with_palette_high_water(index);
+        let key = blend_key();
+        let rows = state.palette_section_rows(&key);
+        assert_eq!(u32::from(rows), (index + 1) * 4);
+        let mut dst = destination(rows);
+        state.fill_palette_section(&key, &mut dst);
+        assert_filled(&dst);
     }
 }

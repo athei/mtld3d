@@ -26,6 +26,7 @@ use mtld3d_core::{
         LibrarySlot, Resolution, mark_kept_reads, may_skip_draw,
     },
     build_index::BuildLookup,
+    draw_data::{FixedPsSource, FixedVsSource, ProgrammablePsSource, ProgrammableVsSource},
     dxso::{
         DxsoProgram, FfPsKey, FfVsKey, LOG_TARGET as MSL_TRACE_TARGET, VariantKey, VsSamplerKinds,
         emit_ps_ff_named, emit_ps_programmable_named, emit_vs_ff_named, emit_vs_programmable_named,
@@ -53,7 +54,7 @@ use super::{
     open_or_create_cache_file,
 };
 use crate::{
-    draw::{PsSource, ShaderRef, VsSource},
+    draw::{PsSourceView, ShaderRef, VsSourceView},
     native_call,
 };
 
@@ -311,9 +312,9 @@ impl PipelineIdentity {
 
 /// What a deferred draw's pipeline build needs besides its two functions.
 ///
-/// Kept from the draw's encoding to its submission, since the draw's
-/// sources are not: `VsSource` and `PsSource` live in the frame's scratch
-/// and are neither `Clone` nor `Copy`.
+/// Retained from encoding through submission without borrowing shader source
+/// views from the frame arena. The pipeline identity preserves the source keys
+/// needed when the two compiled functions become ready.
 pub struct DeferredTemplate {
     /// The draw's pipeline snapshot; its functions are filled in as its libraries land.
     snapshot: PipelineSnapshot,
@@ -637,16 +638,18 @@ impl FrameEncoder {
     /// The borrowed outcome is one pointer: unknown, recorded failure, or
     /// ready handles. It stays borrowed until both warm stages are known.
     #[inline]
-    pub fn lookup_vs_library(&self, source: &VsSource) -> Option<&Option<StageLibHandles>> {
+    pub fn lookup_vs_library(&self, source: VsSourceView<'_>) -> Option<&Option<StageLibHandles>> {
         match source {
-            VsSource::FixedFunction { key, .. } => self.ff_vs_libs.lookup_entry(key),
-            VsSource::Programmable {
+            VsSourceView::FixedFunction(FixedVsSource { key, .. }) => {
+                self.ff_vs_libs.lookup_entry(key)
+            }
+            VsSourceView::Programmable(ProgrammableVsSource {
                 vs_id,
                 provided_input_mask,
                 clip_plane_count,
                 sampler_kinds,
                 ..
-            } => self.prog_vs_libs.lookup_entry(&(
+            }) => self.prog_vs_libs.lookup_entry(&(
                 *vs_id,
                 *provided_input_mask,
                 *clip_plane_count,
@@ -668,7 +671,7 @@ impl FrameEncoder {
     /// draw that names them and are never removed, so a missing program is
     /// as final as a rejected one.
     #[inline]
-    pub fn resolve_vs_library(&mut self, source: &VsSource) -> Resolution<StageLibHandles> {
+    pub fn resolve_vs_library(&mut self, source: VsSourceView<'_>) -> Resolution<StageLibHandles> {
         match self.lookup_vs_library(source) {
             Some(Some(handles)) => return Resolution::Ready(*handles),
             Some(None) => return Resolution::Failed,
@@ -680,7 +683,7 @@ impl FrameEncoder {
     /// The cold half of [`Self::resolve_vs_library`], out of line so a hit pays nothing for it.
     #[cold]
     #[inline(never)]
-    fn resolve_vs_library_miss(&mut self, source: &VsSource) -> Resolution<StageLibHandles> {
+    fn resolve_vs_library_miss(&mut self, source: VsSourceView<'_>) -> Resolution<StageLibHandles> {
         let mut miss_ns = 0;
         let miss = NanosSetTimer::start(&raw mut miss_ns);
         let begun = self.begin_vs_library(source);
@@ -705,16 +708,18 @@ impl FrameEncoder {
         resolution
     }
 
-    fn record_vs_library(&mut self, source: &VsSource, outcome: Option<StageLibHandles>) {
+    fn record_vs_library(&mut self, source: VsSourceView<'_>, outcome: Option<StageLibHandles>) {
         match source {
-            VsSource::FixedFunction { key, .. } => self.ff_vs_libs.record(key.clone(), outcome),
-            VsSource::Programmable {
+            VsSourceView::FixedFunction(FixedVsSource { key, .. }) => {
+                self.ff_vs_libs.record(key.clone(), outcome);
+            }
+            VsSourceView::Programmable(ProgrammableVsSource {
                 vs_id,
                 provided_input_mask,
                 clip_plane_count,
                 sampler_kinds,
                 ..
-            } => self.prog_vs_libs.record(
+            }) => self.prog_vs_libs.record(
                 (
                     *vs_id,
                     *provided_input_mask,
@@ -732,10 +737,10 @@ impl FrameEncoder {
     /// shader), bridges the warm-loaded disk-keyed `lib_cache`, and queues
     /// the build otherwise. Every `VsKey` variant of a shader maps to the
     /// same `disk_key`.
-    fn begin_vs_library(&mut self, source: &VsSource) -> Begun {
+    fn begin_vs_library(&mut self, source: VsSourceView<'_>) -> Begun {
         let disk_key = source.disk_key();
         let (kind, program) = match source {
-            VsSource::Programmable { vs_id, .. } => {
+            VsSourceView::Programmable(ProgrammableVsSource { vs_id, .. }) => {
                 let Some(program) = self.program_cache.get(vs_id) else {
                     error!(target: LOG_TARGET, "VS {vs_id:#x} missing from program_cache");
                     return Begun::Failed;
@@ -745,7 +750,7 @@ impl FrameEncoder {
                     Some(Arc::clone(program)),
                 )
             }
-            VsSource::FixedFunction { .. } => (Some(CachedKind::FfVs), None),
+            VsSourceView::FixedFunction(_) => (Some(CachedKind::FfVs), None),
         };
         // `lib_cache` owns every library built from here, and device
         // teardown destroys what it holds. A shader with no cache kind would
@@ -767,13 +772,13 @@ impl FrameEncoder {
         }
         let input = match (source, program) {
             (
-                VsSource::Programmable {
+                VsSourceView::Programmable(ProgrammableVsSource {
                     vs_id,
                     provided_input_mask,
                     clip_plane_count,
                     sampler_kinds,
                     ..
-                },
+                }),
                 Some(program),
             ) => LibraryInput::ProgrammableVs {
                 vs_id: *vs_id,
@@ -782,10 +787,10 @@ impl FrameEncoder {
                 clip_plane_count: *clip_plane_count,
                 sampler_kinds: *sampler_kinds,
             },
-            (VsSource::FixedFunction { key, .. }, _) => {
+            (VsSourceView::FixedFunction(FixedVsSource { key, .. }), _) => {
                 LibraryInput::FixedFunctionVs { key: key.clone() }
             }
-            (VsSource::Programmable { .. }, None) => return Begun::Failed,
+            (VsSourceView::Programmable(_), None) => return Begun::Failed,
         };
         Begun::Queued(self.enqueue_library(input, reference))
     }
@@ -797,15 +802,15 @@ impl FrameEncoder {
     #[inline]
     pub fn lookup_ps_library(
         &self,
-        source: &PsSource,
+        source: PsSourceView<'_>,
         variant: VariantKey,
     ) -> Option<&Option<StageLibHandles>> {
         match source {
-            PsSource::FixedFunction { key, .. } => self
+            PsSourceView::FixedFunction(FixedPsSource { key, .. }) => self
                 .ff_ps_libs
                 .get(key)
                 .and_then(|variants| variants.lookup_entry(&variant)),
-            PsSource::Programmable { ps_id, .. } => {
+            PsSourceView::Programmable(ProgrammablePsSource { ps_id, .. }) => {
                 self.prog_ps_libs.lookup_entry(&(*ps_id, variant))
             }
         }
@@ -821,7 +826,7 @@ impl FrameEncoder {
     #[inline]
     pub fn resolve_ps_library(
         &mut self,
-        source: &PsSource,
+        source: PsSourceView<'_>,
         variant: VariantKey,
     ) -> Resolution<StageLibHandles> {
         match self.lookup_ps_library(source, variant) {
@@ -837,7 +842,7 @@ impl FrameEncoder {
     #[inline(never)]
     fn resolve_ps_library_miss(
         &mut self,
-        source: &PsSource,
+        source: PsSourceView<'_>,
         variant: VariantKey,
     ) -> Resolution<StageLibHandles> {
         let mut miss_ns = 0;
@@ -866,28 +871,28 @@ impl FrameEncoder {
 
     fn record_ps_library(
         &mut self,
-        source: &PsSource,
+        source: PsSourceView<'_>,
         variant: VariantKey,
         outcome: Option<StageLibHandles>,
     ) {
         match source {
-            PsSource::FixedFunction { key, .. } => {
+            PsSourceView::FixedFunction(FixedPsSource { key, .. }) => {
                 self.ff_ps_libs
                     .entry(key.clone())
                     .or_default()
                     .record(variant, outcome);
             }
-            PsSource::Programmable { ps_id, .. } => {
+            PsSourceView::Programmable(ProgrammablePsSource { ps_id, .. }) => {
                 self.prog_ps_libs.record((*ps_id, variant), outcome);
             }
         }
     }
 
     /// Cold half of [`Self::resolve_ps_library`]; the `disk_key` folds in `variant`.
-    fn begin_ps_library(&mut self, source: &PsSource, variant: VariantKey) -> Begun {
+    fn begin_ps_library(&mut self, source: PsSourceView<'_>, variant: VariantKey) -> Begun {
         let disk_key = source.disk_key(variant);
         let (kind, program) = match source {
-            PsSource::Programmable { ps_id, .. } => {
+            PsSourceView::Programmable(ProgrammablePsSource { ps_id, .. }) => {
                 let Some(program) = self.program_cache.get(ps_id) else {
                     error!(target: LOG_TARGET, "PS {ps_id:#x} missing from program_cache");
                     return Begun::Failed;
@@ -897,7 +902,7 @@ impl FrameEncoder {
                     Some(Arc::clone(program)),
                 )
             }
-            PsSource::FixedFunction { .. } => (Some(CachedKind::FfPs), None),
+            PsSourceView::FixedFunction(_) => (Some(CachedKind::FfPs), None),
         };
         // See `begin_vs_library`: a library no cache kind owns would outlive
         // its device.
@@ -916,16 +921,20 @@ impl FrameEncoder {
             return Begun::Bridged(handles);
         }
         let input = match (source, program) {
-            (PsSource::Programmable { ps_id, .. }, Some(program)) => LibraryInput::ProgrammablePs {
-                ps_id: *ps_id,
-                program,
-                variant,
-            },
-            (PsSource::FixedFunction { key, .. }, _) => LibraryInput::FixedFunctionPs {
-                key: key.clone(),
-                variant,
-            },
-            (PsSource::Programmable { .. }, None) => return Begun::Failed,
+            (PsSourceView::Programmable(ProgrammablePsSource { ps_id, .. }), Some(program)) => {
+                LibraryInput::ProgrammablePs {
+                    ps_id: *ps_id,
+                    program,
+                    variant,
+                }
+            }
+            (PsSourceView::FixedFunction(FixedPsSource { key, .. }), _) => {
+                LibraryInput::FixedFunctionPs {
+                    key: key.clone(),
+                    variant,
+                }
+            }
+            (PsSourceView::Programmable(_), None) => return Begun::Failed,
         };
         Begun::Queued(self.enqueue_library(input, reference))
     }
@@ -1853,18 +1862,18 @@ impl FrameEncoder {
 }
 
 /// `prog 0x…` / `ff 0x…` for a vertex-shader source, keyed as its library is.
-fn vs_source_tag(source: &VsSource) -> String {
+fn vs_source_tag(source: VsSourceView<'_>) -> String {
     PairShaderId {
-        is_programmable: matches!(source, VsSource::Programmable { .. }),
+        is_programmable: matches!(source, VsSourceView::Programmable(_)),
         hash: source.disk_key(),
     }
     .tag()
 }
 
 /// `prog 0x…` / `ff 0x…` for a pixel-shader source and variant, keyed as its library is.
-fn ps_source_tag(source: &PsSource, variant: VariantKey) -> String {
+fn ps_source_tag(source: PsSourceView<'_>, variant: VariantKey) -> String {
     PairShaderId {
-        is_programmable: matches!(source, PsSource::Programmable { .. }),
+        is_programmable: matches!(source, PsSourceView::Programmable(_)),
         hash: source.disk_key(variant),
     }
     .tag()
@@ -1881,11 +1890,11 @@ fn pipeline_identity(
     PipelineIdentity {
         shader_refs: pipeline_shader_refs(program_cache, shaders),
         vs: PairShaderId {
-            is_programmable: matches!(shaders.vs, VsSource::Programmable { .. }),
+            is_programmable: matches!(shaders.vs, VsSourceView::Programmable(_)),
             hash: shaders.vs.disk_key(),
         },
         ps: PairShaderId {
-            is_programmable: matches!(shaders.ps, PsSource::Programmable { .. }),
+            is_programmable: matches!(shaders.ps, PsSourceView::Programmable(_)),
             hash: shaders.ps.disk_key(shaders.variant),
         },
     }
@@ -1896,15 +1905,15 @@ fn pipeline_shader_refs(
     shaders: &ShaderRef<'_>,
 ) -> Option<(ShaderRecordRef, ShaderRecordRef)> {
     let vs_kind = match shaders.vs {
-        VsSource::FixedFunction { .. } => CachedKind::FfVs,
-        VsSource::Programmable { vs_id, .. } => {
+        VsSourceView::FixedFunction(_) => CachedKind::FfVs,
+        VsSourceView::Programmable(ProgrammableVsSource { vs_id, .. }) => {
             let major = program_cache.get(vs_id)?.major;
             CachedKind::from_programmable(major, false)?
         }
     };
     let ps_kind = match shaders.ps {
-        PsSource::FixedFunction { .. } => CachedKind::FfPs,
-        PsSource::Programmable { ps_id, .. } => {
+        PsSourceView::FixedFunction(_) => CachedKind::FfPs,
+        PsSourceView::Programmable(ProgrammablePsSource { ps_id, .. }) => {
             let major = program_cache.get(ps_id)?.major;
             CachedKind::from_programmable(major, true)?
         }
