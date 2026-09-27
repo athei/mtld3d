@@ -2300,10 +2300,7 @@ impl DeviceInner {
         }
         if value == RS_DEFAULTS[index] {
             if mtld3d_core::state_trace::enabled() {
-                log::trace!(
-                    target: mtld3d_core::state_trace::TARGET,
-                    "D3DRS_{index} = {value:#x} (default — write suppressed in warn machinery)"
-                );
+                Self::trace_default_rs(index, value);
             }
             return;
         }
@@ -2316,16 +2313,38 @@ impl DeviceInner {
         );
         if matches!(class, RsClass::Consumed) {
             if mtld3d_core::state_trace::enabled() {
-                let default = RS_DEFAULTS[index];
-                log::trace!(
-                    target: mtld3d_core::state_trace::TARGET,
-                    "D3DRS_{index} Consumed = {value:#x} (default {default:#x})"
-                );
+                Self::trace_consumed_rs(index, value, RS_DEFAULTS[index]);
             }
             return;
         }
         self.mark_rs_warn(index);
-        let default = RS_DEFAULTS[index];
+        Self::log_unconsumed_rs(index, value, RS_DEFAULTS[index], &class);
+    }
+
+    /// Keep trace formatting off the ordinary render-state setter stack.
+    #[cold]
+    #[inline(never)]
+    fn trace_default_rs(index: usize, value: u32) {
+        log::trace!(
+            target: mtld3d_core::state_trace::TARGET,
+            "D3DRS_{index} = {value:#x} (default — write suppressed in warn machinery)"
+        );
+    }
+
+    /// Keep consumed-state trace formatting off the ordinary setter stack.
+    #[cold]
+    #[inline(never)]
+    fn trace_consumed_rs(index: usize, value: u32, default: u32) {
+        log::trace!(
+            target: mtld3d_core::state_trace::TARGET,
+            "D3DRS_{index} Consumed = {value:#x} (default {default:#x})"
+        );
+    }
+
+    /// Format a diagnostic only after its once-per-slot latch is marked.
+    #[cold]
+    #[inline(never)]
+    fn log_unconsumed_rs(index: usize, value: u32, default: u32, class: &RsClass) {
         match class {
             RsClass::Consumed => {} // unreachable given early-return above
             RsClass::Obsolete(reason) => {
