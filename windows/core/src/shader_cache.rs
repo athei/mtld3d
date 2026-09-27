@@ -976,15 +976,72 @@ pub fn read_header(bytes: &[u8]) -> Result<CacheHeader, CacheReadError> {
 /// well-formed file.
 #[must_use]
 pub fn read_records(bytes: &[u8]) -> CacheRecords {
+    parse_records(bytes, RecordMode::CurrentEmitter).0
+}
+
+/// Validated on-disk inventory, independent of the reader's emitter fingerprint.
+///
+/// These counts describe stored records, not whether this build can reuse their MSL.
+pub struct CacheStats {
+    pub shaders: usize,
+    pub ff_shaders: usize,
+    pub pipelines: usize,
+    pub needs_compaction: bool,
+}
+
+/// Count schema-compatible records without modifying the cache or filtering old emitters.
+///
+/// Uses the runtime parser's checksums, payload validation and deduplication. Unlike
+/// runtime recovery, diagnostics reject malformed data rather than report a valid prefix.
+///
+/// # Errors
+///
+/// Rejects a wrong header or schema, damaged chunks, malformed records and dangling
+/// pipeline references.
+pub fn read_stats(bytes: &[u8]) -> Result<CacheStats, &'static str> {
+    let header = read_header(bytes).map_err(|_| "not a shader cache")?;
+    if header != CacheHeader::CURRENT {
+        return Err("incompatible cache format or shader schema");
+    }
+    let (records, valid) = parse_records(bytes, RecordMode::StoredInventory);
+    if !valid {
+        return Err("malformed shader cache records");
+    }
+    Ok(CacheStats {
+        shaders: records.shaders.len(),
+        ff_shaders: records
+            .shaders
+            .iter()
+            .filter(|entry| !entry.kind.is_programmable())
+            .count(),
+        pipelines: records.pipelines.len(),
+        needs_compaction: records.needs_compaction,
+    })
+}
+
+enum RecordMode {
+    CurrentEmitter,
+    StoredInventory,
+}
+
+struct RecordSelection {
+    mode: RecordMode,
+    duplicates: bool,
+}
+
+fn parse_records(bytes: &[u8], mode: RecordMode) -> (CacheRecords, bool) {
     let mut shaders = Vec::new();
     let mut pipelines = Vec::new();
     if bytes.len() < HEADER_LEN {
-        return CacheRecords {
-            shaders,
-            pipelines,
-            needs_compaction: false,
-            valid_len: 0,
-        };
+        return (
+            CacheRecords {
+                shaders,
+                pipelines,
+                needs_compaction: false,
+                valid_len: 0,
+            },
+            false,
+        );
     }
     let mut off = HEADER_LEN;
     let mut single_count: usize = 0;
@@ -992,7 +1049,10 @@ pub fn read_records(bytes: &[u8]) -> CacheRecords {
     let mut other_chunk = false;
     let mut seen_shaders = FxHashMap::default();
     let mut seen_pipelines: FxHashSet<u64> = FxHashSet::default();
-    let mut duplicates = false;
+    let mut selection = RecordSelection {
+        mode,
+        duplicates: false,
+    };
 
     while off + CHUNK_HEADER_LEN <= bytes.len() {
         if bytes[off..off + 8] == SHADER_CACHE_MAGIC {
@@ -1047,7 +1107,7 @@ pub fn read_records(bytes: &[u8]) -> CacheRecords {
                             &mut pipelines,
                             &mut seen_shaders,
                             &mut seen_pipelines,
-                            &mut duplicates,
+                            &mut selection,
                         );
                     }
                 }
@@ -1063,7 +1123,7 @@ pub fn read_records(bytes: &[u8]) -> CacheRecords {
                         &mut pipelines,
                         &mut seen_shaders,
                         &mut seen_pipelines,
-                        &mut duplicates,
+                        &mut selection,
                     ),
                     _ => other_chunk = true,
                 },
@@ -1079,7 +1139,7 @@ pub fn read_records(bytes: &[u8]) -> CacheRecords {
                         &mut pipelines,
                         &mut seen_shaders,
                         &mut seen_pipelines,
-                        &mut duplicates,
+                        &mut selection,
                     ),
                     None => other_chunk = true,
                 },
@@ -1109,15 +1169,18 @@ pub fn read_records(bytes: &[u8]) -> CacheRecords {
     let already_optimal = bundle_count == 1
         && single_count == 0
         && !other_chunk
-        && !duplicates
+        && !selection.duplicates
         && !dangling
         && !trailing_garbage;
-    CacheRecords {
-        shaders,
-        pipelines,
-        needs_compaction: !already_optimal,
-        valid_len: off,
-    }
+    (
+        CacheRecords {
+            shaders,
+            pipelines,
+            needs_compaction: !already_optimal,
+            valid_len: off,
+        },
+        !other_chunk && !dangling && !trailing_garbage,
+    )
 }
 
 /// Emit the 16-byte file header into `buf`.
@@ -1528,21 +1591,24 @@ fn push_record(
     pipelines: &mut Vec<PipelineRecipe>,
     seen_shaders: &mut FxHashMap<ShaderRecordRef, usize>,
     seen_pipelines: &mut FxHashSet<u64>,
-    duplicates: &mut bool,
+    selection: &mut RecordSelection,
 ) {
     match record {
         PlainRecord::Shader(entry) => {
-            if entry.needs_regeneration() && entry.source.is_none() {
+            if matches!(selection.mode, RecordMode::CurrentEmitter)
+                && entry.needs_regeneration()
+                && entry.source.is_none()
+            {
                 mtld3d_shared::log_once_info!(
                     target: crate::LOG_TARGET,
                     "shader_cache: discarded stale MSL without retained DXSO"
                 );
-                *duplicates = true;
+                selection.duplicates = true;
                 return;
             }
             let reference = ShaderRecordRef::new(entry.kind, entry.key);
             if let Some(&index) = seen_shaders.get(&reference) {
-                *duplicates = true;
+                selection.duplicates = true;
                 // A refreshed append wins over an older emitter, in either record order.
                 let old = &mut shaders[index];
                 if !entry.needs_regeneration() && old.needs_regeneration() {
@@ -1557,7 +1623,7 @@ fn push_record(
             if seen_pipelines.insert(recipe.disk_key()) {
                 pipelines.push(*recipe);
             } else {
-                *duplicates = true;
+                selection.duplicates = true;
             }
         }
     }

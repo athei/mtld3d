@@ -543,7 +543,19 @@ fn read_draw(reader: &mut WireReader<'_>) -> Result<DrawOp, WireError> {
         }
         _ => return Err(WireError::InvalidValue),
     };
-    let index_source = match reader.u8()? {
+    let index_source = read_indices(reader)?;
+    validate_draw(&vertex_source, &index_source)?;
+    // Bound resources remain numeric descriptors here. Packet validation checks their
+    // exact published identities before replay; only ScratchSlice forms borrowed bytes.
+    Ok(DrawOp {
+        metal_prim,
+        vertex_source,
+        index_source,
+    })
+}
+
+fn read_indices(reader: &mut WireReader<'_>) -> Result<IndexSource, WireError> {
+    Ok(match reader.u8()? {
         0 => IndexSource::None {
             start_vertex: WireValue::read_wire(reader)?,
             vertex_count: WireValue::read_wire(reader)?,
@@ -575,14 +587,6 @@ fn read_draw(reader: &mut WireReader<'_>) -> Result<DrawOp, WireError> {
             index_type: WireValue::read_wire(reader)?,
         },
         _ => return Err(WireError::InvalidValue),
-    };
-    validate_draw(&vertex_source, &index_source)?;
-    // Bound resources remain numeric descriptors here. Packet validation checks their
-    // exact published identities before replay; only ScratchSlice forms borrowed bytes.
-    Ok(DrawOp {
-        metal_prim,
-        vertex_source,
-        index_source,
     })
 }
 
@@ -636,6 +640,10 @@ fn validate_draw(vertices: &VertexSource, indices: &IndexSource) -> Result<(), W
             }
         }
     }
+    validate_indices(indices)
+}
+
+fn validate_indices(indices: &IndexSource) -> Result<(), WireError> {
     match indices {
         IndexSource::Bound {
             backing_ptr,
@@ -695,6 +703,111 @@ fn validate_index_bytes(
         .ok_or(WireError::TooLarge)?;
     if required > length {
         return Err(WireError::InvalidValue);
+    }
+    Ok(())
+}
+
+/// Validate a draw without constructing stream storage or borrowing backing bytes.
+///
+/// # Errors
+/// Rejects malformed fields, invalid byte extents, or a backing identity rejected by
+/// the caller's retained-inventory check.
+pub fn validate_wire_draw(
+    reader: &mut WireReader<'_>,
+    mut backing: impl FnMut(u64, u64) -> Result<(), WireError>,
+) -> Result<(), WireError> {
+    mtld3d_shared::mtl::PrimitiveType::read_wire(reader)?;
+    match reader.u8()? {
+        0 => {
+            let bytes = read_scratch_slice(reader)?;
+            let size = reader.u32()?;
+            reader.u32()?;
+            if size > bytes.as_raw().1 {
+                return Err(WireError::InvalidValue);
+            }
+        }
+        1 => {
+            let mut used = 0u16;
+            let mut stream = |reader: &mut WireReader<'_>| -> Result<(), WireError> {
+                let value = read_stream(reader)?;
+                if value.stream >= 16 || used & (1 << value.stream) != 0 {
+                    return Err(WireError::InvalidValue);
+                }
+                used |= 1 << value.stream;
+                validate_backing(value.backing_ptr, value.backing_len)?;
+                backing(value.backing_ptr as u64, value.backing_len as u64)
+            };
+            stream(reader)?;
+            let count = reader.u32()?;
+            if count > 15 {
+                return Err(WireError::InvalidValue);
+            }
+            for _ in 0..count {
+                stream(reader)?;
+            }
+            reader.u32()?;
+        }
+        _ => return Err(WireError::InvalidValue),
+    }
+    let indices = read_indices(reader)?;
+    validate_indices(&indices)?;
+    if let IndexSource::Bound {
+        backing_ptr,
+        backing_len,
+        ..
+    } = indices
+    {
+        backing(backing_ptr as u64, backing_len as u64)?;
+    }
+    Ok(())
+}
+
+/// Validate dirty snapshot values without building native snapshots or allocating scratch.
+///
+/// # Errors
+/// Rejects malformed masks, fields, or byte ranges outside the reader's retained inventory.
+pub fn validate_wire_snapshot(reader: &mut WireReader<'_>) -> Result<(), WireError> {
+    let mask = reader.u32()?;
+    if mask & !0x1ffff != 0 {
+        return Err(WireError::InvalidValue);
+    }
+    if mask & 1 != 0 {
+        RenderStateSnapshot::read_wire(reader)?;
+    }
+    if mask & 2 != 0 {
+        let stages = reader.u16()?;
+        for _ in 0..stages.count_ones() {
+            StageBinding::read_wire(reader)?;
+        }
+    }
+    if mask & 4 != 0 {
+        let count = reader.u32()?;
+        if count > 16 {
+            return Err(WireError::InvalidValue);
+        }
+        for _ in 0..count {
+            VertexAttrDesc::read_wire(reader)?;
+        }
+        <[u32; 16]>::read_wire(reader)?;
+        reader.u16()?;
+        reader.u64()?;
+    }
+    if mask & 8 != 0 {
+        VsSource::read_wire(reader)?;
+    }
+    if mask & 16 != 0 {
+        PsSource::read_wire(reader)?;
+    }
+    if mask & 32 != 0 {
+        VariantKey::read_wire(reader)?;
+    }
+    for index in 0..10 {
+        if mask & (1 << (index + 6)) != 0 {
+            read_optional_bytes(reader)?;
+        }
+    }
+    if mask & (1 << 16) != 0 {
+        DepthStencilFlags::read_wire(reader)?;
     }
     Ok(())
 }

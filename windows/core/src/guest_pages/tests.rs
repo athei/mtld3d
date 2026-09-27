@@ -115,3 +115,91 @@ fn invalid_descriptor_does_not_publish_completion() {
     unsafe { lease.cancel_unadopted() };
     assert!(lease.maintain());
 }
+
+fn retire_pooled_lease(
+    mut lease: GuestPageLease,
+    cells: &crate::guest_completions::CompletionPool,
+) {
+    // SAFETY: this fixture retains the original allocation until the unique native owner drops.
+    let native = unsafe { lease.descriptor().adopt_owned() }.expect("native owner");
+    assert!(!lease.maintain());
+    drop(native);
+    cells.drain(
+        &mut crate::guest_completions::CompletionDrain::default(),
+        16,
+        |_| {},
+    );
+    assert!(lease.maintain());
+    cells.recycle(lease.into_slot().expect("pooled completion"));
+}
+
+#[test]
+fn retired_vbib_returns_original_pages_and_contents_to_guest_pool() {
+    // The runtime uses an existing process-lifetime pool; retain that lifetime in this fixture.
+    let pool = Box::leak(Box::new(PageBoxPool::new(PAGE_SIZE * 2)));
+    let mut original = PageBox::new_zeroed(12);
+    // SAFETY: the original allocation is uniquely owned and the first byte is in bounds.
+    unsafe { original.as_mut_ptr().write(73) };
+    let address = original.as_ptr();
+    assert!(pool.recycle(original).is_none());
+    let original = pool.acquire(12).expect("initial pool acquire");
+    let cells = crate::guest_completions::CompletionPool::new();
+    let mut lease = GuestPageLease::for_recyclable_pooled(original, &cells, Some(pool));
+    // SAFETY: the lease remains alive through native retirement and notification consumption.
+    let native = unsafe { lease.descriptor().adopt_owned() }.expect("native owner");
+    assert!(pool.acquire(12).is_none());
+    assert!(!lease.maintain());
+    drop(native);
+    assert!(
+        !lease.maintain(),
+        "publication alone cannot reclaim queued completion"
+    );
+    cells.drain(
+        &mut crate::guest_completions::CompletionDrain::default(),
+        16,
+        |_| {},
+    );
+    assert!(lease.maintain());
+    cells.recycle(lease.into_slot().expect("pooled completion"));
+    let reused = pool.acquire(12).expect("original guest pages returned");
+    assert!(reused.is_native_owned());
+    assert_eq!(reused.as_ptr(), address);
+    // SAFETY: the first byte was initialized and no native consumer retains the allocation.
+    assert_eq!(unsafe { reused.as_ptr().read() }, 73);
+}
+
+#[test]
+fn guest_pool_return_preserves_disabled_and_capacity_filters() {
+    for cap in [0, PAGE_SIZE] {
+        let pool = Box::leak(Box::new(PageBoxPool::new(cap)));
+        let cells = crate::guest_completions::CompletionPool::new();
+        let lease = GuestPageLease::for_recyclable_pooled(
+            PageBox::new_zeroed(PAGE_SIZE * 2),
+            &cells,
+            Some(pool),
+        );
+        retire_pooled_lease(lease, &cells);
+        assert!(pool.acquire(PAGE_SIZE * 2).is_none());
+    }
+}
+
+#[test]
+fn guest_pool_return_excludes_aliases_readers_and_texture_owners() {
+    let pool = Box::leak(Box::new(PageBoxPool::new(PAGE_SIZE * 8)));
+    for hold_read in [false, true] {
+        let cells = crate::guest_completions::CompletionPool::new();
+        let lease =
+            GuestPageLease::for_recyclable_pooled(PageBox::new_zeroed(12), &cells, Some(pool));
+        let external = Arc::clone(&lease.owner);
+        let read = hold_read.then(|| PageBoxRead::new(Arc::clone(&external)));
+        retire_pooled_lease(lease, &cells);
+        assert!(pool.acquire(12).is_none());
+        drop(read);
+        drop(external);
+    }
+    let cells = crate::guest_completions::CompletionPool::new();
+    let texture = GuestPageLease::for_shared_pooled(Arc::new(PageBox::new_zeroed(12)), &cells);
+    assert!(texture.recycle_pool.is_none());
+    retire_pooled_lease(texture, &cells);
+    assert!(pool.acquire(12).is_none());
+}

@@ -177,25 +177,21 @@ impl FramePacket {
     ///
     /// Standalone test leases remain owned by this packet.
     pub fn take_leases(&mut self) -> impl Iterator<Item = PacketLease> + '_ {
-        let admitted = self.flags.contains(PacketFlags::ADMITTED)
-            && !self.was_rejected()
-            && self
-                .completion
-                .as_ref()
-                .is_some_and(|cell| cell.is_complete());
+        let admitted = self.flags.contains(PacketFlags::ADMITTED) && self.can_retire_leases();
         self.pages
-            .extract_if(.., move |lease| admitted && lease.token().is_some())
+            .extract_if(.., |lease| lease.token().is_some())
             .map(PacketLease::Page)
             .chain(
                 self.queries
-                    .extract_if(.., move |lease| admitted && lease.token().is_some())
+                    .extract_if(.., |lease| lease.token().is_some())
                     .map(PacketLease::Query),
             )
             .chain(
                 self.redirties
-                    .extract_if(.., move |lease| admitted && lease.tokens()[0].is_some())
+                    .extract_if(.., |lease| lease.tokens()[0].is_some())
                     .map(PacketLease::Redirty),
             )
+            .take(if admitted { usize::MAX } else { 0 })
     }
 
     /// Record successful admission while preserving all published owners.
@@ -282,19 +278,20 @@ impl FramePacket {
         }
     }
 
+    fn can_retire_leases(&self) -> bool {
+        self.recording_error.is_none()
+            && self
+                .completion
+                .as_ref()
+                .is_some_and(|cell| cell.is_complete())
+            && (self.flags.contains(PacketFlags::CANCELLED)
+                || (self.flags.contains(PacketFlags::ADMITTED) && !self.was_rejected()))
+    }
+
     /// Retire resource owners whose native acknowledgments have arrived.
     #[must_use]
     pub fn maintain(&mut self) -> bool {
-        if self.recording_error.is_some()
-            || (!self.flags.contains(PacketFlags::ADMITTED)
-                && !self
-                    .completion
-                    .as_ref()
-                    .is_some_and(|cell| cell.is_complete()))
-        {
-            return false;
-        }
-        if self.was_rejected() && !self.flags.contains(PacketFlags::CANCELLED) {
+        if !self.can_retire_leases() {
             return false;
         }
         let replay_complete = self

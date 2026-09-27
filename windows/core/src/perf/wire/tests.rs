@@ -1,7 +1,5 @@
 use mtld3d_shared::encoder_wire::FrameSlab;
 #[cfg(perf_tracking)]
-use mtld3d_shared::tsc::tsc_hz;
-#[cfg(perf_tracking)]
 use strum::EnumCount;
 
 #[cfg(perf_tracking)]
@@ -23,7 +21,7 @@ fn tracking_marker_must_match_build() {
         Err(WireError::InvalidValue)
     ));
     assert!(matches!(
-        FramePerfPayload::read_wire(&mut WireReader::new(&[2])),
+        FramePerfPayload::read_wire(&mut WireReader::new(&[3])),
         Err(WireError::InvalidValue)
     ));
 }
@@ -53,8 +51,8 @@ fn default_payload_and_all_truncations() {
 
 #[cfg(perf_tracking)]
 #[test]
-fn wire_durations_are_nanoseconds_and_counts_are_exact() {
-    let frequency = tsc_hz();
+fn wire_durations_preserve_source_ticks_without_calibration() {
+    let frequency = 123_456_789;
     let payload = FramePerfPayload {
         counters: FrameCounters {
             reset_epoch: 1,
@@ -105,7 +103,7 @@ fn wire_durations_are_nanoseconds_and_counts_are_exact() {
             op_vec_realloc_bytes: 44,
         },
     };
-    let mut expected_bytes = vec![1_u8];
+    let mut expected_bytes = vec![2_u8];
     expected_bytes.extend_from_slice(&(1_u64).to_le_bytes());
     expected_bytes.extend_from_slice(&(1_u8).to_le_bytes());
     for _ in 0..3 {
@@ -149,29 +147,29 @@ fn wire_durations_are_nanoseconds_and_counts_are_exact() {
         expected_bytes.extend_from_slice(&(33_u32).to_le_bytes());
     }
     for _ in 0..ApiCategory::COUNT {
-        expected_bytes.extend_from_slice(&(5_000_000_000_u64).to_le_bytes());
+        expected_bytes.extend_from_slice(&(5_u64 * frequency).to_le_bytes());
     }
-    expected_bytes.extend_from_slice(&(25_000_000_000_u64).to_le_bytes());
+    expected_bytes.extend_from_slice(&(25_u64 * frequency).to_le_bytes());
     for _ in 0..DeviceSubCategory::COUNT {
-        expected_bytes.extend_from_slice(&(26_000_000_000_u64).to_le_bytes());
+        expected_bytes.extend_from_slice(&(26_u64 * frequency).to_le_bytes());
     }
     for _ in 0..BindSubCategory::COUNT {
-        expected_bytes.extend_from_slice(&(28_000_000_000_u64).to_le_bytes());
+        expected_bytes.extend_from_slice(&(28_u64 * frequency).to_le_bytes());
     }
     for _ in 0..SurfaceSubCategory::COUNT {
-        expected_bytes.extend_from_slice(&(30_000_000_000_u64).to_le_bytes());
+        expected_bytes.extend_from_slice(&(30_u64 * frequency).to_le_bytes());
     }
-    expected_bytes.extend_from_slice(&(34_000_000_000_u64).to_le_bytes());
-    expected_bytes.extend_from_slice(&(35_000_000_000_u64).to_le_bytes());
-    expected_bytes.extend_from_slice(&(36_000_000_000_u64).to_le_bytes());
-    expected_bytes.extend_from_slice(&(37_000_000_000_u64).to_le_bytes());
-    expected_bytes.extend_from_slice(&(38_000_000_000_u64).to_le_bytes());
-    expected_bytes.extend_from_slice(&(39_000_000_000_u64).to_le_bytes());
-    expected_bytes.extend_from_slice(&(40_000_000_000_u64).to_le_bytes());
+    expected_bytes.extend_from_slice(&(34_u64 * frequency).to_le_bytes());
+    expected_bytes.extend_from_slice(&(35_u64 * frequency).to_le_bytes());
+    expected_bytes.extend_from_slice(&(36_u64 * frequency).to_le_bytes());
+    expected_bytes.extend_from_slice(&(37_u64 * frequency).to_le_bytes());
+    expected_bytes.extend_from_slice(&(38_u64 * frequency).to_le_bytes());
+    expected_bytes.extend_from_slice(&(39_u64 * frequency).to_le_bytes());
+    expected_bytes.extend_from_slice(&(40_u64 * frequency).to_le_bytes());
     expected_bytes.extend_from_slice(&(43_u64).to_le_bytes());
     expected_bytes.extend_from_slice(&(44_u64).to_le_bytes());
-    expected_bytes.extend_from_slice(&(41_000_000_000_u64).to_le_bytes());
-    expected_bytes.extend_from_slice(&(42_000_000_000_u64).to_le_bytes());
+    expected_bytes.extend_from_slice(&(41_u64 * frequency).to_le_bytes());
+    expected_bytes.extend_from_slice(&(42_u64 * frequency).to_le_bytes());
     let slab = encoded(&payload);
     let mut reader = WireReader::new(slab.as_bytes());
     let mut record = reader.next_record().unwrap().unwrap();

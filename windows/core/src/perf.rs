@@ -68,6 +68,8 @@ use super::passes::Pass;
 use super::passes::{ColorLoad, DepthLoad};
 
 pub mod compilation;
+#[cfg(perf_tracking)]
+mod deferred;
 pub mod window_line;
 mod wire;
 
@@ -1860,6 +1862,10 @@ pub struct EncoderPerfState {
     compilation: compilation::CompilationPerf,
     /// Rolling aggregator for the 2-second `info!` summary.
     perf_window: PerfWindow,
+    // Native devices always set clock domains before intake. None supports local
+    // core clients and unit fixtures whose counters already share one domain.
+    clocked: Option<deferred::ClockedSamples>,
+    submit_nanos: deferred::SubmitNanos,
 
     /// API-thread counters seeded from `FramePerfPayload` in `begin_frame`.
     ///
@@ -1923,6 +1929,8 @@ impl EncoderPerfState {
         Self {
             compilation: compilation::CompilationPerf::new(),
             perf_window: PerfWindow::new(),
+            clocked: None,
+            submit_nanos: deferred::SubmitNanos::default(),
             counters: FrameCounters::new(),
             timing: FrameTiming::new(),
             enc: EncoderFrameCounters::new(),
@@ -1943,7 +1951,10 @@ impl EncoderPerfState {
     /// accumulated its first frame.
     #[must_use]
     pub fn window_due(&self) -> bool {
-        self.perf_window.started_tsc != 0
+        self.clocked
+            .as_ref()
+            .is_none_or(|clocks| matches!(clocks.frequencies(), Ok(Some(_))))
+            && self.perf_window.started_tsc != 0
             && rdtsc().saturating_sub(self.perf_window.started_tsc)
                 >= secs_to_cycles(SUMMARY_INTERVAL_SECS)
     }
@@ -1972,11 +1983,69 @@ impl EncoderPerfState {
         self.enc.slot_waits = slot_waits;
         self.enc.gpu_cycles = gpu_cycles;
         self.enc.gpu_buffers = gpu_buffers;
+        let gpu = core::mem::take(&mut self.submit_nanos.gpu);
+        self.submit_nanos = deferred::SubmitNanos {
+            gpu,
+            ..deferred::SubmitNanos::default()
+        };
         self.per_pair_stats.clear();
+    }
+
+    /// Configure elapsed-source-tick telemetry without sharing Rust ownership with PE.
+    ///
+    /// # Safety
+    /// The aligned source mailbox stays live until `finish_deferred` completes at shutdown.
+    pub unsafe fn set_clock_domains(
+        &mut self,
+        source: u64,
+        native: std::sync::Arc<mtld3d_shared::clock_calibration::ClockCalibration>,
+    ) {
+        // SAFETY: the caller provides the device-owned mailbox lifetime.
+        self.clocked = Some(unsafe { deferred::ClockedSamples::new(source, native) });
+    }
+
+    fn drain_deferred(&mut self) {
+        while let Some((sample, compilation, hz, captured_at)) = self
+            .clocked
+            .as_mut()
+            .and_then(deferred::ClockedSamples::take_ready)
+        {
+            if self.perf_window.started_tsc == 0 {
+                self.perf_window.started_tsc = captured_at;
+            }
+            self.compilation.finish_deferred_frame(
+                compilation,
+                wire::scale_ticks(
+                    sample.enc.op_sub_cycles[OpSub::Resolve as usize],
+                    hz,
+                    1_000_000_000,
+                ),
+                wire::scale_ticks(
+                    sample.enc.op_sub_cycles[OpSub::Pipeline as usize],
+                    hz,
+                    1_000_000_000,
+                ),
+                wire::scale_ticks(sample.enc.op_cycles, hz, 1_000_000_000),
+            );
+            self.perf_window.accumulate(&sample);
+        }
+    }
+
+    /// Consume every ready sample after both calibration workers have joined.
+    pub fn finish_deferred(&mut self) {
+        self.drain_deferred();
+        if let Some(clocked) = &mut self.clocked {
+            clocked.finish();
+        }
     }
 
     pub const fn set_op_cycles(&mut self, cycles: u64) {
         self.enc.op_cycles = cycles;
+    }
+
+    /// Include native packet validation and decoding in the encoder operation stage.
+    pub const fn add_op_cycles(&mut self, cycles: u64) {
+        self.enc.op_cycles = self.enc.op_cycles.saturating_add(cycles);
     }
 
     pub const fn set_submit_cycles(&mut self, cycles: u64) {
@@ -2037,6 +2106,16 @@ impl EncoderPerfState {
         &raw mut self.enc.submit_cycles
     }
 
+    pub fn set_submit_wait_nanos(&mut self, drawable: u64, present: u64) {
+        if self.clocked.is_some() {
+            self.submit_nanos.drawable = drawable;
+            self.submit_nanos.present = present;
+        } else {
+            self.set_drawable_wait_cycles(ns_to_cycles(drawable));
+            self.set_present_wait_cycles(ns_to_cycles(present));
+        }
+    }
+
     pub const fn set_drawable_wait_cycles(&mut self, cycles: u64) {
         self.enc.drawable_wait_cycles = cycles;
     }
@@ -2059,6 +2138,22 @@ impl EncoderPerfState {
     /// values convert into our cycles here.
     pub fn fold_submit_timings(&mut self, timings: &SubmitTimings, submit_exec_cycles: u64) {
         self.enc.submit_exec_cycles = submit_exec_cycles;
+        if self.clocked.is_some() {
+            self.submit_nanos.blits = timings.leading_blits_ns;
+            self.submit_nanos.passes = timings.passes_ns;
+            self.submit_nanos.commit = timings.commit_ns;
+            for ((ns, buffers), busy) in self
+                .submit_nanos
+                .gpu
+                .iter_mut()
+                .zip(&mut self.enc.gpu_buffers)
+                .zip(&timings.gpu)
+            {
+                *ns = ns.saturating_add(busy.ns);
+                *buffers = buffers.saturating_add(busy.buffers);
+            }
+            return;
+        }
         self.enc.submit_blits_cycles = ns_to_cycles(timings.leading_blits_ns);
         self.enc.submit_passes_cycles = ns_to_cycles(timings.passes_ns);
         self.enc.submit_commit_cycles = ns_to_cycles(timings.commit_ns);
@@ -2322,12 +2417,29 @@ impl EncoderPerfState {
         self.enc.slot_waits = 0;
         self.enc.gpu_cycles = [0; CommandBufferRole::COUNT];
         self.enc.gpu_buffers = [0; CommandBufferRole::COUNT];
-        self.compilation.finish_frame(
-            compilation::cycles_to_ns(self.enc.op_sub_cycles[OpSub::Resolve as usize]),
-            compilation::cycles_to_ns(self.enc.op_sub_cycles[OpSub::Pipeline as usize]),
-            compilation::cycles_to_ns(self.enc.op_cycles),
-        );
-        self.perf_window.accumulate(&sample);
+        if let Some(clocked) = &mut self.clocked {
+            clocked.push(deferred::PendingSample {
+                sample,
+                compilation: self.compilation.defer_frame(),
+                nanos: core::mem::take(&mut self.submit_nanos),
+                captured_at: rdtsc(),
+            });
+            self.drain_deferred();
+            if !self
+                .clocked
+                .as_ref()
+                .is_some_and(|clocked| matches!(clocked.frequencies(), Ok(Some(_))))
+            {
+                return;
+            }
+        } else {
+            self.compilation.finish_frame(
+                compilation::cycles_to_ns(self.enc.op_sub_cycles[OpSub::Resolve as usize]),
+                compilation::cycles_to_ns(self.enc.op_sub_cycles[OpSub::Pipeline as usize]),
+                compilation::cycles_to_ns(self.enc.op_cycles),
+            );
+            self.perf_window.accumulate(&sample);
+        }
 
         let window_cycles = rdtsc().saturating_sub(self.perf_window.started_tsc);
         if window_cycles < secs_to_cycles(SUMMARY_INTERVAL_SECS) {
@@ -2476,7 +2588,14 @@ impl EncoderPerfState {
     #[inline]
     pub const fn begin_frame(&mut self, _payload: &FramePerfPayload) {}
     #[inline]
+    pub const fn set_submit_wait_nanos(&mut self, _drawable: u64, _present: u64) {}
+    #[inline]
+    pub const fn finish_deferred(&mut self) {}
+
+    #[inline]
     pub const fn set_op_cycles(&mut self, _cycles: u64) {}
+    #[inline]
+    pub const fn add_op_cycles(&mut self, _cycles: u64) {}
     #[inline]
     pub const fn set_submit_cycles(&mut self, _cycles: u64) {}
     #[inline]

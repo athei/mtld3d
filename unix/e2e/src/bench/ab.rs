@@ -631,6 +631,7 @@ fn run_round(
             outcome.notes()
         ));
     }
+    check_measurement_logs(dir)?;
     check_verdicts(benches, &outcome.results, run.failed, dir)
         .map_err(|reason| format!("{reason}{}", outcome.notes()))?;
     let written = new_files(dir, &before)?
@@ -638,6 +639,42 @@ fn run_round(
         .map(|path| metrics::read(&path).map(|file| (path, file)))
         .collect::<Result<Vec<_>, String>>()?;
     assign(benches, written, dir)
+}
+
+/// Reject explicitly invalid measurements, including messages flushed at shutdown.
+///
+/// External frame timings can still exist when calibration failed, so inspect the
+/// completed process logs before accepting any metrics. Failed-process logs and
+/// cold-start child logs remain in the same round directory.
+fn check_measurement_logs(dir: &Path) -> Result<(), String> {
+    for entry in fs::read_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))? {
+        let path = entry.map_err(|e| format!("{}: {e}", dir.display()))?.path();
+        if !matches!(
+            path.extension().and_then(|ext| ext.to_str()),
+            Some("log" | "layer-log")
+        ) {
+            continue;
+        }
+        let text = fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        check_measurement_log(&path, &text)?;
+    }
+    Ok(())
+}
+
+fn check_measurement_log(path: &Path, text: &str) -> Result<(), String> {
+    if let Some((line, message)) = text
+        .lines()
+        .enumerate()
+        .find(|(_, line)| line.contains("perf-invalid:"))
+    {
+        return Err(format!(
+            "{}:{}: invalid benchmark measurement: {}",
+            path.display(),
+            line + 1,
+            message.trim()
+        ));
+    }
+    Ok(())
 }
 
 /// Check that every one of `benches` passed in a round process that reported `results`.

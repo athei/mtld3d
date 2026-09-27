@@ -14,6 +14,7 @@ use crate::{
     encoder_value::WireValue,
     guest_completions::{CompletionPool, CompletionSlot, LeaseCells},
     page_box::{PAGE_SIZE, PageBox, PageBoxRead},
+    page_box_pool::PageBoxPool,
 };
 
 /// PE-owned allocation and acknowledgment storage for one published native lease.
@@ -25,6 +26,7 @@ pub struct GuestPageLease {
     owner: Arc<PageBox>,
     read: Option<PageBoxRead>,
     cells: LeaseCells,
+    recycle_pool: Option<&'static PageBoxPool>,
 }
 
 impl GuestPageLease {
@@ -41,6 +43,7 @@ impl GuestPageLease {
             owner,
             read: None,
             cells: LeaseCells::default(),
+            recycle_pool: None,
         }
     }
 
@@ -51,6 +54,7 @@ impl GuestPageLease {
             owner: Arc::clone(read.backing()),
             read: Some(read),
             cells: LeaseCells::default(),
+            recycle_pool: None,
         }
     }
 
@@ -59,12 +63,25 @@ impl GuestPageLease {
         Self::for_shared_pooled(Arc::new(owner), pool)
     }
 
+    /// Retain an owned VB/IB allocation for return to its original runtime's pool.
+    #[must_use]
+    pub fn for_recyclable_pooled(
+        owner: PageBox,
+        pool: &CompletionPool,
+        recycle_pool: Option<&'static PageBoxPool>,
+    ) -> Self {
+        let mut lease = Self::for_owned_pooled(owner, pool);
+        lease.recycle_pool = recycle_pool;
+        lease
+    }
+
     #[must_use]
     pub fn for_shared_pooled(owner: Arc<PageBox>, pool: &CompletionPool) -> Self {
         Self {
             owner,
             read: None,
             cells: LeaseCells::Pooled(pool.allocate(false)),
+            recycle_pool: None,
         }
     }
 
@@ -74,6 +91,7 @@ impl GuestPageLease {
             owner: Arc::clone(read.backing()),
             read: Some(read),
             cells: LeaseCells::Pooled(pool.allocate(true)),
+            recycle_pool: None,
         }
     }
 
@@ -82,9 +100,20 @@ impl GuestPageLease {
         self.cells.token()
     }
 
-    /// Return mailbox storage after both completion events have been consumed.
+    /// Return mailbox storage and any eligible original allocation after retirement.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the original allocation's recycle pool mutex is poisoned.
     #[must_use]
     pub fn into_slot(self) -> Option<CompletionSlot> {
+        if self.cells.reusable()
+            && let Some(pool) = self.recycle_pool
+            && let Ok(owner) = Arc::try_unwrap(self.owner)
+            && !owner.has_readers()
+        {
+            drop(pool.recycle(owner));
+        }
         self.cells.into_slot()
     }
 

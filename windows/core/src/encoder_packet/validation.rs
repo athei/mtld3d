@@ -1,18 +1,24 @@
 //! Validate a complete operation stream before any ownership is adopted.
 
 use super::{
-    DrawReader, EncoderOpcode, GuestPageDescriptor, GuestQueryDescriptor, Op, QueryLeaseCache,
-    ScratchArena, UploadFields, WireError, WireReader, WireValue, metadata::PacketInventory,
-    read_operation,
+    EncoderOpcode, GuestPageDescriptor, GuestQueryDescriptor, UploadFields, WireError, WireReader,
+    WireValue, metadata::PacketInventory, read_scratch_slice,
+};
+use crate::encoder_data::{
+    BindColorOp, BindDepthOp, CarryDepthOp, ClearColorOp, ClearDepthStencilOp, ColorFillOp,
+    DestroyTextureOp, GenerateMipmapsOp, GenerateMipmapsOrderedOp, NoteColorReadOp,
+    ResolveDepthSurfaceOp, ResolveDepthTextureOp, ResolveDynamicDepthOp, RetireColorOp,
+    RetireDepthOp, SetDumpDrawOp, SetVertexSamplerOp, SetVertexTextureOp, SetViewportOp,
+    StretchBlitOp, UnbindExtraColorOp,
 };
 
-pub(super) struct Validation {
-    pub inventory: PacketInventory,
+pub(super) struct Validation<'a> {
+    pub inventory: &'a mut PacketInventory,
     backings: rustc_hash::FxHashSet<(u64, u64)>,
 }
 
-impl Validation {
-    pub fn new(inventory: PacketInventory) -> Result<Self, WireError> {
+impl<'a> Validation<'a> {
+    pub fn new(inventory: &'a mut PacketInventory) -> Result<Self, WireError> {
         let mut backings = rustc_hash::FxHashSet::default();
         backings
             .try_reserve(inventory.backings.len())
@@ -28,8 +34,6 @@ impl Validation {
         &mut self,
         tag: &EncoderOpcode,
         reader: &mut WireReader<'_>,
-        draws: &mut DrawReader,
-        scratch: &mut ScratchArena,
     ) -> Result<(), WireError> {
         match tag {
             EncoderOpcode::ReadColorHandle
@@ -97,100 +101,114 @@ impl Validation {
                 }
                 take_exact(&mut self.inventory.pages, fields)?;
             }
+            EncoderOpcode::SetViewport => {
+                SetViewportOp::read_wire(reader)?;
+            }
+            EncoderOpcode::SetVertexSampler => {
+                SetVertexSamplerOp::read_wire(reader)?;
+            }
+            EncoderOpcode::SetVertexTexture => {
+                SetVertexTextureOp::read_wire(reader)?;
+            }
+            EncoderOpcode::BindDepth => {
+                BindDepthOp::read_wire(reader)?;
+            }
+            EncoderOpcode::BindColor => {
+                BindColorOp::read_wire(reader)?;
+            }
+            EncoderOpcode::GenerateMipmapsOrdered => {
+                GenerateMipmapsOrderedOp::read_wire(reader)?;
+            }
+            EncoderOpcode::UnbindExtraColor => {
+                UnbindExtraColorOp::read_wire(reader)?;
+            }
+            EncoderOpcode::DestroyTexture => {
+                DestroyTextureOp::read_wire(reader)?;
+            }
+            EncoderOpcode::NoteColorRead => {
+                NoteColorReadOp::read_wire(reader)?;
+            }
+            EncoderOpcode::ResolveDepthSurface => {
+                ResolveDepthSurfaceOp::read_wire(reader)?;
+            }
+            EncoderOpcode::StretchBlit => {
+                StretchBlitOp::read_wire(reader)?;
+            }
+            EncoderOpcode::ColorFill => {
+                ColorFillOp::read_wire(reader)?;
+            }
+            EncoderOpcode::CarryDepth => {
+                CarryDepthOp::read_wire(reader)?;
+            }
+            EncoderOpcode::ClearColor => {
+                ClearColorOp::read_wire(reader)?;
+            }
+            EncoderOpcode::ClearDepthStencil => {
+                ClearDepthStencilOp::read_wire(reader)?;
+            }
+            EncoderOpcode::ResolveDynamicDepth => {
+                ResolveDynamicDepthOp::read_wire(reader)?;
+            }
+            EncoderOpcode::ResolveDepthTexture => {
+                ResolveDepthTextureOp::read_wire(reader)?;
+            }
+            EncoderOpcode::RetireColor => {
+                RetireColorOp::read_wire(reader)?;
+            }
+            EncoderOpcode::RetireDepth => {
+                RetireDepthOp::read_wire(reader)?;
+            }
+            EncoderOpcode::GenerateMipmaps => {
+                GenerateMipmapsOp::read_wire(reader)?;
+            }
+            EncoderOpcode::SetDumpDraw => {
+                SetDumpDrawOp::read_wire(reader)?;
+            }
             EncoderOpcode::SetVsConstRange
             | EncoderOpcode::SetPsConstRange
-            | EncoderOpcode::SetFfVsConstRange
-            | EncoderOpcode::Draw
-            | EncoderOpcode::SetViewport
-            | EncoderOpcode::SetVertexSampler
-            | EncoderOpcode::SetVertexTexture
-            | EncoderOpcode::BindDepth
-            | EncoderOpcode::BindColor
-            | EncoderOpcode::GenerateMipmapsOrdered
-            | EncoderOpcode::UnbindExtraColor
-            | EncoderOpcode::DestroyTexture
-            | EncoderOpcode::NoteColorRead
-            | EncoderOpcode::ResolveDepthSurface
-            | EncoderOpcode::StretchBlit
-            | EncoderOpcode::ColorFill
-            | EncoderOpcode::CarryDepth
-            | EncoderOpcode::ClearColor
-            | EncoderOpcode::ClearColorRects
-            | EncoderOpcode::ClearDepthStencilRects
-            | EncoderOpcode::ClearDepthStencil
-            | EncoderOpcode::ResolveDynamicDepth
-            | EncoderOpcode::ResolveDepthTexture
-            | EncoderOpcode::RetireColor
-            | EncoderOpcode::RetireDepth
-            | EncoderOpcode::UploadColor
-            | EncoderOpcode::UploadResampled
-            | EncoderOpcode::GenerateMipmaps
-            | EncoderOpcode::SetDumpDraw
-            | EncoderOpcode::SetSnapshot => {
-                let mut queries = QueryLeaseCache::default();
-                let op = read_operation(tag, reader, draws, scratch, &mut queries, &mut |_| {
-                    Err(WireError::InvalidValue)
+            | EncoderOpcode::SetFfVsConstRange => {
+                let start = reader.u16()?;
+                let rows = reader.u16()?;
+                let data = read_scratch_slice(reader)?;
+                if usize::from(start) + usize::from(rows) > crate::draw_data::CONSTANT_ROWS
+                    || data.as_raw().1 < u32::from(rows) * 16
+                {
+                    return Err(WireError::InvalidValue);
+                }
+            }
+            EncoderOpcode::Draw => {
+                crate::encoder_draw::validate_wire_draw(reader, |address, length| {
+                    if self.backings.contains(&(address, length)) {
+                        Ok(())
+                    } else {
+                        Err(WireError::InvalidValue)
+                    }
                 })?;
-                match &op {
-                    Op::Draw(draw) => {
-                        use crate::draw_data::{IndexSource, VertexSource};
-                        if let VertexSource::Bound { first, extra, .. } = &draw.vertex_source {
-                            for stream in core::iter::once(first).chain(extra.iter()) {
-                                if !self.backings.contains(&(
-                                    stream.backing_ptr as u64,
-                                    stream.backing_len as u64,
-                                )) {
-                                    return Err(WireError::InvalidValue);
-                                }
-                            }
-                        }
-                        if let IndexSource::Bound {
-                            backing_ptr,
-                            backing_len,
-                            ..
-                        } = &draw.index_source
-                            && !self
-                                .backings
-                                .contains(&(*backing_ptr as u64, *backing_len as u64))
-                        {
-                            return Err(WireError::InvalidValue);
-                        }
-                    }
-                    Op::UploadColor(value)
-                        if u64::from(value.src_stride) * u64::from(value.height)
-                            > u64::from(value.bytes.as_raw().1) =>
-                    {
-                        return Err(WireError::InvalidValue);
-                    }
-                    Op::UploadResampled(value)
-                        if u64::from(value.target.bytes_per_row)
-                            * u64::from(value.target.logical.1)
-                            > u64::from(value.bytes.as_raw().1) =>
-                    {
-                        return Err(WireError::InvalidValue);
-                    }
-
-                    _ => {}
+            }
+            EncoderOpcode::SetSnapshot => crate::encoder_draw::validate_wire_snapshot(reader)?,
+            EncoderOpcode::ClearColorRects => {
+                ClearColorOp::read_wire(reader)?;
+                validate_rects(reader)?;
+            }
+            EncoderOpcode::ClearDepthStencilRects => {
+                ClearDepthStencilOp::read_wire(reader)?;
+                validate_rects(reader)?;
+            }
+            EncoderOpcode::UploadColor => {
+                reader.u64()?;
+                let bytes = read_scratch_slice(reader)?;
+                reader.u32()?;
+                let height = reader.u32()?;
+                let stride = reader.u32()?;
+                if u64::from(stride) * u64::from(height) > u64::from(bytes.as_raw().1) {
+                    return Err(WireError::InvalidValue);
                 }
-                if let Op::SetVsConstRange {
-                    start_row,
-                    rows,
-                    data,
-                }
-                | Op::SetPsConstRange {
-                    start_row,
-                    rows,
-                    data,
-                }
-                | Op::SetFfVsConstRange {
-                    start_row,
-                    rows,
-                    data,
-                } = op
-                    && (usize::from(start_row)
-                        .checked_add(usize::from(rows))
-                        .is_none_or(|end| end > crate::draw_data::CONSTANT_ROWS)
-                        || data.as_raw().1 < u32::from(rows) * 16)
+            }
+            EncoderOpcode::UploadResampled => {
+                let target = crate::encoder_data::ResampledUpload::read_wire(reader)?;
+                let bytes = read_scratch_slice(reader)?;
+                if u64::from(target.bytes_per_row) * u64::from(target.logical.1)
+                    > u64::from(bytes.as_raw().1)
                 {
                     return Err(WireError::InvalidValue);
                 }
@@ -223,5 +241,16 @@ fn take_exact<T: PartialEq + Copy>(inventory: &mut Vec<T>, fields: T) -> Result<
         .position(|value| value == &fields)
         .ok_or(WireError::InvalidValue)?;
     inventory.swap_remove(index);
+    Ok(())
+}
+
+fn validate_rects(reader: &mut WireReader<'_>) -> Result<(), WireError> {
+    let count = reader.u32()? as usize;
+    if count > reader.remaining_len() / 16 {
+        return Err(WireError::Truncated);
+    }
+    for _ in 0..count {
+        <(i32, i32, i32, i32)>::read_wire(reader)?;
+    }
     Ok(())
 }

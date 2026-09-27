@@ -48,6 +48,7 @@ macro_rules! scalar_codec {
         impl WireValue for $scalar {
             const MIN_WIRE_BYTES: usize = size_of::<Self>();
 
+            #[inline]
             fn write_wire(&self, writer: &mut WireWriter<'_>) -> Result<(), WireError> {
                 writer.$scalar(*self)
             }
@@ -62,6 +63,7 @@ macro_rules! scalar_codec {
 scalar_codec!(u8, u16, u32, u64, i32, f32);
 
 impl WireValue for bool {
+    #[inline]
     fn write_wire(&self, writer: &mut WireWriter<'_>) -> Result<(), WireError> {
         writer.u8(u8::from(*self))
     }

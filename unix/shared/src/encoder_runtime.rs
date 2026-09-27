@@ -20,6 +20,8 @@ pub struct CreateEncoderParams {
     pub config_len: u32,
     pub result: i32,
     pub runtime: u64,
+    /// PERF source calibration retained through native destruction, or zero.
+    pub source_clock_ptr: u64,
 }
 
 #[repr(C, align(8))]
@@ -36,9 +38,10 @@ impl Thunk for DestroyEncoderParams {
 }
 
 const _: () = {
-    assert!(size_of::<CreateEncoderParams>() == 40);
+    assert!(size_of::<CreateEncoderParams>() == 48);
     assert!(align_of::<CreateEncoderParams>() == 8);
     assert!(core::mem::offset_of!(CreateEncoderParams, runtime) == 32);
+    assert!(core::mem::offset_of!(CreateEncoderParams, source_clock_ptr) == 40);
     assert!(size_of::<DestroyEncoderParams>() == 8);
 };
 

@@ -128,6 +128,7 @@ impl WireWriter<'_> {
         tag: u16,
         write: impl FnOnce(&mut WireWriter<'_>) -> Result<(), WireError>,
     ) -> Result<usize, WireError> {
+        u32::try_from(destination.len()).map_err(|_| WireError::TooLarge)?;
         let mut writer = WireWriter {
             storage: WireStorage::Slice {
                 bytes: destination,
@@ -148,8 +149,9 @@ impl WireWriter<'_> {
     /// # Errors
     ///
     /// Returns `TooLarge` beyond the slab byte limit or `AllocationFailed`.
+    #[inline]
     pub fn u8(&mut self, value: u8) -> Result<(), WireError> {
-        self.bytes(&value.to_le_bytes())
+        self.fixed(value.to_le_bytes())
     }
 
     /// Append a little-endian `u16` field.
@@ -157,8 +159,9 @@ impl WireWriter<'_> {
     /// # Errors
     ///
     /// Returns `TooLarge` beyond the slab byte limit or `AllocationFailed`.
+    #[inline]
     pub fn u16(&mut self, value: u16) -> Result<(), WireError> {
-        self.bytes(&value.to_le_bytes())
+        self.fixed(value.to_le_bytes())
     }
 
     /// Append a little-endian `u32` field.
@@ -166,8 +169,9 @@ impl WireWriter<'_> {
     /// # Errors
     ///
     /// Returns `TooLarge` beyond the slab byte limit or `AllocationFailed`.
+    #[inline]
     pub fn u32(&mut self, value: u32) -> Result<(), WireError> {
-        self.bytes(&value.to_le_bytes())
+        self.fixed(value.to_le_bytes())
     }
 
     /// Append a little-endian `u64` field.
@@ -175,8 +179,9 @@ impl WireWriter<'_> {
     /// # Errors
     ///
     /// Returns `TooLarge` beyond the slab byte limit or `AllocationFailed`.
+    #[inline]
     pub fn u64(&mut self, value: u64) -> Result<(), WireError> {
-        self.bytes(&value.to_le_bytes())
+        self.fixed(value.to_le_bytes())
     }
 
     /// Append a little-endian `i32` field.
@@ -184,8 +189,9 @@ impl WireWriter<'_> {
     /// # Errors
     ///
     /// Returns `TooLarge` beyond the slab byte limit or `AllocationFailed`.
+    #[inline]
     pub fn i32(&mut self, value: i32) -> Result<(), WireError> {
-        self.bytes(&value.to_le_bytes())
+        self.fixed(value.to_le_bytes())
     }
 
     /// Append a little-endian `f32` field.
@@ -193,8 +199,28 @@ impl WireWriter<'_> {
     /// # Errors
     ///
     /// Returns `TooLarge` beyond the slab byte limit or `AllocationFailed`.
+    #[inline]
     pub fn f32(&mut self, value: f32) -> Result<(), WireError> {
-        self.bytes(&value.to_le_bytes())
+        self.fixed(value.to_le_bytes())
+    }
+
+    /// Keep scalar stores visible to callers without inlining vector growth.
+    ///
+    /// The reserved window was checked against the wire size limit at construction.
+    #[inline]
+    fn fixed<const N: usize>(&mut self, value: [u8; N]) -> Result<(), WireError> {
+        match &mut self.storage {
+            WireStorage::Slice { bytes, used } => {
+                let destination = bytes
+                    .get_mut(*used..)
+                    .and_then(<[u8]>::first_chunk_mut::<N>)
+                    .ok_or(WireError::TooLarge)?;
+                *destination = value;
+                *used += N;
+                Ok(())
+            }
+            WireStorage::Vector(bytes) => Self::append_vector(bytes, &value),
+        }
     }
 
     /// Append bytes without adding a length prefix.
@@ -210,10 +236,7 @@ impl WireWriter<'_> {
         u32::try_from(length).map_err(|_| WireError::TooLarge)?;
         match &mut self.storage {
             WireStorage::Vector(bytes) => {
-                bytes
-                    .try_reserve(value.len())
-                    .map_err(|_| WireError::AllocationFailed)?;
-                bytes.extend_from_slice(value);
+                Self::append_vector(bytes, value)?;
             }
             WireStorage::Slice { bytes, used } => {
                 bytes
@@ -223,6 +246,24 @@ impl WireWriter<'_> {
                 *used = length;
             }
         }
+        Ok(())
+    }
+
+    /// Keep fallible vector growth out of each inlined reserved scalar store.
+    ///
+    /// Production codegen otherwise duplicates allocation paths and leaves some
+    /// scalar writes out of line even when every operation uses a reserved slice.
+    #[inline(never)]
+    fn append_vector(bytes: &mut Vec<u8>, value: &[u8]) -> Result<(), WireError> {
+        let length = bytes
+            .len()
+            .checked_add(value.len())
+            .ok_or(WireError::TooLarge)?;
+        u32::try_from(length).map_err(|_| WireError::TooLarge)?;
+        bytes
+            .try_reserve(value.len())
+            .map_err(|_| WireError::AllocationFailed)?;
+        bytes.extend_from_slice(value);
         Ok(())
     }
 }

@@ -91,7 +91,11 @@ pub fn write_metadata(
         .write_wire(writer)?;
     let mut retained = core::mem::take(&mut frame.vbib_retentions).into_iter();
     while let Some(entry) = retained.next() {
-        let lease = GuestPageLease::for_owned_pooled(entry.page_box, &recorder.completion_pool);
+        let lease = GuestPageLease::for_recyclable_pooled(
+            entry.page_box,
+            &recorder.completion_pool,
+            recorder.pagebox_pool,
+        );
         let descriptor = lease.descriptor();
         recorder.pages.push(lease);
         let result = (|| {
@@ -166,16 +170,49 @@ pub fn write_metadata(
     Ok(())
 }
 
-/// Reconstruct metadata after validating the immutable packet's ownership contract.
-///
-/// # Safety
-///
-/// When `adopt` is true, every descriptor remains owned by the packet and is adopted
-/// exactly once. False only validates and never touches guest allocation memory.
-pub unsafe fn read_metadata(
-    reader: &mut WireReader<'_>,
-    adopt: bool,
-) -> Result<(FrameData, PacketInventory), WireError> {
+/// Metadata parsed once, with guest ownership held back until complete validation.
+pub(super) struct ParsedMetadata {
+    pub frame: FrameData,
+    pub inventory: PacketInventory,
+    staging: Vec<(crate::ids::TextureId, u32, u64, u64, GuestPageDescriptor)>,
+    retained: Vec<(crate::ids::BufferId, u64, GuestPageDescriptor)>,
+}
+
+impl ParsedMetadata {
+    /// Adopt descriptors only after all operation records and inventories have passed.
+    ///
+    /// # Safety
+    /// Each descriptor is uniquely retained by the immutable packet until acknowledgment.
+    pub unsafe fn adopt(mut self) -> Result<FrameData, WireError> {
+        for (texture_id, level, backing_ptr, backing_len, descriptor) in self.staging {
+            // SAFETY: whole-packet validation established this unique retained descriptor.
+            let keepalive = unsafe { descriptor.adopt_shared()? };
+            if keepalive.as_ptr() as u64 != backing_ptr || keepalive.len() as u64 != backing_len {
+                return Err(WireError::InvalidValue);
+            }
+            self.frame.pending_staging_warmups.push(StagingWarmupEntry {
+                texture_id,
+                level,
+                backing_ptr,
+                backing_len,
+                keepalive,
+            });
+        }
+        for (buffer_id, last_submit_seq, descriptor) in self.retained {
+            // SAFETY: whole-packet validation established this unique retained descriptor.
+            let page_box = unsafe { descriptor.adopt_owned()? };
+            self.frame.vbib_retentions.push(PendingVbibRetention {
+                buffer_id,
+                page_box,
+                last_submit_seq,
+            });
+        }
+        Ok(self.frame)
+    }
+}
+
+/// Parse scalar metadata and descriptors without adopting or touching guest memory.
+pub(super) fn read_metadata(reader: &mut WireReader<'_>) -> Result<ParsedMetadata, WireError> {
     let mut metadata_pages = Vec::new();
     let init = FrameInit {
         device_handle: WireValue::read_wire(reader)?,
@@ -224,6 +261,10 @@ pub unsafe fn read_metadata(
         frame.pending_buffer_warmups.push(entry);
     }
     let staging = bounded_count(reader, 84)?;
+    let mut staging_descriptors = Vec::new();
+    staging_descriptors
+        .try_reserve(staging)
+        .map_err(|_| WireError::AllocationFailed)?;
     frame
         .pending_staging_warmups
         .try_reserve(staging)
@@ -243,22 +284,13 @@ pub unsafe fn read_metadata(
             return Err(WireError::InvalidValue);
         }
         metadata_pages.push(fields);
-        if adopt {
-            // SAFETY: the caller retains this uniquely adopted packet descriptor.
-            let keepalive = unsafe { descriptor.adopt_shared()? };
-            if keepalive.as_ptr() as u64 != backing_ptr || keepalive.len() as u64 != backing_len {
-                return Err(WireError::InvalidValue);
-            }
-            frame.pending_staging_warmups.push(StagingWarmupEntry {
-                texture_id,
-                level,
-                backing_ptr,
-                backing_len,
-                keepalive,
-            });
-        }
+        staging_descriptors.push((texture_id, level, backing_ptr, backing_len, descriptor));
     }
     let retained = bounded_count(reader, 72)?;
+    let mut retained_descriptors = Vec::new();
+    retained_descriptors
+        .try_reserve(retained)
+        .map_err(|_| WireError::AllocationFailed)?;
     frame
         .vbib_retentions
         .try_reserve(retained)
@@ -272,15 +304,7 @@ pub unsafe fn read_metadata(
             return Err(WireError::InvalidValue);
         }
         metadata_pages.push(fields);
-        if adopt {
-            // SAFETY: the caller retains this uniquely adopted packet descriptor.
-            let page_box = unsafe { descriptor.adopt_owned()? };
-            frame.vbib_retentions.push(PendingVbibRetention {
-                buffer_id,
-                page_box,
-                last_submit_seq,
-            });
-        }
+        retained_descriptors.push((buffer_id, last_submit_seq, descriptor));
     }
     let count = bounded_count(reader, 16)?;
     let mut ranges = Vec::new();
@@ -316,9 +340,11 @@ pub unsafe fn read_metadata(
             .ok_or(WireError::InvalidValue)?;
         pages.swap_remove(index);
     }
-    Ok((
+    Ok(ParsedMetadata {
         frame,
-        PacketInventory {
+        staging: staging_descriptors,
+        retained: retained_descriptors,
+        inventory: PacketInventory {
             ranges,
             pages,
             queries,
@@ -330,7 +356,7 @@ pub unsafe fn read_metadata(
             command_spans,
             backings,
         },
-    ))
+    })
 }
 
 fn read_spans(reader: &mut WireReader<'_>) -> Result<Vec<(u64, u64)>, WireError> {

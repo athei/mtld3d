@@ -1663,7 +1663,6 @@ extern "system" fn d3d9_create_device(
         }
     };
     addref_parent_direct3d9(this);
-    spawn_tsc_warmup();
 
     let dev = Direct3DDevice9::new(crate::device::DeviceCreateInfo {
         device_handle: cq_params.device_handle,
@@ -1830,25 +1829,6 @@ fn addref_parent_direct3d9(this: *mut c_void) {
         let parent: &mut Direct3D9 = &mut parent_wrap;
         parent.refcount += 1;
     }
-}
-
-/// Warm the API runtime's TSC calibration in the background.
-///
-/// API telemetry converts cycles to nanoseconds before handing a frame to Unix.
-/// Warming here keeps its first conversion from paying the calibration sleep.
-/// Deliberately not spawned from `DllMain` or `Direct3DCreate9`: mod /
-/// launcher DLLs commonly probe-call `Direct3DCreate9` early enough that the
-/// spawned thread's stdlib thread-entry (TLS, `env_logger` lazy init) still
-/// races the host process's own init and can blow a 2 MB Wine stack or fault
-/// with a corrupt TEB. `CreateDevice` runs past all of that.
-/// `tsc_hz()` is internally latched by a `LazyLock`, so a second
-/// `CreateDevice` call just returns the cached value.
-fn spawn_tsc_warmup() {
-    let _ = std::thread::Builder::new()
-        .name("mtld3d-tsc-warmup".into())
-        .spawn(|| {
-            let _ = mtld3d_shared::tsc::tsc_hz();
-        });
 }
 
 /// Create native encoder, submit, compile and shader-cache prewarm workers.

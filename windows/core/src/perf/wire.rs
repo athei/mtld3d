@@ -1,21 +1,32 @@
 //! Architecture-independent API telemetry for native frame replay.
 //!
-//! Every duration is serialized as elapsed nanoseconds, then converted once
-//! into the reader's local counter units. Counts and byte volumes stay exact.
+//! PERF durations are elapsed source-counter ticks, tagged separately from nanoseconds.
+//! The device calibration mailbox supplies their frequency asynchronously; aggregation
+//! converts them only after both clock domains are ready. Counts and byte volumes stay exact.
 //! No timestamp or Rust representation crosses the runtime boundary.
 
 use mtld3d_shared::encoder_wire::{WireError, WireReader, WireWriter};
-#[cfg(perf_tracking)]
-use mtld3d_shared::tsc::ns_to_cycles;
 
 use super::FramePerfPayload;
 #[cfg(perf_tracking)]
-use super::{FrameCounters, FrameTiming, compilation::cycles_to_ns};
+use super::{FrameCounters, FrameTiming};
 use crate::encoder_value::WireValue;
+
+#[repr(u8)]
+enum DurationEncoding {
+    Disabled = 0,
+    SourceElapsedTicks = 2,
+}
+
+const DURATION_ENCODING: DurationEncoding = if cfg!(perf_tracking) {
+    DurationEncoding::SourceElapsedTicks
+} else {
+    DurationEncoding::Disabled
+};
 
 impl WireValue for FramePerfPayload {
     fn write_wire(&self, writer: &mut WireWriter<'_>) -> Result<(), WireError> {
-        writer.u8(u8::from(cfg!(perf_tracking)))?;
+        writer.u8(DURATION_ENCODING as u8)?;
         #[cfg(perf_tracking)]
         {
             self.counters.write_wire(writer)?;
@@ -25,7 +36,7 @@ impl WireValue for FramePerfPayload {
     }
 
     fn read_wire(reader: &mut WireReader<'_>) -> Result<Self, WireError> {
-        if reader.u8()? != u8::from(cfg!(perf_tracking)) {
+        if reader.u8()? != DURATION_ENCODING as u8 {
             // Matching PE/Unix builds agree on whether telemetry is present.
             return Err(WireError::InvalidValue);
         }
@@ -47,19 +58,24 @@ impl WireValue for FramePerfPayload {
 macro_rules! telemetry_codec {
     ($value:ident { values: [$($value_field:ident),* $(,)?],
                        durations: [$($duration_field:ident),* $(,)?] }) => {
+        impl $value {
+            pub(super) fn rescale_durations(&mut self, source_hz: u64, target_hz: u64) {
+                $(self.$duration_field.rescale(source_hz, target_hz);)*
+            }
+        }
         impl WireValue for $value {
             fn write_wire(&self, writer: &mut WireWriter<'_>) -> Result<(), WireError> {
                 // Exhaustive destructuring makes a newly added counter require a codec entry.
                 let Self { $($value_field,)* $($duration_field,)* } = self;
                 $($value_field.write_wire(writer)?;)*
-                $($duration_field.write_nanos(writer)?;)*
+                $($duration_field.write_ticks(writer)?;)*
                 Ok(())
             }
 
             fn read_wire(reader: &mut WireReader<'_>) -> Result<Self, WireError> {
                 Ok(Self {
                     $($value_field: WireValue::read_wire(reader)?,)*
-                    $($duration_field: WireDuration::read_nanos(reader)?,)*
+                    $($duration_field: WireDuration::read_ticks(reader)?,)*
                 })
             }
         }
@@ -122,38 +138,53 @@ telemetry_codec!(FrameTiming {
 
 #[cfg(perf_tracking)]
 trait WireDuration: Sized {
-    fn write_nanos(&self, writer: &mut WireWriter<'_>) -> Result<(), WireError>;
-    fn read_nanos(reader: &mut WireReader<'_>) -> Result<Self, WireError>;
+    fn rescale(&mut self, source_hz: u64, target_hz: u64);
+    fn write_ticks(&self, writer: &mut WireWriter<'_>) -> Result<(), WireError>;
+    fn read_ticks(reader: &mut WireReader<'_>) -> Result<Self, WireError>;
 }
 
 #[cfg(perf_tracking)]
 impl WireDuration for u64 {
-    fn write_nanos(&self, writer: &mut WireWriter<'_>) -> Result<(), WireError> {
-        // Zero duration does not require initializing the sender's timer calibration.
-        writer.u64(if *self == 0 { 0 } else { cycles_to_ns(*self) })
+    fn rescale(&mut self, source_hz: u64, target_hz: u64) {
+        *self = scale_ticks(*self, source_hz, target_hz);
+    }
+    fn write_ticks(&self, writer: &mut WireWriter<'_>) -> Result<(), WireError> {
+        writer.u64(*self)
     }
 
-    fn read_nanos(reader: &mut WireReader<'_>) -> Result<Self, WireError> {
-        reader.u64().map(ns_to_cycles)
+    fn read_ticks(reader: &mut WireReader<'_>) -> Result<Self, WireError> {
+        reader.u64()
     }
 }
 
 #[cfg(perf_tracking)]
 impl<const N: usize> WireDuration for [u64; N] {
-    fn write_nanos(&self, writer: &mut WireWriter<'_>) -> Result<(), WireError> {
+    fn rescale(&mut self, source_hz: u64, target_hz: u64) {
+        for value in self {
+            value.rescale(source_hz, target_hz);
+        }
+    }
+    fn write_ticks(&self, writer: &mut WireWriter<'_>) -> Result<(), WireError> {
         for duration in self {
-            duration.write_nanos(writer)?;
+            duration.write_ticks(writer)?;
         }
         Ok(())
     }
 
-    fn read_nanos(reader: &mut WireReader<'_>) -> Result<Self, WireError> {
+    fn read_ticks(reader: &mut WireReader<'_>) -> Result<Self, WireError> {
         let mut values = [0; N];
         for value in &mut values {
-            *value = u64::read_nanos(reader)?;
+            *value = u64::read_ticks(reader)?;
         }
         Ok(values)
     }
+}
+
+#[cfg(perf_tracking)]
+pub(super) fn scale_ticks(ticks: u64, source_hz: u64, target_hz: u64) -> u64 {
+    debug_assert!(source_hz != 0);
+    u64::try_from(u128::from(ticks) * u128::from(target_hz) / u128::from(source_hz))
+        .unwrap_or(u64::MAX)
 }
 
 #[cfg(test)]

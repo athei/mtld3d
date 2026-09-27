@@ -197,3 +197,19 @@ fn shader_failure_counts_stop_at_the_failed_phase() {
     assert!(perf.window.iter().all(|metric| metric.calls == 0));
     assert!(perf.slow.is_empty());
 }
+
+#[test]
+#[cfg(perf_tracking)]
+fn deferred_frames_keep_compilation_peaks_and_residuals_separate() {
+    let mut perf = CompilationPerf::new();
+    perf.record_enabled(Kind::ShaderVs, 4_000_000, true, 1, identity);
+    let first = perf.defer_frame();
+    perf.record_enabled(Kind::ShaderVs, 6_000_000, true, 2, identity);
+    let second = perf.defer_frame();
+    perf.finish_deferred_frame(first, 5_000_000, 0, 10_000_000);
+    perf.finish_deferred_frame(second, 8_000_000, 0, 20_000_000);
+    assert_eq!(perf.window[Kind::ShaderVs as usize].ns, 10_000_000);
+    assert_eq!(perf.window[Kind::ShaderVs as usize].peak_ns, 6_000_000);
+    assert_eq!(perf.window[Kind::ResolveOther as usize].ns, 3_000_000);
+    assert_eq!(perf.window[Kind::ResolveOther as usize].peak_ns, 2_000_000);
+}

@@ -782,3 +782,82 @@ fn command_and_payload_cannot_alias_reply_or_readback_destinations() {
         }
     }
 }
+
+#[test]
+fn early_native_lease_events_do_not_retire_a_pending_or_rejected_packet() {
+    let (mut frame, _) = frame_with_leases();
+    frame.ops.clear();
+    let mut packet =
+        FramePacket::new(frame).unwrap_or_else(|(error, _)| panic!("empty fixture: {error:?}"));
+    let pool = packet
+        .recorder
+        .as_ref()
+        .expect("recorder")
+        .completion_pool
+        .clone();
+    let original = Arc::new(PageBox::new_zeroed(4));
+    let read = crate::page_box::PageBoxRead::new(Arc::clone(&original));
+    let lease = GuestPageLease::for_read_pooled(read, &pool);
+    let descriptor = lease.descriptor();
+    packet.pages.push(lease);
+    // SAFETY: the fixture retains one packet and models its only native consumer.
+    unsafe { packet.mark_admitted() };
+    // SAFETY: the retained lease permits this sole adoption until its native read drops.
+    let native = unsafe { descriptor.adopt_read() }.expect("native read");
+    drop(native);
+    let mut cursor = crate::guest_completions::CompletionDrain::default();
+    assert_eq!(packet.drain_test_completions(&mut cursor), 2);
+    assert_eq!(packet.take_leases().count(), 0);
+    assert!(!packet.maintain());
+    assert_eq!(packet.pages.len(), 1);
+    assert!(
+        original.has_readers(),
+        "pending replay keeps its original read guard"
+    );
+
+    // SAFETY: the packet retains its completion cell and this models the native
+    // decoder rejecting only after dropping its partially reconstructed owners.
+    let complete = unsafe { &*(packet.completion_address() as *const LeaseCompletion) };
+    complete.publish_rejected();
+    assert_eq!(packet.take_leases().count(), 0);
+    assert!(!packet.maintain());
+    assert!(
+        original.has_readers(),
+        "rejection remains quarantined until shutdown"
+    );
+    // SAFETY: the only native owner was dropped above; the runtime is quiescent.
+    unsafe { packet.cancel_unadopted() };
+    packet.drain_test_completions(&mut cursor);
+    assert!(packet.maintain());
+    assert!(!original.has_readers());
+}
+
+#[test]
+fn parsed_metadata_moves_into_frame_without_reading_metadata_again() {
+    let (mut frame, _) = frame_with_leases();
+    frame.ops.clear();
+    frame.submit_seq = 91;
+    let mut packet = FramePacket::new(frame)
+        .unwrap_or_else(|(error, _)| panic!("valid metadata fixture: {error:?}"));
+    let bytes = packet.metadata_bytes().to_vec();
+    // SAFETY: the packet owns all described allocations throughout this decode.
+    let parsed = unsafe { parse_metadata(&bytes) }.unwrap();
+    assert_eq!(parsed.frame.submit_seq, 91);
+    drop(bytes);
+    let decoded = decode_validated_chunks(
+        parsed,
+        &[],
+        ReplayCompletion {
+            address: packet.completion_address(),
+            rejected: true,
+        },
+        &mut QueryLeaseCache::default(),
+        |_| Err(WireError::InvalidValue),
+    )
+    .unwrap();
+    assert_eq!(decoded.submit_seq, 91);
+    // SAFETY: decoding succeeded and this test owns the sole native frame.
+    unsafe { packet.mark_admitted() };
+    drop(decoded);
+    assert!(packet.maintain());
+}

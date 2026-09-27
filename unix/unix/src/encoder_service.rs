@@ -34,6 +34,7 @@ pub struct EncoderService {
     pub programs: Arc<ProgramRegistry>,
     prewarm: PrewarmHandle,
     failure_ptr: u64,
+    calibration: CalibrationWorker,
 }
 
 impl EncoderService {
@@ -47,16 +48,26 @@ impl EncoderService {
         config: Mtld3dConfig,
         caps: GpuCaps,
         cache_path: Option<PathBuf>,
+        source_clock_ptr: u64,
     ) -> std::io::Result<Self> {
+        let calibration = CalibrationWorker::start();
+        let clocks = EncoderClocks {
+            native: Arc::clone(&calibration.clock),
+            #[cfg(perf_tracking)]
+            source: source_clock_ptr,
+        };
+        #[cfg(not(perf_tracking))]
+        let _ = source_clock_ptr;
         let config = Arc::new(config);
         let (mut prewarm, receiver) =
             shader_prewarm::spawn(device, config.shader_cache_enable, cache_path.clone());
-        match EncoderThread::spawn(caps, Arc::clone(&config), receiver, cache_path) {
+        match EncoderThread::spawn(caps, Arc::clone(&config), receiver, cache_path, clocks) {
             Ok(encoder) => Ok(Self {
                 encoder,
                 programs: Arc::new(ProgramRegistry::new()),
                 prewarm,
                 failure_ptr: 0,
+                calibration,
             }),
             Err(error) => {
                 prewarm.cancel_and_join();
@@ -80,7 +91,81 @@ impl EncoderService {
 impl Drop for EncoderService {
     fn drop(&mut self) {
         self.prewarm.cancel_and_join();
+        self.calibration.join();
         self.encoder.shutdown();
+    }
+}
+
+/// Device-owned calibration uses this native linkage unit's clock domain.
+///
+/// Startup never waits for the calibration sleep; shutdown joins the worker so
+/// neither device teardown nor library unloading leaves native code running.
+pub struct EncoderClocks {
+    pub native: Arc<mtld3d_shared::clock_calibration::ClockCalibration>,
+    #[cfg(perf_tracking)]
+    pub source: u64,
+}
+
+struct CalibrationWorker {
+    clock: Arc<mtld3d_shared::clock_calibration::ClockCalibration>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl CalibrationWorker {
+    fn start() -> Self {
+        Self::spawn(mtld3d_shared::tsc::tsc_hz)
+    }
+
+    fn spawn(work: impl FnOnce() -> u64 + Send + 'static) -> Self {
+        let clock = Arc::new(mtld3d_shared::clock_calibration::ClockCalibration::new());
+        let published = Arc::clone(&clock);
+        let result = std::thread::Builder::new()
+            .name("mtld3d-native-tsc-warmup".into())
+            .spawn(move || {
+                struct PublishFailure(Arc<mtld3d_shared::clock_calibration::ClockCalibration>);
+                impl Drop for PublishFailure {
+                    fn drop(&mut self) {
+                        if matches!(self.0.get(), Ok(None)) {
+                            // SAFETY: this worker is the mailbox's only publisher.
+                            unsafe {
+                                self.0.publish_failed();
+                            }
+                        }
+                    }
+                }
+                let publication = PublishFailure(published);
+                let hz = work();
+                // SAFETY: this worker is the mailbox's only publisher.
+                unsafe {
+                    publication.0.publish_ready(hz);
+                }
+            });
+        let handle = match result {
+            Ok(handle) => Some(handle),
+            Err(error) => {
+                // SAFETY: a failed spawn never created a competing publisher.
+                unsafe {
+                    clock.publish_failed();
+                }
+                log::error!(target: LOG_TARGET, "perf-invalid: native calibration worker could not start: {error}; rendering continues");
+                None
+            }
+        };
+        Self { clock, handle }
+    }
+
+    fn join(&mut self) {
+        if let Some(handle) = self.handle.take()
+            && handle.join().is_err()
+        {
+            log::error!(target: LOG_TARGET, "perf-invalid: native clock calibration worker panicked; rendering continues");
+        }
+    }
+}
+
+impl Drop for CalibrationWorker {
+    fn drop(&mut self) {
+        self.join();
     }
 }
 
@@ -110,6 +195,8 @@ pub extern "C" fn create_handler(args: *mut core::ffi::c_void) -> i32 {
     if params.device.is_null()
         || params.failure_ptr == 0
         || params.failure_ptr % 4 != 0
+        || (cfg!(perf_tracking)
+            && (params.source_clock_ptr == 0 || params.source_clock_ptr % 8 != 0))
         || params.config_ptr == 0
         || params.config_len == 0
         || params
@@ -132,7 +219,7 @@ pub extern "C" fn create_handler(args: *mut core::ffi::c_void) -> i32 {
             return params.result;
         }
     };
-    match EncoderService::new(params.device, config, caps, path) {
+    match EncoderService::new(params.device, config, caps, path, params.source_clock_ptr) {
         Ok(mut service) => {
             service.failure_ptr = params.failure_ptr;
             params.runtime = Box::into_raw(Box::new(service)) as u64;

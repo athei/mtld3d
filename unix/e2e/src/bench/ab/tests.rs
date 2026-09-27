@@ -561,3 +561,54 @@ fn a_layout_comparison_runs_one_commit_in_two_layouts() {
         let _ = fs::remove_dir_all(spec.wine.parent().unwrap());
     }
 }
+
+#[test]
+fn valid_perf_logs_and_external_timing_fallback_remain_accepted() {
+    let path = Path::new("/ab/cand/0/e2e-42.log");
+    for text in [
+        "",
+        "perf: no mtld3d::perf window\n",
+        "[INFO] perf-kv: frame_us=12\n",
+    ] {
+        assert!(check_measurement_log(path, text).is_ok());
+    }
+}
+
+#[test]
+fn invalid_calibration_rejects_metrics_even_when_reported_at_shutdown() {
+    let path = Path::new("/ab/cand/0/e2e-42.log");
+    for marker in [
+        "perf-invalid: calibration failed; rendering continues",
+        "perf-invalid: final reason=calibration incomplete, retained_samples=1, rejected_samples=0",
+    ] {
+        let text = format!("[INFO] perf-kv: frame_us=12\n[ERROR] {marker}\n");
+        let reason = check_measurement_log(path, &text).unwrap_err();
+        assert!(reason.contains("e2e-42.log:2:"), "{reason}");
+        assert!(reason.contains(marker), "{reason}");
+    }
+}
+
+#[test]
+fn round_scan_checks_child_and_retained_failed_process_logs() {
+    let dir = std::env::temp_dir().join(format!("mtld3d-bench-invalid-{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    let metrics = dir.join("bench-b.metrics");
+    fs::write(&metrics, "metric b frame.p50 1 ms lower time\n").unwrap();
+    for name in [
+        "e2e-42.log",
+        "bench-cold_start-child.log",
+        "e2e-43.layer-log",
+    ] {
+        let log = dir.join(name);
+        fs::write(
+            &log,
+            "[ERROR] perf-invalid: final reason=calibration incomplete\n",
+        )
+        .unwrap();
+        let reason = check_measurement_logs(&dir).unwrap_err();
+        assert!(reason.contains(name), "{reason}");
+        fs::remove_file(log).unwrap();
+    }
+    assert!(check_measurement_logs(&dir).is_ok());
+    fs::remove_dir_all(dir).unwrap();
+}

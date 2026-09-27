@@ -56,6 +56,7 @@ pub use owner::{FramePacket, PacketLease};
 
 /// API-side operation bytes and owners awaiting native acknowledgment.
 pub struct FrameRecorder {
+    pagebox_pool: Option<&'static crate::page_box_pool::PageBoxPool>,
     completion_pool: crate::guest_completions::CompletionPool,
     slab: RecordedSpans,
     metadata: FrameSlab,
@@ -85,9 +86,15 @@ impl FrameRecorder {
         Self::with_completion_pool(crate::guest_completions::CompletionPool::new())
     }
 
+    /// Set the original runtime's pool for retired VB/IB allocations.
+    pub const fn set_pagebox_pool(&mut self, pool: &'static crate::page_box_pool::PageBoxPool) {
+        self.pagebox_pool = Some(pool);
+    }
+
     #[must_use]
     pub fn with_completion_pool(completion_pool: crate::guest_completions::CompletionPool) -> Self {
         Self {
+            pagebox_pool: None,
             completion_pool,
             slab: RecordedSpans::new(),
             metadata: FrameSlab::new(),
@@ -146,6 +153,7 @@ impl FrameRecorder {
                             replies_bool: &mut self.replies_bool,
                             redirties: &mut self.redirties,
                             pool: &self.completion_pool,
+                            pagebox_pool: self.pagebox_pool,
                         },
                     )
                 })
@@ -267,6 +275,7 @@ const fn op_tag(op: &Op) -> Result<EncoderOpcode, WireError> {
 }
 
 struct WriteContext<'a> {
+    pagebox_pool: Option<&'static crate::page_box_pool::PageBoxPool>,
     draws: &'a mut DrawWriter,
     pages: &'a mut Vec<GuestPageLease>,
     queries: &'a mut Vec<GuestQueryLease>,
@@ -282,6 +291,7 @@ fn write_operation(
     context: &mut WriteContext<'_>,
 ) -> Result<(), WireError> {
     let WriteContext {
+        pagebox_pool,
         draws,
         pages,
         queries,
@@ -392,7 +402,7 @@ fn write_operation(
             dst_offset,
             size,
         } => {
-            let lease = GuestPageLease::for_owned_pooled(page_box, pool);
+            let lease = GuestPageLease::for_recyclable_pooled(page_box, pool, *pagebox_pool);
             let descriptor = lease.descriptor();
             pages.push(lease);
             buffer_id.write_wire(writer)?;
@@ -877,10 +887,10 @@ pub unsafe fn decode_packet(
         rejected: true,
     };
     // SAFETY: the caller supplies authentic retained metadata identities and inventory.
-    let (_, inventory) = unsafe { parse_metadata(metadata, false)? };
+    let parsed = unsafe { parse_metadata(metadata)? };
     let mut table = WireReader::new(operations);
     let mut chunks = Vec::new();
-    let mut command_spans = inventory.command_spans.iter();
+    let mut command_spans = parsed.inventory.command_spans.iter();
     while let Some(mut record) = table.next_record()? {
         if record.tag != FRAME_CHUNK_TAG {
             return Err(WireError::InvalidValue);
@@ -902,7 +912,7 @@ pub unsafe fn decode_packet(
     if command_spans.next().is_some() {
         return Err(WireError::InvalidValue);
     }
-    decode_validated_chunks(metadata, &chunks, guard, queries, resolve_program)
+    decode_validated_chunks(parsed, &chunks, guard, queries, resolve_program)
 }
 
 #[cfg(test)]
@@ -922,39 +932,31 @@ unsafe fn decode_chunks(
         address: completion,
         rejected: true,
     };
-    decode_validated_chunks(metadata, chunks, guard, queries, resolve_program)
+    // SAFETY: the test caller supplies the same retained metadata contract.
+    let parsed = unsafe { parse_metadata(metadata)? };
+    decode_validated_chunks(parsed, chunks, guard, queries, resolve_program)
 }
 
 fn decode_validated_chunks(
-    metadata: &[u8],
+    mut parsed: metadata::ParsedMetadata,
     chunks: &[&[u8]],
     mut guard: ReplayCompletion,
     queries: &mut QueryLeaseCache,
     mut resolve_program: impl FnMut(u64) -> Result<(ProgramId, DxsoProgram), WireError>,
 ) -> Result<FrameData, WireError> {
-    // SAFETY: the only callers establish authentic immutable packet metadata and inventory.
-    let (_, inventory) = unsafe { parse_metadata(metadata, false)? };
-    let ranges = inventory.ranges.clone();
+    let inventory = &mut parsed.inventory;
+    let ranges = std::mem::take(&mut inventory.ranges);
     let mut validator = validation::Validation::new(inventory)?;
-    // SAFETY: the complete retained inventory is checked before any guest bytes are used.
-    let mut draws = unsafe { DrawReader::new() };
-    let mut scratch = ScratchArena::new();
     for bytes in chunks {
         // SAFETY: validation only borrows pointers contained by the retained frame inventory.
         let mut reader = unsafe { WireReader::new_trusted_with_ranges(bytes, &ranges) };
         while let Some(mut record) = reader.next_record()? {
-            validator.operation(
-                &EncoderOpcode::try_from(record.tag)?,
-                &mut record.payload,
-                &mut draws,
-                &mut scratch,
-            )?;
+            validator.operation(&EncoderOpcode::try_from(record.tag)?, &mut record.payload)?;
         }
     }
     validator.finish()?;
-    drop(scratch);
     // SAFETY: every record and single-adoption descriptor was validated without side effects.
-    let (mut frame, _) = unsafe { parse_metadata(metadata, true)? };
+    let mut frame = unsafe { parsed.adopt()? };
     // SAFETY: this second pass reconstructs the already-validated immutable draw stream.
     let mut draws = unsafe { DrawReader::new() };
     for bytes in chunks {
@@ -977,18 +979,14 @@ fn decode_validated_chunks(
     Ok(frame)
 }
 
-unsafe fn parse_metadata(
-    bytes: &[u8],
-    adopt: bool,
-) -> Result<(FrameData, metadata::PacketInventory), WireError> {
+unsafe fn parse_metadata(bytes: &[u8]) -> Result<metadata::ParsedMetadata, WireError> {
     // SAFETY: the caller retains authentic typed metadata; operation ranges are checked separately.
     let mut reader = unsafe { WireReader::new_trusted(bytes) };
     let mut record = reader.next_record()?.ok_or(WireError::Truncated)?;
     if record.tag != FRAME_METADATA_TAG || !reader.is_empty() {
         return Err(WireError::InvalidValue);
     }
-    // SAFETY: adopt is enabled only after complete packet prevalidation; otherwise no owners move.
-    let result = unsafe { metadata::read_metadata(&mut record.payload, adopt)? };
+    let result = metadata::read_metadata(&mut record.payload)?;
     if !record.payload.is_empty() {
         return Err(WireError::InvalidValue);
     }

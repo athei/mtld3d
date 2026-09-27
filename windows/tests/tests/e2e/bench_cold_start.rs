@@ -47,7 +47,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use mtld3d_core::shader_cache::{self, CacheHeader, CacheLoad};
+use mtld3d_core::shader_cache::{self, CacheHeader};
 use mtld3d_tests::{
     Harness, HarnessConfig, IndexBuffer, MemorySample, PixelShader, Texture, VertexBuffer,
     VertexDeclaration, VertexShader, run_child,
@@ -635,7 +635,7 @@ struct Settled {
     notes: String,
 }
 
-/// The records a cache holds.
+/// Validated stored records, independent of the reporting executable's emitter.
 struct Counts {
     shaders: usize,
     ff_shaders: usize,
@@ -650,22 +650,14 @@ impl Counts {
     /// # Errors
     /// Names what the file is when it is not a current cache.
     fn of(path: &Path) -> Result<Self, String> {
-        match shader_cache::load(path) {
-            Ok(CacheLoad::Current(records)) => Ok(Self {
-                shaders: records.shaders.len(),
-                ff_shaders: records
-                    .shaders
-                    .iter()
-                    .filter(|entry| !entry.kind.is_programmable())
-                    .count(),
-                pipelines: records.pipelines.len(),
-                appended: records.needs_compaction,
-            }),
-            Ok(CacheLoad::Missing) => Err("no cache file".to_owned()),
-            Ok(CacheLoad::InvalidatedVersion(header)) => Err(version_note(&header)),
-            Ok(CacheLoad::InvalidatedWrongMagic) => Err("not a shader cache".to_owned()),
-            Err(error) => Err(format!("unreadable: {error}")),
-        }
+        let bytes = fs::read(path).map_err(|error| format!("unreadable: {error}"))?;
+        let stats = shader_cache::read_stats(&bytes).map_err(str::to_owned)?;
+        Ok(Self {
+            shaders: stats.shaders,
+            ff_shaders: stats.ff_shaders,
+            pipelines: stats.pipelines,
+            appended: stats.needs_compaction,
+        })
     }
 
     const fn records(&self) -> usize {
@@ -923,7 +915,7 @@ fn report(name: &str, shape: &str, measured: &Measured, kind: &Kind) {
     let mut body = String::from(shape);
     let _ = writeln!(
         body,
-        "cache: {shaders} shaders ({ff} fixed-function), {pipelines} pipeline recipes, {kib} KiB, \
+        "stored cache: {shaders} shaders ({ff} fixed-function), {pipelines} pipeline recipes, {kib} KiB, \
          put back before each of {count} measured processes{notes}",
         shaders = settled.counts.shaders,
         ff = settled.counts.ff_shaders,

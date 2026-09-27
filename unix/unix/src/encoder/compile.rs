@@ -44,7 +44,7 @@ use mtld3d_shared::{
     mtl::StageTag,
     mtl_handle::{MTLDeviceKind, MTLFunctionKind, MTLRenderPipelineStateKind, MTLTextureKind},
     perf::{NanosSetTimer, PipelineTimings, ShaderTimings},
-    tsc::{rdtsc, secs_to_cycles},
+    tsc::rdtsc,
 };
 use rustc_hash::FxHashMap;
 
@@ -1158,7 +1158,11 @@ impl FrameEncoder {
         let Some(&oldest) = self.compile_in_flight.values().min() else {
             return;
         };
-        if rdtsc().saturating_sub(oldest) > secs_to_cycles(STALLED_BUILD_SECS) {
+        // Calibration runs during startup. Its absence cannot prove a five-second stall.
+        let Ok(Some(hz)) = self.clock.get() else {
+            return;
+        };
+        if rdtsc().saturating_sub(oldest) > hz.saturating_mul(STALLED_BUILD_SECS) {
             mtld3d_shared::log_once_warn!(
                 target: LOG_TARGET,
                 "encoder: a shader or pipeline build has been in flight for over \

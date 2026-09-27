@@ -36,6 +36,9 @@ use mtld3d_types::{D3D_OK, D3DERR_DEVICELOST, E_OUTOFMEMORY};
 
 use crate::{LOG_TARGET, unix_call::unix_call};
 
+#[cfg(perf_tracking)]
+mod calibration;
+
 #[derive(Default)]
 struct LeaseRegistry {
     entries: Vec<Option<PacketLease>>,
@@ -110,6 +113,8 @@ impl LeaseRegistry {
 
 pub struct EncoderThread {
     runtime: u64,
+    #[cfg(perf_tracking)]
+    source_clock: calibration::SourceClock,
     gpu_caps: GpuCaps,
     pending: Mutex<Vec<FramePacket>>,
     failure: AtomicI32,
@@ -141,6 +146,8 @@ impl EncoderThread {
             })
             .map_err(|_| E_OUTOFMEMORY)?;
         let native_failure = Box::new(AtomicU32::new(0));
+        #[cfg(perf_tracking)]
+        let source_clock = calibration::SourceClock::new();
         let mut params = CreateEncoderParams {
             failure_ptr: core::ptr::from_ref(native_failure.as_ref()) as u64,
             device,
@@ -148,6 +155,10 @@ impl EncoderThread {
             config_len: u32::try_from(settings.as_bytes().len()).map_err(|_| E_OUTOFMEMORY)?,
             result: E_OUTOFMEMORY,
             runtime: 0,
+            #[cfg(perf_tracking)]
+            source_clock_ptr: source_clock.address(),
+            #[cfg(not(perf_tracking))]
+            source_clock_ptr: 0,
         };
         let status = unix_call(&mut params);
         if status != D3D_OK || params.result != D3D_OK || params.runtime == 0 {
@@ -161,6 +172,8 @@ impl EncoderThread {
         }
         Ok(Self {
             runtime: params.runtime,
+            #[cfg(perf_tracking)]
+            source_clock,
             gpu_caps,
             pending: Mutex::new(Vec::new()),
             failure: AtomicI32::new(D3D_OK),
@@ -254,9 +267,9 @@ impl EncoderThread {
             frame.scratch = scratch;
             frame.recorder = Some(recorder);
         } else {
-            frame.recorder = Some(FrameRecorder::with_completion_pool(
-                self.completions.clone(),
-            ));
+            let mut recorder = FrameRecorder::with_completion_pool(self.completions.clone());
+            recorder.set_pagebox_pool(&crate::page_box_pool::PAGEBOX_POOL);
+            frame.recorder = Some(recorder);
         }
     }
 
@@ -359,6 +372,8 @@ impl EncoderThread {
         if self.runtime == 0 {
             return Ok(());
         }
+        #[cfg(perf_tracking)]
+        self.source_clock.join();
         let mut params = DestroyEncoderParams {
             runtime: self.runtime,
         };
@@ -397,6 +412,8 @@ impl Drop for EncoderThread {
     fn drop(&mut self) {
         let _shutdown = self.shutdown();
         if self.runtime != 0 {
+            #[cfg(perf_tracking)]
+            self.source_clock.retain_after_failed_destroy();
             std::mem::forget(std::mem::replace(
                 &mut self.native_failure,
                 Box::new(AtomicU32::new(0)),

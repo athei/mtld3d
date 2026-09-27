@@ -2,6 +2,7 @@ use strum::{EnumCount, VariantArray};
 
 pub mod blit_geometry;
 pub mod bounded_cache;
+pub mod clock_calibration;
 mod commands;
 pub mod crumb;
 pub mod encoder_protocol;

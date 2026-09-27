@@ -664,6 +664,29 @@ The `mtld3d::perf` summary in `windows/core/src/perf.rs` is compiled in only on 
 
 `Encode+commit` splits into three children the unix side times with `NanosSetTimer` inside `SubmitFrame`: the frame-leading blits, the replay of every pass descriptor (upload and draw, each pass's own blits included), and the frame buffer's completion-handler install plus both commits. A `resid` row takes what is left (command-buffer creation, the present settle less its wait, the upload buffer's handler, the thunk crossing), so the children add up to their parent. The `GPU` block reports `GPUEndTime - GPUStartTime` per command-buffer role (frame, upload, present) as ms per frame, with the number of buffers behind each and no peak, since a report does not line up with one frame. It is not the device's whole GPU time: snapshot copies, read-backs, creation-time clears, the cursor overlay and the shutdown fence are not counted, nor a frame or upload buffer submitted before its sequence or counters were wired. A synchronous submit behind a barrier is timed and folded like an async one, so `Encode+commit` and its children always describe the same submission. Each completion handler adds its buffer's time to the device record, and the next `SubmitFrame` of that device moves the sums into its `SubmitTimings` output and leaves zero behind, so every buffer is reported once, one submission after it finished. Buffers of one queue can overlap on the GPU, so the roles add up to busy time, not wall time, which the block's label says. All of it travels as nanoseconds in the fixed `SubmitFrameParams.timings` output; outside a `PERF=1` build, or with the perf target off, the handlers read no time and every field stays zero.
 
+The API frame telemetry payload uses a separate duration contract: its symbolic
+`SourceElapsedTicks` wire tag (`2`) identifies elapsed ticks from the source
+runtime, not nanoseconds or absolute timestamps. Each device owns a source-clock
+calibration mailbox. A background
+worker publishes its immutable `u64` frequency through an `AtomicU32` state
+(`Pending`, `Ready`, or `Failed`), with release/acquire ordering. The PE owner
+retains this mailbox while the native runtime can read it, joins its calibration
+worker before native destruction, and releases it only after native readers stop.
+The native runtime also owns its local calibration worker. Neither side assumes
+a frequency or subtracts timestamps from different clocks.
+
+Calibration runs on background workers, so neither the API nor encoder intake
+waits for it. The encoder thread retains up to 4096 frame samples while either
+frequency is pending. Once both frequencies are ready, deferred aggregation on
+the encoder thread rescales source durations into native duration ticks using
+the two published frequencies, preserves queued samples, and uses the existing
+nanosecond and millisecond report conversions. Calibration failure or exceeding
+the pending bound logs `perf-invalid:` and stops accepting further samples while
+retaining pending samples and counting rejected samples. Rendering continues;
+this does not report device loss. Teardown joins both calibration workers before
+the final deferred drain. This contract adds no runtime setting and applies only
+to `PERF=1` telemetry.
+
 Each report identifies its owning encoder thread with `encoder=ThreadId(...)`,
 which distinguishes D3D device instances without a shared counter. The interval
 header gives its first and last device reset epochs. Inverse outcomes and

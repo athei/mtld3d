@@ -3,7 +3,7 @@ use std::{
     thread,
 };
 
-use super::{FrameSlab, LeaseCompletion, ReplayMailbox, WireError, WireReader};
+use super::{FrameSlab, LeaseCompletion, ReplayMailbox, WireError, WireReader, WireWriter};
 
 #[test]
 fn scalar_records_round_trip_without_payload_copy() {
@@ -143,4 +143,51 @@ fn retained_ranges_reject_escape_and_survive_record_nesting() {
     assert!(record.payload.permits_range(0x2000, 0x20));
     assert!(!record.payload.permits_range(0x2000, 0x21));
     assert!(!WireReader::new(&[]).permits_range(0x1000, 1));
+}
+
+#[test]
+fn reserved_scalar_stores_match_growing_storage() {
+    fn write_fields(writer: &mut WireWriter<'_>) -> Result<(), WireError> {
+        writer.u8(0xa5)?;
+        writer.u16(0x5678)?;
+        writer.u32(0x1234_5678)?;
+        writer.u64(0x0123_4567_89ab_cdef)?;
+        writer.i32(-123)?;
+        writer.f32(f32::from_bits(0x7fc0_0042))?;
+        writer.bytes(&[11, 22, 33])
+    }
+    let mut slab = FrameSlab::new();
+    slab.push_record(0x1234, write_fields).unwrap();
+    let mut reserved = [0xaa; 40];
+    let length = WireWriter::record_into(&mut reserved, 0x1234, write_fields).unwrap();
+    assert_eq!(&reserved[..length], slab.as_bytes());
+    assert_eq!(&reserved[length..], &[0xaa; 8]);
+    for limit in 0..length {
+        let mut truncated = [0xaa; 40];
+        assert_eq!(
+            WireWriter::record_into(&mut truncated[..limit], 0x1234, write_fields),
+            Err(WireError::TooLarge)
+        );
+        assert!(truncated[limit..].iter().all(|byte| *byte == 0xaa));
+    }
+}
+
+#[test]
+fn failed_reserved_scalar_does_not_advance_or_partially_write() {
+    for available in 0..8 {
+        let mut reserved = [0xaa; 14];
+        let length = WireWriter::record_into(&mut reserved[..6 + available], 7, |writer| {
+            assert_eq!(writer.u64(u64::MAX), Err(WireError::TooLarge));
+            if available != 0 {
+                writer.u8(42)?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(length, 6 + usize::from(available != 0));
+        if available != 0 {
+            assert_eq!(reserved[6], 42);
+        }
+        assert!(reserved[length..].iter().all(|byte| *byte == 0xaa));
+    }
 }

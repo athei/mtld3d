@@ -94,6 +94,12 @@ pub struct CompilationPerf {
     asynchronous: AsyncMetrics,
 }
 
+#[cfg(perf_tracking)]
+pub(super) struct DeferredFrame {
+    metrics: [Metric; Kind::COUNT],
+    serial: u64,
+}
+
 impl CompilationPerf {
     #[must_use]
     pub const fn new() -> Self {
@@ -149,11 +155,11 @@ impl CompilationPerf {
     #[cfg(perf_tracking)]
     pub fn note_install(&mut self, enqueued_tsc: u64, installed_tsc: u64) {
         if perf_enabled() {
-            let ns = cycles_to_ns(installed_tsc.saturating_sub(enqueued_tsc));
+            let cycles = installed_tsc.saturating_sub(enqueued_tsc);
             let metrics = &mut self.asynchronous;
             metrics.installs = metrics.installs.saturating_add(1);
-            metrics.latency_ns = metrics.latency_ns.saturating_add(ns);
-            metrics.latency_peak_ns = metrics.latency_peak_ns.max(ns);
+            metrics.latency_cycles = metrics.latency_cycles.saturating_add(cycles);
+            metrics.latency_peak_cycles = metrics.latency_peak_cycles.max(cycles);
         }
     }
 
@@ -308,16 +314,47 @@ impl CompilationPerf {
     /// Close a submission, calculating residuals before taking window maxima.
     #[cfg(perf_tracking)]
     pub fn finish_frame(&mut self, resolve_ns: u64, pipeline_ns: u64, encoder_ns: u64) {
-        let shaders = self.frame[Kind::ShaderVs as usize]
+        let frame = self.defer_frame();
+        self.finish_deferred_frame(frame, resolve_ns, pipeline_ns, encoder_ns);
+    }
+
+    #[cfg(perf_tracking)]
+    pub(super) const fn defer_frame(&mut self) -> DeferredFrame {
+        let frame = DeferredFrame {
+            metrics: core::mem::replace(&mut self.frame, [const { Metric::new() }; Kind::COUNT]),
+            serial: self.frame_serial,
+        };
+        self.frame_serial = self.frame_serial.wrapping_add(1);
+        frame
+    }
+
+    #[cfg(perf_tracking)]
+    pub(super) fn finish_deferred_frame(
+        &mut self,
+        mut frame: DeferredFrame,
+        resolve_ns: u64,
+        pipeline_ns: u64,
+        encoder_ns: u64,
+    ) {
+        // Called only once the native frequency is published. Preserve early install
+        // durations as native ticks until this aggregation boundary.
+        let metrics = &mut self.asynchronous;
+        metrics.latency_ns = metrics
+            .latency_ns
+            .saturating_add(cycles_to_ns(core::mem::take(&mut metrics.latency_cycles)));
+        metrics.latency_peak_ns = metrics.latency_peak_ns.max(cycles_to_ns(core::mem::take(
+            &mut metrics.latency_peak_cycles,
+        )));
+        let shaders = frame.metrics[Kind::ShaderVs as usize]
             .ns
-            .saturating_add(self.frame[Kind::ShaderPs as usize].ns);
-        let pipelines = self.frame[Kind::Pipeline as usize]
+            .saturating_add(frame.metrics[Kind::ShaderPs as usize].ns);
+        let pipelines = frame.metrics[Kind::Pipeline as usize]
             .ns
-            .saturating_add(self.frame[Kind::Sibling as usize].ns)
-            .saturating_add(self.frame[Kind::Depth as usize].ns);
-        self.frame[Kind::ResolveOther as usize].ns = resolve_ns.saturating_sub(shaders);
-        self.frame[Kind::PipelineOther as usize].ns = pipeline_ns.saturating_sub(pipelines);
-        for (window, frame) in self.window.iter_mut().zip(&mut self.frame) {
+            .saturating_add(frame.metrics[Kind::Sibling as usize].ns)
+            .saturating_add(frame.metrics[Kind::Depth as usize].ns);
+        frame.metrics[Kind::ResolveOther as usize].ns = resolve_ns.saturating_sub(shaders);
+        frame.metrics[Kind::PipelineOther as usize].ns = pipeline_ns.saturating_sub(pipelines);
+        for (window, frame) in self.window.iter_mut().zip(&mut frame.metrics) {
             window.ns = window.ns.saturating_add(frame.ns);
             window.calls = window.calls.saturating_add(frame.calls);
             window.failures = window.failures.saturating_add(frame.failures);
@@ -325,11 +362,10 @@ impl CompilationPerf {
             *frame = Metric::new();
         }
         for event in &mut self.slow {
-            if event.serial == self.frame_serial {
+            if event.serial == frame.serial {
                 event.encoder_ns = Some(encoder_ns);
             }
         }
-        self.frame_serial = self.frame_serial.wrapping_add(1);
     }
 
     /// Append the window's compilation keys to the `perf-kv` line.
@@ -493,6 +529,8 @@ struct AsyncMetrics {
     pending_peak: u64,
     /// Builds installed, and their summed and longest enqueue-to-install latency.
     installs: u64,
+    latency_cycles: u64,
+    latency_peak_cycles: u64,
     latency_ns: u64,
     latency_peak_ns: u64,
     /// Draws encoded with a placeholder pipeline, whose builds their submission waited for.
@@ -513,6 +551,8 @@ impl AsyncMetrics {
             skipped: 0,
             pending_peak: 0,
             installs: 0,
+            latency_cycles: 0,
+            latency_peak_cycles: 0,
             latency_ns: 0,
             latency_peak_ns: 0,
             deferred: 0,

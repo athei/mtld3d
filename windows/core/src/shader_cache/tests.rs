@@ -1108,3 +1108,51 @@ fn retained_dxso_accepts_the_parsers_end_opcode_encoding() {
         }
     }
 }
+
+#[test]
+fn inventory_counts_stored_records_across_emitter_fingerprints() {
+    for emitter in [SHADER_EMITTER_VERSION, SHADER_EMITTER_VERSION ^ 1] {
+        let mut entries = sample_entries();
+        for entry in &mut entries {
+            entry.emitter_version = emitter;
+        }
+        let mut recipe = sample_recipe();
+        recipe.ps = ShaderRecordRef::new(entries[1].kind, entries[1].key);
+        let mut bytes = Vec::new();
+        write_header(&mut bytes);
+        write_bundle(&mut bytes, &entries, &[recipe]);
+        let stats = read_stats(&bytes).expect("valid stored inventory");
+        assert_eq!(
+            (stats.shaders, stats.ff_shaders, stats.pipelines),
+            (3, 1, 1)
+        );
+        assert!(!stats.needs_compaction);
+        if emitter != SHADER_EMITTER_VERSION {
+            let runtime = read_records(&bytes);
+            assert!(runtime.shaders.is_empty());
+            assert!(runtime.pipelines.is_empty());
+            assert!(runtime.needs_compaction);
+        }
+    }
+}
+
+#[test]
+fn inventory_rejects_checksum_schema_and_payload_damage() {
+    let original = write_file(&[sample_entries()], true);
+    let mut damaged = original.clone();
+    damaged[HEADER_LEN + 16] ^= 1;
+    assert!(read_stats(&damaged).is_err());
+    let mut schema = original.clone();
+    schema[12] ^= 1;
+    assert!(read_stats(&schema).is_err());
+    let mut format = original.clone();
+    format[8] ^= 1;
+    assert!(read_stats(&format).is_err());
+    assert!(read_stats(&original[..original.len() - 1]).is_err());
+
+    let mut malformed = Vec::new();
+    write_header(&mut malformed);
+    let frame = zstd::encode_all(&[0xff][..], ZSTD_APPEND_LEVEL).unwrap();
+    push_chunk(&mut malformed, RECORD_KIND_BUNDLE, 0, &frame);
+    assert!(read_stats(&malformed).is_err());
+}

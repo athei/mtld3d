@@ -11,7 +11,7 @@ use rustc_hash::FxHashSet;
 
 use super::*;
 
-const fn sample(enc_cyc: u64, drawable_wait: u64) -> FrameSample {
+pub(super) const fn sample(enc_cyc: u64, drawable_wait: u64) -> FrameSample {
     FrameSample {
         counters: FrameCounters::new(),
         timing: FrameTiming::new(),
@@ -1460,4 +1460,23 @@ fn dispatch_trace_excludes_logger_and_separates_shader_validation_from_compile()
     ] {
         assert_eq!(unix_dispatch_kind(thunk as u32), Some("sync"));
     }
+}
+
+#[test]
+fn native_decode_cycles_extend_operations_once_and_reset_next_frame() {
+    let mut state = EncoderPerfState::new();
+    let payload = FramePerfPayload::new();
+    state.begin_frame(&payload);
+    state.set_op_cycles(100);
+    state.set_submit_cycles(25);
+    state.add_op_cycles(40);
+    assert_eq!(state.enc.op_cycles, 140);
+    assert_eq!(state.enc.op_cycles + state.enc.submit_cycles, 165);
+    assert_eq!(
+        state.timing.frame_total_cycles,
+        payload.timing.frame_total_cycles
+    );
+    state.begin_frame(&payload);
+    assert_eq!(state.enc.op_cycles, 0);
+    assert_eq!(state.enc.submit_cycles, 0);
 }

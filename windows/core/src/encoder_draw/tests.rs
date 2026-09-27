@@ -18,6 +18,18 @@ fn encode_draw(draw: &DrawOp) -> FrameSlab {
     let mut writer = DrawWriter::new();
     slab.push_record(1, |output| writer.encode_draw(draw, output))
         .unwrap();
+    // SAFETY: each fixture retains the immutable byte ranges it encodes; bound buffers
+    // remain numeric identities and are never dereferenced by either parser.
+    let mut checked = unsafe { WireReader::new_trusted(&slab.as_bytes()[6..]) };
+    // SAFETY: same fixture lifetime applies to the reconstruction comparison.
+    let mut wire = unsafe { WireReader::new_trusted(&slab.as_bytes()[6..]) };
+    // SAFETY: fixture byte owners outlive this immediately dropped decoded operation.
+    let mut decoder = unsafe { DrawReader::new() };
+    assert_eq!(
+        super::validate_wire_draw(&mut checked, |_, _| Ok(())).is_ok(),
+        decoder.decode_draw(&mut wire).is_ok(),
+        "stack-only validation must agree with native reconstruction"
+    );
     slab
 }
 
@@ -264,14 +276,14 @@ fn every_truncated_draw_prefix_fails() {
     let encoded = encode_draw(&draw);
     let payload = &encoded.as_bytes()[6..];
     for count in 0..payload.len() {
-        // SAFETY: the UP draw contains only owned scalar and inline bytes.
-        let mut decoder = unsafe { DrawReader::new() };
-        assert!(
-            decoder
-                .decode_draw(&mut WireReader::new(&payload[..count]))
-                .is_err()
-        );
+        assert_draw_rejected(&payload[..count]);
     }
+    let mut invalid = payload.to_vec();
+    invalid[..4].copy_from_slice(&u32::MAX.to_le_bytes());
+    assert_draw_rejected(&invalid);
+    invalid.copy_from_slice(payload);
+    invalid[4] = u8::MAX;
+    assert_draw_rejected(&invalid);
 }
 
 #[test]
@@ -490,6 +502,9 @@ fn complete_snapshot_reconstructs_native_structures_and_borrows_only_bytes() {
     assert!(direct_length <= super::SNAPSHOT_DELTA_MAX_BYTES);
     let payload = &first.as_bytes()[6..];
     for length in 0..payload.len() {
+        // SAFETY: this read-only validator borrows the same retained fixture bytes.
+        let mut checked = unsafe { WireReader::new_trusted(&payload[..length]) };
+        assert!(super::validate_wire_snapshot(&mut checked).is_err());
         let mut truncated_scratch = ScratchArena::new();
         // SAFETY: any complete ranges in this prefix name the live immutable bytes above.
         let mut truncated_decoder = unsafe { DrawReader::new() };
@@ -501,6 +516,10 @@ fn complete_snapshot_reconstructs_native_structures_and_borrows_only_bytes() {
                 .is_err()
         );
     }
+    // SAFETY: the fixture retains every initialized byte span for this read-only pass.
+    let mut checked = unsafe { WireReader::new_trusted(payload) };
+    super::validate_wire_snapshot(&mut checked).unwrap();
+    assert!(checked.is_empty());
     let mut native = ScratchArena::new();
     // SAFETY: the only wire addresses name bytes above, alive through all decoded-token uses.
     let mut stream = unsafe { WireReader::new_trusted(first.as_bytes()) };
@@ -632,4 +651,54 @@ fn released_cpu_backing_keeps_bound_vertex_and_index_buffer_descriptors() {
     let restored = decoder.decode_draw(&mut record.payload).unwrap();
     assert!(record.payload.is_empty());
     assert_eq!(encode_draw(&restored).as_bytes(), encoded.as_bytes());
+}
+
+fn assert_draw_rejected(payload: &[u8]) {
+    // SAFETY: callers retain every unmodified fixture byte span; malformed cases
+    // alter scalar discriminants or truncate fields, never forge byte addresses.
+    let mut checked = unsafe { WireReader::new_trusted(payload) };
+    assert!(super::validate_wire_draw(&mut checked, |_, _| Ok(())).is_err());
+    // SAFETY: the same fixture storage remains live during reconstruction.
+    let mut wire = unsafe { WireReader::new_trusted(payload) };
+    // SAFETY: decoded values cannot outlive the retained fixture storage.
+    let mut decoder = unsafe { DrawReader::new() };
+    assert!(decoder.decode_draw(&mut wire).is_err());
+}
+
+#[test]
+fn maximum_bound_stream_draw_validation_matches_reconstruction() {
+    let stream = |index| StreamBinding {
+        stream: index,
+        buffer_id: BufferId::new_unique(),
+        backing_ptr: 0,
+        backing_len: crate::page_box::PAGE_SIZE,
+        backing_generation: 0,
+        offset: 0,
+        stride: 16,
+        freq: 1,
+    };
+    let draw = DrawOp {
+        metal_prim: PrimitiveType::Triangle,
+        vertex_source: VertexSource::Bound {
+            first: stream(0),
+            extra: (1..16).map(stream).collect(),
+            stream0_freq: 1,
+        },
+        index_source: IndexSource::None {
+            start_vertex: 0,
+            vertex_count: 3,
+        },
+    };
+    let encoded = encode_draw(&draw);
+    let payload = &encoded.as_bytes()[6..];
+    let mut checked = WireReader::new(payload);
+    super::validate_wire_draw(&mut checked, |address, length| {
+        assert_eq!((address, length), (0, crate::page_box::PAGE_SIZE as u64));
+        Ok(())
+    })
+    .unwrap();
+    assert!(checked.is_empty());
+    for length in 0..payload.len() {
+        assert_draw_rejected(&payload[..length]);
+    }
 }

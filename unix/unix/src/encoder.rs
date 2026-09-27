@@ -74,7 +74,7 @@ use mtld3d_shared::{
     perf::{NanosSetTimer, ShaderTimings, SubmitTimings},
     record_handle::DeviceRecordHandle,
     texture_views::TextureViews,
-    tsc::{ns_to_cycles, rdtsc, secs_to_cycles},
+    tsc::rdtsc,
 };
 use mtld3d_types::{D3DSAMP_MIPMAPLODBIAS, SAMPLER_STATE_COUNT};
 // Fast non-cryptographic hasher for the per-draw resource caches below
@@ -463,8 +463,8 @@ struct SubmitPacket {
 
 /// What one `SubmitFrame` thunk reported back.
 ///
-/// The durations are nanoseconds because the two sides do not share a cycle
-/// counter; they become our cycles via `ns_to_cycles` when folded into perf.
+/// PERF durations retain nanosecond units until native calibration completes.
+/// Disabled builds return only the submission status.
 struct SubmitOutcome {
     status: i32,
     /// The last present's `nextDrawable` wait, as the presenter measured it.
@@ -472,15 +472,19 @@ struct SubmitOutcome {
     /// The presenter runs on its own thread, so the submit that hands over
     /// the next frame reports the wait of the one before: lagged by one
     /// present, like every submit-side figure under async.
+    #[cfg(perf_tracking)]
     drawable_wait_ns: u64,
     /// How long the submit waited for the previous present to commit.
     ///
     /// The display's cadence as the submit thread sees it: part of
     /// `submit_exec`, and what `Encode+commit` subtracts.
+    #[cfg(perf_tracking)]
     present_wait_ns: u64,
     /// Whether the submit copied the pending present's frame into a slot, and waited for one.
+    #[cfg(perf_tracking)]
     snapshot: SnapshotFlags,
     /// The encode and commit split, and the GPU time of the buffers that finished meanwhile.
+    #[cfg(perf_tracking)]
     timings: SubmitTimings,
 }
 
@@ -711,6 +715,7 @@ pub struct FrameEncoder {
     /// The `Async` per-frame perf summary reports this (lagged ≤1 frame).
     last_submit_status: i32,
     runtime_failure_ptr: u64,
+    clock: Arc<mtld3d_shared::clock_calibration::ClockCalibration>,
     /// Whether the previous submit was a mid-frame flush (`NO_PRESENT`).
     ///
     /// Set in `finalize_submit` from the frame's flags, read in the next
@@ -1351,6 +1356,7 @@ impl FrameEncoder {
         gpu_caps: GpuCaps,
         config: Arc<Mtld3dConfig>,
         cache_path: Option<PathBuf>,
+        clock: Arc<mtld3d_shared::clock_calibration::ClockCalibration>,
     ) -> std::io::Result<Self> {
         // Spawn the dedicated submit thread. It issues the `SubmitFrame`
         // thunk for `Async` frames so the unix command-walk + present
@@ -1412,6 +1418,7 @@ impl FrameEncoder {
             submit_payloads_total: 0,
             last_submit_status: 0,
             runtime_failure_ptr: 0,
+            clock,
             prev_submit_no_present: false,
             dump_draw: None,
             current_blit_retention: Vec::new(),
@@ -2449,15 +2456,12 @@ impl FrameEncoder {
 
     /// Latch a thunk's status and fold its timings into the perf counters.
     ///
-    /// The unix side measures its durations in nanoseconds (its counter is
-    /// not ours), so they convert to our cycles here, where every other perf
-    /// bucket is denominated.
+    /// Submit durations remain nanoseconds until native calibration is ready.
+    #[cfg(perf_tracking)]
     fn fold_submit_outcome(&mut self, outcome: &SubmitOutcome, submit_exec_tsc: u64) {
         self.last_submit_status = outcome.status;
         self.perf
-            .set_drawable_wait_cycles(ns_to_cycles(outcome.drawable_wait_ns));
-        self.perf
-            .set_present_wait_cycles(ns_to_cycles(outcome.present_wait_ns));
+            .set_submit_wait_nanos(outcome.drawable_wait_ns, outcome.present_wait_ns);
         if outcome.snapshot.contains(SnapshotFlags::TAKEN) {
             self.perf.bump_snapshot();
         }
@@ -2466,6 +2470,11 @@ impl FrameEncoder {
         }
         self.perf
             .fold_submit_timings(&outcome.timings, submit_exec_tsc);
+    }
+
+    #[cfg(not(perf_tracking))]
+    const fn fold_submit_outcome(&mut self, outcome: &SubmitOutcome, _submit_exec_tsc: u64) {
+        self.last_submit_status = outcome.status;
     }
 
     /// Hand a finalized packet to the submit thread (`Async` mode).
@@ -5442,7 +5451,10 @@ impl FrameEncoder {
     /// poll cost stays in the few-cycle range — no `Instant::now()`
     /// syscall.
     pub fn maybe_emit_compile_summary(&mut self) {
-        let idle = secs_to_cycles(1);
+        // Debounce is one second; a pending initial calibration cannot yet reach it.
+        let Ok(Some(idle)) = self.clock.get() else {
+            return;
+        };
         let Some(snap) = self.compile_stats.poll_drain(rdtsc(), idle) else {
             return;
         };
@@ -8224,6 +8236,7 @@ impl EncoderThread {
         config: Arc<Mtld3dConfig>,
         prewarm_rx: mpsc::Receiver<Option<WarmCache>>,
         cache_path: Option<PathBuf>,
+        clocks: crate::encoder_service::EncoderClocks,
     ) -> std::io::Result<Self> {
         let (sender, receiver) = mpsc::sync_channel::<EncoderMessage>(API_FRAME_CHANNEL_CAP);
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
@@ -8237,6 +8250,7 @@ impl EncoderThread {
                     config,
                     cache_path,
                     ready_tx,
+                    clocks,
                 );
             })?;
         match ready_rx.recv() {
@@ -8473,6 +8487,7 @@ fn encoder_thread_main(
     config: Arc<Mtld3dConfig>,
     cache_path: Option<PathBuf>,
     ready: mpsc::SyncSender<std::io::Result<()>>,
+    clocks: crate::encoder_service::EncoderClocks,
 ) {
     let apple = GpuCaps::apple_silicon_default();
     if !gpu_caps.unified_memory
@@ -8491,17 +8506,21 @@ fn encoder_thread_main(
             cfg.linear_align256,
         );
     }
-    let mut enc = match FrameEncoder::new(gpu_caps, config, cache_path) {
+    let mut enc = match FrameEncoder::new(gpu_caps, config, cache_path, clocks.native) {
         Ok(enc) => enc,
         Err(error) => {
             let _ = ready.send(Err(error));
             return;
         }
     };
+    #[cfg(perf_tracking)]
+    // SAFETY: PE retains source calibration until native destruction completes.
+    unsafe {
+        enc.perf
+            .set_clock_domains(clocks.source, Arc::clone(&enc.clock));
+    }
     let _ = ready.send(Ok(()));
     drop(ready);
-    // Calibrate this native linkage unit before timed frame replay begins.
-    let _ = mtld3d_shared::tsc::tsc_hz();
     let mut queries = mtld3d_core::guest_queries::QueryLeaseCache::default();
     let mut frame_counter: u64 = 0;
     // Idempotent — also called from `lib.rs::init_logger` during
@@ -8527,7 +8546,13 @@ fn encoder_thread_main(
             Ok(EncoderMessage::Encoded { frame, done }) => {
                 // SAFETY: admission retained the immutable PE packet until its decoder's
                 // final replay guard or rejection guard publishes completion.
-                let status = match unsafe { frame.decode(&mut queries) } {
+                let mut decode_cycles = 0;
+                let decoded = {
+                    let _decode = mtld3d_core::perf::CycleSetTimer::start(&raw mut decode_cycles);
+                    // SAFETY: the admitted packet retains every borrowed range through replay.
+                    unsafe { frame.decode(&mut queries) }
+                };
+                let status = match decoded {
                     Ok(decoded) => {
                         enc.runtime_failure_ptr = frame.failure_ptr;
                         frame_counter += 1;
@@ -8538,6 +8563,7 @@ fn encoder_thread_main(
                             &mut enc,
                             Box::new(decoded),
                             frame_counter,
+                            decode_cycles,
                             if frame.mode == EncoderSubmitMode::Queue {
                                 SubmitMode::Async
                             } else {
@@ -8642,6 +8668,7 @@ fn encoder_thread_main(
                 enc.drain_submit_thread();
                 enc.drain_presentation();
                 enc.shutdown_cleanup();
+                enc.perf.finish_deferred();
                 let submit_thread = enc.submit_thread.take();
                 drop(enc);
                 if let Some(handle) = submit_thread
@@ -8667,7 +8694,13 @@ fn encoder_thread_main(
 /// the last frame's present is in the trace. A mid-frame flush of a marked
 /// frame arrives through the `MidFrameSubmit*` arms, which is why all three
 /// frame arms go through here.
-fn run_frame_bracketed(enc: &mut FrameEncoder, frame: Box<FrameData>, fc: u64, mode: SubmitMode) {
+fn run_frame_bracketed(
+    enc: &mut FrameEncoder,
+    frame: Box<FrameData>,
+    fc: u64,
+    decode_cycles: u64,
+    mode: SubmitMode,
+) {
     let marks = frame.gpu_capture_marks();
     if marks.contains(FrameDataFlags::GPU_CAPTURE_START) {
         enc.drain_submit_thread();
@@ -8683,7 +8716,7 @@ fn run_frame_bracketed(enc: &mut FrameEncoder, frame: Box<FrameData>, fc: u64, m
     } else {
         mode
     };
-    run_frame(enc, frame, fc, mode);
+    run_frame(enc, frame, fc, decode_cycles, mode);
     if marks.contains(FrameDataFlags::GPU_CAPTURE_STOP) {
         enc.drain_presentation();
         let mut p = mtld3d_shared::StopGpuCaptureParams { pad0: 0 };
@@ -8697,7 +8730,13 @@ fn run_frame_bracketed(enc: &mut FrameEncoder, frame: Box<FrameData>, fc: u64, m
 /// Shared between `EncoderMessage::Frame` (normal Present, `Async`) and the
 /// rare readback / capture / reset paths (`Sync`, after a submit-thread
 /// barrier).
-fn run_frame(enc: &mut FrameEncoder, mut frame: Box<FrameData>, fc: u64, mode: SubmitMode) {
+fn run_frame(
+    enc: &mut FrameEncoder,
+    mut frame: Box<FrameData>,
+    fc: u64,
+    decode_cycles: u64,
+    mode: SubmitMode,
+) {
     if let Some(pacing) = frame.apply_pacing.take()
         && !frame.layer_handle.is_null()
     {
@@ -8841,6 +8880,10 @@ fn run_frame(enc: &mut FrameEncoder, mut frame: Box<FrameData>, fc: u64, mode: S
             }
         }
     }
+    // Packet validation and decoding run on this same native worker before replay.
+    // Add their native cycles after the op timer closes, so the reported encoder
+    // stage includes them once without changing the PE timing payload or subtimers.
+    enc.perf.add_op_cycles(decode_cycles);
     mtld3d_shared::crumb!("phase:OpLoopDn");
     enc.intake_vbib_retentions(&mut frame);
     mtld3d_shared::crumb!("phase:IntakeVbib");
@@ -9130,9 +9173,13 @@ fn execute_submit(
     }
     let outcome = SubmitOutcome {
         status,
+        #[cfg(perf_tracking)]
         drawable_wait_ns: params.drawable_wait_ns,
+        #[cfg(perf_tracking)]
         present_wait_ns: params.present_wait_ns,
+        #[cfg(perf_tracking)]
         snapshot: params.snapshot_flags,
+        #[cfg(perf_tracking)]
         timings: params.timings,
     };
     (payload, outcome)

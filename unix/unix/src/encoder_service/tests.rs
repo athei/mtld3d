@@ -97,3 +97,46 @@ fn native_failure_mailbox_is_sticky() {
     unsafe { super::publish_failure(0) };
     assert_eq!(failure.load(Ordering::Acquire), 1);
 }
+
+#[test]
+fn calibration_startup_does_not_wait_for_work_and_drop_joins() {
+    use std::{sync::mpsc, time::Duration};
+    let (release, blocked) = mpsc::channel();
+    let (started, start) = mpsc::channel();
+    let (finished, finish) = mpsc::channel();
+    let owner = std::thread::spawn(move || {
+        let calibration = super::CalibrationWorker::spawn(move || {
+            blocked.recv().unwrap();
+            1_000_000_000
+        });
+        started.send(()).unwrap();
+        drop(calibration);
+        finished.send(()).unwrap();
+    });
+    let startup = start.recv_timeout(Duration::from_secs(2));
+    let prematurely_finished = finish.recv_timeout(Duration::from_millis(50)).is_ok();
+    release.send(()).unwrap();
+    finish.recv_timeout(Duration::from_secs(2)).unwrap();
+    owner.join().unwrap();
+    assert!(
+        startup.is_ok(),
+        "startup must return before calibration completes"
+    );
+    assert!(
+        !prematurely_finished,
+        "shutdown must retain and join calibration"
+    );
+}
+
+#[test]
+fn calibration_panic_publishes_failure_before_join() {
+    let worker = super::CalibrationWorker::spawn(|| panic!("test calibration failure"));
+    let mailbox = std::sync::Arc::clone(&worker.clock);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while matches!(mailbox.get(), Ok(None)) && std::time::Instant::now() < deadline {
+        std::thread::yield_now();
+    }
+    assert!(mailbox.get().is_err());
+    drop(worker);
+    assert_eq!(std::sync::Arc::strong_count(&mailbox), 1);
+}
