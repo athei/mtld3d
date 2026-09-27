@@ -35,16 +35,6 @@ pub struct GuestPageLease {
 }
 
 impl GuestPageLease {
-    /// Retain a shared allocation without treating cached ownership as a read.
-    #[must_use]
-    pub fn for_shared(owner: Arc<PageBox>) -> Self {
-        Self {
-            owner,
-            read: None,
-            cells: LeaseCells::default(),
-        }
-    }
-
     /// Retain an existing read until native acquisition closes the handoff.
     #[must_use]
     pub fn for_read(read: PageBoxRead) -> Self {
@@ -52,15 +42,6 @@ impl GuestPageLease {
             owner: Arc::clone(read.backing()),
             read: Some(read),
             cells: LeaseCells::default(),
-        }
-    }
-
-    #[must_use]
-    pub fn for_shared_pooled(owner: Arc<PageBox>, pool: &CompletionPool) -> Self {
-        Self {
-            owner,
-            read: None,
-            cells: LeaseCells::Pooled(pool.allocate(false)),
         }
     }
 
@@ -168,42 +149,6 @@ impl GuestPageDescriptor {
             self.completion,
             self.read_acquired,
         ]
-    }
-
-    /// Adopt ownership without acquiring a read.
-    ///
-    /// # Safety
-    ///
-    /// The original PE lease and its bytes remain alive until final completion. This is the only
-    /// native adoption of the descriptor. Shared mutation obeys the original allocation's access
-    /// contract, and ownership-only publication cannot race a new unsynchronized read.
-    ///
-    /// # Errors
-    ///
-    /// Rejects invalid descriptor ranges or a descriptor that requests a read handoff.
-    #[cfg(not(windows))]
-    pub unsafe fn adopt_owned(&self) -> Result<PageBox, WireError> {
-        if self.read_acquired != 0 {
-            return Err(WireError::InvalidValue);
-        }
-        // SAFETY: the caller supplies the unique retained lease and access contract above.
-        unsafe { self.adopt_page() }
-    }
-
-    /// Adopt shared ownership without treating a cached wrapper as a read.
-    ///
-    /// # Safety
-    ///
-    /// The contract is identical to `adopt_owned`: this is the only adoption, and PE keeps its
-    /// allocation and cells alive until the last native wrapper publishes completion.
-    ///
-    /// # Errors
-    ///
-    /// Rejects the same invalid ranges and read handoff as `adopt_owned`.
-    #[cfg(not(windows))]
-    pub unsafe fn adopt_shared(&self) -> Result<Arc<PageBox>, WireError> {
-        // SAFETY: the caller supplies the same retained lease required by adopt_owned.
-        unsafe { self.adopt_owned() }.map(Arc::new)
     }
 
     /// Acquire the native read before acknowledging the original PE read.

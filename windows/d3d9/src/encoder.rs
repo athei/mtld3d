@@ -10,8 +10,7 @@ use std::sync::{
 
 pub use mtld3d_core::encoder_data::{
     ColorFillTarget, DepthTransfer, FrameData, FrameDataFlags, FrameInit, ResampledUpload,
-    RetiredColorTarget, StagingWarmupEntry, SubmitFence, TextureInfo, TextureUploadJob,
-    VbibWarmupEntry,
+    RetiredColorTarget, SubmitFence, TextureInfo, TextureUploadJob, VbibWarmupEntry,
 };
 use mtld3d_core::{
     config::Mtld3dConfig,

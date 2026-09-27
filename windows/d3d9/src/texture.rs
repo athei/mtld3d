@@ -478,14 +478,6 @@ impl TextureInner {
             .sum()
     }
 
-    /// Whether `level`'s staging is currently released (placeholder only).
-    ///
-    /// The staging warmup skips such levels: there is no backing worth
-    /// wrapping, and every dropped level of every texture shares one page.
-    pub const fn staging_is_dropped(&self, level: usize) -> bool {
-        self.dropped_staging & (1u32 << level) != 0
-    }
-
     /// Claim `(face, level)` for the GPU: its Metal texture holds pixels staging does not.
     ///
     /// The next write of that subresource's staging resolves the claim, reading
@@ -1014,21 +1006,6 @@ impl TextureInner {
     /// flush, and the cross-device rehydrate.
     pub const fn is_cpu_only(&self) -> bool {
         self.flags.contains(TextureFlags::CPU_ONLY)
-    }
-
-    /// How many per-mip staging buffers to wrap in an `MTLBuffer` eagerly.
-    ///
-    /// Zero for a cube map, whose staging is face-major in the cube sidecar,
-    /// and for a volume texture, whose box upload carries its own `Arc`;
-    /// neither has a per-level wrapper for the encoder to reuse.
-    pub fn staging_warmup_levels(&self) -> u32 {
-        if self
-            .flags
-            .intersects(TextureFlags::CUBE.union(TextureFlags::VOLUME_TEXTURE))
-        {
-            return 0;
-        }
-        u32::try_from(self.staging.len()).expect("mip count fits u32")
     }
 
     /// Volume (`LockBox`) lock: a writable pointer into the level's single staging buffer.
@@ -2245,11 +2222,8 @@ impl TextureInner {
 
     /// Clone the staging `Arc` for this mip.
     ///
-    /// Cheap (refcount bump) — used by the upload operation to keep the bytes
-    /// alive until the encoder thread blits them to the texture, and by
-    /// `push_texture_warmups` (device.rs) to populate
-    /// `StagingWarmupEntry.keepalive` so the staging `MTLBuffer` wrapper
-    /// survives a same-frame `texture_release`.
+    /// The upload retains these bytes through encoding and GPU retirement. A cached
+    /// staging wrapper keeps its own native owner until the wrapper is destroyed.
     pub fn staging_arc(&self, level: usize) -> Arc<PageBox> {
         Arc::clone(&self.staging[level])
     }

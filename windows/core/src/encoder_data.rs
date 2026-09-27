@@ -927,31 +927,6 @@ pub struct VbibWarmupEntry {
     pub map_mode: BufferMapMode,
 }
 
-/// Warmup entry for a texture mip's staging `MTLBuffer` wrap.
-///
-/// Pushed at `CreateTexture` time alongside the `TextureInfo` warmup; drained
-/// after `drain_texture_warmups` so the `texture_cache` entry exists. The
-/// resulting handle lands in `TextureGpuState::mip_staging_buffers[level]`,
-/// so the first `UnlockRect`-driven upload's `get_or_create_staging_buffer`
-/// hits the cache instead of cache-missing.
-///
-/// Skipped for RT / depth / expansion-path textures, their staging
-/// backing is never wrapped as a cached `MTLBuffer` here (RT/depth have no
-/// upload staging path; the expansion path builds its own transient staging
-/// buffer per upload before blitting).
-///
-/// `keepalive` holds the PE-side `Arc<PageBox>` so the staging
-/// allocation outlives the API thread's `texture_release` (which drops
-/// the original Arc from `TextureInner.staging` synchronously) and is
-/// still valid when `drain_staging_warmups` wraps it via
-/// `newBufferWithBytesNoCopy:`. After drain the clone moves into
-/// `MipStagingBuffer.keepalive`.
-pub struct StagingWarmupEntry {
-    pub texture_id: TextureId,
-    pub level: u32,
-    pub keepalive: Arc<PageBox>,
-}
-
 pub struct FrameData {
     pub recorder: Option<crate::encoder_packet::FrameRecorder>,
     pub ops: Vec<Op>,

@@ -103,8 +103,8 @@ use super::{
         build_alpha_ref_bytes,
     },
     encoder::{
-        ColorFillTarget, EncoderThread, FrameData, FrameInit, StagingWarmupEntry, SubmitFence,
-        TextureInfo, VbibWarmupEntry,
+        ColorFillTarget, EncoderThread, FrameData, FrameInit, SubmitFence, TextureInfo,
+        VbibWarmupEntry,
     },
     index_buffer::{Direct3DIndexBuffer9, IndexBufferCreateInfo},
     null_out,
@@ -5233,42 +5233,19 @@ fn resolve_texture_storage(
     ))
 }
 
-/// Queue the eager `MTLTexture` create and per-mip staging-buffer wraps.
+/// Queue the eager `MTLTexture` creation before any draw can bind it.
 ///
-/// Runs for a freshly constructed texture, and again when a system-memory one
-/// is promoted at its first sampling bind. Staging warmup is skipped for RT
-/// (no upload staging path). The staging Arcs stay stable until a
-/// Lock(DISCARD) rename swaps them.
+/// Runs for a freshly constructed texture and when a system-memory texture is
+/// promoted at its first sampling bind. Uploads create staging wrappers on first use.
 fn push_texture_warmups(dev: &mut DeviceInner, inner: &crate::texture::TextureInner) {
-    // A system-memory texture owns no Metal texture, so there is nothing to
-    // create and nothing for a staging wrapper to feed.
     if inner.is_cpu_only() {
         return;
     }
-    let info = inner.texture_info();
-    let texture_id = info.texture_id;
-    let usage_flags = info.usage_flags;
     let frame = &mut dev.current_frame;
     let recorder = frame
         .recorder
         .get_or_insert_with(mtld3d_core::encoder_packet::FrameRecorder::new);
-    recorder.capture_texture_warmup(&mut frame.scratch, &info);
-    if usage_flags.contains(mtld3d_shared::mtl::TextureUsage::RENDER_TARGET) {
-        return;
-    }
-    for level in 0..inner.staging_warmup_levels() {
-        if inner.staging_is_dropped(level as usize) {
-            continue;
-        }
-        recorder.capture_staging_warmup(
-            &mut frame.scratch,
-            StagingWarmupEntry {
-                texture_id,
-                level,
-                keepalive: inner.staging_arc(level as usize),
-            },
-        );
-    }
+    recorder.capture_texture_warmup(&mut frame.scratch, &inner.texture_info());
 }
 
 /// Vtable-shaped args bundle for `create_depth_texture_path`.

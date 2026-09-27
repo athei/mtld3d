@@ -499,6 +499,35 @@ fn low_mips_below_the_linear_alignment_sample_their_own_texels() {
     }
 }
 
+/// First use can follow creation in the same frame or after an idle frame.
+///
+/// Only mip 2 is initialized; its queued upload must survive the final API release.
+#[test]
+fn first_mip_upload_survives_release_before_submission() {
+    let h = Harness::new();
+    for (submit_creation, color) in [(false, 0xFF20_A060), (true, 0xFFA0_2060)] {
+        let tex = h.create_texture(8, 8, 0, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED);
+        if submit_creation {
+            assert_eq!(h.present(), 0, "submit creation before the first upload");
+        }
+        tex.lock_rect(2, 0).write_u32(&[color; 4]);
+        let quad = bind_for_quadrant_draws(&h, &tex);
+        assert_eq!(h.set_sampler_state(0, D3DSAMP_MIPFILTER, D3DTEXF_POINT), 0);
+        assert_eq!(h.set_sampler_state(0, D3DSAMP_MAXMIPLEVEL, 2), 0);
+        assert_eq!(h.clear_target(BLACK), 0);
+        assert_eq!(h.begin_scene(), 0);
+        assert_eq!(h.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad), 0);
+        assert_eq!(h.end_scene(), 0);
+        assert_eq!(h.clear_texture(0), 0);
+        drop(tex);
+        assert_pixel_eq(
+            h.read_pixel(320, 240),
+            color,
+            "the uploaded mip survives release before native submission",
+        );
+    }
+}
+
 #[test]
 fn level_desc_reports_surface_type() {
     let h = Harness::new();

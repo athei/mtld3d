@@ -57,7 +57,6 @@ pub enum EncoderOpcode {
     SetSnapshot = 41,
     WarmupTexture = 42,
     WarmupBuffer = 43,
-    WarmupStaging = 44,
     RetainVbib = 45,
     SetLayerPacing = 46,
     SetGamma = 47,

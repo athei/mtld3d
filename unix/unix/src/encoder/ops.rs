@@ -6,9 +6,7 @@ use mtld3d_core::{
         BindDepthOpFlags, BlitSide, ColorFillTarget, DepthTransfer, ResampledUpload,
         RetiredColorTarget, StretchSurfaceFlags,
     },
-    encoder_packet::metadata::{
-        BufferWarmupRecord, GammaRecord, LayerPacingRecord, StagingWarmupRecord,
-    },
+    encoder_packet::metadata::{BufferWarmupRecord, GammaRecord, LayerPacingRecord},
     encoder_records::{self as records, borrow, borrow_array, borrow_prefix},
     guest_queries::QueryLeaseCache,
     ids::{BufferId, TextureId},
@@ -77,9 +75,6 @@ fn execute_control(
         }
         EncoderOpcode::WarmupBuffer => {
             enc.warmup_buffer_record(borrow::<BufferWarmupRecord>(payload)?)?;
-        }
-        EncoderOpcode::WarmupStaging => {
-            enc.warmup_staging_record(borrow::<StagingWarmupRecord>(payload)?)?;
         }
         EncoderOpcode::SetLayerPacing => {
             let r = borrow::<LayerPacingRecord>(payload)?;

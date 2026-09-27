@@ -50,10 +50,14 @@ fn read_handoff_never_exposes_zero_before_native_read_ends() {
 fn cached_native_ownership_keeps_original_owner_alive() {
     let original = Arc::new(PageBox::new_zeroed(4));
     let weak = Arc::downgrade(&original);
-    let mut lease = GuestPageLease::for_shared(original);
+    let mut lease = GuestPageLease::for_read(PageBoxRead::new(original));
     let descriptor = lease.descriptor();
-    // SAFETY: the retained lease grants one native shared owner and no concurrent mutation.
-    let native = unsafe { descriptor.adopt_shared() }.expect("native owner");
+    // SAFETY: the retained lease grants exactly one native read handoff.
+    let read = unsafe { descriptor.adopt_read() }.expect("native read");
+    let native = Arc::clone(read.backing());
+    assert!(!lease.maintain());
+    drop(read);
+    assert!(!native.has_readers());
     assert!(weak.upgrade().is_some());
     assert!(!lease.maintain());
     drop(native);
@@ -90,10 +94,14 @@ fn failed_frame_admission_can_cancel_from_pe() {
 #[test]
 fn native_pool_rejects_borrowed_guest_allocation() {
     let pool = PageBoxPool::new(PAGE_SIZE * 2);
-    let mut lease = GuestPageLease::for_shared(Arc::new(PageBox::new_zeroed(12)));
+    let mut lease = GuestPageLease::for_read(PageBoxRead::new(Arc::new(PageBox::new_zeroed(12))));
     let descriptor = lease.descriptor();
-    // SAFETY: the lease is retained for the sole native ownership borrow.
-    let native = unsafe { descriptor.adopt_owned() }.expect("native box");
+    // SAFETY: the lease retains the original read and cells for one native adoption.
+    let read = unsafe { descriptor.adopt_read() }.expect("native read");
+    assert!(!lease.maintain());
+    let native = Arc::clone(read.backing());
+    drop(read);
+    let native = Arc::try_unwrap(native).unwrap_or_else(|_| panic!("sole native cached owner"));
     assert!(!native.is_native_owned());
     let returned = pool
         .recycle(native)
@@ -105,11 +113,11 @@ fn native_pool_rejects_borrowed_guest_allocation() {
 
 #[test]
 fn invalid_descriptor_does_not_publish_completion() {
-    let mut lease = GuestPageLease::for_shared(Arc::new(PageBox::new_zeroed(4)));
+    let mut lease = GuestPageLease::for_read(PageBoxRead::new(Arc::new(PageBox::new_zeroed(4))));
     let mut descriptor = lease.descriptor();
     descriptor.logical_len = descriptor.padded_len + 1;
     // SAFETY: retained cells are valid, and the invalid range is rejected without dereferencing.
-    assert!(unsafe { descriptor.adopt_owned() }.is_err());
+    assert!(unsafe { descriptor.adopt_read() }.is_err());
     assert!(!lease.maintain());
     // SAFETY: failed adoption never constructed a native owner.
     unsafe { lease.cancel_unadopted() };
@@ -121,7 +129,7 @@ fn retire_pooled_lease(
     cells: &crate::guest_completions::CompletionPool,
 ) {
     // SAFETY: this fixture retains the original allocation until the unique native owner drops.
-    let native = unsafe { lease.descriptor().adopt_owned() }.expect("native owner");
+    let native = unsafe { lease.descriptor().adopt_read() }.expect("native owner");
     assert!(!lease.maintain());
     drop(native);
     cells.drain(
@@ -138,7 +146,8 @@ fn shared_page_lease_preserves_other_owners_and_readers() {
     for hold_read in [false, true] {
         let cells = crate::guest_completions::CompletionPool::new();
         let external = Arc::new(PageBox::new_zeroed(12));
-        let lease = GuestPageLease::for_shared_pooled(Arc::clone(&external), &cells);
+        let lease =
+            GuestPageLease::for_read_pooled(PageBoxRead::new(Arc::clone(&external)), &cells);
         let read = hold_read.then(|| PageBoxRead::new(Arc::clone(&external)));
         retire_pooled_lease(lease, &cells);
         assert_eq!(Arc::strong_count(&external), if hold_read { 2 } else { 1 });

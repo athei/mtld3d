@@ -7,11 +7,9 @@ use mtld3d_shared::{
 
 use super::FrameRecorder;
 use crate::{
-    encoder_data::{FrameData, PendingVbibRetention, StagingWarmupEntry, VbibWarmupEntry},
+    encoder_data::{FrameData, PendingVbibRetention, VbibWarmupEntry},
     encoder_records::TextureRecord,
-    guest_pages::{
-        GuestOwnedPageDescriptor, GuestOwnedPageLease, GuestPageDescriptor, GuestPageLease,
-    },
+    guest_pages::{GuestOwnedPageDescriptor, GuestOwnedPageLease},
     perf::FramePerfPayload,
 };
 
@@ -22,14 +20,6 @@ pub struct BufferWarmupRecord {
     pub backing_len: u64,
     pub backing_generation: u64,
     pub map_mode: u32,
-    pub reserved: u32,
-}
-
-#[repr(C, align(8))]
-pub struct StagingWarmupRecord {
-    pub texture_id: u64,
-    pub page: GuestPageDescriptor,
-    pub level: u32,
     pub reserved: u32,
 }
 
@@ -57,8 +47,6 @@ pub struct GammaRecord {
 // SAFETY: these canonical records contain only fixed integers and descriptors, and all offsets
 // and sizes are asserted below. No field has invalid bit patterns or owns a Rust allocation.
 unsafe impl crate::encoder_records::CommandRecord for BufferWarmupRecord {}
-// SAFETY: the descriptor is seven u64 fields and all surrounding padding is explicit.
-unsafe impl crate::encoder_records::CommandRecord for StagingWarmupRecord {}
 // SAFETY: every byte belongs to initialized u64 fields, including the page descriptor.
 unsafe impl crate::encoder_records::CommandRecord for VbibRetentionRecord {}
 // SAFETY: this 16-byte integer record has no padding or invalid bit patterns.
@@ -198,25 +186,6 @@ impl FrameRecorder {
                 backing_len: entry.backing_len,
                 backing_generation: entry.backing_generation,
                 map_mode: entry.map_mode as u32,
-                reserved: 0,
-            },
-        );
-    }
-    pub fn capture_staging_warmup(
-        &mut self,
-        scratch: &mut crate::scratch::ScratchArena,
-        entry: StagingWarmupEntry,
-    ) {
-        let lease = GuestPageLease::for_shared_pooled(entry.keepalive, &self.completion_pool);
-        let page = lease.descriptor();
-        self.pages.push(lease);
-        self.metadata_command(
-            scratch,
-            mtld3d_shared::encoder_protocol::EncoderOpcode::WarmupStaging,
-            StagingWarmupRecord {
-                texture_id: entry.texture_id.raw(),
-                page,
-                level: entry.level,
                 reserved: 0,
             },
         );
@@ -491,12 +460,6 @@ const _: () = {
     assert!(core::mem::offset_of!(BufferWarmupRecord, backing_generation) == 24);
     assert!(core::mem::offset_of!(BufferWarmupRecord, map_mode) == 32);
     assert!(core::mem::offset_of!(BufferWarmupRecord, reserved) == 36);
-    assert!(size_of::<StagingWarmupRecord>() == 72);
-    assert!(align_of::<StagingWarmupRecord>() == 8);
-    assert!(core::mem::offset_of!(StagingWarmupRecord, texture_id) == 0);
-    assert!(core::mem::offset_of!(StagingWarmupRecord, page) == 8);
-    assert!(core::mem::offset_of!(StagingWarmupRecord, level) == 64);
-    assert!(core::mem::offset_of!(StagingWarmupRecord, reserved) == 68);
     assert!(size_of::<VbibRetentionRecord>() == 48);
     assert!(align_of::<VbibRetentionRecord>() == 8);
     assert!(core::mem::offset_of!(VbibRetentionRecord, buffer_id) == 0);
