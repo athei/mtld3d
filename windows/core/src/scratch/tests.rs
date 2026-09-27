@@ -274,3 +274,52 @@ fn flat_command_commit_preserves_previous_region_on_failure_and_rollover() {
     assert_eq!(&bytes[16..19], &[1, 2, 3]);
     assert!(bytes[19..].iter().all(|&byte| byte == 0));
 }
+
+#[test]
+fn reused_command_padding_is_zero_for_every_alignment_residue() {
+    use mtld3d_shared::command_header::{COMMAND_HEADER_BYTES, CommandHeader};
+
+    let mut arena = ScratchArena::with_chunk_size(TEST_CHUNK);
+    for payload_bytes in 0..16 {
+        arena.clear();
+        let dirty = arena
+            .write_command(1, 0, TEST_CHUNK - COMMAND_HEADER_BYTES, |payload| {
+                payload.fill(0xff);
+                Ok(payload.len())
+            })
+            .unwrap();
+        arena.clear();
+        let first = arena
+            .write_command(2, 3, payload_bytes, |payload| {
+                payload.fill(0xa5);
+                Ok(payload.len())
+            })
+            .unwrap();
+        assert_eq!(first.address, dirty.address);
+        let used = COMMAND_HEADER_BYTES + payload_bytes;
+        let aligned = (used + 15) & !15;
+        // SAFETY: this retained chunk was fully initialized above. The committed
+        // record occupies its prefix, and the next sixteen bytes retain the sentinel.
+        let bytes =
+            unsafe { core::slice::from_raw_parts(first.address as *const u8, aligned + 16) };
+        assert!(
+            bytes[COMMAND_HEADER_BYTES..used]
+                .iter()
+                .all(|&byte| byte == 0xa5)
+        );
+        assert!(bytes[used..aligned].iter().all(|&byte| byte == 0));
+        assert!(bytes[aligned..].iter().all(|&byte| byte == 0xff));
+        // SAFETY: the command begins at an aligned address and has an initialized header.
+        let header = unsafe { &*(first.address as *const CommandHeader) };
+        assert_eq!((header.opcode, header.operand, header.reserved), (2, 3, 0));
+        assert_eq!(header.record_bytes as usize, used);
+        let next = arena
+            .write_command(4, 0, 1, |payload| {
+                payload[0] = 0x5a;
+                Ok(1)
+            })
+            .unwrap();
+        assert_eq!(next.address, first.address + aligned as u64);
+        assert_eq!(next.address % 16, 0);
+    }
+}

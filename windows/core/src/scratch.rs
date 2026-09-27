@@ -233,12 +233,20 @@ impl ScratchArena {
         }
         let used = payload_used + COMMAND_HEADER_BYTES;
         let aligned_used = (used + 15) & !15;
-        // SAFETY: padding lies within the exclusive reservation.
-        unsafe {
-            pointer
-                .wrapping_add(used)
-                .write_bytes(0, aligned_used - used);
-        };
+        let padding = pointer.wrapping_add(used);
+        // Fixed command fields are eight-byte aligned. Keep their usual padding
+        // stores inline instead of calling memset for zero or eight bytes.
+        match aligned_used - used {
+            0 => {}
+            8 => {
+                // SAFETY: exactly eight padding bytes lie within this exclusive reservation.
+                unsafe { padding.write_bytes(0, 8) };
+            }
+            length => {
+                // SAFETY: all remaining padding bytes lie within this exclusive reservation.
+                unsafe { padding.write_bytes(0, length) };
+            }
+        }
         let record_bytes = u32::try_from(used).map_err(|_| WireError::TooLarge)?;
         let header_pointer = pointer as usize as *mut CommandHeader;
         // SAFETY: aligned chunk storage and cursor establish header alignment;
