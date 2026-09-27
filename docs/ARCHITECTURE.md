@@ -473,10 +473,9 @@ payload copies, frame serialization at `Present`, or waits to simplify the
 native consumer. Keep PE cancellation owners local and native runtime owners
 native. Include a handoff field only when its actual consumer needs it.
 
-The encoder migration is still being optimized and validated. Its fixed-record
-conversion is in progress; the policy above is the required endpoint, not a
-claim that every current frame path already satisfies it or has passed the
-performance gates.
+Frame commands use fixed records constructed directly on PE and borrowed by
+Unix. The encoder migration is still being optimized and validated; matched
+performance acceptance remains pending.
 
 How to apply:
 - New thunk field with symbolic meaning → its shared protocol type. Sizes/offsets/counts/`!= 0` booleans → `u32`.

@@ -1316,17 +1316,19 @@ impl FrameData {
     }
 
     /// Write a bound draw directly from its borrowed stream and index snapshots.
+    ///
+    /// # Errors
+    /// Returns the latched frame error or a wire capture failure.
     #[cfg(windows)]
     pub fn record_bound_draw(
         &mut self,
         prefix: crate::encoder_draw::draw_record::DrawPrefix,
         vertices: &crate::encoder_draw::draw_record::BoundVertices,
         indices: Option<&crate::encoder_draw::draw_record::IndexBuffer>,
-    ) {
-        let _ = self
-            .recorder
+    ) -> Result<(), mtld3d_shared::encoder_wire::WireError> {
+        self.recorder
             .get_or_insert_with(crate::encoder_packet::FrameRecorder::new)
-            .record_bound_draw(&mut self.scratch, prefix, vertices, indices);
+            .record_bound_draw(&mut self.scratch, prefix, vertices, indices)
     }
 
     /// Retain an owned draw for native replay.
@@ -1537,15 +1539,15 @@ impl FrameData {
 
 /// Capture a typed operation without a transient allocation on the API runtime.
 ///
-/// PE immediately serializes this value. Native decoding retains boxed payloads to keep its
-/// queued operation enum compact.
+/// Keep the owned operation payload inline for PE recording. Native replay borrows
+/// fixed command records directly rather than reconstructing owned operations.
 #[cfg(windows)]
 #[must_use]
 pub const fn capture_op<T>(value: T) -> T {
     value
 }
 
-/// Box a decoded operation for the native encoder queue.
+/// Box an owned operation payload for the host-side `Op` representation.
 #[cfg(not(windows))]
 #[must_use]
 pub fn capture_op<T>(value: T) -> Box<T> {

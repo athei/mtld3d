@@ -1855,15 +1855,17 @@ impl DeviceInner {
     /// Report capture failures without polling workers again within the same draw.
     fn recording_status(&self) -> Result<(), i32> {
         if let Some(error) = self.current_frame.recording_error() {
-            let status = match error {
-                mtld3d_shared::encoder_wire::WireError::AllocationFailed => {
-                    mtld3d_types::E_OUTOFMEMORY
-                }
-                _ => mtld3d_types::D3DERR_DEVICELOST,
-            };
-            return Err(self.encoder.record_failure(status));
+            return Err(self.capture_failure(error));
         }
         Ok(())
+    }
+
+    fn capture_failure(&self, error: mtld3d_shared::encoder_wire::WireError) -> i32 {
+        let status = match error {
+            mtld3d_shared::encoder_wire::WireError::AllocationFailed => mtld3d_types::E_OUTOFMEMORY,
+            _ => mtld3d_types::D3DERR_DEVICELOST,
+        };
+        self.encoder.record_failure(status)
     }
 
     pub fn try_push_control<T: mtld3d_core::encoder_packet::CaptureControl>(
@@ -10110,14 +10112,12 @@ extern "system" fn device_draw_primitive(
     emit_snapshot_deltas(&obj);
     drop(snap);
     let _push = CycleAddTimer::start(draw_push_op_ptr(perf_ptr));
-    obj.inner().current_frame.record_bound_draw(
+    let result = obj.inner().current_frame.record_bound_draw(
         DrawPrefix::nonindexed(metal_prim, start_vertex, vtx_count),
         &vertex_source,
         None,
     );
-    obj.inner()
-        .recording_status()
-        .map_or_else(|hr| hr, |()| D3D_OK)
+    result.map_or_else(|error| obj.inner().capture_failure(error), |()| D3D_OK)
 }
 
 /// The `IndexSource` for a fan rewritten into an explicit index list.
@@ -10397,14 +10397,12 @@ extern "system" fn device_draw_indexed_primitive(
     emit_snapshot_deltas(&obj);
     drop(snap);
     let _push = CycleAddTimer::start(draw_push_op_ptr(perf_ptr));
-    obj.inner().current_frame.record_bound_draw(
+    let result = obj.inner().current_frame.record_bound_draw(
         DrawPrefix::indexed(metal_prim, base_vertex_index, index_count),
         &vertex_source,
         Some(&index_source),
     );
-    obj.inner()
-        .recording_status()
-        .map_or_else(|hr| hr, |()| D3D_OK)
+    result.map_or_else(|error| obj.inner().capture_failure(error), |()| D3D_OK)
 }
 
 /// Upload any still-mapped `Staged` VB/IB dirty span before a draw reads it.
