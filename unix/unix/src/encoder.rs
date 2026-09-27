@@ -100,6 +100,7 @@ const CONSTANT_ROWS: usize = 256;
 
 mod compile;
 mod depth;
+
 mod upload_view;
 pub use compile::StretchCopyTargets;
 pub use mtld3d_core::encoder_data::{
@@ -114,6 +115,9 @@ use mtld3d_core::{
 use mtld3d_shared::encoder_wire::WireError;
 use upload_view::{TextureView, UploadView};
 mod ops;
+
+#[cfg(test)]
+mod tests;
 
 /// Sub-target for the once-per-distinct sampler-state diagnostic.
 ///
@@ -1365,7 +1369,25 @@ impl FrameEncoder {
         cache_path: Option<PathBuf>,
         clock: Arc<mtld3d_shared::clock_calibration::ClockCalibration>,
         context: &crate::encoder_service::EncoderContext,
+        submit: impl SubmitSpawner,
     ) -> std::io::Result<Self> {
+        let apple = GpuCaps::apple_silicon_default();
+        if !gpu_caps.unified_memory
+            || gpu_caps.min_linear_texture_align != apple.min_linear_texture_align
+        {
+            let cfg = &config;
+            mtld3d_shared::log_once_info!(
+                target: LOG_TARGET,
+                "Intel-family GPU paths active: unified_memory={} (forced={}), \
+                 min_linear_texture_align={} (forced={}): CPU-visible buffers are Managed \
+                 with didModifyRange after every write, tiny mips take the padded staging \
+                 or the upload pass",
+                gpu_caps.unified_memory,
+                cfg.managed_memory,
+                gpu_caps.min_linear_texture_align,
+                cfg.linear_align256,
+            );
+        }
         // Spawn the dedicated submit thread. It invokes the native backend
         // for `Async` frames so the command walk and presentation
         // overlaps the encoder's next build. The work channel is cap-1 so
@@ -1374,9 +1396,8 @@ impl FrameEncoder {
         // never blocks handing payloads back.
         let (submit_work_tx, submit_work_rx) = mpsc::sync_channel::<SubmitPacket>(1);
         let (submit_return_tx, submit_return_rx) = mpsc::channel::<ReturnedPayload>();
-        let submit_thread = thread::Builder::new()
-            .name("mtld3d-submit".into())
-            .spawn(move || submit_thread_main(&submit_work_rx, &submit_return_tx))?;
+        let submit_thread =
+            submit.spawn(move || submit_thread_main(&submit_work_rx, &submit_return_tx))?;
         let compile_queue = Arc::new(compile::CompileQueue::new());
         let (compile_results_tx, compile_results) = mpsc::channel();
         let compile_threads = compile::spawn_workers(&compile_queue, &compile_results_tx);
@@ -5327,14 +5348,14 @@ impl FrameEncoder {
     /// miss-compiles to append records to `mtld3d_shaders.bin` — unless
     /// `writes_disabled` is set, in which case `cache_disabled` latches so
     /// the rest of the session skips the open/append entirely.
-    pub fn ingest_warm_cache(&mut self, warm: WarmCache, writes_disabled: bool) {
-        for (reference, handles) in warm.libraries {
+    pub fn ingest_warm_cache(&mut self, mut warm: WarmCache, writes_disabled: bool) {
+        for (reference, handles) in warm.libraries.drain(..) {
             self.lib_cache.insert(reference, handles);
         }
-        for (key, handle) in warm.pipelines {
+        for (key, handle) in warm.pipelines.drain(..) {
             self.pipeline_cache.record(key, Some(handle));
         }
-        for (primary, sibling) in warm.no_color_siblings {
+        for (primary, sibling) in warm.no_color_siblings.drain(..) {
             self.no_color_pipeline_alt.insert(primary, sibling);
         }
         self.flags.insert(FrameEncoderFlags::CACHE_READY);
@@ -7830,7 +7851,7 @@ impl FrameEncoder {
         }
     }
 
-    /// Drain every cache + retention queue, releasing the MTL handles via bulk-destroy thunks.
+    /// Drain every cache and retention queue through direct native bulk destruction.
     ///
     /// Called from the encoder thread on `EncoderMessage::Shutdown` *before*
     /// the loop exits — the `Arc<AtomicU64>` backing `coherent_seq` lives
@@ -8175,6 +8196,59 @@ impl WarmCache {
     }
 }
 
+/// Start the submit worker during encoder initialization.
+///
+/// Keeping launch separate lets startup failures exercise the actual encoder
+/// readiness and cleanup path without changing frame execution.
+pub trait SubmitSpawner: Send + 'static {
+    fn spawn(self, work: impl FnOnce() + Send + 'static)
+    -> std::io::Result<thread::JoinHandle<()>>;
+}
+
+struct NativeSubmitSpawner;
+
+impl SubmitSpawner for NativeSubmitSpawner {
+    fn spawn(
+        self,
+        work: impl FnOnce() + Send + 'static,
+    ) -> std::io::Result<thread::JoinHandle<()>> {
+        thread::Builder::new()
+            .name("mtld3d-submit".into())
+            .spawn(work)
+    }
+}
+
+impl Drop for WarmCache {
+    fn drop(&mut self) {
+        self.release_with(destroy_resources_bulk);
+    }
+}
+
+impl WarmCache {
+    fn release_with(&mut self, mut destroy: impl FnMut(DestroyKind, &[u64])) {
+        let pipelines: Vec<_> = self
+            .pipelines
+            .drain(..)
+            .map(|(_, handle)| handle.raw())
+            .collect();
+        let functions: Vec<_> = self
+            .libraries
+            .iter()
+            .map(|(_, handles)| handles.func.raw())
+            .collect();
+        let libraries: Vec<_> = self
+            .libraries
+            .drain(..)
+            .map(|(_, handles)| handles.library.raw())
+            .collect();
+        // These mappings borrow entries in pipelines; they own no additional retain.
+        self.no_color_siblings.clear();
+        destroy(DestroyKind::RenderPipeline, &pipelines);
+        destroy(DestroyKind::ShaderFunction, &functions);
+        destroy(DestroyKind::ShaderLibrary, &libraries);
+    }
+}
+
 impl EncoderThread {
     pub fn spawn(
         gpu_caps: GpuCaps,
@@ -8183,20 +8257,40 @@ impl EncoderThread {
         cache_path: Option<PathBuf>,
         startup: crate::encoder_service::EncoderStartup,
     ) -> std::io::Result<Self> {
+        Self::spawn_with_submit(
+            gpu_caps,
+            config,
+            prewarm_rx,
+            cache_path,
+            startup,
+            NativeSubmitSpawner,
+        )
+    }
+
+    /// Start the real encoder and wait for its submit-worker startup result.
+    pub fn spawn_with_submit(
+        gpu_caps: GpuCaps,
+        config: Arc<Mtld3dConfig>,
+        prewarm_rx: mpsc::Receiver<Option<WarmCache>>,
+        cache_path: Option<PathBuf>,
+        startup: crate::encoder_service::EncoderStartup,
+        submit: impl SubmitSpawner,
+    ) -> std::io::Result<Self> {
         let (sender, receiver) = mpsc::sync_channel::<EncoderMessage>(API_FRAME_CHANNEL_CAP);
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let handle = thread::Builder::new()
             .name("mtld3d-encoder".into())
             .spawn(move || {
-                encoder_thread_main(
-                    &receiver,
-                    &prewarm_rx,
-                    gpu_caps,
-                    config,
-                    cache_path,
-                    ready_tx,
-                    startup,
-                );
+                encoder_thread_main(&receiver, &prewarm_rx, ready_tx, &startup, move |startup| {
+                    FrameEncoder::new(
+                        gpu_caps,
+                        config,
+                        cache_path,
+                        Arc::clone(&startup.clocks.native),
+                        &startup.context,
+                        submit,
+                    )
+                });
             })?;
         match ready_rx.recv() {
             Ok(Ok(())) => Ok(Self {
@@ -8428,36 +8522,11 @@ fn destroy_resources_bulk(kind: DestroyKind, handles: &[u64]) {
 fn encoder_thread_main(
     receiver: &mpsc::Receiver<EncoderMessage>,
     prewarm_rx: &mpsc::Receiver<Option<WarmCache>>,
-    gpu_caps: GpuCaps,
-    config: Arc<Mtld3dConfig>,
-    cache_path: Option<PathBuf>,
     ready: mpsc::SyncSender<std::io::Result<()>>,
-    startup: crate::encoder_service::EncoderStartup,
+    startup: &crate::encoder_service::EncoderStartup,
+    initialize: impl FnOnce(&crate::encoder_service::EncoderStartup) -> std::io::Result<FrameEncoder>,
 ) {
-    let apple = GpuCaps::apple_silicon_default();
-    if !gpu_caps.unified_memory
-        || gpu_caps.min_linear_texture_align != apple.min_linear_texture_align
-    {
-        let cfg = &config;
-        mtld3d_shared::log_once_info!(
-            target: LOG_TARGET,
-            "Intel-family GPU paths active: unified_memory={} (forced={}), \
-             min_linear_texture_align={} (forced={}): CPU-visible buffers are Managed \
-             with didModifyRange after every write, tiny mips take the padded staging \
-             or the upload pass",
-            gpu_caps.unified_memory,
-            cfg.managed_memory,
-            gpu_caps.min_linear_texture_align,
-            cfg.linear_align256,
-        );
-    }
-    let mut enc = match FrameEncoder::new(
-        gpu_caps,
-        config,
-        cache_path,
-        startup.clocks.native,
-        &startup.context,
-    ) {
+    let mut enc = match initialize(startup) {
         Ok(enc) => enc,
         Err(error) => {
             let _ = ready.send(Err(error));

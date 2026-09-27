@@ -55,13 +55,26 @@ impl EncoderService {
         #[cfg(not(perf_tracking))]
         let _ = source_clock_ptr;
         let config = Arc::new(config);
-        let (mut prewarm, receiver) = shader_prewarm::spawn(
+        let (prewarm, receiver) = shader_prewarm::spawn(
             context.device_handle,
             config.shader_cache_enable,
             cache_path.clone(),
         );
         let startup = EncoderStartup { context, clocks };
-        match EncoderThread::spawn(caps, Arc::clone(&config), receiver, cache_path, startup) {
+        Self::finish_startup(calibration, prewarm, receiver, |receiver| {
+            EncoderThread::spawn(caps, config, receiver, cache_path, startup)
+        })
+    }
+
+    fn finish_startup(
+        calibration: CalibrationWorker,
+        mut prewarm: PrewarmHandle,
+        receiver: std::sync::mpsc::Receiver<Option<crate::encoder::WarmCache>>,
+        start: impl FnOnce(
+            std::sync::mpsc::Receiver<Option<crate::encoder::WarmCache>>,
+        ) -> std::io::Result<EncoderThread>,
+    ) -> std::io::Result<Self> {
+        match start(receiver) {
             Ok(encoder) => Ok(Self {
                 encoder,
                 programs: Arc::new(ProgramRegistry::new()),
