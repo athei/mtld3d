@@ -349,18 +349,19 @@ fn emit_draw_view(
     // out. All no-ops unless perf tracking is on.
     let t_resolve = CycleAddTimer::start(enc.op_sub_cycles_ptr(OpSub::Resolve));
     // Lifetime-launder the scratch-resident snapshot ptr off `enc` so
-    // the rest of emit_draw can freely reborrow `&mut enc`. SAFETY:
-    // the pointee lives in `NativeFrame::scratch`, retained through
-    // submission or failure quarantine. A snapshot command in this
-    // frame installed the pointer before this draw.
+    // the rest of emit_draw can freely reborrow `&mut enc`. A snapshot
+    // command in this frame decoded the pointee into `enc.scratch` and
+    // installed the pointer before this draw.
     let snap_ptr = enc
         .current_snapshot_ptr()
         .expect("emit_draw: snapshot not supplied")
         .as_ptr();
-    // SAFETY: snap_ptr is non-null (NonNull invariant) and points to
-    // a live CurrentSnapshot in NativeFrame::scratch. Its frame owner
-    // retains the allocation through submission or failure quarantine,
-    // beyond every `enc` reborrow below.
+    // SAFETY: snap_ptr is non-null (NonNull invariant) and points to a live
+    // CurrentSnapshot in `enc.scratch`. That arena is only appended to until
+    // `finalize_submit` moves it into the frame's payload, which is cleared only
+    // after submission returns; a failed replay stops every later message before
+    // `begin_frame` could clear it. Appending never moves a chunk or writes bytes
+    // already handed out, so the pointee outlives every `enc` reborrow below.
     let snap: &CurrentSnapshot = unsafe { &*snap_ptr };
     // Every Option must be Some by the time a Draw runs — the API
     // thread populates every field before queuing the changed snapshot.

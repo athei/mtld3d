@@ -5,7 +5,7 @@ use std::ptr::NonNull;
 use mtld3d_shared::frame_metadata::FrameMetadata;
 
 use super::{ReplayCompletion, metadata::FrameView};
-use crate::{guest_pages::GuestOwnedPage, ids::BufferId, scratch::ScratchArena};
+use crate::{guest_pages::GuestOwnedPage, ids::BufferId};
 
 /// Native retirement of a uniquely owned PE buffer allocation.
 pub struct NativeVbibRetention {
@@ -14,16 +14,19 @@ pub struct NativeVbibRetention {
     pub last_submit_seq: u64,
 }
 
-/// Native allocations and the immutable metadata lease retained through final submit reads.
+/// Native owners and the immutable metadata lease retained through final submit reads.
+///
+/// Snapshots decoded from the frame live in the encoder's own arena, which the
+/// submission's payload carries and returns, so dropping this owner frees no
+/// snapshot storage on the submit thread.
 pub struct NativeFrame {
     header: NonNull<FrameMetadata>,
-    scratch: ScratchArena,
     pending_vbib_retentions: Vec<NativeVbibRetention>,
-    // Last: publish only after every native scratch reference has become unreachable.
+    // Last: publish only after every other native owner has been dropped.
     pub(super) replay_completion: Option<ReplayCompletion>,
 }
 
-// SAFETY: the metadata is immutable under the packet lease; native scratch moves exclusively
+// SAFETY: the metadata is immutable under the packet lease; the frame moves exclusively
 // from the encoder to submit, and no encoder work accesses it after that transfer.
 unsafe impl Send for NativeFrame {}
 
@@ -32,7 +35,6 @@ impl NativeFrame {
     pub(super) unsafe fn new(view: &FrameView<'_>) -> Self {
         Self {
             header: NonNull::from(view.header()),
-            scratch: ScratchArena::new(),
             pending_vbib_retentions: Vec::new(),
             replay_completion: None,
         }
@@ -53,13 +55,5 @@ impl NativeFrame {
 
     pub fn take_vbib_retentions(&mut self) -> Vec<NativeVbibRetention> {
         core::mem::take(&mut self.pending_vbib_retentions)
-    }
-
-    /// Access native snapshot storage without changing its ownership.
-    ///
-    /// # Safety
-    /// Do not clear, replace or release the arena while any decoded snapshot refers to it.
-    pub const unsafe fn scratch_mut(&mut self) -> &mut ScratchArena {
-        &mut self.scratch
     }
 }

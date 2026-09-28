@@ -416,9 +416,12 @@ pub struct StageLibHandles {
 /// thread; synchronous submission runs inline on the encoder thread.
 #[derive(Default)]
 struct FramePayload {
-    /// Per-frame shader-constant / `DrawPrimitiveUP` scratch.
+    /// Per-frame scratch: decoded draw snapshots, shader constants, `DrawPrimitiveUP` data.
     ///
     /// Pointers to its chunks are embedded in `Command`s inside `passes`.
+    /// Recycling it with the payload is what keeps steady-state frames from
+    /// allocating a chunk, and it is cleared on the encoder thread, never
+    /// freed on the submit thread.
     scratch: ScratchArena,
     /// The frame's finalized passes, each owning its `commands` and `leading_blits`.
     ///
@@ -436,6 +439,31 @@ struct FramePayload {
     ///
     /// Carried by the synthetic trailing `PassDescriptor`.
     trailing_blits: Vec<BlitCommand>,
+}
+
+impl FramePayload {
+    /// Take the encoder's finished per-frame buffers and hand it this payload's cleared ones.
+    ///
+    /// Only the headers swap: the chunks and blits the frame's commands point
+    /// into stay where they are, and the encoder records the next frame into
+    /// storage this payload kept from an earlier one.
+    const fn adopt_frame_buffers(
+        &mut self,
+        scratch: &mut ScratchArena,
+        blits: &mut Vec<BlitCommand>,
+    ) {
+        core::mem::swap(&mut self.scratch, scratch);
+        core::mem::swap(&mut self.frame_blit_commands, blits);
+    }
+
+    /// Clear what a finished submission read, keeping every allocation for the next frame.
+    fn clear(&mut self, pass_state: &mut PassState) {
+        pass_state.recycle_passes(&mut self.passes);
+        self.descriptors.clear();
+        self.frame_blit_commands.clear();
+        self.trailing_blits.clear();
+        self.scratch.clear();
+    }
 }
 
 /// How `submit` runs the native submission for one frame.
@@ -462,11 +490,11 @@ struct SubmitPacket {
     failure_ptr: u64,
     params: SubmitDescription,
     payload: FramePayload,
-    /// Native snapshot storage and the immutable PE command lease.
+    /// The immutable PE command lease.
     ///
-    /// They remain live until `execute_submit` returns. Commands can borrow leaves
-    /// from either arena.
-    frame: Box<NativeFrame>,
+    /// It remains live until `execute_submit` returns; dropping it afterwards
+    /// publishes the replay completion that lets PE reuse the packet storage.
+    frame: NativeFrame,
 }
 
 /// What one native submission reported back.
@@ -536,8 +564,9 @@ fn submit_thread_main(
             let _exec = mtld3d_core::perf::CycleSetTimer::start(&raw mut submit_exec_tsc);
             execute_submit(record, &params, payload, failure_ptr)
         };
-        // The final CPU reader has finished with both retained command regions and
-        // native snapshot storage. GPU resource leases retire independently.
+        // The final CPU reader has finished with the retained command regions, and the
+        // payload carrying the snapshots goes back to the encoder. GPU resource leases
+        // retire independently.
         drop(frame);
         if return_tx
             .send(ReturnedPayload {
@@ -8741,13 +8770,14 @@ fn run_frame(
                             }
                         }
                         EncoderOpcode::SetSnapshot => {
-                            // SAFETY: scratch is only appended and remains owned by this frame.
-                            let scratch = unsafe { frame.scratch_mut() };
-                            // SAFETY: this frame retains every canonical snapshot leaf through submit.
+                            // SAFETY: this frame retains every canonical snapshot leaf through
+                            // submit. The encoder's scratch is only appended until it moves into
+                            // this frame's payload, which is cleared only after submission has
+                            // returned, and never after a failed replay.
                             let snapshot = unsafe {
                                 state
                                     .draw_reader()
-                                    .decode_snapshot(command.payload(), scratch)?
+                                    .decode_snapshot(command.payload(), &mut enc.scratch)?
                             };
                             enc.current_snapshot = Some(snapshot);
                         }
@@ -8833,7 +8863,7 @@ fn run_frame(
 /// In `Async` mode `execute_submit` runs on the dedicated submit thread and
 /// the payload is recycled when it returns; in `Sync` mode all three run
 /// inline on the encoder thread.
-fn submit(enc: &mut FrameEncoder, frame: Box<NativeFrame>, mode: SubmitMode) {
+fn submit(enc: &mut FrameEncoder, frame: NativeFrame, mode: SubmitMode) {
     match mode {
         SubmitMode::Async => submit_async(enc, frame),
         SubmitMode::Sync => submit_sync(enc, frame),
@@ -8861,7 +8891,7 @@ const fn frame_summary_ctx(owner: &NativeFrame) -> FrameSummaryContext {
 /// encoder-side finalize (plus any backpressure wait inside
 /// `acquire_clean_payload`); the unix command-walk and commit are on the
 /// submit thread, the present on the presenter.
-fn submit_async(enc: &mut FrameEncoder, frame: Box<NativeFrame>) {
+fn submit_async(enc: &mut FrameEncoder, frame: NativeFrame) {
     let (params, payload) = {
         let _submit = mtld3d_core::perf::CycleSetTimer::start(enc.perf.submit_cycles_ptr());
         finalize_submit(enc, &frame)
@@ -8870,8 +8900,8 @@ fn submit_async(enc: &mut FrameEncoder, frame: Box<NativeFrame>) {
     let ctx = frame_summary_ctx(&frame);
     enc.log_perf_summary(&payload, &ctx, status);
     enc.maybe_emit_compile_summary();
-    // `frame` rides along so its scratch (which several Commands point into)
-    // outlives the deferred replay; the submit thread drops it afterwards.
+    // `frame` rides along so its PE lease outlives the deferred replay; the
+    // submit thread drops it afterwards, which publishes the replay completion.
     enc.dispatch_submit(SubmitPacket {
         failure_ptr: enc.runtime_failure_ptr,
         params,
@@ -8887,7 +8917,7 @@ fn submit_async(enc: &mut FrameEncoder, frame: Box<NativeFrame>) {
 /// timer wraps finalize + execute so the per-frame summary (emitted after,
 /// from the still-live payload) reads a settled value; the payload is
 /// recycled only once the summary has read its passes / scratch.
-fn submit_sync(enc: &mut FrameEncoder, frame: Box<NativeFrame>) {
+fn submit_sync(enc: &mut FrameEncoder, frame: NativeFrame) {
     let (payload, status) = {
         let _submit = mtld3d_core::perf::CycleSetTimer::start(enc.perf.submit_cycles_ptr());
         let (params, payload) = finalize_submit(enc, &frame);
@@ -8918,8 +8948,8 @@ fn submit_sync(enc: &mut FrameEncoder, frame: Box<NativeFrame>) {
     enc.log_perf_summary(&payload, &ctx, status);
     enc.maybe_emit_compile_summary();
     reclaim_payload(enc, payload);
-    // `execute_submit` ran inline, so the replay is done reading
-    // `frame`'s scratch; drop it (explicit for symmetry with the async path).
+    // `execute_submit` ran inline, so the replay is done reading `frame`'s
+    // lease; drop it (explicit for symmetry with the async path).
     drop(frame);
 }
 
@@ -9024,11 +9054,7 @@ fn finalize_submit(
     // them before either arena leaves the encoder's ownership.
     enc.reset_bound_constants();
     let mut payload = enc.acquire_clean_payload();
-    core::mem::swap(&mut payload.scratch, &mut enc.scratch);
-    core::mem::swap(
-        &mut payload.frame_blit_commands,
-        &mut enc.frame_blit_commands,
-    );
+    payload.adopt_frame_buffers(&mut enc.scratch, &mut enc.frame_blit_commands);
     payload.passes = passes;
     payload.descriptors = descriptors;
     payload.trailing_blits = trailing_blits;
@@ -9134,11 +9160,7 @@ fn execute_submit(
 /// the buffers (retaining their heap), and return the set to
 /// `payload_pool` for the next frame's `finalize_submit`.
 fn reclaim_payload(enc: &mut FrameEncoder, mut payload: FramePayload) {
-    enc.pass_state.recycle_passes(&mut payload.passes);
-    payload.descriptors.clear();
-    payload.frame_blit_commands.clear();
-    payload.trailing_blits.clear();
-    payload.scratch.clear();
+    payload.clear(&mut enc.pass_state);
     enc.payload_pool.push(payload);
 }
 

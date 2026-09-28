@@ -19,24 +19,24 @@ impl ReplayState {
 
 /// An immutable command stream and the native state retaining its frame lease.
 pub struct ReplayPacket {
-    frame: Box<NativeFrame>,
+    frame: NativeFrame,
     commands: CommandCursor,
     state: ReplayState,
     exhausted: bool,
     failure: Option<WireError>,
-    // Last: reject only after native owners and snapshot storage have been released.
+    // Last: reject only after the native owners have been released.
     completion: Option<ReplayCompletion>,
 }
 
 impl ReplayPacket {
     /// The caller retains semantically valid matched-producer commands and all referenced storage.
-    pub(super) unsafe fn new(
+    pub(super) const unsafe fn new(
         frame: NativeFrame,
         commands: CommandCursor,
         completion: ReplayCompletion,
     ) -> Self {
         Self {
-            frame: Box::new(frame),
+            frame,
             commands,
             state: ReplayState {
                 // SAFETY: the matched producer retains all typed records under this packet lease.
@@ -49,15 +49,16 @@ impl ReplayPacket {
     }
 
     #[must_use]
-    pub fn frame(&self) -> &NativeFrame {
+    pub const fn frame(&self) -> &NativeFrame {
         &self.frame
     }
 
     /// Execute one command while its borrowed record and genuine runtime owners remain live.
     ///
     /// # Safety
-    /// The consumer must not clear, replace, move or release the frame arena or its lease
-    /// while any snapshot, encoder state or submitted command can still reference it.
+    /// The consumer must not release the frame's lease, or clear, replace or release the
+    /// storage it decodes snapshots into, while any snapshot, encoder state or submitted
+    /// command can still reference them.
     /// Retained tokens may escape the callback only while that same frame lease remains live.
     ///
     /// # Errors
@@ -97,7 +98,7 @@ impl ReplayPacket {
     ///
     /// # Errors
     /// Returns the retained packet if replay failed or has not reached the end of its regions.
-    pub fn into_frame(mut self) -> Result<Box<NativeFrame>, (WireError, Box<Self>)> {
+    pub fn into_frame(mut self) -> Result<NativeFrame, (WireError, Box<Self>)> {
         if self.failure.is_some() || !self.exhausted || !self.commands.is_complete() {
             return Err((WireError::InvalidValue, Box::new(self)));
         }

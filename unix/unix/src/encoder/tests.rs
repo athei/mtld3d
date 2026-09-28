@@ -230,3 +230,85 @@ fn native_shader_build_resets_empty_inputs_and_retains_outputs_after_pool_drain(
         destroy_resources_bulk(DestroyKind::ShaderLibrary, &[handles.library.raw()]);
     });
 }
+
+#[test]
+fn payload_rotation_reuses_warm_scratch_chunks_across_the_submit_thread() {
+    use std::collections::BTreeSet;
+
+    use mtld3d_core::{passes::PassState, scratch::ScratchArena};
+
+    use super::{FramePayload, SUBMIT_PAYLOAD_CAP};
+
+    const FRAMES: usize = 48;
+    const WARM_FRAMES: usize = 8;
+    let (work_tx, work_rx) = mpsc::sync_channel::<FramePayload>(1);
+    let (return_tx, return_rx) = mpsc::channel::<FramePayload>();
+    // Stands in for the submit thread: it reads a payload and hands the whole of it back.
+    let submit = std::thread::spawn(move || {
+        while let Ok(payload) = work_rx.recv() {
+            assert!(
+                payload.scratch.bytes_used() > 0,
+                "the frame's snapshots rode along"
+            );
+            if return_tx.send(payload).is_err() {
+                break;
+            }
+        }
+    });
+    let mut live = ScratchArena::new();
+    let mut blits = Vec::new();
+    let mut pass_state = PassState::new();
+    let mut pool: Vec<FramePayload> = Vec::new();
+    let mut created = 0_u32;
+    let mut seen = BTreeSet::new();
+    let snapshot = vec![0x5a_u8; 30 * 1024];
+    for frame in 0..FRAMES {
+        // `begin_frame`, then two snapshot decodes' worth of storage and a constant block,
+        // which together need two chunks.
+        live.clear();
+        for _ in 0..3 {
+            live.alloc(&snapshot);
+        }
+        let chunks = live
+            .allocation_ranges()
+            .map(|(address, _)| address)
+            .collect::<Vec<_>>();
+        assert_eq!(chunks.len(), 2);
+        if frame >= WARM_FRAMES {
+            assert!(
+                chunks.iter().all(|address| seen.contains(address)),
+                "frame {frame} recorded into a chunk no earlier frame had"
+            );
+        }
+        seen.extend(chunks);
+        // `acquire_clean_payload`: reclaim what came back, reuse, create up to the cap, wait.
+        while let Ok(mut returned) = return_rx.try_recv() {
+            returned.clear(&mut pass_state);
+            pool.push(returned);
+        }
+        let mut payload = pool.pop().unwrap_or_else(|| {
+            if created < SUBMIT_PAYLOAD_CAP {
+                created += 1;
+                FramePayload::default()
+            } else {
+                let mut returned = return_rx.recv().unwrap();
+                returned.clear(&mut pass_state);
+                returned
+            }
+        });
+        payload.adopt_frame_buffers(&mut live, &mut blits);
+        work_tx.send(payload).unwrap();
+    }
+    drop(work_tx);
+    submit.join().unwrap();
+    while let Ok(mut returned) = return_rx.try_recv() {
+        returned.clear(&mut pass_state);
+        pool.push(returned);
+    }
+    // The encoder's arena and at most two payloads' arenas exist, each warmed to two chunks.
+    let arenas = pool.iter().map(|payload| &payload.scratch).chain([&live]);
+    let chunk_total = arenas.map(ScratchArena::chunk_count).sum::<u32>();
+    assert_eq!(pool.len(), usize::try_from(created).unwrap());
+    assert_eq!(chunk_total, 2 * (created + 1));
+    assert_eq!(seen.len(), usize::try_from(chunk_total).unwrap());
+}

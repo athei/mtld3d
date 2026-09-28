@@ -205,7 +205,7 @@ fn final_command_requires_exhaustion_before_frame_transfer() {
 }
 
 #[test]
-fn failed_dispatch_retains_native_scratch_until_quarantine_is_released() {
+fn failed_dispatch_keeps_the_packet_lease_until_quarantine_is_released() {
     let mut frame = empty_frame();
     let mut recorder = FrameRecorder::new();
     recorder
@@ -219,12 +219,7 @@ fn failed_dispatch_retains_native_scratch_until_quarantine_is_released() {
         .unwrap();
     let mut owner = seal(frame, recorder);
     let mut packet = admit(&mut owner);
-    let mut pointer = std::ptr::null_mut();
-    let error = replay(&mut packet, |_, native, _| {
-        // SAFETY: this test does not clear or replace native scratch while its borrow lives.
-        pointer = unsafe { native.scratch_mut() }.alloc_value(0x1234_u32);
-        Err(WireError::InvalidValue)
-    });
+    let error = replay(&mut packet, |_, _, _| Err(WireError::InvalidValue));
     assert_eq!(error, Err(WireError::InvalidValue));
     assert_eq!(
         replay(&mut packet, |_, _, _| panic!("failure must be sticky")),
@@ -234,8 +229,7 @@ fn failed_dispatch_retains_native_scratch_until_quarantine_is_released() {
         panic!("failed replay must be quarantined");
     };
     assert!(!owner.maintain());
-    // SAFETY: the quarantined native owner retains this initialized scratch allocation.
-    assert_eq!(unsafe { *pointer }, 0x1234);
+    assert!(!owner.was_rejected());
     drop(packet);
     assert!(owner.was_rejected());
     assert!(!owner.maintain());
