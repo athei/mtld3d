@@ -8767,7 +8767,7 @@ fn run_frame(
                             )?;
                             // SAFETY: this packet retains authentic capture and backing addresses
                             // through the final submit CPU reader, including failure quarantine.
-                            unsafe { draw::emit_draw(enc, &draw)? };
+                            unsafe { draw::emit_draw(enc, &draw) };
                         }
                         EncoderOpcode::AdoptProgram => {
                             let record = mtld3d_core::encoder_records::borrow::<

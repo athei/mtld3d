@@ -121,11 +121,7 @@ fn destination_mismatch_is_rejected_before_writing() {
 }
 
 fn checked_draw_fields(bytes: &[u8]) -> Result<(), WireError> {
-    let view = DrawView::new(bytes)?;
-    view.metal_primitive()?;
-    view.vertices()?;
-    view.indices()?;
-    Ok(())
+    DrawView::new(bytes).map(drop)
 }
 
 #[test]
@@ -175,18 +171,18 @@ fn all_index_sources_use_actual_fixed_views() {
                 (prefix_commands + 1) % 2 * 8
             );
             let view = DrawView::new(payload).unwrap();
-            assert_eq!(view.metal_primitive().unwrap(), PrimitiveType::Triangle);
-            match (kind, view.indices().unwrap()) {
+            assert_eq!(view.metal_primitive(), PrimitiveType::Triangle);
+            match (kind, view.indices()) {
                 (
                     0,
-                    IndexView::None {
+                    &IndexView::None {
                         start_vertex,
                         vertex_count,
                     },
                 ) => assert_eq!((start_vertex, vertex_count), (2, 3)),
                 (
                     1,
-                    IndexView::Bound {
+                    &IndexView::Bound {
                         record,
                         index_count,
                         base_vertex,
@@ -200,14 +196,14 @@ fn all_index_sources_use_actual_fixed_views() {
                 }
                 (
                     2,
-                    IndexView::Fan {
+                    &IndexView::Fan {
                         start_vertex,
                         primitive_count,
                     },
                 ) => assert_eq!((start_vertex, primitive_count), (5, 2)),
                 (
                     3,
-                    IndexView::Generated {
+                    &IndexView::Generated {
                         record,
                         index_count,
                         min_vertex,
@@ -215,7 +211,7 @@ fn all_index_sources_use_actual_fixed_views() {
                 ) => assert_eq!((record.maximum, index_count, min_vertex), (2, 3, 0)),
                 (
                     4,
-                    IndexView::Up {
+                    &IndexView::Up {
                         record,
                         index_count,
                     },
@@ -252,7 +248,7 @@ fn large_up_bytes_keep_original_capture_identity_and_fixed_record_size() {
     let bytes = encode(&draw, &mut arena);
     assert_eq!(bytes.len(), 56);
     let view = DrawView::new(bytes).unwrap();
-    let VertexView::Up { record, stride } = view.vertices().unwrap() else {
+    let &VertexView::Up { record, stride } = view.vertices() else {
         unreachable!()
     };
     assert_eq!(
@@ -261,7 +257,7 @@ fn large_up_bytes_keep_original_capture_identity_and_fixed_record_size() {
     );
     // SAFETY: the record references the immutable static fixture retained for this test.
     assert_eq!(unsafe { record.bytes() }.as_slice(), LARGE);
-    let IndexView::Up { record, .. } = view.indices().unwrap() else {
+    let IndexView::Up { record, .. } = view.indices() else {
         unreachable!()
     };
     assert_eq!(record.index_type().unwrap(), IndexType::UInt16);
@@ -284,7 +280,7 @@ fn sixteen_streams_borrow_fixed_records_without_rebuilding_bindings() {
     let mut arena = ScratchArena::new();
     let bytes = encode(&draw, &mut arena);
     let view = DrawView::new(bytes).unwrap();
-    let vertices = view.vertices().unwrap();
+    let vertices = view.vertices();
     assert_eq!(vertices.bindings().len(), 16);
     for (index, record) in vertices.bindings().enumerate() {
         assert_eq!(usize::from(record.stream), index);
@@ -321,21 +317,9 @@ fn padding_is_initialized_and_unknown_fixed_tags_are_rejected() {
         let address = arena.alloc(&changed);
         // SAFETY: arena owns the initialized malformed scalar fixture through validation.
         let changed = unsafe { core::slice::from_raw_parts(address as *const u8, changed.len()) };
+        // The primitive (0), vertex kind (1), index kind (2) and stream count (3)
+        // are each rejected by the decode, before any consumer reads a field.
         assert_eq!(checked_draw_fields(changed), Err(WireError::InvalidValue));
-        match offset {
-            0 => assert_eq!(
-                DrawView::new(changed).unwrap().metal_primitive(),
-                Err(WireError::InvalidValue)
-            ),
-            2 => assert!(matches!(
-                DrawView::new(changed).unwrap().indices(),
-                Err(WireError::InvalidValue)
-            )),
-            _ => assert!(matches!(
-                DrawView::new(changed),
-                Err(WireError::InvalidValue)
-            )),
-        }
     }
 }
 
@@ -469,6 +453,61 @@ fn ordinary_bound_capture_rejects_bad_extents_and_stream_counts_before_publicati
     vertices.extra = ExtraStreams::Owned((0..16).map(stream).collect());
     assert_eq!(
         bound_payload_size(&vertices, None),
+        Err(WireError::InvalidValue)
+    );
+}
+
+/// A copy of `bytes` in 8-aligned arena storage, `shift` bytes past an aligned start.
+fn stored<'a>(arena: &'a mut ScratchArena, bytes: &[u8], shift: usize) -> &'a [u8] {
+    let mut padded = vec![0; shift];
+    padded.extend_from_slice(bytes);
+    let address = usize::try_from(arena.alloc(&padded)).expect("host address") + shift;
+    // SAFETY: the arena owns the initialized copy and cannot be reset or dropped while the
+    // returned borrow of it lives.
+    unsafe { core::slice::from_raw_parts(address as *const u8, bytes.len()) }
+}
+
+#[test]
+fn decode_checks_index_type_extent_and_alignment_once() {
+    let draw = bound(IndexSource::Bound {
+        buffer_id: BufferId::new_unique(),
+        backing_ptr: 0,
+        backing_len: 4096,
+        backing_generation: 0,
+        offset: 0,
+        index_count: 3,
+        index_type: IndexType::UInt32,
+        base_vertex: 0,
+    });
+    let mut arena = ScratchArena::new();
+    let original = encode(&draw, &mut arena).to_vec();
+    let mut checks = ScratchArena::new();
+    let view = DrawView::new(stored(&mut checks, &original, 0)).unwrap();
+    let &IndexView::Bound { record, .. } = view.indices() else {
+        unreachable!()
+    };
+    assert_eq!(record.index_type(), Ok(IndexType::UInt32));
+    // The index element type at offset 64 + 36.
+    let mut unknown_type = original.clone();
+    unknown_type[100] = 9;
+    assert_eq!(
+        DrawView::new(stored(&mut checks, &unknown_type, 0)).map(drop),
+        Err(WireError::InvalidValue)
+    );
+    // Bytes past the index record, and a stream array cut short.
+    let mut trailing = original.clone();
+    trailing.extend_from_slice(&[0; 8]);
+    assert_eq!(
+        DrawView::new(stored(&mut checks, &trailing, 0)).map(drop),
+        Err(WireError::InvalidValue)
+    );
+    assert_eq!(
+        DrawView::new(stored(&mut checks, &original[..40], 0)).map(drop),
+        Err(WireError::Truncated)
+    );
+    // The same bytes off their 8-byte alignment.
+    assert_eq!(
+        DrawView::new(stored(&mut checks, &original, 4)).map(drop),
         Err(WireError::InvalidValue)
     );
 }

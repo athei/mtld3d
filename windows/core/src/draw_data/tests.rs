@@ -47,7 +47,7 @@ fn decoded_extra_streams_borrow_command_bytes_and_preserve_order() {
         )
     };
     let restored = DrawView::new(bytes).unwrap();
-    let VertexView::Bound { records, .. } = restored.vertices().unwrap() else {
+    let VertexView::Bound { records, .. } = restored.vertices() else {
         unreachable!()
     };
     assert_eq!(records.as_ptr().cast::<u8>(), bytes[16..].as_ptr());

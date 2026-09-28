@@ -834,16 +834,16 @@ fn indexed_up_borrows_original_arena_payload_through_region_reuse_and_submit() {
         replay(&mut packet, |command, _, _| {
             assert!(matches!(command.opcode(), EncoderOpcode::Draw));
             let draw = DrawView::new(command.payload())?;
-            let VertexView::Up { record, stride } = draw.vertices()? else {
+            let &VertexView::Up { record, stride } = draw.vertices() else {
                 panic!("UP vertex input");
             };
             assert_eq!(stride, 16);
             // SAFETY: this authentic record refers to the retained frame arena payload.
             let vertex_bytes = unsafe { record.bytes() };
-            let IndexView::Up {
+            let &IndexView::Up {
                 record,
                 index_count,
-            } = draw.indices()?
+            } = draw.indices()
             else {
                 panic!("UP index input");
             };

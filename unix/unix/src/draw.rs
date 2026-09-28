@@ -28,7 +28,6 @@ use mtld3d_core::{
 };
 use mtld3d_shared::{
     Command, MetalHandle, VertexAttrDesc,
-    encoder_wire::WireError,
     mtl::{
         IndexType, PS_BOOL_CONST_SLOT, PS_DRAW_SLOT, PS_INT_CONST_SLOT, PS_LOD_BIAS_SLOT,
         PrimitiveType, SET_BYTES_MAX, VS_BOOL_CONST_SLOT, VS_DRAW_SLOT, VS_FLOAT_CONST_SLOT,
@@ -307,28 +306,15 @@ fn resolve_pipeline_slow(
 
 /// Execute a draw directly from its retained command record.
 ///
+/// [`DrawView::new`] has already rejected malformed draw fields, so nothing
+/// here fails.
+///
 /// # Safety
 /// The view must belong to the authentic admitted packet. Its captured bytes and
 /// backing allocations remain immutable and retained until submit completion. The
 /// encoder snapshot cache must name initialized snapshots retained by that packet.
-///
-/// # Errors
-/// Rejects malformed draw fields before changing encoder state.
-pub unsafe fn emit_draw(enc: &mut FrameEncoder, draw: &DrawView<'_>) -> Result<(), WireError> {
-    let metal_prim = draw.metal_primitive()?;
-    let vertex_source = draw.vertices()?;
-    let index_source = draw.indices()?;
-    match &index_source {
-        IndexView::Bound { record, .. } => {
-            record.index_type()?;
-        }
-        IndexView::Up { record, .. } | IndexView::Generated { record, .. } => {
-            record.index_type()?;
-        }
-        _ => {}
-    }
-    emit_draw_view(enc, metal_prim, &vertex_source, &index_source);
-    Ok(())
+pub unsafe fn emit_draw(enc: &mut FrameEncoder, draw: &DrawView<'_>) {
+    emit_draw_view(enc, draw.metal_primitive(), draw.vertices(), draw.indices());
 }
 
 fn emit_draw_view(

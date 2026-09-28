@@ -651,11 +651,13 @@ pub(super) fn write_into(
     finish_payload(destination, at)
 }
 
-/// Borrowed fixed draw fields. The containing command allocation owns every record.
+/// A decoded fixed draw: its primitive and its typed vertex and index records.
+///
+/// The containing command allocation owns every record.
 pub struct DrawView<'a> {
-    prefix: &'a DrawPrefix,
-    vertices: &'a [u8],
-    indices: &'a [u8],
+    primitive: PrimitiveType,
+    vertices: VertexView<'a>,
+    indices: IndexView<'a>,
 }
 
 /// Vertex input borrowed directly from a fixed draw command.
@@ -696,112 +698,134 @@ pub enum IndexView<'a> {
     },
 }
 
+/// Borrow exactly one aligned record.
 fn fixed_ref<T: DrawPod>(bytes: &[u8]) -> Result<&T, WireError> {
-    // SAFETY: DrawPod permits every bit pattern; align_to returns only aligned complete values.
-    let (prefix, values, suffix) = unsafe { bytes.align_to::<T>() };
-    if !prefix.is_empty() || !suffix.is_empty() || values.len() != 1 {
+    let pointer = bytes.as_ptr().cast::<T>();
+    if bytes.len() != size_of::<T>() || !pointer.is_aligned() {
         return Err(WireError::InvalidValue);
     }
-    Ok(&values[0])
+    // SAFETY: the pointer is aligned and names `size_of::<T>()` initialized bytes borrowed
+    // for the returned lifetime; DrawPod permits every bit pattern.
+    Ok(unsafe { &*pointer })
+}
+
+/// Borrow `count` aligned records from the front of `bytes`, and the bytes after them.
+fn fixed_records<T: DrawPod>(bytes: &[u8], count: usize) -> Result<(&[T], &[u8]), WireError> {
+    let (records, rest) = bytes
+        .split_at_checked(count * size_of::<T>())
+        .ok_or(WireError::Truncated)?;
+    let pointer = records.as_ptr().cast::<T>();
+    if !pointer.is_aligned() {
+        return Err(WireError::InvalidValue);
+    }
+    // SAFETY: the pointer is aligned and names `count` complete initialized records borrowed
+    // for the returned lifetime; DrawPod permits every bit pattern.
+    Ok((unsafe { core::slice::from_raw_parts(pointer, count) }, rest))
 }
 
 impl<'a> DrawView<'a> {
-    /// Split an immutable draw payload into its prefix and borrowed record ranges.
+    /// Decode an immutable draw payload into its primitive and typed record views.
     ///
-    /// The accessors validate the primitive and typed vertex/index records before
-    /// the native consumer changes encoder state. Construction does not repeat them.
+    /// Every field the native consumer interprets is checked here, once and
+    /// before it changes encoder state: the prefix, the primitive, the vertex
+    /// kind and stream count, the index kind and index element type, and the
+    /// extent and alignment of every record. Record counts come from the
+    /// prefix, so no extent is divided back into a count.
     ///
     /// # Errors
-    /// Returns an error for a truncated or unaligned prefix, an invalid vertex kind
-    /// or stream count, or a truncated vertex range.
+    /// Returns an error for a truncated or unaligned record, an unknown
+    /// primitive, vertex kind, index kind or index element type, a stream count
+    /// outside one to sixteen, or bytes left over after the index record.
     pub fn new(bytes: &'a [u8]) -> Result<Self, WireError> {
         let (prefix, rest) = bytes
             .split_at_checked(size_of::<DrawPrefix>())
             .ok_or(WireError::Truncated)?;
         let prefix: &DrawPrefix = fixed_ref(prefix)?;
-        let vertex_bytes = match prefix.vertex_kind {
-            0 if prefix.stream_count == 0 => size_of::<VertexBytes>(),
+        let primitive =
+            PrimitiveType::from_repr(u32::from(prefix.primitive)).ok_or(WireError::InvalidValue)?;
+        let (vertices, indices) = match prefix.vertex_kind {
+            0 if prefix.stream_count == 0 => {
+                let (record, rest) = rest
+                    .split_at_checked(size_of::<VertexBytes>())
+                    .ok_or(WireError::Truncated)?;
+                let vertices = VertexView::Up {
+                    record: fixed_ref(record)?,
+                    stride: prefix.stride_or_frequency,
+                };
+                (vertices, rest)
+            }
             1 if (1..=16).contains(&prefix.stream_count) => {
-                usize::from(prefix.stream_count) * size_of::<StreamRecord>()
+                let (records, rest) = fixed_records(rest, usize::from(prefix.stream_count))?;
+                let vertices = VertexView::Bound {
+                    records,
+                    stream0_freq: prefix.stride_or_frequency,
+                };
+                (vertices, rest)
             }
             _ => return Err(WireError::InvalidValue),
         };
-        let (vertices, indices) = rest
-            .split_at_checked(vertex_bytes)
-            .ok_or(WireError::Truncated)?;
+        let first = prefix.first_or_base;
+        let count = prefix.count;
+        let indices = match prefix.index_kind {
+            0 if indices.is_empty() => IndexView::None {
+                start_vertex: first,
+                vertex_count: count,
+            },
+            1 => {
+                let record: &IndexBuffer = fixed_ref(indices)?;
+                record.index_type()?;
+                IndexView::Bound {
+                    record,
+                    index_count: count,
+                    base_vertex: first.cast_signed(),
+                }
+            }
+            2 if indices.is_empty() => IndexView::Fan {
+                start_vertex: first,
+                primitive_count: count,
+            },
+            3 => {
+                let record: &IndexBytes = fixed_ref(indices)?;
+                record.index_type()?;
+                IndexView::Generated {
+                    record,
+                    index_count: count,
+                    min_vertex: first,
+                }
+            }
+            4 => {
+                let record: &IndexBytes = fixed_ref(indices)?;
+                record.index_type()?;
+                IndexView::Up {
+                    record,
+                    index_count: count,
+                }
+            }
+            _ => return Err(WireError::InvalidValue),
+        };
         Ok(Self {
-            prefix,
+            primitive,
             vertices,
             indices,
         })
     }
 
-    /// Read the primitive type.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error for an unknown primitive type.
-    pub fn metal_primitive(&self) -> Result<PrimitiveType, WireError> {
-        PrimitiveType::from_repr(u32::from(self.prefix.primitive)).ok_or(WireError::InvalidValue)
+    /// The primitive type.
+    #[must_use]
+    pub const fn metal_primitive(&self) -> PrimitiveType {
+        self.primitive
     }
 
-    /// Borrow the vertex records.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error for an incomplete or unaligned vertex record.
-    pub fn vertices(&self) -> Result<VertexView<'a>, WireError> {
-        if self.prefix.vertex_kind == 0 {
-            Ok(VertexView::Up {
-                record: fixed_ref(self.vertices)?,
-                stride: self.prefix.stride_or_frequency,
-            })
-        } else {
-            // SAFETY: StreamRecord has only integer fields and explicit initialized padding.
-            let (prefix, records, suffix) = unsafe { self.vertices.align_to::<StreamRecord>() };
-            if !prefix.is_empty() || !suffix.is_empty() {
-                return Err(WireError::InvalidValue);
-            }
-            Ok(VertexView::Bound {
-                records,
-                stream0_freq: self.prefix.stride_or_frequency,
-            })
-        }
+    /// The vertex records.
+    #[must_use]
+    pub const fn vertices(&self) -> &VertexView<'a> {
+        &self.vertices
     }
 
-    /// Borrow the index records.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error for an incomplete, unaligned or unknown index record.
-    pub fn indices(&self) -> Result<IndexView<'a>, WireError> {
-        let first = self.prefix.first_or_base;
-        let count = self.prefix.count;
-        match self.prefix.index_kind {
-            0 if self.indices.is_empty() => Ok(IndexView::None {
-                start_vertex: first,
-                vertex_count: count,
-            }),
-            1 => Ok(IndexView::Bound {
-                record: fixed_ref(self.indices)?,
-                index_count: count,
-                base_vertex: first.cast_signed(),
-            }),
-            2 if self.indices.is_empty() => Ok(IndexView::Fan {
-                start_vertex: first,
-                primitive_count: count,
-            }),
-            3 => Ok(IndexView::Generated {
-                record: fixed_ref(self.indices)?,
-                index_count: count,
-                min_vertex: first,
-            }),
-            4 => Ok(IndexView::Up {
-                record: fixed_ref(self.indices)?,
-                index_count: count,
-            }),
-            _ => Err(WireError::InvalidValue),
-        }
+    /// The index records, whose element type is already checked.
+    #[must_use]
+    pub const fn indices(&self) -> &IndexView<'a> {
+        &self.indices
     }
 }
 
