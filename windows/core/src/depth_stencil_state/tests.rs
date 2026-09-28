@@ -290,3 +290,32 @@ fn only_a_test_that_can_fail_or_a_write_uses_depth() {
         "depth clear-quad"
     );
 }
+
+#[test]
+fn snapshot_equality_sees_every_byte() {
+    let original = base();
+    assert_eq!(original, base());
+    let edits: [fn(&mut DepthStencilSnapshot); 14] = [
+        |s| s.depth_enable ^= 1,
+        |s| s.depth_write ^= 1,
+        |s| s.depth_func ^= 0x80,
+        |s| s.stencil_enable ^= 1,
+        |s| s.front.func ^= 0x80,
+        |s| s.front.fail_op ^= 0x80,
+        |s| s.front.depth_fail_op ^= 0x80,
+        |s| s.front.pass_op ^= 0x80,
+        |s| s.back.func ^= 0x80,
+        |s| s.back.fail_op ^= 0x80,
+        |s| s.back.depth_fail_op ^= 0x80,
+        |s| s.back.pass_op ^= 0x80,
+        |s| s.read_mask ^= 1 << 31,
+        |s| s.write_mask ^= 1 << 31,
+    ];
+    for (index, edit) in edits.iter().enumerate() {
+        let mut changed = base();
+        edit(&mut changed);
+        assert_ne!(changed, original, "edit {index} is compared");
+        let copy = changed;
+        assert_eq!(changed, copy, "edit {index} equals its copy");
+    }
+}

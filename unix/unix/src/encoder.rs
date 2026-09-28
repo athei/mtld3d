@@ -884,6 +884,13 @@ pub struct FrameEncoder {
     /// New color targets cleared together before this frame reaches the GPU.
     texture_clears: crate::metal::TextureClearBatch,
     depth_stencil_cache: FxHashMap<DepthStencilKey, MetalHandle<MTLDepthStencilStateKind>>,
+    /// The last depth-stencil snapshot resolved to a built state, and that state.
+    ///
+    /// Consecutive draws almost always share their depth-stencil state, so an
+    /// equal snapshot skips the key packing and the cache probe. It names an
+    /// entry of `depth_stencil_cache`, which is emptied only at shutdown,
+    /// where the memo is forgotten with it.
+    depth_stencil_memo: Option<(DepthStencilSnapshot, MetalHandle<MTLDepthStencilStateKind>)>,
     /// Every render pipeline build by key, failures included.
     ///
     /// A key Metal refused is remembered as failed, so its later draws are
@@ -1521,6 +1528,7 @@ impl FrameEncoder {
             record,
             texture_clears: crate::metal::TextureClearBatch::new(),
             depth_stencil_cache: FxHashMap::default(),
+            depth_stencil_memo: None,
             pipeline_cache: BuildIndex::default(),
             clear_quad_pipeline_cache: FxHashMap::default(),
             blit_pipeline_cache: FxHashMap::default(),
@@ -5155,13 +5163,34 @@ impl FrameEncoder {
     // ── D3D9→Metal translation + caching (runs on encoder thread) ──
 
     /// Look up or create an `MTLDepthStencilState` for the given D3D9 state.
+    ///
+    /// A snapshot equal to the previous one answers from
+    /// [`Self::depth_stencil_memo`] without packing its key.
+    #[inline]
     pub fn get_or_create_depth_stencil(
         &mut self,
         snapshot: &DepthStencilSnapshot,
         draw_phase: bool,
     ) -> u64 {
+        if let Some((memo, handle)) = &self.depth_stencil_memo
+            && memo == snapshot
+        {
+            debug_assert!(
+                self.depth_stencil_cache
+                    .get(&key_from_snapshot(snapshot))
+                    .is_some_and(|cached| cached.raw() == handle.raw()),
+                "the depth-stencil memo names the cache's state for its snapshot"
+            );
+            return handle.raw();
+        }
+        self.depth_stencil_lookup(snapshot, draw_phase)
+    }
+
+    /// The cache probe and build behind [`Self::get_or_create_depth_stencil`].
+    fn depth_stencil_lookup(&mut self, snapshot: &DepthStencilSnapshot, draw_phase: bool) -> u64 {
         let key = key_from_snapshot(snapshot);
         if let Some(&handle) = self.depth_stencil_cache.get(&key) {
+            self.depth_stencil_memo = Some((*snapshot, handle));
             return handle.raw();
         }
 
@@ -5192,6 +5221,7 @@ impl FrameEncoder {
             return 0;
         };
         self.depth_stencil_cache.insert(key, state);
+        self.depth_stencil_memo = Some((*snapshot, state));
         state.raw()
     }
 
@@ -7897,6 +7927,7 @@ impl FrameEncoder {
         // — just drop the handle copies.
         self.libraries.clear();
         self.sampler_cache.clear();
+        self.depth_stencil_memo = None;
         self.depth_stencil_cache.clear();
         self.program_cache.clear();
         mtld3d_shared::crumb!("phase:SdDone");

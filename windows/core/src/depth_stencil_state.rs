@@ -101,7 +101,7 @@ const REPLACE_FACE: StencilFaceState = StencilFaceState {
 /// design: Metal carries the reference value on the encoder
 /// (`setStencilReferenceValue`), not on the state object, so folding it in
 /// here would mint a distinct Metal object per reference value.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug)]
 #[repr(C, align(4))]
 pub struct DepthStencilSnapshot {
     pub depth_enable: u8,
@@ -124,6 +124,17 @@ pub struct DepthStencilSnapshot {
     /// `D3DRS_STENCILWRITEMASK`, as the game set it.
     pub write_mask: u32,
 }
+
+// Written out rather than derived because the encoder compares each draw's
+// snapshot with the previous one: the derived compare tests every byte with
+// a branch, while `snapshot_words` reads the 20 bytes as three words.
+impl PartialEq for DepthStencilSnapshot {
+    fn eq(&self, other: &Self) -> bool {
+        snapshot_words(self) == snapshot_words(other)
+    }
+}
+
+impl Eq for DepthStencilSnapshot {}
 
 impl DepthStencilSnapshot {
     /// Depth and stencil both inert.
@@ -357,6 +368,43 @@ fn face_params(f: StencilFaceState) -> StencilFaceDescription {
         depth_fail_op: d3d_to_metal_stencil_op(u32::from(f.depth_fail_op)),
         pass_op: d3d_to_metal_stencil_op(u32::from(f.pass_op)),
     }
+}
+
+/// The 20 bytes of a snapshot as three words, in layout order; equal words mean equal snapshots.
+///
+/// The destructuring names every field, so a field added later fails to
+/// compile here instead of escaping the compare.
+fn snapshot_words(snapshot: &DepthStencilSnapshot) -> [u64; 3] {
+    let DepthStencilSnapshot {
+        depth_enable,
+        depth_write,
+        depth_func,
+        stencil_enable,
+        front,
+        back,
+        read_mask,
+        write_mask,
+    } = snapshot;
+    [
+        u64::from(*depth_enable)
+            | u64::from(*depth_write) << 8
+            | u64::from(*depth_func) << 16
+            | u64::from(*stencil_enable) << 24
+            | u64::from(face_word(*front)) << 32,
+        u64::from(face_word(*back)) | u64::from(*read_mask) << 32,
+        u64::from(*write_mask),
+    ]
+}
+
+/// One stencil face as a word, in layout order.
+const fn face_word(face: StencilFaceState) -> u32 {
+    let StencilFaceState {
+        func,
+        fail_op,
+        depth_fail_op,
+        pass_op,
+    } = face;
+    u32::from_le_bytes([func, fail_op, depth_fail_op, pass_op])
 }
 
 #[cfg(test)]

@@ -96,7 +96,7 @@ windows/core/src/convert.rs FfVsLayout Clone,Copy,Default
 windows/core/src/convert.rs FfVsLayoutFlags Clone,Copy,Debug,Default,PartialEq,Eq
 windows/core/src/convert.rs InputSemantic Clone,Copy,Debug,PartialEq,Eq
 windows/core/src/depth_stencil_state.rs DepthStencilKey Clone,Copy,PartialEq,Eq,Hash,Debug
-windows/core/src/depth_stencil_state.rs DepthStencilSnapshot Clone,Copy,Debug,PartialEq,Eq
+windows/core/src/depth_stencil_state.rs DepthStencilSnapshot Clone,Copy,Debug
 windows/core/src/depth_stencil_state.rs StencilFaceDescription Clone,Copy,Debug,PartialEq,Eq
 windows/core/src/depth_stencil_state.rs StencilFaceState Clone,Copy,Debug,PartialEq,Eq
 windows/core/src/dirty_range.rs DirtyRange Clone,Copy,Debug,PartialEq,Eq,Default
