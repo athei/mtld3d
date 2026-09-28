@@ -82,7 +82,7 @@ After any `.rs` change, run both before declaring the task done. `make` only reb
 
 ## winecrt0 TLS conflict
 
-Linking the full `libwinecrt0.a` causes duplicate TLS symbols (`__tls_index`, `__tls_start`, …) with the CRT. Fix: extract only `unix_lib.o` via `ar p` in `build.rs`.
+Linking the full `libwinecrt0.a` causes duplicate TLS symbols (`__tls_index`, `__tls_start`, …) with the CRT. Fix: `windows/shim/build.rs` extracts only `unix_lib.o`, by its full member name with `llvm-ar xP`, since an ARM64X archive carries one `unix_lib.o` per half under two directories and a basename match would hand back the first.
 
 ## `extern "system"` everywhere, not `extern "stdcall"`
 
@@ -124,7 +124,7 @@ Watch relative paths on the way out: `include_str!` resolves against the contain
 
 ## End-to-end tests are listed in `COVERAGE.md`
 
-`windows/tests/COVERAGE.md` is the index of the end-to-end suite: one row per test file, saying what that file pins. The files are the modules of `windows/tests/tests/e2e/main.rs`, the one binary whose tests share a process, plus the three files beside it under `windows/tests/tests/` that need a process of their own (`exit_code.rs`, `unload.rs`, `snmalloc_drift.rs`); `main.rs` declares the modules, pins nothing, and has no row. It is how a reader finds whether a behaviour is already covered, and how a reviewer sees what a change is claiming, so it is only useful while it is complete. `make audit` matches it against both directories in both directions: a test file with no row fails, and a row naming a file that is not there fails too. A new test file lands as a module of `main.rs` with its row in the same change, and a deleted one takes its row and its `mod` line with it.
+`windows/tests/COVERAGE.md` is the index of the end-to-end suite: one row per test file, saying what that file pins. The files are the modules of `windows/tests/tests/e2e/main.rs`, the one binary whose tests share a process, plus the four files beside it under `windows/tests/tests/` that need a process of their own (`exit_code.rs`, `unload.rs`, `snmalloc_drift.rs`, `thread_exit.rs`); `main.rs` declares the modules, pins nothing, and has no row. It is how a reader finds whether a behaviour is already covered, and how a reviewer sees what a change is claiming, so it is only useful while it is complete. `make audit` matches it against both directories in both directions: a test file with no row fails, and a row naming a file that is not there fails too. A new test file lands as a module of `main.rs` with its row in the same change, and a deleted one takes its row and its `mod` line with it.
 
 The row is one sentence per behaviour the file pins, not a summary of the file. A test added to an existing file extends that file's row rather than adding a new one.
 

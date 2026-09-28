@@ -80,7 +80,7 @@ that touches `docs/CONVENTIONS.md`.
 
 ## Reading a test run
 
-The end-to-end suite is four test binaries per architecture, and the runner
+The end-to-end suite is five test binaries per architecture, and the runner
 in `unix/e2e` runs each one once under Wine with every test of the binary on
 `JOBS` threads of that process (four at a time by default; the Makefile says
 what that assumes of the Wine it runs under). It prints one
@@ -177,7 +177,7 @@ named test failed and runs the rest again in a fresh process, and a crash or
 a hang (no result for `TIMEOUT` seconds) is charged the same way, through a
 one-thread re-run of the tests that were in flight when nothing names the
 culprit. So a failure costs one result and one extra process, and the
-`processes` count in the summary says how many the run took: eight is a
+`processes` count in the summary says how many the run took: ten is a
 clean `make test`.
 
 Explicit test selections, including recovery rounds and filtered initial runs,

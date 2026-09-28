@@ -1,3 +1,5 @@
+#[cfg(any(target_arch = "aarch64", target_arch = "arm64ec"))]
+mod arm64_crt;
 mod bound_buffers;
 mod bound_rt;
 mod capture;
@@ -54,6 +56,9 @@ use crate::{direct3d9::Direct3D9, unix_call::unix_call};
 
 const DLL_PROCESS_ATTACH: u32 = 1;
 const DLL_PROCESS_DETACH: u32 = 0;
+/// The reason a thread's exit gives a TLS callback, which only the ARM64X halves install.
+#[cfg(any(target_arch = "aarch64", target_arch = "arm64ec"))]
+const DLL_THREAD_DETACH: u32 = 3;
 
 /// Single source of truth for the `log` crate target, so callers don't hard-code the string.
 ///
@@ -145,6 +150,8 @@ pub extern "system" fn dll_main(instance: *mut c_void, reason: u32, _reserved: *
     if reason != DLL_PROCESS_ATTACH {
         return 1;
     }
+    #[cfg(any(target_arch = "aarch64", target_arch = "arm64ec"))]
+    arm64_crt::attach();
     init_logger(instance);
     attach_process(instance);
     1

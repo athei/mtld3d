@@ -2,6 +2,16 @@ ifndef WINE_SDK
 $(error WINE_SDK is not set)
 endif
 
+# Where the EC=1 leg (`windows-arm64x`) finds Wine's two ARM64X link archives,
+# `libwinecrt0.a` and `libntdll.a`, under `lib/wine/aarch64-windows`. The Wine
+# SDK is an x86 Wine and carries neither, so they come from a Wine tree of their
+# own, which wine-build's "ARM64X link libraries" step stages as
+# `dist/wine-arm64x` beside the SDK's `dist/wine`. Taken here, before ISOLATED=1
+# below points WINE_SDK at a clone that has no sibling.
+ifndef WINE_SDK_ARM64X
+WINE_SDK_ARM64X := $(WINE_SDK)-arm64x
+endif
+
 # Clone the directory tree $(1) to $(2), cheapest mechanism first. On one APFS
 # volume clonefile(2) takes a directory and clones the whole hierarchy in a
 # single call, so the cost is the call and not the file count, where `cp -c -R`
@@ -137,6 +147,16 @@ else ifeq ($(PERF),0)
 export MTLD3D_PERF := 0
 endif
 
+# EC=1 adds the ARM64X leg (`windows-arm64x` below) to `make`, `make install`,
+# `make bundle`, `make check` and `make setup-rust`, beside the legs those
+# always build; without it none of them changes. The leg needs a toolchain the
+# others do not, which it checks for before it builds. EC_LEG is the leg's name
+# when it is on and empty otherwise, for the aggregates that list it.
+ifeq ($(EC),1)
+$(info ==> EC=1: the ARM64X d3d9.dll and mtld3d.dll build beside the x86 ones)
+EC_LEG := arm64x
+endif
+
 # Frame pointers are opt-in: the toolchain default decides for a normal build,
 # and FP=1 forces them on for the guest-pc sampling profiler, whose stack walks
 # follow the guest frame-pointer chain, and without them every walk stops at
@@ -185,6 +205,10 @@ NEXTEST_VERSION ?= latest
 
 PE_i386     := i686-pc-windows-msvc
 PE_x64      := x86_64-pc-windows-msvc
+# The two halves of the ARM64X DLLs, which serve an arm64 Wine: the EC half
+# runs natively in x64 processes, the ARM64 half in arm64 ones.
+PE_arm64    := aarch64-pc-windows-msvc
+PE_arm64ec  := arm64ec-pc-windows-msvc
 # Release/Wine targets for the unix half. Wine picks the `.so` out of
 # `lib/wine/<cpu>-unix` by the arch of the Wine build that loads it, so there is
 # one artifact per Wine host ISA: x86_64 for today's Wine on macOS, aarch64 for
@@ -206,6 +230,9 @@ HOST_ARCH := $(shell uname -m)
 
 OUT_i386       := windows/target/$(PE_i386)/$(PROFILE)
 OUT_x64        := windows/target/$(PE_x64)/$(PROFILE)
+OUT_arm64      := windows/target/$(PE_arm64)/$(PROFILE)
+OUT_arm64ec    := windows/target/$(PE_arm64ec)/$(PROFILE)
+OUT_arm64x     := windows/target/arm64x/$(PROFILE)
 OUT_unix_x64   := unix/target/$(UNIX_TARGET_x64)/$(PROFILE)
 OUT_unix_arm64 := unix/target/$(UNIX_TARGET_arm64)/$(PROFILE)
 
@@ -339,8 +366,9 @@ TAG          ?= $(shell git describe --tags --exact-match 2>/dev/null)
 #
 # Every target here is phony: the recipes write into cargo's target dirs and the
 # Wine install, never into a file named after the target.
-.PHONY: all windows windows-i686 windows-x86_64 unix unix-x64 unix-arm64 \
-	install install-windows-i686 install-windows-x86_64 install-unix-x64 install-unix-arm64 \
+.PHONY: all windows windows-i686 windows-x86_64 windows-arm64x unix unix-x64 unix-arm64 \
+	install install-windows-i686 install-windows-x86_64 install-windows-arm64x \
+	install-unix-x64 install-unix-arm64 \
 	bundle version-check stage clean-isolated clean-isolated-orphans \
 	configure-test-prefix configure-test-prefix-locked configure-test-prefix-session \
 	configure-test-prefix-boot \
@@ -351,7 +379,7 @@ TAG          ?= $(shell git describe --tags --exact-match 2>/dev/null)
 	conformance-scale conformance-scale-i686 conformance-scale-x86_64 \
 	conformance-baseline-scale-i686 conformance-baseline-scale-x86_64 \
 	conformance-baseline-intel-i686 conformance-baseline-intel-x86_64 \
-	conformance-isolate fmt fmt-check clippy clippy-pe-i686 clippy-pe-x86_64 \
+	conformance-isolate fmt fmt-check clippy clippy-pe-i686 clippy-pe-x86_64 clippy-pe-arm64x \
 	clippy-native audit test-isolation test-e2e-discovery doc doc-windows doc-unix check clean upgrade \
 	upgrade-incompat setup setup-rust setup-nextest setup-dev setup-xwin \
 	setup-rosetta \
@@ -359,7 +387,7 @@ TAG          ?= $(shell git describe --tags --exact-match 2>/dev/null)
 
 all: windows unix
 
-windows: windows-i686 windows-x86_64
+windows: windows-i686 windows-x86_64 $(EC_LEG:%=windows-%)
 unix: unix-x64 unix-arm64
 
 # Per-arch build leaves. Each PE arch and each unix arch is independent, so a
@@ -390,6 +418,127 @@ windows-x86_64:
 	$(WINEBUILD) --builtin $(OUT_x64)/mtld3d.dll
 	$(WINEBUILD) --fake-module -o $(OUT_x64)/mtld3d.fake.dll -m64 --dll $(OUT_x64)/mtld3d.dll
 
+# ARM64X `d3d9.dll` and `mtld3d.dll`, built with EC=1 only: the layout an arm64
+# Wine keeps its own builtins in, one image under `lib/wine/aarch64-windows`
+# holding an ARM64 half for arm64 processes and an ARM64EC half that x64
+# processes run natively, where the x64 DLLs above would be emulated. 32-bit
+# processes still load the i386 DLLs. Rust has no ARM64X target, so each crate
+# is built once per half as a static library, and one `lld-link /machine:arm64x`
+# puts both halves into one image.
+#
+# The CRT is llvm-mingw's, because MSVC ships its ARM64 and ARM64EC libraries
+# only with Visual Studio, and xwin splats neither. `dllcrt2.o` is the DLL
+# entry point, and it does what MSVC's does for the x86 DLLs: it runs the
+# static initializers std registers, sets up TLS and runs the module's atexit
+# table at detach. `-lldmingw` is the linker mode that CRT is written for, in
+# which LLD supplies the constructor list `libmingw32.a` reads. The three
+# symbols of MSVC's static CRT that remain, and the thread-exit teardown of
+# snmalloc that MSVC's CRT runs and llvm-mingw's does not, are in
+# `windows/d3d9/src/arm64_crt.rs`. `kernel32` precedes `mincore`, so what both
+# define is imported from `KERNEL32.dll` as the x86 DLLs import it, and only
+# what `kernel32` lacks (`WaitOnAddress`, `VirtualAlloc2FromApp`) comes from
+# the API sets. `ntdll` is Wine's own import library rather than llvm-mingw's,
+# the one the `unix_lib.o` inside the shim is built against, and it carries the
+# ARM64EC stack probe. It goes last: LLD takes a symbol from the first library
+# that defines it, and Wine's ntdll also exports C runtime functions (`memcpy`,
+# `_errno`) that have to come from the ucrt the rest of the CRT uses. Each
+# library is named by path for both halves, since both sysroots spell it the
+# same. `/defarm64native` exports the same names from the ARM64 half as `/def`
+# does from the EC half. `/opt:ref,icf` is what rustc passes for the x86 DLLs,
+# and `/debug` would otherwise turn both off: it drops the code nothing
+# reaches, zstd's suffix sorter among it, along with that code's C assertion
+# import.
+#
+# The linker has to be LLD 23 or newer. An ARM64X image has one TLS directory
+# field, and each half brings its own `_tls_used`, `_tls_index` and TLS
+# callbacks; LLD 23 gives the EC view its own directory through an ARM64X
+# relocation, where LLD 22 hands both views the ARM64 one, so an x64 process
+# runs the ARM64 TLS callbacks under the x64 emulator and its EC code reads a
+# TLS index the loader never set. Homebrew's `lld` is one: its version follows
+# Homebrew's `llvm`, and llvm-mingw's own LLD may be older.
+#
+# LLVM_MINGW (default `/opt/llvm-mingw`) is the CRT, and its `llvm-nm` reads the
+# static libraries for the checks below. ARM64X_LLD (default Homebrew's `lld`)
+# is the linker. WINE_SDK_ARM64X (top of this file) holds the Wine archives.
+LLVM_MINGW         ?= /opt/llvm-mingw
+ARM64X_LLD         ?= /opt/homebrew/opt/lld/bin/lld-link
+ARM64X_LLD_MIN     := 23
+ARM64X_SYSLIBS     := mingw32 mingwex ucrt kernel32 mincore user32 advapi32 gdi32 ws2_32 \
+	userenv bcrypt dbghelp
+
+# What the leg needs beyond the x86 legs' toolchain, checked before it builds so
+# that a missing piece is named instead of surfacing as a build-script or link
+# error. ARM64X_REQUIRE_CARGO is what cargo needs for the two halves, which is
+# all a clippy leg needs: both Rust targets, and the Wine archives the shim's
+# build script reads. ARM64X_REQUIRE_LINK is what the link adds. Each is one
+# shell line that exits 2 with a message on the first thing missing.
+define ARM64X_REQUIRE_CARGO
+installed=$$(rustup target list --installed --toolchain $(RUST_STABLE) 2>/dev/null); \
+for target in $(PE_arm64) $(PE_arm64ec); do \
+	echo "$$installed" | grep -qx $$target || { echo "EC=1: the Rust target $$target is not installed for $(RUST_STABLE); \`make EC=1 setup-rust\` adds it" >&2; exit 2; }; \
+done; \
+for archive in libwinecrt0.a libntdll.a; do \
+	[ -f $(WINE_SDK_ARM64X)/lib/wine/aarch64-windows/$$archive ] || { echo "EC=1: $(WINE_SDK_ARM64X)/lib/wine/aarch64-windows/$$archive is missing; WINE_SDK_ARM64X names the ARM64X link libraries wine-build stages as dist/wine-arm64x" >&2; exit 2; }; \
+done
+endef
+define ARM64X_REQUIRE_LINK
+for sysroot in aarch64 arm64ec; do \
+	[ -f $(LLVM_MINGW)/$$sysroot-w64-mingw32/lib/dllcrt2.o ] || { echo "EC=1: $(LLVM_MINGW) has no $$sysroot-w64-mingw32 CRT; LLVM_MINGW names an llvm-mingw install" >&2; exit 2; }; \
+done; \
+[ -x $(LLVM_MINGW)/bin/llvm-nm ] || { echo "EC=1: $(LLVM_MINGW)/bin/llvm-nm is missing; LLVM_MINGW names an llvm-mingw install" >&2; exit 2; }; \
+version=$$($(ARM64X_LLD) --version 2>/dev/null | sed -n 's/.*LLD \([0-9][0-9]*\)\..*/\1/p'); \
+[ -n "$$version" ] || { echo "EC=1: no LLD at $(ARM64X_LLD); ARM64X_LLD names an lld-link $(ARM64X_LLD_MIN) or newer, such as Homebrew's (\`brew install lld\`)" >&2; exit 2; }; \
+[ "$$version" -ge $(ARM64X_LLD_MIN) ] || { echo "EC=1: $(ARM64X_LLD) is LLD $$version, and the ARM64X link needs $(ARM64X_LLD_MIN) or newer" >&2; exit 2; }
+endef
+
+# `-fno-threadsafe-statics` (see `windows/.cargo/config.toml`) is sound only
+# while every guarded local static in the C++ is one that a lock of its own
+# already serializes, which for this snmalloc revision is one, the handler
+# latch in `PALWindows::initialise_for_singleton` under its `Singleton`. So the
+# guard variables the two halves carry are held to exactly that one, and a
+# thread-safe guard (`?$TSS`, `_Init_thread_*`) would mean the flag stopped
+# applying. The same pass checks that snmalloc's thread-exit teardown is the one
+# `arm64_crt.rs` calls, `_malloc_thread_cleanup`, and that nothing registers a
+# `thread_local` destructor through llvm-mingw's `__tlregdtor`, which never
+# runs one. An snmalloc upgrade that trips either has to be read before the
+# list moves.
+ARM64X_STATIC_GUARDS := ??_B?1??initialise_for_singleton@PALWindows@snmalloc@@CAXPEA_K@Z@51
+define ARM64X_CHECK_ARCHIVES
+for lib in $(OUT_arm64)/d3d9.lib $(OUT_arm64ec)/d3d9.lib; do \
+	symbols=$$($(LLVM_MINGW)/bin/llvm-nm $$lib 2>/dev/null) || { echo "EC=1: llvm-nm cannot read $$lib" >&2; exit 1; }; \
+	guards=$$(echo "$$symbols" | awk '{ print $$NF }' | grep -E '^#?(\?\?_B|\?\$$TSS|_Init_thread_)' | sort -u); \
+	[ "$$guards" = '$(ARM64X_STATIC_GUARDS)' ] || { echo "EC=1: $$lib carries the static guards [$$guards] where the C++ built with -fno-threadsafe-statics may only carry [$(ARM64X_STATIC_GUARDS)]" >&2; exit 1; }; \
+	echo "$$symbols" | grep -qE ' T #?_malloc_thread_cleanup$$' || { echo "EC=1: $$lib defines no _malloc_thread_cleanup, so no thread exit would tear its allocator down" >&2; exit 1; }; \
+	! echo "$$symbols" | grep -qE ' #?__tlregdtor$$' || { echo "EC=1: $$lib registers a thread_local destructor through __tlregdtor, which llvm-mingw never runs" >&2; exit 1; }; \
+done
+endef
+
+# $(1) = crate and DLL name, $(2) = its `.def` under `windows/`.
+define arm64x_link
+$(ARM64X_LLD) -lldmingw /dll /machine:arm64x /nodefaultlib /opt:ref,icf \
+	/entry:DllMainCRTStartup /def:windows/$(2) /defarm64native:windows/$(2) \
+	/debug /pdb:$(OUT_arm64x)/$(1).pdb /out:$(OUT_arm64x)/$(1).dll \
+	$(LLVM_MINGW)/aarch64-w64-mingw32/lib/dllcrt2.o $(LLVM_MINGW)/arm64ec-w64-mingw32/lib/dllcrt2.o \
+	$(OUT_arm64)/$(1).lib $(OUT_arm64ec)/$(1).lib \
+	$(foreach sysroot,aarch64 arm64ec,$(foreach lib,$(ARM64X_SYSLIBS),$(LLVM_MINGW)/$(sysroot)-w64-mingw32/lib/lib$(lib).a)) \
+	$(WINE_SDK_ARM64X)/lib/wine/aarch64-windows/libntdll.a
+endef
+
+windows-arm64x:
+	$(ARM64X_REQUIRE_CARGO)
+	$(ARM64X_REQUIRE_LINK)
+	cd windows && for target in $(PE_arm64) $(PE_arm64ec); do \
+		for crate in mtld3d d3d9; do \
+			WINE_SDK=$(WINE_SDK_ARM64X) cargo +$(RUST_STABLE) rustc --profile $(PROFILE) --target $$target \
+				-p $$crate --crate-type staticlib $(FRAME_POINTERS) || exit ; \
+		done ; \
+	done
+	$(ARM64X_CHECK_ARCHIVES)
+	mkdir -p $(OUT_arm64x)
+	$(call arm64x_link,mtld3d,shim/mtld3d.def)
+	$(call arm64x_link,d3d9,d3d9/d3d9.def)
+	$(WINEBUILD) --builtin $(OUT_arm64x)/mtld3d.dll
+
 # On Mach-O the DWARF stays behind in the compiler's `.o` files, with only a
 # debug map in the dylib pointing at them by absolute path; `dsymutil` walks
 # that map and gathers the DWARF into a `.dSYM`, the shippable equivalent of
@@ -408,7 +557,8 @@ unix-arm64:
 	rm -rf $(OUT_unix_arm64)/mtld3d.so.dSYM
 	dsymutil $(OUT_unix_arm64)/mtld3d.so
 
-install: install-windows-i686 install-windows-x86_64 install-unix-x64 install-unix-arm64
+install: install-windows-i686 install-windows-x86_64 install-unix-x64 install-unix-arm64 \
+	$(EC_LEG:%=install-windows-%)
 
 # Per-arch install leaves, named after the build leaf each one installs: a test
 # leg installs the one PE arch it exercises plus the one unix `.so` its Wine
@@ -457,6 +607,29 @@ install-windows-x86_64: $(if $(STAGE),,windows-x86_64)
 			rm -f $$dir/lib/wine/x86_64-windows/d3d9.pdb $$dir/lib/wine/x86_64-windows/mtld3d.pdb ; \
 			$(WINEBUILD) --fake-module -o $$dir/lib/wine/x86_64-windows/d3d9.dll   -m64 --dll $$tree/x86_64-windows/d3d9.dll ; \
 			$(WINEBUILD) --fake-module -o $$dir/lib/wine/x86_64-windows/mtld3d.dll -m64 --dll $$tree/x86_64-windows/mtld3d.dll ; \
+		fi ; \
+	done
+
+# The ARM64X pair (EC=1) goes where an arm64 Wine keeps its own ARM64X builtins,
+# `aarch64-windows`, from which it loads them for arm64 and x64 processes alike;
+# the unix half is the `aarch64-unix` `.so` that `install-unix-arm64` already
+# installs. In the subtree layout the default dir gets the fake-module markers,
+# as the x86 leaves write them, built for `aarch64-windows`. Wine resolves a
+# builtin through the copy `wineboot` placed in the prefix's `system32` when it
+# created the prefix, so the pair takes effect in prefixes created after the
+# install: one created before it holds no ARM64X `mtld3d.dll` there.
+install-windows-arm64x: windows-arm64x
+	for dir in $(INSTALL_DIRS); do \
+		tree=$$($(call MTLD3D_TREE,$$dir)) ; \
+		mkdir -p $$tree/aarch64-windows ; \
+		cp -c $(OUT_arm64x)/mtld3d.dll $(OUT_arm64x)/mtld3d.pdb $$tree/aarch64-windows/ ; \
+		cp -c $(OUT_arm64x)/d3d9.dll   $(OUT_arm64x)/d3d9.pdb   $$tree/aarch64-windows/ ; \
+		$(WINEBUILD) --builtin $$tree/aarch64-windows/d3d9.dll ; \
+		if [ $$tree != $$dir/lib/wine ]; then \
+			mkdir -p $$dir/lib/wine/aarch64-windows ; \
+			rm -f $$dir/lib/wine/aarch64-windows/d3d9.pdb $$dir/lib/wine/aarch64-windows/mtld3d.pdb ; \
+			$(WINEBUILD) --fake-module -o $$dir/lib/wine/aarch64-windows/d3d9.dll   -b aarch64-windows --dll $$tree/aarch64-windows/d3d9.dll ; \
+			$(WINEBUILD) --fake-module -o $$dir/lib/wine/aarch64-windows/mtld3d.dll -b aarch64-windows --dll $$tree/aarch64-windows/mtld3d.dll ; \
 		fi ; \
 	done
 
@@ -537,6 +710,11 @@ version-check:
 #
 # Two archives come out of one run: the bundle users install, and the symbols
 # that make a crash report from one of them readable.
+#
+# With EC=1 both also carry the ARM64X pair, under `aarch64-windows` as
+# `install-windows-arm64x` lays it out: builtin-marked in wine/, and its
+# symbols in the debug archive. It gets no native/ copy and no prefix marker,
+# since neither route has been run with it.
 bundle: all
 	rm -rf $(BUNDLE_STAGE) $(BUNDLE_OUT) $(DEBUG_STAGE) $(DEBUG_OUT)
 	mkdir -p $(BUNDLE_STAGE)/wine/i386-windows
@@ -560,6 +738,9 @@ bundle: all
 	cp -c $(OUT_x64)/mtld3d.fake.dll       $(BUNDLE_STAGE)/prefix-markers/system32/mtld3d.dll
 	$(WINEBUILD) --builtin $(BUNDLE_STAGE)/wine/i386-windows/d3d9.dll
 	$(WINEBUILD) --builtin $(BUNDLE_STAGE)/wine/x86_64-windows/d3d9.dll
+	$(if $(EC_LEG),mkdir -p $(BUNDLE_STAGE)/wine/aarch64-windows && \
+		cp -c $(OUT_arm64x)/mtld3d.dll $(OUT_arm64x)/d3d9.dll $(BUNDLE_STAGE)/wine/aarch64-windows/ && \
+		$(WINEBUILD) --builtin $(BUNDLE_STAGE)/wine/aarch64-windows/d3d9.dll)
 	cp -c $(OUT_unix_x64)/mtld3d.so        $(BUNDLE_STAGE)/wine/$(UNIX_WINEDIR_x64)/
 	cp -c $(OUT_unix_arm64)/mtld3d.so      $(BUNDLE_STAGE)/wine/$(UNIX_WINEDIR_arm64)/
 	cp -c $(OUT_i386)/d3d9.dll             $(BUNDLE_STAGE)/native/i386-windows/
@@ -575,7 +756,7 @@ bundle: all
 	# so they carry no stamp and are not swept.
 	test -n "$(BUILD_ID)" || { echo "bundle: this build has no identity to check the binaries against" >&2; exit 1; }
 	for f in $(BUNDLE_STAGE)/wine/i386-windows/*.dll \
-	         $(BUNDLE_STAGE)/wine/x86_64-windows/*.dll \
+	         $(BUNDLE_STAGE)/wine/x86_64-windows/*.dll$(if $(EC_LEG), $(BUNDLE_STAGE)/wine/aarch64-windows/*.dll) \
 	         $(BUNDLE_STAGE)/wine/$(UNIX_WINEDIR_x64)/mtld3d.so \
 	         $(BUNDLE_STAGE)/wine/$(UNIX_WINEDIR_arm64)/mtld3d.so ; do \
 		LC_ALL=C grep -a -q -F "$(BUILD_ID)" $$f || { echo "bundle: $$f is not stamped $(BUILD_ID); it was built at another commit, rebuild it" >&2; exit 1; } ; \
@@ -593,9 +774,11 @@ bundle: all
 	cp -c $(OUT_i386)/mtld3d.pdb           $(DEBUG_STAGE)/i386-windows/
 	cp -c $(OUT_x64)/d3d9.pdb              $(DEBUG_STAGE)/x86_64-windows/
 	cp -c $(OUT_x64)/mtld3d.pdb            $(DEBUG_STAGE)/x86_64-windows/
+	$(if $(EC_LEG),mkdir -p $(DEBUG_STAGE)/aarch64-windows && \
+		cp -c $(OUT_arm64x)/d3d9.pdb $(OUT_arm64x)/mtld3d.pdb $(DEBUG_STAGE)/aarch64-windows/)
 	$(call clone_tree,$(OUT_unix_x64)/mtld3d.so.dSYM,$(DEBUG_STAGE)/$(UNIX_WINEDIR_x64)/mtld3d.so.dSYM)
 	$(call clone_tree,$(OUT_unix_arm64)/mtld3d.so.dSYM,$(DEBUG_STAGE)/$(UNIX_WINEDIR_arm64)/mtld3d.so.dSYM)
-	tar -cJf $(DEBUG_OUT) -C $(DEBUG_STAGE) BUILD i386-windows x86_64-windows \
+	tar -cJf $(DEBUG_OUT) -C $(DEBUG_STAGE) BUILD i386-windows x86_64-windows$(if $(EC_LEG), aarch64-windows) \
 		$(UNIX_WINEDIR_x64) $(UNIX_WINEDIR_arm64)
 
 # The test hand-off (see STAGE above): the install inputs laid out exactly as
@@ -818,13 +1001,13 @@ test-unit:
 # The e2e suite, one leg per PE arch: each installs the arch it exercises plus
 # the unix `.so` this SDK's Wine loads, so the two legs are independent jobs.
 #
-# The suite is four test binaries per arch (`windows/tests/tests`: the
-# one-process suite `e2e`, and `exit_code`, `unload` and `snmalloc_drift`,
-# which need a process of their own), and the runner in `unix/e2e` runs each once under
+# The suite is five test binaries per arch (`windows/tests/tests`: the
+# one-process suite `e2e`, and `exit_code`, `unload`, `snmalloc_drift` and
+# `thread_exit`, which need a process of their own), and the runner in `unix/e2e` runs each once under
 # Wine, every test of a binary on `JOBS` threads of that one process, each
 # with its own device. Only a failure, a crash or a hang costs another
 # process: the runner marks the test it attributes the end to and runs the
-# rest again. So a run is eight Wine launches, and its report counts every
+# rest again. So a run is ten Wine launches, and its report counts every
 # test rather than stopping at a summary.
 #
 # JOBS=<n> is how many tests run at once, each on its own thread with its
@@ -1377,14 +1560,15 @@ fmt-check:
 	cd windows && cargo +$(RUST_NIGHTLY) fmt --check
 	cd unix && cargo +$(RUST_NIGHTLY) fmt --check
 
-clippy: clippy-pe-i686 clippy-pe-x86_64 clippy-native
+clippy: clippy-pe-i686 clippy-pe-x86_64 clippy-native $(EC_LEG:%=clippy-pe-%)
 
-# Three independent clippy legs, split by the target they lint for so each is one
-# job. No --all-targets on the whole-workspace PE runs: that would build every
-# member's test targets for PE, including mtld3d-core's apple-only objc2 dev-deps
-# (the SM3 corpus test), which hard `compile_error!` off Apple. Lib/bin only
-# there; mtld3d-tests' integration tests aren't covered by those runs, so its own
-# per-crate pass lints all its targets (it has no apple dev-deps).
+# Three independent clippy legs (four with EC=1), split by the target they lint
+# for so each is one job. No --all-targets on the whole-workspace PE runs: that
+# would build every member's test targets for PE, including mtld3d-core's
+# apple-only objc2 dev-deps (the SM3 corpus test), which hard `compile_error!`
+# off Apple. Lib/bin only there; mtld3d-tests' integration tests aren't covered
+# by those runs, so its own per-crate pass lints all its targets (it has no apple
+# dev-deps).
 clippy-pe-i686:
 	cd windows && cargo +$(RUST_STABLE) clippy --target $(PE_i386) $(DENY_WARNINGS)
 	cd windows && cargo +$(RUST_STABLE) clippy -p mtld3d-tests --target $(PE_i386) --all-targets $(DENY_WARNINGS)
@@ -1398,6 +1582,17 @@ clippy-pe-i686:
 clippy-pe-x86_64:
 	cd windows && cargo +$(RUST_STABLE) clippy --target $(PE_x64) $(DENY_WARNINGS)
 	cd windows && cargo +$(RUST_STABLE) clippy -p mtld3d-tests --target $(PE_x64) --all-targets $(DENY_WARNINGS)
+
+# The two halves of the ARM64X leg (EC=1), linted for the code only they compile
+# (`windows/d3d9/src/arm64_crt.rs`) and for the `cfg` arms the x86 targets never
+# take, in the windows workspace and in `unix/shared` (its ARM64EC clock), the
+# way `clippy-pe-i686` reaches the latter.
+clippy-pe-arm64x:
+	$(ARM64X_REQUIRE_CARGO)
+	for target in $(PE_arm64) $(PE_arm64ec); do \
+		( cd windows && WINE_SDK=$(WINE_SDK_ARM64X) cargo +$(RUST_STABLE) clippy --target $$target $(DENY_WARNINGS) ) || exit ; \
+		( cd unix && cargo +$(RUST_STABLE) clippy -p mtld3d-shared --target $$target $(DENY_WARNINGS) ) || exit ; \
+	done
 
 # Everything that lints for this machine's own arch: mtld3d-core's test targets
 # (the only place `#[cfg(test)]` blocks in the windows workspace are linted) and
@@ -1638,7 +1833,7 @@ setup-rust:
 	# on stable.
 	rustup toolchain install $(RUST_STABLE) --profile minimal --component clippy --component llvm-tools
 	rustup target add --toolchain $(RUST_STABLE) \
-		$(PE_i386) $(PE_x64) $(UNIX_TARGET_x64) $(UNIX_TARGET_arm64)
+		$(PE_i386) $(PE_x64) $(UNIX_TARGET_x64) $(UNIX_TARGET_arm64)$(if $(EC_LEG), $(PE_arm64) $(PE_arm64ec))
 	rustup toolchain install $(RUST_NIGHTLY) --profile minimal --component rustfmt
 	# `--locked`: taking every tool's own lockfile is what makes a CI runner and
 	# a laptop install the same thing.

@@ -1,0 +1,3 @@
+LIBRARY MTLD3D.DLL
+EXPORTS
+    mtld3d_unix_call

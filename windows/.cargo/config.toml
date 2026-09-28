@@ -50,6 +50,17 @@ rustflags = [
     "-Lnative=/opt/xwin/sdk/lib/ucrt/x86_64",
 ]
 
+# The two halves of the ARM64X DLLs. Rust has no ARM64X target, so each crate
+# is built once per half as a static library and the Makefile links both into
+# one image with `lld-link /machine:arm64x` (see `windows-arm64x` there). Cargo
+# never links a PE for these targets, so there is no linker and no library
+# search path here: the Makefile names every import library itself.
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=-crt-static"]
+
+[target.arm64ec-pc-windows-msvc]
+rustflags = ["-C", "target-feature=-crt-static"]
+
 [env]
 # xwin include paths repeated for C and C++ — cc-rs reads CFLAGS_<target>
 # and CXXFLAGS_<target> separately with no cross-fallback, and TOML has
@@ -76,6 +87,26 @@ CFLAGS_i686-pc-windows-msvc     = "-march=nehalem -fno-omit-frame-pointer -idira
 CFLAGS_x86_64-pc-windows-msvc   = "-march=x86-64-v2 -fno-omit-frame-pointer -idirafter /opt/xwin/crt/include -idirafter /opt/xwin/sdk/include/ucrt -idirafter /opt/xwin/sdk/include/um -idirafter /opt/xwin/sdk/include/shared"
 CXXFLAGS_i686-pc-windows-msvc   = "-march=nehalem -fno-omit-frame-pointer -idirafter /opt/xwin/crt/include -idirafter /opt/xwin/sdk/include/ucrt -idirafter /opt/xwin/sdk/include/um -idirafter /opt/xwin/sdk/include/shared"
 CXXFLAGS_x86_64-pc-windows-msvc = "-march=x86-64-v2 -fno-omit-frame-pointer -idirafter /opt/xwin/crt/include -idirafter /opt/xwin/sdk/include/ucrt -idirafter /opt/xwin/sdk/include/um -idirafter /opt/xwin/sdk/include/shared"
+# The ARM64X halves link llvm-mingw's CRT, not MSVC's (see `windows-arm64x` in
+# the Makefile), so the C++ of snmalloc-sys is built the way snmalloc builds it
+# for every non-MSVC target: without exceptions and RTTI, whose runtime
+# support lives in MSVC's static CRT. `-fno-threadsafe-statics` drops the
+# guard calls MSVC's static CRT would also have to supply; snmalloc's one guarded
+# local static is initialised under its own `Singleton` lock, and the Makefile
+# fails the leg if another one appears. `SNMALLOC_USE_THREAD_CLEANUP` takes the
+# allocator's per-thread teardown off C++ `thread_local` destructors, which
+# llvm-mingw registers through a `__tlregdtor` that never runs them: snmalloc
+# then exports `_malloc_thread_cleanup` for the platform to call at thread
+# exit, and `windows/d3d9/src/arm64_crt.rs` calls it from a TLS callback.
+# `ARM64_SYSREG` is the Windows SDK macro snmalloc's ARM layer reads its cycle
+# counter with; the SDK defines it in `arm64intr.h`, which clang's own header
+# of that name shadows. ARM64EC defines `_M_X64`, so zstd would include the
+# x86 SIMD headers, which clang cannot compile for an ARM64 back end:
+# `ZSTD_NO_INTRINSICS` keeps it on its scalar code.
+CFLAGS_aarch64-pc-windows-msvc    = "-idirafter /opt/xwin/crt/include -idirafter /opt/xwin/sdk/include/ucrt -idirafter /opt/xwin/sdk/include/um -idirafter /opt/xwin/sdk/include/shared"
+CFLAGS_arm64ec-pc-windows-msvc    = "-DZSTD_NO_INTRINSICS -idirafter /opt/xwin/crt/include -idirafter /opt/xwin/sdk/include/ucrt -idirafter /opt/xwin/sdk/include/um -idirafter /opt/xwin/sdk/include/shared"
+CXXFLAGS_aarch64-pc-windows-msvc  = "-fno-exceptions -fno-rtti -fno-threadsafe-statics -DSNMALLOC_USE_THREAD_CLEANUP -DARM64_SYSREG(op0,op1,crn,crm,op2)=((((op0)&1)<<14)|(((op1)&7)<<11)|(((crn)&15)<<7)|(((crm)&15)<<3)|((op2)&7)) -idirafter /opt/xwin/crt/include -idirafter /opt/xwin/sdk/include/ucrt -idirafter /opt/xwin/sdk/include/um -idirafter /opt/xwin/sdk/include/shared"
+CXXFLAGS_arm64ec-pc-windows-msvc  = "-fno-exceptions -fno-rtti -fno-threadsafe-statics -DSNMALLOC_USE_THREAD_CLEANUP -DARM64_SYSREG(op0,op1,crn,crm,op2)=((((op0)&1)<<14)|(((op1)&7)<<11)|(((crn)&15)<<7)|(((crm)&15)<<3)|((op2)&7)) -idirafter /opt/xwin/crt/include -idirafter /opt/xwin/sdk/include/ucrt -idirafter /opt/xwin/sdk/include/um -idirafter /opt/xwin/sdk/include/shared"
 # The MSVC librarian, as a bare name resolved from PATH: `make setup-rust` puts an
 # `llvm-lib` symlink in the cargo bin directory onto `llvm-ar`, which switches to
 # lib.exe-compatible mode based on the name it is invoked under. That mode is what
@@ -84,3 +115,8 @@ CXXFLAGS_x86_64-pc-windows-msvc = "-march=x86-64-v2 -fno-omit-frame-pointer -idi
 # object it writes an archive with no members at all and exits 0.
 AR_i686-pc-windows-msvc         = "llvm-lib"
 AR_x86_64-pc-windows-msvc       = "llvm-lib"
+AR_aarch64-pc-windows-msvc      = "llvm-lib"
+AR_arm64ec-pc-windows-msvc      = "llvm-lib"
+# `llvm-lib` infers an archive's machine from its first member and takes an
+# ARM64EC object for a plain ARM64 one, so it is told which it is writing.
+ARFLAGS_arm64ec-pc-windows-msvc = "-machine:arm64ec"

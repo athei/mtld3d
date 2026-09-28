@@ -44,6 +44,13 @@ matching the arch of the Wine build itself: an x86_64 Wine takes
 round. Nothing to choose: copy both, or the one your Wine needs. The PE side
 is x86 in either case.
 
+A bundle built from source with `EC=1` (see the `README.md`) also carries
+`wine/aarch64-windows/`, holding `d3d9.dll` and `mtld3d.dll` as builtin-marked
+ARM64X images; release bundles do not. Copied into an arm64 Wine with the rest
+of `wine/`, they serve x64 games in prefixes created after the copy, which
+then run the PE side as native code. An x86_64 Wine never reads that
+directory.
+
 Common to both routes: `mtld3d.dll` + `mtld3d.so` are a custom-named Wine
 builtin pair — the PE half can only reach its unix half when loaded as a
 builtin, so there is no native variant of it. And Wine resolves builtin

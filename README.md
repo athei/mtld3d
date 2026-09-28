@@ -140,6 +140,30 @@ make check        # the pre-commit gate: fmt, clippy, audit, doc
 `make bundle` packs the release tarball and its debug symbols. Every other
 target and variable is documented in the Makefile beside its definition.
 
+`EC=1` adds an opt-in leg for an arm64 Wine. `EC=1 make` also builds
+`d3d9.dll` and `mtld3d.dll` as ARM64X images, whose ARM64EC half an x64 game
+runs as native code instead of translating it, and `EC=1 make install` puts
+them into `lib/wine/aarch64-windows` of the install tree, beside the
+`aarch64-unix` `mtld3d.so` every install carries. An arm64 Wine then loads
+them for x64 processes in prefixes created after the install; 32-bit games
+keep loading the i386 DLLs. `EC=1 make bundle` adds the pair to both
+archives and `EC=1 make check` lints both halves. Without `EC=1` no target
+builds, installs or checks any of it. The leg needs, beyond the above:
+
+- llvm-mingw, for its ARM64 and ARM64EC CRT, at `/opt/llvm-mingw` or where
+  `LLVM_MINGW` says.
+- LLD 23 or newer as `lld-link`, which Homebrew's `lld` formula provides
+  (`brew install lld`, the default `ARM64X_LLD`); an older LLD links an image
+  whose x64 view runs the ARM64 view's TLS callbacks.
+- The Rust targets `aarch64-pc-windows-msvc` and `arm64ec-pc-windows-msvc`,
+  which `EC=1 make setup-rust` adds.
+- Wine's ARM64X link archives, which the "ARM64X link libraries" step of
+  [wine-build](https://github.com/athei/wine-build) stages as
+  `dist/wine-arm64x` beside `dist/wine`. `WINE_SDK_ARM64X` names them and
+  defaults to `$WINE_SDK-arm64x`.
+
+The leg checks for each of these before it builds and names what is missing.
+
 ## Architecture
 
 ```

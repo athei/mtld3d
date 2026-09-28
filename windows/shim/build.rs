@@ -44,10 +44,20 @@ fn main() {
         .unwrap_or_else(|err| panic!("{lib_dir}/libwinecrt0.a: {err}"));
     let unix_lib_path =
         extract_unix_lib(&llvm_ar, &archive.to_string_lossy(), object_arch, &out_dir);
-    println!("cargo:rustc-link-arg-cdylib={unix_lib_path}");
 
-    // Preserve Wine's long DWARF section names without linker warnings.
-    println!("cargo:rustc-link-arg-cdylib=/ignore:longsections");
+    // The two ARM64X halves are built as static libraries and linked into one
+    // image by the Makefile, and cargo hands link arguments to a cdylib only.
+    // So for those the object travels inside the static library instead, as a
+    // native library rustc bundles into it; the link that follows pulls it in
+    // through the unix-call symbols the shim references.
+    if matches!(object_arch, "aarch64-windows" | "arm64ec-windows") {
+        bundle_unix_lib(&llvm_ar, &unix_lib_path, &out_dir);
+    } else {
+        println!("cargo:rustc-link-arg-cdylib={unix_lib_path}");
+
+        // Preserve Wine's long DWARF section names without linker warnings.
+        println!("cargo:rustc-link-arg-cdylib=/ignore:longsections");
+    }
 
     println!("cargo:rerun-if-env-changed=WINE_SDK");
     println!("cargo:rerun-if-env-changed=LLVM_AR");
@@ -55,14 +65,15 @@ fn main() {
 
 /// Extract `unix_lib.o` for `object_arch` from `archive` into `out_dir`.
 ///
-/// Returns the path of the extracted object. `llvm-ar` matches members by
-/// BASENAME, so the directory part of a member name selects nothing: an ARM64X
-/// `libwinecrt0.a` carries two `unix_lib.o` members (the ARM64 one and the EC
-/// one) and a plain `ar p <path>` would hand back whichever comes first. The
-/// stored names are read first, then the wanted one is pulled out by instance
-/// number, which is the only selector `ar` offers for a repeated name. Reading
-/// them also survives Wine moving winecrt0 between `dlls/` and `libs/`, which
-/// it has done before.
+/// Returns the path of the extracted object. An ARM64X `libwinecrt0.a` carries
+/// two `unix_lib.o` members, the ARM64 one and the EC one, under different
+/// directories. Without the `P` modifier `llvm-ar` compares basenames only and
+/// hands back the first member of that name whatever path it was asked for,
+/// and its `N` instance count is kept per stored path, so no count above one
+/// ever matches. So the stored names are read first, and the wanted member is
+/// extracted by its full stored name with `P`, which compares whole paths and
+/// still writes the object under its basename. Reading the names also survives
+/// Wine moving winecrt0 between `dlls/` and `libs/`, which it has done before.
 ///
 /// # Panics
 ///
@@ -79,27 +90,47 @@ fn extract_unix_lib(llvm_ar: &str, archive: &str, object_arch: &str, out_dir: &s
     );
     let listing = String::from_utf8(listing.stdout).expect("ar member names are UTF-8");
 
-    // 1-based instance number among the members sharing this basename, which is
-    // what `ar`'s `N` modifier counts.
-    let instance = listing
+    let member = listing
         .lines()
-        .filter(|member| member.ends_with("unix_lib.o"))
-        .position(|member| member.contains(&format!("{object_arch}/")))
-        .map_or_else(
-            || panic!("{archive} carries no {object_arch}/unix_lib.o"),
-            |index| index + 1,
-        );
+        .find(|member| member.ends_with(&format!("{object_arch}/unix_lib.o")))
+        .unwrap_or_else(|| panic!("{archive} carries no {object_arch}/unix_lib.o"));
 
     let status = std::process::Command::new(llvm_ar)
         .current_dir(out_dir)
-        .args(["xN", &instance.to_string(), archive, "unix_lib.o"])
+        .args(["xP", archive, member])
         .status()
         .expect("ar failed");
     assert!(
         status.success(),
-        "extracting unix_lib.o from {archive} failed"
+        "extracting {member} from {archive} failed"
     );
     format!("{out_dir}/unix_lib.o")
+}
+
+/// Wrap `unix_lib` in a COFF archive in `out_dir` and link it as a native library.
+///
+/// rustc bundles a native static library into a static library it builds, which
+/// is how the object reaches the ARM64X link. The COFF format is spelled out
+/// because `llvm-ar` would otherwise write the host's format, and it is the COFF
+/// writer that gives an ARM64EC member the EC symbol map the linker reads.
+///
+/// # Panics
+///
+/// If `llvm-ar` cannot write the archive.
+fn bundle_unix_lib(llvm_ar: &str, unix_lib: &str, out_dir: &str) {
+    let archive = format!("{out_dir}/wine_unix_lib.lib");
+    // `r` adds to an archive that exists, so a rerun starts from none.
+    let _ = std::fs::remove_file(&archive);
+    let status = std::process::Command::new(llvm_ar)
+        .args(["rcs", "--format=coff", &archive, unix_lib])
+        .status()
+        .expect("ar failed");
+    assert!(
+        status.success(),
+        "archiving {unix_lib} into {archive} failed"
+    );
+    println!("cargo:rustc-link-search=native={out_dir}");
+    println!("cargo:rustc-link-lib=static=wine_unix_lib");
 }
 
 /// Resolve the `llvm-ar` binary.
