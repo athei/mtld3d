@@ -287,16 +287,21 @@ so the two switches are not given together, and `EC=1 make bench-ab` needs a
 `BASE` whose Makefile has `windows-arm64x`: it stops with a message naming
 `BASE` otherwise. `make bench-variants` compares
 layouts instead of commits: this checkout's x86_64 build on the SDK's Wine
-against the same build on `WINE_ARM64` (`sdk-vs-arm64`), and with `EC=1` the
-x86_64 build against the ARM64X one on `WINE_ARM64` (`x86_64-vs-arm64x`), each
-pair a `bench-ab` run of its own whose report names each leg's runtime and DLL
-variant. Such a run has one commit in both legs, so a binary the two layouts
-share loads as one image, which the comparison notes instead of refusing, and
-the first pair runs two Wines. Read that first pair with care: it changes the
-host arch and the Wine build at once (the SDK is a patched CrossOver 26,
-`WINE_ARM64` a stock CrossOver 27), so its differences are not the arch's
-alone. The second pair runs one Wine in both legs and changes only our DLLs,
-so it measures what the ARM64X build buys an x64 game.
+against the same build on `WINE_ARM64` (`x86_64-sdk-vs-arm64`), and with
+`EC=1` the x86_64 build against the ARM64X one on `WINE_ARM64`
+(`x86_64-vs-arm64x`). `ARCH=i686` runs the first pair for the i686 build
+instead (`i686-sdk-vs-arm64`), the path World of Warcraft 1.12 and 3.3.5a
+take on an arm64 Wine, whose x86 translator runs our 32-bit DLLs; there is no
+ARM64X pair for it, since a 32-bit process never loads the ARM64X build. Every
+pair is a `bench-ab` run of its own whose report names each leg's runtime and
+DLL variant. Such a run has one commit in both legs, so a binary the two
+layouts share loads as one image, which the comparison notes instead of
+refusing, and the first pair runs two Wines. Read that first pair with care:
+it changes the host arch and the Wine build at once (the SDK is a patched
+CrossOver 26, `WINE_ARM64` a stock CrossOver 27), so its differences are not
+the arch's alone, for either arch. The ARM64X pair runs one Wine in both legs
+and changes only our DLLs, so it measures what the ARM64X build buys an x64
+game.
 
 `make bench-host` is the one benchmark that needs no Wine: it times DXSO
 parsing and MSL emission on this machine over two synthetic corpora and any

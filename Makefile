@@ -1529,7 +1529,12 @@ $(error a benchmark measures one layout: EC=1 benchmarks the ARM64X build and AR
 endif
 endif
 BENCH_LEG := $(if $(filter 1,$(EC)),arm64x,$(if $(filter 1,$(ARM64)),$(ARCH)))
-BENCH_ARCH := $(if $(or $(filter arm64x,$(BENCH_LEG)),$(filter bench-variants,$(MAKECMDGOALS))),x86_64,$(ARCH))
+# `bench-variants` compares the builds of one arch, x86_64 unless ARCH is given
+# (`ARCH=i686` for the 32-bit production path), and runs its ARM64X pair only
+# with the x86_64 binary.
+BENCH_VARIANTS_ARCH := $(if $(filter file,$(origin ARCH)),x86_64,$(ARCH))
+BENCH_VARIANTS_EC := $(if $(and $(EC_LEG),$(filter x86_64,$(BENCH_VARIANTS_ARCH))),arm64x)
+BENCH_ARCH := $(if $(filter bench-variants,$(MAKECMDGOALS)),$(BENCH_VARIANTS_ARCH),$(if $(filter arm64x,$(BENCH_LEG)),x86_64,$(ARCH)))
 BENCH_TARGET := $(if $(filter x86_64,$(BENCH_ARCH)),$(PE_x64),$(PE_i386))
 BENCH_EXES = $(if $(STAGE),$(STAGE)/tests/$(BENCH_ARCH)/*.exe,$(call E2E_EXES,$(BENCH_TARGET),--profile $(PROFILE)))
 BENCH_CONF := shaderCache.enable=false;color.hdr.enable=false
@@ -1768,27 +1773,30 @@ bench-ab:
 		$(if $(ACCEPT),--accept '$(ACCEPT)') $(BENCH_SAME_IMAGE) --report '$(BENCH_AB_OUT)/report.txt' -- $$suite
 
 # `make bench-variants` measures this checkout in two or three layouts
-# instead of two builds: its x86_64 build on the SDK's Wine (the tree
-# `bench-ab` gives its candidate), the same build on a clone of WINE_ARM64,
-# and with EC=1 the ARM64X build on another clone, each tree set up as the
-# arm64-runtime legs set theirs up. It runs the `bench-ab` machinery once per
-# pair of neighbouring layouts, each pair into a directory of its own under
-# `variants-<commit>-<time>` in the directory bench-ab writes to: `sdk-vs-arm64`
-# and, with EC=1, `x86_64-vs-arm64x`. Each pair is a layout comparison (the
-# runner's `--base-runtime` and the three flags beside it): one commit in both
-# legs, so a binary the two layouts share runs as one image and is noted, the
-# legs of two runtimes run two Wines, and the report names each leg's runtime
-# and DLL variant; `make bench-compare` judges a pair's directory again the
-# same way. BENCH_SET, RUNS, BENCH_CONFIG, ACCEPT and BENCH_WAIT_IDLE mean
-# what they mean for `bench-ab`; the host emitter benchmark does not run,
-# since no layout changes it.
+# instead of two builds: its build of one arch (x86_64 by default, i686 with
+# ARCH=i686) on the SDK's Wine (the tree `bench-ab` gives its candidate), the
+# same build on a clone of WINE_ARM64, and for x86_64 with EC=1 the ARM64X
+# build on another clone, each tree set up as the arm64-runtime legs set theirs
+# up. It runs the `bench-ab` machinery once per pair of neighbouring layouts,
+# each pair into a directory of its own under `variants-<commit>-<time>` in the
+# directory bench-ab writes to: `<arch>-sdk-vs-arm64` and, for x86_64 with
+# EC=1, `x86_64-vs-arm64x`. The i686 pair is the path the 32-bit games take on
+# an arm64 Wine, where the translator runs our i686 build. Each pair is a
+# layout comparison (the runner's `--base-runtime` and the three flags beside
+# it): one commit in both legs, so a binary the two layouts share runs as one
+# image and is noted, the legs of two runtimes run two Wines, and the report
+# names each leg's runtime and DLL variant; `make bench-compare` judges a
+# pair's directory again the same way. BENCH_SET, RUNS, BENCH_CONFIG, ACCEPT
+# and BENCH_WAIT_IDLE mean what they mean for `bench-ab`; the host emitter
+# benchmark does not run, since no layout changes it.
 #
 # The two pairs answer different questions. The first mixes two things: the
 # arch of the host Wine and which Wine build it is (the SDK is a patched
 # CrossOver 26, WINE_ARM64 is whatever it names, a stock CrossOver 27 on the
 # machines this was written for), so a difference there is not the arch's
-# alone. The second runs one Wine in both legs and changes only our DLLs, so
-# it isolates what the ARM64X build buys an x64 game.
+# alone; that holds for the i686 pair as it does for the x86_64 one. The
+# ARM64X pair runs one Wine in both legs and changes only our DLLs, so it
+# isolates what the ARM64X build buys an x64 game.
 ifneq ($(filter bench-variants,$(MAKECMDGOALS)),)
 ifeq ($(strip $(BENCH_SET)),)
 $(error BENCH_SET is wow, full or a list of test-name filters, not empty)
@@ -1810,7 +1818,7 @@ $(E2E_RUNNER) bench-ab --out '$(1)' --runs $(RUNS) --timeout $(BENCH_TIMEOUT) \
 	$(if $(ACCEPT),--accept '$(ACCEPT)') --report '$(1)/report.txt' -- $$suite
 endef
 # The three trees, and the stop of their servers.
-BENCH_VARIANT_TREES = $(ISOLATED_ROOT) $(call arm64_root,x86_64) $(if $(EC_LEG),$(call arm64_root,arm64x))
+BENCH_VARIANT_TREES = $(ISOLATED_ROOT) $(call arm64_root,$(BENCH_VARIANTS_ARCH)) $(if $(BENCH_VARIANTS_EC),$(call arm64_root,arm64x))
 define BENCH_VARIANTS_STOP
 stop_servers() { for tree in $(foreach t,$(BENCH_VARIANT_TREES),'$(t)'); do \
 	[ -x "$$tree/sdk/bin/wineserver" ] && WINEPREFIX="$$tree/prefix" "$$tree/sdk/bin/wineserver" -k >/dev/null 2>&1 ; \
@@ -1825,12 +1833,13 @@ bench-variants:
 	# The build, and the SDK tree, which the install into the isolated SDK
 	# clone makes; the arm64 installs below take the same build from its
 	# output directories and build nothing.
-	$(BENCH_SUBMAKE) $(BENCH_LEG_MAKE) install-windows-x86_64 install-unix-$(SDK_UNIX_ARCH) windows-i686 unix-arm64 \
-		$(EC_LEG:%=windows-%) > '$(BENCH_VARIANTS_OUT)/build.log' 2>&1 || \
+	$(if $(and $(EC_LEG),$(if $(BENCH_VARIANTS_EC),,1)),echo "make bench-variants: the ARM64X pair runs the x86_64 binary; ARCH=$(BENCH_VARIANTS_ARCH) runs its sdk-vs-arm64 pair alone")
+	$(BENCH_SUBMAKE) $(BENCH_LEG_MAKE) install-windows-$(BENCH_VARIANTS_ARCH) install-unix-$(SDK_UNIX_ARCH) windows-i686 windows-x86_64 unix-arm64 \
+		$(BENCH_VARIANTS_EC:%=windows-%) > '$(BENCH_VARIANTS_OUT)/build.log' 2>&1 || \
 		{ echo "make bench-variants: the build failed; the end of $(BENCH_VARIANTS_OUT)/build.log:" >&2; tail -n 40 '$(BENCH_VARIANTS_OUT)/build.log' >&2; exit 2; }
 	$(BENCH_SUBMAKE) $(call BENCH_LEG_CONFIGURE,$(ISOLATED_ROOT)) > '$(BENCH_VARIANTS_OUT)/configure-sdk.log' 2>&1 & sdk=$$!; \
-		( $(call ARM64_TREE_SETUP,$(call arm64_root,x86_64),$(call bench_outputs,$(CURDIR)) $(call arm64_install_args,x86_64,$(call arm64_sdk,x86_64))) ) > '$(BENCH_VARIANTS_OUT)/configure-arm64.log' 2>&1 & arm64=$$!; \
-		$(if $(EC_LEG),( $(call ARM64_TREE_SETUP,$(call arm64_root,arm64x),$(call bench_outputs,$(CURDIR)) $(call arm64_install_args,arm64x,$(call arm64_sdk,arm64x))) ) > '$(BENCH_VARIANTS_OUT)/configure-arm64x.log' 2>&1 & arm64x=$$!;,arm64x=;) \
+		( $(call ARM64_TREE_SETUP,$(call arm64_root,$(BENCH_VARIANTS_ARCH)),$(call bench_outputs,$(CURDIR)) $(call arm64_install_args,$(BENCH_VARIANTS_ARCH),$(call arm64_sdk,$(BENCH_VARIANTS_ARCH)))) ) > '$(BENCH_VARIANTS_OUT)/configure-arm64.log' 2>&1 & arm64=$$!; \
+		$(if $(BENCH_VARIANTS_EC),( $(call ARM64_TREE_SETUP,$(call arm64_root,arm64x),$(call bench_outputs,$(CURDIR)) $(call arm64_install_args,arm64x,$(call arm64_sdk,arm64x))) ) > '$(BENCH_VARIANTS_OUT)/configure-arm64x.log' 2>&1 & arm64x=$$!;,arm64x=;) \
 		( $(BENCH_SUITE_ASSIGN) && cd $(E2E_RUNNER_DIR) && $(E2E_RUNNER_BUILD) ); built=$$?; \
 		failed=0; for job in sdk:$$sdk arm64:$$arm64 $${arm64x:+arm64x:$$arm64x}; do \
 			wait $${job#*:} || { failed=1; echo "make bench-variants: setting up the $${job%%:*} tree failed; the end of $(BENCH_VARIANTS_OUT)/configure-$${job%%:*}.log:" >&2; tail -n 40 '$(BENCH_VARIANTS_OUT)'/configure-$${job%%:*}.log >&2; } ; \
@@ -1840,9 +1849,9 @@ bench-variants:
 	$(BENCH_SUITE_ASSIGN); \
 	$(ARM64_BENCH_SUITE_COPY) && \
 	cd $(E2E_RUNNER_DIR) && export WINEDEBUG= MTL_DEBUG_LAYER=0 MTL_HUD_ENABLED=0 && \
-	$(call bench_variant_pair,$(BENCH_VARIANTS_OUT)/sdk-vs-arm64,$(ISOLATED_ROOT),$(call arm64_root,x86_64),sdk,arm64,x86_64,x86_64); \
+	$(call bench_variant_pair,$(BENCH_VARIANTS_OUT)/$(BENCH_VARIANTS_ARCH)-sdk-vs-arm64,$(ISOLATED_ROOT),$(call arm64_root,$(BENCH_VARIANTS_ARCH)),sdk,arm64,$(BENCH_VARIANTS_ARCH),$(BENCH_VARIANTS_ARCH)); \
 	status=$$?; \
-	$(if $(EC_LEG),$(call bench_variant_pair,$(BENCH_VARIANTS_OUT)/x86_64-vs-arm64x,$(call arm64_root,x86_64),$(call arm64_root,arm64x),arm64,arm64,x86_64,arm64x); \
+	$(if $(BENCH_VARIANTS_EC),$(call bench_variant_pair,$(BENCH_VARIANTS_OUT)/x86_64-vs-arm64x,$(call arm64_root,x86_64),$(call arm64_root,arm64x),arm64,arm64,x86_64,arm64x); \
 	second=$$?; [ $$second -le $$status ] || status=$$second; )\
 	echo "make bench-variants: reports under $(BENCH_VARIANTS_OUT)"; exit $$status
 
