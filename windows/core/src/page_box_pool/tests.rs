@@ -7,9 +7,16 @@
 //! `pooled_bytes` across transitions, pinning the lock-free gauge to the parked set. The cap
 //! moves after construction: a pool built disabled parks once it is given a budget, and stops
 //! again when the budget is taken away.
+//!
+//! The texture staging lane is covered the same way: a same-size box comes back with its pages
+//! and generation, the two lanes never serve each other, the staging share and the shared cap
+//! both refuse, the class limit applies, a box with another owner or a counted reader is never
+//! parked, and draining the lane frees only staging.
 
-use super::{MAX_POOL_CLASSES, PageBoxPool};
-use crate::page_box::{PAGE_SIZE, PageBox};
+use std::sync::Arc;
+
+use super::{MAX_POOL_CLASSES, PageBoxPool, STAGING_SHARE_DIVISOR};
+use crate::page_box::{PAGE_SIZE, PageBox, PageBoxRead};
 
 #[test]
 fn disabled_pool_never_stores() {
@@ -120,13 +127,16 @@ fn diagnostics_partition_acquire_and_recycle_outcomes() {
     assert!(pool.recycle(PageBox::new_uninit(PAGE_SIZE)).is_some());
     assert!(pool.acquire(PAGE_SIZE).is_some());
     assert!(pool.acquire(PAGE_SIZE).is_none());
-    let summary = pool.inner.lock().unwrap().diagnostics.summary();
+    let summary = pool.diagnostics_summary();
     assert_eq!(
         summary,
         format!(
             "pagebox-pool cumulative: hit=1 empty=2 oversize=1 disabled=1 \
          oversize_requested_bytes={oversized} largest_oversize_request={oversized} \
-         recycle_parked=1 recycle_cap=1 recycle_oversize=1 recycle_disabled=1"
+         recycle_parked=1 recycle_cap=1 recycle_oversize=1 recycle_disabled=1 \
+         staging: pagebox-pool cumulative: hit=0 empty=0 oversize=0 disabled=0 \
+         oversize_requested_bytes=0 largest_oversize_request=0 \
+         recycle_parked=0 recycle_cap=0 recycle_oversize=0 recycle_disabled=0"
         )
     );
 }
@@ -145,11 +155,187 @@ fn diagnostics_keep_concurrent_acquire_totals() {
         }
     });
     assert!(
-        pool.inner
-            .lock()
-            .unwrap()
-            .diagnostics
-            .summary()
-            .contains("hit=0 empty=128 oversize=0")
+        pool.diagnostics_summary()
+            .starts_with("pagebox-pool cumulative: hit=0 empty=128 oversize=0")
     );
+}
+
+#[test]
+fn staging_reuses_a_same_size_box_with_its_pages_and_generation() {
+    let pool = PageBoxPool::new(usize::MAX);
+    let backing = Arc::new(PageBox::new_uninit(3 * PAGE_SIZE));
+    let (ptr, generation) = (backing.as_ptr(), backing.generation());
+    assert!(pool.recycle_staging(backing), "the last owner parks");
+    assert_eq!(pool.staging_bytes(), 3 * PAGE_SIZE);
+    assert_eq!(pool.pooled_bytes(), 3 * PAGE_SIZE);
+    assert!(
+        pool.acquire_staging(PAGE_SIZE).is_none(),
+        "another class misses"
+    );
+    let hit = pool
+        .acquire_staging(2 * PAGE_SIZE + 5)
+        .expect("same padded class");
+    assert_eq!(hit.as_ptr(), ptr);
+    assert_eq!(
+        hit.generation(),
+        generation,
+        "parked pages were never freed"
+    );
+    assert_eq!(hit.len(), 3 * PAGE_SIZE);
+    assert_eq!(hit.logical_len(), 2 * PAGE_SIZE + 5);
+    assert!(!hit.has_readers());
+    assert_eq!(pool.staging_bytes(), 0);
+    assert_eq!(pool.pooled_bytes(), 0);
+}
+
+#[test]
+fn the_lanes_never_serve_each_other() {
+    let pool = PageBoxPool::new(usize::MAX);
+    assert!(pool.recycle(PageBox::new_uninit(PAGE_SIZE)).is_none());
+    assert!(pool.acquire_staging(PAGE_SIZE).is_none());
+    assert!(pool.recycle_staging(Arc::new(PageBox::new_uninit(2 * PAGE_SIZE))));
+    assert!(pool.acquire(2 * PAGE_SIZE).is_none());
+    assert_eq!(pool.pooled_bytes(), 3 * PAGE_SIZE);
+    assert!(pool.acquire(PAGE_SIZE).is_some());
+    assert!(pool.acquire_staging(2 * PAGE_SIZE).is_some());
+}
+
+#[test]
+fn staging_stops_at_its_share_while_buffers_keep_the_rest_of_the_cap() {
+    let cap = 8 * PAGE_SIZE;
+    let share = cap / STAGING_SHARE_DIVISOR;
+    let pool = PageBoxPool::new(cap);
+    for _ in 0..share / PAGE_SIZE {
+        assert!(pool.recycle_staging(Arc::new(PageBox::new_uninit(PAGE_SIZE))));
+    }
+    assert!(
+        !pool.recycle_staging(Arc::new(PageBox::new_uninit(PAGE_SIZE))),
+        "the staging share is full"
+    );
+    assert_eq!(pool.staging_bytes(), share);
+    for _ in 0..(cap - share) / PAGE_SIZE {
+        assert!(pool.recycle(PageBox::new_uninit(PAGE_SIZE)).is_none());
+    }
+    assert!(
+        pool.recycle(PageBox::new_uninit(PAGE_SIZE)).is_some(),
+        "the shared cap is full"
+    );
+    assert_eq!(pool.pooled_bytes(), cap);
+}
+
+#[test]
+fn staging_is_refused_once_buffers_fill_the_shared_cap() {
+    let pool = PageBoxPool::new(8 * PAGE_SIZE);
+    for _ in 0..8 {
+        assert!(pool.recycle(PageBox::new_uninit(PAGE_SIZE)).is_none());
+    }
+    assert!(!pool.recycle_staging(Arc::new(PageBox::new_uninit(PAGE_SIZE))));
+    assert_eq!(pool.staging_bytes(), 0);
+    assert_eq!(pool.pooled_bytes(), 8 * PAGE_SIZE);
+}
+
+#[test]
+fn staging_keeps_the_class_limit() {
+    let pool = PageBoxPool::new(usize::MAX);
+    assert!(pool.recycle_staging(Arc::new(PageBox::new_uninit(MAX_POOL_CLASSES * PAGE_SIZE))));
+    assert!(pool.acquire_staging(MAX_POOL_CLASSES * PAGE_SIZE).is_some());
+    let jumbo = (MAX_POOL_CLASSES + 1) * PAGE_SIZE;
+    assert!(!pool.recycle_staging(Arc::new(PageBox::new_uninit(jumbo))));
+    assert!(pool.acquire_staging(jumbo).is_none());
+    assert_eq!(pool.staging_bytes(), 0);
+}
+
+#[test]
+fn staging_with_another_owner_or_reader_is_not_parked() {
+    let pool = PageBoxPool::new(usize::MAX);
+    let texture = Arc::new(PageBox::new_uninit(PAGE_SIZE));
+    let upload = Arc::clone(&texture);
+    assert!(!pool.recycle_staging(texture), "the upload still owns it");
+    assert_eq!(pool.staging_bytes(), 0);
+    assert!(
+        pool.acquire_staging(PAGE_SIZE).is_none(),
+        "nothing to hand out"
+    );
+    let read = PageBoxRead::new(upload);
+    assert!(read.backing().has_readers());
+    assert!(!pool.recycle_staging(Arc::clone(read.backing())));
+    assert!(pool.acquire_staging(PAGE_SIZE).is_none());
+    let backing = Arc::clone(read.backing());
+    drop(read);
+    assert!(
+        pool.recycle_staging(backing),
+        "the reader's end frees the last owner"
+    );
+    assert!(pool.acquire_staging(PAGE_SIZE).is_some());
+}
+
+#[test]
+fn a_disabled_pool_parks_no_staging_and_the_take_counts_nothing() {
+    let pool = PageBoxPool::new(0);
+    assert!(!pool.recycle_staging(Arc::new(PageBox::new_uninit(PAGE_SIZE))));
+    let mut take = pool.take_staging();
+    let page = take.take(PAGE_SIZE);
+    assert_eq!(page.logical_len(), PAGE_SIZE);
+    assert_eq!(take.finish(), (0, 0));
+}
+
+#[test]
+fn the_take_counts_hits_and_misses_and_a_miss_allocates() {
+    let pool = PageBoxPool::new(usize::MAX);
+    let mut take = pool.take_staging();
+    let first = take.take(PAGE_SIZE);
+    assert_eq!(take.finish(), (0, 1));
+    let ptr = first.as_ptr();
+    assert!(pool.recycle_staging(Arc::new(first)));
+    let mut take = pool.take_staging();
+    let reused = take.take(100);
+    assert_eq!(reused.as_ptr(), ptr);
+    assert_eq!(reused.logical_len(), 100);
+    let fresh = take.take(PAGE_SIZE);
+    assert_ne!(fresh.as_ptr(), ptr);
+    assert_eq!(take.finish(), (1, 1));
+    assert_eq!(pool.pooled_bytes(), 0);
+}
+
+#[test]
+fn one_take_serves_every_level_of_a_create_under_one_lock() {
+    let pool = PageBoxPool::new(usize::MAX);
+    let levels = [4 * PAGE_SIZE, 2 * PAGE_SIZE, PAGE_SIZE, PAGE_SIZE];
+    let mut parked = Vec::new();
+    for &len in &levels {
+        let pb = PageBox::new_uninit(len);
+        parked.push(pb.as_ptr());
+        assert!(pool.recycle_staging(Arc::new(pb)));
+    }
+    let mut take = pool.take_staging();
+    let mut taken: Vec<PageBox> = levels.iter().map(|&len| take.take(len)).collect();
+    // A fifth level no box was parked for falls through to the allocator.
+    taken.push(take.take(8 * PAGE_SIZE));
+    assert_eq!(take.finish(), (4, 1));
+    // The lock is free again once the take has finished.
+    assert_eq!(pool.staging_bytes(), 0);
+    assert_eq!(pool.pooled_bytes(), 0);
+    // Same-class boxes come back last parked first.
+    assert_eq!(taken[0].as_ptr(), parked[0]);
+    assert_eq!(taken[1].as_ptr(), parked[1]);
+    assert_eq!(taken[2].as_ptr(), parked[3]);
+    assert_eq!(taken[3].as_ptr(), parked[2]);
+}
+
+#[test]
+fn draining_frees_only_the_staging_lane() {
+    let pool = PageBoxPool::new(usize::MAX);
+    assert!(pool.recycle(PageBox::new_uninit(PAGE_SIZE)).is_none());
+    for pages in [1, 2, 2] {
+        assert!(pool.recycle_staging(Arc::new(PageBox::new_uninit(pages * PAGE_SIZE))));
+    }
+    assert_eq!(pool.drain_staging(), 5 * PAGE_SIZE);
+    assert_eq!(pool.staging_bytes(), 0);
+    assert_eq!(pool.pooled_bytes(), PAGE_SIZE);
+    assert!(pool.acquire_staging(2 * PAGE_SIZE).is_none());
+    assert!(
+        pool.acquire(PAGE_SIZE).is_some(),
+        "the buffer lane is untouched"
+    );
+    assert_eq!(pool.drain_staging(), 0);
 }

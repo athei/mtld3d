@@ -72,7 +72,7 @@ impl FrameRecorder {
         Self::with_completion_pool(crate::guest_completions::CompletionPool::new())
     }
 
-    /// Set the original runtime's pool for retired VB/IB allocations.
+    /// Set the original runtime's pool for retired VB/IB allocations and texture staging.
     pub const fn set_pagebox_pool(&mut self, pool: &'static crate::page_box_pool::PageBoxPool) {
         self.pagebox_pool = Some(pool);
     }

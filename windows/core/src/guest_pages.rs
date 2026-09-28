@@ -18,6 +18,7 @@ use crate::{
     encoder_value::WireValue,
     guest_completions::{CompletionPool, CompletionSlot, LeaseCells},
     page_box::{PAGE_SIZE, PageBox, PageBoxRead},
+    page_box_pool::PageBoxPool,
 };
 
 mod owned;
@@ -32,6 +33,8 @@ pub struct GuestPageLease {
     owner: Arc<PageBox>,
     read: Option<PageBoxRead>,
     cells: LeaseCells,
+    /// Staging lane the owner is offered to once native ownership has ended.
+    recycle_pool: Option<&'static PageBoxPool>,
 }
 
 impl GuestPageLease {
@@ -42,15 +45,24 @@ impl GuestPageLease {
             owner: Arc::clone(read.backing()),
             read: Some(read),
             cells: LeaseCells::default(),
+            recycle_pool: None,
         }
     }
 
+    /// A pooled read lease whose owner is offered to `recycle_pool` at retirement.
+    ///
+    /// The offer parks the pages only when this lease held their last owner.
     #[must_use]
-    pub fn for_read_pooled(read: PageBoxRead, pool: &CompletionPool) -> Self {
+    pub fn for_read_pooled(
+        read: PageBoxRead,
+        pool: &CompletionPool,
+        recycle_pool: Option<&'static PageBoxPool>,
+    ) -> Self {
         Self {
             owner: Arc::clone(read.backing()),
             read: Some(read),
             cells: LeaseCells::Pooled(pool.allocate(true)),
+            recycle_pool,
         }
     }
 
@@ -59,10 +71,27 @@ impl GuestPageLease {
         self.cells.token()
     }
 
-    /// Return mailbox storage after retirement.
+    /// Return mailbox storage after retirement, offering the owner to the staging lane.
+    ///
+    /// The owner is offered only once both acknowledgments were observed, so native code has
+    /// dropped every adopted page, wrapper keepalive and reader of these bytes, after its
+    /// wrapper destroys and the GPU completion that gates them. Before that, or without a
+    /// pool, the owner drops as before.
     #[must_use]
     pub fn into_slot(self) -> Option<CompletionSlot> {
-        self.cells.into_slot()
+        let Self {
+            owner,
+            read,
+            cells,
+            recycle_pool,
+        } = self;
+        drop(read);
+        if let Some(pool) = recycle_pool
+            && cells.reusable()
+        {
+            pool.recycle_staging(owner);
+        }
+        cells.into_slot()
     }
 
     /// Describe one native adoption while this PE lease remains retained.

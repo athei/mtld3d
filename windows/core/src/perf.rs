@@ -860,6 +860,13 @@ struct FrameCounters {
     ///
     /// So they skipped the snapshot rebuild (the `keys` bucket work).
     keys_gate_skips: [u32; KeysGate::COUNT],
+    /// Texture staging allocations served warm from the page-box pool's staging lane.
+    ///
+    /// With `texture_pool_misses` this renders the textures `pool` row. Both
+    /// stay 0 while the pool is disabled (`memory.pageboxPoolCapMB = 0`).
+    texture_pool_hits: u32,
+    /// Pool-enabled texture staging allocations that fell through to the allocator.
+    texture_pool_misses: u32,
     reserved: u32,
 }
 
@@ -875,6 +882,8 @@ impl FrameCounters {
     const fn new() -> Self {
         Self {
             reserved: 0,
+            texture_pool_hits: 0,
+            texture_pool_misses: 0,
             reset_epoch: 0,
             reset_epoch_saturated: 0,
             inverse_view: [0; 3],
@@ -1536,6 +1545,13 @@ impl ApiPerfState {
         self.counters.texture_discards = self.counters.texture_discards.saturating_add(1);
     }
 
+    /// Add one call's texture staging pool outcomes (see `StagingTake`).
+    pub const fn add_texture_pool_outcomes(&mut self, hits: u32, misses: u32) {
+        self.counters.texture_pool_hits = self.counters.texture_pool_hits.saturating_add(hits);
+        self.counters.texture_pool_misses =
+            self.counters.texture_pool_misses.saturating_add(misses);
+    }
+
     /// Drain this frame's API-thread counters into the outgoing payload, then zero self.
     ///
     /// Also samples `rdtsc()` and computes `frame_total_cycles` as the
@@ -1647,6 +1663,8 @@ impl ApiPerfState {
     pub const fn bump_texture_rename(&mut self) {}
     #[inline]
     pub const fn bump_texture_discard(&mut self) {}
+    #[inline]
+    pub const fn add_texture_pool_outcomes(&mut self, _hits: u32, _misses: u32) {}
 
     #[inline]
     pub const fn drain_into_payload(&mut self, _payload: &mut FramePerfPayload) {}
@@ -2962,6 +2980,8 @@ struct PerfWindow {
     vbib_retained_bytes: Stat,
     texture_renames: Stat,
     texture_discards: Stat,
+    texture_pool_hits: Stat,
+    texture_pool_misses: Stat,
     /// No GPU analog (texture staging is PE-side, `MTLTexture` handles aren't swapped on rename).
     texture_preserve_cpu: Stat,
     /// Contended partial texture Locks handed back in place (sum only).
@@ -3198,6 +3218,10 @@ impl PerfWindow {
             .add(u64::from(s.counters.texture_renames));
         self.texture_discards
             .add(u64::from(s.counters.texture_discards));
+        self.texture_pool_hits
+            .add(u64::from(s.counters.texture_pool_hits));
+        self.texture_pool_misses
+            .add(u64::from(s.counters.texture_pool_misses));
         self.texture_preserve_cpu
             .add(u64::from(s.counters.texture_preserve_cpu));
         self.texture_write_in_place_contended
@@ -5053,6 +5077,22 @@ impl<'a> Summary<'a> {
             None,
             "API: contended partial Lock handed back live (kept divergence; no rename, no stall)",
         );
+        // Staging-lane effectiveness; all-zero while the pool is off.
+        let tex_pool_hits = w.texture_pool_hits.sum;
+        let tex_pool_misses = w.texture_pool_misses.sum;
+        let tex_pool_lookups = tex_pool_hits + tex_pool_misses;
+        let tex_pool_hit_pct = if tex_pool_lookups > 0 {
+            u64_to_f64_exact(tex_pool_hits) / u64_to_f64_exact(tex_pool_lookups) * 100.0
+        } else {
+            0.0
+        };
+        self.res_row(
+            out,
+            "pool",
+            &format!("hit={tex_pool_hits} miss={tex_pool_misses} ({tex_pool_hit_pct:.1}%)"),
+            None,
+            "API: staging pops a warm same-size PageBox; last owners park retired staging",
+        );
         // `uploads = raw + padded + pass`: every Unlock takes one of the
         // three paths. `raw` is the cheap blit (cached `bytesNoCopy` wrapper
         // around the game's PageBox). `padded` is a blit too, but its
@@ -5734,6 +5774,8 @@ fn render_kv(w: &PerfWindow, caches: &CacheSizes, window_secs: f64) -> KvLine {
     // Resources (textures).
     kv.total("tex_rename", w.texture_renames.sum);
     kv.total("tex_discard", w.texture_discards.sum);
+    kv.total("tex_pool_hit", w.texture_pool_hits.sum);
+    kv.total("tex_pool_miss", w.texture_pool_misses.sum);
     kv.total("tex_preserve_cpu", w.texture_preserve_cpu.sum);
     kv.total("tex_in_place", w.texture_write_in_place_contended.sum);
     kv.total("tex_uploads", w.texture_blit_uploads.sum);
@@ -5810,7 +5852,7 @@ mod tests;
 
 #[cfg(perf_tracking)]
 const _: () = {
-    assert!(size_of::<FrameCounters>() == 616);
+    assert!(size_of::<FrameCounters>() == 624);
     assert!(align_of::<FrameCounters>() == 8);
     assert!(core::mem::offset_of!(FrameCounters, reset_epoch) == 0);
     assert!(core::mem::offset_of!(FrameCounters, inverse_view) == 8);
@@ -5852,15 +5894,17 @@ const _: () = {
     assert!(core::mem::offset_of!(FrameCounters, surface_sub_calls) == 520);
     assert!(core::mem::offset_of!(FrameCounters, keys_gate_calls) == 540);
     assert!(core::mem::offset_of!(FrameCounters, keys_gate_skips) == 576);
-    assert!(core::mem::offset_of!(FrameCounters, reserved) == 612);
+    assert!(core::mem::offset_of!(FrameCounters, texture_pool_hits) == 612);
+    assert!(core::mem::offset_of!(FrameCounters, texture_pool_misses) == 616);
+    assert!(core::mem::offset_of!(FrameCounters, reserved) == 620);
     assert!(size_of::<FrameTiming>() == 32);
     assert!(align_of::<FrameTiming>() == 8);
     assert!(core::mem::offset_of!(FrameTiming, present_block_cycles) == 0);
     assert!(core::mem::offset_of!(FrameTiming, frame_total_cycles) == 8);
     assert!(core::mem::offset_of!(FrameTiming, op_vec_capacity_bytes) == 16);
     assert!(core::mem::offset_of!(FrameTiming, op_vec_realloc_bytes) == 24);
-    assert!(size_of::<FramePerfPayload>() == 648);
+    assert!(size_of::<FramePerfPayload>() == 656);
     assert!(align_of::<FramePerfPayload>() == 8);
     assert!(core::mem::offset_of!(FramePerfPayload, counters) == 0);
-    assert!(core::mem::offset_of!(FramePerfPayload, timing) == 616);
+    assert!(core::mem::offset_of!(FramePerfPayload, timing) == 624);
 };

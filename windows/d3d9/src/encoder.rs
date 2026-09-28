@@ -373,6 +373,11 @@ impl EncoderThread {
         // SAFETY: native destruction joined every worker and retired GPU references, so
         // no native user or publisher remains.
         unsafe { retirement.cancel_after_quiescence(&self.completions) };
+        // Every staging lease this device handed over has retired above, so no native
+        // reference to a parked staging box remains; free them rather than keep committed
+        // pages for a texture set that has gone with its device. The lane is process-wide,
+        // so boxes other live devices parked go too; they only lose warm pages.
+        crate::page_box_pool::PAGEBOX_POOL.drain_staging();
         Ok(())
     }
 }

@@ -107,7 +107,8 @@ fn pooled_read_handoff_retains_owner_through_cached_native_reference() {
     let pool = CompletionPool::new();
     let mut cursor = CompletionDrain::default();
     let owner = Arc::new(PageBox::new_zeroed(8));
-    let mut lease = GuestPageLease::for_read_pooled(PageBoxRead::new(Arc::clone(&owner)), &pool);
+    let mut lease =
+        GuestPageLease::for_read_pooled(PageBoxRead::new(Arc::clone(&owner)), &pool, None);
     // SAFETY: lease keeps its original reader, backing and cells alive through adoption.
     let native = unsafe { lease.descriptor().adopt_read() }.expect("native read");
     assert!(!lease.maintain());
@@ -139,7 +140,8 @@ fn rejected_pooled_read_consumes_both_events_before_recycling() {
     let pool = CompletionPool::new();
     let mut cursor = CompletionDrain::default();
     let owner = Arc::new(PageBox::new_zeroed(8));
-    let mut lease = GuestPageLease::for_read_pooled(PageBoxRead::new(Arc::clone(&owner)), &pool);
+    let mut lease =
+        GuestPageLease::for_read_pooled(PageBoxRead::new(Arc::clone(&owner)), &pool, None);
     // SAFETY: descriptor has never been adopted and cannot reach native code.
     unsafe { lease.descriptor().cancel_unadopted() }.expect("cancel");
     pool.drain(&mut cursor, 1, |_| {});

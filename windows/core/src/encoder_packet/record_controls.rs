@@ -172,12 +172,11 @@ fn write_rects<T: CommandRecord>(
 fn capture_upload(
     job: TextureUploadJob,
     destination: &mut [u8],
-    pages: &mut Vec<GuestPageLease>,
-    redirties: &mut Vec<GuestRedirtyLease>,
-    pool: &crate::guest_completions::CompletionPool,
+    owners: &mut CaptureOwners<'_>,
     mip_texture: u64,
     mip_flags: u32,
 ) -> Result<(), WireError> {
+    let pool = owners.completion_pool;
     let declined = crate::upload_redirty::RedirtyEntry {
         subresource: job.redirty_subresource(),
         face: job.destination_slice,
@@ -187,10 +186,10 @@ fn capture_upload(
     let emitted = job.emitted_answer();
     let lease = GuestRedirtyLease::new_pooled(job.redirty, declined, emitted, pool);
     let redirty = lease.descriptor();
-    redirties.push(lease);
-    let lease = GuestPageLease::for_read_pooled(job.staging, pool);
+    owners.redirties.push(lease);
+    let lease = GuestPageLease::for_read_pooled(job.staging, pool, owners.pagebox_pool);
     let page = lease.descriptor();
-    pages.push(lease);
+    owners.pages.push(lease);
     let staging_index = u32::try_from(job.staging_index).map_err(|_| WireError::TooLarge)?;
     crate::encoder_records::write(
         destination,
@@ -753,6 +752,8 @@ struct CaptureOwners<'a> {
     replies_u64: &'a mut Vec<ReplyU64>,
     replies_bool: &'a mut Vec<ReplyBool>,
     completion_pool: &'a crate::guest_completions::CompletionPool,
+    /// Where texture upload leases offer their staging at retirement, when the runtime has a pool.
+    pagebox_pool: Option<&'static crate::page_box_pool::PageBoxPool>,
 }
 
 impl FrameRecorder {
@@ -772,6 +773,7 @@ impl FrameRecorder {
             replies_u64: &mut self.replies_u64,
             replies_bool: &mut self.replies_bool,
             completion_pool: &self.completion_pool,
+            pagebox_pool: self.pagebox_pool,
         };
         let result = scratch.push_fixed_record(tag.into(), 0, size_of::<R>(), |destination| {
             build(
@@ -972,15 +974,7 @@ capture_resource!(
     v,
     destination,
     owners,
-    capture_upload(
-        v.job,
-        destination,
-        owners.pages,
-        owners.redirties,
-        owners.completion_pool,
-        0,
-        0
-    )
+    capture_upload(v.job, destination, owners, 0, 0)
 );
 capture_resource!(
     UploadTextureAndMipsOp,
@@ -992,9 +986,7 @@ capture_resource!(
     capture_upload(
         v.job,
         destination,
-        owners.pages,
-        owners.redirties,
-        owners.completion_pool,
+        owners,
         v.texture_id.raw(),
         u32::from(v.flags.bits())
     )

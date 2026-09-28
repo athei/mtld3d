@@ -1,13 +1,17 @@
+use std::sync::Arc;
+
 use mtld3d_shared::encoder_protocol::EncoderOpcode;
 
 use super::*;
 use crate::{
-    encoder_data::StageUploadOp,
+    encoder_data::{StageUploadOp, TextureInfo, TextureUploadJob, UploadTextureOp},
     encoder_packet::tests::{admit, empty_frame, replay, seal},
-    encoder_records::{StageUploadRecord, borrow},
+    encoder_records::{StageUploadRecord, TextureUploadRecord, borrow},
     guest_pages::GuestOwnedPage,
     ids::BufferId,
-    page_box::PageBox,
+    page_box::{PAGE_SIZE, PageBox, PageBoxRead},
+    page_box_pool::PageBoxPool,
+    upload_redirty::RedirtyQueue,
 };
 
 #[derive(Default, Debug, PartialEq, Eq)]
@@ -310,4 +314,193 @@ fn a_replay_completion_another_drain_consumed_is_maintained_at_the_push() {
         pages.acquire(12).expect("freed at the push").as_ptr(),
         address
     );
+}
+
+/// A packet uploading all of `staging`'s level through a pooled lease offered to `pages`.
+fn staging_upload_packet(
+    pool: &CompletionPool,
+    pages: &'static PageBoxPool,
+    staging: &Arc<PageBox>,
+) -> FramePacket {
+    use mtld3d_shared::mtl::{PixelFormat, Swizzle, TextureCreateFlags, TextureUsage};
+    use mtld3d_types::D3DFMT_A8R8G8B8;
+
+    let mut frame = empty_frame();
+    let mut recorder = FrameRecorder::with_completion_pool(pool.clone());
+    recorder.pagebox_pool = Some(pages);
+    let job = TextureUploadJob {
+        info: TextureInfo {
+            texture_id: crate::ids::TextureId::new_unique(),
+            d3d_format: D3DFMT_A8R8G8B8,
+            width: 64,
+            height: 64,
+            depth: 1,
+            levels: 1,
+            pixel_format: PixelFormat::Bgra8Unorm,
+            create_flags: TextureCreateFlags::empty(),
+            swizzle: [Swizzle::Red, Swizzle::Green, Swizzle::Blue, Swizzle::Alpha],
+            usage_flags: TextureUsage::empty(),
+        },
+        staging: PageBoxRead::new(Arc::clone(staging)),
+        level: 0,
+        destination_slice: 0,
+        staging_index: 0,
+        origin_x: 0,
+        origin_y: 0,
+        region_w: 64,
+        region_h: 64,
+        src_d3d_format: D3DFMT_A8R8G8B8,
+        src_pitch: 256,
+        bytes_per_pixel: 4,
+        depth: 1,
+        slice_pitch: 256 * 64,
+        redirty: Arc::new(RedirtyQueue::new()),
+        release_staging: false,
+        upload_generation: 1,
+    };
+    recorder
+        .record_typed(&mut frame.scratch, UploadTextureOp { job })
+        .unwrap();
+    seal(frame, recorder)
+}
+
+/// Replay the upload, returning the native read and feedback owners it adopted.
+fn replay_upload(owner: &mut FramePacket) -> (PageBoxRead, Arc<RedirtyQueue>) {
+    let mut packet = admit(owner);
+    let mut adopted = None;
+    while replay(&mut packet, |command, _, _| {
+        assert!(matches!(command.opcode(), EncoderOpcode::UploadTexture));
+        let record = borrow::<TextureUploadRecord>(command.payload())?;
+        // SAFETY: the real producer retained these unique read and feedback descriptors.
+        let read = unsafe { record.page.adopt_read()? };
+        // SAFETY: the feedback lease stays with this admitted packet through native use.
+        let feedback = unsafe { record.redirty.adopt()? };
+        adopted = Some((read, feedback));
+        Ok(())
+    })
+    .unwrap()
+    {}
+    drop(
+        packet
+            .into_frame()
+            .unwrap_or_else(|(error, _)| panic!("complete replay: {error:?}")),
+    );
+    adopted.expect("one upload")
+}
+
+#[test]
+fn staging_released_before_its_upload_retires_is_parked_by_the_retiring_pass() {
+    let pool = CompletionPool::new();
+    let pages = Box::leak(Box::new(PageBoxPool::new(usize::MAX)));
+    let staging = Arc::new(PageBox::new_uninit(64 * 256));
+    let address = staging.as_ptr();
+    let mut owner = staging_upload_packet(&pool, pages, &staging);
+    let native = replay_upload(&mut owner);
+    let mut retirement = PacketRetirement::default();
+    let mut calls = Calls::default();
+    retirement.push_submitted(owner, false, &pool, &mut calls);
+    assert!(
+        !pages.recycle_staging(staging),
+        "the texture's release leaves the pages with the upload lease"
+    );
+    retirement.maintain(&pool, &mut calls);
+    assert_eq!(
+        pages.staging_bytes(),
+        0,
+        "native code still holds the page and its wrapper keepalive"
+    );
+    assert!(pages.acquire_staging(64 * 256).is_none());
+    drop(native);
+    retirement.maintain(&pool, &mut calls);
+    assert!(registered(&retirement).is_empty());
+    assert_eq!(pages.staging_bytes(), PAGE_SIZE);
+    assert_eq!(
+        pages
+            .acquire_staging(64 * 256)
+            .expect("parked by the pass that retired the lease")
+            .as_ptr(),
+        address
+    );
+    assert_eq!(calls, Calls::default());
+}
+
+#[test]
+fn device_teardown_retires_staging_leases_and_the_drain_empties_the_lane() {
+    let pool = CompletionPool::new();
+    let pages = Box::leak(Box::new(PageBoxPool::new(usize::MAX)));
+    let mut retirement = PacketRetirement::default();
+    let mut calls = Calls::default();
+    let mut native = Vec::new();
+    for _ in 0..3 {
+        let staging = Arc::new(PageBox::new_uninit(64 * 256));
+        let mut owner = staging_upload_packet(&pool, pages, &staging);
+        native.push(replay_upload(&mut owner));
+        retirement.push_submitted(owner, false, &pool, &mut calls);
+        assert!(!pages.recycle_staging(staging));
+    }
+    retirement.maintain(&pool, &mut calls);
+    assert_eq!(
+        registered(&retirement).len(),
+        6,
+        "a page lease and a feedback lease per upload"
+    );
+    // Native destruction joins every worker and drops every native owner first.
+    drop(native);
+    // SAFETY: the native owners above are gone and nothing else can reach the packets.
+    unsafe { retirement.cancel_after_quiescence(&pool) };
+    assert!(retirement.pending.is_empty());
+    assert!(registered(&retirement).is_empty());
+    assert!(!pool.has_ready());
+    assert_eq!(pages.staging_bytes(), 3 * PAGE_SIZE);
+    assert_eq!(pages.drain_staging(), 3 * PAGE_SIZE);
+    assert_eq!(pages.staging_bytes(), 0);
+    assert_eq!(pages.pooled_bytes(), 0);
+    assert!(pages.acquire_staging(64 * 256).is_none());
+}
+
+#[test]
+fn a_native_wrapper_keepalive_defers_parking_until_it_drops() {
+    let pool = CompletionPool::new();
+    let pages = Box::leak(Box::new(PageBoxPool::new(usize::MAX)));
+    let staging = Arc::new(PageBox::new_uninit(64 * 256));
+    let address = staging.as_ptr();
+    let mut owner = staging_upload_packet(&pool, pages, &staging);
+    let (read, feedback) = replay_upload(&mut owner);
+    // The cached staging wrapper keeps its own clone of the adopted native box, as
+    // `MipStagingBuffer.keepalive` does, and outlives the upload's read.
+    let keepalive = Arc::clone(read.backing());
+    let mut retirement = PacketRetirement::default();
+    let mut calls = Calls::default();
+    retirement.push_submitted(owner, false, &pool, &mut calls);
+    assert!(
+        !pages.recycle_staging(staging),
+        "the texture is released first"
+    );
+    drop(read);
+    drop(feedback);
+    retirement.maintain(&pool, &mut calls);
+    assert_eq!(
+        pages.staging_bytes(),
+        0,
+        "the wrapper keepalive still pins the pages"
+    );
+    assert!(pages.acquire_staging(64 * 256).is_none());
+    assert_eq!(
+        registered(&retirement).len(),
+        1,
+        "the page lease stays registered"
+    );
+    // Retention destroys the wrapper after GPU retirement, then drops the keepalive.
+    drop(keepalive);
+    retirement.maintain(&pool, &mut calls);
+    assert!(registered(&retirement).is_empty());
+    assert_eq!(pages.staging_bytes(), PAGE_SIZE);
+    assert_eq!(
+        pages
+            .acquire_staging(64 * 256)
+            .expect("parked once the keepalive dropped")
+            .as_ptr(),
+        address
+    );
+    assert_eq!(calls, Calls::default());
 }

@@ -253,7 +253,8 @@ pub struct Mtld3dConfig {
     /// parked bytes peaked at 53 MiB in a quiet scene, so the default
     /// leaves ~2x headroom for busy scenes. The cap bounds the
     /// committed bytes the pool may park; over-cap boxes drop to the
-    /// allocator as before. The pool is one per process, so the value the
+    /// allocator as before. Texture staging shares the cap and may hold at
+    /// most a quarter of it. The pool is one per process, so the value the
     /// most recent `Direct3DCreate9` resolved is the one in force. Default:
     /// 128 MiB. File key: `memory.pageboxPoolCapMB` (value in MiB).
     pub pagebox_pool_cap_bytes: u64,

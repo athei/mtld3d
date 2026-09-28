@@ -619,7 +619,7 @@ fn early_native_lease_events_do_not_retire_a_pending_or_rejected_packet() {
         .clone();
     let original = Arc::new(PageBox::new_zeroed(4));
     let read = crate::page_box::PageBoxRead::new(Arc::clone(&original));
-    let lease = GuestPageLease::for_read_pooled(read, &pool);
+    let lease = GuestPageLease::for_read_pooled(read, &pool, None);
     let descriptor = lease.descriptor();
     packet.pages.push(lease);
     // SAFETY: the fixture retains one packet and models its only native consumer.

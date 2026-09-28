@@ -121,7 +121,7 @@ use super::{
     surface::{ColorTargetCreateInfo, Direct3DSurface9, SurfaceMultiSample, SystemMemoryDst},
     texture::{
         CUBE_FACE_COUNT, Direct3DTexture9, SourceImage, TextureCreateInfo, TextureInner,
-        new_uninit_page_box,
+        take_staging,
     },
     unix_call::unix_call,
     vertex_buffer::{Direct3DVertexBuffer9, VertexBufferCreateInfo},
@@ -5111,35 +5111,44 @@ fn create_texture_path(info: &TextureCreateArgs) -> i32 {
     // and a draw that references a never-Locked MTLTexture samples
     // Metal-zeroed texture memory (independent of the staging PageBox).
     // Page alignment satisfies `newBufferWithBytesNoCopy:`'s contract
-    // on non-UMA Macs (Intel/AMD).
+    // on non-UMA Macs (Intel/AMD). Each level pops a parked box of its
+    // padded size from the page-box pool before it falls back to the
+    // allocator; the device counts both outcomes once per create.
     let mut staging: Vec<PageBox> = Vec::with_capacity(actual_levels as usize);
     let mut mip_widths = Vec::with_capacity(actual_levels as usize);
     let mut mip_heights = Vec::with_capacity(actual_levels as usize);
     let mut mip_bytes_per_row = Vec::with_capacity(actual_levels as usize);
 
-    if let Some(layout) = &planar_layout {
-        // One level whose allocation is the planar layout's, not pitch times
-        // height: the chroma planes follow the luma rows in the same box, and
-        // the lock pitch strides all of them. The per-level arrays keep the
-        // logical extent, which is what `GetDesc` and rect validation read.
-        staging.push(new_uninit_page_box(layout.total_bytes()));
-        mip_widths.push(width);
-        mip_heights.push(height);
-        mip_bytes_per_row.push(layout.pitch());
-        // Every offset a planar lock, upload or decode forms is derived from
-        // the layout, so the allocation has to be exactly the layout's size.
-        debug_assert_eq!(staging[0].logical_len(), layout.total_bytes());
-        debug_assert_eq!(actual_levels, 1);
-    } else {
-        for level in 0..actual_levels {
-            let (mw, mh, size, bpr) = compute_mip_size(width, height, level, &fmt);
-            staging.push(new_uninit_page_box(size as usize));
-            mip_widths.push(mw);
-            mip_heights.push(mh);
-            mip_bytes_per_row.push(bpr);
+    let (pool_hits, pool_misses) = {
+        let mut staging_take = take_staging();
+        if let Some(layout) = &planar_layout {
+            // One level whose allocation is the planar layout's, not pitch times
+            // height: the chroma planes follow the luma rows in the same box, and
+            // the lock pitch strides all of them. The per-level arrays keep the
+            // logical extent, which is what `GetDesc` and rect validation read.
+            staging.push(staging_take.take(layout.total_bytes()));
+            mip_widths.push(width);
+            mip_heights.push(height);
+            mip_bytes_per_row.push(layout.pitch());
+            // Every offset a planar lock, upload or decode forms is derived from
+            // the layout, so the allocation has to be exactly the layout's size.
+            debug_assert_eq!(staging[0].logical_len(), layout.total_bytes());
+            debug_assert_eq!(actual_levels, 1);
+        } else {
+            for level in 0..actual_levels {
+                let (mw, mh, size, bpr) = compute_mip_size(width, height, level, &fmt);
+                staging.push(staging_take.take(size as usize));
+                mip_widths.push(mw);
+                mip_heights.push(mh);
+                mip_bytes_per_row.push(bpr);
+            }
         }
-    }
+        staging_take.finish()
+    };
 
+    obj.inner()
+        .perf_mut()
+        .add_texture_pool_outcomes(pool_hits, pool_misses);
     let mut flags = TextureFlags::empty();
     flags.set(TextureFlags::AUTOGEN_MIPMAP, autogen_mipmap);
     flags.set(TextureFlags::OFFSCREEN_PLAIN, offscreen_plain);
@@ -5572,19 +5581,26 @@ extern "system" fn device_create_volume_texture(
     let mut mip_widths = Vec::with_capacity(actual_levels as usize);
     let mut mip_heights = Vec::with_capacity(actual_levels as usize);
     let mut mip_bytes_per_row = Vec::with_capacity(actual_levels as usize);
-    for level in 0..actual_levels {
-        let (mw, mh, slice_size, bpr) = compute_mip_size(width, height, level, &fmt);
-        let md = (depth >> level).max(1);
-        let box_bytes = (slice_size as usize).saturating_mul(md as usize);
-        staging.push(new_uninit_page_box(box_bytes));
-        mip_widths.push(mw);
-        mip_heights.push(mh);
-        mip_bytes_per_row.push(bpr);
-    }
+    let (pool_hits, pool_misses) = {
+        let mut staging_take = take_staging();
+        for level in 0..actual_levels {
+            let (mw, mh, slice_size, bpr) = compute_mip_size(width, height, level, &fmt);
+            let md = (depth >> level).max(1);
+            let box_bytes = (slice_size as usize).saturating_mul(md as usize);
+            staging.push(staging_take.take(box_bytes));
+            mip_widths.push(mw);
+            mip_heights.push(mh);
+            mip_bytes_per_row.push(bpr);
+        }
+        staging_take.finish()
+    };
     // SAFETY: vtable thunk; `this` is *mut Direct3DDevice9 per IDirect3DDevice9 ABI.
     let Some(obj) = (unsafe { InPtr::<Direct3DDevice9>::opt(this) }) else {
         return D3DERR_INVALIDCALL;
     };
+    obj.inner()
+        .perf_mut()
+        .add_texture_pool_outcomes(pool_hits, pool_misses);
     let tex = crate::texture::Direct3DVolumeTexture9::new(TextureCreateInfo {
         texture_id: mtld3d_core::ids::TextureId::new_unique(),
         device_handle: obj.inner().device_handle,
@@ -5756,16 +5772,23 @@ extern "system" fn device_create_cube_texture(
         mip_heights.push(mh);
         mip_bytes_per_row.push(bpr);
     }
-    for _face in 0..CUBE_FACE_COUNT {
-        for level in 0..actual_levels {
-            let (_, _, size, _) = compute_mip_size(edge_length, edge_length, level, &fmt);
-            staging.push(new_uninit_page_box(size as usize));
+    let (pool_hits, pool_misses) = {
+        let mut staging_take = take_staging();
+        for _face in 0..CUBE_FACE_COUNT {
+            for level in 0..actual_levels {
+                let (_, _, size, _) = compute_mip_size(edge_length, edge_length, level, &fmt);
+                staging.push(staging_take.take(size as usize));
+            }
         }
-    }
+        staging_take.finish()
+    };
     // SAFETY: vtable thunk; `this` is *mut Direct3DDevice9 per IDirect3DDevice9 ABI.
     let Some(obj) = (unsafe { InPtr::<Direct3DDevice9>::opt(this) }) else {
         return D3DERR_INVALIDCALL;
     };
+    obj.inner()
+        .perf_mut()
+        .add_texture_pool_outcomes(pool_hits, pool_misses);
     // A cube face is never the main view's colour or depth target, so it keeps
     // whatever edge length the game asked for.
     let mut flags = TextureFlags::CUBE;

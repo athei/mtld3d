@@ -7,6 +7,7 @@ use mtld3d_core::{
     ids::TextureId,
     level_authority::{LevelAuthorityMask, WritePlan},
     page_box::{PageBox, PageBoxRead},
+    page_box_pool::StagingTake,
     pixel_convert,
     render_scale::{RenderScale, TargetExtent},
     staging_coverage::StagingCoverage,
@@ -657,9 +658,26 @@ impl TextureInner {
 
     /// Release `level`'s staging; the in-flight upload keeps its own `Arc`.
     fn drop_staging(&mut self, level: usize) {
-        self.staging[level] = dropped_staging_placeholder();
+        let released = core::mem::replace(&mut self.staging[level], dropped_staging_placeholder());
+        retire_staging(self.device_inner, released);
         self.dropped_staging |= 1u32 << level;
         self.reset_staging_coverage(level);
+    }
+
+    /// Give every staging allocation to the page-box pool at the texture's final release.
+    ///
+    /// A level whose upload is still in flight stays with that upload's
+    /// lease and is parked, if at all, when the lease retires.
+    fn retire_all_staging(&mut self) {
+        let device_inner = self.device_inner;
+        for backing in self.staging.drain(..) {
+            retire_staging(device_inner, backing);
+        }
+        if let Some(cube) = self.cube.as_deref_mut() {
+            for backing in cube.staging.drain(..) {
+                retire_staging(device_inner, backing);
+            }
+        }
     }
 
     /// Forget what the level's staging held, because it no longer holds it.
@@ -686,7 +704,8 @@ impl TextureInner {
         }
         let block_rows = self.mip_heights[level].div_ceil(self.block_h.max(1));
         let len = (self.mip_bytes_per_row[level] as usize).saturating_mul(block_rows as usize);
-        self.staging[level] = Arc::new(new_uninit_page_box(len.max(1)));
+        // The slot holds the shared placeholder, never its last owner.
+        self.staging[level] = Arc::new(take_staging_for(self.device_inner, len.max(1)));
         self.dropped_staging &= !(1u32 << level);
         self.reset_staging_coverage(level);
         // The allocation is fresh, so no GPU-visible command references it and
@@ -2385,7 +2404,7 @@ impl TextureInner {
                 let mip_len = cube.staging[index].logical_len();
                 let old = core::mem::replace(
                     &mut cube.staging[index],
-                    Arc::new(new_uninit_page_box(mip_len)),
+                    Arc::new(take_staging_for(device_inner, mip_len)),
                 );
                 if preserve == PreserveKind::Cpu {
                     let dst = Arc::get_mut(&mut cube.staging[index])
@@ -2395,6 +2414,7 @@ impl TextureInner {
                     // and both contain `mip_len` logical bytes.
                     unsafe { core::ptr::copy_nonoverlapping(old.as_ptr(), dst, mip_len) };
                 }
+                retire_staging(device_inner, old);
                 if device_inner != 0 {
                     let mut perf = DeviceInner::from_ptr(device_inner).perf_mut();
                     match preserve {
@@ -2663,7 +2683,7 @@ impl TextureInner {
         );
         // Copy only logical mip bytes, excluding the page-padded tail.
         let mip_len = self.staging[level].logical_len();
-        let fresh = new_uninit_page_box(mip_len);
+        let fresh = take_staging_for(self.device_inner, mip_len);
         let old = core::mem::replace(&mut self.staging[level], Arc::new(fresh));
         // A detached texture has no live device profiling state.
         let dev_inner_raw = self.device_inner;
@@ -2701,6 +2721,7 @@ impl TextureInner {
                 }
             }
         }
+        retire_staging(dev_inner_raw, old);
         if perf_attached {
             DeviceInner::from_ptr(dev_inner_raw)
                 .perf_mut()
@@ -2917,7 +2938,7 @@ impl TextureInner {
     }
 }
 
-/// Allocate `len` uninitialized bytes in a page-aligned `PageBox`.
+/// Take uninitialized page-aligned staging, a parked box of each size first.
 ///
 /// Used by the `FreshBox` Lock path and by `CreateTexture` for initial
 /// staging — the game writes the dirty rect before any GPU read, and
@@ -2925,14 +2946,45 @@ impl TextureInner {
 /// are never observed. On an initial Draw-before-Lock, the freshly-
 /// created `MTLTexture` is the GPU-visible surface and is zeroed by
 /// Metal; the staging `PageBox` is only read when an upload blit fires,
-/// which requires a prior Lock write.
+/// which requires a prior Lock write. A box popped from the page-box
+/// pool carries another texture's stale bytes under exactly that
+/// contract, so it is interchangeable with a fresh allocation.
 ///
 /// Page-aligned because the encoder wraps the staging via
 /// `newBufferWithBytesNoCopy:`, which on non-UMA Macs (Intel/AMD)
 /// rejects misaligned pointer or length. Apple Silicon tolerates the
-/// misalignment in practice but documents the same contract.
-pub fn new_uninit_page_box(len: usize) -> PageBox {
-    PageBox::new_uninit(len)
+/// misalignment in practice but documents the same contract; a pooled
+/// box has the same alignment and padded length as a fresh one.
+pub fn take_staging() -> StagingTake<'static> {
+    crate::page_box_pool::PAGEBOX_POOL.take_staging()
+}
+
+/// Drop one owner of a staging box, parking it in the page-box pool if it was the last.
+///
+/// Every site where `TextureInner` gives up a staging `Arc` comes through
+/// here. An upload still in flight holds its own `Arc`, so the box stays
+/// with it and is parked, if at all, when that lease retires. A detached
+/// texture (`device_inner == 0`) drops instead: its device drained the
+/// staging lane at teardown, and parking afterwards would undo that.
+pub fn retire_staging(device_inner: u64, backing: Arc<PageBox>) {
+    if device_inner != 0 {
+        crate::page_box_pool::PAGEBOX_POOL.recycle_staging(backing);
+    }
+}
+
+/// One staging allocation, counted on the owning device when the texture still has one.
+fn take_staging_for(device_inner: u64, len: usize) -> PageBox {
+    let (page, (hits, misses)) = {
+        let mut take = take_staging();
+        let page = take.take(len);
+        (page, take.finish())
+    };
+    if device_inner != 0 {
+        DeviceInner::from_ptr(device_inner)
+            .perf_mut()
+            .add_texture_pool_outcomes(hits, misses);
+    }
+    page
 }
 
 /// Parameters for `Direct3DTexture9::new`.
@@ -3369,6 +3421,8 @@ unsafe fn finalize_texture(this: *mut Direct3DTexture9) {
     // (The texture outlives every shell referencing it, so this is the last
     // owner, and the shells were freed just above.)
     ti_mut.dc_lock.teardown();
+    // Offer the staging to the page-box pool; a detached texture drops it.
+    ti_mut.retire_all_staging();
     // SAFETY: both counters reached zero; `inner_ptr` is the original
     // `Box::into_raw(TextureInner)` from `Self::new` and no other
     // reference can survive.

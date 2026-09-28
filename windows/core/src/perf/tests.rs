@@ -572,6 +572,7 @@ fn summary_golden_layout() {
         "  discards  1                                                   API: rename, no preserve (whole-level DISCARD on a DEFAULT-pool texture)\n",
         "  preserve  1                       peak/frame 1                API: rename + sync memcpy (whole-level non-DISCARD contended, or an unaligned compressed rect)\n",
         "in-place    0                                                   API: contended partial Lock handed back live (kept divergence; no rename, no stall)\n",
+        "pool        hit=7 miss=1 (87.5%)                                API: staging pops a warm same-size PageBox; last owners park retired staging\n",
         "uploads     2                                                   encoder: total texture uploads (raw + padded + pass)\n",
         "  raw       2                                                   encoder: blit; source = cached bytesNoCopy wrapper (cheap)\n",
         "  padded    0                                                   encoder: blit; source repacked on the CPU into a transient buffer (alloc + memcpy + extra unix_call)\n",
@@ -714,7 +715,8 @@ fn kv_golden_line() {
         " vbib_retention_peak_count=6 vbib_retained_bytes=3670016 vbib_pool_hit_total=14",
         " vbib_pool_miss_total=1 pagebox_pool_recycled_total=14",
         " pagebox_pool_recycled_bytes_total=688128 pagebox_pool_parked_bytes=1048576",
-        " tex_rename_total=2 tex_discard_total=1 tex_preserve_cpu_total=1",
+        " tex_rename_total=2 tex_discard_total=1 tex_pool_hit_total=7 tex_pool_miss_total=1",
+        " tex_preserve_cpu_total=1",
         " tex_in_place_total=0 tex_uploads_total=2 tex_uploads_raw_total=2",
         " tex_uploads_padded_total=0 tex_uploads_pass_total=0 tex_reorder_total=1",
         " tex_destroy_total=1 tex_retention_peak_count=0 tex_staging_retained_bytes=0",
@@ -1001,6 +1003,10 @@ fn sample_window() -> PerfWindow {
             texture_discards: 1,
             texture_preserve_cpu: 1,
             texture_write_in_place_contended: 0,
+            // Staging pool fixture: 7 of 8 staging allocations served
+            // warm (87.5%), one fell through to the allocator.
+            texture_pool_hits: 7,
+            texture_pool_misses: 1,
             // AddDirtyRect probe fixture: 4 calls, 3 with a usable
             // sub-region; area sum 10000 bp ⇒ mean coverage 25% of the mip.
             texture_add_dirty_calls: 4,

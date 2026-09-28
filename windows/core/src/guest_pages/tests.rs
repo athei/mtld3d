@@ -147,7 +147,7 @@ fn shared_page_lease_preserves_other_owners_and_readers() {
         let cells = crate::guest_completions::CompletionPool::new();
         let external = Arc::new(PageBox::new_zeroed(12));
         let lease =
-            GuestPageLease::for_read_pooled(PageBoxRead::new(Arc::clone(&external)), &cells);
+            GuestPageLease::for_read_pooled(PageBoxRead::new(Arc::clone(&external)), &cells, None);
         let read = hold_read.then(|| PageBoxRead::new(Arc::clone(&external)));
         retire_pooled_lease(lease, &cells);
         assert_eq!(Arc::strong_count(&external), if hold_read { 2 } else { 1 });
@@ -155,4 +155,77 @@ fn shared_page_lease_preserves_other_owners_and_readers() {
         drop(read);
         assert!(!external.has_readers());
     }
+}
+
+/// A pooled lease of `owner`'s pages that offers them to `pages` at retirement.
+fn staging_lease(
+    owner: &Arc<PageBox>,
+    cells: &crate::guest_completions::CompletionPool,
+    pages: &'static PageBoxPool,
+) -> GuestPageLease {
+    GuestPageLease::for_read_pooled(PageBoxRead::new(Arc::clone(owner)), cells, Some(pages))
+}
+
+#[test]
+fn a_retired_lease_parks_staging_the_texture_released_before_it() {
+    let cells = crate::guest_completions::CompletionPool::new();
+    let pages = Box::leak(Box::new(PageBoxPool::new(usize::MAX)));
+    let texture = Arc::new(PageBox::new_uninit(3 * PAGE_SIZE));
+    let (address, generation) = (texture.as_ptr(), texture.generation());
+    let mut lease = staging_lease(&texture, &cells, pages);
+    // SAFETY: the lease retains the allocation and cells until the native read drops.
+    let native = unsafe { lease.descriptor().adopt_read() }.expect("native read");
+    assert!(
+        !pages.recycle_staging(texture),
+        "the texture's release leaves the pages with the lease"
+    );
+    assert!(
+        pages.acquire_staging(3 * PAGE_SIZE).is_none(),
+        "no create can take pages native code still reads"
+    );
+    assert!(!lease.maintain());
+    drop(native);
+    cells.drain(
+        &mut crate::guest_completions::CompletionDrain::default(),
+        16,
+        |_| {},
+    );
+    assert!(lease.maintain());
+    cells.recycle(lease.into_slot().expect("pooled completion"));
+    assert_eq!(pages.staging_bytes(), 3 * PAGE_SIZE);
+    let reused = pages
+        .acquire_staging(3 * PAGE_SIZE)
+        .expect("parked at retirement");
+    assert_eq!(reused.as_ptr(), address);
+    assert_eq!(reused.generation(), generation);
+    assert!(!reused.has_readers());
+}
+
+#[test]
+fn a_retired_lease_leaves_staging_the_texture_still_owns() {
+    let cells = crate::guest_completions::CompletionPool::new();
+    let pages = Box::leak(Box::new(PageBoxPool::new(usize::MAX)));
+    let texture = Arc::new(PageBox::new_uninit(PAGE_SIZE));
+    retire_pooled_lease(staging_lease(&texture, &cells, pages), &cells);
+    assert_eq!(pages.staging_bytes(), 0);
+    assert_eq!(Arc::strong_count(&texture), 1);
+    assert!(!texture.has_readers());
+    assert!(
+        pages.recycle_staging(texture),
+        "the texture's release parks it"
+    );
+    assert_eq!(pages.staging_bytes(), PAGE_SIZE);
+}
+
+#[test]
+fn an_unacknowledged_lease_never_offers_its_pages() {
+    let cells = crate::guest_completions::CompletionPool::new();
+    let pages = Box::leak(Box::new(PageBoxPool::new(usize::MAX)));
+    let texture = Arc::new(PageBox::new_uninit(PAGE_SIZE));
+    let lease = staging_lease(&texture, &cells, pages);
+    drop(texture);
+    // Neither acknowledgment arrived, so the owner drops instead of parking.
+    drop(lease.into_slot());
+    assert_eq!(pages.staging_bytes(), 0);
+    assert!(pages.acquire_staging(PAGE_SIZE).is_none());
 }
