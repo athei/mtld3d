@@ -206,6 +206,13 @@ is in [`CONFORMANCE.md`](../unix/conformance/CONFORMANCE.md#kept-divergences).
   auto-resize is the device window's, and follows a `Reset` that names another
   window; D3D9 subclasses the focus window instead. No knob.
 - `D3DRS_MULTISAMPLEANTIALIAS = FALSE` is ignored. No knob.
+- The adapter mode list leaves out every display size win32u cannot scale
+  the monitor to in its 16-bit ratio, on every Wine, and a fullscreen request
+  for one follows the window instead of setting the mode. The list describes
+  the primary display only and serves its own aspect first; on a notched
+  MacBook panel it then serves the aspect of the area below the notch, which
+  win32u centres so that it straddles the notch strip, and on any other
+  display nothing more. No knob.
 - A windowed device's `SetGammaRamp` is stored and reported back but changes
   nothing on screen, where D3D9 ramps the whole desktop. Only the implicit
   swap chain carries a ramp. No knob.

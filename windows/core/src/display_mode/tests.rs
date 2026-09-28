@@ -1,5 +1,7 @@
 use super::{
-    ModeRequest, mode_set_attempts, select_mode_sizes, served_mode_indices, served_mode_sizes,
+    MAX_SERVED_SIZES, ModeRequest, drop_unscalable_sizes, gcd, mode_set_attempts,
+    monitor_ratio_fits, notch_area, physical_extent, select_mode_sizes, served_mode_indices,
+    served_mode_sizes,
 };
 
 const MBP: (u32, u32) = (3456, 2234);
@@ -81,11 +83,15 @@ fn an_empty_enumeration_serves_the_desktop_mode_alone() {
     assert_eq!(select_mode_sizes(MBP, []), vec![MBP]);
 }
 
+const MBP_NOTCH: (u32, u32) = (3456, 2160);
+
 #[test]
-fn only_the_panels_aspect_is_served_largest_first() {
+fn the_panels_aspect_is_served_largest_first_then_the_notch_areas() {
     // The desktop's aspect is 1.547; 2336x1510 and 2992x1934 share it within
-    // the panel tolerance (integer rounding), the 16:10, 16:9 and 4:3 sizes
-    // do not and are left to a game's own config, however large.
+    // the panel tolerance (integer rounding) and come first, largest first.
+    // 2560x1600 has the notch area's aspect and follows them although it is
+    // larger than 2336x1510. The 16:9, 4:3 and 3:2 sizes are left to a
+    // game's own config, however large.
     let settable = [
         MBP,
         (640, 480),
@@ -95,10 +101,254 @@ fn only_the_panels_aspect_is_served_largest_first() {
         (2560, 1600),
         (2992, 1934),
         (1920, 1280),
+        (1440, 900),
     ];
     assert_eq!(
-        served_mode_sizes(&settable, 15),
-        vec![MBP, (2992, 1934), (2336, 1510)]
+        served_mode_sizes(&settable, Some(MBP_NOTCH), 15),
+        vec![MBP, (2992, 1934), (2336, 1510), (2560, 1600), (1440, 900)]
+    );
+}
+
+#[test]
+fn without_a_notch_only_the_panels_aspect_is_served() {
+    let settable = [MBP, (2560, 1600), (2992, 1934), (1440, 900)];
+    assert_eq!(
+        served_mode_sizes(&settable, None, 15),
+        vec![MBP, (2992, 1934)]
+    );
+}
+
+#[test]
+fn the_bound_cuts_the_notch_tier_first() {
+    let settable = [MBP, (1920, 1200), (2624, 1696), (2560, 1600), (1728, 1117)];
+    assert_eq!(
+        served_mode_sizes(&settable, Some(MBP_NOTCH), 4),
+        vec![MBP, (2624, 1696), (1728, 1117), (2560, 1600)]
+    );
+}
+
+#[test]
+fn the_notch_area_is_the_same_width_a_notch_strip_shorter() {
+    // 74 of 2234 rows, 3.3 %, with Wine's Retina mode on; 37 of 1117 off.
+    assert_eq!(notch_area(MBP, MBP_WINE_SIZES), Some(MBP_NOTCH));
+    assert_eq!(
+        notch_area((1728, 1117), MBP_NORETINA_WINE_SIZES),
+        Some((1728, 1080))
+    );
+}
+
+#[test]
+fn a_same_width_mode_far_shorter_than_a_notch_is_no_notch_area() {
+    // 1920x1080 below 1920x1200 is 10 % shorter, 1280x768 below 1280x800 is
+    // 4 %, the closest pair in Wine's own table; neither is a notch.
+    assert_eq!(notch_area((1920, 1200), [(1920, 1080), (1680, 1050)]), None);
+    assert_eq!(notch_area((1280, 800), [(1280, 768), (1280, 720)]), None);
+    // A strip under 3 % is no notch either.
+    assert_eq!(notch_area((3456, 2234), [(3456, 2200)]), None);
+    // Nor is the physical mode itself, or a mode of another width.
+    assert_eq!(notch_area(MBP, [MBP, (3200, 2160)]), None);
+}
+
+/// The sizes Wine lists for a 3456x2234 display under `EmulateModeset`.
+const MBP_WINE_SIZES: [(u32, u32); 43] = [
+    (1024, 768),
+    (1152, 864),
+    (1168, 730),
+    (1168, 755),
+    (1280, 1024),
+    (1280, 720),
+    (1280, 768),
+    (1280, 800),
+    (1280, 960),
+    (1312, 820),
+    (1312, 848),
+    (1440, 900),
+    (1440, 960),
+    (1496, 935),
+    (1496, 967),
+    (1600, 1200),
+    (1600, 900),
+    (1680, 1050),
+    (1728, 1080),
+    (1728, 1117),
+    (1920, 1080),
+    (1920, 1200),
+    (1920, 1280),
+    (1920, 800),
+    (2056, 1285),
+    (2056, 1329),
+    (2336, 1460),
+    (2336, 1510),
+    (2560, 1080),
+    (2560, 1440),
+    (2560, 1600),
+    (2624, 1640),
+    (2624, 1696),
+    (2880, 1620),
+    (2992, 1870),
+    (2992, 1934),
+    (3200, 1800),
+    (3456, 2160),
+    (3456, 2234),
+    (640, 480),
+    (800, 600),
+    (960, 540),
+    (960, 600),
+];
+
+/// The sizes Wine lists for a 1728x1117 display (Retina mode off).
+const MBP_NORETINA_WINE_SIZES: [(u32, u32); 23] = [
+    (640, 480),
+    (800, 600),
+    (960, 540),
+    (960, 600),
+    (1024, 768),
+    (1152, 864),
+    (1168, 730),
+    (1168, 755),
+    (1280, 720),
+    (1280, 768),
+    (1280, 800),
+    (1280, 960),
+    (1280, 1024),
+    (1312, 820),
+    (1312, 848),
+    (1440, 900),
+    (1440, 960),
+    (1496, 935),
+    (1496, 967),
+    (1600, 900),
+    (1680, 1050),
+    (1728, 1080),
+    (1728, 1117),
+];
+
+/// The table a desktop serves from `sizes`, the way the adapter builds it.
+fn served_for(desktop: (u32, u32), sizes: &[(u32, u32)]) -> Vec<(u32, u32)> {
+    let physical = physical_extent(desktop, sizes.iter().copied());
+    let notch = notch_area(physical, sizes.iter().copied());
+    let mut settable = select_mode_sizes(desktop, sizes.iter().copied());
+    drop_unscalable_sizes(&mut settable, physical, 96);
+    let served = served_mode_sizes(&settable, notch, MAX_SERVED_SIZES);
+    // Only sizes win32u can scale to are served, and none twice.
+    assert!(
+        served
+            .iter()
+            .all(|&size| monitor_ratio_fits(size, physical, 96))
+    );
+    let mut distinct = served.clone();
+    distinct.sort_unstable();
+    distinct.dedup();
+    assert_eq!(distinct.len(), served.len(), "{served:?}");
+    served
+}
+
+#[test]
+fn a_notched_3456x2234_display_serves_its_panel_then_the_notch_areas_sizes() {
+    assert_eq!(
+        served_for(MBP, &MBP_WINE_SIZES),
+        vec![
+            (3456, 2234),
+            (2624, 1696),
+            (1728, 1117),
+            (1312, 848),
+            (3456, 2160),
+            (2624, 1640),
+            (2560, 1600),
+            (2336, 1460),
+            (1920, 1200),
+            (1728, 1080),
+            (1680, 1050),
+            (1440, 900),
+            (1312, 820),
+            (1280, 800),
+            (960, 600),
+        ]
+    );
+}
+
+#[test]
+fn the_same_panel_with_retina_mode_off_serves_its_panel_then_the_notch_areas_sizes() {
+    assert_eq!(
+        served_for((1728, 1117), &MBP_NORETINA_WINE_SIZES),
+        vec![
+            (1728, 1117),
+            (1312, 848),
+            (1728, 1080),
+            (1680, 1050),
+            (1440, 900),
+            (1312, 820),
+            (1280, 800),
+            (1168, 730),
+            (960, 600),
+        ]
+    );
+}
+
+/// Wine's own table of sizes, which it lists for any display at or below the physical size.
+const WINE_TABLE: [(u32, u32); 24] = [
+    (640, 480),
+    (800, 600),
+    (1024, 768),
+    (1152, 864),
+    (1280, 960),
+    (1600, 1200),
+    (960, 540),
+    (1280, 720),
+    (1600, 900),
+    (1920, 1080),
+    (2560, 1440),
+    (2880, 1620),
+    (3200, 1800),
+    (1440, 900),
+    (1680, 1050),
+    (1920, 1200),
+    (2560, 1600),
+    (1440, 960),
+    (1920, 1280),
+    (2560, 1080),
+    (1920, 800),
+    (3840, 1600),
+    (1280, 1024),
+    (1280, 768),
+];
+
+/// `WINE_TABLE` as a display of `physical` lists it, with the physical mode last.
+fn wine_list(physical: (u32, u32)) -> Vec<(u32, u32)> {
+    WINE_TABLE
+        .iter()
+        .copied()
+        .filter(|&(w, h)| w <= physical.0 && h <= physical.1)
+        .chain(core::iter::once(physical))
+        .collect()
+}
+
+#[test]
+fn a_16_9_external_display_serves_its_own_aspect_only() {
+    let display = (3840, 2160);
+    assert_eq!(notch_area(display, wine_list(display)), None);
+    assert_eq!(
+        served_for(display, &wine_list(display)),
+        vec![
+            display,
+            (3200, 1800),
+            (2880, 1620),
+            (2560, 1440),
+            (1920, 1080),
+            (1600, 900),
+            (1280, 720),
+            (960, 540),
+        ]
+    );
+}
+
+#[test]
+fn a_16_10_display_without_a_notch_serves_each_size_once() {
+    let display = (2560, 1600);
+    assert_eq!(notch_area(display, wine_list(display)), None);
+    assert_eq!(
+        served_for(display, &wine_list(display)),
+        vec![display, (1920, 1200), (1680, 1050), (1440, 900)]
     );
 }
 
@@ -106,7 +356,7 @@ fn only_the_panels_aspect_is_served_largest_first() {
 fn the_bound_cuts_the_smallest_panel_sizes() {
     let settable = [MBP, (2336, 1510), (2624, 1696), (2992, 1934)];
     assert_eq!(
-        served_mode_sizes(&settable, 3),
+        served_mode_sizes(&settable, None, 3),
         vec![MBP, (2992, 1934), (2624, 1696)]
     );
 }
@@ -117,24 +367,24 @@ fn panel_sizes_of_equal_pixel_count_keep_their_enumeration_order() {
     let desktop = (3840, 2160);
     let settable = [desktop, (1920, 1080), (1920, 1080)];
     assert_eq!(
-        served_mode_sizes(&settable, 15),
+        served_mode_sizes(&settable, None, 15),
         vec![desktop, (1920, 1080), (1920, 1080)]
     );
     let settable = [desktop, (1280, 720), (1600, 900), (960, 540)];
     assert_eq!(
-        served_mode_sizes(&settable, 15),
+        served_mode_sizes(&settable, None, 15),
         vec![desktop, (1600, 900), (1280, 720), (960, 540)]
     );
 }
 
 #[test]
 fn a_bound_of_zero_still_serves_the_desktop() {
-    assert_eq!(served_mode_sizes(&[MBP, (640, 480)], 0), vec![MBP]);
+    assert_eq!(served_mode_sizes(&[MBP, (640, 480)], None, 0), vec![MBP]);
 }
 
 #[test]
 fn an_empty_settable_list_serves_nothing() {
-    assert!(served_mode_sizes(&[], 5).is_empty());
+    assert!(served_mode_sizes(&[], None, 5).is_empty());
 }
 
 #[test]
@@ -159,4 +409,120 @@ fn served_indices_are_the_positions_of_served_sizes_in_list_order() {
 fn no_served_size_in_the_list_yields_no_indices() {
     assert!(served_mode_indices([(640, 480)], &[MBP]).is_empty());
     assert!(served_mode_indices([], &[MBP]).is_empty());
+}
+
+/// The heights a 2234-pixel-high display at 96 dpi cannot be scaled to.
+///
+/// Each shares a factor of 3 or less with 96 * 2234 = 214464, so the reduced
+/// numerator stays at 71488 or more. All of them are sizes Wine lists for
+/// that display.
+const UNSCALABLE_MBP_HEIGHTS: [u32; 9] = [1934, 1870, 1510, 1329, 1285, 967, 935, 755, 730];
+
+#[test]
+fn heights_sharing_too_small_a_factor_with_the_physical_height_do_not_fit() {
+    for height in UNSCALABLE_MBP_HEIGHTS {
+        assert!(
+            !monitor_ratio_fits((MBP.0, height), MBP, 96),
+            "{}x{height} fits",
+            MBP.0
+        );
+    }
+}
+
+#[test]
+fn common_and_panel_sizes_fit() {
+    for size in [(640, 480), (1728, 1117), (3456, 2160), (2624, 1696), MBP] {
+        assert!(monitor_ratio_fits(size, MBP, 96), "{size:?} does not fit");
+    }
+}
+
+#[test]
+fn the_width_is_checked_as_well_as_the_height() {
+    // 96 * 3456 = 331776 needs a common factor of 6 or more; an odd width
+    // shares at most a 3 with it (3455 shares 1, 3453 shares 3).
+    assert!(!monitor_ratio_fits((3455, MBP.1), MBP, 96));
+    assert!(!monitor_ratio_fits((3453, MBP.1), MBP, 96));
+    assert!(monitor_ratio_fits((3456, MBP.1), MBP, 96));
+    // Either axis alone fails the size.
+    assert!(!monitor_ratio_fits((3455, 2160), MBP, 96));
+    assert!(!monitor_ratio_fits((1728, 1934), MBP, 96));
+}
+
+#[test]
+fn the_dpi_scales_the_numerator() {
+    // 1028 shares 4 with 96 * 2234 = 214464, leaving 53616, which fits; at
+    // 192 dpi the same factor leaves 107232, which does not.
+    assert!(monitor_ratio_fits((MBP.0, 1028), MBP, 96));
+    assert!(!monitor_ratio_fits((MBP.0, 1028), MBP, 192));
+    // 1117 divides the numerator at any dpi, and 1728 divides 3456.
+    assert!(monitor_ratio_fits((1728, 1117), MBP, 1000));
+}
+
+#[test]
+fn zero_terms_never_fail() {
+    assert!(monitor_ratio_fits((0, 0), MBP, 96));
+    assert!(monitor_ratio_fits((2992, 1934), MBP, 0));
+    assert!(monitor_ratio_fits((2992, 1934), (0, 0), 96));
+}
+
+#[test]
+fn gcd_reduces_like_euclid() {
+    assert_eq!(gcd(214_464, 1934), 2);
+    assert_eq!(gcd(214_464, 1117), 1117);
+    assert_eq!(gcd(0, 7), 7);
+    assert_eq!(gcd(7, 0), 7);
+}
+
+#[test]
+fn the_physical_extent_is_the_largest_size_on_each_axis() {
+    // A virtual mode is current; the list still carries the physical mode.
+    let list = [(640, 480), MBP, (1728, 1117), (2992, 1934)];
+    assert_eq!(physical_extent((1728, 1117), list), MBP);
+    assert_eq!(physical_extent(MBP, []), MBP);
+    // A list with no dominating entry yields the extent of both axes.
+    assert_eq!(
+        physical_extent((1920, 1080), [(1920, 1200), (2048, 1152)]),
+        (2048, 1200)
+    );
+}
+
+#[test]
+fn unscalable_sizes_are_left_out_in_list_order() {
+    let mut settable = vec![
+        MBP,
+        (2992, 1934),
+        (1728, 1117),
+        (1496, 967),
+        (640, 480),
+        (2336, 1510),
+    ];
+    let dropped = drop_unscalable_sizes(&mut settable, MBP, 96);
+    assert_eq!(settable, vec![MBP, (1728, 1117), (640, 480)]);
+    assert_eq!(dropped, vec![(2992, 1934), (1496, 967), (2336, 1510)]);
+}
+
+#[test]
+fn the_desktop_stays_even_when_it_does_not_fit() {
+    // A virtual mode current when the table is built is its first entry.
+    let mut settable = vec![(2992, 1934), (1496, 967), (640, 480)];
+    let dropped = drop_unscalable_sizes(&mut settable, MBP, 96);
+    assert_eq!(settable, vec![(2992, 1934), (640, 480)]);
+    assert_eq!(dropped, vec![(1496, 967)]);
+}
+
+#[test]
+fn every_known_unscalable_size_is_dropped_and_the_desktop_never_is() {
+    let mut settable = vec![MBP];
+    settable.extend(UNSCALABLE_MBP_HEIGHTS.map(|height| (1000, height)));
+    let dropped = drop_unscalable_sizes(&mut settable, MBP, 96);
+    assert_eq!(settable, vec![MBP]);
+    assert_eq!(dropped.len(), UNSCALABLE_MBP_HEIGHTS.len());
+    assert!(!dropped.contains(&MBP));
+}
+
+#[test]
+fn an_empty_settable_list_drops_nothing() {
+    let mut settable = Vec::new();
+    assert!(drop_unscalable_sizes(&mut settable, MBP, 96).is_empty());
+    assert!(settable.is_empty());
 }

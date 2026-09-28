@@ -288,6 +288,26 @@ record. A knob, where one makes sense, is named with its default.
   count to the pass's attachments with no per-draw override.
   `D3DPRASTERCAPS_MULTISAMPLE_TOGGLE` is not advertised, which is how D3D9
   says the toggle is unavailable, and the first write is logged. No knob.
+- **The adapter mode list leaves out the display sizes win32u cannot scale
+  the monitor to.** After a mode-set, win32u recomputes the monitor's scale
+  as `dpi * physical / size` on each axis, reduces it by the greatest common
+  divisor of its terms, and packs each term into 16 bits. CrossOver 27's
+  win32u asserts that the reduced numerator fits (`make_ratio`,
+  `sysparams.c:324`) and aborts the process when it does not; at 96 dpi on a
+  3456x2234 display that is 2992x1934, 2992x1870, 2336x1510, 2056x1329,
+  2056x1285, 1496x967, 1496x935, 1168x755 and 1168x730, all sizes Wine lists
+  itself. A CrossOver 27 build cannot be told apart from here, so the sizes
+  are left out on every Wine: `EnumAdapterModes` and the main module's
+  `EnumDisplaySettingsW` never offer one, and a fullscreen request for one
+  follows the window, as a request for no display mode does, rather than
+  setting the mode. The physical size is the largest extent on each axis of
+  Win32's mode list, which under `EmulateModeset` is the physical mode, and
+  the DPI is `GetSystemDpiForProcess`. The desktop mode always stays, and the
+  sizes left out are logged once. No site observes it directly:
+  `test_reset_fullscreen` sets the first served size other than the
+  desktop's, which was 2992x1934 and aborted the `device` subtest on
+  CrossOver 27. No knob: the sizes a knob would restore end the process on
+  the Wine that lists them.
 - **A windowed device's `SetGammaRamp` changes nothing on screen**, and only
   the implicit swap chain carries a ramp at all. The ramp is stored and
   `GetGammaRamp` reports it back either way, and it starts applying as soon as
@@ -633,9 +653,14 @@ test_window_style 5220).
 
 The mode list `EnumAdapterModes` serves is a bounded subset of
 `EnumDisplaySettingsW`'s (the sizes of the display's own aspect, largest
-first), so an enumerated mode is one win32u accepts by
-construction, and a fullscreen request for any mode in the full list is set
-whether or not the bounded list carries it. The test binary, being the
+first, then on a notched MacBook panel the sizes of the aspect of the area
+below the notch, largest first, which win32u centres so that they straddle
+the notch strip; the notch area is the mode Wine lists at the physical width
+and 3 % to 4 % shorter, and a display without one gets no second tier), so an
+enumerated mode is one win32u accepts by construction, and a fullscreen
+request for any mode in the full list is set whether or not the bounded list
+carries it. Both lists leave out the sizes win32u cannot scale the monitor to
+(see Kept divergences). The test binary, being the
 process's main module, enumerates the same bounded list through its own
 `EnumDisplaySettingsW` import (d3d9 redirects it at load; user32's list is
 untouched and `ENUM_CURRENT_SETTINGS` passes through), so a mode the test

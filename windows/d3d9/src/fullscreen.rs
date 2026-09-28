@@ -166,6 +166,9 @@ const CDS_FULLSCREEN: u32 = 0x0000_0004;
 /// `ChangeDisplaySettingsW` return value for a mode that was applied.
 const DISP_CHANGE_SUCCESSFUL: i32 = 0;
 
+/// Win32 `USER_DEFAULT_SCREEN_DPI`, the system DPI when none is configured.
+const USER_DEFAULT_SCREEN_DPI: u32 = 96;
+
 /// The mode-list ceiling for [`enumerate_display_modes`].
 ///
 /// Wine's virtual list is a few dozen entries; a driver enumerating without
@@ -272,6 +275,31 @@ pub fn enumerate_display_modes() -> Vec<DisplayModeInfo> {
     modes
 }
 
+/// The system DPI win32u scales each monitor by.
+///
+/// `GetSystemDpiForProcess` answers it whatever the process's DPI awareness,
+/// and it is the value Wine's display drivers give win32u for every display
+/// source; `GetDpiForSystem` answers 96 to a DPI-unaware process instead. A
+/// query that answers 0 is taken as the Windows default of 96, with a
+/// warning.
+pub fn system_dpi() -> u32 {
+    // SAFETY: `GetCurrentProcess` takes no arguments and returns the
+    // current-process pseudo-handle.
+    let process = unsafe { crate::GetCurrentProcess() };
+    // SAFETY: `process` is the current-process pseudo-handle, the one
+    // process the call answers for.
+    let dpi = unsafe { GetSystemDpiForProcess(process) };
+    if dpi == 0 {
+        mtld3d_shared::log_once_warn!(
+            target: LOG_TARGET,
+            "GetSystemDpiForProcess answered 0; the mode filter assumes \
+             {USER_DEFAULT_SCREEN_DPI} dpi"
+        );
+        return USER_DEFAULT_SCREEN_DPI;
+    }
+    dpi
+}
+
 /// Set `request` as the primary display's mode, `true` on success.
 ///
 /// Compare-first: a mode that is already current is left alone, which keeps
@@ -363,6 +391,7 @@ unsafe extern "system" {
     fn EnumDisplaySettingsW(device_name: *const u16, mode_num: u32, dev_mode: *mut DevModeW)
     -> i32;
     fn GetMonitorInfoW(monitor: *mut c_void, info: *mut MonitorInfo) -> i32;
+    fn GetSystemDpiForProcess(process: *mut c_void) -> u32;
     fn GetWindowLongW(hwnd: *mut c_void, index: i32) -> i32;
     fn GetWindowRect(hwnd: *mut c_void, rect: *mut Rect) -> i32;
     fn IsWindow(hwnd: *mut c_void) -> i32;

@@ -340,10 +340,14 @@ The resolution picked in the game's video options therefore sizes the frame.
 `render.scale` in `mtld3d.conf` multiplies on top of it, rendering fewer
 pixels and upscaling the result to the screen.
 
-The resolution list a game sees carries sizes of the display's own aspect
-only, largest first and at most 15 per colour format, because Wine's full list
-overflows menus built for a driver's short one. Any mode Wine accepts stays
-settable whether listed or not. A request that matches no mode, such as a size
-a game derived from its own window, follows the window instead. A fullscreen
-game is never told it lost its device on a focus change: the desktop mode
-comes back on deactivation and the game's mode is set again on activation.
+The resolution list a game sees describes the primary display. It carries
+the sizes of the display's own aspect, largest first, and on a notched
+MacBook then the sizes of the area below the notch, largest first (Wine
+centres them, so they straddle the strip beside the notch), at most 15 per
+colour format, because Wine's full list overflows menus built for a driver's
+short one. Any mode Wine accepts stays settable whether listed or not, except
+the sizes some Wine builds abort on (`docs/STATUS.md`, Kept divergences). A
+request that matches no mode, such as a size a game derived from its own
+window, follows the window instead. A fullscreen game is never told it lost
+its device on a focus change: the desktop mode comes back on deactivation and
+the game's mode is set again on activation.
