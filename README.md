@@ -147,11 +147,28 @@ into `lib/wine/aarch64-windows` of the arm64 Wine `WINE_ARM64` names, with the
 arm64 `mtld3d.so` in its `aarch64-unix`; the x86 install trees get nothing
 more than without `EC=1`. That Wine then loads the pair for x64 processes in
 prefixes created after the install; 32-bit games keep loading the i386 DLLs.
-`EC=1 make test` adds a leg that runs the x64 end-to-end suite under that Wine
-in a prefix it creates afresh, `EC=1 make conformance` one that runs the
-x86_64 conformance binary there, `EC=1 make bundle` adds the pair to both
-archives and `EC=1 make check` lints both halves. Without `EC=1` no target
-builds, installs, tests or checks any of it.
+`EC=1 make test` adds a leg that runs the x64 end-to-end suite against that
+pair, `EC=1 make conformance` one that runs the x86_64 conformance binary
+against it, `EC=1 make bundle` adds the pair to both archives and
+`EC=1 make check` lints both halves. Without `EC=1` no target builds,
+installs, tests or checks any of it.
+
+`ARM64=1` is the other half: the i686 and x86_64 builds that ship, under an
+arm64 Wine. `ARM64=1 make install` puts them into `i386-windows` and
+`x86_64-windows` of `WINE_ARM64`, with the arm64 `mtld3d.so`, and replaces
+the `d3d9.dll` and `mtld3d.dll` of its `aarch64-windows`, ours from an
+`EC=1` install or Wine's own, with x64 markers, so that x64 processes load the
+x86_64 build (`INSTALL.md` says why). `ARM64=1 make test` and
+`ARM64=1 make conformance` add a leg per arch under that Wine. `ARM64=1`
+needs `WINE_ARM64` and none of the ARM64X toolchain below. With both
+switches, `make install` puts all three builds in and x64 processes get the
+ARM64X one, and `make test` runs all three arm64 legs.
+
+Every arm64 leg runs in a private clone of `WINE_ARM64` with a prefix created
+for the run, so the legs never see each other's DLLs and never write into
+`WINE_ARM64` itself; only `make install` does. The same switches move
+`make bench` and `make bench-ab` onto that Wine, and `make bench-variants`
+compares the layouts with each other (`CONTRIBUTING.md`, Benchmarks).
 
 The leg needs, beyond the above, a toolchain and four paths. None of the paths
 has a default: each comes from the environment, and a target that needs one
@@ -169,8 +186,8 @@ fails naming it when it is unset or points at the wrong thing.
   `EC=1 make check` read it.
 - An arm64 Wine, such as CrossOver 27's; `WINE_ARM64` names the directory
   holding its `bin/wine` and `lib/wine`. Only the install, test and
-  conformance legs read it, so `EC=1 make` and `EC=1 make check` run without
-  it.
+  conformance targets of `EC=1` and `ARM64=1` read it, so `EC=1 make` and
+  `EC=1 make check` run without it.
 
 The leg checks for each of these before it builds and names what is missing.
 

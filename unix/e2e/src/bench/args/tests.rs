@@ -321,3 +321,37 @@ fn shape_takes_the_game_log_and_the_metrics_file() {
     let reason = parse_shape(args(&["--game-log"])).unwrap_err();
     assert!(reason.contains("--game-log needs a value"), "{reason}");
 }
+
+#[test]
+fn layouts_come_for_both_legs_or_neither() {
+    let with = |extra: &[&str]| {
+        let mut tokens = vec!["--out", "/ab"];
+        tokens.extend(LEGS);
+        tokens.extend(extra);
+        tokens.extend(["--", "/e2e.exe"]);
+        parse_ab(args(&tokens))
+    };
+    assert!(with(&[]).unwrap().layouts.is_none());
+    let config = with(&[
+        "--base-runtime",
+        "sdk",
+        "--base-variant",
+        "x86_64",
+        "--cand-runtime",
+        "arm64",
+        "--cand-variant",
+        "x86_64",
+    ])
+    .unwrap();
+    let layouts = config.layouts.unwrap();
+    assert_eq!(layouts.base.runtime, "sdk");
+    assert_eq!(layouts.cand.runtime, "arm64");
+    assert_eq!(layouts.cand.variant, "x86_64");
+    let reason = with(&["--base-runtime", "sdk", "--base-variant", "x86_64"]).unwrap_err();
+    assert!(reason.contains("both legs or neither"), "{reason}");
+    let reason = with(&["--cand-runtime", "arm64"]).unwrap_err();
+    assert!(
+        reason.contains("--cand-runtime without --cand-variant"),
+        "{reason}"
+    );
+}

@@ -522,3 +522,42 @@ fn benchmark_log_environment_fixture() {
     }
     fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn a_layout_comparison_runs_one_commit_in_two_layouts() {
+    let layouts = |base: (&str, &str), cand: (&str, &str)| Layouts {
+        base: compare::Layout {
+            runtime: base.0.to_owned(),
+            variant: base.1.to_owned(),
+        },
+        cand: compare::Layout {
+            runtime: cand.0.to_owned(),
+            variant: cand.1.to_owned(),
+        },
+    };
+    let sdk = fake_wine("layout-sdk", "wine-11.0", "server-a");
+    let arm64 = fake_wine("layout-arm64", "wine-10.0", "server-b");
+    let two_runtimes = layouts(("sdk", "x86_64"), ("arm64", "x86_64"));
+    let wine = check_layouts(&sdk, &arm64, &two_runtimes).unwrap();
+    assert!(
+        wine.starts_with("base wine-11.0 (") && wine.contains("cand wine-10.0 ("),
+        "{wine}"
+    );
+
+    let one_runtime = layouts(("arm64", "x86_64"), ("arm64", "arm64x"));
+    let reason = check_layouts(&sdk, &arm64, &one_runtime).unwrap_err();
+    assert!(reason.contains("different Wines"), "{reason}");
+
+    let same = layouts(("arm64", "x86_64"), ("arm64", "x86_64"));
+    let reason = check_layouts(&arm64, &arm64, &same).unwrap_err();
+    assert!(reason.contains("needs two"), "{reason}");
+
+    let mut other_commit = fake_wine("layout-other", "wine-10.0", "server-b");
+    other_commit.stamp = "v2".to_owned();
+    let reason = check_layouts(&arm64, &other_commit, &one_runtime).unwrap_err();
+    assert!(reason.contains("one commit"), "{reason}");
+
+    for spec in [sdk, arm64, other_commit] {
+        let _ = fs::remove_dir_all(spec.wine.parent().unwrap());
+    }
+}

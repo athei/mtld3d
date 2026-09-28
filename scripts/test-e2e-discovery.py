@@ -46,6 +46,10 @@ class E2eDiscoveryTests(unittest.TestCase):
         self.environment = os.environ.copy()
         for name in ("MAKEFLAGS", "MFLAGS", "GNUMAKEFLAGS", "MAKEOVERRIDES", "MAKELEVEL"):
             self.environment.pop(name, None)
+        # The opt-in switches move the benchmarks onto another Wine and build,
+        # which the fake SDK here does not model; the tests pin the default.
+        for name in ("EC", "ARM64"):
+            self.environment.pop(name, None)
         self.environment["PATH"] = f"{self.root}{os.pathsep}{self.environment['PATH']}"
 
     def run_make(self, *arguments, fail_target):

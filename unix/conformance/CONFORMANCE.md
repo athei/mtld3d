@@ -20,7 +20,8 @@ make conformance-intel-i686     # one arch under the intel.* keys
 make conformance-scale          # both arches at render.scale = 0.75
 make conformance-scale-i686     # one arch at render.scale = 0.75 (what CI runs, on one image)
 make conformance-baseline       # (re)record this machine's six legs of baseline.txt in sequence
-EC=1 make conformance-arm64x    # the x86_64 binary under the arm64 Wine (The ARM64X leg, below)
+ARM64=1 make conformance        # also both arches under the arm64 Wine (The arm64-runtime legs, below)
+EC=1 make conformance-arm64x    # the x86_64 binary against the ARM64X build, same Wine
 ```
 
 A leg is one architecture under one variant on one GPU family. The `intel`
@@ -49,24 +50,27 @@ workflow with `record_intel_baseline` and copy the `@mac2` sections out of
 the `baseline-mac2-<arch>` artifacts (`make conformance-baseline` on an Apple
 Silicon machine leaves them untouched, the merge being leg-scoped).
 
-### The ARM64X leg
+### The arm64-runtime legs
 
-`EC=1 make conformance` adds `conformance-arm64x`: the x86_64 `d3d9_test.exe`
-that `conformance-x86_64` runs, out of the x86_64 Wine SDK (a PE test runs
-under any Wine), run under the arm64 Wine that `WINE_ARM64` names, whose x64
-processes load the ARM64X `d3d9.dll` and `mtld3d.dll` `make install` put
-there. It runs in a prefix of its own, created afresh after the install and
+`ARM64=1 make conformance` adds `conformance-i686-arm64` and
+`conformance-x86_64-arm64`, and `EC=1` adds `conformance-arm64x`. Each runs
+the SDK's own `d3d9_test.exe` of its arch, the binary `conformance-<arch>`
+runs (a PE test runs under any Wine), under the arm64 Wine that `WINE_ARM64`
+names: the two x86 legs against the i686 and x86_64 builds, the ARM64X leg
+the x86_64 binary against the ARM64X build. Every leg runs in a private clone
+of that Wine with its own prefix, created afresh after the leg's install and
 configured by `configure-test-prefix` as the other legs' prefixes are.
 
-It has no baseline entries of its own. It records under the `x86_64` label, so
-the runner judges it against the `[x86_64/...]` entries, which were taken on
-the x86_64 Wine the SDK is (the header's `Wine:` line names it, and the runner
-warns that the arm64 Wine's version differs), and on the same Apple GPU
-family. What it reports is therefore how the arm64 runtime differs from that
-baseline: the ARM64X build, CrossOver's arm64 Wine and its x64 translation
-together. How such a run should be keyed, as a leg of its own or under the
-x86_64 entries, is not decided, so there is no `conformance-baseline-arm64x`,
-and a site this leg moves is not reclassified here on its evidence alone.
+None of them has baseline entries of its own. Each records under its arch's
+label, so the runner judges it against that arch's entries, which were taken
+on the x86_64 Wine the SDK is (the header's `Wine:` line names it, and the
+runner warns that the arm64 Wine's version differs), and on the same Apple GPU
+family. What a leg reports is therefore how its runtime differs from that
+baseline: CrossOver's arm64 Wine and its x86 translation, plus, for the
+ARM64X leg, the ARM64X build. How such runs should be keyed, as legs of their
+own or under the existing entries, is not decided, so none has a baseline
+target, and a site one of them moves is not reclassified here on its evidence
+alone.
 
 Set `MTLD3D_CONFORMANCE_RAW_DIR=<dir>` to also persist each subtest's full raw
 output to `<dir>/<leg>-<subtest>.log`. The normal run reduces output to per-site

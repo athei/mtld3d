@@ -21,7 +21,11 @@
 //! by doing the same. A run of one clean commit against itself also leaves
 //! a `same-image-allowed` file there (see `compare::check_builds`), so a later
 //! `bench-compare` judges it the way `bench-ab` did, and a `wine.txt` naming
-//! the one Wine both legs ran, which the report quotes. After its timed
+//! the one Wine both legs ran, which the report quotes. A layout comparison
+//! (`--base-runtime` and the three flags beside it) runs one commit in two
+//! layouts, a Wine and a build of the PE side each, and leaves a
+//! `layouts.txt` naming them; its `wine.txt` names both Wines when the
+//! runtimes differ (see `compare::Layouts`). After its timed
 //! rounds every benchmark whose metrics declare `shape` lines also runs once
 //! per leg with the layer's pass trace on, into `<leg>/shape/<test>/`; that
 //! run is not timed, and its log is what the pass-shape comparison reads
@@ -64,6 +68,9 @@ const SAME_IMAGE_FILE: &str = "same-image-allowed";
 
 /// The file in an A/B directory that names the one Wine both legs ran.
 const WINE_FILE: &str = "wine.txt";
+
+/// The file in an A/B directory that names each leg's layout, in a layout comparison.
+const LAYOUTS_FILE: &str = "layouts.txt";
 
 /// One of the two builds an A/B run compares, and the directory its runs write into.
 #[derive(Debug, PartialEq, Eq)]

@@ -4,7 +4,7 @@ use std::{path::PathBuf, time::Duration};
 
 use super::{
     ab::{AbConfig, HostBench, LegSpec},
-    compare::Options,
+    compare::{Layout, Layouts, Options},
 };
 
 /// How long a benchmark process may go without a line when `--timeout` is not given.
@@ -106,6 +106,10 @@ pub fn parse_compare(mut args: impl Iterator<Item = String>) -> Result<CompareCo
 /// `--wait-idle <secs>` waits for three consecutive measured quiet samples
 /// before each timed process, for at most that many seconds; zero (the
 /// default) keeps the single advisory sample without waiting.
+/// `--<leg>-runtime <name>` and `--<leg>-variant <name>`, given for both legs
+/// or not at all, make the run a layout comparison: one commit in two
+/// layouts, which may run two Wines and share a binary's image (see
+/// `compare::Layouts`).
 ///
 /// # Errors
 ///
@@ -140,6 +144,10 @@ pub fn parse_ab(mut args: impl Iterator<Item = String>) -> Result<AbConfig, Stri
             "--cand-prefix" => cand.prefix = Some(PathBuf::from(value(&mut args, &arg)?)),
             "--cand-stamp" => cand.stamp = Some(value(&mut args, &arg)?),
             "--cand-config" => cand.config = Some(value(&mut args, &arg)?),
+            "--base-runtime" => base.runtime = Some(value(&mut args, &arg)?),
+            "--base-variant" => base.variant = Some(value(&mut args, &arg)?),
+            "--cand-runtime" => cand.runtime = Some(value(&mut args, &arg)?),
+            "--cand-variant" => cand.variant = Some(value(&mut args, &arg)?),
             "--out" => out = Some(PathBuf::from(value(&mut args, &arg)?)),
             "--runs" => {
                 runs = count(&value(&mut args, &arg)?, &arg)?;
@@ -195,6 +203,15 @@ pub fn parse_ab(mut args: impl Iterator<Item = String>) -> Result<AbConfig, Stri
             );
         }
     };
+    let layouts = match (base.layout("base")?, cand.layout("cand")?) {
+        (Some(base), Some(cand)) => Some(Layouts { base, cand }),
+        (None, None) => None,
+        (Some(_), None) | (None, Some(_)) => {
+            return Err(
+                "--<leg>-runtime and --<leg>-variant go with both legs or neither".to_owned(),
+            );
+        }
+    };
     Ok(AbConfig {
         base: base.finish("base")?,
         cand: cand.finish("cand")?,
@@ -209,6 +226,7 @@ pub fn parse_ab(mut args: impl Iterator<Item = String>) -> Result<AbConfig, Stri
         report,
         host,
         corpus_dir,
+        layouts,
     })
 }
 
@@ -219,9 +237,21 @@ struct PartialLeg {
     prefix: Option<PathBuf>,
     stamp: Option<String>,
     config: Option<String>,
+    runtime: Option<String>,
+    variant: Option<String>,
 }
 
 impl PartialLeg {
+    /// The leg's layout, `None` without one, or which half of it is missing.
+    fn layout(&mut self, leg: &str) -> Result<Option<Layout>, String> {
+        match (self.runtime.take(), self.variant.take()) {
+            (Some(runtime), Some(variant)) => Ok(Some(Layout { runtime, variant })),
+            (None, None) => Ok(None),
+            (Some(_), None) => Err(format!("--{leg}-runtime without --{leg}-variant")),
+            (None, Some(_)) => Err(format!("--{leg}-variant without --{leg}-runtime")),
+        }
+    }
+
     /// The leg, or which of its flags is missing.
     fn finish(self, leg: &str) -> Result<LegSpec, String> {
         let missing = |flag: &str| format!("missing --{leg}-{flag}");

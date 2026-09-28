@@ -47,8 +47,8 @@ use std::{
 };
 
 use super::{
-    Leg, SAME_IMAGE_FILE, SHAPE_DIR, WINE_FILE,
-    compare::{self, Options},
+    LAYOUTS_FILE, Leg, SAME_IMAGE_FILE, SHAPE_DIR, WINE_FILE,
+    compare::{self, Layouts, Options},
     machine,
     metrics::{self, Class, MetricsFile},
     shape::{self, Identity, SHAPE_RUST_LOG},
@@ -123,6 +123,8 @@ pub struct AbConfig {
     pub host: Option<HostBench>,
     /// The staged shader caches, linked into every end-to-end run's directory as `corpus`.
     pub corpus_dir: Option<PathBuf>,
+    /// Each leg's layout, when the run compares one commit in two layouts.
+    pub layouts: Option<Layouts>,
 }
 
 /// The host emitter benchmark: each leg's own `emit_corpus`, and the caches both read.
@@ -182,12 +184,22 @@ pub fn run(config: &AbConfig) -> Result<ExitCode, String> {
             ));
         }
     }
-    let wine = check_wine(&config.base, &config.cand)?;
+    let wine = match &config.layouts {
+        Some(layouts) => check_layouts(&config.base, &config.cand, layouts)?,
+        None => check_wine(&config.base, &config.cand)?,
+    };
     fs::create_dir_all(&out).map_err(|e| format!("{}: {e}", out.display()))?;
     let wine_file = out.join(WINE_FILE);
     fs::write(&wine_file, format!("{wine}\n"))
         .map_err(|e| format!("{}: {e}", wine_file.display()))?;
-    println!("bench-ab: both legs run {wine}");
+    if let Some(layouts) = &config.layouts {
+        let layouts_file = out.join(LAYOUTS_FILE);
+        fs::write(&layouts_file, layouts.render())
+            .map_err(|e| format!("{}: {e}", layouts_file.display()))?;
+        println!("bench-ab: {}; wine: {wine}", layouts.describe());
+    } else {
+        println!("bench-ab: both legs run {wine}");
+    }
     let benches = select_benches(config)?;
     if config.options.allow_same_image {
         // Recorded in the directory so that a later `bench-compare` of it
@@ -416,6 +428,43 @@ pub fn check_wine(base: &LegSpec, cand: &LegSpec) -> Result<String, String> {
         ));
     }
     Ok(format!("{base_version}, one wineserver"))
+}
+
+/// Check the legs of a layout comparison, and name the Wine or Wines they run.
+///
+/// Both legs build one commit, so their stamps must match, and their layouts
+/// must differ, or the run compares nothing. Legs of one runtime have to run
+/// one Wine, as in [`check_wine`]; legs of two runtimes run two, which the
+/// comparison is about, and the result names both.
+///
+/// # Errors
+///
+/// Returns a message when the stamps differ, the layouts are the same, a
+/// loader cannot be run, or legs of one runtime run two Wines.
+pub fn check_layouts(base: &LegSpec, cand: &LegSpec, layouts: &Layouts) -> Result<String, String> {
+    if base.stamp != cand.stamp {
+        return Err(format!(
+            "a layout comparison runs one commit in both legs, but base is stamped {} and \
+             cand {}",
+            base.stamp, cand.stamp
+        ));
+    }
+    if layouts.base == layouts.cand {
+        return Err(format!(
+            "both legs have the layout {} {}: a layout comparison needs two",
+            layouts.base.runtime, layouts.base.variant
+        ));
+    }
+    if layouts.base.runtime == layouts.cand.runtime {
+        return check_wine(base, cand);
+    }
+    Ok(format!(
+        "base {} ({}), cand {} ({})",
+        wine_version(&base.wine)?,
+        base.wine.display(),
+        wine_version(&cand.wine)?,
+        cand.wine.display()
+    ))
 }
 
 /// What `wine --version` prints, which the loader answers without a prefix or a server.

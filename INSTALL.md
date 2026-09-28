@@ -52,6 +52,25 @@ of `wine/`, they serve x64 games in prefixes created after the copy, which
 then run the PE side as native code. An x86_64 Wine never reads that
 directory.
 
+Which `d3d9.dll` an x64 process on an arm64 Wine gets is decided by
+`aarch64-windows`: `wineboot` fills a new prefix's `system32` from there, and
+a `d3d9.dll` in it that is an ARM64X image, ours or Wine's own, sends the
+loader to `aarch64-windows` for x64 processes too. The source tree's
+`make install` sets it up for either choice (see the `README.md`):
+
+- `EC=1 make install`: x64 processes get the ARM64X build; 32-bit processes
+  keep whatever `i386-windows` holds.
+- `ARM64=1 make install`: the i686 and x86_64 builds go into `i386-windows`
+  and `x86_64-windows`, and `aarch64-windows` gets x64 fake-module markers
+  for `d3d9.dll` and `mtld3d.dll` in place of any ARM64X copy, Wine's own
+  `d3d9.dll` included. x64 processes get the x86_64 build and 32-bit ones the
+  i686 build; an arm64 process has no `d3d9.dll`.
+- `EC=1 ARM64=1 make install`: all three. x64 processes get the ARM64X build,
+  32-bit processes the i686 one.
+
+Only prefixes created after the install see the change. A prefix keeps what
+`wineboot` copied into its `system32` when it was made.
+
 Common to both routes: `mtld3d.dll` + `mtld3d.so` are a custom-named Wine
 builtin pair — the PE half can only reach its unix half when loaded as a
 builtin, so there is no native variant of it. And Wine resolves builtin

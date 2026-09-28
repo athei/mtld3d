@@ -1559,3 +1559,97 @@ fn notes_many_benchmarks_share_print_once() {
         keys[0]
     );
 }
+
+#[test]
+fn a_layout_comparison_notes_the_images_its_layouts_share() {
+    let fixture = Fixture::new("layouts");
+    for round in 0..3 {
+        fixture.write(
+            "base",
+            round,
+            "b",
+            &meta_unix("v1", "X64", "SO"),
+            &[("x", 1.0, "ms lower time")],
+        );
+        fixture.write(
+            "cand",
+            round,
+            "b",
+            &meta_unix("v1", "ARM64X", "SO"),
+            &[("x", 1.0, "ms lower time")],
+        );
+    }
+    // Without the file, one mtld3d.so in both legs is refused.
+    assert!(evaluate(&fixture.root, &Options::default()).is_err());
+    let layouts = Layouts::parse("base arm64 x86_64\ncand arm64 arm64x\n").unwrap();
+    fs::write(fixture.root.join(LAYOUTS_FILE), layouts.render()).unwrap();
+    let comparison = evaluate(&fixture.root, &Options::default()).unwrap();
+    assert!(
+        comparison
+            .notes
+            .iter()
+            .any(|note| note == "both legs ran mtld3d.so image SO: their layouts share it"),
+        "{:?}",
+        comparison.notes
+    );
+    assert!(
+        comparison.header.iter().any(|line| line
+            == "layouts: base arm64 runtime, x86_64 DLLs   cand arm64 runtime, arm64x DLLs"),
+        "{:?}",
+        comparison.header
+    );
+}
+
+#[test]
+fn a_layout_comparison_refuses_two_commits_and_bad_files() {
+    let fixture = Fixture::new("layouts-stamps");
+    for round in 0..3 {
+        fixture.write(
+            "base",
+            round,
+            "b",
+            &meta("v1", "A"),
+            &[("x", 1.0, "ms lower time")],
+        );
+        fixture.write(
+            "cand",
+            round,
+            "b",
+            &meta("v2", "B"),
+            &[("x", 1.0, "ms lower time")],
+        );
+    }
+    fs::write(
+        fixture.root.join(LAYOUTS_FILE),
+        "base sdk x86_64\ncand arm64 x86_64\n",
+    )
+    .unwrap();
+    let reason = error_of(&fixture);
+    assert!(reason.contains("one commit in both legs"), "{reason}");
+    assert!(Layouts::parse("base sdk x86_64\n").is_err());
+    assert!(Layouts::parse("base sdk\ncand arm64 x86_64\n").is_err());
+    assert!(Layouts::parse("base sdk x86_64\nbase arm64 x86_64\ncand a b\n").is_err());
+}
+
+#[test]
+fn a_layout_comparison_of_one_layout_is_refused() {
+    let fixture = Fixture::new("layouts-one");
+    for round in 0..3 {
+        for leg in ["base", "cand"] {
+            fixture.write(
+                leg,
+                round,
+                "b",
+                &meta("v1", "SAME"),
+                &[("x", 1.0, "ms lower time")],
+            );
+        }
+    }
+    fs::write(
+        fixture.root.join(LAYOUTS_FILE),
+        "base arm64 x86_64\ncand arm64 x86_64\n",
+    )
+    .unwrap();
+    let reason = error_of(&fixture);
+    assert!(reason.contains("a layout comparison needs two"), "{reason}");
+}
