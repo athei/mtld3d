@@ -331,14 +331,15 @@ fn single_stream_records_match_checked_writer_and_reuse_failed_rollover() {
     use crate::{
         draw_data::{ExtraStreams, StreamBinding},
         encoder_draw::draw_record::{
-            BoundVertices, DrawPrefix, IndexBuffer, bound_payload_size, write_bound_into,
+            BoundVertices, DrawPrefix, IndexBuffer, StreamRecord, bound_payload_size,
+            write_bound_into,
         },
     };
 
     for index_kind in [None, Some(IndexType::UInt16), Some(IndexType::UInt32)] {
         for owned_empty in [false, true] {
             let vertices = BoundVertices {
-                first: StreamBinding {
+                first: StreamRecord::from_binding(&StreamBinding {
                     stream: 7,
                     buffer_id: BufferId::new_unique(),
                     backing_ptr: 0x1234,
@@ -347,7 +348,7 @@ fn single_stream_records_match_checked_writer_and_reuse_failed_rollover() {
                     offset: 12,
                     stride: 24,
                     freq: 0x4000_0011,
-                },
+                }),
                 extra: if owned_empty {
                     ExtraStreams::Owned(Box::new([]))
                 } else {
@@ -509,7 +510,7 @@ fn capture_failure_survives_later_snapshot_draw_and_owned_control() {
             unreachable!()
         };
         let vertices = crate::encoder_draw::draw_record::BoundVertices {
-            first,
+            first: crate::encoder_draw::draw_record::StreamRecord::from_binding(&first),
             extra,
             stream0_freq,
         };
@@ -1118,6 +1119,235 @@ fn recovered_recording_storage_keeps_every_lease_vector_capacity() {
         for slot in lease.into_slots().into_iter().flatten() {
             pool.recycle(slot);
         }
+    }
+}
+
+fn replayed_draw_payloads(frame: FrameData, recorder: FrameRecorder) -> Vec<Vec<u8>> {
+    let mut owner = seal(frame, recorder);
+    let mut packet = admit(&mut owner);
+    let mut payloads = Vec::new();
+    while replay(&mut packet, |command, _, _| {
+        assert!(matches!(command.opcode(), EncoderOpcode::Draw));
+        payloads.push(command.payload().to_vec());
+        Ok(())
+    })
+    .unwrap()
+    {}
+    drop(
+        packet
+            .into_frame()
+            .unwrap_or_else(|(error, _)| panic!("complete: {error:?}")),
+    );
+    drain_all(&owner);
+    assert!(owner.maintain());
+    payloads
+}
+
+fn single_stream_binding() -> crate::draw_data::StreamBinding {
+    crate::draw_data::StreamBinding {
+        stream: 5,
+        buffer_id: BufferId::new_unique(),
+        backing_ptr: 0x0001_2340,
+        backing_len: 8192,
+        backing_generation: 0x1122_3344_5566_7788,
+        offset: 12,
+        stride: 24,
+        freq: 0x4000_0011,
+    }
+}
+
+/// Record `draw` four times through the direct append, with a chunk that holds two records.
+///
+/// The first attempt finds no open region and the third a full one; both fall back to the
+/// checked writer, which opens a region, so the frame spans two regions.
+fn append_single_stream_draws<D: crate::encoder_draw::draw_record::SingleStreamDraw>(
+    vertices: &crate::encoder_draw::draw_record::BoundVertices,
+    draw: &D,
+    record_bytes: usize,
+) -> Vec<Vec<u8>> {
+    let mut frame = empty_frame();
+    frame.scratch = ScratchArena::with_chunk_size(2 * record_bytes + 16);
+    let mut recorder = FrameRecorder::new();
+    let mut appended = Vec::new();
+    for _ in 0..4 {
+        let used = frame.scratch.bytes_used();
+        let count = recorder.len();
+        let direct = recorder.try_append_single_stream(&mut frame.scratch, vertices, draw);
+        if direct {
+            assert_eq!(frame.scratch.bytes_used(), used + record_bytes as u64);
+        } else {
+            assert_eq!(frame.scratch.bytes_used(), used);
+            assert_eq!(recorder.len(), count);
+            recorder
+                .record_bound_draw(&mut frame.scratch, draw.prefix(), vertices, draw.index())
+                .unwrap();
+        }
+        assert_eq!(recorder.len(), count + 1);
+        appended.push(direct);
+    }
+    assert_eq!(appended, [false, true, false, true]);
+    assert_eq!(
+        frame.scratch.chunk_count(),
+        2,
+        "fixture must cross a region boundary"
+    );
+    replayed_draw_payloads(frame, recorder)
+}
+
+#[test]
+fn single_stream_append_matches_the_draw_op_encoding_across_regions() {
+    use mtld3d_shared::{
+        command_header::COMMAND_HEADER_BYTES,
+        mtl::{IndexType, PrimitiveType},
+    };
+
+    use crate::{
+        draw_data::{DrawOp, ExtraStreams, IndexSource, VertexSource},
+        encoder_draw::draw_record::{
+            BoundVertices, IndexBuffer, IndexedDraw, NonindexedDraw, SINGLE_BOUND_BYTES,
+            SINGLE_INDEXED_BOUND_BYTES, StreamRecord,
+        },
+    };
+
+    for index_type in [None, Some(IndexType::UInt16), Some(IndexType::UInt32)] {
+        let binding = single_stream_binding();
+        let stream0_freq = 0x8000_0003;
+        let index_buffer = BufferId::new_unique();
+        let draw_op = DrawOp {
+            metal_prim: PrimitiveType::TriangleStrip,
+            vertex_source: VertexSource::Bound {
+                first: binding.copy_value(),
+                extra: ExtraStreams::EMPTY,
+                stream0_freq,
+            },
+            index_source: index_type.map_or(
+                IndexSource::None {
+                    start_vertex: u32::MAX - 9,
+                    vertex_count: 9,
+                },
+                |index_type| IndexSource::Bound {
+                    buffer_id: index_buffer,
+                    backing_ptr: 0x0005_6780,
+                    backing_len: 4096,
+                    backing_generation: 123,
+                    offset: 16,
+                    index_count: 9,
+                    index_type,
+                    base_vertex: i32::MIN,
+                },
+            ),
+        };
+        let mut frame = empty_frame();
+        let mut recorder = FrameRecorder::new();
+        for _ in 0..4 {
+            recorder.record_draw(&mut frame.scratch, &draw_op).unwrap();
+        }
+        let expected = replayed_draw_payloads(frame, recorder);
+
+        let vertices = BoundVertices {
+            first: StreamRecord::from_binding(&binding),
+            extra: ExtraStreams::EMPTY,
+            stream0_freq,
+        };
+        let actual = index_type.map_or_else(
+            || {
+                append_single_stream_draws(
+                    &vertices,
+                    &NonindexedDraw {
+                        primitive: PrimitiveType::TriangleStrip,
+                        start_vertex: u32::MAX - 9,
+                        vertex_count: 9,
+                    },
+                    COMMAND_HEADER_BYTES + SINGLE_BOUND_BYTES,
+                )
+            },
+            |index_type| {
+                append_single_stream_draws(
+                    &vertices,
+                    &IndexedDraw {
+                        primitive: PrimitiveType::TriangleStrip,
+                        base_vertex: i32::MIN,
+                        index_count: 9,
+                        index: &IndexBuffer {
+                            buffer: index_buffer.raw(),
+                            address: 0x0005_6780,
+                            length: 4096,
+                            generation: 123,
+                            offset: 16,
+                            kind: index_type as u8,
+                            reserved: [0; 3],
+                        },
+                    },
+                    COMMAND_HEADER_BYTES + SINGLE_INDEXED_BOUND_BYTES,
+                )
+            },
+        );
+        assert_eq!(actual.len(), 4);
+        assert_eq!(actual, expected);
+    }
+}
+
+#[test]
+fn single_stream_append_declines_latched_errors_and_extra_streams_without_writing() {
+    use mtld3d_shared::mtl::PrimitiveType;
+
+    use crate::{
+        draw_data::ExtraStreams,
+        encoder_draw::draw_record::{
+            BoundVertices, NonindexedDraw, SingleStreamDraw, StreamRecord,
+        },
+    };
+
+    let draw = NonindexedDraw {
+        primitive: PrimitiveType::Triangle,
+        start_vertex: 3,
+        vertex_count: 6,
+    };
+    let single = BoundVertices {
+        first: StreamRecord::from_binding(&single_stream_binding()),
+        extra: ExtraStreams::EMPTY,
+        stream0_freq: 1,
+    };
+    for extra in [
+        ExtraStreams::Owned(Box::new([])),
+        ExtraStreams::Owned(Box::new([single_stream_binding()])),
+    ] {
+        let mut scratch = ScratchArena::new();
+        let mut recorder = FrameRecorder::new();
+        recorder
+            .record_bound_draw(&mut scratch, draw.prefix(), &single, None)
+            .unwrap();
+        let vertices = BoundVertices {
+            first: StreamRecord::from_binding(&single_stream_binding()),
+            extra,
+            stream0_freq: 1,
+        };
+        let used = scratch.bytes_used();
+        assert!(!recorder.try_append_single_stream(&mut scratch, &vertices, &draw));
+        assert_eq!((scratch.bytes_used(), recorder.len()), (used, 1));
+        recorder
+            .record_bound_draw(&mut scratch, draw.prefix(), &vertices, None)
+            .unwrap();
+        assert_eq!(recorder.len(), 2);
+    }
+
+    for error in [WireError::AllocationFailed, WireError::InvalidValue] {
+        let mut scratch = ScratchArena::new();
+        let mut recorder = FrameRecorder::new();
+        recorder
+            .record_bound_draw(&mut scratch, draw.prefix(), &single, None)
+            .unwrap();
+        assert!(recorder.try_append_single_stream(&mut scratch, &single, &draw));
+        assert_eq!(recorder.finish_record(Err(error)), Err(error));
+        let used = scratch.bytes_used();
+        assert!(!recorder.try_append_single_stream(&mut scratch, &single, &draw));
+        assert_eq!((scratch.bytes_used(), recorder.len()), (used, 2));
+        assert_eq!(
+            recorder.record_bound_draw(&mut scratch, draw.prefix(), &single, None),
+            Err(error)
+        );
+        assert_eq!((scratch.bytes_used(), recorder.len()), (used, 2));
+        assert_eq!(recorder.recording_error(), Some(error));
     }
 }
 

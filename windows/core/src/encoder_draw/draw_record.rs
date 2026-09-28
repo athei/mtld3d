@@ -12,8 +12,11 @@ use crate::draw_data::{
 };
 
 /// Bound streams captured once on PE and borrowed while writing their command.
+///
+/// The first stream is captured directly in its fixed record layout, like the index buffer,
+/// so a one-stream draw copies it into the command unchanged.
 pub struct BoundVertices {
-    pub first: StreamBinding,
+    pub first: StreamRecord,
     pub extra: ExtraStreams,
     pub stream0_freq: u32,
 }
@@ -56,6 +59,9 @@ impl DrawPrefix {
     }
 }
 
+/// One bound vertex stream in its fixed record layout.
+///
+/// Only this module constructs records, and every constructor zeroes `reserved`.
 #[repr(C, align(8))]
 pub struct StreamRecord {
     pub buffer: u64,
@@ -66,7 +72,7 @@ pub struct StreamRecord {
     pub stride: u32,
     pub frequency: u32,
     pub stream: u8,
-    pub reserved: [u8; 3],
+    reserved: [u8; 3],
 }
 
 #[repr(C, align(8))]
@@ -94,6 +100,129 @@ pub struct IndexBytes {
     pub maximum: u32,
     pub kind: u8,
     pub reserved: [u8; 7],
+}
+
+/// One bound vertex stream without indices, in its final payload layout.
+#[repr(C, align(8))]
+pub struct SingleBoundPayload {
+    prefix: DrawPrefix,
+    stream: StreamRecord,
+}
+
+/// One bound vertex stream and its bound index buffer, in their final payload layout.
+#[repr(C, align(8))]
+pub struct SingleIndexedBoundPayload {
+    prefix: DrawPrefix,
+    stream: StreamRecord,
+    index: IndexBuffer,
+}
+
+impl SingleBoundPayload {
+    /// Complete a nonindexed prefix with its one stream.
+    ///
+    /// Returns `None` when the prefix names an index tail.
+    #[inline]
+    #[must_use]
+    pub const fn new(prefix: &DrawPrefix, first: &StreamRecord, stream0_freq: u32) -> Option<Self> {
+        if prefix.index_kind == 1 {
+            return None;
+        }
+        Some(Self {
+            prefix: single_stream_prefix(prefix, stream0_freq),
+            stream: first.copied(),
+        })
+    }
+}
+
+impl SingleIndexedBoundPayload {
+    /// Complete an indexed prefix with its one stream and index buffer.
+    ///
+    /// Returns `None` when the prefix does not name an index tail.
+    #[inline]
+    #[must_use]
+    pub const fn new(
+        prefix: &DrawPrefix,
+        first: &StreamRecord,
+        stream0_freq: u32,
+        index: &IndexBuffer,
+    ) -> Option<Self> {
+        if prefix.index_kind != 1 {
+            return None;
+        }
+        Some(Self {
+            prefix: single_stream_prefix(prefix, stream0_freq),
+            stream: first.copied(),
+            index: index_record(index),
+        })
+    }
+}
+
+/// A one-stream bound draw whose payload is built in place once its command has room.
+///
+/// Each implementor fixes its prefix shape, so its payload always agrees with its index tail.
+/// The draw paths are generic over this trait so that each instance has one caller.
+pub trait SingleStreamDraw {
+    type Payload: crate::encoder_records::CommandRecord;
+    /// The prefix the checked writer receives for this draw.
+    fn prefix(&self) -> DrawPrefix;
+    /// The bound index tail, if the draw has one.
+    fn index(&self) -> Option<&IndexBuffer>;
+    /// The complete payload of this draw with its one stream.
+    fn payload(&self, first: &StreamRecord, stream0_freq: u32) -> Self::Payload;
+}
+
+/// An ordinary nonindexed draw over bound streams.
+pub struct NonindexedDraw {
+    pub primitive: PrimitiveType,
+    pub start_vertex: u32,
+    pub vertex_count: u32,
+}
+
+/// An ordinary indexed draw over bound streams and a bound index buffer.
+pub struct IndexedDraw<'a> {
+    pub primitive: PrimitiveType,
+    pub base_vertex: i32,
+    pub index_count: u32,
+    pub index: &'a IndexBuffer,
+}
+
+impl SingleStreamDraw for NonindexedDraw {
+    type Payload = SingleBoundPayload;
+    #[inline]
+    fn prefix(&self) -> DrawPrefix {
+        DrawPrefix::nonindexed(self.primitive, self.start_vertex, self.vertex_count)
+    }
+    #[inline]
+    fn index(&self) -> Option<&IndexBuffer> {
+        None
+    }
+    #[inline]
+    fn payload(&self, first: &StreamRecord, stream0_freq: u32) -> SingleBoundPayload {
+        SingleBoundPayload {
+            prefix: single_stream_prefix(&self.prefix(), stream0_freq),
+            stream: first.copied(),
+        }
+    }
+}
+
+impl SingleStreamDraw for IndexedDraw<'_> {
+    type Payload = SingleIndexedBoundPayload;
+    #[inline]
+    fn prefix(&self) -> DrawPrefix {
+        DrawPrefix::indexed(self.primitive, self.base_vertex, self.index_count)
+    }
+    #[inline]
+    fn index(&self) -> Option<&IndexBuffer> {
+        Some(self.index)
+    }
+    #[inline]
+    fn payload(&self, first: &StreamRecord, stream0_freq: u32) -> SingleIndexedBoundPayload {
+        SingleIndexedBoundPayload {
+            prefix: single_stream_prefix(&self.prefix(), stream0_freq),
+            stream: first.copied(),
+            index: index_record(self.index),
+        }
+    }
 }
 
 // The supported targets are little-endian; explicit fields cover the full record with no
@@ -136,6 +265,14 @@ const _: () = {
     assert!(std::mem::offset_of!(IndexBytes, maximum) == 12);
     assert!(std::mem::offset_of!(IndexBytes, kind) == 16);
     assert!(std::mem::offset_of!(IndexBytes, reserved) == 17);
+    assert!(size_of::<SingleBoundPayload>() == 64 && align_of::<SingleBoundPayload>() == 8);
+    assert!(std::mem::offset_of!(SingleBoundPayload, prefix) == 0);
+    assert!(std::mem::offset_of!(SingleBoundPayload, stream) == 16);
+    assert!(size_of::<SingleIndexedBoundPayload>() == 104);
+    assert!(align_of::<SingleIndexedBoundPayload>() == 8);
+    assert!(std::mem::offset_of!(SingleIndexedBoundPayload, prefix) == 0);
+    assert!(std::mem::offset_of!(SingleIndexedBoundPayload, stream) == 16);
+    assert!(std::mem::offset_of!(SingleIndexedBoundPayload, index) == 64);
 };
 
 /// An integer-only draw record with explicitly initialized padding.
@@ -154,6 +291,16 @@ unsafe impl DrawPod for VertexBytes {}
 unsafe impl DrawPod for IndexBuffer {}
 // SAFETY: the layout assertions cover integer-only records and explicit reserved bytes.
 unsafe impl DrawPod for IndexBytes {}
+// SAFETY: the layout assertions show two integer-only records with no gap or tail.
+unsafe impl DrawPod for SingleBoundPayload {}
+// SAFETY: the layout assertions show three integer-only records with no gap or tail.
+unsafe impl DrawPod for SingleIndexedBoundPayload {}
+// SAFETY: every byte belongs to an integer field or explicit zeroed reserve, every bit pattern
+// is valid, and the asserted layout is the same on all four targets.
+unsafe impl crate::encoder_records::CommandRecord for SingleBoundPayload {}
+// SAFETY: every byte belongs to an integer field or explicit zeroed reserve, every bit pattern
+// is valid, and the asserted layout is the same on all four targets.
+unsafe impl crate::encoder_records::CommandRecord for SingleIndexedBoundPayload {}
 
 fn put<T: DrawPod>(destination: &mut [u8], at: &mut usize, value: T) {
     let bytes = &mut destination[*at..*at + size_of::<T>()];
@@ -163,17 +310,45 @@ fn put<T: DrawPod>(destination: &mut [u8], at: &mut usize, value: T) {
     *at += size_of::<T>();
 }
 
-const fn stream_record(value: &StreamBinding) -> StreamRecord {
-    StreamRecord {
-        buffer: value.buffer_id.raw(),
-        address: value.backing_ptr as u64,
-        length: value.backing_len as u64,
-        generation: value.backing_generation,
-        offset: value.offset,
-        stride: value.stride,
-        frequency: value.freq,
-        stream: value.stream,
-        reserved: [0; 3],
+impl StreamRecord {
+    /// The fixed record of one bound stream.
+    #[inline]
+    #[must_use]
+    pub const fn from_binding(value: &StreamBinding) -> Self {
+        Self {
+            buffer: value.buffer_id.raw(),
+            address: value.backing_ptr as u64,
+            length: value.backing_len as u64,
+            generation: value.backing_generation,
+            offset: value.offset,
+            stride: value.stride,
+            frequency: value.freq,
+            stream: value.stream,
+            reserved: [0; 3],
+        }
+    }
+
+    /// Copy every field, including the reserved bytes, which every constructor zeroes.
+    #[inline]
+    const fn copied(&self) -> Self {
+        Self {
+            buffer: self.buffer,
+            address: self.address,
+            length: self.length,
+            generation: self.generation,
+            offset: self.offset,
+            stride: self.stride,
+            frequency: self.frequency,
+            stream: self.stream,
+            reserved: self.reserved,
+        }
+    }
+}
+
+impl From<StreamBinding> for StreamRecord {
+    #[inline]
+    fn from(value: StreamBinding) -> Self {
+        Self::from_binding(&value)
     }
 }
 
@@ -190,20 +365,32 @@ fn put_prefix(
     at
 }
 
+const fn index_record(index: &IndexBuffer) -> IndexBuffer {
+    IndexBuffer {
+        buffer: index.buffer,
+        address: index.address,
+        length: index.length,
+        generation: index.generation,
+        offset: index.offset,
+        kind: index.kind,
+        reserved: [0; 3],
+    }
+}
+
+const fn single_stream_prefix(prefix: &DrawPrefix, stream0_freq: u32) -> DrawPrefix {
+    DrawPrefix {
+        primitive: prefix.primitive,
+        vertex_kind: prefix.vertex_kind,
+        index_kind: prefix.index_kind,
+        stream_count: 1,
+        stride_or_frequency: stream0_freq,
+        first_or_base: prefix.first_or_base,
+        count: prefix.count,
+    }
+}
+
 fn put_bound_index(destination: &mut [u8], at: &mut usize, index: &IndexBuffer) {
-    put(
-        destination,
-        at,
-        IndexBuffer {
-            buffer: index.buffer,
-            address: index.address,
-            length: index.length,
-            generation: index.generation,
-            offset: index.offset,
-            kind: index.kind,
-            reserved: [0; 3],
-        },
-    );
+    put(destination, at, index_record(index));
 }
 
 const fn finish_payload(destination: &[u8], at: usize) -> Result<(), WireError> {
@@ -215,47 +402,30 @@ const fn finish_payload(destination: &[u8], at: usize) -> Result<(), WireError> 
 }
 
 #[inline]
-fn put_bound_vertices(
-    destination: &mut [u8],
-    at: &mut usize,
-    first: &StreamBinding,
-    extra: &ExtraStreams,
-) {
-    put(destination, at, stream_record(first));
+fn put_extra_streams(destination: &mut [u8], at: &mut usize, extra: &ExtraStreams) {
     for value in extra {
-        put(destination, at, stream_record(&value));
+        put(destination, at, StreamRecord::from_binding(&value));
     }
 }
 
 /// Exact payload extent for one bound vertex stream without indices.
-pub const SINGLE_BOUND_BYTES: usize = size_of::<DrawPrefix>() + size_of::<StreamRecord>();
+pub const SINGLE_BOUND_BYTES: usize = size_of::<SingleBoundPayload>();
 /// Exact payload extent for one bound vertex stream with a bound index buffer.
-pub const SINGLE_INDEXED_BOUND_BYTES: usize = SINGLE_BOUND_BYTES + size_of::<IndexBuffer>();
-
-fn put_single_bound(
-    destination: &mut [u8],
-    prefix: DrawPrefix,
-    first: &StreamBinding,
-    stream0_freq: u32,
-) {
-    let mut at = put_prefix(destination, prefix, 1, stream0_freq);
-    put(destination, &mut at, stream_record(first));
-}
+pub const SINGLE_INDEXED_BOUND_BYTES: usize = size_of::<SingleIndexedBoundPayload>();
 
 /// Write one bound vertex stream directly into its exact final reservation.
 ///
 /// # Errors
 /// Returns an error if the prefix requires an index tail.
 pub fn write_single_bound_into(
-    prefix: DrawPrefix,
-    first: &StreamBinding,
+    prefix: &DrawPrefix,
+    first: &StreamRecord,
     stream0_freq: u32,
     destination: &mut [u8; SINGLE_BOUND_BYTES],
 ) -> Result<(), WireError> {
-    if prefix.index_kind == 1 {
-        return Err(WireError::InvalidValue);
-    }
-    put_single_bound(destination, prefix, first, stream0_freq);
+    let payload =
+        SingleBoundPayload::new(prefix, first, stream0_freq).ok_or(WireError::InvalidValue)?;
+    put(destination, &mut 0, payload);
     Ok(())
 }
 
@@ -264,18 +434,15 @@ pub fn write_single_bound_into(
 /// # Errors
 /// Returns an error if the prefix does not require an index tail.
 pub fn write_single_indexed_bound_into(
-    prefix: DrawPrefix,
-    first: &StreamBinding,
+    prefix: &DrawPrefix,
+    first: &StreamRecord,
     stream0_freq: u32,
     index: &IndexBuffer,
     destination: &mut [u8; SINGLE_INDEXED_BOUND_BYTES],
 ) -> Result<(), WireError> {
-    if prefix.index_kind != 1 {
-        return Err(WireError::InvalidValue);
-    }
-    let (vertices, indices) = destination.split_at_mut(SINGLE_BOUND_BYTES);
-    put_single_bound(vertices, prefix, first, stream0_freq);
-    put_bound_index(indices, &mut 0, index);
+    let payload = SingleIndexedBoundPayload::new(prefix, first, stream0_freq, index)
+        .ok_or(WireError::InvalidValue)?;
+    put(destination, &mut 0, payload);
     Ok(())
 }
 
@@ -323,7 +490,8 @@ pub fn write_bound_into(
     let stream_count =
         u8::try_from(vertices.extra.len() + 1).map_err(|_| WireError::InvalidValue)?;
     let mut at = put_prefix(destination, prefix, stream_count, vertices.stream0_freq);
-    put_bound_vertices(destination, &mut at, &vertices.first, &vertices.extra);
+    put(destination, &mut at, vertices.first.copied());
+    put_extra_streams(destination, &mut at, &vertices.extra);
     if let Some(index) = indices {
         put_bound_index(destination, &mut at, index);
     }
@@ -417,7 +585,8 @@ pub(super) fn write_into(
             );
         }
         VertexSource::Bound { first, extra, .. } => {
-            put_bound_vertices(destination, &mut at, first, extra);
+            put(destination, &mut at, StreamRecord::from_binding(first));
+            put_extra_streams(destination, &mut at, extra);
         }
     }
     match &draw.index_source {

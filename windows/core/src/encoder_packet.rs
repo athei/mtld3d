@@ -359,6 +359,35 @@ impl FrameRecorder {
         self.finish_record(result)
     }
 
+    /// Append a one-stream bound draw straight into the open command region.
+    ///
+    /// Returns false and records nothing when a capture error is latched, the draw has extra
+    /// streams or the region lacks room. The caller then takes `record_bound_draw` with the
+    /// draw's prefix and index tail, which handles each of those cases and writes the same
+    /// bytes this path does.
+    #[inline]
+    pub fn try_append_single_stream<D: crate::encoder_draw::draw_record::SingleStreamDraw>(
+        &mut self,
+        scratch: &mut ScratchArena,
+        vertices: &crate::encoder_draw::draw_record::BoundVertices,
+        draw: &D,
+    ) -> bool {
+        if self.error.is_some() || !matches!(vertices.extra, crate::draw_data::ExtraStreams::Empty)
+        {
+            return false;
+        }
+        let Some(slot) = scratch.command_slot::<D::Payload>() else {
+            return false;
+        };
+        slot.write(
+            u16::from(EncoderOpcode::Draw),
+            0,
+            draw.payload(&vertices.first, vertices.stream0_freq),
+        );
+        self.count += 1;
+        true
+    }
+
     /// Capture an ordinary bound draw from borrowed stream and index snapshots.
     ///
     /// # Errors
@@ -386,7 +415,7 @@ impl FrameRecorder {
                     SINGLE_INDEXED_BOUND_BYTES,
                     |destination| {
                         write_single_indexed_bound_into(
-                            prefix,
+                            &prefix,
                             &vertices.first,
                             vertices.stream0_freq,
                             index,
@@ -403,7 +432,7 @@ impl FrameRecorder {
                     SINGLE_BOUND_BYTES,
                     |destination| {
                         write_single_bound_into(
-                            prefix,
+                            &prefix,
                             &vertices.first,
                             vertices.stream0_freq,
                             destination

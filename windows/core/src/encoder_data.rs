@@ -1317,10 +1317,33 @@ impl FrameData {
 
     /// Write a bound draw directly from its borrowed stream and index snapshots.
     ///
+    /// A one-stream draw appends inline into the open command region. Everything else, a
+    /// missing recorder, a latched error, extra streams or a full region, goes through the
+    /// checked recorder path with the draw's prefix and index tail, which returns the same
+    /// result and writes the same bytes. Generic over the draw shape so that each shape's one
+    /// caller inlines only that shape, and the prefix is built only on the fallback.
+    ///
     /// # Errors
     /// Returns the latched frame error or a wire capture failure.
     #[cfg(windows)]
-    pub fn record_bound_draw(
+    #[inline]
+    pub fn record_single_stream_draw<D: crate::encoder_draw::draw_record::SingleStreamDraw>(
+        &mut self,
+        draw: &D,
+        vertices: &crate::encoder_draw::draw_record::BoundVertices,
+    ) -> Result<(), mtld3d_shared::encoder_wire::WireError> {
+        if let Some(recorder) = &mut self.recorder
+            && recorder.try_append_single_stream(&mut self.scratch, vertices, draw)
+        {
+            return Ok(());
+        }
+        self.record_bound_draw(draw.prefix(), vertices, draw.index())
+    }
+
+    /// Write a bound draw through the checked recorder path.
+    #[cfg(windows)]
+    #[inline(never)]
+    fn record_bound_draw(
         &mut self,
         prefix: crate::encoder_draw::draw_record::DrawPrefix,
         vertices: &crate::encoder_draw::draw_record::BoundVertices,

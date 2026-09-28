@@ -378,7 +378,7 @@ fn ordinary_bound_capture_matches_generic_bytes_for_sparse_and_full_streams() {
                 unreachable!()
             };
             let vertices = BoundVertices {
-                first,
+                first: StreamRecord::from_binding(&first),
                 extra,
                 stream0_freq,
             };
@@ -424,7 +424,7 @@ fn ordinary_bound_capture_matches_generic_bytes_for_sparse_and_full_streams() {
 #[test]
 fn ordinary_bound_capture_rejects_bad_extents_and_stream_counts_before_publication() {
     let mut vertices = BoundVertices {
-        first: stream(0),
+        first: StreamRecord::from_binding(&stream(0)),
         extra: ExtraStreams::EMPTY,
         stream0_freq: 1,
     };

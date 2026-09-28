@@ -31,7 +31,7 @@ use mtld3d_core::{
     dxso::{VsSamplerKinds, operand_token_count},
     encoder_draw::{
         ApiSnapshotCache, SnapshotAttributes, SnapshotDelta,
-        draw_record::{BoundVertices, DrawPrefix, IndexBuffer},
+        draw_record::{BoundVertices, IndexBuffer, IndexedDraw, NonindexedDraw, StreamRecord},
     },
     ff_state::{FfState, FfVsDirty, TssWriteFeeds, tss_write_feeds},
     format::{
@@ -1849,6 +1849,15 @@ impl DeviceInner {
     /// Stop capture after a known failure without polling native work per draw.
     fn known_encoder_status(&self) -> Result<(), i32> {
         self.recording_status()?;
+        self.encoder.known_status()
+    }
+
+    /// Stop a bound draw after a failure the device has already latched.
+    ///
+    /// A capture error still latched only in the frame recorder is reported by the draw's own
+    /// record, which returns that error, or by `recording_status` on a path that records
+    /// nothing. Either way it maps through `capture_failure`, which latches the device failure.
+    fn latched_encoder_status(&self) -> Result<(), i32> {
         self.encoder.known_status()
     }
 
@@ -10057,15 +10066,18 @@ extern "system" fn device_draw_primitive(
     let _timer = device_timer(this, DeviceSubCategory::Draws);
     // SAFETY: vtable thunk; `this` is *mut Direct3DDevice9 per IDirect3DDevice9 ABI.
     let Some(obj) = (unsafe { InPtrMut::<Direct3DDevice9>::opt(this) }) else {
+        std::hint::cold_path();
         return D3DERR_INVALIDCALL;
     };
     let dev = obj.inner();
     if !has_vertex_layout_source(dev) {
+        std::hint::cold_path();
         return D3DERR_INVALIDCALL;
     }
     // Triangle fan has no Metal primitive: rewrite it as a triangle-list index
     // stream over the bound streams. Kept off the (non-fan) hot path below.
     if primitive_type == D3DPT_TRIANGLEFAN {
+        std::hint::cold_path();
         if primitive_count == 0 {
             return D3DERR_INVALIDCALL;
         }
@@ -10088,21 +10100,28 @@ extern "system" fn device_draw_primitive(
         return draw_bound_triangle_fan(&obj, index_source, D3DERR_INVALIDCALL);
     }
     let Some(metal_prim) = d3d_to_metal_primitive(primitive_type) else {
+        std::hint::cold_path();
         return D3DERR_INVALIDCALL;
     };
     let vtx_count = vertex_count(primitive_type, primitive_count);
     if vtx_count == 0 {
+        std::hint::cold_path();
         return D3DERR_INVALIDCALL;
     }
     // Flush any bound buffer that's drawn while still mapped, before the draw
     // snapshot reads it.
     flush_mapped_bound_buffers(obj.inner());
-    if let Err(hr) = obj.inner().known_encoder_status() {
+    if let Err(hr) = obj.inner().latched_encoder_status() {
+        std::hint::cold_path();
         return hr;
     }
     let perf_ptr = DeviceInner::perf_ptr_of(obj.inner);
     let snap = CycleAddTimer::start(draw_snapshot_ptr(perf_ptr));
     let Some(vertex_source) = snapshot_bound_vertex_source(dev) else {
+        std::hint::cold_path();
+        if let Err(hr) = obj.inner().recording_status() {
+            return hr;
+        }
         mtld3d_shared::log_once_warn!(
             target: LOG_TARGET,
             "DrawPrimitive: no vertex buffer bound"
@@ -10112,10 +10131,13 @@ extern "system" fn device_draw_primitive(
     emit_snapshot_deltas(&obj);
     drop(snap);
     let _push = CycleAddTimer::start(draw_push_op_ptr(perf_ptr));
-    let result = obj.inner().current_frame.record_bound_draw(
-        DrawPrefix::nonindexed(metal_prim, start_vertex, vtx_count),
+    let result = obj.inner().current_frame.record_single_stream_draw(
+        &NonindexedDraw {
+            primitive: metal_prim,
+            start_vertex,
+            vertex_count: vtx_count,
+        },
         &vertex_source,
-        None,
     );
     result.map_or_else(|error| obj.inner().capture_failure(error), |()| D3D_OK)
 }
@@ -10172,22 +10194,23 @@ fn draw_bound_triangle_fan(
     }
     let perf_ptr = DeviceInner::perf_ptr_of(obj.inner);
     let snap = CycleAddTimer::start(draw_snapshot_ptr(perf_ptr));
-    let Some(vertex_source) = snapshot_bound_vertex_source(obj.inner()) else {
+    let Some((first, extra)) = snapshot_bound_streams::<StreamBinding>(obj.inner()) else {
         mtld3d_shared::log_once_warn!(
             target: LOG_TARGET,
             "triangle fan: no vertex buffer bound"
         );
         return no_vertex_buffer_hr;
     };
+    let stream0_freq = obj.inner().bound_buffers().stream_freq(0);
     emit_snapshot_deltas(obj);
     drop(snap);
     let _push = CycleAddTimer::start(draw_push_op_ptr(perf_ptr));
     obj.inner().record_draw(&DrawOp {
         metal_prim: mtld3d_shared::mtl::PrimitiveType::Triangle,
         vertex_source: VertexSource::Bound {
-            first: vertex_source.first,
-            extra: vertex_source.extra,
-            stream0_freq: vertex_source.stream0_freq,
+            first,
+            extra,
+            stream0_freq,
         },
         index_source,
     });
@@ -10338,15 +10361,18 @@ extern "system" fn device_draw_indexed_primitive(
     let _timer = device_timer(this, DeviceSubCategory::Draws);
     // SAFETY: vtable thunk; `this` is *mut Direct3DDevice9 per IDirect3DDevice9 ABI.
     let Some(obj) = (unsafe { InPtrMut::<Direct3DDevice9>::opt(this) }) else {
+        std::hint::cold_path();
         return D3DERR_INVALIDCALL;
     };
     let dev = obj.inner();
     if !has_vertex_layout_source(dev) {
+        std::hint::cold_path();
         return D3DERR_INVALIDCALL;
     }
     // Triangle fan has no Metal primitive: rewrite the addressed indices as a
     // triangle list over the bound streams. Kept off the (non-fan) hot path.
     if primitive_type == D3DPT_TRIANGLEFAN {
+        std::hint::cold_path();
         if primitive_count == 0 {
             return D3DERR_INVALIDCALL;
         }
@@ -10360,22 +10386,26 @@ extern "system" fn device_draw_indexed_primitive(
         return draw_bound_triangle_fan(&obj, index_source, D3D_OK);
     }
     let Some(metal_prim) = d3d_to_metal_primitive(primitive_type) else {
+        std::hint::cold_path();
         return D3DERR_INVALIDCALL;
     };
     let index_count = vertex_count(primitive_type, primitive_count);
     if index_count == 0 {
+        std::hint::cold_path();
         return D3DERR_INVALIDCALL;
     }
 
     // Flush any bound buffer that's drawn while still mapped, before the draw
     // snapshot reads it.
     flush_mapped_bound_buffers(obj.inner());
-    if let Err(hr) = obj.inner().known_encoder_status() {
+    if let Err(hr) = obj.inner().latched_encoder_status() {
+        std::hint::cold_path();
         return hr;
     }
     let perf_ptr = DeviceInner::perf_ptr_of(obj.inner);
     let snap = CycleAddTimer::start(draw_snapshot_ptr(perf_ptr));
     let Some(vertex_source) = snapshot_bound_vertex_source(dev) else {
+        std::hint::cold_path();
         // D3D9 permits an indexed draw with a valid declaration but NO stream
         // source bound: it returns S_OK (rendering is undefined) rather than
         // INVALIDCALL — unlike the non-indexed DrawPrimitive. With no vertex
@@ -10387,6 +10417,10 @@ extern "system" fn device_draw_indexed_primitive(
             .map_or_else(|hr| hr, |()| D3D_OK);
     };
     let Some(index_source) = snapshot_bound_index_source(dev, start_index) else {
+        std::hint::cold_path();
+        if let Err(hr) = obj.inner().recording_status() {
+            return hr;
+        }
         mtld3d_shared::log_once_warn!(
             target: LOG_TARGET,
             "DrawIndexedPrimitive: no index buffer bound"
@@ -10397,10 +10431,14 @@ extern "system" fn device_draw_indexed_primitive(
     emit_snapshot_deltas(&obj);
     drop(snap);
     let _push = CycleAddTimer::start(draw_push_op_ptr(perf_ptr));
-    let result = obj.inner().current_frame.record_bound_draw(
-        DrawPrefix::indexed(metal_prim, base_vertex_index, index_count),
+    let result = obj.inner().current_frame.record_single_stream_draw(
+        &IndexedDraw {
+            primitive: metal_prim,
+            base_vertex: base_vertex_index,
+            index_count,
+            index: &index_source,
+        },
         &vertex_source,
-        Some(&index_source),
     );
     result.map_or_else(|error| obj.inner().capture_failure(error), |()| D3D_OK)
 }
@@ -10432,8 +10470,25 @@ fn flush_mapped_bound_buffers(dev: &mut DeviceInner) {
 /// one binding. Each bound stream is stamped with the current submit seq so
 /// the retention pipeline keeps its `PageBox` alive until that seq retires; a
 /// named stream with nothing bound is left out and reads zeros at draw time.
-/// `None` when no named stream has a buffer. Runs on the API thread.
+/// The first stream is captured in its fixed record layout, like the index
+/// buffer. `None` when no named stream has a buffer. Runs on the API thread.
+/// Kept out of line so the draw receives the record as one contiguous value.
+#[inline(never)]
 fn snapshot_bound_vertex_source(dev: &DeviceInner) -> Option<BoundVertices> {
+    let (first, extra) = snapshot_bound_streams::<StreamRecord>(dev)?;
+    Some(BoundVertices {
+        first,
+        extra,
+        stream0_freq: dev.bound_buffers().stream_freq(0),
+    })
+}
+
+/// Snapshot the first bound declared stream and any further ones, as for a bound draw.
+///
+/// Generic over the first stream's form, so each caller converts it where it is captured.
+fn snapshot_bound_streams<First: From<StreamBinding>>(
+    dev: &DeviceInner,
+) -> Option<(First, mtld3d_core::draw_data::ExtraStreams)> {
     let decl_ptr = dev.vertex_decl();
     let decl_mask = if decl_ptr.is_null() {
         1
@@ -10448,7 +10503,7 @@ fn snapshot_bound_vertex_source(dev: &DeviceInner) -> Option<BoundVertices> {
         return None;
     }
     let seq = dev.current_seq();
-    let mut first: Option<StreamBinding> = None;
+    let mut first: Option<First> = None;
     let mut extra = Vec::new();
     while mask != 0 {
         let stream = mask.trailing_zeros();
@@ -10457,16 +10512,19 @@ fn snapshot_bound_vertex_source(dev: &DeviceInner) -> Option<BoundVertices> {
             continue;
         };
         if first.is_none() {
-            first = Some(binding);
+            first = Some(First::from(binding));
         } else {
             extra.push(binding);
         }
     }
-    Some(BoundVertices {
-        first: first?,
-        extra: mtld3d_core::draw_data::ExtraStreams::Owned(extra.into_boxed_slice()),
-        stream0_freq: bound.stream_freq(0),
-    })
+    Some((
+        first?,
+        if extra.is_empty() {
+            mtld3d_core::draw_data::ExtraStreams::Empty
+        } else {
+            mtld3d_core::draw_data::ExtraStreams::Owned(extra.into_boxed_slice())
+        },
+    ))
 }
 
 /// Snapshot a declared stream if bound, stamping its buffer with `seq`.
