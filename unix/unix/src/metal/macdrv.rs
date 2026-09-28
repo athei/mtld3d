@@ -23,6 +23,7 @@ use crate::{LOG_TARGET, metal::handle::IntoRetained};
 
 pub mod attachment;
 mod cursor_overlay;
+mod delegate_forward;
 
 use attachment::{AttachFlags, AttachLatches, Attachment};
 pub use cursor_overlay::{poll_from_present, set_cursor_overlay};
@@ -142,10 +143,11 @@ static SCREEN_PARAM_CHANGES: AtomicU64 = AtomicU64::new(0);
 
 /// Wine's `NSApplication` delegate, retained for the process lifetime.
 ///
-/// Set once by [`install_screen_params_filter`]; zero until then. Held
-/// as an address because the observer block that reads it must not capture
-/// a `!Send` `Retained`, and the delegate is only ever touched on the main
-/// thread, where the notification is posted.
+/// Set once by [`install_screen_params_filter`]; zero until then, and for
+/// good when the delegate does not implement the method, since then there is
+/// nothing to forward to. Held as an address because the observer block that
+/// reads it must not capture a `!Send` `Retained`, and the delegate is only
+/// ever touched on the main thread, where the notification is posted.
 static WINE_APP_DELEGATE_PTR: AtomicUsize = AtomicUsize::new(0);
 
 /// One screen's contribution to the configuration snapshot.
@@ -209,7 +211,9 @@ static LAST_SCREEN_CONFIGURATION: Mutex<Option<ScreenConfiguration>> = Mutex::ne
 
 /// Whether the screen-parameter filter is in place. **Main thread only.**
 ///
-/// Set by the attempt that took the notification over, and only by that one.
+/// Set by the attempt that found a delegate and installed the handler, and
+/// only by that one, whether it took the notification over from the delegate
+/// or left a delegate without `applicationDidChangeScreenParameters:` alone.
 /// An attempt that runs before `NSApp` has a delegate installs nothing, so it
 /// leaves this clear and the next attach or headroom refresh tries again.
 /// Read and written on the main thread alone, which is what `Relaxed` rests on.
@@ -222,7 +226,7 @@ enum ScreenParamsFilterStep {
     AlreadyOurs,
     /// `NSApp` has no delegate to take the notification over from yet.
     AwaitDelegate,
-    /// Unregister Wine's delegate for the name and observe it ourselves.
+    /// Observe the name ourselves, unregistering a delegate that implements the method.
     TakeOver,
 }
 
@@ -272,14 +276,22 @@ const fn screen_params_filter_step(installed: bool, has_delegate: bool) -> Scree
 /// name, so removing our observer at teardown would leave nobody forwarding
 /// it at all. What teardown retires instead is the attachment record, and
 /// the handler walks only the records that are still live.
+///
+/// Whether the delegate implements `applicationDidChangeScreenParameters:`
+/// is checked once, here, on the delegate being taken over from, since that
+/// is the one object the handler ever forwards to. `AppKit` subscribes a
+/// delegate to the notification only when it implements the method, so a
+/// delegate without it is left alone and nothing is forwarded; the handler is
+/// installed all the same and still reconciles every layer on a real change.
+/// A delegate installed later is subscribed by `AppKit` itself and receives
+/// the notification unfiltered, which a check per notification would not
+/// change either.
 fn install_screen_params_filter(mtm: objc2::MainThreadMarker) {
     use core::ptr::NonNull;
 
     use block2::RcBlock;
-    use objc2::runtime::ProtocolObject;
     use objc2_app_kit::{
-        NSApplication, NSApplicationDelegate, NSApplicationDidChangeScreenParametersNotification,
-        NSScreen,
+        NSApplication, NSApplicationDidChangeScreenParametersNotification, NSScreen,
     };
     use objc2_foundation::{NSNotification, NSNotificationCenter};
 
@@ -312,14 +324,25 @@ fn install_screen_params_filter(mtm: objc2::MainThreadMarker) {
     // SAFETY: `ProtocolObject` is a transparent wrapper over `AnyObject`,
     // so the pointer reinterprets losslessly for the call below.
     let observer = unsafe { &*Retained::as_ptr(&delegate).cast::<objc2::runtime::AnyObject>() };
-    // SAFETY: objc2 typed binding; the delegate is a live observer of the
-    // center (AppKit registered it), and removing a registration that
-    // does not exist is a documented no-op.
-    unsafe { center.removeObserver_name_object(observer, Some(name), None) };
-    WINE_APP_DELEGATE_PTR.store(Retained::as_ptr(&delegate) as usize, Ordering::Release);
-    // Leaked on purpose: the delegate is Wine's application controller
-    // and lives as long as the process.
-    core::mem::forget(delegate);
+    let forwards = delegate_forward::delegate_handles_screen_parameters(observer);
+    if forwards {
+        // SAFETY: objc2 typed binding; the delegate is a live observer of the
+        // center (AppKit registered it), and removing a registration that
+        // does not exist is a documented no-op.
+        unsafe { center.removeObserver_name_object(observer, Some(name), None) };
+        WINE_APP_DELEGATE_PTR.store(Retained::as_ptr(&delegate) as usize, Ordering::Release);
+        // Leaked on purpose: the delegate is Wine's application controller
+        // and lives as long as the process.
+        core::mem::forget(delegate);
+    } else {
+        mtld3d_shared::log_once_info!(
+            target: LOG_TARGET,
+            "present: Wine's application delegate does not implement \
+             applicationDidChangeScreenParameters:, so AppKit delivers it no screen-parameter \
+             notification and there is nothing to filter or forward; the notification is \
+             observed only to reconcile the layers on a real change",
+        );
+    }
 
     let block = RcBlock::new(move |notification: NonNull<NSNotification>| {
         autoreleasepool(|_| {
@@ -343,7 +366,7 @@ fn install_screen_params_filter(mtm: objc2::MainThreadMarker) {
                 debug!(
                     target: LOG_TARGET,
                     "screen params changed #{count}: headroom={headroom:.3} {}",
-                    if changed { "configuration changed, forwarded to Wine" } else { "filtered" },
+                    if changed { "configuration changed" } else { "unchanged, filtered" },
                 );
             }
             if !changed {
@@ -358,13 +381,23 @@ fn install_screen_params_filter(mtm: objc2::MainThreadMarker) {
                 return;
             }
             // SAFETY: the pointer was taken from a `Retained` that is leaked
-            // above, so the delegate outlives this block, and the call is on
-            // the main thread, which is the delegate's thread.
-            let delegate =
-                unsafe { &*(delegate_ptr as *const ProtocolObject<dyn NSApplicationDelegate>) };
-            // SAFETY: the notification pointer is valid for the handler's
-            // duration; Wine implements this optional delegate method.
-            unsafe { delegate.applicationDidChangeScreenParameters(notification.as_ref()) };
+            // above, so the delegate outlives this block, and `ProtocolObject`
+            // is a transparent wrapper over `AnyObject`.
+            let delegate = unsafe { &*(delegate_ptr as *const objc2::runtime::AnyObject) };
+            // SAFETY: the notification pointer is valid for the handler's duration.
+            let notification = unsafe { notification.as_ref() };
+            // SAFETY: the block runs on the main thread, which is the
+            // delegate's thread, and `notification` is the one being delivered.
+            let forwarded =
+                unsafe { delegate_forward::forward_screen_parameters(delegate, notification) };
+            if let Err(thrown) = forwarded {
+                mtld3d_shared::log_once_warn!(
+                    target: LOG_TARGET,
+                    "present: Wine's applicationDidChangeScreenParameters: threw {thrown}; \
+                     caught so the process survives, the rest of Wine's handler did not run",
+                );
+                debug!(target: LOG_TARGET, "screen params #{count}: Wine's handler threw {thrown}");
+            }
         });
     });
     // SAFETY: objc2 typed binding; the center copies the block, and the
@@ -374,11 +407,13 @@ fn install_screen_params_filter(mtm: objc2::MainThreadMarker) {
     };
     core::mem::forget(token);
     SCREEN_PARAMS_FILTER_INSTALLED.store(true, Ordering::Relaxed);
-    info!(
-        target: LOG_TARGET,
-        "present: filtering NSApplicationDidChangeScreenParametersNotification for Wine \
-         (forwarded only when screen geometry, scale or the main display mode changed)",
-    );
+    if forwards {
+        info!(
+            target: LOG_TARGET,
+            "present: filtering NSApplicationDidChangeScreenParametersNotification for Wine \
+             (forwarded only when screen geometry, scale or the main display mode changed)",
+        );
+    }
 }
 
 /// Install the `NSWindowDidChangeOcclusionState` observer exactly once.

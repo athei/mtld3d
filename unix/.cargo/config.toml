@@ -24,7 +24,8 @@ MACOSX_DEPLOYMENT_TARGET = "15.0"
 # runs under x86-on-ARM translation, whose vector unit is 128-bit: 256-bit
 # AVX/AVX2 ops are split across two halves and underperform plain SSE, so the
 # baseline caps at SSE4.2 (128-bit, 1:1 with the host vector unit) plus the
-# AVX-independent GPR bit-manipulation features (BMI1/BMI2/LZCNT). Pre-emptive:
-# this workspace has no C dependency today, so nothing reads these yet.
+# AVX-independent GPR bit-manipulation features (BMI1/BMI2/LZCNT). The one
+# C-family object built here today is `mtld3d-unix`'s Objective-C delegate
+# forward, which the `cc` crate compiles with these flags.
 CFLAGS_x86_64-apple-darwin   = "-march=x86-64-v2 -mbmi -mbmi2 -mlzcnt"
 CXXFLAGS_x86_64-apple-darwin = "-march=x86-64-v2 -mbmi -mbmi2 -mlzcnt"

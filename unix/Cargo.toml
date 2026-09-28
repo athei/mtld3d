@@ -17,6 +17,7 @@ homepage = "https://github.com/athei/mtld3d"
 [workspace.dependencies]
 bitflags = "2"
 block2 = "0.6"
+cc = "1"
 mtld3d-shared = { path = "shared" }
 env_logger = { version = "0.11", default-features = false, features = ["auto-color", "humantime"] }
 libc = "0.2"
@@ -54,6 +55,7 @@ objc2-app-kit = { version = "0.3", default-features = false, features = [
 objc2-core-foundation = { version = "0.3", features = ["CFCGTypes", "CFRunLoop"] }
 objc2-core-graphics = { version = "0.3", features = ["CGColorSpace", "CGDirectDisplay"] }
 objc2-foundation = { version = "0.3", features = [
+    "NSException",
     "NSString",
     "NSURL",
     "NSProcessInfo",

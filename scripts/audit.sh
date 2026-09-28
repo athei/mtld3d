@@ -403,7 +403,7 @@ fi
 # source described private work, cited the upstream test suite as if the reader
 # could open it, and narrated its own development history.
 
-RELEASE=$(git ls-files '*.rs' '*.msl' '*.md' '*.toml' '*.conf' Makefile |
+RELEASE=$(git ls-files '*.rs' '*.m' '*.msl' '*.md' '*.toml' '*.conf' Makefile |
     grep -v '^unix/conformance/' || true)
 
 # shellcheck disable=SC2086
