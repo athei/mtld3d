@@ -1341,12 +1341,15 @@ conformance-x86_64: install-windows-x86_64 install-unix-$(SDK_UNIX_ARCH)
 # that arch's entries of `baseline.txt`, which were taken on the SDK's Wine;
 # none has entries of its own or a baseline target, and what each reports is
 # how its runtime differs from them (`unix/conformance/CONFORMANCE.md`, "The
-# arm64-runtime legs").
+# arm64-runtime legs"). With MTLD3D_CONFORMANCE_RAW_DIR set, each leg keeps
+# its raw output in `arm64-<leg>` under it, since two legs record under one
+# arch's label and would otherwise write the same files.
 # $(1) = the leg, $(2) = the arch of the test binary.
 define arm64_conformance_leg
 	test -f $(D3D9_TEST_$(2)) || { echo "$(D3D9_TEST_$(2)) is missing: re-bundle the Wine SDK, this one predates the published d3d9 test binaries" >&2; exit 2; }
 	$(call ARM64_LEG_START,$(1))
-	export WINEPREFIX='$(call arm64_prefix,$(1))' ; $(CONFORMANCE_BIN) --wine '$(call arm64_sdk,$(1))/bin/wine' \
+	export WINEPREFIX='$(call arm64_prefix,$(1))' $(if $(MTLD3D_CONFORMANCE_RAW_DIR),MTLD3D_CONFORMANCE_RAW_DIR='$(MTLD3D_CONFORMANCE_RAW_DIR)/arm64-$(1)') ; \
+		$(CONFORMANCE_BIN) --wine '$(call arm64_sdk,$(1))/bin/wine' \
 		--wineserver '$(call arm64_sdk,$(1))/bin/wineserver' --assets $(CURDIR)/unix/conformance \
 		--arch $(2) --exe $(D3D9_TEST_$(2)) $(if $(LOG),--log $(LOG)); \
 		$(call ARM64_LEG_STOP,$(1))
@@ -1501,6 +1504,22 @@ BENCH_TIMEOUT ?= 300
 # set up the way the arm64-runtime test legs set theirs up (see
 # `test-e2e-i686-arm64`). A benchmark measures one layout, so the two
 # switches do not go together here; `make bench-variants` compares layouts.
+# The benchmark binaries are built with the layer's own profile, so cargo
+# leaves that profile's `d3d9.dll` and `mtld3d.dll` beside them in `deps/`,
+# unmarked. The SDK's Wine loads its builtins anyway; a stock arm64 Wine loads
+# the application directory's copies first, and a `mtld3d.dll` loaded as a
+# native DLL has no unix half, while naming the builtins in WINEDLLOVERRIDES
+# makes it search the builtin directory of the copy's own arch, which for the
+# ARM64X build is the wrong one. So every benchmark on the arm64 Wine, and
+# every leg of `bench-variants`, runs a copy of the binary in a directory that
+# holds nothing else (ARM64_BENCH_SUITE_COPY, after BENCH_SUITE_ASSIGN), and
+# each leg loads the builtins its tree carries. The directory is named
+# `<profile>/deps` like cargo's, since the benchmark reads its profile from
+# that path.
+define ARM64_BENCH_SUITE_COPY
+bin='$(ISOLATED_ROOT)/bench-bin/$(PROFILE)/deps' && rm -rf '$(ISOLATED_ROOT)/bench-bin' && mkdir -p "$$bin" && cp -c "$$suite" "$$bin/" && \
+	suite="$$bin/$$(basename "$$suite")"
+endef
 # BENCH_LEG names the arm64-runtime leg, empty on the SDK's Wine, and
 # BENCH_ARCH the arch of the benchmark binary, x86_64 for the ARM64X build and
 # for `bench-variants`.
@@ -1527,7 +1546,7 @@ bench: $(if $(BENCH_LEG),$(call arm64_builds,$(BENCH_LEG)),install-windows-$(ARC
 	mkdir -p '$(BENCH_DIR)' && rm -f '$(BENCH_DIR)'/bench-*.txt '$(BENCH_DIR)'/bench-*.metrics
 	$(call bench_stage_corpus,$(BENCH_DIR))
 	$(BENCH_SUITE_ASSIGN); \
-	cd $(E2E_RUNNER_DIR) && $(if $(BENCH_LEG),WINEPREFIX='$(call arm64_prefix,$(BENCH_LEG))' )MTLD3D_CONFIG='$(MTLD3D_CONF_BENCH)' WINEDEBUG= MTL_DEBUG_LAYER=0 MTL_HUD_ENABLED=0 \
+	$(if $(BENCH_LEG),$(ARM64_BENCH_SUITE_COPY) && )cd $(E2E_RUNNER_DIR) && $(if $(BENCH_LEG),WINEPREFIX='$(call arm64_prefix,$(BENCH_LEG))' )MTLD3D_CONFIG='$(MTLD3D_CONF_BENCH)' WINEDEBUG= MTL_DEBUG_LAYER=0 MTL_HUD_ENABLED=0 \
 		RUST_LOG=info __CX_UNIX_RUST_LOG=info \
 		$(E2E_RUNNER) --wine $(if $(BENCH_LEG),'$(call arm64_sdk,$(BENCH_LEG))/bin/wine',$(WINE)) --jobs 1 --timeout $(BENCH_TIMEOUT) --ignored \
 		$(if $(FILTER),--filter '$(FILTER)') --log-dir '$(BENCH_DIR)' -- $$suite$(if $(BENCH_LEG),; $(call ARM64_LEG_STOP,$(BENCH_LEG)))
@@ -1737,7 +1756,7 @@ bench-ab:
 	$(if $(BENCH_CORPUS),$(call bench_stage_corpus,$(BENCH_AB_OUT)))
 	$(BENCH_STOP_SERVERS); trap stop_servers EXIT; \
 	$(BENCH_SUITE_ASSIGN); \
-	cd $(E2E_RUNNER_DIR) && WINEDEBUG= MTL_DEBUG_LAYER=0 MTL_HUD_ENABLED=0 \
+	$(if $(BENCH_LEG),$(ARM64_BENCH_SUITE_COPY) && )cd $(E2E_RUNNER_DIR) && WINEDEBUG= MTL_DEBUG_LAYER=0 MTL_HUD_ENABLED=0 \
 		$(E2E_RUNNER) bench-ab --out '$(BENCH_AB_OUT)' --runs $(RUNS) --timeout $(BENCH_TIMEOUT) \
 		--wait-idle $(BENCH_WAIT_IDLE) \
 		--base-wine '$(call bench_tree,$(BENCH_BASE_ISO))/sdk/bin/wine' \
@@ -1819,6 +1838,7 @@ bench-variants:
 		[ $$failed -eq 0 ] && [ $$built -eq 0 ] || { $(BENCH_VARIANTS_STOP); stop_servers; exit 2; }
 	$(BENCH_VARIANTS_STOP); trap stop_servers EXIT; \
 	$(BENCH_SUITE_ASSIGN); \
+	$(ARM64_BENCH_SUITE_COPY) && \
 	cd $(E2E_RUNNER_DIR) && export WINEDEBUG= MTL_DEBUG_LAYER=0 MTL_HUD_ENABLED=0 && \
 	$(call bench_variant_pair,$(BENCH_VARIANTS_OUT)/sdk-vs-arm64,$(ISOLATED_ROOT),$(call arm64_root,x86_64),sdk,arm64,x86_64,x86_64); \
 	status=$$?; \
