@@ -719,20 +719,15 @@ fn emit_draw_view(
         }
     }
     drop(t_keys);
-    // 2. Resolve the VS and PS libraries. The hot path is a borrow-probe of
-    //    the source-keyed index (no per-draw content hash, no clone); the
-    //    slow path owns the disk-key hash, warm-cache bridge and enqueue.
-    //    An unbuilt or failed stage sends the draw there; it installs
-    //    finished builds before probing again and queues both stages before
-    //    deciding whether to wait, defer or skip the draw.
+    // 2. Resolve the VS and PS libraries. The hot path answers a draw naming
+    //    the previous draw's source records from the memo, and otherwise
+    //    borrow-probes the source-keyed index (no per-draw content hash, no
+    //    clone); the slow path owns the disk-key hash, warm-cache bridge and
+    //    enqueue. An unbuilt or failed stage sends the draw there; it
+    //    installs finished builds before probing again and queues both
+    //    stages before deciding whether to wait, defer or skip the draw.
     let t_lookup = CycleAddTimer::start(enc.op_sub_detail_ptr(OpSubDetail::RLookup));
-    let libraries = match enc.lookup_vs_library(vs) {
-        Some(Some(vs_handles)) => match enc.lookup_ps_library(ps, ps_variant) {
-            Some(Some(ps_handles)) => Some((*vs_handles, *ps_handles)),
-            None | Some(None) => None,
-        },
-        None | Some(None) => None,
-    };
+    let libraries = enc.lookup_libraries(vs, ps, ps_variant);
     let Some((vs_handles, ps_handles)) = libraries.or_else(|| {
         resolve_libraries_slow(
             enc,

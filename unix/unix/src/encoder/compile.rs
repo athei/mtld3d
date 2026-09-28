@@ -59,6 +59,8 @@ use crate::{
     metal::handle::IntoRetained,
 };
 
+pub mod libraries;
+
 #[cfg(test)]
 mod tests;
 
@@ -633,35 +635,24 @@ enum Begun {
 }
 
 impl FrameEncoder {
-    /// Probe the VS source-key index without starting or waiting for a build.
+    /// Both stages' built library handles for a draw, or `None` for the slow path.
     ///
-    /// The borrowed outcome is one pointer: unknown, recorded failure, or
-    /// ready handles. It stays borrowed until both warm stages are known.
+    /// See [`libraries::StageLibraries::lookup_ready`]: a draw naming the
+    /// previous draw's source records answers from the memo.
     #[inline]
-    pub fn lookup_vs_library(&self, source: VsSourceView<'_>) -> Option<&Option<StageLibHandles>> {
-        match source {
-            VsSourceView::FixedFunction(FixedVsSource { key, .. }) => {
-                self.ff_vs_libs.lookup_entry(key)
-            }
-            VsSourceView::Programmable(ProgrammableVsSource {
-                vs_id,
-                provided_input_mask,
-                clip_plane_count,
-                sampler_kinds,
-                ..
-            }) => self.prog_vs_libs.lookup_entry(&(
-                *vs_id,
-                *provided_input_mask,
-                *clip_plane_count,
-                *sampler_kinds,
-            )),
-        }
+    pub fn lookup_libraries(
+        &mut self,
+        vs: VsSourceView<'_>,
+        ps: PsSourceView<'_>,
+        variant: VariantKey,
+    ) -> Option<(StageLibHandles, StageLibHandles)> {
+        self.libraries.lookup_ready(vs, ps, variant)
     }
 
     /// Resolve the VS library for a draw.
     ///
-    /// Hot path: borrow-probe the source-keyed index (`ff_vs_libs` /
-    /// `prog_vs_libs`), `FxHash` + exact `Eq`, no per-draw content hash,
+    /// Hot path: borrow-probe the source-keyed index (`libraries`),
+    /// `FxHash` + exact `Eq`, no per-draw content hash,
     /// no clone. VS variants share one `MTLLibrary`, so the index key
     /// excludes `variant`. On a miss (about once per shader) the cold half
     /// computes the `disk_key`, answers from the warm cache when it can and
@@ -672,7 +663,7 @@ impl FrameEncoder {
     /// as final as a rejected one.
     #[inline]
     pub fn resolve_vs_library(&mut self, source: VsSourceView<'_>) -> Resolution<StageLibHandles> {
-        match self.lookup_vs_library(source) {
+        match self.libraries.lookup_vs(source) {
             Some(Some(handles)) => return Resolution::Ready(*handles),
             Some(None) => return Resolution::Failed,
             None => {}
@@ -709,26 +700,7 @@ impl FrameEncoder {
     }
 
     fn record_vs_library(&mut self, source: VsSourceView<'_>, outcome: Option<StageLibHandles>) {
-        match source {
-            VsSourceView::FixedFunction(FixedVsSource { key, .. }) => {
-                self.ff_vs_libs.record(key.clone(), outcome);
-            }
-            VsSourceView::Programmable(ProgrammableVsSource {
-                vs_id,
-                provided_input_mask,
-                clip_plane_count,
-                sampler_kinds,
-                ..
-            }) => self.prog_vs_libs.record(
-                (
-                    *vs_id,
-                    *provided_input_mask,
-                    *clip_plane_count,
-                    *sampler_kinds,
-                ),
-                outcome,
-            ),
-        }
+        self.libraries.record_vs(source, outcome);
     }
 
     /// Cold half of [`Self::resolve_vs_library`]: the index missed.
@@ -795,33 +767,12 @@ impl FrameEncoder {
         Begun::Queued(self.enqueue_library(input, reference))
     }
 
-    /// Probe the PS source-key and variant index without async resolution.
-    ///
-    /// Preserve the recorded failure inside the borrowed outcome, so the
-    /// full resolver distinguishes it from a key it still needs to build.
-    #[inline]
-    pub fn lookup_ps_library(
-        &self,
-        source: PsSourceView<'_>,
-        variant: VariantKey,
-    ) -> Option<&Option<StageLibHandles>> {
-        match source {
-            PsSourceView::FixedFunction(FixedPsSource { key, .. }) => self
-                .ff_ps_libs
-                .get(key)
-                .and_then(|variants| variants.lookup_entry(&variant)),
-            PsSourceView::Programmable(ProgrammablePsSource { ps_id, .. }) => {
-                self.prog_ps_libs.lookup_entry(&(*ps_id, variant))
-            }
-        }
-    }
-
     /// Resolve the PS library for a draw.
     ///
     /// Hot path: borrow-probe the source-keyed index. PS MSL depends on
-    /// `variant`, so the key folds it in: `ff_ps_libs` nests
+    /// `variant`, so the key folds it in: the fixed-function index nests
     /// `FfPsKey → variant → handles` (borrow the `FfPsKey`, no clone),
-    /// `prog_ps_libs` uses a `(ProgramId, VariantKey)` `Copy` tuple. A miss
+    /// the programmable one uses a `(ProgramId, VariantKey)` `Copy` tuple. A miss
     /// takes the same cold half as the vertex stage.
     #[inline]
     pub fn resolve_ps_library(
@@ -829,7 +780,7 @@ impl FrameEncoder {
         source: PsSourceView<'_>,
         variant: VariantKey,
     ) -> Resolution<StageLibHandles> {
-        match self.lookup_ps_library(source, variant) {
+        match self.libraries.lookup_ps(source, variant) {
             Some(Some(handles)) => return Resolution::Ready(*handles),
             Some(None) => return Resolution::Failed,
             None => {}
@@ -875,17 +826,7 @@ impl FrameEncoder {
         variant: VariantKey,
         outcome: Option<StageLibHandles>,
     ) {
-        match source {
-            PsSourceView::FixedFunction(FixedPsSource { key, .. }) => {
-                self.ff_ps_libs
-                    .entry(key.clone())
-                    .or_default()
-                    .record(variant, outcome);
-            }
-            PsSourceView::Programmable(ProgrammablePsSource { ps_id, .. }) => {
-                self.prog_ps_libs.record((*ps_id, variant), outcome);
-            }
-        }
+        self.libraries.record_ps(source, variant, outcome);
     }
 
     /// Cold half of [`Self::resolve_ps_library`]; the `disk_key` folds in `variant`.
@@ -1725,24 +1666,23 @@ impl FrameEncoder {
         }
         self.pending_libs.remove(&reference);
         match input {
-            LibraryInput::FixedFunctionVs { key } => self.ff_vs_libs.record(key, handles),
+            LibraryInput::FixedFunctionVs { key } => self.libraries.record_ff_vs(key, handles),
             LibraryInput::ProgrammableVs {
                 vs_id,
                 provided_input_mask,
                 clip_plane_count,
                 sampler_kinds,
                 ..
-            } => self.prog_vs_libs.record(
+            } => self.libraries.record_programmable_vs(
                 (vs_id, provided_input_mask, clip_plane_count, sampler_kinds),
                 handles,
             ),
-            LibraryInput::FixedFunctionPs { key, variant } => self
-                .ff_ps_libs
-                .entry(key)
-                .or_default()
-                .record(variant, handles),
+            LibraryInput::FixedFunctionPs { key, variant } => {
+                self.libraries.record_ff_ps(key, variant, handles);
+            }
             LibraryInput::ProgrammablePs { ps_id, variant, .. } => {
-                self.prog_ps_libs.record((ps_id, variant), handles);
+                self.libraries
+                    .record_programmable_ps(ps_id, variant, handles);
             }
         }
     }

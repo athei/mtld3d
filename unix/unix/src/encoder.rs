@@ -18,7 +18,7 @@ use mtld3d_core::{
     config::Mtld3dConfig,
     convert::{FAN_PATTERN_MAX_TRIANGLES, fan_pattern_bytes, fill_fan_pattern_u16},
     depth_stencil_state::{DepthStencilSnapshot, description_from_snapshot, key_from_snapshot},
-    dxso::{DxsoProgram, FfPsKey, FfVsKey, VariantKey, VsSamplerKinds, declared_ps_samplers},
+    dxso::{DxsoProgram, declared_ps_samplers},
     encoder_packet::NativeVbibRetention,
     ff_state::{FF_VS_PALETTE_BASE_ROW, MAX_VERTEX_BLEND_MATRIX_INDEX},
     format::map_d3d_format,
@@ -989,24 +989,12 @@ pub struct FrameEncoder {
     /// below; `lib_cache` is now the warm-load landing zone + disk-write
     /// index, consulted only on an index miss (≈ once per shader).
     lib_cache: FxHashMap<ShaderRecordRef, StageLibHandles>,
-    /// Per-draw shader-library lookup, keyed on the shader-identity struct.
+    /// Per-draw shader-library lookup by source key, with a memo of the previous draw's answer.
     ///
-    /// `FxHash` + exact `Eq`, probed by borrow — no per-draw content hash,
-    /// no clone. One pair of maps per stage; VS keys exclude `variant`
-    /// (variants share one `MTLLibrary`) but carry the user clip plane count
-    /// (a programmable VS compiles one library per count), PS keys fold the
-    /// variant in. The Xxh3
-    /// `disk_key` is computed only on a miss here, to bridge `lib_cache`
-    /// (warm-load) and address the on-disk cache. A key whose build failed is
-    /// recorded too: the same key yields the same source, so its later draws
-    /// are dropped on the probe instead of compiling again. A library a
-    /// worker is building is in `pending_libs` until its outcome lands here.
-    /// `reset_cleanup` forgets the failures (a Reset at unchanged back-buffer
-    /// dimensions never reaches it), shutdown forgets everything.
-    ff_vs_libs: BuildIndex<FfVsKey, StageLibHandles>,
-    prog_vs_libs: BuildIndex<(ProgramId, u16, u8, VsSamplerKinds), StageLibHandles>,
-    ff_ps_libs: FxHashMap<FfPsKey, BuildIndex<VariantKey, StageLibHandles>>,
-    prog_ps_libs: BuildIndex<(ProgramId, VariantKey), StageLibHandles>,
+    /// `reset_cleanup` forgets the failures, shutdown forgets everything,
+    /// and `begin_frame` forgets the memo, whose record addresses are only
+    /// meaningful inside the packet that carries them.
+    libraries: compile::libraries::StageLibraries,
     texture_cache: FxHashMap<TextureId, TextureGpuState>,
     sampler_cache: FxHashMap<SamplerKey, MetalHandle<MTLSamplerStateKind>>,
     /// Per-stage memo of the last sampler resolve, keyed on the raw D3D9 sampler-state words.
@@ -1547,10 +1535,7 @@ impl FrameEncoder {
             prog_sampler_decls: FxHashMap::default(),
             prog_reads_vpos: FxHashSet::default(),
             lib_cache: FxHashMap::default(),
-            ff_vs_libs: BuildIndex::default(),
-            prog_vs_libs: BuildIndex::default(),
-            ff_ps_libs: FxHashMap::default(),
-            prog_ps_libs: BuildIndex::default(),
+            libraries: compile::libraries::StageLibraries::default(),
             texture_cache: FxHashMap::default(),
             sampler_cache: FxHashMap::default(),
             sampler_resolve_memo: core::array::from_fn(|_| None),
@@ -2127,6 +2112,9 @@ impl FrameEncoder {
         // (about to drop). Drop the cached slice; next FF draw re-bumps
         // from the persistent mirror.
         self.ff_vs_const_scratch_cache = None;
+        // The library memo names source records by address, and this
+        // packet's records may sit where the previous packet's did.
+        self.libraries.begin_packet();
         self.frame_blit_commands.clear();
         self.flags.remove(FrameEncoderFlags::BLIT_CMDS_NEED_ENCODER);
         self.dump_draw = None;
@@ -7907,10 +7895,7 @@ impl FrameEncoder {
         self.lib_cache.clear();
         // Non-owning indices into the libraries destroyed above via `lib_cache`
         // — just drop the handle copies.
-        self.ff_vs_libs.clear();
-        self.prog_vs_libs.clear();
-        self.ff_ps_libs.clear();
-        self.prog_ps_libs.clear();
+        self.libraries.clear();
         self.sampler_cache.clear();
         self.depth_stencil_cache.clear();
         self.program_cache.clear();
@@ -7948,12 +7933,7 @@ impl FrameEncoder {
         // that reaches this cleanup (one at unchanged dimensions does not):
         // a rejected source or descriptor fails again at the cost of one
         // build, a build the compiler service dropped goes through.
-        self.ff_vs_libs.forget_failures();
-        self.prog_vs_libs.forget_failures();
-        for variants in self.ff_ps_libs.values_mut() {
-            variants.forget_failures();
-        }
-        self.prog_ps_libs.forget_failures();
+        self.libraries.forget_failures();
         self.pipeline_cache.forget_failures();
         // The implicit surfaces the caller is about to destroy never pass
         // through the retention queue, so this is their only chance to leave
