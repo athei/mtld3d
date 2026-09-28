@@ -65,8 +65,6 @@ fn batch_creation_keeps_views_and_ordered_clears_after_pool_drain() {
     };
     use objc2::rc::autoreleasepool;
 
-    use crate::metal::handle::IntoRetained;
-
     autoreleasepool(|_| {
         let device = MTLCreateSystemDefaultDevice().expect("Metal device for texture batch");
         let queue = device.newCommandQueue().expect("texture batch queue");
@@ -93,33 +91,46 @@ fn batch_creation_keeps_views_and_ordered_clears_after_pool_drain() {
             usage_flags: TextureUsage::RENDER_TARGET,
         });
         let mut views = [TextureViews::EMPTY; 2];
-        assert!(autoreleasepool(|_| super::create_textures(
-            &device,
-            queue_handle,
-            &descriptors,
-            &mut views,
-        )));
-        for (index, view) in views.iter().enumerate() {
-            let texture = view
-                .linear
-                .into_retained()
-                .expect("batch texture survives pool");
-            assert_eq!(texture.mipmapLevelCount(), 3);
-            for slice in 0..if index == 0 { 1 } else { 6 } {
-                for level in 0..3 {
-                    assert_eq!(read_first_pixel(&queue, &texture, slice, level), [0; 4]);
-                }
-            }
+        let mut clears = super::TextureClearBatch::new();
+        for (descriptor, view) in descriptors.iter().zip(&mut views) {
+            assert!(autoreleasepool(|_| super::create_textures(
+                &device,
+                core::slice::from_ref(descriptor),
+                core::slice::from_mut(view),
+                &mut clears,
+            )));
+        }
+        // The batch must own these resources even when the texture cache releases
+        // its canonical handles before the frame reaches submission.
+        for view in &views {
             for handle in view.owned_handles() {
                 super::destroy_texture(handle.raw());
             }
         }
-        assert!(super::create_textures(
-            &device,
-            MetalHandle::NULL,
-            &[],
-            &mut []
-        ));
+        let textures = clears.textures.clone();
+        assert_eq!(textures.len(), 2, "batch retains both released textures");
+        let committed = autoreleasepool(|_| clears.commit(queue_handle, TRANSPARENT_BLACK))
+            .expect("two creations share one actual initialization command buffer");
+        assert!(clears.commit(queue_handle, TRANSPARENT_BLACK).is_none());
+        for (index, (view, texture)) in views.iter().zip(&textures).enumerate() {
+            assert_eq!(texture.mipmapLevelCount(), 3);
+            for slice in 0..if index == 0 { 1 } else { 6 } {
+                for level in 0..3 {
+                    assert_eq!(read_first_pixel(&queue, texture, slice, level), [0; 4]);
+                }
+            }
+            let red = MTLClearColor {
+                red: 1.0,
+                green: 0.0,
+                blue: 0.0,
+                alpha: 1.0,
+            };
+            clear_new_color_textures(queue_handle, &[view.linear], red);
+            assert_eq!(read_first_pixel(&queue, texture, 0, 0), [0, 0, 255, 255]);
+        }
+        assert_eq!(committed.status(), MTLCommandBufferStatus::Completed);
+        assert!(super::create_textures(&device, &[], &mut [], &mut clears));
+        assert!(clears.commit(queue_handle, TRANSPARENT_BLACK).is_none());
     });
 }
 

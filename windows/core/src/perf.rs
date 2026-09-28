@@ -88,21 +88,6 @@ pub const fn unix_dispatch_kind(code: u32) -> Option<&'static str> {
         None
     } else if code == Thunks::SubmitEncoderFrame as u32 {
         Some("enqueue")
-    } else if code == Thunks::SubmitFrame as u32
-        || code == Thunks::CreateDepthStencilState as u32
-        || code == Thunks::CreateTexturesBatch as u32
-        || code == Thunks::CreateSamplerState as u32
-        || code == Thunks::CreateBuffersBatch as u32
-        || code == Thunks::CreateTextureSliceView as u32
-    {
-        Some("replay")
-    } else if code == Thunks::CompileShaderLibrary as u32
-        || code == Thunks::CreateRenderPipeline as u32
-        || code == Thunks::EnsureClearQuadPipeline as u32
-        || code == Thunks::EnsureBlitPipeline as u32
-        || code == Thunks::CreateDepthTransferPipeline as u32
-    {
-        Some("compile")
     } else {
         Some("sync")
     }

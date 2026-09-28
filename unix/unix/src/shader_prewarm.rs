@@ -39,6 +39,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use crate::{
     LOG_TARGET,
     encoder::{StageLibHandles, WarmCache, compile_stage_library},
+    metal::handle::IntoRetained,
 };
 
 /// Start prewarm for one device and return its startup barrier.
@@ -332,20 +333,15 @@ fn compile_pipeline(
     let mut total_ns = 0;
     let timer = NanosSetTimer::start(&raw mut total_ns);
     let vertex_layouts = pipeline_state::vertex_layouts_from_snapshot(snapshot);
-    let params = pipeline_state::params_from_snapshot(&PipelineBuildInputs {
+    let params = pipeline_state::description_from_snapshot(&PipelineBuildInputs {
         snapshot,
         vertex_attrs: recipe.vertex_attrs(),
         vertex_layouts: &vertex_layouts,
-        device_handle,
     });
     let mut timings = mtld3d_shared::perf::PipelineTimings::new();
     let pipeline = autoreleasepool(|_| {
-        crate::metal::create_render_pipeline(
-            &params,
-            recipe.vertex_attrs(),
-            &vertex_layouts,
-            &mut timings,
-        )
+        let device = device_handle.into_retained()?;
+        crate::metal::create_render_pipeline(&device, &params, &mut timings)
     });
     if pipeline.is_none() {
         error!(target: LOG_TARGET, "failed to create render pipeline");

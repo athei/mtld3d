@@ -24,7 +24,7 @@
 use std::sync::{Mutex, OnceLock};
 
 use mtld3d_shared::{
-    EnsureBlitPipelineParams, MetalHandle,
+    MetalHandle,
     mtl::PixelFormat,
     mtl_handle::{MTLFunctionKind, MTLRenderPipelineStateKind},
 };
@@ -161,26 +161,25 @@ static CACHE: OnceLock<Option<UploadCache>> = OnceLock::new();
 /// Returns `None` on any compile / pipeline-create failure; the PE side then
 /// falls back to the blit upload path for that texture.
 pub fn ensure_upload_pipeline(
-    params: &EnsureBlitPipelineParams,
+    device: &ProtocolObject<dyn MTLDevice>,
+    color_format: PixelFormat,
 ) -> Option<MetalHandle<MTLRenderPipelineStateKind>> {
-    let device = params.device_handle.into_retained()?;
-
     let cache = CACHE
-        .get_or_init(|| build_library_and_functions(&device))
+        .get_or_init(|| build_library_and_functions(device))
         .as_ref()?;
 
     {
         let pipelines = cache.pipelines.lock().ok()?;
-        if let Some(&handle) = pipelines.get(&params.color_format) {
+        if let Some(&handle) = pipelines.get(&color_format) {
             return Some(handle);
         }
     }
 
-    let handle = build_pipeline(&device, cache, params.color_format)?;
+    let handle = build_pipeline(device, cache, color_format)?;
     let mut pipelines = cache.pipelines.lock().ok()?;
     // SAFETY: `build_pipeline` handed `handle` the only retain on its
     // pipeline, and nothing else copied it.
-    Some(unsafe { keep_first(&mut pipelines, params.color_format, handle) })
+    Some(unsafe { keep_first(&mut pipelines, color_format, handle) })
 }
 
 fn build_library_and_functions(device: &ProtocolObject<dyn MTLDevice>) -> Option<UploadCache> {

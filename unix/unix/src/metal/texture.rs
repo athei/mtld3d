@@ -1,6 +1,6 @@
+use mtld3d_core::depth_stencil_state::{DepthStencilDescription, StencilFaceDescription};
 use mtld3d_shared::{
-    CreateDepthStencilStateParams, CreateTextureSliceViewParams, MetalHandle, StencilFaceParams,
-    TextureCreateDesc,
+    MetalHandle, TextureCreateDesc,
     mtl::{
         BlendFactor as WireBlendFactor, CompareFunc, PixelFormat, StencilOp, StorageMode, Swizzle,
         TextureCreateFlags, TextureUsage,
@@ -262,36 +262,72 @@ pub fn clear_new_color_textures(
     handles: &[MetalHandle<MTLTextureKind>],
     clear_color: MTLClearColor,
 ) {
-    let textures: Vec<_> = handles
-        .iter()
-        .filter_map(|handle| handle.into_retained())
-        .collect();
-    if textures.is_empty() {
-        return;
+    let mut batch = TextureClearBatch::new();
+    for &handle in handles {
+        batch.retain(handle);
     }
-    let Some(queue) = queue_handle.into_retained() else {
-        mtld3d_shared::log_once_warn!(
-            target: crate::LOG_TARGET,
-            "clear_new_color_textures: no queue for the creation-time clear; \
-             the new texture starts with undefined contents",
-        );
-        return;
-    };
-    let Some(cmd_buf) = diagnostics::command_buffer(&queue) else {
-        mtld3d_shared::log_once_warn!(
-            target: crate::LOG_TARGET,
-            "clear_new_color_textures: commandBuffer() returned nil for the creation-time \
-             clear; the new texture starts with undefined contents",
-        );
-        return;
-    };
-    let cmd_label = objc2_foundation::NSString::from_str("mtld3d-init-clear");
-    cmd_buf.setLabel(Some(&cmd_label));
-    for texture in &textures {
-        clear_one_texture(&cmd_buf, texture, clear_color);
+    drop(batch.commit(queue_handle, clear_color));
+}
+
+/// New color textures awaiting one initialization clear before frame submission.
+///
+/// Retains textures independently of the cache, including same-frame releases.
+/// Dropping an uncommitted batch releases those retains without submitting work.
+pub struct TextureClearBatch {
+    textures: Vec<Retained<ProtocolObject<dyn MTLTexture>>>,
+}
+
+impl TextureClearBatch {
+    pub const fn new() -> Self {
+        Self {
+            textures: Vec::new(),
+        }
     }
-    diagnostics::observe_initialization(&cmd_buf);
-    cmd_buf.commit();
+
+    fn retain(&mut self, handle: MetalHandle<MTLTextureKind>) {
+        if let Some(texture) = handle.into_retained() {
+            self.textures.push(texture);
+        }
+    }
+
+    /// Commit one clear buffer, returning it when work was submitted.
+    ///
+    /// Drains retained textures on success and failure, keeping vector capacity.
+    /// The caller must commit before any submission that can access these textures.
+    pub fn commit(
+        &mut self,
+        queue_handle: MetalHandle<MTLCommandQueueKind>,
+        clear_color: MTLClearColor,
+    ) -> Option<Retained<ProtocolObject<dyn MTLCommandBuffer>>> {
+        let textures = self.textures.drain(..);
+        if textures.len() == 0 {
+            return None;
+        }
+        let Some(queue) = queue_handle.into_retained() else {
+            mtld3d_shared::log_once_warn!(
+                target: crate::LOG_TARGET,
+                "clear_new_color_textures: no queue for the creation-time clear; \
+                 the new texture starts with undefined contents",
+            );
+            return None;
+        };
+        let Some(cmd_buf) = diagnostics::command_buffer(&queue) else {
+            mtld3d_shared::log_once_warn!(
+                target: crate::LOG_TARGET,
+                "clear_new_color_textures: commandBuffer() returned nil for the creation-time \
+                 clear; the new texture starts with undefined contents",
+            );
+            return None;
+        };
+        let cmd_label = objc2_foundation::NSString::from_str("mtld3d-init-clear");
+        cmd_buf.setLabel(Some(&cmd_label));
+        for texture in textures {
+            clear_one_texture(&cmd_buf, &texture, clear_color);
+        }
+        diagnostics::observe_initialization(&cmd_buf);
+        cmd_buf.commit();
+        Some(cmd_buf)
+    }
 }
 
 /// Encode the clear passes of one texture into an open command buffer.
@@ -590,30 +626,22 @@ pub fn create_msaa_companion(
 
 /// Creates an `MTLDepthStencilState` object.
 pub fn create_depth_stencil_state(
-    params: &CreateDepthStencilStateParams,
+    device: &ProtocolObject<dyn MTLDevice>,
+    params: &DepthStencilDescription,
 ) -> Option<MetalHandle<MTLDepthStencilStateKind>> {
-    let device = params.device_handle.into_retained()?;
-
     let desc = MTLDepthStencilDescriptor::new();
-
-    if params.depth_test_enable != 0 {
-        desc.setDepthCompareFunction(mtl_compare_function(params.depth_compare_func));
-        desc.setDepthWriteEnabled(params.depth_write_enable != 0);
-    } else {
-        desc.setDepthCompareFunction(MTLCompareFunction::Always);
-        desc.setDepthWriteEnabled(false);
-    }
-
-    if params.stencil_test_enable != 0 {
+    desc.setDepthCompareFunction(mtl_compare_function(params.depth_compare_func));
+    desc.setDepthWriteEnabled(params.depth_write_enable);
+    if let Some(stencil) = &params.stencil {
         desc.setFrontFaceStencil(Some(&stencil_face_descriptor(
-            params.front,
-            params.stencil_read_mask,
-            params.stencil_write_mask,
+            stencil.front,
+            stencil.read_mask,
+            stencil.write_mask,
         )));
         desc.setBackFaceStencil(Some(&stencil_face_descriptor(
-            params.back,
-            params.stencil_read_mask,
-            params.stencil_write_mask,
+            stencil.back,
+            stencil.read_mask,
+            stencil.write_mask,
         )));
     }
 
@@ -632,7 +660,7 @@ pub fn create_depth_stencil_state(
 /// (`D3DRS_STENCILMASK` / `D3DRS_STENCILWRITEMASK`) covering both, so the
 /// same pair is written to each face.
 fn stencil_face_descriptor(
-    face: StencilFaceParams,
+    face: StencilFaceDescription,
     read_mask: u32,
     write_mask: u32,
 ) -> Retained<MTLStencilDescriptor> {
@@ -680,27 +708,24 @@ pub const fn mtl_blend_factor(wire: WireBlendFactor) -> MTLBlendFactor {
 /// Create texture views, keeping successful slots when another creation fails.
 ///
 /// The caller supplies an autorelease pool. Each distinct returned handle owns
-/// one retain. Creation-time clears share one command buffer on the frame queue.
+/// one retain. The caller commits `clears` before submitting texture-consuming work.
 /// Returns whether every creation succeeded.
 ///
 /// # Panics
 /// Panics when the descriptor and output counts differ.
 pub fn create_textures(
     device: &ProtocolObject<dyn MTLDevice>,
-    queue: MetalHandle<MTLCommandQueueKind>,
     descs: &[TextureCreateDesc],
     views: &mut [TextureViews],
+    clears: &mut TextureClearBatch,
 ) -> bool {
     assert_eq!(descs.len(), views.len());
     let mut any_failed = false;
-    // Collected rather than cleared per element, so the batch costs one
-    // command buffer instead of one each.
-    let mut clear_on_create: Vec<MetalHandle<MTLTextureKind>> = Vec::new();
     for (desc, slot) in descs.iter().zip(views) {
         if let Some(created) = create_texture(device, desc) {
             *slot = created;
             if desc.flags.contains(TextureCreateFlags::CLEAR_ON_CREATE) {
-                clear_on_create.push(slot.linear);
+                clears.retain(slot.linear);
             }
         } else {
             *slot = TextureViews::EMPTY;
@@ -712,7 +737,6 @@ pub fn create_textures(
             );
         }
     }
-    clear_new_color_textures(queue, &clear_on_create, TRANSPARENT_BLACK);
     !any_failed
 }
 
@@ -991,9 +1015,10 @@ fn mint_texture_views(
 /// The returned view is a fresh object whose retain the caller owns; the PE
 /// side destroys it once the frame that binds it has retired.
 pub fn create_texture_slice_view(
-    params: &CreateTextureSliceViewParams,
+    texture_handle: MetalHandle<MTLTextureKind>,
+    slice: u32,
 ) -> Option<MetalHandle<MTLTextureKind>> {
-    let texture = params.texture_handle.into_retained()?;
+    let texture = texture_handle.into_retained()?;
     let levels = texture.mipmapLevelCount();
     // SAFETY: objc2 typed binding; `texture` is retained for the call, the
     // format is the base texture's own, and the level range covers exactly the
@@ -1003,12 +1028,11 @@ pub fn create_texture_slice_view(
             texture.pixelFormat(),
             MTLTextureType::Type2D,
             objc2_foundation::NSRange::new(0, levels),
-            objc2_foundation::NSRange::new(params.slice as usize, 1),
+            objc2_foundation::NSRange::new(slice as usize, 1),
         )
     }?;
     let label = objc2_foundation::NSString::from_str(&format!(
-        "mtld3d-sliceview-{:#x}-{}",
-        params.texture_handle, params.slice
+        "mtld3d-sliceview-{texture_handle:#x}-{slice}"
     ));
     view.setLabel(Some(&label));
     // SAFETY: `Retained::into_raw` hands over the view's only retain, which

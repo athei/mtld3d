@@ -54,7 +54,10 @@ use super::{
     FrameEncoder, FrameEncoderFlags, LOG_TARGET, StageLibHandles, compile_stage_library,
     open_or_create_cache_file,
 };
-use crate::draw::{PsSourceView, ShaderRef, VsSourceView};
+use crate::{
+    draw::{PsSourceView, ShaderRef, VsSourceView},
+    metal::handle::IntoRetained,
+};
 
 #[cfg(test)]
 mod tests;
@@ -68,12 +71,6 @@ const COMPILE_WORKERS: usize = 4;
 
 /// Seconds a build may stay in flight before the encoder warns that it looks stuck.
 const STALLED_BUILD_SECS: u64 = 5;
-
-/// Stack reserved for each native compile worker.
-///
-/// MSL emission and backend compilation run on this Unix stack. It is not
-/// allocated from the guest's 32-bit address space.
-const COMPILE_WORKER_STACK: usize = 1024 * 1024;
 
 /// The jobs waiting for a worker, and the workers' wake-up.
 ///
@@ -179,7 +176,6 @@ pub fn spawn_workers(
         let results = results.clone();
         match thread::Builder::new()
             .name("mtld3d-compile".into())
-            .stack_size(COMPILE_WORKER_STACK)
             .spawn(move || worker_main(&queue, &results))
         {
             Ok(handle) => started.push(handle),
@@ -553,15 +549,15 @@ fn build_pipeline(job: PipelineJob) -> PipelineOutcome {
     let key = pipeline_state::key_from_snapshot(&snapshot, &vertex_attrs);
     // One layout per used stream, borrowed through the synchronous build.
     let vertex_layouts = pipeline_state::vertex_layouts_from_snapshot(&snapshot);
-    let params = pipeline_state::params_from_snapshot(&PipelineBuildInputs {
+    let params = pipeline_state::description_from_snapshot(&PipelineBuildInputs {
         snapshot: &snapshot,
         vertex_attrs: &vertex_attrs,
         vertex_layouts: &vertex_layouts,
-        device_handle: device,
     });
     let mut native = PipelineTimings::new();
     let pipeline = autoreleasepool(|_| {
-        crate::metal::create_render_pipeline(&params, &vertex_attrs, &vertex_layouts, &mut native)
+        let device = device.into_retained()?;
+        crate::metal::create_render_pipeline(&device, &params, &mut native)
     });
     let status = if pipeline.is_some() {
         0

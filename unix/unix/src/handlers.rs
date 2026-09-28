@@ -3,24 +3,18 @@ use std::sync::Arc;
 
 use log::{debug, error, info, warn};
 use mtld3d_shared::{
-    AttachMetalLayerParams, BlitTextureToBufferParams, BufferCreateDesc,
-    CompileShaderLibraryParams, CreateBackbufferParams, CreateBuffersBatchParams,
-    CreateColorTargetParams, CreateCommandQueueParams, CreateDepthStencilStateParams,
-    CreateDepthTextureParams, CreateRenderPipelineParams, CreateSamplerStateParams,
-    CreateTextureSliceViewParams, CreateTexturesBatchParams, DestroyCommandQueueParams,
-    DestroyResourcesBulkParams, DetachMetalLayerParams, EnsureBlitPipelineParams,
-    EnsureClearQuadPipelineParams, GetDeviceInfoParams, GetTaskFaultsParams, InPtr, InPtrMut,
-    MetalHandle, OpenLogParams, SetCursorOverlayParams, SetDisplaySyncEnabledParams,
-    SetGammaRampParams, SetPresentWaitPolicyParams, StartGpuCaptureParams, SubmitFrameParams,
-    TextureCreateDesc, VertexAttrDesc, VertexBufferLayoutDesc, WaitForGpuRetireParams,
-    WaitForPresentIdleParams, WriteLogParams, identity,
-    mtl::{CursorOverlayFlags, DestroyKind, QuadPipelineKind},
-    mtl_handle::{MTLBufferKind, MTLTextureKind},
+    AttachMetalLayerParams, BlitTextureToBufferParams, CreateBackbufferParams,
+    CreateColorTargetParams, CreateCommandQueueParams, CreateDepthTextureParams,
+    DestroyCommandQueueParams, DestroyResourcesBulkParams, DetachMetalLayerParams,
+    GetDeviceInfoParams, InPtr, InPtrMut, MetalHandle, OpenLogParams, SetCursorOverlayParams,
+    SetPresentWaitPolicyParams, WriteLogParams, identity,
+    mtl::{CursorOverlayFlags, DestroyKind},
+    mtl_handle::MTLTextureKind,
     record_handle::DeviceRecordHandle,
 };
 use objc2_core_foundation::kCFRunLoopCommonModes;
 
-use crate::{LOG_TARGET, metal, metal::handle::IntoRetained};
+use crate::{LOG_TARGET, metal};
 
 const STATUS_SUCCESS: i32 = 0;
 // NTSTATUS bit-pattern reinterpret for `unix_call` return; see d3d9/lib.rs
@@ -208,8 +202,7 @@ pub extern "C" fn get_device_info_handler(args: *mut c_void) -> i32 {
 ///
 /// A null or unknown handle is a device whose creation failed or one already
 /// destroyed; the caller returns without touching Metal, as it did when the
-/// device was looked up by queue address. A thunk whose call cannot be
-/// dropped takes the stricter [`wait_device_record`] instead.
+/// device was looked up by queue address.
 fn device_record(handle: DeviceRecordHandle, thunk: &str) -> Option<Arc<metal::DeviceRecord>> {
     let record = borrow_device_record(handle);
     if record.is_none() {
@@ -221,28 +214,9 @@ fn device_record(handle: DeviceRecordHandle, thunk: &str) -> Option<Arc<metal::D
     record
 }
 
-/// The record a wait thunk names, or `None` after an error.
-///
-/// A wait whose record is missing never happens, so the read-back or the
-/// `Reset` behind it runs against GPU work that has not retired. Every miss
-/// is an ordering violation of its own rather than one process-wide gap, so
-/// each one is logged, and the thunk answers `STATUS_UNSUCCESSFUL` so the
-/// caller learns that the wait it asked for did not run.
-fn wait_device_record(handle: DeviceRecordHandle, thunk: &str) -> Option<Arc<metal::DeviceRecord>> {
-    let record = borrow_device_record(handle);
-    if record.is_none() {
-        error!(
-            target: LOG_TARGET,
-            "{thunk}: no device record for handle {handle:#x}; the wait did not happen",
-        );
-    }
-    record
-}
-
 /// The record a handle names, with no verdict on a miss.
 ///
-/// The two lookups above differ only in how loudly a miss is reported, so the
-/// borrow and its safety argument have one home between them.
+/// The PE lifecycle keeps the named record live through each boundary call.
 fn borrow_device_record(handle: DeviceRecordHandle) -> Option<Arc<metal::DeviceRecord>> {
     // SAFETY: the PE side passes back a handle `CreateCommandQueue` produced
     // and keeps it until its `DestroyCommandQueue`, which is the one caller
@@ -416,68 +390,6 @@ pub extern "C" fn set_cursor_overlay_handler(args: *mut c_void) -> i32 {
     }
 }
 
-pub extern "C" fn set_display_sync_enabled_handler(args: *mut c_void) -> i32 {
-    // SAFETY: unix-call handler params; PE side passes *const SetDisplaySyncEnabledParams.
-    let Some(params) = (unsafe { InPtr::<SetDisplaySyncEnabledParams>::opt(args.cast()) }) else {
-        return -1;
-    };
-    metal::set_display_sync_enabled(
-        params.layer_handle,
-        &metal::PresentPacing {
-            vsync_requested: params.display_sync_enabled != 0,
-            max_fps: params.max_fps,
-        },
-    );
-    STATUS_SUCCESS
-}
-
-pub extern "C" fn set_gamma_ramp_handler(args: *mut c_void) -> i32 {
-    // SAFETY: unix-call handler params; PE side passes *const SetGammaRampParams.
-    let Some(params) = (unsafe { InPtr::<SetGammaRampParams>::opt(args.cast()) }) else {
-        return -1;
-    };
-    let entries = if params.entries_ptr == 0 {
-        None
-    } else {
-        let expected = metal::gamma_table_lanes();
-        if params.entries_len as usize != expected {
-            warn!(
-                target: LOG_TARGET,
-                "SetGammaRamp: rejected a table of {} lanes (expected {expected})",
-                params.entries_len,
-            );
-            return STATUS_UNSUCCESSFUL;
-        }
-        // SAFETY: PE supplied `entries_ptr`/`entries_len` as a `u16` table
-        // valid for the call duration; the pointer is non-zero per the branch
-        // and the lane count was just checked against the one table shape.
-        Some(unsafe { core::slice::from_raw_parts(params.entries_ptr as *const u16, expected) })
-    };
-    if metal::set_gamma_ramp(&params, entries) {
-        STATUS_SUCCESS
-    } else {
-        STATUS_UNSUCCESSFUL
-    }
-}
-
-pub extern "C" fn wait_for_gpu_retire_handler(args: *mut c_void) -> i32 {
-    // SAFETY: unix-call handler params; PE side passes *const WaitForGpuRetireParams.
-    let Some(params) = (unsafe { InPtr::<WaitForGpuRetireParams>::opt(args.cast()) }) else {
-        return -1;
-    };
-    let Some(record) = wait_device_record(params.record_handle, "WaitForGpuRetire") else {
-        return STATUS_UNSUCCESSFUL;
-    };
-    metal::wait_for_gpu_retire(
-        record.pending(),
-        params.target_seq,
-        params.coherent_seq_ptr,
-        params.upload_coherent_seq_ptr,
-        params.failed_submit_seq_ptr,
-    );
-    STATUS_SUCCESS
-}
-
 pub extern "C" fn set_present_wait_policy_handler(args: *mut c_void) -> i32 {
     // SAFETY: unix-call handler params; PE side passes *const SetPresentWaitPolicyParams.
     let Some(params) = (unsafe { InPtr::<SetPresentWaitPolicyParams>::opt(args.cast()) }) else {
@@ -493,56 +405,24 @@ pub extern "C" fn set_present_wait_policy_handler(args: *mut c_void) -> i32 {
     STATUS_SUCCESS
 }
 
-pub extern "C" fn wait_for_present_idle_handler(args: *mut c_void) -> i32 {
-    // SAFETY: unix-call handler params; PE side passes *const WaitForPresentIdleParams.
-    let Some(params) = (unsafe { InPtr::<WaitForPresentIdleParams>::opt(args.cast()) }) else {
-        return -1;
-    };
-    let Some(record) = wait_device_record(params.record_handle, "WaitForPresentIdle") else {
-        return STATUS_UNSUCCESSFUL;
-    };
-    metal::wait_for_present_idle(&record);
-    STATUS_SUCCESS
-}
-
-pub extern "C" fn start_gpu_capture_handler(args: *mut c_void) -> i32 {
-    // SAFETY: unix-call handler params; PE side passes *const StartGpuCaptureParams.
-    let Some(params) = (unsafe { InPtr::<StartGpuCaptureParams>::opt(args.cast()) }) else {
-        return -1;
-    };
-    metal::start_capture(params.device_handle);
-    STATUS_SUCCESS
-}
-
-pub extern "C" fn stop_gpu_capture_handler(_args: *mut c_void) -> i32 {
-    metal::stop_capture();
-    STATUS_SUCCESS
-}
-
-/// Report the process-wide page-fault counters from `getrusage`.
-///
-/// One cheap libc call; the PE side gates it to once per perf summary
-/// window. `ru_minflt` / `ru_majflt` are cumulative since process start,
-/// so the caller deltas consecutive samples.
-pub extern "C" fn get_task_faults_handler(args: *mut c_void) -> i32 {
-    // SAFETY: unix-call handler params; PE side passes *mut GetTaskFaultsParams.
-    let Some(mut params) = (unsafe { InPtrMut::<GetTaskFaultsParams>::opt(args) }) else {
-        return -1;
-    };
-    // SAFETY: `rusage` is plain old data; all-zero is a valid initial value
-    // for an out-parameter the kernel overwrites.
+/// Sample process-wide faults once per enabled encoder summary window.
+pub fn task_faults() -> mtld3d_core::perf::TaskFaults {
+    // SAFETY: rusage is plain data initialized before the kernel fills it.
     let mut usage: libc::rusage = unsafe { core::mem::zeroed() };
-    // SAFETY: `usage` is a live, writable rusage and RUSAGE_SELF is a valid
-    // `who` selector.
+    // SAFETY: usage is a live writable output and RUSAGE_SELF is valid.
     let rc = unsafe { libc::getrusage(libc::RUSAGE_SELF, &raw mut usage) };
-    if rc != 0 {
-        return STATUS_UNSUCCESSFUL;
+    mtld3d_core::perf::TaskFaults {
+        minor: if rc == 0 {
+            u64::try_from(usage.ru_minflt).unwrap_or(0)
+        } else {
+            0
+        },
+        major: if rc == 0 {
+            u64::try_from(usage.ru_majflt).unwrap_or(0)
+        } else {
+            0
+        },
     }
-    // c_long on macOS is i64; a negative count never occurs, but saturate
-    // to 0 rather than wrap if the kernel ever reports one.
-    params.minor_faults = u64::try_from(usage.ru_minflt).unwrap_or(0);
-    params.major_faults = u64::try_from(usage.ru_majflt).unwrap_or(0);
-    STATUS_SUCCESS
 }
 
 pub extern "C" fn destroy_command_queue_handler(args: *mut c_void) -> i32 {
@@ -656,198 +536,6 @@ pub extern "C" fn create_backbuffer_handler(args: *mut c_void) -> i32 {
         record.queue().raw(),
     );
     STATUS_SUCCESS
-}
-
-pub extern "C" fn create_render_pipeline_handler(args: *mut c_void) -> i32 {
-    // SAFETY: unix-call handler params; PE side passes *mut CreateRenderPipelineParams.
-    let Some(mut params) = (unsafe { InPtrMut::<CreateRenderPipelineParams>::opt(args) }) else {
-        return -1;
-    };
-    let params: &mut CreateRenderPipelineParams = &mut params;
-
-    let attrs = if params.vertex_attr_count == 0 || params.vertex_attrs_ptr == 0 {
-        &[][..]
-    } else {
-        // SAFETY: PE supplied `vertex_attrs_ptr` as the address of a
-        // `[VertexAttrDesc; vertex_attr_count]` valid for the call duration.
-        unsafe {
-            core::slice::from_raw_parts(
-                params.vertex_attrs_ptr as *const VertexAttrDesc,
-                params.vertex_attr_count as usize,
-            )
-        }
-    };
-    let layouts = if params.vertex_layout_count == 0 || params.vertex_layouts_ptr == 0 {
-        &[][..]
-    } else {
-        // SAFETY: PE supplied `vertex_layouts_ptr` as the address of a
-        // `[VertexBufferLayoutDesc; vertex_layout_count]` valid for the call
-        // duration.
-        unsafe {
-            core::slice::from_raw_parts(
-                params.vertex_layouts_ptr as *const VertexBufferLayoutDesc,
-                params.vertex_layout_count as usize,
-            )
-        }
-    };
-
-    let mut timings = mtld3d_shared::perf::PipelineTimings::new();
-    let result = metal::create_render_pipeline(params, attrs, layouts, &mut timings);
-    params.timings.write(timings);
-    if let Some(handle) = result {
-        params.pipeline_handle = handle;
-        STATUS_SUCCESS
-    } else {
-        error!(target: LOG_TARGET, "failed to create render pipeline");
-        STATUS_UNSUCCESSFUL
-    }
-}
-
-pub extern "C" fn ensure_clear_quad_pipeline_handler(args: *mut c_void) -> i32 {
-    // SAFETY: unix-call handler params; PE side passes *mut EnsureClearQuadPipelineParams.
-    let Some(mut params) = (unsafe { InPtrMut::<EnsureClearQuadPipelineParams>::opt(args) }) else {
-        return -1;
-    };
-    let params: &mut EnsureClearQuadPipelineParams = &mut params;
-    if let Some(handle) = metal::ensure_clear_quad_pipeline(params) {
-        params.pipeline_handle = handle;
-        STATUS_SUCCESS
-    } else {
-        error!(target: LOG_TARGET, "failed to ensure clear-quad pipeline");
-        STATUS_UNSUCCESSFUL
-    }
-}
-
-pub extern "C" fn create_depth_transfer_pipeline_handler(args: *mut c_void) -> i32 {
-    // SAFETY: the paired thunk supplies this writable, aligned parameter block.
-    let Some(mut params) =
-        (unsafe { InPtrMut::<mtld3d_shared::CreateDepthTransferPipelineParams>::opt(args) })
-    else {
-        return STATUS_UNSUCCESSFUL;
-    };
-    let Some(pipeline) = metal::depth_transfer::create_pipeline(params.device_handle, params.kind)
-    else {
-        return STATUS_UNSUCCESSFUL;
-    };
-    params.pipeline_handle = pipeline;
-    STATUS_SUCCESS
-}
-
-pub extern "C" fn ensure_blit_pipeline_handler(args: *mut c_void) -> i32 {
-    // SAFETY: unix-call handler params; PE side passes *mut EnsureBlitPipelineParams.
-    let Some(mut params) = (unsafe { InPtrMut::<EnsureBlitPipelineParams>::opt(args) }) else {
-        return -1;
-    };
-    let params: &mut EnsureBlitPipelineParams = &mut params;
-    let resolved = match params.quad_kind {
-        QuadPipelineKind::StretchBlit => metal::ensure_blit_pipeline(params),
-        QuadPipelineKind::TextureUpload => metal::ensure_upload_pipeline(params),
-    };
-    if let Some(handle) = resolved {
-        params.pipeline_handle = handle;
-        STATUS_SUCCESS
-    } else {
-        error!(target: LOG_TARGET, "failed to ensure {:?} quad pipeline", params.quad_kind);
-        STATUS_UNSUCCESSFUL
-    }
-}
-
-pub extern "C" fn create_texture_slice_view_handler(args: *mut c_void) -> i32 {
-    // SAFETY: unix-call handler params; PE side passes *mut CreateTextureSliceViewParams.
-    let Some(mut params) = (unsafe { InPtrMut::<CreateTextureSliceViewParams>::opt(args) }) else {
-        return -1;
-    };
-    let params: &mut CreateTextureSliceViewParams = &mut params;
-    if let Some(handle) = metal::create_texture_slice_view(params) {
-        params.view_handle = handle;
-        STATUS_SUCCESS
-    } else {
-        error!(target: LOG_TARGET, "failed to create a 2D view of texture slice {}", params.slice);
-        STATUS_UNSUCCESSFUL
-    }
-}
-
-pub extern "C" fn compile_shader_library_handler(args: *mut c_void) -> i32 {
-    // SAFETY: unix-call handler params; PE side passes *mut CompileShaderLibraryParams.
-    let Some(mut params) = (unsafe { InPtrMut::<CompileShaderLibraryParams>::opt(args) }) else {
-        return -1;
-    };
-
-    params
-        .timings
-        .write(mtld3d_shared::perf::ShaderTimings::new());
-    if params.msl_ptr == 0 || params.msl_len == 0 {
-        warn!(target: LOG_TARGET, "CompileShaderLibrary: empty source");
-        return STATUS_UNSUCCESSFUL;
-    }
-    if params.entry_ptr == 0 || params.entry_len == 0 {
-        warn!(target: LOG_TARGET, "CompileShaderLibrary: empty entry name");
-        return STATUS_UNSUCCESSFUL;
-    }
-
-    // SAFETY: PE supplied `msl_ptr`/`msl_len` as an MSL source slice valid for
-    // the call duration; the pointer is non-zero per the length check above.
-    let bytes = unsafe {
-        core::slice::from_raw_parts(params.msl_ptr as *const u8, params.msl_len as usize)
-    };
-    let Ok(src) = core::str::from_utf8(bytes) else {
-        warn!(target: LOG_TARGET, "CompileShaderLibrary: invalid UTF-8");
-        return STATUS_UNSUCCESSFUL;
-    };
-
-    // SAFETY: PE supplied `entry_ptr`/`entry_len` as an entry-name slice valid
-    // for the call duration; non-zero per the length check above.
-    let entry_bytes = unsafe {
-        core::slice::from_raw_parts(params.entry_ptr as *const u8, params.entry_len as usize)
-    };
-    let Ok(entry) = core::str::from_utf8(entry_bytes) else {
-        warn!(target: LOG_TARGET, "CompileShaderLibrary: invalid UTF-8 in entry name");
-        return STATUS_UNSUCCESSFUL;
-    };
-
-    let mut timings = mtld3d_shared::perf::ShaderTimings::new();
-    let result = metal::compile_shader_library(
-        params.device_handle,
-        src,
-        params.stage_tag,
-        entry,
-        &mut timings,
-    );
-    params.timings.write(timings);
-    match result {
-        Some((lib, func)) => {
-            params.library_handle = lib;
-            params.fn_handle = func;
-            STATUS_SUCCESS
-        }
-        None => STATUS_UNSUCCESSFUL,
-    }
-}
-
-pub extern "C" fn submit_frame_handler(args: *mut c_void) -> i32 {
-    // SAFETY: unix-call handler params; PE side passes *mut SubmitFrameParams.
-    let Some(mut params) = (unsafe { InPtrMut::<SubmitFrameParams>::opt(args) }) else {
-        return -1;
-    };
-
-    submit_frame(&mut params)
-}
-
-/// Submit a finalized frame through the shared native implementation.
-///
-/// Callers keep the storage referenced by `SubmitFrameParams` live until this
-/// synchronous call returns.
-/// The caller supplies an autorelease pool. Keep device-record lookup and status
-/// mapping shared with the PE handler so native submission has the same failure path.
-pub fn submit_frame(params: &mut SubmitFrameParams) -> i32 {
-    let Some(record) = device_record(params.record_handle, "SubmitFrame") else {
-        return STATUS_UNSUCCESSFUL;
-    };
-    if metal::submit_frame(&record, params) {
-        STATUS_SUCCESS
-    } else {
-        STATUS_UNSUCCESSFUL
-    }
 }
 
 pub extern "C" fn blit_texture_to_buffer_handler(args: *mut c_void) -> i32 {
@@ -973,119 +661,6 @@ pub extern "C" fn create_color_target_handler(args: *mut c_void) -> i32 {
     STATUS_SUCCESS
 }
 
-pub extern "C" fn create_depth_stencil_state_handler(args: *mut c_void) -> i32 {
-    // SAFETY: unix-call handler params; PE side passes *mut CreateDepthStencilStateParams.
-    let Some(mut params) = (unsafe { InPtrMut::<CreateDepthStencilStateParams>::opt(args) }) else {
-        return -1;
-    };
-    let params: &mut CreateDepthStencilStateParams = &mut params;
-
-    if let Some(handle) = metal::create_depth_stencil_state(params) {
-        params.state_handle = handle;
-        STATUS_SUCCESS
-    } else {
-        error!(target: LOG_TARGET, "failed to create depth stencil state");
-        STATUS_UNSUCCESSFUL
-    }
-}
-
-pub extern "C" fn create_textures_batch_handler(args: *mut c_void) -> i32 {
-    // SAFETY: unix-call handler params; PE side passes *mut CreateTexturesBatchParams.
-    let Some(params) = (unsafe { InPtrMut::<CreateTexturesBatchParams>::opt(args) }) else {
-        return -1;
-    };
-    if params.count == 0 {
-        return STATUS_SUCCESS;
-    }
-    let Some(record) = device_record(params.record_handle, "CreateTexturesBatch") else {
-        return STATUS_UNSUCCESSFUL;
-    };
-    let Some(device) = params.device_handle.into_retained() else {
-        error!(
-            target: LOG_TARGET,
-            "create_textures_batch: device_handle={:#x} reject",
-            params.device_handle
-        );
-        return STATUS_UNSUCCESSFUL;
-    };
-    // SAFETY: PE supplied `descs_ptr` as a `[TextureCreateDesc; count]` valid
-    // for the call duration per the wire contract.
-    let descs = unsafe {
-        core::slice::from_raw_parts(
-            params.descs_ptr as *const TextureCreateDesc,
-            params.count as usize,
-        )
-    };
-    // SAFETY: PE supplied an initialized, aligned TextureViews array of
-    // count elements with exclusive access for the duration of this call.
-    let views = unsafe {
-        core::slice::from_raw_parts_mut(
-            params.views_out_ptr as *mut mtld3d_shared::texture_views::TextureViews,
-            params.count as usize,
-        )
-    };
-    if metal::create_textures(&device, record.queue(), descs, views) {
-        STATUS_SUCCESS
-    } else {
-        STATUS_UNSUCCESSFUL
-    }
-}
-
-pub extern "C" fn create_sampler_state_handler(args: *mut c_void) -> i32 {
-    // SAFETY: unix-call handler params; PE side passes *mut CreateSamplerStateParams.
-    let Some(mut params) = (unsafe { InPtrMut::<CreateSamplerStateParams>::opt(args) }) else {
-        return -1;
-    };
-    let params: &mut CreateSamplerStateParams = &mut params;
-
-    if let Some(handle) = metal::create_sampler_state(params) {
-        params.sampler_handle = handle;
-        STATUS_SUCCESS
-    } else {
-        error!(target: LOG_TARGET, "failed to create sampler state");
-        STATUS_UNSUCCESSFUL
-    }
-}
-
-pub extern "C" fn create_buffers_batch_handler(args: *mut c_void) -> i32 {
-    // SAFETY: unix-call handler params; PE side passes *mut CreateBuffersBatchParams.
-    let Some(params) = (unsafe { InPtrMut::<CreateBuffersBatchParams>::opt(args) }) else {
-        return -1;
-    };
-    if params.count == 0 {
-        return STATUS_SUCCESS;
-    }
-    let Some(device) = params.device_handle.into_retained() else {
-        error!(
-            target: LOG_TARGET,
-            "create_buffers_batch: device_handle={:#x} reject",
-            params.device_handle
-        );
-        return STATUS_UNSUCCESSFUL;
-    };
-    // SAFETY: PE supplied `descs_ptr` as a `[BufferCreateDesc; count]` valid
-    // for the call duration per the wire contract.
-    let descs = unsafe {
-        core::slice::from_raw_parts(
-            params.descs_ptr as *const BufferCreateDesc,
-            params.count as usize,
-        )
-    };
-    // SAFETY: PE allocates a `[MetalHandle<MTLBufferKind>; count]` slice
-    // and hands its raw pointer here; wire-compatible with `u64`.
-    let handles = unsafe {
-        core::slice::from_raw_parts_mut(
-            params.handles_out_ptr as *mut MetalHandle<MTLBufferKind>,
-            params.count as usize,
-        )
-    };
-    if metal::create_buffers(&device, descs, handles) {
-        STATUS_SUCCESS
-    } else {
-        STATUS_UNSUCCESSFUL
-    }
-}
-
 pub extern "C" fn destroy_resources_bulk_handler(args: *mut c_void) -> i32 {
     // SAFETY: unix-call handler params; PE side passes *const DestroyResourcesBulkParams.
     let Some(params) = (unsafe { InPtr::<DestroyResourcesBulkParams>::opt(args.cast()) }) else {
@@ -1099,15 +674,24 @@ pub extern "C" fn destroy_resources_bulk_handler(args: *mut c_void) -> i32 {
     let slice = unsafe {
         core::slice::from_raw_parts(params.handles_ptr as *const u64, params.count as usize)
     };
+    destroy_resources_bulk(params.kind, slice);
+    STATUS_SUCCESS
+}
+
+/// Destroy native resources without rebuilding a boundary request.
+pub fn destroy_resources_bulk(kind: DestroyKind, slice: &[u64]) {
+    if slice.is_empty() {
+        return;
+    }
     // The handles by value, so a later fault or ledger warning on one of
     // them can be matched to the destroy that carried it.
     debug!(
         target: LOG_TARGET,
         "DestroyResourcesBulk {:?} x{}: {slice:#x?}",
-        params.kind,
-        params.count,
+        kind,
+        slice.len(),
     );
-    match params.kind {
+    match kind {
         DestroyKind::Buffer => {
             for &h in slice {
                 metal::destroy_buffer(h);
@@ -1149,7 +733,6 @@ pub extern "C" fn destroy_resources_bulk_handler(args: *mut c_void) -> i32 {
             }
         }
     }
-    STATUS_SUCCESS
 }
 
 /// Resolve the public export's storage, without following a CF object pointer.

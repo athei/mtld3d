@@ -7,8 +7,7 @@ use mtld3d_core::{
     storage_policy::buffer_storage_mode,
 };
 use mtld3d_shared::{
-    BlitCommand, BlitCommandType, BufferCreateDesc, CopyBufferToTextureInfo,
-    CreateDepthTransferPipelineParams, MetalHandle,
+    BlitCommand, BlitCommandType, BufferCreateDesc, CopyBufferToTextureInfo, MetalHandle,
     mtl::{BufferKind, DepthTransferKind, DestroyKind, PixelFormat},
     mtl_handle::{MTLBufferKind, MTLTextureKind},
 };
@@ -223,17 +222,13 @@ impl FrameEncoder {
             };
             let slot = &mut self.depth_transfer.pipelines[kind as usize];
             if slot.is_null() && (source_samples > 1 || !same_extent) {
-                let mut params = CreateDepthTransferPipelineParams {
-                    device_handle: self.device_handle,
-                    pipeline_handle: MetalHandle::NULL,
-                    kind,
-                    pad: 0,
-                };
-                if crate::native_call(&mut params) != 0 || params.pipeline_handle.is_null() {
+                let Some(pipeline) =
+                    crate::metal::depth_transfer::create_pipeline(self.device_handle, kind)
+                else {
                     log::error!(target: super::LOG_TARGET, "depth transfer: pipeline creation failed");
                     return false;
-                }
-                *slot = params.pipeline_handle;
+                };
+                *slot = pipeline;
             }
             command.cmd = BlitCommandType::TransferDepth as u32;
             command.src_offset = slot.raw();

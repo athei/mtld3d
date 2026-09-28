@@ -174,7 +174,7 @@ const PRIMITIVE_MISC_DEFAULT: PrimitiveMiscCaps = PrimitiveMiscCaps::MASKZ
 /// `DEPTHBIAS` + `SLOPESCALEDEPTHBIAS` reflect the explicit-RS bias path that
 /// reaches Metal's `setDepthBias:slopeScale:clamp:` per draw. `ANISOTROPY`
 /// advertises the wired path `D3DSAMP_MAXANISOTROPY` →
-/// `SamplerSnapshot.max_anisotropy` → `CreateSamplerStateParams.max_anisotropy`
+/// `SamplerSnapshot.max_anisotropy` → `SamplerDescription.max_anisotropy`
 /// → `setMaxAnisotropy:` on `MTLSamplerDescriptor`; without the cap bit,
 /// well-behaved games clamp to `MAXANISOTROPY=1` and never ask for it.
 /// `MIPMAPLODBIAS` advertises `D3DSAMP_MIPMAPLODBIAS`, which Metal expresses

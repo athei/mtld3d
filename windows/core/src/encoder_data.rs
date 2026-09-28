@@ -879,7 +879,7 @@ bitflags::bitflags! {
         ///
         /// The triggers are `LockRect` on the backbuffer and
         /// `GetRenderTargetData`. `submit()` honours the flag by zeroing the
-        /// present-layer fields in `SubmitFrameParams` so the Metal side
+        /// present-layer fields in `SubmitDescription` so the Metal side
         /// queues no present for it; a present still waiting for its drawable
         /// is copied into a slot rather than waited for. The command buffer
         /// still commits, so in-order queue execution makes the backbuffer
@@ -944,7 +944,7 @@ pub struct FrameData {
     pub layer_handle: MetalHandle<CAMetalLayerKind>,
     /// `NSView*` the layer was attached to.
     ///
-    /// Forwarded to `SubmitFrameParams.present_view`: it names the attachment
+    /// Forwarded to `SubmitDescription.present_view`: it names the attachment
     /// record `submit_frame` reads its display state from (the window's
     /// occlusion, the live EDR headroom, the present throttle, the geometry
     /// streak), all of which the unix side derives for that window alone.
@@ -975,7 +975,7 @@ pub struct FrameData {
     pub flags: FrameDataFlags,
     /// Monotonic submit seq stamped by `DeviceInner::present` before the encoder handoff.
     ///
-    /// Carried into `SubmitFrameParams` so the unix `addCompletedHandler`
+    /// Carried into `SubmitDescription` so the unix `addCompletedHandler`
     /// knows which seq to broadcast.
     pub submit_seq: u64,
     /// Raw pointer to the device's `Arc<AtomicU64>` coherent-seq.
@@ -987,7 +987,7 @@ pub struct FrameData {
     /// Raw pointer to the device's `Arc<AtomicU64>` upload-coherent-seq.
     ///
     /// Same lifetime guarantee as `coherent_seq_ptr`. Forwarded verbatim
-    /// into `SubmitFrameParams::upload_coherent_seq_ptr`; non-zero tells
+    /// into `the upload retirement counter`; non-zero tells
     /// the unix side to split the ordered upload prefix into its own,
     /// earlier-retiring command buffer. 0 only before the frame is
     /// stamped (`FrameData::new` default); every submitted frame carries
@@ -996,7 +996,7 @@ pub struct FrameData {
     /// Raw pointer to the device's `Arc<AtomicU64>` failed-submit seq.
     ///
     /// Same lifetime guarantee as `coherent_seq_ptr`. Forwarded verbatim
-    /// into `SubmitFrameParams::failed_submit_seq_ptr`, which both
+    /// into `the failed submission counter`, which both
     /// completion handlers `fetch_max` when their command buffer aborts.
     /// 0 only before the frame is stamped.
     pub failed_submit_seq_ptr: u64,

@@ -11,7 +11,7 @@ use block2::RcBlock;
 use log::{debug, error, trace};
 use mtld3d_shared::{
     BlitCommand, BlitCommandType, Command, CommandType, ExtraColorDesc, MetalHandle,
-    NullTextureKind, PassDescriptor, SubmitFrameParams,
+    NullTextureKind, PassDescriptor,
     mtl::{
         BlockLayout, CullMode, IndexType, LoadAction, PixelFormat, PrimitiveType, SET_BYTES_MAX,
         StoreAction, TriangleFillMode, VisibilityResultMode,
@@ -20,7 +20,7 @@ use mtld3d_shared::{
         MTLBufferKind, MTLDepthStencilStateKind, MTLDeviceKind, MTLRenderPipelineStateKind,
         MTLSamplerStateKind, MTLTextureKind,
     },
-    perf::{CommandBufferRole, NanosSetTimer, SubmitTimings},
+    perf::{CommandBufferRole, NanosSetTimer},
 };
 use objc2::{Message, rc::Retained, runtime::ProtocolObject};
 use objc2_foundation::{NSError, NSRange};
@@ -43,6 +43,7 @@ use crate::{
         macdrv::attachment,
         null_texture,
         record::DeviceRecord,
+        submission::{FrameSubmission, SubmissionOutcome, SubmitDescription},
         texture::mtl_pixel_format,
         transient::{SubmitStamp, UploadRing},
         upscale::UpscaleCache,
@@ -514,21 +515,24 @@ struct EncodeContext<'a> {
 /// with its own attachments and load actions, settles the pending present
 /// against this frame's writes, commits, and hands the presenter what it
 /// needs to show the frame once a drawable is available.
-pub fn submit_frame(record: &Arc<DeviceRecord>, params: &mut SubmitFrameParams) -> bool {
-    submit_frame_with(record, params, |params| encode_frame(record, params))
+pub fn submit_frame(record: &Arc<DeviceRecord>, frame: &FrameSubmission<'_>) -> SubmissionOutcome {
+    submit_frame_with(record, frame, |outcome| {
+        encode_frame(record, frame, outcome)
+    })
 }
 
 /// Keep CPU encoding failures inside the same retirement boundary as GPU failures.
 fn submit_frame_with(
     record: &DeviceRecord,
-    params: &mut SubmitFrameParams,
-    encode: impl FnOnce(&mut SubmitFrameParams) -> bool,
-) -> bool {
-    let success = encode(params);
-    if !success {
-        retire_failed_submit(record, params);
+    frame: &FrameSubmission<'_>,
+    encode: impl FnOnce(&mut SubmissionOutcome) -> bool,
+) -> SubmissionOutcome {
+    let mut outcome = SubmissionOutcome::new();
+    outcome.success = encode(&mut outcome);
+    if !outcome.success {
+        retire_failed_submit(record, frame.description);
     }
-    success
+    outcome
 }
 
 /// Retire every committed buffer before publishing a failed CPU submission as finished.
@@ -540,25 +544,28 @@ fn submit_frame_with(
 /// copies, read only textures they retain. So what the PE side stamped with
 /// this frame's sequence can be recycled once it is published, even though no
 /// command buffer of the frame itself ran.
-fn retire_failed_submit(record: &DeviceRecord, params: &SubmitFrameParams) {
+fn retire_failed_submit(record: &DeviceRecord, params: &SubmitDescription) {
     // SubmitFrame is serialized per device. Nothing can insert a later buffer
     // for either counter while this call drains the failed frame's work.
-    for counter in [params.coherent_seq_ptr, params.upload_coherent_seq_ptr] {
+    for counter in [
+        params.draw_retirement.address(),
+        params.upload_retirement.address(),
+    ] {
         if counter != 0 {
             wait_registered(
                 record.pending(),
                 counter,
                 params.submit_seq,
-                params.failed_submit_seq_ptr,
+                params.failed_submission.address(),
                 "cpu-cleanup",
             );
         }
     }
     // Recovery can inspect failed_seq before retirement and abandon retries.
     // Publish the CPU failure only after its committed work is no longer live.
-    advance_counter(params.failed_submit_seq_ptr, params.submit_seq);
-    advance_counter(params.upload_coherent_seq_ptr, params.submit_seq);
-    advance_counter(params.coherent_seq_ptr, params.submit_seq);
+    params.failed_submission.publish(params.submit_seq);
+    params.upload_retirement.publish(params.submit_seq);
+    params.draw_retirement.publish(params.submit_seq);
 }
 
 /// Publish a submission without an upload buffer on the upload counter.
@@ -594,15 +601,16 @@ pub fn advance_counter(pointer: u64, seq: u64) {
     }
 }
 
-fn encode_frame(record: &Arc<DeviceRecord>, params: &mut SubmitFrameParams) -> bool {
-    params.drawable_wait_ns = 0;
-    params.present_wait_ns = 0;
-    params.snapshot_flags = mtld3d_shared::mtl::SnapshotFlags::empty();
-    params.timings = SubmitTimings::new();
+fn encode_frame(
+    record: &Arc<DeviceRecord>,
+    frame: &FrameSubmission<'_>,
+    outcome: &mut SubmissionOutcome,
+) -> bool {
+    let params = frame.description;
     // First, so a submission that fails below still reports what finished.
-    record.gpu_time().drain(&mut params.timings.gpu);
+    record.gpu_time().drain(&mut outcome.timings.gpu);
     let queue_handle = record.queue();
-    mtld3d_shared::crumb!("submit:enter", queue_handle.raw(), params.pass_count);
+    mtld3d_shared::crumb!("submit:enter", queue_handle.raw(), frame.passes.len());
     mtld3d_shared::crumb!("submit:queueret", queue_handle.raw());
     let Some(queue) = queue_handle.into_retained() else {
         error!(target: LOG_TARGET, "submit_frame: queue retain failed (handle={queue_handle:#x})");
@@ -620,38 +628,13 @@ fn encode_frame(record: &Arc<DeviceRecord>, params: &mut SubmitFrameParams) -> b
         cmd_buf.setLabel(Some(&label));
     }
 
-    if params.upload_pass_count > params.pass_count
-        || (params.pass_count != 0 && params.passes_ptr == 0)
-        || (params.blit_command_count != 0 && params.blit_commands_ptr == 0)
-    {
-        error!(target: LOG_TARGET, "submit_frame: invalid upload prefix or command array");
+    if params.upload_pass_count > frame.passes.len() {
+        error!(target: LOG_TARGET, "submit_frame: invalid upload prefix");
         return false;
     }
-    let blits = if params.blit_command_count == 0 {
-        &[]
-    } else {
-        // SAFETY: PE supplied a non-null array of `blit_command_count`
-        // commands, owned by the frame payload until this call returns.
-        unsafe {
-            core::slice::from_raw_parts(
-                params.blit_commands_ptr as *const BlitCommand,
-                params.blit_command_count as usize,
-            )
-        }
-    };
-    let passes = if params.pass_count == 0 {
-        &[]
-    } else {
-        // SAFETY: PE supplied a non-null array of `pass_count` descriptors,
-        // owned by the frame payload until this call returns.
-        unsafe {
-            core::slice::from_raw_parts(
-                params.passes_ptr as *const PassDescriptor,
-                params.pass_count as usize,
-            )
-        }
-    };
-    let upload_pass_count = params.upload_pass_count as usize;
+    let blits = frame.blits;
+    let passes = frame.passes;
+    let upload_pass_count = params.upload_pass_count;
     let device = queue.device();
     let stamp = SubmitStamp::new(params);
     // A submission whose buffers can never be seen to retire uses a ring of
@@ -675,7 +658,7 @@ fn encode_frame(record: &Arc<DeviceRecord>, params: &mut SubmitFrameParams) -> b
         planes,
     };
     let mut upload_cb = None;
-    let draw_pass_start = if params.upload_coherent_seq_ptr != 0 {
+    let draw_pass_start = if params.upload_retirement.address() != 0 {
         if !blits.is_empty() || upload_pass_count != 0 {
             let Some(cb) = encode_upload_cmd_buf(
                 record,
@@ -683,6 +666,7 @@ fn encode_frame(record: &Arc<DeviceRecord>, params: &mut SubmitFrameParams) -> b
                 blits,
                 &passes[..upload_pass_count],
                 params,
+                outcome,
                 &mut ctx,
             ) else {
                 return false;
@@ -694,11 +678,11 @@ fn encode_frame(record: &Arc<DeviceRecord>, params: &mut SubmitFrameParams) -> b
         ctx.stamp = SubmitStamp::new(params);
         if !blits.is_empty() {
             let encoded = {
-                let _blits = NanosSetTimer::start(&raw mut params.timings.leading_blits_ns);
+                let _blits = NanosSetTimer::start(&raw mut outcome.timings.leading_blits_ns);
                 encode_leading_blits(
                     &cmd_buf,
                     blits,
-                    params.blit_commands_need_encoder != 0,
+                    params.blit_commands_need_encoder,
                     BlitSite::FrameLeading,
                     &mut ctx,
                 )
@@ -720,7 +704,7 @@ fn encode_frame(record: &Arc<DeviceRecord>, params: &mut SubmitFrameParams) -> b
             }
         }
     }
-    params.timings.passes_ns = params.timings.passes_ns.saturating_add(draw_passes_ns);
+    outcome.timings.passes_ns = outcome.timings.passes_ns.saturating_add(draw_passes_ns);
     ctx.ring.end_submission(&ctx.stamp);
     ctx.planes.end_submission(&ctx.stamp);
 
@@ -756,12 +740,12 @@ fn encode_frame(record: &Arc<DeviceRecord>, params: &mut SubmitFrameParams) -> b
     };
     // Everything is encoded and nothing has committed: settle what the
     // pending present reads before this frame's render work can overwrite it.
-    super::presenter::resolve_present_conflict(record.present(), &queue, params, packet.is_some());
+    super::presenter::resolve_present_conflict(record.present(), &queue, outcome, packet.is_some());
 
     super::upscale::retire_evicted(&cmd_buf, record.upscale());
 
     // Spans the frame buffer's handler install and both commits.
-    let commit = NanosSetTimer::start(&raw mut params.timings.commit_ns);
+    let commit = NanosSetTimer::start(&raw mut outcome.timings.commit_ns);
     install_frame_handler(&cmd_buf, record, params);
 
     // The upload buffer goes first on the queue, so the render work that
@@ -773,13 +757,13 @@ fn encode_frame(record: &Arc<DeviceRecord>, params: &mut SubmitFrameParams) -> b
         commit_registered(
             record.pending(),
             &upload_cb,
-            params.upload_coherent_seq_ptr,
+            params.upload_retirement.address(),
             params.submit_seq,
         );
     } else {
         publish_idle_upload(
             record.pending(),
-            params.upload_coherent_seq_ptr,
+            params.upload_retirement.address(),
             params.submit_seq,
         );
     }
@@ -787,13 +771,13 @@ fn encode_frame(record: &Arc<DeviceRecord>, params: &mut SubmitFrameParams) -> b
     commit_registered(
         record.pending(),
         &cmd_buf,
-        params.coherent_seq_ptr,
+        params.draw_retirement.address(),
         params.submit_seq,
     );
     drop(commit);
     if let Some(packet) = packet {
         mtld3d_shared::crumb!("submit:push", params.submit_seq);
-        params.drawable_wait_ns = super::presenter::push(record.present(), packet);
+        outcome.drawable_wait_ns = super::presenter::push(record.present(), packet);
     }
     mtld3d_shared::crumb!("submit:done");
     true
@@ -1044,15 +1028,15 @@ fn register_pending(
 fn install_frame_handler(
     cmd_buf: &ProtocolObject<dyn MTLCommandBuffer>,
     record: &Arc<DeviceRecord>,
-    params: &SubmitFrameParams,
+    params: &SubmitDescription,
 ) {
-    if params.coherent_seq_ptr == 0 || params.submit_seq == 0 {
+    if params.draw_retirement.address() == 0 || params.submit_seq == 0 {
         return;
     }
-    let counter = params.coherent_seq_ptr;
+    let counter = params.draw_retirement;
     let retiring = Arc::clone(record);
     let seq = params.submit_seq;
-    let failed_seq_ptr = params.failed_submit_seq_ptr;
+    let failed_seq = params.failed_submission;
     let handler = RcBlock::new(
         move |cb_ptr: core::ptr::NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
             // SAFETY: Metal invokes the block with the buffer it ended; the
@@ -1081,7 +1065,12 @@ fn install_frame_handler(
                      present showed undefined memory",
                 );
             }
-            retire_finished(retiring.pending(), counter, failed_seq_ptr, "frame-retire");
+            retire_finished(
+                retiring.pending(),
+                counter.address(),
+                failed_seq.address(),
+                "frame-retire",
+            );
             mtld3d_shared::crumb!("submit:retire", seq);
         },
     );
@@ -1113,11 +1102,12 @@ fn encode_upload_cmd_buf(
     queue: &ProtocolObject<dyn MTLCommandQueue>,
     blits: &[BlitCommand],
     passes: &[PassDescriptor],
-    params: &mut SubmitFrameParams,
+    params: &SubmitDescription,
+    outcome: &mut SubmissionOutcome,
     ctx: &mut EncodeContext<'_>,
 ) -> Option<Retained<ProtocolObject<dyn MTLCommandBuffer>>> {
     let submit_seq = params.submit_seq;
-    let upload_coherent_seq_ptr = params.upload_coherent_seq_ptr;
+    let upload_counter = params.upload_retirement;
     mtld3d_shared::crumb!("submit:upcmdbuf");
     let Some(upload_cb) = diagnostics::command_buffer(queue) else {
         error!(target: LOG_TARGET, "submit_frame: upload commandBuffer() returned nil");
@@ -1129,11 +1119,11 @@ fn encode_upload_cmd_buf(
     }
     if !blits.is_empty() {
         let encoded = {
-            let _blits = NanosSetTimer::start(&raw mut params.timings.leading_blits_ns);
+            let _blits = NanosSetTimer::start(&raw mut outcome.timings.leading_blits_ns);
             encode_leading_blits(
                 &upload_cb,
                 blits,
-                params.blit_commands_need_encoder != 0,
+                params.blit_commands_need_encoder,
                 BlitSite::FrameLeading,
                 ctx,
             )
@@ -1143,7 +1133,7 @@ fn encode_upload_cmd_buf(
         }
     }
     {
-        let _passes = NanosSetTimer::start(&raw mut params.timings.passes_ns);
+        let _passes = NanosSetTimer::start(&raw mut outcome.timings.passes_ns);
         for (pass_idx, pass) in passes.iter().enumerate() {
             if !encode_pass(&upload_cb, pass, pass_idx, ctx) {
                 return None;
@@ -1152,7 +1142,7 @@ fn encode_upload_cmd_buf(
     }
     if submit_seq > 0 {
         let seq = submit_seq;
-        let failed_seq_ptr = params.failed_submit_seq_ptr;
+        let failed_seq = params.failed_submission;
         // As the render buffer's handler: the record outlives the block.
         let retiring = Arc::clone(record);
         let handler = RcBlock::new(
@@ -1188,8 +1178,8 @@ fn encode_upload_cmd_buf(
                 }
                 retire_finished(
                     retiring.pending(),
-                    upload_coherent_seq_ptr,
-                    failed_seq_ptr,
+                    upload_counter.address(),
+                    failed_seq.address(),
                     "upload-retire",
                 );
                 mtld3d_shared::crumb!("submit:upretire", seq);

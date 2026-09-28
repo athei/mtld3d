@@ -14,7 +14,7 @@ use mtld3d_core::{
     render_scale::{RenderScale, TargetExtent},
 };
 use mtld3d_shared::{
-    InPtr, MetalHandle, SetDisplaySyncEnabledParams, SetGammaRampParams,
+    InPtr, MetalHandle,
     encoder_protocol::EncoderOpcode,
     encoder_wire::WireError,
     mtl::{DeviceCapsFlags, PixelFormat},
@@ -22,7 +22,6 @@ use mtld3d_shared::{
 };
 
 use super::{BLIT_TRACE_TARGET, FrameEncoder};
-use crate::native_call;
 
 /// Execute a borrowed control record while its packet retains every referenced owner.
 ///
@@ -84,12 +83,13 @@ fn execute_control(
             if r.layer != 0 {
                 // SAFETY: the frame retains the layer named by this command through replay.
                 let layer_handle = unsafe { MetalHandle::<CAMetalLayerKind>::new(r.layer) };
-                let mut params = SetDisplaySyncEnabledParams {
+                crate::metal::set_display_sync_enabled(
                     layer_handle,
-                    display_sync_enabled: r.display_sync,
-                    max_fps: r.max_fps,
-                };
-                native_call(&mut params);
+                    &crate::metal::PresentPacing {
+                        vsync_requested: r.display_sync != 0,
+                        max_fps: r.max_fps,
+                    },
+                );
             }
         }
         EncoderOpcode::SetGamma => {
@@ -108,13 +108,19 @@ fn execute_control(
             if r.layer != 0 {
                 // SAFETY: the frame retains the layer and gamma entries through this native call.
                 let layer_handle = unsafe { MetalHandle::<CAMetalLayerKind>::new(r.layer) };
-                let mut params = SetGammaRampParams {
-                    layer_handle,
-                    entries_ptr: r.entries_ptr,
-                    entries_len: r.entries_len,
-                    pad0: 0,
+                let entries = if r.mode == 1 {
+                    None
+                } else {
+                    // SAFETY: the immutable frame retains the table through replay, and
+                    // its address, extent and alignment were checked above.
+                    Some(unsafe {
+                        core::slice::from_raw_parts(
+                            r.entries_ptr as *const u16,
+                            r.entries_len as usize,
+                        )
+                    })
                 };
-                native_call(&mut params);
+                crate::metal::set_gamma_ramp(layer_handle, entries);
             }
         }
         EncoderOpcode::SetViewport => {

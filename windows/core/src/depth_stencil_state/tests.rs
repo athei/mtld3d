@@ -1,4 +1,4 @@
-//! Unit tests for the depth/stencil snapshot, its cache key, and the wire params.
+//! Unit tests for the depth/stencil snapshot, its cache key, and the native description.
 //!
 //! Every snapshot field must reach the key, and the key packs translated Metal enums so an
 //! out-of-range `SetRenderState` value cannot alias a valid one and be handed the wrong
@@ -172,17 +172,19 @@ fn masks_narrow_to_the_width_the_attachment_observes() {
     let narrow = snapshot_from_state(&rs);
     assert_eq!(key_from_snapshot(&wide), key_from_snapshot(&narrow));
 
-    // SAFETY: tests; opaque value never dereferenced.
-    let dev = unsafe { MetalHandle::new(0xDEAD) };
-    let params = params_from_snapshot(&wide, key_from_snapshot(&wide), dev);
-    assert_eq!(params.stencil_read_mask, 0x12);
-    assert_eq!(params.stencil_write_mask, 0x34);
+    let params = description_from_snapshot(&wide, key_from_snapshot(&wide));
+    assert_eq!(
+        params.stencil.as_ref().expect("stencil enabled").read_mask,
+        0x12
+    );
+    assert_eq!(
+        params.stencil.as_ref().expect("stencil enabled").write_mask,
+        0x34
+    );
 }
 
 #[test]
 fn clear_quad_states_are_distinct_and_write_what_they_claim() {
-    // SAFETY: tests; opaque value never dereferenced.
-    let dev = unsafe { MetalHandle::new(0xDEAD) };
     let states = [
         DepthStencilSnapshot::inert(),
         DepthStencilSnapshot::depth_overwrite(),
@@ -197,32 +199,71 @@ fn clear_quad_states_are_distinct_and_write_what_they_claim() {
     }
 
     let both = DepthStencilSnapshot::depth_stencil_overwrite();
-    let params = params_from_snapshot(&both, key_from_snapshot(&both), dev);
-    assert_eq!(params.depth_write_enable, 1);
+    let params = description_from_snapshot(&both, key_from_snapshot(&both));
+    assert!(params.depth_write_enable);
     assert_eq!(params.depth_compare_func, d3d_to_metal_cmp(D3DCMP_ALWAYS));
-    assert_eq!(params.stencil_test_enable, 1);
+    assert!(params.stencil.is_some());
     assert_eq!(
-        params.front.pass_op,
+        params
+            .stencil
+            .as_ref()
+            .expect("stencil enabled")
+            .front
+            .pass_op,
         d3d_to_metal_stencil_op(D3DSTENCILOP_REPLACE)
     );
-    assert_eq!(params.front, params.back);
-    assert_eq!(params.stencil_write_mask, STENCIL_MASK_BITS);
+    assert_eq!(
+        params.stencil.as_ref().expect("stencil enabled").front,
+        params.stencil.as_ref().expect("stencil enabled").back
+    );
+    assert_eq!(
+        params.stencil.as_ref().expect("stencil enabled").write_mask,
+        STENCIL_MASK_BITS
+    );
 }
 
 #[test]
 fn params_translate_the_default_state() {
-    // SAFETY: tests; opaque value never dereferenced.
-    let dev = unsafe { MetalHandle::new(0xDEAD) };
     let s = base();
-    let params = params_from_snapshot(&s, key_from_snapshot(&s), dev);
-    assert_eq!(params.stencil_test_enable, 1);
-    assert_eq!(params.front.compare_func, d3d_to_metal_cmp(D3DCMP_ALWAYS));
+    let params = description_from_snapshot(&s, key_from_snapshot(&s));
+    assert!(params.stencil.is_some());
     assert_eq!(
-        params.front.pass_op,
+        params
+            .stencil
+            .as_ref()
+            .expect("stencil enabled")
+            .front
+            .compare_func,
+        d3d_to_metal_cmp(D3DCMP_ALWAYS)
+    );
+    assert_eq!(
+        params
+            .stencil
+            .as_ref()
+            .expect("stencil enabled")
+            .front
+            .pass_op,
         d3d_to_metal_stencil_op(D3DSTENCILOP_KEEP)
     );
-    assert_eq!(params.front, params.back, "one-sided default");
+    assert_eq!(
+        params.stencil.as_ref().expect("stencil enabled").front,
+        params.stencil.as_ref().expect("stencil enabled").back,
+        "one-sided default"
+    );
     assert_eq!(params.id, key_from_snapshot(&s).raw());
+}
+
+#[test]
+fn disabled_native_tests_ignore_stale_write_and_compare_state() {
+    let snapshot = DepthStencilSnapshot {
+        depth_write: 1,
+        depth_func: narrow(D3DCMP_LESSEQUAL),
+        ..DepthStencilSnapshot::inert()
+    };
+    let description = description_from_snapshot(&snapshot, key_from_snapshot(&snapshot));
+    assert_eq!(description.depth_compare_func, CompareFunc::Always);
+    assert!(!description.depth_write_enable);
+    assert!(description.stencil.is_none());
 }
 
 #[test]

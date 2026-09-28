@@ -16,6 +16,7 @@ mod presenter;
 mod record;
 mod sampler;
 mod shader;
+pub mod submission;
 mod texture;
 mod transient;
 mod upload_quad;
@@ -27,7 +28,7 @@ pub use capture::{start_capture, stop_capture};
 pub use clear_quad::ensure_clear_quad_pipeline;
 pub use command::{BlitArgs, blit_texture_to_buffer, submit_frame, wait_for_gpu_retire};
 pub use device::{create_command_queue, default_device_info, destroy_command_queue};
-pub use gamma::{expected_lanes as gamma_table_lanes, set_gamma_ramp};
+pub use gamma::set_gamma_ramp;
 pub use macdrv::{
     LayerAttachRequest, PresentPacing, attach_metal_layer, declare_latency_critical_activity,
     detach_metal_layer, retire_metal_view, set_cursor_overlay, set_display_sync_enabled,
@@ -39,9 +40,10 @@ pub use record::DeviceRecord;
 pub use sampler::{create_sampler_state, destroy_sampler_state};
 pub use shader::{compile_shader_library, destroy_function, destroy_library};
 pub use texture::{
-    OPAQUE_BLACK, TRANSPARENT_BLACK, clear_new_color_textures, create_backbuffer,
-    create_color_target, create_depth_stencil_state, create_depth_texture, create_msaa_companion,
-    create_texture_slice_view, create_textures, destroy_depth_stencil_state, destroy_texture,
+    OPAQUE_BLACK, TRANSPARENT_BLACK, TextureClearBatch, clear_new_color_textures,
+    create_backbuffer, create_color_target, create_depth_stencil_state, create_depth_texture,
+    create_msaa_companion, create_texture_slice_view, create_textures, destroy_depth_stencil_state,
+    destroy_texture,
 };
 pub use upload_quad::ensure_upload_pipeline;
 pub use upscale::is_supported as upscale_is_supported;

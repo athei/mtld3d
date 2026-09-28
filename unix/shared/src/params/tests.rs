@@ -1,31 +1,23 @@
-//! Size and alignment checks for a dozen of the PE/unix thunk parameter structs.
+//! Size, alignment and field-offset checks for live PE/Unix records.
 //!
-//! Each covered struct pins `size_of` against a field-by-field tally in a comment, and `align_of`
-//! against 8 (`ExtraColorDesc` gets only the size check); the other param structs are not covered.
-//! No test reads `offset_of`, so swapping two same-width fields still passes here; the parent
-//! module asserts field offsets at compile time only for `CreateDepthStencilStateParams`. Two
-//! tests also pin `PassDescriptor::pack_flags`, where an ordinary pass encodes as zero and every
-//! volume depth plane round-trips.
+//! Native-only descriptions have no cross-target layout contract. Pass flag
+//! tests also preserve ordinary and volume attachment encodings.
 
 use super::{
-    BufferCreateDesc, CreateBuffersBatchParams, CreateTexturesBatchParams,
-    DestroyResourcesBulkParams, ExtraColorDesc, LoadAction, MetalHandle, PassDescriptor,
-    StoreAction, SubmitFrameParams, TextureCreateDesc,
+    BufferCreateDesc, DestroyResourcesBulkParams, ExtraColorDesc, LoadAction, MetalHandle,
+    PassDescriptor, StoreAction, TextureCreateDesc,
 };
 
 #[test]
 fn buffer_param_layouts_match_wow64() {
     // All thunk params must be 8-byte aligned and contain only u32/u64
     // fields so 32-bit PE and 64-bit Unix agree on layout.
-    assert_eq!(core::mem::align_of::<CreateBuffersBatchParams>(), 8);
     assert_eq!(core::mem::align_of::<BufferCreateDesc>(), 8);
     assert_eq!(core::mem::align_of::<DestroyResourcesBulkParams>(), 8);
 
     // Sizes: sum of fields with repr(C, align(8)) padding:
-    //   CreateBuffersBatchParams   = 8 + 4 + 4 + 8 + 8     = 32
     //   BufferCreateDesc           = 8 + 8 + 8 + 4 + 4     = 32
     //   DestroyResourcesBulkParams = 4 + 4 + 8 + 4 + 4     = 24
-    assert_eq!(core::mem::size_of::<CreateBuffersBatchParams>(), 32);
     assert_eq!(core::mem::size_of::<BufferCreateDesc>(), 32);
     assert_eq!(core::mem::size_of::<DestroyResourcesBulkParams>(), 24);
 }
@@ -62,14 +54,6 @@ fn open_log_layout() {
 }
 
 #[test]
-fn set_display_sync_enabled_layout() {
-    use super::SetDisplaySyncEnabledParams;
-    // u64 + u32 + u32 = 8 + 4 + 4 = 16
-    assert_eq!(core::mem::align_of::<SetDisplaySyncEnabledParams>(), 8);
-    assert_eq!(core::mem::size_of::<SetDisplaySyncEnabledParams>(), 16);
-}
-
-#[test]
 fn blit_texture_to_buffer_layout() {
     use super::BlitTextureToBufferParams;
     // 3*u64 (handles) + 2*u64 (dst ptr/len) + 10*u32
@@ -79,30 +63,11 @@ fn blit_texture_to_buffer_layout() {
 }
 
 #[test]
-fn create_texture_slice_view_layout() {
-    use super::CreateTextureSliceViewParams;
-    // 2*u64 (handles) + 2*u32 = 16 + 8 = 24
-    assert_eq!(core::mem::align_of::<CreateTextureSliceViewParams>(), 8);
-    assert_eq!(core::mem::size_of::<CreateTextureSliceViewParams>(), 24);
-}
-
-#[test]
-fn wait_for_gpu_retire_layout() {
-    use super::WaitForGpuRetireParams;
-    // 8 record_handle + 4 * u64 = 40
-    assert_eq!(core::mem::align_of::<WaitForGpuRetireParams>(), 8);
-    assert_eq!(core::mem::size_of::<WaitForGpuRetireParams>(), 40);
-}
-
-#[test]
 fn present_sync_param_layouts_match_wow64() {
-    use super::{SetPresentWaitPolicyParams, WaitForPresentIdleParams};
+    use super::SetPresentWaitPolicyParams;
     // 8 record_handle + 4 policy + 4 pad0 = 16
     assert_eq!(core::mem::align_of::<SetPresentWaitPolicyParams>(), 8);
     assert_eq!(core::mem::size_of::<SetPresentWaitPolicyParams>(), 16);
-    // 8 record_handle
-    assert_eq!(core::mem::align_of::<WaitForPresentIdleParams>(), 8);
-    assert_eq!(core::mem::size_of::<WaitForPresentIdleParams>(), 8);
 }
 
 #[test]
@@ -122,8 +87,6 @@ fn create_command_queue_layout_matches_wow64() {
 #[test]
 fn frame_param_layouts_match_wow64() {
     assert_eq!(core::mem::align_of::<PassDescriptor>(), 8);
-    assert_eq!(core::mem::align_of::<SubmitFrameParams>(), 8);
-    assert_eq!(core::mem::align_of::<CreateTexturesBatchParams>(), 8);
     assert_eq!(core::mem::align_of::<TextureCreateDesc>(), 8);
 
     // PassDescriptor: 6 * u64 + 16 * u32 + 3 * ExtraColorDesc = 48 + 64 + 96 = 208.
@@ -131,38 +94,6 @@ fn frame_param_layouts_match_wow64() {
     // ExtraColorDesc: 8 texture + 8 resolve + 4 subresource + 4 load + 4 store
     // + 4 reserved = 32.
     assert_eq!(core::mem::size_of::<ExtraColorDesc>(), 32);
-
-    // SubmitFrameParams:
-    //   8 record_handle
-    //   + 8 blit_commands_ptr + 4 blit_command_count + 4 blit_commands_need_encoder
-    //   + 8 passes_ptr + 4 pass_count + 4 upload_pass_count
-    //   + 8 present_layer + 8 present_texture
-    //   + 8 submit_seq + 8 coherent_seq_ptr + 8 upload_coherent_seq_ptr
-    //   + 8 failed_submit_seq_ptr
-    //   + 8 drawable_wait_ns + 8 present_view
-    //   + 8 present_wait_ns + 4 snapshot_flags + 4 pad0
-    //   + 72 timings (3 * 8 CPU spans + 3 * 16 GPU roles)
-    //   = 192
-    assert_eq!(core::mem::size_of::<SubmitFrameParams>(), 192);
-    assert_eq!(
-        core::mem::offset_of!(SubmitFrameParams, upload_pass_count),
-        36
-    );
-    assert_eq!(core::mem::offset_of!(SubmitFrameParams, present_layer), 40);
-    assert_eq!(
-        core::mem::offset_of!(SubmitFrameParams, present_wait_ns),
-        104
-    );
-    assert_eq!(
-        core::mem::offset_of!(SubmitFrameParams, snapshot_flags),
-        112
-    );
-    assert_eq!(core::mem::offset_of!(SubmitFrameParams, timings), 120);
-
-    // CreateTexturesBatchParams:
-    //   8 device_handle + 8 record_handle + 4 count + 4 _pad0 + 8 descs_ptr
-    //   + 8 views_out_ptr = 40
-    assert_eq!(core::mem::size_of::<CreateTexturesBatchParams>(), 40);
 
     // TextureCreateDesc:
     //   8 tex_id
@@ -233,19 +164,7 @@ fn pass_descriptor_flags_round_trip_every_volume_depth_plane() {
 
 #[test]
 fn depth_transfer_layouts_match_wow64() {
-    use super::{BlitTextureToBufferParams, CreateDepthTransferPipelineParams};
-    assert_eq!(
-        core::mem::size_of::<CreateDepthTransferPipelineParams>(),
-        24
-    );
-    assert_eq!(
-        core::mem::align_of::<CreateDepthTransferPipelineParams>(),
-        8
-    );
-    assert_eq!(
-        core::mem::offset_of!(CreateDepthTransferPipelineParams, kind),
-        16
-    );
+    use super::BlitTextureToBufferParams;
     assert_eq!(core::mem::size_of::<BlitTextureToBufferParams>(), 96);
     assert_eq!(
         core::mem::offset_of!(BlitTextureToBufferParams, stencil_offset),

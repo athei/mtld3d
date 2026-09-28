@@ -1432,25 +1432,6 @@ fn dispatch_trace_excludes_logger_and_separates_shader_validation_from_compile()
         unix_dispatch_kind(Thunks::SubmitEncoderFrame as u32),
         Some("enqueue")
     );
-    for thunk in [
-        Thunks::SubmitFrame,
-        Thunks::CreateDepthStencilState,
-        Thunks::CreateTexturesBatch,
-        Thunks::CreateSamplerState,
-        Thunks::CreateBuffersBatch,
-        Thunks::CreateTextureSliceView,
-    ] {
-        assert_eq!(unix_dispatch_kind(thunk as u32), Some("replay"));
-    }
-    for thunk in [
-        Thunks::CompileShaderLibrary,
-        Thunks::CreateRenderPipeline,
-        Thunks::EnsureClearQuadPipeline,
-        Thunks::EnsureBlitPipeline,
-        Thunks::CreateDepthTransferPipeline,
-    ] {
-        assert_eq!(unix_dispatch_kind(thunk as u32), Some("compile"));
-    }
     // Shader validation and resource creation remain necessary synchronous calls.
     for thunk in [
         Thunks::CreateShaderProgram,

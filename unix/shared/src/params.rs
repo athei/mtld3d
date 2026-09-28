@@ -1,16 +1,12 @@
 use super::{
     Thunk, Thunks,
     mtl::{
-        AddressMode, BlendFactor, BlendOperation, BorderColor, BufferKind, ClearQuadFlags,
-        ColorSpacePolicy, ColorWriteMask, CompareFunc, CursorOverlayFlags, DestroyKind,
-        DeviceCapsFlags, LoadAction, MinMagFilter, MipFilter, PixelFormat, PresentWaitPolicy,
-        SnapshotFlags, SoftwareCursorPolicy, StageTag, StencilOp, StorageMode, StoreAction,
-        Swizzle, TextureUsage, VertexFormat, VertexStepFunction,
+        BufferKind, ColorSpacePolicy, CursorOverlayFlags, DestroyKind, DeviceCapsFlags, LoadAction,
+        PixelFormat, PresentWaitPolicy, SoftwareCursorPolicy, StorageMode, StoreAction, Swizzle,
+        TextureUsage, VertexFormat, VertexStepFunction,
     },
     mtl_handle::{
-        CAMetalLayerKind, MTLBufferKind, MTLDepthStencilStateKind, MTLDeviceKind, MTLFunctionKind,
-        MTLLibraryKind, MTLRenderPipelineStateKind, MTLSamplerStateKind, MTLTextureKind,
-        MetalHandle, NSViewKind,
+        CAMetalLayerKind, MTLBufferKind, MTLDeviceKind, MTLTextureKind, MetalHandle, NSViewKind,
     },
     record_handle::DeviceRecordHandle,
 };
@@ -34,21 +30,7 @@ const _: () = {
         b: u64,
     }
     // 8 (not 4) ⇒ repr(C) u64 is 8-aligned on this target.
-    // Duration outputs have identical offsets in i686 PE and 64-bit Unix,
-    // independent of cfg(perf_tracking). Every Windows check compiles these.
-    assert!(core::mem::offset_of!(CompileShaderLibraryParams, timings) == 56);
-    assert!(core::mem::size_of::<CompileShaderLibraryParams>() == 80);
-    assert!(core::mem::offset_of!(CreateRenderPipelineParams, timings) == 192);
-    assert!(core::mem::size_of::<CreateRenderPipelineParams>() == 208);
-
     assert!(core::mem::offset_of!(U64After4, b) == 8);
-    // A real wire struct whose `u64 id` sits after device_handle(8) + three
-    // 4-byte fields: offset 24 ⇒ u64 8-aligned; would be 20 if 4-aligned.
-    assert!(core::mem::size_of::<StencilFaceParams>() == 16);
-    assert!(core::mem::offset_of!(CreateDepthStencilStateParams, front) == 24);
-    assert!(core::mem::offset_of!(CreateDepthStencilStateParams, id) == 64);
-    assert!(core::mem::size_of::<CreateDepthStencilStateParams>() == 80);
-
     // Device create / render / destroy structs: align must be 8 and size
     // identical on all targets.
     assert!(core::mem::align_of::<CreateCommandQueueParams>() == 8);
@@ -57,8 +39,6 @@ const _: () = {
     assert!(core::mem::size_of::<DetachMetalLayerParams>() == 8);
     assert!(core::mem::size_of::<CreateBackbufferParams>() == 64);
     assert!(core::mem::size_of::<DestroyCommandQueueParams>() == 40);
-    assert!(core::mem::offset_of!(SubmitFrameParams, timings) == 120);
-    assert!(core::mem::size_of::<SubmitFrameParams>() == 192);
     assert!(core::mem::size_of::<SetCursorOverlayParams>() == 56);
     assert!(core::mem::size_of::<PassDescriptor>() == 208);
 };
@@ -339,93 +319,6 @@ impl Thunk for SetCursorOverlayParams {
     const CODE: u32 = Thunks::SetCursorOverlay as u32;
 }
 
-/// Re-derive the present throttle of an already-attached layer.
-///
-/// Used by the D3D9 Reset path to honour a runtime change of
-/// `D3DPRESENT_PARAMETERS::PresentationInterval`. The layer's own
-/// `displaySyncEnabled` stays off; what moves is the minimum present
-/// duration on the layer's attachment record.
-#[repr(C, align(8))]
-pub struct SetDisplaySyncEnabledParams {
-    /// The layer whose attachment record takes the new pacing.
-    ///
-    /// Looked up by layer address, so a device that never attached one is
-    /// answered with a warning and no change.
-    pub layer_handle: MetalHandle<CAMetalLayerKind>, // in
-    pub display_sync_enabled: u32, // in: 0 = off, !=0 = on
-    /// The effective frame-rate ceiling in Hz, `0` = uncapped.
-    ///
-    /// Resolved on the PE side the way `AttachMetalLayerParams::max_fps` is,
-    /// and re-sent with every change so the throttle recomputation keeps
-    /// honouring `present.maxFps` and follows a Reset between `ONE` and a
-    /// divided interval, which moves this field alone.
-    pub max_fps: u32, // in
-}
-
-impl Thunk for SetDisplaySyncEnabledParams {
-    const CODE: u32 = Thunks::SetDisplaySyncEnabled as u32;
-}
-
-/// Put a gamma lookup table on an attached layer, or take the current one off.
-///
-/// The PE side owns every D3D9 rule behind it: it validates the ramp the
-/// application set, keeps it for `GetGammaRamp`, decides that it changes
-/// something and that the device is fullscreen, and converts it to the
-/// entries below. The handler keeps them for the layer and the present pass
-/// hands them to its fragment stage, so a layer either has a table or does
-/// not.
-#[repr(C, align(8))]
-pub struct SetGammaRampParams {
-    /// The layer whose attachment record takes the table.
-    ///
-    /// Looked up by layer address, like `SetDisplaySyncEnabledParams`, so a
-    /// device that never attached one is answered with a warning.
-    pub layer_handle: MetalHandle<CAMetalLayerKind>, // in
-    /// `*const u16`, the ramp as four lanes per entry (R, G, B, one); `0` removes the table.
-    pub entries_ptr: u64, // in
-    /// `u16` lane count at `entries_ptr`, four per entry. Zero with a null pointer.
-    pub entries_len: u32, // in
-    pub pad0: u32,
-}
-
-impl Thunk for SetGammaRampParams {
-    const CODE: u32 = Thunks::SetGammaRamp as u32;
-}
-
-/// Block the caller until the GPU has retired the cmdbuf with `submit_seq >= target_seq`.
-///
-/// Then bump `coherent_seq` so subsequent `Acquire` loaders observe the
-/// advance synchronously.
-///
-/// Used by `wait_for_gpu_idle` (Reset / OOM recovery / shutdown) and by the
-/// occlusion-query FLUSH path to convert spin loops into a kernel sleep on
-/// Metal's `MTLCommandBuffer::waitUntilCompleted`. The unix side also waits
-/// through the same function on its presentation counter, with no
-/// failed-submit sink, so a present the GPU killed is logged and never marks
-/// the frame's uploads failed.
-#[repr(C, align(8))]
-pub struct WaitForGpuRetireParams {
-    /// The device whose in-flight command buffers the wait looks through.
-    pub record_handle: DeviceRecordHandle, // in
-    pub target_seq: u64,       // in
-    pub coherent_seq_ptr: u64, // in: PE-side AtomicU64 backing
-    /// The upload buffers' counter; its buffers up to the retired sequence are waited for too.
-    ///
-    /// 0 when the device has none, and then only the draw buffers are.
-    pub upload_coherent_seq_ptr: u64, // in: PE-side AtomicU64 backing
-    /// Where an aborted command buffer is recorded, mirroring `SubmitFrameParams`.
-    ///
-    /// The wait publishes the counters itself so the caller observes the
-    /// advance synchronously, which would otherwise launder a command
-    /// buffer the GPU killed into "retired cleanly". 0 disables the
-    /// check.
-    pub failed_submit_seq_ptr: u64, // in: PE-side AtomicU64 backing
-}
-
-impl Thunk for WaitForGpuRetireParams {
-    const CODE: u32 = Thunks::WaitForGpuRetire as u32;
-}
-
 /// Set how a present-bearing submit on `record_handle` treats a pending present.
 ///
 /// The PE-side barrier that waits for its in-flight submits sets
@@ -442,71 +335,6 @@ pub struct SetPresentWaitPolicyParams {
 
 impl Thunk for SetPresentWaitPolicyParams {
     const CODE: u32 = Thunks::SetPresentWaitPolicy as u32;
-}
-
-/// Block until every present queued on `record_handle` has committed and the last one retired.
-///
-/// The caller has drained its submit thread first, so no present is queued
-/// meanwhile and the wait ends. Runs before a Reset destroys or replaces the
-/// back buffer or the layer, before shutdown, and around a GPU capture, so
-/// no present buffer is in flight where the trace or the teardown does not
-/// expect one.
-#[repr(C, align(8))]
-pub struct WaitForPresentIdleParams {
-    pub record_handle: DeviceRecordHandle, // in
-}
-
-impl Thunk for WaitForPresentIdleParams {
-    const CODE: u32 = Thunks::WaitForPresentIdle as u32;
-}
-
-/// Begin a Metal GPU frame capture writing a `.gputrace` document to disk.
-///
-/// The trace goes next to the process's log file, numbered per capture
-/// (`<stem>-<pid>-<n>.gputrace`), or to `/tmp/mtld3d_capture.gputrace` when
-/// no log location was named.
-///
-/// Apple requires the process to have launched with `MTL_CAPTURE_ENABLED=1`;
-/// without it the unix-side handler logs a warn and returns without
-/// capturing. Triggered from the encoder thread when the API thread sets the
-/// `CAPTURE_REQUESTED` flag (F12 hotkey in `device_present`).
-#[repr(C, align(8))]
-pub struct StartGpuCaptureParams {
-    pub device_handle: MetalHandle<MTLDeviceKind>, // in: capture-object
-}
-
-impl Thunk for StartGpuCaptureParams {
-    const CODE: u32 = Thunks::StartGpuCapture as u32;
-}
-
-/// End the in-progress Metal GPU frame capture.
-///
-/// Idempotent on the unix side (no-op if no capture was started).
-#[repr(C, align(8))]
-pub struct StopGpuCaptureParams {
-    // allow: FFI struct padding; pub for cross-crate field-init.
-    pub pad0: u64,
-}
-
-impl Thunk for StopGpuCaptureParams {
-    const CODE: u32 = Thunks::StopGpuCapture as u32;
-}
-
-/// Read the process-wide page-fault counters via `getrusage(RUSAGE_SELF)`.
-///
-/// Sampled by the encoder thread once per perf summary window (PERF=1
-/// builds only) so the summary can report a fault-rate delta. Minor
-/// faults are the first-touch zero-fill signal the `PageBox` churn
-/// investigation watches; major faults ride along for free. Process-wide:
-/// every thread's faults land in the same counters.
-#[repr(C, align(8))]
-pub struct GetTaskFaultsParams {
-    pub minor_faults: u64, // out: cumulative ru_minflt since process start
-    pub major_faults: u64, // out: cumulative ru_majflt since process start
-}
-
-impl Thunk for GetTaskFaultsParams {
-    const CODE: u32 = Thunks::GetTaskFaults as u32;
 }
 
 #[repr(C, align(8))]
@@ -570,7 +398,7 @@ impl Thunk for CreateBackbufferParams {
 
 /// Vertex attribute descriptor, one per Metal vertex input attribute.
 ///
-/// Packed as an array pointed to by `CreateRenderPipelineParams::vertex_attrs_ptr`.
+/// Borrowed by native pipeline creation and captured in shader input records.
 #[repr(C, align(4))]
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct VertexAttrDesc {
@@ -582,7 +410,7 @@ pub struct VertexAttrDesc {
 
 /// One vertex buffer layout of a render pipeline: a D3D9 stream the draw reads.
 ///
-/// Packed as an array pointed to by `CreateRenderPipelineParams::vertex_layouts_ptr`,
+/// Borrowed by native pipeline creation,
 /// one entry per stream that contributes an attribute. `stride` is never 0
 /// (Metal rejects it for every step function). `step_rate` is the instances
 /// per advance for `PerInstance`, 1 for `PerVertex`, 0 for `Constant`.
@@ -592,206 +420,6 @@ pub struct VertexBufferLayoutDesc {
     pub stride: u32,       // in: bytes per step
     pub step_function: VertexStepFunction, // in
     pub step_rate: u32,    // in
-}
-
-#[repr(C, align(8))]
-pub struct CreateRenderPipelineParams {
-    pub device_handle: MetalHandle<MTLDeviceKind>,  // in
-    pub vs_fn_handle: MetalHandle<MTLFunctionKind>, // in
-    pub ps_fn_handle: MetalHandle<MTLFunctionKind>, // in
-    pub vertex_attrs_ptr: u64,                      // in: *const VertexAttrDesc
-    pub vertex_layouts_ptr: u64,                    // in: *const VertexBufferLayoutDesc
-    pub vertex_attr_count: u32,                     // in
-    pub vertex_layout_count: u32,                   // in
-    pub blend_enable: u32,                          // in: non-zero = enabled
-    pub src_blend: BlendFactor,                     // in: source RGB
-    pub dst_blend: BlendFactor,                     // in: dest RGB
-    pub blend_op: BlendOperation,                   // in: RGB blend op (D3DRS_BLENDOP)
-    pub src_blend_alpha: BlendFactor, // in: source alpha (only if separate_alpha_blend_enable)
-    pub dst_blend_alpha: BlendFactor, // in: dest alpha (only if separate_alpha_blend_enable)
-    pub blend_op_alpha: BlendOperation, // in: alpha blend op (D3DRS_BLENDOPALPHA)
-    pub separate_alpha_blend_enable: u32, // in: non-zero = use *_alpha fields; else mirror RGB
-    pub color_write_mask: ColorWriteMask, // in
-    pub has_depth: u32,               // in: non-zero = pipeline declares depth attachment
-    pub has_stencil: u32, // in: non-zero = depth attachment format carries stencil (D24S8/D24FS8)
-    pub color_format: PixelFormat, // in: colorAttachments[0]
-    pub has_color_output: u32, /* in: non-zero = pipeline declares a color attachment; zero =
-                           * no color attachment, descriptor leaves colorAttachments[0]
-                           * default (pixelFormat=Invalid). Set zero by the pass-state
-                           * machine for cascade caster passes where every draw has
-                           * color_write_mask=0 (eliminates Apple "Unused Texture"). */
-    pub extra_present_mask: u32, // in: bit i = colorAttachments[i + 1] is declared
-    /// `rasterSampleCount` of the pipeline, 1 for a single-sampled pass.
-    ///
-    /// Metal requires it to equal the sample count of every attachment
-    /// texture of the render pass the pipeline is bound in, so it is part of
-    /// the pipeline cache key on the PE side.
-    pub sample_count: u32, // in
-    /// Enable Metal alpha-to-coverage for this multisampled pipeline.
-    pub alpha_to_coverage: u32, // in: non-zero = enabled
-    pub extra: [ExtraColorAttachmentParams; 3], // in: colorAttachments[1..=3]
-    pub pipeline_handle: MetalHandle<MTLRenderPipelineStateKind>, // out
-    pub timings: super::perf::TimingOutput<super::perf::PipelineTimings>, // out: nanoseconds when PERF is enabled
-}
-
-/// One extra colour attachment (`colorAttachments[1..=3]`) of a render pipeline.
-///
-/// The blend operations are shared with attachment 0 (D3D9 has one blend
-/// state); the factors are resolved per attachment because the
-/// destination-alpha clamp depends on whether that target's D3D format has an
-/// alpha channel. Ignored unless the matching `extra_present_mask` bit is set.
-#[repr(C)]
-pub struct ExtraColorAttachmentParams {
-    pub format: PixelFormat,          // in
-    pub write_mask: ColorWriteMask,   // in
-    pub src_blend: BlendFactor,       // in: source RGB
-    pub dst_blend: BlendFactor,       // in: dest RGB
-    pub src_blend_alpha: BlendFactor, // in: source alpha (already effective)
-    pub dst_blend_alpha: BlendFactor, // in: dest alpha (already effective)
-}
-
-impl Thunk for CreateRenderPipelineParams {
-    const CODE: u32 = Thunks::CreateRenderPipeline as u32;
-}
-
-/// Lazy create-or-fetch of the per-format-combo "clear-quad" pipeline.
-///
-/// Used to honour D3D9's viewport-clipped mid-pass Clear semantics on
-/// Metal — instead of ending the encoder and starting a new one with
-/// `loadAction = Clear` (which clears the full attachment and wipes
-/// prior in-pass draws), the PE side binds this pipeline, sets scissor
-/// to the viewport, pushes the clear value via `setVertexBytes`, and
-/// draws a single fullscreen triangle that writes the constant depth
-/// (or color) only inside the scissor rect.
-///
-/// One pipeline per `(depth_format, color_format, flags)` combo (where
-/// `flags` carries `HAS_COLOR` / `HAS_DEPTH` / `HAS_STENCIL`), cached
-/// unix-side for process lifetime in a
-/// `HashMap<key, MTLRenderPipelineState*>`. A workload whose
-/// cascade-depth tile atlases all share one combo (`Depth32Float`,
-/// no color) caps the cache at a single entry.
-///
-/// The same VS / PS pair handles both depth-only and depth+color clears
-/// via the `HAS_COLOR` flag. The pipeline's depth-write side is gated by
-/// the depth-stencil state the PE emits separately
-/// (`get_or_create_depth_stencil(1, 1, ALWAYS)`); the color side is gated
-/// by `HAS_COLOR` and the matching `color_format`.
-#[repr(C, align(8))]
-pub struct EnsureClearQuadPipelineParams {
-    pub device_handle: MetalHandle<MTLDeviceKind>, // in
-    pub depth_format: PixelFormat,                 // in (ignored when HAS_DEPTH unset)
-    pub color_format: PixelFormat,                 // in (ignored when HAS_COLOR unset)
-    pub flags: ClearQuadFlags,                     // in: HAS_COLOR | HAS_DEPTH | HAS_STENCIL
-    /// Render targets 1..3 of the pass the quad draws into: bit `i` = slot `i + 1` bound.
-    ///
-    /// A colour quad writes its clear colour to every declared slot; a
-    /// depth quad declares them with an empty write mask, as it does for
-    /// slot 0 under `COLOR_FORMAT_NO_WRITE`. Zero on a single-target pass.
-    pub extra_present_mask: u32, // in
-    pub extra_formats: [PixelFormat; 3],           // in (ignored where the mask bit is clear)
-    /// `rasterSampleCount` of the pass the quad draws into, 1 for none.
-    ///
-    /// Part of the unix-side cache key: a quad pipeline built for a
-    /// single-sampled pass cannot be bound in a multisampled one.
-    pub sample_count: u32, // in
-    pub pipeline_handle: MetalHandle<MTLRenderPipelineStateKind>, // out
-}
-
-impl Thunk for EnsureClearQuadPipelineParams {
-    const CODE: u32 = Thunks::EnsureClearQuadPipeline as u32;
-}
-
-/// Lazy create-or-fetch of the per-destination-format "blit" pipeline.
-///
-/// Used by a *scaling* `IDirect3DDevice9::StretchRect`.
-///
-/// Metal's `MTLBlitCommandEncoder` can only do 1:1 copies, so a `StretchRect`
-/// whose source and destination rects differ in size is translated into a
-/// render pass that samples the source texture onto a fullscreen-NDC quad
-/// covering the destination rect (the PE side sets viewport + scissor to the
-/// destination rect; the source rect is mapped to `[0,1]` texcoords via a
-/// `setVertexBytes` transform). This pipeline is the VS/PS pair for that quad.
-///
-/// `quad_kind` selects the fragment function: `StretchBlit` samples the bound
-/// source texture, `TextureUpload` decodes packed staging bytes read out of a
-/// bound `MTLBuffer` (the texture-upload quad, which serves the packed 16-bit
-/// expansion and the sub-alignment-pitch mip copy).
-///
-/// One pipeline per (`quad_kind`, destination `color_format`) pair (sources
-/// are bound as fragment arguments, not declared in the pipeline), cached
-/// unix-side for process lifetime. Mirrors `EnsureClearQuadPipelineParams`.
-/// No depth attachment: neither quad writes depth, and the PE side opens the
-/// destination pass with no depth texture, so no depth format is declared.
-#[repr(C, align(8))]
-pub struct EnsureBlitPipelineParams {
-    pub device_handle: MetalHandle<MTLDeviceKind>, // in
-    pub color_format: PixelFormat,                 // in: destination colour format
-    pub quad_kind: crate::mtl::QuadPipelineKind,   // in: which fragment function to link
-    /// `rasterSampleCount` of the destination pass, 1 for none.
-    ///
-    /// A `StretchRect` into a multisampled render target opens a
-    /// multisampled pass, and Metal rejects a single-sampled pipeline there.
-    pub sample_count: u32, // in
-    pub pipeline_handle: MetalHandle<MTLRenderPipelineStateKind>, // out
-}
-
-impl Thunk for EnsureBlitPipelineParams {
-    const CODE: u32 = Thunks::EnsureBlitPipeline as u32;
-}
-
-/// Create a single-slice, 2D `MTLTexture` view of one array slice of a texture.
-///
-/// The scaling `StretchRect` fragment function declares its source as
-/// `texture2d<float>`, so a cube-map source has to be bound as a 2D view of the
-/// face it addresses: the cube texture itself binds as a `texturecube` and
-/// reads face 0 whatever face the D3D9 call named. The view spans every mip
-/// level of the base texture, so the explicit `level()` the fragment function
-/// passes still selects the source mip.
-///
-/// The view is a fresh object the caller owns: the PE side parks it on the
-/// resource-retention queue and destroys it through `DestroyResourcesBulk` once
-/// the frame that binds it has retired.
-#[repr(C, align(8))]
-pub struct CreateTextureSliceViewParams {
-    pub texture_handle: MetalHandle<MTLTextureKind>, // in: base texture
-    pub view_handle: MetalHandle<MTLTextureKind>,    // out: single-slice 2D view
-    pub slice: u32,                                  // in: array slice to expose
-    // allow: FFI struct padding; pub for cross-crate field-init.
-    pub pad0: u32,
-}
-
-impl Thunk for CreateTextureSliceViewParams {
-    const CODE: u32 = Thunks::CreateTextureSliceView as u32;
-}
-
-/// Compile one stage's MSL source into an `MTLLibrary` and resolve its single entry point.
-///
-/// A pipeline can mix an `MTLFunction` from a VS library with one from a PS
-/// library — Metal links by stage-in/stage-out layout at pipeline creation.
-///
-/// `entry_ptr` / `entry_len` are the UTF-8 entry-point name to look up via
-/// `newFunctionWithName:`; the same string must appear in the function
-/// definition inside the MSL at `msl_ptr`. Per-shader-id names
-/// (`mtld3d_vs_ff_5f3a0001`, `mtld3d_ps_sm3_a2b1c4d8`, …) make Xcode's
-/// pipeline-state inspector show distinct labels per shader rather than
-/// collapsing every pipeline to "`mtld3d_vs`" / "`mtld3d_ps`".
-#[repr(C, align(8))]
-pub struct CompileShaderLibraryParams {
-    pub device_handle: MetalHandle<MTLDeviceKind>, // in
-    pub msl_ptr: u64,                              // in: *const u8 (UTF-8 MSL source)
-    pub msl_len: u32,                              // in: byte length
-    pub stage_tag: StageTag,                       // in
-    pub entry_ptr: u64,                            // in: *const u8 (UTF-8 entry-point name)
-    pub entry_len: u32,                            // in: byte length
-    // allow: FFI struct padding; pub for cross-crate field-init.
-    pub pad0: u32,                                   // align next u64
-    pub library_handle: MetalHandle<MTLLibraryKind>, // out
-    pub fn_handle: MetalHandle<MTLFunctionKind>,     // out
-    pub timings: super::perf::TimingOutput<super::perf::ShaderTimings>, // out: nanoseconds when PERF is enabled
-}
-
-impl Thunk for CompileShaderLibraryParams {
-    const CODE: u32 = Thunks::CompileShaderLibrary as u32;
 }
 
 /// One render pass inside a `SubmitFrame` submission.
@@ -806,8 +434,8 @@ impl Thunk for CompileShaderLibraryParams {
 /// inside an `MTLBlitCommandEncoder` *before* this pass's render
 /// encoder. Used by `StretchRect` (texture-to-texture copy) so a blit
 /// that lands between two D3D9 draws is ordered against both the source
-/// pass's draws and the next pass's draws — the global
-/// `SubmitFrameParams.blit_commands_ptr` runs at frame start and would
+/// pass's draws and the next pass's draws. The frame-leading blit slice
+/// runs at frame start and would
 /// mis-order a mid-frame blit. A pass with `color_texture == 0` and
 /// `command_count == 0` is a "blit-only" trailing pass synthesised when
 /// `StretchRect` lands after the last draw of the frame.
@@ -970,120 +598,6 @@ impl ExtraColorDesc {
     }
 }
 
-/// Self-contained frame submission.
-///
-/// Carries one or more render passes plus the optional present blit, so
-/// `SetRenderTarget` / mid-frame `Clear` / depth-stencil changes can break
-/// the flat command stream into separate Metal encoders.
-#[repr(C, align(8))]
-pub struct SubmitFrameParams {
-    pub record_handle: DeviceRecordHandle, // in
-    // Leading blit pass. Replayed inside a single
-    // `MTLBlitCommandEncoder` before any render pass. 0-count =
-    // skip.
-    pub blit_commands_ptr: u64,  // in: *const BlitCommand
-    pub blit_command_count: u32, // in
-    /// 0 / non-zero: same gate as `PassDescriptor::leading_blits_need_encoder`.
-    ///
-    /// Applied to the frame-leading blit list.
-    pub blit_commands_need_encoder: u32, // in
-    // Render pass list
-    pub passes_ptr: u64, // in: *const PassDescriptor
-    pub pass_count: u32, // in
-    /// Leading descriptors executed in the upload command buffer, at most `pass_count`.
-    ///
-    /// Each carries the blits preceding its upload render pass. A final
-    /// blit-only descriptor carries uploads after the last render upload.
-    /// The remaining descriptors belong to the draw command buffer.
-    pub upload_pass_count: u32,
-    // Present (NULL = skip)
-    pub present_layer: MetalHandle<CAMetalLayerKind>, // in (NULL = no present)
-    pub present_texture: MetalHandle<MTLTextureKind>, // in: blit to drawable
-    // Submit-seq fencing. The submit `addCompletedHandler` block
-    // `fetch_max`es `submit_seq` into `*(coherent_seq_ptr as
-    // *const AtomicU64)` with Release ordering once the frame retires
-    // on the GPU, so the PE-side texture + VB/IB retention drains can
-    // release backings / MTLBuffers. `coherent_seq_ptr` is 0 on the
-    // very first submit (no previous frame).
-    pub submit_seq: u64,       // in
-    pub coherent_seq_ptr: u64, // in: *const AtomicU64 (PE heap, stable)
-    /// Texture-upload completion fence.
-    ///
-    /// When non-zero, the frame-leading blits and `upload_pass_count`
-    /// descriptors are encoded into a command buffer committed before the draw CB; the
-    /// counter at `*(upload_coherent_seq_ptr as *const AtomicU64)` reaches
-    /// `submit_seq` once that CB and every earlier upload CB ended, and a
-    /// frame without one is published once no earlier one is in flight. Because the queue
-    /// is in-order the uploads still finish before any same-frame draw
-    /// samples them, but this CB retires ~a frame earlier than the draw
-    /// CB — so the next frame's texture `LockRect` sees the staging retired
-    /// and skips the synchronous preserve memcpy. Every submitted frame
-    /// carries the real pointer; 0 (a defensive null guard) falls back to
-    /// encoding the leading blits and all passes on the draw CB. Distinct from
-    /// `coherent_seq_ptr`, which tracks full-frame (draw) retirement; the PE
-    /// retention drain gates on the lower of the two.
-    pub upload_coherent_seq_ptr: u64, // in: *const AtomicU64 (PE heap, stable)
-    /// Highest submit seq whose CPU encoding or GPU execution failed.
-    ///
-    /// `submit_seq` is `fetch_max`ed into
-    /// `*(failed_submit_seq_ptr as *const AtomicU64)` as a draw or upload
-    /// command buffer that reached `MTLCommandBufferStatus::Error` is
-    /// retired, before its retirement counter passes it. A CPU encoding
-    /// failure first drains all committed draw/upload buffers and their
-    /// handlers, then records the failed sequence before advancing retirement
-    /// to that sequence. Deliberately a second counter rather than a gate on
-    /// `coherent_seq`: an aborted
-    /// command buffer *is* finished with its source memory, so withholding
-    /// the retirement bump would pin every seq-gated queue behind a seq
-    /// that never retires and deadlock `wait_for_gpu_retire`. Retirement
-    /// for lifetime and retirement for success are separate facts, and the
-    /// PE side needs both to tell an upload it can free from one it must
-    /// re-issue. 0 before the frame is stamped.
-    pub failed_submit_seq_ptr: u64, // in: *const AtomicU64 (PE heap, stable)
-    /// Nanoseconds spent in `nextDrawable()`, 0 outside a `PERF=1` build.
-    ///
-    /// Nanoseconds, not cycles, because this is the one duration that crosses
-    /// the boundary: each side calibrates its own counter, and an arm64 `.so`
-    /// reads `CNTVCT_EL0` while the PE side reads an emulated `rdtsc` at a
-    /// different rate, so a raw cycle count would be scaled by the wrong Hz on
-    /// arrival. Measured by `perf::NanosSetTimer`; the PE side converts it into
-    /// its own cycles with `tsc::ns_to_cycles` before folding it into perf.
-    pub drawable_wait_ns: u64, // out
-    /// `NSView*` the layer was attached to: the key of the attachment record.
-    ///
-    /// `submit_frame` looks the record up by it each present and reads the
-    /// display state the record holds for this device's window (occlusion,
-    /// the live EDR headroom, the present throttle, the present-geometry
-    /// streak). NULL when no layer was attached, which is also when
-    /// `present_layer` is NULL and nothing is presented.
-    pub present_view: MetalHandle<NSViewKind>, // in
-    /// Nanoseconds the submit waited for the previous present to commit.
-    ///
-    /// The wait a present-bearing submit pays under `WaitForCommit` before
-    /// its render buffer commits: the display's cadence seen from the submit
-    /// thread. Same unit and reason as `drawable_wait_ns`; 0 outside a
-    /// `PERF=1` build.
-    pub present_wait_ns: u64, // out
-    /// What this submit did about a present still waiting for its drawable.
-    ///
-    /// `TAKEN` for a no-present submit finding one, or a present-bearing one
-    /// under `SnapshotPending`; `SLOT_WAITED` when the copy had to wait for a
-    /// slot. The PE side counts both: no copies in steady state, one per
-    /// read-back, and no waits unless the ring is too small for the workload.
-    pub snapshot_flags: SnapshotFlags, // out
-    pub pad0: u32,
-    /// The submit thread's encode and commit split, and the GPU time of finished buffers.
-    ///
-    /// Durations in nanoseconds, for the same reason as `drawable_wait_ns`,
-    /// plus the number of buffers behind each GPU sum; all zero outside a
-    /// `PERF=1` build or while the perf target is off.
-    pub timings: super::perf::SubmitTimings, // out
-}
-
-impl Thunk for SubmitFrameParams {
-    const CODE: u32 = Thunks::SubmitFrame as u32;
-}
-
 #[repr(C, align(8))]
 pub struct CreateDepthTextureParams {
     pub device_handle: MetalHandle<MTLDeviceKind>, // in
@@ -1135,41 +649,7 @@ impl Thunk for CreateColorTargetParams {
     const CODE: u32 = Thunks::CreateColorTarget as u32;
 }
 
-#[repr(C, align(8))]
-pub struct CreateDepthStencilStateParams {
-    pub device_handle: MetalHandle<MTLDeviceKind>, // in
-    pub depth_test_enable: u32,                    // in: non-zero = enabled
-    pub depth_write_enable: u32,                   // in: non-zero = enabled
-    pub depth_compare_func: CompareFunc,           // in
-    pub stencil_test_enable: u32,                  // in: non-zero = enabled
-    pub front: StencilFaceParams,                  // in
-    pub back: StencilFaceParams,                   // in
-    pub stencil_read_mask: u32,                    // in
-    pub stencil_write_mask: u32,                   // in
-    pub id: u64,                                   // in: caller-defined label tag
-    pub state_handle: MetalHandle<MTLDepthStencilStateKind>, // out
-}
-
-/// One face of the stencil test, mirroring `MTLStencilDescriptor`.
-///
-/// Embedded twice in `CreateDepthStencilStateParams`. D3D9 addresses the back
-/// face through the separate `D3DRS_CCW_STENCIL*` states, which apply only
-/// while `D3DRS_TWOSIDEDSTENCILMODE` is set; the PE side resolves that and
-/// sends both faces populated either way.
-#[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct StencilFaceParams {
-    pub compare_func: CompareFunc,
-    pub stencil_fail_op: StencilOp,
-    pub depth_fail_op: StencilOp,
-    pub pass_op: StencilOp,
-}
-
-impl Thunk for CreateDepthStencilStateParams {
-    const CODE: u32 = Thunks::CreateDepthStencilState as u32;
-}
-
-/// Per-element descriptor inside `CreateTexturesBatchParams::descs_ptr`.
+/// One native texture creation description.
 ///
 /// One entry per `MTLTexture` to create. The unix side iterates the slice
 /// and writes each resulting handle into the matching slot of
@@ -1192,74 +672,7 @@ pub struct TextureCreateDesc {
     pub usage_flags: TextureUsage, // in
 }
 
-/// Batched `MTLTexture` creation with distinct attachment and sampling roles.
-///
-/// `descs_ptr` names `count` texture descriptors. `views_out_ptr` names a
-/// caller-owned array of `TextureViews` with the same length. Both arrays
-/// remain aligned and stable throughout the call. A failed element receives
-/// an empty bundle; every distinct non-null handle in a successful bundle
-/// transfers one canonical retain to the caller.
-#[repr(C, align(8))]
-pub struct CreateTexturesBatchParams {
-    pub device_handle: MetalHandle<MTLDeviceKind>,
-    pub record_handle: DeviceRecordHandle,
-    pub count: u32,
-    // allow: FFI struct padding; pub for cross-crate field-init.
-    pub pad0: u32,
-    pub descs_ptr: u64,
-    pub views_out_ptr: u64,
-}
-
-impl Thunk for CreateTexturesBatchParams {
-    const CODE: u32 = Thunks::CreateTexturesBatch as u32;
-}
-
-#[repr(C, align(8))]
-pub struct CreateSamplerStateParams {
-    pub device_handle: MetalHandle<MTLDeviceKind>, // in
-    pub id: u64,                                   // in: caller-defined label tag
-    pub min_filter: MinMagFilter,                  // in
-    pub mag_filter: MinMagFilter,                  // in
-    pub mip_filter: MipFilter,                     // in
-    pub address_u: AddressMode,                    // in
-    pub address_v: AddressMode,                    // in
-    pub address_w: AddressMode,                    // in
-    pub max_anisotropy: u32,                       // in
-    /// `D3DSAMP_MAXMIPLEVEL` → Metal's `setLodMinClamp`.
-    ///
-    /// D3D9's MAXMIPLEVEL is confusingly the *minimum* fine mip index the
-    /// sampler may select (i.e. "don't sample mips finer than N"). Stored
-    /// as f32 bits; 0 means default (no clamp). Zero bit-pattern of f32 is
-    /// 0.0, which is also the natural default — clamping to "at least
-    /// mip 0" is a no-op.
-    pub lod_min_clamp: u32, // in: f32 bits
-    /// Upper bound on selected mip LOD.
-    ///
-    /// Stored as f32 bits. A fixed `1000.0` matches the D3D9 convention —
-    /// effectively "no upper clamp", with Metal naturally capping at the
-    /// texture's actual mip count. Metal's default is `FLT_MAX`, so
-    /// `1000.0` is just an explicit ceiling that makes the field's intent
-    /// visible.
-    pub lod_max_clamp: u32, // in: f32 bits
-    /// 0 / non-zero: when set, the sampler is created with `compareFunction = LessEqual`.
-    ///
-    /// MSL `sample_compare(...)` against a `depth2d<float>` then returns
-    /// the D3D9 hardware-shadow PCF result (1 = lit, 0 = shadowed) the
-    /// terrain shadow shaders depend on. Set by the encoder for any
-    /// sampler bound to a depth-format slot (`depth_sampler_mask` bit
-    /// set); separate cache entry from the non-compare variant of the
-    /// same D3D9 sampler state.
-    pub is_compare: u32,
-    /// Border preset for `AddressMode::ClampToBorderColor` on any axis.
-    pub border_color: BorderColor, // in
-    pub sampler_handle: MetalHandle<MTLSamplerStateKind>, // out
-}
-
-impl Thunk for CreateSamplerStateParams {
-    const CODE: u32 = Thunks::CreateSamplerState as u32;
-}
-
-/// Per-element descriptor inside `CreateBuffersBatchParams::descs_ptr`.
+/// One native buffer creation description.
 ///
 /// One entry per `MTLBuffer` to wrap. Each `backing_ptr` is caller-owned,
 /// page-aligned, and stays in PE-addressable memory; the unix side wraps
@@ -1274,28 +687,6 @@ pub struct BufferCreateDesc {
     pub id: u64,                   // in: caller-defined id, formatted into MTLBuffer label
     pub storage_mode: StorageMode, // in: Private not supported for newBufferWithBytesNoCopy
     pub kind: BufferKind,          // in: role of the buffer, formatted into MTLBuffer label
-}
-
-/// Batched `MTLBuffer` wrap.
-///
-/// One PE↔Unix crossing wraps `count` PE-owned memory regions as
-/// `MTLBuffer`s. Same shape as `CreateTexturesBatchParams`: caller-owned
-/// `[BufferCreateDesc; count]` in and `[u64; count]` out, both 8-byte
-/// aligned and stable for the duration of the call.
-///
-/// Single-create call sites use `count = 1` against a one-element array.
-#[repr(C, align(8))]
-pub struct CreateBuffersBatchParams {
-    pub device_handle: MetalHandle<MTLDeviceKind>, // in
-    pub count: u32,                                // in
-    // allow: FFI struct padding; pub for cross-crate field-init.
-    pub pad0: u32,
-    pub descs_ptr: u64,       // in: *const BufferCreateDesc, len=count
-    pub handles_out_ptr: u64, // out: *mut MetalHandle<MTLBufferKind>, len=count (NULL on failure)
-}
-
-impl Thunk for CreateBuffersBatchParams {
-    const CODE: u32 = Thunks::CreateBuffersBatch as u32;
 }
 
 /// Bulk MTL handle release.
@@ -1380,19 +771,6 @@ pub struct BlitTextureToBufferParams {
 
 impl Thunk for BlitTextureToBufferParams {
     const CODE: u32 = Thunks::BlitTextureToBuffer as u32;
-}
-
-/// Create one device-owned pipeline for native depth-plane extraction.
-#[repr(C, align(8))]
-pub struct CreateDepthTransferPipelineParams {
-    pub device_handle: MetalHandle<MTLDeviceKind>,
-    pub pipeline_handle: MetalHandle<crate::mtl_handle::MTLComputePipelineStateKind>,
-    pub kind: crate::mtl::DepthTransferKind,
-    pub pad: u32,
-}
-
-impl Thunk for CreateDepthTransferPipelineParams {
-    const CODE: u32 = Thunks::CreateDepthTransferPipeline as u32;
 }
 
 #[cfg(test)]

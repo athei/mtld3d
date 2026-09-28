@@ -42,7 +42,6 @@ use std::{
 
 use block2::RcBlock;
 use mtld3d_shared::{
-    SubmitFrameParams,
     mtl::{PRESENT_PIPELINE_DEPTH, PresentWaitPolicy, SnapshotFlags},
     mtl_handle::{CAMetalLayerKind, MTLCommandQueueKind, MTLTextureKind, MetalHandle},
     perf::{CommandBufferRole, NanosSetTimer},
@@ -514,7 +513,7 @@ pub fn push(state: &PresentState, packet: PresentPacket) -> u64 {
 pub fn resolve_present_conflict(
     state: &PresentState,
     queue: &ProtocolObject<dyn MTLCommandQueue>,
-    params: &mut SubmitFrameParams,
+    params: &mut super::submission::SubmissionOutcome,
     present_bearing: bool,
 ) {
     let mut inner = state.lock();

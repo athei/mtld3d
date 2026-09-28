@@ -468,7 +468,7 @@ pub struct DeviceInner {
     /// Texture-upload retirement seq.
     ///
     /// Raised as the *upload* command buffers (a separate CB committed before
-    /// the draw CB; see `SubmitFrameParams::upload_coherent_seq_ptr`) end in
+    /// the draw CB) end in
     /// sequence order, and for a submission without one once no upload
     /// buffer up to it is in flight. Because that CB retires ~a frame earlier
     /// than the draw CB tracked by `coherent_seq`, a texture mip's staging

@@ -19,7 +19,7 @@
 use std::sync::{Mutex, OnceLock};
 
 use mtld3d_shared::{
-    EnsureBlitPipelineParams, MetalHandle,
+    MetalHandle,
     mtl::PixelFormat,
     mtl_handle::{MTLFunctionKind, MTLRenderPipelineStateKind},
 };
@@ -194,15 +194,15 @@ static CACHE: OnceLock<Option<BlitCache>> = OnceLock::new();
 /// leaves the size-mismatch `StretchRect` rejected (the 1:1 path is
 /// unaffected).
 pub fn ensure_blit_pipeline(
-    params: &EnsureBlitPipelineParams,
+    device: &ProtocolObject<dyn MTLDevice>,
+    color_format: PixelFormat,
+    sample_count: u32,
 ) -> Option<MetalHandle<MTLRenderPipelineStateKind>> {
-    let device = params.device_handle.into_retained()?;
-
     let cache = CACHE
-        .get_or_init(|| build_library_and_functions(&device))
+        .get_or_init(|| build_library_and_functions(device))
         .as_ref()?;
 
-    let key = (params.color_format, params.sample_count.max(1));
+    let key = (color_format, sample_count.max(1));
     {
         let pipelines = cache.pipelines.lock().ok()?;
         if let Some(&handle) = pipelines.get(&key) {
@@ -210,7 +210,7 @@ pub fn ensure_blit_pipeline(
         }
     }
 
-    let handle = build_pipeline(&device, cache, key)?;
+    let handle = build_pipeline(device, cache, key)?;
     let mut pipelines = cache.pipelines.lock().ok()?;
     // SAFETY: `build_pipeline` handed `handle` the only retain on its
     // pipeline, and nothing else copied it.

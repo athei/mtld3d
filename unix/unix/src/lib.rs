@@ -69,35 +69,15 @@ const fn dispatch(code: Thunks) -> UnixCallFn {
         Thunks::AttachMetalLayer => arp!(handlers::attach_metal_layer_handler),
         Thunks::DestroyCommandQueue => arp!(handlers::destroy_command_queue_handler),
         Thunks::CreateBackbuffer => arp!(handlers::create_backbuffer_handler),
-        Thunks::CreateRenderPipeline => arp!(handlers::create_render_pipeline_handler),
-        Thunks::SubmitFrame => arp!(handlers::submit_frame_handler),
         Thunks::CreateDepthTexture => arp!(handlers::create_depth_texture_handler),
         Thunks::CreateColorTarget => arp!(handlers::create_color_target_handler),
-        Thunks::CreateDepthStencilState => arp!(handlers::create_depth_stencil_state_handler),
-        Thunks::CreateTexturesBatch => arp!(handlers::create_textures_batch_handler),
-        Thunks::CreateSamplerState => arp!(handlers::create_sampler_state_handler),
-        Thunks::CompileShaderLibrary => arp!(handlers::compile_shader_library_handler),
-        Thunks::CreateBuffersBatch => arp!(handlers::create_buffers_batch_handler),
         Thunks::BlitTextureToBuffer => arp!(handlers::blit_texture_to_buffer_handler),
-        Thunks::SetDisplaySyncEnabled => arp!(handlers::set_display_sync_enabled_handler),
         Thunks::DestroyResourcesBulk => arp!(handlers::destroy_resources_bulk_handler),
-        Thunks::WaitForGpuRetire => arp!(handlers::wait_for_gpu_retire_handler),
-        Thunks::StartGpuCapture => arp!(handlers::start_gpu_capture_handler),
-        Thunks::StopGpuCapture => arp!(handlers::stop_gpu_capture_handler),
-        Thunks::EnsureClearQuadPipeline => arp!(handlers::ensure_clear_quad_pipeline_handler),
-        Thunks::CreateDepthTransferPipeline => {
-            arp!(handlers::create_depth_transfer_pipeline_handler)
-        }
-        Thunks::EnsureBlitPipeline => arp!(handlers::ensure_blit_pipeline_handler),
-        Thunks::CreateTextureSliceView => arp!(handlers::create_texture_slice_view_handler),
-        Thunks::GetTaskFaults => arp!(handlers::get_task_faults_handler),
         Thunks::WriteLog => arp!(handlers::write_log_handler),
         Thunks::OpenLog => arp!(handlers::open_log_handler),
         Thunks::SetCursorOverlay => arp!(handlers::set_cursor_overlay_handler),
-        Thunks::SetGammaRamp => arp!(handlers::set_gamma_ramp_handler),
         Thunks::DetachMetalLayer => arp!(handlers::detach_metal_layer_handler),
         Thunks::SetPresentWaitPolicy => arp!(handlers::set_present_wait_policy_handler),
-        Thunks::WaitForPresentIdle => arp!(handlers::wait_for_present_idle_handler),
     }
 }
 
@@ -114,11 +94,4 @@ const fn build_dispatch_table() -> [UnixCallFn; Thunks::COUNT] {
         i += 1;
     }
     table
-}
-
-/// Call a native backend handler without crossing Wine's PE boundary.
-fn native_call<T: mtld3d_shared::Thunk>(params: &mut T) -> i32 {
-    // SAFETY: Thunk associates the parameter layout with its dispatch entry;
-    // the live exclusive borrow lasts until the handler has returned.
-    unsafe { DISPATCH_TABLE[T::CODE as usize](std::ptr::from_mut(params).cast()) }
 }

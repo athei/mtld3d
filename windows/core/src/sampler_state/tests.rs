@@ -4,7 +4,7 @@
 //! the cache key, which is what makes a silently dropped sampler state
 //! impossible: a new field that never reaches the key fails here. The rest pins
 //! the packed key layout by bit position, the 1:1 filter mapping (no implicit
-//! promote), and that `params_from_snapshot` agrees with the key it was given.
+//! promote), and that `description_from_snapshot` agrees with the key it was given.
 
 use mtld3d_shared::mtl::MinMagFilter;
 use mtld3d_types::{
@@ -89,9 +89,7 @@ fn border_preset_lives_in_bits_39_and_40() {
         "non-preset colour shares the black sampler"
     );
 
-    // SAFETY: tests; opaque values never dereferenced.
-    let dev = unsafe { MetalHandle::new(0xDEAD) };
-    let p = params_from_snapshot(&s, fallback, dev);
+    let p = description_from_snapshot(&s, fallback);
     assert_eq!(p.border_color, BorderColor::OpaqueBlack);
 }
 
@@ -110,24 +108,21 @@ fn raw_filters_pass_through_1_to_1() {
 
 #[test]
 fn params_match_snapshot_on_default() {
-    // SAFETY: tests; opaque values never dereferenced.
-    let dev = unsafe { MetalHandle::new(0xDEAD) };
     let s = base();
     let key = key_from_snapshot(&s);
-    let p = params_from_snapshot(&s, key, dev);
-    assert_eq!(p.device_handle, dev);
+    let p = description_from_snapshot(&s, key);
     assert_eq!(p.id, key.raw());
     assert_eq!(p.max_anisotropy, 1);
-    assert_eq!(p.lod_min_clamp, 0.0_f32.to_bits());
-    assert_eq!(p.lod_max_clamp, 1000.0_f32.to_bits());
+    assert_eq!(p.lod_min_clamp.to_bits(), 0.0_f32.to_bits());
+    assert_eq!(p.lod_max_clamp.to_bits(), 1000.0_f32.to_bits());
 
     let mut s2 = base();
     s2.max_mip_level = 3;
     let key2 = key_from_snapshot(&s2);
-    let p2 = params_from_snapshot(&s2, key2, dev);
+    let p2 = description_from_snapshot(&s2, key2);
     assert_eq!(p2.id, key2.raw());
-    assert_eq!(p2.lod_min_clamp, 3.0_f32.to_bits());
-    assert_eq!(p2.lod_max_clamp, 1000.0_f32.to_bits());
+    assert_eq!(p2.lod_min_clamp.to_bits(), 3.0_f32.to_bits());
+    assert_eq!(p2.lod_max_clamp.to_bits(), 1000.0_f32.to_bits());
 }
 
 #[test]
@@ -258,16 +253,14 @@ fn lod_bias_table_cache_is_independent_of_pass_bindings() {
 
 #[test]
 fn anisotropy_clamps_to_the_advertised_ceiling() {
-    // SAFETY: tests; opaque values never dereferenced.
-    let dev = unsafe { MetalHandle::new(0xDEAD) };
     let mut ss = linear_state();
     ss[D3DSAMP_MAXANISOTROPY as usize] = 64;
     let s = snapshot_from_state(&ss, false);
-    let p = params_from_snapshot(&s, key_from_snapshot(&s), dev);
+    let p = description_from_snapshot(&s, key_from_snapshot(&s));
     assert_eq!(p.max_anisotropy, MAX_ANISOTROPY);
     ss[D3DSAMP_MAXANISOTROPY as usize] = 0;
     let s = snapshot_from_state(&ss, false);
-    let p = params_from_snapshot(&s, key_from_snapshot(&s), dev);
+    let p = description_from_snapshot(&s, key_from_snapshot(&s));
     assert_eq!(p.max_anisotropy, 1);
 }
 
@@ -305,13 +298,11 @@ fn an_in_space_filter_the_translator_skips_still_reaches_its_fallback() {
     // `D3DTEXF_GAUSSIANQUAD` is a D3D9 filter the Metal translation has no
     // arm for. It is inside the space, so it keeps reaching that translator's
     // own logged fallback instead of being substituted here.
-    // SAFETY: tests; opaque values never dereferenced.
-    let dev = unsafe { MetalHandle::new(0xDEAD) };
     let mut ss = linear_state();
     ss[D3DSAMP_MINFILTER as usize] = D3DTEXF_GAUSSIANQUAD;
     let s = snapshot_from_state(&ss, false);
     assert_eq!(u32::from(s.min_filter), D3DTEXF_GAUSSIANQUAD);
-    let p = params_from_snapshot(&s, key_from_snapshot(&s), dev);
+    let p = description_from_snapshot(&s, key_from_snapshot(&s));
     assert_eq!(p.min_filter, MinMagFilter::Nearest);
 }
 

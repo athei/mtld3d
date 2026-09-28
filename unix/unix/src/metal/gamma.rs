@@ -19,7 +19,7 @@
 
 use std::sync::{LazyLock, Mutex, MutexGuard, PoisonError};
 
-use mtld3d_shared::SetGammaRampParams;
+use mtld3d_shared::{MetalHandle, mtl_handle::CAMetalLayerKind};
 use objc2::runtime::ProtocolObject;
 use objc2_metal::MTLRenderCommandEncoder;
 use rustc_hash::FxHashMap;
@@ -67,9 +67,12 @@ fn tables() -> MutexGuard<'static, FxHashMap<usize, Table>> {
 /// fullscreen: the table is removed and the layer's presents go back to the
 /// route they would take with no ramp at all. Returns `false` for a layer no
 /// attachment record names, which is a device that never attached one.
-pub fn set_gamma_ramp(params: &SetGammaRampParams, entries: Option<&[u16]>) -> bool {
-    let layer = usize::try_from(params.layer_handle.raw())
-        .expect("a 64-bit host addresses every layer pointer");
+pub fn set_gamma_ramp(
+    layer_handle: MetalHandle<CAMetalLayerKind>,
+    entries: Option<&[u16]>,
+) -> bool {
+    let layer =
+        usize::try_from(layer_handle.raw()).expect("a 64-bit host addresses every layer pointer");
     let Some(att) = attachment::find_by_layer(layer) else {
         mtld3d_shared::log_once_warn!(
             target: LOG_TARGET,
@@ -133,12 +136,6 @@ pub fn bind(enc: &ProtocolObject<dyn MTLRenderCommandEncoder>, layer: usize) -> 
     // copy `setFragmentBytes:` makes and nothing more.
     drop(tables);
     true
-}
-
-/// Lanes a payload must carry, for the boundary check.
-#[must_use]
-pub const fn expected_lanes() -> usize {
-    LANES
 }
 
 /// The layer of a retired attachment keeps no table.

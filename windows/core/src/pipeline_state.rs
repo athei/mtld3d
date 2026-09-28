@@ -2,7 +2,7 @@
 //!
 //! Two functions consume the same input (`PipelineSnapshot`) and produce
 //! the two outputs that must stay in lockstep — the pipeline-cache
-//! `PipelineKey` and the wire-format `CreateRenderPipelineParams`. Anything
+//! `PipelineKey` and the native `PipelineDescription`. Anything
 //! that can change the Metal pipeline **must** appear in both. Per-field
 //! unit tests below assert the static invariant: "mutating one snapshot
 //! field produces a different key". If the audit claims a D3D state is
@@ -12,8 +12,7 @@
 //! single cached pipeline.
 
 use mtld3d_shared::{
-    CreateRenderPipelineParams, ExtraColorAttachmentParams, MetalHandle, VertexAttrDesc,
-    VertexBufferLayoutDesc,
+    MetalHandle, VertexAttrDesc, VertexBufferLayoutDesc,
     mtl::{BlendFactor, BlendOperation, ColorWriteMask, PixelFormat, VertexStepFunction},
     mtl_handle::MTLFunctionKind,
 };
@@ -411,9 +410,8 @@ pub struct PipelineBuildInputs<'a> {
     /// The wire form of `snapshot.stream_layouts`, used streams only.
     ///
     /// Built by [`vertex_layouts_from_snapshot`]; the slice outlives the
-    /// synchronous `CreateRenderPipeline` thunk that reads it by pointer.
+    /// synchronous native pipeline creation that borrows it.
     pub vertex_layouts: &'a [VertexBufferLayoutDesc],
-    pub device_handle: MetalHandle<mtld3d_shared::mtl_handle::MTLDeviceKind>,
 }
 
 /// One vertex buffer layout of a pipeline: how Metal steps through a D3D9 stream.
@@ -505,48 +503,70 @@ pub fn key_from_snapshot(s: &PipelineSnapshot, vertex_attrs: &[VertexAttrDesc]) 
     }
 }
 
-/// Build the `CreateRenderPipelineParams` wire struct from a pipeline snapshot.
-///
-/// # Panics
-///
-/// Panics if `inputs.vertex_attrs.len()` or `inputs.vertex_layouts.len()`
-/// exceeds `u32::MAX` (unreachable — D3D9 caps both at 16).
+/// Resolved blend fields of an additional native color attachment.
+pub struct ExtraColorAttachmentDescription {
+    pub format: PixelFormat,
+    pub write_mask: ColorWriteMask,
+    pub src_blend: BlendFactor,
+    pub dst_blend: BlendFactor,
+    pub src_blend_alpha: BlendFactor,
+    pub dst_blend_alpha: BlendFactor,
+}
+
+/// Resolved native pipeline inputs, borrowing the caller's vertex descriptions.
+pub struct PipelineDescription<'a> {
+    pub vs_fn_handle: MetalHandle<MTLFunctionKind>,
+    pub ps_fn_handle: MetalHandle<MTLFunctionKind>,
+    pub vertex_attrs: &'a [VertexAttrDesc],
+    pub vertex_layouts: &'a [VertexBufferLayoutDesc],
+    pub flags: PipelineRsFlags,
+    pub attach: PipelineAttachFlags,
+    pub src_blend: BlendFactor,
+    pub dst_blend: BlendFactor,
+    pub blend_op: BlendOperation,
+    pub src_blend_alpha: BlendFactor,
+    pub dst_blend_alpha: BlendFactor,
+    pub blend_op_alpha: BlendOperation,
+    pub color_write_mask: ColorWriteMask,
+    pub color_format: PixelFormat,
+    pub extra_present_mask: u8,
+    pub sample_count: u8,
+    pub extra: [ExtraColorAttachmentDescription; 3],
+}
+
+/// Build native pipeline inputs from the same snapshot used by the cache key.
 #[must_use]
-pub fn params_from_snapshot(inputs: &PipelineBuildInputs<'_>) -> CreateRenderPipelineParams {
+pub fn description_from_snapshot<'a>(inputs: &PipelineBuildInputs<'a>) -> PipelineDescription<'a> {
     let s = inputs.snapshot;
     let blend = effective_blend(&s.rs);
-    let vertex_attr_count =
-        u32::try_from(inputs.vertex_attrs.len()).expect("vertex attr count ≤ D3D9 max 16");
-    let vertex_layout_count =
-        u32::try_from(inputs.vertex_layouts.len()).expect("vertex layout count ≤ MaxStreams");
-    CreateRenderPipelineParams {
-        device_handle: inputs.device_handle,
+    let mut flags = PipelineRsFlags::empty();
+    flags.set(PipelineRsFlags::BLEND_ENABLE, s.rs.blend_enable());
+    flags.set(PipelineRsFlags::SEPARATE_ALPHA_BLEND, blend.separate_alpha);
+    flags.set(
+        PipelineRsFlags::ALPHA_TO_COVERAGE,
+        s.rs.alpha_to_coverage(s.sample_count),
+    );
+    PipelineDescription {
         vs_fn_handle: s.vs_fn,
         ps_fn_handle: s.ps_fn,
-        vertex_attrs_ptr: inputs.vertex_attrs.as_ptr() as u64,
-        vertex_layouts_ptr: inputs.vertex_layouts.as_ptr() as u64,
-        vertex_attr_count,
-        vertex_layout_count,
-        blend_enable: u32::from(s.rs.blend_enable()),
+        vertex_attrs: inputs.vertex_attrs,
+        vertex_layouts: inputs.vertex_layouts,
+        flags,
+        attach: s.attach,
         src_blend: d3d_to_metal_blend_rt(blend.src, s.color_has_alpha()),
         dst_blend: d3d_to_metal_blend_rt(blend.dst, s.color_has_alpha()),
         blend_op: d3d_to_metal_blend_op(blend.op),
         src_blend_alpha: d3d_to_metal_blend_rt(blend.src_alpha, s.color_has_alpha()),
         dst_blend_alpha: d3d_to_metal_blend_rt(blend.dst_alpha, s.color_has_alpha()),
         blend_op_alpha: d3d_to_metal_blend_op(blend.op_alpha),
-        separate_alpha_blend_enable: u32::from(blend.separate_alpha),
         color_write_mask: d3d_to_metal_write_mask(u32::from(s.rs.color_write_mask)),
-        has_depth: u32::from(s.has_depth()),
-        has_stencil: u32::from(s.has_stencil()),
         color_format: s.color_format,
-        has_color_output: u32::from(s.has_color_output()),
-        extra_present_mask: u32::from(s.extra.present_mask),
-        sample_count: u32::from(s.sample_count.max(1)),
-        alpha_to_coverage: u32::from(s.rs.alpha_to_coverage(s.sample_count)),
+        extra_present_mask: s.extra.present_mask,
+        sample_count: s.sample_count.max(1),
         extra: core::array::from_fn(|i| {
             let (src_blend, dst_blend, src_blend_alpha, dst_blend_alpha) =
                 s.extra_blend_factors(&blend, i);
-            ExtraColorAttachmentParams {
+            ExtraColorAttachmentDescription {
                 format: s.extra_format(i),
                 write_mask: s.extra_write_mask(i),
                 src_blend,
@@ -555,8 +575,6 @@ pub fn params_from_snapshot(inputs: &PipelineBuildInputs<'_>) -> CreateRenderPip
                 dst_blend_alpha,
             }
         }),
-        pipeline_handle: MetalHandle::NULL,
-        timings: mtld3d_shared::perf::TimingOutput::new(),
     }
 }
 

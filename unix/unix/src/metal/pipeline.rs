@@ -1,10 +1,11 @@
 use log::{debug, error};
+use mtld3d_core::pipeline_state::{PipelineAttachFlags, PipelineDescription, PipelineRsFlags};
 use mtld3d_shared::{
-    CreateRenderPipelineParams, MetalHandle, VertexAttrDesc, VertexBufferLayoutDesc,
+    MetalHandle,
     mtl::{BlendOperation, VertexFormat, VertexStepFunction},
     mtl_handle::MTLRenderPipelineStateKind,
 };
-use objc2::rc::Retained;
+use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_metal::{
     MTLBlendOperation, MTLColorWriteMask, MTLDevice, MTLFunction, MTLPixelFormat,
     MTLRenderPipelineDescriptor, MTLVertexDescriptor, MTLVertexFormat, MTLVertexStepFunction,
@@ -20,18 +21,16 @@ use crate::{
 ///
 /// The vertex descriptor is caller-supplied. Shader compilation happens
 /// upstream in `compile_shader_library`; this function deals purely with
-/// pipeline state. `vertex_attrs` and `vertex_layouts` are reconstructed at
-/// the handler boundary because the FFI struct carries only raw pointers +
-/// lengths.
+/// pipeline state. Vertex descriptions are borrowed directly from the caller.
 pub fn create_render_pipeline(
-    params: &CreateRenderPipelineParams,
-    vertex_attrs: &[VertexAttrDesc],
-    vertex_layouts: &[VertexBufferLayoutDesc],
+    device: &ProtocolObject<dyn MTLDevice>,
+    params: &PipelineDescription<'_>,
     timings: &mut mtld3d_shared::perf::PipelineTimings,
 ) -> Option<MetalHandle<MTLRenderPipelineStateKind>> {
     timings.reset();
     let preparation = mtld3d_shared::perf::NanosSetTimer::start(&raw mut timings.preparation_ns);
-    let device = params.device_handle.into_retained()?;
+    let vertex_attrs = params.vertex_attrs;
+    let vertex_layouts = params.vertex_layouts;
     let vertex_function = params.vs_fn_handle.into_retained()?;
     let fragment_function = params.ps_fn_handle.into_retained()?;
 
@@ -75,7 +74,7 @@ pub fn create_render_pipeline(
     // texture of the pass the pipeline is bound in, so the PE side keys the
     // pipeline cache on it.
     desc.setRasterSampleCount(params.sample_count.max(1) as usize);
-    desc.setAlphaToCoverageEnabled(params.alpha_to_coverage != 0);
+    desc.setAlphaToCoverageEnabled(params.flags.contains(PipelineRsFlags::ALPHA_TO_COVERAGE));
 
     // Pipeline-state label = `<vs_name> + <ps_name>`. Surfaces in Xcode's
     // Frame Capture timeline + pipeline-state list views as the per-shader
@@ -85,10 +84,13 @@ pub fn create_render_pipeline(
     {
         let vs_name = vertex_function.name();
         let ps_name = fragment_function.name();
-        let suffix = if params.has_color_output == 0 {
-            " no-color"
-        } else {
+        let suffix = if params
+            .attach
+            .contains(PipelineAttachFlags::HAS_COLOR_OUTPUT)
+        {
             ""
+        } else {
+            " no-color"
         };
         let mrt = if params.extra_present_mask == 0 {
             String::new()
@@ -100,7 +102,10 @@ pub fn create_render_pipeline(
         desc.setLabel(Some(&label));
     }
 
-    if params.has_color_output != 0 {
+    if params
+        .attach
+        .contains(PipelineAttachFlags::HAS_COLOR_OUTPUT)
+    {
         // SAFETY: `colorAttachments()` returns a non-null descriptor array;
         // subscript 0 is always valid.
         let color0 = unsafe { desc.colorAttachments().objectAtIndexedSubscript(0) };
@@ -117,12 +122,12 @@ pub fn create_render_pipeline(
         let mask = MTLColorWriteMask::from_bits_truncate(params.color_write_mask.bits() as usize);
         color0.setWriteMask(mask);
 
-        if params.blend_enable != 0 {
+        if params.flags.contains(PipelineRsFlags::BLEND_ENABLE) {
             // D3D9 spec: separate alpha factors/ops only apply when
             // D3DRS_SEPARATEALPHABLENDENABLE is TRUE. Otherwise the RGB
-            // values mirror onto alpha. The PE side pre-resolves this in
-            // `pipeline_state::effective_blend`: by the time the thunk
-            // arrives the alpha fields already carry the correct effective
+            // values mirror onto alpha. The core translator resolves this in
+            // `pipeline_state::effective_blend`: by the time creation
+            // runs the alpha fields already carry the correct effective
             // values, so we just apply them unconditionally.
             color0.setBlendingEnabled(true);
             color0.setSourceRGBBlendFactor(mtl_blend_factor(params.src_blend));
@@ -147,7 +152,7 @@ pub fn create_render_pipeline(
         color.setPixelFormat(mtl_pixel_format(extra.format));
         let mask = MTLColorWriteMask::from_bits_truncate(extra.write_mask.bits() as usize);
         color.setWriteMask(mask);
-        if params.blend_enable != 0 {
+        if params.flags.contains(PipelineRsFlags::BLEND_ENABLE) {
             color.setBlendingEnabled(true);
             color.setSourceRGBBlendFactor(mtl_blend_factor(extra.src_blend));
             color.setDestinationRGBBlendFactor(mtl_blend_factor(extra.dst_blend));
@@ -158,11 +163,11 @@ pub fn create_render_pipeline(
         }
     }
 
-    if params.has_depth != 0 {
+    if params.attach.contains(PipelineAttachFlags::HAS_DEPTH) {
         // Match the framebuffer: depth-only targets (D24X8 / D16 / D32 → Depth32Float)
         // must leave stencilAttachmentPixelFormat at the Invalid default, or Metal
         // rejects the pipeline at draw time. Only D24S8 / D24FS8 pair depth+stencil.
-        if params.has_stencil != 0 {
+        if params.attach.contains(PipelineAttachFlags::HAS_STENCIL) {
             desc.setDepthAttachmentPixelFormat(MTLPixelFormat::Depth32Float_Stencil8);
             desc.setStencilAttachmentPixelFormat(MTLPixelFormat::Depth32Float_Stencil8);
         } else {
@@ -190,8 +195,8 @@ pub fn create_render_pipeline(
         "created render pipeline {raw:#x} (attrs={}, layouts={}, blend={}, depth={})",
         vertex_attrs.len(),
         vertex_layouts.len(),
-        params.blend_enable,
-        params.has_depth != 0
+        u32::from(params.flags.contains(PipelineRsFlags::BLEND_ENABLE)),
+        params.attach.contains(PipelineAttachFlags::HAS_DEPTH)
     );
     // SAFETY: `Retained::into_raw` above transferred the retain into `raw`.
     Some(unsafe { MetalHandle::<MTLRenderPipelineStateKind>::new(raw) })

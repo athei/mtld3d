@@ -8,14 +8,18 @@
 //! has still to read, which Apple Silicon usually hides and the Intel and
 //! paravirtual devices do not.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(test)]
+use std::sync::atomic::AtomicU64;
 
-use mtld3d_shared::{MetalHandle, SubmitFrameParams, mtl_handle::MTLBufferKind};
+use mtld3d_shared::{MetalHandle, mtl_handle::MTLBufferKind};
 use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_foundation::NSString;
 use objc2_metal::{MTLBuffer, MTLDevice, MTLResource, MTLResourceOptions};
 
-use super::handle::{BorrowRetained, ReleaseRetain};
+use super::{
+    handle::{BorrowRetained, ReleaseRetain},
+    submission::{RetirementCounter, SubmitDescription},
+};
 
 /// Capacity of the first upload-ring chunk.
 const FIRST_CHUNK_BYTES: usize = 64 * 1024;
@@ -33,9 +37,9 @@ pub struct SubmitStamp {
     /// The upload command buffer rather than the render one.
     upload: bool,
     /// Address of the PE-side render retirement counter, 0 when absent.
-    draw_counter: u64,
+    draw_counter: RetirementCounter,
     /// Address of the PE-side upload retirement counter, 0 when absent.
-    upload_counter: u64,
+    upload_counter: RetirementCounter,
 }
 
 impl SubmitStamp {
@@ -47,8 +51,8 @@ impl SubmitStamp {
     /// reaches, and `persistent` reports false so the caller keeps its
     /// buffers out of the device's pools.
     #[must_use]
-    pub const fn new(params: &SubmitFrameParams) -> Self {
-        let persistent = params.submit_seq != 0 && params.coherent_seq_ptr != 0;
+    pub const fn new(params: &SubmitDescription) -> Self {
+        let persistent = params.submit_seq != 0 && params.draw_retirement.is_present();
         Self {
             seq: if persistent {
                 params.submit_seq
@@ -56,8 +60,8 @@ impl SubmitStamp {
                 u64::MAX
             },
             upload: false,
-            draw_counter: params.coherent_seq_ptr,
-            upload_counter: params.upload_coherent_seq_ptr,
+            draw_counter: params.draw_retirement,
+            upload_counter: params.upload_retirement,
         }
     }
 
@@ -79,8 +83,14 @@ impl SubmitStamp {
         Self {
             seq,
             upload: false,
-            draw_counter: core::ptr::from_ref(draw) as u64,
-            upload_counter: core::ptr::from_ref(upload) as u64,
+            // SAFETY: test counters outlive all uses of the returned stamp.
+            draw_counter: unsafe {
+                RetirementCounter::from_address(core::ptr::from_ref(draw) as u64)
+            },
+            // SAFETY: test counters outlive all uses of the returned stamp.
+            upload_counter: unsafe {
+                RetirementCounter::from_address(core::ptr::from_ref(upload) as u64)
+            },
         }
     }
 
@@ -92,24 +102,13 @@ impl SubmitStamp {
 
     /// The newest sequence the render command buffers have retired.
     fn draw_retired(&self) -> u64 {
-        load_counter(self.draw_counter)
+        self.draw_counter.load()
     }
 
     /// The newest sequence the upload command buffers have retired.
     fn upload_retired(&self) -> u64 {
-        load_counter(self.upload_counter)
+        self.upload_counter.load()
     }
-}
-
-/// Read a PE-side retirement counter; 0 for an absent one.
-fn load_counter(address: u64) -> u64 {
-    if address == 0 {
-        return 0;
-    }
-    // SAFETY: SubmitFrame carries stable PE `AtomicU64` addresses that stay
-    // live through the call, and every stamp lives only inside that call.
-    let counter = unsafe { &*(address as *const AtomicU64) };
-    counter.load(Ordering::Acquire)
 }
 
 /// The newest submission whose command buffers use a resource, per retirement counter.

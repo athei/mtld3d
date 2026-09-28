@@ -17,7 +17,7 @@ use mtld3d_core::{
     build_index::BuildIndex,
     config::Mtld3dConfig,
     convert::{FAN_PATTERN_MAX_TRIANGLES, fan_pattern_bytes, fill_fan_pattern_u16},
-    depth_stencil_state::{DepthStencilSnapshot, key_from_snapshot, params_from_snapshot},
+    depth_stencil_state::{DepthStencilSnapshot, description_from_snapshot, key_from_snapshot},
     dxso::{DxsoProgram, FfPsKey, FfVsKey, VariantKey, VsSamplerKinds, declared_ps_samplers},
     encoder_packet::NativeVbibRetention,
     ff_state::{FF_VS_PALETTE_BASE_ROW, MAX_VERTEX_BLEND_MATRIX_INDEX},
@@ -33,7 +33,7 @@ use mtld3d_core::{
     },
     perf::{
         CacheSizes, EncoderPerfState, FrameSummaryContext, OpSub, OpSubDetail, PairShaderId,
-        PairStatsSample, TaskFaults,
+        PairStatsSample,
         compilation::{Identity as CompileIdentity, Kind as CompileKind},
         perf_enabled,
     },
@@ -54,26 +54,24 @@ use mtld3d_core::{
 };
 use mtld3d_shared::{
     BlitCommand, BlitCommandType, BufferCreateDesc, Command, CommandType, CopyBufferToBufferInfo,
-    CopyBufferToTextureInfo, CreateTextureSliceViewParams, DestroyResourcesBulkParams,
-    EnsureBlitPipelineParams, EnsureClearQuadPipelineParams, ExtraColorDesc, GetTaskFaultsParams,
-    MetalHandle, PassDescriptor, SetPresentWaitPolicyParams, SubmitFrameParams, TextureCreateDesc,
-    WaitForGpuRetireParams, WaitForPresentIdleParams,
+    CopyBufferToTextureInfo, ExtraColorDesc, MetalHandle, PassDescriptor, TextureCreateDesc,
     encoder_protocol::EncoderSubmitMode,
     mtl::{
         BufferKind, ClearQuadFlags, CullMode, DestroyKind, LoadAction, PRESENT_PIPELINE_DEPTH,
-        PixelFormat, PresentWaitPolicy, PrimitiveType, QuadPipelineKind, SnapshotFlags, StageTag,
-        StorageMode, StoreAction, Swizzle, TextureCreateFlags, TextureUsage, TriangleFillMode,
-        VisibilityResultMode,
+        PixelFormat, PresentWaitPolicy, PrimitiveType, StageTag, StorageMode, StoreAction, Swizzle,
+        TextureCreateFlags, TextureUsage, TriangleFillMode, VisibilityResultMode,
     },
     mtl_handle::{
         MTLBufferKind, MTLDepthStencilStateKind, MTLDeviceKind, MTLFunctionKind,
         MTLRenderPipelineStateKind, MTLSamplerStateKind, MTLTextureKind,
     },
-    perf::{NanosSetTimer, ShaderTimings, SubmitTimings},
+    perf::{NanosSetTimer, ShaderTimings},
     record_handle::DeviceRecordHandle,
     texture_views::TextureViews,
     tsc::rdtsc,
 };
+#[cfg(perf_tracking)]
+use mtld3d_shared::{mtl::SnapshotFlags, perf::SubmitTimings};
 use mtld3d_types::{D3DSAMP_MIPMAPLODBIAS, SAMPLER_STATE_COUNT};
 use objc2::{
     rc::{Retained, autoreleasepool},
@@ -89,9 +87,11 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use super::{
     LOG_TARGET,
     draw::{self, CurrentSnapshotPtr, PsKey, ScratchSlice, ShaderRef},
-    native_call,
 };
-use crate::metal::handle::IntoRetained;
+use crate::metal::{
+    handle::IntoRetained,
+    submission::{FrameSubmission, RetirementCounter, SubmissionOutcome, SubmitDescription},
+};
 
 /// Sub-target for the per-draw breadcrumb emitted by `FrameEncoder::maybe_emit_draw_trace`.
 ///
@@ -405,17 +405,15 @@ pub struct StageLibHandles {
 // Persists across frames on the encoder thread. `begin_frame()` resets
 // per-frame state (commands, scratch) while preserving caches.
 
-/// Owns every per-frame buffer the unix `SubmitFrame` thunk reads via raw pointer.
+/// Owns every per-frame buffer read by native submission.
 ///
-/// The pointers in `SubmitFrameParams` and in each `PassDescriptor` alias into
-/// `scratch`, `passes`, `descriptors`, `frame_blit_commands`, and
-/// `trailing_blits`, so the whole payload must stay alive and unmutated for the
-/// full duration of that thunk. It is detached from the encoder at submit
-/// (`finalize_submit`) by O(1) `Vec`/arena swaps — the heap behind each field
-/// never moves, so the raw pointers stay valid wherever the payload travels —
-/// and recycled afterwards (`reclaim_payload`) so steady-state frames allocate
+/// Pass descriptors borrow command and blit storage in this payload. The
+/// whole payload stays alive and unmutated until submission returns. It is
+/// detached by O(1) `Vec`/arena swaps in `finalize_submit`. The heap behind
+/// each field never moves, so command pointers stay valid during handoff. It
+/// is recycled afterwards (`reclaim_payload`) so steady-state frames allocate
 /// nothing here. In `Async` mode the payload crosses to the dedicated submit
-/// thread; in `Sync` mode the thunk runs inline on the encoder thread.
+/// thread; synchronous submission runs inline on the encoder thread.
 #[derive(Default)]
 struct FramePayload {
     /// Per-frame shader-constant / `DrawPrimitiveUP` scratch.
@@ -428,7 +426,7 @@ struct FramePayload {
     passes: Vec<Pass>,
     /// One descriptor per pass, plus optional upload-tail and trailing blit-only descriptors.
     ///
-    /// `SubmitFrameParams.passes_ptr` aliases this vec's backing.
+    /// Native submission borrows this vec as a slice at execution time.
     descriptors: Vec<PassDescriptor>,
     /// Frame-leading blits (texture uploads, GPU preserves, notifies).
     ///
@@ -440,7 +438,7 @@ struct FramePayload {
     trailing_blits: Vec<BlitCommand>,
 }
 
-/// How `submit` runs the `SubmitFrame` thunk for one frame.
+/// How `submit` runs the native submission for one frame.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SubmitMode {
     /// Hand the finalized payload to the dedicated submit thread and return immediately.
@@ -448,7 +446,7 @@ enum SubmitMode {
     /// Overlaps the unix command-walk + present with the next frame's
     /// build. The normal Present path.
     Async,
-    /// Run the `SubmitFrame` thunk inline on the encoder thread and block until it returns.
+    /// Run the native submission inline on the encoder thread and block until it returns.
     ///
     /// Used after a submit-thread barrier for the rare paths that need the
     /// command buffer committed before they proceed (mid-frame readback,
@@ -462,7 +460,7 @@ enum SubmitMode {
 /// handoff stays alloc-free, and the channel slot carries the struct inline.
 struct SubmitPacket {
     failure_ptr: u64,
-    params: SubmitFrameParams,
+    params: SubmitDescription,
     payload: FramePayload,
     /// Native snapshot storage and the immutable PE command lease.
     ///
@@ -471,7 +469,7 @@ struct SubmitPacket {
     frame: Box<NativeFrame>,
 }
 
-/// What one `SubmitFrame` thunk reported back.
+/// What one native submission reported back.
 ///
 /// PERF durations retain nanosecond units until native calibration completes.
 /// Disabled builds return only the submission status.
@@ -500,7 +498,7 @@ struct SubmitOutcome {
 
 /// A finished frame coming back from the submit thread.
 ///
-/// The payload (for recycling) plus what the thunk reported.
+/// The payload (for recycling) plus what submission reported.
 struct ReturnedPayload {
     payload: FramePayload,
     outcome: SubmitOutcome,
@@ -520,6 +518,7 @@ struct ReturnedPayload {
 /// payload for recycling. Exits when the encoder drops the work channel at
 /// teardown (`recv` returns `Err`).
 fn submit_thread_main(
+    record: Option<&Arc<crate::metal::DeviceRecord>>,
     work_rx: &mpsc::Receiver<SubmitPacket>,
     return_tx: &mpsc::Sender<ReturnedPayload>,
 ) {
@@ -535,7 +534,7 @@ fn submit_thread_main(
         let mut submit_exec_tsc: u64 = 0;
         let (payload, outcome) = {
             let _exec = mtld3d_core::perf::CycleSetTimer::start(&raw mut submit_exec_tsc);
-            execute_submit(params, payload, failure_ptr)
+            execute_submit(record, &params, payload, failure_ptr)
         };
         // The final CPU reader has finished with both retained command regions and
         // native snapshot storage. GPU resource leases retire independently.
@@ -562,7 +561,7 @@ bitflags::bitflags! {
         /// Encoder-bound covers any CopyBuffer/Texture variant.
         /// `NotifyBufferDidModifyRange` does NOT flip it because the unix
         /// dispatcher calls that one outside any encoder. Read at submit to
-        /// fill `SubmitFrameParams.blit_commands_need_encoder`, so the unix
+        /// fill `SubmitDescription.blit_commands_need_encoder`, so the unix
         /// side can skip `MTLBlitCommandEncoder` creation on pure-notify
         /// frames. Reset in `begin_frame` alongside the Vec clear.
         const BLIT_CMDS_NEED_ENCODER = 1 << 0;
@@ -579,9 +578,9 @@ bitflags::bitflags! {
         /// A Metal GPU capture is open: every frame runs `SubmitMode::Sync`.
         ///
         /// Set on `FrameDataFlags::GPU_CAPTURE_START`, cleared after the frame
-        /// carrying `GPU_CAPTURE_STOP`, so the `SubmitFrame` thunks of the
+        /// carrying `GPU_CAPTURE_STOP`, so the native submissions of the
         /// whole run execute inline on the encoder thread between the
-        /// `StartGpuCapture` and `StopGpuCapture` thunks.
+        /// native capture start and stop calls.
         const GPU_CAPTURING = 1 << 3;
         /// `shader.asyncCompile` is on and a compile worker started.
         ///
@@ -690,7 +689,7 @@ pub struct FrameEncoder {
     /// Texture uploads, GPU-side preserves, non-UMA `didModifyRange:`
     /// notifies. Replayed inside a single `MTLBlitCommandEncoder` before
     /// any render pass. Stable backing for
-    /// `SubmitFrameParams.blit_commands_ptr`.
+    /// the frame-leading blit slice.
     frame_blit_commands: Vec<BlitCommand>,
     /// Assorted encoder booleans (`BLIT_CMDS_NEED_ENCODER` / `CACHE_READY` / `CACHE_DISABLED`).
     ///
@@ -853,6 +852,8 @@ pub struct FrameEncoder {
     record_handle: DeviceRecordHandle,
     /// Keeps the frame queue alive for creation-time clears through encoder cleanup.
     record: Option<Arc<crate::metal::DeviceRecord>>,
+    /// New color targets cleared together before this frame reaches the GPU.
+    texture_clears: crate::metal::TextureClearBatch,
     depth_stencil_cache: FxHashMap<DepthStencilKey, MetalHandle<MTLDepthStencilStateKind>>,
     /// Every render pipeline build by key, failures included.
     ///
@@ -1158,9 +1159,7 @@ fn apply_const_range_into(
 /// Cache key for the per-format-combo clear-quad pipeline.
 ///
 /// Used by `emit_clear_quad_depth_stencil_inner` / `emit_clear_quad_color_inner`.
-/// Mirrors `EnsureClearQuadPipelineParams` (modulo `device_handle`) so the
-/// PE-side cache and the unix-side cache agree on what counts as a
-/// distinct pipeline.
+/// Includes every format and flag used by the native pipeline cache.
 #[derive(Hash, PartialEq, Eq, Clone, Copy)]
 struct ClearQuadKey {
     depth_format: PixelFormat,
@@ -1421,8 +1420,12 @@ impl FrameEncoder {
         // never blocks handing payloads back.
         let (submit_work_tx, submit_work_rx) = mpsc::sync_channel::<SubmitPacket>(1);
         let (submit_return_tx, submit_return_rx) = mpsc::channel::<ReturnedPayload>();
-        let submit_thread =
-            submit.spawn(move || submit_thread_main(&submit_work_rx, &submit_return_tx))?;
+        // SAFETY: the context retains the record through encoder initialization.
+        let record = unsafe { crate::metal::DeviceRecord::borrow(context.record_handle) };
+        let submit_record = record.clone();
+        let submit_thread = submit.spawn(move || {
+            submit_thread_main(submit_record.as_ref(), &submit_work_rx, &submit_return_tx);
+        })?;
         let compile_queue = Arc::new(compile::CompileQueue::new());
         let (compile_results_tx, compile_results) = mpsc::channel();
         let compile_threads = compile::spawn_workers(&compile_queue, &compile_results_tx);
@@ -1498,7 +1501,8 @@ impl FrameEncoder {
             record_handle: context.record_handle,
             // SAFETY: native destruction joins this worker before consuming the
             // device record supplied at startup. A failed creation may be null.
-            record: unsafe { crate::metal::DeviceRecord::borrow(context.record_handle) },
+            record,
+            texture_clears: crate::metal::TextureClearBatch::new(),
             depth_stencil_cache: FxHashMap::default(),
             pipeline_cache: BuildIndex::default(),
             clear_quad_pipeline_cache: FxHashMap::default(),
@@ -1568,14 +1572,14 @@ impl FrameEncoder {
     /// Initialization and each encoder work item supply a bounded autorelease pool.
     /// Each successful slot owns one retain per distinct handle; failed slots are empty.
     fn batch_create_textures(
-        &self,
+        &mut self,
         descs: &[TextureCreateDesc],
         views_out: &mut [TextureViews],
     ) -> i32 {
         if descs.is_empty() {
             return 0;
         }
-        let Some(record) = &self.record else {
+        let Some(_) = &self.record else {
             mtld3d_shared::log_once_warn!(
                 target: LOG_TARGET,
                 "CreateTexturesBatch: no device record for handle {:#x}; the call is dropped",
@@ -1583,10 +1587,22 @@ impl FrameEncoder {
             );
             return 0xC000_0001_u32.cast_signed();
         };
-        if crate::metal::create_textures(&self.device, record.queue(), descs, views_out) {
+        if crate::metal::create_textures(&self.device, descs, views_out, &mut self.texture_clears) {
             return 0;
         }
         0xC000_0001_u32.cast_signed()
+    }
+
+    /// Commit initialization clears before frame submission or replay failure cleanup.
+    fn commit_texture_clears(&mut self) {
+        let queue = self
+            .record
+            .as_ref()
+            .map_or(MetalHandle::NULL, |record| record.queue());
+        drop(
+            self.texture_clears
+                .commit(queue, crate::metal::TRANSPARENT_BLACK),
+        );
     }
 
     /// Create buffers directly on the encoder's retained Metal device.
@@ -2208,20 +2224,12 @@ impl FrameEncoder {
     fn log_perf_summary(&mut self, payload: &FramePayload, ctx: &FrameSummaryContext, status: i32) {
         let caches = self.cache_sizes(payload);
         let cmd_vec_realloc_bytes = self.pass_state.take_cmd_vec_realloc_bytes();
-        // One getrusage unix_call per 2 s window, only when the summary is
+        // One getrusage call per 2 s window, only when the summary is
         // both enabled and about to emit; every other frame passes None.
         let task_faults = (perf_enabled() && self.perf.window_due()).then(|| {
             #[cfg(perf_tracking)]
             self.pagebox_pool.log_diagnostics();
-            let mut p = GetTaskFaultsParams {
-                minor_faults: 0,
-                major_faults: 0,
-            };
-            let _ = native_call(&mut p);
-            TaskFaults {
-                minor: p.minor_faults,
-                major: p.major_faults,
-            }
+            crate::handlers::task_faults()
         });
         self.perf.log_frame_summary(
             &caches,
@@ -2305,7 +2313,7 @@ impl FrameEncoder {
 
     /// Fold one returned frame back in.
     ///
-    /// Decrement the in-flight count, latch what the thunk reported for the
+    /// Decrement the in-flight count, latch what submission reported for the
     /// next `Async` summary, log on failure, and recycle the payload's
     /// buffers.
     fn reclaim_returned(&mut self, returned: ReturnedPayload) {
@@ -2321,7 +2329,7 @@ impl FrameEncoder {
         reclaim_payload(self, returned.payload);
     }
 
-    /// Latch a thunk's status and fold its timings into the perf counters.
+    /// Latch submission status and fold its timings into the perf counters.
     ///
     /// Submit durations remain nanoseconds until native calibration is ready.
     #[cfg(perf_tracking)]
@@ -2396,12 +2404,9 @@ impl FrameEncoder {
         if self.record_handle.is_null() {
             return;
         }
-        let mut params = SetPresentWaitPolicyParams {
-            record_handle: self.record_handle,
-            policy,
-            pad0: 0,
-        };
-        let _ = native_call(&mut params);
+        if let Some(record) = self.record.as_ref() {
+            crate::metal::set_wait_policy(record.present(), policy);
+        }
     }
 
     /// Wait until every present queued so far has committed and the last one retired.
@@ -2426,15 +2431,10 @@ impl FrameEncoder {
             }
             return;
         }
-        let mut params = WaitForPresentIdleParams {
-            record_handle: self.record_handle,
-        };
-        let status = native_call(&mut params);
-        if status != 0 {
-            error!(
-                target: LOG_TARGET,
-                "encoder: WaitForPresentIdle failed status={status:#x}; a queued present may still be reading the surfaces this drain guards"
-            );
+        if let Some(record) = self.record.as_ref() {
+            crate::metal::wait_for_present_idle(record);
+        } else {
+            error!(target: LOG_TARGET, "encoder: WaitForPresentIdle failed, no device record; a queued present may still be reading the surfaces this drain guards");
         }
     }
 
@@ -4075,27 +4075,22 @@ impl FrameEncoder {
         if let Some(&handle) = self.clear_quad_pipeline_cache.get(&key) {
             return handle.raw();
         }
-        let mut params = EnsureClearQuadPipelineParams {
-            device_handle: self.device_handle,
-            depth_format: key.depth_format,
-            color_format: key.color_format,
-            flags: key.flags,
-            extra_present_mask: u32::from(key.extra.present_mask),
-            extra_formats: key.extra.formats,
-            sample_count: u32::from(key.sample_count),
-            pipeline_handle: MetalHandle::NULL,
-        };
-        let status = native_call(&mut params);
-        let pipeline = params.pipeline_handle;
-        if status != 0 || pipeline.is_null() {
+        let Some(pipeline) = crate::metal::ensure_clear_quad_pipeline(
+            &self.device,
+            key.depth_format,
+            key.color_format,
+            key.flags,
+            &key.extra,
+            u32::from(key.sample_count),
+        ) else {
             mtld3d_shared::log_once_warn!(
                 target: LOG_TARGET,
-                "clear-quad: EnsureClearQuadPipeline failed status={status:#x} → fallback to pass-break Clear (WoW tile-atlas shadows will regress)"
+                "clear-quad: EnsureClearQuadPipeline failed → fallback to pass-break Clear (WoW tile-atlas shadows will regress)"
             );
             self.clear_quad_pipeline_cache
                 .insert(key, MetalHandle::NULL);
             return 0;
-        }
+        };
         self.clear_quad_pipeline_cache.insert(key, pipeline);
         if key.flags.contains(ClearQuadFlags::COLOR_FORMAT_NO_WRITE) {
             // This depth clear-quad declares the pass's color format (write
@@ -4143,23 +4138,16 @@ impl FrameEncoder {
         if let Some(&handle) = self.blit_pipeline_cache.get(&key) {
             return handle.raw();
         }
-        let mut params = EnsureBlitPipelineParams {
-            device_handle: self.device_handle,
-            color_format,
-            quad_kind: QuadPipelineKind::StretchBlit,
-            sample_count: u32::from(sample_count),
-            pipeline_handle: MetalHandle::NULL,
-        };
-        let status = native_call(&mut params);
-        let pipeline = params.pipeline_handle;
-        if status != 0 || pipeline.is_null() {
+        let Some(pipeline) =
+            crate::metal::ensure_blit_pipeline(&self.device, color_format, u32::from(sample_count))
+        else {
             mtld3d_shared::log_once_warn!(
                 target: LOG_TARGET,
-                "blit-quad: EnsureBlitPipeline failed status={status:#x} → scaling StretchRect dropped"
+                "blit-quad: EnsureBlitPipeline failed → scaling StretchRect dropped"
             );
             self.blit_pipeline_cache.insert(key, MetalHandle::NULL);
             return 0;
-        }
+        };
         self.blit_pipeline_cache.insert(key, pipeline);
         pipeline.raw()
     }
@@ -4173,26 +4161,16 @@ impl FrameEncoder {
         if let Some(&handle) = self.upload_pipeline_cache.get(&color_format) {
             return handle.raw();
         }
-        let mut params = EnsureBlitPipelineParams {
-            device_handle: self.device_handle,
-            color_format,
-            quad_kind: QuadPipelineKind::TextureUpload,
-            // A D3D9 texture cannot be multisampled, so the upload pass is
-            // always single-sampled.
-            sample_count: 1,
-            pipeline_handle: MetalHandle::NULL,
-        };
-        let status = native_call(&mut params);
-        let pipeline = params.pipeline_handle;
-        if status != 0 || pipeline.is_null() {
+        let Some(pipeline) = crate::metal::ensure_upload_pipeline(&self.device, color_format)
+        else {
             mtld3d_shared::log_once_warn!(
                 target: LOG_TARGET,
-                "upload-quad: EnsureBlitPipeline failed status={status:#x} → texture upload pass dropped"
+                "upload-quad: EnsureBlitPipeline failed → texture upload pass dropped"
             );
             self.upload_pipeline_cache
                 .insert(color_format, MetalHandle::NULL);
             return 0;
-        }
+        };
         self.upload_pipeline_cache.insert(color_format, pipeline);
         pipeline.raw()
     }
@@ -4235,24 +4213,16 @@ impl FrameEncoder {
     /// that binds it and is destroyed once the GPU has retired that frame.
     /// Returns 0 when the unix side cannot create it, which drops the blit.
     fn slice_view_for_frame(&mut self, handle: u64, slice: u32) -> u64 {
-        let mut params = CreateTextureSliceViewParams {
-            // SAFETY: `handle` is a live Metal texture address resolved by the
-            // caller from the texture cache, non-zero per its own guard.
-            texture_handle: unsafe { MetalHandle::<MTLTextureKind>::new(handle) },
-            view_handle: MetalHandle::NULL,
-            slice,
-            pad0: 0,
-        };
-        let status = native_call(&mut params);
-        let view = params.view_handle;
-        if status != 0 || view.is_null() {
+        // SAFETY: this nonzero texture is retained in the encoder cache through this call.
+        let texture = unsafe { MetalHandle::<MTLTextureKind>::new(handle) };
+        let Some(view) = crate::metal::create_texture_slice_view(texture, slice) else {
             mtld3d_shared::log_once_warn!(
                 target: LOG_TARGET,
-                "blit-quad: CreateTextureSliceView failed status={status:#x}, a scaling \
+                "blit-quad: CreateTextureSliceView failed, a scaling \
                  StretchRect out of a cube face is dropped"
             );
             return 0;
-        }
+        };
         self.pending_resource_retention
             .push_back(PendingResourceRetention {
                 kind: DestroyKind::Texture,
@@ -5184,16 +5154,15 @@ impl FrameEncoder {
         } else {
             core::ptr::null_mut()
         });
-        let mut params = params_from_snapshot(snapshot, key, self.device_handle);
-        let status = native_call(&mut params);
-        let state = params.state_handle;
+        let description = description_from_snapshot(snapshot, key);
+        let state = crate::metal::create_depth_stencil_state(&self.device, &description);
         drop(timer);
         if draw_phase {
             let device = self.device_handle.raw();
             self.perf.compilation_mut().record(
                 CompileKind::Depth,
                 ns,
-                status == 0 && !state.is_null(),
+                state.is_some(),
                 self.current_submit_seq,
                 || CompileIdentity::Depth {
                     device,
@@ -5201,10 +5170,10 @@ impl FrameEncoder {
                 },
             );
         }
-        if status != 0 || state.is_null() {
+        let Some(state) = state else {
             error!(target: LOG_TARGET, "encoder: CreateDepthStencilState failed");
             return 0;
-        }
+        };
         self.depth_stencil_cache.insert(key, state);
         state.raw()
     }
@@ -6047,7 +6016,7 @@ impl FrameEncoder {
     /// Settle the `Staged` VB/IB half of the upload recovery.
     ///
     /// Frees a released entry the way `drain_retired_resource_retention`
-    /// does (wrapper destroyed in one bulk thunk, then the backing offered
+    /// does (wrapper destroyed in one bulk destroy call, then the backing offered
     /// to the page-box pool), and subtracts its bytes from the shared
     /// retention total exactly once, so a replayed entry (whose bytes stay
     /// live) is never double-counted in either direction.
@@ -6093,7 +6062,7 @@ impl FrameEncoder {
     /// Free the transient wrapper + PE-heap backing of settled `Staged` VB/IB uploads.
     ///
     /// Destroy order mirrors `drain_retired_resource_retention`: every
-    /// `MTLBuffer` wrapper goes in one bulk thunk, and only then do the
+    /// `MTLBuffer` wrapper goes in one bulk destroy call, and only then do the
     /// backings drop, because Metal holds a `bytesNoCopy` pointer into them
     /// until the wrapper is released. The bytes leave the shared retention
     /// total here, exactly once per entry.
@@ -6250,7 +6219,7 @@ impl FrameEncoder {
     /// Drain resource-retention entries whose seq has retired on the GPU.
     ///
     /// Partitions popped entries by `DestroyKind`, destroys each kind's
-    /// handles in one bulk thunk, then drops any `PageBox` backings. Drop
+    /// handles in one bulk destroy call, then drops any `PageBox` backings. Drop
     /// order matters: the wrapper destroy fires before the `PageBox` drops
     /// so Metal releases its `bytesNoCopy` pointer before the backing pages
     /// return to the allocator. Safe to call with a 0 `coherent_seq_ptr`
@@ -6315,7 +6284,7 @@ impl FrameEncoder {
         destroy_resources_bulk(DestroyKind::Buffer, &buffers);
         destroy_resources_bulk(DestroyKind::Texture, &textures);
         // PageBoxes inside `drained` are released here, after every
-        // wrapper destroy thunk has returned. VB/IB boxes are offered to
+        // wrapper destroy call has returned. VB/IB boxes are offered to
         // the recycle pool first so the next same-size Lock-rename gets
         // warm, still-committed pages; texture padded-staging boxes and
         // pool rejects (disabled, oversize, cap reached) drop to the
@@ -7757,13 +7726,11 @@ impl FrameEncoder {
             }
             return handle.raw();
         }
-        let mut params = sampler_state::params_from_snapshot(&snapshot, key, self.device_handle);
-        let status = native_call(&mut params);
-        let sampler = params.sampler_handle;
-        if status != 0 || sampler.is_null() {
+        let description = sampler_state::description_from_snapshot(&snapshot, key);
+        let Some(sampler) = crate::metal::create_sampler_state(&self.device, &description) else {
             error!(target: LOG_TARGET, "encoder: CreateSamplerState failed");
             return 0;
-        }
+        };
         self.sampler_cache.insert(key, sampler);
         if !force_point {
             self.memoize_sampler_resolve(stage, sampler_state, is_compare, sampler.raw());
@@ -8068,19 +8035,20 @@ impl FrameEncoder {
         if self.coherent_seq_ptr == 0 || target_seq == 0 {
             return;
         }
-        let mut params = WaitForGpuRetireParams {
-            record_handle: self.record_handle,
-            target_seq,
-            coherent_seq_ptr: self.coherent_seq_ptr,
-            upload_coherent_seq_ptr: self.upload_coherent_seq_ptr,
-            failed_submit_seq_ptr: self.failed_seq_ptr,
-        };
-        let status = native_call(&mut params);
-        if status != 0 {
-            error!(
-                target: LOG_TARGET,
-                "encoder: WaitForGpuRetire(target_seq={target_seq}) failed status={status:#x}; the work it waited for may not have retired"
+        self.wait_for_retirement(target_seq, self.upload_coherent_seq_ptr);
+    }
+
+    fn wait_for_retirement(&self, target_seq: u64, upload_coherent_seq_ptr: u64) {
+        if let Some(record) = self.record.as_ref() {
+            crate::metal::wait_for_gpu_retire(
+                record.pending(),
+                target_seq,
+                self.coherent_seq_ptr,
+                upload_coherent_seq_ptr,
+                self.failed_seq_ptr,
             );
+        } else {
+            error!(target: LOG_TARGET, "encoder: WaitForGpuRetire(target_seq={target_seq}) failed, no device record; the work it waited for may not have retired");
         }
     }
 
@@ -8292,7 +8260,7 @@ impl EncoderThread {
 
     /// Drive the encoder thread to finalize visibility queries up to `target_seq`.
     ///
-    /// The encoder waits (via the `WaitForGpuRetire` thunk → Metal
+    /// The encoder waits (via the native GPU retirement wait via Metal
     /// `waitUntilCompleted`) only when `coherent_seq < target_seq`;
     /// otherwise it just runs `intake_visibility` and returns. Used by
     /// `IDirect3DQuery9::GetData(D3DGETDATA_FLUSH)`. `target_seq == 0`
@@ -8371,7 +8339,7 @@ enum EncoderMessage {
     ///
     /// Used by `Query9::GetData(D3DGETDATA_FLUSH)` to drain queries the
     /// app is polling as a GPU fence between frames. The encoder blocks
-    /// (via `WaitForGpuRetire` thunk → Metal `waitUntilCompleted`) only
+    /// (via native GPU retirement wait via Metal `waitUntilCompleted`) only
     /// when `coherent_seq < target_seq` — otherwise it just runs intake
     /// locally. `target_seq == 0` means the END closure has not been
     /// processed yet (game called `Issue(END)` but not Present); skip the
@@ -8432,24 +8400,9 @@ pub fn compile_stage_library(
     Some(StageLibHandles { library, func })
 }
 
-/// Issue a single bulk-destroy thunk.
-///
-/// Caller hands us a slice of MTL handles of one `DestroyKind`; the
-/// slice's backing must outlive this call (stack array, `Vec`, or
-/// `Box<[u64]>` — anything stable). Empty slices short-circuit before
-/// touching the FFI boundary.
+/// Destroy the retained native handles of one resource kind.
 fn destroy_resources_bulk(kind: DestroyKind, handles: &[u64]) {
-    if handles.is_empty() {
-        return;
-    }
-    let mut params = DestroyResourcesBulkParams {
-        kind,
-        pad0: 0,
-        handles_ptr: handles.as_ptr() as u64,
-        count: u32::try_from(handles.len()).expect("bulk-destroy count fits u32"),
-        pad1: 0,
-    };
-    native_call(&mut params);
+    crate::handlers::destroy_resources_bulk(kind, handles);
 }
 
 // ── Encoder thread main loop ──
@@ -8605,23 +8558,9 @@ fn encoder_thread_main(
                         let coh = unsafe { SharedCounter::new(enc.coherent_seq_ptr) }
                             .load(Ordering::Acquire);
                         if coh < target_seq {
-                            let mut params = WaitForGpuRetireParams {
-                                record_handle: enc.record_handle,
-                                target_seq,
-                                coherent_seq_ptr: enc.coherent_seq_ptr,
-                                // Query results are written by the draw buffer
-                                // alone, and nothing is destroyed on this wait.
-                                upload_coherent_seq_ptr: 0,
-                                failed_submit_seq_ptr: enc.failed_seq_ptr,
-                            };
                             mtld3d_shared::crumb!("vis:retirebeg", target_seq, coh);
-                            let status = native_call(&mut params);
-                            if status != 0 {
-                                error!(
-                                    target: LOG_TARGET,
-                                    "encoder: WaitForGpuRetire(target_seq={target_seq}) failed status={status:#x}; the visibility counts read next may miss the queries of that frame"
-                                );
-                            }
+                            // Queries are written by the draw buffer alone; this wait destroys nothing.
+                            enc.wait_for_retirement(target_seq, 0);
                             mtld3d_shared::crumb!("vis:retireend", target_seq);
                         }
                     }
@@ -8682,13 +8621,13 @@ fn encoder_thread_main(
 
 /// Run one frame inside the F12 GPU-capture bracket when it carries the marks.
 ///
-/// The capture must wrap the actual `SubmitFrame` thunk, which `Async`
+/// The capture must wrap the actual native submission, which `Async`
 /// runs on the submit thread, and the present buffer the presenter commits
 /// for the frame afterwards. On `GPU_CAPTURE_START` the submit thread is
 /// drained and presentation waited idle so prior frames and their presents
 /// are committed, the capture starts, and every frame until
 /// `GPU_CAPTURE_STOP` runs `Sync` so its inline execute on this thread sits
-/// between the two capture thunks; the stop waits for presentation again so
+/// between capture start and stop; the stop waits for presentation again so
 /// the last frame's present is in the trace. A mid-frame flush of a marked
 /// frame arrives through the `MidFrameSubmit*` arms, which is why all three
 /// frame arms go through here.
@@ -8705,10 +8644,7 @@ fn run_frame_bracketed(
     if marks.contains(FrameDataFlags::GPU_CAPTURE_START) {
         enc.drain_submit_thread();
         enc.drain_presentation();
-        let mut p = mtld3d_shared::StartGpuCaptureParams {
-            device_handle: enc.device_handle,
-        };
-        let _ = native_call(&mut p);
+        crate::metal::start_capture(enc.device_handle);
         enc.flags.insert(FrameEncoderFlags::GPU_CAPTURING);
     }
     let mode = if enc.flags.contains(FrameEncoderFlags::GPU_CAPTURING) {
@@ -8719,8 +8655,7 @@ fn run_frame_bracketed(
     let result = run_frame(enc, packet, fc, decode_cycles, queries, admitted, mode);
     if marks.contains(FrameDataFlags::GPU_CAPTURE_STOP) {
         enc.drain_presentation();
-        let mut p = mtld3d_shared::StopGpuCaptureParams { pad0: 0 };
-        let _ = native_call(&mut p);
+        crate::metal::stop_capture();
         enc.flags.remove(FrameEncoderFlags::GPU_CAPTURING);
     }
     result
@@ -8852,8 +8787,12 @@ fn run_frame(
             let result = unsafe { packet.replay_one(consume) };
             match result {
                 Ok(true) => {}
-                Ok(false) => break,
+                Ok(false) => {
+                    enc.commit_texture_clears();
+                    break;
+                }
                 Err(error) => {
+                    enc.commit_texture_clears();
                     enc.failed_replay = Some(Box::new(packet));
                     return Err(error);
                 }
@@ -8957,7 +8896,12 @@ fn submit_sync(enc: &mut FrameEncoder, frame: Box<NativeFrame>) {
         let mut submit_exec_tsc: u64 = 0;
         let (payload, outcome) = {
             let _exec = mtld3d_core::perf::CycleSetTimer::start(&raw mut submit_exec_tsc);
-            execute_submit(params, payload, enc.runtime_failure_ptr)
+            execute_submit(
+                enc.record.as_ref(),
+                &params,
+                payload,
+                enc.runtime_failure_ptr,
+            )
         };
         enc.fold_submit_outcome(&outcome, submit_exec_tsc);
         (payload, outcome.status)
@@ -8983,12 +8927,12 @@ fn submit_sync(enc: &mut FrameEncoder, frame: Box<NativeFrame>) {
 ///
 /// Close passes, run the load/store rules, build the `PassDescriptor`s,
 /// and detach the frame's read payload from the encoder. Returns the
-/// `params` (with raw pointers aliasing into the payload) plus the owned
-/// [`FramePayload`] that backs them.
+/// native description plus the owned [`FramePayload`]. Borrowed submission
+/// slices are constructed only when this payload is executed.
 fn finalize_submit(
     enc: &mut FrameEncoder,
     owner: &NativeFrame,
-) -> (SubmitFrameParams, FramePayload) {
+) -> (SubmitDescription, FramePayload) {
     let frame = owner.view();
     // If the game called `Clear()` without any subsequent draw this frame
     // (or after the last draw), the pending clear still needs to
@@ -9075,7 +9019,7 @@ fn finalize_submit(
     // install a clean set, so the next frame can start building while this
     // one is submitted. Every move here is an O(1) `Vec`/arena header swap;
     // the heap behind `scratch` / `frame_blit_commands` is untouched, so
-    // the raw pointers built into `params` below stay valid.
+    // the raw pointers built into pass descriptors below stay valid.
     // Binding tokens can alias either arena carried by this submission. Forget
     // them before either arena leaves the encoder's ownership.
     enc.reset_bound_constants();
@@ -9089,49 +9033,34 @@ fn finalize_submit(
     payload.descriptors = descriptors;
     payload.trailing_blits = trailing_blits;
 
-    let params = SubmitFrameParams {
-        record_handle: enc.record_handle,
-        blit_commands_ptr: if has_upload_passes || payload.frame_blit_commands.is_empty() {
-            0
-        } else {
-            payload.frame_blit_commands.as_ptr() as u64
-        },
-        blit_command_count: if has_upload_passes {
-            0
-        } else {
-            u32::try_from(payload.frame_blit_commands.len()).expect("frame blit count fits u32")
-        },
-        blit_commands_need_encoder: u32::from(
-            enc.flags
-                .contains(FrameEncoderFlags::BLIT_CMDS_NEED_ENCODER),
-        ),
-        passes_ptr: payload.descriptors.as_ptr() as u64,
-        pass_count: u32::try_from(payload.descriptors.len()).expect("pass count fits u32"),
-        upload_pass_count: u32::try_from(upload_pass_count).expect("upload pass count fits u32"),
-        present_layer: if frame.flags().contains(FrameDataFlags::NO_PRESENT) {
+    let params = SubmitDescription {
+        blit_commands_need_encoder: enc
+            .flags
+            .contains(FrameEncoderFlags::BLIT_CMDS_NEED_ENCODER),
+        upload_pass_count,
+        present_layer: if no_present {
             MetalHandle::NULL
         } else {
             frame.layer_handle()
         },
-        present_texture: if frame.flags().contains(FrameDataFlags::NO_PRESENT) {
+        present_texture: if no_present {
             MetalHandle::NULL
         } else {
             frame.backbuffer_handle()
         },
-        submit_seq: frame.header().submit_seq,
-        coherent_seq_ptr: enc.coherent_seq_ptr,
-        upload_coherent_seq_ptr: enc.upload_coherent_seq_ptr,
-        failed_submit_seq_ptr: enc.failed_seq_ptr,
-        drawable_wait_ns: 0,
-        present_view: if frame.flags().contains(FrameDataFlags::NO_PRESENT) {
+        present_view: if no_present {
             MetalHandle::NULL
         } else {
             frame.view_handle()
         },
-        present_wait_ns: 0,
-        snapshot_flags: SnapshotFlags::empty(),
-        pad0: 0,
-        timings: SubmitTimings::new(),
+        submit_seq: frame.header().submit_seq,
+        // SAFETY: the device retains these atomics through encoder/submit joins,
+        // committed GPU work, its completion callbacks and failed-submit cleanup.
+        draw_retirement: unsafe { RetirementCounter::from_address(enc.coherent_seq_ptr) },
+        // SAFETY: the same device lifecycle drains every upload callback first.
+        upload_retirement: unsafe { RetirementCounter::from_address(enc.upload_coherent_seq_ptr) },
+        // SAFETY: failure publication completes before the device frees its sink.
+        failed_submission: unsafe { RetirementCounter::from_address(enc.failed_seq_ptr) },
     };
 
     // Retention bookkeeping is keyed by `submit_seq` and only needs the
@@ -9147,18 +9076,39 @@ fn finalize_submit(
 
 /// Submit one finalized frame through the native backend.
 ///
-/// `params` carries raw pointers aliasing into `payload`; both are taken
-/// by value so the payload stays alive for the whole submission, then handed
-/// back for recycling along with what the backend reported through `params`.
+/// The description and payload move together. Submission borrows their
+/// slices only during this call, then returns the payload for recycling and
+/// the separate native outcome.
 /// This is the only part of submit that runs on the dedicated submit thread
 /// in `Async` mode.
 fn execute_submit(
-    mut params: SubmitFrameParams,
+    record: Option<&Arc<crate::metal::DeviceRecord>>,
+    description: &SubmitDescription,
     payload: FramePayload,
     failure_ptr: u64,
 ) -> (FramePayload, SubmitOutcome) {
-    let status = autoreleasepool(|_| crate::handlers::submit_frame(&mut params));
-    if status != 0 {
+    let result = autoreleasepool(|_| {
+        let Some(record) = record else {
+            error!(target: LOG_TARGET, "SubmitFrame: missing device record");
+            return SubmissionOutcome::new();
+        };
+        let frame = FrameSubmission {
+            description,
+            blits: if description.upload_pass_count == 0 {
+                &payload.frame_blit_commands
+            } else {
+                &[]
+            },
+            passes: &payload.descriptors,
+        };
+        crate::metal::submit_frame(record, &frame)
+    });
+    let status = if result.success {
+        0
+    } else {
+        0xC000_0001_u32.cast_signed()
+    };
+    if !result.success {
         // SAFETY: the device retains its mailbox until the submit worker joins.
         unsafe {
             crate::encoder_service::publish_failure(failure_ptr);
@@ -9167,13 +9117,13 @@ fn execute_submit(
     let outcome = SubmitOutcome {
         status,
         #[cfg(perf_tracking)]
-        drawable_wait_ns: params.drawable_wait_ns,
+        drawable_wait_ns: result.drawable_wait_ns,
         #[cfg(perf_tracking)]
-        present_wait_ns: params.present_wait_ns,
+        present_wait_ns: result.present_wait_ns,
         #[cfg(perf_tracking)]
-        snapshot: params.snapshot_flags,
+        snapshot: result.snapshot_flags,
         #[cfg(perf_tracking)]
-        timings: params.timings,
+        timings: result.timings,
     };
     (payload, outcome)
 }
@@ -9497,7 +9447,7 @@ fn retire_visibility_buffer(enc: &mut FrameEncoder, submit_seq: u64) {
 ///
 /// Keyed by the frame's `submit_seq`. They're released when `coherent_seq`
 /// reaches `submit_seq` — checked next `begin_frame`. Called from
-/// `finalize_submit`, before the thunk is issued: the move into
+/// `finalize_submit`, before submission: the move into
 /// `pending_blit_retention` keeps the reads alive across the blit
 /// encode + commit path, whichever thread runs it.
 fn retire_blit_reads(enc: &mut FrameEncoder, submit_seq: u64) {

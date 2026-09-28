@@ -1,9 +1,10 @@
+use mtld3d_core::sampler_state::{SamplerDescription, SamplerFlags};
 use mtld3d_shared::{
-    CreateSamplerStateParams, MetalHandle,
+    MetalHandle,
     mtl::{AddressMode, BorderColor, MinMagFilter, MipFilter},
     mtl_handle::MTLSamplerStateKind,
 };
-use objc2::rc::Retained;
+use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_metal::{
     MTLCompareFunction, MTLDevice, MTLSamplerAddressMode, MTLSamplerBorderColor,
     MTLSamplerDescriptor, MTLSamplerMinMagFilter, MTLSamplerMipFilter,
@@ -11,7 +12,7 @@ use objc2_metal::{
 
 use crate::metal::{
     device::{supports_sampler_border, supports_sampler_mirror_clamp},
-    handle::{IntoRetained, ReleaseRetain},
+    handle::ReleaseRetain,
 };
 
 /// Sub-target for the depth-path diagnostic probe in `create_sampler_state`.
@@ -23,15 +24,14 @@ use crate::metal::{
 const DEPTH_TRACE_TARGET: &str = "mtld3d::unix::depth";
 
 pub fn create_sampler_state(
-    params: &CreateSamplerStateParams,
+    device: &ProtocolObject<dyn MTLDevice>,
+    params: &SamplerDescription,
 ) -> Option<MetalHandle<MTLSamplerStateKind>> {
-    let device = params.device_handle.into_retained()?;
-
     // A device without border-colour support (the paravirtualized CI
     // device) aborts sampler creation on one. Fall back to clamp-to-edge
     // there — the PE side stops advertising border addressing on such a
     // device, so only a title that ignores the cap sees the substitution.
-    let border_ok = supports_sampler_border(&device);
+    let border_ok = supports_sampler_border(device);
     let uses_border = matches!(params.address_u, AddressMode::ClampToBorderColor)
         || matches!(params.address_v, AddressMode::ClampToBorderColor)
         || matches!(params.address_w, AddressMode::ClampToBorderColor);
@@ -42,7 +42,7 @@ pub fn create_sampler_state(
     // substitution happens before the descriptor is built rather than after a
     // rejected creation, because a creation the device refuses is API misuse
     // the validation layer logs whether or not a retry then succeeds.
-    let mirror_clamp_ok = supports_sampler_mirror_clamp(&device);
+    let mirror_clamp_ok = supports_sampler_mirror_clamp(device);
     let address = |wire: AddressMode| {
         if !border_ok && matches!(wire, AddressMode::ClampToBorderColor) {
             mtld3d_shared::log_once_warn!(
@@ -76,7 +76,7 @@ pub fn create_sampler_state(
     }
     // D3DSAMP_MAXMIPLEVEL → setLodMinClamp. 0.0 is the default (no
     // clamp); any higher value pins the sampler to "at least mip N".
-    let lod_min = f32::from_bits(params.lod_min_clamp);
+    let lod_min = params.lod_min_clamp;
     if lod_min > 0.0 {
         desc.setLodMinClamp(lod_min);
     }
@@ -84,7 +84,7 @@ pub fn create_sampler_state(
     // own default is `FLT_MAX`, so the value is semantically a no-op
     // for any plausible mip chain; the explicit assignment just makes
     // the field's intent visible in the descriptor.
-    desc.setLodMaxClamp(f32::from_bits(params.lod_max_clamp));
+    desc.setLodMaxClamp(params.lod_max_clamp);
 
     // Shadow-comparison sampler variant. MSL `sample_compare(...)` against
     // a `depth2d<float>` evaluates "ref <= sampled_depth" with the
@@ -93,7 +93,7 @@ pub fn create_sampler_state(
     // occluder wrote). Without this, `sample_compare` returns 0 and the
     // PCF accumulator math in the terrain shader produces a
     // character-locked oval instead of an actual world-space shadow.
-    if params.is_compare != 0 {
+    if params.flags.contains(SamplerFlags::IS_COMPARE) {
         desc.setCompareFunction(MTLCompareFunction::LessEqual);
     }
 
@@ -104,15 +104,15 @@ pub fn create_sampler_state(
     // isn't enabled.
     mtld3d_shared::log_once_trace_by!(
         target: DEPTH_TRACE_TARGET,
-        key: (u64::from(params.is_compare) << 56) | params.id,
+        key: (u64::from(params.flags.contains(SamplerFlags::IS_COMPARE)) << 56) | params.id,
         "depth: create_sampler_state(id={:#x}) is_compare={} min={:?} mag={:?}",
         params.id,
-        params.is_compare,
+        u32::from(params.flags.contains(SamplerFlags::IS_COMPARE)),
         params.min_filter,
         params.mag_filter
     );
 
-    let label_kind = if params.is_compare != 0 {
+    let label_kind = if params.flags.contains(SamplerFlags::IS_COMPARE) {
         "sampcmp"
     } else {
         "samp"

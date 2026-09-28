@@ -489,13 +489,13 @@ pub enum BorderColor {
     OpaqueWhite = 2,
 }
 
-/// Shader stage selector for `CompileShaderLibraryParams::stage_tag`.
+/// Shader stage selector for the native shader compiler.
 ///
 /// Selects the MSL compile options for the stage: the Unix side compiles the
 /// vertex path with `MTLMathMode::Safe` (FP reassociation would defeat
 /// `[[position, invariant]]` across pipelines) and the fragment path with
 /// `MTLMathMode::Fast`. The entry-point name is carried separately in
-/// `CompileShaderLibraryParams::entry_ptr`.
+/// the native compiler entry name.
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, FromRepr)]
 pub enum StageTag {
@@ -946,7 +946,7 @@ pub enum PresentWaitPolicy {
 bitflags::bitflags! {
     /// What `SubmitFrame` did about a present still waiting for its drawable.
     ///
-    /// Out-flags on `SubmitFrameParams`. `TAKEN`: the submit copied the
+    /// Output flags on native `SubmissionOutcome`. `TAKEN`: the submit copied the
     /// pending present's frame into a slot. `SLOT_WAITED`: every slot was
     /// held by a present not yet committed, so the copy first waited for the
     /// oldest one, which is a wait on the display; the PE side counts both,

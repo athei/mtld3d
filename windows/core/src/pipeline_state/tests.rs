@@ -162,13 +162,10 @@ fn extra_target_blend_factors_clamp_on_their_own_alpha() {
     s.extra.has_alpha_mask = 0; // RT1 is alpha-less, RT0 keeps alpha
     let attrs: [VertexAttrDesc; 0] = [];
     let layouts = vertex_layouts_from_snapshot(&s);
-    // SAFETY: tests; opaque values never dereferenced.
-    let dev = unsafe { MetalHandle::new(0xDEAD) };
-    let p = params_from_snapshot(&PipelineBuildInputs {
+    let p = description_from_snapshot(&PipelineBuildInputs {
         snapshot: &s,
         vertex_attrs: &attrs,
         vertex_layouts: &layouts,
-        device_handle: dev,
     });
     assert_eq!(p.src_blend, BlendFactor::DestinationAlpha);
     assert_eq!(p.extra_present_mask, 0b001);
@@ -348,23 +345,21 @@ fn destination_alpha_clamps_on_no_alpha_rt() {
 
 #[test]
 fn params_match_key_on_default_snapshot() {
-    // Sanity: params_from_snapshot is not smuggling different
+    // Sanity: description_from_snapshot is not smuggling different
     // values than key_from_snapshot. Any downstream divergence on
     // these fields would be a silent bug.
     let s = base();
     let k = key_of(&s);
     let attrs: [VertexAttrDesc; 0] = [];
     let layouts = vertex_layouts_from_snapshot(&s);
-    // SAFETY: tests; opaque values never dereferenced.
-    let dev = unsafe { MetalHandle::new(0xDEAD) };
-    let p = params_from_snapshot(&PipelineBuildInputs {
+    let p = description_from_snapshot(&PipelineBuildInputs {
         snapshot: &s,
         vertex_attrs: &attrs,
         vertex_layouts: &layouts,
-        device_handle: dev,
     });
-    assert_eq!(p.device_handle, dev);
-    assert_eq!(p.vertex_layout_count, 1);
+    assert_eq!(p.vertex_layouts.len(), 1);
+    assert_eq!(p.vertex_layouts.as_ptr(), layouts.as_ptr());
+    assert_eq!(p.vertex_attrs.as_ptr(), attrs.as_ptr());
     assert_eq!(layouts[0].buffer_index, 0);
     assert_eq!(layouts[0].stride, 32);
     assert_eq!(layouts[0].step_function, VertexStepFunction::PerVertex);
@@ -377,13 +372,25 @@ fn params_match_key_on_default_snapshot() {
     assert_eq!(p.src_blend_alpha, k.src_blend_alpha);
     assert_eq!(p.dst_blend_alpha, k.dst_blend_alpha);
     assert_eq!(p.blend_op_alpha, k.blend_op_alpha);
-    assert_eq!(p.separate_alpha_blend_enable, k.separate_alpha_blend_enable);
+    assert_eq!(
+        u32::from(p.flags.contains(PipelineRsFlags::SEPARATE_ALPHA_BLEND)),
+        k.separate_alpha_blend_enable
+    );
     assert_eq!(p.color_write_mask, k.color_write_mask);
-    assert_eq!(p.has_depth, k.has_depth);
-    assert_eq!(p.has_stencil, k.has_stencil);
+    assert_eq!(
+        u32::from(p.attach.contains(PipelineAttachFlags::HAS_DEPTH)),
+        k.has_depth
+    );
+    assert_eq!(
+        u32::from(p.attach.contains(PipelineAttachFlags::HAS_STENCIL)),
+        k.has_stencil
+    );
     assert_eq!(p.color_format, k.color_format);
-    assert_eq!(p.has_color_output, k.has_color_output);
-    assert_eq!(p.extra_present_mask, u32::from(k.extra_present_mask));
+    assert_eq!(
+        u32::from(p.attach.contains(PipelineAttachFlags::HAS_COLOR_OUTPUT)),
+        k.has_color_output
+    );
+    assert_eq!(p.extra_present_mask, k.extra_present_mask);
     for i in 0..3 {
         assert_eq!(p.extra[i].format, k.extra_formats[i]);
         assert_eq!(p.extra[i].write_mask, k.extra_write_masks[i]);
@@ -421,13 +428,15 @@ fn alpha_to_coverage_keys_only_multisampled_pipelines_and_reaches_wire() {
         assert_ne!(key_of(&on), key_of(&off));
         for snapshot in [&off, &on] {
             let key = key_of(snapshot);
-            let params = params_from_snapshot(&PipelineBuildInputs {
+            let params = description_from_snapshot(&PipelineBuildInputs {
                 snapshot,
                 vertex_attrs: &[],
                 vertex_layouts: &[],
-                device_handle: MetalHandle::NULL,
             });
-            assert_eq!(params.alpha_to_coverage != 0, key.alpha_to_coverage);
+            assert_eq!(
+                params.flags.contains(PipelineRsFlags::ALPHA_TO_COVERAGE),
+                key.alpha_to_coverage
+            );
         }
         on.attach.remove(PipelineAttachFlags::HAS_COLOR_OUTPUT);
         assert!(
@@ -464,27 +473,26 @@ fn removing_the_colour_output_matches_a_pass_without_colour_attachments() {
     assert_eq!(snapshot.extra, ExtraColorAttachments::NONE);
 }
 
-/// Wire params of `s` with no vertex input, for comparing blend fields.
-fn params_of(s: &PipelineSnapshot) -> CreateRenderPipelineParams {
-    params_from_snapshot(&PipelineBuildInputs {
+/// Native description of `s` with no vertex input, for comparing blend fields.
+fn params_of(s: &PipelineSnapshot) -> PipelineDescription<'_> {
+    description_from_snapshot(&PipelineBuildInputs {
         snapshot: s,
         vertex_attrs: &[],
         vertex_layouts: &[],
-        device_handle: MetalHandle::NULL,
     })
 }
 
-/// The blend fields of the wire params, target 0 then targets 1..3.
-fn blend_fields(p: &CreateRenderPipelineParams) -> Vec<u32> {
+/// The blend fields of the native description, target 0 then targets 1..3.
+fn blend_fields(p: &PipelineDescription<'_>) -> Vec<u32> {
     let mut fields = vec![
-        p.blend_enable,
+        u32::from(p.flags.contains(PipelineRsFlags::BLEND_ENABLE)),
         p.src_blend as u32,
         p.dst_blend as u32,
         p.blend_op as u32,
         p.src_blend_alpha as u32,
         p.dst_blend_alpha as u32,
         p.blend_op_alpha as u32,
-        p.separate_alpha_blend_enable,
+        u32::from(p.flags.contains(PipelineRsFlags::SEPARATE_ALPHA_BLEND)),
     ];
     for extra in &p.extra {
         fields.extend([
@@ -518,14 +526,20 @@ fn blend_off_ignores_stale_factors_in_key_and_params() {
         blend_fields(&params_of(&stale))
     );
     let p = params_of(&stale);
-    assert_eq!(p.blend_enable, 0);
+    assert_eq!(
+        u32::from(p.flags.contains(PipelineRsFlags::BLEND_ENABLE)),
+        0
+    );
     assert_eq!(p.src_blend, BlendFactor::One);
     assert_eq!(p.dst_blend, BlendFactor::Zero);
     assert_eq!(p.blend_op, BlendOperation::Add);
     assert_eq!(p.src_blend_alpha, BlendFactor::One);
     assert_eq!(p.dst_blend_alpha, BlendFactor::Zero);
     assert_eq!(p.blend_op_alpha, BlendOperation::Add);
-    assert_eq!(p.separate_alpha_blend_enable, 0);
+    assert_eq!(
+        u32::from(p.flags.contains(PipelineRsFlags::SEPARATE_ALPHA_BLEND)),
+        0
+    );
     assert_eq!(p.extra[0].src_blend, BlendFactor::One);
     assert_eq!(p.extra[0].dst_blend, BlendFactor::Zero);
 }

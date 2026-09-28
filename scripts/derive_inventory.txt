@@ -53,7 +53,6 @@ unix/shared/src/mtl.rs TriangleFillMode Clone,Copy,Debug,PartialEq,Eq,FromRepr
 unix/shared/src/mtl.rs VertexFormat Clone,Copy,Debug,PartialEq,Eq,Hash,FromRepr
 unix/shared/src/mtl.rs VertexStepFunction Clone,Copy,Debug,PartialEq,Eq,Hash,FromRepr
 unix/shared/src/mtl.rs VisibilityResultMode Clone,Copy,Debug,PartialEq,Eq,Hash,FromRepr
-unix/shared/src/params.rs StencilFaceParams Clone,Copy,Debug,PartialEq,Eq
 unix/shared/src/params.rs VertexAttrDesc Clone,Copy,PartialEq,Eq
 unix/shared/src/record_handle.rs DeviceRecordHandle Clone,Copy
 unix/shared/src/shader_create.rs DeclUsage Clone,Copy,Debug,PartialEq,Eq
@@ -81,6 +80,7 @@ unix/unix/src/metal/null_texture.rs NullTextures Clone,Copy
 unix/unix/src/metal/present.rs GammaStage Clone,Copy,PartialEq,Eq,Hash
 unix/unix/src/metal/present.rs PresentPipelines Clone,Copy
 unix/unix/src/metal/presenter.rs PresenterFlags Clone,Copy,Debug,Default,PartialEq,Eq
+unix/unix/src/metal/submission.rs RetirementCounter Clone,Copy
 unix/unix/src/metal/upscale.rs ScalerKey Clone,Copy,PartialEq,Eq,Hash
 unix/unix/src/metal/upscale.rs ScratchKey Clone,Copy,PartialEq,Eq,Hash
 windows/core/src/async_compile.rs ClearPlanes Clone,Copy,Debug,Default,PartialEq,Eq
@@ -97,6 +97,7 @@ windows/core/src/convert.rs FfVsLayoutFlags Clone,Copy,Debug,Default,PartialEq,E
 windows/core/src/convert.rs InputSemantic Clone,Copy,Debug,PartialEq,Eq
 windows/core/src/depth_stencil_state.rs DepthStencilKey Clone,Copy,PartialEq,Eq,Hash,Debug
 windows/core/src/depth_stencil_state.rs DepthStencilSnapshot Clone,Copy,Debug,PartialEq,Eq
+windows/core/src/depth_stencil_state.rs StencilFaceDescription Clone,Copy,Debug,PartialEq,Eq
 windows/core/src/depth_stencil_state.rs StencilFaceState Clone,Copy,Debug,PartialEq,Eq
 windows/core/src/dirty_range.rs DirtyRange Clone,Copy,Debug,PartialEq,Eq,Default
 windows/core/src/dirty_rect.rs DirtyRect Clone,Copy,Debug,PartialEq,Eq

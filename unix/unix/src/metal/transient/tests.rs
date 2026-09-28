@@ -111,26 +111,18 @@ fn an_upload_read_holds_the_chunk_until_the_upload_counter_retires() {
 #[test]
 fn an_unstamped_use_never_retires() {
     let (draw, upload) = (AtomicU64::new(u64::MAX - 1), AtomicU64::new(u64::MAX - 1));
-    let params = SubmitFrameParams {
-        record_handle: mtld3d_shared::record_handle::DeviceRecordHandle::NULL,
-        blit_commands_ptr: 0,
-        blit_command_count: 0,
-        blit_commands_need_encoder: 0,
-        passes_ptr: 0,
-        pass_count: 0,
+    let params = SubmitDescription {
+        blit_commands_need_encoder: false,
         upload_pass_count: 0,
         present_layer: mtld3d_shared::MetalHandle::NULL,
         present_texture: mtld3d_shared::MetalHandle::NULL,
-        submit_seq: 0,
-        coherent_seq_ptr: address(&draw),
-        upload_coherent_seq_ptr: address(&upload),
-        failed_submit_seq_ptr: 0,
-        drawable_wait_ns: 0,
         present_view: mtld3d_shared::MetalHandle::NULL,
-        present_wait_ns: 0,
-        snapshot_flags: mtld3d_shared::mtl::SnapshotFlags::empty(),
-        pad0: 0,
-        timings: mtld3d_shared::perf::SubmitTimings::new(),
+        submit_seq: 0,
+        // SAFETY: the counters outlive every stamp use in this test.
+        draw_retirement: unsafe { RetirementCounter::from_address(address(&draw)) },
+        // SAFETY: the counters outlive every stamp use in this test.
+        upload_retirement: unsafe { RetirementCounter::from_address(address(&upload)) },
+        failed_submission: RetirementCounter::NONE,
     };
     let unstamped = SubmitStamp::new(&params);
     assert!(!unstamped.persistent());

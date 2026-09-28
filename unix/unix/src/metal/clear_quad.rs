@@ -32,7 +32,7 @@
 use std::sync::{Mutex, OnceLock};
 
 use mtld3d_shared::{
-    EnsureClearQuadPipelineParams, MetalHandle,
+    MetalHandle,
     mtl::{ClearQuadFlags, PixelFormat},
     mtl_handle::{MTLFunctionKind, MTLRenderPipelineStateKind},
 };
@@ -148,30 +148,32 @@ static CACHE: OnceLock<Option<ClearQuadCache>> = OnceLock::new();
 /// then falls back to the legacy `end_current_pass` path (sub-rect Clear
 /// semantics regress, but the game still renders).
 pub fn ensure_clear_quad_pipeline(
-    params: &EnsureClearQuadPipelineParams,
+    device: &ProtocolObject<dyn MTLDevice>,
+    depth_format: PixelFormat,
+    color_format: PixelFormat,
+    flags: ClearQuadFlags,
+    extra: &mtld3d_core::pipeline_state::ExtraColorAttachments,
+    sample_count: u32,
 ) -> Option<MetalHandle<MTLRenderPipelineStateKind>> {
-    let device = params.device_handle.into_retained()?;
-
     let cache = CACHE
-        .get_or_init(|| build_library_and_functions(&device))
+        .get_or_init(|| build_library_and_functions(device))
         .as_ref()?;
 
-    let extra_present_mask =
-        u8::try_from(params.extra_present_mask & 0x7).expect("masked to three bits");
+    let extra_present_mask = extra.present_mask & 0x7;
     let key = ClearQuadKey {
-        depth_format: params.depth_format,
-        color_format: params.color_format,
-        flags: params.flags,
+        depth_format,
+        color_format,
+        flags,
         extra_present_mask,
         // Normalise absent slots so single-target keys never fragment.
         extra_formats: core::array::from_fn(|i| {
             if extra_present_mask & (1 << i) != 0 {
-                params.extra_formats[i]
+                extra.formats[i]
             } else {
                 PixelFormat::Bgra8Unorm
             }
         }),
-        sample_count: params.sample_count.max(1),
+        sample_count: sample_count.max(1),
     };
 
     {
@@ -181,7 +183,7 @@ pub fn ensure_clear_quad_pipeline(
         }
     }
 
-    let handle = build_pipeline(&device, cache, &key)?;
+    let handle = build_pipeline(device, cache, &key)?;
     let mut pipelines = cache.pipelines.lock().ok()?;
     // SAFETY: `build_pipeline` handed `handle` the only retain on its
     // pipeline, and nothing else copied it.

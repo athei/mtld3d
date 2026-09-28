@@ -1,8 +1,8 @@
 //! Single source of truth for D3D9 → Metal sampler-state translation.
 //!
 //! Mirrors `pipeline_state` but for samplers: one `SamplerSnapshot` input
-//! drives both the cache `SamplerKey` and the wire-format
-//! `CreateSamplerStateParams`. Per-field unit tests assert the
+//! drives both the cache `SamplerKey` and the native
+//! `SamplerDescription`. Per-field unit tests assert the
 //! static invariant that mutating any snapshot field produces a
 //! different key, so the pipeline-style silent-drop bug (state classified
 //! Consumed but value never reaches the sampler) is unrepresentable.
@@ -15,9 +15,7 @@
 
 use std::fmt;
 
-use mtld3d_shared::{
-    CreateSamplerStateParams, MetalHandle, mtl::BorderColor, mtl_handle::MTLDeviceKind,
-};
+use mtld3d_shared::mtl::{AddressMode, BorderColor, MinMagFilter, MipFilter};
 use mtld3d_types::{
     D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_ADDRESSW, D3DSAMP_BORDERCOLOR, D3DSAMP_DMAPOFFSET,
     D3DSAMP_ELEMENTINDEX, D3DSAMP_MAGFILTER, D3DSAMP_MAXANISOTROPY, D3DSAMP_MAXMIPLEVEL,
@@ -134,7 +132,7 @@ pub enum SampClass {
 pub const fn samp_classify(type_: u32) -> SampClass {
     match type_ {
         // Address, filter and anisotropy: `snapshot_from_state`, packed by
-        // `key_from_snapshot` and built by `params_from_snapshot`.
+        // `key_from_snapshot` and built by `description_from_snapshot`.
         D3DSAMP_ADDRESSU
         | D3DSAMP_ADDRESSV
         | D3DSAMP_ADDRESSW
@@ -151,7 +149,7 @@ pub const fn samp_classify(type_: u32) -> SampClass {
         // key (`SamplerFlags::SRGB_TEXTURE`) so distinct samplers stay
         // distinct.
         | D3DSAMP_SRGBTEXTURE
-        // BORDERCOLOR: `params_from_snapshot` picks the nearest Metal border
+        // BORDERCOLOR: `description_from_snapshot` picks the nearest Metal border
         // preset (transparent black, opaque black, opaque white; other
         // colours fall back to opaque black with a once-per-colour warn from
         // `convert::d3d_border_color_to_metal`).
@@ -181,7 +179,7 @@ pub const fn samp_classify(type_: u32) -> SampClass {
 ///
 /// [`snapshot_from_state`] narrows each state once on the way in: the enum
 /// ones to their D3D9 value space, the numeric ones to the range the sampler
-/// accepts. `key_from_snapshot` packs exactly the bytes `params_from_snapshot`
+/// accepts. `key_from_snapshot` packs exactly the bytes `description_from_snapshot`
 /// translates, so a state can never be keyed as one thing and built as
 /// another, and the key's four-bit fields are exact without a mask.
 pub struct SamplerSnapshot {
@@ -489,7 +487,7 @@ const fn clamped_max_anisotropy(value: u32) -> u8 {
 /// The border preset the key carries.
 ///
 /// Exact presets map to themselves, anything else to opaque black, matching
-/// what `params_from_snapshot` (which also logs the substitution) hands to the
+/// what `description_from_snapshot` (which also logs the substitution) hands to the
 /// unix side.
 const fn border_preset_for_key(color: u32) -> BorderColor {
     match border_color_preset(color) {
@@ -498,15 +496,26 @@ const fn border_preset_for_key(color: u32) -> BorderColor {
     }
 }
 
-/// Translate a snapshot into the wire-format `CreateSamplerStateParams`.
+/// Resolved native sampler inputs, independent of device and output ownership.
+pub struct SamplerDescription {
+    pub id: u64,
+    pub min_filter: MinMagFilter,
+    pub mag_filter: MinMagFilter,
+    pub mip_filter: MipFilter,
+    pub address_u: AddressMode,
+    pub address_v: AddressMode,
+    pub address_w: AddressMode,
+    pub max_anisotropy: u32,
+    pub lod_min_clamp: f32,
+    pub lod_max_clamp: f32,
+    pub flags: SamplerFlags,
+    pub border_color: BorderColor,
+}
+
+/// Translate a snapshot into native sampler inputs.
 #[must_use]
-pub fn params_from_snapshot(
-    s: &SamplerSnapshot,
-    key: SamplerKey,
-    device_handle: MetalHandle<MTLDeviceKind>,
-) -> CreateSamplerStateParams {
-    CreateSamplerStateParams {
-        device_handle,
+pub fn description_from_snapshot(s: &SamplerSnapshot, key: SamplerKey) -> SamplerDescription {
+    SamplerDescription {
         id: key.raw(),
         min_filter: d3d_to_metal_min_mag_filter(u32::from(s.min_filter)),
         mag_filter: d3d_to_metal_min_mag_filter(u32::from(s.mag_filter)),
@@ -515,11 +524,10 @@ pub fn params_from_snapshot(
         address_v: d3d_to_metal_address_mode(u32::from(s.address_v)),
         address_w: d3d_to_metal_address_mode(u32::from(s.address_w)),
         max_anisotropy: u32::from(s.max_anisotropy),
-        lod_min_clamp: f32::from(s.max_mip_level).to_bits(),
-        lod_max_clamp: LOD_MAX_CLAMP.to_bits(),
-        is_compare: u32::from(s.flags.contains(SamplerFlags::IS_COMPARE)),
+        lod_min_clamp: f32::from(s.max_mip_level),
+        lod_max_clamp: LOD_MAX_CLAMP,
+        flags: s.flags & SamplerFlags::IS_COMPARE,
         border_color: d3d_border_color_to_metal(s.border_color),
-        sampler_handle: MetalHandle::NULL,
     }
 }
 
