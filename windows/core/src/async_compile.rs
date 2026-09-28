@@ -61,15 +61,21 @@ impl TicketSource {
     }
 }
 
-/// The jobs no worker has started yet, urgent ones first.
+/// The jobs no worker has started yet, urgent ones first, then pipelines, then the rest.
 ///
-/// The normal lane holds the jobs nothing waits for; the urgent lane the
-/// ones a draw the encoder is waiting on needs. A job leaves the lanes
-/// exactly once: a worker pops it, or the encoder steals it to run on its
-/// own thread. So a ticket that is no longer here names a job that is
-/// running or has finished.
+/// The urgent lane holds the jobs a draw the encoder is waiting on needs.
+/// The pipeline lane holds the pipelines nothing waits for yet: a pipeline
+/// is queued only once both its libraries are built, it builds in a few
+/// milliseconds, and every draw that needs it is otherwise ready, so it goes
+/// ahead of the libraries, which take tens of milliseconds each and whose
+/// draws also wait for a pipeline after them. The normal lane holds every
+/// other job nothing waits for. Each lane is first in, first out. A job
+/// leaves the lanes exactly once: a worker pops it, or the encoder steals it
+/// to run on its own thread. So a ticket that is no longer here names a job
+/// that is running or has finished.
 pub struct CompileLanes<J> {
     urgent: VecDeque<(JobTicket, J)>,
+    pipelines: VecDeque<(JobTicket, J)>,
     normal: VecDeque<(JobTicket, J)>,
 }
 
@@ -84,6 +90,7 @@ impl<J> CompileLanes<J> {
     pub const fn new() -> Self {
         Self {
             urgent: VecDeque::new(),
+            pipelines: VecDeque::new(),
             normal: VecDeque::new(),
         }
     }
@@ -93,14 +100,25 @@ impl<J> CompileLanes<J> {
         self.normal.push_back((ticket, job));
     }
 
+    /// Queue the pipeline `job` behind the other pipelines, ahead of every normal job.
+    ///
+    /// For a pipeline whose libraries are built and that nothing waits for
+    /// yet; see [`CompileLanes`].
+    pub fn push_pipeline(&mut self, ticket: JobTicket, job: J) {
+        self.pipelines.push_back((ticket, job));
+    }
+
     /// Queue `job` behind the other urgent ones, ahead of every normal job.
     pub fn push_urgent(&mut self, ticket: JobTicket, job: J) {
         self.urgent.push_back((ticket, job));
     }
 
-    /// The next job to start: the oldest urgent one, else the oldest normal one.
+    /// The next job to start: the oldest urgent one, else the oldest pipeline, else any other.
     pub fn pop(&mut self) -> Option<(JobTicket, J)> {
-        self.urgent.pop_front().or_else(|| self.normal.pop_front())
+        self.urgent
+            .pop_front()
+            .or_else(|| self.pipelines.pop_front())
+            .or_else(|| self.normal.pop_front())
     }
 
     /// Move the unstarted job `ticket` to the back of the urgent lane.
@@ -112,13 +130,15 @@ impl<J> CompileLanes<J> {
         if self.urgent.iter().any(|(queued, _)| *queued == ticket) {
             return true;
         }
-        let Some(position) = self.normal.iter().position(|(queued, _)| *queued == ticket) else {
-            return false;
-        };
-        if let Some(entry) = self.normal.remove(position) {
-            self.urgent.push_back(entry);
+        for lane in [&mut self.pipelines, &mut self.normal] {
+            if let Some(position) = lane.iter().position(|(queued, _)| *queued == ticket) {
+                if let Some(entry) = lane.remove(position) {
+                    self.urgent.push_back(entry);
+                }
+                return true;
+            }
         }
-        true
+        false
     }
 
     /// Take the unstarted urgent job `ticket`, so its caller can run it instead of a worker.
@@ -145,16 +165,16 @@ impl<J> CompileLanes<J> {
         self.urgent.remove(idle)
     }
 
-    /// How many jobs wait in both lanes together.
+    /// How many jobs wait in all lanes together.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.urgent.len() + self.normal.len()
+        self.urgent.len() + self.pipelines.len() + self.normal.len()
     }
 
-    /// Whether no job waits in either lane.
+    /// Whether no job waits in any lane.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.urgent.is_empty() && self.normal.is_empty()
+        self.urgent.is_empty() && self.pipelines.is_empty() && self.normal.is_empty()
     }
 }
 

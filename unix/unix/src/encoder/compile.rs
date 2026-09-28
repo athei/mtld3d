@@ -110,8 +110,15 @@ impl CompileQueue {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// Queue a job nothing waits for yet; a primary pipeline goes ahead of the libraries.
     fn push(&self, ticket: JobTicket, job: QueuedJob) {
-        self.lock().lanes.push_normal(ticket, job);
+        let mut state = self.lock();
+        if matches!(&job.job, CompileJob::Pipeline(pipeline) if pipeline.sibling_of.is_none()) {
+            state.lanes.push_pipeline(ticket, job);
+        } else {
+            state.lanes.push_normal(ticket, job);
+        }
+        drop(state);
         self.ready.notify_one();
     }
 

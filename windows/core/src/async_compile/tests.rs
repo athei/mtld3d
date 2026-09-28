@@ -86,6 +86,67 @@ fn steal_takes_only_the_named_urgent_job() {
     assert_eq!(lanes.pop(), Some((normal, "normal")));
 }
 
+/// Pipelines start ahead of queued libraries, each class in order, and urgent jobs before both.
+#[test]
+fn pipelines_pop_ahead_of_libraries_and_behind_urgent_jobs() {
+    let mut tickets = TicketSource::new();
+    let mut lanes = CompileLanes::new();
+    // A burst of new shaders queued their libraries, then the pipeline of a
+    // draw whose libraries had already landed, then more of both.
+    let library_a = tickets.issue();
+    let library_b = tickets.issue();
+    let pipeline_a = tickets.issue();
+    let library_c = tickets.issue();
+    let pipeline_b = tickets.issue();
+    let urgent = tickets.issue();
+    lanes.push_normal(library_a, "library a");
+    lanes.push_normal(library_b, "library b");
+    lanes.push_pipeline(pipeline_a, "pipeline a");
+    lanes.push_normal(library_c, "library c");
+    lanes.push_pipeline(pipeline_b, "pipeline b");
+    lanes.push_urgent(urgent, "urgent");
+    assert_eq!(lanes.len(), 6);
+    let order: Vec<_> = core::iter::from_fn(|| lanes.pop()).collect();
+    assert_eq!(
+        order,
+        [
+            (urgent, "urgent"),
+            (pipeline_a, "pipeline a"),
+            (pipeline_b, "pipeline b"),
+            (library_a, "library a"),
+            (library_b, "library b"),
+            (library_c, "library c"),
+        ]
+    );
+    assert!(lanes.is_empty());
+}
+
+/// A waited-for pipeline moves from the pipeline lane to the urgent one, and only once.
+#[test]
+fn promote_moves_a_queued_pipeline_to_the_urgent_lane() {
+    let mut tickets = TicketSource::new();
+    let mut lanes = CompileLanes::new();
+    let library = tickets.issue();
+    let first = tickets.issue();
+    let waited = tickets.issue();
+    lanes.push_normal(library, "library");
+    lanes.push_pipeline(first, "first");
+    lanes.push_pipeline(waited, "waited");
+    assert!(lanes.promote(waited));
+    assert_eq!(lanes.len(), 3, "promotion moves, it does not copy");
+    assert_eq!(
+        lanes.steal(waited, 0),
+        Some("waited"),
+        "it is stealable once urgent"
+    );
+    assert_eq!(lanes.pop(), Some((first, "first")));
+    assert_eq!(lanes.pop(), Some((library, "library")));
+    assert!(
+        !lanes.promote(waited),
+        "a job that left the lanes is not promoted"
+    );
+}
+
 /// Every attached colour target and every plane the draw uses has to be regenerated.
 #[test]
 fn a_draw_skips_only_when_everything_it_depends_on_is_regenerated() {

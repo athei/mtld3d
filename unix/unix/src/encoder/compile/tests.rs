@@ -111,3 +111,56 @@ fn canceled_queue_and_blocked_worker_release_distinct_job_owners() {
         "no canceled owner was revived"
     );
 }
+
+fn pipeline_job(sibling_of: Option<u64>) -> QueuedJob {
+    let snapshot = PipelineSnapshot {
+        vs_fn: MetalHandle::NULL,
+        ps_fn: MetalHandle::NULL,
+        vdecl_hash: 0,
+        stream_layouts: [mtld3d_core::pipeline_state::StreamLayout::UNUSED;
+            mtld3d_types::MAX_STREAMS as usize],
+        color_format: mtld3d_shared::mtl::PixelFormat::Bgra8Unorm,
+        attach: mtld3d_core::pipeline_state::PipelineAttachFlags::empty(),
+        rs: mtld3d_core::pipeline_state::PipelineRsBits::default(),
+        extra: mtld3d_core::pipeline_state::ExtraColorAttachments::NONE,
+        ps_color_out_mask: 1,
+        sample_count: 1,
+    };
+    let shader = PairShaderId {
+        is_programmable: true,
+        hash: 1,
+    };
+    QueuedJob {
+        job: CompileJob::Pipeline(Box::new(PipelineJob {
+            snapshot,
+            vertex_attrs: Vec::new(),
+            identity: PipelineIdentity {
+                shader_refs: None,
+                vs: shader,
+                ps: shader,
+            },
+            sibling_of,
+            device: MetalHandle::NULL,
+            persist: false,
+            cache_path: None,
+        })),
+        enqueued_tsc: 0,
+    }
+}
+
+/// A primary pipeline starts ahead of queued libraries; a no-colour sibling queues with them.
+#[test]
+fn push_sends_primary_pipelines_ahead_and_siblings_with_the_libraries() {
+    let queue = CompileQueue::new();
+    let mut tickets = TicketSource::new();
+    let library = tickets.issue();
+    let sibling = tickets.issue();
+    let primary = tickets.issue();
+    queue.push(library, retained_job().0);
+    queue.push(sibling, pipeline_job(Some(0x1000)));
+    queue.push(primary, pipeline_job(None));
+    let order: Vec<JobTicket> = core::iter::from_fn(|| queue.take_any())
+        .map(|(ticket, _)| ticket)
+        .collect();
+    assert_eq!(order, [primary, library, sibling]);
+}
