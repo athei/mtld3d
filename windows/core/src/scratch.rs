@@ -65,7 +65,60 @@ pub struct ScratchArena {
     next_chunk: usize,
     payload_chunk: Option<usize>,
     command_chunk: Option<usize>,
+    /// First byte of the open command region, as an exposed address; zero when none is open.
+    ///
+    /// While a region is open its chunk's `used` stays zero and the three addresses below
+    /// describe it: `command_base <= command_cursor <= command_limit`, all within the chunk.
+    /// Closing the region stores `command_cursor - command_base` into the chunk.
+    command_base: usize,
+    /// Address at which the next command in the open region begins.
+    command_cursor: usize,
+    /// Address one past the last byte of the open region.
+    command_limit: usize,
+    /// One descriptor per command region, in record order.
+    ///
+    /// `open_command_region` is the only way a region opens, and it pushes the descriptor
+    /// before any command is written there, so every command lands in a region the table
+    /// names. The open region's length lives in the cursor; `publish_command_region` copies it
+    /// into the last descriptor, which the region's closing and the frame's sealing both do.
+    /// A region stays empty only when the record that opened it failed, and that failure is
+    /// latched, so its frame is rejected before replay.
+    command_regions: Vec<mtld3d_shared::command_header::CommandRegion>,
     chunk_size: usize,
+}
+
+/// A command header immediately followed by its fixed payload.
+#[repr(C)]
+struct FramedCommand<T> {
+    header: mtld3d_shared::command_header::CommandHeader,
+    payload: T,
+}
+
+/// Room for one fixed command at the open region's cursor, committed by `write`.
+pub struct CommandSlot<'a, T> {
+    arena: &'a mut ScratchArena,
+    cursor: usize,
+    record_bytes: u32,
+    payload: core::marker::PhantomData<T>,
+}
+
+impl<T: crate::encoder_records::CommandRecord> CommandSlot<'_, T> {
+    /// Write the header and payload in place and advance the region past them.
+    #[inline]
+    pub const fn write(self, opcode: u16, operand: u16, payload: T) {
+        let command = FramedCommand {
+            header: mtld3d_shared::command_header::CommandHeader {
+                opcode,
+                operand,
+                record_bytes: self.record_bytes,
+            },
+            payload,
+        };
+        // SAFETY: `command_slot` found the whole command inside the open region, an exclusive
+        // range of one exposed chunk allocation, at a command-aligned cursor.
+        unsafe { ptr::with_exposed_provenance_mut::<FramedCommand<T>>(self.cursor).write(command) };
+        self.arena.command_cursor = self.cursor + size_of::<FramedCommand<T>>();
+    }
 }
 
 /// A completed command and the contiguous region that now contains it.
@@ -93,6 +146,10 @@ impl ScratchArena {
             next_chunk: 0,
             payload_chunk: None,
             command_chunk: None,
+            command_base: 0,
+            command_cursor: 0,
+            command_limit: 0,
+            command_regions: Vec::new(),
             chunk_size,
         }
     }
@@ -183,11 +240,146 @@ impl ScratchArena {
         index
     }
 
+    /// Bytes a command with a `payload_bound`-byte payload reserves, header and padding included.
+    const fn command_reservation(
+        payload_bound: usize,
+    ) -> Result<usize, mtld3d_shared::encoder_wire::WireError> {
+        use mtld3d_shared::{
+            command_header::{COMMAND_ALIGNMENT, COMMAND_HEADER_BYTES},
+            encoder_wire::WireError,
+        };
+        let Some(bound) = payload_bound.checked_add(COMMAND_HEADER_BYTES) else {
+            return Err(WireError::TooLarge);
+        };
+        if bound > u32::MAX as usize || bound > isize::MAX as usize {
+            return Err(WireError::TooLarge);
+        }
+        let Some(padded) = bound.checked_add(COMMAND_ALIGNMENT - 1) else {
+            return Err(WireError::TooLarge);
+        };
+        Ok(padded & !(COMMAND_ALIGNMENT - 1))
+    }
+
+    /// Whether the open command region can take a `reserved`-byte command.
+    const fn has_command_room(&self, reserved: usize) -> bool {
+        self.command_limit - self.command_cursor >= reserved
+    }
+
+    /// Bytes committed to the open command region, zero when none is open.
+    const fn open_command_bytes(&self) -> usize {
+        self.command_cursor - self.command_base
+    }
+
+    /// Store the open region's committed length into its descriptor.
+    ///
+    /// # Errors
+    /// Returns `TooLarge` if the region length does not fit its descriptor.
+    pub fn publish_command_region(&mut self) -> Result<(), mtld3d_shared::encoder_wire::WireError> {
+        let used = u32::try_from(self.open_command_bytes())
+            .map_err(|_| mtld3d_shared::encoder_wire::WireError::TooLarge)?;
+        if let Some(region) = self.command_regions.last_mut() {
+            region.used_bytes = used;
+        }
+        Ok(())
+    }
+
+    /// Borrow the published region table as its fixed-width descriptor bytes.
+    #[must_use]
+    pub const fn command_descriptor_bytes(&self) -> &[u8] {
+        // SAFETY: CommandRegion has no padding, every scalar field is initialized,
+        // and this borrow prevents changes to the descriptor vector.
+        unsafe {
+            core::slice::from_raw_parts(
+                self.command_regions.as_ptr().cast::<u8>(),
+                core::mem::size_of_val(self.command_regions.as_slice()),
+            )
+        }
+    }
+
+    /// Publish the open region, then list every region's address and committed length.
+    ///
+    /// # Panics
+    /// Panics if the open region's length does not fit its descriptor.
+    #[cfg(test)]
+    pub fn command_ranges(&mut self) -> impl Iterator<Item = (u64, u64)> + '_ {
+        self.publish_command_region()
+            .expect("test regions fit their descriptors");
+        self.command_regions
+            .iter()
+            .map(|region| (region.address, u64::from(region.used_bytes)))
+    }
+
+    /// Close the open command region and open one with room for `reserved` bytes.
+    ///
+    /// The new region's descriptor is pushed before any command is written there. The closed
+    /// region keeps its committed length in its chunk and its descriptor.
+    ///
+    /// # Errors
+    /// Returns an allocation failure before the arena changes, or a closed region's length error.
+    #[cold]
+    #[inline(never)]
+    fn open_command_region(
+        &mut self,
+        reserved: usize,
+    ) -> Result<(), mtld3d_shared::encoder_wire::WireError> {
+        self.command_regions
+            .try_reserve(1)
+            .map_err(|_| mtld3d_shared::encoder_wire::WireError::AllocationFailed)?;
+        self.publish_command_region()?;
+        if let Some(index) = self.command_chunk {
+            self.chunks[index].used = self.open_command_bytes();
+        }
+        let index = self.acquire_chunk(reserved);
+        self.command_chunk = Some(index);
+        let chunk = &mut self.chunks[index];
+        let base = chunk.as_mut_ptr().expose_provenance();
+        self.command_base = base;
+        self.command_cursor = base;
+        self.command_limit = base + chunk.len();
+        self.command_regions
+            .push(mtld3d_shared::command_header::CommandRegion {
+                address: base as u64,
+                used_bytes: 0,
+                reserved: 0,
+            });
+        Ok(())
+    }
+
+    /// Claim room for one complete fixed command in the open region.
+    ///
+    /// Returns `None` when no region is open or the command does not fit. The payload size is
+    /// a multiple of the command alignment, so no padding follows it. Nothing is committed
+    /// until the slot is written.
+    #[inline]
+    pub fn command_slot<T: crate::encoder_records::CommandRecord>(
+        &mut self,
+    ) -> Option<CommandSlot<'_, T>> {
+        use mtld3d_shared::command_header::{COMMAND_ALIGNMENT, COMMAND_HEADER_BYTES};
+        const {
+            assert!(align_of::<T>() <= COMMAND_ALIGNMENT);
+            assert!(size_of::<T>().is_multiple_of(COMMAND_ALIGNMENT));
+            assert!(size_of::<FramedCommand<T>>() == COMMAND_HEADER_BYTES + size_of::<T>());
+            assert!(size_of::<FramedCommand<T>>() <= u32::MAX as usize);
+        }
+        let record_bytes = u32::try_from(size_of::<FramedCommand<T>>()).ok()?;
+        let cursor = self.command_cursor;
+        if self.command_limit - cursor < size_of::<FramedCommand<T>>() {
+            return None;
+        }
+        Some(CommandSlot {
+            arena: self,
+            cursor,
+            record_bytes,
+            payload: core::marker::PhantomData,
+        })
+    }
+
     /// Initialize a command in a contiguous command region of this arena.
     ///
     /// Payload allocations use a separate cursor into the same owned chunk pool.
-    /// A failed callback leaves the committed region length unchanged. Successful
-    /// records contain an exact logical length and zero alignment padding.
+    /// A command that does not fit opens and names a new region first. A failed callback
+    /// leaves the committed region length unchanged. Successful records contain an exact
+    /// logical length and zero alignment padding.
     ///
     /// # Errors
     /// Returns overflow, invalid callback length or the callback's error.
@@ -202,29 +394,14 @@ impl ScratchArena {
             command_header::{COMMAND_ALIGNMENT, COMMAND_HEADER_BYTES, CommandHeader},
             encoder_wire::WireError,
         };
-        let bound = payload_bound
-            .checked_add(COMMAND_HEADER_BYTES)
-            .ok_or(WireError::TooLarge)?;
-        if bound > u32::MAX as usize || bound > isize::MAX as usize {
-            return Err(WireError::TooLarge);
+        let reserved = Self::command_reservation(payload_bound)?;
+        if !self.has_command_room(reserved) {
+            self.open_command_region(reserved)?;
         }
         let alignment_mask = COMMAND_ALIGNMENT - 1;
-        let reserved = bound
-            .checked_add(alignment_mask)
-            .ok_or(WireError::TooLarge)?
-            & !alignment_mask;
-        let index = if let Some(index) = self.command_chunk
-            && reserved <= self.chunks[index].len() - self.chunks[index].used
-        {
-            index
-        } else {
-            let index = self.acquire_chunk(reserved);
-            self.command_chunk = Some(index);
-            index
-        };
-        let chunk = &mut self.chunks[index];
-        let pointer = chunk.as_mut_ptr().wrapping_add(chunk.used);
-        // SAFETY: the exclusive aligned reservation contains this payload window.
+        let pointer = ptr::with_exposed_provenance_mut::<u8>(self.command_cursor);
+        // SAFETY: the open region holds this exclusive aligned reservation, which contains
+        // the header and this payload window.
         let destination = unsafe {
             core::slice::from_raw_parts_mut(
                 pointer.wrapping_add(COMMAND_HEADER_BYTES),
@@ -260,13 +437,44 @@ impl ScratchArena {
                 record_bytes,
             });
         };
-        chunk.used += aligned_used;
+        self.command_cursor += aligned_used;
         Ok(CommandAllocation {
             address: pointer as u64,
             record_bytes: used,
-            region_address: chunk.as_ptr() as u64,
-            region_bytes: chunk.used,
+            region_address: self.command_base as u64,
+            region_bytes: self.open_command_bytes(),
         })
+    }
+
+    /// Initialize a command whose payload fills exactly `payload_bytes`.
+    ///
+    /// # Errors
+    /// Returns the callback's error or a reservation or region failure.
+    pub fn push_fixed_record(
+        &mut self,
+        tag: u16,
+        operand: u16,
+        payload_bytes: usize,
+        fill: impl FnOnce(&mut [u8]) -> Result<(), mtld3d_shared::encoder_wire::WireError>,
+    ) -> Result<(), mtld3d_shared::encoder_wire::WireError> {
+        self.push_initialized_record(tag, operand, payload_bytes, |destination| {
+            fill(destination)?;
+            Ok(payload_bytes)
+        })
+    }
+
+    /// Initialize a command whose callback reports how much of `bound` it used.
+    ///
+    /// # Errors
+    /// Returns the callback's error or a reservation or region failure.
+    pub fn push_initialized_record(
+        &mut self,
+        tag: u16,
+        operand: u16,
+        bound: usize,
+        fill: impl FnOnce(&mut [u8]) -> Result<usize, mtld3d_shared::encoder_wire::WireError>,
+    ) -> Result<(), mtld3d_shared::encoder_wire::WireError> {
+        self.write_command(tag, operand, bound, fill).map(drop)
     }
 
     /// Copy `data` into the arena and return a stable pointer cast to `u64`.
@@ -386,6 +594,10 @@ impl ScratchArena {
         self.next_chunk = 0;
         self.payload_chunk = None;
         self.command_chunk = None;
+        self.command_base = 0;
+        self.command_cursor = 0;
+        self.command_limit = 0;
+        self.command_regions.clear();
     }
 
     /// Number of owned chunks, including oversized allocations.
@@ -435,7 +647,8 @@ impl ScratchArena {
     /// Sum of committed or allocated bytes in both logical cursors this frame.
     #[must_use]
     pub fn bytes_used(&self) -> u64 {
-        self.chunks.iter().map(|chunk| chunk.used as u64).sum()
+        let committed: u64 = self.chunks.iter().map(|chunk| chunk.used as u64).sum();
+        committed + self.open_command_bytes() as u64
     }
 }
 

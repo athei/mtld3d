@@ -321,7 +321,7 @@ fn invalid_constant_capture_latches_error_without_publishing_a_command() {
         Err(WireError::InvalidValue)
     );
     assert_eq!(recorder.count, 0);
-    assert!(recorder.slab.descriptor_bytes().is_empty());
+    assert!(scratch.command_descriptor_bytes().is_empty());
 }
 
 #[test]
@@ -392,7 +392,7 @@ fn single_stream_records_match_checked_writer_and_reuse_failed_rollover() {
                     index.as_ref(),
                 )
                 .unwrap();
-            let committed: Vec<_> = recorder.slab.ranges().collect();
+            let committed: Vec<_> = scratch.command_ranges().collect();
             assert_eq!(committed.len(), 1);
             let used = scratch.bytes_used();
             assert_eq!(
@@ -405,11 +405,16 @@ fn single_stream_records_match_checked_writer_and_reuse_failed_rollover() {
                 Err(WireError::InvalidValue)
             );
             assert_eq!(scratch.bytes_used(), used);
-            assert_eq!(recorder.slab.ranges().collect::<Vec<_>>(), committed);
+            // The rejected record's rollover named an empty region; the committed one is intact.
+            let after_failure: Vec<_> = scratch.command_ranges().collect();
+            assert_eq!(after_failure.len(), 2);
+            assert_eq!(after_failure[0], committed[0]);
+            assert_eq!(after_failure[1].1, 0);
             assert_eq!(recorder.len(), 1);
+            scratch.publish_command_region().unwrap();
             // SAFETY: the live recorder and arena retain this unchanged committed region.
             let mut cursor =
-                unsafe { replay::CommandCursor::new(recorder.slab.descriptor_bytes()) }.unwrap();
+                unsafe { replay::CommandCursor::new(scratch.command_descriptor_bytes()) }.unwrap();
             // SAFETY: the initialized region remains owned and immutable through this read.
             let record = unsafe { cursor.next_record() }.unwrap().unwrap();
             assert_eq!(record.payload, expected);
@@ -435,13 +440,14 @@ fn single_stream_records_match_checked_writer_and_reuse_failed_rollover() {
                     )
                     .unwrap();
             }
-            let reused: Vec<_> = recorder.slab.ranges().collect();
+            let reused: Vec<_> = scratch.command_ranges().collect();
             assert_eq!(reused.len(), 2);
             assert_eq!(reused[0], committed[0]);
             assert_eq!(scratch.chunk_count(), 2);
+            scratch.publish_command_region().unwrap();
             // SAFETY: both completed records remain owned by the live recorder and arena.
             let mut cursor =
-                unsafe { replay::CommandCursor::new(recorder.slab.descriptor_bytes()) }.unwrap();
+                unsafe { replay::CommandCursor::new(scratch.command_descriptor_bytes()) }.unwrap();
             for _ in 0..2 {
                 // SAFETY: the same immutable command regions remain retained during iteration.
                 let record = unsafe { cursor.next_record() }.unwrap().unwrap();
@@ -1113,4 +1119,84 @@ fn recovered_recording_storage_keeps_every_lease_vector_capacity() {
             pool.recycle(slot);
         }
     }
+}
+
+#[test]
+fn cursor_borrows_typed_payloads_at_both_eight_byte_positions() {
+    use super::replay::CommandCursor;
+    use crate::encoder_records::{IdRecord, borrow, write};
+
+    let mut arena = ScratchArena::with_chunk_size(64);
+    arena.push_fixed_record(1, 0, 0, |_| Ok(())).unwrap();
+    let ordinary = arena.alloc(&[9; 3]);
+    assert_eq!(ordinary % 16, 0);
+    arena
+        .push_fixed_record(2, 0, size_of::<IdRecord>(), |bytes| {
+            write(
+                bytes,
+                IdRecord {
+                    id: 0x1234_5678_9abc_def0,
+                },
+            )
+        })
+        .unwrap();
+    arena.push_fixed_record(3, 0, 0, |_| Ok(())).unwrap();
+    arena
+        .push_fixed_record(4, 0, size_of::<IdRecord>(), |bytes| {
+            write(bytes, IdRecord { id: 17 })
+        })
+        .unwrap();
+    arena.publish_command_region().unwrap();
+    // SAFETY: the arena retains its table and every immutable region through iteration.
+    let mut cursor = unsafe { CommandCursor::new(arena.command_descriptor_bytes()) }.unwrap();
+    for (opcode, id, payload_modulo) in [
+        (1, None, 8),
+        (2, Some(0x1234_5678_9abc_def0), 0),
+        (3, None, 0),
+        (4, Some(17), 8),
+    ] {
+        // SAFETY: the authentic command table and initialized regions remain unchanged above.
+        let record = unsafe { cursor.next_record() }.unwrap().unwrap();
+        assert_eq!(record.opcode, opcode);
+        assert_eq!(record.payload.as_ptr() as usize % 16, payload_modulo);
+        if let Some(id) = id {
+            assert_eq!(borrow::<IdRecord>(record.payload).unwrap().id, id);
+        } else {
+            assert!(record.payload.is_empty());
+        }
+    }
+    assert!(cursor.is_complete());
+    // SAFETY: the same retained table remains valid when checking its end.
+    assert!(unsafe { cursor.next_record() }.unwrap().is_none());
+}
+
+#[test]
+fn publish_counts_commands_appended_through_the_arena_slot() {
+    use super::replay::CommandCursor;
+    use crate::encoder_records::{IdRecord, borrow};
+
+    let mut arena = ScratchArena::with_chunk_size(64);
+    arena.push_fixed_record(1, 0, 0, |_| Ok(())).unwrap();
+    arena
+        .command_slot::<IdRecord>()
+        .unwrap()
+        .write(2, 0, IdRecord { id: 41 });
+    arena.publish_command_region().unwrap();
+    assert_eq!(
+        arena
+            .command_ranges()
+            .map(|(_, used)| used)
+            .collect::<Vec<_>>(),
+        [24]
+    );
+    // SAFETY: the arena retains its table and every immutable region through iteration.
+    let mut cursor = unsafe { CommandCursor::new(arena.command_descriptor_bytes()) }.unwrap();
+    // SAFETY: the authentic command table and initialized regions remain unchanged above.
+    let first = unsafe { cursor.next_record() }.unwrap().unwrap();
+    assert_eq!((first.opcode, first.payload.len()), (1, 0));
+    // SAFETY: the same retained table remains valid for the second record.
+    let second = unsafe { cursor.next_record() }.unwrap().unwrap();
+    assert_eq!(second.opcode, 2);
+    assert_eq!(borrow::<IdRecord>(second.payload).unwrap().id, 41);
+    assert!(cursor.is_complete());
 }

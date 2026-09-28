@@ -319,3 +319,136 @@ fn reused_command_padding_is_zero_for_every_alignment_residue() {
         assert_eq!(next.address % COMMAND_ALIGNMENT as u64, 0);
     }
 }
+
+#[test]
+fn command_slot_claims_exact_room_and_commits_only_when_written() {
+    use mtld3d_shared::command_header::{COMMAND_HEADER_BYTES, CommandHeader};
+
+    use crate::encoder_records::IdRecord;
+
+    let mut arena = ScratchArena::with_chunk_size(64);
+    assert!(arena.command_slot::<IdRecord>().is_none());
+    assert!(!arena.has_command_room(16));
+    arena.open_command_region(16).unwrap();
+    let region = arena.command_base as u64;
+    assert_eq!(arena.command_regions.len(), 1);
+    assert_eq!(region % 16, 0);
+    assert_eq!(arena.open_command_bytes(), 0);
+    assert!(arena.command_slot::<IdRecord>().is_some());
+    assert_eq!((arena.open_command_bytes(), arena.bytes_used()), (0, 0));
+    for id in 0..4_u64 {
+        arena
+            .command_slot::<IdRecord>()
+            .unwrap()
+            .write(3, 9, IdRecord { id: 0x100 + id });
+    }
+    assert_eq!((arena.open_command_bytes(), arena.bytes_used()), (64, 64));
+    assert!(arena.command_slot::<IdRecord>().is_none());
+    for index in 0..4_u64 {
+        let address = region + index * 16;
+        // SAFETY: the arena retains its open region, whose four written commands are aligned.
+        let header = unsafe { &*(address as *const CommandHeader) };
+        assert_eq!(
+            (header.opcode, header.operand, header.record_bytes),
+            (3, 9, 16)
+        );
+        // SAFETY: the payload follows its header inside the same retained command.
+        let id = unsafe { *((address + COMMAND_HEADER_BYTES as u64) as *const u64) };
+        assert_eq!(id, 0x100 + index);
+    }
+    let next = arena
+        .write_command(4, 0, 8, |payload| {
+            payload.fill(0x5a);
+            Ok(8)
+        })
+        .unwrap();
+    assert_ne!(next.region_address, region);
+    assert_eq!((next.region_bytes, arena.bytes_used()), (16, 80));
+    arena.clear();
+    assert!(arena.command_slot::<IdRecord>().is_none());
+    assert_eq!(arena.bytes_used(), 0);
+}
+
+#[test]
+fn failed_rollover_keeps_committed_region_and_reuses_next_reservation() {
+    use mtld3d_shared::encoder_wire::WireError;
+
+    let mut arena = ScratchArena::with_chunk_size(64);
+    arena
+        .push_fixed_record(1, 0, 56, |bytes| {
+            bytes.fill(1);
+            Ok(())
+        })
+        .unwrap();
+    arena.publish_command_region().unwrap();
+    let first = arena.command_regions[0].address;
+    assert_eq!(arena.command_regions[0].used_bytes, 64);
+    assert_eq!(
+        arena.push_fixed_record(2, 0, 16, |bytes| {
+            bytes.fill(2);
+            Err(WireError::InvalidValue)
+        }),
+        Err(WireError::InvalidValue)
+    );
+    // The rollover names its region before writing, so the failed record leaves it empty.
+    arena.publish_command_region().unwrap();
+    assert_eq!(arena.command_regions.len(), 2);
+    assert_eq!(arena.command_regions[0].address, first);
+    assert_eq!(arena.command_regions[0].used_bytes, 64);
+    assert_eq!(arena.command_regions[1].used_bytes, 0);
+    assert_eq!(arena.bytes_used(), 64);
+    arena
+        .push_fixed_record(3, 0, 16, |bytes| {
+            bytes.fill(3);
+            Ok(())
+        })
+        .unwrap();
+    arena.publish_command_region().unwrap();
+    assert_eq!(arena.command_regions.len(), 2);
+    assert_eq!(arena.command_regions[1].used_bytes, 24);
+    assert_ne!(arena.command_regions[1].address, first);
+    assert_eq!(arena.chunk_count(), 2);
+}
+
+#[test]
+fn oversized_payload_and_two_cursors_reuse_one_pool_after_clear() {
+    let mut arena = ScratchArena::with_chunk_size(64);
+    arena.push_fixed_record(1, 0, 0, |_| Ok(())).unwrap();
+    let first = arena.command_regions[0].address;
+    let oversized = arena.alloc(&[7; 128]);
+    let ordinary = arena.alloc(&[8; 16]);
+    assert_ne!(oversized, first);
+    assert_ne!(ordinary, first);
+    arena.push_fixed_record(2, 0, 0, |_| Ok(())).unwrap();
+    arena.publish_command_region().unwrap();
+    assert_eq!(arena.command_regions.len(), 1);
+    assert_eq!(arena.command_regions[0].used_bytes, 16);
+    assert_eq!(arena.oversized_chunk_count(), 1);
+    let retained = arena.small_chunk_count();
+    arena.clear();
+    assert_eq!(arena.oversized_chunk_count(), 0);
+    arena.push_fixed_record(3, 0, 0, |_| Ok(())).unwrap();
+    arena.alloc(&[9; 16]);
+    assert_eq!(arena.command_regions[0].address, first);
+    assert_eq!(arena.small_chunk_count(), retained);
+}
+
+#[test]
+fn write_command_names_every_region_it_opens() {
+    let mut arena = ScratchArena::with_chunk_size(32);
+    for opcode in 1..=5_u16 {
+        arena
+            .write_command(opcode, 0, 8, |payload| {
+                payload.fill(0x11);
+                Ok(8)
+            })
+            .unwrap();
+    }
+    let regions: Vec<_> = arena.command_ranges().collect();
+    assert_eq!(
+        regions.iter().map(|&(_, used)| used).collect::<Vec<_>>(),
+        [32, 32, 16]
+    );
+    assert_eq!(arena.chunk_count(), 3);
+    assert_eq!(arena.bytes_used(), 80);
+}

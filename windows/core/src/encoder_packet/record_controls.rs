@@ -124,58 +124,49 @@ fn clear_depth(depth: Option<u32>, stencil: Option<u32>) -> ClearDepthStencilRec
     }
 }
 
-impl FrameRecorder {
-    fn fixed<T: CommandRecord>(
-        &mut self,
-        scratch: &mut ScratchArena,
-        tag: EncoderOpcode,
-        operand: u16,
-        build: impl FnOnce() -> T,
-    ) -> Result<(), WireError> {
-        self.slab.push_fixed_record(
-            scratch,
-            tag.into(),
-            operand,
-            size_of::<T>(),
-            |destination| crate::encoder_records::write(destination, build()),
-        )
-    }
+fn write_fixed<T: CommandRecord>(
+    scratch: &mut ScratchArena,
+    tag: EncoderOpcode,
+    operand: u16,
+    build: impl FnOnce() -> T,
+) -> Result<(), WireError> {
+    scratch.push_fixed_record(tag.into(), operand, size_of::<T>(), |destination| {
+        crate::encoder_records::write(destination, build())
+    })
+}
 
-    fn rects<T: CommandRecord>(
-        &mut self,
-        scratch: &mut ScratchArena,
-        tag: EncoderOpcode,
-        rects: &[(i32, i32, i32, i32)],
-        build: impl FnOnce() -> T,
-    ) -> Result<(), WireError> {
-        let size = rects
-            .len()
-            .checked_mul(size_of::<RectRecord>())
-            .and_then(|v| v.checked_add(size_of::<T>()))
-            .ok_or(WireError::TooLarge)?;
-        self.slab
-            .push_fixed_record(scratch, tag.into(), 0, size, |destination| {
-                let (head, tail) = destination.split_at_mut(size_of::<T>());
-                crate::encoder_records::write(head, build())?;
-                for (bytes, &(x, y, right, bottom)) in tail
-                    .as_chunks_mut::<{ size_of::<RectRecord>() }>()
-                    .0
-                    .iter_mut()
-                    .zip(rects)
-                {
-                    crate::encoder_records::write(
-                        bytes,
-                        RectRecord {
-                            x,
-                            y,
-                            right,
-                            bottom,
-                        },
-                    )?;
-                }
-                Ok(())
-            })
-    }
+fn write_rects<T: CommandRecord>(
+    scratch: &mut ScratchArena,
+    tag: EncoderOpcode,
+    rects: &[(i32, i32, i32, i32)],
+    build: impl FnOnce() -> T,
+) -> Result<(), WireError> {
+    let size = rects
+        .len()
+        .checked_mul(size_of::<RectRecord>())
+        .and_then(|v| v.checked_add(size_of::<T>()))
+        .ok_or(WireError::TooLarge)?;
+    scratch.push_fixed_record(tag.into(), 0, size, |destination| {
+        let (head, tail) = destination.split_at_mut(size_of::<T>());
+        crate::encoder_records::write(head, build())?;
+        for (bytes, &(x, y, right, bottom)) in tail
+            .as_chunks_mut::<{ size_of::<RectRecord>() }>()
+            .0
+            .iter_mut()
+            .zip(rects)
+        {
+            crate::encoder_records::write(
+                bytes,
+                RectRecord {
+                    x,
+                    y,
+                    right,
+                    bottom,
+                },
+            )?;
+        }
+        Ok(())
+    })
 }
 
 fn capture_upload(
@@ -249,10 +240,10 @@ pub trait CaptureControl: Sized {
 
 macro_rules! capture_fixed {
     ($recorder:ident,$scratch:ident,$tag:ident,$value:expr) => {
-        $recorder.fixed($scratch, $tag, 0, || $value)?
+        write_fixed($scratch, $tag, 0, || $value)?
     };
     ($recorder:ident,$scratch:ident,$tag:ident,$operand:expr,$value:expr) => {
-        $recorder.fixed($scratch, $tag, $operand, || $value)?
+        write_fixed($scratch, $tag, $operand, || $value)?
     };
 }
 
@@ -582,7 +573,7 @@ capture_control!(
     scratch,
     tag,
     {
-        recorder.rects(scratch, tag, &v.rects, || ClearColorRecord {
+        write_rects(scratch, tag, &v.rects, || ClearColorRecord {
             rgba: [v.r_bits, v.g_bits, v.b_bits, v.a_bits],
             srgb_write: u32::from(v.srgb_write),
             reserved: 0,
@@ -597,7 +588,7 @@ capture_control!(
     scratch,
     tag,
     {
-        recorder.rects(scratch, tag, &v.list, || clear_depth(v.depth, v.stencil))?;
+        write_rects(scratch, tag, &v.list, || clear_depth(v.depth, v.stencil))?;
     }
 );
 capture_control!(
@@ -661,7 +652,7 @@ impl CaptureControl for AdoptProgramOp {
         recorder: &mut FrameRecorder,
         scratch: &mut ScratchArena,
     ) -> Result<(), WireError> {
-        let result = recorder.fixed(scratch, EncoderOpcode::AdoptProgram, 0, || IdRecord {
+        let result = write_fixed(scratch, EncoderOpcode::AdoptProgram, 0, || IdRecord {
             id: self.registration,
         });
         if result.is_err() {
@@ -782,15 +773,13 @@ impl FrameRecorder {
             replies_bool: &mut self.replies_bool,
             completion_pool: &self.completion_pool,
         };
-        let result =
-            self.slab
-                .push_fixed_record(scratch, tag.into(), 0, size_of::<R>(), |destination| {
-                    build(
-                        pending.take().ok_or(WireError::InvalidValue)?,
-                        destination,
-                        &mut owners,
-                    )
-                });
+        let result = scratch.push_fixed_record(tag.into(), 0, size_of::<R>(), |destination| {
+            build(
+                pending.take().ok_or(WireError::InvalidValue)?,
+                destination,
+                &mut owners,
+            )
+        });
         if let Some(value) = pending {
             self.rejected_ops.push(value.into_rejected());
         }

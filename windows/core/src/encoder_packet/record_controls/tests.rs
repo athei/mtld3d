@@ -8,8 +8,8 @@ use crate::{
     visibility::VisibilityQueryCore,
 };
 
-fn first_payload<T: CommandRecord>(recorder: &FrameRecorder) -> &T {
-    let (address, length) = recorder.slab.ranges().next().unwrap();
+fn first_payload<T: CommandRecord>(scratch: &mut ScratchArena) -> &T {
+    let (address, length) = scratch.command_ranges().next().unwrap();
     assert!(length >= COMMAND_HEADER_BYTES as u64 + size_of::<T>() as u64);
     // SAFETY: the test retains the recorder's scratch arena and this exact initialized
     // command region. Its fixed header precedes a payload with the asserted size.
@@ -39,7 +39,7 @@ fn typed_viewport_is_constructed_in_final_command_storage() {
             },
         )
         .unwrap();
-    let record = first_payload::<SetViewportRecord>(&recorder);
+    let record = first_payload::<SetViewportRecord>(&mut scratch);
     assert_eq!(
         (record.x, record.y, record.width, record.height),
         (7, 9, 640, 480)
@@ -64,7 +64,7 @@ fn typed_query_retains_original_owner_and_captured_generation() {
             },
         )
         .unwrap();
-    assert_eq!(first_payload::<QueryRecord>(&recorder).generation, 37);
+    assert_eq!(first_payload::<QueryRecord>(&mut scratch).generation, 37);
     assert_eq!(recorder.queries.len(), 1);
     assert!(weak.upgrade().is_some());
     assert!(recorder.rejected_ops.is_empty());
@@ -92,7 +92,7 @@ fn latched_failure_retains_typed_owner_without_publishing_command() {
             )
             .is_err()
     );
-    assert!(recorder.slab.ranges().next().is_none());
+    assert!(scratch.command_ranges().next().is_none());
     assert!(recorder.queries.is_empty());
     assert_eq!(recorder.rejected_ops.len(), 1);
     assert!(weak.upgrade().is_some());

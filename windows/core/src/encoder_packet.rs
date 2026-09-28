@@ -26,8 +26,6 @@ mod owner;
 mod record_controls;
 pub use record_controls::CaptureControl;
 
-mod recording;
-use recording::RecordedCommands;
 mod replay;
 mod retirement;
 pub use retirement::{PacketRetirement, RetirementHooks};
@@ -48,7 +46,6 @@ pub struct FrameRecorder {
     gamma_tables: Vec<GammaTableOwner>,
     pagebox_pool: Option<&'static crate::page_box_pool::PageBoxPool>,
     completion_pool: crate::guest_completions::CompletionPool,
-    slab: RecordedCommands,
     metadata: MetadataStorage,
     draws: DrawWriter,
     pages: Vec<GuestPageLease>,
@@ -86,7 +83,6 @@ impl FrameRecorder {
             gamma_tables: Vec::new(),
             pagebox_pool: None,
             completion_pool,
-            slab: RecordedCommands::new(),
             metadata: MetadataStorage::new(),
             draws: DrawWriter::new(),
             pages: Vec::new(),
@@ -356,13 +352,9 @@ impl FrameRecorder {
             return Err(error);
         }
         let result = crate::encoder_draw::draw_payload_size(draw).and_then(|length| {
-            self.slab.push_fixed_record(
-                scratch,
-                u16::from(EncoderOpcode::Draw),
-                0,
-                length,
-                |destination| crate::encoder_draw::write_draw_into(draw, destination, length),
-            )
+            scratch.push_fixed_record(u16::from(EncoderOpcode::Draw), 0, length, |destination| {
+                crate::encoder_draw::write_draw_into(draw, destination, length)
+            })
         });
         self.finish_record(result)
     }
@@ -388,8 +380,7 @@ impl FrameRecorder {
         }
         let result = if vertices.extra.is_empty() {
             if let Some(index) = indices {
-                self.slab.push_fixed_record(
-                    scratch,
+                scratch.push_fixed_record(
                     u16::from(EncoderOpcode::Draw),
                     0,
                     SINGLE_INDEXED_BOUND_BYTES,
@@ -406,8 +397,7 @@ impl FrameRecorder {
                     },
                 )
             } else {
-                self.slab.push_fixed_record(
-                    scratch,
+                scratch.push_fixed_record(
                     u16::from(EncoderOpcode::Draw),
                     0,
                     SINGLE_BOUND_BYTES,
@@ -425,8 +415,7 @@ impl FrameRecorder {
             }
         } else {
             bound_payload_size(vertices, indices).and_then(|length| {
-                self.slab.push_fixed_record(
-                    scratch,
+                scratch.push_fixed_record(
                     u16::from(EncoderOpcode::Draw),
                     0,
                     length,
@@ -581,13 +570,8 @@ impl FrameRecorder {
         {
             return self.finish_record(Err(WireError::InvalidValue));
         }
-        let result = self.slab.push_fixed_record(
-            scratch,
-            u16::from(opcode),
-            start_row,
-            usize::from(rows) * 16,
-            fill,
-        );
+        let result =
+            scratch.push_fixed_record(u16::from(opcode), start_row, usize::from(rows) * 16, fill);
         self.finish_record(result)
     }
 
@@ -611,8 +595,7 @@ impl FrameRecorder {
         if let Some(error) = self.error {
             return Err(error);
         }
-        let result = self.slab.push_initialized_record(
-            scratch,
+        let result = scratch.push_initialized_record(
             u16::from(EncoderOpcode::SetSnapshot),
             0,
             crate::encoder_draw::SNAPSHOT_DELTA_MAX_BYTES,
@@ -633,7 +616,6 @@ impl FrameRecorder {
     /// Reuse capture allocations only after replay and all local references have ended.
     pub fn reset(&mut self) {
         self.gamma_tables.clear();
-        self.slab.clear();
         self.metadata.clear();
         self.draws.clear();
         self.registrations.clear();

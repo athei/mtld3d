@@ -112,8 +112,12 @@ impl FramePacket {
                 ..
             } = &mut packet;
             let recorder = recorder.as_mut().expect("new packet owns recorder");
+            let frame = frame.as_mut().expect("new packet owns frame");
             recorder.error.take().map_or_else(
-                || metadata.seal(frame.as_mut().expect("new packet owns frame"), recorder),
+                || {
+                    frame.scratch.publish_command_region()?;
+                    metadata.seal(frame, recorder)
+                },
                 Err,
             )
         };
@@ -141,9 +145,9 @@ impl FramePacket {
 
     #[must_use]
     pub fn operation_bytes(&self) -> &[u8] {
-        self.recorder
+        self.frame
             .as_ref()
-            .map_or(&[], |recorder| recorder.slab.descriptor_bytes())
+            .map_or(&[], |frame| frame.scratch.command_descriptor_bytes())
     }
 
     #[must_use]

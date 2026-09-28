@@ -145,17 +145,15 @@ impl FrameRecorder {
         if self.error.is_some() {
             return;
         }
-        let result =
-            self.slab
-                .push_fixed_record(scratch, tag.into(), 0, size_of::<T>(), |destination| {
-                    debug_assert_eq!(destination.len(), size_of::<T>());
-                    debug_assert!(destination.as_ptr().cast::<T>().is_aligned());
-                    // SAFETY: write_command reserves exactly this payload size at command
-                    // alignment. The assertion above bounds T's alignment, and CommandRecord
-                    // requires every byte of value to be initialized, with no implicit padding.
-                    unsafe { destination.as_mut_ptr().cast::<T>().write(value) };
-                    Ok(())
-                });
+        let result = scratch.push_fixed_record(tag.into(), 0, size_of::<T>(), |destination| {
+            debug_assert_eq!(destination.len(), size_of::<T>());
+            debug_assert!(destination.as_ptr().cast::<T>().is_aligned());
+            // SAFETY: write_command reserves exactly this payload size at command
+            // alignment. The assertion above bounds T's alignment, and CommandRecord
+            // requires every byte of value to be initialized, with no implicit padding.
+            unsafe { destination.as_mut_ptr().cast::<T>().write(value) };
+            Ok(())
+        });
         match result {
             Ok(()) => self.count += 1,
             Err(error) => self.error = Some(error),
