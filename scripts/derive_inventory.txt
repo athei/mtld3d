@@ -190,7 +190,7 @@ windows/core/src/pipeline_state.rs ExtraColorAttachments Clone,Copy,Debug,Partia
 windows/core/src/pipeline_state.rs PipelineAttachFlags Clone,Copy,Debug,Default,PartialEq,Eq,Hash
 windows/core/src/pipeline_state.rs PipelineRsBits Clone,Copy,Debug,Default,PartialEq,Eq,Hash
 windows/core/src/pipeline_state.rs PipelineRsFlags Clone,Copy,Debug,Default,PartialEq,Eq,Hash
-windows/core/src/pipeline_state.rs PipelineSnapshot Clone,PartialEq,Eq
+windows/core/src/pipeline_state.rs PipelineSnapshot Clone
 windows/core/src/pipeline_state.rs StreamLayout Clone,Copy,Debug,PartialEq,Eq,Hash
 windows/core/src/present.rs DisplaySync Clone,Copy,Debug,PartialEq,Eq
 windows/core/src/present.rs LayerPacing Clone,Copy,Debug,PartialEq,Eq

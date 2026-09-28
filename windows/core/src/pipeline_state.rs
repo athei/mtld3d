@@ -221,13 +221,13 @@ impl PipelineRsBits {
 /// the no-color twin in `get_or_create_pipeline`).
 ///
 /// `PartialEq`/`Eq` back the encoder's single-entry resolve memo: comparing
-/// two 48 B snapshots is cheaper than rebuilding the [`PipelineKey`] (its
+/// two snapshots is cheaper than rebuilding the [`PipelineKey`] (its
 /// D3D→Metal translations + the cache probe), and equality implies an
 /// identical key, so the memo can return the cached handle directly. The
 /// key is a pure function of the snapshot and the attribute list, and the
 /// list is a function of the declaration (`vdecl_hash`) and the vertex
 /// shader it was resolved against, whose identity `vs_fn` carries.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct PipelineSnapshot {
     pub vs_fn: MetalHandle<MTLFunctionKind>,
     pub ps_fn: MetalHandle<MTLFunctionKind>,
@@ -272,6 +272,39 @@ pub struct PipelineSnapshot {
     /// because D3D9 caps the enum at 16 samples.
     pub sample_count: u8,
 }
+
+// Written out rather than derived because the memo compares a snapshot on
+// every draw: the derived compare tests the sixteen stream layouts field by
+// field, a branch each, while `same_layouts` folds them into one reduction.
+// The destructuring names every field, so a new field fails to compile here.
+impl PartialEq for PipelineSnapshot {
+    fn eq(&self, other: &Self) -> bool {
+        let Self {
+            vs_fn,
+            ps_fn,
+            vdecl_hash,
+            stream_layouts,
+            color_format,
+            attach,
+            rs,
+            extra,
+            ps_color_out_mask,
+            sample_count,
+        } = self;
+        *vs_fn == other.vs_fn
+            && *ps_fn == other.ps_fn
+            && *vdecl_hash == other.vdecl_hash
+            && *color_format == other.color_format
+            && *attach == other.attach
+            && *rs == other.rs
+            && *extra == other.extra
+            && *ps_color_out_mask == other.ps_color_out_mask
+            && *sample_count == other.sample_count
+            && same_layouts(stream_layouts, &other.stream_layouts)
+    }
+}
+
+impl Eq for PipelineSnapshot {}
 
 impl PipelineSnapshot {
     /// Effective Metal write mask of extra target `extra_index` (slot `extra_index + 1`).
@@ -638,6 +671,27 @@ fn effective_blend(rs: &PipelineRsBits) -> EffectiveBlend {
         op_alpha,
         separate_alpha,
     }
+}
+
+/// Whether two layout arrays are equal, folded into one reduction with no branch per field.
+///
+/// The destructuring names every field, so a new field fails to compile here.
+fn same_layouts(
+    left: &[StreamLayout; MAX_STREAMS as usize],
+    right: &[StreamLayout; MAX_STREAMS as usize],
+) -> bool {
+    let mut difference = 0;
+    for (left, right) in left.iter().zip(right) {
+        let StreamLayout {
+            stride,
+            step,
+            step_rate,
+        } = left;
+        difference |= (stride ^ right.stride)
+            | (*step as u32 ^ right.step as u32)
+            | (step_rate ^ right.step_rate);
+    }
+    difference == 0
 }
 
 #[cfg(test)]

@@ -673,3 +673,38 @@ fn attrs_hash_covers_every_attribute_field() {
     }
     assert_ne!(h, VertexAttrsHash::from_attrs(&[attr, attr]), "count");
 }
+
+#[test]
+fn snapshot_equality_sees_every_field_and_every_stream_layout() {
+    let original = base();
+    assert!(original == base(), "equal snapshots compare equal");
+    let mut changed: Vec<PipelineSnapshot> = Vec::new();
+    let mut push = |edit: &dyn Fn(&mut PipelineSnapshot)| {
+        let mut snapshot = base();
+        edit(&mut snapshot);
+        changed.push(snapshot);
+    };
+    // SAFETY: tests; opaque values never dereferenced.
+    push(&|s| s.vs_fn = unsafe { MetalHandle::new(0x1001) });
+    // SAFETY: tests; opaque values never dereferenced.
+    push(&|s| s.ps_fn = unsafe { MetalHandle::new(0x2001) });
+    push(&|s| s.vdecl_hash = 0x3001);
+    push(&|s| s.color_format = PixelFormat::Rgba8Unorm);
+    push(&|s| s.attach.remove(PipelineAttachFlags::HAS_DEPTH));
+    push(&|s| s.rs.color_write_mask_ext[2] = 0x7);
+    push(&|s| s.extra = with_rt1().extra);
+    push(&|s| s.ps_color_out_mask = 0b11);
+    push(&|s| s.sample_count = 4);
+    for stream in [0, 7, 15] {
+        push(&|s| s.stream_layouts[stream].stride = 12);
+        push(&|s| s.stream_layouts[stream].step = VertexStepFunction::PerInstance);
+        push(&|s| s.stream_layouts[stream].step_rate = 2);
+    }
+    for (index, snapshot) in changed.iter().enumerate() {
+        assert!(*snapshot != original, "edit {index} is compared");
+        assert!(
+            snapshot.clone() == *snapshot,
+            "edit {index} equals its copy"
+        );
+    }
+}
