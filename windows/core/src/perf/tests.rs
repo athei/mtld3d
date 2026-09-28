@@ -588,7 +588,7 @@ fn summary_golden_layout() {
         "\n",
         "Commands / passes (raw window totals)\n",
         "  passes=4         commands=140         draws=100\n",
-        "  pipeline memo  97 / 100  (97.0%)  consecutive-draw resolve elided\n",
+        "  pipeline memo  97 / 100  (97.0%)  recent-draw resolve elided\n",
         "  fan generated  0         indexed / oversized fans rewritten per draw (slow path; 0 is the goal)\n",
         "  up indexed     3         DrawIndexedPrimitiveUP draws (inline indices copied into the upload ring)\n",
         "  up oversized   2         UP draws past the 4 KiB inline limit (vertices copied into the upload ring)\n",

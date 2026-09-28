@@ -37,7 +37,7 @@ use mtld3d_core::{
         compilation::{Identity as CompileIdentity, Kind as CompileKind},
         perf_enabled,
     },
-    pipeline_state::{PipelineKey, PipelineSnapshot},
+    pipeline_state::PipelineKey,
     render_scale::{RenderScale, TargetExtent},
     sampler_state,
     scratch::ScratchArena,
@@ -958,19 +958,17 @@ pub struct FrameEncoder {
     /// until device teardown destroys them, so the mapping never dangles; no
     /// per-frame clear.
     no_color_pipeline_alt: FxHashMap<u64, MetalHandle<MTLRenderPipelineStateKind>>,
-    /// Single-entry "L0" memo in front of `pipeline_cache`.
+    /// The recent built pipelines by snapshot, in front of `pipeline_cache`.
     ///
-    /// `(last with-color snapshot → its handle)`. Consecutive draws
-    /// overwhelmingly reuse the same pipeline (identical shaders + vdecl +
-    /// blend + RT), so an equal snapshot returns the handle without
-    /// rebuilding the `PipelineKey` (its D3D→Metal translations) or
-    /// probing the cache. Holds a `PipelineSnapshot` (all-`Copy` fields,
-    /// no borrowed/arena pointer) + the `u64` handle, so it persists
-    /// across frames safely — `pipeline_cache` never evicts, so a
-    /// snapshot→handle mapping stays valid for the device's lifetime. Only
-    /// successful (non-null) resolves are stored; a failing snapshot goes to
-    /// `pipeline_cache`, which remembers the failure.
-    last_pipeline_memo: Option<(PipelineSnapshot, u64)>,
+    /// An equal snapshot returns the handle without rebuilding the
+    /// `PipelineKey` (its D3D→Metal translations) or probing the cache. It
+    /// holds `PipelineSnapshot`s (all-`Copy` fields, no borrowed/arena
+    /// pointer) and `u64` handles, so it persists across frames safely:
+    /// `pipeline_cache` never evicts, so a snapshot→handle mapping stays
+    /// valid for the device's lifetime. Only successful (non-null) resolves
+    /// are stored; a failing snapshot goes to `pipeline_cache`, which
+    /// remembers the failure.
+    pipeline_memo: mtld3d_core::pipeline_memo::PipelineMemo,
     /// Parsed programs by content-hash id, shared with the compile jobs that emit from them.
     program_cache: FxHashMap<ProgramId, Arc<DxsoProgram>>,
     /// Per-PS declared sampler slots + types, computed once at registration.
@@ -1538,7 +1536,7 @@ impl FrameEncoder {
             dc_write_back_scratch: MetalHandle::NULL,
             dc_write_back_scratch_key: (0, 0, PixelFormat::Bgra8Unorm),
             no_color_pipeline_alt: FxHashMap::default(),
-            last_pipeline_memo: None,
+            pipeline_memo: mtld3d_core::pipeline_memo::PipelineMemo::default(),
             program_cache: FxHashMap::default(),
             prog_sampler_decls: FxHashMap::default(),
             prog_reads_vpos: FxHashSet::default(),

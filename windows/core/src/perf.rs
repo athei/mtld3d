@@ -1057,7 +1057,7 @@ struct EncoderFrameCounters {
     /// Pipeline-resolve memo effectiveness.
     ///
     /// `calls` counts every `get_or_create_pipeline` invocation; `hits`
-    /// the subset the single-entry snapshot memo served without
+    /// the subset the recent-snapshot memo served without
     /// rebuilding the key.
     pipeline_memo_hits: u32,
     pipeline_memo_calls: u32,
@@ -2088,7 +2088,7 @@ impl EncoderPerfState {
         self.enc.pipeline_memo_calls = self.enc.pipeline_memo_calls.saturating_add(1);
     }
 
-    /// Count one pipeline-resolve memo hit (snapshot matched the previous draw).
+    /// Count one pipeline-resolve memo hit (snapshot matched a recent draw's).
     pub const fn bump_pipeline_memo_hit(&mut self) {
         self.enc.pipeline_memo_hits = self.enc.pipeline_memo_hits.saturating_add(1);
     }
@@ -5263,7 +5263,7 @@ impl<'a> Summary<'a> {
             d = w.draws.sum,
         );
         // Pipeline-resolve memo hit rate — share of get_or_create_pipeline
-        // calls the single-entry snapshot memo served without a key build +
+        // calls the recent-snapshot memo served without a key build +
         // cache probe. Higher = more per-draw resolve work elided.
         let memo_hits = w.pipeline_memo_hits.sum;
         let memo_calls = w.pipeline_memo_calls.sum;
@@ -5274,7 +5274,7 @@ impl<'a> Summary<'a> {
         };
         let _ = writeln!(
             out,
-            "  pipeline memo  {memo_hits} / {memo_calls}  ({memo_pct:.1}%)  consecutive-draw resolve elided",
+            "  pipeline memo  {memo_hits} / {memo_calls}  ({memo_pct:.1}%)  recent-draw resolve elided",
         );
         // Fan draws off the shared pattern buffer: each one rewrote its
         // index list on the API thread and copied it into the unix upload

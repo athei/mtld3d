@@ -909,20 +909,16 @@ impl FrameEncoder {
         shaders: &ShaderRef<'_>,
     ) -> Resolution<u64> {
         self.perf.bump_pipeline_memo_call();
-        // L0 memo: a draw whose pipeline snapshot is identical to the
-        // previous one returns the cached handle without rebuilding the
-        // `PipelineKey` (its D3D→Metal translations) or probing
-        // `pipeline_cache`. It also skips the no-color twin's second resolve
-        // below. A successful sibling mapping is process-lifetime. Only
-        // built primaries are memoised: a pending or failing snapshot goes
-        // on to `resolve_pipeline`, whose cache answers pending or failed on
-        // the probe. The `match` copies the handle out so the memo borrow
-        // ends before the `&mut perf` bump.
-        let memo_hit = match &self.last_pipeline_memo {
-            Some((prev, handle)) if *prev == *snapshot => Some(*handle),
-            _ => None,
-        };
-        if let Some(handle) = memo_hit {
+        // The memo: a draw whose pipeline snapshot equals a recent one
+        // returns the cached handle without rebuilding the `PipelineKey`
+        // (its D3D→Metal translations) or probing `pipeline_cache`. It also
+        // skips the no-color twin's second resolve below. A successful
+        // sibling mapping is process-lifetime. Only built primaries are
+        // memoised: a pending or failing snapshot goes on to
+        // `resolve_pipeline`, whose cache answers pending or failed on the
+        // probe. The no-color twin is resolved beside its primary and never
+        // recorded, so it takes no entry.
+        if let Some(handle) = self.pipeline_memo.lookup(snapshot) {
             self.perf.bump_pipeline_memo_hit();
             return Resolution::Ready(handle);
         }
@@ -941,7 +937,7 @@ impl FrameEncoder {
         self.queue_no_color_sibling(snapshot, vertex_attrs, with_color, |enc| {
             pipeline_identity(&enc.program_cache, shaders)
         });
-        self.last_pipeline_memo = Some((snapshot.clone(), with_color.raw()));
+        self.pipeline_memo.record(snapshot, with_color.raw());
         Resolution::Ready(with_color.raw())
     }
 
@@ -953,9 +949,9 @@ impl FrameEncoder {
     /// Rule H keeps color when there is no depth attachment. Its unused
     /// sibling would have no attachments, which Mac2 Metal rejects.
     /// A successful sibling mapping stays valid as long as the pipeline
-    /// cache, so an L0 miss can reuse it without rebuilding the alternate
+    /// cache, so a memo miss can reuse it without rebuilding the alternate
     /// snapshot and key. The sibling builds asynchronously and nothing
-    /// waits for it: until its mapping lands (at install, or on an L0 miss
+    /// waits for it: until its mapping lands (at install, or on a memo miss
     /// that finds it built), Rule H keeps the pass's color. A failed
     /// sibling leaves no mapping, and `resolve_pipeline` answers failed
     /// from its cache without another build.
@@ -975,7 +971,7 @@ impl FrameEncoder {
             // No-color twin: same identity except the attach flag (and no
             // render targets 1..3, which Rule H strips together with target
             // 0). Explicit `.clone()` because PipelineSnapshot is not Copy;
-            // fires on L0 misses until the sibling has a mapping.
+            // fires on memo misses until the sibling has a mapping.
             let mut alt = snapshot.clone();
             alt.remove_color_output();
             if let Resolution::Ready(no_color) =
