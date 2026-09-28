@@ -78,11 +78,17 @@ rustflags = ["-C", "target-feature=-crt-static"]
 # clang-style), so these flags propagate without needing an MSVC `/arch:`
 # spelling.
 #
-# `-fno-omit-frame-pointer` stays unconditional here, unlike the Rust side's
-# `FP=1` knob: cc and cmake take the whole flag string from the first matching
-# environment variable with no composition, so the knob could only reach them by
-# restating everything above in the Makefile. This is a fixed, small amount of
-# code (snmalloc-sys and zstd-sys) whose frames are worth keeping walkable.
+# cc-rs builds each command line from `CFLAGS`, then `TARGET_CFLAGS` or
+# `HOST_CFLAGS`, then these `CFLAGS_<target>` values, all concatenated in that
+# order, and appends them after the flags and defines a build script adds
+# itself. That is how a production build adds `NDEBUG` through the plain
+# `CFLAGS` (see the Makefile) without restating anything here.
+#
+# `-fno-omit-frame-pointer` stays unconditional here rather than following the
+# Rust side's `FP=1` knob: this is a fixed, small amount of code (snmalloc-sys
+# and zstd-sys) whose frames are worth keeping walkable in every build. Because
+# these flags come last, it also overrides the `-fomit-frame-pointer` that
+# snmalloc-sys's build script adds.
 CFLAGS_i686-pc-windows-msvc     = "-march=nehalem -fno-omit-frame-pointer -idirafter /opt/xwin/crt/include -idirafter /opt/xwin/sdk/include/ucrt -idirafter /opt/xwin/sdk/include/um -idirafter /opt/xwin/sdk/include/shared"
 CFLAGS_x86_64-pc-windows-msvc   = "-march=x86-64-v2 -fno-omit-frame-pointer -idirafter /opt/xwin/crt/include -idirafter /opt/xwin/sdk/include/ucrt -idirafter /opt/xwin/sdk/include/um -idirafter /opt/xwin/sdk/include/shared"
 CXXFLAGS_i686-pc-windows-msvc   = "-march=nehalem -fno-omit-frame-pointer -idirafter /opt/xwin/crt/include -idirafter /opt/xwin/sdk/include/ucrt -idirafter /opt/xwin/sdk/include/um -idirafter /opt/xwin/sdk/include/shared"

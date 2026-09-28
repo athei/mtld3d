@@ -165,6 +165,27 @@ endif
 ifeq ($(PROD),1)
 PROFILE  := production
 $(info ==> PROD=1: cargo profile `production` (fat LTO + codegen-units=1))
+# Production carries no debug assertions, Rust or C/C++ (docs/CONVENTIONS.md,
+# "Production carries no debug assertions"). The cargo profile turns off
+# `debug-assertions`; this turns off `assert` in the C, C++ and Objective-C
+# that build scripts compile through cc-rs (snmalloc-sys and zstd-sys in the PE
+# DLLs, the delegate forward in the Unix dylib), for every target of both
+# workspaces. cc-rs appends the plain `CFLAGS` / `CXXFLAGS` to the
+# `CFLAGS_<target>` values in the `.cargo/config.toml` files, so the per-target
+# flags there stay. The plain names and not `TARGET_CFLAGS`: cc-rs reads
+# `HOST_CFLAGS` instead when the target is the build machine's own, as
+# aarch64-apple-darwin is on an Apple Silicon Mac. `override` keeps a `CFLAGS`
+# given on the command line from replacing the flag instead of receiving it.
+# The filter keeps a nested make from adding the flag twice, which would change
+# the variable and rebuild every C dependency. `PRODUCTION_ASSERT_GATE` below
+# checks the result.
+ifeq ($(filter -DNDEBUG,$(CFLAGS)),)
+override CFLAGS += -DNDEBUG
+endif
+ifeq ($(filter -DNDEBUG,$(CXXFLAGS)),)
+override CXXFLAGS += -DNDEBUG
+endif
+export CFLAGS CXXFLAGS
 else
 PROFILE  := release
 endif
@@ -414,7 +435,7 @@ TAG          ?= $(shell git describe --tags --exact-match 2>/dev/null)
 .PHONY: all windows windows-i686 windows-x86_64 windows-arm64x unix unix-x64 unix-arm64 \
 	install install-windows-i686 install-windows-x86_64 install-windows-arm64x install-arm64 \
 	install-unix-x64 install-unix-arm64 \
-	bundle version-check stage clean-isolated clean-isolated-orphans \
+	bundle version-check production-assert-gate stage clean-isolated clean-isolated-orphans \
 	configure-test-prefix configure-test-prefix-locked configure-test-prefix-session \
 	configure-test-prefix-boot \
 	test test-unit test-e2e-i686 test-e2e-x86_64 test-e2e-i686-arm64 test-e2e-x86_64-arm64 \
@@ -630,7 +651,45 @@ define MTLD3D_TREE
 if [ -d $(1)/lib/wine/d3d9/mtld3d ]; then echo $(1)/lib/wine/d3d9/mtld3d; else echo $(1)/lib/wine; fi
 endef
 
+# The check behind the NDEBUG wiring at the top of this file: a production
+# binary carries no C or C++ assertion path. An `assert` compiled without NDEBUG
+# leaves an import of the C library's handler, `__assert_rtn` in a Mach-O image
+# and `_assert` or `_wassert` in a PE. snmalloc's own checks do not go through
+# that handler and leave their message format instead. snmalloc is linked into
+# the PE DLLs only, and the message check runs on every file anyway, so a later
+# link into the Unix dylib is covered without a change here. The tools are the
+# toolchain's llvm-tools, which `make setup-rust` installs; a tool that fails
+# fails the gate. `PRODUCTION_ASSERT_CHECK` names the files; every production
+# install leaf (the ARM64X one included) and `bundle` run it on what they ship,
+# and `production-assert-gate` runs it on the files `ASSERT_GATE_FILES` names,
+# which include the ARM64X pair with EC=1. That target refuses to run without
+# PROD=1, because its default files would otherwise be the `release` build,
+# which is not held to this rule.
+PRODUCTION_ASSERT_TOOLS = $(shell rustc +$(RUST_STABLE) --print sysroot)/lib/rustlib/$(UNIX_NATIVE_TARGET)/bin
+define PRODUCTION_ASSERT_GATE
+for f in $(1); do \
+	case $$f in \
+	*.dll) imports=$$($(PRODUCTION_ASSERT_TOOLS)/llvm-readobj --coff-imports $$f) || { echo "production-assert-gate: cannot read the imports of $$f" >&2; exit 1; } ; \
+	       hits=$$(printf '%s\n' "$$imports" | sed -n 's/^ *Symbol: \(_w\{0,1\}assert\) (.*/\1/p') ;; \
+	*)     imports=$$($(PRODUCTION_ASSERT_TOOLS)/llvm-nm -u $$f) || { echo "production-assert-gate: cannot read the imports of $$f" >&2; exit 1; } ; \
+	       hits=$$(printf '%s\n' "$$imports" | grep -x -E '_+assert_rtn') ;; \
+	esac ; \
+	if [ -n "$$hits" ]; then echo "production-assert-gate: $$f imports the C assertion handler $$hits: a C or C++ object was built without NDEBUG" >&2; exit 1; fi ; \
+	if LC_ALL=C grep -a -q -F 'assert fail: {} in {} on {} ' $$f; then echo "production-assert-gate: $$f carries snmalloc's assertion message: snmalloc was built without NDEBUG" >&2; exit 1; fi ; \
+done ; \
+echo "production-assert-gate: no C or C++ assertion path in $(1)"
+endef
+PRODUCTION_ASSERT_CHECK = $(if $(filter production,$(PROFILE)),$(call PRODUCTION_ASSERT_GATE,$(1)))
+
+ASSERT_GATE_FILES ?= $(OUT_i386)/d3d9.dll $(OUT_i386)/mtld3d.dll $(OUT_x64)/d3d9.dll \
+	$(OUT_x64)/mtld3d.dll $(OUT_unix_x64)/mtld3d.so $(OUT_unix_arm64)/mtld3d.so \
+	$(if $(EC_LEG),$(OUT_arm64x)/d3d9.dll $(OUT_arm64x)/mtld3d.dll)
+production-assert-gate:
+	$(if $(filter production,$(PROFILE)),,@echo "production-assert-gate: checks production builds; run it with PROD=1" >&2; exit 2)
+	$(call PRODUCTION_ASSERT_GATE,$(ASSERT_GATE_FILES))
+
 install-windows-i686: $(if $(STAGE),,windows-i686)
+	$(call PRODUCTION_ASSERT_CHECK,$(OUT_i386)/d3d9.dll $(OUT_i386)/mtld3d.dll)
 	for dir in $(INSTALL_DIRS); do \
 		tree=$$($(call MTLD3D_TREE,$$dir)) ; \
 		mkdir -p $$tree/i386-windows ; \
@@ -645,6 +704,7 @@ install-windows-i686: $(if $(STAGE),,windows-i686)
 	done
 
 install-windows-x86_64: $(if $(STAGE),,windows-x86_64)
+	$(call PRODUCTION_ASSERT_CHECK,$(OUT_x64)/d3d9.dll $(OUT_x64)/mtld3d.dll)
 	for dir in $(INSTALL_DIRS); do \
 		tree=$$($(call MTLD3D_TREE,$$dir)) ; \
 		mkdir -p $$tree/x86_64-windows ; \
@@ -680,6 +740,7 @@ define ARM64_REQUIRE_RUNTIME
 endef
 
 install-windows-arm64x: $(if $(STAGE),,windows-arm64x unix-arm64) | $(ARM64X_INSTALL_AFTER)
+	$(call PRODUCTION_ASSERT_CHECK,$(OUT_arm64x)/d3d9.dll $(OUT_arm64x)/mtld3d.dll $(OUT_unix_arm64)/mtld3d.so)
 	$(ARM64_REQUIRE_RUNTIME)
 	dir='$(ARM64X_INSTALL_DIR)' ; \
 	tree=$$($(call MTLD3D_TREE,$$dir)) ; \
@@ -741,6 +802,7 @@ install-arm64:
 # default unix dir carries no mtld3d.so at all, so one an earlier install left
 # there goes.
 install-unix-x64: $(if $(STAGE),,unix-x64)
+	$(call PRODUCTION_ASSERT_CHECK,$(OUT_unix_x64)/mtld3d.so)
 	for dir in $(INSTALL_DIRS); do \
 		tree=$$($(call MTLD3D_TREE,$$dir)) ; \
 		mkdir -p $$tree/$(UNIX_WINEDIR_x64) ; \
@@ -753,6 +815,7 @@ install-unix-x64: $(if $(STAGE),,unix-x64)
 	done
 
 install-unix-arm64: $(if $(STAGE),,unix-arm64)
+	$(call PRODUCTION_ASSERT_CHECK,$(OUT_unix_arm64)/mtld3d.so)
 	for dir in $(INSTALL_DIRS); do \
 		tree=$$($(call MTLD3D_TREE,$$dir)) ; \
 		mkdir -p $$tree/$(UNIX_WINEDIR_arm64) ; \
@@ -818,6 +881,7 @@ version-check:
 # symbols in the debug archive. It gets no native/ copy and no prefix marker,
 # since neither route has been run with it.
 bundle: all
+	$(call PRODUCTION_ASSERT_CHECK,$(ASSERT_GATE_FILES))
 	rm -rf $(BUNDLE_STAGE) $(BUNDLE_OUT) $(DEBUG_STAGE) $(DEBUG_OUT)
 	mkdir -p $(BUNDLE_STAGE)/wine/i386-windows
 	mkdir -p $(BUNDLE_STAGE)/wine/x86_64-windows
