@@ -39,6 +39,18 @@ Two commands, both green before you commit:
   many of its checks fail by design, so it gates on a regression against a
   baseline instead of on zero failures.
 
+With `EC=1` (the opt-in ARM64X leg, see the `README.md`) both gates grow a
+leg: `make check` lints the two ARM64X halves, and `make test` adds
+`test-e2e-arm64x`, which installs the ARM64X pair into the arm64 Wine that
+`WINE_ARM64` names, creates a fresh prefix for it (a prefix only knows the
+builtins that were installed when it was made) and runs the x64 suite there
+one test at a time. It leaves out one test with the runner's `--skip`,
+`window_lifecycle::devices_and_windows_come_and_go_on_several_threads_at_once`,
+which deadlocks in that Wine's winemac; the Makefile says why beside the skip.
+`EC=1 make conformance` adds `conformance-arm64x` the same way
+(`unix/conformance/CONFORMANCE.md`, "The ARM64X leg"). The four environment
+variables the leg reads are listed in the `README.md`.
+
 `make fmt` uses nightly rustfmt. If a toolchain bump reformats files you never
 touched, that churn is its own pull request, not a hand-revert and not a passenger
 in yours.

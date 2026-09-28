@@ -20,6 +20,7 @@ fn defaults_fill_in_behind_the_mandatory_pair() {
     assert_eq!(config.timeout, Duration::from_mins(1));
     assert!(config.fail_fast);
     assert!(config.filter.is_empty());
+    assert!(config.skip.is_empty());
     assert!(config.log_dir.is_none());
     assert!(!config.ignored);
     assert_eq!(config.exes.len(), 2);
@@ -37,6 +38,8 @@ fn every_flag_is_read() {
         "--no-fail-fast",
         "--filter",
         "msaa:: stencil",
+        "--skip",
+        "msaa::resolve window_lifecycle::",
         "--log-dir",
         "/l",
         "--ignored",
@@ -48,6 +51,7 @@ fn every_flag_is_read() {
     assert_eq!(config.timeout, Duration::from_mins(4));
     assert!(!config.fail_fast);
     assert_eq!(config.filter, ["msaa::", "stencil"]);
+    assert_eq!(config.skip, ["msaa::resolve", "window_lifecycle::"]);
     assert_eq!(config.log_dir.as_deref(), Some(Path::new("/l")));
     assert!(config.ignored);
 }
@@ -60,5 +64,6 @@ fn missing_and_malformed_inputs_name_themselves() {
     assert!(err(&["--wine", "/w", "--jobs", "0", "--", "/a"]).contains("--jobs"));
     assert!(err(&["--wine", "/w", "--timeout", "x", "--", "/a"]).contains("--timeout"));
     assert!(err(&["--wine", "/w", "--log-dir"]).contains("--log-dir"));
+    assert!(err(&["--wine", "/w", "--skip"]).contains("--skip"));
     assert!(err(&["--wine", "/w", "--bogus", "--", "/a"]).contains("--bogus"));
 }

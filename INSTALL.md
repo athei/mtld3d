@@ -44,7 +44,8 @@ matching the arch of the Wine build itself: an x86_64 Wine takes
 round. Nothing to choose: copy both, or the one your Wine needs. The PE side
 is x86 in either case.
 
-A bundle built from source with `EC=1` (see the `README.md`) also carries
+A bundle built from source with `EC=1` (the `README.md` lists what that
+build needs, the environment variables naming its toolchain among it) also carries
 `wine/aarch64-windows/`, holding `d3d9.dll` and `mtld3d.dll` as builtin-marked
 ARM64X images; release bundles do not. Copied into an arm64 Wine with the rest
 of `wine/`, they serve x64 games in prefixes created after the copy, which

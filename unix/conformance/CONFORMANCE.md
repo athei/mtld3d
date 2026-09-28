@@ -20,6 +20,7 @@ make conformance-intel-i686     # one arch under the intel.* keys
 make conformance-scale          # both arches at render.scale = 0.75
 make conformance-scale-i686     # one arch at render.scale = 0.75 (what CI runs, on one image)
 make conformance-baseline       # (re)record this machine's six legs of baseline.txt in sequence
+EC=1 make conformance-arm64x    # the x86_64 binary under the arm64 Wine (The ARM64X leg, below)
 ```
 
 A leg is one architecture under one variant on one GPU family. The `intel`
@@ -47,6 +48,25 @@ Intel image is the one Mac2 machine the project runs on: dispatch the
 workflow with `record_intel_baseline` and copy the `@mac2` sections out of
 the `baseline-mac2-<arch>` artifacts (`make conformance-baseline` on an Apple
 Silicon machine leaves them untouched, the merge being leg-scoped).
+
+### The ARM64X leg
+
+`EC=1 make conformance` adds `conformance-arm64x`: the x86_64 `d3d9_test.exe`
+that `conformance-x86_64` runs, out of the x86_64 Wine SDK (a PE test runs
+under any Wine), run under the arm64 Wine that `WINE_ARM64` names, whose x64
+processes load the ARM64X `d3d9.dll` and `mtld3d.dll` `make install` put
+there. It runs in a prefix of its own, created afresh after the install and
+configured by `configure-test-prefix` as the other legs' prefixes are.
+
+It has no baseline entries of its own. It records under the `x86_64` label, so
+the runner judges it against the `[x86_64/...]` entries, which were taken on
+the x86_64 Wine the SDK is (the header's `Wine:` line names it, and the runner
+warns that the arm64 Wine's version differs), and on the same Apple GPU
+family. What it reports is therefore how the arm64 runtime differs from that
+baseline: the ARM64X build, CrossOver's arm64 Wine and its x64 translation
+together. How such a run should be keyed, as a leg of its own or under the
+x86_64 entries, is not decided, so there is no `conformance-baseline-arm64x`,
+and a site this leg moves is not reclassified here on its evidence alone.
 
 Set `MTLD3D_CONFORMANCE_RAW_DIR=<dir>` to also persist each subtest's full raw
 output to `<dir>/<leg>-<subtest>.log`. The normal run reduces output to per-site

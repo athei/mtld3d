@@ -15,6 +15,8 @@ pub struct Config {
     pub fail_fast: bool,
     /// `--filter`: substrings a test id has to contain one of; empty = every test.
     pub filter: Vec<String>,
+    /// `--skip`: substrings of which a test id may contain none; empty = skip nothing.
+    pub skip: Vec<String>,
     /// `--log-dir`: where the files of a dead process go; `None` = beside the test binary.
     pub log_dir: Option<PathBuf>,
     /// `--ignored`: run only the tests marked `#[ignore]`, which every other run skips.
@@ -27,6 +29,8 @@ pub struct Config {
 ///
 /// Recognised: `--wine <path>`, `--jobs <N>`, `--timeout <secs>`,
 /// `--no-fail-fast`, `--filter <patterns>` (whitespace-separated),
+/// `--skip <patterns>` (whitespace-separated, applied after `--filter`, so a
+/// test that contains one is left out whatever the filter chose),
 /// `--log-dir <path>`, `--ignored`, then `--` and the test binaries.
 /// `--wine` and at least one binary are mandatory; `--jobs` defaults to 1,
 /// `--timeout` to 60 seconds, and the log directory to the one the layer
@@ -44,6 +48,7 @@ pub fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Config, Stri
     let mut timeout = Duration::from_mins(1);
     let mut fail_fast = true;
     let mut filter = Vec::new();
+    let mut skip = Vec::new();
     let mut log_dir: Option<PathBuf> = None;
     let mut ignored = false;
     let mut exes = Vec::new();
@@ -84,6 +89,12 @@ pub fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Config, Stri
                     .ok_or_else(|| "--filter needs patterns".to_owned())?;
                 filter.extend(value.split_whitespace().map(str::to_owned));
             }
+            "--skip" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "--skip needs patterns".to_owned())?;
+                skip.extend(value.split_whitespace().map(str::to_owned));
+            }
             "--log-dir" => {
                 let value = args
                     .next()
@@ -106,6 +117,7 @@ pub fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Config, Stri
         timeout,
         fail_fast,
         filter,
+        skip,
         log_dir,
         ignored,
         exes,

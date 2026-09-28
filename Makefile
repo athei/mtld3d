@@ -2,15 +2,25 @@ ifndef WINE_SDK
 $(error WINE_SDK is not set)
 endif
 
-# Where the EC=1 leg (`windows-arm64x`) finds Wine's two ARM64X link archives,
-# `libwinecrt0.a` and `libntdll.a`, under `lib/wine/aarch64-windows`. The Wine
-# SDK is an x86 Wine and carries neither, so they come from a Wine tree of their
-# own, which wine-build's "ARM64X link libraries" step stages as
-# `dist/wine-arm64x` beside the SDK's `dist/wine`. Taken here, before ISOLATED=1
-# below points WINE_SDK at a clone that has no sibling.
-ifndef WINE_SDK_ARM64X
-WINE_SDK_ARM64X := $(WINE_SDK)-arm64x
-endif
+# The EC=1 legs (`windows-arm64x` and what builds on it) read four paths that
+# have no default here. Each comes from the environment or the command line,
+# each target that needs one fails naming it when it is unset or points at the
+# wrong thing, and no target without EC=1 reads any of them:
+#
+#   WINE_SDK_ARM64X  a tree holding Wine's two ARM64X link archives,
+#                    `libwinecrt0.a` and `libntdll.a`, under
+#                    `lib/wine/aarch64-windows`: what wine-build's "ARM64X link
+#                    libraries" step stages as `dist/wine-arm64x`. The Wine SDK
+#                    is an x86 Wine and carries neither. The build and the
+#                    clippy leg read it.
+#   LLVM_MINGW       an llvm-mingw install, whose ARM64 and ARM64EC sysroots
+#                    are the CRT the link takes. The build reads it.
+#   ARM64X_LLD       an `lld-link` of LLD 23 or newer, such as Homebrew's
+#                    `lld`. The build reads it.
+#   WINE_ARM64       an arm64 Wine tree, the directory holding `bin/wine` and
+#                    `lib/wine`, that the install, end-to-end and conformance
+#                    legs install the ARM64X DLLs into and run under.
+#                    ISOLATED=1 below clones it as it clones the SDK.
 
 # Clone the directory tree $(1) to $(2), cheapest mechanism first. On one APFS
 # volume clonefile(2) takes a directory and clones the whole hierarchy in a
@@ -68,6 +78,16 @@ endif
 override WINE_SDK := $(ISOLATED_ROOT)/sdk
 override WINE_INSTALL_DIR := $(ISOLATED_ROOT)/sdk
 override WINEPREFIX := $(ISOLATED_ROOT)/prefix
+# The arm64 Wine of the EC=1 legs, cloned the same way once it names a Wine
+# tree; one that names none is left as it is, for the legs to report.
+ifeq ($(EC),1)
+ifneq ($(wildcard $(WINE_ARM64)/bin/wine),)
+ifneq ($(ISOLATED_CLEANING),1)
+$(shell [ -d $(ISOLATED_ROOT)/sdk-arm64 ] || $(call clone_tree,$(WINE_ARM64),$(ISOLATED_ROOT)/sdk-arm64))
+endif
+override WINE_ARM64 := $(ISOLATED_ROOT)/sdk-arm64
+endif
+endif
 export WINEPREFIX
 $(info ==> ISOLATED=1: WINE_SDK=$(WINE_SDK) WINE_INSTALL_DIR=$(WINE_INSTALL_DIR) WINEPREFIX=$(WINEPREFIX))
 endif
@@ -372,8 +392,8 @@ TAG          ?= $(shell git describe --tags --exact-match 2>/dev/null)
 	bundle version-check stage clean-isolated clean-isolated-orphans \
 	configure-test-prefix configure-test-prefix-locked configure-test-prefix-session \
 	configure-test-prefix-boot \
-	test test-unit test-e2e-i686 test-e2e-x86_64 bench bench-ab bench-compare bench-shape clean-bench-ab bench-host bench-host-build \
-	conformance conformance-i686 conformance-x86_64 \
+	test test-unit test-e2e-i686 test-e2e-x86_64 test-e2e-arm64x bench bench-ab bench-compare bench-shape clean-bench-ab bench-host bench-host-build \
+	conformance conformance-i686 conformance-x86_64 conformance-arm64x \
 	conformance-baseline conformance-baseline-i686 conformance-baseline-x86_64 \
 	conformance-intel conformance-intel-i686 conformance-intel-x86_64 \
 	conformance-scale conformance-scale-i686 conformance-scale-x86_64 \
@@ -457,11 +477,9 @@ windows-x86_64:
 # TLS index the loader never set. Homebrew's `lld` is one: its version follows
 # Homebrew's `llvm`, and llvm-mingw's own LLD may be older.
 #
-# LLVM_MINGW (default `/opt/llvm-mingw`) is the CRT, and its `llvm-nm` reads the
-# static libraries for the checks below. ARM64X_LLD (default Homebrew's `lld`)
-# is the linker. WINE_SDK_ARM64X (top of this file) holds the Wine archives.
-LLVM_MINGW         ?= /opt/llvm-mingw
-ARM64X_LLD         ?= /opt/homebrew/opt/lld/bin/lld-link
+# LLVM_MINGW is the CRT, and its `llvm-nm` reads the static libraries for the
+# checks below; ARM64X_LLD is the linker; WINE_SDK_ARM64X holds the Wine
+# archives (all three at the top of this file).
 ARM64X_LLD_MIN     := 23
 ARM64X_SYSLIBS     := mingw32 mingwex ucrt kernel32 mincore user32 advapi32 gdi32 ws2_32 \
 	userenv bcrypt dbghelp
@@ -473,22 +491,25 @@ ARM64X_SYSLIBS     := mingw32 mingwex ucrt kernel32 mincore user32 advapi32 gdi3
 # build script reads. ARM64X_REQUIRE_LINK is what the link adds. Each is one
 # shell line that exits 2 with a message on the first thing missing.
 define ARM64X_REQUIRE_CARGO
+[ -n '$(WINE_SDK_ARM64X)' ] || { echo "EC=1: WINE_SDK_ARM64X is not set; it names the tree holding Wine's ARM64X link archives, which wine-build stages as dist/wine-arm64x" >&2; exit 2; }; \
 installed=$$(rustup target list --installed --toolchain $(RUST_STABLE) 2>/dev/null); \
 for target in $(PE_arm64) $(PE_arm64ec); do \
 	echo "$$installed" | grep -qx $$target || { echo "EC=1: the Rust target $$target is not installed for $(RUST_STABLE); \`make EC=1 setup-rust\` adds it" >&2; exit 2; }; \
 done; \
 for archive in libwinecrt0.a libntdll.a; do \
-	[ -f $(WINE_SDK_ARM64X)/lib/wine/aarch64-windows/$$archive ] || { echo "EC=1: $(WINE_SDK_ARM64X)/lib/wine/aarch64-windows/$$archive is missing; WINE_SDK_ARM64X names the ARM64X link libraries wine-build stages as dist/wine-arm64x" >&2; exit 2; }; \
+	[ -f '$(WINE_SDK_ARM64X)/lib/wine/aarch64-windows/'$$archive ] || { echo "EC=1: WINE_SDK_ARM64X=$(WINE_SDK_ARM64X) holds no lib/wine/aarch64-windows/$$archive; it names the ARM64X link libraries wine-build stages as dist/wine-arm64x" >&2; exit 2; }; \
 done
 endef
 define ARM64X_REQUIRE_LINK
+[ -n '$(LLVM_MINGW)' ] || { echo "EC=1: LLVM_MINGW is not set; it names the llvm-mingw install whose ARM64 and ARM64EC CRT the link takes" >&2; exit 2; }; \
 for sysroot in aarch64 arm64ec; do \
-	[ -f $(LLVM_MINGW)/$$sysroot-w64-mingw32/lib/dllcrt2.o ] || { echo "EC=1: $(LLVM_MINGW) has no $$sysroot-w64-mingw32 CRT; LLVM_MINGW names an llvm-mingw install" >&2; exit 2; }; \
+	[ -f '$(LLVM_MINGW)/'$$sysroot-w64-mingw32/lib/dllcrt2.o ] || { echo "EC=1: LLVM_MINGW=$(LLVM_MINGW) has no $$sysroot-w64-mingw32 CRT; it names an llvm-mingw install" >&2; exit 2; }; \
 done; \
-[ -x $(LLVM_MINGW)/bin/llvm-nm ] || { echo "EC=1: $(LLVM_MINGW)/bin/llvm-nm is missing; LLVM_MINGW names an llvm-mingw install" >&2; exit 2; }; \
-version=$$($(ARM64X_LLD) --version 2>/dev/null | sed -n 's/.*LLD \([0-9][0-9]*\)\..*/\1/p'); \
-[ -n "$$version" ] || { echo "EC=1: no LLD at $(ARM64X_LLD); ARM64X_LLD names an lld-link $(ARM64X_LLD_MIN) or newer, such as Homebrew's (\`brew install lld\`)" >&2; exit 2; }; \
-[ "$$version" -ge $(ARM64X_LLD_MIN) ] || { echo "EC=1: $(ARM64X_LLD) is LLD $$version, and the ARM64X link needs $(ARM64X_LLD_MIN) or newer" >&2; exit 2; }
+[ -x '$(LLVM_MINGW)/bin/llvm-nm' ] || { echo "EC=1: LLVM_MINGW=$(LLVM_MINGW) has no bin/llvm-nm; it names an llvm-mingw install" >&2; exit 2; }; \
+[ -n '$(ARM64X_LLD)' ] || { echo "EC=1: ARM64X_LLD is not set; it names an lld-link $(ARM64X_LLD_MIN) or newer, such as Homebrew's (\`brew install lld\`)" >&2; exit 2; }; \
+version=$$('$(ARM64X_LLD)' --version 2>/dev/null | sed -n 's/.*LLD \([0-9][0-9]*\)\..*/\1/p'); \
+[ -n "$$version" ] || { echo "EC=1: ARM64X_LLD=$(ARM64X_LLD) is no LLD; it names an lld-link $(ARM64X_LLD_MIN) or newer, such as Homebrew's (\`brew install lld\`)" >&2; exit 2; }; \
+[ "$$version" -ge $(ARM64X_LLD_MIN) ] || { echo "EC=1: ARM64X_LLD=$(ARM64X_LLD) is LLD $$version, and the ARM64X link needs $(ARM64X_LLD_MIN) or newer" >&2; exit 2; }
 endef
 
 # `-fno-threadsafe-statics` (see `windows/.cargo/config.toml`) is sound only
@@ -610,28 +631,40 @@ install-windows-x86_64: $(if $(STAGE),,windows-x86_64)
 		fi ; \
 	done
 
-# The ARM64X pair (EC=1) goes where an arm64 Wine keeps its own ARM64X builtins,
-# `aarch64-windows`, from which it loads them for arm64 and x64 processes alike;
-# the unix half is the `aarch64-unix` `.so` that `install-unix-arm64` already
-# installs. In the subtree layout the default dir gets the fake-module markers,
-# as the x86 leaves write them, built for `aarch64-windows`. Wine resolves a
-# builtin through the copy `wineboot` placed in the prefix's `system32` when it
-# created the prefix, so the pair takes effect in prefixes created after the
-# install: one created before it holds no ARM64X `mtld3d.dll` there.
-install-windows-arm64x: windows-arm64x
-	for dir in $(INSTALL_DIRS); do \
-		tree=$$($(call MTLD3D_TREE,$$dir)) ; \
-		mkdir -p $$tree/aarch64-windows ; \
-		cp -c $(OUT_arm64x)/mtld3d.dll $(OUT_arm64x)/mtld3d.pdb $$tree/aarch64-windows/ ; \
-		cp -c $(OUT_arm64x)/d3d9.dll   $(OUT_arm64x)/d3d9.pdb   $$tree/aarch64-windows/ ; \
-		$(WINEBUILD) --builtin $$tree/aarch64-windows/d3d9.dll ; \
-		if [ $$tree != $$dir/lib/wine ]; then \
-			mkdir -p $$dir/lib/wine/aarch64-windows ; \
-			rm -f $$dir/lib/wine/aarch64-windows/d3d9.pdb $$dir/lib/wine/aarch64-windows/mtld3d.pdb ; \
-			$(WINEBUILD) --fake-module -o $$dir/lib/wine/aarch64-windows/d3d9.dll   -b aarch64-windows --dll $$tree/aarch64-windows/d3d9.dll ; \
-			$(WINEBUILD) --fake-module -o $$dir/lib/wine/aarch64-windows/mtld3d.dll -b aarch64-windows --dll $$tree/aarch64-windows/mtld3d.dll ; \
-		fi ; \
-	done
+# The ARM64X pair (EC=1) goes into the arm64 Wine that WINE_ARM64 names, and
+# into no other tree: an x86_64 Wine never reads `aarch64-windows`. There it goes
+# where that Wine keeps its own ARM64X builtins, `aarch64-windows`, from which it
+# loads them for arm64 and x64 processes alike, with the `aarch64-unix` `.so`
+# beside them, the one that Wine loads. In the subtree layout the default dirs
+# get the fake-module markers, as the x86 leaves write them, built for
+# `aarch64-windows`. Wine resolves a builtin through the copy `wineboot` placed
+# in the prefix's `system32` when it created the prefix, so the pair takes
+# effect in prefixes created after the install: one created before it holds no
+# ARM64X `mtld3d.dll` there. The x86 trees in INSTALL_DIRS get what `install`
+# gives them without EC=1.
+define ARM64X_REQUIRE_RUNTIME
+[ -n '$(WINE_ARM64)' ] || { echo "EC=1: WINE_ARM64 is not set; it names the arm64 Wine tree (holding bin/wine and lib/wine) the ARM64X DLLs install into and run under" >&2; exit 2; }; \
+[ -x '$(WINE_ARM64)/bin/wine' ] && [ -x '$(WINE_ARM64)/bin/wineserver' ] && [ -d '$(WINE_ARM64)/lib/wine/aarch64-windows' ] || { echo "EC=1: WINE_ARM64=$(WINE_ARM64) is not an arm64 Wine tree: it needs bin/wine, bin/wineserver and lib/wine/aarch64-windows" >&2; exit 2; }
+endef
+
+install-windows-arm64x: windows-arm64x unix-arm64
+	$(ARM64X_REQUIRE_RUNTIME)
+	dir='$(WINE_ARM64)' ; \
+	tree=$$($(call MTLD3D_TREE,$$dir)) ; \
+	mkdir -p $$tree/aarch64-windows $$tree/$(UNIX_WINEDIR_arm64) || exit ; \
+	cp -c $(OUT_arm64x)/mtld3d.dll $(OUT_arm64x)/mtld3d.pdb $$tree/aarch64-windows/ || exit ; \
+	cp -c $(OUT_arm64x)/d3d9.dll   $(OUT_arm64x)/d3d9.pdb   $$tree/aarch64-windows/ || exit ; \
+	$(WINEBUILD) --builtin $$tree/aarch64-windows/d3d9.dll || exit ; \
+	cp -c $(OUT_unix_arm64)/mtld3d.so $$tree/$(UNIX_WINEDIR_arm64)/ || exit ; \
+	rm -rf $$tree/$(UNIX_WINEDIR_arm64)/mtld3d.so.dSYM ; \
+	$(call clone_tree,$(OUT_unix_arm64)/mtld3d.so.dSYM,$$tree/$(UNIX_WINEDIR_arm64)/mtld3d.so.dSYM) || exit ; \
+	if [ $$tree != $$dir/lib/wine ]; then \
+		mkdir -p $$dir/lib/wine/aarch64-windows ; \
+		rm -f $$dir/lib/wine/aarch64-windows/d3d9.pdb $$dir/lib/wine/aarch64-windows/mtld3d.pdb ; \
+		rm -rf $$dir/lib/wine/$(UNIX_WINEDIR_arm64)/mtld3d.so $$dir/lib/wine/$(UNIX_WINEDIR_arm64)/mtld3d.so.dSYM ; \
+		$(WINEBUILD) --fake-module -o $$dir/lib/wine/aarch64-windows/d3d9.dll   -b aarch64-windows --dll $$tree/aarch64-windows/d3d9.dll ; \
+		$(WINEBUILD) --fake-module -o $$dir/lib/wine/aarch64-windows/mtld3d.dll -b aarch64-windows --dll $$tree/aarch64-windows/mtld3d.dll ; \
+	fi
 
 # Both unix arches create the directory the Wine tree lacks: a Wine only ever
 # loads the one matching its own build, so the other copy is inert, and a tree
@@ -987,7 +1020,7 @@ configure-test-prefix-session:
 	-$(WINESERVER) -p >/dev/null 2>&1
 	-$(WINE) wineboot >/dev/null 2>&1
 
-test: test-unit test-e2e-i686 test-e2e-x86_64
+test: test-unit test-e2e-i686 test-e2e-x86_64 $(EC_LEG:%=test-e2e-%)
 
 # Host-native unit tests, built for this machine's native arch (no Rosetta).
 # Needs no install and no wine at all, which is why it is its own leg: the
@@ -1101,6 +1134,48 @@ test-e2e-x86_64: install-windows-x86_64 install-unix-$(SDK_UNIX_ARCH)
 	$(call E2E_EXES_ASSIGN,$(E2E_EXES_x86_64)); cd $(E2E_RUNNER_DIR) && $(MTLD3D_TEST_ENV) \
 		$(E2E_RUNNER) --wine $(WINE) $(E2E_FLAGS) -- $$exes
 
+# The EC=1 legs, `test-e2e-arm64x` here and `conformance-arm64x` below: the x64
+# binaries under the arm64 Wine of WINE_ARM64, whose x64 processes load the
+# ARM64X pair `install-windows-arm64x` put there and run its EC half.
+#
+# Each runs in a prefix of its own, ARM64X_PREFIX, which it creates afresh
+# after the install, since a prefix only holds a marker for the builtins that
+# were installed when it was made (see the install leaf). It is configured by
+# `configure-test-prefix` like the other legs' prefixes, run against that Wine,
+# and its persistent server is stopped when the leg ends, since the next run
+# makes a new prefix anyway. The prefix sits in `.wine-isolated`, the checkout's
+# own, with or without ISOLATED=1, so `make clean-isolated` takes it down; under
+# ISOLATED=1 the Wine is the clone made at the top of this file.
+ARM64X_PREFIX := $(ISOLATED_ROOT)/prefix-arm64x
+# A sub-make named through a variable, so that `make -n` prints it rather than
+# running it: a line that names `$(MAKE)` itself runs even under `-n`, and this
+# one deletes a prefix and boots Wine.
+ARM64X_SUBMAKE = $(MAKE)
+define ARM64X_FRESH_PREFIX
+[ ! -d '$(ARM64X_PREFIX)' ] || WINEPREFIX='$(ARM64X_PREFIX)' '$(WINE_ARM64)/bin/wineserver' -k >/dev/null 2>&1 ; \
+rm -rf '$(ARM64X_PREFIX)' && \
+$(ARM64X_SUBMAKE) ISOLATED= WINE_SDK='$(WINE_ARM64)' WINE_INSTALL_DIR= WINEPREFIX='$(ARM64X_PREFIX)' configure-test-prefix
+endef
+# Ends the persistent server of ARM64X_PREFIX, keeping the status of the step
+# before it in `status`.
+define ARM64X_STOP_SERVER
+status=$$? ; WINEPREFIX='$(ARM64X_PREFIX)' '$(WINE_ARM64)/bin/wineserver' -k >/dev/null 2>&1 ; exit $$status
+endef
+
+# The one test this leg skips, with the runner's `--skip`. It deadlocks inside
+# CrossOver's winemac, which takes its window-data lock (`my_get_win_data`) and
+# win32u's `surfaces_lock` in both orders when windows are created and
+# destroyed on several threads at once; the hang is Wine's, and the x86 legs
+# still run the test. For the same reason the leg runs one test at a time
+# whatever JOBS says: the default of 4 assumes the winemac fix described at
+# JOBS above, which this Wine does not carry.
+ARM64X_E2E_SKIP := e2e::window_lifecycle::devices_and_windows_come_and_go_on_several_threads_at_once
+test-e2e-arm64x: install-windows-arm64x
+	$(ARM64X_FRESH_PREFIX)
+	$(call E2E_EXES_ASSIGN,$(E2E_EXES_x86_64)); cd $(E2E_RUNNER_DIR) && WINEPREFIX='$(ARM64X_PREFIX)' $(MTLD3D_TEST_ENV) \
+		$(E2E_RUNNER) --wine '$(WINE_ARM64)/bin/wine' $(E2E_FLAGS) --jobs 1 --skip '$(ARM64X_E2E_SKIP)' -- $$exes; \
+		$(ARM64X_STOP_SERVER)
+
 # d3d9 conformance (NOT part of `make test`): run Wine's upstream d3d9 test exe
 # against our installed builtin d3d9.dll, then diff per-site failure counts
 # against the checked-in baseline. Many subtests fail by design, see
@@ -1138,13 +1213,29 @@ define conformance_leg
 	$(CONFORMANCE_RUN) --arch $(1) --exe $(D3D9_TEST_$(1)) $(2) $(if $(LOG),--log $(LOG))
 endef
 
-conformance: conformance-i686 conformance-x86_64
+conformance: conformance-i686 conformance-x86_64 $(EC_LEG:%=conformance-%)
 
 conformance-i686: install-windows-i686 install-unix-$(SDK_UNIX_ARCH)
 	$(call conformance_leg,i686)
 
 conformance-x86_64: install-windows-x86_64 install-unix-$(SDK_UNIX_ARCH)
 	$(call conformance_leg,x86_64)
+
+# The EC=1 leg: the x86_64 SDK's own `d3d9_test.exe`, the binary
+# `conformance-x86_64` runs (a PE test runs under any Wine, so nothing is taken
+# from the arm64 tree), under the arm64 Wine with the ARM64X pair, in the fresh
+# prefix described at `test-e2e-arm64x`. It records under the `x86_64` label,
+# so it is judged against the `[x86_64/...]` entries of `baseline.txt`, which
+# were taken on another Wine; the leg has no entries of its own and no baseline
+# target, and what it reports is how that runtime differs from them
+# (`unix/conformance/CONFORMANCE.md`, "The ARM64X leg").
+conformance-arm64x: install-windows-arm64x
+	$(ARM64X_FRESH_PREFIX)
+	test -f $(D3D9_TEST_x86_64) || { echo "$(D3D9_TEST_x86_64) is missing: re-bundle the Wine SDK, this one predates the published d3d9 test binaries" >&2; exit 2; }
+	export WINEPREFIX='$(ARM64X_PREFIX)' ; $(CONFORMANCE_BIN) --wine '$(WINE_ARM64)/bin/wine' \
+		--wineserver '$(WINE_ARM64)/bin/wineserver' --assets $(CURDIR)/unix/conformance \
+		--arch x86_64 --exe $(D3D9_TEST_x86_64) $(if $(LOG),--log $(LOG)); \
+		$(ARM64X_STOP_SERVER)
 
 conformance-intel: conformance-intel-i686 conformance-intel-x86_64
 

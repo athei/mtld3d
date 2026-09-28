@@ -32,7 +32,7 @@ use crate::{
     attribute::{BinaryOutcome, Launcher as _},
     binary::{WineLauncher, binary_name},
     report::{BinaryReport, Tally},
-    select::{selected, test_id},
+    select::{selected, skipped, test_id},
 };
 
 /// A leg stopped after the driver reported a GPU hang, with no test verdict.
@@ -78,13 +78,16 @@ fn real_main() -> Result<ExitCode, String> {
             Box::new(|_| {}),
         )?
         .ignored_only(config.ignored);
-        let selection = if config.filter.is_empty() {
+        let selection = if config.filter.is_empty() && config.skip.is_empty() {
             None
         } else {
             let names: Vec<String> = launcher
                 .list()?
                 .into_iter()
-                .filter(|test| selected(&test_id(&name, test), &config.filter))
+                .filter(|test| {
+                    let id = test_id(&name, test);
+                    selected(&id, &config.filter) && !skipped(&id, &config.skip)
+                })
                 .collect();
             if names.is_empty() {
                 continue;
@@ -114,7 +117,7 @@ fn real_main() -> Result<ExitCode, String> {
         return Ok(ExitCode::from(GPU_HANG_EXIT));
     }
     if tally.total() == 0 {
-        if config.filter.is_empty() {
+        if config.filter.is_empty() && config.skip.is_empty() {
             return Err("no binary ran any test".to_owned());
         }
         println!("no test matches the filter; nothing to run");
