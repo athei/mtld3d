@@ -33,6 +33,19 @@ type UnixCallFn = unsafe extern "C" fn(*mut c_void) -> i32;
 
 const DISPATCH_TABLE: [UnixCallFn; Thunks::COUNT] = build_dispatch_table();
 
+/// Every native Rust allocation goes through snmalloc, the allocator the PE side uses.
+///
+/// Process-wide resource: a dylib has one global allocator. The native encoder,
+/// submit and worker threads allocate and free per packet, and the default
+/// macOS allocator cost the encoder about 5.5 us per packet more than snmalloc
+/// in a matched streaming measurement. Only Rust's allocation calls change:
+/// snmalloc exports `sn_rust_*` entry points, not `malloc` or `free`, so memory
+/// Objective-C or C allocate is still freed by them, and no buffer this crate
+/// hands to Metal is freed by Metal (`bytesNoCopy` wrappers carry no
+/// deallocator).
+#[global_allocator]
+static ALLOCATOR: snmalloc_rs::SnMalloc = snmalloc_rs::SnMalloc;
+
 /// Wrap a handler in an `@autoreleasepool` so every dispatch call drains on return.
 ///
 /// The pool catches any autoreleased Apple objects (most visibly

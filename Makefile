@@ -173,18 +173,18 @@ PROFILE  := production
 $(info ==> PROD=1: cargo profile `production` (fat LTO + codegen-units=1))
 # Production carries no debug assertions, Rust or C/C++ (docs/CONVENTIONS.md,
 # "Production carries no debug assertions"). The cargo profile turns off
-# `debug-assertions`; this turns off `assert` in the C, C++ and Objective-C
-# that build scripts compile through cc-rs (snmalloc-sys and zstd-sys in the PE
-# DLLs, the delegate forward in the Unix dylib), for every target of both
-# workspaces. cc-rs appends the plain `CFLAGS` / `CXXFLAGS` to the
-# `CFLAGS_<target>` values in the `.cargo/config.toml` files, so the per-target
-# flags there stay. The plain names and not `TARGET_CFLAGS`: cc-rs reads
-# `HOST_CFLAGS` instead when the target is the build machine's own, as
+# `debug-assertions`; this turns off `assert` in the C, C++ and Objective-C that
+# build scripts compile through cc-rs (snmalloc-sys and zstd-sys in the PE DLLs
+# and the Unix dylib, and the delegate forward in the Unix dylib), for every
+# target of both workspaces. cc-rs appends the plain `CFLAGS` / `CXXFLAGS` to
+# the `CFLAGS_<target>` values in the `.cargo/config.toml` files, so the
+# per-target flags there stay. The plain names and not `TARGET_CFLAGS`: cc-rs
+# reads `HOST_CFLAGS` instead when the target is the build machine's own, as
 # aarch64-apple-darwin is on an Apple Silicon Mac. `override` keeps a `CFLAGS`
-# given on the command line from replacing the flag instead of receiving it.
-# The filter keeps a nested make from adding the flag twice, which would change
-# the variable and rebuild every C dependency. `PRODUCTION_ASSERT_GATE` below
-# checks the result.
+# given on the command line from replacing the flag instead of receiving it. The
+# filter keeps a nested make from adding the flag twice, which would change the
+# variable and rebuild every C dependency. `PRODUCTION_ASSERT_GATE` below checks
+# the result.
 ifeq ($(filter -DNDEBUG,$(CFLAGS)),)
 override CFLAGS += -DNDEBUG
 endif
@@ -662,15 +662,14 @@ endef
 # leaves an import of the C library's handler, `__assert_rtn` in a Mach-O image
 # and `_assert` or `_wassert` in a PE. snmalloc's own checks do not go through
 # that handler and leave their message format instead. snmalloc is linked into
-# the PE DLLs only, and the message check runs on every file anyway, so a later
-# link into the Unix dylib is covered without a change here. The tools are the
-# toolchain's llvm-tools, which `make setup-rust` installs; a tool that fails
-# fails the gate. `PRODUCTION_ASSERT_CHECK` names the files; every production
-# install leaf (the ARM64X one included) and `bundle` run it on what they ship,
-# and `production-assert-gate` runs it on the files `ASSERT_GATE_FILES` names,
-# which include the ARM64X pair with EC=1. That target refuses to run without
-# PROD=1, because its default files would otherwise be the `release` build,
-# which is not held to this rule.
+# the PE DLLs and the Unix dylib, and the message check runs on every file. The
+# tools are the toolchain's llvm-tools, which `make setup-rust` installs; a tool
+# that fails fails the gate. `PRODUCTION_ASSERT_CHECK` names the files; every
+# production install leaf (the ARM64X one included) and `bundle` run it on what
+# they ship, and `production-assert-gate` runs it on the files
+# `ASSERT_GATE_FILES` names, which include the ARM64X pair with EC=1. That
+# target refuses to run without PROD=1, because its default files would
+# otherwise be the `release` build, which is not held to this rule.
 PRODUCTION_ASSERT_TOOLS = $(shell rustc +$(RUST_STABLE) --print sysroot)/lib/rustlib/$(UNIX_NATIVE_TARGET)/bin
 define PRODUCTION_ASSERT_GATE
 for f in $(1); do \

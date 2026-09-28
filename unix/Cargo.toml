@@ -87,6 +87,9 @@ objc2-metal = { version = "0.3", features = [
 objc2-metal-fx = { version = "0.3", features = ["MTLFXSpatialScaler"] }
 objc2-quartz-core = { version = "0.3", features = ["CAMetalLayer", "objc2-metal"] }
 rustc-hash = "2"
+# The global allocator of the native dylib, the same pinned revision and `build_cc`
+# configuration the PE side ships (windows/Cargo.toml).
+snmalloc-rs = { git = "https://github.com/microsoft/snmalloc", rev = "edccdfe88f94f3ec1c10c0a29f910e17c1f30978", features = ["build_cc"] }
 strum = { version = "0.28", default-features = false }
 
 [profile.dev]
@@ -113,6 +116,19 @@ debug = 1
 # back off below.
 debug-assertions = true
 overflow-checks = true
+
+# snmalloc-sys 0.7's build.rs reads cargo's `DEBUG` env var (set when the
+# package's debuginfo is enabled) and then compiles its C++ with `-g` and
+# reports a `Debug` build. Keep it a release build of the allocator in every
+# profile, as windows/Cargo.toml does, since dev defaults to `debug = 2`.
+# `NDEBUG` is not this override's job: production gets it for every C and C++
+# object from the Makefile (docs/CONVENTIONS.md, "Production carries no debug
+# assertions"), and `release` keeps snmalloc's checks with the rest.
+[profile.release.package.snmalloc-sys]
+debug = 0
+
+[profile.dev.package.snmalloc-sys]
+debug = 0
 
 # Shipped builds — fat cross-crate LTO + a single codegen unit so the
 # linker can inline and DCE across the whole dylib. Inherits panic, debug,
