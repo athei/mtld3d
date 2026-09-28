@@ -4,7 +4,7 @@
 //! replay and every borrowed resource lease acknowledge completion.
 
 use std::sync::{
-    Arc, Mutex,
+    Arc, Mutex, MutexGuard,
     atomic::{AtomicI32, AtomicU32, AtomicU64},
 };
 
@@ -14,11 +14,10 @@ pub use mtld3d_core::encoder_data::{
 };
 use mtld3d_core::{
     config::Mtld3dConfig,
-    encoder_packet::{FramePacket, FrameRecorder, PacketLease},
+    encoder_packet::{FramePacket, FrameRecorder, PacketRetirement, RetirementHooks},
     encoder_value::WireValue,
     gpu_caps::GpuCaps,
-    guest_completions::{CompletionDrain, CompletionPool},
-    scratch::ScratchArena,
+    guest_completions::CompletionPool,
 };
 use mtld3d_shared::{
     MetalHandle,
@@ -38,78 +37,6 @@ use crate::{LOG_TARGET, unix_call::unix_call};
 
 #[cfg(perf_tracking)]
 mod calibration;
-
-#[derive(Default)]
-struct LeaseRegistry {
-    entries: Vec<Option<PacketLease>>,
-    aliases: Vec<Option<usize>>,
-    drain: CompletionDrain,
-}
-
-impl LeaseRegistry {
-    fn insert(&mut self, mut lease: PacketLease, pool: &CompletionPool) {
-        if lease.maintain() {
-            for slot in lease.into_slots().into_iter().flatten() {
-                pool.recycle(slot);
-            }
-            return;
-        }
-        let tokens = lease.tokens();
-        let primary = usize::try_from(tokens[0].expect("pooled packet lease"))
-            .expect("local slot token fits usize");
-        if self.entries.len() <= primary {
-            self.entries.resize_with(primary + 1, || None);
-        }
-        assert!(
-            self.entries[primary].is_none(),
-            "completion owner is unique"
-        );
-        for token in tokens.into_iter().flatten() {
-            let token = usize::try_from(token).expect("local slot token fits usize");
-            if self.aliases.len() <= token {
-                self.aliases.resize(token + 1, None);
-            }
-            assert!(self.aliases[token].is_none(), "completion alias is unique");
-            self.aliases[token] = Some(primary);
-        }
-        self.entries[primary] = Some(lease);
-    }
-
-    fn drain(&mut self, pool: &CompletionPool) -> usize {
-        let mut consumed = 0;
-        let Self {
-            entries,
-            aliases,
-            drain,
-        } = self;
-        pool.drain(drain, 4096, |event| {
-            consumed += 1;
-            let Ok(token) = usize::try_from(event / 2) else {
-                return;
-            };
-            let Some(primary) = aliases.get(token).copied().flatten() else {
-                return;
-            };
-            let Some(entry) = entries.get_mut(primary) else {
-                return;
-            };
-            if entry.as_mut().is_some_and(PacketLease::maintain)
-                && let Some(lease) = entry.take()
-            {
-                for token in lease.tokens().into_iter().flatten() {
-                    let token = usize::try_from(token).expect("registered local token");
-                    aliases[token] = None;
-                }
-                for slot in lease.into_slots().into_iter().flatten() {
-                    pool.recycle(slot);
-                }
-            }
-            // Events preceding replay completion leave their consumed state in the
-            // retained cells. Inserting the lease checks that state once.
-        });
-        consumed
-    }
-}
 
 /// PE owners of counters borrowed by native workers for the runtime's lifetime.
 pub struct EncoderCounters {
@@ -160,12 +87,11 @@ pub struct EncoderThread {
     #[cfg(perf_tracking)]
     source_clock: calibration::SourceClock,
     gpu_caps: GpuCaps,
-    pending: Mutex<Vec<FramePacket>>,
     failure: AtomicI32,
     native_failure: Box<AtomicU32>,
-    recycled: Mutex<Vec<(ScratchArena, FrameRecorder)>>,
     completions: CompletionPool,
-    leases: Mutex<LeaseRegistry>,
+    /// Submitted packets, their handed-over leases and recovered recording storage.
+    retirement: Mutex<PacketRetirement>,
 }
 
 impl EncoderThread {
@@ -227,12 +153,10 @@ impl EncoderThread {
             #[cfg(perf_tracking)]
             source_clock,
             gpu_caps,
-            pending: Mutex::new(Vec::new()),
             failure: AtomicI32::new(D3D_OK),
             native_failure,
-            recycled: Mutex::new(Vec::with_capacity(2)),
             completions: CompletionPool::new(),
-            leases: Mutex::default(),
+            retirement: Mutex::default(),
         })
     }
 
@@ -271,45 +195,58 @@ impl EncoderThread {
         mtld3d_core::encoder_failure::record_failure(&self.failure, status)
     }
 
-    fn maintain_pending(&self) {
-        let mut pending = self
-            .pending
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut leases = self
-            .leases
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        pending.retain_mut(|packet| {
-            for lease in packet.take_leases() { leases.insert(lease, &self.completions); }
-            if packet.was_rejected() {
-                self.record_failure(D3DERR_DEVICELOST);
-            }
-            for registration in packet.take_rejected_registrations() {
-                let mut params = CancelShaderProgramParams { runtime: self.runtime, registration };
-                let status = unix_call(&mut params);
-                if status != D3D_OK {
-                    log::error!(target: LOG_TARGET, "encoder: shader cancellation failed {status:#x}");
-                    self.record_failure(status);
-                }
-            }
-            if let Some(storage) = packet.take_recording_storage() {
-                let mut recycled = self.recycled.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                if recycled.len() < 2 { recycled.push(storage); }
-            }
-            !packet.maintain()
-        });
-        drop(pending);
-        leases.drain(&self.completions);
-    }
-
-    pub fn reuse_recording_storage(&self, frame: &mut FrameData) {
-        self.maintain_pending();
-        let storage = self
-            .recycled
+    fn lock_retirement(&self) -> MutexGuard<'_, PacketRetirement> {
+        self.retirement
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .pop();
+    }
+
+    /// Retire what native replay and the GPU have finished with.
+    ///
+    /// Every lease notification and every packet's replay completion lands on the
+    /// device's completion queue, so an empty queue means the last pass left nothing
+    /// to do, and this returns without taking a lock.
+    fn maintain_pending(&self) {
+        if !self.completions.has_ready() {
+            return;
+        }
+        self.maintain_retirement(&mut self.lock_retirement());
+    }
+
+    fn maintain_retirement(&self, retirement: &mut PacketRetirement) {
+        retirement.maintain(&self.completions, &mut RetirementCalls { encoder: self });
+    }
+
+    /// Retain a packet whose submission failed and settle its registrations now.
+    ///
+    /// A packet native code never admitted publishes no notification, so it is
+    /// maintained here rather than behind the queue check.
+    fn retain_failed(&self, packet: FramePacket) {
+        self.retain_submitted(packet, true);
+    }
+
+    fn retain_submitted(&self, packet: FramePacket, synchronous: bool) {
+        self.lock_retirement().push_submitted(
+            packet,
+            synchronous,
+            &self.completions,
+            &mut RetirementCalls { encoder: self },
+        );
+    }
+
+    /// Hand the next frame the storage a finished packet gave up, or fresh storage.
+    ///
+    /// This is the one maintenance pass per `Present`: it runs just before the next
+    /// frame records, when the most packets can have finished. A waiting submission
+    /// maintains once more on its own return.
+    pub fn reuse_recording_storage(&self, frame: &mut FrameData) {
+        let storage = {
+            let mut retirement = self.lock_retirement();
+            if self.completions.has_ready() {
+                self.maintain_retirement(&mut retirement);
+            }
+            retirement.take_storage()
+        };
         if let Some((scratch, recorder)) = storage {
             frame.scratch = scratch;
             frame.recorder = Some(recorder);
@@ -325,22 +262,17 @@ impl EncoderThread {
         let mut packet = match FramePacket::new(frame) {
             Ok(packet) => packet,
             Err((error, packet)) => {
-                self.pending
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .push(*packet);
                 log::error!(target: LOG_TARGET, "encoder: frame encoding failed: {error:?}");
-                return Err(self.record_failure(match error {
+                let failure = self.record_failure(match error {
                     mtld3d_shared::encoder_wire::WireError::AllocationFailed => E_OUTOFMEMORY,
                     _ => D3DERR_DEVICELOST,
-                }));
+                });
+                self.retain_failed(*packet);
+                return Err(failure);
             }
         };
         if let Err(failure) = prior_status {
-            self.pending
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .push(packet);
+            self.retain_failed(packet);
             return Err(failure);
         }
         let mut params = SubmitEncoderFrameParams {
@@ -356,23 +288,27 @@ impl EncoderThread {
             admitted: 0,
         };
         let status = unix_call(&mut params);
-        if params.admitted != 0 {
-            // SAFETY: the native queue now owns its borrowing contract until completion.
-            unsafe {
-                packet.mark_admitted();
-            }
-        }
         // Even rejected metadata can retire allocations used by earlier GPU work.
         // Keep every failed packet until native destruction proves quiescence.
-        self.pending
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(packet);
-        self.maintain_pending();
         if status != D3D_OK || params.admitted == 0 {
+            if params.admitted != 0 {
+                // SAFETY: the native queue now owns its borrowing contract until completion.
+                unsafe {
+                    packet.mark_admitted();
+                }
+            }
+            self.retain_failed(packet);
             log::error!(target: LOG_TARGET, "encoder: native frame submission failed {status:#x}, admitted={}", params.admitted);
             return Err(self.record_failure(status));
         }
+        // SAFETY: the native queue now owns its borrowing contract until completion.
+        unsafe {
+            packet.mark_admitted();
+        }
+        // A waiting submission (a mid-frame flush, the retention tier) frees what native
+        // code released before returning, as its callers promise; `Present` leaves that to
+        // the next frame's pass.
+        self.retain_submitted(packet, mode != EncoderSubmitMode::Queue);
         self.status()
     }
 
@@ -430,27 +366,13 @@ impl EncoderThread {
             return Err(self.record_failure(status));
         }
         self.runtime = 0;
-        let mut pending = self
-            .pending
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        for packet in pending.iter_mut() {
-            // SAFETY: native destruction joined every worker and retired GPU references.
-            unsafe {
-                packet.cancel_unadopted();
-            }
-        }
-        let leases = self
-            .leases
+        let retirement = self
+            .retirement
             .get_mut()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // Native publishers have stopped. Consume every cancellation node before
-        // dropping its retained packet, including a detached drain tail.
-        while leases.drain(&self.completions) == 4096 {}
-        pending.clear();
-        drop(pending);
-        leases.entries.clear();
-        leases.aliases.clear();
+        // SAFETY: native destruction joined every worker and retired GPU references, so
+        // no native user or publisher remains.
+        unsafe { retirement.cancel_after_quiescence(&self.completions) };
         Ok(())
     }
 }
@@ -468,16 +390,33 @@ impl Drop for EncoderThread {
             ));
             // A failed destruction cannot prove native readers have stopped.
             // Keep guest backing alive rather than free memory still borrowed by them.
-            let pending = self
-                .pending
+            self.retirement
                 .get_mut()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            std::mem::forget(std::mem::take(pending));
-            std::mem::forget(std::mem::take(
-                self.leases
-                    .get_mut()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner),
-            ));
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .forget_native_owners();
+        }
+    }
+}
+
+/// The device calls one maintenance pass makes: failure latching and shader cancellation.
+struct RetirementCalls<'a> {
+    encoder: &'a EncoderThread,
+}
+
+impl RetirementHooks for RetirementCalls<'_> {
+    fn packet_rejected(&mut self) {
+        self.encoder.record_failure(D3DERR_DEVICELOST);
+    }
+
+    fn cancel_registration(&mut self, registration: u64) {
+        let mut params = CancelShaderProgramParams {
+            runtime: self.encoder.runtime,
+            registration,
+        };
+        let status = unix_call(&mut params);
+        if status != D3D_OK {
+            log::error!(target: LOG_TARGET, "encoder: shader cancellation failed {status:#x}");
+            self.encoder.record_failure(status);
         }
     }
 }

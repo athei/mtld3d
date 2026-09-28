@@ -691,6 +691,53 @@ impl CompletionQueue {
     pub fn take_ready(&self) -> u64 {
         self.head.swap(0, Ordering::Acquire)
     }
+
+    /// Whether a publication is waiting, read without detaching anything.
+    ///
+    /// A publication racing with this read may be missed; the next read sees it.
+    /// `take_ready` provides the ordering for the cells it detaches.
+    #[must_use]
+    pub fn has_ready(&self) -> bool {
+        self.head.load(Ordering::Relaxed) != 0
+    }
+
+    /// Return a detached, unconsumed list to the queue, ahead of newer publications.
+    ///
+    /// The consumer uses this when its budget ends inside a detached list, so the
+    /// queue holds every unconsumed publication and `has_ready` stays exact.
+    ///
+    /// # Safety
+    ///
+    /// `first` heads a list the sole consumer detached with `take_ready` (or a
+    /// suffix of one) and has not consumed. Every node stays retained until it is.
+    pub unsafe fn requeue(&self, first: u64) {
+        if first == 0 {
+            return;
+        }
+        let mut last = first;
+        loop {
+            // SAFETY: every node of this detached list is retained and unconsumed.
+            let cell = unsafe { &*(last as *const LeaseCompletion) };
+            let next = cell.next.load(Ordering::Relaxed);
+            if next == 0 {
+                break;
+            }
+            last = next;
+        }
+        // SAFETY: `last` is the retained final node of the same detached list.
+        let tail = unsafe { &*(last as *const LeaseCompletion) };
+        let mut head = self.head.load(Ordering::Relaxed);
+        loop {
+            tail.next.store(head, Ordering::Relaxed);
+            match self
+                .head
+                .compare_exchange_weak(head, first, Ordering::Release, Ordering::Relaxed)
+            {
+                Ok(_) => return,
+                Err(current) => head = current,
+            }
+        }
+    }
 }
 
 /// Ordered replay-consumed sequences for a single device.

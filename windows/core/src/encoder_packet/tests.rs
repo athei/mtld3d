@@ -18,7 +18,7 @@ use crate::{
     visibility::VisibilityQueryCore,
 };
 
-fn empty_frame() -> FrameData {
+pub(super) fn empty_frame() -> FrameData {
     FrameData::new(&FrameInit {
         device_handle: MetalHandle::NULL,
         record_handle: DeviceRecordHandle::NULL,
@@ -39,7 +39,7 @@ fn empty_frame() -> FrameData {
     })
 }
 
-fn seal(mut frame: FrameData, recorder: FrameRecorder) -> FramePacket {
+pub(super) fn seal(mut frame: FrameData, recorder: FrameRecorder) -> FramePacket {
     frame.recorder = Some(recorder);
     FramePacket::new(frame).unwrap_or_else(|(error, _)| panic!("valid fixture: {error:?}"))
 }
@@ -77,7 +77,7 @@ fn packet_with_leases() -> (FramePacket, Weak<VisibilityQueryCore>) {
 }
 
 // The caller keeps owner alive until native replay and submit have released every borrow.
-fn admit(owner: &mut FramePacket) -> ReplayPacket {
+pub(super) fn admit(owner: &mut FramePacket) -> ReplayPacket {
     // SAFETY: this fixture retains the sole owner through all native uses and quiescence.
     unsafe { owner.mark_admitted() };
     // SAFETY: all records were published by the real typed recorder and remain immutable.
@@ -91,7 +91,7 @@ fn admit(owner: &mut FramePacket) -> ReplayPacket {
     .unwrap()
 }
 
-fn replay(
+pub(super) fn replay(
     packet: &mut ReplayPacket,
     consume: impl FnOnce(CommandView<'_>, &mut NativeFrame, &mut ReplayState) -> Result<(), WireError>,
 ) -> Result<bool, WireError> {
@@ -127,6 +127,11 @@ fn consume_leases(
         _ => panic!("unexpected fixture opcode"),
     }
     Ok(())
+}
+
+/// Consume every queued notification, as the device's maintenance pass does before its walk.
+fn drain_all(owner: &FramePacket) -> usize {
+    owner.drain_test_completions(&mut crate::guest_completions::CompletionDrain::default())
 }
 
 #[test]
@@ -201,6 +206,11 @@ fn final_command_requires_exhaustion_before_frame_transfer() {
         .unwrap_or_else(|(error, _)| panic!("complete: {error:?}"));
     assert!(!owner.maintain());
     drop(frame);
+    assert!(
+        !owner.maintain(),
+        "the replay completion waits to be consumed"
+    );
+    assert_eq!(drain_all(&owner), 1);
     assert!(owner.maintain());
 }
 
@@ -231,6 +241,7 @@ fn failed_dispatch_keeps_the_packet_lease_until_quarantine_is_released() {
     assert!(!owner.maintain());
     assert!(!owner.was_rejected());
     drop(packet);
+    drain_all(&owner);
     assert!(owner.was_rejected());
     assert!(!owner.maintain());
     // SAFETY: all native users have been dropped, as after device shutdown.
@@ -280,6 +291,7 @@ fn inline_constants_cross_regions_and_keep_payload_until_submit_drop() {
     }
     drop(payloads);
     drop(frame);
+    drain_all(&owner);
     assert!(owner.maintain());
 }
 
@@ -561,7 +573,8 @@ fn canceled_packet_returns_completion_slots_to_its_pool() {
     let mut cursor = crate::guest_completions::CompletionDrain::default();
     // SAFETY: this packet was never exposed to a native consumer.
     unsafe { packet.cancel_unadopted() };
-    assert_eq!(packet.drain_test_completions(&mut cursor), 3);
+    // Three lease cancellations and the packet's own replay completion.
+    assert_eq!(packet.drain_test_completions(&mut cursor), 4);
     assert!(packet.maintain());
     drop(packet);
     assert!(query.upgrade().is_none());
@@ -855,6 +868,7 @@ fn indexed_up_borrows_original_arena_payload_through_region_reuse_and_submit() {
     assert_eq!(vertices.as_slice(), &[0x5a; 4800]);
     assert_eq!(indices.as_slice(), &[0, 0, 1, 0, 2, 0]);
     drop(submitted);
+    drain_all(&owner);
     assert!(owner.maintain());
 }
 
@@ -900,6 +914,12 @@ fn retired_buffer_outlives_replay_and_recording_storage_reuse() {
             .into_frame()
             .unwrap_or_else(|(error, _)| panic!("complete replay: {error:?}")),
     );
+    assert_eq!(
+        owner.take_leases().count(),
+        0,
+        "replay completion not consumed yet"
+    );
+    assert_eq!(drain_all(&owner), 1);
     let mut leases: Vec<_> = owner.take_leases().collect();
     assert_eq!(leases.len(), 1);
     let (_, recorder) = owner.take_recording_storage().expect("completed recording");
@@ -938,6 +958,18 @@ fn recording_storage_reuse_keeps_untransferred_owners_on_packet() {
     let allocation = owner.owned_pages.as_ptr();
     // SAFETY: this fixture was never admitted and none of its owners has native users.
     unsafe { owner.cancel_unadopted() };
+    assert!(
+        owner.take_recording_storage().is_none(),
+        "completion not consumed yet"
+    );
+    // The replay completion was published last, so a budget of one consumes it alone
+    // and leaves the lease cancellations queued.
+    let mut cursor = crate::guest_completions::CompletionDrain::default();
+    let consumed = cells.drain(&mut cursor, 1, |event| {
+        assert_eq!(event, crate::guest_completions::REPLAY_COMPLETION_TOKEN);
+    });
+    assert_eq!(consumed, 1);
+    assert!(cells.has_ready(), "the budget's remainder stays queued");
     let (_, recorder) = owner.take_recording_storage().expect("cancelled recording");
     assert!(recorder.owned_pages.is_empty());
     assert_eq!(recorder.owned_pages.capacity(), 0);
@@ -945,11 +977,8 @@ fn recording_storage_reuse_keeps_untransferred_owners_on_packet() {
     assert_eq!(owner.owned_pages.as_ptr(), allocation);
     assert!(!owner.maintain(), "notifications still require consumption");
     assert!(weak.upgrade().is_some());
-    cells.drain(
-        &mut crate::guest_completions::CompletionDrain::default(),
-        16,
-        |_| {},
-    );
+    cells.drain(&mut cursor, 16, |_| {});
+    assert!(!cells.has_ready());
     assert!(owner.maintain());
     assert!(weak.upgrade().is_none());
 }
@@ -1041,5 +1070,47 @@ fn fixed_metadata_records_keep_alignment_across_chunk_rollover() {
             .into_frame()
             .unwrap_or_else(|(error, _)| panic!("complete: {error:?}")),
     );
+    drain_all(&owner);
     assert!(owner.maintain());
+}
+
+#[test]
+fn recovered_recording_storage_keeps_every_lease_vector_capacity() {
+    let (mut owner, _query) = packet_with_leases();
+    let owned_capacity = owner.owned_pages.capacity();
+    let query_capacity = owner.queries.capacity();
+    let mut packet = admit(&mut owner);
+    let mut pages = Vec::new();
+    let mut native_queries = Vec::new();
+    let mut cache = QueryLeaseCache::default();
+    while replay(&mut packet, |command, _, _| {
+        consume_leases(&command, &mut pages, &mut native_queries, &mut cache)
+    })
+    .unwrap()
+    {}
+    drop(
+        packet
+            .into_frame()
+            .unwrap_or_else(|(error, _)| panic!("complete replay: {error:?}")),
+    );
+    drain_all(&owner);
+    let handed_over: Vec<_> = owner.take_leases().collect();
+    assert_eq!(handed_over.len(), 3);
+    let (_, recorder) = owner.take_recording_storage().expect("completed recording");
+    assert!(owned_capacity > 0 && query_capacity > 0);
+    assert!(recorder.owned_pages.is_empty() && recorder.queries.is_empty());
+    assert_eq!(recorder.owned_pages.capacity(), owned_capacity);
+    assert_eq!(recorder.queries.capacity(), query_capacity);
+    // The leases live on elsewhere; release them the way the fixture's native side would.
+    drop(pages);
+    drop(native_queries);
+    cache.maintain();
+    drain_all(&owner);
+    let pool = &recorder.completion_pool;
+    for mut lease in handed_over {
+        assert!(lease.maintain());
+        for slot in lease.into_slots().into_iter().flatten() {
+            pool.recycle(slot);
+        }
+    }
 }

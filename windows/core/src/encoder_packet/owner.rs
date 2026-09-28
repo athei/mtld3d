@@ -88,6 +88,9 @@ impl FramePacket {
         for op in core::mem::take(&mut frame.ops) {
             recorder.record(&mut frame.scratch, op);
         }
+        // The replay completion is queued on the device's pool with the lease notifications,
+        // so the one queue tells maintenance whether anything has arrived.
+        let completion = recorder.completion_pool.replay_completion();
         let mut packet = Self {
             completion_pool: recorder.completion_pool.clone(),
             metadata: core::mem::take(&mut recorder.metadata),
@@ -97,7 +100,7 @@ impl FramePacket {
             owned_pages: Vec::new(),
             queries: Vec::new(),
             redirties: Vec::new(),
-            completion: Some(Box::default()),
+            completion: Some(completion),
             flags: PacketFlags::empty(),
             recording_error: None,
         };
@@ -148,6 +151,14 @@ impl FramePacket {
         self.completion
             .as_ref()
             .map_or(0, |cell| core::ptr::from_ref(cell.as_ref()) as u64)
+    }
+
+    /// Whether a drain has already consumed this packet's replay completion.
+    #[must_use]
+    pub fn replay_consumed(&self) -> bool {
+        self.completion
+            .as_ref()
+            .is_some_and(|cell| cell.is_complete())
     }
 
     #[must_use]
@@ -263,9 +274,19 @@ impl FramePacket {
         let mut recorder = self.recorder.take()?;
         recorder.reset();
         // Replay completion lets owners move to the registry before storage recovery.
-        // Reuse only the empty allocation, never a lease still owned by this packet.
+        // Reuse only an empty allocation, never a lease still owned by this packet, so the
+        // next frame records its leases without growing these vectors again.
+        if self.pages.is_empty() {
+            recorder.pages = core::mem::take(&mut self.pages);
+        }
         if self.owned_pages.is_empty() {
             recorder.owned_pages = core::mem::take(&mut self.owned_pages);
+        }
+        if self.queries.is_empty() {
+            recorder.queries = core::mem::take(&mut self.queries);
+        }
+        if self.redirties.is_empty() {
+            recorder.redirties = core::mem::take(&mut self.redirties);
         }
         recorder.metadata = core::mem::take(&mut self.metadata);
         recorder.metadata.clear();
@@ -278,15 +299,9 @@ impl FramePacket {
         &self,
         cursor: &mut crate::guest_completions::CompletionDrain,
     ) -> usize {
-        let Some(recorder) = &self.recorder else {
-            return 0;
-        };
         let mut total = 0;
         loop {
-            let mut consumed = 0;
-            recorder
-                .completion_pool
-                .drain(cursor, 4096, |_| consumed += 1);
+            let consumed = self.completion_pool.drain(cursor, 4096, |_| {});
             total += consumed;
             if consumed < 4096 {
                 return total;

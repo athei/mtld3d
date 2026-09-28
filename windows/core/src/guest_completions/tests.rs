@@ -163,7 +163,7 @@ fn detached_cursor_retains_blocks_and_rejects_another_device() {
     drop(pool);
     assert!(
         weak.upgrade().is_some(),
-        "detached tail keeps backing alive"
+        "an unconsumed notification keeps its backing alive"
     );
     let other = CompletionPool::new();
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -172,4 +172,101 @@ fn detached_cursor_retains_blocks_and_rejects_another_device() {
     assert!(result.is_err(), "cursor cannot switch device queues");
     drop(cursor);
     assert!(weak.upgrade().is_none());
+}
+
+#[test]
+fn a_budget_leaves_its_remainder_queued_and_ready() {
+    let pool = CompletionPool::new();
+    let slots: Vec<_> = (0..5).map(|_| pool.allocate(false)).collect();
+    assert!(!pool.has_ready());
+    for slot in &slots {
+        slot.completion().publish();
+    }
+    assert!(pool.has_ready());
+    let mut cursor = CompletionDrain::default();
+    let mut events = Vec::new();
+    assert_eq!(pool.drain(&mut cursor, 2, |event| events.push(event)), 2);
+    assert!(pool.has_ready(), "the unconsumed three stay on the queue");
+    slots[0].completion().publish();
+    assert_eq!(pool.drain(&mut cursor, 8, |event| events.push(event)), 3);
+    assert!(!pool.has_ready());
+    events.sort_unstable();
+    let mut expected: Vec<_> = slots.iter().map(|slot| slot.token() * 2 + 1).collect();
+    expected.sort_unstable();
+    assert_eq!(
+        events, expected,
+        "every notification is consumed exactly once"
+    );
+    for slot in slots {
+        pool.recycle(slot);
+    }
+}
+
+#[test]
+fn replay_completion_is_queued_and_complete_only_once_consumed() {
+    use super::REPLAY_COMPLETION_TOKEN;
+
+    let pool = CompletionPool::new();
+    let cell = pool.replay_completion();
+    assert!(!cell.is_complete());
+    cell.publish_rejected();
+    cell.publish();
+    assert!(!cell.is_complete(), "publication alone completes nothing");
+    assert!(!cell.was_rejected());
+    let mut events = Vec::new();
+    pool.drain(&mut CompletionDrain::default(), 8, |event| {
+        events.push(event);
+    });
+    assert_eq!(events, [REPLAY_COMPLETION_TOKEN]);
+    assert!(cell.is_complete());
+    assert!(
+        cell.was_rejected(),
+        "the first publication decides the state"
+    );
+    assert!(!pool.has_ready());
+}
+
+#[test]
+fn recycle_all_returns_every_slot_and_keeps_the_buffer() {
+    let pool = CompletionPool::new();
+    let mut retired: Vec<_> = (0..4).map(|_| pool.allocate(false)).collect();
+    let mut tokens: Vec<_> = retired.iter().map(super::CompletionSlot::token).collect();
+    for slot in &retired {
+        slot.completion().publish();
+    }
+    pool.drain(&mut CompletionDrain::default(), 8, |_| {});
+    let capacity = retired.capacity();
+    pool.recycle_all(&mut retired);
+    assert!(retired.is_empty());
+    assert_eq!(retired.capacity(), capacity);
+    let again: Vec<_> = (0..4).map(|_| pool.allocate(false)).collect();
+    let mut reused: Vec<_> = again.iter().map(super::CompletionSlot::token).collect();
+    tokens.sort_unstable();
+    reused.sort_unstable();
+    assert_eq!(reused, tokens, "every returned slot is allocated again");
+    let fresh = pool.allocate(false);
+    assert_eq!(fresh.token(), 4, "and no other");
+    pool.recycle_all(&mut Vec::new());
+    for slot in again.into_iter().chain([fresh]) {
+        slot.completion().publish();
+        pool.drain(&mut CompletionDrain::default(), 1, |_| {});
+        pool.recycle(slot);
+    }
+}
+
+#[test]
+fn recycle_all_rejects_an_unconsumed_slot() {
+    let pool = CompletionPool::new();
+    let slot = pool.allocate(false);
+    slot.completion().publish();
+    let mut retired = vec![slot];
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        pool.recycle_all(&mut retired);
+    }));
+    assert!(
+        result.is_err(),
+        "a queued notification must be consumed first"
+    );
+    pool.drain(&mut CompletionDrain::default(), 8, |_| {});
+    pool.recycle_all(&mut retired);
 }

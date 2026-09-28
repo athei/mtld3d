@@ -29,6 +29,8 @@ pub use record_controls::CaptureControl;
 mod recording;
 use recording::RecordedCommands;
 mod replay;
+mod retirement;
+pub use retirement::{PacketRetirement, RetirementHooks};
 #[cfg(test)]
 mod tests;
 
