@@ -6,8 +6,9 @@ mtld3d replaces Wine's `d3d9.dll`. The PE side implements the D3D9 API and
 translates it into Metal command buffers that a native library executes on the
 host. The goal is the fastest Direct3D 9 implementation for Wine on macOS.
 Direct3D 8 on the same core is planned
-([#788](https://github.com/athei/mtld3d/issues/788)). Direct3D 10 and later
-are a non-goal: Apple's D3DMetal and DXMT already serve them on macOS.
+([#788](https://github.com/athei/mtld3d/issues/788)). Every other Direct3D
+version is a non-goal: D3D10 and later are already served on macOS by Apple's
+D3DMetal and by DXMT.
 
 Conformance serves speed: where matching D3D9 exactly would cost frame time
 and no game breaks, speed wins. Those trades are listed in
@@ -17,44 +18,41 @@ and no game breaks, speed wins. Those trades are listed in
 
 - Shader Model 1 to 3 and the fixed-function pipeline are translated to Metal
   Shading Language by mtld3d's own translator.
-- Asynchronous shader compilation, on by default. Shaders and pipelines a game
-  uses for the first time build on worker threads. While a build runs on a
-  cold cache, a draw into a target the game rebuilds every frame is skipped
-  for a frame or two instead of stalling the frame, so the game does not
-  stutter. Other draws wait, once per frame for all their builds together.
-  Turned off, every frame waits for every build it needs.
+- Shaders and pipelines a game uses for the first time build on worker
+  threads, and a frame waits once for all the builds it needs, not once per
+  draw. Asynchronous compilation, on by default, goes further on a cold
+  cache: a draw into a target the game rebuilds every frame is skipped for a
+  frame or two instead of waited for, so the game does not stutter. Turned
+  off, those draws wait with the rest.
 - A shader cache, on by default. Translated shaders and pipelines are kept in
   a file next to the game and built again before the first frame of the next
   launch, so combinations seen before do not compile during play. Turned off,
   every launch compiles on first use.
-- Frame pacing through Metal's minimum-duration present
-  (`presentDrawable:afterMinimumDuration:`) for both vsync and the frame cap.
-  Unlike pacing the game's thread or enabling display sync on the Metal
-  layer, this works with ProMotion: the panel follows whatever rate the game
-  sustains below its maximum. Vsync follows the game's present interval; the
-  frame cap is off by default.
+- Frame pacing through Metal's minimum-duration present, for both vsync and
+  the frame cap. Unlike pacing the game's thread or enabling display sync on
+  the Metal layer, this works with ProMotion: the panel follows whatever rate
+  the game sustains below its maximum. Vsync follows the game's present
+  interval; the frame cap is off by default.
 - Upscaling, off by default. The game can render below the presented size and
   have MetalFX's spatial scaler upscale the result. A mip LOD bias, on by
   default, keeps texture detail at the presented size; turned off, textures
   are sampled for the smaller render size.
 - HDR output, on by default. On a display with EDR headroom the frame is
   expanded into that headroom by inverse tone mapping that follows the live
-  headroom. Turned off, the frame is presented as SDR. SDR displays run the
-  SDR path either way.
+  headroom. Turned off, or on a display without EDR headroom, the frame is
+  presented as SDR.
 - A software cursor. It is drawn in its own overlay window independently of
   the game's frames, so it is not tied to the frame rate and has
   hardware-cursor latency. Under HDR it is tone-mapped like the frame, where
   the macOS cursor stays at SDR brightness, and showing or hiding it does not
   delay the next present by a refresh as the hardware cursor does. On by
-  default whenever HDR output is active, and it can be forced on or off.
-  Turned off, the game gets the hardware cursor.
-- Rendering off the game's thread. The game's thread records state, and
-  encoder, submit and presenter threads do the rest, at most one frame ahead.
-- Built-in profiles for the few games that need settings of their own,
-  matched on the executable and its version resource.
+  default whenever HDR output is active, and can be forced on or off; turned
+  off, the game gets the hardware cursor.
+- Built-in profiles for the few games that need settings of their own.
 
 Every switch, with its default, is in [`mtld3d.conf`](mtld3d.conf).
-[`docs/STATUS.md`](docs/STATUS.md) lists everything that is implemented.
+[`docs/STATUS.md`](docs/STATUS.md) lists what is implemented, what is not
+yet, what never will be, and the divergences from D3D9 kept on purpose.
 
 ## Requirements
 
@@ -70,8 +68,7 @@ Every switch, with its default, is in [`mtld3d.conf`](mtld3d.conf).
 - Rosetta 2 for an x86_64 Wine. An arm64 Wine translates x86 itself.
 - [x87sidecar](https://github.com/athei/x87sidecar) under an x86_64 Wine.
   D3D9-era games do their floating-point math in x87 instructions, which
-  Rosetta 2 translates slowly. The wine-build releases carry the patch it
-  needs.
+  Rosetta 2 translates slowly; the wine-build releases carry its patch.
 
 ## Installation
 
@@ -86,10 +83,9 @@ fullscreen game's mode change virtual.
 ## Configuration
 
 mtld3d reads `mtld3d.conf` from the directory of the game's `.exe` at every
-`Direct3DCreate9`. The interface that call returns keeps what was read, for
-itself and every device it creates. A missing file means defaults. The
-`MTLD3D_CONFIG` environment variable takes the same entries, separated by
-semicolons.
+`Direct3DCreate9` and keeps it for that interface and its devices. A missing
+file means defaults. The `MTLD3D_CONFIG` environment variable takes the same
+entries, separated by semicolons.
 
 Each option is resolved from four layers. A later layer wins, key by key:
 
@@ -104,7 +100,7 @@ vendor linked in, and the log names the profile that matched. The
 why it exists. [`app_profile.rs`](windows/core/src/app_profile.rs) lists the
 profiles and the reason for each setting they make.
 
-## Logs and bug reports
+## Logs, games and bug reports
 
 Every process writes `mtld3d-logs/<exe>-<pid>.log` next to the executable,
 never to the standard streams. `RUST_LOG` filters it: unset, everything logs
@@ -112,21 +108,11 @@ at `info`, and `RUST_LOG=mtld3d=warn` quiets the whole project. The log
 targets, the levels and the F12 frame capture are described in
 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#logging).
 
-A game that fails is reported as a
-[`game-compat`](https://github.com/athei/mtld3d/labels/game-compat) issue,
-with its log attached. Each release also carries `mtld3d-debug.tar.xz`, the
-symbols that make a crash in that log readable. If mtld3d does not seem to
-load at all, start with the [Troubleshooting](INSTALL.md#troubleshooting)
-section of `INSTALL.md`.
-
-## Games
-
-[`docs/GAMES.md`](docs/GAMES.md) lists the games tested so far.
-
-## Status
-
-[`docs/STATUS.md`](docs/STATUS.md) lists what is implemented, what is not
-yet, what never will be, and the divergences from D3D9 kept on purpose.
+[`docs/GAMES.md`](docs/GAMES.md) lists the games tested so far and
+[how to report one](docs/GAMES.md#reporting-a-game) that fails. Each release
+also carries `mtld3d-debug.tar.xz`, the symbols that make a crash in a log
+readable. If mtld3d does not seem to load at all, start with the
+[Troubleshooting](INSTALL.md#troubleshooting) section of `INSTALL.md`.
 
 ## Building from source
 

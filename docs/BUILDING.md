@@ -34,19 +34,10 @@ versions are pinned in the Makefile, and the macOS deployment target is in
 
 ## Setup
 
-`make setup` bootstraps a machine once:
-
-- the stable Rust toolchain with clippy and llvm-tools, the nightly one with
-  rustfmt, the cross-compile targets, and `lld-link` and `llvm-lib` symlinks
-  into the cargo bin directory, pointing at the toolchain's own `rust-lld`
-  and `llvm-ar`
-- `xwin` and `cargo-edit` through `cargo install`, and a prebuilt nextest
-- the MSVC CRT and Windows SDK, which `xwin` splats into `/opt/xwin` (about
-  3 GB; creating the directory needs `sudo`)
-- Rosetta 2, when it is missing
-
-It does not install Wine. Each piece is also a target of its own
-(`setup-rust`, `setup-nextest`, `setup-dev`, `setup-xwin`, `setup-rosetta`).
+`make setup` bootstraps a machine once: the pinned Rust toolchains and
+targets, the PE linker symlinks, xwin and the MSVC SDK in `/opt/xwin` (about
+3 GB, needs `sudo`), nextest, cargo-edit and Rosetta 2. It does not install
+Wine. Each piece is also a `setup-*` target of its own.
 
 ## Build
 
@@ -60,7 +51,9 @@ It does not install Wine. Each piece is also a target of its own
 The profile is `release` by default. `PROD=1` selects `production`, the
 profile that ships, with fat LTO and no debug assertions. `PERF`, `FP` and
 `CRUMB` add perf telemetry, frame pointers and a breadcrumb ring for
-debugging heap corruption; the Makefile header says what each one does.
+debugging heap corruption; the Makefile says what each one does, and
+[`ARCHITECTURE.md`](ARCHITECTURE.md#debugging-heap-corruption--mtld3d_crumb1-mmap-breadcrumb)
+describes the breadcrumb ring.
 
 ## Install
 
@@ -78,14 +71,9 @@ mechanism.
 
 ## Gates and tests
 
-Two commands are green before every commit:
-
-- `make check` runs `cargo fmt --check`, clippy with `nursery` and
-  `pedantic`, `make audit`, the Makefile's own tests (`test-isolation` and
-  `test-e2e-discovery`), and `make doc`. Clippy and rustdoc warnings fail
-  it.
-- `make test` runs the unit tests natively on the host, then the end-to-end
-  suite under Wine, one leg per PE architecture.
+`make check` is the lint and documentation gate, and `make test` runs the
+unit tests and the end-to-end suite; both are green before every commit.
+[`CONTRIBUTING.md`](../CONTRIBUTING.md#the-gates) lists what each one runs.
 
 Every test leg installs into the shared Wine tree first, so two checkouts
 testing at once overwrite each other's builds. `ISOLATED=1` avoids that: it
@@ -93,8 +81,7 @@ clones the SDK and the prefix into `.wine-isolated/` inside the checkout and
 runs everything against the clones.
 
 `make conformance` runs Wine's own d3d9 test suite against the installed
-build and compares the failures per site against a baseline. It is not part
-of `make test`, because many of its checks fail by design.
+build and compares the failures per site against a baseline.
 
 [`CONTRIBUTING.md`](../CONTRIBUTING.md#reading-a-test-run) explains how to
 read a test run, and

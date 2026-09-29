@@ -2,27 +2,30 @@ ifndef WINE_SDK
 $(error WINE_SDK is not set)
 endif
 
-# The EC=1 legs (`windows-arm64x` and what builds on it) read four paths that
-# have no default here. Each comes from the environment or the command line,
-# each target that needs one fails naming it when it is unset or points at the
-# wrong thing, and no target without EC=1 reads any of them:
+# The arm64 legs read four paths that have no default here. Each comes from
+# the environment or the command line, and each target that needs one fails
+# naming it when it is unset or points at the wrong thing. The first three are
+# the ARM64X toolchain (`windows-arm64x` and what builds on it) and are read
+# only with EC=1. WINE_ARM64 is read with EC=1 or ARM64=1, and always by
+# `bench-variants`; ARM64=1 reads only WINE_ARM64:
 #
 #   WINE_SDK_ARM64X  a tree holding Wine's two ARM64X link archives,
 #                    `libwinecrt0.a` and `libntdll.a`, under
 #                    `lib/wine/aarch64-windows`: what wine-build's "ARM64X link
 #                    libraries" step stages as `dist/wine-arm64x`. The Wine SDK
-#                    is an x86 Wine and carries neither. The build and the
-#                    clippy leg read it.
+#                    is an x86 Wine and carries neither. The EC=1 build and the
+#                    EC=1 clippy leg read it.
 #   LLVM_MINGW       an llvm-mingw install, whose ARM64 and ARM64EC sysroots
-#                    are the CRT the link takes. The build reads it.
+#                    are the CRT the link takes. The EC=1 build reads it.
 #   ARM64X_LLD       an `lld-link` of LLD 23 or newer, such as Homebrew's
-#                    `lld`. The build reads it.
+#                    `lld`. The EC=1 build reads it.
 #   WINE_ARM64       an arm64 Wine tree, the directory holding `bin/wine` and
 #                    `lib/wine`, that `EC=1 make install` installs the ARM64X
 #                    DLLs into and `ARM64=1 make install` the x86 ones, and
-#                    whose private clones the arm64-runtime legs of EC=1 and
-#                    ARM64=1 run under. ISOLATED=1 below clones it for the
-#                    installs as it clones the SDK. ARM64=1 reads only this one.
+#                    whose private clones the arm64-runtime test, conformance
+#                    and benchmark legs of EC=1 and ARM64=1 run under, as do
+#                    the arm64 legs of `bench-variants`. ISOLATED=1 below
+#                    clones it for the installs as it clones the SDK.
 
 # Clone the directory tree $(1) to $(2), cheapest mechanism first. On one APFS
 # volume clonefile(2) takes a directory and clones the whole hierarchy in a

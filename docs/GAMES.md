@@ -12,7 +12,7 @@ the reason for each one.
 | Half-Life 2 | Plays |
 | Team Fortress 2 | Plays, 64-bit, D3D9 renderer (launched without `-vulkan`) |
 | Grand Theft Auto IV | Plays, `gta-iv` profile |
-| Modern Warfare 2 | Starts and plays a mission, 64-bit |
+| Call of Duty: Modern Warfare 2 | Plays, 64-bit |
 | Halo 2 | Renders, `halo2` profile |
 | 3DMark05 | Runs end to end |
 | Unigine Tropics | Runs |

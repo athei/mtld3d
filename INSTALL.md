@@ -103,7 +103,7 @@ through the bottle's DLL search path and never enters CrossOver's own
   CrossOver 26; CI pins a release of it. CrossOver 27's arm64 Wine is tested
   locally but not run in CI. Older Wine or CrossOver releases are not expected
   to work.
-- A **64-bit prefix / bottle** — 32-bit games run in it through WoW64.
+- A **64-bit prefix / bottle**; 32-bit games run in it through WoW64.
 - **Rosetta 2** (`softwareupdate --install-rosetta`) for an x86_64 Wine, which
   is what most builds are: the game and the whole PE side are x86. An arm64
   Wine brings its own x86 translation (FEX) and does not need it.
