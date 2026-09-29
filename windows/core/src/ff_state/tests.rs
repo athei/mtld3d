@@ -1293,6 +1293,161 @@ mod inverse {
         assert_close(&FfState::mat_mul(&inv, &r), &D3DMATRIX::IDENTITY);
     }
 
+    /// The cofactor inverse with `det2` and `sum3` supplied, so one body serves both precisions.
+    fn cofactor_inverse<T>(
+        m: &[T; 16],
+        det2: impl Fn(T, T, T, T) -> T,
+        sum3: impl Fn([T; 6]) -> T,
+    ) -> [T; 16]
+    where
+        T: Copy
+            + core::ops::Add<Output = T>
+            + core::ops::Neg<Output = T>
+            + core::ops::Mul<Output = T>
+            + core::ops::Div<Output = T>
+            + From<f32>,
+    {
+        let s = [
+            det2(m[0], m[4], m[1], m[5]),
+            det2(m[0], m[4], m[2], m[6]),
+            det2(m[0], m[4], m[3], m[7]),
+            det2(m[1], m[5], m[2], m[6]),
+            det2(m[1], m[5], m[3], m[7]),
+            det2(m[2], m[6], m[3], m[7]),
+        ];
+        let c = [
+            det2(m[8], m[12], m[9], m[13]),
+            det2(m[8], m[12], m[10], m[14]),
+            det2(m[8], m[12], m[11], m[15]),
+            det2(m[9], m[13], m[10], m[14]),
+            det2(m[9], m[13], m[11], m[15]),
+            det2(m[10], m[14], m[11], m[15]),
+        ];
+        let det = sum3([s[0], c[5], -s[1], c[4], s[2], c[3]])
+            + sum3([s[3], c[2], -s[4], c[1], s[5], c[0]]);
+        let inv = T::from(1.0) / det;
+        let row = |v: [T; 6]| sum3(v) * inv;
+        [
+            row([m[5], c[5], -m[6], c[4], m[7], c[3]]),
+            row([-m[1], c[5], m[2], c[4], -m[3], c[3]]),
+            row([m[13], s[5], -m[14], s[4], m[15], s[3]]),
+            row([-m[9], s[5], m[10], s[4], -m[11], s[3]]),
+            row([-m[4], c[5], m[6], c[2], -m[7], c[1]]),
+            row([m[0], c[5], -m[2], c[2], m[3], c[1]]),
+            row([-m[12], s[5], m[14], s[2], -m[15], s[1]]),
+            row([m[8], s[5], -m[10], s[2], m[11], s[1]]),
+            row([m[4], c[4], -m[5], c[2], m[7], c[0]]),
+            row([-m[0], c[4], m[1], c[2], -m[3], c[0]]),
+            row([m[12], s[4], -m[13], s[2], m[15], s[0]]),
+            row([-m[8], s[4], m[9], s[2], -m[11], s[0]]),
+            row([-m[4], c[3], m[5], c[1], -m[6], c[0]]),
+            row([m[0], c[3], -m[1], c[1], m[2], c[0]]),
+            row([-m[12], s[3], m[13], s[1], -m[14], s[0]]),
+            row([m[8], s[3], -m[9], s[1], m[10], s[0]]),
+        ]
+    }
+
+    /// A left-handed look-at view matrix, row-vector convention, as a game builds one.
+    fn look_at(eye: [f32; 3], at: [f32; 3]) -> D3DMATRIX {
+        let sub = |a: [f32; 3], b: [f32; 3]| [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+        let dot =
+            |a: [f32; 3], b: [f32; 3]| [a[0] * b[0], a[1] * b[1], a[2] * b[2]].iter().sum::<f32>();
+        let cross = |a: [f32; 3], b: [f32; 3]| {
+            let (x0, x1) = (a[1] * b[2], a[2] * b[1]);
+            let (y0, y1) = (a[2] * b[0], a[0] * b[2]);
+            let (z0, z1) = (a[0] * b[1], a[1] * b[0]);
+            [x0 - x1, y0 - y1, z0 - z1]
+        };
+        let norm = |a: [f32; 3]| {
+            let len = dot(a, a).sqrt();
+            [a[0] / len, a[1] / len, a[2] / len]
+        };
+        let z = norm(sub(at, eye));
+        let x = norm(cross([0.0, 1.0, 0.0], z));
+        let y = cross(z, x);
+        D3DMATRIX {
+            m: [
+                x[0],
+                y[0],
+                z[0],
+                0.0,
+                x[1],
+                y[1],
+                z[1],
+                0.0,
+                x[2],
+                y[2],
+                z[2],
+                0.0,
+                -dot(x, eye),
+                -dot(y, eye),
+                -dot(z, eye),
+                1.0,
+            ],
+        }
+    }
+
+    #[test]
+    fn unfused_inverse_is_as_close_to_the_exact_one_as_the_fused_form_was() {
+        let mut checked = 0;
+        for ex in [-900.0f32, -35.5, -1.0, 0.25, 3.0, 128.0, 5000.0] {
+            for ey in [-12.0f32, 0.5, 40.0, 700.0] {
+                for (tx, tz) in [
+                    (0.0f32, 1.0f32),
+                    (10.0, -3.0),
+                    (-250.0, 90.0),
+                    (1.0e3, 1.0e3),
+                ] {
+                    let ez = ex * 0.5;
+                    let view = look_at([ex, ey, ez], [ex + tx, ey - 1.0, ez + tz]);
+                    for scale in [1.0f32, 0.01, 40.0] {
+                        let mut m = view;
+                        for v in &mut m.m[..12] {
+                            *v *= scale;
+                        }
+                        let new = FfState::inverse(&m).expect("a view matrix is invertible").m;
+                        let fused = cofactor_inverse(
+                            &m.m,
+                            |a: f32, b, c, d| a.mul_add(d, -(b * c)),
+                            |v| v[0].mul_add(v[1], v[2].mul_add(v[3], v[4] * v[5])),
+                        );
+                        let exact = cofactor_inverse(
+                            &m.m.map(f64::from),
+                            |a: f64, b, c, d| {
+                                let (ad, bc) = (a * d, b * c);
+                                ad - bc
+                            },
+                            |v| {
+                                let products = [v[0] * v[1], v[2] * v[3], v[4] * v[5]];
+                                products[0] + products[1] + products[2]
+                            },
+                        );
+                        // An entry is a sum of products as large as the largest
+                        // entry of its row, so that bounds its rounding error.
+                        for (row, at) in (0..16).step_by(4).zip(0..) {
+                            let scale = exact[row..row + 4]
+                                .iter()
+                                .fold(1.0f64, |acc, v| acc.max(v.abs()));
+                            for i in row..row + 4 {
+                                let (new_error, fused_error) = (
+                                    (f64::from(new[i]) - exact[i]).abs() / scale,
+                                    (f64::from(fused[i]) - exact[i]).abs() / scale,
+                                );
+                                assert!(
+                                    new_error <= 1e-6 && fused_error <= 1e-6,
+                                    "row {at} entry {i}: {new_error:e} unfused, {fused_error:e} fused, for {:?}",
+                                    m.m
+                                );
+                            }
+                        }
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(checked, 7 * 4 * 4 * 3);
+    }
+
     #[test]
     fn singular_matrix_has_no_inverse() {
         let mut z = D3DMATRIX::IDENTITY;

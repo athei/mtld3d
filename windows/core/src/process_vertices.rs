@@ -158,12 +158,16 @@ fn transform_to_screen(pos: [f32; 3], wvp: &D3DMATRIX, vp: &D3DVIEWPORT9) -> [f3
     // Viewport dims/origin fit u16 in practice (D3D9 max RT dim is 16384);
     // convert without an `as`-cast precision-loss lint (the draw-path idiom).
     let to_f = |v: u32| f32::from(u16::try_from(v).unwrap_or(u16::MAX));
-    let unit_x = ndc[0].mul_add(0.5, 0.5);
-    let unit_y = ndc[1].mul_add(-0.5, 0.5);
+    // Each product has a binding of its own rather than a `mul_add`, which
+    // is an `fmaf` call into the CRT on the no-FMA x86 baselines.
+    let (half_x, half_y) = (ndc[0] * 0.5, ndc[1] * -0.5);
+    let (unit_x, unit_y) = (half_x + 0.5, half_y + 0.5);
+    let (span_x, span_y) = (unit_x * to_f(vp.width), unit_y * to_f(vp.height));
+    let span_z = ndc[2] * (vp.max_z - vp.min_z);
     [
-        unit_x.mul_add(to_f(vp.width), to_f(vp.x)),
-        unit_y.mul_add(to_f(vp.height), to_f(vp.y)),
-        ndc[2].mul_add(vp.max_z - vp.min_z, vp.min_z),
+        span_x + to_f(vp.x),
+        span_y + to_f(vp.y),
+        span_z + vp.min_z,
         inv_w,
     ]
 }
