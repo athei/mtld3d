@@ -624,8 +624,9 @@ checksum = "e36638a09924aaac5808dd99b728b0feffb65702858a09617305ac5742f27446"
 
 [[package]]
 name = "xxhash-rust"
-version = "0.8.18"
-source = "git+https://github.com/athei/xxhash-rust?rev=4cb4b3ab17a0891217d5322519c251b3f20b3b5d#4cb4b3ab17a0891217d5322519c251b3f20b3b5d"
+version = "0.8.19"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "550a2b930b62486a393c52d5c3b84bff264b28aa437ed64694d31e93b1757af7"
 
 [[package]]
 name = "zstd"

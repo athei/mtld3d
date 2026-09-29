@@ -27,17 +27,8 @@ rustc-hash = "2"
 snmalloc-rs = { git = "https://github.com/microsoft/snmalloc", rev = "edccdfe88f94f3ec1c10c0a29f910e17c1f30978", features = ["build_cc"] }
 strum = { version = "0.28", default-features = false }
 xbr = { version = "0.2", default-features = false }
-xxhash-rust = { version = "0.8", features = ["xxh3"] }
+xxhash-rust = { version = "0.8.19", features = ["xxh3"] }
 zstd = "0.13"
-
-# xxh3's NEON code is gated on `target_arch = "aarch64"` alone, so on arm64ec,
-# which has NEON as well, the crate does not compile. The fork widens those
-# gates to arm64ec (https://github.com/DoumanAsh/xxhash-rust/pull/57), which is
-# what lets the EC half of the ARM64X DLLs hash on NEON; every other target
-# builds the same code as the release. The patch goes once a release carries
-# the change.
-[patch.crates-io]
-xxhash-rust = { git = "https://github.com/athei/xxhash-rust", rev = "4cb4b3ab17a0891217d5322519c251b3f20b3b5d" }
 
 [profile.dev]
 panic = "abort"
