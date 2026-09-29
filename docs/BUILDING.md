@@ -64,6 +64,30 @@ debugging heap corruption; the Makefile says what each one does, and
 [`ARCHITECTURE.md`](ARCHITECTURE.md#debugging-heap-corruption--mtld3d_crumb1-mmap-breadcrumb)
 describes the breadcrumb ring.
 
+## Instruction-set baselines
+
+The PE DLLs are guest code, which an x86 translator runs: Rosetta under an
+x86_64 Wine, and the translator an arm64 Wine carries (FEX, in CrossOver
+27). [`windows/.cargo/config.toml`](../windows/.cargo/config.toml) sets their
+CPU baseline, for the Rust and for the C and C++ that build scripts compile.
+Neither goes past SSE4.2 or uses BMI; the comments there say why.
+
+The i686 build targets `pentium4`, plain SSE2. The 32-bit build that matters
+today is the one World of Warcraft 1.12 and 3.3.5a load under Rosetta, and
+there `pentium4` measured faster than `nehalem`: 9 to 15 % less time per call
+for the state setters, the shader-constant uploads and a vertex-buffer lock,
+and 2.4 % off the buffer benchmark's frame, while the World of Warcraft 1.12
+frame moved by +0.8 %, inside that run's noise, and the fixed-function draws
+by +0.5 %. Two per-draw gauges of the perf summary rose: the draw snapshot
+(`draw_snapshot_ms`) by 9.5 % and its key building (`draw_snapshot_keys_ms`)
+by 7.3 %. Under the arm64 Wine's translator the same change cost about 7 %
+on a clean draw and 2 to 3 % on a frame, so the baseline is worth measuring
+again once that translator is in production use.
+
+The x86_64 build targets `x86-64-v2`. Lowering it to plain `x86-64` measured
+neutral under both translators, so the SSE4.2 ceiling neither costs nor buys
+anything measurable.
+
 ## Install
 
 `make install` puts the build into the Wine tree `WINE_SDK` names, and also
