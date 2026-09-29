@@ -156,7 +156,7 @@ unless its entry says otherwise.
   Apple GPU returns the target's contents from before the pass began rather
   than the pixels the pass has written. Depth has this handled: a draw that
   samples the bound depth attachment reads a snapshot copy
-  (`depth_snapshot_for_sampling` in `windows/d3d9/src/encoder.rs`). Colour
+  (`depth_snapshot_for_sampling` in `unix/unix/src/encoder.rs`). Colour
   has no equivalent. DXVK detects the bind and resolves it; it is not built
   here because no known title needs it.
 

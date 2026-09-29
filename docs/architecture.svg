@@ -1,6 +1,6 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1146 356" width="1146" height="356" role="img" aria-labelledby="title desc">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1146 500" width="1146" height="500" role="img" aria-labelledby="title desc">
   <title id="title">mtld3d component diagram</title>
-  <desc id="desc">game.exe calls d3d9.dll through the D3D9 COM API. d3d9.dll links mtld3d-core and calls mtld3d.dll through its exported function mtld3d_unix_call, an ordinary function call. mtld3d.dll crosses the Wine PE/Unix boundary into mtld3d.so, which drives the Metal framework. The PE side is i386 or x86_64, one chain per architecture; the host side is Mach-O in Wine's own architecture.</desc>
+  <desc id="desc">game.exe calls d3d9.dll through the D3D9 COM API. d3d9.dll holds the COM API and application state, records each frame into fixed records, links mtld3d-core, and calls mtld3d.dll through its exported function mtld3d_unix_call, an ordinary function call. mtld3d.dll crosses the Wine PE/Unix boundary into mtld3d.so, the native runtime, which also links mtld3d-core. Inside mtld3d.so an encoder thread translates the recorded frame into Metal commands, a submit thread replays and commits them, a presenter thread acquires the drawable and presents, and worker threads compile shaders and pipelines and prewarm the shader cache; mtld3d.so drives the Metal framework. The PE side is i386 or x86_64, one chain per architecture, and with EC=1 an x64 game can load ARM64X builds of d3d9.dll and mtld3d.dll instead; the host side is Mach-O in Wine's own architecture.</desc>
   <style>
     text { fill: #768390; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: 12px; }
     .mono { fill: #6e7b8b; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 14px; font-weight: 700; }
@@ -29,13 +29,13 @@
   <!-- PE side package -->
   <path class="frame" d="M12 40 H116 V26 H12 Z"/>
   <text class="tab" x="20" y="37">Wine PE side</text>
-  <rect class="frame" x="12" y="40" width="710" height="300"/>
-  <text class="muted" x="26" y="62">i386 or x86_64, one chain per architecture</text>
+  <rect class="frame" x="12" y="40" width="710" height="444"/>
+  <text class="muted" x="26" y="62">i386 or x86_64, one chain per architecture; ARM64X for x64 games with EC=1</text>
 
   <!-- Host side package -->
   <path class="frame" d="M836 40 H922 V26 H836 Z"/>
   <text class="tab" x="844" y="37">Host side</text>
-  <rect class="frame" x="836" y="40" width="298" height="300"/>
+  <rect class="frame" x="836" y="40" width="298" height="444"/>
   <text class="muted" x="850" y="62">Mach-O, Wine's own architecture</text>
   <text class="muted" x="850" y="77">(x86_64 or arm64)</text>
 
@@ -51,7 +51,7 @@
   <use href="#cmp" x="402" y="104"/>
   <text class="stereo" x="339" y="122" text-anchor="middle">«library»</text>
   <text class="mono" x="339" y="144" text-anchor="middle">d3d9.dll</text>
-  <text class="muted" x="339" y="163" text-anchor="middle">D3D9 API, COM, state</text>
+  <text class="muted" x="339" y="163" text-anchor="middle">COM API, state, recording</text>
   <rect class="box" x="270" y="180" width="138" height="60"/>
   <text class="stereo" x="339" y="201" text-anchor="middle">«rlib»</text>
   <text class="mono" x="339" y="223" text-anchor="middle" style="font-size:13px">mtld3d-core</text>
@@ -63,17 +63,36 @@
   <text class="mono" x="627" y="158" text-anchor="middle">mtld3d.dll</text>
   <text class="muted" x="627" y="178" text-anchor="middle">PE shim</text>
 
-  <!-- mtld3d.so -->
-  <rect class="box" x="916" y="110" width="160" height="84"/>
-  <use href="#cmp" x="1054" y="118"/>
-  <text class="stereo" x="996" y="136" text-anchor="middle">«library»</text>
-  <text class="mono" x="996" y="158" text-anchor="middle">mtld3d.so</text>
-  <text class="muted" x="996" y="178" text-anchor="middle">Metal abstraction</text>
+  <!-- mtld3d.so with its threads and nested mtld3d-core -->
+  <rect class="box" x="856" y="96" width="262" height="268"/>
+  <use href="#cmp" x="1096" y="104"/>
+  <text class="stereo" x="987" y="122" text-anchor="middle">«library»</text>
+  <text class="mono" x="987" y="144" text-anchor="middle">mtld3d.so</text>
+  <text class="muted" x="987" y="163" text-anchor="middle">native runtime</text>
+  <rect class="box" x="868" y="176" width="117" height="58"/>
+  <text class="stereo" x="926.5" y="192" text-anchor="middle">«thread»</text>
+  <text class="mono" x="926.5" y="210" text-anchor="middle" style="font-size:12.5px">encoder</text>
+  <text class="muted" x="926.5" y="226" text-anchor="middle">D3D9 to Metal</text>
+  <rect class="box" x="989" y="176" width="117" height="58"/>
+  <text class="stereo" x="1047.5" y="192" text-anchor="middle">«thread»</text>
+  <text class="mono" x="1047.5" y="210" text-anchor="middle" style="font-size:12.5px">submit</text>
+  <text class="muted" x="1047.5" y="226" text-anchor="middle">replay, commit</text>
+  <rect class="box" x="868" y="240" width="117" height="58"/>
+  <text class="stereo" x="926.5" y="256" text-anchor="middle">«thread»</text>
+  <text class="mono" x="926.5" y="274" text-anchor="middle" style="font-size:12.5px">presenter</text>
+  <text class="muted" x="926.5" y="290" text-anchor="middle">drawable, present</text>
+  <rect class="box" x="989" y="240" width="117" height="58"/>
+  <text class="stereo" x="1047.5" y="256" text-anchor="middle">«threads»</text>
+  <text class="mono" x="1047.5" y="274" text-anchor="middle" style="font-size:12.5px">workers</text>
+  <text class="muted" x="1047.5" y="290" text-anchor="middle">compile, prewarm</text>
+  <rect class="box" x="868" y="306" width="238" height="46"/>
+  <text class="stereo" x="987" y="324" text-anchor="middle">«rlib»</text>
+  <text class="mono" x="987" y="343" text-anchor="middle" style="font-size:13px">mtld3d-core</text>
 
   <!-- Metal -->
-  <rect class="ext" x="916" y="250" width="160" height="70"/>
-  <text class="stereo" x="996" y="276" text-anchor="middle">«framework»</text>
-  <text class="mono" x="996" y="298" text-anchor="middle">Metal</text>
+  <rect class="ext" x="907" y="398" width="160" height="70"/>
+  <text class="stereo" x="987" y="424" text-anchor="middle">«framework»</text>
+  <text class="mono" x="987" y="446" text-anchor="middle">Metal</text>
 
   <!-- dependencies -->
   <path class="edge" d="M182 152 H252" marker-end="url(#open)"/>
@@ -83,11 +102,11 @@
   <text class="label" x="488" y="144" text-anchor="middle">mtld3d_unix_call</text>
   <text class="muted" x="488" y="172" text-anchor="middle">function call</text>
 
-  <path class="edge" d="M702 152 H914" marker-end="url(#open)"/>
+  <path class="edge" d="M702 152 H854" marker-end="url(#open)"/>
   <text class="label" x="779" y="144" text-anchor="middle">Wine unix call</text>
   <text class="muted" x="779" y="172" text-anchor="middle">PE/Unix</text>
   <text class="muted" x="779" y="186" text-anchor="middle">boundary</text>
 
-  <path class="edge" d="M996 194 V248" marker-end="url(#open)"/>
-  <text class="label" x="1004" y="226">Metal API</text>
+  <path class="edge" d="M987 364 V396" marker-end="url(#open)"/>
+  <text class="label" x="995" y="385">Metal API</text>
 </svg>

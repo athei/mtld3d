@@ -138,7 +138,7 @@ pub enum NullTextureKind {
     Texture3D = 2,
 }
 
-/// Fixed-size command struct written by the API thread and read by the encoding thread.
+/// Fixed-size command struct written by the native encoder and read by the submit thread.
 ///
 /// 32 bytes, aligned to 8. Field semantics depend on `cmd`
 /// (see [`CommandType`]).

@@ -2,13 +2,13 @@
 
 Direct3D 9 for Wine on macOS, backed by Metal.
 
-mtld3d replaces Wine's `d3d9.dll`. The PE side implements the application-facing
-D3D9 API and records commands for the native Unix runtime, which translates
-them into Metal command buffers and submits them. The goal is the fastest
-Direct3D 9 implementation for Wine on macOS. Direct3D 8 on the same core is
-planned ([#788](https://github.com/athei/mtld3d/issues/788)). Every other
-Direct3D version is a non-goal: D3D10 and later are already served on macOS by
-Apple's D3DMetal and by DXMT.
+mtld3d replaces Wine's `d3d9.dll`. The PE side implements the
+application-facing D3D9 API and records commands for the native Unix runtime,
+which translates them into Metal command buffers and submits them. The goal is
+the fastest Direct3D 9 implementation for Wine on macOS. Direct3D 8 on the
+same core is planned ([#788](https://github.com/athei/mtld3d/issues/788)).
+Every other Direct3D version is a non-goal: D3D10 and later are already served
+on macOS by Apple's D3DMetal and by DXMT.
 
 Conformance serves speed: where matching D3D9 exactly would cost frame time
 and no game breaks, speed wins. Those trades are listed in
@@ -19,13 +19,16 @@ and no game breaks, speed wins. Those trades are listed in
 - **Shader translation.** Shader Model 1 to 3 and the fixed-function
   pipeline are translated to Metal Shading Language by mtld3d's own
   translator.
-- **Multithreading.** Rendering work runs in a three-thread pipeline that
-  stays a fixed one frame ahead of the game, so latency is bounded. The
-  auxiliary threads run on the unix side: they take no address space from a
-  32-bit game, and under an arm64 Wine most of the code runs as native arm64.
+- **Multithreading.** The game's thread records each draw and state change into
+  fixed records. Translation into Metal, submission and presentation run in a
+  three-thread pipeline in the native Unix library that stays a fixed one frame
+  ahead of the game, so latency is bounded. Those threads and the shader workers
+  take no address space from a 32-bit game, and under an arm64 Wine they run as
+  native arm64 code.
 - **Background shader builds.** Shaders and pipelines a game uses for the
   first time build on worker threads. A frame waits once for all the builds
-  it needs, not once per draw. Asynchronous compilation goes further on a
+  it needs, not once per draw, and a pipeline whose shaders are ready builds
+  ahead of shaders still queued. Asynchronous compilation goes further on a
   cold cache: a draw into a target the game rebuilds every frame is skipped
   for a frame or two instead of waited for, so the game does not stutter.
   Asynchronous compilation is on by default. Turned off, those draws wait
@@ -135,22 +138,22 @@ the arm64 Wine and the release bundle.
 ## Architecture
 
 ![Component diagram: game.exe calls d3d9.dll through the D3D9 COM API;
-d3d9.dll, which links mtld3d-core, calls the function mtld3d_unix_call
-exported by mtld3d.dll; mtld3d.dll crosses the Wine PE/Unix boundary into mtld3d.so, which drives
-Metal. The PE side is i386 or x86_64, one chain per architecture; the host
-side is Mach-O in Wine's own architecture.](docs/architecture.svg)
+d3d9.dll, which links mtld3d-core, records each frame and calls the function
+mtld3d_unix_call exported by mtld3d.dll; mtld3d.dll crosses the Wine PE/Unix
+boundary into mtld3d.so, the native runtime, whose encoder, submit, presenter
+and worker threads drive Metal. The PE side is i386 or x86_64, one chain per
+architecture, and with EC=1 an x64 game can load ARM64X builds of d3d9.dll
+and mtld3d.dll instead; the host side is Mach-O in Wine's own
+architecture.](docs/architecture.svg)
 
-`d3d9.dll` implements the COM API and application-facing state,
-`mtld3d.dll` is the PE shim that owns Wine's unix-call globals, and
-`mtld3d.so` provides the native runtime and Metal integration. Deferred D3D9
-work and private storage belong on Unix when measurements show no performance
-regression; the API thread stays cheap and frame work stays batched. A frame
-flows through four threads: the game's PE API thread records a batch, a native
-encoder translates it into Metal commands, a native submit thread replays and
-commits, and a native presenter thread acquires the drawable and presents.
-Compilation and prewarm workers also run on Unix. [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) has the
-boundary contract, the threading model, the workspace layout and the
-debugging toolkits.
+`d3d9.dll` implements the COM API, keeps the state the game can observe, and
+records each frame into fixed records. `mtld3d.dll` is the PE shim that owns
+Wine's unix-call globals. `mtld3d.so` is the native runtime on the host: an
+encoder thread translates the recorded frame into Metal commands, a submit
+thread commits them, a presenter thread presents, and worker threads compile
+shaders and pipelines and prewarm the shader cache.
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) has the boundary contract, the
+threading model and the debugging toolkits.
 
 ## Contributing
 

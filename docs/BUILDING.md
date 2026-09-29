@@ -49,7 +49,16 @@ Wine. Each piece is also a `setup-*` target of its own.
   `unix/target/<target>/<profile>/`, each with its `.dSYM`
 
 The profile is `release` by default. `PROD=1` selects `production`, the
-profile that ships, with fat LTO and no debug assertions. `PERF`, `FP` and
+profile that ships, with fat LTO and no debug assertions. That covers the C
+and C++ the build scripts compile too: under `PROD=1` the Makefile passes
+`-DNDEBUG` to every C and C++ object of both workspaces, among them snmalloc,
+which the PE DLLs and `mtld3d.so` both use as their allocator. Every
+production install and `make bundle` then run `production-assert-gate` on the
+binaries they ship, which fails the build if one still carries a C or C++
+assertion path; `make PROD=1 production-assert-gate` runs it on its own.
+[`CONVENTIONS.md`](CONVENTIONS.md#production-carries-no-debug-assertions)
+has the rule. Build production through make: a plain
+`cargo build --profile production` gets no `NDEBUG`. `PERF`, `FP` and
 `CRUMB` add perf telemetry, frame pointers and a breadcrumb ring for
 debugging heap corruption; the Makefile says what each one does, and
 [`ARCHITECTURE.md`](ARCHITECTURE.md#debugging-heap-corruption--mtld3d_crumb1-mmap-breadcrumb)
@@ -105,7 +114,9 @@ The i686 and x86_64 builds that ship, under the arm64 Wine.
 `ARM64=1 make install` puts them into its `i386-windows` and
 `x86_64-windows`, with the arm64 `mtld3d.so`, and replaces the `d3d9.dll` and
 `mtld3d.dll` in its `aarch64-windows` with x64 markers, so that x64 processes
-load the x86_64 build. [`INSTALL.md`](../INSTALL.md) says why.
+load the x86_64 build. [`INSTALL.md`](../INSTALL.md) says why. The PE DLLs
+run translated there, and everything in `mtld3d.so`, the encoder, submit,
+presenter and compile threads included, runs as native arm64 code.
 `ARM64=1 make test` and `ARM64=1 make conformance` add a leg per architecture
 under that Wine.
 
