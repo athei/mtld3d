@@ -2,6 +2,14 @@ fn main() {
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
     println!("cargo:rustc-cdylib-link-arg=/DEF:{manifest_dir}/d3d9.def");
 
+    // The x86_64 DLL's linker map, `deps/d3d9.map` beside the linked image,
+    // with every function's address, size and name. The Makefile's
+    // `MEM_ROUTINE_GATE` reads it to find the in-image memory routines
+    // (`src/guest_mem.rs`), which have no symbol table to be found by.
+    if std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("x86_64") {
+        println!("cargo:rustc-cdylib-link-arg=/lldmap");
+    }
+
     // Diagnostic-only: `MTLD3D_CRUMB=1` enables the mmap breadcrumb in
     // `crate::crumb`. Routed through a build-script cfg instead of a
     // `RUSTFLAGS --cfg` flag so it composes with the xwin-link-path

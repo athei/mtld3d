@@ -15,6 +15,8 @@ mod draw;
 mod encoder;
 mod exit_code_hook;
 mod fullscreen;
+#[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+mod guest_mem;
 mod import_patch;
 mod index_buffer;
 mod log_sink;
@@ -306,6 +308,8 @@ fn log_identity(instance: *mut c_void) {
     let build = identity::BUILD;
     let base = instance as usize;
     log::info!(target: LOG_TARGET, "d3d9.dll {build} {id} loaded at {base:#x}");
+    #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+    guest_mem::log_route();
 }
 
 /// Null a COM `**out` parameter before returning a failing HRESULT.

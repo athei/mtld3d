@@ -45,6 +45,8 @@ pub mod fullscreen_resize;
 pub mod gamma;
 pub mod gpu_caps;
 pub mod guest_completions;
+#[cfg(any(test, all(target_arch = "x86_64", target_os = "windows")))]
+pub mod guest_mem;
 pub mod guest_pages;
 pub mod guest_queries;
 pub mod ids;

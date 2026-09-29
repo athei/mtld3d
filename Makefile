@@ -441,7 +441,7 @@ TAG          ?= $(shell git describe --tags --exact-match 2>/dev/null)
 .PHONY: all windows windows-i686 windows-x86_64 windows-arm64x unix unix-x64 unix-arm64 \
 	install install-windows-i686 install-windows-x86_64 install-windows-arm64x install-arm64 \
 	install-unix-x64 install-unix-arm64 \
-	bundle version-check production-assert-gate stage clean-isolated clean-isolated-orphans \
+	bundle version-check production-assert-gate mem-routine-gate stage clean-isolated clean-isolated-orphans \
 	configure-test-prefix configure-test-prefix-locked configure-test-prefix-session \
 	configure-test-prefix-boot \
 	test test-unit test-e2e-i686 test-e2e-x86_64 test-e2e-i686-arm64 test-e2e-x86_64-arm64 \
@@ -489,6 +489,7 @@ windows-i686:
 
 windows-x86_64:
 	cd windows && cargo +$(RUST_STABLE) build --profile $(PROFILE) --target $(PE_x64) $(FRAME_POINTERS)
+	$(call MEM_ROUTINE_GATE,$(OUT_x64))
 	$(WINEBUILD) --builtin $(OUT_x64)/mtld3d.dll
 	$(WINEBUILD) --fake-module -o $(OUT_x64)/mtld3d.fake.dll -m64 --dll $(OUT_x64)/mtld3d.dll
 
@@ -692,6 +693,51 @@ ASSERT_GATE_FILES ?= $(OUT_i386)/d3d9.dll $(OUT_i386)/mtld3d.dll $(OUT_x64)/d3d9
 production-assert-gate:
 	$(if $(filter production,$(PROFILE)),,@echo "production-assert-gate: checks production builds; run it with PROD=1" >&2; exit 2)
 	$(call PRODUCTION_ASSERT_GATE,$(ASSERT_GATE_FILES))
+
+# The check behind the one rule the x86_64 d3d9.dll's own memory routines
+# (`windows/core/src/guest_mem.rs`) cannot break silently: none of them may
+# compile to a call to itself or to one of the others. Under the x64 emulator
+# such a call recurses until the stack overflows, and no CI leg runs the
+# emulator. The x86_64 link writes a linker map (`windows/d3d9/build.rs`); the
+# gate takes from it the address and size of the four exports and of every
+# function of `mtld3d_core::guest_mem`, disassembles each, and fails on any
+# direct call or jump, conditional ones included, to one of the four. The
+# route's decision (`MemRoute::decide`) and `latch` are left out on purpose: a
+# copy made while the route is being decided takes the in-image routines, so
+# those two may call the four. Functions the four reach only through the CRT or
+# an import are not in the image and not checked. `windows-x86_64` runs the gate
+# on every build, `release` and `production` alike, so every build that is
+# installed, staged or bundled has passed it; `mem-routine-gate` runs it on the
+# build `PROFILE` names. The tools are the toolchain's llvm-tools, as for
+# `PRODUCTION_ASSERT_GATE`.
+define MEM_ROUTINE_GATE
+map=$(1)/deps/d3d9.map ; dll=$(1)/d3d9.dll ; tools=$(PRODUCTION_ASSERT_TOOLS) ; \
+[ -f $$map ] || { echo "mem-routine-gate: no linker map $$map (windows/d3d9/build.rs asks the x86_64 link for one)" >&2; exit 1; } ; \
+base=$$($$tools/llvm-readobj --file-headers $$dll | sed -n 's/^ *ImageBase: \(0x[0-9A-Fa-f]*\).*/\1/p') ; \
+[ -n "$$base" ] || { echo "mem-routine-gate: cannot read the image base of $$dll" >&2; exit 1; } ; \
+funcs=$$(awk '{ name = $$0; sub(/^[0-9a-f]+ +[0-9a-f]+ +[0-9]+ +/, "", name) } \
+	$$3 != "0" { rva = $$1; size = $$2; next } \
+	$$1 == rva && name !~ /MemRoute>::(decide|latch)/ && (name ~ /^mem(cpy|move|set|cmp)$$/ || name ~ /mtld3d_core::guest_mem::/) { print rva, size, name }' $$map | sort -u) ; \
+exports= ; for export in memcpy memmove memset memcmp; do \
+	rva=$$(printf '%s\n' "$$funcs" | awk -v n=$$export '$$3 == n && NF == 3 { print $$1 }') ; \
+	[ -n "$$rva" ] || { echo "mem-routine-gate: $$map names no $$export" >&2; exit 1; } ; \
+	exports="$$exports $$(printf '0x%x' $$(( base + 0x$$rva )))" ; \
+done ; \
+printf '%s\n' "$$funcs" | while read -r rva size name; do \
+	start=$$(( base + 0x$$rva )) ; stop=$$(( start + 0x$$size )) ; \
+	code=$$($$tools/llvm-objdump -d --no-show-raw-insn --start-address=$$start --stop-address=$$stop $$dll) || { echo "mem-routine-gate: cannot disassemble $$name in $$dll" >&2; exit 1; } ; \
+	for target in $$(printf '%s\n' "$$code" | grep -oE '[[:space:]](call[a-z]*|j[a-z]+)[[:space:]]+0x[0-9a-f]+' | grep -oE '0x[0-9a-f]+$$'); do \
+		case " $$exports " in *" $$target "*) \
+			echo "mem-routine-gate: $$name in $$dll branches to the memory routine at $$target:" >&2 ; \
+			printf '%s\n' "$$code" | grep -E "(call[a-z]*|j[a-z]+)[[:space:]]+$$target" >&2 ; exit 1 ;; \
+		esac ; \
+	done ; \
+done || exit 1 ; \
+echo "mem-routine-gate: $$(printf '%s\n' "$$funcs" | wc -l | tr -d ' ') functions of the memory routines in $$dll, none branches to one of the four"
+endef
+
+mem-routine-gate:
+	$(call MEM_ROUTINE_GATE,$(OUT_x64))
 
 install-windows-i686: $(if $(STAGE),,windows-i686)
 	$(call PRODUCTION_ASSERT_CHECK,$(OUT_i386)/d3d9.dll $(OUT_i386)/mtld3d.dll)
