@@ -24,8 +24,8 @@
 //!   OpenGL `glBufferSubData`) make implicitly. Append-only UI batchers
 //!   live here; renaming them on every call drives
 //!   memory-allocation-failure symptoms. D3D9 promises no such thing on
-//!   a plain Lock, so this arm is a deliberate divergence: the README
-//!   lists it under "Faster than conformant" and
+//!   a plain Lock, so this arm is a deliberate divergence:
+//!   `docs/STATUS.md#kept-divergences` lists it and
 //!   `unix/conformance/CONFORMANCE.md` carries its conformance-site
 //!   rationale. It is also the only arm with no other side effect, so
 //!   `d3d9` counts it into a perf row.

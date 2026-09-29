@@ -2403,7 +2403,7 @@ impl TextureInner {
             LockAction::WriteInPlace => {
                 // The kept divergence, counted like its VB/IB twin: a
                 // contended partial Lock handed back over bytes an upload
-                // may still be reading (README, "Faster than conformant").
+                // may still be reading (`docs/STATUS.md#kept-divergences`).
                 if flags & D3DLOCK_NOOVERWRITE == 0 && contended && device_inner != 0 {
                     DeviceInner::from_ptr(device_inner)
                         .perf_mut()
@@ -2666,9 +2666,9 @@ impl TextureInner {
                 //
                 // Counted when it is the kept divergence: a contended
                 // partial Lock without NOOVERWRITE handed back over
-                // bytes an upload may still be reading (README, "Faster
-                // than conformant"). READONLY returned above and an
-                // uncontended Lock is the specified behaviour.
+                // bytes an upload may still be reading
+                // (`docs/STATUS.md#kept-divergences`). READONLY returned
+                // above and an uncontended Lock is the specified behaviour.
                 if flags & D3DLOCK_NOOVERWRITE == 0 && contended && self.device_inner != 0 {
                     DeviceInner::from_ptr(self.device_inner)
                         .perf_mut()

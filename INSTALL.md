@@ -3,7 +3,7 @@
 This is the installation guide for the release bundle (`mtld3d.tar.xz`). It
 covers stock Wine installations and CrossOver bottles. Building from source
 and the developer `make install` flow are covered in the source repository's
-`README.md`.
+`docs/BUILDING.md`.
 
 ## Bundle contents
 
@@ -44,7 +44,7 @@ matching the arch of the Wine build itself: an x86_64 Wine takes
 round. Nothing to choose: copy both, or the one your Wine needs. The PE side
 is x86 in either case.
 
-A bundle built from source with `EC=1` (the `README.md` lists what that
+A bundle built from source with `EC=1` (`docs/BUILDING.md` lists what that
 build needs, the environment variables naming its toolchain among it) also carries
 `wine/aarch64-windows/`, holding `d3d9.dll` and `mtld3d.dll` as builtin-marked
 ARM64X images; release bundles do not. Copied into an arm64 Wine with the rest
@@ -56,7 +56,7 @@ Which `d3d9.dll` an x64 process on an arm64 Wine gets is decided by
 `aarch64-windows`: `wineboot` fills a new prefix's `system32` from there, and
 a `d3d9.dll` in it that is an ARM64X image, ours or Wine's own, sends the
 loader to `aarch64-windows` for x64 processes too. The source tree's
-`make install` sets it up for either choice (see the `README.md`):
+`make install` sets it up for either choice (see `docs/BUILDING.md`):
 
 - `EC=1 make install`: x64 processes get the ARM64X build; 32-bit processes
   keep whatever `i386-windows` holds.
@@ -96,13 +96,13 @@ through the bottle's DLL search path and never enters CrossOver's own
 
 ## Requirements
 
-What the test suites run on in CI:
-
-- **macOS 15 or macOS 26**, on Apple Silicon or Intel.
-- A Wine from [wine-build](https://github.com/athei/wine-build), the release
-  CI pins, which is based on **CrossOver 26**. CrossOver 27 with its arm64 Wine
-  has been tested by hand. Older Wine or CrossOver releases are not expected to
-  work.
+- macOS 15 or macOS 26, on Apple Silicon or Intel. CI covers macOS 15 and 26
+  on Apple Silicon and macOS 15 on Intel, because no macOS 26 Intel runners
+  exist. Intel on macOS 26 is expected to work.
+- A Wine from [wine-build](https://github.com/athei/wine-build), based on
+  CrossOver 26; CI pins a release of it. CrossOver 27's arm64 Wine is tested
+  locally but not run in CI. Older Wine or CrossOver releases are not expected
+  to work.
 - A **64-bit prefix / bottle** — 32-bit games run in it through WoW64.
 - **Rosetta 2** (`softwareupdate --install-rosetta`) for an x86_64 Wine, which
   is what most builds are: the game and the whole PE side are x86. An arm64

@@ -686,8 +686,8 @@ struct FrameCounters {
     /// The plain (no `DISCARD`, no `NOOVERWRITE`) partial Lock of a
     /// DYNAMIC buffer a queued draw may still be reading. `plan_lock`
     /// answers `WriteInPlace` on the strength of the DYNAMIC timing
-    /// contract rather than renaming, the divergence the README lists
-    /// under "Faster than conformant". The arm has no other side effect,
+    /// contract rather than renaming, the divergence listed in
+    /// `docs/STATUS.md#kept-divergences`. The arm has no other side effect,
     /// so this count is the only signal that a game leans on it.
     /// `NOOVERWRITE` / `READONLY` and uncontended Locks are excluded:
     /// handing those back in place is the specified behaviour.

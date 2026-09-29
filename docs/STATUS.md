@@ -1,8 +1,8 @@
 # Status
 
 What mtld3d implements, what it does not yet, what it never will, and the
-divergences from D3D9 it keeps on purpose. The tested games are in the
-[README](../README.md#tested-games); the end-to-end suite's coverage is in
+divergences from D3D9 it keeps on purpose. The tested games are in
+[`GAMES.md`](GAMES.md); the end-to-end suite's coverage is in
 [`COVERAGE.md`](../windows/tests/COVERAGE.md).
 
 ## Supported
@@ -166,7 +166,7 @@ unless its entry says otherwise.
   behind it. It maps a D3D9 device onto a D3D12 device, which has no
   counterpart here.
 - Physical display-mode switching: the mode is meant to stay virtual, see the
-  README's [Fullscreen](../README.md#fullscreen) section.
+  [Fullscreen](../INSTALL.md#fullscreen) section of `INSTALL.md`.
 - Device loss: no exclusive mode is taken, so nothing is ever lost, and
   `TestCooperativeLevel` reports `D3D_OK` across focus changes.
 - Software paths: no reference rasterizer, no software vertex processing, no

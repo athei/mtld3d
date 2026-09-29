@@ -12,7 +12,9 @@ at it.
 
 | File | What it owns |
 | --- | --- |
-| [`README.md`](README.md) | The goal, the requirements, what plays, and where everything else lives. |
+| [`README.md`](README.md) | The goal, the features, the requirements, and where everything else lives. |
+| [`docs/BUILDING.md`](docs/BUILDING.md) | Building from source, installing into a Wine tree, the gates and tests, the arm64 Wine switches, benchmarks and the release bundle. |
+| [`docs/GAMES.md`](docs/GAMES.md) | The games tested so far and how far each one gets. |
 | [`docs/STATUS.md`](docs/STATUS.md) | What is implemented, what is not yet, what never will be, and the divergences kept on purpose. |
 | [`docs/CONVENTIONS.md`](docs/CONVENTIONS.md) | Every code rule: module layout, visibility, data-structure discipline, unsafe discipline, doc-comment shape, dependencies. |
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | The boundary contract: thunk versus command, stable backing for pointers the unix side dereferences, typed wire values, labelling Metal objects, the threading model, the perf counters and how to read them. |
@@ -29,30 +31,34 @@ measured and kept.
 
 Two commands, both green before you commit:
 
-- **`make check`** is `cargo fmt --check`, clippy with `nursery` and `pedantic`,
-  `make audit`, and `make doc`. Only the check legs deny warnings, so a plain
-  `cargo clippy` in an editor reports without failing. Each audit finding names
-  the section of `docs/CONVENTIONS.md` behind it; read that section rather than
-  pattern-matching your way past the grep.
-- **`make test`** is the host-native unit tests plus the end-to-end suite under
+- `make check` is `cargo fmt --check`, clippy with `nursery` and `pedantic`,
+  `make audit`, the Makefile's own tests (`test-isolation` and
+  `test-e2e-discovery`), and `make doc`. Only the check legs deny warnings, so
+  a plain `cargo clippy` in an editor reports without failing. Each audit
+  finding names the section of `docs/CONVENTIONS.md` behind it; read that
+  section rather than pattern-matching your way past the grep.
+- `make test` is the host-native unit tests plus the end-to-end suite under
   Wine, one leg per PE architecture. Conformance is not part of it, on purpose:
   many of its checks fail by design, so it gates on a regression against a
   baseline instead of on zero failures.
 
-Two opt-in switches (see the `README.md`) add legs that run under an arm64
-Wine, the one `WINE_ARM64` names. `ARM64=1` adds `test-e2e-i686-arm64` and
-`test-e2e-x86_64-arm64` to `make test`, the shipping builds under that Wine,
-and `EC=1` adds `test-e2e-arm64x`, the x64 suite against the ARM64X build,
-beside a `make check` leg that lints its two halves. `make conformance` gets
-the matching `conformance-*-arm64` and `conformance-arm64x` legs
-(`unix/conformance/CONFORMANCE.md`, "The arm64-runtime legs"). Each of them
-installs into a private clone of `WINE_ARM64`, creates a fresh prefix for it
-(a prefix only knows the builtins that were installed when it was made) and
-runs one test at a time. The end-to-end ones leave out one test with the
-runner's `--skip`,
-`window_lifecycle::devices_and_windows_come_and_go_on_several_threads_at_once`,
-which deadlocks in that Wine's winemac; the Makefile says why beside the skip.
-The environment variables the legs read are listed in the `README.md`.
+Two opt-in switches (see [`docs/BUILDING.md`](docs/BUILDING.md#arm64-wine))
+add legs that run under an arm64 Wine, the one `WINE_ARM64` names. `ARM64=1`
+adds `test-e2e-i686-arm64` and `test-e2e-x86_64-arm64` to `make test`, the
+shipping builds under that Wine, and `EC=1` adds `test-e2e-arm64x`, the x64
+suite against the ARM64X build, beside a `make check` leg that lints its two
+halves. `make conformance` gets the matching `conformance-*-arm64` and
+`conformance-arm64x` legs (`unix/conformance/CONFORMANCE.md`, "The
+arm64-runtime legs"). Each of them installs into a private clone of
+`WINE_ARM64`, creates a fresh prefix for it (a prefix only knows the builtins
+that were installed when it was made) and runs one test at a time. The
+end-to-end ones leave out two tests with the runner's `--skip`,
+`window_lifecycle::devices_and_windows_come_and_go_on_several_threads_at_once`
+and
+`device::concurrent_retargets_deliver_every_window_message_to_its_own_device`,
+which deadlock in that Wine's winemac; the Makefile says why beside the skip.
+The environment variables the legs read are listed in
+[`docs/BUILDING.md`](docs/BUILDING.md#which-target-reads-which-path).
 
 `make fmt` uses nightly rustfmt. If a toolchain bump reformats files you never
 touched, that churn is its own pull request, not a hand-revert and not a passenger
@@ -278,7 +284,7 @@ layer's own counters, read from the `perf-kv` line of its perf windows as
 `perf.*` (`bench.rs` gives the rules): the per-frame counts of work the API
 calls fix, such as `perf.draws_pf` and `perf.passes_pf`, are the exact ones.
 
-`ARM64=1` and `EC=1` (see the `README.md`) move `make bench` and
+`ARM64=1` and `EC=1` (see `docs/BUILDING.md`) move `make bench` and
 `make bench-ab` onto the arm64 Wine that `WINE_ARM64` names: `ARM64=1` runs
 the `ARCH` build there, `EC=1` the ARM64X build under the x86_64 benchmark
 binary, and each leg of `bench-ab` gets a private clone of that Wine with a
@@ -475,7 +481,8 @@ Each of these rots silently when it is left for later:
 - A new built-in app profile ships with the rationale for every key it sets as
   the comment on its entry in `windows/core/src/app_profile.rs` and a test that
   resolves it from the version strings the shipped binary actually carries.
-  The README links to that file rather than duplicating the profile list.
+  The README and `docs/GAMES.md` link to that file rather than duplicating
+  the profile list.
   A profile that pins no version field is not a profile, it is a name collision
   waiting to happen.
 - A new `Clone` or `Copy` derive updates `scripts/derive_inventory.txt`
