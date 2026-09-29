@@ -5,20 +5,23 @@ endif
 # The arm64 legs read four paths that have no default here. Each comes from
 # the environment or the command line, and each target that needs one fails
 # naming it when it is unset or points at the wrong thing. The first three are
-# the ARM64X toolchain (`windows-arm64x` and what builds on it) and are read
-# only with EC=1. WINE_ARM64 is read with EC=1 or ARM64=1, and always by
-# `bench-variants`; ARM64=1 reads only WINE_ARM64:
+# the ARM64X toolchain: the ARM64X build (`windows-arm64x` and what builds on
+# it) reads all three and its clippy leg (`clippy-pe-arm64x`) the first, and
+# EC=1 adds both to the default targets. WINE_ARM64 is read by the install,
+# test, conformance and benchmark targets under EC=1 or ARM64=1, and always by
+# `bench-variants`, so `EC=1 make` and `EC=1 make check` run without it.
+# ARM64=1 reads only WINE_ARM64:
 #
 #   WINE_SDK_ARM64X  a tree holding Wine's two ARM64X link archives,
 #                    `libwinecrt0.a` and `libntdll.a`, under
 #                    `lib/wine/aarch64-windows`: what wine-build's "ARM64X link
 #                    libraries" step stages as `dist/wine-arm64x`. The Wine SDK
-#                    is an x86 Wine and carries neither. The EC=1 build and the
-#                    EC=1 clippy leg read it.
+#                    is an x86 Wine and carries neither. The ARM64X build and
+#                    its clippy leg read it.
 #   LLVM_MINGW       an llvm-mingw install, whose ARM64 and ARM64EC sysroots
-#                    are the CRT the link takes. The EC=1 build reads it.
+#                    are the CRT the link takes. The ARM64X build reads it.
 #   ARM64X_LLD       an `lld-link` of LLD 23 or newer, such as Homebrew's
-#                    `lld`. The EC=1 build reads it.
+#                    `lld`. The ARM64X build reads it.
 #   WINE_ARM64       an arm64 Wine tree, the directory holding `bin/wine` and
 #                    `lib/wine`, that `EC=1 make install` installs the ARM64X
 #                    DLLs into and `ARM64=1 make install` the x86 ones, and

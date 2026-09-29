@@ -289,9 +289,9 @@ move `make bench` and `make bench-ab` onto the arm64 Wine that `WINE_ARM64`
 names: `ARM64=1` runs the `ARCH` build there, `EC=1` the ARM64X build under
 the x86_64 benchmark binary, and each leg of `bench-ab` gets a private clone
 of that Wine with a fresh prefix, the way the arm64 test legs do. A benchmark
-measures one layout, so the two switches are not given together, and `EC=1 make bench-ab` needs a
-`BASE` whose Makefile has `windows-arm64x`: it stops with a message naming
-`BASE` otherwise. `make bench-variants` compares
+measures one layout, so the two switches are not given together, and
+`EC=1 make bench-ab` needs a `BASE` whose Makefile has `windows-arm64x`: it
+stops with a message naming `BASE` otherwise. `make bench-variants` compares
 layouts instead of commits: this checkout's x86_64 build on the SDK's Wine
 against the same build on `WINE_ARM64` (`x86_64-sdk-vs-arm64`), and with
 `EC=1` the x86_64 build against the ARM64X one on `WINE_ARM64`
