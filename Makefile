@@ -174,9 +174,9 @@ $(info ==> PROD=1: cargo profile `production` (fat LTO + codegen-units=1))
 # Production carries no debug assertions, Rust or C/C++ (docs/CONVENTIONS.md,
 # "Production carries no debug assertions"). The cargo profile turns off
 # `debug-assertions`; this turns off `assert` in the C, C++ and Objective-C that
-# build scripts compile through cc-rs (snmalloc-sys and zstd-sys in the PE DLLs
-# and the Unix dylib, and the delegate forward in the Unix dylib), for every
-# target of both workspaces. cc-rs appends the plain `CFLAGS` / `CXXFLAGS` to
+# build scripts compile through cc-rs (snmalloc-sys in the PE DLLs and the Unix
+# dylib, zstd-sys and the delegate forward in the Unix dylib), for every target
+# of both workspaces. cc-rs appends the plain `CFLAGS` / `CXXFLAGS` to
 # the `CFLAGS_<target>` values in the `.cargo/config.toml` files, so the
 # per-target flags there stay. The plain names and not `TARGET_CFLAGS`: cc-rs
 # reads `HOST_CFLAGS` instead when the target is the build machine's own, as
@@ -506,23 +506,23 @@ windows-x86_64:
 # entry point, and it does what MSVC's does for the x86 DLLs: it runs the
 # static initializers std registers, sets up TLS and runs the module's atexit
 # table at detach. `-lldmingw` is the linker mode that CRT is written for, in
-# which LLD supplies the constructor list `libmingw32.a` reads. The three
-# symbols of MSVC's static CRT that remain, and the thread-exit teardown of
-# snmalloc that MSVC's CRT runs and llvm-mingw's does not, are in
-# `windows/d3d9/src/arm64_crt.rs`. `kernel32` precedes `mincore`, so what both
-# define is imported from `KERNEL32.dll` as the x86 DLLs import it, and only
-# what `kernel32` lacks (`WaitOnAddress`, `VirtualAlloc2FromApp`) comes from
-# the API sets. `ntdll` is Wine's own import library rather than llvm-mingw's,
-# the one the `unix_lib.o` inside the shim is built against, and it carries the
-# ARM64EC stack probe. It goes last: LLD takes a symbol from the first library
-# that defines it, and Wine's ntdll also exports C runtime functions (`memcpy`,
-# `_errno`) that have to come from the ucrt the rest of the CRT uses. Each
-# library is named by path for both halves, since both sysroots spell it the
-# same. `/defarm64native` exports the same names from the ARM64 half as `/def`
-# does from the EC half. `/opt:ref,icf` is what rustc passes for the x86 DLLs,
-# and `/debug` would otherwise turn both off: it drops the code nothing
-# reaches, zstd's suffix sorter among it, along with that code's C assertion
-# import.
+# which LLD supplies the constructor list `libmingw32.a` reads. The one symbol
+# of MSVC's static CRT that remains (the `type_info` vtable), and the
+# thread-exit teardown of snmalloc that MSVC's CRT runs and llvm-mingw's does
+# not, are in `windows/d3d9/src/arm64_crt.rs`. `kernel32` precedes `mincore`,
+# so what both define is imported from `KERNEL32.dll` as the x86 DLLs import
+# it, and only what `kernel32` lacks (`WaitOnAddress`, `VirtualAlloc2FromApp`)
+# comes from the API sets. `ntdll` is Wine's own import library rather than
+# llvm-mingw's, the one the `unix_lib.o` inside the shim is built against, and
+# it carries the ARM64EC stack probe. It goes last: LLD takes a symbol from the
+# first library that defines it, and Wine's ntdll also exports C runtime
+# functions (`memcpy`, `_errno`) that have to come from the ucrt the rest of
+# the CRT uses. Each library is named by path for both halves, since both
+# sysroots spell it the same. `/defarm64native` exports the same names from the
+# ARM64 half as `/def` does from the EC half. `/opt:ref,icf` is what rustc
+# passes for the x86 DLLs, and `/debug` would otherwise turn both off: it drops
+# the code nothing reaches, along with any C assertion import that code
+# carries.
 #
 # The linker has to be LLD 23 or newer. An ARM64X image has one TLS directory
 # field, and each half brings its own `_tls_used`, `_tls_index` and TLS
@@ -1209,10 +1209,11 @@ test: test-unit test-e2e-i686 test-e2e-x86_64 $(ARM64_ARCHS:%=test-e2e-%-arm64) 
 # Host-native unit tests, built for this machine's native arch (no Rosetta).
 # Needs no install and no wine at all, which is why it is its own leg: the
 # windows workspace singles out mtld3d-core (its other members are PE-only and
-# can't build for the host target) and must override its i686 default; the unix
-# workspace already defaults to the host, so just run all of it.
+# can't build for the host target) and must override its i686 default, and turns
+# on its `disk-cache` feature so the shader cache's tests run; the unix workspace
+# already defaults to the host, so just run all of it.
 test-unit:
-	cd windows && cargo +$(RUST_STABLE) nextest run -p mtld3d-core -p mtld3d-types --target $(UNIX_NATIVE_TARGET)
+	cd windows && cargo +$(RUST_STABLE) nextest run -p mtld3d-core -p mtld3d-types --features mtld3d-core/disk-cache --target $(UNIX_NATIVE_TARGET)
 	cd unix && cargo +$(RUST_STABLE) nextest run
 
 # The e2e suite, one leg per PE arch: each installs the arch it exercises plus
@@ -2018,7 +2019,7 @@ BENCH_HOST_DIR := $(BENCH_DIR)/host
 BENCH_HOST_EXE = $(1)/windows/target/$(UNIX_NATIVE_TARGET)/$(PROFILE)/examples/emit_corpus
 bench-host-build:
 	cd windows && cargo +$(RUST_STABLE) build --profile $(PROFILE) -p mtld3d-core \
-		--target $(UNIX_NATIVE_TARGET) --example emit_corpus
+		--features mtld3d-core/disk-cache --target $(UNIX_NATIVE_TARGET) --example emit_corpus
 
 bench-host: bench-host-build
 	mkdir -p '$(BENCH_HOST_DIR)' && rm -f '$(BENCH_HOST_DIR)'/bench-host_emit_*.metrics
@@ -2069,10 +2070,12 @@ clippy-pe-arm64x:
 	done
 
 # Everything that lints for this machine's own arch: mtld3d-core's test targets
-# (the only place `#[cfg(test)]` blocks in the windows workspace are linted) and
-# the whole unix workspace.
+# (the only place `#[cfg(test)]` blocks in the windows workspace are linted),
+# with its `disk-cache` feature on as the Unix dylib builds it, and the whole
+# unix workspace. The PE legs above lint mtld3d-core with the feature off, the
+# way the DLLs build it.
 clippy-native:
-	cd windows && cargo +$(RUST_STABLE) clippy -p mtld3d-core --target $(UNIX_NATIVE_TARGET) --all-targets $(DENY_WARNINGS)
+	cd windows && cargo +$(RUST_STABLE) clippy -p mtld3d-core --features mtld3d-core/disk-cache --target $(UNIX_NATIVE_TARGET) --all-targets $(DENY_WARNINGS)
 	cd unix && cargo +$(RUST_STABLE) clippy --all-targets $(DENY_WARNINGS)
 
 # The conventions clippy can't express: doc-comment shape, the Clone/Copy derive
@@ -2095,9 +2098,14 @@ doc: doc-windows doc-unix
 
 # The windows workspace is documented for a PE target, not the host: d3d9 and the
 # shim are `cdylib`s with raw-dylib imports and only build for *-pc-windows-msvc,
-# so a host run would silently skip them. i686 covers every member.
+# so a host run would silently skip them. i686 covers every member. The first run
+# builds mtld3d-core as the DLLs do, without `disk-cache`; the second documents
+# it again with the feature on, since the unix workspace's `--no-deps` run does
+# not document the path dependency and nothing else would check the shader
+# cache's links.
 doc-windows:
 	cd windows && cargo +$(RUST_STABLE) doc --no-deps --target $(PE_i386) $(DENY_WARNINGS)
+	cd windows && cargo +$(RUST_STABLE) doc --no-deps -p mtld3d-core --features mtld3d-core/disk-cache --target $(PE_i386) $(DENY_WARNINGS)
 
 doc-unix:
 	cd unix && cargo +$(RUST_STABLE) doc --no-deps $(DENY_WARNINGS)

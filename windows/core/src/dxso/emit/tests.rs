@@ -21,7 +21,7 @@ use super::{
 };
 use crate::{
     dxso::{ir::TextureType, parser::parse},
-    shader_cache::ff_key_hash,
+    shader_key::ff_key_hash,
 };
 
 /// D3D enum constant at the key's narrow width.

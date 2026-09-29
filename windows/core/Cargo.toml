@@ -15,7 +15,17 @@ log = { workspace = true }
 rustc-hash = { workspace = true }
 strum = { workspace = true, features = ["derive"] }
 xxhash-rust = { workspace = true }
-zstd = { workspace = true }
+zstd = { workspace = true, optional = true }
+
+# `disk-cache` builds `shader_cache`, the on-disk shader and pipeline cache and
+# its zstd framing. Only the Unix dylib reads and writes the cache, so it and the
+# host tests enable it; the PE DLLs leave it off and link no zstd.
+[features]
+disk-cache = ["dep:zstd"]
+
+[[example]]
+name = "emit_corpus"
+required-features = ["disk-cache"]
 
 [build-dependencies]
 xxhash-rust = { workspace = true }

@@ -22,8 +22,9 @@ use mtld3d_core::{
         compilation::{Identity as CompileIdentity, Kind as CompileKind},
     },
     pipeline_state::{self, PipelineBuildInputs},
-    shader_cache::{self, CacheLoad, CachedKind, ShaderRecordRef},
+    shader_cache::{self, CacheLoad, ShaderRecordRef},
     shader_compile_stats::{CompileBucket, Snapshot, format_summary},
+    shader_key::CachedKind,
     shader_prewarm::PrewarmHandle,
     startup_work,
 };

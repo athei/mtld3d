@@ -89,10 +89,10 @@ rustflags = ["-C", "target-feature=-crt-static"]
 # `CFLAGS` (see the Makefile) without restating anything here.
 #
 # `-fno-omit-frame-pointer` stays unconditional here rather than following the
-# Rust side's `FP=1` knob: this is a fixed, small amount of code (snmalloc-sys
-# and zstd-sys) whose frames are worth keeping walkable in every build. Because
-# these flags come last, it also overrides the `-fomit-frame-pointer` that
-# snmalloc-sys's build script adds.
+# Rust side's `FP=1` knob: this is a fixed, small amount of code (snmalloc-sys,
+# and zstd-sys in the e2e test executables) whose frames are worth keeping
+# walkable in every build. Because these flags come last, it also overrides the
+# `-fomit-frame-pointer` that snmalloc-sys's build script adds.
 CFLAGS_i686-pc-windows-msvc     = "-march=pentium4 -fno-omit-frame-pointer -idirafter /opt/xwin/crt/include -idirafter /opt/xwin/sdk/include/ucrt -idirafter /opt/xwin/sdk/include/um -idirafter /opt/xwin/sdk/include/shared"
 CFLAGS_x86_64-pc-windows-msvc   = "-march=x86-64-v2 -fno-omit-frame-pointer -idirafter /opt/xwin/crt/include -idirafter /opt/xwin/sdk/include/ucrt -idirafter /opt/xwin/sdk/include/um -idirafter /opt/xwin/sdk/include/shared"
 CXXFLAGS_i686-pc-windows-msvc   = "-march=pentium4 -fno-omit-frame-pointer -idirafter /opt/xwin/crt/include -idirafter /opt/xwin/sdk/include/ucrt -idirafter /opt/xwin/sdk/include/um -idirafter /opt/xwin/sdk/include/shared"
@@ -110,11 +110,9 @@ CXXFLAGS_x86_64-pc-windows-msvc = "-march=x86-64-v2 -fno-omit-frame-pointer -idi
 # exit, and `windows/d3d9/src/arm64_crt.rs` calls it from a TLS callback.
 # `ARM64_SYSREG` is the Windows SDK macro snmalloc's ARM layer reads its cycle
 # counter with; the SDK defines it in `arm64intr.h`, which clang's own header
-# of that name shadows. ARM64EC defines `_M_X64`, so zstd would include the
-# x86 SIMD headers, which clang cannot compile for an ARM64 back end:
-# `ZSTD_NO_INTRINSICS` keeps it on its scalar code.
+# of that name shadows.
 CFLAGS_aarch64-pc-windows-msvc    = "-idirafter /opt/xwin/crt/include -idirafter /opt/xwin/sdk/include/ucrt -idirafter /opt/xwin/sdk/include/um -idirafter /opt/xwin/sdk/include/shared"
-CFLAGS_arm64ec-pc-windows-msvc    = "-DZSTD_NO_INTRINSICS -idirafter /opt/xwin/crt/include -idirafter /opt/xwin/sdk/include/ucrt -idirafter /opt/xwin/sdk/include/um -idirafter /opt/xwin/sdk/include/shared"
+CFLAGS_arm64ec-pc-windows-msvc    = "-idirafter /opt/xwin/crt/include -idirafter /opt/xwin/sdk/include/ucrt -idirafter /opt/xwin/sdk/include/um -idirafter /opt/xwin/sdk/include/shared"
 CXXFLAGS_aarch64-pc-windows-msvc  = "-fno-exceptions -fno-rtti -fno-threadsafe-statics -DSNMALLOC_USE_THREAD_CLEANUP -DARM64_SYSREG(op0,op1,crn,crm,op2)=((((op0)&1)<<14)|(((op1)&7)<<11)|(((crn)&15)<<7)|(((crm)&15)<<3)|((op2)&7)) -idirafter /opt/xwin/crt/include -idirafter /opt/xwin/sdk/include/ucrt -idirafter /opt/xwin/sdk/include/um -idirafter /opt/xwin/sdk/include/shared"
 CXXFLAGS_arm64ec-pc-windows-msvc  = "-fno-exceptions -fno-rtti -fno-threadsafe-statics -DSNMALLOC_USE_THREAD_CLEANUP -DARM64_SYSREG(op0,op1,crn,crm,op2)=((((op0)&1)<<14)|(((op1)&7)<<11)|(((crn)&15)<<7)|(((crm)&15)<<3)|((op2)&7)) -idirafter /opt/xwin/crt/include -idirafter /opt/xwin/sdk/include/ucrt -idirafter /opt/xwin/sdk/include/um -idirafter /opt/xwin/sdk/include/shared"
 # The MSVC librarian, as a bare name resolved from PATH: `make setup-rust` puts an

@@ -633,7 +633,7 @@ pub enum Identity {
     },
     Prewarm {
         device: u64,
-        kind: crate::shader_cache::CachedKind,
+        kind: crate::shader_key::CachedKind,
         key: u64,
     },
     Pipeline {

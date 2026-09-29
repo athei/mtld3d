@@ -11,7 +11,7 @@ authors.workspace = true
 crate-type = ["cdylib"]
 
 [dependencies]
-mtld3d-core = { path = "../../windows/core" }
+mtld3d-core = { path = "../../windows/core", features = ["disk-cache"] }
 mtld3d-types = { path = "../../windows/types" }
 bitflags = { workspace = true }
 block2 = { workspace = true }

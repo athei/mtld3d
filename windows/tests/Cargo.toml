@@ -22,11 +22,12 @@ mtld3d-types = { workspace = true }
 # the allocator benchmark example installs snmalloc as its global allocator.
 # The decommit-on-free probe needs the Windows PAL to return pages, so the
 # check cannot live in `mtld3d-core`'s host tests. `mtld3d-core` comes along for
-# `SNMALLOC_LOCAL_CACHE_BYTES` so the threshold is not written down twice.
+# `SNMALLOC_LOCAL_CACHE_BYTES` so the threshold is not written down twice, and
+# with `disk-cache` for the shader-cache reader and writer the e2e cache tests use.
 [dev-dependencies]
 zstd = { workspace = true }
 xxhash-rust = { workspace = true }
-mtld3d-core = { workspace = true }
+mtld3d-core = { workspace = true, features = ["disk-cache"] }
 # The benchmarks time with the layer's own `rdtsc` primitive and calibrated rate
 # (`mtld3d_shared::tsc`) rather than a copy of either.
 mtld3d-shared = { workspace = true }

@@ -1487,7 +1487,7 @@ fn range_fog_keys_only_computed_vertex_fog() {
 fn shader_owned_fog_reuses_the_existing_disabled_key_and_source() {
     use crate::{
         dxso::{emit_ps_programmable, parse},
-        shader_cache::ff_key_hash,
+        shader_key::ff_key_hash,
     };
 
     let shader =

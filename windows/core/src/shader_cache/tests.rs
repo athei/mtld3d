@@ -5,10 +5,10 @@
 //! header-only file. Every one of those but the scrambled-frame case pins the
 //! `needs_compaction` verdict the pre-warm rewrite keys off. The file-level tests write real
 //! files under the system temp root and pin that many writers reaching a cold cache together
-//! still produce one header. Further tests cover header validation, `CachedKind` mapping and
-//! `ff_key_hash` stability.
+//! still produce one header. Further tests cover header validation.
 
 use super::*;
+use crate::shader_key::vs_source_disk_key_programmable;
 
 fn write_file(entries_per_chunk: &[Vec<CacheEntry>], bundle_last: bool) -> Vec<u8> {
     let mut buf = Vec::new();
@@ -629,47 +629,6 @@ fn read_header_returns_both_versions() {
             shader_schema_version: 100,
         })
     );
-}
-
-#[test]
-fn cached_kind_round_trips_via_byte() {
-    for k in [
-        CachedKind::FfVs,
-        CachedKind::FfPs,
-        CachedKind::Sm1Vs,
-        CachedKind::Sm1Ps,
-        CachedKind::Sm2Vs,
-        CachedKind::Sm2Ps,
-        CachedKind::Sm3Vs,
-        CachedKind::Sm3Ps,
-    ] {
-        assert_eq!(CachedKind::from_byte(k as u8), Some(k));
-    }
-}
-
-#[test]
-fn from_programmable_maps_supported_majors() {
-    assert_eq!(
-        CachedKind::from_programmable(1, false),
-        Some(CachedKind::Sm1Vs)
-    );
-    assert_eq!(
-        CachedKind::from_programmable(2, true),
-        Some(CachedKind::Sm2Ps)
-    );
-    assert_eq!(
-        CachedKind::from_programmable(3, false),
-        Some(CachedKind::Sm3Vs)
-    );
-    assert_eq!(CachedKind::from_programmable(0, false), None);
-    assert_eq!(CachedKind::from_programmable(4, true), None);
-}
-
-#[test]
-fn ff_key_hash_is_stable() {
-    let a = (1u32, 2u32, 3u32);
-    let b = (1u32, 2u32, 3u32);
-    assert_eq!(ff_key_hash(&a), ff_key_hash(&b));
 }
 
 #[test]

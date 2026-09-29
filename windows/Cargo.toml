@@ -28,7 +28,7 @@ snmalloc-rs = { git = "https://github.com/microsoft/snmalloc", rev = "edccdfe88f
 strum = { version = "0.28", default-features = false }
 xbr = { version = "0.2", default-features = false }
 xxhash-rust = { version = "0.8.19", features = ["xxh3"] }
-zstd = "0.13"
+zstd = { version = "0.13", default-features = false }
 
 [profile.dev]
 panic = "abort"
@@ -71,7 +71,9 @@ debug = 0
 # `DEBUG` env var the same way snmalloc-sys does and would link `msvcrtd`
 # on i686/x64 windows-msvc when our workspace `debug = 1` is set. Same
 # mitigation: force `DEBUG=false` so its `cc::Build` picks the release
-# CRT (`/MD`, not `/MDd`).
+# CRT (`/MD`, not `/MDd`). The DLLs do not link zstd, since `mtld3d-core`
+# builds its disk cache only with the `disk-cache` feature. The e2e test
+# executables do, because they read and write cache files.
 [profile.release.package.zstd-sys]
 debug = 0
 

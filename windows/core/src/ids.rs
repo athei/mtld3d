@@ -59,7 +59,7 @@ impl ProgramId {
     ///
     /// `xxh3_64` (not `DefaultHasher`) so the value is stable across
     /// `rustc` versions — the same `ProgramId` is the on-disk shader-cache
-    /// key (`shader_cache.rs`), so a hasher whose output is allowed to
+    /// key (`shader_key.rs`), so a hasher whose output is allowed to
     /// shift between toolchains would silently invalidate the cache.
     #[must_use]
     pub fn from_tokens(tokens: &[u32]) -> Self {

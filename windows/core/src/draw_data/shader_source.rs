@@ -6,7 +6,7 @@ use super::{PsKey, VsKey, ps_source_disk_key_ff, vs_source_disk_key_ff};
 use crate::{
     dxso::{FfPsKey, FfVsKey, VariantKey, VsSamplerKinds},
     ids::ProgramId,
-    shader_cache::{ps_source_disk_key_programmable, vs_source_disk_key_programmable},
+    shader_key::{ps_source_disk_key_programmable, vs_source_disk_key_programmable},
 };
 
 bitflags::bitflags! {

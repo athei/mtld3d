@@ -70,10 +70,12 @@ pub mod render_scale;
 pub mod render_state;
 pub mod sampler_state;
 pub mod scratch;
+#[cfg(feature = "disk-cache")]
 pub mod shader_cache;
 pub mod shader_compile_stats;
 pub mod shader_constants;
 pub mod shader_create;
+pub mod shader_key;
 pub mod shader_prewarm;
 pub mod staging_coverage;
 pub mod startup_work;

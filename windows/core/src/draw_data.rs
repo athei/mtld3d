@@ -18,7 +18,7 @@ pub use shader_source::{
     PsSourcePtr, PsSourceView, ShaderSourceFlags, VsSource, VsSourcePtr, VsSourceView,
 };
 
-pub use crate::shader_cache::{ps_source_disk_key_programmable, vs_source_disk_key_programmable};
+pub use crate::shader_key::{ps_source_disk_key_programmable, vs_source_disk_key_programmable};
 use crate::{
     depth_stencil_state::DepthStencilSnapshot,
     dxso::{FfPsKey, FfVsKey, TextureType, VariantKey, VsSamplerKinds},
@@ -26,7 +26,7 @@ use crate::{
     perf::PairShaderId,
     pipeline_state::StreamLayout,
     scratch::ScratchArena,
-    shader_cache,
+    shader_key,
     streams::{bound_stream_layout, layout_stride},
 };
 
@@ -886,12 +886,12 @@ pub const fn null_texture_kind(ty: TextureType) -> NullTextureKind {
 
 #[must_use]
 pub fn vs_source_disk_key_ff(ff: &FfVsKey) -> u64 {
-    shader_cache::ff_key_hash(ff)
+    shader_key::ff_key_hash(ff)
 }
 
 #[must_use]
 pub fn ps_source_disk_key_ff(ff: &FfPsKey, variant: VariantKey) -> u64 {
-    shader_cache::ff_key_hash(&(ff, variant))
+    shader_key::ff_key_hash(&(ff, variant))
 }
 
 /// The shader identity for one draw — the VS/PS sources + `variant`, which travel together.

@@ -4,7 +4,8 @@ use mtld3d_core::{
     pipeline_state::{
         ExtraColorAttachments, PipelineAttachFlags, PipelineRsBits, PipelineSnapshot, StreamLayout,
     },
-    shader_cache::{CachedKind, ShaderRecordRef},
+    shader_cache::ShaderRecordRef,
+    shader_key::CachedKind,
 };
 use mtld3d_shared::{MetalHandle, mtl::PixelFormat};
 use mtld3d_types::MAX_STREAMS;

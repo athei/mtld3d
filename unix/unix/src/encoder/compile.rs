@@ -37,8 +37,9 @@ use mtld3d_core::{
         compilation::{Identity as CompileIdentity, Kind as CompileKind},
     },
     pipeline_state::{self, PipelineBuildInputs, PipelineKey, PipelineSnapshot},
-    shader_cache::{self, CachedKind, PipelineRecipe, ShaderRecordRef},
+    shader_cache::{self, PipelineRecipe, ShaderRecordRef},
     shader_compile_stats::CompileBucket,
+    shader_key::CachedKind,
 };
 use mtld3d_shared::{
     MetalHandle, VertexAttrDesc,

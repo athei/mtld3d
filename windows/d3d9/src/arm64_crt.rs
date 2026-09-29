@@ -57,37 +57,6 @@ pub fn attach() {
     core::hint::black_box(&THREAD_EXIT_CALLBACK);
 }
 
-/// `__cpuid` for ARM64EC, which MSVC supplies from `softintrin.lib`.
-///
-/// ARM64EC presents itself to the preprocessor as x64, so zstd's CPU probe
-/// calls the intrinsic, and zstd is the only caller in the image. Leaf 0
-/// reports the highest supported leaf in its first register, so an all-zero
-/// answer says there is no further leaf, and zstd turns on none of the x86
-/// paths it probes for, its BMI2 code among them. ARM64 code has none of them
-/// anyway.
-///
-/// # Safety
-///
-/// `info` must point to four writable `i32`s, the array the intrinsic fills.
-#[cfg(target_arch = "arm64ec")]
-#[unsafe(no_mangle)]
-pub const unsafe extern "C" fn __cpuid(info: *mut i32, _leaf: i32) {
-    // SAFETY: the caller passes the four-element array the intrinsic writes.
-    unsafe { info.write_bytes(0, 4) };
-}
-
-/// `__cpuidex` for ARM64EC, answering every leaf the way [`__cpuid`] does.
-///
-/// # Safety
-///
-/// `info` must point to four writable `i32`s, the array the intrinsic fills.
-#[cfg(target_arch = "arm64ec")]
-#[unsafe(no_mangle)]
-pub const unsafe extern "C" fn __cpuidex(info: *mut i32, _leaf: i32, _subleaf: i32) {
-    // SAFETY: the caller passes the four-element array the intrinsic writes.
-    unsafe { info.write_bytes(0, 4) };
-}
-
 /// Runs snmalloc's per-thread teardown when a thread exits.
 ///
 /// This is the part of MSVC's CRT that the x86 DLLs get from `__tlregdtor` and

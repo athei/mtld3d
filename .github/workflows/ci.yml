@@ -118,8 +118,9 @@ jobs:
   # names itself, and every step runs whatever the ones before it did: a run
   # is meant to show everything that is wrong at once, not the first thing.
   # `pe` gates the MSVC SDK and the Wine SDK: clippy and rustdoc run build
-  # scripts, so snmalloc-sys and zstd-sys need the xwin headers and the
-  # archiver, and windows/shim's build script reads Wine's libwinecrt0.a.
+  # scripts, so snmalloc-sys (and zstd-sys, for the e2e test crate and the
+  # disk-cache doc run) need the xwin headers and the archiver, and
+  # windows/shim's build script reads Wine's libwinecrt0.a.
   check:
     if: ${{ !inputs.probe_only && !startsWith(github.ref, 'refs/tags/v') }}
     runs-on: macos-26

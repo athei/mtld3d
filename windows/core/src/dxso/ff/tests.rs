@@ -2960,16 +2960,16 @@ fn packed_stage_preserves_legacy_current_hash_stream_and_key_sizes() {
         };
         assert_eq!(writes(&key), writes(&legacy), "CURRENT stream, mask {mask}");
         assert_eq!(
-            crate::shader_cache::ff_key_hash(&key),
-            crate::shader_cache::ff_key_hash(&legacy)
+            crate::shader_key::ff_key_hash(&key),
+            crate::shader_key::ff_key_hash(&legacy)
         );
         let current = key.clone();
         key.stages[0].set_result(FfStageResult::Temp);
         assert_ne!(key, current);
         assert_ne!(writes(&key), writes(&current));
         assert_ne!(
-            crate::shader_cache::ff_key_hash(&key),
-            crate::shader_cache::ff_key_hash(&current)
+            crate::shader_key::ff_key_hash(&key),
+            crate::shader_key::ff_key_hash(&current)
         );
         assert_eq!(key.stages[0].has_texture(), mask & 1 != 0);
     }
