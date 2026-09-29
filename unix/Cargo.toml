@@ -130,6 +130,18 @@ debug = 0
 [profile.dev.package.snmalloc-sys]
 debug = 0
 
+# zstd-sys's C objects would otherwise carry `-g` for the same reason. Under
+# LTO rustc links the dylib against a filtered copy of each rlib in a temporary
+# directory it deletes after the link, so the debug map names those objects by
+# a path that no longer exists: `dsymutil` warns once per object and gathers no
+# DWARF from them. Building them without debug info leaves nothing to point at.
+# dev gets the same override so the two profiles agree, as for snmalloc-sys.
+[profile.release.package.zstd-sys]
+debug = 0
+
+[profile.dev.package.zstd-sys]
+debug = 0
+
 # Shipped builds — fat cross-crate LTO + a single codegen unit so the
 # linker can inline and DCE across the whole dylib. Inherits panic, debug,
 # opt-level, incremental from `release`, but overrides `debug-assertions` +
