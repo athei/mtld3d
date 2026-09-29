@@ -16,39 +16,46 @@ and no game breaks, speed wins. Those trades are listed in
 
 ## Features
 
-- Shader Model 1 to 3 and the fixed-function pipeline are translated to Metal
-  Shading Language by mtld3d's own translator.
-- Shaders and pipelines a game uses for the first time build on worker
-  threads, and a frame waits once for all the builds it needs, not once per
-  draw. Asynchronous compilation, on by default, goes further on a cold
-  cache: a draw into a target the game rebuilds every frame is skipped for a
-  frame or two instead of waited for, so the game does not stutter. Turned
-  off, those draws wait with the rest.
-- A shader cache, on by default. Translated shaders and pipelines are kept in
-  a file next to the game and built again before the first frame of the next
-  launch, so combinations seen before do not compile during play. Turned off,
-  every launch compiles on first use.
-- Frame pacing through Metal's minimum-duration present, for both vsync and
-  the frame cap. Unlike pacing the game's thread or enabling display sync on
-  the Metal layer, this works with ProMotion: the panel follows whatever rate
-  the game sustains below its maximum. Vsync follows the game's present
-  interval; the frame cap is off by default.
-- Upscaling, off by default. The game can render below the presented size and
-  have MetalFX's spatial scaler upscale the result. A mip LOD bias, on by
+- **Shader translation.** Shader Model 1 to 3 and the fixed-function
+  pipeline are translated to Metal Shading Language by mtld3d's own
+  translator.
+- **Multithreading.** Rendering work runs in a three-thread pipeline that
+  stays a fixed one frame ahead of the game, so latency is bounded. The
+  auxiliary threads run on the unix side: they take no address space from a
+  32-bit game, and under an arm64 Wine most of the code runs as native arm64.
+- **Background shader builds.** Shaders and pipelines a game uses for the
+  first time build on worker threads. A frame waits once for all the builds
+  it needs, not once per draw. Asynchronous compilation goes further on a
+  cold cache: a draw into a target the game rebuilds every frame is skipped
+  for a frame or two instead of waited for, so the game does not stutter.
+  Asynchronous compilation is on by default. Turned off, those draws wait
+  with the rest.
+- **Shader cache.** On by default. Translated shaders and pipelines are kept
+  in a file next to the game and built again before the first frame of the
+  next launch, so combinations seen before do not compile during play.
+  Turned off, every launch compiles on first use.
+- **Frame pacing.** Vsync and the frame cap both use Metal's minimum-duration
+  present. Unlike pacing the game's thread or enabling display sync on the
+  Metal layer, this works with ProMotion: the panel follows whatever rate the
+  game sustains below its maximum. Vsync follows the game's present interval;
+  the frame cap is off by default.
+- **Upscaling.** Off by default. The game can render below the presented size
+  and have MetalFX's spatial scaler upscale the result. A mip LOD bias, on by
   default, keeps texture detail at the presented size; turned off, textures
   are sampled for the smaller render size.
-- HDR output, on by default. On a display with EDR headroom the frame is
+- **HDR output.** On by default. On a display with EDR headroom the frame is
   expanded into that headroom by inverse tone mapping that follows the live
   headroom. Turned off, or on a display without EDR headroom, the frame is
   presented as SDR.
-- A software cursor. It is drawn in its own overlay window independently of
-  the game's frames, so it is not tied to the frame rate and has
-  hardware-cursor latency. Under HDR it is tone-mapped like the frame, where
-  the macOS cursor stays at SDR brightness, and showing or hiding it does not
-  delay the next present by a refresh as the hardware cursor does. On by
-  default whenever HDR output is active, and can be forced on or off; turned
-  off, the game gets the hardware cursor.
-- Built-in profiles for the few games that need settings of their own.
+- **Software cursor.** The cursor is drawn in its own overlay window
+  independently of the game's frames, so it is not tied to the frame rate
+  and has hardware-cursor latency. Under HDR it is tone-mapped like the
+  frame, where the macOS cursor stays at SDR brightness. Showing or hiding it
+  does not delay the next present by a refresh as the hardware cursor does.
+  It is on by default whenever HDR output is active, and can be forced on or
+  off. Turned off, the game gets the hardware cursor.
+- **Game profiles.** The few games that need settings of their own get a
+  built-in profile.
 
 Every switch, with its default, is in [`mtld3d.conf`](mtld3d.conf).
 [`docs/STATUS.md`](docs/STATUS.md) lists what is implemented, what is not
