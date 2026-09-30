@@ -5127,6 +5127,64 @@ fn partial_updates_stay_in_place_until_a_draw_samples_the_level() {
     );
 }
 
+/// A partial write over an upload of an earlier frame moves to fresh pages.
+///
+/// A `ColorFill` of an offscreen-plain surface schedules its upload with no
+/// GPU use behind it, so a second fill in the same frame lands in place. Once
+/// the frame is handed off, the encoder may be replaying that upload while
+/// the next frame's fill runs, so the fill must not write the pages it reads:
+/// a read-only lock finds new pages after it. The three fills still reach the
+/// surface.
+#[test]
+fn a_fill_over_an_earlier_frames_upload_moves_to_fresh_pages() {
+    const RED: u32 = 0xFFFF_0000;
+    const GREEN: u32 = 0xFF00_FF00;
+    const BLUE: u32 = 0xFF00_00FF;
+    let h = Harness::new();
+    let surface = h.create_offscreen_plain_surface(4, 4, D3DFMT_X8R8G8B8, D3DPOOL_DEFAULT);
+    let pages = || surface.lock_rect(D3DLOCK_READONLY).bits_ptr();
+    assert_eq!(h.color_fill_hr(&surface, RED), 0, "whole fill");
+    let first = pages();
+    assert_eq!(
+        h.color_fill_rect_hr(&surface, (0, 0, 2, 4), GREEN),
+        0,
+        "partial fill in the same frame"
+    );
+    assert_eq!(
+        pages(),
+        first,
+        "a fill over this frame's unseen upload lands in place"
+    );
+    h.render_once(BLACK, |_| {});
+    assert_eq!(
+        h.color_fill_rect_hr(&surface, (2, 2, 4, 4), BLUE),
+        0,
+        "partial fill in the next frame"
+    );
+    assert_ne!(
+        pages(),
+        first,
+        "a fill over an earlier frame's upload moves to fresh pages"
+    );
+    let back_buffer = h.render_target(0);
+    h.render_once(BLACK, |d| {
+        assert_eq!(
+            d.stretch_rect(&surface, &back_buffer, D3DTEXF_POINT),
+            0,
+            "StretchRect the surface over the back buffer"
+        );
+    });
+    assert_eq!(
+        [
+            h.read_pixel(160, 240),
+            h.read_pixel(480, 120),
+            h.read_pixel(480, 360),
+        ],
+        [GREEN, RED, BLUE],
+        "the surface after the three fills"
+    );
+}
+
 /// A partial copy, a draw, another partial copy and a draw each sample their own version.
 ///
 /// The first partial copy lands in place over the whole copy's pending

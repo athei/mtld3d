@@ -304,9 +304,17 @@ pub struct TextureInner {
     /// [`Self::note_gpu_use`] sets every bit wherever a GPU operation on the
     /// texture is recorded, after it flushes the texture's dirty levels. A CPU
     /// write clears its subresource's bit once it lands on pages no upload
-    /// reads, fresh or renamed. So a clear bit over pages uploads still read
-    /// means no GPU operation on the texture was recorded since those uploads
-    /// were scheduled, and a write may land in place.
+    /// reads, fresh or renamed. Scheduling an upload onto pages an earlier
+    /// frame's upload still reads sets the bit too. So a clear bit over pages
+    /// uploads still read means no GPU operation on the texture was recorded
+    /// since those uploads were scheduled.
+    ///
+    /// That holds only while every path that schedules an upload of the
+    /// texture either marks the device's snapshot dirty, so the next draw
+    /// walks its stages and calls `note_gpu_use`, or calls `note_gpu_use`
+    /// itself. A draw that reuses a cached snapshot records no use, so an
+    /// upload scheduled without either would let such a draw sample pages a
+    /// later write changes in place.
     observed_staging: u128,
     /// Which copy of each subresource holds the pixels it is defined by.
     ///
@@ -2501,16 +2509,20 @@ impl TextureInner {
     /// write covering the whole level and carry the rest of the level for a
     /// partial one; for a volume level, whole means every depth slice.
     ///
-    /// With no GPU operation since, the write lands in place: nothing recorded
-    /// can see the pages between the pending uploads and this write, and each
-    /// pending upload then reads the newest bytes. A replay racing the write
-    /// can read a mix only inside the rectangle the write dirties, and the
-    /// upload of that rectangle lands before the next GPU operation on the
-    /// texture, since every one of them flushes the texture's dirty levels
-    /// first. A subresource the game holds mapped, through a `LockRect` or a
-    /// device context, is written in place too: its pointer aliases the
-    /// current pages, and what the game writes through it has to land in the
-    /// pages the unmap publishes. `face` is a cube face index and zero for
+    /// The write lands in place only when every pending upload of the pages
+    /// was scheduled in the frame still being recorded and no GPU operation on
+    /// the texture was recorded since. The encoder replays a frame only after
+    /// it is handed off, so nothing reads the pages while this thread writes
+    /// them; each pending upload then reads the newest bytes, and nothing
+    /// recorded between the uploads and this write can see the version it
+    /// replaces. An upload of an earlier frame may be replaying on the encoder
+    /// thread at this moment, so pages it reads are renamed like observed
+    /// ones. So are the pages of a render-target or depth texture, which the
+    /// passes it is attached to use unrecorded, and a read back from the GPU.
+    /// A subresource the game holds mapped, through a `LockRect` or a device
+    /// context, is written in place whatever its readers: its pointer aliases
+    /// the current pages, and what the game writes through it has to land in
+    /// the pages the unmap publishes. `face` is a cube face index and zero for
     /// every other texture kind.
     fn prepare_staging_write(&mut self, face: u32, level: usize, whole_level: bool) {
         self.move_staging_off_readers(face, level, whole_level, false);
@@ -2560,7 +2572,7 @@ impl TextureInner {
         if self.dc_in_use() {
             return;
         }
-        let (mapped, has_readers) = match self.cube.as_deref() {
+        let (mapped, has_readers, last_upload_seq) = match self.cube.as_deref() {
             Some(cube) => {
                 let Some(index) = self.cube_subresource_index(face, level) else {
                     return;
@@ -2570,6 +2582,7 @@ impl TextureInner {
                     cube.staging
                         .get(index)
                         .is_some_and(|staging| staging.has_readers()),
+                    cube.last_submit_seq.get(index).copied(),
                 )
             }
             None => (
@@ -2577,6 +2590,7 @@ impl TextureInner {
                 self.staging
                     .get(level)
                     .is_some_and(|staging| staging.has_readers()),
+                self.last_submit_seq.get(level).copied(),
             ),
         };
         if mapped {
@@ -2595,7 +2609,15 @@ impl TextureInner {
         let attached = self.d3d_usage
             & (mtld3d_types::D3DUSAGE_RENDERTARGET | mtld3d_types::D3DUSAGE_DEPTHSTENCIL)
             != 0;
-        if !(always || attached || bit == 0 || self.observed_staging & bit != 0) {
+        // An upload of an earlier frame may be read by the encoder while this
+        // thread writes, so only readers of the frame still being recorded
+        // leave the pages to this write. Scheduling marks the level seen when
+        // it adds a reader to pages an earlier frame's upload still reads, so
+        // the latest upload's frame speaks for every reader.
+        let same_frame = self.device_inner != 0
+            && last_upload_seq == Some(DeviceInner::from_ptr(self.device_inner).current_seq());
+        let seen = always || attached || bit == 0 || self.observed_staging & bit != 0;
+        if same_frame && !seen {
             return;
         }
         let preserve = if whole_level {
@@ -4641,6 +4663,9 @@ fn schedule_upload_with_order<const ORDERED: bool>(
     // a declined upload is retried from the staging this would have released.
     let release_staging = ti.staging_droppable(level_u) && ti.staging_fully_written(level_u);
     let upload_generation = ti.next_upload_generation(level_u);
+    if ti.staging[level_u].has_readers() && ti.last_submit_seq[level_u] != dev.current_seq() {
+        ti.observed_staging |= ti.observed_bit(0, level_u);
+    }
     let job = TextureUploadJob {
         info: ti.texture_info(),
         staging: PageBoxRead::new(ti.staging_arc(level_u)),
@@ -4715,10 +4740,16 @@ fn schedule_cube_upload(
         rect.w,
         rect.h
     );
+    let bit = ti.observed_bit(face, level_u);
     let cube = ti.cube.as_deref_mut().expect("cube storage");
+    let older_reader =
+        cube.staging[index].has_readers() && cube.last_submit_seq[index] != dev.current_seq();
     let staging = PageBoxRead::new(Arc::clone(&cube.staging[index]));
     cube.last_submit_seq[index] = dev.current_seq();
     cube.was_uploaded[index] = true;
+    if older_reader {
+        ti.observed_staging |= bit;
+    }
     let job = TextureUploadJob {
         info: ti.texture_info(),
         staging,
