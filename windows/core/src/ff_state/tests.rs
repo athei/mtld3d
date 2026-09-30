@@ -2503,3 +2503,35 @@ fn an_unhonoured_transform_index_is_dropped_and_warned_once_per_setter_and_index
         1
     );
 }
+
+/// `set_material` stores every field of the material and marks the material section.
+#[test]
+fn set_material_stores_every_field_and_marks_the_material_section() {
+    use mtld3d_types::{D3DCOLORVALUE, D3DMATERIAL9};
+    let color = |base: f32| D3DCOLORVALUE {
+        r: base,
+        g: base + 1.0,
+        b: base + 2.0,
+        a: base + 3.0,
+    };
+    let material = D3DMATERIAL9 {
+        diffuse: color(1.0),
+        ambient: color(5.0),
+        specular: color(9.0),
+        emissive: color(13.0),
+        power: 17.0,
+    };
+    let mut state = FfState::new();
+    let _ = state.take_ff_vs_dirty();
+    state.set_material(&material);
+    let bits = |m: &D3DMATERIAL9| {
+        [m.diffuse, m.ambient, m.specular, m.emissive]
+            .iter()
+            .flat_map(|c| [c.r, c.g, c.b, c.a])
+            .chain([m.power])
+            .map(f32::to_bits)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(bits(state.material()), bits(&material));
+    assert_eq!(state.take_ff_vs_dirty(), super::FfVsDirty::MATERIAL);
+}

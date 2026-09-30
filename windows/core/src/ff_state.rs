@@ -485,9 +485,18 @@ impl FfState {
         &self.material
     }
 
-    pub fn set_material(&mut self, m: &D3DMATERIAL9) {
-        self.material = *m;
-        self.ff_vs_dirty |= FfVsDirty::MATERIAL;
+    /// Store the material and mark its constant section.
+    ///
+    /// Copied field by field: a whole-struct assignment of the 68-byte value
+    /// compiles to a CRT `memmove` call on i686, the fields to plain stores.
+    #[inline]
+    pub const fn set_material(&mut self, m: &D3DMATERIAL9) {
+        self.material.diffuse = m.diffuse;
+        self.material.ambient = m.ambient;
+        self.material.specular = m.specular;
+        self.material.emissive = m.emissive;
+        self.material.power = m.power;
+        self.ff_vs_dirty = self.ff_vs_dirty.union(FfVsDirty::MATERIAL);
     }
 
     #[must_use]
