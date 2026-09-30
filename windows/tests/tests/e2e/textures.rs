@@ -4076,6 +4076,80 @@ fn intra_frame_relock_keeps_per_draw_content() {
     );
 }
 
+/// A write between two draws of one frame reaches the second draw across a same-pointer rebind.
+///
+/// Games bind the texture a stage already holds before most draws. That call
+/// changes nothing the draw captures, so the write itself has to get its
+/// upload scheduled: a managed `LockRect`/`UnlockRect` and a system-memory
+/// `UpdateSurface` into a default-pool level each land between the two draws,
+/// followed by `SetTexture` with the pointer the stage already holds.
+#[test]
+fn a_write_between_draws_reaches_the_next_draw_across_a_same_pointer_rebind() {
+    const RED: u32 = 0xFFFF_0000;
+    const BLUE: u32 = 0xFF00_00FF;
+    let h = Harness::new();
+    h.select_texture_stage(0);
+    point_clamp(&h);
+    assert_eq!(
+        h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1),
+        0,
+        "SetFVF"
+    );
+    let left = horizontal_quad(-1.0, 0.0);
+    let right = horizontal_quad(0.0, 1.0);
+
+    let locked = h.create_texture(1, 1, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED);
+    locked.lock_rect(0, 0).write_u32(&[RED]);
+
+    let updated = h.create_texture(1, 1, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT);
+    let level = updated.surface_level(0);
+    let red = h.create_offscreen_plain_surface(1, 1, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM);
+    red.lock_rect(0).write_u32(&[RED]);
+    assert_eq!(h.update_surface_hr(&red, &level), 0, "first UpdateSurface");
+    let blue = h.create_offscreen_plain_surface(1, 1, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM);
+    blue.lock_rect(0).write_u32(&[BLUE]);
+
+    let cases: [(&str, &Texture<'_>, &dyn Fn()); 2] = [
+        ("LockRect", &locked, &|| {
+            locked.lock_rect(0, 0).write_u32(&[BLUE]);
+        }),
+        ("UpdateSurface", &updated, &|| {
+            assert_eq!(
+                h.update_surface_hr(&blue, &level),
+                0,
+                "second UpdateSurface"
+            );
+        }),
+    ];
+    for (write, tex, rewrite) in cases {
+        assert_eq!(h.set_texture(0, tex), 0, "{write}: SetTexture");
+        h.render_once(BLACK, |d| {
+            assert_eq!(
+                d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &left),
+                0,
+                "{write}: draw before the write"
+            );
+            rewrite();
+            assert_eq!(d.set_texture(0, tex), 0, "{write}: same-pointer SetTexture");
+            assert_eq!(
+                d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &right),
+                0,
+                "{write}: draw after the rebind"
+            );
+        });
+        assert_pixel_eq(
+            h.read_pixel(160, 240),
+            RED,
+            &format!("{write}: the draw before the write keeps its texels"),
+        );
+        assert_pixel_eq(
+            h.read_pixel(480, 240),
+            BLUE,
+            &format!("{write}: the draw after the rebind samples the write"),
+        );
+    }
+}
+
 /// Bind `tex` and read back the single texel at `(u, v)`.
 ///
 /// Every vertex of the quad carries the same texture coordinate, so with point

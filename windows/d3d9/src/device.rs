@@ -9690,10 +9690,14 @@ extern "system" fn device_set_texture(this: *mut c_void, stage: u32, texture: *m
         dev.set_vertex_texture_slot(slot, new_tex);
         return D3D_OK;
     }
+    if rebind_is_redundant(dev, stage as usize, new_tex) {
+        dev.perf_mut().record_keys_gate(KeysGate::SetTexture, true);
+        return D3D_OK;
+    }
     let delta = dev
         .stage_bindings_mut()
         .replace_texture(stage as usize, new_tex);
-    // STAGES always: the encoder binds the new handle and
+    // STAGES on every swap: the encoder binds the new handle and
     // `snapshot_stage_bindings` re-runs flush_dirty_mips/rehydrate and
     // refreshes `cached_bound_texture_mask`. The FF VS/PS keys depend
     // only on the 8-bit occupancy mask (stages 0..7); the variant only
@@ -9723,6 +9727,31 @@ extern "system" fn device_set_texture(this: *mut c_void, stage: u32, texture: *m
     dev.perf_mut()
         .record_keys_gate(KeysGate::SetTexture, !ffkey_rebuilt);
     0 // S_OK
+}
+
+/// Whether binding `tex` at pixel `stage` leaves every input of the stage walk as it is.
+///
+/// True when the stage already holds `tex` and `tex` is null or attached to
+/// `dev`. The slot, its reference and the cached kind and Fetch4 masks are
+/// functions of the pointer alone, so rewriting them changes nothing. What the
+/// walk reads through the texture (its contents, pending uploads, LOD and
+/// residency) is marked dirty on the texture's own device by whichever call
+/// changes it, which is `dev` once the texture is attached here. A texture a
+/// walk on another device has moved away is brought back only by this
+/// device's walk, so that rebind keeps its mark.
+fn rebind_is_redundant(
+    dev: &DeviceInner,
+    stage: usize,
+    tex: *mut crate::texture::Direct3DTexture9,
+) -> bool {
+    if dev.stage_bindings().texture(stage) != tex {
+        return false;
+    }
+    // SAFETY: `tex` is the pointer the stage already holds, so it is null or
+    // kept alive by the stage's reference.
+    unsafe { tex.as_ref() }.is_none_or(|bound| {
+        bound.inner().device_inner() == std::ptr::from_ref::<DeviceInner>(dev) as u64
+    })
 }
 
 extern "system" fn device_get_texture_stage_state(
