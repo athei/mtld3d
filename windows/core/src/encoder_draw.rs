@@ -321,9 +321,31 @@ fn align_snapshot_leaf(writer: &mut SnapshotWriter<'_>) -> Result<(), WireError>
     let address = writer.reserve_bytes(0)?.as_ptr() as usize;
     let padding = address.wrapping_neg() & 7;
     if padding != 0 {
-        writer.reserve_bytes(padding)?.fill(0);
+        zero_short_pad(writer.reserve_bytes(padding)?);
     }
     Ok(())
+}
+
+/// Zero an alignment pad with fixed-size stores.
+///
+/// A `fill` of a length the compiler cannot see is a CRT `memset` call on
+/// i686. A pad of one to seven bytes takes two overlapping stores of four,
+/// two or one byte; a longer slice, which alignment never produces, falls
+/// back to `fill`.
+#[inline]
+fn zero_short_pad(pad: &mut [u8]) {
+    let len = pad.len();
+    if len >= 8 {
+        pad.fill(0);
+    } else if len >= 4 {
+        pad[..4].copy_from_slice(&[0; 4]);
+        pad[len - 4..].copy_from_slice(&[0; 4]);
+    } else if len >= 2 {
+        pad[..2].copy_from_slice(&[0; 2]);
+        pad[len - 2..].copy_from_slice(&[0; 2]);
+    } else if let Some(byte) = pad.first_mut() {
+        *byte = 0;
+    }
 }
 
 // These assertions run on every supported PE and Unix target. The complete field

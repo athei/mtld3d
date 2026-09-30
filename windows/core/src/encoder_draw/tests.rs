@@ -58,6 +58,20 @@ fn encode_snapshot<'a>(arena: &'a mut ScratchArena, delta: &SnapshotDelta<'_>) -
     }
 }
 
+/// Every pad length is zeroed in full, and nothing past it is touched.
+#[test]
+fn short_pads_are_zeroed_in_full_and_nothing_past_them() {
+    for len in 0..=10 {
+        let mut bytes = [0xa5u8; 16];
+        super::zero_short_pad(&mut bytes[..len]);
+        assert!(bytes[..len].iter().all(|&byte| byte == 0), "pad of {len}");
+        assert!(
+            bytes[len..].iter().all(|&byte| byte == 0xa5),
+            "bytes past a pad of {len}"
+        );
+    }
+}
+
 #[test]
 fn leaf_alignment_preserves_zero_padding_bounds_and_every_residue() {
     for residue in 0..8 {
