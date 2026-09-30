@@ -384,3 +384,37 @@ fn state_block_all_captures_and_restores_the_planes() {
         "restored plane clips the bottom"
     );
 }
+
+#[test]
+fn multiply_transform_view_between_draws_of_one_frame_moves_the_world_plane() {
+    // The first draw clips at world y = 0 under the identity view, keeping
+    // the top half green. MultiplyTransform then moves the view up by 0.5,
+    // so the second, yellow draw keeps only the top quarter, provided the
+    // inverse view the planes are read through followed the multiplication.
+    let h = Harness::new();
+    arm_diffuse(&h);
+    assert_eq!(h.set_clip_plane(0, plane_y_above(0.0)), 0);
+    assert_eq!(h.set_render_state(D3DRS_CLIPPLANEENABLE, 1), 0);
+    let mut view = [0.0f32; 16];
+    for i in [0, 5, 10, 15] {
+        view[i] = 1.0;
+    }
+    view[13] = 0.5;
+    let yellow = full_quad().map(|v| PosColorVertex { color: YELLOW, ..v });
+    h.render_once(BLACK, |d| {
+        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &full_quad()), 0);
+        assert_eq!(d.multiply_transform(D3DTS_VIEW, &view), 0);
+        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &yellow), 0);
+    });
+    assert_eq!(
+        h.read_pixel(320, 60),
+        YELLOW,
+        "top quarter: both draws kept"
+    );
+    assert_eq!(
+        h.read_pixel(320, 180),
+        GREEN,
+        "second quarter: only the first draw kept"
+    );
+    assert_eq!(h.read_pixel(320, 380), BLACK, "bottom half: both clipped");
+}

@@ -405,3 +405,55 @@ fn table_fog_exponential_factor_is_computed_per_pixel() {
         "per-pixel exponential fog",
     );
 }
+
+#[test]
+fn multiply_transform_projection_between_draws_of_one_frame_moves_the_fog_source() {
+    // The identity projection is orthographic, so linear table fog reads the
+    // pixel depth: 0.5 fogs to 0.875 of the vertex colour. Multiplying in a
+    // projection whose 4th column is not (0, 0, 0, 1) switches table fog to
+    // the eye W. The second quad sits at z = 2, which that projection maps to
+    // depth 0.5 and W 2, so it fogs to 0.5 only if the switch reached it.
+    #[rustfmt::skip]
+    const PERSPECTIVE: [f32; 16] = [
+        1.0, 0.0, 0.0, 0.0,
+        0.0, 1.0, 0.0, 0.0,
+        0.0, 0.0, 0.5, 1.0,
+        0.0, 0.0, 0.0, 0.0,
+    ];
+    let quad = |x0: f32, x1: f32, half_height: f32, z: f32| {
+        [
+            (x0, half_height),
+            (x0, -half_height),
+            (x1, half_height),
+            (x1, -half_height),
+        ]
+        .map(|(x, y)| PosColorVertex {
+            x,
+            y,
+            z,
+            color: RED,
+        })
+    };
+    let h = harness();
+    let target = h.create_render_target(128, 128, D3DFMT_A8R8G8B8);
+    assert_eq!(h.set_render_target(0, &target), 0);
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE), 0);
+    assert_eq!(h.begin_scene(), 0);
+    assert_eq!(h.clear_target(BLACK), 0);
+    draw(&h, &quad(-1.0, 0.0, 1.0, 0.5));
+    assert_eq!(h.multiply_transform(D3DTS_PROJECTION, &PERSPECTIVE), 0);
+    draw(&h, &quad(0.0, 2.0, 2.0, 2.0));
+    assert_eq!(h.end_scene(), 0);
+    assert_pixel_approx(
+        h.read_pixel(32, 64),
+        0x80df_2000,
+        1,
+        "orthographic projection: Z fog",
+    );
+    assert_pixel_approx(
+        h.read_pixel(96, 64),
+        0x8080_8000,
+        1,
+        "projection multiplied between the draws: W fog",
+    );
+}

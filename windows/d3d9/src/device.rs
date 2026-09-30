@@ -1364,6 +1364,29 @@ impl DeviceInner {
         self.ff_aware_mask(mask)
     }
 
+    /// Dirty bits outside the FF VS source and constants that a write to transform `state` needs.
+    ///
+    /// `SetTransform` and `MultiplyTransform` both add these to
+    /// [`Self::ff_vs_write_mask`], since each rewrites the matrix in place.
+    /// Active table fog keys its Z-versus-W source on the projection matrix's
+    /// 4th column (`VariantKey::fog_source_w`), so a PROJECTION write rebuilds
+    /// the variant; the gate on live table fog keeps vertex-fog-only games
+    /// from churning the variant on every per-frame projection update. The
+    /// fixed-function clip planes walk back from eye space through the
+    /// inverse view the `VsDraw` uniform carries, so a VIEW write rebuilds it.
+    fn transform_write_side_dirty(&self, state: u32) -> SnapshotDirty {
+        match state {
+            mtld3d_types::D3DTS_PROJECTION
+                if self.render_states[D3DRS_FOGENABLE as usize] != 0
+                    && matches!(self.render_states[D3DRS_FOGTABLEMODE as usize], 1..=3) =>
+            {
+                SnapshotDirty::VARIANT | SnapshotDirty::PS_SOURCE
+            }
+            mtld3d_types::D3DTS_VIEW => SnapshotDirty::VS_DRAW,
+            _ => SnapshotDirty::empty(),
+        }
+    }
+
     /// Start a new recording.
     ///
     /// `BeginStateBlock`-only path — returns `false` if a recording is
@@ -9145,22 +9168,8 @@ extern "system" fn device_set_transform(
     // Unknown D3DTS_* indices (vertex blending etc.) are silently accepted.
     let inputs = dev.ff_state().vs_source_transform_inputs();
     dev.ff_state_mut().set_transform(state, &m);
-    let mut mask = dev.ff_vs_write_mask(dev.ff_state().vs_source_transform_inputs() != inputs);
-    // Active table fog keys its Z-vs-W source on the projection matrix's
-    // 4th column (`VariantKey::fog_source_w`), so a PROJECTION write must
-    // rebuild the variant. Gated on live table fog so vertex-fog-only games
-    // don't churn the variant on every per-frame projection update.
-    if state == mtld3d_types::D3DTS_PROJECTION
-        && dev.render_states()[D3DRS_FOGENABLE as usize] != 0
-        && matches!(dev.render_states()[D3DRS_FOGTABLEMODE as usize], 1..=3)
-    {
-        mask |= SnapshotDirty::VARIANT | SnapshotDirty::PS_SOURCE;
-    }
-    // The fixed-function clip planes walk back from eye space through the
-    // inverse view the VsDraw uniform carries.
-    if state == mtld3d_types::D3DTS_VIEW {
-        mask |= SnapshotDirty::VS_DRAW;
-    }
+    let mask = dev.ff_vs_write_mask(dev.ff_state().vs_source_transform_inputs() != inputs)
+        | dev.transform_write_side_dirty(state);
     dev.mark_snapshot_dirty(mask);
     0 // S_OK
 }
@@ -9213,7 +9222,8 @@ extern "system" fn device_multiply_transform(
     // always apply to live FF state, regardless of recording.
     let inputs = dev.ff_state().vs_source_transform_inputs();
     dev.ff_state_mut().multiply_transform(state, &rhs);
-    let mask = dev.ff_vs_write_mask(dev.ff_state().vs_source_transform_inputs() != inputs);
+    let mask = dev.ff_vs_write_mask(dev.ff_state().vs_source_transform_inputs() != inputs)
+        | dev.transform_write_side_dirty(state);
     dev.mark_snapshot_dirty(mask);
     0 // S_OK
 }
