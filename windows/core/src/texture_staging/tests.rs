@@ -1076,6 +1076,7 @@ fn multi_slice_depth_is_never_droppable() {
 fn staging_write_decision_covers_every_combination() {
     for bits in 0..=StagingWrite::all().bits() {
         let write = StagingWrite::from_bits_truncate(bits);
+        let bits = write.bits();
         let mapped = write.contains(StagingWrite::MAPPED);
         let readers = write.contains(StagingWrite::HAS_READERS);
         let same_frame = write.contains(StagingWrite::SAME_FRAME);
@@ -1094,7 +1095,7 @@ fn staging_write_decision_covers_every_combination() {
                 preserve: PreserveKind::Cpu,
             }
         };
-        assert_eq!(decide_staging_write(write), expected, "{write:?}");
+        assert_eq!(decide_staging_write(&write), expected, "facts {bits:#08b}");
     }
 }
 
@@ -1102,7 +1103,7 @@ fn staging_write_decision_covers_every_combination() {
 #[test]
 fn staging_write_under_an_unseen_upload_of_this_frame_stays_in_place() {
     assert_eq!(
-        decide_staging_write(StagingWrite::HAS_READERS | StagingWrite::SAME_FRAME),
+        decide_staging_write(&(StagingWrite::HAS_READERS | StagingWrite::SAME_FRAME)),
         LockAction::WriteInPlace
     );
 }
@@ -1111,13 +1112,13 @@ fn staging_write_under_an_unseen_upload_of_this_frame_stays_in_place() {
 #[test]
 fn staging_write_under_an_earlier_frames_upload_renames() {
     assert_eq!(
-        decide_staging_write(StagingWrite::HAS_READERS),
+        decide_staging_write(&StagingWrite::HAS_READERS),
         LockAction::FreshBox {
             preserve: PreserveKind::Cpu
         }
     );
     assert_eq!(
-        decide_staging_write(StagingWrite::HAS_READERS | StagingWrite::WHOLE_LEVEL),
+        decide_staging_write(&(StagingWrite::HAS_READERS | StagingWrite::WHOLE_LEVEL)),
         LockAction::FreshBox {
             preserve: PreserveKind::None
         }
@@ -1128,12 +1129,13 @@ fn staging_write_under_an_earlier_frames_upload_renames() {
 #[test]
 fn staging_write_under_a_seen_upload_of_this_frame_renames() {
     for seen in [StagingWrite::OBSERVED, StagingWrite::ALWAYS_RENAME] {
+        let bits = seen.bits();
         assert_eq!(
-            decide_staging_write(StagingWrite::HAS_READERS | StagingWrite::SAME_FRAME | seen),
+            decide_staging_write(&(StagingWrite::HAS_READERS | StagingWrite::SAME_FRAME | seen)),
             LockAction::FreshBox {
                 preserve: PreserveKind::Cpu
             },
-            "{seen:?}"
+            "seen {bits:#08b}"
         );
     }
 }
@@ -1142,7 +1144,7 @@ fn staging_write_under_a_seen_upload_of_this_frame_renames() {
 #[test]
 fn staging_write_into_a_mapped_subresource_stays_in_place() {
     assert_eq!(
-        decide_staging_write(StagingWrite::all()),
+        decide_staging_write(&StagingWrite::all()),
         LockAction::WriteInPlace
     );
 }
@@ -1151,7 +1153,7 @@ fn staging_write_into_a_mapped_subresource_stays_in_place() {
 #[test]
 fn staging_write_without_readers_stays_in_place() {
     assert_eq!(
-        decide_staging_write(StagingWrite::all().difference(StagingWrite::HAS_READERS)),
+        decide_staging_write(&(StagingWrite::all().difference(StagingWrite::HAS_READERS))),
         LockAction::WriteInPlace
     );
 }

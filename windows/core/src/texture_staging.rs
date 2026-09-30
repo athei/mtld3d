@@ -234,7 +234,6 @@ bitflags::bitflags! {
     ///
     /// The input of [`decide_staging_write`], gathered by the writer just
     /// before it touches the pages.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
     pub struct StagingWrite: u8 {
         /// The game holds the subresource mapped, by a `LockRect` or a device context.
         const MAPPED = 1 << 0;
@@ -266,7 +265,7 @@ bitflags::bitflags! {
 /// it replaces. Every other write moves to fresh pages, bare when it covers
 /// the whole subresource and carrying the old contents otherwise.
 #[must_use]
-pub const fn decide_staging_write(write: StagingWrite) -> LockAction {
+pub const fn decide_staging_write(write: &StagingWrite) -> LockAction {
     if write.contains(StagingWrite::MAPPED) || !write.contains(StagingWrite::HAS_READERS) {
         return LockAction::WriteInPlace;
     }

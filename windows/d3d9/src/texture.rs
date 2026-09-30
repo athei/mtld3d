@@ -2616,7 +2616,7 @@ impl TextureInner {
         );
         write.set(StagingWrite::ALWAYS_RENAME, always || attached);
         write.set(StagingWrite::WHOLE_LEVEL, whole_level);
-        let LockAction::FreshBox { preserve } = decide_staging_write(write) else {
+        let LockAction::FreshBox { preserve } = decide_staging_write(&write) else {
             return;
         };
         if self.cube.is_some() {
