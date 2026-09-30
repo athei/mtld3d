@@ -4,7 +4,7 @@
 //! `replace_*` setters transfer one refcount into the slot and release
 //! the prior slot value via auto-`Drop` on assignment.
 
-use mtld3d_core::shader_constants::rows_differ;
+use mtld3d_core::shader_constants::{rows_differ, store_window, write_window};
 
 use super::{
     com_ref::{Bound, CachedComPtr},
@@ -124,7 +124,7 @@ impl ShaderBindings {
         let src = &data[..end - start];
         let changed = rows_differ(dst, src);
         if changed {
-            dst.copy_from_slice(src);
+            store_window(dst, src);
         }
         changed
     }
@@ -143,7 +143,7 @@ impl ShaderBindings {
         let src = &data[..end - start];
         let changed = rows_differ(dst, src);
         if changed {
-            dst.copy_from_slice(src);
+            store_window(dst, src);
         }
         changed
     }
@@ -162,24 +162,24 @@ impl ShaderBindings {
     /// [`Self::write_vs_constants`]; `i32` rows compare directly (no
     /// `to_bits` — integers have no NaN aliasing).
     pub fn write_vs_constants_i(&mut self, start: u32, data: &[[i32; 4]]) -> bool {
-        write_rows(&mut self.vs_constants_i, start, data)
+        write_window(&mut self.vs_constants_i, start, data)
     }
 
     /// Write `data` into the VS boolean-constant mirror starting at row `start`.
     ///
     /// Returns whether any value changed.
     pub fn write_vs_constants_b(&mut self, start: u32, data: &[i32]) -> bool {
-        write_rows(&mut self.vs_constants_b, start, data)
+        write_window(&mut self.vs_constants_b, start, data)
     }
 
     /// PS integer-constant analogue of [`Self::write_vs_constants_i`].
     pub fn write_ps_constants_i(&mut self, start: u32, data: &[[i32; 4]]) -> bool {
-        write_rows(&mut self.ps_constants_i, start, data)
+        write_window(&mut self.ps_constants_i, start, data)
     }
 
     /// PS boolean-constant analogue of [`Self::write_vs_constants_b`].
     pub fn write_ps_constants_b(&mut self, start: u32, data: &[i32]) -> bool {
-        write_rows(&mut self.ps_constants_b, start, data)
+        write_window(&mut self.ps_constants_b, start, data)
     }
 
     pub const fn vs_constants_i_copy(&self) -> [[i32; 4]; INT_CONSTANT_ROWS] {
@@ -247,25 +247,4 @@ fn bool_file_bits(file: &[i32; BOOL_CONSTANT_COUNT]) -> u32 {
         }
     }
     bits
-}
-
-/// Copy `data` into `dst_all` starting at row `start`, clamping to the register file's length.
-///
-/// Returns whether any row actually changed. Shared by the integer and
-/// boolean constant writers — both back a fixed-size mirror and want the
-/// same redundant-set gate as the float path, but compare by value
-/// (`PartialEq`) rather than `f32::to_bits`.
-fn write_rows<T: Copy + PartialEq>(dst_all: &mut [T], start: u32, data: &[T]) -> bool {
-    let start = start as usize;
-    let end = (start + data.len()).min(dst_all.len());
-    if start >= end {
-        return false;
-    }
-    let dst = &mut dst_all[start..end];
-    let src = &data[..end - start];
-    let changed = dst != src;
-    if changed {
-        dst.copy_from_slice(src);
-    }
-    changed
 }

@@ -542,7 +542,7 @@ impl FrameRecorder {
             let source = bytes
                 .get(..destination.len())
                 .ok_or(WireError::InvalidValue)?;
-            destination.copy_from_slice(source);
+            crate::shader_constants::copy_row_bytes(destination, source);
             Ok(())
         })
     }
