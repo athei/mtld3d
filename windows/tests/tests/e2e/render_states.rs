@@ -450,6 +450,62 @@ fn colorwrite_mask_drops_red() {
     assert!(px.g > 200 && px.b > 200, "green+blue written, got {px:?}");
 }
 
+/// A render-state write of the stored value between draws leaves every draw of the frame right.
+///
+/// Three draws of one frame fill a third of the target each, placed by their
+/// vertices. The first follows a new `D3DRS_COLORWRITEENABLE`, the second a
+/// write of that same value, which marks nothing, and the third a new value
+/// written twice, so the repeat must not undo the mark of the write before
+/// it. Nothing but the mask is written between a draw and the next, so only
+/// the mark of the mask write can carry a new mask to a draw.
+#[test]
+fn same_value_render_state_writes_between_draws_leave_every_draw_right() {
+    const NO_RED: u32 = 0x0000_000E;
+    const NO_GREEN: u32 = 0x0000_000D;
+    const CYAN: u32 = 0xFF00_FFFF;
+    const MAGENTA: u32 = 0xFFFF_00FF;
+    let h = Harness::new();
+    arm_diffuse(&h);
+    // A white quad over the full height between two clip-space x.
+    let strip = |left: f32, right: f32| {
+        fill_quad(WHITE).map(|v| PosColorVertex {
+            x: if v.x < 0.0 { left } else { right },
+            ..v
+        })
+    };
+    let strips = [strip(-1.0, -0.4), strip(-0.3, 0.3), strip(0.4, 1.0)];
+    let masks: [&[u32]; 3] = [&[NO_RED], &[NO_RED], &[NO_GREEN, NO_GREEN]];
+
+    h.render_once(BLACK, |d| {
+        for (quad, writes) in strips.iter().zip(masks) {
+            for &mask in writes {
+                assert_eq!(
+                    d.set_render_state(D3DRS_COLORWRITEENABLE, mask),
+                    0,
+                    "SetRenderState(COLORWRITEENABLE, {mask:#x})"
+                );
+            }
+            assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, quad), 0);
+        }
+    });
+    assert_eq!(
+        h.read_pixel(100, 240),
+        CYAN,
+        "the draw after the new mask drops red"
+    );
+    assert_eq!(
+        h.read_pixel(320, 240),
+        CYAN,
+        "the draw after the same-value write still drops red"
+    );
+    assert_eq!(
+        h.read_pixel(540, 240),
+        MAGENTA,
+        "the draw after a new mask written twice drops green"
+    );
+    assert_eq!(h.read_pixel(210, 240), BLACK, "between the thirds");
+}
+
 #[test]
 fn scissor_clips_draw() {
     let h = Harness::new();
