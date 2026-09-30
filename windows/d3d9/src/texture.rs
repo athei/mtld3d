@@ -13,8 +13,8 @@ use mtld3d_core::{
     staging_coverage::StagingCoverage,
     texture_flags::TextureFlags,
     texture_staging::{
-        LockAction, MipShape, PreserveKind, decide_lock_action, honoured_lock_flags, is_in_flight,
-        staging_droppable_class,
+        LockAction, MipShape, PreserveKind, StagingWrite, decide_lock_action, decide_staging_write,
+        honoured_lock_flags, is_in_flight, staging_droppable_class,
     },
 };
 use mtld3d_shared::{
@@ -2593,37 +2593,31 @@ impl TextureInner {
                 self.last_submit_seq.get(level).copied(),
             ),
         };
-        if mapped {
-            return;
-        }
         let bit = self.observed_bit(face, level);
-        if !has_readers {
+        if !mapped && !has_readers {
             // Nothing reads these pages, so the next GPU use is the first
             // that can see what lands in them.
             self.observed_staging &= !bit;
-            return;
         }
+        let same_frame = self.device_inner != 0
+            && last_upload_seq == Some(DeviceInner::from_ptr(self.device_inner).current_seq());
         // A render target or depth texture is read and written by the passes
-        // it is attached to, which no stage walk records, so its pending
-        // uploads always count as seen.
+        // it is attached to, which no stage walk records.
         let attached = self.d3d_usage
             & (mtld3d_types::D3DUSAGE_RENDERTARGET | mtld3d_types::D3DUSAGE_DEPTHSTENCIL)
             != 0;
-        // An upload of an earlier frame may be read by the encoder while this
-        // thread writes, so only readers of the frame still being recorded
-        // leave the pages to this write. Scheduling marks the level seen when
-        // it adds a reader to pages an earlier frame's upload still reads, so
-        // the latest upload's frame speaks for every reader.
-        let same_frame = self.device_inner != 0
-            && last_upload_seq == Some(DeviceInner::from_ptr(self.device_inner).current_seq());
-        let seen = always || attached || bit == 0 || self.observed_staging & bit != 0;
-        if same_frame && !seen {
+        let mut write = StagingWrite::empty();
+        write.set(StagingWrite::MAPPED, mapped);
+        write.set(StagingWrite::HAS_READERS, has_readers);
+        write.set(StagingWrite::SAME_FRAME, same_frame);
+        write.set(
+            StagingWrite::OBSERVED,
+            bit == 0 || self.observed_staging & bit != 0,
+        );
+        write.set(StagingWrite::ALWAYS_RENAME, always || attached);
+        write.set(StagingWrite::WHOLE_LEVEL, whole_level);
+        let LockAction::FreshBox { preserve } = decide_staging_write(write) else {
             return;
-        }
-        let preserve = if whole_level {
-            PreserveKind::None
-        } else {
-            PreserveKind::Cpu
         };
         if self.cube.is_some() {
             self.rename_cube_staging(face, level, preserve);

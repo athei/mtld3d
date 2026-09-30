@@ -9,7 +9,8 @@
 //! own. The `texture_lock_offset` cases pin block-row arithmetic: a pixel-row index times a
 //! block-row pitch runs past the end. The `staging_droppable_class` cases walk the pool, usage
 //! and shape combinations, since every class outside the one that releases is a level whose only
-//! copy of some byte is the staging.
+//! copy of some byte is the staging. The `decide_staging_write` cases walk every combination of
+//! the write facts and pin the frame rule on its own.
 
 use std::sync::Arc;
 
@@ -1068,4 +1069,89 @@ fn multi_slice_depth_is_never_droppable() {
         TextureFlags::empty(),
         4
     ));
+}
+
+/// Every combination of the write facts, against the rule spelled out case by case.
+#[test]
+fn staging_write_decision_covers_every_combination() {
+    for bits in 0..=StagingWrite::all().bits() {
+        let write = StagingWrite::from_bits_truncate(bits);
+        let mapped = write.contains(StagingWrite::MAPPED);
+        let readers = write.contains(StagingWrite::HAS_READERS);
+        let same_frame = write.contains(StagingWrite::SAME_FRAME);
+        let observed = write.contains(StagingWrite::OBSERVED);
+        let always = write.contains(StagingWrite::ALWAYS_RENAME);
+        let whole = write.contains(StagingWrite::WHOLE_LEVEL);
+        let in_place = mapped || !readers || (same_frame && !observed && !always);
+        let expected = if in_place {
+            LockAction::WriteInPlace
+        } else if whole {
+            LockAction::FreshBox {
+                preserve: PreserveKind::None,
+            }
+        } else {
+            LockAction::FreshBox {
+                preserve: PreserveKind::Cpu,
+            }
+        };
+        assert_eq!(decide_staging_write(write), expected, "{write:?}");
+    }
+}
+
+/// An unseen upload of the frame being recorded leaves a partial write in place.
+#[test]
+fn staging_write_under_an_unseen_upload_of_this_frame_stays_in_place() {
+    assert_eq!(
+        decide_staging_write(StagingWrite::HAS_READERS | StagingWrite::SAME_FRAME),
+        LockAction::WriteInPlace
+    );
+}
+
+/// An upload of an earlier frame may be replaying, so even an unseen one forces a rename.
+#[test]
+fn staging_write_under_an_earlier_frames_upload_renames() {
+    assert_eq!(
+        decide_staging_write(StagingWrite::HAS_READERS),
+        LockAction::FreshBox {
+            preserve: PreserveKind::Cpu
+        }
+    );
+    assert_eq!(
+        decide_staging_write(StagingWrite::HAS_READERS | StagingWrite::WHOLE_LEVEL),
+        LockAction::FreshBox {
+            preserve: PreserveKind::None
+        }
+    );
+}
+
+/// A GPU use after this frame's upload forces a rename.
+#[test]
+fn staging_write_under_a_seen_upload_of_this_frame_renames() {
+    for seen in [StagingWrite::OBSERVED, StagingWrite::ALWAYS_RENAME] {
+        assert_eq!(
+            decide_staging_write(StagingWrite::HAS_READERS | StagingWrite::SAME_FRAME | seen),
+            LockAction::FreshBox {
+                preserve: PreserveKind::Cpu
+            },
+            "{seen:?}"
+        );
+    }
+}
+
+/// A mapped subresource is written in place whatever else holds.
+#[test]
+fn staging_write_into_a_mapped_subresource_stays_in_place() {
+    assert_eq!(
+        decide_staging_write(StagingWrite::all()),
+        LockAction::WriteInPlace
+    );
+}
+
+/// Pages no upload reads are written in place.
+#[test]
+fn staging_write_without_readers_stays_in_place() {
+    assert_eq!(
+        decide_staging_write(StagingWrite::all().difference(StagingWrite::HAS_READERS)),
+        LockAction::WriteInPlace
+    );
 }

@@ -5127,16 +5127,16 @@ fn partial_updates_stay_in_place_until_a_draw_samples_the_level() {
     );
 }
 
-/// A partial write over an upload of an earlier frame moves to fresh pages.
+/// Fills over an unseen upload, in its own frame and the next, all reach the surface.
 ///
 /// A `ColorFill` of an offscreen-plain surface schedules its upload with no
-/// GPU use behind it, so a second fill in the same frame lands in place. Once
-/// the frame is handed off, the encoder may be replaying that upload while
-/// the next frame's fill runs, so the fill must not write the pages it reads:
-/// a read-only lock finds new pages after it. The three fills still reach the
-/// surface.
+/// GPU use behind it, so a second fill in the same frame lands in place: a
+/// read-only lock finds the same pages. A third fill after the frame is
+/// handed off may find that upload still replaying, and whether it renames
+/// then depends on when the GPU retires the upload, so only the pixels are
+/// pinned for it; `decide_staging_write`'s unit tests pin the frame rule.
 #[test]
-fn a_fill_over_an_earlier_frames_upload_moves_to_fresh_pages() {
+fn fills_over_an_unseen_upload_reach_the_surface_across_frames() {
     const RED: u32 = 0xFFFF_0000;
     const GREEN: u32 = 0xFF00_FF00;
     const BLUE: u32 = 0xFF00_00FF;
@@ -5160,11 +5160,6 @@ fn a_fill_over_an_earlier_frames_upload_moves_to_fresh_pages() {
         h.color_fill_rect_hr(&surface, (2, 2, 4, 4), BLUE),
         0,
         "partial fill in the next frame"
-    );
-    assert_ne!(
-        pages(),
-        first,
-        "a fill over an earlier frame's upload moves to fresh pages"
     );
     let back_buffer = h.render_target(0);
     h.render_once(BLACK, |d| {

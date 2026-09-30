@@ -229,6 +229,59 @@ pub const fn decide_lock_action(
     LockAction::WriteInPlace
 }
 
+bitflags::bitflags! {
+    /// What a CPU write of one texture subresource knows about its staging pages.
+    ///
+    /// The input of [`decide_staging_write`], gathered by the writer just
+    /// before it touches the pages.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+    pub struct StagingWrite: u8 {
+        /// The game holds the subresource mapped, by a `LockRect` or a device context.
+        const MAPPED = 1 << 0;
+        /// A queued, replayable or in-flight upload still reads the pages.
+        const HAS_READERS = 1 << 1;
+        /// The subresource's latest upload belongs to the frame being recorded.
+        const SAME_FRAME = 1 << 2;
+        /// A GPU operation on the texture was recorded after a pending upload.
+        const OBSERVED = 1 << 3;
+        /// The pages rename whenever they have a reader.
+        ///
+        /// A render-target or depth texture, which the passes it is attached
+        /// to use without a record, or a read back from the GPU.
+        const ALWAYS_RENAME = 1 << 4;
+        /// The write covers every byte of the subresource.
+        const WHOLE_LEVEL = 1 << 5;
+    }
+}
+
+/// Where a CPU write of a texture subresource lands: its current pages or fresh ones.
+///
+/// A mapped subresource is written in place whatever its readers: the
+/// game's pointer aliases the current pages, and what it writes through it
+/// has to land in the pages the unmap publishes. Pages no upload reads are
+/// written in place. So are pages whose every pending upload belongs to the
+/// frame being recorded when no GPU operation on the texture was recorded
+/// since: the encoder replays a frame only after it is handed off, so nothing
+/// reads the pages during the write, and nothing recorded can see the version
+/// it replaces. Every other write moves to fresh pages, bare when it covers
+/// the whole subresource and carrying the old contents otherwise.
+#[must_use]
+pub const fn decide_staging_write(write: StagingWrite) -> LockAction {
+    if write.contains(StagingWrite::MAPPED) || !write.contains(StagingWrite::HAS_READERS) {
+        return LockAction::WriteInPlace;
+    }
+    let seen = write.intersects(StagingWrite::OBSERVED.union(StagingWrite::ALWAYS_RENAME));
+    if write.contains(StagingWrite::SAME_FRAME) && !seen {
+        return LockAction::WriteInPlace;
+    }
+    let preserve = if write.contains(StagingWrite::WHOLE_LEVEL) {
+        PreserveKind::None
+    } else {
+        PreserveKind::Cpu
+    };
+    LockAction::FreshBox { preserve }
+}
+
 /// Whether a Lock of a released level has to read the level back from the GPU.
 ///
 /// A default-pool level whose staging was released keeps its only copy on the
