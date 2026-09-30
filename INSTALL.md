@@ -358,14 +358,18 @@ The resolution picked in the game's video options therefore sizes the frame.
 `render.scale` in `mtld3d.conf` multiplies on top of it, rendering fewer
 pixels and upscaling the result to the screen.
 
-The resolution list a game sees describes the primary display. It carries
-the sizes of the display's own aspect, largest first, and on a notched
-MacBook then the sizes of the area below the notch, largest first (Wine
-centres them, so they straddle the strip beside the notch), at most 15 per
-colour format, because Wine's full list overflows menus built for a driver's
-short one. Any mode Wine accepts stays settable whether listed or not, except
-the sizes some Wine builds abort on (`docs/STATUS.md`, Kept divergences). A
-request that matches no mode, such as a size a game derived from its own
-window, follows the window instead. A fullscreen game is never told it lost
-its device on a focus change: the desktop mode comes back on deactivation and
-the game's mode is set again on activation.
+The resolution list a game sees describes the primary display. The list the
+adapter reports carries the sizes that fill the display, largest first (those
+that, scaled onto it, leave a bar of less than one pixel), and then the
+standard sizes of another shape that Wine lists for it (2560x1440, 1920x1080,
+1600x900, 1280x720, 1024x768, 800x600 and 640x480), largest first, which are
+letterboxed in fullscreen. It holds at most 15 sizes per colour format,
+because Wine's full list overflows menus built for a driver's short one. A
+game that builds its menu from Wine's own display-mode list is shown the same
+sizes in Wine's order, and a game that sorts its menu shows its own order. Any
+mode Wine accepts stays settable whether listed or not, except the sizes some
+Wine builds abort on (`docs/STATUS.md`, Kept divergences). A request that
+matches no mode, such as a size a game derived from its own window, follows
+the window instead. A fullscreen game is never told it lost its device on a
+focus change: the desktop mode comes back on deactivation and the game's mode
+is set again on activation.

@@ -267,12 +267,6 @@
   device.c:12689 count=1
   device.c:12784 count=72
   device.c:12823 count=477
-  device.c:14378 count=1
-  device.c:14379 count=1
-  device.c:14383 count=1
-  device.c:14384 count=1
-  device.c:14390 count=1
-  device.c:14391 count=1
   device.c:15160 count=1
 [i686+intel@mac2/visual] crash=0
   visual.c:5090 count=1
@@ -282,10 +276,6 @@
   visual.c:15668 count=15
   visual.c:15727 count=28
   visual.c:16433 count=3
-  visual.c:17167 count=1
-  visual.c:17169 count=1
-  visual.c:17179 count=1
-  visual.c:17181 count=1
   visual.c:18787 count=2
   visual.c:18790 count=2
   visual.c:18793 count=2
@@ -665,12 +655,6 @@
   device.c:12689 count=1
   device.c:12784 count=72
   device.c:12823 count=477
-  device.c:14378 count=1
-  device.c:14379 count=1
-  device.c:14383 count=1
-  device.c:14384 count=1
-  device.c:14390 count=1
-  device.c:14391 count=1
   device.c:15088 count=1
   device.c:15160 count=1
 [x86_64+intel@mac2/visual] crash=0
@@ -681,10 +665,6 @@
   visual.c:15668 count=13
   visual.c:15727 count=28
   visual.c:16433 count=3
-  visual.c:17167 count=1
-  visual.c:17169 count=1
-  visual.c:17179 count=1
-  visual.c:17181 count=1
   visual.c:18787 count=2
   visual.c:18790 count=2
   visual.c:18793 count=2

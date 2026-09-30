@@ -35,50 +35,40 @@ pub fn mode_set_attempts(request: ModeRequest) -> impl Iterator<Item = ModeReque
     core::iter::once(request).chain(without_rate)
 }
 
-/// Maximum tolerated difference between a mode's aspect ratio and the desktop's.
-///
-/// Expressed as a fraction of the desktop aspect.
-///
-/// 15 % keeps 4:3 (1.333), 16:10 (1.6), and 16:9 (1.778) alongside the
-/// MBP-native 3:2-ish (1.547) desktop, and drops 5:4 (1.250, ~19 % off) and
-/// 21:9 (2.333). The intent is "no obviously-wrong aspect in the resolution
-/// dropdown", not a hard mathematical filter; if a future desktop aspect
-/// surprises us, widen this number.
-pub const ASPECT_TOLERANCE: f64 = 0.15;
-
 /// How many sizes `EnumAdapterModes` serves at most, per adapter format.
 ///
 /// Era games size their resolution menus for a driver's list, and Wine's
 /// Win32 view under `EmulateModeset` is long: the panel's own modes plus a
-/// synthesised bank of standard sizes, 40 sizes on a 3456x2234 MBP once
-/// filtered. `WoW` 1.12's video-options dropdown holds 32 buttons (40 on
+/// synthesised bank of standard sizes, 43 sizes on a 3456x2234 MBP.
+/// `WoW` 1.12's video-options dropdown holds 32 buttons (40 on
 /// Turtle `WoW`) and overflowed with a Lua error once that many sizes were
 /// served at each of the two adapter formats; the fixed bank this list
 /// replaced came to 16 sizes on that display, 32 entries, and never
 /// overflowed. 15 per format keeps both formats under the 32 with a slot to
-/// spare. The panel's aspect and the notch area's that [`served_mode_sizes`]
-/// keeps can reach it: they come to 15 on a 3456x2234 display. The bound is
-/// on what a menu shows, not on what a fullscreen request may set.
+/// spare. [`served_mode_sizes`] cuts its list at the bound from the end, so
+/// the standard sizes go first, smallest first, and then the smallest sizes
+/// that fill the display. The bound is on what a menu shows, not on what a
+/// fullscreen request may set.
 pub const MAX_SERVED_SIZES: usize = 15;
 
 // Two adapter formats inside the 32-button menu named above.
 const _: () = assert!(MAX_SERVED_SIZES * 2 < 32);
 
-/// Aspect difference within which a size counts as one of the panel's own modes.
+/// The standard sizes [`served_mode_sizes`] lists after those that fill the display.
 ///
-/// Expressed as a fraction of the desktop aspect, and of the notch area's
-/// aspect for the sizes [`served_mode_sizes`] adds after them. The panel's
-/// modes are scaled from one shape, but integer rounding leaves them a hair
-/// apart (3456x2234, 2992x1934 and 2624x1696 span 1.5470 to 1.5472); 0.5 %
-/// covers that and stays well inside the 3 % to 3:2 (1.5) and the 3.4 % to
-/// 16:10 (1.6) on that panel.
-pub const PANEL_ASPECT_TOLERANCE: f64 = 0.005;
-
-/// The smallest notch strip [`notch_area`] accepts, as a fraction of the physical height.
-pub const NOTCH_STRIP_MIN: f64 = 0.03;
-
-/// The fraction of the physical height a notch strip [`notch_area`] accepts stays under.
-pub const NOTCH_STRIP_MAX: f64 = 0.04;
+/// A size is served only when user32 lists it for the display and it is
+/// settable, so this adds no mode of its own: it picks from Win32's list the
+/// sizes a game's menu is expected to offer whatever the display's shape.
+/// The order here, largest first, is the order they are served in.
+const STANDARD_SIZES: [(u32, u32); 7] = [
+    (2560, 1440),
+    (1920, 1080),
+    (1600, 900),
+    (1280, 720),
+    (1024, 768),
+    (800, 600),
+    (640, 480),
+];
 
 /// The bound on the reduced numerator of win32u's monitor scale ratio.
 ///
@@ -91,24 +81,22 @@ const MONITOR_RATIO_LIMIT: u64 = 1 << 16;
 /// `current` (the desktop mode) comes first so it doubles as the adapter
 /// display mode. Candidates keep their enumeration order, minus duplicates,
 /// anything larger than the desktop on either axis (the display cannot show
-/// more pixels than it has, whatever a mode list says), degenerate sizes, and
-/// aspects further than [`ASPECT_TOLERANCE`] from the desktop's. The result is
-/// never empty: a list that filters down to nothing holds the desktop mode
-/// alone. [`served_mode_sizes`] bounds what games enumerate from it.
+/// more pixels than it has, whatever a mode list says) and degenerate sizes.
+/// A size of any aspect stays: win32u letterboxes a mode whose aspect is not
+/// the display's. The result is never empty: a list that filters down to
+/// nothing holds the desktop mode alone. [`served_mode_sizes`] bounds what
+/// games enumerate from it.
 pub fn select_mode_sizes(
     current: (u32, u32),
     candidates: impl IntoIterator<Item = (u32, u32)>,
 ) -> Vec<(u32, u32)> {
     let (host_w, host_h) = current;
-    let host_aspect = aspect(current);
     let mut sizes = vec![current];
     for (w, h) in candidates {
         if w == 0 || h == 0 || w > host_w || h > host_h || sizes.contains(&(w, h)) {
             continue;
         }
-        if aspect_off((w, h), host_aspect) <= ASPECT_TOLERANCE {
-            sizes.push((w, h));
-        }
+        sizes.push((w, h));
     }
     sizes
 }
@@ -169,75 +157,40 @@ pub fn drop_unscalable_sizes(
     dropped
 }
 
-/// The area below a notch, from the physical display size and Win32's mode list.
-///
-/// A notched `MacBook` panel's physical mode includes the strip beside the
-/// notch, and macOS lists a second mode of the same width that leaves it
-/// out: 3456x2160 below a 3456x2234 display (a 74-pixel strip, 3.3 % of the
-/// height), 1728x1080 below the same panel at 1728x1117 with Wine's Retina
-/// mode off, and a 32 to 37 point strip on every notched model, 3.3 % to
-/// 3.9 % of the height. Wine keeps macOS's own modes in its list, so the
-/// area shows up there, and this relies on macOS listing it. The strip must
-/// be at least [`NOTCH_STRIP_MIN`] and under [`NOTCH_STRIP_MAX`] of the
-/// physical height, which no two same-width sizes of Wine's own table come
-/// within (the closest pair, 1280x800 and 1280x768, are 4 % apart). The
-/// tallest such mode wins. `None` for a display without a notch, which is
-/// every external one.
-pub fn notch_area(
-    physical: (u32, u32),
-    sizes: impl IntoIterator<Item = (u32, u32)>,
-) -> Option<(u32, u32)> {
-    let (width, height) = physical;
-    sizes
-        .into_iter()
-        .filter(|&(w, h)| {
-            if w != width || h == 0 || h >= height {
-                return false;
-            }
-            let strip = f64::from(height - h) / f64::from(height);
-            (NOTCH_STRIP_MIN..NOTCH_STRIP_MAX).contains(&strip)
-        })
-        .max_by_key(|&(_, h)| h)
-}
-
-/// The sizes `EnumAdapterModes` serves: the panel's aspect, then the notch area's, up to `max`.
+/// The sizes `EnumAdapterModes` serves: those that fill the display, then the standard sizes.
 ///
 /// The desktop (the first entry, which doubles as the adapter display mode)
-/// comes first, then the other sizes of the panel's own aspect (within
-/// [`PANEL_ASPECT_TOLERANCE`] of the desktop's), largest first, then, when
-/// `notch` names the area below a notch ([`notch_area`]), the sizes of that
-/// area's aspect (within the same tolerance) that are not of the panel's,
-/// largest first, at most `max` in all; ties keep their enumeration order.
-/// Under Wine's `EmulateModeset` win32u scales a mode uniformly onto the
-/// display and centres it, so a mode of the panel's aspect fills it and any
-/// other is letterboxed with the desktop showing in the bars. On a notched
-/// panel the second tier is the area below the notch, which win32u centres,
-/// so it straddles the notch strip. Without a notch there is no second tier
-/// and only the panel's own aspect is served. The sizes are the primary
-/// display's, the only one this layer describes. Every other settable size
-/// stays settable for a game's own config, since this never touches
+/// comes first whatever its shape, then the other sizes that fill the
+/// `physical` display (scaled onto it they leave a bar of less than one
+/// physical pixel), largest first, then the standard sizes in the list that
+/// do not fill it (2560x1440, 1920x1080, 1600x900, 1280x720, 1024x768,
+/// 800x600 and 640x480), largest first, at most `max` in all. Under Wine's
+/// `EmulateModeset` win32u scales a mode uniformly onto the display and
+/// centres it, so a mode of another shape is letterboxed with the desktop
+/// showing in the bars. The sizes that fill the display therefore come first,
+/// and the standard sizes follow as further window sizes to pick from.
+/// `physical` is [`physical_extent`]'s answer: under `EmulateModeset` the
+/// extent win32u scales a mode onto, and without it the largest extent on
+/// each axis of the driver's own list. The sizes are the primary display's,
+/// the only one this layer describes. Every other settable size stays
+/// settable for a game's own config, since this never touches
 /// [`select_mode_sizes`]' list. A `max` of 0 still serves the desktop.
 #[must_use]
 pub fn served_mode_sizes(
     settable: &[(u32, u32)],
-    notch: Option<(u32, u32)>,
+    physical: (u32, u32),
     max: usize,
 ) -> Vec<(u32, u32)> {
     let Some((&desktop, rest)) = settable.split_first() else {
         return Vec::new();
     };
-    let desktop_aspect = aspect(desktop);
-    let is_panel = |size: (u32, u32)| aspect_off(size, desktop_aspect) <= PANEL_ASPECT_TOLERANCE;
-    let panel = largest_first(rest, is_panel);
-    let below_notch = notch.map_or_else(Vec::new, |area| {
-        let notch_aspect = aspect(area);
-        largest_first(rest, |size| {
-            !is_panel(size) && aspect_off(size, notch_aspect) <= PANEL_ASPECT_TOLERANCE
-        })
-    });
+    let filling = largest_first(rest, |size| fills_display(size, physical));
+    let standard = STANDARD_SIZES
+        .into_iter()
+        .filter(|&size| !fills_display(size, physical) && rest.contains(&size));
     core::iter::once(desktop)
-        .chain(panel)
-        .chain(below_notch)
+        .chain(filling)
+        .chain(standard)
         .take(max.max(1))
         .collect()
 }
@@ -261,13 +214,29 @@ pub fn served_mode_indices(
         .collect()
 }
 
-fn aspect((w, h): (u32, u32)) -> f64 {
-    f64::from(w) / f64::from(h)
-}
-
-/// A size's aspect distance from `reference`, as a fraction of `reference`.
-fn aspect_off(size: (u32, u32), reference: f64) -> f64 {
-    (aspect(size) - reference).abs() / reference
+/// Whether a mode of `size` covers a display of `physical` pixels with no visible bar.
+///
+/// win32u scales a mode uniformly onto the physical display, as far as the
+/// tighter axis allows, and centres it. The mode covers the display when
+/// the bar left on the other axis, both sides together, is under one
+/// physical pixel: win32u rounds each edge of the scaled rectangle to a
+/// pixel, and half of less than one pixel rounds to none. A panel's own
+/// scaled modes pass although integer rounding leaves their aspects a hair
+/// apart (2624x1696 on 3456x2234 leaves a quarter of a pixel). A zero extent
+/// on either side fills nothing.
+fn fills_display(size: (u32, u32), physical: (u32, u32)) -> bool {
+    let (w, h) = (u64::from(size.0), u64::from(size.1));
+    let (phys_w, phys_h) = (u64::from(physical.0), u64::from(physical.1));
+    if w == 0 || h == 0 || phys_w == 0 || phys_h == 0 {
+        return false;
+    }
+    if w * phys_h >= h * phys_w {
+        // Fitted to the width: the bar is `phys_h - h * phys_w / w` rows.
+        phys_h * w - h * phys_w < w
+    } else {
+        // Fitted to the height: the bar is `phys_w - w * phys_h / h` columns.
+        phys_w * h - w * phys_h < h
+    }
 }
 
 fn pixels((w, h): (u32, u32)) -> u64 {

@@ -9,8 +9,8 @@ use mtld3d_core::{
     caps,
     config::{CursorScale, Mtld3dConfig},
     display_mode::{
-        MAX_SERVED_SIZES, ModeRequest, drop_unscalable_sizes, notch_area, physical_extent,
-        select_mode_sizes, served_mode_sizes,
+        MAX_SERVED_SIZES, ModeRequest, drop_unscalable_sizes, physical_extent, select_mode_sizes,
+        served_mode_sizes,
     },
     format_probe::FormatProbeKey,
     multisample,
@@ -167,7 +167,6 @@ fn build_adapter_modes() -> AdapterModes {
         .filter(|&hz| hz > 0)
         .unwrap_or(60);
     let host_bpp = host.map(|mode| mode.bits_per_pel);
-    let host_aspect = f64::from(host_w) / f64::from(host_h);
 
     // Win32 lists every size once per colour depth; the desktop's depth is
     // the one a game gets, so the others only repeat sizes.
@@ -177,7 +176,6 @@ fn build_adapter_modes() -> AdapterModes {
         .filter(|mode| host_bpp.is_none_or(|bpp| mode.bits_per_pel == bpp))
         .map(|mode| (mode.width, mode.height));
     let physical = physical_extent((host_w, host_h), candidates.clone());
-    let notch = notch_area(physical, candidates.clone());
     let mut settable = select_mode_sizes((host_w, host_h), candidates);
     // After a mode-set win32u rescales the monitor by a ratio whose terms it
     // packs into 16 bits each, and some Wine builds abort the process when a
@@ -196,25 +194,7 @@ fn build_adapter_modes() -> AdapterModes {
             physical.1
         );
     }
-    if let Some((w, h)) = notch {
-        mtld3d_shared::log_once_info!(
-            target: LOG_TARGET,
-            "adapter modes: {w}x{h} is the area below the notch of the {}x{} display; the \
-             second tier serves its aspect, {:.3}",
-            physical.0,
-            physical.1,
-            f64::from(w) / f64::from(h)
-        );
-    } else {
-        mtld3d_shared::log_once_info!(
-            target: LOG_TARGET,
-            "adapter modes: no notch area in the {}x{} display's mode list; only its own aspect \
-             is served",
-            physical.0,
-            physical.1
-        );
-    }
-    let sizes = served_mode_sizes(&settable, notch, MAX_SERVED_SIZES);
+    let sizes = served_mode_sizes(&settable, physical, MAX_SERVED_SIZES);
     if enumerated.is_empty() {
         mtld3d_shared::log_once_warn!(
             target: LOG_TARGET,
@@ -237,8 +217,10 @@ fn build_adapter_modes() -> AdapterModes {
 
     info!(
         target: LOG_TARGET,
-        "adapter modes: host {host_w}x{host_h}@{host_hz}Hz aspect={host_aspect:.3}; {} sizes \
+        "adapter modes: host {host_w}x{host_h}@{host_hz}Hz on a {}x{} display; {} sizes \
          settable of {} enumerated modes, {} served ({} entries): {sizes:?}",
+        physical.0,
+        physical.1,
         settable.len(),
         enumerated.len(),
         sizes.len(),
