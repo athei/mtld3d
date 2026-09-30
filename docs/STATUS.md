@@ -198,12 +198,15 @@ is in [`CONFORMANCE.md`](../unix/conformance/CONFORMANCE.md#kept-divergences).
 - A partial `Lock` of a dynamic vertex or index buffer without
   `D3DLOCK_DISCARD` returns a pointer a queued draw may still read. No knob.
 - A partial `LockRect` of a texture level without `D3DLOCK_NOOVERWRITE` or
-  `D3DLOCK_READONLY` returns a pointer an upload may still read. Every other
-  CPU writer of a texture level renames its staging when an upload still reads
-  it and a draw or other GPU operation on the texture was recorded after that
-  upload, so only the partial lock writes in place under an upload something
-  has seen. Back-to-back writes with no GPU use between stay in place, which no
-  draw can tell apart. No knob.
+  `D3DLOCK_READONLY` returns a pointer an upload may still read. Under an
+  upload that still reads a level, only two writes land in place: this partial
+  lock, and any write into a level the game holds mapped by a lock or a device
+  context. Every other CPU writer renames the level's staging first, unless
+  every pending upload of it belongs to the frame being recorded and no draw
+  or other GPU operation on the texture was recorded since, in which case no
+  draw can tell the difference. Writes into a render-target or depth texture
+  and read-backs from the GPU always rename when an upload still reads the
+  level. No knob.
 - A DEFAULT-pool `D3DUSAGE_WRITEONLY` static buffer keeps no CPU copy once
   uploaded, so a read through the lock pointer sees zeros.
   `buffer.ignoreLockBounds` keeps the copy.
