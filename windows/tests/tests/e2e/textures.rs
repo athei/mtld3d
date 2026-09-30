@@ -5340,7 +5340,12 @@ fn intra_frame_get_dc_keeps_per_draw_content() {
         assert_eq!(dc.set_pixel(0, 0, BLUE_COLORREF), BLUE_COLORREF, "SetPixel");
         assert_eq!(dc.release(), 0, "ReleaseDC");
     });
-    assert_eq!(pixels, [RED, BLUE], "draws bracketing a GetDC write");
+    // RGB only: GDI stores 0 in the X8 byte, and a paravirtual device samples it as alpha.
+    assert_eq!(
+        pixels.map(|pixel| pixel & 0x00FF_FFFF),
+        [RED & 0x00FF_FFFF, BLUE & 0x00FF_FFFF],
+        "draws bracketing a GetDC write"
+    );
 }
 
 /// A `ColorFill` of an offscreen-plain surface between two reads of it keeps each read's colour.
