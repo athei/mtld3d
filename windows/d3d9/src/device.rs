@@ -43,12 +43,13 @@ use mtld3d_core::{
     passes::BackbufferContents,
     perf::{
         ApiPerfState, ApiPerfStorage, ApiTimer, BindSubCategory, CycleAddTimer, CycleSetTimer,
-        DeviceSubCategory, KeysGate, SnapshotSection,
+        DeviceSubCategory, KeysGate,
     },
     present::LayerPacing,
     readback::{ReadbackDestination, ReadbackReject, ReadbackSource},
     render_scale::TargetExtent,
     render_state::{RsClass, rs_classify},
+    snapshot::SnapshotSection,
     streams::validate_stream_freq,
     texture_flags::TextureFlags,
     upload_redirty::RedirtyQueue,
@@ -896,6 +897,16 @@ bitflags::bitflags! {
         const PS_CONST_B  = SnapshotSection::PsConstB.bit();
     }
 }
+
+// The flags take their bits from `SnapshotSection`; pin a few so a renumbered
+// section cannot move a flag unnoticed.
+const _: () = {
+    assert!(SnapshotDirty::RS.bits() == 1 << 0);
+    assert!(SnapshotDirty::STAGES.bits() == 1 << 1);
+    assert!(SnapshotDirty::RT_DS.bits() == 1 << 3);
+    assert!(SnapshotDirty::VS_SOURCE.bits() == 1 << 6);
+    assert!(SnapshotDirty::PS_CONST_B.bits() == 1 << 17);
+};
 
 impl DeviceInner {
     /// Read the implicit front buffer into a validated caller-owned surface.
@@ -3517,6 +3528,19 @@ fn draw_snapshot_section_ptr(perf_ptr: *mut ApiPerfState, section: SnapshotSecti
     }
     // SAFETY: see `draw_snapshot_ptr`.
     unsafe { (*perf_ptr).draw_snapshot_section_cycles_ptr(section) }
+}
+
+/// Pointer the `CycleAddTimer` for the `keys` scope of a sampled draw writes into.
+///
+/// Null on an unsampled draw (the caller passes a null `perf_ptr`), so the
+/// timer reads no clock there. Same null-guard as `draw_snapshot_ptr`.
+#[inline]
+fn draw_snapshot_keys_sampled_ptr(perf_ptr: *mut ApiPerfState) -> *mut u64 {
+    if perf_ptr.is_null() {
+        return core::ptr::null_mut();
+    }
+    // SAFETY: see `draw_snapshot_ptr`.
+    unsafe { (*perf_ptr).draw_snapshot_keys_sampled_cycles_ptr() }
 }
 
 /// Pointer the `CycleAddTimer` writes into for the post-consts scratch bumps.
@@ -10871,13 +10895,17 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
     // starts so the buckets don't double-count. Each section's own timer
     // runs inside its dirty branch, a child of `keys_timer`, and only on a
     // sampled draw: on the others its target is null and it reads no clock.
+    // The sampled draws also time the whole scope into a slot of their own,
+    // so the part of `keys` outside the sections is taken on the same draws
+    // as the sections, with the same timer cost in both.
     let perf_ptr = DeviceInner::perf_ptr_of(obj.inner);
-    let keys_timer = CycleAddTimer::start(draw_snapshot_keys_ptr(perf_ptr));
     let section_perf_ptr = if sampled {
         perf_ptr
     } else {
         core::ptr::null_mut()
     };
+    let keys_timer = CycleAddTimer::start(draw_snapshot_keys_ptr(perf_ptr));
+    let keys_sampled_timer = CycleAddTimer::start(draw_snapshot_keys_sampled_ptr(section_perf_ptr));
     let dev = obj.inner();
 
     // VDECL FIRST — its rebuild updates `dev.cached_ff_vs_layout`,
@@ -11230,6 +11258,7 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
         None
     };
 
+    drop(keys_sampled_timer);
     drop(keys_timer);
 
     // From here through `drop(consts_timer)` below is the "consts"

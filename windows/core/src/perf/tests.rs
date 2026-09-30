@@ -618,8 +618,8 @@ fn summary_golden_layout() {
         "  RT_DS                    0             (  0.0%)\n",
         "  VDECL                    0             (  0.0%)\n",
         "  VARIANT                  0             (  0.0%)\n",
-        "  VS_SOURCE               20             ( 20.0%)      0 ns/rebuild\n",
-        "  PS_SOURCE               20             ( 20.0%)      0 ns/rebuild\n",
+        "  VS_SOURCE               20             ( 20.0%)\n",
+        "  PS_SOURCE               20             ( 20.0%)\n",
         "  VS_CONST                25             ( 25.0%)\n",
         "  PS_CONST                 0             (  0.0%)\n",
         "  ALPHA_REF                0             (  0.0%)\n",
@@ -703,7 +703,11 @@ fn kv_golden_line() {
         " draw_snapshot_keys_ps_source_ms=0.000",
         " draw_snapshot_keys_ps_source_peak_ms=0.000 draw_snapshot_keys_resid_ms=0.010",
         " draw_snapshot_keys_resid_peak_ms=0.010 draw_snapshot_rebuild_draws_total=40",
-        " draw_snapshot_sampled_draws_total=20",
+        " draw_snapshot_sampled_draws_total=20 draw_snapshot_sampled_rebuild_vdecl_total=0",
+        " draw_snapshot_sampled_rebuild_rs_total=5 draw_snapshot_sampled_rebuild_rt_ds_total=0",
+        " draw_snapshot_sampled_rebuild_variant_total=0",
+        " draw_snapshot_sampled_rebuild_vs_source_total=0",
+        " draw_snapshot_sampled_rebuild_ps_source_total=0",
         " draw_snapshot_rebuild_rs_total=10 draw_snapshot_rebuild_stages_total=30",
         " draw_snapshot_rebuild_rt_ds_total=0 draw_snapshot_rebuild_vdecl_total=0",
         " draw_snapshot_rebuild_variant_total=0 draw_snapshot_rebuild_vs_source_total=20",
@@ -1024,6 +1028,8 @@ fn sample_window() -> PerfWindow {
     rebuilds[SnapshotSection::VsConst as usize] = 25;
     let mut section_cycles = [0u64; SnapshotSection::SLOTS];
     section_cycles[SnapshotSection::Rs as usize] = 5_000;
+    let mut sampled_rebuilds = [0u32; SnapshotSection::SLOTS];
+    sampled_rebuilds[SnapshotSection::Rs as usize] = 5;
     let s = FrameSample {
         counters: FrameCounters {
             reserved: 0,
@@ -1082,6 +1088,7 @@ fn sample_window() -> PerfWindow {
             keys_gate_calls: [0; KeysGate::COUNT],
             keys_gate_skips: [0; KeysGate::COUNT],
             snapshot_rebuilds: rebuilds,
+            snapshot_sampled_rebuilds: sampled_rebuilds,
             snapshot_rebuild_draws: 40,
             // Half the rebuilding draws were timed, so the sampled section
             // cycles below count twice.
@@ -1102,6 +1109,9 @@ fn sample_window() -> PerfWindow {
             draw_snapshot_bumps_cycles: 10_000,
             draw_push_op_cycles: 20_000,
             draw_snapshot_section_cycles: section_cycles,
+            // The sampled draws spent 10 000 in `keys`, 5 000 of them in RS,
+            // so `rest` scales to 10 000.
+            draw_snapshot_keys_sampled_cycles: 10_000,
         },
         timing: FrameTiming {
             present_block_cycles: 3_200_000,
@@ -1567,4 +1577,75 @@ fn sampled_cycles_scale_to_every_rebuilding_draw() {
     assert_eq!(scale_sampled(5_000, 40, 20), 10_000);
     assert_eq!(scale_sampled(5_000, 40, 0), 0);
     assert_eq!(scale_sampled(u64::MAX, u64::MAX, 1), u64::MAX);
+}
+
+/// One frame's section counters for the sampled-section tests.
+const fn sampled_frame(
+    rebuild_draws: u32,
+    sampled_draws: u32,
+    rs: (u32, u64),
+    keys: (u64, u64),
+) -> FrameSample {
+    let mut frame = sample(0, 0);
+    let c = &mut frame.counters;
+    c.snapshot_rebuild_draws = rebuild_draws;
+    c.snapshot_sampled_draws = sampled_draws;
+    c.snapshot_rebuilds[SnapshotSection::Rs as usize] = rebuild_draws;
+    c.snapshot_sampled_rebuilds[SnapshotSection::Rs as usize] = rs.0;
+    c.draw_snapshot_section_cycles[SnapshotSection::Rs as usize] = rs.1;
+    c.draw_snapshot_keys_cycles = keys.0;
+    c.draw_snapshot_keys_sampled_cycles = keys.1;
+    frame
+}
+
+/// Frames with different sampling ratios scale by the window's ratio of sums, not per frame.
+#[test]
+fn sampled_sections_scale_by_the_window_ratio_across_frames() {
+    let mut w = PerfWindow::new();
+    // 20 of 40 draws sampled, then 10 of 100.
+    w.accumulate(&sampled_frame(40, 20, (20, 5_000), (20_000, 8_000)));
+    w.accumulate(&sampled_frame(100, 10, (10, 1_000), (30_000, 3_000)));
+    // 6 000 sampled RS cycles over 30 of 140 draws.
+    assert_eq!(
+        w.draw_snapshot_section_scaled(SnapshotSection::Rs as usize)
+            .sum,
+        28_000
+    );
+    // Sampled keys 11 000 less sampled RS 6 000, scaled the same way.
+    assert_eq!(w.draw_snapshot_keys_resid_sum(), 23_333);
+    // Cost per rebuild divides by the sampled rebuilds of RS, 30.
+    assert_eq!(
+        w.draw_snapshot_section_per_rebuild(SnapshotSection::Rs as usize),
+        Some(200)
+    );
+    // The per-frame peak is that frame's own scaled estimate.
+    assert_eq!(
+        w.draw_snapshot_section[SnapshotSection::Rs as usize].max,
+        10_000
+    );
+    assert_eq!(w.draw_snapshot_keys_leftover.max, 20_000);
+    assert_eq!(
+        w.draw_snapshot_section_per_rebuild(SnapshotSection::Vdecl as usize),
+        None
+    );
+}
+
+/// Scaled sections above the parent `keys` leave `rest` measured, not clamped to zero.
+///
+/// The section timers' cost lands in the sampled draws only, so the scaled
+/// sections can exceed the `keys` row taken over all draws; `rest` comes
+/// from the sampled `keys` and still reads what the sampled draws spent
+/// outside the sections.
+#[test]
+fn sections_above_keys_keep_the_rest_from_the_sampled_draws() {
+    let mut w = PerfWindow::new();
+    w.accumulate(&sampled_frame(64, 4, (4, 4_000), (5_000, 6_000)));
+    let sections = w
+        .draw_snapshot_section_scaled(SnapshotSection::Rs as usize)
+        .sum;
+    assert_eq!(sections, 64_000);
+    assert!(sections > w.draw_snapshot_keys.sum);
+    assert_eq!(w.draw_snapshot_keys_resid_sum(), 32_000);
+    let grid = Summary::render_with_ansi(&w, &sample_caches(), 2.0, false);
+    assert!(grid.contains("└─ rest"), "the rest row renders: {grid}");
 }
