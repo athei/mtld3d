@@ -2295,13 +2295,10 @@ impl DeviceInner {
     /// Callers gate `mark_snapshot_dirty` on this. POINTSIZE also compares
     /// its numeric value and coverage latch: a state-block restore can leave
     /// either different from the component a same-raw write would select.
+    #[inline]
     pub fn set_render_state(&mut self, index: usize, value: u32) -> bool {
         if index == D3DRS_POINTSIZE as usize {
-            return self.set_point_size_state(
-                value,
-                mtld3d_core::multisample::numeric_point_size(value),
-                mtld3d_core::multisample::a2m_control(value),
-            );
+            return self.set_point_size_render_state(value);
         }
         self.warn_rs_non_default_once(index, value);
         let prev = self.render_states[index];
@@ -2353,6 +2350,18 @@ impl DeviceInner {
         changed
     }
 
+    /// The POINTSIZE arm of [`Self::set_render_state`], which also decodes the A2M token.
+    ///
+    /// Out of line so the setter the thunks inline stays small.
+    #[inline(never)]
+    fn set_point_size_render_state(&mut self, value: u32) -> bool {
+        self.set_point_size_state(
+            value,
+            mtld3d_core::multisample::numeric_point_size(value),
+            mtld3d_core::multisample::a2m_control(value),
+        )
+    }
+
     pub const fn point_size(&self) -> u32 {
         self.point_size
     }
@@ -2395,13 +2404,19 @@ impl DeviceInner {
         self.rs_warn_fired[index / 64] |= 1u64 << (index % 64);
     }
 
+    /// The silent-write audit of one render-state write.
+    ///
+    /// The tests stay inline, so the setter can inline this; the latch mark
+    /// and every log line live in cold functions.
+    #[inline]
     fn warn_rs_non_default_once(&mut self, index: usize, value: u32) {
         static RS_DEFAULTS: [u32; RENDER_STATE_COUNT] = render_state_defaults();
 
         if index >= RENDER_STATE_COUNT {
             return;
         }
-        if value == RS_DEFAULTS[index] {
+        let default = RS_DEFAULTS[index];
+        if value == default {
             if mtld3d_core::state_trace::enabled() {
                 Self::trace_default_rs(index, value);
             }
@@ -2410,18 +2425,14 @@ impl DeviceInner {
         if self.rs_warn_fired(index) {
             return;
         }
-        let class = rs_classify(
-            u32::try_from(index).expect("D3DRS index fits u32 by RENDER_STATE_COUNT bound"),
-            value,
-        );
-        if matches!(class, RsClass::Consumed) {
+        let state = u32::try_from(index).expect("D3DRS index fits u32 by RENDER_STATE_COUNT bound");
+        if matches!(rs_classify(state, value), RsClass::Consumed) {
             if mtld3d_core::state_trace::enabled() {
-                Self::trace_consumed_rs(index, value, RS_DEFAULTS[index]);
+                Self::trace_consumed_rs(index, value, default);
             }
             return;
         }
-        self.mark_rs_warn(index);
-        Self::log_unconsumed_rs(index, value, RS_DEFAULTS[index], &class);
+        self.log_unconsumed_rs_once(index, value, default);
     }
 
     /// Keep trace formatting off the ordinary render-state setter stack.
@@ -2444,11 +2455,13 @@ impl DeviceInner {
         );
     }
 
-    /// Format a diagnostic only after its once-per-slot latch is marked.
+    /// Mark the once-per-slot latch of an unconsumed write, then format its diagnostic.
     #[cold]
     #[inline(never)]
-    fn log_unconsumed_rs(index: usize, value: u32, default: u32, class: &RsClass) {
-        match class {
+    fn log_unconsumed_rs_once(&mut self, index: usize, value: u32, default: u32) {
+        self.mark_rs_warn(index);
+        let state = u32::try_from(index).expect("D3DRS index fits u32 by RENDER_STATE_COUNT bound");
+        match rs_classify(state, value) {
             RsClass::Consumed => {} // unreachable given early-return above
             RsClass::Obsolete(reason) => {
                 info!(

@@ -429,6 +429,20 @@ pub fn fill(caps: &mut D3DCAPS9, caps_all: bool, sampler_border: bool) {
     }
 }
 
+/// Whether `op` is a `D3DTOP_*` operation the fixed-function emitter lacks.
+///
+/// True exactly when [`unimplemented_texture_op`] names one, without the name
+/// lookup, so the texture-stage setter can inline the test.
+#[inline]
+#[must_use]
+pub const fn texture_op_unimplemented(op: u32) -> bool {
+    if op == 0 || op > 32 {
+        return false;
+    }
+    let bit = 1u32 << (op - 1);
+    TexOpCaps::all().bits() & bit != 0 && TEXOP_DEFAULT.bits() & bit == 0
+}
+
 /// The `TexOpCaps` name of a `D3DTOP_*` operation the fixed-function emitter lacks.
 ///
 /// `None` for an operation in `TEXOP_DEFAULT` and for a value outside the

@@ -2471,3 +2471,35 @@ fn walk_ff_writes(light_indices: &[u32], mut rng: u64) {
         );
     }
 }
+
+/// An unhonoured `D3DTS_*` index is dropped, warned once per index, and marks nothing.
+///
+/// `SetTransform` and `MultiplyTransform` keep separate latches, so the second
+/// setter still warns for an index the first one already reported.
+#[test]
+fn an_unhonoured_transform_index_is_dropped_and_warned_once_per_setter_and_index() {
+    capture_warnings();
+    let mut state = FfState::new();
+    let _ = state.take_ff_vs_dirty();
+    for _ in 0..3 {
+        assert!(!state.set_transform(1000, &D3DMATRIX::IDENTITY));
+        assert!(!state.multiply_transform(1000, &D3DMATRIX::IDENTITY));
+    }
+    assert!(!state.set_transform(1001, &D3DMATRIX::IDENTITY));
+    assert!(
+        state.take_ff_vs_dirty().is_empty(),
+        "a dropped value marks no section"
+    );
+    assert_eq!(
+        warnings_containing("SetTransform: D3DTS_1000 not honoured"),
+        1
+    );
+    assert_eq!(
+        warnings_containing("MultiplyTransform: D3DTS_1000 not honoured"),
+        1
+    );
+    assert_eq!(
+        warnings_containing("SetTransform: D3DTS_1001 not honoured"),
+        1
+    );
+}

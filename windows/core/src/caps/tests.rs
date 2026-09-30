@@ -17,7 +17,10 @@ use mtld3d_types::{
     VtxpCaps, d3dps_version, d3dvs_version,
 };
 
-use super::{FF_TEXTURE_STAGES, apply_advertise_all, fill_default, unimplemented_texture_op};
+use super::{
+    FF_TEXTURE_STAGES, apply_advertise_all, fill_default, texture_op_unimplemented,
+    unimplemented_texture_op,
+};
 use crate::dxso::{FfPsKey, FfStage, FfStageFlags, VariantKey, emit_ps_ff};
 
 fn filled() -> D3DCAPS9 {
@@ -321,6 +324,18 @@ fn unimplemented_texture_op_names_the_operation() {
     }
     for op in [0, D3DTOP_LERP + 1, 33, u32::MAX] {
         assert_eq!(unimplemented_texture_op(op), None, "D3DTOP {op}");
+    }
+}
+
+/// The inline test the texture-stage setter runs agrees with the named lookup on every value.
+#[test]
+fn texture_op_unimplemented_agrees_with_the_named_lookup() {
+    for op in (0..=64).chain([u32::MAX - 1, u32::MAX]) {
+        assert_eq!(
+            texture_op_unimplemented(op),
+            unimplemented_texture_op(op).is_some(),
+            "D3DTOP {op}"
+        );
     }
 }
 
