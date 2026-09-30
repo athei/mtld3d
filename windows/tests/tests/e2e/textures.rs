@@ -5145,6 +5145,47 @@ fn managed_dirty_initial_and_evicted_image() {
     }
 }
 
+/// Eviction between two draws of one frame republishes before the second draw.
+///
+/// `EvictManagedResources` drops the device copy of a bound managed texture,
+/// and the runtime replays its system-memory copy on the next use, here a
+/// draw later in the same frame with no state change before it. A `ColorFill`
+/// of a render target that is not bound runs as a render pass of its own and
+/// touches no draw state, so the second draw opens a fresh pass and binds the
+/// texture again instead of reusing the binding the first draw left behind.
+/// A second draw that found nothing to bind samples zeros, not the image.
+#[test]
+fn eviction_between_draws_of_a_frame_reaches_the_next_pass() {
+    const RED: u32 = 0xFFFF_0000;
+    const GREEN: u32 = 0xFF00_FF00;
+    let h = Harness::new();
+    let tex = h.create_texture(64, 64, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED);
+    tex.lock_rect(0, 0).write_u32(&[RED; 64 * 64]);
+    assert_pixel_eq(sample_center(&h, &tex).to_pixel(), RED, "uploaded image");
+    let unbound_rt = h.create_render_target(64, 64, D3DFMT_A8R8G8B8);
+    let full = bind_for_quadrant_draws(&h, &tex);
+    let left = full.map(|v| TexturedVertex {
+        x: v.x.midpoint(-1.0),
+        ..v
+    });
+    let right = full.map(|v| TexturedVertex {
+        x: v.x.midpoint(1.0),
+        ..v
+    });
+    h.render_once(BLACK, |d| {
+        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &left), 0);
+        assert_eq!(d.evict_managed_resources(), 0, "EvictManagedResources");
+        assert_eq!(d.color_fill_hr(&unbound_rt, GREEN), 0, "ColorFill");
+        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &right), 0);
+    });
+    assert_pixel_eq(h.read_pixel(160, 240), RED, "the draw before eviction");
+    assert_pixel_eq(
+        h.read_pixel(480, 240),
+        RED,
+        "the draw after eviction samples the replayed image, not an unbound stage's zeros",
+    );
+}
+
 /// Independent mip pages are enough to reproduce explicit publication failure.
 #[test]
 fn managed_dirty_independent_mip_publication() {

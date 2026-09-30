@@ -2055,6 +2055,14 @@ impl DeviceInner {
         for tex_id in to_evict {
             self.push_control(crate::device::DestroyTextureOp { tex_id });
         }
+        // The replay runs in the stage walk, fragment and vertex slots alike,
+        // and the walk runs only when STAGES is dirty. Without the mark, a
+        // bound texture's next draw in this frame would find its Metal texture
+        // gone and nothing scheduled to recreate it. Eviction is rare, so the
+        // mark is not narrowed to the textures a stage holds.
+        if evicted_count != 0 {
+            self.mark_snapshot_dirty(SnapshotDirty::STAGES);
+        }
         mtld3d_shared::log_once_info!(
             target: TEX_TRACE_TARGET,
             "EvictManagedResources: marked {evicted_count} textures dirty (cache eviction queued)"
