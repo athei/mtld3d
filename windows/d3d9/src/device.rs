@@ -10586,8 +10586,16 @@ extern "system" fn device_draw_indexed_primitive(
 /// A buffer drawn while locked never reached `Unlock`'s upload, so its latest
 /// CPU writes are flushed here. The lock stays open and `dirty` stays set, so
 /// `Unlock` still flushes afterwards.
+///
+/// Only the streams the bound declaration reads are visited, the same set
+/// [`snapshot_bound_streams`] captures: a buffer bound to a stream the draw
+/// does not read is not read by it either.
+#[inline]
 fn flush_mapped_bound_buffers(dev: &mut DeviceInner) {
-    for stream in 0..mtld3d_types::MAX_STREAMS as usize {
+    let mut mask = declared_stream_mask(dev);
+    while mask != 0 {
+        let stream = mask.trailing_zeros() as usize;
+        mask &= mask - 1;
         let vb = dev.bound_buffers().stream_vertex_buffer(stream);
         if !vb.is_null() {
             // SAFETY: a bound vertex buffer is a live wrapper while bound.
@@ -10621,22 +10629,26 @@ fn snapshot_bound_vertex_source(dev: &DeviceInner) -> Option<BoundVertices> {
     })
 }
 
+/// The vertex streams a draw reads: the bound declaration's, or stream 0 alone with none bound.
+fn declared_stream_mask(dev: &DeviceInner) -> u16 {
+    let decl_ptr = dev.vertex_decl();
+    if decl_ptr.is_null() {
+        1
+    } else {
+        // SAFETY: non-null; the device slot's refcount keeps the declaration
+        // alive while bound.
+        unsafe { &*decl_ptr }.inner().stream_mask()
+    }
+}
+
 /// Snapshot the first bound declared stream and any further ones, as for a bound draw.
 ///
 /// Generic over the first stream's form, so each caller converts it where it is captured.
 fn snapshot_bound_streams<First: From<StreamBinding>>(
     dev: &DeviceInner,
 ) -> Option<(First, mtld3d_core::draw_data::ExtraStreams)> {
-    let decl_ptr = dev.vertex_decl();
-    let decl_mask = if decl_ptr.is_null() {
-        1
-    } else {
-        // SAFETY: non-null; the device slot's refcount keeps the declaration
-        // alive while bound.
-        unsafe { &*decl_ptr }.inner().stream_mask()
-    };
     let bound = dev.bound_buffers();
-    let mut mask = decl_mask;
+    let mut mask = declared_stream_mask(dev);
     if mask == 0 {
         return None;
     }

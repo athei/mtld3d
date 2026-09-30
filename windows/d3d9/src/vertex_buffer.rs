@@ -214,10 +214,21 @@ impl VertexBufferInner {
     /// (and any later draw) re-flushes whatever the app writes next. No-op
     /// unless locked + `Staged` + dirty. Mirrors `vb_unlock`'s upload, minus
     /// the clear.
+    #[inline]
     pub fn flush_staged_if_mapped(&mut self, dev: &mut DeviceInner) {
         if !self.locked || !matches!(self.map_mode, BufferMapMode::Staged) {
             return;
         }
+        self.flush_mapped_dirty_span(dev);
+    }
+
+    /// The upload behind [`Self::flush_staged_if_mapped`], for a locked `Staged` buffer.
+    ///
+    /// Out of line and cold so a draw inlines only the lock test: a draw
+    /// issued while its buffer is still mapped is rare.
+    #[cold]
+    #[inline(never)]
+    fn flush_mapped_dirty_span(&mut self, dev: &mut DeviceInner) {
         let Some((min, max)) = self.dirty.span() else {
             return;
         };
