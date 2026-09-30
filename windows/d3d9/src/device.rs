@@ -2299,8 +2299,30 @@ impl DeviceInner {
     /// Callers gate `mark_snapshot_dirty` on this. POINTSIZE also compares
     /// its numeric value and coverage latch: a state-block restore can leave
     /// either different from the component a same-raw write would select.
+    ///
+    /// A write of the value the slot already holds returns here, before the
+    /// call into [`Self::write_render_state`]. The silent-write audit has
+    /// nothing to say about it: a stored value is one the device starts or
+    /// resets with, all of them defaults or consumed, or it came through the
+    /// audit, which latched the slot if the value is not consumed. Only the
+    /// state trace lists such a write, so the early return is taken while
+    /// the trace is off.
     #[inline]
     pub fn set_render_state(&mut self, index: usize, value: u32) -> bool {
+        if index != D3DRS_POINTSIZE as usize
+            && self.render_states[index] == value
+            && !mtld3d_core::state_trace::enabled()
+        {
+            return false;
+        }
+        self.write_render_state(index, value)
+    }
+
+    /// The [`Self::set_render_state`] path that audits the write and stores it.
+    ///
+    /// Out of line so the setter's callers inline only the same-value test.
+    #[inline(never)]
+    fn write_render_state(&mut self, index: usize, value: u32) -> bool {
         if index == D3DRS_POINTSIZE as usize {
             return self.set_point_size_render_state(value);
         }
@@ -2354,9 +2376,9 @@ impl DeviceInner {
         changed
     }
 
-    /// The POINTSIZE arm of [`Self::set_render_state`], which also decodes the A2M token.
+    /// The POINTSIZE arm of [`Self::write_render_state`], which also decodes the A2M token.
     ///
-    /// Out of line so the setter the thunks inline stays small.
+    /// Out of line so the render-state write stays small.
     #[inline(never)]
     fn set_point_size_render_state(&mut self, value: u32) -> bool {
         self.set_point_size_state(
