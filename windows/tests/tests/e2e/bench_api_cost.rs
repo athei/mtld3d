@@ -10,25 +10,26 @@
 //! alone, and the figure a kind reports is the median batch's nanoseconds
 //! per iteration.
 //!
-//! State calls alternate between two values, so that none is a redundant
-//! set the layer may drop, except in the `_same` kinds, which repeat the
-//! bound value and so measure the redundant path. Every batch ends on the
-//! state the others start from. `set_texture_stage_state` and
-//! `set_transform_world` run with both shaders cleared, the fixed-function
-//! pipeline bound, as a fixed-function title such as World of Warcraft 1.12
-//! makes them, so the layer pays the fixed-function state work it may skip
-//! while shaders are bound; their `_shader_bound` twins run the same calls
-//! under the programmable pair, which is that skipped path. The draws are
-//! one small triangle each into a 64x64 back buffer; `draw_clean` changes
-//! nothing between draws,
-//! `draw_dirty_rs` pairs each draw with one `SetRenderState` change, and
-//! `draw_ff_transform` pairs each fixed-function draw with one world
-//! `SetTransform`, so for those, and for the lock kind (a
-//! `D3DLOCK_NOOVERWRITE` `Lock` of 64 bytes, a 64-byte write and the
-//! `Unlock`), the figure is per pair. `Present` between batches hands each
-//! batch to the encoder, and the layer's encoding of a batch overlaps the
-//! next; encoder back-pressure reaches the figures only through the
-//! untimed `Present`, so they are the API thread's own cost per call.
+//! State calls alternate between two values, so that none is a redundant set
+//! the layer may drop, except in the `_same` kinds, which repeat the bound
+//! value and so measure the redundant path. Every batch ends on the state the
+//! others start from. The constant kinds name the register file and how many
+//! registers one call writes: four float rows of a matrix, one row, eight,
+//! sixteen or thirty-two, and one integer or boolean register.
+//! `set_texture_stage_state` and `set_transform_world` run with both shaders
+//! cleared, the fixed-function pipeline bound, as a fixed-function title such
+//! as World of Warcraft 1.12 makes them, so the layer pays the fixed-function
+//! state work it may skip while shaders are bound; their `_shader_bound`
+//! twins run the same calls under the programmable pair, which is that
+//! skipped path. The draws are one small triangle each into a 64x64 back
+//! buffer; `draw_clean` changes nothing between draws, `draw_dirty_rs` pairs
+//! each draw with one `SetRenderState` change, and `draw_ff_transform` pairs
+//! each fixed-function draw with one world `SetTransform`, so for those, and
+//! for the lock kind (a `D3DLOCK_NOOVERWRITE` `Lock` of 64 bytes, a 64-byte
+//! write and the `Unlock`), the figure is per pair. `Present` between batches
+//! hands each batch to the encoder, and the layer's encoding of a batch
+//! overlaps the next; encoder back-pressure reaches the figures only through
+//! the untimed `Present`, so they are the API thread's own cost per call.
 //!
 //! The kinds run interleaved, one batch of each per round, so a drift in
 //! the machine's speed over the run touches every kind alike. The rounds
@@ -92,10 +93,14 @@ const WORLDS: [[f32; 16]; 2] = [
     ],
     IDENTITY_ROWS,
 ];
-/// Two sets of sixteen constant rows the constant kinds alternate.
-const ROWS: [[f32; 64]; 2] = [[0.25; 64], [0.5; 64]];
+/// Two sets of thirty-two constant rows the constant kinds alternate.
+const ROWS: [[f32; 128]; 2] = [[0.25; 128], [0.5; 128]];
 /// The first register the constant kinds write, above every register the programs read.
 const FIRST_FREE_REGISTER: u32 = 8;
+/// The two integer registers the integer-constant kinds alternate.
+const INT_ROWS: [[i32; 4]; 2] = [[1, 2, 3, 4], [5, 6, 7, 8]];
+/// The two values the boolean-constant kinds alternate.
+const BOOLS: [[i32; 1]; 2] = [[1], [0]];
 /// What the lock kind writes into each locked span.
 const PAYLOAD: [u32; 16] = [0x3F80_0000; 16];
 
@@ -110,9 +115,19 @@ enum Kind {
     SetTextureSame,
     SetTransformWorld,
     SetTransformWorldShaderBound,
+    SetVsConstantF1,
     SetVsConstantF4,
+    SetVsConstantF4Same,
+    SetVsConstantF8,
     SetVsConstantF16,
+    SetVsConstantF32,
+    SetVsConstantI1,
+    SetVsConstantB1,
+    SetPsConstantF1,
     SetPsConstantF4,
+    SetPsConstantF4Same,
+    SetPsConstantI1,
+    SetPsConstantB1,
     SetStreamSource,
     SetDeclFvf,
     DrawClean,
@@ -122,7 +137,7 @@ enum Kind {
 }
 
 /// Every kind, in the order a round runs them and the report lists them.
-const KINDS: [Kind; 18] = [
+const KINDS: [Kind; 28] = [
     Kind::SetRenderState,
     Kind::SetRenderStateSame,
     Kind::SetTextureStageState,
@@ -132,9 +147,19 @@ const KINDS: [Kind; 18] = [
     Kind::SetTextureSame,
     Kind::SetTransformWorld,
     Kind::SetTransformWorldShaderBound,
+    Kind::SetVsConstantF1,
     Kind::SetVsConstantF4,
+    Kind::SetVsConstantF4Same,
+    Kind::SetVsConstantF8,
     Kind::SetVsConstantF16,
+    Kind::SetVsConstantF32,
+    Kind::SetVsConstantI1,
+    Kind::SetVsConstantB1,
+    Kind::SetPsConstantF1,
     Kind::SetPsConstantF4,
+    Kind::SetPsConstantF4Same,
+    Kind::SetPsConstantI1,
+    Kind::SetPsConstantB1,
     Kind::SetStreamSource,
     Kind::SetDeclFvf,
     Kind::DrawClean,
@@ -156,9 +181,19 @@ impl Kind {
             Self::SetTextureSame => "set_texture_same",
             Self::SetTransformWorld => "set_transform_world",
             Self::SetTransformWorldShaderBound => "set_transform_world_shader_bound",
+            Self::SetVsConstantF1 => "set_vs_constant_f_1",
             Self::SetVsConstantF4 => "set_vs_constant_f_4",
+            Self::SetVsConstantF4Same => "set_vs_constant_f_4_same",
+            Self::SetVsConstantF8 => "set_vs_constant_f_8",
             Self::SetVsConstantF16 => "set_vs_constant_f_16",
+            Self::SetVsConstantF32 => "set_vs_constant_f_32",
+            Self::SetVsConstantI1 => "set_vs_constant_i_1",
+            Self::SetVsConstantB1 => "set_vs_constant_b_1",
+            Self::SetPsConstantF1 => "set_ps_constant_f_1",
             Self::SetPsConstantF4 => "set_ps_constant_f_4",
+            Self::SetPsConstantF4Same => "set_ps_constant_f_4_same",
+            Self::SetPsConstantI1 => "set_ps_constant_i_1",
+            Self::SetPsConstantB1 => "set_ps_constant_b_1",
             Self::SetStreamSource => "set_stream_source",
             Self::SetDeclFvf => "set_decl_fvf",
             Self::DrawClean => "draw_clean",
@@ -406,6 +441,24 @@ impl<'h> Bench<'h> {
                 );
             })
         };
+        let vs_constant_f = |count: usize| {
+            let rows = rows(count);
+            timed(|odd| {
+                ok(
+                    h.set_vertex_shader_constant_f(FIRST_FREE_REGISTER, rows[usize::from(odd)]),
+                    "SetVertexShaderConstantF",
+                );
+            })
+        };
+        let ps_constant_f = |count: usize| {
+            let rows = rows(count);
+            timed(|odd| {
+                ok(
+                    h.set_pixel_shader_constant_f(FIRST_FREE_REGISTER, rows[usize::from(odd)]),
+                    "SetPixelShaderConstantF",
+                );
+            })
+        };
         match kind {
             Kind::SetRenderState => timed(|odd| {
                 ok(
@@ -434,33 +487,55 @@ impl<'h> Bench<'h> {
             Kind::SetTextureSame => timed(|_| ok(h.set_texture(0, &self.texture), "SetTexture")),
             Kind::SetTransformWorld => self.fixed_function(world),
             Kind::SetTransformWorldShaderBound => world(),
-            Kind::SetVsConstantF4 => {
+            Kind::SetVsConstantF1 => vs_constant_f(1),
+            Kind::SetVsConstantF4 => vs_constant_f(4),
+            Kind::SetVsConstantF4Same => {
                 let rows = rows(4);
-                timed(|odd| {
+                timed(|_| {
                     ok(
-                        h.set_vertex_shader_constant_f(FIRST_FREE_REGISTER, rows[usize::from(odd)]),
+                        h.set_vertex_shader_constant_f(FIRST_FREE_REGISTER, rows[1]),
                         "SetVertexShaderConstantF",
                     );
                 })
             }
-            Kind::SetVsConstantF16 => {
-                let rows = rows(16);
-                timed(|odd| {
-                    ok(
-                        h.set_vertex_shader_constant_f(FIRST_FREE_REGISTER, rows[usize::from(odd)]),
-                        "SetVertexShaderConstantF",
-                    );
-                })
-            }
-            Kind::SetPsConstantF4 => {
+            Kind::SetVsConstantF8 => vs_constant_f(8),
+            Kind::SetVsConstantF16 => vs_constant_f(16),
+            Kind::SetVsConstantF32 => vs_constant_f(32),
+            Kind::SetVsConstantI1 => timed(|odd| {
+                ok(
+                    h.set_vertex_shader_constant_i(0, &INT_ROWS[usize::from(odd)]),
+                    "SetVertexShaderConstantI",
+                );
+            }),
+            Kind::SetVsConstantB1 => timed(|odd| {
+                ok(
+                    h.set_vertex_shader_constant_b(0, &BOOLS[usize::from(odd)]),
+                    "SetVertexShaderConstantB",
+                );
+            }),
+            Kind::SetPsConstantF1 => ps_constant_f(1),
+            Kind::SetPsConstantF4 => ps_constant_f(4),
+            Kind::SetPsConstantF4Same => {
                 let rows = rows(4);
-                timed(|odd| {
+                timed(|_| {
                     ok(
-                        h.set_pixel_shader_constant_f(FIRST_FREE_REGISTER, rows[usize::from(odd)]),
+                        h.set_pixel_shader_constant_f(FIRST_FREE_REGISTER, rows[1]),
                         "SetPixelShaderConstantF",
                     );
                 })
             }
+            Kind::SetPsConstantI1 => timed(|odd| {
+                ok(
+                    h.set_pixel_shader_constant_i(0, &INT_ROWS[usize::from(odd)]),
+                    "SetPixelShaderConstantI",
+                );
+            }),
+            Kind::SetPsConstantB1 => timed(|odd| {
+                ok(
+                    h.set_pixel_shader_constant_b(0, &BOOLS[usize::from(odd)]),
+                    "SetPixelShaderConstantB",
+                );
+            }),
             Kind::SetStreamSource => {
                 let buffers = [&self.other_vb, &self.vb];
                 timed(|odd| {
