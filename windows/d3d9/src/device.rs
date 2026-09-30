@@ -1256,6 +1256,7 @@ impl DeviceInner {
             // system-memory texture's CPU-only phase the same way.
             promote_cpu_only_texture(self, bound);
             crate::texture::flush_dirty_mips(bound.inner_mut(), self);
+            bound.inner_mut().note_gpu_use();
             Some(bound.texture_id())
         };
         self.push_control(crate::device::SetVertexTextureOp {
@@ -2190,6 +2191,7 @@ impl DeviceInner {
             if dynamic_depth && self.depth_stencil_bound() {
                 let inner = tex.inner_mut();
                 crate::texture::flush_dirty_mips(inner, self);
+                inner.note_gpu_use();
                 let info = inner.texture_info();
                 inner.mark_subresource_gpu_authoritative(0, 0);
                 self.push_control(crate::device::ResolveDynamicDepthOp { id, info });
@@ -7022,7 +7024,9 @@ fn readback_from_texture_rt(
     // whose DEFAULT pool leaves the rehydration nothing to do.
     // SAFETY: `parent` is non-null (checked above) and points to a live
     // `Direct3DTexture9` whose refcount keeps it alive while the surface is.
-    crate::texture::flush_dirty_mips(unsafe { (*parent).inner_mut() }, dev.inner());
+    let parent_inner = unsafe { (*parent).inner_mut() };
+    crate::texture::flush_dirty_mips(parent_inner, dev.inner());
+    parent_inner.note_gpu_use();
     let slot = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let slot_op = std::sync::Arc::clone(&slot).into();
     dev.inner().push_control(crate::device::ReadColorHandleOp {
@@ -7725,6 +7729,7 @@ fn flush_dirty_mips_for_gpu_write(
         let tex = unsafe { &mut *parent };
         crate::texture::rehydrate_for_device(tex, obj.inner());
         crate::texture::flush_dirty_mips(tex.inner_mut(), obj.inner());
+        tex.inner_mut().note_gpu_use();
     }
 }
 
@@ -10831,6 +10836,7 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
             // allocation live; the device API lock serialises its access.
             let bound = unsafe { &mut *tex };
             crate::texture::flush_dirty_mips(bound.inner_mut(), dev);
+            bound.inner_mut().note_gpu_use();
         }
         let (arr, ff_mask, packed_mask) = snapshot_stage_bindings(dev);
         obj.inner().cached_bound_texture_mask = ff_mask;
@@ -11615,6 +11621,7 @@ fn snapshot_stage_bindings(
         // device's encoder + handles.
         crate::texture::rehydrate_for_device(tex, dev);
         crate::texture::flush_dirty_mips(tex.inner_mut(), dev);
+        tex.inner_mut().note_gpu_use();
         // A texture's SetLOD raises the effective most-detailed mip. LOD == 0
         // (the common case) is a no-op in both branches.
         let lod = tex.inner().lod();

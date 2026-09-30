@@ -269,7 +269,9 @@ record. A knob, where one makes sense, is named with its default.
   preserved, because Half-Life 2's lightmap pages rely on that. The partial
   lock is the only writer left in place: `UpdateSurface`, `UpdateTexture`,
   `ColorFill`, `GetDC` and a read-back into a level an upload still reads all
-  move the level to fresh pages first. No knob.
+  move the level to fresh pages first once a draw or other GPU operation on
+  the texture was recorded after that upload. With none between, they write in
+  place, since nothing recorded can see the version they replace. No knob.
 - **A DEFAULT-pool `D3DUSAGE_WRITEONLY` static vertex or index buffer keeps
   no CPU copy once every byte has reached the GPU.** D3D9 preserves contents
   across a plain `Lock` whatever the usage says, so a title that reads back

@@ -266,8 +266,9 @@ Texture staging pages are recycled through the process-wide page-box pool
 lane. A staging box parks there once its last owner drops it: the texture at
 release, at a rename (a `LockRect`, or a CPU write such as `UpdateSurface`,
 `UpdateTexture`, `ColorFill`, `GetDC` or a read-back into a level an upload
-still reads) or after its upload, or an upload lease at retirement, whichever
-is last. The next `CreateTexture` or rename of the same
+still reads, once a GPU operation on the texture was recorded after that
+upload) or after its upload, or an upload lease at retirement, whichever is
+last. The next `CreateTexture` or rename of the same
 padded size pops it before it allocates. Both lanes share
 `memory.pageboxPoolCapMB`, and the staging lane may park at most a quarter of
 it (`STAGING_SHARE_DIVISOR`, 32 MiB at the default 128 MiB), so staging cannot

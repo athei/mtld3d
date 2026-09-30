@@ -5057,6 +5057,121 @@ fn update_texture_into_a_locked_level_keeps_the_lock_writes() {
     assert_pixel_eq(h.read_pixel(400, 360), BLUE, "texel the copy wrote");
 }
 
+/// A partial copy lands in place until a draw samples the level, then moves to fresh pages.
+///
+/// Each `UpdateTexture` into a static DEFAULT texture schedules its upload at
+/// once, so the second copy finds the first one's upload still reading the
+/// staging. Nothing recorded between the two can see those pages, so the
+/// second copy writes in place without copying the level: a read-only lock
+/// finds the same pages before and after it. After a draw has sampled the
+/// texture the next partial copy renames. The three copies still sample as
+/// one level.
+#[test]
+fn partial_updates_stay_in_place_until_a_draw_samples_the_level() {
+    const RED: u32 = 0xFFFF_0000;
+    const GREEN: u32 = 0xFF00_FF00;
+    const BLUE: u32 = 0xFF00_00FF;
+    let h = Harness::new();
+    let texture = h.create_texture(2, 2, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT);
+    let source = h.create_texture(2, 2, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM);
+    source.lock_rect(0, 0).write_u32(&[RED; 4]);
+    let pages = || texture.lock_rect(0, D3DLOCK_READONLY).bits_ptr();
+    assert_eq!(h.set_texture(0, &texture), 0, "SetTexture");
+    h.select_texture_stage(0);
+    point_clamp(&h);
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1), 0);
+    assert_eq!(h.begin_scene(), 0, "BeginScene");
+    assert_eq!(h.update_texture_hr(&source, &texture), 0, "whole copy");
+    let first = pages();
+    source
+        .lock_rect_partial(0, &[0, 0, 1, 1], 0)
+        .write_u32(&[GREEN]);
+    assert_eq!(
+        h.update_texture_hr(&source, &texture),
+        0,
+        "first partial copy"
+    );
+    assert_eq!(
+        pages(),
+        first,
+        "a partial copy with no GPU use since the pending upload lands in place"
+    );
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &fullscreen_quad()),
+        0,
+        "sampling draw"
+    );
+    source
+        .lock_rect_partial(0, &[1, 1, 2, 2], 0)
+        .write_u32(&[BLUE]);
+    assert_eq!(
+        h.update_texture_hr(&source, &texture),
+        0,
+        "second partial copy"
+    );
+    assert_ne!(
+        pages(),
+        first,
+        "a partial copy after a draw sampled the level moves to fresh pages"
+    );
+    assert_eq!(h.end_scene(), 0, "EndScene");
+    assert_eq!(h.present(), 0, "Present");
+    assert_eq!(
+        [
+            sample_at(&h, &texture, 160, 120).to_pixel(),
+            sample_at(&h, &texture, 480, 120).to_pixel(),
+            sample_at(&h, &texture, 480, 360).to_pixel(),
+        ],
+        [GREEN, RED, BLUE],
+        "the level after the three copies"
+    );
+}
+
+/// A partial copy, a draw, another partial copy and a draw each sample their own version.
+///
+/// The first partial copy lands in place over the whole copy's pending
+/// upload, which no draw has sampled; the second follows a draw that did and
+/// moves to fresh pages carrying the first copy's texels.
+#[test]
+fn intra_frame_partial_update_texture_keeps_per_draw_content() {
+    const RED: u32 = 0xFFFF_0000;
+    const GREEN: u32 = 0xFF00_FF00;
+    const BLUE: u32 = 0xFF00_00FF;
+    let h = Harness::new();
+    let texture = h.create_texture(2, 2, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT);
+    let source = h.create_texture(2, 2, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM);
+    source.lock_rect(0, 0).write_u32(&[RED; 4]);
+    assert_eq!(h.update_texture_hr(&source, &texture), 0, "whole copy");
+    source
+        .lock_rect_partial(0, &[0, 0, 1, 1], 0)
+        .write_u32(&[GREEN]);
+    assert_eq!(
+        h.update_texture_hr(&source, &texture),
+        0,
+        "first partial copy"
+    );
+    draws_bracketing(&h, &texture, |d| {
+        source
+            .lock_rect_partial(0, &[1, 1, 2, 2], 0)
+            .write_u32(&[BLUE]);
+        assert_eq!(
+            d.update_texture_hr(&source, &texture),
+            0,
+            "second partial copy"
+        );
+    });
+    assert_eq!(
+        [
+            h.read_pixel(80, 120),
+            h.read_pixel(240, 360),
+            h.read_pixel(400, 120),
+            h.read_pixel(560, 360),
+        ],
+        [GREEN, RED, GREEN, BLUE],
+        "left draw before the second partial copy, right draw after it"
+    );
+}
+
 /// A same-format `UpdateTexture` between two draws leaves the first draw its texels.
 ///
 /// Each update schedules its upload at once, so both uploads of the level sit

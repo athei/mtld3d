@@ -200,7 +200,10 @@ is in [`CONFORMANCE.md`](../unix/conformance/CONFORMANCE.md#kept-divergences).
 - A partial `LockRect` of a texture level without `D3DLOCK_NOOVERWRITE` or
   `D3DLOCK_READONLY` returns a pointer an upload may still read. Every other
   CPU writer of a texture level renames its staging when an upload still reads
-  it, so only the partial lock writes in place. No knob.
+  it and a draw or other GPU operation on the texture was recorded after that
+  upload, so only the partial lock writes in place under an upload something
+  has seen. Back-to-back writes with no GPU use between stay in place, which no
+  draw can tell apart. No knob.
 - A DEFAULT-pool `D3DUSAGE_WRITEONLY` static buffer keeps no CPU copy once
   uploaded, so a read through the lock pointer sees zeros.
   `buffer.ignoreLockBounds` keeps the copy.

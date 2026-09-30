@@ -298,6 +298,16 @@ pub struct TextureInner {
     /// `ReleaseDC` keeps whatever GDI drew in them, so the level holds its
     /// staging for as long as the DC does, exactly as a `LockRect` does.
     dc_open: u32,
+    /// Subresources whose pending uploads a GPU operation recorded later may see.
+    ///
+    /// Bit `face * levels + level` for a cube, bit `level` otherwise.
+    /// [`Self::note_gpu_use`] sets every bit wherever a GPU operation on the
+    /// texture is recorded, after it flushes the texture's dirty levels. A CPU
+    /// write clears its subresource's bit once it lands on pages no upload
+    /// reads, fresh or renamed. So a clear bit over pages uploads still read
+    /// means no GPU operation on the texture was recorded since those uploads
+    /// were scheduled, and a write may land in place.
+    observed_staging: u128,
     /// Which copy of each subresource holds the pixels it is defined by.
     ///
     /// A subresource moves to the GPU when it is written there with no CPU
@@ -2294,7 +2304,7 @@ impl TextureInner {
         if let Some(face) = face {
             let index = self.cube_subresource_index(face, level)?;
             self.cube.as_deref()?.staging.get(index)?;
-            self.prepare_staging_write(face, level, false);
+            self.prepare_staging_read_back(face, level, false);
             let page = self.cube.as_deref()?.staging.get(index)?;
             return Some((page.as_ptr() as u64, page.len() as u64, bytes_per_row));
         }
@@ -2302,7 +2312,7 @@ impl TextureInner {
             return None;
         }
         self.ensure_staging(level);
-        self.prepare_staging_write(0, level, false);
+        self.prepare_staging_read_back(0, level, false);
         Some((
             self.staging[level].as_ptr() as u64,
             self.staging[level].len() as u64,
@@ -2484,35 +2494,108 @@ impl TextureInner {
     /// Move a subresource's staging off pages an upload still reads, ahead of a CPU write.
     ///
     /// Every upload scheduled for the subresource holds a read of its pages
-    /// until it retires, and a replay reads them again, so a write into them
-    /// would reach that upload and the draws it serves. With a reader the
-    /// write goes to fresh pages instead: bare for a write covering the whole
-    /// level, carrying the rest of the level for a partial one. Without one it
-    /// lands in place at no extra cost. For a volume level, whole means every
-    /// depth slice of it. A subresource the game holds mapped, through a
-    /// `LockRect` or a device context, is written in place as well: its
-    /// pointer aliases the current pages, and what the game writes through it
-    /// has to land in the pages the unmap publishes. `face` is a cube face
-    /// index and zero for every other texture kind.
+    /// until it retires, and a replay reads them again. The write moves to
+    /// fresh pages when a GPU operation on the texture was recorded after one
+    /// of those uploads (see `observed_staging`): that operation has to see
+    /// the bytes the upload was scheduled with. The fresh pages are bare for a
+    /// write covering the whole level and carry the rest of the level for a
+    /// partial one; for a volume level, whole means every depth slice.
+    ///
+    /// With no GPU operation since, the write lands in place: nothing recorded
+    /// can see the pages between the pending uploads and this write, and each
+    /// pending upload then reads the newest bytes. A replay racing the write
+    /// can read a mix only inside the rectangle the write dirties, and the
+    /// upload of that rectangle lands before the next GPU operation on the
+    /// texture, since every one of them flushes the texture's dirty levels
+    /// first. A subresource the game holds mapped, through a `LockRect` or a
+    /// device context, is written in place too: its pointer aliases the
+    /// current pages, and what the game writes through it has to land in the
+    /// pages the unmap publishes. `face` is a cube face index and zero for
+    /// every other texture kind.
     fn prepare_staging_write(&mut self, face: u32, level: usize, whole_level: bool) {
+        self.move_staging_off_readers(face, level, whole_level, false);
+    }
+
+    /// [`Self::prepare_staging_write`] for a read back into the subresource from the GPU.
+    ///
+    /// A read back renames staging an upload still reads whether or not a GPU
+    /// operation was recorded since: it is itself one, and its copy runs on the
+    /// GPU while an earlier submission's upload may still read the pages.
+    fn prepare_staging_read_back(&mut self, face: u32, level: usize, whole_level: bool) {
+        self.move_staging_off_readers(face, level, whole_level, true);
+    }
+
+    /// The bit `observed_staging` keeps for one subresource.
+    ///
+    /// Zero for a subresource past the mask, which the callers read as seen.
+    fn observed_bit(&self, face: u32, level: usize) -> u128 {
+        let index = if self.cube.is_some() {
+            self.cube_subresource_index(face, level)
+        } else {
+            Some(level)
+        };
+        index
+            .and_then(|index| u32::try_from(index).ok())
+            .and_then(|index| 1u128.checked_shl(index))
+            .unwrap_or(0)
+    }
+
+    /// Record that a GPU operation on this texture follows every upload scheduled so far.
+    ///
+    /// Called where a draw's stage walk, a vertex texture bind, a `StretchRect`
+    /// or `ColorFill` endpoint, a read of the texture back, a depth resolve
+    /// into it or a mip generation flushes its dirty levels. One store: every
+    /// subresource is marked, since the operation may read any of them.
+    pub const fn note_gpu_use(&mut self) {
+        self.observed_staging = u128::MAX;
+    }
+
+    fn move_staging_off_readers(
+        &mut self,
+        face: u32,
+        level: usize,
+        whole_level: bool,
+        always: bool,
+    ) {
         if self.dc_in_use() {
             return;
         }
-        let has_readers = match self.cube.as_deref() {
-            Some(cube) => self
-                .cube_subresource_index(face, level)
-                .filter(|&index| !cube.locked.get(index).copied().unwrap_or(false))
-                .and_then(|index| cube.staging.get(index))
-                .is_some_and(|staging| staging.has_readers()),
-            None => {
-                !self.locked.get(level).copied().unwrap_or(false)
-                    && self
-                        .staging
-                        .get(level)
-                        .is_some_and(|staging| staging.has_readers())
+        let (mapped, has_readers) = match self.cube.as_deref() {
+            Some(cube) => {
+                let Some(index) = self.cube_subresource_index(face, level) else {
+                    return;
+                };
+                (
+                    cube.locked.get(index).copied().unwrap_or(false),
+                    cube.staging
+                        .get(index)
+                        .is_some_and(|staging| staging.has_readers()),
+                )
             }
+            None => (
+                self.locked.get(level).copied().unwrap_or(false),
+                self.staging
+                    .get(level)
+                    .is_some_and(|staging| staging.has_readers()),
+            ),
         };
+        if mapped {
+            return;
+        }
+        let bit = self.observed_bit(face, level);
         if !has_readers {
+            // Nothing reads these pages, so the next GPU use is the first
+            // that can see what lands in them.
+            self.observed_staging &= !bit;
+            return;
+        }
+        // A render target or depth texture is read and written by the passes
+        // it is attached to, which no stage walk records, so its pending
+        // uploads always count as seen.
+        let attached = self.d3d_usage
+            & (mtld3d_types::D3DUSAGE_RENDERTARGET | mtld3d_types::D3DUSAGE_DEPTHSTENCIL)
+            != 0;
+        if !(always || attached || bit == 0 || self.observed_staging & bit != 0) {
             return;
         }
         let preserve = if whole_level {
@@ -2525,6 +2608,7 @@ impl TextureInner {
         } else {
             self.rename_staging(level, preserve);
         }
+        self.observed_staging &= !bit;
     }
 
     fn cube_stash_lock(
@@ -3210,6 +3294,7 @@ fn build_texture_inner(info: TextureCreateInfo) -> *mut TextureInner {
         staging_coverage: Vec::new(),
         upload_generation: Vec::new(),
         dc_open: 0,
+        observed_staging: 0,
         level_authority: LevelAuthorityMask::new(),
         mip_widths: info.mip_widths,
         mip_heights: info.mip_heights,
@@ -3825,6 +3910,7 @@ extern "system" fn texture_generate_mip_sub_levels(this: *mut c_void) {
     // a second time.
     let upload_regenerates = ti.dirty_mask & 1 != 0 && !ti.is_cpu_only();
     flush_dirty_mips(ti, dev);
+    ti.note_gpu_use();
     if upload_regenerates {
         return;
     }
@@ -3958,7 +4044,7 @@ fn materialize_subresource_from_gpu(ti: &mut TextureInner, face: u32, level: usi
     // covers one slice, so the rest of that level is carried over.
     if mtld3d_core::depth_texture::PackedDepth::from_d3d(ti.d3d_format).is_none() {
         let whole = !ti.flags.contains(TextureFlags::VOLUME_TEXTURE);
-        ti.prepare_staging_write(face, level, whole);
+        ti.prepare_staging_read_back(face, level, whole);
     }
     let Some((dst_ptr, dst_len)) = ti.subresource_staging_backing(face, level) else {
         mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
