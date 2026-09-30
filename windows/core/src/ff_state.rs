@@ -489,13 +489,22 @@ impl FfState {
     ///
     /// Copied field by field: a whole-struct assignment of the 68-byte value
     /// compiles to a CRT `memmove` call on i686, the fields to plain stores.
+    /// The exhaustive pattern makes a field added to the type fail to compile
+    /// here rather than go uncopied.
     #[inline]
     pub const fn set_material(&mut self, m: &D3DMATERIAL9) {
-        self.material.diffuse = m.diffuse;
-        self.material.ambient = m.ambient;
-        self.material.specular = m.specular;
-        self.material.emissive = m.emissive;
-        self.material.power = m.power;
+        let D3DMATERIAL9 {
+            diffuse,
+            ambient,
+            specular,
+            emissive,
+            power,
+        } = m;
+        self.material.diffuse = *diffuse;
+        self.material.ambient = *ambient;
+        self.material.specular = *specular;
+        self.material.emissive = *emissive;
+        self.material.power = *power;
         self.ff_vs_dirty = self.ff_vs_dirty.union(FfVsDirty::MATERIAL);
     }
 
