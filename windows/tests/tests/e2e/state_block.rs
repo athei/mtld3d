@@ -1,12 +1,12 @@
 //! State-block capture/apply round-trip.
 
-use mtld3d_tests::{Harness, PosColorVertex, VertexDeclaration, assert_pixel_eq};
+use mtld3d_tests::{Harness, LitVertex, PosColorVertex, VertexDeclaration, assert_pixel_eq};
 use mtld3d_types::{
-    D3D_OK, D3DCULL_NONE, D3DERR_INVALIDCALL, D3DFMT_A8R8G8B8, D3DFVF_DIFFUSE, D3DFVF_XYZ,
-    D3DLIGHT_DIRECTIONAL, D3DLIGHT9, D3DPOOL_MANAGED, D3DPT_TRIANGLELIST, D3DRECT,
-    D3DRS_ALPHABLENDENABLE, D3DRS_CULLMODE, D3DRS_LIGHTING, D3DRS_SCISSORTESTENABLE,
-    D3DSAMP_DMAPOFFSET, D3DSAMP_MINFILTER, D3DSBT_ALL, D3DSBT_PIXELSTATE, D3DSBT_VERTEXSTATE,
-    D3DTEXF_LINEAR, D3DTEXF_POINT, D3DVIEWPORT9,
+    D3D_OK, D3DCOLORVALUE, D3DCULL_NONE, D3DERR_INVALIDCALL, D3DFMT_A8R8G8B8, D3DFVF_DIFFUSE,
+    D3DFVF_NORMAL, D3DFVF_XYZ, D3DLIGHT_DIRECTIONAL, D3DLIGHT9, D3DMATERIAL9, D3DPOOL_MANAGED,
+    D3DPT_TRIANGLELIST, D3DPT_TRIANGLESTRIP, D3DRECT, D3DRS_ALPHABLENDENABLE, D3DRS_CULLMODE,
+    D3DRS_LIGHTING, D3DRS_SCISSORTESTENABLE, D3DSAMP_DMAPOFFSET, D3DSAMP_MINFILTER, D3DSBT_ALL,
+    D3DSBT_PIXELSTATE, D3DSBT_VERTEXSTATE, D3DTEXF_LINEAR, D3DTEXF_POINT, D3DVECTOR, D3DVIEWPORT9,
 };
 
 const BLUE: u32 = 0xFF00_00FF;
@@ -629,5 +629,100 @@ fn begin_end_state_block_records_changes() {
         h.render_state(D3DRS_LIGHTING),
         0,
         "recorded LIGHTING=0 replayed"
+    );
+}
+
+/// A full-screen lit quad facing the viewer.
+fn facing_quad() -> [LitVertex; 4] {
+    [(-1.0, 1.0), (-1.0, -1.0), (1.0, 1.0), (1.0, -1.0)].map(|(x, y)| LitVertex {
+        x,
+        y,
+        z: 0.5,
+        nx: 0.0,
+        ny: 0.0,
+        nz: -1.0,
+    })
+}
+
+const fn colour(r: f32, g: f32, b: f32) -> D3DCOLORVALUE {
+    D3DCOLORVALUE { r, g, b, a: 1.0 }
+}
+
+/// A material of `diffuse` alone.
+fn diffuse_material(diffuse: D3DCOLORVALUE) -> D3DMATERIAL9 {
+    D3DMATERIAL9 {
+        diffuse,
+        ..D3DMATERIAL9::default()
+    }
+}
+
+/// A directional light of `diffuse` shining down +z, onto the quad's face.
+fn frontal_light(diffuse: D3DCOLORVALUE) -> D3DLIGHT9 {
+    D3DLIGHT9 {
+        type_: D3DLIGHT_DIRECTIONAL,
+        diffuse,
+        direction: D3DVECTOR {
+            x: 0.0,
+            y: 0.0,
+            z: 1.0,
+        },
+        ..D3DLIGHT9::default()
+    }
+}
+
+/// Draw the lit quad in a frame of its own and return the centre pixel's `(r, g, b)`.
+fn draw_lit(h: &Harness) -> (u32, u32, u32) {
+    h.render_once(BLUE, |d| {
+        assert_eq!(
+            d.draw_primitive_up(D3DPT_TRIANGLESTRIP, 2, &facing_quad()),
+            0
+        );
+    });
+    let px = h.read_pixel(320, 240);
+    ((px >> 16) & 0xff, (px >> 8) & 0xff, px & 0xff)
+}
+
+#[test]
+fn applied_blocks_restore_the_fixed_function_lights_and_material_a_draw_reads() {
+    // Apply writes the captured lights and material straight into the device
+    // state. A draw after it must light with the restored values, not with the
+    // ones the previous draw uploaded.
+    let h = Harness::new();
+    assert_eq!(h.set_render_state(D3DRS_LIGHTING, 1), 0);
+    assert_eq!(h.set_render_state(D3DRS_CULLMODE, D3DCULL_NONE), 0);
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_NORMAL), 0);
+    h.select_diffuse_stage(0);
+    assert_eq!(h.set_material(&diffuse_material(colour(1.0, 1.0, 1.0))), 0);
+    assert_eq!(h.set_light(0, &frontal_light(colour(1.0, 0.0, 0.0))), 0);
+    assert_eq!(h.light_enable(0, true), 0);
+
+    // VERTEXSTATE carries the lights.
+    let vertex = h.create_state_block(D3DSBT_VERTEXSTATE);
+    assert_eq!(h.set_light(0, &frontal_light(colour(0.0, 1.0, 0.0))), 0);
+    let (r, g, b) = draw_lit(&h);
+    assert!(
+        r <= 2 && g >= 0xF0 && b <= 2,
+        "live green light, got ({r}, {g}, {b})"
+    );
+    assert_eq!(vertex.apply(), 0, "Apply VERTEXSTATE");
+    let (r, g, b) = draw_lit(&h);
+    assert!(
+        r >= 0xF0 && g <= 2 && b <= 2,
+        "VERTEXSTATE restored the red light, got ({r}, {g}, {b})"
+    );
+
+    // ALL carries the material too.
+    let all = h.create_state_block(D3DSBT_ALL);
+    assert_eq!(h.set_material(&diffuse_material(colour(0.5, 0.0, 0.0))), 0);
+    let (r, g, b) = draw_lit(&h);
+    assert!(
+        r.abs_diff(0x80) <= 2 && g <= 2 && b <= 2,
+        "live half-red material, got ({r}, {g}, {b})"
+    );
+    assert_eq!(all.apply(), 0, "Apply ALL");
+    let (r, g, b) = draw_lit(&h);
+    assert!(
+        r >= 0xF0 && g <= 2 && b <= 2,
+        "ALL restored the white material, got ({r}, {g}, {b})"
     );
 }

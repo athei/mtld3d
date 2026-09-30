@@ -2466,6 +2466,9 @@ impl FfStateSnapshot {
         ff.light_spot_mask = self.light_spot_mask;
         ff.texture_stage_states = self.texture_stage_states;
         ff.recompute_tt_active_mask();
+        // The arrays were written past the setters, so the constant sections
+        // they feed are marked here; every section reads something restored.
+        ff.ff_vs_dirty |= FfVsDirty::all();
     }
 
     /// Restore only the fixed-function state a `block_type` state block owns.
@@ -2527,6 +2530,15 @@ impl FfStateSnapshot {
             }
         }
         ff.recompute_tt_active_mask();
+        // The fields were written past the setters, so the constant sections
+        // they feed are marked here: the stage states can move the TT extent
+        // for every block type, the lights feed LIGHTS for a vertex block, and
+        // an ALL block rewrites every matrix and the material as well.
+        ff.ff_vs_dirty |= match block_type {
+            StateBlockType::All => FfVsDirty::all(),
+            StateBlockType::Vertex => FfVsDirty::LIGHTS | FfVsDirty::TT,
+            StateBlockType::Pixel => FfVsDirty::TT,
+        };
     }
 }
 

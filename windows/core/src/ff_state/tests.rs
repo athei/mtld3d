@@ -1316,6 +1316,42 @@ fn assert_overflow_write_marks_lights(name: &str, write: fn(&mut FfState)) {
     );
 }
 
+#[test]
+fn state_block_restores_mark_the_sections_they_write() {
+    use mtld3d_types::{D3DMATERIAL9, D3DTS_PROJECTION, StateBlockType};
+
+    use super::{FfStateSnapshot, FfVsDirty};
+    // A restore writes the arrays directly, past the setters and their marks,
+    // so the encoder mirror only learns of the restored values if the restore
+    // marks the sections itself.
+    let snapshot = FfStateSnapshot::from(&FfState::new());
+    let cases = [
+        (StateBlockType::All, FfVsDirty::all()),
+        (StateBlockType::Vertex, FfVsDirty::LIGHTS | FfVsDirty::TT),
+        (StateBlockType::Pixel, FfVsDirty::TT),
+    ];
+    for (block_type, expected) in cases {
+        let mut state = FfState::new();
+        state.set_transform(D3DTS_PROJECTION, &D3DMATRIX::IDENTITY);
+        state.set_material(&D3DMATERIAL9::default());
+        let _ = state.take_ff_vs_dirty();
+        snapshot.restore_filtered(&mut state, block_type);
+        assert_eq!(
+            state.take_ff_vs_dirty(),
+            expected,
+            "{block_type:?} restore marked the wrong sections"
+        );
+    }
+    let mut state = FfState::new();
+    let _ = state.take_ff_vs_dirty();
+    snapshot.restore_into(&mut state);
+    assert_eq!(
+        state.take_ff_vs_dirty(),
+        FfVsDirty::all(),
+        "restore_into marked the wrong sections"
+    );
+}
+
 mod inverse {
     use mtld3d_types::D3DMATRIX;
 
