@@ -647,7 +647,12 @@ const MIP_TINTS: [u32; 7] = [
 ///
 /// Reading back the drawn pixel therefore names the level the sampler picked.
 fn mip_tinted_texture(h: &Harness) -> Texture<'_> {
-    let tex = h.create_texture(MIP_TEX_DIM, MIP_TEX_DIM, 0, 0, D3DFMT_A8R8G8B8, 0);
+    mip_tinted_texture_in(h, 0)
+}
+
+/// [`mip_tinted_texture`] created in `pool`.
+fn mip_tinted_texture_in(h: &Harness, pool: u32) -> Texture<'_> {
+    let tex = h.create_texture(MIP_TEX_DIM, MIP_TEX_DIM, 0, 0, D3DFMT_A8R8G8B8, pool);
     assert_eq!(
         usize::try_from(tex.level_count()).expect("level count fits usize"),
         MIP_TINTS.len(),
@@ -782,6 +787,61 @@ fn out_of_range_max_mip_level_samples_the_smallest_level() {
         sample_at_max_mip_level(&h, 0x0001_0000),
         MIP_TINTS[MIP_TINTS.len() - 1],
         "an out-of-range MAXMIPLEVEL samples the smallest level"
+    );
+}
+
+/// [`texel_to_pixel_quad`] moved `dx` backbuffer pixels to the right.
+fn texel_to_pixel_quad_at(dx: u32) -> [TexturedVertex; 6] {
+    let shift = 2.0 * f32::from(u16::try_from(dx).expect("shift fits u16")) / 640.0;
+    texel_to_pixel_quad().map(|v| TexturedVertex {
+        x: v.x + shift,
+        ..v
+    })
+}
+
+#[test]
+fn set_lod_on_a_bound_texture_reaches_the_next_draw_of_the_frame() {
+    use mtld3d_types::D3DPOOL_MANAGED;
+
+    // `SetLOD` on a managed texture raises the most detailed level the sampler
+    // may use, like `D3DSAMP_MAXMIPLEVEL` does for the stage. It is texture
+    // state, not device state, so nothing but the texture changes when it is
+    // called on a texture already bound: two draws of one frame around it,
+    // with no other call between them, must sample the old level and then the
+    // new one.
+    const RIGHT: u32 = 2 * MIP_TEX_DIM;
+    let h = Harness::new();
+    let tex = mip_tinted_texture_in(&h, D3DPOOL_MANAGED);
+    arm_mip_tinted(&h, &tex);
+    let left = texel_to_pixel_quad();
+    let right = texel_to_pixel_quad_at(RIGHT);
+
+    // Control: a LOD set before the frame applies to its draw.
+    assert_eq!(tex.set_lod(2), 0, "SetLOD(2) returns the previous LOD");
+    h.render_once(BLACK, |d| {
+        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &left), 0);
+    });
+    assert_eq!(
+        h.read_pixel(MIP_TEX_DIM / 2, MIP_TEX_DIM / 2),
+        MIP_TINTS[2],
+        "a LOD set before the frame pins its draw to level 2"
+    );
+    assert_eq!(tex.set_lod(0), 2, "SetLOD(0) returns the previous LOD");
+
+    h.render_once(BLACK, |d| {
+        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &left), 0);
+        assert_eq!(tex.set_lod(2), 0, "SetLOD(2) returns the previous LOD");
+        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &right), 0);
+    });
+    assert_eq!(
+        h.read_pixel(MIP_TEX_DIM / 2, MIP_TEX_DIM / 2),
+        MIP_TINTS[0],
+        "the draw before SetLOD samples the base level"
+    );
+    assert_eq!(
+        h.read_pixel(RIGHT + MIP_TEX_DIM / 2, MIP_TEX_DIM / 2),
+        MIP_TINTS[2],
+        "the draw after SetLOD on the bound texture samples level 2"
     );
 }
 
