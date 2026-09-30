@@ -393,6 +393,12 @@ pub struct DeviceInner {
     /// only its own `AddRef`s. Released when `DeviceInner` drops (`HashMap`
     /// value `Drop` runs `K::on_drop`).
     fvf_decl_cache: rustc_hash::FxHashMap<u32, CachedComPtr<Direct3DVertexDeclaration9, Bound>>,
+    /// The FVF `bind_fvf_decl` last bound, with its implicit declaration from `fvf_decl_cache`.
+    ///
+    /// Only compared against the bound pointer, never dereferenced. The cache
+    /// holds every entry until the device drops, so no other declaration can
+    /// take this address while the pair names it.
+    last_fvf_bind: (u32, *mut Direct3DVertexDeclaration9),
     /// `IDirect3D9`* that created this device.
     ///
     /// Kept so `GetDirect3D` can hand back the parent interface (with
@@ -1183,13 +1189,42 @@ impl DeviceInner {
     /// declaration (the most-recent of `SetFVF` / `SetVertexDeclaration`
     /// wins). `fvf == 0` is a no-op on the binding, matching the driver.
     /// Returns whether the bound declaration changed (callers gate snapshot
-    /// dirtying on this).
+    /// dirtying on this). A call that would change nothing returns before the
+    /// cache lookup (see [`Self::fvf_bind_is_redundant`]).
+    #[inline]
     pub fn bind_fvf_decl(&mut self, fvf: u32) -> bool {
-        if fvf == 0 {
+        if fvf == 0 || self.fvf_bind_is_redundant(fvf) {
             return false;
         }
+        self.bind_fvf_decl_uncached(fvf)
+    }
+
+    /// Whether binding `fvf` would leave the FVF field and the bound declaration as they are.
+    ///
+    /// True exactly when the FVF field already reads `fvf` and the bound
+    /// declaration is `fvf`'s implicit one. The field alone does not say
+    /// that: a state-block apply writes it without binding a declaration
+    /// and restores a declaration without writing it, so the bound pointer is
+    /// compared too, against the one `bind_fvf_decl` last bound for
+    /// `last_fvf_bind`'s FVF. Each FVF has one cached declaration, so a match
+    /// on both halves is the pair the cache lookup would produce, and every
+    /// dirty mark the caller gates on a change would be skipped anyway.
+    #[inline]
+    fn fvf_bind_is_redundant(&self, fvf: u32) -> bool {
+        let (bound_fvf, bound_decl) = self.last_fvf_bind;
+        self.fvf == fvf && bound_fvf == fvf && self.vertex_decl.raw() == bound_decl
+    }
+
+    /// The [`Self::bind_fvf_decl`] path that looks the declaration up and binds it.
+    #[inline(never)]
+    fn bind_fvf_decl_uncached(&mut self, fvf: u32) -> bool {
         let decl = self.get_or_create_fvf_decl(fvf);
         self.fvf = fvf;
+        self.last_fvf_bind = if decl.is_null() {
+            (0, core::ptr::null_mut())
+        } else {
+            (fvf, decl)
+        };
         self.replace_vertex_decl(decl)
     }
 
@@ -2978,6 +3013,7 @@ impl Direct3DDevice9 {
             fvf: 0,
             vertex_decl: CachedComPtr::null(),
             fvf_decl_cache: rustc_hash::FxHashMap::default(),
+            last_fvf_bind: (0, core::ptr::null_mut()),
             direct3d: info.direct3d,
             device_wrapper: 0,
             creation_adapter: info.creation_adapter,
@@ -12237,7 +12273,9 @@ extern "system" fn device_set_fvf(this: *mut c_void, fvf: u32) -> i32 {
     // A non-zero FVF binds its implicit declaration so GetVertexDeclaration
     // returns it and the draw path resolves the same layout it would from the
     // FVF directly. Redundant-set elimination: re-binding the same cached decl
-    // changes nothing, so skip the VDECL rebuild.
+    // changes nothing, so skip the VDECL rebuild; `bind_fvf_decl` answers
+    // that without the cache lookup when the FVF and its declaration are
+    // already bound.
     let changed = dev.bind_fvf_decl(fvf);
     if changed {
         // VS_SOURCE is marked unconditionally (not via `ff_aware_mask`, which

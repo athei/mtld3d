@@ -2,13 +2,14 @@
 //!
 //! Create, bind, drive a fixed-function draw, and read the bound
 //! declaration back; a declaration split across two streams, including a
-//! stream nothing is bound to.
+//! stream nothing is bound to; `SetFVF` of the FVF already set binding its
+//! declaration again after another one replaced it.
 
-use mtld3d_tests::{Harness, PosColorVertex, PosVertex};
+use mtld3d_tests::{Harness, PosColorVertex, PosVertex, VertexDeclaration};
 use mtld3d_types::{
     D3D_OK, D3DDECL_END_STREAM, D3DDECLTYPE_D3DCOLOR, D3DDECLTYPE_FLOAT3, D3DDECLTYPE_UNUSED,
-    D3DDECLUSAGE_COLOR, D3DDECLUSAGE_NORMAL, D3DDECLUSAGE_POSITION, D3DPOOL_DEFAULT,
-    D3DPT_TRIANGLELIST, D3DRS_LIGHTING, D3DUSAGE_WRITEONLY, D3DVERTEXELEMENT9,
+    D3DDECLUSAGE_COLOR, D3DDECLUSAGE_NORMAL, D3DDECLUSAGE_POSITION, D3DFVF_DIFFUSE, D3DFVF_XYZ,
+    D3DPOOL_DEFAULT, D3DPT_TRIANGLELIST, D3DRS_LIGHTING, D3DUSAGE_WRITEONLY, D3DVERTEXELEMENT9,
 };
 
 /// POSITION float3 on stream 0, COLOR d3dcolor on stream 1.
@@ -307,4 +308,131 @@ fn unbound_declared_stream_reads_zeros() {
         );
     });
     assert_eq!(h.read_pixel(320, 280), BLACK, "UP draw reads zeros too");
+}
+
+/// POSITION float3 on stream 0 and nothing else, terminated by `D3DDECL_END`.
+const fn position_only_decl() -> [D3DVERTEXELEMENT9; 2] {
+    [
+        D3DVERTEXELEMENT9 {
+            stream: 0,
+            offset: 0,
+            type_: D3DDECLTYPE_FLOAT3,
+            method: 0,
+            usage: D3DDECLUSAGE_POSITION,
+            usage_index: 0,
+        },
+        D3DVERTEXELEMENT9 {
+            stream: D3DDECL_END_STREAM,
+            offset: 0,
+            type_: D3DDECLTYPE_UNUSED,
+            method: 0,
+            usage: 0,
+            usage_index: 0,
+        },
+    ]
+}
+
+/// Draw a green triangle through the bound vertex format and read its centre.
+///
+/// The vertices carry a diffuse colour, so only a format that declares it
+/// draws green; the position-only declaration leaves the colour at its
+/// default.
+fn draw_green_through_bound_format(h: &Harness) -> u32 {
+    const GREEN: u32 = 0xFF00_FF00;
+    const BLUE: u32 = 0xFF00_00FF;
+
+    assert_eq!(h.set_render_state(D3DRS_LIGHTING, 0), 0, "lighting off");
+    assert_eq!(h.clear_texture(0), 0, "no texture");
+    h.select_diffuse_stage(0);
+    let tri = centered_positions().map(|p| PosColorVertex {
+        x: p.x,
+        y: p.y,
+        z: p.z,
+        color: GREEN,
+    });
+    h.render_once(BLUE, |d| {
+        assert_eq!(
+            d.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &tri),
+            D3D_OK,
+            "draw through the bound format"
+        );
+    });
+    h.read_pixel(320, 280)
+}
+
+/// `SetFVF` of the FVF set before a `SetVertexDeclaration` binds the FVF's declaration again.
+///
+/// The FVF-to-declaration step can return early for an FVF that is already
+/// bound; the declaration bound in between has to defeat that.
+#[test]
+fn set_fvf_rebinds_its_declaration_after_set_vertex_declaration() {
+    const FVF: u32 = D3DFVF_XYZ | D3DFVF_DIFFUSE;
+
+    let h = Harness::new();
+    assert_eq!(h.set_fvf(FVF), D3D_OK, "first SetFVF");
+    let implicit = VertexDeclaration::from_raw(h.vertex_declaration_raw());
+    let position_only = h.create_vertex_declaration(&position_only_decl());
+    assert_eq!(
+        h.set_vertex_declaration(&position_only),
+        D3D_OK,
+        "SetVertexDeclaration"
+    );
+    assert_eq!(h.fvf(), 0, "a bound declaration clears the FVF");
+
+    assert_eq!(h.set_fvf(FVF), D3D_OK, "second SetFVF");
+    assert_eq!(h.fvf(), FVF, "GetFVF after the second SetFVF");
+    let rebound = VertexDeclaration::from_raw(h.vertex_declaration_raw());
+    assert_eq!(
+        rebound.as_ptr(),
+        implicit.as_ptr(),
+        "the second SetFVF binds the FVF's declaration again"
+    );
+    assert_eq!(
+        draw_green_through_bound_format(&h),
+        0xFF00_FF00,
+        "the draw reads the diffuse the FVF declares"
+    );
+}
+
+/// `SetFVF` of the FVF the device reports binds its declaration again after a block replaced it.
+///
+/// A recorded `SetVertexDeclaration` applied over an FVF binds its
+/// declaration without clearing the FVF the device reports, so the FVF on
+/// its own does not say whether its declaration is still the bound one.
+#[test]
+fn set_fvf_rebinds_its_declaration_after_a_recorded_block_bound_another() {
+    const FVF: u32 = D3DFVF_XYZ | D3DFVF_DIFFUSE;
+
+    let h = Harness::new();
+    let position_only = h.create_vertex_declaration(&position_only_decl());
+    assert_eq!(h.begin_state_block(), D3D_OK, "BeginStateBlock");
+    assert_eq!(
+        h.set_vertex_declaration(&position_only),
+        D3D_OK,
+        "record SetVertexDeclaration"
+    );
+    let block = h.end_state_block();
+
+    assert_eq!(h.set_fvf(FVF), D3D_OK, "first SetFVF");
+    let implicit = VertexDeclaration::from_raw(h.vertex_declaration_raw());
+    assert_eq!(block.apply(), D3D_OK, "Apply the recorded declaration");
+    let applied = VertexDeclaration::from_raw(h.vertex_declaration_raw());
+    assert_eq!(
+        applied.as_ptr(),
+        position_only.as_ptr(),
+        "Apply binds the recorded declaration"
+    );
+
+    assert_eq!(h.set_fvf(FVF), D3D_OK, "second SetFVF");
+    let rebound = VertexDeclaration::from_raw(h.vertex_declaration_raw());
+    assert_eq!(
+        rebound.as_ptr(),
+        implicit.as_ptr(),
+        "the second SetFVF binds the FVF's declaration again"
+    );
+    assert_eq!(
+        draw_green_through_bound_format(&h),
+        0xFF00_FF00,
+        "the draw reads the diffuse the FVF declares"
+    );
 }
