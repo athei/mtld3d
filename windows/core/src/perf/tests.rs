@@ -473,6 +473,13 @@ fn summary_golden_layout() {
         "│  │  │  │  ├─ c_ff     0.02 ms   ( 200 ns/draw)      FF VS+PS const build  peak  0.02 ms\n",
         "│  │  │  │  ├─ c_pr     0.01 ms   ( 100 ns/draw)      programmable consts   peak  0.01 ms\n",
         "│  │  │  │  ├─ keys     0.02 ms   ( 200 ns/draw)      VDECL+RS+variant+srcs peak  0.02 ms\n",
+        "│  │  │  │  │  ├─ decl  0.00 ms   (   0 ns/draw)      attrs + FF VS layout  peak  0.00 ms\n",
+        "│  │  │  │  │  ├─ rs    0.01 ms   ( 100 ns/draw)      render-state struct   peak  0.01 ms\n",
+        "│  │  │  │  │  ├─ rtds  0.00 ms   (   0 ns/draw)      depth/stencil flags   peak  0.00 ms\n",
+        "│  │  │  │  │  ├─ var   0.00 ms   (   0 ns/draw)      pipeline variant key  peak  0.00 ms\n",
+        "│  │  │  │  │  ├─ vs    0.00 ms   (   0 ns/draw)      FF VS key / VS id     peak  0.00 ms\n",
+        "│  │  │  │  │  ├─ ps    0.00 ms   (   0 ns/draw)      FF PS key / PS id     peak  0.00 ms\n",
+        "│  │  │  │  │  └─ rest  0.01 ms   ( 100 ns/draw)      keys less its parts   peak  0.01 ms\n",
         "│  │  │  │  ├─ bumps    0.01 ms   ( 100 ns/draw)      scratch+cache+wrapper peak  0.01 ms\n",
         "│  │  │  │  └─ resid    0.01 ms   ( 100 ns/draw)      uninstrumented noise  peak  0.01 ms\n",
         "│  │  │  └─ push_op     0.02 ms   ( 200 ns/draw)      inline Op::Draw push  peak  0.02 ms\n",
@@ -603,6 +610,26 @@ fn summary_golden_layout() {
         "  SetPixelShader           0 / 0         (  0.0%)\n",
         "  SetVsConst               0 / 0         (  0.0%)\n",
         "  SetPsConst               0 / 0         (  0.0%)\n",
+        "\n",
+        "Snapshot rebuilds  draws that rebuilt each section, as a share of draw calls; ns per rebuild where `keys` times it, from 1 in 16 rebuilding draws\n",
+        "  any section             40 / 100       ( 40.0%)\n",
+        "  RS                      10             ( 10.0%)   1000 ns/rebuild\n",
+        "  STAGES                  30             ( 30.0%)\n",
+        "  RT_DS                    0             (  0.0%)\n",
+        "  VDECL                    0             (  0.0%)\n",
+        "  VARIANT                  0             (  0.0%)\n",
+        "  VS_SOURCE               20             ( 20.0%)      0 ns/rebuild\n",
+        "  PS_SOURCE               20             ( 20.0%)      0 ns/rebuild\n",
+        "  VS_CONST                25             ( 25.0%)\n",
+        "  PS_CONST                 0             (  0.0%)\n",
+        "  ALPHA_REF                0             (  0.0%)\n",
+        "  FOG_COLOR                0             (  0.0%)\n",
+        "  BUMP_ENV                 0             (  0.0%)\n",
+        "  VS_CONST_I               0             (  0.0%)\n",
+        "  VS_DRAW                  0             (  0.0%)\n",
+        "  VS_CONST_B               0             (  0.0%)\n",
+        "  PS_CONST_I               0             (  0.0%)\n",
+        "  PS_CONST_B               0             (  0.0%)\n",
         "inverse-view interval epoch=0 builds=0 bypass=0 hit=0 recompute=0 enabled-hit=n/a saturated=false\n",
         "\n",
         "Per-frame allocator footprint  scratch as small/oversized blocks; op_vec + cmd_vec each split into size + realloc\n",
@@ -666,7 +693,28 @@ fn kv_golden_line() {
         " draw_snapshot_c_pr_peak_ms=0.010 draw_snapshot_keys_ms=0.020",
         " draw_snapshot_keys_peak_ms=0.020 draw_snapshot_bumps_ms=0.010",
         " draw_snapshot_bumps_peak_ms=0.010 draw_snapshot_resid_ms=0.010",
-        " draw_snapshot_resid_peak_ms=0.010 draw_push_op_ms=0.020",
+        " draw_snapshot_resid_peak_ms=0.010",
+        " draw_snapshot_keys_vdecl_ms=0.000 draw_snapshot_keys_vdecl_peak_ms=0.000",
+        " draw_snapshot_keys_rs_ms=0.010 draw_snapshot_keys_rs_peak_ms=0.010",
+        " draw_snapshot_keys_rt_ds_ms=0.000 draw_snapshot_keys_rt_ds_peak_ms=0.000",
+        " draw_snapshot_keys_variant_ms=0.000 draw_snapshot_keys_variant_peak_ms=0.000",
+        " draw_snapshot_keys_vs_source_ms=0.000",
+        " draw_snapshot_keys_vs_source_peak_ms=0.000",
+        " draw_snapshot_keys_ps_source_ms=0.000",
+        " draw_snapshot_keys_ps_source_peak_ms=0.000 draw_snapshot_keys_resid_ms=0.010",
+        " draw_snapshot_keys_resid_peak_ms=0.010 draw_snapshot_rebuild_draws_total=40",
+        " draw_snapshot_sampled_draws_total=20",
+        " draw_snapshot_rebuild_rs_total=10 draw_snapshot_rebuild_stages_total=30",
+        " draw_snapshot_rebuild_rt_ds_total=0 draw_snapshot_rebuild_vdecl_total=0",
+        " draw_snapshot_rebuild_variant_total=0 draw_snapshot_rebuild_vs_source_total=20",
+        " draw_snapshot_rebuild_ps_source_total=20",
+        " draw_snapshot_rebuild_vs_const_total=25 draw_snapshot_rebuild_ps_const_total=0",
+        " draw_snapshot_rebuild_alpha_ref_total=0 draw_snapshot_rebuild_fog_color_total=0",
+        " draw_snapshot_rebuild_bump_env_total=0 draw_snapshot_rebuild_vs_const_i_total=0",
+        " draw_snapshot_rebuild_vs_draw_total=0 draw_snapshot_rebuild_vs_const_b_total=0",
+        " draw_snapshot_rebuild_ps_const_i_total=0",
+        " draw_snapshot_rebuild_ps_const_b_total=0",
+        " draw_push_op_ms=0.020",
         " draw_push_op_peak_ms=0.020 bind_texture_ms=0.004 bind_texture_peak_ms=0.004",
         " bind_texture_calls_total=2 bind_buffer_ms=0.002 bind_buffer_peak_ms=0.002",
         " bind_buffer_calls_total=1 bind_shader_ms=0.002 bind_shader_peak_ms=0.002",
@@ -964,6 +1012,18 @@ fn sample_window() -> PerfWindow {
     scalls[SurfaceSubCategory::GetDc as usize] = 1;
     scalls[SurfaceSubCategory::ReleaseDc as usize] = 0;
     scalls[SurfaceSubCategory::Misc as usize] = 15;
+    // 40 of the 100 draw calls rebuilt a section and 20 of those were timed.
+    // Of the six sections the `keys` bucket times only RS carries cycles:
+    // 5 000 sampled, scaled to 10 000, so `keys` 20 000 splits into RS
+    // 10 000 (1000 ns per each of its 10 rebuilds) and a `rest` of 10 000.
+    let mut rebuilds = [0u32; SnapshotSection::SLOTS];
+    rebuilds[SnapshotSection::Rs as usize] = 10;
+    rebuilds[SnapshotSection::Stages as usize] = 30;
+    rebuilds[SnapshotSection::VsSource as usize] = 20;
+    rebuilds[SnapshotSection::PsSource as usize] = 20;
+    rebuilds[SnapshotSection::VsConst as usize] = 25;
+    let mut section_cycles = [0u64; SnapshotSection::SLOTS];
+    section_cycles[SnapshotSection::Rs as usize] = 5_000;
     let s = FrameSample {
         counters: FrameCounters {
             reserved: 0,
@@ -1021,6 +1081,11 @@ fn sample_window() -> PerfWindow {
             surface_sub_calls: scalls,
             keys_gate_calls: [0; KeysGate::COUNT],
             keys_gate_skips: [0; KeysGate::COUNT],
+            snapshot_rebuilds: rebuilds,
+            snapshot_rebuild_draws: 40,
+            // Half the rebuilding draws were timed, so the sampled section
+            // cycles below count twice.
+            snapshot_sampled_draws: 20,
             // snapshot dominates the Draws bucket; split inside it
             // is stages 20 + c_ff 20 + c_pr 10 + keys 20 + bumps 10
             // + leftover 10 = 90. push_op trails. Every component is
@@ -1036,6 +1101,7 @@ fn sample_window() -> PerfWindow {
             draw_snapshot_keys_cycles: 20_000,
             draw_snapshot_bumps_cycles: 10_000,
             draw_push_op_cycles: 20_000,
+            draw_snapshot_section_cycles: section_cycles,
         },
         timing: FrameTiming {
             present_block_cycles: 3_200_000,
@@ -1467,4 +1533,38 @@ fn native_decode_cycles_extend_operations_once_and_reset_next_frame() {
     state.begin_frame(&payload);
     assert_eq!(state.enc.op_cycles, 0);
     assert_eq!(state.enc.submit_cycles, 0);
+}
+
+/// Every rebuilding draw counts once per dirty section, and about one per sample period is timed.
+#[test]
+fn snapshot_rebuilds_count_each_section_and_sample_one_in_the_period() {
+    let mut state = ApiPerfState::new();
+    let dirty = SnapshotSection::Rs.bit() | SnapshotSection::PsConstB.bit() | (1 << 31);
+    let draws = 16_000u32;
+    let mut sampled = 0u32;
+    for _ in 0..draws {
+        sampled += u32::from(state.record_snapshot_rebuild(dirty));
+    }
+    let c = &state.counters;
+    assert_eq!(c.snapshot_rebuild_draws, draws);
+    assert_eq!(c.snapshot_rebuilds[SnapshotSection::Rs as usize], draws);
+    assert_eq!(
+        c.snapshot_rebuilds[SnapshotSection::PsConstB as usize],
+        draws
+    );
+    assert_eq!(c.snapshot_rebuilds[SnapshotSection::Stages as usize], 0);
+    assert_eq!(c.snapshot_sampled_draws, sampled);
+    let expected = draws / KEYS_SECTION_SAMPLE_PERIOD;
+    assert!(
+        sampled.abs_diff(expected) < expected / 10,
+        "sampled {sampled} of {draws}, expected about {expected}"
+    );
+}
+
+/// Sampled cycles scale by all rebuilding draws over the sampled ones, and to zero with none.
+#[test]
+fn sampled_cycles_scale_to_every_rebuilding_draw() {
+    assert_eq!(scale_sampled(5_000, 40, 20), 10_000);
+    assert_eq!(scale_sampled(5_000, 40, 0), 0);
+    assert_eq!(scale_sampled(u64::MAX, u64::MAX, 1), u64::MAX);
 }

@@ -43,7 +43,7 @@ use mtld3d_core::{
     passes::BackbufferContents,
     perf::{
         ApiPerfState, ApiPerfStorage, ApiTimer, BindSubCategory, CycleAddTimer, CycleSetTimer,
-        DeviceSubCategory, KeysGate,
+        DeviceSubCategory, KeysGate, SnapshotSection,
     },
     present::LayerPacing,
     readback::{ReadbackDestination, ReadbackReject, ReadbackSource},
@@ -835,63 +835,65 @@ bitflags::bitflags! {
     ///
     /// One bit per cached piece in `FrameEncoder::current_snapshot`. See
     /// `SnapshotCache` doc on `DeviceInner::snapshot_dirty` for lifecycle.
+    /// Each bit is its [`SnapshotSection`]'s, so the perf summary's
+    /// per-section rebuild counters read the mask directly.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub struct SnapshotDirty: u32 {
         /// `RenderStateSnapshot` (~25 RS slots).
-        const RS          = 1 << 0;
+        const RS          = SnapshotSection::Rs.bit();
         /// `[Option<StageBinding>; STAGE_COUNT]` — bound textures and per-stage sampler state.
         ///
         /// `bound_texture_mask` rebuild is folded into this branch (see
         /// `emit_snapshot_deltas`).
-        const STAGES      = 1 << 1;
+        const STAGES      = SnapshotSection::Stages.bit();
         /// `has_depth` + `has_stencil` on the current render target.
-        const RT_DS       = 1 << 3;
+        const RT_DS       = SnapshotSection::RtDs.bit();
         /// Vertex attribute layout (`AttrSnapshot`: attrs slice, stride, vdecl hash).
-        const VDECL       = 1 << 4;
+        const VDECL       = SnapshotSection::Vdecl.bit();
         /// Pipeline variant key.
-        const VARIANT     = 1 << 5;
+        const VARIANT     = SnapshotSection::Variant.bit();
         /// VS source (FF key or programmable `vs_id`).
-        const VS_SOURCE   = 1 << 6;
+        const VS_SOURCE   = SnapshotSection::VsSource.bit();
         /// PS source.
-        const PS_SOURCE   = 1 << 7;
+        const PS_SOURCE   = SnapshotSection::PsSource.bit();
         /// VS constants slot.
-        const VS_CONST    = 1 << 8;
+        const VS_CONST    = SnapshotSection::VsConst.bit();
         /// PS constants slot.
-        const PS_CONST    = 1 << 9;
+        const PS_CONST    = SnapshotSection::PsConst.bit();
         /// Alpha-ref bytes (PS slot 14).
-        const ALPHA_REF   = 1 << 10;
+        const ALPHA_REF   = SnapshotSection::AlphaRef.bit();
         /// Fog-color bytes (PS slot 13).
-        const FOG_COLOR   = 1 << 11;
+        const FOG_COLOR   = SnapshotSection::FogColor.bit();
         /// Bump-environment matrix bytes (PS slot 12).
         ///
         /// Per-stage `D3DTSS_BUMPENVMAT*` + luminance, consumed by SM1
         /// `texbem`/`texbeml`/`bem`.
-        const BUMP_ENV    = 1 << 12;
+        const BUMP_ENV    = SnapshotSection::BumpEnv.bit();
         /// VS integer-constant file bytes (vertex slot 14).
         ///
         /// `vs_constants_i`, consumed by a VS reading a dynamic (non-`defi`)
         /// integer constant.
-        const VS_CONST_I  = 1 << 13;
+        const VS_CONST_I  = SnapshotSection::VsConstI.bit();
         /// Per-draw `VsDraw` uniform bytes (point size state).
         ///
         /// `mtld3d_core::vs_draw::VsDrawState::build_bytes` over the point render
         /// states, bound for every draw.
-        const VS_DRAW     = 1 << 14;
+        const VS_DRAW     = SnapshotSection::VsDraw.bit();
         /// VS boolean-constant bitmask (vertex slot 26).
         ///
         /// `vs_constants_b`, consumed by a VS reading a dynamic (non-`defb`)
         /// boolean constant.
-        const VS_CONST_B  = 1 << 15;
+        const VS_CONST_B  = SnapshotSection::VsConstB.bit();
         /// PS integer-constant file bytes (fragment slot 11).
         ///
         /// `ps_constants_i`, consumed by a PS reading a dynamic (non-`defi`)
         /// integer constant.
-        const PS_CONST_I  = 1 << 16;
+        const PS_CONST_I  = SnapshotSection::PsConstI.bit();
         /// PS boolean-constant bitmask (fragment slot 10).
         ///
         /// `ps_constants_b`, consumed by a PS reading a dynamic (non-`defb`)
         /// boolean constant.
-        const PS_CONST_B  = 1 << 17;
+        const PS_CONST_B  = SnapshotSection::PsConstB.bit();
     }
 }
 
@@ -3501,6 +3503,20 @@ fn draw_snapshot_keys_ptr(perf_ptr: *mut ApiPerfState) -> *mut u64 {
     }
     // SAFETY: see `draw_snapshot_ptr`.
     unsafe { (*perf_ptr).draw_snapshot_keys_cycles_ptr() }
+}
+
+/// Pointer the `CycleAddTimer` writes into for one section's rebuild block in the snapshot.
+///
+/// A child of `draw_snapshot_keys_ptr` for the six sections inside the
+/// `keys` scope, started only inside the section's dirty branch. Same
+/// null-guard as `draw_snapshot_ptr`.
+#[inline]
+fn draw_snapshot_section_ptr(perf_ptr: *mut ApiPerfState, section: SnapshotSection) -> *mut u64 {
+    if perf_ptr.is_null() {
+        return core::ptr::null_mut();
+    }
+    // SAFETY: see `draw_snapshot_ptr`.
+    unsafe { (*perf_ptr).draw_snapshot_section_cycles_ptr(section) }
 }
 
 /// Pointer the `CycleAddTimer` writes into for the post-consts scratch bumps.
@@ -10815,6 +10831,7 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
         }
         return;
     }
+    let sampled = obj.inner().perf_mut().record_snapshot_rebuild(dirty.bits());
 
     let stages_ptr = draw_snapshot_stages_ptr(DeviceInner::perf_ptr_of(obj.inner));
     let stages_timer = CycleAddTimer::start(stages_ptr);
@@ -10851,15 +10868,26 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
     // stages walk and the consts work; instrumenting them as one bucket
     // attributes per-draw cost that would otherwise fall into the "other"
     // residual. Dropped just before `consts_timer`
-    // starts so the buckets don't double-count.
-    let keys_timer =
-        CycleAddTimer::start(draw_snapshot_keys_ptr(DeviceInner::perf_ptr_of(obj.inner)));
+    // starts so the buckets don't double-count. Each section's own timer
+    // runs inside its dirty branch, a child of `keys_timer`, and only on a
+    // sampled draw: on the others its target is null and it reads no clock.
+    let perf_ptr = DeviceInner::perf_ptr_of(obj.inner);
+    let keys_timer = CycleAddTimer::start(draw_snapshot_keys_ptr(perf_ptr));
+    let section_perf_ptr = if sampled {
+        perf_ptr
+    } else {
+        core::ptr::null_mut()
+    };
     let dev = obj.inner();
 
     // VDECL FIRST — its rebuild updates `dev.cached_ff_vs_layout`,
     // which conflicts with the long-lived `dev.render_states()` borrow
     // taken below.
     let vdecl_value = if dirty.contains(SnapshotDirty::VDECL) {
+        let _section = CycleAddTimer::start(draw_snapshot_section_ptr(
+            section_perf_ptr,
+            SnapshotSection::Vdecl,
+        ));
         let bound_vertex_shader = dev.shader_bindings().vertex_shader();
         let fvf = dev.fvf;
         let decl_ptr = dev.vertex_decl();
@@ -10925,6 +10953,10 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
     let render_state_value = if dirty.contains(SnapshotDirty::RS) {
         use mtld3d_core::pipeline_state::{PipelineRsBits, PipelineRsFlags};
 
+        let _section = CycleAddTimer::start(draw_snapshot_section_ptr(
+            section_perf_ptr,
+            SnapshotSection::Rs,
+        ));
         // `SetRenderState` stores whatever DWORD the game passed, so an
         // enum state is narrowed through `render_state::enum_value`: the
         // byte when the value is inside that state's enum space, the D3D9
@@ -11024,6 +11056,10 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
 
     // RT_DS: depth/stencil presence.
     let depth_stencil_value = if dirty.contains(SnapshotDirty::RT_DS) {
+        let _section = CycleAddTimer::start(draw_snapshot_section_ptr(
+            section_perf_ptr,
+            SnapshotSection::RtDs,
+        ));
         let bound_ds = dev.bound_rt().depth_stencil();
         let (has_depth, has_stencil) = if !bound_ds.is_null() {
             // SAFETY: non-null check passed; refcount holds it live.
@@ -11048,6 +11084,10 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
     // VARIANT: depends on RS + ff_vs_layout.has_rhw + depth_sampler_mask
     // (current live stage bindings).
     let variant_value = if dirty.contains(SnapshotDirty::VARIANT) {
+        let _section = CycleAddTimer::start(draw_snapshot_section_ptr(
+            section_perf_ptr,
+            SnapshotSection::Variant,
+        ));
         let mut variant = dev.ff_state().variant_key(
             rs,
             dev.cached_ff_vs_layout.has_rhw(),
@@ -11085,6 +11125,10 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
     // even when a VS is still bound. The PS side is NOT bypassed — a bound PS
     // still runs.
     let vs_value = if dirty.contains(SnapshotDirty::VS_SOURCE) {
+        let _section = CycleAddTimer::start(draw_snapshot_section_ptr(
+            section_perf_ptr,
+            SnapshotSection::VsSource,
+        ));
         if bound_vertex_shader.is_null() || dev.cached_ff_vs_layout.has_rhw() {
             let key = dev
                 .ff_state()
@@ -11137,6 +11181,10 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
 
     // PS_SOURCE.
     let ps_value = if dirty.contains(SnapshotDirty::PS_SOURCE) {
+        let _section = CycleAddTimer::start(draw_snapshot_section_ptr(
+            section_perf_ptr,
+            SnapshotSection::PsSource,
+        ));
         if bound_pixel_shader.is_null() {
             let key = dev.ff_state().build_ps_key(rs, bound_mask);
             let sampled_stage_mask = key.sampled_stage_mask();
