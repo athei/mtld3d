@@ -3192,7 +3192,9 @@ impl SurfaceInner {
 /// the subresource takes. An offscreen plain reaches its level through the
 /// texture it owns and takes them the same way: a `StretchRect` or a `ColorFill`
 /// claims it exactly as it claims any other texture level. Only the claim half
-/// reaches a cube face, which keeps its staging for the texture's life.
+/// reaches a cube face, which keeps its staging for the texture's life. What
+/// GDI draws must not reach an upload an earlier draw still reads, so staging
+/// such an upload holds is renamed before the DIB is built over it.
 fn refill_dc_texture_level(inner: &SurfaceInner) -> bool {
     if inner.parent_texture.is_null() {
         return true;
@@ -3208,7 +3210,7 @@ fn refill_dc_texture_level(inner: &SurfaceInner) -> bool {
     // `Direct3DTexture9` whose refcount keeps it alive for as long as this
     // surface is live; it is a distinct allocation from the surface inner.
     let texture = unsafe { (*inner.parent_texture).inner_mut() };
-    texture.materialize_subresource_for_cpu_read(face, inner.mip_level as usize)
+    texture.prepare_subresource_for_dc(face, inner.mip_level as usize)
 }
 
 /// Hold a texture level's staging for as long as a device context maps it.

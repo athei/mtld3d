@@ -841,6 +841,19 @@ impl TextureInner {
             && (self.cube.is_some() || self.ensure_staging_for_lock(level, 0))
     }
 
+    /// Make a subresource's staging ready for a device context to map.
+    ///
+    /// The DIB aliases the staging and GDI may read or write any texel of it,
+    /// so the current pixels are materialized first and the staging is then
+    /// prepared as for a partial CPU write.
+    pub fn prepare_subresource_for_dc(&mut self, face: u32, level: usize) -> bool {
+        if !self.materialize_subresource_for_cpu_read(face, level) {
+            return false;
+        }
+        self.prepare_staging_write(face, level, false);
+        true
+    }
+
     /// Fill `level`'s staging from the GPU copy of the texture.
     ///
     /// Flushes the frame so every pending upload has landed, resolves the
@@ -1263,7 +1276,7 @@ impl TextureInner {
         if !self.ensure_staging_for_write(dst_level, whole) {
             return false;
         }
-        self.prepare_volume_staging_write(dst_level);
+        self.prepare_staging_write(0, dst_level, whole);
         let (Some(dst_box), Some(src_box)) =
             (self.staging.get(dst_level), src.staging.get(src_level))
         else {
@@ -1387,6 +1400,7 @@ impl TextureInner {
         if !self.move_subresource_to_staging(dst_face, dst_level, whole) {
             return false;
         }
+        self.prepare_staging_write(dst_face, dst_level, whole);
         let (Some(dst_cube), Some(src_cube)) = (self.cube.as_deref(), src.cube.as_deref()) else {
             return false;
         };
@@ -1553,20 +1567,7 @@ impl TextureInner {
         if !self.ensure_staging_for_write(dst_level, whole) {
             return false;
         }
-        if !self.flags.contains(TextureFlags::VOLUME_TEXTURE)
-            && self.staging[dst_level].has_readers()
-        {
-            // Earlier uploads and their retries retain these bytes. A whole
-            // conversion replaces them all; a partial one preserves the rest.
-            let preserve = if whole {
-                PreserveKind::None
-            } else {
-                PreserveKind::Cpu
-            };
-            self.rename_staging(dst_level, preserve);
-        } else {
-            self.prepare_volume_staging_write(dst_level);
-        }
+        self.prepare_staging_write(0, dst_level, whole);
         let (Some(dst_box), Some(src_box)) =
             (self.staging.get(dst_level), src.staging.get(src_level))
         else {
@@ -1675,6 +1676,7 @@ impl TextureInner {
         if !self.move_subresource_to_staging(dst_face, dst_level, whole) {
             return false;
         }
+        self.prepare_staging_write(dst_face, dst_level, whole);
         let (Some(dst_cube), Some(src_cube)) = (self.cube.as_deref(), src.cube.as_deref()) else {
             return false;
         };
@@ -1779,6 +1781,7 @@ impl TextureInner {
         if !self.ensure_staging_for_write(dst_level, whole) {
             return false;
         }
+        self.prepare_staging_write(0, dst_level, whole);
         let Some(dst_box) = self.staging.get(dst_level) else {
             return false;
         };
@@ -1879,6 +1882,7 @@ impl TextureInner {
         if !self.move_subresource_to_staging(dst_face, dst_level, whole) {
             return false;
         }
+        self.prepare_staging_write(dst_face, dst_level, whole);
         let Some(dst_box) = self
             .cube
             .as_deref()
@@ -1984,6 +1988,7 @@ impl TextureInner {
         if !self.ensure_staging_for_write(dst_level, whole) {
             return false;
         }
+        self.prepare_staging_write(0, dst_level, whole);
         let Some(dst_box) = self.staging.get(dst_level) else {
             return false;
         };
@@ -2041,6 +2046,7 @@ impl TextureInner {
         if !self.move_subresource_to_staging(dst_face, dst_level, whole) {
             return false;
         }
+        self.prepare_staging_write(dst_face, dst_level, whole);
         let Some(dst_box) = self
             .cube
             .as_deref()
@@ -2097,6 +2103,11 @@ impl TextureInner {
         // A fill is a write: a level whose staging was never materialized (or
         // was dropped after its upload) gets one here, like any first write.
         self.ensure_staging(level);
+        if level >= self.staging.len() {
+            return false;
+        }
+        let whole = self.write_covers_level(level, DirtyRect { x: ox, y: oy, w, h });
+        self.prepare_staging_write(0, level, whole);
         let Some(box_) = self.staging.get(level) else {
             return false;
         };
@@ -2254,12 +2265,16 @@ impl TextureInner {
     /// blit wraps the whole page as its Metal buffer and writes `mip_height`
     /// rows at the returned stride from offset zero, because every subresource
     /// owns its own allocation. The staging is materialized first, so a level
-    /// whose backing was released still receives the copy. `None` when the
+    /// whose backing was released still receives the copy. Staging an upload
+    /// still reads is renamed first, keeping its bytes: the call can still be
+    /// rejected, or its copy fail, after this returns. `None` when the
     /// subresource does not exist.
     pub fn readback_staging(&mut self, face: Option<u32>, level: usize) -> Option<(u64, u64, u32)> {
         let bytes_per_row = *self.mip_bytes_per_row.get(level)?;
         if let Some(face) = face {
             let index = self.cube_subresource_index(face, level)?;
+            self.cube.as_deref()?.staging.get(index)?;
+            self.prepare_staging_write(face, level, false);
             let page = self.cube.as_deref()?.staging.get(index)?;
             return Some((page.as_ptr() as u64, page.len() as u64, bytes_per_row));
         }
@@ -2267,6 +2282,7 @@ impl TextureInner {
             return None;
         }
         self.ensure_staging(level);
+        self.prepare_staging_write(0, level, false);
         Some((
             self.staging[level].as_ptr() as u64,
             self.staging[level].len() as u64,
@@ -2378,8 +2394,6 @@ impl TextureInner {
         let action =
             decide_lock_action(contended, flags, self.d3d_pool, rect, self.mip_shape(level));
         let device_inner = self.device_inner;
-        let texture_id = self.texture_id;
-        let cube = self.cube.as_deref_mut()?;
         let base = match action {
             LockAction::WriteInPlace => {
                 // The kept divergence, counted like its VB/IB twin: a
@@ -2390,47 +2404,101 @@ impl TextureInner {
                         .perf_mut()
                         .bump_texture_write_in_place_contended();
                 }
-                cube.staging[index].as_ptr().cast_mut()
+                self.cube.as_deref()?.staging[index].as_ptr().cast_mut()
             }
-            LockAction::FreshBox { preserve } => {
-                mtld3d_shared::log_once_trace_by!(
-                    target: TEX_TRACE_TARGET,
-                    key: (texture_id.raw() << 8)
-                        | (index as u64 & 0x7f)
-                        | (u64::from(preserve == PreserveKind::Cpu) << 7),
-                    "cube {texture_id:#x} face {face} mip {level} lock rename preserve={}",
-                    preserve_label(preserve)
-                );
-                let mip_len = cube.staging[index].logical_len();
-                let old = core::mem::replace(
-                    &mut cube.staging[index],
-                    Arc::new(take_staging_for(device_inner, mip_len)),
-                );
-                if preserve == PreserveKind::Cpu {
-                    let dst = Arc::get_mut(&mut cube.staging[index])
-                        .expect("fresh cube staging Arc is unique")
-                        .as_mut_ptr();
-                    // SAFETY: old and new cube staging allocations are disjoint
-                    // and both contain `mip_len` logical bytes.
-                    unsafe { core::ptr::copy_nonoverlapping(old.as_ptr(), dst, mip_len) };
-                }
-                retire_staging(device_inner, old);
-                if device_inner != 0 {
-                    let mut perf = DeviceInner::from_ptr(device_inner).perf_mut();
-                    match preserve {
-                        PreserveKind::None => perf.bump_texture_discard(),
-                        PreserveKind::Cpu => perf.bump_texture_preserve_cpu(),
-                    }
-                    perf.bump_texture_rename();
-                }
-                cube.last_submit_seq[index] = 0;
-                Arc::get_mut(&mut cube.staging[index])
-                    .expect("fresh cube staging Arc is unique")
-                    .as_mut_ptr()
-            }
+            LockAction::FreshBox { preserve } => self.rename_cube_staging(face, level, preserve),
         };
         // SAFETY: `offset` was checked against the logical staging length.
         Some((unsafe { base.add(offset) }, pitch))
+    }
+
+    /// Rename one cube face level's staging while earlier uploads retain the old allocation.
+    ///
+    /// The cube counterpart of [`Self::rename_staging`]: the face level gets
+    /// fresh pages, carrying every logical byte of the old ones for
+    /// `PreserveKind::Cpu`, and the old pages stay with whichever uploads
+    /// still read them.
+    fn rename_cube_staging(&mut self, face: u32, level: usize, preserve: PreserveKind) -> *mut u8 {
+        let index = self
+            .cube_subresource_index(face, level)
+            .expect("validated cube subresource");
+        let device_inner = self.device_inner;
+        let texture_id = self.texture_id;
+        mtld3d_shared::log_once_trace_by!(
+            target: TEX_TRACE_TARGET,
+            key: (texture_id.raw() << 8)
+                | (index as u64 & 0x7f)
+                | (u64::from(preserve == PreserveKind::Cpu) << 7),
+            "cube {texture_id:#x} face {face} mip {level} staging rename preserve={}",
+            preserve_label(preserve)
+        );
+        let cube = self.cube.as_deref_mut().expect("cube storage");
+        let mip_len = cube.staging[index].logical_len();
+        let old = core::mem::replace(
+            &mut cube.staging[index],
+            Arc::new(take_staging_for(device_inner, mip_len)),
+        );
+        if preserve == PreserveKind::Cpu {
+            let dst = Arc::get_mut(&mut cube.staging[index])
+                .expect("fresh cube staging Arc is unique")
+                .as_mut_ptr();
+            // SAFETY: old and new cube staging allocations are disjoint
+            // and both contain `mip_len` logical bytes.
+            unsafe { core::ptr::copy_nonoverlapping(old.as_ptr(), dst, mip_len) };
+        }
+        retire_staging(device_inner, old);
+        if device_inner != 0 {
+            let mut perf = DeviceInner::from_ptr(device_inner).perf_mut();
+            match preserve {
+                PreserveKind::None => perf.bump_texture_discard(),
+                PreserveKind::Cpu => perf.bump_texture_preserve_cpu(),
+            }
+            perf.bump_texture_rename();
+        }
+        cube.last_submit_seq[index] = 0;
+        Arc::get_mut(&mut cube.staging[index])
+            .expect("fresh cube staging Arc is unique")
+            .as_mut_ptr()
+    }
+
+    /// Move a subresource's staging off pages an upload still reads, ahead of a CPU write.
+    ///
+    /// Every upload scheduled for the subresource holds a read of its pages
+    /// until it retires, and a replay reads them again, so a write into them
+    /// would reach that upload and the draws it serves. With a reader the
+    /// write goes to fresh pages instead: bare for a write covering the whole
+    /// level, carrying the rest of the level for a partial one. Without one it
+    /// lands in place at no extra cost. A volume level keeps its own
+    /// conservative rule. `face` is a cube face index and zero for every other
+    /// texture kind.
+    fn prepare_staging_write(&mut self, face: u32, level: usize, whole_level: bool) {
+        if self.flags.contains(TextureFlags::VOLUME_TEXTURE) {
+            self.prepare_volume_staging_write(level);
+            return;
+        }
+        let has_readers = match self.cube.as_deref() {
+            Some(cube) => self
+                .cube_subresource_index(face, level)
+                .and_then(|index| cube.staging.get(index))
+                .is_some_and(|staging| staging.has_readers()),
+            None => self
+                .staging
+                .get(level)
+                .is_some_and(|staging| staging.has_readers()),
+        };
+        if !has_readers {
+            return;
+        }
+        let preserve = if whole_level {
+            PreserveKind::None
+        } else {
+            PreserveKind::Cpu
+        };
+        if self.cube.is_some() {
+            self.rename_cube_staging(face, level, preserve);
+        } else {
+            self.rename_staging(level, preserve);
+        }
     }
 
     fn cube_stash_lock(
