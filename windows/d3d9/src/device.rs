@@ -1209,10 +1209,14 @@ impl DeviceInner {
     /// `last_fvf_bind`'s FVF. Each FVF has one cached declaration, so a match
     /// on both halves is the pair the cache lookup would produce, and every
     /// dirty mark the caller gates on a change would be skipped anyway.
+    ///
+    /// The pointer is compared first: a caller that alternates `SetFVF` with
+    /// `SetVertexDeclaration` leaves the FVF field matching and fails only
+    /// there, so that order sends it to the lookup after one test.
     #[inline]
     fn fvf_bind_is_redundant(&self, fvf: u32) -> bool {
         let (bound_fvf, bound_decl) = self.last_fvf_bind;
-        self.fvf == fvf && bound_fvf == fvf && self.vertex_decl.raw() == bound_decl
+        self.vertex_decl.raw() == bound_decl && bound_fvf == fvf && self.fvf == fvf
     }
 
     /// The [`Self::bind_fvf_decl`] path that looks the declaration up and binds it.
