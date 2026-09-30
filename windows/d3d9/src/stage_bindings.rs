@@ -291,11 +291,23 @@ impl StageBindings {
         self.sampler_states[sampler][type_]
     }
 
+    /// Store one sampler state and return whether it changed.
+    ///
+    /// The silent-write audit sees every write. A write of the stored value
+    /// returns before the store and the Fetch4 update, which would change
+    /// nothing: every writer of a stored `D3DSAMP_MIPMAPLODBIAS` command
+    /// either applies it to the Fetch4 latch here or restores the latch it
+    /// was captured with, and `D3DSAMP_MAGFILTER` sets the point bit from the
+    /// stored value alone.
     #[inline]
-    pub fn set_sampler_state(&mut self, sampler: usize, type_: usize, value: u32) {
+    pub fn set_sampler_state(&mut self, sampler: usize, type_: usize, value: u32) -> bool {
         self.warn_samp_non_default_once(sampler, type_, value);
+        if self.sampler_states[sampler][type_] == value {
+            return false;
+        }
         self.sampler_states[sampler][type_] = value;
         self.fetch4.set_sampler(sampler, type_, value);
+        true
     }
 
     /// The silent-write audit of one sampler-state write.

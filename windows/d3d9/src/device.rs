@@ -9953,14 +9953,23 @@ extern "system" fn device_set_sampler_state(
         dev.set_vertex_sampler_slot_state(slot, type_ as usize, value);
         return D3D_OK;
     }
+    let stage = sampler as usize;
     let old_fetch4 = dev.stage_bindings().fetch4().masks();
-    dev.stage_bindings_mut()
-        .set_sampler_state(sampler as usize, type_ as usize, value);
-    if old_fetch4 != dev.stage_bindings().fetch4().masks() {
-        dev.mark_snapshot_dirty(SnapshotDirty::VARIANT);
+    if dev
+        .stage_bindings_mut()
+        .set_sampler_state(stage, type_ as usize, value)
+    {
+        if old_fetch4 != dev.stage_bindings().fetch4().masks() {
+            dev.mark_snapshot_dirty(SnapshotDirty::VARIANT);
+        }
+        // Sampler state lives inside StageBinding only.
+        dev.mark_snapshot_dirty(SnapshotDirty::STAGES);
+    } else if !rebind_is_redundant(dev, stage, dev.stage_bindings().texture(stage)) {
+        // A write of the stored value changes no input of the stage walk, as
+        // a rebind of the bound texture changes none, unless that texture is
+        // attached to another device and needs the walk to come back.
+        dev.mark_snapshot_dirty(SnapshotDirty::STAGES);
     }
-    // Sampler state lives inside StageBinding only.
-    dev.mark_snapshot_dirty(SnapshotDirty::STAGES);
     0 // S_OK
 }
 
