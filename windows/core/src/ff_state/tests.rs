@@ -1269,6 +1269,53 @@ fn view_change_marks_lights_dirty() {
     );
 }
 
+#[test]
+fn overflow_light_writes_mark_lights_dirty() {
+    use mtld3d_types::{D3DLIGHT_POINT, D3DLIGHT_SPOT, D3DLIGHT9};
+    // A light past the eight fast-path slots still packs into the LIGHTS
+    // section when it is enabled, so its SetLight and LightEnable must
+    // re-upload the section like a fast-path write does.
+    assert_overflow_write_marks_lights("SetLight defines an overflow light", |s| {
+        s.set_light_at(
+            9,
+            &D3DLIGHT9 {
+                type_: D3DLIGHT_POINT,
+                ..D3DLIGHT9::default()
+            },
+        );
+    });
+    assert_overflow_write_marks_lights("SetLight rewrites an overflow light", |s| {
+        s.set_light_at(
+            100,
+            &D3DLIGHT9 {
+                type_: D3DLIGHT_SPOT,
+                range: 3.0,
+                ..D3DLIGHT9::default()
+            },
+        );
+    });
+    assert_overflow_write_marks_lights("LightEnable turns an overflow light on", |s| {
+        s.set_light_enabled_at(9, true);
+    });
+    assert_overflow_write_marks_lights("LightEnable turns an overflow light off", |s| {
+        s.set_light_enabled_at(100, false);
+    });
+}
+
+/// Run `write` on a state with enabled overflow light 100 and assert it marked LIGHTS.
+fn assert_overflow_write_marks_lights(name: &str, write: fn(&mut FfState)) {
+    let mut state = FfState::new();
+    state.set_light_at(100, &mtld3d_types::D3DLIGHT9::default());
+    state.set_light_enabled_at(100, true);
+    // Clear the cold-start all-dirty so the write's own mark shows.
+    let _ = state.take_ff_vs_dirty();
+    write(&mut state);
+    assert!(
+        state.take_ff_vs_dirty().contains(super::FfVsDirty::LIGHTS),
+        "{name}: the LIGHTS section was not marked"
+    );
+}
+
 mod inverse {
     use mtld3d_types::D3DMATRIX;
 

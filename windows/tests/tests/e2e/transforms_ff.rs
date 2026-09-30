@@ -1648,3 +1648,67 @@ fn palette_growth_between_draws_of_one_frame_reaches_the_second_draw() {
     );
     assert_eq!(h.read_pixel(320, 240), BLUE, "nothing left at the origin");
 }
+
+/// A white-diffuse directional light shining down +z, onto the quads' faces.
+fn frontal_light(diffuse: D3DCOLORVALUE) -> D3DLIGHT9 {
+    D3DLIGHT9 {
+        type_: D3DLIGHT_DIRECTIONAL,
+        diffuse,
+        direction: D3DVECTOR {
+            x: 0.0,
+            y: 0.0,
+            z: 1.0,
+        },
+        ..D3DLIGHT9::default()
+    }
+}
+
+#[test]
+fn overflow_light_writes_between_draws_of_one_frame_reach_the_later_draw() {
+    // Light 9 sits past the eight fast-path slots but still lights the draw
+    // once enabled, packed into the first shader slot. Rewriting it or
+    // enabling it between draws must upload the lights section again. The
+    // view is set once, before the frame, so no VIEW write re-uploads the
+    // section on the rewrite's behalf.
+    let h = Harness::new();
+    arm_lit_quads(&h, opaque(1.0, 1.0, 1.0));
+    assert_eq!(h.set_light(9, &frontal_light(opaque(1.0, 0.0, 0.0))), 0);
+    assert_eq!(h.light_enable(9, true), 0, "LightEnable(9)");
+    let (left, right) = (lit_quad_at(-0.6), lit_quad_at(0.6));
+    h.render_once(BLUE, |d| {
+        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLESTRIP, 2, &left), 0);
+        assert_eq!(d.set_light(9, &frontal_light(opaque(0.0, 1.0, 0.0))), 0);
+        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLESTRIP, 2, &right), 0);
+    });
+    let (r, g, b) = rgb_at(&h, 128);
+    assert!(
+        r >= 0xF0 && g <= 2 && b <= 2,
+        "first draw, light 9 red: red, got ({r}, {g}, {b})"
+    );
+    let (r, g, b) = rgb_at(&h, 512);
+    assert!(
+        r <= 2 && g >= 0xF0 && b <= 2,
+        "second draw, light 9 rewritten green: green, got ({r}, {g}, {b})"
+    );
+
+    // No light in slots 0..8 is on, so light 9's enable alone decides
+    // whether anything lights the second draw.
+    let h = Harness::new();
+    arm_lit_quads(&h, opaque(1.0, 1.0, 1.0));
+    assert_eq!(h.set_light(9, &frontal_light(opaque(1.0, 1.0, 1.0))), 0);
+    h.render_once(BLUE, |d| {
+        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLESTRIP, 2, &left), 0);
+        assert_eq!(d.light_enable(9, true), 0, "LightEnable(9)");
+        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLESTRIP, 2, &right), 0);
+    });
+    let (r, g, b) = rgb_at(&h, 128);
+    assert!(
+        r <= 2 && g <= 2 && b <= 2,
+        "first draw, light 9 disabled: black, got ({r}, {g}, {b})"
+    );
+    let (r, g, b) = rgb_at(&h, 512);
+    assert!(
+        r >= 0xF0 && g >= 0xF0 && b >= 0xF0,
+        "second draw, light 9 enabled between the draws: white, got ({r}, {g}, {b})"
+    );
+}

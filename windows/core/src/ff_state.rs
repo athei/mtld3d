@@ -216,11 +216,12 @@ pub struct FfState {
     /// D3D9 lets `SetLight` / `LightEnable` address an unbounded set of indices;
     /// `MaxActiveLights` (8) caps only how many lights simultaneously contribute
     /// to a draw, not the addressable index range. Slots `0..8` live in the
-    /// `lights` array — the only slots the FF vertex shader reads — so they stay
-    /// on the fast path; higher indices are kept here purely so `GetLight` /
-    /// `GetLightEnable` round-trip. Overflow lights never feed FF lighting and,
-    /// like the array slots, are not captured by [`FfStateSnapshot`] beyond the
-    /// 8 fast-path slots. Empty for every workload that stays within 8 lights.
+    /// `lights` array with their masks, the fast path; higher indices live
+    /// here. An enabled overflow light with a non-zero type feeds FF lighting:
+    /// [`Self::resolve_active_lights`] packs it after the active fast-path
+    /// slots, up to [`MAX_ACTIVE_LIGHTS`], so its writes mark the LIGHTS
+    /// section like a fast-path write. [`FfStateSnapshot`] does not capture
+    /// these slots. Empty for every workload that stays within 8 lights.
     overflow_lights: BTreeMap<u32, OverflowLight>,
     texture_stage_states: [[u32; TEXTURE_STAGE_STATE_COUNT]; 8],
     /// Bit `s` set iff stage `s`'s `D3DTSS_TEXTURETRANSFORMFLAGS` is non-zero.
@@ -768,6 +769,9 @@ impl FfState {
                     light: *light,
                     enabled: false,
                 });
+            // An enabled overflow light packs into the LIGHTS section through
+            // `resolve_active_lights`, the same as a fast-path slot.
+            self.ff_vs_dirty |= FfVsDirty::LIGHTS;
         }
     }
 
@@ -799,6 +803,7 @@ impl FfState {
                     enabled: false,
                 })
                 .enabled = enabled;
+            self.ff_vs_dirty |= FfVsDirty::LIGHTS;
         }
     }
 
