@@ -368,10 +368,32 @@ const fn blend(default: u8) -> Space {
 /// than either side asked for, and rejecting the write in `SetRenderState`
 /// would make `GetRenderState` disagree with the DWORD the game passed.
 #[must_use]
+#[inline]
 pub fn enum_value(rs: &[u32; RENDER_STATE_COUNT], state: u32) -> u8 {
     let value = rs[state as usize];
     // Exact for every value a space accepts: each enum space and the
     // colour-write mask fit in a byte.
+    let byte = value.to_le_bytes()[0];
+    match space(state) {
+        Some(Space::Enum { first, last, .. })
+            if u32::from(byte) == value && first <= byte && byte <= last =>
+        {
+            byte
+        }
+        Some(Space::Mask { bits }) if value & !u32::from(bits) == 0 => byte,
+        _ => enum_value_outside(rs, state),
+    }
+}
+
+/// The byte [`enum_value`] reads for a value its fast path rejected, with its warning.
+///
+/// Out of line and cold so the warn-once formatting stays out of the
+/// snapshot builders that inline the fast path. Only called for a state with
+/// no space, an enum value outside its space, or a mask with bits outside it.
+#[cold]
+#[inline(never)]
+fn enum_value_outside(rs: &[u32; RENDER_STATE_COUNT], state: u32) -> u8 {
+    let value = rs[state as usize];
     let byte = value.to_le_bytes()[0];
     match space(state) {
         Some(Space::Enum {
@@ -379,9 +401,6 @@ pub fn enum_value(rs: &[u32; RENDER_STATE_COUNT], state: u32) -> u8 {
             last,
             default,
         }) => {
-            if u32::from(byte) == value && first <= byte && byte <= last {
-                return byte;
-            }
             mtld3d_shared::log_once_warn_by!(
                 target: crate::LOG_TARGET,
                 key: u64::from(state),
@@ -390,13 +409,11 @@ pub fn enum_value(rs: &[u32; RENDER_STATE_COUNT], state: u32) -> u8 {
             default
         }
         Some(Space::Mask { bits }) => {
-            if value & !u32::from(bits) != 0 {
-                mtld3d_shared::log_once_warn_by!(
-                    target: crate::LOG_TARGET,
-                    key: u64::from(state),
-                    "D3DRS_{state} = {value:#x} sets bits outside the {bits:#x} mask → dropping them"
-                );
-            }
+            mtld3d_shared::log_once_warn_by!(
+                target: crate::LOG_TARGET,
+                key: u64::from(state),
+                "D3DRS_{state} = {value:#x} sets bits outside the {bits:#x} mask → dropping them"
+            );
             byte & bits
         }
         None => {

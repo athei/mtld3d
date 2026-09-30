@@ -2146,25 +2146,49 @@ fn build_vs_flags(
 /// selector names no source, reads as that stage's D3D9 default and surfaces
 /// once. The emitter's own arms still handle the codes that are in the space
 /// but unimplemented.
+#[inline]
 fn stage_enum_value(stage_states: &[u32; TEXTURE_STAGE_STATE_COUNT], stage: u8, ty: u32) -> u8 {
     let value = stage_states[ty as usize];
-    // Exact for every value the spaces below accept: both fit in a byte.
-    let byte = value.to_le_bytes()[0];
-    let fits = u32::from(byte) == value;
-    let in_space = match ty {
-        D3DTSS_RESULTARG => matches!(value, D3DTA_CURRENT | D3DTA_TEMP),
-        D3DTSS_COLOROP | D3DTSS_ALPHAOP => fits && (D3DTOP_DISABLE..=D3DTOP_LERP).contains(&value),
+    if stage_value_in_space(ty, value) == Some(true) {
+        // Exact: every value a space accepts fits in a byte.
+        return value.to_le_bytes()[0];
+    }
+    stage_enum_value_outside(stage_states, stage, ty)
+}
+
+/// Whether `value` lies in the value space of D3DTSS state `ty`; `None` when `ty` has none.
+const fn stage_value_in_space(ty: u32, value: u32) -> Option<bool> {
+    let fits = value <= 0xff;
+    match ty {
+        D3DTSS_RESULTARG => Some(matches!(value, D3DTA_CURRENT | D3DTA_TEMP)),
+        D3DTSS_COLOROP | D3DTSS_ALPHAOP => {
+            Some(fits && D3DTOP_DISABLE <= value && value <= D3DTOP_LERP)
+        }
         D3DTSS_COLORARG1 | D3DTSS_COLORARG2 | D3DTSS_ALPHAARG1 | D3DTSS_ALPHAARG2 => {
-            fits && value & !(D3DTA_COMPLEMENT | D3DTA_ALPHAREPLICATE) <= D3DTA_CONSTANT
+            Some(fits && value & !(D3DTA_COMPLEMENT | D3DTA_ALPHAREPLICATE) <= D3DTA_CONSTANT)
         }
-        other => {
-            mtld3d_shared::log_once_warn_by!(target: crate::LOG_TARGET, key: u64::from(other),
-                "FF: D3DTSS_{other} narrowed as an enum but carries no enum space → low byte {byte:#x}"
-            );
-            return byte;
-        }
-    };
-    if in_space {
+        _ => None,
+    }
+}
+
+/// The byte [`stage_enum_value`] reads for a value its fast path rejected, with its warning.
+///
+/// Out of line and cold so the warn-once formatting stays out of the key
+/// builders that inline the fast path. Only called for a `ty` with no value
+/// space or a value outside it.
+#[cold]
+#[inline(never)]
+fn stage_enum_value_outside(
+    stage_states: &[u32; TEXTURE_STAGE_STATE_COUNT],
+    stage: u8,
+    ty: u32,
+) -> u8 {
+    let value = stage_states[ty as usize];
+    let byte = value.to_le_bytes()[0];
+    if stage_value_in_space(ty, value).is_none() {
+        mtld3d_shared::log_once_warn_by!(target: crate::LOG_TARGET, key: u64::from(ty),
+            "FF: D3DTSS_{ty} narrowed as an enum but carries no enum space → low byte {byte:#x}"
+        );
         return byte;
     }
     let default = texture_stage_state_defaults(stage)[ty as usize];
