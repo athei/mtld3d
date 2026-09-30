@@ -121,6 +121,22 @@ impl StageBindings {
         self.textures[stage].raw()
     }
 
+    /// Whether `tex` is bound on any of the sixteen stages.
+    ///
+    /// Walks only the set bits of `bound_mask`, so a device with no textures
+    /// bound answers without reading a slot.
+    pub fn binds(&self, tex: *const Direct3DTexture9) -> bool {
+        let mut remaining = self.bound_mask;
+        while remaining != 0 {
+            let stage = remaining.trailing_zeros() as usize;
+            remaining &= remaining - 1;
+            if core::ptr::eq(self.textures[stage].raw(), tex) {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Bit `i` set ⇒ slot `i` is bound to a sampleable depth-format texture (shadow map).
     ///
     /// Folded into `VariantKey::depth_sampler_mask` so the PS shader cache
