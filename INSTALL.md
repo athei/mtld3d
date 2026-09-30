@@ -336,6 +336,24 @@ game window is scaled onto the physical display, letterboxed if the aspect
 differs, and mouse input is mapped into the mode. Without it, Wine's mac
 driver switches the whole desktop to the game's mode.
 
+On a prefix whose system DPI is set to a value other than 96, Wine scales the
+window size and the mouse coordinates of a game that does not declare itself
+DPI-aware by 96 over that DPI, but not the display mode list. In fullscreen
+the game then lays out its interface in a fraction of the screen, its clicks
+land away from the drawn pointer, and the pointer cannot reach the far edges.
+mtld3d logs a warning that names the mismatch when such a game goes
+fullscreen. The remedy is to mark the executable DPI-aware in the prefix,
+under its file name without the path:
+
+```sh
+wine reg add 'HKCU\Software\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Layers' /v hl2.exe /d '~ HIGHDPIAWARE' /f
+```
+
+With `/ve` in place of `/v hl2.exe` the value becomes the key's default and
+applies to every program in the prefix; that default is a Wine extension,
+which Windows does not read. The flag is read when a process starts, so
+restart the game after setting it.
+
 The resolution picked in the game's video options therefore sizes the frame.
 `render.scale` in `mtld3d.conf` multiplies on top of it, rendering fewer
 pixels and upscaling the result to the screen.

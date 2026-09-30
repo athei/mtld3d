@@ -1340,8 +1340,11 @@ pub fn is_settable_mode(width: u32, height: u32) -> bool {
 ///   viewports, scissors and mouse coordinates all live in one space; the
 ///   display keeps its own size and present resolves the difference at the
 ///   drawable (`MetalFX` when enlarging), the same resample `render.scale`
-///   rides. When user32 refused the mode-set the request still stands under
-///   a monitor-sized client rect, which the log line below records. A
+///   rides. The request still stands in the two cases where the client rect
+///   reads another size: user32 refused the mode-set and the window covers
+///   the monitor, or the window is DPI-unaware on a desktop whose system DPI
+///   is not 96 and user32 answers its client rect scaled. The info line below
+///   reports the two sizes, and `warn_if_dpi_scaled` names the second case. A
 ///   request that is *not* a settable mode is one native would reject
 ///   outright, so no game can depend on it being honored; such games carry
 ///   their window size into the request and size their rendering and input
@@ -1362,22 +1365,26 @@ pub fn is_settable_mode(width: u32, height: u32) -> bool {
 /// dimension still zero afterwards is rejected by the caller.
 pub fn resolve_backbuffer_dims(hwnd: u64, pp: &mut D3DPRESENT_PARAMETERS) {
     if pp.windowed == 0 {
+        crate::fullscreen::warn_if_dpi_scaled(hwnd as *mut c_void);
         // Callers reject a zero-dimension fullscreen request before the window
         // moves, so the request is always concrete here.
         let client = client_rect_dims(hwnd as *mut c_void);
         if is_settable_mode(pp.back_buffer_width, pp.back_buffer_height) {
-            // With the mode set the client rect is the request; this line
-            // only fires for the fallback where user32 refused the mode, and
-            // is the breadcrumb tying an upscaled frame with monitor-space
-            // mouse input back to the size the game asked for. A client rect
-            // that cannot be read only costs the line.
+            // With the mode set the client rect is the request. It reads
+            // otherwise when user32 refused the mode and the window covers
+            // the monitor, and when the window is DPI-unaware on a desktop
+            // whose system DPI is not 96, where user32 answers a scaled
+            // client rect. The line reports both sizes, which ties mouse
+            // input in the client rect's space back to the size the game
+            // asked for. A client rect that cannot be read only costs the
+            // line.
             if let Some((client_w, client_h)) = client
                 && (pp.back_buffer_width != client_w || pp.back_buffer_height != client_h)
             {
                 mtld3d_shared::log_once_info!(
                     target: LOG_TARGET,
-                    "fullscreen device: honoring the requested {}x{} back buffer without a \
-                     mode-set; the window covers the monitor ({}x{}) and present scales the frame",
+                    "fullscreen device: honoring the requested {}x{} back buffer although the \
+                     window's client area reads {}x{}",
                     pp.back_buffer_width, pp.back_buffer_height, client_w, client_h,
                 );
             }

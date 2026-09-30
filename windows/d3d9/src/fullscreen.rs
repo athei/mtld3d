@@ -168,6 +168,8 @@ const DISP_CHANGE_SUCCESSFUL: i32 = 0;
 
 /// Win32 `USER_DEFAULT_SCREEN_DPI`, the system DPI when none is configured.
 const USER_DEFAULT_SCREEN_DPI: u32 = 96;
+/// Win32 `DPI_AWARENESS_UNAWARE`, the awareness of a window user32 scales from 96 dpi.
+const DPI_AWARENESS_UNAWARE: i32 = 0;
 
 /// The mode-list ceiling for [`enumerate_display_modes`].
 ///
@@ -300,6 +302,60 @@ pub fn system_dpi() -> u32 {
     dpi
 }
 
+/// Warn once when user32 scales `hwnd` by a system DPI other than 96.
+///
+/// A window keeps the DPI awareness of the thread that created it. For a
+/// DPI-unaware one user32 answers the window's rects and its mouse
+/// coordinates scaled by 96 over the system DPI, while `EnumDisplaySettingsW`
+/// and with it the adapter mode table and a fullscreen back buffer stay in
+/// physical pixels. The two spaces then disagree by that ratio and the device
+/// cannot bring them together, because the window exists before the device
+/// does; the line names the registry value that makes the process DPI-aware.
+///
+/// The mode table is left in physical pixels on purpose. `EnumDisplaySettingsW`
+/// does not take part in DPI virtualization on Windows either, so physical
+/// modes are what a DPI-unaware process is given there too, and a mode list
+/// scaled to the window's space would be one no Windows reports. The layer
+/// therefore warns and changes nothing.
+///
+/// Only a fullscreen device calls this. A windowed back buffer follows the
+/// request or the client rect, which share the scaled space with the mouse,
+/// so nothing disagrees there and the frame is only enlarged.
+///
+/// [`system_dpi`] is compared rather than `GetDpiForWindow`, which answers 96
+/// for a DPI-unaware window whatever the system DPI and so cannot tell a
+/// scaled window from an unscaled one.
+pub fn warn_if_dpi_scaled(hwnd: *mut c_void) {
+    // SAFETY: `GetWindowDpiAwarenessContext` accepts any HWND and only reads
+    // the window's record; a null or dead handle answers a null context.
+    let context = unsafe { GetWindowDpiAwarenessContext(hwnd) };
+    // SAFETY: `GetAwarenessFromDpiAwarenessContext` takes the context by
+    // value and dereferences nothing; one it does not know, null included,
+    // answers `DPI_AWARENESS_INVALID`.
+    let awareness = unsafe { GetAwarenessFromDpiAwarenessContext(context) };
+    // An invalid awareness comes from a null or dead window and passes
+    // silently here. `client_rect_dims` in `direct3d9` warns about the dead
+    // one; a null window is the caller's own case and is silent there too.
+    if awareness != DPI_AWARENESS_UNAWARE {
+        return;
+    }
+    let dpi = system_dpi();
+    if dpi == USER_DEFAULT_SCREEN_DPI {
+        return;
+    }
+    mtld3d_shared::log_once_warn!(
+        target: LOG_TARGET,
+        "display: the game window is DPI-unaware and the desktop runs at {dpi} dpi, so Wine \
+         scales the window's size and mouse coordinates by {USER_DEFAULT_SCREEN_DPI}/{dpi} while \
+         display modes and the back buffer stay in physical pixels; the game lays out its UI \
+         for a smaller screen than it renders to and its clicks miss the pointer; set the \
+         executable's file name, or the key's default value for every program, to \
+         \"~ HIGHDPIAWARE\" under \
+         HKCU\\Software\\Microsoft\\Windows NT\\CurrentVersion\\AppCompatFlags\\Layers, then \
+         restart the game"
+    );
+}
+
 /// Set `request` as the primary display's mode, `true` on success.
 ///
 /// Compare-first: a mode that is already current is left alone, which keeps
@@ -390,8 +446,10 @@ unsafe extern "system" {
     fn ChangeDisplaySettingsW(dev_mode: *mut DevModeW, flags: u32) -> i32;
     fn EnumDisplaySettingsW(device_name: *const u16, mode_num: u32, dev_mode: *mut DevModeW)
     -> i32;
+    fn GetAwarenessFromDpiAwarenessContext(context: *mut c_void) -> i32;
     fn GetMonitorInfoW(monitor: *mut c_void, info: *mut MonitorInfo) -> i32;
     fn GetSystemDpiForProcess(process: *mut c_void) -> u32;
+    fn GetWindowDpiAwarenessContext(hwnd: *mut c_void) -> *mut c_void;
     fn GetWindowLongW(hwnd: *mut c_void, index: i32) -> i32;
     fn GetWindowRect(hwnd: *mut c_void, rect: *mut Rect) -> i32;
     fn IsWindow(hwnd: *mut c_void) -> i32;
