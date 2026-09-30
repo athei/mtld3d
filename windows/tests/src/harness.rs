@@ -44,15 +44,19 @@ static ENVIRONMENT: RwLock<()> = RwLock::new(());
 /// The environment variable the layer reads its configuration overrides from.
 const CONFIG_VAR: &str = "MTLD3D_CONFIG";
 
-/// The display mode of the wineserver session, held by one fullscreen device at a time.
+/// The display mode of the wineserver session, held by one harness at a time.
 ///
 /// A fullscreen device sets a mode the whole session sees, so two of them
-/// live at once would each read the other's. A harness takes the mode when
-/// it goes fullscreen (created that way, or `Reset` into it), keeps it
-/// across further fullscreen resets, and gives it back when it comes back
-/// windowed or is torn down. Windowed devices never wait for it, which is
-/// the exclusion the suite always had. One fullscreen harness per test at a
-/// time: a second one on the same thread would wait for the first forever.
+/// live at once would each read the other's, and a test that reads the
+/// mode, the screen size or a rect derived from them while another test's
+/// device is fullscreen reads that test's mode. A harness takes the mode
+/// when it goes fullscreen (created that way, or `Reset` into it) or when
+/// the test asks through [`Harness::hold_display_mode`], and keeps it until
+/// it is torn down, through a windowed `Reset` too, so everything the test
+/// reads after the first take is its own device's doing. A windowed device
+/// whose test reads nothing of the mode never waits for it. One harness
+/// holding the mode per test at a time: a second one on the same thread
+/// would wait for the first forever.
 ///
 /// A flag under a mutex plus a condvar rather than a held `MutexGuard`,
 /// because the holder is a harness field and a guard there would put a
@@ -83,7 +87,7 @@ bitflags::bitflags! {
     struct HarnessState: u8 {
         /// [`Harness::release_device`] has released the device reference.
         const DEVICE_RELEASED = 1 << 0;
-        /// The device is fullscreen and the harness holds the session's display mode.
+        /// The harness holds the session's display mode until it is torn down.
         const HOLDS_DISPLAY_MODE = 1 << 1;
         /// The device window is another harness's, which destroys it.
         const BORROWED_WINDOW = 1 << 2;
@@ -2937,6 +2941,16 @@ impl Harness {
         win32::current_display_mode()
     }
 
+    /// The primary display's registry mode, from `EnumDisplaySettingsW`.
+    ///
+    /// The mode the desktop has while no device is fullscreen and the one a
+    /// fullscreen device puts back. A fullscreen device's mode-set does not
+    /// change it, so it reads the same whether or not a device holds a mode.
+    #[must_use]
+    pub fn registry_display_mode() -> (u32, u32) {
+        win32::registry_display_mode()
+    }
+
     /// user32 `GetClientRect` — the device window's client size.
     ///
     /// The space mouse coordinates arrive in, so equality with the back
@@ -3004,10 +3018,15 @@ impl Harness {
         hr
     }
 
-    /// Hold the session's display mode before reading geometry for a fullscreen transition.
+    /// Hold the session's display mode from here until the harness is torn down.
     ///
-    /// A following fullscreen [`Self::reset_params`] keeps the same ownership
-    /// interval rather than taking the non-reentrant mode lock again.
+    /// For a test that reads the display mode, the screen size or window
+    /// geometry it compares across a fullscreen transition: called before
+    /// the first such read, it keeps every other test's device out of
+    /// fullscreen for the rest of the test. A following fullscreen
+    /// [`Self::reset_params`] keeps the same ownership interval rather than
+    /// taking the non-reentrant mode lock again. Does nothing when the
+    /// harness already holds the mode.
     pub fn hold_display_mode(&self) {
         if !self.has(HarnessState::HOLDS_DISPLAY_MODE) {
             take_display_mode();
@@ -3018,21 +3037,15 @@ impl Harness {
     /// `Reset` with caller-built parameters (for malformed-input tests).
     ///
     /// Returns the hr; does not touch [`Self::dims`]. A fullscreen request
-    /// takes the session's display mode before the call; a windowed one
-    /// that succeeds gives it back.
+    /// takes the session's display mode before the call, and the harness
+    /// keeps it through a later windowed `Reset` until it is torn down, so
+    /// what the test reads after leaving fullscreen is still its own.
     pub fn reset_params(&self, pp: &mut D3DPRESENT_PARAMETERS) -> i32 {
         if pp.windowed == 0 {
             self.hold_display_mode();
         }
         // SAFETY: vtable thunk; `pp` is writable for the call.
-        let hr = unsafe {
-            (self.dev_vtbl().reset)(self.device, core::ptr::from_mut(pp).cast::<c_void>())
-        };
-        if hr == 0 && pp.windowed != 0 && self.has(HarnessState::HOLDS_DISPLAY_MODE) {
-            self.set(HarnessState::HOLDS_DISPLAY_MODE, false);
-            release_display_mode();
-        }
-        hr
+        unsafe { (self.dev_vtbl().reset)(self.device, core::ptr::from_mut(pp).cast::<c_void>()) }
     }
 
     const fn has(&self, flag: HarnessState) -> bool {

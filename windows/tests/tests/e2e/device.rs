@@ -1873,6 +1873,9 @@ fn rejected_reset_keeps_the_window_mode() {
         window_style: WindowStyle::Framed,
         ..HarnessConfig::default()
     });
+    // Held before the first read of the window's geometry, so no other
+    // test's mode-set falls between the reads this test compares.
+    h.hold_display_mode();
     let original_rect = h.window_rect();
     let original_style = h.window_style();
     let original_exstyle = h.window_exstyle();
@@ -1920,6 +1923,9 @@ fn rejected_zero_dimension_reset_restores_fullscreen() {
         window_style: WindowStyle::Framed,
         ..HarnessConfig::default()
     });
+    // Held before the first read of the window's geometry, so no other
+    // test's mode-set falls between the reads this test compares.
+    h.hold_display_mode();
     let original_rect = h.window_rect();
     let original_client = h.client_size();
     let original_style = h.window_style();
@@ -1996,6 +2002,9 @@ fn reset_fullscreen_adopts_monitor_rect_and_restores() {
         window_style: WindowStyle::Framed,
         ..HarnessConfig::default()
     });
+    // Held before the first read of the window's geometry, so no other
+    // test's mode-set falls between the reads this test compares.
+    h.hold_display_mode();
     let hwnd = h.hwnd();
     let windowed_rect = h.window_rect();
     let windowed_style = h.window_style();
@@ -2074,6 +2083,9 @@ fn nowindowchanges_leaves_the_device_window_alone() {
         behavior_flags: D3DCREATE_HARDWARE_VERTEXPROCESSING | D3DCREATE_NOWINDOWCHANGES,
         ..HarnessConfig::default()
     });
+    // Held before the first read of the window's geometry, so no other
+    // test's mode-set falls between the reads this test compares.
+    h.hold_display_mode();
     let windowed_rect = h.window_rect();
     let windowed_style = h.window_style();
     assert_ne!(
@@ -2394,7 +2406,7 @@ const MAX_RETARGET_ROUNDS: u32 = 2000;
 /// How long workers wait for a concurrent-retarget handshake or transition.
 const FULLSCREEN_PROGRESS_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Time the check deliberately leaves the fullscreen worker without display ownership.
+/// Time the fullscreen worker withholds its ownership signal once the windowed workers are ready.
 const DELAYED_FULLSCREEN_START: Duration = Duration::from_millis(100);
 
 /// Wait for every windowed worker to reach one handshake boundary.
@@ -2435,7 +2447,7 @@ fn publish_transition(senders: &[Sender<u32>], trips: u32) -> Result<(), String>
     Ok(())
 }
 
-/// Wait until the fullscreen worker owns the display mode.
+/// Wait until the fullscreen worker signals that it owns the display mode.
 fn wait_for_fullscreen_start(receiver: &Receiver<u32>) -> Result<(), String> {
     match receiver.recv_timeout(FULLSCREEN_PROGRESS_TIMEOUT) {
         Ok(0) => Ok(()),
@@ -2443,11 +2455,11 @@ fn wait_for_fullscreen_start(receiver: &Receiver<u32>) -> Result<(), String> {
             "the first fullscreen progress signal was trip {trips}, not the ownership signal"
         )),
         Err(RecvTimeoutError::Timeout) => Err(format!(
-            "the fullscreen worker did not acquire the display mode within {} seconds",
+            "the fullscreen worker did not signal display-mode ownership within {} seconds",
             FULLSCREEN_PROGRESS_TIMEOUT.as_secs(),
         )),
         Err(RecvTimeoutError::Disconnected) => {
-            Err("the fullscreen worker stopped before acquiring the display mode".to_owned())
+            Err("the fullscreen worker stopped before signalling display-mode ownership".to_owned())
         }
     }
 }
@@ -2610,7 +2622,6 @@ fn cycle_fullscreen(
                 "a windowed worker stopped after {trips} of {FULLSCREEN_TRIPS} round trips"
             ));
         }
-        h.hold_display_mode();
         let (screen_w, screen_h) = Harness::screen_size();
         let mut pp = fullscreen_params(h.hwnd(), screen_w, screen_h);
         let hr = h.reset_params(&mut pp);
@@ -2703,20 +2714,25 @@ fn concurrent_retarget_outcomes_report_every_returned_failure() {
 /// is shared by every device in the process sends the other devices'
 /// messages to the default procedure for the duration of the move, so the
 /// back buffer stays at the size the `Reset` gave it and the class cursor
-/// replaces the device's. The fullscreen worker waits until all three
-/// windowed workers are held at the start boundary, then owns the display
-/// mode before releasing them, so a delayed fullscreen start cannot consume
-/// the bounded retarget rounds. After release, every windowed worker enters a
-/// measured round before the fullscreen cycles begin, and each pauses after a
-/// bounded burst without fullscreen progress. Every device and window is
-/// created and torn down one thread at a time: the driver's window teardown
-/// and another thread's window update take two locks in opposite orders.
+/// replaces the device's. The fullscreen worker holds the session's display
+/// mode from the creation of its device to the end of the test, and the
+/// windowed workers are spawned only once it does, so no other test sets a
+/// mode while a windowed worker's windows wait without answering messages.
+/// It waits until all three windowed workers are held at the start boundary,
+/// then signals its ownership of the display mode to release them, so a
+/// delayed fullscreen start cannot consume the bounded retarget rounds.
+/// After release, every windowed worker enters a measured round before the
+/// fullscreen cycles begin, and each pauses after a bounded burst without
+/// fullscreen progress. Every device and window is created and torn down one
+/// thread at a time: the driver's window teardown and another thread's
+/// window update take two locks in opposite orders.
 #[test]
 fn concurrent_retargets_deliver_every_window_message_to_its_own_device() {
     const WINDOWED_WORKERS: usize = 3;
     let finished = AtomicUsize::new(0);
     let one_at_a_time = Mutex::new(());
     let done = Barrier::new(WINDOWED_WORKERS + 1);
+    let (holding_sender, holding_receiver) = channel();
     let (ready_sender, ready_receiver) = channel();
     let (started_sender, started_receiver) = channel();
     let (progress_senders, progress_receivers): (Vec<_>, Vec<_>) =
@@ -2730,8 +2746,18 @@ fn concurrent_retargets_deliver_every_window_message_to_its_own_device() {
             move || {
                 let h = {
                     let _serial = one_at_a_time.lock().unwrap_or_else(PoisonError::into_inner);
-                    Harness::new()
+                    let h = Harness::new();
+                    // Held for the whole test, and taken before a windowed
+                    // worker exists: a mode-set waits for every window to
+                    // answer its `WM_DISPLAYCHANGE`, and a windowed worker
+                    // waiting for this one answers nothing, so another
+                    // test's mode-set in that span would hold the mode
+                    // until the workers' bounded waits expire.
+                    h.hold_display_mode();
+                    h
                 };
+                // The parent is gone only if it failed, which ends the test.
+                let _ = holding_sender.send(());
                 let outcome = wait_for_windowed_workers(
                     &ready_receiver,
                     WINDOWED_WORKERS,
@@ -2742,8 +2768,8 @@ fn concurrent_retargets_deliver_every_window_message_to_its_own_device() {
                     match started_receiver.try_recv() {
                         Err(TryRecvError::Empty) => Ok(()),
                         Ok(()) => Err(
-                            "a windowed worker began retargeting before fullscreen display \
-                             ownership"
+                            "a windowed worker began retargeting before the fullscreen worker \
+                             signalled its ownership of the display mode"
                                 .to_owned(),
                         ),
                         Err(TryRecvError::Disconnected) => {
@@ -2751,10 +2777,7 @@ fn concurrent_retargets_deliver_every_window_message_to_its_own_device() {
                         }
                     }
                 })
-                .and_then(|()| {
-                    h.hold_display_mode();
-                    publish_transition(&progress_senders, 0)
-                })
+                .and_then(|()| publish_transition(&progress_senders, 0))
                 .and_then(|()| {
                     wait_for_windowed_workers(
                         &started_receiver,
@@ -2770,6 +2793,15 @@ fn concurrent_retargets_deliver_every_window_message_to_its_own_device() {
                 outcome
             }
         });
+        // No windowed worker is spawned before the fullscreen worker holds
+        // the display mode; the wait is for a test that holds it now.
+        assert!(
+            holding_receiver
+                .recv_timeout(FULLSCREEN_PROGRESS_TIMEOUT)
+                .is_ok(),
+            "the fullscreen worker did not take the display mode within {} seconds",
+            FULLSCREEN_PROGRESS_TIMEOUT.as_secs(),
+        );
         let windowed: Vec<_> = progress_receivers
             .into_iter()
             .map(|progress| {
@@ -3007,6 +3039,9 @@ fn reset_fullscreen_sets_the_display_mode() {
         return;
     }
     let h = Harness::new();
+    // Held from before the first read of the mode to the end of the test:
+    // the windowed Reset and the release below are read against `native`.
+    h.hold_display_mode();
     let native = Harness::current_display_mode();
     let windowed_client = h.client_size();
     assert_ne!(
@@ -3061,7 +3096,10 @@ fn reset_fullscreen_sets_the_display_mode() {
         (640, 480),
         "mode set again"
     );
-    drop(h);
+    // The harness keeps the session's display mode until it is dropped, so
+    // the device is released by itself and the mode read before another
+    // test can set one.
+    assert_eq!(h.release_device(), 0, "the device is fully released");
     assert_eq!(
         Harness::current_display_mode(),
         native,
@@ -3075,13 +3113,16 @@ fn fullscreen_device_restores_the_mode_on_deactivation_and_re_sets_it_on_activat
     if !display_lists_640x480() {
         return;
     }
-    let native = Harness::current_display_mode();
     let h = Harness::fullscreen(640, 480);
     assert_eq!(
         Harness::current_display_mode(),
         (640, 480),
         "fullscreen create sets the mode"
     );
+    // The registry mode rather than the mode current before the create:
+    // another test's device may have been fullscreen then.
+    let native = Harness::registry_display_mode();
+    assert_ne!(native, (640, 480), "the desktop is not at the test mode");
 
     h.send_window_message(WM_ACTIVATEAPP, 0, 0);
     assert_eq!(
@@ -3135,6 +3176,9 @@ fn set_cursor_properties_rejects_oversize() {
     // check sizes the cursor relative to GetAdapterDisplayMode (the desktop
     // resolution, not the backbuffer).
     let h = Harness::new();
+    // The display mode read below has to stay the mode the oversize cursor
+    // is checked against.
+    h.hold_display_mode();
 
     let mut mode = D3DDISPLAYMODE {
         width: 0,

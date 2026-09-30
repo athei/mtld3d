@@ -653,17 +653,32 @@ const _: () = assert!(size_of::<DevModeW>() == DEV_MODE_SIZE as usize);
 /// Panics if the query fails, which means the prefix has no display at all.
 pub fn current_display_mode() -> (u32, u32) {
     const ENUM_CURRENT_SETTINGS: u32 = 0xFFFF_FFFF;
+    display_settings(ENUM_CURRENT_SETTINGS, "ENUM_CURRENT_SETTINGS")
+}
+
+/// The primary display's registry mode (`EnumDisplaySettingsW(ENUM_REGISTRY_SETTINGS)`).
+///
+/// The mode a fullscreen device puts back on the way out. A mode-set that
+/// lasts only while a device is fullscreen leaves it alone.
+///
+/// # Panics
+///
+/// Panics if the query fails, which means the prefix has no display at all.
+pub fn registry_display_mode() -> (u32, u32) {
+    const ENUM_REGISTRY_SETTINGS: u32 = 0xFFFF_FFFE;
+    display_settings(ENUM_REGISTRY_SETTINGS, "ENUM_REGISTRY_SETTINGS")
+}
+
+/// The size `EnumDisplaySettingsW` answers for one of its two pseudo-indices.
+fn display_settings(mode_num: u32, name: &str) -> (u32, u32) {
     // SAFETY: `DevModeW` is all-integer POD, so the all-zero bit pattern is a
     // valid value.
     let mut dm: DevModeW = unsafe { core::mem::zeroed() };
     dm.size = DEV_MODE_SIZE;
     // SAFETY: Win32 thunk; a null device name selects the primary display
     // and `dm` is an owned local with `size` set per the API contract.
-    let ok = unsafe { EnumDisplaySettingsW(core::ptr::null(), ENUM_CURRENT_SETTINGS, &raw mut dm) };
-    assert!(
-        ok != 0,
-        "EnumDisplaySettingsW(ENUM_CURRENT_SETTINGS) failed"
-    );
+    let ok = unsafe { EnumDisplaySettingsW(core::ptr::null(), mode_num, &raw mut dm) };
+    assert!(ok != 0, "EnumDisplaySettingsW({name}) failed");
     (dm.pels_width, dm.pels_height)
 }
 
