@@ -586,6 +586,79 @@ impl FfState {
         out
     }
 
+    /// The FF VS key's active, directional and spot light masks, over compacted shader slots.
+    ///
+    /// Bit `i` refers to compacted slot `i` of [`Self::resolve_active_lights`],
+    /// the packing order `build_lights_section` uses: the active mask is the
+    /// low `n` bits, and a slot with neither type bit is POINT.
+    fn compacted_light_masks(&self) -> [u8; 3] {
+        let active = self.resolve_active_lights();
+        let mut dir = 0u8;
+        let mut spot = 0u8;
+        for (i, l) in active.as_slice().iter().enumerate() {
+            let bit = 1u8 << i;
+            if l.ty == D3DLIGHT_DIRECTIONAL {
+                dir |= bit;
+            } else if l.ty == D3DLIGHT_SPOT {
+                spot |= bit;
+            }
+        }
+        // `len` ≤ MAX_ACTIVE_LIGHTS (8); the active mask is the low `len`
+        // bits set. `0xFFu8 >> (8 - len)` yields exactly that (and 0 for
+        // len == 0, all-ones for len == 8) without an overflowing shift.
+        let active_mask = if active.len == 0 {
+            0u8
+        } else {
+            0xFFu8 >> (8 - active.len)
+        };
+        [active_mask, dir, spot]
+    }
+
+    /// The FF VS source input a transform write can move: the world-palette high-water mark.
+    ///
+    /// [`Self::ff_vs_row_count`] sizes a blended draw's palette from it, and
+    /// nothing else a transform write changes reaches the FF VS key or row
+    /// count (matrices feed only the constant sections). So a `set_transform`
+    /// or `multiply_transform` call that leaves this value unchanged leaves
+    /// the FF VS source unchanged, and the device marks `VS_SOURCE` for it
+    /// only when the value moves. It is one field read, so a transform write
+    /// stays O(1) whatever lights exist.
+    #[must_use]
+    pub const fn vs_source_transform_inputs(&self) -> u16 {
+        self.world_palette_high_water
+    }
+
+    /// The FF VS source inputs a light write can move: which lights are active, with which type.
+    ///
+    /// These are the `FfState` fields behind the key's active, directional
+    /// and spot light masks in [`Self::build_vs_key`]. A light's parameters
+    /// feed only the constant sections, so a `set_light_at` or
+    /// `set_light_enabled_at` call that leaves this value unchanged leaves
+    /// the FF VS key and row count unchanged, and the device marks
+    /// `VS_SOURCE` for it only when the value moves. The texture-stage inputs
+    /// are not covered, since `SetTextureStageState` marks the source itself.
+    ///
+    /// With no light past the fast-path slots, the physical masks stand in
+    /// for the compacted ones, which they determine, and cost three `AND`s.
+    /// Otherwise the compacted masks are computed. A tag byte keeps the two
+    /// encodings from comparing equal.
+    #[must_use]
+    pub fn vs_source_light_inputs(&self) -> u32 {
+        let lights = if self.overflow_lights.is_empty() {
+            let active = self.light_active_mask();
+            [
+                active,
+                self.light_directional_mask & active,
+                self.light_spot_mask & active,
+                0,
+            ]
+        } else {
+            let [active, dir, spot] = self.compacted_light_masks();
+            [active, dir, spot, 1]
+        };
+        u32::from_le_bytes(lights)
+    }
+
     /// Bit `i` set iff the active light at slot `i` is DIRECTIONAL.
     ///
     /// Only meaningful when the corresponding `light_active_mask` bit is set.
@@ -1107,29 +1180,10 @@ impl FfState {
         // equals the physical slots, so these masks are byte-identical to the
         // pre-compaction `light_active_mask()` / `light_directional_mask()` /
         // `light_spot_mask()`.
-        let (light_active_mask, light_directional_mask, light_spot_mask) = if lighting_enabled {
-            let active = self.resolve_active_lights();
-            let mut dir = 0u8;
-            let mut spot = 0u8;
-            for (i, l) in active.as_slice().iter().enumerate() {
-                let bit = 1u8 << i;
-                if l.ty == D3DLIGHT_DIRECTIONAL {
-                    dir |= bit;
-                } else if l.ty == D3DLIGHT_SPOT {
-                    spot |= bit;
-                }
-            }
-            // `len` ≤ MAX_ACTIVE_LIGHTS (8); the active mask is the low `len`
-            // bits set. `0xFFu8 >> (8 - len)` yields exactly that (and 0 for
-            // len == 0, all-ones for len == 8) without an overflowing shift.
-            let active_mask = if active.len == 0 {
-                0u8
-            } else {
-                0xFFu8 >> (8 - active.len)
-            };
-            (active_mask, dir, spot)
+        let [light_active_mask, light_directional_mask, light_spot_mask] = if lighting_enabled {
+            self.compacted_light_masks()
         } else {
-            (0, 0, 0)
+            [0; 3]
         };
         // Decode per-stage TCI mode + input coord-set index from
         // `D3DTSS_TEXCOORDINDEX`, and texture-transform flags from

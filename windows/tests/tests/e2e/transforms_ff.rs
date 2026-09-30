@@ -1454,3 +1454,197 @@ fn indexed_vertex_blend_bounds_the_palette_at_the_advertised_index() {
         );
     }
 }
+
+// ── FF VS source inputs changing between two draws of one frame ──
+
+/// A lit quad facing the viewer, centred on `x` in clip space.
+fn lit_quad_at(x: f32) -> [LitVertex; 4] {
+    [(-0.2, 0.2), (-0.2, -0.2), (0.2, 0.2), (0.2, -0.2)].map(|(dx, dy)| LitVertex {
+        x: x + dx,
+        y: dy,
+        z: 0.5,
+        nx: 0.0,
+        ny: 0.0,
+        nz: -1.0,
+    })
+}
+
+/// Lighting on, identity transforms, `XYZ | NORMAL`, and a material of `diffuse` alone.
+fn arm_lit_quads(h: &Harness, diffuse: D3DCOLORVALUE) {
+    assert_eq!(h.set_render_state(D3DRS_LIGHTING, 1), 0, "lighting on");
+    assert_eq!(h.set_render_state(D3DRS_CULLMODE, D3DCULL_NONE), 0);
+    for state in [D3DTS_WORLD, D3DTS_VIEW, D3DTS_PROJECTION] {
+        assert_eq!(h.set_transform(state, &IDENTITY), 0, "SetTransform");
+    }
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_NORMAL), 0, "SetFVF");
+    h.select_diffuse_stage(0);
+    assert_eq!(h.set_material(&diffuse_material(diffuse)), 0, "SetMaterial");
+}
+
+const fn diffuse_material(diffuse: D3DCOLORVALUE) -> D3DMATERIAL9 {
+    D3DMATERIAL9 {
+        diffuse,
+        ambient: D3DCOLORVALUE {
+            r: 0.0,
+            g: 0.0,
+            b: 0.0,
+            a: 0.0,
+        },
+        specular: D3DCOLORVALUE {
+            r: 0.0,
+            g: 0.0,
+            b: 0.0,
+            a: 0.0,
+        },
+        emissive: D3DCOLORVALUE {
+            r: 0.0,
+            g: 0.0,
+            b: 0.0,
+            a: 0.0,
+        },
+        power: 0.0,
+    }
+}
+
+const fn opaque(r: f32, g: f32, b: f32) -> D3DCOLORVALUE {
+    D3DCOLORVALUE { r, g, b, a: 1.0 }
+}
+
+/// The `(r, g, b)` bytes of the back-buffer pixel at `(x, 240)`.
+fn rgb_at(h: &Harness, x: u32) -> (u32, u32, u32) {
+    let px = h.read_pixel(x, 240);
+    ((px >> 16) & 0xff, (px >> 8) & 0xff, px & 0xff)
+}
+
+#[test]
+fn light_enable_and_material_between_draws_of_one_frame_reach_the_later_draws() {
+    // A light enable moves the FF VS key's active-light mask, so the draw after
+    // it must build a new vertex shader; a material write moves only the
+    // constants, which the draw after it must still upload.
+    let h = Harness::new();
+    arm_lit_quads(&h, opaque(1.0, 0.0, 0.0));
+    let light = D3DLIGHT9 {
+        type_: D3DLIGHT_DIRECTIONAL,
+        diffuse: opaque(1.0, 1.0, 1.0),
+        direction: D3DVECTOR {
+            x: 0.0,
+            y: 0.0,
+            z: 1.0,
+        },
+        ..D3DLIGHT9::default()
+    };
+    assert_eq!(h.set_light(0, &light), 0, "SetLight");
+    let (left, middle, right) = (lit_quad_at(-0.6), lit_quad_at(0.0), lit_quad_at(0.6));
+    h.render_once(BLUE, |d| {
+        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLESTRIP, 2, &left), 0);
+        assert_eq!(d.light_enable(0, true), 0, "LightEnable");
+        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLESTRIP, 2, &middle), 0);
+        assert_eq!(
+            d.set_material(&diffuse_material(opaque(0.0, 1.0, 0.0))),
+            0,
+            "SetMaterial"
+        );
+        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLESTRIP, 2, &right), 0);
+    });
+    let (r, g, b) = rgb_at(&h, 128);
+    assert!(
+        r <= 2 && g <= 2 && b <= 2,
+        "no light enabled yet: black, got ({r}, {g}, {b})"
+    );
+    let (r, g, b) = rgb_at(&h, 320);
+    assert!(
+        r >= 0xF0 && g <= 2 && b <= 2,
+        "the light enabled between draws lights the red material, got ({r}, {g}, {b})"
+    );
+    let (r, g, b) = rgb_at(&h, 512);
+    assert!(
+        r <= 2 && g >= 0xF0 && b <= 2,
+        "the material written between draws is green, got ({r}, {g}, {b})"
+    );
+}
+
+#[test]
+fn light_type_change_between_draws_of_one_frame_reaches_the_later_draws() {
+    // One light, retyped between draws. Its position sits on the eye side of
+    // the quads and its direction points back at the eye, so as a POINT light
+    // it lights them and as a DIRECTIONAL light it arrives from behind and
+    // leaves them black. A draw that kept the previous type's vertex shader
+    // would read the new parameters the old way and get the other answer.
+    let h = Harness::new();
+    arm_lit_quads(&h, opaque(1.0, 1.0, 1.0));
+    let light = |type_| D3DLIGHT9 {
+        type_,
+        diffuse: opaque(1.0, 1.0, 1.0),
+        position: D3DVECTOR {
+            x: 0.0,
+            y: 0.0,
+            z: -1.0,
+        },
+        direction: D3DVECTOR {
+            x: 0.0,
+            y: 0.0,
+            z: -1.0,
+        },
+        range: 10.0,
+        attenuation0: 1.0,
+        ..D3DLIGHT9::default()
+    };
+    assert_eq!(h.set_light(0, &light(D3DLIGHT_POINT)), 0, "SetLight POINT");
+    assert_eq!(h.light_enable(0, true), 0, "LightEnable");
+    let (left, middle, right) = (lit_quad_at(-0.6), lit_quad_at(0.0), lit_quad_at(0.6));
+    h.render_once(BLUE, |d| {
+        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLESTRIP, 2, &left), 0);
+        assert_eq!(d.set_light(0, &light(D3DLIGHT_DIRECTIONAL)), 0);
+        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLESTRIP, 2, &middle), 0);
+        assert_eq!(d.set_light(0, &light(D3DLIGHT_POINT)), 0);
+        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLESTRIP, 2, &right), 0);
+    });
+    for (x, what) in [(128, "first"), (512, "third")] {
+        let (r, g, b) = rgb_at(&h, x);
+        assert!(
+            r >= 0xC0 && g >= 0xC0 && b >= 0xC0,
+            "{what} draw, POINT light on the eye side: lit, got ({r}, {g}, {b})"
+        );
+    }
+    let (r, g, b) = rgb_at(&h, 320);
+    assert!(
+        r <= 2 && g <= 2 && b <= 2,
+        "second draw, DIRECTIONAL light from behind: black, got ({r}, {g}, {b})"
+    );
+}
+
+#[test]
+fn palette_growth_between_draws_of_one_frame_reaches_the_second_draw() {
+    // Raising the world-palette high-water mark between draws widens the FF
+    // VS constant block a blended draw binds, so the draw after it must carry
+    // the larger row count to reach the new matrix.
+    let h = Harness::new();
+    assert_eq!(h.set_render_state(D3DRS_LIGHTING, 0), 0);
+    assert_eq!(h.set_render_state(D3DRS_CULLMODE, D3DCULL_NONE), 0);
+    for state in [D3DTS_VIEW, D3DTS_PROJECTION] {
+        assert_eq!(h.set_transform(state, &IDENTITY), 0);
+    }
+    assert_eq!(h.set_transform(D3DTS_WORLD, &IDENTITY), 0);
+    assert_eq!(h.set_transform(D3DTS_WORLD + 1, &translate_x(0.5)), 0);
+    assert_eq!(h.set_render_state(D3DRS_VERTEXBLEND, D3DVBF_1WEIGHTS), 0);
+    assert_eq!(h.set_render_state(D3DRS_INDEXEDVERTEXBLENDENABLE, 1), 0);
+    assert_eq!(
+        h.set_fvf(D3DFVF_XYZB2 | D3DFVF_LASTBETA_UBYTE4 | D3DFVF_DIFFUSE),
+        0
+    );
+    h.select_diffuse_stage(0);
+
+    let (bone_1, bone_3) = (indexed_quad(1), indexed_quad(3));
+    h.render_once(BLUE, |d| {
+        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLESTRIP, 2, &bone_1), 0);
+        assert_eq!(d.set_transform(D3DTS_WORLD + 3, &translate_x(-0.5)), 0);
+        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLESTRIP, 2, &bone_3), 0);
+    });
+    assert_eq!(h.read_pixel(480, 240), BLEND_RED, "bone 1 shifted right");
+    assert_eq!(
+        h.read_pixel(160, 240),
+        BLEND_RED,
+        "bone 3, set between the draws, shifted left"
+    );
+    assert_eq!(h.read_pixel(320, 240), BLUE, "nothing left at the origin");
+}

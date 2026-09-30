@@ -1347,6 +1347,23 @@ impl DeviceInner {
         result
     }
 
+    /// Dirty bits for a transform or light write to the fixed-function state.
+    ///
+    /// The write always changes the FF VS constants. It changes the FF VS
+    /// source only when `source_moved`: the thunk compares
+    /// [`FfState::vs_source_transform_inputs`] or
+    /// [`FfState::vs_source_light_inputs`] across the write, since a matrix or
+    /// a light's parameters alone never reach the key, while palette growth, a
+    /// light enable or a light type change can. The result then goes through
+    /// [`Self::ff_aware_mask`].
+    fn ff_vs_write_mask(&self, source_moved: bool) -> SnapshotDirty {
+        let mut mask = SnapshotDirty::VS_CONST;
+        if source_moved {
+            mask |= SnapshotDirty::VS_SOURCE;
+        }
+        self.ff_aware_mask(mask)
+    }
+
     /// Start a new recording.
     ///
     /// `BeginStateBlock`-only path — returns `false` if a recording is
@@ -9126,8 +9143,9 @@ extern "system" fn device_set_transform(
         return D3D_OK;
     }
     // Unknown D3DTS_* indices (vertex blending etc.) are silently accepted.
+    let inputs = dev.ff_state().vs_source_transform_inputs();
     dev.ff_state_mut().set_transform(state, &m);
-    let mut mask = dev.ff_aware_mask(SnapshotDirty::VS_SOURCE | SnapshotDirty::VS_CONST);
+    let mut mask = dev.ff_vs_write_mask(dev.ff_state().vs_source_transform_inputs() != inputs);
     // Active table fog keys its Z-vs-W source on the projection matrix's
     // 4th column (`VariantKey::fog_source_w`), so a PROJECTION write must
     // rebuild the variant. Gated on live table fog so vertex-fog-only games
@@ -9193,8 +9211,9 @@ extern "system" fn device_multiply_transform(
     // EndStateBlock returns the multiplied matrix, and a later Capture/Apply
     // does not restore it). So
     // always apply to live FF state, regardless of recording.
+    let inputs = dev.ff_state().vs_source_transform_inputs();
     dev.ff_state_mut().multiply_transform(state, &rhs);
-    let mask = dev.ff_aware_mask(SnapshotDirty::VS_SOURCE | SnapshotDirty::VS_CONST);
+    let mask = dev.ff_vs_write_mask(dev.ff_state().vs_source_transform_inputs() != inputs);
     dev.mark_snapshot_dirty(mask);
     0 // S_OK
 }
@@ -9257,8 +9276,9 @@ extern "system" fn device_set_material(this: *mut c_void, material: *const c_voi
         rec.record(StateOp::Material(m));
         return D3D_OK;
     }
+    // The material feeds the constant sections alone, never the FF VS key.
     dev.ff_state_mut().set_material(&m);
-    let mask = dev.ff_aware_mask(SnapshotDirty::VS_SOURCE | SnapshotDirty::VS_CONST);
+    let mask = dev.ff_aware_mask(SnapshotDirty::VS_CONST);
     dev.mark_snapshot_dirty(mask);
     0 // S_OK
 }
@@ -9295,8 +9315,9 @@ extern "system" fn device_set_light(this: *mut c_void, index: u32, light: *const
         rec.record(StateOp::Light { index, light: l });
         return D3D_OK;
     }
+    let inputs = dev.ff_state().vs_source_light_inputs();
     dev.ff_state_mut().set_light_at(index, &l);
-    let mask = dev.ff_aware_mask(SnapshotDirty::VS_SOURCE | SnapshotDirty::VS_CONST);
+    let mask = dev.ff_vs_write_mask(dev.ff_state().vs_source_light_inputs() != inputs);
     dev.mark_snapshot_dirty(mask);
     0 // S_OK
 }
@@ -9338,8 +9359,9 @@ extern "system" fn device_light_enable(this: *mut c_void, index: u32, enable: i3
         rec.record(StateOp::LightEnable { index, enable: on });
         return D3D_OK;
     }
+    let inputs = dev.ff_state().vs_source_light_inputs();
     dev.ff_state_mut().set_light_enabled_at(index, on);
-    let mask = dev.ff_aware_mask(SnapshotDirty::VS_SOURCE | SnapshotDirty::VS_CONST);
+    let mask = dev.ff_vs_write_mask(dev.ff_state().vs_source_light_inputs() != inputs);
     dev.mark_snapshot_dirty(mask);
     0 // S_OK
 }

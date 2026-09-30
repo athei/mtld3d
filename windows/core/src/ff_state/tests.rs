@@ -8,9 +8,11 @@
 //! the texture-stage-state warn latch firing per stage for unconsumed slots and never for the
 //! bump-environment slots, which route to the texbem uniform alone, and the unimplemented
 //! texture-operation warning firing at the write, once per slot, while a value outside the
-//! `D3DTOP_*` space reads as the stage default instead, and the draw-time narrowing of stage
+//! `D3DTOP_*` space reads as the stage default instead, the draw-time narrowing of stage
 //! arguments and result registers reading the stage default with one warning per stage and
-//! state.
+//! state, and the FF VS source fingerprint moving on every palette growth, light enable and
+//! light type change while holding across matrix, material and light-parameter writes that
+//! leave the FF VS key and row count alone.
 
 use std::sync::Mutex;
 
@@ -1821,4 +1823,568 @@ fn a_result_register_outside_current_and_temp_reads_the_stage_default() {
         warnings_containing("FF: stage 5 D3DTSS_28 = 0x2 outside its value space"),
         1
     );
+}
+
+// ── Which FF writes can move the FF VS source ──
+//
+// The SetTransform and MultiplyTransform thunks compare
+// `FfState::vs_source_transform_inputs` across the write, SetLight and
+// LightEnable compare `FfState::vs_source_light_inputs`, and SetMaterial
+// never marks `VS_SOURCE`. These tests hold each comparison to the key and
+// row count it stands in for.
+
+/// The fingerprint a transform thunk compares, widened for the tests.
+fn transform_inputs(state: &FfState) -> u64 {
+    u64::from(state.vs_source_transform_inputs())
+}
+
+/// The fingerprint a light thunk compares, widened for the tests.
+fn light_inputs(state: &FfState) -> u64 {
+    u64::from(state.vs_source_light_inputs())
+}
+
+/// `SetMaterial` compares nothing: it never marks `VS_SOURCE`.
+const fn material_inputs(_: &FfState) -> u64 {
+    0
+}
+
+/// The FF VS sources a draw could build from `state`: key and row count.
+///
+/// One unlit, one lit with specular, and one lit with indexed three-weight
+/// blending over a declaration with weights and indices, so every
+/// setter-owned input (the light masks, the palette extent) is read by at
+/// least one of them.
+fn vs_sources(state: &FfState) -> Vec<(super::FfVsKey, u16)> {
+    use mtld3d_types::{
+        D3DRS_INDEXEDVERTEXBLENDENABLE, D3DRS_LIGHTING, D3DRS_SPECULARENABLE, D3DRS_VERTEXBLEND,
+        D3DVBF_3WEIGHTS,
+    };
+    let plain = FfVsLayout {
+        flags: FfVsLayoutFlags::HAS_NORMAL,
+        tex_coord_count: 1,
+        tex_coord_dims: [2, 0, 0, 0, 0, 0, 0, 0],
+        declared_weights_count: 0,
+    };
+    let blended = FfVsLayout {
+        flags: FfVsLayoutFlags::HAS_NORMAL | FfVsLayoutFlags::DECLARED_INDICES,
+        declared_weights_count: 3,
+        ..plain
+    };
+    let unlit = rs();
+    let mut lit = rs();
+    lit[D3DRS_LIGHTING as usize] = 1;
+    lit[D3DRS_SPECULARENABLE as usize] = 1;
+    let mut blend = lit;
+    blend[D3DRS_VERTEXBLEND as usize] = D3DVBF_3WEIGHTS;
+    blend[D3DRS_INDEXEDVERTEXBLENDENABLE as usize] = 1;
+    [(unlit, plain), (lit, plain), (blend, blended)]
+        .iter()
+        .map(|(states, layout)| {
+            let key = state.build_vs_key(states, *layout, 0b1);
+            let rows = state.ff_vs_row_count(&key);
+            (key, rows)
+        })
+        .collect()
+}
+
+/// A matrix whose every element depends on `seed`, including the 4th column.
+fn seeded_matrix(seed: f32) -> D3DMATRIX {
+    let mut m = D3DMATRIX::IDENTITY;
+    for (i, value) in m.m.iter_mut().enumerate() {
+        let i = f32::from(u8::try_from(i).expect("16 elements fit u8"));
+        *value = (seed * (i + 1.0)).mul_add(0.125, *value);
+    }
+    m
+}
+
+/// A light of type `ty` whose every parameter depends on `seed`.
+fn seeded_light(ty: u32, seed: f32) -> mtld3d_types::D3DLIGHT9 {
+    use mtld3d_types::{D3DCOLORVALUE, D3DLIGHT9, D3DVECTOR};
+    let color = D3DCOLORVALUE {
+        r: seed,
+        g: seed * 0.5,
+        b: seed * 0.25,
+        a: seed * 0.125,
+    };
+    let vector = D3DVECTOR {
+        x: seed,
+        y: -seed,
+        z: seed + 1.0,
+    };
+    D3DLIGHT9 {
+        type_: ty,
+        diffuse: color,
+        specular: color,
+        ambient: color,
+        position: vector,
+        direction: vector,
+        range: seed * 10.0,
+        falloff: seed,
+        attenuation0: seed,
+        attenuation1: seed * 0.5,
+        attenuation2: seed * 0.25,
+        theta: seed * 0.1,
+        phi: seed * 0.2,
+    }
+}
+
+/// A material whose every parameter depends on `seed`.
+fn seeded_material(seed: f32) -> mtld3d_types::D3DMATERIAL9 {
+    use mtld3d_types::{D3DCOLORVALUE, D3DMATERIAL9};
+    let color = D3DCOLORVALUE {
+        r: seed,
+        g: seed * 0.5,
+        b: seed * 0.25,
+        a: seed * 0.125,
+    };
+    D3DMATERIAL9 {
+        diffuse: color,
+        ambient: color,
+        specular: color,
+        emissive: color,
+        power: seed * 8.0,
+    }
+}
+
+/// Lights 0 (POINT) and 1 (SPOT) set and enabled; slot 2 set DIRECTIONAL but disabled.
+fn lit_state() -> FfState {
+    use mtld3d_types::{D3DLIGHT_DIRECTIONAL, D3DLIGHT_POINT, D3DLIGHT_SPOT};
+    let mut state = FfState::new();
+    state.set_light_at(0, &seeded_light(D3DLIGHT_POINT, 1.0));
+    state.set_light_enabled_at(0, true);
+    state.set_light_at(1, &seeded_light(D3DLIGHT_SPOT, 1.0));
+    state.set_light_enabled_at(1, true);
+    state.set_light_at(2, &seeded_light(D3DLIGHT_DIRECTIONAL, 1.0));
+    state
+}
+
+/// [`lit_state`] plus an enabled SPOT light at overflow index 100.
+fn lit_state_with_overflow() -> FfState {
+    let mut state = lit_state();
+    state.set_light_at(100, &seeded_light(mtld3d_types::D3DLIGHT_SPOT, 1.0));
+    state.set_light_enabled_at(100, true);
+    state
+}
+
+/// One FF write and the fingerprint its thunk compares across it.
+struct FfWrite {
+    name: &'static str,
+    write: fn(&mut FfState),
+    fingerprint: fn(&FfState) -> u64,
+}
+
+#[test]
+fn vs_source_inputs_move_on_every_key_input_the_ff_setters_write() {
+    use mtld3d_types::{D3DLIGHT_DIRECTIONAL, D3DLIGHT_POINT, D3DLIGHT_SPOT, D3DTS_WORLD};
+    let cases: [(fn() -> FfState, FfWrite); 17] = [
+        (
+            FfState::new,
+            FfWrite {
+                name: "SetTransform grows the palette",
+                write: |s| {
+                    s.set_transform(D3DTS_WORLD + 3, &seeded_matrix(1.0));
+                },
+                fingerprint: transform_inputs,
+            },
+        ),
+        (
+            FfState::new,
+            FfWrite {
+                name: "MultiplyTransform grows the palette",
+                write: |s| {
+                    s.multiply_transform(D3DTS_WORLD + 5, &seeded_matrix(1.0));
+                },
+                fingerprint: transform_inputs,
+            },
+        ),
+        (
+            lit_state,
+            FfWrite {
+                name: "LightEnable turns a set light on",
+                write: |s| s.set_light_enabled_at(2, true),
+                fingerprint: light_inputs,
+            },
+        ),
+        (
+            lit_state,
+            FfWrite {
+                name: "LightEnable turns a light off",
+                write: |s| s.set_light_enabled_at(0, false),
+                fingerprint: light_inputs,
+            },
+        ),
+        (
+            lit_state,
+            FfWrite {
+                name: "LightEnable materializes a light on",
+                write: |s| s.set_light_enabled_at(5, true),
+                fingerprint: light_inputs,
+            },
+        ),
+        (
+            lit_state,
+            FfWrite {
+                name: "SetLight changes POINT to SPOT",
+                write: |s| s.set_light_at(0, &seeded_light(D3DLIGHT_SPOT, 1.0)),
+                fingerprint: light_inputs,
+            },
+        ),
+        (
+            lit_state,
+            FfWrite {
+                name: "SetLight changes SPOT to DIRECTIONAL",
+                write: |s| s.set_light_at(1, &seeded_light(D3DLIGHT_DIRECTIONAL, 1.0)),
+                fingerprint: light_inputs,
+            },
+        ),
+        (
+            lit_state,
+            FfWrite {
+                name: "SetLight changes POINT to DIRECTIONAL",
+                write: |s| s.set_light_at(0, &seeded_light(D3DLIGHT_DIRECTIONAL, 1.0)),
+                fingerprint: light_inputs,
+            },
+        ),
+        (
+            lit_state,
+            FfWrite {
+                name: "SetLight changes SPOT to POINT",
+                write: |s| s.set_light_at(1, &seeded_light(D3DLIGHT_POINT, 1.0)),
+                fingerprint: light_inputs,
+            },
+        ),
+        (
+            lit_state,
+            FfWrite {
+                name: "SetLight changes an enabled light to type 0",
+                write: |s| s.set_light_at(0, &seeded_light(0, 1.0)),
+                fingerprint: light_inputs,
+            },
+        ),
+        (
+            || {
+                let mut state = lit_state();
+                state.set_light_at(0, &seeded_light(0, 1.0));
+                state
+            },
+            FfWrite {
+                name: "SetLight gives an enabled type-0 light a type",
+                write: |s| s.set_light_at(0, &seeded_light(D3DLIGHT_POINT, 1.0)),
+                fingerprint: light_inputs,
+            },
+        ),
+        (
+            lit_state_with_overflow,
+            FfWrite {
+                name: "SetLight changes an overflow light's type",
+                write: |s| s.set_light_at(100, &seeded_light(D3DLIGHT_DIRECTIONAL, 1.0)),
+                fingerprint: light_inputs,
+            },
+        ),
+        (
+            lit_state_with_overflow,
+            FfWrite {
+                name: "LightEnable turns an overflow light off",
+                write: |s| s.set_light_enabled_at(100, false),
+                fingerprint: light_inputs,
+            },
+        ),
+        (
+            lit_state,
+            FfWrite {
+                name: "LightEnable materializes an overflow light on",
+                write: |s| s.set_light_enabled_at(200, true),
+                fingerprint: light_inputs,
+            },
+        ),
+        (
+            lit_state_with_overflow,
+            FfWrite {
+                name: "LightEnable ahead of an overflow light shifts its compacted slot",
+                write: |s| s.set_light_enabled_at(2, true),
+                fingerprint: light_inputs,
+            },
+        ),
+        (
+            lit_state_with_overflow,
+            FfWrite {
+                name: "LightEnable turns a fast-path light off beside an overflow light",
+                write: |s| s.set_light_enabled_at(0, false),
+                fingerprint: light_inputs,
+            },
+        ),
+        (
+            lit_state_with_overflow,
+            FfWrite {
+                name: "SetLight retypes a fast-path light beside an overflow light",
+                write: |s| s.set_light_at(0, &seeded_light(D3DLIGHT_DIRECTIONAL, 1.0)),
+                fingerprint: light_inputs,
+            },
+        ),
+    ];
+    for (
+        setup,
+        FfWrite {
+            name,
+            write,
+            fingerprint,
+        },
+    ) in cases
+    {
+        let mut state = setup();
+        let inputs = fingerprint(&state);
+        let sources = vs_sources(&state);
+        write(&mut state);
+        assert_ne!(
+            vs_sources(&state),
+            sources,
+            "{name}: the case does not change the FF VS source, so it pins nothing"
+        );
+        assert_ne!(
+            fingerprint(&state),
+            inputs,
+            "{name}: the FF VS source changed but the setter's fingerprint did not, so the \
+             write would not mark VS_SOURCE"
+        );
+    }
+}
+
+#[test]
+fn vs_source_inputs_hold_across_value_only_ff_writes() {
+    use mtld3d_types::{
+        D3DLIGHT_DIRECTIONAL, D3DLIGHT_POINT, D3DLIGHT_SPOT, D3DTS_PROJECTION, D3DTS_TEXTURE0,
+        D3DTS_VIEW, D3DTS_WORLD,
+    };
+    let writes = [
+        FfWrite {
+            name: "SetTransform WORLD",
+            write: |s| {
+                s.set_transform(D3DTS_WORLD, &seeded_matrix(2.0));
+            },
+            fingerprint: transform_inputs,
+        },
+        FfWrite {
+            name: "SetTransform WORLDMATRIX under the high water",
+            write: |s| {
+                s.set_transform(D3DTS_WORLD + 2, &seeded_matrix(2.0));
+            },
+            fingerprint: transform_inputs,
+        },
+        FfWrite {
+            name: "SetTransform VIEW",
+            write: |s| {
+                s.set_transform(D3DTS_VIEW, &seeded_matrix(2.0));
+            },
+            fingerprint: transform_inputs,
+        },
+        FfWrite {
+            name: "SetTransform PROJECTION",
+            write: |s| {
+                s.set_transform(D3DTS_PROJECTION, &seeded_matrix(2.0));
+            },
+            fingerprint: transform_inputs,
+        },
+        FfWrite {
+            name: "SetTransform TEXTURE0",
+            write: |s| {
+                s.set_transform(D3DTS_TEXTURE0, &seeded_matrix(2.0));
+            },
+            fingerprint: transform_inputs,
+        },
+        FfWrite {
+            name: "MultiplyTransform VIEW",
+            write: |s| {
+                s.multiply_transform(D3DTS_VIEW, &seeded_matrix(2.0));
+            },
+            fingerprint: transform_inputs,
+        },
+        FfWrite {
+            name: "MultiplyTransform WORLD",
+            write: |s| {
+                s.multiply_transform(D3DTS_WORLD, &seeded_matrix(2.0));
+            },
+            fingerprint: transform_inputs,
+        },
+        FfWrite {
+            name: "SetMaterial",
+            write: |s| s.set_material(&seeded_material(2.0)),
+            fingerprint: material_inputs,
+        },
+        FfWrite {
+            name: "SetLight keeps an active light's type",
+            write: |s| s.set_light_at(0, &seeded_light(D3DLIGHT_POINT, 2.0)),
+            fingerprint: light_inputs,
+        },
+        FfWrite {
+            name: "SetLight retypes a disabled light",
+            write: |s| s.set_light_at(2, &seeded_light(D3DLIGHT_SPOT, 2.0)),
+            fingerprint: light_inputs,
+        },
+        FfWrite {
+            name: "LightEnable repeats an enable",
+            write: |s| s.set_light_enabled_at(1, true),
+            fingerprint: light_inputs,
+        },
+        FfWrite {
+            name: "LightEnable materializes a light off",
+            write: |s| s.set_light_enabled_at(6, false),
+            fingerprint: light_inputs,
+        },
+        FfWrite {
+            name: "SetLight keeps an overflow light's type",
+            write: |s| s.set_light_at(100, &seeded_light(D3DLIGHT_SPOT, 2.0)),
+            fingerprint: light_inputs,
+        },
+        FfWrite {
+            name: "SetLight retypes a disabled overflow light",
+            write: |s| s.set_light_at(101, &seeded_light(D3DLIGHT_DIRECTIONAL, 2.0)),
+            fingerprint: light_inputs,
+        },
+    ];
+    for (setup_name, setup) in [
+        ("fast path", lit_state as fn() -> FfState),
+        ("overflow", lit_state_with_overflow),
+    ] {
+        for FfWrite {
+            name,
+            write,
+            fingerprint,
+        } in &writes
+        {
+            let mut state = setup();
+            // Palette high water 3, and a disabled overflow light at 101, so
+            // the writes under the high water and the disabled retype have
+            // something to leave alone.
+            state.set_transform(D3DTS_WORLD + 3, &D3DMATRIX::IDENTITY);
+            state.set_light_at(101, &seeded_light(D3DLIGHT_POINT, 1.0));
+            let inputs = fingerprint(&state);
+            let sources = vs_sources(&state);
+            write(&mut state);
+            assert_eq!(
+                vs_sources(&state),
+                sources,
+                "{setup_name}, {name}: the write changed the FF VS source"
+            );
+            assert_eq!(
+                fingerprint(&state),
+                inputs,
+                "{setup_name}, {name}: the write leaves the FF VS source alone but would mark \
+                 VS_SOURCE"
+            );
+        }
+    }
+}
+
+/// Drift guard: a write that leaves its setter's fingerprint alone leaves the FF VS source alone.
+///
+/// Holds for every transform, material and light write, over the key and the
+/// row count, each write judged by the fingerprint its thunk compares. A
+/// deterministic walk over writes that vary every matrix slot, every material
+/// and light parameter, every light type and enable. It runs once on the
+/// fast-path slots alone and once with overflow indices mixed in, since the
+/// light fingerprint encodes the two cases differently and a state never
+/// returns from the second to the first; the second walk can enable more
+/// than eight lights, so the compaction's truncation is exercised too. A new
+/// key input that one of these setters writes, and that its fingerprint does
+/// not cover, fails here.
+#[test]
+fn unchanged_vs_source_inputs_imply_an_unchanged_vs_source() {
+    walk_ff_writes(&[0, 1, 3, 7], 0x2545_f491_4f6c_dd1d);
+    walk_ff_writes(&[0, 1, 2, 3, 4, 5, 6, 7, 9, 150], 0x9e37_79b9_7f4a_7c15);
+}
+
+/// One walk of [`unchanged_vs_source_inputs_imply_an_unchanged_vs_source`] over `light_indices`.
+fn walk_ff_writes(light_indices: &[u32], mut rng: u64) {
+    use mtld3d_types::{D3DTS_PROJECTION, D3DTS_TEXTURE0, D3DTS_VIEW, D3DTS_WORLD};
+    const TRANSFORMS: [u32; 7] = [
+        D3DTS_WORLD,
+        D3DTS_WORLD + 1,
+        D3DTS_WORLD + 7,
+        D3DTS_WORLD + 60,
+        D3DTS_VIEW,
+        D3DTS_PROJECTION,
+        D3DTS_TEXTURE0 + 1,
+    ];
+    const LIGHT_TYPES: [u32; 5] = [0, 1, 2, 3, 4];
+    let mut next = |bound: usize| {
+        rng = rng
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        usize::try_from(rng >> 33).expect("31 bits fit usize") % bound
+    };
+    let mut state = FfState::new();
+    let (mut held, mut moved, mut truncated) = (0u32, 0u32, 0u32);
+    for step in 0..4000 {
+        let seed = f32::from(u8::try_from(next(8)).expect("under 8")) * 0.5;
+        let op = next(5);
+        let fingerprint: fn(&FfState) -> u64 = match op {
+            0 | 1 => transform_inputs,
+            2 => material_inputs,
+            _ => light_inputs,
+        };
+        let inputs = fingerprint(&state);
+        let sources = vs_sources(&state);
+        let what = match op {
+            0 => {
+                let slot = TRANSFORMS[next(TRANSFORMS.len())];
+                state.set_transform(slot, &seeded_matrix(seed));
+                format!("SetTransform({slot})")
+            }
+            1 => {
+                let slot = TRANSFORMS[next(TRANSFORMS.len())];
+                state.multiply_transform(slot, &seeded_matrix(seed));
+                format!("MultiplyTransform({slot})")
+            }
+            2 => {
+                state.set_material(&seeded_material(seed));
+                "SetMaterial".to_owned()
+            }
+            3 => {
+                let index = light_indices[next(light_indices.len())];
+                let ty = LIGHT_TYPES[next(LIGHT_TYPES.len())];
+                state.set_light_at(index, &seeded_light(ty, seed));
+                format!("SetLight({index}, type {ty})")
+            }
+            _ => {
+                let index = light_indices[next(light_indices.len())];
+                // Bias toward enabling so the walk spends time with many
+                // lights on, past the eight the compaction keeps.
+                let on = next(6) != 0;
+                state.set_light_enabled_at(index, on);
+                format!("LightEnable({index}, {on})")
+            }
+        };
+        let enabled = light_indices
+            .iter()
+            .filter(|&&index| {
+                state.is_light_enabled_at(index)
+                    && state.get_light_at(index).is_some_and(|l| l.type_ != 0)
+            })
+            .count();
+        if enabled > super::MAX_ACTIVE_LIGHTS as usize {
+            truncated += 1;
+        }
+        if fingerprint(&state) == inputs {
+            held += 1;
+            assert_eq!(
+                vs_sources(&state),
+                sources,
+                "step {step}, {what}: the FF VS source changed but the setter's fingerprint did \
+                 not"
+            );
+        } else {
+            moved += 1;
+        }
+    }
+    assert!(
+        held > 1000 && moved > 100,
+        "the walk over {light_indices:?} must exercise both outcomes: {held} held, {moved} moved"
+    );
+    if light_indices.len() > super::MAX_ACTIVE_LIGHTS as usize {
+        assert!(
+            truncated > 300,
+            "the walk over {light_indices:?} must run past {} active lights: {truncated} steps did",
+            super::MAX_ACTIVE_LIGHTS
+        );
+    }
 }
