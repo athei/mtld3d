@@ -9736,9 +9736,10 @@ extern "system" fn device_set_texture(this: *mut c_void, stage: u32, texture: *m
 /// functions of the pointer alone, so rewriting them changes nothing. What the
 /// walk reads through the texture (its contents, pending uploads, LOD and
 /// residency) is marked dirty on the texture's own device by whichever call
-/// changes it, which is `dev` once the texture is attached here. A texture a
-/// walk on another device has moved away is brought back only by this
-/// device's walk, so that rebind keeps its mark.
+/// changes it, which is `dev` once the texture is attached here. A texture
+/// attached to another device comes back through a rehydrate on this device,
+/// which the stage walk performs for every bound stage, so that rebind keeps
+/// its mark.
 fn rebind_is_redundant(
     dev: &DeviceInner,
     stage: usize,
