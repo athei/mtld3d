@@ -8,7 +8,11 @@
 //! the texture-stage-state warn latch firing per stage for unconsumed slots and never for the
 //! bump-environment slots, which route to the texbem uniform alone, and the unimplemented
 //! texture-operation warning firing at the write, once per slot, while a value outside the
-//! `D3DTOP_*` space reads as the stage default instead.
+//! `D3DTOP_*` space reads as the stage default instead, and the draw-time narrowing of stage
+//! arguments and result registers reading the stage default with one warning per stage and
+//! state.
+
+use std::sync::Mutex;
 
 use mtld3d_types::{
     D3DFOG_EXP, D3DFOG_LINEAR, D3DMATRIX, D3DRS_DEPTHBIAS, D3DRS_FOGCOLOR, D3DRS_FOGDENSITY,
@@ -22,7 +26,7 @@ use mtld3d_types::{
 
 use super::{
     FfState, FfVsLayout, TssWriteFeeds, VariantFlags, VariantKey, build_fog_color_bytes,
-    tss_write_feeds,
+    stage_enum_value, tss_write_feeds,
 };
 use crate::convert::FfVsLayoutFlags;
 
@@ -1729,4 +1733,92 @@ fn inline_variable_sections_fill_exact_queried_rows() {
         state.fill_palette_section(&key, &mut dst);
         assert_filled(&dst);
     }
+}
+
+/// The warnings the `log` facade delivered in this test process.
+///
+/// A `static` because the resource is process-wide: the `log` crate takes one
+/// logger per process, set once, and the warn-once latches under test write
+/// only through it.
+static WARNINGS: WarningSink = WarningSink(Mutex::new(Vec::new()));
+
+/// A `log` sink that keeps every warning's text.
+struct WarningSink(Mutex<Vec<String>>);
+
+impl log::Log for WarningSink {
+    fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+        metadata.level() <= log::Level::Warn
+    }
+
+    fn log(&self, record: &log::Record<'_>) {
+        if self.enabled(record.metadata()) {
+            self.0
+                .lock()
+                .expect("warning sink poisoned")
+                .push(record.args().to_string());
+        }
+    }
+
+    fn flush(&self) {}
+}
+
+/// Route this process's warnings into [`WARNINGS`]; later calls keep the first logger.
+fn capture_warnings() {
+    let _ = log::set_logger(&WARNINGS);
+    log::set_max_level(log::LevelFilter::Warn);
+}
+
+/// How many captured warnings contain `needle`.
+fn warnings_containing(needle: &str) -> usize {
+    WARNINGS
+        .0
+        .lock()
+        .expect("warning sink poisoned")
+        .iter()
+        .filter(|line| line.contains(needle))
+        .count()
+}
+
+/// A colour argument wider than a byte reads the stage default, not its low byte, and warns once.
+#[test]
+fn a_colour_argument_wider_than_a_byte_reads_the_stage_default_and_warns_once() {
+    use mtld3d_types::{D3DTSS_COLORARG2, texture_stage_state_defaults};
+    capture_warnings();
+    let mut states = texture_stage_state_defaults(6);
+    // The low byte is D3DTA_TEXTURE, which a truncation would read.
+    states[D3DTSS_COLORARG2 as usize] = 0x0102;
+    let default = texture_stage_state_defaults(6)[D3DTSS_COLORARG2 as usize].to_le_bytes()[0];
+    for _ in 0..3 {
+        assert_eq!(stage_enum_value(&states, 6, D3DTSS_COLORARG2), default);
+    }
+    assert_eq!(
+        warnings_containing("FF: stage 6 D3DTSS_3 = 0x102 outside its value space"),
+        1
+    );
+}
+
+/// A result register other than CURRENT or TEMP reads the stage default, warning once per stage.
+#[test]
+fn a_result_register_outside_current_and_temp_reads_the_stage_default() {
+    use mtld3d_types::{D3DTA_CURRENT, D3DTA_TEMP, D3DTSS_RESULTARG, texture_stage_state_defaults};
+    capture_warnings();
+    let mut states = texture_stage_state_defaults(5);
+    let current = u8::try_from(D3DTA_CURRENT).expect("D3DTA_CURRENT fits a byte");
+    states[D3DTSS_RESULTARG as usize] = D3DTA_TEMP;
+    assert_eq!(
+        u32::from(stage_enum_value(&states, 5, D3DTSS_RESULTARG)),
+        D3DTA_TEMP
+    );
+    assert_eq!(warnings_containing("FF: stage 5 D3DTSS_28 ="), 0);
+    states[D3DTSS_RESULTARG as usize] = D3DTA_TEXTURE;
+    assert_eq!(stage_enum_value(&states, 5, D3DTSS_RESULTARG), current);
+    // TEMP in the low byte of a wider value is not TEMP.
+    states[D3DTSS_RESULTARG as usize] = 0x100 | D3DTA_TEMP;
+    assert_eq!(stage_enum_value(&states, 5, D3DTSS_RESULTARG), current);
+    // The latch is per stage and state, so the second value stays quiet.
+    assert_eq!(warnings_containing("FF: stage 5 D3DTSS_28 ="), 1);
+    assert_eq!(
+        warnings_containing("FF: stage 5 D3DTSS_28 = 0x2 outside its value space"),
+        1
+    );
 }

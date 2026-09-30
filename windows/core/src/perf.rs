@@ -3591,8 +3591,9 @@ impl PerfWindow {
     /// Taken on the sampled draws, sampled `keys` less the sampled sections,
     /// so both sides carry the section timers' cost alike, then scaled like
     /// the sections. The six sections and this add up to the sampled `keys`
-    /// scaled up, which exceeds the parent `keys` row by the sampled timers'
-    /// own cost.
+    /// scaled up, which typically exceeds the parent `keys` row by about what
+    /// the section timers would cost if every rebuilding draw were timed; it
+    /// is an estimate from the sampled draws, so a window can read below.
     fn draw_snapshot_keys_resid_sum(&self) -> u64 {
         let mut sections = [0u64; SnapshotSection::SLOTS];
         for (slot, section) in sections.iter_mut().enumerate() {
@@ -3918,7 +3919,8 @@ fn section_stem(slot: usize) -> &'static str {
     SNAPSHOT_SECTIONS
         .iter()
         .find(|&&(section, ..)| section == slot)
-        .map_or("unassigned", |&(_, stem, _)| stem)
+        .map(|&(_, stem, _)| stem)
+        .expect("every KEYS_SECTIONS slot is in SNAPSHOT_SECTIONS")
 }
 
 /// Compute and format a `(N ns/draw)` aux cell.
@@ -4569,8 +4571,10 @@ impl<'a> Summary<'a> {
                 // sections: the reads between the sections plus the part of
                 // the section timers' cost that falls outside their own
                 // intervals. All seven are scaled from the sampled draws, so
-                // they add up to the sampled `keys` scaled up, which exceeds
-                // the `keys` row above by the sampled timers' cost. The
+                // they add up to the sampled `keys` scaled up, which typically
+                // exceeds the `keys` row above by about what the section
+                // timers would cost if every rebuilding draw were timed
+                // (an estimate, so a window can read below it). The
                 // peaks are one frame's sampled draws scaled by that frame's
                 // ratio, estimates that read high.
                 for &(slot, label, desc) in &KEYS_SECTIONS {
@@ -6284,6 +6288,24 @@ fn render_kv(w: &PerfWindow, caches: &CacheSizes, window_secs: f64) -> KvLine {
 
 #[cfg(all(test, perf_tracking))]
 mod tests;
+
+// Every timed section has a row in the section table, so `section_stem` finds
+// a stem for each of them.
+#[cfg(perf_tracking)]
+const _: () = {
+    let mut timed = 0;
+    while timed < KEYS_SECTIONS.len() {
+        let slot = KEYS_SECTIONS[timed].0;
+        let mut found = false;
+        let mut section = 0;
+        while section < SNAPSHOT_SECTIONS.len() {
+            found |= SNAPSHOT_SECTIONS[section].0 == slot;
+            section += 1;
+        }
+        assert!(found, "every KEYS_SECTIONS slot is in SNAPSHOT_SECTIONS");
+        timed += 1;
+    }
+};
 
 #[cfg(perf_tracking)]
 const _: () = {
