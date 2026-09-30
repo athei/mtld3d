@@ -194,6 +194,13 @@ impl VolumeTexture<'_> {
         unsafe { (self.vtbl().get_level_count)(self.ptr) }
     }
 
+    /// `SetLOD`, returning the previous LOD.
+    #[must_use]
+    pub fn set_lod(&self, lod: u32) -> u32 {
+        // SAFETY: vtable thunk; `self.ptr` is live.
+        unsafe { (self.vtbl().set_lod)(self.ptr, lod) }
+    }
+
     /// Describe mip `level`. Returns `(hr, desc)`.
     #[must_use]
     pub fn level_desc(&self, level: u32) -> (i32, D3DVOLUME_DESC) {
