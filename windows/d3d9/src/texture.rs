@@ -540,6 +540,15 @@ impl TextureInner {
             && rect.h >= self.mip_height(level)
     }
 
+    /// Whether a copy from `src`'s `src_level` reaches every depth slice of `level`.
+    ///
+    /// A copy walks the slices the two levels share, so a source level with
+    /// fewer slices leaves the rest of a volume level as it was. A 2D or cube
+    /// level is one slice and always covered.
+    fn copy_covers_depth(&self, level: usize, src: &Self, src_level: usize) -> bool {
+        (src.depth >> src_level).max(1) >= (self.depth >> level).max(1)
+    }
+
     /// Raw pointer and byte length of one subresource's staging allocation.
     ///
     /// A cube addresses its six faces through the sidecar; every other texture
@@ -1276,7 +1285,8 @@ impl TextureInner {
         if !self.ensure_staging_for_write(dst_level, whole) {
             return false;
         }
-        self.prepare_staging_write(0, dst_level, whole);
+        let every_slice = self.copy_covers_depth(dst_level, src, src_level);
+        self.prepare_staging_write(0, dst_level, whole && every_slice);
         let (Some(dst_box), Some(src_box)) =
             (self.staging.get(dst_level), src.staging.get(src_level))
         else {
@@ -1567,7 +1577,8 @@ impl TextureInner {
         if !self.ensure_staging_for_write(dst_level, whole) {
             return false;
         }
-        self.prepare_staging_write(0, dst_level, whole);
+        let every_slice = self.copy_covers_depth(dst_level, src, src_level);
+        self.prepare_staging_write(0, dst_level, whole && every_slice);
         let (Some(dst_box), Some(src_box)) =
             (self.staging.get(dst_level), src.staging.get(src_level))
         else {
@@ -1765,6 +1776,11 @@ impl TextureInner {
         if dx + rw > self.mip_width(dst_level) || dy + rh > self.mip_height(dst_level) {
             return false;
         }
+        // Rejected before the staging is touched: a rename for a write that
+        // then never lands would leave the level holding fresh, unwritten pages.
+        if src_pitch == 0 {
+            return false;
+        }
         // Preserve GPU-only pixels before a partial write reaches staging.
         let whole = self.write_covers_level(
             dst_level,
@@ -1787,9 +1803,6 @@ impl TextureInner {
         };
         let (bw, bh) = (self.block_w.max(1), self.block_h.max(1));
         let dst_pitch = self.mip_bytes_per_row(dst_level) as usize;
-        if src_pitch == 0 {
-            return false;
-        }
         // A padded row carries bytes past its last block, so the block size
         // comes from the format rather than from the pitch.
         let block_bytes = self.block_bytes.max(1) as usize;
@@ -1872,6 +1885,10 @@ impl TextureInner {
         if dx + rw > self.mip_width(dst_level) || dy + rh > self.mip_height(dst_level) {
             return false;
         }
+        // Rejected before the staging is touched, as in the 2D path.
+        if src_pitch == 0 {
+            return false;
+        }
         let dst_rect = DirtyRect {
             x: dx,
             y: dy,
@@ -1892,9 +1909,6 @@ impl TextureInner {
         };
         let (bw, bh) = (self.block_w.max(1), self.block_h.max(1));
         let dst_pitch = self.mip_bytes_per_row(dst_level) as usize;
-        if src_pitch == 0 {
-            return false;
-        }
         // A padded row carries bytes past its last block, so the block size
         // comes from the format rather than from the pitch.
         let block_bytes = self.block_bytes.max(1) as usize;
@@ -2106,19 +2120,25 @@ impl TextureInner {
         if level >= self.staging.len() {
             return false;
         }
-        let whole = self.write_covers_level(level, DirtyRect { x: ox, y: oy, w, h });
-        self.prepare_staging_write(0, level, whole);
-        let Some(box_) = self.staging.get(level) else {
-            return false;
-        };
         let bpp = pixel.len();
         if bpp == 0 || w == 0 || h == 0 {
             return false;
         }
         let pitch = self.mip_bytes_per_row(level) as usize;
+        let run = w as usize * bpp;
+        // Every row ends before the last one does, so checking the last row
+        // bounds the whole fill before the staging is renamed for it.
+        let last_row_end = (oy as usize + h as usize - 1) * pitch + ox as usize * bpp + run;
+        if last_row_end > self.staging[level].logical_len() {
+            return false;
+        }
+        let whole = self.write_covers_level(level, DirtyRect { x: ox, y: oy, w, h });
+        self.prepare_staging_write(0, level, whole);
+        let Some(box_) = self.staging.get(level) else {
+            return false;
+        };
         let logical = box_.logical_len();
         let base = box_.as_ptr().cast_mut();
-        let run = w as usize * bpp;
         for row in oy..oy.saturating_add(h) {
             let row_off = row as usize * pitch + ox as usize * bpp;
             if row_off + run > logical {
@@ -2468,23 +2488,29 @@ impl TextureInner {
     /// would reach that upload and the draws it serves. With a reader the
     /// write goes to fresh pages instead: bare for a write covering the whole
     /// level, carrying the rest of the level for a partial one. Without one it
-    /// lands in place at no extra cost. A volume level keeps its own
-    /// conservative rule. `face` is a cube face index and zero for every other
-    /// texture kind.
+    /// lands in place at no extra cost. For a volume level, whole means every
+    /// depth slice of it. A subresource the game holds mapped, through a
+    /// `LockRect` or a device context, is written in place as well: its
+    /// pointer aliases the current pages, and what the game writes through it
+    /// has to land in the pages the unmap publishes. `face` is a cube face
+    /// index and zero for every other texture kind.
     fn prepare_staging_write(&mut self, face: u32, level: usize, whole_level: bool) {
-        if self.flags.contains(TextureFlags::VOLUME_TEXTURE) {
-            self.prepare_volume_staging_write(level);
+        if self.dc_in_use() {
             return;
         }
         let has_readers = match self.cube.as_deref() {
             Some(cube) => self
                 .cube_subresource_index(face, level)
+                .filter(|&index| !cube.locked.get(index).copied().unwrap_or(false))
                 .and_then(|index| cube.staging.get(index))
                 .is_some_and(|staging| staging.has_readers()),
-            None => self
-                .staging
-                .get(level)
-                .is_some_and(|staging| staging.has_readers()),
+            None => {
+                !self.locked.get(level).copied().unwrap_or(false)
+                    && self
+                        .staging
+                        .get(level)
+                        .is_some_and(|staging| staging.has_readers())
+            }
         };
         if !has_readers {
             return;
@@ -2800,21 +2826,6 @@ impl TextureInner {
         Arc::get_mut(&mut self.staging[level])
             .expect("fresh Arc is unique")
             .as_mut_ptr()
-    }
-
-    /// Preserve a volume mip before writing bytes another owner may still read.
-    fn prepare_volume_staging_write(&mut self, level: usize) {
-        if self.flags.contains(TextureFlags::VOLUME_TEXTURE)
-            && self
-                .staging
-                .get(level)
-                .is_some_and(|staging| Arc::strong_count(staging) > 1)
-        {
-            // Upload jobs may be replayed after their original submit retires.
-            // Arc ownership covers those readers as well as queued and GPU reads;
-            // a cached staging wrapper alone can conservatively force a rename.
-            self.rename_staging(level, PreserveKind::Cpu);
-        }
     }
 
     fn stash_lock(
@@ -3940,6 +3951,14 @@ fn materialize_subresource_from_gpu(ti: &mut TextureInner, face: u32, level: usi
     // texture kind may have to allocate the level's staging again first.
     if ti.cube.is_none() {
         ti.ensure_staging(level);
+    }
+    // The read replaces the level, so staging an upload still reads moves to
+    // fresh pages without a copy and the read lands there. A depth level
+    // publishes fresh pages of its own after the read, and a volume read
+    // covers one slice, so the rest of that level is carried over.
+    if mtld3d_core::depth_texture::PackedDepth::from_d3d(ti.d3d_format).is_none() {
+        let whole = !ti.flags.contains(TextureFlags::VOLUME_TEXTURE);
+        ti.prepare_staging_write(face, level, whole);
     }
     let Some((dst_ptr, dst_len)) = ti.subresource_staging_backing(face, level) else {
         mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
@@ -5212,7 +5231,7 @@ extern "system" fn volume_lock_box(
     } else {
         0
     };
-    inner.prepare_volume_staging_write(lvl);
+    inner.prepare_staging_write(0, lvl, false);
     let ptr = inner.staging[lvl].as_ptr().cast_mut();
     // Record the lock only after all validation passed, so a rejected LockBox
     // leaves the per-level state untouched.

@@ -3177,6 +3177,84 @@ fn volume_update_keeps_per_draw_content() {
     }
 }
 
+/// A whole-level volume write between two draws leaves the first draw its texels.
+///
+/// The level is written before the frame and uploaded by the first draw, whose
+/// upload still reads the staging when `UpdateTexture` or a whole `LockBox`
+/// rewrites every slice of it.
+#[test]
+fn volume_whole_level_write_after_its_upload_keeps_per_draw_content() {
+    const RED: u32 = 0xFFFF_0000;
+    const BLUE: u32 = 0xFF00_00FF;
+    let harnesses = [
+        Harness::new(),
+        Harness::with_config("intel.managedMemory=true;intel.linearAlign256=true"),
+    ];
+    for h in &harnesses {
+        for lock_box in [false, true] {
+            let (hr, source) =
+                h.try_create_volume_texture([4, 4, 4], 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM);
+            assert_eq!(hr, 0);
+            let source = source.expect("source");
+            let pool = if lock_box {
+                D3DPOOL_MANAGED
+            } else {
+                D3DPOOL_DEFAULT
+            };
+            let (hr, destination) =
+                h.try_create_volume_texture([4, 4, 4], 1, 0, D3DFMT_A8R8G8B8, pool);
+            assert_eq!(hr, 0);
+            let destination = destination.expect("destination");
+            if lock_box {
+                destination.write_u32(0, &[RED; 64]);
+            } else {
+                source.write_u32(0, &[RED; 64]);
+                assert_eq!(h.update_volume_texture_hr(&source, &destination), 0);
+                source.write_u32(0, &[BLUE; 64]);
+            }
+            assert_eq!(h.set_volume_texture(0, &destination), 0);
+            h.select_texture_stage(0);
+            point_clamp(h);
+            assert_eq!(
+                h.set_fvf(
+                    D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1 | (D3DFVF_TEXTUREFORMAT3 << 16)
+                ),
+                0
+            );
+            h.render_once(BLACK, |d| {
+                assert_eq!(
+                    d.draw_primitive_up(
+                        D3DPT_TRIANGLELIST,
+                        2,
+                        &volume_sample_quad(-1.0, 0.0, [0.5, 0.5, 0.875])
+                    ),
+                    0
+                );
+                if lock_box {
+                    destination.write_u32(0, &[BLUE; 64]);
+                } else {
+                    assert_eq!(d.update_volume_texture_hr(&source, &destination), 0);
+                }
+                assert_eq!(
+                    d.draw_primitive_up(
+                        D3DPT_TRIANGLELIST,
+                        2,
+                        &volume_sample_quad(0.0, 1.0, [0.5, 0.5, 0.875])
+                    ),
+                    0
+                );
+            });
+            let pixels = [h.read_pixel(160, 240), h.read_pixel(480, 240)];
+            assert_eq!(
+                pixels,
+                [RED, BLUE],
+                "volume draws bracketing a whole-level write, LockBox={lock_box}"
+            );
+            assert_eq!(h.clear_texture(0), 0);
+        }
+    }
+}
+
 /// A partial volume update preserves earlier draws and every unwritten subresource.
 #[test]
 fn volume_partial_update_keeps_versions_and_untouched_mips() {
@@ -4948,6 +5026,35 @@ fn intra_frame_update_surface_keeps_per_draw_content() {
         [RED, BLUE],
         "draws bracketing a same-format UpdateSurface"
     );
+}
+
+/// A copy into a level the game holds mapped lands in the pages the lock points into.
+///
+/// A partial `LockRect` of a level an upload still reads is handed out in
+/// place, and `UpdateTexture` validates no lock state. What the game writes
+/// through the lock after the copy has to reach the texture at `UnlockRect`,
+/// so the copy must not move the level to pages the lock pointer misses.
+#[test]
+fn update_texture_into_a_locked_level_keeps_the_lock_writes() {
+    const RED: u32 = 0xFFFF_0000;
+    const GREEN: u32 = 0xFF00_FF00;
+    const BLUE: u32 = 0xFF00_00FF;
+    let h = Harness::new();
+    let texture = h.create_texture(2, 2, 1, D3DUSAGE_DYNAMIC, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT);
+    texture.lock_rect(0, 0).write_u32(&[RED; 4]);
+    let blue = h.create_texture(2, 2, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM);
+    blue.lock_rect(0, 0).write_u32(&[BLUE; 4]);
+    draws_bracketing(&h, &texture, |d| {
+        let mut locked = texture.lock_rect_partial(0, &[1, 0, 2, 1], 0);
+        assert_eq!(d.update_texture_hr(&blue, &texture), 0, "UpdateTexture");
+        locked.write_u32(&[GREEN]);
+    });
+    assert_pixel_eq(
+        h.read_pixel(560, 120),
+        GREEN,
+        "texel written through the lock",
+    );
+    assert_pixel_eq(h.read_pixel(400, 360), BLUE, "texel the copy wrote");
 }
 
 /// A same-format `UpdateTexture` between two draws leaves the first draw its texels.
