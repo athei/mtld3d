@@ -1786,7 +1786,7 @@ impl ApiPerfState {
     /// (no predecessor). It also draws whether the next frame is timed.
     ///
     /// # Panics
-    /// Never: the drawn gap is below twice [`FRAME_SAMPLE_PERIOD`], which fits `u8`.
+    /// Never: the drawn gap is below twice `FRAME_SAMPLE_PERIOD`, which fits `u8`.
     pub fn drain_into_payload(&mut self, payload: &mut FramePerfPayload) {
         let now = rdtsc();
         let prev = core::mem::replace(&mut self.prev_present_rdtsc, now);
