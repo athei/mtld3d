@@ -93,11 +93,12 @@ alone there: its environment may be mid-run, and it is that checkout's own
 `make clean-isolated` to take down. A failing run whose log shows a `d3d9.dll v`
 stamp that is not your checkout's is that collision, not a regression.
 
-Both agent runners configured in this tree already print the conventions digest
-at session start and run `scripts/audit.sh --file` after every edit, so a
-violation surfaces while you write rather than at commit time. The digest at
-`.claude/conventions-digest.md` is generated: regenerate it in the same change
-that touches `docs/CONVENTIONS.md`.
+`scripts/audit.sh --file <path>` runs the per-file subset of the audit, so an
+agent runner or an editor can call it after every edit and surface a violation
+while you write rather than at commit time. Such a hook, and any digest of the
+conventions an agent runner prints at session start, is optional local setup:
+the tree tracks neither, nothing keeps a digest in step with
+`docs/CONVENTIONS.md`, and `make check` is the gate either way.
 
 ## Reading a test run
 
