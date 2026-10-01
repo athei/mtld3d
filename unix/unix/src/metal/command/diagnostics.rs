@@ -344,11 +344,11 @@ pub fn observe_initialization(cb: &ProtocolObject<dyn MTLCommandBuffer>) {
             });
         },
     );
-    // Executable lifetime is separate from the block's captures: D3D CreateDevice sets
-    // USED before any clear, so d3d9 detach self-terminates before Wine can unload its
-    // statically imported shim and this Unix image. Native unit clients compile this
-    // code into their test executable. Surviving direct-shim unload has no such contract.
-    // Revisit this observer if D3D unload after CreateDevice can leave the process alive.
+    // Executable lifetime is separate from the block's captures: D3D CreateDevice pins
+    // d3d9.dll before any clear, so no FreeLibrary unloads it, its statically imported
+    // shim or this Unix image while the process lives, and its detach at exit
+    // self-terminates. Native unit clients compile this code into their test executable.
+    // Surviving direct-shim unload has no such contract.
     // Process exit may end a callback before it logs; no completion is inferred then.
     // SAFETY: the live buffer has not been committed. Metal copies the valid block at
     // registration, so our handle may drop. The block captures nothing, uses only the

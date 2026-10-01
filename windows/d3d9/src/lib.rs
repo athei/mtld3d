@@ -53,7 +53,13 @@ use mtld3d_types::{
     E_NOTIMPL, S_FALSE,
 };
 
-use crate::{direct3d9::Direct3D9, unix_call::unix_call};
+use crate::{
+    crash::{
+        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_PIN, GetModuleHandleExA,
+    },
+    direct3d9::Direct3D9,
+    unix_call::unix_call,
+};
 
 const DLL_PROCESS_ATTACH: u32 = 1;
 const DLL_PROCESS_DETACH: u32 = 0;
@@ -99,15 +105,20 @@ static ALLOCATOR: crate::crumb_allocator::CrumbAllocator = crate::crumb_allocato
 /// Set to true when the game calls `IDirect3D9::CreateDevice`.
 ///
 /// Latched on entry to the call, before argument validation, so a rejected
-/// `CreateDevice` still counts as the game having reached for a device.
+/// `CreateDevice` still counts as the game having reached for a device. The
+/// first latch also pins this image ([`pin_image`]), so from then on no
+/// `FreeLibrary` unloads it and the only `DLL_PROCESS_DETACH` still to come is
+/// the one at process exit.
 ///
-/// Used by `DllMain`'s `DLL_PROCESS_DETACH` handler to discriminate real
-/// shutdown from the loader's early `FreeLibrary` probe — Wine sets
-/// `reserved=NULL` for both, so MSDN's "reserved != NULL means process exit"
-/// contract is unusable. `Direct3DCreate9` is too early a signal: launcher/mod
-/// DLLs commonly probe-call it to verify the export resolves, then
-/// `FreeLibrary`. `CreateDevice` requires a real HWND + presentation params, so
-/// reaching it implies actual use.
+/// `DllMain`'s detach handler reads it to choose between ending the process
+/// and unhooking for an unload. Wine's loader passes `lpvReserved` as 0 when
+/// the detach comes from `FreeLibrary` and as 1 when it comes from process
+/// exit, the contract Windows documents, but the pin already makes every
+/// detach after a device a process exit, so the flag alone decides.
+/// `Direct3DCreate9` is too early a signal: launcher and mod DLLs commonly
+/// probe-call it to verify the export resolves, then `FreeLibrary`, and that
+/// unload has to stay real. `CreateDevice` requires a real HWND and
+/// presentation parameters, so reaching it implies actual use.
 pub static USED: AtomicBool = AtomicBool::new(false);
 
 unsafe extern "system" {
@@ -119,19 +130,20 @@ unsafe extern "system" {
 #[unsafe(export_name = "DllMain")]
 pub extern "system" fn dll_main(instance: *mut c_void, reason: u32, _reserved: *mut c_void) -> i32 {
     if reason == DLL_PROCESS_DETACH && USED.load(Ordering::Relaxed) {
-        // Process is exiting (or the game FreeLibrary'd us after CreateDevice).
-        // Skip every remaining destructor on the calling thread — snmalloc's
-        // C++ thread_local teardown walks pools deeply enough to overflow
-        // the 1 MB Wine main-thread stack and Wine then aborts exception
-        // dispatch, hanging the process. TerminateProcess is the only call
-        // that skips DLL_PROCESS_DETACH and TLS callbacks while naming an
-        // exit code; ExitProcess / std::process::exit run them, abort uses
-        // fast-fail. Its code is the one the unix side of Wine exits with,
-        // so it carries the status the process asked to exit with rather
-        // than a zero that would hide a failing run from a unix parent. The
-        // USED flag discriminates against the loader's early FreeLibrary
-        // probe: Wine's `_reserved` arg is NULL for both the probe and real
-        // exit, so the MSDN contract is unusable here.
+        // The process is exiting. A device was created, which pinned the
+        // image, so no `FreeLibrary` reaches this detach unless the pin
+        // failed, which was logged; only process exit does (Wine passes
+        // `_reserved` as 1 here and as 0 for the detach of a
+        // `FreeLibrary`). Skip every remaining destructor on the calling
+        // thread: snmalloc's C++ thread_local teardown walks pools deeply
+        // enough to overflow the 1 MB Wine main-thread stack and Wine then
+        // aborts exception dispatch, hanging the process. TerminateProcess
+        // is the only call that skips DLL_PROCESS_DETACH and TLS callbacks
+        // while naming an exit code; ExitProcess / std::process::exit run
+        // them, abort uses fast-fail. Its code is the one the unix side of
+        // Wine exits with, so it carries the status the process asked to
+        // exit with rather than a zero that would hide a failing run from a
+        // unix parent.
         let status = exit_code_hook::status();
         // SAFETY: Win32 GetCurrentProcess returns a pseudo-handle for the
         // current process; passing it to TerminateProcess is the documented
@@ -142,7 +154,8 @@ pub extern "system" fn dll_main(instance: *mut c_void, reason: u32, _reserved: *
         unsafe { TerminateProcess(proc, status) };
     }
     if reason == DLL_PROCESS_DETACH {
-        // A FreeLibrary the process survives: take the process-wide pointers
+        // A FreeLibrary before any device, which the process survives (or
+        // process exit before any device): take the process-wide pointers
         // into this image down with it.
         crash::uninstall();
         mode_list_hook::uninstall();
@@ -156,6 +169,36 @@ pub extern "system" fn dll_main(instance: *mut c_void, reason: u32, _reserved: *
     init_logger(instance);
     attach_process(instance);
     1
+}
+
+/// Keep this image loaded until the process ends, called once at the first `CreateDevice`.
+///
+/// A pinned module ignores `FreeLibrary`, so a launcher that creates a
+/// device, releases it and frees `d3d9.dll` keeps running with the image
+/// mapped, and the next `LoadLibrary` finds it already there. Unloading for
+/// real after a device existed would run the allocator's thread-local
+/// teardown on the caller's thread and leave process-wide registrations
+/// (window subclasses, notification observers, Metal completion handlers)
+/// pointing into unmapped code. The pin waits for a device rather than
+/// happening at load, because a load that only probes `Direct3DCreate9` and
+/// frees the library again has to unload for real.
+pub fn pin_image() {
+    let mut module: *mut c_void = core::ptr::null_mut();
+    // SAFETY: kernel32 export; `USED` is a static of this image, so its
+    // address names the module, and `out` is a writable local.
+    let ok = unsafe {
+        GetModuleHandleExA(
+            GET_MODULE_HANDLE_EX_FLAG_PIN | GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+            (&raw const USED).cast::<u8>(),
+            &raw mut module,
+        )
+    };
+    if ok == 0 || module.is_null() {
+        mtld3d_shared::log_once_warn!(
+            target: LOG_TARGET,
+            "CreateDevice: GetModuleHandleEx could not pin d3d9.dll; a later FreeLibrary that unloads it ends the process"
+        );
+    }
 }
 
 #[unsafe(export_name = "Direct3DCreate9")]

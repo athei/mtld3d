@@ -280,9 +280,9 @@ pub struct Direct3D9 {
 
 /// What an `IDirect3D9` owns: the configuration it resolved at `Direct3DCreate9`.
 ///
-/// Shared with every device the interface creates and with the threads a
-/// device spawns, so it is reference counted rather than borrowed from the
-/// interface, whose `Release` can come before those threads exit.
+/// Shared with every device the interface creates, so it is reference
+/// counted rather than borrowed from the interface, whose `Release` can come
+/// before a device's.
 pub struct Direct3D9Inner {
     config: Arc<Mtld3dConfig>,
 }
@@ -1421,7 +1421,9 @@ extern "system" fn d3d9_create_device(
     present_params: *mut c_void,
     device: *mut *mut c_void,
 ) -> i32 {
-    crate::USED.store(true, std::sync::atomic::Ordering::Relaxed);
+    if !crate::USED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        crate::pin_image();
+    }
 
     if adapter != 0 || device.is_null() {
         return D3DERR_INVALIDCALL;
