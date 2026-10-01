@@ -3981,6 +3981,7 @@ fn depth_sample_compare_gets_level_zero_by_default() {
 const OP_TEXCOORD: u16 = 64;
 const OP_TEX: u16 = 66;
 const OP_TEXBEM: u16 = 67;
+const OP_TEXBEML: u16 = 68;
 const OP_TEXDEPTH: u16 = 87;
 
 #[test]
@@ -4227,16 +4228,16 @@ fn ps_1_1_add_x2_result_modifier_scales() {
     metal_compile_or_fail(&msl);
 }
 
-#[test]
-fn ps_1_1_texbem_emits_bump_uniform_and_perturb() {
-    // ps_1_1 { tex t0; texbem t1, t0; mov oC0, t1; }
-    // texbem perturbs stage 1's coord by the bump matrix applied to t0, then
-    // samples stage 1. The per-stage bump matrix comes from buffer(12).
+/// Emits `ps_1_1 { tex t0; <op> t1, t0; mov oC0, t1; }` under `key`.
+///
+/// `op` is `texbem` or `texbeml`, which perturb stage 1's coord by the bump
+/// matrix applied to t0 and then sample stage 1.
+fn emit_ps_1_1_texbem(op: u16, key: VariantKey) -> String {
     let bc = [
         0xFFFF_0101,
         opcode_token(OP_TEX, 1),
         dst_token(TYPE_ADDR, 0, 0xF, false),
-        opcode_token(OP_TEXBEM, 2),
+        opcode_token(op, 2),
         dst_token(TYPE_ADDR, 1, 0xF, false),
         src_token(TYPE_ADDR, 0, SWIZ_IDENTITY, 0),
         opcode_token(OP_MOV, 2),
@@ -4245,7 +4246,13 @@ fn ps_1_1_texbem_emits_bump_uniform_and_perturb() {
         END_TOKEN,
     ];
     let ps = parse(&bc).expect("ps_1_1 parse");
-    let msl = emit_ps_programmable(&ps, VariantKey::default()).expect("emit ps_1_1");
+    emit_ps_programmable(&ps, key).expect("emit ps_1_1")
+}
+
+#[test]
+fn ps_1_1_texbem_emits_bump_uniform_and_perturb() {
+    // The per-stage bump matrix comes from buffer(12).
+    let msl = emit_ps_1_1_texbem(OP_TEXBEM, VariantKey::default());
     assert!(
         msl.contains("constant float4 *bump_env [[buffer(12)]]"),
         "texbem must bind the bump-env uniform on slot 12:\n{msl}"
@@ -4255,6 +4262,120 @@ fn ps_1_1_texbem_emits_bump_uniform_and_perturb() {
         "texbem on stage 1 must read bump_env[2] (= stage*2):\n{msl}"
     );
     metal_compile_or_fail(&msl);
+}
+
+#[test]
+fn ps_1_1_texbem_into_a_cube_keeps_the_stage_z() {
+    // The displacement moves the direction's x and y; its z is stage 1's own,
+    // and a cube stage takes no projective divide even when the stage asks.
+    for op in [OP_TEXBEM, OP_TEXBEML] {
+        for tt_projected_mask in [0, 0b0010] {
+            let msl = emit_ps_1_1_texbem(
+                op,
+                VariantKey {
+                    cube_sampler_mask: 0b0010,
+                    tt_projected_mask,
+                    ..VariantKey::default()
+                },
+            );
+            assert!(
+                msl.contains("texturecube<float> s1 [[texture(1)]]"),
+                "a cube-bound op {op} stage binds texturecube:\n{msl}"
+            );
+            assert!(
+                msl.contains(", (t[1]).z, (t[1]).w)).xyz)"),
+                "op {op}: the cube direction carries stage 1's z into the xyz sample:\n{msl}"
+            );
+            assert!(
+                !msl.contains("/ (t[1]).w"),
+                "op {op}: a cube stage is never projected:\n{msl}"
+            );
+            metal_compile_or_fail(&msl);
+        }
+    }
+}
+
+#[test]
+fn ps_1_1_texbem_into_a_volume_keeps_the_stage_z() {
+    for op in [OP_TEXBEM, OP_TEXBEML] {
+        let msl = emit_ps_1_1_texbem(
+            op,
+            VariantKey {
+                volume_sampler_mask: 0b0010,
+                ..VariantKey::default()
+            },
+        );
+        assert!(
+            msl.contains("texture3d<float> s1 [[texture(1)]]"),
+            "a volume-bound op {op} stage binds texture3d:\n{msl}"
+        );
+        assert!(
+            msl.contains(", (t[1]).z, (t[1]).w)).xyz)"),
+            "op {op}: the volume coordinate carries stage 1's z into the xyz sample:\n{msl}"
+        );
+        metal_compile_or_fail(&msl);
+    }
+}
+
+#[test]
+fn ps_1_1_texbem_into_a_projected_volume_divides_the_stage_z() {
+    // D3DTTFF_PROJECTED divides the stage's x, y and z by its w before the
+    // displacement, with the same zero-w guard on each component.
+    for op in [OP_TEXBEM, OP_TEXBEML] {
+        let msl = emit_ps_1_1_texbem(
+            op,
+            VariantKey {
+                volume_sampler_mask: 0b0010,
+                tt_projected_mask: 0b0010,
+                ..VariantKey::default()
+            },
+        );
+        for c in ['x', 'y'] {
+            assert!(
+                msl.contains(&format!(
+                    "(((t[1]).w != 0.0) ? (t[1]).{c} / (t[1]).w : 0.0)"
+                )),
+                "op {op}: the projected {c} is divided by w:\n{msl}"
+            );
+        }
+        assert!(
+            msl.contains(", (((t[1]).w != 0.0) ? (t[1]).z / (t[1]).w : 0.0), 1.0)).xyz)"),
+            "op {op}: the projected z is divided by w and reaches the xyz sample:\n{msl}"
+        );
+        metal_compile_or_fail(&msl);
+    }
+}
+
+#[test]
+fn ps_1_1_texbem_into_a_depth_stage_compares_against_the_stage_z() {
+    // A 2D depth stage samples with a comparison whose reference is the
+    // coordinate's z, so that reference is stage 1's own z, divided by its w
+    // when the stage is projected.
+    for (tt_projected_mask, reference) in [
+        (0, ", (t[1]).z, (t[1]).w)).z), level(0)))"),
+        (
+            0b0010,
+            ", (((t[1]).w != 0.0) ? (t[1]).z / (t[1]).w : 0.0), 1.0)).z), level(0)))",
+        ),
+    ] {
+        let msl = emit_ps_1_1_texbem(
+            OP_TEXBEM,
+            VariantKey {
+                depth_sampler_mask: 0b0010,
+                tt_projected_mask,
+                ..VariantKey::default()
+            },
+        );
+        assert!(
+            msl.contains("depth2d<float> s1 [[texture(1)]]"),
+            "a depth-bound texbem stage binds depth2d:\n{msl}"
+        );
+        assert!(
+            msl.contains("s1.sample_compare(samp1, (float4(") && msl.contains(reference),
+            "the compare reference is stage 1's z (projected: {tt_projected_mask}):\n{msl}"
+        );
+        metal_compile_or_fail(&msl);
+    }
 }
 
 #[test]
