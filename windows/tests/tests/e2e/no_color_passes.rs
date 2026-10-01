@@ -18,14 +18,22 @@
 //! and a depth `Clear` bounded by a scissor reaches the part of the depth
 //! surface it names. A 2x2 target keeps its own 2x2 area, and a depth surface
 //! that `render.scale` reduces keeps the 1x1 area.
+//!
+//! A depth or stencil `Clear` through any colour target smaller than the
+//! depth surface reaches what D3D9 clears, the viewport or the rects on the
+//! depth surface, whatever the colour target's size: pending until the next
+//! pass, after draws, by rect, by a viewport reaching past the target, with a
+//! render target 1 of the same size, and in a 1x1 and 1x2 shape under a
+//! 640x640 viewport.
 
 use mtld3d_tests::{Harness, RhwVertex, Surface, assert_pixel_eq, render_scale_is_identity};
 use mtld3d_types::{
-    D3D_OK, D3DCLEAR_TARGET, D3DCLEAR_ZBUFFER, D3DCMP_ALWAYS, D3DCMP_LESS, D3DFMT_A8R8G8B8,
-    D3DFMT_D24S8, D3DFVF_DIFFUSE, D3DFVF_XYZRHW, D3DLOCK_READONLY, D3DMULTISAMPLE_4_SAMPLES,
-    D3DPOOL_SYSTEMMEM, D3DPT_TRIANGLELIST, D3DRECT, D3DRS_COLORWRITEENABLE, D3DRS_LIGHTING,
-    D3DRS_SCISSORTESTENABLE, D3DRS_SRGBWRITEENABLE, D3DRS_ZENABLE, D3DRS_ZFUNC, D3DRS_ZWRITEENABLE,
-    D3DTEXF_NONE, D3DVIEWPORT9,
+    D3D_OK, D3DCLEAR_STENCIL, D3DCLEAR_TARGET, D3DCLEAR_ZBUFFER, D3DCMP_ALWAYS, D3DCMP_EQUAL,
+    D3DCMP_LESS, D3DFMT_A8R8G8B8, D3DFMT_D24S8, D3DFVF_DIFFUSE, D3DFVF_XYZRHW, D3DLOCK_READONLY,
+    D3DMULTISAMPLE_4_SAMPLES, D3DPOOL_SYSTEMMEM, D3DPT_TRIANGLELIST, D3DRECT,
+    D3DRS_COLORWRITEENABLE, D3DRS_LIGHTING, D3DRS_SCISSORTESTENABLE, D3DRS_SRGBWRITEENABLE,
+    D3DRS_STENCILENABLE, D3DRS_STENCILFUNC, D3DRS_STENCILREF, D3DRS_ZENABLE, D3DRS_ZFUNC,
+    D3DRS_ZWRITEENABLE, D3DTEXF_NONE, D3DVIEWPORT9,
 };
 
 const BLACK: u32 = 0xFF00_0000;
@@ -326,10 +334,10 @@ struct SmallOverDepth<'h> {
 /// Bind `small_edge`-square render target 0 over a depth surface cleared to `depth_value`.
 ///
 /// The large target is bound first with the depth surface and cleared red
-/// with the depth at `depth_value`, in a pass of its own. Then the small
-/// target replaces it, which resets the viewport to the small target, and
-/// the viewport is set back to the whole depth surface. The scene stays
-/// open for the caller's draws.
+/// with the depth at `depth_value` and the stencil at 0, in a pass of its
+/// own. Then the small target replaces it, which resets the viewport to the
+/// small target, and the viewport is set back to the whole depth surface.
+/// The scene stays open for the caller's draws.
 fn small_over_depth(h: &Harness, small_edge: u32, depth_value: f32) -> SmallOverDepth<'_> {
     let big = h.create_render_target(BIG, BIG, D3DFMT_A8R8G8B8);
     let small = h.create_render_target(small_edge, small_edge, D3DFMT_A8R8G8B8);
@@ -347,9 +355,14 @@ fn small_over_depth(h: &Harness, small_edge: u32, depth_value: f32) -> SmallOver
     );
     assert_eq!(h.begin_scene(), D3D_OK, "BeginScene");
     assert_eq!(
-        h.clear(D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, RED, depth_value, 0),
+        h.clear(
+            D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER | D3DCLEAR_STENCIL,
+            RED,
+            depth_value,
+            0
+        ),
         D3D_OK,
-        "clear the large target and the depth surface"
+        "clear the large target, the depth and the stencil"
     );
     assert_eq!(
         h.set_render_target(0, &small),
@@ -735,4 +748,239 @@ fn an_unwritten_1x1_target_over_the_back_buffer_depth_follows_the_render_scale()
         assert_pixel_eq(left, GREEN, "a scaled depth surface keeps the 1x1 area");
     }
     assert_pixel_eq(right, GREEN, "the right half was never drawn");
+}
+
+/// Edge of the render target 0 smaller than the depth surface but larger than 1x1.
+///
+/// The middle and last [`PROBES`] lie outside it. Some GPUs clear the whole
+/// depth texture for a load-action clear whose render area is large, so the
+/// target stays small enough that a clear confined to its area shows.
+const SMALL: u32 = 8;
+
+/// Draw a full quad at `z` that writes the bound target under `ZFUNC` always.
+fn writing_draw(h: &Harness, z: f32, color: u32) {
+    assert_eq!(h.set_render_state(D3DRS_COLORWRITEENABLE, 0xF), D3D_OK);
+    assert_eq!(h.set_render_state(D3DRS_ZFUNC, D3DCMP_ALWAYS), D3D_OK);
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &full_quad(z, color)),
+        D3D_OK,
+        "a draw writing the small target"
+    );
+}
+
+impl SmallOverDepth<'_> {
+    /// Read the depth surface's stencil plane through the large target, then the small target.
+    ///
+    /// The large target comes back with the same depth surface, and a green
+    /// quad is drawn over it with the depth test always passing, depth writes
+    /// off, and the stencil test passing where the plane holds `reference`:
+    /// a texel at any other value keeps the red clear. Returns the three
+    /// [`PROBES`] and the small target's pixel (0, 0).
+    fn probe_stencil(&self, h: &Harness, reference: u32) -> ([u32; 3], u32) {
+        assert_eq!(h.set_render_state(D3DRS_STENCILENABLE, 1), D3D_OK);
+        assert_eq!(h.set_render_state(D3DRS_STENCILFUNC, D3DCMP_EQUAL), D3D_OK);
+        assert_eq!(h.set_render_state(D3DRS_STENCILREF, reference), D3D_OK);
+        assert_eq!(
+            h.set_render_target(0, &self.big),
+            D3D_OK,
+            "rebind the large target"
+        );
+        assert_eq!(
+            h.set_depth_stencil_surface(&self.depth),
+            D3D_OK,
+            "same depth surface"
+        );
+        assert_eq!(h.set_render_state(D3DRS_COLORWRITEENABLE, 0xF), D3D_OK);
+        assert_eq!(h.set_render_state(D3DRS_ZWRITEENABLE, 0), D3D_OK);
+        assert_eq!(h.set_render_state(D3DRS_ZFUNC, D3DCMP_ALWAYS), D3D_OK);
+        assert_eq!(
+            h.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &full_quad(0.75, GREEN)),
+            D3D_OK,
+            "green stencil probe"
+        );
+        assert_eq!(h.end_scene(), D3D_OK, "EndScene");
+        let big = render_target_pixels(h, &self.big, (BIG, BIG), &PROBES);
+        let small = render_target_pixels(
+            h,
+            &self.small,
+            (self.small_edge, self.small_edge),
+            &[(0, 0)],
+        );
+        ([big[0], big[1], big[2]], small[0])
+    }
+}
+
+/// A pending depth `Clear` through a target smaller than the depth surface reaches every texel.
+///
+/// The depth surface starts at 0.0. With the 8x8 target bound and the
+/// viewport over the 256x256 depth surface, one `Clear` of the target and the
+/// depth follows, and nothing is drawn before the large target comes back.
+#[test]
+fn a_depth_clear_through_a_smaller_target_reaches_the_whole_depth_surface() {
+    let h = Harness::new();
+    let s = small_over_depth(&h, SMALL, 0.0);
+    assert_eq!(
+        h.clear(D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, BLUE, 1.0, 0),
+        D3D_OK,
+        "clear the small target and the depth surface"
+    );
+    let (probes, small) = s.probe(&h);
+    assert_probes(probes, [GREEN; 3], "the depth clear reached every texel");
+    assert_pixel_eq(small, BLUE, "the small target keeps its clear");
+}
+
+/// A depth `Clear` after a draw through a smaller target reaches every texel.
+///
+/// The depth surface starts at 0.0, and a draw writes the 8x8 target and 0.5
+/// into its area of the depth surface before the clear to 1.0.
+#[test]
+fn a_depth_clear_after_a_draw_through_a_smaller_target_reaches_the_whole_depth_surface() {
+    let h = Harness::new();
+    let s = small_over_depth(&h, SMALL, 0.0);
+    writing_draw(&h, 0.5, BLUE);
+    assert_eq!(
+        h.clear(D3DCLEAR_ZBUFFER, 0, 1.0, 0),
+        D3D_OK,
+        "clear the depth surface after the draw"
+    );
+    let (probes, small) = s.probe(&h);
+    assert_probes(probes, [GREEN; 3], "the depth clear reached every texel");
+    assert_pixel_eq(small, BLUE, "the draw wrote the small target");
+}
+
+/// A depth `Clear` of a rect reaching past a smaller target reaches the whole rect.
+#[test]
+fn a_rect_depth_clear_past_a_smaller_target_reaches_its_rect() {
+    let h = Harness::new();
+    let s = small_over_depth(&h, SMALL, 0.0);
+    let rect = D3DRECT {
+        x1: 64,
+        y1: 64,
+        x2: 256,
+        y2: 256,
+    };
+    assert_eq!(
+        h.clear_rects(D3DCLEAR_ZBUFFER, 0, 1.0, 0, &[rect]),
+        D3D_OK,
+        "clear a rect of the depth surface"
+    );
+    let (probes, _) = s.probe(&h);
+    assert_probes(
+        probes,
+        [RED, GREEN, GREEN],
+        "the rect was cleared, the corner outside it kept its depth",
+    );
+}
+
+/// A depth `Clear` bounded by a viewport reaching past a smaller target reaches the viewport.
+#[test]
+fn a_viewport_depth_clear_past_a_smaller_target_reaches_its_viewport() {
+    let h = Harness::new();
+    let s = small_over_depth(&h, SMALL, 0.0);
+    let viewport = D3DVIEWPORT9 {
+        x: 64,
+        y: 64,
+        width: 192,
+        height: 192,
+        min_z: 0.0,
+        max_z: 1.0,
+    };
+    assert_eq!(h.set_viewport(&viewport), D3D_OK, "sub-viewport");
+    assert_eq!(
+        h.clear(D3DCLEAR_ZBUFFER, 0, 1.0, 0),
+        D3D_OK,
+        "clear the viewport's part of the depth surface"
+    );
+    let (probes, _) = s.probe(&h);
+    assert_probes(
+        probes,
+        [RED, GREEN, GREEN],
+        "the viewport was cleared, the corner outside it kept its depth",
+    );
+}
+
+/// A depth `Clear` through two render targets smaller than the depth surface reaches every texel.
+#[test]
+fn a_depth_clear_through_two_smaller_targets_reaches_the_whole_depth_surface() {
+    let h = Harness::new();
+    let s = small_over_depth(&h, SMALL, 0.0);
+    let second = h.create_render_target(SMALL, SMALL, D3DFMT_A8R8G8B8);
+    assert_eq!(
+        h.set_render_target(1, &second),
+        D3D_OK,
+        "bind render target 1 the size of render target 0"
+    );
+    assert_eq!(
+        h.clear(D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, BLUE, 1.0, 0),
+        D3D_OK,
+        "clear both targets and the depth surface"
+    );
+    assert_eq!(h.clear_render_target(1), D3D_OK, "unbind render target 1");
+    let (probes, small) = s.probe(&h);
+    assert_probes(probes, [GREEN; 3], "the depth clear reached every texel");
+    assert_pixel_eq(small, BLUE, "render target 0 keeps its clear");
+    let second_pixel = render_target_pixels(&h, &second, (SMALL, SMALL), &[(0, 0)]);
+    assert_pixel_eq(second_pixel[0], BLUE, "render target 1 keeps its clear");
+}
+
+/// A stencil `Clear` through a target smaller than the depth surface reaches every texel.
+#[test]
+fn a_stencil_clear_through_a_smaller_target_reaches_the_whole_depth_surface() {
+    let h = Harness::new();
+    let s = small_over_depth(&h, SMALL, 1.0);
+    assert_eq!(
+        h.clear(D3DCLEAR_TARGET | D3DCLEAR_STENCIL, BLUE, 1.0, 5),
+        D3D_OK,
+        "clear the small target and the stencil plane"
+    );
+    let (probes, small) = s.probe_stencil(&h, 5);
+    assert_probes(probes, [GREEN; 3], "the stencil clear reached every texel");
+    assert_pixel_eq(small, BLUE, "the small target keeps its clear");
+}
+
+/// A 1x1 render target 0 with a 1x2 render target 1 over a larger depth surface clears all of it.
+///
+/// The viewport is 640x640, larger than every surface. The depth surface
+/// starts at 0.0 and `Clear(TARGET | ZBUFFER)` sets it to 1.0; a draw through
+/// the 1x1 target follows with depth writes off, so the pass it opens is the
+/// first to attach the depth surface after the clear.
+#[test]
+fn a_depth_clear_through_a_1x1_and_a_1x2_target_reaches_the_whole_depth_surface() {
+    let h = Harness::new();
+    let s = small_over_depth(&h, 1, 0.0);
+    let second = h.create_render_target(1, 2, D3DFMT_A8R8G8B8);
+    assert_eq!(
+        h.set_render_target(1, &second),
+        D3D_OK,
+        "bind the 1x2 target"
+    );
+    let viewport = D3DVIEWPORT9 {
+        x: 0,
+        y: 0,
+        width: 640,
+        height: 640,
+        min_z: 0.0,
+        max_z: 1.0,
+    };
+    assert_eq!(h.set_viewport(&viewport), D3D_OK, "640x640 viewport");
+    assert_eq!(
+        h.clear(D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, BLUE, 1.0, 0),
+        D3D_OK,
+        "clear both targets and the depth surface"
+    );
+    assert_eq!(h.set_render_state(D3DRS_ZWRITEENABLE, 0), D3D_OK);
+    assert_eq!(h.set_render_state(D3DRS_ZFUNC, D3DCMP_ALWAYS), D3D_OK);
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad(0.0, 1.0, 0.0, 1.0, 0.5, BLUE)),
+        D3D_OK,
+        "a draw through the 1x1 target"
+    );
+    assert_eq!(h.clear_render_target(1), D3D_OK, "unbind the 1x2 target");
+    let (probes, small) = s.probe(&h);
+    assert_probes(probes, [GREEN; 3], "the depth clear reached every texel");
+    assert_pixel_eq(small, BLUE, "the 1x1 target keeps its clear");
+    let second_pixels = render_target_pixels(&h, &second, (1, 2), &[(0, 0), (0, 1)]);
+    for pixel in second_pixels {
+        assert_pixel_eq(pixel, BLUE, "the 1x2 target keeps its clear");
+    }
 }

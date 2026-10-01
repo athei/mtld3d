@@ -2222,7 +2222,9 @@ fn a_stencil_clear_under_a_zero_area_viewport_is_a_no_op() {
     // draws, ahead of them.
     let ds = tex(0x3300);
     let mut s = fresh_scaled();
-    s.set_depth_stencil_attachment(ds, BB_SIZE, false, true);
+    // At the back buffer's render resolution, as a depth surface paired with
+    // it is, so the pass rasterizes the whole surface.
+    s.set_depth_stencil_attachment(ds, (BB_SIZE.0 / 2, BB_SIZE.1 / 2), false, true);
     s.emit_command(dummy_draw());
     let before = s.passes()[0].stencil_load();
     s.set_viewport(1, 1, 1, 1, 0.0, 1.0);
@@ -9580,7 +9582,11 @@ fn a_pending_depth_clear_meeting_a_1x1_target_gets_a_depth_only_pass() {
     assert_eq!(s.passes()[0].depth_texture(), depth());
     assert_eq!(s.passes()[0].depth_load(), DepthLoad::Clear { value: z });
     assert_eq!(s.passes()[1].color_texture(), tiny());
-    assert_eq!(s.passes()[1].depth_load(), DepthLoad::Load);
+    assert_eq!(
+        s.passes()[1].depth_load(),
+        DepthLoad::Clear { value: z },
+        "the 1x1 pass clears its own area to the value the whole surface holds"
+    );
 }
 
 #[test]
@@ -9831,6 +9837,477 @@ fn a_colour_clear_ends_a_dropped_pass_first() {
     let mut s = tiny_over_depth();
     s.emit_command(dummy_draw());
     s.end_rt0_dropped_pass("test");
+    assert!(!s.current_pass_closed());
+}
+
+// ── A render target 0 smaller than the depth surface, larger than 1x1. The
+// ── frame's depth surface is the back buffer's 640x480 one, at the identity
+// ── scale.
+
+/// Edge of the [`small`] target.
+const SMALL: (u32, u32) = (64, 64);
+
+/// A 64x64 render target 0 bound over the frame's depth surface.
+fn small() -> MetalHandle<MTLTextureKind> {
+    tex(0x7800)
+}
+
+/// A frame with the [`small`] target over the 640x480 depth surface, viewport over the depth.
+fn small_over_depth() -> PassState {
+    let mut s = fresh();
+    s.set_color_render_target(small(), SMALL.0, SMALL.1, RT_FORMAT, RenderScale::IDENTITY);
+    s.set_viewport(0, 0, BB_SIZE.0, BB_SIZE.1, 0.0, 1.0);
+    s
+}
+
+/// [`small_over_depth`] with a render target 1 the size of render target 0.
+fn small_mrt_over_depth() -> PassState {
+    let mut s = small_over_depth();
+    s.set_extra_color_render_target(1, Some(slot(tex(0x7900), SMALL)));
+    s
+}
+
+/// Assert `pass` is a depth-only clear pass over the whole frame depth surface.
+fn assert_depth_only_clear_pass(pass: &Pass, depth_load: DepthLoad, stencil_load: StencilLoad) {
+    assert_eq!(pass.color_texture(), MetalHandle::NULL, "no colour");
+    assert!(
+        pass.extra_color().iter().all(|a| !a.is_bound()),
+        "no render target 1..3"
+    );
+    assert_eq!(pass.depth_texture(), depth());
+    assert_eq!(
+        pass.depth_size, BB_SIZE,
+        "the depth surface sets the extent"
+    );
+    assert_eq!(pass.depth_load(), depth_load);
+    assert_eq!(pass.stencil_load(), stencil_load);
+    assert!(!pass.commands().iter().any(Command::is_draw));
+}
+
+#[test]
+fn the_colour_target_covers_the_depth_surface_only_when_it_reaches_it_on_both_axes() {
+    assert!(fresh().pass_color_covers_depth(), "equal extents");
+    assert!(
+        !small_over_depth().pass_color_covers_depth(),
+        "a smaller target"
+    );
+    for (extent, covers, what) in [
+        ((1024, 1024), true, "a larger target"),
+        ((640, 240), false, "shorter"),
+        ((320, 480), false, "narrower"),
+        ((1024, 240), false, "wider but shorter"),
+    ] {
+        let mut s = fresh();
+        s.set_color_render_target(
+            tex(0x7810),
+            extent.0,
+            extent.1,
+            RT_FORMAT,
+            RenderScale::IDENTITY,
+        );
+        assert_eq!(s.pass_color_covers_depth(), covers, "{what}");
+    }
+
+    let mut s = small_over_depth();
+    s.set_rt0_dropped(true);
+    assert!(s.pass_color_covers_depth(), "a pass without colour");
+
+    let mut s = small_over_depth();
+    s.set_color_msaa(tex(0x7820), MetalHandle::NULL, 4);
+    assert!(
+        s.pass_color_covers_depth(),
+        "a depth surface at another sample count, which the pass drops"
+    );
+
+    let mut s = small_over_depth();
+    s.set_depth_stencil_attachment(MetalHandle::NULL, (0, 0), false, false);
+    assert!(s.pass_color_covers_depth(), "no depth surface");
+}
+
+#[test]
+fn a_pending_depth_clear_meeting_a_small_target_gets_a_depth_only_pass() {
+    for (mut s, what) in [
+        (small_over_depth(), "render target 0 alone"),
+        (small_mrt_over_depth(), "with render target 1"),
+    ] {
+        let z = f32::to_bits(0.5);
+        assert!(matches!(s.clear_depth(z), DepthClearOutcome::Folded));
+        depth_draw(&mut s);
+        s.end_current_pass("test");
+        assert_eq!(
+            s.passes().len(),
+            2,
+            "{what}: a depth-only clear pass comes first"
+        );
+        assert_depth_only_clear_pass(
+            &s.passes()[0],
+            DepthLoad::Clear { value: z },
+            StencilLoad::Load,
+        );
+        assert_eq!(s.passes()[0].viewport(), (0, 0, BB_SIZE.0, BB_SIZE.1));
+        let pass = &s.passes()[1];
+        assert_eq!(pass.color_texture(), small(), "{what}");
+        assert_eq!(pass.depth_load(), DepthLoad::Clear { value: z }, "{what}");
+        assert_eq!(
+            pass.extra_present_mask(),
+            s.extra_present_mask(),
+            "{what}: the small pass attaches the bound set"
+        );
+    }
+}
+
+#[test]
+fn a_pending_stencil_clear_meeting_a_small_target_gets_a_depth_only_pass() {
+    let mut s = small_over_depth();
+    s.set_depth_stencil_attachment(depth(), BB_SIZE, false, true);
+    s.set_depth_unscaled(true);
+    assert!(matches!(s.clear_stencil(5), StencilClearOutcome::Folded));
+    depth_draw(&mut s);
+    s.end_current_pass("test");
+    assert_eq!(s.passes().len(), 2);
+    assert_depth_only_clear_pass(
+        &s.passes()[0],
+        DepthLoad::Load,
+        StencilLoad::Clear { value: 5 },
+    );
+    assert_eq!(
+        s.passes()[1].stencil_load(),
+        StencilLoad::Clear { value: 5 }
+    );
+    assert_eq!(
+        s.passes()[1].depth_load(),
+        DepthLoad::Load,
+        "depth keeps what the surface held"
+    );
+}
+
+#[test]
+fn a_whole_depth_or_stencil_clear_ends_a_small_pass_with_draws() {
+    // A quad painted into the open pass would be clipped to the 64x64 area.
+    let z = f32::to_bits(0.5);
+    let mut s = small_over_depth();
+    s.emit_command(dummy_draw());
+    assert!(matches!(s.clear_depth(z), DepthClearOutcome::Folded));
+    assert!(s.current_pass_closed(), "the small pass ended");
+    assert_eq!(s.pending_depth_clear, Some(z));
+
+    let mut s = small_over_depth();
+    s.set_depth_stencil_attachment(depth(), BB_SIZE, false, true);
+    s.set_depth_unscaled(true);
+    s.emit_command(dummy_draw());
+    assert!(matches!(s.clear_stencil(5), StencilClearOutcome::Folded));
+    assert!(s.current_pass_closed(), "the small pass ended");
+    assert_eq!(s.pending_stencil_clear, Some(5));
+}
+
+#[test]
+fn a_whole_depth_clear_ends_a_drawless_small_pass_and_rule_e_moves_its_colour_clear() {
+    let z = f32::to_bits(0.5);
+    let colour = ColorLoad::Clear {
+        r: 1,
+        g: 2,
+        b: 3,
+        a: 4,
+    };
+    let mut s = small_over_depth();
+    assert!(matches!(
+        s.clear_color(1, 2, 3, 4),
+        ColorClearOutcome::Folded
+    ));
+    s.ensure_pass_open();
+    assert!(matches!(s.clear_depth(z), DepthClearOutcome::Folded));
+    assert!(
+        s.current_pass_closed(),
+        "the draw-less pass ended rather than taking the clear"
+    );
+    assert_eq!(
+        s.passes()[0].depth_load(),
+        DepthLoad::DontCare,
+        "not amended"
+    );
+    depth_draw(&mut s);
+    s.end_current_pass("test");
+    assert_eq!(s.passes().len(), 3);
+    apply_submit_rules(&mut s);
+    assert_eq!(
+        s.passes().len(),
+        2,
+        "the colour clear moved across the depth-only pass"
+    );
+    assert_eq!(s.passes()[0].color_texture(), MetalHandle::NULL);
+    assert_eq!(s.passes()[0].depth_load(), DepthLoad::Clear { value: z });
+    assert_eq!(s.passes()[0].depth_store(), StoreAction::Store);
+    assert_eq!(s.passes()[1].color_texture(), small());
+    assert_eq!(s.passes()[1].color_load(), colour);
+    assert_eq!(s.passes()[1].depth_load(), DepthLoad::Clear { value: z });
+}
+
+#[test]
+fn a_depth_only_flush_through_a_small_target_pushes_no_empty_small_pass() {
+    let z = f32::to_bits(0.5);
+    let mut s = small_over_depth();
+    assert!(matches!(s.clear_depth(z), DepthClearOutcome::Folded));
+    s.flush_pending_clears();
+    assert_eq!(s.passes().len(), 1, "the depth-only pass alone");
+    assert_depth_only_clear_pass(
+        &s.passes()[0],
+        DepthLoad::Clear { value: z },
+        StencilLoad::Load,
+    );
+    assert!(s.pending_depth_clear.is_none());
+    assert!(s.current_pass_closed());
+}
+
+#[test]
+fn colour_and_depth_pending_through_a_small_target_give_a_depth_pass_then_the_small_one() {
+    let z = f32::to_bits(0.5);
+    let mut s = small_over_depth();
+    s.clear_color(1, 2, 3, 4);
+    assert!(matches!(s.clear_depth(z), DepthClearOutcome::Folded));
+    s.push_pending_leading_blit(dummy_blit());
+    s.flush_pending_clears();
+    assert_eq!(s.passes().len(), 2);
+    assert_depth_only_clear_pass(
+        &s.passes()[0],
+        DepthLoad::Clear { value: z },
+        StencilLoad::Load,
+    );
+    assert_eq!(
+        s.passes()[0].leading_blits().len(),
+        1,
+        "the first pass pushed takes the blits"
+    );
+    let pass = &s.passes()[1];
+    assert_eq!(pass.color_texture(), small());
+    assert_eq!(
+        pass.color_load(),
+        ColorLoad::Clear {
+            r: 1,
+            g: 2,
+            b: 3,
+            a: 4
+        }
+    );
+    assert_eq!(pass.depth_load(), DepthLoad::Clear { value: z });
+    assert!(pass.leading_blits().is_empty());
+    assert!(s.pending_color_clear.is_none());
+    assert!(s.pending_depth_clear.is_none());
+}
+
+#[test]
+fn the_submit_rules_keep_the_depth_only_pass_a_small_pass_repeats() {
+    // The small pass loads the same `Clear`, but only over its own 64x64
+    // area, so no rule may treat it as covering the depth surface.
+    let z = f32::to_bits(0.5);
+    let mut s = small_over_depth();
+    assert!(matches!(s.clear_depth(z), DepthClearOutcome::Folded));
+    depth_draw(&mut s);
+    s.end_current_pass("test");
+    s.drop_overwritten_clear_only_passes();
+    assert_eq!(s.passes().len(), 2, "Rule I keeps the depth-only pass");
+    s.coalesce_clear_only_passes();
+    assert_eq!(s.passes().len(), 2, "Rule E keeps the depth-only pass");
+    s.finalize_load_actions();
+    s.finalize_store_actions(false);
+    assert_eq!(
+        s.passes()[0].depth_store(),
+        StoreAction::Store,
+        "Rule C keeps the store the small pass does not overwrite"
+    );
+    s.strip_dead_color_in_clear_only_passes();
+    s.strip_color_from_no_color_draw_passes(&FxHashMap::default());
+    s.cull_dead_clear_only_passes();
+    s.merge_adjacent_identical_passes();
+    assert_eq!(
+        s.passes().len(),
+        2,
+        "Rules F and J keep the depth-only pass"
+    );
+    assert_depth_only_clear_pass(
+        &s.passes()[0],
+        DepthLoad::Clear { value: z },
+        StencilLoad::Load,
+    );
+    assert_eq!(s.passes()[1].depth_load(), DepthLoad::Clear { value: z });
+}
+
+#[test]
+fn rule_c_keeps_a_depth_store_a_smaller_pass_clears_only_in_part() {
+    // A pass on the whole depth surface, then a 64x64 pass that opens with a
+    // depth `Clear`: the store keeps the texels outside the 64x64 area.
+    let mut s = fresh();
+    depth_draw(&mut s);
+    s.end_current_pass("test");
+    s.set_color_render_target(small(), SMALL.0, SMALL.1, RT_FORMAT, RenderScale::IDENTITY);
+    depth_draw(&mut s);
+    s.end_current_pass("test");
+    s.passes[1].depth_load = DepthLoad::Clear { value: 0 };
+    s.passes[1].stencil_load = StencilLoad::Clear { value: 0 };
+    s.finalize_store_actions(true);
+    assert_eq!(s.passes()[0].depth_store(), StoreAction::Store);
+
+    // The same clear in a pass that spans the depth surface discards it.
+    let mut s = fresh();
+    depth_draw(&mut s);
+    s.end_current_pass("test");
+    s.set_color_render_target(
+        tex(0x7810),
+        BB_SIZE.0,
+        BB_SIZE.1,
+        RT_FORMAT,
+        RenderScale::IDENTITY,
+    );
+    depth_draw(&mut s);
+    s.end_current_pass("test");
+    s.passes[1].depth_load = DepthLoad::Clear { value: 0 };
+    s.finalize_store_actions(true);
+    assert_eq!(s.passes()[0].depth_store(), StoreAction::DontCare);
+}
+
+#[test]
+fn rule_e_keeps_a_depth_clear_out_of_a_small_pass() {
+    let z = f32::to_bits(0.25);
+    let mut s = fresh();
+    s.pending_depth_clear = Some(z);
+    s.push_depth_clear_pass();
+    s.set_color_render_target(small(), SMALL.0, SMALL.1, RT_FORMAT, RenderScale::IDENTITY);
+    s.emit_command(dummy_draw());
+    s.end_current_pass("test");
+    s.coalesce_clear_only_passes();
+    assert_eq!(s.passes().len(), 2, "the depth clear keeps its own pass");
+    assert_eq!(s.passes()[0].depth_load(), DepthLoad::Clear { value: z });
+    assert_eq!(s.passes()[1].depth_load(), DepthLoad::Load);
+}
+
+#[test]
+fn a_region_depth_clear_past_a_small_target_opens_a_depth_only_pass() {
+    let mut s = small_over_depth();
+    let (has_color, _) = s
+        .begin_region_depth_stencil_clear()
+        .expect("a depth surface is bound");
+    assert!(!has_color, "the quads go to a pass without colour");
+    assert!(s.rt0_dropped());
+    assert_eq!(s.effective_viewport(), (0, 0, BB_SIZE.0, BB_SIZE.1));
+    let pass = s.passes().last().expect("a pass is open");
+    assert_eq!(pass.color_texture(), MetalHandle::NULL);
+    assert_eq!(pass.depth_texture(), depth());
+    assert_eq!(
+        pass.depth_size, BB_SIZE,
+        "the depth surface sets the extent"
+    );
+    assert_eq!(pass.color_size(), BB_SIZE);
+
+    // Through render targets 0 and 1 alike, both left out.
+    let mut s = small_mrt_over_depth();
+    let (has_color, _) = s
+        .begin_region_depth_stencil_clear()
+        .expect("a depth surface is bound");
+    assert!(!has_color);
+    let pass = s.passes().last().expect("a pass is open");
+    assert!(pass.extra_color().iter().all(|a| !a.is_bound()));
+}
+
+#[test]
+fn a_region_depth_clear_inside_a_small_target_keeps_its_pass() {
+    // Every rect lies inside the viewport, and the viewport inside the
+    // target, so the pass that attaches it reaches them all.
+    let mut s = small_over_depth();
+    s.set_viewport(0, 0, SMALL.0, SMALL.1, 0.0, 1.0);
+    s.emit_command(dummy_draw());
+    let (has_color, _) = s
+        .begin_region_depth_stencil_clear()
+        .expect("a depth surface is bound");
+    assert!(has_color);
+    assert!(!s.rt0_dropped());
+    assert_eq!(s.passes().len(), 1, "the open pass stays");
+    assert_eq!(s.passes()[0].color_texture(), small());
+}
+
+#[test]
+fn a_scaled_region_clear_keeps_colour_while_a_scaled_whole_clear_is_routed() {
+    // The frame's depth surface is reduced with the back buffer, so a region
+    // clear's rects, in the 64x64 target's space, cannot address it; a whole
+    // clear needs no rect and still reaches every texel.
+    let half = (BB_SIZE.0 / 2, BB_SIZE.1 / 2);
+    let mut s = fresh_scaled();
+    s.set_color_render_target(small(), SMALL.0, SMALL.1, RT_FORMAT, RenderScale::IDENTITY);
+    s.set_viewport(0, 0, BB_SIZE.0, BB_SIZE.1, 0.0, 1.0);
+    let (has_color, _) = s
+        .begin_region_depth_stencil_clear()
+        .expect("a depth surface is bound");
+    assert!(has_color, "the region clear keeps the colour target");
+    assert!(!s.rt0_dropped());
+    s.end_current_pass("test");
+
+    let z = f32::to_bits(0.5);
+    assert!(matches!(s.clear_depth(z), DepthClearOutcome::Folded));
+    depth_draw(&mut s);
+    s.end_current_pass("test");
+    let clear = &s.passes()[s.passes().len() - 2];
+    assert_eq!(clear.color_texture(), MetalHandle::NULL);
+    assert_eq!(clear.depth_size, half);
+    assert_eq!(clear.depth_load(), DepthLoad::Clear { value: z });
+    assert_eq!(s.passes().last().map(Pass::color_texture), Some(small()));
+}
+
+#[test]
+fn the_next_colour_draw_ends_the_depth_only_pass_a_region_clear_opened() {
+    let mut s = small_over_depth();
+    s.begin_region_depth_stencil_clear()
+        .expect("a depth surface is bound");
+    s.emit_command(dummy_draw());
+    // What the draw path does for a draw that writes render target 0.
+    s.set_rt0_dropped(false);
+    s.emit_command(dummy_draw());
+    s.end_current_pass("test");
+    let colours: Vec<_> = s.passes().iter().map(Pass::color_texture).collect();
+    assert_eq!(colours, [MetalHandle::NULL, small()]);
+}
+
+#[test]
+fn a_zero_area_clear_through_a_small_target_is_a_no_op_that_keeps_the_pass() {
+    // A scaled 64x64 target over the scaled frame depth surface, under a
+    // viewport that rounds to nothing: D3D9 clears nothing, so the pass with
+    // its draws stays open and nothing goes pending.
+    let mut s = fresh_scaled();
+    s.set_color_render_target(
+        small(),
+        SMALL.0,
+        SMALL.1,
+        RT_FORMAT,
+        RenderScale::from_percent(50),
+    );
+    assert!(!s.pass_color_covers_depth());
+    s.set_viewport(1, 1, 1, 1, 0.0, 1.0);
+    let (_, _, w, h) = s.effective_viewport();
+    assert!(w == 0 || h == 0, "the viewport rounds to nothing");
+    s.emit_command(dummy_draw());
+    assert_eq!(s.clear_depth(f32::to_bits(1.0)), DepthClearOutcome::NoOp);
+    assert_eq!(s.clear_stencil(7), StencilClearOutcome::NoOp);
+    assert_eq!(s.passes().len(), 1);
+    assert!(!s.current_pass_closed(), "the small pass stays open");
+    assert!(s.pending_depth_clear.is_none());
+    assert!(s.pending_stencil_clear.is_none());
+}
+
+#[test]
+fn a_depth_surface_smaller_than_the_colour_target_still_takes_the_clear_in_its_pass() {
+    // The pass rasterizes the whole 256x256 depth surface, so nothing moves.
+    let z = f32::to_bits(0.5);
+    let mut s = fresh();
+    s.set_depth_stencil_attachment(tex(0x7830), (256, 256), false, false);
+    s.set_depth_unscaled(true);
+    assert!(s.pass_color_covers_depth());
+    s.ensure_pass_open();
+    assert!(matches!(s.clear_depth(z), DepthClearOutcome::Folded));
+    assert_eq!(s.passes().len(), 1, "amended in place");
+    assert!(!s.current_pass_closed());
+    assert_eq!(s.passes()[0].depth_load(), DepthLoad::Clear { value: z });
+    s.emit_command(dummy_draw());
+    match s.clear_depth(z) {
+        DepthClearOutcome::EmitQuad { has_color, .. } => assert!(has_color),
+        _ => panic!("a clear after a draw paints a quad in the open pass"),
+    }
     assert!(!s.current_pass_closed());
 }
 
