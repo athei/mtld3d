@@ -172,6 +172,23 @@ const SNAPSHOT_SECTIONS: [(usize, &str, &str); 17] = [
 #[cfg(perf_tracking)]
 const KEYS_SECTION_SAMPLE_PERIOD: u32 = 16;
 
+/// One frame in this many, on average, runs its timers; the others read no clock.
+///
+/// A timer costs about as much as a cheap call (two counter reads and the
+/// booking, 12 to 17 ns under Rosetta), so a `PERF=1` build that times
+/// every call of every frame runs its API thread about half again slower
+/// than the production build. Timing whole frames keeps every timed frame
+/// exact (nesting, exclusive time, the rows that are a parent less its
+/// children) and leaves the others at production cost; the summary folds
+/// the timed frames only, so its rows are per timed frame and need no
+/// scaling. The gaps between timed frames are drawn at random, so a
+/// workload that cycles through a few frame shapes is not timed on one of
+/// them only. A benchmark's two-second window holds thousands of frames,
+/// so it keeps a few hundred timed ones; a game at 60 frames a second keeps
+/// about eight a window.
+#[cfg(perf_tracking)]
+const FRAME_SAMPLE_PERIOD: u8 = 16;
+
 /// The six sections the snapshot's `keys` scope times, in the order the draw builds them.
 ///
 /// Each entry is the section's slot, its grid label (at most four columns,
@@ -477,10 +494,20 @@ impl ApiPerfStorage {
         }
     }
 
-    /// Stable backing for subtimers nested inside an owning API timer.
+    /// Stable backing for subtimers nested inside an owning API timer, or null in an untimed frame.
     #[cfg(perf_tracking)]
     pub fn as_ptr(&mut self) -> *mut ApiPerfState {
-        self.state.as_ptr()
+        if self.frame_timed() {
+            self.state.as_ptr()
+        } else {
+            core::ptr::null_mut()
+        }
+    }
+
+    /// Whether the frame being recorded runs its timers ([`FRAME_SAMPLE_PERIOD`]).
+    #[cfg(perf_tracking)]
+    fn frame_timed(&self) -> bool {
+        self.state.borrow().untimed_frames == 0
     }
 
     #[cfg(not(perf_tracking))]
@@ -565,7 +592,20 @@ impl ApiTimer {
     #[cfg(perf_tracking)]
     #[must_use]
     pub fn start(storage: Option<&ApiPerfStorage>, category: ApiCategory) -> Self {
-        Self::new(storage.filter(|_| perf_enabled()), category)
+        Self::begin(storage, category, false)
+    }
+
+    /// Start a timer that reads the clock in timed frames, or in every frame with `every_frame`.
+    ///
+    /// The `Frame` calls are timed in every frame: `Present` drains the
+    /// frame's counters part way through, so its own time lands in the next
+    /// frame, which may be a timed one.
+    #[cfg(perf_tracking)]
+    fn begin(storage: Option<&ApiPerfStorage>, category: ApiCategory, every_frame: bool) -> Self {
+        Self::new(
+            storage.filter(|storage| perf_enabled() && (every_frame || storage.frame_timed())),
+            category,
+        )
     }
 
     #[cfg(perf_tracking)]
@@ -599,7 +639,8 @@ impl ApiTimer {
     #[cfg(perf_tracking)]
     #[must_use]
     pub fn start_device(storage: Option<&ApiPerfStorage>, sub: DeviceSubCategory) -> Self {
-        let mut timer = Self::start(storage, ApiCategory::Device);
+        let every_frame = matches!(sub, DeviceSubCategory::Frame);
+        let mut timer = Self::begin(storage, ApiCategory::Device, every_frame);
         timer.device_sub = Some(sub);
         timer
     }
@@ -980,7 +1021,8 @@ struct FrameCounters {
     texture_pool_hits: u32,
     /// Pool-enabled texture staging allocations that fell through to the allocator.
     texture_pool_misses: u32,
-    reserved: u32,
+    /// 1 when the frame ran its timers ([`FRAME_SAMPLE_PERIOD`]), 0 when it did not.
+    timed: u32,
 }
 
 #[cfg(perf_tracking)]
@@ -994,7 +1036,7 @@ impl Default for FrameCounters {
 impl FrameCounters {
     const fn new() -> Self {
         Self {
-            reserved: 0,
+            timed: 0,
             texture_pool_hits: 0,
             texture_pool_misses: 0,
             reset_epoch: 0,
@@ -1355,6 +1397,12 @@ pub struct ApiPerfState {
     /// that repeats its draw sequence every frame is not sampled at the same
     /// positions each time.
     section_sample_state: u32,
+    /// Untimed frames left before the next timed one; the frame being recorded is timed at 0.
+    ///
+    /// Each timed frame draws the next gap from the xorshift state, between 0
+    /// and twice [`FRAME_SAMPLE_PERIOD`] less two, so a frame is timed one
+    /// time in [`FRAME_SAMPLE_PERIOD`] on average and never on a fixed beat.
+    untimed_frames: u8,
 }
 
 #[cfg(perf_tracking)]
@@ -1376,6 +1424,7 @@ impl ApiPerfState {
             active_child_cycles: 0,
             timer_depth: 0,
             section_sample_state: 0x9e37_79b9,
+            untimed_frames: 0,
         }
     }
 
@@ -1747,6 +1796,18 @@ impl ApiPerfState {
         payload.counters.reset_epoch = self.reset_epoch;
         payload.counters.reset_epoch_saturated = u32::from(self.reset_epoch_saturated);
         payload.timing.frame_total_cycles = if prev == 0 { 0 } else { now - prev };
+        payload.counters.timed = u32::from(self.untimed_frames == 0);
+        self.untimed_frames = if self.untimed_frames == 0 {
+            let mut state = self.section_sample_state;
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            self.section_sample_state = state;
+            let span = u32::from(FRAME_SAMPLE_PERIOD) * 2 - 1;
+            u8::try_from(state % span).expect("a gap below twice the period fits u8")
+        } else {
+            self.untimed_frames - 1
+        };
     }
 }
 
@@ -2115,6 +2176,8 @@ pub struct EncoderPerfState {
     prev_minor_faults: u64,
     /// Cumulative `ru_majflt` at the previous window close (0 = no baseline).
     prev_major_faults: u64,
+    /// Whether the frame being encoded runs its phase timers, as the API thread drew it.
+    frame_timed: bool,
 }
 
 #[cfg(perf_tracking)]
@@ -2142,6 +2205,7 @@ impl EncoderPerfState {
             prev_pagebox_volume: PageBoxVolume::new(),
             prev_minor_faults: 0,
             prev_major_faults: 0,
+            frame_timed: false,
         }
     }
 
@@ -2169,6 +2233,7 @@ impl EncoderPerfState {
         // Seed the API-thread counters + payload timing wholesale.
         self.counters = payload.counters;
         self.timing = payload.timing;
+        self.frame_timed = self.counters.timed != 0;
         // Reset every encoder-bumped per-frame counter in one move.
         // `drawable_wait_cycles` / `submit_exec_cycles` live in `enc` and are
         // folded back from the submit thread when a payload returns (after
@@ -2266,14 +2331,22 @@ impl EncoderPerfState {
     /// One slot of `op_sub_cycles`; the six phases decompose `op_cycles`
     /// for the summary's "Closures (op)" sub-tree.
     pub const fn op_sub_cycles_ptr(&mut self, sub: OpSub) -> *mut u64 {
-        &raw mut self.enc.op_sub_cycles[sub as usize]
+        if self.frame_timed {
+            &raw mut self.enc.op_sub_cycles[sub as usize]
+        } else {
+            core::ptr::null_mut()
+        }
     }
 
     /// Pointer the per-draw `CycleAddTimer` for an [`OpSubDetail`] child writes into.
     ///
     /// Nested inside the `Resolve`/`Binds` parent timers in `emit_draw`.
     pub const fn op_sub_detail_ptr(&mut self, detail: OpSubDetail) -> *mut u64 {
-        &raw mut self.enc.op_sub_detail[detail as usize]
+        if self.frame_timed {
+            &raw mut self.enc.op_sub_detail[detail as usize]
+        } else {
+            core::ptr::null_mut()
+        }
     }
 
     /// Count one `get_or_create_pipeline` call — the memo hit-rate denominator.
@@ -2619,7 +2692,13 @@ impl EncoderPerfState {
         self.enc.slot_waits = 0;
         self.enc.gpu_cycles = [0; CommandBufferRole::COUNT];
         self.enc.gpu_buffers = [0; CommandBufferRole::COUNT];
-        if let Some(clocked) = &mut self.clocked {
+        if !self.frame_timed {
+            // An untimed frame read no phase clock: the window folds the
+            // timed frames alone, so this one's compile rows and submit
+            // timings go with it.
+            let _ = self.compilation.defer_frame();
+            self.submit_nanos = deferred::SubmitNanos::default();
+        } else if let Some(clocked) = &mut self.clocked {
             clocked.push(deferred::PendingSample {
                 sample,
                 compilation: self.compilation.defer_frame(),
@@ -2644,7 +2723,7 @@ impl EncoderPerfState {
         }
 
         let window_cycles = rdtsc().saturating_sub(self.perf_window.started_tsc);
-        if window_cycles < secs_to_cycles(SUMMARY_INTERVAL_SECS) {
+        if self.perf_window.frames == 0 || window_cycles < secs_to_cycles(SUMMARY_INTERVAL_SECS) {
             return;
         }
 
@@ -6359,7 +6438,7 @@ const _: () = {
     assert!(core::mem::offset_of!(FrameCounters, snapshot_sampled_draws) == 912);
     assert!(core::mem::offset_of!(FrameCounters, texture_pool_hits) == 916);
     assert!(core::mem::offset_of!(FrameCounters, texture_pool_misses) == 920);
-    assert!(core::mem::offset_of!(FrameCounters, reserved) == 924);
+    assert!(core::mem::offset_of!(FrameCounters, timed) == 924);
     assert!(size_of::<FrameTiming>() == 32);
     assert!(align_of::<FrameTiming>() == 8);
     assert!(core::mem::offset_of!(FrameTiming, present_block_cycles) == 0);

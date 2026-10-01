@@ -1032,7 +1032,7 @@ fn sample_window() -> PerfWindow {
     sampled_rebuilds[SnapshotSection::Rs as usize] = 5;
     let s = FrameSample {
         counters: FrameCounters {
-            reserved: 0,
+            timed: 1,
             reset_epoch: 0,
             reset_epoch_saturated: 0,
             inverse_view: [0; 3],
@@ -1648,4 +1648,53 @@ fn sections_above_keys_keep_the_rest_from_the_sampled_draws() {
     assert_eq!(w.draw_snapshot_keys_resid_sum(), 32_000);
     let grid = Summary::render_with_ansi(&w, &sample_caches(), 2.0, false);
     assert!(grid.contains("└─ rest"), "the rest row renders: {grid}");
+}
+
+/// About one frame in the period is timed, with gaps that never repeat on a fixed beat.
+#[test]
+fn frames_are_timed_about_one_in_the_period() {
+    let mut state = ApiPerfState::new();
+    let mut payload = FramePerfPayload::new();
+    let frames = 32_000u32;
+    let mut timed = 0u32;
+    let mut by_phase = [0u32; 16];
+    for frame in 0..frames {
+        state.drain_into_payload(&mut payload);
+        if payload.counters.timed != 0 {
+            timed += 1;
+            by_phase[(frame % 16) as usize] += 1;
+        }
+    }
+    let expected = frames / u32::from(FRAME_SAMPLE_PERIOD);
+    assert!(
+        timed.abs_diff(expected) < expected / 10,
+        "{timed} of {frames} timed"
+    );
+    for (phase, &n) in by_phase.iter().enumerate() {
+        assert!(
+            n > expected / 32,
+            "frames at position {phase} of 16 timed {n} times"
+        );
+    }
+}
+
+/// An untimed frame hands out no draw-phase target, and the encoder follows the frame's flag.
+#[test]
+fn untimed_frames_run_no_phase_timers_on_either_side() {
+    let mut storage = ApiPerfStorage::new();
+    storage.state.borrow_mut().untimed_frames = 3;
+    assert!(storage.as_ptr().is_null());
+    storage.state.borrow_mut().untimed_frames = 0;
+    assert!(!storage.as_ptr().is_null());
+
+    let mut enc = EncoderPerfState::new();
+    let mut payload = FramePerfPayload::new();
+    payload.counters.timed = 0;
+    enc.begin_frame(&payload);
+    assert!(enc.op_sub_cycles_ptr(OpSub::Binds).is_null());
+    assert!(enc.op_sub_detail_ptr(OpSubDetail::BDraw).is_null());
+    payload.counters.timed = 1;
+    enc.begin_frame(&payload);
+    assert!(!enc.op_sub_cycles_ptr(OpSub::Binds).is_null());
+    assert!(!enc.op_sub_detail_ptr(OpSubDetail::BDraw).is_null());
 }
