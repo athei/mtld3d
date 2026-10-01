@@ -136,11 +136,113 @@ fn non_zero_stride_steps_per_frequency_word() {
 }
 
 #[test]
-fn layout_stride_widens_below_the_consumed_extent() {
+fn layout_stride_preserves_the_application_step() {
     assert_eq!(layout_stride(48, 36), 48);
     assert_eq!(layout_stride(36, 36), 36);
-    // A stride below the consumed extent is unencodable in Metal: widened.
-    assert_eq!(layout_stride(16, 28), 28);
+    // Crossing attributes will use a separate binding.
+    assert_eq!(layout_stride(16, 28), 16);
     // Zero is the declaration extent for the inline (UP) path.
     assert_eq!(layout_stride(0, 28), 28);
+}
+
+fn attr(stream: u32, offset: u32, format: VertexFormat) -> VertexAttrDesc {
+    VertexAttrDesc {
+        attr_index: stream,
+        buffer_index: stream,
+        offset,
+        format,
+    }
+}
+
+#[test]
+fn crossing_attributes_keep_the_original_stride_and_do_not_clobber_another_stream() {
+    let mut attrs = [
+        attr(0, 0, VertexFormat::Float3),
+        attr(0, 28, VertexFormat::UChar4NormalizedBgra),
+        attr(1, 0, VertexFormat::Float),
+    ];
+    let mut layouts = [StreamLayout::UNUSED; 16];
+    layouts[0] = bound_stream_layout(16, 32, 1);
+    layouts[1] = bound_stream_layout(4, 4, 1);
+    let map = remap_crossing_attributes(&mut attrs, &mut layouts).unwrap();
+    assert_eq!(attrs[1].buffer_index, 2);
+    assert_eq!(attrs[1].offset, 0);
+    assert_eq!(map[2].stream, 0);
+    assert_eq!(map[2].offset, 28);
+    assert_eq!(layouts[2].stride, 16);
+    assert_eq!(attrs[2].buffer_index, 1);
+}
+
+#[test]
+fn remapped_stream_keeps_its_instance_step_and_constant_rate() {
+    for freq in [
+        D3DSTREAMSOURCE_INSTANCEDATA | 2,
+        D3DSTREAMSOURCE_INSTANCEDATA,
+    ] {
+        let mut attrs = [
+            attr(0, 0, VertexFormat::Float3),
+            attr(1, 16, VertexFormat::Float),
+        ];
+        let mut layouts = [StreamLayout::UNUSED; 16];
+        layouts[0] = bound_stream_layout(12, 12, 1);
+        let expected = bound_stream_layout(4, 20, freq);
+        layouts[1] = expected;
+        let map = remap_crossing_attributes(&mut attrs, &mut layouts).unwrap();
+        assert_eq!(attrs[1].buffer_index, 1);
+        assert_eq!(map[1].stream, 1);
+        assert_eq!(map[1].offset, 16);
+        assert_eq!(layouts[1], expected);
+    }
+}
+
+#[test]
+fn all_crossing_streams_reuse_their_slots_without_touching_uniforms() {
+    let mut attrs: [VertexAttrDesc; 16] =
+        std::array::from_fn(|i| attr(u32::try_from(i).unwrap(), 16, VertexFormat::Float));
+    let mut layouts = [bound_stream_layout(4, 20, 1); 16];
+    let map = remap_crossing_attributes(&mut attrs, &mut layouts).unwrap();
+    for (i, a) in attrs.iter().enumerate() {
+        assert_eq!(a.buffer_index, u32::try_from(i).unwrap());
+        assert_eq!(a.offset, 0);
+        assert_eq!(map[i].stream, a.buffer_index);
+        assert_eq!(map[i].offset, 16);
+        assert_eq!(layouts[i].stride, 4);
+    }
+}
+
+#[test]
+fn unsupported_width_alignment_and_slot_pressure_fail_explicitly() {
+    for (offset, format, expected) in [
+        (
+            4,
+            VertexFormat::Float2,
+            VertexFetchError::AttributeWiderThanStride,
+        ),
+        (6, VertexFormat::Float, VertexFetchError::UnalignedOffset),
+    ] {
+        let mut layouts = [StreamLayout::UNUSED; 16];
+        layouts[0] = bound_stream_layout(4, 16, 1);
+        assert!(
+            matches!(remap_crossing_attributes(&mut [attr(0, offset, format)], &mut layouts), Err(error) if error == expected)
+        );
+    }
+    let mut attrs: Vec<VertexAttrDesc> = (0..16)
+        .map(|stream| attr(stream, 0, VertexFormat::Float))
+        .collect();
+    attrs.push(attr(0, 4, VertexFormat::Float));
+    let mut layouts = [bound_stream_layout(4, 8, 1); 16];
+    assert!(matches!(
+        remap_crossing_attributes(&mut attrs, &mut layouts),
+        Err(VertexFetchError::NoFreeSlot)
+    ));
+}
+
+#[test]
+fn inline_capture_includes_the_last_crossing_attribute_and_checks_overflow() {
+    assert_eq!(inline_vertex_span(3, 16, 32), Some(64));
+    assert_eq!(inline_vertex_span(3, 16, 12), Some(48));
+    assert_eq!(inline_vertex_span(0, 16, 32), Some(0));
+    assert_eq!(inline_vertex_span(1, 0, 20), Some(20));
+    assert_eq!(inline_vertex_span(u32::MAX, 16, 32), None);
+    assert_eq!(inline_vertex_span(2, 4, u32::MAX), None);
 }

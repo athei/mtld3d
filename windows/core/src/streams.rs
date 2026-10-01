@@ -7,7 +7,10 @@
 //! validation rules and the instance-count derivation follow the D3D9
 //! runtime's observable behaviour.
 
-use mtld3d_shared::mtl::VertexStepFunction;
+use mtld3d_shared::{
+    VertexAttrDesc,
+    mtl::{VertexFormat, VertexStepFunction},
+};
 use mtld3d_types::{D3DSTREAMSOURCE_INDEXEDDATA, D3DSTREAMSOURCE_INSTANCEDATA, MAX_STREAMS};
 
 use crate::pipeline_state::StreamLayout;
@@ -142,28 +145,132 @@ pub const fn instanced_stream_read_bytes(
     }
 }
 
-/// The stride a stream's vertex buffer layout steps by.
+/// The Metal layout stride before crossing attributes receive separate bindings.
 ///
-/// The application's stride wins when it covers the extent of the declaration
-/// elements the shader consumes on that stream (it can exceed it when the
-/// vertex struct carries fields past them). A zero stride returns the extent:
-/// the inline (UP) path has no other span, and [`bound_stream_layout`] pairs it
-/// with a `Constant` step. A non-zero stride smaller than the consumed extent
-/// means the shader reads an attribute past the end of each vertex, which
-/// Metal rejects as a pipeline, so the layout is widened to the extent with a
-/// warning; the affected draw fetches wrong data either way.
+/// A zero stride feeds one constant element. A nonzero stride is preserved;
+/// [`remap_crossing_attributes`] moves offsets that do not fit into buffer bindings.
 #[must_use]
-pub fn layout_stride(app_stride: u32, extent: u32) -> u32 {
+pub const fn layout_stride(app_stride: u32, extent: u32) -> u32 {
     if app_stride == 0 {
         return extent;
     }
-    if app_stride < extent {
-        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
-            "stream stride {app_stride} below the consumed declaration extent {extent}; layout widened to the extent"
-        );
-        return extent;
-    }
     app_stride
+}
+
+/// Source stream and byte advance of a Metal vertex buffer binding.
+///
+/// Copy because the eight-byte value initializes and indexes a fixed per-draw array.
+#[derive(Clone, Copy)]
+pub struct VertexFetchBinding {
+    pub stream: u32,
+    pub offset: u32,
+}
+
+/// Why a crossing attribute cannot use a second Metal buffer binding.
+#[derive(Debug, PartialEq, Eq)]
+pub enum VertexFetchError {
+    StreamOutOfRange,
+    AttributeWiderThanStride,
+    UnalignedOffset,
+    NoFreeSlot,
+}
+
+/// Remap crossing attributes to spare bindings without changing the vertex step.
+///
+/// Reserve all slots with ordinary attributes first, then assign each crossing
+/// attribute an otherwise unused slot. Streams with only crossing attributes release
+/// their original slot. The sixteen stream slots suffice for at most sixteen attributes
+/// and cannot collide with uniforms. Bindings name original streams; layouts retain
+/// their step function and instance rate. No vertex data or CPU backing is read here.
+///
+/// # Errors
+///
+/// An attribute wider than its stride, an unaligned advanced offset, or too many
+/// attributes for the stream table. Discard outputs on error and log the unsupported draw.
+///
+/// # Panics
+///
+/// The internal stream-index conversion is asserted to fit in `u32`.
+pub fn remap_crossing_attributes(
+    attrs: &mut [VertexAttrDesc],
+    layouts: &mut [StreamLayout; MAX_STREAMS as usize],
+) -> Result<[VertexFetchBinding; MAX_STREAMS as usize], VertexFetchError> {
+    let original = *layouts;
+    let mut bindings = std::array::from_fn(|i| VertexFetchBinding {
+        stream: u32::try_from(i).expect("stream index fits u32"),
+        offset: 0,
+    });
+    let mut reserved = 0u16;
+    for attr in attrs.iter() {
+        let index =
+            usize::try_from(attr.buffer_index).map_err(|_| VertexFetchError::StreamOutOfRange)?;
+        let Some(layout) = original.get(index) else {
+            return Err(VertexFetchError::StreamOutOfRange);
+        };
+        let width = vertex_format_bytes(attr.format);
+        if width > layout.stride {
+            return Err(VertexFetchError::AttributeWiderThanStride);
+        }
+        if attr
+            .offset
+            .checked_add(width)
+            .is_some_and(|end| end <= layout.stride)
+        {
+            reserved |= 1 << index;
+        } else if attr.offset % 4 != 0 {
+            return Err(VertexFetchError::UnalignedOffset);
+        }
+    }
+    for (index, layout) in layouts.iter_mut().enumerate() {
+        if reserved & (1 << index) == 0 {
+            *layout = StreamLayout::UNUSED;
+        }
+    }
+    for attr in attrs.iter_mut() {
+        let index =
+            usize::try_from(attr.buffer_index).map_err(|_| VertexFetchError::StreamOutOfRange)?;
+        if attr
+            .offset
+            .checked_add(vertex_format_bytes(attr.format))
+            .is_some_and(|end| end <= original[index].stride)
+        {
+            continue;
+        }
+        let slot = (!reserved).trailing_zeros();
+        if slot >= MAX_STREAMS {
+            return Err(VertexFetchError::NoFreeSlot);
+        }
+        reserved |= 1 << slot;
+        layouts[slot as usize] = original[index];
+        bindings[slot as usize] = VertexFetchBinding {
+            stream: attr.buffer_index,
+            offset: attr.offset,
+        };
+        attr.buffer_index = slot;
+        attr.offset = 0;
+    }
+    Ok(bindings)
+}
+
+/// Bytes required by an inline stream, including its last crossing attribute.
+///
+/// Keep the packed span where larger; checked arithmetic rejects impossible payloads
+/// before the API borrows the user pointer.
+#[must_use]
+pub const fn inline_vertex_span(count: u32, stride: u32, extent: u32) -> Option<u32> {
+    if count == 0 {
+        return Some(0);
+    }
+    let Some(packed) = count.checked_mul(stride) else {
+        return None;
+    };
+    let Some(last) = (count - 1).checked_mul(stride) else {
+        return None;
+    };
+    let Some(end) = last.checked_add(extent) else {
+        return None;
+    };
+    Some(if end > packed { end } else { packed })
 }
 
 /// The vertex buffer layout of a stream with a vertex buffer bound.
@@ -177,7 +284,7 @@ pub fn layout_stride(app_stride: u32, extent: u32) -> u32 {
 /// stream per vertex would fetch past the buffer's end). Any other stride
 /// steps per the frequency word.
 #[must_use]
-pub fn bound_stream_layout(app_stride: u32, extent: u32, freq: u32) -> StreamLayout {
+pub const fn bound_stream_layout(app_stride: u32, extent: u32, freq: u32) -> StreamLayout {
     if app_stride == 0 {
         return StreamLayout {
             stride: extent,
@@ -190,6 +297,28 @@ pub fn bound_stream_layout(app_stride: u32, extent: u32, freq: u32) -> StreamLay
         stride: layout_stride(app_stride, extent),
         step,
         step_rate,
+    }
+}
+
+/// Storage width of the Metal vertex formats the declaration resolver emits.
+const fn vertex_format_bytes(format: VertexFormat) -> u32 {
+    match format {
+        VertexFormat::Invalid => 0,
+        VertexFormat::UChar4
+        | VertexFormat::UChar4Normalized
+        | VertexFormat::UChar4NormalizedBgra
+        | VertexFormat::Short2
+        | VertexFormat::UShort2Normalized
+        | VertexFormat::Short2Normalized
+        | VertexFormat::Half2
+        | VertexFormat::Float => 4,
+        VertexFormat::Short4
+        | VertexFormat::UShort4Normalized
+        | VertexFormat::Short4Normalized
+        | VertexFormat::Half4
+        | VertexFormat::Float2 => 8,
+        VertexFormat::Float3 => 12,
+        VertexFormat::Float4 => 16,
     }
 }
 
