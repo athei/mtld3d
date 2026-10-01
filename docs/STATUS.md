@@ -110,10 +110,14 @@ unless its entry says otherwise.
   including dynamic depth attachments, remain unavailable. Depth textures
   have no vertex sampling. Automatic mip-generation requests use the
   single-level `D3DOK_NOAUTOGEN` fallback.
-- A 1x1 render target 0 left unwritten over a larger depth surface that
-  `render.scale` reduces keeps render target 0's 1x1 area, warned once. At
-  the identity scale such a pass takes the depth surface's extent, as D3D9
-  does.
+- A colour target smaller than its depth surface under `render.scale`: a
+  whole-surface depth or stencil `Clear` reaches the whole depth surface at
+  any scale, but two cases keep the colour target's extent, each warned
+  once. One is the draws through a 1x1 render target 0 left unwritten over a
+  depth surface that `render.scale` reduces; the other is a depth or stencil
+  `Clear` by rect or by viewport that reaches past the colour target while
+  either surface is scaled. At the identity scale both reach the depth
+  surface, as D3D9 does.
 - Timestamp, timestamp frequency, timestamp disjoint and other niche query
   types: capability probes and creation report `D3DERR_NOTAVAILABLE`.
 - Fixed-function bump-environment mapping: `D3DTOP_BUMPENVMAP` and

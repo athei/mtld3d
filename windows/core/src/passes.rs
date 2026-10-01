@@ -163,10 +163,11 @@ const ENABLE_NEXT_CLEAR_COLOR_DONTCARE: bool = true;
 /// Compile-time gate for Rule C's depth arm (depth and stencil `Store=DontCare`).
 ///
 /// Applies when the next pass in the submission on the same depth texture
-/// and mip level opens with a full-attachment `Clear` of the plane: the depth
-/// store goes on a `DepthLoad::Clear`, the stencil store on a
-/// `StencilLoad::Clear`. Skipped for sampleable or ever-sampled textures and
-/// when anything between the two passes reads or writes the texture. Flip to
+/// and mip level opens with a full-attachment `Clear` of the plane, over a
+/// render area no smaller colour attachment confines: the depth store goes on
+/// a `DepthLoad::Clear`, the stencil store on a `StencilLoad::Clear`. Skipped
+/// for sampleable or ever-sampled textures and when anything between the two
+/// passes reads or writes the texture. Flip to
 /// `false` if a game surfaces that observes depth between a pass and a later
 /// clear through a path the scan does not model.
 const ENABLE_NEXT_CLEAR_DEPTH_DONTCARE: bool = true;
@@ -360,7 +361,12 @@ const fn pack_viewport_key(vp: (u32, u32, u32, u32)) -> u64 {
 /// Whether the `(x, y, w, h)` region spans a whole `(w, h)` extent from its origin.
 const fn region_covers_extent(region: (u32, u32, u32, u32), extent: (u32, u32)) -> bool {
     let (x, y, w, h) = region;
-    x == 0 && y == 0 && w >= extent.0 && h >= extent.1
+    x == 0 && y == 0 && extent_covers((w, h), extent)
+}
+
+/// Whether the `outer` extent reaches at least as far as `inner` on both axes.
+const fn extent_covers(outer: (u32, u32), inner: (u32, u32)) -> bool {
+    outer.0 >= inner.0 && outer.1 >= inner.1
 }
 
 /// How the next render-pass should load its color attachment.
@@ -1007,14 +1013,40 @@ impl Pass {
         if self.depth_texture.is_null() {
             return true;
         }
-        let (dw, dh) = self.depth_size;
-        let covers = |(w, h): (u32, u32)| w >= dw && h >= dh;
-        (self.color_texture.is_null() || covers(self.color_size))
+        (self.color_texture.is_null() || extent_covers(self.color_size, self.depth_size))
             && self
                 .extra_color
                 .iter()
                 .filter(|a| a.is_bound())
-                .all(|a| covers(a.size))
+                .all(|a| extent_covers(a.size, self.depth_size))
+    }
+    /// Whether a depth or stencil `Clear` load of this pass stops short of its depth surface.
+    ///
+    /// A load-action clear reaches only the render area, which a colour
+    /// attachment smaller than the depth surface confines.
+    fn clears_depth_past_its_area(&self) -> bool {
+        (matches!(self.depth_load, DepthLoad::Clear { .. })
+            || matches!(self.stencil_load, StencilLoad::Clear { .. }))
+            && !self.color_extent_covers_depth()
+    }
+    /// Whether this pass repeats the depth and stencil clears of `prev`, a depth-only clear pass.
+    ///
+    /// `prev` attaches no colour, records no draw and attaches the same depth
+    /// texture, level and extent, and every plane this pass loads with `Clear`
+    /// it cleared to the same value. Such a pass may load `Clear` though its
+    /// colour attachments are smaller than the depth surface: the whole
+    /// surface already holds that value.
+    fn repeats_depth_clear_of(&self, prev: &Self) -> bool {
+        let clears_depth = matches!(self.depth_load, DepthLoad::Clear { .. });
+        let clears_stencil = matches!(self.stencil_load, StencilLoad::Clear { .. });
+        prev.color_texture.is_null()
+            && prev.extra_color.iter().all(|a| !a.is_bound())
+            && !prev.commands.iter().any(Command::is_draw)
+            && prev.depth_texture == self.depth_texture
+            && prev.depth_level == self.depth_level
+            && prev.depth_size == self.depth_size
+            && (!clears_depth || prev.depth_load == self.depth_load)
+            && (!clears_stencil || prev.stencil_load == self.stencil_load)
     }
     /// Whether render target 0 changes its texture when the pass draws nothing.
     ///
@@ -1398,11 +1430,15 @@ bitflags::bitflags! {
         /// for reads as scaled. `reset_frame` seeds it for the frame's own
         /// depth surface, which `render.scale` reduces with the back buffer.
         const DEPTH_UNSCALED = 1 << 3;
-        /// Set while the open pass, or the next one a draw opens, leaves render target 0 out.
+        /// Set while the open pass, or the next one a draw opens, attaches no colour target.
         ///
-        /// Only `set_rt0_dropped` sets it, and only right before the pass it
-        /// describes is opened or continued; `end_current_pass` clears it, so
-        /// no other opener can inherit it.
+        /// Such a pass leaves render target 0 out, and with it every render
+        /// target 1..3, so the depth surface alone sets its extent. Only
+        /// `set_rt0_dropped` sets it, and only right before the pass it
+        /// describes is opened or continued: by a draw that leaves a lone 1x1
+        /// render target 0 unwritten, or by a region depth or stencil clear
+        /// that reaches past a colour target smaller than the depth surface.
+        /// `end_current_pass` clears it, so no other opener can inherit it.
         const RT0_DROPPED = 1 << 4;
     }
 }
@@ -2554,6 +2590,23 @@ impl PassState {
         !self.current_color_texture.is_null() && !self.rt0_dropped()
     }
 
+    /// Whether the open pass, or the one about to open, rasterizes the whole bound depth surface.
+    ///
+    /// The live-binding twin of `Pass::color_extent_covers_depth`. Metal
+    /// rasterizes a pass over the smallest of its attachments, so a colour
+    /// target smaller than the depth surface on either axis confines every
+    /// draw, clear quad and load-action clear of the pass to its own extent.
+    /// Render target 0 stands for the whole colour set, since a render target
+    /// 1..3 takes part in a pass only at render target 0's extent. True when
+    /// the pass attaches no colour, when it attaches no depth (a sample-count
+    /// mismatch drops it), and when the depth surface is the smaller one.
+    #[must_use]
+    pub const fn pass_color_covers_depth(&self) -> bool {
+        !self.pass_binds_color()
+            || !self.pass_binds_depth()
+            || extent_covers(self.current_color_size, self.current_depth_size)
+    }
+
     pub fn set_color_rt_has_alpha(&mut self, has_alpha: bool) {
         self.current_attachments
             .set(CurrentAttachmentFlags::COLOR_HAS_ALPHA, has_alpha);
@@ -3465,11 +3518,14 @@ impl PassState {
     ///
     /// A pass that leaves render target 0 out ([`CurrentAttachmentFlags::RT0_DROPPED`])
     /// first lands a pending colour clear in a colour-only pass of its own,
-    /// then opens with the depth attachment alone. A pass that keeps a lone
-    /// 1x1 render target 0 over a larger depth surface first lands a pending
-    /// depth or stencil clear in a depth-only pass, so the clear is not
-    /// confined to the 1x1 area the pass rasterizes. Either extra pass is the
-    /// first one pushed and takes the queued leading blits.
+    /// then opens with the depth attachment alone. A pass whose colour target
+    /// is smaller than the depth surface ([`Self::pass_color_covers_depth`])
+    /// first lands a pending depth or stencil clear in a depth-only pass at
+    /// the depth surface's extent, so the clear is not confined to the area
+    /// the pass rasterizes. The pass itself then loads the same clear values:
+    /// the whole surface holds them by then, and a load-action clear of its
+    /// own area saves loading them back. Either extra pass is the first one
+    /// pushed and takes the queued leading blits.
     #[cold]
     fn open_pass(&mut self) {
         if self.rt0_dropped() {
@@ -3484,9 +3540,12 @@ impl PassState {
             self.push_pass(&PassAttach::DepthOnly);
         } else {
             if (self.pending_depth_clear.is_some() || self.pending_stencil_clear.is_some())
-                && matches!(self.rt0_drop_candidate(), Rt0DropCandidate::Yes)
+                && !self.pass_color_covers_depth()
             {
+                let (depth, stencil) = (self.pending_depth_clear, self.pending_stencil_clear);
                 self.push_depth_clear_pass();
+                self.pending_depth_clear = depth;
+                self.pending_stencil_clear = stencil;
             }
             self.push_pass(&PassAttach::Both);
         }
@@ -3708,6 +3767,15 @@ impl PassState {
             pass.drop_color_attachment();
             pass.color_size = pass.depth_size;
         }
+        debug_assert!(
+            !pass.clears_depth_past_its_area()
+                || self
+                    .passes
+                    .last()
+                    .is_some_and(|prev| pass.repeats_depth_clear_of(prev)),
+            "a pass smaller than its depth surface loads a depth or stencil Clear only after the \
+             depth-only pass that cleared the whole surface to it"
+        );
         pass.commands.push(Command::set_viewport(
             vpx,
             vpy,
@@ -3971,14 +4039,17 @@ impl PassState {
     /// are no pending clears.
     ///
     /// A depth or stencil clear the current attachments cannot carry (render
-    /// target 0 disagrees with the depth surface on samples) is materialised
-    /// as a depth-only pass on the bound depth surface. Nothing is left
-    /// pending afterwards, so the depth setters, which flush before they
-    /// rebind, never let a clear reach a different surface.
+    /// target 0 disagrees with the depth surface on samples), or would carry
+    /// only over part of the surface (a colour target smaller than it), is
+    /// materialised as a depth-only pass on the bound depth surface. Nothing
+    /// is left pending afterwards, so the depth setters, which flush before
+    /// they rebind, never let a clear reach a different surface.
     pub fn flush_pending_clears(&mut self) {
         let depth_pending =
             self.pending_depth_clear.is_some() || self.pending_stencil_clear.is_some();
-        if self.pending_color_clear.is_some() || (depth_pending && self.pass_binds_depth()) {
+        if self.pending_color_clear.is_some()
+            || (depth_pending && self.pass_binds_depth() && self.pass_color_covers_depth())
+        {
             self.ensure_pass_open();
             self.end_current_pass("flush_pending_clears");
         }
@@ -4423,6 +4494,15 @@ impl PassState {
     /// format, which the quad pipeline key needs; `None` when no
     /// depth-stencil is bound, or the pass will drop the one that is
     /// (nothing to clear).
+    ///
+    /// Every rect lies inside the viewport. A viewport that reaches past a
+    /// colour target smaller than the depth surface gets a pass without
+    /// colour ([`CurrentAttachmentFlags::RT0_DROPPED`]), so the depth
+    /// surface, not the colour target, bounds what the quads reach. The next
+    /// draw that needs colour ends that pass. Under `render.scale` the rects
+    /// arrive in the colour target's space, which a pass without colour does
+    /// not share, so a scaled colour target or depth surface keeps the pass
+    /// and its clipping, warned once.
     pub fn begin_region_depth_stencil_clear(&mut self) -> Option<(bool, PixelFormat)> {
         if !self.pass_binds_depth() {
             return None;
@@ -4430,10 +4510,16 @@ impl PassState {
         if self.current_pass_has_counting_visibility() {
             self.end_current_pass("region_depth_clear_vis");
         }
-        // Over a lone 1x1 render target 0 the quads go to a pass without it,
-        // so the depth surface, not the 1x1 target, bounds what they reach.
-        if matches!(self.rt0_drop_candidate(), Rt0DropCandidate::Yes) {
-            self.set_rt0_dropped(true);
+        if !self.pass_color_covers_depth() && !self.viewport_inside_color_attachment() {
+            if self.current_color_scale.is_identity() && self.current_depth_unscaled() {
+                self.set_rt0_dropped(true);
+            } else {
+                mtld3d_shared::log_once_warn!(
+                    target: crate::LOG_TARGET,
+                    "region depth or stencil clear past a colour target smaller than the depth \
+                     surface under render.scale: clipped to the colour target's extent"
+                );
+            }
         }
         let was_closed = self.current_pass_closed();
         let had_pending_depth = self.pending_depth_clear.is_some();
@@ -4460,21 +4546,42 @@ impl PassState {
         Some((self.pass_binds_color(), self.color_attachment_format()))
     }
 
-    /// End an open pass that attaches a lone 1x1 render target 0 over a larger depth surface.
+    /// Whether the viewport covers no pixel, as one that rounds to nothing at render resolution.
+    ///
+    /// D3D9 clears nothing under it. At the identity scale a zero viewport
+    /// means unset and reads as the whole target, so this only answers yes
+    /// under `render.scale`.
+    fn viewport_has_no_area(&self) -> bool {
+        let (_, _, w, h) = self.effective_viewport();
+        w == 0 || h == 0
+    }
+
+    /// Whether the viewport lies inside the bound colour target.
+    ///
+    /// Both are in the colour target's own space, as
+    /// [`Self::effective_viewport`] converts it.
+    fn viewport_inside_color_attachment(&self) -> bool {
+        let (x, y, w, h) = self.effective_viewport();
+        extent_covers(
+            self.current_color_size,
+            (x.saturating_add(w), y.saturating_add(h)),
+        )
+    }
+
+    /// End an open pass whose colour target is smaller than the depth surface.
     ///
     /// A whole-surface depth or stencil clear must reach the whole depth
-    /// surface, but a quad painted into, or a load action folded into, a pass
-    /// that attaches the 1x1 target is confined to its 1x1 area. With the pass
-    /// ended the clear goes pending, and the next pass takes it: a pass that
-    /// leaves render target 0 out as its load action, any other through the
-    /// depth-only pass `open_pass` lands first. A pass that already leaves
-    /// render target 0 out stays open and takes the clear itself.
-    fn end_rt0_pass_for_depth_clear(&mut self) {
-        if !self.current_pass_closed
-            && !self.rt0_dropped()
-            && matches!(self.rt0_drop_candidate(), Rt0DropCandidate::Yes)
-        {
-            self.end_current_pass("rt0_depth_clear");
+    /// surface, but a quad painted into, or a load action folded into, such a
+    /// pass is confined to the colour target's area. With the pass ended the
+    /// clear goes pending, and the next pass takes it: a pass without colour
+    /// as its load action, any other through the depth-only pass `open_pass`
+    /// lands first. Rule E can still move a colour clear of the ended pass
+    /// into the pass after the depth-only one. A pass without colour, or one
+    /// whose colour target covers the depth surface, stays open and takes the
+    /// clear itself.
+    fn end_small_color_pass_for_depth_clear(&mut self) {
+        if !self.current_pass_closed && !self.pass_color_covers_depth() {
+            self.end_current_pass("small_color_depth_clear");
         }
     }
 
@@ -4482,13 +4589,19 @@ impl PassState {
     ///
     /// Mirrors `clear_color` semantics for the depth attachment's load
     /// action, under the same contract: the caller has decided the clear
-    /// covers the whole depth attachment. Routes through one of three paths,
-    /// checked in order:
+    /// covers the whole depth attachment. A zero-area viewport is an explicit
+    /// `NoOp` before anything else: D3D9 clears nothing, so no pass ends and
+    /// no quad or load action is recorded. An open pass whose colour target
+    /// is smaller than the depth surface ends next, since it reaches only that
+    /// target's area. Then routes through one of three paths, checked in
+    /// order:
     ///
     /// 1. Active pass with draws → emit a clear-quad (or fall back to
     ///    pass-break under visibility counting).
     /// 2. Open pass with no draws yet → amend its load action to Clear.
-    /// 3. No open pass → stash as `pending_depth_clear`.
+    /// 3. No open pass → stash as `pending_depth_clear`, which the next pass
+    ///    takes as its load action, through a depth-only pass of its own when
+    ///    that pass's colour target is smaller than the depth surface.
     pub fn clear_depth(&mut self, value: u32) -> DepthClearOutcome {
         let depth_texture = self.current_depth_texture;
         if !self.pass_binds_depth() {
@@ -4497,7 +4610,10 @@ impl PassState {
             // want a depth-declaring pipeline the pass has no attachment for.
             return DepthClearOutcome::NoOp;
         }
-        self.end_rt0_pass_for_depth_clear();
+        if self.viewport_has_no_area() {
+            return DepthClearOutcome::NoOp;
+        }
+        self.end_small_color_pass_for_depth_clear();
         if self.current_pass_has_work()
             && let Some(outcome) = self.clear_depth_in_active_pass(value, depth_texture)
         {
@@ -4517,9 +4633,9 @@ impl PassState {
     ///
     /// Returns `Some(EmitQuad)` on the normal path or `None` if a
     /// visibility-counting query forced the legacy pass-break fallback
-    /// (caller falls through to the amend / stash chain). A zero-area
-    /// viewport is an explicit `NoOp`: D3D9 clears nothing, and a zero-size
-    /// quad would only cost the state switches around it.
+    /// (caller falls through to the amend / stash chain). The caller has
+    /// already answered a zero-area viewport with `NoOp`, so the quad always
+    /// covers pixels.
     ///
     /// Falling through to `end_current_pass` here would open a new
     /// encoder with `loadAction = Clear`, which on Metal clears the
@@ -4547,9 +4663,6 @@ impl PassState {
             return None;
         }
         let vp = self.effective_viewport();
-        if vp.2 == 0 || vp.3 == 0 {
-            return Some(DepthClearOutcome::NoOp);
-        }
         mtld3d_shared::log_once_trace_by!(
             target: DEPTH_TRACE_TARGET,
             key: depth_texture.raw().rotate_left(13) ^ pack_viewport_key(vp),
@@ -4566,11 +4679,11 @@ impl PassState {
 
     /// Apply a stencil clear.
     ///
-    /// Mirrors `clear_depth`, under the same whole-attachment contract: fold
-    /// into the pass's `loadAction` unless the pass already holds draws the
-    /// clear must land after, and paint a quad inside the pass then. Depth
-    /// keeps its own load action throughout, so a stencil-only clear never
-    /// disturbs the depth plane the two share.
+    /// Mirrors `clear_depth`, under the same whole-attachment contract and the
+    /// same zero-area `NoOp`: fold into the pass's `loadAction` unless the
+    /// pass already holds draws the clear must land after, and paint a quad
+    /// inside the pass then. Depth keeps its own load action throughout, so a
+    /// stencil-only clear never disturbs the depth plane the two share.
     pub fn clear_stencil(&mut self, value: u32) -> StencilClearOutcome {
         if !self.pass_binds_depth() {
             // Nothing is attached to clear. Folding would carry the clear
@@ -4578,7 +4691,10 @@ impl PassState {
             // want a depth-declaring pipeline the pass has no attachment for.
             return StencilClearOutcome::NoOp;
         }
-        self.end_rt0_pass_for_depth_clear();
+        if self.viewport_has_no_area() {
+            return StencilClearOutcome::NoOp;
+        }
+        self.end_small_color_pass_for_depth_clear();
         if self.current_pass_has_work()
             && let Some(outcome) = self.clear_stencil_in_active_pass(value)
         {
@@ -4599,18 +4715,15 @@ impl PassState {
     /// Returns `None` only when a visibility-counting query is armed, since
     /// the quad's own fragments would inflate the occlusion counter; that path
     /// ends the pass first, so the folding chain sees a closed pass and cannot
-    /// amend one that already holds draws. A zero-area viewport is an explicit
-    /// `NoOp`: D3D9 clears nothing, and falling through would fold a
-    /// full-attachment clear into this pass, ahead of its recorded draws.
+    /// amend one that already holds draws. The caller has already answered a
+    /// zero-area viewport with `NoOp`, which falling through here would turn
+    /// into a full-attachment clear folded ahead of the pass's recorded draws.
     fn clear_stencil_in_active_pass(&mut self, value: u32) -> Option<StencilClearOutcome> {
         if self.current_pass_has_counting_visibility() {
             self.end_current_pass("clear_stencil_vis_fallback");
             return None;
         }
         let vp = self.effective_viewport();
-        if vp.2 == 0 || vp.3 == 0 {
-            return Some(StencilClearOutcome::NoOp);
-        }
         Some(StencilClearOutcome::EmitQuad {
             value,
             viewport: vp,
@@ -4628,6 +4741,10 @@ impl PassState {
             return None;
         }
         let pass = self.passes.last_mut()?;
+        debug_assert!(
+            pass.color_extent_covers_depth(),
+            "a stencil clear amends only a pass that rasterizes the whole depth surface"
+        );
         pass.stencil_load = StencilLoad::Clear { value };
         self.pending_stencil_clear = None;
         Some(StencilClearOutcome::Folded)
@@ -4662,6 +4779,10 @@ impl PassState {
             return None;
         }
         let pass = self.passes.last_mut()?;
+        debug_assert!(
+            pass.color_extent_covers_depth(),
+            "a depth clear amends only a pass that rasterizes the whole depth surface"
+        );
         pass.depth_load = DepthLoad::Clear { value };
         self.pending_depth_clear = None;
         mtld3d_shared::log_once_trace_by!(
@@ -5884,7 +6005,10 @@ impl PassState {
     /// `StencilLoad::Clear` on a texture that has a stencil plane; the two
     /// planes are decided apart. Such a load action is only reached by a
     /// clear that covers the whole attachment, so the next pass overwrites
-    /// every texel of the plane before anything can read it.
+    /// every texel of the plane before anything can read it, provided its
+    /// render area spans the depth surface: a pass whose colour attachments
+    /// are smaller clears only their area, and the store before it keeps the
+    /// rest.
     ///
     /// Skipped for a sampleable or ever-sampled texture (a sampler, a blit
     /// source or a readback reads device memory), and when anything that
@@ -5908,6 +6032,7 @@ impl PassState {
                     .contains(PassDepthFlags::SAMPLEABLE)
                 && !self.seen_sampled_textures.contains(&texture)
                 && !self.depth_touched_between(i, next, texture)
+                && self.passes[next].color_extent_covers_depth()
             {
                 let depth_cleared = matches!(self.passes[next].depth_load, DepthLoad::Clear { .. });
                 let stencil_cleared =
