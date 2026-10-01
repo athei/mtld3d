@@ -15,7 +15,7 @@ use mtld3d_types::SAMPLER_STATE_COUNT;
 use crate::{
     buffer_rename::BufferMapMode,
     dirty_rect::DirtyRect,
-    draw_data::{CurrentSnapshotPtr, DrawOp, ScratchSlice},
+    draw_data::{DrawOp, ScratchSlice},
     encoder_reply::{ReplyBool, ReplyU64},
     ids::{BufferId, ProgramId, TextureId},
     page_box::{PageBox, PageBoxRead},
@@ -744,8 +744,6 @@ pub enum Op {
         rows: u16,
         data: ScratchSlice,
     },
-    /// Install decoded native state before dependent draws.
-    SetSnapshot(CurrentSnapshotPtr),
     /// Issue a draw using the current snapshot.
     Draw(DrawOp),
     SetViewport(

@@ -104,7 +104,6 @@ windows/core/src/dirty_range.rs DirtyRange Clone,Copy,Debug,PartialEq,Eq,Default
 windows/core/src/dirty_rect.rs DirtyRect Clone,Copy,Debug,PartialEq,Eq
 windows/core/src/display_mode.rs ModeRequest Clone,Copy,Debug,PartialEq,Eq
 windows/core/src/draw_data.rs AttrSnapshot Clone,Copy
-windows/core/src/draw_data.rs CurrentSnapshotPtr Clone,Copy
 windows/core/src/draw_data.rs DepthScissorFlags Clone,Copy,Debug,Default,PartialEq,Eq
 windows/core/src/draw_data.rs DepthStencilFlags Clone,Copy,Debug,Default,PartialEq,Eq
 windows/core/src/draw_data.rs RenderStatePtr Clone,Copy

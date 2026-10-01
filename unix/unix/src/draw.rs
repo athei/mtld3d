@@ -71,7 +71,7 @@ const DECAL_TRACE_TARGET: &str = "mtld3d::d3d9::decal";
 const CASTER_TRACE_TARGET: &str = "mtld3d::d3d9::caster";
 
 pub use mtld3d_core::draw_data::{
-    CurrentSnapshot, CurrentSnapshotPtr, DepthStencilFlags, NULL_STREAM_ZEROS, PsKey, PsSourceView,
+    CurrentSnapshot, DepthStencilFlags, NULL_STREAM_ZEROS, PsKey, PsSourceView,
     RenderStateSnapshot, ScratchSlice, ShaderRef, StageBindingsPtr, VsSourceView,
     arena_alloc_bytes, null_texture_kind,
 };
@@ -83,12 +83,6 @@ fn close_dump_group(enc: &mut FrameEncoder, dump_draw: Option<u32>) {
     }
 }
 
-/// Encoder-thread draw dispatch.
-///
-/// Pulls the cumulative state from `enc.current_snapshot` (updated by
-/// the draw op before dispatch) and combines it with `draw`'s
-/// per-call varying parameters (primitive type + vertex/index source).
-/// UP spans borrow the API frame capture until native submit replay completes.
 /// The depth and stencil planes a draw tests or writes, as a pending build's skip needs them.
 fn planes_used(
     render_state: &RenderStateSnapshot,
@@ -306,6 +300,10 @@ fn resolve_pipeline_slow(
 
 /// Execute a draw directly from its retained command record.
 ///
+/// Combines the cumulative state in `snap`, which the packet's snapshot
+/// records built up before this draw, with `draw`'s per-call parameters
+/// (primitive type and vertex and index source). UP spans borrow the API
+/// frame capture until native submit replay completes.
 /// [`DrawView::new`] has already rejected malformed draw fields, so nothing
 /// here fails. The draw runs at a fixed stack page offset (see
 /// [`crate::stack_page`]), so its speed does not depend on the frames above it.
@@ -313,14 +311,20 @@ fn resolve_pipeline_slow(
 /// # Safety
 /// The view must belong to the authentic admitted packet. Its captured bytes and
 /// backing allocations remain immutable and retained until submit completion. The
-/// encoder snapshot cache must name initialized snapshots retained by that packet.
-pub unsafe fn emit_draw(enc: &mut FrameEncoder, draw: &DrawView<'_>) {
+/// tokens in `snap` must have been decoded from records retained by that packet.
+pub unsafe fn emit_draw(enc: &mut FrameEncoder, snap: &CurrentSnapshot, draw: &DrawView<'_>) {
     crate::stack_page::run_pinned(|| {
         #[cfg(perf_tracking)]
         if !crate::stack_page::at_pin() {
             enc.bump_draw_unpinned();
         }
-        emit_draw_view(enc, draw.metal_primitive(), draw.vertices(), draw.indices());
+        emit_draw_view(
+            enc,
+            snap,
+            draw.metal_primitive(),
+            draw.vertices(),
+            draw.indices(),
+        );
     });
 }
 
@@ -330,6 +334,7 @@ pub unsafe fn emit_draw(enc: &mut FrameEncoder, draw: &DrawView<'_>) {
 #[inline(never)]
 fn emit_draw_view(
     enc: &mut FrameEncoder,
+    snap: &CurrentSnapshot,
     metal_prim: PrimitiveType,
     vertex_source: &VertexView<'_>,
     index_source: &IndexView<'_>,
@@ -345,21 +350,6 @@ fn emit_draw_view(
     // next begins, and a draw-drop `return` folds the open phase in on the way
     // out. All no-ops unless perf tracking is on.
     let t_resolve = CycleAddTimer::start(enc.op_sub_cycles_ptr(OpSub::Resolve));
-    // Lifetime-launder the scratch-resident snapshot ptr off `enc` so
-    // the rest of emit_draw can freely reborrow `&mut enc`. A snapshot
-    // command in this frame decoded the pointee into `enc.scratch` and
-    // installed the pointer before this draw.
-    let snap_ptr = enc
-        .current_snapshot_ptr()
-        .expect("emit_draw: snapshot not supplied")
-        .as_ptr();
-    // SAFETY: snap_ptr is non-null (NonNull invariant) and points to a live
-    // CurrentSnapshot in `enc.scratch`. That arena is only appended to until
-    // `finalize_submit` moves it into the frame's payload, which is cleared only
-    // after submission returns; a failed replay stops every later message before
-    // `begin_frame` could clear it. Appending never moves a chunk or writes bytes
-    // already handed out, so the pointee outlives every `enc` reborrow below.
-    let snap: &CurrentSnapshot = unsafe { &*snap_ptr };
     // Every Option must be Some by the time a Draw runs — the API
     // thread populates every field before queuing the changed snapshot.
     let render_state: &RenderStateSnapshot = snap

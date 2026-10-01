@@ -446,41 +446,6 @@ impl AttrSnapshot {
     }
 }
 
-/// Cached pointer to a scratch-allocated `CurrentSnapshot`.
-///
-/// Wrapped in a newtype so it can be `Copy` + `Send` while making the
-/// unsafe deref site explicit at the read.
-#[derive(Clone, Copy)]
-pub struct CurrentSnapshotPtr(NonNull<CurrentSnapshot>);
-
-// SAFETY: see `AttrSnapshot`. The CurrentSnapshot struct lives in the
-// current frame's ScratchArena owned by the encoder thread for the
-// duration of `run_frame`.
-unsafe impl Send for CurrentSnapshotPtr {}
-
-impl CurrentSnapshotPtr {
-    /// Bind a snapshot to its frame-retained arena.
-    ///
-    /// # Safety
-    ///
-    /// `ptr` addresses an initialized `CurrentSnapshot`. Keep it and all referenced
-    /// storage immutable and allocated until every copy of this token is forgotten.
-    #[must_use]
-    pub const unsafe fn new(ptr: NonNull<CurrentSnapshot>) -> Self {
-        Self(ptr)
-    }
-
-    /// Raw `*mut CurrentSnapshot` for lifetime-laundered reads inside `emit_draw`.
-    ///
-    /// Direct `as_ref` is intentionally not provided — `as_ref` returns
-    /// `&CurrentSnapshot` whose lifetime is tied to `self`, which in turn
-    /// lives on `FrameEncoder` and prevents the usual `&mut enc` reborrows.
-    #[must_use]
-    pub const fn as_ptr(&self) -> *mut CurrentSnapshot {
-        self.0.as_ptr()
-    }
-}
-
 /// Cached pointer to an immutable canonical `RenderStateSnapshot`.
 ///
 /// The native scratch or retained PE command arena owns the storage.
@@ -681,17 +646,14 @@ bitflags::bitflags! {
 
 /// Encoder-thread state representing what's currently "bound" for `emit_draw`.
 ///
-/// Lives in the per-frame `ScratchArena`; `FrameEncoder` holds an
-/// `Option<CurrentSnapshotPtr>` that a draw carrying changed state
-/// updates. `emit_draw` borrows `&CurrentSnapshot` once via lifetime
-/// laundering and reads fields directly — no struct copies on the encoder
-/// side.
+/// The packet's `DrawReader` owns it and applies each changed snapshot
+/// record to it in place; `emit_draw` borrows it from the reader and reads
+/// fields directly, so the encoder never copies the struct.
 ///
 /// Intentionally NOT `Copy` / `Clone` — accidental whole-struct copies
 /// would be a per-draw pessimisation. The large FF keys (`FfVsKey` /
 /// `FfPsKey`) live behind lease-bound `VsSourcePtr` / `PsSourcePtr` tokens
-/// rather than inline, so the wrapper that gets memcpy'd per draw is
-/// ~160 B (pointers + scalars) and the FF source is only bumped when
+/// rather than inline, and the FF source is only re-sent when
 /// `VS_SOURCE` / `PS_SOURCE` is dirty.
 pub struct CurrentSnapshot {
     pub render_state: Option<RenderStatePtr>,

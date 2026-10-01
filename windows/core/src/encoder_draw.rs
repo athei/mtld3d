@@ -1,8 +1,9 @@
 //! Dirty draw state captured directly into the frame wire buffer.
 //!
-//! Canonical state and shader-source leaves borrow the retained command arena.
-//! Immutable aggregate roots use native scratch; both owners remain live
-//! through submit replay. Borrowed addresses never transfer allocation ownership.
+//! Canonical state and shader-source leaves borrow the retained command arena,
+//! which stays live through submit replay. The decoded root lives in the
+//! reader, and a draw borrows it. Borrowed addresses never transfer allocation
+//! ownership.
 
 use std::ptr::NonNull;
 
@@ -10,12 +11,11 @@ use mtld3d_shared::{VertexAttrDesc, encoder_wire::WireError};
 
 use crate::{
     draw_data::{
-        AttrSnapshot, CurrentSnapshot, CurrentSnapshotPtr, DeclarationHeader, DepthStencilFlags,
-        DrawOp, PsSource, PsSourceView, RenderStatePtr, RenderStateSnapshot, ScratchSlice,
-        StageBinding, StageBindingsPtr, VsSource, VsSourceView,
+        AttrSnapshot, CurrentSnapshot, DeclarationHeader, DepthStencilFlags, DrawOp, PsSource,
+        PsSourceView, RenderStatePtr, RenderStateSnapshot, ScratchSlice, StageBinding,
+        StageBindingsPtr, VsSource, VsSourceView,
     },
     dxso::VariantKey,
-    scratch::ScratchArena,
 };
 
 mod shader_record;
@@ -443,7 +443,8 @@ const _: () = {
 
 /// Native decoder for one retained frame lease.
 ///
-/// Decoded tokens borrow native scratch and leased PE byte ranges through replay.
+/// Decoded tokens borrow leased PE byte ranges through replay. The reader owns
+/// the decoded root, and a draw borrows it until the next decode.
 pub struct DrawReader {
     current: CurrentSnapshot,
     poisoned: bool,
@@ -470,7 +471,16 @@ impl DrawReader {
         self.poisoned = false;
     }
 
-    /// Apply changed canonical records and retain an immutable native snapshot root.
+    /// The snapshot every changed record decoded so far adds up to.
+    ///
+    /// A draw reads it in place; the borrow ends before the next decode can
+    /// change it.
+    #[must_use]
+    pub const fn snapshot(&self) -> &CurrentSnapshot {
+        &self.current
+    }
+
+    /// Apply changed canonical records to the snapshot [`Self::snapshot`] returns.
     ///
     /// # Safety
     /// The paired typed producer must construct every canonical record with valid fields.
@@ -479,33 +489,20 @@ impl DrawReader {
     ///
     /// # Errors
     /// Returns a truncated, malformed, or previously poisoned capture error.
-    pub unsafe fn decode_snapshot(
-        &mut self,
-        payload: &[u8],
-        scratch: &mut ScratchArena,
-    ) -> Result<CurrentSnapshotPtr, WireError> {
+    pub unsafe fn decode_snapshot(&mut self, payload: &[u8]) -> Result<(), WireError> {
         if self.poisoned {
             return Err(WireError::InvalidValue);
         }
         let mut reader = SnapshotReader { remaining: payload };
-        let result = self
-            .read_snapshot_delta(&mut reader, scratch)
-            .and_then(|snapshot| {
-                if reader.remaining.is_empty() {
-                    Ok(snapshot)
-                } else {
-                    Err(WireError::InvalidValue)
-                }
-            });
+        let result = match self.read_snapshot_delta(&mut reader) {
+            Ok(()) if !reader.remaining.is_empty() => Err(WireError::InvalidValue),
+            result => result,
+        };
         self.poisoned = result.is_err();
         result
     }
 
-    fn read_snapshot_delta(
-        &mut self,
-        reader: &mut SnapshotReader<'_>,
-        scratch: &mut ScratchArena,
-    ) -> Result<CurrentSnapshotPtr, WireError> {
+    fn read_snapshot_delta(&mut self, reader: &mut SnapshotReader<'_>) -> Result<(), WireError> {
         let mask = read_snapshot_mask(reader)?;
         if mask & 1 != 0 {
             let ptr = read_borrowed_render_state(reader)?;
@@ -547,12 +544,7 @@ impl DrawReader {
         if mask & (1 << 16) != 0 {
             self.current.depth_stencil = read_depth_flags(reader)?;
         }
-        // SAFETY: CurrentSnapshot contains only trivial-Drop tokens and scalar values;
-        // native scratch and every borrowed PE range remain retained through replay.
-        let ptr = unsafe { scratch.alloc_from(&self.current) };
-        let ptr = NonNull::new(ptr).ok_or(WireError::InvalidValue)?;
-        // SAFETY: the initialized snapshot and its referents remain live through replay.
-        Ok(unsafe { CurrentSnapshotPtr::new(ptr) })
+        Ok(())
     }
 }
 

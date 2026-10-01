@@ -89,7 +89,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::{
     LOG_TARGET,
-    draw::{self, CurrentSnapshotPtr, PsKey, ScratchSlice, ShaderRef},
+    draw::{self, PsKey, ScratchSlice, ShaderRef},
 };
 use crate::metal::{
     handle::IntoRetained,
@@ -1127,17 +1127,6 @@ pub struct FrameEncoder {
     /// the one before. Advanced at `begin_frame` unless the previous submit
     /// was a mid-frame flush, whose frame goes on.
     cleared_targets: ClearHistory,
-    /// Pointer to the most recently shipped `CurrentSnapshot`.
-    ///
-    /// Lives in the per-frame `ScratchArena`. Set by
-    /// `Op::SetSnapshot` in the dispatch loop; read by `emit_draw`
-    /// via lifetime-laundered deref. Reset to `None` at the head of
-    /// `run_frame` so stale pointers from a prior frame's arena can't
-    /// dangle into the new frame's op stream — the API thread re-emits a
-    /// fresh snapshot with the first draw of every new frame
-    /// (`stamp_and_swap` sets `SnapshotDirty::all()`).
-    current_snapshot: Option<CurrentSnapshotPtr>,
-
     /// Encoder-thread mirror of the programmable VS constant array.
     ///
     /// Kept in sync with `ShaderBindings::vs_constants` (API thread) via
@@ -1647,7 +1636,6 @@ impl FrameEncoder {
             deferred: Box::new(compile::DeferredDraws::new()),
             compile_tickets: TicketSource::new(),
             cleared_targets: ClearHistory::new(),
-            current_snapshot: None,
             vs_constants_mirror: Box::new([[0.0; 4]; CONSTANT_ROWS]),
             ps_constants_mirror: Box::new([[0.0; 4]; CONSTANT_ROWS]),
             vs_constants_populated_rows: 0,
@@ -1664,15 +1652,6 @@ impl FrameEncoder {
     #[must_use]
     pub fn config(&self) -> &Mtld3dConfig {
         &self.config
-    }
-
-    /// Pointer accessor for the encoder's current snapshot.
-    ///
-    /// Returns the raw scratch pointer so callers can launder the
-    /// lifetime (the pointee lives in the per-frame arena, distinct
-    /// from `self`).
-    pub const fn current_snapshot_ptr(&self) -> Option<CurrentSnapshotPtr> {
-        self.current_snapshot
     }
 
     /// Create textures directly on the encoder's retained Metal device.
@@ -9020,7 +8999,6 @@ fn run_frame(
     mode: SubmitMode,
 ) -> Result<(), mtld3d_shared::encoder_wire::WireError> {
     mtld3d_shared::crumb!("phase:BfEnter");
-    enc.current_snapshot = None;
     enc.begin_frame(packet.frame());
     enc.drain_returned_payloads();
     mtld3d_shared::crumb!("phase:OpLoop");
@@ -9086,15 +9064,8 @@ fn run_frame(
                         }
                         EncoderOpcode::SetSnapshot => {
                             // SAFETY: this frame retains every canonical snapshot leaf through
-                            // submit. The encoder's scratch is only appended until it moves into
-                            // this frame's payload, which is cleared only after submission has
-                            // returned, and never after a failed replay.
-                            let snapshot = unsafe {
-                                state
-                                    .draw_reader()
-                                    .decode_snapshot(command.payload(), &mut enc.scratch)?
-                            };
-                            enc.current_snapshot = Some(snapshot);
+                            // submit, and never releases it after a failed replay.
+                            unsafe { state.draw_reader().decode_snapshot(command.payload())? };
                         }
                         EncoderOpcode::Draw => {
                             let draw = mtld3d_core::encoder_draw::draw_record::DrawView::new(
@@ -9102,7 +9073,7 @@ fn run_frame(
                             )?;
                             // SAFETY: this packet retains authentic capture and backing addresses
                             // through the final submit CPU reader, including failure quarantine.
-                            unsafe { draw::emit_draw(enc, &draw) };
+                            unsafe { draw::emit_draw(enc, state.draw_reader().snapshot(), &draw) };
                         }
                         EncoderOpcode::AdoptProgram => {
                             let record = mtld3d_core::encoder_records::borrow::<

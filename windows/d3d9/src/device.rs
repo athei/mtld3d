@@ -853,7 +853,7 @@ pub const fn rs_dirty_mask(state: u32) -> SnapshotDirty {
 bitflags::bitflags! {
     /// Per-draw snapshot dirty mask.
     ///
-    /// One bit per cached piece in `FrameEncoder::current_snapshot`. See
+    /// One bit per cached piece of the native `DrawReader` snapshot. See
     /// `SnapshotCache` doc on `DeviceInner::snapshot_dirty` for lifecycle.
     /// Each bit is its [`SnapshotSection`]'s, so the perf summary's
     /// per-section rebuild counters read the mask directly.
