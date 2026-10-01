@@ -2211,21 +2211,33 @@ fn translate_instruction(
             let coord = register_read_expr(dst.reg, ctx)?;
             let bump = &srcs[0];
             let (m00, m01, m10, m11) = bump_matrix_exprs(n);
-            // Base texcoord (`tN`). When stage N has D3DTTFF_PROJECTED the FF VS
-            // stashed the projective divisor in `.w`, so divide `.xy` by it before
-            // perturbing (a `.w` of 0 reads the origin), matching the implicit
-            // divide the plain `tex`/`texld` path applies.
-            let (bx, by) = if ctx.is_tt_projected(n) {
+            // Base texcoord (`tN`). The displacement moves `.xy` alone, and `.z`
+            // and `.w` stay the stage's own, so a cube or volume destination
+            // samples at its own third coordinate. When stage N has
+            // D3DTTFF_PROJECTED the FF VS stashed the projective divisor in `.w`,
+            // so divide `.xyz` by it before perturbing (a `.w` of 0 reads the
+            // origin), matching the implicit divide the plain `tex`/`texld` path
+            // applies; the divided coordinate's `.w` is 1.
+            let (bx, by, bz, bw) = if ctx.is_tt_projected(n) {
+                let divided =
+                    |c: char| format!("((({coord}).w != 0.0) ? ({coord}).{c} / ({coord}).w : 0.0)");
                 (
-                    format!("((({coord}).w != 0.0) ? ({coord}).x / ({coord}).w : 0.0)"),
-                    format!("((({coord}).w != 0.0) ? ({coord}).y / ({coord}).w : 0.0)"),
+                    divided('x'),
+                    divided('y'),
+                    divided('z'),
+                    String::from("1.0"),
                 )
             } else {
-                (format!("({coord}).x"), format!("({coord}).y"))
+                (
+                    format!("({coord}).x"),
+                    format!("({coord}).y"),
+                    format!("({coord}).z"),
+                    format!("({coord}).w"),
+                )
             };
             let u = format!("{bx} + {m00} * ({bump}).x + {m10} * ({bump}).y");
             let v = format!("{by} + {m01} * ({bump}).x + {m11} * ({bump}).y");
-            let coord4 = format!("float4({u}, {v}, 0.0, 0.0)");
+            let coord4 = format!("float4({u}, {v}, {bz}, {bw})");
             let sampled = sample_or_compare(ctx, n, &coord4, None, None);
             store_dst(out, *dst, &sampled, ctx, None);
             if matches!(inst.opcode, Opcode::TexBemL) {

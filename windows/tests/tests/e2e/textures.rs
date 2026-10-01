@@ -12,13 +12,14 @@ use mtld3d_types::{
     D3DFMT_DXT1, D3DFMT_DXT2, D3DFMT_DXT3, D3DFMT_DXT4, D3DFMT_DXT5, D3DFMT_INTZ, D3DFMT_L8,
     D3DFMT_NV12, D3DFMT_Q8W8V8U8, D3DFMT_R5G6B5, D3DFMT_R8G8B8, D3DFMT_UYVY, D3DFMT_V8U8,
     D3DFMT_V16U16, D3DFMT_X1R5G5B5, D3DFMT_X8B8G8R8, D3DFMT_X8R8G8B8, D3DFMT_YUY2, D3DFMT_YV12,
-    D3DFVF_DIFFUSE, D3DFVF_TEX1, D3DFVF_TEXTUREFORMAT3, D3DFVF_XYZ, D3DLOCK_DISCARD,
-    D3DLOCK_NO_DIRTY_UPDATE, D3DLOCK_READONLY, D3DPOOL_DEFAULT, D3DPOOL_MANAGED, D3DPOOL_SCRATCH,
-    D3DPOOL_SYSTEMMEM, D3DPT_TRIANGLELIST, D3DRECT, D3DRS_ALPHABLENDENABLE, D3DRS_DESTBLEND,
-    D3DRS_SRCBLEND, D3DRTYPE_SURFACE, D3DRTYPE_VOLUME, D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV,
-    D3DSAMP_MAGFILTER, D3DSAMP_MAXMIPLEVEL, D3DSAMP_MINFILTER, D3DSAMP_MIPFILTER, D3DTA_TEXTURE,
-    D3DTADDRESS_CLAMP, D3DTEXF_ANISOTROPIC, D3DTEXF_LINEAR, D3DTEXF_NONE, D3DTEXF_POINT,
-    D3DTOP_SELECTARG1, D3DTSS_ALPHAARG1, D3DTSS_ALPHAOP, D3DUSAGE_AUTOGENMIPMAP,
+    D3DFVF_DIFFUSE, D3DFVF_TEX1, D3DFVF_TEXCOUNT_SHIFT, D3DFVF_TEXTUREFORMAT3, D3DFVF_XYZ,
+    D3DLOCK_DISCARD, D3DLOCK_NO_DIRTY_UPDATE, D3DLOCK_READONLY, D3DPOOL_DEFAULT, D3DPOOL_MANAGED,
+    D3DPOOL_SCRATCH, D3DPOOL_SYSTEMMEM, D3DPT_TRIANGLELIST, D3DRECT, D3DRS_ALPHABLENDENABLE,
+    D3DRS_DESTBLEND, D3DRS_SRCBLEND, D3DRTYPE_SURFACE, D3DRTYPE_VOLUME, D3DSAMP_ADDRESSU,
+    D3DSAMP_ADDRESSV, D3DSAMP_MAGFILTER, D3DSAMP_MAXMIPLEVEL, D3DSAMP_MINFILTER, D3DSAMP_MIPFILTER,
+    D3DTA_TEXTURE, D3DTADDRESS_CLAMP, D3DTEXF_ANISOTROPIC, D3DTEXF_LINEAR, D3DTEXF_NONE,
+    D3DTEXF_POINT, D3DTOP_SELECTARG1, D3DTSS_ALPHAARG1, D3DTSS_ALPHAOP, D3DTSS_BUMPENVMAT00,
+    D3DTSS_BUMPENVMAT01, D3DTSS_BUMPENVMAT10, D3DTSS_BUMPENVMAT11, D3DUSAGE_AUTOGENMIPMAP,
     D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_DYNAMIC, D3DUSAGE_RENDERTARGET,
 };
 
@@ -1447,6 +1448,89 @@ fn fixed_function_cube_sampling_uses_direction_coordinates() {
         0xFFFF_0000,
         "fixed-function cube sample",
     );
+}
+
+#[repr(C)]
+struct BumpCubeVertex {
+    x: f32,
+    y: f32,
+    z: f32,
+    bump: [f32; 2],
+    direction: [f32; 3],
+}
+
+/// `texbem` into a cube stage samples along the stage's own direction, z included.
+///
+/// The bump matrix is zero, so the displacement is zero whatever the stage-0
+/// map holds, and the direction `(0.2, 0.1, 1.0)` names +Z. A lookup that
+/// drops the third coordinate reads `(0.2, 0.1, 0)` instead, which is +X.
+#[test]
+fn texbem_into_a_cube_samples_the_face_its_direction_names() {
+    // ps_1_1 { tex t0; texbem t1, t0; mov r0, t1 }
+    const PS: &[u32] = &[
+        0xffff_0101,
+        0x0000_0042,
+        0xb00f_0000,
+        0x0000_0043,
+        0xb00f_0001,
+        0xb0e4_0000,
+        0x0000_0001,
+        0x800f_0000,
+        0xb0e4_0001,
+        0x0000_ffff,
+    ];
+    // +X, -X, +Y, -Y, +Z, -Z.
+    const FACES: [u32; 6] = [
+        0xffff_0000,
+        0xff00_ffff,
+        0xff00_ff00,
+        0xffff_00ff,
+        0xff00_00ff,
+        0xffff_ff00,
+    ];
+    let h = Harness::new();
+    let bump = h.create_texture(1, 1, 1, 0, D3DFMT_V8U8, D3DPOOL_MANAGED);
+    bump.lock_rect(0, 0).write_u8_rect(2, 1, &[0, 0]);
+    let cube = h.create_cube_texture_owned(4, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED);
+    for (face, colour) in (0u32..).zip(FACES) {
+        cube.lock_rect(face, 0, 0).write_u32(&[colour; 16]);
+    }
+    assert_eq!(h.set_texture(0, &bump), 0);
+    assert_eq!(h.set_cube_texture(1, &cube), 0);
+    for state in [
+        D3DTSS_BUMPENVMAT00,
+        D3DTSS_BUMPENVMAT01,
+        D3DTSS_BUMPENVMAT10,
+        D3DTSS_BUMPENVMAT11,
+    ] {
+        assert_eq!(h.set_texture_stage_state(1, state, 0f32.to_bits()), 0);
+    }
+    let shader = h.create_pixel_shader(PS);
+    assert_eq!(h.set_pixel_shader(&shader), 0, "SetPixelShader");
+    // Two texcoord sets, the second three components wide.
+    assert_eq!(
+        h.set_fvf(D3DFVF_XYZ | (2 << D3DFVF_TEXCOUNT_SHIFT) | (D3DFVF_TEXTUREFORMAT3 << 18)),
+        0
+    );
+    let vertex = |x: f32, y: f32| BumpCubeVertex {
+        x,
+        y,
+        z: 0.5,
+        bump: [0.5, 0.5],
+        direction: [0.2, 0.1, 1.0],
+    };
+    let quad = [
+        vertex(-1.0, 1.0),
+        vertex(1.0, 1.0),
+        vertex(-1.0, -1.0),
+        vertex(1.0, 1.0),
+        vertex(1.0, -1.0),
+        vertex(-1.0, -1.0),
+    ];
+    h.render_once(BLACK, |d| {
+        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad), 0);
+    });
+    assert_pixel_eq(h.read_pixel(320, 240), FACES[4], "texbem cube sample");
 }
 
 #[test]
