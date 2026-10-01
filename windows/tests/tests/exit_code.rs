@@ -1,9 +1,9 @@
 //! The status a process ends with survives the detach that kills it.
 //!
-//! `d3d9.dll` ends a process that has created a device from its
-//! `DLL_PROCESS_DETACH` (it cannot survive the allocator's thread-local
-//! teardown on Wine's 1 MB main-thread stack), and the code of that
-//! `TerminateProcess` is the one the unix side of Wine exits with, so a
+//! `d3d9.dll` ends a process that has created a device from the
+//! `DLL_PROCESS_DETACH` of its exit (it cannot survive the allocator's
+//! thread-local teardown on Wine's 1 MB main-thread stack), and the code of
+//! that `TerminateProcess` is the one the unix side of Wine exits with, so a
 //! status the process named itself has to be carried into it. Nothing inside
 //! the process can read its own unix exit status, so the assertion belongs
 //! to the runner: the test creates a device, declares on stdout the code it

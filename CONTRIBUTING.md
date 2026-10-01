@@ -101,7 +101,7 @@ that touches `docs/CONVENTIONS.md`.
 
 ## Reading a test run
 
-The end-to-end suite is five test binaries per architecture, and the runner
+The end-to-end suite is six test binaries per architecture, and the runner
 in `unix/e2e` runs each one once under Wine with every test of the binary on
 `JOBS` threads of that process (four at a time by default; the Makefile says
 what that assumes of the Wine it runs under). It prints one
@@ -184,12 +184,15 @@ window's size, `BGRA8Unorm`, a sample count the device answered for) that
 `AppleParavirtGPUMetal`, is the same runner fault, so re-run the failed jobs.
 A line naming a zero dimension or a null handle is the layer's own bug.
 
-Two things are worth knowing when a test process looks wrong. `d3d9.dll`
-terminates the process from its `DLL_PROCESS_DETACH` once a device exists
-(it cannot survive the allocator's thread-local teardown on Wine's 1 MB
-main-thread stack), so a test binary's exit status is whatever that
-`TerminateProcess` carries: the status the process asked to exit with, and 0
-for a process that never asked. The harness's panic hook
+Two things are worth knowing when a test process looks wrong. Once a device
+has existed, `d3d9.dll` terminates the process from the
+`DLL_PROCESS_DETACH` of its exit (it cannot survive the allocator's
+thread-local teardown on Wine's 1 MB main-thread stack), so a test binary's
+exit status is whatever that `TerminateProcess` carries: the status the
+process asked to exit with, and 0 for a process that never asked. A
+`FreeLibrary` after a device does not reach that detach: the first
+`CreateDevice` pins the image, so it stays mapped and the process carries
+on. The harness's panic hook
 (`windows/tests/src/win32.rs`) does not wait for libtest to reach its own
 exit and terminates with libtest's failure code at the first failed
 assertion, after the default hook has printed the report that names the
@@ -198,7 +201,7 @@ named test failed and runs the rest again in a fresh process, and a crash or
 a hang (no result for `TIMEOUT` seconds) is charged the same way, through a
 one-thread re-run of the tests that were in flight when nothing names the
 culprit. So a failure costs one result and one extra process, and the
-`processes` count in the summary says how many the run took: ten is a
+`processes` count in the summary says how many the run took: twelve is a
 clean `make test`.
 
 Explicit test selections, including recovery rounds and filtered initial runs,

@@ -106,15 +106,15 @@ const TEST_FAILURE_EXIT_CODE: u32 = 101;
 /// Make a failed assertion end the test process with a failing exit code.
 ///
 /// mtld3d's `d3d9.dll` terminates the process from its `DLL_PROCESS_DETACH`
-/// once a device has been created (it cannot survive snmalloc's thread-local
-/// teardown on Wine's 1 MB main-thread stack), so a test binary's exit
-/// status is the one that `TerminateProcess` carries. The hook keeps the
-/// default hook's report, which names the failing test (libtest runs each
-/// test on a thread named after it), and then terminates with libtest's
-/// failure code at the first failed assertion, without waiting for libtest
-/// to reach the exit of its own. The tests of the suite share the
-/// process, so the ones in flight go down with it: the e2e runner marks the
-/// named test failed and runs the rest again in a fresh process.
+/// at process exit once a device has been created (it cannot survive
+/// snmalloc's thread-local teardown on Wine's 1 MB main-thread stack), so a
+/// test binary's exit status is the one that `TerminateProcess` carries.
+/// The hook keeps the default hook's report, which names the failing test
+/// (libtest runs each test on a thread named after it), and then terminates
+/// with libtest's failure code at the first failed assertion, without
+/// waiting for libtest to reach the exit of its own. The tests of the suite
+/// share the process, so the ones in flight go down with it: the e2e runner
+/// marks the named test failed and runs the rest again in a fresh process.
 pub fn install_failure_exit_hook() {
     FAILURE_EXIT_HOOK.call_once(|| {
         let default_hook = std::panic::take_hook();

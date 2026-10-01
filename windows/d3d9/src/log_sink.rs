@@ -36,10 +36,13 @@ use std::{
 use log::warn;
 use mtld3d_shared::{OpenLogParams, WriteLogParams, log_once_warn};
 
-use crate::{LOG_TARGET, crash::GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, unix_call::unix_call};
+use crate::{
+    LOG_TARGET,
+    crash::{GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GetModuleHandleExA},
+    unix_call::unix_call,
+};
 
 unsafe extern "system" {
-    fn GetModuleHandleExA(flags: u32, address: *const u8, out: *mut *mut c_void) -> i32;
     fn FreeLibrary(module: *mut c_void) -> i32;
     fn FreeLibraryAndExitThread(module: *mut c_void, exit_code: u32) -> !;
     fn GetThreadId(thread: *mut c_void) -> u32;

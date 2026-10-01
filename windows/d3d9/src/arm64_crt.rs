@@ -68,10 +68,11 @@ pub fn attach() {
 /// Unlike the x86 DLLs, whose CRT callback runs the destructors on a process
 /// detach too, this one leaves a process detach alone, on purpose. Wine calls
 /// TLS callbacks before the DLL's entry point, so a teardown there would run
-/// ahead of `DllMain`, whose detach ends a process that created a device so
-/// that the allocator is not torn down on Wine's 1 MB main-thread stack. What
-/// it gives up is small: the process is ending or the image is being
-/// unmapped, and snmalloc's memory stays reserved either way.
+/// ahead of `DllMain`, whose detach at the exit of a process that created a
+/// device ends it so that the allocator is not torn down on Wine's 1 MB
+/// main-thread stack. What it gives up is small: the process is ending or the
+/// image, which no device ever pinned, is being unmapped, and snmalloc's
+/// memory stays reserved either way.
 extern "system" fn on_tls_event(_module: *mut c_void, reason: u32, _reserved: *mut c_void) {
     if reason == DLL_THREAD_DETACH {
         // SAFETY: snmalloc's teardown may run at any point on the calling

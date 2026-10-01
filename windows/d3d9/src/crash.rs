@@ -53,6 +53,8 @@ const STATUS_ASSERTION_FAILURE: u32 = 0xC000_0420;
 
 const EXCEPTION_CONTINUE_SEARCH: i32 = 0;
 pub const GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS: u32 = 4;
+/// `GetModuleHandleEx` flag that keeps the module loaded until the process ends.
+pub const GET_MODULE_HANDLE_EX_FLAG_PIN: u32 = 1;
 
 static INSTALLED: AtomicBool = AtomicBool::new(false);
 static D3D9_HMODULE: AtomicPtr<c_void> = AtomicPtr::new(core::ptr::null_mut());
@@ -286,7 +288,7 @@ type VectoredHandler = extern "system" fn(*mut ExceptionPointers) -> i32;
 unsafe extern "system" {
     fn RtlAddVectoredExceptionHandler(first: u32, handler: VectoredHandler) -> *mut c_void;
     fn RtlRemoveVectoredExceptionHandler(handle: *mut c_void) -> u32;
-    fn GetModuleHandleExA(flags: u32, module_name: *const u8, out: *mut *mut c_void) -> i32;
+    pub fn GetModuleHandleExA(flags: u32, module_name: *const u8, out: *mut *mut c_void) -> i32;
     fn GetModuleFileNameA(module: *mut c_void, filename: *mut u8, size: u32) -> u32;
     fn GlobalMemoryStatusEx(buffer: *mut MemoryStatusEx) -> i32;
     fn VirtualQuery(
@@ -323,9 +325,11 @@ pub fn install(d3d9_module: *mut c_void) {
 
 /// Remove the VEH before the image goes away. Idempotent.
 ///
-/// Called from `DllMain` `PROCESS_DETACH` on the path the process survives
-/// (a `FreeLibrary` before any device was created); the real-exit path
-/// terminates the process instead and never gets here.
+/// Called from `DllMain` `PROCESS_DETACH` when no device was created: a
+/// `FreeLibrary` the process survives, or the exit of a process that never
+/// created one. Once a device exists the image is pinned, so the only
+/// detach left is process exit, which terminates the process instead and
+/// never gets here.
 pub fn uninstall() {
     if !INSTALLED.swap(false, Ordering::AcqRel) {
         return;
