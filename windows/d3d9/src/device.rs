@@ -4530,8 +4530,6 @@ extern "system" fn device_reset(this: *mut c_void, present_params: *mut c_void) 
         if let Err(hr) = retarget_device_window(dev, &pp, target_window) {
             return hr;
         }
-        // The fresh attach's layer carries no gamma table either.
-        dev.reapply_gamma();
     }
 
     // debug, not info — fires per-frame during a window drag.
@@ -4603,6 +4601,13 @@ extern "system" fn device_reset(this: *mut c_void, present_params: *mut c_void) 
     //    would hand them to the reseed to throw away, so this keeps the
     //    order `apply_auto_resize` already uses.
     dev.reseed_current_frame();
+    // The fresh attach's layer carries no gamma table. The ramp is queued only
+    // now that `current_frame` names that layer: the frames the flushes above
+    // sent still named the layer the retarget detached, and a ramp riding one
+    // of them would be dropped for want of an attachment.
+    if retargeted {
+        dev.reapply_gamma();
+    }
 
     // 8. Reset device state to D3D9 defaults. Cursor + silent-write
     //    warn latches survive (per-spec / process-lifetime telemetry).
