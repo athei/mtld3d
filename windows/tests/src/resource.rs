@@ -271,7 +271,18 @@ impl VolumeTexture<'_> {
     /// # Panics
     /// Panics if the lock fails or `texels` is not exactly one level's worth.
     pub fn write_u32(&self, level: u32, texels: &[u32]) {
-        self.write_texels(level, None, texels);
+        self.write_texels(level, None, 0, texels);
+    }
+
+    /// [`Self::write_u32`] through a `LockBox` that passes `flags`.
+    ///
+    /// For a test of what the lock flags change, such as a write through a
+    /// `D3DLOCK_READONLY` lock, which the application promised not to make.
+    ///
+    /// # Panics
+    /// Panics if the lock fails or `texels` is not exactly one level's worth.
+    pub fn write_u32_with_flags(&self, level: u32, flags: u32, texels: &[u32]) {
+        self.write_texels(level, None, flags, texels);
     }
 
     /// [`Self::write_u32`] for 16-bit-per-texel formats (R5G6B5, A4R4G4B4, ...).
@@ -279,7 +290,7 @@ impl VolumeTexture<'_> {
     /// # Panics
     /// Panics if the lock fails or `texels` is not exactly one level's worth.
     pub fn write_u16(&self, level: u32, texels: &[u16]) {
-        self.write_texels(level, None, texels);
+        self.write_texels(level, None, 0, texels);
     }
 
     /// Fill an eight-byte signed four-lane mip, honoring row and slice pitches.
@@ -287,7 +298,7 @@ impl VolumeTexture<'_> {
     /// # Panics
     /// Panics if the lock fails or the slice does not fill the mip.
     pub fn write_i16x4(&self, level: u32, texels: &[[i16; 4]]) {
-        self.write_texels(level, None, texels);
+        self.write_texels(level, None, 0, texels);
     }
 
     /// Read an eight-byte signed four-lane mip and return its reported pitches.
@@ -350,7 +361,7 @@ impl VolumeTexture<'_> {
     /// # Panics
     /// Panics if the lock fails or the slice does not fill the box.
     pub fn write_box_i16x4(&self, level: u32, region: &D3DBOX, texels: &[[i16; 4]]) {
-        self.write_texels(level, Some(region), texels);
+        self.write_texels(level, Some(region), 0, texels);
     }
 
     /// Fill a box of a 32-bit-per-texel volume, preserving texels outside it.
@@ -358,7 +369,7 @@ impl VolumeTexture<'_> {
     /// # Panics
     /// Panics if the lock fails or `texels` does not fill the box exactly.
     pub fn write_box_u32(&self, level: u32, region: &D3DBOX, texels: &[u32]) {
-        self.write_texels(level, Some(region), texels);
+        self.write_texels(level, Some(region), 0, texels);
     }
 
     /// Write raw DXT blocks into a volume box, honoring both returned pitches.
@@ -479,7 +490,7 @@ impl VolumeTexture<'_> {
         (locked.row_pitch, locked.slice_pitch, output)
     }
 
-    fn write_texels<T: Copy>(&self, level: u32, region: Option<&D3DBOX>, texels: &[T]) {
+    fn write_texels<T: Copy>(&self, level: u32, region: Option<&D3DBOX>, flags: u32, texels: &[T]) {
         let (hr, desc) = self.level_desc(level);
         expect_ok(hr, "VolumeTexture GetLevelDesc");
         let (width, height, depth) = region.map_or((desc.width, desc.height, desc.depth), |b| {
@@ -506,7 +517,7 @@ impl VolumeTexture<'_> {
                 level,
                 &raw mut locked,
                 region.map_or(core::ptr::null(), |b| core::ptr::from_ref(b).cast()),
-                0,
+                flags,
             )
         };
         expect_ok(hr, "VolumeTexture LockBox");

@@ -5264,12 +5264,22 @@ extern "system" fn volume_get_volume_level(
     D3D_OK
 }
 
+/// Warn once that a `LockBox` passed `D3DLOCK` bits this layer does not know.
+///
+/// Out of line so `LockBox` does not build the log arguments on its hot path.
+#[cold]
+#[inline(never)]
+fn warn_unknown_lock_box_bits(unknown: u32) {
+    mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+        "volume LockBox: unrecognised D3DLOCK bits {unknown:#x} ignored");
+}
+
 extern "system" fn volume_lock_box(
     this: *mut c_void,
     level: u32,
     locked_box: *mut D3DLOCKED_BOX,
     box_ptr: *const c_void,
-    _flags: u32,
+    flags: u32,
 ) -> i32 {
     let _api = crate::com_ref::com_api_lock::<Direct3DTexture9>(this);
     if locked_box.is_null() {
@@ -5359,11 +5369,21 @@ extern "system" fn volume_lock_box(
     } else {
         0
     };
-    inner.prepare_staging_write(0, lvl, false);
+    let read_only = flags & D3DLOCK_READONLY != 0;
+    let no_dirty = flags & D3DLOCK_NO_DIRTY_UPDATE != 0;
+    // A read-only lock writes nothing, so it reads the pages an upload may
+    // still be reading rather than moving the level off them.
+    if !read_only {
+        inner.prepare_staging_write(0, lvl, false);
+    }
     let ptr = inner.staging[lvl].as_ptr().cast_mut();
     // Record the lock only after all validation passed, so a rejected LockBox
     // leaves the per-level state untouched.
-    inner.stash_lock(lvl, false, false, None);
+    inner.stash_lock(lvl, read_only, no_dirty, None);
+    let unknown = flags & !D3DLOCK_KNOWN_BITS;
+    if unknown != 0 {
+        warn_unknown_lock_box_bits(unknown);
+    }
     // SAFETY: `offset` lands inside the level's allocation — the box is
     // validated above against the level dimensions and `lock_box` sized the
     // backing as `slice_pitch * depth`.
@@ -5390,21 +5410,29 @@ extern "system" fn volume_unlock_box(this: *mut c_void, level: u32) -> i32 {
     if lvl >= inner.levels as usize {
         return D3DERR_INVALIDCALL;
     }
-    let (read_only, _, was_locked, _) = inner.take_lock(lvl);
+    let (read_only, no_dirty, was_locked, _) = inner.take_lock(lvl);
     if !was_locked {
         // UnlockBox without a matching LockBox (or a double-Unlock) is INVALIDCALL.
         return D3DERR_INVALIDCALL;
     }
-    if read_only {
-        // A read-only lock wrote nothing, so there is nothing to upload.
+    // A read-only lock wrote nothing, so it publishes nothing, except on a
+    // level that was never uploaded: its contents are owed to the GPU once,
+    // as the 2D `UnlockRect` does for a READONLY first lock.
+    if read_only && inner.was_uploaded[lvl] {
         return D3D_OK;
     }
     // The written level is now an `UpdateTexture` source: a SYSTEMMEM volume
     // filled through LockBox and pushed into a DEFAULT-pool twin is the
     // standard way an engine uploads a colour-grading LUT, and UpdateTexture
     // copies only levels marked here. Volumes track dirtiness per whole
-    // level (no sub-box), so the mark is the full mip.
-    inner.mark_update_dirty(lvl, None);
+    // level (no sub-box), so the mark is the full mip. A read-only lock and a
+    // `D3DLOCK_NO_DIRTY_UPDATE` lock add no dirty region. The GPU upload below
+    // still carries a NO_DIRTY_UPDATE write, because a volume's `AddDirtyBox`
+    // publishes nothing to the GPU and the write would otherwise never reach
+    // it.
+    if !read_only && !no_dirty {
+        inner.mark_update_dirty(lvl, None);
+    }
     // Lazy box→3D upload, mirroring the 2D `texture_unlock_rect` path: mark the
     // level dirty so the next bind-time `flush_dirty_mips` dispatches
     // `schedule_upload` (the volume variant), which routes the whole staging
