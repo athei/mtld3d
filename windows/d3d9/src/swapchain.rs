@@ -234,10 +234,10 @@ unsafe impl crate::com_ref::ComChild for Direct3DSwapChain9 {
 
 extern "system" fn swapchain_present(
     this: *mut c_void,
-    _source_rect: *const c_void,
-    _dest_rect: *const c_void,
-    _dest_window_override: usize,
-    _dirty_region: *const c_void,
+    source_rect: *const c_void,
+    dest_rect: *const c_void,
+    dest_window_override: usize,
+    dirty_region: *const c_void,
     _flags: u32,
 ) -> i32 {
     let _api = crate::com_ref::com_api_lock::<Direct3DSwapChain9>(this);
@@ -245,6 +245,18 @@ extern "system" fn swapchain_present(
     let Some(obj) = (unsafe { InPtr::<Direct3DSwapChain9>::opt(this) }) else {
         return D3DERR_INVALIDCALL;
     };
+    crate::device::warn_ignored_present_arguments(
+        source_rect,
+        dest_rect,
+        dest_window_override != 0,
+        dirty_region,
+    );
+    if !obj.inner().owned_by_device {
+        mtld3d_shared::log_once_warn!(target: LOG_TARGET,
+            "IDirect3DSwapChain9::Present on an additional swap chain presents the device's \
+             back buffer into the device window; additional swap chains have no back buffer or \
+             window of their own");
+    }
     let device_inner = obj.inner().device_inner;
     // SAFETY: `device_inner` was stamped from a live `DeviceInner` that
     // outlives its swapchains per D3D9 lifetime rules. There is one drawable,

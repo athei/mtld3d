@@ -4823,13 +4823,19 @@ fn reconcile_implicit_depth(dev: &mut DeviceInner, new_depth_format: u32) -> Res
 
 extern "system" fn device_present(
     this: *mut c_void,
-    _src_rect: *const c_void,
-    _dst_rect: *const c_void,
-    _dst_window_override: *mut c_void,
-    _dirty_region: *const c_void,
+    src_rect: *const c_void,
+    dst_rect: *const c_void,
+    dst_window_override: *mut c_void,
+    dirty_region: *const c_void,
 ) -> i32 {
     let _api = device_api_lock(this);
     let _timer = device_timer(this, DeviceSubCategory::Frame);
+    warn_ignored_present_arguments(
+        src_rect,
+        dst_rect,
+        !dst_window_override.is_null(),
+        dirty_region,
+    );
     // SAFETY: vtable thunk; `this` is *mut Direct3DDevice9 per IDirect3DDevice9 ABI.
     let Some(obj) = (unsafe { InPtrMut::<Direct3DDevice9>::opt(this) }) else {
         return D3DERR_INVALIDCALL;
@@ -4841,6 +4847,53 @@ extern "system" fn device_present(
 
     mtld3d_shared::crumb!("d3d9:present");
     dev.present()
+}
+
+/// Warn once for each optional `Present` argument, none of which is honoured.
+///
+/// Presentation always shows the whole back buffer across the device window:
+/// a source or destination rect, a destination window override and a dirty
+/// region are accepted and ignored. Shared by `IDirect3DDevice9::Present` and
+/// `IDirect3DSwapChain9::Present`.
+#[inline]
+pub fn warn_ignored_present_arguments(
+    source_rect: *const c_void,
+    dest_rect: *const c_void,
+    window_override: bool,
+    dirty_region: *const c_void,
+) {
+    if source_rect.is_null() && dest_rect.is_null() && !window_override && dirty_region.is_null() {
+        return;
+    }
+    warn_present_arguments(source_rect, dest_rect, window_override, dirty_region);
+}
+
+/// The warnings themselves, out of line: nearly every `Present` passes no optional argument.
+#[cold]
+#[inline(never)]
+fn warn_present_arguments(
+    source_rect: *const c_void,
+    dest_rect: *const c_void,
+    window_override: bool,
+    dirty_region: *const c_void,
+) {
+    if !source_rect.is_null() {
+        mtld3d_shared::log_once_warn!(target: LOG_TARGET,
+            "Present: a source rect is ignored; the whole back buffer is presented");
+    }
+    if !dest_rect.is_null() {
+        mtld3d_shared::log_once_warn!(target: LOG_TARGET,
+            "Present: a destination rect is ignored; the frame fills the device window");
+    }
+    if window_override {
+        mtld3d_shared::log_once_warn!(target: LOG_TARGET,
+            "Present: a destination window override is ignored; the frame goes to the device \
+             window");
+    }
+    if !dirty_region.is_null() {
+        mtld3d_shared::log_once_warn!(target: LOG_TARGET,
+            "Present: a dirty region is ignored; the whole back buffer is presented");
+    }
 }
 
 extern "system" fn device_get_back_buffer(

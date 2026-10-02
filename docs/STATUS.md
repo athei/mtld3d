@@ -80,8 +80,8 @@ divergences from D3D9 it keeps on purpose. The tested games are in
   ATOC; A2M is an independent latch. Either request replaces alpha testing
   only on multisampled render targets. Both controls work independently
   of reported vendor; control writes preserve numeric point size.
-- Windowed and fullscreen swap chains, mode enumeration, hardware and software
-  cursors, MetalFX upscaling, HDR output.
+- Windowed and fullscreen presentation of the implicit swap chain, mode
+  enumeration, hardware and software cursors, MetalFX upscaling, HDR output.
 - The gamma ramp of a fullscreen device. `SetGammaRamp` validates the ramp,
   keeps it for `GetGammaRamp`, and the present pass looks each channel up in
   it on the way to the drawable, the software cursor's sprite included. A ramp
@@ -118,6 +118,17 @@ unless its entry says otherwise.
   `Clear` by rect or by viewport that reaches past the colour target while
   either surface is scaled. At the identity scale both reach the depth
   surface, as D3D9 does.
+- Additional swap chains: `CreateAdditionalSwapChain` succeeds and its
+  object carries its own present parameters, but its `GetBackBuffer` hands
+  back the device's back buffer and its `Present` presents the device frame
+  into the device window, warned once. There is no back buffer or window per
+  chain, so a title that renders a second view through one sees it alias the
+  first.
+- `Present` arguments: a source rect, a destination rect, a destination
+  window override and a dirty region are accepted on
+  `IDirect3DDevice9::Present` and `IDirect3DSwapChain9::Present` and ignored,
+  each warned once; the whole back buffer is presented across the device
+  window.
 - Timestamp, timestamp frequency, timestamp disjoint and other niche query
   types: capability probes and creation report `D3DERR_NOTAVAILABLE`.
 - Fixed-function bump-environment mapping: `D3DTOP_BUMPENVMAP` and
