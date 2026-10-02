@@ -1170,8 +1170,9 @@ fn emit_ps_function(
     // SM2/SM3 oDepth: the PS function must return a struct binding
     // both `oC0 [[color(0)]]` and `oDepth [[depth(any)]]` instead of
     // a bare float4. Pre-scan so we only pay the struct cost when the
-    // shader actually writes oDepth — most don't.
-    let has_depth_out = ps.instructions.iter().any(|i| {
+    // shader actually writes oDepth (most don't). A write inside a
+    // subroutine counts: `call` inline-expands it into this function.
+    let has_depth_out = ps.all_instructions().any(|i| {
         // Explicit `oDepth` write, or an SM1 op that writes fragment depth
         // as a side effect (`texdepth`, `texm3x2depth`) — both route through
         // the `_depth_storage` / `PsOut` path below.

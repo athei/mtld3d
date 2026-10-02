@@ -433,7 +433,7 @@ impl DxsoProgram {
     /// body. Any question of the form "does this shader use X" has to ask
     /// both lists, or a shader that only reaches X through a `call` answers
     /// no.
-    fn all_instructions(&self) -> impl Iterator<Item = &Instruction> {
+    pub(super) fn all_instructions(&self) -> impl Iterator<Item = &Instruction> {
         self.instructions
             .iter()
             .chain(self.subroutines.values().flatten())

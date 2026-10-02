@@ -3367,6 +3367,35 @@ fn ps_writing_odepth_returns_psout_struct_with_depth_field() {
 }
 
 #[test]
+fn ps_writing_odepth_only_in_a_subroutine_exports_depth() {
+    // ps_3_0 { call l0; mov oC0, c0; ret; label l0; mov oDepth, c1.x; ret; }
+    const TYPE_DEPTHOUT: u32 = 9;
+    let bc = vec![
+        PS3_HEADER,
+        opcode_token(OP_CALL, 1),
+        src_token(TYPE_LABEL, 0, SWIZ_IDENTITY, 0),
+        opcode_token(OP_MOV, 2),
+        dst_token(TYPE_COLOROUT, 0, 0xF, false),
+        src_token(TYPE_CONST, 0, SWIZ_IDENTITY, 0),
+        opcode_token(OP_RET, 0),
+        opcode_token(OP_LABEL, 1),
+        src_token(TYPE_LABEL, 0, SWIZ_IDENTITY, 0),
+        opcode_token(OP_MOV, 2),
+        dst_token(TYPE_DEPTHOUT, 0, 0xF, false),
+        src_token(TYPE_CONST, 1, SWIZ_XXXX, 0),
+        opcode_token(OP_RET, 0),
+        END_TOKEN,
+    ];
+    let ps = parse(&bc).expect("PS3 parse");
+    let msl = emit_ps_programmable(&ps, VariantKey::default()).expect("emit PS3");
+    metal_compile_or_fail(&msl);
+    assert!(
+        msl.contains("_depth_storage = (ps_c[1]).xxxx;") && msl.contains("oDepth [[depth(any)]]"),
+        "an oDepth write in a subroutine must reach the depth output:\n{msl}"
+    );
+}
+
+#[test]
 fn ps_without_odepth_keeps_float4_return_for_simplicity() {
     // PS without oDepth writes stays on the bare-`float4` return path —
     // no struct, no extra storage local.
