@@ -28,11 +28,24 @@
 //!
 //! The test times each `CreateTexture` and each `LockRect` call alone with
 //! the benchmarks' `rdtsc` clock (`TscClock`), so those rows need no
-//! `PERF=1` build. One such call is short enough that its single time moves
-//! with the machine, so each kind is compared by its mean time per call
-//! over whole frames (see `CallTimes`), with the slowest single
-//! call reported beside it; a spike is a single `LockRect` over twice that
-//! median and over 50 us, since the stalls a game shows take milliseconds.
+//! `PERF=1` build, and each new level's whole fill, its `LockRect`, the
+//! write and its `UnlockRect`, as one interval. One such call is short
+//! enough that its single time moves with the machine, so each kind is
+//! compared by its mean time per call over whole frames (see `CallTimes`),
+//! with the slowest single call reported beside it; a spike is a single
+//! `LockRect` over twice that median and over 50 us, since the stalls a
+//! game shows take milliseconds.
+//!
+//! Under an arm64 Wine the x86 translator (FEX) reads the counter with an
+//! instruction that is not ordered after earlier stores, and a fence does
+//! not order it either, so the stores of one level's write can still be
+//! draining when the next timed call starts and are charged to it. There
+//! the per-call `LockRect` row is not the call alone and moves with the
+//! cost of the write before it. A texture's levels are filled one after
+//! another with only the loop between their intervals, so a drain that
+//! misses one level's interval lands in the next level's, and only the
+//! last level's can leave the row: the whole-fill row is the one to judge
+//! on an arm64 Wine.
 
 use std::{collections::VecDeque, time::SystemTime};
 
@@ -176,6 +189,11 @@ fn texture_streaming() {
          frame time (Present to Present): {row}\n\
          API work (Present return to Present call): {work_row}\n\
          LockRect of a new texture's level (the call alone): {lock_row}\n\
+         whole fill of a new texture's level (LockRect, write and UnlockRect): \
+         {fill_row}\n\
+         under an arm64 Wine (FEX) the counter read is not ordered after earlier \
+         stores, so the per-call rows also carry the drain of the writes before \
+         them; judge the whole-fill row there\n\
          single LockRect calls over 2x the median and 50 us ({limit} ns): {spikes}\n\
          whole-level LockRect of the in-use atlas (the call alone): {preserve_row}\n\
          CreateTexture: {create_row}\n{memory}{perf}",
@@ -188,6 +206,7 @@ fn texture_streaming() {
         row = stats.row(),
         work_row = work.row(),
         lock_row = times.lock.row(),
+        fill_row = times.fill.row(),
         limit = limit.as_nanos(),
         preserve_row = times.preserve.row(),
         create_row = times.create.row(),
@@ -200,6 +219,7 @@ fn texture_streaming() {
     metrics.frame_rows("frame", &stats);
     metrics.frame_rows("api", &work);
     metrics.call_rows("lockrect", &times.lock);
+    metrics.call_rows("fill", &times.fill);
     metrics.metric(
         "lockrect.spikes",
         Value::Count(u64::try_from(spikes).expect("count fits u64")),
@@ -253,6 +273,8 @@ fn texture_streaming() {
 struct Times {
     /// Every `LockRect` call on a new texture's levels, the call alone.
     lock: CallTimes,
+    /// Every new texture's level filled whole: its `LockRect`, the write and its `UnlockRect`.
+    fill: CallTimes,
     /// Every whole-level `LockRect` of the in-use atlas, the call alone.
     preserve: CallTimes,
     /// Every `CreateTexture` call.
@@ -264,7 +286,12 @@ struct Times {
 impl Times {
     /// End a frame for every kind of call.
     fn end_frame(&mut self) {
-        for calls in [&mut self.lock, &mut self.preserve, &mut self.create] {
+        for calls in [
+            &mut self.lock,
+            &mut self.fill,
+            &mut self.preserve,
+            &mut self.create,
+        ] {
             calls.end_frame();
         }
     }
@@ -334,6 +361,7 @@ impl<'h> Scene<'h> {
             &scene.pattern,
             0,
             &mut CallTimes::default(),
+            &mut CallTimes::default(),
         );
         for (format, edge) in UPDATES {
             let create = |pool| h.create_texture(edge, edge, 0, 0, format, pool);
@@ -348,6 +376,7 @@ impl<'h> Scene<'h> {
                 (format, edge),
                 &scene.pattern,
                 1,
+                &mut CallTimes::default(),
                 &mut CallTimes::default(),
             );
             ok(
@@ -455,6 +484,7 @@ impl<'h> Scene<'h> {
             &self.pattern,
             serial,
             &mut self.times.lock,
+            &mut self.times.fill,
         );
         self.draw(&texture, serial);
         self.live.push_back(texture);
@@ -481,23 +511,28 @@ impl<'h> Scene<'h> {
 
 /// Lock and fill every level of `texture`, of `(format, edge)`, from `pattern`.
 ///
-/// Each `LockRect` call's time, the call alone, goes to `times`; `seed`
-/// picks where in `pattern` the fill starts.
+/// Each `LockRect` call's time, the call alone, goes to `locks`, and each
+/// level's whole fill, from before its `LockRect` to after its
+/// `UnlockRect`, to `fills`; `seed` picks where in `pattern` the fill
+/// starts.
 fn fill(
     texture: &Texture<'_>,
     (format, edge): (u32, u32),
     pattern: &[u8],
     seed: u32,
-    times: &mut CallTimes,
+    locks: &mut CallTimes,
+    fills: &mut CallTimes,
 ) {
     let offset = pattern_offset(seed);
     for level in 0..texture.level_count() {
         let (row_bytes, rows) = level_rows(format, edge >> level);
         let started = TscClock::now();
         let mut lock = texture.lock_rect(level, 0);
-        times.add(TscClock::since(started));
+        locks.add(TscClock::since(started));
         lock.write_u8_rect(row_bytes, rows, &pattern[offset..offset + row_bytes * rows]);
-        ok(lock.unlock(), "UnlockRect");
+        let unlocked = lock.unlock();
+        fills.add(TscClock::since(started));
+        ok(unlocked, "UnlockRect");
     }
 }
 
