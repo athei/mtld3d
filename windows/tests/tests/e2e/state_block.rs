@@ -845,9 +845,8 @@ fn applied_all_block_keeps_the_fvf_bound_after_a_capture_without_one() {
     let block = h.create_state_block(D3DSBT_ALL);
 
     assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_NORMAL), 0);
-    let direct = h.fvf();
     assert_eq!(block.apply(), D3D_OK, "Apply ALL");
-    assert_eq!(h.fvf(), direct, "GetFVF after Apply");
+    assert_eq!(h.fvf(), D3DFVF_XYZ | D3DFVF_NORMAL, "GetFVF after Apply");
     let (r, g, b) = draw_lit(&h);
     assert!(
         r >= 0xF0 && g <= 2 && b <= 2,

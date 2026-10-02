@@ -1188,34 +1188,33 @@ impl DeviceInner {
 
     /// Apply D3D9 `SetFVF` semantics for a non-zero `fvf`.
     ///
-    /// Record the FVF and bind its implicit declaration as the current vertex
-    /// declaration (the most-recent of `SetFVF` / `SetVertexDeclaration`
-    /// wins). `fvf == 0` is a no-op on the binding, matching the driver.
+    /// Bind the FVF's implicit declaration, which carries the FVF, as the
+    /// current vertex declaration (the most-recent of `SetFVF` /
+    /// `SetVertexDeclaration` wins). `fvf == 0` is a no-op on the binding,
+    /// matching the driver.
     /// Returns whether the bound declaration changed (callers gate snapshot
-    /// dirtying on this). A call that would change nothing returns before the
-    /// cache lookup (see [`Self::fvf_bind_is_redundant`]).
+    /// dirtying on this), or `None` when the declaration cannot be built,
+    /// leaving the binding as it was. A call that would change nothing
+    /// returns before the cache lookup (see [`Self::fvf_bind_is_redundant`]).
     #[inline]
-    pub fn bind_fvf_decl(&mut self, fvf: u32) -> bool {
+    pub fn bind_fvf_decl(&mut self, fvf: u32) -> Option<bool> {
         if fvf == 0 || self.fvf_bind_is_redundant(fvf) {
-            return false;
+            return Some(false);
         }
         self.bind_fvf_decl_uncached(fvf)
     }
 
-    /// Whether binding `fvf` would leave the FVF field and the bound declaration as they are.
+    /// Whether binding `fvf` would leave the bound declaration as it is.
     ///
-    /// True exactly when the FVF field already reads `fvf` and the bound
-    /// declaration is `fvf`'s implicit one. The field alone does not say
-    /// that: a state-block apply writes it without binding a declaration
-    /// and restores a declaration without writing it, so the bound pointer is
-    /// compared too, against the one `bind_fvf_decl` last bound for
-    /// `last_fvf_bind`'s FVF. Each FVF has one cached declaration, so a match
-    /// on both halves is the pair the cache lookup would produce, and every
-    /// dirty mark the caller gates on a change would be skipped anyway.
-    ///
-    /// The pointer is compared first: a caller that alternates `SetFVF` with
-    /// `SetVertexDeclaration` leaves the FVF field matching and fails only
-    /// there, so that order sends it to the lookup after one test.
+    /// True exactly when the bound declaration is `fvf`'s implicit one,
+    /// answered without the cache lookup or a dereference: the bound pointer
+    /// is compared against the one `bind_fvf_decl` last bound, and the FVF
+    /// against the one it bound it for (`last_fvf_bind`). Each FVF has one
+    /// cached declaration, so a match on both halves is the declaration the
+    /// lookup would produce, and every dirty mark the caller gates on a change
+    /// would be skipped anyway. Any other path that binds a declaration (a
+    /// `SetVertexDeclaration`, a state-block apply) moves the pointer and
+    /// fails the first half.
     #[inline]
     fn fvf_bind_is_redundant(&self, fvf: u32) -> bool {
         let (bound_fvf, bound_decl) = self.last_fvf_bind;
@@ -1224,14 +1223,13 @@ impl DeviceInner {
 
     /// The [`Self::bind_fvf_decl`] path that looks the declaration up and binds it.
     #[inline(never)]
-    fn bind_fvf_decl_uncached(&mut self, fvf: u32) -> bool {
+    fn bind_fvf_decl_uncached(&mut self, fvf: u32) -> Option<bool> {
         let decl = self.get_or_create_fvf_decl(fvf);
-        self.last_fvf_bind = if decl.is_null() {
-            (0, core::ptr::null_mut())
-        } else {
-            (fvf, decl)
-        };
-        self.replace_vertex_decl(decl)
+        if decl.is_null() {
+            return None;
+        }
+        self.last_fvf_bind = (fvf, decl);
+        Some(self.replace_vertex_decl(decl))
     }
 
     /// Release every vertex fetch slot's bound-texture refcount at device teardown.
@@ -12663,9 +12661,16 @@ extern "system" fn device_set_fvf(this: *mut c_void, fvf: u32) -> i32 {
         // nothing and records nothing.
         if fvf != 0 {
             let decl = dev.get_or_create_fvf_decl(fvf);
+            if decl.is_null() {
+                mtld3d_shared::log_once_warn!(
+                    target: LOG_TARGET,
+                    "recorded SetFVF({fvf:#x}): no declaration for the FVF → DRIVERINTERNALERROR, nothing recorded"
+                );
+                return mtld3d_types::D3DERR_DRIVERINTERNALERROR;
+            }
             if let Some(rec) = dev.recording_state_block_mut() {
-                // SAFETY: `decl` is null or a live declaration the FVF cache
-                // holds until the device drops.
+                // SAFETY: `decl` is a live declaration the FVF cache holds
+                // until the device drops.
                 let adopted = unsafe { CachedComPtr::adopt(decl) };
                 rec.record(StateOp::VertexDeclaration(adopted));
             }
@@ -12683,8 +12688,15 @@ extern "system" fn device_set_fvf(this: *mut c_void, fvf: u32) -> i32 {
     // FVF directly. Redundant-set elimination: re-binding the same cached decl
     // changes nothing, so skip the VDECL rebuild; `bind_fvf_decl` answers
     // that without the cache lookup when the FVF and its declaration are
-    // already bound.
-    let changed = dev.bind_fvf_decl(fvf);
+    // already bound. An FVF whose declaration cannot be built leaves the
+    // bound declaration as it is, as in Wine.
+    let Some(changed) = dev.bind_fvf_decl(fvf) else {
+        mtld3d_shared::log_once_warn!(
+            target: LOG_TARGET,
+            "SetFVF({fvf:#x}): no declaration for the FVF → DRIVERINTERNALERROR, binding kept"
+        );
+        return mtld3d_types::D3DERR_DRIVERINTERNALERROR;
+    };
     if changed {
         // VS_SOURCE is marked unconditionally (not via `ff_aware_mask`, which
         // drops it for a programmable VS): a declaration change alters which VS
