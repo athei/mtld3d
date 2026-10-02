@@ -2042,8 +2042,9 @@ fn translate_instruction(
         // That's exactly `step(s1, s0)`.
         Opcode::Sge => format!("step({}, {})", srcs[1], srcs[0]),
         // ps_1_0..1_3 `texcoord tN`: copy iterated texcoord set N into the
-        // register as colour data, clamped to [0,1]. The set index is the dst
-        // register number (no source operand).
+        // register as colour data, (u, v, w, 1) with u, v and w clamped to
+        // [0,1]. The set index is the dst register number (no source
+        // operand).
         // ps_1_4 `texcrd rN, tM`: copy texcoord set M into rN, NOT clamped.
         Opcode::TexCoord => {
             let dst = inst.dst.as_ref().ok_or_else(|| {
@@ -2052,7 +2053,7 @@ fn translate_instruction(
             if ctx.shader_minor >= 4 {
                 srcs[0].clone()
             } else {
-                format!("saturate(in.texcoord{})", dst.reg.index)
+                format!("float4(saturate(in.texcoord{}).xyz, 1.0)", dst.reg.index)
             }
         }
         Opcode::TexLd if ctx.is_sm1() => {

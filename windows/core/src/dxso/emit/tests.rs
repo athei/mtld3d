@@ -4235,8 +4235,8 @@ fn ps_1_1_tex_and_texcoord_use_t_register_array() {
         "t[] not seeded from texcoord varyings:\n{msl}"
     );
     assert!(
-        msl.contains("saturate(in.texcoord0)"),
-        "texcoord must clamp the iterated coord:\n{msl}"
+        msl.contains("t[0] = float4(saturate(in.texcoord0).xyz, 1.0);"),
+        "texcoord must clamp the iterated coord and set w to 1:\n{msl}"
     );
     // `tex t1` samples stage 1 (implicit sampler) at the coord in t[1].
     assert!(
