@@ -777,7 +777,7 @@ impl Drop for ApiTimer {
 #[cfg(perf_tracking)]
 impl ApiTimer {
     /// Book one call and `cycles` into this timer's bucket and the buckets above it.
-    fn book(&self, perf: &mut ApiPerfState, cycles: u64) {
+    const fn book(&self, perf: &mut ApiPerfState, cycles: u64) {
         if let Some(bind) = self.bind_sub {
             // `start_bind` always pairs with `device_sub == Bind`; the
             // helper bumps Device top + Bind device-sub + bind-sub all
