@@ -1833,11 +1833,12 @@ fn translate_instruction(
     let srcs: Vec<String> = inst
         .srcs
         .iter()
-        .map(|s| {
-            if s.reg.kind == RegKind::Sampler {
-                Ok(String::new())
-            } else {
+        .enumerate()
+        .map(|(index, s)| {
+            if loads_source(inst, index) {
                 load_src(s, ctx)
+            } else {
+                Ok(String::new())
             }
         })
         .collect::<Result<_, _>>()?;
@@ -2641,6 +2642,16 @@ fn emit_matmul(
 /// handles by warning and falling back.
 fn current_loop_al(ctx: &EmitContext) -> Option<usize> {
     ctx.loop_stack.borrow().iter().rev().find_map(|f| *f)
+}
+
+/// Whether source operand `index` of `inst` has a value to load before the opcode's arm runs.
+///
+/// A sampler names a binding, not a value. The `aL` operand of `loop aL,
+/// iN` names the counter that the `Loop` arm itself declares, so no loop
+/// frame holds it yet.
+fn loads_source(inst: &Instruction, index: usize) -> bool {
+    let operand = &inst.srcs[index];
+    !(operand.reg.kind == RegKind::Sampler || (inst.opcode == Opcode::Loop && index == 0))
 }
 
 fn load_src(src: &SrcOperand, ctx: &EmitContext) -> Result<String, EmitError> {

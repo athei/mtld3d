@@ -2842,6 +2842,62 @@ fn loop_relative_const_addressing_indexes_by_al() {
     );
 }
 
+/// The `aL` operand of `loop aL, iN` is not loaded; the counter and a `c[aL + N]` read are.
+///
+/// The `Loop` arm declares the counter, so loading that operand first would
+/// resolve an `aL` read with no loop frame open and log a false warning.
+#[test]
+fn loop_counter_operand_is_not_loaded_before_its_loop() {
+    // ps_3_0 { defi i0, 1, 18, 1, 0; loop aL, i0; mov r0, c[aL + 2]; endloop;
+    //          mov oC0, r0; }
+    let bc = [
+        0xFFFF_0300,
+        0x0500_0030,
+        0xF00F_0000,
+        1,
+        18,
+        1,
+        0,
+        0x0200_001B,
+        0xF0E4_0800,
+        0xF0E4_0000,
+        0x0300_0001,
+        0x800F_0000,
+        0xA0E4_2002,
+        0xF000_0800,
+        0x0000_001D,
+        0x0200_0001,
+        0x800F_0800,
+        0x80E4_0000,
+        0x0000_FFFF,
+    ];
+    let ps = parse(&bc).expect("ps_3_0 parse");
+    let loop_inst = ps
+        .instructions
+        .iter()
+        .find(|inst| inst.opcode == super::Opcode::Loop)
+        .expect("loop instruction");
+    assert!(
+        !super::loads_source(loop_inst, 0),
+        "the aL operand names the counter"
+    );
+    assert!(super::loads_source(loop_inst, 1), "the iN operand is read");
+    let mov = ps
+        .instructions
+        .iter()
+        .find(|inst| inst.srcs.first().is_some_and(|src| src.rel_addr.is_some()))
+        .expect("relative read");
+    assert!(
+        super::loads_source(mov, 0),
+        "c[aL + N] is read inside the loop"
+    );
+    let msl = emit_ps_programmable(&ps, VariantKey::default()).expect("emit PS3");
+    assert!(
+        msl.contains("r[0] = ps_c[aL_0 + 2];"),
+        "the loop body still indexes by its counter:\n{msl}"
+    );
+}
+
 #[test]
 fn dynamic_int_constant_reads_the_runtime_vs_i_buffer() {
     // vs_3_0 { dcl_position v0; loop aL, i0; mov r0, c[aL + 8]; endloop;
