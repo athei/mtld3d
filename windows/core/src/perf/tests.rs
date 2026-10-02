@@ -1347,8 +1347,8 @@ fn exclusive_exit_saturates_when_children_exceed_elapsed() {
 fn api_timer_storage_outlives_nested_device_release() {
     let mut storage = ApiPerfStorage::new();
     let weak = Rc::downgrade(&storage.state);
-    let outer = ApiTimer::new(Some(&storage), ApiCategory::Texture);
-    let inner = ApiTimer::new(Some(&storage), ApiCategory::Device);
+    let outer = ApiTimer::new(Some(&storage), ApiCategory::Texture, true);
+    let inner = ApiTimer::new(Some(&storage), ApiCategory::Device, true);
     storage.state_mut().bump_texture_rename();
     assert_eq!(storage.state.borrow().timer_depth, 2);
     drop(storage);
@@ -1372,7 +1372,7 @@ fn api_timer_storage_outlives_nested_device_release() {
 fn api_timer_storage_outlives_direct_device_release() {
     let storage = ApiPerfStorage::new();
     let weak = Rc::downgrade(&storage.state);
-    let timer = ApiTimer::new(Some(&storage), ApiCategory::Device);
+    let timer = ApiTimer::new(Some(&storage), ApiCategory::Device, true);
     drop(storage);
     assert_eq!(weak.strong_count(), 1);
     drop(timer);
@@ -1382,8 +1382,8 @@ fn api_timer_storage_outlives_direct_device_release() {
 #[test]
 fn api_timer_nested_writeback_balances_depth_and_counts() {
     let storage = ApiPerfStorage::new();
-    let outer = ApiTimer::new(Some(&storage), ApiCategory::Surface);
-    let inner = ApiTimer::new(Some(&storage), ApiCategory::Texture);
+    let outer = ApiTimer::new(Some(&storage), ApiCategory::Surface, true);
+    let inner = ApiTimer::new(Some(&storage), ApiCategory::Texture, true);
     drop(inner);
     drop(outer);
     let state = storage.state.borrow();
@@ -1706,26 +1706,26 @@ fn untimed_frames_run_no_phase_timers_on_either_side() {
     assert!(!enc.op_sub_detail_ptr(OpSubDetail::BDraw).is_null());
 }
 
-/// In an untimed frame an ordinary timer is inert, while a `Frame` call's timer still books.
+/// In an untimed frame a timer only counts its call; a `Frame` call's timer reads the clock.
 #[test]
-fn untimed_frame_times_only_the_frame_calls() {
+fn untimed_frame_counts_every_call_and_times_only_the_frame_calls() {
     let storage = ApiPerfStorage::new();
     storage.state.borrow_mut().untimed_frames = 5;
-    let inert = ApiTimer::frame_gated(Some(&storage), ApiCategory::Device, false);
-    assert!(inert.state.is_none(), "an untimed frame reads no clock");
-    drop(inert);
+    let counted = ApiTimer::frame_gated(Some(&storage), ApiCategory::Device, false);
+    assert!(!counted.clock, "an untimed frame reads no clock");
+    assert_eq!(storage.state.borrow().timer_depth, 0);
+    drop(counted);
     let frame = ApiTimer::frame_gated(Some(&storage), ApiCategory::Device, true);
-    assert!(
-        frame.state.is_some(),
-        "a Frame call reads the clock in every frame"
-    );
+    assert!(frame.clock, "a Frame call reads the clock in every frame");
+    assert_eq!(storage.state.borrow().timer_depth, 1);
     drop(frame);
     let state = storage.state.borrow();
     assert_eq!(
         state.counters.api_call_counts_by_category[ApiCategory::Device as usize],
-        1,
-        "only the Frame call booked"
+        2,
+        "both calls counted"
     );
+    assert_eq!(state.timer_depth, 0);
 }
 
 /// A mid-frame flush keeps the frame's flag; only the presenting drain draws the next gap.

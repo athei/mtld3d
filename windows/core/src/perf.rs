@@ -538,6 +538,8 @@ impl ApiPerfStorage {
 pub struct ApiTimer {
     start: u64,
     state: Option<Rc<RefCell<ApiPerfState>>>,
+    /// Whether the timer read the clock; one in an untimed frame only counts its call at `Drop`.
+    clock: bool,
     category: ApiCategory,
     /// Set on `Device`-category timers built via `start_device`.
     ///
@@ -613,20 +615,23 @@ impl ApiTimer {
         category: ApiCategory,
         every_frame: bool,
     ) -> Self {
-        Self::new(
-            storage.filter(|storage| every_frame || storage.frame_timed()),
-            category,
-        )
+        let clock = storage.is_some_and(|storage| every_frame || storage.frame_timed());
+        Self::new(storage, category, clock)
     }
 
     #[cfg(perf_tracking)]
-    fn new(storage: Option<&ApiPerfStorage>, category: ApiCategory) -> Self {
+    fn new(storage: Option<&ApiPerfStorage>, category: ApiCategory, clock: bool) -> Self {
         let state = storage.map(|s| Rc::clone(&s.state));
-        let saved_child_cycles = Self::enter_scope(state.as_ref());
-        let start = if state.is_some() { rdtsc() } else { 0 };
+        let saved_child_cycles = if clock {
+            Self::enter_scope(state.as_ref())
+        } else {
+            0
+        };
+        let start = if clock && state.is_some() { rdtsc() } else { 0 };
         Self {
             start,
             state,
+            clock,
             category,
             device_sub: None,
             bind_sub: None,
@@ -742,6 +747,11 @@ impl Drop for ApiTimer {
         let Some(state) = &self.state else {
             return;
         };
+        if !self.clock {
+            // An untimed frame counts the call and books no time.
+            self.book(&mut state.borrow_mut(), 0);
+            return;
+        }
         let elapsed = rdtsc() - self.start;
         let mut perf = state.borrow_mut();
         // Exclusive (self) time: subtract the cycles consumed by nested
@@ -760,17 +770,25 @@ impl Drop for ApiTimer {
             perf.timer_depth,
         );
         perf.active_child_cycles = restored;
+        self.book(&mut perf, self_time);
+    }
+}
+
+#[cfg(perf_tracking)]
+impl ApiTimer {
+    /// Book one call and `cycles` into this timer's bucket and the buckets above it.
+    fn book(&self, perf: &mut ApiPerfState, cycles: u64) {
         if let Some(bind) = self.bind_sub {
             // `start_bind` always pairs with `device_sub == Bind`; the
             // helper bumps Device top + Bind device-sub + bind-sub all
             // under the single rdtsc delta.
-            perf.add_bind_cycles(bind, self_time);
+            perf.add_bind_cycles(bind, cycles);
         } else if let Some(sub) = self.device_sub {
-            perf.add_device_cycles(sub, self_time);
+            perf.add_device_cycles(sub, cycles);
         } else if let Some(sub) = self.surface_sub {
-            perf.add_surface_cycles(sub, self_time);
+            perf.add_surface_cycles(sub, cycles);
         } else {
-            perf.add_api_cycles(self.category, self_time);
+            perf.add_api_cycles(self.category, cycles);
         }
     }
 }
