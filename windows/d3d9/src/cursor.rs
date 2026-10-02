@@ -1434,9 +1434,17 @@ pub extern "system" fn device_show_cursor(this: *mut c_void, show: i32) -> i32 {
 /// the same hole, and applications keep the window thread out of D3D calls
 /// during `Reset`, so this is parity rather than a gap. What runs unlocked:
 /// the cursor latches on `WM_SETCURSOR` and `WM_ACTIVATE*`, the fullscreen
-/// window lookup, and the auto-resize on `WM_SIZE`, which flushes the current
-/// frame; a user resize on this thread while another thread draws under the
-/// flag is the residual.
+/// window lookup, the auto-resize on `WM_SIZE`, which flushes the current
+/// frame, the registry mode restore on deactivation, and the fullscreen
+/// re-cover and reactivation posted as `WM_APP_REASSERT_FULLSCREEN` and
+/// `WM_APP_REACTIVATE_FULLSCREEN`, which set the display mode and move the
+/// window. The device pointer is read under the `DEVICE_INSTANCES` mutex and
+/// used after it is released; the device's final `Release` restores the
+/// original procedure and removes the entry before it frees anything, so only
+/// a message already past the lookup can meet a device being released. A
+/// user resize or activation change on this thread while another thread
+/// draws, resets or releases the device under the flag is the residual, and
+/// native D3D9's window hook leaves the same one.
 extern "system" fn cursor_wnd_proc(hwnd: *mut c_void, msg: u32, wp: usize, lp: isize) -> isize {
     // Resolve the owning device for *this* window. A window may still be
     // subclassed briefly after its device's entry is removed (or never have
