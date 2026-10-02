@@ -31,7 +31,7 @@ fn peaks_are_per_frame_and_residuals_use_the_same_frame() {
     assert_eq!(perf.slow[1].encoder_ns, Some(10_000_000));
     assert!(perf.frame.iter().all(|metric| metric.calls == 0));
     let mut output = String::new();
-    perf.append_window(&mut output, 2);
+    perf.append_window(&mut output, 2, 2);
     assert!(output.contains("calls=3     failed=1"));
     assert!(output.contains("encoder_ops_same_submission=30.000ms"));
     assert!(output.contains("device=0x7"));
@@ -70,7 +70,7 @@ fn empty_windows_reset_remainders() {
     let mut perf = CompilationPerf::new();
     perf.finish_frame(90_000_000, 80_000_000, 100_000_000);
     let mut output = String::new();
-    perf.append_window(&mut output, 1);
+    perf.append_window(&mut output, 1, 1);
     assert!(output.is_empty());
     perf.record_enabled(Kind::Depth, 1_000_000, true, 2, identity);
     perf.finish_frame(2_000_000, 3_000_000, 4_000_000);
@@ -94,13 +94,13 @@ fn async_rows_print_with_no_compilation_row_and_reset_with_the_window() {
     perf.asynchronous.misses = 4;
     perf.asynchronous.miss_ns = 400_000;
     let mut output = String::new();
-    perf.append_window(&mut output, 1);
+    perf.append_window(&mut output, 1, 1);
     assert!(output.contains("draws skipped=3  pending peak=2  installs=2"));
     assert!(output.contains("latency avg 15.000 ms  max 20.000 ms"));
     assert!(output.contains("draws deferred=2  urgent waits=1  waited 5.000 ms  stolen=1"));
     assert!(output.contains("encoder per miss 0.100 ms  misses=4"));
     let mut again = String::new();
-    perf.append_window(&mut again, 1);
+    perf.append_window(&mut again, 1, 1);
     assert!(again.is_empty(), "the window resets the async rows too");
 }
 
@@ -113,7 +113,7 @@ fn kv_values_follow_the_window_and_keys_stay_when_it_is_idle() {
             .collect::<Vec<_>>()
     };
     let mut perf = CompilationPerf::new();
-    let mut idle = KvLine::new(5.0, 2);
+    let mut idle = KvLine::new(5.0, 2, 2);
     perf.append_kv(&mut idle);
     let idle = idle.finish();
     perf.record_enabled(Kind::Library, 3_000_000, true, 1, identity);
@@ -125,7 +125,7 @@ fn kv_values_follow_the_window_and_keys_stay_when_it_is_idle() {
     perf.asynchronous.latency_ns = 30_000_000;
     perf.asynchronous.latency_peak_ns = 20_000_000;
     perf.asynchronous.urgent_wait_ns = 5_000_000;
-    let mut busy = KvLine::new(5.0, 2);
+    let mut busy = KvLine::new(5.0, 2, 2);
     perf.append_kv(&mut busy);
     let busy = busy.finish();
     assert!(busy.contains(

@@ -172,20 +172,21 @@ const SNAPSHOT_SECTIONS: [(usize, &str, &str); 17] = [
 #[cfg(perf_tracking)]
 const KEYS_SECTION_SAMPLE_PERIOD: u32 = 16;
 
-/// One frame in this many, on average, runs its timers; the others read no clock.
+/// One frame in this many, on average, runs its per-call and per-draw timers.
 ///
 /// A timer costs about as much as a cheap call (two counter reads and the
 /// booking, 12 to 17 ns under Rosetta), so a `PERF=1` build that times
 /// every call of every frame runs its API thread about half again slower
 /// than the production build. Timing whole frames keeps every timed frame
 /// exact (nesting, exclusive time, the rows that are a parent less its
-/// children) and leaves the others at production cost; the summary folds
-/// the timed frames only, so its rows are per timed frame and need no
-/// scaling. The gaps between timed frames are drawn at random, so a
-/// workload that cycles through a few frame shapes is not timed on one of
-/// them only. A benchmark's two-second window holds thousands of frames,
-/// so it keeps a few hundred timed ones; a game at 60 frames a second keeps
-/// about eight a window.
+/// children) and leaves the others at production cost but for the few
+/// once-a-frame timers. The summary takes its timer rows from the timed
+/// frames and its counts from every frame, so nothing is scaled. The gaps
+/// between timed frames are drawn at random, so a workload that cycles
+/// through a few frame shapes is not timed on one of them only. A
+/// benchmark's two-second window holds thousands of frames, so it keeps a
+/// few hundred timed ones; a game at 60 frames a second keeps about eight a
+/// window.
 #[cfg(perf_tracking)]
 const FRAME_SAMPLE_PERIOD: u8 = 16;
 
@@ -602,8 +603,18 @@ impl ApiTimer {
     /// frame, which may be a timed one.
     #[cfg(perf_tracking)]
     fn begin(storage: Option<&ApiPerfStorage>, category: ApiCategory, every_frame: bool) -> Self {
+        Self::frame_gated(storage.filter(|_| perf_enabled()), category, every_frame)
+    }
+
+    /// The frame gate of [`Self::begin`], past the runtime perf switch.
+    #[cfg(perf_tracking)]
+    fn frame_gated(
+        storage: Option<&ApiPerfStorage>,
+        category: ApiCategory,
+        every_frame: bool,
+    ) -> Self {
         Self::new(
-            storage.filter(|storage| perf_enabled() && (every_frame || storage.frame_timed())),
+            storage.filter(|storage| every_frame || storage.frame_timed()),
             category,
         )
     }
@@ -1391,11 +1402,12 @@ pub struct ApiPerfState {
     /// `active_child_cycles` can be reset to 0 at rest (prevents
     /// top-level residue).
     timer_depth: u32,
-    /// Xorshift state that picks the rebuilding draws whose `keys` sections are timed.
+    /// Xorshift state that picks the draws whose `keys` sections are timed, and the frame gaps.
     ///
     /// Persists across frames and is never drained, so a game or benchmark
     /// that repeats its draw sequence every frame is not sampled at the same
-    /// positions each time.
+    /// positions each time. The gap to the next timed frame
+    /// ([`Self::untimed_frames`]) is drawn from the same state.
     section_sample_state: u32,
     /// Untimed frames left before the next timed one; the frame being recorded is timed at 0.
     ///
@@ -1450,9 +1462,14 @@ impl ApiPerfState {
     /// Pointer the `CycleAddTimer` writes into.
     ///
     /// Naming mirrors the `present_block_cycles_ptr` accessor — d3d9
-    /// query.rs is the only consumer.
+    /// query.rs is the only consumer. Null in an untimed frame, like the
+    /// `Query` timer around it.
     pub const fn query_wait_cycles_ptr(&mut self) -> *mut u64 {
-        &raw mut self.counters.query_wait_cycles
+        if self.untimed_frames == 0 {
+            &raw mut self.counters.query_wait_cycles
+        } else {
+            core::ptr::null_mut()
+        }
     }
 
     /// Pointer the `CycleAddTimer` writes into for the Draw-internal snapshot phase.
@@ -1629,7 +1646,8 @@ impl ApiPerfState {
         state ^= state >> 17;
         state ^= state << 5;
         self.section_sample_state = state;
-        let sampled = state & (KEYS_SECTION_SAMPLE_PERIOD - 1) == 0;
+        // The sections are timed only in a timed frame, so only there is a draw sampled.
+        let sampled = self.untimed_frames == 0 && state & (KEYS_SECTION_SAMPLE_PERIOD - 1) == 0;
         let draws = &mut self.counters.snapshot_rebuild_draws;
         *draws = draws.saturating_add(1);
         if sampled {
@@ -1783,11 +1801,12 @@ impl ApiPerfState {
     ///
     /// Also samples `rdtsc()` and computes `frame_total_cycles` as the
     /// delta from the previous call — returns 0 on the very first frame
-    /// (no predecessor). It also draws whether the next frame is timed.
+    /// (no predecessor). A presenting drain (`presenting`) also draws
+    /// whether the next frame is timed; a mid-frame flush keeps the flag.
     ///
     /// # Panics
     /// Never: the drawn gap is below twice `FRAME_SAMPLE_PERIOD`, which fits `u8`.
-    pub fn drain_into_payload(&mut self, payload: &mut FramePerfPayload) {
+    pub fn drain_into_payload(&mut self, payload: &mut FramePerfPayload, presenting: bool) {
         let now = rdtsc();
         let prev = core::mem::replace(&mut self.prev_present_rdtsc, now);
         // Move this frame's counters into the payload, leaving a zeroed
@@ -1800,6 +1819,11 @@ impl ApiPerfState {
         payload.counters.reset_epoch_saturated = u32::from(self.reset_epoch_saturated);
         payload.timing.frame_total_cycles = if prev == 0 { 0 } else { now - prev };
         payload.counters.timed = u32::from(self.untimed_frames == 0);
+        // A mid-frame flush sends a piece of the frame out; the pieces of one
+        // D3D9 frame share its flag, so only a presenting drain moves on.
+        if !presenting {
+            return;
+        }
         self.untimed_frames = if self.untimed_frames == 0 {
             let mut state = self.section_sample_state;
             state ^= state << 13;
@@ -1924,7 +1948,8 @@ impl ApiPerfState {
     pub const fn add_texture_pool_outcomes(&mut self, _hits: u32, _misses: u32) {}
 
     #[inline]
-    pub const fn drain_into_payload(&mut self, _payload: &mut FramePerfPayload) {}
+    pub const fn drain_into_payload(&mut self, _payload: &mut FramePerfPayload, _presenting: bool) {
+    }
 }
 
 /// Payload that crosses the API→encoder channel inside `FrameData`.
@@ -2126,8 +2151,13 @@ pub struct FrameSummaryContext {
 #[cfg(perf_tracking)]
 pub struct EncoderPerfState {
     compilation: compilation::CompilationPerf,
-    /// Rolling aggregator for the 2-second `info!` summary.
+    /// Rolling aggregator of the timed frames: every timer row of the 2-second summary.
     perf_window: PerfWindow,
+    /// Rolling aggregator of every frame: the counts, gauges and faults of the summary.
+    ///
+    /// Its time sums mix timed and untimed frames and are never rendered;
+    /// its start and its frame count set the window's span.
+    count_window: PerfWindow,
     // Native devices always set clock domains before intake. None supports local
     // core clients and unit fixtures whose counters already share one domain.
     clocked: Option<deferred::ClockedSamples>,
@@ -2197,6 +2227,7 @@ impl EncoderPerfState {
         Self {
             compilation: compilation::CompilationPerf::new(),
             perf_window: PerfWindow::new(),
+            count_window: PerfWindow::new(),
             clocked: None,
             submit_nanos: deferred::SubmitNanos::default(),
             counters: FrameCounters::new(),
@@ -2223,8 +2254,8 @@ impl EncoderPerfState {
         self.clocked
             .as_ref()
             .is_none_or(|clocks| matches!(clocks.frequencies(), Ok(Some(_))))
-            && self.perf_window.started_tsc != 0
-            && rdtsc().saturating_sub(self.perf_window.started_tsc)
+            && self.count_window.started_tsc != 0
+            && rdtsc().saturating_sub(self.count_window.started_tsc)
                 >= secs_to_cycles(SUMMARY_INTERVAL_SECS)
     }
 
@@ -2280,8 +2311,8 @@ impl EncoderPerfState {
             .as_mut()
             .and_then(deferred::ClockedSamples::take_ready)
         {
-            if self.perf_window.started_tsc == 0 {
-                self.perf_window.started_tsc = captured_at;
+            if self.count_window.started_tsc == 0 {
+                self.count_window.started_tsc = captured_at;
             }
             self.compilation.finish_deferred_frame(
                 compilation,
@@ -2297,7 +2328,7 @@ impl EncoderPerfState {
                 ),
                 clock_scale::scale_ticks(sample.enc.op_cycles, hz, 1_000_000_000),
             );
-            self.perf_window.accumulate(&sample);
+            self.fold(&sample);
         }
     }
 
@@ -2695,13 +2726,7 @@ impl EncoderPerfState {
         self.enc.slot_waits = 0;
         self.enc.gpu_cycles = [0; CommandBufferRole::COUNT];
         self.enc.gpu_buffers = [0; CommandBufferRole::COUNT];
-        if !self.frame_timed {
-            // An untimed frame read no phase clock: the window folds the
-            // timed frames alone, so this one's compile rows and submit
-            // timings go with it.
-            let _ = self.compilation.defer_frame();
-            self.submit_nanos = deferred::SubmitNanos::default();
-        } else if let Some(clocked) = &mut self.clocked {
+        if let Some(clocked) = &mut self.clocked {
             clocked.push(deferred::PendingSample {
                 sample,
                 compilation: self.compilation.defer_frame(),
@@ -2722,11 +2747,11 @@ impl EncoderPerfState {
                 compilation::cycles_to_ns(self.enc.op_sub_cycles[OpSub::Pipeline as usize]),
                 compilation::cycles_to_ns(self.enc.op_cycles),
             );
-            self.perf_window.accumulate(&sample);
+            self.fold(&sample);
         }
 
-        let window_cycles = rdtsc().saturating_sub(self.perf_window.started_tsc);
-        if self.perf_window.frames == 0 || window_cycles < secs_to_cycles(SUMMARY_INTERVAL_SECS) {
+        let window_cycles = rdtsc().saturating_sub(self.count_window.started_tsc);
+        if self.count_window.frames == 0 || window_cycles < secs_to_cycles(SUMMARY_INTERVAL_SECS) {
             return;
         }
 
@@ -2735,7 +2760,7 @@ impl EncoderPerfState {
         // the first sample has no baseline and measures nothing.
         if let Some(faults) = task_faults {
             if self.prev_minor_faults != 0 {
-                self.perf_window.faults_window = Some(TaskFaults {
+                self.count_window.faults_window = Some(TaskFaults {
                     minor: faults.minor.saturating_sub(self.prev_minor_faults),
                     major: faults.major.saturating_sub(self.prev_major_faults),
                 });
@@ -2746,11 +2771,15 @@ impl EncoderPerfState {
 
         if want_stats {
             let window_secs = cycles_to_ms(window_cycles) / 1e3;
-            let mut rendered = Summary::render(&self.perf_window, caches, window_secs);
-            let mut kv = render_kv(&self.perf_window, caches, window_secs);
+            let mut rendered =
+                Summary::render(&self.perf_window, &self.count_window, caches, window_secs);
+            let mut kv = render_kv(&self.perf_window, &self.count_window, caches, window_secs);
             self.compilation.append_kv(&mut kv);
-            self.compilation
-                .append_window(&mut rendered, self.perf_window.frames);
+            self.compilation.append_window(
+                &mut rendered,
+                self.count_window.frames,
+                self.perf_window.frames,
+            );
             info!(target: LOG_TARGET, "encoder={:?} {rendered}", std::thread::current().id());
             info!(target: LOG_TARGET, "{}", kv.finish());
         }
@@ -2849,6 +2878,15 @@ impl EncoderPerfState {
         }
 
         self.perf_window.reset();
+        self.count_window.reset();
+    }
+
+    /// Fold a frame's sample: its counts into the count window, its timers if it was timed.
+    fn fold(&mut self, sample: &FrameSample) {
+        self.count_window.accumulate(sample);
+        if sample.counters.timed != 0 {
+            self.perf_window.accumulate(sample);
+        }
     }
 }
 
@@ -3921,10 +3959,16 @@ impl Bottleneck {
 /// `cargo test -p mtld3d-core --target x86_64-apple-darwin`.
 #[cfg(perf_tracking)]
 struct Summary<'a> {
+    /// The timed frames: every timer row and the ratios built on it.
     w: &'a PerfWindow,
+    /// Every frame: the count, gauge and fault sections.
+    c: &'a PerfWindow,
     caches: &'a CacheSizes,
     window_secs: f64,
+    /// The timed frames, at least 1: the divisor of the timer rows.
     frames: u32,
+    /// Every frame, at least 1: the divisor of the per-frame counts and gauges.
+    all_frames: u32,
     s: Style,
 }
 
@@ -4171,21 +4215,40 @@ fn write_row(out: &mut String, s: &Style, row: &Row<'_>) {
 
 #[cfg(perf_tracking)]
 impl<'a> Summary<'a> {
-    fn render(w: &'a PerfWindow, caches: &'a CacheSizes, window_secs: f64) -> String {
-        Self::render_with_ansi(w, caches, window_secs, ansi_enabled())
+    fn render(
+        w: &'a PerfWindow,
+        c: &'a PerfWindow,
+        caches: &'a CacheSizes,
+        window_secs: f64,
+    ) -> String {
+        Self::render_windows(w, c, caches, window_secs, ansi_enabled())
     }
 
+    /// Render one window as both the timed and the count window, as the unit tests do.
+    #[cfg(test)]
     fn render_with_ansi(
         w: &'a PerfWindow,
         caches: &'a CacheSizes,
         window_secs: f64,
         ansi: bool,
     ) -> String {
+        Self::render_windows(w, w, caches, window_secs, ansi)
+    }
+
+    fn render_windows(
+        w: &'a PerfWindow,
+        c: &'a PerfWindow,
+        caches: &'a CacheSizes,
+        window_secs: f64,
+        ansi: bool,
+    ) -> String {
         let this = Self {
             w,
+            c,
             caches,
             window_secs,
             frames: w.frames.max(1),
+            all_frames: c.frames.max(1),
             s: Style::from_flag(ansi),
         };
         this.build()
@@ -4266,16 +4329,17 @@ impl<'a> Summary<'a> {
         let s = &self.s;
         let _ = writeln!(
             out,
-            "{b}── perf  window={wsec:.2}s  frames={frames}  bottleneck={c}{label}{r}{b} ──{r}",
+            "{b}── perf  window={wsec:.2}s  frames={frames}  timed={timed}  bottleneck={c}{label}{r}{b} ──{r}",
             b = s.bold,
             r = s.reset,
             c = bn.color(s),
             wsec = self.window_secs,
-            frames = self.w.frames,
+            frames = self.c.frames,
+            timed = self.w.frames,
             label = bn.label(),
         );
         if let (Some(first), Some(last)) =
-            (self.w.inverse_epochs.first(), self.w.inverse_epochs.last())
+            (self.c.inverse_epochs.first(), self.c.inverse_epochs.last())
         {
             let _ = writeln!(
                 out,
@@ -4288,7 +4352,7 @@ impl<'a> Summary<'a> {
     fn write_inverse_view(&self, out: &mut String) {
         use mtld3d_shared::tsc::u64_to_f64_exact;
 
-        for epoch in &self.w.inverse_epochs {
+        for epoch in &self.c.inverse_epochs {
             let [bypass, hit, recompute] = epoch.counts;
             let enabled = hit.checked_add(recompute);
             let builds = enabled.and_then(|n| n.checked_add(bypass));
@@ -5276,9 +5340,9 @@ impl<'a> Summary<'a> {
 
     fn write_resources_vbib(&self, out: &mut String) {
         use mtld3d_shared::tsc::u64_to_f64_exact;
-        let w = self.w;
+        let w = self.c;
         let s = &self.s;
-        let f = f64::from(self.frames);
+        let f = f64::from(self.all_frames);
         let vbib_ret_depth = u64_to_f64_exact(w.vbib_retention_depth.sum) / f;
         let vbib_ret_kb = u64_to_f64_exact(w.vbib_retained_bytes.sum) / f / 1024.0;
         let vbib_ret_peak_kb = u64_to_f64_exact(w.vbib_retained_bytes.max) / 1024.0;
@@ -5466,9 +5530,9 @@ impl<'a> Summary<'a> {
 
     fn write_resources_textures(&self, out: &mut String) {
         use mtld3d_shared::tsc::u64_to_f64_exact;
-        let w = self.w;
+        let w = self.c;
         let s = &self.s;
-        let f = f64::from(self.frames);
+        let f = f64::from(self.all_frames);
         let blit_ret = u64_to_f64_exact(w.pending_blit_retention_depth.sum) / f;
         let tex_ret_kb = u64_to_f64_exact(w.tex_staging_retained_bytes.sum) / f / 1024.0;
         let tex_ret_peak_kb = u64_to_f64_exact(w.tex_staging_retained_bytes.max) / 1024.0;
@@ -5685,7 +5749,7 @@ impl<'a> Summary<'a> {
 
     fn write_commands_passes(&self, out: &mut String) {
         use mtld3d_shared::tsc::u64_to_f64_exact;
-        let w = self.w;
+        let w = self.c;
         let s = &self.s;
         let _ = writeln!(out);
         let _ = writeln!(
@@ -5759,7 +5823,7 @@ impl<'a> Summary<'a> {
             "SetVsConst",
             "SetPsConst",
         ];
-        let w = self.w;
+        let w = self.c;
         let s = &self.s;
         let _ = writeln!(out);
         let _ = writeln!(
@@ -5790,7 +5854,7 @@ impl<'a> Summary<'a> {
     /// section, and for the six sections `keys` times, ns per rebuild.
     fn write_snapshot_rebuilds(&self, out: &mut String) {
         use mtld3d_shared::tsc::u64_to_f64_exact;
-        let w = self.w;
+        let w = self.c;
         let s = &self.s;
         let calls = w.device_sub_calls_by[DeviceSubCategory::Draws as usize].sum;
         let pct = |n: u64| {
@@ -5836,9 +5900,9 @@ impl<'a> Summary<'a> {
 
     fn write_alloc_footprint(&self, out: &mut String) {
         use mtld3d_shared::tsc::u64_to_f64_exact;
-        let w = self.w;
+        let w = self.c;
         let s = &self.s;
-        let f = f64::from(self.frames);
+        let f = f64::from(self.all_frames);
         let _ = writeln!(out);
         let _ = writeln!(
             out,
@@ -5991,23 +6055,34 @@ impl<'a> Summary<'a> {
 #[cfg(perf_tracking)]
 struct KvLine {
     out: String,
-    /// The window's frame count as a divisor, at least 1.
+    /// Every frame of the window, at least 1: the divisor of the all-frame times.
     frames: f64,
+    /// The timed frames of the window, at least 1: the divisor of the timer rows.
+    timed: f64,
 }
 
 #[cfg(perf_tracking)]
 impl KvLine {
-    fn new(window_secs: f64, frames: u32) -> Self {
+    fn new(window_secs: f64, frames: u32, timed_frames: u32) -> Self {
         let mut out = String::with_capacity(8192);
-        let _ = write!(out, "perf-kv v1 window_s={window_secs:.3} frames={frames}");
+        let _ = write!(
+            out,
+            "perf-kv v1 window_s={window_secs:.3} frames={frames} timed_frames={timed_frames}"
+        );
         Self {
             out,
             frames: f64::from(frames.max(1)),
+            timed: f64::from(timed_frames.max(1)),
         }
     }
 
-    /// `<base>_ms`: a window total in milliseconds, averaged per frame.
+    /// `<base>_ms`: a timer's window total in milliseconds, per timed frame.
     fn per_frame_ms(&mut self, base: impl Display, window_ms: f64) {
+        let _ = write!(self.out, " {base}_ms={:.3}", window_ms / self.timed);
+    }
+
+    /// `<base>_ms`: a window total in milliseconds measured in every frame, per frame.
+    fn per_any_frame_ms(&mut self, base: impl Display, window_ms: f64) {
         let _ = write!(self.out, " {base}_ms={:.3}", window_ms / self.frames);
     }
 
@@ -6048,14 +6123,15 @@ impl KvLine {
     }
 }
 
-/// Render the grid's window as a `perf-kv v1` line, compilation keys excluded.
+/// Render the grid's windows as a `perf-kv v1` line, compilation keys excluded.
 ///
-/// Reads the same [`PerfWindow`] and [`CacheSizes`] the grid renders, and
+/// The timer keys come from the timed frames (`w`), the counts, gauges and
+/// faults from every frame (`c`). Reads the same windows and [`CacheSizes`] the grid renders, and
 /// the same derived sums, so the two outputs never disagree about what a
 /// window measured. The caller appends the compilation keys before the
 /// compilation window is cleared.
 #[cfg(perf_tracking)]
-fn render_kv(w: &PerfWindow, caches: &CacheSizes, window_secs: f64) -> KvLine {
+fn render_kv(w: &PerfWindow, c: &PerfWindow, caches: &CacheSizes, window_secs: f64) -> KvLine {
     const API: [(ApiCategory, &str); ApiCategory::COUNT] = [
         (ApiCategory::Device, "api_device"),
         (ApiCategory::VertexBuffer, "api_vertex_buffer"),
@@ -6130,7 +6206,7 @@ fn render_kv(w: &PerfWindow, caches: &CacheSizes, window_secs: f64) -> KvLine {
         (KeysGate::SetPsConst, "keys_set_ps_const"),
     ];
 
-    let mut kv = KvLine::new(window_secs, w.frames);
+    let mut kv = KvLine::new(window_secs, c.frames, w.frames);
 
     // The `buckets:` line, plus the frame it divides.
     kv.cycles("frame", &w.frame_total);
@@ -6151,13 +6227,13 @@ fn render_kv(w: &PerfWindow, caches: &CacheSizes, window_secs: f64) -> KvLine {
     for (category, base) in API {
         let i = category as usize;
         kv.cycles(base, &w.api_by[i]);
-        kv.total(format_args!("{base}_calls"), w.calls_by[i].sum);
+        kv.total(format_args!("{base}_calls"), c.calls_by[i].sum);
     }
     kv.cycles("query_wait", &w.query_wait);
     for (sub, base) in DEVICE {
         let i = sub as usize;
         kv.cycles(base, &w.device_sub_by[i]);
-        kv.total(format_args!("{base}_calls"), w.device_sub_calls_by[i].sum);
+        kv.total(format_args!("{base}_calls"), c.device_sub_calls_by[i].sum);
     }
     kv.cycles("present_stall", &w.present_block);
     kv.per_frame_ms("dev_frame_other", cycles_to_ms(w.frame_other_sum()));
@@ -6191,30 +6267,30 @@ fn render_kv(w: &PerfWindow, caches: &CacheSizes, window_secs: f64) -> KvLine {
         "draw_snapshot_keys_resid",
         cycles_to_ms(w.draw_snapshot_keys_leftover.max),
     );
-    kv.total("draw_snapshot_rebuild_draws", w.snapshot_rebuild_draws.sum);
-    kv.total("draw_snapshot_sampled_draws", w.snapshot_sampled_draws.sum);
+    kv.total("draw_snapshot_rebuild_draws", c.snapshot_rebuild_draws.sum);
+    kv.total("draw_snapshot_sampled_draws", c.snapshot_sampled_draws.sum);
     for (slot, ..) in KEYS_SECTIONS {
         kv.total(
             format_args!("draw_snapshot_sampled_rebuild_{}", section_stem(slot)),
-            w.snapshot_sampled_rebuilds_by[slot].sum,
+            c.snapshot_sampled_rebuilds_by[slot].sum,
         );
     }
     for (slot, stem, _) in SNAPSHOT_SECTIONS {
         kv.total(
             format_args!("draw_snapshot_rebuild_{stem}"),
-            w.snapshot_rebuilds_by[slot].sum,
+            c.snapshot_rebuilds_by[slot].sum,
         );
     }
     kv.cycles("draw_push_op", &w.draw_push_op);
     for (sub, base) in BIND {
         let i = sub as usize;
         kv.cycles(base, &w.bind_sub_by[i]);
-        kv.total(format_args!("{base}_calls"), w.bind_sub_calls_by[i].sum);
+        kv.total(format_args!("{base}_calls"), c.bind_sub_calls_by[i].sum);
     }
     for (sub, base) in SURFACE {
         let i = sub as usize;
         kv.cycles(base, &w.surface_sub_by[i]);
-        kv.total(format_args!("{base}_calls"), w.surface_sub_calls_by[i].sum);
+        kv.total(format_args!("{base}_calls"), c.surface_sub_calls_by[i].sum);
     }
 
     // Encoder thread.
@@ -6250,65 +6326,65 @@ fn render_kv(w: &PerfWindow, caches: &CacheSizes, window_secs: f64) -> KvLine {
     kv.per_frame_ms("submit_resid", cycles_to_ms(w.submit_resid_sum()));
     kv.peak_ms("submit_resid", cycles_to_ms(w.submit_resid.max));
     kv.cycles("present_wait", &w.present_wait);
-    kv.total("snapshots", w.snapshots.sum);
-    kv.total("slot_waits", w.slot_waits.sum);
+    kv.total("snapshots", c.snapshots.sum);
+    kv.total("slot_waits", c.slot_waits.sum);
 
     // GPU time per command-buffer role: no peak, a report is not one frame.
     kv.per_frame_ms("gpu", cycles_to_ms(w.gpu_sum()));
     for (role, base) in GPU {
         let i = role as usize;
         kv.per_frame_ms(base, cycles_to_ms(w.gpu[i].sum));
-        kv.total(format_args!("{base}_cbs"), w.gpu_buffers[i].sum);
+        kv.total(format_args!("{base}_cbs"), c.gpu_buffers[i].sum);
     }
 
     // Resources (VB/IB).
-    kv.total("vb_rename", w.vb_rename.sum);
-    kv.total("ib_rename", w.ib_rename.sum);
-    kv.total("vb_discard", w.vb_discards.sum);
-    kv.total("ib_discard", w.ib_discards.sum);
-    kv.total("vbib_preserve_cpu", w.vbib_preserve_cpu.sum);
-    kv.total("vbib_rename_bytes", w.vbib_rename_bytes.sum);
-    kv.total("vbib_in_place", w.vbib_write_in_place_contended.sum);
-    kv.total("vbib_staging_uploads", w.vbib_staging_uploads.sum);
-    kv.total("vbib_reorder", w.vbib_mid_pass_reorders.sum);
-    kv.total("vbib_full_skip", w.vbib_full_upload_skips.sum);
-    kv.total("vbib_full_skip_bytes", w.vbib_full_upload_skip_bytes.sum);
-    if let Some(copies) = w.vbib_gpu_copies() {
+    kv.total("vb_rename", c.vb_rename.sum);
+    kv.total("ib_rename", c.ib_rename.sum);
+    kv.total("vb_discard", c.vb_discards.sum);
+    kv.total("ib_discard", c.ib_discards.sum);
+    kv.total("vbib_preserve_cpu", c.vbib_preserve_cpu.sum);
+    kv.total("vbib_rename_bytes", c.vbib_rename_bytes.sum);
+    kv.total("vbib_in_place", c.vbib_write_in_place_contended.sum);
+    kv.total("vbib_staging_uploads", c.vbib_staging_uploads.sum);
+    kv.total("vbib_reorder", c.vbib_mid_pass_reorders.sum);
+    kv.total("vbib_full_skip", c.vbib_full_upload_skips.sum);
+    kv.total("vbib_full_skip_bytes", c.vbib_full_upload_skip_bytes.sum);
+    if let Some(copies) = c.vbib_gpu_copies() {
         kv.total("vbib_gpu_copy", copies);
     }
-    kv.total("vbib_gpu_copy_bytes", w.vbib_preserve_gpu_bytes.sum);
-    kv.total("vbib_alloc_fail", w.vbib_reorder_alloc_failures.sum);
-    kv.total("vbib_destroy", w.buffer_destroys.sum);
-    kv.total("vbib_ret_cap_drain", w.retention_cap_drain.sum);
-    kv.total("vbib_ret_cap_submit", w.retention_cap_submit.sum);
-    kv.count("vbib_retention_peak", w.vbib_retention_depth.max);
-    kv.bytes("vbib_retained", w.vbib_retained_bytes.max);
-    kv.total("vbib_pool_hit", w.vbib_pool_hits.sum);
-    kv.total("vbib_pool_miss", w.vbib_pool_misses.sum);
-    kv.total("pagebox_pool_recycled", w.pagebox_pool_recycled.sum);
+    kv.total("vbib_gpu_copy_bytes", c.vbib_preserve_gpu_bytes.sum);
+    kv.total("vbib_alloc_fail", c.vbib_reorder_alloc_failures.sum);
+    kv.total("vbib_destroy", c.buffer_destroys.sum);
+    kv.total("vbib_ret_cap_drain", c.retention_cap_drain.sum);
+    kv.total("vbib_ret_cap_submit", c.retention_cap_submit.sum);
+    kv.count("vbib_retention_peak", c.vbib_retention_depth.max);
+    kv.bytes("vbib_retained", c.vbib_retained_bytes.max);
+    kv.total("vbib_pool_hit", c.vbib_pool_hits.sum);
+    kv.total("vbib_pool_miss", c.vbib_pool_misses.sum);
+    kv.total("pagebox_pool_recycled", c.pagebox_pool_recycled.sum);
     kv.total(
         "pagebox_pool_recycled_bytes",
-        w.pagebox_pool_recycled_bytes.sum,
+        c.pagebox_pool_recycled_bytes.sum,
     );
-    kv.bytes("pagebox_pool_parked", w.pagebox_pool_bytes.max);
+    kv.bytes("pagebox_pool_parked", c.pagebox_pool_bytes.max);
 
     // Resources (textures).
-    kv.total("tex_rename", w.texture_renames.sum);
-    kv.total("tex_discard", w.texture_discards.sum);
-    kv.total("tex_pool_hit", w.texture_pool_hits.sum);
-    kv.total("tex_pool_miss", w.texture_pool_misses.sum);
-    kv.total("tex_preserve_cpu", w.texture_preserve_cpu.sum);
-    kv.total("tex_in_place", w.texture_write_in_place_contended.sum);
-    kv.total("tex_uploads", w.texture_blit_uploads.sum);
-    kv.total("tex_uploads_raw", w.raw_texture_uploads());
-    kv.total("tex_uploads_padded", w.texture_blit_padded_uploads.sum);
-    kv.total("tex_uploads_pass", w.texture_expand_uploads.sum);
-    kv.total("tex_reorder", w.texture_gpu_renames.sum);
-    kv.total("tex_destroy", w.texture_destroys.sum);
-    kv.count("tex_retention_peak", w.pending_blit_retention_depth.max);
-    kv.bytes("tex_staging_retained", w.tex_staging_retained_bytes.max);
-    kv.total("tex_dirtyrect_calls", w.texture_add_dirty_calls.sum);
-    kv.total("tex_dirtyrect_partial", w.texture_add_dirty_partial.sum);
+    kv.total("tex_rename", c.texture_renames.sum);
+    kv.total("tex_discard", c.texture_discards.sum);
+    kv.total("tex_pool_hit", c.texture_pool_hits.sum);
+    kv.total("tex_pool_miss", c.texture_pool_misses.sum);
+    kv.total("tex_preserve_cpu", c.texture_preserve_cpu.sum);
+    kv.total("tex_in_place", c.texture_write_in_place_contended.sum);
+    kv.total("tex_uploads", c.texture_blit_uploads.sum);
+    kv.total("tex_uploads_raw", c.raw_texture_uploads());
+    kv.total("tex_uploads_padded", c.texture_blit_padded_uploads.sum);
+    kv.total("tex_uploads_pass", c.texture_expand_uploads.sum);
+    kv.total("tex_reorder", c.texture_gpu_renames.sum);
+    kv.total("tex_destroy", c.texture_destroys.sum);
+    kv.count("tex_retention_peak", c.pending_blit_retention_depth.max);
+    kv.bytes("tex_staging_retained", c.tex_staging_retained_bytes.max);
+    kv.total("tex_dirtyrect_calls", c.texture_add_dirty_calls.sum);
+    kv.total("tex_dirtyrect_partial", c.texture_add_dirty_partial.sum);
 
     // Caches, at summary emit.
     let widen = |len: usize| u64::try_from(len).unwrap_or(u64::MAX);
@@ -6320,25 +6396,25 @@ fn render_kv(w: &PerfWindow, caches: &CacheSizes, window_secs: f64) -> KvLine {
     kv.count("cache_depth_states", widen(caches.depth_states));
 
     // Commands / passes and the per-draw slow paths.
-    kv.total("passes", w.passes.sum);
-    kv.total("commands", w.commands.sum);
-    kv.total("draws", w.draws.sum);
-    kv.total("pipeline_memo_hits", w.pipeline_memo_hits.sum);
-    kv.total("pipeline_memo_calls", w.pipeline_memo_calls.sum);
-    kv.total("fan_generated", w.fan_generated.sum);
-    kv.total("up_indexed", w.up_indexed.sum);
-    kv.total("up_oversized", w.up_vertex_oversized.sum);
+    kv.total("passes", c.passes.sum);
+    kv.total("commands", c.commands.sum);
+    kv.total("draws", c.draws.sum);
+    kv.total("pipeline_memo_hits", c.pipeline_memo_hits.sum);
+    kv.total("pipeline_memo_calls", c.pipeline_memo_calls.sum);
+    kv.total("fan_generated", c.fan_generated.sum);
+    kv.total("up_indexed", c.up_indexed.sum);
+    kv.total("up_oversized", c.up_vertex_oversized.sum);
 
     // Keys gating.
     for (gate, base) in KEYS {
         let i = gate as usize;
-        kv.total(format_args!("{base}_calls"), w.keys_gate_calls_by[i].sum);
-        kv.total(format_args!("{base}_skips"), w.keys_gate_skips_by[i].sum);
+        kv.total(format_args!("{base}_calls"), c.keys_gate_calls_by[i].sum);
+        kv.total(format_args!("{base}_skips"), c.keys_gate_skips_by[i].sum);
     }
 
     // Inverse-view outcomes, summed over the window's reset epochs.
     let mut inverse = [0u64; 3];
-    for epoch in &w.inverse_epochs {
+    for epoch in &c.inverse_epochs {
         for (total, count) in inverse.iter_mut().zip(epoch.counts) {
             *total = total.saturating_add(count);
         }
@@ -6349,19 +6425,19 @@ fn render_kv(w: &PerfWindow, caches: &CacheSizes, window_secs: f64) -> KvLine {
     kv.total("inverse_recompute", recompute);
 
     // Per-frame allocator footprint.
-    kv.count("scratch_small_peak", w.scratch_small_blocks.max);
-    kv.count("scratch_oversized_peak", w.scratch_oversized_blocks.max);
-    kv.bytes("scratch", w.scratch_bytes.max);
-    kv.bytes("op_vec_capacity", w.op_vec_capacity_bytes.max);
-    kv.total("op_vec_realloc_bytes", w.op_vec_realloc_bytes.sum);
-    kv.bytes("cmd_vec_capacity", w.cmd_vec_capacity_bytes.max);
-    kv.total("cmd_vec_realloc_bytes", w.cmd_vec_realloc_bytes.sum);
-    kv.total("pagebox_alloc", w.pagebox_allocs.sum);
-    kv.total("pagebox_alloc_bytes", w.pagebox_alloc_bytes.sum);
-    kv.total("pagebox_free", w.pagebox_frees.sum);
-    kv.total("pagebox_free_bytes", w.pagebox_free_bytes.sum);
-    kv.total("pagebox_uncached", w.pagebox_uncached_allocs.sum);
-    if let Some(faults) = &w.faults_window {
+    kv.count("scratch_small_peak", c.scratch_small_blocks.max);
+    kv.count("scratch_oversized_peak", c.scratch_oversized_blocks.max);
+    kv.bytes("scratch", c.scratch_bytes.max);
+    kv.bytes("op_vec_capacity", c.op_vec_capacity_bytes.max);
+    kv.total("op_vec_realloc_bytes", c.op_vec_realloc_bytes.sum);
+    kv.bytes("cmd_vec_capacity", c.cmd_vec_capacity_bytes.max);
+    kv.total("cmd_vec_realloc_bytes", c.cmd_vec_realloc_bytes.sum);
+    kv.total("pagebox_alloc", c.pagebox_allocs.sum);
+    kv.total("pagebox_alloc_bytes", c.pagebox_alloc_bytes.sum);
+    kv.total("pagebox_free", c.pagebox_frees.sum);
+    kv.total("pagebox_free_bytes", c.pagebox_free_bytes.sum);
+    kv.total("pagebox_uncached", c.pagebox_uncached_allocs.sum);
+    if let Some(faults) = &c.faults_window {
         kv.total("faults_minor", faults.minor);
         kv.total("faults_major", faults.major);
     }

@@ -1617,7 +1617,9 @@ impl DeviceInner {
         // share the recycled frame arena.
         let op_vec_capacity_bytes = frame.op_vec_capacity_bytes();
         let op_vec_realloc_bytes = frame.take_op_vec_realloc_bytes();
-        self.perf.state_mut().drain_into_payload(frame.perf_mut());
+        self.perf
+            .state_mut()
+            .drain_into_payload(frame.perf_mut(), !no_present);
         frame
             .perf_mut()
             .set_op_vec_metrics(op_vec_capacity_bytes, op_vec_realloc_bytes);

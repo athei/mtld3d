@@ -1524,7 +1524,8 @@ impl Metrics {
     /// - `_peak_ms`, the worst frame: `perf.<key>` in ms, `info`, the largest
     ///   of the windows.
     /// - `_ms`, a per-frame average: `perf.<key>` in ms, `time`, the windows'
-    ///   mean weighted by their frames. `_avg_ms`, an average per event, is
+    ///   mean weighted by their frames, the timed ones where the line names
+    ///   them (`timed_frames`). `_avg_ms`, an average per event, is
     ///   weighted by the event's count where the line carries it
     ///   (`comp_async_latency_avg_ms` by `comp_async_installs_total`) and by
     ///   frames otherwise.
@@ -1581,8 +1582,11 @@ impl Metrics {
                     .find_map(|&(key, value)| (key == wanted).then_some(value))
             };
             let frames = find("frames").unwrap_or(0.0);
+            // A layer that times one frame in several reports its timer
+            // rows per timed frame, so those weigh by its timed frames.
+            let timed = find("timed_frames").unwrap_or(frames);
             for &(key, value) in &pairs {
-                if key == "window_s" || key == "frames" {
+                if key == "window_s" || key == "frames" || key == "timed_frames" {
                     continue;
                 }
                 let Some(rule) = perf_rule(key, work) else {
@@ -1590,7 +1594,8 @@ impl Metrics {
                 };
                 let weight = match rule.fold {
                     Fold::EventMean(events) => find(events).unwrap_or(0.0),
-                    Fold::FrameMean | Fold::Max | Fold::PerFrame => frames,
+                    Fold::FrameMean => timed,
+                    Fold::Max | Fold::PerFrame => frames,
                 };
                 folds
                     .entry(key)

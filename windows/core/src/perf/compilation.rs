@@ -377,9 +377,17 @@ impl CompilationPerf {
     #[cfg(perf_tracking)]
     pub(super) fn append_kv(&self, kv: &mut super::KvLine) {
         for ((index, base), metric) in Kind::KEYS.iter().enumerate().zip(&self.window) {
-            kv.per_frame_ms(base, ms(metric.ns));
+            let remainder =
+                index == Kind::ResolveOther as usize || index == Kind::PipelineOther as usize;
+            if remainder {
+                // Computed from the encoder's resolve and pipeline phases,
+                // which run their timers in the timed frames only.
+                kv.per_frame_ms(base, ms(metric.ns));
+            } else {
+                kv.per_any_frame_ms(base, ms(metric.ns));
+            }
             kv.peak_ms(base, ms(metric.peak_ns));
-            if index != Kind::ResolveOther as usize && index != Kind::PipelineOther as usize {
+            if !remainder {
                 kv.total(format_args!("{base}_calls"), metric.calls);
                 kv.total(format_args!("{base}_failed"), metric.failures);
             }
@@ -396,15 +404,18 @@ impl CompilationPerf {
         kv.peak_ms("comp_async_latency", ms(metrics.latency_peak_ns));
         kv.total("comp_async_deferred_draws", metrics.deferred);
         kv.total("comp_async_urgent_waits", metrics.urgent_waits);
-        kv.per_frame_ms("comp_async_urgent_wait", ms(metrics.urgent_wait_ns));
+        kv.per_any_frame_ms("comp_async_urgent_wait", ms(metrics.urgent_wait_ns));
         kv.total("comp_async_stolen", metrics.stolen);
         kv.total("comp_async_misses", metrics.misses);
-        kv.per_frame_ms("comp_async_miss", ms(metrics.miss_ns));
+        kv.per_any_frame_ms("comp_async_miss", ms(metrics.miss_ns));
     }
 
     /// Render once with the existing PERF summary, then clear the window.
+    ///
+    /// `frames` is every frame of the window, `timed_frames` the frames that
+    /// ran their timers, the divisor of the two remainder rows.
     #[cfg(perf_tracking)]
-    pub fn append_window(&mut self, output: &mut String, frames: u32) {
+    pub fn append_window(&mut self, output: &mut String, frames: u32, timed_frames: u32) {
         if self.window.iter().all(|metric| metric.calls == 0) && self.asynchronous.is_idle() {
             self.window = [const { Metric::new() }; Kind::COUNT];
             self.slow.clear();
@@ -415,7 +426,7 @@ impl CompilationPerf {
             output,
             "\nCompilation (worker time for asynchronous builds; nested rows are not additive)"
         );
-        self.write_metrics(output, frames.max(1));
+        self.write_metrics(output, frames.max(1), timed_frames.max(1));
         self.write_slow(output);
         self.asynchronous.write(output);
         self.window = [const { Metric::new() }; Kind::COUNT];
@@ -464,12 +475,18 @@ impl CompilationPerf {
     }
 
     #[cfg(perf_tracking)]
-    fn write_metrics(&self, output: &mut String, frames: u32) {
-        for (label, metric) in Kind::LABELS.iter().zip(&self.window) {
+    fn write_metrics(&self, output: &mut String, frames: u32, timed_frames: u32) {
+        for (index, (label, metric)) in Kind::LABELS.iter().zip(&self.window).enumerate() {
+            let divisor =
+                if index == Kind::ResolveOther as usize || index == Kind::PipelineOther as usize {
+                    timed_frames
+                } else {
+                    frames
+                };
             let _ = writeln!(
                 output,
                 "  {label:<20} {:>7.3} ms/frame  peak/frame {:>7.3} ms  total {:>9.3} ms  calls={:<5} failed={}",
-                ms(metric.ns) / f64::from(frames),
+                ms(metric.ns) / f64::from(divisor),
                 ms(metric.peak_ns),
                 ms(metric.ns),
                 metric.calls,
