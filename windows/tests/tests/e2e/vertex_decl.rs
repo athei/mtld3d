@@ -3,13 +3,17 @@
 //! Create, bind, drive a fixed-function draw, and read the bound
 //! declaration back; a declaration split across two streams, including a
 //! stream nothing is bound to; `SetFVF` of the FVF already set binding its
-//! declaration again after another one replaced it.
+//! declaration again after another one replaced it; the declaration `SetFVF`
+//! built keeping its FVF when bound through `SetVertexDeclaration`.
 
-use mtld3d_tests::{Harness, PosColorVertex, PosVertex, VertexDeclaration};
+use mtld3d_tests::{Harness, LitVertex, PosColorVertex, PosVertex, VertexDeclaration};
 use mtld3d_types::{
-    D3D_OK, D3DDECL_END_STREAM, D3DDECLTYPE_D3DCOLOR, D3DDECLTYPE_FLOAT3, D3DDECLTYPE_UNUSED,
-    D3DDECLUSAGE_COLOR, D3DDECLUSAGE_NORMAL, D3DDECLUSAGE_POSITION, D3DFVF_DIFFUSE, D3DFVF_XYZ,
-    D3DPOOL_DEFAULT, D3DPT_TRIANGLELIST, D3DRS_LIGHTING, D3DUSAGE_WRITEONLY, D3DVERTEXELEMENT9,
+    D3D_OK, D3DCOLORVALUE, D3DCULL_NONE, D3DDECL_END_STREAM, D3DDECLTYPE_D3DCOLOR,
+    D3DDECLTYPE_FLOAT3, D3DDECLTYPE_UNUSED, D3DDECLUSAGE_COLOR, D3DDECLUSAGE_NORMAL,
+    D3DDECLUSAGE_POSITION, D3DFVF_DIFFUSE, D3DFVF_NORMAL, D3DFVF_XYZ, D3DLIGHT_DIRECTIONAL,
+    D3DLIGHT9, D3DMATERIAL9, D3DMCS_COLOR1, D3DPOOL_DEFAULT, D3DPT_TRIANGLELIST,
+    D3DPT_TRIANGLESTRIP, D3DRS_COLORVERTEX, D3DRS_CULLMODE, D3DRS_DIFFUSEMATERIALSOURCE,
+    D3DRS_LIGHTING, D3DUSAGE_WRITEONLY, D3DVECTOR, D3DVERTEXELEMENT9,
 };
 
 /// POSITION float3 on stream 0, COLOR d3dcolor on stream 1.
@@ -435,4 +439,96 @@ fn set_fvf_rebinds_its_declaration_after_a_recorded_block_bound_another() {
         0xFF00_FF00,
         "the draw reads the diffuse the FVF declares"
     );
+}
+
+/// A lit quad facing the viewer, centred on `x` in clip space, with no diffuse.
+fn lit_quad_at(x: f32) -> [LitVertex; 4] {
+    [(-0.2, 0.2), (-0.2, -0.2), (0.2, 0.2), (0.2, -0.2)].map(|(dx, dy)| LitVertex {
+        x: x + dx,
+        y: dy,
+        z: 0.5,
+        nx: 0.0,
+        ny: 0.0,
+        nz: -1.0,
+    })
+}
+
+/// The FVF's own declaration bound through `SetVertexDeclaration` keeps the FVF.
+///
+/// The FVF lacks a diffuse colour, so a COLORVERTEX diffuse source of COLOR1
+/// falls back to the red material, as it does for the FVF; `GetFVF` keeps
+/// reporting the FVF, in that frame and the next one.
+#[test]
+fn rebinding_an_fvf_declaration_through_set_vertex_declaration_keeps_the_fvf() {
+    const FVF: u32 = D3DFVF_XYZ | D3DFVF_NORMAL;
+    const RED: u32 = 0xFFFF_0000;
+    const BLUE: u32 = 0xFF00_00FF;
+
+    let h = Harness::new();
+    assert_eq!(h.set_render_state(D3DRS_LIGHTING, 1), 0, "lighting on");
+    assert_eq!(h.set_render_state(D3DRS_CULLMODE, D3DCULL_NONE), 0);
+    assert_eq!(h.set_render_state(D3DRS_COLORVERTEX, 1), 0, "COLORVERTEX");
+    assert_eq!(
+        h.set_render_state(D3DRS_DIFFUSEMATERIALSOURCE, D3DMCS_COLOR1),
+        0,
+        "diffuse from COLOR1"
+    );
+    let white = D3DCOLORVALUE {
+        r: 1.0,
+        g: 1.0,
+        b: 1.0,
+        a: 1.0,
+    };
+    let light = D3DLIGHT9 {
+        type_: D3DLIGHT_DIRECTIONAL,
+        diffuse: white,
+        direction: D3DVECTOR {
+            x: 0.0,
+            y: 0.0,
+            z: 1.0,
+        },
+        ..D3DLIGHT9::default()
+    };
+    assert_eq!(h.set_light(0, &light), 0, "SetLight");
+    assert_eq!(h.light_enable(0, true), 0, "LightEnable");
+    let material = D3DMATERIAL9 {
+        diffuse: D3DCOLORVALUE {
+            r: 1.0,
+            g: 0.0,
+            b: 0.0,
+            a: 1.0,
+        },
+        ..D3DMATERIAL9::default()
+    };
+    assert_eq!(h.set_material(&material), 0, "SetMaterial");
+    assert_eq!(h.clear_texture(0), 0, "no texture");
+    h.select_diffuse_stage(0);
+    assert_eq!(h.set_fvf(FVF), D3D_OK, "SetFVF");
+
+    let (left, middle, right) = (lit_quad_at(-0.6), lit_quad_at(0.0), lit_quad_at(0.6));
+    h.render_once(BLUE, |d| {
+        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLESTRIP, 2, &left), 0);
+        let implicit = VertexDeclaration::from_raw(d.vertex_declaration_raw());
+        assert_eq!(
+            d.set_vertex_declaration(&implicit),
+            D3D_OK,
+            "SetVertexDeclaration of the FVF's own declaration"
+        );
+        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLESTRIP, 2, &middle), 0);
+    });
+    assert_eq!(h.read_pixel(128, 240), RED, "the draw through SetFVF");
+    assert_eq!(
+        h.read_pixel(320, 240),
+        RED,
+        "the draw after rebinding the declaration in the same frame"
+    );
+    h.render_once(BLUE, |d| {
+        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLESTRIP, 2, &right), 0);
+    });
+    assert_eq!(
+        h.read_pixel(512, 240),
+        RED,
+        "the next frame's draw falls back to the material, as the FVF does"
+    );
+    assert_eq!(h.fvf(), FVF, "GetFVF after SetVertexDeclaration");
 }

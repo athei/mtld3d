@@ -1161,6 +1161,7 @@ impl DeviceInner {
         let Some(decl) = Direct3DVertexDeclaration9::new(&VertexDeclCreateInfo {
             device_inner,
             elements: &elements,
+            fvf,
         }) else {
             return core::ptr::null_mut();
         };
@@ -1190,9 +1191,10 @@ impl DeviceInner {
     /// Record the FVF and bind its implicit declaration as the current vertex
     /// declaration (the most-recent of `SetFVF` / `SetVertexDeclaration`
     /// wins). `fvf == 0` is a no-op on the binding, matching the driver.
-    /// Returns whether the bound declaration changed (callers gate snapshot
-    /// dirtying on this). A call that would change nothing returns before the
-    /// cache lookup (see [`Self::fvf_bind_is_redundant`]).
+    /// Returns whether the bound declaration or the FVF field changed
+    /// (callers gate snapshot dirtying on this: the draw layout reads both).
+    /// A call that would change nothing returns before the cache lookup (see
+    /// [`Self::fvf_bind_is_redundant`]).
     #[inline]
     pub fn bind_fvf_decl(&mut self, fvf: u32) -> bool {
         if fvf == 0 || self.fvf_bind_is_redundant(fvf) {
@@ -1225,13 +1227,14 @@ impl DeviceInner {
     #[inline(never)]
     fn bind_fvf_decl_uncached(&mut self, fvf: u32) -> bool {
         let decl = self.get_or_create_fvf_decl(fvf);
+        let fvf_changed = self.fvf != fvf;
         self.fvf = fvf;
         self.last_fvf_bind = if decl.is_null() {
             (0, core::ptr::null_mut())
         } else {
             (fvf, decl)
         };
-        self.replace_vertex_decl(decl)
+        self.replace_vertex_decl(decl) || fvf_changed
     }
 
     /// Release every vertex fetch slot's bound-texture refcount at device teardown.
@@ -12523,6 +12526,7 @@ extern "system" fn device_create_vertex_declaration(
     Direct3DVertexDeclaration9::new(&VertexDeclCreateInfo {
         device_inner: obj.inner_ptr(),
         elements: slice,
+        fvf: 0,
     })
     .map_or_else(
         || {
@@ -12561,11 +12565,19 @@ extern "system" fn device_set_vertex_declaration(this: *mut c_void, decl: *mut c
     // re-resolves to a byte-identical attrs slice (+ FfVsLayout), so
     // skip the expensive VDECL rebuild. VS_SOURCE/VS_CONST only matter
     // if FF VS bound (FF VS key reads ff_vs_layout).
-    let changed = dev.replace_vertex_decl(new);
-    // An explicitly-set declaration carries no FVF: GetFVF reports 0 until the
-    // next SetFVF re-establishes one. Mirrors the D3D9 runtime resetting the
-    // effective FVF when a declaration is bound directly.
-    dev.fvf = 0;
+    let decl_changed = dev.replace_vertex_decl(new);
+    // The FVF is the declaration's: the one `SetFVF` built for an FVF keeps
+    // reporting that FVF when it is bound here, and a declaration the game
+    // created reports 0 until the next SetFVF. The draw layout reads the FVF
+    // field as well as the declaration, so a change of either marks it.
+    let fvf = if new.is_null() {
+        0
+    } else {
+        // SAFETY: non-null checked; the slot adopted a ref above.
+        unsafe { (*new).inner().fvf() }
+    };
+    let changed = decl_changed || dev.fvf != fvf;
+    dev.fvf = fvf;
     if changed {
         // VS_SOURCE is marked unconditionally (not via `ff_aware_mask`, which
         // drops it for a programmable VS): a declaration change alters which VS
