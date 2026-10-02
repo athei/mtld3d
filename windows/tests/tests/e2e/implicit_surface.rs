@@ -352,6 +352,96 @@ fn read_only_lock_rect_on_a_non_lockable_backbuffer_reads_the_rendered_pixels() 
     );
 }
 
+/// A back-buffer lock is recorded, so a second lock and a `GetDC` wait for its unlock.
+///
+/// The lock maps a read-back page, and a second lock or a `GetDC` that
+/// succeeded would replace that page under the pointer the first lock handed
+/// out. D3D9 refuses both while the surface is mapped, for the read-only lock
+/// of a back buffer that is not lockable as for one that is.
+#[test]
+fn back_buffer_lock_rect_refuses_a_second_lock_and_get_dc() {
+    const FILL: u32 = 0xFF20_4080;
+    for lockable in [false, true] {
+        let h = if lockable {
+            Harness::with_lockable_back_buffer()
+        } else {
+            Harness::new()
+        };
+        assert_eq!(h.clear_target(FILL), D3D_OK, "clear the back buffer");
+        let back_buffer = h.back_buffer(0);
+        let locked = back_buffer.lock_rect(D3DLOCK_READONLY);
+        let (hr, bits_null) = back_buffer.lock_rect_probe(D3DLOCK_READONLY);
+        assert_eq!(
+            hr, D3DERR_INVALIDCALL,
+            "a second LockRect of a locked back buffer (lockable={lockable})"
+        );
+        assert!(
+            !bits_null,
+            "a refused LockRect leaves the caller's D3DLOCKED_RECT untouched"
+        );
+        let sentinel = 0xdead_beef_usize as *mut core::ffi::c_void;
+        let (hr, out) = back_buffer.get_dc(sentinel);
+        assert_eq!(
+            hr, D3DERR_INVALIDCALL,
+            "GetDC on a locked back buffer (lockable={lockable})"
+        );
+        assert_eq!(out, sentinel, "a refused GetDC leaves the out HDC alone");
+        assert_eq!(
+            locked.as_u32(1)[0],
+            FILL,
+            "the first lock's page still holds the read-back"
+        );
+        drop(locked);
+        assert_eq!(
+            back_buffer.unlock_rect(),
+            D3DERR_INVALIDCALL,
+            "a second UnlockRect finds no lock"
+        );
+    }
+}
+
+/// An `UnlockRect` with no lock under a back-buffer DC leaves the DC's page in place.
+///
+/// The DC wraps the read-back page a lock would map, and `UnlockRect` of a
+/// surface that is not mapped while a DC is out is a no-op `D3D_OK`. What GDI
+/// draws after it still reaches the back buffer at `ReleaseDC`, and a
+/// `LockRect` while the DC is out is refused.
+#[test]
+fn back_buffer_unlock_rect_under_a_dc_keeps_what_gdi_draws() {
+    const GREEN: u32 = 0xFF00_FF00;
+    const RED: u32 = 0xFFFF_0000;
+    const RED_COLORREF: u32 = 0x0000_00FF;
+    let h = Harness::with_lockable_back_buffer();
+    assert_eq!(h.clear_target(GREEN), D3D_OK, "clear the back buffer green");
+    let back_buffer = h.back_buffer(0);
+    let dc = back_buffer.dc();
+    let (hr, bits_null) = back_buffer.lock_rect_probe(D3DLOCK_READONLY);
+    assert_eq!(hr, D3DERR_INVALIDCALL, "LockRect while a GetDC is out");
+    assert!(
+        !bits_null,
+        "a refused LockRect leaves the caller's D3DLOCKED_RECT untouched"
+    );
+    assert_eq!(
+        back_buffer.unlock_rect(),
+        D3D_OK,
+        "UnlockRect of an unmapped surface under a DC is a no-op"
+    );
+    dc.fill_block(64, RED_COLORREF);
+    assert_eq!(dc.release(), D3D_OK, "ReleaseDC");
+    // Alpha is masked off as in the write-back test above: GDI leaves the
+    // fourth byte at zero.
+    assert_eq!(
+        h.read_pixel(16, 16) | 0xFF00_0000,
+        RED,
+        "what GDI drew after the UnlockRect reaches the back buffer"
+    );
+    assert_eq!(
+        h.read_pixel(320, 240),
+        GREEN,
+        "the pixels GDI left alone still hold the clear colour"
+    );
+}
+
 #[test]
 fn implicit_depth_stencil_is_cached() {
     let h = Harness::with_depth();

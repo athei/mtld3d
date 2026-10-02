@@ -2147,6 +2147,8 @@ extern "system" fn surface_lock_rect(
     let inner_mut = unsafe { &mut *obj.inner };
     // SAFETY: `dc_lock_ptr` returns the live resource-wide state.
     if (unsafe { &*inner_mut.dc_lock_ptr() }).dc_in_use {
+        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+            "IDirect3DSurface9::LockRect while a GetDC on the resource is outstanding → INVALIDCALL");
         return D3DERR_INVALIDCALL;
     }
     let parent_tex = obj.inner().parent_texture;
@@ -2327,18 +2329,19 @@ extern "system" fn surface_unlock_rect(this: *mut c_void) -> i32 {
         // the (shared cube) resource is a no-op success — see `try_end_lock`.
         return inner.try_end_lock();
     }
-    // Standalone color surface (the backbuffer readback path). A successful
-    // `LockRect` stashes `readback = Some(page)`, so `Some` ⇒ a real lock was
-    // held ⇒ drop it and return S_OK (the performance-critical portrait
-    // Lock→read→Unlock cycle). `None` ⇒ no successful Lock was outstanding (a
-    // non-lockable `CreateRenderTarget`/`CreateDepthStencilSurface` surface whose
-    // LockRect returns INVALIDCALL, or a double-Unlock) ⇒ D3D9 returns
-    // INVALIDCALL.
-    if inner.readback.take().is_some() {
-        D3D_OK
-    } else {
-        D3DERR_INVALIDCALL
+    // Standalone colour surface (the back-buffer read-back path). A successful
+    // `LockRect` recorded the lock and stashed its page in `readback`, so
+    // ending that lock drops the page (the performance-critical portrait
+    // Lock→read→Unlock cycle). Without a lock `try_end_lock` answers: a no-op
+    // S_OK while a `GetDC` holds the same page, which must survive until
+    // `ReleaseDC` writes it back, and INVALIDCALL otherwise (a double unlock,
+    // or a non-lockable render target whose `LockRect` was refused).
+    let was_mapped = inner.flags.contains(SurfaceFlags::MAPPED);
+    let hr = inner.try_end_lock();
+    if was_mapped {
+        inner.readback = None;
     }
+    hr
 }
 
 /// Synchronous backbuffer readback.
@@ -2371,7 +2374,32 @@ fn backbuffer_lock_readback(
         );
         return D3DERR_INVALIDCALL;
     }
+    // The read-back page is what the lock maps, and a `GetDC` wraps the same
+    // slot, so the back buffer takes the surface lock state like every other
+    // lockable surface: a second lock or a lock under an outstanding DC is
+    // refused before anything replaces the page the first one handed out.
+    if let Err(hr) = inner.try_begin_lock() {
+        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+            "backbuffer LockRect while the back buffer is already locked or a GetDC on it is outstanding → INVALIDCALL"
+        );
+        return hr;
+    }
+    let hr = backbuffer_read_into_lock(inner, locked_rect, rect);
+    if hr != D3D_OK {
+        let _ = inner.try_end_lock();
+    }
+    hr
+}
 
+/// Read the back buffer, or `rect` of it, into the page a successful back-buffer lock maps.
+///
+/// The caller has recorded the lock; on a failure it is the caller that
+/// takes the record back.
+fn backbuffer_read_into_lock(
+    inner: &mut SurfaceInner,
+    locked_rect: *mut D3DLOCKED_RECT,
+    rect: *const c_void,
+) -> i32 {
     // Implicit backbuffer surface resolves its extent + Metal handle live from
     // the device (see `ImplicitKind`) — read before borrowing `device_inner`
     // below so the two derefs of the raw device pointer never overlap.
@@ -2380,6 +2408,8 @@ fn backbuffer_lock_readback(
     let tex_handle = inner.live_color_handle();
     let (x, y, w, h) = parse_surface_rect(rect, full_w, full_h);
     if w == 0 || h == 0 {
+        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+            "back-buffer LockRect: the locked area is empty → INVALIDCALL");
         return D3DERR_INVALIDCALL;
     }
 
@@ -2404,11 +2434,15 @@ fn backbuffer_lock_readback(
     let bytes_per_row = mtld3d_core::format::linear_row_pitch(w, fmt.bytes_per_pixel());
     let bytes = (bytes_per_row as usize).saturating_mul(h as usize);
     if bytes == 0 {
+        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+            "back-buffer LockRect: the read-back page would be empty → INVALIDCALL");
         return D3DERR_INVALIDCALL;
     }
     let mut page = PageBox::new_uninit(bytes);
 
     if inner.device_inner.is_null() {
+        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+            "back-buffer LockRect: the surface has no owning device → INVALIDCALL");
         return D3DERR_INVALIDCALL;
     }
     // SAFETY: `inner.device_inner` was stamped at `Self::new` from a
@@ -2416,6 +2450,8 @@ fn backbuffer_lock_readback(
     // its child resources per D3D9 lifetime rules.
     let device_inner = unsafe { &mut *inner.device_inner };
     if let Err(hr) = device_inner.flush_current_frame_blocking() {
+        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+            "back-buffer LockRect: flushing the frame before the read-back failed → {hr:#x}");
         return hr;
     }
 
