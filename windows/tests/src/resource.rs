@@ -1361,6 +1361,34 @@ impl Surface<'_> {
         // SAFETY: vtable thunk; `self.ptr` is live.
         unsafe { (self.vtbl().free_private_data)(self.ptr, &raw const *guid) }
     }
+
+    /// `SetPrivateData(guid, punk, sizeof(ptr), D3DSPD_IUNKNOWN)`.
+    ///
+    /// The runtime holds a reference on `punk` until the key is overwritten,
+    /// freed, or the surface dies; for an implicit surface that is the
+    /// device's destruction.
+    ///
+    /// # Safety
+    /// `punk` is a live COM object that stays live until the runtime releases
+    /// the reference it takes here.
+    ///
+    /// # Panics
+    /// Never in practice: only if a pointer does not fit `u32`.
+    #[must_use]
+    pub unsafe fn set_private_data_unknown(&self, guid: &Guid, punk: *mut c_void) -> i32 {
+        let size = u32::try_from(size_of::<*mut c_void>()).expect("pointer size fits u32");
+        // SAFETY: vtable thunk; for `D3DSPD_IUNKNOWN` the data pointer *is*
+        // the interface pointer, live per the contract above.
+        unsafe {
+            (self.vtbl().set_private_data)(
+                self.ptr,
+                &raw const *guid,
+                punk.cast_const(),
+                size,
+                mtld3d_types::D3DSPD_IUNKNOWN,
+            )
+        }
+    }
 }
 
 impl Drop for Surface<'_> {

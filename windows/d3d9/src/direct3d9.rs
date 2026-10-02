@@ -1,7 +1,10 @@
 use core::ffi::c_void;
 use std::{
     path::Path,
-    sync::{Arc, LazyLock},
+    sync::{
+        Arc, LazyLock,
+        atomic::{AtomicU32, Ordering, fence},
+    },
 };
 
 use log::{error, info, trace, warn};
@@ -274,7 +277,8 @@ static DIRECT3D9_VTBL: IDirect3D9Vtbl = IDirect3D9Vtbl {
 #[repr(C)]
 pub struct Direct3D9 {
     vtbl: *const IDirect3D9Vtbl,
-    refcount: u32,
+    /// The public refcount, changed from any thread that holds the interface or a device it made.
+    refcount: AtomicU32,
     inner: Box<Direct3D9Inner>,
 }
 
@@ -299,9 +303,14 @@ impl Direct3D9 {
     pub fn new(config: Arc<Mtld3dConfig>) -> Self {
         Self {
             vtbl: &raw const DIRECT3D9_VTBL,
-            refcount: 1,
+            refcount: AtomicU32::new(1),
             inner: Box::new(Direct3D9Inner { config }),
         }
+    }
+
+    /// Take one more reference; the count after it.
+    fn add_ref(&self) -> u32 {
+        self.refcount.fetch_add(1, Ordering::Relaxed) + 1
     }
 
     /// The configuration this interface resolved at `Direct3DCreate9`.
@@ -551,26 +560,37 @@ extern "system" fn d3d9_add_ref(this: *mut c_void) -> u32 {
     // SAFETY: D3D9 AddRef — null `this` is UB per spec; we preserve the
     // crash semantic so refcount miscounts surface as a null-deref.
     // SAFETY: IDirect3D9 IUnknown thunk; D3D9 ABI guarantees `this` is *mut Direct3D9.
-    let mut wrap = unsafe { VtableThis::<Direct3D9>::new(this) };
-    let obj: &mut Direct3D9 = &mut wrap;
-    obj.refcount += 1;
-    obj.refcount
+    let wrap = unsafe { VtableThis::<Direct3D9>::new(this) };
+    wrap.add_ref()
 }
 
 extern "system" fn d3d9_release(this: *mut c_void) -> u32 {
     // SAFETY: D3D9 Release — same contract as AddRef above.
     // SAFETY: IDirect3D9 IUnknown thunk; D3D9 ABI guarantees `this` is *mut Direct3D9.
-    let mut wrap = unsafe { VtableThis::<Direct3D9>::new(this) };
-    let obj: &mut Direct3D9 = &mut wrap;
-    obj.refcount -= 1;
-    let rc = obj.refcount;
-    if rc == 0 {
-        // SAFETY: refcount reached zero; `this` is the original
+    let wrap = unsafe { VtableThis::<Direct3D9>::new(this) };
+    // The interface is not tied to a device's lock: every device it created
+    // takes and gives back references on it from its own threads, so the
+    // count is atomic. `checked_sub` only keeps a `Release` past zero from
+    // wrapping the count; it answers 0 and frees nothing.
+    let Ok(previous) = wrap
+        .refcount
+        .fetch_update(Ordering::Release, Ordering::Relaxed, |count| {
+            count.checked_sub(1)
+        })
+    else {
+        return 0;
+    };
+    if previous == 1 {
+        // Every other thread's last use of the interface happened before its
+        // own decrement, which the `Release` ordering publishes; this fence
+        // makes those uses happen before the free.
+        fence(Ordering::Acquire);
+        // SAFETY: the count reached zero; `this` is the original
         // `Box::into_raw(Direct3D9)` allocation from `Direct3DCreate9`,
         // and no other reference can survive a zero refcount.
         drop(unsafe { Box::from_raw(this.cast::<Direct3D9>()) });
     }
-    rc
+    previous - 1
 }
 
 // ── IDirect3D9 methods ──
@@ -1426,7 +1446,7 @@ extern "system" fn d3d9_create_device(
     present_params: *mut c_void,
     device: *mut *mut c_void,
 ) -> i32 {
-    if !crate::USED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+    if !crate::USED.swap(true, Ordering::Relaxed) {
         crate::pin_image();
     }
 
@@ -1821,9 +1841,8 @@ pub const fn attached_pacing(layer_params: &AttachMetalLayerParams) -> LayerPaci
 fn addref_parent_direct3d9(this: *mut c_void) {
     if !this.is_null() {
         // SAFETY: IDirect3D9 IUnknown thunk; D3D9 ABI guarantees `this` is *mut Direct3D9.
-        let mut parent_wrap = unsafe { VtableThis::<Direct3D9>::new(this) };
-        let parent: &mut Direct3D9 = &mut parent_wrap;
-        parent.refcount += 1;
+        let parent = unsafe { VtableThis::<Direct3D9>::new(this) };
+        parent.add_ref();
     }
 }
 

@@ -44,6 +44,16 @@ E2E_TESTS_DIR=windows/tests/tests/e2e
 E2E_SPAWN='\.spawn(_scoped)?\(|thread::spawn\(|thread::Builder'
 E2E_SPAWN_MESSAGE='raw thread spawn in an end-to-end test: use mtld3d_tests::spawn_scoped, which names the worker after its test'
 
+# A thread the PE side starts is waited for through `JoinHandle::is_finished`,
+# never `JoinHandle::join`: Wine can invalidate a thread handle held for a long
+# session, and `join` panics on the failed wait, which aborts the process. The
+# empty-argument `.join()` is the thread join (a slice or path join takes an
+# argument). Unit tests run natively on the host, and the end-to-end crate
+# joins the scoped workers it spawned moments before, so both are left out.
+PE_JOIN='\.join\(\)|JoinHandle::join'
+PE_JOIN_MESSAGE='thread join on the PE side: poll JoinHandle::is_finished, then drop the handle'
+PE_JOIN_EXEMPT='^windows/tests/|/tests(\.rs$|/)'
+
 # The COM entry points that hold the device's API lock: every
 # `extern "system" fn` defined in these files opens with `let _api =`. The
 # cursor window procedure is the one exception, by name: it runs on the window
@@ -316,6 +326,14 @@ case "${1:-}" in
         banned "$E2E_SPAWN" 'Every end-to-end test names itself' "$E2E_SPAWN_MESSAGE" "$file"
         ;;
     esac
+    case $file in
+    windows/*.rs)
+        if ! printf '%s\n' "$file" | grep -qE "$PE_JOIN_EXEMPT"; then
+            banned "$PE_JOIN" 'The PE side waits for its threads, it never joins them' \
+                "$PE_JOIN_MESSAGE" "$file"
+        fi
+        ;;
+    esac
 
     exit $status
     ;;
@@ -382,6 +400,13 @@ e2e_tests=$(git ls-files "$E2E_TESTS_DIR/*.rs" || true)
 if [ -n "$e2e_tests" ]; then
     # shellcheck disable=SC2086
     banned "$E2E_SPAWN" 'Every end-to-end test names itself' "$E2E_SPAWN_MESSAGE" $e2e_tests
+fi
+
+pe_sources=$(git ls-files 'windows/*.rs' | grep -vE "$PE_JOIN_EXEMPT" || true)
+if [ -n "$pe_sources" ]; then
+    # shellcheck disable=SC2086
+    banned "$PE_JOIN" 'The PE side waits for its threads, it never joins them' \
+        "$PE_JOIN_MESSAGE" $pe_sources
 fi
 
 modules=$(git ls-files '*/mod.rs' || true)

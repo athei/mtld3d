@@ -302,6 +302,15 @@ pub unsafe trait ComChild: Sized {
         self.owning_device()
     }
 
+    /// Hold the API lock that serialises this object's entry points until the guard drops.
+    ///
+    /// The owning device's lock. A type whose object can be called while its
+    /// device is being released, or after, carries the lock itself and
+    /// overrides this, since the device's own refcount no longer leads to it.
+    fn enter_api_lock(&self) -> ApiGuard {
+        device_api_lock(self.owning_device())
+    }
+
     /// Whether a public 1→0 transition finalizes (frees) the wrapper now.
     ///
     /// Device- or container-owned cached objects (the implicit swapchain and
@@ -382,15 +391,15 @@ pub unsafe fn com_get_device<T: ComChild>(this: *mut c_void, device: *mut *mut c
 /// Every entry point of every child object binds this as its first
 /// statement, the child-local getters and setters included, so two threads
 /// on one object are serialised the way the device's own entry points are.
-/// A null `this`, or a child with no device (a managed texture between
-/// devices), gets the no-op guard.
+/// A null `this` gets the no-op guard; which lock the rest take is
+/// [`ComChild::enter_api_lock`]'s answer.
 #[inline]
 pub fn com_api_lock<T: ComChild>(this: *mut c_void) -> ApiGuard {
     // SAFETY: vtable thunk; `this` is `*mut T` per the object's ABI.
     let Some(obj) = (unsafe { InPtr::<T>::opt(this) }) else {
         return ApiGuard::NOOP;
     };
-    device_api_lock(obj.owning_device())
+    obj.enter_api_lock()
 }
 
 // ── Shader bytecode read-back ──

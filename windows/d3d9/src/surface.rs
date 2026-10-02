@@ -2,6 +2,7 @@ use core::ffi::c_void;
 
 use log::trace;
 use mtld3d_core::{
+    api_lock::ApiGuard,
     page_box::PageBox,
     perf::SurfaceSubCategory,
     render_scale::RenderScale,
@@ -1870,6 +1871,19 @@ unsafe impl crate::com_ref::ComChild for Direct3DSurface9 {
         // Standalone surface: it pins the device for its public lifetime, so
         // its own pointer cannot go stale under it.
         inner.device_wrapper()
+    }
+    fn enter_api_lock(&self) -> ApiGuard {
+        let inner = self.inner();
+        // A surface that belongs to a texture is covered by the lock the
+        // texture carries, which outlives the texture's device; see
+        // `owning_device` for why the container is the one to ask.
+        if !inner.parent_texture.is_null() {
+            // SAFETY: as in `owning_device`, the parent texture is live for as
+            // long as a public reference to this surface is.
+            let parent = unsafe { &*inner.parent_texture };
+            return parent.enter_api_lock();
+        }
+        crate::device::device_api_lock(inner.device_wrapper())
     }
     fn finalizes_on_zero(&self) -> bool {
         // Implicit surfaces are never freed by `Release` — they are destroyed

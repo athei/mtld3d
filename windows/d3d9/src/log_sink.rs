@@ -16,6 +16,10 @@
 //! `d3d9.dll` for its lifetime and leaves through `FreeLibraryAndExitThread`,
 //! so a `FreeLibrary` cannot unmap the image under a running thread, and one
 //! that follows the last `Release` finds no thread of ours in the image.
+//! That exit needs the loader lock, so a last `Release` whose caller holds it
+//! (another DLL's `DLL_PROCESS_DETACH`, a TLS callback) sends the stop and
+//! returns without waiting; the thread's own reference keeps the image mapped
+//! until it is gone.
 //!
 //! [`open`] names that file's location first: the directory `log.dir` picks,
 //! or `mtld3d-logs` next to the executable, as a unix path the unix side can
@@ -49,6 +53,8 @@ unsafe extern "system" {
     fn OpenThread(access: u32, inherit: i32, thread_id: u32) -> *mut c_void;
     fn WaitForSingleObject(handle: *mut c_void, millis: u32) -> u32;
     fn CloseHandle(handle: *mut c_void) -> i32;
+    fn RtlGetCurrentPeb() -> *mut c_void;
+    fn RtlIsCriticalSectionLockedByThread(section: *mut c_void) -> i32;
 }
 
 /// `OpenThread` access right that allows waiting for the thread's end.
@@ -57,6 +63,12 @@ const SYNCHRONIZE: u32 = 0x0010_0000;
 const INFINITE: u32 = 0xFFFF_FFFF;
 /// `WaitForSingleObject` result for a signaled object.
 const WAIT_OBJECT_0: u32 = 0;
+/// Offset of `PEB.LoaderLock`, the loader's `RTL_CRITICAL_SECTION*`, in a 32-bit PEB.
+#[cfg(target_pointer_width = "32")]
+const PEB_LOADER_LOCK_OFFSET: usize = 0xa0;
+/// Offset of `PEB.LoaderLock`, the loader's `RTL_CRITICAL_SECTION*`, in a 64-bit PEB.
+#[cfg(target_pointer_width = "64")]
+const PEB_LOADER_LOCK_OFFSET: usize = 0x110;
 
 /// Name the process's log location to the unix side.
 ///
@@ -244,10 +256,27 @@ fn start(worker: &mut Worker) {
 }
 
 /// Send the stop and wait for the logging thread to be gone.
+///
+/// Except when the calling thread holds the loader lock: the logging thread
+/// leaves through `FreeLibraryAndExitThread`, whose unload and thread detach
+/// both take that lock, so it cannot be gone before the caller lets the lock
+/// go. Then the stop goes out without the wait. The thread drains what is
+/// queued and exits once the lock is free, and its own reference on the image
+/// keeps it mapped until then; an interface created before the thread has put
+/// the queue back starts no thread of its own, and its lines wait for the next
+/// one.
 fn stop(worker: &mut Worker) {
     let Some(thread_id) = worker.thread_id.take() else {
         return;
     };
+    if caller_holds_loader_lock() {
+        log::debug!(
+            target: LOG_TARGET,
+            "log thread: the last release holds the loader lock; stopping without waiting"
+        );
+        let _ = QUEUE.tx.send(Message::Stop);
+        return;
+    }
     // A fresh handle, opened while the thread is certainly alive (the stop
     // is not sent yet), so the id cannot name another thread.
     // SAFETY: plain kernel32 call; a failure returns null.
@@ -270,6 +299,26 @@ fn stop(worker: &mut Worker) {
             "log thread: the wait for its exit failed ({waited:#x}); the image stays mapped until it is gone"
         );
     }
+}
+
+/// Whether the calling thread holds the loader lock, read off the process's PEB.
+fn caller_holds_loader_lock() -> bool {
+    // SAFETY: ntdll export; answers this process's PEB, which lives as long as
+    // the process.
+    let peb = unsafe { RtlGetCurrentPeb() };
+    if peb.is_null() {
+        return false;
+    }
+    // SAFETY: the offset is `PEB.LoaderLock`'s on this architecture, inside the PEB.
+    let field = unsafe { peb.cast::<u8>().add(PEB_LOADER_LOCK_OFFSET) };
+    // SAFETY: the field is a pointer the loader set at process start, readable
+    // for the process's lifetime; `read_unaligned` asks nothing of its alignment.
+    let section = unsafe { field.cast::<*mut c_void>().read_unaligned() };
+    if section.is_null() {
+        return false;
+    }
+    // SAFETY: ntdll export; `section` is the loader's live critical section.
+    unsafe { RtlIsCriticalSectionLockedByThread(section) != 0 }
 }
 
 /// The logging thread: forward every line until the stop, then leave with the image reference.

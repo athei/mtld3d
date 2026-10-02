@@ -30,7 +30,7 @@ pub use resource::{
     SurfaceDc, SwapChain, Texture, VertexBuffer, VertexDeclaration, VertexShader, Volume,
     VolumeTexture,
 };
-pub use shared::{SharedDevice, SharedQuery, SharedVertexBuffer};
+pub use shared::{SharedDevice, SharedQuery, SharedTexture, SharedVertexBuffer};
 pub use vertex::{
     LitVertex, PosColorVertex, PosVertex, RhwVertex, SpecularVertex, TexturedVertex, Vertex,
     VolumeVertex,
