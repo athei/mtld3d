@@ -11714,6 +11714,12 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
         let ff_dirty = dev.ff_state.take_ff_vs_dirty();
         if !ff_dirty.is_empty() {
             if key.has_rhw() {
+                // A pretransformed layout reads row 0 alone, so every other
+                // section stays marked for the next draw that reads it. WV is
+                // the one this row overwrites, and a change back to a
+                // transformed layout marks it again.
+                dev.ff_state
+                    .mark_ff_vs_dirty(ff_dirty.difference(FfVsDirty::WV));
                 let v = dev.viewport();
                 let to_f32 = |n: u32| {
                     f32::from(u16::try_from(n).expect("D3D9 viewport dim ≤ 16384 fits u16"))
