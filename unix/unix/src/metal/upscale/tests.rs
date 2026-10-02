@@ -25,8 +25,9 @@ use objc2_metal_fx::{MTLFXSpatialScaler, MTLFXSpatialScalerColorProcessingMode};
 use rustc_hash::FxHashMap;
 
 use super::{
-    MAX_CACHED_SCALERS, ScalerCache, ScalerEntry, ScalerKey, ScalerSlot, ScratchKey, UpscaleCache,
-    evict_least_recently_used, take_evicted, take_scalers,
+    MAX_CACHED_SCALERS, MAX_CACHED_SCRATCH, ScalerCache, ScalerEntry, ScalerKey, ScalerSlot,
+    ScratchCache, ScratchEntry, ScratchKey, UpscaleCache, evict_least_recently_used, scratch_in,
+    take_evicted, take_scalers, take_scratch,
 };
 
 /// A cache's live scaler count.
@@ -330,7 +331,26 @@ fn two_devices_at_one_geometry_get_their_own_scaler() {
 
 /// Live scratch entries in one device's cache.
 fn scratch_entries(cache: &UpscaleCache) -> usize {
-    cache.scratch.lock().map_or(0, |scratch| scratch.len())
+    cache
+        .scratch
+        .lock()
+        .map_or(0, |scratch| scratch.targets.len())
+}
+
+/// Scratch targets a cache has evicted but not yet released.
+fn pending_scratch_releases(cache: &UpscaleCache) -> usize {
+    cache
+        .scratch
+        .lock()
+        .map_or(0, |scratch| scratch.evicted.len())
+}
+
+/// A scratch entry standing for a texture, never dereferenced and never released.
+const fn scratch_entry(handle: u64) -> ScratchEntry {
+    ScratchEntry {
+        handle,
+        last_used: 0,
+    }
 }
 
 /// A key at one fixed geometry.
@@ -349,39 +369,134 @@ fn a_retire_takes_one_devices_entries_only() {
     let second = UpscaleCache::new();
     {
         let mut scratch = first.scratch.lock().expect("a fresh cache lock");
-        scratch.insert(key(), 0x10);
-        scratch.insert(
+        scratch.targets.insert(key(), scratch_entry(0x10));
+        scratch.targets.insert(
             ScratchKey {
                 format: PixelFormat::Rgba16Float,
                 ..key()
             },
-            0x11,
+            scratch_entry(0x11),
         );
+        scratch.evicted.push(0x12);
     }
     second
         .scratch
         .lock()
         .expect("a fresh cache lock")
-        .insert(key(), 0x20);
+        .targets
+        .insert(key(), scratch_entry(0x20));
 
-    let mut retired: Vec<u64> = first
-        .scratch
-        .lock()
-        .expect("a fresh cache lock")
-        .drain()
-        .map(|(_, handle)| handle)
-        .collect();
+    let mut retired = take_scratch(&mut first.scratch.lock().expect("a fresh cache lock"));
     retired.sort_unstable();
-    assert_eq!(retired, [0x10, 0x11], "both of the device's entries go");
+    assert_eq!(
+        retired,
+        [0x10, 0x11, 0x12],
+        "the device's entries go, evicted ones included"
+    );
+    assert_eq!(scratch_entries(&first), 0);
+    assert_eq!(pending_scratch_releases(&first), 0);
     assert_eq!(
         second
             .scratch
             .lock()
             .expect("a fresh cache lock")
-            .get(&key()),
-        Some(&0x20),
+            .targets
+            .get(&key())
+            .map(|entry| entry.handle),
+        Some(0x20),
         "the other device's entry stays"
     );
+}
+
+/// A scratch key at the size `size` names.
+fn scratch_key(size: u32) -> ScratchKey {
+    ScratchKey {
+        width: size,
+        height: size,
+        format: PixelFormat::Rgba16Float,
+    }
+}
+
+/// Walking through more scratch sizes than the bound holds evicts the least recently used.
+///
+/// A window dragged under `render.scale` with a gamma ramp or HDR asks for a
+/// render-size target at every size it rests at, each a Private texture of the
+/// frame's extent. Unbounded, every one of them stayed until the device went
+/// away. The geometry in steady use is refreshed on every lookup, so it is
+/// never the victim, and a target Metal declines displaces nothing.
+#[test]
+fn walking_through_scratch_sizes_bounds_the_cache_and_keeps_the_one_in_use() {
+    let mut cache = ScratchCache {
+        targets: rustc_hash::FxHashMap::default(),
+        tick: 0,
+        evicted: Vec::new(),
+    };
+    let steady = scratch_key(4096);
+    let mut handles = 0x1000_u64..;
+    let mut build = || handles.next();
+    let steady_handle = scratch_in(&mut cache, steady, &mut build).expect("the steady target");
+    let walked = u32::try_from(MAX_CACHED_SCRATCH * 3).expect("a small bound");
+    for size in 0..walked {
+        scratch_in(&mut cache, scratch_key(64 + size), &mut build).expect("a walked target");
+        assert!(
+            cache.targets.len() <= MAX_CACHED_SCRATCH,
+            "{} live targets after {size} sizes",
+            cache.targets.len()
+        );
+        assert_eq!(
+            scratch_in(&mut cache, steady, || panic!("the steady target is a hit")),
+            Some(steady_handle),
+            "the target in steady use survives the walk"
+        );
+    }
+    assert_eq!(
+        cache.evicted.len() + cache.targets.len(),
+        usize::try_from(walked).expect("a small count") + 1,
+        "every target built is either live or waiting for its release"
+    );
+    assert!(!cache.evicted.contains(&steady_handle));
+
+    let before = (cache.targets.len(), cache.evicted.len());
+    assert_eq!(scratch_in(&mut cache, scratch_key(8), || None), None);
+    assert_eq!(
+        (cache.targets.len(), cache.evicted.len()),
+        before,
+        "a declined target evicts nothing"
+    );
+}
+
+/// Evicted scratch targets are released once the device's next command buffer retires.
+#[test]
+fn evicted_scratch_targets_wait_for_a_command_buffer_of_their_device() {
+    let Some(device) = gpu() else { return };
+    let queue = device.newCommandQueue().expect("queue");
+    let cache = UpscaleCache::new();
+    let walked = u32::try_from(MAX_CACHED_SCRATCH + 2).expect("a small bound");
+    for size in 0..walked {
+        assert!(
+            super::scratch_target(
+                &device,
+                &cache,
+                16 + size,
+                16 + size,
+                PixelFormat::Bgra8Unorm
+            )
+            .is_some(),
+            "a scratch target at {size}"
+        );
+    }
+    assert_eq!(scratch_entries(&cache), MAX_CACHED_SCRATCH);
+    assert_eq!(pending_scratch_releases(&cache), 2);
+    let cmd = queue.commandBuffer().expect("command buffer");
+    cmd.setLabel(Some(&objc2_foundation::NSString::from_str(
+        "mtld3d-test-scratch-eviction",
+    )));
+    super::retire_evicted(&cmd, &cache);
+    assert_eq!(pending_scratch_releases(&cache), 0);
+    cmd.commit();
+    cmd.waitUntilCompleted();
+    super::retire(&cache);
+    assert_eq!(scratch_entries(&cache), 0);
 }
 
 /// Two devices at one geometry get two textures, and a retire frees one device's.
