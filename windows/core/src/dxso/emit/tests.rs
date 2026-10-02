@@ -4483,6 +4483,52 @@ fn ps_1_1_texm3x3vspec_reads_the_eye_vector_from_the_iterated_coordinates() {
 }
 
 #[test]
+fn ps_2_x_static_flow_control_compiles() {
+    // ps_2_x { if b0; mov oC0, c0; endif } reads the runtime boolean file;
+    // ps_2_x { defi i0, 2, 0, 0, 0; mov r0, c0; rep i0; add r0, r0, c1;
+    // endrep; mov oC0, r0 } runs a defined loop count.
+    let bool_branch = [
+        0xFFFF_0201,
+        opcode_token(OP_IF, 1),
+        src_token(TYPE_CONSTBOOL, 0, SWIZ_IDENTITY, 0),
+        opcode_token(OP_MOV, 2),
+        dst_token(TYPE_COLOROUT, 0, 0xF, false),
+        src_token(TYPE_CONST, 0, SWIZ_IDENTITY, 0),
+        opcode_token(OP_ENDIF, 0),
+        END_TOKEN,
+    ];
+    let int_loop = [
+        0xFFFF_0201,
+        opcode_token(OP_DEFI, 5),
+        dst_token(TYPE_CONSTINT, 0, 0xF, false),
+        2,
+        0,
+        0,
+        0,
+        opcode_token(OP_MOV, 2),
+        dst_token(TYPE_TEMP, 0, 0xF, false),
+        src_token(TYPE_CONST, 0, SWIZ_IDENTITY, 0),
+        opcode_token(OP_REP, 1),
+        src_token(TYPE_CONSTINT, 0, SWIZ_IDENTITY, 0),
+        opcode_token(OP_ADD, 3),
+        dst_token(TYPE_TEMP, 0, 0xF, false),
+        src_token(TYPE_TEMP, 0, SWIZ_IDENTITY, 0),
+        src_token(TYPE_CONST, 1, SWIZ_IDENTITY, 0),
+        opcode_token(OP_ENDREP, 0),
+        opcode_token(OP_MOV, 2),
+        dst_token(TYPE_COLOROUT, 0, 0xF, false),
+        src_token(TYPE_TEMP, 0, SWIZ_IDENTITY, 0),
+        END_TOKEN,
+    ];
+    for bc in [&bool_branch[..], &int_loop[..]] {
+        let ps = parse(bc).expect("ps_2_x parse");
+        assert!(!ps.violates_constant_register_limits());
+        let msl = emit_ps_programmable(&ps, VariantKey::default()).expect("emit ps_2_x");
+        metal_compile_or_fail(&msl);
+    }
+}
+
+#[test]
 fn constant_register_limits_reject_out_of_range_files() {
     // Addressing a constant register past the model's file must be caught
     // so CreateShader returns INVALIDCALL. The bytecode is hand-assembled

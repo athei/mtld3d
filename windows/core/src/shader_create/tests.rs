@@ -155,3 +155,54 @@ fn pixel_relative_constant_read_is_reported() {
     assert!(shader.usage.contains(ShaderUsage::RELATIVE_CONST));
     assert_eq!(shader.max_const_used, 3);
 }
+
+#[test]
+fn pixel_integer_and_boolean_files_start_at_ps_2_x() {
+    // ps_2_x { defb b0, true; if b0; mov oC0, c0; endif }
+    let bool_branch = [
+        0xffff_0201,
+        0x0200_002f,
+        0xe00f_0800,
+        1,
+        0x0100_0028,
+        0xe0e4_0800,
+        0x0200_0001,
+        0x800f_0800,
+        0xa0e4_0000,
+        0x0000_002b,
+        0x0000_ffff,
+    ];
+    // ps_2_x { defi i0, 2, 0, 0, 0; mov r0, c0; rep i0; add r0, r0, c1; endrep;
+    // mov oC0, r0 }
+    let int_loop = [
+        0xffff_0201,
+        0x0500_0030,
+        0xf00f_0000,
+        2,
+        0,
+        0,
+        0,
+        0x0200_0001,
+        0x800f_0000,
+        0xa0e4_0000,
+        0x0100_0026,
+        0xf0e4_0000,
+        0x0300_0002,
+        0x800f_0000,
+        0x80e4_0000,
+        0xa0e4_0001,
+        0x0000_0027,
+        0x0200_0001,
+        0x800f_0800,
+        0x80e4_0000,
+        0x0000_ffff,
+    ];
+    for mut tokens in [bool_branch.to_vec(), int_loop.to_vec()] {
+        assert!(parse_shader(&ShaderStage::Pixel, &tokens).is_ok());
+        tokens[0] = 0xffff_0200;
+        assert!(matches!(
+            parse_shader(&ShaderStage::Pixel, &tokens),
+            Err(ShaderCreateError::ConstantRegisterLimit)
+        ));
+    }
+}

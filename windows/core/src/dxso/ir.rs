@@ -392,9 +392,11 @@ impl DxsoProgram {
     /// `D3DERR_INVALIDCALL`. Float files: 256 for any vertex shader (the
     /// hardware-vertex-processing `MaxVertexShaderConst`) and 8 / 32 / 224
     /// for pixel shader model 1 / 2 / 3. Integer (`iN`) and boolean (`bN`)
-    /// files hold 16 registers each and only exist from `vs_2_0` / `ps_3_0`
-    /// onward, so any integer or boolean register in an earlier model —
-    /// notably a `ps_2_0` using `defi` / `defb` — is itself out of range.
+    /// files hold 16 registers each and only exist from `vs_2_0` / `ps_2_x`
+    /// onward (`ps_2_x` is version 2.1, the model the static flow control in
+    /// `PS20Caps` serves), so any integer or boolean register in an earlier
+    /// model (notably a `ps_2_0` using `defi` / `defb`) is itself out of
+    /// range.
     #[must_use]
     pub fn violates_constant_register_limits(&self) -> bool {
         let is_vertex = self.shader_type == ShaderType::Vertex;
@@ -407,12 +409,12 @@ impl DxsoProgram {
                 _ => 224,
             }
         };
-        let int_bool_limit: u16 =
-            if (is_vertex && self.major >= 2) || (!is_vertex && self.major >= 3) {
-                16
-            } else {
-                0
-            };
+        let has_int_bool_files = if is_vertex {
+            self.major >= 2
+        } else {
+            (self.major, self.minor) >= (2, 1)
+        };
+        let int_bool_limit: u16 = if has_int_bool_files { 16 } else { 0 };
         let float_max = self
             .max_const_reg()
             .into_iter()
@@ -454,16 +456,6 @@ impl DxsoProgram {
         })
     }
 
-    /// Whether any instruction reads an integer-constant register (`iN`) not declared by `defi`.
-    ///
-    /// That is a *dynamic* integer constant fed by `SetVertexShaderConstantI`.
-    /// `defi` constants are baked into the MSL as locals, but a dynamic `iN`
-    /// (typically a `loop aL, iN` / `rep iN` counter) needs the runtime
-    /// integer-constant buffer uploaded and bound; draws that bind such a
-    /// shader gate that bind on this flag, and the emitter gates the
-    /// declaration of the `vs_i` / `ps_i` argument on it. Subroutine bodies
-    /// count: a `call` inline-expands them into the entry point, so a `rep
-    /// iN` reached only through a `call` still reads the argument.
     /// True when a `ps_3_0` program declares the `vPos` register.
     ///
     /// `vPos` is `MiscType` register 0, identified by index rather than by the
@@ -477,6 +469,16 @@ impl DxsoProgram {
         })
     }
 
+    /// Whether any instruction reads an integer-constant register (`iN`) not declared by `defi`.
+    ///
+    /// That is a *dynamic* integer constant fed by `SetVertexShaderConstantI`.
+    /// `defi` constants are baked into the MSL as locals, but a dynamic `iN`
+    /// (typically a `loop aL, iN` / `rep iN` counter) needs the runtime
+    /// integer-constant buffer uploaded and bound; draws that bind such a
+    /// shader gate that bind on this flag, and the emitter gates the
+    /// declaration of the `vs_i` / `ps_i` argument on it. Subroutine bodies
+    /// count: a `call` inline-expands them into the entry point, so a `rep
+    /// iN` reached only through a `call` still reads the argument.
     #[must_use]
     pub fn uses_dynamic_int_constants(&self) -> bool {
         let defined: std::collections::BTreeSet<u16> =
