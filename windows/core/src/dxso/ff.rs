@@ -1556,16 +1556,15 @@ fn emit_vs(out: &mut String, vs: &FfVsKey, entry: &str) {
         let _ = writeln!(out, "    out.texcoord{i} = float4(0.0);");
     }
 
-    // Vertex fog factor (linear / exp / exp2). Eye-space Z from vs_c[2]
-    // (row 2 of transpose(WV), full 4 components including translation) so
-    // `dot(pos, vs_c[2])` is the eye-space Z coordinate of the vertex. Fog
+    // Vertex fog factor (linear / exp / exp2) from the eye-space vertex,
+    // `pos_view`, which already includes the world/view transforms and any
+    // sequential or indexed vertex blending, before projection. Without
+    // blending its `.z` is `dot(pos, vs_c[2])`, row 2 of transpose(WV). Fog
     // params live at vs_c[8] (see the layout comment above).
     let fog_coordinate = if vs.flags.contains(FfVsFlags::RANGE_FOG) {
-        // pos_view already includes the world/view transforms and any
-        // sequential or indexed vertex blending, before projection.
         "        float eyeZ = length(pos_view.xyz);\n"
     } else {
-        "        float eyeZ = abs(dot(pos, vs_c[2]));\n"
+        "        float eyeZ = abs(pos_view.z);\n"
     };
     match vs.fog_mode {
         1 => {

@@ -7,7 +7,7 @@ use mtld3d_types::{
     D3DMATRIX, D3DPT_TRIANGLESTRIP, D3DRECT, D3DRS_CULLMODE, D3DRS_FOGCOLOR, D3DRS_FOGDENSITY,
     D3DRS_FOGENABLE, D3DRS_FOGEND, D3DRS_FOGSTART, D3DRS_FOGTABLEMODE, D3DRS_FOGVERTEXMODE,
     D3DRS_INDEXEDVERTEXBLENDENABLE, D3DRS_LIGHTING, D3DRS_RANGEFOGENABLE, D3DRS_SCISSORTESTENABLE,
-    D3DRS_VERTEXBLEND, D3DRS_ZENABLE, D3DSBT_ALL, D3DSBT_VERTEXSTATE, D3DTS_VIEW, D3DTS_WORLD,
+    D3DRS_VERTEXBLEND, D3DRS_ZENABLE, D3DSBT_ALL, D3DSBT_VERTEXSTATE, D3DTS_PROJECTION, D3DTS_VIEW, D3DTS_WORLD,
     D3DVBF_1WEIGHTS,
 };
 
@@ -195,6 +195,36 @@ fn range_fog_uses_transformed_and_blended_eye_position() {
     });
     h.render_once(BLACK, |d| draw(d, &indexed));
     assert_eq!(h.read_pixel(64, 64), GREEN, "indexed blending before fog");
+}
+
+/// Ordinary vertex fog reads the eye depth of the blended position.
+///
+/// The vertex sits at z = 10 with its whole weight on world matrix 1, which
+/// moves it to z = 60, and the projection scales z by 1/100 so both depths
+/// stay inside the clip volume. Linear fog from 0 to 100 gives 0.4 at the
+/// blended depth and 0.9 at the unblended one.
+#[test]
+fn vertex_fog_uses_the_blended_eye_depth() {
+    let h = harness();
+    assert_eq!(h.set_render_state(D3DRS_FOGSTART, 0.0_f32.to_bits()), 0);
+    assert_eq!(h.set_render_state(D3DRS_FOGEND, 100.0_f32.to_bits()), 0);
+    let mut projection = D3DMATRIX::IDENTITY.m;
+    projection[10] = 0.01;
+    assert_eq!(h.set_transform(D3DTS_PROJECTION, &projection), 0);
+    assert_eq!(h.set_transform(D3DTS_WORLD, &D3DMATRIX::IDENTITY.m), 0);
+    let mut deeper = D3DMATRIX::IDENTITY.m;
+    deeper[14] = 50.0;
+    assert_eq!(h.set_transform(D3DTS_WORLD + 1, &deeper), 0);
+    assert_eq!(h.set_render_state(D3DRS_VERTEXBLEND, D3DVBF_1WEIGHTS), 0);
+    assert_eq!(h.set_fvf(D3DFVF_XYZB1 | D3DFVF_DIFFUSE), 0);
+    let blended = vertices().map(|v| BlendedVertex {
+        position: [v.x, v.y, 10.0],
+        weight: 0.0,
+        color: RED,
+    });
+    h.render_once(BLACK, |d| draw(d, &blended));
+    // 0.4 of red and 0.6 of the green fog colour.
+    assert_pixel_approx(h.read_pixel(64, 64), 0xFF66_9900, 2, "blended eye depth");
 }
 
 #[repr(C)]

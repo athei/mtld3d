@@ -2710,13 +2710,16 @@ fn range_fog_changes_only_the_vertex_distance_expression() {
             key.vertex_blend_count = blends;
             key.declared_weights_count = u8::from(blends != 0);
             let ordinary = emit_vs_ff(&key);
-            assert!(ordinary.contains("float eyeZ = abs(dot(pos, vs_c[2]));"));
+            // The eye depth of the blended position when the vertex blends,
+            // which without blending is the row-2 dot of the single matrix.
+            assert!(ordinary.contains("float eyeZ = abs(pos_view.z);"), "{ordinary}");
+            assert!(!ordinary.contains("abs(dot(pos"), "{ordinary}");
             assert!(!ordinary.contains("length(pos_view.xyz)"));
             key.flags.insert(FfVsFlags::RANGE_FOG);
             let range = emit_vs_ff(&key);
             assert!(range.contains("float eyeZ = length(pos_view.xyz);"));
             assert_eq!(
-                range.replace("length(pos_view.xyz)", "abs(dot(pos, vs_c[2]))"),
+                range.replace("length(pos_view.xyz)", "abs(pos_view.z)"),
                 ordinary,
                 "ordinary fog keeps the same source and range changes only distance"
             );
