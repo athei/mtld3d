@@ -304,7 +304,7 @@ Use these in preference to raw pointer juggling. Each lives in `mtld3d_shared` (
 
 **External COM pointers** (`windows/d3d9/src/com_ref.rs`):
 
-- **`CachedComPtr<T: ComUnknown>`** — owning cached pointer with RAII refcount. `unsafe fn adopt(p)` calls `AddRef`; `Drop` calls `Release`. Use to cache external D3D9 COM pointers we don't own (bound RT/DS/VB/IB). Replaces inline `(*p).vtbl().add_ref(...)` / `release(...)` pairs.
+- **`CachedComPtr<T: ComUnknown, Bound>`**: owning cached pointer with RAII refcount. `unsafe fn adopt(p)` takes a device-internal reference and `Drop` gives it back, so the application's public refcount never counts it. Use for every reference the device keeps on an external D3D9 COM object (bound RT/DS/VB/IB, the objects a state block captures or records). Replaces inline `(*p).vtbl().add_ref(...)` / `release(...)` pairs.
 
 Other concentration examples: `PageBox`, `Crumb`, `ScratchArena`, the per-Win32-function wrappers in `cursor.rs` (`set_cursor`, `delete_object`, `create_bitmap_packed`, …).
 

@@ -178,12 +178,11 @@ fn child_resources_balance_device_refcount() {
 
 /// A `D3DSBT_ALL` state block captures the bound state.
 ///
-/// That includes the implicit FVF vertex declaration (which sits at public
-/// refcount 0 in the cache, so the capture's `AddRef` forwards a device
-/// reference). Creating then releasing the block must leave the device refcount
-/// unchanged — i.e. the captured objects' forwarded references are released
-/// with the block. Otherwise the device is left holding references it can never
-/// shed, and teardown never reaches a zero refcount.
+/// That includes the implicit FVF vertex declaration, which sits at public
+/// refcount 0 in the cache. Creating then releasing the block must leave the
+/// device refcount unchanged: whatever the block holds goes with it.
+/// Otherwise the device is left holding references it can never shed, and
+/// teardown never reaches a zero refcount.
 #[test]
 fn state_block_capture_balances_device_refcount() {
     let h = Harness::new();
@@ -198,6 +197,68 @@ fn state_block_capture_balances_device_refcount() {
         h.device_refcount(),
         base,
         "D3DSBT_ALL capture + release leaves the device refcount balanced",
+    );
+}
+
+/// The references a state block holds never show in an object's public refcount.
+///
+/// A block keeps what it captured or recorded alive, but `Release` answers
+/// the application's own references only: a texture bound, captured by a
+/// `D3DSBT_ALL` block or recorded into a `BeginStateBlock` one and unbound
+/// again counts one reference, the application's. Capturing the implicit
+/// declaration an FVF binds, which no application reference holds, adds no
+/// device reference beyond the block's own. A captured texture the
+/// application has released stays usable: `Apply` binds it again.
+#[test]
+fn state_blocks_hold_no_public_reference_on_what_they_capture() {
+    let h = Harness::new();
+    let base = h.device_refcount();
+    let tex = h.create_texture(4, 4, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT);
+    assert_eq!(h.set_texture(0, &tex), D3D_OK, "SetTexture");
+    assert_eq!(h.set_fvf(D3DFVF_XYZ), D3D_OK, "SetFVF");
+    assert_eq!(tex.refcount(), 1, "a binding takes no public reference");
+
+    let captured = h.create_state_block(D3DSBT_ALL);
+    assert_eq!(
+        h.device_refcount(),
+        base + 2,
+        "the texture and the block each hold the device once; the captured FVF declaration does not"
+    );
+    assert_eq!(h.clear_texture(0), D3D_OK, "SetTexture(0, NULL)");
+    assert_eq!(
+        tex.refcount(),
+        1,
+        "a D3DSBT_ALL capture takes no public reference on the texture"
+    );
+
+    assert_eq!(h.begin_state_block(), D3D_OK, "BeginStateBlock");
+    assert_eq!(h.set_texture(0, &tex), D3D_OK, "SetTexture while recording");
+    let recorded = h.end_state_block();
+    assert_eq!(
+        tex.refcount(),
+        1,
+        "a recorded SetTexture takes no public reference on the texture"
+    );
+
+    let raw = tex.as_ptr();
+    drop(tex);
+    assert_eq!(
+        h.device_refcount(),
+        base + 2,
+        "the application's last texture reference took its device reference with it"
+    );
+    assert_eq!(captured.apply(), D3D_OK, "Apply of the D3DSBT_ALL block");
+    assert!(
+        h.texture_matches_raw(0, raw),
+        "the block kept the released texture alive and binds it again"
+    );
+    assert_eq!(h.clear_texture(0), D3D_OK, "SetTexture(0, NULL)");
+    drop(captured);
+    drop(recorded);
+    assert_eq!(
+        h.device_refcount(),
+        base,
+        "releasing the blocks leaves the device refcount balanced"
     );
 }
 

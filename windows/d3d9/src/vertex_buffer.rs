@@ -461,12 +461,6 @@ unsafe fn finalize_vertex_buffer(this: *mut Direct3DVertexBuffer9) {
 }
 
 impl ComUnknown for Direct3DVertexBuffer9 {
-    fn vtbl_add_ref(&self) -> unsafe extern "system" fn(*mut c_void) -> u32 {
-        self.vtbl().add_ref
-    }
-    fn vtbl_release(&self) -> unsafe extern "system" fn(*mut c_void) -> u32 {
-        self.vtbl().release
-    }
     fn private_refcount_inc(&mut self) {
         self.private_refcount += 1;
     }

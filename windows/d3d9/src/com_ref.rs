@@ -13,17 +13,15 @@
 //! refcount; `Drop` decrements it. Assignment Drops the old value, so
 //! `field = unsafe { CachedComPtr::adopt(new) }` is the swap idiom.
 //!
-//! The `K: Ownership` type parameter selects the bookkeeping path:
-//!
-//! - `Owned` (default) — bumps the public `IUnknown` refcount through the
-//!   COM vtable (`AddRef`/`Release` thunks). Used for state-block captures
-//!   that can outlive the live binding.
-//! - `Bound` — bumps the wrapper's device-internal `private_refcount`
-//!   inline (no vtable indirection, no `ApiTimer` instrumentation). Used
-//!   for the per-draw bind hot path (texture stages, bound VB/IB,
-//!   render targets, shader slots, vertex declaration). Keeps a dual
-//!   public/private refcount split: the public `IUnknown` count and a
-//!   device-internal binding count are tracked separately.
+//! The `K: Ownership` type parameter selects the bookkeeping path. Its one
+//! marker, `Bound`, bumps the wrapper's device-internal `private_refcount`
+//! inline (no vtable indirection, no `ApiTimer` instrumentation). Every
+//! reference the device takes for itself is one of these: the per-draw bind
+//! slots (texture stages, bound VB/IB, render targets, shader slots, vertex
+//! declaration) and the objects a state block captures or records. The
+//! public `IUnknown` count and the device-internal count are tracked
+//! separately, so the application's `AddRef`/`Release` answers only ever
+//! count the application's own references.
 
 use core::{ffi::c_void, marker::PhantomData, ptr::null_mut};
 
@@ -38,13 +36,11 @@ use crate::device::{
 
 /// COM types whose vtable starts with the `IUnknown` head.
 ///
-/// Exposes callable `AddRef`/`Release` thunks, plus a device-internal
-/// "bound slot" refcount that swap-by-bind paths use to keep the
-/// object alive across game-side `Release`. Implemented by every
-/// `IDirect3DXxx9` wrapper in this crate.
+/// Exposes a device-internal "bound slot" refcount, beside the public one,
+/// that the device's own references (bind slots, state-block captures) use
+/// to keep the object alive across game-side `Release`. Implemented by
+/// every `IDirect3DXxx9` wrapper the device binds.
 pub trait ComUnknown {
-    fn vtbl_add_ref(&self) -> unsafe extern "system" fn(*mut c_void) -> u32;
-    fn vtbl_release(&self) -> unsafe extern "system" fn(*mut c_void) -> u32;
     /// Increment the device-internal "bound slot" refcount.
     fn private_refcount_inc(&mut self);
     /// Decrement the device-internal "bound slot" refcount.
@@ -79,39 +75,14 @@ pub unsafe trait Ownership {
     unsafe fn on_drop<T: ComUnknown>(p: *mut T);
 }
 
-/// Public-refcount ownership: bumps/decrements via the COM vtable's `AddRef`/`Release` thunks.
-///
-/// The slot participates in the public `IUnknown` refcount the game can
-/// observe via `QueryInterface` etc. Used for state-block captures
-/// (`StateOp::*` variants) that may outlive the live binding.
-pub struct Owned;
-
-// SAFETY: `on_adopt`/`on_drop` only call vtable thunks; correctness
-// relies on the same invariants as direct `(*p).vtbl().add_ref(...)`.
-unsafe impl Ownership for Owned {
-    unsafe fn on_adopt<T: ComUnknown>(p: *mut T) {
-        // SAFETY: caller asserts `p` non-null and points to a live `T`.
-        let f = unsafe { (*p).vtbl_add_ref() };
-        // SAFETY: `f` is the AddRef thunk for the same vtable; passing
-        // `p` as IUnknown `this` matches the D3D9 ABI.
-        unsafe { f(p.cast::<c_void>()) };
-    }
-    unsafe fn on_drop<T: ComUnknown>(p: *mut T) {
-        // SAFETY: caller asserts `p` non-null and points to a live `T`.
-        let f = unsafe { (*p).vtbl_release() };
-        // SAFETY: `f` is the Release thunk for the same vtable; passing
-        // `p` as IUnknown `this` matches the D3D9 ABI.
-        unsafe { f(p.cast::<c_void>()) };
-    }
-}
-
 /// Private-refcount ownership: bumps/decrements the wrapper's `private_refcount` field directly.
 ///
 /// Via [`ComUnknown::private_refcount_inc`] and
 /// [`ComUnknown::private_refcount_dec_maybe_finalize`]. No vtable
 /// indirection, no `ApiTimer` instrumentation. Invisible to external COM
 /// callers. Used for device-internal bind slots (texture stages, bound
-/// VB/IB, render targets, shader slots, vertex declaration).
+/// VB/IB, render targets, shader slots, vertex declaration) and for the
+/// objects a state block captures or records.
 pub struct Bound;
 
 // SAFETY: `on_adopt` only increments a `u32`; `on_drop` calls the
@@ -136,7 +107,7 @@ unsafe impl Ownership for Bound {
 /// Constructed via [`Self::adopt`] (which bumps the matching refcount);
 /// released via `Drop`. Assignment runs `Drop` on the old value, so the
 /// swap idiom is `field = unsafe { CachedComPtr::adopt(new) };`.
-pub struct CachedComPtr<T: ComUnknown, K: Ownership = Owned>(*mut T, PhantomData<K>);
+pub struct CachedComPtr<T: ComUnknown, K: Ownership>(*mut T, PhantomData<K>);
 
 impl<T: ComUnknown, K: Ownership> CachedComPtr<T, K> {
     /// Null pointer; safe to construct without owning any retain.

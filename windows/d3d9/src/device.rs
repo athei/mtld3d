@@ -622,10 +622,11 @@ pub struct DeviceInner {
     /// In-progress `BeginStateBlock` recording.
     ///
     /// `Some(..)` between a successful `BeginStateBlock` and its matching
-    /// `EndStateBlock`. While set, every state-change COM setter diverts its
-    /// write into the block instead of the live device — spec-correct replay
-    /// semantics for `Apply()` on the resulting state block. Null-safe to read
-    /// via `recording_state_block()`; mutating through
+    /// `EndStateBlock`, or a `Reset` that ends it first. While set, every
+    /// state-change COM setter diverts its write into the block instead of
+    /// the live device: spec-correct replay semantics for `Apply()` on the
+    /// resulting state block. Null-safe to read via
+    /// `recording_state_block()`; mutating through
     /// `recording_state_block_mut()` is how each setter records its op.
     recording_state_block: Option<Box<RecordingStateBlock>>,
     /// The pacing this device has handed to its layer.
@@ -2565,10 +2566,6 @@ impl DeviceInner {
         // Scissor defaults to the full target, like the viewport reseed below.
         self.scissor_rect = [0, 0, self.backbuffer_width, self.backbuffer_height];
 
-        // Drop any in-flight state-block recording; per spec, Reset
-        // invalidates an open Begin/EndStateBlock pair.
-        self.recording_state_block = None;
-
         // Viewport reseed mirrors `set_viewport` — push the op so the
         // encoder's pass-state picks up the default before the first
         // post-Reset draw.
@@ -3796,7 +3793,11 @@ extern "system" fn device_release(this: *mut c_void) -> u32 {
         // realize one of them again.
         device_inner.cursor_mut().destroy_handles();
 
-        // Release bound surfaces + buffers + textures (if any) before teardown.
+        // Release bound surfaces + buffers + textures (if any) before teardown,
+        // and the objects an open `BeginStateBlock` recording holds: a
+        // device-internal reference can be the last one on its object, whose
+        // finalization still reaches this device.
+        device_inner.recording_state_block = None;
         device_inner.bound_rt_mut().teardown();
         device_inner.bound_buffers_mut().teardown();
         device_inner.stage_bindings_mut().teardown();
@@ -4301,10 +4302,15 @@ extern "system" fn device_reset(this: *mut c_void, present_params: *mut c_void) 
         dev.flags.insert(DeviceFlags::NOT_RESET);
         return D3DERR_INVALIDCALL;
     }
+    // A Reset with well-formed parameters ends an open `BeginStateBlock`
+    // recording whether or not it goes on to succeed, before it looks for
+    // outstanding references: the recording dies with the state it was
+    // recording against.
+    dev.recording_state_block = None;
     // Reset rejects any outstanding app reference to a `D3DPOOL_DEFAULT`
     // resource or an implicit surface: those are backed by the device memory
     // the Reset recreates, and D3D9 makes the app release them first. The
-    // device's own bindings do not count (they are reset below on success).
+    // device's own references (bindings, state blocks) do not count.
     let blockers = dev.outstanding_reset_blockers.load(Ordering::Acquire);
     if blockers != 0 {
         warn!(
@@ -9754,8 +9760,8 @@ extern "system" fn device_set_texture(this: *mut c_void, stage: u32, texture: *m
 
     if let Some(rec) = dev.recording_state_block_mut() {
         // SAFETY: `new_tex` is null or a *mut Direct3DTexture9 supplied by
-        // the calling game via SetTexture; its AddRef/Release thunks are
-        // valid for the lifetime of the recording.
+        // the calling game via SetTexture, which the reference taken here
+        // keeps alive for the lifetime of the recording.
         let tex = unsafe { CachedComPtr::adopt(new_tex) };
         rec.record(StateOp::Texture { stage, tex });
         return D3D_OK;

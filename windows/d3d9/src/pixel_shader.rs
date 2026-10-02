@@ -211,12 +211,6 @@ unsafe fn finalize_pixel_shader(this: *mut Direct3DPixelShader9) {
 }
 
 impl ComUnknown for Direct3DPixelShader9 {
-    fn vtbl_add_ref(&self) -> unsafe extern "system" fn(*mut c_void) -> u32 {
-        self.vtbl().add_ref
-    }
-    fn vtbl_release(&self) -> unsafe extern "system" fn(*mut c_void) -> u32 {
-        self.vtbl().release
-    }
     fn private_refcount_inc(&mut self) {
         self.private_refcount += 1;
     }

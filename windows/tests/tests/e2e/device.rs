@@ -1035,6 +1035,54 @@ fn reset_rejects_outstanding_default_pool_resources() {
     drop(sysmem);
 }
 
+/// An open `BeginStateBlock` recording never blocks `Reset`, and `Reset` ends it.
+///
+/// What a recording holds is the device's own reference, so a
+/// `D3DPOOL_DEFAULT` buffer recorded into it and then released by the
+/// application does not count as outstanding. A Reset with well-formed
+/// parameters drops the recording before it looks for outstanding
+/// references, so even one an application reference rejects leaves no
+/// recording open: the next `BeginStateBlock` starts a new one.
+#[test]
+fn reset_ends_an_open_recording_and_is_not_blocked_by_it() {
+    let h = Harness::new();
+    let vb = h.create_vertex_buffer(64, 0, D3DFVF_XYZ, D3DPOOL_DEFAULT);
+    assert_eq!(h.begin_state_block(), D3D_OK, "BeginStateBlock");
+    assert_eq!(
+        h.set_stream_source(0, &vb, 0, 12),
+        D3D_OK,
+        "SetStreamSource while recording"
+    );
+    drop(vb);
+    assert_eq!(
+        h.reset(640, 480),
+        D3D_OK,
+        "a released DEFAULT-pool buffer an open recording holds does not block Reset"
+    );
+    assert_eq!(
+        h.begin_state_block(),
+        D3D_OK,
+        "the Reset ended the open recording"
+    );
+    drop(h.end_state_block());
+
+    let held = h.create_vertex_buffer(64, 0, D3DFVF_XYZ, D3DPOOL_DEFAULT);
+    assert_eq!(h.begin_state_block(), D3D_OK, "BeginStateBlock");
+    assert_eq!(
+        h.reset(640, 480),
+        D3DERR_INVALIDCALL,
+        "a DEFAULT-pool buffer the application holds blocks Reset"
+    );
+    assert_eq!(
+        h.begin_state_block(),
+        D3D_OK,
+        "the rejected Reset still ended the open recording"
+    );
+    drop(h.end_state_block());
+    drop(held);
+    assert_eq!(h.reset(640, 480), D3D_OK, "Reset succeeds once released");
+}
+
 #[test]
 fn reset_bad_dims_rejected() {
     let h = Harness::new();
