@@ -7,7 +7,10 @@
 //! backing has to hold every row the copy writes. The surface plumbing lives in
 //! `windows/d3d9`; the geometry decision is here.
 
-use mtld3d_types::{D3DFMT_A8R8G8B8, D3DFMT_X8R8G8B8};
+use mtld3d_types::{
+    D3DFMT_A1R5G5B5, D3DFMT_A8B8G8R8, D3DFMT_A8R8G8B8, D3DFMT_X1R5G5B5, D3DFMT_X8B8G8R8,
+    D3DFMT_X8R8G8B8,
+};
 
 /// The colour image a read-back copies out of.
 pub struct ReadbackSource {
@@ -84,7 +87,7 @@ impl ReadbackReject {
 /// format, and anything else is `D3DERR_INVALIDCALL`. The formats are the D3D
 /// ones, not the storage behind them: `R8G8B8` is stored as BGRA8 like
 /// `X8R8G8B8`, but its rows are three bytes a texel, so the copy would not fit
-/// them. The one pair of distinct formats accepted is the one
+/// them. The pairs of distinct formats accepted are the ones
 /// [`formats_match`] names. The length rule is ours: the copy writes `height`
 /// rows of `bytes_per_row`, and the Metal blit takes the whole backing as its
 /// destination buffer.
@@ -111,17 +114,23 @@ pub fn reject_readback_dst(
 
 /// Whether a read-back of a `src` surface may land in a `dst` surface, both `D3DFMT_*`.
 ///
-/// The same format, or `X8R8G8B8` and `A8R8G8B8` either way round: their
-/// bytes are laid out alike and differ only in whether the fourth one means
-/// alpha, and an application that reads an `X8R8G8B8` back buffer into an
-/// `A8R8G8B8` surface (what the end-to-end harness does for every pixel it
-/// checks) gets the colour channels it asked for.
+/// The same format, or the alpha and padded forms of one layout either way
+/// round (`X8R8G8B8` and `A8R8G8B8`, `X8B8G8R8` and `A8B8G8R8`, `X1R5G5B5`
+/// and `A1R5G5B5`): their bytes are laid out alike and differ only in whether
+/// the top bits mean alpha, so an application that reads an `X8R8G8B8` back
+/// buffer into an `A8R8G8B8` surface (what the end-to-end harness does for
+/// every pixel it checks) gets the colour channels it asked for.
 #[must_use]
 pub const fn formats_match(src: u32, dst: u32) -> bool {
     src == dst
         || matches!(
             (src, dst),
-            (D3DFMT_X8R8G8B8, D3DFMT_A8R8G8B8) | (D3DFMT_A8R8G8B8, D3DFMT_X8R8G8B8)
+            (D3DFMT_X8R8G8B8, D3DFMT_A8R8G8B8)
+                | (D3DFMT_A8R8G8B8, D3DFMT_X8R8G8B8)
+                | (D3DFMT_X8B8G8R8, D3DFMT_A8B8G8R8)
+                | (D3DFMT_A8B8G8R8, D3DFMT_X8B8G8R8)
+                | (D3DFMT_X1R5G5B5, D3DFMT_A1R5G5B5)
+                | (D3DFMT_A1R5G5B5, D3DFMT_X1R5G5B5)
         )
 }
 

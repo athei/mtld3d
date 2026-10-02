@@ -1,4 +1,7 @@
-use mtld3d_types::{D3DFMT_A8B8G8R8, D3DFMT_A16B16G16R16F, D3DFMT_R8G8B8, D3DFMT_X1R5G5B5};
+use mtld3d_types::{
+    D3DFMT_A1R5G5B5, D3DFMT_A8B8G8R8, D3DFMT_A16B16G16R16F, D3DFMT_R5G6B5, D3DFMT_R8G8B8,
+    D3DFMT_X1R5G5B5, D3DFMT_X8B8G8R8,
+};
 
 use super::*;
 
@@ -97,12 +100,23 @@ fn a_destination_of_another_format_is_rejected() {
 }
 
 #[test]
-fn the_x8_a8_pair_matches_either_way_round() {
+fn the_alpha_and_padded_pairs_match_either_way_round() {
     assert!(formats_match(D3DFMT_X8R8G8B8, D3DFMT_A8R8G8B8));
     assert!(formats_match(D3DFMT_A8R8G8B8, D3DFMT_X8R8G8B8));
     assert!(formats_match(D3DFMT_R8G8B8, D3DFMT_R8G8B8));
     assert!(!formats_match(D3DFMT_X8R8G8B8, D3DFMT_R8G8B8));
     assert!(!formats_match(D3DFMT_A8B8G8R8, D3DFMT_A8R8G8B8));
+    // The other two alpha/padded pairs, each way round, and no cross between
+    // the pairs.
+    for (a, b) in [
+        (D3DFMT_X8B8G8R8, D3DFMT_A8B8G8R8),
+        (D3DFMT_X1R5G5B5, D3DFMT_A1R5G5B5),
+    ] {
+        assert!(formats_match(a, b), "{a:#x} -> {b:#x}");
+        assert!(formats_match(b, a), "{b:#x} -> {a:#x}");
+    }
+    assert!(!formats_match(D3DFMT_X8B8G8R8, D3DFMT_A8R8G8B8));
+    assert!(!formats_match(D3DFMT_X1R5G5B5, D3DFMT_R5G6B5));
     let dst = ReadbackDestination {
         format: D3DFMT_A8R8G8B8,
         ..destination()

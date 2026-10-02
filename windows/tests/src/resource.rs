@@ -277,12 +277,21 @@ impl VolumeTexture<'_> {
     /// [`Self::write_u32`] through a `LockBox` that passes `flags`.
     ///
     /// For a test of what the lock flags change, such as a write through a
-    /// `D3DLOCK_READONLY` lock, which the application promised not to make.
+    /// `D3DLOCK_READONLY` lock, which the application promised not to make, or
+    /// one under `D3DLOCK_NO_DIRTY_UPDATE`, which records no dirty region.
     ///
     /// # Panics
     /// Panics if the lock fails or `texels` is not exactly one level's worth.
     pub fn write_u32_with_flags(&self, level: u32, flags: u32, texels: &[u32]) {
         self.write_texels(level, None, flags, texels);
+    }
+
+    /// `AddDirtyBox(null)`: flag the whole volume dirty. Returns the hr.
+    #[must_use]
+    pub fn add_dirty_box(&self) -> i32 {
+        // SAFETY: vtable thunk; `self.ptr` is live, a null box names the whole
+        // volume.
+        unsafe { (self.vtbl().add_dirty_box)(self.ptr, core::ptr::null()) }
     }
 
     /// [`Self::write_u32`] for 16-bit-per-texel formats (R5G6B5, A4R4G4B4, ...).

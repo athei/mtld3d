@@ -3,8 +3,8 @@
 //! The round-trip renders to a texture, then samples it.
 
 use mtld3d_tests::{
-    CubeTexture, Harness, HarnessConfig, PosColorVertex, Rgba8, Surface, TexturedVertex, Vertex,
-    VolumeVertex,
+    CubeTexture, Harness, HarnessConfig, PosColorVertex, Rgba8, RhwVertex, Surface, TexturedVertex,
+    Vertex, VolumeVertex,
 };
 use mtld3d_types::{
     D3D_OK, D3DBLEND_INVSRCALPHA, D3DBLEND_SRCALPHA, D3DCLEAR_TARGET, D3DCLEAR_ZBUFFER,
@@ -12,15 +12,15 @@ use mtld3d_types::{
     D3DFMT_A1R5G5B5, D3DFMT_A4R4G4B4, D3DFMT_A8, D3DFMT_A8B8G8R8, D3DFMT_A8R8G8B8,
     D3DFMT_A16B16G16R16F, D3DFMT_A32B32G32R32F, D3DFMT_D24S8, D3DFMT_INTZ, D3DFMT_L8, D3DFMT_NV12,
     D3DFMT_R5G6B5, D3DFMT_R8G8B8, D3DFMT_UYVY, D3DFMT_X1R5G5B5, D3DFMT_X8R8G8B8, D3DFMT_YUY2,
-    D3DFMT_YV12, D3DFVF_DIFFUSE, D3DFVF_TEX1, D3DFVF_XYZ, D3DLOCK_DISCARD, D3DLOCK_NOOVERWRITE,
-    D3DLOCK_READONLY, D3DPOOL_DEFAULT, D3DPOOL_MANAGED, D3DPOOL_SCRATCH, D3DPOOL_SYSTEMMEM,
-    D3DPT_TRIANGLELIST, D3DRECT, D3DRS_ALPHABLENDENABLE, D3DRS_DESTBLEND, D3DRS_LIGHTING,
-    D3DRS_SRCBLEND, D3DRS_ZENABLE, D3DRS_ZFUNC, D3DRS_ZWRITEENABLE, D3DSAMP_ADDRESSU,
-    D3DSAMP_ADDRESSV, D3DSAMP_MAGFILTER, D3DSAMP_MAXMIPLEVEL, D3DSAMP_MINFILTER, D3DSAMP_MIPFILTER,
-    D3DTA_DIFFUSE, D3DTA_TEXTURE, D3DTADDRESS_CLAMP, D3DTEXF_LINEAR, D3DTEXF_NONE, D3DTEXF_POINT,
-    D3DTOP_MODULATE, D3DTOP_SELECTARG1, D3DTSS_ALPHAARG1, D3DTSS_ALPHAOP, D3DTSS_COLORARG1,
-    D3DTSS_COLORARG2, D3DTSS_COLOROP, D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_DEPTHSTENCIL,
-    D3DUSAGE_RENDERTARGET, D3DVIEWPORT9,
+    D3DFMT_YV12, D3DFVF_DIFFUSE, D3DFVF_TEX1, D3DFVF_XYZ, D3DFVF_XYZRHW, D3DLOCK_DISCARD,
+    D3DLOCK_NOOVERWRITE, D3DLOCK_READONLY, D3DPOOL_DEFAULT, D3DPOOL_MANAGED, D3DPOOL_SCRATCH,
+    D3DPOOL_SYSTEMMEM, D3DPT_TRIANGLELIST, D3DRECT, D3DRS_ALPHABLENDENABLE, D3DRS_DESTBLEND,
+    D3DRS_LIGHTING, D3DRS_SRCBLEND, D3DRS_ZENABLE, D3DRS_ZFUNC, D3DRS_ZWRITEENABLE,
+    D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_MAGFILTER, D3DSAMP_MAXMIPLEVEL, D3DSAMP_MINFILTER,
+    D3DSAMP_MIPFILTER, D3DTA_DIFFUSE, D3DTA_TEXTURE, D3DTADDRESS_CLAMP, D3DTEXF_LINEAR,
+    D3DTEXF_NONE, D3DTEXF_POINT, D3DTOP_MODULATE, D3DTOP_SELECTARG1, D3DTSS_ALPHAARG1,
+    D3DTSS_ALPHAOP, D3DTSS_COLORARG1, D3DTSS_COLORARG2, D3DTSS_COLOROP, D3DUSAGE_AUTOGENMIPMAP,
+    D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_RENDERTARGET, D3DVIEWPORT9,
 };
 
 const RED: u32 = 0xFFFF_0000;
@@ -2100,9 +2100,11 @@ fn stretch_rect_rejects_a_render_target_into_an_offscreen_plain() {
 /// `UpdateSurface` writes into a render-target surface and into the back buffer.
 ///
 /// Neither has a texture behind it. The region lands at its destination point
-/// and nowhere else, after the `ColorFill` or `Clear` recorded before it and
-/// before the draw recorded after it. A source in another format the update
-/// codec covers is converted, as it is into a texture level. A multisampled
+/// and nowhere else, after the draw or `Clear` recorded before it and before
+/// the draw recorded after it: on the render target a whole-target draw, the
+/// update and a draw over its bottom-right quarter are recorded with no
+/// read-back between them. A source in another format the update codec
+/// covers is converted, as it is into a texture level. A multisampled
 /// destination is refused, as D3D9 refuses one.
 #[test]
 fn update_surface_reaches_a_render_target_and_the_back_buffer() {
@@ -2111,15 +2113,58 @@ fn update_surface_reaches_a_render_target_and_the_back_buffer() {
     src.lock_rect(0).write_u32(&[GREEN; 64 * 64]);
 
     let rt = h.create_render_target(64, 64, D3DFMT_A8R8G8B8);
-    assert_eq!(h.color_fill_hr(&rt, RED), 0);
+    let back = h.render_target(0);
+    assert_eq!(h.set_render_target(0, &rt), 0, "bind the render target");
+    draw_fill(&h, MAGENTA);
     assert_eq!(
         h.update_surface_region_hr(&src, &rect(0, 0, 32, 32), &rt, (16, 16)),
         0,
         "UpdateSurface into a render target",
     );
+    // Pre-transformed, so it covers texels 32..64 on both axes: the bottom-right
+    // quarter of the region and the target beyond it.
+    assert_eq!(h.set_fvf(D3DFVF_XYZRHW | D3DFVF_DIFFUSE), 0, "SetFVF");
+    let corner = |x: f32, y: f32| RhwVertex {
+        x,
+        y,
+        z: 0.5,
+        rhw: 1.0,
+        color: WHITE,
+    };
+    let quad = [
+        corner(32.0, 32.0),
+        corner(64.0, 32.0),
+        corner(32.0, 64.0),
+        corner(64.0, 32.0),
+        corner(64.0, 64.0),
+        corner(32.0, 64.0),
+    ];
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad),
+        0,
+        "the draw after the update"
+    );
+    assert_eq!(h.set_render_target(0, &back), 0, "restore the back buffer");
     let pixels = read_back(&h, &rt, (64, 64), D3DFMT_A8R8G8B8);
-    for (x, y, expected) in [(8, 8, RED), (16, 16, GREEN), (47, 47, GREEN), (48, 48, RED)] {
-        assert_eq!(pixels[y * 64 + x], expected, "render target ({x}, {y})");
+    for (x, y, expected, what) in [
+        (
+            8,
+            8,
+            MAGENTA,
+            "the earlier draw, left of and above the region",
+        ),
+        (56, 8, MAGENTA, "the earlier draw, right of the region"),
+        (8, 56, MAGENTA, "the earlier draw, below the region"),
+        (20, 20, GREEN, "the region outside the later draw"),
+        (44, 20, GREEN, "the region beside the later draw"),
+        (40, 40, WHITE, "the later draw over the region"),
+        (56, 56, WHITE, "the later draw outside the region"),
+    ] {
+        assert_eq!(
+            pixels[y * 64 + x],
+            expected,
+            "render target ({x}, {y}): {what}"
+        );
     }
 
     let narrow = h.create_offscreen_plain_surface(8, 8, D3DFMT_R5G6B5, D3DPOOL_SYSTEMMEM);

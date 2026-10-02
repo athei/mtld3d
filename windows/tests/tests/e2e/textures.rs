@@ -3409,6 +3409,117 @@ fn add_dirty_rect_marks_every_level_for_update_texture() {
     }
 }
 
+/// A partial `AddDirtyRect` reaches each level scaled to that level's extent.
+///
+/// The rect `(16, 16, 48, 48)` on a 64x64 source covers `(8, 8, 24, 24)` of
+/// level 1. After every level is rewritten under `D3DLOCK_NO_DIRTY_UPDATE`,
+/// `UpdateTexture` copies the scaled rect of level 1: a texel inside it takes
+/// the new colour and one outside it keeps the old, as on level 0.
+#[test]
+fn add_dirty_rect_scales_a_partial_rect_to_each_level() {
+    const RED: u32 = 0xFFFF_0000;
+    const GREEN: u32 = 0xFF00_FF00;
+    const SIZE: u32 = 64;
+    let h = Harness::new();
+    let src = h.create_texture(SIZE, SIZE, 0, 0, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM);
+    let dst = h.create_texture(SIZE, SIZE, 0, 0, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT);
+    let side = |level: u32| (SIZE >> level).max(1) as usize;
+    for level in 0..src.level_count() {
+        let n = side(level);
+        src.lock_rect(level, 0)
+            .write_u32_rect(n, n, &vec![RED; n * n]);
+    }
+    assert_eq!(h.update_texture_hr(&src, &dst), 0, "first UpdateTexture");
+    for level in 0..src.level_count() {
+        let n = side(level);
+        src.lock_rect(level, D3DLOCK_NO_DIRTY_UPDATE)
+            .write_u32_rect(n, n, &vec![GREEN; n * n]);
+    }
+    assert_eq!(
+        src.add_dirty_rect_partial(&[16, 16, 48, 48]),
+        0,
+        "AddDirtyRect(16, 16, 48, 48)"
+    );
+    assert_eq!(h.update_texture_hr(&src, &dst), 0, "second UpdateTexture");
+    assert_eq!(h.set_sampler_state(0, D3DSAMP_MIPFILTER, D3DTEXF_POINT), 0);
+    // The quad maps the level across the 640x480 back buffer, so texel
+    // (tx, ty) of an n-wide level sits at ((tx + 0.5) * 640 / n, (ty + 0.5) * 480 / n).
+    for (level, inside, outside) in [(0, (325, 243), (45, 33)), (1, (330, 247), (50, 37))] {
+        assert_eq!(h.set_sampler_state(0, D3DSAMP_MAXMIPLEVEL, level), 0);
+        let [inner, outer] = sample_points(&h, &dst, [inside, outside]);
+        assert_pixel_eq(
+            inner,
+            GREEN,
+            &format!("level {level} inside the scaled rect"),
+        );
+        assert_pixel_eq(
+            outer,
+            RED,
+            &format!("level {level} outside the scaled rect"),
+        );
+    }
+}
+
+/// `AddDirtyBox(NULL)` marks every level of a volume source for `UpdateTexture`.
+///
+/// Every level of an 8x8x8 system-memory volume is rewritten under
+/// `D3DLOCK_NO_DIRTY_UPDATE`, so only the `AddDirtyBox` can make the second
+/// `UpdateTexture` copy the new content; each level is then sampled through
+/// `D3DSAMP_MAXMIPLEVEL`.
+#[test]
+fn add_dirty_box_marks_every_level_for_update_texture() {
+    const RED: u32 = 0xFFFF_0000;
+    const GREEN: u32 = 0xFF00_FF00;
+    const EDGE: u32 = 8;
+    let h = Harness::new();
+    let (hr, src) =
+        h.try_create_volume_texture([EDGE; 3], 0, 0, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM);
+    assert_eq!(hr, 0, "system-memory volume");
+    let src = src.expect("source");
+    let (hr, dst) = h.try_create_volume_texture([EDGE; 3], 0, 0, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT);
+    assert_eq!(hr, 0, "default-pool volume");
+    let dst = dst.expect("destination");
+    let levels = src.level_count();
+    assert_eq!(levels, 4, "a full 8x8x8 chain");
+    let texels = |level: u32| {
+        let n = (EDGE >> level).max(1) as usize;
+        n * n * n
+    };
+    for level in 0..levels {
+        src.write_u32(level, &vec![RED; texels(level)]);
+    }
+    assert_eq!(
+        h.update_volume_texture_hr(&src, &dst),
+        0,
+        "first UpdateTexture"
+    );
+    for level in 0..levels {
+        src.write_u32_with_flags(level, D3DLOCK_NO_DIRTY_UPDATE, &vec![GREEN; texels(level)]);
+    }
+    assert_eq!(src.add_dirty_box(), 0, "AddDirtyBox(NULL)");
+    assert_eq!(
+        h.update_volume_texture_hr(&src, &dst),
+        0,
+        "second UpdateTexture"
+    );
+    assert_eq!(h.set_volume_texture(0, &dst), 0);
+    h.select_texture_stage(0);
+    point_clamp(&h);
+    assert_eq!(h.set_sampler_state(0, D3DSAMP_MIPFILTER, D3DTEXF_POINT), 0);
+    assert_eq!(
+        h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1 | (D3DFVF_TEXTUREFORMAT3 << 16)),
+        0
+    );
+    for level in 0..levels {
+        assert_eq!(h.set_sampler_state(0, D3DSAMP_MAXMIPLEVEL, level), 0);
+        assert_pixel_eq(
+            sample_volume_depth(&h, 0.5),
+            GREEN,
+            &format!("volume level {level} after AddDirtyBox"),
+        );
+    }
+}
+
 /// `UpdateTexture` accepts a source whose levels are still mapped.
 ///
 /// The per-endpoint rejection `UpdateSurface` applies does not carry over to
