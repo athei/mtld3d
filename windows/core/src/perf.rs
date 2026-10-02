@@ -190,6 +190,23 @@ const KEYS_SECTION_SAMPLE_PERIOD: u32 = 16;
 #[cfg(perf_tracking)]
 const FRAME_SAMPLE_PERIOD: u8 = 16;
 
+/// The seed of the frame picks in [`ApiPerfState::new`], which the unit tests use.
+///
+/// A device seeds its picks from the clock instead
+/// ([`ApiPerfStorage::new`]), so two runs of one workload time different
+/// frames.
+#[cfg(perf_tracking)]
+const FIXED_FRAME_SEED: u32 = 0x2545_f491;
+
+/// A seed for the frame picks from the time-stamp counter, never 0.
+///
+/// Xorshift stays at 0 once there, so the low bit is set.
+#[cfg(perf_tracking)]
+fn frame_seed_from_clock() -> u32 {
+    let [b0, b1, b2, b3, b4, b5, b6, b7] = rdtsc().to_le_bytes();
+    (u32::from_le_bytes([b0, b1, b2, b3]) ^ u32::from_le_bytes([b4, b5, b6, b7])) | 1
+}
+
 /// The six sections the snapshot's `keys` scope times, in the order the draw builds them.
 ///
 /// Each entry is the section's slot, its grid label (at most four columns,
@@ -471,7 +488,9 @@ impl ApiPerfStorage {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            state: Rc::new(RefCell::new(ApiPerfState::new())),
+            state: Rc::new(RefCell::new(ApiPerfState::with_frame_seed(
+                frame_seed_from_clock(),
+            ))),
         }
     }
 
@@ -1420,13 +1439,18 @@ pub struct ApiPerfState {
     /// `active_child_cycles` can be reset to 0 at rest (prevents
     /// top-level residue).
     timer_depth: u32,
-    /// Xorshift state that picks the draws whose `keys` sections are timed, and the frame gaps.
+    /// Xorshift state that picks the draws whose `keys` sections are timed.
     ///
     /// Persists across frames and is never drained, so a game or benchmark
     /// that repeats its draw sequence every frame is not sampled at the same
-    /// positions each time. The gap to the next timed frame
-    /// ([`Self::untimed_frames`]) is drawn from the same state.
+    /// positions each time.
     section_sample_state: u32,
+    /// Xorshift state that draws the gap to the next timed frame ([`Self::untimed_frames`]).
+    ///
+    /// Kept apart from the draw picks, so the frames a device times depend
+    /// only on its seed and its frame count. A device seeds it from the
+    /// clock, so two runs of one workload time different frames.
+    frame_sample_state: u32,
     /// Untimed frames left before the next timed one; the frame being recorded is timed at 0.
     ///
     /// Each timed frame draws the next gap from the xorshift state, between 0
@@ -1444,8 +1468,15 @@ impl Default for ApiPerfState {
 
 #[cfg(perf_tracking)]
 impl ApiPerfState {
+    /// Counters whose frame picks start from a fixed seed, as the unit tests want.
     #[must_use]
     pub const fn new() -> Self {
+        Self::with_frame_seed(FIXED_FRAME_SEED)
+    }
+
+    /// Counters whose frame picks start from `seed`; the low bit is set, since xorshift stays at 0.
+    #[must_use]
+    pub const fn with_frame_seed(seed: u32) -> Self {
         Self {
             counters: FrameCounters::new(),
             reset_epoch: 0,
@@ -1454,6 +1485,7 @@ impl ApiPerfState {
             active_child_cycles: 0,
             timer_depth: 0,
             section_sample_state: 0x9e37_79b9,
+            frame_sample_state: seed | 1,
             untimed_frames: 0,
         }
     }
@@ -1843,11 +1875,11 @@ impl ApiPerfState {
             return;
         }
         self.untimed_frames = if self.untimed_frames == 0 {
-            let mut state = self.section_sample_state;
+            let mut state = self.frame_sample_state;
             state ^= state << 13;
             state ^= state >> 17;
             state ^= state << 5;
-            self.section_sample_state = state;
+            self.frame_sample_state = state;
             let span = u32::from(FRAME_SAMPLE_PERIOD) * 2 - 1;
             u8::try_from(state % span).expect("a gap below twice the period fits u8")
         } else {
@@ -2174,7 +2206,8 @@ pub struct EncoderPerfState {
     /// Rolling aggregator of every frame: the counts, gauges and faults of the summary.
     ///
     /// Its time sums mix timed and untimed frames and are never rendered;
-    /// its start and its frame count set the window's span.
+    /// the peaks of the timers that read the clock in every frame are. Its
+    /// start and its frame count set the window's span.
     count_window: PerfWindow,
     // Native devices always set clock domains before intake. None supports local
     // core clients and unit fixtures whose counters already share one domain.
@@ -3977,9 +4010,9 @@ impl Bottleneck {
 /// `cargo test -p mtld3d-core --target x86_64-apple-darwin`.
 #[cfg(perf_tracking)]
 struct Summary<'a> {
-    /// The timed frames: every timer row and the ratios built on it.
+    /// The timed frames: every timer row's time and the per-call and per-draw ratios built on it.
     w: &'a PerfWindow,
-    /// Every frame: the count, gauge and fault sections.
+    /// Every frame: the counts, gauges and faults, and the peaks of the every-frame timers.
     c: &'a PerfWindow,
     caches: &'a CacheSizes,
     window_secs: f64,
@@ -4447,11 +4480,11 @@ impl<'a> Summary<'a> {
                 ms: Some(frame_total_ms),
                 aux: None,
                 desc: None,
-                peak: Some(cycles_to_ms(w.frame_total.max)),
+                peak: Some(cycles_to_ms(self.c.frame_total.max)),
             },
         );
 
-        let total_calls: u64 = w.calls_by.iter().map(|c| c.sum).sum();
+        let total_calls: u64 = self.c.calls_by.iter().map(|c| c.sum).sum();
         // `D3D9 calls` reports `api_cyc` (sum of raw buckets). The
         // Device bucket's raw value includes `send_frame` backpressure
         // wait, which nests below as a `Present stall` subtimer of
@@ -4490,7 +4523,7 @@ impl<'a> Summary<'a> {
             };
             let label = format!("│  {branch} {name}");
             let avg_ms = cycles_to_ms(w.api_by[*cat as usize].sum / f);
-            let calls = w.calls_by[*cat as usize].sum;
+            let calls = self.c.calls_by[*cat as usize].sum;
             write_row(
                 out,
                 s,
@@ -4585,8 +4618,15 @@ impl<'a> Summary<'a> {
             };
             let idx = *sub as usize;
             let label = format!("│  │  {branch} {name}");
+            // The `Frame` calls read the clock in every frame, the others in the timed ones.
+            let peak_window = if matches!(sub, DeviceSubCategory::Frame) {
+                self.c
+            } else {
+                w
+            };
             let avg_ms = cycles_to_ms(w.device_sub_by[idx].sum / f);
-            let calls = w.device_sub_calls_by[idx].sum;
+            let timed_calls = w.device_sub_calls_by[idx].sum;
+            let calls = self.c.device_sub_calls_by[idx].sum;
             // Draws reports `(N ns/draw)` (each call IS one draw); the
             // per-Set rows report `(N ns/call)` against their own call
             // count so the magnitude stays comparable across captures
@@ -4599,7 +4639,7 @@ impl<'a> Summary<'a> {
                 | DeviceSubCategory::TexStageState
                 | DeviceSubCategory::SamplerState
                 | DeviceSubCategory::ShaderConst
-                | DeviceSubCategory::Bind => ns_per_call_aux(w.device_sub_by[idx].sum, calls),
+                | DeviceSubCategory::Bind => ns_per_call_aux(w.device_sub_by[idx].sum, timed_calls),
                 _ => None,
             };
             let aux_cell = aux.unwrap_or_else(|| format!("({calls:>10})"));
@@ -4612,7 +4652,7 @@ impl<'a> Summary<'a> {
                     ms: Some(avg_ms),
                     aux: Some(aux_cell),
                     desc: None,
-                    peak: Some(cycles_to_ms(w.device_sub_by[idx].max)),
+                    peak: Some(cycles_to_ms(peak_window.device_sub_by[idx].max)),
                 },
             );
             // `Present stall` is measured by `CycleSetTimer` inside
@@ -4634,7 +4674,7 @@ impl<'a> Summary<'a> {
                         ms: Some(present_ms),
                         aux: None,
                         desc: Some("encoder backpressure"),
-                        peak: Some(cycles_to_ms(w.present_block.max)),
+                        peak: Some(cycles_to_ms(self.c.present_block.max)),
                     },
                 );
                 // Make Frame's children sum to Frame: the remainder
@@ -4652,7 +4692,7 @@ impl<'a> Summary<'a> {
                         ms: Some(frame_other_ms),
                         aux: None,
                         desc: Some("non-blocking body"),
-                        peak: Some(cycles_to_ms(w.frame_other.max)),
+                        peak: Some(cycles_to_ms(self.c.frame_other.max)),
                     },
                 );
             }
@@ -4851,7 +4891,7 @@ impl<'a> Summary<'a> {
             let idx = *sub as usize;
             let label = format!("│  │  │  {branch} {name}");
             let avg_ms = cycles_to_ms(w.bind_sub_by[idx].sum / f);
-            let calls = w.bind_sub_calls_by[idx].sum;
+            let calls = self.c.bind_sub_calls_by[idx].sum;
             write_row(
                 out,
                 s,
@@ -4900,7 +4940,7 @@ impl<'a> Summary<'a> {
             let idx = *sub as usize;
             let label = format!("│  │  {branch} {name}");
             let avg_ms = cycles_to_ms(w.surface_sub_by[idx].sum / f);
-            let calls = w.surface_sub_calls_by[idx].sum;
+            let calls = self.c.surface_sub_calls_by[idx].sum;
             write_row(
                 out,
                 s,
@@ -4956,7 +4996,7 @@ impl<'a> Summary<'a> {
                 ms: Some(op_ms),
                 aux: Some(format!("({pct:>5.1} %)", pct = enc_pct(op_ms))),
                 desc: Some("D3D9→Metal translate"),
-                peak: Some(cycles_to_ms(w.op_cyc.max)),
+                peak: Some(cycles_to_ms(self.c.op_cyc.max)),
             },
         );
         // Decompose "Closures (op)" into the six per-draw phases measured
@@ -5089,7 +5129,7 @@ impl<'a> Summary<'a> {
                 ms: Some(finalize_ms),
                 aux: Some(format!("({pct:>5.1} %)", pct = enc_pct(finalize_ms))),
                 desc: Some("passes + descriptors"),
-                peak: Some(cycles_to_ms(w.finalize.max)),
+                peak: Some(cycles_to_ms(self.c.finalize.max)),
             },
         );
         write_row(
@@ -5101,7 +5141,7 @@ impl<'a> Summary<'a> {
                 ms: Some(stall_ms),
                 aux: Some(format!("({pct:>5.1} %)", pct = enc_pct(stall_ms))),
                 desc: Some("submit backpressure"),
-                peak: Some(cycles_to_ms(w.submit_stall.max)),
+                peak: Some(cycles_to_ms(self.c.submit_stall.max)),
             },
         );
     }
@@ -5136,7 +5176,7 @@ impl<'a> Summary<'a> {
                 ms: Some(submit_exec_ms),
                 aux: None,
                 desc: None,
-                peak: Some(cycles_to_ms(w.submit_exec.max)),
+                peak: Some(cycles_to_ms(self.c.submit_exec.max)),
             },
         );
         write_row(
@@ -5148,7 +5188,7 @@ impl<'a> Summary<'a> {
                 ms: Some(encode_commit_ms),
                 aux: None,
                 desc: Some("command-walk → Metal"),
-                peak: Some(cycles_to_ms(w.encode_commit.max)),
+                peak: Some(cycles_to_ms(self.c.encode_commit.max)),
             },
         );
         let children = [
@@ -5156,11 +5196,22 @@ impl<'a> Summary<'a> {
                 "│  ├─ leading blits",
                 "frame-leading blits",
                 &w.submit_blits,
+                &self.c.submit_blits,
             ),
-            ("│  ├─ passes", "render-pass replay", &w.submit_passes),
-            ("│  ├─ commit", "handlers + commit", &w.submit_commit),
+            (
+                "│  ├─ passes",
+                "render-pass replay",
+                &w.submit_passes,
+                &self.c.submit_passes,
+            ),
+            (
+                "│  ├─ commit",
+                "handlers + commit",
+                &w.submit_commit,
+                &self.c.submit_commit,
+            ),
         ];
-        for (label, desc, stat) in children {
+        for (label, desc, stat, every_frame) in children {
             write_row(
                 out,
                 s,
@@ -5170,7 +5221,7 @@ impl<'a> Summary<'a> {
                     ms: Some(cycles_to_ms(stat.sum / f)),
                     aux: None,
                     desc: Some(desc),
-                    peak: Some(cycles_to_ms(stat.max)),
+                    peak: Some(cycles_to_ms(every_frame.max)),
                 },
             );
         }
@@ -5184,7 +5235,7 @@ impl<'a> Summary<'a> {
                 ms: Some(cycles_to_ms(resid / f)),
                 aux: None,
                 desc: Some("setup, settle, thunk"),
-                peak: Some(cycles_to_ms(w.submit_resid.max)),
+                peak: Some(cycles_to_ms(self.c.submit_resid.max)),
             },
         );
         write_row(
@@ -5196,7 +5247,7 @@ impl<'a> Summary<'a> {
                 ms: Some(pw_ms),
                 aux: None,
                 desc: Some("prior present commit"),
-                peak: Some(cycles_to_ms(w.present_wait.max)),
+                peak: Some(cycles_to_ms(self.c.present_wait.max)),
             },
         );
     }
@@ -5212,7 +5263,6 @@ impl<'a> Summary<'a> {
     /// and the tripwire for the ring's size: 0 is the goal. All come back
     /// with the next payload, lagged one present.
     fn write_present_thread(&self, out: &mut String, dw_ms: f64) {
-        let w = self.w;
         let s = &self.s;
         let _ = writeln!(out);
         write_row(
@@ -5224,7 +5274,7 @@ impl<'a> Summary<'a> {
                 ms: Some(dw_ms),
                 aux: None,
                 desc: None,
-                peak: Some(cycles_to_ms(w.drawable_wait.max)),
+                peak: Some(cycles_to_ms(self.c.drawable_wait.max)),
             },
         );
         write_row(
@@ -5236,7 +5286,7 @@ impl<'a> Summary<'a> {
                 ms: Some(dw_ms),
                 aux: None,
                 desc: Some("nextDrawable GPU+comp"),
-                peak: Some(cycles_to_ms(w.drawable_wait.max)),
+                peak: Some(cycles_to_ms(self.c.drawable_wait.max)),
             },
         );
         write_row(
@@ -5246,7 +5296,7 @@ impl<'a> Summary<'a> {
                 label: "├─ Snapshots",
                 bold_label: false,
                 ms: None,
-                aux: Some(format!("({:>10})", w.snapshots.sum)),
+                aux: Some(format!("({:>10})", self.c.snapshots.sum)),
                 desc: Some("presented from a copy"),
                 peak: None,
             },
@@ -5258,7 +5308,7 @@ impl<'a> Summary<'a> {
                 label: "└─ Slot waits",
                 bold_label: false,
                 ms: None,
-                aux: Some(format!("({:>10})", w.slot_waits.sum)),
+                aux: Some(format!("({:>10})", self.c.slot_waits.sum)),
                 desc: Some("copy waited for a present"),
                 peak: None,
             },
@@ -5323,7 +5373,7 @@ impl<'a> Summary<'a> {
                     label,
                     bold_label: false,
                     ms: Some(cycles_to_ms(w.gpu[role].sum / f)),
-                    aux: Some(format!("({:>10})", w.gpu_buffers[role].sum)),
+                    aux: Some(format!("({:>10})", self.c.gpu_buffers[role].sum)),
                     desc: Some(desc),
                     peak: None,
                 },
@@ -5332,7 +5382,6 @@ impl<'a> Summary<'a> {
     }
 
     fn write_frame_total(&self, out: &mut String, frame_total_ms: f64) {
-        let w = self.w;
         let s = &self.s;
         let _ = writeln!(out);
         write_row(
@@ -5344,7 +5393,7 @@ impl<'a> Summary<'a> {
                 ms: Some(frame_total_ms),
                 aux: None,
                 desc: None,
-                peak: Some(cycles_to_ms(w.frame_total.max)),
+                peak: Some(cycles_to_ms(self.c.frame_total.max)),
             },
         );
         let _ = writeln!(
@@ -5352,7 +5401,7 @@ impl<'a> Summary<'a> {
             "{d}submit_status={status:#x}   (API, Encoder, Submit, Present run in parallel; frame_total ≥ max(api_cpu, enc_cpu, submit_cpu + present_wait, gpu_wait)){r}",
             d = s.dim,
             r = s.reset,
-            status = w.last_submit_status,
+            status = self.c.last_submit_status,
         );
     }
 
@@ -5907,7 +5956,7 @@ impl<'a> Summary<'a> {
                 pct(rebuilds)
             );
             if KEYS_SECTIONS.iter().any(|&(timed, ..)| timed == slot)
-                && let Some(per_rebuild) = w.draw_snapshot_section_per_rebuild(slot)
+                && let Some(per_rebuild) = self.w.draw_snapshot_section_per_rebuild(slot)
             {
                 let ns = cycles_to_ms(per_rebuild) * 1e6;
                 let _ = write!(out, "  {ns:>5.0} ns/rebuild");
@@ -6121,6 +6170,15 @@ impl KvLine {
         self.peak_ms(base, cycles_to_ms(stat.max));
     }
 
+    /// `<base>_ms` from the timed frames and `<base>_peak_ms` from every frame.
+    ///
+    /// For a timer that reads the clock in every frame, so its worst frame
+    /// can be any frame of the window.
+    fn every_frame_cycles(&mut self, base: impl Display + Copy, timed: &Stat, every: &Stat) {
+        self.per_frame_ms(base, cycles_to_ms(timed.sum));
+        self.peak_ms(base, cycles_to_ms(every.max));
+    }
+
     /// `<base>_total`: the window total of a count, never averaged.
     fn total(&mut self, base: impl Display, total: u64) {
         let _ = write!(self.out, " {base}_total={total}");
@@ -6227,13 +6285,13 @@ fn render_kv(w: &PerfWindow, c: &PerfWindow, caches: &CacheSizes, window_secs: f
     let mut kv = KvLine::new(window_secs, c.frames, w.frames);
 
     // The `buckets:` line, plus the frame it divides.
-    kv.cycles("frame", &w.frame_total);
+    kv.every_frame_cycles("frame", &w.frame_total, &c.frame_total);
     kv.cycles("api_d3d9", &w.api_work);
     kv.cycles("api_outside", &w.outside_d3d9);
-    kv.cycles("enc_work", &w.enc_work);
+    kv.every_frame_cycles("enc_work", &w.enc_work, &c.enc_work);
     kv.per_frame_ms("submit_work", cycles_to_ms(w.encode_commit_sum()));
-    kv.peak_ms("submit_work", cycles_to_ms(w.encode_commit.max));
-    kv.cycles("gpu_wait", &w.drawable_wait);
+    kv.peak_ms("submit_work", cycles_to_ms(c.encode_commit.max));
+    kv.every_frame_cycles("gpu_wait", &w.drawable_wait, &c.drawable_wait);
 
     // API thread: D3D9 calls, their categories and the device sub-buckets.
     kv.cycles("api_calls", &w.api_cyc);
@@ -6250,12 +6308,17 @@ fn render_kv(w: &PerfWindow, c: &PerfWindow, caches: &CacheSizes, window_secs: f
     kv.cycles("query_wait", &w.query_wait);
     for (sub, base) in DEVICE {
         let i = sub as usize;
-        kv.cycles(base, &w.device_sub_by[i]);
+        // The `Frame` calls read the clock in every frame, the others in the timed ones.
+        if matches!(sub, DeviceSubCategory::Frame) {
+            kv.every_frame_cycles(base, &w.device_sub_by[i], &c.device_sub_by[i]);
+        } else {
+            kv.cycles(base, &w.device_sub_by[i]);
+        }
         kv.total(format_args!("{base}_calls"), c.device_sub_calls_by[i].sum);
     }
-    kv.cycles("present_stall", &w.present_block);
+    kv.every_frame_cycles("present_stall", &w.present_block, &c.present_block);
     kv.per_frame_ms("dev_frame_other", cycles_to_ms(w.frame_other_sum()));
-    kv.peak_ms("dev_frame_other", cycles_to_ms(w.frame_other.max));
+    kv.peak_ms("dev_frame_other", cycles_to_ms(c.frame_other.max));
     kv.cycles("draw_snapshot", &w.draw_snapshot);
     kv.cycles("draw_snapshot_stages", &w.draw_snapshot_stages);
     kv.cycles("draw_snapshot_c_ff", &w.draw_snapshot_c_ff);
@@ -6312,8 +6375,8 @@ fn render_kv(w: &PerfWindow, c: &PerfWindow, caches: &CacheSizes, window_secs: f
     }
 
     // Encoder thread.
-    kv.cycles("enc", &w.enc_cyc);
-    kv.cycles("enc_op", &w.op_cyc);
+    kv.every_frame_cycles("enc", &w.enc_cyc, &c.enc_cyc);
+    kv.every_frame_cycles("enc_op", &w.op_cyc, &c.op_cyc);
     for (sub, base) in OP {
         kv.cycles(base, &w.op_sub[sub as usize]);
     }
@@ -6333,17 +6396,17 @@ fn render_kv(w: &PerfWindow, c: &PerfWindow, caches: &CacheSizes, window_secs: f
     kv.per_frame_ms("enc_op_resid", cycles_to_ms(w.op_resid_sum()));
     kv.peak_ms("enc_op_resid", cycles_to_ms(w.op_leftover.max));
     kv.per_frame_ms("enc_finalize", cycles_to_ms(w.finalize_sum()));
-    kv.peak_ms("enc_finalize", cycles_to_ms(w.finalize.max));
-    kv.cycles("enc_submit_stall", &w.submit_stall);
+    kv.peak_ms("enc_finalize", cycles_to_ms(c.finalize.max));
+    kv.every_frame_cycles("enc_submit_stall", &w.submit_stall, &c.submit_stall);
 
     // Submit and present threads.
-    kv.cycles("submit", &w.submit_exec);
-    kv.cycles("submit_blits", &w.submit_blits);
-    kv.cycles("submit_passes", &w.submit_passes);
-    kv.cycles("submit_commit", &w.submit_commit);
+    kv.every_frame_cycles("submit", &w.submit_exec, &c.submit_exec);
+    kv.every_frame_cycles("submit_blits", &w.submit_blits, &c.submit_blits);
+    kv.every_frame_cycles("submit_passes", &w.submit_passes, &c.submit_passes);
+    kv.every_frame_cycles("submit_commit", &w.submit_commit, &c.submit_commit);
     kv.per_frame_ms("submit_resid", cycles_to_ms(w.submit_resid_sum()));
-    kv.peak_ms("submit_resid", cycles_to_ms(w.submit_resid.max));
-    kv.cycles("present_wait", &w.present_wait);
+    kv.peak_ms("submit_resid", cycles_to_ms(c.submit_resid.max));
+    kv.every_frame_cycles("present_wait", &w.present_wait, &c.present_wait);
     kv.total("snapshots", c.snapshots.sum);
     kv.total("slot_waits", c.slot_waits.sum);
 

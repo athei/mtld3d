@@ -1793,3 +1793,108 @@ fn a_window_without_timed_frames_reports_counts_and_zero_timers() {
     let grid = Summary::render_windows(&timed, &count, &sample_caches(), 2.0, false);
     assert!(grid.contains("frames=1  timed=0"), "{grid}");
 }
+
+/// The grid takes its counts and the peaks of the every-frame timers from every frame.
+///
+/// The per-call ratios stay with the timed frames, whose time they divide.
+#[test]
+fn grid_counts_and_every_frame_peaks_come_from_every_frame() {
+    let device = ApiCategory::Device as usize;
+    let render_state = DeviceSubCategory::RenderState as usize;
+    let timed_frame = {
+        let mut frame = sample(100, 0);
+        frame.counters.timed = 1;
+        frame.counters.api_call_counts_by_category[device] = 10;
+        frame.counters.device_sub_calls[render_state] = 10;
+        frame.counters.device_sub_cycles[render_state] = ns_to_cycles(1_000);
+        frame.enc.slot_waits = 1;
+        frame.timing.frame_total_cycles = ns_to_cycles(1_000_000);
+        frame.timing.present_block_cycles = ns_to_cycles(100_000);
+        frame
+    };
+    let untimed_frame = {
+        let mut frame = sample(100, 0);
+        frame.counters.api_call_counts_by_category[device] = 30;
+        frame.counters.device_sub_calls[render_state] = 30;
+        frame.enc.slot_waits = 4;
+        frame.timing.frame_total_cycles = ns_to_cycles(9_000_000);
+        frame.timing.present_block_cycles = ns_to_cycles(7_000_000);
+        frame
+    };
+    let mut enc = EncoderPerfState::new();
+    enc.fold(&timed_frame);
+    enc.fold(&untimed_frame);
+    let grid = Summary::render_windows(
+        &enc.perf_window,
+        &enc.count_window,
+        &sample_caches(),
+        2.0,
+        false,
+    );
+    let row = |label: &str| {
+        grid.lines()
+            .find(|line| line.starts_with(label))
+            .unwrap_or_else(|| panic!("no {label} row in\n{grid}"))
+            .to_owned()
+    };
+    assert!(row("├─ D3D9 calls").contains("40 calls"), "{grid}");
+    assert!(row("│  ├─ Device").contains("(        40)"), "{grid}");
+    assert!(row("└─ Slot waits").contains("(         5)"), "{grid}");
+    assert!(
+        row("│  │  ├─ RenderState").contains("( 100 ns/call)"),
+        "the ratio divides the timed frame's time by its own calls: {grid}"
+    );
+    let peak = |ns: u64| format!("peak {:>5.2} ms", cycles_to_ms(ns_to_cycles(ns)));
+    assert!(row("API thread").contains(&peak(9_000_000)), "{grid}");
+    assert!(row("Frame total").contains(&peak(9_000_000)), "{grid}");
+    assert!(
+        row("│  │  │  ├─ Send stall").contains(&peak(7_000_000)),
+        "{grid}"
+    );
+
+    let line = render_kv(&enc.perf_window, &enc.count_window, &sample_caches(), 2.0).finish();
+    assert!(line.contains(" api_calls_total=40 "), "{line}");
+    assert!(line.contains(" slot_waits_total=5 "), "{line}");
+    let kv_peak = |ns: u64| format!("{:.3}", cycles_to_ms(ns_to_cycles(ns)));
+    assert!(
+        line.contains(&format!(" frame_peak_ms={} ", kv_peak(9_000_000))),
+        "{line}"
+    );
+    assert!(
+        line.contains(&format!(" present_stall_peak_ms={} ", kv_peak(7_000_000))),
+        "{line}"
+    );
+    assert!(
+        line.contains(&format!(" frame_ms={} ", kv_peak(1_000_000))),
+        "the time stays with the timed frame: {line}"
+    );
+}
+
+/// The frame picks follow the seed alone: the draw picks between presents leave them be.
+#[test]
+fn frame_picks_depend_only_on_the_seed_and_the_frame_count() {
+    let picks = |seed: u32, draws_per_frame: u32| {
+        let mut state = ApiPerfState::with_frame_seed(seed);
+        let mut payload = FramePerfPayload::new();
+        (0..512)
+            .map(|_| {
+                for _ in 0..draws_per_frame {
+                    state.record_snapshot_rebuild(SnapshotSection::Rs.bit());
+                }
+                state.drain_into_payload(&mut payload, true);
+                payload.counters.timed != 0
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        picks(7, 0),
+        picks(7, 37),
+        "draws do not move the frame picks"
+    );
+    assert_ne!(picks(7, 0), picks(8, 0), "another seed picks other frames");
+    assert_eq!(
+        ApiPerfState::with_frame_seed(0).frame_sample_state,
+        1,
+        "a zero seed is made odd, since xorshift stays at 0"
+    );
+}
