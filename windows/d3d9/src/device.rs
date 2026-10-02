@@ -2837,9 +2837,10 @@ impl DeviceInner {
     ///
     /// Mirrors `device_reset`'s size-change pipeline (drain → destroy
     /// old textures → adopt new dims → push `drawableSize` → recreate
-    /// textures → reseed `current_frame` → re-push default viewport) but
-    /// **skips** `reset_to_defaults` — the game didn't request a Reset,
-    /// so its render states / textures / vertex bindings must survive.
+    /// textures → reseed `current_frame` → re-push default viewport while
+    /// render target 0 is the back buffer) but **skips**
+    /// `reset_to_defaults`: the game didn't request a Reset, so its render
+    /// states / textures / bindings must survive.
     /// No-op when dims already match, and for a fullscreen device: its
     /// logical size is the mode the game requested, decoupled from the
     /// window, and only a `Reset` may change it. Caller drives this from
@@ -2905,7 +2906,44 @@ impl DeviceInner {
         }
 
         self.set_backbuffer_dims(new_width, new_height);
+        let back_buffer_made = self.recreate_implicit_surfaces(new_width, new_height);
+        // Whichever way the recreate went, the textures the flush's frame and
+        // the saved bindings named are gone: the reseeded frame and the
+        // re-asserted bindings name what it made, or nothing where it failed.
+        // The game's own bindings outlive the resize.
+        self.reseed_current_frame();
+        self.retarget_implicit_bindings(old_depth);
+        self.reassert_saved_bindings();
 
+        // The viewport and scissor follow render target 0 when that is the
+        // back buffer the resize changed. A game drawing into its own target
+        // keeps them: D3D9 changes them only at `SetRenderTarget` and `Reset`.
+        // A back buffer that failed leaves them to the `Reset` it requires.
+        let rt0_is_back_buffer = self
+            .last_color_rt_binding
+            .as_ref()
+            .is_none_or(|(binding, _)| matches!(binding, RtBinding::Backbuffer { .. }));
+        if back_buffer_made && rt0_is_back_buffer {
+            self.set_viewport(D3DVIEWPORT9 {
+                x: 0,
+                y: 0,
+                width: new_width,
+                height: new_height,
+                min_z: 0.0,
+                max_z: 1.0,
+            });
+            self.scissor_rect = [0, 0, new_width, new_height];
+        }
+    }
+
+    /// Create the back buffer and implicit depth texture `apply_auto_resize` needs.
+    ///
+    /// The old ones are already destroyed. A back buffer Metal refuses leaves
+    /// every implicit handle NULL and the device requiring `Reset`; a depth
+    /// texture it refuses leaves the depth handle NULL and the device drawing
+    /// without depth. Each failure logs once, at the step that failed.
+    /// Returns whether the back buffer was made.
+    fn recreate_implicit_surfaces(&mut self, new_width: u32, new_height: u32) -> bool {
         let mut bb_params = mtld3d_shared::CreateBackbufferParams {
             device_handle: self.device_handle,
             record_handle: self.record_handle,
@@ -2933,7 +2971,7 @@ impl DeviceInner {
             self.set_backbuffer_msaa_handle(MetalHandle::NULL, MetalHandle::NULL);
             self.set_depth_stencil_handle(MetalHandle::NULL);
             self.flags.insert(DeviceFlags::NOT_RESET);
-            return;
+            return false;
         }
         self.set_backbuffer_handle(bb_params.texture_handle, bb_params.srgb_texture_handle);
         self.set_backbuffer_msaa_handle(
@@ -2958,7 +2996,7 @@ impl DeviceInner {
                     self.depth_stencil_format,
                 );
                 self.set_depth_stencil_handle(MetalHandle::NULL);
-                return;
+                return true;
             };
             // Render space, matching the colour attachment exactly.
             let mut ds_params = CreateDepthTextureParams {
@@ -2976,29 +3014,13 @@ impl DeviceInner {
                     "apply_auto_resize: CreateDepthTexture failed (0x{status:08X}) — depth lost",
                 );
                 self.set_depth_stencil_handle(MetalHandle::NULL);
-                return;
+                return true;
             }
             self.set_depth_stencil_handle(ds_params.texture_handle);
         } else {
             self.set_depth_stencil_handle(MetalHandle::NULL);
         }
-
-        self.reseed_current_frame();
-        // The game's own bindings outlive the resize: the reseeded frame gets
-        // them back, with the implicit surfaces' new handles.
-        self.retarget_implicit_bindings(old_depth);
-        self.reassert_saved_bindings();
-
-        let viewport = D3DVIEWPORT9 {
-            x: 0,
-            y: 0,
-            width: new_width,
-            height: new_height,
-            min_z: 0.0,
-            max_z: 1.0,
-        };
-        self.set_viewport(viewport);
-        self.scissor_rect = [0, 0, new_width, new_height];
+        true
     }
 }
 
