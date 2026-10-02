@@ -5,7 +5,7 @@
 
 use core::ffi::c_void;
 
-use mtld3d_tests::{Harness, UNWRITTEN};
+use mtld3d_tests::{Harness, UNWRITTEN, spawn_scoped};
 use mtld3d_types::{
     D3D_OK, D3DCLEAR_TARGET, D3DDECL_END_STREAM, D3DDECLTYPE_FLOAT3, D3DDECLTYPE_UNUSED,
     D3DDECLUSAGE_POSITION, D3DERR_INVALIDCALL, D3DERR_MOREDATA, D3DERR_NOTFOUND,
@@ -15,8 +15,8 @@ use mtld3d_types::{
     D3DRTYPE_TEXTURE, D3DSAMP_MAGFILTER, D3DSAMP_MINFILTER, D3DSAMP_MIPFILTER, D3DSBT_ALL,
     D3DSGR_CALIBRATE, D3DSGR_NO_CALIBRATION, D3DTEXF_LINEAR, D3DTEXF_NONE, D3DTEXF_POINT,
     D3DTSS_CONSTANT, D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_WRITEONLY, D3DVERTEXELEMENT9, E_NOINTERFACE,
-    Guid, IID_IDIRECT3D9, IID_IDIRECT3DDEVICE9, IID_IDIRECT3DSWAPCHAIN9, IID_IDIRECT3DTEXTURE9,
-    IID_IUNKNOWN,
+    Guid, IDirect3D9Vtbl, IID_IDIRECT3D9, IID_IDIRECT3DDEVICE9, IID_IDIRECT3DSWAPCHAIN9,
+    IID_IDIRECT3DTEXTURE9, IID_IUNKNOWN,
 };
 
 /// `GetPrivateData` as a test reads it: the hr and the size it reported.
@@ -360,6 +360,60 @@ fn factory_refcount_increments_and_decrements() {
         1,
         "Release returns the post-decrement count"
     );
+}
+
+/// `AddRef` and `Release` on one `IDirect3D9` from several threads at once keep an exact count.
+///
+/// COM reference counts are free-threaded, and every device an interface
+/// created takes and gives back a reference on it from that device's own
+/// threads, under that device's lock alone. A count that loses an update
+/// leaks the interface (and with the last one the log thread) or frees it
+/// under a holder. Every thread pairs its calls, so the count has to come
+/// back to where it started. A cushion of references taken first keeps a
+/// lost decrement from freeing the interface in the middle of the run. A
+/// lost update is a race, so a regression fails this run by run with high
+/// odds rather than every time.
+#[test]
+fn factory_refcount_survives_concurrent_add_ref_and_release() {
+    const THREADS: usize = 4;
+    const PAIRS: u32 = 100_000;
+    const CUSHION: u32 = 1_000_000;
+    let h = Harness::factory_only();
+    for _ in 0..CUSHION {
+        h.add_ref_factory();
+    }
+    let factory = h.factory() as usize;
+    std::thread::scope(|scope| {
+        for _ in 0..THREADS {
+            spawn_scoped(scope, || {
+                let interface = factory as *mut c_void;
+                // SAFETY: `interface` is the live `IDirect3D9` the harness
+                // holds, whose first word is its vtable.
+                let vtbl_ptr = unsafe { *interface.cast::<*const IDirect3D9Vtbl>() };
+                // SAFETY: the vtable of a live interface is a `'static` table.
+                let vtbl = unsafe { &*vtbl_ptr };
+                for _ in 0..PAIRS {
+                    // SAFETY: vtable thunks; each `Release` balances the
+                    // `AddRef` before it, and the cushion keeps the count up.
+                    unsafe { (vtbl.add_ref)(interface) };
+                    // SAFETY: as above.
+                    unsafe { (vtbl.release)(interface) };
+                }
+            });
+        }
+    });
+    let held = h.add_ref_factory();
+    h.release_factory();
+    // Checked before the cushion goes back: a count that came out short
+    // would let these releases free the interface the harness still holds.
+    assert_eq!(
+        held,
+        CUSHION + 2,
+        "the harness's reference, the cushion and this probe's, nothing gained or lost"
+    );
+    for _ in 0..CUSHION {
+        h.release_factory();
+    }
 }
 
 #[test]
