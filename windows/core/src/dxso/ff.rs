@@ -671,8 +671,10 @@ fn emit_vertex_in(out: &mut String, vs: &FfVsKey) {
     if vs.vertex_blend_count > 0 && vs.declared_weights_count > 0 {
         out.push_str("    float4 blend_weight [[attribute(12)]];\n");
     }
+    // Read as floats whatever the declared type, which Metal converts every
+    // vertex format into; `emit_vertex_blend` rounds each lane to an index.
     if vs.vertex_blend_count > 0 && vs.declared_indices() {
-        out.push_str("    uint4 blend_indices [[attribute(13)]];\n");
+        out.push_str("    float4 blend_indices [[attribute(13)]];\n");
     }
     // Per-vertex point size (`D3DFVF_PSIZE`), a FLOAT1 the descriptor
     // zero-pads; only `.x` is read.
@@ -813,10 +815,14 @@ fn emit_point_size(out: &mut String, vs: &FfVsKey, scale: bool) {
 ///
 /// Index source:
 /// - Indexed mode (`vertex_blend_indexed = true`): `idx[i] = in.blend_indices[i]`,
-///   clamped to [`MAX_VERTEX_BLEND_MATRIX_INDEX`]. D3D9 leaves a `BLENDINDICES`
-///   value above `MaxVertexBlendMatrixIndex` undefined, and the palette only
-///   reaches that far, so the clamp is what keeps the read inside the bound
-///   constant block: one `min` per index, and every in-range index unchanged.
+///   rounded to the nearest integer and clamped to
+///   [`MAX_VERTEX_BLEND_MATRIX_INDEX`]. The lanes arrive as floats from any
+///   declared type: a `UBYTE4` index is its byte value, as is a `D3DCOLOR`
+///   one, which the descriptor feeds as bytes in memory order, and a `FLOAT`
+///   index is its own value. D3D9 leaves a `BLENDINDICES` value above
+///   `MaxVertexBlendMatrixIndex` undefined, and the palette only reaches that
+///   far, so the clamp is what keeps the read inside the bound constant
+///   block, and every in-range index is unchanged.
 /// - Sequential mode: `idx[i] = i` (matrices come from `world_palette[0..K]`),
 ///   already inside the cap since K is at most `D3DVBF_3WEIGHTS + 1`.
 ///
@@ -840,7 +846,7 @@ fn emit_vertex_blend(out: &mut String, vs: &FfVsKey, needs_normal: bool) {
         out.push_str("    {\n");
         let _ = writeln!(
             out,
-            "        uint idx = min(in.blend_indices[0], {MAX_VERTEX_BLEND_MATRIX_INDEX}u);"
+            "        uint idx = uint(clamp(rint(in.blend_indices[0]), 0.0, {MAX_VERTEX_BLEND_MATRIX_INDEX}.0));"
         );
         let _ = writeln!(
             out,
@@ -867,7 +873,7 @@ fn emit_vertex_blend(out: &mut String, vs: &FfVsKey, needs_normal: bool) {
         if indexed {
             let _ = writeln!(
                 out,
-                "        uint idx = min(in.blend_indices[{i}], {MAX_VERTEX_BLEND_MATRIX_INDEX}u);"
+                "        uint idx = uint(clamp(rint(in.blend_indices[{i}]), 0.0, {MAX_VERTEX_BLEND_MATRIX_INDEX}.0));"
             );
         } else {
             let _ = writeln!(out, "        uint idx = {i}u;");
@@ -892,7 +898,7 @@ fn emit_vertex_blend(out: &mut String, vs: &FfVsKey, needs_normal: bool) {
     if indexed {
         let _ = writeln!(
             out,
-            "        uint idx = min(in.blend_indices[{last}], {MAX_VERTEX_BLEND_MATRIX_INDEX}u);"
+            "        uint idx = uint(clamp(rint(in.blend_indices[{last}]), 0.0, {MAX_VERTEX_BLEND_MATRIX_INDEX}.0));"
         );
     } else {
         let _ = writeln!(out, "        uint idx = {last}u;");

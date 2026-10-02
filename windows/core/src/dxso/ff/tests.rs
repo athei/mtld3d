@@ -2491,7 +2491,7 @@ fn vertex_blend_indexed_3_weight_reads_blend_indices() {
         "{msl}"
     );
     assert!(
-        msl.contains("uint4 blend_indices [[attribute(13)]]"),
+        msl.contains("float4 blend_indices [[attribute(13)]]"),
         "{msl}"
     );
     // Three explicit + one implicit indexed reads, each clamped to the
@@ -2500,7 +2500,7 @@ fn vertex_blend_indexed_3_weight_reads_blend_indices() {
     for i in 0..4 {
         assert!(
             msl.contains(&format!(
-                "in.blend_indices[{i}], {MAX_VERTEX_BLEND_MATRIX_INDEX}u)"
+                "uint(clamp(rint(in.blend_indices[{i}]), 0.0, {MAX_VERTEX_BLEND_MATRIX_INDEX}.0))"
             )),
             "indexed mode reads a clamped blend_indices[{i}]: {msl}"
         );
@@ -2521,7 +2521,7 @@ fn vertex_blend_indexed_only_0_weights_single_matrix() {
     // No BLENDWEIGHT slot needed.
     assert!(!msl.contains("blend_weight"), "{msl}");
     assert!(
-        msl.contains("uint4 blend_indices [[attribute(13)]]"),
+        msl.contains("float4 blend_indices [[attribute(13)]]"),
         "{msl}"
     );
     // No accumulator weight sum — single-matrix shortcut path.
@@ -2531,7 +2531,7 @@ fn vertex_blend_indexed_only_0_weights_single_matrix() {
     );
     assert!(
         msl.contains(&format!(
-            "in.blend_indices[0], {MAX_VERTEX_BLEND_MATRIX_INDEX}u)"
+            "uint(clamp(rint(in.blend_indices[0]), 0.0, {MAX_VERTEX_BLEND_MATRIX_INDEX}.0))"
         )),
         "{msl}"
     );

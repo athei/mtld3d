@@ -657,6 +657,45 @@ fn resolve_attrs_for_ff_matches_ff_convention() {
     assert_eq!(resolved.extents[0], 20);
 }
 
+/// The FF descriptor fetches `D3DCOLOR` blend indices as raw bytes in memory order.
+///
+/// A normalized BGRA fetch would hand the FF VS colour channels in (0, 1),
+/// swizzled, where it needs each byte's value as a palette index. Every other
+/// `D3DCOLOR` element, and the same element under a programmable VS, keeps
+/// the colour fetch.
+#[test]
+fn resolve_attrs_for_ff_fetches_d3dcolor_blend_indices_as_bytes() {
+    let (elements, _) = fvf_to_elements(
+        D3DFVF_XYZB3 | D3DFVF_LASTBETA_D3DCOLOR | D3DFVF_DIFFUSE,
+    );
+    let format_of = |resolved: &ResolvedAttrs, attr: u32| {
+        resolved
+            .attrs
+            .iter()
+            .find(|a| a.attr_index == attr)
+            .map(|a| a.format)
+    };
+    let ff = resolve_attrs_for_ff(&elements);
+    assert_eq!(format_of(&ff, 13), Some(VertexFormat::UChar4), "indices");
+    assert_eq!(format_of(&ff, 12), Some(VertexFormat::Float2), "weights");
+    assert_eq!(
+        format_of(&ff, 2),
+        Some(VertexFormat::UChar4NormalizedBgra),
+        "diffuse"
+    );
+    let semantics = [InputSemantic {
+        usage: DeclUsage::BlendIndices,
+        usage_index: 0,
+        register_index: 3,
+    }];
+    let programmable = resolve_attrs_for_vs(&elements, &semantics);
+    assert_eq!(
+        format_of(&programmable, 3),
+        Some(VertexFormat::UChar4NormalizedBgra),
+        "a programmable VS decodes D3DCOLOR itself"
+    );
+}
+
 #[test]
 fn resolve_attrs_keeps_each_stream_separate() {
     // POSITION on stream 0, COLOR0 on stream 1 at offset 0, an unconsumed

@@ -1498,6 +1498,102 @@ fn indexed_vertex_blend_bounds_the_palette_at_the_advertised_index() {
     }
 }
 
+/// Position, one `D3DCOLOR` blend-index word and a diffuse colour.
+///
+/// The FVF is `D3DFVF_XYZB1 | D3DFVF_LASTBETA_D3DCOLOR | D3DFVF_DIFFUSE`: the
+/// one beta is the packed indices, so the vertex carries no weight.
+#[repr(C)]
+struct ColorIndexVertex {
+    position: [f32; 3],
+    indices: u32,
+    color: u32,
+}
+
+/// Position, one `FLOAT1` blend index and a diffuse colour, through a declaration.
+#[repr(C)]
+struct FloatIndexVertex {
+    position: [f32; 3],
+    index: f32,
+    color: u32,
+}
+
+/// The quarter quad of [`indexed_quad`] with its indices in another vertex format.
+fn quarter_quad<V>(vertex: impl Fn([f32; 3]) -> V) -> [V; 4] {
+    [(-0.25, 0.25), (-0.25, -0.25), (0.25, 0.25), (0.25, -0.25)].map(|(x, y)| vertex([x, y, 0.5]))
+}
+
+/// Indexed blending reads `D3DCOLOR` and `FLOAT` blend indices as palette indices.
+///
+/// Under `D3DVBF_0WEIGHTS` the whole vertex follows the matrix its first index
+/// names. Bone 1 shifts right, bone 3 left, and bone 0 off screen. The
+/// `D3DCOLOR` word 0x00030201 holds the bytes 1, 2, 3, 0 in memory, and the
+/// first of them is the index, so the quad lands right; the colour channel
+/// order would pick 3 and land left. A `FLOAT1` index of 1.0 lands right too.
+#[test]
+fn indexed_vertex_blend_reads_d3dcolor_and_float_blend_indices() {
+    use mtld3d_types::{
+        D3DDECL_END, D3DDECLMETHOD_DEFAULT, D3DDECLTYPE_D3DCOLOR, D3DDECLTYPE_FLOAT1,
+        D3DDECLTYPE_FLOAT3, D3DDECLUSAGE_BLENDINDICES, D3DDECLUSAGE_COLOR, D3DDECLUSAGE_POSITION,
+        D3DFVF_LASTBETA_D3DCOLOR, D3DFVF_XYZB1, D3DVBF_0WEIGHTS, D3DVERTEXELEMENT9,
+    };
+    let h = Harness::new();
+    assert_eq!(h.set_render_state(D3DRS_LIGHTING, 0), 0);
+    assert_eq!(h.set_render_state(D3DRS_CULLMODE, D3DCULL_NONE), 0);
+    for state in [D3DTS_VIEW, D3DTS_PROJECTION] {
+        assert_eq!(h.set_transform(state, &IDENTITY), 0);
+    }
+    assert_eq!(h.set_transform(D3DTS_WORLD, &translate_x(10.0)), 0);
+    assert_eq!(h.set_transform(D3DTS_WORLD + 1, &translate_x(0.5)), 0);
+    assert_eq!(h.set_transform(D3DTS_WORLD + 3, &translate_x(-0.5)), 0);
+    assert_eq!(h.set_render_state(D3DRS_VERTEXBLEND, D3DVBF_0WEIGHTS), 0);
+    assert_eq!(h.set_render_state(D3DRS_INDEXEDVERTEXBLENDENABLE, 1), 0);
+    h.select_diffuse_stage(0);
+    let assert_shifted_right = |context: &str| {
+        assert_eq!(h.read_pixel(480, 240), BLEND_RED, "{context}: bone 1 shifted right");
+        assert_eq!(h.read_pixel(160, 240), BLUE, "{context}: nothing on bone 3");
+        assert_eq!(h.read_pixel(320, 240), BLUE, "{context}: nothing at the origin");
+    };
+
+    assert_eq!(
+        h.set_fvf(D3DFVF_XYZB1 | D3DFVF_LASTBETA_D3DCOLOR | D3DFVF_DIFFUSE),
+        0
+    );
+    let packed = quarter_quad(|position| ColorIndexVertex {
+        position,
+        indices: 0x0003_0201,
+        color: BLEND_RED,
+    });
+    h.render_once(BLUE, |d| {
+        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLESTRIP, 2, &packed), 0);
+    });
+    assert_shifted_right("D3DCOLOR indices");
+
+    let element = |offset, type_, usage| D3DVERTEXELEMENT9 {
+        stream: 0,
+        offset,
+        type_,
+        method: D3DDECLMETHOD_DEFAULT,
+        usage,
+        usage_index: 0,
+    };
+    let decl = h.create_vertex_declaration(&[
+        element(0, D3DDECLTYPE_FLOAT3, D3DDECLUSAGE_POSITION),
+        element(12, D3DDECLTYPE_FLOAT1, D3DDECLUSAGE_BLENDINDICES),
+        element(16, D3DDECLTYPE_D3DCOLOR, D3DDECLUSAGE_COLOR),
+        D3DDECL_END,
+    ]);
+    assert_eq!(h.set_vertex_declaration(&decl), 0);
+    let float = quarter_quad(|position| FloatIndexVertex {
+        position,
+        index: 1.0,
+        color: BLEND_RED,
+    });
+    h.render_once(BLUE, |d| {
+        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLESTRIP, 2, &float), 0);
+    });
+    assert_shifted_right("FLOAT1 index");
+}
+
 // ── FF VS source inputs changing between two draws of one frame ──
 
 /// A lit quad facing the viewer, centred on `x` in clip space.

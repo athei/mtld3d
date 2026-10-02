@@ -249,3 +249,6 @@ pub fn destroy_render_pipeline(pipeline_handle: u64) {
     // SAFETY: just wrapped the unique canonical retain.
     unsafe { handle.release_retain() };
 }
+
+#[cfg(test)]
+mod tests;
