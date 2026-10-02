@@ -29,7 +29,7 @@ use mtld3d_types::{
 
 use super::{
     D3D_OK, D3DERR_INVALIDCALL, LOG_TARGET,
-    com_ref::{Bound, CachedComPtr},
+    com_ref::{CachedComPtr, Captured},
     device::{DeviceInner, Direct3DDevice9},
     index_buffer::Direct3DIndexBuffer9,
     pixel_shader::Direct3DPixelShader9,
@@ -53,7 +53,8 @@ static DIRECT3D_STATE_BLOCK9_VTBL: IDirect3DStateBlock9Vtbl = IDirect3DStateBloc
 /// One state-change operation recorded between `BeginStateBlock` and `EndStateBlock`.
 ///
 /// COM-object variants carry their own [`CachedComPtr`], a device-internal
-/// reference the application's refcount never sees, released on Drop;
+/// reference the application's refcount never sees (though it keeps a
+/// `D3DPOOL_DEFAULT` object outstanding for `Reset`), released on Drop;
 /// `Apply` replays each op by calling the corresponding live `DeviceInner`
 /// setter, lending the stored pointer via [`CachedComPtr::raw`], and the
 /// live binding takes its own reference, so refcounts stay balanced.
@@ -103,10 +104,10 @@ pub enum StateOp {
     Texture {
         stage: u32,
         /// Null for SetTexture(stage, NULL).
-        tex: CachedComPtr<Direct3DTexture9, Bound>,
+        tex: CachedComPtr<Direct3DTexture9, Captured>,
     },
-    VertexDeclaration(CachedComPtr<Direct3DVertexDeclaration9, Bound>),
-    VertexShader(CachedComPtr<Direct3DVertexShader9, Bound>),
+    VertexDeclaration(CachedComPtr<Direct3DVertexDeclaration9, Captured>),
+    VertexShader(CachedComPtr<Direct3DVertexShader9, Captured>),
     VertexShaderConstantF {
         start: u32,
         values: Vec<[f32; 4]>,
@@ -114,7 +115,7 @@ pub enum StateOp {
     StreamSource {
         stream: u32,
         /// Null for SetStreamSource(stream, NULL, ..).
-        vb: CachedComPtr<Direct3DVertexBuffer9, Bound>,
+        vb: CachedComPtr<Direct3DVertexBuffer9, Captured>,
         offset: u32,
         stride: u32,
     },
@@ -123,8 +124,8 @@ pub enum StateOp {
         /// Raw `SetStreamSourceFreq` word, already validated by the setter.
         setting: u32,
     },
-    Indices(CachedComPtr<Direct3DIndexBuffer9, Bound>),
-    PixelShader(CachedComPtr<Direct3DPixelShader9, Bound>),
+    Indices(CachedComPtr<Direct3DIndexBuffer9, Captured>),
+    PixelShader(CachedComPtr<Direct3DPixelShader9, Captured>),
     PixelShaderConstantF {
         start: u32,
         values: Vec<[f32; 4]>,
@@ -603,20 +604,21 @@ struct StateSnapshot {
     fetch4_enabled: u16,
     vertex_sampler_states: [[u32; SAMPLER_STATE_COUNT]; 4],
     ff: FfStateSnapshot,
-    bound_textures: [CachedComPtr<Direct3DTexture9, Bound>; STAGE_COUNT],
-    bound_vertex_textures: [CachedComPtr<Direct3DTexture9, Bound>; 4],
+    bound_textures: [CachedComPtr<Direct3DTexture9, Captured>; STAGE_COUNT],
+    bound_vertex_textures: [CachedComPtr<Direct3DTexture9, Captured>; 4],
     viewport: D3DVIEWPORT9,
     scissor_rect: [u32; 4],
-    bound_vertex_shader: CachedComPtr<Direct3DVertexShader9, Bound>,
-    bound_pixel_shader: CachedComPtr<Direct3DPixelShader9, Bound>,
+    bound_vertex_shader: CachedComPtr<Direct3DVertexShader9, Captured>,
+    bound_pixel_shader: CachedComPtr<Direct3DPixelShader9, Captured>,
     /// Vertex declaration + index buffer round-trip like the bound shaders.
     ///
     /// Captured with a device-internal reference, released on drop, like
     /// every object the snapshot holds: it keeps the object alive after the
     /// app releases its own reference, and never shows in the app's refcount
-    /// or holds the device a second time.
-    bound_vertex_decl: CachedComPtr<Direct3DVertexDeclaration9, Bound>,
-    bound_index_buffer: CachedComPtr<Direct3DIndexBuffer9, Bound>,
+    /// or holds the device a second time. A held `D3DPOOL_DEFAULT` index
+    /// buffer still blocks `Reset` while the snapshot lives.
+    bound_vertex_decl: CachedComPtr<Direct3DVertexDeclaration9, Captured>,
+    bound_index_buffer: CachedComPtr<Direct3DIndexBuffer9, Captured>,
     /// Every vertex stream's binding and frequency, indexed by stream.
     ///
     /// Same ownership as the index buffer. Restored by `D3DSBT_ALL` only:
@@ -638,7 +640,7 @@ struct StateSnapshot {
 
 /// One vertex stream as a `D3DSBT_ALL` snapshot captures it.
 struct StreamSnapshot {
-    vb: CachedComPtr<Direct3DVertexBuffer9, Bound>,
+    vb: CachedComPtr<Direct3DVertexBuffer9, Captured>,
     offset: u32,
     stride: u32,
     freq: u32,
@@ -953,7 +955,7 @@ unsafe fn finalize_state_block(this: *mut Direct3DStateBlock9) {
 
 // SAFETY: `refcount_mut` exposes this wrapper's own counter; `finalize` frees it
 // exactly once at refcount zero. State blocks have no bound-slot (private)
-// refcount and do not forward to the device in this revision.
+// refcount; their public refcount forwards to the device that created them.
 unsafe impl crate::com_ref::ComChild for Direct3DStateBlock9 {
     fn refcount_mut(&mut self) -> &mut u32 {
         &mut self.refcount

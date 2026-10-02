@@ -4309,8 +4309,10 @@ extern "system" fn device_reset(this: *mut c_void, present_params: *mut c_void) 
     dev.recording_state_block = None;
     // Reset rejects any outstanding app reference to a `D3DPOOL_DEFAULT`
     // resource or an implicit surface: those are backed by the device memory
-    // the Reset recreates, and D3D9 makes the app release them first. The
-    // device's own references (bindings, state blocks) do not count.
+    // the Reset recreates, and D3D9 makes the app release them first. A state
+    // block that holds such a resource keeps it outstanding too, since the
+    // resource lives as long as the block; the device's bindings do not count
+    // (they are reset below on success).
     let blockers = dev.outstanding_reset_blockers.load(Ordering::Acquire);
     if blockers != 0 {
         warn!(

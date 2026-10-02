@@ -179,6 +179,12 @@ pub struct TextureInner {
     /// with `D3DUSAGE_RENDERTARGET` — passed through to `CreateTextureParams`
     /// so the Metal texture is allocated with `MTLTextureUsage::RenderTarget`.
     usage_flags: TextureUsage,
+    /// References state blocks hold on this texture.
+    ///
+    /// A `D3DPOOL_DEFAULT` texture a state block keeps alive is a `Reset`
+    /// blocker until this and the public refcount are both zero
+    /// (`ComChild::state_block_refs_mut`).
+    state_block_refs: u32,
     /// Raw D3D9 `D3DUSAGE_*` bits.
     ///
     /// Read by the lock entry points to tell the default-pool texture D3D9
@@ -3298,6 +3304,7 @@ fn build_texture_inner(info: TextureCreateInfo) -> *mut TextureInner {
         flags,
         swizzle: info.swizzle,
         usage_flags: info.usage_flags,
+        state_block_refs: 0,
         d3d_usage: info.d3d_usage,
         render_scale: info.render_scale,
         autogen_filter_type: D3DTEXF_LINEAR,
@@ -3638,6 +3645,9 @@ unsafe impl crate::com_ref::ComChild for Direct3DTexture9 {
     }
     fn blocks_reset_while_referenced(&self) -> bool {
         self.inner().is_default_pool()
+    }
+    fn state_block_refs_mut(&mut self) -> Option<&mut u32> {
+        Some(&mut self.inner_mut().state_block_refs)
     }
     fn private_refcount(&self) -> u32 {
         self.private_refcount

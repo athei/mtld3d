@@ -31,7 +31,7 @@ use mtld3d_types::{
     D3DPRESENT_INTERVAL_FOUR, D3DPRESENT_INTERVAL_IMMEDIATE, D3DPRESENT_INTERVAL_ONE,
     D3DPRESENT_INTERVAL_THREE, D3DPRESENT_INTERVAL_TWO, D3DPRESENT_PARAMETERS, D3DPT_TRIANGLELIST,
     D3DRS_COLORWRITEENABLE, D3DRS_FILLMODE, D3DRS_LIGHTING, D3DRTYPE_CUBETEXTURE, D3DRTYPE_SURFACE,
-    D3DRTYPE_TEXTURE, D3DRTYPE_VOLUME, D3DRTYPE_VOLUMETEXTURE, D3DSWAPEFFECT_DISCARD,
+    D3DRTYPE_TEXTURE, D3DRTYPE_VOLUME, D3DRTYPE_VOLUMETEXTURE, D3DSBT_ALL, D3DSWAPEFFECT_DISCARD,
     D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_DYNAMIC, D3DUSAGE_QUERY_FILTER,
     D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING, D3DUSAGE_QUERY_SRGBREAD, D3DUSAGE_QUERY_SRGBWRITE,
     D3DUSAGE_QUERY_VERTEXTEXTURE, D3DUSAGE_QUERY_WRAPANDMIP, D3DUSAGE_RENDERTARGET, D3DVIEWPORT9,
@@ -1037,12 +1037,11 @@ fn reset_rejects_outstanding_default_pool_resources() {
 
 /// An open `BeginStateBlock` recording never blocks `Reset`, and `Reset` ends it.
 ///
-/// What a recording holds is the device's own reference, so a
-/// `D3DPOOL_DEFAULT` buffer recorded into it and then released by the
-/// application does not count as outstanding. A Reset with well-formed
-/// parameters drops the recording before it looks for outstanding
-/// references, so even one an application reference rejects leaves no
-/// recording open: the next `BeginStateBlock` starts a new one.
+/// A Reset with well-formed parameters drops the recording before it looks
+/// for outstanding references, so a `D3DPOOL_DEFAULT` buffer recorded into it
+/// and then released by the application is gone by the time it looks, and
+/// even a Reset an application reference rejects leaves no recording open:
+/// the next `BeginStateBlock` starts a new one.
 #[test]
 fn reset_ends_an_open_recording_and_is_not_blocked_by_it() {
     let h = Harness::new();
@@ -1081,6 +1080,52 @@ fn reset_ends_an_open_recording_and_is_not_blocked_by_it() {
     drop(h.end_state_block());
     drop(held);
     assert_eq!(h.reset(640, 480), D3D_OK, "Reset succeeds once released");
+}
+
+/// A state block that holds a `D3DPOOL_DEFAULT` resource keeps `Reset` rejected.
+///
+/// A `D3DSBT_ALL` block captures the bound buffer or texture and keeps it
+/// alive after the device unbinds it and the application releases its own
+/// reference, so the resource is still outstanding: `Reset` fails while the
+/// block lives and succeeds once the block is released. The device's own
+/// binding is not what blocks, since it is gone before the `Reset`.
+#[test]
+fn reset_is_rejected_while_a_state_block_holds_a_default_pool_resource() {
+    let h = Harness::new();
+    for what in ["vertex buffer", "texture"] {
+        let block = if what == "vertex buffer" {
+            let vb = h.create_vertex_buffer(64, 0, D3DFVF_XYZ, D3DPOOL_DEFAULT);
+            assert_eq!(
+                h.set_stream_source(0, &vb, 0, 12),
+                D3D_OK,
+                "SetStreamSource"
+            );
+            let block = h.create_state_block(D3DSBT_ALL);
+            assert_eq!(
+                h.set_stream_source_null(0, 0, 0),
+                D3D_OK,
+                "unbind the stream"
+            );
+            block
+        } else {
+            let tex = h.create_texture(16, 16, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT);
+            assert_eq!(h.set_texture(0, &tex), D3D_OK, "SetTexture");
+            let block = h.create_state_block(D3DSBT_ALL);
+            assert_eq!(h.clear_texture(0), D3D_OK, "unbind the texture");
+            block
+        };
+        assert_eq!(
+            h.reset(640, 480),
+            D3DERR_INVALIDCALL,
+            "a {what} only a state block holds still blocks Reset"
+        );
+        drop(block);
+        assert_eq!(
+            h.reset(640, 480),
+            D3D_OK,
+            "Reset succeeds once the block holding the {what} is released"
+        );
+    }
 }
 
 #[test]
