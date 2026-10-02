@@ -654,10 +654,10 @@ fn restore_recomputes_derived_masks() {
     use mtld3d_types::{D3DLIGHT_DIRECTIONAL, D3DLIGHT_SPOT, D3DLIGHT9};
 
     use super::FfStateSnapshot;
-    // State-block Apply restores the light/TSS arrays wholesale,
-    // bypassing the setters that maintain the masks — the captured
-    // light masks must land with the lights array, and tt_active_mask
-    // must re-derive from the restored stage states.
+    // State-block Apply restores the TSS array wholesale, bypassing the
+    // setter that maintains tt_active_mask, which must re-derive from the
+    // restored stage states; the lights go back through their setters, so
+    // their masks follow the restored lights.
     let mut src = FfState::new();
     src.set_light(
         0,
@@ -1362,13 +1362,14 @@ fn overflow_light_writes_mark_lights_dirty() {
     });
 }
 
-/// A snapshot carries the lights past the fast-path slots to the block types that own lights.
+/// A snapshot restores the lights it captured, at any index, and only those.
 ///
-/// `Vertex` and `All` put the captured light 100 back, parameters and
-/// enable, and leave light 200, defined after the capture, as it is: a block
-/// applies the lights it captured. `Pixel` leaves the overflow lights alone.
+/// `Vertex` and `All` put the captured lights 1 and 100 back, parameters and
+/// enable, and leave lights 3 and 200, defined after the capture, defined and
+/// enabled: a block applies the lights it captured. `Pixel` leaves every
+/// light alone.
 #[test]
-fn snapshot_restores_overflow_lights_with_the_lights() {
+fn snapshot_restores_the_captured_lights_and_only_those() {
     use mtld3d_types::{D3DLIGHT_DIRECTIONAL, D3DLIGHT9, StateBlockType};
 
     use super::FfStateSnapshot;
@@ -1379,57 +1380,108 @@ fn snapshot_restores_overflow_lights_with_the_lights() {
         ..Default::default()
     };
     let mut src = FfState::new();
-    src.set_light_at(100, &captured);
-    src.set_light_enabled_at(100, true);
+    for index in [1, 100] {
+        src.set_light_at(index, &captured);
+        src.set_light_enabled_at(index, true);
+    }
     let snap = FfStateSnapshot::from(&src);
 
     let changed = |state: &mut FfState| {
-        state.set_light_at(
-            100,
-            &D3DLIGHT9 {
-                range: 7.0,
-                ..captured
-            },
-        );
-        state.set_light_enabled_at(100, false);
-        state.set_light_at(200, &captured);
+        for index in [1, 100] {
+            state.set_light_at(
+                index,
+                &D3DLIGHT9 {
+                    range: 7.0,
+                    ..captured
+                },
+            );
+            state.set_light_enabled_at(index, false);
+        }
+        for index in [3, 200] {
+            state.set_light_at(index, &captured);
+            state.set_light_enabled_at(index, true);
+        }
     };
+    let range_at = |state: &FfState, index| state.get_light_at(index).map(|l| l.range.to_bits());
     for block_type in [StateBlockType::All, StateBlockType::Vertex] {
         let mut state = FfState::new();
         changed(&mut state);
         snap.restore_filtered(&mut state, block_type);
+        for index in [1, 100] {
+            assert_eq!(
+                range_at(&state, index),
+                Some(42.0_f32.to_bits()),
+                "{block_type:?} restores light {index}"
+            );
+            assert!(
+                state.is_light_enabled_at(index),
+                "{block_type:?} restores the enable of light {index}"
+            );
+        }
+        for index in [3, 200] {
+            assert!(
+                state.is_light_defined_at(index) && state.is_light_enabled_at(index),
+                "{block_type:?} leaves light {index}, defined after the capture"
+            );
+        }
         assert_eq!(
-            state.get_light_at(100).map(|l| l.range.to_bits()),
-            Some(42.0_f32.to_bits()),
-            "{block_type:?} restores light 100"
-        );
-        assert!(
-            state.is_light_enabled_at(100),
-            "{block_type:?} restores the enable"
-        );
-        assert!(
-            state.is_light_defined_at(200),
-            "{block_type:?} leaves a light defined after the capture"
+            state.light_active_mask(),
+            (1 << 1) | (1 << 3),
+            "{block_type:?}: the fast-path masks follow the lights the setters wrote"
         );
     }
     let mut state = FfState::new();
     changed(&mut state);
     snap.restore_into(&mut state);
-    assert_eq!(
-        state.get_light_at(100).map(|l| l.range.to_bits()),
-        Some(42.0_f32.to_bits()),
-        "restore_into restores light 100"
-    );
+    assert_eq!(range_at(&state, 100), Some(42.0_f32.to_bits()));
+    assert!(state.is_light_enabled_at(3), "restore_into leaves light 3");
 
     let mut state = FfState::new();
     changed(&mut state);
     snap.restore_filtered(&mut state, StateBlockType::Pixel);
+    for index in [1, 100] {
+        assert_eq!(
+            range_at(&state, index),
+            Some(7.0_f32.to_bits()),
+            "Pixel leaves light {index}"
+        );
+        assert!(!state.is_light_enabled_at(index), "Pixel leaves its enable");
+    }
+}
+
+/// A later snapshot kept to an earlier one's light set refreshes those lights and adds none.
+#[test]
+fn keep_light_set_of_refreshes_the_created_lights_only() {
+    use mtld3d_types::{D3DLIGHT_DIRECTIONAL, D3DLIGHT9, StateBlockType};
+
+    use super::FfStateSnapshot;
+
+    let light = |range| D3DLIGHT9 {
+        type_: D3DLIGHT_DIRECTIONAL,
+        range,
+        ..Default::default()
+    };
+    let mut state = FfState::new();
+    state.set_light_at(9, &light(1.0));
+    let created = FfStateSnapshot::from(&state);
+    state.set_light_at(9, &light(2.0));
+    state.set_light_at(10, &light(3.0));
+    let mut fresh = FfStateSnapshot::from(&state);
+    fresh.keep_light_set_of(&created);
+
+    let mut target = FfState::new();
+    target.set_light_at(10, &light(4.0));
+    fresh.restore_filtered(&mut target, StateBlockType::Vertex);
     assert_eq!(
-        state.get_light_at(100).map(|l| l.range.to_bits()),
-        Some(7.0_f32.to_bits()),
-        "Pixel leaves light 100"
+        target.get_light_at(9).map(|l| l.range.to_bits()),
+        Some(2.0_f32.to_bits()),
+        "light 9 refreshed to its value at the later capture"
     );
-    assert!(!state.is_light_enabled_at(100), "Pixel leaves the enable");
+    assert_eq!(
+        target.get_light_at(10).map(|l| l.range.to_bits()),
+        Some(4.0_f32.to_bits()),
+        "light 10 is not in the created set"
+    );
 }
 
 /// Run `write` on a state with enabled overflow light 100 and assert it marked LIGHTS.

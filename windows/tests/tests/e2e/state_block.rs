@@ -770,6 +770,37 @@ fn created_blocks_restore_a_light_past_the_eight_fast_path_slots() {
     }
 }
 
+#[test]
+fn created_blocks_leave_a_light_defined_after_the_capture() {
+    // A block applies the lights it captured. Light 3, defined and enabled
+    // after the block was created, stays defined and enabled through Apply
+    // and lights the draw after it.
+    for (sbt, name) in [(D3DSBT_ALL, "ALL"), (D3DSBT_VERTEXSTATE, "VERTEXSTATE")] {
+        let h = Harness::new();
+        assert_eq!(h.set_render_state(D3DRS_LIGHTING, 1), 0);
+        assert_eq!(h.set_render_state(D3DRS_CULLMODE, D3DCULL_NONE), 0);
+        assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_NORMAL), 0);
+        h.select_diffuse_stage(0);
+        assert_eq!(h.set_material(&diffuse_material(colour(1.0, 1.0, 1.0))), 0);
+
+        let block = h.create_state_block(sbt);
+        assert_eq!(h.set_light(3, &frontal_light(colour(0.0, 1.0, 0.0))), 0);
+        assert_eq!(h.light_enable(3, true), 0);
+        assert_eq!(block.apply(), 0, "Apply {name}");
+        assert!(h.light_enabled(3), "{name}: light 3 stays enabled");
+        assert_eq!(
+            h.light(3).diffuse.g.to_bits(),
+            1.0f32.to_bits(),
+            "{name}: light 3 keeps its parameters"
+        );
+        let (r, g, b) = draw_lit(&h);
+        assert!(
+            r <= 2 && g >= 0xF0 && b <= 2,
+            "{name}: light 3 lights the quad, got ({r}, {g}, {b})"
+        );
+    }
+}
+
 /// POSITION float3 on stream 0, nothing else: a declaration the game created.
 const fn position_only_decl() -> [D3DVERTEXELEMENT9; 2] {
     [

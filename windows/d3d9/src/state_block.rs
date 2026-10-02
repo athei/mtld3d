@@ -991,6 +991,9 @@ extern "system" fn sb_capture(this: *mut c_void) -> i32 {
             // previous snapshot (releases the references its slots held).
             let block_type = snap.block_type;
             let mut fresh = StateSnapshot::capture_from(dev, block_type);
+            // D3D9 fixes a block's light set when it creates the block, so a
+            // `Capture` refreshes those lights and adds none.
+            fresh.ff.keep_light_set_of(&snap.ff);
             // D3D9 keeps the stream offsets a `CreateStateBlock` block captured
             // at creation: a later `Capture` refreshes the buffer and stride of
             // each stream but not its offset. Recorded blocks (`BeginStateBlock`)
