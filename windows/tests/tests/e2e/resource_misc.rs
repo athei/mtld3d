@@ -5,7 +5,7 @@
 
 use core::ffi::c_void;
 
-use mtld3d_tests::Harness;
+use mtld3d_tests::{Harness, UNWRITTEN};
 use mtld3d_types::{
     D3D_OK, D3DCLEAR_TARGET, D3DDECL_END_STREAM, D3DDECLTYPE_FLOAT3, D3DDECLTYPE_UNUSED,
     D3DDECLUSAGE_POSITION, D3DERR_INVALIDCALL, D3DERR_MOREDATA, D3DERR_NOTFOUND,
@@ -14,8 +14,8 @@ use mtld3d_types::{
     D3DPOOL_MANAGED, D3DPOOL_SCRATCH, D3DPOOL_SYSTEMMEM, D3DQUERYTYPE_EVENT, D3DRTYPE_SURFACE,
     D3DRTYPE_TEXTURE, D3DSAMP_MAGFILTER, D3DSAMP_MINFILTER, D3DSAMP_MIPFILTER, D3DSBT_ALL,
     D3DSGR_CALIBRATE, D3DSGR_NO_CALIBRATION, D3DTEXF_LINEAR, D3DTEXF_NONE, D3DTEXF_POINT,
-    D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_WRITEONLY, D3DVERTEXELEMENT9, E_NOINTERFACE, Guid,
-    IID_IDIRECT3D9, IID_IDIRECT3DDEVICE9, IID_IDIRECT3DSWAPCHAIN9, IID_IDIRECT3DTEXTURE9,
+    D3DTSS_CONSTANT, D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_WRITEONLY, D3DVERTEXELEMENT9, E_NOINTERFACE,
+    Guid, IID_IDIRECT3D9, IID_IDIRECT3DDEVICE9, IID_IDIRECT3DSWAPCHAIN9, IID_IDIRECT3DTEXTURE9,
     IID_IUNKNOWN,
 };
 
@@ -64,6 +64,11 @@ const POSITION_DECL: [D3DVERTEXELEMENT9; 2] = [
     },
 ];
 
+/// `SetTexture` / `GetTexture` take the fragment and vertex stages and ignore every other stage.
+///
+/// A stage no sampler has is accepted and ignored: `SetTexture` returns
+/// `D3D_OK` without binding and `GetTexture` returns `D3D_OK` with a null
+/// texture, the answer Windows and Wine give.
 #[test]
 fn get_texture_accepts_all_fragment_and_vertex_slots() {
     let h = Harness::new();
@@ -88,16 +93,98 @@ fn get_texture_accepts_all_fragment_and_vertex_slots() {
         );
     }
 
+    for stage in [16, 256, 261, u32::MAX] {
+        assert_eq!(
+            h.set_texture(stage, &texture),
+            D3D_OK,
+            "SetTexture({stage}) is accepted and ignored"
+        );
+        assert_eq!(
+            h.texture_matches_raw_result(stage, core::ptr::null_mut()),
+            (D3D_OK, true),
+            "GetTexture({stage}) answers a null texture"
+        );
+        assert_eq!(
+            texture.refcount(),
+            base,
+            "SetTexture({stage}) took no reference"
+        );
+    }
+}
+
+/// State calls with an index no state has follow the D3D9 runtimes rather than refusing it.
+///
+/// A texture-stage-state stage past the eighth clamps to the eighth, and a
+/// type past `D3DTSS_CONSTANT` (or the unnamed type 0) to `D3DTSS_CONSTANT`,
+/// on both `Set` and `Get`. A sampler state of a stage no sampler has is
+/// accepted and ignored, and reads as zero. A render state past
+/// `D3DRS_BLENDOPALPHA` up to 255 is accepted, ignored and reads as zero;
+/// above 255, and the unnamed states 1 to 6, `SetRenderState` still answers
+/// `D3D_OK` while `GetRenderState` is `INVALIDCALL`.
+#[test]
+fn out_of_range_state_indices_clamp_or_are_ignored() {
+    let h = Harness::new();
+
     assert_eq!(
-        h.set_texture(16, &texture),
-        D3DERR_INVALIDCALL,
-        "SetTexture rejects the first invalid fragment slot"
+        h.set_texture_stage_state(9, D3DTSS_CONSTANT, 0x1234_5678),
+        D3D_OK
     );
+    assert_eq!(h.texture_stage_state(7, D3DTSS_CONSTANT), 0x1234_5678);
     assert_eq!(
-        h.texture_matches_raw_result(16, core::ptr::null_mut()),
-        (D3DERR_INVALIDCALL, true),
-        "GetTexture rejects the first invalid fragment slot"
+        h.try_texture_stage_state(u32::MAX, D3DTSS_CONSTANT),
+        (D3D_OK, 0x1234_5678),
+        "a Get past the eighth stage reads the eighth"
     );
+    assert_eq!(h.set_texture_stage_state(2, 40, 0x0BAD_F00D), D3D_OK);
+    assert_eq!(h.texture_stage_state(2, D3DTSS_CONSTANT), 0x0BAD_F00D);
+    assert_eq!(
+        h.try_texture_stage_state(2, 0),
+        (D3D_OK, 0x0BAD_F00D),
+        "type 0 reads D3DTSS_CONSTANT"
+    );
+
+    for sampler in [16, 256, 261] {
+        assert_eq!(
+            h.set_sampler_state(sampler, D3DSAMP_MAGFILTER, D3DTEXF_POINT),
+            D3D_OK,
+            "SetSamplerState({sampler}) is accepted and ignored"
+        );
+        assert_eq!(
+            h.try_sampler_state(sampler, D3DSAMP_MAGFILTER),
+            (D3D_OK, 0),
+            "GetSamplerState({sampler}) reads zero"
+        );
+    }
+    assert_eq!(
+        h.sampler_state(15, D3DSAMP_MAGFILTER),
+        D3DTEXF_POINT,
+        "the last fragment sampler keeps its default"
+    );
+
+    for state in [210, 255] {
+        assert_eq!(
+            h.set_render_state(state, 7),
+            D3D_OK,
+            "SetRenderState({state})"
+        );
+        assert_eq!(
+            h.try_render_state(state),
+            (D3D_OK, 0),
+            "GetRenderState({state}) reads zero"
+        );
+    }
+    for state in [1, 6, 256, u32::MAX] {
+        assert_eq!(
+            h.set_render_state(state, 7),
+            D3D_OK,
+            "SetRenderState({state})"
+        );
+        assert_eq!(
+            h.try_render_state(state),
+            (D3DERR_INVALIDCALL, UNWRITTEN),
+            "GetRenderState({state}) is refused"
+        );
+    }
 }
 
 /// Every child resource forwards exactly one reference to the owning device.
@@ -655,9 +742,9 @@ fn resource_no_op_methods_are_callable() {
 /// They stay pinned at `0` for every other pool. D3D9 honours priority only for
 /// managed resources — it orders the resource manager's eviction — so
 /// `SetPriority` returns the previously stored value and `GetPriority` reads it
-/// back; non-managed pools report `0` and discard the write. Covers the two
-/// resource types the contract round-trips (texture and vertex buffer); surfaces
-/// and render targets are always `0`.
+/// back; non-managed pools report `0` and discard the write. Covers a texture
+/// and a vertex buffer (`buffers.rs` covers the index buffer); surfaces and
+/// render targets are always `0`.
 #[test]
 fn priority_round_trips_for_managed_resources() {
     let h = Harness::new();

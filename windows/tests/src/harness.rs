@@ -41,6 +41,12 @@ mod cursor_bitmap;
 /// which is a read of the variable like any other.
 static ENVIRONMENT: RwLock<()> = RwLock::new(());
 
+/// The value the seeded `try_*` getters put in their out slot before the call.
+///
+/// A getter that leaves the slot alone reads back as this, which no state a
+/// test sets holds.
+pub const UNWRITTEN: u32 = 0xDEAD_BEEF;
+
 /// The environment variable the layer reads its configuration overrides from.
 const CONFIG_VAR: &str = "MTLD3D_CONFIG";
 
@@ -996,9 +1002,12 @@ impl Harness {
     }
 
     /// `GetRenderState` returning `(hr, value)`.
+    ///
+    /// The out slot is seeded with [`UNWRITTEN`], so a call that leaves it
+    /// alone reads back as that value.
     #[must_use]
     pub fn try_render_state(&self, state: u32) -> (i32, u32) {
-        let mut value = 0u32;
+        let mut value = UNWRITTEN;
         // SAFETY: vtable thunk; `&mut value` is writable.
         let hr = unsafe { (self.dev_vtbl().get_render_state)(self.device, state, &raw mut value) };
         (hr, value)
@@ -1008,6 +1017,17 @@ impl Harness {
     pub fn set_sampler_state(&self, sampler: u32, state: u32, value: u32) -> i32 {
         // SAFETY: vtable thunk; `self.device` is live.
         unsafe { (self.dev_vtbl().set_sampler_state)(self.device, sampler, state, value) }
+    }
+
+    /// `GetSamplerState` returning `(hr, value)`, the out slot seeded with [`UNWRITTEN`].
+    #[must_use]
+    pub fn try_sampler_state(&self, sampler: u32, state: u32) -> (i32, u32) {
+        let mut value = UNWRITTEN;
+        // SAFETY: vtable thunk; `&mut value` is writable.
+        let hr = unsafe {
+            (self.dev_vtbl().get_sampler_state)(self.device, sampler, state, &raw mut value)
+        };
+        (hr, value)
     }
 
     /// `GetSamplerState`, asserting success.
@@ -1066,6 +1086,17 @@ impl Harness {
                 "SetTextureStageState",
             );
         }
+    }
+
+    /// `GetTextureStageState` returning `(hr, value)`, the out slot seeded with [`UNWRITTEN`].
+    #[must_use]
+    pub fn try_texture_stage_state(&self, stage: u32, ts_state: u32) -> (i32, u32) {
+        let mut value = UNWRITTEN;
+        // SAFETY: vtable thunk; `&mut value` is writable.
+        let hr = unsafe {
+            (self.dev_vtbl().get_texture_stage_state)(self.device, stage, ts_state, &raw mut value)
+        };
+        (hr, value)
     }
 
     /// `GetTextureStageState`, asserting success.
@@ -1264,6 +1295,28 @@ impl Harness {
         }
     }
 
+    /// `DrawPrimitiveUP` with a stride the caller names rather than `size_of::<V>()`.
+    ///
+    /// For a test of the stride's own validation, such as a zero stride.
+    pub fn draw_primitive_up_with_stride<V>(
+        &self,
+        prim: u32,
+        prim_count: u32,
+        verts: &[V],
+        stride: u32,
+    ) -> i32 {
+        // SAFETY: vtable thunk; `verts` is read-only for the call.
+        unsafe {
+            (self.dev_vtbl().draw_primitive_up)(
+                self.device,
+                prim,
+                prim_count,
+                verts.as_ptr().cast::<c_void>(),
+                stride,
+            )
+        }
+    }
+
     /// `DrawPrimitive` against the bound stream source.
     pub fn draw_primitive(&self, prim: u32, start_vertex: u32, prim_count: u32) -> i32 {
         // SAFETY: vtable thunk; `self.device` is live.
@@ -1304,6 +1357,20 @@ impl Harness {
         indices: &[I],
         verts: &[V],
     ) -> i32 {
+        let stride = u32::try_from(core::mem::size_of::<V>()).expect("vertex stride fits u32");
+        self.draw_indexed_primitive_up_with_stride(params, indices, verts, stride)
+    }
+
+    /// `DrawIndexedPrimitiveUP` with a vertex stride the caller names. Returns the hr.
+    ///
+    /// For a test of the stride's own validation, such as a zero stride.
+    pub fn draw_indexed_primitive_up_with_stride<I, V>(
+        &self,
+        params: &DrawIndexedUpParams,
+        indices: &[I],
+        verts: &[V],
+        stride: u32,
+    ) -> i32 {
         let &DrawIndexedUpParams {
             prim,
             min_vertex_index,
@@ -1311,7 +1378,6 @@ impl Harness {
             prim_count,
             index_format,
         } = params;
-        let stride = u32::try_from(core::mem::size_of::<V>()).expect("vertex stride fits u32");
         // SAFETY: vtable thunk; both slices are read-only for the call.
         unsafe {
             (self.dev_vtbl().draw_indexed_primitive_up)(

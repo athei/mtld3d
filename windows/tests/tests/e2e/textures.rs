@@ -3,8 +3,8 @@
 //! Plus cube and volume texture contracts.
 
 use mtld3d_tests::{
-    Harness, LockedRect, Rgba8, Texture, TexturedVertex, VolumeVertex, assert_pixel_approx,
-    assert_pixel_eq,
+    Harness, LockedRect, Rgba8, Texture, TexturedVertex, VolumeTexture, VolumeVertex,
+    assert_pixel_approx, assert_pixel_eq,
 };
 use mtld3d_types::{
     D3DBLEND_INVSRCALPHA, D3DBLEND_SRCALPHA, D3DBLEND_ZERO, D3DBOX, D3DERR_INVALIDCALL,
@@ -611,6 +611,24 @@ fn autogen_mipmap_texture_rejects_sub_level_unlock() {
     // Level zero stays reachable, where an Unlock without a matching Lock is
     // the S_OK case for a texture level.
     assert_eq!(tex.unlock_rect(0), 0, "UnlockRect on the exposed level");
+}
+
+/// `UnlockRect` of a level no mip chain can hold is `INVALIDCALL`.
+///
+/// The level arrives as a `u32` the application chose, so 256 and the top of
+/// the range are as possible as 15, and each is answered like any other level
+/// past the chain rather than ending the process.
+#[test]
+fn texture_unlock_rect_rejects_a_level_past_any_chain() {
+    let h = Harness::new();
+    let tex = h.create_texture(16, 16, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED);
+    for level in [1, 255, 256, u32::MAX] {
+        assert_eq!(
+            tex.unlock_rect(level),
+            D3DERR_INVALIDCALL,
+            "UnlockRect({level}) of a one-level texture"
+        );
+    }
 }
 
 #[test]
@@ -3259,6 +3277,79 @@ fn volume_update_keeps_per_draw_content() {
         let pixels = [h.read_pixel(160, 240), h.read_pixel(480, 240)];
         assert_eq!(pixels, [RED, BLUE], "volume draws bracketing UpdateTexture");
     }
+}
+
+/// Bind `volume` on stage 0 for `sample_volume_depth` with point filtering.
+fn arm_volume_sampling(h: &Harness, volume: &VolumeTexture<'_>) {
+    assert_eq!(h.set_volume_texture(0, volume), 0);
+    h.select_texture_stage(0);
+    point_clamp(h);
+    assert_eq!(
+        h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1 | (D3DFVF_TEXTUREFORMAT3 << 16)),
+        0
+    );
+}
+
+/// A `LockBox` with `D3DLOCK_READONLY` of an uploaded level publishes nothing.
+///
+/// A write through its pointer, one the application promised not to make,
+/// shows it: the sampled volume keeps the texels it was uploaded with.
+#[test]
+fn volume_lock_box_read_only_publishes_nothing() {
+    const RED: u32 = 0xFFFF_0000;
+    const BLUE: u32 = 0xFF00_00FF;
+    let h = Harness::new();
+    let (hr, managed) =
+        h.try_create_volume_texture([4, 4, 4], 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED);
+    assert_eq!(hr, 0);
+    let managed = managed.expect("managed volume");
+    managed.write_u32(0, &[RED; 64]);
+    arm_volume_sampling(&h, &managed);
+    assert_pixel_eq(sample_volume_depth(&h, 0.875), RED, "uploaded volume");
+    managed.write_u32_with_flags(0, D3DLOCK_READONLY, &[BLUE; 64]);
+    assert_pixel_eq(
+        sample_volume_depth(&h, 0.875),
+        RED,
+        "a READONLY lock publishes nothing",
+    );
+}
+
+/// A `LockBox` with `D3DLOCK_NO_DIRTY_UPDATE` of an `UpdateTexture` source adds no dirty region.
+///
+/// The next `UpdateTexture` copies nothing, while an ordinary lock after it
+/// is copied.
+#[test]
+fn volume_lock_box_no_dirty_update_adds_no_dirty_region() {
+    const RED: u32 = 0xFFFF_0000;
+    const GREEN: u32 = 0xFF00_FF00;
+    const BLUE: u32 = 0xFF00_00FF;
+    let h = Harness::new();
+    let (hr, source) =
+        h.try_create_volume_texture([4, 4, 4], 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM);
+    assert_eq!(hr, 0);
+    let source = source.expect("source");
+    let (hr, destination) =
+        h.try_create_volume_texture([4, 4, 4], 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT);
+    assert_eq!(hr, 0);
+    let destination = destination.expect("destination");
+    source.write_u32(0, &[RED; 64]);
+    assert_eq!(h.update_volume_texture_hr(&source, &destination), 0);
+    arm_volume_sampling(&h, &destination);
+    assert_pixel_eq(sample_volume_depth(&h, 0.875), RED, "first update");
+    source.write_u32_with_flags(0, D3DLOCK_NO_DIRTY_UPDATE, &[BLUE; 64]);
+    assert_eq!(h.update_volume_texture_hr(&source, &destination), 0);
+    assert_pixel_eq(
+        sample_volume_depth(&h, 0.875),
+        RED,
+        "a NO_DIRTY_UPDATE write is not copied",
+    );
+    source.write_u32(0, &[GREEN; 64]);
+    assert_eq!(h.update_volume_texture_hr(&source, &destination), 0);
+    assert_pixel_eq(
+        sample_volume_depth(&h, 0.875),
+        GREEN,
+        "an ordinary write after it is",
+    );
 }
 
 /// A whole-level volume write between two draws leaves the first draw its texels.

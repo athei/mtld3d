@@ -191,8 +191,9 @@ impl EncoderThread {
         mtld3d_core::encoder_failure::known_status(&self.failure)
     }
 
-    pub fn record_failure(&self, status: i32) -> i32 {
-        mtld3d_core::encoder_failure::record_failure(&self.failure, status)
+    /// Latch `status` as the device failure unless one is latched; `cause` names the step.
+    pub fn record_failure(&self, status: i32, cause: &str) -> i32 {
+        mtld3d_core::encoder_failure::record_failure(&self.failure, status, cause)
     }
 
     fn lock_retirement(&self) -> MutexGuard<'_, PacketRetirement> {
@@ -263,10 +264,13 @@ impl EncoderThread {
             Ok(packet) => packet,
             Err((error, packet)) => {
                 log::error!(target: LOG_TARGET, "encoder: frame encoding failed: {error:?}");
-                let failure = self.record_failure(match error {
-                    mtld3d_shared::encoder_wire::WireError::AllocationFailed => E_OUTOFMEMORY,
-                    _ => D3DERR_DEVICELOST,
-                });
+                let failure = self.record_failure(
+                    match error {
+                        mtld3d_shared::encoder_wire::WireError::AllocationFailed => E_OUTOFMEMORY,
+                        _ => D3DERR_DEVICELOST,
+                    },
+                    "frame encoding failed",
+                );
                 self.retain_failed(*packet);
                 return Err(failure);
             }
@@ -299,7 +303,7 @@ impl EncoderThread {
             }
             self.retain_failed(packet);
             log::error!(target: LOG_TARGET, "encoder: native frame submission failed {status:#x}, admitted={}", params.admitted);
-            return Err(self.record_failure(status));
+            return Err(self.record_failure(status, "native frame submission failed"));
         }
         // SAFETY: the native queue now owns its borrowing contract until completion.
         unsafe {
@@ -335,7 +339,7 @@ impl EncoderThread {
         let status = unix_call(&mut params);
         if status != D3D_OK {
             log::error!(target: LOG_TARGET, "encoder: native control {command} failed {status:#x}");
-            return Err(self.record_failure(status));
+            return Err(self.record_failure(status, "native encoder control failed"));
         }
         self.maintain_pending();
         self.status()
@@ -363,7 +367,7 @@ impl EncoderThread {
         let status = unix_call(&mut params);
         if status != D3D_OK {
             log::error!(target: LOG_TARGET, "encoder: native destruction failed {status:#x}");
-            return Err(self.record_failure(status));
+            return Err(self.record_failure(status, "native encoder destruction failed"));
         }
         self.runtime = 0;
         let retirement = self
@@ -410,7 +414,10 @@ struct RetirementCalls<'a> {
 
 impl RetirementHooks for RetirementCalls<'_> {
     fn packet_rejected(&mut self) {
-        self.encoder.record_failure(D3DERR_DEVICELOST);
+        self.encoder.record_failure(
+            D3DERR_DEVICELOST,
+            "the native runtime rejected a frame packet",
+        );
     }
 
     fn cancel_registration(&mut self, registration: u64) {
@@ -421,7 +428,8 @@ impl RetirementHooks for RetirementCalls<'_> {
         let status = unix_call(&mut params);
         if status != D3D_OK {
             log::error!(target: LOG_TARGET, "encoder: shader cancellation failed {status:#x}");
-            self.encoder.record_failure(status);
+            self.encoder
+                .record_failure(status, "native shader cancellation failed");
         }
     }
 }

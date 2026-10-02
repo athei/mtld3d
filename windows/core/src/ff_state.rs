@@ -35,7 +35,7 @@ use mtld3d_types::{
 
 use crate::{
     LOG_TARGET,
-    caps::{texture_op_unimplemented, unimplemented_texture_op},
+    caps::{FF_TEXTURE_STAGES, texture_op_unimplemented, unimplemented_texture_op},
     convert::FfVsLayout,
     dxso::{
         FfPsKey, FfStage, FfStageFlags, FfStageResult, FfVsFlags, FfVsKey, VariantFlags, VariantKey,
@@ -2161,6 +2161,39 @@ pub enum TssWriteFeeds {
     StageConstant,
     /// The SM1 `texbem`/`texbeml`/`bem` PS uniform (`build_bump_env_bytes`).
     BumpEnv,
+}
+
+/// The last texture stage the texture-stage-state calls store; a later stage clamps to it.
+pub const LAST_TEXTURE_STAGE: u32 = FF_TEXTURE_STAGES - 1;
+
+/// Whether a texture-stage-state stage and type name an entry of the stored table.
+///
+/// Type 0 names no `D3DTSS_*` state, and a type past `D3DTSS_CONSTANT` lies
+/// past the table.
+#[must_use]
+#[inline]
+pub const fn texture_stage_state_in_table(stage: u32, ty: u32) -> bool {
+    stage <= LAST_TEXTURE_STAGE && ty != 0 && (ty as usize) < TEXTURE_STAGE_STATE_COUNT
+}
+
+/// Clamp a texture-stage-state stage and type into the stored table, as D3D9 runtimes do.
+///
+/// A stage past the last reads and writes the last. A type past
+/// `D3DTSS_CONSTANT`, and the unnamed type 0, read and write
+/// `D3DTSS_CONSTANT`. An index already in the table is returned unchanged.
+#[must_use]
+pub const fn clamp_texture_stage_state(stage: u32, ty: u32) -> (u32, u32) {
+    let stage = if stage > LAST_TEXTURE_STAGE {
+        LAST_TEXTURE_STAGE
+    } else {
+        stage
+    };
+    let ty = if ty == 0 || (ty as usize) >= TEXTURE_STAGE_STATE_COUNT {
+        D3DTSS_CONSTANT
+    } else {
+        ty
+    };
+    (stage, ty)
 }
 
 /// Route a `D3DTSS_*` slot to the snapshot piece that reads it.

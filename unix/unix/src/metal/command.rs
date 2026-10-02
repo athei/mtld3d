@@ -1,4 +1,4 @@
-use core::ffi::c_void;
+use core::{ffi::c_void, hash::BuildHasher as _};
 use std::{
     collections::BTreeMap,
     sync::{
@@ -953,6 +953,13 @@ pub fn encode_present(
             );
             clear_drawable(cmd_buf, &drawable_texture);
         } else {
+            if gamma_layer != 0 {
+                mtld3d_shared::log_once_warn!(
+                    target: LOG_TARGET,
+                    "present: the gamma-ramp pass failed to encode; the frame is copied without \
+                     the ramp"
+                );
+            }
             encode_present_blit(
                 cmd_buf,
                 args.source,
@@ -1379,6 +1386,10 @@ fn encode_present_blit(
         clear_drawable(cmd_buf, drawable);
     }
     let Some(blit) = cmd_buf.blitCommandEncoder() else {
+        mtld3d_shared::log_once_warn!(
+            target: LOG_TARGET,
+            "present: the blit encoder could not be created; the drawable is presented as it is"
+        );
         return;
     };
     let label = objc2_foundation::NSString::from_str("mtld3d-present-blit");
@@ -1776,6 +1787,11 @@ fn encode_fullscreen_pass(
         (unsafe { MetalHandle::<MTLRenderPipelineStateKind>::new(pipeline_handle) })
             .into_retained()
     else {
+        mtld3d_shared::log_once_warn_by!(
+            target: LOG_TARGET,
+            key: rustc_hash::FxBuildHasher.hash_one(label),
+            "{label}: no pipeline state to encode with; the pass is skipped"
+        );
         return false;
     };
 
@@ -1794,6 +1810,11 @@ fn encode_fullscreen_pass(
     color0.setStoreAction(MTLStoreAction::Store);
 
     let Some(enc) = cmd_buf.renderCommandEncoderWithDescriptor(&pass_desc) else {
+        mtld3d_shared::log_once_warn_by!(
+            target: LOG_TARGET,
+            key: rustc_hash::FxBuildHasher.hash_one(label),
+            "{label}: the render encoder could not be created; the pass is skipped"
+        );
         return false;
     };
     let label = objc2_foundation::NSString::from_str(label);
@@ -3660,7 +3681,14 @@ fn encode_readback_resolve(
         format,
         PixelFormat::R32Float | PixelFormat::Rg32Float | PixelFormat::Rgba32Float
     );
-    let pipeline = super::present::ensure_readback_pipeline(device, format, nearest)?;
+    let Some(pipeline) = super::present::ensure_readback_pipeline(device, format, nearest) else {
+        mtld3d_shared::log_once_warn!(
+            target: LOG_TARGET,
+            "readback resolve: no {format:?} copy pipeline; readback reads the render-resolution \
+             level instead and will be the wrong size"
+        );
+        return None;
+    };
     // The copy pass samples level 0 of slice 0 of whatever it is handed, so any
     // other level or slice goes in through a one-level, one-slice view.
     let view;
@@ -3671,14 +3699,22 @@ fn encode_readback_resolve(
         // format is its own, and the ranges name one level and one slice it
         // holds (the caller's `level` / `slice` were validated on the PE side
         // against the resource they came from).
-        view = unsafe {
+        let Some(level_view) = (unsafe {
             src.newTextureViewWithPixelFormat_textureType_levels_slices(
                 mtl_format,
                 MTLTextureType::Type2D,
                 NSRange::new(level as usize, 1),
                 NSRange::new(slice as usize, 1),
             )
-        }?;
+        }) else {
+            mtld3d_shared::log_once_warn!(
+                target: LOG_TARGET,
+                "readback resolve: no view of level {level} slice {slice}; readback reads the \
+                 render-resolution level instead and will be the wrong size"
+            );
+            return None;
+        };
+        view = level_view;
         &*view
     };
     encode_fullscreen_pass(
@@ -3697,6 +3733,14 @@ fn encode_readback_resolve(
         },
     )
     .then_some(target)
+    .or_else(|| {
+        mtld3d_shared::log_once_warn!(
+            target: LOG_TARGET,
+            "readback resolve: the copy pass failed to encode; readback reads the \
+             render-resolution level instead and will be the wrong size"
+        );
+        None
+    })
 }
 
 /// Synchronous texture→buffer readback into PE-addressable memory.

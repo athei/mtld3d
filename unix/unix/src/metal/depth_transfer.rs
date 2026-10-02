@@ -162,6 +162,11 @@ pub fn encode(
     let resample = source.sampleCount() != 1 || width != out_width || height != out_height;
     let input_set = if resample && source.sampleCount() == 1 {
         let Some(set) = planes.acquire(&device, width, height, stencil, stamp, None) else {
+            log::error!(
+                target: LOG_TARGET,
+                "depth transfer: input planes for {width}x{height} (stencil={stencil}) could not \
+                 be allocated"
+            );
             return false;
         };
         Some(set)
@@ -171,6 +176,11 @@ pub fn encode(
     let Some(output_set) =
         planes.acquire(&device, out_width, out_height, stencil, stamp, input_set)
     else {
+        log::error!(
+            target: LOG_TARGET,
+            "depth transfer: output planes for {out_width}x{out_height} (stencil={stencil}) \
+             could not be allocated"
+        );
         return false;
     };
     let output = planes.view(output_set, out_width, stencil);
@@ -493,6 +503,7 @@ fn extract_planes(
     output: &PlaneBuffers<'_>,
 ) -> bool {
     let Some(blit) = cb.blitCommandEncoder() else {
+        log::error!(target: LOG_TARGET, "depth transfer: plane extraction blit encoder failed");
         return false;
     };
     blit.setLabel(Some(&NSString::from_str("mtld3d-depth-transfer-extract")));
@@ -542,9 +553,18 @@ fn copy_multisample_source(
         desc.setSampleCount(source.sampleCount());
     }
     desc.setUsage(MTLTextureUsage::ShaderRead | MTLTextureUsage::PixelFormatView);
-    let sampleable = source.device().newTextureWithDescriptor(&desc)?;
+    let Some(sampleable) = source.device().newTextureWithDescriptor(&desc) else {
+        log::error!(
+            target: LOG_TARGET,
+            "depth transfer: {width}x{height} multisample source copy could not be allocated"
+        );
+        return None;
+    };
     sampleable.setLabel(Some(&NSString::from_str("mtld3d-depth-transfer-source")));
-    let blit = cb.blitCommandEncoder()?;
+    let Some(blit) = cb.blitCommandEncoder() else {
+        log::error!(target: LOG_TARGET, "depth transfer: source copy blit encoder failed");
+        return None;
+    };
     blit.setLabel(Some(&NSString::from_str(
         "mtld3d-depth-transfer-source-copy",
     )));

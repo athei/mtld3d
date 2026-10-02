@@ -193,6 +193,12 @@ pub extern "C" fn get_device_info_handler(args: *mut c_void) -> i32 {
             buf[copy_len] = 0;
             params.name_len = u64::try_from(copy_len).expect("name copy len fits u64");
         }
+    } else {
+        mtld3d_shared::log_once_warn!(
+            target: LOG_TARGET,
+            "GetDeviceInfo: no Metal device; the adapter reports an empty name, a zero \
+             registry id and no capability bits"
+        );
     }
 
     STATUS_SUCCESS

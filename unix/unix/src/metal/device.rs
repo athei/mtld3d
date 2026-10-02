@@ -41,6 +41,10 @@ unsafe extern "C" {}
 /// transparent `u64` newtype, so the static is trivially `Send + Sync`.
 static PINNED_DEVICE: LazyLock<MetalHandle<MTLDeviceKind>> = LazyLock::new(|| {
     let Some(device) = MTLCreateSystemDefaultDevice() else {
+        log::error!(
+            target: LOG_TARGET,
+            "MTLCreateSystemDefaultDevice returned no device; the process has no Metal device"
+        );
         return MetalHandle::<MTLDeviceKind>::NULL;
     };
     // SAFETY: `Retained::into_raw` transfers the retain into the `u64` and

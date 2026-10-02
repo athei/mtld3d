@@ -1,4 +1,7 @@
-//! Bitwise comparison of floating-point shader constant rows, and the copy of short windows.
+//! Shader-constant register windows, row comparison and short-window copies.
+//!
+//! The register windows the D3D9 constant calls accept, the bitwise comparison
+//! of float rows, and the copy of short windows.
 
 /// Whether two constant windows differ, including NaN payloads and signed zero.
 ///
@@ -117,6 +120,31 @@ fn copy_ends<T: Copy, const K: usize>(dst: &mut [T], src: &[T]) {
     if let (Some(to), Some(from)) = (dst.last_chunk_mut::<K>(), src.last_chunk::<K>()) {
         *to = *from;
     }
+}
+
+/// Whether a `[start, start + count)` constant-register window fits a `limit`-row file.
+///
+/// The window of the float `Set`/`Get` shader-constant calls, which D3D9
+/// refuses whole rather than clamping. The sum is widened to `u64` so a start
+/// near `u32::MAX` (a signed `-1`, or a `start++` probe sweep past the file)
+/// cannot wrap back into range. A zero count fits when its start is at or
+/// before the end of the file.
+#[must_use]
+#[inline]
+pub fn window_in_range(start: u32, count: u32, limit: usize) -> bool {
+    u64::from(start) + u64::from(count) <= limit as u64
+}
+
+/// How many registers an integer or boolean constant call moves, or `None` to refuse it.
+///
+/// D3D9 refuses a start at or past the `rows`-deep file whatever the count,
+/// and clamps a count that runs past the file to the registers that remain. A
+/// zero count moves nothing and is accepted.
+#[must_use]
+#[inline]
+pub fn int_bool_rows(start: u32, count: u32, rows: usize) -> Option<usize> {
+    let remaining = rows.checked_sub(start as usize).filter(|&n| n > 0)?;
+    Some((count as usize).min(remaining))
 }
 
 #[cfg(test)]

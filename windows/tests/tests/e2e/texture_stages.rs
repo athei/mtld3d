@@ -1568,7 +1568,12 @@ fn per_stage_constant_stateblock_reset_and_shader_transitions() {
         assert_eq!(h.clear_pixel_shader(), 0);
         assert_eq!(temp_probe_pixel(&h, 0xFFFF_FFFF), 0x0032_5476);
     }
-    assert!(h.set_texture_stage_state(8, D3DTSS_CONSTANT, 0xFFFF_FFFF) < 0);
+    // A stage past the eighth clamps to the eighth, as D3D9 runtimes do.
+    assert_eq!(
+        h.set_texture_stage_state(8, D3DTSS_CONSTANT, 0xFFFF_FFFF),
+        0
+    );
+    assert_eq!(h.texture_stage_state(7, D3DTSS_CONSTANT), 0xFFFF_FFFF);
     assert_eq!(h.texture_stage_state(0, D3DTSS_CONSTANT), 0xFF32_5476);
     assert_eq!(h.reset(640, 480), 0);
     for stage in 0..8 {
