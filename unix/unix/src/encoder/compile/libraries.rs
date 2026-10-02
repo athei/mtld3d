@@ -326,7 +326,7 @@ fn variant_words(variant: &VariantKey) -> [u64; 3] {
         alpha_func,
         fog_mode,
         fog_table_mode,
-        reserved,
+        linked_input_mask,
         depth_sampler_mask,
         depth_fetch_mask,
         fetch4_mask,
@@ -343,7 +343,7 @@ fn variant_words(variant: &VariantKey) -> [u64; 3] {
         u64::from(*alpha_func)
             | u64::from(*fog_mode) << 8
             | u64::from(*fog_table_mode) << 16
-            | u64::from(*reserved) << 24
+            | u64::from(*linked_input_mask) << 24
             | u64::from(*depth_sampler_mask) << 32
             | u64::from(*depth_fetch_mask) << 48,
         u64::from(*fetch4_mask)

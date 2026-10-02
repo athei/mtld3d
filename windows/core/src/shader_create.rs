@@ -6,7 +6,7 @@
 use mtld3d_shared::shader_create::{ShaderInputSemantic, ShaderStage, ShaderUsage};
 
 use crate::{
-    dxso::{Declaration, DxsoError, DxsoProgram, RegKind, ShaderType, parse},
+    dxso::{Declaration, DxsoError, DxsoProgram, LinkInputs, RegKind, ShaderType, parse},
     ids::ProgramId,
 };
 
@@ -76,6 +76,7 @@ pub fn parse_shader(
                     usage,
                     usage_index,
                     reg,
+                    ..
                 } = decl
                     && reg.kind == RegKind::Input
                 {
@@ -92,6 +93,10 @@ pub fn parse_shader(
         ShaderStage::Pixel => {
             usage.set(ShaderUsage::AUTOMATIC_FOG, program.major < 3);
             usage.set(ShaderUsage::BUMP_ENV, program.uses_bump_env());
+            usage.set(
+                ShaderUsage::LINKED_INPUTS,
+                !LinkInputs::ps_inputs(&program).is_empty(),
+            );
             program.color_out_mask()
         }
     };

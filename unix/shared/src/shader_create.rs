@@ -52,6 +52,11 @@ bitflags! {
         const BOOL_CONST = 1 << 2;
         const BUMP_ENV = 1 << 3;
         const AUTOMATIC_FOG = 1 << 4;
+        /// A `ps_3_0` reads an input semantic outside the fixed-function varyings.
+        ///
+        /// Such a draw's pixel variant records which of those semantics the
+        /// bound vertex shader outputs (`VariantKey::linked_input_mask`).
+        const LINKED_INPUTS = 1 << 5;
     }
 }
 

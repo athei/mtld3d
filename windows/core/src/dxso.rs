@@ -10,6 +10,7 @@
 mod emit;
 mod ff;
 mod ir;
+mod link;
 mod opcode;
 mod parser;
 
@@ -34,6 +35,7 @@ pub use ff::{
 pub use ir::{
     CmpFunc, DeclUsage, Declaration, DxsoError, DxsoProgram, RegKind, ShaderType, TextureType,
 };
+pub use link::{LinkInputs, MAX_LINKED_INPUTS, SemanticSet};
 pub use parser::{operand_token_count, parse};
 
 #[cfg(test)]

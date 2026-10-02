@@ -1210,7 +1210,7 @@ fn ps2_vreg_input_maps_to_color_not_position() {
 #[test]
 fn programmable_ps_emits_fog_blend_when_variant_fog_mode_set() {
     let variant = VariantKey {
-        reserved: 0,
+        linked_input_mask: 0,
         alpha_func: 0,
         fog_mode: narrow(D3DFOG_LINEAR),
         fog_table_mode: 0,
@@ -2264,11 +2264,21 @@ fn sm3_ps_input_color_uses_usage_index_not_reg_index() {
         END_TOKEN,
     ];
     let ps = parse(&bc).expect("PS3 parse");
-    let ps_msl = emit_ps_programmable(&ps, VariantKey::default()).expect("emit PS3");
+    let linked = VariantKey {
+        linked_input_mask: 1,
+        ..VariantKey::default()
+    };
+    let ps_msl = emit_ps_programmable(&ps, linked).expect("emit PS3");
     assert!(
         ps_msl.contains("oC0 = in.color2;"),
         "PS3 dcl_color2 v7 must read from in.color2:\n{ps_msl}"
     );
+    metal_compile_or_fail(&ps_msl);
+    // COLOR2 is no fixed-function varying: behind a vertex shader that does
+    // not output it, the input reads zero.
+    let ps_msl = emit_ps_programmable(&ps, VariantKey::default()).expect("emit PS3");
+    assert!(ps_msl.contains("oC0 = float4(0.0);"), "{ps_msl}");
+    metal_compile_or_fail(&ps_msl);
 }
 
 #[test]
@@ -5727,4 +5737,216 @@ fn a_ps_reading_its_depth_output_parses_but_does_not_emit() {
     );
     let ps = parse(&bytecode).expect("the parser accepts a depth-output source");
     assert!(emit_ps_programmable(&ps, VariantKey::default()).is_err());
+}
+
+// ── SM3 linkage by semantic ──
+
+const DCL_NORMAL: u8 = 3;
+
+/// `dcl_<usage><index> <reg_type>N.<mask>` as its three tokens.
+fn dcl(usage: u8, index: u8, reg_type: u32, reg: u16, mask: u8) -> [u32; 3] {
+    [
+        opcode_token(OP_DCL, 2),
+        dcl_usage_token(usage, index),
+        dst_token(reg_type, reg, mask, false),
+    ]
+}
+
+/// The member names of the emitted `Varyings` struct, in order.
+fn varyings_members(msl: &str) -> Vec<String> {
+    let body = msl
+        .split("struct Varyings {\n")
+        .nth(1)
+        .and_then(|rest| rest.split("};").next())
+        .expect("Varyings struct");
+    body.lines()
+        .filter_map(|line| {
+            let decl = line.trim().strip_suffix(';')?;
+            let decl = decl.split(" [[").next()?;
+            decl.split_whitespace().nth(1).map(str::to_owned)
+        })
+        .collect()
+}
+
+/// `vs_3_0`: position in `o0`, NORMAL0 in `o1` and COLOR2 in `o2`, both from `v1`.
+fn vs3_normal_color2() -> Vec<u32> {
+    let mut bc = vec![VS3_HEADER];
+    for d in [
+        dcl(DCL_POSITION, 0, TYPE_INPUT, 0, 0xF),
+        dcl(DCL_NORMAL, 0, TYPE_INPUT, 1, 0xF),
+        dcl(DCL_POSITION, 0, TYPE_TEXCOORDOUT, 0, 0xF),
+        dcl(DCL_NORMAL, 0, TYPE_TEXCOORDOUT, 1, 0xF),
+        dcl(DCL_COLOR, 2, TYPE_TEXCOORDOUT, 2, 0xF),
+    ] {
+        bc.extend_from_slice(&d);
+    }
+    for (out, input) in [(0, 0), (1, 1), (2, 1)] {
+        bc.extend_from_slice(&[
+            opcode_token(OP_MOV, 2),
+            dst_token(TYPE_TEXCOORDOUT, out, 0xF, false),
+            src_token(TYPE_INPUT, input, SWIZ_IDENTITY, 0),
+        ]);
+    }
+    bc.push(END_TOKEN);
+    bc
+}
+
+/// `ps_3_0 { dcl_normal v0; dcl_color2 v1; add oC0, v0, v1; }`.
+fn ps3_normal_color2() -> Vec<u32> {
+    let mut bc = vec![PS3_HEADER];
+    bc.extend_from_slice(&dcl(DCL_NORMAL, 0, TYPE_INPUT, 0, 0xF));
+    bc.extend_from_slice(&dcl(DCL_COLOR, 2, TYPE_INPUT, 1, 0xF));
+    bc.extend_from_slice(&[
+        opcode_token(OP_ADD, 3),
+        dst_token(TYPE_COLOROUT, 0, 0xF, false),
+        src_token(TYPE_INPUT, 0, SWIZ_IDENTITY, 0),
+        src_token(TYPE_INPUT, 1, SWIZ_IDENTITY, 0),
+        END_TOKEN,
+    ]);
+    bc
+}
+
+#[test]
+fn sm3_vertex_outputs_outside_the_fixed_set_get_their_own_members() {
+    let vs = parse(&vs3_normal_color2()).expect("VS3 parse");
+    let msl = emit_vs_programmable(&vs).expect("emit VS3");
+    let members = varyings_members(&msl);
+    for member in ["normal0", "color2", "texcoord15", "color1", "fog"] {
+        assert!(members.iter().any(|m| m == member), "{member}:\n{msl}");
+    }
+    assert!(msl.contains("out.normal0 = in.v1;"), "{msl}");
+    assert!(msl.contains("out.color2 = in.v1;"), "{msl}");
+    assert!(!msl.contains("_rastout_discard = in.v1"), "{msl}");
+    metal_compile_or_fail(&msl);
+}
+
+#[test]
+fn sm3_pixel_inputs_outside_the_fixed_set_read_the_linked_member_or_zero() {
+    let ps = parse(&ps3_normal_color2()).expect("PS3 parse");
+    let linked = emit_ps_programmable(
+        &ps,
+        VariantKey {
+            linked_input_mask: 0b11,
+            ..VariantKey::default()
+        },
+    )
+    .expect("emit PS3 linked");
+    assert!(
+        linked.contains("oC0 = (in.normal0 + in.color2);"),
+        "{linked}"
+    );
+    assert!(!linked.contains("in.color0"), "{linked}");
+    metal_compile_or_fail(&linked);
+
+    // The vertex side declares every member the linked pixel side reads, so
+    // Metal, which links the two stages by member name, accepts the pair.
+    let vs = parse(&vs3_normal_color2()).expect("VS3 parse");
+    let vs_members = varyings_members(&emit_vs_programmable(&vs).expect("emit VS3"));
+    for member in varyings_members(&linked) {
+        assert!(vs_members.contains(&member), "VS lacks {member}");
+    }
+
+    let unlinked = emit_ps_programmable(&ps, VariantKey::default()).expect("emit PS3 unlinked");
+    assert!(
+        unlinked.contains("oC0 = (float4(0.0) + float4(0.0));"),
+        "{unlinked}"
+    );
+    let members = varyings_members(&unlinked);
+    assert!(!members.iter().any(|m| m == "normal0" || m == "color2"));
+    metal_compile_or_fail(&unlinked);
+
+    let normal_only = emit_ps_programmable(
+        &ps,
+        VariantKey {
+            linked_input_mask: 0b01,
+            ..VariantKey::default()
+        },
+    )
+    .expect("emit PS3 normal");
+    assert!(normal_only.contains("oC0 = (in.normal0 + float4(0.0));"));
+    metal_compile_or_fail(&normal_only);
+}
+
+#[test]
+fn sm3_packed_registers_link_each_semantic_by_its_lanes() {
+    // vs_3_0 { dcl_position o0; dcl_texcoord0 o1.xy; dcl_texcoord1 o1.zw;
+    //          mov o0, v0; mov o1.xy, v1; mov o1.zw, v1.xyxy; }
+    let mut bc = vec![VS3_HEADER];
+    for d in [
+        dcl(DCL_POSITION, 0, TYPE_INPUT, 0, 0xF),
+        dcl(DCL_TEXCOORD, 0, TYPE_INPUT, 1, 0xF),
+        dcl(DCL_POSITION, 0, TYPE_TEXCOORDOUT, 0, 0xF),
+        dcl(DCL_TEXCOORD, 0, TYPE_TEXCOORDOUT, 1, 0x3),
+        dcl(DCL_TEXCOORD, 1, TYPE_TEXCOORDOUT, 1, 0xC),
+    ] {
+        bc.extend_from_slice(&d);
+    }
+    bc.extend_from_slice(&[
+        opcode_token(OP_MOV, 2),
+        dst_token(TYPE_TEXCOORDOUT, 0, 0xF, false),
+        src_token(TYPE_INPUT, 0, SWIZ_IDENTITY, 0),
+        opcode_token(OP_MOV, 2),
+        dst_token(TYPE_TEXCOORDOUT, 1, 0x3, false),
+        src_token(TYPE_INPUT, 1, SWIZ_IDENTITY, 0),
+        opcode_token(OP_MOV, 2),
+        dst_token(TYPE_TEXCOORDOUT, 1, 0xC, false),
+        src_token(TYPE_INPUT, 1, 0x44, 0),
+        END_TOKEN,
+    ]);
+    let vs = parse(&bc).expect("VS3 parse");
+    let vs_msl = emit_vs_programmable(&vs).expect("emit VS3");
+    for line in [
+        "_o0.xy = (in.v1).xy;",
+        "_o0.zw = ((in.v1).xyxy).zw;",
+        "out.texcoord0.xy = _o0.xy;",
+        "out.texcoord1.zw = _o0.zw;",
+    ] {
+        assert!(vs_msl.contains(line), "{line}:\n{vs_msl}");
+    }
+    metal_compile_or_fail(&vs_msl);
+
+    // ps_3_0 packs the same two semantics into another register in reverse
+    // declaration order: { dcl_texcoord1 v3.zw; dcl_texcoord0 v3.xy; mov oC0, v3; }
+    let mut bc = vec![PS3_HEADER];
+    bc.extend_from_slice(&dcl(DCL_TEXCOORD, 1, TYPE_INPUT, 3, 0xC));
+    bc.extend_from_slice(&dcl(DCL_TEXCOORD, 0, TYPE_INPUT, 3, 0x3));
+    bc.extend_from_slice(&[
+        opcode_token(OP_MOV, 2),
+        dst_token(TYPE_COLOROUT, 0, 0xF, false),
+        src_token(TYPE_INPUT, 3, SWIZ_IDENTITY, 0),
+        END_TOKEN,
+    ]);
+    let ps = parse(&bc).expect("PS3 parse");
+    let ps_msl = emit_ps_programmable(&ps, VariantKey::default()).expect("emit PS3");
+    assert!(
+        ps_msl.contains(
+            "float4 _v3 = float4(in.texcoord0.x, in.texcoord0.y, in.texcoord1.z, in.texcoord1.w);"
+        ),
+        "{ps_msl}"
+    );
+    assert!(ps_msl.contains("oC0 = _v3;"), "{ps_msl}");
+    metal_compile_or_fail(&ps_msl);
+}
+
+#[test]
+fn sm3_packed_input_lanes_follow_the_point_sprite_substitution() {
+    let mut bc = vec![PS3_HEADER];
+    bc.extend_from_slice(&dcl(DCL_TEXCOORD, 0, TYPE_INPUT, 0, 0x3));
+    bc.extend_from_slice(&dcl(DCL_TEXCOORD, 1, TYPE_INPUT, 0, 0xC));
+    bc.extend_from_slice(&[
+        opcode_token(OP_MOV, 2),
+        dst_token(TYPE_COLOROUT, 0, 0xF, false),
+        src_token(TYPE_INPUT, 0, SWIZ_IDENTITY, 0),
+        END_TOKEN,
+    ]);
+    let ps = parse(&bc).expect("PS3 parse");
+    let mut variant = VariantKey::default();
+    variant.flags.insert(VariantFlags::POINT_SPRITE);
+    let msl = emit_ps_programmable(&ps, variant).expect("emit PS3 sprite");
+    let substituted = msl
+        .find("in.texcoord0 = float4(point_coord")
+        .expect("sprite prologue");
+    let assembled = msl.find("float4 _v0 = ").expect("assembled input");
+    assert!(substituted < assembled, "{msl}");
+    metal_compile_or_fail(&msl);
 }

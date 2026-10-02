@@ -1453,7 +1453,8 @@ impl FfState {
             render_states[D3DRS_POINTSPRITEENABLE as usize] != 0,
         );
         VariantKey {
-            reserved: 0,
+            // Derived on the encoder thread from the draw's two shaders.
+            linked_input_mask: 0,
             alpha_func: if alpha_test_on {
                 crate::render_state::enum_value(render_states, D3DRS_ALPHAFUNC)
             } else {

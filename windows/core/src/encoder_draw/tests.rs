@@ -712,7 +712,8 @@ fn canonical_variant_hash_preserves_all_original_fields_in_order() {
 
     use crate::dxso::{VariantFlags, VariantKey};
 
-    // The pre-canonical struct declaration, retained to pin its derived hash sequence.
+    // The pre-canonical struct declaration, retained to pin its derived hash
+    // sequence, with the linked-input mask the canonical hash appends last.
     #[derive(Hash)]
     struct OriginalVariant {
         alpha_func: u8,
@@ -729,6 +730,7 @@ fn canonical_variant_hash_preserves_all_original_fields_in_order() {
         color_out_mask: u8,
         sample_mask: u8,
         flags: VariantFlags,
+        linked_input_mask: u8,
     }
     struct HashBytes(Vec<u8>);
     impl Hasher for HashBytes {
@@ -754,9 +756,10 @@ fn canonical_variant_hash_preserves_all_original_fields_in_order() {
         color_out_mask: 12,
         sample_mask: 13,
         flags: VariantFlags::FLAT_SHADE,
+        linked_input_mask: 14,
     };
     let current = VariantKey {
-        reserved: 0,
+        linked_input_mask: original.linked_input_mask,
         alpha_func: original.alpha_func,
         fog_mode: original.fog_mode,
         fog_table_mode: original.fog_table_mode,

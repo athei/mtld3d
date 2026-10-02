@@ -31,9 +31,10 @@ use mtld3d_shared::mtl::{
 
 use super::{
     ir::{
-        DeclUsage, Declaration, DstMods, DstOperand, DxsoProgram, InstrFlags, Instruction, RegKind,
-        Register, ShaderType, SrcModifier, SrcOperand, Swizzle, TextureType, WriteMask,
+        Declaration, DstMods, DstOperand, DxsoProgram, InstrFlags, Instruction, RegKind, Register,
+        ShaderType, SrcModifier, SrcOperand, Swizzle, TextureType, WriteMask,
     },
+    link::{self, PsInputs, Semantic, VsOutputs},
     opcode::Opcode,
 };
 
@@ -143,8 +144,16 @@ pub struct VariantKey {
     /// params arrive in `fog_data[1]` = (start, end, density, depth-bias) on
     /// buffer 13.
     pub fog_table_mode: u8,
-    /// Initialized padding in the canonical capture record.
-    pub reserved: u8,
+    /// Bit `i` set ⇒ the bound vertex shader outputs the PS's `i`-th extra input semantic.
+    ///
+    /// The extra inputs are the `ps_3_0` input semantics outside the members
+    /// every `Varyings` struct declares (NORMAL, TANGENT, COLOR2, …), in the
+    /// order [`super::LinkInputs`] lists them. The PS declares a stage-in
+    /// member for each set bit and reads zero for each clear one, since Metal
+    /// rejects a fragment input the vertex function does not write. The
+    /// encoder derives it from the draw's two shaders; the API sends zero.
+    /// Part of the PS cache key.
+    pub linked_input_mask: u8,
     /// Bit `i` set ⇒ sampler slot `i` is bound to a depth-format texture.
     ///
     /// The PS emitter outputs `depth2d<float>` for that slot and wraps
@@ -213,7 +222,7 @@ pub struct VariantKey {
     pub flags: VariantFlags,
 }
 
-// Preserve the existing cache identity: canonical padding is not shader state.
+// Field by field, so the hash shape stays explicit and independent of the record layout.
 impl core::hash::Hash for VariantKey {
     fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
         core::hash::Hash::hash(&self.alpha_func, state);
@@ -230,6 +239,7 @@ impl core::hash::Hash for VariantKey {
         core::hash::Hash::hash(&self.color_out_mask, state);
         core::hash::Hash::hash(&self.sample_mask, state);
         core::hash::Hash::hash(&self.flags, state);
+        core::hash::Hash::hash(&self.linked_input_mask, state);
     }
 }
 
@@ -406,7 +416,13 @@ pub fn emit_vs_programmable_named(
     w(&mut out, "#include <metal_stdlib>\n");
     w(&mut out, "using namespace metal;\n\n");
     emit_vertex_in(&mut out, vs, provided_mask);
-    emit_varyings(&mut out, false, clip_plane_count);
+    let outputs = VsOutputs::build(vs);
+    emit_varyings(
+        &mut out,
+        false,
+        clip_plane_count,
+        outputs.as_ref().map_or(&[], VsOutputs::extras),
+    );
     w(&mut out, POS_FIXUP_MSL);
     w(&mut out, crate::vs_draw::VS_DRAW_MSL);
     emit_const_rel_helper(&mut out, vs);
@@ -419,6 +435,7 @@ pub fn emit_vs_programmable_named(
             clip_plane_count,
             sampler_kinds,
         },
+        outputs.as_ref(),
     )?;
     Ok(out)
 }
@@ -480,10 +497,12 @@ pub fn emit_ps_programmable_named(
     let mut out = String::new();
     w(&mut out, "#include <metal_stdlib>\n");
     w(&mut out, "using namespace metal;\n\n");
+    let inputs = PsInputs::build(ps, variant.linked_input_mask);
     emit_varyings(
         &mut out,
         variant.flags.contains(VariantFlags::FLAT_SHADE),
         0,
+        inputs.extras(),
     );
     emit_const_rel_helper(&mut out, ps);
     if variant.flags.contains(VariantFlags::SRGB_WRITE) {
@@ -492,7 +511,7 @@ pub fn emit_ps_programmable_named(
     if variant.flags.contains(VariantFlags::VPOS_SCALE) && ps.reads_vpos() {
         w(&mut out, crate::ps_draw::PS_DRAW_MSL);
     }
-    emit_ps_function(&mut out, ps, variant, entry)?;
+    emit_ps_function(&mut out, ps, variant, entry, &inputs)?;
     Ok(out)
 }
 
@@ -555,7 +574,7 @@ fn emit_vertex_in(out: &mut String, vs: &DxsoProgram, provided_mask: u16) {
 // return; Metal's pipeline validation doesn't complain, and unused inputs get
 // dead-code-eliminated by the MSL compiler.
 
-fn emit_varyings(out: &mut String, flat: bool, clip_planes: u8) {
+fn emit_varyings(out: &mut String, flat: bool, clip_planes: u8, extras: &[Semantic]) {
     w(out, "struct Varyings {\n");
     // `invariant` — the analog of an `Invariant` decoration on a SPIR-V
     // `gl_Position` output — keeps the clip-space position bit-stable WITHIN a
@@ -598,6 +617,12 @@ fn emit_varyings(out: &mut String, flat: bool, clip_planes: u8) {
     // into fragment input. Always-present so VS and PS struct layouts
     // stay aligned (FF + programmable mix-and-match).
     w(out, "    float point_size [[point_size]];\n");
+    // SM3 semantics outside the members above (NORMAL, TANGENT, COLOR2, …),
+    // one member each, named after the semantic. Metal links a vertex output
+    // to a fragment input by member name, so the two structs may differ
+    // here: the VS declares every extra it outputs, the PS only those the
+    // bound VS outputs (see `dxso::link`).
+    link::write_extra_members(out, extras);
     // User clip planes: one `[[clip_distance]]` lane per enabled plane, a
     // VS-only output the rasterizer consumes (a fragment with any negative
     // lane is discarded). Metal rejects the attribute on a fragment input,
@@ -633,6 +658,7 @@ fn emit_vs_function(
     out: &mut String,
     vs: &DxsoProgram,
     key: &VsFunctionKey<'_>,
+    outputs: Option<&VsOutputs>,
 ) -> Result<(), EmitError> {
     let entry = key.entry;
     let provided_mask = key.provided_mask;
@@ -746,6 +772,11 @@ fn emit_vs_function(
     // Writing to this local instead of `out.position` keeps the
     // position computation from being clobbered on the following line.
     w(out, "    float4 _rastout_discard = float4(0.0);\n");
+    // SM3: the extra semantic members start at zero, and every output
+    // register several semantics share gets its staging local.
+    if let Some(outputs) = outputs {
+        outputs.write_prologue(out);
+    }
 
     for def in &vs.def_constants {
         let v = def.value;
@@ -779,7 +810,6 @@ fn emit_vs_function(
     let def_int_consts: BTreeSet<u16> = vs.def_int_constants.iter().map(|d| d.reg.index).collect();
     let def_bool_consts: BTreeSet<u16> =
         vs.def_bool_constants.iter().map(|d| d.reg.index).collect();
-    let vs_output_map = build_vs_output_map(vs);
     let subs = (!vs.subroutines.is_empty()).then_some(&vs.subroutines);
     let ctx = EmitContext::vs(&VsInit {
         major: vs.major,
@@ -788,12 +818,17 @@ fn emit_vs_function(
         def_consts: &def_consts,
         def_int_consts: &def_int_consts,
         def_bool_consts: &def_bool_consts,
-        vs_output_map: vs_output_map.as_ref(),
+        vs_output_map: outputs.map(VsOutputs::targets),
         subroutines: subs,
         vs_provided_mask: provided_mask,
     });
     for inst in &vs.instructions {
         translate_instruction(out, inst, &ctx)?;
+    }
+    // SM3: move each semantic out of a shared output register into its
+    // member, before the fog fallback and the position epilogue read them.
+    if let Some(outputs) = outputs {
+        outputs.write_epilogue(out);
     }
 
     // SM1/SM2 clamp the vertex colour outputs (oD0/oD1) to [0,1] before
@@ -810,7 +845,7 @@ fn emit_vs_function(
     // (which then also covers a dynamically-skipped predicated oFog write).
     // `out.color1` defaults to 0.0, so a shader writing neither oFog nor oD1
     // is fully fogged — matching the D3D9 zero specular-alpha default.
-    if !vs_writes_fog(vs, vs_output_map.as_ref()) {
+    if !vs_writes_fog(vs, outputs) {
         w(out, "    out.fog = float4(out.color1.w);\n");
     }
     // User clip planes are clip-space for the programmable pipeline: one
@@ -851,80 +886,21 @@ fn emit_vs_function(
     Ok(())
 }
 
-/// SM3 VS routes every output through a `dcl_<usage> <reg>` declaration.
-///
-/// The dcl carries the semantic regardless of which output-flavor register
-/// kind the HLSL compiler picked. Some compilers ship SM3 outputs as
-/// `RegKind::TexcoordOut` (`D3DSPR_TEXCRDOUT`, type 6, aliased as
-/// `D3DSPR_OUTPUT` in SM3); others emit `RegKind::Output` (type 11),
-/// `RegKind::RastOut`, or `RegKind::AttrOut`. Walk all of them and key
-/// on `(kind, index)` so SM3-aware lookup overrides the SM2
-/// register-kind defaults in `register_write_target`.
-fn build_vs_output_map(vs: &DxsoProgram) -> Option<BTreeMap<(RegKind, u16), String>> {
-    if vs.major != 3 {
-        return None;
-    }
-    let mut map: BTreeMap<(RegKind, u16), String> = BTreeMap::new();
-    for decl in &vs.declarations {
-        if let Declaration::Semantic {
-            usage,
-            usage_index,
-            reg,
-        } = decl
-            && is_output_reg_kind(reg.kind)
-        {
-            let target = match usage {
-                // POSITION0 is clip space ([[position]]); POSITION1+ are
-                // interpolated user varyings (out.position1, …).
-                DeclUsage::Position if *usage_index == 0 => "out.position".to_string(),
-                DeclUsage::Position => format!("out.position{usage_index}"),
-                DeclUsage::Fog => "out.fog".to_string(),
-                DeclUsage::Color => format!("out.color{usage_index}"),
-                DeclUsage::Texcoord => format!("out.texcoord{usage_index}"),
-                // SM3 `dcl_psize oN` — point-size output. Same
-                // float4-storage indirection as SM2 `oPts` so the
-                // write_mask path stays uniform.
-                DeclUsage::PSize => "_psize_storage".to_string(),
-                other => {
-                    mtld3d_shared::log_once_warn_by!(
-                        target: super::LOG_TARGET,
-                        key: u64::from(*usage_index),
-                        "dxso: VS3 output usage {other:?}{usage_index} unmapped → write sunk"
-                    );
-                    "_rastout_discard".to_string()
-                }
-            };
-            map.insert((reg.kind, reg.index), target);
-        }
-    }
-    Some(map)
-}
-
-const fn is_output_reg_kind(kind: RegKind) -> bool {
-    matches!(
-        kind,
-        RegKind::RastOut | RegKind::AttrOut | RegKind::TexcoordOut | RegKind::Output
-    )
-}
-
 /// Whether any instruction (main body or subroutine) writes the fog output.
 ///
-/// `oFog` (`RastOut` index 1) in SM1/SM2, or an output register `dcl`-ed with
-/// `DeclUsage::Fog` in SM3. Mirrors `register_write_target`'s resolution: an
-/// SM3 output write without a matching dcl is sunk, so it does not count.
-fn vs_writes_fog(vs: &DxsoProgram, output_map: Option<&BTreeMap<(RegKind, u16), String>>) -> bool {
+/// `oFog` (`RastOut` index 1) in SM1/SM2, or the lane of the output register
+/// `dcl`-ed with `FOG0` in SM3. An SM3 output write without a matching dcl is
+/// sunk, so it does not count.
+fn vs_writes_fog(vs: &DxsoProgram, outputs: Option<&VsOutputs>) -> bool {
     vs.instructions
         .iter()
         .chain(vs.subroutines.values().flatten())
         .filter_map(|inst| inst.dst.as_ref())
         .any(|dst| {
-            let reg = &dst.reg;
-            if let Some(map) = output_map {
-                return map
-                    .get(&(reg.kind, reg.index))
-                    .is_some_and(|target| target == "out.fog");
+            if let Some(outputs) = outputs {
+                return outputs.writes_fog(*dst);
             }
-            reg.kind == RegKind::RastOut && reg.index == 1
+            dst.reg.kind == RegKind::RastOut && dst.reg.index == 1
         })
 }
 
@@ -1089,56 +1065,14 @@ fn emit_ps_function(
     ps: &DxsoProgram,
     variant: VariantKey,
     entry: &str,
+    inputs: &PsInputs,
 ) -> Result<(), EmitError> {
     // PS 2.0 DCL usage is structural only — the register kind fixes the
     // semantic: `RegKind::Input` is v0..vN (COLOR0..COLORN per D3D9 SM2),
     // `RegKind::Addr` is t0..tN (read via `in.texcoord{index}` in
-    // `register_read_expr`, no map entry needed).
-    //
-    // PS 3.0 unifies inputs under `RegKind::Input` and the semantic comes
-    // from the matching `dcl_<usage><index> vN` — the varying slot is the
-    // declared `usage_index`, not `reg.index`. Walk the dcls and pick
-    // color/texcoord based on the declared usage when major == 3.
-    let mut ps_input_map: BTreeMap<u16, String> = BTreeMap::new();
-    for decl in &ps.declarations {
-        if let Declaration::Semantic {
-            reg,
-            usage,
-            usage_index,
-        } = decl
-            && reg.kind == RegKind::Input
-        {
-            let mapped = if ps.major == 3 {
-                match usage {
-                    DeclUsage::Color => format!("color{usage_index}"),
-                    DeclUsage::Texcoord => format!("texcoord{usage_index}"),
-                    // Fog gets its own varying that mirrors VS3
-                    // `dcl_fog oN` writes; the FF PS expects the
-                    // same `in.fog.x` channel so links stay clean.
-                    DeclUsage::Fog => "fog".to_string(),
-                    // PS3 `dcl_position0 vN` is the varying-syntax form
-                    // of vPos — clip-space position from VS post-
-                    // rasterizer becomes screen-space pixel coords on
-                    // read via the [[position]] field. POSITION1+ read
-                    // the matching interpolated user varying instead.
-                    DeclUsage::Position if *usage_index == 0 => "position".to_string(),
-                    DeclUsage::Position => format!("position{usage_index}"),
-                    other => {
-                        mtld3d_shared::log_once_warn_by!(
-                            target: super::LOG_TARGET,
-                            key: u64::from(*usage_index),
-                            "dxso: PS3 input usage {other:?}{usage_index} unmapped → reads return color{usage_index}"
-                        );
-                        format!("color{usage_index}")
-                    }
-                }
-            } else {
-                format!("color{}", reg.index)
-            };
-            ps_input_map.insert(reg.index, mapped);
-        }
-    }
-
+    // `register_read_expr`, no map entry needed). PS 3.0 unifies inputs under
+    // `RegKind::Input` and links each by its `dcl_<usage><index> vN.mask`
+    // semantic; `inputs` holds the read expression of every input register.
     // The declared sampler set drives the fragment-function signature, typed
     // by the texture each slot is bound to. Shared with the encoder's
     // unbound-slot fallback so the MSL and the bind side cannot disagree on
@@ -1322,6 +1256,9 @@ fn emit_ps_function(
     if point_sprite {
         write_point_sprite_prologue(out);
     }
+    // Input registers several semantics share, assembled after the point
+    // sprite substitution so their texture-coordinate lanes see it.
+    inputs.write_prologue(out);
     // Zeroed for the same reason as in `emit_vs_function`.
     w(out, "    float4 r[32] = {};\n");
     // SM1 pixel shaders: `tN` (RegKind::Addr) is a read-write register that
@@ -1406,7 +1343,7 @@ fn emit_ps_function(
     let ctx = EmitContext::ps(&PsInit {
         major: ps.major,
         minor: ps.minor,
-        map: &ps_input_map,
+        map: inputs.reads(),
         samplers: &samplers,
         depth_sampler_mask: variant.depth_sampler_mask,
         depth_fetch_mask: variant.depth_fetch_mask,
@@ -1622,6 +1559,7 @@ struct EmitContext<'a> {
     /// texcoord input by index.
     shader_major: u8,
     shader_minor: u8,
+    /// PS only: the read expression of each input register `vN`, by index.
     ps_input_map: Option<&'a BTreeMap<u16, String>>,
     /// Per-sampler texture type of the texture bound to each declared slot.
     ///
@@ -1677,13 +1615,12 @@ struct EmitContext<'a> {
     /// call (label already on the stack) emits a once-per-label warn and skips
     /// the expansion rather than blowing the host stack.
     expansion_stack: RefCell<Vec<u32>>,
-    /// SM3 VS only: maps `(reg.kind, reg.index)` → `out.<semantic>` MSL field.
+    /// SM3 VS only: maps `(reg.kind, reg.index)` to the register's write target.
     ///
-    /// Populated from the `dcl_*` declarations. SM2 VS uses register-kind
-    /// dispatch in `register_write_target` and leaves this `None`. Keying on
-    /// the kind too is load-bearing — different HLSL backends emit SM3 outputs
-    /// as `TexcoordOut`, `AttrOut`, `RastOut`, or Output, sometimes with
-    /// overlapping indices.
+    /// Populated from the `dcl_*` declarations (see `link::VsOutputs`): an
+    /// `out.<semantic>` member, or the staging local of a register several
+    /// semantics share. SM2 VS uses register-kind dispatch in
+    /// `register_write_target` and leaves this `None`.
     vs_output_map: Option<&'a BTreeMap<(RegKind, u16), String>>,
     /// Const-register indices defined by a `def` instruction.
     ///
@@ -2785,12 +2722,10 @@ fn register_read_expr(reg: Register, ctx: &EmitContext) -> Result<String, EmitEr
                     "float4(0.0)".to_owned()
                 }
             } else {
-                let name = ctx
-                    .ps_input_map
+                ctx.ps_input_map
                     .and_then(|m| m.get(&reg.index))
                     .cloned()
-                    .unwrap_or_else(|| format!("color{}", reg.index));
-                format!("in.{name}")
+                    .unwrap_or_else(|| format!("in.color{}", reg.index))
             }
         }
         // Direct named constants we allow reading back (rare — mostly for
@@ -3066,7 +3001,7 @@ fn register_write_target(reg: Register, ctx: &EmitContext) -> String {
     // to SM2 register-kind defaults only when the map is absent (SM2)
     // or has no entry (a missing-dcl bug — sink-and-warn).
     if let Some(map) = ctx.vs_output_map
-        && is_output_reg_kind(reg.kind)
+        && link::is_output_kind(reg.kind)
     {
         return map.get(&(reg.kind, reg.index)).map_or_else(
             || {

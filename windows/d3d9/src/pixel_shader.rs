@@ -86,6 +86,11 @@ impl Direct3DPixelShader9 {
         self.inner().flags.contains(PsUsage::USES_REL_CONST)
     }
 
+    /// `true` when a `ps_3_0` reads an input semantic outside the fixed-function varyings.
+    pub fn reads_linked_inputs(&self) -> bool {
+        self.inner().flags.contains(PsUsage::READS_LINKED_INPUTS)
+    }
+
     /// Bit `i` set ⇒ the bytecode writes `oCi` (see `DxsoProgram::color_out_mask`).
     pub fn color_out_mask(&self) -> u8 {
         self.inner().color_out_mask
@@ -129,6 +134,11 @@ bitflags::bitflags! {
         /// The row is known only at draw time, so such draws bind every
         /// populated row instead of the statically named prefix.
         const USES_REL_CONST = 1 << 4;
+        /// A `ps_3_0` input semantic links to a vertex output by name.
+        ///
+        /// Such a draw's pixel variant records which of those semantics the
+        /// bound vertex shader outputs.
+        const READS_LINKED_INPUTS = 1 << 5;
     }
 }
 

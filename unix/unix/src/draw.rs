@@ -543,6 +543,17 @@ fn emit_draw_view(
         ps_variant.flags.insert(VariantFlags::SAMPLE_MASK);
         ps_variant.sample_mask = render_state.sample_mask;
     }
+    // A `ps_3_0` input semantic outside the fixed-function varyings (NORMAL,
+    // TANGENT, COLOR2, …) links by name to the vertex output of the same
+    // semantic, and Metal rejects a fragment input the vertex function does
+    // not write, so the pixel variant records which of them this draw's
+    // vertex shader outputs. Every other draw's flag is clear and its byte
+    // stays zero.
+    if let PsSourceView::Programmable(source) = ps
+        && source.reads_linked_inputs()
+    {
+        ps_variant.linked_input_mask = enc.linked_input_mask(source.ps_id, vs);
+    }
     // Programmable VS/PS: snapshot from the encoder-side mirror (kept
     // in sync via `Op::Set{Vs,Ps}ConstRange` deltas). FF: symmetric —
     // snapshot from `ff_vs_constants_mirror` (kept in sync via

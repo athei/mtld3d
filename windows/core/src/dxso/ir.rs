@@ -60,6 +60,11 @@ pub enum Declaration {
         usage: DeclUsage,
         usage_index: u32,
         reg: Register,
+        /// The lanes of `reg` the semantic occupies, from the dcl token's write mask.
+        ///
+        /// Several semantics can share one SM3 output or input register, each
+        /// in its own lanes (`dcl_texcoord0 o1.xy; dcl_texcoord1 o1.zw`).
+        mask: WriteMask,
     },
     /// A PS sampler declaration carrying the expected texture dimensionality.
     Sampler {
@@ -313,6 +318,7 @@ impl DxsoProgram {
                         kind: RegKind::Input,
                         ..
                     },
+                    ..
                 }
             )
         })
