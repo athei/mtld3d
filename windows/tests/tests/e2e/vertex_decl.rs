@@ -401,8 +401,8 @@ fn set_fvf_rebinds_its_declaration_after_set_vertex_declaration() {
 /// `SetFVF` of the FVF the device reports binds its declaration again after a block replaced it.
 ///
 /// A recorded `SetVertexDeclaration` applied over an FVF binds its
-/// declaration without clearing the FVF the device reports, so the FVF on
-/// its own does not say whether its declaration is still the bound one.
+/// declaration past the `SetFVF` entry point, so the FVF bound last through
+/// that entry point does not say whether its declaration is still bound.
 #[test]
 fn set_fvf_rebinds_its_declaration_after_a_recorded_block_bound_another() {
     const FVF: u32 = D3DFVF_XYZ | D3DFVF_DIFFUSE;

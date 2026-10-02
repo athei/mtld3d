@@ -376,14 +376,14 @@ pub struct DeviceInner {
     /// converts those to the Metal texture's own resolution at the point a
     /// value becomes a Metal command. Identity unless `render.scale` is set.
     render_scale: mtld3d_core::render_scale::RenderScale,
-    fvf: u32,
     /// Currently-bound vertex declaration (null = none).
     ///
     /// Uses the `Bound` ownership marker — swaps bump the wrapper's
     /// `private_refcount` inline rather than going through the COM vtable's
-    /// `AddRef`/`Release` thunks. Separate from FVF: `SetVertexDeclaration`
-    /// and `SetFVF` shadow each other and the most recent wins at snapshot
-    /// time (`vertex_decl` takes precedence when non-null).
+    /// `AddRef`/`Release` thunks. It also carries the FVF: `SetFVF` binds
+    /// the declaration it built for the FVF, which reports that FVF, so the
+    /// most recent of `SetFVF` and `SetVertexDeclaration` wins and no other
+    /// path can set one without the other.
     vertex_decl: CachedComPtr<Direct3DVertexDeclaration9, Bound>,
     /// Implicit vertex declarations synthesised by `SetFVF`, keyed by FVF.
     ///
@@ -1191,10 +1191,9 @@ impl DeviceInner {
     /// Record the FVF and bind its implicit declaration as the current vertex
     /// declaration (the most-recent of `SetFVF` / `SetVertexDeclaration`
     /// wins). `fvf == 0` is a no-op on the binding, matching the driver.
-    /// Returns whether the bound declaration or the FVF field changed
-    /// (callers gate snapshot dirtying on this: the draw layout reads both).
-    /// A call that would change nothing returns before the cache lookup (see
-    /// [`Self::fvf_bind_is_redundant`]).
+    /// Returns whether the bound declaration changed (callers gate snapshot
+    /// dirtying on this). A call that would change nothing returns before the
+    /// cache lookup (see [`Self::fvf_bind_is_redundant`]).
     #[inline]
     pub fn bind_fvf_decl(&mut self, fvf: u32) -> bool {
         if fvf == 0 || self.fvf_bind_is_redundant(fvf) {
@@ -1220,21 +1219,19 @@ impl DeviceInner {
     #[inline]
     fn fvf_bind_is_redundant(&self, fvf: u32) -> bool {
         let (bound_fvf, bound_decl) = self.last_fvf_bind;
-        self.vertex_decl.raw() == bound_decl && bound_fvf == fvf && self.fvf == fvf
+        self.vertex_decl.raw() == bound_decl && bound_fvf == fvf
     }
 
     /// The [`Self::bind_fvf_decl`] path that looks the declaration up and binds it.
     #[inline(never)]
     fn bind_fvf_decl_uncached(&mut self, fvf: u32) -> bool {
         let decl = self.get_or_create_fvf_decl(fvf);
-        let fvf_changed = self.fvf != fvf;
-        self.fvf = fvf;
         self.last_fvf_bind = if decl.is_null() {
             (0, core::ptr::null_mut())
         } else {
             (fvf, decl)
         };
-        self.replace_vertex_decl(decl) || fvf_changed
+        self.replace_vertex_decl(decl)
     }
 
     /// Release every vertex fetch slot's bound-texture refcount at device teardown.
@@ -1335,8 +1332,17 @@ impl DeviceInner {
         &mut self.stage_bindings
     }
 
-    pub const fn fvf_field(&self) -> u32 {
-        self.fvf
+    /// The FVF `GetFVF` reports: the bound declaration's, 0 with none bound.
+    ///
+    /// Only the declaration `SetFVF` built for an FVF carries one; a
+    /// declaration the game created reports 0.
+    pub fn fvf(&self) -> u32 {
+        let decl = self.vertex_decl.raw();
+        if decl.is_null() {
+            return 0;
+        }
+        // SAFETY: non-null; the bound slot's refcount keeps the declaration live.
+        unsafe { (*decl).inner().fvf() }
     }
 
     /// In-progress `BeginStateBlock` recording, if any.
@@ -2618,7 +2624,6 @@ impl DeviceInner {
         self.shader_bindings
             .replace_pixel_shader(core::ptr::null_mut());
 
-        self.fvf = 0;
         self.render_states = render_state_defaults();
         self.point_size = self.render_states[D3DRS_POINTSIZE as usize];
         self.flags.remove(DeviceFlags::A2M_ENABLED);
@@ -3116,7 +3121,6 @@ impl Direct3DDevice9 {
             backbuffer_width: info.backbuffer_width,
             backbuffer_height: info.backbuffer_height,
             render_scale: info.render_scale,
-            fvf: 0,
             vertex_decl: CachedComPtr::null(),
             fvf_decl_cache: rustc_hash::FxHashMap::default(),
             last_fvf_bind: (0, core::ptr::null_mut()),
@@ -3225,15 +3229,6 @@ impl Direct3DDevice9 {
     pub const fn add_ref_self(&mut self) -> u32 {
         self.refcount += 1;
         self.refcount
-    }
-
-    pub fn fvf(&self) -> u32 {
-        self.inner().fvf
-    }
-
-    /// Mutation goes through `inner()`'s raw-pointer indirection, so `&self` is sufficient.
-    pub fn set_fvf(&self, fvf: u32) {
-        self.inner().fvf = fvf;
     }
 }
 
@@ -10537,11 +10532,9 @@ extern "system" fn device_get_npatch_mode(this: *mut c_void) -> f32 {
 /// A `Draw*` call needs either an explicitly bound vertex declaration or a
 /// non-zero FVF; with neither, the runtime has no way to interpret the
 /// vertex stream and the draw is invalid. A non-zero FVF binds its implicit
-/// declaration (so `vertex_decl()` is non-null), and binding a declaration
-/// directly resets the FVF to zero, so the two conditions are mutually
-/// exclusive: the draw is invalid only when both are absent.
+/// declaration, so a bound declaration is the whole test.
 const fn has_vertex_layout_source(dev: &DeviceInner) -> bool {
-    !dev.vertex_decl().is_null() || dev.fvf_field() != 0
+    !dev.vertex_decl().is_null()
 }
 
 /// The `log_once_warn_by!` key of a log line shared by several entry points.
@@ -11395,13 +11388,13 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
             SnapshotSection::Vdecl,
         ));
         let bound_vertex_shader = dev.shader_bindings().vertex_shader();
-        let fvf = dev.fvf;
+        let fvf = dev.fvf();
         let decl_ptr = dev.vertex_decl();
         let (resolved, vdecl_hash, ff_vs_layout) = if decl_ptr.is_null() {
             let (elements, _fvf_stride) = fvf_to_elements(fvf);
-            // `fvf == 0` only when the format came from SetVertexDeclaration
-            // (SetFVF always carries D3DFVF_XYZ); a real declaration reads 0
-            // for an omitted COLORVERTEX source, FVF falls back to material.
+            // With no declaration bound `fvf` is 0, since the FVF is the bound
+            // declaration's, so the layout reads an omitted COLORVERTEX source
+            // as 0, as a declaration does.
             let layout = convert::ff_vs_layout_from_elements(&elements, fvf == 0);
             // Pre-transformed (POSITIONT/XYZRHW) layouts bypass a bound VS —
             // D3D9 runs the FF pre-transformed path regardless, even when a
@@ -12392,7 +12385,7 @@ extern "system" fn device_process_vertices(
         );
         return D3DERR_INVALIDCALL;
     }
-    let src_fvf = dev.fvf_field();
+    let src_fvf = dev.fvf();
     let src_stream_offset = dev.bound_buffers().stream_offset(0);
     let src_stride = dev.bound_buffers().stream_stride(0);
     let wvp = dev.ff_state().world_view_projection();
@@ -12575,19 +12568,10 @@ extern "system" fn device_set_vertex_declaration(this: *mut c_void, decl: *mut c
     // re-resolves to a byte-identical attrs slice (+ FfVsLayout), so
     // skip the expensive VDECL rebuild. VS_SOURCE/VS_CONST only matter
     // if FF VS bound (FF VS key reads ff_vs_layout).
-    let decl_changed = dev.replace_vertex_decl(new);
-    // The FVF is the declaration's: the one `SetFVF` built for an FVF keeps
-    // reporting that FVF when it is bound here, and a declaration the game
-    // created reports 0 until the next SetFVF. The draw layout reads the FVF
-    // field as well as the declaration, so a change of either marks it.
-    let fvf = if new.is_null() {
-        0
-    } else {
-        // SAFETY: non-null checked; the slot adopted a ref above.
-        unsafe { (*new).inner().fvf() }
-    };
-    let changed = decl_changed || dev.fvf != fvf;
-    dev.fvf = fvf;
+    // The FVF is the declaration's (`DeviceInner::fvf`): the one `SetFVF`
+    // built for an FVF keeps reporting that FVF when it is bound here, and a
+    // declaration the game created reports 0, so the pointer decides both.
+    let changed = dev.replace_vertex_decl(new);
     if changed {
         // VS_SOURCE is marked unconditionally (not via `ff_aware_mask`, which
         // drops it for a programmable VS): a declaration change alters which VS
@@ -12650,8 +12634,20 @@ extern "system" fn device_set_fvf(this: *mut c_void, fvf: u32) -> i32 {
         return D3DERR_INVALIDCALL;
     };
     let dev = obj.inner();
-    if let Some(rec) = dev.recording_state_block_mut() {
-        rec.record(StateOp::Fvf(fvf));
+    if dev.is_state_block_recording() {
+        // A recorded SetFVF is a change of declaration, to the one built for
+        // the FVF, so a `Capture` of the block refreshes it from the bound
+        // declaration like a recorded SetVertexDeclaration. SetFVF(0) changes
+        // nothing and records nothing.
+        if fvf != 0 {
+            let decl = dev.get_or_create_fvf_decl(fvf);
+            if let Some(rec) = dev.recording_state_block_mut() {
+                // SAFETY: `decl` is null or a live declaration the FVF cache
+                // holds until the device drops.
+                let adopted = unsafe { CachedComPtr::adopt(decl) };
+                rec.record(StateOp::VertexDeclaration(adopted));
+            }
+        }
         return D3D_OK;
     }
     // SetFVF(0) is not a valid FVF; the driver treats it as a no-op, leaving
@@ -12701,7 +12697,7 @@ extern "system" fn device_get_fvf(this: *mut c_void, fvf: *mut u32) -> i32 {
     };
     // SAFETY: `fvf` is non-null (checked above) and per the D3D9 ABI
     // points to a writable `u32` slot owned by the caller.
-    unsafe { *fvf = obj.inner().fvf };
+    unsafe { *fvf = obj.inner().fvf() };
     0 // S_OK
 }
 

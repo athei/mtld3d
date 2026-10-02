@@ -2,11 +2,13 @@
 
 use mtld3d_tests::{Harness, LitVertex, PosColorVertex, VertexDeclaration, assert_pixel_eq};
 use mtld3d_types::{
-    D3D_OK, D3DCOLORVALUE, D3DCULL_NONE, D3DERR_INVALIDCALL, D3DFMT_A8R8G8B8, D3DFVF_DIFFUSE,
+    D3D_OK, D3DCOLORVALUE, D3DCULL_NONE, D3DDECL_END_STREAM, D3DDECLTYPE_FLOAT3,
+    D3DDECLTYPE_UNUSED, D3DDECLUSAGE_POSITION, D3DERR_INVALIDCALL, D3DFMT_A8R8G8B8, D3DFVF_DIFFUSE,
     D3DFVF_NORMAL, D3DFVF_XYZ, D3DLIGHT_DIRECTIONAL, D3DLIGHT9, D3DMATERIAL9, D3DPOOL_MANAGED,
     D3DPT_TRIANGLELIST, D3DPT_TRIANGLESTRIP, D3DRECT, D3DRS_ALPHABLENDENABLE, D3DRS_CULLMODE,
     D3DRS_LIGHTING, D3DRS_SCISSORTESTENABLE, D3DSAMP_DMAPOFFSET, D3DSAMP_MINFILTER, D3DSBT_ALL,
-    D3DSBT_PIXELSTATE, D3DSBT_VERTEXSTATE, D3DTEXF_LINEAR, D3DTEXF_POINT, D3DVECTOR, D3DVIEWPORT9,
+    D3DSBT_PIXELSTATE, D3DSBT_VERTEXSTATE, D3DTEXF_LINEAR, D3DTEXF_POINT, D3DVECTOR,
+    D3DVERTEXELEMENT9, D3DVIEWPORT9,
 };
 
 const BLUE: u32 = 0xFF00_00FF;
@@ -766,4 +768,105 @@ fn created_blocks_restore_a_light_past_the_eight_fast_path_slots() {
             "{name}: the restored red light 9 lights the quad, got ({r}, {g}, {b})"
         );
     }
+}
+
+/// POSITION float3 on stream 0, nothing else: a declaration the game created.
+const fn position_only_decl() -> [D3DVERTEXELEMENT9; 2] {
+    [
+        D3DVERTEXELEMENT9 {
+            stream: 0,
+            offset: 0,
+            type_: D3DDECLTYPE_FLOAT3,
+            method: 0,
+            usage: D3DDECLUSAGE_POSITION,
+            usage_index: 0,
+        },
+        D3DVERTEXELEMENT9 {
+            stream: D3DDECL_END_STREAM,
+            offset: 0,
+            type_: D3DDECLTYPE_UNUSED,
+            method: 0,
+            usage: 0,
+            usage_index: 0,
+        },
+    ]
+}
+
+/// What `GetFVF` reports with `decl` bound through `SetVertexDeclaration`, the direct bind.
+fn fvf_of_direct_bind(h: &Harness, decl: &VertexDeclaration<'_>) -> u32 {
+    assert_eq!(h.set_vertex_declaration(decl), D3D_OK, "direct bind");
+    h.fvf()
+}
+
+#[test]
+fn applied_all_block_keeps_the_fvf_bound_after_a_capture_without_one() {
+    // A block created with no declaration bound restores none, so the FVF
+    // set after it stays bound through Apply: GetFVF keeps reporting it and
+    // a lit draw without a diffuse colour falls back to the material, as the
+    // FVF does.
+    let h = Harness::new();
+    assert_eq!(h.set_render_state(D3DRS_LIGHTING, 1), 0);
+    assert_eq!(h.set_render_state(D3DRS_CULLMODE, D3DCULL_NONE), 0);
+    h.select_diffuse_stage(0);
+    assert_eq!(h.set_material(&diffuse_material(colour(1.0, 0.0, 0.0))), 0);
+    assert_eq!(h.set_light(0, &frontal_light(colour(1.0, 1.0, 1.0))), 0);
+    assert_eq!(h.light_enable(0, true), 0);
+    let block = h.create_state_block(D3DSBT_ALL);
+
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_NORMAL), 0);
+    let direct = h.fvf();
+    assert_eq!(block.apply(), D3D_OK, "Apply ALL");
+    assert_eq!(h.fvf(), direct, "GetFVF after Apply");
+    let (r, g, b) = draw_lit(&h);
+    assert!(
+        r >= 0xF0 && g <= 2 && b <= 2,
+        "the FVF's material fallback lights the quad red, got ({r}, {g}, {b})"
+    );
+}
+
+#[test]
+fn applied_recorded_declaration_reports_the_fvf_of_the_direct_bind() {
+    // A recorded SetVertexDeclaration applied over an FVF leaves the device
+    // where SetVertexDeclaration of the same declaration would.
+    const FVF: u32 = D3DFVF_XYZ | D3DFVF_DIFFUSE;
+    let h = Harness::new();
+    let position_only = h.create_vertex_declaration(&position_only_decl());
+    let direct = fvf_of_direct_bind(&h, &position_only);
+
+    assert_eq!(h.begin_state_block(), D3D_OK, "BeginStateBlock");
+    assert_eq!(h.set_vertex_declaration(&position_only), D3D_OK, "record");
+    let block = h.end_state_block();
+    assert_eq!(h.set_fvf(FVF), D3D_OK, "SetFVF");
+    assert_eq!(block.apply(), D3D_OK, "Apply");
+    assert_eq!(
+        VertexDeclaration::from_raw(h.vertex_declaration_raw()).as_ptr(),
+        position_only.as_ptr(),
+        "Apply binds the recorded declaration"
+    );
+    assert_eq!(h.fvf(), direct, "GetFVF after Apply");
+}
+
+#[test]
+fn captured_recorded_set_fvf_restores_the_declaration_bound_at_capture() {
+    // A recorded SetFVF is a declaration change, and a Capture refreshes it
+    // from the bound declaration, even one the game created.
+    const RECORDED: u32 = D3DFVF_XYZ | D3DFVF_DIFFUSE;
+    const LATER: u32 = D3DFVF_XYZ | D3DFVF_NORMAL;
+    let h = Harness::new();
+    let position_only = h.create_vertex_declaration(&position_only_decl());
+    let direct = fvf_of_direct_bind(&h, &position_only);
+
+    assert_eq!(h.begin_state_block(), D3D_OK, "BeginStateBlock");
+    assert_eq!(h.set_fvf(RECORDED), D3D_OK, "record SetFVF");
+    let block = h.end_state_block();
+    assert_eq!(h.set_vertex_declaration(&position_only), D3D_OK);
+    assert_eq!(block.capture(), D3D_OK, "Capture");
+    assert_eq!(h.set_fvf(LATER), D3D_OK, "SetFVF after the capture");
+    assert_eq!(block.apply(), D3D_OK, "Apply");
+    assert_eq!(
+        VertexDeclaration::from_raw(h.vertex_declaration_raw()).as_ptr(),
+        position_only.as_ptr(),
+        "Apply binds the declaration bound at the capture"
+    );
+    assert_eq!(h.fvf(), direct, "GetFVF after Apply");
 }

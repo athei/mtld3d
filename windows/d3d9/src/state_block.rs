@@ -100,7 +100,6 @@ pub enum StateOp {
         index: u32,
         plane: [f32; 4],
     },
-    Fvf(u32),
     Texture {
         stage: u32,
         /// Null for SetTexture(stage, NULL).
@@ -255,9 +254,6 @@ impl RecordingStateBlock {
                 }
                 StateOp::ClipPlane { index, plane } => {
                     *plane = dev.clip_plane(*index);
-                }
-                StateOp::Fvf(fvf) => {
-                    *fvf = dev.fvf_field();
                 }
                 StateOp::Texture { stage, tex } => {
                     let live = crate::device::vertex_sampler_slot(*stage).map_or_else(
@@ -436,9 +432,6 @@ impl RecordingStateBlock {
                 StateOp::ClipPlane { index, plane } => {
                     dev.set_clip_plane(*index, *plane);
                 }
-                StateOp::Fvf(fvf) => {
-                    dev.bind_fvf_decl(*fvf);
-                }
                 StateOp::Texture { stage, tex } => {
                     if let Some(slot) = crate::device::vertex_sampler_slot(*stage) {
                         dev.set_vertex_texture_slot(slot, tex.raw());
@@ -541,12 +534,9 @@ impl Direct3DStateBlock9 {
         // a live wrapper.
         let d = unsafe { &*device_obj };
         let dev = d.inner();
-        let fvf = d.fvf();
         let inner = Box::into_raw(Box::new(StateBlockInner {
             device: device_obj,
-            body: StateBlockBody::Snapshot(Box::new(StateSnapshot::capture_from(
-                dev, fvf, block_type,
-            ))),
+            body: StateBlockBody::Snapshot(Box::new(StateSnapshot::capture_from(dev, block_type))),
         }));
         Ok(Self {
             vtbl: &raw const DIRECT3D_STATE_BLOCK9_VTBL,
@@ -596,7 +586,6 @@ struct StateSnapshot {
     /// `Vertex` / `Pixel` snapshots still record every field (capture is
     /// type-agnostic); the filter is applied only at `Apply` time.
     block_type: StateBlockType,
-    fvf: u32,
     render_states: [u32; RENDER_STATE_COUNT],
     point_size: u32,
     a2m_enabled: bool,
@@ -647,7 +636,7 @@ struct StreamSnapshot {
 }
 
 impl StateSnapshot {
-    fn capture_from(dev: &DeviceInner, fvf: u32, block_type: StateBlockType) -> Self {
+    fn capture_from(dev: &DeviceInner, block_type: StateBlockType) -> Self {
         let bound_textures = core::array::from_fn(|i| {
             let ptr = dev.stage_bindings().texture(i);
             // SAFETY: `ptr` comes from the device's stage-binding slot,
@@ -685,7 +674,6 @@ impl StateSnapshot {
 
         Self {
             block_type,
-            fvf,
             render_states: *dev.render_states(),
             point_size: dev.point_size(),
             a2m_enabled: dev.a2m_enabled(),
@@ -719,14 +707,8 @@ impl StateSnapshot {
     /// The `replace_*` helpers take the live binding's own reference, so the
     /// snapshot's `CachedComPtr` keeps its reference and stays valid for a
     /// subsequent Apply.
-    fn apply_to(&self, dev: &mut DeviceInner, device_wrapper: &Direct3DDevice9) {
+    fn apply_to(&self, dev: &mut DeviceInner) {
         let block_type = self.block_type;
-
-        // FVF (vertex pipeline). Restore first: the field-only `set_fvf` has no
-        // decl side-effect, so the decl restore below lands the captured pair.
-        if block_type.includes_vertex_pipeline() {
-            device_wrapper.set_fvf(self.fvf);
-        }
 
         // Render states — per-index membership. `0u32..` yields the D3DRS index
         // as a u32 without a fallible width conversion.
@@ -825,7 +807,8 @@ impl StateSnapshot {
             dev.shader_bindings_mut()
                 .replace_vertex_shader(self.bound_vertex_shader.raw());
             // D3D9 restores the vertex declaration only when the block captured a
-            // non-NULL one; the vertex shader, by contrast, applies even when
+            // non-NULL one, and the FVF with it, since the FVF is the
+            // declaration's; the vertex shader, by contrast, applies even when
             // NULL (unbinds).
             if !self.bound_vertex_decl.raw().is_null() {
                 dev.replace_vertex_decl(self.bound_vertex_decl.raw());
@@ -1007,7 +990,7 @@ extern "system" fn sb_capture(this: *mut c_void) -> i32 {
             // the next Apply writes back the same slice. Assignment drops the
             // previous snapshot (releases the references its slots held).
             let block_type = snap.block_type;
-            let mut fresh = StateSnapshot::capture_from(dev, device_obj.fvf(), block_type);
+            let mut fresh = StateSnapshot::capture_from(dev, block_type);
             // D3D9 keeps the stream offsets a `CreateStateBlock` block captured
             // at creation: a later `Capture` refreshes the buffer and stride of
             // each stream but not its offset. Recorded blocks (`BeginStateBlock`)
@@ -1047,7 +1030,7 @@ extern "system" fn sb_apply(this: *mut c_void) -> i32 {
         return D3DERR_INVALIDCALL;
     }
     match &inner.body {
-        StateBlockBody::Snapshot(snap) => snap.apply_to(dev, device_obj),
+        StateBlockBody::Snapshot(snap) => snap.apply_to(dev),
         StateBlockBody::Recorded(rec) => rec.apply_to(dev),
     }
     D3D_OK
