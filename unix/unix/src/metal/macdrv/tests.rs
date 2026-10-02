@@ -58,15 +58,29 @@
 //! way. The layer declares the four pointers it reads out of the fork's
 //! `struct d3dmetal_macdrv_win_data` and takes the client view out of the
 //! fourth, so those four offsets are asserted here beside the table's.
+//!
+//! `run_through_wine` is the synchronous main-thread hop through that
+//! table's `on_main_thread`. A test process has no Wine main thread, so the
+//! entry is stood in for by one that does what Wine's does with the block:
+//! copies it, runs it once, and lets the copy go. The test pins that the work
+//! has run exactly once by the time the hop returns. Two more stand-ins are
+//! stubs: one drops the block, as `CrossOver`'s arm64 build does, and one keeps
+//! a copy and runs it after the hop has returned; the hop answers that the
+//! work did not run, and the late run leaves the work alone.
 
-use core::ffi::c_void;
+use core::{
+    cell::{Cell, RefCell},
+    ffi::c_void,
+};
+
+use block2::{Block, RcBlock};
 
 use super::{
     KEPT_METAL_VIEWS, LayerMode, MacdrvFuncs, MacdrvFunctionsTable, MacdrvWinData, MetalViewPark,
     PresentPacing, ScreenParamsFilterStep, backing_scale_change, backing_scale_from,
     first_null_required_entry, layer_mode_change, layer_mode_for, min_present_duration,
-    min_present_duration_change, pack_pacing, pick_orphan, screen_params_filter_step,
-    unpack_pacing,
+    min_present_duration_change, pack_pacing, pick_orphan, run_through_wine,
+    screen_params_filter_step, unpack_pacing,
 };
 
 #[test]
@@ -681,4 +695,78 @@ fn the_win_data_record_is_read_through_the_prefix_the_fork_publishes() {
     assert_eq!(core::mem::offset_of!(MacdrvWinData, cocoa_view), 16);
     assert_eq!(core::mem::offset_of!(MacdrvWinData, client_cocoa_view), 24);
     assert_eq!(size_of::<MacdrvWinData>(), 32);
+}
+
+/// Stands in for Wine's `OnMainThread`: copies the block, runs the copy once, lets it go.
+extern "C" fn run_block_in_place(block: &Block<dyn Fn()>) {
+    let copy = block.copy();
+    copy.call(());
+}
+
+/// Counts one run of the hop's work in the `Cell<u32>` its context names.
+extern "C" fn count_run(ctx: *mut c_void) {
+    // SAFETY: the test below hands the hop the address of a live `Cell<u32>`.
+    let runs = unsafe { &*ctx.cast::<Cell<u32>>() };
+    runs.set(runs.get() + 1);
+}
+
+#[test]
+fn the_wine_hop_runs_its_work_once_before_it_returns() {
+    let runs = Cell::new(0_u32);
+    let ran = run_through_wine(
+        run_block_in_place,
+        count_run,
+        core::ptr::from_ref(&runs).cast_mut().cast::<c_void>(),
+    );
+    assert!(ran, "the hop answers that the work ran");
+    assert_eq!(
+        runs.get(),
+        1,
+        "the work ran exactly once, before the hop returned"
+    );
+}
+
+/// Stands in for a stub `OnMainThread`: returns without running the block.
+extern "C" fn drop_block(_block: &Block<dyn Fn()>) {}
+
+#[test]
+fn a_stub_entry_that_drops_the_block_hands_the_work_back() {
+    let runs = Cell::new(0_u32);
+    let ran = run_through_wine(
+        drop_block,
+        count_run,
+        core::ptr::from_ref(&runs).cast_mut().cast::<c_void>(),
+    );
+    assert!(!ran, "the hop answers that the work did not run");
+    assert_eq!(runs.get(), 0, "the work did not run");
+}
+
+thread_local! {
+    /// The copy `keep_block` keeps for the test to run after the hop returns.
+    static KEPT_BLOCK: RefCell<Option<RcBlock<dyn Fn()>>> = const { RefCell::new(None) };
+}
+
+/// Stands in for an entry that keeps a copy of the block and runs it later.
+extern "C" fn keep_block(block: &Block<dyn Fn()>) {
+    KEPT_BLOCK.with_borrow_mut(|kept| *kept = Some(block.copy()));
+}
+
+#[test]
+fn a_block_run_after_the_hop_gave_up_leaves_the_work_alone() {
+    let runs = Cell::new(0_u32);
+    let ran = run_through_wine(
+        keep_block,
+        count_run,
+        core::ptr::from_ref(&runs).cast_mut().cast::<c_void>(),
+    );
+    assert!(!ran, "the hop answers that the work did not run");
+    let kept = KEPT_BLOCK
+        .with_borrow_mut(Option::take)
+        .expect("the entry kept a copy of the block");
+    kept.call(());
+    assert_eq!(
+        runs.get(),
+        0,
+        "the late run found the run taken and did not reach the work"
+    );
 }

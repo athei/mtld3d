@@ -1,9 +1,10 @@
 use core::{
     ffi::c_void,
-    sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering},
 };
 use std::sync::{Arc, LazyLock, Mutex};
 
+use block2::{Block, RcBlock};
 use libloading::os::unix::Library;
 use log::{debug, error, info, log_enabled};
 use mtld3d_shared::{
@@ -776,10 +777,24 @@ unsafe extern "C" {
 /// process lifetime).
 static MACDRV_LIB: LazyLock<Library> = LazyLock::new(Library::this);
 
-/// Run a closure synchronously on `AppKit`'s main thread (libdispatch's main queue).
+/// Run a closure synchronously on `AppKit`'s main thread.
 ///
-/// Waits for completion. Apple documents compositor-impacting `CALayer`
-/// setters — `wantsExtendedDynamicRangeContent`, `colorspace`, `pixelFormat` —
+/// Waits for completion, through Wine's own `OnMainThread` (the
+/// `on_main_thread` entry of the `macdrv_functions` table) where the table
+/// has it, and through libdispatch's main queue otherwise. Wine's door is the
+/// one to take: winemac's main thread, while it waits for a Wine thread to
+/// answer a query (a resize, the min/max info, the pasteboard), runs only a
+/// private run-loop mode that never drains the main queue, so a bare
+/// `dispatch_sync` from that Wine thread stalls both until the query times
+/// out and fails. `OnMainThread` queues the work on Wine's request source,
+/// which that mode does run, and while the calling thread waits it answers
+/// the queries addressed to it, as every synchronous request Wine itself
+/// makes does. A Wine whose entry returns without running the work
+/// (`CrossOver`'s arm64 build publishes it as a stub) gets the main queue
+/// instead, for that hop and every later one.
+///
+/// Apple documents compositor-impacting `CALayer` setters
+/// (`wantsExtendedDynamicRangeContent`, `colorspace`, `pixelFormat`)
 /// as needing to take effect inside a `CATransaction` commit, which by
 /// convention runs on the main thread's run loop. Setting these properties
 /// from a non-main thread sets the model layer but leaves the *rendered*
@@ -804,21 +819,104 @@ fn run_on_main_thread_sync<F: FnOnce()>(f: F) {
     }
     extern "C" fn thunk<F: FnOnce()>(ctx: *mut c_void) {
         // SAFETY: `ctx` is the `&mut CallCtx<F>` we just handed to
-        // `dispatch_sync_f`; libdispatch passes it through to the
-        // worker function unchanged.
+        // `run_through_wine` or `dispatch_sync_f`, which pass it through to
+        // the worker function unchanged while the caller waits.
         let ctx = unsafe { &mut *(ctx.cast::<CallCtx<F>>()) };
         if let Some(f) = ctx.f.take() {
             autoreleasepool(|_| f());
         }
     }
+    /// Whether this Wine's `OnMainThread` returned without running a hop's work.
+    ///
+    /// A machine fact about the loaded Wine, latched by the first hop that
+    /// sees it and never cleared: `CrossOver`'s arm64 build publishes the entry
+    /// as a stub that logs and drops the block, and every later hop goes
+    /// straight to the main queue rather than ask it again.
+    static WINE_HOP_DROPS_WORK: AtomicBool = AtomicBool::new(false);
     let mut ctx = CallCtx { f: Some(f) };
+    let ctx_ptr = (&raw mut ctx).cast::<c_void>();
+    if !WINE_HOP_DROPS_WORK.load(Ordering::Relaxed)
+        && let Some(on_main_thread) = wine_on_main_thread()
+    {
+        if run_through_wine(on_main_thread, thunk::<F>, ctx_ptr) {
+            return;
+        }
+        WINE_HOP_DROPS_WORK.store(true, Ordering::Relaxed);
+        mtld3d_shared::log_once_warn!(
+            target: LOG_TARGET,
+            "main-thread hop: this Wine's OnMainThread returned without running the work → \
+             libdispatch's main queue, which winemac does not drain while it waits for a query",
+        );
+    }
     // SAFETY: `_dispatch_main_q` is libSystem's main-queue singleton —
     // a valid `dispatch_queue_t` for the process lifetime. `&mut ctx`
     // is valid until this function returns, and `dispatch_sync_f` is
     // synchronous, so the thunk runs before we drop `ctx`.
     unsafe {
         let main_q = (&raw const _dispatch_main_q).cast_mut().cast::<c_void>();
-        dispatch_sync_f(main_q, (&raw mut ctx).cast::<c_void>(), thunk::<F>);
+        dispatch_sync_f(main_q, ctx_ptr, thunk::<F>);
+    }
+}
+
+/// Wine's `OnMainThread`, read from the `macdrv_functions` table; `None` without one.
+fn wine_on_main_thread() -> Option<unsafe extern "C" fn(&Block<dyn Fn()>)> {
+    let table = macdrv_functions()?;
+    // SAFETY: the entry is Wine's `void (*)(dispatch_block_t)` stored as
+    // `*mut c_void` per its C ABI, and a `dispatch_block_t` is a pointer to a
+    // block; a null entry reads as `None`.
+    unsafe {
+        core::mem::transmute::<*mut c_void, Option<unsafe extern "C" fn(&Block<dyn Fn()>)>>(
+            table.on_main_thread,
+        )
+    }
+}
+
+/// Run `work(ctx)` on the main thread through Wine's `OnMainThread`; whether it ran.
+///
+/// Wine's own entry runs the block on the main thread before it returns. A
+/// stub entry returns without running it, and then the answer is `false`
+/// and the work is the caller's to run another way. The block claims the run
+/// on a state it shares with this call before it reaches `ctx`, and this call
+/// claims it the other way before it answers `false`, so a block an entry
+/// kept and runs later finds the run taken and touches nothing of the
+/// caller's. The block carries `ctx` as an address rather than a borrow for
+/// the same reason: Wine keeps a copy of the block until its request loop
+/// lets it go, which can be after this returns.
+fn run_through_wine(
+    on_main_thread: unsafe extern "C" fn(&Block<dyn Fn()>),
+    work: extern "C" fn(*mut c_void),
+    ctx: *mut c_void,
+) -> bool {
+    const PENDING: u8 = 0;
+    const RUNNING: u8 = 1;
+    const DONE: u8 = 2;
+    const ABANDONED: u8 = 3;
+    let state = Arc::new(AtomicU8::new(PENDING));
+    let block_state = Arc::clone(&state);
+    let ctx_addr = ctx.expose_provenance();
+    let block = RcBlock::new(move || {
+        if block_state
+            .compare_exchange(PENDING, RUNNING, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+        {
+            work(core::ptr::with_exposed_provenance_mut(ctx_addr));
+            block_state.store(DONE, Ordering::Release);
+        }
+    });
+    // SAFETY: the entry takes a block and returns; `ctx` is live until this
+    // call returns, and the block reaches it only while this call waits
+    // below. The caller does not call this from the main thread, where a
+    // synchronous wait could never end, as it does not for `dispatch_sync_f`
+    // either.
+    unsafe { on_main_thread(&block) };
+    loop {
+        match state.compare_exchange(PENDING, ABANDONED, Ordering::Acquire, Ordering::Acquire) {
+            Ok(_) => return false,
+            Err(DONE) => return true,
+            // An entry that runs the block on its own schedule is running it
+            // now; `ctx` stays live until it is done.
+            Err(_) => std::thread::yield_now(),
+        }
     }
 }
 
