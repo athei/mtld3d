@@ -16,13 +16,17 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use mtld3d_tests::{
-    HARNESS_PROBE_REPLY, Harness, HarnessConfig, SharedDevice, SharedQuery, WM_HARNESS_PROBE,
-    assert_pixel_eq, harness_window_proc, send_message, spawn_scoped, window_proc,
+    HARNESS_PROBE_REPLY, Harness, HarnessConfig, SharedDevice, SharedQuery, Texture,
+    WM_HARNESS_PROBE, assert_pixel_eq, harness_window_proc, send_message, spawn_scoped,
+    window_proc,
 };
 use mtld3d_types::{
-    D3DCREATE_HARDWARE_VERTEXPROCESSING, D3DCREATE_MULTITHREADED, D3DGETDATA_FLUSH, D3DISSUE_BEGIN,
-    D3DISSUE_END, D3DQUERYTYPE_OCCLUSION,
+    D3DCREATE_HARDWARE_VERTEXPROCESSING, D3DCREATE_MULTITHREADED, D3DFMT_A8R8G8B8, D3DFVF_XYZ,
+    D3DGETDATA_FLUSH, D3DISSUE_BEGIN, D3DISSUE_END, D3DPOOL_MANAGED, D3DPT_TRIANGLELIST,
+    D3DQUERYTYPE_OCCLUSION, D3DVERTEXTEXTURESAMPLER0,
 };
+
+use super::shaders::{PS_COLOR_PASSTHROUGH, centered_triangle, vs_fetch_to_color};
 
 /// Two devices attached at once present independently, and a teardown leaves the other alone.
 ///
@@ -399,4 +403,71 @@ fn two_devices_on_one_window_share_its_subclass_in_either_release_order() {
         drop(second);
         drop(first);
     }
+}
+
+/// Draw the centred triangle coloured by what vertex texture slot 0 fetches from `texture`.
+///
+/// The texture is bound at the vertex slot alone, so nothing but that slot's
+/// bind and the draw that follows can bring it to `h`'s device. Returns the
+/// pixel at the triangle's centre.
+fn vertex_fetched_colour(h: &Harness, texture: &Texture<'_>) -> u32 {
+    const BLUE: u32 = 0xFF00_00FF;
+    assert_eq!(
+        h.set_texture(D3DVERTEXTEXTURESAMPLER0, texture),
+        0,
+        "bind vertex sampler 0"
+    );
+    let vs = h.create_vertex_shader(&vs_fetch_to_color());
+    let ps = h.create_pixel_shader(&PS_COLOR_PASSTHROUGH);
+    assert_eq!(h.set_vertex_shader(&vs), 0, "SetVertexShader");
+    assert_eq!(h.set_pixel_shader(&ps), 0, "SetPixelShader");
+    assert_eq!(h.set_fvf(D3DFVF_XYZ), 0, "SetFVF");
+    h.render_once(BLUE, |d| {
+        assert_eq!(
+            d.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &centered_triangle()),
+            0,
+            "draw"
+        );
+    });
+    let pixel = h.read_pixel(320, 280);
+    assert_eq!(h.clear_vertex_shader(), 0, "unbind VS");
+    assert_eq!(h.clear_pixel_shader(), 0, "unbind PS");
+    assert_eq!(
+        h.clear_texture(D3DVERTEXTEXTURESAMPLER0),
+        0,
+        "unbind vertex sampler 0"
+    );
+    pixel
+}
+
+/// A texture another live device used is sampled through a vertex texture slot of this one.
+///
+/// A `D3DPOOL_MANAGED` texture follows the device it is used on. A fragment
+/// stage moves it over in the draw's stage walk, and a vertex texture slot has
+/// to as well: bound at the slot alone, the texture stayed attached to the
+/// device it came from, its levels never uploaded here, and the fetch found no
+/// storage behind its id on this device's encoder.
+#[test]
+fn a_texture_bound_only_at_a_vertex_slot_moves_to_the_device_that_samples_it() {
+    const GREEN: u32 = 0xFF00_FF00;
+    let first = Harness::new();
+    let second = Harness::new();
+    let texture = first.create_texture(2, 2, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED);
+    texture.lock_rect(0, 0).write_u32(&[GREEN; 4]);
+
+    assert_eq!(
+        vertex_fetched_colour(&first, &texture),
+        GREEN,
+        "the device that created the texture fetches it"
+    );
+    assert_eq!(
+        vertex_fetched_colour(&second, &texture),
+        GREEN,
+        "the second device fetches the texture it took over through the vertex slot"
+    );
+    assert_eq!(
+        vertex_fetched_colour(&first, &texture),
+        GREEN,
+        "and the first device fetches it again once it moves back"
+    );
 }

@@ -5060,17 +5060,26 @@ fn rehydrate_for_device_slow(tex: &mut Direct3DTexture9, dev: &mut DeviceInner, 
     // device, so an entry left on a device that is still alive dangles the
     // moment the texture is freed. Both that device's release teardown and its
     // `EvictManagedResources` walk their registry and dereference every entry.
-    // A zero here is a device already released, whose `detach_from_device`
-    // zeroed the link and whose registry went away with it.
+    // Its encoder caches the texture's Metal storage under the same id, and
+    // the destroy `finalize_texture` sends goes to the adopting device alone,
+    // so this one has to drop it too. Its frame is its own lock's to write,
+    // not this one's, so the id is filed with it and its next frame hand-off
+    // records the destroy, behind every op it recorded before. A zero here is
+    // a device already released, whose `detach_from_device` zeroed the link
+    // and whose registry and caches went away with it.
     if ti.device_inner != 0 {
-        DeviceInner::from_ptr(ti.device_inner)
-            .deregister_texture(std::ptr::from_mut::<TextureInner>(ti));
+        let left = DeviceInner::from_ptr(ti.device_inner);
+        left.note_departed_texture(texture_id);
+        left.deregister_texture(std::ptr::from_mut::<TextureInner>(ti));
     }
     ti.device_inner = dev_ptr;
     ti.api_lock.store(dev.api_lock_ptr(), Ordering::Release);
     ti.device_handle = dev.device_handle();
     ti.point_cached_surfaces_at(std::ptr::from_mut::<DeviceInner>(dev));
     dev.register_texture(std::ptr::from_mut::<TextureInner>(ti));
+    // Back on a device it left before that device dropped it: the storage
+    // there is this texture's again, so the pending drop is called off.
+    dev.cancel_departed_texture(texture_id);
     // Seed the new device's encoder texture_cache with this texture's
     // info so the per-draw stage binding (which carries only
     // `texture_id`) resolves to a real Metal handle without needing

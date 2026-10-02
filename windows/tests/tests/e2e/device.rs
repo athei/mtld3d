@@ -15,10 +15,10 @@ use std::{
 
 use mtld3d_core::display_mode::MAX_SERVED_SIZES;
 use mtld3d_tests::{
-    Harness, HarnessConfig, StateBlock, Texture, TexturedVertex, WM_ACTIVATEAPP, WS_CAPTION,
-    WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE, WindowStyle, assert_pixel_eq, config_var, create_window,
-    cursor_is_live, cursor_mask_bits, destroy_window, enumerate_display_sizes, run_child,
-    spawn_scoped, window_rect,
+    Harness, HarnessConfig, PosVertex, StateBlock, Texture, TexturedVertex, WM_ACTIVATEAPP,
+    WS_CAPTION, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE, WindowStyle, assert_pixel_eq, config_var,
+    create_window, cursor_is_live, cursor_mask_bits, destroy_window, enumerate_display_sizes,
+    run_child, spawn_scoped, window_rect,
 };
 use mtld3d_types::{
     D3D_OK, D3DCLEAR_TARGET, D3DCREATE_HARDWARE_VERTEXPROCESSING, D3DCREATE_NOWINDOWCHANGES,
@@ -2466,6 +2466,93 @@ fn reset_fullscreen_retarget_keeps_the_previous_window_covered() {
         "leaving fullscreen gives back the window the device presented into",
     );
     destroy_window(second);
+}
+
+/// The name `a_texture_moving_between_live_devices_leaves_the_first` runs its workload under.
+const TEXTURE_MOVE_CHILD_NAME: &str = "texture-move.exe";
+
+/// The child's log filter: the texture's move and the encoders' cache records.
+const TEXTURE_MOVE_LOG_FILTER: &str =
+    "warn,mtld3d::d3d9::tex=info,mtld3d::unix=debug,mtld3d::unix::command=warn";
+
+/// A texture taken over by a second live device leaves the first device's encoder.
+///
+/// A `D3DPOOL_MANAGED` texture follows the device it is drawn with. The
+/// device it leaves had created Metal storage for it, and the destroy a
+/// texture's release sends goes to the device it is attached to at that
+/// point, which is the new one: without a destroy of its own, the first
+/// device kept that storage until it was released. The workload runs in a
+/// process of its own, so the log it reads holds its devices' lines alone.
+#[test]
+fn a_texture_moving_between_live_devices_leaves_the_first() {
+    if running_as(TEXTURE_MOVE_CHILD_NAME) {
+        texture_move_workload();
+        return;
+    }
+    run_in_private_log_child(
+        TEXTURE_MOVE_CHILD_NAME,
+        "device::a_texture_moving_between_live_devices_leaves_the_first",
+        TEXTURE_MOVE_LOG_FILTER,
+    );
+}
+
+/// Draw with a managed texture on one device, then on a second, and wait for the first to drop it.
+fn texture_move_workload() {
+    const GREEN: u32 = 0xFF00_FF00;
+    let triangle = [
+        PosVertex {
+            x: 0.0,
+            y: 0.5,
+            z: 0.5,
+        },
+        PosVertex {
+            x: 0.5,
+            y: -0.5,
+            z: 0.5,
+        },
+        PosVertex {
+            x: -0.5,
+            y: -0.5,
+            z: 0.5,
+        },
+    ];
+    let draw_with = |h: &Harness, texture: &Texture<'_>| {
+        assert_eq!(h.set_texture(0, texture), D3D_OK, "SetTexture");
+        assert_eq!(h.set_fvf(D3DFVF_XYZ), D3D_OK, "SetFVF");
+        h.render_once(GREEN, |d| {
+            assert_eq!(
+                d.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &triangle),
+                D3D_OK,
+                "draw"
+            );
+        });
+        // The read-back waits for the encoder to have replayed the frame.
+        let _ = h.read_pixel(1, 1);
+        assert_eq!(h.clear_texture(0), D3D_OK, "unbind the texture");
+    };
+
+    let first = Harness::new();
+    let second = Harness::new();
+    let texture = first.create_texture(2, 2, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED);
+    texture.lock_rect(0, 0).write_u32(&[GREEN; 4]);
+    draw_with(&first, &texture);
+    draw_with(&second, &texture);
+
+    let moved = await_logged_lines("rehydrated for new device", 1);
+    let id = moved[0]
+        .split_once(" tex ")
+        .and_then(|(_, rest)| rest.split_whitespace().next())
+        .expect("the move line names the texture")
+        .to_owned();
+    // The first device's next frame carries the destroy its encoder runs.
+    assert_eq!(
+        first.present(),
+        D3D_OK,
+        "a present on the device the texture left"
+    );
+    let _ = first.read_pixel(1, 1);
+    await_logged_lines(&format!("texture {id} left the encoder cache"), 1);
+    drop(texture);
 }
 
 /// The name the workload child of `fullscreen_retarget_reset_carries_the_gamma_ramp` runs under.

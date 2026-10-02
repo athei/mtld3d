@@ -21,6 +21,7 @@ pub mod caps;
 pub mod config;
 pub mod convert;
 pub mod cursor;
+pub mod departed_textures;
 pub mod depth_stencil_state;
 pub mod depth_texture;
 pub mod dirty_range;

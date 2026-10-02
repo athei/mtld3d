@@ -135,7 +135,7 @@ const VS1_EXPP_FRACTION: [u32; 14] = [
     0x0000_FFFF,
 ];
 
-const fn centered_triangle() -> [PosVertex; 3] {
+pub const fn centered_triangle() -> [PosVertex; 3] {
     [
         PosVertex {
             x: 0.0,
@@ -1386,9 +1386,17 @@ const VS_FETCH: [u32; 27] = [
     0x0000_FFFF,                                        // end (o1 write below)
 ];
 
+/// [`VS_FETCH`] with `mov o1, r0`: the texel sampler 0 fetches becomes the vertex colour.
+pub fn vs_fetch_to_color() -> Vec<u32> {
+    let mut tokens = VS_FETCH.to_vec();
+    let end = tokens.pop().expect("end token");
+    tokens.extend_from_slice(&[0x0200_0001, 0xE00F_0001, 0x80E4_0000, end]);
+    tokens
+}
+
 /// `ps_3_0 { dcl_color0 v0; mov oC0, v0; }`, pass the VS color through.
 #[rustfmt::skip]
-const PS_COLOR_PASSTHROUGH: [u32; 8] = [
+pub const PS_COLOR_PASSTHROUGH: [u32; 8] = [
     0xFFFF_0300,                                        // ps_3_0
     0x0200_001F, 0x8000_000A, 0x900F_0000,              // dcl_color0 v0
     0x0200_0001, 0x800F_0800, 0x90E4_0000,              // mov oC0, v0

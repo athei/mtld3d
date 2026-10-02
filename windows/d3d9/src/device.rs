@@ -28,6 +28,7 @@ use mtld3d_core::{
         self, FfVsLayout, InputSemantic, d3d_to_metal_primitive, fvf_to_elements,
         resolve_attrs_for_ff, resolve_attrs_for_vs, vertex_count,
     },
+    departed_textures::DepartedTextures,
     dirty_rect::DirtyRect,
     dxso::{VsSamplerKinds, operand_token_count},
     encoder_draw::{
@@ -714,6 +715,14 @@ pub struct DeviceInner {
     /// create, release and Evict run one at a time, on the API thread or
     /// serialised by the device `ApiLock` under `D3DCREATE_MULTITHREADED`.
     live_textures: Mutex<rustc_hash::FxHashMap<TextureId, *mut TextureInner>>,
+    /// Textures that moved to another device and still have storage on this one's encoder.
+    ///
+    /// The move runs under the adopting device's `ApiLock`, which does not
+    /// cover this device's `current_frame`, so it files the id here instead of
+    /// recording the destroy itself; `stamp_and_swap` drains the list into
+    /// the frame it hands over, under this device's own lock. A leaf mutex
+    /// like `live_textures`.
+    departed_textures: DepartedTextures,
     /// What the encoder made of each upload, waiting to be acted on.
     ///
     /// The bind-time flush clears a level's dirty bit and takes its pending
@@ -1280,8 +1289,9 @@ impl DeviceInner {
 
     /// Bind `tex` to vertex texture fetch slot `slot` (0..4).
     ///
-    /// Swaps the bound-slot refcount, flushes the texture's dirty mips,
-    /// and mirrors the id to the encoder. Later CPU writes dirty the draw
+    /// Swaps the bound-slot refcount, moves a texture another device last
+    /// used over to this one, flushes the texture's dirty mips, and mirrors
+    /// the id to the encoder. Later CPU writes dirty the draw
     /// snapshot, which flushes the same slots before the next draw.
     pub fn set_vertex_texture_slot(
         &mut self,
@@ -1313,6 +1323,9 @@ impl DeviceInner {
         } else {
             // SAFETY: non-null per the branch; live per D3D9 lifetime rules.
             let bound = unsafe { &mut *tex };
+            // A texture another device last used is moved over first, so its
+            // levels upload here and its id names storage on this encoder.
+            crate::texture::rehydrate_for_device(bound, self);
             // Vertex texture fetch samples like a stage bind, so it ends a
             // system-memory texture's CPU-only phase the same way.
             promote_cpu_only_texture(self, bound);
@@ -1624,6 +1637,11 @@ impl DeviceInner {
     /// the `submit_seq` it carries. Shared between `Present` and
     /// `flush_current_frame_blocking`.
     fn stamp_and_swap(&mut self, new_frame: FrameData, no_present: bool) -> (FrameData, u64) {
+        // Textures that moved to another device leave this encoder's cache
+        // behind every op the outgoing frame recorded.
+        for tex_id in self.departed_textures.take() {
+            self.push_control(DestroyTextureOp { tex_id });
+        }
         let mut frame = core::mem::replace(&mut self.current_frame, new_frame);
         // A `PresentationInterval` a Reset changed rides the first frame that
         // leaves the device after it, which is this one: the encoder applies it
@@ -2184,6 +2202,19 @@ impl DeviceInner {
     /// freed, so the registry never holds a dangling pointer, and from
     /// `texture::rehydrate_for_device` for the device a texture migrates off,
     /// which is the only other way an entry stops belonging here.
+    /// File a texture that moved to another device for this device's encoder to drop.
+    ///
+    /// Called under the adopting device's lock; see
+    /// [`mtld3d_core::departed_textures`].
+    pub fn note_departed_texture(&self, id: TextureId) {
+        self.departed_textures.note(id);
+    }
+
+    /// Keep the storage of a texture that moved back before its departure was drained.
+    pub fn cancel_departed_texture(&self, id: TextureId) {
+        self.departed_textures.cancel(id);
+    }
+
     pub fn deregister_texture(&self, ti: *mut TextureInner) {
         // SAFETY: deregistration runs before the live inner Box is freed or
         // transferred to another device; its texture id never changes.
@@ -3231,6 +3262,7 @@ impl Direct3DDevice9 {
             cur_autogen_rt_ids: [None; RENDER_TARGET_SLOTS],
             last_depth_binding: None,
             live_textures: Mutex::new(rustc_hash::FxHashMap::default()),
+            departed_textures: DepartedTextures::default(),
             upload_redirty: Arc::new(RedirtyQueue::new()),
             snapshot_dirty: SnapshotDirty::all(),
             snapshot_cache: ApiSnapshotCache::EMPTY,
@@ -11629,6 +11661,9 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
             // SAFETY: the bound-slot refcount keeps this separate texture
             // allocation live; the device API lock serialises its access.
             let bound = unsafe { &mut *tex };
+            // Bound here, then used on another device: back it comes, as a
+            // fragment stage's texture does in the stage walk.
+            crate::texture::rehydrate_for_device(bound, dev);
             crate::texture::flush_dirty_mips(bound.inner_mut(), dev);
             bound.inner_mut().note_gpu_use();
         }

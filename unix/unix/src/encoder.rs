@@ -7955,6 +7955,11 @@ impl FrameEncoder {
     pub fn destroy_cached_texture(&mut self, texture_id: TextureId) {
         if let Some(state) = self.texture_cache.remove(&texture_id) {
             let seq = self.current_submit_seq;
+            debug!(
+                target: LOG_TARGET,
+                "texture {:#x} left the encoder cache; its storage retires behind submission {seq}",
+                texture_id.raw()
+            );
             self.pass_state.unregister_srgb_twin(state.views.srgb);
             // `into_iter` so each slot's `keepalive` Arc moves into the
             // retention entry — the `MTLBuffer` wrapper must outlive
