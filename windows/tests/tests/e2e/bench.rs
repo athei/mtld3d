@@ -1228,6 +1228,78 @@ pub struct PassShape {
     pub ff_ps: u32,
     /// Textures the pass's draws sample, summed over the draws.
     pub textures: u32,
+    /// The pass's state mix, for a benchmark that reports one.
+    pub state: Option<PassState>,
+}
+
+/// The state mix of one render pass: shares, draw-to-draw switches and distinct shaders.
+///
+/// Each share counts draws: those with blending on, with alpha test on,
+/// with depth writes off (whether depth is on or not), culling nothing, and
+/// writing no colour to render target 0. A switch counts the draws after
+/// the pass's first whose value differs from the draw before: the vertex
+/// and the pixel shader (fixed function counting as one value), the stage-0
+/// texture (none counting as one), the blend state (enable, both factors,
+/// the operation and the separate-alpha states), the alpha test (enable,
+/// function and reference) and the cull mode. The distinct counts are the
+/// programmable vertex and pixel shaders and the textures bound on any stage.
+pub struct PassState {
+    /// Draws with blending on.
+    pub blend: u32,
+    /// Draws with the alpha test on.
+    pub atest: u32,
+    /// Draws with depth writes off.
+    pub zwrite_off: u32,
+    /// Draws with `D3DCULL_NONE`.
+    pub cull_none: u32,
+    /// Draws whose render target 0 colour write mask is 0.
+    pub cmask0: u32,
+    /// Draws whose vertex shader differs from the draw before.
+    pub vs_sw: u32,
+    /// Draws whose pixel shader differs from the draw before.
+    pub ps_sw: u32,
+    /// Draws whose stage-0 texture differs from the draw before.
+    pub tex_sw: u32,
+    /// Draws whose blend state differs from the draw before.
+    pub blend_sw: u32,
+    /// Draws whose alpha test differs from the draw before.
+    pub atest_sw: u32,
+    /// Draws whose cull mode differs from the draw before.
+    pub cull_sw: u32,
+    /// Distinct programmable vertex shaders.
+    pub vs_n: u32,
+    /// Distinct programmable pixel shaders.
+    pub ps_n: u32,
+    /// Distinct textures bound on any stage.
+    pub tex_n: u32,
+}
+
+impl PassState {
+    /// Append the 14 keys of the mix to `out`, each after a space.
+    ///
+    /// The keys and their order are part of the `shape` record's format
+    /// ([`Metrics`]), which the benchmark reports print too.
+    pub fn write_keys(&self, out: &mut String) {
+        let _ = write!(
+            out,
+            " blend={} atest={} zwrite_off={} cull_none={} cmask0={} vs_sw={} ps_sw={} \
+             tex_sw={} blend_sw={} atest_sw={} cull_sw={} vs_n={} ps_n={} tex_n={}",
+            self.blend,
+            self.atest,
+            self.zwrite_off,
+            self.cull_none,
+            self.cmask0,
+            self.vs_sw,
+            self.ps_sw,
+            self.tex_sw,
+            self.blend_sw,
+            self.atest_sw,
+            self.cull_sw,
+            self.vs_n,
+            self.ps_n,
+            self.tex_n,
+        );
+    }
 }
 
 /// A benchmark's numbers in the machine-read form of `bench-<name>.metrics`.
@@ -1260,7 +1332,10 @@ pub struct PassShape {
 ///   layer's `perf-kv` lines ([`Self::perf`] has the rules); a file without
 ///   them says why in a `# no perf-kv line` comment.
 /// - `shape <bench> pass <i> <W>x<H> draws=<n> ff_vs=<n> ff_ps=<n>
-///   tex_per_draw=<x.xx>`, one per [`PassShape`] of a scene benchmark.
+///   tex_per_draw=<x.xx>`, one per [`PassShape`] of a scene benchmark,
+///   followed by the [`PassState`] keys `blend= atest= zwrite_off=
+///   cull_none= cmask0= vs_sw= ps_sw= tex_sw= blend_sw= atest_sw= cull_sw=
+///   vs_n= ps_n= tex_n=`, each a count, when the benchmark reports them.
 ///
 /// A program comparing a base build with a candidate reads these, so the
 /// format is a contract: a record changes by adding a key or a metric, never
@@ -1497,7 +1572,7 @@ impl Metrics {
     pub fn shapes(&mut self, passes: &[PassShape]) {
         for (at, pass) in passes.iter().enumerate() {
             assert!(pass.draws > 0, "pass {at} of a scene has draws");
-            let _ = writeln!(
+            let _ = write!(
                 self.shapes,
                 "shape {bench} pass {at} {width}x{height} draws={draws} ff_vs={ff_vs} \
                  ff_ps={ff_ps} tex_per_draw={per_draw:.2}",
@@ -1509,6 +1584,10 @@ impl Metrics {
                 ff_ps = pass.ff_ps,
                 per_draw = f64::from(pass.textures) / f64::from(pass.draws),
             );
+            if let Some(state) = &pass.state {
+                state.write_keys(&mut self.shapes);
+            }
+            self.shapes.push('\n');
         }
     }
 

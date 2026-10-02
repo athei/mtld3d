@@ -1981,7 +1981,12 @@ bench-compare:
 # frame the game dumped with F12 into passes and prints them beside the
 # benchmark's `shape` lines, flagging draw counts off by more than 10 %,
 # fixed-function shares off by more than 10 points, textures per draw off by
-# more than 1.0, and a different pass count. Exit 1 when anything is flagged.
+# more than 1.0, and a different pass count. Where the `shape` lines carry a
+# state mix, it also flags blend, alpha-test, depth-write-off, cull-none and
+# colour-mask-0 shares off by more than 10 points, and shader, texture and
+# state switch counts and distinct shader and texture counts off by more than
+# 15 % of the game's count or 5, whichever is larger. Exit 1 when anything is
+# flagged.
 # It runs nothing under Wine and judges no build; it is run by hand.
 bench-shape:
 	test -n '$(GAME_LOG)' -a -n '$(BENCH_METRICS)' || \
