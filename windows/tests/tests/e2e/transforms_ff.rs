@@ -753,6 +753,49 @@ fn texture_arg_specular_selects_vertex_color1() {
     );
 }
 
+/// Position, normal, diffuse and specular: the `XYZ | NORMAL | DIFFUSE | SPECULAR` FVF.
+#[repr(C)]
+struct LitSpecularVertex {
+    position: [f32; 3],
+    normal: [f32; 3],
+    diffuse: u32,
+    specular: u32,
+}
+
+#[test]
+fn lit_draw_with_specular_off_passes_vertex_specular_to_a_stage() {
+    // Lighting with SPECULARENABLE off computes no specular term, so oD1 is
+    // the vertex COLOR1, which D3DTA_SPECULAR selects into the cascade.
+    let h = Harness::new();
+    assert_eq!(h.set_render_state(D3DRS_LIGHTING, 1), 0, "lighting on");
+    assert_eq!(h.set_render_state(D3DRS_SPECULARENABLE, 0), 0, "specular off");
+    assert_eq!(
+        h.set_fvf(D3DFVF_XYZ | D3DFVF_NORMAL | D3DFVF_DIFFUSE | D3DFVF_SPECULAR),
+        0,
+        "SetFVF"
+    );
+    h.select_diffuse_stage(0);
+    assert_eq!(
+        h.set_texture_stage_state(0, D3DTSS_COLORARG1, D3DTA_SPECULAR),
+        0,
+        "COLORARG1 = SPECULAR",
+    );
+    let tri = solid_triangle(0).map(|v| LitSpecularVertex {
+        position: [v.x, v.y, v.z],
+        normal: [0.0, 0.0, -1.0],
+        diffuse: 0xFF00_FF00,
+        specular: 0xFFFF_0000,
+    });
+    h.render_once(BLUE, |d| {
+        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &tri), 0, "draw");
+    });
+    assert_eq!(
+        h.read_pixel(320, 280),
+        0xFFFF_0000,
+        "stage selects the lit draw's vertex specular red"
+    );
+}
+
 #[test]
 fn sparse_light_indices_round_trip() {
     // D3D9 lets SetLight / LightEnable address light indices beyond

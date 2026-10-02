@@ -105,7 +105,8 @@ bitflags::bitflags! {
         /// `D3DRS_SPECULARENABLE`.
         ///
         /// Gates per-light Blinn-Phong specular emission into `color1`; when
-        /// clear, `color1` receives `saturate(float4(0.0))`.
+        /// clear, a lit `color1` is the vertex specular colour, or zero
+        /// without one.
         const SPECULAR_ENABLE = 1 << 6;
         /// `D3DRS_INDEXEDVERTEXBLENDENABLE`: the world-matrix index source.
         ///
@@ -1293,7 +1294,9 @@ fn emit_vs(out: &mut String, vs: &FfVsKey, entry: &str) {
             out,
             "    float4 diffuseAccum = {mat_emissive} + vs_c[9] * {mat_ambient};"
         );
-        out.push_str("    float3 specAccum = float3(0.0);\n");
+        if vs.specular_enable() {
+            out.push_str("    float3 specAccum = float3(0.0);\n");
+        }
         // Walk active light slots via the bitmask (1 bit per slot, MSB→LSB
         // order is irrelevant since each iteration emits an independent
         // accumulation block). The per-light DIRECTIONAL/SPOT/POINT branch
@@ -1397,7 +1400,15 @@ fn emit_vs(out: &mut String, vs: &FfVsKey, entry: &str) {
         out.push_str("    float4 lit = saturate(diffuseAccum);\n");
         let _ = writeln!(out, "    lit.a = {mat_diffuse}.a;");
         out.push_str("    out.color0 = lit;\n");
-        out.push_str("    out.color1 = float4(saturate(specAccum), 0.0);\n");
+        if vs.specular_enable() {
+            out.push_str("    out.color1 = float4(saturate(specAccum), 0.0);\n");
+        } else if vs.has_color1() {
+            // With specular lighting off, oD1 is the vertex specular colour,
+            // as on the unlit path.
+            out.push_str("    out.color1 = in.v3;\n");
+        } else {
+            out.push_str("    out.color1 = float4(0.0);\n");
+        }
     } else {
         if vs.has_color0() {
             out.push_str("    out.color0 = in.v2;\n");

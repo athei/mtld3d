@@ -193,20 +193,31 @@ fn emits_one_directional_light() {
     assert!(msl.contains("lit.a = "), "{msl}");
 }
 
+/// A lit draw with specular lighting off passes the vertex specular colour through to `color1`.
+///
+/// Lighting computes no specular term then, so a `D3DTA_SPECULAR` argument or
+/// a pixel shader reading `v1` sees the vertex colour as on the unlit path,
+/// and zero for a vertex without one.
 #[test]
-fn specular_disabled_emits_zero_color1_and_no_pow() {
-    let mut vs = default_vs_key();
-    vs.flags.set(FfVsFlags::HAS_NORMAL, true);
-    vs.flags.set(FfVsFlags::LIGHTING_ENABLED, true);
-    vs.light_active_mask = 1;
-    vs.light_directional_mask = 1;
-    // specular_enable is false in the default key.
-    let msl = emit_pair_for_tests(&vs, &default_ps_key(), VariantKey::default());
-    assert!(
-        msl.contains("out.color1 = float4(saturate(specAccum), 0.0);"),
-        "{msl}"
-    );
-    assert!(!msl.contains("pow(ndoth"), "{msl}");
+fn specular_disabled_passes_vertex_specular_and_emits_no_pow() {
+    for color1 in [false, true] {
+        let mut vs = default_vs_key();
+        vs.flags.set(FfVsFlags::HAS_NORMAL, true);
+        vs.flags.set(FfVsFlags::LIGHTING_ENABLED, true);
+        vs.flags.set(FfVsFlags::HAS_COLOR1, color1);
+        vs.light_active_mask = 1;
+        vs.light_directional_mask = 1;
+        // specular_enable is false in the default key.
+        let msl = emit_pair_for_tests(&vs, &default_ps_key(), VariantKey::default());
+        let expected = if color1 {
+            "out.color1 = in.v3;"
+        } else {
+            "out.color1 = float4(0.0);"
+        };
+        assert!(msl.contains(expected), "{msl}");
+        assert!(!msl.contains("specAccum"), "{msl}");
+        assert!(!msl.contains("pow(ndoth"), "{msl}");
+    }
 }
 
 #[test]
