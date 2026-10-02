@@ -1613,12 +1613,10 @@ impl DeviceInner {
             let carried = frame.take_carried_capture_marks(true);
             self.current_frame.mark_gpu_capture(carried);
         }
-        // Preserve the existing perf payload fields while command bytes and UP data
-        // share the recycled frame arena.
+        // Keep the perf payload fields while command bytes and UP data share the frame arena.
         let op_vec_capacity_bytes = frame.op_vec_capacity_bytes();
         let op_vec_realloc_bytes = frame.take_op_vec_realloc_bytes();
-        self.perf
-            .state_mut()
+        self.perf_mut()
             .drain_into_payload(frame.perf_mut(), !no_present);
         frame
             .perf_mut()
