@@ -4342,19 +4342,32 @@ extern "system" fn texture_lock_rect(
     0 // S_OK
 }
 
+/// The `INVALIDCALL` `UnlockRect` answers for a level past the mip chain.
+///
+/// Out of line so the unlock path does not build the log arguments.
+#[cold]
+#[inline(never)]
+fn reject_unlock_level(level: u32) -> i32 {
+    mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+        "IDirect3DTexture9::UnlockRect: level {level} past the mip chain → INVALIDCALL"
+    );
+    D3DERR_INVALIDCALL
+}
+
 extern "system" fn texture_unlock_rect(this: *mut c_void, level: u32) -> i32 {
     let _api = crate::com_ref::com_api_lock::<Direct3DTexture9>(this);
     let _timer = tex_timer(this);
-    let level_u8 = u8::try_from(level).expect("D3D9 mip level ≤ 14");
-    mtld3d_shared::crumb!("api:tex_ulock", u64::from(level_u8));
     // SAFETY: vtable thunk; `this` is *mut Direct3DTexture9 per IDirect3DTexture9 ABI.
     let Some(mut obj) = (unsafe { InPtrMut::<Direct3DTexture9>::opt(this) }) else {
         return D3DERR_INVALIDCALL;
     };
     let ti = obj.inner_mut();
+    // Checked before anything narrows `level`: an application may pass any
+    // `u32`, and a level past the chain is INVALIDCALL, never a panic.
     if level >= ti.app_level_count() {
-        return D3DERR_INVALIDCALL;
+        return reject_unlock_level(level);
     }
+    mtld3d_shared::crumb!("api:tex_ulock", u64::from(level));
     let level_u = level as usize;
     let (read_only, no_dirty, was_locked, lock_rect) = ti.take_lock(level_u);
     if !was_locked {

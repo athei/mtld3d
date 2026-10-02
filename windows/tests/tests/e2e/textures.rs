@@ -613,6 +613,24 @@ fn autogen_mipmap_texture_rejects_sub_level_unlock() {
     assert_eq!(tex.unlock_rect(0), 0, "UnlockRect on the exposed level");
 }
 
+/// `UnlockRect` of a level no mip chain can hold is `INVALIDCALL`.
+///
+/// The level arrives as a `u32` the application chose, so 256 and the top of
+/// the range are as possible as 15, and each is answered like any other level
+/// past the chain rather than ending the process.
+#[test]
+fn texture_unlock_rect_rejects_a_level_past_any_chain() {
+    let h = Harness::new();
+    let tex = h.create_texture(16, 16, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED);
+    for level in [1, 255, 256, u32::MAX] {
+        assert_eq!(
+            tex.unlock_rect(level),
+            D3DERR_INVALIDCALL,
+            "UnlockRect({level}) of a one-level texture"
+        );
+    }
+}
+
 #[test]
 fn autogen_generate_mip_sub_levels_reads_the_pending_level_zero_write() {
     // An explicit `GenerateMipSubLevels` downsamples level 0, and a level-0
