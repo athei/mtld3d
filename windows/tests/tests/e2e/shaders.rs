@@ -1830,6 +1830,58 @@ fn relative_constant_read_inside_a_call_sees_the_uploaded_row() {
     );
 }
 
+/// `ps_3_0` reading `c[aL + 2]` inside a one-pass `loop` that starts `aL` at 18.
+///
+/// `defi i0, 1, 18, 1, 0; loop aL, i0; mov r0, c[aL + 2]; endloop; mov oC0, r0`
+/// The instruction stream names rows up to `c2` only; the row it reads is `c20`.
+#[rustfmt::skip]
+const PS_LOOP_REL_CONST: [u32; 19] = [
+    0xFFFF_0300,                                        // ps_3_0
+    0x0500_0030, 0xF00F_0000, 1, 18, 1, 0,              // defi i0, 1, 18, 1, 0
+    0x0200_001B, 0xF0E4_0800, 0xF0E4_0000,              // loop aL, i0
+    0x0300_0001, 0x800F_0000, 0xA0E4_2002, 0xF000_0800, // mov r0, c[aL + 2]
+    0x0000_001D,                                        // endloop
+    0x0200_0001, 0x800F_0800, 0x80E4_0000,              // mov oC0, r0
+    0x0000_FFFF,                                        // end
+];
+
+/// The pixel constant prefix a draw binds covers a `c[aL + N]` read.
+///
+/// Rows 0..=19 are red, so a prefix sized from the rows the instruction stream
+/// names (three) ends long before the green row 20 the loop counter selects.
+#[test]
+fn pixel_relative_constant_read_in_a_loop_sees_the_uploaded_row() {
+    let h = Harness::new();
+    let vs = h.create_vertex_shader(&VS_BC);
+    let ps = h.create_pixel_shader(&PS_LOOP_REL_CONST);
+    assert_eq!(h.set_vertex_shader(&vs), 0, "SetVertexShader");
+    assert_eq!(h.set_pixel_shader(&ps), 0, "SetPixelShader");
+    assert_eq!(h.set_fvf(D3DFVF_XYZ), 0, "SetFVF");
+
+    let mut constants = [0.0f32; 21 * 4];
+    for row in 0..20 {
+        constants[row * 4] = 1.0;
+        constants[row * 4 + 3] = 1.0;
+    }
+    constants[20 * 4 + 1] = 1.0;
+    constants[20 * 4 + 3] = 1.0;
+    assert_eq!(
+        h.set_pixel_shader_constant_f(0, &constants),
+        0,
+        "SetPixelShaderConstantF"
+    );
+
+    let tri = centered_triangle();
+    h.render_once(0xFF00_00FF, |d| {
+        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &tri), 0, "draw");
+    });
+    assert_eq!(
+        h.read_pixel(320, 280),
+        0xFF00_FF00,
+        "the row c[aL + 2] names must be inside the bound constant prefix"
+    );
+}
+
 #[test]
 fn defined_pixel_constant_ignores_the_constant_buffer() {
     let h = Harness::new();

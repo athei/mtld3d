@@ -58,6 +58,10 @@ pub struct ProgrammablePsSource {
 
 impl ProgrammablePsSource {
     #[must_use]
+    pub const fn uses_rel_const(&self) -> bool {
+        self.flags.contains(ShaderSourceFlags::RELATIVE)
+    }
+    #[must_use]
     pub const fn uses_bump_env(&self) -> bool {
         self.flags.contains(ShaderSourceFlags::BUMP_ENV)
     }

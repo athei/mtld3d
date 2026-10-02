@@ -81,6 +81,11 @@ impl Direct3DPixelShader9 {
         self.inner().flags.contains(PsUsage::USES_BOOL_CONST)
     }
 
+    /// `true` when the shader reads a float constant through `c[aL + N]`.
+    pub fn uses_rel_const(&self) -> bool {
+        self.inner().flags.contains(PsUsage::USES_REL_CONST)
+    }
+
     /// Bit `i` set ⇒ the bytecode writes `oCi` (see `DxsoProgram::color_out_mask`).
     pub fn color_out_mask(&self) -> u8 {
         self.inner().color_out_mask
@@ -119,6 +124,11 @@ bitflags::bitflags! {
         const USES_BOOL_CONST = 1 << 2;
         /// SM1/SM2 output goes through the fixed-function fog stage.
         const AUTOMATIC_FOG = 1 << 3;
+        /// Reads a float constant through relative addressing (`c[aL + N]`).
+        ///
+        /// The row is known only at draw time, so such draws bind every
+        /// populated row instead of the statically named prefix.
+        const USES_REL_CONST = 1 << 4;
     }
 }
 

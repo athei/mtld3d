@@ -64,13 +64,13 @@ pub fn parse_shader(
         ShaderUsage::BOOL_CONST,
         program.uses_dynamic_bool_constants(),
     );
+    usage.set(
+        ShaderUsage::RELATIVE_CONST,
+        program.uses_relative_const_addressing(),
+    );
     let mut input_semantics = Vec::new();
     let color_out_mask = match stage {
         ShaderStage::Vertex => {
-            usage.set(
-                ShaderUsage::RELATIVE_CONST,
-                program.uses_relative_const_addressing(),
-            );
             for decl in &program.declarations {
                 if let Declaration::Semantic {
                     usage,

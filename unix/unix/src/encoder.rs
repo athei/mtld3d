@@ -5043,11 +5043,17 @@ impl FrameEncoder {
     /// The maximum `start_row + rows` seen across every
     /// `Op::SetVsConstRange` applied. `emit_draw` uses this for shaders
     /// that bind constants via relative addressing (`c[a0.x + N]`), where
-    /// the static-analysis bound from `max_const_used` would truncate. PS
-    /// has no equivalent because D3D9 PS doesn't support relative-addressed
-    /// constants in any profile we ship.
+    /// the static-analysis bound from `max_const_used` would truncate.
     pub const fn vs_constants_populated_rows(&self) -> u16 {
         self.vs_constants_populated_rows
+    }
+
+    /// Populated-row high-watermark of the encoder-side PS mirror.
+    ///
+    /// The pixel-side twin of [`Self::vs_constants_populated_rows`], for
+    /// `ps_3_0` shaders that read `c[aL + N]` inside a `loop`.
+    pub const fn ps_constants_populated_rows(&self) -> u16 {
+        self.ps_constants_populated_rows
     }
 
     /// Change the native triangle fill state without adding a pipeline variant.

@@ -11975,6 +11975,10 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
                         mtld3d_core::draw_data::ShaderSourceFlags::BUMP_ENV
                     } else {
                         mtld3d_core::draw_data::ShaderSourceFlags::empty()
+                    }) | (if ps_obj.uses_rel_const() {
+                        mtld3d_core::draw_data::ShaderSourceFlags::RELATIVE
+                    } else {
+                        mtld3d_core::draw_data::ShaderSourceFlags::empty()
                     }),
 
                     reserved: [0; 4],
@@ -13890,6 +13894,12 @@ extern "system" fn device_create_pixel_shader(
         created
             .usage
             .contains(mtld3d_shared::shader_create::ShaderUsage::BOOL_CONST),
+    );
+    usage.set(
+        crate::pixel_shader::PsUsage::USES_REL_CONST,
+        created
+            .usage
+            .contains(mtld3d_shared::shader_create::ShaderUsage::RELATIVE_CONST),
     );
     if let Err(result) = created.adopt(obj.inner()) {
         return result;

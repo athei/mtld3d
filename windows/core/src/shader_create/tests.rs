@@ -121,3 +121,37 @@ fn vertex_constant_usage_flags_are_independent() {
     assert!(shader.usage.contains(ShaderUsage::BOOL_CONST));
     assert!(!shader.usage.contains(ShaderUsage::BUMP_ENV));
 }
+
+#[test]
+fn pixel_relative_constant_read_is_reported() {
+    // ps_3_0: defi i0, 4, 0, 1, 0; mov r0, c1; loop aL, i0;
+    // add r0, r0, c[aL + 2]; endloop; mov oC0, r0
+    let tokens = [
+        0xffff_0300,
+        0x0500_0030,
+        0xf00f_0000,
+        4,
+        0,
+        1,
+        0,
+        0x0200_0001,
+        0x800f_0000,
+        0xa0e4_0001,
+        0x0200_001b,
+        0xf0e4_0800,
+        0xf0e4_0000,
+        0x0400_0002,
+        0x800f_0000,
+        0x80e4_0000,
+        0xa0e4_2002,
+        0xf000_0800,
+        0x0000_001d,
+        0x0200_0001,
+        0x800f_0800,
+        0x80e4_0000,
+        0x0000_ffff,
+    ];
+    let shader = parse_shader(&ShaderStage::Pixel, &tokens).expect("valid relative read");
+    assert!(shader.usage.contains(ShaderUsage::RELATIVE_CONST));
+    assert_eq!(shader.max_const_used, 3);
+}

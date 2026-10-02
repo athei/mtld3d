@@ -566,8 +566,16 @@ fn emit_draw_view(
         }
     };
     let ps_constants = match ps {
-        PsSourceView::Programmable(ProgrammablePsSource { max_const_used, .. }) => {
-            enc.ps_const_scratch(*max_const_used)
+        PsSourceView::Programmable(value) => {
+            // A `c[aL + N]` read names its row only at draw time. The
+            // statically named rows stay bound even when the application
+            // has populated fewer, so the bound prefix covers both.
+            let rows = if value.uses_rel_const() {
+                enc.ps_constants_populated_rows().max(value.max_const_used)
+            } else {
+                value.max_const_used
+            };
+            enc.ps_const_scratch(rows)
         }
         PsSourceView::FixedFunction(FixedPsSource { constant_rows, .. }) if *constant_rows != 0 => {
             snap.ps_constants.unwrap_or(ScratchSlice::EMPTY)
