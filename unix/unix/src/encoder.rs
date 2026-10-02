@@ -111,8 +111,8 @@ mod depth;
 mod upload_view;
 pub use compile::StretchCopyTargets;
 pub use mtld3d_core::encoder_data::{
-    BlitSide, ColorFillTarget, ColorRtBinding, DepthTransfer, ResampledUpload, RetiredColorTarget,
-    TextureUploadJob,
+    BlitSide, ColorFillTarget, ColorRegionUpdate, ColorRtBinding, DepthTransfer, ResampledUpload,
+    RetiredColorTarget, TextureUploadJob,
 };
 use mtld3d_core::{
     encoder_draw::draw_record::{IndexView, VertexView},
@@ -7445,21 +7445,155 @@ impl FrameEncoder {
         if color_handle == 0 || width == 0 || height == 0 || src_stride == 0 {
             return;
         }
+        let Some((buffer_handle, bytes_per_row)) =
+            self.stage_color_rows("upload_bytes_to_color_handle", rows, height, src_stride)
+        else {
+            return;
+        };
+        let info = CopyBufferToTextureInfo {
+            buffer_handle,
+            buffer_offset: 0,
+            bytes_per_row,
+            texture_handle: color_handle,
+            destination_slice: 0,
+            mip_level: 0,
+            origin_x: 0,
+            origin_y: 0,
+            region_w: width,
+            region_h: height,
+            // Single-slice 2D copy: `bytes_per_image == bytes_per_row *
+            // region_h`, matching the blit's pre-existing implicit value.
+            depth: 1,
+            bytes_per_image: bytes_per_row.saturating_mul(height),
+        };
+        self.frame_blit_commands
+            .push(BlitCommand::copy_buffer_to_texture(&info));
+        self.flags.insert(FrameEncoderFlags::BLIT_CMDS_NEED_ENCODER);
+        self.perf.bump_texture_blit_upload();
+    }
+
+    /// Write `UpdateSurface` rows into a region of a colour surface no texture backs.
+    ///
+    /// The destination is a render-target surface or the back buffer. D3D9
+    /// orders the copy after every call before it, so a `Clear` still
+    /// waiting for a pass lands first, the open pass ends, and the copy rides
+    /// the next pass's leading blits like a `StretchRect` does. A destination
+    /// `render.scale` shrinks takes the rows into a scratch at their own
+    /// extent first and resamples them into the converted rect with the
+    /// blit quad, which a scaling `StretchRect` uses too.
+    pub fn update_color_region(&mut self, region: &ColorRegionUpdate, rows: &[u8]) {
+        let (width, height) = region.extent;
+        if region.color_handle == 0 || width == 0 || height == 0 || region.bytes_per_row == 0 {
+            return;
+        }
+        self.flush_pending_clears();
+        self.end_current_pass("update_surface");
+        let Some((buffer_handle, bytes_per_row)) =
+            self.stage_color_rows("update_color_region", rows, height, region.bytes_per_row)
+        else {
+            return;
+        };
+        let copy_into = |texture_handle: u64, (origin_x, origin_y): (u32, u32)| {
+            BlitCommand::copy_buffer_to_texture(&CopyBufferToTextureInfo {
+                buffer_handle,
+                buffer_offset: 0,
+                bytes_per_row,
+                texture_handle,
+                destination_slice: 0,
+                mip_level: 0,
+                origin_x,
+                origin_y,
+                region_w: width,
+                region_h: height,
+                depth: 1,
+                bytes_per_image: bytes_per_row.saturating_mul(height),
+            })
+        };
+        if region.scale.is_identity() {
+            self.push_stretch_rect_blit(copy_into(region.color_handle, region.origin));
+            return;
+        }
+        let Some((scratch, scratch_w, scratch_h)) =
+            self.stretch_scratch_texture(region.color_handle, region.extent, region.format)
+        else {
+            mtld3d_shared::log_once_warn!(
+                target: LOG_TARGET,
+                "UpdateSurface: no {width}x{height} {:?} scratch to resample a region into a \
+                 scaled surface through; the region is dropped",
+                region.format
+            );
+            return;
+        };
+        self.push_stretch_rect_blit(copy_into(scratch, (0, 0)));
+        let (x, y, w, h) = TargetExtent::new(region.scale, region.logical, region.texture).rect(
+            region.origin.0,
+            region.origin.1,
+            width,
+            height,
+        );
+        self.stretch_blit_scaled(
+            &BlitSide {
+                handle: scratch,
+                rect: StretchRegion {
+                    x: 0,
+                    y: 0,
+                    w: width,
+                    h: height,
+                },
+                dims: (scratch_w, scratch_h),
+                mip: 0,
+                slice: None,
+                msaa: MetalHandle::NULL,
+                msaa_srgb: MetalHandle::NULL,
+                sample_count: 1,
+            },
+            &BlitSide {
+                handle: region.color_handle,
+                rect: StretchRegion { x, y, w, h },
+                dims: region.texture,
+                mip: 0,
+                slice: None,
+                msaa: MetalHandle::NULL,
+                msaa_srgb: MetalHandle::NULL,
+                sample_count: 1,
+            },
+            region.format,
+            mtld3d_core::stretch_rect::BlitDecode::None,
+            mtld3d_types::D3DTEXF_LINEAR,
+        );
+    }
+
+    /// Copy `height` rows of `src_stride` bytes into a fresh staging `MTLBuffer` a blit can read.
+    ///
+    /// Returns the buffer's handle and its row stride. The rows land in a
+    /// page-aligned `PageBox` (padding each row up to
+    /// `min_linear_texture_align` if the source stride is below it), which a
+    /// transient `MTLBuffer` wraps; both retire after the GPU retires this
+    /// frame. The bytes are *copied* here (the caller's staging is not aliased
+    /// across the API/encoder boundary). `caller` names the entry point in the
+    /// failure lines.
+    fn stage_color_rows(
+        &mut self,
+        caller: &str,
+        rows: &[u8],
+        height: u32,
+        src_stride: u32,
+    ) -> Option<(u64, u32)> {
         let src_stride = src_stride as usize;
         // `copyFromBuffer:toTexture:` requires `sourceBytesPerRow` ≥
         // `minimumLinearTextureAlignmentForPixelFormat:`; pad narrow rows up.
         let padded_stride = src_stride.max(self.gpu_caps.min_linear_texture_align as usize);
         let Some(padded_size) = padded_stride.checked_mul(height as usize) else {
-            error!(target: LOG_TARGET, "upload_bytes_to_color_handle: staging size overflow");
-            return;
+            error!(target: LOG_TARGET, "{caller}: staging size overflow");
+            return None;
         };
         if rows.len() < src_stride.saturating_mul(height as usize) {
             error!(
                 target: LOG_TARGET,
-                "upload_bytes_to_color_handle: source slice {} shorter than {src_stride}*{height}",
+                "{caller}: source slice {} shorter than {src_stride}*{height}",
                 rows.len(),
             );
-            return;
+            return None;
         }
         // `bytesNoCopy` needs page-aligned backing, so the rows must land in a
         // `PageBox` (re-packing the source rows into the padded stride).
@@ -7495,34 +7629,12 @@ impl FrameEncoder {
         if status != 0 || staging_handle.is_null() {
             error!(
                 target: LOG_TARGET,
-                "upload_bytes_to_color_handle: CreateBuffer failed (status={status:#x}, len={staging_len})",
+                "{caller}: CreateBuffer failed (status={status:#x}, len={staging_len})",
             );
-            return;
+            return None;
         }
         // Non-UMA: the CPU just wrote the staging slab; notify before the blit.
         self.enqueue_notify_buffer_did_modify_range(staging_handle.raw(), 0, staging_len);
-
-        let bytes_per_row = u32::try_from(padded_stride).expect("padded stride fits u32");
-        let info = CopyBufferToTextureInfo {
-            buffer_handle: staging_handle.raw(),
-            buffer_offset: 0,
-            bytes_per_row,
-            texture_handle: color_handle,
-            destination_slice: 0,
-            mip_level: 0,
-            origin_x: 0,
-            origin_y: 0,
-            region_w: width,
-            region_h: height,
-            // Single-slice 2D copy: `bytes_per_image == bytes_per_row *
-            // region_h`, matching the blit's pre-existing implicit value.
-            depth: 1,
-            bytes_per_image: bytes_per_row.saturating_mul(height),
-        };
-        self.frame_blit_commands
-            .push(BlitCommand::copy_buffer_to_texture(&info));
-        self.flags.insert(FrameEncoderFlags::BLIT_CMDS_NEED_ENCODER);
-        self.perf.bump_texture_blit_upload();
 
         // Retire the wrapper + PageBox after the GPU retires this frame — the
         // blit reads them at command-buffer execution. Wrapper first so Metal
@@ -7538,6 +7650,10 @@ impl FrameEncoder {
                 seq: self.current_submit_seq,
                 from_texture: true,
             });
+        Some((
+            staging_handle.raw(),
+            u32::try_from(padded_stride).expect("padded stride fits u32"),
+        ))
     }
 
     /// Upload `rows` at their own extent, then resample them into a smaller colour texture.

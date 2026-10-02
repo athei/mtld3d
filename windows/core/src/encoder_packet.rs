@@ -245,6 +245,11 @@ impl FrameRecorder {
                 let value = *value;
                 self.record_typed(scratch, value)
             }
+            Op::UpdateColorRegion(value) => {
+                #[cfg(not(windows))]
+                let value = *value;
+                self.record_typed(scratch, value)
+            }
             Op::GenerateMipmaps(value) => {
                 #[cfg(not(windows))]
                 let value = *value;

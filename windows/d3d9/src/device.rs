@@ -13,8 +13,9 @@ pub use mtld3d_core::encoder_data::{
     ReadTextureColorHandleOp, ReadTextureHandleOp, ResolveDepthSurfaceOp, ResolveDepthTextureOp,
     ResolveDynamicDepthOp, RetireColorOp, RetireDepthOp, RtBinding, SetDumpDrawOp,
     SetVertexSamplerOp, SetVertexTextureOp, SetViewportOp, StretchBlitOp, StretchKind,
-    StretchSurfaceFlags, StretchSurfaceInfo, UnbindExtraColorOp, UploadColorOp, UploadResampledOp,
-    UploadTextureAndMipsOp, UploadTextureOp, UploadTextureOpFlags,
+    StretchSurfaceFlags, StretchSurfaceInfo, UnbindExtraColorOp, UpdateColorRegionOp,
+    UploadColorOp, UploadResampledOp, UploadTextureAndMipsOp, UploadTextureOp,
+    UploadTextureOpFlags,
 };
 
 mod frame_dump;
@@ -931,7 +932,9 @@ impl DeviceInner {
         let source = ReadbackSource {
             width: self.backbuffer_width,
             height: self.backbuffer_height,
-            format: self.current_frame.backbuffer_format(),
+            format: mtld3d_core::format::backbuffer_surface_format(
+                self.present_params.back_buffer_format,
+            ),
         };
         if reject_readback("GetFrontBufferData", &source, &dst_desc).is_some() {
             return D3DERR_INVALIDCALL;
@@ -5306,6 +5309,24 @@ fn create_texture_path(info: &TextureCreateArgs) -> i32 {
         });
     }
 
+    // Packed 4:2:2 YUV has no sampling decode, so the device answers no to the
+    // texture query and only the runtime's CPU-only SCRATCH form creates, the
+    // rule cube and volume textures follow too. The DEFAULT-pool offscreen
+    // plain `StretchRect` decodes keeps the texture behind it.
+    if !offscreen_plain
+        && mtld3d_core::stretch_rect::is_packed_yuv(format)
+        && pool != D3DPOOL_SCRATCH
+    {
+        mtld3d_shared::log_once_warn_by!(
+            target: crate::LOG_TARGET,
+            key: (u64::from(pool) << 32) | u64::from(format),
+            "reject CreateTexture(format={}, pool={pool}) → INVALIDCALL (a packed YUV texture is \
+             a D3DPOOL_SCRATCH resource only)",
+            mtld3d_core::format::format_name(format)
+        );
+        null_out(texture);
+        return D3DERR_INVALIDCALL;
+    }
     // SAFETY: vtable thunk; `this` is *mut Direct3DDevice9 per IDirect3DDevice9 ABI.
     let Some(obj) = (unsafe { InPtr::<Direct3DDevice9>::opt(this) }) else {
         null_out(texture);
@@ -6886,6 +6907,19 @@ extern "system" fn device_update_surface(
             );
             return D3DERR_INVALIDCALL;
         }
+        // The same region rules as a texture-level source: the rect inside the
+        // source, the copy inside the destination level, and block-aligned
+        // origins and extents for a block-compressed pair.
+        if !tex
+            .inner()
+            .update_region_valid(dst_level, (src_w, src_h), rect, point)
+        {
+            mtld3d_shared::log_once_warn!(
+                target: crate::LOG_TARGET,
+                "reject UpdateSurface: standalone source rect/destination point out of bounds → INVALIDCALL"
+            );
+            return D3DERR_INVALIDCALL;
+        }
         let image = SourceImage {
             bytes: src_bytes,
             pitch: src_pitch,
@@ -6910,6 +6944,21 @@ extern "system" fn device_update_surface(
         schedule_staging_upload_at_next_bind(tex);
         return D3D_OK;
     }
+    // A render-target surface or the back buffer: a colour surface with no
+    // texture behind it, whose Metal texture takes the region directly.
+    if dst_parent.is_null() && !dst_surf.metal_color_handle().is_null() {
+        // SAFETY: vtable thunk; `this` is *mut Direct3DDevice9 per IDirect3DDevice9 ABI.
+        let Some(obj) = (unsafe { InPtr::<Direct3DDevice9>::opt(this) }) else {
+            return D3DERR_INVALIDCALL;
+        };
+        // SAFETY: optional *const RECT / *const POINT per the ABI; null → None.
+        let rect = (unsafe { ValueIn::<mtld3d_types::D3DRECT>::read_opt(src_rect) })
+            .map(|r| (r.x1, r.y1, r.x2, r.y2));
+        // SAFETY: as above; POINT is two i32 (x, y).
+        let point =
+            (unsafe { ValueIn::<[i32; 2]>::read_opt(dst_point) }).map_or((0, 0), |p| (p[0], p[1]));
+        return update_surface_into_color_target(obj.inner(), &src_surf, &dst_surf, rect, point);
+    }
     if src_parent.is_null() || dst_parent.is_null() || std::ptr::eq(src_parent, dst_parent) {
         mtld3d_shared::log_once_warn!(
             target: crate::LOG_TARGET,
@@ -6926,7 +6975,8 @@ extern "system" fn device_update_surface(
     let point =
         (unsafe { ValueIn::<[i32; 2]>::read_opt(dst_point) }).map_or((0, 0), |p| (p[0], p[1]));
     copy_systemmem_to_default(dst_parent, src_parent, |dst, src| {
-        if !dst.update_region_valid(dst_level, src, src_level, rect, point) {
+        let src_extent = (src.mip_width(src_level), src.mip_height(src_level));
+        if !dst.update_region_valid(dst_level, src_extent, rect, point) {
             mtld3d_shared::log_once_warn!(
                 target: crate::LOG_TARGET,
                 "reject UpdateSurface: source rect/destination point out of bounds → INVALIDCALL"
@@ -6954,6 +7004,150 @@ extern "system" fn device_update_surface(
         }
         D3D_OK
     })
+}
+
+/// `UpdateSurface` into a render-target surface or the back buffer.
+///
+/// Both are `D3DPOOL_DEFAULT` colour surfaces with no texture behind them, so
+/// the region goes to their Metal texture as tightly packed rows, ordered
+/// among the application's passes on the encoder thread. The source is a
+/// `D3DPOOL_SYSTEMMEM` surface, standalone or a texture level, its region is
+/// held to the rules a texture destination applies, and a pair of two
+/// formats converts where the update codec covers it, as it does into a
+/// texture. A multisampled destination is refused, as D3D9 refuses one.
+fn update_surface_into_color_target(
+    dev: &mut DeviceInner,
+    src_surf: &crate::surface::Direct3DSurface9,
+    dst_surf: &crate::surface::Direct3DSurface9,
+    src_rect: Option<(i32, i32, i32, i32)>,
+    dst_point: (i32, i32),
+) -> i32 {
+    // Keyed by the reason, so each one is warned once.
+    let reject = |key: u64, why: &str| {
+        mtld3d_shared::log_once_warn_by!(
+            target: crate::LOG_TARGET,
+            key: key,
+            "reject UpdateSurface into a render target or back buffer: {why} → INVALIDCALL"
+        );
+        D3DERR_INVALIDCALL
+    };
+    if dst_surf.multi_sample().sample_count > 1 {
+        return reject(1, "the destination is multisampled");
+    }
+    let src_parent = src_surf.parent_texture();
+    let image = if src_parent.is_null() {
+        if src_surf.standalone_pool() != D3DPOOL_SYSTEMMEM {
+            return reject(2, "the source is not D3DPOOL_SYSTEMMEM");
+        }
+        let Some((ptr, len, pitch, width, height, format)) = src_surf.system_memory_source() else {
+            return reject(3, "the source has no system-memory backing");
+        };
+        SourceImage {
+            // SAFETY: `ptr`/`len` describe the live system-memory backing of
+            // the source surface, which outlives this call.
+            bytes: unsafe { std::slice::from_raw_parts(ptr, len) },
+            pitch,
+            width,
+            height,
+            format,
+        }
+    } else {
+        // SAFETY: a non-null parent is the live `Direct3DTexture9` the source
+        // surface holds a reference on.
+        let tex = unsafe { &*src_parent };
+        if tex.d3d_pool() != D3DPOOL_SYSTEMMEM {
+            return reject(4, "the source is not D3DPOOL_SYSTEMMEM");
+        }
+        let Some(image) = tex
+            .inner()
+            .surface_source_image(src_surf.cube_face(), src_surf.mip_level() as usize)
+        else {
+            return reject(5, "the source level has no staging");
+        };
+        image
+    };
+    let dst_format = dst_surf.standalone_format();
+    let dst_extent = (dst_surf.standalone_width(), dst_surf.standalone_height());
+    // The rows go to the Metal texture as they are, so the destination's
+    // storage has to be its D3D format's own layout, which every format a
+    // render target or back buffer is created in has.
+    let Some(dst_mapping) =
+        crate::direct3d9::map_for_device(dst_format, dev.config().expand_packed16).filter(|m| {
+            !mtld3d_core::upload_pass::is_expanded_upload(dst_format, m.metal_pixel_format())
+        })
+    else {
+        return reject(
+            6,
+            "the destination format has no storage that takes its rows",
+        );
+    };
+    if image.format != dst_format
+        && !mtld3d_core::pixel_convert::can_convert_update(image.format, dst_format)
+    {
+        return reject(7, "no conversion between the two formats");
+    }
+    let Some((region, origin)) = mtld3d_core::dirty_rect::update_surface_region(
+        src_rect,
+        dst_point,
+        (image.width, image.height),
+        dst_extent,
+        (1, 1),
+    ) else {
+        return reject(8, "the source rect or destination point leaves a surface");
+    };
+    let bpp = dst_mapping.bytes_per_pixel() as usize;
+    let row_bytes = region.w as usize * bpp;
+    let mut rows = vec![0u8; row_bytes * region.h as usize];
+    if image.format == dst_format {
+        for (row, out) in (region.y as usize..).zip(rows.chunks_exact_mut(row_bytes)) {
+            let start = row * image.pitch + region.x as usize * bpp;
+            let Some(src_row) = image.bytes.get(start..start + row_bytes) else {
+                return reject(9, "the source backing is shorter than its rows");
+            };
+            out.copy_from_slice(src_row);
+        }
+    } else {
+        let convert = mtld3d_core::pixel_convert::ConvertRegion {
+            src_x: region.x,
+            src_y: region.y,
+            dst_x: 0,
+            dst_y: 0,
+            width: region.w,
+            height: region.h,
+            src_pitch: image.pitch,
+            dst_pitch: row_bytes,
+            src_slice_pitch: image.pitch * image.height as usize,
+            dst_slice_pitch: rows.len(),
+            depth: 1,
+        };
+        if !mtld3d_core::pixel_convert::convert_region(
+            &mut rows,
+            dst_format,
+            image.bytes,
+            image.format,
+            &convert,
+        ) {
+            return reject(10, "the conversion ran past the source backing");
+        }
+    }
+    let scale = dst_surf.render_scale();
+    let texture = TargetExtent::whole(scale, dst_extent).texture();
+    // SAFETY: the captured token moves directly into this frame's operation.
+    let bytes = unsafe { dev.capture_frame_bytes(&rows) };
+    dev.push_control(UpdateColorRegionOp {
+        target: mtld3d_core::encoder_data::ColorRegionUpdate {
+            color_handle: dst_surf.metal_color_handle().raw(),
+            format: dst_mapping.metal_pixel_format(),
+            origin,
+            extent: (region.w, region.h),
+            logical: dst_extent,
+            texture,
+            scale,
+            bytes_per_row: u32::try_from(row_bytes).expect("a surface row fits u32"),
+        },
+        bytes,
+    });
+    D3D_OK
 }
 
 extern "system" fn device_update_texture(
@@ -7238,14 +7432,14 @@ extern "system" fn device_get_render_target_data(
     let hr = if src_handle.is_null() {
         readback_from_texture_rt(&obj, &src, &dst_desc)
     } else {
-        let Some(fmt) = map_d3d_format(src.standalone_format()) else {
+        if map_d3d_format(src.standalone_format()).is_none() {
             warn_readback_rejected("GetRenderTargetData", ReadbackReject::FormatMismatch);
             return D3DERR_INVALIDCALL;
-        };
+        }
         let source = ReadbackSource {
             width: src.standalone_width(),
             height: src.standalone_height(),
-            format: fmt.metal_pixel_format(),
+            format: src.standalone_format(),
         };
         if reject_readback("GetRenderTargetData", &source, &dst_desc).is_some() {
             return D3DERR_INVALIDCALL;
@@ -7294,10 +7488,10 @@ fn readback_from_texture_rt(
             "GetRenderTargetData: source is not a render target → INVALIDCALL");
         return D3DERR_INVALIDCALL;
     }
-    let Some(fmt) = map_d3d_format(tex.d3d_format()) else {
+    if map_d3d_format(tex.d3d_format()).is_none() {
         warn_readback_rejected("GetRenderTargetData", ReadbackReject::FormatMismatch);
         return D3DERR_INVALIDCALL;
-    };
+    }
     // The surface names one subresource of the parent texture: a cube face
     // rides the Metal array slice, a `GetSurfaceLevel` / `GetCubeMapSurface`
     // level the mip.
@@ -7307,7 +7501,7 @@ fn readback_from_texture_rt(
     let source = ReadbackSource {
         width: ti.mip_width(level as usize),
         height: ti.mip_height(level as usize),
-        format: fmt.metal_pixel_format(),
+        format: tex.d3d_format(),
     };
     if reject_readback("GetRenderTargetData", &source, dst).is_some() {
         return D3DERR_INVALIDCALL;
@@ -7816,11 +8010,7 @@ extern "system" fn device_stretch_rect(
     // A planar source always converts: its R8 storage holds YUV planes, not
     // the pixels of any colour format, so it never takes the 1:1 blit. It is
     // answered ahead of the lookup, which has no entry for it.
-    let cross_format = planar_endpoint
-        || crate::direct3d9::map_for_device(src_info.format, expand_packed16)
-            .map(|m| m.metal_pixel_format())
-            != crate::direct3d9::map_for_device(dst_info.format, expand_packed16)
-                .map(|m| m.metal_pixel_format());
+    let cross_format = planar_endpoint || !copies_bytes(&src_info, &dst_info, expand_packed16);
 
     // A cross-format 1:1 copy into an offscreen-plain destination has no GPU
     // path: the render-quad conversion needs a render-target destination, and
@@ -8036,13 +8226,26 @@ fn flush_dirty_mips_for_gpu_write(
     }
 }
 
-/// Compare the *Metal* pixel formats, not the D3D codes.
+/// Whether the 1:1 blit, a copy of the texture's bytes, is the copy D3D9 defines.
 ///
-/// Distinct D3D formats can share a single Metal format (e.g. A8R8G8B8 +
-/// X8R8G8B8 are both `Bgra8Unorm` — only the alpha-channel meaning
-/// differs, which doesn't matter for a byte-level blit). `WoW` composites a
-/// X8R8G8B8 source onto an A8R8G8B8 destination at login, so rejecting an
-/// alpha-only difference would wrongly fail a valid blit.
+/// Compares the *Metal* pixel formats, not the D3D codes: distinct D3D
+/// formats can share a single Metal format (e.g. A8R8G8B8 + X8R8G8B8 are both
+/// `Bgra8Unorm`, only the alpha-channel meaning differs, which doesn't matter
+/// for a byte-level blit). `WoW` composites a X8R8G8B8 source onto an
+/// A8R8G8B8 destination at login, so rejecting an alpha-only difference would
+/// wrongly fail a valid blit. A shared storage does not make every pair a
+/// byte copy, though: a packed YUV endpoint lays its bytes out in an order no
+/// other format shares (`reinterprets_packed_yuv`), so such a pair converts
+/// or is refused like a pair of two storages.
+fn copies_bytes(src: &StretchSurfaceInfo, dst: &StretchSurfaceInfo, expand_packed16: bool) -> bool {
+    let metal = |format: u32| {
+        crate::direct3d9::map_for_device(format, expand_packed16).map(|m| m.metal_pixel_format())
+    };
+    metal(src.format) == metal(dst.format)
+        && !mtld3d_core::stretch_rect::reinterprets_packed_yuv(src.format, dst.format)
+}
+
+/// Gate a colour `StretchRect` pair on a transport that copies or converts it.
 fn check_stretch_rect_formats(
     src: &StretchSurfaceInfo,
     dst: &StretchSurfaceInfo,
@@ -8054,8 +8257,8 @@ fn check_stretch_rect_formats(
         .map(|m| m.metal_pixel_format());
     let dst_mtl = crate::direct3d9::map_for_device(dst.format, expand_packed16)
         .map(|m| m.metal_pixel_format());
-    // A same-Metal-format pair takes the 1:1 copy path. A cross-Metal-format
-    // pair converts either via the render-quad path (sample src → write the dst
+    // A pair `copies_bytes` accepts takes the 1:1 copy path. Any other pair
+    // converts either via the render-quad path (sample src → write the dst
     // render target — needs a render-target destination) or, into an
     // offscreen-plain destination (which can't be rendered into), via the CPU
     // converter in `device_stretch_rect` (the offscreen→offscreen cross-format
@@ -8063,7 +8266,7 @@ fn check_stretch_rect_formats(
     // endpoint schedules an upload. Unmappable formats are always rejected.
     let convertible = src_mtl.is_some()
         && dst_mtl.is_some()
-        && (src_mtl == dst_mtl
+        && (copies_bytes(src, dst, expand_packed16)
             || dst.flags.contains(StretchSurfaceFlags::IS_RENDER_TARGET)
             || (dst
                 .flags
@@ -8088,8 +8291,9 @@ fn check_stretch_rect_formats(
 /// Parse the source and destination rects against the surface dims.
 ///
 /// Returns `Some((src_region, dst_region))` on success, `None` on any
-/// rejection (inverted / degenerate rect — `parse_rect` returns `None` —
-/// which callers map to `D3DERR_INVALIDCALL`).
+/// rejection (an empty or inverted rect, or one with an edge outside its
+/// surface), which callers map to `D3DERR_INVALIDCALL`. A rejection is
+/// warned once per reason, naming both rects.
 ///
 /// A size mismatch between the two regions is NOT rejected here: that's a
 /// scaling request, which `device_stretch_rect` routes to the render-quad
@@ -8113,9 +8317,26 @@ fn parse_stretch_regions(
     // SAFETY: see above.
     let extracted_dst =
         unsafe { ValueIn::<D3DRECT>::read_opt(dst_rect) }.map(|r| (r.x1, r.y1, r.x2, r.y2));
-    let src_region = parse_rect(extracted_src, src_info.width, src_info.height)?;
-    let dst_region = parse_rect(extracted_dst, dst_info.width, dst_info.height)?;
-    Some((src_region, dst_region))
+    let parsed = parse_rect(extracted_src, src_info.width, src_info.height).and_then(|src| {
+        parse_rect(extracted_dst, dst_info.width, dst_info.height).map(|dst| (src, dst))
+    });
+    match parsed {
+        Ok(regions) => Some(regions),
+        Err(reason) => {
+            mtld3d_shared::log_once_warn_by!(
+                target: crate::LOG_TARGET,
+                key: reason.key(),
+                "reject StretchRect: {} (src rect {extracted_src:?} on {}x{}, dst rect \
+                 {extracted_dst:?} on {}x{}) → INVALIDCALL",
+                reason.as_str(),
+                src_info.width,
+                src_info.height,
+                dst_info.width,
+                dst_info.height
+            );
+            None
+        }
+    }
 }
 
 fn resolve_stretch_surface(

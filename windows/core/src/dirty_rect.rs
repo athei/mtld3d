@@ -146,5 +146,77 @@ pub fn clip_copy_region(
     Some((DirtyRect { w, h, ..src }, DirtyRect { w, h, ..dst }))
 }
 
+/// The region an `UpdateSurface` call names, checked against both levels.
+///
+/// `src_rect` is the optional half-open `(left, top, right, bottom)` of the
+/// source, the whole `src_level` when absent, and `dst_point` is where its
+/// top-left texel lands in `dst_level`. D3D9 refuses an empty or inverted
+/// rect, a negative edge or point, a region that leaves either level, and,
+/// for a block-compressed `block`, an origin off the block grid or an extent
+/// off it that does not reach the edge of both levels. `block` is `(1, 1)`
+/// for uncompressed formats.
+///
+/// Returns the source region and the destination origin, or `None` for a
+/// region D3D9 refuses.
+#[must_use]
+pub fn update_surface_region(
+    src_rect: Option<(i32, i32, i32, i32)>,
+    dst_point: (i32, i32),
+    src_level: (u32, u32),
+    dst_level: (u32, u32),
+    block: (u32, u32),
+) -> Option<(DirtyRect, (u32, u32))> {
+    let (sw, sh) = src_level;
+    let region = match src_rect {
+        None => DirtyRect::full(sw, sh),
+        Some((l, t, r, b)) => {
+            if l < 0 || t < 0 || r <= l || b <= t {
+                return None;
+            }
+            DirtyRect {
+                x: l.cast_unsigned(),
+                y: t.cast_unsigned(),
+                w: r.abs_diff(l),
+                h: b.abs_diff(t),
+            }
+        }
+    };
+    if dst_point.0 < 0 || dst_point.1 < 0 {
+        return None;
+    }
+    let (dx, dy) = (dst_point.0.cast_unsigned(), dst_point.1.cast_unsigned());
+    let (dw, dh) = dst_level;
+    let DirtyRect {
+        x: rx,
+        y: ry,
+        w: rw,
+        h: rh,
+    } = region;
+    if rx.saturating_add(rw) > sw
+        || ry.saturating_add(rh) > sh
+        || dx.saturating_add(rw) > dw
+        || dy.saturating_add(rh) > dh
+    {
+        return None;
+    }
+    // A non-block-aligned extent is only allowed when it reaches the edge of
+    // BOTH levels: a 2x2 region from a 2x2 source level into a 4x4
+    // destination level stops short of the destination's edge and is refused.
+    let (bw, bh) = (block.0.max(1), block.1.max(1));
+    if bw > 1 || bh > 1 {
+        let aligned = |v: u32, b: u32| v.is_multiple_of(b);
+        if !aligned(rx, bw)
+            || !aligned(ry, bh)
+            || !aligned(dx, bw)
+            || !aligned(dy, bh)
+            || (!aligned(rw, bw) && (rx + rw != sw || dx + rw != dw))
+            || (!aligned(rh, bh) && (ry + rh != sh || dy + rh != dh))
+        {
+            return None;
+        }
+    }
+    Some((region, (dx, dy)))
+}
+
 #[cfg(test)]
 mod tests;

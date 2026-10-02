@@ -1,7 +1,7 @@
 //! Rect parsing + validation for `IDirect3DDevice9::StretchRect`.
 //!
 //! The actual blit dispatch lives in `windows/d3d9` (it needs a Metal
-//! handle); only the pure host-testable parts live here: the rect clamp, the
+//! handle); only the pure host-testable parts live here: the rect check, the
 //! routes a same-texture pair and a planar YUV endpoint take, the source
 //! decode selector, and the CPU twins of the YUV decodes the blit fragment
 //! function runs.
@@ -12,8 +12,8 @@ use crate::{pixel_convert::can_convert, planar_yuv::planar_yuv_layout_from_pitch
 
 /// Parsed source / destination region for a `StretchRect`.
 ///
-/// Coordinates are clamped against the surface dimensions; an empty
-/// region (after clamping) is reported as `None` by `parse`.
+/// Always inside its surface and non-empty: `parse_rect` refuses anything
+/// else rather than clamping it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StretchRegion {
     pub x: u32,
@@ -22,44 +22,45 @@ pub struct StretchRegion {
     pub h: u32,
 }
 
-/// Parse a D3D9 `RECT*` (4 × i32, `left/top/right/bottom`) clamped against `(full_w, full_h)`.
+/// Parse a D3D9 `RECT*` (4 × i32, `left/top/right/bottom`) against a `(full_w, full_h)` surface.
 ///
-/// `NULL` means "full surface". Returns `None` for a degenerate / empty rect
-/// — caller treats as `D3DERR_INVALIDCALL`.
+/// `NULL` means "full surface". D3D9 refuses a rect that is empty or
+/// inverted, and one that leaves the surface: a negative edge, or a far edge
+/// past the surface's extent. Nothing is clamped, since a clamped source rect
+/// silently becomes a scale and a clamped destination rect a shifted copy.
 ///
 /// `rect_ptr` is opaque: the wrapper crate owns the unsafe deref since
 /// `D3DRECT` lives in `mtld3d-types` (not depended on here). Caller must
 /// either pass `None` or a `Some((x1, y1, x2, y2))` already extracted.
-#[must_use]
-pub fn parse_rect(
+///
+/// # Errors
+///
+/// [`RejectReason::EmptyRect`] for an empty or inverted rect,
+/// [`RejectReason::RectOutsideSurface`] for one that leaves the surface.
+pub const fn parse_rect(
     extracted: Option<(i32, i32, i32, i32)>,
     full_w: u32,
     full_h: u32,
-) -> Option<StretchRegion> {
+) -> Result<StretchRegion, RejectReason> {
     let Some((x1, y1, x2, y2)) = extracted else {
-        return Some(StretchRegion {
+        return Ok(StretchRegion {
             x: 0,
             y: 0,
             w: full_w,
             h: full_h,
         });
     };
-    let x1 = x1.max(0).cast_unsigned();
-    let y1 = y1.max(0).cast_unsigned();
-    let x2 = x2.max(0).cast_unsigned();
-    let y2 = y2.max(0).cast_unsigned();
-    let x = x1.min(full_w);
-    let y = y1.min(full_h);
-    let right = x2.min(full_w);
-    let bottom = y2.min(full_h);
-    if right <= x || bottom <= y {
-        return None;
+    if x2 <= x1 || y2 <= y1 {
+        return Err(RejectReason::EmptyRect);
     }
-    Some(StretchRegion {
-        x,
-        y,
-        w: right - x,
-        h: bottom - y,
+    if x1 < 0 || y1 < 0 || x2.cast_unsigned() > full_w || y2.cast_unsigned() > full_h {
+        return Err(RejectReason::RectOutsideSurface);
+    }
+    Ok(StretchRegion {
+        x: x1.cast_unsigned(),
+        y: y1.cast_unsigned(),
+        w: x2.abs_diff(x1),
+        h: y2.abs_diff(y1),
     })
 }
 
@@ -83,6 +84,10 @@ pub enum RejectReason {
     UnsupportedDestination,
     /// Destination is a planar YUV surface, which nothing encodes into.
     PlanarDestination,
+    /// A source or destination rect is empty or inverted.
+    EmptyRect,
+    /// A source or destination rect has an edge outside its surface.
+    RectOutsideSurface,
 }
 
 impl RejectReason {
@@ -103,6 +108,8 @@ impl RejectReason {
             Self::UnsupportedSource => "source surface has no Metal backing",
             Self::UnsupportedDestination => "destination surface has no Metal backing",
             Self::PlanarDestination => "destination is a planar YUV surface (decode only)",
+            Self::EmptyRect => "a source or destination rect is empty or inverted",
+            Self::RectOutsideSurface => "a source or destination rect leaves its surface",
         }
     }
 }
@@ -256,6 +263,19 @@ pub const fn blit_decode(d3d_format: u32) -> BlitDecode {
 #[must_use]
 pub const fn is_packed_yuv(d3d_format: u32) -> bool {
     matches!(d3d_format, D3DFMT_YUY2 | D3DFMT_UYVY)
+}
+
+/// Whether a copy of the bytes between two formats that share their storage would reinterpret them.
+///
+/// `YUY2` and `UYVY` are both stored as two-channel bytes, as `A8L8` is, but
+/// each packed YUV format orders its luma and chroma bytes its own way, so a
+/// verbatim copy between one of them and any other format hands the
+/// destination bytes in a layout it does not have. No conversion between the
+/// two exists either: `CheckDeviceFormatConversion` answers no for every such
+/// pair, since packed YUV is never a destination.
+#[must_use]
+pub const fn reinterprets_packed_yuv(src_format: u32, dst_format: u32) -> bool {
+    src_format != dst_format && (is_packed_yuv(src_format) || is_packed_yuv(dst_format))
 }
 
 /// Whether `d3d_format` is one of the two planar 4:2:0 YUV formats.

@@ -276,6 +276,31 @@ pub struct ResampledUpload {
     pub sample_count: u8,
 }
 
+/// One `UpdateSurface` region into a colour surface no texture backs, resolved on the API thread.
+///
+/// The destination is a render-target surface or the back buffer. Built by
+/// `device_update_surface`, where the surface's extent and scale are
+/// reachable, and run by `update_color_region` on the encoder thread, in API
+/// order among the application's passes.
+pub struct ColorRegionUpdate {
+    /// Destination colour `MTLTexture`.
+    pub color_handle: u64,
+    /// Metal format of the destination, which the rows are already encoded in.
+    pub format: PixelFormat,
+    /// Where the region's top-left texel lands, in the coordinates D3D9 reports.
+    pub origin: (u32, u32),
+    /// Extent of the region, which is the extent the rows describe.
+    pub extent: (u32, u32),
+    /// Extent of the destination as D3D9 reports it.
+    pub logical: (u32, u32),
+    /// Extent Metal allocated for the destination, at or below `logical`.
+    pub texture: (u32, u32),
+    /// The scale that relates `texture` to `logical`.
+    pub scale: RenderScale,
+    /// Row stride of the rows.
+    pub bytes_per_row: u32,
+}
+
 /// One `ColorFill` against a render-target texture, resolved on the API thread.
 ///
 /// Built by `device_color_fill` and consumed by
@@ -598,6 +623,11 @@ pub struct UploadResampledOp {
     pub bytes: ScratchSlice,
 }
 
+pub struct UpdateColorRegionOp {
+    pub target: ColorRegionUpdate,
+    pub bytes: ScratchSlice,
+}
+
 pub struct ReadTextureHandleOp {
     pub texture_id: TextureId,
     pub slot_op: ReplyU64,
@@ -823,6 +853,10 @@ pub enum Op {
     UploadResampled(
         #[cfg(windows)] UploadResampledOp,
         #[cfg(not(windows))] Box<UploadResampledOp>,
+    ),
+    UpdateColorRegion(
+        #[cfg(windows)] UpdateColorRegionOp,
+        #[cfg(not(windows))] Box<UpdateColorRegionOp>,
     ),
     ReadTextureHandle(
         #[cfg(windows)] ReadTextureHandleOp,

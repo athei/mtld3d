@@ -232,6 +232,22 @@ record!(UploadColorRecord {
     stride: u32,
     reserved: u32
 });
+record!(UpdateColorRegionRecord {
+    handle: u64,
+    bytes: ByteSpan,
+    format: u32,
+    origin_x: u32,
+    origin_y: u32,
+    width: u32,
+    height: u32,
+    logical_width: u32,
+    logical_height: u32,
+    texture_width: u32,
+    texture_height: u32,
+    scale: u32,
+    stride: u32,
+    reserved: u32
+});
 record!(ResampledTargetRecord {
     handle: u64,
     msaa: u64,

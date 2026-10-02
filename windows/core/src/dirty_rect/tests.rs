@@ -18,8 +18,13 @@
 //!
 //! Two drive `union`: disjoint rects come back as the box enclosing both, and a rect inside
 //! another comes back as the outer one.
+//!
+//! Three drive `update_surface_region`, the region an `UpdateSurface` call names: a region
+//! inside both levels comes back as given; one that is empty or inverted, has a negative edge
+//! or point, or leaves either level is refused; and a block-compressed one is held to the
+//! block grid unless it ends at the edge of both levels.
 
-use super::{DirtyRect, clip_copy_region};
+use super::{DirtyRect, clip_copy_region, update_surface_region};
 
 #[test]
 fn clamp_inside_is_identity() {
@@ -349,5 +354,70 @@ fn mip_scaling_rounds_outward_before_block_alignment_and_clipping() {
         }
         .next_mip(),
         DirtyRect::full(1, 1)
+    );
+}
+
+#[test]
+fn update_surface_region_takes_a_region_inside_both_levels() {
+    assert_eq!(
+        update_surface_region(None, (0, 0), (16, 16), (16, 16), (1, 1)),
+        Some((DirtyRect::full(16, 16), (0, 0)))
+    );
+    assert_eq!(
+        update_surface_region(Some((2, 4, 10, 8)), (6, 12), (16, 16), (16, 16), (1, 1)),
+        Some((
+            DirtyRect {
+                x: 2,
+                y: 4,
+                w: 8,
+                h: 4
+            },
+            (6, 12)
+        ))
+    );
+}
+
+#[test]
+fn update_surface_region_refuses_what_leaves_a_level() {
+    for (rect, point) in [
+        (Some((0, 0, 8, 8)), (-4, -4)),
+        (Some((0, 0, 32, 32)), (0, 0)),
+        (Some((-4, 0, 4, 8)), (0, 0)),
+        (Some((0, 0, 8, 8)), (12, 12)),
+        (Some((8, 8, 4, 4)), (0, 0)),
+        (Some((4, 4, 4, 8)), (0, 0)),
+        (None, (1, 0)),
+    ] {
+        assert_eq!(
+            update_surface_region(rect, point, (16, 16), (16, 16), (1, 1)),
+            None,
+            "{rect:?} at {point:?}"
+        );
+    }
+}
+
+#[test]
+fn update_surface_region_holds_compressed_regions_to_the_block_grid() {
+    let dxt = (4, 4);
+    // A partial block that stops short of the levels' edges, and an origin
+    // off the grid on either side.
+    for (rect, point) in [
+        (Some((0, 0, 2, 2)), (0, 0)),
+        (Some((0, 0, 4, 4)), (2, 2)),
+        (Some((2, 0, 6, 4)), (0, 0)),
+    ] {
+        assert_eq!(
+            update_surface_region(rect, point, (8, 8), (8, 8), dxt),
+            None,
+            "{rect:?} at {point:?}"
+        );
+    }
+    // Whole blocks, and a partial block that ends at the edge of both levels.
+    assert!(update_surface_region(Some((4, 4, 8, 8)), (0, 0), (8, 8), (8, 8), dxt).is_some());
+    assert!(update_surface_region(None, (0, 0), (2, 2), (2, 2), dxt).is_some());
+    assert_eq!(
+        update_surface_region(None, (0, 0), (2, 2), (4, 4), dxt),
+        None,
+        "a 2x2 level into a 4x4 one stops short of the destination's edge"
     );
 }

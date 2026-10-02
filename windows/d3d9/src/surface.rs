@@ -62,8 +62,8 @@ pub struct SystemMemoryDst {
     pub height: u32,
     /// Row stride the destination's own `LockRect` reports.
     pub bytes_per_row: u32,
-    /// Byte layout of the destination's D3D9 format.
-    pub format: mtld3d_shared::mtl::PixelFormat,
+    /// The destination's D3D9 format (`D3DFMT_*`).
+    pub format: u32,
 }
 
 /// Marks a surface as one of the device's **implicit** (device-owned) surfaces.
@@ -950,7 +950,7 @@ impl Direct3DSurface9 {
                 width,
                 height,
                 bytes_per_row,
-                format: fmt.metal_pixel_format(),
+                format: inner.standalone_format,
             });
         }
         if inner.parent_texture.is_null() {
@@ -968,14 +968,14 @@ impl Direct3DSurface9 {
         let level = inner.mip_level as usize;
         let face = (inner.cube_face != u32::MAX).then_some(inner.cube_face);
         let (ptr, len, bytes_per_row) = texture.readback_staging(face, level)?;
-        let fmt = mtld3d_core::format::map_d3d_format(texture.d3d_format())?;
+        mtld3d_core::format::map_d3d_format(texture.d3d_format())?;
         Some(SystemMemoryDst {
             ptr,
             len,
             width: texture.mip_width(level),
             height: texture.mip_height(level),
             bytes_per_row,
-            format: fmt.metal_pixel_format(),
+            format: texture.d3d_format(),
         })
     }
 

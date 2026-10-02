@@ -283,7 +283,8 @@ pub fn map_d3d_format(d3d_format: u32) -> Option<FormatMapping> {
 /// True when `lookup_d3d_format` has a Metal counterpart for `d3d_format`.
 ///
 /// This is the set the colour create paths accept, so it is also the set
-/// `CheckDeviceFormat` must advertise for `D3DRTYPE_TEXTURE`. Silent: a
+/// `CheckDeviceFormat` advertises for `D3DRTYPE_TEXTURE`, less the formats
+/// with no sampling path (ATI1's pitch, packed YUV's decode). Silent: a
 /// capability probe for an unmapped format is not a fault. Device-independent:
 /// the packed 16-bit members stay in the set on every device because
 /// `map_d3d_format_device` backs them with `Bgra8Unorm` where the native
@@ -816,11 +817,11 @@ const fn lookup_d3d_format(d3d_format: u32) -> Option<FormatMapping> {
             has_alpha: true,
         }),
         // YUY2/UYVY are 4:2:2 packed YUV (2 bytes per pixel, 4 per 2-pixel
-        // macropixel). We don't do YUV→RGB sampling, so they back a creatable,
-        // lockable 2-byte surface/volume (RG8) for the conformance lock/offset
-        // checks; sampling such a texture would be wrong, but nothing in the
-        // target workload uses YUV. Treated as 2 bytes/pixel (1x1 block) so the
-        // lock pitch is `width * 2`, matching D3D9.
+        // macropixel). Nothing decodes them when they are sampled, so they
+        // back a lockable 2-byte (RG8) offscreen plain, which `StretchRect`
+        // decodes, and a CPU-only SCRATCH texture, and are no texture format.
+        // Treated as 2 bytes/pixel (1x1 block) so the lock pitch is
+        // `width * 2`, matching D3D9.
         D3DFMT_YUY2 | D3DFMT_UYVY => Some(FormatMapping {
             metal_pixel_format: PixelFormat::Rg8Unorm,
             bytes_per_pixel: 2,
