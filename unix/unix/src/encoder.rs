@@ -18,9 +18,10 @@ use mtld3d_core::{
     config::Mtld3dConfig,
     convert::{FAN_PATTERN_MAX_TRIANGLES, fan_pattern_bytes, fill_fan_pattern_u16},
     depth_stencil_state::{DepthStencilSnapshot, description_from_snapshot, key_from_snapshot},
-    dxso::{DxsoProgram, declared_ps_samplers},
+    dxso::{
+        DxsoProgram, FF_VS_PALETTE_BASE_ROW, MAX_VERTEX_BLEND_MATRIX_INDEX, declared_ps_samplers,
+    },
     encoder_packet::NativeVbibRetention,
-    ff_state::{FF_VS_PALETTE_BASE_ROW, MAX_VERTEX_BLEND_MATRIX_INDEX},
     format::map_d3d_format,
     gpu_caps::GpuCaps,
     guest_pages::GuestOwnedPage,

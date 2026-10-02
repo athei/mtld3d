@@ -450,12 +450,12 @@ fn indexed_vertex_blending_advertises_the_palette_the_layout_carries() {
     );
     assert_eq!(
         caps.max_vertex_blend_matrix_index,
-        crate::ff_state::MAX_VERTEX_BLEND_MATRIX_INDEX
+        crate::dxso::MAX_VERTEX_BLEND_MATRIX_INDEX
     );
     // The palette is packed four rows per matrix from the base row, so the
     // advertised index is the last one whose four rows end inside the block,
     // and one more would not fit.
-    let palette_base = u32::from(crate::ff_state::FF_VS_PALETTE_BASE_ROW);
+    let palette_base = u32::from(crate::dxso::FF_VS_PALETTE_BASE_ROW);
     let rows_through = |index: u32| palette_base + (index + 1) * 4;
     assert!(
         rows_through(caps.max_vertex_blend_matrix_index) <= FF_VS_CONST_ROWS,

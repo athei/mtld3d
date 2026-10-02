@@ -45,7 +45,26 @@ use mtld3d_types::{
 use super::emit::{
     VariantFlags, VariantKey, fog_blend_active, write_fog_blend, write_point_sprite_prologue,
 };
-use crate::ff_state::MAX_VERTEX_BLEND_MATRIX_INDEX;
+
+/// First FF VS constant row of the world-matrix palette.
+///
+/// Every section below it has a fixed row range (`FfVsDirty` in `ff_state`
+/// names each one); the palette runs from here to the end of the constant
+/// block, four rows per matrix, and the emitted FF VS reads it as
+/// `vs_c + FF_VS_PALETTE_BASE_ROW + idx * 4`. Declared here because the
+/// emitted MSL depends on it, so the emitter fingerprint covers it.
+pub const FF_VS_PALETTE_BASE_ROW: u16 = 95;
+
+/// Highest `D3DTS_WORLDMATRIX(i)` index a draw can read through vertex blending.
+///
+/// The encoder binds 256 FF VS constant rows (`CONSTANT_ROWS` in the `d3d9`
+/// crate, which asserts that its mirror still holds this index), so rows
+/// 95..=255 carry 40 whole matrices and 39 is the last index whose four rows
+/// are inside the block. `caps::fill` reports it as
+/// `D3DCAPS9::MaxVertexBlendMatrixIndex`, so a title that sizes its bone
+/// palette from the cap never asks for a matrix the layout has no rows for.
+/// The emitted FF VS clamps a blend index to it.
+pub const MAX_VERTEX_BLEND_MATRIX_INDEX: u32 = 39;
 
 // The FF emitter stores D3D9 texture-op / texture-arg / compare-func codes in
 // `u8` cache-key fields and matches on them; the canonical `mtld3d_types`
@@ -780,7 +799,7 @@ fn emit_point_size(out: &mut String, vs: &FfVsKey, scale: bool) {
 ///
 /// Sourced from the per-bone pre-multiplied
 /// `transpose(world_palette[i] × view)` matrices packed at
-/// `vs_c[95 + bone*4 .. 95 + bone*4 + 4]` by `ff_state::build_vs_constants`.
+/// `vs_c[FF_VS_PALETTE_BASE_ROW + bone*4 ..][..4]` by `ff_state::build_vs_constants`.
 ///
 /// Position formula (K = `vertex_blend_count`):
 ///
@@ -822,7 +841,10 @@ fn emit_vertex_blend(out: &mut String, vs: &FfVsKey, needs_normal: bool) {
             out,
             "        uint idx = min(in.blend_indices[0], {MAX_VERTEX_BLEND_MATRIX_INDEX}u);"
         );
-        out.push_str("        constant float4 *m = vs_c + 95 + idx * 4u;\n");
+        let _ = writeln!(
+            out,
+            "        constant float4 *m = vs_c + {FF_VS_PALETTE_BASE_ROW} + idx * 4u;"
+        );
         out.push_str(
             "        pos_view = float4(dot(pos, m[0]), dot(pos, m[1]), dot(pos, m[2]), dot(pos, m[3]));\n",
         );
@@ -849,7 +871,10 @@ fn emit_vertex_blend(out: &mut String, vs: &FfVsKey, needs_normal: bool) {
         } else {
             let _ = writeln!(out, "        uint idx = {i}u;");
         }
-        out.push_str("        constant float4 *m = vs_c + 95 + idx * 4u;\n");
+        let _ = writeln!(
+            out,
+            "        constant float4 *m = vs_c + {FF_VS_PALETTE_BASE_ROW} + idx * 4u;"
+        );
         out.push_str(
             "        pos_view += w * float4(dot(pos, m[0]), dot(pos, m[1]), dot(pos, m[2]), dot(pos, m[3]));\n",
         );
@@ -871,10 +896,12 @@ fn emit_vertex_blend(out: &mut String, vs: &FfVsKey, needs_normal: bool) {
     } else {
         let _ = writeln!(out, "        uint idx = {last}u;");
     }
-    // World-matrix palette base is row 95 (same as the explicit-weight loop and
-    // the K=1 indexed path, and the encoder's upload base in `ff_state`); the
-    // implicit last-weight contribution reads from the same row-95 base.
-    out.push_str("        constant float4 *m = vs_c + 95 + idx * 4u;\n");
+    // The implicit last-weight contribution reads the same palette base as
+    // the explicit-weight loop and the K=1 indexed path.
+    let _ = writeln!(
+        out,
+        "        constant float4 *m = vs_c + {FF_VS_PALETTE_BASE_ROW} + idx * 4u;"
+    );
     out.push_str(
         "        pos_view += w * float4(dot(pos, m[0]), dot(pos, m[1]), dot(pos, m[2]), dot(pos, m[3]));\n",
     );

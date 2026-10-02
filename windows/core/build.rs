@@ -20,6 +20,7 @@ fn emitter_fingerprint() {
         "src/vs_draw.rs".into(),
         "src/ps_draw.rs".into(),
         "../../unix/shared/src/mtl.rs".into(),
+        "../../unix/shared/src/shader_create.rs".into(),
     ]);
     paths.sort();
     let mut hash = Xxh3::new();

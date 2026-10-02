@@ -38,7 +38,8 @@ use crate::{
     caps::{FF_TEXTURE_STAGES, texture_op_unimplemented, unimplemented_texture_op},
     convert::FfVsLayout,
     dxso::{
-        FfPsKey, FfStage, FfStageFlags, FfStageResult, FfVsFlags, FfVsKey, VariantFlags, VariantKey,
+        FF_VS_PALETTE_BASE_ROW, FfPsKey, FfStage, FfStageFlags, FfStageResult, FfVsFlags, FfVsKey,
+        MAX_VERTEX_BLEND_MATRIX_INDEX, VariantFlags, VariantKey,
     },
     scratch::ScratchArena,
 };
@@ -51,23 +52,6 @@ use crate::{
 /// `caps::fill` reports this value as `D3DCAPS9::MaxActiveLights`, so the
 /// advertised cap cannot drift from the number of slots the FF VS has.
 pub const MAX_ACTIVE_LIGHTS: u32 = 8;
-
-/// First FF VS constant row of the world-matrix palette.
-///
-/// Every section below it has a fixed row range (`FfVsDirty` names each one);
-/// the palette runs from here to the end of the constant block, four rows per
-/// matrix, and the emitted FF VS reads it as `vs_c + 95 + idx * 4`.
-pub const FF_VS_PALETTE_BASE_ROW: u16 = 95;
-
-/// Highest `D3DTS_WORLDMATRIX(i)` index a draw can read through vertex blending.
-///
-/// The encoder binds 256 FF VS constant rows (`CONSTANT_ROWS` in the `d3d9`
-/// crate, which asserts that its mirror still holds this index), so rows
-/// 95..=255 carry 40 whole matrices and 39 is the last index whose four rows
-/// are inside the block. `caps::fill` reports it as
-/// `D3DCAPS9::MaxVertexBlendMatrixIndex`, so a title that sizes its bone
-/// palette from the cap never asks for a matrix the layout has no rows for.
-pub const MAX_VERTEX_BLEND_MATRIX_INDEX: u32 = 39;
 
 bitflags! {
     /// Per-section dirty bits for the FF VS const buffer.

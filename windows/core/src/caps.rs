@@ -11,7 +11,7 @@ use mtld3d_types::{
     d3dps_version, d3dvs_version,
 };
 
-use crate::ff_state::{MAX_ACTIVE_LIGHTS, MAX_VERTEX_BLEND_MATRIX_INDEX};
+use crate::{dxso::MAX_VERTEX_BLEND_MATRIX_INDEX, ff_state::MAX_ACTIVE_LIGHTS};
 
 // Caps are a *truthful floor* under current capability: they advertise only
 // what the renderer actually implements. Every default below therefore names

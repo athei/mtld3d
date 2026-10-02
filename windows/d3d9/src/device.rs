@@ -12103,7 +12103,7 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
                     let rows = dev.ff_state.palette_section_rows(&key);
                     if rows != 0 {
                         dev.current_frame.record_ff_vs_destination(
-                            mtld3d_core::ff_state::FF_VS_PALETTE_BASE_ROW,
+                            mtld3d_core::dxso::FF_VS_PALETTE_BASE_ROW,
                             rows,
                             |destination| dev.ff_state.fill_palette_section(&key, destination),
                         );

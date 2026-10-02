@@ -10,11 +10,11 @@ use mtld3d_types::{
     D3DTOP_DISABLE, D3DTOP_MODULATE, D3DTOP_SELECTARG1,
 };
 
-use super::{FfPsKey, FfStage, FfStageFlags, FfVsFlags, FfVsKey, emit_ps_ff, emit_vs_ff};
-use crate::{
-    dxso::emit::{VariantFlags, VariantKey},
-    ff_state::MAX_VERTEX_BLEND_MATRIX_INDEX,
+use super::{
+    FfPsKey, FfStage, FfStageFlags, FfVsFlags, FfVsKey, MAX_VERTEX_BLEND_MATRIX_INDEX, emit_ps_ff,
+    emit_vs_ff,
 };
+use crate::dxso::emit::{VariantFlags, VariantKey};
 
 /// D3D enum constant at the key's narrow width.
 fn narrow(v: u32) -> u8 {
