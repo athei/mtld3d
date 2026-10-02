@@ -1,4 +1,7 @@
-use super::{INLINE_COPY_MAX, copy_row_bytes, copy_window, rows_differ, write_window};
+use super::{
+    INLINE_COPY_MAX, copy_row_bytes, copy_window, int_bool_rows, rows_differ, window_in_range,
+    write_window,
+};
 
 fn scalar(cur: &[[f32; 4]], new: &[[f32; 4]]) -> bool {
     cur.len() != new.len()
@@ -258,4 +261,32 @@ fn write_window_clamps_to_the_file_and_ignores_a_window_past_it() {
     assert!(!write_window(&mut file, u32::MAX, &[1, 2]));
     assert!(!write_window(&mut file, 1, &[]));
     assert_eq!(file, [0, 0, 7, 8]);
+}
+
+#[test]
+fn float_windows_fit_up_to_the_end_of_the_file() {
+    assert!(window_in_range(0, 256, 256));
+    assert!(window_in_range(255, 1, 256));
+    assert!(window_in_range(256, 0, 256));
+    assert!(window_in_range(223, 1, 224));
+    assert!(!window_in_range(255, 2, 256));
+    assert!(!window_in_range(256, 1, 256));
+    assert!(!window_in_range(257, 0, 256));
+    assert!(!window_in_range(224, 1, 224));
+    assert!(!window_in_range(u32::MAX, 1, 256));
+    assert!(!window_in_range(1, u32::MAX, 256));
+    assert!(!window_in_range(u32::MAX, u32::MAX, 256));
+}
+
+#[test]
+fn int_bool_rows_refuse_a_start_past_the_file_and_clamp_the_count() {
+    assert_eq!(int_bool_rows(0, 0, 16), Some(0));
+    assert_eq!(int_bool_rows(0, 16, 16), Some(16));
+    assert_eq!(int_bool_rows(0, 17, 16), Some(16));
+    assert_eq!(int_bool_rows(15, 0, 16), Some(0));
+    assert_eq!(int_bool_rows(15, 1, 16), Some(1));
+    assert_eq!(int_bool_rows(15, u32::MAX, 16), Some(1));
+    assert_eq!(int_bool_rows(16, 0, 16), None);
+    assert_eq!(int_bool_rows(16, 1, 16), None);
+    assert_eq!(int_bool_rows(u32::MAX, 1, 16), None);
 }

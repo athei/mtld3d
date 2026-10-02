@@ -49,6 +49,7 @@ use mtld3d_core::{
     readback::{ReadbackDestination, ReadbackReject, ReadbackSource},
     render_scale::TargetExtent,
     render_state::{RsClass, rs_classify},
+    shader_constants::{int_bool_rows, window_in_range},
     snapshot::SnapshotSection,
     streams::validate_stream_freq,
     texture_flags::TextureFlags,
@@ -12791,19 +12792,28 @@ extern "system" fn device_set_vertex_shader_constant_f(
 ) -> i32 {
     let _api = device_api_lock(this);
     let _timer = device_timer(this, DeviceSubCategory::ShaderConst);
-    if constant_data.is_null()
-        || count == 0
-        || !const_window_in_range(start_register, count, CONSTANT_ROWS)
-    {
+    if constant_data.is_null() {
         return D3DERR_INVALIDCALL;
+    }
+    if !window_in_range(start_register, count, CONSTANT_ROWS) {
+        return reject_constant_window(
+            "SetVertexShaderConstantF",
+            start_register,
+            count,
+            CONSTANT_ROWS,
+        );
+    }
+    // A zero count names an empty window, which D3D9 accepts and writes nothing into.
+    if count == 0 {
+        return D3D_OK;
     }
     // SAFETY: vtable thunk; `this` is *mut Direct3DDevice9 per IDirect3DDevice9 ABI.
     let Some(obj) = (unsafe { InPtrMut::<Direct3DDevice9>::opt(this) }) else {
         return D3DERR_INVALIDCALL;
     };
     let dev = obj.inner();
-    // SAFETY: `constant_data` is non-null and `count != 0` (checked
-    // above); per the D3D9 ABI the caller guarantees the bounded floats
+    // SAFETY: `constant_data` is non-null and `count` non-zero (both
+    // settled above); per the D3D9 ABI the caller guarantees the bounded floats
     // are initialized and readable without mutation in one allocation for
     // this call. The byte size fits `isize::MAX`; all `f32` bits are valid.
     let constants = unsafe {
@@ -12840,19 +12850,6 @@ extern "system" fn device_set_vertex_shader_constant_f(
     0
 }
 
-/// True when a `[start, start + count)` constant-register window fits a register file.
-///
-/// The file is `limit` rows deep. Shared by the `Set*ShaderConstantF`
-/// thunks, which reject out-of-range windows with `D3DERR_INVALIDCALL`
-/// (D3D9 validates the window rather than silently clamping the write). The
-/// sum is widened to `u64` first so a near-`u32::MAX` start register — a
-/// signed `-1` passed as the start, or an unbounded `start++` probe sweep
-/// that walks past the register file — cannot wrap back into range and spin
-/// forever waiting for the rejection that a clamping write never yields.
-fn const_window_in_range(start: u32, count: u32, limit: usize) -> bool {
-    u64::from(start) + u64::from(count) <= limit as u64
-}
-
 /// Copy `mirror[start..]` into `out`, clamping to the mirror's length.
 ///
 /// Shared by every `Get*ShaderConstant*` thunk. Out-of-range tail rows are
@@ -12868,6 +12865,54 @@ fn copy_constants_out<T: Copy>(mirror: &[T], start: u32, out: &mut [T]) {
     out[..end - start].copy_from_slice(&mirror[start..end]);
 }
 
+/// How many registers an integer or boolean constant call moves, or the `HRESULT` refusing it.
+///
+/// D3D9 refuses a null array and a start at or past the `rows`-deep register
+/// file whatever the count, accepts a zero count as a call that moves
+/// nothing, and clamps a count that runs past the file to the registers that
+/// remain, so the caller copy is bounded before an unaligned input can
+/// allocate. Shared by the eight `Set`/`Get` integer and boolean thunks.
+fn int_bool_constant_rows(
+    call: &str,
+    has_data: bool,
+    start: u32,
+    count: u32,
+    rows: usize,
+) -> Result<usize, i32> {
+    if !has_data {
+        return Err(D3DERR_INVALIDCALL);
+    }
+    int_bool_rows(start, count, rows).ok_or_else(|| reject_constant_start(call, start, rows))
+}
+
+/// The `INVALIDCALL` an integer or boolean constant call answers for a start past the file.
+///
+/// Out of line so the setters do not build the log arguments on their hot path.
+#[cold]
+#[inline(never)]
+fn reject_constant_start(call: &str, start: u32, rows: usize) -> i32 {
+    mtld3d_shared::log_once_warn_by!(
+        target: LOG_TARGET,
+        key: caller_log_key(call),
+        "{call}: start register {start} past the {rows}-register file → INVALIDCALL"
+    );
+    D3DERR_INVALIDCALL
+}
+
+/// The `INVALIDCALL` a float constant setter or getter answers for a window past the file.
+///
+/// Out of line so the four calls do not build the log arguments on their hot path.
+#[cold]
+#[inline(never)]
+fn reject_constant_window(call: &str, start: u32, count: u32, rows: usize) -> i32 {
+    mtld3d_shared::log_once_warn_by!(
+        target: LOG_TARGET,
+        key: caller_log_key(call),
+        "{call}: registers {start}+{count} run past the {rows}-register file → INVALIDCALL"
+    );
+    D3DERR_INVALIDCALL
+}
+
 extern "system" fn device_get_vertex_shader_constant_f(
     this: *mut c_void,
     start_register: u32,
@@ -12876,15 +12921,27 @@ extern "system" fn device_get_vertex_shader_constant_f(
 ) -> i32 {
     let _api = device_api_lock(this);
     let _timer = device_timer(this, DeviceSubCategory::ShaderConst);
-    if constant_data.is_null() || count == 0 {
+    if constant_data.is_null() {
         return D3DERR_INVALIDCALL;
+    }
+    if !window_in_range(start_register, count, CONSTANT_ROWS) {
+        return reject_constant_window(
+            "GetVertexShaderConstantF",
+            start_register,
+            count,
+            CONSTANT_ROWS,
+        );
+    }
+    // A zero count reads nothing, which D3D9 accepts.
+    if count == 0 {
+        return D3D_OK;
     }
     // SAFETY: vtable thunk; `this` is *mut Direct3DDevice9 per IDirect3DDevice9 ABI.
     let Some(obj) = (unsafe { InPtr::<Direct3DDevice9>::opt(this) }) else {
         return D3DERR_INVALIDCALL;
     };
     let mirror = obj.inner().shader_bindings().vs_constants_copy();
-    // SAFETY: `constant_data` is non-null and `count != 0` (checked above);
+    // SAFETY: `constant_data` is non-null and `count` non-zero (both settled above);
     // per the D3D9 ABI the caller guarantees `count * 4` `f32`s are writable.
     let out = unsafe {
         core::slice::from_raw_parts_mut(constant_data.cast::<[f32; 4]>(), count as usize)
@@ -12901,17 +12958,22 @@ extern "system" fn device_set_vertex_shader_constant_i(
 ) -> i32 {
     let _api = device_api_lock(this);
     let _timer = device_timer(this, DeviceSubCategory::ShaderConst);
-    if constant_data.is_null() || count == 0 {
-        return D3DERR_INVALIDCALL;
-    }
+    let count = match int_bool_constant_rows(
+        "SetVertexShaderConstantI",
+        !constant_data.is_null(),
+        start_register,
+        count,
+        INT_CONSTANT_ROWS,
+    ) {
+        Ok(0) => return D3D_OK,
+        Ok(rows) => rows,
+        Err(hr) => return hr,
+    };
     // SAFETY: vtable thunk; `this` is *mut Direct3DDevice9 per IDirect3DDevice9 ABI.
     let Some(obj) = (unsafe { InPtrMut::<Direct3DDevice9>::opt(this) }) else {
         return D3DERR_INVALIDCALL;
     };
     let dev = obj.inner();
-    // The register mirror clamps oversized writes; bound the caller copy
-    // to the same window before an unaligned input can allocate.
-    let count = (count as usize).min(INT_CONSTANT_ROWS.saturating_sub(start_register as usize));
     // SAFETY: `constant_data` is non-null and `count` is bounded above;
     // per the D3D9 ABI, the bounded rows are initialized and readable
     // without mutation in one allocation for this call. The byte size
@@ -12946,19 +13008,25 @@ extern "system" fn device_get_vertex_shader_constant_i(
 ) -> i32 {
     let _api = device_api_lock(this);
     let _timer = device_timer(this, DeviceSubCategory::ShaderConst);
-    if constant_data.is_null() || count == 0 {
-        return D3DERR_INVALIDCALL;
-    }
+    let count = match int_bool_constant_rows(
+        "GetVertexShaderConstantI",
+        !constant_data.is_null(),
+        start_register,
+        count,
+        INT_CONSTANT_ROWS,
+    ) {
+        Ok(0) => return D3D_OK,
+        Ok(rows) => rows,
+        Err(hr) => return hr,
+    };
     // SAFETY: vtable thunk; `this` is *mut Direct3DDevice9 per IDirect3DDevice9 ABI.
     let Some(obj) = (unsafe { InPtr::<Direct3DDevice9>::opt(this) }) else {
         return D3DERR_INVALIDCALL;
     };
     let mirror = obj.inner().shader_bindings().vs_constants_i_copy();
-    // SAFETY: `constant_data` is non-null and `count != 0` (checked above);
+    // SAFETY: `constant_data` is non-null and `count` is non-zero and clamped to the file (above);
     // per the D3D9 ABI the caller guarantees `count * 4` `i32`s are writable.
-    let out = unsafe {
-        core::slice::from_raw_parts_mut(constant_data.cast::<[i32; 4]>(), count as usize)
-    };
+    let out = unsafe { core::slice::from_raw_parts_mut(constant_data.cast::<[i32; 4]>(), count) };
     copy_constants_out(&mirror, start_register, out);
     0
 }
@@ -12971,17 +13039,22 @@ extern "system" fn device_set_vertex_shader_constant_b(
 ) -> i32 {
     let _api = device_api_lock(this);
     let _timer = device_timer(this, DeviceSubCategory::ShaderConst);
-    if constant_data.is_null() || count == 0 {
-        return D3DERR_INVALIDCALL;
-    }
+    let count = match int_bool_constant_rows(
+        "SetVertexShaderConstantB",
+        !constant_data.is_null(),
+        start_register,
+        count,
+        BOOL_CONSTANT_COUNT,
+    ) {
+        Ok(0) => return D3D_OK,
+        Ok(rows) => rows,
+        Err(hr) => return hr,
+    };
     // SAFETY: vtable thunk; `this` is *mut Direct3DDevice9 per IDirect3DDevice9 ABI.
     let Some(obj) = (unsafe { InPtrMut::<Direct3DDevice9>::opt(this) }) else {
         return D3DERR_INVALIDCALL;
     };
     let dev = obj.inner();
-    // The register mirror clamps oversized writes; bound the caller copy
-    // to the same window before an unaligned input can allocate.
-    let count = (count as usize).min(BOOL_CONSTANT_COUNT.saturating_sub(start_register as usize));
     // SAFETY: `constant_data` is non-null and `count` is bounded above;
     // per the D3D9 ABI, the bounded BOOLs are initialized and readable
     // without mutation in one allocation for this call. The byte size
@@ -13015,17 +13088,25 @@ extern "system" fn device_get_vertex_shader_constant_b(
 ) -> i32 {
     let _api = device_api_lock(this);
     let _timer = device_timer(this, DeviceSubCategory::ShaderConst);
-    if constant_data.is_null() || count == 0 {
-        return D3DERR_INVALIDCALL;
-    }
+    let count = match int_bool_constant_rows(
+        "GetVertexShaderConstantB",
+        !constant_data.is_null(),
+        start_register,
+        count,
+        BOOL_CONSTANT_COUNT,
+    ) {
+        Ok(0) => return D3D_OK,
+        Ok(rows) => rows,
+        Err(hr) => return hr,
+    };
     // SAFETY: vtable thunk; `this` is *mut Direct3DDevice9 per IDirect3DDevice9 ABI.
     let Some(obj) = (unsafe { InPtr::<Direct3DDevice9>::opt(this) }) else {
         return D3DERR_INVALIDCALL;
     };
     let mirror = obj.inner().shader_bindings().vs_constants_b_copy();
-    // SAFETY: `constant_data` is non-null and `count != 0` (checked above);
+    // SAFETY: `constant_data` is non-null and `count` is non-zero and clamped to the file (above);
     // per the D3D9 ABI the caller guarantees `count` `BOOL`s are writable.
-    let out = unsafe { core::slice::from_raw_parts_mut(constant_data, count as usize) };
+    let out = unsafe { core::slice::from_raw_parts_mut(constant_data, count) };
     copy_constants_out(&mirror, start_register, out);
     0
 }
@@ -13356,19 +13437,28 @@ extern "system" fn device_set_pixel_shader_constant_f(
 ) -> i32 {
     let _api = device_api_lock(this);
     let _timer = device_timer(this, DeviceSubCategory::ShaderConst);
-    if constant_data.is_null()
-        || count == 0
-        || !const_window_in_range(start_register, count, PS_FLOAT_CONSTANT_LIMIT)
-    {
+    if constant_data.is_null() {
         return D3DERR_INVALIDCALL;
+    }
+    if !window_in_range(start_register, count, PS_FLOAT_CONSTANT_LIMIT) {
+        return reject_constant_window(
+            "SetPixelShaderConstantF",
+            start_register,
+            count,
+            PS_FLOAT_CONSTANT_LIMIT,
+        );
+    }
+    // A zero count names an empty window, which D3D9 accepts and writes nothing into.
+    if count == 0 {
+        return D3D_OK;
     }
     // SAFETY: vtable thunk; `this` is *mut Direct3DDevice9 per IDirect3DDevice9 ABI.
     let Some(obj) = (unsafe { InPtrMut::<Direct3DDevice9>::opt(this) }) else {
         return D3DERR_INVALIDCALL;
     };
     let dev = obj.inner();
-    // SAFETY: `constant_data` is non-null and `count != 0` (checked
-    // above); per the D3D9 ABI the caller guarantees the bounded floats
+    // SAFETY: `constant_data` is non-null and `count` non-zero (both
+    // settled above); per the D3D9 ABI the caller guarantees the bounded floats
     // are initialized and readable without mutation in one allocation for
     // this call. The byte size fits `isize::MAX`; all `f32` bits are valid.
     let constants = unsafe {
@@ -13402,15 +13492,27 @@ extern "system" fn device_get_pixel_shader_constant_f(
 ) -> i32 {
     let _api = device_api_lock(this);
     let _timer = device_timer(this, DeviceSubCategory::ShaderConst);
-    if constant_data.is_null() || count == 0 {
+    if constant_data.is_null() {
         return D3DERR_INVALIDCALL;
+    }
+    if !window_in_range(start_register, count, PS_FLOAT_CONSTANT_LIMIT) {
+        return reject_constant_window(
+            "GetPixelShaderConstantF",
+            start_register,
+            count,
+            PS_FLOAT_CONSTANT_LIMIT,
+        );
+    }
+    // A zero count reads nothing, which D3D9 accepts.
+    if count == 0 {
+        return D3D_OK;
     }
     // SAFETY: vtable thunk; `this` is *mut Direct3DDevice9 per IDirect3DDevice9 ABI.
     let Some(obj) = (unsafe { InPtr::<Direct3DDevice9>::opt(this) }) else {
         return D3DERR_INVALIDCALL;
     };
     let mirror = obj.inner().shader_bindings().ps_constants_copy();
-    // SAFETY: `constant_data` is non-null and `count != 0` (checked above);
+    // SAFETY: `constant_data` is non-null and `count` non-zero (both settled above);
     // per the D3D9 ABI the caller guarantees `count * 4` `f32`s are writable.
     let out = unsafe {
         core::slice::from_raw_parts_mut(constant_data.cast::<[f32; 4]>(), count as usize)
@@ -13427,17 +13529,22 @@ extern "system" fn device_set_pixel_shader_constant_i(
 ) -> i32 {
     let _api = device_api_lock(this);
     let _timer = device_timer(this, DeviceSubCategory::ShaderConst);
-    if constant_data.is_null() || count == 0 {
-        return D3DERR_INVALIDCALL;
-    }
+    let count = match int_bool_constant_rows(
+        "SetPixelShaderConstantI",
+        !constant_data.is_null(),
+        start_register,
+        count,
+        INT_CONSTANT_ROWS,
+    ) {
+        Ok(0) => return D3D_OK,
+        Ok(rows) => rows,
+        Err(hr) => return hr,
+    };
     // SAFETY: vtable thunk; `this` is *mut Direct3DDevice9 per IDirect3DDevice9 ABI.
     let Some(obj) = (unsafe { InPtrMut::<Direct3DDevice9>::opt(this) }) else {
         return D3DERR_INVALIDCALL;
     };
     let dev = obj.inner();
-    // The register mirror clamps oversized writes; bound the caller copy
-    // to the same window before an unaligned input can allocate.
-    let count = (count as usize).min(INT_CONSTANT_ROWS.saturating_sub(start_register as usize));
     // SAFETY: `constant_data` is non-null and `count` is bounded above;
     // per the D3D9 ABI, the bounded rows are initialized and readable
     // without mutation in one allocation for this call. The byte size
@@ -13469,19 +13576,25 @@ extern "system" fn device_get_pixel_shader_constant_i(
 ) -> i32 {
     let _api = device_api_lock(this);
     let _timer = device_timer(this, DeviceSubCategory::ShaderConst);
-    if constant_data.is_null() || count == 0 {
-        return D3DERR_INVALIDCALL;
-    }
+    let count = match int_bool_constant_rows(
+        "GetPixelShaderConstantI",
+        !constant_data.is_null(),
+        start_register,
+        count,
+        INT_CONSTANT_ROWS,
+    ) {
+        Ok(0) => return D3D_OK,
+        Ok(rows) => rows,
+        Err(hr) => return hr,
+    };
     // SAFETY: vtable thunk; `this` is *mut Direct3DDevice9 per IDirect3DDevice9 ABI.
     let Some(obj) = (unsafe { InPtr::<Direct3DDevice9>::opt(this) }) else {
         return D3DERR_INVALIDCALL;
     };
     let mirror = obj.inner().shader_bindings().ps_constants_i_copy();
-    // SAFETY: `constant_data` is non-null and `count != 0` (checked above);
+    // SAFETY: `constant_data` is non-null and `count` is non-zero and clamped to the file (above);
     // per the D3D9 ABI the caller guarantees `count * 4` `i32`s are writable.
-    let out = unsafe {
-        core::slice::from_raw_parts_mut(constant_data.cast::<[i32; 4]>(), count as usize)
-    };
+    let out = unsafe { core::slice::from_raw_parts_mut(constant_data.cast::<[i32; 4]>(), count) };
     copy_constants_out(&mirror, start_register, out);
     0
 }
@@ -13494,17 +13607,22 @@ extern "system" fn device_set_pixel_shader_constant_b(
 ) -> i32 {
     let _api = device_api_lock(this);
     let _timer = device_timer(this, DeviceSubCategory::ShaderConst);
-    if constant_data.is_null() || count == 0 {
-        return D3DERR_INVALIDCALL;
-    }
+    let count = match int_bool_constant_rows(
+        "SetPixelShaderConstantB",
+        !constant_data.is_null(),
+        start_register,
+        count,
+        BOOL_CONSTANT_COUNT,
+    ) {
+        Ok(0) => return D3D_OK,
+        Ok(rows) => rows,
+        Err(hr) => return hr,
+    };
     // SAFETY: vtable thunk; `this` is *mut Direct3DDevice9 per IDirect3DDevice9 ABI.
     let Some(obj) = (unsafe { InPtrMut::<Direct3DDevice9>::opt(this) }) else {
         return D3DERR_INVALIDCALL;
     };
     let dev = obj.inner();
-    // The register mirror clamps oversized writes; bound the caller copy
-    // to the same window before an unaligned input can allocate.
-    let count = (count as usize).min(BOOL_CONSTANT_COUNT.saturating_sub(start_register as usize));
     // SAFETY: `constant_data` is non-null and `count` is bounded above;
     // per the D3D9 ABI, the bounded BOOLs are initialized and readable
     // without mutation in one allocation for this call. The byte size
@@ -13535,17 +13653,25 @@ extern "system" fn device_get_pixel_shader_constant_b(
 ) -> i32 {
     let _api = device_api_lock(this);
     let _timer = device_timer(this, DeviceSubCategory::ShaderConst);
-    if constant_data.is_null() || count == 0 {
-        return D3DERR_INVALIDCALL;
-    }
+    let count = match int_bool_constant_rows(
+        "GetPixelShaderConstantB",
+        !constant_data.is_null(),
+        start_register,
+        count,
+        BOOL_CONSTANT_COUNT,
+    ) {
+        Ok(0) => return D3D_OK,
+        Ok(rows) => rows,
+        Err(hr) => return hr,
+    };
     // SAFETY: vtable thunk; `this` is *mut Direct3DDevice9 per IDirect3DDevice9 ABI.
     let Some(obj) = (unsafe { InPtr::<Direct3DDevice9>::opt(this) }) else {
         return D3DERR_INVALIDCALL;
     };
     let mirror = obj.inner().shader_bindings().ps_constants_b_copy();
-    // SAFETY: `constant_data` is non-null and `count != 0` (checked above);
+    // SAFETY: `constant_data` is non-null and `count` is non-zero and clamped to the file (above);
     // per the D3D9 ABI the caller guarantees `count` `BOOL`s are writable.
-    let out = unsafe { core::slice::from_raw_parts_mut(constant_data, count as usize) };
+    let out = unsafe { core::slice::from_raw_parts_mut(constant_data, count) };
     copy_constants_out(&mirror, start_register, out);
     0
 }
