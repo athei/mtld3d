@@ -74,7 +74,12 @@ pub struct MappedImage {
 pub struct PatchedImports<const N: usize> {
     /// The patched slots, in hook order; null where the import is absent.
     slots: [AtomicPtr<*const ()>; N],
-    /// The entry points the slots held; null where no slot was patched.
+    /// The entry points the slots held; null where the import is absent.
+    ///
+    /// Recorded before the write is tried and never cleared: another thread
+    /// can be inside a replacement at any moment the slot names it, and a
+    /// little after, so the original it forwards to has to be there first
+    /// and stay.
     originals: [AtomicPtr<()>; N],
     /// Whether [`PatchedImports::install`] has already run.
     installed: AtomicBool,
@@ -200,7 +205,8 @@ impl<const N: usize> PatchedImports<N> {
     ///
     /// Idempotent, and every hook is optional: an import the main module
     /// does not have and a slot whose page will not open are both skipped,
-    /// leaving that index without an original and its replacement unreached.
+    /// leaving the replacement unreached. The original is recorded before
+    /// the write is tried, so it is null only where the import is absent.
     pub fn install(&self, hooks: &[Hook<'_>; N]) -> usize {
         if self.installed.swap(true, Ordering::AcqRel) {
             return 0;
@@ -213,7 +219,14 @@ impl<const N: usize> PatchedImports<N> {
             let Some(slot) = image.import_slot(hook.dll, hook.func) else {
                 continue;
             };
-            let Some(original) = write_slot(slot, hook.replacement) else {
+            // The original is published before the slot names the
+            // replacement, so a thread that calls through the slot the moment
+            // it changes finds the entry point it forwards to.
+            // SAFETY: `slot` is an aligned, readable entry of the main
+            // module's import address table (`MappedImage::import_slot`).
+            let original = unsafe { slot.read_volatile() };
+            self.originals[i].store(original.cast_mut(), Ordering::Release);
+            let Some(previous) = write_slot(slot, hook.replacement) else {
                 warn!(
                     target: LOG_TARGET,
                     "import patch: the import slot of {} is not writable",
@@ -221,7 +234,16 @@ impl<const N: usize> PatchedImports<N> {
                 );
                 continue;
             };
-            self.originals[i].store(original.cast_mut(), Ordering::Release);
+            if previous != original {
+                // Something else rewrote the slot between the read and the
+                // write; forward to what the slot held when it was replaced.
+                self.originals[i].store(previous.cast_mut(), Ordering::Release);
+                mtld3d_shared::log_once_warn!(
+                    target: LOG_TARGET,
+                    "import patch: an import slot changed while it was being patched → \
+                     forwarding to the entry point it held at the write",
+                );
+            }
             self.slots[i].store(slot, Ordering::Release);
             patched += 1;
         }
@@ -231,14 +253,16 @@ impl<const N: usize> PatchedImports<N> {
     /// Put the original entry points back. Idempotent.
     ///
     /// Called on the `FreeLibrary` path the process survives, so no slot
-    /// keeps pointing into an image that is about to unmap.
+    /// keeps pointing into an image that is about to unmap. The originals
+    /// stay recorded: a thread that entered a replacement before its slot
+    /// was restored still forwards through them.
     pub fn uninstall(&self) {
         for (slot, original) in self.slots.iter().zip(&self.originals) {
             let slot = slot.swap(ptr::null_mut(), Ordering::AcqRel);
             if slot.is_null() {
                 continue;
             }
-            write_slot(slot, original.swap(ptr::null_mut(), Ordering::AcqRel));
+            write_slot(slot, original.load(Ordering::Acquire));
         }
         self.installed.store(false, Ordering::Release);
     }
@@ -247,9 +271,10 @@ impl<const N: usize> PatchedImports<N> {
     pub fn original<F>(&self, index: usize) -> F {
         let original = self.originals[index].load(Ordering::Acquire);
         // SAFETY: the slot held an entry point of exactly the signature `F`
-        // names before `install` replaced it, and a replacement only runs
-        // while its slot is patched, so the pointer is that entry point and
-        // `F` is a pointer-sized `fn` type.
+        // names before `install` replaced it, and `install` records it before
+        // the slot can lead a caller into a replacement and never clears it,
+        // so the pointer is that entry point and `F` is a pointer-sized `fn`
+        // type.
         unsafe { core::mem::transmute_copy(&original) }
     }
 }
