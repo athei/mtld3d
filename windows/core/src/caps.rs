@@ -45,7 +45,7 @@ const MAX_VERTEX_W: f32 = 1e10;
 /// same number. It is likewise the texture-coordinate-set count reported
 /// through `FVFCaps`. Distinct from the 16 sampler slots an SM3 pixel shader
 /// addresses, which no `D3DCAPS9` field reports.
-const FF_TEXTURE_STAGES: u32 = 8;
+pub const FF_TEXTURE_STAGES: u32 = 8;
 
 /// Matrices blended into one vertex by the FF vertex-blending path.
 ///

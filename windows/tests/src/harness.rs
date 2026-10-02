@@ -41,6 +41,12 @@ mod cursor_bitmap;
 /// which is a read of the variable like any other.
 static ENVIRONMENT: RwLock<()> = RwLock::new(());
 
+/// The value the seeded `try_*` getters put in their out slot before the call.
+///
+/// A getter that leaves the slot alone reads back as this, which no state a
+/// test sets holds.
+pub const UNWRITTEN: u32 = 0xDEAD_BEEF;
+
 /// The environment variable the layer reads its configuration overrides from.
 const CONFIG_VAR: &str = "MTLD3D_CONFIG";
 
@@ -996,9 +1002,12 @@ impl Harness {
     }
 
     /// `GetRenderState` returning `(hr, value)`.
+    ///
+    /// The out slot is seeded with [`UNWRITTEN`], so a call that leaves it
+    /// alone reads back as that value.
     #[must_use]
     pub fn try_render_state(&self, state: u32) -> (i32, u32) {
-        let mut value = 0u32;
+        let mut value = UNWRITTEN;
         // SAFETY: vtable thunk; `&mut value` is writable.
         let hr = unsafe { (self.dev_vtbl().get_render_state)(self.device, state, &raw mut value) };
         (hr, value)
@@ -1008,6 +1017,17 @@ impl Harness {
     pub fn set_sampler_state(&self, sampler: u32, state: u32, value: u32) -> i32 {
         // SAFETY: vtable thunk; `self.device` is live.
         unsafe { (self.dev_vtbl().set_sampler_state)(self.device, sampler, state, value) }
+    }
+
+    /// `GetSamplerState` returning `(hr, value)`, the out slot seeded with [`UNWRITTEN`].
+    #[must_use]
+    pub fn try_sampler_state(&self, sampler: u32, state: u32) -> (i32, u32) {
+        let mut value = UNWRITTEN;
+        // SAFETY: vtable thunk; `&mut value` is writable.
+        let hr = unsafe {
+            (self.dev_vtbl().get_sampler_state)(self.device, sampler, state, &raw mut value)
+        };
+        (hr, value)
     }
 
     /// `GetSamplerState`, asserting success.
@@ -1066,6 +1086,17 @@ impl Harness {
                 "SetTextureStageState",
             );
         }
+    }
+
+    /// `GetTextureStageState` returning `(hr, value)`, the out slot seeded with [`UNWRITTEN`].
+    #[must_use]
+    pub fn try_texture_stage_state(&self, stage: u32, ts_state: u32) -> (i32, u32) {
+        let mut value = UNWRITTEN;
+        // SAFETY: vtable thunk; `&mut value` is writable.
+        let hr = unsafe {
+            (self.dev_vtbl().get_texture_stage_state)(self.device, stage, ts_state, &raw mut value)
+        };
+        (hr, value)
     }
 
     /// `GetTextureStageState`, asserting success.

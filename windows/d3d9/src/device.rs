@@ -92,7 +92,7 @@ use mtld3d_types::{
     D3DUSAGE_DONOTCLIP, D3DUSAGE_DYNAMIC, D3DUSAGE_NONSECURE, D3DUSAGE_NPATCHES, D3DUSAGE_POINTS,
     D3DUSAGE_QUERY_FILTER, D3DUSAGE_RENDERTARGET, D3DUSAGE_RTPATCHES, D3DUSAGE_SOFTWAREPROCESSING,
     D3DUSAGE_WRITEONLY, D3DVIEWPORT9, Guid, IDirect3DDevice9Vtbl, RENDER_STATE_COUNT,
-    SAMPLER_STATE_COUNT, TEXTURE_STAGE_STATE_COUNT, render_state_defaults,
+    SAMPLER_STATE_COUNT, render_state_defaults,
 };
 
 use super::{
@@ -9604,8 +9604,10 @@ extern "system" fn device_get_clip_plane(this: *mut c_void, index: u32, plane: *
 extern "system" fn device_set_render_state(this: *mut c_void, state: u32, value: u32) -> i32 {
     let _api = device_api_lock(this);
     let _timer = device_timer(this, DeviceSubCategory::RenderState);
-    if (state as usize) >= RENDER_STATE_COUNT {
-        return D3DERR_INVALIDCALL;
+    // A state no D3D9 render state names (1 to 6, or past `D3DRS_BLENDOPALPHA`)
+    // is accepted and ignored.
+    if (1..mtld3d_types::D3DRS_ZENABLE).contains(&state) || (state as usize) >= RENDER_STATE_COUNT {
+        return ignore_unnamed_render_state(state);
     }
     // SAFETY: vtable thunk; `this` is *mut Direct3DDevice9 per IDirect3DDevice9 ABI.
     let Some(obj) = (unsafe { InPtrMut::<Direct3DDevice9>::opt(this) }) else {
@@ -9651,8 +9653,20 @@ extern "system" fn device_set_render_state(this: *mut c_void, state: u32, value:
 extern "system" fn device_get_render_state(this: *mut c_void, state: u32, value: *mut u32) -> i32 {
     let _api = device_api_lock(this);
     let _timer = device_timer(this, DeviceSubCategory::RenderState);
-    if (state as usize) >= RENDER_STATE_COUNT || value.is_null() {
+    if value.is_null() {
         return D3DERR_INVALIDCALL;
+    }
+    // States 1 to 6 and past 255 are refused; state 0 and the unnamed states
+    // up to 255 read as zero.
+    if (1..mtld3d_types::D3DRS_ZENABLE).contains(&state) || state > 255 {
+        return reject_unreadable_render_state(state);
+    }
+    if state == 0 || (state as usize) >= RENDER_STATE_COUNT {
+        warn_unnamed_render_state_read(state);
+        // SAFETY: `value` is non-null (checked above) and per the D3D9 ABI
+        // points to a writable `u32` slot owned by the caller.
+        unsafe { *value = 0 };
+        return D3D_OK;
     }
     // SAFETY: vtable thunk; `this` is *mut Direct3DDevice9 per IDirect3DDevice9 ABI.
     let Some(obj) = (unsafe { InPtr::<Direct3DDevice9>::opt(this) }) else {
@@ -9663,6 +9677,41 @@ extern "system" fn device_get_render_state(this: *mut c_void, state: u32, value:
     // points to a writable `u32` slot owned by the caller.
     unsafe { *value = dev.render_state(state as usize) };
     0 // S_OK
+}
+
+/// The `D3D_OK` `SetRenderState` answers for a state no D3D9 render state names, which it ignores.
+///
+/// Out of line, like the other index rejects below, so the state and sampler
+/// setters do not build the log arguments on their hot path.
+#[cold]
+#[inline(never)]
+fn ignore_unnamed_render_state(state: u32) -> i32 {
+    mtld3d_shared::log_once_warn!(
+        target: LOG_TARGET,
+        "SetRenderState({state}): no render state has that index → ignored, D3D_OK"
+    );
+    D3D_OK
+}
+
+/// The `INVALIDCALL` `GetRenderState` answers for states 1 to 6 and past 255.
+#[cold]
+#[inline(never)]
+fn reject_unreadable_render_state(state: u32) -> i32 {
+    mtld3d_shared::log_once_warn!(
+        target: LOG_TARGET,
+        "GetRenderState({state}): outside the readable render states → INVALIDCALL"
+    );
+    D3DERR_INVALIDCALL
+}
+
+/// Warn once that `GetRenderState` read zero for state 0 or an unnamed state up to 255.
+#[cold]
+#[inline(never)]
+fn warn_unnamed_render_state_read(state: u32) {
+    mtld3d_shared::log_once_warn!(
+        target: LOG_TARGET,
+        "GetRenderState({state}): no render state has that index → 0, D3D_OK"
+    );
 }
 
 extern "system" fn device_create_state_block(
@@ -9775,9 +9824,16 @@ extern "system" fn device_get_texture(
 ) -> i32 {
     let _api = device_api_lock(this);
     let _timer = bind_timer(this, BindSubCategory::Texture);
-    let vertex_slot = vertex_sampler_slot(stage);
-    if (vertex_slot.is_none() && stage as usize >= STAGE_COUNT) || texture.is_null() {
+    if texture.is_null() {
         return D3DERR_INVALIDCALL;
+    }
+    let vertex_slot = vertex_sampler_slot(stage);
+    if vertex_slot.is_none() && stage as usize >= STAGE_COUNT {
+        warn_invalid_sampler("GetTexture", stage);
+        // SAFETY: `texture` is non-null (checked above) and per the D3D9
+        // ABI points to a writable `*mut c_void` slot owned by the caller.
+        unsafe { *texture = core::ptr::null_mut() };
+        return D3D_OK;
     }
     // SAFETY: vtable thunk; `this` is *mut Direct3DDevice9 per IDirect3DDevice9 ABI.
     let Some(obj) = (unsafe { InPtr::<Direct3DDevice9>::opt(this) }) else {
@@ -9815,12 +9871,69 @@ pub const fn vertex_sampler_slot(stage: u32) -> Option<usize> {
     }
 }
 
+/// Warn once per entry point that a texture or sampler call named a stage no sampler has.
+///
+/// Such a call is accepted and ignored, and a getter reads zero or null: a
+/// stage past the sixteen fragment samplers and outside the four vertex ones.
+/// `D3DDMAPSAMPLER` is one of them, as in Wine: no displacement-map sampler
+/// exists here.
+#[cold]
+#[inline(never)]
+fn warn_invalid_sampler(call: &str, stage: u32) {
+    mtld3d_shared::log_once_warn_by!(
+        target: LOG_TARGET,
+        key: caller_log_key(call),
+        "{call}({stage}): no sampler has that stage → ignored, D3D_OK"
+    );
+}
+
+/// Clamp a texture-stage-state stage and type into the stored table, as D3D9 runtimes do.
+///
+/// [`mtld3d_core::ff_state::clamp_texture_stage_state`] owns the rule; an
+/// index outside the table is logged once per entry point.
+fn clamp_texture_stage_state(call: &str, stage: u32, type_: u32) -> (u32, u32) {
+    if mtld3d_core::ff_state::texture_stage_state_in_table(stage, type_) {
+        return (stage, type_);
+    }
+    clamp_texture_stage_state_out_of_table(call, stage, type_)
+}
+
+/// The out-of-table half of [`clamp_texture_stage_state`]: log once and clamp.
+///
+/// Out of line so the texture-stage-state calls do not build the log
+/// arguments on their hot path.
+#[cold]
+#[inline(never)]
+fn clamp_texture_stage_state_out_of_table(call: &str, stage: u32, type_: u32) -> (u32, u32) {
+    let (to_stage, to_type) = mtld3d_core::ff_state::clamp_texture_stage_state(stage, type_);
+    mtld3d_shared::log_once_warn_by!(
+        target: LOG_TARGET,
+        key: caller_log_key(call),
+        "{call}(stage {stage}, type {type_}): outside the table → clamped to stage {to_stage}, \
+         type {to_type}"
+    );
+    (to_stage, to_type)
+}
+
+/// The `INVALIDCALL` a sampler-state call answers for a type past `D3DSAMP_DMAPOFFSET`.
+#[cold]
+#[inline(never)]
+fn reject_sampler_state_type(call: &str, type_: u32) -> i32 {
+    mtld3d_shared::log_once_warn_by!(
+        target: LOG_TARGET,
+        key: caller_log_key(call),
+        "{call}: no sampler state has type {type_} → INVALIDCALL"
+    );
+    D3DERR_INVALIDCALL
+}
+
 extern "system" fn device_set_texture(this: *mut c_void, stage: u32, texture: *mut c_void) -> i32 {
     let _api = device_api_lock(this);
     let _timer = bind_timer(this, BindSubCategory::Texture);
     let vertex_slot = vertex_sampler_slot(stage);
     if vertex_slot.is_none() && stage as usize >= STAGE_COUNT {
-        return D3DERR_INVALIDCALL;
+        warn_invalid_sampler("SetTexture", stage);
+        return D3D_OK;
     }
     // SAFETY: vtable thunk; `this` is *mut Direct3DDevice9 per IDirect3DDevice9 ABI.
     let Some(obj) = (unsafe { InPtr::<Direct3DDevice9>::opt(this) }) else {
@@ -9916,9 +10029,10 @@ extern "system" fn device_get_texture_stage_state(
 ) -> i32 {
     let _api = device_api_lock(this);
     let _timer = device_timer(this, DeviceSubCategory::TexStageState);
-    if value.is_null() || stage >= 8 || (type_ as usize) >= TEXTURE_STAGE_STATE_COUNT {
+    if value.is_null() {
         return D3DERR_INVALIDCALL;
     }
+    let (stage, type_) = clamp_texture_stage_state("GetTextureStageState", stage, type_);
     // SAFETY: vtable thunk; `this` is *mut Direct3DDevice9 per IDirect3DDevice9 ABI.
     let Some(obj) = (unsafe { InPtr::<Direct3DDevice9>::opt(this) }) else {
         return D3DERR_INVALIDCALL;
@@ -9942,9 +10056,7 @@ extern "system" fn device_set_texture_stage_state(
 ) -> i32 {
     let _api = device_api_lock(this);
     let _timer = device_timer(this, DeviceSubCategory::TexStageState);
-    if stage >= 8 || (type_ as usize) >= TEXTURE_STAGE_STATE_COUNT {
-        return D3DERR_INVALIDCALL;
-    }
+    let (stage, type_) = clamp_texture_stage_state("SetTextureStageState", stage, type_);
     // SAFETY: vtable thunk; `this` is *mut Direct3DDevice9 per IDirect3DDevice9 ABI.
     let Some(obj) = (unsafe { InPtrMut::<Direct3DDevice9>::opt(this) }) else {
         return D3DERR_INVALIDCALL;
@@ -9994,12 +10106,19 @@ extern "system" fn device_get_sampler_state(
 ) -> i32 {
     let _api = device_api_lock(this);
     let _timer = device_timer(this, DeviceSubCategory::SamplerState);
-    let vertex_slot = vertex_sampler_slot(sampler);
-    if (vertex_slot.is_none() && sampler as usize >= STAGE_COUNT)
-        || type_ as usize >= SAMPLER_STATE_COUNT
-        || value.is_null()
-    {
+    if value.is_null() {
         return D3DERR_INVALIDCALL;
+    }
+    let vertex_slot = vertex_sampler_slot(sampler);
+    if vertex_slot.is_none() && sampler as usize >= STAGE_COUNT {
+        warn_invalid_sampler("GetSamplerState", sampler);
+        // SAFETY: `value` is non-null (checked above) and per the D3D9 ABI
+        // points to a writable `u32` slot owned by the caller.
+        unsafe { *value = 0 };
+        return D3D_OK;
+    }
+    if type_ as usize >= SAMPLER_STATE_COUNT {
+        return reject_sampler_state_type("GetSamplerState", type_);
     }
     // SAFETY: vtable thunk; `this` is *mut Direct3DDevice9 per IDirect3DDevice9 ABI.
     let Some(obj) = (unsafe { InPtr::<Direct3DDevice9>::opt(this) }) else {
@@ -10030,10 +10149,12 @@ extern "system" fn device_set_sampler_state(
     let _api = device_api_lock(this);
     let _timer = device_timer(this, DeviceSubCategory::SamplerState);
     let vertex_slot = vertex_sampler_slot(sampler);
-    if (vertex_slot.is_none() && sampler as usize >= STAGE_COUNT)
-        || type_ as usize >= SAMPLER_STATE_COUNT
-    {
-        return D3DERR_INVALIDCALL;
+    if vertex_slot.is_none() && sampler as usize >= STAGE_COUNT {
+        warn_invalid_sampler("SetSamplerState", sampler);
+        return D3D_OK;
+    }
+    if type_ as usize >= SAMPLER_STATE_COUNT {
+        return reject_sampler_state_type("SetSamplerState", type_);
     }
     // SAFETY: vtable thunk; `this` is *mut Direct3DDevice9 per IDirect3DDevice9 ABI.
     let Some(obj) = (unsafe { InPtr::<Direct3DDevice9>::opt(this) }) else {

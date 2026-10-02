@@ -11,9 +11,10 @@
 //! `D3DTOP_*` space reads as the stage default instead, the draw-time narrowing of stage
 //! arguments and result registers reading the stage default with one warning per stage and
 //! state, the world-matrix palette sized from the blend mode with every unset matrix carried as
-//! identity, and the FF VS source fingerprint moving on every light enable and light type change
+//! identity, the FF VS source fingerprint moving on every light enable and light type change
 //! while holding across every matrix, material and light-parameter write, none of which moves
-//! the FF VS key or row count.
+//! the FF VS key or row count, and out-of-table texture-stage-state stages and types clamping to
+//! the last stage and to `D3DTSS_CONSTANT`.
 
 use std::sync::Mutex;
 
@@ -28,8 +29,9 @@ use mtld3d_types::{
 };
 
 use super::{
-    FfState, FfVsLayout, TssWriteFeeds, VariantFlags, VariantKey, build_fog_color_bytes,
-    stage_enum_value, tss_write_feeds,
+    FfState, FfVsLayout, LAST_TEXTURE_STAGE, TssWriteFeeds, VariantFlags, VariantKey,
+    build_fog_color_bytes, clamp_texture_stage_state, stage_enum_value,
+    texture_stage_state_in_table, tss_write_feeds,
 };
 use crate::convert::FfVsLayoutFlags;
 
@@ -2595,4 +2597,28 @@ fn set_material_stores_every_field_and_marks_the_material_section() {
     };
     assert_eq!(bits(state.material()), bits(&material));
     assert_eq!(state.take_ff_vs_dirty(), super::FfVsDirty::MATERIAL);
+}
+
+#[test]
+fn texture_stage_state_indices_clamp_into_the_table() {
+    assert_eq!(LAST_TEXTURE_STAGE, 7);
+    for (stage, ty) in [(0, 1), (7, 1), (7, 32), (3, 32)] {
+        assert!(texture_stage_state_in_table(stage, ty), "{stage}/{ty}");
+        assert_eq!(clamp_texture_stage_state(stage, ty), (stage, ty));
+    }
+    for (stage, ty, clamped) in [
+        (8, 1, (7, 1)),
+        (u32::MAX, 32, (7, 32)),
+        (0, 0, (0, 32)),
+        (0, 33, (0, 32)),
+        (7, u32::MAX, (7, 32)),
+        (8, 0, (7, 32)),
+    ] {
+        assert!(!texture_stage_state_in_table(stage, ty), "{stage}/{ty}");
+        assert_eq!(
+            clamp_texture_stage_state(stage, ty),
+            clamped,
+            "{stage}/{ty}"
+        );
+    }
 }
