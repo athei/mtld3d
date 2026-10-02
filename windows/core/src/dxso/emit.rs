@@ -2340,9 +2340,11 @@ fn translate_instruction(
                     let eye = if matches!(inst.opcode, Opcode::TexM3x3Spec) {
                         format!("({e}).xyz", e = srcs[1])
                     } else {
-                        // vspec: eye vector from the .w of the three coord regs.
+                        // vspec: eye vector from the .w of the three iterated
+                        // texture coordinates. The two pad registers already
+                        // hold their dot products, so read the interpolants.
                         format!(
-                            "float3(t[{a}].w, t[{b}].w, ({coord}).w)",
+                            "float3(in.texcoord{a}.w, in.texcoord{b}.w, in.texcoord{m}.w)",
                             a = m.saturating_sub(2),
                             b = m.saturating_sub(1)
                         )
