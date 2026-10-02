@@ -174,11 +174,11 @@ pub struct FfVsKey {
     pub input_tex_coord_count: u8,
     /// Number of per-stage texcoord *varyings* the VS emits for the PS to sample.
     ///
-    /// Inflated above `input_tex_coord_count` when PS texture stages are
-    /// active without matching vertex-stream texcoords — the VS still needs to
-    /// emit an output for each active stage so the PS can read it, but the
-    /// passthru reads fall back to `float4(0,0,0,1)` for coord-set indices
-    /// outside `input_tex_coord_count`.
+    /// Covers every stage whose TCI generates a coordinate or routes a set
+    /// the stream carries, whatever its `COLOROP`, since a programmable PS
+    /// samples the stages it names. Inflated above `input_tex_coord_count`
+    /// by such a stage, and by an active textured stage with no matching
+    /// vertex-stream texcoords, whose passthru read falls back to zero.
     pub tex_coord_count: u8,
     /// Bit `i` set iff slot `i`'s `D3DLIGHT9` contributes to FF VS shading.
     ///

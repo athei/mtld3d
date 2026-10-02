@@ -14,7 +14,7 @@ use mtld3d_types::{
     D3DRS_EMISSIVEMATERIALSOURCE, D3DRS_INDEXEDVERTEXBLENDENABLE, D3DRS_LIGHTING,
     D3DRS_LOCALVIEWER, D3DRS_SPECULARENABLE, D3DRS_VERTEXBLEND, D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV,
     D3DSAMP_MAGFILTER, D3DSAMP_MINFILTER, D3DTA_ALPHAREPLICATE, D3DTA_DIFFUSE, D3DTA_SPECULAR,
-    D3DTA_TEXTURE, D3DTADDRESS_CLAMP, D3DTADDRESS_WRAP, D3DTEXF_POINT, D3DTOP_MODULATE,
+    D3DTA_TEXTURE, D3DTADDRESS_CLAMP, D3DTADDRESS_WRAP, D3DTEXF_POINT, D3DTOP_DISABLE, D3DTOP_MODULATE,
     D3DTOP_SELECTARG1, D3DTS_PROJECTION, D3DTS_TEXTURE0, D3DTS_VIEW, D3DTS_WORLD, D3DTSS_ALPHAARG1,
     D3DTSS_ALPHAOP, D3DTSS_COLORARG1, D3DTSS_COLORARG2, D3DTSS_COLOROP, D3DTSS_TEXCOORDINDEX,
     D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_COUNT2, D3DTTFF_COUNT3, D3DVBF_1WEIGHTS, D3DVECTOR,
@@ -1873,5 +1873,101 @@ fn texture_transform_written_before_a_pretransformed_draw_reaches_the_next_trans
         h.read_pixel(480, 240),
         TT_GREEN,
         "the next frame's draw reads the scale as well"
+    );
+}
+
+// ── FF VS coordinates for a programmable PS past the FF chain's end ──
+
+/// Position and one two-component texture coordinate (`D3DFVF_XYZ | D3DFVF_TEX1`).
+#[repr(C)]
+struct PosUvVertex {
+    x: f32,
+    y: f32,
+    z: f32,
+    u: f32,
+    v: f32,
+}
+
+/// The fixed-function VS writes stage 1's coordinate for a pixel shader while stage 1 is DISABLE.
+///
+/// `ps_1_1 { tex t1; mov r0, t1 }` samples a 2x1 red|green texture on stage 1
+/// with POINT filtering and CLAMP addressing, and the FF colour cascade ends at
+/// stage 1, whose `COLOROP` keeps its default `DISABLE`. The stream carries
+/// one coordinate set with u = 0.75, so stage 1 routed to set 0 reads green; a
+/// coordinate left at zero reads the red texel. Generating stage 1's coordinate
+/// from the eye-space position instead puts u = x, so the right quarter reads
+/// green and the left half red.
+#[test]
+fn ff_vs_writes_a_pixel_shader_stage_past_the_first_disabled_stage() {
+    const RED: u32 = 0xFFFF_0000;
+    const GREEN: u32 = 0xFF00_FF00;
+    const PS: &[u32] = &[
+        0xffff_0101,
+        0x0000_0042,
+        0xb00f_0001,
+        0x0000_0001,
+        0x800f_0000,
+        0xb0e4_0001,
+        0x0000_ffff,
+    ];
+    let h = Harness::new();
+    assert_eq!(h.set_render_state(D3DRS_LIGHTING, 0), 0, "lighting off");
+    assert_eq!(h.set_render_state(D3DRS_CULLMODE, D3DCULL_NONE), 0);
+    for state in [D3DTS_WORLD, D3DTS_VIEW, D3DTS_PROJECTION] {
+        assert_eq!(h.set_transform(state, &IDENTITY), 0, "SetTransform");
+    }
+    let tex = h.create_texture(2, 1, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED);
+    tex.lock_rect(0, 0).write_u32_rect(2, 1, &[RED, GREEN]);
+    assert_eq!(h.set_texture(1, &tex), 0, "SetTexture(1)");
+    for (state, value) in [
+        (D3DSAMP_MINFILTER, D3DTEXF_POINT),
+        (D3DSAMP_MAGFILTER, D3DTEXF_POINT),
+        (D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP),
+        (D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP),
+    ] {
+        assert_eq!(h.set_sampler_state(1, state, value), 0, "SetSamplerState");
+    }
+    assert_eq!(
+        h.texture_stage_state(1, D3DTSS_COLOROP),
+        D3DTOP_DISABLE,
+        "stage 1 keeps its default DISABLE"
+    );
+    let shader = h.create_pixel_shader(PS);
+    assert_eq!(h.set_pixel_shader(&shader), 0, "SetPixelShader");
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_TEX1), 0, "SetFVF");
+    let quad = TEXGEN_CORNERS.map(|(x, y)| PosUvVertex {
+        x,
+        y,
+        z: 0.5,
+        u: 0.75,
+        v: 0.5,
+    });
+
+    assert_eq!(h.set_texture_stage_state(1, D3DTSS_TEXCOORDINDEX, 0), 0);
+    h.render_once(BLUE, |d| {
+        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad), 0, "draw");
+    });
+    for x in [80, 560] {
+        assert_pixel_approx(h.read_pixel(x, 240), GREEN, 2, "stage 1 routed to set 0");
+    }
+
+    assert_eq!(
+        h.set_texture_stage_state(1, D3DTSS_TEXCOORDINDEX, TCI_CAMERASPACEPOSITION),
+        0
+    );
+    h.render_once(BLUE, |d| {
+        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad), 0, "draw");
+    });
+    assert_pixel_approx(
+        h.read_pixel(560, 240),
+        GREEN,
+        2,
+        "stage 1 generated from x = 0.75",
+    );
+    assert_pixel_approx(
+        h.read_pixel(80, 240),
+        RED,
+        2,
+        "stage 1 generated from x = -0.75",
     );
 }
