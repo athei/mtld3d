@@ -1171,11 +1171,14 @@ Sites: 16433=expected
 
 VS special-float ops on NaN/±inf: the test accepts four distinct vendor
 results (r500/r600/nv40/nv50) plus broken(warp) — special-value handling is
-GPU-defined, not spec-mandated. Our Metal GPU produces a fifth valid IEEE
-result matching no vendor's encoding. Matching a specific vendor is neither
-feasible nor desirable. No capability involved (old `caps` tag incoherent).
-The `@mac2` legs count three, not two: the paravirtual device encodes one
-more instruction's result its own way.
+GPU-defined, not spec-mandated. The one failure left on the Apple family is
+the `def1` case, a `def` constant holding a NaN moved into the output: our
+Metal GPU produces a fifth valid IEEE result matching no vendor's encoding
+(0x008000ff). Matching a specific vendor is neither feasible nor desirable.
+No capability involved (old `caps` tag incoherent). `nrm` of a zero vector
+returns its source, the zero vector the test's hardware gives, so it passes.
+The `@mac2` legs count two: `def1`, and `pow`, whose result the paravirtual
+device encodes its own way (0x00808000; `def1` reads the same value there).
 
 ### visual.c/float_texture_test, g16r16_texture_test, test_mipmap_autogen, test_signed_formats, volume_v16u16_test
 Sites: 5090=expected 5169=expected 6034=expected 18787=expected
