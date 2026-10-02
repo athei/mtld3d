@@ -13,17 +13,18 @@
 //! refcount; `Drop` decrements it. Assignment Drops the old value, so
 //! `field = unsafe { CachedComPtr::adopt(new) }` is the swap idiom.
 //!
-//! The `K: Ownership` type parameter selects the bookkeeping path:
+//! The `K: Ownership` type parameter selects the bookkeeping path. Both
+//! markers bump the wrapper's device-internal `private_refcount` inline (no
+//! vtable indirection, no `ApiTimer` instrumentation), so the application's
+//! `AddRef`/`Release` answers only ever count the application's own
+//! references:
 //!
-//! - `Owned` (default) — bumps the public `IUnknown` refcount through the
-//!   COM vtable (`AddRef`/`Release` thunks). Used for state-block captures
-//!   that can outlive the live binding.
-//! - `Bound` — bumps the wrapper's device-internal `private_refcount`
-//!   inline (no vtable indirection, no `ApiTimer` instrumentation). Used
-//!   for the per-draw bind hot path (texture stages, bound VB/IB,
-//!   render targets, shader slots, vertex declaration). Keeps a dual
-//!   public/private refcount split: the public `IUnknown` count and a
-//!   device-internal binding count are tracked separately.
+//! - `Bound` serves the per-draw bind slots (texture stages, bound VB/IB,
+//!   render targets, shader slots, vertex declaration).
+//! - `Captured` serves the objects a state block captures or records. It
+//!   also counts the reference toward the object's `Reset` blocker: a
+//!   `D3DPOOL_DEFAULT` object a state block keeps alive is outstanding for
+//!   `Reset` as one the application holds is, while a binding never is.
 
 use core::{ffi::c_void, marker::PhantomData, ptr::null_mut};
 
@@ -38,13 +39,11 @@ use crate::device::{
 
 /// COM types whose vtable starts with the `IUnknown` head.
 ///
-/// Exposes callable `AddRef`/`Release` thunks, plus a device-internal
-/// "bound slot" refcount that swap-by-bind paths use to keep the
-/// object alive across game-side `Release`. Implemented by every
-/// `IDirect3DXxx9` wrapper in this crate.
-pub trait ComUnknown {
-    fn vtbl_add_ref(&self) -> unsafe extern "system" fn(*mut c_void) -> u32;
-    fn vtbl_release(&self) -> unsafe extern "system" fn(*mut c_void) -> u32;
+/// Exposes a device-internal "bound slot" refcount, beside the public one,
+/// that the device's own references (bind slots, state-block captures) use
+/// to keep the object alive across game-side `Release`. Implemented by
+/// every `IDirect3DXxx9` wrapper the device binds.
+pub trait ComUnknown: ComChild {
     /// Increment the device-internal "bound slot" refcount.
     fn private_refcount_inc(&mut self);
     /// Decrement the device-internal "bound slot" refcount.
@@ -79,32 +78,6 @@ pub unsafe trait Ownership {
     unsafe fn on_drop<T: ComUnknown>(p: *mut T);
 }
 
-/// Public-refcount ownership: bumps/decrements via the COM vtable's `AddRef`/`Release` thunks.
-///
-/// The slot participates in the public `IUnknown` refcount the game can
-/// observe via `QueryInterface` etc. Used for state-block captures
-/// (`StateOp::*` variants) that may outlive the live binding.
-pub struct Owned;
-
-// SAFETY: `on_adopt`/`on_drop` only call vtable thunks; correctness
-// relies on the same invariants as direct `(*p).vtbl().add_ref(...)`.
-unsafe impl Ownership for Owned {
-    unsafe fn on_adopt<T: ComUnknown>(p: *mut T) {
-        // SAFETY: caller asserts `p` non-null and points to a live `T`.
-        let f = unsafe { (*p).vtbl_add_ref() };
-        // SAFETY: `f` is the AddRef thunk for the same vtable; passing
-        // `p` as IUnknown `this` matches the D3D9 ABI.
-        unsafe { f(p.cast::<c_void>()) };
-    }
-    unsafe fn on_drop<T: ComUnknown>(p: *mut T) {
-        // SAFETY: caller asserts `p` non-null and points to a live `T`.
-        let f = unsafe { (*p).vtbl_release() };
-        // SAFETY: `f` is the Release thunk for the same vtable; passing
-        // `p` as IUnknown `this` matches the D3D9 ABI.
-        unsafe { f(p.cast::<c_void>()) };
-    }
-}
-
 /// Private-refcount ownership: bumps/decrements the wrapper's `private_refcount` field directly.
 ///
 /// Via [`ComUnknown::private_refcount_inc`] and
@@ -129,6 +102,64 @@ unsafe impl Ownership for Bound {
     }
 }
 
+/// State-block ownership: a [`Bound`] reference that also keeps a `Reset` blocker outstanding.
+///
+/// A `D3DPOOL_DEFAULT` object a state block holds stays alive across
+/// `Reset`, so D3D9 counts it as outstanding even after the application has
+/// released its own reference. The object counts once while either its
+/// public refcount or its state-block references
+/// ([`ComChild::state_block_refs_mut`]) are non-zero; the edges of the
+/// second count are taken here, those of the first in [`com_add_ref`] and
+/// [`com_release`].
+pub struct Captured;
+
+// SAFETY: as for `Bound`, plus a counter update on the live wrapper (and on
+// its live owning device) before the reference that may free it is dropped.
+unsafe impl Ownership for Captured {
+    unsafe fn on_adopt<T: ComUnknown>(p: *mut T) {
+        // SAFETY: caller asserts `p` non-null and points to a live `T`.
+        unsafe { Bound::on_adopt(p) };
+        // SAFETY: as above; the reference just taken keeps it live.
+        unsafe { note_state_block_ref(p, true) };
+    }
+    unsafe fn on_drop<T: ComUnknown>(p: *mut T) {
+        // SAFETY: caller asserts `p` was claimed by `on_adopt`, so it is live
+        // until the `Bound` release below.
+        unsafe { note_state_block_ref(p, false) };
+        // SAFETY: as above; the release may free the wrapper.
+        unsafe { Bound::on_drop(p) };
+    }
+}
+
+/// Count a state-block reference taken (`acquired`) or given back on `p`.
+///
+/// On the count's 0↔1 edge, while the application holds no public
+/// reference, the object starts or stops being a `Reset` blocker.
+///
+/// # Safety
+/// `p` is non-null and points to a live `T`.
+unsafe fn note_state_block_ref<T: ComChild>(p: *mut T, acquired: bool) {
+    // SAFETY: caller asserts `p` points to a live `T`, and the API lock
+    // the entry point holds makes this access exclusive.
+    let obj = unsafe { &mut *p };
+    let unreferenced = *obj.refcount_mut() == 0;
+    let blocks = obj.blocks_reset_while_referenced();
+    let forward = obj.device_forward_target();
+    let Some(refs) = obj.state_block_refs_mut() else {
+        return;
+    };
+    let edge = if acquired {
+        *refs += 1;
+        *refs == 1
+    } else {
+        *refs -= 1;
+        *refs == 0
+    };
+    if edge && unreferenced && blocks {
+        device_wrapper_note_reset_blocker(forward, acquired);
+    }
+}
+
 /// Cached pointer to an external COM object.
 ///
 /// The contained pointer is either null or addresses a `T` we hold one
@@ -136,7 +167,7 @@ unsafe impl Ownership for Bound {
 /// Constructed via [`Self::adopt`] (which bumps the matching refcount);
 /// released via `Drop`. Assignment runs `Drop` on the old value, so the
 /// swap idiom is `field = unsafe { CachedComPtr::adopt(new) };`.
-pub struct CachedComPtr<T: ComUnknown, K: Ownership = Owned>(*mut T, PhantomData<K>);
+pub struct CachedComPtr<T: ComUnknown, K: Ownership>(*mut T, PhantomData<K>);
 
 impl<T: ComUnknown, K: Ownership> CachedComPtr<T, K> {
     /// Null pointer; safe to construct without owning any retain.
@@ -240,6 +271,8 @@ impl<T: ComUnknown, K: Ownership> Drop for CachedComPtr<T, K> {
 /// pin it: the engine takes a reference on whatever it returns and hands it to
 /// the application. A type that pins its device answers unconditionally, since
 /// the device cannot go while this object holds a reference on it.
+/// [`state_block_refs_mut`](Self::state_block_refs_mut) must expose a counter
+/// of this object's own that nothing but the engine changes.
 pub unsafe trait ComChild: Sized {
     /// The wrapper's public `IUnknown` refcount field.
     fn refcount_mut(&mut self) -> &mut u32;
@@ -283,11 +316,22 @@ pub unsafe trait ComChild: Sized {
     /// True for a `D3DPOOL_DEFAULT` resource and for the device's implicit
     /// surfaces: D3D9 rejects `Reset` while the app still holds any of them.
     /// The engine counts such objects on the owning device across their
-    /// public 0↔1 edges (`AddRef` / `Release` / creation), so only
-    /// app-visible references count, never the device's own bind slots.
+    /// public 0↔1 edges (`AddRef` / `Release` / creation) and the edges of
+    /// their state-block references ([`Self::state_block_refs_mut`]), so
+    /// app-visible and state-block references count, never the device's own
+    /// bind slots.
     /// Requires a non-null [`device_forward_target`](Self::device_forward_target).
     fn blocks_reset_while_referenced(&self) -> bool {
         false
+    }
+
+    /// The count of state-block references on this object, for a type that can block `Reset`.
+    ///
+    /// A state block's reference keeps a blocking object outstanding as the
+    /// application's own does, so the engine counts the object as a blocker
+    /// while either count is non-zero. `None` for a type that never blocks.
+    fn state_block_refs_mut(&mut self) -> Option<&mut u32> {
+        None
     }
 
     /// Free the wrapper and all backing allocations.
@@ -412,7 +456,8 @@ pub unsafe fn com_add_ref<T: ComChild>(this: *mut c_void) -> u32 {
         } else {
             null_mut()
         };
-        (rc, forward, obj.blocks_reset_while_referenced())
+        let blocks_reset = obj.blocks_reset_while_referenced() && !held_by_state_block(obj);
+        (rc, forward, blocks_reset)
     };
     // No-op when `forward` is null (object does not forward to the device).
     device_wrapper_add_ref(forward);
@@ -420,6 +465,11 @@ pub unsafe fn com_add_ref<T: ComChild>(this: *mut c_void) -> u32 {
         device_wrapper_note_reset_blocker(forward, true);
     }
     rc
+}
+
+/// Whether a state block holds `obj`, which keeps it a `Reset` blocker on its own.
+fn held_by_state_block<T: ComChild>(obj: &mut T) -> bool {
+    obj.state_block_refs_mut().is_some_and(|refs| *refs != 0)
 }
 
 /// Register a freshly created [`ComChild`] with its owning device.
@@ -469,12 +519,8 @@ pub unsafe fn com_release<T: ComChild>(this: *mut c_void) -> u32 {
         // any finalize frees the wrapper.
         let forward = obj.device_forward_target();
         let finalize_now = obj.finalizes_on_zero() && obj.private_refcount() == 0;
-        (
-            rc,
-            forward,
-            finalize_now,
-            obj.blocks_reset_while_referenced(),
-        )
+        let blocks_reset = obj.blocks_reset_while_referenced() && !held_by_state_block(obj);
+        (rc, forward, finalize_now, blocks_reset)
     };
     if finalize_now {
         // SAFETY: both counters are zero (`finalizes_on_zero()` true and

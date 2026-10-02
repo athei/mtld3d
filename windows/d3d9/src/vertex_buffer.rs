@@ -107,6 +107,12 @@ pub struct VertexBufferInner {
     ///
     /// Non-fatal mismatches are logged once via `log_once_warn!`.
     locked: bool,
+    /// References state blocks hold on this vertex buffer.
+    ///
+    /// A `D3DPOOL_DEFAULT` vertex buffer a state block keeps alive is a `Reset`
+    /// blocker until this and the public refcount are both zero
+    /// (`ComChild::state_block_refs_mut`).
+    state_block_refs: u32,
     /// App-set managed-resource priority, round-tripped by `GetPriority` / `SetPriority`.
     ///
     /// D3D9 only honours priority for `D3DPOOL_MANAGED` buffers (it drives
@@ -331,6 +337,7 @@ impl Direct3DVertexBuffer9 {
             backing,
             last_submit_seq: 0,
             locked: false,
+            state_block_refs: 0,
             priority: 0,
         }));
         Self {
@@ -461,12 +468,6 @@ unsafe fn finalize_vertex_buffer(this: *mut Direct3DVertexBuffer9) {
 }
 
 impl ComUnknown for Direct3DVertexBuffer9 {
-    fn vtbl_add_ref(&self) -> unsafe extern "system" fn(*mut c_void) -> u32 {
-        self.vtbl().add_ref
-    }
-    fn vtbl_release(&self) -> unsafe extern "system" fn(*mut c_void) -> u32 {
-        self.vtbl().release
-    }
     fn private_refcount_inc(&mut self) {
         self.private_refcount += 1;
     }
@@ -491,6 +492,9 @@ unsafe impl crate::com_ref::ComChild for Direct3DVertexBuffer9 {
     }
     fn blocks_reset_while_referenced(&self) -> bool {
         self.inner().pool == mtld3d_types::D3DPOOL_DEFAULT
+    }
+    fn state_block_refs_mut(&mut self) -> Option<&mut u32> {
+        Some(&mut self.inner_mut().state_block_refs)
     }
     fn private_refcount(&self) -> u32 {
         self.private_refcount

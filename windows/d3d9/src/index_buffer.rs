@@ -85,6 +85,12 @@ pub struct IndexBufferInner {
     backing: BufferBacking,
     last_submit_seq: u64,
     locked: bool,
+    /// References state blocks hold on this index buffer.
+    ///
+    /// A `D3DPOOL_DEFAULT` index buffer a state block keeps alive is a `Reset`
+    /// blocker until this and the public refcount are both zero
+    /// (`ComChild::state_block_refs_mut`).
+    state_block_refs: u32,
 }
 
 impl IndexBufferInner {
@@ -246,6 +252,7 @@ impl Direct3DIndexBuffer9 {
             backing,
             last_submit_seq: 0,
             locked: false,
+            state_block_refs: 0,
         }));
         Self {
             vtbl: &raw const DIRECT3D_INDEX_BUFFER9_VTBL,
@@ -369,12 +376,6 @@ unsafe fn finalize_index_buffer(this: *mut Direct3DIndexBuffer9) {
 }
 
 impl ComUnknown for Direct3DIndexBuffer9 {
-    fn vtbl_add_ref(&self) -> unsafe extern "system" fn(*mut c_void) -> u32 {
-        self.vtbl().add_ref
-    }
-    fn vtbl_release(&self) -> unsafe extern "system" fn(*mut c_void) -> u32 {
-        self.vtbl().release
-    }
     fn private_refcount_inc(&mut self) {
         self.private_refcount += 1;
     }
@@ -399,6 +400,9 @@ unsafe impl crate::com_ref::ComChild for Direct3DIndexBuffer9 {
     }
     fn blocks_reset_while_referenced(&self) -> bool {
         self.inner().pool == mtld3d_types::D3DPOOL_DEFAULT
+    }
+    fn state_block_refs_mut(&mut self) -> Option<&mut u32> {
+        Some(&mut self.inner_mut().state_block_refs)
     }
     fn private_refcount(&self) -> u32 {
         self.private_refcount

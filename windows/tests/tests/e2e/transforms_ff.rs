@@ -6,7 +6,7 @@ use mtld3d_tests::{
 };
 use mtld3d_types::{
     D3DCMP_GREATER, D3DCOLORVALUE, D3DCULL_NONE, D3DFMT_A8R8G8B8, D3DFVF_DIFFUSE,
-    D3DFVF_LASTBETA_UBYTE4, D3DFVF_NORMAL, D3DFVF_SPECULAR, D3DFVF_XYZ, D3DFVF_XYZB2,
+    D3DFVF_LASTBETA_UBYTE4, D3DFVF_NORMAL, D3DFVF_SPECULAR, D3DFVF_XYZ, D3DFVF_XYZB1, D3DFVF_XYZB2,
     D3DLIGHT_DIRECTIONAL, D3DLIGHT_POINT, D3DLIGHT_SPOT, D3DLIGHT9, D3DMATERIAL9, D3DMCS_MATERIAL,
     D3DPOOL_MANAGED, D3DPT_TRIANGLELIST, D3DPT_TRIANGLESTRIP, D3DRS_ALPHAFUNC, D3DRS_ALPHAREF,
     D3DRS_ALPHATESTENABLE, D3DRS_AMBIENT, D3DRS_AMBIENTMATERIALSOURCE, D3DRS_CULLMODE,
@@ -1613,11 +1613,79 @@ fn light_type_change_between_draws_of_one_frame_reaches_the_later_draws() {
     );
 }
 
+/// Position, one blend weight and a diffuse colour, for `D3DFVF_XYZB1 | D3DFVF_DIFFUSE`.
+#[repr(C)]
+struct SequentialBlendVertex {
+    position: [f32; 3],
+    weight: f32,
+    color: u32,
+}
+
+/// Vertex blending reads a world matrix the title never set as identity.
+///
+/// Only `D3DTS_WORLD` is written, and it moves everything far off screen,
+/// so a quad lands at the origin only through the identity D3D9 defines for
+/// every other `D3DTS_WORLDMATRIX(i)`. Sequential `D3DVBF_1WEIGHTS` blending
+/// with the whole weight on the implicit second matrix reads matrix 1;
+/// indexed blending with the whole weight on bone 5 reads matrix 5.
+#[test]
+fn vertex_blending_reads_unset_world_matrices_as_identity() {
+    let h = Harness::new();
+    assert_eq!(h.set_render_state(D3DRS_LIGHTING, 0), 0);
+    assert_eq!(h.set_render_state(D3DRS_CULLMODE, D3DCULL_NONE), 0);
+    for state in [D3DTS_VIEW, D3DTS_PROJECTION] {
+        assert_eq!(h.set_transform(state, &IDENTITY), 0);
+    }
+    assert_eq!(h.set_transform(D3DTS_WORLD, &translate_x(10.0)), 0);
+    assert_eq!(h.set_render_state(D3DRS_VERTEXBLEND, D3DVBF_1WEIGHTS), 0);
+    assert_eq!(h.set_fvf(D3DFVF_XYZB1 | D3DFVF_DIFFUSE), 0);
+    h.select_diffuse_stage(0);
+
+    let sequential = [(-0.25, 0.25), (-0.25, -0.25), (0.25, 0.25), (0.25, -0.25)].map(|(x, y)| {
+        SequentialBlendVertex {
+            position: [x, y, 0.5],
+            weight: 0.0,
+            color: BLEND_RED,
+        }
+    });
+    h.render_once(BLUE, |d| {
+        assert_eq!(
+            d.draw_primitive_up(D3DPT_TRIANGLESTRIP, 2, &sequential),
+            0,
+            "sequential draw"
+        );
+    });
+    assert_eq!(
+        h.read_pixel(320, 240),
+        BLEND_RED,
+        "sequential blending: the unset matrix 1 is identity"
+    );
+
+    assert_eq!(h.set_render_state(D3DRS_INDEXEDVERTEXBLENDENABLE, 1), 0);
+    assert_eq!(
+        h.set_fvf(D3DFVF_XYZB2 | D3DFVF_LASTBETA_UBYTE4 | D3DFVF_DIFFUSE),
+        0
+    );
+    let indexed = indexed_quad(5);
+    h.render_once(BLUE, |d| {
+        assert_eq!(
+            d.draw_primitive_up(D3DPT_TRIANGLESTRIP, 2, &indexed),
+            0,
+            "indexed draw"
+        );
+    });
+    assert_eq!(
+        h.read_pixel(320, 240),
+        BLEND_RED,
+        "indexed blending: the unset matrix 5 is identity"
+    );
+}
+
 #[test]
 fn palette_growth_between_draws_of_one_frame_reaches_the_second_draw() {
-    // Raising the world-palette high-water mark between draws widens the FF
-    // VS constant block a blended draw binds, so the draw after it must carry
-    // the larger row count to reach the new matrix.
+    // A world matrix written between two draws of one frame is uploaded
+    // before the blended draw after it, which reads it rather than the
+    // identity the first draw saw in that slot.
     let h = Harness::new();
     assert_eq!(h.set_render_state(D3DRS_LIGHTING, 0), 0);
     assert_eq!(h.set_render_state(D3DRS_CULLMODE, D3DCULL_NONE), 0);

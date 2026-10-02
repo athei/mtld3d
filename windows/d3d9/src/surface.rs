@@ -1770,12 +1770,6 @@ pub unsafe fn set_cached_surface_device(ptr: u64, device_inner: *mut DeviceInner
 }
 
 impl ComUnknown for Direct3DSurface9 {
-    fn vtbl_add_ref(&self) -> unsafe extern "system" fn(*mut c_void) -> u32 {
-        self.vtbl().add_ref
-    }
-    fn vtbl_release(&self) -> unsafe extern "system" fn(*mut c_void) -> u32 {
-        self.vtbl().release
-    }
     fn private_refcount_inc(&mut self) {
         self.private_refcount += 1;
         // A sub-surface's private count pins its container too. `bound_rt` holds

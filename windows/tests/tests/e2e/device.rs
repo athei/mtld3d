@@ -14,10 +14,10 @@ use std::{
 
 use mtld3d_core::display_mode::MAX_SERVED_SIZES;
 use mtld3d_tests::{
-    Harness, HarnessConfig, TexturedVertex, WM_ACTIVATEAPP, WS_CAPTION, WS_EX_TOPMOST, WS_POPUP,
-    WS_VISIBLE, WindowStyle, assert_pixel_eq, config_var, create_window, cursor_is_live,
-    cursor_mask_bits, destroy_window, enumerate_display_sizes, run_child, spawn_scoped,
-    window_rect,
+    Harness, HarnessConfig, StateBlock, Texture, TexturedVertex, WM_ACTIVATEAPP, WS_CAPTION,
+    WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE, WindowStyle, assert_pixel_eq, config_var, create_window,
+    cursor_is_live, cursor_mask_bits, destroy_window, enumerate_display_sizes, run_child,
+    spawn_scoped, window_rect,
 };
 use mtld3d_types::{
     D3D_OK, D3DCLEAR_TARGET, D3DCREATE_HARDWARE_VERTEXPROCESSING, D3DCREATE_NOWINDOWCHANGES,
@@ -31,7 +31,7 @@ use mtld3d_types::{
     D3DPRESENT_INTERVAL_FOUR, D3DPRESENT_INTERVAL_IMMEDIATE, D3DPRESENT_INTERVAL_ONE,
     D3DPRESENT_INTERVAL_THREE, D3DPRESENT_INTERVAL_TWO, D3DPRESENT_PARAMETERS, D3DPT_TRIANGLELIST,
     D3DRS_COLORWRITEENABLE, D3DRS_FILLMODE, D3DRS_LIGHTING, D3DRTYPE_CUBETEXTURE, D3DRTYPE_SURFACE,
-    D3DRTYPE_TEXTURE, D3DRTYPE_VOLUME, D3DRTYPE_VOLUMETEXTURE, D3DSWAPEFFECT_DISCARD,
+    D3DRTYPE_TEXTURE, D3DRTYPE_VOLUME, D3DRTYPE_VOLUMETEXTURE, D3DSBT_ALL, D3DSWAPEFFECT_DISCARD,
     D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_DYNAMIC, D3DUSAGE_QUERY_FILTER,
     D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING, D3DUSAGE_QUERY_SRGBREAD, D3DUSAGE_QUERY_SRGBWRITE,
     D3DUSAGE_QUERY_VERTEXTEXTURE, D3DUSAGE_QUERY_WRAPANDMIP, D3DUSAGE_RENDERTARGET, D3DVIEWPORT9,
@@ -1033,6 +1033,152 @@ fn reset_rejects_outstanding_default_pool_resources() {
     );
     drop(managed);
     drop(sysmem);
+}
+
+/// An open `BeginStateBlock` recording never blocks `Reset`, and `Reset` ends it.
+///
+/// A Reset with well-formed parameters drops the recording before it looks
+/// for outstanding references, so a `D3DPOOL_DEFAULT` buffer recorded into it
+/// and then released by the application is gone by the time it looks, and
+/// even a Reset an application reference rejects leaves no recording open:
+/// the next `BeginStateBlock` starts a new one.
+#[test]
+fn reset_ends_an_open_recording_and_is_not_blocked_by_it() {
+    let h = Harness::new();
+    let vb = h.create_vertex_buffer(64, 0, D3DFVF_XYZ, D3DPOOL_DEFAULT);
+    assert_eq!(h.begin_state_block(), D3D_OK, "BeginStateBlock");
+    assert_eq!(
+        h.set_stream_source(0, &vb, 0, 12),
+        D3D_OK,
+        "SetStreamSource while recording"
+    );
+    drop(vb);
+    assert_eq!(
+        h.reset(640, 480),
+        D3D_OK,
+        "a released DEFAULT-pool buffer an open recording holds does not block Reset"
+    );
+    assert_eq!(
+        h.begin_state_block(),
+        D3D_OK,
+        "the Reset ended the open recording"
+    );
+    drop(h.end_state_block());
+
+    let held = h.create_vertex_buffer(64, 0, D3DFVF_XYZ, D3DPOOL_DEFAULT);
+    assert_eq!(h.begin_state_block(), D3D_OK, "BeginStateBlock");
+    assert_eq!(
+        h.reset(640, 480),
+        D3DERR_INVALIDCALL,
+        "a DEFAULT-pool buffer the application holds blocks Reset"
+    );
+    assert_eq!(
+        h.begin_state_block(),
+        D3D_OK,
+        "the rejected Reset still ended the open recording"
+    );
+    drop(h.end_state_block());
+    drop(held);
+    assert_eq!(h.reset(640, 480), D3D_OK, "Reset succeeds once released");
+}
+
+/// A state block that holds a `D3DPOOL_DEFAULT` resource keeps `Reset` rejected.
+///
+/// A `D3DSBT_ALL` block captures the bound buffer or texture and keeps it
+/// alive after the device unbinds it and the application releases its own
+/// reference, so the resource is still outstanding: `Reset` fails while the
+/// block lives and succeeds once the block is released. The device's own
+/// binding is not what blocks, since it is gone before the `Reset`.
+#[test]
+fn reset_is_rejected_while_a_state_block_holds_a_default_pool_resource() {
+    let h = Harness::new();
+    for what in ["vertex buffer", "texture"] {
+        let block = if what == "vertex buffer" {
+            let vb = h.create_vertex_buffer(64, 0, D3DFVF_XYZ, D3DPOOL_DEFAULT);
+            assert_eq!(
+                h.set_stream_source(0, &vb, 0, 12),
+                D3D_OK,
+                "SetStreamSource"
+            );
+            let block = h.create_state_block(D3DSBT_ALL);
+            assert_eq!(
+                h.set_stream_source_null(0, 0, 0),
+                D3D_OK,
+                "unbind the stream"
+            );
+            block
+        } else {
+            let tex = h.create_texture(16, 16, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT);
+            assert_eq!(h.set_texture(0, &tex), D3D_OK, "SetTexture");
+            let block = h.create_state_block(D3DSBT_ALL);
+            assert_eq!(h.clear_texture(0), D3D_OK, "unbind the texture");
+            block
+        };
+        assert_eq!(
+            h.reset(640, 480),
+            D3DERR_INVALIDCALL,
+            "a {what} only a state block holds still blocks Reset"
+        );
+        drop(block);
+        assert_eq!(
+            h.reset(640, 480),
+            D3D_OK,
+            "Reset succeeds once the block holding the {what} is released"
+        );
+    }
+}
+
+/// A state block holding a released, unbound `D3DPOOL_DEFAULT` texture.
+fn block_holding_a_released_texture(h: &Harness) -> StateBlock<'_> {
+    let tex = h.create_texture(16, 16, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT);
+    assert_eq!(h.set_texture(0, &tex), D3D_OK, "SetTexture");
+    let block = h.create_state_block(D3DSBT_ALL);
+    assert_eq!(h.clear_texture(0), D3D_OK, "unbind the texture");
+    block
+}
+
+/// A public reference to a texture a state block holds leaves it outstanding for `Reset` once.
+///
+/// The texture counts as outstanding while the application or a state block
+/// holds it, whichever let go last. A `GetTexture` reference taken and given
+/// back while the block holds it leaves the block's hold alone, so `Reset`
+/// stays rejected until the block is released. One that outlives the block
+/// keeps `Reset` rejected after the block is gone, and releasing it is what
+/// lets `Reset` through: neither hand-over leaves the texture counted twice
+/// or not at all.
+#[test]
+fn reset_counts_a_held_texture_once_across_public_references() {
+    let h = Harness::new();
+    let block = block_holding_a_released_texture(&h);
+    assert_eq!(block.apply(), D3D_OK, "Apply binds the held texture");
+    drop(Texture::from_raw(h.texture_raw(0)));
+    assert_eq!(
+        h.reset(640, 480),
+        D3DERR_INVALIDCALL,
+        "a GetTexture reference given back leaves the block's hold in place"
+    );
+    drop(block);
+    assert_eq!(
+        h.reset(640, 480),
+        D3D_OK,
+        "Reset succeeds once the block is released"
+    );
+
+    let block = block_holding_a_released_texture(&h);
+    assert_eq!(block.apply(), D3D_OK, "Apply binds the held texture");
+    let held = Texture::from_raw(h.texture_raw(0));
+    drop(block);
+    assert_eq!(
+        h.reset(640, 480),
+        D3DERR_INVALIDCALL,
+        "the application's GetTexture reference outlives the block and blocks Reset"
+    );
+    drop(held);
+    assert_eq!(
+        h.reset(640, 480),
+        D3D_OK,
+        "Reset succeeds once the application releases the texture"
+    );
 }
 
 #[test]

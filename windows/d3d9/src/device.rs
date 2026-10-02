@@ -622,10 +622,11 @@ pub struct DeviceInner {
     /// In-progress `BeginStateBlock` recording.
     ///
     /// `Some(..)` between a successful `BeginStateBlock` and its matching
-    /// `EndStateBlock`. While set, every state-change COM setter diverts its
-    /// write into the block instead of the live device — spec-correct replay
-    /// semantics for `Apply()` on the resulting state block. Null-safe to read
-    /// via `recording_state_block()`; mutating through
+    /// `EndStateBlock`, or a `Reset` that ends it first. While set, every
+    /// state-change COM setter diverts its write into the block instead of
+    /// the live device: spec-correct replay semantics for `Apply()` on the
+    /// resulting state block. Null-safe to read via
+    /// `recording_state_block()`; mutating through
     /// `recording_state_block_mut()` is how each setter records its op.
     recording_state_block: Option<Box<RecordingStateBlock>>,
     /// The pacing this device has handed to its layer.
@@ -1389,11 +1390,11 @@ impl DeviceInner {
     /// Dirty bits for a transform or light write to the fixed-function state.
     ///
     /// The write always changes the FF VS constants. It changes the FF VS
-    /// source only when `source_moved`: the thunk compares
-    /// [`FfState::vs_source_transform_inputs`] or
-    /// [`FfState::vs_source_light_inputs`] across the write, since a matrix or
-    /// a light's parameters alone never reach the key, while palette growth, a
-    /// light enable or a light type change can. The result then goes through
+    /// source only when `source_moved`: a transform write never does, since
+    /// a matrix reaches neither the key nor the row count, and a light thunk
+    /// compares [`FfState::vs_source_light_inputs`] across the write, since a
+    /// light's parameters alone never reach the key while a light enable or a
+    /// light type change can. The result then goes through
     /// [`Self::ff_aware_mask`].
     fn ff_vs_write_mask(&self, source_moved: bool) -> SnapshotDirty {
         let mut mask = SnapshotDirty::VS_CONST;
@@ -2564,10 +2565,6 @@ impl DeviceInner {
         self.flags.remove(DeviceFlags::IN_SCENE);
         // Scissor defaults to the full target, like the viewport reseed below.
         self.scissor_rect = [0, 0, self.backbuffer_width, self.backbuffer_height];
-
-        // Drop any in-flight state-block recording; per spec, Reset
-        // invalidates an open Begin/EndStateBlock pair.
-        self.recording_state_block = None;
 
         // Viewport reseed mirrors `set_viewport` — push the op so the
         // encoder's pass-state picks up the default before the first
@@ -3796,7 +3793,11 @@ extern "system" fn device_release(this: *mut c_void) -> u32 {
         // realize one of them again.
         device_inner.cursor_mut().destroy_handles();
 
-        // Release bound surfaces + buffers + textures (if any) before teardown.
+        // Release bound surfaces + buffers + textures (if any) before teardown,
+        // and the objects an open `BeginStateBlock` recording holds: a
+        // device-internal reference can be the last one on its object, whose
+        // finalization still reaches this device.
+        device_inner.recording_state_block = None;
         device_inner.bound_rt_mut().teardown();
         device_inner.bound_buffers_mut().teardown();
         device_inner.stage_bindings_mut().teardown();
@@ -4301,10 +4302,17 @@ extern "system" fn device_reset(this: *mut c_void, present_params: *mut c_void) 
         dev.flags.insert(DeviceFlags::NOT_RESET);
         return D3DERR_INVALIDCALL;
     }
+    // A Reset with well-formed parameters ends an open `BeginStateBlock`
+    // recording whether or not it goes on to succeed, before it looks for
+    // outstanding references: the recording dies with the state it was
+    // recording against.
+    dev.recording_state_block = None;
     // Reset rejects any outstanding app reference to a `D3DPOOL_DEFAULT`
     // resource or an implicit surface: those are backed by the device memory
-    // the Reset recreates, and D3D9 makes the app release them first. The
-    // device's own bindings do not count (they are reset below on success).
+    // the Reset recreates, and D3D9 makes the app release them first. A state
+    // block that holds such a resource keeps it outstanding too, since the
+    // resource lives as long as the block; the device's bindings do not count
+    // (they are reset below on success).
     let blockers = dev.outstanding_reset_blockers.load(Ordering::Acquire);
     if blockers != 0 {
         warn!(
@@ -9241,10 +9249,9 @@ extern "system" fn device_set_transform(
         return D3D_OK;
     }
     // Unknown D3DTS_* indices (vertex blending etc.) are silently accepted.
-    let inputs = dev.ff_state().vs_source_transform_inputs();
     dev.ff_state_mut().set_transform(state, &m);
-    let mask = dev.ff_vs_write_mask(dev.ff_state().vs_source_transform_inputs() != inputs)
-        | dev.transform_write_side_dirty(state);
+    // A matrix feeds the FF VS constants only, never its key or row count.
+    let mask = dev.ff_vs_write_mask(false) | dev.transform_write_side_dirty(state);
     dev.mark_snapshot_dirty(mask);
     0 // S_OK
 }
@@ -9295,10 +9302,9 @@ extern "system" fn device_multiply_transform(
     // EndStateBlock returns the multiplied matrix, and a later Capture/Apply
     // does not restore it). So
     // always apply to live FF state, regardless of recording.
-    let inputs = dev.ff_state().vs_source_transform_inputs();
     dev.ff_state_mut().multiply_transform(state, &rhs);
-    let mask = dev.ff_vs_write_mask(dev.ff_state().vs_source_transform_inputs() != inputs)
-        | dev.transform_write_side_dirty(state);
+    // A matrix feeds the FF VS constants only, never its key or row count.
+    let mask = dev.ff_vs_write_mask(false) | dev.transform_write_side_dirty(state);
     dev.mark_snapshot_dirty(mask);
     0 // S_OK
 }
@@ -9754,8 +9760,8 @@ extern "system" fn device_set_texture(this: *mut c_void, stage: u32, texture: *m
 
     if let Some(rec) = dev.recording_state_block_mut() {
         // SAFETY: `new_tex` is null or a *mut Direct3DTexture9 supplied by
-        // the calling game via SetTexture; its AddRef/Release thunks are
-        // valid for the lifetime of the recording.
+        // the calling game via SetTexture, which the reference taken here
+        // keeps alive for the lifetime of the recording.
         let tex = unsafe { CachedComPtr::adopt(new_tex) };
         rec.record(StateOp::Texture { stage, tex });
         return D3D_OK;
