@@ -1756,7 +1756,7 @@ extern "system" fn d3d9_create_device(
     // SAFETY: `inner_ptr` was just derived from a live `DeviceInner` we
     // own via `dev`; the borrow is local to this expression and `dev`
     // outlives it.
-    unsafe { (*inner_ptr).cursor_mut().install_subclass(inner_ptr) };
+    unsafe { (*inner_ptr).cursor().install_subclass(inner_ptr) };
 
     let dev_ptr = Box::into_raw(Box::new(dev));
     // Stamp the wrapper pointer so resource `GetDevice` thunks can hand it back

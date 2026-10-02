@@ -16,7 +16,8 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use mtld3d_tests::{
-    Harness, HarnessConfig, SharedDevice, SharedQuery, assert_pixel_eq, spawn_scoped,
+    HARNESS_PROBE_REPLY, Harness, HarnessConfig, SharedDevice, SharedQuery, WM_HARNESS_PROBE,
+    assert_pixel_eq, harness_window_proc, send_message, spawn_scoped, window_proc,
 };
 use mtld3d_types::{
     D3DCREATE_HARDWARE_VERTEXPROCESSING, D3DCREATE_MULTITHREADED, D3DGETDATA_FLUSH, D3DISSUE_BEGIN,
@@ -304,4 +305,98 @@ fn two_scaled_devices_on_two_threads_read_back_their_own_pixels() {
             );
         }
     });
+}
+
+/// Send the window the messages the subclass acts on, then check its own procedure still answers.
+///
+/// `WM_SETCURSOR` over the client area with no D3D cursor set and `WM_SIZE`
+/// at the window's own client size both run through the subclass and on to
+/// the procedure it forwards to; the probe is answered by the harness
+/// window's procedure alone.
+fn window_still_reaches_its_procedure(hwnd: usize, when: &str) {
+    const WM_SIZE: u32 = 0x0005;
+    const WM_SETCURSOR: u32 = 0x0020;
+    const WM_MOUSEMOVE: isize = 0x0200;
+    const HTCLIENT: isize = 1;
+    // 480 rows in the high word, 640 columns in the low one.
+    const CLIENT_SIZE: isize = (0x01E0 << 16) | 0x0280;
+
+    let _ = send_message(hwnd, WM_SETCURSOR, hwnd, (WM_MOUSEMOVE << 16) | HTCLIENT);
+    let _ = send_message(hwnd, WM_SIZE, 0, CLIENT_SIZE);
+    assert_eq!(
+        send_message(hwnd, WM_HARNESS_PROBE, 0, 0),
+        HARNESS_PROBE_REPLY,
+        "{when}: the window's own procedure receives its messages"
+    );
+}
+
+/// Two devices on one window share its subclass, and the last one out restores its procedure.
+///
+/// D3D9 allows several devices on one window. Only the first one hooks the
+/// window procedure: a second hook would take the first for the procedure it
+/// wraps and forward every message to itself until the stack ran out. With
+/// both devices alive a cursor and a resize message reach the window's own
+/// procedure, the device left behind after either release keeps receiving
+/// them, and once both are gone the window runs its own procedure again, in
+/// either release order.
+#[test]
+fn two_devices_on_one_window_share_its_subclass_in_either_release_order() {
+    for first_released_first in [true, false] {
+        let order = if first_released_first {
+            "first device released first"
+        } else {
+            "second device released first"
+        };
+        let first = Harness::new();
+        let hwnd = first.hwnd();
+        let second = Harness::create(&HarnessConfig {
+            device_window: hwnd,
+            ..HarnessConfig::default()
+        });
+        assert_ne!(
+            window_proc(hwnd),
+            harness_window_proc(),
+            "{order}: the window is subclassed while a device lives"
+        );
+        window_still_reaches_its_procedure(hwnd, &format!("{order}, both devices alive"));
+
+        if first_released_first {
+            assert_eq!(
+                first.release_device(),
+                0,
+                "the first device is fully released"
+            );
+            window_still_reaches_its_procedure(hwnd, &format!("{order}, second device left"));
+            assert_eq!(
+                second.release_device(),
+                0,
+                "the second device is fully released"
+            );
+        } else {
+            assert_eq!(
+                second.release_device(),
+                0,
+                "the second device is fully released"
+            );
+            window_still_reaches_its_procedure(hwnd, &format!("{order}, first device left"));
+            assert_eq!(
+                first.release_device(),
+                0,
+                "the first device is fully released"
+            );
+        }
+        assert_eq!(
+            window_proc(hwnd),
+            harness_window_proc(),
+            "{order}: the window runs its own procedure once no device is left"
+        );
+        assert_eq!(
+            send_message(hwnd, WM_HARNESS_PROBE, 0, 0),
+            HARNESS_PROBE_REPLY,
+            "{order}: the window's own procedure answers once no device is left"
+        );
+        // The window outlives both devices; the harness that created it destroys it.
+        drop(second);
+        drop(first);
+    }
 }

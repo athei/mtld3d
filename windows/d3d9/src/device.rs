@@ -3889,9 +3889,11 @@ extern "system" fn device_release(this: *mut c_void) -> u32 {
         // it sees any other window change.
         device_inner.leave_fullscreen();
 
-        // Restore the game's original window proc *before* freeing DeviceInner;
-        // the subclass's global back-pointer becomes dangling once we drop.
-        device_inner.cursor().uninstall_subclass();
+        // Leave the window's subclass *before* freeing DeviceInner; the
+        // registry's back-pointer becomes dangling once we drop. The game's
+        // procedure comes back with the last device on the window.
+        let device_ptr = std::ptr::from_mut::<DeviceInner>(&mut device_inner);
+        device_inner.cursor().uninstall_subclass(device_ptr);
         // The HCURSORs the device built die with it, now that no message can
         // realize one of them again.
         device_inner.cursor_mut().destroy_handles();
