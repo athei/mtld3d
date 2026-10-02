@@ -106,7 +106,7 @@ fn frames() -> Vec<String> {
 ///
 /// That is blend, atest, `zwrite_off`, `cull_none`, cmask0, then the switches
 /// vs, ps, tex, blend, atest, cull, then the distinct vs, ps, tex.
-const fn mix(values: [u32; 14]) -> StateMix {
+const fn mix(values: [u32; STATE_KEYS.len()]) -> StateMix {
     StateMix::from_values(values)
 }
 
@@ -439,18 +439,18 @@ fn a_draw_line_carrying_every_field_parses() {
 #[test]
 fn a_draw_line_lacking_a_field_is_an_error_and_other_events_are_no_draw() {
     for (key, broken) in [
-        (" alpha=[", WOW_FF_DRAW.replace(" alpha=[1,7,1]", "")),
-        (" cw=[", WOW_FF_DRAW.replace(" cw=[", " colour=[")),
-        (" cull=<n>", WOW_FF_DRAW.replace("cull=2", "cull=back")),
-        (" tex=[", WOW_FF_DRAW.replace(" tex=[", " textures=[")),
+        ("alpha=[", WOW_FF_DRAW.replace(" alpha=[1,7,1]", "")),
+        ("cw=[", WOW_FF_DRAW.replace(" cw=[", " colour=[")),
+        ("cull=<n>", WOW_FF_DRAW.replace("cull=2", "cull=back")),
+        ("tex=[", WOW_FF_DRAW.replace(" tex=[", " textures=[")),
     ] {
         let reason = Draw::parse(&broken).err().unwrap();
-        assert!(reason.contains(&format!("no {key}")), "{reason}");
+        assert!(reason.contains(&format!(": no {key}")), "{reason}");
     }
     let reason = Draw::parse(&WOW_FF_DRAW.replace("z=[1,0,4]", "z=[1]"))
         .err()
         .unwrap();
-    assert!(reason.contains(" z=[...] has no number at 1"), "{reason}");
+    assert!(reason.contains(": z=[...] has no number at 1"), "{reason}");
     assert!(
         Draw::parse("draw 3 psc: c66=[0.0, 0.0, 0.0, 0.0]")
             .unwrap()
@@ -588,7 +588,7 @@ fn switches_and_distinct_counts_follow_the_draw_order_of_the_pass() {
 }
 
 /// A shape line that declares a state mix, the keys in [`STATE_KEYS`] order.
-fn with_state(base: &str, values: [u32; 14]) -> String {
+fn with_state(base: &str, values: [u32; STATE_KEYS.len()]) -> String {
     let mut line = base.to_owned();
     for (key, value) in STATE_KEYS.iter().zip(values) {
         let _ = write!(line, " {key}={value}");
@@ -643,7 +643,7 @@ fn a_bench_without_the_state_keys_is_not_reported_and_not_judged() {
 fn a_bench_that_reports_the_state_mix_is_judged_on_it() {
     let game = parse_game_log(&log(&frames(), 1)).unwrap();
     let base = matching_bench();
-    let reported = |values: [[u32; 14]; 3]| {
+    let reported = |values: [[u32; STATE_KEYS.len()]; 3]| {
         base.iter()
             .zip(values)
             .map(|(line, values)| with_state(line, values))
@@ -679,7 +679,7 @@ fn a_bench_that_reports_the_state_mix_is_judged_on_it() {
 
 #[test]
 fn state_shares_pass_at_ten_points_and_counts_at_fifteen_percent_or_five() {
-    let judged = |game_values: [u32; 14], bench_values: [u32; 14]| {
+    let judged = |game_values: [u32; STATE_KEYS.len()], bench_values: [u32; STATE_KEYS.len()]| {
         let game = pass(
             SHADOW,
             "d",
@@ -698,7 +698,7 @@ fn state_shares_pass_at_ten_points_and_counts_at_fifteen_percent_or_five() {
         flags(Some(&game), Some(&bench))
     };
     let with = |slot: usize, value: u32| {
-        let mut values = [0; 14];
+        let mut values = [0; STATE_KEYS.len()];
         values[slot] = value;
         values
     };
@@ -717,4 +717,41 @@ fn state_shares_pass_at_ten_points_and_counts_at_fifteen_percent_or_five() {
     assert!(judged(with(7, 0), with(7, 5)).is_empty());
     assert_eq!(judged(with(7, 10), with(7, 16)), ["tex_sw"]);
     assert_eq!(judged(with(7, 0), with(7, 6)), ["tex_sw"]);
+}
+
+#[test]
+fn a_shape_line_that_repeats_a_key_is_an_error() {
+    let values = [0; STATE_KEYS.len()];
+    for (line, key) in [
+        (
+            "pass 0 8x8 draws=1 ff_vs=0 ff_ps=0 tex_per_draw=1 draws=2".to_owned(),
+            "draws",
+        ),
+        (
+            with_state("pass 0 8x8 draws=1 ff_vs=0 ff_ps=0 tex_per_draw=1", values) + " vs_sw=3",
+            "vs_sw",
+        ),
+    ] {
+        let reason = parse_bench(&[line], None).unwrap_err();
+        assert!(reason.contains(&format!(": repeats {key}=")), "{reason}");
+    }
+}
+
+#[test]
+fn a_share_count_over_the_pass_draws_is_an_error() {
+    let base = "pass 0 8x8 draws=10 ff_vs=0 ff_ps=0 tex_per_draw=1";
+    let mut values = [0; STATE_KEYS.len()];
+    // Every draw counted is the most a share may count; switch counts are not shares.
+    values[..STATE_SHARES].fill(10);
+    values[STATE_SHARES] = 11;
+    assert!(parse_bench(&[with_state(base, values)], None).is_ok());
+    for (slot, key) in STATE_KEYS[..STATE_SHARES].iter().enumerate() {
+        let mut over = values;
+        over[slot] = 11;
+        let reason = parse_bench(&[with_state(base, over)], None).unwrap_err();
+        assert!(
+            reason.contains(&format!(": {key}=11 counts more draws than the pass's 10")),
+            "{reason}"
+        );
+    }
 }

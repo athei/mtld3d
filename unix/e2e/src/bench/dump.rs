@@ -92,6 +92,21 @@ const STATE_SHARES: usize = 5;
 /// The keys every `shape` line carries.
 const BASE_KEYS: [&str; 4] = ["draws", "ff_vs", "ff_ps", "tex_per_draw"];
 
+/// Every key a `shape` line may carry: [`BASE_KEYS`], then [`STATE_KEYS`].
+const SHAPE_KEYS: [&str; BASE_KEYS.len() + STATE_KEYS.len()] = {
+    let mut keys = [""; BASE_KEYS.len() + STATE_KEYS.len()];
+    let mut slot = 0;
+    while slot < keys.len() {
+        keys[slot] = if slot < BASE_KEYS.len() {
+            BASE_KEYS[slot]
+        } else {
+            STATE_KEYS[slot - BASE_KEYS.len()]
+        };
+        slot += 1;
+    }
+    keys
+};
+
 /// What a state-mix cell shows for a benchmark pass that does not report its state mix.
 const NOT_REPORTED: &str = "n/r";
 
@@ -157,20 +172,14 @@ impl GamePass {
     /// The pass of `draws`, which share a render target and depth surface; `None` for no draw.
     fn of(draws: &[Draw<'_>]) -> Option<Self> {
         let first = draws.first()?;
-        let count = |test: fn(&Draw<'_>) -> bool| {
-            u32::try_from(draws.iter().filter(|d| test(d)).count()).unwrap_or(u32::MAX)
-        };
         Some(Self {
             target: first.target.to_owned(),
             depth: first.depth.to_owned(),
             size: Size::find(first.target),
-            draws: u32::try_from(draws.len()).unwrap_or(u32::MAX),
-            ff_vs: count(|d| d.vs == "ff"),
-            ff_ps: count(|d| d.ps == "ff"),
-            textures: draws
-                .iter()
-                .map(|d| u32::try_from(d.texture_ids().count()).unwrap_or(u32::MAX))
-                .fold(0, u32::saturating_add),
+            draws: narrow(draws.len()),
+            ff_vs: count_draws(draws, |d| d.vs == "ff"),
+            ff_ps: count_draws(draws, |d| d.ps == "ff"),
+            textures: narrow(draws.iter().map(|d| d.texture_ids().count()).sum()),
             state: StateMix::of(draws),
         })
     }
@@ -311,9 +320,7 @@ impl StateMix {
 
     /// The state mix of one pass's draws, in draw order.
     fn of(draws: &[Draw<'_>]) -> Self {
-        let narrow = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
-        let count =
-            |test: &dyn Fn(&Draw<'_>) -> bool| narrow(draws.iter().filter(|d| test(d)).count());
+        let count = |test: fn(&Draw<'_>) -> bool| count_draws(draws, test);
         let switches = |differs: &dyn Fn(&Draw<'_>, &Draw<'_>) -> bool| {
             narrow(
                 draws
@@ -326,11 +333,11 @@ impl StateMix {
             |ids: &mut dyn Iterator<Item = &str>| narrow(ids.collect::<BTreeSet<_>>().len());
         let programmable = |shader: &&str| !matches!(*shader, "ff" | "none");
         Self {
-            blend: count(&|d| d.blend_enable != 0),
-            atest: count(&|d| d.alpha_enable != 0),
-            zwrite_off: count(&|d| d.z_write == 0),
-            cull_none: count(&|d| d.cull == D3DCULL_NONE),
-            cmask0: count(&|d| d.color_mask == 0),
+            blend: count(|d| d.blend_enable != 0),
+            atest: count(|d| d.alpha_enable != 0),
+            zwrite_off: count(|d| d.z_write == 0),
+            cull_none: count(|d| d.cull == D3DCULL_NONE),
+            cmask0: count(|d| d.color_mask == 0),
             vs_sw: switches(&|a, b| a.vs != b.vs),
             ps_sw: switches(&|a, b| a.ps != b.ps),
             tex_sw: switches(&|a, b| a.stage0_texture() != b.stage0_texture()),
@@ -482,8 +489,8 @@ pub fn parse_bench(lines: &[String], backbuffer: Option<&str>) -> Result<BenchFr
             ));
         }
         let size = Size::parse(size).ok_or_else(|| format!("shape line {line:?}: bad size"))?;
-        let mut values = [None::<&str>; BASE_KEYS.len() + STATE_KEYS.len()];
-        let keys: Vec<&str> = BASE_KEYS.into_iter().chain(STATE_KEYS).collect();
+        let keys = SHAPE_KEYS;
+        let mut values = [None::<&str>; SHAPE_KEYS.len()];
         for word in rest {
             let (key, value) = word
                 .split_once('=')
@@ -492,7 +499,9 @@ pub fn parse_bench(lines: &[String], backbuffer: Option<&str>) -> Result<BenchFr
                 .iter()
                 .position(|known| *known == key)
                 .ok_or_else(|| format!("shape line {line:?}: unknown key {key:?}"))?;
-            values[slot] = Some(value);
+            if values[slot].replace(value).is_some() {
+                return Err(format!("shape line {line:?}: repeats {key}="));
+            }
         }
         let get = |slot: usize| {
             values[slot].ok_or_else(|| format!("shape line {line:?}: no {}=", keys[slot]))
@@ -527,9 +536,22 @@ pub fn parse_bench(lines: &[String], backbuffer: Option<&str>) -> Result<BenchFr
                 missing.join(", ")
             ));
         };
+        let draws = count(0)?;
+        if let Some(state) = &state {
+            let values = state.values();
+            let over = values[..STATE_SHARES]
+                .iter()
+                .zip(STATE_KEYS)
+                .find(|&(&value, _)| value > draws);
+            if let Some((value, key)) = over {
+                return Err(format!(
+                    "shape line {line:?}: {key}={value} counts more draws than the pass's {draws}"
+                ));
+            }
+        }
         passes.push(BenchPass {
             size,
-            draws: count(0)?,
+            draws,
             ff_vs: count(1)?,
             ff_ps: count(2)?,
             tex_per_draw,
@@ -882,7 +904,9 @@ impl<'a> Draw<'a> {
         if seq.is_empty() || !seq.bytes().all(|b| b.is_ascii_digit()) {
             return Ok(None);
         }
-        let missing = |what: &str| format!("draw line {event:?}: no {what}");
+        // The keys carry the space before them so a longer key ending in the
+        // same name never matches; the messages print them without it.
+        let missing = |what: &str| format!("draw line {event:?}: no {}", what.trim_start());
         let target = between(rest, "rt=", " ds=").ok_or_else(|| missing("rt= ... ds="))?;
         let depth = between(rest, " ds=", " vs=").ok_or_else(|| missing("ds= ... vs="))?;
         let depth = depth.rsplit_once('/').map_or(depth, |(label, _)| label);
@@ -895,8 +919,12 @@ impl<'a> Draw<'a> {
         let word = |key: &str| first_word(state, key).ok_or_else(|| missing(key));
         let list = |key: &str| between(state, key, "]").ok_or_else(|| missing(key));
         let number = |list: &str, key: &str, index: usize| {
-            list_number(list, index)
-                .ok_or_else(|| format!("draw line {event:?}: {key}...] has no number at {index}"))
+            list_number(list, index).ok_or_else(|| {
+                format!(
+                    "draw line {event:?}: {}...] has no number at {index}",
+                    key.trim_start()
+                )
+            })
         };
         let z = list(" z=[")?;
         let blend = list(" blend=[")?;
@@ -944,6 +972,16 @@ impl<'a> Draw<'a> {
 fn between<'a>(text: &'a str, start: &str, end: &str) -> Option<&'a str> {
     let (_, after) = text.split_once(start)?;
     Some(after.split_once(end)?.0)
+}
+
+/// `n` as a count of the dump, which no frame comes near overflowing; `u32::MAX` if one did.
+fn narrow(n: usize) -> u32 {
+    u32::try_from(n).unwrap_or(u32::MAX)
+}
+
+/// How many of `draws` pass `test`.
+fn count_draws(draws: &[Draw<'_>], test: impl Fn(&Draw<'_>) -> bool) -> u32 {
+    narrow(draws.iter().filter(|d| test(d)).count())
 }
 
 /// The first word of `text` after the first `key`.
