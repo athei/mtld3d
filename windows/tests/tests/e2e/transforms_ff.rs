@@ -12,12 +12,13 @@ use mtld3d_types::{
     D3DRS_ALPHAFUNC, D3DRS_ALPHAREF, D3DRS_ALPHATESTENABLE, D3DRS_AMBIENT,
     D3DRS_AMBIENTMATERIALSOURCE, D3DRS_CULLMODE, D3DRS_DIFFUSEMATERIALSOURCE,
     D3DRS_EMISSIVEMATERIALSOURCE, D3DRS_INDEXEDVERTEXBLENDENABLE, D3DRS_LIGHTING,
-    D3DRS_LOCALVIEWER, D3DRS_NORMALIZENORMALS, D3DRS_SPECULARENABLE, D3DRS_VERTEXBLEND, D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV,
-    D3DSAMP_MAGFILTER, D3DSAMP_MINFILTER, D3DTA_ALPHAREPLICATE, D3DTA_DIFFUSE, D3DTA_SPECULAR,
-    D3DTA_TEXTURE, D3DTADDRESS_CLAMP, D3DTADDRESS_WRAP, D3DTEXF_POINT, D3DTOP_DISABLE, D3DTOP_MODULATE,
-    D3DTOP_SELECTARG1, D3DTS_PROJECTION, D3DTS_TEXTURE0, D3DTS_VIEW, D3DTS_WORLD, D3DTSS_ALPHAARG1,
-    D3DTSS_ALPHAOP, D3DTSS_COLORARG1, D3DTSS_COLORARG2, D3DTSS_COLOROP, D3DTSS_TEXCOORDINDEX,
-    D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_COUNT2, D3DTTFF_COUNT3, D3DVBF_1WEIGHTS, D3DVECTOR,
+    D3DRS_LOCALVIEWER, D3DRS_NORMALIZENORMALS, D3DRS_SPECULARENABLE, D3DRS_VERTEXBLEND,
+    D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_MAGFILTER, D3DSAMP_MINFILTER, D3DTA_ALPHAREPLICATE,
+    D3DTA_DIFFUSE, D3DTA_SPECULAR, D3DTA_TEXTURE, D3DTADDRESS_CLAMP, D3DTADDRESS_WRAP,
+    D3DTEXF_POINT, D3DTOP_DISABLE, D3DTOP_MODULATE, D3DTOP_SELECTARG1, D3DTS_PROJECTION,
+    D3DTS_TEXTURE0, D3DTS_VIEW, D3DTS_WORLD, D3DTSS_ALPHAARG1, D3DTSS_ALPHAOP, D3DTSS_COLORARG1,
+    D3DTSS_COLORARG2, D3DTSS_COLOROP, D3DTSS_TEXCOORDINDEX, D3DTSS_TEXTURETRANSFORMFLAGS,
+    D3DTTFF_COUNT2, D3DTTFF_COUNT3, D3DVBF_1WEIGHTS, D3DVECTOR,
 };
 
 #[rustfmt::skip]
@@ -768,7 +769,11 @@ fn lit_draw_with_specular_off_passes_vertex_specular_to_a_stage() {
     // the vertex COLOR1, which D3DTA_SPECULAR selects into the cascade.
     let h = Harness::new();
     assert_eq!(h.set_render_state(D3DRS_LIGHTING, 1), 0, "lighting on");
-    assert_eq!(h.set_render_state(D3DRS_SPECULARENABLE, 0), 0, "specular off");
+    assert_eq!(
+        h.set_render_state(D3DRS_SPECULARENABLE, 0),
+        0,
+        "specular off"
+    );
     assert_eq!(
         h.set_fvf(D3DFVF_XYZ | D3DFVF_NORMAL | D3DFVF_DIFFUSE | D3DFVF_SPECULAR),
         0,
@@ -1599,9 +1604,17 @@ fn indexed_vertex_blend_reads_d3dcolor_and_float_blend_indices() {
     assert_eq!(h.set_render_state(D3DRS_INDEXEDVERTEXBLENDENABLE, 1), 0);
     h.select_diffuse_stage(0);
     let assert_shifted_right = |context: &str| {
-        assert_eq!(h.read_pixel(480, 240), BLEND_RED, "{context}: bone 1 shifted right");
+        assert_eq!(
+            h.read_pixel(480, 240),
+            BLEND_RED,
+            "{context}: bone 1 shifted right"
+        );
         assert_eq!(h.read_pixel(160, 240), BLUE, "{context}: nothing on bone 3");
-        assert_eq!(h.read_pixel(320, 240), BLUE, "{context}: nothing at the origin");
+        assert_eq!(
+            h.read_pixel(320, 240),
+            BLUE,
+            "{context}: nothing at the origin"
+        );
     };
 
     assert_eq!(

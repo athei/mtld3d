@@ -665,9 +665,7 @@ fn resolve_attrs_for_ff_matches_ff_convention() {
 /// the colour fetch.
 #[test]
 fn resolve_attrs_for_ff_fetches_d3dcolor_blend_indices_as_bytes() {
-    let (elements, _) = fvf_to_elements(
-        D3DFVF_XYZB3 | D3DFVF_LASTBETA_D3DCOLOR | D3DFVF_DIFFUSE,
-    );
+    let (elements, _) = fvf_to_elements(D3DFVF_XYZB3 | D3DFVF_LASTBETA_D3DCOLOR | D3DFVF_DIFFUSE);
     let format_of = |resolved: &ResolvedAttrs, attr: u32| {
         resolved
             .attrs

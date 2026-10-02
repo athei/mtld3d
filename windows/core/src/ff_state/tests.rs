@@ -339,10 +339,18 @@ fn tex_coord_count_covers_routed_and_generated_stages_past_colorop_disable() {
         ff.build_vs_key(&rs(), layout, 0b0000_0011).tex_coord_count
     };
     let plain = one_set(FfVsLayoutFlags::empty());
-    assert_eq!(count(&[], plain), 1, "defaults route set i; only set 0 exists");
+    assert_eq!(
+        count(&[], plain),
+        1,
+        "defaults route set i; only set 0 exists"
+    );
     assert_eq!(count(&[(1, 0)], plain), 2, "stage 1 rerouted to set 0");
     assert_eq!(count(&[(3, 0)], plain), 4, "stage 3 rerouted to set 0");
-    assert_eq!(count(&[(1, 2)], plain), 1, "stage 1 routed to an absent set");
+    assert_eq!(
+        count(&[(1, 2)], plain),
+        1,
+        "stage 1 routed to an absent set"
+    );
     assert_eq!(
         count(&[(2, CAMERASPACEPOSITION | 5)], plain),
         3,
@@ -400,7 +408,10 @@ fn normalize_normals_flag_follows_every_eye_normal_reader() {
     assert!(flag(1, 0, normal), "lit");
     assert!(!flag(0, 0, normal), "unlit passthru reads no normal");
     for tci in [CAMERASPACENORMAL, CAMERASPACEREFLECTIONVECTOR, SPHEREMAP] {
-        assert!(flag(0, tci, normal), "unlit texgen {tci:#x} reads the normal");
+        assert!(
+            flag(0, tci, normal),
+            "unlit texgen {tci:#x} reads the normal"
+        );
     }
     assert!(!flag(0, CAMERASPACEPOSITION, normal), "position texgen");
     assert!(

@@ -503,11 +503,7 @@ fn the_eye_space_normal_is_declared_only_where_it_is_read() {
                         normal && (tci == 3 || tci == 4),
                         "{case}"
                     );
-                    assert_eq!(
-                        msl.contains("float4(n, 0.0)"),
-                        normal && tci == 1,
-                        "{case}"
-                    );
+                    assert_eq!(msl.contains("float4(n, 0.0)"), normal && tci == 1, "{case}");
                     // The name is a single letter, so it is counted as a
                     // token rather than as a substring: no token at all is
                     // what says the shader neither declares nor reads it.
@@ -2010,11 +2006,7 @@ fn tci_cameraspacereflection_vertex_blended_reads_the_blended_locals() {
         "{msl}"
     );
     // The blended normal keeps its magnitude without NORMALIZENORMALS.
-    assert_eq!(
-        msl.matches("    float3 n = n_blend;\n").count(),
-        1,
-        "{msl}"
-    );
+    assert_eq!(msl.matches("    float3 n = n_blend;\n").count(), 1, "{msl}");
     assert!(!msl.contains("n = normalize(n)"), "{msl}");
     assert!(
         msl.contains(concat!(
@@ -2049,9 +2041,13 @@ fn texgen_reads_the_lighting_normal_lit_or_unlit() {
                 vs.tci_modes[0] = tci;
                 let msl = emit_vs_ff(&vs);
                 let case = format!("lighting={lighting} tci={tci} normalize={normalize}\n{msl}");
-                assert!(msl.contains("static inline float4 mtld3d_cross4("), "{case}");
+                assert!(
+                    msl.contains("static inline float4 mtld3d_cross4("),
+                    "{case}"
+                );
                 assert_eq!(
-                    msl.matches("    float3 n = (abs(nwvdet) > 1e-12)\n").count(),
+                    msl.matches("    float3 n = (abs(nwvdet) > 1e-12)\n")
+                        .count(),
                     1,
                     "{case}"
                 );
@@ -2379,11 +2375,7 @@ fn tci_spheremap_vertex_blended_reads_the_blended_locals() {
         "{msl}"
     );
     // The blended normal keeps its magnitude without NORMALIZENORMALS.
-    assert_eq!(
-        msl.matches("    float3 n = n_blend;\n").count(),
-        1,
-        "{msl}"
-    );
+    assert_eq!(msl.matches("    float3 n = n_blend;\n").count(), 1, "{msl}");
     assert!(!msl.contains("n = normalize(n)"), "{msl}");
     assert!(msl.contains("float3 R_tci = reflect(E_tci, n);"), "{msl}");
 }
@@ -2809,7 +2801,10 @@ fn range_fog_changes_only_the_vertex_distance_expression() {
             let ordinary = emit_vs_ff(&key);
             // The eye depth of the blended position when the vertex blends,
             // which without blending is the row-2 dot of the single matrix.
-            assert!(ordinary.contains("float eyeZ = abs(pos_view.z);"), "{ordinary}");
+            assert!(
+                ordinary.contains("float eyeZ = abs(pos_view.z);"),
+                "{ordinary}"
+            );
             assert!(!ordinary.contains("abs(dot(pos"), "{ordinary}");
             assert!(!ordinary.contains("length(pos_view.xyz)"));
             key.flags.insert(FfVsFlags::RANGE_FOG);

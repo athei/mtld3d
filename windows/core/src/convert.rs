@@ -1331,7 +1331,8 @@ pub fn resolve_attrs_for_ff(elements: &[D3DVERTEXELEMENT9]) -> ResolvedAttrs {
         reg
     });
     for attr in &mut resolved.attrs {
-        if Some(attr.attr_index) == blend_indices && attr.format == VertexFormat::UChar4NormalizedBgra
+        if Some(attr.attr_index) == blend_indices
+            && attr.format == VertexFormat::UChar4NormalizedBgra
         {
             attr.format = VertexFormat::UChar4;
         }

@@ -4,7 +4,10 @@
 //! FVF or a declaration, builds a pipeline with the FF VS that reads it.
 
 use mtld3d_core::{
-    convert::{decl_type_to_metal_format, ff_vs_layout_from_elements, fvf_to_elements, resolve_attrs_for_ff},
+    convert::{
+        decl_type_to_metal_format, ff_vs_layout_from_elements, fvf_to_elements,
+        resolve_attrs_for_ff,
+    },
     dxso::{VariantKey, emit_ps_ff_named, emit_vs_ff_named},
     ff_state::FfState,
     pipeline_state::{
@@ -13,10 +16,8 @@ use mtld3d_core::{
 };
 use mtld3d_shared::{
     MetalHandle, VertexBufferLayoutDesc,
+    mtl::{BlendFactor, BlendOperation, ColorWriteMask, PixelFormat, StageTag, VertexStepFunction},
     mtl_handle::MTLDeviceKind,
-    mtl::{
-        BlendFactor, BlendOperation, ColorWriteMask, PixelFormat, StageTag, VertexStepFunction,
-    },
     perf::{PipelineTimings, ShaderTimings},
 };
 use mtld3d_types::{
@@ -24,9 +25,10 @@ use mtld3d_types::{
     D3DDECLTYPE_FLOAT3, D3DDECLTYPE_FLOAT4, D3DDECLTYPE_FLOAT16_2, D3DDECLTYPE_FLOAT16_4,
     D3DDECLTYPE_SHORT2, D3DDECLTYPE_SHORT2N, D3DDECLTYPE_SHORT4, D3DDECLTYPE_SHORT4N,
     D3DDECLTYPE_UBYTE4, D3DDECLTYPE_UBYTE4N, D3DDECLTYPE_USHORT2N, D3DDECLTYPE_USHORT4N,
-    D3DDECLUSAGE_BLENDINDICES, D3DDECLUSAGE_BLENDWEIGHT, D3DDECLUSAGE_POSITION, D3DFVF_LASTBETA_D3DCOLOR,
-    D3DFVF_LASTBETA_UBYTE4, D3DFVF_XYZB2, D3DFVF_XYZB3, D3DFVF_XYZB5, D3DRS_INDEXEDVERTEXBLENDENABLE,
-    D3DRS_LIGHTING, D3DRS_VERTEXBLEND, D3DVBF_1WEIGHTS, D3DVERTEXELEMENT9, render_state_defaults,
+    D3DDECLUSAGE_BLENDINDICES, D3DDECLUSAGE_BLENDWEIGHT, D3DDECLUSAGE_POSITION,
+    D3DFVF_LASTBETA_D3DCOLOR, D3DFVF_LASTBETA_UBYTE4, D3DFVF_XYZB2, D3DFVF_XYZB3, D3DFVF_XYZB5,
+    D3DRS_INDEXEDVERTEXBLENDENABLE, D3DRS_LIGHTING, D3DRS_VERTEXBLEND, D3DVBF_1WEIGHTS,
+    D3DVERTEXELEMENT9, render_state_defaults,
 };
 use objc2::rc::Retained;
 use objc2_metal::MTLCreateSystemDefaultDevice;
@@ -141,9 +143,18 @@ fn every_ff_blend_index_format_builds_a_pipeline() {
     // SAFETY: the device's retain stays alive until every call below returns.
     let handle = unsafe { MetalHandle::new(Retained::as_ptr(&device) as u64) };
     let mut cases: Vec<(String, Vec<D3DVERTEXELEMENT9>)> = [
-        ("XYZB2 | LASTBETA_UBYTE4", D3DFVF_XYZB2 | D3DFVF_LASTBETA_UBYTE4),
-        ("XYZB2 | LASTBETA_D3DCOLOR", D3DFVF_XYZB2 | D3DFVF_LASTBETA_D3DCOLOR),
-        ("XYZB3 | LASTBETA_D3DCOLOR", D3DFVF_XYZB3 | D3DFVF_LASTBETA_D3DCOLOR),
+        (
+            "XYZB2 | LASTBETA_UBYTE4",
+            D3DFVF_XYZB2 | D3DFVF_LASTBETA_UBYTE4,
+        ),
+        (
+            "XYZB2 | LASTBETA_D3DCOLOR",
+            D3DFVF_XYZB2 | D3DFVF_LASTBETA_D3DCOLOR,
+        ),
+        (
+            "XYZB3 | LASTBETA_D3DCOLOR",
+            D3DFVF_XYZB3 | D3DFVF_LASTBETA_D3DCOLOR,
+        ),
         ("XYZB5", D3DFVF_XYZB5),
     ]
     .into_iter()
@@ -184,5 +195,8 @@ fn every_ff_blend_index_format_builds_a_pipeline() {
             }
         }
     }
-    assert!(refused.is_empty(), "Metal refused the FF pipeline for: {refused:#?}");
+    assert!(
+        refused.is_empty(),
+        "Metal refused the FF pipeline for: {refused:#?}"
+    );
 }
