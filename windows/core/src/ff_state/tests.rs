@@ -1482,6 +1482,21 @@ fn keep_light_set_of_refreshes_the_created_lights_only() {
         Some(4.0_f32.to_bits()),
         "light 10 is not in the created set"
     );
+
+    // A Reset undefines every light; a Capture after it keeps light 9 in the
+    // set as the default light, disabled.
+    let mut after_reset = FfStateSnapshot::from(&FfState::new());
+    after_reset.keep_light_set_of(&created);
+    let mut target = FfState::new();
+    target.set_light_at(9, &light(5.0));
+    target.set_light_enabled_at(9, true);
+    after_reset.restore_filtered(&mut target, StateBlockType::Vertex);
+    assert_eq!(
+        target.get_light_at(9).map(|l| l.diffuse.r.to_bits()),
+        Some(FfState::enable_default_light().diffuse.r.to_bits()),
+        "light 9 restores as the default light"
+    );
+    assert!(!target.is_light_enabled_at(9), "light 9 restores disabled");
 }
 
 /// Run `write` on a state with enabled overflow light 100 and assert it marked LIGHTS.

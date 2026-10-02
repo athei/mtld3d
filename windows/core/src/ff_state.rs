@@ -2590,15 +2590,36 @@ impl FfStateSnapshot {
         };
     }
 
-    /// Keep only the lights `created` captured, refreshed to this snapshot's values.
+    /// Keep the light set `created` captured, refreshed to this snapshot's values.
     ///
     /// A `Capture` of a block `CreateStateBlock` made refreshes the lights the
     /// block was created with and adds none: D3D9 fixes a block's light set
-    /// when it creates the block. Lights cannot be undefined, so every light
-    /// of `created` is still in this newer snapshot.
+    /// when it creates the block. A light of that set this snapshot did not
+    /// find, one a `Reset` undefined since, is kept as the default light
+    /// `LightEnable` would create, disabled, so the set never shrinks.
     pub fn keep_light_set_of(&mut self, created: &Self) {
-        self.lights
-            .retain(|light| created.lights.iter().any(|c| c.index == light.index));
+        let fresh = core::mem::take(&mut self.lights);
+        self.lights = created
+            .lights
+            .iter()
+            .map(|kept| {
+                fresh
+                    .iter()
+                    .find(|light| light.index == kept.index)
+                    .map_or_else(
+                        || CapturedLight {
+                            index: kept.index,
+                            light: FfState::enable_default_light(),
+                            enabled: false,
+                        },
+                        |light| CapturedLight {
+                            index: light.index,
+                            light: light.light,
+                            enabled: light.enabled,
+                        },
+                    )
+            })
+            .collect();
     }
 
     /// Set each captured light back, leaving every light the snapshot did not capture alone.
