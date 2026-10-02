@@ -2360,6 +2360,50 @@ fn setp_lt_emits_componentwise_predicate_assignment() {
 }
 
 #[test]
+fn setp_honours_its_write_mask_and_predicate() {
+    // ps_3_0 { setp_gt p0.x, c0, c1; setp_lt p0.y, c0, c1;
+    // (p0.x) setp_eq p0.zw, c0, c1; mov oC0, c0; }
+    // Each setp writes only its masked lanes, and a predicated one keeps the
+    // lanes whose predicate component is false.
+    let setp = |cmp: u32| u32::from(OP_SETP) | (cmp << 16) | (3u32 << 24);
+    let bc = vec![
+        PS3_HEADER,
+        setp(1),
+        dst_token(TYPE_PREDICATE, 0, 0x1, false),
+        src_token(TYPE_CONST, 0, SWIZ_IDENTITY, 0),
+        src_token(TYPE_CONST, 1, SWIZ_IDENTITY, 0),
+        setp(4),
+        dst_token(TYPE_PREDICATE, 0, 0x2, false),
+        src_token(TYPE_CONST, 0, SWIZ_IDENTITY, 0),
+        src_token(TYPE_CONST, 1, SWIZ_IDENTITY, 0),
+        u32::from(OP_SETP) | (2u32 << 16) | (4u32 << 24) | (1 << 28),
+        dst_token(TYPE_PREDICATE, 0, 0xC, false),
+        src_token(TYPE_PREDICATE, 0, SWIZ_XXXX, 0),
+        src_token(TYPE_CONST, 0, SWIZ_IDENTITY, 0),
+        src_token(TYPE_CONST, 1, SWIZ_IDENTITY, 0),
+        opcode_token(OP_MOV, 2),
+        dst_token(TYPE_COLOROUT, 0, 0xF, false),
+        src_token(TYPE_CONST, 0, SWIZ_IDENTITY, 0),
+        END_TOKEN,
+    ];
+    let ps = parse(&bc).expect("PS3 parse");
+    let msl = emit_ps_programmable(&ps, VariantKey::default()).expect("emit PS3");
+    assert!(
+        msl.contains("p0.x = (ps_c[0] > ps_c[1]).x;"),
+        "setp p0.x must write only .x:\n{msl}"
+    );
+    assert!(
+        msl.contains("p0.y = (ps_c[0] < ps_c[1]).y;"),
+        "setp p0.y must write only .y:\n{msl}"
+    );
+    assert!(
+        msl.contains("p0.zw = select(p0.zw, (ps_c[0] == ps_c[1]).zw, p0.xx);"),
+        "a predicated setp must keep the lanes its predicate rejects:\n{msl}"
+    );
+    metal_compile_or_fail(&msl);
+}
+
+#[test]
 fn if_reads_predicate_source_with_replicate_swizzle() {
     // ps_3_0 { setp_lt p0, c0, c1; if p0.x; mov oC0, c0; endif; }
     let bc = vec![

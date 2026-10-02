@@ -2511,11 +2511,29 @@ fn translate_instruction(
         }
         // SM3 `setp_<cmp> p0, s0, s1` — componentwise predicate set.
         // Bypass `store_dst`: p0 is bool4, the standard write-mask
-        // path expects float4 lvalues. `inst.cmp_func` is decoded by
-        // the parser; default to `==` if absent.
+        // path expects float4 lvalues. The destination write mask and an
+        // instruction predicate narrow the write the same way they do for
+        // a float destination. `inst.cmp_func` is decoded by the parser;
+        // default to `==` if absent.
         Opcode::SetP => {
             let op_str = inst.cmp_func.map_or("==", super::ir::CmpFunc::op);
-            let _ = writeln!(out, "    p0 = ({} {} {});", srcs[0], op_str, srcs[1]);
+            let cmp = format!("({} {} {})", srcs[0], op_str, srcs[1]);
+            let mask = inst.dst.map_or(WriteMask::ALL, |d| d.write_mask);
+            let (target, value) = if mask == WriteMask::ALL {
+                ("p0".to_string(), cmp)
+            } else {
+                let chars = write_mask_chars(mask);
+                (format!("p0.{chars}"), format!("{cmp}.{chars}"))
+            };
+            if let Some(pred) = inst.predicate.as_ref() {
+                let predicate = predicate_mask_expr(pred, mask);
+                let _ = writeln!(
+                    out,
+                    "    {target} = select({target}, {value}, {predicate});"
+                );
+            } else {
+                let _ = writeln!(out, "    {target} = {value};");
+            }
             return Ok(());
         }
         // `breakp p0.comp` consumes a regular predicate source. The generic
