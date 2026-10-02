@@ -28,6 +28,11 @@ pub const D3DERR_NOTAVAILABLE: i32 = 0x8876_086A_u32.cast_signed();
 /// texture bound. `MAKE_D3DHRESULT(2082)`.
 pub const D3DERR_UNSUPPORTEDTEXTUREFILTER: i32 = 0x8876_0822_u32.cast_signed();
 pub const D3DERR_MOREDATA: i32 = 0x8876_0867_u32.cast_signed();
+/// `D3DERR_DRIVERINTERNALERROR`: the driver could not carry out a valid call.
+///
+/// `SetFVF` answers with it when it cannot build the FVF's declaration.
+/// `MAKE_D3DHRESULT(2087)`.
+pub const D3DERR_DRIVERINTERNALERROR: i32 = 0x8876_0827_u32.cast_signed();
 pub const D3DERR_NOTFOUND: i32 = 0x8876_0866_u32.cast_signed();
 /// `D3DERR_DEVICENOTRESET`: a failed `Reset` must be retried before rendering resumes.
 pub const D3DERR_DEVICENOTRESET: i32 = 0x8876_0869_u32.cast_signed();

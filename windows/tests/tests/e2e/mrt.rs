@@ -762,3 +762,77 @@ fn larger_target_outside_the_pass_takes_one_srgb_encode_inside_the_viewport() {
         "slot 1 outside the viewport keeps its contents",
     );
 }
+
+#[test]
+fn back_buffer_bound_at_slot_one_follows_an_auto_resize() {
+    // The back buffer bound at slot 1 is a surface a WM_SIZE resize
+    // replaces. The frame after the resize and the one after its Present
+    // must both write `oC1` into the new back buffer.
+    const WM_SIZE: u32 = 0x0005;
+    let h = Harness::new();
+    let rt_before = h.create_texture(
+        64,
+        64,
+        1,
+        D3DUSAGE_RENDERTARGET,
+        D3DFMT_A8R8G8B8,
+        D3DPOOL_DEFAULT,
+    );
+    assert_eq!(
+        h.set_render_target(0, &rt_before.surface_level(0)),
+        D3D_OK,
+        "bind slot 0"
+    );
+    assert_eq!(
+        h.set_render_target(1, &h.back_buffer(0)),
+        D3D_OK,
+        "bind the back buffer at slot 1"
+    );
+    assert_eq!(h.set_render_state(D3DRS_LIGHTING, 0), D3D_OK);
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE), D3D_OK);
+    // The client size the WM_SIZE announces, as lparam's high and low words.
+    let (width, height): (isize, isize) = (320, 240);
+    let _ = h.send_window_message(WM_SIZE, 0, (height << 16) | width);
+    let (hr, desc) = h.back_buffer(0).desc();
+    assert_eq!(hr, D3D_OK);
+    assert_eq!((desc.width, desc.height), (320, 240), "the resize took");
+    // Slot 0 takes a target made at the new back-buffer size: under
+    // `render.scale` a target shares the back buffer's scale only when it is
+    // created at the back buffer's reported size, and the two slots must
+    // rasterize at one size. Slot 1 keeps the binding made before the resize.
+    let rt0 = h.create_texture(
+        320,
+        240,
+        1,
+        D3DUSAGE_RENDERTARGET,
+        D3DFMT_A8R8G8B8,
+        D3DPOOL_DEFAULT,
+    );
+    assert_eq!(
+        h.set_render_target(0, &rt0.surface_level(0)),
+        D3D_OK,
+        "bind slot 0 at the new size"
+    );
+    let ps = h.create_pixel_shader(&PS_TWO_TARGETS);
+    assert_eq!(h.set_pixel_shader(&ps), D3D_OK);
+    for frame in ["the frame after the resize", "the next frame"] {
+        h.render_once(BLACK, |d| {
+            assert_eq!(
+                d.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &full_cover()),
+                D3D_OK,
+                "{frame}: draw"
+            );
+        });
+        assert_color(
+            read_rt_pixel(&h, &h.back_buffer(0), 160, 120),
+            BLUE,
+            &format!("{frame}: oC1 lands in the new back buffer"),
+        );
+        assert_color(
+            read_rt_pixel(&h, &rt0.surface_level(0), 160, 120),
+            GREEN,
+            &format!("{frame}: oC0 lands in slot 0"),
+        );
+    }
+    assert_eq!(h.clear_pixel_shader(), D3D_OK);
+}

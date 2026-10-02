@@ -287,8 +287,8 @@ bitflags::bitflags! {
         ///
         /// Distinguishes "no override, use the auto depth" from "explicitly
         /// unbound" so the pipeline's depth/stencil-format snapshot matches
-        /// the actual render-pass attachment. Cleared by
-        /// `reseed_current_frame` (which restores the default bindings).
+        /// the actual render-pass attachment. Cleared by `reset_to_defaults`
+        /// (which restores the default bindings).
         const DEPTH_EXPLICITLY_UNBOUND = 1 << 0;
         /// Set between a successful `BeginScene` and its `EndScene`.
         ///
@@ -376,14 +376,14 @@ pub struct DeviceInner {
     /// converts those to the Metal texture's own resolution at the point a
     /// value becomes a Metal command. Identity unless `render.scale` is set.
     render_scale: mtld3d_core::render_scale::RenderScale,
-    fvf: u32,
     /// Currently-bound vertex declaration (null = none).
     ///
     /// Uses the `Bound` ownership marker — swaps bump the wrapper's
     /// `private_refcount` inline rather than going through the COM vtable's
-    /// `AddRef`/`Release` thunks. Separate from FVF: `SetVertexDeclaration`
-    /// and `SetFVF` shadow each other and the most recent wins at snapshot
-    /// time (`vertex_decl` takes precedence when non-null).
+    /// `AddRef`/`Release` thunks. It also carries the FVF: `SetFVF` binds
+    /// the declaration it built for the FVF, which reports that FVF, so the
+    /// most recent of `SetFVF` and `SetVertexDeclaration` wins and no other
+    /// path can set one without the other.
     vertex_decl: CachedComPtr<Direct3DVertexDeclaration9, Bound>,
     /// Implicit vertex declarations synthesised by `SetFVF`, keyed by FVF.
     ///
@@ -1161,6 +1161,7 @@ impl DeviceInner {
         let Some(decl) = Direct3DVertexDeclaration9::new(&VertexDeclCreateInfo {
             device_inner,
             elements: &elements,
+            fvf,
         }) else {
             return core::ptr::null_mut();
         };
@@ -1187,51 +1188,48 @@ impl DeviceInner {
 
     /// Apply D3D9 `SetFVF` semantics for a non-zero `fvf`.
     ///
-    /// Record the FVF and bind its implicit declaration as the current vertex
-    /// declaration (the most-recent of `SetFVF` / `SetVertexDeclaration`
-    /// wins). `fvf == 0` is a no-op on the binding, matching the driver.
+    /// Bind the FVF's implicit declaration, which carries the FVF, as the
+    /// current vertex declaration (the most-recent of `SetFVF` /
+    /// `SetVertexDeclaration` wins). `fvf == 0` is a no-op on the binding,
+    /// matching the driver.
     /// Returns whether the bound declaration changed (callers gate snapshot
-    /// dirtying on this). A call that would change nothing returns before the
-    /// cache lookup (see [`Self::fvf_bind_is_redundant`]).
+    /// dirtying on this), or `None` when the declaration cannot be built,
+    /// leaving the binding as it was. A call that would change nothing
+    /// returns before the cache lookup (see [`Self::fvf_bind_is_redundant`]).
     #[inline]
-    pub fn bind_fvf_decl(&mut self, fvf: u32) -> bool {
+    pub fn bind_fvf_decl(&mut self, fvf: u32) -> Option<bool> {
         if fvf == 0 || self.fvf_bind_is_redundant(fvf) {
-            return false;
+            return Some(false);
         }
         self.bind_fvf_decl_uncached(fvf)
     }
 
-    /// Whether binding `fvf` would leave the FVF field and the bound declaration as they are.
+    /// Whether binding `fvf` would leave the bound declaration as it is.
     ///
-    /// True exactly when the FVF field already reads `fvf` and the bound
-    /// declaration is `fvf`'s implicit one. The field alone does not say
-    /// that: a state-block apply writes it without binding a declaration
-    /// and restores a declaration without writing it, so the bound pointer is
-    /// compared too, against the one `bind_fvf_decl` last bound for
-    /// `last_fvf_bind`'s FVF. Each FVF has one cached declaration, so a match
-    /// on both halves is the pair the cache lookup would produce, and every
-    /// dirty mark the caller gates on a change would be skipped anyway.
-    ///
-    /// The pointer is compared first: a caller that alternates `SetFVF` with
-    /// `SetVertexDeclaration` leaves the FVF field matching and fails only
-    /// there, so that order sends it to the lookup after one test.
+    /// True exactly when the bound declaration is `fvf`'s implicit one,
+    /// answered without the cache lookup or a dereference: the bound pointer
+    /// is compared against the one `bind_fvf_decl` last bound, and the FVF
+    /// against the one it bound it for (`last_fvf_bind`). Each FVF has one
+    /// cached declaration, so a match on both halves is the declaration the
+    /// lookup would produce, and every dirty mark the caller gates on a change
+    /// would be skipped anyway. Any other path that binds a declaration (a
+    /// `SetVertexDeclaration`, a state-block apply) moves the pointer and
+    /// fails the first half.
     #[inline]
     fn fvf_bind_is_redundant(&self, fvf: u32) -> bool {
         let (bound_fvf, bound_decl) = self.last_fvf_bind;
-        self.vertex_decl.raw() == bound_decl && bound_fvf == fvf && self.fvf == fvf
+        self.vertex_decl.raw() == bound_decl && bound_fvf == fvf
     }
 
     /// The [`Self::bind_fvf_decl`] path that looks the declaration up and binds it.
     #[inline(never)]
-    fn bind_fvf_decl_uncached(&mut self, fvf: u32) -> bool {
+    fn bind_fvf_decl_uncached(&mut self, fvf: u32) -> Option<bool> {
         let decl = self.get_or_create_fvf_decl(fvf);
-        self.fvf = fvf;
-        self.last_fvf_bind = if decl.is_null() {
-            (0, core::ptr::null_mut())
-        } else {
-            (fvf, decl)
-        };
-        self.replace_vertex_decl(decl)
+        if decl.is_null() {
+            return None;
+        }
+        self.last_fvf_bind = (fvf, decl);
+        Some(self.replace_vertex_decl(decl))
     }
 
     /// Release every vertex fetch slot's bound-texture refcount at device teardown.
@@ -1264,6 +1262,11 @@ impl DeviceInner {
     /// Store one vertex-slot sampler state and mirror the row to the encoder.
     pub fn set_vertex_sampler_slot_state(&mut self, slot: usize, type_: usize, value: u32) {
         self.vertex_sampler_states[slot][type_] = value;
+        self.push_vertex_sampler_row(slot);
+    }
+
+    /// Mirror vertex sampler `slot`'s whole state row to the encoder.
+    fn push_vertex_sampler_row(&mut self, slot: usize) {
         let state = self.vertex_sampler_states[slot];
         self.push_control(crate::device::SetVertexSamplerOp {
             slot: u8::try_from(slot).expect("validated attachment or vertex sampler slot"),
@@ -1327,8 +1330,17 @@ impl DeviceInner {
         &mut self.stage_bindings
     }
 
-    pub const fn fvf_field(&self) -> u32 {
-        self.fvf
+    /// The FVF `GetFVF` reports: the bound declaration's, 0 with none bound.
+    ///
+    /// Only the declaration `SetFVF` built for an FVF carries one; a
+    /// declaration the game created reports 0.
+    pub fn fvf(&self) -> u32 {
+        let decl = self.vertex_decl.raw();
+        if decl.is_null() {
+            return 0;
+        }
+        // SAFETY: non-null; the bound slot's refcount keeps the declaration live.
+        unsafe { (*decl).inner().fvf() }
     }
 
     /// In-progress `BeginStateBlock` recording, if any.
@@ -1644,12 +1656,19 @@ impl DeviceInner {
         // thread to re-emit every Op::Set* on the first draw of the
         // new frame.
         self.snapshot_dirty = SnapshotDirty::all();
-        // The fresh frame's pass state defaults to the implicit backbuffer +
-        // auto depth-stencil, but a D3D9 render-target or depth binding —
-        // including an explicit `SetDepthStencilSurface(NULL)` unbind —
-        // outlives Present and internal flushes alike. Re-assert it into the
-        // fresh frame, or the pass would carry an attachment the pipeline
-        // (built from the D3D9 snapshot) does not declare.
+        self.reassert_saved_bindings();
+        (frame, this_seq)
+    }
+
+    /// Push the saved render-target and depth bindings into `current_frame`.
+    ///
+    /// The fresh frame's pass state defaults to the implicit backbuffer +
+    /// auto depth-stencil, but a D3D9 render-target or depth binding,
+    /// including an explicit `SetDepthStencilSurface(NULL)` unbind, outlives
+    /// Present, internal flushes and an automatic back-buffer resize alike.
+    /// Re-asserted into the fresh frame, or the pass would carry an attachment
+    /// the pipeline (built from the D3D9 snapshot) does not declare.
+    fn reassert_saved_bindings(&mut self) {
         // Clone (not Copy) out of the persistent binding: `TextureInfo` and
         // the binding enums are wide aggregates, and frame swaps are rare
         // relative to draws.
@@ -1666,7 +1685,48 @@ impl DeviceInner {
         {
             self.push_depth_binding_op(binding, is_sampleable, has_stencil, sample_count);
         }
-        (frame, this_seq)
+    }
+
+    /// Point the saved bindings that name the implicit surfaces at their replacements.
+    ///
+    /// A binding saved by `SetRenderTarget` or `SetDepthStencilSurface` holds
+    /// the handles and extent of the surface it bound, while the surface
+    /// object itself resolves them live from the device. After
+    /// `apply_auto_resize` has replaced the back buffer and the implicit
+    /// depth surface, a saved back-buffer binding and a saved binding of
+    /// `old_depth`, the implicit depth texture the resize retired, take the
+    /// device's current handles and extent; every other binding names a
+    /// surface the resize did not touch.
+    fn retarget_implicit_bindings(&mut self, old_depth: MetalHandle<MTLTextureKind>) {
+        let current = RtBinding::Backbuffer {
+            handle: self.backbuffer_handle,
+            msaa: self.backbuffer_msaa_handle,
+            msaa_srgb: self.backbuffer_msaa_srgb_handle,
+            sample_count: self.backbuffer_sample_count,
+            width: self.backbuffer_width,
+            height: self.backbuffer_height,
+        };
+        for saved in core::iter::once(&mut self.last_color_rt_binding)
+            .chain(self.last_extra_rt_bindings.iter_mut())
+            .flatten()
+        {
+            if matches!(saved.0, RtBinding::Backbuffer { .. }) {
+                saved.0 = current.clone();
+            }
+        }
+        if old_depth.is_null() {
+            return;
+        }
+        if let Some((DepthBinding::Eager(handle, extent, scale), ..)) =
+            self.last_depth_binding.as_mut()
+            && *handle == old_depth
+        {
+            *handle = self.depth_stencil_handle;
+            *extent = (
+                scale.dimension(self.backbuffer_width),
+                scale.dimension(self.backbuffer_height),
+            );
+        }
     }
 
     /// Submit the current frame's accumulated ops synchronously.
@@ -2539,6 +2599,7 @@ impl DeviceInner {
         }
         self.cur_autogen_rt_ids = [None; RENDER_TARGET_SLOTS];
         self.last_depth_binding = None;
+        self.flags.remove(DeviceFlags::DEPTH_EXPLICITLY_UNBOUND);
         self.bound_buffers.teardown();
         self.stage_bindings
             .reset_to_defaults(&[mtld3d_types::sampler_state_defaults(); STAGE_COUNT]);
@@ -2549,14 +2610,18 @@ impl DeviceInner {
                 self.set_vertex_texture_slot(slot, core::ptr::null_mut());
             }
         }
-        self.vertex_sampler_states = [mtld3d_types::sampler_state_defaults(); 4];
+        // The encoder's mirror of the vertex sampler rows learns of the
+        // defaults only through the ops, as it does of every other write.
+        for slot in 0..self.vertex_sampler_states.len() {
+            self.vertex_sampler_states[slot] = mtld3d_types::sampler_state_defaults();
+            self.push_vertex_sampler_row(slot);
+        }
         self.replace_vertex_decl(core::ptr::null_mut());
         self.shader_bindings
             .replace_vertex_shader(core::ptr::null_mut());
         self.shader_bindings
             .replace_pixel_shader(core::ptr::null_mut());
 
-        self.fvf = 0;
         self.render_states = render_state_defaults();
         self.point_size = self.render_states[D3DRS_POINTSIZE as usize];
         self.flags.remove(DeviceFlags::A2M_ENABLED);
@@ -2672,14 +2737,17 @@ impl DeviceInner {
         self.encoder.reset(retired_textures)
     }
 
-    /// Drop the empty `current_frame` left behind by `flush_current_frame_blocking`.
+    /// Drop the `current_frame` left behind by `flush_current_frame_blocking`.
     ///
     /// Replace it with a fresh one carrying the device's *current*
-    /// backbuffer / depth handles. Used by `device_reset` after the
-    /// implicit backbuffer + depth textures are recreated: without it,
-    /// the next `Present` would send the stale handles the pre-Reset
-    /// flush baked into `current_frame` and the unix-side `submit_frame`
-    /// would dereference the freed `MTLTextures`.
+    /// backbuffer / depth handles. Used by `device_reset` and
+    /// `apply_auto_resize` after the implicit backbuffer + depth textures
+    /// are recreated: without it, the next `Present` would send the stale
+    /// handles the flush baked into `current_frame` and the unix-side
+    /// `submit_frame` would dereference the freed `MTLTextures`. The dropped
+    /// frame holds only the bindings the flush re-asserted, which may name
+    /// the retired textures; the caller decides which bindings the fresh
+    /// frame gets back.
     pub fn reseed_current_frame(&mut self) {
         // The replaced frame is dropped rather than submitted, so an F12 run
         // in progress hands its marks to the fresh one: without that the
@@ -2689,9 +2757,6 @@ impl DeviceInner {
         let carried = self.current_frame.take_carried_capture_marks(false);
         self.current_frame = self.fresh_frame();
         self.current_frame.mark_gpu_capture(carried);
-        // Reseeding restores the default RT/depth bindings, so any prior
-        // explicit `SetDepthStencilSurface(NULL)` override no longer applies.
-        self.flags.remove(DeviceFlags::DEPTH_EXPLICITLY_UNBOUND);
     }
 
     /// The window this device took fullscreen, or `None` when it is windowed.
@@ -2770,9 +2835,10 @@ impl DeviceInner {
     ///
     /// Mirrors `device_reset`'s size-change pipeline (drain → destroy
     /// old textures → adopt new dims → push `drawableSize` → recreate
-    /// textures → reseed `current_frame` → re-push default viewport) but
-    /// **skips** `reset_to_defaults` — the game didn't request a Reset,
-    /// so its render states / textures / vertex bindings must survive.
+    /// textures → reseed `current_frame` → re-push default viewport while
+    /// render target 0 is the back buffer) but **skips**
+    /// `reset_to_defaults`: the game didn't request a Reset, so its render
+    /// states / textures / bindings must survive.
     /// No-op when dims already match, and for a fullscreen device: its
     /// logical size is the mode the game requested, decoupled from the
     /// window, and only a `Reset` may change it. Caller drives this from
@@ -2812,6 +2878,7 @@ impl DeviceInner {
         if self.flush_current_frame_blocking().is_err() {
             return;
         }
+        let old_depth = self.depth_stencil_handle;
         let old_handles: [u64; 5] = [
             self.backbuffer_handle.raw(),
             self.backbuffer_srgb_handle.raw(),
@@ -2837,7 +2904,44 @@ impl DeviceInner {
         }
 
         self.set_backbuffer_dims(new_width, new_height);
+        let back_buffer_made = self.recreate_implicit_surfaces(new_width, new_height);
+        // Whichever way the recreate went, the textures the flush's frame and
+        // the saved bindings named are gone: the reseeded frame and the
+        // re-asserted bindings name what it made, or nothing where it failed.
+        // The game's own bindings outlive the resize.
+        self.reseed_current_frame();
+        self.retarget_implicit_bindings(old_depth);
+        self.reassert_saved_bindings();
 
+        // The viewport and scissor follow render target 0 when that is the
+        // back buffer the resize changed. A game drawing into its own target
+        // keeps them: D3D9 changes them only at `SetRenderTarget` and `Reset`.
+        // A back buffer that failed leaves them to the `Reset` it requires.
+        let rt0_is_back_buffer = self
+            .last_color_rt_binding
+            .as_ref()
+            .is_none_or(|(binding, _)| matches!(binding, RtBinding::Backbuffer { .. }));
+        if back_buffer_made && rt0_is_back_buffer {
+            self.set_viewport(D3DVIEWPORT9 {
+                x: 0,
+                y: 0,
+                width: new_width,
+                height: new_height,
+                min_z: 0.0,
+                max_z: 1.0,
+            });
+            self.scissor_rect = [0, 0, new_width, new_height];
+        }
+    }
+
+    /// Create the back buffer and implicit depth texture `apply_auto_resize` needs.
+    ///
+    /// The old ones are already destroyed. A back buffer Metal refuses leaves
+    /// every implicit handle NULL and the device requiring `Reset`; a depth
+    /// texture it refuses leaves the depth handle NULL and the device drawing
+    /// without depth. Each failure logs once, at the step that failed.
+    /// Returns whether the back buffer was made.
+    fn recreate_implicit_surfaces(&mut self, new_width: u32, new_height: u32) -> bool {
         let mut bb_params = mtld3d_shared::CreateBackbufferParams {
             device_handle: self.device_handle,
             record_handle: self.record_handle,
@@ -2865,7 +2969,7 @@ impl DeviceInner {
             self.set_backbuffer_msaa_handle(MetalHandle::NULL, MetalHandle::NULL);
             self.set_depth_stencil_handle(MetalHandle::NULL);
             self.flags.insert(DeviceFlags::NOT_RESET);
-            return;
+            return false;
         }
         self.set_backbuffer_handle(bb_params.texture_handle, bb_params.srgb_texture_handle);
         self.set_backbuffer_msaa_handle(
@@ -2890,7 +2994,7 @@ impl DeviceInner {
                     self.depth_stencil_format,
                 );
                 self.set_depth_stencil_handle(MetalHandle::NULL);
-                return;
+                return true;
             };
             // Render space, matching the colour attachment exactly.
             let mut ds_params = CreateDepthTextureParams {
@@ -2908,25 +3012,13 @@ impl DeviceInner {
                     "apply_auto_resize: CreateDepthTexture failed (0x{status:08X}) — depth lost",
                 );
                 self.set_depth_stencil_handle(MetalHandle::NULL);
-                return;
+                return true;
             }
             self.set_depth_stencil_handle(ds_params.texture_handle);
         } else {
             self.set_depth_stencil_handle(MetalHandle::NULL);
         }
-
-        self.reseed_current_frame();
-
-        let viewport = D3DVIEWPORT9 {
-            x: 0,
-            y: 0,
-            width: new_width,
-            height: new_height,
-            min_z: 0.0,
-            max_z: 1.0,
-        };
-        self.set_viewport(viewport);
-        self.scissor_rect = [0, 0, new_width, new_height];
+        true
     }
 }
 
@@ -3049,7 +3141,6 @@ impl Direct3DDevice9 {
             backbuffer_width: info.backbuffer_width,
             backbuffer_height: info.backbuffer_height,
             render_scale: info.render_scale,
-            fvf: 0,
             vertex_decl: CachedComPtr::null(),
             fvf_decl_cache: rustc_hash::FxHashMap::default(),
             last_fvf_bind: (0, core::ptr::null_mut()),
@@ -3158,15 +3249,6 @@ impl Direct3DDevice9 {
     pub const fn add_ref_self(&mut self) -> u32 {
         self.refcount += 1;
         self.refcount
-    }
-
-    pub fn fvf(&self) -> u32 {
-        self.inner().fvf
-    }
-
-    /// Mutation goes through `inner()`'s raw-pointer indirection, so `&self` is sufficient.
-    pub fn set_fvf(&self, fvf: u32) {
-        self.inner().fvf = fvf;
     }
 }
 
@@ -10470,11 +10552,9 @@ extern "system" fn device_get_npatch_mode(this: *mut c_void) -> f32 {
 /// A `Draw*` call needs either an explicitly bound vertex declaration or a
 /// non-zero FVF; with neither, the runtime has no way to interpret the
 /// vertex stream and the draw is invalid. A non-zero FVF binds its implicit
-/// declaration (so `vertex_decl()` is non-null), and binding a declaration
-/// directly resets the FVF to zero, so the two conditions are mutually
-/// exclusive: the draw is invalid only when both are absent.
+/// declaration, so a bound declaration is the whole test.
 const fn has_vertex_layout_source(dev: &DeviceInner) -> bool {
-    !dev.vertex_decl().is_null() || dev.fvf_field() != 0
+    !dev.vertex_decl().is_null()
 }
 
 /// The `log_once_warn_by!` key of a log line shared by several entry points.
@@ -11328,13 +11408,13 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
             SnapshotSection::Vdecl,
         ));
         let bound_vertex_shader = dev.shader_bindings().vertex_shader();
-        let fvf = dev.fvf;
+        let fvf = dev.fvf();
         let decl_ptr = dev.vertex_decl();
         let (resolved, vdecl_hash, ff_vs_layout) = if decl_ptr.is_null() {
             let (elements, _fvf_stride) = fvf_to_elements(fvf);
-            // `fvf == 0` only when the format came from SetVertexDeclaration
-            // (SetFVF always carries D3DFVF_XYZ); a real declaration reads 0
-            // for an omitted COLORVERTEX source, FVF falls back to material.
+            // With no declaration bound `fvf` is 0, since the FVF is the bound
+            // declaration's, so the layout reads an omitted COLORVERTEX source
+            // as 0, as a declaration does.
             let layout = convert::ff_vs_layout_from_elements(&elements, fvf == 0);
             // Pre-transformed (POSITIONT/XYZRHW) layouts bypass a bound VS —
             // D3D9 runs the FF pre-transformed path regardless, even when a
@@ -11714,6 +11794,12 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
         let ff_dirty = dev.ff_state.take_ff_vs_dirty();
         if !ff_dirty.is_empty() {
             if key.has_rhw() {
+                // A pretransformed layout reads row 0 alone, so every other
+                // section stays marked for the next draw that reads it. WV is
+                // the one this row overwrites, and a change back to a
+                // transformed layout marks it again.
+                dev.ff_state
+                    .mark_ff_vs_dirty(ff_dirty.difference(FfVsDirty::WV));
                 let v = dev.viewport();
                 let to_f32 = |n: u32| {
                     f32::from(u16::try_from(n).expect("D3D9 viewport dim ≤ 16384 fits u16"))
@@ -12319,7 +12405,7 @@ extern "system" fn device_process_vertices(
         );
         return D3DERR_INVALIDCALL;
     }
-    let src_fvf = dev.fvf_field();
+    let src_fvf = dev.fvf();
     let src_stream_offset = dev.bound_buffers().stream_offset(0);
     let src_stride = dev.bound_buffers().stream_stride(0);
     let wvp = dev.ff_state().world_view_projection();
@@ -12463,6 +12549,7 @@ extern "system" fn device_create_vertex_declaration(
     Direct3DVertexDeclaration9::new(&VertexDeclCreateInfo {
         device_inner: obj.inner_ptr(),
         elements: slice,
+        fvf: 0,
     })
     .map_or_else(
         || {
@@ -12501,11 +12588,10 @@ extern "system" fn device_set_vertex_declaration(this: *mut c_void, decl: *mut c
     // re-resolves to a byte-identical attrs slice (+ FfVsLayout), so
     // skip the expensive VDECL rebuild. VS_SOURCE/VS_CONST only matter
     // if FF VS bound (FF VS key reads ff_vs_layout).
+    // The FVF is the declaration's (`DeviceInner::fvf`): the one `SetFVF`
+    // built for an FVF keeps reporting that FVF when it is bound here, and a
+    // declaration the game created reports 0, so the pointer decides both.
     let changed = dev.replace_vertex_decl(new);
-    // An explicitly-set declaration carries no FVF: GetFVF reports 0 until the
-    // next SetFVF re-establishes one. Mirrors the D3D9 runtime resetting the
-    // effective FVF when a declaration is bound directly.
-    dev.fvf = 0;
     if changed {
         // VS_SOURCE is marked unconditionally (not via `ff_aware_mask`, which
         // drops it for a programmable VS): a declaration change alters which VS
@@ -12568,8 +12654,27 @@ extern "system" fn device_set_fvf(this: *mut c_void, fvf: u32) -> i32 {
         return D3DERR_INVALIDCALL;
     };
     let dev = obj.inner();
-    if let Some(rec) = dev.recording_state_block_mut() {
-        rec.record(StateOp::Fvf(fvf));
+    if dev.is_state_block_recording() {
+        // A recorded SetFVF is a change of declaration, to the one built for
+        // the FVF, so a `Capture` of the block refreshes it from the bound
+        // declaration like a recorded SetVertexDeclaration. SetFVF(0) changes
+        // nothing and records nothing.
+        if fvf != 0 {
+            let decl = dev.get_or_create_fvf_decl(fvf);
+            if decl.is_null() {
+                mtld3d_shared::log_once_warn!(
+                    target: LOG_TARGET,
+                    "recorded SetFVF({fvf:#x}): no declaration for the FVF → DRIVERINTERNALERROR, nothing recorded"
+                );
+                return mtld3d_types::D3DERR_DRIVERINTERNALERROR;
+            }
+            if let Some(rec) = dev.recording_state_block_mut() {
+                // SAFETY: `decl` is a live declaration the FVF cache holds
+                // until the device drops.
+                let adopted = unsafe { CachedComPtr::adopt(decl) };
+                rec.record(StateOp::VertexDeclaration(adopted));
+            }
+        }
         return D3D_OK;
     }
     // SetFVF(0) is not a valid FVF; the driver treats it as a no-op, leaving
@@ -12583,8 +12688,15 @@ extern "system" fn device_set_fvf(this: *mut c_void, fvf: u32) -> i32 {
     // FVF directly. Redundant-set elimination: re-binding the same cached decl
     // changes nothing, so skip the VDECL rebuild; `bind_fvf_decl` answers
     // that without the cache lookup when the FVF and its declaration are
-    // already bound.
-    let changed = dev.bind_fvf_decl(fvf);
+    // already bound. An FVF whose declaration cannot be built leaves the
+    // bound declaration as it is, as in Wine.
+    let Some(changed) = dev.bind_fvf_decl(fvf) else {
+        mtld3d_shared::log_once_warn!(
+            target: LOG_TARGET,
+            "SetFVF({fvf:#x}): no declaration for the FVF → DRIVERINTERNALERROR, binding kept"
+        );
+        return mtld3d_types::D3DERR_DRIVERINTERNALERROR;
+    };
     if changed {
         // VS_SOURCE is marked unconditionally (not via `ff_aware_mask`, which
         // drops it for a programmable VS): a declaration change alters which VS
@@ -12619,7 +12731,7 @@ extern "system" fn device_get_fvf(this: *mut c_void, fvf: *mut u32) -> i32 {
     };
     // SAFETY: `fvf` is non-null (checked above) and per the D3D9 ABI
     // points to a writable `u32` slot owned by the caller.
-    unsafe { *fvf = obj.inner().fvf };
+    unsafe { *fvf = obj.inner().fvf() };
     0 // S_OK
 }
 

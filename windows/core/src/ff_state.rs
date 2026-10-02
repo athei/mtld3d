@@ -221,8 +221,9 @@ pub struct FfState {
     /// here. An enabled overflow light with a non-zero type feeds FF lighting:
     /// [`Self::resolve_active_lights`] packs it after the active fast-path
     /// slots, up to [`MAX_ACTIVE_LIGHTS`], so its writes mark the LIGHTS
-    /// section like a fast-path write. [`FfStateSnapshot`] does not capture
-    /// these slots. Empty for every workload that stays within 8 lights.
+    /// section like a fast-path write. [`FfStateSnapshot`] captures them with
+    /// the fast-path slots. Empty for every workload that stays within 8
+    /// lights.
     overflow_lights: BTreeMap<u32, OverflowLight>,
     texture_stage_states: [[u32; TEXTURE_STAGE_STATE_COUNT]; 8],
     /// Bit `s` set iff stage `s`'s `D3DTSS_TEXTURETRANSFORMFLAGS` is non-zero.
@@ -694,8 +695,8 @@ impl FfState {
     /// or the mask goes stale against the restored array. The light masks
     /// cannot be re-derived the same way (an untouched slot's
     /// `D3DLIGHT9::default()` is indistinguishable from an explicit
-    /// directional `SetLight`), so they travel with [`FfStateSnapshot`]
-    /// instead.
+    /// directional `SetLight`), so [`FfStateSnapshot`] restores lights
+    /// through their setters instead.
     fn recompute_tt_active_mask(&mut self) {
         self.tt_active_mask = 0;
         for (s, stage) in self.texture_stage_states.iter().enumerate() {
@@ -2486,23 +2487,18 @@ pub struct FfStateSnapshot {
     world_palette_high_water: u16,
     texture_transforms: [D3DMATRIX; 8],
     material: D3DMATERIAL9,
-    lights: [D3DLIGHT9; 8],
-    light_enabled: u8,
-    light_defined_mask: u8,
-    /// The three setter-maintained light masks travel with the lights array.
+    /// Every light defined at capture, at any index, in ascending index order.
     ///
-    /// They cannot be re-derived from it after a restore, because an untouched
-    /// slot's `D3DLIGHT9::default()` carries a directional type yet must not
-    /// contribute (its `light_set_mask` bit is clear).
-    light_set_mask: u8,
-    light_directional_mask: u8,
-    light_spot_mask: u8,
+    /// Restoring sets each one back through the light setters, which keep
+    /// the type and enable masks, and leaves a light defined after the
+    /// capture as it is: a block applies only the lights it captured.
+    lights: Vec<CapturedLight>,
     texture_stage_states: [[u32; TEXTURE_STAGE_STATE_COUNT]; 8],
 }
 
 impl FfStateSnapshot {
     #[must_use]
-    pub const fn from(state: &FfState) -> Self {
+    pub fn from(state: &FfState) -> Self {
         Self {
             view: state.view,
             projection: state.projection,
@@ -2510,12 +2506,7 @@ impl FfStateSnapshot {
             world_palette_high_water: state.world_palette_high_water,
             texture_transforms: state.texture_transforms,
             material: state.material,
-            lights: state.lights,
-            light_enabled: state.light_enabled,
-            light_defined_mask: state.light_defined_mask,
-            light_set_mask: state.light_set_mask,
-            light_directional_mask: state.light_directional_mask,
-            light_spot_mask: state.light_spot_mask,
+            lights: capture_lights(state),
             texture_stage_states: state.texture_stage_states,
         }
     }
@@ -2527,12 +2518,7 @@ impl FfStateSnapshot {
         ff.world_palette_high_water = self.world_palette_high_water;
         ff.texture_transforms = self.texture_transforms;
         ff.material = self.material;
-        ff.lights = self.lights;
-        ff.light_enabled = self.light_enabled;
-        ff.light_defined_mask = self.light_defined_mask;
-        ff.light_set_mask = self.light_set_mask;
-        ff.light_directional_mask = self.light_directional_mask;
-        ff.light_spot_mask = self.light_spot_mask;
+        self.restore_lights(ff);
         ff.texture_stage_states = self.texture_stage_states;
         ff.recompute_tt_active_mask();
         // The arrays were written past the setters, so the constant sections
@@ -2550,16 +2536,15 @@ impl FfStateSnapshot {
     /// - transforms (view / projection / world palette / texture transforms)
     ///   and material are `D3DSBT_ALL`-only — neither filtered block captures
     ///   them;
-    /// - lights (and the enable / defined masks that travel with them) belong
-    ///   to the vertex pipeline (`Vertex` and `All`);
+    /// - the captured lights, with their enables, belong to the vertex
+    ///   pipeline (`Vertex` and `All`);
     /// - texture-stage states are filtered per index via
     ///   [`StateBlockType::includes_tss`].
     ///
-    /// As with [`Self::restore_into`], the captured light masks travel with the
-    /// lights array (they are not derivable from it — see the field doc),
-    /// while `tt_active_mask` re-derives from the restored stage states via
-    /// `FfState::recompute_tt_active_mask`; both are normally maintained
-    /// incrementally by setters, which a bulk array restore bypasses.
+    /// As with [`Self::restore_into`], the lights go back through their
+    /// setters, which keep the light masks, while `tt_active_mask` re-derives
+    /// from the restored stage states via `FfState::recompute_tt_active_mask`,
+    /// since a bulk array restore bypasses the setter that maintains it.
     pub fn restore_filtered(&self, ff: &mut FfState, block_type: StateBlockType) {
         // Transforms + material: D3DSBT_ALL only.
         if matches!(block_type, StateBlockType::All) {
@@ -2573,12 +2558,7 @@ impl FfStateSnapshot {
         // Lights (+ enable / defined / type masks): vertex pipeline →
         // Vertex | All.
         if !matches!(block_type, StateBlockType::Pixel) {
-            ff.lights = self.lights;
-            ff.light_enabled = self.light_enabled;
-            ff.light_defined_mask = self.light_defined_mask;
-            ff.light_set_mask = self.light_set_mask;
-            ff.light_directional_mask = self.light_directional_mask;
-            ff.light_spot_mask = self.light_spot_mask;
+            self.restore_lights(ff);
         }
         // Texture-stage states: whole-array for All, per-index otherwise. The
         // `0u32..` counter zipped with the per-stage array yields the `D3DTSS_*`
@@ -2609,6 +2589,75 @@ impl FfStateSnapshot {
             StateBlockType::Pixel => FfVsDirty::TT,
         };
     }
+
+    /// Keep the light set `created` captured, refreshed to this snapshot's values.
+    ///
+    /// A `Capture` of a block `CreateStateBlock` made refreshes the lights the
+    /// block was created with and adds none: D3D9 fixes a block's light set
+    /// when it creates the block. A light of that set this snapshot did not
+    /// find, one a `Reset` undefined since, is kept as the default light
+    /// `LightEnable` would create, disabled, so the set never shrinks.
+    pub fn keep_light_set_of(&mut self, created: &Self) {
+        let fresh = core::mem::take(&mut self.lights);
+        self.lights = created
+            .lights
+            .iter()
+            .map(|kept| {
+                fresh
+                    .iter()
+                    .find(|light| light.index == kept.index)
+                    .map_or_else(
+                        || CapturedLight {
+                            index: kept.index,
+                            light: FfState::enable_default_light(),
+                            enabled: false,
+                        },
+                        |light| CapturedLight {
+                            index: light.index,
+                            light: light.light,
+                            enabled: light.enabled,
+                        },
+                    )
+            })
+            .collect();
+    }
+
+    /// Set each captured light back, leaving every light the snapshot did not capture alone.
+    fn restore_lights(&self, ff: &mut FfState) {
+        for captured in &self.lights {
+            ff.set_light_at(captured.index, &captured.light);
+            ff.set_light_enabled_at(captured.index, captured.enabled);
+        }
+    }
+}
+
+/// One light an [`FfStateSnapshot`] captured.
+struct CapturedLight {
+    index: u32,
+    light: D3DLIGHT9,
+    enabled: bool,
+}
+
+/// Every light `state` has defined, fast-path slots first, each with its enable.
+fn capture_lights(state: &FfState) -> Vec<CapturedLight> {
+    let fast = (0u32..)
+        .zip(&state.lights)
+        .enumerate()
+        .filter(|&(slot, _)| state.light_defined(slot))
+        .map(|(slot, (index, light))| CapturedLight {
+            index,
+            light: *light,
+            enabled: state.light_enabled(slot),
+        });
+    let overflow = state
+        .overflow_lights
+        .iter()
+        .map(|(&index, slot)| CapturedLight {
+            index,
+            light: slot.light,
+            enabled: slot.enabled,
+        });
+    fast.chain(overflow).collect()
 }
 
 fn d3dcolor_to_rgba(c: u32) -> [f32; 4] {

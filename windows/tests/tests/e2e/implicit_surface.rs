@@ -5,13 +5,22 @@
 //! `GetRenderTarget(0) == GetBackBuffer(0)`, surviving its refcount reaching
 //! zero (destroyed only at device teardown), and resolving its extent live from
 //! the device so a `Reset` that recreates the backbuffer is reflected without
-//! re-allocating the surface.
+//! re-allocating the surface. The render-target and depth bindings a game
+//! made, of those surfaces or of its own, outlive an automatic back-buffer
+//! resize.
 
-use mtld3d_tests::{Harness, HarnessConfig};
+use mtld3d_tests::{Harness, HarnessConfig, PosColorVertex};
 use mtld3d_types::{
-    D3D_OK, D3DERR_INVALIDCALL, D3DFMT_A8R8G8B8, D3DFMT_A16B16G16R16F, D3DFMT_R5G6B5,
-    D3DFMT_X8R8G8B8, D3DLOCK_READONLY, D3DPRESENTFLAG_LOCKABLE_BACKBUFFER,
+    D3D_OK, D3DCLEAR_TARGET, D3DCLEAR_ZBUFFER, D3DCULL_NONE, D3DERR_DEVICENOTRESET,
+    D3DERR_INVALIDCALL, D3DERR_NOTFOUND, D3DFMT_A8R8G8B8, D3DFMT_A16B16G16R16F, D3DFMT_D24S8,
+    D3DFMT_R5G6B5, D3DFMT_X8R8G8B8, D3DFVF_DIFFUSE, D3DFVF_XYZ, D3DLOCK_READONLY,
+    D3DPRESENTFLAG_LOCKABLE_BACKBUFFER, D3DPT_TRIANGLESTRIP, D3DRS_CULLMODE, D3DRS_LIGHTING,
 };
+
+const WM_SIZE: u32 = 0x0005;
+const BLUE: u32 = 0xFF00_00FF;
+const RED: u32 = 0xFFFF_0000;
+const GREEN: u32 = 0xFF00_FF00;
 
 fn assert_backbuffer_format(h: &Harness, expected: u32) {
     let chain = h.implicit_swapchain();
@@ -116,7 +125,6 @@ fn backbuffer_reporting_resolves_additional_swapchain_unknown_format() {
 
 #[test]
 fn backbuffer_reporting_tracks_auto_resize_in_present_parameters() {
-    const WM_SIZE: u32 = 0x0005;
     for cache_first in [false, true] {
         let h = Harness::create(&HarnessConfig {
             back_buffer_format: D3DFMT_A8R8G8B8,
@@ -457,4 +465,194 @@ fn implicit_depth_stencil_is_cached() {
         ds2.as_ptr(),
         "GetDepthStencilSurface must return the one cached implicit surface"
     );
+}
+
+// ── Bindings across an automatic back-buffer resize ──
+
+/// A `WM_SIZE` lparam: the client height in the high word, the width in the low.
+///
+/// The two words fill 32 bits, which go through `i32` because an i686 lparam
+/// has no more: a height past 32767 sets its sign bit there.
+fn client_size(width: u16, height: u16) -> isize {
+    let words = (u32::from(height) << 16) | u32::from(width);
+    isize::try_from(words.cast_signed()).expect("an i32 fits an lparam")
+}
+
+/// A clip-space quad over the whole viewport in `color`, at depth 0.5.
+fn full_quad(color: u32) -> [PosColorVertex; 4] {
+    [(-1.0, 1.0), (1.0, 1.0), (-1.0, -1.0), (1.0, -1.0)].map(|(x, y)| PosColorVertex {
+        x,
+        y,
+        z: 0.5,
+        color,
+    })
+}
+
+/// Lighting off and the diffuse colour on stage 0, for [`full_quad`].
+fn arm_diffuse_draws(h: &Harness) {
+    assert_eq!(h.set_render_state(D3DRS_LIGHTING, 0), D3D_OK);
+    assert_eq!(h.set_render_state(D3DRS_CULLMODE, D3DCULL_NONE), D3D_OK);
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE), D3D_OK);
+    h.select_diffuse_stage(0);
+}
+
+#[test]
+fn explicitly_bound_implicit_surfaces_follow_an_auto_resize() {
+    // The back buffer and the implicit depth surface bound by hand are the
+    // surfaces the resize replaces. The frame after the resize and the one
+    // after its Present must both draw into the new pair, depth-tested
+    // against the new depth surface.
+    let h = Harness::with_depth();
+    arm_diffuse_draws(&h);
+    {
+        let back_buffer = h.back_buffer(0);
+        let depth = h.depth_stencil_surface().expect("implicit depth surface");
+        assert_eq!(h.set_render_target(0, &back_buffer), D3D_OK);
+        assert_eq!(h.set_depth_stencil_surface(&depth), D3D_OK);
+    }
+    let _ = h.send_window_message(WM_SIZE, 0, client_size(320, 240));
+    let (hr, desc) = h.back_buffer(0).desc();
+    assert_eq!(hr, D3D_OK);
+    assert_eq!((desc.width, desc.height), (320, 240), "the resize took");
+    let vp = h.viewport();
+    assert_eq!(
+        (vp.width, vp.height),
+        (320, 240),
+        "the viewport follows the back buffer bound as render target 0"
+    );
+    for (color, frame) in [
+        (RED, "the frame after the resize"),
+        (GREEN, "the next frame"),
+    ] {
+        let quad = full_quad(color);
+        h.render_once(BLUE, |d| {
+            assert_eq!(
+                d.clear(D3DCLEAR_ZBUFFER, 0, 1.0, 0),
+                D3D_OK,
+                "{frame}: clear depth"
+            );
+            assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLESTRIP, 2, &quad), D3D_OK);
+        });
+        assert_eq!(
+            h.read_pixel(160, 120),
+            color,
+            "{frame}: the quad reaches the back buffer"
+        );
+    }
+}
+
+#[test]
+fn offscreen_render_target_and_depth_bindings_survive_a_mid_frame_auto_resize() {
+    // A resize between a Clear and a draw of one frame flushes the frame. The
+    // draw after it still goes to the render target and the depth surface the
+    // game bound, not to the new back buffer.
+    let h = Harness::with_depth();
+    arm_diffuse_draws(&h);
+    let target = h.create_render_target(64, 64, D3DFMT_A8R8G8B8);
+    let depth = h.create_depth_stencil_surface(64, 64, D3DFMT_D24S8);
+    assert_eq!(h.set_render_target(0, &target), D3D_OK);
+    assert_eq!(h.set_depth_stencil_surface(&depth), D3D_OK);
+    let quad = full_quad(GREEN);
+    assert!(h.pump(), "WM_QUIT before render");
+    assert_eq!(h.begin_scene(), D3D_OK);
+    assert_eq!(
+        h.clear(D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, BLUE, 1.0, 0),
+        D3D_OK,
+        "clear the target and its depth"
+    );
+    let _ = h.send_window_message(WM_SIZE, 0, client_size(320, 240));
+    // The viewport and scissor `SetRenderTarget` gave the 64x64 target stay:
+    // the resize changed the back buffer, not the target being drawn.
+    let vp = h.viewport();
+    assert_eq!(
+        (vp.x, vp.y, vp.width, vp.height),
+        (0, 0, 64, 64),
+        "the viewport keeps the target's extent"
+    );
+    let scissor = h.scissor_rect();
+    assert_eq!(
+        (scissor.x1, scissor.y1, scissor.x2, scissor.y2),
+        (0, 0, 64, 64),
+        "the scissor keeps the target's extent"
+    );
+    assert_eq!(h.draw_primitive_up(D3DPT_TRIANGLESTRIP, 2, &quad), D3D_OK);
+    assert_eq!(h.end_scene(), D3D_OK);
+    assert_eq!(h.present(), D3D_OK);
+    assert_eq!(
+        h.render_target(0).as_ptr(),
+        target.as_ptr(),
+        "the game's target is still bound"
+    );
+    assert_eq!(
+        h.read_pixel(32, 32),
+        GREEN,
+        "the draw after the resize reached the target"
+    );
+}
+
+#[test]
+fn a_failed_auto_resize_leaves_no_destroyed_texture_bound() {
+    // A back buffer Metal refuses (65535 texels a side) leaves the device
+    // requiring Reset, with the old back buffer and depth texture already
+    // destroyed. A Clear recorded meanwhile reaches the GPU with the flush
+    // the Reset starts with, and must find no destroyed texture bound,
+    // neither the default target nor the back buffer and depth surface the
+    // game bound by hand.
+    const OVERSIZE: u16 = 0xffff;
+    let h = Harness::with_depth();
+    arm_diffuse_draws(&h);
+    {
+        let back_buffer = h.back_buffer(0);
+        let depth = h.depth_stencil_surface().expect("implicit depth surface");
+        assert_eq!(h.set_render_target(0, &back_buffer), D3D_OK);
+        assert_eq!(h.set_depth_stencil_surface(&depth), D3D_OK);
+    }
+    let _ = h.send_window_message(WM_SIZE, 0, client_size(OVERSIZE, OVERSIZE));
+    assert_eq!(
+        h.test_cooperative_level(),
+        D3DERR_DEVICENOTRESET,
+        "the refused back buffer requires Reset"
+    );
+    assert_eq!(
+        h.clear(D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, RED, 1.0, 0),
+        D3D_OK,
+        "a Clear before the Reset"
+    );
+    assert_eq!(h.reset(640, 480), D3D_OK, "Reset rebuilds the back buffer");
+    // Reset returned every state to its default, the FVF included.
+    arm_diffuse_draws(&h);
+    let quad = full_quad(GREEN);
+    h.render_once(BLUE, |d| {
+        assert_eq!(d.clear(D3DCLEAR_ZBUFFER, 0, 1.0, 0), D3D_OK);
+        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLESTRIP, 2, &quad), D3D_OK);
+    });
+    assert_eq!(
+        h.read_pixel(320, 240),
+        GREEN,
+        "the device draws after the Reset"
+    );
+}
+
+#[test]
+fn an_unbound_depth_surface_stays_unbound_across_an_auto_resize() {
+    // `SetDepthStencilSurface(NULL)` is the game's choice and the resize does
+    // not undo it: no depth surface is reported, and draws in the frames
+    // after the resize run without one.
+    let h = Harness::with_depth();
+    arm_diffuse_draws(&h);
+    assert_eq!(h.clear_depth_stencil_surface(), D3D_OK, "unbind depth");
+    let _ = h.send_window_message(WM_SIZE, 0, client_size(320, 240));
+    let (hr, surface) = h.depth_stencil_surface_hr();
+    assert_eq!(hr, D3DERR_NOTFOUND, "no depth surface after the resize");
+    assert!(surface.is_none(), "a null out-pointer with NOTFOUND");
+    for (color, frame) in [
+        (RED, "the frame after the resize"),
+        (GREEN, "the next frame"),
+    ] {
+        let quad = full_quad(color);
+        h.render_once(BLUE, |d| {
+            assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLESTRIP, 2, &quad), D3D_OK);
+        });
+        assert_eq!(h.read_pixel(160, 120), color, "{frame}: the draw lands");
+    }
 }

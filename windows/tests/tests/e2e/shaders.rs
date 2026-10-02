@@ -1448,6 +1448,66 @@ fn vertex_texture_fetch_reads_the_bound_slot() {
 }
 
 #[test]
+fn reset_restores_the_vertex_sampler_state_the_draw_samples_with() {
+    // Reset puts every sampler state back to its default, the vertex samplers
+    // included, and a texture bound after it samples with those defaults.
+    // The fetch reads u = 1.25 of a 2x1 texture, red then green: the default
+    // WRAP addressing reads the red texel, a CLAMP left over from before the
+    // Reset would read the green one.
+    const RED: u32 = 0xFFFF_0000;
+    const GREEN: u32 = 0xFF00_FF00;
+    let h = Harness::new();
+    let vertex_sampler_0 = mtld3d_types::D3DVERTEXTEXTURESAMPLER0;
+    assert_eq!(
+        h.set_sampler_state(
+            vertex_sampler_0,
+            mtld3d_types::D3DSAMP_ADDRESSU,
+            mtld3d_types::D3DTADDRESS_CLAMP
+        ),
+        0,
+        "CLAMP before the Reset"
+    );
+    assert_eq!(h.reset(640, 480), 0, "same-size Reset");
+    assert_eq!(
+        h.sampler_state(vertex_sampler_0, mtld3d_types::D3DSAMP_ADDRESSU),
+        mtld3d_types::D3DTADDRESS_WRAP,
+        "Reset reports the default addressing"
+    );
+
+    let tex = h.create_texture(2, 1, 1, 0, mtld3d_types::D3DFMT_A8R8G8B8, D3DPOOL_MANAGED);
+    tex.lock_rect(0, 0).write_u32(&[RED, GREEN]);
+    assert_eq!(
+        h.set_texture(vertex_sampler_0, &tex),
+        0,
+        "bind vertex sampler 0"
+    );
+    let mut vs_tokens = VS_FETCH.to_vec();
+    // `def c4` x, the fetch's u.
+    vs_tokens[15] = 1.25f32.to_bits();
+    let end = vs_tokens.pop().expect("end token");
+    vs_tokens.extend_from_slice(&[0x0200_0001, 0xE00F_0001, 0x80E4_0000, end]);
+    let vs = h.create_vertex_shader(&vs_tokens);
+    let ps = h.create_pixel_shader(&PS_COLOR_PASSTHROUGH);
+    assert_eq!(h.set_vertex_shader(&vs), 0, "SetVertexShader");
+    assert_eq!(h.set_pixel_shader(&ps), 0, "SetPixelShader");
+    assert_eq!(h.set_fvf(D3DFVF_XYZ), 0, "SetFVF");
+
+    let tri = centered_triangle();
+    h.render_once(0xFF00_00FF, |d| {
+        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &tri), 0, "draw");
+    });
+    assert_eq!(
+        h.read_pixel(320, 280),
+        RED,
+        "the fetch at u = 1.25 wraps to the red texel"
+    );
+
+    assert_eq!(h.clear_vertex_shader(), 0, "unbind VS");
+    assert_eq!(h.clear_pixel_shader(), 0, "unbind PS");
+    assert_eq!(h.clear_texture(vertex_sampler_0), 0, "unbind slot");
+}
+
+#[test]
 fn vertex_texture_fetch_keeps_intra_frame_versions() {
     // The upload after the left draw is ordered before the right draw. The
     // encoder executes uploads at frame start, so it must rename the sampled
