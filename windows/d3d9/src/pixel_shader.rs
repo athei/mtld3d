@@ -142,6 +142,12 @@ bitflags::bitflags! {
     }
 }
 
+// Each flag owns a bit: two flags on one bit would let `set` of either
+// clear the other.
+const _: () = assert!(
+    PsUsage::all().bits().count_ones() as usize == <PsUsage as bitflags::Flags>::FLAGS.len()
+);
+
 struct PixelShaderInner {
     device_inner: *mut DeviceInner,
     shader_id: ProgramId,
