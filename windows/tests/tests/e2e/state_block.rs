@@ -726,3 +726,44 @@ fn applied_blocks_restore_the_fixed_function_lights_and_material_a_draw_reads() 
         "ALL restored the white material, got ({r}, {g}, {b})"
     );
 }
+
+#[test]
+fn created_blocks_restore_a_light_past_the_eight_fast_path_slots() {
+    // Light 9 lives past the eight slots the fixed-function constants keep
+    // per index, but D3D9 addresses lights without a bound, and both block
+    // types that carry lights carry it: its parameters, its enable, and the
+    // lighting a draw after Apply reads.
+    for (sbt, name) in [(D3DSBT_ALL, "ALL"), (D3DSBT_VERTEXSTATE, "VERTEXSTATE")] {
+        let h = Harness::new();
+        assert_eq!(h.set_render_state(D3DRS_LIGHTING, 1), 0);
+        assert_eq!(h.set_render_state(D3DRS_CULLMODE, D3DCULL_NONE), 0);
+        assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_NORMAL), 0);
+        h.select_diffuse_stage(0);
+        assert_eq!(h.set_material(&diffuse_material(colour(1.0, 1.0, 1.0))), 0);
+        assert_eq!(h.set_light(9, &frontal_light(colour(1.0, 0.0, 0.0))), 0);
+        assert_eq!(h.light_enable(9, true), 0);
+
+        let block = h.create_state_block(sbt);
+        assert_eq!(h.set_light(9, &frontal_light(colour(0.0, 1.0, 0.0))), 0);
+        assert_eq!(h.light_enable(9, false), 0);
+        let (r, g, b) = draw_lit(&h);
+        assert!(
+            r <= 2 && g <= 2 && b <= 2,
+            "{name}: light 9 disabled before Apply, got ({r}, {g}, {b})"
+        );
+
+        assert_eq!(block.apply(), 0, "Apply {name}");
+        let restored = h.light(9).diffuse;
+        assert_eq!(
+            (restored.r.to_bits(), restored.g.to_bits()),
+            (1.0f32.to_bits(), 0.0f32.to_bits()),
+            "{name}: GetLight(9) reports the captured red light"
+        );
+        assert!(h.light_enabled(9), "{name}: light 9 enabled again");
+        let (r, g, b) = draw_lit(&h);
+        assert!(
+            r >= 0xF0 && g <= 2 && b <= 2,
+            "{name}: the restored red light 9 lights the quad, got ({r}, {g}, {b})"
+        );
+    }
+}

@@ -221,8 +221,9 @@ pub struct FfState {
     /// here. An enabled overflow light with a non-zero type feeds FF lighting:
     /// [`Self::resolve_active_lights`] packs it after the active fast-path
     /// slots, up to [`MAX_ACTIVE_LIGHTS`], so its writes mark the LIGHTS
-    /// section like a fast-path write. [`FfStateSnapshot`] does not capture
-    /// these slots. Empty for every workload that stays within 8 lights.
+    /// section like a fast-path write. [`FfStateSnapshot`] captures them with
+    /// the fast-path slots. Empty for every workload that stays within 8
+    /// lights.
     overflow_lights: BTreeMap<u32, OverflowLight>,
     texture_stage_states: [[u32; TEXTURE_STAGE_STATE_COUNT]; 8],
     /// Bit `s` set iff stage `s`'s `D3DTSS_TEXTURETRANSFORMFLAGS` is non-zero.
@@ -2497,12 +2498,17 @@ pub struct FfStateSnapshot {
     light_set_mask: u8,
     light_directional_mask: u8,
     light_spot_mask: u8,
+    /// The lights past the fast-path slots defined at capture: index, parameters, enable.
+    ///
+    /// Restoring puts each one back and leaves a light defined after the
+    /// capture as it is, since a block applies only the lights it captured.
+    overflow_lights: Vec<(u32, D3DLIGHT9, bool)>,
     texture_stage_states: [[u32; TEXTURE_STAGE_STATE_COUNT]; 8],
 }
 
 impl FfStateSnapshot {
     #[must_use]
-    pub const fn from(state: &FfState) -> Self {
+    pub fn from(state: &FfState) -> Self {
         Self {
             view: state.view,
             projection: state.projection,
@@ -2516,6 +2522,11 @@ impl FfStateSnapshot {
             light_set_mask: state.light_set_mask,
             light_directional_mask: state.light_directional_mask,
             light_spot_mask: state.light_spot_mask,
+            overflow_lights: state
+                .overflow_lights
+                .iter()
+                .map(|(&index, slot)| (index, slot.light, slot.enabled))
+                .collect(),
             texture_stage_states: state.texture_stage_states,
         }
     }
@@ -2533,6 +2544,7 @@ impl FfStateSnapshot {
         ff.light_set_mask = self.light_set_mask;
         ff.light_directional_mask = self.light_directional_mask;
         ff.light_spot_mask = self.light_spot_mask;
+        self.restore_overflow_lights(ff);
         ff.texture_stage_states = self.texture_stage_states;
         ff.recompute_tt_active_mask();
         // The arrays were written past the setters, so the constant sections
@@ -2579,6 +2591,7 @@ impl FfStateSnapshot {
             ff.light_set_mask = self.light_set_mask;
             ff.light_directional_mask = self.light_directional_mask;
             ff.light_spot_mask = self.light_spot_mask;
+            self.restore_overflow_lights(ff);
         }
         // Texture-stage states: whole-array for All, per-index otherwise. The
         // `0u32..` counter zipped with the per-stage array yields the `D3DTSS_*`
@@ -2608,6 +2621,14 @@ impl FfStateSnapshot {
             StateBlockType::Vertex => FfVsDirty::LIGHTS | FfVsDirty::TT,
             StateBlockType::Pixel => FfVsDirty::TT,
         };
+    }
+
+    /// Put the captured lights past the fast-path slots back, leaving every other one alone.
+    fn restore_overflow_lights(&self, ff: &mut FfState) {
+        for &(index, light, enabled) in &self.overflow_lights {
+            ff.overflow_lights
+                .insert(index, OverflowLight { light, enabled });
+        }
     }
 }
 

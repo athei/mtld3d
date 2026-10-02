@@ -1362,6 +1362,76 @@ fn overflow_light_writes_mark_lights_dirty() {
     });
 }
 
+/// A snapshot carries the lights past the fast-path slots to the block types that own lights.
+///
+/// `Vertex` and `All` put the captured light 100 back, parameters and
+/// enable, and leave light 200, defined after the capture, as it is: a block
+/// applies the lights it captured. `Pixel` leaves the overflow lights alone.
+#[test]
+fn snapshot_restores_overflow_lights_with_the_lights() {
+    use mtld3d_types::{D3DLIGHT_DIRECTIONAL, D3DLIGHT9, StateBlockType};
+
+    use super::FfStateSnapshot;
+
+    let captured = D3DLIGHT9 {
+        type_: D3DLIGHT_DIRECTIONAL,
+        range: 42.0,
+        ..Default::default()
+    };
+    let mut src = FfState::new();
+    src.set_light_at(100, &captured);
+    src.set_light_enabled_at(100, true);
+    let snap = FfStateSnapshot::from(&src);
+
+    let changed = |state: &mut FfState| {
+        state.set_light_at(
+            100,
+            &D3DLIGHT9 {
+                range: 7.0,
+                ..captured
+            },
+        );
+        state.set_light_enabled_at(100, false);
+        state.set_light_at(200, &captured);
+    };
+    for block_type in [StateBlockType::All, StateBlockType::Vertex] {
+        let mut state = FfState::new();
+        changed(&mut state);
+        snap.restore_filtered(&mut state, block_type);
+        assert_eq!(
+            state.get_light_at(100).map(|l| l.range.to_bits()),
+            Some(42.0_f32.to_bits()),
+            "{block_type:?} restores light 100"
+        );
+        assert!(
+            state.is_light_enabled_at(100),
+            "{block_type:?} restores the enable"
+        );
+        assert!(
+            state.is_light_defined_at(200),
+            "{block_type:?} leaves a light defined after the capture"
+        );
+    }
+    let mut state = FfState::new();
+    changed(&mut state);
+    snap.restore_into(&mut state);
+    assert_eq!(
+        state.get_light_at(100).map(|l| l.range.to_bits()),
+        Some(42.0_f32.to_bits()),
+        "restore_into restores light 100"
+    );
+
+    let mut state = FfState::new();
+    changed(&mut state);
+    snap.restore_filtered(&mut state, StateBlockType::Pixel);
+    assert_eq!(
+        state.get_light_at(100).map(|l| l.range.to_bits()),
+        Some(7.0_f32.to_bits()),
+        "Pixel leaves light 100"
+    );
+    assert!(!state.is_light_enabled_at(100), "Pixel leaves the enable");
+}
+
 /// Run `write` on a state with enabled overflow light 100 and assert it marked LIGHTS.
 fn assert_overflow_write_marks_lights(name: &str, write: fn(&mut FfState)) {
     let mut state = FfState::new();
