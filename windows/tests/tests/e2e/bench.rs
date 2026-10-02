@@ -1524,7 +1524,10 @@ impl Metrics {
     /// - `_peak_ms`, the worst frame: `perf.<key>` in ms, `info`, the largest
     ///   of the windows.
     /// - `_ms`, a per-frame average: `perf.<key>` in ms, `time`, the windows'
-    ///   mean weighted by their frames. `_avg_ms`, an average per event, is
+    ///   mean weighted by the frames the key divides by: the compilation
+    ///   keys (`comp_*_ms`) but the two remainders cover every frame
+    ///   (`frames`), the timer keys the timed frames (`timed_frames`, or
+    ///   `frames` on a line without it). `_avg_ms`, an average per event, is
     ///   weighted by the event's count where the line carries it
     ///   (`comp_async_latency_avg_ms` by `comp_async_installs_total`) and by
     ///   frames otherwise.
@@ -1581,8 +1584,12 @@ impl Metrics {
                     .find_map(|&(key, value)| (key == wanted).then_some(value))
             };
             let frames = find("frames").unwrap_or(0.0);
+            // A layer that times one frame in several reports its timer
+            // rows per timed frame, so those weigh by its timed frames
+            // (`FrameSet::Timed`).
+            let timed = find("timed_frames").unwrap_or(frames);
             for &(key, value) in &pairs {
-                if key == "window_s" || key == "frames" {
+                if key == "window_s" || key == "frames" || key == "timed_frames" {
                     continue;
                 }
                 let Some(rule) = perf_rule(key, work) else {
@@ -1590,7 +1597,8 @@ impl Metrics {
                 };
                 let weight = match rule.fold {
                     Fold::EventMean(events) => find(events).unwrap_or(0.0),
-                    Fold::FrameMean | Fold::Max | Fold::PerFrame => frames,
+                    Fold::FrameMean(FrameSet::Timed) => timed,
+                    Fold::FrameMean(FrameSet::Every) | Fold::Max | Fold::PerFrame => frames,
                 };
                 folds
                     .entry(key)
@@ -1892,14 +1900,22 @@ struct PerfRule {
 
 /// How the values one key takes in several windows become one.
 enum Fold {
-    /// The mean of per-frame values, weighted by each window's frames.
-    FrameMean,
+    /// The mean of per-frame values, weighted by each window's frames in the given set.
+    FrameMean(FrameSet),
     /// The mean of per-event values, weighted by each window's count of the event, the key named.
     EventMean(&'static str),
     /// The largest value of any window.
     Max,
     /// The windows' totals summed, over their frames summed.
     PerFrame,
+}
+
+/// The frames a `_ms` key of the `perf-kv` line is divided by.
+enum FrameSet {
+    /// Every frame of the window (`frames`).
+    Every,
+    /// The frames that ran their timers (`timed_frames`).
+    Timed,
 }
 
 /// The running sums one key's values fold into.
@@ -1931,7 +1947,7 @@ impl PerfFold {
             }
         };
         match fold {
-            Fold::FrameMean | Fold::EventMean(_) => over(self.weighted),
+            Fold::FrameMean(_) | Fold::EventMean(_) => over(self.weighted),
             Fold::Max => self.max,
             Fold::PerFrame => over(self.sum),
         }
@@ -1961,7 +1977,17 @@ fn perf_rule(key: &str, work: &FrameWork) -> Option<PerfRule> {
         return rule(own(), events, PerfUnit::Ms, 4, Class::Time);
     }
     if key.ends_with("_ms") {
-        return rule(own(), Fold::FrameMean, PerfUnit::Ms, 4, Class::Time);
+        // The compilation keys divide by every frame, but the two remainders,
+        // which come from the encoder's per-draw phases of the timed frames.
+        let every = key.starts_with("comp_")
+            && key != "comp_resolve_remainder_ms"
+            && key != "comp_pipeline_remainder_ms";
+        let set = if every {
+            FrameSet::Every
+        } else {
+            FrameSet::Timed
+        };
+        return rule(own(), Fold::FrameMean(set), PerfUnit::Ms, 4, Class::Time);
     }
     if key.ends_with("_bytes") {
         return rule(own(), Fold::Max, PerfUnit::Bytes, 0, Class::Bytes);

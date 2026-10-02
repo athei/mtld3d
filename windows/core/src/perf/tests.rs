@@ -292,7 +292,7 @@ fn api_perf_drain_moves_and_resets() {
     api.bump_vbib_write_in_place_contended();
 
     let mut p = FramePerfPayload::new();
-    api.drain_into_payload(&mut p);
+    api.drain_into_payload(&mut p, true);
 
     assert_eq!(
         p.counters.api_cycles_by_category[ApiCategory::VertexBuffer as usize],
@@ -321,7 +321,7 @@ fn api_perf_drain_moves_and_resets() {
 
     // Second drain should report a real frame_total (tsc moved).
     let mut p2 = FramePerfPayload::new();
-    api.drain_into_payload(&mut p2);
+    api.drain_into_payload(&mut p2, true);
     assert!(
         p2.timing.frame_total_cycles > 0,
         "second drain must see a non-zero TSC delta"
@@ -436,7 +436,7 @@ fn staged_upload_summary_marks_saturated_derived_counts() {
         }
         let summary = Summary::render_with_ansi(&window, &sample_caches(), 2.01, false);
         assert!(summary.contains("  GPU copy  count=saturated bytes=49152"));
-        let kv = render_kv(&window, &sample_caches(), 2.01).finish();
+        let kv = render_kv(&window, &window, &sample_caches(), 2.01).finish();
         assert!(
             !kv.contains(" vbib_gpu_copy_total="),
             "an unknown count is left out"
@@ -457,7 +457,7 @@ fn summary_golden_layout() {
     let caches = sample_caches();
     let got = Summary::render_with_ansi(&w, &caches, 2.01, false);
     let want = concat!(
-        "── perf  window=2.01s  frames=1  bottleneck=ENCODER (GPU) ──\n",
+        "── perf  window=2.01s  frames=1  timed=1  bottleneck=ENCODER (GPU) ──\n",
         "reset epochs=0..0; inverse/upload counts are interval totals (not cumulative)\n",
         "buckets: api_d3d9=2.80  api_outside=3.00  enc_work=1.50  submit_work=0.10  gpu_wait=6.00  (ms/frame, avg)\n",
         "\n",
@@ -654,9 +654,9 @@ fn summary_golden_layout() {
 /// precision.
 #[test]
 fn kv_golden_line() {
-    let got = render_kv(&sample_window(), &sample_caches(), 2.01).finish();
+    let got = render_kv(&sample_window(), &sample_window(), &sample_caches(), 2.01).finish();
     let want = concat!(
-        "perf-kv v1 window_s=2.010 frames=1",
+        "perf-kv v1 window_s=2.010 frames=1 timed_frames=1",
         " frame_ms=10.000 frame_peak_ms=10.000 api_d3d9_ms=2.800 api_d3d9_peak_ms=2.800",
         " api_outside_ms=3.000 api_outside_peak_ms=3.000 enc_work_ms=1.500",
         " enc_work_peak_ms=1.500 submit_work_ms=0.100 submit_work_peak_ms=0.100",
@@ -818,7 +818,7 @@ fn kv_aggregates_average_peak_and_total_over_frames() {
     let mut w = PerfWindow::new();
     w.accumulate(&light);
     w.accumulate(&heavy);
-    let line = render_kv(&w, &sample_caches(), 2.0).finish();
+    let line = render_kv(&w, &w, &sample_caches(), 2.0).finish();
     let expected = [
         "perf-kv v1 window_s=2.000 frames=2 ".to_owned(),
         format!(" frame_ms={:.3} ", cycles_to_ms(12_000_000) / 2.0),
@@ -845,7 +845,7 @@ fn kv_aggregates_average_peak_and_total_over_frames() {
 fn kv_keys_are_unique_and_unit_suffixed() {
     const FLOAT_SUFFIXES: [&str; 1] = ["_ms"];
     const INTEGER_SUFFIXES: [&str; 3] = ["_total", "_bytes", "_count"];
-    let mut kv = render_kv(&sample_window(), &sample_caches(), 2.01);
+    let mut kv = render_kv(&sample_window(), &sample_window(), &sample_caches(), 2.01);
     compilation::CompilationPerf::new().append_kv(&mut kv);
     let line = kv.finish();
     assert!(
@@ -854,8 +854,14 @@ fn kv_keys_are_unique_and_unit_suffixed() {
     );
     let mut fields = line.split(' ');
     assert_eq!(
-        fields.by_ref().take(4).collect::<Vec<_>>(),
-        ["perf-kv", "v1", "window_s=2.010", "frames=1"]
+        fields.by_ref().take(5).collect::<Vec<_>>(),
+        [
+            "perf-kv",
+            "v1",
+            "window_s=2.010",
+            "frames=1",
+            "timed_frames=1"
+        ]
     );
     let mut seen = FxHashSet::default();
     for field in fields {
@@ -1032,7 +1038,7 @@ fn sample_window() -> PerfWindow {
     sampled_rebuilds[SnapshotSection::Rs as usize] = 5;
     let s = FrameSample {
         counters: FrameCounters {
-            reserved: 0,
+            timed: 1,
             reset_epoch: 0,
             reset_epoch_saturated: 0,
             inverse_view: [0; 3],
@@ -1341,8 +1347,8 @@ fn exclusive_exit_saturates_when_children_exceed_elapsed() {
 fn api_timer_storage_outlives_nested_device_release() {
     let mut storage = ApiPerfStorage::new();
     let weak = Rc::downgrade(&storage.state);
-    let outer = ApiTimer::new(Some(&storage), ApiCategory::Texture);
-    let inner = ApiTimer::new(Some(&storage), ApiCategory::Device);
+    let outer = ApiTimer::new(Some(&storage), ApiCategory::Texture, true);
+    let inner = ApiTimer::new(Some(&storage), ApiCategory::Device, true);
     storage.state_mut().bump_texture_rename();
     assert_eq!(storage.state.borrow().timer_depth, 2);
     drop(storage);
@@ -1366,7 +1372,7 @@ fn api_timer_storage_outlives_nested_device_release() {
 fn api_timer_storage_outlives_direct_device_release() {
     let storage = ApiPerfStorage::new();
     let weak = Rc::downgrade(&storage.state);
-    let timer = ApiTimer::new(Some(&storage), ApiCategory::Device);
+    let timer = ApiTimer::new(Some(&storage), ApiCategory::Device, true);
     drop(storage);
     assert_eq!(weak.strong_count(), 1);
     drop(timer);
@@ -1376,8 +1382,8 @@ fn api_timer_storage_outlives_direct_device_release() {
 #[test]
 fn api_timer_nested_writeback_balances_depth_and_counts() {
     let storage = ApiPerfStorage::new();
-    let outer = ApiTimer::new(Some(&storage), ApiCategory::Surface);
-    let inner = ApiTimer::new(Some(&storage), ApiCategory::Texture);
+    let outer = ApiTimer::new(Some(&storage), ApiCategory::Surface, true);
+    let inner = ApiTimer::new(Some(&storage), ApiCategory::Texture, true);
     drop(inner);
     drop(outer);
     let state = storage.state.borrow();
@@ -1431,7 +1437,7 @@ fn inverse_counts_partition_builds_and_preserve_reset_intervals() {
         api.record_inverse_view(cache.last_use());
     }
     let mut payload = FramePerfPayload::new();
-    api.drain_into_payload(&mut payload);
+    api.drain_into_payload(&mut payload, true);
     assert_eq!(payload.counters.inverse_view, [1, 1, 1]);
     assert_eq!(api.counters.inverse_view, [0; 3]);
     let mut old = sample(0, 0);
@@ -1444,7 +1450,7 @@ fn inverse_counts_partition_builds_and_preserve_reset_intervals() {
     let _ = cache.build_bytes(&rs, 1.0f32.to_bits(), &D3DMATRIX::IDENTITY, &[]);
     assert!(matches!(cache.last_use(), InverseViewUse::Recompute));
     api.record_inverse_view(cache.last_use());
-    api.drain_into_payload(&mut payload);
+    api.drain_into_payload(&mut payload, true);
     let mut new = sample(0, 0);
     new.counters = payload.counters;
     w.accumulate(&new);
@@ -1460,7 +1466,7 @@ fn inverse_counts_partition_builds_and_preserve_reset_intervals() {
     assert!(out.contains("epoch=0 builds=3 bypass=1 hit=1 recompute=1 enabled-hit=50.0%"));
     assert!(out.contains("epoch=1 builds=1 bypass=0 hit=0 recompute=1 enabled-hit=0.0%"));
     let mut other = ApiPerfState::new();
-    other.drain_into_payload(&mut payload);
+    other.drain_into_payload(&mut payload, true);
     assert_eq!(payload.counters.reset_epoch, 0);
     assert_eq!(payload.counters.inverse_view, [0; 3]);
     let mut other_window = PerfWindow::new();
@@ -1476,7 +1482,7 @@ fn inverse_rates_are_undefined_for_empty_or_saturated_counts() {
     let mut api = ApiPerfState::new();
     api.record_inverse_view(&InverseViewUse::Bypass);
     let mut payload = FramePerfPayload::new();
-    api.drain_into_payload(&mut payload);
+    api.drain_into_payload(&mut payload, true);
     let mut s = sample(0, 0);
     s.counters = payload.counters;
     let mut w = PerfWindow::new();
@@ -1487,7 +1493,7 @@ fn inverse_rates_are_undefined_for_empty_or_saturated_counts() {
     api.record_inverse_view(&InverseViewUse::Hit);
     assert!(api.counters.inverse_view_saturated != 0);
     assert_eq!(api.counters.inverse_view[1], u64::MAX);
-    api.drain_into_payload(&mut payload);
+    api.drain_into_payload(&mut payload, true);
     s.counters = payload.counters;
     w.accumulate(&s);
     let out = Summary::render_with_ansi(&w, &sample_caches(), 5.0, false);
@@ -1500,7 +1506,7 @@ fn inverse_rates_are_undefined_for_empty_or_saturated_counts() {
     assert!(w.inverse_epochs[0].saturated);
     api.reset_epoch = u64::MAX;
     api.advance_reset_epoch();
-    api.drain_into_payload(&mut payload);
+    api.drain_into_payload(&mut payload, true);
     assert_eq!(payload.counters.reset_epoch, u64::MAX);
     assert!(payload.counters.reset_epoch_saturated != 0);
 }
@@ -1648,4 +1654,247 @@ fn sections_above_keys_keep_the_rest_from_the_sampled_draws() {
     assert_eq!(w.draw_snapshot_keys_resid_sum(), 32_000);
     let grid = Summary::render_with_ansi(&w, &sample_caches(), 2.0, false);
     assert!(grid.contains("└─ rest"), "the rest row renders: {grid}");
+}
+
+/// About one frame in the period is timed, with gaps that never repeat on a fixed beat.
+#[test]
+fn frames_are_timed_about_one_in_the_period() {
+    let mut state = ApiPerfState::new();
+    let mut payload = FramePerfPayload::new();
+    let frames = 32_000u32;
+    let mut timed = 0u32;
+    let period = u32::from(FRAME_SAMPLE_PERIOD);
+    let mut by_phase = [0u32; FRAME_SAMPLE_PERIOD as usize];
+    for frame in 0..frames {
+        state.drain_into_payload(&mut payload, true);
+        if payload.counters.timed != 0 {
+            timed += 1;
+            by_phase[(frame % period) as usize] += 1;
+        }
+    }
+    let expected = frames / u32::from(FRAME_SAMPLE_PERIOD);
+    assert!(
+        timed.abs_diff(expected) < expected / 10,
+        "{timed} of {frames} timed"
+    );
+    for (phase, &n) in by_phase.iter().enumerate() {
+        assert!(
+            n > expected / 32,
+            "frames at position {phase} of 16 timed {n} times"
+        );
+    }
+}
+
+/// An untimed frame hands out no draw-phase target, and the encoder follows the frame's flag.
+#[test]
+fn untimed_frames_run_no_phase_timers_on_either_side() {
+    let mut storage = ApiPerfStorage::new();
+    storage.state.borrow_mut().untimed_frames = 3;
+    assert!(storage.as_ptr().is_null());
+    storage.state.borrow_mut().untimed_frames = 0;
+    assert!(!storage.as_ptr().is_null());
+
+    let mut enc = EncoderPerfState::new();
+    let mut payload = FramePerfPayload::new();
+    payload.counters.timed = 0;
+    enc.begin_frame(&payload);
+    assert!(enc.op_sub_cycles_ptr(OpSub::Binds).is_null());
+    assert!(enc.op_sub_detail_ptr(OpSubDetail::BDraw).is_null());
+    payload.counters.timed = 1;
+    enc.begin_frame(&payload);
+    assert!(!enc.op_sub_cycles_ptr(OpSub::Binds).is_null());
+    assert!(!enc.op_sub_detail_ptr(OpSubDetail::BDraw).is_null());
+}
+
+/// In an untimed frame a timer only counts its call; a `Frame` call's timer reads the clock.
+#[test]
+fn untimed_frame_counts_every_call_and_times_only_the_frame_calls() {
+    let storage = ApiPerfStorage::new();
+    storage.state.borrow_mut().untimed_frames = 5;
+    let counted = ApiTimer::frame_gated(Some(&storage), ApiCategory::Device, false);
+    assert!(!counted.clock, "an untimed frame reads no clock");
+    assert_eq!(storage.state.borrow().timer_depth, 0);
+    drop(counted);
+    let frame = ApiTimer::frame_gated(Some(&storage), ApiCategory::Device, true);
+    assert!(frame.clock, "a Frame call reads the clock in every frame");
+    assert_eq!(storage.state.borrow().timer_depth, 1);
+    drop(frame);
+    let state = storage.state.borrow();
+    assert_eq!(
+        state.counters.api_call_counts_by_category[ApiCategory::Device as usize],
+        2,
+        "both calls counted"
+    );
+    assert_eq!(state.timer_depth, 0);
+}
+
+/// A mid-frame flush keeps the frame's flag; only the presenting drain draws the next gap.
+#[test]
+fn a_flush_keeps_the_frame_flag_and_a_present_moves_on() {
+    let mut state = ApiPerfState::new();
+    let mut payload = FramePerfPayload::new();
+    state.untimed_frames = 0;
+    for _ in 0..3 {
+        state.drain_into_payload(&mut payload, false);
+        assert_eq!(
+            payload.counters.timed, 1,
+            "every piece of a timed frame is timed"
+        );
+        assert_eq!(state.untimed_frames, 0);
+    }
+    state.untimed_frames = 4;
+    state.drain_into_payload(&mut payload, false);
+    assert_eq!(payload.counters.timed, 0);
+    assert_eq!(
+        state.untimed_frames, 4,
+        "a flush does not count down the gap"
+    );
+    state.drain_into_payload(&mut payload, true);
+    assert_eq!(payload.counters.timed, 0);
+    assert_eq!(state.untimed_frames, 3, "the present does");
+}
+
+/// Every frame's counts reach the count window; only timed frames reach the timer window.
+#[test]
+fn every_frame_folds_its_counts_and_only_timed_frames_their_timers() {
+    let mut enc = EncoderPerfState::new();
+    for timed in [1, 0, 0, 1, 0] {
+        let mut frame = sample(100, 0);
+        frame.counters.timed = timed;
+        frame.counters.vb_rename = 2;
+        frame.draws = 7;
+        enc.fold(&frame);
+    }
+    assert_eq!(enc.count_window.frames, 5);
+    assert_eq!(enc.perf_window.frames, 2);
+    assert_eq!(enc.count_window.vb_rename.sum, 10);
+    assert_eq!(enc.count_window.draws.sum, 35);
+    assert_eq!(
+        enc.perf_window.enc_cyc.sum, 200,
+        "the timers of the two timed frames"
+    );
+    let line = render_kv(&enc.perf_window, &enc.count_window, &sample_caches(), 2.0).finish();
+    assert!(line.contains(" frames=5 timed_frames=2 "), "{line}");
+    assert!(line.contains(" vb_rename_total=10 "), "{line}");
+}
+
+/// A window with no timed frame still reports its counts, with its timer rows at zero.
+#[test]
+fn a_window_without_timed_frames_reports_counts_and_zero_timers() {
+    let mut count = PerfWindow::new();
+    let mut frame = sample(100, 0);
+    frame.counters.vb_rename = 3;
+    count.accumulate(&frame);
+    let timed = PerfWindow::new();
+    let line = render_kv(&timed, &count, &sample_caches(), 2.0).finish();
+    assert!(line.contains(" frames=1 timed_frames=0 "), "{line}");
+    assert!(line.contains(" vb_rename_total=3 "), "{line}");
+    assert!(line.contains(" frame_ms=0.000 "), "{line}");
+    let grid = Summary::render_windows(&timed, &count, &sample_caches(), 2.0, false);
+    assert!(grid.contains("frames=1  timed=0"), "{grid}");
+}
+
+/// The grid takes its counts and the peaks of the every-frame timers from every frame.
+///
+/// The per-call ratios stay with the timed frames, whose time they divide.
+#[test]
+fn grid_counts_and_every_frame_peaks_come_from_every_frame() {
+    let device = ApiCategory::Device as usize;
+    let render_state = DeviceSubCategory::RenderState as usize;
+    let timed_frame = {
+        let mut frame = sample(100, 0);
+        frame.counters.timed = 1;
+        frame.counters.api_call_counts_by_category[device] = 10;
+        frame.counters.device_sub_calls[render_state] = 10;
+        frame.counters.device_sub_cycles[render_state] = ns_to_cycles(1_000);
+        frame.enc.slot_waits = 1;
+        frame.timing.frame_total_cycles = ns_to_cycles(1_000_000);
+        frame.timing.present_block_cycles = ns_to_cycles(100_000);
+        frame
+    };
+    let untimed_frame = {
+        let mut frame = sample(100, 0);
+        frame.counters.api_call_counts_by_category[device] = 30;
+        frame.counters.device_sub_calls[render_state] = 30;
+        frame.enc.slot_waits = 4;
+        frame.timing.frame_total_cycles = ns_to_cycles(9_000_000);
+        frame.timing.present_block_cycles = ns_to_cycles(7_000_000);
+        frame
+    };
+    let mut enc = EncoderPerfState::new();
+    enc.fold(&timed_frame);
+    enc.fold(&untimed_frame);
+    let grid = Summary::render_windows(
+        &enc.perf_window,
+        &enc.count_window,
+        &sample_caches(),
+        2.0,
+        false,
+    );
+    let row = |label: &str| {
+        grid.lines()
+            .find(|line| line.starts_with(label))
+            .unwrap_or_else(|| panic!("no {label} row in\n{grid}"))
+            .to_owned()
+    };
+    assert!(row("├─ D3D9 calls").contains("40 calls"), "{grid}");
+    assert!(row("│  ├─ Device").contains("(        40)"), "{grid}");
+    assert!(row("└─ Slot waits").contains("(         5)"), "{grid}");
+    assert!(
+        row("│  │  ├─ RenderState").contains("( 100 ns/call)"),
+        "the ratio divides the timed frame's time by its own calls: {grid}"
+    );
+    let peak = |ns: u64| format!("peak {:>5.2} ms", cycles_to_ms(ns_to_cycles(ns)));
+    assert!(row("API thread").contains(&peak(9_000_000)), "{grid}");
+    assert!(row("Frame total").contains(&peak(9_000_000)), "{grid}");
+    assert!(
+        row("│  │  │  ├─ Send stall").contains(&peak(7_000_000)),
+        "{grid}"
+    );
+
+    let line = render_kv(&enc.perf_window, &enc.count_window, &sample_caches(), 2.0).finish();
+    assert!(line.contains(" api_calls_total=40 "), "{line}");
+    assert!(line.contains(" slot_waits_total=5 "), "{line}");
+    let kv_peak = |ns: u64| format!("{:.3}", cycles_to_ms(ns_to_cycles(ns)));
+    assert!(
+        line.contains(&format!(" frame_peak_ms={} ", kv_peak(9_000_000))),
+        "{line}"
+    );
+    assert!(
+        line.contains(&format!(" present_stall_peak_ms={} ", kv_peak(7_000_000))),
+        "{line}"
+    );
+    assert!(
+        line.contains(&format!(" frame_ms={} ", kv_peak(1_000_000))),
+        "the time stays with the timed frame: {line}"
+    );
+}
+
+/// The frame picks follow the seed alone: the draw picks between presents leave them be.
+#[test]
+fn frame_picks_depend_only_on_the_seed_and_the_frame_count() {
+    let picks = |seed: u32, draws_per_frame: u32| {
+        let mut state = ApiPerfState::with_frame_seed(seed);
+        let mut payload = FramePerfPayload::new();
+        (0..512)
+            .map(|_| {
+                for _ in 0..draws_per_frame {
+                    state.record_snapshot_rebuild(SnapshotSection::Rs.bit());
+                }
+                state.drain_into_payload(&mut payload, true);
+                payload.counters.timed != 0
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        picks(7, 0),
+        picks(7, 37),
+        "draws do not move the frame picks"
+    );
+    assert_ne!(picks(7, 0), picks(8, 0), "another seed picks other frames");
+    assert_eq!(
+        ApiPerfState::with_frame_seed(0).frame_sample_state,
+        1,
+        "a zero seed is made odd, since xorshift stays at 0"
+    );
 }
