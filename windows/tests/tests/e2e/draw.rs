@@ -1056,6 +1056,98 @@ fn draw_without_decl_or_fvf_is_invalid_but_a_bound_draw_still_renders() {
     );
 }
 
+/// A draw of zero primitives succeeds and draws nothing; an inline draw with a zero stride fails.
+///
+/// D3D9 answers `D3D_OK` for a zero primitive count on every draw entry point
+/// and every primitive type, fans included, and `D3DERR_INVALIDCALL` for a
+/// `DrawPrimitiveUP` or `DrawIndexedPrimitiveUP` whose vertex stride is zero,
+/// whatever the count.
+#[test]
+fn zero_primitive_draws_succeed_and_a_zero_inline_stride_fails() {
+    let h = Harness::new();
+    arm_diffuse(&h);
+    let v = |x: f32, y: f32| PosColorVertex {
+        x,
+        y,
+        z: 0.5,
+        color: GREEN,
+    };
+    let tri = [v(0.0, 0.5), v(0.5, -0.5), v(-0.5, -0.5)];
+    let indices: [u16; 3] = [0, 1, 2];
+    let stride = u32::try_from(core::mem::size_of::<PosColorVertex>()).expect("stride fits u32");
+    let vb = h.create_vertex_buffer(stride * 3, D3DUSAGE_WRITEONLY, 0, D3DPOOL_DEFAULT);
+    vb.lock(0, 0, 0).write(&tri);
+    assert_eq!(h.set_stream_source(0, &vb, 0, stride), 0, "SetStreamSource");
+    let ib = h.create_index_buffer(6, D3DUSAGE_WRITEONLY, D3DFMT_INDEX16, D3DPOOL_DEFAULT);
+    ib.lock(0, 0, 0).write(&indices);
+    assert_eq!(h.set_indices(&ib), 0, "SetIndices");
+    let inline = |prim, prim_count| DrawIndexedUpParams {
+        prim,
+        min_vertex_index: 0,
+        num_vertices: 3,
+        prim_count,
+        index_format: D3DFMT_INDEX16,
+    };
+    h.render_once(BLACK, |d| {
+        for prim in [
+            D3DPT_POINTLIST,
+            D3DPT_LINELIST,
+            D3DPT_LINESTRIP,
+            D3DPT_TRIANGLELIST,
+            D3DPT_TRIANGLESTRIP,
+            D3DPT_TRIANGLEFAN,
+        ] {
+            assert_eq!(
+                d.draw_primitive(prim, 0, 0),
+                0,
+                "DrawPrimitive of type {prim} with no primitives"
+            );
+            assert_eq!(
+                d.draw_indexed_primitive(prim, 0, 0, 3, 0, 0),
+                0,
+                "DrawIndexedPrimitive of type {prim} with no primitives"
+            );
+            assert_eq!(
+                d.draw_primitive_up(prim, 0, &tri),
+                0,
+                "DrawPrimitiveUP of type {prim} with no primitives"
+            );
+            assert_eq!(
+                d.draw_indexed_primitive_up(&inline(prim, 0), &indices, &tri),
+                0,
+                "DrawIndexedPrimitiveUP of type {prim} with no primitives"
+            );
+            for prim_count in [0, 1] {
+                assert_eq!(
+                    d.draw_primitive_up_with_stride(prim, prim_count, &tri, 0),
+                    D3DERR_INVALIDCALL,
+                    "DrawPrimitiveUP of type {prim}, count {prim_count}, with a zero stride"
+                );
+                assert_eq!(
+                    d.draw_indexed_primitive_up_with_stride(
+                        &inline(prim, prim_count),
+                        &indices,
+                        &tri,
+                        0
+                    ),
+                    D3DERR_INVALIDCALL,
+                    "DrawIndexedPrimitiveUP of type {prim}, count {prim_count}, with a zero stride"
+                );
+            }
+        }
+    });
+    assert_eq!(
+        h.read_pixel(320, 240),
+        BLACK,
+        "none of the accepted draws put a primitive on screen"
+    );
+    // The device is still usable: the same bound triangle draws.
+    h.render_once(BLACK, |d| {
+        assert_eq!(d.draw_primitive(D3DPT_TRIANGLELIST, 0, 1), 0, "a real draw");
+    });
+    assert_eq!(h.read_pixel(320, 240), GREEN, "the real draw renders");
+}
+
 #[test]
 fn bound_buffer_uses_stream_source_stride_not_decl_extent() {
     // A bound `DrawPrimitive` steps the vertex stream by the `SetStreamSource`

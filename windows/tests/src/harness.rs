@@ -1264,6 +1264,28 @@ impl Harness {
         }
     }
 
+    /// `DrawPrimitiveUP` with a stride the caller names rather than `size_of::<V>()`.
+    ///
+    /// For a test of the stride's own validation, such as a zero stride.
+    pub fn draw_primitive_up_with_stride<V>(
+        &self,
+        prim: u32,
+        prim_count: u32,
+        verts: &[V],
+        stride: u32,
+    ) -> i32 {
+        // SAFETY: vtable thunk; `verts` is read-only for the call.
+        unsafe {
+            (self.dev_vtbl().draw_primitive_up)(
+                self.device,
+                prim,
+                prim_count,
+                verts.as_ptr().cast::<c_void>(),
+                stride,
+            )
+        }
+    }
+
     /// `DrawPrimitive` against the bound stream source.
     pub fn draw_primitive(&self, prim: u32, start_vertex: u32, prim_count: u32) -> i32 {
         // SAFETY: vtable thunk; `self.device` is live.
@@ -1304,6 +1326,20 @@ impl Harness {
         indices: &[I],
         verts: &[V],
     ) -> i32 {
+        let stride = u32::try_from(core::mem::size_of::<V>()).expect("vertex stride fits u32");
+        self.draw_indexed_primitive_up_with_stride(params, indices, verts, stride)
+    }
+
+    /// `DrawIndexedPrimitiveUP` with a vertex stride the caller names. Returns the hr.
+    ///
+    /// For a test of the stride's own validation, such as a zero stride.
+    pub fn draw_indexed_primitive_up_with_stride<I, V>(
+        &self,
+        params: &DrawIndexedUpParams,
+        indices: &[I],
+        verts: &[V],
+        stride: u32,
+    ) -> i32 {
         let &DrawIndexedUpParams {
             prim,
             min_vertex_index,
@@ -1311,7 +1347,6 @@ impl Harness {
             prim_count,
             index_format,
         } = params;
-        let stride = u32::try_from(core::mem::size_of::<V>()).expect("vertex stride fits u32");
         // SAFETY: vtable thunk; both slices are read-only for the call.
         unsafe {
             (self.dev_vtbl().draw_indexed_primitive_up)(

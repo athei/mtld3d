@@ -10284,6 +10284,51 @@ const fn has_vertex_layout_source(dev: &DeviceInner) -> bool {
     !dev.vertex_decl().is_null() || dev.fvf_field() != 0
 }
 
+/// The `log_once_warn_by!` key of a log line shared by several entry points.
+///
+/// Keyed by the entry point's name, so each caller of a shared cold helper
+/// logs its own first occurrence instead of the first caller hiding the rest.
+fn caller_log_key(call: &str) -> u64 {
+    use core::hash::BuildHasher as _;
+    rustc_hash::FxBuildHasher.hash_one(call)
+}
+
+/// The `INVALIDCALL` every `Draw*` answers with no vertex declaration and no FVF bound.
+#[cold]
+#[inline(never)]
+fn reject_missing_vertex_layout(call: &str) -> i32 {
+    mtld3d_shared::log_once_warn_by!(
+        target: LOG_TARGET,
+        key: caller_log_key(call),
+        "{call} with neither a vertex declaration nor an FVF bound → INVALIDCALL"
+    );
+    D3DERR_INVALIDCALL
+}
+
+/// The `INVALIDCALL` a triangle fan answers when its rewrite to a list cannot address it.
+#[cold]
+#[inline(never)]
+fn reject_unaddressable_fan(call: &str, primitive_count: u32) -> i32 {
+    mtld3d_shared::log_once_warn_by!(
+        target: LOG_TARGET,
+        key: caller_log_key(call),
+        "{call}: a {primitive_count}-triangle fan has an index past u32 → INVALIDCALL"
+    );
+    D3DERR_INVALIDCALL
+}
+
+/// The `INVALIDCALL` an inline draw answers for a zero vertex stride.
+#[cold]
+#[inline(never)]
+fn reject_zero_up_stride(call: &str) -> i32 {
+    mtld3d_shared::log_once_warn_by!(
+        target: LOG_TARGET,
+        key: caller_log_key(call),
+        "{call} with a zero vertex stride → INVALIDCALL"
+    );
+    D3DERR_INVALIDCALL
+}
+
 extern "system" fn device_draw_primitive(
     this: *mut c_void,
     primitive_type: u32,
@@ -10299,16 +10344,17 @@ extern "system" fn device_draw_primitive(
     };
     let dev = obj.inner();
     if !has_vertex_layout_source(dev) {
+        return reject_missing_vertex_layout("DrawPrimitive");
+    }
+    // A draw of no primitives is valid and draws nothing.
+    if primitive_count == 0 {
         std::hint::cold_path();
-        return D3DERR_INVALIDCALL;
+        return D3D_OK;
     }
     // Triangle fan has no Metal primitive: rewrite it as a triangle-list index
     // stream over the bound streams. Kept off the (non-fan) hot path below.
     if primitive_type == D3DPT_TRIANGLEFAN {
         std::hint::cold_path();
-        if primitive_count == 0 {
-            return D3DERR_INVALIDCALL;
-        }
         // The encoder's shared 16-bit pattern covers every fan a 16-bit index
         // can address and costs nothing per draw; anything longer, or a start
         // vertex past the base-vertex range, gets a generated 32-bit list.
@@ -10321,7 +10367,7 @@ extern "system" fn device_draw_primitive(
             }
         } else {
             let Some(fan) = convert::FanRewrite::sequential(start_vertex, primitive_count) else {
-                return D3DERR_INVALIDCALL;
+                return reject_unaddressable_fan("DrawPrimitive", primitive_count);
             };
             generated_fan_source(dev, &fan)
         };
@@ -10594,16 +10640,17 @@ extern "system" fn device_draw_indexed_primitive(
     };
     let dev = obj.inner();
     if !has_vertex_layout_source(dev) {
+        return reject_missing_vertex_layout("DrawIndexedPrimitive");
+    }
+    // A draw of no primitives is valid and draws nothing.
+    if primitive_count == 0 {
         std::hint::cold_path();
-        return D3DERR_INVALIDCALL;
+        return D3D_OK;
     }
     // Triangle fan has no Metal primitive: rewrite the addressed indices as a
     // triangle list over the bound streams. Kept off the (non-fan) hot path.
     if primitive_type == D3DPT_TRIANGLEFAN {
         std::hint::cold_path();
-        if primitive_count == 0 {
-            return D3DERR_INVALIDCALL;
-        }
         let Some(index_source) =
             bound_index_fan(dev, start_index, base_vertex_index, primitive_count)
         else {
@@ -10860,16 +10907,23 @@ extern "system" fn device_draw_primitive_up(
     let Some(obj) = (unsafe { InPtrMut::<Direct3DDevice9>::opt(this) }) else {
         return D3DERR_INVALIDCALL;
     };
+    if vertex_stride == 0 {
+        return reject_zero_up_stride("DrawPrimitiveUP");
+    }
     let dev = obj.inner();
     if !has_vertex_layout_source(dev) {
-        return D3DERR_INVALIDCALL;
+        return reject_missing_vertex_layout("DrawPrimitiveUP");
+    }
+    // A draw of no primitives is valid and draws nothing.
+    if primitive_count == 0 {
+        return D3D_OK;
     }
 
     // Triangle fan has no Metal primitive: the fan's vertices go up as they
     // are and an index list makes the triangles. Kept off the (non-fan) hot
     // path below.
     if primitive_type == D3DPT_TRIANGLEFAN {
-        if vertex_data.is_null() || primitive_count == 0 {
+        if vertex_data.is_null() {
             return D3DERR_INVALIDCALL;
         }
         let fan_bytes = (primitive_count as usize + 2) * vertex_stride as usize;
@@ -10886,7 +10940,7 @@ extern "system" fn device_draw_primitive_up(
             }
         } else {
             let Some(fan) = convert::FanRewrite::sequential(0, primitive_count) else {
-                return D3DERR_INVALIDCALL;
+                return reject_unaddressable_fan("DrawPrimitiveUP", primitive_count);
             };
             generated_fan_source(dev, &fan)
         };
@@ -11932,11 +11986,18 @@ extern "system" fn device_draw_indexed_primitive_up(
     let Some(obj) = (unsafe { InPtrMut::<Direct3DDevice9>::opt(this) }) else {
         return D3DERR_INVALIDCALL;
     };
+    if vertex_stride == 0 {
+        return reject_zero_up_stride("DrawIndexedPrimitiveUP");
+    }
     let dev = obj.inner();
     if !has_vertex_layout_source(dev) {
-        return D3DERR_INVALIDCALL;
+        return reject_missing_vertex_layout("DrawIndexedPrimitiveUP");
     }
-    if index_data.is_null() || vertex_data.is_null() || primitive_count == 0 {
+    // A draw of no primitives is valid and draws nothing.
+    if primitive_count == 0 {
+        return D3D_OK;
+    }
+    if index_data.is_null() || vertex_data.is_null() {
         return D3DERR_INVALIDCALL;
     }
     let (index_type, index_size): (mtld3d_shared::mtl::IndexType, usize) = match index_format {
@@ -11972,7 +12033,7 @@ extern "system" fn device_draw_indexed_primitive_up(
         let src = unsafe { core::slice::from_raw_parts(index_data.cast::<u8>(), src_bytes) };
         // Inline indices are absolute, so no base vertex folds in.
         let Some(fan) = convert::FanRewrite::indexed(src, index_size, 0, primitive_count) else {
-            return D3DERR_INVALIDCALL;
+            return reject_unaddressable_fan("DrawIndexedPrimitiveUP", primitive_count);
         };
         (
             d3d_to_metal_primitive(D3DPT_TRIANGLELIST).expect("triangle list is supported"),
