@@ -8,12 +8,12 @@ use log::{debug, error, info, trace, warn};
 pub use mtld3d_core::encoder_data::{
     BeginVisibilityOp, BindColorOp, BindDepthOp, BindDepthOpFlags, CarryDepthOp, ClearColorOp,
     ClearColorRectsOp, ClearDepthStencilOp, ClearDepthStencilRectsOp, ColorFillOp, DepthBinding,
-    DestroyTextureOp, EndVisibilityOp, GenerateMipmapsOp, GenerateMipmapsOrderedOp,
-    NoteColorReadOp, PendingVbibRetention, ReadColorHandleOp, ReadDeviceBufferOp,
-    ReadTextureColorHandleOp, ReadTextureHandleOp, ResolveDepthSurfaceOp, ResolveDepthTextureOp,
-    ResolveDynamicDepthOp, RetireColorOp, RetireDepthOp, RtBinding, SetDumpDrawOp,
-    SetVertexSamplerOp, SetVertexTextureOp, SetViewportOp, StretchBlitOp, StretchKind,
-    StretchSurfaceFlags, StretchSurfaceInfo, UnbindExtraColorOp, UpdateColorRegionOp,
+    DestroyBufferOp, DestroyTextureOp, EndVisibilityOp, GenerateMipmapsOp,
+    GenerateMipmapsOrderedOp, NoteColorReadOp, PendingVbibRetention, ReadColorHandleOp,
+    ReadDeviceBufferOp, ReadTextureColorHandleOp, ReadTextureHandleOp, ResolveDepthSurfaceOp,
+    ResolveDepthTextureOp, ResolveDynamicDepthOp, RetireColorOp, RetireDepthOp, RtBinding,
+    SetDumpDrawOp, SetVertexSamplerOp, SetVertexTextureOp, SetViewportOp, StretchBlitOp,
+    StretchKind, StretchSurfaceFlags, StretchSurfaceInfo, UnbindExtraColorOp, UpdateColorRegionOp,
     UploadColorOp, UploadResampledOp, UploadTextureAndMipsOp, UploadTextureOp,
     UploadTextureOpFlags,
 };
@@ -1509,6 +1509,25 @@ impl DeviceInner {
                 page_box,
                 last_submit_seq,
             });
+    }
+
+    /// Retire a released VB/IB: its CPU backing when it has one, its device buffer otherwise.
+    ///
+    /// A buffer that still holds its backing goes through the retention
+    /// pipeline, which pairs the backing with the encoder's cache entry. A
+    /// `D3DPOOL_DEFAULT` `D3DUSAGE_WRITEONLY` buffer gave its backing up after
+    /// its upload, so nothing would reach that entry; the destroy op takes its
+    /// device buffer out instead, ordered after every draw that bound it.
+    pub fn retire_released_buffer(
+        &mut self,
+        buffer_id: BufferId,
+        backing: Option<PageBox>,
+        last_submit_seq: u64,
+    ) {
+        match backing {
+            Some(page_box) => self.queue_vbib_retention(buffer_id, page_box, last_submit_seq),
+            None => self.push_control(crate::device::DestroyBufferOp { buffer_id }),
+        }
     }
 
     /// Push an inline, op-stream-ordered `Staged` VB/IB dirty-range upload.

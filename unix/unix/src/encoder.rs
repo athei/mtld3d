@@ -1258,6 +1258,41 @@ struct BufferGpuState {
     last_submit_seq: u64,
 }
 
+/// Take the device buffer of a released `Staged` buffer out of the cache.
+///
+/// Returns the retention entry that destroys it once the GPU has retired
+/// `seq` and every submission that bound it. A `Direct` entry wraps a CPU
+/// backing, which reaches the cache only through the retention queue with
+/// that backing attached, so it is left where it is.
+fn take_released_buffer(
+    buffer_cache: &mut FxHashMap<BufferId, BufferGpuState>,
+    buffer_id: BufferId,
+    seq: u64,
+) -> Option<PendingResourceRetention> {
+    if !buffer_cache.get(&buffer_id)?.is_staged {
+        return None;
+    }
+    let state = buffer_cache.remove(&buffer_id)?;
+    Some(PendingResourceRetention {
+        kind: DestroyKind::Buffer,
+        handle: state.device_buffer.raw(),
+        page_box: None,
+        staging_arc: None,
+        seq: state.last_submit_seq.max(seq),
+        from_texture: false,
+    })
+}
+
+/// Every Metal buffer the cache owns: `Direct` wrappers and `Staged` device buffers.
+fn cached_buffer_handles(buffer_cache: &FxHashMap<BufferId, BufferGpuState>) -> Vec<u64> {
+    buffer_cache
+        .values()
+        .flat_map(|state| [state.mtl_buffer, state.device_buffer])
+        .filter(|handle| !handle.is_null())
+        .map(MetalHandle::raw)
+        .collect()
+}
+
 /// The encoder's shared 16-bit triangle-fan index pattern.
 ///
 /// `convert::fill_fan_pattern_u16` in a PE `PageBox` wrapped as an
@@ -7884,6 +7919,25 @@ impl FrameEncoder {
         }
     }
 
+    /// Retire the device buffer of a VB/IB released without a CPU backing.
+    ///
+    /// Ordered after every draw of this frame that bound the buffer, so the
+    /// destroy is gated on the current submit seq like a texture's. A buffer
+    /// no draw ever bound has no entry, and nothing to retire.
+    pub fn destroy_cached_buffer(&mut self, buffer_id: BufferId) {
+        if let Some(entry) =
+            take_released_buffer(&mut self.buffer_cache, buffer_id, self.current_submit_seq)
+        {
+            debug!(
+                target: LOG_TARGET,
+                "buffer {:#x} left the encoder cache; its device buffer retires behind submission {}",
+                buffer_id.raw(),
+                entry.seq
+            );
+            self.pending_resource_retention.push_back(entry);
+        }
+    }
+
     /// Look up or create an `MTLSamplerState` for the given D3D9 sampler state.
     ///
     /// Key + params both come from `mtld3d_core::sampler_state` so the static
@@ -7989,14 +8043,9 @@ impl FrameEncoder {
         self.pending_pipelines.clear();
         // 1. Collect live-cache handles into local Vecs. Pure-Rust walks
         //    overlap the GPU's final command buffers finishing up.
-        let mut buffers: Vec<u64> = Vec::new();
+        let mut buffers = cached_buffer_handles(&self.buffer_cache);
         let mut textures: Vec<u64> = Vec::new();
 
-        for state in self.buffer_cache.values() {
-            if !state.mtl_buffer.is_null() {
-                buffers.push(state.mtl_buffer.raw());
-            }
-        }
         for state in self.texture_cache.values() {
             for slot in &state.mip_staging_buffers {
                 if !slot.handle.is_null() {

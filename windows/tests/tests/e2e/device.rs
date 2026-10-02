@@ -1462,7 +1462,7 @@ fn logged_ceilings() -> Vec<(String, u32)> {
 }
 
 /// Whether this process is the copy of the test executable named `child_name`.
-fn running_as(child_name: &str) -> bool {
+pub fn running_as(child_name: &str) -> bool {
     std::env::current_exe()
         .expect("resolve test executable")
         .file_name()
@@ -1478,7 +1478,7 @@ const PRIVATE_LOG_FILTER: &str = "warn,mtld3d::unix=info";
 /// layer writes its log into a directory only that process uses, so a test
 /// that reads its own process log reads its device's lines and nobody
 /// else's. Panics with the child's standard error when the child fails.
-fn run_in_private_log_child(child_name: &str, test: &str, filter: &str) {
+pub fn run_in_private_log_child(child_name: &str, test: &str, filter: &str) {
     let exe = std::env::current_exe().expect("resolve test executable");
     let _factory = Harness::factory_only();
     let stamp = std::time::SystemTime::now()
@@ -1664,7 +1664,7 @@ fn process_log() -> String {
 ///
 /// The layer's log thread writes a line a moment after the call that
 /// produced it returns, so the lines are polled for, within a bound.
-fn await_logged_lines(needle: &str, expected: usize) -> Vec<String> {
+pub fn await_logged_lines(needle: &str, expected: usize) -> Vec<String> {
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
         let logged = logged_lines(needle);

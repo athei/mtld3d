@@ -501,6 +501,16 @@ pub struct DestroyTextureOp {
     pub tex_id: TextureId,
 }
 
+/// A vertex or index buffer released with no CPU backing left to retire.
+///
+/// A `D3DPOOL_DEFAULT` `D3DUSAGE_WRITEONLY` buffer drops its CPU copy once
+/// an upload has carried every byte, so its release has no `PageBox` to send
+/// through the retention queue. The device buffer the draws bind is still
+/// cached on the encoder, and this is what takes it out.
+pub struct DestroyBufferOp {
+    pub buffer_id: BufferId,
+}
+
 pub struct ReadColorHandleOp {
     pub texture_id: TextureId,
     pub slot_op: ReplyU64,
@@ -769,6 +779,10 @@ pub enum Op {
     DestroyTexture(
         #[cfg(windows)] DestroyTextureOp,
         #[cfg(not(windows))] Box<DestroyTextureOp>,
+    ),
+    DestroyBuffer(
+        #[cfg(windows)] DestroyBufferOp,
+        #[cfg(not(windows))] Box<DestroyBufferOp>,
     ),
     ReadColorHandle(
         #[cfg(windows)] ReadColorHandleOp,

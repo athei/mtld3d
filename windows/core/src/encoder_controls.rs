@@ -13,12 +13,13 @@ use crate::{
     encoder_data::{
         BindColorOp, BindDepthOp, BindDepthOpFlags, BlitSide, CarryDepthOp, ClearColorOp,
         ClearColorRectsOp, ClearDepthStencilOp, ClearDepthStencilRectsOp, ColorFillOp,
-        ColorFillTarget, ColorRtBinding, DepthBinding, DepthTransfer, DestroyTextureOp,
-        GenerateMipmapsOp, GenerateMipmapsOrderedOp, NoteColorReadOp, ResampledUpload,
-        ResolveDepthSurfaceOp, ResolveDepthTextureOp, ResolveDynamicDepthOp, RetireColorOp,
-        RetireDepthOp, RetiredColorTarget, RtBinding, SetDumpDrawOp, SetVertexSamplerOp,
-        SetVertexTextureOp, SetViewportOp, StretchBlitOp, StretchKind, StretchSurfaceFlags,
-        StretchSurfaceInfo, TextureInfo, UnbindExtraColorOp, UploadTextureOpFlags,
+        ColorFillTarget, ColorRtBinding, DepthBinding, DepthTransfer, DestroyBufferOp,
+        DestroyTextureOp, GenerateMipmapsOp, GenerateMipmapsOrderedOp, NoteColorReadOp,
+        ResampledUpload, ResolveDepthSurfaceOp, ResolveDepthTextureOp, ResolveDynamicDepthOp,
+        RetireColorOp, RetireDepthOp, RetiredColorTarget, RtBinding, SetDumpDrawOp,
+        SetVertexSamplerOp, SetVertexTextureOp, SetViewportOp, StretchBlitOp, StretchKind,
+        StretchSurfaceFlags, StretchSurfaceInfo, TextureInfo, UnbindExtraColorOp,
+        UploadTextureOpFlags,
     },
     encoder_value::WireValue,
     render_scale::RenderScale,
@@ -240,6 +241,7 @@ fields_codec!(BindColorOp { slot, info, scale });
 fields_codec!(GenerateMipmapsOrderedOp { old_id });
 fields_codec!(UnbindExtraColorOp { slot });
 fields_codec!(DestroyTextureOp { tex_id });
+fields_codec!(DestroyBufferOp { buffer_id });
 fields_codec!(NoteColorReadOp { src });
 fields_codec!(ResolveDepthSurfaceOp { transfer });
 fields_codec!(StretchBlitOp {

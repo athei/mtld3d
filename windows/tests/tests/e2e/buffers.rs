@@ -11,6 +11,8 @@ use mtld3d_types::{
     D3DUSAGE_WRITEONLY,
 };
 
+use super::device::{await_logged_lines, run_in_private_log_child, running_as};
+
 const FVF: u32 = D3DFVF_XYZ | D3DFVF_DIFFUSE;
 const BLUE: u32 = 0xFF00_00FF;
 const MAGENTA: u32 = 0xFFFF_00FF;
@@ -637,6 +639,81 @@ fn reset_after_a_released_backing_leaves_buffer_draws_working() {
         (RED, GREEN),
         "a buffer created after the Reset fills and draws"
     );
+}
+
+/// The executable name the write-only buffer release test runs its workload under.
+const BUFFER_RELEASE_CHILD_NAME: &str = "buffer-release.exe";
+
+/// The child's log filter: the encoder's cache records.
+const BUFFER_RELEASE_LOG_FILTER: &str = "warn,mtld3d::unix=debug,mtld3d::unix::command=warn";
+
+/// Write-only DEFAULT buffers created, filled, drawn and released round after round keep drawing.
+///
+/// Each buffer gives its CPU copy up after its upload, so its release retires
+/// the device buffer the draws bound through an op in the frame rather than
+/// through the retention queue that carries a backing. Every round draws a
+/// fresh vertex and index buffer while the previous round's destroys are in
+/// flight, and a `Reset` every few rounds recreates the implicit surfaces
+/// around them, as a game does on every resolution change. A destroy that
+/// took a live buffer's device buffer, or ran ahead of a draw that bound it,
+/// shows as a wrong or missing triangle, and a release that reached no
+/// destroy leaves the encoder's record of it missing from the log. The
+/// workload runs in a process of its own, so the log it reads holds its
+/// device's lines alone.
+#[test]
+fn writeonly_default_buffers_released_round_after_round_keep_drawing() {
+    if running_as(BUFFER_RELEASE_CHILD_NAME) {
+        buffer_release_workload();
+        return;
+    }
+    run_in_private_log_child(
+        BUFFER_RELEASE_CHILD_NAME,
+        "buffers::writeonly_default_buffers_released_round_after_round_keep_drawing",
+        BUFFER_RELEASE_LOG_FILTER,
+    );
+}
+
+/// Draw with a fresh pair of write-only DEFAULT buffers per round, then wait for every release.
+fn buffer_release_workload() {
+    const ROUNDS: u32 = 24;
+    const INDICES: [u16; 6] = [0, 1, 2, 3, 4, 5];
+    let h = Harness::new();
+    let (width, height) = h.dims();
+    for round in 0..ROUNDS {
+        let (left, right) = if round % 2 == 0 {
+            (GREEN, MAGENTA)
+        } else {
+            (RED, GREEN)
+        };
+        let vb = h.create_vertex_buffer(stride() * 6, D3DUSAGE_WRITEONLY, FVF, D3DPOOL_DEFAULT);
+        vb.lock(0, 0, 0).write(&side_by_side_triangles(left, right));
+        let ib = h.create_index_buffer(12, D3DUSAGE_WRITEONLY, D3DFMT_INDEX16, D3DPOOL_DEFAULT);
+        ib.lock(0, 0, 0).write(&INDICES);
+        arm_two_triangles(&h, &vb);
+        assert_eq!(h.set_indices(&ib), 0, "SetIndices");
+        h.render_once(BLUE, |d| {
+            assert_eq!(
+                d.draw_indexed_primitive(D3DPT_TRIANGLELIST, 0, 0, 6, 0, 2),
+                0,
+                "DrawIndexedPrimitive of both triangles"
+            );
+        });
+        assert_eq!(
+            (h.read_pixel(160, 280), h.read_pixel(480, 280)),
+            (left, right),
+            "round {round} draws its own buffers"
+        );
+        drop(ib);
+        drop(vb);
+        if round % 8 == 7 {
+            assert_eq!(h.reset(width, height), D3D_OK, "Reset after round {round}");
+        }
+    }
+    // The last round's destroys ride the next frame the device sends.
+    h.render_once(BLUE, |_| {});
+    let _ = h.read_pixel(1, 1);
+    let buffers = usize::try_from(ROUNDS * 2).expect("a small count");
+    await_logged_lines("left the encoder cache; its device buffer retires", buffers);
 }
 
 #[test]

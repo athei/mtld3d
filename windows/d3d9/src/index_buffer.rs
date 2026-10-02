@@ -367,14 +367,12 @@ unsafe fn finalize_index_buffer(this: *mut Direct3DIndexBuffer9) {
         last_submit_seq,
         ..
     } = *inner_box;
-    if !device_inner.is_null()
-        && let Some(current_box) = current_box
-    {
+    if !device_inner.is_null() {
         // SAFETY: `device_inner` was stamped at `Self::new` from a
         // live `DeviceInner`; the device outlives all its child
         // resources per D3D9 lifetime rules.
         let dev = unsafe { &mut *device_inner };
-        dev.queue_vbib_retention(buffer_id, current_box, last_submit_seq);
+        dev.retire_released_buffer(buffer_id, current_box, last_submit_seq);
     }
     // SAFETY: both counters reached zero; `this` is the original
     // `Box::into_raw(Direct3DIndexBuffer9)` allocation.
