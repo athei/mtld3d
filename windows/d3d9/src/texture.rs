@@ -1,7 +1,11 @@
 use core::ffi::c_void;
-use std::sync::{Arc, atomic::Ordering};
+use std::sync::{
+    Arc,
+    atomic::{AtomicPtr, Ordering},
+};
 
 use mtld3d_core::{
+    api_lock::{ApiGuard, ApiLock},
     dirty_rect::{DirtyRect, clip_copy_region},
     format::block_row_pitch,
     ids::TextureId,
@@ -160,6 +164,17 @@ pub struct TextureInner {
     /// Kept as `u64` because `DeviceInner::from_ptr` takes a `u64` by
     /// convention.
     device_inner: u64,
+    /// The API lock that serialises calls on this texture, null when its device has none.
+    ///
+    /// The lock of the device the texture belongs to: taken from the creating
+    /// device and replaced by `rehydrate_for_device` when a bind moves the
+    /// texture to another device, whose threads then work on it. A detach
+    /// keeps it, so a call that arrives while the device's final `Release`
+    /// tears that device down waits for the teardown to end instead of
+    /// running beside it, and afterwards runs on the texture alone. Atomic
+    /// because a thread reads it to find the lock before it holds one; the
+    /// lock it names is leaked at device creation and never freed.
+    api_lock: AtomicPtr<ApiLock>,
     width: u32,
     height: u32,
     /// Slice count: 1 for ordinary 2D textures, >1 for a volume (3D) texture.
@@ -468,6 +483,35 @@ pub fn is_dropped_staging_page(bits: *const u8) -> bool {
 }
 
 impl TextureInner {
+    /// Hold the API lock that covers this texture until the guard drops.
+    ///
+    /// Reads the lock, enters it, and reads it again: a texture a bind moved
+    /// to another device while this thread waited is covered by that
+    /// device's lock now, so the stale one is left and the new one entered.
+    /// The move itself runs under the adopting device's lock alone, so a
+    /// call already inside the old lock when it happens is not serialised
+    /// against it; only a texture two live devices use at once can get
+    /// there, which D3D9 does not allow (a resource belongs to the device
+    /// that created it).
+    fn enter_api_lock(&self) -> ApiGuard {
+        loop {
+            let lock = self.api_lock.load(Ordering::Acquire);
+            if lock.is_null() {
+                return ApiGuard::NOOP;
+            }
+            // SAFETY: a non-null pointer names a lock leaked at its device's
+            // creation, which lives for the rest of the process.
+            let lock_ref = unsafe { &*lock };
+            // SAFETY: the lock lives for the rest of the process, so it
+            // outlives the guard.
+            let guard = unsafe { lock_ref.enter() };
+            if self.api_lock.load(Ordering::Acquire) == lock {
+                return guard;
+            }
+            drop(guard);
+        }
+    }
+
     /// Process-unique id of the texture this inner belongs to.
     pub const fn texture_id(&self) -> TextureId {
         self.texture_id
@@ -3283,6 +3327,7 @@ fn build_texture_inner(info: TextureCreateInfo) -> *mut TextureInner {
         texture_id: info.texture_id,
         device_handle: info.device_handle,
         device_inner: info.device_inner,
+        api_lock: AtomicPtr::new(DeviceInner::from_ptr(dev_ptr).api_lock_ptr()),
         width: info.width,
         height: info.height,
         depth: info.depth,
@@ -3662,6 +3707,12 @@ unsafe impl crate::com_ref::ComChild for Direct3DTexture9 {
             return core::ptr::null_mut();
         }
         DeviceInner::from_ptr(inner.device_inner).device_wrapper()
+    }
+    fn enter_api_lock(&self) -> ApiGuard {
+        // The texture carries its lock rather than reading it off the device:
+        // a managed one does not pin the device, so the device can be in its
+        // final `Release`, or gone, while a call on the texture arrives.
+        self.inner().enter_api_lock()
     }
     unsafe fn finalize(this: *mut Self) {
         // SAFETY: forwarded from the engine — both counters are zero.
@@ -5016,6 +5067,7 @@ fn rehydrate_for_device_slow(tex: &mut Direct3DTexture9, dev: &mut DeviceInner, 
             .deregister_texture(std::ptr::from_mut::<TextureInner>(ti));
     }
     ti.device_inner = dev_ptr;
+    ti.api_lock.store(dev.api_lock_ptr(), Ordering::Release);
     ti.device_handle = dev.device_handle();
     ti.point_cached_surfaces_at(std::ptr::from_mut::<DeviceInner>(dev));
     dev.register_texture(std::ptr::from_mut::<TextureInner>(ti));
@@ -5591,11 +5643,12 @@ impl Direct3DVolume9 {
     }
 }
 
-/// Hold the API lock of the device that owns a volume shell's parent texture.
+/// Hold the API lock that covers a volume shell's parent texture.
 ///
-/// The shell has no device of its own; its parent volume texture does, and a
-/// sub-resource and its container cannot come from different devices.
-fn volume9_api_lock(this: *mut c_void) -> mtld3d_core::api_lock::ApiGuard {
+/// The shell has no device of its own; its parent volume texture carries the
+/// lock, and a sub-resource and its container cannot come from different
+/// devices.
+fn volume9_api_lock(this: *mut c_void) -> ApiGuard {
     // SAFETY: vtable thunk; `this` is *mut Direct3DVolume9 per IDirect3DVolume9 ABI.
     let parent = (unsafe { InPtr::<Direct3DVolume9>::opt(this) })
         .map_or(core::ptr::null_mut(), |v| v.parent_texture);

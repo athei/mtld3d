@@ -4,7 +4,11 @@
 //! from any thread. Without it a call from a second thread is undefined, as it
 //! is on native, so no test here drives an unflagged device from two threads.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use core::ffi::c_void;
+use std::{
+    sync::atomic::{AtomicBool, AtomicU32, Ordering},
+    time::{Duration, Instant},
+};
 
 use mtld3d_tests::{Harness, HarnessConfig, Vertex, assert_pixel_eq, spawn_scoped};
 use mtld3d_types::{
@@ -12,7 +16,7 @@ use mtld3d_types::{
     D3DCULL_NONE, D3DFMT_A8R8G8B8, D3DFVF_DIFFUSE, D3DFVF_XYZ, D3DGETDATA_FLUSH, D3DISSUE_BEGIN,
     D3DISSUE_END, D3DLOCK_DISCARD, D3DPOOL_DEFAULT, D3DPOOL_MANAGED, D3DPT_TRIANGLELIST,
     D3DQUERYTYPE_OCCLUSION, D3DRS_CULLMODE, D3DRS_LIGHTING, D3DSBT_ALL, D3DUSAGE_DYNAMIC,
-    D3DUSAGE_WRITEONLY,
+    D3DUSAGE_WRITEONLY, E_NOINTERFACE, Guid,
 };
 
 const FVF: u32 = D3DFVF_XYZ | D3DFVF_DIFFUSE;
@@ -198,5 +202,191 @@ fn multithreaded_device_reenters_its_lock_on_one_thread() {
         h.read_pixel(320, 280),
         GREEN,
         "the device renders after every re-entrant path",
+    );
+}
+
+/// The private-data key the teardown probe is stored under.
+const TEARDOWN_PROBE_KEY: Guid = Guid {
+    data1: 0x6d74_6c64,
+    data2: 0x0942,
+    data3: 0x0001,
+    data4: *b"teardown",
+};
+
+/// How long the probe holds the teardown open for a call that should be waiting.
+const TEARDOWN_HOLD: Duration = Duration::from_millis(500);
+
+/// How long a worker waits for a teardown that never starts before it gives up.
+const TEARDOWN_START_LIMIT: Duration = Duration::from_secs(20);
+
+/// The `IUnknown` head of [`TeardownProbe`].
+#[repr(C)]
+struct ProbeVtbl {
+    query_interface: extern "system" fn(*mut c_void, *const Guid, *mut *mut c_void) -> i32,
+    add_ref: extern "system" fn(*mut c_void) -> u32,
+    release: extern "system" fn(*mut c_void) -> u32,
+}
+
+static PROBE_VTBL: ProbeVtbl = ProbeVtbl {
+    query_interface: probe_query_interface,
+    add_ref: probe_add_ref,
+    release: probe_release,
+};
+
+/// A COM object stored as private data, whose last `Release` runs inside the device's teardown.
+///
+/// An implicit surface's private data is released when the device is
+/// destroyed, in the middle of the final `Release`. The probe's last
+/// `Release` marks that moment, then holds the teardown open for
+/// [`TEARDOWN_HOLD`] and records whether the call another thread made in
+/// the meantime came back while the teardown was still running.
+#[repr(C)]
+struct TeardownProbe {
+    vtbl: &'static ProbeVtbl,
+    refcount: AtomicU32,
+    /// Set by the last `Release`, from inside the device's teardown.
+    teardown_started: AtomicBool,
+    /// Set by the worker once its call returned.
+    call_returned: AtomicBool,
+    /// Whether the worker's call had returned before the hold ran out.
+    returned_during_teardown: AtomicBool,
+}
+
+impl TeardownProbe {
+    const fn new() -> Self {
+        Self {
+            vtbl: &PROBE_VTBL,
+            refcount: AtomicU32::new(0),
+            teardown_started: AtomicBool::new(false),
+            call_returned: AtomicBool::new(false),
+            returned_during_teardown: AtomicBool::new(false),
+        }
+    }
+
+    const fn as_unknown(&self) -> *mut c_void {
+        core::ptr::from_ref(self).cast_mut().cast::<c_void>()
+    }
+
+    /// Block until the teardown starts; false when it does not within the limit.
+    fn await_teardown(&self) -> bool {
+        let deadline = Instant::now() + TEARDOWN_START_LIMIT;
+        while !self.teardown_started.load(Ordering::Acquire) {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        true
+    }
+}
+
+fn probe_from(this: *mut c_void) -> &'static TeardownProbe {
+    // SAFETY: the runtime only calls the probe through the pointer the test
+    // stored, which names a `TeardownProbe` that outlives every call: the
+    // test keeps it until the device that holds the reference is gone.
+    unsafe { &*this.cast::<TeardownProbe>() }
+}
+
+extern "system" fn probe_query_interface(
+    _this: *mut c_void,
+    _riid: *const Guid,
+    ppv: *mut *mut c_void,
+) -> i32 {
+    if !ppv.is_null() {
+        // SAFETY: the caller's out-param, checked non-null.
+        unsafe { *ppv = core::ptr::null_mut() };
+    }
+    E_NOINTERFACE
+}
+
+extern "system" fn probe_add_ref(this: *mut c_void) -> u32 {
+    probe_from(this).refcount.fetch_add(1, Ordering::AcqRel) + 1
+}
+
+extern "system" fn probe_release(this: *mut c_void) -> u32 {
+    let probe = probe_from(this);
+    let remaining = probe.refcount.fetch_sub(1, Ordering::AcqRel) - 1;
+    if remaining == 0 {
+        probe.teardown_started.store(true, Ordering::Release);
+        let deadline = Instant::now() + TEARDOWN_HOLD;
+        while Instant::now() < deadline && !probe.call_returned.load(Ordering::Acquire) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        probe.returned_during_teardown.store(
+            probe.call_returned.load(Ordering::Acquire),
+            Ordering::Release,
+        );
+    }
+    remaining
+}
+
+/// A managed texture called during the device's final `Release` waits for the teardown to end.
+///
+/// A `D3DPOOL_MANAGED` texture does not pin its device, so an application
+/// may release the device while another thread still holds and uses the
+/// texture. The releasing thread holds the device's lock for the whole
+/// teardown, and a texture call from the other thread has to wait for it:
+/// the teardown detaches the texture and releases the device's own
+/// references on it, and a call running beside that races the texture's
+/// counts and reads a device that is being freed. The probe stored on the
+/// implicit render target is released in the middle of that teardown, after
+/// the texture has been detached, and starts the other thread's `LockRect`
+/// there; the call has to come back only once the final `Release` returned,
+/// and succeed on the texture the device left behind.
+#[test]
+fn a_managed_texture_waits_out_the_final_device_release() {
+    let h = multithreaded_harness();
+    let texture = h.create_texture(4, 4, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED);
+    texture.lock_rect(0, 0).write_u32_rect(4, 4, &[GREEN; 16]);
+    let probe = TeardownProbe::new();
+    {
+        let back_buffer = h.back_buffer(0);
+        // SAFETY: the probe lives on this frame until the end of the test,
+        // past the device's destruction, which releases the reference.
+        let hr = unsafe {
+            back_buffer.set_private_data_unknown(&TEARDOWN_PROBE_KEY, probe.as_unknown())
+        };
+        assert_eq!(
+            hr, D3D_OK,
+            "SetPrivateData(D3DSPD_IUNKNOWN) on the back buffer"
+        );
+    }
+    assert_eq!(
+        probe.refcount.load(Ordering::Acquire),
+        1,
+        "the back buffer holds the probe's one reference"
+    );
+
+    let shared = h.shared();
+    let shared_texture = shared.share_texture(&texture);
+    let worker_hr = std::thread::scope(|scope| {
+        let worker = spawn_scoped(scope, || {
+            if !probe.await_teardown() {
+                return None;
+            }
+            let hr = shared_texture.lock_and_unlock(0);
+            probe.call_returned.store(true, Ordering::Release);
+            Some(hr)
+        });
+        assert_eq!(
+            h.release_device(),
+            0,
+            "the harness held the only device reference"
+        );
+        worker.join().expect("the worker thread panicked")
+    });
+
+    assert!(
+        probe.teardown_started.load(Ordering::Acquire),
+        "the device's destruction released the back buffer's private data"
+    );
+    let hr = worker_hr.expect("the worker saw the teardown start");
+    assert_eq!(
+        hr, D3D_OK,
+        "LockRect and UnlockRect on the texture the device left behind"
+    );
+    assert!(
+        !probe.returned_during_teardown.load(Ordering::Acquire),
+        "a managed texture call ran beside the final Release instead of waiting for its lock"
     );
 }

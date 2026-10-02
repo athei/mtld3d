@@ -425,9 +425,10 @@ pub struct DeviceInner {
     /// Leaked at creation rather than owned here: a child `Release` can drive
     /// the device to zero and free this struct while the guard the child's
     /// thunk took is still live, and that guard releases through the lock on
-    /// its way out. One small allocation per flagged device creation. `None`
-    /// is the whole of "not multithreaded": every thunk then takes the no-op
-    /// guard.
+    /// its way out, and a texture keeps entering it after the device is gone
+    /// ([`Self::api_lock_ptr`]). One small allocation per flagged device
+    /// creation. `None` is the whole of "not multithreaded": every thunk then
+    /// takes the no-op guard.
     api_lock: Option<&'static ApiLock>,
     /// Normalised present parameters the implicit swapchain reports.
     ///
@@ -3277,6 +3278,17 @@ impl DeviceInner {
         self.device_wrapper = wrapper as u64;
     }
 
+    /// The device's API lock as the pointer a texture keeps; null without the multithreaded flag.
+    ///
+    /// The lock is leaked at creation, so the pointer stays valid after this
+    /// device is gone; a `D3DPOOL_MANAGED` texture that outlives the device
+    /// keeps entering it.
+    pub fn api_lock_ptr(&self) -> *mut ApiLock {
+        self.api_lock.map_or(core::ptr::null_mut(), |lock| {
+            core::ptr::from_ref(lock).cast_mut()
+        })
+    }
+
     /// The implicit backbuffer `MTLTexture`.
     ///
     /// The single drawable also backs every swapchain's `GetBackBuffer`
@@ -3578,8 +3590,11 @@ impl DeviceInner {
 /// wait for the lock counts as API time, which is what the app pays. The
 /// shell is leaked at teardown and its inner is not, so a refcount of zero
 /// means there is no inner to read: a `Release` past zero, like a null
-/// `this`, gets the no-op guard. The unflagged fast path is a null test, a
-/// refcount load, one pointer chase and a discriminant test.
+/// `this`, gets the no-op guard. A texture reaches the lock through the
+/// pointer it carries instead ([`crate::com_ref::ComChild::enter_api_lock`]),
+/// because a managed one can be called while the device is in its final
+/// `Release` or gone. The unflagged fast path is a null test, a refcount
+/// load, one pointer chase and a discriminant test.
 #[inline]
 pub fn device_api_lock(this: *mut c_void) -> ApiGuard {
     // SAFETY: vtable thunk; `this` is *mut Direct3DDevice9 per IDirect3DDevice9 ABI.

@@ -13,12 +13,12 @@ use core::{ffi::c_void, marker::PhantomData};
 use mtld3d_types::{
     D3D_OK, D3DCLEAR_TARGET, D3DCREATE_MULTITHREADED, D3DFMT_A8R8G8B8, D3DLOCK_READONLY,
     D3DLOCKED_RECT, D3DPOOL_SYSTEMMEM, D3DSURFACE_DESC, IDirect3DDevice9Vtbl, IDirect3DQuery9Vtbl,
-    IDirect3DSurface9Vtbl, IDirect3DVertexBuffer9Vtbl,
+    IDirect3DSurface9Vtbl, IDirect3DTexture9Vtbl, IDirect3DVertexBuffer9Vtbl,
 };
 
 use crate::{
     harness::Harness,
-    resource::{Query, VertexBuffer},
+    resource::{Query, Texture, VertexBuffer},
     vtbl::deref_vtbl,
 };
 
@@ -241,6 +241,56 @@ impl SharedDevice<'_> {
             query: query.as_ptr() as usize,
             _marker: PhantomData,
         }
+    }
+
+    /// A handle to `texture` for another thread; the texture outlives the handle.
+    ///
+    /// The handle stays usable after the device is released when the texture
+    /// does not pin it (`D3DPOOL_MANAGED`), as D3D9 allows.
+    #[must_use]
+    pub fn share_texture<'a>(&self, texture: &'a Texture<'_>) -> SharedTexture<'a> {
+        SharedTexture {
+            texture: texture.as_ptr() as usize,
+            _marker: PhantomData,
+        }
+    }
+}
+
+/// A texture handle any thread may call.
+pub struct SharedTexture<'a> {
+    texture: usize,
+    _marker: PhantomData<&'a ()>,
+}
+
+impl SharedTexture<'_> {
+    const fn texture(&self) -> *mut c_void {
+        self.texture as *mut c_void
+    }
+
+    fn vtbl(&self) -> &'static IDirect3DTexture9Vtbl {
+        // SAFETY: the texture is live for the borrow this handle carries.
+        unsafe { deref_vtbl::<IDirect3DTexture9Vtbl>(self.texture()) }
+    }
+
+    /// `LockRect` over the whole of mip `level`, then `UnlockRect`.
+    ///
+    /// Returns the first failing `HRESULT`, or `D3D_OK` once both succeeded.
+    #[must_use]
+    pub fn lock_and_unlock(&self, level: u32) -> i32 {
+        let mut locked = D3DLOCKED_RECT {
+            pitch: 0,
+            bits: core::ptr::null_mut(),
+        };
+        // SAFETY: vtable thunk; the texture is live, `&mut locked` is
+        // writable, a null rect locks the whole level.
+        let hr = unsafe {
+            (self.vtbl().lock_rect)(self.texture(), level, &raw mut locked, core::ptr::null(), 0)
+        };
+        if hr != D3D_OK {
+            return hr;
+        }
+        // SAFETY: vtable thunk; balances the lock above.
+        unsafe { (self.vtbl().unlock_rect)(self.texture(), level) }
     }
 }
 
