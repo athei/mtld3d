@@ -1648,6 +1648,20 @@ impl IndexBuffer<'_> {
         unsafe { deref_vtbl::<IDirect3DIndexBuffer9Vtbl>(self.ptr) }
     }
 
+    /// `SetPriority`, returning the previous priority.
+    #[must_use]
+    pub fn set_priority(&self, priority: u32) -> u32 {
+        // SAFETY: vtable thunk; `self.ptr` is live.
+        unsafe { (self.vtbl().set_priority)(self.ptr, priority) }
+    }
+
+    /// `GetPriority`.
+    #[must_use]
+    pub fn priority(&self) -> u32 {
+        // SAFETY: vtable thunk; `self.ptr` is live.
+        unsafe { (self.vtbl().get_priority)(self.ptr) }
+    }
+
     /// Lock `[offset, offset+size)` bytes (`size == 0` locks the whole buffer).
     #[must_use]
     pub fn lock(&self, offset: u32, size: u32, flags: u32) -> BufferLock<'_> {

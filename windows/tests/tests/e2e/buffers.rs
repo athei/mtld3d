@@ -6,8 +6,9 @@
 use mtld3d_tests::{Harness, Vertex, VertexBuffer};
 use mtld3d_types::{
     D3D_OK, D3DCULL_NONE, D3DERR_INVALIDCALL, D3DFMT_INDEX16, D3DFVF_DIFFUSE, D3DFVF_XYZ,
-    D3DLOCK_DISCARD, D3DPOOL_DEFAULT, D3DPT_TRIANGLELIST, D3DRS_CULLMODE, D3DRS_LIGHTING,
-    D3DRTYPE_INDEXBUFFER, D3DRTYPE_VERTEXBUFFER, D3DUSAGE_DYNAMIC, D3DUSAGE_WRITEONLY,
+    D3DLOCK_DISCARD, D3DPOOL_DEFAULT, D3DPOOL_MANAGED, D3DPT_TRIANGLELIST, D3DRS_CULLMODE,
+    D3DRS_LIGHTING, D3DRTYPE_INDEXBUFFER, D3DRTYPE_VERTEXBUFFER, D3DUSAGE_DYNAMIC,
+    D3DUSAGE_WRITEONLY,
 };
 
 const FVF: u32 = D3DFVF_XYZ | D3DFVF_DIFFUSE;
@@ -131,6 +132,37 @@ fn draw_indexed_primitive_from_buffers() {
         "indexed quad renders magenta"
     );
     assert_eq!(h.read_pixel(10, 10), BLUE, "outside quad stays background");
+}
+
+/// A managed index buffer stores its priority the way a managed vertex buffer does.
+///
+/// `SetPriority` returns the value it replaces and `GetPriority` reads the
+/// stored one back. Any other pool keeps both at `0` and discards the write.
+#[test]
+fn managed_index_buffer_priority_round_trips() {
+    let h = Harness::new();
+    let managed = h.create_index_buffer(64, 0, D3DFMT_INDEX16, D3DPOOL_MANAGED);
+    assert_eq!(managed.priority(), 0, "a managed index buffer starts at 0");
+    assert_eq!(
+        managed.set_priority(3),
+        0,
+        "SetPriority returns the previous 0"
+    );
+    assert_eq!(managed.priority(), 3, "GetPriority reads the stored value");
+    assert_eq!(
+        managed.set_priority(7),
+        3,
+        "SetPriority returns the previous 3"
+    );
+    assert_eq!(managed.priority(), 7, "GetPriority reads the new value");
+
+    let default = h.create_index_buffer(64, D3DUSAGE_WRITEONLY, D3DFMT_INDEX16, D3DPOOL_DEFAULT);
+    assert_eq!(
+        default.set_priority(3),
+        0,
+        "a non-managed SetPriority returns 0"
+    );
+    assert_eq!(default.priority(), 0, "and discards the write");
 }
 
 #[test]

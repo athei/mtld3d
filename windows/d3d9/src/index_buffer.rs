@@ -1,9 +1,7 @@
 //! `IDirect3DIndexBuffer9` COM wrapper.
 //!
 //! Mirrors `vertex_buffer.rs`; the vtable type, the `fvf` → `format` field
-//! swap, the reported resource type, and priority handling differ — the index
-//! buffer's `SetPriority` / `GetPriority` are no-ops rather than round-tripping
-//! an app-set value.
+//! swap and the reported resource type differ.
 
 use core::ffi::c_void;
 use std::sync::atomic::Ordering;
@@ -91,6 +89,13 @@ pub struct IndexBufferInner {
     /// blocker until this and the public refcount are both zero
     /// (`ComChild::state_block_refs_mut`).
     state_block_refs: u32,
+    /// App-set managed-resource priority, round-tripped by `GetPriority` / `SetPriority`.
+    ///
+    /// D3D9 only honours priority for `D3DPOOL_MANAGED` buffers (it drives
+    /// the resource manager's eviction order); for every other pool both
+    /// accessors are fixed at `0`. Metal has no eviction-order hint, so
+    /// this is app-visible state only and never acted upon.
+    priority: u32,
 }
 
 impl IndexBufferInner {
@@ -253,6 +258,7 @@ impl Direct3DIndexBuffer9 {
             last_submit_seq: 0,
             locked: false,
             state_block_refs: 0,
+            priority: 0,
         }));
         Self {
             vtbl: &raw const DIRECT3D_INDEX_BUFFER9_VTBL,
@@ -484,24 +490,32 @@ extern "system" fn ib_free_private_data(this: *mut c_void, guid: *const Guid) ->
     obj.inner_mut().private_data.free(&guid)
 }
 
-extern "system" fn ib_set_priority(this: *mut c_void, _priority: u32) -> u32 {
+// Priority is honoured only for `D3DPOOL_MANAGED` resources (D3D9 manager
+// eviction order), as on a vertex buffer. For every other pool both accessors
+// are fixed at `0`. Metal has no eviction-order hint, so the value is stored
+// and round-tripped but never acted upon.
+extern "system" fn ib_set_priority(this: *mut c_void, priority: u32) -> u32 {
     let _api = crate::com_ref::com_api_lock::<Direct3DIndexBuffer9>(this);
     let _timer = ib_timer(this);
-    mtld3d_shared::log_once_info!(
-        target: crate::LOG_TARGET,
-        "IDirect3DIndexBuffer9::SetPriority: no Metal analog, no-op"
-    );
-    0
+    // SAFETY: vtable thunk; `this` is *mut Direct3DIndexBuffer9 per ABI.
+    let Some(mut obj) = (unsafe { InPtrMut::<Direct3DIndexBuffer9>::opt(this) }) else {
+        return 0;
+    };
+    let inner = obj.inner_mut();
+    if inner.pool != mtld3d_types::D3DPOOL_MANAGED {
+        return 0;
+    }
+    core::mem::replace(&mut inner.priority, priority)
 }
 
 extern "system" fn ib_get_priority(this: *mut c_void) -> u32 {
     let _api = crate::com_ref::com_api_lock::<Direct3DIndexBuffer9>(this);
     let _timer = ib_timer(this);
-    mtld3d_shared::log_once_info!(
-        target: crate::LOG_TARGET,
-        "IDirect3DIndexBuffer9::GetPriority: no Metal analog, no-op"
-    );
-    0
+    // SAFETY: vtable thunk; `this` is *mut Direct3DIndexBuffer9 per ABI.
+    let Some(obj) = (unsafe { InPtr::<Direct3DIndexBuffer9>::opt(this) }) else {
+        return 0;
+    };
+    obj.inner().priority
 }
 
 extern "system" fn ib_pre_load(this: *mut c_void) {

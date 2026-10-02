@@ -655,9 +655,9 @@ fn resource_no_op_methods_are_callable() {
 /// They stay pinned at `0` for every other pool. D3D9 honours priority only for
 /// managed resources — it orders the resource manager's eviction — so
 /// `SetPriority` returns the previously stored value and `GetPriority` reads it
-/// back; non-managed pools report `0` and discard the write. Covers the two
-/// resource types the contract round-trips (texture and vertex buffer); surfaces
-/// and render targets are always `0`.
+/// back; non-managed pools report `0` and discard the write. Covers a texture
+/// and a vertex buffer (`buffers.rs` covers the index buffer); surfaces and
+/// render targets are always `0`.
 #[test]
 fn priority_round_trips_for_managed_resources() {
     let h = Harness::new();
