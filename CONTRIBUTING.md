@@ -317,11 +317,14 @@ On an arm64 Wine the benchmarks' clock is FEX's translation of `rdtsc`, a
 counter read that is not ordered after earlier stores (an `mfence` does not
 order it either), so stores still draining when a timed call starts are
 charged to that call. A row that times one call alone between writes is
-then not the call alone: `texture_streaming`'s `lockrect.*` rows carry part
-of the previous level's fill, and move with a change that only makes that
-write slower. Judge it on an arm64 leg by `fill.*`, which times each level's
-`LockRect`, write and `UnlockRect` as one interval and so keeps the drain
-inside the row.
+then not the call alone: `texture_streaming`'s `lockrect.p50` and
+`lockrect.p99`, the new textures' `LockRect` rows, carry part of the
+previous level's fill, and move with a change that only makes that write
+slower. Judge those on an arm64 leg by `fill.p50` and `fill.p99`, which time
+each level's `LockRect`, write and `UnlockRect` as one interval. A texture's
+levels are filled one after another, so a drain that misses one level's
+interval lands in the next level's, and only the last level's can leave
+the row.
 
 `make bench-host` is the one benchmark that needs no Wine: it times DXSO
 parsing and MSL emission on this machine over two synthetic corpora and any
