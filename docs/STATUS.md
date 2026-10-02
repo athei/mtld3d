@@ -170,6 +170,13 @@ unless its entry says otherwise.
   it: both World of Warcraft targets create a plain device, and nothing else
   in the tested set asks for 9Ex. Issue #789 is the record of the decision
   and of what an implementation would cover.
+- SM3 relative addressing of anything but the float constants: an input
+  read through the loop counter (`v[aL]` in `ps_3_0` and `vs_3_0`) and a
+  `vs_3_0` output written through it (`o[aL]`). A shader that writes
+  `o[aL]` fails `CreateVertexShader` with `D3DERR_INVALIDCALL`; one that
+  reads `v[aL]` is created, but its translation fails with a logged error
+  and its draws are left out, so this one does not fail cleanly. No known
+  title needs either.
 - A draw that samples the colour render target it is drawing into (a
   feedback loop) has no hazard handling, and nothing detects the bind, so
   this one does not fail cleanly. Metal leaves the result undefined, and an
