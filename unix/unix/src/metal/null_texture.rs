@@ -54,7 +54,13 @@ impl NullTextures {
     }
 }
 
-static NULL_TEXTURES: OnceLock<NullTextures> = OnceLock::new();
+/// The set `create` built, or `None` once it failed.
+///
+/// Process-wide: the textures and sampler are built on the one `MTLDevice`
+/// the process uses, which every D3D device shares. A failed creation is
+/// kept too, so a draw that binds a null texture after it asks Metal once
+/// rather than on every draw.
+static NULL_TEXTURES: OnceLock<Option<NullTextures>> = OnceLock::new();
 
 /// The shared default sampler, borrowed for as long as the caller needs it.
 ///
@@ -79,15 +85,12 @@ pub fn default_sampler(
 /// Lazily create and cache the opaque-black textures + default sampler.
 ///
 /// Called from the command loop the first time a draw binds a null texture.
-/// Returns `None` (with an error at the failure site) if any Metal object
-/// cannot be created; the caller then leaves the argument unbound, the same
-/// state as before this path existed.
+/// Returns `None` (with a warning at the failure site, logged once) if any
+/// Metal object cannot be created; the caller then leaves the argument
+/// unbound. The failure is cached with the set, so later draws are not
+/// retried against Metal.
 pub fn ensure(device: &ProtocolObject<dyn MTLDevice>) -> Option<NullTextures> {
-    if let Some(r) = NULL_TEXTURES.get() {
-        return Some(*r);
-    }
-    let created = create(device)?;
-    Some(*NULL_TEXTURES.get_or_init(|| created))
+    *NULL_TEXTURES.get_or_init(|| create(device))
 }
 
 fn create(device: &ProtocolObject<dyn MTLDevice>) -> Option<NullTextures> {
@@ -135,7 +138,14 @@ fn make_black_texture(
     desc.setUsage(MTLTextureUsage::ShaderRead);
     desc.setStorageMode(cpu_written_texture_storage(device));
 
-    let texture = device.newTextureWithDescriptor(&desc)?;
+    let Some(texture) = device.newTextureWithDescriptor(&desc) else {
+        mtld3d_shared::log_once_warn!(
+            target: LOG_TARGET,
+            "null texture: the 1x1 black {texture_type:?} texture could not be created; \
+             unbound declared samplers stay unbound"
+        );
+        return None;
+    };
     let label = objc2_foundation::NSString::from_str("mtld3d-null-black");
     texture.setLabel(Some(&label));
 

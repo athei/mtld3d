@@ -259,9 +259,18 @@ pub fn ensure_gamma_pipeline(
     // milliseconds, and two threads building the same key both succeed, one
     // copy is kept and the other's retain released.
     let library = ensure_library(device)?;
-    let vs = library.newFunctionWithName(&NSString::from_str("mtld3d_present_vs"))?;
     let (ps_name, color_format) = stage.function();
-    let ps = library.newFunctionWithName(&NSString::from_str(ps_name))?;
+    let (Some(vs), Some(ps)) = (
+        library.newFunctionWithName(&NSString::from_str("mtld3d_present_vs")),
+        library.newFunctionWithName(&NSString::from_str(ps_name)),
+    ) else {
+        mtld3d_shared::log_once_warn!(
+            target: LOG_TARGET,
+            "present: the gamma pipeline's functions (mtld3d_present_vs, {ps_name}) are not in \
+             the present library; the frame is presented without the ramp"
+        );
+        return None;
+    };
     let label = format!("mtld3d-present-pipeline-{ps_name}");
     let pipeline = build_pipeline(device, &vs, &ps, color_format, &label)?;
     // SAFETY: `Retained::into_raw` transfers the retain into the typed handle.

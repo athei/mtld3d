@@ -9085,6 +9085,20 @@ fn intersect_d3d_rects(
     (x2 > x1 && y2 > y1).then_some((x1, y1, x2, y2))
 }
 
+/// The `INVALIDCALL` `Clear` answers for a depth or stencil clear with no depth-stencil surface.
+///
+/// Out of line so `Clear` does not build the log arguments on its hot path.
+#[cold]
+#[inline(never)]
+fn reject_depth_clear_without_surface(flags: u32) -> i32 {
+    mtld3d_shared::log_once_warn!(
+        target: LOG_TARGET,
+        "Clear of depth or stencil (flags={flags:#x}) with no depth-stencil surface bound → \
+         INVALIDCALL"
+    );
+    D3DERR_INVALIDCALL
+}
+
 extern "system" fn device_clear(
     this: *mut c_void,
     count: u32,
@@ -9113,7 +9127,7 @@ extern "system" fn device_clear(
     // invalid: a prior `SetDepthStencilSurface(NULL)` leaves no surface to
     // clear.
     if flags & (D3DCLEAR_ZBUFFER | D3DCLEAR_STENCIL) != 0 && !dev.depth_stencil_bound() {
-        return D3DERR_INVALIDCALL;
+        return reject_depth_clear_without_surface(flags);
     }
 
     // Clear also honours D3DRS_SCISSORTESTENABLE: when on, every cleared

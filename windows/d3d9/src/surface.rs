@@ -2508,28 +2508,33 @@ fn backbuffer_read_into_lock(
 /// width and bit count.
 fn readback_full_backbuffer(inner: &mut SurfaceInner) -> Option<(u32, u32, u32)> {
     if inner.device_inner.is_null() {
+        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+            "back-buffer GetDC: the surface has no owning device → INVALIDCALL");
         return None;
     }
     let w = inner.live_width();
     let h = inner.live_height();
     let tex_handle = inner.live_color_handle();
-    if w == 0 || h == 0 || tex_handle.is_null() {
-        return None;
-    }
-    let fmt = mtld3d_core::format::map_d3d_format(inner.live_format())?;
-    if fmt.bytes_per_pixel() == 0 {
-        return None;
-    }
-    let bytes_per_row = mtld3d_core::format::linear_row_pitch(w, fmt.bytes_per_pixel());
+    let format = inner.live_format();
+    let bytes_per_pixel =
+        mtld3d_core::format::map_d3d_format(format).map_or(0, |mapping| mapping.bytes_per_pixel());
+    let bytes_per_row = mtld3d_core::format::linear_row_pitch(w, bytes_per_pixel);
     let bytes = (bytes_per_row as usize).saturating_mul(h as usize);
-    if bytes == 0 {
+    if tex_handle.is_null() || bytes == 0 {
+        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+            "back-buffer GetDC: nothing to read back ({w}x{h}, format {format:#x}, \
+             texture {:#x}) → INVALIDCALL", tex_handle.raw());
         return None;
     }
     let mut page = PageBox::new_uninit(bytes);
     // SAFETY: `device_inner` is non-null (checked) and points to the live owning
     // device, which outlives its child surfaces per D3D9 lifetime rules.
     let device_inner = unsafe { &mut *inner.device_inner };
-    device_inner.flush_current_frame_blocking().ok()?;
+    if let Err(hr) = device_inner.flush_current_frame_blocking() {
+        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+            "back-buffer GetDC: flushing the frame failed ({hr:#x}) → INVALIDCALL");
+        return None;
+    }
     let mut params = BlitTextureToBufferParams {
         planes: mtld3d_shared::mtl::ReadbackPlanes::Color,
         stencil_bytes_per_row: 0,
@@ -2554,7 +2559,10 @@ fn readback_full_backbuffer(inner: &mut SurfaceInner) -> Option<(u32, u32, u32)>
         // BGRA8 back buffer: a block row is a pixel row.
         block_height: 1,
     };
-    if unix_call(&mut params) != 0 {
+    let status = unix_call(&mut params);
+    if status != 0 {
+        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+            "back-buffer GetDC: BlitTextureToBuffer failed status={status:#x} → INVALIDCALL");
         return None;
     }
     inner.readback = Some(page);
@@ -2577,12 +2585,19 @@ fn readback_full_backbuffer(inner: &mut SurfaceInner) -> Option<(u32, u32, u32)>
 fn backbuffer_dc_upload(inner: &mut SurfaceInner) {
     let (width, height) = (inner.live_width(), inner.live_height());
     let color_handle = inner.live_color_handle().raw();
-    let Some(mapping) = mtld3d_core::format::map_d3d_format(inner.live_format()) else {
+    let live_format = inner.live_format();
+    let Some(mapping) = mtld3d_core::format::map_d3d_format(live_format) else {
+        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+            "back-buffer ReleaseDC: format {live_format:#x} has no mapping; GDI's drawing is \
+             not written back");
         return;
     };
     let format = mapping.metal_pixel_format();
     let bpp = mapping.bytes_per_pixel();
     if bpp == 0 || width == 0 || height == 0 || color_handle == 0 || inner.device_inner.is_null() {
+        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+            "back-buffer ReleaseDC: nothing to write back into ({width}x{height}, {bpp} bytes \
+             per pixel, texture {color_handle:#x}); GDI's drawing is not written back");
         return;
     }
     // SAFETY: `device_inner` is non-null (checked above) and points to the live
@@ -2592,9 +2607,14 @@ fn backbuffer_dc_upload(inner: &mut SurfaceInner) {
         .saturating_mul(height as usize)
         .saturating_mul(bpp as usize);
     let Some(page) = inner.readback.as_ref() else {
+        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+            "back-buffer ReleaseDC: the DC's page is gone; GDI's drawing is not written back");
         return;
     };
     if page.len() < needed {
+        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+            "back-buffer ReleaseDC: the DC's page holds {} bytes, {needed} needed; GDI's \
+             drawing is not written back", page.len());
         return;
     }
     // Capture into frame-owned bytes before the caller can drop the DC page.

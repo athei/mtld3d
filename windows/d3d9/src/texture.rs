@@ -5542,17 +5542,18 @@ extern "system" fn volume9_query_interface(
     let _api = volume9_api_lock(this);
     // A volume is an `IUnknown` and an `IDirect3DVolume9`, nothing else: it is
     // not a resource (the parent texture is).
-    // SAFETY: `riid` is the caller's read-only GUID pointer.
-    let accepted = (unsafe { InPtr::<Guid>::opt(riid.cast()) })
-        .is_some_and(|iid| matches!(*iid, IID_IUNKNOWN | IID_IDIRECT3DVOLUME9));
-    if accepted && !ppv.is_null() {
-        // SAFETY: validated writable out pointer.
-        unsafe { *ppv = this };
-        volume9_add_ref(this);
-        return D3D_OK;
+    // SAFETY: `this` is the live volume for the vtable call, `riid` the
+    // caller's read-only GUID pointer and `ppv` its out slot, per the ABI.
+    unsafe {
+        crate::com_ref::com_query_interface(
+            this,
+            riid,
+            ppv,
+            &[IID_IUNKNOWN, IID_IDIRECT3DVOLUME9],
+            volume9_add_ref,
+            "IDirect3DVolume9",
+        )
     }
-    null_out(ppv);
-    E_NOINTERFACE
 }
 
 extern "system" fn volume9_add_ref(this: *mut c_void) -> u32 {
