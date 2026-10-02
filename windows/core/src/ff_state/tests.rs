@@ -370,6 +370,45 @@ fn tex_coord_count_covers_routed_and_generated_stages_past_colorop_disable() {
     assert_eq!(count(&[(1, CAMERASPACEPOSITION)], rhw), 2);
 }
 
+/// `D3DRS_NORMALIZENORMALS` reaches the key for every draw that reads the eye normal.
+///
+/// Lighting reads it, and so does a texgen stage the VS emits that generates
+/// from the normal, lit or not. A draw with neither, or without a vertex
+/// normal, keeps the bit clear so the render state does not fork its shader.
+#[test]
+fn normalize_normals_flag_follows_every_eye_normal_reader() {
+    use mtld3d_types::{D3DRS_LIGHTING, D3DRS_NORMALIZENORMALS};
+    const CAMERASPACENORMAL: u32 = 1 << 16;
+    const CAMERASPACEREFLECTIONVECTOR: u32 = 3 << 16;
+    const SPHEREMAP: u32 = 4 << 16;
+    const CAMERASPACEPOSITION: u32 = 2 << 16;
+    let layout = |flags| FfVsLayout {
+        flags,
+        tex_coord_count: 1,
+        tex_coord_dims: [2, 0, 0, 0, 0, 0, 0, 0],
+        declared_weights_count: 0,
+    };
+    let normal = layout(FfVsLayoutFlags::HAS_NORMAL);
+    let flag = |lighting: u32, tci: u32, layout: FfVsLayout| {
+        let mut ff = FfState::new();
+        ff.set_texture_stage_state(0, D3DTSS_TEXCOORDINDEX as usize, tci);
+        let mut states = rs();
+        states[D3DRS_LIGHTING as usize] = lighting;
+        states[D3DRS_NORMALIZENORMALS as usize] = 1;
+        ff.build_vs_key(&states, layout, 0b1).normalize_normals()
+    };
+    assert!(flag(1, 0, normal), "lit");
+    assert!(!flag(0, 0, normal), "unlit passthru reads no normal");
+    for tci in [CAMERASPACENORMAL, CAMERASPACEREFLECTIONVECTOR, SPHEREMAP] {
+        assert!(flag(0, tci, normal), "unlit texgen {tci:#x} reads the normal");
+    }
+    assert!(!flag(0, CAMERASPACEPOSITION, normal), "position texgen");
+    assert!(
+        !flag(0, SPHEREMAP, layout(FfVsLayoutFlags::empty())),
+        "no vertex normal"
+    );
+}
+
 #[test]
 fn local_viewer_flag_canonicalizes_on_lighting_and_specular() {
     use mtld3d_types::{D3DRS_LIGHTING, D3DRS_LOCALVIEWER, D3DRS_SPECULARENABLE};

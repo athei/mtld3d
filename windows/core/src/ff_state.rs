@@ -1323,6 +1323,20 @@ impl FfState {
             FfVsFlags::RANGE_FOG,
             matches!(fog_mode, 1..=3) && render_states[D3DRS_RANGEFOGENABLE as usize] != 0,
         );
+        // D3DRS_NORMALIZENORMALS only affects a draw that reads the eye
+        // normal: lighting, or a texgen stage the VS emits that generates
+        // from the normal. Gate the variant fork on those so the other draws
+        // don't multiply pipelines.
+        let texgen_reads_normal = !layout.has_rhw()
+            && tci_modes[..usize::from(tex_coord_count)]
+                .iter()
+                .any(|&mode| matches!(mode, 1 | 3 | 4));
+        flags.set(
+            FfVsFlags::NORMALIZE_NORMALS,
+            (lighting_enabled || texgen_reads_normal)
+                && layout.has_normal()
+                && render_states[D3DRS_NORMALIZENORMALS as usize] != 0,
+        );
 
         FfVsKey {
             reserved: 0,
@@ -2224,14 +2238,6 @@ fn build_vs_flags(
     flags.set(FfVsFlags::USES_VERTEX_DECL, layout.uses_vertex_decl());
     flags.set(FfVsFlags::HAS_COLOR1, layout.has_color1());
     flags.set(FfVsFlags::LIGHTING_ENABLED, lighting_enabled);
-    // D3DRS_NORMALIZENORMALS only affects a lit draw with a normal — gate the
-    // variant fork on those so unlit / no-normal draws don't multiply pipelines.
-    flags.set(
-        FfVsFlags::NORMALIZE_NORMALS,
-        lighting_enabled
-            && layout.has_normal()
-            && render_states[D3DRS_NORMALIZENORMALS as usize] != 0,
-    );
     flags.set(FfVsFlags::HAS_RHW, layout.has_rhw());
     flags.set(
         FfVsFlags::COLOR_VERTEX,

@@ -12,7 +12,7 @@ use mtld3d_types::{
     D3DRS_ALPHAFUNC, D3DRS_ALPHAREF, D3DRS_ALPHATESTENABLE, D3DRS_AMBIENT,
     D3DRS_AMBIENTMATERIALSOURCE, D3DRS_CULLMODE, D3DRS_DIFFUSEMATERIALSOURCE,
     D3DRS_EMISSIVEMATERIALSOURCE, D3DRS_INDEXEDVERTEXBLENDENABLE, D3DRS_LIGHTING,
-    D3DRS_LOCALVIEWER, D3DRS_SPECULARENABLE, D3DRS_VERTEXBLEND, D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV,
+    D3DRS_LOCALVIEWER, D3DRS_NORMALIZENORMALS, D3DRS_SPECULARENABLE, D3DRS_VERTEXBLEND, D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV,
     D3DSAMP_MAGFILTER, D3DSAMP_MINFILTER, D3DTA_ALPHAREPLICATE, D3DTA_DIFFUSE, D3DTA_SPECULAR,
     D3DTA_TEXTURE, D3DTADDRESS_CLAMP, D3DTADDRESS_WRAP, D3DTEXF_POINT, D3DTOP_DISABLE, D3DTOP_MODULATE,
     D3DTOP_SELECTARG1, D3DTS_PROJECTION, D3DTS_TEXTURE0, D3DTS_VIEW, D3DTS_WORLD, D3DTSS_ALPHAARG1,
@@ -1342,6 +1342,16 @@ const CUBE_TEXGEN_NORMALS: [(f32, f32, f32); 4] = [
 /// `faces` is the `D3DCUBEMAP_FACES` index each quadrant must show, in the
 /// order of [`CUBE_TEXGEN_NORMALS`].
 fn assert_cube_texgen_faces(h: &Harness, faces: [usize; 4], context: &str) {
+    assert_scaled_normal_cube_texgen_faces(h, 1.0, faces, context);
+}
+
+/// [`assert_cube_texgen_faces`] with every model normal scaled to length `length`.
+fn assert_scaled_normal_cube_texgen_faces(
+    h: &Harness,
+    length: f32,
+    faces: [usize; 4],
+    context: &str,
+) {
     let mut vertices = Vec::with_capacity(24);
     for ((sx, sy), (nx, ny, nz)) in [(1.0f32, 1.0f32), (1.0, -1.0), (-1.0, 1.0), (-1.0, -1.0)]
         .into_iter()
@@ -1352,9 +1362,9 @@ fn assert_cube_texgen_faces(h: &Harness, faces: [usize; 4], context: &str) {
                 x: f32::midpoint(sx, cx),
                 y: f32::midpoint(sy, cy),
                 z: 0.0,
-                nx,
-                ny,
-                nz,
+                nx: nx * length,
+                ny: ny * length,
+                nz: nz * length,
             });
         }
     }
@@ -1395,6 +1405,46 @@ fn texgen_cube_camera_space_normal_selects_the_face_the_normal_names() {
     let h = Harness::new();
     let _cube = arm_cube_texgen(&h, TCI_CAMERASPACENORMAL);
     assert_cube_texgen_faces(&h, [0, 5, 5, 3], "camera-space normal");
+}
+
+/// CAMERASPACENORMAL under a non-uniform world takes the normal lighting takes.
+///
+/// The world scales z by 4, which leaves the quads (all at z = 0) where they
+/// are. The D3D9 normal matrix, the inverse transpose, divides each normal's z
+/// by 4, so the four quads name +X, -X, +Y and -Y; the plain world matrix
+/// would multiply it by 4 and turn all four to -Z.
+#[test]
+fn texgen_cube_camera_space_normal_uses_the_normal_matrix_under_a_scaled_world() {
+    let h = Harness::new();
+    let _cube = arm_cube_texgen(&h, TCI_CAMERASPACENORMAL);
+    let mut world = IDENTITY;
+    world[10] = 4.0;
+    assert_eq!(h.set_transform(D3DTS_WORLD, &world), 0, "world");
+    assert_cube_texgen_faces(&h, [0, 1, 2, 3], "camera-space normal, world z x4");
+}
+
+/// The reflection vector reflects about the unnormalized normal unless NORMALIZENORMALS is set.
+///
+/// Every model normal has length 2. Reflecting E = (0, 0, 1) about N = 2u
+/// gives E - 8 (E.u) u, so the quads show +X, -Z, -Z and -Y; about the unit u
+/// they show +Z, -X, +Y and +Z. Lighting on or off does not change which
+/// normal the stage reads.
+#[test]
+fn texgen_cube_reflection_vector_renormalizes_only_under_normalizenormals() {
+    let h = Harness::new();
+    let _cube = arm_cube_texgen(&h, TCI_CAMERASPACEREFLECTIONVECTOR);
+    for lighting in [0, 1] {
+        assert_eq!(h.set_render_state(D3DRS_LIGHTING, lighting), 0);
+        for (normalize, faces) in [(0, [0, 5, 5, 3]), (1, [4, 1, 2, 4])] {
+            assert_eq!(h.set_render_state(D3DRS_NORMALIZENORMALS, normalize), 0);
+            assert_scaled_normal_cube_texgen_faces(
+                &h,
+                2.0,
+                faces,
+                &format!("reflection, lighting={lighting} normalizenormals={normalize}"),
+            );
+        }
+    }
 }
 
 // ── Indexed vertex blending past the advertised palette index ──

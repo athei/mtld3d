@@ -180,7 +180,8 @@ pub const fn rs_classify(index: u32, value: u32) -> RsClass {
         | D3DRS_SPECULARMATERIALSOURCE
         | D3DRS_EMISSIVEMATERIALSOURCE
         // NORMALIZENORMALS is the `FfVsFlags::NORMALIZE_NORMALS` key bit on a
-        // lit draw with a normal: the VS renormalizes the eye-space normal.
+        // draw that reads a vertex normal for lighting or texgen: the VS
+        // renormalizes the eye-space normal.
         | D3DRS_NORMALIZENORMALS
         // SPECULARENABLE gates the specular colour output of the FF VS.
         | D3DRS_SPECULARENABLE
