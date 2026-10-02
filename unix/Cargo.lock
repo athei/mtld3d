@@ -309,6 +309,7 @@ version = "0.11.0"
 dependencies = [
  "libc",
  "mtld3d-shared",
+ "mtld3d-types",
 ]
 
 [[package]]

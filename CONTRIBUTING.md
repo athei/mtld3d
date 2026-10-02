@@ -369,8 +369,22 @@ fails the run like a changed exact metric unless `ACCEPT` names `shape` or
 checks a benchmark's scene against a frame a game dumped with F12: the pass
 count, and per pass the draw count, the fixed-function share and the
 textures per draw, with render-target sizes shown relative to each side's
-back buffer. Run it by hand when building or reshaping a scene that stands
-for a game; it is no gate.
+back buffer. Each pass is also compared on its state mix, which a benchmark
+declares by appending these counts to its `shape` line: `blend=`, `atest=`,
+`zwrite_off=`, `cull_none=` and `cmask0=` count the draws with blending on,
+with alpha test on, whose depth-write field is 0, with cull mode NONE, and
+whose render target 0 colour write mask is 0, and are judged as shares of
+the pass's draws within 10 points. `vs_sw=`, `ps_sw=`, `tex_sw=`,
+`blend_sw=`, `atest_sw=` and `cull_sw=` count the draws after the pass's
+first whose vertex shader, pixel shader, stage-0 texture, whole blend tuple,
+whole alpha-test tuple or cull mode differs from the draw before (fixed
+function and no texture are values like any other), and `vs_n=`, `ps_n=`
+and `tex_n=` count the distinct programmable vertex and pixel shaders and
+the distinct textures on any stage. Those nine are judged within 15 % of the
+game's count, but never closer than 5. A `shape` line without the state keys
+still parses: its state mix prints as not reported and is not judged. Run it
+by hand when building or reshaping a scene that stands for a game; it is no
+gate.
 
 Bench numbers come from `PROD=1 PERF=1` builds only; `make bench-ab` builds
 both legs that way and refuses any other profile, since `release` carries
