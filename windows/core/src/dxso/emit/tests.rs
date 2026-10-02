@@ -1385,13 +1385,14 @@ fn lit_emits_lighting_coefficients() {
         "lit must compute max(src.x, 0) for the diffuse term:\n{msl}"
     );
     assert!(
-        msl.contains("pow(max((in.v0).y, 0.0), (in.v0).w)"),
-        "lit must compute pow(max(src.y,0), src.w) for the specular term:\n{msl}"
+        msl.contains("pow((in.v0).y, clamp((in.v0).w, -127.9961, 127.9961))"),
+        "lit must raise src.y to src.w clamped to the D3D9 exponent range:\n{msl}"
     );
     assert!(
-        msl.contains("(in.v0).x > 0.0"),
-        "lit must gate the specular term on src.x > 0:\n{msl}"
+        msl.contains("((in.v0).x > 0.0) && ((in.v0).y > 0.0)"),
+        "lit must gate the specular term on src.x > 0 and src.y > 0:\n{msl}"
     );
+    metal_compile_or_fail(&emit_vs_programmable(&parse(&bc).expect("vs parse")).expect("emit vs"));
 }
 
 #[test]

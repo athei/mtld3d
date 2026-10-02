@@ -1964,15 +1964,15 @@ fn translate_instruction(
         // D3D9 lit src — fixed-function lighting coefficients:
         //   dst.x = 1
         //   dst.y = max(src.x, 0)
-        //   dst.z = src.x > 0 ? pow(max(src.y, 0), src.w) : 0
+        //   dst.z = (src.x > 0 && src.y > 0) ? pow(src.y, power) : 0
         //   dst.w = 1
-        // The src.x > 0 gate avoids `pow(0, w)` blowing up when the
-        // diffuse term is zero. `clamp` mirrors the D3D9 exponent
-        // range — Metal's pow has the same well-behavedness so the
-        // gate alone is enough.
+        // where power is src.w clamped to +-127.9961, the D3D9 exponent
+        // range. Gating on src.y keeps `pow(0, w)` out of the result: it is
+        // 1 for w = 0 and +inf for a negative w, where D3D9 gives 0.
         Opcode::Lit => format!(
             "float4(1.0, max(({s}).x, 0.0), \
-             (({s}).x > 0.0) ? pow(max(({s}).y, 0.0), ({s}).w) : 0.0, \
+             ((({s}).x > 0.0) && (({s}).y > 0.0)) \
+             ? pow(({s}).y, clamp(({s}).w, -127.9961, 127.9961)) : 0.0, \
              1.0)",
             s = srcs[0]
         ),
