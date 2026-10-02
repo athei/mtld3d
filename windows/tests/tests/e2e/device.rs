@@ -14,10 +14,10 @@ use std::{
 
 use mtld3d_core::display_mode::MAX_SERVED_SIZES;
 use mtld3d_tests::{
-    Harness, HarnessConfig, TexturedVertex, WM_ACTIVATEAPP, WS_CAPTION, WS_EX_TOPMOST, WS_POPUP,
-    WS_VISIBLE, WindowStyle, assert_pixel_eq, config_var, create_window, cursor_is_live,
-    cursor_mask_bits, destroy_window, enumerate_display_sizes, run_child, spawn_scoped,
-    window_rect,
+    Harness, HarnessConfig, StateBlock, Texture, TexturedVertex, WM_ACTIVATEAPP, WS_CAPTION,
+    WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE, WindowStyle, assert_pixel_eq, config_var, create_window,
+    cursor_is_live, cursor_mask_bits, destroy_window, enumerate_display_sizes, run_child,
+    spawn_scoped, window_rect,
 };
 use mtld3d_types::{
     D3D_OK, D3DCLEAR_TARGET, D3DCREATE_HARDWARE_VERTEXPROCESSING, D3DCREATE_NOWINDOWCHANGES,
@@ -1126,6 +1126,59 @@ fn reset_is_rejected_while_a_state_block_holds_a_default_pool_resource() {
             "Reset succeeds once the block holding the {what} is released"
         );
     }
+}
+
+/// A state block holding a released, unbound `D3DPOOL_DEFAULT` texture.
+fn block_holding_a_released_texture(h: &Harness) -> StateBlock<'_> {
+    let tex = h.create_texture(16, 16, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT);
+    assert_eq!(h.set_texture(0, &tex), D3D_OK, "SetTexture");
+    let block = h.create_state_block(D3DSBT_ALL);
+    assert_eq!(h.clear_texture(0), D3D_OK, "unbind the texture");
+    block
+}
+
+/// A public reference to a texture a state block holds leaves it outstanding for `Reset` once.
+///
+/// The texture counts as outstanding while the application or a state block
+/// holds it, whichever let go last. A `GetTexture` reference taken and given
+/// back while the block holds it leaves the block's hold alone, so `Reset`
+/// stays rejected until the block is released. One that outlives the block
+/// keeps `Reset` rejected after the block is gone, and releasing it is what
+/// lets `Reset` through: neither hand-over leaves the texture counted twice
+/// or not at all.
+#[test]
+fn reset_counts_a_held_texture_once_across_public_references() {
+    let h = Harness::new();
+    let block = block_holding_a_released_texture(&h);
+    assert_eq!(block.apply(), D3D_OK, "Apply binds the held texture");
+    drop(Texture::from_raw(h.texture_raw(0)));
+    assert_eq!(
+        h.reset(640, 480),
+        D3DERR_INVALIDCALL,
+        "a GetTexture reference given back leaves the block's hold in place"
+    );
+    drop(block);
+    assert_eq!(
+        h.reset(640, 480),
+        D3D_OK,
+        "Reset succeeds once the block is released"
+    );
+
+    let block = block_holding_a_released_texture(&h);
+    assert_eq!(block.apply(), D3D_OK, "Apply binds the held texture");
+    let held = Texture::from_raw(h.texture_raw(0));
+    drop(block);
+    assert_eq!(
+        h.reset(640, 480),
+        D3DERR_INVALIDCALL,
+        "the application's GetTexture reference outlives the block and blocks Reset"
+    );
+    drop(held);
+    assert_eq!(
+        h.reset(640, 480),
+        D3D_OK,
+        "Reset succeeds once the application releases the texture"
+    );
 }
 
 #[test]
