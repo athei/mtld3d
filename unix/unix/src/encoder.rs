@@ -336,6 +336,41 @@ struct DepthSnapshot {
     epoch: u64,
 }
 
+/// Take the scratch copies cached for `source`, whose texture is being destroyed.
+///
+/// `depth_snapshots` and `stretch_scratch` are keyed by the source's handle,
+/// an allocation address Metal hands to the next texture it creates once this
+/// one is gone. An entry left behind would leak its full-size copy and hand
+/// that copy, with the old texture's contents, to whatever lands at the
+/// address. Every use of a copy names its source too, so once the source has
+/// retired the copies are unreferenced.
+fn take_source_scratch(
+    depth_snapshots: &mut FxHashMap<u64, DepthSnapshot>,
+    stretch_scratch: &mut FxHashMap<u64, StretchScratch>,
+    source: u64,
+) -> [Option<MetalHandle<MTLTextureKind>>; 2] {
+    [
+        depth_snapshots
+            .remove(&source)
+            .map(|snapshot| snapshot.handle),
+        stretch_scratch
+            .remove(&source)
+            .map(|scratch| scratch.handle),
+    ]
+}
+
+/// Empty both source-keyed scratch caches, returning every copy they held.
+fn drain_source_scratch(
+    depth_snapshots: &mut FxHashMap<u64, DepthSnapshot>,
+    stretch_scratch: &mut FxHashMap<u64, StretchScratch>,
+) -> Vec<MetalHandle<MTLTextureKind>> {
+    depth_snapshots
+        .drain()
+        .map(|(_, snapshot)| snapshot.handle)
+        .chain(stretch_scratch.drain().map(|(_, scratch)| scratch.handle))
+        .collect()
+}
+
 pub struct TextureGpuState {
     pub views: TextureViews,
     pub mip_staging_buffers: Vec<MipStagingBuffer>,
@@ -2932,6 +2967,9 @@ impl FrameEncoder {
             },
             "resz",
         );
+        // The copy writes the destination's depth with no draw or clear, so a
+        // snapshot taken of it for sampling while bound no longer reflects it.
+        self.bump_depth_write_epoch();
     }
 
     /// Resolve one multisampled depth surface into a single-sampled one.
@@ -3007,6 +3045,9 @@ impl FrameEncoder {
             },
             "depth-alias",
         );
+        // As for the RESZ copy: the destination's depth changed under any
+        // snapshot taken of it.
+        self.bump_depth_write_epoch();
     }
 
     /// A readable copy of the bound depth attachment, for a draw that samples it.
@@ -3018,7 +3059,8 @@ impl FrameEncoder {
     /// the values as of the last write or clear. So: land a pending clear,
     /// close the pass, queue a blit that copies the attachment into a scratch
     /// depth texture of the same size and format, and hand that copy out. The
-    /// copy stays valid until a depth write or clear bumps the epoch, so a run
+    /// copy stays valid until a depth write, a clear or a copy into a depth texture
+    /// (RESZ, a depth transfer, the alias carry) bumps the epoch, so a run
     /// of light-volume draws costs one copy. Returns 0 when no depth attachment is bound or the
     /// scratch texture cannot be created.
     pub fn depth_snapshot_for_sampling(&mut self) -> u64 {
@@ -6327,12 +6369,14 @@ impl FrameEncoder {
         }
     }
 
-    /// Prune the pass state's handle-keyed records for a texture being destroyed.
+    /// Prune the handle-keyed records for a texture being destroyed.
     ///
     /// The retention drains are the one point where an `MTLTexture` handle
     /// stops naming this resource: the GPU has retired every submission that
     /// referenced it, so no pass under construction can name it either, and
-    /// the address is about to become available to the next allocation.
+    /// the address is about to become available to the next allocation. The
+    /// depth snapshot and `StretchRect` scratch copied out of the texture go
+    /// with it, on the retention queue.
     fn retire_texture_handle(&mut self, handle: u64) {
         // SAFETY: a `DestroyKind::Texture` retention entry carries the `.raw()`
         // of a `MetalHandle<MTLTextureKind>`, so the value is an `MTLTexture`
@@ -6342,6 +6386,19 @@ impl FrameEncoder {
         // The address can name the next texture Metal creates, which must not
         // inherit this one's clears.
         self.cleared_targets.forget(texture);
+        let copies =
+            take_source_scratch(&mut self.depth_snapshots, &mut self.stretch_scratch, handle);
+        for copy in copies.into_iter().flatten() {
+            self.pending_resource_retention
+                .push_back(PendingResourceRetention {
+                    kind: DestroyKind::Texture,
+                    handle: copy.raw(),
+                    page_box: None,
+                    staging_arc: None,
+                    seq: self.current_submit_seq,
+                    from_texture: false,
+                });
+        }
     }
 
     /// Drain resource-retention entries whose seq has retired on the GPU.
@@ -8095,6 +8152,17 @@ impl FrameEncoder {
         // the bulk destroy releases every wrapper around their pages.
         for entry in self.pending_texture_uploads.drain_all() {
             held.staging_reads.push(entry.into_payload().staging);
+        }
+        // The scratch copies of textures still alive here, and the write-back
+        // slot, are not in any cache the walk above collected.
+        textures.extend(
+            drain_source_scratch(&mut self.depth_snapshots, &mut self.stretch_scratch)
+                .into_iter()
+                .map(MetalHandle::raw),
+        );
+        let write_back = core::mem::replace(&mut self.dc_write_back_scratch, MetalHandle::NULL);
+        if !write_back.is_null() {
+            textures.push(write_back.raw());
         }
 
         // 3. Bulk destroys for live caches. Pipelines reference functions,

@@ -1052,6 +1052,150 @@ fn intz_depth_sampled_while_bound_as_depth_attachment() {
     assert_eq!(h.clear_texture(0), 0, "unbind INTZ");
 }
 
+/// A RESZ resolve into an INTZ texture reaches the next draw that samples it while bound.
+///
+/// Sampling the bound depth attachment reads a copy the encoder keeps until
+/// a depth write moves its epoch. A RESZ resolve into the texture is such a
+/// write even though no draw or clear touches it: sampled again while bound,
+/// the texture must read the 0.75 the resolve brought in, not the 0.25 the
+/// first copy held.
+#[test]
+fn intz_depth_sampled_while_bound_sees_a_resz_resolve_into_it() {
+    let h = Harness::new();
+    let depth_texture = || {
+        h.create_texture(
+            640,
+            480,
+            1,
+            D3DUSAGE_DEPTHSTENCIL,
+            D3DFMT_INTZ,
+            D3DPOOL_DEFAULT,
+        )
+    };
+    let sampled = depth_texture();
+    let source = depth_texture();
+    let sampled_surf = sampled.surface_level(0);
+    let source_surf = source.surface_level(0);
+    let backbuffer = h.render_target(0);
+    assert_eq!(h.set_render_target(0, &backbuffer), 0, "color target");
+    assert_eq!(h.clear_texture(0), 0, "no sampler while writing depth");
+
+    // The resolve's source holds 0.75, written before the first sample takes its copy.
+    assert_eq!(h.set_depth_stencil_surface(&source_surf), 0, "bind source");
+    assert_eq!(h.clear(D3DCLEAR_ZBUFFER, BLACK, 0.75, 0), 0);
+
+    // The sampled texture gets 0.25 from a draw, then is sampled while bound.
+    assert_eq!(
+        h.set_depth_stencil_surface(&sampled_surf),
+        0,
+        "bind the sampled texture as depth"
+    );
+    assert_eq!(h.set_render_state(D3DRS_ZENABLE, 1), 0);
+    assert_eq!(h.set_render_state(D3DRS_ZWRITEENABLE, 1), 0);
+    assert_eq!(h.set_render_state(D3DRS_ZFUNC, D3DCMP_ALWAYS), 0);
+    h.select_diffuse_stage(0);
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE), 0);
+    assert_eq!(
+        h.clear(D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, BLACK, 1.0, 0),
+        0
+    );
+    let occluder = [
+        PosColorVertex {
+            x: -1.0,
+            y: 3.0,
+            z: 0.25,
+            color: WHITE,
+        },
+        PosColorVertex {
+            x: 3.0,
+            y: -1.0,
+            z: 0.25,
+            color: WHITE,
+        },
+        PosColorVertex {
+            x: -1.0,
+            y: -1.0,
+            z: 0.25,
+            color: WHITE,
+        },
+    ];
+    assert_eq!(h.begin_scene(), 0);
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &occluder),
+        0,
+        "depth write draw"
+    );
+    assert_eq!(h.end_scene(), 0);
+    assert_eq!(h.set_render_state(D3DRS_ZWRITEENABLE, 0), 0);
+    let sample_center = || {
+        assert_eq!(h.set_texture(0, &sampled), 0, "bind INTZ as a sampler");
+        h.select_texture_stage(0);
+        for (state, value) in [
+            (D3DSAMP_MINFILTER, D3DTEXF_POINT),
+            (D3DSAMP_MAGFILTER, D3DTEXF_POINT),
+            (D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP),
+            (D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP),
+        ] {
+            assert_eq!(h.set_sampler_state(0, state, value), 0, "sampler");
+        }
+        assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1), 0);
+        let v = |x: f32, y: f32, u: f32, vv: f32| TexturedVertex {
+            x,
+            y,
+            z: 0.5,
+            color: WHITE,
+            u,
+            v: vv,
+        };
+        let quad = [
+            v(-0.5, 0.5, 0.0, 0.0),
+            v(0.5, 0.5, 1.0, 0.0),
+            v(-0.5, -0.5, 0.0, 1.0),
+            v(0.5, 0.5, 1.0, 0.0),
+            v(0.5, -0.5, 1.0, 1.0),
+            v(-0.5, -0.5, 0.0, 1.0),
+        ];
+        assert_eq!(h.begin_scene(), 0);
+        assert_eq!(
+            h.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad),
+            0,
+            "sample-depth draw with the attachment still bound"
+        );
+        assert_eq!(h.end_scene(), 0);
+        assert_eq!(h.present(), 0);
+        let center = Rgba8::from_pixel(h.read_pixel(320, 240));
+        assert_eq!(h.clear_texture(0), 0, "unbind INTZ");
+        center
+    };
+    let first = sample_center();
+    assert!(
+        (48..=90).contains(&first.r),
+        "the first sample reads the drawn 0.25 as dark gray, got {first:?}"
+    );
+
+    // The resolve copies the bound source into the texture at stage 0, with
+    // no draw or clear on either; then the texture is the attachment again.
+    assert_eq!(h.set_depth_stencil_surface(&source_surf), 0, "bind source");
+    assert_eq!(h.set_texture(0, &sampled), 0, "bind resolve destination");
+    assert_eq!(
+        h.set_render_state(mtld3d_types::D3DRS_POINTSIZE, 0x7fa0_5000),
+        0,
+        "RESZ into the sampled texture"
+    );
+    assert_eq!(h.clear_texture(0), 0, "unbind the resolve destination");
+    assert_eq!(
+        h.set_depth_stencil_surface(&sampled_surf),
+        0,
+        "bind the sampled texture as depth again"
+    );
+    assert_eq!(h.clear(D3DCLEAR_TARGET, BLACK, 1.0, 0), 0);
+    let second = sample_center();
+    assert!(
+        (170..=210).contains(&second.r),
+        "the second sample reads the resolved 0.75 as light gray, got {second:?}"
+    );
+}
+
 #[test]
 fn intz_depth_sample_via_fixed_function() {
     // The cascade-shadow plumbing under the fixed-function pixel pipeline: an

@@ -176,7 +176,8 @@ impl FrameEncoder {
     /// the source and anything after it reads what it wrote. Queuing it enters
     /// the source as read (its last pass keeps its depth store) and the
     /// destination as blit-written (its next pass loads rather than
-    /// discards). Returns `false` with nothing queued when either end is not a
+    /// discards), and moves the depth write epoch, so a depth snapshot of the
+    /// destination is taken again. Returns `false` with nothing queued when either end is not a
     /// depth texture or the transfer pipeline cannot be created.
     pub fn queue_depth_transfer(&mut self, transfer: &DepthTransfer) -> bool {
         let &DepthTransfer {
@@ -235,6 +236,10 @@ impl FrameEncoder {
         }
         self.pass_state
             .push_leading_blit_after_clears(command, "depth_transfer");
+        // The transfer (a RESZ resolve, or the resolve of a multisampled depth
+        // StretchRect) writes its destination's depth, so a snapshot taken of
+        // it for sampling while bound no longer reflects it.
+        self.bump_depth_write_epoch();
         true
     }
 

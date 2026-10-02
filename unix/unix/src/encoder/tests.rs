@@ -20,8 +20,9 @@ use objc2_metal::{
 };
 
 use super::{
-    BufferGpuState, DestroyKind, StageLibHandles, WarmCache, cached_buffer_handles,
-    destroy_resources_bulk, take_released_buffer,
+    BufferGpuState, DepthSnapshot, DestroyKind, StageLibHandles, StretchScratch, WarmCache,
+    cached_buffer_handles, destroy_resources_bulk, drain_source_scratch, take_released_buffer,
+    take_source_scratch,
 };
 
 struct NativeObjects {
@@ -315,6 +316,75 @@ fn payload_rotation_reuses_warm_scratch_chunks_across_the_submit_thread() {
     assert_eq!(pool.len(), usize::try_from(created).unwrap());
     assert_eq!(chunk_total, 2 * (created + 1));
     assert_eq!(seen.len(), usize::try_from(chunk_total).unwrap());
+}
+
+/// An opaque texture handle, never dereferenced.
+fn texture(raw: u64) -> MetalHandle<mtld3d_shared::mtl_handle::MTLTextureKind> {
+    // SAFETY: tests; opaque values never dereferenced.
+    unsafe { MetalHandle::new(raw) }
+}
+
+/// A destroyed source takes its depth snapshot and `StretchRect` scratch with it.
+///
+/// Both caches are keyed by the source texture's handle. A source destroyed
+/// without its entries leaked a full-size Private copy per recreated depth
+/// target or back buffer, and a texture Metal later created at the same
+/// address was handed the old copy. Shutdown takes whatever is left.
+#[test]
+fn a_destroyed_source_takes_its_scratch_copies_and_leaves_the_others() {
+    let mut snapshots = rustc_hash::FxHashMap::default();
+    let mut scratch = rustc_hash::FxHashMap::default();
+    for (source, copy) in [(0x100, 0x1100), (0x200, 0x1200)] {
+        snapshots.insert(
+            source,
+            DepthSnapshot {
+                handle: texture(copy),
+                width: 64,
+                height: 64,
+                format: PixelFormat::Depth32Float,
+                epoch: 0,
+            },
+        );
+    }
+    for (source, copy) in [(0x100, 0x2100), (0x300, 0x2300)] {
+        scratch.insert(
+            source,
+            StretchScratch {
+                handle: texture(copy),
+                width: 64,
+                height: 64,
+                format: PixelFormat::Bgra8Unorm,
+            },
+        );
+    }
+
+    let taken = take_source_scratch(&mut snapshots, &mut scratch, 0x100);
+    assert_eq!(
+        taken.map(|copy| copy.map(MetalHandle::raw)),
+        [Some(0x1100), Some(0x2100)],
+        "both copies of the destroyed source are handed back for retirement"
+    );
+    assert_eq!(
+        take_source_scratch(&mut snapshots, &mut scratch, 0x100).map(|copy| copy.is_some()),
+        [false, false],
+        "a texture created later at the same address finds no copy of the old one"
+    );
+    assert!(
+        snapshots.contains_key(&0x200),
+        "another source keeps its snapshot"
+    );
+    assert!(
+        scratch.contains_key(&0x300),
+        "another source keeps its scratch"
+    );
+
+    let mut rest: Vec<u64> = drain_source_scratch(&mut snapshots, &mut scratch)
+        .into_iter()
+        .map(MetalHandle::raw)
+        .collect();
+    rest.sort_unstable();
+    assert_eq!(rest, [0x1200, 0x2300], "shutdown takes every copy left");
+    assert!(snapshots.is_empty() && scratch.is_empty());
 }
 
 /// An opaque buffer handle, never dereferenced.
