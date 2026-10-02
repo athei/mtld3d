@@ -1,8 +1,8 @@
 //! Unit tests for the host-testable half of `StretchRect`.
 //!
-//! `parse_rect` is checked against its clamping contract: a null rect covers the whole
-//! surface, out-of-bounds corners clamp to the surface instead of wrapping, and a rect
-//! that is empty after clamping reports `None` so the caller can fail the call. A
+//! `parse_rect` is checked against its contract: a null rect covers the whole surface, a
+//! rect inside the surface is taken as given, and an empty or inverted rect and one with
+//! an edge outside the surface are each refused with their own reason, never clamped. A
 //! separate check keeps every `RejectReason` key distinct, which is what makes the
 //! once-per-reason warn fire once per reason rather than collapsing to a single line.
 //!
@@ -15,7 +15,9 @@
 //! The packed-YUV cases pin the source decode: which `BlitDecode` a format selects and
 //! the discriminants the fragment shader matches on, the fixed-point `yuv_to_rgb8`
 //! against reference samples in both the full-range and reduced-range conventions, and
-//! the macropixel byte order that separates `YUY2` from `UYVY`. The conversion has a
+//! the macropixel byte order that separates `YUY2` from `UYVY`, which also makes a
+//! verbatim copy between the two, or between either and `A8L8`, a reinterpretation the
+//! caller refuses. The conversion has a
 //! float twin in the blit shader, so a change here that is not mirrored there shows up
 //! as a colour shift no other test would catch.
 //!
@@ -30,7 +32,7 @@ use super::*;
 fn null_rect_is_full_surface() {
     assert_eq!(
         parse_rect(None, 100, 200),
-        Some(StretchRegion {
+        Ok(StretchRegion {
             x: 0,
             y: 0,
             w: 100,
@@ -40,19 +42,10 @@ fn null_rect_is_full_surface() {
 }
 
 #[test]
-fn rect_clamped_against_surface() {
+fn rect_inside_the_surface_is_taken_as_given() {
     assert_eq!(
-        parse_rect(Some((-10, -20, 50, 60)), 100, 100),
-        Some(StretchRegion {
-            x: 0,
-            y: 0,
-            w: 50,
-            h: 60
-        })
-    );
-    assert_eq!(
-        parse_rect(Some((10, 20, 200, 300)), 100, 100),
-        Some(StretchRegion {
+        parse_rect(Some((10, 20, 100, 100)), 100, 100),
+        Ok(StretchRegion {
             x: 10,
             y: 20,
             w: 90,
@@ -62,9 +55,36 @@ fn rect_clamped_against_surface() {
 }
 
 #[test]
-fn empty_rect_returns_none() {
-    assert_eq!(parse_rect(Some((50, 50, 50, 50)), 100, 100), None);
-    assert_eq!(parse_rect(Some((100, 0, 200, 100)), 100, 100), None);
+fn rect_leaving_the_surface_is_refused() {
+    for rect in [
+        (-10, -20, 50, 60),
+        (0, -1, 50, 60),
+        (10, 20, 200, 100),
+        (10, 20, 100, 101),
+        (100, 0, 200, 100),
+    ] {
+        assert_eq!(
+            parse_rect(Some(rect), 100, 100),
+            Err(RejectReason::RectOutsideSurface),
+            "{rect:?}"
+        );
+    }
+}
+
+#[test]
+fn empty_or_inverted_rect_is_refused() {
+    for rect in [
+        (50, 50, 50, 50),
+        (50, 50, 60, 50),
+        (60, 0, 50, 10),
+        (-5, 0, -10, 10),
+    ] {
+        assert_eq!(
+            parse_rect(Some(rect), 100, 100),
+            Err(RejectReason::EmptyRect),
+            "{rect:?}"
+        );
+    }
 }
 
 #[test]
@@ -75,6 +95,8 @@ fn reject_keys_are_distinct() {
         RejectReason::UnsupportedSource,
         RejectReason::UnsupportedDestination,
         RejectReason::PlanarDestination,
+        RejectReason::EmptyRect,
+        RejectReason::RectOutsideSurface,
     ]
     .iter()
     .map(|r| r.key())
@@ -199,6 +221,29 @@ fn blit_decode_follows_the_source_format() {
     assert_eq!(BlitDecode::Uyvy.uniform().to_bits(), 2.0f32.to_bits());
     assert!(is_packed_yuv(D3DFMT_YUY2) && is_packed_yuv(D3DFMT_UYVY));
     assert!(!is_packed_yuv(mtld3d_types::D3DFMT_R5G6B5));
+}
+
+#[test]
+fn a_packed_yuv_byte_copy_needs_both_ends_in_one_format() {
+    use mtld3d_types::{D3DFMT_A8L8, D3DFMT_A8R8G8B8, D3DFMT_X8R8G8B8};
+    // The two packed formats order luma and chroma differently, and A8L8
+    // shares their storage without being YUV at all.
+    for (src, dst) in [
+        (D3DFMT_YUY2, D3DFMT_UYVY),
+        (D3DFMT_UYVY, D3DFMT_YUY2),
+        (D3DFMT_A8L8, D3DFMT_YUY2),
+        (D3DFMT_UYVY, D3DFMT_A8L8),
+    ] {
+        assert!(reinterprets_packed_yuv(src, dst), "{src:#x} -> {dst:#x}");
+    }
+    // A format copies into itself, and a pair with no YUV end is not judged here.
+    for (src, dst) in [
+        (D3DFMT_YUY2, D3DFMT_YUY2),
+        (D3DFMT_UYVY, D3DFMT_UYVY),
+        (D3DFMT_X8R8G8B8, D3DFMT_A8R8G8B8),
+    ] {
+        assert!(!reinterprets_packed_yuv(src, dst), "{src:#x} -> {dst:#x}");
+    }
 }
 
 #[test]

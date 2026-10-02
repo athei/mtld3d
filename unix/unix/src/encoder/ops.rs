@@ -3,8 +3,8 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use log::trace;
 use mtld3d_core::{
     encoder_data::{
-        BindDepthOpFlags, BlitSide, ColorFillTarget, DepthTransfer, ResampledUpload,
-        RetiredColorTarget, StretchSurfaceFlags,
+        BindDepthOpFlags, BlitSide, ColorFillTarget, ColorRegionUpdate, DepthTransfer,
+        ResampledUpload, RetiredColorTarget, StretchSurfaceFlags,
     },
     encoder_packet::metadata::{BufferWarmupRecord, GammaRecord, LayerPacingRecord},
     encoder_records::{self as records, borrow, borrow_array, borrow_prefix},
@@ -327,6 +327,22 @@ fn execute_control(
                     msaa: texture_handle(t.msaa),
                     msaa_srgb: texture_handle(t.msaa_srgb),
                     sample_count: byte(t.sample_count)?,
+                },
+                retained_bytes(&r.bytes)?,
+            );
+        }
+        EncoderOpcode::UpdateColorRegion => {
+            let r = borrow::<records::UpdateColorRegionRecord>(payload)?;
+            enc.update_color_region(
+                &ColorRegionUpdate {
+                    color_handle: r.handle,
+                    format: pixel_format(r.format)?,
+                    origin: (r.origin_x, r.origin_y),
+                    extent: (r.width, r.height),
+                    logical: (r.logical_width, r.logical_height),
+                    texture: (r.texture_width, r.texture_height),
+                    scale: RenderScale::from_percent(r.scale),
+                    bytes_per_row: r.stride,
                 },
                 retained_bytes(&r.bytes)?,
             );

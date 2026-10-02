@@ -1868,11 +1868,16 @@ fn encode_fullscreen_pass(
 /// depth/stencil formats are excluded by Metal at runtime; PE-side
 /// `device_create_texture` already drops the autogen flag for
 /// `fmt.is_compressed()`, so this guard is defensive against future
-/// format additions.
+/// format additions. The packed 16-bit formats are both on the Apple family,
+/// the only one that has them; a device without them backs those D3D formats
+/// with `BGRA8Unorm`.
 const fn pixel_format_supports_mipgen(fmt: MTLPixelFormat) -> bool {
     matches!(
         fmt,
         MTLPixelFormat::A8Unorm
+            | MTLPixelFormat::B5G6R5Unorm
+            | MTLPixelFormat::BGR5A1Unorm
+            | MTLPixelFormat::ABGR4Unorm
             | MTLPixelFormat::R8Unorm
             | MTLPixelFormat::R8Snorm
             | MTLPixelFormat::R16Unorm

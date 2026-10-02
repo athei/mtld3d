@@ -667,6 +667,37 @@ fn autogen_generate_mip_sub_levels_reads_the_pending_level_zero_write() {
     }
 }
 
+/// The packed 16-bit formats generate their AUTOGEN chain like the 32-bit ones.
+///
+/// Level 4 of a 64x64 chain is never written, so it reads what generation
+/// left there. Each format fills level 0 with one colour whose channels differ,
+/// which a box filter keeps, so a missing generation (an empty level) and a
+/// channel mix-up both show. The two formats that answer `D3DOK_NOAUTOGEN`
+/// to the query still create a full chain, and it is generated too.
+#[test]
+fn autogen_packed16_formats_generate_their_mip_chain() {
+    let h = Harness::new();
+    assert_eq!(h.set_sampler_state(0, D3DSAMP_MIPFILTER, D3DTEXF_POINT), 0);
+    assert_eq!(h.set_sampler_state(0, D3DSAMP_MAXMIPLEVEL, 4), 0);
+    for (format, name, texel, expected) in [
+        (D3DFMT_R5G6B5, "R5G6B5", 0xF800_u16, 0xFFFF_0000),
+        (D3DFMT_X1R5G5B5, "X1R5G5B5", 0x03E0, 0xFF00_FF00),
+        (D3DFMT_A1R5G5B5, "A1R5G5B5", 0x801F, 0xFF00_00FF),
+        (D3DFMT_A4R4G4B4, "A4R4G4B4", 0x8F0F, 0x88FF_00FF),
+    ] {
+        for pool in [D3DPOOL_DEFAULT, D3DPOOL_MANAGED] {
+            let tex = h.create_texture(64, 64, 0, D3DUSAGE_AUTOGENMIPMAP, format, pool);
+            tex.lock_rect(0, 0).write(&[texel; 64 * 64]);
+            assert_pixel_approx(
+                sample_center(&h, &tex).to_pixel(),
+                expected,
+                2,
+                &format!("{name} pool {pool}: generated level 4"),
+            );
+        }
+    }
+}
+
 #[test]
 fn default_pool_texture_lock_splits_by_entry_point() {
     let h = Harness::new();
@@ -799,6 +830,38 @@ fn scratch_extension_cubes_are_cpu_only_resources() {
             D3DERR_INVALIDCALL,
             "GPU extension cube remains unsupported",
         );
+    }
+}
+
+/// `YUY2` and `UYVY` 2D textures are CPU-only `D3DPOOL_SCRATCH` resources.
+///
+/// Nothing decodes packed YUV when a texture is sampled, so the device answers
+/// no to the texture query and every GPU-visible pool refuses the create. The
+/// offscreen plain surfaces stay: `StretchRect` decodes a `D3DPOOL_DEFAULT`
+/// one, and a `D3DPOOL_SYSTEMMEM` one is an `UpdateSurface` source.
+#[test]
+fn packed_yuv_textures_are_scratch_only() {
+    let h = Harness::new();
+    for format in [D3DFMT_YUY2, D3DFMT_UYVY] {
+        let (hr, tex) = h.try_create_texture(4, 4, 1, 0, format, D3DPOOL_SCRATCH);
+        assert_eq!(hr, 0, "{format:#x}: SCRATCH texture");
+        drop(Texture::from_raw(tex));
+        for pool in [D3DPOOL_DEFAULT, D3DPOOL_MANAGED, D3DPOOL_SYSTEMMEM] {
+            let (hr, _) = h.try_create_texture(4, 4, 1, 0, format, pool);
+            assert_eq!(
+                hr, D3DERR_INVALIDCALL,
+                "{format:#x}: texture in pool {pool}"
+            );
+        }
+        for pool in [D3DPOOL_DEFAULT, D3DPOOL_SYSTEMMEM] {
+            let surface = h.create_offscreen_plain_surface(4, 4, format, pool);
+            let (hr, desc) = surface.desc();
+            assert_eq!(
+                (hr, desc.format),
+                (0, format),
+                "offscreen plain in pool {pool}"
+            );
+        }
     }
 }
 
@@ -3164,6 +3227,86 @@ fn update_surface_rejects_a_scratch_standalone_source() {
     assert_pixel_eq(sample_center(&h, &dst).to_pixel(), GREEN, "accepted fill");
 }
 
+/// A standalone system-memory source gets the region checks a texture-level source gets.
+///
+/// The source rect has to lie inside the source and the copy inside the
+/// destination, the destination point may not be negative, and a
+/// block-compressed region has to be block-aligned unless it reaches the edge
+/// of both levels. Every rejected call leaves the destination as it was; the
+/// accepted region in the same test lands where its point says.
+#[test]
+fn update_surface_checks_the_region_of_a_standalone_source() {
+    const RED: u32 = 0xFFFF_0000;
+    const GREEN: u32 = 0xFF00_FF00;
+    const fn rect(x1: i32, y1: i32, x2: i32, y2: i32) -> D3DRECT {
+        D3DRECT { x1, y1, x2, y2 }
+    }
+    let h = Harness::new();
+    let fill = h.create_texture(16, 16, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM);
+    fill.lock_rect(0, 0).write_u32(&[RED; 256]);
+    let dst = h.create_texture(16, 16, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT);
+    assert_eq!(h.update_texture_hr(&fill, &dst), 0, "red base");
+    let level = dst.surface_level(0);
+    let src = h.create_offscreen_plain_surface(16, 16, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM);
+    src.lock_rect(0).write_u32(&[GREEN; 256]);
+    for (region, point, name) in [
+        (rect(0, 0, 8, 8), (-4, -4), "a negative destination point"),
+        (rect(0, 0, 32, 32), (0, 0), "a source rect past the source"),
+        (rect(-4, 0, 4, 8), (0, 0), "a negative source rect"),
+        (rect(0, 0, 8, 8), (12, 12), "a copy past the destination"),
+        (rect(8, 8, 4, 4), (0, 0), "an inverted source rect"),
+    ] {
+        assert_eq!(
+            h.update_surface_region_hr(&src, &region, &level, point),
+            D3DERR_INVALIDCALL,
+            "{name}"
+        );
+    }
+    let narrow = h.create_offscreen_plain_surface(16, 16, D3DFMT_R5G6B5, D3DPOOL_SYSTEMMEM);
+    narrow.lock_rect(0).write::<u16>(&[0x07E0; 256]);
+    assert_eq!(
+        h.update_surface_region_hr(&narrow, &rect(0, 0, 32, 32), &level, (0, 0)),
+        D3DERR_INVALIDCALL,
+        "a converting source rect past the source"
+    );
+    assert_pixel_eq(
+        sample_center(&h, &dst).to_pixel(),
+        RED,
+        "every rejected call left the destination alone",
+    );
+    assert_eq!(
+        h.update_surface_region_hr(&src, &rect(0, 0, 8, 8), &level, (8, 8)),
+        0,
+        "a region inside both levels"
+    );
+    let [top_left, bottom_right] = sample_points(&h, &dst, [(100, 75), (540, 405)]);
+    assert_pixel_eq(top_left, RED, "outside the accepted region");
+    assert_pixel_eq(bottom_right, GREEN, "inside the accepted region");
+
+    let dxt_dst = h.create_texture(8, 8, 1, 0, D3DFMT_DXT1, D3DPOOL_DEFAULT);
+    let dxt_src = h.create_offscreen_plain_surface(8, 8, D3DFMT_DXT1, D3DPOOL_SYSTEMMEM);
+    for (region, point, name) in [
+        (rect(0, 0, 2, 2), (0, 0), "a partial block"),
+        (rect(0, 0, 4, 4), (2, 2), "an unaligned block destination"),
+    ] {
+        assert_eq!(
+            h.update_surface_region_hr(&dxt_src, &region, &dxt_dst.surface_level(0), point),
+            D3DERR_INVALIDCALL,
+            "DXT1: {name}"
+        );
+    }
+    assert_eq!(
+        h.update_surface_region_hr(
+            &dxt_src,
+            &rect(4, 4, 8, 8),
+            &dxt_dst.surface_level(0),
+            (0, 0)
+        ),
+        0,
+        "DXT1: one aligned block"
+    );
+}
+
 #[test]
 fn update_texture_keeps_cube_faces_independent() {
     let h = Harness::new();
@@ -3182,6 +3325,88 @@ fn update_texture_keeps_cube_faces_independent() {
         0xFF00_FF00,
         "UpdateTexture negative-X face",
     );
+}
+
+/// `AddDirtyRect` marks every level of the source, so `UpdateTexture` copies them all.
+///
+/// The source is rewritten level by level under `D3DLOCK_NO_DIRTY_UPDATE`,
+/// which adds no dirty region of its own, so the only thing that can make
+/// `UpdateTexture` copy the new content is the `AddDirtyRect` that follows.
+/// D3D9 applies its rect to every level, scaled to the level's extent. Point
+/// mip filtering with `D3DSAMP_MAXMIPLEVEL` reads one level at a time; the
+/// cube runs the same sequence through `IDirect3DCubeTexture9::AddDirtyRect`
+/// on the face it names.
+#[test]
+fn add_dirty_rect_marks_every_level_for_update_texture() {
+    const RED: u32 = 0xFFFF_0000;
+    const GREEN: u32 = 0xFF00_FF00;
+    const SIZE: u32 = 64;
+    const EDGE: u32 = 16;
+    let h = Harness::new();
+    let src = h.create_texture(SIZE, SIZE, 0, 0, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM);
+    let dst = h.create_texture(SIZE, SIZE, 0, 0, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT);
+    let levels = src.level_count();
+    assert_eq!(levels, 7, "a full 64x64 chain");
+    let side = |level: u32| (SIZE >> level).max(1) as usize;
+    for level in 0..levels {
+        let n = side(level);
+        src.lock_rect(level, 0)
+            .write_u32_rect(n, n, &vec![RED; n * n]);
+    }
+    assert_eq!(h.update_texture_hr(&src, &dst), 0, "first UpdateTexture");
+    for level in 0..levels {
+        let n = side(level);
+        src.lock_rect(level, D3DLOCK_NO_DIRTY_UPDATE)
+            .write_u32_rect(n, n, &vec![GREEN; n * n]);
+    }
+    assert_eq!(src.add_dirty_rect(), 0, "AddDirtyRect(NULL)");
+    assert_eq!(h.update_texture_hr(&src, &dst), 0, "second UpdateTexture");
+    assert_eq!(h.set_sampler_state(0, D3DSAMP_MIPFILTER, D3DTEXF_POINT), 0);
+    for level in [0, 1, 3, 6] {
+        assert_eq!(h.set_sampler_state(0, D3DSAMP_MAXMIPLEVEL, level), 0);
+        assert_pixel_eq(
+            sample_center(&h, &dst).to_pixel(),
+            GREEN,
+            &format!("2D level {level} after AddDirtyRect"),
+        );
+    }
+
+    let src = h.create_cube_texture_owned(EDGE, 0, 0, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM);
+    let dst = h.create_cube_texture_owned(EDGE, 0, 0, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT);
+    let levels = src.level_count();
+    assert_eq!(levels, 5, "a full 16x16 cube chain");
+    let side = |level: u32| (EDGE >> level).max(1) as usize;
+    for face in 0..6 {
+        for level in 0..levels {
+            let n = side(level);
+            src.lock_rect(face, level, 0)
+                .write_u32_rect(n, n, &vec![RED; n * n]);
+        }
+    }
+    assert_eq!(
+        h.update_cube_texture_hr(&src, &dst),
+        0,
+        "first cube UpdateTexture"
+    );
+    for level in 0..levels {
+        let n = side(level);
+        src.lock_rect(0, level, D3DLOCK_NO_DIRTY_UPDATE)
+            .write_u32_rect(n, n, &vec![GREEN; n * n]);
+    }
+    assert_eq!(src.add_dirty_rect(0), 0, "cube AddDirtyRect(+X, NULL)");
+    assert_eq!(
+        h.update_cube_texture_hr(&src, &dst),
+        0,
+        "second cube UpdateTexture"
+    );
+    for level in [0, 1, 4] {
+        assert_eq!(h.set_sampler_state(0, D3DSAMP_MAXMIPLEVEL, level), 0);
+        assert_pixel_eq(
+            sample_cube_x(&h, &dst, 1.0),
+            GREEN,
+            &format!("cube +X level {level} after AddDirtyRect"),
+        );
+    }
 }
 
 /// `UpdateTexture` accepts a source whose levels are still mapped.

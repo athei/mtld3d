@@ -1025,6 +1025,14 @@ impl CubeTexture<'_> {
         unsafe { (self.vtbl().generate_mip_sub_levels)(self.ptr) };
     }
 
+    /// `AddDirtyRect(face, null)`: flag the whole face dirty. Returns the hr.
+    #[must_use]
+    pub fn add_dirty_rect(&self, face: u32) -> i32 {
+        // SAFETY: the wrapper owns a live cube texture; a null rect names the
+        // whole face.
+        unsafe { (self.vtbl().add_dirty_rect)(self.ptr, face, core::ptr::null()) }
+    }
+
     /// Lock one cube face and mip level.
     ///
     /// # Panics

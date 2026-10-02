@@ -813,9 +813,16 @@ fn planar_yuv_is_a_plain_surface_and_a_conversion_source_only() {
         D3DERR_NOTAVAILABLE,
         "one planar format does not convert into the other"
     );
-    // The packed formats keep the texture answer they had.
+    // The packed formats are plain surfaces and no texture: nothing decodes
+    // them when they are sampled, so a texture answer would hand out raw
+    // bytes. Their SCRATCH textures stay creatable, which is the runtime's
+    // answer and not the device's.
     for format in [D3DFMT_YUY2, D3DFMT_UYVY] {
-        assert_eq!(check(0, D3DRTYPE_TEXTURE, format), D3D_OK);
+        assert_eq!(check(0, D3DRTYPE_TEXTURE, format), D3DERR_NOTAVAILABLE);
+        assert_eq!(
+            check(D3DUSAGE_DYNAMIC, D3DRTYPE_TEXTURE, format),
+            D3DERR_NOTAVAILABLE
+        );
         assert_eq!(check(0, D3DRTYPE_SURFACE, format), D3D_OK);
     }
 }

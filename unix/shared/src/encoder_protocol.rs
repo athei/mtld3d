@@ -60,6 +60,7 @@ pub enum EncoderOpcode {
     RetainVbib = 45,
     SetLayerPacing = 46,
     SetGamma = 47,
+    UpdateColorRegion = 48,
 }
 
 /// How far a frame submission waits on the native pipeline.

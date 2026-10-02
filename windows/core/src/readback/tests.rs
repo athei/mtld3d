@@ -1,10 +1,12 @@
+use mtld3d_types::{D3DFMT_A8B8G8R8, D3DFMT_A16B16G16R16F, D3DFMT_R8G8B8, D3DFMT_X1R5G5B5};
+
 use super::*;
 
 fn source() -> ReadbackSource {
     ReadbackSource {
         width: 64,
         height: 32,
-        format: PixelFormat::Bgra8Unorm,
+        format: D3DFMT_X8R8G8B8,
     }
 }
 
@@ -12,7 +14,7 @@ fn destination() -> ReadbackDestination {
     ReadbackDestination {
         width: 64,
         height: 32,
-        format: PixelFormat::Bgra8Unorm,
+        format: D3DFMT_X8R8G8B8,
         bytes_per_row: 256,
         len: 8192,
     }
@@ -73,15 +75,39 @@ fn a_differently_sized_destination_is_rejected() {
 }
 
 #[test]
-fn a_differently_laid_out_destination_is_rejected() {
+fn a_destination_of_another_format_is_rejected() {
+    // R8G8B8 shares the source's BGRA8 storage but not its row layout; the
+    // others differ in storage too.
+    for format in [
+        D3DFMT_R8G8B8,
+        D3DFMT_A16B16G16R16F,
+        D3DFMT_A8B8G8R8,
+        D3DFMT_X1R5G5B5,
+    ] {
+        let dst = ReadbackDestination {
+            format,
+            ..destination()
+        };
+        assert_eq!(
+            reject_readback_dst(&source(), &dst),
+            Some(ReadbackReject::FormatMismatch),
+            "{format:#x}"
+        );
+    }
+}
+
+#[test]
+fn the_x8_a8_pair_matches_either_way_round() {
+    assert!(formats_match(D3DFMT_X8R8G8B8, D3DFMT_A8R8G8B8));
+    assert!(formats_match(D3DFMT_A8R8G8B8, D3DFMT_X8R8G8B8));
+    assert!(formats_match(D3DFMT_R8G8B8, D3DFMT_R8G8B8));
+    assert!(!formats_match(D3DFMT_X8R8G8B8, D3DFMT_R8G8B8));
+    assert!(!formats_match(D3DFMT_A8B8G8R8, D3DFMT_A8R8G8B8));
     let dst = ReadbackDestination {
-        format: PixelFormat::Rgba16Float,
+        format: D3DFMT_A8R8G8B8,
         ..destination()
     };
-    assert_eq!(
-        reject_readback_dst(&source(), &dst),
-        Some(ReadbackReject::FormatMismatch)
-    );
+    assert_eq!(reject_readback_dst(&source(), &dst), None);
 }
 
 #[test]

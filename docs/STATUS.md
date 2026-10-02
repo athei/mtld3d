@@ -147,6 +147,11 @@ unless its entry says otherwise.
   reference. Planar chroma is never filtered: `D3DTEXF_LINEAR` filters luma
   and replicates each chroma sample over its 2x2 block. `ColorFill` of a
   packed or planar YUV surface succeeds and leaves it unfilled.
+- Packed YUV (YUY2, UYVY) textures: nothing decodes them when they are
+  sampled, so `CheckDeviceFormat` answers `D3DERR_NOTAVAILABLE` for every
+  texture query and only a `D3DPOOL_SCRATCH` texture creates. They remain
+  offscreen plain surfaces, and a DEFAULT-pool one is a `StretchRect` source
+  that decodes into any render target and 1:1 into a colour offscreen plain.
 - Scaled, sub-rect or converting depth-to-depth `StretchRect`: only the
   whole-surface 1:1 copy between same-format DEFAULT-pool depth surfaces
   works, multisample resolve included.

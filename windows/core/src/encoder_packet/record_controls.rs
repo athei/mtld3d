@@ -16,7 +16,8 @@ use crate::{
         RectRecord, ResampledTargetRecord, ResolveDepthTextureRecord, ResolveDynamicDepthRecord,
         RetireColorRecord, SetVertexSamplerRecord, SetVertexTextureRecord, SetViewportRecord,
         SlotRecord, StageUploadRecord, StretchBlitRecord, SurfaceIdentityRecord, SurfaceRecord,
-        TextureRecord, TextureUploadRecord, UploadColorRecord, UploadResampledRecord,
+        TextureRecord, TextureUploadRecord, UpdateColorRegionRecord, UploadColorRecord,
+        UploadResampledRecord,
     },
     encoder_reply::{ReplyBool, ReplyU64},
     guest_pages::{GuestOwnedPageLease, GuestPageLease},
@@ -710,6 +711,37 @@ capture_control!(
             UploadResampledRecord {
                 target: resampled(&v.target),
                 bytes: span(v.bytes)
+            }
+        );
+    }
+);
+capture_control!(
+    UpdateColorRegionOp,
+    UpdateColorRegion,
+    v,
+    recorder,
+    scratch,
+    tag,
+    {
+        capture_fixed!(
+            recorder,
+            scratch,
+            tag,
+            UpdateColorRegionRecord {
+                handle: v.target.color_handle,
+                bytes: span(v.bytes),
+                format: v.target.format as u32,
+                origin_x: v.target.origin.0,
+                origin_y: v.target.origin.1,
+                width: v.target.extent.0,
+                height: v.target.extent.1,
+                logical_width: v.target.logical.0,
+                logical_height: v.target.logical.1,
+                texture_width: v.target.texture.0,
+                texture_height: v.target.texture.1,
+                scale: v.target.scale.percent(),
+                stride: v.target.bytes_per_row,
+                reserved: 0
             }
         );
     }
