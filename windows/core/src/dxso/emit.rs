@@ -695,7 +695,10 @@ fn emit_vs_function(
         );
     }
     w(out, "\n) {\n");
-    w(out, "    float4 r[32];\n");
+    // Temporaries start at zero, so a register read before any write (a
+    // partly written output alpha, say) yields 0 rather than whatever the
+    // GPU register held.
+    w(out, "    float4 r[32] = {};\n");
     // D3D9 address register `a0`. SM2 has exactly one int4 a0; the emitter
     // allocates one int4 local so `mova` / `c[a0.x + N]` / reading `a0`
     // directly all go through the same identifier. Zero-init so early
@@ -1319,7 +1322,8 @@ fn emit_ps_function(
     if point_sprite {
         write_point_sprite_prologue(out);
     }
-    w(out, "    float4 r[32];\n");
+    // Zeroed for the same reason as in `emit_vs_function`.
+    w(out, "    float4 r[32] = {};\n");
     // SM1 pixel shaders: `tN` (RegKind::Addr) is a read-write register that
     // holds the iterated texture coordinate AND receives `tex`/`texcoord`/
     // `texbem`/… results. Back it with a mutable array seeded from the

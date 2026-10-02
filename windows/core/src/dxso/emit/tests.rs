@@ -326,6 +326,26 @@ fn minimal_vs_plus_ps_emits_valid_msl_skeleton() {
 }
 
 #[test]
+fn temporaries_start_at_zero() {
+    // A temporary read before any write must not pick up what the GPU
+    // register last held; both stages zero the register file.
+    let vs = emit_vs_programmable(&parse(&trivial_passthrough_vs()).expect("vs parse"))
+        .expect("emit vs");
+    let ps = emit_ps_programmable(
+        &parse(&red_constant_ps()).expect("ps parse"),
+        VariantKey::default(),
+    )
+    .expect("emit ps");
+    for msl in [&vs, &ps] {
+        assert!(
+            msl.contains("float4 r[32] = {};"),
+            "temporaries must be zero-initialised:\n{msl}"
+        );
+        metal_compile_or_fail(msl);
+    }
+}
+
+#[test]
 fn varyings_put_texcoord_before_color() {
     let msl = emit_pair_for_tests(
         &trivial_passthrough_vs(),
