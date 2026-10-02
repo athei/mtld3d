@@ -3,13 +3,14 @@
 //! `IDirect3D9` queries, caps, `TestCooperativeLevel`, and `Reset`
 //! (state-default restore, resize, malformed input).
 
+use core::ffi::{c_char, c_void};
 use std::{
     sync::{
         Barrier, Mutex, PoisonError,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError, channel},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use mtld3d_core::display_mode::MAX_SERVED_SIZES;
@@ -35,8 +36,21 @@ use mtld3d_types::{
     D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_DYNAMIC, D3DUSAGE_QUERY_FILTER,
     D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING, D3DUSAGE_QUERY_SRGBREAD, D3DUSAGE_QUERY_SRGBWRITE,
     D3DUSAGE_QUERY_VERTEXTEXTURE, D3DUSAGE_QUERY_WRAPANDMIP, D3DUSAGE_RENDERTARGET, D3DVIEWPORT9,
-    DevCaps, TextureCaps,
+    DevCaps, IDirect3D9Vtbl, TextureCaps,
 };
+
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn GetModuleHandleA(name: *const c_char) -> *mut c_void;
+    fn GetProcAddress(module: *mut c_void, name: *const c_char) -> *mut c_void;
+    fn GetCurrentProcess() -> *mut c_void;
+    fn TerminateProcess(process: *mut c_void, exit_code: u32) -> i32;
+}
+
+/// `LdrLockLoaderLock(flags, result, cookie)`; flags 0 waits for the lock.
+type LdrLockLoaderLockFn = unsafe extern "system" fn(u32, *mut u32, *mut usize) -> i32;
+/// `LdrUnlockLoaderLock(flags, cookie)`.
+type LdrUnlockLoaderLockFn = unsafe extern "system" fn(u32, usize) -> i32;
 
 #[test]
 fn adapter_basics() {
@@ -4299,4 +4313,106 @@ fn a_harness_with_its_own_configuration_leaves_the_environment_alone() {
         "the entry reached its own interface"
     );
     assert_eq!(probe(&plain), D3D_OK, "and no interface created after it");
+}
+
+/// The copy of the test executable whose last interface is released under the loader lock.
+const LOADER_LOCK_CHILD_NAME: &str = "loader-lock-release.exe";
+
+/// How long the last `Release` may take under the loader lock before it counts as hung.
+const LOADER_LOCK_RELEASE_LIMIT: Duration = Duration::from_secs(10);
+
+/// The exit code the loader-lock child ends with when its release hung, libtest's failure code.
+const LOADER_LOCK_HUNG_EXIT_CODE: u32 = 101;
+
+/// An `ntdll` export by name, for the loader-lock calls no import library names.
+fn ntdll_export(name: &core::ffi::CStr) -> *mut c_void {
+    // SAFETY: plain kernel32 lookup by a NUL-terminated name.
+    let ntdll = unsafe { GetModuleHandleA(c"ntdll.dll".as_ptr()) };
+    assert!(!ntdll.is_null(), "ntdll.dll is loaded in every process");
+    // SAFETY: `ntdll` is a live module handle and the name is NUL-terminated.
+    let entry = unsafe { GetProcAddress(ntdll, name.as_ptr()) };
+    assert!(!entry.is_null(), "ntdll exports {}", name.to_string_lossy());
+    entry
+}
+
+/// Release the process's last `IDirect3D9` on a thread that holds the loader lock.
+///
+/// The last interface stops the layer's log thread, and that thread leaves
+/// through `FreeLibraryAndExitThread`, which needs the loader lock. A caller
+/// that holds it, another DLL's `DLL_PROCESS_DETACH` during a `FreeLibrary`
+/// or a TLS destructor, must get its `Release` back rather than wait for a
+/// thread that cannot exit before the caller lets the lock go. The main
+/// thread watches the release, and a hang ends the process at the limit
+/// with a failing exit code. Not through a panic: the default hook's
+/// backtrace loads `dbghelp`, which waits for the loader lock the stuck
+/// worker holds, so the process would hang instead of failing.
+fn last_release_under_loader_lock_workload() {
+    let h = Harness::factory_only();
+    let factory = h.factory() as usize;
+    // The worker releases the harness's reference, the only one in this
+    // process, so the harness must not release it again.
+    core::mem::forget(h);
+    // SAFETY: the export has the `LdrLockLoaderLock` signature declared above.
+    let lock: LdrLockLoaderLockFn =
+        unsafe { core::mem::transmute(ntdll_export(c"LdrLockLoaderLock")) };
+    // SAFETY: the export has the `LdrUnlockLoaderLock` signature declared above.
+    let unlock: LdrUnlockLoaderLockFn =
+        unsafe { core::mem::transmute(ntdll_export(c"LdrUnlockLoaderLock")) };
+
+    let released = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        let worker = spawn_scoped(scope, || {
+            let mut cookie = 0usize;
+            // SAFETY: flags 0 waits for the lock; a null result is allowed
+            // and `cookie` receives the value the unlock takes back.
+            let status = unsafe { lock(0, core::ptr::null_mut(), &raw mut cookie) };
+            assert_eq!(status, 0, "LdrLockLoaderLock");
+            let interface = factory as *mut c_void;
+            // SAFETY: `interface` is the live `IDirect3D9` the harness created,
+            // whose first word is its vtable.
+            let vtbl_ptr = unsafe { *interface.cast::<*const IDirect3D9Vtbl>() };
+            // SAFETY: the vtable of a live interface is a `'static` table.
+            let vtbl = unsafe { &*vtbl_ptr };
+            // SAFETY: vtable thunk; this releases the one reference there is.
+            let remaining = unsafe { (vtbl.release)(interface) };
+            released.store(true, Ordering::Release);
+            // SAFETY: balances the lock above with the cookie it handed out.
+            let status = unsafe { unlock(0, cookie) };
+            assert_eq!(status, 0, "LdrUnlockLoaderLock");
+            remaining
+        });
+        let deadline = Instant::now() + LOADER_LOCK_RELEASE_LIMIT;
+        while !released.load(Ordering::Acquire) {
+            if Instant::now() >= deadline {
+                eprintln!(
+                    "the last IDirect3D9 Release did not return within \
+                     {LOADER_LOCK_RELEASE_LIMIT:?} while its thread held the loader lock"
+                );
+                // SAFETY: plain kernel32 call answering this process's pseudo-handle.
+                let process = unsafe { GetCurrentProcess() };
+                // SAFETY: the current process's pseudo-handle; the documented
+                // self-terminate form.
+                unsafe { TerminateProcess(process, LOADER_LOCK_HUNG_EXIT_CODE) };
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let remaining = worker.join().expect("the releasing thread panicked");
+        assert_eq!(remaining, 0, "the release was the interface's last");
+    });
+}
+
+#[test]
+fn the_last_interface_release_returns_while_its_caller_holds_the_loader_lock() {
+    if running_as(LOADER_LOCK_CHILD_NAME) {
+        last_release_under_loader_lock_workload();
+        return;
+    }
+    // Only the process's last interface stops the log thread, and the
+    // suite's process always has other interfaces alive, so the workload
+    // runs in a process of its own.
+    run_in_private_log_child(
+        LOADER_LOCK_CHILD_NAME,
+        "device::the_last_interface_release_returns_while_its_caller_holds_the_loader_lock",
+        PRIVATE_LOG_FILTER,
+    );
 }

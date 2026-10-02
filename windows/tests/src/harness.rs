@@ -409,6 +409,7 @@ impl Harness {
     /// Panics if the factory cannot be created.
     #[must_use]
     pub fn factory_only_with_config(entries: &str) -> Self {
+        win32::install_failure_exit_hook();
         let d3d9 = create_factory(entries);
         Self {
             d3d9,
