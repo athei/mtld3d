@@ -4059,8 +4059,10 @@ const OP_TEX: u16 = 66;
 const OP_TEXBEM: u16 = 67;
 const OP_TEXBEML: u16 = 68;
 const OP_TEXDEPTH: u16 = 87;
+const OP_TEXM3X2PAD: u16 = 71;
 const OP_TEXM3X3PAD: u16 = 73;
 const OP_TEXM3X3VSPEC: u16 = 77;
+const OP_TEXM3X2DEPTH: u16 = 84;
 
 #[test]
 fn vs_1_1_passthrough_uses_implicit_position_output() {
@@ -4473,6 +4475,33 @@ fn ps_1_3_texdepth_writes_depth_output() {
     assert!(
         msl.contains("oDepth [[depth(any)]]") && msl.contains("_depth_storage"),
         "texdepth must route through the PsOut depth path:\n{msl}"
+    );
+    metal_compile_or_fail(&msl);
+}
+
+#[test]
+fn ps_1_3_texm3x2depth_with_a_zero_w_writes_the_far_plane() {
+    // ps_1_3 { tex t0; texm3x2pad t1, t0; texm3x2depth t2, t0; mov r0, t0; }
+    let bc = [
+        0xFFFF_0103,
+        opcode_token(OP_TEX, 1),
+        dst_token(TYPE_ADDR, 0, 0xF, false),
+        opcode_token(OP_TEXM3X2PAD, 2),
+        dst_token(TYPE_ADDR, 1, 0xF, false),
+        src_token(TYPE_ADDR, 0, SWIZ_IDENTITY, 0),
+        opcode_token(OP_TEXM3X2DEPTH, 2),
+        dst_token(TYPE_ADDR, 2, 0xF, false),
+        src_token(TYPE_ADDR, 0, SWIZ_IDENTITY, 0),
+        opcode_token(OP_MOV, 2),
+        dst_token(TYPE_TEMP, 0, 0xF, false),
+        src_token(TYPE_ADDR, 0, SWIZ_IDENTITY, 0),
+        END_TOKEN,
+    ];
+    let ps = parse(&bc).expect("ps_1_3 parse");
+    let msl = emit_ps_programmable(&ps, VariantKey::default()).expect("emit ps_1_3");
+    assert!(
+        msl.contains("saturate((t[1].x) / (dot((t[2]).xyz, (t[0]).xyz))) : 1.0);"),
+        "texm3x2depth must write depth 1.0 when w is zero:\n{msl}"
     );
     metal_compile_or_fail(&msl);
 }

@@ -2306,7 +2306,8 @@ fn translate_instruction(
             sample_or_compare(ctx, m, &coord4, None, None)
         }
         // `texm3x2depth tM, src` (ps_1_3) — z = pad result (t[M-1].x),
-        // w = dot(coord_m, src); write fragment depth = z / w.
+        // w = dot(coord_m, src); write fragment depth = z / w, and 1.0 (the
+        // far plane) when w is zero.
         Opcode::TexM3x2Depth => {
             let dst = inst.dst.as_ref().ok_or_else(|| {
                 EmitError::UnsupportedInstruction("texm3x2depth missing dst".into())
@@ -2317,7 +2318,7 @@ fn translate_instruction(
             let z = format!("t[{}].x", m.saturating_sub(1));
             let _ = writeln!(
                 out,
-                "    _depth_storage = float4(({w}) != 0.0 ? saturate(({z}) / ({w})) : 0.0);"
+                "    _depth_storage = float4(({w}) != 0.0 ? saturate(({z}) / ({w})) : 1.0);"
             );
             return Ok(());
         }
