@@ -1267,6 +1267,11 @@ impl DeviceInner {
     /// Store one vertex-slot sampler state and mirror the row to the encoder.
     pub fn set_vertex_sampler_slot_state(&mut self, slot: usize, type_: usize, value: u32) {
         self.vertex_sampler_states[slot][type_] = value;
+        self.push_vertex_sampler_row(slot);
+    }
+
+    /// Mirror vertex sampler `slot`'s whole state row to the encoder.
+    fn push_vertex_sampler_row(&mut self, slot: usize) {
         let state = self.vertex_sampler_states[slot];
         self.push_control(crate::device::SetVertexSamplerOp {
             slot: u8::try_from(slot).expect("validated attachment or vertex sampler slot"),
@@ -2601,7 +2606,12 @@ impl DeviceInner {
                 self.set_vertex_texture_slot(slot, core::ptr::null_mut());
             }
         }
-        self.vertex_sampler_states = [mtld3d_types::sampler_state_defaults(); 4];
+        // The encoder's mirror of the vertex sampler rows learns of the
+        // defaults only through the ops, as it does of every other write.
+        for slot in 0..self.vertex_sampler_states.len() {
+            self.vertex_sampler_states[slot] = mtld3d_types::sampler_state_defaults();
+            self.push_vertex_sampler_row(slot);
+        }
         self.replace_vertex_decl(core::ptr::null_mut());
         self.shader_bindings
             .replace_vertex_shader(core::ptr::null_mut());
