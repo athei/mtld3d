@@ -17,10 +17,10 @@ fn full_observation_and_later_errors_preserve_the_first_hresult() {
     for first in [E_OUTOFMEMORY, D3DERR_DEVICELOST] {
         let failure = AtomicI32::new(D3D_OK);
         let native = AtomicU32::new(1);
-        assert_eq!(record_failure(&failure, first), first);
+        assert_eq!(record_failure(&failure, first, "test"), first);
         assert_eq!(status(&failure, &native), Err(first));
-        assert_eq!(record_failure(&failure, E_OUTOFMEMORY), first);
-        assert_eq!(record_failure(&failure, D3DERR_DEVICELOST), first);
+        assert_eq!(record_failure(&failure, E_OUTOFMEMORY, "test"), first);
+        assert_eq!(record_failure(&failure, D3DERR_DEVICELOST, "test"), first);
         assert_eq!(known_status(&failure), Err(first));
     }
 }
@@ -29,7 +29,7 @@ fn full_observation_and_later_errors_preserve_the_first_hresult() {
 fn nonallocation_failures_normalize_to_device_lost() {
     for status in [D3D_OK, mtld3d_types::D3DERR_INVALIDCALL] {
         let failure = AtomicI32::new(D3D_OK);
-        assert_eq!(record_failure(&failure, status), D3DERR_DEVICELOST);
+        assert_eq!(record_failure(&failure, status, "test"), D3DERR_DEVICELOST);
         assert_eq!(known_status(&failure), Err(D3DERR_DEVICELOST));
     }
 }

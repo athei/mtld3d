@@ -171,8 +171,17 @@ unless its entry says otherwise.
   counterpart here.
 - Physical display-mode switching: the mode is meant to stay virtual, see the
   [Fullscreen](../INSTALL.md#fullscreen) section of `INSTALL.md`.
-- Device loss: no exclusive mode is taken, so nothing is ever lost, and
-  `TestCooperativeLevel` reports `D3D_OK` across focus changes.
+- Device loss on focus changes: no exclusive mode is taken, so a focus
+  change loses nothing, and `TestCooperativeLevel` reports `D3D_OK` across
+  it. A device is lost only when the layer itself fails: a frame that
+  cannot be encoded or submitted to Metal, such as a depth transfer whose
+  private planes cannot be allocated, latches `D3DERR_DEVICELOST`. A frame
+  whose commands cannot be recorded because the layer's own command buffer
+  could not grow latches `E_OUTOFMEMORY` instead. Every later call that
+  reports device state, `TestCooperativeLevel` and `Reset` included,
+  returns the latched code until the device is released, and the log names
+  the step that failed first. There is no recovery short of creating a new
+  device.
 - Software paths: no reference rasterizer, no software vertex processing, no
   `RegisterSoftwareDevice`; the default Metal device is the only adapter.
 - Legacy remnants: N-patch and RT-patch tessellation, vertex tweening,

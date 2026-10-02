@@ -1706,7 +1706,9 @@ impl DeviceInner {
         let status = unix_call(&mut params);
         if status != D3D_OK {
             error!(target: LOG_TARGET, "encoder: presentation barrier failed {status:#x}");
-            return Err(self.encoder.record_failure(status));
+            return Err(self
+                .encoder
+                .record_failure(status, "the presentation barrier failed"));
         }
         Ok(())
     }
@@ -1969,7 +1971,7 @@ impl DeviceInner {
             mtld3d_shared::encoder_wire::WireError::AllocationFailed => mtld3d_types::E_OUTOFMEMORY,
             _ => mtld3d_types::D3DERR_DEVICELOST,
         };
-        self.encoder.record_failure(status)
+        self.encoder.record_failure(status, "frame capture failed")
     }
 
     pub fn try_push_control<T: mtld3d_core::encoder_packet::CaptureControl>(
@@ -3977,8 +3979,10 @@ struct ParentIUnknownVtbl {
 extern "system" fn device_test_cooperative_level(this: *mut c_void) -> i32 {
     let _api = device_api_lock(this);
     let _timer = device_timer(this, DeviceSubCategory::Misc);
-    // The device is never lost (no exclusive mode is ever taken), so the only
-    // non-OK answer is the latch a failed implicit-resource rebuild leaves behind.
+    // No exclusive mode is ever taken, so focus changes never lose the device.
+    // The non-OK answers are the failure latch a step the layer could not
+    // complete leaves behind (a failed encode, submission or capture) and the
+    // DEVICENOTRESET a failed implicit-resource rebuild leaves.
     // SAFETY: vtable thunk; `this` is *mut Direct3DDevice9 per IDirect3DDevice9 ABI.
     let object = unsafe { InPtr::<Direct3DDevice9>::opt(this) };
     if let Some(obj) = &object

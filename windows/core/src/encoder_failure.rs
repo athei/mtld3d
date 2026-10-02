@@ -24,20 +24,37 @@ pub fn known_status(failure: &AtomicI32) -> Result<(), i32> {
 /// Returns the first latched failure, including a newly observed native failure.
 pub fn status(failure: &AtomicI32, native_failure: &AtomicU32) -> Result<(), i32> {
     if native_failure.load(Ordering::Acquire) != 0 {
-        return Err(record_failure(failure, D3DERR_DEVICELOST));
+        return Err(record_failure(
+            failure,
+            D3DERR_DEVICELOST,
+            "the native runtime failed a frame it had admitted",
+        ));
     }
     known_status(failure)
 }
 
 /// Latch the first failure, preserving allocation failures as out-of-memory.
-pub fn record_failure(failure: &AtomicI32, status: i32) -> i32 {
-    let status = if status == E_OUTOFMEMORY {
+///
+/// `status` is what the failing step returned and `cause` names that step.
+/// The latch that wins logs both once, since every later call that reports
+/// device state answers with the latched `HRESULT` and names no cause of its
+/// own; a failure after the latch only returns the first one.
+pub fn record_failure(failure: &AtomicI32, status: i32, cause: &str) -> i32 {
+    let latched = if status == E_OUTOFMEMORY {
         status
     } else {
         D3DERR_DEVICELOST
     };
-    match failure.compare_exchange(D3D_OK, status, Ordering::AcqRel, Ordering::Acquire) {
-        Ok(_) => status,
+    match failure.compare_exchange(D3D_OK, latched, Ordering::AcqRel, Ordering::Acquire) {
+        Ok(_) => {
+            log::error!(
+                target: crate::LOG_TARGET,
+                "device failure latched as {latched:#010x}: {cause} (status {status:#x}); \
+                 every later call that reports device state returns it until the device is \
+                 released"
+            );
+            latched
+        }
         Err(previous) => previous,
     }
 }

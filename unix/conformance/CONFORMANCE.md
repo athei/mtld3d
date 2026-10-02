@@ -1039,10 +1039,11 @@ Sites: 12199=expected
 
 Focus-loss/device-lost lifecycle: TestCooperativeLevel/Present/Reset must
 report DEVICELOST/DEVICENOTRESET across a fullscreen focus cycle. Our
-device is never lost by design (no exclusive fullscreen, no GPU loss on
-Metal). The only non-OK `TestCooperativeLevel` answer we give is the
+device is never lost to focus by design (no exclusive fullscreen, no GPU
+loss on Metal). The non-OK `TestCooperativeLevel` answers we give are the
 DEVICENOTRESET latch a failed `Reset` leaves behind, which is the windowed
-API contract test_reset exercises, not focus-driven loss.
+API contract test_reset exercises, and the DEVICELOST a frame the layer
+failed to encode or submit latches, which no focus change produces.
 
 ### device.c/test_check_device_format
 Sites: 12689=expected 12694=expected
