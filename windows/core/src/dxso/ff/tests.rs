@@ -1438,6 +1438,47 @@ fn depth_sampler_mask_emits_depth2d_and_sample_compare() {
     );
 }
 
+/// A projected depth-compare stage divides both the coordinate and the reference by `.w`.
+///
+/// `D3DTTFF_PROJECTED` on a shadow-map stage asks for the projective lookup
+/// the colour, Fetch4 and raw-depth branches already perform, so the
+/// comparison reads `xy / w` against `z / w` with the same zero-`w` guard.
+#[test]
+fn projected_depth_compare_divides_coordinate_and_reference_by_w() {
+    let mut vs = default_vs_key();
+    vs.tex_coord_count = 1;
+    vs.input_tex_coord_count = 1;
+    let mut ps = default_ps_key();
+    ps.stages[0] = FfStage {
+        color_op: narrow(D3DTOP_SELECTARG1),
+        color_arg1: narrow(D3DTA_TEXTURE),
+        color_arg2: narrow(D3DTA_CURRENT),
+        alpha_op: narrow(D3DTOP_SELECTARG1),
+        alpha_arg1: narrow(D3DTA_TEXTURE),
+        alpha_arg2: narrow(D3DTA_CURRENT),
+        flags: FfStageFlags::HAS_TEXTURE,
+    };
+    ps.tt_projected_mask = 0b1;
+    let depth = VariantKey {
+        depth_sampler_mask: 0b1,
+        ..VariantKey::default()
+    };
+    let msl = emit_pair_for_tests(&vs, &ps, depth);
+    assert!(
+        msl.contains(
+            "float3 proj0 = in.texcoord0.w != 0.0 ? in.texcoord0.xyz / in.texcoord0.w : float3(0.0);"
+        ),
+        "{msl}"
+    );
+    assert!(
+        msl.contains(
+            "float4 t0 = float4(s0.sample_compare(samp0, proj0.xy, saturate(proj0.z), level(0)));"
+        ),
+        "{msl}"
+    );
+    assert!(!msl.contains("in.texcoord0.xy,"), "{msl}");
+}
+
 #[test]
 fn volume_sampler_mask_emits_texture3d_and_xyz_sample() {
     // A volume (3D) texture bound to an FF stage must emit `texture3d<float>`

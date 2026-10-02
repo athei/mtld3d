@@ -1119,3 +1119,102 @@ fn texldb_adds_instruction_and_sampler_biases() {
 
     assert_eq!(h.clear_pixel_shader(), 0, "SetPixelShader(null)");
 }
+
+/// Position, diffuse and one four-component texture coordinate.
+///
+/// The FVF is `D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1 |
+/// D3DFVF_TEXCOORDSIZE4(0)`, the shape a projective shadow-map lookup takes.
+#[repr(C)]
+struct ProjectiveVertex {
+    x: f32,
+    y: f32,
+    z: f32,
+    color: u32,
+    coord: [f32; 4],
+}
+
+/// A projected fixed-function shadow-map stage compares `z / w` against the stored depth.
+///
+/// The D24S8 texture holds depth 0.5 everywhere. Each half of the target
+/// draws the coordinate `(0.5, 0.5, r, 1)` scaled by `w = 4` through
+/// `D3DTTFF_COUNT4 | D3DTTFF_PROJECTED` and an identity texture matrix, so
+/// the comparison reads the reference `r`: 0.25 passes (white) on the left
+/// and 0.75 fails (black) on the right. An undivided reference reads 1.0 and
+/// 3.0 and fails on both halves.
+#[test]
+fn projected_shadow_map_lookup_divides_the_reference_by_w() {
+    use mtld3d_types::{
+        D3DFMT_D24S8, D3DPOOL_DEFAULT, D3DRS_LIGHTING, D3DRS_ZENABLE, D3DTS_TEXTURE0,
+        D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_COUNT4, D3DTTFF_PROJECTED, D3DUSAGE_DYNAMIC,
+    };
+    const TEXCOORDSIZE4_0: u32 = 2 << 16;
+    const IDENTITY: [f32; 16] = [
+        1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+    ];
+    let h = Harness::new();
+    let depth = h.create_texture(4, 4, 1, D3DUSAGE_DYNAMIC, D3DFMT_D24S8, D3DPOOL_DEFAULT);
+    depth
+        .lock_rect(0, 0)
+        .write_u32_rect(4, 4, &[0x8000_0000; 16]);
+    assert_eq!(h.set_render_state(D3DRS_ZENABLE, 0), 0);
+    assert_eq!(h.set_render_state(D3DRS_LIGHTING, 0), 0);
+    assert_eq!(
+        h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1 | TEXCOORDSIZE4_0),
+        0
+    );
+    h.select_texture_stage(0);
+    assert_eq!(h.set_texture(0, &depth), 0);
+    for (state, value) in [
+        (D3DSAMP_MINFILTER, D3DTEXF_POINT),
+        (D3DSAMP_MAGFILTER, D3DTEXF_POINT),
+        (D3DSAMP_MIPFILTER, D3DTEXF_POINT),
+    ] {
+        assert_eq!(h.set_sampler_state(0, state, value), 0);
+    }
+    assert_eq!(h.set_transform(D3DTS_TEXTURE0, &IDENTITY), 0);
+    assert_eq!(
+        h.set_texture_stage_state(
+            0,
+            D3DTSS_TEXTURETRANSFORMFLAGS,
+            D3DTTFF_COUNT4 | D3DTTFF_PROJECTED
+        ),
+        0
+    );
+    let quad = |left: f32, right: f32, reference: f32| {
+        let v = |x, y| ProjectiveVertex {
+            x,
+            y,
+            z: 0.5,
+            color: 0xFFFF_FFFF,
+            coord: [2.0, 2.0, reference * 4.0, 4.0],
+        };
+        [
+            v(left, 1.0),
+            v(right, 1.0),
+            v(left, -1.0),
+            v(right, 1.0),
+            v(right, -1.0),
+            v(left, -1.0),
+        ]
+    };
+    h.render_once(YELLOW, |d| {
+        assert_eq!(
+            d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad(-1.0, 0.0, 0.25)),
+            0
+        );
+        assert_eq!(
+            d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad(0.0, 1.0, 0.75)),
+            0
+        );
+    });
+    assert_pixel_eq(
+        h.read_pixel(160, 240),
+        0xFFFF_FFFF,
+        "reference 0.25 after the divide passes against 0.5",
+    );
+    assert_pixel_eq(
+        h.read_pixel(480, 240),
+        0x0000_0000,
+        "reference 0.75 after the divide fails against 0.5",
+    );
+}

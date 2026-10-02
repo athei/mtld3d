@@ -1845,9 +1845,22 @@ fn emit_ps(out: &mut String, ps: &FfPsKey, variant: VariantKey, entry: &str) {
                     "    float4 t{i} = float4(s{i}.sample(samp{i}, {uv}, level(0)){fill});"
                 );
             } else if (variant.depth_sampler_mask & (1u16 << i)) != 0 {
+                // D3DTTFF_PROJECTED divides the reference depth by `.w` along
+                // with the coordinate, the projective shadow-map lookup; `.w
+                // == 0` reads the origin against a zero reference, as the
+                // colour path reads the origin.
+                let coord = if (ps.tt_projected_mask & (1u8 << i)) != 0 {
+                    let _ = writeln!(
+                        out,
+                        "    float3 proj{i} = in.texcoord{i}.w != 0.0 ? in.texcoord{i}.xyz / in.texcoord{i}.w : float3(0.0);"
+                    );
+                    format!("proj{i}")
+                } else {
+                    format!("in.texcoord{i}")
+                };
                 let _ = writeln!(
                     out,
-                    "    float4 t{i} = float4(s{i}.sample_compare(samp{i}, in.texcoord{i}.xy, saturate(in.texcoord{i}.z), level(0)));",
+                    "    float4 t{i} = float4(s{i}.sample_compare(samp{i}, {coord}.xy, saturate({coord}.z), level(0)));",
                 );
             } else {
                 // D3DTTFF_PROJECTED: divide the coordinate by `.w` before
