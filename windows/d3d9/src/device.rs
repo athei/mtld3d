@@ -287,8 +287,8 @@ bitflags::bitflags! {
         ///
         /// Distinguishes "no override, use the auto depth" from "explicitly
         /// unbound" so the pipeline's depth/stencil-format snapshot matches
-        /// the actual render-pass attachment. Cleared by
-        /// `reseed_current_frame` (which restores the default bindings).
+        /// the actual render-pass attachment. Cleared by `reset_to_defaults`
+        /// (which restores the default bindings).
         const DEPTH_EXPLICITLY_UNBOUND = 1 << 0;
         /// Set between a successful `BeginScene` and its `EndScene`.
         ///
@@ -1644,12 +1644,19 @@ impl DeviceInner {
         // thread to re-emit every Op::Set* on the first draw of the
         // new frame.
         self.snapshot_dirty = SnapshotDirty::all();
-        // The fresh frame's pass state defaults to the implicit backbuffer +
-        // auto depth-stencil, but a D3D9 render-target or depth binding —
-        // including an explicit `SetDepthStencilSurface(NULL)` unbind —
-        // outlives Present and internal flushes alike. Re-assert it into the
-        // fresh frame, or the pass would carry an attachment the pipeline
-        // (built from the D3D9 snapshot) does not declare.
+        self.reassert_saved_bindings();
+        (frame, this_seq)
+    }
+
+    /// Push the saved render-target and depth bindings into `current_frame`.
+    ///
+    /// The fresh frame's pass state defaults to the implicit backbuffer +
+    /// auto depth-stencil, but a D3D9 render-target or depth binding,
+    /// including an explicit `SetDepthStencilSurface(NULL)` unbind, outlives
+    /// Present, internal flushes and an automatic back-buffer resize alike.
+    /// Re-asserted into the fresh frame, or the pass would carry an attachment
+    /// the pipeline (built from the D3D9 snapshot) does not declare.
+    fn reassert_saved_bindings(&mut self) {
         // Clone (not Copy) out of the persistent binding: `TextureInfo` and
         // the binding enums are wide aggregates, and frame swaps are rare
         // relative to draws.
@@ -1666,7 +1673,48 @@ impl DeviceInner {
         {
             self.push_depth_binding_op(binding, is_sampleable, has_stencil, sample_count);
         }
-        (frame, this_seq)
+    }
+
+    /// Point the saved bindings that name the implicit surfaces at their replacements.
+    ///
+    /// A binding saved by `SetRenderTarget` or `SetDepthStencilSurface` holds
+    /// the handles and extent of the surface it bound, while the surface
+    /// object itself resolves them live from the device. After
+    /// `apply_auto_resize` has replaced the back buffer and the implicit
+    /// depth surface, a saved back-buffer binding and a saved binding of
+    /// `old_depth`, the implicit depth texture the resize retired, take the
+    /// device's current handles and extent; every other binding names a
+    /// surface the resize did not touch.
+    fn retarget_implicit_bindings(&mut self, old_depth: MetalHandle<MTLTextureKind>) {
+        let current = RtBinding::Backbuffer {
+            handle: self.backbuffer_handle,
+            msaa: self.backbuffer_msaa_handle,
+            msaa_srgb: self.backbuffer_msaa_srgb_handle,
+            sample_count: self.backbuffer_sample_count,
+            width: self.backbuffer_width,
+            height: self.backbuffer_height,
+        };
+        for saved in core::iter::once(&mut self.last_color_rt_binding)
+            .chain(self.last_extra_rt_bindings.iter_mut())
+            .flatten()
+        {
+            if matches!(saved.0, RtBinding::Backbuffer { .. }) {
+                saved.0 = current.clone();
+            }
+        }
+        if old_depth.is_null() {
+            return;
+        }
+        if let Some((DepthBinding::Eager(handle, extent, scale), ..)) =
+            self.last_depth_binding.as_mut()
+            && *handle == old_depth
+        {
+            *handle = self.depth_stencil_handle;
+            *extent = (
+                scale.dimension(self.backbuffer_width),
+                scale.dimension(self.backbuffer_height),
+            );
+        }
     }
 
     /// Submit the current frame's accumulated ops synchronously.
@@ -2539,6 +2587,7 @@ impl DeviceInner {
         }
         self.cur_autogen_rt_ids = [None; RENDER_TARGET_SLOTS];
         self.last_depth_binding = None;
+        self.flags.remove(DeviceFlags::DEPTH_EXPLICITLY_UNBOUND);
         self.bound_buffers.teardown();
         self.stage_bindings
             .reset_to_defaults(&[mtld3d_types::sampler_state_defaults(); STAGE_COUNT]);
@@ -2672,14 +2721,17 @@ impl DeviceInner {
         self.encoder.reset(retired_textures)
     }
 
-    /// Drop the empty `current_frame` left behind by `flush_current_frame_blocking`.
+    /// Drop the `current_frame` left behind by `flush_current_frame_blocking`.
     ///
     /// Replace it with a fresh one carrying the device's *current*
-    /// backbuffer / depth handles. Used by `device_reset` after the
-    /// implicit backbuffer + depth textures are recreated: without it,
-    /// the next `Present` would send the stale handles the pre-Reset
-    /// flush baked into `current_frame` and the unix-side `submit_frame`
-    /// would dereference the freed `MTLTextures`.
+    /// backbuffer / depth handles. Used by `device_reset` and
+    /// `apply_auto_resize` after the implicit backbuffer + depth textures
+    /// are recreated: without it, the next `Present` would send the stale
+    /// handles the flush baked into `current_frame` and the unix-side
+    /// `submit_frame` would dereference the freed `MTLTextures`. The dropped
+    /// frame holds only the bindings the flush re-asserted, which may name
+    /// the retired textures; the caller decides which bindings the fresh
+    /// frame gets back.
     pub fn reseed_current_frame(&mut self) {
         // The replaced frame is dropped rather than submitted, so an F12 run
         // in progress hands its marks to the fresh one: without that the
@@ -2689,9 +2741,6 @@ impl DeviceInner {
         let carried = self.current_frame.take_carried_capture_marks(false);
         self.current_frame = self.fresh_frame();
         self.current_frame.mark_gpu_capture(carried);
-        // Reseeding restores the default RT/depth bindings, so any prior
-        // explicit `SetDepthStencilSurface(NULL)` override no longer applies.
-        self.flags.remove(DeviceFlags::DEPTH_EXPLICITLY_UNBOUND);
     }
 
     /// The window this device took fullscreen, or `None` when it is windowed.
@@ -2812,6 +2861,7 @@ impl DeviceInner {
         if self.flush_current_frame_blocking().is_err() {
             return;
         }
+        let old_depth = self.depth_stencil_handle;
         let old_handles: [u64; 5] = [
             self.backbuffer_handle.raw(),
             self.backbuffer_srgb_handle.raw(),
@@ -2916,6 +2966,10 @@ impl DeviceInner {
         }
 
         self.reseed_current_frame();
+        // The game's own bindings outlive the resize: the reseeded frame gets
+        // them back, with the implicit surfaces' new handles.
+        self.retarget_implicit_bindings(old_depth);
+        self.reassert_saved_bindings();
 
         let viewport = D3DVIEWPORT9 {
             x: 0,
