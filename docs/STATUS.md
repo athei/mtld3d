@@ -129,6 +129,12 @@ unless its entry says otherwise.
   `IDirect3DDevice9::Present` and `IDirect3DSwapChain9::Present` and ignored,
   each warned once; the whole back buffer is presented across the device
   window.
+- SM3 pixel inputs outside the fixed-function varyings (NORMAL, TANGENT,
+  COLOR2 and the like) behind a pretransformed (XYZRHW, POSITIONT) draw read
+  zero: Windows feeds them the vertex declaration's elements by semantic,
+  and the fixed-function vertex path outputs none of them. A `ps_3_0` links
+  at most `MAX_LINKED_INPUTS` (eight) such semantics; a ninth and later read
+  zero, warned once. Issue #981.
 - Timestamp, timestamp frequency, timestamp disjoint and other niche query
   types: capability probes and creation report `D3DERR_NOTAVAILABLE`.
 - Fixed-function bump-environment mapping: `D3DTOP_BUMPENVMAP` and

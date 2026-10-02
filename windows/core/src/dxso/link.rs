@@ -493,10 +493,16 @@ impl PsInputs {
                 (DeclUsage::PSize, 0) => None,
                 _ if !semantic.is_extra() => Some(format!("in.{}", semantic.member())),
                 _ => {
-                    let linked = link
-                        .position(semantic)
-                        .is_some_and(|i| linked_input_mask & (1 << i) != 0);
-                    if !linked {
+                    let position = link.position(semantic);
+                    let linked = position.is_some_and(|i| linked_input_mask & (1 << i) != 0);
+                    if position.is_none() {
+                        mtld3d_shared::log_once_info_by!(target: super::LOG_TARGET,
+                            key: u64::from(semantic.code()),
+                            "dxso: PS input {} is past the first {MAX_LINKED_INPUTS} extra \
+                             input semantics → reads zero",
+                            semantic.member()
+                        );
+                    } else if !linked {
                         mtld3d_shared::log_once_info_by!(target: super::LOG_TARGET,
                             key: u64::from(semantic.code()),
                             "dxso: PS input {} has no vertex output → reads zero",
