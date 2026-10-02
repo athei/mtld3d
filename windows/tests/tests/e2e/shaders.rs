@@ -1830,6 +1830,58 @@ fn relative_constant_read_inside_a_call_sees_the_uploaded_row() {
     );
 }
 
+/// `ps_3_0` reading `c[aL + 2]` inside a one-pass `loop` that starts `aL` at 18.
+///
+/// `defi i0, 1, 18, 1, 0; loop aL, i0; mov r0, c[aL + 2]; endloop; mov oC0, r0`
+/// The instruction stream names rows up to `c2` only; the row it reads is `c20`.
+#[rustfmt::skip]
+const PS_LOOP_REL_CONST: [u32; 19] = [
+    0xFFFF_0300,                                        // ps_3_0
+    0x0500_0030, 0xF00F_0000, 1, 18, 1, 0,              // defi i0, 1, 18, 1, 0
+    0x0200_001B, 0xF0E4_0800, 0xF0E4_0000,              // loop aL, i0
+    0x0300_0001, 0x800F_0000, 0xA0E4_2002, 0xF000_0800, // mov r0, c[aL + 2]
+    0x0000_001D,                                        // endloop
+    0x0200_0001, 0x800F_0800, 0x80E4_0000,              // mov oC0, r0
+    0x0000_FFFF,                                        // end
+];
+
+/// The pixel constant prefix a draw binds covers a `c[aL + N]` read.
+///
+/// Rows 0..=19 are red, so a prefix sized from the rows the instruction stream
+/// names (three) ends long before the green row 20 the loop counter selects.
+#[test]
+fn pixel_relative_constant_read_in_a_loop_sees_the_uploaded_row() {
+    let h = Harness::new();
+    let vs = h.create_vertex_shader(&VS_BC);
+    let ps = h.create_pixel_shader(&PS_LOOP_REL_CONST);
+    assert_eq!(h.set_vertex_shader(&vs), 0, "SetVertexShader");
+    assert_eq!(h.set_pixel_shader(&ps), 0, "SetPixelShader");
+    assert_eq!(h.set_fvf(D3DFVF_XYZ), 0, "SetFVF");
+
+    let mut constants = [0.0f32; 21 * 4];
+    for row in 0..20 {
+        constants[row * 4] = 1.0;
+        constants[row * 4 + 3] = 1.0;
+    }
+    constants[20 * 4 + 1] = 1.0;
+    constants[20 * 4 + 3] = 1.0;
+    assert_eq!(
+        h.set_pixel_shader_constant_f(0, &constants),
+        0,
+        "SetPixelShaderConstantF"
+    );
+
+    let tri = centered_triangle();
+    h.render_once(0xFF00_00FF, |d| {
+        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &tri), 0, "draw");
+    });
+    assert_eq!(
+        h.read_pixel(320, 280),
+        0xFF00_FF00,
+        "the row c[aL + 2] names must be inside the bound constant prefix"
+    );
+}
+
 #[test]
 fn defined_pixel_constant_ignores_the_constant_buffer() {
     let h = Harness::new();
@@ -2594,4 +2646,232 @@ fn packed10_vertex_texture(format: u32) {
             );
         }
     }
+}
+
+/// `vs_3_0`: red diffuse in `o1`, green NORMAL0 in `o2`, blue COLOR2 in `o3`.
+#[rustfmt::skip]
+const VS3_NORMAL_AND_COLOR2: [u32; 47] = [
+    0xFFFE_0300,                                        // vs_3_0
+    0x0500_0051, 0xA00F_0000,                           // def c0,
+    0x0000_0000, 0x3F80_0000, 0x0000_0000, 0x3F80_0000, //   0, 1, 0, 1
+    0x0500_0051, 0xA00F_0001,                           // def c1,
+    0x3F80_0000, 0x0000_0000, 0x0000_0000, 0x3F80_0000, //   1, 0, 0, 1
+    0x0500_0051, 0xA00F_0002,                           // def c2,
+    0x0000_0000, 0x0000_0000, 0x3F80_0000, 0x3F80_0000, //   0, 0, 1, 1
+    0x0200_001F, 0x8000_0000, 0x900F_0000,              // dcl_position v0
+    0x0200_001F, 0x8000_0000, 0xE00F_0000,              // dcl_position o0
+    0x0200_001F, 0x8000_000A, 0xE00F_0001,              // dcl_color0 o1
+    0x0200_001F, 0x8000_0003, 0xE00F_0002,              // dcl_normal0 o2
+    0x0200_001F, 0x8002_000A, 0xE00F_0003,              // dcl_color2 o3
+    0x0200_0001, 0xE00F_0000, 0x90E4_0000,              // mov o0, v0
+    0x0200_0001, 0xE00F_0001, 0xA0E4_0001,              // mov o1, c1
+    0x0200_0001, 0xE00F_0002, 0xA0E4_0000,              // mov o2, c0
+    0x0200_0001, 0xE00F_0003, 0xA0E4_0002,              // mov o3, c2
+    0x0000_FFFF,                                        // end
+];
+
+/// `ps_3_0 { dcl_normal0 v0; mov oC0, v0; }`.
+#[rustfmt::skip]
+const PS3_READ_NORMAL: [u32; 8] = [
+    0xFFFF_0300,                                        // ps_3_0
+    0x0200_001F, 0x8000_0003, 0x900F_0000,              // dcl_normal0 v0
+    0x0200_0001, 0x800F_0800, 0x90E4_0000,              // mov oC0, v0
+    0x0000_FFFF,                                        // end
+];
+
+/// `ps_3_0 { dcl_color2 v0; mov oC0, v0; }`.
+#[rustfmt::skip]
+const PS3_READ_COLOR2: [u32; 8] = [
+    0xFFFF_0300,                                        // ps_3_0
+    0x0200_001F, 0x8002_000A, 0x900F_0000,              // dcl_color2 v0
+    0x0200_0001, 0x800F_0800, 0x90E4_0000,              // mov oC0, v0
+    0x0000_FFFF,                                        // end
+];
+
+/// Draw the centered triangle with `vs` and `ps` over black and read its centre.
+fn draw_pair(h: &Harness, vs: &[u32], ps: &[u32]) -> u32 {
+    let vs = h.create_vertex_shader(vs);
+    let ps = h.create_pixel_shader(ps);
+    assert_eq!(h.set_vertex_shader(&vs), 0, "SetVertexShader");
+    assert_eq!(h.set_pixel_shader(&ps), 0, "SetPixelShader");
+    assert_eq!(h.set_fvf(D3DFVF_XYZ), 0, "SetFVF");
+    h.render_once(0xFF00_0000, |d| {
+        assert_eq!(
+            d.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &centered_triangle()),
+            0,
+            "draw"
+        );
+    });
+    let pixel = h.read_pixel(320, 280);
+    assert_eq!(h.clear_vertex_shader(), 0, "unbind VS");
+    assert_eq!(h.clear_pixel_shader(), 0, "unbind PS");
+    pixel
+}
+
+#[test]
+fn sm3_semantics_outside_the_fixed_set_link_by_name() {
+    let h = Harness::new();
+    assert_eq!(
+        draw_pair(&h, &VS3_NORMAL_AND_COLOR2, &PS3_READ_NORMAL),
+        0xFF00_FF00,
+        "the pixel shader's NORMAL0 is the vertex shader's NORMAL0, not its diffuse"
+    );
+    assert_eq!(
+        draw_pair(&h, &VS3_NORMAL_AND_COLOR2, &PS3_READ_COLOR2),
+        0xFF00_00FF,
+        "COLOR2 links like any other semantic"
+    );
+}
+
+/// `vs_3_0` packing TEXCOORD0 into `o1.xy` and TEXCOORD1 into `o1.zw`.
+///
+/// TEXCOORD0 carries (1, 0) and TEXCOORD1's `zw` carry (1, 1).
+#[rustfmt::skip]
+const VS3_PACKED_TEXCOORDS: [u32; 29] = [
+    0xFFFE_0300,                                        // vs_3_0
+    0x0500_0051, 0xA00F_0000,                           // def c0,
+    0x3F80_0000, 0x0000_0000, 0x3F80_0000, 0x3F80_0000, //   1, 0, 1, 1
+    0x0200_001F, 0x8000_0000, 0x900F_0000,              // dcl_position v0
+    0x0200_001F, 0x8000_0000, 0xE00F_0000,              // dcl_position o0
+    0x0200_001F, 0x8000_0005, 0xE003_0001,              // dcl_texcoord0 o1.xy
+    0x0200_001F, 0x8001_0005, 0xE00C_0001,              // dcl_texcoord1 o1.zw
+    0x0200_0001, 0xE00F_0000, 0x90E4_0000,              // mov o0, v0
+    0x0200_0001, 0xE003_0001, 0xA0E4_0000,              // mov o1.xy, c0
+    0x0200_0001, 0xE00C_0001, 0xA0E4_0000,              // mov o1.zw, c0
+    0x0000_FFFF,                                        // end
+];
+
+/// [`VS3_PACKED_TEXCOORDS`] with TEXCOORD1 in `o2.zw` instead.
+#[rustfmt::skip]
+const VS3_SPLIT_TEXCOORDS: [u32; 29] = [
+    0xFFFE_0300,                                        // vs_3_0
+    0x0500_0051, 0xA00F_0000,                           // def c0,
+    0x3F80_0000, 0x0000_0000, 0x3F80_0000, 0x3F80_0000, //   1, 0, 1, 1
+    0x0200_001F, 0x8000_0000, 0x900F_0000,              // dcl_position v0
+    0x0200_001F, 0x8000_0000, 0xE00F_0000,              // dcl_position o0
+    0x0200_001F, 0x8000_0005, 0xE003_0001,              // dcl_texcoord0 o1.xy
+    0x0200_001F, 0x8001_0005, 0xE00C_0002,              // dcl_texcoord1 o2.zw
+    0x0200_0001, 0xE00F_0000, 0x90E4_0000,              // mov o0, v0
+    0x0200_0001, 0xE003_0001, 0xA0E4_0000,              // mov o1.xy, c0
+    0x0200_0001, 0xE00C_0002, 0xA0E4_0000,              // mov o2.zw, c0
+    0x0000_FFFF,                                        // end
+];
+
+/// `ps_3_0` reading TEXCOORD0 from `v2.xy` and TEXCOORD1 from `v5.zw` into one colour.
+#[rustfmt::skip]
+const PS3_SPLIT_TEXCOORDS: [u32; 17] = [
+    0xFFFF_0300,                                        // ps_3_0
+    0x0200_001F, 0x8000_0005, 0x9003_0002,              // dcl_texcoord0 v2.xy
+    0x0200_001F, 0x8001_0005, 0x900C_0005,              // dcl_texcoord1 v5.zw
+    0x0200_0001, 0x8003_0000, 0x90E4_0002,              // mov r0.xy, v2
+    0x0200_0001, 0x800C_0000, 0x90E4_0005,              // mov r0.zw, v5
+    0x0200_0001, 0x800F_0800, 0x80E4_0000,              // mov oC0, r0
+    0x0000_FFFF,                                        // end
+];
+
+/// `ps_3_0` packing TEXCOORD0 into `v0.xy` and TEXCOORD1 into `v0.zw`.
+#[rustfmt::skip]
+const PS3_PACKED_TEXCOORDS: [u32; 11] = [
+    0xFFFF_0300,                                        // ps_3_0
+    0x0200_001F, 0x8000_0005, 0x9003_0000,              // dcl_texcoord0 v0.xy
+    0x0200_001F, 0x8001_0005, 0x900C_0000,              // dcl_texcoord1 v0.zw
+    0x0200_0001, 0x800F_0800, 0x90E4_0000,              // mov oC0, v0
+    0x0000_FFFF,                                        // end
+];
+
+#[test]
+fn sm3_packed_and_split_registers_link_by_semantic_lanes() {
+    let h = Harness::new();
+    for (vs, ps, what) in [
+        (
+            &VS3_PACKED_TEXCOORDS,
+            &PS3_SPLIT_TEXCOORDS[..],
+            "a register the vertex shader packs, read from two pixel registers",
+        ),
+        (
+            &VS3_SPLIT_TEXCOORDS,
+            &PS3_PACKED_TEXCOORDS[..],
+            "two vertex registers, read from one register the pixel shader packs",
+        ),
+    ] {
+        assert_eq!(
+            draw_pair(&h, vs, ps),
+            0xFFFF_00FF,
+            "{what}: red and green from TEXCOORD0.xy, blue and alpha from TEXCOORD1.zw"
+        );
+    }
+}
+
+/// `vs_3_0` writing a red diffuse and no semantic outside the fixed set.
+#[rustfmt::skip]
+const VS3_RED_DIFFUSE: [u32; 23] = [
+    0xFFFE_0300,                                        // vs_3_0
+    0x0500_0051, 0xA00F_0000,                           // def c0,
+    0x3F80_0000, 0x0000_0000, 0x0000_0000, 0x3F80_0000, //   1, 0, 0, 1
+    0x0200_001F, 0x8000_0000, 0x900F_0000,              // dcl_position v0
+    0x0200_001F, 0x8000_0000, 0xE00F_0000,              // dcl_position o0
+    0x0200_001F, 0x8000_000A, 0xE00F_0001,              // dcl_color0 o1
+    0x0200_0001, 0xE00F_0000, 0x90E4_0000,              // mov o0, v0
+    0x0200_0001, 0xE00F_0001, 0xA0E4_0000,              // mov o1, c0
+    0x0000_FFFF,                                        // end
+];
+
+/// `ps_3_0 { dcl_normal0 v0; add oC0, v0, c0; }` with `c0` from the constant buffer.
+#[rustfmt::skip]
+const PS3_NORMAL_PLUS_C0: [u32; 9] = [
+    0xFFFF_0300,                                        // ps_3_0
+    0x0200_001F, 0x8000_0003, 0x900F_0000,              // dcl_normal0 v0
+    0x0300_0002, 0x800F_0800, 0x90E4_0000, 0xA0E4_0000, // add oC0, v0, c0
+    0x0000_FFFF,                                        // end
+];
+
+#[test]
+fn an_sm3_input_no_vertex_output_supplies_reads_zero() {
+    let h = Harness::new();
+    let ps = h.create_pixel_shader(&PS3_NORMAL_PLUS_C0);
+    assert_eq!(h.set_pixel_shader(&ps), 0, "SetPixelShader");
+    assert_eq!(
+        h.set_pixel_shader_constant_f(0, &[0.0, 1.0, 0.0, 1.0]),
+        0,
+        "SetPSConstF(green)"
+    );
+
+    // Fixed-function vertex processing with a red diffuse.
+    assert_eq!(h.set_render_state(D3DRS_LIGHTING, 0), 0, "LIGHTING off");
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE), 0, "SetFVF");
+    let red = |x: f32, y: f32| PosColorVertex {
+        x,
+        y,
+        z: 0.5,
+        color: 0xFFFF_0000,
+    };
+    let tri = [red(0.0, 0.5), red(0.5, -0.5), red(-0.5, -0.5)];
+    h.render_once(0xFF00_0000, |d| {
+        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &tri), 0, "draw");
+    });
+    assert_eq!(
+        h.read_pixel(320, 280),
+        0xFF00_FF00,
+        "fixed-function vertex processing outputs no NORMAL0, so it reads zero"
+    );
+
+    // A vertex shader that outputs a red diffuse and no NORMAL0.
+    let vs = h.create_vertex_shader(&VS3_RED_DIFFUSE);
+    assert_eq!(h.set_vertex_shader(&vs), 0, "SetVertexShader");
+    assert_eq!(h.set_fvf(D3DFVF_XYZ), 0, "SetFVF");
+    h.render_once(0xFF00_0000, |d| {
+        assert_eq!(
+            d.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &centered_triangle()),
+            0,
+            "draw"
+        );
+    });
+    assert_eq!(
+        h.read_pixel(320, 280),
+        0xFF00_FF00,
+        "a vertex shader without NORMAL0 leaves the input at zero"
+    );
+
+    assert_eq!(h.clear_vertex_shader(), 0, "unbind VS");
+    assert_eq!(h.clear_pixel_shader(), 0, "unbind PS");
 }

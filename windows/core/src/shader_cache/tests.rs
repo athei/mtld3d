@@ -861,7 +861,7 @@ fn programmable_entry(kind: CachedKind) -> CacheEntry {
         ShaderSource::pixel(
             &program,
             VariantKey {
-                reserved: 0,
+                linked_input_mask: 0xA5,
                 alpha_func: 5,
                 fog_mode: 4,
                 fog_table_mode: 3,

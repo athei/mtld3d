@@ -10,11 +10,11 @@ use mtld3d_types::{
     D3DTOP_DISABLE, D3DTOP_MODULATE, D3DTOP_SELECTARG1,
 };
 
-use super::{FfPsKey, FfStage, FfStageFlags, FfVsFlags, FfVsKey, emit_ps_ff, emit_vs_ff};
-use crate::{
-    dxso::emit::{VariantFlags, VariantKey},
-    ff_state::MAX_VERTEX_BLEND_MATRIX_INDEX,
+use super::{
+    FfPsKey, FfStage, FfStageFlags, FfVsFlags, FfVsKey, MAX_VERTEX_BLEND_MATRIX_INDEX, emit_ps_ff,
+    emit_vs_ff,
 };
+use crate::dxso::emit::{VariantFlags, VariantKey};
 
 /// D3D enum constant at the key's narrow width.
 fn narrow(v: u32) -> u8 {
@@ -193,20 +193,31 @@ fn emits_one_directional_light() {
     assert!(msl.contains("lit.a = "), "{msl}");
 }
 
+/// A lit draw with specular lighting off passes the vertex specular colour through to `color1`.
+///
+/// Lighting computes no specular term then, so a `D3DTA_SPECULAR` argument or
+/// a pixel shader reading `v1` sees the vertex colour as on the unlit path,
+/// and zero for a vertex without one.
 #[test]
-fn specular_disabled_emits_zero_color1_and_no_pow() {
-    let mut vs = default_vs_key();
-    vs.flags.set(FfVsFlags::HAS_NORMAL, true);
-    vs.flags.set(FfVsFlags::LIGHTING_ENABLED, true);
-    vs.light_active_mask = 1;
-    vs.light_directional_mask = 1;
-    // specular_enable is false in the default key.
-    let msl = emit_pair_for_tests(&vs, &default_ps_key(), VariantKey::default());
-    assert!(
-        msl.contains("out.color1 = float4(saturate(specAccum), 0.0);"),
-        "{msl}"
-    );
-    assert!(!msl.contains("pow(ndoth"), "{msl}");
+fn specular_disabled_passes_vertex_specular_and_emits_no_pow() {
+    for color1 in [false, true] {
+        let mut vs = default_vs_key();
+        vs.flags.set(FfVsFlags::HAS_NORMAL, true);
+        vs.flags.set(FfVsFlags::LIGHTING_ENABLED, true);
+        vs.flags.set(FfVsFlags::HAS_COLOR1, color1);
+        vs.light_active_mask = 1;
+        vs.light_directional_mask = 1;
+        // specular_enable is false in the default key.
+        let msl = emit_pair_for_tests(&vs, &default_ps_key(), VariantKey::default());
+        let expected = if color1 {
+            "out.color1 = in.v3;"
+        } else {
+            "out.color1 = float4(0.0);"
+        };
+        assert!(msl.contains(expected), "{msl}");
+        assert!(!msl.contains("specAccum"), "{msl}");
+        assert!(!msl.contains("pow(ndoth"), "{msl}");
+    }
 }
 
 #[test]
@@ -433,12 +444,10 @@ fn the_eye_space_position_is_declared_only_where_it_is_read() {
 fn the_eye_space_normal_is_declared_only_where_it_is_read() {
     // `n` has two kinds of reader, both of which need a vertex normal: the
     // diffuse N.L term and the specular half-angle, which sit inside the
-    // per-light block, and the reflection vector of the
-    // CAMERASPACEREFLECTIONVECTOR and SPHEREMAP texgen modes.
-    // CAMERASPACENORMAL is not one of them: it reads the separate
-    // un-normalized `n_texgen`. A key with no reader would declare a local
-    // nothing reads; a key with one that lost the declaration would not
-    // compile, so every combination is swept.
+    // per-light block, and the CAMERASPACENORMAL, CAMERASPACEREFLECTIONVECTOR
+    // and SPHEREMAP texgen modes, which read the same value. A key with no
+    // reader would declare a local nothing reads; a key with one that lost
+    // the declaration would not compile, so every combination is swept.
     for bits in 0u8..32 {
         let lighting = bits & 1 != 0;
         let normal = bits & 2 != 0;
@@ -475,7 +484,7 @@ fn the_eye_space_normal_is_declared_only_where_it_is_read() {
                     // reads nothing, and the lighting terms live inside the
                     // per-light block, so an enabled lighting branch with no
                     // active slot reads nothing either.
-                    let texgen_reads = normal && (tci == 3 || tci == 4);
+                    let texgen_reads = normal && matches!(tci, 1 | 3 | 4);
                     let lit_reads = lighting && normal && light_active != 0;
                     let reads = texgen_reads || lit_reads;
 
@@ -489,7 +498,12 @@ fn the_eye_space_normal_is_declared_only_where_it_is_read() {
                     // read and the name never occurs undeclared.
                     assert_eq!(msl.contains("dot(n, L)"), lit_reads, "{case}");
                     assert_eq!(msl.contains("dot(n, H)"), lit_reads && specular, "{case}");
-                    assert_eq!(msl.contains("reflect(E_tci, n)"), texgen_reads, "{case}");
+                    assert_eq!(
+                        msl.contains("reflect(E_tci, n)"),
+                        normal && (tci == 3 || tci == 4),
+                        "{case}"
+                    );
+                    assert_eq!(msl.contains("float4(n, 0.0)"), normal && tci == 1, "{case}");
                     // The name is a single letter, so it is counted as a
                     // token rather than as a substring: no token at all is
                     // what says the shader neither declares nor reads it.
@@ -499,12 +513,12 @@ fn the_eye_space_normal_is_declared_only_where_it_is_read() {
                         .count();
                     assert_eq!(tokens > 0, reads, "{case}");
                     // The terms that must not move with the declaration: the
-                    // renormalization the single-matrix lit path appends
-                    // rides with it, the sphere map's normal-less reflection
-                    // does not, and `n_texgen` keeps its own reader.
+                    // renormalization rides with it whenever NORMALIZENORMALS
+                    // is set, lit or not, blended or not, and the sphere
+                    // map's normal-less reflection does not.
                     assert_eq!(
                         msl.contains("    n = normalize(n);"),
-                        reads && lighting && blend == 0 && normalize_normals,
+                        reads && normalize_normals,
                         "{case}"
                     );
                     assert_eq!(
@@ -512,16 +526,7 @@ fn the_eye_space_normal_is_declared_only_where_it_is_read() {
                         tci == 4 && !normal,
                         "{case}"
                     );
-                    assert_eq!(
-                        msl.contains("float3 n_texgen = "),
-                        normal && tci == 1,
-                        "{case}"
-                    );
-                    assert_eq!(
-                        msl.contains("float4(n_texgen, 0.0)"),
-                        normal && tci == 1,
-                        "{case}"
-                    );
+                    assert!(!msl.contains("n_texgen"), "{case}");
                 }
             }
         }
@@ -1427,6 +1432,47 @@ fn depth_sampler_mask_emits_depth2d_and_sample_compare() {
     );
 }
 
+/// A projected depth-compare stage divides both the coordinate and the reference by `.w`.
+///
+/// `D3DTTFF_PROJECTED` on a shadow-map stage asks for the projective lookup
+/// the colour, Fetch4 and raw-depth branches already perform, so the
+/// comparison reads `xy / w` against `z / w` with the same zero-`w` guard.
+#[test]
+fn projected_depth_compare_divides_coordinate_and_reference_by_w() {
+    let mut vs = default_vs_key();
+    vs.tex_coord_count = 1;
+    vs.input_tex_coord_count = 1;
+    let mut ps = default_ps_key();
+    ps.stages[0] = FfStage {
+        color_op: narrow(D3DTOP_SELECTARG1),
+        color_arg1: narrow(D3DTA_TEXTURE),
+        color_arg2: narrow(D3DTA_CURRENT),
+        alpha_op: narrow(D3DTOP_SELECTARG1),
+        alpha_arg1: narrow(D3DTA_TEXTURE),
+        alpha_arg2: narrow(D3DTA_CURRENT),
+        flags: FfStageFlags::HAS_TEXTURE,
+    };
+    ps.tt_projected_mask = 0b1;
+    let depth = VariantKey {
+        depth_sampler_mask: 0b1,
+        ..VariantKey::default()
+    };
+    let msl = emit_pair_for_tests(&vs, &ps, depth);
+    assert!(
+        msl.contains(
+            "float3 proj0 = in.texcoord0.w != 0.0 ? in.texcoord0.xyz / in.texcoord0.w : float3(0.0);"
+        ),
+        "{msl}"
+    );
+    assert!(
+        msl.contains(
+            "float4 t0 = float4(s0.sample_compare(samp0, proj0.xy, saturate(proj0.z), level(0)));"
+        ),
+        "{msl}"
+    );
+    assert!(!msl.contains("in.texcoord0.xy,"), "{msl}");
+}
+
 #[test]
 fn volume_sampler_mask_emits_texture3d_and_xyz_sample() {
     // A volume (3D) texture bound to an FF stage must emit `texture3d<float>`
@@ -1529,7 +1575,7 @@ fn emits_alpha_test_discard() {
     let vs = default_vs_key();
     let ps = default_ps_key();
     let variant = VariantKey {
-        reserved: 0,
+        linked_input_mask: 0,
         alpha_func: narrow(D3DCMP_GREATER),
         fog_mode: 0,
         fog_table_mode: 0,
@@ -1562,7 +1608,7 @@ fn emits_fog_blend_on_buffer_13_when_enabled() {
     vs.fog_mode = narrow(D3DFOG_LINEAR);
     let ps = default_ps_key();
     let variant = VariantKey {
-        reserved: 0,
+        linked_input_mask: 0,
         alpha_func: 0,
         fog_mode: 3,
         fog_table_mode: 0,
@@ -1677,7 +1723,7 @@ fn omits_alpha_test_when_always() {
     let vs = default_vs_key();
     let ps = default_ps_key();
     let variant = VariantKey {
-        reserved: 0,
+        linked_input_mask: 0,
         alpha_func: narrow(D3DCMP_ALWAYS),
         fog_mode: 0,
         fog_table_mode: 0,
@@ -1919,9 +1965,12 @@ fn tci_cameraspacereflection_emits_reflection_vector() {
         flags: FfStageFlags::HAS_TEXTURE,
     };
     let msl = emit_pair_for_tests(&vs, &ps, VariantKey::default());
-    // Eye-space normal + position must be declared (pre-scan hoist, since
-    // lighting is disabled in the default key).
-    assert_eq!(msl.matches("float3 n = normalize(").count(), 1, "{msl}");
+    // Eye-space normal + position must be declared although lighting is
+    // disabled in the default key: the normal through the D3D9 normal
+    // matrix, as lighting reads it, and not renormalized while
+    // NORMALIZENORMALS is clear.
+    assert_eq!(msl.matches("float3 n = (abs(nwvdet)").count(), 1, "{msl}");
+    assert!(!msl.contains("normalize(n"), "{msl}");
     assert_eq!(msl.matches("float3 posEye =").count(), 1, "{msl}");
     assert!(
         msl.contains(concat!(
@@ -1956,11 +2005,9 @@ fn tci_cameraspacereflection_vertex_blended_reads_the_blended_locals() {
         1,
         "{msl}"
     );
-    assert_eq!(
-        msl.matches("    float3 n = normalize(n_blend);\n").count(),
-        1,
-        "{msl}"
-    );
+    // The blended normal keeps its magnitude without NORMALIZENORMALS.
+    assert_eq!(msl.matches("    float3 n = n_blend;\n").count(), 1, "{msl}");
+    assert!(!msl.contains("n = normalize(n)"), "{msl}");
     assert!(
         msl.contains(concat!(
             "        float3 E_tci = normalize(posEye);\n",
@@ -1970,6 +2017,46 @@ fn tci_cameraspacereflection_vertex_blended_reads_the_blended_locals() {
         "{msl}"
     );
     assert!(!msl.contains("dot(n, E_tci)"), "{msl}");
+}
+
+/// Texgen reads the normal lighting reads, through the D3D9 normal matrix, lit or unlit.
+///
+/// CAMERASPACENORMAL, CAMERASPACEREFLECTIONVECTOR and SPHEREMAP take the
+/// eye-space normal from the upper-left block of inverse(WV), the one the
+/// lighting terms use, so a non-uniform world scale tilts it the same way for
+/// both; the plain 3x3 of WV would tilt it the other way. It is renormalized
+/// only under NORMALIZENORMALS, whether or not lighting is on.
+#[test]
+fn texgen_reads_the_lighting_normal_lit_or_unlit() {
+    for lighting in [false, true] {
+        for tci in [1u8, 3, 4] {
+            for normalize in [false, true] {
+                let mut vs = default_vs_key();
+                vs.flags.set(FfVsFlags::HAS_NORMAL, true);
+                vs.flags.set(FfVsFlags::LIGHTING_ENABLED, lighting);
+                vs.flags.set(FfVsFlags::NORMALIZE_NORMALS, normalize);
+                vs.light_active_mask = u8::from(lighting);
+                vs.light_directional_mask = u8::from(lighting);
+                vs.tex_coord_count = 1;
+                vs.tci_modes[0] = tci;
+                let msl = emit_vs_ff(&vs);
+                let case = format!("lighting={lighting} tci={tci} normalize={normalize}\n{msl}");
+                assert!(
+                    msl.contains("static inline float4 mtld3d_cross4("),
+                    "{case}"
+                );
+                assert_eq!(
+                    msl.matches("    float3 n = (abs(nwvdet) > 1e-12)\n")
+                        .count(),
+                    1,
+                    "{case}"
+                );
+                assert!(!msl.contains("dot(in.v1.xyz, vs_c[0].xyz)"), "{case}");
+                assert_eq!(msl.contains("    n = normalize(n);\n"), normalize, "{case}");
+                assert!(!msl.contains("normalize(float3(dot(in.v1"), "{case}");
+            }
+        }
+    }
 }
 
 #[test]
@@ -2148,24 +2235,25 @@ fn eye_space_locals_are_declared_once_for_every_lighting_normal_and_tci_mix() {
                     // back to passthru and reads no eye-space position, so
                     // the pre-scan does not hoist one for it.
                     let wants_pos_eye = lighting || mode == 2 || mode == 4 || (mode == 3 && normal);
-                    // A CAMERASPACENORMAL stage reads `n_texgen`, and a
-                    // normal-less CAMERASPACEREFLECTIONVECTOR stage falls
-                    // back to passthru, so neither hoists an eye normal.
-                    let wants_normal = normal && (lighting || mode == 3 || mode == 4);
+                    // A normal-less texgen stage falls back to passthru or,
+                    // for SPHEREMAP, reflects about no normal, so it reads no
+                    // eye normal.
+                    let wants_normal = normal && (lighting || matches!(mode, 1 | 3 | 4));
                     assert_eq!(pos_eye_decls, usize::from(wants_pos_eye), "{case}");
                     assert_eq!(normal_decls, usize::from(wants_normal), "{case}");
 
                     // Every consumer has its declaration, and the eye normal
                     // is declared only where one reads it.
                     let pos_eye_uses = msl.matches("posEye").count() - pos_eye_decls;
-                    let normal_uses =
-                        msl.matches("dot(n, ").count() + msl.matches("reflect(E_tci, n)").count();
+                    let normal_uses = msl.matches("dot(n, ").count()
+                        + msl.matches("reflect(E_tci, n)").count()
+                        + msl.matches("float4(n, 0.0)").count();
                     assert!(pos_eye_uses == 0 || pos_eye_decls == 1, "{case}");
                     assert_eq!(normal_decls, usize::from(normal_uses > 0), "{case}");
 
                     // The texgen source each mode resolves to.
                     let raw = match mode {
-                        1 if normal => "float4 raw0 = float4(n_texgen, 0.0);",
+                        1 if normal => "float4 raw0 = float4(n, 0.0);",
                         2 => "float4 raw0 = float4(posEye, 0.0);",
                         3 if normal => "raw0 = float4(R_tci, 0.0);",
                         4 => "raw0 = float4(R_tci.xy / m_tci + 0.5, 0.0, 0.0);",
@@ -2207,7 +2295,9 @@ fn tci_spheremap_emits_sphere_map_of_the_reflection_vector() {
     // D3DTSS_TEXCOORDINDEX = 0x40000 (TCI_SPHEREMAP). With lighting off the
     // pre-scan hoists both eye-space locals, and the stage emits
     // R = reflect(normalize(posEye), n), m = 2 * |R + (0, 0, 1)| and the
-    // coordinate (R.x / m + 0.5, R.y / m + 0.5, 0, 0).
+    // coordinate (R.x / m + 0.5, R.y / m + 0.5, 0, 0). The normal is the one
+    // lighting reads, through the D3D9 normal matrix and not renormalized
+    // while NORMALIZENORMALS is clear.
     let mut vs = default_vs_key();
     vs.flags.set(FfVsFlags::HAS_NORMAL, true);
     vs.tex_coord_count = 1;
@@ -2215,7 +2305,8 @@ fn tci_spheremap_emits_sphere_map_of_the_reflection_vector() {
     vs.tex_coord_dims[0] = 2;
     vs.tci_modes[0] = 4;
     let msl = emit_vs_ff(&vs);
-    assert_eq!(msl.matches("float3 n = normalize(").count(), 1, "{msl}");
+    assert_eq!(msl.matches("float3 n = (abs(nwvdet)").count(), 1, "{msl}");
+    assert!(!msl.contains("normalize(n"), "{msl}");
     assert_eq!(msl.matches("float3 posEye =").count(), 1, "{msl}");
     for line in [
         "        float3 E_tci = normalize(posEye);\n",
@@ -2283,11 +2374,9 @@ fn tci_spheremap_vertex_blended_reads_the_blended_locals() {
         1,
         "{msl}"
     );
-    assert_eq!(
-        msl.matches("    float3 n = normalize(n_blend);\n").count(),
-        1,
-        "{msl}"
-    );
+    // The blended normal keeps its magnitude without NORMALIZENORMALS.
+    assert_eq!(msl.matches("    float3 n = n_blend;\n").count(), 1, "{msl}");
+    assert!(!msl.contains("n = normalize(n)"), "{msl}");
     assert!(msl.contains("float3 R_tci = reflect(E_tci, n);"), "{msl}");
 }
 
@@ -2439,7 +2528,7 @@ fn vertex_blend_indexed_3_weight_reads_blend_indices() {
         "{msl}"
     );
     assert!(
-        msl.contains("uint4 blend_indices [[attribute(13)]]"),
+        msl.contains("float4 blend_indices [[attribute(13)]]"),
         "{msl}"
     );
     // Three explicit + one implicit indexed reads, each clamped to the
@@ -2448,7 +2537,7 @@ fn vertex_blend_indexed_3_weight_reads_blend_indices() {
     for i in 0..4 {
         assert!(
             msl.contains(&format!(
-                "in.blend_indices[{i}], {MAX_VERTEX_BLEND_MATRIX_INDEX}u)"
+                "uint(clamp(rint(in.blend_indices[{i}]), 0.0, {MAX_VERTEX_BLEND_MATRIX_INDEX}.0))"
             )),
             "indexed mode reads a clamped blend_indices[{i}]: {msl}"
         );
@@ -2469,7 +2558,7 @@ fn vertex_blend_indexed_only_0_weights_single_matrix() {
     // No BLENDWEIGHT slot needed.
     assert!(!msl.contains("blend_weight"), "{msl}");
     assert!(
-        msl.contains("uint4 blend_indices [[attribute(13)]]"),
+        msl.contains("float4 blend_indices [[attribute(13)]]"),
         "{msl}"
     );
     // No accumulator weight sum — single-matrix shortcut path.
@@ -2479,7 +2568,7 @@ fn vertex_blend_indexed_only_0_weights_single_matrix() {
     );
     assert!(
         msl.contains(&format!(
-            "in.blend_indices[0], {MAX_VERTEX_BLEND_MATRIX_INDEX}u)"
+            "uint(clamp(rint(in.blend_indices[0]), 0.0, {MAX_VERTEX_BLEND_MATRIX_INDEX}.0))"
         )),
         "{msl}"
     );
@@ -2710,13 +2799,19 @@ fn range_fog_changes_only_the_vertex_distance_expression() {
             key.vertex_blend_count = blends;
             key.declared_weights_count = u8::from(blends != 0);
             let ordinary = emit_vs_ff(&key);
-            assert!(ordinary.contains("float eyeZ = abs(dot(pos, vs_c[2]));"));
+            // The eye depth of the blended position when the vertex blends,
+            // which without blending is the row-2 dot of the single matrix.
+            assert!(
+                ordinary.contains("float eyeZ = abs(pos_view.z);"),
+                "{ordinary}"
+            );
+            assert!(!ordinary.contains("abs(dot(pos"), "{ordinary}");
             assert!(!ordinary.contains("length(pos_view.xyz)"));
             key.flags.insert(FfVsFlags::RANGE_FOG);
             let range = emit_vs_ff(&key);
             assert!(range.contains("float eyeZ = length(pos_view.xyz);"));
             assert_eq!(
-                range.replace("length(pos_view.xyz)", "abs(dot(pos, vs_c[2]))"),
+                range.replace("length(pos_view.xyz)", "abs(pos_view.z)"),
                 ordinary,
                 "ordinary fog keeps the same source and range changes only distance"
             );

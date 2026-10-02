@@ -1309,9 +1309,15 @@ pub fn vertex_decl_has_rhw(elements: &[D3DVERTEXELEMENT9]) -> bool {
 ///
 /// See `crate::dxso::ff_attr_index_for_semantic`. The FF VS has no `dcl_*`
 /// declarations — its input layout is fixed.
+///
+/// A `D3DCOLOR` `BLENDINDICES` element is fetched as four unnormalized bytes
+/// in memory order, the order `D3DCOLORtoUBYTE4` gives a programmable shader,
+/// so each lane reaches the FF VS as its byte value rather than a normalized
+/// and swizzled colour channel.
 #[must_use]
 pub fn resolve_attrs_for_ff(elements: &[D3DVERTEXELEMENT9]) -> ResolvedAttrs {
-    resolve_attrs(elements, "FF", |e| {
+    let blend_indices = ff_attr_index_for_semantic(D3DDECLUSAGE_BLENDINDICES, 0).map(u32::from);
+    let mut resolved = resolve_attrs(elements, "FF", |e| {
         let reg = ff_attr_index_for_semantic(e.usage, e.usage_index);
         if reg.is_none() {
             mtld3d_shared::log_once_warn_by!(
@@ -1323,7 +1329,15 @@ pub fn resolve_attrs_for_ff(elements: &[D3DVERTEXELEMENT9]) -> ResolvedAttrs {
             );
         }
         reg
-    })
+    });
+    for attr in &mut resolved.attrs {
+        if Some(attr.attr_index) == blend_indices
+            && attr.format == VertexFormat::UChar4NormalizedBgra
+        {
+            attr.format = VertexFormat::UChar4;
+        }
+    }
+    resolved
 }
 
 /// Convenience: hash a contiguous `&[D3DVERTEXELEMENT9]` for use as a pipeline-cache key.

@@ -326,7 +326,15 @@ mod source;
 /// `78` turns `pos_fixup` into the `PosFixup` struct and adds the
 /// `D3DRS_DEPTHBIAS` offset to the position epilogue, changing the MSL of
 /// every vertex shader.
-pub const SHADER_CACHE_SCHEMA_VERSION: u32 = 78;
+///
+/// `79` links `vs_3_0` outputs to `ps_3_0` inputs by semantic and dcl write
+/// mask: semantics outside the fixed-function set get `Varyings` members of
+/// their own, and the programmable PS variant and its recipe gain
+/// `VariantKey::linked_input_mask`, which moves every PS key hash. It also
+/// fetches a `D3DCOLOR` `BLENDINDICES` element of a fixed-function draw as
+/// unnormalized bytes, changing the vertex descriptor of those pipeline
+/// recipes.
+pub const SHADER_CACHE_SCHEMA_VERSION: u32 = 79;
 
 /// Source-derived identity of MSL emission, independent of persistent DXSO and shader keys.
 pub const SHADER_EMITTER_VERSION: u64 = include!(concat!(env!("OUT_DIR"), "/emitter_version.rs"));

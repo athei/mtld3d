@@ -158,6 +158,7 @@ pub fn parse(bytecode: &[u32]) -> Result<DxsoProgram, DxsoError> {
                         usage: decode_decl_usage((usage_token & 0x1F) as u8)?,
                         usage_index: (usage_token >> 16) & 0xF,
                         reg,
+                        mask: WriteMask(((dst_token >> 16) & 0xF) as u8),
                     }
                 };
                 declarations.push(decl);

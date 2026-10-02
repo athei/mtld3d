@@ -11975,6 +11975,14 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
                         mtld3d_core::draw_data::ShaderSourceFlags::BUMP_ENV
                     } else {
                         mtld3d_core::draw_data::ShaderSourceFlags::empty()
+                    }) | (if ps_obj.uses_rel_const() {
+                        mtld3d_core::draw_data::ShaderSourceFlags::RELATIVE
+                    } else {
+                        mtld3d_core::draw_data::ShaderSourceFlags::empty()
+                    }) | (if ps_obj.reads_linked_inputs() {
+                        mtld3d_core::draw_data::ShaderSourceFlags::LINKED_INPUTS
+                    } else {
+                        mtld3d_core::draw_data::ShaderSourceFlags::empty()
                     }),
 
                     reserved: [0; 4],
@@ -12099,7 +12107,7 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
                     let rows = dev.ff_state.palette_section_rows(&key);
                     if rows != 0 {
                         dev.current_frame.record_ff_vs_destination(
-                            mtld3d_core::ff_state::FF_VS_PALETTE_BASE_ROW,
+                            mtld3d_core::dxso::FF_VS_PALETTE_BASE_ROW,
                             rows,
                             |destination| dev.ff_state.fill_palette_section(&key, destination),
                         );
@@ -13890,6 +13898,18 @@ extern "system" fn device_create_pixel_shader(
         created
             .usage
             .contains(mtld3d_shared::shader_create::ShaderUsage::BOOL_CONST),
+    );
+    usage.set(
+        crate::pixel_shader::PsUsage::USES_REL_CONST,
+        created
+            .usage
+            .contains(mtld3d_shared::shader_create::ShaderUsage::RELATIVE_CONST),
+    );
+    usage.set(
+        crate::pixel_shader::PsUsage::READS_LINKED_INPUTS,
+        created
+            .usage
+            .contains(mtld3d_shared::shader_create::ShaderUsage::LINKED_INPUTS),
     );
     if let Err(result) = created.adopt(obj.inner()) {
         return result;

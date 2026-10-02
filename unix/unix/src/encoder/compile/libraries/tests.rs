@@ -382,7 +382,7 @@ fn every_variant_field_reaches_the_compared_words() {
             ..base
         },
         VariantKey {
-            reserved: 1,
+            linked_input_mask: 1,
             ..base
         },
         VariantKey {

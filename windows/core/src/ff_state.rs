@@ -38,7 +38,8 @@ use crate::{
     caps::{FF_TEXTURE_STAGES, texture_op_unimplemented, unimplemented_texture_op},
     convert::FfVsLayout,
     dxso::{
-        FfPsKey, FfStage, FfStageFlags, FfStageResult, FfVsFlags, FfVsKey, VariantFlags, VariantKey,
+        FF_VS_PALETTE_BASE_ROW, FfPsKey, FfStage, FfStageFlags, FfStageResult, FfVsFlags, FfVsKey,
+        MAX_VERTEX_BLEND_MATRIX_INDEX, VariantFlags, VariantKey,
     },
     scratch::ScratchArena,
 };
@@ -51,23 +52,6 @@ use crate::{
 /// `caps::fill` reports this value as `D3DCAPS9::MaxActiveLights`, so the
 /// advertised cap cannot drift from the number of slots the FF VS has.
 pub const MAX_ACTIVE_LIGHTS: u32 = 8;
-
-/// First FF VS constant row of the world-matrix palette.
-///
-/// Every section below it has a fixed row range (`FfVsDirty` names each one);
-/// the palette runs from here to the end of the constant block, four rows per
-/// matrix, and the emitted FF VS reads it as `vs_c + 95 + idx * 4`.
-pub const FF_VS_PALETTE_BASE_ROW: u16 = 95;
-
-/// Highest `D3DTS_WORLDMATRIX(i)` index a draw can read through vertex blending.
-///
-/// The encoder binds 256 FF VS constant rows (`CONSTANT_ROWS` in the `d3d9`
-/// crate, which asserts that its mirror still holds this index), so rows
-/// 95..=255 carry 40 whole matrices and 39 is the last index whose four rows
-/// are inside the block. `caps::fill` reports it as
-/// `D3DCAPS9::MaxVertexBlendMatrixIndex`, so a title that sizes its bone
-/// palette from the cap never asks for a matrix the layout has no rows for.
-pub const MAX_VERTEX_BLEND_MATRIX_INDEX: u32 = 39;
 
 bitflags! {
     /// Per-section dirty bits for the FF VS const buffer.
@@ -1251,13 +1235,16 @@ impl FfState {
         // stages expect distinct coord sets (e.g. v4 = tiled distortion UV,
         // v5 = normalized scene UV, v6 = second scene UV).
         //
-        // `max_active_stage` and `tex_coord_count` keep the original FF-PS-
-        // aware semantics: default-state stages (COLOROP=MODULATE + no
-        // texture, or any COLOROP=DISABLE chain terminator) must NOT
-        // inflate `tex_coord_count`, or every draw on defaults would emit
-        // a dead varying and trip `passthru_rhs`'s out-of-range fallback
-        // warn. `input_tex_coord_count` stays pinned to the vertex-stream
-        // count so the `VertexIn` struct only declares attributes that
+        // `tex_coord_count` covers every stage that has a coordinate to
+        // write, whatever its COLOROP, for the same reason: a programmable
+        // PS samples the stages it names, and the key does not know whether
+        // one is bound. A stage has a coordinate when its TCI generates one
+        // or routes a set the stream carries; a stage on its defaults routes
+        // set `i`, so the count only grows past the stream's set count for a
+        // stage with a texture bound ahead of the chain terminator (which
+        // samples zero) or a TCI that reroutes or generates.
+        // `input_tex_coord_count` stays pinned to the vertex-stream count so
+        // the `VertexIn` struct only declares attributes that
         // `resolve_attrs_for_ff` populates in the MTLVertexDescriptor.
         let mut tci_modes = [0u8; 8];
         let mut tci_coord_indices = [0u8; 8];
@@ -1298,6 +1285,12 @@ impl FfState {
                 max_active_stage = Some(index);
             }
         }
+        let mut routed_stage_count = 0u8;
+        for (count, (&mode, &set)) in (1u8..).zip(tci_modes.iter().zip(&tci_coord_indices)) {
+            if stage_has_coordinate(mode, set, layout) {
+                routed_stage_count = count;
+            }
+        }
         // `.min(8)` is defensive: `ff_vs_layout_from_elements` already
         // clamps, but keep the invariant enforced here so a future layout
         // source can't reintroduce OOB into FfVsKey's [u8; 8] per-stage
@@ -1305,6 +1298,7 @@ impl FfState {
         let tex_coord_count = layout
             .tex_coord_count
             .max(max_active_stage.map_or(0, |m| m + 1))
+            .max(routed_stage_count)
             .min(8);
         assert!(
             tex_coord_count <= 8,
@@ -1328,6 +1322,20 @@ impl FfState {
         flags.set(
             FfVsFlags::RANGE_FOG,
             matches!(fog_mode, 1..=3) && render_states[D3DRS_RANGEFOGENABLE as usize] != 0,
+        );
+        // D3DRS_NORMALIZENORMALS only affects a draw that reads the eye
+        // normal: lighting, or a texgen stage the VS emits that generates
+        // from the normal. Gate the variant fork on those so the other draws
+        // don't multiply pipelines.
+        let texgen_reads_normal = !layout.has_rhw()
+            && tci_modes[..usize::from(tex_coord_count)]
+                .iter()
+                .any(|&mode| matches!(mode, 1 | 3 | 4));
+        flags.set(
+            FfVsFlags::NORMALIZE_NORMALS,
+            (lighting_enabled || texgen_reads_normal)
+                && layout.has_normal()
+                && render_states[D3DRS_NORMALIZENORMALS as usize] != 0,
         );
 
         FfVsKey {
@@ -1469,7 +1477,8 @@ impl FfState {
             render_states[D3DRS_POINTSPRITEENABLE as usize] != 0,
         );
         VariantKey {
-            reserved: 0,
+            // Derived on the encoder thread from the draw's two shaders.
+            linked_input_mask: 0,
             alpha_func: if alpha_test_on {
                 crate::render_state::enum_value(render_states, D3DRS_ALPHAFUNC)
             } else {
@@ -2229,14 +2238,6 @@ fn build_vs_flags(
     flags.set(FfVsFlags::USES_VERTEX_DECL, layout.uses_vertex_decl());
     flags.set(FfVsFlags::HAS_COLOR1, layout.has_color1());
     flags.set(FfVsFlags::LIGHTING_ENABLED, lighting_enabled);
-    // D3DRS_NORMALIZENORMALS only affects a lit draw with a normal — gate the
-    // variant fork on those so unlit / no-normal draws don't multiply pipelines.
-    flags.set(
-        FfVsFlags::NORMALIZE_NORMALS,
-        lighting_enabled
-            && layout.has_normal()
-            && render_states[D3DRS_NORMALIZENORMALS as usize] != 0,
-    );
     flags.set(FfVsFlags::HAS_RHW, layout.has_rhw());
     flags.set(
         FfVsFlags::COLOR_VERTEX,
@@ -2266,6 +2267,26 @@ fn build_vs_flags(
         !layout.has_rhw() && render_states[D3DRS_POINTSCALEENABLE as usize] != 0,
     );
     flags
+}
+
+/// Whether the FF VS writes a coordinate other than zero for a stage with this TCI.
+///
+/// `mode` and `set` are the decoded `FfVsKey::tci_modes` and
+/// `tci_coord_indices` entries. CAMERASPACEPOSITION and SPHEREMAP always
+/// generate one; CAMERASPACENORMAL and CAMERASPACEREFLECTIONVECTOR generate
+/// one from a vertex normal and otherwise pass the set through, as passthru
+/// and the undefined modes do. A pre-transformed layout generates nothing and
+/// passes every mode through.
+fn stage_has_coordinate(mode: u8, set: u8, layout: FfVsLayout) -> bool {
+    let routes_a_streamed_set = set.min(7) < layout.tex_coord_count;
+    if layout.has_rhw() {
+        return routes_a_streamed_set;
+    }
+    match mode {
+        2 | 4 => true,
+        1 | 3 => layout.has_normal() || routes_a_streamed_set,
+        _ => routes_a_streamed_set,
+    }
 }
 
 /// A D3DTSS op or argument code, narrowed to the byte an `FfStage` carries.

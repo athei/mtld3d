@@ -543,6 +543,17 @@ fn emit_draw_view(
         ps_variant.flags.insert(VariantFlags::SAMPLE_MASK);
         ps_variant.sample_mask = render_state.sample_mask;
     }
+    // A `ps_3_0` input semantic outside the fixed-function varyings (NORMAL,
+    // TANGENT, COLOR2, …) links by name to the vertex output of the same
+    // semantic, and Metal rejects a fragment input the vertex function does
+    // not write, so the pixel variant records which of them this draw's
+    // vertex shader outputs. Every other draw's flag is clear and its byte
+    // stays zero.
+    if let PsSourceView::Programmable(source) = ps
+        && source.reads_linked_inputs()
+    {
+        ps_variant.linked_input_mask = enc.linked_input_mask(source.ps_id, vs);
+    }
     // Programmable VS/PS: snapshot from the encoder-side mirror (kept
     // in sync via `Op::Set{Vs,Ps}ConstRange` deltas). FF: symmetric —
     // snapshot from `ff_vs_constants_mirror` (kept in sync via
@@ -566,8 +577,16 @@ fn emit_draw_view(
         }
     };
     let ps_constants = match ps {
-        PsSourceView::Programmable(ProgrammablePsSource { max_const_used, .. }) => {
-            enc.ps_const_scratch(*max_const_used)
+        PsSourceView::Programmable(value) => {
+            // A `c[aL + N]` read names its row only at draw time. The
+            // statically named rows stay bound even when the application
+            // has populated fewer, so the bound prefix covers both.
+            let rows = if value.uses_rel_const() {
+                enc.ps_constants_populated_rows().max(value.max_const_used)
+            } else {
+                value.max_const_used
+            };
+            enc.ps_const_scratch(rows)
         }
         PsSourceView::FixedFunction(FixedPsSource { constant_rows, .. }) if *constant_rows != 0 => {
             snap.ps_constants.unwrap_or(ScratchSlice::EMPTY)

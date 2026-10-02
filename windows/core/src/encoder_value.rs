@@ -276,7 +276,7 @@ fields_codec!(FfPsKey {
 });
 
 fields_codec!(VariantKey {
-    reserved,
+    linked_input_mask,
     alpha_func,
     fog_mode,
     fog_table_mode,

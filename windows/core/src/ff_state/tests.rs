@@ -308,6 +308,118 @@ fn tci_indices_preserved_past_colorop_disable_terminator() {
     );
 }
 
+/// A stage past the first `COLOROP_DISABLE` gets a texcoord output when its TCI has a coordinate.
+///
+/// A programmable PS bound over the FF VS samples the stages it names, and
+/// the FF stages stay on their default `DISABLE`, so the count of emitted
+/// coordinates follows `D3DTSS_TEXCOORDINDEX` alone: a stage routed to a set
+/// the stream carries or generating one counts, a stage routed to a set the
+/// stream lacks does not.
+#[test]
+fn tex_coord_count_covers_routed_and_generated_stages_past_colorop_disable() {
+    use mtld3d_types::D3DTOP_DISABLE;
+    const CAMERASPACEPOSITION: u32 = 2 << 16;
+    const CAMERASPACENORMAL: u32 = 1 << 16;
+    let one_set = |flags| FfVsLayout {
+        flags,
+        tex_coord_count: 1,
+        tex_coord_dims: [2, 0, 0, 0, 0, 0, 0, 0],
+        declared_weights_count: 0,
+    };
+    let count = |tci: &[(usize, u32)], layout: FfVsLayout| {
+        let mut ff = FfState::new();
+        for &(stage, value) in tci {
+            ff.set_texture_stage_state(stage, D3DTSS_TEXCOORDINDEX as usize, value);
+        }
+        assert_eq!(
+            ff.texture_stage_state(1, D3DTSS_COLOROP as usize),
+            D3DTOP_DISABLE,
+            "stage 1 keeps its default DISABLE"
+        );
+        ff.build_vs_key(&rs(), layout, 0b0000_0011).tex_coord_count
+    };
+    let plain = one_set(FfVsLayoutFlags::empty());
+    assert_eq!(
+        count(&[], plain),
+        1,
+        "defaults route set i; only set 0 exists"
+    );
+    assert_eq!(count(&[(1, 0)], plain), 2, "stage 1 rerouted to set 0");
+    assert_eq!(count(&[(3, 0)], plain), 4, "stage 3 rerouted to set 0");
+    assert_eq!(
+        count(&[(1, 2)], plain),
+        1,
+        "stage 1 routed to an absent set"
+    );
+    assert_eq!(
+        count(&[(2, CAMERASPACEPOSITION | 5)], plain),
+        3,
+        "position texgen needs no set"
+    );
+    assert_eq!(
+        count(&[(1, CAMERASPACENORMAL | 1)], plain),
+        1,
+        "normal texgen without a normal passes an absent set through"
+    );
+    assert_eq!(
+        count(
+            &[(1, CAMERASPACENORMAL | 1)],
+            one_set(FfVsLayoutFlags::HAS_NORMAL)
+        ),
+        2,
+        "normal texgen with a normal"
+    );
+    let rhw = one_set(FfVsLayoutFlags::HAS_RHW);
+    assert_eq!(
+        count(&[(1, CAMERASPACEPOSITION | 1)], rhw),
+        1,
+        "pre-transformed texgen passes an absent set through"
+    );
+    assert_eq!(count(&[(1, CAMERASPACEPOSITION)], rhw), 2);
+}
+
+/// `D3DRS_NORMALIZENORMALS` reaches the key for every draw that reads the eye normal.
+///
+/// Lighting reads it, and so does a texgen stage the VS emits that generates
+/// from the normal, lit or not. A draw with neither, or without a vertex
+/// normal, keeps the bit clear so the render state does not fork its shader.
+#[test]
+fn normalize_normals_flag_follows_every_eye_normal_reader() {
+    use mtld3d_types::{D3DRS_LIGHTING, D3DRS_NORMALIZENORMALS};
+    const CAMERASPACENORMAL: u32 = 1 << 16;
+    const CAMERASPACEREFLECTIONVECTOR: u32 = 3 << 16;
+    const SPHEREMAP: u32 = 4 << 16;
+    const CAMERASPACEPOSITION: u32 = 2 << 16;
+    let layout = |flags| FfVsLayout {
+        flags,
+        tex_coord_count: 1,
+        tex_coord_dims: [2, 0, 0, 0, 0, 0, 0, 0],
+        declared_weights_count: 0,
+    };
+    let normal = layout(FfVsLayoutFlags::HAS_NORMAL);
+    let flag = |lighting: u32, tci: u32, layout: FfVsLayout| {
+        let mut ff = FfState::new();
+        ff.set_texture_stage_state(0, D3DTSS_TEXCOORDINDEX as usize, tci);
+        let mut states = rs();
+        states[D3DRS_LIGHTING as usize] = lighting;
+        states[D3DRS_NORMALIZENORMALS as usize] = 1;
+        ff.build_vs_key(&states, layout, 0b1).normalize_normals()
+    };
+    assert!(flag(1, 0, normal), "lit");
+    assert!(!flag(0, 0, normal), "unlit passthru reads no normal");
+    for tci in [CAMERASPACENORMAL, CAMERASPACEREFLECTIONVECTOR, SPHEREMAP] {
+        assert!(
+            flag(0, tci, normal),
+            "unlit texgen {tci:#x} reads the normal"
+        );
+    }
+    assert!(!flag(0, CAMERASPACEPOSITION, normal), "position texgen");
+    assert!(
+        !flag(0, SPHEREMAP, layout(FfVsLayoutFlags::empty())),
+        "no vertex normal"
+    );
+}
+
 #[test]
 fn local_viewer_flag_canonicalizes_on_lighting_and_specular() {
     use mtld3d_types::{D3DRS_LIGHTING, D3DRS_LOCALVIEWER, D3DRS_SPECULARENABLE};

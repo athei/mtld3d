@@ -12,12 +12,13 @@ use mtld3d_types::{
     D3DRS_ALPHAFUNC, D3DRS_ALPHAREF, D3DRS_ALPHATESTENABLE, D3DRS_AMBIENT,
     D3DRS_AMBIENTMATERIALSOURCE, D3DRS_CULLMODE, D3DRS_DIFFUSEMATERIALSOURCE,
     D3DRS_EMISSIVEMATERIALSOURCE, D3DRS_INDEXEDVERTEXBLENDENABLE, D3DRS_LIGHTING,
-    D3DRS_LOCALVIEWER, D3DRS_SPECULARENABLE, D3DRS_VERTEXBLEND, D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV,
-    D3DSAMP_MAGFILTER, D3DSAMP_MINFILTER, D3DTA_ALPHAREPLICATE, D3DTA_DIFFUSE, D3DTA_SPECULAR,
-    D3DTA_TEXTURE, D3DTADDRESS_CLAMP, D3DTADDRESS_WRAP, D3DTEXF_POINT, D3DTOP_MODULATE,
-    D3DTOP_SELECTARG1, D3DTS_PROJECTION, D3DTS_TEXTURE0, D3DTS_VIEW, D3DTS_WORLD, D3DTSS_ALPHAARG1,
-    D3DTSS_ALPHAOP, D3DTSS_COLORARG1, D3DTSS_COLORARG2, D3DTSS_COLOROP, D3DTSS_TEXCOORDINDEX,
-    D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_COUNT2, D3DTTFF_COUNT3, D3DVBF_1WEIGHTS, D3DVECTOR,
+    D3DRS_LOCALVIEWER, D3DRS_NORMALIZENORMALS, D3DRS_SPECULARENABLE, D3DRS_VERTEXBLEND,
+    D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_MAGFILTER, D3DSAMP_MINFILTER, D3DTA_ALPHAREPLICATE,
+    D3DTA_DIFFUSE, D3DTA_SPECULAR, D3DTA_TEXTURE, D3DTADDRESS_CLAMP, D3DTADDRESS_WRAP,
+    D3DTEXF_POINT, D3DTOP_DISABLE, D3DTOP_MODULATE, D3DTOP_SELECTARG1, D3DTS_PROJECTION,
+    D3DTS_TEXTURE0, D3DTS_VIEW, D3DTS_WORLD, D3DTSS_ALPHAARG1, D3DTSS_ALPHAOP, D3DTSS_COLORARG1,
+    D3DTSS_COLORARG2, D3DTSS_COLOROP, D3DTSS_TEXCOORDINDEX, D3DTSS_TEXTURETRANSFORMFLAGS,
+    D3DTTFF_COUNT2, D3DTTFF_COUNT3, D3DVBF_1WEIGHTS, D3DVECTOR,
 };
 
 #[rustfmt::skip]
@@ -753,6 +754,53 @@ fn texture_arg_specular_selects_vertex_color1() {
     );
 }
 
+/// Position, normal, diffuse and specular: the `XYZ | NORMAL | DIFFUSE | SPECULAR` FVF.
+#[repr(C)]
+struct LitSpecularVertex {
+    position: [f32; 3],
+    normal: [f32; 3],
+    diffuse: u32,
+    specular: u32,
+}
+
+#[test]
+fn lit_draw_with_specular_off_passes_vertex_specular_to_a_stage() {
+    // Lighting with SPECULARENABLE off computes no specular term, so oD1 is
+    // the vertex COLOR1, which D3DTA_SPECULAR selects into the cascade.
+    let h = Harness::new();
+    assert_eq!(h.set_render_state(D3DRS_LIGHTING, 1), 0, "lighting on");
+    assert_eq!(
+        h.set_render_state(D3DRS_SPECULARENABLE, 0),
+        0,
+        "specular off"
+    );
+    assert_eq!(
+        h.set_fvf(D3DFVF_XYZ | D3DFVF_NORMAL | D3DFVF_DIFFUSE | D3DFVF_SPECULAR),
+        0,
+        "SetFVF"
+    );
+    h.select_diffuse_stage(0);
+    assert_eq!(
+        h.set_texture_stage_state(0, D3DTSS_COLORARG1, D3DTA_SPECULAR),
+        0,
+        "COLORARG1 = SPECULAR",
+    );
+    let tri = solid_triangle(0).map(|v| LitSpecularVertex {
+        position: [v.x, v.y, v.z],
+        normal: [0.0, 0.0, -1.0],
+        diffuse: 0xFF00_FF00,
+        specular: 0xFFFF_0000,
+    });
+    h.render_once(BLUE, |d| {
+        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &tri), 0, "draw");
+    });
+    assert_eq!(
+        h.read_pixel(320, 280),
+        0xFFFF_0000,
+        "stage selects the lit draw's vertex specular red"
+    );
+}
+
 #[test]
 fn sparse_light_indices_round_trip() {
     // D3D9 lets SetLight / LightEnable address light indices beyond
@@ -1299,6 +1347,16 @@ const CUBE_TEXGEN_NORMALS: [(f32, f32, f32); 4] = [
 /// `faces` is the `D3DCUBEMAP_FACES` index each quadrant must show, in the
 /// order of [`CUBE_TEXGEN_NORMALS`].
 fn assert_cube_texgen_faces(h: &Harness, faces: [usize; 4], context: &str) {
+    assert_scaled_normal_cube_texgen_faces(h, 1.0, faces, context);
+}
+
+/// [`assert_cube_texgen_faces`] with every model normal scaled to length `length`.
+fn assert_scaled_normal_cube_texgen_faces(
+    h: &Harness,
+    length: f32,
+    faces: [usize; 4],
+    context: &str,
+) {
     let mut vertices = Vec::with_capacity(24);
     for ((sx, sy), (nx, ny, nz)) in [(1.0f32, 1.0f32), (1.0, -1.0), (-1.0, 1.0), (-1.0, -1.0)]
         .into_iter()
@@ -1309,9 +1367,9 @@ fn assert_cube_texgen_faces(h: &Harness, faces: [usize; 4], context: &str) {
                 x: f32::midpoint(sx, cx),
                 y: f32::midpoint(sy, cy),
                 z: 0.0,
-                nx,
-                ny,
-                nz,
+                nx: nx * length,
+                ny: ny * length,
+                nz: nz * length,
             });
         }
     }
@@ -1352,6 +1410,46 @@ fn texgen_cube_camera_space_normal_selects_the_face_the_normal_names() {
     let h = Harness::new();
     let _cube = arm_cube_texgen(&h, TCI_CAMERASPACENORMAL);
     assert_cube_texgen_faces(&h, [0, 5, 5, 3], "camera-space normal");
+}
+
+/// CAMERASPACENORMAL under a non-uniform world takes the normal lighting takes.
+///
+/// The world scales z by 4, which leaves the quads (all at z = 0) where they
+/// are. The D3D9 normal matrix, the inverse transpose, divides each normal's z
+/// by 4, so the four quads name +X, -X, +Y and -Y; the plain world matrix
+/// would multiply it by 4 and turn all four to -Z.
+#[test]
+fn texgen_cube_camera_space_normal_uses_the_normal_matrix_under_a_scaled_world() {
+    let h = Harness::new();
+    let _cube = arm_cube_texgen(&h, TCI_CAMERASPACENORMAL);
+    let mut world = IDENTITY;
+    world[10] = 4.0;
+    assert_eq!(h.set_transform(D3DTS_WORLD, &world), 0, "world");
+    assert_cube_texgen_faces(&h, [0, 1, 2, 3], "camera-space normal, world z x4");
+}
+
+/// The reflection vector reflects about the unnormalized normal unless NORMALIZENORMALS is set.
+///
+/// Every model normal has length 2. Reflecting E = (0, 0, 1) about N = 2u
+/// gives E - 8 (E.u) u, so the quads show +X, -Z, -Z and -Y; about the unit u
+/// they show +Z, -X, +Y and +Z. Lighting on or off does not change which
+/// normal the stage reads.
+#[test]
+fn texgen_cube_reflection_vector_renormalizes_only_under_normalizenormals() {
+    let h = Harness::new();
+    let _cube = arm_cube_texgen(&h, TCI_CAMERASPACEREFLECTIONVECTOR);
+    for lighting in [0, 1] {
+        assert_eq!(h.set_render_state(D3DRS_LIGHTING, lighting), 0);
+        for (normalize, faces) in [(0, [0, 5, 5, 3]), (1, [4, 1, 2, 4])] {
+            assert_eq!(h.set_render_state(D3DRS_NORMALIZENORMALS, normalize), 0);
+            assert_scaled_normal_cube_texgen_faces(
+                &h,
+                2.0,
+                faces,
+                &format!("reflection, lighting={lighting} normalizenormals={normalize}"),
+            );
+        }
+    }
 }
 
 // ── Indexed vertex blending past the advertised palette index ──
@@ -1453,6 +1551,110 @@ fn indexed_vertex_blend_bounds_the_palette_at_the_advertised_index() {
             "bone {index} left nothing at the origin"
         );
     }
+}
+
+/// Position, one `D3DCOLOR` blend-index word and a diffuse colour.
+///
+/// The FVF is `D3DFVF_XYZB1 | D3DFVF_LASTBETA_D3DCOLOR | D3DFVF_DIFFUSE`: the
+/// one beta is the packed indices, so the vertex carries no weight.
+#[repr(C)]
+struct ColorIndexVertex {
+    position: [f32; 3],
+    indices: u32,
+    color: u32,
+}
+
+/// Position, one `FLOAT1` blend index and a diffuse colour, through a declaration.
+#[repr(C)]
+struct FloatIndexVertex {
+    position: [f32; 3],
+    index: f32,
+    color: u32,
+}
+
+/// The quarter quad of [`indexed_quad`] with its indices in another vertex format.
+fn quarter_quad<V>(vertex: impl Fn([f32; 3]) -> V) -> [V; 4] {
+    [(-0.25, 0.25), (-0.25, -0.25), (0.25, 0.25), (0.25, -0.25)].map(|(x, y)| vertex([x, y, 0.5]))
+}
+
+/// Indexed blending reads `D3DCOLOR` and `FLOAT` blend indices as palette indices.
+///
+/// Under `D3DVBF_0WEIGHTS` the whole vertex follows the matrix its first index
+/// names. Bone 1 shifts right, bone 3 left, and bone 0 off screen. The
+/// `D3DCOLOR` word 0x00030201 holds the bytes 1, 2, 3, 0 in memory, and the
+/// first of them is the index, so the quad lands right; the colour channel
+/// order would pick 3 and land left. A `FLOAT1` index of 1.0 lands right too.
+#[test]
+fn indexed_vertex_blend_reads_d3dcolor_and_float_blend_indices() {
+    use mtld3d_types::{
+        D3DDECL_END, D3DDECLMETHOD_DEFAULT, D3DDECLTYPE_D3DCOLOR, D3DDECLTYPE_FLOAT1,
+        D3DDECLTYPE_FLOAT3, D3DDECLUSAGE_BLENDINDICES, D3DDECLUSAGE_COLOR, D3DDECLUSAGE_POSITION,
+        D3DFVF_LASTBETA_D3DCOLOR, D3DFVF_XYZB1, D3DVBF_0WEIGHTS, D3DVERTEXELEMENT9,
+    };
+    let h = Harness::new();
+    assert_eq!(h.set_render_state(D3DRS_LIGHTING, 0), 0);
+    assert_eq!(h.set_render_state(D3DRS_CULLMODE, D3DCULL_NONE), 0);
+    for state in [D3DTS_VIEW, D3DTS_PROJECTION] {
+        assert_eq!(h.set_transform(state, &IDENTITY), 0);
+    }
+    assert_eq!(h.set_transform(D3DTS_WORLD, &translate_x(10.0)), 0);
+    assert_eq!(h.set_transform(D3DTS_WORLD + 1, &translate_x(0.5)), 0);
+    assert_eq!(h.set_transform(D3DTS_WORLD + 3, &translate_x(-0.5)), 0);
+    assert_eq!(h.set_render_state(D3DRS_VERTEXBLEND, D3DVBF_0WEIGHTS), 0);
+    assert_eq!(h.set_render_state(D3DRS_INDEXEDVERTEXBLENDENABLE, 1), 0);
+    h.select_diffuse_stage(0);
+    let assert_shifted_right = |context: &str| {
+        assert_eq!(
+            h.read_pixel(480, 240),
+            BLEND_RED,
+            "{context}: bone 1 shifted right"
+        );
+        assert_eq!(h.read_pixel(160, 240), BLUE, "{context}: nothing on bone 3");
+        assert_eq!(
+            h.read_pixel(320, 240),
+            BLUE,
+            "{context}: nothing at the origin"
+        );
+    };
+
+    assert_eq!(
+        h.set_fvf(D3DFVF_XYZB1 | D3DFVF_LASTBETA_D3DCOLOR | D3DFVF_DIFFUSE),
+        0
+    );
+    let packed = quarter_quad(|position| ColorIndexVertex {
+        position,
+        indices: 0x0003_0201,
+        color: BLEND_RED,
+    });
+    h.render_once(BLUE, |d| {
+        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLESTRIP, 2, &packed), 0);
+    });
+    assert_shifted_right("D3DCOLOR indices");
+
+    let element = |offset, type_, usage| D3DVERTEXELEMENT9 {
+        stream: 0,
+        offset,
+        type_,
+        method: D3DDECLMETHOD_DEFAULT,
+        usage,
+        usage_index: 0,
+    };
+    let decl = h.create_vertex_declaration(&[
+        element(0, D3DDECLTYPE_FLOAT3, D3DDECLUSAGE_POSITION),
+        element(12, D3DDECLTYPE_FLOAT1, D3DDECLUSAGE_BLENDINDICES),
+        element(16, D3DDECLTYPE_D3DCOLOR, D3DDECLUSAGE_COLOR),
+        D3DDECL_END,
+    ]);
+    assert_eq!(h.set_vertex_declaration(&decl), 0);
+    let float = quarter_quad(|position| FloatIndexVertex {
+        position,
+        index: 1.0,
+        color: BLEND_RED,
+    });
+    h.render_once(BLUE, |d| {
+        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLESTRIP, 2, &float), 0);
+    });
+    assert_shifted_right("FLOAT1 index");
 }
 
 // ── FF VS source inputs changing between two draws of one frame ──
@@ -1873,5 +2075,101 @@ fn texture_transform_written_before_a_pretransformed_draw_reaches_the_next_trans
         h.read_pixel(480, 240),
         TT_GREEN,
         "the next frame's draw reads the scale as well"
+    );
+}
+
+// ── FF VS coordinates for a programmable PS past the FF chain's end ──
+
+/// Position and one two-component texture coordinate (`D3DFVF_XYZ | D3DFVF_TEX1`).
+#[repr(C)]
+struct PosUvVertex {
+    x: f32,
+    y: f32,
+    z: f32,
+    u: f32,
+    v: f32,
+}
+
+/// The fixed-function VS writes stage 1's coordinate for a pixel shader while stage 1 is DISABLE.
+///
+/// `ps_1_1 { tex t1; mov r0, t1 }` samples a 2x1 red|green texture on stage 1
+/// with POINT filtering and CLAMP addressing, and the FF colour cascade ends at
+/// stage 1, whose `COLOROP` keeps its default `DISABLE`. The stream carries
+/// one coordinate set with u = 0.75, so stage 1 routed to set 0 reads green; a
+/// coordinate left at zero reads the red texel. Generating stage 1's coordinate
+/// from the eye-space position instead puts u = x, so the right quarter reads
+/// green and the left half red.
+#[test]
+fn ff_vs_writes_a_pixel_shader_stage_past_the_first_disabled_stage() {
+    const RED: u32 = 0xFFFF_0000;
+    const GREEN: u32 = 0xFF00_FF00;
+    const PS: &[u32] = &[
+        0xffff_0101,
+        0x0000_0042,
+        0xb00f_0001,
+        0x0000_0001,
+        0x800f_0000,
+        0xb0e4_0001,
+        0x0000_ffff,
+    ];
+    let h = Harness::new();
+    assert_eq!(h.set_render_state(D3DRS_LIGHTING, 0), 0, "lighting off");
+    assert_eq!(h.set_render_state(D3DRS_CULLMODE, D3DCULL_NONE), 0);
+    for state in [D3DTS_WORLD, D3DTS_VIEW, D3DTS_PROJECTION] {
+        assert_eq!(h.set_transform(state, &IDENTITY), 0, "SetTransform");
+    }
+    let tex = h.create_texture(2, 1, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED);
+    tex.lock_rect(0, 0).write_u32_rect(2, 1, &[RED, GREEN]);
+    assert_eq!(h.set_texture(1, &tex), 0, "SetTexture(1)");
+    for (state, value) in [
+        (D3DSAMP_MINFILTER, D3DTEXF_POINT),
+        (D3DSAMP_MAGFILTER, D3DTEXF_POINT),
+        (D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP),
+        (D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP),
+    ] {
+        assert_eq!(h.set_sampler_state(1, state, value), 0, "SetSamplerState");
+    }
+    assert_eq!(
+        h.texture_stage_state(1, D3DTSS_COLOROP),
+        D3DTOP_DISABLE,
+        "stage 1 keeps its default DISABLE"
+    );
+    let shader = h.create_pixel_shader(PS);
+    assert_eq!(h.set_pixel_shader(&shader), 0, "SetPixelShader");
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_TEX1), 0, "SetFVF");
+    let quad = TEXGEN_CORNERS.map(|(x, y)| PosUvVertex {
+        x,
+        y,
+        z: 0.5,
+        u: 0.75,
+        v: 0.5,
+    });
+
+    assert_eq!(h.set_texture_stage_state(1, D3DTSS_TEXCOORDINDEX, 0), 0);
+    h.render_once(BLUE, |d| {
+        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad), 0, "draw");
+    });
+    for x in [80, 560] {
+        assert_pixel_approx(h.read_pixel(x, 240), GREEN, 2, "stage 1 routed to set 0");
+    }
+
+    assert_eq!(
+        h.set_texture_stage_state(1, D3DTSS_TEXCOORDINDEX, TCI_CAMERASPACEPOSITION),
+        0
+    );
+    h.render_once(BLUE, |d| {
+        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad), 0, "draw");
+    });
+    assert_pixel_approx(
+        h.read_pixel(560, 240),
+        GREEN,
+        2,
+        "stage 1 generated from x = 0.75",
+    );
+    assert_pixel_approx(
+        h.read_pixel(80, 240),
+        RED,
+        2,
+        "stage 1 generated from x = -0.75",
     );
 }

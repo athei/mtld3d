@@ -17,6 +17,7 @@ bitflags::bitflags! {
         const INTEGER = 2;
         const BOOLEAN = 4;
         const BUMP_ENV = 8;
+        const LINKED_INPUTS = 16;
     }
 }
 
@@ -57,6 +58,15 @@ pub struct ProgrammablePsSource {
 }
 
 impl ProgrammablePsSource {
+    /// Whether the shader reads an input semantic the vertex shader must output by name.
+    #[must_use]
+    pub const fn reads_linked_inputs(&self) -> bool {
+        self.flags.contains(ShaderSourceFlags::LINKED_INPUTS)
+    }
+    #[must_use]
+    pub const fn uses_rel_const(&self) -> bool {
+        self.flags.contains(ShaderSourceFlags::RELATIVE)
+    }
     #[must_use]
     pub const fn uses_bump_env(&self) -> bool {
         self.flags.contains(ShaderSourceFlags::BUMP_ENV)

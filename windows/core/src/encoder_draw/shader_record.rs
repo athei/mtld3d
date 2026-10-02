@@ -191,7 +191,7 @@ packed_fields!(crate::dxso::FfStage;
 packed_fields!(crate::dxso::FfPsKey; stages:56, specular_add:1, tt_projected_mask:1);
 packed_fields!(crate::dxso::VsSamplerKinds; volume_mask:1, cube_mask:1);
 packed_fields!(crate::dxso::VariantKey;
-    alpha_func:1, fog_mode:1, fog_table_mode:1, reserved:1, depth_sampler_mask:2,
+    alpha_func:1, fog_mode:1, fog_table_mode:1, linked_input_mask:1, depth_sampler_mask:2,
     depth_fetch_mask:2, fetch4_mask:2, fetch4_alpha_mask:2, raw_depth_red_mask:2,
     volume_sampler_mask:2, cube_sampler_mask:2, tt_projected_mask:1, color_out_mask:1,
     sample_mask:1, flags:1);

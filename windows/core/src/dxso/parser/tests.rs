@@ -97,9 +97,11 @@ fn parse_minimal_vs_passthrough() {
             usage,
             usage_index,
             reg,
+            mask,
         } => {
             assert_eq!(usage, DeclUsage::Position);
             assert_eq!(usage_index, 0);
+            assert_eq!(mask, WriteMask::ALL);
             assert_eq!(reg.kind, RegKind::Input);
             assert_eq!(reg.index, 0);
         }
@@ -408,6 +410,7 @@ fn parse_sm_3_0_vs_with_named_output() {
                 usage,
                 usage_index,
                 reg,
+                ..
             } if reg.kind == RegKind::Output => Some((*usage, *usage_index, reg.index)),
             _ => None,
         })

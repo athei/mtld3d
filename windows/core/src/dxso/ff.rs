@@ -45,7 +45,26 @@ use mtld3d_types::{
 use super::emit::{
     VariantFlags, VariantKey, fog_blend_active, write_fog_blend, write_point_sprite_prologue,
 };
-use crate::ff_state::MAX_VERTEX_BLEND_MATRIX_INDEX;
+
+/// First FF VS constant row of the world-matrix palette.
+///
+/// Every section below it has a fixed row range (`FfVsDirty` in `ff_state`
+/// names each one); the palette runs from here to the end of the constant
+/// block, four rows per matrix, and the emitted FF VS reads it as
+/// `vs_c + FF_VS_PALETTE_BASE_ROW + idx * 4`. Declared here because the
+/// emitted MSL depends on it, so the emitter fingerprint covers it.
+pub const FF_VS_PALETTE_BASE_ROW: u16 = 95;
+
+/// Highest `D3DTS_WORLDMATRIX(i)` index a draw can read through vertex blending.
+///
+/// The encoder binds 256 FF VS constant rows (`CONSTANT_ROWS` in the `d3d9`
+/// crate, which asserts that its mirror still holds this index), so rows
+/// 95..=255 carry 40 whole matrices and 39 is the last index whose four rows
+/// are inside the block. `caps::fill` reports it as
+/// `D3DCAPS9::MaxVertexBlendMatrixIndex`, so a title that sizes its bone
+/// palette from the cap never asks for a matrix the layout has no rows for.
+/// The emitted FF VS clamps a blend index to it.
+pub const MAX_VERTEX_BLEND_MATRIX_INDEX: u32 = 39;
 
 // The FF emitter stores D3D9 texture-op / texture-arg / compare-func codes in
 // `u8` cache-key fields and matches on them; the canonical `mtld3d_types`
@@ -86,7 +105,8 @@ bitflags::bitflags! {
         /// `D3DRS_SPECULARENABLE`.
         ///
         /// Gates per-light Blinn-Phong specular emission into `color1`; when
-        /// clear, `color1` receives `saturate(float4(0.0))`.
+        /// clear, a lit `color1` is the vertex specular colour, or zero
+        /// without one.
         const SPECULAR_ENABLE = 1 << 6;
         /// `D3DRS_INDEXEDVERTEXBLENDENABLE`: the world-matrix index source.
         ///
@@ -118,10 +138,11 @@ bitflags::bitflags! {
         const USES_VERTEX_DECL = 1 << 11;
         /// `D3DRS_NORMALIZENORMALS` is enabled.
         ///
-        /// The FF VS then renormalizes the eye-space normal after the
-        /// inverse-transpose transform; when clear (the D3D9 default) the
-        /// transformed normal keeps its magnitude, so a non-unit model normal
-        /// scales the lighting.
+        /// The FF VS then renormalizes the eye-space normal that lighting and
+        /// texgen share; when clear (the D3D9 default) the transformed normal
+        /// keeps its magnitude, so a non-unit normal scales the lighting and
+        /// the generated coordinates. Canonicalized at key build: only set
+        /// when something reads the normal.
         const NORMALIZE_NORMALS = 1 << 12;
         /// Vertex declaration has a PSIZE element (`D3DFVF_PSIZE`).
         ///
@@ -155,11 +176,11 @@ pub struct FfVsKey {
     pub input_tex_coord_count: u8,
     /// Number of per-stage texcoord *varyings* the VS emits for the PS to sample.
     ///
-    /// Inflated above `input_tex_coord_count` when PS texture stages are
-    /// active without matching vertex-stream texcoords — the VS still needs to
-    /// emit an output for each active stage so the PS can read it, but the
-    /// passthru reads fall back to `float4(0,0,0,1)` for coord-set indices
-    /// outside `input_tex_coord_count`.
+    /// Covers every stage whose TCI generates a coordinate or routes a set
+    /// the stream carries, whatever its `COLOROP`, since a programmable PS
+    /// samples the stages it names. Inflated above `input_tex_coord_count`
+    /// by such a stage, and by an active textured stage with no matching
+    /// vertex-stream texcoords, whose passthru read falls back to zero.
     pub tex_coord_count: u8,
     /// Bit `i` set iff slot `i`'s `D3DLIGHT9` contributes to FF VS shading.
     ///
@@ -581,14 +602,30 @@ pub fn emit_vs_ff_named(vs_key: &FfVsKey, entry: &str) -> String {
     emit_varyings(&mut out, false, vs_key.clip_plane_count);
     out.push_str(super::emit::POS_FIXUP_MSL);
     out.push_str(crate::vs_draw::VS_DRAW_MSL);
-    if vs_key.lighting_enabled() && vs_key.has_normal() {
+    if reads_eye_normal(vs_key) && vs_key.vertex_blend_count == 0 {
         emit_normal_matrix_helpers(&mut out);
     }
     emit_vs(&mut out, vs_key, entry);
     out
 }
 
-/// Emit the generalised cross product the lit FF VS builds its normal matrix from.
+/// Whether the FF VS reads the eye-space normal `n`.
+///
+/// Its readers are lighting with an active light, for the diffuse N.L term
+/// and the specular half-angle, and the CAMERASPACENORMAL,
+/// CAMERASPACEREFLECTIONVECTOR and SPHEREMAP texgen modes of an emitted
+/// stage. All of them need a vertex normal, and a pre-transformed vertex has
+/// neither lighting nor texgen.
+fn reads_eye_normal(vs: &FfVsKey) -> bool {
+    let active = usize::from(vs.tex_coord_count).min(8);
+    let texgen_reads_normal = vs.tci_modes[..active]
+        .iter()
+        .any(|&m| matches!(m, 1 | 3 | 4));
+    let lit_reads_normal = vs.lighting_enabled() && vs.light_active_mask != 0;
+    vs.has_normal() && !vs.has_rhw() && (texgen_reads_normal || lit_reads_normal)
+}
+
+/// Emit the generalised cross product the FF VS builds its normal matrix from.
 ///
 /// `mtld3d_cross4(u, v, w)` is the 4-vector `x` with `dot(x, t) ==
 /// det(float4x4(u, v, w, t))` for every `t` (the columns in that order), so it
@@ -651,8 +688,10 @@ fn emit_vertex_in(out: &mut String, vs: &FfVsKey) {
     if vs.vertex_blend_count > 0 && vs.declared_weights_count > 0 {
         out.push_str("    float4 blend_weight [[attribute(12)]];\n");
     }
+    // Read as floats whatever the declared type, which Metal converts every
+    // vertex format into; `emit_vertex_blend` rounds each lane to an index.
     if vs.vertex_blend_count > 0 && vs.declared_indices() {
-        out.push_str("    uint4 blend_indices [[attribute(13)]];\n");
+        out.push_str("    float4 blend_indices [[attribute(13)]];\n");
     }
     // Per-vertex point size (`D3DFVF_PSIZE`), a FLOAT1 the descriptor
     // zero-pads; only `.x` is read.
@@ -780,7 +819,7 @@ fn emit_point_size(out: &mut String, vs: &FfVsKey, scale: bool) {
 ///
 /// Sourced from the per-bone pre-multiplied
 /// `transpose(world_palette[i] × view)` matrices packed at
-/// `vs_c[95 + bone*4 .. 95 + bone*4 + 4]` by `ff_state::build_vs_constants`.
+/// `vs_c[FF_VS_PALETTE_BASE_ROW + bone*4 ..][..4]` by `ff_state::build_vs_constants`.
 ///
 /// Position formula (K = `vertex_blend_count`):
 ///
@@ -793,10 +832,14 @@ fn emit_point_size(out: &mut String, vs: &FfVsKey, scale: bool) {
 ///
 /// Index source:
 /// - Indexed mode (`vertex_blend_indexed = true`): `idx[i] = in.blend_indices[i]`,
-///   clamped to [`MAX_VERTEX_BLEND_MATRIX_INDEX`]. D3D9 leaves a `BLENDINDICES`
-///   value above `MaxVertexBlendMatrixIndex` undefined, and the palette only
-///   reaches that far, so the clamp is what keeps the read inside the bound
-///   constant block: one `min` per index, and every in-range index unchanged.
+///   rounded to the nearest integer and clamped to
+///   [`MAX_VERTEX_BLEND_MATRIX_INDEX`]. The lanes arrive as floats from any
+///   declared type: a `UBYTE4` index is its byte value, as is a `D3DCOLOR`
+///   one, which the descriptor feeds as bytes in memory order, and a `FLOAT`
+///   index is its own value. D3D9 leaves a `BLENDINDICES` value above
+///   `MaxVertexBlendMatrixIndex` undefined, and the palette only reaches that
+///   far, so the clamp is what keeps the read inside the bound constant
+///   block, and every in-range index is unchanged.
 /// - Sequential mode: `idx[i] = i` (matrices come from `world_palette[0..K]`),
 ///   already inside the cap since K is at most `D3DVBF_3WEIGHTS + 1`.
 ///
@@ -820,9 +863,12 @@ fn emit_vertex_blend(out: &mut String, vs: &FfVsKey, needs_normal: bool) {
         out.push_str("    {\n");
         let _ = writeln!(
             out,
-            "        uint idx = min(in.blend_indices[0], {MAX_VERTEX_BLEND_MATRIX_INDEX}u);"
+            "        uint idx = uint(clamp(rint(in.blend_indices[0]), 0.0, {MAX_VERTEX_BLEND_MATRIX_INDEX}.0));"
         );
-        out.push_str("        constant float4 *m = vs_c + 95 + idx * 4u;\n");
+        let _ = writeln!(
+            out,
+            "        constant float4 *m = vs_c + {FF_VS_PALETTE_BASE_ROW} + idx * 4u;"
+        );
         out.push_str(
             "        pos_view = float4(dot(pos, m[0]), dot(pos, m[1]), dot(pos, m[2]), dot(pos, m[3]));\n",
         );
@@ -844,12 +890,15 @@ fn emit_vertex_blend(out: &mut String, vs: &FfVsKey, needs_normal: bool) {
         if indexed {
             let _ = writeln!(
                 out,
-                "        uint idx = min(in.blend_indices[{i}], {MAX_VERTEX_BLEND_MATRIX_INDEX}u);"
+                "        uint idx = uint(clamp(rint(in.blend_indices[{i}]), 0.0, {MAX_VERTEX_BLEND_MATRIX_INDEX}.0));"
             );
         } else {
             let _ = writeln!(out, "        uint idx = {i}u;");
         }
-        out.push_str("        constant float4 *m = vs_c + 95 + idx * 4u;\n");
+        let _ = writeln!(
+            out,
+            "        constant float4 *m = vs_c + {FF_VS_PALETTE_BASE_ROW} + idx * 4u;"
+        );
         out.push_str(
             "        pos_view += w * float4(dot(pos, m[0]), dot(pos, m[1]), dot(pos, m[2]), dot(pos, m[3]));\n",
         );
@@ -866,15 +915,17 @@ fn emit_vertex_blend(out: &mut String, vs: &FfVsKey, needs_normal: bool) {
     if indexed {
         let _ = writeln!(
             out,
-            "        uint idx = min(in.blend_indices[{last}], {MAX_VERTEX_BLEND_MATRIX_INDEX}u);"
+            "        uint idx = uint(clamp(rint(in.blend_indices[{last}]), 0.0, {MAX_VERTEX_BLEND_MATRIX_INDEX}.0));"
         );
     } else {
         let _ = writeln!(out, "        uint idx = {last}u;");
     }
-    // World-matrix palette base is row 95 (same as the explicit-weight loop and
-    // the K=1 indexed path, and the encoder's upload base in `ff_state`); the
-    // implicit last-weight contribution reads from the same row-95 base.
-    out.push_str("        constant float4 *m = vs_c + 95 + idx * 4u;\n");
+    // The implicit last-weight contribution reads the same palette base as
+    // the explicit-weight loop and the K=1 indexed path.
+    let _ = writeln!(
+        out,
+        "        constant float4 *m = vs_c + {FF_VS_PALETTE_BASE_ROW} + idx * 4u;"
+    );
     out.push_str(
         "        pos_view += w * float4(dot(pos, m[0]), dot(pos, m[1]), dot(pos, m[2]), dot(pos, m[3]));\n",
     );
@@ -1080,21 +1131,11 @@ fn emit_vs(out: &mut String, vs: &FfVsKey, entry: &str) {
     // and each declared only where something reads it. Declared anywhere
     // else it is a local nothing reads, which Metal's compiler warns about.
     //
-    // The eye-space normal: lighting reads it for the diffuse N.L term and
-    // for the specular half-angle, both of which sit inside the per-light
-    // block, so an enabled lighting branch with no active slot reads
-    // neither. Texgen reads it for the reflection vector of
-    // CAMERASPACEREFLECTIONVECTOR and of SPHEREMAP; CAMERASPACENORMAL reads
-    // the separately declared, un-normalized `n_texgen` instead. All of them
-    // need a vertex normal, without which the emitter takes a normal-less
-    // arm.
+    // The eye-space normal `n` is one value for lighting and texgen alike
+    // (`reads_eye_normal` names its readers); without a vertex normal the
+    // emitter takes a normal-less arm.
     let active = vs.tex_coord_count as usize;
-    let texgen_reads_normal = vs.tci_modes[..active].iter().any(|&m| m == 3 || m == 4);
-    let lit_reads_normal = vs.lighting_enabled() && vs.light_active_mask != 0;
-    let needs_normal = vs.has_normal() && (texgen_reads_normal || lit_reads_normal);
-    // The un-normalized texgen normal, read by a CAMERASPACENORMAL stage
-    // alone (its declaration site is below the lighting branch).
-    let needs_texgen_normal = vs.has_normal() && vs.tci_modes[..active].contains(&1);
+    let needs_normal = reads_eye_normal(vs);
     // The specular material power and view vector `V`: their readers are the
     // half-angle and the power term inside the per-light block, so they need
     // an active light slot as much as they need a normal.
@@ -1130,9 +1171,9 @@ fn emit_vs(out: &mut String, vs: &FfVsKey, entry: &str) {
     // reflection-style same-shader-twice scenarios.
     out.push_str("    float4 pos = float4(in.v0.xyz, 1.0);\n");
     if blended {
-        // `n_blend` has two readers, the eye normal and the texgen normal,
-        // and the accumulation that feeds it costs a multiply-add per bone.
-        emit_vertex_blend(out, vs, needs_normal || needs_texgen_normal);
+        // The accumulation that feeds `n_blend` costs a multiply-add per
+        // bone, so it runs only for a shader that reads the eye normal.
+        emit_vertex_blend(out, vs, needs_normal);
     } else {
         out.push_str(
             "    float4 pos_view = float4(dot(pos, vs_c[0]), dot(pos, vs_c[1]), dot(pos, vs_c[2]), dot(pos, vs_c[3]));\n",
@@ -1167,17 +1208,43 @@ fn emit_vs(out: &mut String, vs: &FfVsKey, entry: &str) {
         }
     }
 
-    // TCI pre-scan: a stage that reads the eye-space normal or position with
-    // lighting off has no lighting branch to declare it, so it is declared
-    // here instead. The lighting branch owns both whenever lighting is
-    // enabled and something reads them.
-    if needs_normal && !vs.lighting_enabled() {
+    // The eye-space normal, shared by lighting and texgen. A blended vertex
+    // takes the weighted sum of its bones' normals, which `emit_vertex_blend`
+    // accumulated through the 3x3 block of each palette x view matrix. A
+    // single matrix takes the D3D9 normal matrix, the upper-left 3x3 block
+    // of inverse(WV). For an affine WV that is the inverse of its own 3x3
+    // block, so a pure rotation R gives R·n (the direction the position
+    // transform gives), a uniform scale s gives R·n / s, and shear is
+    // handled. The block is taken from the FULL 4x4 inverse because a
+    // projective WV (a non-trivial fourth column) changes it; `vs_c[0..3]`
+    // are the columns of WV (the rows of transpose(WV)), and row i of
+    // adj(WV) is the generalised cross product of the other three columns,
+    // with the sign of the cyclic permutation that brings column i to the
+    // front. Computed inline to avoid a separate constant slot. A singular
+    // WV has no inverse and is used unchanged, as the fixed-function
+    // pipeline does. D3D9 renormalizes only when D3DRS_NORMALIZENORMALS is
+    // set, lit or not, so a non-unit normal otherwise scales the lighting
+    // and the generated coordinates.
+    if needs_normal {
         if blended {
-            out.push_str("    float3 n = normalize(n_blend);\n");
+            out.push_str("    float3 n = n_blend;\n");
         } else {
-            out.push_str("    float3 n = normalize(float3(dot(in.v1.xyz, vs_c[0].xyz), dot(in.v1.xyz, vs_c[1].xyz), dot(in.v1.xyz, vs_c[2].xyz)));\n");
+            out.push_str("    float4 nadj0 = -mtld3d_cross4(vs_c[1], vs_c[2], vs_c[3]);\n");
+            out.push_str("    float4 nadj1 = mtld3d_cross4(vs_c[2], vs_c[3], vs_c[0]);\n");
+            out.push_str("    float4 nadj2 = -mtld3d_cross4(vs_c[3], vs_c[0], vs_c[1]);\n");
+            out.push_str("    float nwvdet = dot(nadj0, vs_c[0]);\n");
+            out.push_str("    float3 n = (abs(nwvdet) > 1e-12)\n");
+            out.push_str("        ? float3(dot(nadj0.xyz, in.v1.xyz), dot(nadj1.xyz, in.v1.xyz), dot(nadj2.xyz, in.v1.xyz)) / nwvdet\n");
+            out.push_str("        : float3(dot(float3(vs_c[0].x, vs_c[1].x, vs_c[2].x), in.v1.xyz), dot(float3(vs_c[0].y, vs_c[1].y, vs_c[2].y), in.v1.xyz), dot(float3(vs_c[0].z, vs_c[1].z, vs_c[2].z), in.v1.xyz));\n");
+        }
+        if vs.normalize_normals() {
+            out.push_str("    n = normalize(n);\n");
         }
     }
+    // TCI pre-scan: a stage that reads the eye-space position with lighting
+    // off has no lighting branch to declare it, so it is declared here
+    // instead. The lighting branch owns it whenever lighting is enabled and
+    // something reads it.
     if needs_pos_eye && !vs.lighting_enabled() {
         if blended {
             out.push_str("    float3 posEye = pos_view.xyz;\n");
@@ -1204,49 +1271,17 @@ fn emit_vs(out: &mut String, vs: &FfVsKey, entry: &str) {
         let mat_specular = resolve_mat(vs.specular_source, 12, mat_flags);
         let mat_emissive = resolve_mat(vs.emissive_source, 13, mat_flags);
         if blended {
-            // Blended-WV path: `n_blend` and `pos_view` are accumulated in
+            // Blended-WV path: `pos_view` is accumulated in
             // `emit_vertex_blend` from the per-bone palette × view matrices.
             if needs_pos_eye {
                 out.push_str("    float3 posEye = pos_view.xyz;\n");
             }
-            if needs_normal {
-                out.push_str("    float3 n = normalize(n_blend);\n");
-            }
         } else {
-            // Single-WV path: top-3x3 of transposed WorldView at vs_c[0..2].
-            // Eye-space position (needs only `pos`) for point-light vectors and
-            // specular half-angle. `vs_c[0..2]` hold full rows of transpose(WV)
-            // including translation.
+            // Single-WV path: eye-space position (needs only `pos`) for
+            // point-light vectors and the local viewer. `vs_c[0..2]` hold full
+            // rows of transpose(WV) including translation.
             if needs_pos_eye {
                 out.push_str("    float3 posEye = float3(dot(pos, vs_c[0]), dot(pos, vs_c[1]), dot(pos, vs_c[2]));\n");
-            }
-            if needs_normal {
-                // The eye normal is the model normal (a column vector) times
-                // the D3D9 normal matrix: the upper-left 3x3 block of
-                // inverse(WV). For an affine WV that is the inverse of its
-                // own 3x3 block, so a pure rotation R gives R·n (the direction
-                // the position transform gives), a uniform scale s gives
-                // R·n / s, and shear is handled. The block is taken from the
-                // FULL 4x4 inverse because a projective WV (a non-trivial
-                // fourth column) changes it; `vs_c[0..3]` are the columns of
-                // WV (the rows of transpose(WV)), and row i of adj(WV) is the
-                // generalised cross product of the other three columns, with
-                // the sign of the cyclic permutation that brings column i to
-                // the front. Computed inline to avoid a separate constant
-                // slot. A singular WV has no inverse and is used unchanged,
-                // as the fixed-function pipeline does. D3D9 only renormalizes
-                // when D3DRS_NORMALIZENORMALS is set, so an un-renormalized
-                // non-unit model normal otherwise scales the lighting.
-                out.push_str("    float4 nadj0 = -mtld3d_cross4(vs_c[1], vs_c[2], vs_c[3]);\n");
-                out.push_str("    float4 nadj1 = mtld3d_cross4(vs_c[2], vs_c[3], vs_c[0]);\n");
-                out.push_str("    float4 nadj2 = -mtld3d_cross4(vs_c[3], vs_c[0], vs_c[1]);\n");
-                out.push_str("    float nwvdet = dot(nadj0, vs_c[0]);\n");
-                out.push_str("    float3 n = (abs(nwvdet) > 1e-12)\n");
-                out.push_str("        ? float3(dot(nadj0.xyz, in.v1.xyz), dot(nadj1.xyz, in.v1.xyz), dot(nadj2.xyz, in.v1.xyz)) / nwvdet\n");
-                out.push_str("        : float3(dot(float3(vs_c[0].x, vs_c[1].x, vs_c[2].x), in.v1.xyz), dot(float3(vs_c[0].y, vs_c[1].y, vs_c[2].y), in.v1.xyz), dot(float3(vs_c[0].z, vs_c[1].z, vs_c[2].z), in.v1.xyz));\n");
-                if vs.normalize_normals() {
-                    out.push_str("    n = normalize(n);\n");
-                }
             }
         }
         if lit_specular {
@@ -1266,7 +1301,9 @@ fn emit_vs(out: &mut String, vs: &FfVsKey, entry: &str) {
             out,
             "    float4 diffuseAccum = {mat_emissive} + vs_c[9] * {mat_ambient};"
         );
-        out.push_str("    float3 specAccum = float3(0.0);\n");
+        if vs.specular_enable() {
+            out.push_str("    float3 specAccum = float3(0.0);\n");
+        }
         // Walk active light slots via the bitmask (1 bit per slot, MSB→LSB
         // order is irrelevant since each iteration emits an independent
         // accumulation block). The per-light DIRECTIONAL/SPOT/POINT branch
@@ -1370,7 +1407,15 @@ fn emit_vs(out: &mut String, vs: &FfVsKey, entry: &str) {
         out.push_str("    float4 lit = saturate(diffuseAccum);\n");
         let _ = writeln!(out, "    lit.a = {mat_diffuse}.a;");
         out.push_str("    out.color0 = lit;\n");
-        out.push_str("    out.color1 = float4(saturate(specAccum), 0.0);\n");
+        if vs.specular_enable() {
+            out.push_str("    out.color1 = float4(saturate(specAccum), 0.0);\n");
+        } else if vs.has_color1() {
+            // With specular lighting off, oD1 is the vertex specular colour,
+            // as on the unlit path.
+            out.push_str("    out.color1 = in.v3;\n");
+        } else {
+            out.push_str("    out.color1 = float4(0.0);\n");
+        }
     } else {
         if vs.has_color0() {
             out.push_str("    out.color0 = in.v2;\n");
@@ -1385,18 +1430,6 @@ fn emit_vs(out: &mut String, vs: &FfVsKey, entry: &str) {
             out.push_str("    out.color1 = in.v3;\n");
         } else {
             out.push_str("    out.color1 = float4(0.0);\n");
-        }
-    }
-
-    // Un-normalized eye-space normal for CAMERASPACENORMAL texgen. D3D9 does
-    // NOT normalize generated texture coordinates (that is only done for
-    // lighting, and only under D3DRS_NORMALIZENORMALS), so this is distinct
-    // from the normalized `n` the lighting branch declares.
-    if needs_texgen_normal {
-        if vs.vertex_blend_count > 0 {
-            out.push_str("    float3 n_texgen = n_blend;\n");
-        } else {
-            out.push_str("    float3 n_texgen = float3(dot(in.v1.xyz, vs_c[0].xyz), dot(in.v1.xyz, vs_c[1].xyz), dot(in.v1.xyz, vs_c[2].xyz));\n");
         }
     }
 
@@ -1425,7 +1458,7 @@ fn emit_vs(out: &mut String, vs: &FfVsKey, entry: &str) {
             }
             1 if vs.has_normal() => {
                 n = 3;
-                let _ = writeln!(out, "    float4 raw{i} = float4(n_texgen, 0.0);");
+                let _ = writeln!(out, "    float4 raw{i} = float4(n, 0.0);");
             }
             2 => {
                 n = 3;
@@ -1529,16 +1562,15 @@ fn emit_vs(out: &mut String, vs: &FfVsKey, entry: &str) {
         let _ = writeln!(out, "    out.texcoord{i} = float4(0.0);");
     }
 
-    // Vertex fog factor (linear / exp / exp2). Eye-space Z from vs_c[2]
-    // (row 2 of transpose(WV), full 4 components including translation) so
-    // `dot(pos, vs_c[2])` is the eye-space Z coordinate of the vertex. Fog
+    // Vertex fog factor (linear / exp / exp2) from the eye-space vertex,
+    // `pos_view`, which already includes the world/view transforms and any
+    // sequential or indexed vertex blending, before projection. Without
+    // blending its `.z` is `dot(pos, vs_c[2])`, row 2 of transpose(WV). Fog
     // params live at vs_c[8] (see the layout comment above).
     let fog_coordinate = if vs.flags.contains(FfVsFlags::RANGE_FOG) {
-        // pos_view already includes the world/view transforms and any
-        // sequential or indexed vertex blending, before projection.
         "        float eyeZ = length(pos_view.xyz);\n"
     } else {
-        "        float eyeZ = abs(dot(pos, vs_c[2]));\n"
+        "        float eyeZ = abs(pos_view.z);\n"
     };
     match vs.fog_mode {
         1 => {
@@ -1808,9 +1840,22 @@ fn emit_ps(out: &mut String, ps: &FfPsKey, variant: VariantKey, entry: &str) {
                     "    float4 t{i} = float4(s{i}.sample(samp{i}, {uv}, level(0)){fill});"
                 );
             } else if (variant.depth_sampler_mask & (1u16 << i)) != 0 {
+                // D3DTTFF_PROJECTED divides the reference depth by `.w` along
+                // with the coordinate, the projective shadow-map lookup; `.w
+                // == 0` reads the origin against a zero reference, as the
+                // colour path reads the origin.
+                let coord = if (ps.tt_projected_mask & (1u8 << i)) != 0 {
+                    let _ = writeln!(
+                        out,
+                        "    float3 proj{i} = in.texcoord{i}.w != 0.0 ? in.texcoord{i}.xyz / in.texcoord{i}.w : float3(0.0);"
+                    );
+                    format!("proj{i}")
+                } else {
+                    format!("in.texcoord{i}")
+                };
                 let _ = writeln!(
                     out,
-                    "    float4 t{i} = float4(s{i}.sample_compare(samp{i}, in.texcoord{i}.xy, saturate(in.texcoord{i}.z), level(0)));",
+                    "    float4 t{i} = float4(s{i}.sample_compare(samp{i}, {coord}.xy, saturate({coord}.z), level(0)));",
                 );
             } else {
                 // D3DTTFF_PROJECTED: divide the coordinate by `.w` before

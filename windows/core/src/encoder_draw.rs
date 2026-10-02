@@ -710,7 +710,7 @@ fn read_variant(reader: &mut SnapshotReader<'_>) -> Result<VariantKey, WireError
     let record: &VariantRecord = borrow_record(reader)?;
     #[cfg(debug_assertions)]
     if record.reserved != [0; 2]
-        || record.key.reserved != 0
+        || record.key.linked_input_mask != 0
         || crate::dxso::VariantFlags::from_bits(record.key.flags.bits()).is_none()
     {
         return Err(WireError::InvalidValue);

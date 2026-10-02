@@ -18,9 +18,12 @@ use mtld3d_core::{
     config::Mtld3dConfig,
     convert::{FAN_PATTERN_MAX_TRIANGLES, fan_pattern_bytes, fill_fan_pattern_u16},
     depth_stencil_state::{DepthStencilSnapshot, description_from_snapshot, key_from_snapshot},
-    dxso::{DxsoProgram, declared_ps_samplers},
+    draw_data::VsSourceView,
+    dxso::{
+        DxsoProgram, FF_VS_PALETTE_BASE_ROW, LinkInputs, MAX_VERTEX_BLEND_MATRIX_INDEX,
+        SemanticSet, declared_ps_samplers,
+    },
     encoder_packet::NativeVbibRetention,
-    ff_state::{FF_VS_PALETTE_BASE_ROW, MAX_VERTEX_BLEND_MATRIX_INDEX},
     format::map_d3d_format,
     gpu_caps::GpuCaps,
     guest_pages::GuestOwnedPage,
@@ -982,6 +985,17 @@ pub struct FrameEncoder {
     /// Read on every programmable draw into a scaled target: only such a
     /// shader takes the render-scale variant and its `PsDraw` uniform.
     prog_reads_vpos: FxHashSet<ProgramId>,
+    /// The extra input semantics of each `ps_3_0` that reads one.
+    ///
+    /// Read only by a draw whose pixel shader record carries
+    /// `ShaderSourceFlags::LINKED_INPUTS`, to build its
+    /// `VariantKey::linked_input_mask`.
+    prog_link_inputs: FxHashMap<ProgramId, LinkInputs>,
+    /// The extra output semantics of each `vs_3_0` that declares one.
+    ///
+    /// The other half of `linked_input_mask`: a vertex shader with no entry
+    /// outputs none, which every fixed-function, SM1 and SM2 one shares.
+    prog_link_outputs: FxHashMap<ProgramId, SemanticSet>,
     /// Compiled `MTLLibrary` handles keyed by content hash (`disk_key`).
     ///
     /// One entry per unique shader source; a single shader compiled
@@ -1540,6 +1554,8 @@ impl FrameEncoder {
             program_cache: FxHashMap::default(),
             prog_sampler_decls: FxHashMap::default(),
             prog_reads_vpos: FxHashSet::default(),
+            prog_link_inputs: FxHashMap::default(),
+            prog_link_outputs: FxHashMap::default(),
             lib_cache: FxHashMap::default(),
             libraries: compile::libraries::StageLibraries::default(),
             texture_cache: FxHashMap::default(),
@@ -5043,11 +5059,17 @@ impl FrameEncoder {
     /// The maximum `start_row + rows` seen across every
     /// `Op::SetVsConstRange` applied. `emit_draw` uses this for shaders
     /// that bind constants via relative addressing (`c[a0.x + N]`), where
-    /// the static-analysis bound from `max_const_used` would truncate. PS
-    /// has no equivalent because D3D9 PS doesn't support relative-addressed
-    /// constants in any profile we ship.
+    /// the static-analysis bound from `max_const_used` would truncate.
     pub const fn vs_constants_populated_rows(&self) -> u16 {
         self.vs_constants_populated_rows
+    }
+
+    /// Populated-row high-watermark of the encoder-side PS mirror.
+    ///
+    /// The pixel-side twin of [`Self::vs_constants_populated_rows`], for
+    /// `ps_3_0` shaders that read `c[aL + N]` inside a `loop`.
+    pub const fn ps_constants_populated_rows(&self) -> u16 {
+        self.ps_constants_populated_rows
     }
 
     /// Change the native triangle fill state without adding a pipeline variant.
@@ -5238,9 +5260,35 @@ impl FrameEncoder {
         if program.reads_vpos() {
             self.prog_reads_vpos.insert(shader_id);
         }
+        let inputs = LinkInputs::ps_inputs(&program);
+        if !inputs.is_empty() {
+            self.prog_link_inputs.insert(shader_id, inputs);
+        }
+        let outputs = SemanticSet::vs_outputs(&program);
+        if !outputs.is_empty() {
+            self.prog_link_outputs.insert(shader_id, outputs);
+        }
         self.program_cache
             .entry(shader_id)
             .or_insert_with(|| Arc::new(program));
+    }
+
+    /// Which extra input semantics of the pixel shader `ps_id` the vertex shader `vs` outputs.
+    ///
+    /// The `VariantKey::linked_input_mask` of a draw pairing them: zero for a
+    /// pixel shader with no extra input and for a vertex shader with no extra
+    /// output, fixed-function ones included.
+    pub fn linked_input_mask(&self, ps_id: ProgramId, vs: VsSourceView<'_>) -> u8 {
+        let VsSourceView::Programmable(vs) = vs else {
+            return 0;
+        };
+        match (
+            self.prog_link_inputs.get(&ps_id),
+            self.prog_link_outputs.get(&vs.vs_id),
+        ) {
+            (Some(inputs), Some(outputs)) => inputs.mask_against(outputs),
+            _ => 0,
+        }
     }
 
     /// True when the pixel shader `ps_id` declares `vPos`.

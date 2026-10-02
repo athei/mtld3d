@@ -129,6 +129,12 @@ unless its entry says otherwise.
   `IDirect3DDevice9::Present` and `IDirect3DSwapChain9::Present` and ignored,
   each warned once; the whole back buffer is presented across the device
   window.
+- SM3 pixel inputs outside the fixed-function varyings (NORMAL, TANGENT,
+  COLOR2 and the like) behind a pretransformed (XYZRHW, POSITIONT) draw read
+  zero: Windows feeds them the vertex declaration's elements by semantic,
+  and the fixed-function vertex path outputs none of them. A `ps_3_0` links
+  at most `MAX_LINKED_INPUTS` (eight) such semantics; a ninth and later read
+  zero, warned once. Issue #981.
 - Timestamp, timestamp frequency, timestamp disjoint and other niche query
   types: capability probes and creation report `D3DERR_NOTAVAILABLE`.
 - Fixed-function bump-environment mapping: `D3DTOP_BUMPENVMAP` and
@@ -170,6 +176,13 @@ unless its entry says otherwise.
   it: both World of Warcraft targets create a plain device, and nothing else
   in the tested set asks for 9Ex. Issue #789 is the record of the decision
   and of what an implementation would cover.
+- SM3 relative addressing of anything but the float constants: an input
+  read through the loop counter (`v[aL]` in `ps_3_0` and `vs_3_0`) and a
+  `vs_3_0` output written through it (`o[aL]`). A shader that writes
+  `o[aL]` fails `CreateVertexShader` with `D3DERR_INVALIDCALL`; one that
+  reads `v[aL]` is created, but its translation fails with a logged error
+  and its draws are left out, so this one does not fail cleanly. No known
+  title needs either.
 - A draw that samples the colour render target it is drawing into (a
   feedback loop) has no hazard handling, and nothing detects the bind, so
   this one does not fail cleanly. Metal leaves the result undefined, and an
