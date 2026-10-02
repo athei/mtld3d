@@ -5587,15 +5587,16 @@ fn a_scoped_pass_with_srgb_write_off_attaches_the_base_view() {
     );
 }
 
-/// Retiring the bound depth texture unbinds it and forgets every set naming it.
+/// Retiring the bound depth texture unbinds it and leaves its records to the retirement boundary.
 ///
 /// The standalone surface that owns the texture finalizes while the device
 /// still has it bound, and the Metal texture is destroyed once the submit
-/// seq gating it retires. A handle left in the session-wide sampled or
-/// sampleable-depth sets would then answer for whatever Metal hands back at
-/// the same address next.
+/// seq gating it retires. Until then the passes already built name the
+/// texture, so the sampled and sampleable-depth sets keep it; the retention
+/// drain's `unregister_texture` is what forgets it, before Metal can hand the
+/// address to another texture.
 #[test]
-fn retiring_the_bound_depth_texture_unbinds_and_forgets_it() {
+fn retiring_the_bound_depth_texture_unbinds_it_and_retirement_forgets_it() {
     let mut s = fresh();
     let shadow = tex(0x9100);
     s.set_depth_stencil_attachment(shadow, (256, 256), true, true);
@@ -5612,8 +5613,62 @@ fn retiring_the_bound_depth_texture_unbinds_and_forgets_it() {
     assert_eq!(s.current_depth_size(), (0, 0));
     assert!(!s.current_depth_has_stencil());
     assert!(!s.current_depth_is_sampleable());
+    assert!(
+        s.is_depth_handle_sampleable(shadow),
+        "the passes built this frame still classify the texture"
+    );
+    assert!(s.texture_sampled_this_frame(shadow));
+
+    s.unregister_texture(shadow);
+
     assert!(!s.is_depth_handle_sampleable(shadow));
     assert!(!s.texture_sampled_this_frame(shadow));
+}
+
+/// A depth surface released after a `StretchRect` out of it keeps the store the copy reads.
+///
+/// The transfer is queued as a blit leading the next pass and reads the
+/// source's device memory, so the source's last pass has to store its depth.
+/// The copy marks the source read, which is what exempts that store from the
+/// last-use discard. The surface is released before the frame is submitted,
+/// as a game that copies its scene depth into a sampleable texture and lets
+/// the original go does, and the release must leave that mark in place.
+#[test]
+fn releasing_a_depth_transfer_source_keeps_the_store_the_transfer_reads() {
+    let source = tex(0x9300);
+    let destination = tex(0x9400);
+    let mut s = fresh();
+    s.set_depth_stencil_attachment(source, BB_SIZE, false, false);
+    depth_draw(&mut s);
+    s.push_leading_blit_after_clears(
+        BlitCommand {
+            cmd: BlitCommandType::TransferDepth as u32,
+            ..BlitCommand::copy_texture_to_texture_full_mip(
+                source.raw(),
+                destination.raw(),
+                0,
+                BB_SIZE.0,
+                BB_SIZE.1,
+            )
+        },
+        "depth_transfer",
+    );
+    s.set_depth_stencil_attachment(destination, BB_SIZE, true, false);
+    s.retire_depth_texture(source);
+    depth_draw(&mut s);
+    s.end_current_pass("test");
+    s.finalize_store_actions(false);
+
+    let source_pass = s
+        .passes()
+        .iter()
+        .find(|pass| pass.depth_texture() == source)
+        .expect("the pass that drew into the source");
+    assert_eq!(
+        source_pass.depth_store(),
+        StoreAction::Store,
+        "the transfer out of the released source reads the depth that pass stores"
+    );
 }
 
 /// Retiring a texture that is not the bound one leaves the attachment alone.

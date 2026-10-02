@@ -4321,14 +4321,16 @@ impl PassState {
         self.current_depth_size = size;
     }
 
-    /// Forget a depth texture whose storage is on its way to the retention queue.
+    /// Unbind a depth texture whose storage is on its way to the retention queue.
     ///
     /// Called when the standalone surface that owns the texture finalizes.
-    /// Every set keyed by a texture handle drops the entry, so a later Metal
-    /// texture handed back at the same address is not mistaken for this one:
-    /// the sampled and sampleable-depth sets outlive a frame by design, and
-    /// a stale member there would let the load/store rules keep a store or
-    /// classify a sample against storage that is gone.
+    /// Only the attachment goes here: the handle-keyed records stay until
+    /// [`Self::unregister_texture`] drops them at the retirement boundary,
+    /// since the passes this frame has built still name the texture and
+    /// their store actions are not final until submit. A depth `StretchRect`
+    /// out of the texture marked it read, and that mark is what keeps the
+    /// store of its last pass; dropping it here would discard the depth the
+    /// queued transfer reads.
     ///
     /// The unbind is the ordinary case rather than an error. A surface
     /// finalizes when the device drops the reference it holds while bound,
@@ -4339,19 +4341,9 @@ impl PassState {
     /// stencil clear materialising against the outgoing attachment, exactly
     /// as the replacement bind would have done.
     pub fn retire_depth_texture(&mut self, texture: MetalHandle<MTLTextureKind>) {
-        if texture.is_null() {
-            return;
-        }
-        if self.current_depth_texture == texture {
+        if !texture.is_null() && self.current_depth_texture == texture {
             self.set_depth_stencil_attachment(MetalHandle::NULL, (0, 0), false, false);
         }
-        self.seen_depth_rts.remove(&texture);
-        self.seen_sampleable_depth_textures.remove(&texture);
-        self.seen_sampled_textures.remove(&texture);
-        self.frame_sampled_textures.remove(&texture);
-        self.blit_written_rts.remove(&texture);
-        self.frame_caster_writes.remove(&texture);
-        self.frame_cascade_samples.remove(&texture);
     }
 
     /// Apply a whole-target colour clear.
