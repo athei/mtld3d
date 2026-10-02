@@ -10,9 +10,10 @@
 //! texture-operation warning firing at the write, once per slot, while a value outside the
 //! `D3DTOP_*` space reads as the stage default instead, the draw-time narrowing of stage
 //! arguments and result registers reading the stage default with one warning per stage and
-//! state, and the FF VS source fingerprint moving on every palette growth, light enable and
-//! light type change while holding across matrix, material and light-parameter writes that
-//! leave the FF VS key and row count alone.
+//! state, the world-matrix palette sized from the blend mode with every unset matrix carried as
+//! identity, and the FF VS source fingerprint moving on every light enable and light type change
+//! while holding across every matrix, material and light-parameter write, none of which moves
+//! the FF VS key or row count.
 
 use std::sync::Mutex;
 
@@ -893,17 +894,74 @@ fn ff_vs_row_count_full_no_blend() {
 }
 
 #[test]
-fn ff_vs_row_count_blend_extends_palette() {
-    use mtld3d_types::{D3DMATRIX, D3DTS_WORLD};
+fn ff_vs_row_count_sizes_the_palette_from_the_blend_mode() {
+    // Sequential blending reads the key's k matrices and indexed blending
+    // every matrix up to the advertised cap, whichever of them the title has
+    // set: the high-water mark of the writes sizes nothing.
+    let cap = u16::try_from(super::MAX_VERTEX_BLEND_MATRIX_INDEX).expect("cap fits u16");
+    for high_water in [0, 1, 4, 255] {
+        let state = state_with_palette_high_water(high_water);
+        for count in 1..=4u8 {
+            assert_eq!(
+                state.ff_vs_row_count(&blend_key_with(count, false)),
+                super::FF_VS_PALETTE_BASE_ROW + u16::from(count) * 4,
+                "sequential blending over {count} matrices, high water {high_water}"
+            );
+        }
+        for count in 1..=4u8 {
+            assert_eq!(
+                state.ff_vs_row_count(&blend_key_with(count, true)),
+                super::FF_VS_PALETTE_BASE_ROW + (cap + 1) * 4,
+                "indexed blending over {count} matrices, high water {high_water}"
+            );
+        }
+    }
+}
+
+#[test]
+fn the_palette_section_carries_unset_world_matrices_as_identity() {
+    use mtld3d_types::{D3DTS_VIEW, D3DTS_WORLD};
+
+    use crate::scratch::ScratchArena;
+    // Only D3DTS_WORLD is set, so every other matrix a blended draw reads is
+    // the identity D3D9 defines, and reaches the shader as identity times
+    // the view.
     let mut state = FfState::new();
-    // Touch palette[4] via D3DTS_WORLDMATRIX(4) = 260 to push the
-    // high-water mark to 4 → world_palette_used() = 5.
-    state.set_transform(D3DTS_WORLD, &D3DMATRIX::IDENTITY);
-    state.set_transform(256 + 4, &D3DMATRIX::IDENTITY);
-    let mut key = make_vs_key(super::FfVsFlags::empty(), 0);
-    key.vertex_blend_count = 2;
-    // 95 + 5*4 = 115 rows.
-    assert_eq!(state.ff_vs_row_count(&key), 115);
+    let mut world = D3DMATRIX::IDENTITY;
+    world.m[12] = 3.0;
+    let mut view = D3DMATRIX::IDENTITY;
+    view.m[13] = 2.0;
+    state.set_transform(D3DTS_WORLD, &world);
+    state.set_transform(D3DTS_VIEW, &view);
+    let cap = usize::try_from(super::MAX_VERTEX_BLEND_MATRIX_INDEX).expect("cap fits usize");
+    let first = FfState::transpose(&FfState::mat_mul(&world, &view));
+    let unset = FfState::transpose(&view);
+    for (key, matrices) in [
+        (blend_key_with(2, false), 2),
+        (blend_key_with(4, false), 4),
+        (blend_key_with(2, true), cap + 1),
+    ] {
+        let mut scratch = ScratchArena::new();
+        let (start, rows, ptr) = state
+            .build_palette_section(&key, &mut scratch)
+            .expect("vertex blending is on");
+        assert_eq!(start, super::FF_VS_PALETTE_BASE_ROW);
+        assert_eq!(usize::from(rows), matrices * 4, "{matrices} matrices");
+        // SAFETY: the builder initialized `rows` 16-byte rows at `ptr`.
+        let packed = unsafe { read_section_rows(ptr, usize::from(rows)) };
+        for (bone, chunk) in packed.as_chunks::<4>().0.iter().enumerate() {
+            let expected = if bone == 0 { &first } else { &unset };
+            for (row, lanes) in chunk.iter().enumerate() {
+                for (lane, value) in lanes.iter().enumerate() {
+                    assert_eq!(
+                        value.to_bits(),
+                        expected.m[row * 4 + lane].to_bits(),
+                        "{matrices} matrices: bone {bone} row {row} lane {lane}"
+                    );
+                }
+            }
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -1693,10 +1751,21 @@ fn per_stage_constants_pack_fresh_prefix_without_changing_keys() {
 /// own compile-time assert pins the same number against the advertised index.
 const FF_VS_CONST_ROWS: u16 = 256;
 
-fn blend_key() -> super::FfVsKey {
-    let mut key = make_vs_key(super::FfVsFlags::empty(), 0);
-    key.vertex_blend_count = 2;
+/// A key blending `count` matrices, by vertex index or in sequence.
+fn blend_key_with(count: u8, indexed: bool) -> super::FfVsKey {
+    let flags = if indexed {
+        super::FfVsFlags::VERTEX_BLEND_INDEXED
+    } else {
+        super::FfVsFlags::empty()
+    };
+    let mut key = make_vs_key(flags, 0);
+    key.vertex_blend_count = count;
     key
+}
+
+/// Indexed one-weight blending, which reads the palette up to the cap.
+fn blend_key() -> super::FfVsKey {
+    blend_key_with(2, true)
 }
 
 fn state_with_palette_high_water(index: u32) -> FfState {
@@ -1809,11 +1878,16 @@ fn inline_variable_sections_fill_exact_queried_rows() {
         state.fill_tt_section(&mut dst);
         assert_filled(&dst);
     }
-    for index in [0, 1, 7, 39] {
-        let state = state_with_palette_high_water(index);
-        let key = blend_key();
+    let cap = u16::try_from(super::MAX_VERTEX_BLEND_MATRIX_INDEX).expect("cap fits u16");
+    for (key, matrices) in [
+        (make_vs_key(super::FfVsFlags::empty(), 0), 0),
+        (blend_key_with(1, false), 1),
+        (blend_key_with(4, false), 4),
+        (blend_key(), cap + 1),
+    ] {
+        let state = state_with_palette_high_water(7);
         let rows = state.palette_section_rows(&key);
-        assert_eq!(u32::from(rows), (index + 1) * 4);
+        assert_eq!(rows, matrices * 4);
         let mut dst = destination(rows);
         state.fill_palette_section(&key, &mut dst);
         assert_filled(&dst);
@@ -1910,24 +1984,18 @@ fn a_result_register_outside_current_and_temp_reads_the_stage_default() {
 
 // ── Which FF writes can move the FF VS source ──
 //
-// The SetTransform and MultiplyTransform thunks compare
-// `FfState::vs_source_transform_inputs` across the write, SetLight and
-// LightEnable compare `FfState::vs_source_light_inputs`, and SetMaterial
-// never marks `VS_SOURCE`. These tests hold each comparison to the key and
-// row count it stands in for.
-
-/// The fingerprint a transform thunk compares, widened for the tests.
-fn transform_inputs(state: &FfState) -> u64 {
-    u64::from(state.vs_source_transform_inputs())
-}
+// SetLight and LightEnable compare `FfState::vs_source_light_inputs` across
+// the write, while SetTransform, MultiplyTransform and SetMaterial never mark
+// `VS_SOURCE`. These tests hold each comparison to the key and row count it
+// stands in for.
 
 /// The fingerprint a light thunk compares, widened for the tests.
 fn light_inputs(state: &FfState) -> u64 {
     u64::from(state.vs_source_light_inputs())
 }
 
-/// `SetMaterial` compares nothing: it never marks `VS_SOURCE`.
-const fn material_inputs(_: &FfState) -> u64 {
+/// The transform and material thunks compare nothing: they never mark `VS_SOURCE`.
+const fn no_inputs(_: &FfState) -> u64 {
     0
 }
 
@@ -2058,28 +2126,8 @@ struct FfWrite {
 
 #[test]
 fn vs_source_inputs_move_on_every_key_input_the_ff_setters_write() {
-    use mtld3d_types::{D3DLIGHT_DIRECTIONAL, D3DLIGHT_POINT, D3DLIGHT_SPOT, D3DTS_WORLD};
-    let cases: [(fn() -> FfState, FfWrite); 17] = [
-        (
-            FfState::new,
-            FfWrite {
-                name: "SetTransform grows the palette",
-                write: |s| {
-                    s.set_transform(D3DTS_WORLD + 3, &seeded_matrix(1.0));
-                },
-                fingerprint: transform_inputs,
-            },
-        ),
-        (
-            FfState::new,
-            FfWrite {
-                name: "MultiplyTransform grows the palette",
-                write: |s| {
-                    s.multiply_transform(D3DTS_WORLD + 5, &seeded_matrix(1.0));
-                },
-                fingerprint: transform_inputs,
-            },
-        ),
+    use mtld3d_types::{D3DLIGHT_DIRECTIONAL, D3DLIGHT_POINT, D3DLIGHT_SPOT};
+    let cases: [(fn() -> FfState, FfWrite); 15] = [
         (
             lit_state,
             FfWrite {
@@ -2244,54 +2292,68 @@ fn vs_source_inputs_hold_across_value_only_ff_writes() {
             write: |s| {
                 s.set_transform(D3DTS_WORLD, &seeded_matrix(2.0));
             },
-            fingerprint: transform_inputs,
+            fingerprint: no_inputs,
         },
         FfWrite {
             name: "SetTransform WORLDMATRIX under the high water",
             write: |s| {
                 s.set_transform(D3DTS_WORLD + 2, &seeded_matrix(2.0));
             },
-            fingerprint: transform_inputs,
+            fingerprint: no_inputs,
+        },
+        FfWrite {
+            name: "SetTransform WORLDMATRIX raises the high water",
+            write: |s| {
+                s.set_transform(D3DTS_WORLD + 9, &seeded_matrix(2.0));
+            },
+            fingerprint: no_inputs,
+        },
+        FfWrite {
+            name: "MultiplyTransform WORLDMATRIX past the blending cap",
+            write: |s| {
+                s.multiply_transform(D3DTS_WORLD + 200, &seeded_matrix(2.0));
+            },
+            fingerprint: no_inputs,
         },
         FfWrite {
             name: "SetTransform VIEW",
             write: |s| {
                 s.set_transform(D3DTS_VIEW, &seeded_matrix(2.0));
             },
-            fingerprint: transform_inputs,
+            fingerprint: no_inputs,
         },
         FfWrite {
             name: "SetTransform PROJECTION",
             write: |s| {
                 s.set_transform(D3DTS_PROJECTION, &seeded_matrix(2.0));
             },
-            fingerprint: transform_inputs,
+            fingerprint: no_inputs,
         },
         FfWrite {
             name: "SetTransform TEXTURE0",
             write: |s| {
                 s.set_transform(D3DTS_TEXTURE0, &seeded_matrix(2.0));
             },
-            fingerprint: transform_inputs,
+            fingerprint: no_inputs,
         },
         FfWrite {
             name: "MultiplyTransform VIEW",
             write: |s| {
                 s.multiply_transform(D3DTS_VIEW, &seeded_matrix(2.0));
             },
-            fingerprint: transform_inputs,
+            fingerprint: no_inputs,
         },
         FfWrite {
             name: "MultiplyTransform WORLD",
             write: |s| {
                 s.multiply_transform(D3DTS_WORLD, &seeded_matrix(2.0));
             },
-            fingerprint: transform_inputs,
+            fingerprint: no_inputs,
         },
         FfWrite {
             name: "SetMaterial",
             write: |s| s.set_material(&seeded_material(2.0)),
-            fingerprint: material_inputs,
+            fingerprint: no_inputs,
         },
         FfWrite {
             name: "SetLight keeps an active light's type",
@@ -2401,8 +2463,7 @@ fn walk_ff_writes(light_indices: &[u32], mut rng: u64) {
         let seed = f32::from(u8::try_from(next(8)).expect("under 8")) * 0.5;
         let op = next(5);
         let fingerprint: fn(&FfState) -> u64 = match op {
-            0 | 1 => transform_inputs,
-            2 => material_inputs,
+            0..=2 => no_inputs,
             _ => light_inputs,
         };
         let inputs = fingerprint(&state);

@@ -169,15 +169,16 @@ pub struct FfState {
     /// `D3DTS_WORLD == D3DTS_WORLDMATRIX(0)` per spec (both equal raw state
     /// 256), so `palette[0]` is the single-world-matrix slot used when vertex
     /// blending is disabled. `palette[1..255]` are the additional matrices for
-    /// `D3DRS_VERTEXBLEND` mode. 16 KB per device, one-time. Most games (e.g.
-    /// `WoW`) only touch `palette[0]`; per-draw constant upload reads
-    /// `world_palette[0..=world_palette_high_water]`, so non-blending
-    /// workloads ship 64 bytes of world matrix as before.
+    /// `D3DRS_VERTEXBLEND` mode. 16 KB per device, one-time. Every slot starts
+    /// as identity, which is what a blended draw reads for a matrix the title
+    /// never set; a draw uploads the matrices its blending can read
+    /// (`palette_matrices`), and a draw without blending reads
+    /// `palette[0]` through the world-view section alone.
     world_palette: [D3DMATRIX; 256],
     /// Maximum palette index ever written via `SetTransform`.
     ///
-    /// Drives the per-draw upload extent so we don't ship unused identity
-    /// matrices.
+    /// Read only to warn once when indexed blending cannot reach a matrix
+    /// the title wrote; it sizes nothing.
     world_palette_high_water: u16,
     texture_transforms: [D3DMATRIX; 8],
     material: D3DMATERIAL9,
@@ -421,11 +422,7 @@ impl FfState {
 
     /// Track the highest world-palette index ever set.
     ///
-    /// Per-draw constant uploads then only pack
-    /// `world_palette[0..=high_water]` instead of the full 16 KB array.
-    /// `D3DTS_WORLD == D3DTS_WORLDMATRIX(0) == 256` always keeps
-    /// `high_water >= 0` (the default value), so non-blending workloads pay
-    /// one matrix as before.
+    /// Only the warning for a matrix past the blending cap reads it.
     fn bump_palette_high_water(&mut self, state: u32) {
         if (256..=511).contains(&state) {
             // (state - 256) is in 0..=255, well inside u16.
@@ -439,42 +436,44 @@ impl FfState {
 
     /// Number of world matrices the game has set via `SetTransform`.
     ///
-    /// Or 1 if only `D3DTS_WORLD` / `palette[0]` was touched. Drives the
-    /// per-draw constant-upload extent in [`Self::build_palette_section`].
+    /// Or 1 if only `D3DTS_WORLD` / `palette[0]` was touched.
     #[must_use]
     pub const fn world_palette_used(&self) -> usize {
         self.world_palette_high_water as usize + 1
     }
 
-    /// World matrices a vertex-blending draw uploads and the shader may read.
+    /// World matrices a vertex-blending draw with `vs_key` can read, and so uploads.
     ///
-    /// [`Self::world_palette_used`] counts every `D3DTS_WORLDMATRIX(i)` the
-    /// title has written, and D3D9 lets that run to 256, while the FF VS
-    /// constant block holds the palette only up to
-    /// [`MAX_VERTEX_BLEND_MATRIX_INDEX`], the index `caps::fill` advertises as
-    /// `D3DCAPS9::MaxVertexBlendMatrixIndex`. Counting or packing past it runs
-    /// off the end of the block, so the matrices above the cap are dropped and
-    /// the first draw that would have carried one says so once.
-    fn world_palette_uploaded(&self) -> usize {
-        let used = self.world_palette_used();
+    /// Sequential blending reads `world_palette[0..k]` for the key's `k`
+    /// matrices, whichever of them the title has set: an unset matrix is
+    /// identity, and the shader has to read it as identity rather than as
+    /// rows no upload wrote. Indexed blending reads the index each vertex
+    /// carries, clamped to [`MAX_VERTEX_BLEND_MATRIX_INDEX`] (the index
+    /// `caps::fill` advertises as `D3DCAPS9::MaxVertexBlendMatrixIndex`, the
+    /// last one the FF VS constant block holds), so every matrix up to the
+    /// cap is uploaded. D3D9 lets a title write matrices up to 255, and the
+    /// first indexed draw after one past the cap was written says once that
+    /// no draw reaches it. Zero without blending.
+    fn palette_matrices(&self, vs_key: &FfVsKey) -> usize {
+        let count = usize::from(vs_key.vertex_blend_count);
+        if count == 0 || !vs_key.vertex_blend_indexed() {
+            return count;
+        }
         let limit = usize::try_from(MAX_VERTEX_BLEND_MATRIX_INDEX)
             .expect("MaxVertexBlendMatrixIndex fits usize")
             + 1;
+        let used = self.world_palette_used();
         if used > limit {
             mtld3d_shared::log_once_warn!(
                 target: crate::LOG_TARGET,
                 "FF vertex blend: D3DTS_WORLDMATRIX({}) is past MaxVertexBlendMatrixIndex {MAX_VERTEX_BLEND_MATRIX_INDEX} → matrices above the cap not uploaded",
                 used - 1
             );
-            return limit;
         }
-        used
+        limit
     }
 
     /// Read-only access to the world-matrix palette.
-    ///
-    /// Slice length is bounded by `world_palette_used()` for callers that want
-    /// only the in-use range.
     #[must_use]
     pub const fn world_palette(&self) -> &[D3DMATRIX; 256] {
         &self.world_palette
@@ -624,20 +623,6 @@ impl FfState {
             0xFFu8 >> (8 - active.len)
         };
         [active_mask, dir, spot]
-    }
-
-    /// The FF VS source input a transform write can move: the world-palette high-water mark.
-    ///
-    /// [`Self::ff_vs_row_count`] sizes a blended draw's palette from it, and
-    /// nothing else a transform write changes reaches the FF VS key or row
-    /// count (matrices feed only the constant sections). So a `set_transform`
-    /// or `multiply_transform` call that leaves this value unchanged leaves
-    /// the FF VS source unchanged, and the device marks `VS_SOURCE` for it
-    /// only when the value moves. It is one field read, so a transform write
-    /// stays O(1) whatever lights exist.
-    #[must_use]
-    pub const fn vs_source_transform_inputs(&self) -> u16 {
-        self.world_palette_high_water
     }
 
     /// The FF VS source inputs a light write can move: which lights are active, with which type.
@@ -1551,7 +1536,7 @@ impl FfState {
     ///
     /// Panics if the uploaded palette count exceeds `u32` or if the computed
     /// row count exceeds `u16`. Both are unreachable:
-    /// `world_palette_uploaded` bounds the palette by
+    /// `palette_matrices` bounds the palette by
     /// [`MAX_VERTEX_BLEND_MATRIX_INDEX`], so the count stops at
     /// `95 + 40 * 4 = 255`.
     #[must_use]
@@ -1593,7 +1578,7 @@ impl FfState {
         }
         let mut row_count: u32 = u32::from(max_row) + 1;
         if vs_key.vertex_blend_count > 0 {
-            let used = self.world_palette_uploaded();
+            let used = self.palette_matrices(vs_key);
             let palette_rows = u32::from(FF_VS_PALETTE_BASE_ROW)
                 + u32::try_from(used).expect("uploaded palette ≤ 40") * 4;
             if palette_rows > row_count {
@@ -1985,7 +1970,8 @@ impl FfState {
 
     /// Bump-copy the row 95+ PALETTE section (world-matrix palette × view).
     ///
-    /// Extent: `world_palette_uploaded` × 4 rows. Returns `None` when
+    /// Extent: four rows per matrix the key's blending can read
+    /// (`palette_matrices`). Returns `None` when
     /// `vs_key.vertex_blend_count == 0` (palette is never read by the
     /// shader in that case).
     ///
@@ -2022,7 +2008,7 @@ impl FfState {
         if vs_key.vertex_blend_count == 0 {
             return;
         }
-        let used = self.world_palette_uploaded();
+        let used = self.palette_matrices(vs_key);
         let rows_usize = used * 4;
         assert_eq!(dst.len(), rows_usize);
         for (bone, chunk) in dst.as_chunks_mut::<4>().0.iter_mut().enumerate() {
@@ -2072,11 +2058,7 @@ impl FfState {
     /// Panics if the internally bounded section exceeds its row budget.
     #[must_use]
     pub fn palette_section_rows(&self, vs_key: &FfVsKey) -> u16 {
-        if vs_key.vertex_blend_count == 0 {
-            0
-        } else {
-            u16::try_from(self.world_palette_uploaded() * 4).expect("palette has at most 160 rows")
-        }
+        u16::try_from(self.palette_matrices(vs_key) * 4).expect("palette has at most 160 rows")
     }
 
     /// Pack a used stage-constant prefix directly into immutable frame scratch.

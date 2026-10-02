@@ -1390,11 +1390,11 @@ impl DeviceInner {
     /// Dirty bits for a transform or light write to the fixed-function state.
     ///
     /// The write always changes the FF VS constants. It changes the FF VS
-    /// source only when `source_moved`: the thunk compares
-    /// [`FfState::vs_source_transform_inputs`] or
-    /// [`FfState::vs_source_light_inputs`] across the write, since a matrix or
-    /// a light's parameters alone never reach the key, while palette growth, a
-    /// light enable or a light type change can. The result then goes through
+    /// source only when `source_moved`: a transform write never does, since
+    /// a matrix reaches neither the key nor the row count, and a light thunk
+    /// compares [`FfState::vs_source_light_inputs`] across the write, since a
+    /// light's parameters alone never reach the key while a light enable or a
+    /// light type change can. The result then goes through
     /// [`Self::ff_aware_mask`].
     fn ff_vs_write_mask(&self, source_moved: bool) -> SnapshotDirty {
         let mut mask = SnapshotDirty::VS_CONST;
@@ -9247,10 +9247,9 @@ extern "system" fn device_set_transform(
         return D3D_OK;
     }
     // Unknown D3DTS_* indices (vertex blending etc.) are silently accepted.
-    let inputs = dev.ff_state().vs_source_transform_inputs();
     dev.ff_state_mut().set_transform(state, &m);
-    let mask = dev.ff_vs_write_mask(dev.ff_state().vs_source_transform_inputs() != inputs)
-        | dev.transform_write_side_dirty(state);
+    // A matrix feeds the FF VS constants only, never its key or row count.
+    let mask = dev.ff_vs_write_mask(false) | dev.transform_write_side_dirty(state);
     dev.mark_snapshot_dirty(mask);
     0 // S_OK
 }
@@ -9301,10 +9300,9 @@ extern "system" fn device_multiply_transform(
     // EndStateBlock returns the multiplied matrix, and a later Capture/Apply
     // does not restore it). So
     // always apply to live FF state, regardless of recording.
-    let inputs = dev.ff_state().vs_source_transform_inputs();
     dev.ff_state_mut().multiply_transform(state, &rhs);
-    let mask = dev.ff_vs_write_mask(dev.ff_state().vs_source_transform_inputs() != inputs)
-        | dev.transform_write_side_dirty(state);
+    // A matrix feeds the FF VS constants only, never its key or row count.
+    let mask = dev.ff_vs_write_mask(false) | dev.transform_write_side_dirty(state);
     dev.mark_snapshot_dirty(mask);
     0 // S_OK
 }
