@@ -1928,7 +1928,13 @@ fn translate_instruction(
         // D3D9 `nrm` scales EVERY written component (incl. w) by
         // 1/length(src.xyz): dst = src * rsqrt(dot(src.xyz, src.xyz)). The
         // write-mask is applied by store_dst (so `nrm r.xyz` leaves w intact).
-        Opcode::Nrm => format!("(({s}) * rsqrt(dot(({s}).xyz, ({s}).xyz)))", s = srcs[0]),
+        // A zero-length source comes back unchanged instead of as the NaN of
+        // 0 * inf: D3D9 hardware never produces a NaN or inf from `nrm`.
+        Opcode::Nrm => format!(
+            "((dot(({s}).xyz, ({s}).xyz) == 0.0) ? ({s}) \
+             : (({s}) * rsqrt(dot(({s}).xyz, ({s}).xyz))))",
+            s = srcs[0]
+        ),
         Opcode::Abs => format!("abs({})", srcs[0]),
         // D3D9: pow(base, exp) = base <= 0 ? 0 : pow(base, exp); uses abs(base).
         Opcode::Pow => format!("float4(pow(abs(({}).x), ({}).x))", srcs[0], srcs[1]),

@@ -171,6 +171,7 @@ const OP_LOGP: u16 = 79;
 const OP_DEF: u16 = 81;
 const OP_CMP: u16 = 88;
 const OP_LIT: u16 = 16;
+const OP_NRM: u16 = 36;
 const OP_DST: u16 = 17;
 const OP_CND: u16 = 80;
 const OP_LOOP: u16 = 27;
@@ -1393,6 +1394,36 @@ fn lit_emits_lighting_coefficients() {
         "lit must gate the specular term on src.x > 0 and src.y > 0:\n{msl}"
     );
     metal_compile_or_fail(&emit_vs_programmable(&parse(&bc).expect("vs parse")).expect("emit vs"));
+}
+
+#[test]
+fn nrm_of_a_zero_vector_returns_the_source() {
+    // ps_3_0 { dcl_texcoord0 v0; nrm r0, v0; mov oC0, r0; }
+    // rsqrt(0) is inf and 0 * inf is NaN, so a zero-length source has to
+    // bypass the scale.
+    let bc = vec![
+        PS3_HEADER,
+        opcode_token(OP_DCL, 2),
+        dcl_usage_token(DCL_TEXCOORD, 0),
+        dst_token(TYPE_INPUT, 0, 0xF, false),
+        opcode_token(OP_NRM, 2),
+        dst_token(TYPE_TEMP, 0, 0xF, false),
+        src_token(TYPE_INPUT, 0, SWIZ_IDENTITY, 0),
+        opcode_token(OP_MOV, 2),
+        dst_token(TYPE_COLOROUT, 0, 0xF, false),
+        src_token(TYPE_TEMP, 0, SWIZ_IDENTITY, 0),
+        END_TOKEN,
+    ];
+    let ps = parse(&bc).expect("PS3 parse");
+    let msl = emit_ps_programmable(&ps, VariantKey::default()).expect("emit PS3");
+    assert!(
+        msl.contains(
+            "r[0] = ((dot((in.texcoord0).xyz, (in.texcoord0).xyz) == 0.0) ? (in.texcoord0) \
+             : ((in.texcoord0) * rsqrt(dot((in.texcoord0).xyz, (in.texcoord0).xyz))));"
+        ),
+        "nrm must return a zero-length source unchanged:\n{msl}"
+    );
+    metal_compile_or_fail(&msl);
 }
 
 #[test]
