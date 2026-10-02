@@ -360,7 +360,7 @@ impl EncoderThread {
             return Ok(());
         }
         #[cfg(perf_tracking)]
-        self.source_clock.join();
+        self.source_clock.wait();
         let mut params = DestroyEncoderParams {
             runtime: self.runtime,
         };

@@ -1,6 +1,13 @@
 //! PERF-only source-clock publication retained through native shutdown.
 
-use std::{sync::Arc, thread::JoinHandle};
+use std::{
+    sync::{
+        Arc,
+        atomic::{Ordering, fence},
+    },
+    thread::JoinHandle,
+    time::Duration,
+};
 
 use mtld3d_shared::clock_calibration::ClockCalibration;
 
@@ -51,16 +58,30 @@ impl SourceClock {
         Arc::as_ptr(&self.clock) as u64
     }
 
-    pub(super) fn join(&mut self) {
-        if let Some(worker) = self.worker.take()
-            && worker.join().is_err()
-        {
-            log::warn!(target: LOG_TARGET, "source clock calibration failed; timing invalid");
-            if matches!(self.clock.get(), Ok(None)) {
-                // SAFETY: the failed worker is joined and never published; this
-                // is now the only publisher and SourceClock retains the mailbox.
-                unsafe { self.clock.publish_failed() };
-            }
+    /// Wait for the calibration worker to end, then let its handle go.
+    ///
+    /// Polls `is_finished` rather than calling `JoinHandle::join`: Wine can
+    /// invalidate a thread handle held for a long session, and `join` panics
+    /// on the failed wait, which ends the process at device release.
+    /// `is_finished` reads the count std keeps on the thread's result, so it
+    /// never waits on the OS handle.
+    pub(super) fn wait(&mut self) {
+        let Some(worker) = self.worker.take() else {
+            return;
+        };
+        while !worker.is_finished() {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        // `is_finished` may read the count without ordering; the worker's
+        // last writes, its publication included, happen before its release
+        // of that count, and this fence makes them visible to the check below.
+        fence(Ordering::Acquire);
+        drop(worker);
+        if matches!(self.clock.get(), Ok(None)) {
+            log::warn!(target: LOG_TARGET, "source clock calibration ended without a result; timing invalid");
+            // SAFETY: the worker has ended without publishing; this is now
+            // the only publisher and SourceClock retains the mailbox.
+            unsafe { self.clock.publish_failed() };
         }
     }
 
@@ -73,6 +94,6 @@ impl SourceClock {
 
 impl Drop for SourceClock {
     fn drop(&mut self) {
-        self.join();
+        self.wait();
     }
 }

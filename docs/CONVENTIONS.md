@@ -26,6 +26,7 @@ Most of this document is enforced by `make check`: `cargo +nightly fmt --check`,
 | Every end-to-end test file (`windows/tests/tests/*.rs` and `tests/e2e/*.rs`, `main.rs` aside) has a row in `windows/tests/COVERAGE.md`, and every row a file | §End-to-end tests are listed in `COVERAGE.md` |
 | Raw thread spawns (`.spawn(`, `.spawn_scoped(`, `thread::spawn(`, `thread::Builder`) = 0 under `windows/tests/tests/e2e/` | §Every end-to-end test names itself |
 | Every `extern "system" fn` in the device and child-object files opens with `let _api =`, the cursor window procedure excepted | §Every device entry point holds the API lock |
+| `.join()` / `JoinHandle::join` = 0 under `windows/`, unit tests and the end-to-end crate aside | §The PE side waits for its threads, it never joins them |
 | Release hygiene (see below) | §Release hygiene |
 
 Every finding names the section it came from. The confined-pattern checks compare **sets of files**, not counts, so moving an exception to a new file fails even though the count is unchanged — which is the point: each of those files earned its exception with an argument recorded here, and a new one needs a new argument.
@@ -66,6 +67,10 @@ The Makefile enforces the C/C++ half after the build. Every production install l
 ## Every device entry point holds the API lock
 
 A device created with `D3DCREATE_MULTITHREADED` serialises its entry points on a reentrant per-device lock (`mtld3d-core`'s `api_lock`, ARCHITECTURE.md §Threading model). The guard is taken by the first statement of every `extern "system" fn` in `device.rs`, `cursor.rs`, `texture.rs`, `surface.rs`, `vertex_buffer.rs`, `index_buffer.rs`, `swapchain.rs`, `query.rs`, `state_block.rs`, `vertex_decl.rs`, `vertex_shader.rs` and `pixel_shader.rs`: `let _api = device_api_lock(this);` on the device, `let _api = crate::com_ref::com_api_lock::<T>(this);` on a child, ahead of the `_timer`, so the timer's drop runs under the lock. Items (`use`, `const`) and comments may precede it; a statement may not. `make audit` checks every such function, so a thunk added later cannot escape the lock silently. The one exception is `cursor_wnd_proc`, which runs on the window thread that a locked `Reset` sends messages to and must not wait for the lock; the audit names it.
+
+## The PE side waits for its threads, it never joins them
+
+A thread that `d3d9.dll` or `mtld3d-core` starts on the PE side is waited for by polling `JoinHandle::is_finished` and then dropping the handle, never by `JoinHandle::join`. Under Wine the Win32 handle behind a `JoinHandle` held for a long session can come back invalid, and `join` panics on the failed wait, which under `panic = "abort"` ends the game at device release. `is_finished` reads the count std keeps on the thread's result and never waits on the handle. `PrewarmHandle::cancel_and_join` and the source-clock calibration worker are the two sites, and both sleep a millisecond between polls, which only teardown pays. The one other wait allowed is `WaitForSingleObject` on a handle opened just for it while the thread is known to be alive, as the log thread's stop does (`log_sink.rs`): the handle is never held long enough for Wine to invalidate it. `make audit` bans `.join()` with no argument (a slice or path join takes one) and `JoinHandle::join` in every `.rs` file under `windows/` except unit tests, which run natively on the host, and the end-to-end crate under `windows/tests/`, which joins scoped workers it spawned moments before.
 
 ## Factor pure functionality into `mtld3d-core`; `d3d9` is wiring
 
