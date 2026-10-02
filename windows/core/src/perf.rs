@@ -6237,7 +6237,7 @@ fn render_kv(w: &PerfWindow, c: &PerfWindow, caches: &CacheSizes, window_secs: f
 
     // API thread: D3D9 calls, their categories and the device sub-buckets.
     kv.cycles("api_calls", &w.api_cyc);
-    let api_calls = w
+    let api_calls = c
         .calls_by
         .iter()
         .fold(0u64, |sum, stat| sum.saturating_add(stat.sum));
