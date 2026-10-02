@@ -324,6 +324,20 @@ impl Direct3DSurface9 {
     /// [`ImplicitKind`]). `container` is the implicit swapchain wrapper
     /// `GetContainer` returns.
     pub fn new_implicit_backbuffer(device_inner: *mut DeviceInner, container: u64) -> Self {
+        Self::backbuffer(device_inner, container, SurfaceFlags::empty())
+    }
+
+    /// The back buffer of an additional swap chain, which pins that swap chain while referenced.
+    ///
+    /// Shaped like [`Self::new_implicit_backbuffer`]: the swap chain caches it
+    /// and frees it with itself, and it resolves its colour handle live from
+    /// the device. `swap_chain` is the `Direct3DSwapChain9` wrapper that is its
+    /// `GetContainer` and that it pins (see [`SurfaceFlags::PINS_SWAP_CHAIN`]).
+    pub fn new_swap_chain_backbuffer(device_inner: *mut DeviceInner, swap_chain: u64) -> Self {
+        Self::backbuffer(device_inner, swap_chain, SurfaceFlags::PINS_SWAP_CHAIN)
+    }
+
+    fn backbuffer(device_inner: *mut DeviceInner, container: u64, flags: SurfaceFlags) -> Self {
         let inner = Box::into_raw(Box::new(SurfaceInner {
             device_inner,
             parent_texture: core::ptr::null_mut(),
@@ -345,7 +359,7 @@ impl Direct3DSurface9 {
             multi_sample: SurfaceMultiSample::NONE,
             readback: None,
             system_memory: None,
-            flags: SurfaceFlags::empty(),
+            flags,
             private_data: PrivateDataStore::default(),
             dc_lock: DcLockState::default(),
             lock_flags: 0,
@@ -676,6 +690,22 @@ impl Direct3DSurface9 {
     /// frees it. See [`SurfaceFlags::CONTAINER_CACHED`].
     fn container_cached(&self) -> bool {
         self.inner().flags.contains(SurfaceFlags::CONTAINER_CACHED)
+    }
+
+    /// The additional swap chain this back buffer pins while referenced, or 0.
+    ///
+    /// See [`SurfaceFlags::PINS_SWAP_CHAIN`].
+    fn pinned_swap_chain(&self) -> u64 {
+        if self.inner().flags.contains(SurfaceFlags::PINS_SWAP_CHAIN) {
+            self.inner().container
+        } else {
+            0
+        }
+    }
+
+    /// Whether nothing references this surface, publicly or through a device binding.
+    const fn unreferenced(&self) -> bool {
+        self.refcount == 0 && self.private_refcount == 0
     }
 
     /// Whether this surface currently has an outstanding `LockRect`.
@@ -1059,6 +1089,15 @@ bitflags::bitflags! {
         /// `finalize_texture` is the single free site. Clear for every other
         /// surface, freed on its own last release.
         const CONTAINER_CACHED = 1 << 2;
+        /// The back buffer of an additional swap chain, which it pins while referenced.
+        ///
+        /// Its first reference of either kind, public or a device binding,
+        /// pins the swap chain it names as `container`, and its last one
+        /// unpins it, so the swap chain and this surface with it are freed
+        /// only once neither the application nor the device references the
+        /// surface. Clear on the device's own implicit back buffer, which the
+        /// device keeps.
+        const PINS_SWAP_CHAIN = 1 << 3;
     }
 }
 
@@ -1510,9 +1549,25 @@ extern "system" fn surface_add_ref(this: *mut c_void) -> u32 {
     // SAFETY: IDirect3DSurface9 AddRef thunk; `this` is the live wrapper.
     let tex = unsafe { container_forward_texture(this) };
     if tex.is_null() {
+        // The first reference of either kind pins an additional swap chain.
+        let pin = {
+            // SAFETY: live wrapper per the thunk; the borrow ends before the engine call.
+            let obj = unsafe { &*this.cast::<Direct3DSurface9>() };
+            if obj.unreferenced() {
+                obj.pinned_swap_chain()
+            } else {
+                0
+            }
+        };
         // SAFETY: a standalone/implicit surface — the central engine forwards
         // the device reference on a device-owned implicit surface's 0→1 edge.
-        return unsafe { crate::com_ref::com_add_ref::<Direct3DSurface9>(this) };
+        let rc = unsafe { crate::com_ref::com_add_ref::<Direct3DSurface9>(this) };
+        if pin != 0 {
+            // SAFETY: an additional swap chain's back buffer names its live
+            // swap chain as `container`, unpinned until this reference.
+            unsafe { crate::swapchain::pin_for_backbuffer(pin) };
+        }
+        return rc;
     }
     // A texture sub-surface: forward the public AddRef to the container texture
     // (so the shared count the test observes is the texture's), and bump our own
@@ -1534,9 +1589,30 @@ extern "system" fn surface_release(this: *mut c_void) -> u32 {
     // SAFETY: IDirect3DSurface9 Release thunk; `this` is the live wrapper.
     let tex = unsafe { container_forward_texture(this) };
     if tex.is_null() {
+        // The release that takes the last reference of either kind unpins an
+        // additional swap chain. Decided before the engine call, which can
+        // free an ordinary surface and, through the device release it
+        // forwards, tear down a device whose binding was this surface's other
+        // reference; a release past zero is not the last reference.
+        let swap_chain = {
+            // SAFETY: live wrapper per the thunk; the borrow ends before the engine call.
+            let obj = unsafe { &*this.cast::<Direct3DSurface9>() };
+            if obj.refcount == 1 && obj.private_refcount == 0 {
+                obj.pinned_swap_chain()
+            } else {
+                0
+            }
+        };
         // SAFETY: a standalone/implicit surface — the central engine finalizes it
         // (or forwards the device release for a device-owned implicit surface).
-        return unsafe { crate::com_ref::com_release::<Direct3DSurface9>(this) };
+        let rc = unsafe { crate::com_ref::com_release::<Direct3DSurface9>(this) };
+        if swap_chain != 0 {
+            // SAFETY: the last reference is gone, which releases the pin the
+            // first one took on the live swap chain. That can free the swap
+            // chain and this surface with it, so it comes last.
+            unsafe { crate::swapchain::unpin_for_backbuffer(swap_chain) };
+        }
+        return rc;
     }
     // A texture sub-surface: drop our own refcount and free the surface Box once
     // no app/bound reference remains, THEN forward the public Release to the
@@ -1772,7 +1848,17 @@ pub unsafe fn set_cached_surface_device(ptr: u64, device_inner: *mut DeviceInner
 
 impl ComUnknown for Direct3DSurface9 {
     fn private_refcount_inc(&mut self) {
+        let pin = if self.unreferenced() {
+            self.pinned_swap_chain()
+        } else {
+            0
+        };
         self.private_refcount += 1;
+        if pin != 0 {
+            // SAFETY: an additional swap chain's back buffer names its live
+            // swap chain as `container`, unpinned until this device binding.
+            unsafe { crate::swapchain::pin_for_backbuffer(pin) };
+        }
         // A sub-surface's private count pins its container too. `bound_rt` holds
         // a private reference on a bound render-target or depth-stencil surface,
         // and every accessor on that surface (`GetDesc`, `LockRect`,
@@ -1790,7 +1876,7 @@ impl ComUnknown for Direct3DSurface9 {
         }
     }
     unsafe fn private_refcount_dec_maybe_finalize(this: *mut Self) {
-        let (finalize_now, tex) = {
+        let (finalize_now, tex, unpin) = {
             // SAFETY: caller asserts `this` points to a live wrapper with
             // at least one private refcount outstanding.
             let obj = unsafe { &mut *this };
@@ -1805,7 +1891,12 @@ impl ComUnknown for Direct3DSurface9 {
                 && obj.private_refcount == 0
                 && obj.inner().implicit_kind == ImplicitKind::None
                 && !obj.container_cached();
-            (finalize_now, obj.forward_texture())
+            let unpin = if obj.unreferenced() {
+                obj.pinned_swap_chain()
+            } else {
+                0
+            };
+            (finalize_now, obj.forward_texture(), unpin)
         };
         if finalize_now {
             // SAFETY: both counters reached zero — no other reference
@@ -1819,6 +1910,14 @@ impl ComUnknown for Direct3DSurface9 {
             // SAFETY: `tex` is the live container texture this surface took a
             // private reference on in `private_refcount_inc`.
             unsafe { Direct3DTexture9::private_refcount_dec_maybe_finalize(tex) };
+        }
+        if unpin != 0 {
+            // A back buffer is never finalized above. Its last reference of
+            // either kind is gone, which releases the pin on the live swap
+            // chain; that can free the swap chain and this surface with it,
+            // so it comes last.
+            // SAFETY: the pinned swap chain is live until this unpin.
+            unsafe { crate::swapchain::unpin_for_backbuffer(unpin) };
         }
     }
 }

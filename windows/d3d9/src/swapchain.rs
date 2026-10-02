@@ -49,6 +49,7 @@ impl Direct3DSwapChain9 {
             present_params,
             owned_by_device,
             backbuffer_surface: 0,
+            backbuffer_pins: 0,
         }));
         Self {
             vtbl: &raw const DIRECT3D_SWAPCHAIN9_VTBL,
@@ -136,6 +137,14 @@ struct SwapChainInner {
     /// longer reuses a freed wrapper. Unused for the implicit swapchain (its
     /// backbuffer is the device's implicit RT).
     backbuffer_surface: u64,
+    /// Whether the back buffer is referenced, publicly or by a device binding: 1 or 0.
+    ///
+    /// The back buffer pins its swap chain while anything references it, the
+    /// way D3D9 keeps a swap chain alive for as long as its back buffer is, so
+    /// the swap chain is finalized only once both this and its public count
+    /// are zero. Whichever of the two reaches zero last finalizes it, and the
+    /// back buffer with it.
+    backbuffer_pins: u32,
 }
 
 extern "system" fn swapchain_query_interface(
@@ -178,10 +187,69 @@ extern "system" fn swapchain_release(this: *mut c_void) -> u32 {
     unsafe { crate::com_ref::com_release::<Direct3DSwapChain9>(this) }
 }
 
+/// Pin an additional swap chain while its back buffer is referenced.
+///
+/// Called by the back buffer when its first reference of either kind, public
+/// or a device binding, is taken.
+///
+/// # Safety
+/// `swap_chain` is the live app-owned `Direct3DSwapChain9` the back buffer
+/// names as its container.
+pub unsafe fn pin_for_backbuffer(swap_chain: u64) {
+    // SAFETY: the caller passes the live swap chain wrapper.
+    let inner_ptr = unsafe { (*(swap_chain as *mut Direct3DSwapChain9)).inner };
+    // SAFETY: its `inner` is the live `Box::into_raw(SwapChainInner)` for as
+    // long as the wrapper is.
+    let inner = unsafe { &mut *inner_ptr };
+    inner.backbuffer_pins += 1;
+}
+
+/// Drop the pin the back buffer holds, finalizing the swap chain when nothing else holds it.
+///
+/// Called by the back buffer when its last reference of either kind goes.
+/// When the application has already released the swap chain, this is the
+/// release that frees it, and the back buffer with it, so the caller must
+/// not touch the back buffer afterwards.
+///
+/// # Safety
+/// `swap_chain` is the live app-owned `Direct3DSwapChain9` the back buffer
+/// names as its container, pinned by a matching [`pin_for_backbuffer`].
+pub unsafe fn unpin_for_backbuffer(swap_chain: u64) {
+    let this = swap_chain as *mut Direct3DSwapChain9;
+    let finalize_now = {
+        // SAFETY: the caller passes the live, pinned swap chain wrapper.
+        let obj = unsafe { &mut *this };
+        // SAFETY: its `inner` is live for as long as the wrapper is.
+        let inner = unsafe { &mut *obj.inner };
+        debug_assert!(
+            inner.backbuffer_pins > 0,
+            "unpinned a swap chain that was not pinned"
+        );
+        if inner.backbuffer_pins == 0 {
+            // A back buffer's references and its pin went out of step. The
+            // swap chain is left alone: whatever freed the pin's owner may
+            // already be finalizing it.
+            mtld3d_shared::log_once_warn!(target: LOG_TARGET,
+                "swap chain {swap_chain:#x}: a back buffer released a pin it did not hold; the swap chain is not finalized here");
+            return;
+        }
+        inner.backbuffer_pins -= 1;
+        inner.backbuffer_pins == 0 && obj.refcount == 0 && !inner.owned_by_device
+    };
+    if finalize_now {
+        // SAFETY: the public count and the back buffer's pin are both zero, so
+        // no reference to the swap chain survives.
+        unsafe { finalize_swapchain(this) };
+    }
+}
+
 /// Destroy an app-owned `Direct3DSwapChain9` wrapper once its refcount has reached zero.
 ///
-/// The device-owned implicit swapchain is never finalized (its shell is leaked
-/// at device teardown).
+/// Its back buffer goes with it, so this runs only once the back buffer is
+/// referenced by nothing either: the last public `Release` of an unpinned
+/// swap chain, or [`unpin_for_backbuffer`] after it. The device-owned
+/// implicit swapchain is never finalized (its shell is leaked at device
+/// teardown).
 ///
 /// # Safety
 /// `this` must point to a live, app-owned `Direct3DSwapChain9` wrapper at
@@ -193,7 +261,8 @@ unsafe fn finalize_swapchain(this: *mut Direct3DSwapChain9) {
     let inner = unsafe { (*this).inner };
     // Finalize the swapchain-owned cached backbuffer surface (a `Backbuffer`-kind
     // surface never freed by its own `Release` — destroyed with its owner here,
-    // mirroring how `device_release` finalizes the implicit RT/DS surfaces).
+    // mirroring how `device_release` finalizes the implicit RT/DS surfaces). It
+    // pins this swap chain while referenced, so nothing references it now.
     // SAFETY: `inner` is live (sole owner); read the cached pointer before the
     // box is freed.
     let backbuffer_surface = unsafe { (*inner).backbuffer_surface };
@@ -209,12 +278,18 @@ unsafe fn finalize_swapchain(this: *mut Direct3DSwapChain9) {
     drop(unsafe { Box::from_raw(this) });
 }
 
-// SAFETY: `refcount_mut` exposes this wrapper's own counter; `finalize` frees an
-// app-owned swapchain exactly once at refcount zero. The device-owned implicit
+// SAFETY: `refcount_mut` exposes this wrapper's own counter and
+// `private_refcount` the back buffer's pin; `finalize` frees an app-owned
+// swapchain exactly once when both are zero. The device-owned implicit
 // swapchain forwards its refcount to the device and is never finalized here.
 unsafe impl crate::com_ref::ComChild for Direct3DSwapChain9 {
     fn refcount_mut(&mut self) -> &mut u32 {
         &mut self.refcount
+    }
+    fn private_refcount(&self) -> u32 {
+        // The back buffer's pin keeps a swap chain whose public count reached
+        // zero alive; `unpin_for_backbuffer` finalizes it when the pin goes.
+        self.inner().backbuffer_pins
     }
     fn owning_device(&self) -> *mut c_void {
         // Both the device-owned implicit swapchain (forwards on its 0→1 edge)
@@ -334,8 +409,8 @@ extern "system" fn swapchain_get_back_buffer(
     }
     // App-owned additional swapchain: return its cached, swapchain-owned
     // backbuffer surface (a `Backbuffer`-kind surface — refcount 0, forwards the
-    // device refcount on its 0↔1 edge, never freed by `Release`; finalized in
-    // `finalize_swapchain`). One cached object keeps `GetBackBuffer` identity
+    // device refcount on its 0↔1 edge and pins this swapchain while referenced,
+    // never freed by `Release`; finalized in `finalize_swapchain`). One cached object keeps `GetBackBuffer` identity
     // stable, so a `Release`-to-0-then-`AddRef` no longer reuses a freed wrapper.
     // There is one Metal drawable, so it aliases the device backbuffer (resolved
     // live, like the device's implicit RT) and `this` is its `GetContainer`.
@@ -345,7 +420,7 @@ extern "system" fn swapchain_get_back_buffer(
     // lazily cache the backbuffer is sound.
     let inner_mut = unsafe { &mut *obj.inner };
     if inner_mut.backbuffer_surface == 0 {
-        let surf = Direct3DSurface9::new_implicit_backbuffer(inner_mut.device_inner, this as u64);
+        let surf = Direct3DSurface9::new_swap_chain_backbuffer(inner_mut.device_inner, this as u64);
         inner_mut.backbuffer_surface = Box::into_raw(Box::new(surf)) as u64;
     }
     let surf = inner_mut.backbuffer_surface as *mut Direct3DSurface9;
