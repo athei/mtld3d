@@ -15,10 +15,10 @@ use std::{
 
 use mtld3d_core::display_mode::MAX_SERVED_SIZES;
 use mtld3d_tests::{
-    Harness, HarnessConfig, StateBlock, Texture, TexturedVertex, WM_ACTIVATEAPP, WS_CAPTION,
-    WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE, WindowStyle, assert_pixel_eq, config_var, create_window,
-    cursor_is_live, cursor_mask_bits, destroy_window, enumerate_display_sizes, run_child,
-    spawn_scoped, window_rect,
+    Harness, HarnessConfig, PosVertex, StateBlock, Texture, TexturedVertex, WM_ACTIVATEAPP,
+    WS_CAPTION, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE, WindowStyle, assert_pixel_eq, config_var,
+    create_window, cursor_is_live, cursor_mask_bits, destroy_window, enumerate_display_sizes,
+    run_child, spawn_scoped, window_rect,
 };
 use mtld3d_types::{
     D3D_OK, D3DCLEAR_TARGET, D3DCREATE_HARDWARE_VERTEXPROCESSING, D3DCREATE_NOWINDOWCHANGES,
@@ -28,12 +28,13 @@ use mtld3d_types::{
     D3DFMT_DXT1, D3DFMT_G16R16, D3DFMT_G16R16F, D3DFMT_G32R32F, D3DFMT_L8, D3DFMT_NV12,
     D3DFMT_R5G6B5, D3DFMT_R8G8B8, D3DFMT_R16F, D3DFMT_R32F, D3DFMT_UYVY, D3DFMT_X8B8G8R8,
     D3DFMT_X8R8G8B8, D3DFMT_YUY2, D3DFMT_YV12, D3DFVF_DIFFUSE, D3DFVF_TEX1, D3DFVF_XYZ,
-    D3DOK_NOAUTOGEN, D3DPOOL_DEFAULT, D3DPOOL_MANAGED, D3DPOOL_SCRATCH, D3DPOOL_SYSTEMMEM,
-    D3DPRESENT_INTERVAL_FOUR, D3DPRESENT_INTERVAL_IMMEDIATE, D3DPRESENT_INTERVAL_ONE,
-    D3DPRESENT_INTERVAL_THREE, D3DPRESENT_INTERVAL_TWO, D3DPRESENT_PARAMETERS, D3DPT_TRIANGLELIST,
-    D3DRS_COLORWRITEENABLE, D3DRS_FILLMODE, D3DRS_LIGHTING, D3DRTYPE_CUBETEXTURE, D3DRTYPE_SURFACE,
-    D3DRTYPE_TEXTURE, D3DRTYPE_VOLUME, D3DRTYPE_VOLUMETEXTURE, D3DSBT_ALL, D3DSWAPEFFECT_DISCARD,
-    D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_DYNAMIC, D3DUSAGE_QUERY_FILTER,
+    D3DGAMMARAMP, D3DOK_NOAUTOGEN, D3DPOOL_DEFAULT, D3DPOOL_MANAGED, D3DPOOL_SCRATCH,
+    D3DPOOL_SYSTEMMEM, D3DPRESENT_INTERVAL_FOUR, D3DPRESENT_INTERVAL_IMMEDIATE,
+    D3DPRESENT_INTERVAL_ONE, D3DPRESENT_INTERVAL_THREE, D3DPRESENT_INTERVAL_TWO,
+    D3DPRESENT_PARAMETERS, D3DPT_TRIANGLELIST, D3DRS_COLORWRITEENABLE, D3DRS_FILLMODE,
+    D3DRS_LIGHTING, D3DRTYPE_CUBETEXTURE, D3DRTYPE_SURFACE, D3DRTYPE_TEXTURE, D3DRTYPE_VOLUME,
+    D3DRTYPE_VOLUMETEXTURE, D3DSBT_ALL, D3DSWAPEFFECT_DISCARD, D3DUSAGE_AUTOGENMIPMAP,
+    D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_DYNAMIC, D3DUSAGE_QUERY_FILTER,
     D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING, D3DUSAGE_QUERY_SRGBREAD, D3DUSAGE_QUERY_SRGBWRITE,
     D3DUSAGE_QUERY_VERTEXTEXTURE, D3DUSAGE_QUERY_WRAPANDMIP, D3DUSAGE_RENDERTARGET, D3DVIEWPORT9,
     DevCaps, IDirect3D9Vtbl, TextureCaps,
@@ -1462,7 +1463,7 @@ fn logged_ceilings() -> Vec<(String, u32)> {
 }
 
 /// Whether this process is the copy of the test executable named `child_name`.
-fn running_as(child_name: &str) -> bool {
+pub fn running_as(child_name: &str) -> bool {
     std::env::current_exe()
         .expect("resolve test executable")
         .file_name()
@@ -1478,7 +1479,16 @@ const PRIVATE_LOG_FILTER: &str = "warn,mtld3d::unix=info";
 /// layer writes its log into a directory only that process uses, so a test
 /// that reads its own process log reads its device's lines and nobody
 /// else's. Panics with the child's standard error when the child fails.
-fn run_in_private_log_child(child_name: &str, test: &str, filter: &str) {
+pub fn run_in_private_log_child(child_name: &str, test: &str, filter: &str) {
+    run_in_private_log_child_with(child_name, test, filter, "");
+}
+
+/// [`run_in_private_log_child`] with `config` entries appended to the child's configuration.
+///
+/// `config` is `key=value` entries separated by `;`, applied after the
+/// suite's own, so an entry here overrides the suite's value for this child
+/// alone.
+pub fn run_in_private_log_child_with(child_name: &str, test: &str, filter: &str, config: &str) {
     let exe = std::env::current_exe().expect("resolve test executable");
     let _factory = Harness::factory_only();
     let stamp = std::time::SystemTime::now()
@@ -1505,8 +1515,12 @@ fn run_in_private_log_child(child_name: &str, test: &str, filter: &str) {
     // child is handed the private directory instead, always, and the run here
     // takes the same path CI takes. The parser keeps everything after the
     // entry's first `=`, so the path stands as long as it carries no `;`.
-    let output = run_child(&mut command, &format!("log.dir={}", dir.display()))
-        .expect("run the workload child");
+    let entries = if config.is_empty() {
+        format!("log.dir={}", dir.display())
+    } else {
+        format!("{config};log.dir={}", dir.display())
+    };
+    let output = run_child(&mut command, &entries).expect("run the workload child");
     assert!(
         output.status.success(),
         "workload child {child_name} failed: {}",
@@ -1664,7 +1678,7 @@ fn process_log() -> String {
 ///
 /// The layer's log thread writes a line a moment after the call that
 /// produced it returns, so the lines are polled for, within a bound.
-fn await_logged_lines(needle: &str, expected: usize) -> Vec<String> {
+pub fn await_logged_lines(needle: &str, expected: usize) -> Vec<String> {
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
         let logged = logged_lines(needle);
@@ -2451,6 +2465,170 @@ fn reset_fullscreen_retarget_keeps_the_previous_window_covered() {
         second_rect,
         "leaving fullscreen gives back the window the device presented into",
     );
+    destroy_window(second);
+}
+
+/// The name `a_texture_moving_between_live_devices_leaves_the_first` runs its workload under.
+const TEXTURE_MOVE_CHILD_NAME: &str = "texture-move.exe";
+
+/// The child's log filter: the texture's move and the encoders' cache records.
+const TEXTURE_MOVE_LOG_FILTER: &str =
+    "warn,mtld3d::d3d9::tex=info,mtld3d::unix=debug,mtld3d::unix::command=warn";
+
+/// A texture taken over by a second live device leaves the first device's encoder.
+///
+/// A `D3DPOOL_MANAGED` texture follows the device it is drawn with. The
+/// device it leaves had created Metal storage for it, and the destroy a
+/// texture's release sends goes to the device it is attached to at that
+/// point, which is the new one: without a destroy of its own, the first
+/// device kept that storage until it was released. The workload runs in a
+/// process of its own, so the log it reads holds its devices' lines alone.
+#[test]
+fn a_texture_moving_between_live_devices_leaves_the_first() {
+    if running_as(TEXTURE_MOVE_CHILD_NAME) {
+        texture_move_workload();
+        return;
+    }
+    run_in_private_log_child(
+        TEXTURE_MOVE_CHILD_NAME,
+        "device::a_texture_moving_between_live_devices_leaves_the_first",
+        TEXTURE_MOVE_LOG_FILTER,
+    );
+}
+
+/// Draw with a managed texture on one device, then on a second, and wait for the first to drop it.
+fn texture_move_workload() {
+    const GREEN: u32 = 0xFF00_FF00;
+    let triangle = [
+        PosVertex {
+            x: 0.0,
+            y: 0.5,
+            z: 0.5,
+        },
+        PosVertex {
+            x: 0.5,
+            y: -0.5,
+            z: 0.5,
+        },
+        PosVertex {
+            x: -0.5,
+            y: -0.5,
+            z: 0.5,
+        },
+    ];
+    let draw_with = |h: &Harness, texture: &Texture<'_>| {
+        assert_eq!(h.set_texture(0, texture), D3D_OK, "SetTexture");
+        assert_eq!(h.set_fvf(D3DFVF_XYZ), D3D_OK, "SetFVF");
+        h.render_once(GREEN, |d| {
+            assert_eq!(
+                d.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &triangle),
+                D3D_OK,
+                "draw"
+            );
+        });
+        // The read-back waits for the encoder to have replayed the frame.
+        let _ = h.read_pixel(1, 1);
+        assert_eq!(h.clear_texture(0), D3D_OK, "unbind the texture");
+    };
+
+    let first = Harness::new();
+    let second = Harness::new();
+    let texture = first.create_texture(2, 2, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED);
+    texture.lock_rect(0, 0).write_u32(&[GREEN; 4]);
+    draw_with(&first, &texture);
+    draw_with(&second, &texture);
+
+    let moved = await_logged_lines("rehydrated for new device", 1);
+    let id = moved[0]
+        .split_once(" tex ")
+        .and_then(|(_, rest)| rest.split_whitespace().next())
+        .expect("the move line names the texture")
+        .to_owned();
+    // The first device's next frame carries the destroy its encoder runs.
+    assert_eq!(
+        first.present(),
+        D3D_OK,
+        "a present on the device the texture left"
+    );
+    let _ = first.read_pixel(1, 1);
+    await_logged_lines(&format!("texture {id} left the encoder cache"), 1);
+    drop(texture);
+}
+
+/// The name the workload child of `fullscreen_retarget_reset_carries_the_gamma_ramp` runs under.
+const GAMMA_RETARGET_CHILD_NAME: &str = "gamma-retarget.exe";
+
+/// A fullscreen `Reset` onto another device window carries the gamma ramp to the layer it attaches.
+///
+/// The retarget attaches a fresh layer, which carries no ramp, so the device
+/// sends the one it holds again. It has to ride a frame that names the new
+/// layer: the frames the Reset flushes on its way still name the layer the
+/// retarget detached, and the unix side drops a ramp for a layer no
+/// attachment record names, logging that once. The workload runs in a
+/// process of its own, so the log it reads holds its device's lines alone.
+#[test]
+fn fullscreen_retarget_reset_carries_the_gamma_ramp() {
+    if running_as(GAMMA_RETARGET_CHILD_NAME) {
+        gamma_retarget_workload();
+        return;
+    }
+    // The Main Thread Checker is off in this child alone: presenting into the
+    // window the retarget covers runs winemac's `-[WineMetalLayer nextDrawable]`,
+    // which reads `-[NSView superview]` on the presenter thread, and the checker
+    // ends the process on CI. Re-enable it when #990 keeps that Wine call off
+    // mtld3d's layers (https://github.com/athei/mtld3d/issues/990).
+    run_in_private_log_child_with(
+        GAMMA_RETARGET_CHILD_NAME,
+        "device::fullscreen_retarget_reset_carries_the_gamma_ramp",
+        PRIVATE_LOG_FILTER,
+        "debug.mainThreadChecker=false",
+    );
+}
+
+/// Set a ramp on a fullscreen device, retarget it fullscreen onto a second window, and present.
+fn gamma_retarget_workload() {
+    let h = Harness::new();
+    let second = create_window(320, 240, false);
+    h.hold_display_mode();
+    let (screen_w, screen_h) = Harness::screen_size();
+    let mut pp = fullscreen_params(h.hwnd(), screen_w, screen_h);
+    assert_eq!(
+        h.reset_params(&mut pp),
+        D3D_OK,
+        "fullscreen Reset on the device's own window"
+    );
+    // Every level at half its identity value: usable, and not identity.
+    let half: [u16; 256] = core::array::from_fn(|level| {
+        u16::try_from(level * 128).expect("a level of the halved ramp fits u16")
+    });
+    h.set_gamma_ramp(
+        0,
+        0,
+        &D3DGAMMARAMP {
+            red: half,
+            green: half,
+            blue: half,
+        },
+    );
+    assert_eq!(h.present(), D3D_OK, "the present that carries the ramp");
+
+    let mut pp = fullscreen_params(second, screen_w, screen_h);
+    assert_eq!(
+        h.reset_params(&mut pp),
+        D3D_OK,
+        "fullscreen Reset onto a second device window"
+    );
+    assert_eq!(h.present(), D3D_OK, "the present after the retarget");
+    // The read-back waits for the encoder to have replayed every frame before
+    // it, which is where a ramp reaches the layer its frame names.
+    let _ = h.read_pixel(1, 1);
+    let dropped = logged_lines("with no attachment record");
+    assert!(
+        dropped.is_empty(),
+        "a ramp rode a frame naming a detached layer: {dropped:?}"
+    );
+
+    assert_eq!(h.reset(screen_w, screen_h), D3D_OK, "windowed Reset");
     destroy_window(second);
 }
 

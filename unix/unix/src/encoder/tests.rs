@@ -19,7 +19,11 @@ use objc2_metal::{
     MTLRenderPipelineState,
 };
 
-use super::{DestroyKind, StageLibHandles, WarmCache, destroy_resources_bulk};
+use super::{
+    BufferGpuState, DepthSnapshot, DestroyKind, StageLibHandles, StretchScratch, WarmCache,
+    cached_buffer_handles, destroy_resources_bulk, drain_source_scratch, take_released_buffer,
+    take_source_scratch,
+};
 
 struct NativeObjects {
     library: Retained<ProtocolObject<dyn MTLLibrary>>,
@@ -312,4 +316,165 @@ fn payload_rotation_reuses_warm_scratch_chunks_across_the_submit_thread() {
     assert_eq!(pool.len(), usize::try_from(created).unwrap());
     assert_eq!(chunk_total, 2 * (created + 1));
     assert_eq!(seen.len(), usize::try_from(chunk_total).unwrap());
+}
+
+/// An opaque texture handle, never dereferenced.
+fn texture(raw: u64) -> MetalHandle<mtld3d_shared::mtl_handle::MTLTextureKind> {
+    // SAFETY: tests; opaque values never dereferenced.
+    unsafe { MetalHandle::new(raw) }
+}
+
+/// A destroyed source takes its depth snapshot and `StretchRect` scratch with it.
+///
+/// Both caches are keyed by the source texture's handle. A source destroyed
+/// without its entries leaked a full-size Private copy per recreated depth
+/// target or back buffer, and a texture Metal later created at the same
+/// address was handed the old copy. Shutdown takes whatever is left.
+#[test]
+fn a_destroyed_source_takes_its_scratch_copies_and_leaves_the_others() {
+    let mut snapshots = rustc_hash::FxHashMap::default();
+    let mut scratch = rustc_hash::FxHashMap::default();
+    for (source, copy) in [(0x100, 0x1100), (0x200, 0x1200)] {
+        snapshots.insert(
+            source,
+            DepthSnapshot {
+                handle: texture(copy),
+                width: 64,
+                height: 64,
+                format: PixelFormat::Depth32Float,
+                epoch: 0,
+            },
+        );
+    }
+    for (source, copy) in [(0x100, 0x2100), (0x300, 0x2300)] {
+        scratch.insert(
+            source,
+            StretchScratch {
+                handle: texture(copy),
+                width: 64,
+                height: 64,
+                format: PixelFormat::Bgra8Unorm,
+            },
+        );
+    }
+
+    let taken = take_source_scratch(&mut snapshots, &mut scratch, 0x100);
+    assert_eq!(
+        taken.map(|copy| copy.map(MetalHandle::raw)),
+        [Some(0x1100), Some(0x2100)],
+        "both copies of the destroyed source are handed back for retirement"
+    );
+    assert_eq!(
+        take_source_scratch(&mut snapshots, &mut scratch, 0x100).map(|copy| copy.is_some()),
+        [false, false],
+        "a texture created later at the same address finds no copy of the old one"
+    );
+    assert!(
+        snapshots.contains_key(&0x200),
+        "another source keeps its snapshot"
+    );
+    assert!(
+        scratch.contains_key(&0x300),
+        "another source keeps its scratch"
+    );
+
+    let mut rest: Vec<u64> = drain_source_scratch(&mut snapshots, &mut scratch)
+        .into_iter()
+        .map(MetalHandle::raw)
+        .collect();
+    rest.sort_unstable();
+    assert_eq!(rest, [0x1200, 0x2300], "shutdown takes every copy left");
+    assert!(snapshots.is_empty() && scratch.is_empty());
+}
+
+/// An opaque buffer handle, never dereferenced.
+fn buffer(raw: u64) -> MetalHandle<mtld3d_shared::mtl_handle::MTLBufferKind> {
+    // SAFETY: tests; opaque values never dereferenced.
+    unsafe { MetalHandle::new(raw) }
+}
+
+/// A `Staged` entry whose CPU backing was released, the shape a `WRITEONLY` DEFAULT buffer reaches.
+fn staged(device_buffer: u64, last_submit_seq: u64) -> BufferGpuState {
+    BufferGpuState {
+        mtl_buffer: MetalHandle::NULL,
+        device_buffer: buffer(device_buffer),
+        is_staged: true,
+        backing_ptr: 0,
+        length: 4096,
+        backing_generation: 0,
+        last_submit_seq,
+    }
+}
+
+/// A `Direct` entry wrapping a CPU backing.
+fn direct(wrapper: u64) -> BufferGpuState {
+    BufferGpuState {
+        mtl_buffer: buffer(wrapper),
+        device_buffer: MetalHandle::NULL,
+        is_staged: false,
+        backing_ptr: 0x10_0000,
+        length: 4096,
+        backing_generation: 1,
+        last_submit_seq: 3,
+    }
+}
+
+/// A released `Staged` buffer with no backing hands its device buffer to the retention queue.
+///
+/// A `D3DPOOL_DEFAULT` `D3DUSAGE_WRITEONLY` buffer drops its CPU copy after
+/// its upload, so its release sends no backing through the retention intake,
+/// the one path that took the entry out before; its Private device buffer
+/// leaked on every release, and every DEFAULT buffer is recreated around a
+/// `Reset`. The destroy waits for the later of the frame that released the
+/// buffer and the last frame that drew with it.
+#[test]
+fn a_released_staged_buffer_retires_its_device_buffer() {
+    use mtld3d_core::ids::BufferId;
+
+    let mut cache = rustc_hash::FxHashMap::default();
+    let (released, kept, wrapped) = (
+        BufferId::from_raw(1),
+        BufferId::from_raw(2),
+        BufferId::from_raw(3),
+    );
+    cache.insert(released, staged(0xD100, 7));
+    cache.insert(kept, staged(0xD200, 7));
+    cache.insert(wrapped, direct(0xC300));
+
+    let entry = take_released_buffer(&mut cache, released, 5).expect("the device buffer retires");
+    assert!(matches!(entry.kind, DestroyKind::Buffer));
+    assert_eq!(entry.handle, 0xD100);
+    assert_eq!(entry.seq, 7, "gated on the last frame that drew with it");
+    assert!(entry.page_box.is_none(), "no CPU backing rides along");
+    assert!(!cache.contains_key(&released));
+    assert!(
+        take_released_buffer(&mut cache, released, 9).is_none(),
+        "a second destroy finds nothing"
+    );
+    assert_eq!(
+        take_released_buffer(&mut cache, kept, 9).map(|entry| entry.seq),
+        Some(9),
+        "a release after the last draw waits for its own frame"
+    );
+    assert!(
+        take_released_buffer(&mut cache, wrapped, 9).is_none(),
+        "a Direct wrapper retires with its backing, not here"
+    );
+    assert!(cache.contains_key(&wrapped));
+}
+
+/// Shutdown collects the `Staged` device buffers as well as the `Direct` wrappers.
+#[test]
+fn shutdown_collects_staged_device_buffers_and_direct_wrappers() {
+    use mtld3d_core::ids::BufferId;
+
+    let mut cache = rustc_hash::FxHashMap::default();
+    cache.insert(BufferId::from_raw(1), staged(0xD100, 1));
+    cache.insert(BufferId::from_raw(2), direct(0xC200));
+    // A staged entry whose warmup create failed holds no buffer yet.
+    cache.insert(BufferId::from_raw(3), staged(0, 1));
+
+    let mut handles = cached_buffer_handles(&cache);
+    handles.sort_unstable();
+    assert_eq!(handles, [0xC200, 0xD100]);
 }

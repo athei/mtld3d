@@ -165,6 +165,11 @@ impl FrameRecorder {
                 let value = *value;
                 self.record_typed(scratch, value)
             }
+            Op::DestroyBuffer(value) => {
+                #[cfg(not(windows))]
+                let value = *value;
+                self.record_typed(scratch, value)
+            }
             Op::NoteColorRead(value) => {
                 #[cfg(not(windows))]
                 let value = *value;

@@ -444,8 +444,8 @@ unsafe fn finalize_vertex_buffer(this: *mut Direct3DVertexBuffer9) {
     // `Box::into_raw(VertexBufferInner)` from `Self::new` and no
     // other reference can survive.
     let mut inner_box = unsafe { Box::from_raw(inner_ptr) };
-    // A buffer that already released its backing has nothing left to
-    // retain: the GPU reads its device buffer, not this memory.
+    // A buffer that already released its backing has no CPU copy left to
+    // retain, and the release destroys the device buffer the GPU reads.
     let current_box = inner_box.backing.release();
     let VertexBufferInner {
         device_inner,
@@ -453,14 +453,12 @@ unsafe fn finalize_vertex_buffer(this: *mut Direct3DVertexBuffer9) {
         last_submit_seq,
         ..
     } = *inner_box;
-    if !device_inner.is_null()
-        && let Some(current_box) = current_box
-    {
+    if !device_inner.is_null() {
         // SAFETY: `device_inner` was stamped at `Self::new` from a
         // live `DeviceInner`; the device outlives all its child
         // resources per D3D9 lifetime rules.
         let dev = unsafe { &mut *device_inner };
-        dev.queue_vbib_retention(buffer_id, current_box, last_submit_seq);
+        dev.retire_released_buffer(buffer_id, current_box, last_submit_seq);
     }
     // SAFETY: both counters reached zero; `this` is the original
     // `Box::into_raw(Direct3DVertexBuffer9)` allocation.

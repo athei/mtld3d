@@ -147,6 +147,9 @@ fn execute_control(
             None,
         ),
         EncoderOpcode::DestroyTexture => enc.destroy_cached_texture(texture_id(payload)?),
+        EncoderOpcode::DestroyBuffer => {
+            enc.destroy_cached_buffer(BufferId::from_raw(borrow::<records::IdRecord>(payload)?.id));
+        }
         EncoderOpcode::ReadColorHandle
         | EncoderOpcode::ReadTextureColorHandle
         | EncoderOpcode::ReadTextureHandle => {

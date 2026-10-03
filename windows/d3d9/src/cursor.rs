@@ -31,6 +31,7 @@ use log::{Level, debug, error, info, log_enabled, trace, warn};
 use mtld3d_core::{
     cursor::{BitmapLayout, reconcile_upload},
     perf::DeviceSubCategory,
+    window_subclass::WindowSubclasses,
 };
 use mtld3d_shared::{
     InPtr, MetalHandle, SetCursorOverlayParams,
@@ -42,7 +43,6 @@ use mtld3d_types::{
     CURSOR_SHOWING, CURSORINFO, D3DLOCK_READONLY, D3DLOCKED_RECT, D3DSURFACE_DESC, ICONINFO,
     IDirect3DSurface9Vtbl, POINT,
 };
-use rustc_hash::FxHashMap;
 use xxhash_rust::xxh3::Xxh3;
 
 use super::{
@@ -314,18 +314,19 @@ const WM_APP_REACTIVATE_FULLSCREEN: u32 = 0x8000 + 0x03DA;
 
 // ── Per-window subclass back-pointers ──
 
-/// Maps each subclassed window (`HWND` as `usize`) to the owning `DeviceInner`.
+/// The subclassed windows (`HWND` as `usize`), each with the `DeviceInner`s registered on it.
 ///
-/// The device is held as a raw pointer widened to `usize`. Populated by
-/// `CursorState::install_subclass` during `CreateDevice`, entry removed by
-/// `CursorState::uninstall_subclass` during device release. `cursor_wnd_proc`
-/// looks up its own `hwnd` here to find the owning device — `CallWindowProcW`
-/// can't pass per-device user data, and a single global back-pointer is wrong
-/// when more than one device exists at once (the second `CreateDevice` would
-/// orphan the first window's cursor and, once either device tears down, leave a
-/// still-subclassed window pointing at a stale/cleared device).
-static DEVICE_INSTANCES: LazyLock<Mutex<FxHashMap<usize, usize>>> =
-    LazyLock::new(|| Mutex::new(FxHashMap::default()));
+/// Devices are held as raw pointers widened to `usize`. A device registers in
+/// `CursorState::install_subclass` during `CreateDevice` and a retarget, and
+/// leaves in `CursorState::uninstall_subclass` during release and a retarget.
+/// `cursor_wnd_proc` looks up its own `hwnd` here to find the device a message
+/// goes to and the procedure to forward to: `CallWindowProcW` can't pass
+/// per-device user data, and a window procedure has no key but the `HWND`.
+/// Two devices may share one window, so only the first one replaces the
+/// procedure and the last one to leave puts it back
+/// ([`mtld3d_core::window_subclass`]).
+static DEVICE_INSTANCES: LazyLock<Mutex<WindowSubclasses>> =
+    LazyLock::new(|| Mutex::new(WindowSubclasses::default()));
 
 // ── CursorState ──
 
@@ -480,7 +481,6 @@ const HITCH_MAX_INTERVAL_US: u64 = 500_000;
 /// writes them, so cursor invariants don't leak into the rest of `d3d9`.
 pub struct CursorState {
     hwnd: *mut c_void,
-    original_wndproc: *mut c_void,
     /// The metal view the device attached, naming its unix-side attachment record.
     ///
     /// Every `SetCursorOverlay` carries it so the overlay follows this
@@ -571,7 +571,6 @@ impl CursorState {
         }
         Self {
             hwnd,
-            original_wndproc: null_mut(),
             view_handle,
             sinks,
             handle: null_mut(),
@@ -948,11 +947,12 @@ impl CursorState {
     /// Subclass the game's hwnd so `WM_SETCURSOR` / `WM_ACTIVATE` route through `cursor_wnd_proc`.
     ///
     /// Registers `dev_ptr` in `DEVICE_INSTANCES` under this window's `HWND`, so
-    /// the subclass can resolve the owning device from the window a message
-    /// arrived on. The game's original wndproc is stored back into `self` for
-    /// later restoration. No-op if `hwnd` was never captured or `dev_ptr` is
-    /// null.
-    pub fn install_subclass(&mut self, dev_ptr: *mut DeviceInner) {
+    /// the subclass can resolve the device from the window a message arrived
+    /// on. Only the first device on a window replaces its procedure; a device
+    /// joining a window another live device already subclasses shares that
+    /// hook, and messages keep going to the first device until it leaves.
+    /// No-op if `hwnd` was never captured or `dev_ptr` is null.
+    pub fn install_subclass(&self, dev_ptr: *mut DeviceInner) {
         if self.hwnd.is_null() || dev_ptr.is_null() {
             mtld3d_shared::log_once_warn!(
                 target: LOG_TARGET,
@@ -962,45 +962,53 @@ impl CursorState {
             );
             return;
         }
-        DEVICE_INSTANCES
+        let mut prev_wndproc = 0;
+        // The lock is held across the procedure swap so that a device leaving
+        // the window on another thread cannot restore the game's procedure in
+        // between, and the hook never takes itself for the procedure it wraps.
+        // Replacing `GWLP_WNDPROC` sends the window no message.
+        let installed = DEVICE_INSTANCES
             .lock()
             .expect("device-instances mutex poisoned")
-            .insert(self.hwnd as usize, dev_ptr as usize);
-        let prev = set_window_long_ptr(
-            self.hwnd,
-            GWLP_WNDPROC,
-            cursor_wnd_proc as *const () as isize,
-        );
-        self.original_wndproc = prev as *mut c_void;
+            .register(self.hwnd as usize, dev_ptr as usize, || {
+                prev_wndproc = set_window_long_ptr(
+                    self.hwnd,
+                    GWLP_WNDPROC,
+                    cursor_wnd_proc as *const () as isize,
+                )
+                .cast_unsigned();
+                prev_wndproc
+            });
         debug!(
             target: LOG_TARGET,
-            "install_subclass: hwnd={:p} dev={:p} prev_wndproc={:p} scale={} window_tid={} caller_tid={}",
+            "install_subclass: hwnd={:p} dev={:p} installed={installed} prev_wndproc={prev_wndproc:#x} scale={} window_tid={} caller_tid={}",
             self.hwnd,
             dev_ptr,
-            self.original_wndproc,
             self.scale,
             window_thread_id(self.hwnd),
             current_thread_id(),
         );
     }
 
-    /// Restore the game's original wndproc and drop this window's back-pointer.
+    /// Unregister `dev_ptr` from this window, restoring the game's wndproc when no device is left.
     ///
-    /// Removes the window's `DEVICE_INSTANCES` entry. Call from the
-    /// device-release path before freeing `DeviceInner`.
-    pub fn uninstall_subclass(&self) {
-        debug!(
-            target: LOG_TARGET,
-            "uninstall_subclass: hwnd={:p} restoring prev_wndproc={:p} cache_entries={}",
-            self.hwnd, self.original_wndproc, self.cache.len(),
-        );
-        if !self.hwnd.is_null() && !self.original_wndproc.is_null() {
-            set_window_long_ptr(self.hwnd, GWLP_WNDPROC, self.original_wndproc as isize);
-        }
-        DEVICE_INSTANCES
+    /// Call from the device-release path before freeing `DeviceInner`, and
+    /// before a retarget moves the device to another window.
+    pub fn uninstall_subclass(&self, dev_ptr: *mut DeviceInner) {
+        let restored = DEVICE_INSTANCES
             .lock()
             .expect("device-instances mutex poisoned")
-            .remove(&(self.hwnd as usize));
+            .unregister(self.hwnd as usize, dev_ptr as usize, |original| {
+                if original != 0 {
+                    set_window_long_ptr(self.hwnd, GWLP_WNDPROC, original.cast_signed());
+                }
+            });
+        debug!(
+            target: LOG_TARGET,
+            "uninstall_subclass: hwnd={:p} dev={dev_ptr:p} restored={restored} cache_entries={}",
+            self.hwnd,
+            self.cache.len(),
+        );
     }
 
     /// Destroy every HCURSOR this device built.
@@ -1070,9 +1078,10 @@ impl CursorState {
     ///
     /// A `Reset` naming a different `hDeviceWindow` moves the presentation
     /// surface onto that window, and the messages the cursor rides move with
-    /// it. The old window's procedure and back-pointer go back before the new
-    /// window's are taken, so a message arriving between the two finds no
-    /// device rather than the wrong one. The realized `HCURSOR`, both sprite
+    /// it. The device leaves the old window before it joins the new one, so a
+    /// message arriving between the two finds no device rather than the wrong
+    /// one, and a new window another device already subclasses is joined
+    /// rather than hooked a second time. The realized `HCURSOR`, both sprite
     /// caches and the visibility latches carry over: `Reset` re-specifies the
     /// swap chain, not the cursor the application set.
     ///
@@ -1087,9 +1096,8 @@ impl CursorState {
         view_handle: MetalHandle<NSViewKind>,
         dev_ptr: *mut DeviceInner,
     ) {
-        self.uninstall_subclass();
+        self.uninstall_subclass(dev_ptr);
         self.hwnd = hwnd;
-        self.original_wndproc = null_mut();
         self.view_handle = view_handle;
         self.install_subclass(dev_ptr);
         self.push_overlay_state();
@@ -1439,26 +1447,29 @@ pub extern "system" fn device_show_cursor(this: *mut c_void, show: i32) -> i32 {
 /// re-cover and reactivation posted as `WM_APP_REASSERT_FULLSCREEN` and
 /// `WM_APP_REACTIVATE_FULLSCREEN`, which set the display mode and move the
 /// window. The device pointer is read under the `DEVICE_INSTANCES` mutex and
-/// used after it is released; the device's final `Release` restores the
-/// original procedure and removes the entry before it frees anything, so only
-/// a message already past the lookup can meet a device being released. A
+/// used after it is released; the device's final `Release` removes its
+/// registration (the last device on the window also restores the original
+/// procedure) before it frees anything, so only a message already past the
+/// lookup can meet a device being released. A deferred fullscreen repair that
+/// one device posted and another device on the window receives finds that
+/// device's own state, and its guards make it a no-op there. A
 /// user resize or activation change on this thread while another thread
 /// draws, resets or releases the device under the flag is the residual, and
 /// native D3D9's window hook leaves the same one.
 extern "system" fn cursor_wnd_proc(hwnd: *mut c_void, msg: u32, wp: usize, lp: isize) -> isize {
-    // Resolve the owning device for *this* window. A window may still be
-    // subclassed briefly after its device's entry is removed (or never have
-    // been registered); fall back to the default proc rather than deref a
-    // missing/stale device.
-    let dev_ptr = DEVICE_INSTANCES
+    // Resolve the device for *this* window, and the procedure the hook
+    // replaced. A window may still be subclassed briefly after its last
+    // device left (or never have been registered); fall back to the default
+    // proc rather than deref a missing/stale device.
+    let route = DEVICE_INSTANCES
         .lock()
         .expect("device-instances mutex poisoned")
-        .get(&(hwnd as usize))
-        .copied()
-        .unwrap_or(0) as *mut DeviceInner;
-    if dev_ptr.is_null() {
+        .route(hwnd as usize);
+    let Some((device, original_wndproc)) = route else {
         return def_window_proc(hwnd, msg, wp, lp);
-    }
+    };
+    let dev_ptr = device as *mut DeviceInner;
+    let original_wndproc = original_wndproc as *mut c_void;
 
     // While the device itself is moving the window through a fullscreen
     // transition (mode-set, cover, restore), every message but the mode
@@ -1471,9 +1482,9 @@ extern "system" fn cursor_wnd_proc(hwnd: *mut c_void, msg: u32, wp: usize, lp: i
     }
 
     if msg == WM_SETCURSOR {
-        // SAFETY: `dev_ptr` is this window's `DEVICE_INSTANCES` entry,
-        // installed by `install_subclass`; it's null-checked above and
-        // removed only in `uninstall_subclass` on device drop.
+        // SAFETY: `dev_ptr` is the device this window's `DEVICE_INSTANCES`
+        // entry routes to, registered by `install_subclass` and removed only
+        // by `uninstall_subclass`, which runs before the device is freed.
         let cur = unsafe { (*dev_ptr).cursor_mut() };
         let hit_test = lp.cast_unsigned() & 0xFFFF;
         if hit_test == HTCLIENT && !cur.handle.is_null() && cur.effective_visible() {
@@ -1650,9 +1661,6 @@ extern "system" fn cursor_wnd_proc(hwnd: *mut c_void, msg: u32, wp: usize, lp: i
         return 0;
     }
 
-    // SAFETY: see WM_SETCURSOR branch — `dev_ptr` is live for the
-    // lifetime of the subclass.
-    let original_wndproc = unsafe { (*dev_ptr).cursor() }.original_wndproc;
     call_window_proc(original_wndproc, hwnd, msg, wp, lp)
 }
 

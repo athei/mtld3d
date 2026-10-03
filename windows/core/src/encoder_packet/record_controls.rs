@@ -484,6 +484,16 @@ capture_control!(
         capture_fixed!(recorder, scratch, tag, IdRecord { id: v.tex_id.raw() });
     }
 );
+capture_control!(DestroyBufferOp, DestroyBuffer, v, recorder, scratch, tag, {
+    capture_fixed!(
+        recorder,
+        scratch,
+        tag,
+        IdRecord {
+            id: v.buffer_id.raw()
+        }
+    );
+});
 capture_control!(NoteColorReadOp, NoteColorRead, v, recorder, scratch, tag, {
     capture_fixed!(recorder, scratch, tag, IdRecord { id: v.src.raw() });
 });

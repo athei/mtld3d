@@ -3,8 +3,8 @@
 //! The round-trip renders to a texture, then samples it.
 
 use mtld3d_tests::{
-    CubeTexture, Harness, HarnessConfig, PosColorVertex, Rgba8, RhwVertex, Surface, TexturedVertex,
-    Vertex, VolumeVertex,
+    CubeTexture, Harness, HarnessConfig, PosColorVertex, Rgba8, RhwVertex, Surface, SwapChain,
+    TexturedVertex, Vertex, VolumeVertex,
 };
 use mtld3d_types::{
     D3D_OK, D3DBLEND_INVSRCALPHA, D3DBLEND_SRCALPHA, D3DCLEAR_TARGET, D3DCLEAR_ZBUFFER,
@@ -20,7 +20,7 @@ use mtld3d_types::{
     D3DSAMP_MIPFILTER, D3DTA_DIFFUSE, D3DTA_TEXTURE, D3DTADDRESS_CLAMP, D3DTEXF_LINEAR,
     D3DTEXF_NONE, D3DTEXF_POINT, D3DTOP_MODULATE, D3DTOP_SELECTARG1, D3DTSS_ALPHAARG1,
     D3DTSS_ALPHAOP, D3DTSS_COLORARG1, D3DTSS_COLORARG2, D3DTSS_COLOROP, D3DUSAGE_AUTOGENMIPMAP,
-    D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_RENDERTARGET, D3DVIEWPORT9,
+    D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_RENDERTARGET, D3DVIEWPORT9, IID_IDIRECT3DSWAPCHAIN9,
 };
 
 const RED: u32 = 0xFFFF_0000;
@@ -1050,6 +1050,150 @@ fn intz_depth_sampled_while_bound_as_depth_attachment() {
         "the depth written by the occluder (0.25) samples back as dark gray, got {center:?}"
     );
     assert_eq!(h.clear_texture(0), 0, "unbind INTZ");
+}
+
+/// A RESZ resolve into an INTZ texture reaches the next draw that samples it while bound.
+///
+/// Sampling the bound depth attachment reads a copy the encoder keeps until
+/// a depth write moves its epoch. A RESZ resolve into the texture is such a
+/// write even though no draw or clear touches it: sampled again while bound,
+/// the texture must read the 0.75 the resolve brought in, not the 0.25 the
+/// first copy held.
+#[test]
+fn intz_depth_sampled_while_bound_sees_a_resz_resolve_into_it() {
+    let h = Harness::new();
+    let depth_texture = || {
+        h.create_texture(
+            640,
+            480,
+            1,
+            D3DUSAGE_DEPTHSTENCIL,
+            D3DFMT_INTZ,
+            D3DPOOL_DEFAULT,
+        )
+    };
+    let sampled = depth_texture();
+    let source = depth_texture();
+    let sampled_surf = sampled.surface_level(0);
+    let source_surf = source.surface_level(0);
+    let backbuffer = h.render_target(0);
+    assert_eq!(h.set_render_target(0, &backbuffer), 0, "color target");
+    assert_eq!(h.clear_texture(0), 0, "no sampler while writing depth");
+
+    // The resolve's source holds 0.75, written before the first sample takes its copy.
+    assert_eq!(h.set_depth_stencil_surface(&source_surf), 0, "bind source");
+    assert_eq!(h.clear(D3DCLEAR_ZBUFFER, BLACK, 0.75, 0), 0);
+
+    // The sampled texture gets 0.25 from a draw, then is sampled while bound.
+    assert_eq!(
+        h.set_depth_stencil_surface(&sampled_surf),
+        0,
+        "bind the sampled texture as depth"
+    );
+    assert_eq!(h.set_render_state(D3DRS_ZENABLE, 1), 0);
+    assert_eq!(h.set_render_state(D3DRS_ZWRITEENABLE, 1), 0);
+    assert_eq!(h.set_render_state(D3DRS_ZFUNC, D3DCMP_ALWAYS), 0);
+    h.select_diffuse_stage(0);
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE), 0);
+    assert_eq!(
+        h.clear(D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, BLACK, 1.0, 0),
+        0
+    );
+    let occluder = [
+        PosColorVertex {
+            x: -1.0,
+            y: 3.0,
+            z: 0.25,
+            color: WHITE,
+        },
+        PosColorVertex {
+            x: 3.0,
+            y: -1.0,
+            z: 0.25,
+            color: WHITE,
+        },
+        PosColorVertex {
+            x: -1.0,
+            y: -1.0,
+            z: 0.25,
+            color: WHITE,
+        },
+    ];
+    assert_eq!(h.begin_scene(), 0);
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &occluder),
+        0,
+        "depth write draw"
+    );
+    assert_eq!(h.end_scene(), 0);
+    assert_eq!(h.set_render_state(D3DRS_ZWRITEENABLE, 0), 0);
+    let sample_center = || {
+        assert_eq!(h.set_texture(0, &sampled), 0, "bind INTZ as a sampler");
+        h.select_texture_stage(0);
+        for (state, value) in [
+            (D3DSAMP_MINFILTER, D3DTEXF_POINT),
+            (D3DSAMP_MAGFILTER, D3DTEXF_POINT),
+            (D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP),
+            (D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP),
+        ] {
+            assert_eq!(h.set_sampler_state(0, state, value), 0, "sampler");
+        }
+        assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1), 0);
+        let v = |x: f32, y: f32, u: f32, vv: f32| TexturedVertex {
+            x,
+            y,
+            z: 0.5,
+            color: WHITE,
+            u,
+            v: vv,
+        };
+        let quad = [
+            v(-0.5, 0.5, 0.0, 0.0),
+            v(0.5, 0.5, 1.0, 0.0),
+            v(-0.5, -0.5, 0.0, 1.0),
+            v(0.5, 0.5, 1.0, 0.0),
+            v(0.5, -0.5, 1.0, 1.0),
+            v(-0.5, -0.5, 0.0, 1.0),
+        ];
+        assert_eq!(h.begin_scene(), 0);
+        assert_eq!(
+            h.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad),
+            0,
+            "sample-depth draw with the attachment still bound"
+        );
+        assert_eq!(h.end_scene(), 0);
+        assert_eq!(h.present(), 0);
+        let center = Rgba8::from_pixel(h.read_pixel(320, 240));
+        assert_eq!(h.clear_texture(0), 0, "unbind INTZ");
+        center
+    };
+    let first = sample_center();
+    assert!(
+        (48..=90).contains(&first.r),
+        "the first sample reads the drawn 0.25 as dark gray, got {first:?}"
+    );
+
+    // The resolve copies the bound source into the texture at stage 0, with
+    // no draw or clear on either; then the texture is the attachment again.
+    assert_eq!(h.set_depth_stencil_surface(&source_surf), 0, "bind source");
+    assert_eq!(h.set_texture(0, &sampled), 0, "bind resolve destination");
+    assert_eq!(
+        h.set_render_state(mtld3d_types::D3DRS_POINTSIZE, 0x7fa0_5000),
+        0,
+        "RESZ into the sampled texture"
+    );
+    assert_eq!(h.clear_texture(0), 0, "unbind the resolve destination");
+    assert_eq!(
+        h.set_depth_stencil_surface(&sampled_surf),
+        0,
+        "bind the sampled texture as depth again"
+    );
+    assert_eq!(h.clear(D3DCLEAR_TARGET, BLACK, 1.0, 0), 0);
+    let second = sample_center();
+    assert!(
+        (170..=210).contains(&second.r),
+        "the second sample reads the resolved 0.75 as light gray, got {second:?}"
+    );
 }
 
 #[test]
@@ -7209,4 +7353,137 @@ fn uncleared_draw_into_a_render_target_texture_keeps_last_frames_pixels() {
         inside.g > 200 && inside.r < 40 && inside.b < 40,
         "inside the triangle the target shows the green draw, got {inside:?}"
     );
+}
+
+/// The first back buffer of `chain`, as a reference that is not tied to the swap chain's.
+///
+/// D3D9 keeps a swap chain alive for as long as its back buffer is referenced,
+/// so a test may release the swap chain first; the harness wrapper's lifetime
+/// would forbid exactly that.
+fn detached_back_buffer<'h>(chain: &SwapChain<'h>) -> Surface<'h> {
+    let borrowed = chain.back_buffer();
+    let raw = borrowed.as_ptr();
+    core::mem::forget(borrowed);
+    Surface::from_raw(raw)
+}
+
+/// An additional swap chain's back buffer stays usable after the swap chain's last release.
+///
+/// The back buffer pins its swap chain while the application holds it, so
+/// releasing the swap chain first leaves both alive, the back buffer still
+/// describing itself and naming its swap chain as its container. The back
+/// buffer is a `D3DPOOL_DEFAULT` resource the application holds, so `Reset`
+/// refuses until it goes; its release then returns the device reference its
+/// first reference took, and the device count ends where it started.
+#[test]
+fn an_additional_swap_chain_back_buffer_outlives_the_swap_chain_release() {
+    let h = Harness::new();
+    let (width, height) = h.dims();
+    let before = h.device_refcount();
+    let chain = h.additional_swapchain();
+    let back_buffer = detached_back_buffer(&chain);
+    drop(chain);
+
+    let (hr, desc) = back_buffer.desc();
+    assert_eq!(hr, D3D_OK, "GetDesc on the held back buffer");
+    assert_eq!((desc.width, desc.height), (width, height));
+    let (hr, container, _) = back_buffer.get_container(&IID_IDIRECT3DSWAPCHAIN9);
+    assert_eq!(hr, D3D_OK, "the back buffer still names its swap chain");
+    assert!(!container.is_null());
+    assert_eq!(
+        h.reset(width, height),
+        D3DERR_INVALIDCALL,
+        "Reset refuses while the application holds the back buffer"
+    );
+
+    drop(back_buffer);
+    assert_eq!(
+        h.device_refcount(),
+        before,
+        "the back buffer's release returns the device reference it took"
+    );
+    assert_eq!(
+        h.reset(width, height),
+        D3D_OK,
+        "Reset succeeds once the back buffer is gone"
+    );
+}
+
+/// What a test does with the device once a bound back buffer's swap chain is released.
+#[derive(Debug)]
+enum AfterRelease {
+    /// `GetRenderTarget(0)` hands the bound back buffer back.
+    GetRenderTarget,
+    /// `SetRenderTarget(0, implicit)` drops the device's binding.
+    SetRenderTarget,
+    /// `Reset` drops the binding as it restores render target 0.
+    Reset,
+}
+
+/// A bound additional swap chain back buffer survives the application releasing it and its chain.
+///
+/// The device's binding is a reference of its own, so the swap chain and its
+/// back buffer survive the application's last releases of the two, and
+/// `GetRenderTarget` hands the back buffer back alive. Replacing the binding,
+/// directly or through `Reset`, releases the swap chain with its back buffer,
+/// and the device count is back where it started: every device reference and
+/// `Reset` blocker the back buffer took was returned.
+#[test]
+fn a_bound_additional_swap_chain_back_buffer_survives_the_application_releases() {
+    for after in [
+        AfterRelease::GetRenderTarget,
+        AfterRelease::SetRenderTarget,
+        AfterRelease::Reset,
+    ] {
+        let h = Harness::new();
+        let (width, height) = h.dims();
+        let before = h.device_refcount();
+        {
+            let chain = h.additional_swapchain();
+            let back_buffer = chain.back_buffer();
+            assert_eq!(
+                h.set_render_target(0, &back_buffer),
+                D3D_OK,
+                "{after:?}: bind the back buffer"
+            );
+        }
+        match after {
+            AfterRelease::GetRenderTarget => {
+                let bound = h.render_target(0);
+                let (hr, desc) = bound.desc();
+                assert_eq!(hr, D3D_OK, "{after:?}: GetDesc on the bound back buffer");
+                assert_eq!((desc.width, desc.height), (width, height));
+                let (hr, container, _) = bound.get_container(&IID_IDIRECT3DSWAPCHAIN9);
+                assert_eq!(
+                    hr, D3D_OK,
+                    "{after:?}: the bound back buffer names its swap chain"
+                );
+                assert!(!container.is_null());
+                drop(bound);
+                let implicit = h.back_buffer(0);
+                assert_eq!(h.set_render_target(0, &implicit), D3D_OK);
+            }
+            AfterRelease::SetRenderTarget => {
+                let implicit = h.back_buffer(0);
+                assert_eq!(h.set_render_target(0, &implicit), D3D_OK);
+            }
+            AfterRelease::Reset => {
+                assert_eq!(
+                    h.reset(width, height),
+                    D3D_OK,
+                    "{after:?}: the device's own binding does not block Reset"
+                );
+            }
+        }
+        assert_eq!(
+            h.device_refcount(),
+            before,
+            "{after:?}: the device count is back where it started"
+        );
+        assert_eq!(
+            h.reset(width, height),
+            D3D_OK,
+            "{after:?}: a later Reset succeeds"
+        );
+    }
 }

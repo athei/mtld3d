@@ -61,6 +61,7 @@ pub enum EncoderOpcode {
     SetLayerPacing = 46,
     SetGamma = 47,
     UpdateColorRegion = 48,
+    DestroyBuffer = 49,
 }
 
 /// How far a frame submission waits on the native pipeline.

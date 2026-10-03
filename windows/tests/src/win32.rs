@@ -63,6 +63,14 @@ unsafe extern "system" {
     ) -> i32;
 }
 
+// `GetWindowLongPtrA` is a 64-bit export only; 32-bit user32 answers the
+// same query through `GetWindowLongA`, which the header aliases it to.
+#[cfg(target_pointer_width = "64")]
+#[link(name = "user32")]
+unsafe extern "system" {
+    fn GetWindowLongPtrA(hwnd: usize, index: i32) -> isize;
+}
+
 #[link(name = "kernel32")]
 unsafe extern "system" {
     fn GetModuleHandleA(name: *const c_char) -> usize;
@@ -326,6 +334,9 @@ pub enum WindowStyle {
 }
 
 extern "system" fn wnd_proc(hwnd: usize, msg: u32, wparam: usize, lparam: isize) -> isize {
+    if msg == WM_HARNESS_PROBE {
+        return HARNESS_PROBE_REPLY;
+    }
     if msg == WM_DESTROY {
         // A window that `destroy_window` destroys takes this quit back out, so
         // only a window destroyed from outside the harness ends the pump.
@@ -548,6 +559,19 @@ pub struct Rect {
 /// `WM_ACTIVATEAPP` — the app-level activation message a fullscreen device answers.
 pub const WM_ACTIVATEAPP: u32 = 0x001C;
 
+/// A private message the harness window's own procedure answers with [`HARNESS_PROBE_REPLY`].
+///
+/// Sent to a test window, it tells whether the window's own procedure still
+/// receives what reaches the window, through whatever subclass the layer put
+/// in front of it: the default procedure answers it with 0. `WM_APP` range.
+pub const WM_HARNESS_PROBE: u32 = 0x8000 + 0x0E2E;
+
+/// What the harness window's procedure answers [`WM_HARNESS_PROBE`] with.
+pub const HARNESS_PROBE_REPLY: isize = 0x6D74_6C64;
+
+/// `GWLP_WNDPROC`: a window's procedure.
+const GWLP_WNDPROC: i32 = -4;
+
 /// `GWL_STYLE` — a window's style bits.
 pub const GWL_STYLE: i32 = -16;
 /// `GWL_EXSTYLE` — a window's extended style bits.
@@ -572,6 +596,37 @@ pub fn window_rect(hwnd: usize) -> Rect {
     let ok = unsafe { GetWindowRect(hwnd, &raw mut rect) };
     assert!(ok != 0, "GetWindowRect failed");
     rect
+}
+
+/// The procedure `hwnd` currently runs, as an address.
+///
+/// # Panics
+///
+/// Panics if a 32-bit target's procedure address does not fit `usize`, which
+/// it always does.
+#[must_use]
+pub fn window_proc(hwnd: usize) -> usize {
+    #[cfg(target_pointer_width = "64")]
+    {
+        // SAFETY: Win32 thunk; `hwnd` is a window this process created and
+        // the index is the documented `GWLP_WNDPROC`.
+        unsafe { GetWindowLongPtrA(hwnd, GWLP_WNDPROC) }.cast_unsigned()
+    }
+    #[cfg(target_pointer_width = "32")]
+    {
+        usize::try_from(
+            // SAFETY: Win32 thunk; `hwnd` is a window this process created and
+            // the index is the documented `GWLP_WNDPROC`, a 32-bit long here.
+            unsafe { GetWindowLongA(hwnd, GWLP_WNDPROC) }.cast_unsigned(),
+        )
+        .expect("a 32-bit procedure address fits usize")
+    }
+}
+
+/// The procedure the harness window class registers, as an address.
+#[must_use]
+pub fn harness_window_proc() -> usize {
+    wnd_proc as *const () as usize
 }
 
 /// `GetWindowLongA` — one of a window's `GWL_*` longs, as a bit mask.

@@ -35,16 +35,13 @@
 //!
 //! Unlike the pipelines in `blit.rs` / `clear_quad.rs` / `present.rs`, they are
 //! **not** leaked for the process: a resize walks through a new key per size
-//! the window rests at, and each one holds ~16 MiB of intermediates. The cache
-//! is bounded ([`MAX_CACHED_SCALERS`]) and evicts its least-recently-used
-//! entry, with the release deferred to a command buffer of the device's queue;
-//! everything a device holds, live and evicted, is released in
-//! `DestroyCommandQueue`.
+//! the window rests at, and each one holds ~16 MiB of intermediates. Both
+//! caches are bounded ([`MAX_CACHED_SCALERS`], [`MAX_CACHED_SCRATCH`]) and
+//! evict their least-recently-used entry, with the release deferred to a
+//! command buffer of the device's queue; everything a device holds, live and
+//! evicted, is released in `DestroyCommandQueue`.
 
-use std::{
-    collections::hash_map::Entry,
-    sync::{Mutex, OnceLock},
-};
+use std::sync::{Mutex, OnceLock};
 
 use block2::RcBlock;
 use mtld3d_shared::{
@@ -97,6 +94,16 @@ struct ScalerKey {
 /// its own, and its geometries must not evict the game's.
 const MAX_CACHED_SCALERS: usize = 8;
 
+/// Scratch targets one device keeps alive at once.
+///
+/// Steady-state play needs a handful: the readback resolve at the reported
+/// back-buffer size in each format a read-back asks for, and the gamma and
+/// HDR present paths at render size. What this bounds is a window being
+/// resized while `render.scale` is below 1 and a ramp or HDR is on: every
+/// size the window rests at asks for a render-size target, a Private texture
+/// of the frame's full extent that would otherwise stay until the device goes.
+const MAX_CACHED_SCRATCH: usize = 8;
+
 /// Whether the pinned `MTLDevice` supports `MetalFX` at all.
 ///
 /// A machine fact, latched once so an unsupported GPU pays one query instead
@@ -110,12 +117,7 @@ static SUPPORTED: OnceLock<bool> = OnceLock::new();
 /// buffers of the queue that resolves into it.
 pub struct UpscaleCache {
     scalers: Mutex<ScalerCache>,
-    /// Scratch targets by geometry and format, as raw texture handles.
-    ///
-    /// Stores the wire handle rather than a `Retained` so the map is trivially
-    /// `Send`; each use re-borrows through `IntoRetained`, which bumps the
-    /// refcount and leaves the cache's own retain live.
-    scratch: Mutex<FxHashMap<ScratchKey, u64>>,
+    scratch: Mutex<ScratchCache>,
 }
 
 impl Default for UpscaleCache {
@@ -133,9 +135,39 @@ impl UpscaleCache {
                 tick: 0,
                 evicted: Vec::new(),
             }),
-            scratch: Mutex::new(FxHashMap::default()),
+            scratch: Mutex::new(ScratchCache {
+                targets: FxHashMap::default(),
+                tick: 0,
+                evicted: Vec::new(),
+            }),
         }
     }
+}
+
+/// The live scratch targets, plus what it takes to bound them.
+///
+/// Targets are stored as raw texture handles rather than `Retained` so the
+/// cache is trivially `Send`; each use re-borrows through `IntoRetained`,
+/// which bumps the refcount and leaves the cache's own retain live.
+struct ScratchCache {
+    /// One target per geometry and format currently served.
+    targets: FxHashMap<ScratchKey, ScratchEntry>,
+    /// Monotonic lookup counter that orders [`ScratchEntry::last_used`].
+    tick: u64,
+    /// Evicted targets awaiting a command buffer of this device's queue to outlive them.
+    ///
+    /// Released alongside the scalers' evictions, by the same completion
+    /// handler: a target can still be read or written by a command buffer the
+    /// GPU has not finished.
+    evicted: Vec<u64>,
+}
+
+/// One cached scratch target and its recency.
+struct ScratchEntry {
+    /// The texture, owning the canonical retain `create_upscale_target` adopted.
+    handle: u64,
+    /// [`ScratchCache::tick`] at the most recent lookup.
+    last_used: u64,
 }
 
 /// The live scalers, plus what it takes to bound them.
@@ -340,6 +372,7 @@ fn encode_with(
     if !supported(device) {
         return false;
     }
+    let cache_ref = cache;
     // Keep texture binding and encode atomic with respect to other lookups.
     let Ok(mut cache) = cache.scalers.lock() else {
         mtld3d_shared::log_once_warn!(target: LOG_TARGET,
@@ -373,21 +406,21 @@ fn encode_with(
         src.width(), src.height(), dst.width(), dst.height(), mode, dst.storageMode(), dst.usage());
     let evicted = take_evicted(&mut cache);
     drop(cache);
-    release_when_retired(cmd_buf, evicted);
+    release_when_retired(cmd_buf, evicted, take_evicted_scratch(cache_ref));
     encoded
 }
 
 /// Schedule pending evictions even when presentation falls back after preflight.
 pub fn retire_evicted(cmd_buf: &ProtocolObject<dyn MTLCommandBuffer>, cache: &UpscaleCache) {
-    let evicted = {
-        let Ok(mut cache) = cache.scalers.lock() else {
+    let evicted = cache.scalers.lock().map_or_else(
+        |_| {
             mtld3d_shared::log_once_warn!(target: LOG_TARGET,
                 "upscale: poisoned cache leaves evictions pending until the device goes away");
-            return;
-        };
-        take_evicted(&mut cache)
-    };
-    release_when_retired(cmd_buf, evicted);
+            Vec::new()
+        },
+        |mut scalers| take_evicted(&mut scalers),
+    );
+    release_when_retired(cmd_buf, evicted, take_evicted_scratch(cache));
 }
 
 /// Release `evicted` once `cmd_buf` retires.
@@ -400,12 +433,17 @@ pub fn retire_evicted(cmd_buf: &ProtocolObject<dyn MTLCommandBuffer>, cache: &Up
 /// their own, or for [`retire_scalers`] when that queue goes away.
 ///
 /// The block owns the slots through a mutex so that a handler Metal somehow
-/// ran twice would find the list empty rather than over-release.
-fn release_when_retired(cmd_buf: &ProtocolObject<dyn MTLCommandBuffer>, evicted: Vec<ScalerSlot>) {
-    if evicted.is_empty() {
+/// ran twice would find the list empty rather than over-release. Evicted
+/// scratch targets ride the same handler.
+fn release_when_retired(
+    cmd_buf: &ProtocolObject<dyn MTLCommandBuffer>,
+    evicted: Vec<ScalerSlot>,
+    scratch: Vec<u64>,
+) {
+    if evicted.is_empty() && scratch.is_empty() {
         return;
     }
-    let evicted = Mutex::new(evicted);
+    let evicted = Mutex::new((evicted, scratch));
 
     let handler = RcBlock::new(
         move |_cb: core::ptr::NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
@@ -414,8 +452,12 @@ fn release_when_retired(cmd_buf: &ProtocolObject<dyn MTLCommandBuffer>, evicted:
                     "upscale: retirement lock poisoned; evicted resources remain allocated");
                 return;
             };
-            for slot in evicted.drain(..) {
+            let (slots, scratch) = &mut *evicted;
+            for slot in slots.drain(..) {
                 slot.release();
+            }
+            for handle in scratch.drain(..) {
+                super::texture::destroy_texture(handle);
             }
         },
     );
@@ -427,6 +469,18 @@ fn release_when_retired(cmd_buf: &ProtocolObject<dyn MTLCommandBuffer>, evicted:
 /// Take the scalers `queue` has evicted and not yet released.
 fn take_evicted(cache: &mut ScalerCache) -> Vec<ScalerSlot> {
     core::mem::take(&mut cache.evicted)
+}
+
+/// Take the scratch targets this device has evicted and not yet released.
+fn take_evicted_scratch(cache: &UpscaleCache) -> Vec<u64> {
+    cache.scratch.lock().map_or_else(
+        |_| {
+            mtld3d_shared::log_once_warn!(target: LOG_TARGET,
+                "upscale: poisoned scratch cache leaves evictions pending until the device goes away");
+            Vec::new()
+        },
+        |mut scratch| core::mem::take(&mut scratch.evicted),
+    )
 }
 
 /// Whether [`encode`] would serve this pair, without encoding anything.
@@ -674,11 +728,18 @@ pub fn retire(cache: &UpscaleCache) {
             );
             Vec::new()
         },
-        |mut scratch| scratch.drain().map(|(_, handle)| handle).collect(),
+        |mut scratch| take_scratch(&mut scratch),
     );
     for handle in retired {
         super::texture::destroy_texture(handle);
     }
+}
+
+/// Take every scratch target, live and evicted, out of one device's cache.
+fn take_scratch(cache: &mut ScratchCache) -> Vec<u64> {
+    let mut retired = core::mem::take(&mut cache.evicted);
+    retired.extend(cache.targets.drain().map(|(_, entry)| entry.handle));
+    retired
 }
 
 /// Take every scaler, live and evicted, out of one device's cache.
@@ -732,17 +793,57 @@ pub fn scratch_target(
     };
     let handle = {
         let mut scratch = cache.scratch.lock().ok()?;
-        match scratch.entry(key) {
-            Entry::Occupied(entry) => *entry.get(),
-            Entry::Vacant(entry) => {
-                let built = super::texture::create_upscale_target(device, width, height, format)?;
-                *entry.insert(built.raw())
-            }
-        }
+        scratch_in(&mut scratch, key, || {
+            super::texture::create_upscale_target(device, width, height, format)
+                .map(MetalHandle::raw)
+        })?
     };
     // SAFETY: the handle came from `create_upscale_target`, which adopted the
     // texture's canonical retain; the cache holds it until the device retires.
     unsafe { MetalHandle::<MTLTextureKind>::new(handle) }.into_retained()
+}
+
+/// Look up, or build and cache, the scratch target for `key`, evicting the least recently used.
+///
+/// `build` runs only on a miss and before the eviction, so a target Metal
+/// declines never displaces a usable one. The evicted target waits on the
+/// cache's eviction list for a command buffer of this device's queue.
+fn scratch_in(
+    cache: &mut ScratchCache,
+    key: ScratchKey,
+    build: impl FnOnce() -> Option<u64>,
+) -> Option<u64> {
+    cache.tick += 1;
+    let tick = cache.tick;
+    if let Some(entry) = cache.targets.get_mut(&key) {
+        entry.last_used = tick;
+        return Some(entry.handle);
+    }
+    let handle = build()?;
+    if cache.targets.len() >= MAX_CACHED_SCRATCH
+        && let Some(victim) = cache
+            .targets
+            .iter()
+            .min_by_key(|(_, entry)| entry.last_used)
+            .map(|(key, _)| *key)
+        && let Some(entry) = cache.targets.remove(&victim)
+    {
+        mtld3d_shared::log_once_info!(
+            target: LOG_TARGET,
+            "present: more than {MAX_CACHED_SCRATCH} scratch targets in use on one device, \
+             retiring the least recently used ({}x{} {:?})",
+            victim.width, victim.height, victim.format,
+        );
+        cache.evicted.push(entry.handle);
+    }
+    cache.targets.insert(
+        key,
+        ScratchEntry {
+            handle,
+            last_used: tick,
+        },
+    );
+    Some(handle)
 }
 
 /// Narrow a Metal texture dimension to the `u32` the cache key stores.
