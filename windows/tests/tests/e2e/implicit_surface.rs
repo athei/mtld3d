@@ -14,7 +14,8 @@ use mtld3d_types::{
     D3D_OK, D3DCLEAR_TARGET, D3DCLEAR_ZBUFFER, D3DCULL_NONE, D3DERR_DEVICENOTRESET,
     D3DERR_INVALIDCALL, D3DERR_NOTFOUND, D3DFMT_A8R8G8B8, D3DFMT_A16B16G16R16F, D3DFMT_D24S8,
     D3DFMT_R5G6B5, D3DFMT_X8R8G8B8, D3DFVF_DIFFUSE, D3DFVF_XYZ, D3DLOCK_READONLY,
-    D3DPRESENTFLAG_LOCKABLE_BACKBUFFER, D3DPT_TRIANGLESTRIP, D3DRS_CULLMODE, D3DRS_LIGHTING,
+    D3DPRESENT_PARAMETERS, D3DPRESENTFLAG_LOCKABLE_BACKBUFFER, D3DPT_TRIANGLESTRIP, D3DRS_CULLMODE,
+    D3DRS_LIGHTING, D3DSWAPEFFECT_DISCARD,
 };
 
 const WM_SIZE: u32 = 0x0005;
@@ -631,6 +632,134 @@ fn a_failed_auto_resize_leaves_no_destroyed_texture_bound() {
         GREEN,
         "the device draws after the Reset"
     );
+}
+
+/// Bind the back buffer and the implicit depth surface by hand, as saved bindings.
+fn bind_implicit_surfaces_by_hand(h: &Harness) {
+    let back_buffer = h.back_buffer(0);
+    let depth = h.depth_stencil_surface().expect("implicit depth surface");
+    assert_eq!(h.set_render_target(0, &back_buffer), D3D_OK);
+    assert_eq!(h.set_depth_stencil_surface(&depth), D3D_OK);
+}
+
+/// After a `Reset` failed past its destroy, a `Clear` and the next `Reset` find nothing destroyed.
+///
+/// A back buffer Metal refuses (65535 texels a side) fails `Reset` after the
+/// old back buffer and depth texture are destroyed. The same request again
+/// fails the same way rather than taking the same-size path, as no back
+/// buffer of that size exists. A `Clear` recorded before the `Reset` the
+/// device then requires reaches the GPU with the flush that `Reset` starts
+/// with, and must find neither the destroyed textures nor the saved bindings
+/// of them by hand; the device then draws.
+#[test]
+fn a_reset_whose_back_buffer_is_refused_leaves_no_destroyed_texture_bound() {
+    const OVERSIZE: u32 = 0xffff;
+    let h = Harness::with_depth();
+    arm_diffuse_draws(&h);
+    bind_implicit_surfaces_by_hand(&h);
+    assert_eq!(
+        h.reset(OVERSIZE, OVERSIZE),
+        D3DERR_INVALIDCALL,
+        "a back buffer Metal refuses fails the Reset"
+    );
+    assert_eq!(h.test_cooperative_level(), D3DERR_DEVICENOTRESET);
+    assert_eq!(
+        h.reset(OVERSIZE, OVERSIZE),
+        D3DERR_INVALIDCALL,
+        "the same refused size fails the Reset again"
+    );
+    assert_eq!(h.test_cooperative_level(), D3DERR_DEVICENOTRESET);
+    assert_eq!(
+        h.clear(D3DCLEAR_TARGET, RED, 1.0, 0),
+        D3D_OK,
+        "a Clear before the next Reset"
+    );
+    assert_eq!(h.reset(640, 480), D3D_OK, "Reset rebuilds the back buffer");
+    arm_diffuse_draws(&h);
+    let quad = full_quad(GREEN);
+    h.render_once(BLUE, |d| {
+        assert_eq!(d.clear(D3DCLEAR_ZBUFFER, 0, 1.0, 0), D3D_OK);
+        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLESTRIP, 2, &quad), D3D_OK);
+    });
+    assert_eq!(
+        h.read_pixel(320, 240),
+        GREEN,
+        "the device draws after the Reset"
+    );
+}
+
+/// A `Reset` whose new depth format has no Metal mapping leaves no destroyed depth bound.
+///
+/// The `Reset` destroys the implicit depth texture before it finds the new
+/// `AutoDepthStencilFormat` unusable, and fails, on a same-size request and
+/// on one that also resizes the back buffer. Either way no depth surface is
+/// reported, a `Clear` recorded before the next `Reset` reaches the GPU with
+/// that `Reset`'s flush and must not find the destroyed depth texture, which
+/// the depth surface bound by hand named, and the next `Reset` restores the
+/// depth surface so the device draws depth-tested again.
+#[test]
+fn a_reset_with_an_unusable_depth_format_leaves_no_destroyed_depth_bound() {
+    let h = Harness::with_depth();
+    let (width, height) = h.dims();
+    for (request, case) in [((width, height), "same size"), ((320, 240), "resizing")] {
+        arm_diffuse_draws(&h);
+        bind_implicit_surfaces_by_hand(&h);
+        let mut pp = D3DPRESENT_PARAMETERS {
+            back_buffer_width: request.0,
+            back_buffer_height: request.1,
+            back_buffer_format: D3DFMT_X8R8G8B8,
+            back_buffer_count: 1,
+            multi_sample_type: 0,
+            multi_sample_quality: 0,
+            swap_effect: D3DSWAPEFFECT_DISCARD,
+            device_window: h.hwnd(),
+            windowed: 1,
+            enable_auto_depth_stencil: 1,
+            auto_depth_stencil_format: D3DFMT_A8R8G8B8,
+            flags: 0,
+            full_screen_refresh_rate_in_hz: 0,
+            presentation_interval: 0,
+        };
+        assert_eq!(
+            h.reset_params(&mut pp),
+            D3DERR_INVALIDCALL,
+            "{case}: a colour format as the auto depth format fails the Reset"
+        );
+        assert_eq!(h.test_cooperative_level(), D3DERR_DEVICENOTRESET);
+        let (hr, depth) = h.depth_stencil_surface_hr();
+        assert_eq!(
+            hr, D3DERR_NOTFOUND,
+            "{case}: no depth surface after the failure"
+        );
+        assert!(depth.is_none());
+        assert_eq!(
+            h.clear(D3DCLEAR_TARGET, RED, 1.0, 0),
+            D3D_OK,
+            "{case}: a Clear before the next Reset"
+        );
+        assert_eq!(
+            h.reset(width, height),
+            D3D_OK,
+            "{case}: Reset restores the depth"
+        );
+        assert!(
+            h.depth_stencil_surface().is_some(),
+            "{case}: the implicit depth surface is back"
+        );
+        arm_diffuse_draws(&h);
+        let near = full_quad(GREEN).map(|v| PosColorVertex { z: 0.25, ..v });
+        let far = full_quad(RED);
+        h.render_once(BLUE, |d| {
+            assert_eq!(d.clear(D3DCLEAR_ZBUFFER, 0, 1.0, 0), D3D_OK);
+            assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLESTRIP, 2, &near), D3D_OK);
+            assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLESTRIP, 2, &far), D3D_OK);
+        });
+        assert_eq!(
+            h.read_pixel(width / 2, height / 2),
+            GREEN,
+            "{case}: the farther quad is depth-tested away"
+        );
+    }
 }
 
 #[test]

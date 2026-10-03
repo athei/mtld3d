@@ -22,19 +22,20 @@ use mtld3d_tests::{
 };
 use mtld3d_types::{
     D3D_OK, D3DCLEAR_TARGET, D3DCREATE_HARDWARE_VERTEXPROCESSING, D3DCREATE_NOWINDOWCHANGES,
-    D3DDISPLAYMODE, D3DERR_DEVICENOTRESET, D3DERR_INVALIDCALL, D3DERR_NOTAVAILABLE, D3DFILL_SOLID,
-    D3DFMT_A2R10G10B10, D3DFMT_A8B8G8R8, D3DFMT_A8R8G8B8, D3DFMT_A16B16G16R16,
-    D3DFMT_A16B16G16R16F, D3DFMT_A32B32G32R32F, D3DFMT_ATI1, D3DFMT_D24S8, D3DFMT_DF24,
-    D3DFMT_DXT1, D3DFMT_G16R16, D3DFMT_G16R16F, D3DFMT_G32R32F, D3DFMT_L8, D3DFMT_NV12,
-    D3DFMT_R5G6B5, D3DFMT_R8G8B8, D3DFMT_R16F, D3DFMT_R32F, D3DFMT_UYVY, D3DFMT_X8B8G8R8,
-    D3DFMT_X8R8G8B8, D3DFMT_YUY2, D3DFMT_YV12, D3DFVF_DIFFUSE, D3DFVF_TEX1, D3DFVF_XYZ,
-    D3DGAMMARAMP, D3DOK_NOAUTOGEN, D3DPOOL_DEFAULT, D3DPOOL_MANAGED, D3DPOOL_SCRATCH,
-    D3DPOOL_SYSTEMMEM, D3DPRESENT_INTERVAL_FOUR, D3DPRESENT_INTERVAL_IMMEDIATE,
+    D3DDISPLAYMODE, D3DERR_DEVICENOTRESET, D3DERR_INVALIDCALL, D3DERR_NOTAVAILABLE,
+    D3DERR_NOTFOUND, D3DFILL_SOLID, D3DFMT_A2R10G10B10, D3DFMT_A8B8G8R8, D3DFMT_A8R8G8B8,
+    D3DFMT_A16B16G16R16, D3DFMT_A16B16G16R16F, D3DFMT_A32B32G32R32F, D3DFMT_ATI1, D3DFMT_D24S8,
+    D3DFMT_DF24, D3DFMT_DXT1, D3DFMT_G16R16, D3DFMT_G16R16F, D3DFMT_G32R32F, D3DFMT_INDEX16,
+    D3DFMT_L8, D3DFMT_NV12, D3DFMT_R5G6B5, D3DFMT_R8G8B8, D3DFMT_R16F, D3DFMT_R32F, D3DFMT_UYVY,
+    D3DFMT_X8B8G8R8, D3DFMT_X8R8G8B8, D3DFMT_YUY2, D3DFMT_YV12, D3DFVF_DIFFUSE, D3DFVF_TEX1,
+    D3DFVF_XYZ, D3DGAMMARAMP, D3DLOCK_READONLY, D3DOK_NOAUTOGEN, D3DPOOL_DEFAULT, D3DPOOL_MANAGED,
+    D3DPOOL_SCRATCH, D3DPOOL_SYSTEMMEM, D3DPRESENT_INTERVAL_FOUR, D3DPRESENT_INTERVAL_IMMEDIATE,
     D3DPRESENT_INTERVAL_ONE, D3DPRESENT_INTERVAL_THREE, D3DPRESENT_INTERVAL_TWO,
     D3DPRESENT_PARAMETERS, D3DPT_TRIANGLELIST, D3DRS_COLORWRITEENABLE, D3DRS_FILLMODE,
     D3DRS_LIGHTING, D3DRTYPE_CUBETEXTURE, D3DRTYPE_SURFACE, D3DRTYPE_TEXTURE, D3DRTYPE_VOLUME,
-    D3DRTYPE_VOLUMETEXTURE, D3DSBT_ALL, D3DSWAPEFFECT_DISCARD, D3DUSAGE_AUTOGENMIPMAP,
-    D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_DYNAMIC, D3DUSAGE_QUERY_FILTER,
+    D3DRTYPE_VOLUMETEXTURE, D3DSAMP_ADDRESSU, D3DSBT_ALL, D3DSWAPEFFECT_DISCARD, D3DTADDRESS_CLAMP,
+    D3DTADDRESS_WRAP, D3DTOP_MODULATE, D3DTOP_SELECTARG1, D3DTS_WORLD, D3DTSS_COLOROP,
+    D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_DYNAMIC, D3DUSAGE_QUERY_FILTER,
     D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING, D3DUSAGE_QUERY_SRGBREAD, D3DUSAGE_QUERY_SRGBWRITE,
     D3DUSAGE_QUERY_VERTEXTEXTURE, D3DUSAGE_QUERY_WRAPANDMIP, D3DUSAGE_RENDERTARGET, D3DVIEWPORT9,
     DevCaps, IDirect3D9Vtbl, TextureCaps,
@@ -1203,6 +1204,169 @@ fn reset_counts_a_held_texture_once_across_public_references() {
     );
 }
 
+/// A `Reset` an outstanding resource rejects still restores the state defaults.
+///
+/// D3D9 resets the device state before it checks for outstanding resources,
+/// so after a rejected `Reset` every getter reports what a successful one
+/// would: render, sampler and stage states, the world transform and the
+/// viewport at their defaults, no texture, stream, index buffer or
+/// declaration bound, render target 0 on the back buffer with the other
+/// slots empty, and the implicit depth surface back after an explicit
+/// unbind. The frame in flight follows the defaults as well: a `Clear` after
+/// the rejection lands on the back buffer and leaves the render target the
+/// application had bound with what it held.
+#[test]
+fn rejected_reset_restores_the_state_defaults() {
+    const GREEN: u32 = 0xFF00_FF00;
+    const RED: u32 = 0xFFFF_0000;
+    let h = Harness::with_depth();
+    // The held DEFAULT-pool render target is what rejects the Reset.
+    let target = h.create_render_target(64, 64, D3DFMT_A8R8G8B8);
+    let second = h.create_render_target(64, 64, D3DFMT_A8R8G8B8);
+    assert_eq!(h.set_render_target(0, &target), D3D_OK, "bind target 0");
+    assert_eq!(h.set_render_target(1, &second), D3D_OK, "bind target 1");
+    assert_eq!(h.clear_target(GREEN), D3D_OK, "clear the bound targets");
+    assert_eq!(h.clear_depth_stencil_surface(), D3D_OK, "unbind the depth");
+    let tex = h.create_texture(16, 16, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED);
+    assert_eq!(h.set_texture(0, &tex), D3D_OK, "SetTexture");
+    let vb = h.create_vertex_buffer(64, 0, D3DFVF_XYZ, D3DPOOL_MANAGED);
+    assert_eq!(
+        h.set_stream_source(0, &vb, 0, 12),
+        D3D_OK,
+        "SetStreamSource"
+    );
+    let ib = h.create_index_buffer(64, 0, D3DFMT_INDEX16, D3DPOOL_MANAGED);
+    assert_eq!(h.set_indices(&ib), D3D_OK, "SetIndices");
+    assert_eq!(h.set_fvf(D3DFVF_XYZ), D3D_OK, "SetFVF");
+    assert_eq!(h.set_render_state(D3DRS_LIGHTING, 0), D3D_OK);
+    assert_eq!(
+        h.set_sampler_state(0, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP),
+        D3D_OK
+    );
+    assert_eq!(
+        h.set_texture_stage_state(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1),
+        D3D_OK
+    );
+    let world: [f32; 16] = core::array::from_fn(|i| if i % 5 == 0 { 2.0 } else { 0.0 });
+    assert_eq!(h.set_transform(D3DTS_WORLD, &world), D3D_OK);
+    let custom = D3DVIEWPORT9 {
+        x: 8,
+        y: 8,
+        width: 32,
+        height: 32,
+        min_z: 0.25,
+        max_z: 0.75,
+    };
+    assert_eq!(h.set_viewport(&custom), D3D_OK);
+
+    assert_eq!(
+        h.reset(640, 480),
+        D3DERR_INVALIDCALL,
+        "a held DEFAULT-pool render target blocks Reset"
+    );
+    assert_eq!(h.test_cooperative_level(), D3DERR_DEVICENOTRESET);
+
+    assert_eq!(h.render_state(D3DRS_LIGHTING), 1, "LIGHTING default");
+    assert_eq!(
+        h.sampler_state(0, D3DSAMP_ADDRESSU),
+        D3DTADDRESS_WRAP,
+        "ADDRESSU default"
+    );
+    assert_eq!(
+        h.texture_stage_state(0, D3DTSS_COLOROP),
+        D3DTOP_MODULATE,
+        "stage-0 COLOROP default"
+    );
+    let identity: [f32; 16] = core::array::from_fn(|i| if i % 5 == 0 { 1.0 } else { 0.0 });
+    assert_eq!(
+        h.transform(D3DTS_WORLD).map(f32::to_bits),
+        identity.map(f32::to_bits),
+        "world transform default"
+    );
+    let vp = h.viewport();
+    assert_eq!(
+        (vp.x, vp.y, vp.width, vp.height),
+        (0, 0, 640, 480),
+        "viewport covers the back buffer"
+    );
+    assert_eq!(
+        (vp.min_z.to_bits(), vp.max_z.to_bits()),
+        (0.0_f32.to_bits(), 1.0_f32.to_bits()),
+        "viewport depth range default"
+    );
+    assert!(h.texture_raw(0).is_null(), "stage-0 texture unbound");
+    let (hr, stream, _, _) = h.get_stream_source(0);
+    assert_eq!(hr, D3D_OK, "GetStreamSource");
+    assert!(stream.is_none(), "stream 0 unbound");
+    let (hr, bound_ib) = h.get_indices();
+    assert_eq!(hr, D3D_OK, "GetIndices");
+    assert!(bound_ib.is_none(), "index buffer unbound");
+    assert!(
+        h.vertex_declaration_raw().is_null(),
+        "vertex declaration unbound"
+    );
+    assert_eq!(h.fvf(), 0, "no FVF");
+    {
+        let rt0 = h.render_target(0);
+        let back_buffer = h.back_buffer(0);
+        assert_eq!(
+            rt0.as_ptr(),
+            back_buffer.as_ptr(),
+            "render target 0 is the back buffer"
+        );
+    }
+    let (hr, rt1) = h.render_target_hr(1);
+    assert_eq!(hr, D3DERR_NOTFOUND, "render target 1 unbound");
+    assert!(rt1.is_none());
+    let (hr, depth) = h.depth_stencil_surface_hr();
+    assert_eq!(hr, D3D_OK, "the implicit depth surface is bound again");
+    assert!(depth.is_some());
+    drop(depth);
+
+    assert_eq!(
+        h.clear_target(RED),
+        D3D_OK,
+        "Clear after the rejected Reset"
+    );
+    assert_pixel_eq(
+        h.read_pixel(320, 240),
+        RED,
+        "the Clear reaches the back buffer",
+    );
+    let (hr, desc) = target.desc();
+    assert_eq!(hr, D3D_OK, "GetDesc of the formerly bound target");
+    let sysmem = h.create_offscreen_plain_surface(
+        desc.width,
+        desc.height,
+        D3DFMT_A8R8G8B8,
+        D3DPOOL_SYSTEMMEM,
+    );
+    assert_eq!(
+        h.get_render_target_data_hr(&target, &sysmem),
+        D3D_OK,
+        "read back the formerly bound target"
+    );
+    let held = {
+        let locked = sysmem.lock_rect(D3DLOCK_READONLY);
+        let pitch_px = locked.pitch().cast_unsigned() / 4;
+        let idx = (32 * pitch_px + 32) as usize;
+        locked.as_u32(idx + 1)[idx]
+    };
+    assert_pixel_eq(held, GREEN, "the formerly bound target keeps its contents");
+
+    drop(sysmem);
+    drop(target);
+    drop(second);
+    assert_eq!(
+        h.reset(640, 480),
+        D3D_OK,
+        "Reset succeeds once the targets are released"
+    );
+    drop(tex);
+    drop(vb);
+    drop(ib);
+}
+
 #[test]
 fn reset_bad_dims_rejected() {
     let h = Harness::new();
@@ -1226,11 +1390,20 @@ fn reset_bad_dims_rejected() {
         full_screen_refresh_rate_in_hz: 0,
         presentation_interval: 0,
     };
+    // The parameters pass the swap-effect, count and interval checks, so the
+    // rejection still ends an open recording.
+    assert_eq!(h.begin_state_block(), D3D_OK, "BeginStateBlock");
     assert_eq!(
         h.reset_params(&mut pp),
         D3DERR_INVALIDCALL,
         "fullscreen 0x0 Reset must be INVALIDCALL"
     );
+    assert_eq!(
+        h.begin_state_block(),
+        D3D_OK,
+        "the rejected Reset ended the open recording"
+    );
+    drop(h.end_state_block());
 }
 
 #[test]

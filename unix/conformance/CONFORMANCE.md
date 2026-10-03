@@ -292,6 +292,19 @@ record. A knob, where one makes sense, is named with its default.
   presents into rather than on the one that holds focus. Sites: `test_wndproc`
   and `test_wndproc_windowed` for where the hook sits,
   `test_device_window_reset` for its following a retarget, all below. No knob.
+- **A rejected `Reset` leaves render target 0 on the back buffer and the
+  depth stencil on the implicit surface.** Like a successful one it releases
+  every binding and returns every state to its default before it fails, and
+  it leaves the attachments a successful `Reset` leaves. Wine and DXVK unbind
+  both before their outstanding-resource check and do not bind them again on
+  failure, so `GetRenderTarget(0)` and `GetDepthStencilSurface` answer
+  `D3DERR_NOTFOUND` there. What Windows answers is not observable: no d3d9
+  test reads the device after a rejected `Reset`, and Wine's d3d8
+  `test_reset` keeps its `GetIndices` after one under `if (0)` because it
+  crashes on Windows. The layer has no state without render target 0: the
+  pass machine, the snapshot and every draw path assume one, so an unbound
+  slot 0 would be a new device state for a device that can do nothing but
+  `Reset` again. No site observes it. No knob.
 - **`D3DRS_MULTISAMPLEANTIALIAS = FALSE` is ignored.** Metal ties the sample
   count to the pass's attachments with no per-draw override.
   `D3DPRASTERCAPS_MULTISAMPLE_TOGGLE` is not advertised, which is how D3D9

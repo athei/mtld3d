@@ -2638,6 +2638,13 @@ impl DeviceInner {
     /// flow into the next frame via `fresh_frame`, but the viewport push
     /// here references the new dimensions.
     pub fn reset_to_defaults(&mut self) {
+        // An autogen texture bound as a render target regenerates its mip
+        // chain when it stops being one, as `SetRenderTarget` does on the way
+        // off it; queued ahead of the teardown that may release it.
+        let autogen = core::mem::replace(&mut self.cur_autogen_rt_ids, [None; RENDER_TARGET_SLOTS]);
+        for old_id in autogen.into_iter().flatten() {
+            self.push_control(crate::device::GenerateMipmapsOrderedOp { old_id });
+        }
         self.bound_rt.teardown();
         // Reset reverts the colour target to the implicit backbuffer and the
         // depth/stencil to the implicit auto-depth default, and unbinds render
@@ -2651,7 +2658,6 @@ impl DeviceInner {
                 });
             }
         }
-        self.cur_autogen_rt_ids = [None; RENDER_TARGET_SLOTS];
         self.last_depth_binding = None;
         self.flags.remove(DeviceFlags::DEPTH_EXPLICITLY_UNBOUND);
         self.bound_buffers.teardown();
@@ -4447,38 +4453,37 @@ extern "system" fn device_reset(this: *mut c_void, present_params: *mut c_void) 
         );
         return D3DERR_INVALIDCALL;
     }
+    // A Reset with well-formed parameters ends an open `BeginStateBlock`
+    // recording whether or not it goes on to succeed, before it looks for
+    // outstanding references: the recording dies with the state it was
+    // recording against. Every rejection from here on goes through
+    // `reject_reset`, which restores the state defaults as well.
+    dev.recording_state_block = None;
     // A fullscreen request must still be well-formed even though its size is
     // not used: the D3D9 "zero means the client area" rule is windowed-only,
     // so zero dimensions here are a malformed request. Checked before the
-    // window moves, so a rejected Reset leaves the device exactly as it was.
+    // window moves, so a rejected Reset leaves the window as it was.
     if pp.windowed == 0 && (pp.back_buffer_width == 0 || pp.back_buffer_height == 0) {
         warn!(
             target: LOG_TARGET,
             "reject Reset({}x{}) — a fullscreen request may not carry zero dimensions",
             pp.back_buffer_width, pp.back_buffer_height,
         );
-        dev.flags.insert(DeviceFlags::NOT_RESET);
-        return D3DERR_INVALIDCALL;
+        return reject_reset(dev);
     }
-    // A Reset with well-formed parameters ends an open `BeginStateBlock`
-    // recording whether or not it goes on to succeed, before it looks for
-    // outstanding references: the recording dies with the state it was
-    // recording against.
-    dev.recording_state_block = None;
     // Reset rejects any outstanding app reference to a `D3DPOOL_DEFAULT`
     // resource or an implicit surface: those are backed by the device memory
     // the Reset recreates, and D3D9 makes the app release them first. A state
     // block that holds such a resource keeps it outstanding too, since the
-    // resource lives as long as the block; the device's bindings do not count
-    // (they are reset below on success).
+    // resource lives as long as the block; the device's bindings do not count,
+    // so they need not be released before the count is read.
     let blockers = dev.outstanding_reset_blockers.load(Ordering::Acquire);
     if blockers != 0 {
         warn!(
             target: LOG_TARGET,
             "reject Reset — {blockers} D3DPOOL_DEFAULT resource(s) or implicit surface(s) still referenced",
         );
-        dev.flags.insert(DeviceFlags::NOT_RESET);
-        return D3DERR_INVALIDCALL;
+        return reject_reset(dev);
     }
     if pp.windowed != 0 && pp.back_buffer_format == 0 {
         pp.back_buffer_format = crate::direct3d9::adapter_display_format();
@@ -4499,8 +4504,7 @@ extern "system" fn device_reset(this: *mut c_void, present_params: *mut c_void) 
             "reject Reset: MultiSampleType={} Quality={} on back-buffer format {} is not available",
             pp.multi_sample_type, pp.multi_sample_quality, pp.back_buffer_format,
         );
-        dev.flags.insert(DeviceFlags::NOT_RESET);
-        return D3DERR_INVALIDCALL;
+        return reject_reset(dev);
     };
     let target_window = if pp.device_window == 0 {
         dev.window()
@@ -4514,8 +4518,7 @@ extern "system" fn device_reset(this: *mut c_void, present_params: *mut c_void) 
             "reject Reset({}x{}, fmt={}) - no usable windowed client area",
             pp.back_buffer_width, pp.back_buffer_height, pp.back_buffer_format,
         );
-        dev.flags.insert(DeviceFlags::NOT_RESET);
-        return D3DERR_INVALIDCALL;
+        return reject_reset(dev);
     }
     pp.back_buffer_count = pp.back_buffer_count.max(1);
     warn_present_params_fields_once(&pp);
@@ -4538,9 +4541,13 @@ extern "system" fn device_reset(this: *mut c_void, present_params: *mut c_void) 
         pp.multi_sample_quality,
         new_sample_count,
     );
+    // A back buffer an earlier `Reset` failed to create takes the recreate
+    // path at any size: the dimensions that `Reset` adopted are not a back
+    // buffer that exists.
     let resized = pp.back_buffer_width != dev.backbuffer_width
         || pp.back_buffer_height != dev.backbuffer_height
-        || multi_sample_changed;
+        || multi_sample_changed
+        || dev.backbuffer_handle.is_null();
     // Reset adopts the present params' auto depth-stencil configuration: an
     // enabled flag (re)creates the implicit depth-stencil at the given format,
     // a disabled flag drops it. This is independent of a resize, so resolve the
@@ -4575,8 +4582,7 @@ extern "system" fn device_reset(this: *mut c_void, present_params: *mut c_void) 
         // so adopt the new auto-DS format before it runs.
         dev.depth_stencil_format = new_depth_format;
         if let Err(hr) = reset_recreate_resources(dev, &pp) {
-            dev.flags.insert(DeviceFlags::NOT_RESET);
-            return hr;
+            return fail_reset(dev, hr);
         }
     } else {
         // Skip flush + destroy + recreate + setDrawableSize entirely. The game
@@ -4590,8 +4596,7 @@ extern "system" fn device_reset(this: *mut c_void, present_params: *mut c_void) 
         // EnableAutoDepthStencil flag can flip without a resize (a no-op when
         // it is unchanged, so the fast path stays fast).
         if let Err(hr) = reconcile_implicit_depth(dev, new_depth_format) {
-            dev.flags.insert(DeviceFlags::NOT_RESET);
-            return hr;
+            return fail_reset(dev, hr);
         }
         // Deliver every op queued since the last Present before the reseed
         // below replaces `current_frame`. The queue holds work whose
@@ -4658,6 +4663,43 @@ extern "system" fn device_reset(this: *mut c_void, present_params: *mut c_void) 
     }
 
     D3D_OK
+}
+
+/// Fail a well-formed `Reset` with the device state at its defaults.
+///
+/// D3D9 resets the device state before it checks what can make a `Reset`
+/// fail, so a rejected one still releases every binding and returns every
+/// state to its default, leaving what a successful `Reset` leaves: render
+/// target 0 on the back buffer, the depth stencil on the implicit surface,
+/// no recording and no open scene. The frame in flight is delivered first,
+/// as a same-size `Reset` does, and [`fail_reset`] replaces it, so the
+/// attachments it records follow the defaults as well; without that, a draw
+/// after the rejection would be built for the back buffer while its pass
+/// still carried the targets the application had bound.
+fn reject_reset(dev: &mut DeviceInner) -> i32 {
+    if let Err(hr) = dev.flush_current_frame_blocking() {
+        dev.flags.insert(DeviceFlags::NOT_RESET);
+        return hr;
+    }
+    fail_reset(dev, D3DERR_INVALIDCALL)
+}
+
+/// End a failed `Reset` on a fresh frame with the state defaults, answering `hr`.
+///
+/// The frame in flight was already delivered by the caller, unless the
+/// encoder had already failed, which this then leaves latched. Past the point
+/// where `Reset` destroyed the implicit back buffer or depth texture, the
+/// frame that delivery left behind and the saved render-target and depth
+/// bindings still name the destroyed textures, so the frame is dropped
+/// unsent rather than delivered and the defaults clear the saved bindings.
+/// The fresh frame names whatever the failed recreate left, NULL where it
+/// made nothing. The device reports `D3DERR_DEVICENOTRESET` until a `Reset`
+/// succeeds.
+fn fail_reset(dev: &mut DeviceInner, hr: i32) -> i32 {
+    dev.flags.insert(DeviceFlags::NOT_RESET);
+    dev.reseed_current_frame();
+    dev.reset_to_defaults();
+    hr
 }
 
 /// Resolve geometry after the window transition, undoing a rejected fullscreen exit.
@@ -4863,6 +4905,7 @@ fn reset_recreate_resources(
         dev.set_backbuffer_handle(MetalHandle::NULL, MetalHandle::NULL);
         dev.set_backbuffer_msaa_handle(MetalHandle::NULL, MetalHandle::NULL);
         dev.set_depth_stencil_handle(MetalHandle::NULL);
+        dev.depth_stencil_format = 0;
         return Err(D3DERR_INVALIDCALL);
     }
     dev.set_backbuffer_handle(bb_params.texture_handle, bb_params.srgb_texture_handle);
@@ -4883,7 +4926,10 @@ fn reset_recreate_resources(
                 "Reset: depth_stencil_format {} has no Metal mapping — device unusable",
                 dev.depth_stencil_format
             );
+            // No implicit depth surface exists now, and the format says so,
+            // as `reconcile_implicit_depth` leaves it on the same failure.
             dev.set_depth_stencil_handle(MetalHandle::NULL);
+            dev.depth_stencil_format = 0;
             return Err(D3DERR_INVALIDCALL);
         };
         // Render space, matching the colour attachment exactly — Metal
@@ -4900,6 +4946,7 @@ fn reset_recreate_resources(
         if status != 0 || ds_params.texture_handle.is_null() {
             error!(target: LOG_TARGET, "Reset: CreateDepthTexture failed (0x{status:08X}) — device unusable");
             dev.set_depth_stencil_handle(MetalHandle::NULL);
+            dev.depth_stencil_format = 0;
             return Err(D3DERR_INVALIDCALL);
         }
         dev.set_depth_stencil_handle(ds_params.texture_handle);

@@ -58,18 +58,10 @@ pub fn create_backbuffer(
     width: u32,
     height: u32,
 ) -> Option<(MetalHandle<MTLTextureKind>, u64)> {
-    // Metal raises an NSException (→ abort) for a zero or over-large texture
-    // dimension. Reject such a request so a degenerate backbuffer size — e.g.
-    // resolved from the off-screen monitor geometry the conformance suite
-    // probes — fails CreateBackbuffer gracefully instead of aborting the
-    // process. `MAX_TEXTURE_DIM` is the Metal 2D limit on the supported GPUs.
-    const MAX_TEXTURE_DIM: u32 = 16384;
-    if width == 0 || height == 0 || width > MAX_TEXTURE_DIM || height > MAX_TEXTURE_DIM {
-        log::error!(
-            target: crate::LOG_TARGET,
-            "create_backbuffer: {width}x{height} is outside the 1..={MAX_TEXTURE_DIM} Metal \
-             accepts per dimension; refused",
-        );
+    // A degenerate backbuffer size, e.g. resolved from the off-screen monitor
+    // geometry the conformance suite probes, fails CreateBackbuffer
+    // gracefully instead of aborting the process.
+    if !extent_is_creatable("create_backbuffer", width, height) {
         return None;
     }
     let Some(device) = device_handle.into_retained() else {
@@ -397,6 +389,11 @@ pub fn create_depth_texture(
     pixel_format: PixelFormat,
     sample_count: u32,
 ) -> Option<MetalHandle<MTLTextureKind>> {
+    // The implicit depth surface follows the back buffer's size, so a `Reset`
+    // retried at a size the back buffer was refused at asks for it too.
+    if !extent_is_creatable("create_depth_texture", width, height) {
+        return None;
+    }
     let device = device_handle.into_retained()?;
     let mtl_format = mtl_pixel_format(pixel_format);
 
@@ -1226,6 +1223,25 @@ const fn mtl_storage_mode(wire: StorageMode) -> MTLStorageMode {
         StorageMode::Private => MTLStorageMode::Private,
         StorageMode::Memoryless => MTLStorageMode::Memoryless,
     }
+}
+
+/// Whether Metal can create a 2D texture of `width` x `height`, logging the refusal at `site`.
+///
+/// Metal raises an `NSException`, which aborts the process, for a zero or
+/// over-large texture dimension, so a creator rejects such a request
+/// before it reaches `newTextureWithDescriptor`. `MAX_TEXTURE_DIM` is the
+/// Metal 2D limit on the supported GPUs.
+fn extent_is_creatable(site: &str, width: u32, height: u32) -> bool {
+    use mtld3d_core::caps::MAX_TEXTURE_DIM;
+    if width == 0 || height == 0 || width > MAX_TEXTURE_DIM || height > MAX_TEXTURE_DIM {
+        log::error!(
+            target: crate::LOG_TARGET,
+            "{site}: {width}x{height} is outside the 1..={MAX_TEXTURE_DIM} Metal accepts per \
+             dimension; refused",
+        );
+        return false;
+    }
+    true
 }
 
 #[cfg(test)]
