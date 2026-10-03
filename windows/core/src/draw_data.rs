@@ -832,6 +832,20 @@ impl PsKey {
     }
 }
 
+/// The fallback texture for a bound pixel stage whose own Metal texture is missing.
+///
+/// The fragment function types the slot from the texture bound to it. A
+/// depth texture is declared `depth2d<float>` whether it is sampled with a
+/// comparison or read raw, so it falls back to the depth kind; every other
+/// slot takes the black texture of its declared dimension.
+#[must_use]
+pub const fn missing_texture_kind(variant: VariantKey, slot: u16) -> NullTextureKind {
+    if slot < 16 && variant.depth_sampler_mask & (1u16 << slot) != 0 {
+        return NullTextureKind::Depth2D;
+    }
+    null_texture_kind(crate::dxso::bound_sampler_type(variant, slot))
+}
+
 /// The black-fallback texture of the kind an emitted sampler argument carries.
 ///
 /// Both stages type their `[[texture(n)]]` arguments from the texture bound to

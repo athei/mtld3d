@@ -70,3 +70,35 @@ fn decoded_extra_streams_borrow_command_bytes_and_preserve_order() {
         [1, 3, 7]
     );
 }
+
+#[test]
+fn a_missing_depth_texture_falls_back_to_the_depth_kind() {
+    let variant = VariantKey {
+        depth_sampler_mask: 0b0110,
+        depth_fetch_mask: 0b0100,
+        cube_sampler_mask: 0b1000,
+        volume_sampler_mask: 0b1_0000,
+        ..VariantKey::default()
+    };
+    assert_eq!(
+        missing_texture_kind(variant, 1),
+        NullTextureKind::Depth2D,
+        "a comparison slot"
+    );
+    assert_eq!(
+        missing_texture_kind(variant, 2),
+        NullTextureKind::Depth2D,
+        "a raw-depth slot is depth2d too"
+    );
+    assert_eq!(
+        missing_texture_kind(variant, 3),
+        NullTextureKind::TextureCube
+    );
+    assert_eq!(missing_texture_kind(variant, 4), NullTextureKind::Texture3D);
+    assert_eq!(missing_texture_kind(variant, 0), NullTextureKind::Texture2D);
+    assert_eq!(
+        missing_texture_kind(variant, 16),
+        NullTextureKind::Texture2D,
+        "a slot past the masks"
+    );
+}
