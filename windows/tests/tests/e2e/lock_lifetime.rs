@@ -19,6 +19,8 @@ use super::device::{await_logged_lines, run_in_private_log_child, running_as};
 
 const FVF: u32 = D3DFVF_XYZ | D3DFVF_DIFFUSE;
 const FAILED_DEVICE_CHILD_NAME: &str = "lock_lifetime_failed_device.exe";
+#[cfg(target_arch = "x86")]
+const OUT_OF_MEMORY_CHILD_NAME: &str = "lock_lifetime_out_of_memory.exe";
 const BLACK: u32 = 0xFF00_0000;
 const BLUE: u32 = 0xFF00_00FF;
 const GREEN: u32 = 0xFF00_FF00;
@@ -346,11 +348,12 @@ fn release_dc_on_a_sibling_subresource_is_refused() {
     assert_eq!(dc.release(), D3D_OK, "the face that holds it releases it");
 }
 
-/// A create whose system-memory copy the process cannot allocate answers `E_OUTOFMEMORY`.
+/// A create whose system-memory copy no allocation can hold answers `E_OUTOFMEMORY`.
 ///
-/// Inside a 32-bit process a request this size has no room, whatever the
-/// sizes the device reports allow. The create fails cleanly, hands back no
-/// object, and the device keeps working.
+/// Inside a 32-bit process each of these is 2 GiB or more, past what a
+/// layout can describe there, whatever the sizes the device reports allow,
+/// so nothing is allocated. The create fails cleanly, hands back no object,
+/// and the device keeps working.
 #[cfg(target_arch = "x86")]
 #[test]
 fn creates_whose_staging_cannot_be_allocated_answer_out_of_memory() {
@@ -376,13 +379,6 @@ fn creates_whose_staging_cannot_be_allocated_answer_out_of_memory() {
     // 2 GiB for level 0 alone.
     let (hr, tex) = h.try_create_texture(16384, 8192, 1, 0, D3DFMT_A32B32G32R32F, D3DPOOL_MANAGED);
     assert_eq!((hr, tex.is_null()), (E_OUTOFMEMORY, true), "CreateTexture");
-    // 1 GiB a face, six faces.
-    let (hr, cube) = h.try_create_cube_texture(8192, 1, 0, D3DFMT_A32B32G32R32F, D3DPOOL_MANAGED);
-    assert_eq!(
-        (hr, cube.is_null()),
-        (E_OUTOFMEMORY, true),
-        "CreateCubeTexture"
-    );
     // 2 GiB for the one level.
     let (hr, volume) = h.try_create_volume_texture(
         [1024, 1024, 128],
@@ -480,4 +476,53 @@ fn failed_device_workload() {
         destroyed >= 2,
         "both targets' textures are destroyed with the device: {lines:?}"
     );
+}
+
+/// A cube whose six faces the 32-bit address space cannot hold answers `E_OUTOFMEMORY`.
+///
+/// Each face is 1 GiB, a size a layout can describe, so the allocator itself
+/// refuses one of them, and the faces taken before it are given back. The
+/// allocations are real, so the create runs in a process of its own, where
+/// no other test's allocation competes for the address space.
+#[cfg(target_arch = "x86")]
+#[test]
+fn a_cube_the_allocator_refuses_answers_out_of_memory() {
+    if running_as(OUT_OF_MEMORY_CHILD_NAME) {
+        out_of_memory_workload();
+        return;
+    }
+    run_in_private_log_child(
+        OUT_OF_MEMORY_CHILD_NAME,
+        "lock_lifetime::a_cube_the_allocator_refuses_answers_out_of_memory",
+        "warn",
+    );
+}
+
+/// Create the cube the allocator refuses, then draw.
+#[cfg(target_arch = "x86")]
+fn out_of_memory_workload() {
+    use mtld3d_types::{D3DFMT_A32B32G32R32F, E_OUTOFMEMORY};
+    let h = Harness::new();
+    let (hr, cube) = h.try_create_cube_texture(8192, 1, 0, D3DFMT_A32B32G32R32F, D3DPOOL_MANAGED);
+    assert_eq!(
+        (hr, cube.is_null()),
+        (E_OUTOFMEMORY, true),
+        "CreateCubeTexture"
+    );
+    let vb = h.create_vertex_buffer(stride() * 3, D3DUSAGE_WRITEONLY, FVF, D3DPOOL_DEFAULT);
+    vb.lock(0, 0, 0).write(&solid_triangle(GREEN));
+    arm_diffuse(&h);
+    assert_eq!(
+        h.set_stream_source(0, &vb, 0, stride()),
+        0,
+        "SetStreamSource"
+    );
+    h.render_once(BLUE, |d| {
+        assert_eq!(
+            d.draw_primitive(D3DPT_TRIANGLELIST, 0, 1),
+            0,
+            "DrawPrimitive"
+        );
+    });
+    assert_pixel_eq(h.read_pixel(320, 280), GREEN, "the device still draws");
 }

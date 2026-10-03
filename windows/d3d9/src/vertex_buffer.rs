@@ -834,8 +834,6 @@ extern "system" fn vb_lock(
         }
     }
 
-    inner.lock_count = inner.lock_count.saturating_add(1);
-
     let unknown = flags & !D3DLOCK_KNOWN_BITS;
     if unknown != 0 {
         mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET, "vb_lock: unrecognised D3DLOCK bits {unknown:#x} ignored");
@@ -849,6 +847,9 @@ extern "system" fn vb_lock(
         unsafe { *pp_data = core::ptr::null_mut() };
         return D3DERR_INVALIDCALL;
     };
+    // Counted only once the pointer exists: a refused Lock maps nothing for
+    // an Unlock to end.
+    inner.lock_count = inner.lock_count.saturating_add(1);
     // SAFETY: `pp_data` is non-null (checked above) and per the D3D9
     // ABI points to a writable `*mut c_void` slot owned by the caller.
     unsafe { *pp_data = ptr.cast::<c_void>() };

@@ -5446,10 +5446,6 @@ fn resolve_create_levels(entry_point: &str, requested: u32, natural: u32) -> u32
     resolve_mip_levels(requested, natural)
 }
 
-/// The body of `CreateTexture`, plus the intent the vtable signature cannot carry.
-///
-/// `CreateOffscreenPlainSurface` backs a `D3DPOOL_DEFAULT` plain with a
-/// texture created through here, so both entry points share one create path.
 /// Refuse a create whose system-memory copy the process cannot allocate.
 ///
 /// The staging a resource gets at creation is the one allocation that may
@@ -5464,6 +5460,10 @@ fn refuse_unallocatable_staging(entry_point: &str, out: *mut *mut c_void) -> i32
     mtld3d_types::E_OUTOFMEMORY
 }
 
+/// The body of `CreateTexture`, plus the intent the vtable signature cannot carry.
+///
+/// `CreateOffscreenPlainSurface` backs a `D3DPOOL_DEFAULT` plain with a
+/// texture created through here, so both entry points share one create path.
 fn create_texture_path(info: &TextureCreateArgs) -> i32 {
     let TextureCreateArgs {
         this,

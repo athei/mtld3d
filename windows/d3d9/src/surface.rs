@@ -111,7 +111,7 @@ pub enum ImplicitKind {
 ///   every `LockRect`, and turns an `UnlockRect` of an unmapped sub-resource
 ///   into a no-op success (the D3D9 behavior the conformance test asserts).
 /// * `held_dc` — the GDI objects of that outstanding `GetDC`.
-/// * `holder` — the `(cube face, mip level)` whose `GetDC` returned them, the
+/// * `holder`: the `(cube face, mip level)` whose `GetDC` returned them, the
 ///   one subresource whose `ReleaseDC` may give them back.
 pub struct DcLockState {
     map_count: u32,

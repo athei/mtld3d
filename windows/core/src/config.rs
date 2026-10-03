@@ -55,7 +55,7 @@ pub struct Mtld3dConfig {
     /// A seam for the test suite: it latches the device failure a Metal
     /// error would, so the suite can drive what a device does once it can no
     /// longer submit frames. A game never needs it; it only breaks the
-    /// device. Read once per submission while it is armed, nothing after.
+    /// device. Each submission pays one relaxed load of the armed flag.
     /// Default: `false`. File key: `debug.failNextSubmit`.
     pub fail_next_submit: bool,
     /// Force the packed 16-bit expansion path used on non-Apple-family GPUs.
