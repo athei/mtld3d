@@ -36,8 +36,17 @@
 //! and each is measured beside a private executable that only clears and
 //! presents, so the prewarm of that cache is the work, and reported as
 //! `cold_start_<name>`. A corpus whose header names another
-//! format or schema than this build's is one the layer would wipe: it is
+//! format or schema than the layer's is one the layer would wipe: it is
 //! skipped, and the `cold_start` report says so.
+//!
+//! The layer under test need not be the build of this binary: `make
+//! bench-ab` runs the candidate's binary against the base's layer too. So
+//! the format and schema a cache is judged by are the layer's, read from
+//! the header of the synthetic cache, which the priming process's layer
+//! wrote into an empty directory. The stored and appended record counts
+//! need this binary's reader, which decodes only its own schema, so a
+//! layer that writes another one gets its timings, its prewarm counts and
+//! its cache size reported without those counts, and the report says why.
 
 use core::fmt::Write as _;
 use std::{
@@ -197,21 +206,23 @@ fn cold_start() {
     let synthetic = Sandbox::new(&root.join("synthetic"), &exe, DRAW_EXE);
     fs::copy(&exe, synthetic.dir.join(PRIME_EXE)).expect("copy the priming executable");
     let prime = spawn(&synthetic.dir.join(PRIME_EXE), &synthetic.dir);
+    let layer = header_of(&synthetic.cache)
+        .unwrap_or_else(|reason| panic!("the priming process left no shader cache: {reason}"));
     let primed = synthetic
-        .settle()
+        .settle(&layer)
         .unwrap_or_else(|reason| panic!("the priming process left no usable cache: {reason}"));
-    let measured = synthetic.measure(primed);
+    let measured = synthetic.measure(primed, &layer);
 
     let mut notes = String::new();
     let (mut corpora, mut skipped) = (0_u64, 0_u64);
     for (name, source) in corpus_files() {
         let sandbox = Sandbox::new(&root.join(format!("corpus-{name}")), &exe, CLEAR_EXE);
         fs::copy(&source, &sandbox.cache).expect("copy a corpus cache");
-        let settled = compatible(&sandbox.cache).and_then(|()| sandbox.settle());
+        let settled = compatible(&sandbox.cache, &layer).and_then(|()| sandbox.settle(&layer));
         match settled {
             Ok(settled) => {
                 corpora += 1;
-                let measured = sandbox.measure(settled);
+                let measured = sandbox.measure(settled, &layer);
                 let _ = writeln!(
                     notes,
                     "corpus {name}: measured as cold_start_{name} ({})",
@@ -574,9 +585,12 @@ impl Sandbox {
 
     /// One untimed process on the cache, then keep what it left as the snapshot.
     ///
+    /// `layer` is the header the layer under test writes, which the kept
+    /// cache has to carry; its records are counted when it is this binary's.
+    ///
     /// # Errors
     /// Names why the cache is not usable when no current cache is left.
-    fn settle(&self) -> Result<Settled, String> {
+    fn settle(&self, layer: &CacheHeader) -> Result<Settled, String> {
         let warm_up = spawn(&self.exe, &self.dir);
         let mut notes = String::new();
         if warm_up.log.contains("shader_cache: compacted ") {
@@ -587,11 +601,19 @@ impl Sandbox {
             notes.push_str("; the untimed process regenerated stale MSL");
         }
         fs::copy(&self.cache, &self.snapshot).map_err(|error| format!("no cache left: {error}"))?;
-        let counts = Counts::of(&self.snapshot)?;
-        if counts.appended {
-            notes.push_str(
+        let counts = Counts::of(&self.snapshot, layer)?;
+        match &counts {
+            Some(counts) if counts.appended => notes.push_str(
                 "; the kept cache is not one bundle, so each measured process compacts it",
-            );
+            ),
+            Some(_) => {}
+            None => {
+                let _ = write!(
+                    notes,
+                    "; records not counted: {}",
+                    version_note(layer, "this benchmark binary", &CacheHeader::CURRENT)
+                );
+            }
         }
         let bytes = fs::metadata(&self.snapshot).map_or(0, |meta| meta.len());
         Ok(Settled {
@@ -603,17 +625,24 @@ impl Sandbox {
     }
 
     /// The measured processes, each started on the snapshot.
-    fn measure(&self, settled: Settled) -> Measured {
+    fn measure(&self, settled: Settled, layer: &CacheHeader) -> Measured {
         let mut runs = Vec::with_capacity(RUNS);
         for _ in 0..RUNS {
             fs::copy(&self.snapshot, &self.cache).expect("put the settled cache back");
             let child = spawn(&self.exe, &self.dir);
-            let after = Counts::of(&self.cache).unwrap_or_else(|reason| {
+            let after = Counts::of(&self.cache, layer).unwrap_or_else(|reason| {
                 panic!("a measured process left no current cache: {reason}")
             });
+            let live = settled
+                .counts
+                .as_ref()
+                .zip(after)
+                .map(|(settled, after)| Live {
+                    appended: after.records().saturating_sub(settled.records()),
+                    grew: after.appended,
+                });
             runs.push(Run {
-                appended: after.records().saturating_sub(settled.counts.records()),
-                grew: after.appended,
+                live,
                 prewarm: Prewarm::of(&child.log),
                 child,
             });
@@ -627,7 +656,8 @@ impl Sandbox {
 
 /// The settled cache every measured process starts from.
 struct Settled {
-    counts: Counts,
+    /// Its records, when this binary's reader decodes the layer's schema.
+    counts: Option<Counts>,
     bytes: u64,
     /// Whether the untimed process regenerated MSL an older emitter wrote.
     regenerated: bool,
@@ -645,19 +675,29 @@ struct Counts {
 }
 
 impl Counts {
-    /// Load the cache at `path`.
+    /// Load the cache at `path`, which has to carry the header `layer`.
+    ///
+    /// `None` when that header is not this binary's own, whose reader
+    /// decodes the records of its own schema only.
     ///
     /// # Errors
-    /// Names what the file is when it is not a current cache.
-    fn of(path: &Path) -> Result<Self, String> {
+    /// Names what the file is when it is not a current cache of the layer.
+    fn of(path: &Path, layer: &CacheHeader) -> Result<Option<Self>, String> {
         let bytes = fs::read(path).map_err(|error| format!("unreadable: {error}"))?;
+        let header = header_in(&bytes)?;
+        if header != *layer {
+            return Err(version_note(&header, "the layer", layer));
+        }
+        if header != CacheHeader::CURRENT {
+            return Ok(None);
+        }
         let stats = shader_cache::read_stats(&bytes).map_err(str::to_owned)?;
-        Ok(Self {
+        Ok(Some(Self {
             shaders: stats.shaders,
             ff_shaders: stats.ff_shaders,
             pipelines: stats.pipelines,
             appended: stats.needs_compaction,
-        })
+        }))
     }
 
     const fn records(&self) -> usize {
@@ -770,6 +810,12 @@ struct Step {
 struct Run {
     child: Child,
     prewarm: Prewarm,
+    /// What it appended to the settled cache, when the settled cache's records are counted.
+    live: Option<Live>,
+}
+
+/// What one measured process appended to the settled cache.
+struct Live {
     /// Records the run added to the settled cache.
     appended: usize,
     /// Whether the run appended anything at all, a duplicate record included.
@@ -873,27 +919,43 @@ fn corpus_files() -> Vec<(String, PathBuf)> {
     files
 }
 
-/// Whether the cache at `path` is of this build's format and schema.
+/// Whether the cache at `path` is of the format and schema `layer`, the layer's.
 ///
 /// # Errors
 /// Names the versions the file carries when the layer would wipe it.
-fn compatible(path: &Path) -> Result<(), String> {
-    let bytes = fs::read(path).map_err(|error| format!("unreadable: {error}"))?;
-    let header = shader_cache::read_header(&bytes).map_err(|_| "not a shader cache".to_owned())?;
-    if header == CacheHeader::CURRENT {
+fn compatible(path: &Path, layer: &CacheHeader) -> Result<(), String> {
+    let header = header_of(path)?;
+    if header == *layer {
         Ok(())
     } else {
-        Err(version_note(&header))
+        Err(version_note(&header, "the layer", layer))
     }
 }
 
-fn version_note(header: &CacheHeader) -> String {
+/// The format and schema the cache at `path` carries.
+///
+/// # Errors
+/// Names what the file is when it has no shader cache header.
+fn header_of(path: &Path) -> Result<CacheHeader, String> {
+    header_in(&fs::read(path).map_err(|error| format!("unreadable: {error}"))?)
+}
+
+/// The format and schema the cache `bytes` carry.
+///
+/// # Errors
+/// Says so when the bytes do not start with a shader cache header.
+fn header_in(bytes: &[u8]) -> Result<CacheHeader, String> {
+    shader_cache::read_header(bytes).map_err(|_| "not a shader cache".to_owned())
+}
+
+/// What a cache of `header` is to `reader`, which reads `reads`.
+fn version_note(header: &CacheHeader, reader: &str, reads: &CacheHeader) -> String {
     format!(
-        "cache format {} schema {}, this build reads format {} schema {}",
+        "cache format {} schema {}, {reader} reads format {} schema {}",
         header.format_version,
         header.shader_schema_version,
-        CacheHeader::CURRENT.format_version,
-        CacheHeader::CURRENT.shader_schema_version,
+        reads.format_version,
+        reads.shader_schema_version,
     )
 }
 
@@ -913,13 +975,16 @@ fn report(name: &str, shape: &str, measured: &Measured, kind: &Kind) {
     let count = |n: usize| Value::Count(u64::try_from(n).expect("a count fits u64"));
     metrics.metric("runs", count(runs.len()), Direction::Higher, Class::Info);
     let mut body = String::from(shape);
+    let records = settled.counts.as_ref().map_or_else(String::new, |counts| {
+        format!(
+            "{} shaders ({} fixed-function), {} pipeline recipes, ",
+            counts.shaders, counts.ff_shaders, counts.pipelines
+        )
+    });
     let _ = writeln!(
         body,
-        "stored cache: {shaders} shaders ({ff} fixed-function), {pipelines} pipeline recipes, {kib} KiB, \
-         put back before each of {count} measured processes{notes}",
-        shaders = settled.counts.shaders,
-        ff = settled.counts.ff_shaders,
-        pipelines = settled.counts.pipelines,
+        "stored cache: {records}{kib} KiB, put back before each of {count} measured \
+         processes{notes}",
         kib = settled.bytes >> 10,
         count = runs.len(),
         notes = settled.notes,
@@ -983,40 +1048,12 @@ fn report(name: &str, shape: &str, measured: &Measured, kind: &Kind) {
         }
     }
     if let Some(last) = runs.last() {
-        // Why fewer pipelines than recipes were built: a failed build, a
-        // recipe naming a shader that failed, or a recipe resolving to a
-        // pipeline another recipe had already built this startup.
-        let prewarm = &last.prewarm;
-        let recipes = u64::try_from(settled.counts.pipelines).expect("a count fits u64");
-        let built = prewarm.counts[1].unwrap_or(0);
-        let duplicates = recipes
-            .saturating_sub(built)
-            .saturating_sub(prewarm.failed)
-            .saturating_sub(prewarm.skipped);
-        let shaders = u64::try_from(settled.counts.shaders).expect("a count fits u64");
-        let _ = writeln!(
-            body,
-            "prewarm of the last run: {built} of {recipes} recipes built, {failed} failed, \
-             {skipped} skipped for a shader that failed, {duplicates} resolved to a pipeline \
-             already built; {missing} of {shaders} shaders not prewarmed",
-            failed = prewarm.failed,
-            skipped = prewarm.skipped,
-            missing = shaders.saturating_sub(prewarm.counts[0].unwrap_or(0)),
+        prewarm_rows(
+            &mut body,
+            &mut metrics,
+            &last.prewarm,
+            settled.counts.as_ref(),
         );
-        for (metric, value) in [
-            ("prewarm.failed", prewarm.failed),
-            ("prewarm.skipped", prewarm.skipped),
-            ("prewarm.duplicates", duplicates),
-        ] {
-            metrics.metric(metric, Value::Count(value), Direction::Lower, Class::Info);
-        }
-    }
-    for (metric, value) in [
-        ("cache.shaders", settled.counts.shaders),
-        ("cache.ff_shaders", settled.counts.ff_shaders),
-        ("cache.pipelines", settled.counts.pipelines),
-    ] {
-        metrics.metric(metric, count(value), Direction::Higher, Class::Exact);
     }
     metrics.metric(
         "cache.mib",
@@ -1024,27 +1061,10 @@ fn report(name: &str, shape: &str, measured: &Measured, kind: &Kind) {
         Direction::Lower,
         Class::Info,
     );
-    let appended: usize = runs.iter().map(|run| run.appended).sum();
-    let grew = runs.iter().filter(|run| run.grew).count();
-    let _ = writeln!(
-        body,
-        "live records (appended to the settled cache, so not prewarmed): {appended}, by {grew} \
-         of {} runs",
-        runs.len()
-    );
-    metrics.metric(
-        "live.records",
-        count(appended),
-        Direction::Lower,
-        Class::Exact,
-    );
-    if settled.counts.appended {
-        let _ = writeln!(
-            body,
-            "live runs: not counted, the kept cache is not one bundle, so every run appends"
-        );
+    if let Some(counts) = &settled.counts {
+        record_rows(&mut body, &mut metrics, counts, runs);
     } else {
-        metrics.metric("live.runs", count(grew), Direction::Lower, Class::Exact);
+        body.push_str("live records: not counted, as the stored ones are not\n");
     }
 
     let memory: Vec<u64> = (0..MEMORY_ROWS.len())
@@ -1098,6 +1118,85 @@ fn report(name: &str, shape: &str, measured: &Measured, kind: &Kind) {
         }
     }
     write_report(&metrics, &log, &body);
+}
+
+/// The last run's prewarm against the stored recipes and shaders, when those are counted.
+fn prewarm_rows(
+    body: &mut String,
+    metrics: &mut Metrics,
+    prewarm: &Prewarm,
+    counts: Option<&Counts>,
+) {
+    let built = prewarm.counts[1].unwrap_or(0);
+    let (failed, skipped) = (prewarm.failed, prewarm.skipped);
+    if let Some(counts) = counts {
+        // Why fewer pipelines than recipes were built: a failed build, a
+        // recipe naming a shader that failed, or a recipe resolving to a
+        // pipeline another recipe had already built this startup.
+        let recipes = u64::try_from(counts.pipelines).expect("a count fits u64");
+        let duplicates = recipes
+            .saturating_sub(built)
+            .saturating_sub(failed)
+            .saturating_sub(skipped);
+        let shaders = u64::try_from(counts.shaders).expect("a count fits u64");
+        let _ = writeln!(
+            body,
+            "prewarm of the last run: {built} of {recipes} recipes built, {failed} failed, \
+             {skipped} skipped for a shader that failed, {duplicates} resolved to a pipeline \
+             already built; {missing} of {shaders} shaders not prewarmed",
+            missing = shaders.saturating_sub(prewarm.counts[0].unwrap_or(0)),
+        );
+        metrics.metric(
+            "prewarm.duplicates",
+            Value::Count(duplicates),
+            Direction::Lower,
+            Class::Info,
+        );
+    } else {
+        let _ = writeln!(
+            body,
+            "prewarm of the last run: {built} pipelines built, {failed} failed, {skipped} \
+             skipped for a shader that failed; the stored recipes are not counted"
+        );
+    }
+    for (metric, value) in [("prewarm.failed", failed), ("prewarm.skipped", skipped)] {
+        metrics.metric(metric, Value::Count(value), Direction::Lower, Class::Info);
+    }
+}
+
+/// The stored records and what the measured processes appended to them.
+fn record_rows(body: &mut String, metrics: &mut Metrics, counts: &Counts, runs: &[Run]) {
+    let count = |n: usize| Value::Count(u64::try_from(n).expect("a count fits u64"));
+    for (metric, value) in [
+        ("cache.shaders", counts.shaders),
+        ("cache.ff_shaders", counts.ff_shaders),
+        ("cache.pipelines", counts.pipelines),
+    ] {
+        metrics.metric(metric, count(value), Direction::Higher, Class::Exact);
+    }
+    let live = || runs.iter().filter_map(|run| run.live.as_ref());
+    let appended: usize = live().map(|live| live.appended).sum();
+    let grew = live().filter(|live| live.grew).count();
+    let _ = writeln!(
+        body,
+        "live records (appended to the settled cache, so not prewarmed): {appended}, by {grew} \
+         of {} runs",
+        runs.len()
+    );
+    metrics.metric(
+        "live.records",
+        count(appended),
+        Direction::Lower,
+        Class::Exact,
+    );
+    if counts.appended {
+        let _ = writeln!(
+            body,
+            "live runs: not counted, the kept cache is not one bundle, so every run appends"
+        );
+    } else {
+        metrics.metric("live.runs", count(grew), Direction::Lower, Class::Exact);
+    }
 }
 
 /// Where the `at`-th programmable draw goes, in clip space.

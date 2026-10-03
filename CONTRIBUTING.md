@@ -339,7 +339,10 @@ are exact, so a change that alters the emitted code shows up there even when
 its time per shader stays inside the noise. A `BASE` older than the host
 benchmark runs neither leg's, and the run says so. The same caches are what
 `cold_start` measures in both legs. A cache only one build can read (a
-format change between them) is skipped for both with a note, while any
+format or schema change between them) is skipped for both with a note.
+`cold_start` counts a cache's records with the candidate's reader, so
+when the base's layer writes another schema the base leg reports its
+timings without those counts, and their rows read as added. Any
 other difference in what a benchmark ran, such as its own configuration
 entries or the depth path it took, stops the comparison: only the build and
 the run may differ between the legs.
