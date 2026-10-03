@@ -5,16 +5,21 @@
 
 use mtld3d_shared::mtl::{PS_LOD_BIAS_SLOT, VS_POS_FIXUP_SLOT};
 use mtld3d_types::{
-    D3DCMP_ALWAYS, D3DCMP_GREATER, D3DFOG_LINEAR, D3DMCS_COLOR1, D3DMCS_COLOR2, D3DMCS_MATERIAL,
-    D3DTA_ALPHAREPLICATE, D3DTA_CURRENT, D3DTA_DIFFUSE, D3DTA_SPECULAR, D3DTA_TEXTURE,
-    D3DTOP_DISABLE, D3DTOP_MODULATE, D3DTOP_SELECTARG1,
+    D3DCMP_ALWAYS, D3DCMP_GREATER, D3DDECLUSAGE_BINORMAL, D3DDECLUSAGE_FOG, D3DDECLUSAGE_NORMAL,
+    D3DFOG_LINEAR, D3DMCS_COLOR1, D3DMCS_COLOR2, D3DMCS_MATERIAL, D3DTA_ALPHAREPLICATE,
+    D3DTA_CURRENT, D3DTA_DIFFUSE, D3DTA_SPECULAR, D3DTA_TEXTURE, D3DTOP_DISABLE, D3DTOP_MODULATE,
+    D3DTOP_SELECTARG1,
 };
 
 use super::{
     FfPsKey, FfStage, FfStageFlags, FfVsFlags, FfVsKey, MAX_VERTEX_BLEND_MATRIX_INDEX, emit_ps_ff,
     emit_vs_ff,
 };
-use crate::dxso::emit::{VariantFlags, VariantKey};
+use crate::dxso::{
+    decl_passthrough_code,
+    emit::{VariantFlags, VariantKey},
+    tci_entry,
+};
 
 /// D3D enum constant at the key's narrow width.
 fn narrow(v: u32) -> u8 {
@@ -49,13 +54,13 @@ fn default_vs_key() -> FfVsKey {
         specular_source: narrow(D3DMCS_COLOR2),
         emissive_source: narrow(D3DMCS_MATERIAL),
         fog_mode: 0,
-        tci_modes: [0; 8],
-        tci_coord_indices: [0; 8],
+        tci: [0; 8],
         tex_coord_dims: [0; 8],
         tt_flags: [0; 8],
         vertex_blend_count: 0,
         declared_weights_count: 0,
         clip_plane_count: 0,
+        passthrough: [0; 8],
     }
 }
 
@@ -380,7 +385,7 @@ fn the_eye_space_position_is_declared_only_where_it_is_read() {
                     vs.light_spot_mask = spot;
                     vs.tex_coord_count = 1;
                     vs.input_tex_coord_count = 1;
-                    vs.tci_modes[0] = tci;
+                    vs.tci[0] = tci_entry(tci, 0);
                     vs.vertex_blend_count = blend;
                     vs.declared_weights_count = blend;
                     let msl = emit_vs_ff(&vs);
@@ -472,7 +477,7 @@ fn the_eye_space_normal_is_declared_only_where_it_is_read() {
                     vs.light_spot_mask = spot;
                     vs.tex_coord_count = 1;
                     vs.input_tex_coord_count = 1;
-                    vs.tci_modes[0] = tci;
+                    vs.tci[0] = tci_entry(tci, 0);
                     vs.vertex_blend_count = blend;
                     vs.declared_weights_count = blend;
                     let msl = emit_vs_ff(&vs);
@@ -798,7 +803,7 @@ fn no_vertex_shader_local_is_declared_unread() {
                     vs.tex_coord_count = 1;
                     vs.input_tex_coord_count = 1;
                     vs.tex_coord_dims[0] = 2;
-                    vs.tci_modes[0] = tci;
+                    vs.tci[0] = tci_entry(tci, 0);
                     vs.vertex_blend_count = blend;
                     vs.declared_weights_count = weights;
                     check(&vs);
@@ -860,7 +865,7 @@ fn no_vertex_shader_local_is_declared_unread() {
                     vs.tex_coord_count = 1;
                     vs.input_tex_coord_count = 1;
                     vs.tex_coord_dims[0] = dim;
-                    vs.tci_modes[0] = tci;
+                    vs.tci[0] = tci_entry(tci, 0);
                     vs.tt_flags[0] = tt;
                     check(&vs);
                 }
@@ -1922,7 +1927,7 @@ fn tci_passthru_honours_coord_index_override() {
     let mut vs = default_vs_key();
     vs.tex_coord_count = 1;
     vs.input_tex_coord_count = 3;
-    vs.tci_coord_indices[0] = 2;
+    vs.tci[0] = tci_entry(0, 2);
     vs.tex_coord_dims[2] = 2; // coord-set 2 is FLOAT2
     let mut ps = default_ps_key();
     ps.stages[0] = FfStage {
@@ -1953,7 +1958,7 @@ fn tci_cameraspacereflection_emits_reflection_vector() {
     let mut vs = default_vs_key();
     vs.flags.set(FfVsFlags::HAS_NORMAL, true);
     vs.tex_coord_count = 1;
-    vs.tci_modes[0] = 3;
+    vs.tci[0] = tci_entry(3, 0);
     let mut ps = default_ps_key();
     ps.stages[0] = FfStage {
         color_op: 4,
@@ -1998,7 +2003,7 @@ fn tci_cameraspacereflection_vertex_blended_reads_the_blended_locals() {
     vs.vertex_blend_count = 1;
     vs.declared_weights_count = 1;
     vs.tex_coord_count = 1;
-    vs.tci_modes[0] = 3;
+    vs.tci[0] = tci_entry(3, 0);
     let msl = emit_vs_ff(&vs);
     assert_eq!(
         msl.matches("    float3 posEye = pos_view.xyz;\n").count(),
@@ -2038,7 +2043,7 @@ fn texgen_reads_the_lighting_normal_lit_or_unlit() {
                 vs.light_active_mask = u8::from(lighting);
                 vs.light_directional_mask = u8::from(lighting);
                 vs.tex_coord_count = 1;
-                vs.tci_modes[0] = tci;
+                vs.tci[0] = tci_entry(tci, 0);
                 let msl = emit_vs_ff(&vs);
                 let case = format!("lighting={lighting} tci={tci} normalize={normalize}\n{msl}");
                 assert!(
@@ -2066,8 +2071,7 @@ fn tci_cameraspacenormal_without_normal_falls_back() {
     let mut vs = default_vs_key();
     vs.tex_coord_count = 1;
     vs.input_tex_coord_count = 1;
-    vs.tci_modes[0] = 1;
-    vs.tci_coord_indices[0] = 0;
+    vs.tci[0] = tci_entry(1, 0);
     vs.tex_coord_dims[0] = 2; // coord-set 0 is FLOAT2
     // has_normal = false in default key.
     let ps = default_ps_key();
@@ -2190,7 +2194,7 @@ fn tci_cameraspaceposition_reuses_lighting_poseye() {
     vs.light_active_mask = 1;
     vs.light_directional_mask = 1;
     vs.tex_coord_count = 1;
-    vs.tci_modes[0] = 2; // CAMERASPACEPOSITION
+    vs.tci[0] = tci_entry(2, 0); // CAMERASPACEPOSITION
     let ps = default_ps_key();
     let msl = emit_pair_for_tests(&vs, &ps, VariantKey::default());
     let pos_eye_decls = msl.matches("float3 posEye =").count();
@@ -2223,7 +2227,7 @@ fn eye_space_locals_are_declared_once_for_every_lighting_normal_and_tci_mix() {
                         vs.declared_weights_count = 1;
                     }
                     vs.tex_coord_count = 1;
-                    vs.tci_modes[0] = mode;
+                    vs.tci[0] = tci_entry(mode, 0);
                     let msl = emit_vs_ff(&vs);
                     let case = format!(
                         "blended={blended} lighting={lighting} normal={normal} tci={mode}\n{msl}"
@@ -2303,7 +2307,7 @@ fn tci_spheremap_emits_sphere_map_of_the_reflection_vector() {
     vs.tex_coord_count = 1;
     vs.input_tex_coord_count = 1;
     vs.tex_coord_dims[0] = 2;
-    vs.tci_modes[0] = 4;
+    vs.tci[0] = tci_entry(4, 0);
     let msl = emit_vs_ff(&vs);
     assert_eq!(msl.matches("float3 n = (abs(nwvdet)").count(), 1, "{msl}");
     assert!(!msl.contains("normalize(n"), "{msl}");
@@ -2330,7 +2334,7 @@ fn tci_spheremap_without_normal_reflects_about_a_zero_normal() {
     vs.tex_coord_count = 1;
     vs.input_tex_coord_count = 1;
     vs.tex_coord_dims[0] = 2;
-    vs.tci_modes[0] = 4;
+    vs.tci[0] = tci_entry(4, 0);
     let msl = emit_vs_ff(&vs);
     assert_eq!(msl.matches("float3 posEye =").count(), 1, "{msl}");
     assert!(!msl.contains("float3 n ="), "{msl}");
@@ -2352,7 +2356,7 @@ fn tci_spheremap_lit_reuses_the_lighting_locals() {
     vs.light_active_mask = 1;
     vs.light_directional_mask = 1;
     vs.tex_coord_count = 1;
-    vs.tci_modes[0] = 4;
+    vs.tci[0] = tci_entry(4, 0);
     let msl = emit_vs_ff(&vs);
     assert_eq!(msl.matches("float3 posEye =").count(), 1, "{msl}");
     assert_eq!(msl.matches("float3 n =").count(), 1, "{msl}");
@@ -2367,7 +2371,7 @@ fn tci_spheremap_vertex_blended_reads_the_blended_locals() {
     vs.vertex_blend_count = 1;
     vs.declared_weights_count = 1;
     vs.tex_coord_count = 1;
-    vs.tci_modes[0] = 4;
+    vs.tci[0] = tci_entry(4, 0);
     let msl = emit_vs_ff(&vs);
     assert_eq!(
         msl.matches("    float3 posEye = pos_view.xyz;\n").count(),
@@ -2388,7 +2392,7 @@ fn tci_spheremap_texture_transform_applies_to_the_generated_coordinate() {
     let mut vs = default_vs_key();
     vs.flags.set(FfVsFlags::HAS_NORMAL, true);
     vs.tex_coord_count = 1;
-    vs.tci_modes[0] = 4;
+    vs.tci[0] = tci_entry(4, 0);
     vs.tt_flags[0] = 2;
     let msl = emit_vs_ff(&vs);
     let generated = msl
@@ -2408,7 +2412,7 @@ fn tci_spheremap_texture_transform_applies_to_the_generated_coordinate() {
 }
 
 #[test]
-fn tci_modes_above_spheremap_pass_the_input_coordinate_through() {
+fn tci_mode_above_spheremap_passes_the_input_coordinate_through() {
     // Modes 5 and up are undefined; the stage reads its input coordinate and
     // hoists nothing.
     let mut vs = default_vs_key();
@@ -2416,7 +2420,7 @@ fn tci_modes_above_spheremap_pass_the_input_coordinate_through() {
     vs.tex_coord_count = 1;
     vs.input_tex_coord_count = 1;
     vs.tex_coord_dims[0] = 2;
-    vs.tci_modes[0] = 5;
+    vs.tci[0] = tci_entry(5, 0);
     let msl = emit_vs_ff(&vs);
     assert!(
         msl.contains("float4 raw0 = float4(in.v4.xy, 0.0, 0.0);"),
@@ -2435,7 +2439,7 @@ fn tci_spheremap_on_xyzrhw_passes_the_input_coordinate_through() {
     vs.tex_coord_count = 1;
     vs.input_tex_coord_count = 1;
     vs.tex_coord_dims[0] = 2;
-    vs.tci_modes[0] = 4;
+    vs.tci[0] = tci_entry(4, 0);
     let msl = emit_vs_ff(&vs);
     assert!(msl.contains("out.texcoord0 = float4(("), "{msl}");
     assert!(msl.contains("in.v4"), "{msl}");
@@ -2445,7 +2449,7 @@ fn tci_spheremap_on_xyzrhw_passes_the_input_coordinate_through() {
 #[test]
 fn emit_vs_ff_tex_coord_count_8_rhw_does_not_panic() {
     // Guards the `for i in 0..vs.tex_coord_count` loop that indexes the
-    // per-stage `[u8; 8]` arrays (tci_modes etc.): the construction-side
+    // per-stage `[u8; 8]` arrays (tci etc.): the construction-side
     // clamp caps tex_coord_count at 8, so every slot must be walked fully
     // without an out-of-bounds panic.
     let mut vs = default_vs_key();
@@ -2460,7 +2464,7 @@ fn emit_vs_ff_tex_coord_count_8_rhw_does_not_panic() {
 #[test]
 fn emit_vs_ff_tex_coord_count_8_non_rhw_does_not_panic() {
     // Same invariant for the non-XYZRHW branch (the per-stage texcoord loop and
-    // the `vs.tci_modes[..active]` TCI pre-scan in `emit_vs`).
+    // the TCI pre-scan over the active stages in `emit_vs`).
     let mut vs = default_vs_key();
     vs.flags.set(FfVsFlags::HAS_RHW, false);
     vs.input_tex_coord_count = 8;
@@ -3763,4 +3767,85 @@ fn modulate_inv_color_add_alpha_constant_values_leave_shader_identity_unchanged(
         assert_eq!(key, changed);
         assert_eq!(source, emit_ps_ff(&changed, VariantKey::default()));
     }
+}
+
+/// A pre-transformed key passing NORMAL0, FOG0 and BINORMAL0 through, with the FF normal flag set.
+fn rhw_passthrough_key() -> FfVsKey {
+    let mut vs = default_vs_key();
+    vs.flags.set(FfVsFlags::HAS_RHW, true);
+    vs.flags.set(FfVsFlags::HAS_NORMAL, true);
+    let code = |usage| decl_passthrough_code(usage, 0).expect("semantic passes through");
+    vs.passthrough[..3].copy_from_slice(&[
+        code(D3DDECLUSAGE_NORMAL),
+        code(D3DDECLUSAGE_FOG),
+        code(D3DDECLUSAGE_BINORMAL),
+    ]);
+    vs
+}
+
+#[test]
+fn rhw_passes_declaration_elements_through_by_semantic() {
+    let msl = emit_vs_ff(&rhw_passthrough_key());
+    for line in [
+        "float4 p0 [[attribute(15)]];",
+        "float4 p1 [[attribute(16)]];",
+        "float4 p2 [[attribute(17)]];",
+        "    float4 normal0;\n",
+        "    float4 binormal0;\n",
+        "out.normal0 = in.p0;",
+        "out.fog = in.p1;",
+        "out.binormal0 = in.p2;",
+    ] {
+        assert!(msl.contains(line), "{line:?} missing from\n{msl}");
+    }
+    // The pre-transformed stage never reads the FF normal slot, and the
+    // descriptor carries the element at its passthrough attribute instead.
+    assert!(!msl.contains("[[attribute(1)]]"), "{msl}");
+    // Fog is a member every struct declares, not an extra one.
+    assert!(!msl.contains("float4 fog0;"), "{msl}");
+}
+
+#[test]
+fn rhw_specular_alpha_fog_keeps_the_fog_varying() {
+    let mut vs = rhw_passthrough_key();
+    vs.flags.set(FfVsFlags::HAS_COLOR1, true);
+    vs.fog_mode = 4;
+    let msl = emit_vs_ff(&vs);
+    assert!(
+        msl.contains("out.fog = float4(in.v3.w, 0.0, 0.0, 0.0);"),
+        "{msl}"
+    );
+    assert!(!msl.contains("out.fog = in.p1;"), "{msl}");
+    assert!(msl.contains("out.normal0 = in.p0;"), "{msl}");
+}
+
+#[test]
+fn an_untransformed_key_passes_nothing_through_and_keeps_its_normal() {
+    let mut vs = default_vs_key();
+    vs.flags.set(FfVsFlags::HAS_NORMAL, true);
+    let msl = emit_vs_ff(&vs);
+    assert!(msl.contains("float4 v1 [[attribute(1)]];"), "{msl}");
+    assert!(!msl.contains("in.p0"), "{msl}");
+    assert!(!msl.contains("normal0"), "{msl}");
+    // The FF pixel stage declares no extra member whatever the vertex stage outputs.
+    let ps = emit_ps_ff(&default_ps_key(), VariantKey::default());
+    assert!(!ps.contains("normal0"), "{ps}");
+}
+
+/// `tci_entry` clamps a mode past the nibble and a set past 7 to values the emitter treats alike.
+///
+/// Mode 0x14 and set 9 read as mode 15 and set 7; an undefined mode emits
+/// the same passthru MSL whichever undefined value it carries.
+#[test]
+fn tci_entry_clamps_without_changing_the_emitted_shader() {
+    assert_eq!(tci_entry(0x14, 9), tci_entry(15, 7));
+    let msl = |mode| {
+        let mut vs = default_vs_key();
+        vs.tex_coord_count = 1;
+        vs.input_tex_coord_count = 1;
+        vs.tex_coord_dims[0] = 2;
+        vs.tci[0] = tci_entry(mode, 0);
+        emit_vs_ff(&vs)
+    };
+    assert_eq!(msl(5), msl(0x14));
 }

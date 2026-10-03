@@ -81,6 +81,30 @@ impl Semantic {
         }
     }
 
+    /// The semantic of a vertex declaration element; `None` for a usage outside `D3DDECLUSAGE_*`.
+    const fn from_decl(usage: u8, usage_index: u8) -> Option<Self> {
+        if usage > DeclUsage::Sample as u8 {
+            return None;
+        }
+        Some(Self::from_code((usage << 4) | (usage_index & 0xF)))
+    }
+
+    /// Whether a pre-transformed draw's vertex stage passes an element of this semantic through.
+    ///
+    /// With no vertex shader in the way, D3D9 feeds each `ps_3_0` input from
+    /// the declaration element of the same semantic. The fixed-function
+    /// vertex stage already writes the position, both colours, the texture
+    /// coordinates and the point size from the declaration, so the elements
+    /// left to pass through are the secondary position, fog and every extra
+    /// semantic but the pre-transformed position itself.
+    const fn passes_through(self) -> bool {
+        match (self.usage, self.index) {
+            (DeclUsage::PositionT, 0) => false,
+            (DeclUsage::Position, 1) | (DeclUsage::Fog, 0) => true,
+            _ => self.is_extra(),
+        }
+    }
+
     /// Whether the semantic travels in a member outside the set every `Varyings` declares.
     ///
     /// The clip position (`POSITION0`) and the point size (`PSIZE0`) are not
@@ -149,6 +173,21 @@ impl SemanticSet {
         for element in elements(vs).filter(|e| is_output_kind(e.reg.0)) {
             if element.semantic.is_extra() {
                 set.insert(element.semantic);
+            }
+        }
+        set
+    }
+
+    /// The extra semantics a pre-transformed draw's vertex stage outputs from its declaration.
+    ///
+    /// `passthrough` is the list [`decl_passthrough_code`] builds; the rest
+    /// of it lands in members every `Varyings` declares.
+    #[must_use]
+    pub fn passthrough_outputs(passthrough: &[u8; MAX_LINKED_INPUTS]) -> Self {
+        let mut set = Self::default();
+        for (_, semantic) in passthrough_entries(passthrough) {
+            if semantic.is_extra() {
+                set.insert(semantic);
             }
         }
         set
@@ -570,6 +609,74 @@ pub fn write_extra_members(out: &mut String, extras: &[Semantic]) {
     for semantic in extras {
         let _ = writeln!(out, "    float4 {};", semantic.member());
     }
+}
+
+/// The passthrough code of a declaration element; `None` for one a pre-transformed draw drops.
+///
+/// A pre-transformed draw's passthrough list holds these codes in the
+/// order the declaration names them, without repeats, at most
+/// [`MAX_LINKED_INPUTS`] of them, and zero in the slots past its end: the
+/// code of `POSITION0`, which never passes through. Entry `k` is read from
+/// the vertex attribute the fixed-function convention reserves for it.
+#[must_use]
+pub const fn decl_passthrough_code(usage: u8, usage_index: u8) -> Option<u8> {
+    match Semantic::from_decl(usage, usage_index) {
+        Some(semantic) if semantic.passes_through() => Some(semantic.code()),
+        _ => None,
+    }
+}
+
+/// The extra semantics of a passthrough list, the `Varyings` members its vertex stage declares.
+#[must_use]
+pub fn passthrough_extras(passthrough: [u8; MAX_LINKED_INPUTS]) -> Vec<Semantic> {
+    passthrough_entries(&passthrough)
+        .map(|(_, semantic)| semantic)
+        .filter(|semantic| semantic.is_extra())
+        .collect()
+}
+
+/// Declare the vertex input of each passthrough entry, `p<k>` at attribute `attr_base + k`.
+pub fn write_passthrough_inputs(
+    out: &mut String,
+    passthrough: [u8; MAX_LINKED_INPUTS],
+    attr_base: u16,
+) {
+    for (k, _) in passthrough_entries(&passthrough) {
+        let _ = writeln!(
+            out,
+            "    float4 p{k} [[attribute({})]];",
+            usize::from(attr_base) + k
+        );
+    }
+}
+
+/// Write each passthrough entry's input into the member named after its semantic.
+///
+/// `FOG0` lands in `fog`, which the fixed-function pixel stage also reads as
+/// the vertex fog factor, so it is written only when `write_fog` says the
+/// vertex stage supplies no factor of its own.
+pub fn write_passthrough_outputs(
+    out: &mut String,
+    passthrough: [u8; MAX_LINKED_INPUTS],
+    write_fog: bool,
+) {
+    for (k, semantic) in passthrough_entries(&passthrough) {
+        if (semantic.usage, semantic.index) == (DeclUsage::Fog, 0) && !write_fog {
+            continue;
+        }
+        let _ = writeln!(out, "    out.{} = in.p{k};", semantic.member());
+    }
+}
+
+/// The occupied slots of a passthrough list with their semantics.
+fn passthrough_entries(
+    passthrough: &[u8; MAX_LINKED_INPUTS],
+) -> impl Iterator<Item = (usize, Semantic)> + '_ {
+    passthrough
+        .iter()
+        .take_while(|code| **code != 0)
+        .map(|code| Semantic::from_code(*code))
+        .enumerate()
 }
 
 #[cfg(test)]

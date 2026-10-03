@@ -30,7 +30,7 @@ use mtld3d_core::{
     },
     departed_textures::DepartedTextures,
     dirty_rect::DirtyRect,
-    dxso::{VsSamplerKinds, operand_token_count},
+    dxso::{MAX_LINKED_INPUTS, VsSamplerKinds, operand_token_count},
     encoder_draw::{
         ApiSnapshotCache, SnapshotAttributes, SnapshotDelta,
         draw_record::{BoundVertices, IndexBuffer, IndexedDraw, NonindexedDraw, StreamRecord},
@@ -1119,6 +1119,18 @@ impl DeviceInner {
 
     pub const fn vertex_decl(&self) -> *mut Direct3DVertexDeclaration9 {
         self.vertex_decl.raw()
+    }
+
+    /// The elements the bound declaration passes to the pixel stage of a pre-transformed draw.
+    ///
+    /// Empty with no declaration bound, the state in which the FVF is 0.
+    fn bound_decl_passthrough(&self) -> [u8; MAX_LINKED_INPUTS] {
+        let decl = self.vertex_decl();
+        if decl.is_null() {
+            return [0; MAX_LINKED_INPUTS];
+        }
+        // SAFETY: non-null; the bound-slot refcount keeps the declaration live.
+        unsafe { &*decl }.inner().passthrough()
     }
 
     /// Bind `new` as the current vertex declaration. Pass null to clear.
@@ -11764,7 +11776,7 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
             // D3D9 runs the FF pre-transformed path regardless, even when a
             // VS is still bound — so the attrs must resolve for the FF VS too.
             let resolved = if bound_vertex_shader.is_null() || layout.has_rhw() {
-                resolve_attrs_for_ff(&elements)
+                resolve_attrs_for_ff(&elements, &[0; MAX_LINKED_INPUTS])
             } else {
                 // SAFETY: non-null check passed; refcount holds it live.
                 let vs_obj = unsafe { &*bound_vertex_shader };
@@ -11778,7 +11790,7 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
             let layout = convert::ff_vs_layout_from_elements(elements, fvf == 0);
             // See the FVF arm: POSITIONT bypasses a bound VS.
             let resolved = if bound_vertex_shader.is_null() || layout.has_rhw() {
-                resolve_attrs_for_ff(elements)
+                resolve_attrs_for_ff(elements, &decl.inner().passthrough())
             } else {
                 // SAFETY: see above.
                 let vs_obj = unsafe { &*bound_vertex_shader };
@@ -11993,9 +12005,12 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
             SnapshotSection::VsSource,
         ));
         if bound_vertex_shader.is_null() || dev.cached_ff_vs_layout.has_rhw() {
-            let key = dev
-                .ff_state()
-                .build_vs_key(rs, dev.cached_ff_vs_layout, bound_mask);
+            let key = dev.ff_state().build_vs_key(
+                rs,
+                dev.cached_ff_vs_layout,
+                bound_mask,
+                dev.bound_decl_passthrough(),
+            );
             mtld3d_shared::crumb!(
                 "ffvs:cap",
                 dev.current_seq(),
@@ -12139,9 +12154,12 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
         let key_ref = vs_value.as_ref().or(dev.snapshot_cache.vs.as_ref());
         let key = match key_ref {
             Some(VsSource::FixedFunction(value)) => value.key.clone(),
-            _ => dev
-                .ff_state()
-                .build_vs_key(rs, dev.cached_ff_vs_layout, bound_mask),
+            _ => dev.ff_state().build_vs_key(
+                rs,
+                dev.cached_ff_vs_layout,
+                bound_mask,
+                dev.bound_decl_passthrough(),
+            ),
         };
         let ff_dirty = dev.ff_state.take_ff_vs_dirty();
         if !ff_dirty.is_empty() {

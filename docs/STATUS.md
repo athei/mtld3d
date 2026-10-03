@@ -129,12 +129,17 @@ unless its entry says otherwise.
   `IDirect3DDevice9::Present` and `IDirect3DSwapChain9::Present` and ignored,
   each warned once; the whole back buffer is presented across the device
   window.
-- SM3 pixel inputs outside the fixed-function varyings (NORMAL, TANGENT,
-  COLOR2 and the like) behind a pretransformed (XYZRHW, POSITIONT) draw read
-  zero: Windows feeds them the vertex declaration's elements by semantic,
-  and the fixed-function vertex path outputs none of them. A `ps_3_0` links
-  at most `MAX_LINKED_INPUTS` (eight) such semantics; a ninth and later read
-  zero, warned once. Issue #981.
+- SM3 linkage limits. A `ps_3_0` links at most `MAX_LINKED_INPUTS` (eight)
+  input semantics outside the fixed-function varyings (NORMAL, TANGENT,
+  COLOR2 and the like); a ninth and later read zero, warned once. A
+  pretransformed (XYZRHW, POSITIONT) draw feeds a `ps_3_0` the declaration's
+  elements by semantic, at most eight of them besides the position, colours,
+  texture coordinates and point size, the rest reading zero, warned once.
+  Two of its inputs keep the fixed-function value instead, both unverified
+  against Windows: TEXCOORDn is the set stage n's `D3DTSS_TEXCOORDINDEX`
+  routes, which is the declaration's TEXCOORDn unless the index was changed,
+  and FOG reads the specular alpha while fog is enabled with both fog modes
+  NONE, where the fixed-function pixel stage reads its fog factor.
 - Timestamp, timestamp frequency, timestamp disjoint and other niche query
   types: capability probes and creation report `D3DERR_NOTAVAILABLE`.
 - Fixed-function bump-environment mapping: `D3DTOP_BUMPENVMAP` and

@@ -3836,13 +3836,13 @@ fn vertex_blend_msl_compiles_under_metal() {
         specular_source: 2,
         emissive_source: 0,
         fog_mode: 0,
-        tci_modes: [0; 8],
-        tci_coord_indices: [0; 8],
+        tci: [0; 8],
         tex_coord_dims: [0; 8],
         tt_flags: [0; 8],
         vertex_blend_count: 3,
         declared_weights_count: 2,
         clip_plane_count: 0,
+        passthrough: [0; 8],
     };
     metal_compile_or_fail(&emit_vs_ff(&sequential));
 
@@ -3857,6 +3857,7 @@ fn vertex_blend_msl_compiles_under_metal() {
         vertex_blend_count: 1,
         declared_weights_count: 0,
         clip_plane_count: 0,
+        passthrough: [0; 8],
         ..sequential
     };
     metal_compile_or_fail(&emit_vs_ff(&indexed_only));
@@ -3884,13 +3885,13 @@ fn ff_vs_lit_specular_msl_compiles_under_metal() {
         specular_source: 2,
         emissive_source: 0,
         fog_mode: 0,
-        tci_modes: [0; 8],
-        tci_coord_indices: [0; 8],
+        tci: [0; 8],
         tex_coord_dims: [0; 8],
         tt_flags: [0; 8],
         vertex_blend_count: 0,
         declared_weights_count: 0,
         clip_plane_count: 0,
+        passthrough: [0; 8],
     };
     metal_compile_or_fail(&emit_vs_ff(&key));
 }
@@ -3915,13 +3916,13 @@ fn ff_vs_with_clip_planes_emits_clip_distances_and_compiles() {
         specular_source: 2,
         emissive_source: 0,
         fog_mode: 0,
-        tci_modes: [0; 8],
-        tci_coord_indices: [0; 8],
+        tci: [0; 8],
         tex_coord_dims: [0; 8],
         tt_flags: [0; 8],
         vertex_blend_count: 0,
         declared_weights_count: 0,
         clip_plane_count: 2,
+        passthrough: [0; 8],
     };
     let msl = emit_vs_ff(&key);
     assert!(
@@ -3939,6 +3940,7 @@ fn ff_vs_with_clip_planes_emits_clip_distances_and_compiles() {
     metal_compile_or_fail(&msl);
     let no_clip = FfVsKey {
         clip_plane_count: 0,
+        passthrough: [0; 8],
         ..key
     };
     assert!(

@@ -5,12 +5,18 @@
 
 use core::ffi::c_void;
 
-use mtld3d_tests::{Harness, HarnessConfig, PosColorVertex, PosVertex, VolumeVertex, run_child};
+use mtld3d_tests::{
+    Harness, HarnessConfig, PosColorVertex, PosVertex, VolumeVertex, assert_pixel_approx, run_child,
+};
 use mtld3d_types::{
-    D3DCLEAR_STENCIL, D3DCLEAR_ZBUFFER, D3DERR_INVALIDCALL, D3DFMT_D24S8, D3DFVF_DIFFUSE,
-    D3DFVF_TEX1, D3DFVF_TEXTUREFORMAT3, D3DFVF_XYZ, D3DPOOL_MANAGED, D3DPT_TRIANGLELIST,
-    D3DRS_ALPHABLENDENABLE, D3DRS_COLORWRITEENABLE, D3DRS_LIGHTING, D3DRS_SRGBWRITEENABLE,
-    D3DRS_ZENABLE,
+    D3DCLEAR_STENCIL, D3DCLEAR_ZBUFFER, D3DDECL_END_STREAM, D3DDECLTYPE_D3DCOLOR,
+    D3DDECLTYPE_FLOAT4, D3DDECLTYPE_UNUSED, D3DDECLUSAGE_BINORMAL, D3DDECLUSAGE_BLENDINDICES,
+    D3DDECLUSAGE_BLENDWEIGHT, D3DDECLUSAGE_COLOR, D3DDECLUSAGE_DEPTH, D3DDECLUSAGE_FOG,
+    D3DDECLUSAGE_NORMAL, D3DDECLUSAGE_POSITIONT, D3DDECLUSAGE_TANGENT, D3DDECLUSAGE_TEXCOORD,
+    D3DERR_INVALIDCALL, D3DFMT_D24S8, D3DFVF_DIFFUSE, D3DFVF_TEX1, D3DFVF_TEXTUREFORMAT3,
+    D3DFVF_XYZ, D3DPOOL_MANAGED, D3DPT_TRIANGLELIST, D3DPT_TRIANGLESTRIP, D3DRS_ALPHABLENDENABLE,
+    D3DRS_COLORWRITEENABLE, D3DRS_LIGHTING, D3DRS_SRGBWRITEENABLE, D3DRS_ZENABLE, D3DTA_DIFFUSE,
+    D3DTOP_SELECTARG1, D3DTSS_COLORARG1, D3DTSS_COLOROP, D3DVERTEXELEMENT9,
 };
 
 /// `vs_2_0`: `dcl_position v0; mov oPos, v0;`
@@ -2882,4 +2888,163 @@ fn an_sm3_input_no_vertex_output_supplies_reads_zero() {
 
     assert_eq!(h.clear_vertex_shader(), 0, "unbind VS");
     assert_eq!(h.clear_pixel_shader(), 0, "unbind PS");
+}
+
+/// One vertex of [`PRETRANSFORMED_PASSTHROUGH_DECL`].
+#[repr(C)]
+struct PassthroughVertex {
+    position: [f32; 4],
+    float4s: [[f32; 4]; 8],
+    diffuse: u32,
+    specular: u32,
+}
+
+/// Usage of each `FLOAT4` element of [`PassthroughVertex::float4s`], in order.
+const PASSTHROUGH_USAGES: [u8; 8] = [
+    D3DDECLUSAGE_BLENDWEIGHT,
+    D3DDECLUSAGE_BLENDINDICES,
+    D3DDECLUSAGE_NORMAL,
+    D3DDECLUSAGE_FOG,
+    D3DDECLUSAGE_TEXCOORD,
+    D3DDECLUSAGE_TANGENT,
+    D3DDECLUSAGE_BINORMAL,
+    D3DDECLUSAGE_DEPTH,
+];
+
+/// The colour each element of [`PassthroughVertex::float4s`] carries, distinct per channel.
+const PASSTHROUGH_COLORS: [u32; 8] = [
+    0xFF10_2030,
+    0xFF40_5060,
+    0xFF70_8090,
+    0xFFA0_B0C0,
+    0xFF11_2233,
+    0xFF44_5566,
+    0xFF77_8899,
+    0xFFAA_BBCC,
+];
+
+const PASSTHROUGH_DIFFUSE: u32 = 0xFF12_3456;
+
+/// `ps_3_0 { dcl_<usage><index> v0; mov oC0, v0; }`
+fn ps3_echo(usage: u8, index: u8) -> [u32; 8] {
+    [
+        0xFFFF_0300,
+        0x0200_001F,
+        0x8000_0000 | (u32::from(index) << 16) | u32::from(usage),
+        0x900F_0000,
+        0x0200_0001,
+        0x800F_0800,
+        0x90E4_0000,
+        0x0000_FFFF,
+    ]
+}
+
+/// A pre-transformed draw feeds each `ps_3_0` input the declaration element of its semantic.
+///
+/// With no vertex shader, D3D9 hands a `ps_3_0` the declaration's elements
+/// by semantic: the ones the fixed-function stage carries anyway (texture
+/// coordinates, colours) and every other semantic, NORMAL, TANGENT, FOG and
+/// the rest. A semantic the declaration lacks reads zero, and the same
+/// declaration still draws its diffuse through the fixed-function pixel
+/// stage.
+#[test]
+fn a_pretransformed_draw_feeds_sm3_inputs_from_the_declaration_by_semantic() {
+    let element = |offset: u16, type_: u8, usage: u8| D3DVERTEXELEMENT9 {
+        stream: 0,
+        offset,
+        type_,
+        method: 0,
+        usage,
+        usage_index: 0,
+    };
+    let mut elements = vec![element(0, D3DDECLTYPE_FLOAT4, D3DDECLUSAGE_POSITIONT)];
+    for (i, usage) in (0u16..).zip(PASSTHROUGH_USAGES) {
+        elements.push(element(16 + 16 * i, D3DDECLTYPE_FLOAT4, usage));
+    }
+    let mut specular = element(148, D3DDECLTYPE_D3DCOLOR, D3DDECLUSAGE_COLOR);
+    specular.usage_index = 1;
+    elements.extend([
+        element(144, D3DDECLTYPE_D3DCOLOR, D3DDECLUSAGE_COLOR),
+        specular,
+        D3DVERTEXELEMENT9 {
+            stream: D3DDECL_END_STREAM,
+            offset: 0,
+            type_: D3DDECLTYPE_UNUSED,
+            method: 0,
+            usage: 0,
+            usage_index: 0,
+        },
+    ]);
+    let float4s = PASSTHROUGH_COLORS.map(|color| {
+        let [b, g, r, _] = color.to_le_bytes();
+        let unorm = |c: u8| f32::from(c) / 255.0;
+        [unorm(r), unorm(g), unorm(b), 1.0]
+    });
+    let vertex = |x: f32, y: f32| PassthroughVertex {
+        position: [x, y, 0.5, 1.0],
+        float4s,
+        diffuse: PASSTHROUGH_DIFFUSE,
+        specular: 0xFF00_0000,
+    };
+    let quad = [
+        vertex(0.0, 0.0),
+        vertex(640.0, 0.0),
+        vertex(0.0, 480.0),
+        vertex(640.0, 480.0),
+    ];
+
+    let h = Harness::new();
+    let decl = h.create_vertex_declaration(&elements);
+    assert_eq!(h.set_vertex_declaration(&decl), 0, "SetVertexDeclaration");
+    assert_eq!(h.set_render_state(D3DRS_LIGHTING, 0), 0, "LIGHTING");
+    let draw = || {
+        h.render_once(0xFFFF_00FF, |d| {
+            assert_eq!(
+                d.draw_primitive_up(D3DPT_TRIANGLESTRIP, 2, &quad),
+                0,
+                "draw"
+            );
+        });
+        h.read_pixel(320, 240)
+    };
+
+    let mut cases: Vec<(u8, u8, u32)> = PASSTHROUGH_USAGES
+        .into_iter()
+        .zip(PASSTHROUGH_COLORS)
+        .map(|(usage, color)| (usage, 0, color))
+        .collect();
+    cases.extend([
+        (D3DDECLUSAGE_COLOR, 0, PASSTHROUGH_DIFFUSE),
+        // Neither is in the declaration: every lane, alpha included, reads zero.
+        (D3DDECLUSAGE_COLOR, 2, 0x0000_0000),
+        (D3DDECLUSAGE_TEXCOORD, 1, 0x0000_0000),
+    ]);
+    for (usage, index, expected) in cases {
+        let ps = h.create_pixel_shader(&ps3_echo(usage, index));
+        assert_eq!(h.set_pixel_shader(&ps), 0, "SetPixelShader");
+        assert_pixel_approx(
+            draw(),
+            expected,
+            1,
+            &format!("ps_3_0 reading usage {usage} index {index}"),
+        );
+        assert_eq!(h.clear_pixel_shader(), 0, "unbind PS");
+    }
+
+    assert_eq!(
+        h.set_texture_stage_state(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1),
+        0,
+        "COLOROP"
+    );
+    assert_eq!(
+        h.set_texture_stage_state(0, D3DTSS_COLORARG1, D3DTA_DIFFUSE),
+        0,
+        "COLORARG1"
+    );
+    assert_pixel_approx(
+        draw(),
+        PASSTHROUGH_DIFFUSE,
+        1,
+        "the fixed-function pixel stage still draws the diffuse",
+    );
 }

@@ -582,6 +582,12 @@ pub enum VertexStepFunction {
 /// uniforms sit above this range (see [`VS_POS_FIXUP_SLOT`]).
 pub const VERTEX_STREAM_SLOTS: u32 = 16;
 
+/// Entries in a Metal vertex descriptor's attribute table.
+///
+/// Every `[[attribute(N)]]` a vertex function declares, and every
+/// `attr_index` a pipeline recipe carries, is below this.
+pub const VERTEX_ATTRIBUTE_SLOTS: u32 = 31;
+
 /// Vertex-stage buffer slot of the half-pixel rasterization fixup uniform.
 ///
 /// The three uniform slots sit at the top of Metal's 31-entry vertex buffer

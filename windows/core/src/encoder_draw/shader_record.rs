@@ -183,7 +183,7 @@ macro_rules! packed_fields {
 packed_fields!(crate::dxso::FfVsKey;
     flags:2, input_tex_coord_count:1, tex_coord_count:1, light_active_mask:1,
     light_directional_mask:1, light_spot_mask:1, diffuse_source:1, ambient_source:1,
-    specular_source:1, emissive_source:1, fog_mode:1, tci_modes:8, tci_coord_indices:8,
+    specular_source:1, emissive_source:1, fog_mode:1, tci:8, passthrough:8,
     tex_coord_dims:8, tt_flags:8, vertex_blend_count:1, declared_weights_count:1,
     clip_plane_count:1, reserved:1);
 packed_fields!(crate::dxso::FfStage;

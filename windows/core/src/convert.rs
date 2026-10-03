@@ -39,7 +39,10 @@ use mtld3d_types::{
 };
 use xxhash_rust::xxh3::Xxh3;
 
-use crate::dxso::{DeclUsage, ff_attr_index_for_semantic};
+use crate::dxso::{
+    DeclUsage, FF_PASSTHROUGH_ATTR_BASE, MAX_LINKED_INPUTS, decl_passthrough_code,
+    ff_attr_index_for_semantic,
+};
 
 /// `(usage, usage_index) → input register index` pulled from a parsed VS's `dcl_*` declarations.
 ///
@@ -1147,6 +1150,9 @@ pub struct FfVsLayout {
     pub declared_weights_count: u8,
 }
 
+// Small enough to pass and copy by value (CONVENTIONS, the 16-byte rule).
+const _: () = assert!(core::mem::size_of::<FfVsLayout>() <= 16);
+
 bitflags::bitflags! {
     /// Boolean predicates for `FfVsLayout`.
     ///
@@ -1280,6 +1286,51 @@ pub fn ff_vs_layout_from_elements(elements: &[D3DVERTEXELEMENT9], uses_decl: boo
     }
 }
 
+/// The elements a pre-transformed declaration passes to the pixel stage by semantic.
+///
+/// The `FfVsKey::passthrough` list (`dxso::decl_passthrough_code` gives
+/// its shape): each element whose semantic passes through, in declaration
+/// order, once per semantic, and empty for a declaration without an
+/// in-range POSITIONT element. An element `resolve_attrs` drops (a stream
+/// past the slot table, a type with no Metal format) is left out too, so the
+/// FF VS never declares an attribute the descriptor lacks. Past
+/// [`MAX_LINKED_INPUTS`] entries, which is what the varying budget leaves
+/// beside the fixed-function members, the rest read zero, warned once.
+#[must_use]
+pub fn rhw_passthrough(elements: &[D3DVERTEXELEMENT9]) -> [u8; MAX_LINKED_INPUTS] {
+    let mut passthrough = [0; MAX_LINKED_INPUTS];
+    let pretransformed = elements
+        .iter()
+        .any(|e| e.usage == D3DDECLUSAGE_POSITIONT && u32::from(e.stream) < MAX_STREAMS);
+    if !pretransformed {
+        return passthrough;
+    }
+    let mut len = 0;
+    for e in elements {
+        if u32::from(e.stream) >= MAX_STREAMS
+            || decl_type_to_metal_format(e.type_).0 == VertexFormat::Invalid
+        {
+            continue;
+        }
+        let Some(code) = decl_passthrough_code(e.usage, e.usage_index) else {
+            continue;
+        };
+        if passthrough[..len].contains(&code) {
+            continue;
+        }
+        if len == MAX_LINKED_INPUTS {
+            mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+                "FF vertex decl: pre-transformed layout passes more than {MAX_LINKED_INPUTS} \
+                 semantics to the pixel stage → the rest read zero"
+            );
+            break;
+        }
+        passthrough[len] = code;
+        len += 1;
+    }
+    passthrough
+}
+
 /// Whether a declaration contains an in-range pre-transformed position.
 ///
 /// Binding needs only this flag. Scan every element so TEXCOORD diagnostics
@@ -1308,16 +1359,32 @@ pub fn vertex_decl_has_rhw(elements: &[D3DVERTEXELEMENT9]) -> bool {
 /// Same as [`resolve_attrs_for_vs`] but uses the FF VS's attribute convention.
 ///
 /// See `crate::dxso::ff_attr_index_for_semantic`. The FF VS has no `dcl_*`
-/// declarations — its input layout is fixed.
+/// declarations, so its input layout is fixed, but for the elements a
+/// pre-transformed layout passes through: `passthrough` is the
+/// declaration's [`rhw_passthrough`] list, and its entry `k` reads attribute
+/// `FF_PASSTHROUGH_ATTR_BASE + k` instead of a fixed-function one.
 ///
 /// A `D3DCOLOR` `BLENDINDICES` element is fetched as four unnormalized bytes
 /// in memory order, the order `D3DCOLORtoUBYTE4` gives a programmable shader,
 /// so each lane reaches the FF VS as its byte value rather than a normalized
-/// and swizzled colour channel.
+/// and swizzled colour channel. One a pre-transformed layout passes through
+/// keeps the normalized colour fetch its declared type names, as a `vs_3_0`
+/// input does, since the pixel shader reads it as data, not as an index.
 #[must_use]
-pub fn resolve_attrs_for_ff(elements: &[D3DVERTEXELEMENT9]) -> ResolvedAttrs {
+pub fn resolve_attrs_for_ff(
+    elements: &[D3DVERTEXELEMENT9],
+    passthrough: &[u8; MAX_LINKED_INPUTS],
+) -> ResolvedAttrs {
     let blend_indices = ff_attr_index_for_semantic(D3DDECLUSAGE_BLENDINDICES, 0).map(u32::from);
     let mut resolved = resolve_attrs(elements, "FF", |e| {
+        if passthrough[0] != 0
+            && let Some(code) = decl_passthrough_code(e.usage, e.usage_index)
+            && let Some((attr, _)) = (FF_PASSTHROUGH_ATTR_BASE..)
+                .zip(passthrough)
+                .find(|(_, entry)| **entry == code)
+        {
+            return Some(attr);
+        }
         let reg = ff_attr_index_for_semantic(e.usage, e.usage_index);
         if reg.is_none() {
             mtld3d_shared::log_once_warn_by!(
@@ -1370,6 +1437,8 @@ pub struct PackedVertexDecl {
     /// Lets the draw path pick the streams to snapshot without walking the
     /// elements per draw. Streams past the slot table contribute no bit.
     pub stream_mask: u16,
+    /// [`rhw_passthrough`] of the elements, built once here rather than on every layout rebuild.
+    pub passthrough: [u8; MAX_LINKED_INPUTS],
 }
 
 /// Validate + pack the raw element slice a game passes to `CreateVertexDeclaration`.
@@ -1388,10 +1457,12 @@ pub fn pack_vertex_decl(elements: &[D3DVERTEXELEMENT9]) -> Option<PackedVertexDe
         .iter()
         .filter(|e| u32::from(e.stream) < MAX_STREAMS)
         .fold(0u16, |m, e| m | (1 << e.stream));
+    let passthrough = rhw_passthrough(&packed[..end_pos]);
     Some(PackedVertexDecl {
         elements_with_end: packed,
         hash,
         stream_mask,
+        passthrough,
     })
 }
 
@@ -1440,7 +1511,7 @@ const fn decl_usage_to_byte(u: crate::dxso::DeclUsage) -> u8 {
 /// Clamp the declaration's TEXCOORD extent and diagnose the largest invalid index.
 fn checked_tex_coord_count(max_texcoord_index: Option<u8>) -> u8 {
     // D3D9 spec caps TEXCOORD usage_index at 7 (D3DDP_MAXTEXCOORD = 8).
-    // FfVsKey's per-stage arrays (tci_modes, tci_coord_indices, tt_flags)
+    // FfVsKey's per-stage arrays (tci, tt_flags)
     // are sized [u8; 8]; a larger usage_index would index out of bounds on
     // the encoder thread. Clamp at the source and surface the offending raw
     // value once per distinct usage_index.

@@ -7,7 +7,8 @@
 //!
 //! - Vertex attributes at `[[attribute(N)]]` with N matching
 //!   `fvf_to_vertex_attrs` (0=position, 1=normal, 2=diffuse, 3=specular,
-//!   4..11=texcoord0..7).
+//!   4..11=texcoord0..7), and from 15 up the declaration elements a
+//!   pre-transformed draw passes through to the pixel stage by semantic.
 //! - Varyings struct: `position` first, then `texcoord0..7`, then
 //!   `color0..1` (texcoord-before-color workaround for a Metal
 //!   shader-compiler crash).
@@ -27,7 +28,9 @@
 
 use std::fmt::Write;
 
-use mtld3d_shared::mtl::{PS_LOD_BIAS_SLOT, VS_DRAW_SLOT, VS_FLOAT_CONST_SLOT, VS_POS_FIXUP_SLOT};
+use mtld3d_shared::mtl::{
+    PS_LOD_BIAS_SLOT, VERTEX_ATTRIBUTE_SLOTS, VS_DRAW_SLOT, VS_FLOAT_CONST_SLOT, VS_POS_FIXUP_SLOT,
+};
 use mtld3d_types::{
     D3DCMP_ALWAYS, D3DCMP_EQUAL, D3DCMP_GREATER, D3DCMP_GREATEREQUAL, D3DCMP_LESS,
     D3DCMP_LESSEQUAL, D3DCMP_NEVER, D3DCMP_NOTEQUAL, D3DDECLUSAGE_BLENDINDICES,
@@ -42,8 +45,14 @@ use mtld3d_types::{
     D3DTOP_MODULATEINVCOLOR_ADDALPHA, D3DTOP_SELECTARG1, D3DTOP_SELECTARG2, D3DTOP_SUBTRACT,
 };
 
-use super::emit::{
-    VariantFlags, VariantKey, fog_blend_active, write_fog_blend, write_point_sprite_prologue,
+use super::{
+    emit::{
+        VariantFlags, VariantKey, fog_blend_active, write_fog_blend, write_point_sprite_prologue,
+    },
+    link::{
+        MAX_LINKED_INPUTS, Semantic, passthrough_extras, write_extra_members,
+        write_passthrough_inputs, write_passthrough_outputs,
+    },
 };
 
 /// First FF VS constant row of the world-matrix palette.
@@ -65,6 +74,17 @@ pub const FF_VS_PALETTE_BASE_ROW: u16 = 95;
 /// palette from the cap never asks for a matrix the layout has no rows for.
 /// The emitted FF VS clamps a blend index to it.
 pub const MAX_VERTEX_BLEND_MATRIX_INDEX: u32 = 39;
+
+/// Vertex attribute of the first declaration element a pre-transformed draw passes through.
+///
+/// Entry `k` of `FfVsKey::passthrough` reads the attribute `k` slots above
+/// this one, past every fixed-function attribute `ff_attr_index_for_semantic`
+/// hands out.
+pub const FF_PASSTHROUGH_ATTR_BASE: u16 = 15;
+
+const _: () = assert!(
+    FF_PASSTHROUGH_ATTR_BASE as usize + MAX_LINKED_INPUTS <= VERTEX_ATTRIBUTE_SLOTS as usize
+);
 
 // The FF emitter stores D3D9 texture-op / texture-arg / compare-func codes in
 // `u8` cache-key fields and matches on them; the canonical `mtld3d_types`
@@ -224,17 +244,21 @@ pub struct FfVsKey {
     /// 0. XYZRHW vertices bypass the vertex-fog computation, so a `HAS_RHW`
     /// draw carries either 0 (fog off, or table fog) or 4.
     pub fog_mode: u8,
-    /// Per-stage TCI (texture coordinate index) mode.
+    /// Per-stage `D3DTSS_TEXCOORDINDEX`, narrowed to a byte by [`tci_entry`].
     ///
-    /// Decoded from the high byte of `D3DTSS_TEXCOORDINDEX[i]`. 0 = PASSTHRU,
-    /// 1 = CAMERASPACENORMAL, 2 = CAMERASPACEPOSITION,
-    /// 3 = CAMERASPACEREFLECTIONVECTOR, 4 = SPHEREMAP. Higher values are
-    /// undefined and fall back to passthru with a one-shot warn.
-    pub tci_modes: [u8; 8],
-    /// Per-stage input coord-set index for passthru mode.
+    /// The high nibble is the TCI mode (0 = PASSTHRU, 1 = CAMERASPACENORMAL,
+    /// 2 = CAMERASPACEPOSITION, 3 = CAMERASPACEREFLECTIONVECTOR,
+    /// 4 = SPHEREMAP; higher values are undefined and fall back to passthru
+    /// with a one-shot warn), the low nibble the input coordinate set
+    /// (0..7), the two halves the D3D9 value itself carries. Read them with
+    /// [`FfVsKey::tci_mode`] and [`FfVsKey::tci_set`].
+    pub tci: [u8; 8],
+    /// The declaration elements a pre-transformed draw passes to the pixel stage by semantic.
     ///
-    /// Decoded from the low byte of `D3DTSS_TEXCOORDINDEX[i]` (0..7).
-    pub tci_coord_indices: [u8; 8],
+    /// The list `link::decl_passthrough_code` describes: a semantic code per
+    /// entry, zero past the end, entry `k` read from attribute
+    /// [`FF_PASSTHROUGH_ATTR_BASE`] `+ k`. Empty on an untransformed layout.
+    pub passthrough: [u8; MAX_LINKED_INPUTS],
     /// Declared component count (1..=4) of each *input* TEXCOORD set.
     ///
     /// Indexed by coord-set (= `usage_index`); `0` if the set is absent.
@@ -274,8 +298,8 @@ impl core::hash::Hash for FfVsKey {
         core::hash::Hash::hash(&self.specular_source, state);
         core::hash::Hash::hash(&self.emissive_source, state);
         core::hash::Hash::hash(&self.fog_mode, state);
-        core::hash::Hash::hash(&self.tci_modes, state);
-        core::hash::Hash::hash(&self.tci_coord_indices, state);
+        core::hash::Hash::hash(&self.tci, state);
+        core::hash::Hash::hash(&self.passthrough, state);
         core::hash::Hash::hash(&self.tex_coord_dims, state);
         core::hash::Hash::hash(&self.tt_flags, state);
         core::hash::Hash::hash(&self.vertex_blend_count, state);
@@ -355,6 +379,30 @@ impl FfVsKey {
     pub const fn declared_indices(&self) -> bool {
         self.flags.contains(FfVsFlags::DECLARED_INDICES)
     }
+    /// The TCI mode of `stage`, the high nibble of its `tci` entry.
+    #[inline]
+    #[must_use]
+    pub const fn tci_mode(&self, stage: usize) -> u8 {
+        self.tci[stage] >> 4
+    }
+    /// The input coordinate set of `stage` (0..7), the low nibble of its `tci` entry.
+    #[inline]
+    #[must_use]
+    pub const fn tci_set(&self, stage: usize) -> u8 {
+        self.tci[stage] & 0x0F
+    }
+}
+
+/// One `FfVsKey::tci` entry from a TCI mode and an input coordinate set.
+///
+/// A mode above 15 keeps the nibble's highest value and a set above 7 reads
+/// set 7, the same undefined-mode passthru and the same coordinate set the
+/// emitter takes for the raw values.
+#[must_use]
+pub const fn tci_entry(mode: u8, set: u8) -> u8 {
+    let mode = if mode > 15 { 15 } else { mode };
+    let set = if set > 7 { 7 } else { set };
+    (mode << 4) | set
 }
 
 /// Texture-transform flag accessor helpers.
@@ -392,8 +440,7 @@ pub enum FfStageResult {
 ///
 /// Note: D3D9's `D3DTSS_TEXCOORDINDEX` controls *both* the VS (TCI mode +
 /// input coord-set selection) and the PS (which varying to sample from).
-/// Both concerns are handled on the VS side
-/// (`FfVsKey::tci_modes` + `FfVsKey::tci_coord_indices`, one entry per
+/// Both concerns are handled on the VS side (`FfVsKey::tci`, one entry per
 /// stage) so the VS emits the correct coord for each stage into
 /// `Varyings.texcoord[stage]`. The PS then samples stage `N` using
 /// `Varyings.texcoord[N]` — no per-stage indirection needed here.
@@ -559,7 +606,8 @@ impl FfPsKey {
 ///
 /// Returns the `[[attribute(N)]]` index that a vertex element with the given
 /// `(usage, usage_index)` lands on in the FF VS. `None` means the FF VS does
-/// not consume this semantic — callers should skip the element.
+/// not consume this semantic, and callers skip the element unless a
+/// pre-transformed layout passes it through (`FF_PASSTHROUGH_ATTR_BASE`).
 ///
 /// This is the single source of truth for the FF input layout: the vertex
 /// descriptor built by the pipeline and the `struct VertexIn` emitted here
@@ -599,7 +647,12 @@ pub fn emit_vs_ff_named(vs_key: &FfVsKey, entry: &str) -> String {
     out.push_str("#include <metal_stdlib>\n");
     out.push_str("using namespace metal;\n\n");
     emit_vertex_in(&mut out, vs_key);
-    emit_varyings(&mut out, false, vs_key.clip_plane_count);
+    emit_varyings(
+        &mut out,
+        false,
+        vs_key.clip_plane_count,
+        &passthrough_extras(vs_key.passthrough),
+    );
     out.push_str(super::emit::POS_FIXUP_MSL);
     out.push_str(crate::vs_draw::VS_DRAW_MSL);
     if reads_eye_normal(vs_key) && vs_key.vertex_blend_count == 0 {
@@ -618,9 +671,7 @@ pub fn emit_vs_ff_named(vs_key: &FfVsKey, entry: &str) -> String {
 /// neither lighting nor texgen.
 fn reads_eye_normal(vs: &FfVsKey) -> bool {
     let active = usize::from(vs.tex_coord_count).min(8);
-    let texgen_reads_normal = vs.tci_modes[..active]
-        .iter()
-        .any(|&m| matches!(m, 1 | 3 | 4));
+    let texgen_reads_normal = (0..active).any(|stage| matches!(vs.tci_mode(stage), 1 | 3 | 4));
     let lit_reads_normal = vs.lighting_enabled() && vs.light_active_mask != 0;
     vs.has_normal() && !vs.has_rhw() && (texgen_reads_normal || lit_reads_normal)
 }
@@ -653,6 +704,7 @@ pub fn emit_ps_ff_named(ps_key: &FfPsKey, variant: VariantKey, entry: &str) -> S
         &mut out,
         variant.flags.contains(VariantFlags::FLAT_SHADE),
         0,
+        &[],
     );
     if variant.flags.contains(VariantFlags::SRGB_WRITE) {
         super::emit::emit_srgb_write_helper(&mut out);
@@ -670,7 +722,10 @@ fn emit_vertex_in(out: &mut String, vs: &FfVsKey) {
     // Position: XYZ path is float3-padded (Metal zero-fills w), XYZRHW path
     // needs all four lanes (screen_x, screen_y, z, rhw).
     out.push_str("    float4 v0 [[attribute(0)]];\n");
-    if vs.has_normal() {
+    // A pre-transformed vertex is neither lit, texgen'd nor blended, so its
+    // normal and blend inputs have no reader; a `ps_3_0` reads them through
+    // the passthrough inputs below instead.
+    if vs.has_normal() && !vs.has_rhw() {
         out.push_str("    float4 v1 [[attribute(1)]];\n");
     }
     if vs.has_color0() {
@@ -685,12 +740,12 @@ fn emit_vertex_in(out: &mut String, vs: &FfVsKey) {
     // Vertex blending inputs. Only declared when the resolved blend mode
     // will use them — keeps the MTLVertexDescriptor and VertexIn in lock-
     // step with what the game actually wired up.
-    if vs.vertex_blend_count > 0 && vs.declared_weights_count > 0 {
+    if vs.vertex_blend_count > 0 && vs.declared_weights_count > 0 && !vs.has_rhw() {
         out.push_str("    float4 blend_weight [[attribute(12)]];\n");
     }
     // Read as floats whatever the declared type, which Metal converts every
     // vertex format into; `emit_vertex_blend` rounds each lane to an index.
-    if vs.vertex_blend_count > 0 && vs.declared_indices() {
+    if vs.vertex_blend_count > 0 && vs.declared_indices() && !vs.has_rhw() {
         out.push_str("    float4 blend_indices [[attribute(13)]];\n");
     }
     // Per-vertex point size (`D3DFVF_PSIZE`), a FLOAT1 the descriptor
@@ -698,6 +753,7 @@ fn emit_vertex_in(out: &mut String, vs: &FfVsKey) {
     if vs.has_psize() {
         out.push_str("    float4 psize [[attribute(14)]];\n");
     }
+    write_passthrough_inputs(out, vs.passthrough, FF_PASSTHROUGH_ATTR_BASE);
     out.push_str("};\n\n");
 }
 
@@ -736,7 +792,7 @@ fn masked_input_rhs(vs: &FfVsKey, stage: usize, src: u32) -> String {
     }
 }
 
-fn emit_varyings(out: &mut String, flat: bool, clip_planes: u8) {
+fn emit_varyings(out: &mut String, flat: bool, clip_planes: u8, extras: &[Semantic]) {
     out.push_str("struct Varyings {\n");
     // Must match `dxso::emit::emit_varyings` byte-for-byte — see the
     // invariance comment there. Analog of an `Invariant` decoration on
@@ -771,6 +827,10 @@ fn emit_varyings(out: &mut String, flat: bool, clip_planes: u8) {
     // oPts / dcl_psize must link to an FF PS, and vice versa, so the
     // layout has to stay identical.
     out.push_str("    float point_size [[point_size]];\n");
+    // The extra semantics a pre-transformed draw passes through, one member
+    // each, named as `dxso::emit::emit_varyings` names them; the FF PS reads
+    // none and declares none.
+    write_extra_members(out, extras);
     // VS-only: see `dxso::emit::emit_varyings`.
     if clip_planes > 0 {
         let _ = writeln!(
@@ -1067,13 +1127,13 @@ fn emit_vs(out: &mut String, vs: &FfVsKey, entry: &str) {
         // We still honour the coord-set selector so a stage reading a
         // non-default set picks the right attribute.
         for i in 0..vs.tex_coord_count as usize {
-            let mode = vs.tci_modes[i];
+            let mode = vs.tci_mode(i);
             if matches!(mode, 1..=4) {
                 mtld3d_shared::log_once_warn!(target: super::LOG_TARGET,
                     "dxso FF: TCI mode {mode} on XYZRHW stage {i} — eye-space undefined, falling back to passthru"
                 );
             }
-            let src = u32::from(vs.tci_coord_indices[i].min(7));
+            let src = u32::from(vs.tci_set(i));
             let n = input_dim(vs, src);
             let raw = masked_input_rhs(vs, i, src);
             if (1..4).contains(&n) {
@@ -1095,6 +1155,12 @@ fn emit_vs(out: &mut String, vs: &FfVsKey, entry: &str) {
         } else {
             out.push_str("    out.fog = float4(1.0);\n");
         }
+        // Every other element a `ps_3_0` reads by semantic, straight from the
+        // declaration. A `FOG0` element replaces the fog varying only when
+        // the specular alpha is not the vertex fog factor: under fog mode 4
+        // the FF PS reads the factor there, and the key cannot tell whether
+        // a `ps_3_0`, which owns its fog, is bound instead.
+        write_passthrough_outputs(out, vs.passthrough, vs.fog_mode != 4);
         // NDC depth for the table-fog Z source (see the Varyings decl). The
         // clip-space round trip (`z*w / w`) keeps the FP rounding shape the
         // rasterizer's own depth uses.
@@ -1148,9 +1214,10 @@ fn emit_vs(out: &mut String, vs: &FfVsKey, entry: &str) {
     // vertex normal, since without one that mode falls back to passthru.
     // Lighting reads it for the vertex-to-light vector of a POINT or SPOT
     // slot and for the local-viewer `V`.
-    let texgen_reads_pos_eye = vs.tci_modes[..active]
-        .iter()
-        .any(|&m| m == 2 || m == 4 || (m == 3 && vs.has_normal()));
+    let texgen_reads_pos_eye = (0..active).any(|stage| {
+        let m = vs.tci_mode(stage);
+        m == 2 || m == 4 || (m == 3 && vs.has_normal())
+    });
     let lit_reads_pos_eye = (vs.lighting_enabled()
         && (vs.light_active_mask & !vs.light_directional_mask) != 0)
         || (lit_specular && vs.local_viewer());
@@ -1442,8 +1509,8 @@ fn emit_vs(out: &mut String, vs: &FfVsKey, entry: &str) {
     // must happen at sample time, not here). Implements the D3D9 D3DTTFF
     // texture-coordinate transform per the spec.
     for i in 0..vs.tex_coord_count as usize {
-        let mode = vs.tci_modes[i];
-        let src = u32::from(vs.tci_coord_indices[i].min(7));
+        let mode = vs.tci_mode(i);
+        let src = u32::from(vs.tci_set(i));
         let tt = vs.tt_flags[i];
         let count = tt_count(tt); // 0 (passthru) or 2/3/4 (matrix transform)
         let projected = tt_projected(tt);

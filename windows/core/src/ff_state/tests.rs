@@ -251,12 +251,12 @@ fn spheremap_texgen_mode_reaches_the_vs_key() {
         tex_coord_dims: [0; 8],
         declared_weights_count: 0,
     };
-    let key = ff.build_vs_key(&rs(), layout, 0b0000_0001);
-    assert_eq!(key.tci_modes[0], 4);
-    assert_eq!(key.tci_coord_indices[0], 1);
+    let key = ff.build_vs_key(&rs(), layout, 0b0000_0001, [0; 8]);
+    assert_eq!(key.tci_mode(0), 4);
+    assert_eq!(key.tci_set(0), 1);
 }
 
-/// `build_vs_key` must populate `tci_coord_indices` for every stage the VB layout declares.
+/// `build_vs_key` must populate the `tci` coordinate sets for every stage the VB layout declares.
 ///
 /// This holds for every stage the layout declares an attribute for, even
 /// when the FF PS color-blend chain terminates earlier via
@@ -266,7 +266,7 @@ fn spheremap_texgen_mode_reaches_the_vs_key() {
 /// while the captured FF state leaves stage 1+'s `COLOROP` at its default
 /// `DISABLE` (the game doesn't enable FF blending when a programmable PS
 /// is bound). Stopping TCI decode at the first `COLOROP_DISABLE` would
-/// leave `tci_coord_indices[1..]` at their `[0; 8]` init, routing every
+/// leave the sets of stages 1.. at their `[0; 8]` init, routing every
 /// VS texcoord output onto `v4`; the PS would then sample every texture
 /// at `v4`'s coord set instead of the distinct sets each stage expects,
 /// collapsing the intended multi-texture result.
@@ -291,15 +291,15 @@ fn tci_indices_preserved_past_colorop_disable_terminator() {
         declared_weights_count: 0,
     };
     // bound_texture_mask = stages 0/1/2 all have textures bound.
-    let key = ff.build_vs_key(&rs(), layout, 0b0000_0111);
+    let key = ff.build_vs_key(&rs(), layout, 0b0000_0111, [0; 8]);
 
     // D3D9 spec default for `D3DTSS_TEXCOORDINDEX` is the stage index.
     // The fix preserves that for stages past the FF PS chain
     // terminator; the broken behaviour collapsed them all to 0.
     assert_eq!(
-        &key.tci_coord_indices[..3],
-        &[0u8, 1, 2],
-        "tci_coord_indices[1..3] must stay populated; collapsing them to 0 \
+        [key.tci_set(0), key.tci_set(1), key.tci_set(2)],
+        [0u8, 1, 2],
+        "the sets of stages 1..3 must stay populated; collapsing them to 0 \
          would route every FF VS texcoord output onto v4",
     );
     assert_eq!(
@@ -336,7 +336,8 @@ fn tex_coord_count_covers_routed_and_generated_stages_past_colorop_disable() {
             D3DTOP_DISABLE,
             "stage 1 keeps its default DISABLE"
         );
-        ff.build_vs_key(&rs(), layout, 0b0000_0011).tex_coord_count
+        ff.build_vs_key(&rs(), layout, 0b0000_0011, [0; 8])
+            .tex_coord_count
     };
     let plain = one_set(FfVsLayoutFlags::empty());
     assert_eq!(
@@ -403,7 +404,8 @@ fn normalize_normals_flag_follows_every_eye_normal_reader() {
         let mut states = rs();
         states[D3DRS_LIGHTING as usize] = lighting;
         states[D3DRS_NORMALIZENORMALS as usize] = 1;
-        ff.build_vs_key(&states, layout, 0b1).normalize_normals()
+        ff.build_vs_key(&states, layout, 0b1, [0; 8])
+            .normalize_normals()
     };
     assert!(flag(1, 0, normal), "lit");
     assert!(!flag(0, 0, normal), "unlit passthru reads no normal");
@@ -434,23 +436,23 @@ fn local_viewer_flag_canonicalizes_on_lighting_and_specular() {
     // RS defaults: LIGHTING=1, LOCALVIEWER=1, SPECULARENABLE=0 — the
     // bit stays clear while no specular term reads V.
     let mut states = rs();
-    let key = ff.build_vs_key(&states, layout, 0);
+    let key = ff.build_vs_key(&states, layout, 0, [0; 8]);
     assert!(!key.local_viewer(), "no specular → no LOCAL_VIEWER bit");
 
     // Specular on + default LOCALVIEWER=1 → set.
     states[D3DRS_SPECULARENABLE as usize] = 1;
-    let key = ff.build_vs_key(&states, layout, 0);
+    let key = ff.build_vs_key(&states, layout, 0, [0; 8]);
     assert!(key.local_viewer(), "specular + RS default → set");
 
     // Explicit LOCALVIEWER=0 → infinite viewer.
     states[D3DRS_LOCALVIEWER as usize] = 0;
-    let key = ff.build_vs_key(&states, layout, 0);
+    let key = ff.build_vs_key(&states, layout, 0, [0; 8]);
     assert!(!key.local_viewer(), "RS off → infinite viewer");
 
     // Lighting off clears it even with specular + localviewer on.
     states[D3DRS_LOCALVIEWER as usize] = 1;
     states[D3DRS_LIGHTING as usize] = 0;
-    let key = ff.build_vs_key(&states, layout, 0);
+    let key = ff.build_vs_key(&states, layout, 0, [0; 8]);
     assert!(!key.local_viewer(), "unlit → no LOCAL_VIEWER bit");
 }
 
@@ -907,13 +909,13 @@ fn make_vs_key(flags: super::FfVsFlags, fog_mode: u8) -> super::FfVsKey {
         specular_source: 0,
         emissive_source: 0,
         fog_mode,
-        tci_modes: [0; 8],
-        tci_coord_indices: [0; 8],
+        tci: [0; 8],
         tex_coord_dims: [0; 8],
         tt_flags: [0; 8],
         vertex_blend_count: 0,
         declared_weights_count: 0,
         clip_plane_count: 0,
+        passthrough: [0; 8],
     }
 }
 
@@ -1254,7 +1256,7 @@ fn lit_vs_key(state: &FfState) -> super::FfVsKey {
         tex_coord_dims: [0; 8],
         declared_weights_count: 0,
     };
-    state.build_vs_key(&rs, layout, 0)
+    state.build_vs_key(&rs, layout, 0, [0; 8])
 }
 
 #[test]
@@ -1870,9 +1872,9 @@ fn range_fog_keys_only_computed_vertex_fog() {
             states[D3DRS_FOGTABLEMODE as usize] = table;
             let mut layout = FfVsLayout::default();
             layout.flags.set(FfVsLayoutFlags::HAS_RHW, rhw);
-            let ordinary = ff.build_vs_key(&states, layout, 0);
+            let ordinary = ff.build_vs_key(&states, layout, 0, [0; 8]);
             states[D3DRS_RANGEFOGENABLE as usize] = 1;
-            let mut range = ff.build_vs_key(&states, layout, 0);
+            let mut range = ff.build_vs_key(&states, layout, 0, [0; 8]);
             let active = mode != 0 && enabled != 0 && table == 0 && !rhw;
             assert_eq!(range.flags.contains(FfVsFlags::RANGE_FOG), active);
             range.flags.remove(FfVsFlags::RANGE_FOG);
@@ -2282,7 +2284,7 @@ fn vs_sources(state: &FfState) -> Vec<(super::FfVsKey, u16)> {
     [(unlit, plain), (lit, plain), (blend, blended)]
         .iter()
         .map(|(states, layout)| {
-            let key = state.build_vs_key(states, *layout, 0b1);
+            let key = state.build_vs_key(states, *layout, 0b1, [0; 8]);
             let rows = state.ff_vs_row_count(&key);
             (key, rows)
         })
