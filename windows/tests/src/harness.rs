@@ -82,15 +82,18 @@ const CONFIG_VAR: &str = "MTLD3D_CONFIG";
 /// The hold under a mutex plus a condvar rather than a held `MutexGuard`,
 /// because the holder is a harness field and a guard there would put a
 /// significant drop into every test's `Harness`.
-static MODESET: Mutex<ModeSet> = Mutex::new(ModeSet::Free { released: None });
+static MODESET: Mutex<ModeSet> = Mutex::new(ModeSet {
+    lock: None,
+    released: None,
+});
 static MODESET_RELEASED: Condvar = Condvar::new();
 
-/// Who has the display mode in this process.
-enum ModeSet {
-    /// No harness holds it; `released` is when this process last gave it back.
-    Free { released: Option<Instant> },
-    /// A harness holds it, through the locked machine-wide file.
-    Held(File),
+/// Whether a harness of this process holds the display mode, and when it was last given back.
+struct ModeSet {
+    /// The locked machine-wide file while a harness holds the mode.
+    lock: Option<File>,
+    /// When this process last gave the mode back.
+    released: Option<Instant>,
 }
 
 /// How long a process waits after giving the display mode back before it asks again.
@@ -117,18 +120,15 @@ const MODESET_LOCK_FILE: &str = "e2e-display-mode.lock";
 /// hook every harness installs first, and the exit gives the lock back.
 fn take_display_mode() {
     let mut mode = MODESET.lock().unwrap_or_else(PoisonError::into_inner);
-    while matches!(*mode, ModeSet::Held(_)) {
+    while mode.lock.is_some() {
         mode = MODESET_RELEASED
             .wait(mode)
             .unwrap_or_else(PoisonError::into_inner);
     }
-    if let ModeSet::Free {
-        released: Some(released),
-    } = *mode
-    {
+    if let Some(released) = mode.released {
         std::thread::sleep(MODESET_HANDOFF_PAUSE.saturating_sub(released.elapsed()));
     }
-    *mode = ModeSet::Held(lock_machine_display_mode());
+    mode.lock = Some(lock_machine_display_mode());
 }
 
 /// Give the session's display mode back and wake one harness waiting for it.
@@ -136,9 +136,8 @@ fn take_display_mode() {
 /// Dropping the lock file closes it, which releases the machine-wide lock.
 fn release_display_mode() {
     let mut mode = MODESET.lock().unwrap_or_else(PoisonError::into_inner);
-    *mode = ModeSet::Free {
-        released: Some(Instant::now()),
-    };
+    mode.lock = None;
+    mode.released = Some(Instant::now());
     drop(mode);
     MODESET_RELEASED.notify_one();
 }
