@@ -265,8 +265,9 @@ impl RecordingStateBlock {
                     *m = *dev.ff_state().material();
                 }
                 StateOp::Light { index, light } => {
-                    // A recorded Light op implies the slot was defined, so this
-                    // resolves; leave the recorded value untouched otherwise.
+                    // A slot the device has not defined keeps the recorded
+                    // value: a recorded SetLight, or the default light a
+                    // recorded enable of an unset light put in the block.
                     if let Some(l) = dev.ff_state().get_light_at(*index) {
                         *light = l;
                     }

@@ -955,9 +955,16 @@ fn recorded_light_enable_of_an_unset_light_applies_the_default_light() {
     assert_eq!(block.apply(), D3D_OK, "Apply");
     assert_default_light(&h.light(0), "light 0 after Apply");
     assert!(h.light_enabled(0), "light 0 enabled by Apply");
+    let light = h.light(1);
     assert_eq!(
-        h.light(1).diffuse.g.to_bits(),
-        1.0f32.to_bits(),
+        [
+            light.diffuse.r,
+            light.diffuse.g,
+            light.diffuse.b,
+            light.diffuse.a
+        ]
+        .map(f32::to_bits),
+        [0.0f32, 1.0, 0.0, 1.0].map(f32::to_bits),
         "a recorded disable keeps light 1's parameters"
     );
     assert!(!h.light_enabled(1), "light 1 disabled by Apply");
