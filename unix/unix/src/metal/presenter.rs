@@ -454,7 +454,15 @@ pub fn stop_and_join(state: &PresentState) {
 }
 
 /// Set or clear the hurry level for `queue`.
+///
+/// Each change is logged at debug level on the present target, so a test can
+/// read which policy a barrier left behind.
 pub fn set_wait_policy(state: &PresentState, policy: PresentWaitPolicy) {
+    log::debug!(
+        target: super::command::PRESENT_LOG_TARGET,
+        "presenter {:p}: wait policy {policy:?}",
+        core::ptr::from_ref(state)
+    );
     {
         let mut inner = state.lock();
         match policy {

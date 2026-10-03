@@ -660,8 +660,8 @@ fn a_span_begun_past_the_slot_budget_with_no_draw_counts_nothing() {
 /// The name the workload child of `a_flush_wait_on_a_sent_end_submits_nothing_more` runs under.
 const FLUSH_WAIT_CHILD_NAME: &str = "occlusion-flush-wait.exe";
 
-/// The log filter of that child: the frame command buffers each submission retires.
-const FLUSH_WAIT_LOG_FILTER: &str = "warn,mtld3d::unix::command=debug";
+/// The log filter of that child: retired frame command buffers and the present wait policy.
+const FLUSH_WAIT_LOG_FILTER: &str = "warn,mtld3d::unix::command=debug,mtld3d::unix::present=debug";
 
 /// The frames each device of that child submits.
 ///
@@ -696,8 +696,8 @@ fn a_flush_wait_on_a_sent_end_submits_nothing_more() {
 /// devices make that read, so it adds one submission to each. Both reads
 /// answer with the count without a Present.
 fn flush_wait_workload() {
-    let reader = Harness::with_config("query.flushImmediate=false");
-    let control = Harness::with_config("query.flushImmediate=false");
+    let reader = Harness::with_config("query.flushImmediate=false;query.eventImmediate=false");
+    let control = Harness::with_config("query.flushImmediate=false;query.eventImmediate=false");
     for (h, reads_sent) in [(&reader, true), (&control, false)] {
         let dims = h.dims();
         let Some(sent) = h.create_query(D3DQUERYTYPE_OCCLUSION) else {
@@ -706,6 +706,9 @@ fn flush_wait_workload() {
         let Some(unsent) = h.create_query(D3DQUERYTYPE_OCCLUSION) else {
             panic!("OCCLUSION query should be supported");
         };
+        let fence = h
+            .create_query(D3DQUERYTYPE_EVENT)
+            .expect("EVENT query is supported");
         arm_for_counting_draws(h);
 
         assert!(h.pump(), "WM_QUIT");
@@ -715,7 +718,14 @@ fn flush_wait_workload() {
         draw_full_frame(h, "the draw of the span the Present sends");
         assert_eq!(sent.issue(D3DISSUE_END), 0, "Issue(END)");
         assert_eq!(h.end_scene(), 0);
+        assert_eq!(fence.issue(D3DISSUE_END), 0, "Issue(END) of the fence");
         assert_eq!(h.present(), 0);
+        // Wait for the presented frame to retire without submitting anything:
+        // the fence rode that frame, so a poll without FLUSH only reads
+        // retirement. With nothing in flight afterwards, no barrier drain
+        // puts the present wait policy back for the read below.
+        wait_for_event(&fence, 0);
+        std::thread::sleep(std::time::Duration::from_millis(50));
 
         assert_eq!(h.begin_scene(), 0);
         assert_eq!(h.clear_target(0xFF00_0000), 0);
@@ -726,6 +736,22 @@ fn flush_wait_workload() {
                 1,
                 dims,
                 "a quad covering the frame",
+            );
+            // The read hurried presentation for its wait and nothing was in
+            // flight to drain; the hurry has to end with the read, or every
+            // later present copies its frame instead of waiting for the last.
+            let policies = logged_lines(": wait policy ");
+            assert!(
+                policies
+                    .iter()
+                    .any(|line| line.ends_with("SnapshotPending")),
+                "the read of a sent END hurries presentation: {policies:?}"
+            );
+            assert!(
+                policies
+                    .last()
+                    .is_some_and(|line| line.ends_with("WaitForCommit")),
+                "the read of a sent END leaves the present wait policy hurried: {policies:?}"
             );
         }
         assert_eq!(unsent.issue(D3DISSUE_BEGIN), 0, "Issue(BEGIN)");

@@ -1825,10 +1825,11 @@ impl DeviceInner {
     /// payload the submit thread holds while it waits for the previous
     /// present to commit, which is a wait on the display. Setting the policy
     /// here, before the flush is sent, wakes that submit into a copy so the
-    /// encoder, and then the flush, go on at once; the encoder's flush arm
-    /// puts the policy back once its own submission has committed. The one
-    /// thunk this side issues off the device lifecycle, and only on a path
-    /// that is already a synchronous read-back.
+    /// encoder, and then the flush, go on at once. The encoder puts the policy
+    /// back when the request that follows ends: the flush arm once its own
+    /// submission has committed, the visibility intake once its drain is done.
+    /// The one thunk this side issues off the device lifecycle, and only on a
+    /// path that is already a synchronous read-back.
     pub fn hurry_presentation(&self) -> Result<(), i32> {
         if self.record_handle.is_null() {
             return Ok(());

@@ -8865,7 +8865,12 @@ fn encoder_thread_main(
                     let _ = done.send(());
                 }
                 Ok(EncoderMessage::IntakeVisibilityFor { target_seq, done }) => {
+                    // The API thread hurried presentation ahead of this request.
+                    // The drain below puts the policy back only when a submit was
+                    // in flight, so the request ends the hurry itself, on every
+                    // exit, or every later present would copy instead of waiting.
                     if enc.failed_replay.is_some() {
+                        enc.set_present_wait_policy(PresentWaitPolicy::WaitForCommit);
                         drop(done);
                         return false;
                     }
@@ -8875,6 +8880,7 @@ fn encoder_thread_main(
                     // unix-side PENDING_CMDBUFS registry) before WaitForGpuRetire,
                     // so drain any in-flight async submits first.
                     enc.drain_submit_thread();
+                    enc.set_present_wait_policy(PresentWaitPolicy::WaitForCommit);
                     mtld3d_shared::crumb!("vis:drainend", target_seq);
                     if target_seq != 0 && enc.coherent_seq_ptr != 0 {
                         // SAFETY: `coherent_seq_ptr` is a PE-heap
