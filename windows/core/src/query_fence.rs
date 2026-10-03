@@ -24,6 +24,19 @@ pub const fn event_completed(end_seq: u64, coherent_seq: u64) -> bool {
 /// without it hanging rather than rendering.
 #[must_use]
 pub const fn event_needs_submit(end_seq: u64, current_seq: u64) -> bool {
+    end_in_recording_frame(end_seq, current_seq)
+}
+
+/// Whether a query's `Issue(D3DISSUE_END)` stamped with `end_seq` is still in the recording frame.
+///
+/// `current_seq` is the seq the frame being recorded will be submitted under,
+/// so an END stamped with it has not been handed to the encoder, and a wait
+/// for its result has to submit that frame first. An END stamped with an
+/// earlier seq rode a frame already handed over, and the encoder takes every
+/// later request after that frame, so waiting needs no submission of its own.
+/// Zero is a query never ended, which is in no frame.
+#[must_use]
+pub const fn end_in_recording_frame(end_seq: u64, current_seq: u64) -> bool {
     end_seq != 0 && end_seq >= current_seq
 }
 

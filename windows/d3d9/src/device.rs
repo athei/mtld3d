@@ -1825,11 +1825,12 @@ impl DeviceInner {
     /// payload the submit thread holds while it waits for the previous
     /// present to commit, which is a wait on the display. Setting the policy
     /// here, before the flush is sent, wakes that submit into a copy so the
-    /// encoder, and then the flush, go on at once; the encoder's flush arm
-    /// puts the policy back once its own submission has committed. The one
-    /// thunk this side issues off the device lifecycle, and only on a path
-    /// that is already a synchronous read-back.
-    fn hurry_presentation(&self) -> Result<(), i32> {
+    /// encoder, and then the flush, go on at once. The encoder puts the policy
+    /// back when the request that follows ends: the flush arm once its own
+    /// submission has committed, the visibility intake once its drain is done.
+    /// The one thunk this side issues off the device lifecycle, and only on a
+    /// path that is already a synchronous read-back.
+    pub fn hurry_presentation(&self) -> Result<(), i32> {
         if self.record_handle.is_null() {
             return Ok(());
         }
@@ -2429,9 +2430,10 @@ impl DeviceInner {
     ///
     /// The encoder waits (via `WaitForGpuRetire` thunk → Metal
     /// `waitUntilCompleted`) only when `coherent_seq < target_seq`;
-    /// otherwise it just runs intake locally. `target_seq == 0` (END operation
-    /// not yet processed: game called `Issue(END)` but not Present) skips the
-    /// round-trip entirely so the FLUSH poll loop can return `S_FALSE` fast.
+    /// otherwise it just runs intake locally. The encoder takes the request
+    /// after every frame handed to it before, so the frame `target_seq` names
+    /// has been encoded and committed by the time it waits. `target_seq == 0`,
+    /// a query never ended, skips the round-trip.
     pub fn encoder_intake_visibility_for(&self, target_seq: u64) -> Result<(), i32> {
         self.encoder.status()?;
         if target_seq == 0 {

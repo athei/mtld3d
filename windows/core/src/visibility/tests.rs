@@ -700,3 +700,58 @@ fn queued_brackets_execute_their_recorded_generation() {
     assert_eq!(core.get_u64(), 7);
     assert_eq!(core.seq_end_loaded(), 2);
 }
+
+#[test]
+fn an_end_opens_an_empty_span_only_on_a_query_never_begun() {
+    use super::EndIssue;
+    let core = VisibilityQueryCore::new();
+    assert!(!core.span_open(), "a query never begun has no span");
+    assert_eq!(core.end_issue(), EndIssue::OpenAndClose);
+    core.mark_armed();
+    assert!(core.span_open());
+    assert_eq!(core.end_issue(), EndIssue::Close, "a begun span closes");
+    core.mark_end_requested();
+    assert!(!core.span_open());
+    assert_eq!(
+        core.end_issue(),
+        EndIssue::Keep,
+        "a closed span keeps the result its first END made"
+    );
+    core.mark_armed();
+    assert_eq!(core.end_issue(), EndIssue::Close, "a restarted span closes");
+}
+
+#[test]
+fn state_a_span_begun_without_a_slot_splits_into_an_empty_segment() {
+    use super::{QueryStatus, VisibilityQueryState};
+    let mut state = VisibilityQueryState::new();
+    let mut buffer = dummy_buf(1);
+    write_slot(&mut buffer, 0, 900);
+    // Another span counted into slot 0, then the budget ran out.
+    while state.bump_slot().is_some() {}
+    state.mark_exhausted();
+    let starved = VisibilityQueryCore::new();
+    starved.begin(
+        1,
+        state.next_slot(),
+        (640, 480),
+        (640, 480),
+        state.draws_seen(),
+    );
+    starved.mark_uncounted();
+    state.push_active(&starved);
+    state.pool.retire(buffer);
+    state.split_open_spans(1);
+    state.reset_frame();
+    state.resume_open_spans(2);
+    starved.end(2, state.draws_seen());
+    state.remove_active(&starved);
+    state.push_pending(2, starved.clone(), (starved.offset_begin(), 0), true);
+    state.intake_completed(2);
+    assert_eq!(starved.status(), QueryStatus::Issued);
+    assert_eq!(
+        starved.get_u32(),
+        0,
+        "a span with no draw in it counts none of the slots reserved before it began"
+    );
+}

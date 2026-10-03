@@ -18,7 +18,7 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
 };
 
-use mtld3d_core::visibility::{QueryStatus, VisibilityQueryCore};
+use mtld3d_core::visibility::{EndIssue, QueryStatus, VisibilityQueryCore};
 use mtld3d_shared::InPtr;
 use mtld3d_types::{
     D3DGETDATA_FLUSH, D3DISSUE_BEGIN, D3DISSUE_END, D3DQUERYTYPE_EVENT, D3DQUERYTYPE_OCCLUSION,
@@ -98,11 +98,13 @@ struct QueryInner {
     /// `intake_visibility` finalizes it post-GPU. `None` for
     /// EVENT.
     core: Option<Arc<VisibilityQueryCore>>,
-    /// For EVENT queries: the frame seq `Issue(D3DISSUE_END)` recorded.
+    /// The seq of the frame the last `Issue(D3DISSUE_END)` was recorded into.
     ///
-    /// The query reports completion once the GPU has retired that seq. Zero
-    /// until the first `Issue(END)`; zero reads as complete, because a query
-    /// with nothing outstanding is finished by definition.
+    /// An EVENT query reports completion once the GPU has retired that seq.
+    /// Zero until the first `Issue(END)`; zero reads as complete, because a
+    /// query with nothing outstanding is finished by definition. An OCCLUSION
+    /// query's `D3DGETDATA_FLUSH` wait reads it to tell whether its END is
+    /// still in the recording frame.
     end_seq: AtomicU64,
 }
 
@@ -212,11 +214,37 @@ unsafe fn finalize_query(this: *mut Direct3DQuery9) {
     // `Box::into_raw(QueryInner)` from `Self::new` and no other reference
     // can survive a zero refcount.
     let inner = unsafe { (*this).inner };
+    // SAFETY: as above; the inner is live until it is dropped below.
+    close_released_span(unsafe { &*inner });
     // SAFETY: as above — sole owner of the inner allocation.
     drop(unsafe { Box::from_raw(inner) });
     // SAFETY: refcount reached zero; `this` is the original
     // `Box::into_raw(Direct3DQuery9)` allocation.
     drop(unsafe { Box::from_raw(this) });
+}
+
+/// End the span of an occlusion query released while it was open.
+///
+/// The application can no longer read the count, and an open span keeps the
+/// encoder arming a counting slot on every pass and keeping every draw it
+/// could otherwise leave out, for as long as the device lives. The END is
+/// recorded like the application's own, so the span closes in frame order.
+fn close_released_span(inner: &QueryInner) {
+    let Some(core) = inner.core.as_ref() else {
+        return;
+    };
+    if !core.span_open() {
+        return;
+    }
+    let generation = core.mark_end_requested();
+    // SAFETY: a query's final `Release` finalizes it before giving back its
+    // device reference, so `device_inner` is live, and the release holds the
+    // device's API lock.
+    let dev = unsafe { &mut *inner.device_inner };
+    dev.push_control(crate::device::EndVisibilityOp {
+        core: Arc::clone(core),
+        generation,
+    });
 }
 
 // SAFETY: `refcount_mut` exposes this wrapper's own counter; `finalize` frees
@@ -303,25 +331,33 @@ extern "system" fn query_issue(this: *mut c_void, flags: u32) -> i32 {
     // `DeviceInner` and is kept alive by the device — query outlives the
     // app's device only if the app violates D3D9 lifetime rules.
     let dev = unsafe { &mut *device_inner };
+    let mut begin = flags & D3DISSUE_BEGIN != 0;
+    let end = flags & D3DISSUE_END != 0;
+    if end && !begin {
+        match core.end_issue() {
+            EndIssue::Close => {}
+            EndIssue::OpenAndClose => begin = true,
+            EndIssue::Keep => {
+                if dev.frame_dump_active() {
+                    dev.frame_dump_event(&format!(
+                        "Query({this:?}) Issue END on a closed span, keeping its result"
+                    ));
+                }
+                return D3D_OK;
+            }
+        }
+    }
     if dev.frame_dump_active() {
         dev.frame_dump_event(&format!(
             "Query({this:?}) Issue{}{}",
-            if flags & D3DISSUE_BEGIN != 0 {
-                " BEGIN"
-            } else {
-                ""
-            },
-            if flags & D3DISSUE_END != 0 {
-                " END"
-            } else {
-                ""
-            }
+            if begin { " BEGIN" } else { "" },
+            if end { " END" } else { "" }
         ));
     }
-    // Clone once for BEGIN (defensive — both bits can be set in one
-    // call), move the original into END so we don't waste a refcount
-    // bump in the common END-only path.
-    if flags & D3DISSUE_BEGIN != 0 {
+    // Clone once for BEGIN (both bits can be set in one call, and an END on
+    // a query never begun opens its span here too), move the original into
+    // END so the common END-only path costs no refcount bump.
+    if begin {
         // Reflect "query armed" synchronously so a no-Present
         // `GetData(D3DGETDATA_FLUSH)` sees `Pending` (and, under the
         // blocking config, flushes the recording frame to run this
@@ -332,11 +368,12 @@ extern "system" fn query_issue(this: *mut c_void, flags: u32) -> i32 {
         let c = core.clone();
         dev.push_control(crate::device::BeginVisibilityOp { c, generation });
     }
-    if flags & D3DISSUE_END != 0 {
+    if end {
         // Mark "end issued" synchronously so a no-Present `GetData(FLUSH)`
         // knows the span is closed and there is a result to wait for (an
         // *open* query has none however far the GPU has got).
         let generation = core.mark_end_requested();
+        inner.end_seq.store(dev.current_seq(), Ordering::Release);
         dev.push_control(crate::device::EndVisibilityOp { core, generation });
     }
     dev.encoder_status().map_or_else(|hr| hr, |()| D3D_OK)
@@ -488,19 +525,20 @@ extern "system" fn query_get_data(
                             }
                             return D3D_OK;
                         }
-                        // Spec-correct fallback (config off). The
-                        // Present-driven encoder may not have run this
-                        // query's BEGIN/END operations yet (a D3D9 app can
-                        // poll a query with no intervening Present), so
-                        // first flush the current recording frame: that
-                        // drains the operations (assigning the visibility
-                        // slots + `seq_end`) and submits the counting
-                        // pass to the GPU. Then block on the GPU retiring
-                        // `seq_end` so intake folds the per-fragment
-                        // counts in and the status read below sees
-                        // `Issued`. Bracket with `CycleAddTimer` so the
-                        // kernel sleep shows up as the `Wait for GPU`
-                        // sub-row under `Query` in the perf summary.
+                        // Spec-correct fallback (config off). When the
+                        // END is still in the recording frame (a D3D9 app
+                        // can poll a query with no intervening Present),
+                        // that frame is submitted first, so its BEGIN/END
+                        // operations reach the encoder and the counting
+                        // passes the GPU. An END in a frame already handed
+                        // over needs no submission: the encoder takes the
+                        // intake request after that frame. Then block on
+                        // the GPU retiring the END's frame so intake folds
+                        // the per-fragment counts in and the status read
+                        // below sees `Issued`. Bracket with
+                        // `CycleAddTimer` so the kernel sleep shows up as
+                        // the `Wait for GPU` sub-row under `Query` in the
+                        // perf summary.
                         //
                         // Only do this once END has been issued. A query
                         // still open (begun, not ended) has its counting
@@ -515,16 +553,27 @@ extern "system" fn query_get_data(
                             // `Self::new` from a live `DeviceInner` and is kept
                             // alive by the device for the wrapper's lifetime.
                             let dev = unsafe { &mut *inner.device_inner };
+                            let end_seq = inner.end_seq.load(Ordering::Acquire);
                             {
                                 let _wait = mtld3d_core::perf::CycleAddTimer::start(
                                     dev.perf_mut().query_wait_cycles_ptr(),
                                 );
-                                if let Err(hr) = dev.flush_current_frame_blocking() {
+                                // Either way the wait queues behind submits
+                                // that may be waiting on the display, so they
+                                // are hurried first; the blocking flush does
+                                // that itself.
+                                let ready = if mtld3d_core::query_fence::end_in_recording_frame(
+                                    end_seq,
+                                    dev.current_seq(),
+                                ) {
+                                    dev.flush_current_frame_blocking()
+                                } else {
+                                    dev.hurry_presentation()
+                                };
+                                if let Err(hr) = ready {
                                     return hr;
                                 }
-                                if let Err(hr) =
-                                    dev.encoder_intake_visibility_for(core.seq_end_loaded())
-                                {
+                                if let Err(hr) = dev.encoder_intake_visibility_for(end_seq) {
                                     return hr;
                                 }
                             }

@@ -254,6 +254,38 @@ fn a_draw_counted_by_an_occlusion_query_is_built_before_its_frame_is_submitted()
     );
 }
 
+/// A query released with its span open stops counting, so a later first-seen draw is left out.
+///
+/// The application can never read the count of a query it released, so the
+/// span ends with the query: nothing counts the draws after it, and a draw
+/// into the back buffer whose build is in flight is left out as it would be
+/// had the query never begun.
+#[test]
+fn a_query_released_while_counting_no_longer_keeps_a_draw_in_its_frame() {
+    let h =
+        device_with("shader.asyncCompile=true;shaderCache.enable=false;query.flushImmediate=false");
+    let Some(q) = h.create_query(D3DQUERYTYPE_OCCLUSION) else {
+        panic!("OCCLUSION query should be supported");
+    };
+    h.render_once(BLUE, |_| {
+        assert_eq!(q.issue(D3DISSUE_BEGIN), D3D_OK, "Issue(BEGIN)");
+    });
+    drop(q);
+    let tri = covering_triangle(RED);
+    h.render_once(BLUE, |dev| {
+        assert_eq!(
+            dev.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &tri),
+            D3D_OK,
+            "DrawPrimitiveUP"
+        );
+    });
+    assert_pixel_eq(
+        h.read_pixel(320, 240),
+        BLUE,
+        "the first frame leaves the draw out: no query counts it",
+    );
+}
+
 /// A scratch target copied into part of a kept one every frame is kept too, and so is its draw.
 ///
 /// The copy covers a corner of the kept target only: a copy over a whole
