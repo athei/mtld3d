@@ -880,6 +880,7 @@ in its row, and every family carries the suffixes its row names.
 | `tex_dirtyrect_calls_total`, `tex_dirtyrect_partial_total` | `dirtyrect` calls and the partial ones. |
 | `cache_<x>_count` | `Caches` at the summary: `textures`, `pipelines`, `samplers`, `programs`, `libs`, `depth_states`. |
 | `passes_total`, `commands_total`, `draws_total`, `pipeline_memo_hits_total`, `pipeline_memo_calls_total`, `fan_generated_total`, `up_indexed_total`, `up_oversized_total` | `Commands / passes`. |
+| `draw_unpinned_total` | No summary row: draws whose draw path ran off its pinned stack page offset (`unix/unix/src/stack_page.rs`), 0 unless the pin broke. |
 | `keys_<x>_calls_total`, `keys_<x>_skips_total` | `Keys gating`: `set_texture`, `set_render_state`, `set_tex_stage_state`, `set_fvf`, `set_vertex_decl`, `set_vertex_shader`, `set_pixel_shader`, `set_vs_const`, `set_ps_const`. |
 | `inverse_bypass_total`, `inverse_hit_total`, `inverse_recompute_total` | The `inverse-view` rows, summed over the window's reset epochs. |
 | `scratch_small_peak_count`, `scratch_oversized_peak_count`, `scratch_bytes` | `scratch`: peak blocks and peak bytes. |

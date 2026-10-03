@@ -2097,15 +2097,17 @@ fn perf_rule(key: &str, work: &FrameWork) -> Option<PerfRule> {
 ///
 /// Draws, passes, commands, the calls of every API, device, bind, surface
 /// and keys-gating row and the keys gate's skips, texture uploads and
-/// dirty rects, user-pointer draws, generated fans and staging uploads: a
-/// frame that repeats the calls of the one before repeats these. Anything
-/// else counts events that depend on how the CPU and the GPU overlap.
+/// dirty rects, user-pointer draws, generated fans, draws off the stack
+/// pin and staging uploads: a frame that repeats the calls of the one
+/// before repeats these. Anything else counts events that depend on how
+/// the CPU and the GPU overlap.
 fn structural(base: &str) -> bool {
-    const WHOLE: [&str; 5] = [
+    const WHOLE: [&str; 6] = [
         "draws",
         "passes",
         "commands",
         "fan_generated",
+        "draw_unpinned",
         "vbib_staging_uploads",
     ];
     const PREFIX: [&str; 4] = ["tex_uploads", "tex_dirtyrect", "up_", "keys_"];

@@ -776,8 +776,8 @@ fn kv_golden_line() {
         " cache_textures_count=48 cache_pipelines_count=12 cache_samplers_count=6",
         " cache_programs_count=8 cache_libs_count=8 cache_depth_states_count=4",
         " passes_total=4 commands_total=140 draws_total=100 pipeline_memo_hits_total=97",
-        " pipeline_memo_calls_total=100 fan_generated_total=0 up_indexed_total=3",
-        " up_oversized_total=2 keys_set_texture_calls_total=0",
+        " pipeline_memo_calls_total=100 fan_generated_total=0 draw_unpinned_total=0",
+        " up_indexed_total=3 up_oversized_total=2 keys_set_texture_calls_total=0",
         " keys_set_texture_skips_total=0 keys_set_render_state_calls_total=0",
         " keys_set_render_state_skips_total=0 keys_set_tex_stage_state_calls_total=0",
         " keys_set_tex_stage_state_skips_total=0 keys_set_fvf_calls_total=0",
@@ -1163,6 +1163,7 @@ fn sample_window() -> PerfWindow {
             // 97 of 100 pipeline resolves served from the memo → 97.0%.
             pipeline_memo_hits: 97,
             fan_generated: 0,
+            draw_unpinned: 0,
             // Three indexed UP draws and two oversized inline vertex streams
             // went through the unix upload ring.
             up_indexed: 3,

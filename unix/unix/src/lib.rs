@@ -13,6 +13,7 @@ mod main_thread_checker;
 mod metal;
 mod shader_prewarm;
 mod shader_programs;
+mod stack_page;
 
 /// `log` target used by every call inside this crate.
 ///

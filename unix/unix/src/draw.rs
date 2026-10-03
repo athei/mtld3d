@@ -307,16 +307,27 @@ fn resolve_pipeline_slow(
 /// Execute a draw directly from its retained command record.
 ///
 /// [`DrawView::new`] has already rejected malformed draw fields, so nothing
-/// here fails.
+/// here fails. The draw runs at a fixed stack page offset (see
+/// [`crate::stack_page`]), so its speed does not depend on the frames above it.
 ///
 /// # Safety
 /// The view must belong to the authentic admitted packet. Its captured bytes and
 /// backing allocations remain immutable and retained until submit completion. The
 /// encoder snapshot cache must name initialized snapshots retained by that packet.
 pub unsafe fn emit_draw(enc: &mut FrameEncoder, draw: &DrawView<'_>) {
-    emit_draw_view(enc, draw.metal_primitive(), draw.vertices(), draw.indices());
+    crate::stack_page::run_pinned(|| {
+        #[cfg(perf_tracking)]
+        if !crate::stack_page::at_pin() {
+            enc.bump_draw_unpinned();
+        }
+        emit_draw_view(enc, draw.metal_primitive(), draw.vertices(), draw.indices());
+    });
 }
 
+// Kept out of line so that its frame, and so every call it makes, sits below
+// the gap `run_pinned` reserves; inlined, each of the 64 gap instances would
+// also carry its own copy of this function.
+#[inline(never)]
 fn emit_draw_view(
     enc: &mut FrameEncoder,
     metal_prim: PrimitiveType,

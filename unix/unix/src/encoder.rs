@@ -600,7 +600,9 @@ fn submit_thread_main(
         let mut submit_exec_tsc: u64 = 0;
         let (payload, outcome) = {
             let _exec = mtld3d_core::perf::CycleSetTimer::start(&raw mut submit_exec_tsc);
-            execute_submit(record, &params, payload, failure_ptr)
+            // The replay's thousands of native calls run at a pinned stack page
+            // offset, so this loop's frame cannot move them across a page boundary.
+            crate::stack_page::run_pinned(|| execute_submit(record, &params, payload, failure_ptr))
         };
         // The final CPU reader has finished with the retained command regions, and the
         // payload carrying the snapshots goes back to the encoder. GPU resource leases
@@ -5629,6 +5631,12 @@ impl FrameEncoder {
         self.perf.bump_fan_generated();
     }
 
+    /// Count a draw whose draw path ran off its pinned stack page offset.
+    #[cfg(perf_tracking)]
+    pub const fn bump_draw_unpinned(&mut self) {
+        self.perf.bump_draw_unpinned();
+    }
+
     /// Count a `DrawIndexedPrimitiveUP` draw.
     pub const fn bump_up_indexed(&mut self) {
         self.perf.bump_up_indexed();
@@ -9233,12 +9241,10 @@ fn submit_sync(enc: &mut FrameEncoder, frame: NativeFrame) {
         let mut submit_exec_tsc: u64 = 0;
         let (payload, outcome) = {
             let _exec = mtld3d_core::perf::CycleSetTimer::start(&raw mut submit_exec_tsc);
-            execute_submit(
-                enc.record.as_ref(),
-                &params,
-                payload,
-                enc.runtime_failure_ptr,
-            )
+            let record = enc.record.as_ref();
+            let failure_ptr = enc.runtime_failure_ptr;
+            // Pinned like the submit thread's replay, whatever the encoder's frames above.
+            crate::stack_page::run_pinned(|| execute_submit(record, &params, payload, failure_ptr))
         };
         enc.fold_submit_outcome(&outcome, submit_exec_tsc);
         (payload, outcome.status)
@@ -9414,6 +9420,8 @@ fn finalize_submit(
 /// the separate native outcome.
 /// This is the only part of submit that runs on the dedicated submit thread
 /// in `Async` mode.
+// Kept out of line so its frame sits below the gap `run_pinned` reserves.
+#[inline(never)]
 fn execute_submit(
     record: Option<&Arc<crate::metal::DeviceRecord>>,
     description: &SubmitDescription,
