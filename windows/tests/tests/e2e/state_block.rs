@@ -900,3 +900,104 @@ fn captured_recorded_set_fvf_restores_the_declaration_bound_at_capture() {
     );
     assert_eq!(h.fvf(), direct, "GetFVF after Apply");
 }
+
+/// Assert `light` is the default light `LightEnable` creates: white, directional, down +z.
+fn assert_default_light(light: &D3DLIGHT9, message: &str) {
+    assert_eq!(light.type_, D3DLIGHT_DIRECTIONAL, "{message}: type");
+    let diffuse = [
+        light.diffuse.r,
+        light.diffuse.g,
+        light.diffuse.b,
+        light.diffuse.a,
+    ];
+    assert_eq!(
+        diffuse.map(f32::to_bits),
+        [1.0f32, 1.0, 1.0, 0.0].map(f32::to_bits),
+        "{message}: diffuse"
+    );
+    let direction = [light.direction.x, light.direction.y, light.direction.z];
+    assert_eq!(
+        direction.map(f32::to_bits),
+        [0.0f32, 0.0, 1.0].map(f32::to_bits),
+        "{message}: direction"
+    );
+}
+
+#[test]
+fn recorded_light_enable_of_an_unset_light_applies_the_default_light() {
+    // A recorded block holds a light's parameters with its enable, so enabling
+    // a light the recording never set records the default light `LightEnable`
+    // creates: Apply writes it over the device's light, and a Capture
+    // refreshes it from the device. A recorded disable defines nothing.
+    let h = Harness::new();
+    assert_eq!(h.set_render_state(D3DRS_LIGHTING, 1), 0);
+    assert_eq!(h.set_render_state(D3DRS_CULLMODE, D3DCULL_NONE), 0);
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_NORMAL), 0);
+    h.select_diffuse_stage(0);
+    assert_eq!(h.set_material(&diffuse_material(colour(1.0, 1.0, 1.0))), 0);
+    let red = frontal_light(colour(1.0, 0.0, 0.0));
+    let green = frontal_light(colour(0.0, 1.0, 0.0));
+    assert_eq!(h.set_light(0, &red), 0);
+    assert_eq!(h.light_enable(0, false), 0);
+    assert_eq!(h.set_light(1, &green), 0);
+    assert_eq!(h.light_enable(1, true), 0);
+
+    assert_eq!(h.begin_state_block(), D3D_OK, "BeginStateBlock");
+    assert_eq!(h.light_enable(0, true), D3D_OK, "record enable of light 0");
+    assert_eq!(
+        h.light_enable(1, false),
+        D3D_OK,
+        "record disable of light 1"
+    );
+    let block = h.end_state_block();
+    assert!(!h.light_enabled(0), "the recording left light 0 disabled");
+
+    assert_eq!(block.apply(), D3D_OK, "Apply");
+    assert_default_light(&h.light(0), "light 0 after Apply");
+    assert!(h.light_enabled(0), "light 0 enabled by Apply");
+    assert_eq!(
+        h.light(1).diffuse.g.to_bits(),
+        1.0f32.to_bits(),
+        "a recorded disable keeps light 1's parameters"
+    );
+    assert!(!h.light_enabled(1), "light 1 disabled by Apply");
+    let (r, g, b) = draw_lit(&h);
+    assert!(
+        r >= 0xF0 && g >= 0xF0 && b >= 0xF0,
+        "the default white light lights the quad, got ({r}, {g}, {b})"
+    );
+
+    // Capture refreshes the recorded light 0 from the device, parameters too.
+    assert_eq!(h.set_light(0, &green), 0);
+    assert_eq!(h.light_enable(1, false), 0);
+    assert_eq!(block.capture(), D3D_OK, "Capture");
+    assert_eq!(h.set_light(0, &red), 0);
+    assert_eq!(h.light_enable(0, false), 0);
+    assert_eq!(block.apply(), D3D_OK, "Apply after Capture");
+    let light = h.light(0);
+    assert_eq!(
+        [light.diffuse.r, light.diffuse.g].map(f32::to_bits),
+        [0.0f32, 1.0].map(f32::to_bits),
+        "Apply writes light 0 as captured"
+    );
+    assert!(h.light_enabled(0), "light 0 enabled as captured");
+}
+
+#[test]
+fn recorded_light_enable_after_a_recorded_set_light_keeps_its_parameters() {
+    // Enabling a light the recording has set records no default over it.
+    let h = Harness::new();
+    let blue = frontal_light(colour(0.0, 0.0, 1.0));
+    assert_eq!(h.begin_state_block(), D3D_OK, "BeginStateBlock");
+    assert_eq!(h.set_light(3, &blue), D3D_OK, "record SetLight");
+    assert_eq!(h.light_enable(3, true), D3D_OK, "record enable");
+    let block = h.end_state_block();
+    assert_eq!(block.apply(), D3D_OK, "Apply");
+    let light = h.light(3);
+    assert_eq!(
+        [light.diffuse.r, light.diffuse.b].map(f32::to_bits),
+        [0.0f32, 1.0].map(f32::to_bits),
+        "light 3 keeps the recorded parameters"
+    );
+    assert!(h.light_enabled(3), "light 3 enabled");
+}

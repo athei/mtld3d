@@ -20,7 +20,10 @@
 use core::ffi::c_void;
 
 use log::warn;
-use mtld3d_core::{ff_state::FfStateSnapshot, vs_draw::MAX_CLIP_PLANES};
+use mtld3d_core::{
+    ff_state::{FfState, FfStateSnapshot},
+    vs_draw::MAX_CLIP_PLANES,
+};
 use mtld3d_shared::{InPtr, VtableThis};
 use mtld3d_types::{
     D3DLIGHT9, D3DMATERIAL9, D3DMATRIX, D3DVIEWPORT9, Guid, IDirect3DStateBlock9Vtbl, MAX_STREAMS,
@@ -166,6 +169,27 @@ impl RecordingStateBlock {
     /// and `Drop` on the recorded op releases it.
     pub fn record(&mut self, op: StateOp) {
         self.ops.push(op);
+    }
+
+    /// Record a `LightEnable`, defining the default light first when it enables an unset light.
+    ///
+    /// A recorded block holds a light's parameters with its enable: enabling
+    /// a light the recording never set gives the block the default light
+    /// `LightEnable` creates, so `Apply` writes those parameters before the
+    /// enable and `Capture` refreshes them from the device. A disable defines
+    /// nothing.
+    pub fn record_light_enable(&mut self, index: u32, enable: bool) {
+        let has_light = self
+            .ops
+            .iter()
+            .any(|op| matches!(op, StateOp::Light { index: set, .. } if *set == index));
+        if enable && !has_light {
+            self.ops.push(StateOp::Light {
+                index,
+                light: FfState::enable_default_light(),
+            });
+        }
+        self.ops.push(StateOp::LightEnable { index, enable });
     }
 
     /// Refresh every op's payload from the current device state.

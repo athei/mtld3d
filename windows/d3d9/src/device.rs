@@ -10167,7 +10167,7 @@ extern "system" fn device_light_enable(this: *mut c_void, index: u32, enable: i3
     let dev = obj.inner();
     let on = enable != 0;
     if let Some(rec) = dev.recording_state_block_mut() {
-        rec.record(StateOp::LightEnable { index, enable: on });
+        rec.record_light_enable(index, on);
         return D3D_OK;
     }
     let inputs = dev.ff_state().vs_source_light_inputs();
