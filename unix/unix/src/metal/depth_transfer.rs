@@ -211,8 +211,15 @@ pub fn encode(
             None
         };
         let view = if stencil && let Some(sampleable) = sampleable.as_ref() {
-            let Some(view) = sampleable.newTextureViewWithPixelFormat(MTLPixelFormat::X32_Stencil8)
-            else {
+            let create = || sampleable.newTextureViewWithPixelFormat(MTLPixelFormat::X32_Stencil8);
+            let Some(view) = create().or_else(|| {
+                super::texture::retry_refused_create(
+                    &sampleable.device(),
+                    "mtld3d-depth-transfer-stencil",
+                    "stencil view",
+                    create,
+                )
+            }) else {
                 log::error!(target: LOG_TARGET, "depth transfer: stencil view allocation failed");
                 return false;
             };
@@ -553,7 +560,9 @@ fn copy_multisample_source(
         desc.setSampleCount(source.sampleCount());
     }
     desc.setUsage(MTLTextureUsage::ShaderRead | MTLTextureUsage::PixelFormatView);
-    let Some(sampleable) = source.device().newTextureWithDescriptor(&desc) else {
+    let Some(sampleable) =
+        super::texture::new_texture(&source.device(), &desc, "mtld3d-depth-transfer-source")
+    else {
         log::error!(
             target: LOG_TARGET,
             "depth transfer: {width}x{height} multisample source copy could not be allocated"
