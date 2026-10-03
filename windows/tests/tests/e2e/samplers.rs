@@ -118,6 +118,53 @@ fn fetch4_gathers_and_restores_latched_sampler_state() {
 }
 
 #[test]
+fn fetch4_recorded_numeric_bias_leaves_the_latch_out_across_capture() {
+    // A recorded numeric MIPMAPLODBIAS holds no Fetch4 latch, and a Capture
+    // keeps it out: refreshing the bias cannot add the latch to the block.
+    use mtld3d_types::{D3DFMT_L8, FETCH4_DISABLE, FETCH4_ENABLE};
+
+    let h = Harness::new();
+    let luminance = h.create_texture(2, 2, 1, 0, D3DFMT_L8, 0);
+    luminance
+        .lock_rect(0, 0)
+        .write_u8_rect(2, 2, &[0x10, 0x20, 0x30, 0x40]);
+    arm_texture(&h, &luminance, D3DTADDRESS_CLAMP, D3DTEXF_POINT);
+    let mut quad = uv_quad(1.0);
+    for vertex in &mut quad {
+        vertex.u = 0.125;
+        vertex.v = 0.125;
+    }
+    let sample = || {
+        h.render_once(BLACK, |d| {
+            assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad), 0);
+        });
+        h.read_pixel(160, 120)
+    };
+    let bias = 0.0f32.to_bits();
+    assert_eq!(h.begin_state_block(), 0);
+    assert_eq!(h.set_sampler_state(0, D3DSAMP_MIPMAPLODBIAS, bias), 0);
+    let recorded = h.end_state_block();
+    assert_eq!(
+        h.set_sampler_state(0, D3DSAMP_MIPMAPLODBIAS, FETCH4_ENABLE),
+        0
+    );
+    assert_eq!(h.set_sampler_state(0, D3DSAMP_MIPMAPLODBIAS, bias), 0);
+    assert_eq!(sample(), 0x1020_3040, "latched gather before Capture");
+    assert_eq!(recorded.capture(), 0);
+    assert_eq!(
+        h.set_sampler_state(0, D3DSAMP_MIPMAPLODBIAS, FETCH4_DISABLE),
+        0
+    );
+    assert_eq!(recorded.apply(), 0);
+    assert_eq!(h.sampler_state(0, D3DSAMP_MIPMAPLODBIAS), bias);
+    assert_eq!(
+        sample() & 0xffff_0000,
+        0xff10_0000,
+        "Apply of the numeric bias leaves the cleared latch alone"
+    );
+}
+
+#[test]
 fn fetch4_ignores_single_slice_volume_textures() {
     use mtld3d_types::{D3DFMT_L16, D3DPOOL_MANAGED, FETCH4_DISABLE, FETCH4_ENABLE};
 

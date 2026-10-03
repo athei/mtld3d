@@ -20,7 +20,10 @@
 use core::ffi::c_void;
 
 use log::warn;
-use mtld3d_core::{ff_state::FfStateSnapshot, vs_draw::MAX_CLIP_PLANES};
+use mtld3d_core::{
+    ff_state::{FfState, FfStateSnapshot},
+    vs_draw::MAX_CLIP_PLANES,
+};
 use mtld3d_shared::{InPtr, VtableThis};
 use mtld3d_types::{
     D3DLIGHT9, D3DMATERIAL9, D3DMATRIX, D3DVIEWPORT9, Guid, IDirect3DStateBlock9Vtbl, MAX_STREAMS,
@@ -168,6 +171,30 @@ impl RecordingStateBlock {
         self.ops.push(op);
     }
 
+    /// Record a `LightEnable`, defining the default light first when it enables an unset light.
+    ///
+    /// A recorded block holds a light's parameters with its enable: enabling
+    /// a light the recording never set gives the block the default light
+    /// `LightEnable` creates, so `Apply` writes those parameters before the
+    /// enable and `Capture` refreshes them from the device. A disable defines
+    /// nothing. Out of line, so the recording path adds nothing to the setter
+    /// that inlines it.
+    #[cold]
+    #[inline(never)]
+    pub fn record_light_enable(&mut self, index: u32, enable: bool) {
+        let has_light = self
+            .ops
+            .iter()
+            .any(|op| matches!(op, StateOp::Light { index: set, .. } if *set == index));
+        if enable && !has_light {
+            self.ops.push(StateOp::Light {
+                index,
+                light: FfState::enable_default_light(),
+            });
+        }
+        self.ops.push(StateOp::LightEnable { index, enable });
+    }
+
     /// Refresh every op's payload from the current device state.
     ///
     /// Used by `IDirect3DStateBlock9::Capture` on a recorded block —
@@ -205,11 +232,12 @@ impl RecordingStateBlock {
                     value,
                     fetch4,
                 } => {
-                    if *type_ == mtld3d_types::D3DSAMP_MIPMAPLODBIAS
+                    // Like the POINTSIZE components, a refresh keeps the op's
+                    // membership: only a recorded GET4/GET1 carries the latch.
+                    if let Some(latch) = fetch4
                         && (*sampler as usize) < STAGE_COUNT
                     {
-                        *fetch4 =
-                            Some(dev.stage_bindings().fetch4().enabled() & (1 << *sampler) != 0);
+                        *latch = dev.stage_bindings().fetch4().enabled() & (1 << *sampler) != 0;
                     }
                     *value = crate::device::vertex_sampler_slot(*sampler).map_or_else(
                         || {
@@ -237,8 +265,9 @@ impl RecordingStateBlock {
                     *m = *dev.ff_state().material();
                 }
                 StateOp::Light { index, light } => {
-                    // A recorded Light op implies the slot was defined, so this
-                    // resolves; leave the recorded value untouched otherwise.
+                    // A slot the device has not defined keeps the recorded
+                    // value: a recorded SetLight, or the default light a
+                    // recorded enable of an unset light put in the block.
                     if let Some(l) = dev.ff_state().get_light_at(*index) {
                         *light = l;
                     }

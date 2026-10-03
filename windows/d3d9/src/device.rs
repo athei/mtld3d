@@ -2762,6 +2762,9 @@ impl DeviceInner {
         self.flags.remove(DeviceFlags::A2M_ENABLED);
         self.ff_state = FfState::new();
         self.vs_draw = mtld3d_core::vs_draw::VsDrawState::new();
+        // Every user clip plane returns to its zero default; the per-draw
+        // uniform that carries them rebuilds with the rest below.
+        self.clip_planes = [[0.0; 4]; CLIP_PLANE_SLOTS];
         #[cfg(perf_tracking)]
         self.perf.state_mut().advance_reset_epoch();
         // Reset abandons any open scene; a following EndScene must fail.
@@ -10164,7 +10167,7 @@ extern "system" fn device_light_enable(this: *mut c_void, index: u32, enable: i3
     let dev = obj.inner();
     let on = enable != 0;
     if let Some(rec) = dev.recording_state_block_mut() {
-        rec.record(StateOp::LightEnable { index, enable: on });
+        rec.record_light_enable(index, on);
         return D3D_OK;
     }
     let inputs = dev.ff_state().vs_source_light_inputs();

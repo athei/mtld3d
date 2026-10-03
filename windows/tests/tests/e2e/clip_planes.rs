@@ -168,6 +168,34 @@ fn inverse_view_follows_restores_multiplication_and_reset() {
 }
 
 #[test]
+fn reset_returns_every_clip_plane_to_zero() {
+    // Reset puts every user clip plane back to its zero default, so a plane
+    // enabled after it without a new SetClipPlane clips nothing.
+    let h = Harness::new();
+    for index in 0..6 {
+        assert_eq!(h.set_clip_plane(index, plane_y_above(0.0)), 0);
+    }
+    assert_eq!(h.reset(640, 480), 0);
+    for index in 0..6 {
+        let (hr, plane) = h.get_clip_plane(index);
+        assert_eq!(hr, 0, "GetClipPlane({index})");
+        assert_eq!(
+            plane.map(f32::to_bits),
+            [0.0f32; 4].map(f32::to_bits),
+            "clip plane {index} after Reset"
+        );
+    }
+    arm_diffuse(&h);
+    assert_eq!(h.set_render_state(D3DRS_CLIPPLANEENABLE, 1), 0);
+    draw_quad(&h);
+    assert_eq!(
+        h.read_pixel(320, 380),
+        GREEN,
+        "the zero plane clips nothing"
+    );
+}
+
+#[test]
 fn clipping_render_state_gates_the_planes() {
     let h = Harness::new();
     arm_diffuse(&h);

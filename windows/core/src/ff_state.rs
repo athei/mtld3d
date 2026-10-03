@@ -729,7 +729,8 @@ impl FfState {
     /// The light D3D9 materializes when `LightEnable` targets a slot with no `SetLight`.
     ///
     /// White diffuse over the `D3DLIGHT9` default (directional, direction +Z).
-    fn enable_default_light() -> D3DLIGHT9 {
+    #[must_use]
+    pub fn enable_default_light() -> D3DLIGHT9 {
         D3DLIGHT9 {
             diffuse: D3DCOLORVALUE {
                 r: 1.0,
