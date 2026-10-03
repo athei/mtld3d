@@ -38,6 +38,7 @@ mod failure_exits;
 mod float_filter;
 mod format_query;
 mod implicit_surface;
+mod lock_lifetime;
 mod mrt;
 mod msaa;
 mod multi_device;

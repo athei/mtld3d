@@ -5,6 +5,8 @@
 //! agrees with upstream's mask-bits form at every chunk size. Then `PageBox`
 //! itself: page-aligned pointers, a padded length rounded up to a page multiple
 //! (one page even at zero), and the full logical range readable and writable.
+//! The fallible constructors answer `None` for a length no layout can hold and
+//! allocate like the infallible ones otherwise.
 
 use std::sync::{Arc, mpsc};
 
@@ -231,4 +233,21 @@ fn guest_lease_shares_reader_count_and_never_enters_native_pool() {
         0,
         "guest allocation still belongs to its owner"
     );
+}
+
+#[test]
+fn fallible_constructors_refuse_a_length_no_layout_holds() {
+    assert!(
+        PageBox::try_new_uninit(usize::MAX).is_none(),
+        "rounding up overflows"
+    );
+    assert!(
+        PageBox::try_new_zeroed(isize::MAX.cast_unsigned()).is_none(),
+        "the rounded length is past what a layout holds"
+    );
+    let page = PageBox::try_new_zeroed(10).expect("a small allocation succeeds");
+    assert_eq!((page.len(), page.logical_len()), (PAGE_SIZE, 10));
+    assert!(page.as_slice().iter().all(|&byte| byte == 0), "zeroed");
+    let page = PageBox::try_new_uninit(PAGE_SIZE + 1).expect("a small allocation succeeds");
+    assert_eq!(page.len(), 2 * PAGE_SIZE);
 }

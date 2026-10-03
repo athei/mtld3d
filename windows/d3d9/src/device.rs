@@ -723,6 +723,14 @@ pub struct DeviceInner {
     /// the frame it hands over, under this device's own lock. A leaf mutex
     /// like `live_textures`.
     departed_textures: DepartedTextures,
+    /// Metal textures of standalone targets released after the device failed.
+    ///
+    /// A device whose failure is latched sends no frame again, so a retire
+    /// operation recorded then would never reach the encoder that destroys
+    /// the texture. The handles wait here instead, sRGB twins ahead of the
+    /// texture each holds a retain on, and the final `Release` destroys them
+    /// once the encoder's shutdown has waited for the GPU.
+    retired_while_failed: Vec<u64>,
     /// What the encoder made of each upload, waiting to be acted on.
     ///
     /// The bind-time flush clears a level's dirty bit and takes its pending
@@ -1782,6 +1790,20 @@ impl DeviceInner {
         }
     }
 
+    /// Drop what the open frame recorded on a device that can no longer send a frame.
+    ///
+    /// A failed device keeps recording, uploads included, and nothing would
+    /// ever take the frame off it, so each `Present` starts it again from the
+    /// saved bindings instead of letting it grow for as long as the
+    /// application runs. Nothing in it can reach the GPU: the encoder refuses
+    /// every frame of a failed device.
+    #[cold]
+    fn discard_unsendable_frame(&mut self) {
+        let fresh = self.fresh_frame();
+        drop(core::mem::replace(&mut self.current_frame, fresh));
+        self.reassert_saved_bindings();
+    }
+
     /// Submit the current frame's accumulated ops synchronously.
     ///
     /// Then continue with a fresh empty frame. Used by `LockRect` on the
@@ -1929,9 +1951,11 @@ impl DeviceInner {
     /// Recycle-pool hit, else enforce the cap, else allocate. The cap is
     /// the only mechanism bounding retained bytes: allocation itself is
     /// infallible (see `PageBox::new_uninit`), because on the 32-bit game
-    /// process the allocator never fails cleanly — the process thrashes or
+    /// process the allocator never fails cleanly: the process thrashes or
     /// dies long before `alloc` returns null, so reacting to a null was
-    /// always too late to be the fix.
+    /// always too late to be the fix. The one exception is the system-memory
+    /// copy a resource gets at creation, which a create answers with
+    /// `E_OUTOFMEMORY` as D3D9 does; a rename is never a creation.
     pub fn alloc_pagebox_capped(&mut self, logical_len: usize) -> Result<PageBox, i32> {
         self.encoder.status()?;
         // Recycle-pool fast path: a hit is a warm, still-committed box of
@@ -1980,6 +2004,7 @@ impl DeviceInner {
     /// the encoder's next summary can read it.
     pub fn present(&mut self) -> i32 {
         if let Err(hr) = self.encoder.status() {
+            self.discard_unsendable_frame();
             return hr;
         }
         // Both `IDirect3DDevice9::Present` and the swap chain's land here, so
@@ -2220,6 +2245,44 @@ impl DeviceInner {
     /// [`mtld3d_core::departed_textures`].
     pub fn note_departed_texture(&self, id: TextureId) {
         self.departed_textures.note(id);
+    }
+
+    /// Retire a standalone colour target's Metal textures.
+    ///
+    /// The encoder destroys them once the GPU is past every pass that names
+    /// them. A device whose failure is latched sends no frame again, so the
+    /// final `Release` destroys them instead (see `retired_while_failed`).
+    pub fn retire_color_target(&mut self, retired: crate::encoder::RetiredColorTarget) {
+        if self.encoder.status().is_ok() {
+            self.push_control(crate::device::RetireColorOp { retired });
+            return;
+        }
+        self.keep_retired_while_failed(&[
+            retired.srgb,
+            retired.base,
+            retired.msaa_srgb,
+            retired.msaa,
+        ]);
+    }
+
+    /// Retire a standalone depth-stencil target's Metal texture, as [`Self::retire_color_target`].
+    pub fn retire_depth_target(&mut self, depth: MetalHandle<MTLTextureKind>) {
+        if self.encoder.status().is_ok() {
+            self.push_control(crate::device::RetireDepthOp { depth });
+            return;
+        }
+        self.keep_retired_while_failed(&[depth]);
+    }
+
+    /// File the non-null `handles` for the final `Release` to destroy.
+    #[cold]
+    fn keep_retired_while_failed(&mut self, handles: &[MetalHandle<MTLTextureKind>]) {
+        self.retired_while_failed.extend(
+            handles
+                .iter()
+                .filter(|handle| !handle.is_null())
+                .map(|handle| handle.raw()),
+        );
     }
 
     /// Keep the storage of a texture that moved back before its departure was drained.
@@ -3281,6 +3344,7 @@ impl Direct3DDevice9 {
             last_depth_binding: None,
             live_textures: Mutex::new(rustc_hash::FxHashMap::default()),
             departed_textures: DepartedTextures::default(),
+            retired_while_failed: Vec::new(),
             upload_redirty: Arc::new(RedirtyQueue::new()),
             snapshot_dirty: SnapshotDirty::all(),
             snapshot_cache: ApiSnapshotCache::EMPTY,
@@ -4023,11 +4087,35 @@ extern "system" fn device_release(this: *mut c_void) -> u32 {
         // MTLBuffer wrapping a `PageBox` the game ever Locked has been
         // released.
         if device_inner.shutdown().is_err() {
-            // An unacknowledged shutdown may still read device-owned sinks and GPU resources.
+            // An unacknowledged shutdown may still read device-owned sinks and GPU resources,
+            // so the device memory and its command queue stay as they are. The parent's
+            // reference is the application's object, which nothing native holds (the
+            // encoder decodes its own copy of the configuration), so it is given back.
+            error!(target: LOG_TARGET,
+                "device release: the encoder did not acknowledge shutdown; the device and its \
+                 command queue are left allocated");
             std::mem::forget(device_inner);
+            release_parent(parent);
             return rc;
         }
 
+        // Targets released after the device failed never reached the encoder,
+        // and the shutdown above has waited for every pass that named them.
+        let retired_while_failed = core::mem::take(&mut device_inner.retired_while_failed);
+        if !retired_while_failed.is_empty() {
+            let mut destroy = mtld3d_shared::DestroyResourcesBulkParams {
+                kind: mtld3d_shared::mtl::DestroyKind::Texture,
+                pad0: 0,
+                handles_ptr: retired_while_failed.as_ptr() as u64,
+                count: u32::try_from(retired_while_failed.len())
+                    .expect("a device's released targets fit u32"),
+                pad1: 0,
+            };
+            unix_call(&mut destroy);
+            info!(target: LOG_TARGET,
+                "device release: destroyed {} Metal textures of targets released after the \
+                 device failed", retired_while_failed.len());
+        }
         if !implicit_handles.is_empty() {
             let mut destroy = mtld3d_shared::DestroyResourcesBulkParams {
                 kind: mtld3d_shared::mtl::DestroyKind::Texture,
@@ -4053,17 +4141,25 @@ extern "system" fn device_release(this: *mut c_void) -> u32 {
         // top of `device_release` rather than a use-after-free. The leak is
         // bounded by device-create count (one per device, ~24 bytes).
         obj.refcount = 0;
-        if !parent.is_null() {
-            // SAFETY: `parent` is non-null (checked above) and was
-            // AddRef'd during `Direct3D9::CreateDevice`; the parent's
-            // refcount has kept it alive until this Release.
-            let parent_obj = unsafe { &*(parent as *const ParentIUnknown) };
-            // SAFETY: `parent_obj.vtbl` is the `'static` parent vtable.
-            let vtbl = unsafe { &*parent_obj.vtbl };
-            (vtbl.release)(parent);
-        }
+        release_parent(parent);
     }
     rc
+}
+
+/// Give back the reference a device holds on the `IDirect3D9` that created it.
+///
+/// Null for a device whose parent was never recorded.
+fn release_parent(parent: *mut c_void) {
+    if parent.is_null() {
+        return;
+    }
+    // SAFETY: `parent` is non-null (checked above) and was AddRef'd during
+    // `Direct3D9::CreateDevice`; the parent's refcount has kept it alive until
+    // this Release.
+    let parent_obj = unsafe { &*(parent as *const ParentIUnknown) };
+    // SAFETY: `parent_obj.vtbl` is the `'static` parent vtable.
+    let vtbl = unsafe { &*parent_obj.vtbl };
+    (vtbl.release)(parent);
 }
 
 /// The owning `Direct3DDevice9`* wrapper for a child's `device_inner` pointer.
@@ -5350,6 +5446,20 @@ fn resolve_create_levels(entry_point: &str, requested: u32, natural: u32) -> u32
     resolve_mip_levels(requested, natural)
 }
 
+/// Refuse a create whose system-memory copy the process cannot allocate.
+///
+/// The staging a resource gets at creation is the one allocation that may
+/// fail; D3D9 answers such a create `E_OUTOFMEMORY` and hands back no object.
+/// What was allocated before the failure has already been dropped by the
+/// caller.
+fn refuse_unallocatable_staging(entry_point: &str, out: *mut *mut c_void) -> i32 {
+    warn!(target: LOG_TARGET,
+        "reject {entry_point}: the resource's system-memory copy cannot be allocated → \
+         E_OUTOFMEMORY");
+    null_out(out);
+    mtld3d_types::E_OUTOFMEMORY
+}
+
 /// The body of `CreateTexture`, plus the intent the vtable signature cannot carry.
 ///
 /// `CreateOffscreenPlainSurface` backs a `D3DPOOL_DEFAULT` plain with a
@@ -5614,6 +5724,9 @@ fn create_texture_path(info: &TextureCreateArgs) -> i32 {
     let mut mip_heights = Vec::with_capacity(actual_levels as usize);
     let mut mip_bytes_per_row = Vec::with_capacity(actual_levels as usize);
 
+    // The staging is the one allocation of a create that may fail: a level the
+    // process has no room for refuses the create with `E_OUTOFMEMORY`.
+    let mut out_of_memory = false;
     let (pool_hits, pool_misses) = {
         let mut staging_take = take_staging();
         if let Some(layout) = &planar_layout {
@@ -5621,18 +5734,25 @@ fn create_texture_path(info: &TextureCreateArgs) -> i32 {
             // height: the chroma planes follow the luma rows in the same box, and
             // the lock pitch strides all of them. The per-level arrays keep the
             // logical extent, which is what `GetDesc` and rect validation read.
-            staging.push(staging_take.take(layout.total_bytes()));
+            match staging_take.try_take(layout.total_bytes()) {
+                Some(page) => staging.push(page),
+                None => out_of_memory = true,
+            }
             mip_widths.push(width);
             mip_heights.push(height);
             mip_bytes_per_row.push(layout.pitch());
             // Every offset a planar lock, upload or decode forms is derived from
             // the layout, so the allocation has to be exactly the layout's size.
-            debug_assert_eq!(staging[0].logical_len(), layout.total_bytes());
+            debug_assert!(out_of_memory || staging[0].logical_len() == layout.total_bytes());
             debug_assert_eq!(actual_levels, 1);
         } else {
             for level in 0..actual_levels {
                 let (mw, mh, size, bpr) = compute_mip_size(width, height, level, &fmt);
-                staging.push(staging_take.take(size as usize));
+                let Some(page) = staging_take.try_take(size as usize) else {
+                    out_of_memory = true;
+                    break;
+                };
+                staging.push(page);
                 mip_widths.push(mw);
                 mip_heights.push(mh);
                 mip_bytes_per_row.push(bpr);
@@ -5640,6 +5760,9 @@ fn create_texture_path(info: &TextureCreateArgs) -> i32 {
         }
         staging_take.finish()
     };
+    if out_of_memory {
+        return refuse_unallocatable_staging("CreateTexture", texture);
+    }
 
     obj.inner()
         .perf_mut()
@@ -5922,12 +6045,19 @@ fn create_depth_texture_path(info: &DepthTextureCreateInfo) -> i32 {
     } else {
         obj.inner().scale_for_created_target(width, height, true)
     };
+    // The staging is the one allocation of a create that may fail.
     let staging = if dynamic {
-        mip_bytes_per_row
+        let staging: Option<Vec<PageBox>> = mip_bytes_per_row
             .iter()
             .zip(&mip_heights)
-            .map(|(&pitch, &rows)| PageBox::new_zeroed(pitch as usize * rows as usize))
-            .collect()
+            .map(|(&pitch, &rows)| {
+                PageBox::try_new_zeroed((pitch as usize).saturating_mul(rows as usize))
+            })
+            .collect();
+        let Some(staging) = staging else {
+            return refuse_unallocatable_staging("CreateTexture", texture);
+        };
+        staging
     } else {
         Vec::new()
     };
@@ -6091,13 +6221,20 @@ extern "system" fn device_create_volume_texture(
             let (mw, mh, slice_size, bpr) = compute_mip_size(width, height, level, &fmt);
             let md = (depth >> level).max(1);
             let box_bytes = (slice_size as usize).saturating_mul(md as usize);
-            staging.push(staging_take.take(box_bytes));
+            // The staging is the one allocation of a create that may fail.
+            let Some(page) = staging_take.try_take(box_bytes) else {
+                break;
+            };
+            staging.push(page);
             mip_widths.push(mw);
             mip_heights.push(mh);
             mip_bytes_per_row.push(bpr);
         }
         staging_take.finish()
     };
+    if staging.len() != actual_levels as usize {
+        return refuse_unallocatable_staging("CreateVolumeTexture", texture);
+    }
     // SAFETY: vtable thunk; `this` is *mut Direct3DDevice9 per IDirect3DDevice9 ABI.
     let Some(obj) = (unsafe { InPtr::<Direct3DDevice9>::opt(this) }) else {
         return D3DERR_INVALIDCALL;
@@ -6288,14 +6425,21 @@ extern "system" fn device_create_cube_texture(
     }
     let (pool_hits, pool_misses) = {
         let mut staging_take = take_staging();
-        for _face in 0..CUBE_FACE_COUNT {
+        // The staging is the one allocation of a create that may fail.
+        'faces: for _face in 0..CUBE_FACE_COUNT {
             for level in 0..actual_levels {
                 let (_, _, size, _) = compute_mip_size(edge_length, edge_length, level, &fmt);
-                staging.push(staging_take.take(size as usize));
+                let Some(page) = staging_take.try_take(size as usize) else {
+                    break 'faces;
+                };
+                staging.push(page);
             }
         }
         staging_take.finish()
     };
+    if staging.len() != actual_levels as usize * CUBE_FACE_COUNT as usize {
+        return refuse_unallocatable_staging("CreateCubeTexture", texture);
+    }
     // SAFETY: vtable thunk; `this` is *mut Direct3DDevice9 per IDirect3DDevice9 ABI.
     let Some(obj) = (unsafe { InPtr::<Direct3DDevice9>::opt(this) }) else {
         return D3DERR_INVALIDCALL;
@@ -6391,13 +6535,15 @@ extern "system" fn device_create_vertex_buffer(
         "CreateVertexBuffer(len={length}, usage={usage:#x}, fvf={fvf:#x}, pool={pool})"
     );
     warn_unused_usage_and_pool_once("VertexBuffer", usage, pool);
-    let buffer = Direct3DVertexBuffer9::new(&VertexBufferCreateInfo {
+    let Some(buffer) = Direct3DVertexBuffer9::new(&VertexBufferCreateInfo {
         device_inner: std::ptr::from_mut::<DeviceInner>(dev),
         length,
         usage,
         fvf,
         pool,
-    });
+    }) else {
+        return refuse_unallocatable_staging("CreateVertexBuffer", vb);
+    };
     // Queue the eager `MTLBuffer` wrap so subsequent draw operations hit
     // the buffer cache instead of cache-missing inside
     // `ensure_vbib_mtl_buffer` on first bind.
@@ -6472,13 +6618,15 @@ extern "system" fn device_create_index_buffer(
         "CreateIndexBuffer(len={length}, usage={usage:#x}, format={format}, pool={pool})"
     );
     warn_unused_usage_and_pool_once("IndexBuffer", usage, pool);
-    let buffer = Direct3DIndexBuffer9::new(&IndexBufferCreateInfo {
+    let Some(buffer) = Direct3DIndexBuffer9::new(&IndexBufferCreateInfo {
         device_inner: std::ptr::from_mut::<DeviceInner>(dev),
         length,
         usage,
         format,
         pool,
-    });
+    }) else {
+        return refuse_unallocatable_staging("CreateIndexBuffer", ib);
+    };
     // Queue the eager `MTLBuffer` wrap; same drain semantics as VB.
     let inner = buffer.inner();
     dev.push_buffer_warmup(VbibWarmupEntry {
@@ -6744,6 +6892,19 @@ extern "system" fn device_create_render_target(
         let bpp = map_d3d_format(format).map_or(0, |m| m.bytes_per_pixel());
         (linear_row_pitch(width, bpp) as usize).saturating_mul(height as usize)
     };
+    // Zero-initialise the staging (defence-in-depth): a `LockRect` before any
+    // render, or any path that skips the read-back fill, reads defined bytes
+    // rather than allocator garbage. It is the one allocation of the create that
+    // may fail, and it is made before the colour texture so a refusal leaves
+    // nothing to tear down.
+    let staging = if staging_bytes == 0 {
+        None
+    } else {
+        let Some(staging) = PageBox::try_new_zeroed(staging_bytes) else {
+            return refuse_unallocatable_staging("CreateRenderTarget", surface);
+        };
+        Some(staging)
+    };
     let Some(surf_ptr) = create_color_target_surface(
         obj.inner().device_handle,
         obj.inner_ptr(),
@@ -6763,14 +6924,11 @@ extern "system" fn device_create_render_target(
         null_out(surface);
         return D3DERR_INVALIDCALL;
     };
-    if staging_bytes != 0 {
-        // Zero-initialise the staging (defence-in-depth): a `LockRect` before
-        // any render, or any path that skips the read-back fill, reads defined
-        // bytes rather than allocator garbage.
+    if let Some(staging) = staging {
         // SAFETY: `surf_ptr` is the freshly created, live standalone RT
         // surface (refcount 1); no other reference exists yet, so the
         // exclusive borrow to attach the staging is sound.
-        unsafe { &mut *surf_ptr }.set_lockable_staging(PageBox::new_zeroed(staging_bytes));
+        unsafe { &mut *surf_ptr }.set_lockable_staging(staging);
     }
     // SAFETY: vtable out-param; `surface` is *mut *mut c_void per IDirect3DDevice9 ABI.
     unsafe { OutPtr::write_opt(surface, surf_ptr.cast::<c_void>()) };
@@ -6950,11 +7108,11 @@ fn copy_systemmem_to_default(
     // allocation is distinct from the dst inner (src_parent != dst_parent).
     let src_inner = unsafe { &*core::ptr::from_ref(src_tex.inner()) };
     let hr = copy(dst_tex.inner_mut(), src_inner);
-    if hr != D3D_OK {
-        return hr;
-    }
+    // A copy that failed partway has still written the levels before the one
+    // that failed, and those owe their upload like any other: the re-walk is
+    // what flushes them at the next draw.
     schedule_staging_upload_at_next_bind(dst_tex);
-    D3D_OK
+    hr
 }
 
 extern "system" fn device_update_surface(
@@ -7406,6 +7564,9 @@ extern "system" fn device_update_texture(
                     let sw = src.mip_width(src_level);
                     let sh = src.mip_height(src_level);
                     let Some(c) = dr.clamp(sw, sh) else { continue };
+                    if !c.reaches(dst.mip_width(level), dst.mip_height(level)) {
+                        continue;
+                    }
                     let copied = if c.x == 0 && c.y == 0 && c.w >= sw && c.h >= sh {
                         dst.update_cube_sub_region_from(
                             (face, level),
@@ -7481,6 +7642,9 @@ extern "system" fn device_update_texture(
             let sw = src.mip_width(src_level);
             let sh = src.mip_height(src_level);
             let Some(c) = dr.clamp(sw, sh) else { continue };
+            if !c.reaches(dst.mip_width(level), dst.mip_height(level)) {
+                continue;
+            }
             let copied = if c.x == 0 && c.y == 0 && c.w >= sw && c.h >= sh {
                 // Whole mip.
                 dst.update_sub_region_from(level, src, src_level, None, (0, 0))
@@ -8974,14 +9138,12 @@ extern "system" fn device_create_offscreen_plain_surface(
     } else {
         (linear_row_pitch(width, bpp) as usize).saturating_mul(height as usize)
     };
-    let surf = Direct3DSurface9::new_system_memory(
-        obj.inner_ptr(),
-        width,
-        height,
-        format,
-        pool,
-        PageBox::new_uninit(bytes),
-    );
+    // The surface's bytes are the one allocation of the create that may fail.
+    let Some(backing) = PageBox::try_new_uninit(bytes) else {
+        return refuse_unallocatable_staging("CreateOffscreenPlainSurface", surface);
+    };
+    let surf =
+        Direct3DSurface9::new_system_memory(obj.inner_ptr(), width, height, format, pool, backing);
     let surf_ptr = Box::into_raw(Box::new(surf));
     // SAFETY: `surf_ptr` is a freshly created, live system-memory surface at
     // refcount 1.

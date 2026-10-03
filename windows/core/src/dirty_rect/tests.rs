@@ -19,6 +19,9 @@
 //! Two drive `union`: disjoint rects come back as the box enclosing both, and a rect inside
 //! another comes back as the outer one.
 //!
+//! One drives `reaches`: a region whose origin lies inside a level reaches it however far it
+//! overhangs, and one whose origin lies past either edge, or that is empty, does not.
+//!
 //! Three drive `update_surface_region`, the region an `UpdateSurface` call names: a region
 //! inside both levels comes back as given; one that is empty or inverted, has a negative edge
 //! or point, or leaves either level is refused; and a block-compressed one is held to the
@@ -419,5 +422,32 @@ fn update_surface_region_holds_compressed_regions_to_the_block_grid() {
         update_surface_region(None, (0, 0), (2, 2), (4, 4), dxt),
         None,
         "a 2x2 level into a 4x4 one stops short of the destination's edge"
+    );
+}
+
+#[test]
+fn reaches_needs_an_origin_inside_the_level() {
+    let at = |x, y| DirtyRect { x, y, w: 2, h: 1 };
+    assert!(
+        at(0, 0).reaches(1, 4),
+        "an overhanging region still reaches the level"
+    );
+    assert!(
+        !at(2, 0).reaches(1, 4),
+        "an origin past the right edge reaches nothing"
+    );
+    assert!(
+        !at(0, 4).reaches(1, 4),
+        "an origin past the bottom edge reaches nothing"
+    );
+    assert!(
+        !DirtyRect {
+            x: 0,
+            y: 0,
+            w: 0,
+            h: 1
+        }
+        .reaches(1, 4),
+        "an empty region reaches nothing"
     );
 }

@@ -27,7 +27,7 @@ use mtld3d_core::{
     vs_draw::{MAX_CLIP_PLANES, VS_DRAW_BYTES, VsDrawState},
 };
 use mtld3d_shared::{
-    Command, MetalHandle, VertexAttrDesc,
+    Command, MetalHandle, NullTextureKind, VertexAttrDesc,
     mtl::{
         IndexType, PS_BOOL_CONST_SLOT, PS_DRAW_SLOT, PS_INT_CONST_SLOT, PS_LOD_BIAS_SLOT,
         PrimitiveType, SET_BYTES_MAX, VS_BOOL_CONST_SLOT, VS_DRAW_SLOT, VS_FLOAT_CONST_SLOT,
@@ -73,7 +73,7 @@ const CASTER_TRACE_TARGET: &str = "mtld3d::d3d9::caster";
 pub use mtld3d_core::draw_data::{
     CurrentSnapshot, DepthStencilFlags, NULL_STREAM_ZEROS, PsKey, PsSourceView,
     RenderStateSnapshot, ScratchSlice, ShaderRef, StageBindingsPtr, VsSourceView,
-    arena_alloc_bytes, null_texture_kind,
+    arena_alloc_bytes, missing_texture_kind, null_texture_kind,
 };
 
 /// Close the `draw N` debug group `emit_draw` opened for a dumped draw.
@@ -1057,7 +1057,8 @@ fn emit_draw_view(
             // A texture whose Metal texture could not be made. The fragment
             // function still declares the slot, typed by the bound texture,
             // and Metal requires every declared slot to be bound, so it reads
-            // the shared black texture of that type.
+            // the shared fallback of that type: black, or depth zero for a
+            // depth texture's `depth2d` slot.
             mtld3d_shared::log_once_warn_by!(target: crate::LOG_TARGET,
                 key: b.texture_id.raw(),
                 "draw: stage {stage_u32} bound to {:?} but its texture handle is 0; sampled \
@@ -1065,15 +1066,31 @@ fn emit_draw_view(
                 b.texture_id
             );
             let slot = u16::try_from(stage_u32).expect("sampler stage is below STAGE_COUNT");
-            let kind = null_texture_kind(bound_sampler_type(variant, slot));
+            let kind = missing_texture_kind(variant, slot);
             if enc
                 .last_bound()
                 .fragment_texture_changed(stage_u32, null_texture_tex_sentinel(kind as u64))
             {
                 enc.emit_command(Command::set_fragment_null_texture(kind, stage_u32));
+                // The bind installs the default sampler, which is not the
+                // comparison or raw-fetch one a depth slot reads through.
+                enc.last_bound()
+                    .fragment_sampler_changed(stage_u32, NULL_TEXTURE_SAMPLER_SENTINEL);
             }
-            enc.last_bound()
-                .fragment_sampler_changed(stage_u32, NULL_TEXTURE_SAMPLER_SENTINEL);
+            if kind == NullTextureKind::Depth2D {
+                let is_compare = (fetch_mask & bit) == 0;
+                let sampler =
+                    enc.get_or_create_sampler(stage_u32, &b.sampler_state, is_compare, !is_compare);
+                if enc
+                    .last_bound()
+                    .fragment_sampler_changed(stage_u32, sampler_cache_key(sampler))
+                {
+                    enc.emit_command(Command::set_fragment_sampler_state(sampler, stage_u32));
+                }
+            } else {
+                enc.last_bound()
+                    .fragment_sampler_changed(stage_u32, NULL_TEXTURE_SAMPLER_SENTINEL);
+            }
             bound_mask |= bit;
             continue;
         }

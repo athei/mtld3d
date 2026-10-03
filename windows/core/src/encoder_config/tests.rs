@@ -21,6 +21,7 @@ fn resolved_configuration_preserves_nondefaults() {
     let mut value = Mtld3dConfig::default();
     value.caps_all = !value.caps_all;
     value.main_thread_checker = !value.main_thread_checker;
+    value.fail_next_submit = !value.fail_next_submit;
     value.expand_packed16 = !value.expand_packed16;
     value.deny_float32_filtering = !value.deny_float32_filtering;
     value.managed_memory = !value.managed_memory;

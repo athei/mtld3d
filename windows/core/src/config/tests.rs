@@ -23,6 +23,7 @@ fn defaults_match_documented_values() {
     let d = Mtld3dConfig::default();
     assert!(!d.caps_all);
     assert!(!d.main_thread_checker);
+    assert!(!d.fail_next_submit);
     assert!(!d.expand_packed16);
     assert!(!d.deny_float32_filtering);
     assert!(!d.managed_memory);
@@ -332,6 +333,21 @@ fn main_thread_checker_defaults_off_and_parses_on() {
     );
     assert!(
         parse(None, "", Some("debug.mainThreadChecker=true")).main_thread_checker,
+        "the env override reaches the key"
+    );
+}
+
+#[test]
+fn fail_next_submit_defaults_off_and_parses_on() {
+    assert!(!parse(None, "", None).fail_next_submit, "off by default");
+    assert!(parse(None, "debug.failNextSubmit = true\n", None).fail_next_submit);
+    assert!(!parse(None, "debug.failNextSubmit = false\n", None).fail_next_submit);
+    assert!(
+        !parse(None, "debug.failNextSubmit = maybe\n", None).fail_next_submit,
+        "an unparsable value keeps the default"
+    );
+    assert!(
+        parse(None, "", Some("debug.failNextSubmit=true")).fail_next_submit,
         "the env override reaches the key"
     );
 }

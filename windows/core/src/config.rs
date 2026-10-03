@@ -50,6 +50,14 @@ pub struct Mtld3dConfig {
     /// a game never needs it. Default: `false`. File key:
     /// `debug.mainThreadChecker`.
     pub main_thread_checker: bool,
+    /// Refuse the device's first frame submission as if the native runtime had rejected it.
+    ///
+    /// A seam for the test suite: it latches the device failure a Metal
+    /// error would, so the suite can drive what a device does once it can no
+    /// longer submit frames. A game never needs it; it only breaks the
+    /// device. Each submission pays one relaxed load of the armed flag.
+    /// Default: `false`. File key: `debug.failNextSubmit`.
+    pub fail_next_submit: bool,
     /// Force the packed 16-bit expansion path used on non-Apple-family GPUs.
     ///
     /// Treats the device as lacking the native packed 16-bit pixel
@@ -363,6 +371,7 @@ impl Default for Mtld3dConfig {
         Self {
             caps_all: false,
             main_thread_checker: false,
+            fail_next_submit: false,
             expand_packed16: false,
             deny_float32_filtering: false,
             managed_memory: false,
@@ -479,6 +488,10 @@ pub fn log_options(cfg: &Mtld3dConfig) {
     info!(
         target: crate::LOG_TARGET,
         "config: debug.mainThreadChecker = {}", cfg.main_thread_checker
+    );
+    info!(
+        target: crate::LOG_TARGET,
+        "config: debug.failNextSubmit = {}", cfg.fail_next_submit
     );
     info!(
         target: crate::LOG_TARGET,
@@ -617,6 +630,7 @@ fn apply(cfg: &mut Mtld3dConfig, source: &str, key: &str, value: &str) {
         "debug.mainThreadChecker" => {
             assign_bool(source, key, value, &mut cfg.main_thread_checker);
         }
+        "debug.failNextSubmit" => assign_bool(source, key, value, &mut cfg.fail_next_submit),
         "intel.expandPacked16" => assign_bool(source, key, value, &mut cfg.expand_packed16),
         "intel.denyFloat32Filtering" => {
             assign_bool(source, key, value, &mut cfg.deny_float32_filtering);

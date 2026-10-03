@@ -214,8 +214,10 @@ unless its entry says otherwise.
   could not grow latches `E_OUTOFMEMORY` instead. Every later call that
   reports device state, `TestCooperativeLevel` and `Reset` included,
   returns the latched code until the device is released, and the log names
-  the step that failed first. There is no recovery short of creating a new
-  device.
+  the step that failed first. A failed device drops its open frame at each
+  `Present`, and its final `Release` destroys the render targets and depth
+  surfaces released after the failure. There is no recovery short of
+  creating a new device.
 - Software paths: no reference rasterizer, no software vertex processing, no
   `RegisterSoftwareDevice`; the default Metal device is the only adapter.
 - Legacy remnants: N-patch and RT-patch tessellation, vertex tweening,

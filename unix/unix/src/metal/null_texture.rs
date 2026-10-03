@@ -14,8 +14,10 @@ use std::sync::OnceLock;
 use mtld3d_shared::{MetalHandle, NullTextureKind, mtl_handle::MTLSamplerStateKind};
 use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_metal::{
-    MTLDevice, MTLOrigin, MTLPixelFormat, MTLRegion, MTLResource, MTLSamplerDescriptor,
-    MTLSamplerState, MTLSize, MTLTexture, MTLTextureDescriptor, MTLTextureType, MTLTextureUsage,
+    MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLDevice, MTLLoadAction, MTLOrigin,
+    MTLPixelFormat, MTLRegion, MTLRenderPassDescriptor, MTLResource, MTLSamplerDescriptor,
+    MTLSamplerState, MTLSize, MTLStorageMode, MTLStoreAction, MTLTexture, MTLTextureDescriptor,
+    MTLTextureType, MTLTextureUsage,
 };
 
 use crate::{
@@ -23,7 +25,7 @@ use crate::{
     metal::{device::cpu_written_texture_storage, handle::BorrowRetained},
 };
 
-/// Handles to the three opaque-black textures and their default sampler.
+/// Handles to the four fallback textures and their default sampler.
 ///
 /// Raw pointers (`Retained::into_raw`) so the set is `Copy`/`Send`/`Sync` and
 /// caches in a `OnceLock`; the objects leak for the process lifetime, which is
@@ -33,6 +35,11 @@ pub struct NullTextures {
     texture_2d: u64,
     texture_cube: u64,
     texture_3d: u64,
+    /// `None` when the depth fallback could not be made or cleared.
+    ///
+    /// Only that fallback is lost: a `Depth2D` request then takes the 2D
+    /// colour texture, the binding a depth slot got before it existed.
+    depth_2d: Option<u64>,
     sampler: u64,
 }
 
@@ -44,6 +51,10 @@ impl NullTextures {
             NullTextureKind::Texture2D => self.texture_2d,
             NullTextureKind::TextureCube => self.texture_cube,
             NullTextureKind::Texture3D => self.texture_3d,
+            NullTextureKind::Depth2D => match self.depth_2d {
+                Some(depth) => depth,
+                None => self.texture_2d,
+            },
         }
     }
 
@@ -97,6 +108,9 @@ fn create(device: &ProtocolObject<dyn MTLDevice>) -> Option<NullTextures> {
     let texture_2d = make_black_texture(device, MTLTextureType::Type2D, 1)?;
     let texture_cube = make_black_texture(device, MTLTextureType::TypeCube, 6)?;
     let texture_3d = make_black_texture(device, MTLTextureType::Type3D, 1)?;
+    // The depth fallback is optional: a device that cannot make or clear it
+    // keeps the colour fallbacks and the default sampler.
+    let depth_2d = make_zero_depth_texture(device);
 
     let sampler_desc = MTLSamplerDescriptor::new();
     let Some(sampler) = device.newSamplerStateWithDescriptor(&sampler_desc) else {
@@ -111,6 +125,7 @@ fn create(device: &ProtocolObject<dyn MTLDevice>) -> Option<NullTextures> {
         texture_2d: Retained::into_raw(texture_2d) as u64,
         texture_cube: Retained::into_raw(texture_cube) as u64,
         texture_3d: Retained::into_raw(texture_3d) as u64,
+        depth_2d: depth_2d.map(|depth| Retained::into_raw(depth) as u64),
         sampler: Retained::into_raw(sampler) as u64,
     })
 }
@@ -168,6 +183,69 @@ fn make_black_texture(
                 region, 0, slice, black_ptr, 4, 4,
             );
         }
+    }
+    Some(texture)
+}
+
+/// A 1x1 `Depth32Float` texture holding depth zero, for a `depth2d<float>` slot.
+///
+/// A depth texture's storage is private to the GPU, so it is cleared by a
+/// one-off render pass on a queue of its own, waited for once: a raw read of
+/// it returns zero and a comparison against it fails for every reference
+/// above zero, so it samples as black like the colour fallbacks.
+fn make_zero_depth_texture(
+    device: &ProtocolObject<dyn MTLDevice>,
+) -> Option<Retained<ProtocolObject<dyn MTLTexture>>> {
+    let desc = MTLTextureDescriptor::new();
+    desc.setTextureType(MTLTextureType::Type2D);
+    desc.setPixelFormat(MTLPixelFormat::Depth32Float);
+    // SAFETY: plain property setter on a fresh descriptor.
+    unsafe { desc.setWidth(1) };
+    // SAFETY: plain property setter on a fresh descriptor.
+    unsafe { desc.setHeight(1) };
+    desc.setUsage(MTLTextureUsage::ShaderRead | MTLTextureUsage::RenderTarget);
+    desc.setStorageMode(MTLStorageMode::Private);
+    let Some(texture) = device.newTextureWithDescriptor(&desc) else {
+        mtld3d_shared::log_once_warn!(
+            target: LOG_TARGET,
+            "null texture: the 1x1 depth texture could not be created; a depth slot whose \
+             texture is missing binds the 2D black texture instead"
+        );
+        return None;
+    };
+    texture.setLabel(Some(&objc2_foundation::NSString::from_str(
+        "mtld3d-null-depth",
+    )));
+    let cleared = device.newCommandQueue().and_then(|queue| {
+        queue.setLabel(Some(&objc2_foundation::NSString::from_str(
+            "mtld3d-null-depth-clear",
+        )));
+        let cmd_buf = queue.commandBuffer()?;
+        cmd_buf.setLabel(Some(&objc2_foundation::NSString::from_str(
+            "mtld3d-null-depth-clear",
+        )));
+        let pass_desc = MTLRenderPassDescriptor::new();
+        let depth = pass_desc.depthAttachment();
+        depth.setTexture(Some(&texture));
+        depth.setLoadAction(MTLLoadAction::Clear);
+        depth.setClearDepth(0.0);
+        depth.setStoreAction(MTLStoreAction::Store);
+        let encoder = cmd_buf.renderCommandEncoderWithDescriptor(&pass_desc)?;
+        encoder.setLabel(Some(&objc2_foundation::NSString::from_str(
+            "mtld3d-null-depth-clear",
+        )));
+        encoder.endEncoding();
+        cmd_buf.commit();
+        cmd_buf.waitUntilCompleted();
+        Some(())
+    });
+    if cleared.is_none() {
+        mtld3d_shared::log_once_warn!(
+            target: LOG_TARGET,
+            "null texture: the 1x1 depth texture could not be cleared; a depth slot whose \
+             texture is missing binds the 2D black texture instead"
+        );
+        return None;
     }
     Some(texture)
 }

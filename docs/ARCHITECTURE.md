@@ -280,6 +280,16 @@ box, and a texture detached from its device drops its staging instead of
 parking it. The textures `pool` row of the `PERF=1` summary counts the lane's
 hits and misses.
 
+Page allocation is infallible: a box the allocator refuses ends the process,
+because past creation there is nothing to give back that the retention cap and
+the pool have not already bounded. The one exception is the system-memory copy
+a resource gets when it is created, the staging of a texture, cube, volume,
+dynamic depth texture, lockable render target or system-memory offscreen plain,
+and the backing of a vertex or index buffer: that allocation is fallible, and a
+create whose copy cannot be allocated answers `E_OUTOFMEMORY` with no object,
+as D3D9 does. A rename, a re-created staging, a read-back page and every other
+later allocation keep the infallible contract.
+
 Metal documents that one queue executes its buffers in commit order, and consecutive
 buffers may overlap on the GPU; it documents nothing about the order their completions are
 reported in. So no counter may stand for a buffer that has not itself ended. Each

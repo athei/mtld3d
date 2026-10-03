@@ -136,6 +136,11 @@ pub enum NullTextureKind {
     TextureCube = 1,
     /// `texture3d<float>` — a `dcl_volume` sampler.
     Texture3D = 2,
+    /// `depth2d<float>`: a depth texture's slot whose own Metal texture is missing.
+    ///
+    /// The slot is sampled with a comparison or read raw, and either way
+    /// declared `depth2d`.
+    Depth2D = 3,
 }
 
 /// Fixed-size command struct written by the native encoder and read by the submit thread.
