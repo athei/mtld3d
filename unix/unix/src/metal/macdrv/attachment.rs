@@ -447,17 +447,12 @@ fn is_live(map: &FxHashMap<usize, Arc<Attachment>>, att: &Arc<Attachment>) -> bo
 
 /// Create the record for a freshly attached view and make it live.
 ///
-/// A view address that is already registered names a record whose teardown
-/// never ran; the new record replaces it so the live device wins.
+/// Attach unregisters a record whose teardown never ran before it registers
+/// the view again, giving back what that record held, so the insert here
+/// replaces nothing.
 pub fn register(view: usize, layer: usize, latches: &AttachLatches) -> Arc<Attachment> {
     let att = Arc::new(Attachment::new(view, layer, latches));
-    if lock().insert(view, Arc::clone(&att)).is_some() {
-        mtld3d_shared::log_once_warn!(
-            target: crate::LOG_TARGET,
-            "present: view {view:#x} attached twice without a teardown between; \\
-             the earlier record is dropped",
-        );
-    }
+    lock().insert(view, Arc::clone(&att));
     att
 }
 

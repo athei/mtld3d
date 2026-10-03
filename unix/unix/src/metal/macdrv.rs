@@ -1011,20 +1011,34 @@ pub fn attach_metal_layer(
     // neither gets a view from Wine.
     let kept = kept_metal_view(&funcs, hwnd);
     let hosted = matches!(kept, Some(KeptView::Hosted { .. }));
-    let (view, layer) = match kept {
-        Some(KeptView::Hosted { view, layer }) => (view as *mut c_void, layer as *mut c_void),
+    let surface_calls = client_surface::SurfaceCalls::load();
+    // A view that went through `get_win_data` comes back with its client
+    // surface already retained, under the window data lock that keeps the
+    // surface alive; a hosted view's is read and retained below.
+    let (view, layer, retained) = match kept {
+        Some(KeptView::Hosted { view, layer }) => (view as *mut c_void, layer as *mut c_void, None),
         Some(KeptView::Orphan {
             view,
             layer,
             from_hwnd,
-        }) => adopt_metal_view(&funcs, hwnd, device_handle, view, layer, from_hwnd)?,
-        None => create_metal_view(&funcs, hwnd, device_handle)?,
+        }) => adopt_metal_view(
+            &funcs,
+            hwnd,
+            device_handle,
+            &KeptLayer {
+                view,
+                layer,
+                from_hwnd,
+            },
+            surface_calls.as_ref(),
+        )?,
+        None => create_metal_view(&funcs, hwnd, device_handle, surface_calls.as_ref())?,
     };
     // AppKit owns the view's window and screen relationships on the main
     // thread; the view is retained for as long as the device holds it. The
     // same hop takes the layer off winemac's `nextDrawable` override, which
-    // walks the view from the presenter thread, and reads the client
-    // surface the override would have presented.
+    // walks the view from the presenter thread, and reads a hosted view's
+    // client surface, which the override would have presented.
     let mut hint = None;
     let mut layer_class = client_surface::LayerClass::Plain;
     let mut surface = 0;
@@ -1032,13 +1046,16 @@ pub fn attach_metal_layer(
         let mtm = objc2::MainThreadMarker::new().expect("display lookup runs on the main thread");
         hint = Some(view_display_caps(view, mtm));
         layer_class = client_surface::bypass_present_hook(layer, mtm);
-        surface = client_surface::client_surface_of(view, mtm);
+        if retained.is_none() {
+            surface = client_surface::client_surface_of(view, mtm);
+        }
     });
     let hint = hint.expect("synchronous display lookup completed");
-    let surface_calls = client_surface::SurfaceCalls::load();
-    let surface = surface_calls
-        .as_ref()
-        .map_or(0, |calls| calls.retain(surface));
+    let surface = retained.unwrap_or_else(|| {
+        surface_calls
+            .as_ref()
+            .map_or(0, |calls| calls.retain(surface))
+    });
     info!(
         target: LOG_TARGET,
         "present: layer {:#x} of view {:#x} presents through CAMetalLayer ({layer_class:?}); \
@@ -1166,14 +1183,44 @@ fn create_metal_view(
     funcs: &MacdrvFuncs,
     hwnd: u64,
     device_handle: MetalHandle<MTLDeviceKind>,
-) -> Option<(*mut c_void, *mut c_void)> {
+    calls: Option<&client_surface::SurfaceCalls>,
+) -> Option<(*mut c_void, *mut c_void, Option<usize>)> {
     let win_data = get_win_data(funcs, hwnd)?;
     // SAFETY: `win_data` is the live record `get_win_data` handed back,
     // valid until `release_win_data`.
     let client_view = unsafe { (*win_data).client_cocoa_view };
-    let result = wine_metal_view(funcs, client_view, device_handle);
+    let result = wine_metal_view(funcs, client_view, device_handle)
+        .map(|(view, layer)| (view, layer, Some(retain_client_surface(client_view, calls))));
     release_win_data(funcs, win_data);
     result
+}
+
+/// Read and retain the client surface `client_view` shows, `0` when there is none.
+///
+/// Called while the caller holds the window data `get_win_data` locked: the
+/// window's data holds Wine's own reference on the surface, and the one
+/// place that drops it, the driver's `DestroyWindow`, takes that lock first,
+/// so the surface stays alive from the read to the reference taken here.
+/// The reference is taken on the calling thread, a Wine thread; the surface
+/// is presented only after the lock is released, since presenting takes
+/// win32u's surface lock and then the window data, the order a concurrent
+/// `detach_client_surfaces` already holds the first of.
+fn retain_client_surface(
+    client_view: *mut c_void,
+    calls: Option<&client_surface::SurfaceCalls>,
+) -> usize {
+    let Some(calls) = calls else {
+        return 0;
+    };
+    if client_view.is_null() {
+        return 0;
+    }
+    let mut surface = 0;
+    run_on_main_thread_sync(|| {
+        let mtm = MainThreadMarker::new().expect("the client surface is read on the main thread");
+        surface = client_surface::client_view_surface(client_view, mtm);
+    });
+    calls.retain(surface)
 }
 
 /// Move a kept view, `layer` and all, into `hwnd`'s window for the device attaching there.
@@ -1193,10 +1240,14 @@ fn adopt_metal_view(
     funcs: &MacdrvFuncs,
     hwnd: u64,
     device_handle: MetalHandle<MTLDeviceKind>,
-    view: usize,
-    layer: usize,
-    from_hwnd: u64,
-) -> Option<(*mut c_void, *mut c_void)> {
+    kept: &KeptLayer,
+    calls: Option<&client_surface::SurfaceCalls>,
+) -> Option<(*mut c_void, *mut c_void, Option<usize>)> {
+    let &KeptLayer {
+        view,
+        layer,
+        from_hwnd,
+    } = kept;
     let Some(win_data) = get_win_data(funcs, hwnd) else {
         release_metal_view(view);
         return None;
@@ -1248,7 +1299,8 @@ fn adopt_metal_view(
         } else {
             wine_metal_view(funcs, client_view, device_handle)
         }
-    };
+    }
+    .map(|(view, layer)| (view, layer, Some(retain_client_surface(client_view, calls))));
     release_win_data(funcs, win_data);
     result
 }
@@ -1387,6 +1439,13 @@ fn wine_metal_view(
         return None;
     }
     Some((view, layer))
+}
+
+/// A kept view and its layer moving from the window `from_hwnd` into another.
+struct KeptLayer {
+    view: usize,
+    layer: usize,
+    from_hwnd: u64,
 }
 
 /// What the park holds for a device attaching to a window, owned by the caller from here on.

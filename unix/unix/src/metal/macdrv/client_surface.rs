@@ -105,6 +105,23 @@ pub fn client_surface_of(view: *mut c_void, _mtm: MainThreadMarker) -> usize {
     surface_field(object, host)
 }
 
+/// The client surface the client view `client_view` shows, `0` when none. **Main thread only.**
+///
+/// `client_view` is the cocoa view of a client surface Wine created, read
+/// from a `get_win_data` record the caller still holds.
+pub fn client_view_surface(client_view: *mut c_void, _mtm: MainThreadMarker) -> usize {
+    let Some(host) = AnyClass::get(CLIENT_VIEW_CLASS) else {
+        return 0;
+    };
+    // SAFETY: `client_view` is the cocoa view of the `get_win_data` record
+    // the caller holds, which keeps the view in its window until released;
+    // the retain covers the read.
+    let Some(client_view) = (unsafe { Retained::retain(client_view.cast::<AnyObject>()) }) else {
+        return 0;
+    };
+    surface_field(&client_view, host)
+}
+
 /// win32u's client surface reference and present calls, resolved together.
 ///
 /// Resolved before any lock is taken, so a caller that takes a reference
@@ -130,15 +147,18 @@ impl SurfaceCalls {
     pub fn retain(&self, surface: usize) -> usize {
         if surface != 0 {
             // SAFETY: `surface` is one a live attachment record holds a
-            // reference on, or one attach read from the field of its view's
-            // cocoa view on the main thread just before. Wine holds the
-            // reference keeping the latter alive in the window's data and
-            // drops it only when the window is destroyed, which the window's
-            // owner thread does; nothing Wine exports lets this thread hold it
-            // across the read. So the precondition is the D3D9 one that the
-            // device window stays valid for the `CreateDevice` or `Reset` that
-            // attaches to it: a window its owner destroys while another
-            // thread attaches a device to it can free the surface first.
+            // reference on, or one attach read from a client view's field on
+            // the main thread just before. Wine's own reference on the latter
+            // is held by the window's data and dropped only by the driver's
+            // `DestroyWindow`, which takes the window data lock first. A view
+            // created or moved in through `get_win_data` is retained while
+            // the caller holds that lock, so the surface is alive. A kept
+            // view reused in place goes through no `get_win_data`, which
+            // would create and show a client surface of its own, so there the
+            // precondition is the D3D9 one that the device window stays valid
+            // for the `CreateDevice` or `Reset` that attaches to it: a window
+            // its owner destroys while another thread attaches a device to it
+            // can free that surface between the read and this reference.
             unsafe { (self.add_ref)(surface as *mut c_void) };
         }
         surface
