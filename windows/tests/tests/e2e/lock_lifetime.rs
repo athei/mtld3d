@@ -9,13 +9,16 @@
 
 use mtld3d_tests::{Harness, TexturedVertex, Vertex, assert_pixel_eq};
 use mtld3d_types::{
-    D3D_OK, D3DERR_INVALIDCALL, D3DFMT_A8R8G8B8, D3DFMT_INDEX16, D3DFMT_R8G8B8, D3DFVF_DIFFUSE,
-    D3DFVF_TEX1, D3DFVF_XYZ, D3DLOCK_READONLY, D3DPOOL_DEFAULT, D3DPOOL_MANAGED, D3DPOOL_SYSTEMMEM,
-    D3DPT_TRIANGLELIST, D3DRS_LIGHTING, D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_MAGFILTER,
-    D3DSAMP_MINFILTER, D3DTADDRESS_CLAMP, D3DTEXF_POINT, D3DUSAGE_WRITEONLY,
+    D3D_OK, D3DERR_DEVICELOST, D3DERR_INVALIDCALL, D3DFMT_A8R8G8B8, D3DFMT_INDEX16, D3DFMT_R8G8B8,
+    D3DFVF_DIFFUSE, D3DFVF_TEX1, D3DFVF_XYZ, D3DLOCK_READONLY, D3DPOOL_DEFAULT, D3DPOOL_MANAGED,
+    D3DPOOL_SYSTEMMEM, D3DPT_TRIANGLELIST, D3DRS_LIGHTING, D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV,
+    D3DSAMP_MAGFILTER, D3DSAMP_MINFILTER, D3DTADDRESS_CLAMP, D3DTEXF_POINT, D3DUSAGE_WRITEONLY,
 };
 
+use super::device::{await_logged_lines, run_in_private_log_child, running_as};
+
 const FVF: u32 = D3DFVF_XYZ | D3DFVF_DIFFUSE;
+const FAILED_DEVICE_CHILD_NAME: &str = "lock_lifetime_failed_device.exe";
 const BLACK: u32 = 0xFF00_0000;
 const BLUE: u32 = 0xFF00_00FF;
 const GREEN: u32 = 0xFF00_FF00;
@@ -415,4 +418,66 @@ fn creates_whose_staging_cannot_be_allocated_answer_out_of_memory() {
         );
     });
     assert_pixel_eq(h.read_pixel(320, 280), GREEN, "the device still draws");
+}
+
+/// A render target released after the device failed is destroyed with the device.
+///
+/// `debug.failNextSubmit` refuses the first frame the way a Metal rejection
+/// does, so the device latches `D3DERR_DEVICELOST` and sends no frame again.
+/// A retire recorded into a frame then never reaches the encoder that
+/// destroys the target's Metal texture; the final `Release` destroys it
+/// instead and logs the count. Runs in a process of its own so the log it
+/// reads is its device's alone.
+#[test]
+fn a_target_released_after_the_device_failed_is_destroyed_with_the_device() {
+    if running_as(FAILED_DEVICE_CHILD_NAME) {
+        failed_device_workload();
+        return;
+    }
+    run_in_private_log_child(
+        FAILED_DEVICE_CHILD_NAME,
+        "lock_lifetime::a_target_released_after_the_device_failed_is_destroyed_with_the_device",
+        "warn,mtld3d::d3d9=info",
+    );
+}
+
+/// Fail the device, release two targets, then the device, and read the count it destroyed.
+fn failed_device_workload() {
+    let h = Harness::with_config("debug.failNextSubmit=true");
+    let first = h.create_render_target(64, 64, D3DFMT_A8R8G8B8);
+    let second = h.create_render_target(32, 32, D3DFMT_A8R8G8B8);
+    assert_eq!(
+        h.present(),
+        D3DERR_DEVICELOST,
+        "the first submission is refused"
+    );
+    assert_eq!(
+        h.test_cooperative_level(),
+        D3DERR_DEVICELOST,
+        "the failure is latched"
+    );
+    drop(first);
+    drop(second);
+    assert_eq!(
+        h.present(),
+        D3DERR_DEVICELOST,
+        "a failed device presents nothing"
+    );
+    assert_eq!(h.release_device(), 0, "the final Release");
+    let lines = await_logged_lines(
+        "Metal textures of targets released after the device failed",
+        1,
+    );
+    let destroyed: usize = lines[0]
+        .split("destroyed ")
+        .nth(1)
+        .and_then(|rest| rest.split(' ').next())
+        .and_then(|count| count.parse().ok())
+        .expect("the line names a count");
+    // Each target carries its colour texture and, for a format with an sRGB
+    // twin, the twin view taken of it.
+    assert!(
+        destroyed >= 2,
+        "both targets' textures are destroyed with the device: {lines:?}"
+    );
 }

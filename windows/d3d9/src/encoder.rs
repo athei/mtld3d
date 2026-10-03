@@ -5,7 +5,7 @@
 
 use std::sync::{
     Arc, Mutex, MutexGuard,
-    atomic::{AtomicI32, AtomicU32, AtomicU64},
+    atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering},
 };
 
 pub use mtld3d_core::encoder_data::{
@@ -92,6 +92,8 @@ pub struct EncoderThread {
     completions: CompletionPool,
     /// Submitted packets, their handed-over leases and recovered recording storage.
     retirement: Mutex<PacketRetirement>,
+    /// `debug.failNextSubmit`, armed until the first submission it refuses.
+    fail_next_submit: AtomicBool,
 }
 
 impl EncoderThread {
@@ -157,6 +159,7 @@ impl EncoderThread {
             native_failure,
             completions: CompletionPool::new(),
             retirement: Mutex::default(),
+            fail_next_submit: AtomicBool::new(config.fail_next_submit),
         })
     }
 
@@ -279,6 +282,9 @@ impl EncoderThread {
             self.retain_failed(packet);
             return Err(failure);
         }
+        if self.fail_next_submit.load(Ordering::Relaxed) {
+            return Err(self.refuse_for_test(packet));
+        }
         let mut params = SubmitEncoderFrameParams {
             runtime: self.runtime,
             metadata_ptr: packet.metadata_bytes().as_ptr() as u64,
@@ -314,6 +320,22 @@ impl EncoderThread {
         // the next frame's pass.
         self.retain_submitted(packet, mode != EncoderSubmitMode::Queue);
         self.status()
+    }
+
+    /// Refuse `packet` the way a native rejection would, for `debug.failNextSubmit`.
+    ///
+    /// Out of line and cold: the key is a test seam, armed only in the
+    /// suite, and the submission path pays one relaxed load for it.
+    #[cold]
+    #[inline(never)]
+    fn refuse_for_test(&self, packet: FramePacket) -> i32 {
+        self.fail_next_submit.store(false, Ordering::Relaxed);
+        log::error!(target: LOG_TARGET, "encoder: debug.failNextSubmit refused the frame submission");
+        self.retain_failed(packet);
+        self.record_failure(
+            D3DERR_DEVICELOST,
+            "debug.failNextSubmit refused the submission",
+        )
     }
 
     pub fn send_frame(&self, frame: FrameData) -> Result<(), i32> {

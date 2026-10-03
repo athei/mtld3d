@@ -1690,7 +1690,7 @@ unsafe fn finalize_surface(this: *mut Direct3DSurface9) {
         );
         // SAFETY: a standalone surface forwards a device reference for its
         // public lifetime, so the device outlives this finalize.
-        unsafe { &mut *inner.device_inner }.push_control(crate::device::RetireColorOp { retired });
+        unsafe { &mut *inner.device_inner }.retire_color_target(retired);
     }
     // A standalone depth-stencil target owns its Metal depth texture the same
     // way, and retires it the same way. The implicit auto depth-stencil
@@ -1713,7 +1713,7 @@ unsafe fn finalize_surface(this: *mut Direct3DSurface9) {
         );
         // SAFETY: a standalone surface forwards a device reference for its
         // public lifetime, so the device outlives this finalize.
-        unsafe { &mut *inner.device_inner }.push_control(crate::device::RetireDepthOp { depth });
+        unsafe { &mut *inner.device_inner }.retire_depth_target(depth);
     }
     // A texture shell has nothing of the texture to give back here. The
     // reference `GetSurfaceLevel` / `GetCubeMapSurface` took on it is dropped by

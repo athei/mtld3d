@@ -723,6 +723,14 @@ pub struct DeviceInner {
     /// the frame it hands over, under this device's own lock. A leaf mutex
     /// like `live_textures`.
     departed_textures: DepartedTextures,
+    /// Metal textures of standalone targets released after the device failed.
+    ///
+    /// A device whose failure is latched sends no frame again, so a retire
+    /// operation recorded then would never reach the encoder that destroys
+    /// the texture. The handles wait here instead, sRGB twins ahead of the
+    /// texture each holds a retain on, and the final `Release` destroys them
+    /// once the encoder's shutdown has waited for the GPU.
+    retired_while_failed: Vec<u64>,
     /// What the encoder made of each upload, waiting to be acted on.
     ///
     /// The bind-time flush clears a level's dirty bit and takes its pending
@@ -1782,6 +1790,20 @@ impl DeviceInner {
         }
     }
 
+    /// Drop what the open frame recorded on a device that can no longer send a frame.
+    ///
+    /// A failed device keeps recording, uploads included, and nothing would
+    /// ever take the frame off it, so each `Present` starts it again from the
+    /// saved bindings instead of letting it grow for as long as the
+    /// application runs. Nothing in it can reach the GPU: the encoder refuses
+    /// every frame of a failed device.
+    #[cold]
+    fn discard_unsendable_frame(&mut self) {
+        let fresh = self.fresh_frame();
+        drop(core::mem::replace(&mut self.current_frame, fresh));
+        self.reassert_saved_bindings();
+    }
+
     /// Submit the current frame's accumulated ops synchronously.
     ///
     /// Then continue with a fresh empty frame. Used by `LockRect` on the
@@ -1982,6 +2004,7 @@ impl DeviceInner {
     /// the encoder's next summary can read it.
     pub fn present(&mut self) -> i32 {
         if let Err(hr) = self.encoder.status() {
+            self.discard_unsendable_frame();
             return hr;
         }
         // Both `IDirect3DDevice9::Present` and the swap chain's land here, so
@@ -2222,6 +2245,44 @@ impl DeviceInner {
     /// [`mtld3d_core::departed_textures`].
     pub fn note_departed_texture(&self, id: TextureId) {
         self.departed_textures.note(id);
+    }
+
+    /// Retire a standalone colour target's Metal textures.
+    ///
+    /// The encoder destroys them once the GPU is past every pass that names
+    /// them. A device whose failure is latched sends no frame again, so the
+    /// final `Release` destroys them instead (see `retired_while_failed`).
+    pub fn retire_color_target(&mut self, retired: crate::encoder::RetiredColorTarget) {
+        if self.encoder.status().is_ok() {
+            self.push_control(crate::device::RetireColorOp { retired });
+            return;
+        }
+        self.keep_retired_while_failed(&[
+            retired.srgb,
+            retired.base,
+            retired.msaa_srgb,
+            retired.msaa,
+        ]);
+    }
+
+    /// Retire a standalone depth-stencil target's Metal texture, as [`Self::retire_color_target`].
+    pub fn retire_depth_target(&mut self, depth: MetalHandle<MTLTextureKind>) {
+        if self.encoder.status().is_ok() {
+            self.push_control(crate::device::RetireDepthOp { depth });
+            return;
+        }
+        self.keep_retired_while_failed(&[depth]);
+    }
+
+    /// File the non-null `handles` for the final `Release` to destroy.
+    #[cold]
+    fn keep_retired_while_failed(&mut self, handles: &[MetalHandle<MTLTextureKind>]) {
+        self.retired_while_failed.extend(
+            handles
+                .iter()
+                .filter(|handle| !handle.is_null())
+                .map(|handle| handle.raw()),
+        );
     }
 
     /// Keep the storage of a texture that moved back before its departure was drained.
@@ -3283,6 +3344,7 @@ impl Direct3DDevice9 {
             last_depth_binding: None,
             live_textures: Mutex::new(rustc_hash::FxHashMap::default()),
             departed_textures: DepartedTextures::default(),
+            retired_while_failed: Vec::new(),
             upload_redirty: Arc::new(RedirtyQueue::new()),
             snapshot_dirty: SnapshotDirty::all(),
             snapshot_cache: ApiSnapshotCache::EMPTY,
@@ -4037,6 +4099,23 @@ extern "system" fn device_release(this: *mut c_void) -> u32 {
             return rc;
         }
 
+        // Targets released after the device failed never reached the encoder,
+        // and the shutdown above has waited for every pass that named them.
+        let retired_while_failed = core::mem::take(&mut device_inner.retired_while_failed);
+        if !retired_while_failed.is_empty() {
+            let mut destroy = mtld3d_shared::DestroyResourcesBulkParams {
+                kind: mtld3d_shared::mtl::DestroyKind::Texture,
+                pad0: 0,
+                handles_ptr: retired_while_failed.as_ptr() as u64,
+                count: u32::try_from(retired_while_failed.len())
+                    .expect("a device's released targets fit u32"),
+                pad1: 0,
+            };
+            unix_call(&mut destroy);
+            info!(target: LOG_TARGET,
+                "device release: destroyed {} Metal textures of targets released after the \
+                 device failed", retired_while_failed.len());
+        }
         if !implicit_handles.is_empty() {
             let mut destroy = mtld3d_shared::DestroyResourcesBulkParams {
                 kind: mtld3d_shared::mtl::DestroyKind::Texture,

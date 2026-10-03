@@ -20,6 +20,7 @@ impl WireValue for Mtld3dConfig {
     fn write_wire(&self, writer: &mut WireWriter<'_>) -> Result<(), WireError> {
         self.caps_all.write_wire(writer)?;
         self.main_thread_checker.write_wire(writer)?;
+        self.fail_next_submit.write_wire(writer)?;
         self.expand_packed16.write_wire(writer)?;
         self.deny_float32_filtering.write_wire(writer)?;
         self.managed_memory.write_wire(writer)?;
@@ -54,6 +55,7 @@ impl WireValue for Mtld3dConfig {
         Ok(Self {
             caps_all: <bool>::read_wire(reader)?,
             main_thread_checker: <bool>::read_wire(reader)?,
+            fail_next_submit: <bool>::read_wire(reader)?,
             expand_packed16: <bool>::read_wire(reader)?,
             deny_float32_filtering: <bool>::read_wire(reader)?,
             managed_memory: <bool>::read_wire(reader)?,
