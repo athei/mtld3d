@@ -734,21 +734,39 @@ fn flush_wait_workload() {
     drop(reader);
     drop(control);
 
+    // A device's last retire lines can land after it is gone, so the counts
+    // are compared once both queues have retired the four frames each device
+    // submits (two Presents, the read of the unsent END, the release's flush)
+    // and a quiet second has passed with no further line.
+    const EXPECTED: usize = 4;
+    const QUIET: std::time::Duration = std::time::Duration::from_secs(1);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    loop {
-        let per_queue = retired_frame_buffers();
-        let counts: Vec<usize> = per_queue.values().map(BTreeSet::len).collect();
-        let settled = counts.len() == 2 && counts.iter().all(|&n| n >= 3) && counts[0] == counts[1];
-        if settled {
-            break;
+    let mut last: Vec<usize> = Vec::new();
+    let mut since = std::time::Instant::now();
+    let counts = loop {
+        let counts: Vec<usize> = retired_frame_buffers()
+            .values()
+            .map(BTreeSet::len)
+            .collect();
+        if counts != last {
+            last.clone_from(&counts);
+            since = std::time::Instant::now();
+        }
+        let complete = counts.len() == 2 && counts.iter().all(|&n| n >= EXPECTED);
+        if complete && since.elapsed() >= QUIET {
+            break counts;
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "both devices retire as many frame command buffers, at least three each \
-             (the read of a sent END submits nothing): {counts:?}"
+            "both devices retire at least {EXPECTED} frame command buffers: {counts:?}"
         );
-        std::thread::yield_now();
-    }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    assert_eq!(
+        counts[0], counts[1],
+        "both devices retire as many frame command buffers: the read of a sent END \
+         submits nothing"
+    );
 }
 
 /// The frame command buffers this process's log saw retire, as sequence numbers per queue.

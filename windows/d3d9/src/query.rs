@@ -558,11 +558,19 @@ extern "system" fn query_get_data(
                                 let _wait = mtld3d_core::perf::CycleAddTimer::start(
                                     dev.perf_mut().query_wait_cycles_ptr(),
                                 );
-                                if mtld3d_core::query_fence::end_in_recording_frame(
+                                // Either way the wait queues behind submits
+                                // that may be waiting on the display, so they
+                                // are hurried first; the blocking flush does
+                                // that itself.
+                                let ready = if mtld3d_core::query_fence::end_in_recording_frame(
                                     end_seq,
                                     dev.current_seq(),
-                                ) && let Err(hr) = dev.flush_current_frame_blocking()
-                                {
+                                ) {
+                                    dev.flush_current_frame_blocking()
+                                } else {
+                                    dev.hurry_presentation()
+                                };
+                                if let Err(hr) = ready {
                                     return hr;
                                 }
                                 if let Err(hr) = dev.encoder_intake_visibility_for(end_seq) {

@@ -1829,7 +1829,7 @@ impl DeviceInner {
     /// puts the policy back once its own submission has committed. The one
     /// thunk this side issues off the device lifecycle, and only on a path
     /// that is already a synchronous read-back.
-    fn hurry_presentation(&self) -> Result<(), i32> {
+    pub fn hurry_presentation(&self) -> Result<(), i32> {
         if self.record_handle.is_null() {
             return Ok(());
         }

@@ -65,8 +65,8 @@ pub enum QueryStatus {
 /// What an `Issue(D3DISSUE_END)` without `D3DISSUE_BEGIN` does to an occlusion query.
 ///
 /// Only an open span has anything to close. An END on a query that was never
-/// begun opens and closes an empty span, so the query answers with the zero
-/// its no draws counted. An END on a span already closed changes nothing, so
+/// begun opens and closes an empty span, so the query answers 0, since no
+/// draw is inside it. An END on a span already closed changes nothing, so
 /// the query keeps the result of the span the first END closed.
 #[derive(Debug, PartialEq, Eq)]
 pub enum EndIssue {
