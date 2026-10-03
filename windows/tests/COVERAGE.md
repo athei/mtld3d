@@ -39,7 +39,9 @@ off), `buffer.ignoreLockBounds` in `buffers.rs`, `depth.aliasSameSize` in
 `intel.linearAlign256` in `non_uma.rs`, `render.scale` in `render_scale.rs` and
 `implicit_surface.rs`, for the quantities that convert between the reported and
 rasterized spaces instead of staying in one of them, `cursor.software` in
-`device.rs`, `debug.presentGateFile` in `present_split.rs`, `debug.presentOccluded` in `device.rs` and `present_split.rs` (each on a workload child of its own, which counts the drawables it acquires), and
+`device.rs`, `debug.presentGateFile` in `present_split.rs`,
+`debug.presentOccluded` in `device.rs` and `present_split.rs` (each in a
+workload child of its own, which counts the drawables it acquires), and
 `query.flushImmediate` and `query.eventImmediate` in `query.rs`, each on both
 of its values: the occlusion counting cases pin `query.flushImmediate` false so
 they read the count rather than the permissive stub the fence reading of a

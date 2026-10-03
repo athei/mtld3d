@@ -2628,11 +2628,17 @@ fn natural_drawable_size(layer: &objc2_quartz_core::CAMetalLayer) -> (u32, u32) 
 /// The presenter calls this on its own thread. It touches the layer alone,
 /// never the view it backs: `drawableSize` is `CAMetalLayer`'s own and asks
 /// the view for no action, unlike an animatable property, so the write needs
-/// no main-thread hop. Reading `bounds`/`contentsScale` off the main thread
-/// races an in-flight `AppKit` resize; the cost of losing that race is one
-/// frame at the previous size, corrected on the next present.
+/// no main-thread hop. A layer write off the main thread would open an
+/// implicit transaction there, and the presenter thread has no run loop to
+/// commit one, so the write rides an explicit transaction of its own,
+/// committed at once with actions off; only a resize pays for it, since the
+/// compare before it returns first on every other present. Reading
+/// `bounds`/`contentsScale` off the main thread races an in-flight `AppKit`
+/// resize; the cost of losing that race is one frame at the previous size,
+/// corrected on the next present.
 pub fn sync_drawable_size(layer: &objc2_quartz_core::CAMetalLayer) {
     use objc2_core_foundation::CGSize;
+    use objc2_quartz_core::CATransaction;
 
     let (native_w, native_h) = natural_drawable_size(layer);
     if native_w == 0 || native_h == 0 {
@@ -2650,7 +2656,10 @@ pub fn sync_drawable_size(layer: &objc2_quartz_core::CAMetalLayer) {
         current.width,
         current.height,
     );
+    CATransaction::begin();
+    CATransaction::setDisableActions(true);
     layer.setDrawableSize(CGSize { width, height });
+    CATransaction::commit();
 }
 
 /// Apply the layer's colour configuration, and report the colorspace label it picked.

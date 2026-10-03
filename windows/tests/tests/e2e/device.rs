@@ -1657,15 +1657,27 @@ pub const DRAWABLE_LOG_FILTER: &str = "warn,mtld3d::unix=info,mtld3d::unix::pres
 /// either way.
 pub const PRESENT_OCCLUDED: &str = "debug.presentOccluded=true";
 
+/// How long one `nextDrawable` may wait before it gives up and drops the frame.
+///
+/// The layer allows the timeout (`allowsNextDrawableTimeout`, set at
+/// attach), which `CAMetalLayer` documents as one second.
+pub const DRAWABLE_TIMEOUT: Duration = Duration::from_secs(1);
+
 /// Wait until the presenter has acquired `expected` drawables for `hwnd`, and hand the lines back.
 ///
 /// The presenter logs one line per drawable under [`DRAWABLE_LOG_FILTER`], so
 /// a test that counts them knows its presents reached `nextDrawable` rather
-/// than being skipped, and cannot pass without running that call.
+/// than being skipped, and cannot pass without running that call. The bound
+/// leaves every one of them its whole [`DRAWABLE_TIMEOUT`] on top of the
+/// usual ten seconds, so a runner whose hidden windows vend drawables slowly
+/// but do vend them passes; a drawable that never comes drops its frame and
+/// fails the count.
 pub fn await_acquired_drawables(hwnd: usize, expected: usize) -> Vec<String> {
-    await_logged_lines(
+    let wait = DRAWABLE_TIMEOUT * u32::try_from(expected).expect("a drawable count fits u32");
+    await_logged_lines_within(
         &format!("drawable acquired on window {hwnd:#x} for"),
         expected,
+        Duration::from_secs(10) + wait,
     )
 }
 
@@ -1873,7 +1885,12 @@ fn process_log() -> String {
 /// The layer's log thread writes a line a moment after the call that
 /// produced it returns, so the lines are polled for, within a bound.
 pub fn await_logged_lines(needle: &str, expected: usize) -> Vec<String> {
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    await_logged_lines_within(needle, expected, Duration::from_secs(10))
+}
+
+/// [`await_logged_lines`] with a bound of the caller's.
+fn await_logged_lines_within(needle: &str, expected: usize, bound: Duration) -> Vec<String> {
+    let deadline = std::time::Instant::now() + bound;
     loop {
         let logged = logged_lines(needle);
         if logged.len() >= expected {
@@ -2223,7 +2240,10 @@ fn resized_drawable_workload() {
     const RED: u32 = 0xFFFF_0000;
     const BLUE: u32 = 0xFF00_00FF;
     /// Presents at most after the resize, 20 ms apart, for Wine to resize the views.
-    const RESIZE_PRESENTS: u32 = 100;
+    ///
+    /// Few enough that one [`DRAWABLE_TIMEOUT`] each still fits the runner's
+    /// per-test bound.
+    const RESIZE_PRESENTS: usize = 20;
 
     let h = Harness::new();
     h.render_once(RED, |_| {});
@@ -2232,8 +2252,10 @@ fn resized_drawable_workload() {
     mtld3d_tests::set_window_pos(h.hwnd(), 0, 0, 800, 600);
     assert_eq!(h.reset(800, 600), D3D_OK, "Reset to the window's new size");
     let mut resized = Vec::new();
-    for _ in 0..RESIZE_PRESENTS {
+    let mut presents = 0;
+    while presents < RESIZE_PRESENTS {
         h.render_once(BLUE, |_| {});
+        presents += 1;
         resized = logged_lines("drawable resized");
         if resized.len() > attached.len() {
             break;
@@ -2253,8 +2275,8 @@ fn resized_drawable_workload() {
         size(&resized[resized.len() - 1]),
         "the drawable moved off the window's first size: {resized:?}"
     );
-    // Every present after the resize reached `nextDrawable`.
-    await_acquired_drawables(h.hwnd(), 2);
+    // The present before the resize and every one after it reached `nextDrawable`.
+    await_acquired_drawables(h.hwnd(), 1 + presents);
     assert_pixel_eq(h.read_pixel(700, 500), BLUE, "the grown back buffer");
 }
 
@@ -2851,7 +2873,10 @@ fn fullscreen_retarget_reset_carries_the_gamma_ramp() {
 /// Set a ramp on a fullscreen device, retarget it fullscreen onto a second window, and present.
 fn gamma_retarget_workload() {
     /// Presents after the retarget, 50 ms apart, past the moment the window may turn visible.
-    const VISIBLE_PRESENTS: u32 = 20;
+    ///
+    /// Few enough that one [`DRAWABLE_TIMEOUT`] each still fits the runner's
+    /// per-test bound with the Resets around them.
+    const VISIBLE_PRESENTS: u32 = 8;
     let h = Harness::new();
     let second = create_window(320, 240, false);
     h.hold_display_mode();
