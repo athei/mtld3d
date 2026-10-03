@@ -105,51 +105,60 @@ pub fn client_surface_of(view: *mut c_void, _mtm: MainThreadMarker) -> usize {
     surface_field(object, host)
 }
 
-/// Take a reference on `surface` for the attachment record, `0` passing through.
+/// win32u's client surface reference and present calls, resolved together.
 ///
-/// Returns `surface` when the reference was taken, and `0` when there is
-/// nothing to hold or this Wine exports no client surface functions.
-pub fn retain(surface: usize) -> usize {
-    if surface == 0 {
-        return 0;
-    }
-    let Some(add_ref) = surface_fn(c"client_surface_add_ref") else {
-        return 0;
-    };
-    // SAFETY: `surface` was read from a live cocoa view's field on the main
-    // thread just before, and the window data list Wine keeps for the window
-    // holds a reference on it until the window is destroyed.
-    unsafe { add_ref(surface as *mut c_void) };
-    surface
+/// Resolved before any lock is taken, so a caller that takes a reference
+/// under the attachment registry lock makes one atomic increment there and
+/// no symbol lookup.
+pub struct SurfaceCalls {
+    add_ref: SurfaceFn,
+    present: SurfaceFn,
+    release: SurfaceFn,
 }
 
-/// Have Wine show `surface` as its window's client view; `0` does nothing.
-///
-/// The caller holds a reference on `surface`. A surface whose window is gone
-/// is one Wine has detached, and presenting it does nothing.
-pub fn present(surface: usize) {
-    if surface == 0 {
-        return;
+impl SurfaceCalls {
+    /// The three exports, or `None` with a warning on a Wine that lacks one.
+    pub fn load() -> Option<Self> {
+        Some(Self {
+            add_ref: surface_fn(c"client_surface_add_ref")?,
+            present: surface_fn(c"client_surface_present")?,
+            release: surface_fn(c"client_surface_release")?,
+        })
     }
-    let Some(present) = surface_fn(c"client_surface_present") else {
-        return;
-    };
-    // SAFETY: the caller holds a reference on `surface`, so it is a live
-    // client surface; win32u checks it is still attached under its lock.
-    unsafe { present(surface as *mut c_void) };
-    info!(target: LOG_TARGET, "present: Wine shows client surface {surface:#x}");
-}
 
-/// Give back a reference [`retain`] took; `0` does nothing.
-pub fn release(surface: usize) {
-    if surface == 0 {
-        return;
+    /// Take a reference on `surface`, handing it back; `0` passes through.
+    pub fn retain(&self, surface: usize) -> usize {
+        if surface != 0 {
+            // SAFETY: `surface` is either read from a live cocoa view's field
+            // on the main thread just before, which the window data list Wine
+            // keeps for the window holds a reference on until the window is
+            // destroyed, or one a live attachment record holds a reference on.
+            unsafe { (self.add_ref)(surface as *mut c_void) };
+        }
+        surface
     }
-    let Some(release) = surface_fn(c"client_surface_release") else {
-        return;
-    };
-    // SAFETY: the caller hands over the reference `retain` took.
-    unsafe { release(surface as *mut c_void) };
+
+    /// Have Wine show `surface` as its window's client view; `0` does nothing.
+    ///
+    /// The caller holds a reference on `surface`. A surface whose window is
+    /// gone is one Wine has detached, and presenting it does nothing.
+    pub fn present(&self, surface: usize) {
+        if surface == 0 {
+            return;
+        }
+        // SAFETY: the caller holds a reference on `surface`, so it is a live
+        // client surface; win32u checks it is still attached under its lock.
+        unsafe { (self.present)(surface as *mut c_void) };
+        info!(target: LOG_TARGET, "present: Wine shows client surface {surface:#x}");
+    }
+
+    /// Give back a reference [`Self::retain`] took; `0` does nothing.
+    pub fn release(&self, surface: usize) {
+        if surface != 0 {
+            // SAFETY: the caller hands over a reference `retain` took.
+            unsafe { (self.release)(surface as *mut c_void) };
+        }
+    }
 }
 
 /// [`bypass_present_hook`] against a hook class the caller names.
@@ -228,7 +237,7 @@ fn surface_fn(name: &CStr) -> Option<SurfaceFn> {
     mtld3d_shared::log_once_warn!(
         target: LOG_TARGET,
         "present: this Wine exports no {name:?}; a window another device's surface hid stays \
-         on that surface",
+         on that surface, and a metal view's client surface is not shown by the layer",
     );
     None
 }

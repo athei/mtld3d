@@ -59,12 +59,15 @@ pub fn detach_metal_layer(view_handle: MetalHandle<NSViewKind>) -> Option<Arc<At
     super::gamma::detach(&att);
     // Another device still presenting into this window gets its surface
     // shown again, rather than the window keeping this view's last frame.
-    if let Some(sibling) = attachment::retain_newest_surface_on(att.hwnd(), client_surface::retain)
-    {
-        client_surface::present(sibling);
-        client_surface::release(sibling);
+    if let Some(calls) = client_surface::SurfaceCalls::load() {
+        if let Some(sibling) =
+            attachment::retain_newest_surface_on(att.hwnd(), |surface| calls.retain(surface))
+        {
+            calls.present(sibling);
+            calls.release(sibling);
+        }
+        calls.release(att.client_surface());
     }
-    client_surface::release(att.client_surface());
     debug!(
         target: LOG_TARGET,
         "present: detached view {:#x} (layer {:#x}); its display state is retired",
@@ -1032,7 +1035,10 @@ pub fn attach_metal_layer(
         surface = client_surface::client_surface_of(view, mtm);
     });
     let hint = hint.expect("synchronous display lookup completed");
-    let surface = client_surface::retain(surface);
+    let surface_calls = client_surface::SurfaceCalls::load();
+    let surface = surface_calls
+        .as_ref()
+        .map_or(0, |calls| calls.retain(surface));
     info!(
         target: LOG_TARGET,
         "present: layer {:#x} of view {:#x} presents through CAMetalLayer ({layer_class:?}); \
@@ -1091,7 +1097,9 @@ pub fn attach_metal_layer(
     );
     // A new view's surface is the one Wine shows already; a kept view's may
     // have been hidden for a later surface of the same window since.
-    client_surface::present(surface);
+    if let Some(calls) = &surface_calls {
+        calls.present(surface);
+    }
     attachment::publish_backing_scale(&att, backing_scale);
     // The software cursor rides the same decision: the overlay window
     // is a compositing cost an EDR layer already pays.
