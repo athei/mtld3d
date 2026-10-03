@@ -305,6 +305,25 @@ record. A knob, where one makes sense, is named with its default.
   pass machine, the snapshot and every draw path assume one, so an unbound
   slot 0 would be a new device state for a device that can do nothing but
   `Reset` again. No site observes it. No knob.
+- **A texture whose Metal allocation is refused at an extent within the
+  reported limits still creates.** `CreateTexture`, `CreateCubeTexture` and
+  `CreateVolumeTexture` record the Metal texture's creation into the frame
+  and return; the encoder thread makes it before any operation that uses it.
+  When Metal returns nil there, the refusal is logged with the descriptor and
+  the device's memory figures, the texture samples as opaque black, and the
+  uploads into it and draws and copies through it are dropped, each logged.
+  Wine and DXVK allocate at the create and answer `E_OUTOFMEMORY` or
+  `D3DERR_OUTOFVIDEOMEMORY` when it fails. Answering at the create here would
+  make every texture create wait on the encoder thread, which owns the
+  texture records, or move the allocation onto the API thread, on the
+  streaming path that loads thousands of textures, for a failure Metal
+  reports only when the GPU is out of memory. A width or height past
+  `MaxTextureWidth` or `MaxTextureHeight` is refused at the create with
+  `D3DERR_NOTAVAILABLE`, as Wine refuses a texture past its 2D limit. A
+  volume past `MaxVolumeExtent` on any axis is refused the same way, which is
+  ours alone: Wine checks no 3D limit and DXVK checks no size, but Metal
+  aborts the process on a 3D descriptor past it. No site observes the
+  deferred refusal. No knob.
 - **`D3DRS_MULTISAMPLEANTIALIAS = FALSE` is ignored.** Metal ties the sample
   count to the pass's attachments with no per-draw override.
   `D3DPRASTERCAPS_MULTISAMPLE_TOGGLE` is not advertised, which is how D3D9

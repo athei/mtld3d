@@ -5762,7 +5762,13 @@ impl FrameEncoder {
         );
         let handle = views.linear;
         if status != 0 || handle.is_null() {
-            error!(target: LOG_TARGET, "encoder: CreateTexture failed");
+            // Not cached, so a later use asks again; logged once per texture.
+            mtld3d_shared::log_once_warn_by!(
+                target: LOG_TARGET,
+                key: texture_id.raw(),
+                "encoder: CreateTexture failed for texture {:#x}",
+                texture_id.raw()
+            );
             return 0;
         }
         self.pass_state.register_texture_views(&views);

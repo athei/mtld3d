@@ -2815,6 +2815,28 @@ impl Harness {
         unsafe { SwapChain::from_raw(chain) }
     }
 
+    /// `CreateAdditionalSwapChain` with a window-sized request and a null `ppSwapChain`.
+    ///
+    /// Returns the hr: a call that has nowhere to hand the chain must make none.
+    #[must_use]
+    pub fn additional_swapchain_null_output_hr(&self) -> i32 {
+        let cfg = HarnessConfig {
+            width: self.width.get(),
+            height: self.height.get(),
+            ..HarnessConfig::default()
+        };
+        let mut pp = present_params(&cfg, self.hwnd);
+        // SAFETY: live device and valid presentation parameters; the output
+        // is deliberately null, which the call has to refuse before writing.
+        unsafe {
+            (self.dev_vtbl().create_additional_swap_chain)(
+                self.device,
+                core::ptr::from_mut(&mut pp).cast::<c_void>(),
+                core::ptr::null_mut(),
+            )
+        }
+    }
+
     /// `CreateOffscreenPlainSurface` returning the raw hr, for the rejection paths.
     pub fn create_offscreen_plain_surface_hr(
         &self,

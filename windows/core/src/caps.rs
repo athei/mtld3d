@@ -404,6 +404,37 @@ const ADVERTISE_ALL_TEXTURE: TextureCaps = TextureCaps::all().difference(Texture
 /// MIN/MIP/MAG mode, with no sampler-side path or warn to surface an attempt.
 const ADVERTISE_ALL_FILTER: FilterCaps = FilterCaps::all().difference(FilterCaps::CONVOLUTIONMONO);
 
+/// Whether a 2D or cube texture of `width` x `height` fits the extent the device reports.
+///
+/// `MaxTextureWidth` and `MaxTextureHeight` advertise [`MAX_TEXTURE_DIM`], so
+/// a request past it is refused even on a GPU whose own 2D limit is higher.
+/// Metal raises an exception, which ends the process, for a descriptor past
+/// its limit rather than returning nil, and so it does for a zero extent;
+/// every creator checks here first.
+#[must_use]
+pub const fn texture_extent_fits(width: u32, height: u32) -> bool {
+    width != 0 && height != 0 && width <= MAX_TEXTURE_DIM && height <= MAX_TEXTURE_DIM
+}
+
+/// Whether a volume texture of `width` x `height` x `depth` fits the extent Metal can create.
+///
+/// A volume more than one slice deep is a 3D Metal texture, held on every
+/// axis to `MaxVolumeExtent` ([`MAX_VOLUME_EXTENT`]), the 3D limit Metal
+/// enforces with an exception. A single-slice volume is created as a 2D
+/// texture, so it takes the 2D limit of [`texture_extent_fits`].
+#[must_use]
+pub const fn volume_extent_fits(width: u32, height: u32, depth: u32) -> bool {
+    if depth == 1 {
+        return texture_extent_fits(width, height);
+    }
+    width != 0
+        && height != 0
+        && depth != 0
+        && width <= MAX_VOLUME_EXTENT
+        && height <= MAX_VOLUME_EXTENT
+        && depth <= MAX_VOLUME_EXTENT
+}
+
 /// Single entry point for both `IDirect3D9::GetDeviceCaps` and `IDirect3DDevice9::GetDeviceCaps`.
 ///
 /// Runs `fill_default`, then ORs in every spec bit per field when `caps_all` is

@@ -1435,7 +1435,11 @@ fn wine_metal_view(
     // load; `view` is non-null per the check above.
     let layer = unsafe { (funcs.macdrv_view_get_metal_layer)(view) };
     if layer.is_null() {
-        error!(target: LOG_TARGET, "macdrv_view_get_metal_layer returned null");
+        error!(target: LOG_TARGET, "macdrv_view_get_metal_layer returned null; view released");
+        // SAFETY: extern "C" Wine entry point; `view` is the retained view
+        // `macdrv_view_create_metal_view` handed out above, which nothing else
+        // holds, so this gives back its only reference.
+        unsafe { (funcs.macdrv_view_release_metal_view)(view) };
         return None;
     }
     Some((view, layer))
