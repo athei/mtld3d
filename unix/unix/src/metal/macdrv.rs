@@ -23,6 +23,7 @@ use objc2_core_graphics::{CGColor, CGColorSpace};
 use crate::{LOG_TARGET, metal::handle::IntoRetained};
 
 pub mod attachment;
+mod client_surface;
 mod cursor_overlay;
 mod delegate_forward;
 
@@ -46,13 +47,24 @@ pub use cursor_overlay::{poll_from_present, set_cursor_overlay};
 ///
 /// Only the record of this view is retired, and it is handed back so the
 /// view's retirement knows the window it served. A device that never
-/// attached finds no record, and another device's record is untouched.
+/// attached finds no record, and another device's record is untouched,
+/// except that Wine is told to show the client surface of the newest device
+/// still attached to the same window. Runs on the API thread, a Wine thread,
+/// which win32u's client surface calls need.
 pub fn detach_metal_layer(view_handle: MetalHandle<NSViewKind>) -> Option<Arc<Attachment>> {
     let view_addr =
         usize::try_from(view_handle.raw()).expect("a 64-bit host addresses every view pointer");
     let att = attachment::unregister(view_addr)?;
     cursor_overlay::detach(&att);
     super::gamma::detach(&att);
+    // Another device still presenting into this window gets its surface
+    // shown again, rather than the window keeping this view's last frame.
+    if let Some(sibling) = attachment::retain_newest_surface_on(att.hwnd(), client_surface::retain)
+    {
+        client_surface::present(sibling);
+        client_surface::release(sibling);
+    }
+    client_surface::release(att.client_surface());
     debug!(
         target: LOG_TARGET,
         "present: detached view {:#x} (layer {:#x}); its display state is retired",
@@ -1006,13 +1018,28 @@ pub fn attach_metal_layer(
         None => create_metal_view(&funcs, hwnd, device_handle)?,
     };
     // AppKit owns the view's window and screen relationships on the main
-    // thread; the view is retained for as long as the device holds it.
+    // thread; the view is retained for as long as the device holds it. The
+    // same hop takes the layer off winemac's `nextDrawable` override, which
+    // walks the view from the presenter thread, and reads the client
+    // surface the override would have presented.
     let mut hint = None;
+    let mut layer_class = client_surface::LayerClass::Plain;
+    let mut surface = 0;
     run_on_main_thread_sync(|| {
         let mtm = objc2::MainThreadMarker::new().expect("display lookup runs on the main thread");
         hint = Some(view_display_caps(view, mtm));
+        layer_class = client_surface::bypass_present_hook(layer, mtm);
+        surface = client_surface::client_surface_of(view, mtm);
     });
     let hint = hint.expect("synchronous display lookup completed");
+    let surface = client_surface::retain(surface);
+    info!(
+        target: LOG_TARGET,
+        "present: layer {:#x} of view {:#x} presents through CAMetalLayer ({layer_class:?}); \
+         client surface {surface:#x}",
+        layer as usize,
+        view as usize,
+    );
     if hosted {
         info!(
             target: LOG_TARGET,
@@ -1059,8 +1086,12 @@ pub fn attach_metal_layer(
                 .expect("PE wire pointer fits host address space (unix is 64-bit)"),
             cursor_kick_sink: usize::try_from(cursor_kick_sink_ptr)
                 .expect("PE wire pointer fits host address space (unix is 64-bit)"),
+            client_surface: surface,
         },
     );
+    // A new view's surface is the one Wine shows already; a kept view's may
+    // have been hidden for a later surface of the same window since.
+    client_surface::present(surface);
     attachment::publish_backing_scale(&att, backing_scale);
     // The software cursor rides the same decision: the overlay window
     // is a compositing cost an EDR layer already pays.
@@ -1354,9 +1385,9 @@ enum KeptView {
 /// window it is reused, and taking it goes through none of Wine's calls, so
 /// the client surface it sits in stays the one Wine shows for the window
 /// (one Wine hid for a later surface of the same window is shown again by
-/// the first `nextDrawable` of the kept layer, which Wine reports as that
-/// surface's present). No longer hosted (the handle reused by a new window,
-/// or its window gone) it is moved into the window the handle has now. With
+/// the attach, which presents the surface the view sits in). No longer
+/// hosted (the handle reused by a new window, or its window gone) it is
+/// moved into the window the handle has now. With
 /// none kept for `hwnd`, the newest kept view whose own handle has no window
 /// any more is moved in; a kept view whose handle still has a window is that
 /// window's, on screen or not, and stays.

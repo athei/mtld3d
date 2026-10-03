@@ -1653,15 +1653,6 @@ const PRIVATE_LOG_FILTER: &str = "warn,mtld3d::unix=info";
 /// that reads its own process log reads its device's lines and nobody
 /// else's. Panics with the child's standard error when the child fails.
 pub fn run_in_private_log_child(child_name: &str, test: &str, filter: &str) {
-    run_in_private_log_child_with(child_name, test, filter, "");
-}
-
-/// [`run_in_private_log_child`] with `config` entries appended to the child's configuration.
-///
-/// `config` is `key=value` entries separated by `;`, applied after the
-/// suite's own, so an entry here overrides the suite's value for this child
-/// alone.
-pub fn run_in_private_log_child_with(child_name: &str, test: &str, filter: &str, config: &str) {
     let exe = std::env::current_exe().expect("resolve test executable");
     let _factory = Harness::factory_only();
     let stamp = std::time::SystemTime::now()
@@ -1688,12 +1679,8 @@ pub fn run_in_private_log_child_with(child_name: &str, test: &str, filter: &str,
     // child is handed the private directory instead, always, and the run here
     // takes the same path CI takes. The parser keeps everything after the
     // entry's first `=`, so the path stands as long as it carries no `;`.
-    let entries = if config.is_empty() {
-        format!("log.dir={}", dir.display())
-    } else {
-        format!("{config};log.dir={}", dir.display())
-    };
-    let output = run_child(&mut command, &entries).expect("run the workload child");
+    let output = run_child(&mut command, &format!("log.dir={}", dir.display()))
+        .expect("run the workload child");
     assert!(
         output.status.success(),
         "workload child {child_name} failed: {}",
@@ -2739,27 +2726,30 @@ const GAMMA_RETARGET_CHILD_NAME: &str = "gamma-retarget.exe";
 /// retarget detached, and the unix side drops a ramp for a layer no
 /// attachment record names, logging that once. The workload runs in a
 /// process of its own, so the log it reads holds its device's lines alone.
+///
+/// The covered window turns visible a moment after the retarget, and only a
+/// present into a visible window acquires a drawable, so the workload keeps
+/// presenting for a while after it. Those presents run the layer's
+/// `nextDrawable` under the suite's Main Thread Checker, which ends the
+/// process if anything on that call walks `AppKit` off the main thread, as
+/// winemac's override of it on the layer Wine creates does.
 #[test]
 fn fullscreen_retarget_reset_carries_the_gamma_ramp() {
     if running_as(GAMMA_RETARGET_CHILD_NAME) {
         gamma_retarget_workload();
         return;
     }
-    // The Main Thread Checker is off in this child alone: presenting into the
-    // window the retarget covers runs winemac's `-[WineMetalLayer nextDrawable]`,
-    // which reads `-[NSView superview]` on the presenter thread, and the checker
-    // ends the process on CI. Re-enable it when #990 keeps that Wine call off
-    // mtld3d's layers (https://github.com/athei/mtld3d/issues/990).
-    run_in_private_log_child_with(
+    run_in_private_log_child(
         GAMMA_RETARGET_CHILD_NAME,
         "device::fullscreen_retarget_reset_carries_the_gamma_ramp",
         PRIVATE_LOG_FILTER,
-        "debug.mainThreadChecker=false",
     );
 }
 
 /// Set a ramp on a fullscreen device, retarget it fullscreen onto a second window, and present.
 fn gamma_retarget_workload() {
+    /// Presents after the retarget, 50 ms apart, so some land after the window turns visible.
+    const VISIBLE_PRESENTS: u32 = 20;
     let h = Harness::new();
     let second = create_window(320, 240, false);
     h.hold_display_mode();
@@ -2792,6 +2782,12 @@ fn gamma_retarget_workload() {
         "fullscreen Reset onto a second device window"
     );
     assert_eq!(h.present(), D3D_OK, "the present after the retarget");
+    // The window reads as visible once its occlusion state arrives on the
+    // main thread; until then a present skips the drawable.
+    for _ in 0..VISIBLE_PRESENTS {
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(h.present(), D3D_OK, "a present into the covered window");
+    }
     // The read-back waits for the encoder to have replayed every frame before
     // it, which is where a ramp reaches the layer its frame names.
     let _ = h.read_pixel(1, 1);
@@ -4347,6 +4343,79 @@ fn a_second_device_on_the_same_window_presents_through_the_kept_metal_view() {
     );
     // The window is the first harness's to destroy, after the device on it.
     drop(second);
+}
+
+/// The name the workload child of the two-devices-on-one-window surface test runs under.
+const SHARED_WINDOW_CHILD_NAME: &str = "shared-window-surface.exe";
+
+/// A device leaving a window another device still presents into hands the window back to it.
+///
+/// Wine shows one client surface per window, and a device's attach creates
+/// one and shows it, hiding the surface of a device already on the window.
+/// The layer presents through `CAMetalLayer`'s own `nextDrawable`, which
+/// tells Wine nothing, so the departing device's teardown has Wine show the
+/// remaining device's surface again; otherwise the window would keep the
+/// departed device's last frame. Each attach names its layer class and its
+/// client surface, and every surface shown is logged, so the workload runs
+/// in a process of its own and reads them back.
+#[test]
+fn a_device_leaving_a_shared_window_hands_it_back_to_the_other() {
+    if running_as(SHARED_WINDOW_CHILD_NAME) {
+        shared_window_workload();
+        return;
+    }
+    run_in_private_log_child(
+        SHARED_WINDOW_CHILD_NAME,
+        "device::a_device_leaving_a_shared_window_hands_it_back_to_the_other",
+        PRIVATE_LOG_FILTER,
+    );
+}
+
+/// Two devices on one window, the later one released first, and the surfaces Wine was told to show.
+fn shared_window_workload() {
+    const RED: u32 = 0xFFFF_0000;
+    const BLUE: u32 = 0xFF00_00FF;
+
+    let first = Harness::new();
+    first.render_once(RED, |_| {});
+    let second = Harness::create(&HarnessConfig {
+        device_window: first.hwnd(),
+        ..HarnessConfig::default()
+    });
+    second.render_once(BLUE, |_| {});
+    let attached = await_logged_lines("presents through CAMetalLayer", 2);
+    assert_eq!(attached.len(), 2, "both devices attached: {attached:?}");
+    for line in &attached {
+        assert!(
+            line.contains("CAMetalLayer (Bypassed)") || line.contains("CAMetalLayer (Plain)"),
+            "every layer presents through CAMetalLayer's own nextDrawable: {line}"
+        );
+    }
+    let surface = attached[0]
+        .split_once("client surface ")
+        .map(|(_, rest)| rest.trim().to_owned())
+        .expect("the attach line names the client surface");
+    assert_eq!(second.release_device(), 0, "release the later device");
+    // A Wine whose cocoa views name no client surface has none to show.
+    if surface != "0x0" {
+        let needle = format!("Wine shows client surface {surface}");
+        let shown = await_logged_lines(&needle, 2);
+        assert_eq!(
+            shown.len(),
+            2,
+            "the first device's surface shown at its attach and after the release: {shown:?}"
+        );
+        let last = logged_lines("Wine shows client surface");
+        assert_eq!(
+            last.last(),
+            Some(&shown[1]),
+            "the first device's surface is the last one shown: {last:?}"
+        );
+    }
+    first.render_once(RED, |_| {});
+    assert_pixel_eq(first.read_pixel(1, 1), RED, "the remaining device");
+    drop(second);
+    drop(first);
 }
 
 #[test]

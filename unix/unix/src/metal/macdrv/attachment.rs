@@ -23,6 +23,9 @@
 //! old one). Outside those helpers a record is plain data: atomics and
 //! immutable words a main-thread observer, the submit thread and the API
 //! thread may read at any time, whether or not the record is still live.
+//! The Wine client surface a record names is held by a reference the record
+//! owns, which its teardown gives back after unregistering it, so another
+//! device's teardown takes its own reference on it under the registry lock.
 //!
 //! The lock is held for a lookup plus one retain or one atomic store, never
 //! across `AppKit` work, and nothing in this file takes any other lock, so
@@ -30,7 +33,10 @@
 //! anywhere else.
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::{
+    sync::{Arc, LazyLock, Mutex},
+    time::Instant,
+};
 
 use mtld3d_shared::mtl::ColorSpacePolicy;
 use objc2::{MainThreadMarker, rc::Retained};
@@ -92,6 +98,11 @@ pub struct AttachLatches {
     pub backing_scale_sink: usize,
     /// Address of the PE-side `AtomicU32` a cursor re-apply is asked through, `0` = none.
     pub cursor_kick_sink: usize,
+    /// Wine's client surface the view sits in, `0` = none.
+    ///
+    /// The record owns one reference on it, taken at attach and given back
+    /// by the teardown that unregisters the record.
+    pub client_surface: usize,
 }
 
 /// The display state of one attached metal view.
@@ -111,6 +122,10 @@ pub struct Attachment {
     backing_scale_sink: usize,
     /// See [`AttachLatches::cursor_kick_sink`].
     cursor_kick_sink: usize,
+    /// See [`AttachLatches::client_surface`].
+    client_surface: usize,
+    /// When the record was registered, which orders the devices on one window.
+    attached_at: Instant,
     flags: AttachFlags,
     color_space: ColorSpacePolicy,
     /// Raw `NSWindow*` the occlusion observer filters notifications by.
@@ -193,13 +208,15 @@ pub struct Attachment {
 }
 
 impl Attachment {
-    const fn new(view: usize, layer: usize, latches: &AttachLatches) -> Self {
+    fn new(view: usize, layer: usize, latches: &AttachLatches) -> Self {
         Self {
             view,
             layer,
             hwnd: latches.hwnd,
             backing_scale_sink: latches.backing_scale_sink,
             cursor_kick_sink: latches.cursor_kick_sink,
+            client_surface: latches.client_surface,
+            attached_at: Instant::now(),
             flags: latches.flags,
             color_space: latches.color_space,
             window: AtomicUsize::new(0),
@@ -248,6 +265,12 @@ impl Attachment {
     #[must_use]
     pub const fn hwnd(&self) -> u64 {
         self.hwnd
+    }
+
+    /// Wine's client surface the record holds a reference on, `0` = none.
+    #[must_use]
+    pub const fn client_surface(&self) -> usize {
+        self.client_surface
     }
 
     /// `color.hdr.enable` as the attach carried it.
@@ -461,6 +484,24 @@ pub fn find(view: usize) -> Option<Arc<Attachment>> {
 #[must_use]
 pub fn find_by_layer(layer: usize) -> Option<Arc<Attachment>> {
     lock().values().find(|att| att.layer == layer).cloned()
+}
+
+/// The client surface of the newest live record on `hwnd`, retained through `retain`.
+///
+/// `retain` takes a reference on the surface while the record is live under
+/// the registry lock, and the record's teardown gives its own reference
+/// back only after it unregistered the record, so the surface outlives the
+/// call whatever that device does meanwhile; the caller gives the reference
+/// back. `None` when no live record on `hwnd` holds a surface.
+pub fn retain_newest_surface_on(hwnd: u64, retain: impl FnOnce(usize) -> usize) -> Option<usize> {
+    let map = lock();
+    let retained = map
+        .values()
+        .filter(|att| att.hwnd == hwnd && att.client_surface != 0)
+        .max_by_key(|att| att.attached_at)
+        .map(|newest| retain(newest.client_surface));
+    drop(map);
+    retained.filter(|&surface| surface != 0)
 }
 
 /// A snapshot of every live record, for a main-thread observer to walk.
