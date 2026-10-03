@@ -14,6 +14,8 @@
 //! again names a new record rather than the old one, and that a Reset's
 //! re-pacing makes one record's reconciliation due at once, defers to a
 //! refresh already in flight, and leaves the other records' cadence alone.
+//! They also pin which client surface a window's departing device hands the
+//! window to: the newest live record's on that window that holds one.
 
 use core::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
@@ -22,7 +24,7 @@ use mtld3d_shared::mtl::ColorSpacePolicy;
 
 use super::{
     AttachFlags, AttachLatches, Attachment, HEADROOM_REFRESH_PRESENTS, find, find_by_layer, live,
-    publish_backing_scale, register, request_cursor_kick_all, unregister,
+    publish_backing_scale, register, request_cursor_kick_all, retain_newest_surface_on, unregister,
 };
 use crate::metal::{
     command::PresentGeometry,
@@ -51,6 +53,7 @@ fn latches(
         backing_scale,
         backing_scale_sink,
         cursor_kick_sink,
+        client_surface: 0,
     }
 }
 
@@ -194,6 +197,7 @@ fn each_record_seeds_its_own_defaults() {
             backing_scale: 2,
             backing_scale_sink: 0,
             cursor_kick_sink: 0,
+            client_surface: 0,
         },
     );
     assert_eq!(
@@ -474,4 +478,62 @@ fn a_reset_repaces_one_record_only() {
 
     unregister(VIEW_A);
     unregister(VIEW_B);
+}
+
+/// Latches for a record on `hwnd` holding a reference on `client_surface`.
+fn surface_latches(hwnd: u64, client_surface: usize) -> AttachLatches {
+    AttachLatches {
+        hwnd,
+        client_surface,
+        ..latches(AttachFlags::empty(), 1, None)
+    }
+}
+
+#[test]
+fn the_newest_live_record_on_the_window_names_the_surface() {
+    const HWND: u64 = 0x7_0040;
+    const VIEW_A: usize = 0x7_0000;
+    const VIEW_B: usize = 0x7_1000;
+    const VIEW_C: usize = 0x7_2000;
+    const VIEW_OTHER: usize = 0x7_3000;
+
+    let retained = |surface: usize| surface;
+    assert_eq!(
+        retain_newest_surface_on(HWND, retained),
+        None,
+        "no record yet"
+    );
+
+    register(VIEW_A, VIEW_A + 8, &surface_latches(HWND, 0xa000));
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    register(VIEW_B, VIEW_B + 8, &surface_latches(HWND, 0xb000));
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    register(VIEW_C, VIEW_C + 8, &surface_latches(HWND, 0));
+    register(
+        VIEW_OTHER,
+        VIEW_OTHER + 8,
+        &surface_latches(HWND + 1, 0xd000),
+    );
+    assert_eq!(
+        retain_newest_surface_on(HWND, retained),
+        Some(0xb000),
+        "the newest record holding a surface, on this window only"
+    );
+
+    unregister(VIEW_B);
+    assert_eq!(
+        retain_newest_surface_on(HWND, retained),
+        Some(0xa000),
+        "an unregistered record names nothing"
+    );
+    assert_eq!(
+        retain_newest_surface_on(HWND, |_| 0),
+        None,
+        "a surface the retain refuses is not handed back"
+    );
+
+    unregister(VIEW_A);
+    assert_eq!(retain_newest_surface_on(HWND, retained), None);
+    unregister(VIEW_C);
+    unregister(VIEW_OTHER);
 }

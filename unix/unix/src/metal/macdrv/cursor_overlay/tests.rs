@@ -172,6 +172,7 @@ fn attachment(view: usize) -> std::sync::Arc<super::Attachment> {
             backing_scale: 1,
             backing_scale_sink: 0,
             cursor_kick_sink: 0,
+            client_surface: 0,
         },
     )
 }
