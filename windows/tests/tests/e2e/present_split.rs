@@ -25,6 +25,14 @@ use mtld3d_types::{
     D3D_OK, D3DCREATE_HARDWARE_VERTEXPROCESSING, D3DCREATE_MULTITHREADED, D3DLOCK_READONLY,
 };
 
+use super::device::{
+    DRAWABLE_LOG_FILTER, PRESENT_OCCLUDED, await_acquired_drawables, run_in_private_log_child_with,
+    running_as,
+};
+
+/// The name the workload child of the full-pipeline test runs under.
+const FULL_PIPELINE_CHILD_NAME: &str = "present-full-pipeline.exe";
+
 /// A gate file of this test's own under the prefix's temp directory, and the entry naming it.
 ///
 /// Created here, so the queue that resolves the path at creation finds it.
@@ -101,9 +109,26 @@ fn a_readback_completes_while_the_presenter_is_parked() {
 /// the image of the present ahead of it into a slot before the partial frame
 /// copies the last; the slot array is sized for exactly this. One slot short,
 /// the last copy waits for the oldest present to commit, which the gate
-/// holds, and the harness reports a timeout.
+/// holds, and the harness reports a timeout. The workload runs in a process
+/// of its own that presents into occluded windows ([`PRESENT_OCCLUDED`]):
+/// once the gate lifts, every queued present, each from its slot, acquires a
+/// drawable under the suite's Main Thread Checker, and the log counts them.
 #[test]
 fn a_readback_behind_a_full_pipeline_completes_while_the_presenter_is_parked() {
+    if running_as(FULL_PIPELINE_CHILD_NAME) {
+        full_pipeline_workload();
+        return;
+    }
+    run_in_private_log_child_with(
+        FULL_PIPELINE_CHILD_NAME,
+        "present_split::a_readback_behind_a_full_pipeline_completes_while_the_presenter_is_parked",
+        DRAWABLE_LOG_FILTER,
+        PRESENT_OCCLUDED,
+    );
+}
+
+/// Fill the pipeline behind a parked presenter, read back, lift the gate, and count the drawables.
+fn full_pipeline_workload() {
     const STAGES: u32 = 5;
     const LAST: u32 = 0xFFFF_00FF;
     let (gate, entry) = gate_file("pipeline");
@@ -139,6 +164,11 @@ fn a_readback_behind_a_full_pipeline_completes_while_the_presenter_is_parked() {
         h.render_once(LAST, |_| {});
     }
     assert_pixel_eq(h.read_pixel(1, 1), LAST, "after the gate was lifted");
+    // The five frames behind the gate and the two after it.
+    await_acquired_drawables(
+        h.hwnd(),
+        usize::try_from(STAGES + 2).expect("a present count fits usize"),
+    );
 }
 
 /// One device's parked presenter leaves another device presenting and reading back.

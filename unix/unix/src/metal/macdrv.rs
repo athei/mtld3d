@@ -2625,9 +2625,12 @@ fn natural_drawable_size(layer: &objc2_quartz_core::CAMetalLayer) -> (u32, u32) 
 /// drawable pool), hence the compare first. Degenerate geometry is left
 /// alone rather than written as a zero size Metal would reject.
 ///
-/// Reading `bounds`/`contentsScale` off the main thread races an in-flight
-/// `AppKit` resize; the cost of losing that race is one frame at the previous
-/// size, corrected on the next present.
+/// The presenter calls this on its own thread. It touches the layer alone,
+/// never the view it backs: `drawableSize` is `CAMetalLayer`'s own and asks
+/// the view for no action, unlike an animatable property, so the write needs
+/// no main-thread hop. Reading `bounds`/`contentsScale` off the main thread
+/// races an in-flight `AppKit` resize; the cost of losing that race is one
+/// frame at the previous size, corrected on the next present.
 pub fn sync_drawable_size(layer: &objc2_quartz_core::CAMetalLayer) {
     use objc2_core_foundation::CGSize;
 
@@ -2641,6 +2644,12 @@ pub fn sync_drawable_size(layer: &objc2_quartz_core::CAMetalLayer) {
     if (current.width - width).abs() <= 0.0 && (current.height - height).abs() <= 0.0 {
         return;
     }
+    debug!(
+        target: super::command::PRESENT_LOG_TARGET,
+        "present: drawable resized {:.0}x{:.0} -> {native_w}x{native_h}",
+        current.width,
+        current.height,
+    );
     layer.setDrawableSize(CGSize { width, height });
 }
 

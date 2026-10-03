@@ -24,7 +24,7 @@ use mtld3d_shared::{
     AttachMetalLayerParams, CreateBackbufferParams, CreateCommandQueueParams,
     CreateDepthTextureParams, DestroyCommandQueueParams, GetDeviceInfoParams, InPtr, InPtrMut,
     MetalHandle, OutPtr, VtableThis,
-    mtl::DeviceCapsFlags,
+    mtl::{DeviceCapsFlags, PresentDebugFlags},
     mtl_handle::{MTLDeviceKind, MTLTextureKind, NSViewKind},
     record_handle::DeviceRecordHandle,
 };
@@ -1483,6 +1483,8 @@ extern "system" fn d3d9_create_device(
 
     // Create Metal device + command queue
     let gate = present_gate_unix_path(cfg);
+    let mut present_debug = PresentDebugFlags::empty();
+    present_debug.set(PresentDebugFlags::PRESENT_OCCLUDED, cfg.present_occluded);
     let mut cq_params = CreateCommandQueueParams {
         device_handle: MetalHandle::NULL,
         record_handle: DeviceRecordHandle::NULL,
@@ -1492,7 +1494,7 @@ extern "system" fn d3d9_create_device(
         gate_file_len: gate.as_ref().map_or(0, |path| {
             u32::try_from(path.len()).expect("a gate path fits u32")
         }),
-        pad0: 0,
+        present_debug,
     };
     let status = unix_call(&mut cq_params);
     if status != 0 {

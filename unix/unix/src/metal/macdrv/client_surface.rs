@@ -246,8 +246,12 @@ fn surface_field(object: &AnyObject, host: &AnyClass) -> usize {
         return 0;
     }
     // SAFETY: `object` is a `host`, which declares the field, and its
-    // encoding is a pointer's; winemac writes it on the main thread only,
-    // where the caller reads it.
+    // encoding is a pointer's. winemac writes the field once, on the Wine
+    // thread inside the `get_win_data` that creates the cocoa view, before
+    // that call returns; every read here runs on the main thread after a
+    // synchronous hop the same or a later attach made after that call, so
+    // the write is ordered before the read, and a later `get_win_data` for
+    // the window writes a new cocoa view's field, not this one.
     let surface = unsafe { *ivar.load::<*mut c_void>(object) };
     surface as usize
 }

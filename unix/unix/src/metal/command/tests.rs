@@ -32,7 +32,7 @@ use std::{
 
 use mtld3d_shared::{
     ExtraColorDesc, MetalHandle, PassDescriptor,
-    mtl::{BlockLayout, LoadAction, PixelFormat, StoreAction},
+    mtl::{BlockLayout, LoadAction, PixelFormat, PresentDebugFlags, StoreAction},
 };
 use objc2::{
     Message as _,
@@ -899,7 +899,7 @@ fn test_record(queue: &ProtocolObject<dyn MTLCommandQueue>) -> Arc<DeviceRecord>
     // SAFETY: `Retained::into_raw` transfers this test's extra retain into the
     // handle, which the record's `Drop` releases.
     let handle = unsafe { MetalHandle::new(Retained::into_raw(retained) as u64) };
-    DeviceRecord::new(handle, None)
+    DeviceRecord::new(handle, None, PresentDebugFlags::empty())
 }
 
 fn test_submit_params(

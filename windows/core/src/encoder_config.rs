@@ -34,6 +34,7 @@ impl WireValue for Mtld3dConfig {
         self.bytecode_dump_dir.write_wire(writer)?;
         self.skip_shaders.write_wire(writer)?;
         self.present_gate_file.write_wire(writer)?;
+        self.present_occluded.write_wire(writer)?;
         self.query_flush_immediate.write_wire(writer)?;
         self.query_event_immediate.write_wire(writer)?;
         self.depth_alias_same_size.write_wire(writer)?;
@@ -67,6 +68,7 @@ impl WireValue for Mtld3dConfig {
             bytecode_dump_dir: <String>::read_wire(reader)?,
             skip_shaders: <Vec<u64>>::read_wire(reader)?,
             present_gate_file: <String>::read_wire(reader)?,
+            present_occluded: <bool>::read_wire(reader)?,
             query_flush_immediate: <bool>::read_wire(reader)?,
             query_event_immediate: <bool>::read_wire(reader)?,
             depth_alias_same_size: <bool>::read_wire(reader)?,

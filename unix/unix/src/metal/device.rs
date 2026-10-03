@@ -5,7 +5,7 @@ use std::{
 
 use mtld3d_shared::{
     MetalHandle,
-    mtl::DeviceCapsFlags,
+    mtl::{DeviceCapsFlags, PresentDebugFlags},
     mtl_handle::{MTLCommandQueueKind, MTLDeviceKind, MTLTextureKind, NSViewKind},
     record_handle::DeviceRecordHandle,
 };
@@ -226,7 +226,10 @@ pub struct DeviceCaps {
 /// Snapshots the device caps the PE side needs at creation time. Every D3D
 /// device is handed the same `MTLDevice`, so the process-wide Metal caches and
 /// the command buffers that bind from them always name one device.
-pub fn create_command_queue(gate: Option<PathBuf>) -> Option<DeviceCaps> {
+pub fn create_command_queue(
+    gate: Option<PathBuf>,
+    present_debug: PresentDebugFlags,
+) -> Option<DeviceCaps> {
     let device = pinned_device()?;
     let queue = device.newCommandQueue()?;
     let queue_label = objc2_foundation::NSString::from_str("mtld3d");
@@ -237,7 +240,7 @@ pub fn create_command_queue(gate: Option<PathBuf>) -> Option<DeviceCaps> {
     // address, which the record's `Drop` releases.
     let queue_handle =
         unsafe { MetalHandle::<MTLCommandQueueKind>::new(Retained::into_raw(queue) as u64) };
-    let record = DeviceRecord::new(queue_handle, gate);
+    let record = DeviceRecord::new(queue_handle, gate, present_debug);
     if !super::presenter::spawn(&record) {
         return None;
     }

@@ -10,7 +10,10 @@ use std::{
     time::Duration,
 };
 
-use mtld3d_shared::mtl_handle::{CAMetalLayerKind, MTLCommandQueueKind, MTLTextureKind};
+use mtld3d_shared::{
+    mtl::PresentDebugFlags,
+    mtl_handle::{CAMetalLayerKind, MTLCommandQueueKind, MTLTextureKind},
+};
 use objc2_metal::MTLPixelFormat;
 
 use super::*;
@@ -55,6 +58,7 @@ fn state_with(inner: Inner) -> Arc<PresentState> {
         present_retired: AtomicU64::new(0),
         thread: Mutex::new(None),
         stalled: AtomicBool::new(false),
+        present_occluded: false,
     })
 }
 
@@ -78,9 +82,16 @@ fn a_record_keeps_the_queue_alive_for_its_thread() {
     // and releases when it drops at the end of this test.
     let handle =
         unsafe { MetalHandle::<MTLCommandQueueKind>::new(Retained::into_raw(queue) as u64) };
-    let record = DeviceRecord::new(handle, None);
+    let record = DeviceRecord::new(handle, None, PresentDebugFlags::empty());
     assert!(spawn(&record), "the presenter thread starts");
     stop_and_join(record.present());
+}
+
+/// `debug.presentOccluded` reaches the state the presenter reads, and nothing else sets it.
+#[test]
+fn present_occluded_comes_from_the_queue_flags_alone() {
+    assert!(!PresentState::new(None, PresentDebugFlags::empty()).present_occluded);
+    assert!(PresentState::new(None, PresentDebugFlags::PRESENT_OCCLUDED).present_occluded);
 }
 
 /// A handle round-trips to its record, and only the destroying caller ends it.
@@ -90,7 +101,11 @@ fn a_record_keeps_the_queue_alive_for_its_thread() {
 /// `consume` takes that last reference back.
 #[test]
 fn a_record_handle_round_trips_and_only_consume_ends_it() {
-    let record = DeviceRecord::new(MetalHandle::<MTLCommandQueueKind>::NULL, None);
+    let record = DeviceRecord::new(
+        MetalHandle::<MTLCommandQueueKind>::NULL,
+        None,
+        PresentDebugFlags::empty(),
+    );
     let handle = Arc::clone(&record).into_handle();
     {
         // SAFETY: the handle came from `into_handle` above and has not been
