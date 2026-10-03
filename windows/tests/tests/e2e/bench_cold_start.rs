@@ -611,7 +611,7 @@ impl Sandbox {
                 let _ = write!(
                     notes,
                     "; records not counted: {}",
-                    version_note(layer, "this benchmark binary", &CacheHeader::CURRENT)
+                    version_note(layer, "this benchmark binary reads", &CacheHeader::CURRENT)
                 );
             }
         }
@@ -686,7 +686,7 @@ impl Counts {
         let bytes = fs::read(path).map_err(|error| format!("unreadable: {error}"))?;
         let header = header_in(&bytes)?;
         if header != *layer {
-            return Err(version_note(&header, "the layer", layer));
+            return Err(version_note(&header, "the layer writes", layer));
         }
         if header != CacheHeader::CURRENT {
             return Ok(None);
@@ -928,7 +928,7 @@ fn compatible(path: &Path, layer: &CacheHeader) -> Result<(), String> {
     if header == *layer {
         Ok(())
     } else {
-        Err(version_note(&header, "the layer", layer))
+        Err(version_note(&header, "the layer writes", layer))
     }
 }
 
@@ -948,14 +948,14 @@ fn header_in(bytes: &[u8]) -> Result<CacheHeader, String> {
     shader_cache::read_header(bytes).map_err(|_| "not a shader cache".to_owned())
 }
 
-/// What a cache of `header` is to `reader`, which reads `reads`.
-fn version_note(header: &CacheHeader, reader: &str, reads: &CacheHeader) -> String {
+/// A cache of `header` set against `versions`, which `whose` names ("the layer writes").
+fn version_note(header: &CacheHeader, whose: &str, versions: &CacheHeader) -> String {
     format!(
-        "cache format {} schema {}, {reader} reads format {} schema {}",
+        "cache format {} schema {}, {whose} format {} schema {}",
         header.format_version,
         header.shader_schema_version,
-        reads.format_version,
-        reads.shader_schema_version,
+        versions.format_version,
+        versions.shader_schema_version,
     )
 }
 
