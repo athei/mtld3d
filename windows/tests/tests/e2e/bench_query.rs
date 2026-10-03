@@ -32,8 +32,14 @@
 //! are context only. `query_poll_spec` pins both keys to their
 //! defaults, stated explicitly so a suite-wide `BENCH_CONFIG` cannot move
 //! them. `query.flushImmediate` changes only an occlusion read that passes
-//! the FLUSH flag, which this frame never does; it is set in the `wow` test
-//! only so the test runs what the profile runs.
+//! the FLUSH flag, which these two frames never do; it is set in the `wow`
+//! test only so the test runs what the profile runs.
+//!
+//! `query_flush_read_spec` runs the spec frame with the occlusion reads
+//! passing `D3DGETDATA_FLUSH`, the pattern of a title that culls by the
+//! counts it waits for (Grand Theft Auto IV's coronas). Each read waits for
+//! the GPU to retire the previous frame, whose END a Present already sent, so
+//! it guards what such a wait costs the frame being recorded.
 
 use std::time::{Duration, Instant, SystemTime};
 
@@ -86,18 +92,32 @@ enum Answering {
 #[ignore = "benchmark, run by `make bench`"]
 fn query_poll_wow() {
     let wow = mtld3d_core::app_profile::builtin("wow").expect("the wow profile ships");
-    poll("query_poll_wow", wow.settings(), &Answering::Immediate);
+    poll("query_poll_wow", wow.settings(), &Answering::Immediate, 0);
 }
 
 /// The throttled frame with both query keys at their defaults.
 #[test]
 #[ignore = "benchmark, run by `make bench`"]
 fn query_poll_spec() {
-    poll("query_poll_spec", SPEC_KEYS, &Answering::Retirement);
+    poll("query_poll_spec", SPEC_KEYS, &Answering::Retirement, 0);
+}
+
+/// The spec frame with the occlusion reads waiting for their counts through `D3DGETDATA_FLUSH`.
+#[test]
+#[ignore = "benchmark, run by `make bench`"]
+fn query_flush_read_spec() {
+    poll(
+        "query_flush_read_spec",
+        SPEC_KEYS,
+        &Answering::Retirement,
+        D3DGETDATA_FLUSH,
+    );
 }
 
 /// Warm up, time the throttled frames under `keys`, and write the report `name`.
-fn poll(name: &str, keys: &'static str, answering: &Answering) {
+///
+/// `read_flags` are the flags the occlusion reads pass to `GetData`.
+fn poll(name: &str, keys: &'static str, answering: &Answering, read_flags: u32) {
     // Before the device: its creation logs, so the layer log is written after
     // this mark whatever the benchmark's warm-up logs.
     let tsc = TscClock::calibrated();
@@ -118,7 +138,7 @@ fn poll(name: &str, keys: &'static str, answering: &Answering) {
     let mut frame = 0;
     for _ in 0..WARM_UP_FRAMES {
         assert!(h.pump(), "WM_QUIT during warm-up");
-        scene.read_occlusion(frame);
+        scene.read_occlusion(frame, read_flags);
         scene.draw(frame);
         scene.throttle(frame);
         ok(h.present(), "Present");
@@ -129,7 +149,7 @@ fn poll(name: &str, keys: &'static str, answering: &Answering) {
 
     let start = log.start_span(started, || {
         assert!(h.pump(), "WM_QUIT outside the measured frames");
-        scene.read_occlusion(frame);
+        scene.read_occlusion(frame, read_flags);
         scene.draw(frame);
         scene.throttle(frame);
         ok(h.present(), "Present");
@@ -144,7 +164,7 @@ fn poll(name: &str, keys: &'static str, answering: &Answering) {
     let (mut ready, mut pending) = (0, 0);
     while clock.frames() < MEASURED_FRAMES || clock.elapsed() < start.length() {
         assert!(h.pump(), "WM_QUIT during the measured frames");
-        let occlusion = scene.read_occlusion(frame);
+        let occlusion = scene.read_occlusion(frame, read_flags);
         ready += occlusion.ready;
         pending += occlusion.pending;
         scene.draw(frame);
@@ -159,7 +179,7 @@ fn poll(name: &str, keys: &'static str, answering: &Answering) {
     let end = MemorySample::now();
     let span = start.end(&log, || {
         assert!(h.pump(), "WM_QUIT outside the measured frames");
-        scene.read_occlusion(frame);
+        scene.read_occlusion(frame, read_flags);
         scene.draw(frame);
         scene.throttle(frame);
         ok(h.present(), "Present");
@@ -183,7 +203,7 @@ fn poll(name: &str, keys: &'static str, answering: &Answering) {
          harness configuration, over MTLD3D_CONFIG: {keys}\n\
          per frame: Issue(END) of this frame's EVENT query, then GetData(FLUSH) on the \
          previous frame's until S_OK, then Present; each frame reads the previous frame's \
-         occlusion queries once with GetData(0)\n\
+         occlusion queries once with GetData({read_flags:#x})\n\
          warm-up: {WARM_UP_FRAMES} frames\n\
          measured: {frames} frames in {elapsed:.2?} (at least {MEASURED_FRAMES} frames \
          and {length:?}, {start})\n\
@@ -362,8 +382,8 @@ impl<'h> Scene<'h> {
         scene
     }
 
-    /// Read the previous frame's occlusion queries once each, without FLUSH.
-    fn read_occlusion(&self, frame: u32) -> OcclusionReads {
+    /// Read the previous frame's occlusion queries once each, passing `flags`.
+    fn read_occlusion(&self, frame: u32, flags: u32) -> OcclusionReads {
         let set = set_of(frame + 1);
         let mut reads = OcclusionReads {
             ready: 0,
@@ -373,10 +393,10 @@ impl<'h> Scene<'h> {
             return reads;
         }
         for query in &self.occlusion[set] {
-            match query.data_u32(0) {
+            match query.data_u32(flags) {
                 (D3D_OK, _) => reads.ready += 1,
                 (S_FALSE, _) => reads.pending += 1,
-                (hr, _) => panic!("occlusion GetData(0): 0x{hr:08X}"),
+                (hr, _) => panic!("occlusion GetData({flags:#x}): 0x{hr:08X}"),
             }
         }
         reads

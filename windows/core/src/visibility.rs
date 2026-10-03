@@ -62,6 +62,22 @@ pub enum QueryStatus {
     Issued,
 }
 
+/// What an `Issue(D3DISSUE_END)` without `D3DISSUE_BEGIN` does to an occlusion query.
+///
+/// Only an open span has anything to close. An END on a query that was never
+/// begun opens and closes an empty span, so the query answers with the zero
+/// its no draws counted. An END on a span already closed changes nothing, so
+/// the query keeps the result of the span the first END closed.
+#[derive(Debug, PartialEq, Eq)]
+pub enum EndIssue {
+    /// A span is open: the END closes it.
+    Close,
+    /// The query was never begun: the END opens a span and closes it at once.
+    OpenAndClose,
+    /// The last span is already closed: the END is ignored.
+    Keep,
+}
+
 /// Shared counted object behind a `Direct3DQuery9`.
 ///
 /// Held by `Arc` so the encoder-side pending list can keep the core alive
@@ -307,6 +323,24 @@ impl VisibilityQueryCore {
         self.mailbox().end_requested.load(Ordering::Acquire) != 0
     }
 
+    /// Whether the API thread has a span open: begun and not ended since.
+    #[must_use]
+    pub fn span_open(&self) -> bool {
+        self.mailbox().requested_generation.load(Ordering::Acquire) != 0 && !self.end_requested()
+    }
+
+    /// What an `Issue(D3DISSUE_END)` without `D3DISSUE_BEGIN` does now, see [`EndIssue`].
+    #[must_use]
+    pub fn end_issue(&self) -> EndIssue {
+        if self.mailbox().requested_generation.load(Ordering::Acquire) == 0 {
+            EndIssue::OpenAndClose
+        } else if self.end_requested() {
+            EndIssue::Keep
+        } else {
+            EndIssue::Close
+        }
+    }
+
     /// Slot where Metal started counting the segment currently open.
     ///
     /// Paired with the allocator's next index to make the half-open span
@@ -317,10 +351,8 @@ impl VisibilityQueryCore {
 
     /// Submit-seq the encoder will retire this query at, set when the END closure runs.
     ///
-    /// `0` means END has not yet been processed. API-thread
-    /// `GetData(FLUSH)` reads this against the device's `coherent_seq` to
-    /// skip the encoder round-trip when intake provably can't finalize
-    /// this query yet.
+    /// `0` means the encoder has not processed the END of the bracket the
+    /// API thread last requested.
     pub fn seq_end_loaded(&self) -> u64 {
         if self.mailbox().end_generation.load(Ordering::Acquire)
             == self.mailbox().requested_generation.load(Ordering::Acquire)
@@ -797,6 +829,16 @@ impl VisibilityQueryState {
     /// directly.
     pub const fn bump_slot(&mut self) -> Option<u32> {
         self.allocator.bump()
+    }
+
+    /// The slot the next allocation would hand out: the frame's high-water mark.
+    ///
+    /// Where a span begun without a slot starts. Every slot below it was
+    /// reserved before the span began, and once the frame is exhausted no slot
+    /// is reserved after it, so a segment cut from there covers nothing.
+    #[must_use]
+    pub const fn next_slot(&self) -> u32 {
+        self.allocator.next
     }
 
     /// Record a query as open between BEGIN and END.

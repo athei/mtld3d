@@ -2633,10 +2633,13 @@ impl FrameEncoder {
     /// first call in the frame.
     pub fn begin_visibility_query(&mut self, core: &Arc<VisibilityQueryCore>, generation: u64) {
         let slot = self.allocate_visibility_slot();
+        // Without a slot the frame is exhausted and the span starts at its
+        // high-water mark, so a frame boundary cuts an empty segment rather
+        // than one over the slots other spans counted into.
         core.begin_recorded(
             generation,
             self.current_submit_seq,
-            slot.unwrap_or(0),
+            slot.unwrap_or_else(|| self.visibility.next_slot()),
             self.pass_state.current_color_logical_size(),
             self.pass_state.current_color_size(),
             self.visibility.draws_seen(),

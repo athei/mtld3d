@@ -1,5 +1,7 @@
 //! Query objects: the EVENT fence path (issue → get-data signalled).
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use mtld3d_tests::{Harness, HarnessConfig, PosColorVertex, Query};
 use mtld3d_types::{
     D3DCLEAR_TARGET, D3DCLEAR_ZBUFFER, D3DCMP_LESS, D3DERR_NOTAVAILABLE, D3DFMT_D24S8,
@@ -9,6 +11,8 @@ use mtld3d_types::{
     D3DQUERYTYPE_TIMESTAMPFREQ, D3DRS_LIGHTING, D3DRS_ZENABLE, D3DRS_ZFUNC, D3DUSAGE_DYNAMIC,
     D3DUSAGE_WRITEONLY, S_FALSE,
 };
+
+use super::device::{logged_lines, run_in_private_log_child, running_as};
 
 /// Poll an EVENT query without other calls that could submit its work.
 fn wait_for_event(q: &Query<'_>, flags: u32) {
@@ -520,6 +524,251 @@ fn occlusion_query_past_the_slot_budget_reads_fully_visible() {
         u32::MAX,
         "a query the frame had no slot left for, with a draw in it, reads fully visible"
     );
+}
+
+#[test]
+fn an_end_with_no_begin_counts_nothing() {
+    // `Issue(D3DISSUE_END)` on an occlusion query that was never begun opens
+    // and closes an empty span: no draw is inside it, so it counts nothing.
+    // Another query of the same frame counts a full frame first, so a span
+    // that read the frame's slots from the start would report that frame.
+    let h = Harness::with_config("query.flushImmediate=false");
+    let dims = h.dims();
+    let Some(counted) = h.create_query(D3DQUERYTYPE_OCCLUSION) else {
+        panic!("OCCLUSION query should be supported");
+    };
+    let Some(unbegun) = h.create_query(D3DQUERYTYPE_OCCLUSION) else {
+        panic!("OCCLUSION query should be supported");
+    };
+    arm_for_counting_draws(&h);
+
+    assert!(h.pump(), "WM_QUIT");
+    assert_eq!(h.begin_scene(), 0);
+    assert_eq!(h.clear_target(0xFF00_0000), 0);
+    assert_eq!(counted.issue(D3DISSUE_BEGIN), 0, "Issue(BEGIN)");
+    draw_full_frame(&h, "the draw the other query counts");
+    assert_eq!(counted.issue(D3DISSUE_END), 0, "Issue(END)");
+    assert_eq!(unbegun.issue(D3DISSUE_END), 0, "Issue(END) with no BEGIN");
+    assert_eq!(h.end_scene(), 0);
+    assert_eq!(h.present(), 0);
+
+    assert_full_frames(
+        occlusion_count(&counted, "the counted span"),
+        1,
+        dims,
+        "a quad covering the frame",
+    );
+    assert_eq!(
+        occlusion_count(&unbegun, "the span END alone made"),
+        0,
+        "an END with no BEGIN closes an empty span"
+    );
+}
+
+#[test]
+fn a_second_end_keeps_the_count_of_the_first() {
+    // A second `Issue(D3DISSUE_END)` on a span already closed has no span to
+    // close. The query keeps the result of the span the first END closed, so
+    // a frame drawn once inside it counts once.
+    let h = Harness::with_config("query.flushImmediate=false");
+    let dims = h.dims();
+    let Some(q) = h.create_query(D3DQUERYTYPE_OCCLUSION) else {
+        panic!("OCCLUSION query should be supported");
+    };
+    arm_for_counting_draws(&h);
+
+    assert!(h.pump(), "WM_QUIT");
+    assert_eq!(h.begin_scene(), 0);
+    assert_eq!(h.clear_target(0xFF00_0000), 0);
+    assert_eq!(q.issue(D3DISSUE_BEGIN), 0, "Issue(BEGIN)");
+    draw_full_frame(&h, "the counted draw");
+    assert_eq!(q.issue(D3DISSUE_END), 0, "Issue(END)");
+    assert_eq!(q.issue(D3DISSUE_END), 0, "a second Issue(END)");
+    assert_eq!(h.end_scene(), 0);
+    assert_eq!(h.present(), 0);
+
+    assert_full_frames(
+        occlusion_count(&q, "the span ended twice"),
+        1,
+        dims,
+        "the span the first END closed",
+    );
+}
+
+#[test]
+fn a_span_begun_past_the_slot_budget_with_no_draw_counts_nothing() {
+    // A query begun once the frame's slots are spent counts into no slot. Cut
+    // by the frame boundary before its END, the part of the span in that
+    // frame covers none of the frame's slots: they were all reserved before
+    // it began, and the first of them holds a full frame another query
+    // counted. With no draw in the span, its exact answer is zero.
+    const FILLERS: usize = 600;
+
+    let h = Harness::with_config("query.flushImmediate=false");
+    let dims = h.dims();
+    let Some(counted) = h.create_query(D3DQUERYTYPE_OCCLUSION) else {
+        panic!("OCCLUSION query should be supported");
+    };
+    let fillers: Vec<Query<'_>> = (0..FILLERS)
+        .map(|_| {
+            h.create_query(D3DQUERYTYPE_OCCLUSION)
+                .expect("OCCLUSION query should be supported")
+        })
+        .collect();
+    let Some(starved) = h.create_query(D3DQUERYTYPE_OCCLUSION) else {
+        panic!("OCCLUSION query should be supported");
+    };
+    arm_for_counting_draws(&h);
+
+    assert!(h.pump(), "WM_QUIT");
+    assert_eq!(h.begin_scene(), 0);
+    assert_eq!(h.clear_target(0xFF00_0000), 0);
+    assert_eq!(counted.issue(D3DISSUE_BEGIN), 0, "Issue(BEGIN)");
+    draw_full_frame(&h, "the draw the first slot counts");
+    assert_eq!(counted.issue(D3DISSUE_END), 0, "Issue(END)");
+    for q in &fillers {
+        assert_eq!(q.issue(D3DISSUE_BEGIN), 0);
+        assert_eq!(q.issue(D3DISSUE_END), 0);
+    }
+    assert_eq!(
+        starved.issue(D3DISSUE_BEGIN),
+        0,
+        "Issue(BEGIN) past the budget"
+    );
+    assert_eq!(h.end_scene(), 0);
+    assert_eq!(h.present(), 0);
+
+    assert_eq!(h.begin_scene(), 0);
+    assert_eq!(h.clear_target(0xFF00_0000), 0);
+    assert_eq!(starved.issue(D3DISSUE_END), 0, "Issue(END)");
+    assert_eq!(h.end_scene(), 0);
+    assert_eq!(h.present(), 0);
+
+    assert_full_frames(
+        occlusion_count(&counted, "the counted span"),
+        1,
+        dims,
+        "a quad covering the frame",
+    );
+    assert_eq!(
+        occlusion_count(&starved, "the starved span"),
+        0,
+        "a span with no draw in it counts nothing, whatever slot it began at"
+    );
+}
+
+/// The name the workload child of `a_flush_wait_on_a_sent_end_submits_nothing_more` runs under.
+const FLUSH_WAIT_CHILD_NAME: &str = "occlusion-flush-wait.exe";
+
+/// The log filter of that child: the frame command buffers each submission retires.
+const FLUSH_WAIT_LOG_FILTER: &str = "warn,mtld3d::unix::command=debug";
+
+#[test]
+fn a_flush_wait_on_a_sent_end_submits_nothing_more() {
+    if running_as(FLUSH_WAIT_CHILD_NAME) {
+        flush_wait_workload();
+        return;
+    }
+    // The submissions are counted from the frame command buffers the log
+    // records, so the workload runs alone in a log directory of its own.
+    run_in_private_log_child(
+        FLUSH_WAIT_CHILD_NAME,
+        "query::a_flush_wait_on_a_sent_end_submits_nothing_more",
+        FLUSH_WAIT_LOG_FILTER,
+    );
+}
+
+/// Run the same frames on two devices; only one reads a query whose END was sent mid-frame.
+///
+/// A `D3DGETDATA_FLUSH` read of a query whose END rode a frame already handed
+/// over waits for that frame alone, so it adds no submission: both devices
+/// retire the same number of frame command buffers. A read of a query whose
+/// END is still in the recording frame submits that frame first, and both
+/// devices make that read, so it adds one submission to each. Both reads
+/// answer with the count without a Present.
+fn flush_wait_workload() {
+    let reader = Harness::with_config("query.flushImmediate=false");
+    let control = Harness::with_config("query.flushImmediate=false");
+    for (h, reads_sent) in [(&reader, true), (&control, false)] {
+        let dims = h.dims();
+        let Some(sent) = h.create_query(D3DQUERYTYPE_OCCLUSION) else {
+            panic!("OCCLUSION query should be supported");
+        };
+        let Some(unsent) = h.create_query(D3DQUERYTYPE_OCCLUSION) else {
+            panic!("OCCLUSION query should be supported");
+        };
+        arm_for_counting_draws(h);
+
+        assert!(h.pump(), "WM_QUIT");
+        assert_eq!(h.begin_scene(), 0);
+        assert_eq!(h.clear_target(0xFF00_0000), 0);
+        assert_eq!(sent.issue(D3DISSUE_BEGIN), 0, "Issue(BEGIN)");
+        draw_full_frame(h, "the draw of the span the Present sends");
+        assert_eq!(sent.issue(D3DISSUE_END), 0, "Issue(END)");
+        assert_eq!(h.end_scene(), 0);
+        assert_eq!(h.present(), 0);
+
+        assert_eq!(h.begin_scene(), 0);
+        assert_eq!(h.clear_target(0xFF00_0000), 0);
+        draw_full_frame(h, "a draw of the frame being recorded");
+        if reads_sent {
+            assert_full_frames(
+                occlusion_count(&sent, "the span a Present sent"),
+                1,
+                dims,
+                "a quad covering the frame",
+            );
+        }
+        assert_eq!(unsent.issue(D3DISSUE_BEGIN), 0, "Issue(BEGIN)");
+        draw_full_frame(h, "the draw of the span still being recorded");
+        assert_eq!(unsent.issue(D3DISSUE_END), 0, "Issue(END)");
+        assert_full_frames(
+            occlusion_count(&unsent, "the span in the recording frame"),
+            1,
+            dims,
+            "a quad covering the frame, read without a Present",
+        );
+        assert_eq!(h.end_scene(), 0);
+        assert_eq!(h.present(), 0);
+    }
+    drop(reader);
+    drop(control);
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let per_queue = retired_frame_buffers();
+        let counts: Vec<usize> = per_queue.values().map(BTreeSet::len).collect();
+        let settled = counts.len() == 2 && counts.iter().all(|&n| n >= 3) && counts[0] == counts[1];
+        if settled {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "both devices retire as many frame command buffers, at least three each \
+             (the read of a sent END submits nothing): {counts:?}"
+        );
+        std::thread::yield_now();
+    }
+}
+
+/// The frame command buffers this process's log saw retire, as sequence numbers per queue.
+fn retired_frame_buffers() -> BTreeMap<String, BTreeSet<String>> {
+    let mut per_queue: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for line in logged_lines("command-buffer buffer=") {
+        if !line.contains(" role=frame ") {
+            continue;
+        }
+        let field = |key: &str| {
+            line.split_whitespace()
+                .find_map(|word| word.strip_prefix(key))
+                .map(str::to_owned)
+        };
+        let (Some(queue), Some(seq)) = (field("queue="), field("seq=")) else {
+            continue;
+        };
+        per_queue.entry(queue).or_default().insert(seq);
+    }
+    per_queue
 }
 
 #[test]

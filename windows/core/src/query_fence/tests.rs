@@ -1,4 +1,4 @@
-use super::{event_completed, event_needs_submit};
+use super::{end_in_recording_frame, event_completed, event_needs_submit};
 
 /// An EVENT query completes only when its frame retires.
 ///
@@ -41,4 +41,22 @@ fn an_event_query_in_the_open_frame_forces_a_submit() {
         !event_needs_submit(0, 7),
         "a query never issued waits on nothing"
     );
+}
+
+/// An END stamped with the recording frame's seq is unsent; an earlier one is not.
+///
+/// The occlusion `D3DGETDATA_FLUSH` wait submits the recording frame only in
+/// the first case, so a query ended in a frame already handed over costs no
+/// mid-frame submission.
+#[test]
+fn an_end_is_in_the_recording_frame_only_under_its_seq() {
+    assert!(
+        end_in_recording_frame(7, 7),
+        "ended in the frame being recorded"
+    );
+    assert!(
+        !end_in_recording_frame(6, 7),
+        "ended in a frame already handed over"
+    );
+    assert!(!end_in_recording_frame(0, 7), "never ended");
 }

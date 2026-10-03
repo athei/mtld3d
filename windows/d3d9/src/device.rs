@@ -2429,9 +2429,10 @@ impl DeviceInner {
     ///
     /// The encoder waits (via `WaitForGpuRetire` thunk → Metal
     /// `waitUntilCompleted`) only when `coherent_seq < target_seq`;
-    /// otherwise it just runs intake locally. `target_seq == 0` (END operation
-    /// not yet processed: game called `Issue(END)` but not Present) skips the
-    /// round-trip entirely so the FLUSH poll loop can return `S_FALSE` fast.
+    /// otherwise it just runs intake locally. The encoder takes the request
+    /// after every frame handed to it before, so the frame `target_seq` names
+    /// has been encoded and committed by the time it waits. `target_seq == 0`,
+    /// a query never ended, skips the round-trip.
     pub fn encoder_intake_visibility_for(&self, target_seq: u64) -> Result<(), i32> {
         self.encoder.status()?;
         if target_seq == 0 {

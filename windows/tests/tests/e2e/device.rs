@@ -1851,7 +1851,7 @@ fn logged_pacing() -> Vec<String> {
 ///
 /// The log is the one the layer writes into this process's log directory,
 /// which for a workload child holds its device's lines and nobody else's.
-fn logged_lines(needle: &str) -> Vec<String> {
+pub fn logged_lines(needle: &str) -> Vec<String> {
     process_log()
         .lines()
         .filter(|line| line.contains(needle))
