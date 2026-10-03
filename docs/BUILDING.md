@@ -108,6 +108,12 @@ mechanism.
 unit tests and the end-to-end suite; both are green before every commit.
 [`CONTRIBUTING.md`](../CONTRIBUTING.md#the-gates) lists what each one runs.
 
+The test legs run with Apple's Metal validation layer on and the Metal HUD
+off; the Makefile says why beside `MTL_HUD_ENABLED`. Setting
+`MTL_HUD_ENABLED=1` on the command line or in the environment turns the HUD
+on for the end-to-end suite, to watch a run. The conformance runner keeps it
+off for its test processes either way.
+
 Every test leg installs into the shared Wine tree first, so two checkouts
 testing at once overwrite each other's builds. `ISOLATED=1` avoids that: it
 clones the SDK and the prefix into `.wine-isolated/` inside the checkout and

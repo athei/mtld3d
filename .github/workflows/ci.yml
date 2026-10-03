@@ -74,10 +74,6 @@ env:
   RUST_NIGHTLY: nightly-2026-08-18
   CARGO_TOOLS: xwin@0.10.0
   NEXTEST_VERSION: 0.9.143
-  # The paravirtual GPU on a runner does not implement the counters the Metal HUD
-  # samples, and says so on every launch. The validation layer keeps the
-  # Makefile's default of on: it catches the misuse these legs exist to find.
-  MTL_HUD_ENABLED: "0"
 
 # The shape: two machines compile, everything else replays. `build` makes the
 # stage every test leg installs and runs from, so the suites fan out over
