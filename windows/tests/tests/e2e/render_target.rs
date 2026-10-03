@@ -4,7 +4,7 @@
 
 use mtld3d_tests::{
     CubeTexture, Harness, HarnessConfig, PosColorVertex, Rgba8, RhwVertex, Surface, SwapChain,
-    TexturedVertex, Vertex, VolumeVertex,
+    Texture, TexturedVertex, Vertex, VolumeVertex,
 };
 use mtld3d_types::{
     D3D_OK, D3DBLEND_INVSRCALPHA, D3DBLEND_SRCALPHA, D3DCLEAR_TARGET, D3DCLEAR_ZBUFFER,
@@ -3278,11 +3278,74 @@ fn color_fill_autogen_render_target_regenerates_the_mip_chain() {
         "ColorFill green"
     );
 
-    // Sample level 4 (4x4) of the 64x64 chain. MAXMIPLEVEL is the most
-    // detailed level the sampler may use, so the draw cannot read the filled
-    // level 0 instead.
+    sample_mip_level_4(&h, &rt);
+    assert_eq!(h.present(), 0);
+
+    let center = Rgba8::from_pixel(h.read_pixel(320, 240));
+    assert!(
+        center.g > 200 && center.r < 40 && center.b < 40,
+        "the small mip carries the fill colour, got {center:?}"
+    );
+}
+
+/// A rejected `Reset` regenerates the chain of an autogen render target it unbinds.
+///
+/// The `Reset` returns render target 0 to the back buffer, and an autogen
+/// texture leaving render target 0 rebuilds its lower levels from level 0,
+/// as `SetRenderTarget` does. The chain is seeded red, level 0 is cleared
+/// green while bound, and the texture, a held `D3DPOOL_DEFAULT` resource,
+/// rejects the `Reset`; the small level then reads green, red while stale.
+#[test]
+fn rejected_reset_regenerates_a_bound_autogen_render_target() {
+    let h = Harness::new();
+    let rt = h.create_texture(
+        64,
+        64,
+        1,
+        D3DUSAGE_RENDERTARGET | D3DUSAGE_AUTOGENMIPMAP,
+        D3DFMT_A8R8G8B8,
+        D3DPOOL_DEFAULT,
+    );
+    let rt_surface = rt.surface_level(0);
+    {
+        let backbuffer = h.render_target(0);
+        assert_eq!(h.set_render_target(0, &rt_surface), 0, "bind RT");
+        assert_eq!(h.clear_target(RED), 0, "clear RT red");
+        assert_eq!(
+            h.set_render_target(0, &backbuffer),
+            0,
+            "unbinding regenerates the chain red"
+        );
+    }
+    assert_eq!(h.set_render_target(0, &rt_surface), 0, "bind RT again");
+    assert_eq!(h.clear_target(GREEN), 0, "clear level 0 green");
+    assert_eq!(
+        h.reset(640, 480),
+        D3DERR_INVALIDCALL,
+        "the held texture rejects the Reset"
+    );
+    let rt0 = h.render_target(0);
+    assert_ne!(rt0.as_ptr(), rt_surface.as_ptr(), "RT0 left the texture");
+    drop(rt0);
+
+    sample_mip_level_4(&h, &rt);
+    let center = Rgba8::from_pixel(h.read_pixel(320, 240));
+    assert!(
+        center.g > 200 && center.r < 40 && center.b < 40,
+        "the small mip carries level 0's green, got {center:?}"
+    );
+    drop(rt_surface);
+    drop(rt);
+    assert_eq!(h.reset(640, 480), D3D_OK, "Reset once the texture is gone");
+}
+
+/// Draw the 4x4 level of the 64x64 `rt` over the middle of a black render target 0.
+///
+/// MAXMIPLEVEL is the most detailed level the sampler may use, so the draw
+/// cannot read a more detailed level instead. Leaves the scene ended.
+fn sample_mip_level_4(h: &Harness, rt: &Texture<'_>) {
     assert_eq!(h.clear_target(BLACK), 0, "clear backbuffer black");
-    assert_eq!(h.set_texture(0, &rt), 0, "bind the filled texture");
+    assert_eq!(h.set_texture(0, rt), 0, "bind the filled texture");
     for (state, value) in [
         (D3DTSS_COLOROP, D3DTOP_SELECTARG1),
         (D3DTSS_COLORARG1, D3DTA_TEXTURE),
@@ -3363,13 +3426,6 @@ fn color_fill_autogen_render_target_regenerates_the_mip_chain() {
         "sample the regenerated mip"
     );
     assert_eq!(h.end_scene(), 0);
-    assert_eq!(h.present(), 0);
-
-    let center = Rgba8::from_pixel(h.read_pixel(320, 240));
-    assert!(
-        center.g > 200 && center.r < 40 && center.b < 40,
-        "the small mip carries the fill colour, got {center:?}"
-    );
 }
 
 #[test]

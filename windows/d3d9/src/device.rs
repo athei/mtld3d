@@ -2638,6 +2638,13 @@ impl DeviceInner {
     /// flow into the next frame via `fresh_frame`, but the viewport push
     /// here references the new dimensions.
     pub fn reset_to_defaults(&mut self) {
+        // An autogen texture bound as a render target regenerates its mip
+        // chain when it stops being one, as `SetRenderTarget` does on the way
+        // off it; queued ahead of the teardown that may release it.
+        let autogen = core::mem::replace(&mut self.cur_autogen_rt_ids, [None; RENDER_TARGET_SLOTS]);
+        for old_id in autogen.into_iter().flatten() {
+            self.push_control(crate::device::GenerateMipmapsOrderedOp { old_id });
+        }
         self.bound_rt.teardown();
         // Reset reverts the colour target to the implicit backbuffer and the
         // depth/stencil to the implicit auto-depth default, and unbinds render
@@ -2651,7 +2658,6 @@ impl DeviceInner {
                 });
             }
         }
-        self.cur_autogen_rt_ids = [None; RENDER_TARGET_SLOTS];
         self.last_depth_binding = None;
         self.flags.remove(DeviceFlags::DEPTH_EXPLICITLY_UNBOUND);
         self.bound_buffers.teardown();
@@ -4535,9 +4541,13 @@ extern "system" fn device_reset(this: *mut c_void, present_params: *mut c_void) 
         pp.multi_sample_quality,
         new_sample_count,
     );
+    // A back buffer an earlier `Reset` failed to create takes the recreate
+    // path at any size: the dimensions that `Reset` adopted are not a back
+    // buffer that exists.
     let resized = pp.back_buffer_width != dev.backbuffer_width
         || pp.back_buffer_height != dev.backbuffer_height
-        || multi_sample_changed;
+        || multi_sample_changed
+        || dev.backbuffer_handle.is_null();
     // Reset adopts the present params' auto depth-stencil configuration: an
     // enabled flag (re)creates the implicit depth-stencil at the given format,
     // a disabled flag drops it. This is independent of a resize, so resolve the
@@ -4657,15 +4667,15 @@ extern "system" fn device_reset(this: *mut c_void, present_params: *mut c_void) 
 
 /// Fail a well-formed `Reset` with the device state at its defaults.
 ///
-/// D3D9 restores the device state before it checks what can make a `Reset`
-/// fail, so a rejected one still leaves every binding released and every
-/// state at its default: render target 0 on the back buffer, the depth
-/// stencil on the implicit surface, no recording and no open scene. The
-/// frame in flight is delivered first, as a same-size `Reset` does, and
-/// [`fail_reset`] replaces it, so the attachments it records follow the
-/// defaults as well; without that, a draw after the rejection would be built
-/// for the back buffer while its pass still carried the targets the
-/// application had bound.
+/// D3D9 resets the device state before it checks what can make a `Reset`
+/// fail, so a rejected one still releases every binding and returns every
+/// state to its default, leaving what a successful `Reset` leaves: render
+/// target 0 on the back buffer, the depth stencil on the implicit surface,
+/// no recording and no open scene. The frame in flight is delivered first,
+/// as a same-size `Reset` does, and [`fail_reset`] replaces it, so the
+/// attachments it records follow the defaults as well; without that, a draw
+/// after the rejection would be built for the back buffer while its pass
+/// still carried the targets the application had bound.
 fn reject_reset(dev: &mut DeviceInner) -> i32 {
     if let Err(hr) = dev.flush_current_frame_blocking() {
         dev.flags.insert(DeviceFlags::NOT_RESET);
@@ -4676,7 +4686,8 @@ fn reject_reset(dev: &mut DeviceInner) -> i32 {
 
 /// End a failed `Reset` on a fresh frame with the state defaults, answering `hr`.
 ///
-/// The frame in flight was already delivered by the caller. Past the point
+/// The frame in flight was already delivered by the caller, unless the
+/// encoder had already failed, which this then leaves latched. Past the point
 /// where `Reset` destroyed the implicit back buffer or depth texture, the
 /// frame that delivery left behind and the saved render-target and depth
 /// bindings still name the destroyed textures, so the frame is dropped
@@ -4894,6 +4905,7 @@ fn reset_recreate_resources(
         dev.set_backbuffer_handle(MetalHandle::NULL, MetalHandle::NULL);
         dev.set_backbuffer_msaa_handle(MetalHandle::NULL, MetalHandle::NULL);
         dev.set_depth_stencil_handle(MetalHandle::NULL);
+        dev.depth_stencil_format = 0;
         return Err(D3DERR_INVALIDCALL);
     }
     dev.set_backbuffer_handle(bb_params.texture_handle, bb_params.srgb_texture_handle);

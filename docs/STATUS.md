@@ -255,6 +255,10 @@ is in [`CONFORMANCE.md`](../unix/conformance/CONFORMANCE.md#kept-divergences).
 - The window procedure carrying cursor realization and the windowed
   auto-resize is the device window's, and follows a `Reset` that names another
   window; D3D9 subclasses the focus window instead. No knob.
+- A rejected `Reset` leaves render target 0 on the back buffer and the
+  depth stencil on the implicit surface, as a successful one does, where
+  the reference implementations leave both unbound; what D3D9 itself
+  leaves there is not observable. No knob.
 - `D3DRS_MULTISAMPLEANTIALIAS = FALSE` is ignored. No knob.
 - The adapter mode list leaves out every display size win32u cannot scale
   the monitor to in its 16-bit ratio, on every Wine, and a fullscreen request

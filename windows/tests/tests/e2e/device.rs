@@ -1390,11 +1390,20 @@ fn reset_bad_dims_rejected() {
         full_screen_refresh_rate_in_hz: 0,
         presentation_interval: 0,
     };
+    // The parameters pass the swap-effect, count and interval checks, so the
+    // rejection still ends an open recording.
+    assert_eq!(h.begin_state_block(), D3D_OK, "BeginStateBlock");
     assert_eq!(
         h.reset_params(&mut pp),
         D3DERR_INVALIDCALL,
         "fullscreen 0x0 Reset must be INVALIDCALL"
     );
+    assert_eq!(
+        h.begin_state_block(),
+        D3D_OK,
+        "the rejected Reset ended the open recording"
+    );
+    drop(h.end_state_block());
 }
 
 #[test]

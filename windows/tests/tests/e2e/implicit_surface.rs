@@ -645,10 +645,12 @@ fn bind_implicit_surfaces_by_hand(h: &Harness) {
 /// After a `Reset` failed past its destroy, a `Clear` and the next `Reset` find nothing destroyed.
 ///
 /// A back buffer Metal refuses (65535 texels a side) fails `Reset` after the
-/// old back buffer and depth texture are destroyed. A `Clear` recorded
-/// before the `Reset` the device then requires reaches the GPU with the
-/// flush that `Reset` starts with, and must find neither the destroyed
-/// textures nor the saved bindings of them by hand; the device then draws.
+/// old back buffer and depth texture are destroyed. The same request again
+/// fails the same way rather than taking the same-size path, as no back
+/// buffer of that size exists. A `Clear` recorded before the `Reset` the
+/// device then requires reaches the GPU with the flush that `Reset` starts
+/// with, and must find neither the destroyed textures nor the saved bindings
+/// of them by hand; the device then draws.
 #[test]
 fn a_reset_whose_back_buffer_is_refused_leaves_no_destroyed_texture_bound() {
     const OVERSIZE: u32 = 0xffff;
@@ -659,6 +661,12 @@ fn a_reset_whose_back_buffer_is_refused_leaves_no_destroyed_texture_bound() {
         h.reset(OVERSIZE, OVERSIZE),
         D3DERR_INVALIDCALL,
         "a back buffer Metal refuses fails the Reset"
+    );
+    assert_eq!(h.test_cooperative_level(), D3DERR_DEVICENOTRESET);
+    assert_eq!(
+        h.reset(OVERSIZE, OVERSIZE),
+        D3DERR_INVALIDCALL,
+        "the same refused size fails the Reset again"
     );
     assert_eq!(h.test_cooperative_level(), D3DERR_DEVICENOTRESET);
     assert_eq!(
