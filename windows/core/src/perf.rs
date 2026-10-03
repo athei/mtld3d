@@ -1277,6 +1277,12 @@ struct EncoderFrameCounters {
     /// unix side copied it into its upload ring. Non-indexed fans ride the
     /// shared pattern buffer and are not counted. A tripwire: 0 is the goal.
     fan_generated: u32,
+    /// Draws whose draw path did not run at its pinned stack page offset.
+    ///
+    /// The unix side runs every draw at one 4 KiB stack page offset so that
+    /// frames above it cannot move its calls across a page boundary. A
+    /// tripwire for a build that lost the pin: 0 is the goal.
+    draw_unpinned: u32,
     /// `DrawIndexedPrimitiveUP` draws, whose inline indices the unix side copies into its ring.
     up_indexed: u32,
     /// UP draws whose inline vertices exceed `SET_BYTES_MAX` and go through the ring.
@@ -1382,6 +1388,7 @@ impl EncoderFrameCounters {
             op_sub_detail: [0; OpSubDetail::COUNT],
             pipeline_memo_hits: 0,
             fan_generated: 0,
+            draw_unpinned: 0,
             up_indexed: 0,
             up_vertex_oversized: 0,
             pipeline_memo_calls: 0,
@@ -2449,6 +2456,11 @@ impl EncoderPerfState {
         self.enc.fan_generated = self.enc.fan_generated.saturating_add(1);
     }
 
+    /// Count one draw that ran off its pinned stack page offset.
+    pub const fn bump_draw_unpinned(&mut self) {
+        self.enc.draw_unpinned = self.enc.draw_unpinned.saturating_add(1);
+    }
+
     /// Count one `DrawIndexedPrimitiveUP` draw.
     pub const fn bump_up_indexed(&mut self) {
         self.enc.up_indexed = self.enc.up_indexed.saturating_add(1);
@@ -2990,6 +3002,8 @@ impl EncoderPerfState {
     #[inline]
     pub const fn bump_fan_generated(&mut self) {}
     #[inline]
+    pub const fn bump_draw_unpinned(&mut self) {}
+    #[inline]
     pub const fn bump_up_indexed(&mut self) {}
     #[inline]
     pub const fn bump_up_vertex_oversized(&mut self) {}
@@ -3242,6 +3256,7 @@ struct PerfWindow {
     /// Pipeline-resolve memo hits / calls — rendered as a hit rate (sum only).
     pipeline_memo_hits: Stat,
     fan_generated: Stat,
+    draw_unpinned: Stat,
     up_indexed: Stat,
     up_vertex_oversized: Stat,
     pipeline_memo_calls: Stat,
@@ -3516,6 +3531,7 @@ impl PerfWindow {
         self.pipeline_memo_hits
             .add(u64::from(s.enc.pipeline_memo_hits));
         self.fan_generated.add(u64::from(s.enc.fan_generated));
+        self.draw_unpinned.add(u64::from(s.enc.draw_unpinned));
         self.up_indexed.add(u64::from(s.enc.up_indexed));
         self.up_vertex_oversized
             .add(u64::from(s.enc.up_vertex_oversized));
@@ -6483,6 +6499,7 @@ fn render_kv(w: &PerfWindow, c: &PerfWindow, caches: &CacheSizes, window_secs: f
     kv.total("pipeline_memo_hits", c.pipeline_memo_hits.sum);
     kv.total("pipeline_memo_calls", c.pipeline_memo_calls.sum);
     kv.total("fan_generated", c.fan_generated.sum);
+    kv.total("draw_unpinned", c.draw_unpinned.sum);
     kv.total("up_indexed", c.up_indexed.sum);
     kv.total("up_oversized", c.up_vertex_oversized.sum);
 
