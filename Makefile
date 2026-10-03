@@ -377,9 +377,9 @@ INSTALL_DIRS := $(sort $(WINE_SDK) $(WINE_INSTALL_DIR))
 # is here to catch Metal misuse on a real GPU. The Metal HUD is off: no test
 # reads it, and it hooks every drawable present and reads the view's safe-area
 # insets, an AppKit call, from the dispatch thread on which Metal runs the
-# scheduled present. That read races the main thread laying out the same window
-# and can abort a test process inside AppKit. MTL_HUD_ENABLED=1 on the command
-# line or in the environment turns it back on to watch a run.
+# scheduled present. That read races AppKit's own work on the main thread and
+# can abort a test process inside AppKit. MTL_HUD_ENABLED=1 on the command line
+# or in the environment turns it back on to watch a run.
 export MTL_HUD_ENABLED ?= 0
 export MTL_DEBUG_LAYER ?= 1
 # Apple's variable, read by the Main Thread Checker that the test config below
