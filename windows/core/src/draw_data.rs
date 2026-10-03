@@ -398,8 +398,8 @@ unsafe impl crate::encoder_records::CommandRecord for DeclarationHeader {}
 
 // SAFETY: AttrSnapshot.ptr aliases immutable bytes in the retained command arena
 // or native per-frame ScratchArena owned by the frame being encoded.
-// CurrentSnapshot lives on FrameEncoder (encoder-thread-only). Send is
-// permitted but never actually crossed.
+// CurrentSnapshot lives on the packet's DrawReader, which only the encoder
+// thread replays. Send is permitted but never actually crossed.
 unsafe impl Send for AttrSnapshot {}
 
 impl AttrSnapshot {

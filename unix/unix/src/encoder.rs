@@ -454,7 +454,7 @@ pub struct StageLibHandles {
 /// thread; synchronous submission runs inline on the encoder thread.
 #[derive(Default)]
 struct FramePayload {
-    /// Per-frame scratch: decoded draw snapshots, shader constants, `DrawPrimitiveUP` data.
+    /// Per-frame scratch: shader constants, `DrawPrimitiveUP` data.
     ///
     /// Pointers to its chunks are embedded in `Command`s inside `passes`.
     /// Recycling it with the payload is what keeps steady-state frames from
@@ -9098,7 +9098,8 @@ fn run_frame(
                     }
                     Ok(())
                 };
-            // SAFETY: dispatch only appends native snapshot storage and genuine owners.
+            // SAFETY: dispatch decodes each snapshot in place into the packet's own reader
+            // and appends nothing for it; it only appends genuine owners.
             // The whole frame remains retained through submit or failure quarantine.
             let result = unsafe { packet.replay_one(consume) };
             match result {

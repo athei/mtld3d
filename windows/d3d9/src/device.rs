@@ -1703,11 +1703,11 @@ impl DeviceInner {
             failed_submit_seq_ptr: Arc::as_ptr(&self.failed_submit_seq) as u64,
         });
         frame.set_retained_bytes_ptr(Arc::as_ptr(&self.vbib_retained_bytes) as u64);
-        // Every cached snapshot pointer in the encoder's CurrentSnapshot
-        // aliases into the outgoing frame's `ScratchArena`, which is
-        // about to drop after the encoder drains it. Force the API
-        // thread to re-emit every Op::Set* on the first draw of the
-        // new frame.
+        // The next frame's packet decodes into a fresh, empty
+        // `DrawReader`, and the tokens the outgoing frame's snapshot
+        // held borrow that frame's command storage, released once the
+        // encoder drains it. Force the API thread to re-emit every
+        // snapshot section on the first draw of the new frame.
         self.snapshot_dirty = SnapshotDirty::all();
         self.reassert_saved_bindings();
         (frame, this_seq)
