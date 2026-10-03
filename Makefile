@@ -373,12 +373,14 @@ DENY_WARNINGS := --config 'build.warnings="deny"'
 # name the same clone, and the install loops must write it once.
 INSTALL_DIRS := $(sort $(WINE_SDK) $(WINE_INSTALL_DIR))
 
-# Both overridable, unlike the rest of these: the HUD and the validation layer
-# are here to catch Metal misuse on a real GPU, and a caller running against a
-# paravirtual one (a CI runner) has reason to turn them off, since neither has
-# anything useful to say about a device that does not implement the counters they
-# read.
-export MTL_HUD_ENABLED ?= 1
+# Both overridable, unlike the rest of these. The validation layer is on: it
+# is here to catch Metal misuse on a real GPU. The Metal HUD is off: no test
+# reads it, and it hooks every drawable present and reads the view's safe-area
+# insets, an AppKit call, from the dispatch thread on which Metal runs the
+# scheduled present. That read races the main thread laying out the same window
+# and can abort a test process inside AppKit. MTL_HUD_ENABLED=1 on the command
+# line or in the environment turns it back on to watch a run.
+export MTL_HUD_ENABLED ?= 0
 export MTL_DEBUG_LAYER ?= 1
 # Apple's variable, read by the Main Thread Checker that the test config below
 # loads into every test process (`debug.mainThreadChecker=true`): with it set,
@@ -1048,7 +1050,8 @@ stage: all
 #     it is made (MTC_CRASH_ON_REPORT, exported above) instead of surfacing as
 #     a rare death later in Wine's own code.
 #   - WINEDEBUG= (empty)        — silence the +msync debug channel's per-call spam.
-# MTL_DEBUG_LAYER stays on (inherited) so Metal API misuse fails the tests.
+# MTL_DEBUG_LAYER stays on (inherited) so Metal API misuse fails the tests;
+# MTL_HUD_ENABLED stays off (inherited), for the reason given beside it.
 #
 # SCALE=<n> additionally reruns the whole e2e suite at `render.scale = <n>`,
 # i.e. rasterizing the back buffer smaller than the resolution D3D9 reports and
