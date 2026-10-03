@@ -439,6 +439,7 @@ fn pass_shapes() -> Vec<PassShape> {
                 .filter(|&&(_, ps, _)| ps == TEXTURED_CASTER)
                 .map(|&(_, _, draws)| draws)
                 .sum(),
+            state: None,
         })
         .collect();
 
@@ -456,6 +457,7 @@ fn pass_shapes() -> Vec<PassShape> {
         ff_vs: SKY_DRAWS,
         ff_ps: SKY_DRAWS,
         textures: scene_textures,
+        state: None,
     });
     passes.extend((0..3).map(|_| PassShape {
         width: GLOW_WIDTH,
@@ -464,6 +466,7 @@ fn pass_shapes() -> Vec<PassShape> {
         ff_vs: 1,
         ff_ps: 0,
         textures: 4,
+        state: None,
     }));
     let quads = UI_BEFORE_MINIMAP + UI_AFTER_MINIMAP;
     passes.push(PassShape {
@@ -473,6 +476,7 @@ fn pass_shapes() -> Vec<PassShape> {
         ff_vs: 1 + MINIMAP_DRAWS,
         ff_ps: MINIMAP_DRAWS,
         textures: 2 + quads + 3,
+        state: None,
     });
 
     let draws: u32 = passes.iter().map(|pass| pass.draws).sum();

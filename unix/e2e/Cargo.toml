@@ -13,6 +13,9 @@ libc = { workspace = true }
 # the file naming and the fatal banner from the crate that defines them rather
 # than restating either.
 mtld3d-shared = { workspace = true }
+# `bench-shape` reads D3D9 render-state values out of the layer's frame dump,
+# and those constants have one home.
+mtld3d-types = { path = "../../windows/types" }
 
 [lints]
 workspace = true

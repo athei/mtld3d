@@ -17,11 +17,11 @@ use crate::pipeline_state::PipelineSnapshot;
 
 /// Snapshots the memo holds.
 ///
-/// The busiest benchmark frame (1104 draws over 44 distinct snapshots)
-/// reuses at most 19 of them between two draws of the same one: the scene's
-/// fixed-function models cycle five blend modes, each with its light and
-/// texture-operation variants. The 3.3.5a frame needs 15. With 24 entries
-/// both frames miss only on each snapshot's first draw.
+/// 24 entries do not hold every pipeline of a busy frame, only the ones its
+/// draws alternate among: the `wow112` benchmark builds 88 pipelines, and
+/// the memo answers 98.6 % of its draws, against 97.8 to 97.9 % in the World
+/// of Warcraft 1.12 window that scene is calibrated on (WoW-14623). The
+/// 3.3.5a frame needs 15.
 pub const PIPELINE_MEMO_ENTRIES: usize = 24;
 
 // The tag scan collects its candidates in a `u32` bit mask, one bit per entry.
