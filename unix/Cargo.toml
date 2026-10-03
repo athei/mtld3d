@@ -85,7 +85,7 @@ objc2-metal = { version = "0.3", features = [
     "MTLVertexDescriptor",
 ] }
 objc2-metal-fx = { version = "0.3", features = ["MTLFXSpatialScaler"] }
-objc2-quartz-core = { version = "0.3", features = ["CAMetalLayer", "objc2-metal"] }
+objc2-quartz-core = { version = "0.3", features = ["CAMetalLayer", "CATransaction", "objc2-metal"] }
 rustc-hash = "2"
 # The global allocator of the native dylib, the same pinned revision and `build_cc`
 # configuration the PE side ships (windows/Cargo.toml).

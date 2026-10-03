@@ -35,6 +35,7 @@ fn resolved_configuration_preserves_nondefaults() {
     value.bytecode_dump_dir = "bytecode_dump_dir/utf8-ä".into();
     value.skip_shaders = vec![0, u64::MAX, 55];
     value.present_gate_file = "present_gate_file/utf8-ä".into();
+    value.present_occluded = !value.present_occluded;
     value.query_flush_immediate = !value.query_flush_immediate;
     value.query_event_immediate = !value.query_event_immediate;
     value.depth_alias_same_size = !value.depth_alias_same_size;

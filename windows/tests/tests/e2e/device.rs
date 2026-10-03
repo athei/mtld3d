@@ -1646,6 +1646,41 @@ pub fn running_as(child_name: &str) -> bool {
 /// The log filter a workload child runs under unless it needs more: unix-side info records.
 const PRIVATE_LOG_FILTER: &str = "warn,mtld3d::unix=info";
 
+/// The filter of a child that counts its drawables: the present target's debug lines too.
+pub const DRAWABLE_LOG_FILTER: &str = "warn,mtld3d::unix=info,mtld3d::unix::present=debug";
+
+/// The entry that has the presenter acquire drawables for the suite's hidden windows.
+///
+/// A present into an occluded window skips `nextDrawable` otherwise, so the
+/// call and everything it reaches would never run under the suite's Main
+/// Thread Checker here; on a machine whose windows turn visible it runs
+/// either way.
+pub const PRESENT_OCCLUDED: &str = "debug.presentOccluded=true";
+
+/// How long one `nextDrawable` may wait before it gives up and drops the frame.
+///
+/// The layer allows the timeout (`allowsNextDrawableTimeout`, set at
+/// attach), which `CAMetalLayer` documents as one second.
+pub const DRAWABLE_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Wait until the presenter has acquired `expected` drawables for `hwnd`, and hand the lines back.
+///
+/// The presenter logs one line per drawable under [`DRAWABLE_LOG_FILTER`], so
+/// a test that counts them knows its presents reached `nextDrawable` rather
+/// than being skipped, and cannot pass without running that call. The bound
+/// leaves every one of them its whole [`DRAWABLE_TIMEOUT`] on top of the
+/// usual ten seconds, so a runner whose hidden windows vend drawables slowly
+/// but do vend them passes; a drawable that never comes drops its frame and
+/// fails the count.
+pub fn await_acquired_drawables(hwnd: usize, expected: usize) -> Vec<String> {
+    let wait = DRAWABLE_TIMEOUT * u32::try_from(expected).expect("a drawable count fits u32");
+    await_logged_lines_within(
+        &format!("drawable acquired on window {hwnd:#x} for"),
+        expected,
+        Duration::from_secs(10) + wait,
+    )
+}
+
 /// Run `test` in a copy of this executable named `child_name`, alone in a log directory of its own.
 ///
 /// The copy logs under `filter` whatever the suite's filter is, and the
@@ -1653,6 +1688,14 @@ const PRIVATE_LOG_FILTER: &str = "warn,mtld3d::unix=info";
 /// that reads its own process log reads its device's lines and nobody
 /// else's. Panics with the child's standard error when the child fails.
 pub fn run_in_private_log_child(child_name: &str, test: &str, filter: &str) {
+    run_in_private_log_child_with(child_name, test, filter, "");
+}
+
+/// [`run_in_private_log_child`] with `entries` added to the child's configuration.
+///
+/// `entries` are `key=value` entries, `;`-separated, for every interface the
+/// child creates; empty adds none.
+pub fn run_in_private_log_child_with(child_name: &str, test: &str, filter: &str, entries: &str) {
     let exe = std::env::current_exe().expect("resolve test executable");
     let _factory = Harness::factory_only();
     let stamp = std::time::SystemTime::now()
@@ -1679,8 +1722,11 @@ pub fn run_in_private_log_child(child_name: &str, test: &str, filter: &str) {
     // child is handed the private directory instead, always, and the run here
     // takes the same path CI takes. The parser keeps everything after the
     // entry's first `=`, so the path stands as long as it carries no `;`.
-    let output = run_child(&mut command, &format!("log.dir={}", dir.display()))
-        .expect("run the workload child");
+    let mut config = format!("log.dir={}", dir.display());
+    if !entries.is_empty() {
+        config = format!("{entries};{config}");
+    }
+    let output = run_child(&mut command, &config).expect("run the workload child");
     assert!(
         output.status.success(),
         "workload child {child_name} failed: {}",
@@ -1839,7 +1885,12 @@ fn process_log() -> String {
 /// The layer's log thread writes a line a moment after the call that
 /// produced it returns, so the lines are polled for, within a bound.
 pub fn await_logged_lines(needle: &str, expected: usize) -> Vec<String> {
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    await_logged_lines_within(needle, expected, Duration::from_secs(10))
+}
+
+/// [`await_logged_lines`] with a bound of the caller's.
+fn await_logged_lines_within(needle: &str, expected: usize, bound: Duration) -> Vec<String> {
+    let deadline = std::time::Instant::now() + bound;
     loop {
         let logged = logged_lines(needle);
         if logged.len() >= expected {
@@ -2155,6 +2206,78 @@ fn reset_resize_grows_backbuffer() {
     assert_pixel_eq(h.read_pixel(400, 300), blue, "new center renders");
     // (700,500) only exists in the grown 800x600 backbuffer.
     assert_pixel_eq(h.read_pixel(700, 500), blue, "grown backbuffer reachable");
+}
+
+/// The name the workload child of the resized-drawable test runs under.
+const RESIZED_DRAWABLE_CHILD_NAME: &str = "resized-drawable.exe";
+
+/// A window resized under a presenting device gets a drawable of its new size.
+///
+/// The presenter re-points the layer's `drawableSize` at its backing store
+/// before each `nextDrawable`, on its own thread, so a resize of the window
+/// between two presents is the one moment it writes the layer off the main
+/// thread. The child presents into occluded windows ([`PRESENT_OCCLUDED`]),
+/// so that write and the drawables after it run under the suite's Main
+/// Thread Checker, and it reads the resize back from its log: once at the
+/// attach, which writes the window's first size, and once more for the new
+/// one.
+#[test]
+fn a_resized_window_presents_through_a_drawable_of_its_new_size() {
+    if running_as(RESIZED_DRAWABLE_CHILD_NAME) {
+        resized_drawable_workload();
+        return;
+    }
+    run_in_private_log_child_with(
+        RESIZED_DRAWABLE_CHILD_NAME,
+        "device::a_resized_window_presents_through_a_drawable_of_its_new_size",
+        DRAWABLE_LOG_FILTER,
+        PRESENT_OCCLUDED,
+    );
+}
+
+/// Present, resize the window and `Reset` to its size, and present until the drawable follows.
+fn resized_drawable_workload() {
+    const RED: u32 = 0xFFFF_0000;
+    const BLUE: u32 = 0xFF00_00FF;
+    /// Presents at most after the resize, 20 ms apart, for Wine to resize the views.
+    ///
+    /// Few enough that one [`DRAWABLE_TIMEOUT`] each still fits the runner's
+    /// per-test bound.
+    const RESIZE_PRESENTS: usize = 20;
+
+    let h = Harness::new();
+    h.render_once(RED, |_| {});
+    await_acquired_drawables(h.hwnd(), 1);
+    let attached = await_logged_lines("drawable resized", 1);
+    mtld3d_tests::set_window_pos(h.hwnd(), 0, 0, 800, 600);
+    assert_eq!(h.reset(800, 600), D3D_OK, "Reset to the window's new size");
+    let mut resized = Vec::new();
+    let mut presents = 0;
+    while presents < RESIZE_PRESENTS {
+        h.render_once(BLUE, |_| {});
+        presents += 1;
+        resized = logged_lines("drawable resized");
+        if resized.len() > attached.len() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        resized.len() > attached.len(),
+        "the presenter resized the drawable after the window grew: {resized:?}"
+    );
+    let size = |line: &str| {
+        line.rsplit_once("-> ")
+            .map(|(_, size)| size.trim().to_owned())
+    };
+    assert_ne!(
+        size(&resized[0]),
+        size(&resized[resized.len() - 1]),
+        "the drawable moved off the window's first size: {resized:?}"
+    );
+    // The present before the resize and every one after it reached `nextDrawable`.
+    await_acquired_drawables(h.hwnd(), 1 + presents);
+    assert_pixel_eq(h.read_pixel(700, 500), BLUE, "the grown back buffer");
 }
 
 /// Whether the display lists the 640x480 mode the fullscreen tests request.
@@ -2727,29 +2850,33 @@ const GAMMA_RETARGET_CHILD_NAME: &str = "gamma-retarget.exe";
 /// attachment record names, logging that once. The workload runs in a
 /// process of its own, so the log it reads holds its device's lines alone.
 ///
-/// The covered window turns visible a moment after the retarget, and only a
-/// present into a visible window acquires a drawable, so the workload keeps
-/// presenting for a while after it. Those presents run the layer's
-/// `nextDrawable` under the suite's Main Thread Checker, which ends the
-/// process if anything on that call walks `AppKit` off the main thread, as
-/// winemac's override of it on the layer Wine creates does.
+/// The child presents into occluded windows too ([`PRESENT_OCCLUDED`]), so
+/// every present after the retarget acquires a drawable, whether or not the
+/// window turns visible, and the workload counts them. Those presents run the
+/// layer's `nextDrawable` under the suite's Main Thread Checker, which ends
+/// the process if anything on that call walks `AppKit` off the main thread,
+/// as winemac's override of it on the layer Wine creates does.
 #[test]
 fn fullscreen_retarget_reset_carries_the_gamma_ramp() {
     if running_as(GAMMA_RETARGET_CHILD_NAME) {
         gamma_retarget_workload();
         return;
     }
-    run_in_private_log_child(
+    run_in_private_log_child_with(
         GAMMA_RETARGET_CHILD_NAME,
         "device::fullscreen_retarget_reset_carries_the_gamma_ramp",
-        PRIVATE_LOG_FILTER,
+        DRAWABLE_LOG_FILTER,
+        PRESENT_OCCLUDED,
     );
 }
 
 /// Set a ramp on a fullscreen device, retarget it fullscreen onto a second window, and present.
 fn gamma_retarget_workload() {
-    /// Presents after the retarget, 50 ms apart, so some land after the window turns visible.
-    const VISIBLE_PRESENTS: u32 = 20;
+    /// Presents after the retarget, 50 ms apart, past the moment the window may turn visible.
+    ///
+    /// Few enough that one [`DRAWABLE_TIMEOUT`] each still fits the runner's
+    /// per-test bound with the Resets around them.
+    const VISIBLE_PRESENTS: u32 = 8;
     let h = Harness::new();
     let second = create_window(320, 240, false);
     h.hold_display_mode();
@@ -2782,12 +2909,18 @@ fn gamma_retarget_workload() {
         "fullscreen Reset onto a second device window"
     );
     assert_eq!(h.present(), D3D_OK, "the present after the retarget");
-    // The window reads as visible once its occlusion state arrives on the
-    // main thread; until then a present skips the drawable.
+    // A window that turns visible does so once its occlusion state arrives
+    // on the main thread; the child acquires a drawable either way.
     for _ in 0..VISIBLE_PRESENTS {
         std::thread::sleep(Duration::from_millis(50));
         assert_eq!(h.present(), D3D_OK, "a present into the covered window");
     }
+    // The presents after the retarget reached `nextDrawable` on the second
+    // window's layer; the first of them may race the window's own attach.
+    await_acquired_drawables(
+        second,
+        usize::try_from(VISIBLE_PRESENTS).expect("a present count fits usize"),
+    );
     // The read-back waits for the encoder to have replayed every frame before
     // it, which is where a ramp reaches the layer its frame names.
     let _ = h.read_pixel(1, 1);
@@ -4358,17 +4491,21 @@ const SHARED_WINDOW_CHILD_NAME: &str = "shared-window-surface.exe";
 /// departed device's last frame. Each attach names its layer class and its
 /// client surface, and every surface shown is logged, so the workload runs
 /// in a process of its own and reads them back. Every Wine the suite runs on
-/// keeps the client surface where attach reads it, so a null one fails.
+/// keeps the client surface where attach reads it, so a null one fails. The
+/// child presents into occluded windows ([`PRESENT_OCCLUDED`]), so both
+/// layers on the window acquire drawables under the Main Thread Checker,
+/// before and after the handback.
 #[test]
 fn a_device_leaving_a_shared_window_hands_it_back_to_the_other() {
     if running_as(SHARED_WINDOW_CHILD_NAME) {
         shared_window_workload();
         return;
     }
-    run_in_private_log_child(
+    run_in_private_log_child_with(
         SHARED_WINDOW_CHILD_NAME,
         "device::a_device_leaving_a_shared_window_hands_it_back_to_the_other",
-        PRIVATE_LOG_FILTER,
+        DRAWABLE_LOG_FILTER,
+        PRESENT_OCCLUDED,
     );
 }
 
@@ -4418,6 +4555,9 @@ fn shared_window_workload() {
     );
     first.render_once(RED, |_| {});
     assert_pixel_eq(first.read_pixel(1, 1), RED, "the remaining device");
+    // One drawable per present: the first device, the second on the same
+    // window, and the first again after the handback.
+    await_acquired_drawables(first.hwnd(), 3);
     drop(second);
     drop(first);
 }
@@ -4507,11 +4647,14 @@ fn a_new_window_takes_the_metal_view_a_destroyed_window_left() {
     // Which window took which view is read out of the process log, and in
     // the suite's process the kept view a window takes may be any test's.
     // The workload therefore runs in a process of its own, where the only
-    // kept view is its first device's.
-    run_in_private_log_child(
+    // kept view is its first device's. It presents into occluded windows
+    // too, so the moved layer acquires drawables under the Main Thread
+    // Checker.
+    run_in_private_log_child_with(
         KEPT_VIEW_CHILD_NAME,
         "device::a_new_window_takes_the_metal_view_a_destroyed_window_left",
-        PRIVATE_LOG_FILTER,
+        DRAWABLE_LOG_FILTER,
+        PRESENT_OCCLUDED,
     );
 }
 
@@ -4549,6 +4692,9 @@ fn kept_view_move_workload() {
                 "the move names the new window: {}",
                 moved[0]
             );
+            // The moved layer presents through `CAMetalLayer`'s own
+            // `nextDrawable`, which the attach of a moved view reinstates.
+            await_acquired_drawables(second.hwnd(), 1);
         });
     });
 }

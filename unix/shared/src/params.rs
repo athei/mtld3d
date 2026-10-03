@@ -2,8 +2,8 @@ use super::{
     Thunk, Thunks,
     mtl::{
         BufferKind, ColorSpacePolicy, CursorOverlayFlags, DestroyKind, DeviceCapsFlags, LoadAction,
-        PixelFormat, PresentWaitPolicy, SoftwareCursorPolicy, StorageMode, StoreAction, Swizzle,
-        TextureUsage, VertexFormat, VertexStepFunction,
+        PixelFormat, PresentDebugFlags, PresentWaitPolicy, SoftwareCursorPolicy, StorageMode,
+        StoreAction, Swizzle, TextureUsage, VertexFormat, VertexStepFunction,
     },
     mtl_handle::{
         CAMetalLayerKind, MTLBufferKind, MTLDeviceKind, MTLTextureKind, MetalHandle, NSViewKind,
@@ -35,6 +35,7 @@ const _: () = {
     // identical on all targets.
     assert!(core::mem::align_of::<CreateCommandQueueParams>() == 8);
     assert!(core::mem::size_of::<CreateCommandQueueParams>() == 40);
+    assert!(core::mem::offset_of!(CreateCommandQueueParams, present_debug) == 36);
     assert!(core::mem::size_of::<AttachMetalLayerParams>() == 88);
     assert!(core::mem::size_of::<DetachMetalLayerParams>() == 8);
     assert!(core::mem::size_of::<CreateBackbufferParams>() == 64);
@@ -160,7 +161,8 @@ pub struct CreateCommandQueueParams {
     /// side copies them into the presenter state it creates for this queue.
     pub gate_file_ptr: u64, // in: *const u8
     pub gate_file_len: u32,                        // in: byte count
-    pub pad0: u32,
+    /// The queue's presenter switches, `debug.presentOccluded` among them.
+    pub present_debug: PresentDebugFlags, // in
 }
 
 impl Thunk for CreateCommandQueueParams {

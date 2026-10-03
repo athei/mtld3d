@@ -158,6 +158,14 @@ pub struct Mtld3dConfig {
     /// stands; resolved to a unix path once per device at queue creation.
     /// Empty = no gate. Default: `""`. File key: `debug.presentGateFile`.
     pub present_gate_file: String,
+    /// Acquire and present drawables for a window that reads as occluded.
+    ///
+    /// A seam for the test suite: its windows stay hidden, and a present
+    /// into a hidden window otherwise skips the drawable, so without this
+    /// nothing that `nextDrawable` reaches runs under the Main Thread
+    /// Checker. A game never needs it: an occluded window shows nothing.
+    /// Default: `false`. File key: `debug.presentOccluded`.
+    pub present_occluded: bool,
     /// Answer a pending occlusion FLUSH poll immediately.
     ///
     /// Skips the kernel block on `MTLCommandBuffer::waitUntilCompleted` and
@@ -369,6 +377,7 @@ impl Default for Mtld3dConfig {
             bytecode_dump_dir: String::new(),
             skip_shaders: Vec::new(),
             present_gate_file: String::new(),
+            present_occluded: false,
             query_flush_immediate: false,
             query_event_immediate: false,
             depth_alias_same_size: false,
@@ -526,6 +535,10 @@ pub fn log_options(cfg: &Mtld3dConfig) {
     );
     info!(
         target: crate::LOG_TARGET,
+        "config: debug.presentOccluded = {}", cfg.present_occluded
+    );
+    info!(
+        target: crate::LOG_TARGET,
         "config: query.flushImmediate = {}", cfg.query_flush_immediate
     );
     info!(
@@ -620,6 +633,7 @@ fn apply(cfg: &mut Mtld3dConfig, source: &str, key: &str, value: &str) {
         "debug.bytecodeDumpDir" => value.clone_into(&mut cfg.bytecode_dump_dir),
         "debug.skipShaders" => cfg.skip_shaders = parse_hex_list(value),
         "debug.presentGateFile" => value.clone_into(&mut cfg.present_gate_file),
+        "debug.presentOccluded" => assign_bool(source, key, value, &mut cfg.present_occluded),
         "query.flushImmediate" => assign_bool(source, key, value, &mut cfg.query_flush_immediate),
         "query.eventImmediate" => assign_bool(source, key, value, &mut cfg.query_event_immediate),
         "depth.aliasSameSize" => assign_bool(source, key, value, &mut cfg.depth_alias_same_size),

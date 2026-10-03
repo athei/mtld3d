@@ -42,7 +42,7 @@ use std::{
 
 use block2::RcBlock;
 use mtld3d_shared::{
-    mtl::{PRESENT_PIPELINE_DEPTH, PresentWaitPolicy, SnapshotFlags},
+    mtl::{PRESENT_PIPELINE_DEPTH, PresentDebugFlags, PresentWaitPolicy, SnapshotFlags},
     mtl_handle::{CAMetalLayerKind, MTLCommandQueueKind, MTLTextureKind, MetalHandle},
     perf::{CommandBufferRole, NanosSetTimer},
 };
@@ -121,6 +121,11 @@ pub struct PresentState {
     /// the record it lives on is shared. Per device so two presenters do not
     /// clear each other's edge and swallow the dump.
     stalled: AtomicBool,
+    /// `debug.presentOccluded`: acquire a drawable for a window that reads as occluded.
+    ///
+    /// Fixed at creation. Read only on the occluded branch of a present, so a
+    /// present into a visible window never looks at it.
+    present_occluded: bool,
 }
 
 struct Inner {
@@ -257,12 +262,19 @@ impl PresentState {
     ///
     /// The thread starts separately, once the record that owns this state
     /// exists, since the thread holds a reference to it.
-    pub fn new(gate: Option<PathBuf>) -> Self {
+    pub fn new(gate: Option<PathBuf>, debug: PresentDebugFlags) -> Self {
         if let Some(path) = &gate {
             log::info!(
                 target: LOG_TARGET,
                 "presenter: gated at {} (parks before each drawable while it exists)",
                 path.display(),
+            );
+        }
+        let present_occluded = debug.contains(PresentDebugFlags::PRESENT_OCCLUDED);
+        if present_occluded {
+            log::info!(
+                target: LOG_TARGET,
+                "presenter: presents into occluded windows too (debug.presentOccluded)",
             );
         }
         Self {
@@ -280,6 +292,7 @@ impl PresentState {
             present_retired: AtomicU64::new(0),
             thread: Mutex::new(None),
             stalled: AtomicBool::new(false),
+            present_occluded,
         }
     }
 
@@ -752,11 +765,12 @@ fn present_frame(record: &Arc<DeviceRecord>, queue: &ProtocolObject<dyn MTLComma
              occluded, headroom 1.0, unthrottled, stretch route",
         );
     }
-    if attachment.as_ref().is_some_and(|att| att.window_occluded()) {
+    if attachment.as_ref().is_some_and(|att| att.window_occluded()) && !state.present_occluded {
         // Window fully occluded: the compositor is not recycling drawables,
         // so `nextDrawable` would block its full timeout for nothing that
         // reaches the screen. The render work committed already; the frame
-        // is simply not shown.
+        // is simply not shown. `debug.presentOccluded` presents anyway, so
+        // the test suite, whose windows stay hidden, runs this path.
         mtld3d_shared::crumb!("present:occluded-skip", layer.raw());
         drop_front(state, seq);
         return true;

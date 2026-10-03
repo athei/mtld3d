@@ -6,6 +6,7 @@
 //! has one GPU, so the assertions pin the invariant rather than reproduce the
 //! dual-GPU divergence, which needs graphics switching to observe.
 
+use mtld3d_shared::mtl::PresentDebugFlags;
 use objc2_metal::MTLDevice;
 
 use super::{DeviceCaps, create_command_queue, default_device_info};
@@ -37,11 +38,12 @@ fn release(caps: &DeviceCaps) {
 /// live after both handed-out retains are dropped.
 #[test]
 fn create_command_queue_hands_out_the_pinned_device() {
-    let Some(first) = create_command_queue(None) else {
+    let Some(first) = create_command_queue(None, PresentDebugFlags::empty()) else {
         eprintln!("MTLCreateSystemDefaultDevice returned nil, skipping");
         return;
     };
-    let second = create_command_queue(None).expect("a second queue on the pinned device");
+    let second = create_command_queue(None, PresentDebugFlags::empty())
+        .expect("a second queue on the pinned device");
     assert_eq!(
         first.device_handle.raw(),
         second.device_handle.raw(),
@@ -68,7 +70,8 @@ fn create_command_queue_hands_out_the_pinned_device() {
     release(&first);
     release(&second);
 
-    let third = create_command_queue(None).expect("a queue after both devices were destroyed");
+    let third = create_command_queue(None, PresentDebugFlags::empty())
+        .expect("a queue after both devices were destroyed");
     let device = third
         .device_handle
         .into_retained()

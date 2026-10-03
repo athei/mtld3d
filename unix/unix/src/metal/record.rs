@@ -20,6 +20,7 @@ use std::{
 };
 
 use mtld3d_shared::{
+    mtl::PresentDebugFlags,
     mtl_handle::{MTLCommandQueueKind, MetalHandle},
     record_handle::DeviceRecordHandle,
 };
@@ -70,10 +71,14 @@ impl Drop for DeviceRecord {
 
 impl DeviceRecord {
     /// Build the record for a queue whose retain it takes over.
-    pub fn new(queue: MetalHandle<MTLCommandQueueKind>, gate: Option<PathBuf>) -> Arc<Self> {
+    pub fn new(
+        queue: MetalHandle<MTLCommandQueueKind>,
+        gate: Option<PathBuf>,
+        present_debug: PresentDebugFlags,
+    ) -> Arc<Self> {
         Arc::new(Self {
             queue,
-            present: PresentState::new(gate),
+            present: PresentState::new(gate, present_debug),
             presented: Presented::new(),
             upscale: UpscaleCache::new(),
             pending: PendingCmdBufs::new(),

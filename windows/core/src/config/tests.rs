@@ -37,6 +37,7 @@ fn defaults_match_documented_values() {
     assert!(d.bytecode_dump_dir.is_empty());
     assert!(d.skip_shaders.is_empty());
     assert!(d.present_gate_file.is_empty());
+    assert!(!d.present_occluded);
     assert!(!d.query_flush_immediate);
     assert!(!d.query_event_immediate);
     assert!(!d.buffer_ignore_lock_bounds);
@@ -436,6 +437,21 @@ fn present_gate_file_is_a_plain_string() {
     );
     let cfg = parse(None, "debug.presentGateFile =\n", None);
     assert!(cfg.present_gate_file.is_empty(), "empty disables the gate");
+}
+
+#[test]
+fn present_occluded_defaults_off_and_parses_on() {
+    assert!(!parse(None, "", None).present_occluded, "off by default");
+    assert!(parse(None, "debug.presentOccluded = true\n", None).present_occluded);
+    assert!(!parse(None, "debug.presentOccluded = false\n", None).present_occluded);
+    assert!(
+        !parse(None, "debug.presentOccluded = maybe\n", None).present_occluded,
+        "an unparsable value keeps the default"
+    );
+    assert!(
+        parse(None, "", Some("debug.presentOccluded=true")).present_occluded,
+        "the env override reaches the key"
+    );
 }
 
 #[test]

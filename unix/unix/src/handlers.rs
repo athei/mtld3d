@@ -256,7 +256,7 @@ pub extern "C" fn create_command_queue_handler(args: *mut c_void) -> i32 {
             |path| Some(std::path::PathBuf::from(path)),
         )
     };
-    if let Some(caps) = metal::create_command_queue(gate) {
+    if let Some(caps) = metal::create_command_queue(gate, params.present_debug) {
         params.device_handle = caps.device_handle;
         params.record_handle = caps.record_handle;
         params.unified_memory = u32::from(caps.unified_memory);

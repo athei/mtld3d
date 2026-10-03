@@ -964,5 +964,21 @@ bitflags::bitflags! {
     }
 }
 
+bitflags::bitflags! {
+    /// Presenter switches a queue keeps for its lifetime, from `CreateCommandQueueParams`.
+    ///
+    /// Diagnostic seams for the test suite; a game runs with none set.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct PresentDebugFlags: u32 {
+        /// Acquire and present a drawable for a window that reads as occluded.
+        ///
+        /// `debug.presentOccluded`. Without it a present into a fully covered
+        /// or hidden window skips `nextDrawable`, which is every present of a
+        /// suite whose windows stay hidden, so nothing that call reaches runs
+        /// under the Main Thread Checker there.
+        const PRESENT_OCCLUDED = 1 << 0;
+    }
+}
+
 #[cfg(test)]
 mod tests;

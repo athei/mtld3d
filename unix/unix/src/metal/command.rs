@@ -139,7 +139,7 @@ fn first_pending<V>(
 ///
 /// Inherits `mtld3d::unix` filters by prefix; `mtld3d::unix::present=trace`
 /// turns on the per-frame rows without touching anything else.
-const PRESENT_LOG_TARGET: &str = "mtld3d::unix::present";
+pub const PRESENT_LOG_TARGET: &str = "mtld3d::unix::present";
 
 /// A presented interval above this is a pause, not a hitch; it reseeds.
 const PRESENTED_MAX_INTERVAL_NS: u64 = 500_000_000;
@@ -987,6 +987,14 @@ pub fn encode_present(
     // Debug and trace output only, so the per-frame block allocation
     // and handler registration are skipped when the target is off.
     if log::log_enabled!(target: PRESENT_LOG_TARGET, log::Level::Debug) {
+        // One line per drawable presented, which is what a test counts to
+        // know its presents reached `nextDrawable` rather than being skipped.
+        debug!(
+            target: PRESENT_LOG_TARGET,
+            "present: drawable acquired on window {:#x} for seq={}",
+            attachment.map_or(0, |att| att.hwnd()),
+            args.seq,
+        );
         register_presented_probe(drawable, args.record, args.seq, args.drawable_wait_ns);
     }
 }
