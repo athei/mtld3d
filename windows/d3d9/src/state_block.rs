@@ -177,7 +177,10 @@ impl RecordingStateBlock {
     /// a light the recording never set gives the block the default light
     /// `LightEnable` creates, so `Apply` writes those parameters before the
     /// enable and `Capture` refreshes them from the device. A disable defines
-    /// nothing.
+    /// nothing. Out of line, so the recording path adds nothing to the setter
+    /// that inlines it.
+    #[cold]
+    #[inline(never)]
     pub fn record_light_enable(&mut self, index: u32, enable: bool) {
         let has_light = self
             .ops
