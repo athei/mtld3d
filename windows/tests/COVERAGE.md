@@ -37,11 +37,17 @@ fullscreen; the harness keeps it, through a windowed `Reset` too, until it
 is dropped. The take is a lock in the process and, inside it, an exclusive
 lock on `~/Library/Caches/mtld3d/e2e-display-mode.lock`, so tests that
 change or read the mode run one at a time across every test process on the
-machine while the others run beside them. A new test that changes or reads
-the display mode goes through one of those three, never through a device
-or a `ChangeDisplaySettings` call of its own. The file lock ends with its
-handle, so a test process that panics, crashes or is killed gives it up as
-it exits, and a test waiting for another process's turn says so on stderr.
+machine while the others run beside them. A process that gives the mode
+back waits 150 ms before it takes it again, longer than the interval at
+which Wine retries a lock another wineserver holds, so two runs alternate
+test by test rather than one waiting for all of the other's. A new test that
+changes or reads the display mode goes through one of those three, never
+through a device or a `ChangeDisplaySettings` call of its own. The file
+lock ends with its handle, so a test process that panics, crashes or is
+killed gives it up as it exits. A test that has to wait for another
+process's turn says so on stderr, which the runner keeps for a process that
+ended with tests unaccounted for, so a timed-out test's kept stderr shows
+whether it was waiting.
 Thirteen options are gated this way today:
 `shader.asyncCompile` in `async_compile.rs` (the rest of the suite runs it
 off), `buffer.ignoreLockBounds` in `buffers.rs`, `depth.aliasSameSize` in

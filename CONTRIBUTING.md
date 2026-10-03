@@ -78,7 +78,8 @@ APFS. Use it whenever another worktree may be testing or a game is running; a
 plain `make install` still targets the shared trees on purpose, since that is
 how the game gets a build. The display mode is the one thing a clone cannot
 separate: the tests that change or read it take turns across every run on the
-machine, as [`windows/tests/COVERAGE.md`](windows/tests/COVERAGE.md) describes. The clones and the persistent wineserver of the
+machine, as [`windows/tests/COVERAGE.md`](windows/tests/COVERAGE.md) describes.
+The clones and the persistent wineserver of the
 private prefix stay behind for the next run; `make clean-isolated` takes down
 the ones in the checkout you are in, and `make clean-isolated-orphans` the ones
 a removed checkout left behind. Either one ends the whole Wine session rather

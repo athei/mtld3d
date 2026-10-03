@@ -9,6 +9,7 @@ use std::{
     fs::{File, OpenOptions, TryLockError},
     path::PathBuf,
     sync::{Condvar, Mutex, PoisonError, RwLock},
+    time::{Duration, Instant},
 };
 
 use mtld3d_types::{
@@ -78,11 +79,30 @@ const CONFIG_VAR: &str = "MTLD3D_CONFIG";
 /// It is a static because the resource is machine-wide: the open lock file is
 /// the hold, and no single harness outlives the others to own it.
 ///
-/// The open lock file under a mutex plus a condvar rather than a held
-/// `MutexGuard`, because the holder is a harness field and a guard there
-/// would put a significant drop into every test's `Harness`.
-static MODESET_HELD: Mutex<Option<File>> = Mutex::new(None);
+/// The hold under a mutex plus a condvar rather than a held `MutexGuard`,
+/// because the holder is a harness field and a guard there would put a
+/// significant drop into every test's `Harness`.
+static MODESET: Mutex<ModeSet> = Mutex::new(ModeSet::Free { released: None });
 static MODESET_RELEASED: Condvar = Condvar::new();
+
+/// Who has the display mode in this process.
+enum ModeSet {
+    /// No harness holds it; `released` is when this process last gave it back.
+    Free { released: Option<Instant> },
+    /// A harness holds it, through the locked machine-wide file.
+    Held(File),
+}
+
+/// How long a process waits after giving the display mode back before it asks again.
+///
+/// Wine retries a lock another wineserver holds every 100 ms, while the
+/// process that just gave it back would ask again within the same
+/// millisecond, so without a pause one process would keep the mode for its
+/// whole run of display-mode tests and another run's tests would wait for
+/// all of them. A pause longer than one retry lets a waiting process in
+/// first, so concurrent runs alternate test by test. Uncontended, it costs
+/// one pause per back-to-back take.
+const MODESET_HANDOFF_PAUSE: Duration = Duration::from_millis(150);
 
 /// The directory of the machine-wide display-mode lock, relative to the user's home.
 const MODESET_LOCK_DIR: &str = r"Library\Caches\mtld3d";
@@ -92,26 +112,34 @@ const MODESET_LOCK_FILE: &str = "e2e-display-mode.lock";
 /// Take the session's display mode, waiting for the harness or process that holds it.
 ///
 /// The machine-wide lock is taken under the mutex, so this process asks for
-/// it on one thread at a time and never holds it twice.
+/// it on one thread at a time and never holds it twice. A panic between this
+/// take and the harness that owns it ends the process through the failure
+/// hook every harness installs first, and the exit gives the lock back.
 fn take_display_mode() {
-    let mut held = MODESET_HELD.lock().unwrap_or_else(PoisonError::into_inner);
-    while held.is_some() {
-        held = MODESET_RELEASED
-            .wait(held)
+    let mut mode = MODESET.lock().unwrap_or_else(PoisonError::into_inner);
+    while matches!(*mode, ModeSet::Held(_)) {
+        mode = MODESET_RELEASED
+            .wait(mode)
             .unwrap_or_else(PoisonError::into_inner);
     }
-    *held = Some(lock_machine_display_mode());
+    if let ModeSet::Free {
+        released: Some(released),
+    } = *mode
+    {
+        std::thread::sleep(MODESET_HANDOFF_PAUSE.saturating_sub(released.elapsed()));
+    }
+    *mode = ModeSet::Held(lock_machine_display_mode());
 }
 
 /// Give the session's display mode back and wake one harness waiting for it.
 ///
-/// Closing the lock file releases the machine-wide lock.
+/// Dropping the lock file closes it, which releases the machine-wide lock.
 fn release_display_mode() {
-    let lock = MODESET_HELD
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .take();
-    drop(lock);
+    let mut mode = MODESET.lock().unwrap_or_else(PoisonError::into_inner);
+    *mode = ModeSet::Free {
+        released: Some(Instant::now()),
+    };
+    drop(mode);
     MODESET_RELEASED.notify_one();
 }
 
@@ -125,8 +153,9 @@ fn release_display_mode() {
 /// retrying. It ends with the handle: when the harness gives the mode back,
 /// and when the process exits or is killed, since the wineserver closes a dead
 /// process's handles and the kernel drops a dead server's locks. A wait for
-/// another process names the file on stderr, where a kept log of a slow test
-/// shows it.
+/// another process is announced on stderr, which the runner keeps only for a
+/// process that ends with tests unaccounted for, so a timed-out test's kept
+/// stderr says whether it was waiting for the mode.
 ///
 /// # Panics
 ///
