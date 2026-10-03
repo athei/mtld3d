@@ -287,35 +287,25 @@ impl PageBox {
     ///
     /// # Panics
     ///
-    /// Panics when the allocator returns null. Both profiles build with
-    /// `panic = "abort"`, so this aborts either way — but panicking runs
+    /// Panics when the allocation fails. Both profiles build with
+    /// `panic = "abort"`, so this aborts either way, but panicking runs
     /// the panic hook first, which dumps the crumb ring
     /// (`std::alloc::handle_alloc_error` would abort straight away with no
-    /// trace). There is no recovery to attempt: retained VB/IB bytes are
-    /// bounded proactively by the retention cap long before the address
-    /// space runs out.
+    /// trace). Every allocation is infallible this way except the system-memory
+    /// copy a resource gets at creation, which goes through
+    /// [`Self::try_new_uninit`] and [`Self::try_new_zeroed`] so the create can
+    /// answer `E_OUTOFMEMORY` as D3D9 does. Past creation there is no recovery
+    /// to attempt: retained VB/IB bytes are bounded proactively by the
+    /// retention cap long before the address space runs out.
     #[must_use]
     pub fn new_uninit(logical_len: usize) -> Self {
-        let (len, layout) = Self::layout_for(logical_len);
-        // SAFETY: `layout_for` returns a non-zero-size, page-aligned Layout.
-        let ptr = unsafe { alloc::alloc(layout) };
-        let ptr = NonNull::new(ptr).expect("PageBox alloc failed");
-        note_alloc(len);
-        PAGEBOX_LIVE_BYTES.fetch_add(len as u64, core::sync::atomic::Ordering::Relaxed);
-        Self {
-            ptr,
-            len,
-            logical_len,
-            ownership: PageOwnership::Native(layout),
-            generation: PAGE_BOX_GENERATION.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1,
-            readers: AtomicU32::new(0),
-        }
+        Self::try_new_uninit(logical_len).expect("PageBox alloc failed")
     }
 
     /// Same as `new_uninit` but zero-initializes the full padded region.
     ///
     /// Used by VB/IB creation so a first-draw-before-Lock sees defined
-    /// bytes. Costs one `bzero` per buffer create — negligible compared
+    /// bytes. Costs one `bzero` per buffer create, negligible compared
     /// to the alternative of every rename paying for the same zero init.
     ///
     /// # Panics
@@ -323,10 +313,35 @@ impl PageBox {
     /// Same allocation-failure contract as `new_uninit`.
     #[must_use]
     pub fn new_zeroed(logical_len: usize) -> Self {
-        let (len, layout) = Self::layout_for(logical_len);
-        // SAFETY: `layout_for` returns a non-zero-size, page-aligned Layout.
-        let ptr = unsafe { alloc::alloc_zeroed(layout) };
-        let ptr = NonNull::new(ptr).expect("PageBox alloc failed");
+        Self::try_new_zeroed(logical_len).expect("PageBox alloc failed")
+    }
+
+    /// [`Self::new_uninit`] that answers `None` where that one panics.
+    ///
+    /// For the creation of a resource only: a length whose page-rounded
+    /// layout the platform cannot express, or an allocation the allocator
+    /// refuses, is `None`, which the create answers with `E_OUTOFMEMORY`.
+    #[must_use]
+    pub fn try_new_uninit(logical_len: usize) -> Option<Self> {
+        let (len, layout) = Self::try_layout_for(logical_len)?;
+        // SAFETY: `try_layout_for` returns a non-zero-size, page-aligned Layout.
+        let ptr = NonNull::new(unsafe { alloc::alloc(layout) })?;
+        Some(Self::adopt(ptr, len, logical_len, layout))
+    }
+
+    /// [`Self::new_zeroed`] that answers `None` where that one panics.
+    ///
+    /// The same creation-only contract as [`Self::try_new_uninit`].
+    #[must_use]
+    pub fn try_new_zeroed(logical_len: usize) -> Option<Self> {
+        let (len, layout) = Self::try_layout_for(logical_len)?;
+        // SAFETY: `try_layout_for` returns a non-zero-size, page-aligned Layout.
+        let ptr = NonNull::new(unsafe { alloc::alloc_zeroed(layout) })?;
+        Some(Self::adopt(ptr, len, logical_len, layout))
+    }
+
+    /// Wrap a fresh allocation of `layout` and count it.
+    fn adopt(ptr: NonNull<u8>, len: usize, logical_len: usize, layout: Layout) -> Self {
         note_alloc(len);
         PAGEBOX_LIVE_BYTES.fetch_add(len as u64, core::sync::atomic::Ordering::Relaxed);
         Self {
@@ -497,13 +512,17 @@ impl PageBox {
         self.logical_len = logical_len;
     }
 
-    fn layout_for(logical_len: usize) -> (usize, Layout) {
+    /// The padded length and layout of a `logical_len` request, `None` past what a layout holds.
+    fn try_layout_for(logical_len: usize) -> Option<(usize, Layout)> {
         // A zero-length PageBox is still allocated at one page so the
         // returned pointer is non-null and the MTLBuffer wrap doesn't
         // choke on length=0.
-        let padded = Self::padded_len(logical_len);
-        let layout = Layout::from_size_align(padded, PAGE_SIZE).expect("valid page-aligned layout");
-        (padded, layout)
+        let padded = logical_len
+            .max(1)
+            .div_ceil(PAGE_SIZE)
+            .checked_mul(PAGE_SIZE)?;
+        let layout = Layout::from_size_align(padded, PAGE_SIZE).ok()?;
+        Some((padded, layout))
     }
 }
 

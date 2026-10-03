@@ -106,7 +106,9 @@ impl PoolInner {
     ///
     /// The caller has checked that the pool is enabled.
     fn pop(&mut self, kind: LaneKind, logical_len: usize, gauge: &AtomicUsize) -> Option<PageBox> {
-        let class = PageBox::padded_len(logical_len) / PAGE_SIZE - 1;
+        // The page count less one, which is what the padded length names
+        // without forming it: a length too long to round up is oversize too.
+        let class = logical_len.max(1).div_ceil(PAGE_SIZE) - 1;
         let lane = &mut self.lanes[kind as usize];
         if class >= MAX_POOL_CLASSES {
             #[cfg(perf_tracking)]
@@ -157,7 +159,20 @@ impl StagingTake<'_> {
     ///
     /// Either way the contents are uninitialized, the contract of
     /// [`PageBox::new_uninit`].
+    ///
+    /// # Panics
+    ///
+    /// When no box is parked and the allocation fails, as
+    /// [`PageBox::new_uninit`] does.
     pub fn take(&mut self, logical_len: usize) -> PageBox {
+        self.try_take(logical_len).expect("PageBox alloc failed")
+    }
+
+    /// [`Self::take`] that answers `None` when no box is parked and the allocation fails.
+    ///
+    /// For the staging a texture gets at creation, the one place a staging
+    /// allocation may fail (see [`PageBox::try_new_uninit`]).
+    pub fn try_take(&mut self, logical_len: usize) -> Option<PageBox> {
         let Some(inner) = self.guard.as_mut() else {
             #[cfg(perf_tracking)]
             self.pool.record_acquire(
@@ -165,14 +180,14 @@ impl StagingTake<'_> {
                 diagnostics::Acquire::Disabled,
                 logical_len,
             );
-            return PageBox::new_uninit(logical_len);
+            return PageBox::try_new_uninit(logical_len);
         };
         if let Some(pb) = inner.pop(LaneKind::Staging, logical_len, &self.pool.pooled_bytes) {
             self.hits = self.hits.saturating_add(1);
-            return pb;
+            return Some(pb);
         }
         self.misses = self.misses.saturating_add(1);
-        PageBox::new_uninit(logical_len)
+        PageBox::try_new_uninit(logical_len)
     }
 
     /// Release the pool and report `(hits, misses)` for the device's counters.

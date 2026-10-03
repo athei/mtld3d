@@ -54,6 +54,17 @@ impl DirtyRect {
         }
     }
 
+    /// Whether the rect, placed at its own origin, reaches into a `(width, height)` level.
+    ///
+    /// `UpdateTexture` pairs levels whose extents need not match and copies
+    /// what the two share. A source dirty region whose origin lies past the
+    /// destination level's extent shares nothing with it, so that level copies
+    /// nothing, which is no failure.
+    #[must_use]
+    pub const fn reaches(self, width: u32, height: u32) -> bool {
+        self.x < width && self.y < height && self.w != 0 && self.h != 0
+    }
+
     /// Clamp to `(mip_w, mip_h)`.
     ///
     /// Returns `None` when the rect falls entirely outside the mip, so the
