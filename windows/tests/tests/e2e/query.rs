@@ -663,6 +663,15 @@ const FLUSH_WAIT_CHILD_NAME: &str = "occlusion-flush-wait.exe";
 /// The log filter of that child: the frame command buffers each submission retires.
 const FLUSH_WAIT_LOG_FILTER: &str = "warn,mtld3d::unix::command=debug";
 
+/// The frames each device of that child submits.
+///
+/// Two Presents, the read of the END still being recorded, and the flush of
+/// its release.
+const FLUSH_WAIT_FRAMES: usize = 4;
+
+/// How long the child's log has to stay unchanged before the counts are compared.
+const FLUSH_WAIT_QUIET: std::time::Duration = std::time::Duration::from_secs(1);
+
 #[test]
 fn a_flush_wait_on_a_sent_end_submits_nothing_more() {
     if running_as(FLUSH_WAIT_CHILD_NAME) {
@@ -735,11 +744,8 @@ fn flush_wait_workload() {
     drop(control);
 
     // A device's last retire lines can land after it is gone, so the counts
-    // are compared once both queues have retired the four frames each device
-    // submits (two Presents, the read of the unsent END, the release's flush)
-    // and a quiet second has passed with no further line.
-    const EXPECTED: usize = 4;
-    const QUIET: std::time::Duration = std::time::Duration::from_secs(1);
+    // are compared once both queues have retired the frames each device
+    // submits and a quiet second has passed with no further line.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     let mut last: Vec<usize> = Vec::new();
     let mut since = std::time::Instant::now();
@@ -752,13 +758,13 @@ fn flush_wait_workload() {
             last.clone_from(&counts);
             since = std::time::Instant::now();
         }
-        let complete = counts.len() == 2 && counts.iter().all(|&n| n >= EXPECTED);
-        if complete && since.elapsed() >= QUIET {
+        let complete = counts.len() == 2 && counts.iter().all(|&n| n >= FLUSH_WAIT_FRAMES);
+        if complete && since.elapsed() >= FLUSH_WAIT_QUIET {
             break counts;
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "both devices retire at least {EXPECTED} frame command buffers: {counts:?}"
+            "both devices retire at least {FLUSH_WAIT_FRAMES} frame command buffers: {counts:?}"
         );
         std::thread::sleep(std::time::Duration::from_millis(20));
     };
