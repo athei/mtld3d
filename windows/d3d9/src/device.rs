@@ -2762,6 +2762,9 @@ impl DeviceInner {
         self.flags.remove(DeviceFlags::A2M_ENABLED);
         self.ff_state = FfState::new();
         self.vs_draw = mtld3d_core::vs_draw::VsDrawState::new();
+        // Every user clip plane returns to its zero default; the per-draw
+        // uniform that carries them rebuilds with the rest below.
+        self.clip_planes = [[0.0; 4]; CLIP_PLANE_SLOTS];
         #[cfg(perf_tracking)]
         self.perf.state_mut().advance_reset_epoch();
         // Reset abandons any open scene; a following EndScene must fail.
