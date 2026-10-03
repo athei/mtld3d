@@ -1079,6 +1079,20 @@ pub fn attach_metal_layer(
     let mut flags = AttachFlags::empty();
     flags.set(AttachFlags::HDR_ENABLE_REQUESTED, hdr_enable);
     flags.set(AttachFlags::HDR_ACTIVE, mode == LayerMode::Hdr);
+    // A record still registered for this view is one whose teardown never
+    // ran; the new record replaces it, and the reference it held on its
+    // client surface goes with it.
+    if let Some(stale) = attachment::unregister(view as usize) {
+        mtld3d_shared::log_once_warn!(
+            target: LOG_TARGET,
+            "present: view {:#x} attached again without a teardown between; the earlier \
+             record is dropped",
+            view as usize,
+        );
+        if let Some(calls) = &surface_calls {
+            calls.release(stale.client_surface());
+        }
+    }
     let att = attachment::register(
         view as usize,
         layer as usize,

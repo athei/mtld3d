@@ -4357,7 +4357,8 @@ const SHARED_WINDOW_CHILD_NAME: &str = "shared-window-surface.exe";
 /// remaining device's surface again; otherwise the window would keep the
 /// departed device's last frame. Each attach names its layer class and its
 /// client surface, and every surface shown is logged, so the workload runs
-/// in a process of its own and reads them back.
+/// in a process of its own and reads them back. Every Wine the suite runs on
+/// keeps the client surface where attach reads it, so a null one fails.
 #[test]
 fn a_device_leaving_a_shared_window_hands_it_back_to_the_other() {
     if running_as(SHARED_WINDOW_CHILD_NAME) {
@@ -4395,23 +4396,26 @@ fn shared_window_workload() {
         .split_once("client surface ")
         .map(|(_, rest)| rest.trim().to_owned())
         .expect("the attach line names the client surface");
+    // Every Wine the suite runs on keeps the client surface on the cocoa
+    // view, so a null one means the field moved and the handback is untested.
+    assert_ne!(
+        surface, "0x0",
+        "the attach read the first device's client surface"
+    );
     assert_eq!(second.release_device(), 0, "release the later device");
-    // A Wine whose cocoa views name no client surface has none to show.
-    if surface != "0x0" {
-        let needle = format!("Wine shows client surface {surface}");
-        let shown = await_logged_lines(&needle, 2);
-        assert_eq!(
-            shown.len(),
-            2,
-            "the first device's surface shown at its attach and after the release: {shown:?}"
-        );
-        let last = logged_lines("Wine shows client surface");
-        assert_eq!(
-            last.last(),
-            Some(&shown[1]),
-            "the first device's surface is the last one shown: {last:?}"
-        );
-    }
+    let needle = format!("Wine shows client surface {surface}");
+    let shown = await_logged_lines(&needle, 2);
+    assert_eq!(
+        shown.len(),
+        2,
+        "the first device's surface shown at its attach and after the release: {shown:?}"
+    );
+    let last = logged_lines("Wine shows client surface");
+    assert_eq!(
+        last.last(),
+        Some(&shown[1]),
+        "the first device's surface is the last one shown: {last:?}"
+    );
     first.render_once(RED, |_| {});
     assert_pixel_eq(first.read_pixel(1, 1), RED, "the remaining device");
     drop(second);

@@ -129,10 +129,16 @@ impl SurfaceCalls {
     /// Take a reference on `surface`, handing it back; `0` passes through.
     pub fn retain(&self, surface: usize) -> usize {
         if surface != 0 {
-            // SAFETY: `surface` is either read from a live cocoa view's field
-            // on the main thread just before, which the window data list Wine
-            // keeps for the window holds a reference on until the window is
-            // destroyed, or one a live attachment record holds a reference on.
+            // SAFETY: `surface` is one a live attachment record holds a
+            // reference on, or one attach read from the field of its view's
+            // cocoa view on the main thread just before. Wine holds the
+            // reference keeping the latter alive in the window's data and
+            // drops it only when the window is destroyed, which the window's
+            // owner thread does; nothing Wine exports lets this thread hold it
+            // across the read. So the precondition is the D3D9 one that the
+            // device window stays valid for the `CreateDevice` or `Reset` that
+            // attaches to it: a window its owner destroys while another
+            // thread attaches a device to it can free the surface first.
             unsafe { (self.add_ref)(surface as *mut c_void) };
         }
         surface
@@ -203,7 +209,7 @@ fn surface_field(object: &AnyObject, host: &AnyClass) -> usize {
         return 0;
     }
     let Some(ivar) = host.instance_variable(CLIENT_SURFACE_IVAR) else {
-        mtld3d_shared::log_once_warn!(
+        mtld3d_shared::log_once_info!(
             target: LOG_TARGET,
             "present: this Wine's {CLIENT_VIEW_CLASS:?} keeps no {CLIENT_SURFACE_IVAR:?}; a \
              window another device's surface hid stays on that surface",
@@ -234,7 +240,7 @@ fn surface_fn(name: &CStr) -> Option<SurfaceFn> {
     if let Ok(symbol) = symbol {
         return Some(*symbol);
     }
-    mtld3d_shared::log_once_warn!(
+    mtld3d_shared::log_once_info!(
         target: LOG_TARGET,
         "present: this Wine exports no {name:?}; a window another device's surface hid stays \
          on that surface, and a metal view's client surface is not shown by the layer",
