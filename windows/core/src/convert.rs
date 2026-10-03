@@ -1511,7 +1511,7 @@ const fn decl_usage_to_byte(u: crate::dxso::DeclUsage) -> u8 {
 /// Clamp the declaration's TEXCOORD extent and diagnose the largest invalid index.
 fn checked_tex_coord_count(max_texcoord_index: Option<u8>) -> u8 {
     // D3D9 spec caps TEXCOORD usage_index at 7 (D3DDP_MAXTEXCOORD = 8).
-    // FfVsKey's per-stage arrays (tci_modes, tci_coord_indices, tt_flags)
+    // FfVsKey's per-stage arrays (tci, tt_flags)
     // are sized [u8; 8]; a larger usage_index would index out of bounds on
     // the encoder thread. Clamp at the source and surface the offending raw
     // value once per distinct usage_index.

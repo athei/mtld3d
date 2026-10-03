@@ -252,11 +252,11 @@ fn spheremap_texgen_mode_reaches_the_vs_key() {
         declared_weights_count: 0,
     };
     let key = ff.build_vs_key(&rs(), layout, 0b0000_0001, [0; 8]);
-    assert_eq!(key.tci_modes[0], 4);
-    assert_eq!(key.tci_coord_indices[0], 1);
+    assert_eq!(key.tci_mode(0), 4);
+    assert_eq!(key.tci_set(0), 1);
 }
 
-/// `build_vs_key` must populate `tci_coord_indices` for every stage the VB layout declares.
+/// `build_vs_key` must populate the `tci` coordinate sets for every stage the VB layout declares.
 ///
 /// This holds for every stage the layout declares an attribute for, even
 /// when the FF PS color-blend chain terminates earlier via
@@ -266,7 +266,7 @@ fn spheremap_texgen_mode_reaches_the_vs_key() {
 /// while the captured FF state leaves stage 1+'s `COLOROP` at its default
 /// `DISABLE` (the game doesn't enable FF blending when a programmable PS
 /// is bound). Stopping TCI decode at the first `COLOROP_DISABLE` would
-/// leave `tci_coord_indices[1..]` at their `[0; 8]` init, routing every
+/// leave the sets of stages 1.. at their `[0; 8]` init, routing every
 /// VS texcoord output onto `v4`; the PS would then sample every texture
 /// at `v4`'s coord set instead of the distinct sets each stage expects,
 /// collapsing the intended multi-texture result.
@@ -297,9 +297,9 @@ fn tci_indices_preserved_past_colorop_disable_terminator() {
     // The fix preserves that for stages past the FF PS chain
     // terminator; the broken behaviour collapsed them all to 0.
     assert_eq!(
-        &key.tci_coord_indices[..3],
-        &[0u8, 1, 2],
-        "tci_coord_indices[1..3] must stay populated; collapsing them to 0 \
+        [key.tci_set(0), key.tci_set(1), key.tci_set(2)],
+        [0u8, 1, 2],
+        "the sets of stages 1..3 must stay populated; collapsing them to 0 \
          would route every FF VS texcoord output onto v4",
     );
     assert_eq!(
@@ -909,8 +909,7 @@ fn make_vs_key(flags: super::FfVsFlags, fog_mode: u8) -> super::FfVsKey {
         specular_source: 0,
         emissive_source: 0,
         fog_mode,
-        tci_modes: [0; 8],
-        tci_coord_indices: [0; 8],
+        tci: [0; 8],
         tex_coord_dims: [0; 8],
         tt_flags: [0; 8],
         vertex_blend_count: 0,

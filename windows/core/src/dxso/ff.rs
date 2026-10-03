@@ -244,17 +244,21 @@ pub struct FfVsKey {
     /// 0. XYZRHW vertices bypass the vertex-fog computation, so a `HAS_RHW`
     /// draw carries either 0 (fog off, or table fog) or 4.
     pub fog_mode: u8,
-    /// Per-stage TCI (texture coordinate index) mode.
+    /// Per-stage `D3DTSS_TEXCOORDINDEX`, narrowed to a byte by [`tci_entry`].
     ///
-    /// Decoded from the high byte of `D3DTSS_TEXCOORDINDEX[i]`. 0 = PASSTHRU,
-    /// 1 = CAMERASPACENORMAL, 2 = CAMERASPACEPOSITION,
-    /// 3 = CAMERASPACEREFLECTIONVECTOR, 4 = SPHEREMAP. Higher values are
-    /// undefined and fall back to passthru with a one-shot warn.
-    pub tci_modes: [u8; 8],
-    /// Per-stage input coord-set index for passthru mode.
+    /// The high nibble is the TCI mode (0 = PASSTHRU, 1 = CAMERASPACENORMAL,
+    /// 2 = CAMERASPACEPOSITION, 3 = CAMERASPACEREFLECTIONVECTOR,
+    /// 4 = SPHEREMAP; higher values are undefined and fall back to passthru
+    /// with a one-shot warn), the low nibble the input coordinate set
+    /// (0..7), the two halves the D3D9 value itself carries. Read them with
+    /// [`FfVsKey::tci_mode`] and [`FfVsKey::tci_set`].
+    pub tci: [u8; 8],
+    /// The declaration elements a pre-transformed draw passes to the pixel stage by semantic.
     ///
-    /// Decoded from the low byte of `D3DTSS_TEXCOORDINDEX[i]` (0..7).
-    pub tci_coord_indices: [u8; 8],
+    /// The list `link::decl_passthrough_code` describes: a semantic code per
+    /// entry, zero past the end, entry `k` read from attribute
+    /// [`FF_PASSTHROUGH_ATTR_BASE`] `+ k`. Empty on an untransformed layout.
+    pub passthrough: [u8; MAX_LINKED_INPUTS],
     /// Declared component count (1..=4) of each *input* TEXCOORD set.
     ///
     /// Indexed by coord-set (= `usage_index`); `0` if the set is absent.
@@ -276,12 +280,6 @@ pub struct FfVsKey {
     /// the world-space position; always 0 on an RHW layout, which D3D9 never
     /// clips against user planes.
     pub clip_plane_count: u8,
-    /// The declaration elements a pre-transformed draw passes to the pixel stage by semantic.
-    ///
-    /// The list `link::decl_passthrough_code` describes: a semantic code per
-    /// entry, zero past the end, entry `k` read from attribute
-    /// [`FF_PASSTHROUGH_ATTR_BASE`] `+ k`. Empty on an untransformed layout.
-    pub passthrough: [u8; MAX_LINKED_INPUTS],
     /// Initialized padding in the canonical capture record.
     pub reserved: u8,
 }
@@ -300,14 +298,13 @@ impl core::hash::Hash for FfVsKey {
         core::hash::Hash::hash(&self.specular_source, state);
         core::hash::Hash::hash(&self.emissive_source, state);
         core::hash::Hash::hash(&self.fog_mode, state);
-        core::hash::Hash::hash(&self.tci_modes, state);
-        core::hash::Hash::hash(&self.tci_coord_indices, state);
+        core::hash::Hash::hash(&self.tci, state);
+        core::hash::Hash::hash(&self.passthrough, state);
         core::hash::Hash::hash(&self.tex_coord_dims, state);
         core::hash::Hash::hash(&self.tt_flags, state);
         core::hash::Hash::hash(&self.vertex_blend_count, state);
         core::hash::Hash::hash(&self.declared_weights_count, state);
         core::hash::Hash::hash(&self.clip_plane_count, state);
-        core::hash::Hash::hash(&self.passthrough, state);
     }
 }
 
@@ -382,6 +379,30 @@ impl FfVsKey {
     pub const fn declared_indices(&self) -> bool {
         self.flags.contains(FfVsFlags::DECLARED_INDICES)
     }
+    /// The TCI mode of `stage`, the high nibble of its `tci` entry.
+    #[inline]
+    #[must_use]
+    pub const fn tci_mode(&self, stage: usize) -> u8 {
+        self.tci[stage] >> 4
+    }
+    /// The input coordinate set of `stage` (0..7), the low nibble of its `tci` entry.
+    #[inline]
+    #[must_use]
+    pub const fn tci_set(&self, stage: usize) -> u8 {
+        self.tci[stage] & 0x0F
+    }
+}
+
+/// One `FfVsKey::tci` entry from a TCI mode and an input coordinate set.
+///
+/// A mode above 15 keeps the nibble's highest value and a set above 7 reads
+/// set 7, the same undefined-mode passthru and the same coordinate set the
+/// emitter takes for the raw values.
+#[must_use]
+pub const fn tci_entry(mode: u8, set: u8) -> u8 {
+    let mode = if mode > 15 { 15 } else { mode };
+    let set = if set > 7 { 7 } else { set };
+    (mode << 4) | set
 }
 
 /// Texture-transform flag accessor helpers.
@@ -420,8 +441,7 @@ pub enum FfStageResult {
 /// Note: D3D9's `D3DTSS_TEXCOORDINDEX` controls *both* the VS (TCI mode +
 /// input coord-set selection) and the PS (which varying to sample from).
 /// Both concerns are handled on the VS side
-/// (`FfVsKey::tci_modes` + `FfVsKey::tci_coord_indices`, one entry per
-/// stage) so the VS emits the correct coord for each stage into
+/// (`FfVsKey::tci`, one entry per stage) so the VS emits the correct coord for each stage into
 /// `Varyings.texcoord[stage]`. The PS then samples stage `N` using
 /// `Varyings.texcoord[N]` — no per-stage indirection needed here.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -651,9 +671,7 @@ pub fn emit_vs_ff_named(vs_key: &FfVsKey, entry: &str) -> String {
 /// neither lighting nor texgen.
 fn reads_eye_normal(vs: &FfVsKey) -> bool {
     let active = usize::from(vs.tex_coord_count).min(8);
-    let texgen_reads_normal = vs.tci_modes[..active]
-        .iter()
-        .any(|&m| matches!(m, 1 | 3 | 4));
+    let texgen_reads_normal = (0..active).any(|stage| matches!(vs.tci_mode(stage), 1 | 3 | 4));
     let lit_reads_normal = vs.lighting_enabled() && vs.light_active_mask != 0;
     vs.has_normal() && !vs.has_rhw() && (texgen_reads_normal || lit_reads_normal)
 }
@@ -1109,13 +1127,13 @@ fn emit_vs(out: &mut String, vs: &FfVsKey, entry: &str) {
         // We still honour the coord-set selector so a stage reading a
         // non-default set picks the right attribute.
         for i in 0..vs.tex_coord_count as usize {
-            let mode = vs.tci_modes[i];
+            let mode = vs.tci_mode(i);
             if matches!(mode, 1..=4) {
                 mtld3d_shared::log_once_warn!(target: super::LOG_TARGET,
                     "dxso FF: TCI mode {mode} on XYZRHW stage {i} — eye-space undefined, falling back to passthru"
                 );
             }
-            let src = u32::from(vs.tci_coord_indices[i].min(7));
+            let src = u32::from(vs.tci_set(i));
             let n = input_dim(vs, src);
             let raw = masked_input_rhs(vs, i, src);
             if (1..4).contains(&n) {
@@ -1196,9 +1214,10 @@ fn emit_vs(out: &mut String, vs: &FfVsKey, entry: &str) {
     // vertex normal, since without one that mode falls back to passthru.
     // Lighting reads it for the vertex-to-light vector of a POINT or SPOT
     // slot and for the local-viewer `V`.
-    let texgen_reads_pos_eye = vs.tci_modes[..active]
-        .iter()
-        .any(|&m| m == 2 || m == 4 || (m == 3 && vs.has_normal()));
+    let texgen_reads_pos_eye = (0..active).any(|stage| {
+        let m = vs.tci_mode(stage);
+        m == 2 || m == 4 || (m == 3 && vs.has_normal())
+    });
     let lit_reads_pos_eye = (vs.lighting_enabled()
         && (vs.light_active_mask & !vs.light_directional_mask) != 0)
         || (lit_specular && vs.local_viewer());
@@ -1490,8 +1509,8 @@ fn emit_vs(out: &mut String, vs: &FfVsKey, entry: &str) {
     // must happen at sample time, not here). Implements the D3D9 D3DTTFF
     // texture-coordinate transform per the spec.
     for i in 0..vs.tex_coord_count as usize {
-        let mode = vs.tci_modes[i];
-        let src = u32::from(vs.tci_coord_indices[i].min(7));
+        let mode = vs.tci_mode(i);
+        let src = u32::from(vs.tci_set(i));
         let tt = vs.tt_flags[i];
         let count = tt_count(tt); // 0 (passthru) or 2/3/4 (matrix transform)
         let projected = tt_projected(tt);

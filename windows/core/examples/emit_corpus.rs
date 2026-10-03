@@ -57,7 +57,7 @@ use std::{
 use mtld3d_core::{
     dxso::{
         self, DxsoProgram, FfPsKey, FfStage, FfStageFlags, FfVsFlags, FfVsKey, VariantKey,
-        VsSamplerKinds,
+        VsSamplerKinds, tci_entry,
     },
     shader_cache::{
         CACHE_FORMAT_VERSION, CacheEntry, SHADER_CACHE_SCHEMA_VERSION, SHADER_EMITTER_VERSION,
@@ -81,7 +81,7 @@ const TARGET: Duration = Duration::from_millis(200);
 /// Fewest passes a measurement takes when `--iters` is not given.
 const MIN_PASSES: u32 = 5;
 
-/// `D3DTSS_TCI_CAMERASPACEREFLECTIONVECTOR` in the `FfVsKey::tci_modes` encoding.
+/// `D3DTSS_TCI_CAMERASPACEREFLECTIONVECTOR` as the mode half of an `FfVsKey::tci` entry.
 const TCI_REFLECTION: u8 = 3;
 
 /// `D3DTTFF_COUNT2` in the `FfVsKey::tt_flags` encoding.
@@ -866,10 +866,9 @@ fn vs_key(shape: &VsShape) -> FfVsKey {
         } else {
             0
         },
-        tci_modes: [0; 8],
         // Every stage's `D3DTSS_TEXCOORDINDEX` defaults to its own index.
-        tci_coord_indices: core::array::from_fn(|stage| {
-            u8::try_from(stage).expect("stage index fits u8")
+        tci: core::array::from_fn(|stage| {
+            tci_entry(0, u8::try_from(stage).expect("stage index fits u8"))
         }),
         tex_coord_dims: [0; 8],
         tt_flags: [0; 8],
@@ -886,11 +885,11 @@ fn vs_key(shape: &VsShape) -> FfVsKey {
         Texturing::EnvMap => {
             let stage = usize::from(tex);
             key.tex_coord_count = tex + 1;
-            key.tci_modes[stage] = TCI_REFLECTION;
+            key.tci[stage] = tci_entry(TCI_REFLECTION, tex);
             key.tt_flags[stage] = TT_COUNT3;
         }
         Texturing::Scrolled => key.tt_flags[0] = TT_COUNT2,
-        Texturing::SharedUv => key.tci_coord_indices[1] = 0,
+        Texturing::SharedUv => key.tci[1] = tci_entry(0, 0),
     }
     key
 }

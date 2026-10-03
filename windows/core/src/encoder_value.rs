@@ -250,14 +250,13 @@ fields_codec!(FfVsKey {
     specular_source,
     emissive_source,
     fog_mode,
-    tci_modes,
-    tci_coord_indices,
+    tci,
+    passthrough,
     tex_coord_dims,
     tt_flags,
     vertex_blend_count,
     declared_weights_count,
-    clip_plane_count,
-    passthrough
+    clip_plane_count
 });
 
 fields_codec!(FfStage {

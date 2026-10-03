@@ -337,9 +337,10 @@ mod source;
 ///
 /// `80` passes a pre-transformed declaration's elements through to a
 /// `ps_3_0` by semantic: `FfVsKey::passthrough` joins the fixed-function
-/// key, the pre-transformed FF VS reads those elements from attributes 15 and
-/// up and declares the extra members they feed, and its pipeline recipes
-/// carry those attributes.
+/// key in the bytes freed by folding its TCI modes and coordinate sets into
+/// one `tci` byte per stage, the pre-transformed FF VS reads those elements
+/// from attributes 15 and up and declares the extra members they feed, and
+/// its pipeline recipes carry those attributes.
 pub const SHADER_CACHE_SCHEMA_VERSION: u32 = 80;
 
 /// Source-derived identity of MSL emission, independent of persistent DXSO and shader keys.

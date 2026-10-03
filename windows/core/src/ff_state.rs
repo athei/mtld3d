@@ -39,7 +39,7 @@ use crate::{
     convert::FfVsLayout,
     dxso::{
         FF_VS_PALETTE_BASE_ROW, FfPsKey, FfStage, FfStageFlags, FfStageResult, FfVsFlags, FfVsKey,
-        MAX_LINKED_INPUTS, MAX_VERTEX_BLEND_MATRIX_INDEX, VariantFlags, VariantKey,
+        MAX_LINKED_INPUTS, MAX_VERTEX_BLEND_MATRIX_INDEX, VariantFlags, VariantKey, tci_entry,
     },
     scratch::ScratchArena,
 };
@@ -1228,7 +1228,7 @@ impl FfState {
         // chain, but programmable PS draws using FF VS still depend on the
         // VS routing the right coord-set to each stage the PS samples.
         // Stopping the loop at the first `COLOROP_DISABLE` would leave
-        // `tci_coord_indices[1..]` at their `[0; 8]` init for the very
+        // the `tci` sets of stages 1.. at their `[0; 8]` init for the very
         // common pattern of "game leaves stages 1..N at default
         // `COLOROP_DISABLE` while a programmable PS does its own sampling",
         // collapsing every VS texcoord output onto coord-set 0 (v4) — fine
@@ -1247,13 +1247,12 @@ impl FfState {
         // `input_tex_coord_count` stays pinned to the vertex-stream count so
         // the `VertexIn` struct only declares attributes that
         // `resolve_attrs_for_ff` populates in the MTLVertexDescriptor.
-        let mut tci_modes = [0u8; 8];
-        let mut tci_coord_indices = [0u8; 8];
+        let mut tci = [0u8; 8];
         let mut tt_flags = [0u8; 8];
         for (i, stage_state) in self.texture_stage_states.iter().enumerate() {
-            let raw = stage_state[D3DTSS_TEXCOORDINDEX as usize];
-            tci_modes[i] = raw.to_le_bytes()[2]; // bits 16..23
-            tci_coord_indices[i] = raw.to_le_bytes()[0]; // bits 0..7
+            let raw = stage_state[D3DTSS_TEXCOORDINDEX as usize].to_le_bytes();
+            // Mode from bits 16..23, coordinate set from bits 0..7.
+            tci[i] = tci_entry(raw[2], raw[0]);
             let ttff = stage_state[D3DTSS_TEXTURETRANSFORMFLAGS as usize];
             // Only D3DTTFF_COUNT2..4 trigger the texture-matrix multiply.
             // D3DTTFF_DISABLE (0), D3DTTFF_COUNT1 (1), and any value above
@@ -1287,15 +1286,15 @@ impl FfState {
             }
         }
         let mut routed_stage_count = 0u8;
-        for (count, (&mode, &set)) in (1u8..).zip(tci_modes.iter().zip(&tci_coord_indices)) {
-            if stage_has_coordinate(mode, set, layout) {
+        for (count, &entry) in (1u8..).zip(&tci) {
+            if stage_has_coordinate(entry >> 4, entry & 0x0F, layout) {
                 routed_stage_count = count;
             }
         }
         // `.min(8)` is defensive: `ff_vs_layout_from_elements` already
         // clamps, but keep the invariant enforced here so a future layout
         // source can't reintroduce OOB into FfVsKey's [u8; 8] per-stage
-        // arrays (tci_modes, tci_coord_indices, tt_flags).
+        // arrays (tci, tt_flags).
         let tex_coord_count = layout
             .tex_coord_count
             .max(max_active_stage.map_or(0, |m| m + 1))
@@ -1329,9 +1328,9 @@ impl FfState {
         // from the normal. Gate the variant fork on those so the other draws
         // don't multiply pipelines.
         let texgen_reads_normal = !layout.has_rhw()
-            && tci_modes[..usize::from(tex_coord_count)]
+            && tci[..usize::from(tex_coord_count)]
                 .iter()
-                .any(|&mode| matches!(mode, 1 | 3 | 4));
+                .any(|&entry| matches!(entry >> 4, 1 | 3 | 4));
         flags.set(
             FfVsFlags::NORMALIZE_NORMALS,
             (lighting_enabled || texgen_reads_normal)
@@ -1364,8 +1363,7 @@ impl FfState {
                 "EMISSIVEMATERIALSOURCE",
             ),
             fog_mode,
-            tci_modes,
-            tci_coord_indices,
+            tci,
             tex_coord_dims: layout.tex_coord_dims,
             tt_flags,
             vertex_blend_count,
@@ -1409,8 +1407,7 @@ impl FfState {
             stage.alpha_arg1 = to_u8(D3DTSS_ALPHAARG1);
             stage.alpha_arg2 = to_u8(D3DTSS_ALPHAARG2);
             // `D3DTSS_TEXCOORDINDEX` is now consumed VS-side via
-            // `FfVsKey::tci_modes` + `tci_coord_indices` (one entry per
-            // stage). The PS samples `Varyings.texcoord[stage]` 1:1.
+            // `FfVsKey::tci` (one entry per stage). The PS samples `Varyings.texcoord[stage]` 1:1.
             stage.flags.set(
                 FfStageFlags::HAS_TEXTURE,
                 (bound_texture_mask & (1 << i)) != 0,
@@ -2277,11 +2274,11 @@ fn build_vs_flags(
 
 /// Whether the FF VS writes a coordinate other than zero for a stage with this TCI.
 ///
-/// `mode` and `set` are the decoded `FfVsKey::tci_modes` and
-/// `tci_coord_indices` entries. CAMERASPACEPOSITION and SPHEREMAP always
-/// generate one; CAMERASPACENORMAL and CAMERASPACEREFLECTIONVECTOR generate
-/// one from a vertex normal and otherwise pass the set through, as passthru
-/// and the undefined modes do. A pre-transformed layout generates nothing and
+/// `mode` and `set` are the two halves of an `FfVsKey::tci` entry.
+/// CAMERASPACEPOSITION and SPHEREMAP always generate one;
+/// CAMERASPACENORMAL and CAMERASPACEREFLECTIONVECTOR generate one from a
+/// vertex normal and otherwise pass the set through, as passthru and the
+/// undefined modes do. A pre-transformed layout generates nothing and
 /// passes every mode through.
 fn stage_has_coordinate(mode: u8, set: u8, layout: FfVsLayout) -> bool {
     let routes_a_streamed_set = set.min(7) < layout.tex_coord_count;

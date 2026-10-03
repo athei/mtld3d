@@ -117,10 +117,10 @@ unsafe fn borrow<T>(bytes: &[u8]) -> &T {
 
 pub(super) fn read_vs(reader: &mut SnapshotReader<'_>) -> Result<VsSourcePtr, WireError> {
     let source = if matches!(read_header(reader)?, SourceKind::FixedFunction) {
-        let bytes = super::read_aligned_bytes(reader, 64, 8)?;
+        let bytes = super::read_aligned_bytes(reader, 56, 8)?;
         #[cfg(debug_assertions)]
-        if bytes[55] != 0
-            || bytes[58..].iter().any(|&b| b != 0)
+        if bytes[47] != 0
+            || bytes[50..].iter().any(|&b| b != 0)
             || crate::dxso::FfVsFlags::from_bits(u16::from_le_bytes([bytes[0], bytes[1]])).is_none()
         {
             return Err(WireError::InvalidValue);
@@ -183,9 +183,9 @@ macro_rules! packed_fields {
 packed_fields!(crate::dxso::FfVsKey;
     flags:2, input_tex_coord_count:1, tex_coord_count:1, light_active_mask:1,
     light_directional_mask:1, light_spot_mask:1, diffuse_source:1, ambient_source:1,
-    specular_source:1, emissive_source:1, fog_mode:1, tci_modes:8, tci_coord_indices:8,
+    specular_source:1, emissive_source:1, fog_mode:1, tci:8, passthrough:8,
     tex_coord_dims:8, tt_flags:8, vertex_blend_count:1, declared_weights_count:1,
-    clip_plane_count:1, passthrough:8, reserved:1);
+    clip_plane_count:1, reserved:1);
 packed_fields!(crate::dxso::FfStage;
     color_op:1, color_arg1:1, color_arg2:1, alpha_op:1, alpha_arg1:1, alpha_arg2:1, flags:1);
 packed_fields!(crate::dxso::FfPsKey; stages:56, specular_add:1, tt_projected_mask:1);
@@ -202,8 +202,8 @@ const _: () = {
     use crate::dxso::{FfPsKey, FfStage, FfVsKey, VsSamplerKinds};
     assert!(size_of::<SourceHeader>() == 8);
     assert!(size_of::<VsSamplerKinds>() == 2);
-    assert!(size_of::<FfVsKey>() == 56);
-    assert!(offset_of!(FfVsKey, reserved) == 55);
+    assert!(size_of::<FfVsKey>() == 48);
+    assert!(offset_of!(FfVsKey, reserved) == 47);
     assert!(size_of::<FfStage>() == 7);
     assert!(size_of::<FfPsKey>() == 58);
     assert!(offset_of!(FfPsKey, specular_add) == 56);
@@ -222,11 +222,11 @@ const _: () = {
     assert!(offset_of!(ProgrammablePsSource, flags) == 10);
     assert!(offset_of!(ProgrammablePsSource, color_out_mask) == 11);
     assert!(offset_of!(ProgrammablePsSource, reserved) == 12);
-    assert!(size_of::<FixedVsSource>() == 64);
+    assert!(size_of::<FixedVsSource>() == 56);
     assert!(align_of::<FixedVsSource>() == 8);
     assert!(offset_of!(FixedVsSource, key) == 0);
-    assert!(offset_of!(FixedVsSource, max_row_count) == 56);
-    assert!(offset_of!(FixedVsSource, reserved) == 58);
+    assert!(offset_of!(FixedVsSource, max_row_count) == 48);
+    assert!(offset_of!(FixedVsSource, reserved) == 50);
     assert!(size_of::<FixedPsSource>() == 64);
     assert!(align_of::<FixedPsSource>() == 8);
     assert!(offset_of!(FixedPsSource, key) == 0);
