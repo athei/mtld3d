@@ -4447,38 +4447,37 @@ extern "system" fn device_reset(this: *mut c_void, present_params: *mut c_void) 
         );
         return D3DERR_INVALIDCALL;
     }
+    // A Reset with well-formed parameters ends an open `BeginStateBlock`
+    // recording whether or not it goes on to succeed, before it looks for
+    // outstanding references: the recording dies with the state it was
+    // recording against. Every rejection from here on goes through
+    // `reject_reset`, which restores the state defaults as well.
+    dev.recording_state_block = None;
     // A fullscreen request must still be well-formed even though its size is
     // not used: the D3D9 "zero means the client area" rule is windowed-only,
     // so zero dimensions here are a malformed request. Checked before the
-    // window moves, so a rejected Reset leaves the device exactly as it was.
+    // window moves, so a rejected Reset leaves the window as it was.
     if pp.windowed == 0 && (pp.back_buffer_width == 0 || pp.back_buffer_height == 0) {
         warn!(
             target: LOG_TARGET,
             "reject Reset({}x{}) — a fullscreen request may not carry zero dimensions",
             pp.back_buffer_width, pp.back_buffer_height,
         );
-        dev.flags.insert(DeviceFlags::NOT_RESET);
-        return D3DERR_INVALIDCALL;
+        return reject_reset(dev);
     }
-    // A Reset with well-formed parameters ends an open `BeginStateBlock`
-    // recording whether or not it goes on to succeed, before it looks for
-    // outstanding references: the recording dies with the state it was
-    // recording against.
-    dev.recording_state_block = None;
     // Reset rejects any outstanding app reference to a `D3DPOOL_DEFAULT`
     // resource or an implicit surface: those are backed by the device memory
     // the Reset recreates, and D3D9 makes the app release them first. A state
     // block that holds such a resource keeps it outstanding too, since the
-    // resource lives as long as the block; the device's bindings do not count
-    // (they are reset below on success).
+    // resource lives as long as the block; the device's bindings do not count,
+    // so they need not be released before the count is read.
     let blockers = dev.outstanding_reset_blockers.load(Ordering::Acquire);
     if blockers != 0 {
         warn!(
             target: LOG_TARGET,
             "reject Reset — {blockers} D3DPOOL_DEFAULT resource(s) or implicit surface(s) still referenced",
         );
-        dev.flags.insert(DeviceFlags::NOT_RESET);
-        return D3DERR_INVALIDCALL;
+        return reject_reset(dev);
     }
     if pp.windowed != 0 && pp.back_buffer_format == 0 {
         pp.back_buffer_format = crate::direct3d9::adapter_display_format();
@@ -4499,8 +4498,7 @@ extern "system" fn device_reset(this: *mut c_void, present_params: *mut c_void) 
             "reject Reset: MultiSampleType={} Quality={} on back-buffer format {} is not available",
             pp.multi_sample_type, pp.multi_sample_quality, pp.back_buffer_format,
         );
-        dev.flags.insert(DeviceFlags::NOT_RESET);
-        return D3DERR_INVALIDCALL;
+        return reject_reset(dev);
     };
     let target_window = if pp.device_window == 0 {
         dev.window()
@@ -4514,8 +4512,7 @@ extern "system" fn device_reset(this: *mut c_void, present_params: *mut c_void) 
             "reject Reset({}x{}, fmt={}) - no usable windowed client area",
             pp.back_buffer_width, pp.back_buffer_height, pp.back_buffer_format,
         );
-        dev.flags.insert(DeviceFlags::NOT_RESET);
-        return D3DERR_INVALIDCALL;
+        return reject_reset(dev);
     }
     pp.back_buffer_count = pp.back_buffer_count.max(1);
     warn_present_params_fields_once(&pp);
@@ -4658,6 +4655,27 @@ extern "system" fn device_reset(this: *mut c_void, present_params: *mut c_void) 
     }
 
     D3D_OK
+}
+
+/// Fail a well-formed `Reset` with the device state at its defaults.
+///
+/// D3D9 restores the device state before it checks what can make a `Reset`
+/// fail, so a rejected one still leaves every binding released and every
+/// state at its default: render target 0 on the back buffer, the depth
+/// stencil on the implicit surface, no recording and no open scene. The
+/// frame in flight is delivered and replaced first, as a same-size `Reset`
+/// does, so the attachments it records follow the defaults as well; without
+/// that, a draw after the rejection would be built for the back buffer while
+/// its pass still carried the targets the application had bound. The device
+/// then reports `D3DERR_DEVICENOTRESET` until a `Reset` succeeds.
+fn reject_reset(dev: &mut DeviceInner) -> i32 {
+    dev.flags.insert(DeviceFlags::NOT_RESET);
+    if let Err(hr) = dev.flush_current_frame_blocking() {
+        return hr;
+    }
+    dev.reseed_current_frame();
+    dev.reset_to_defaults();
+    D3DERR_INVALIDCALL
 }
 
 /// Resolve geometry after the window transition, undoing a rejected fullscreen exit.
