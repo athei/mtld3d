@@ -1814,6 +1814,56 @@ impl Harness {
         (hr, texture)
     }
 
+    /// `CreateVertexBuffer` returning `(hr, this)` for error-path tests.
+    #[must_use]
+    pub fn try_create_vertex_buffer(
+        &self,
+        length: u32,
+        usage: u32,
+        fvf: u32,
+        pool: u32,
+    ) -> (i32, *mut c_void) {
+        let mut out: *mut c_void = core::ptr::null_mut();
+        // SAFETY: vtable thunk; `&mut out` is writable, null shared-handle is allowed.
+        let hr = unsafe {
+            (self.dev_vtbl().create_vertex_buffer)(
+                self.device,
+                length,
+                usage,
+                fvf,
+                pool,
+                &raw mut out,
+                core::ptr::null_mut(),
+            )
+        };
+        (hr, out)
+    }
+
+    /// `CreateIndexBuffer` returning `(hr, this)` for error-path tests.
+    #[must_use]
+    pub fn try_create_index_buffer(
+        &self,
+        length: u32,
+        usage: u32,
+        format: u32,
+        pool: u32,
+    ) -> (i32, *mut c_void) {
+        let mut out: *mut c_void = core::ptr::null_mut();
+        // SAFETY: vtable thunk; `&mut out` is writable, null shared-handle is allowed.
+        let hr = unsafe {
+            (self.dev_vtbl().create_index_buffer)(
+                self.device,
+                length,
+                usage,
+                format,
+                pool,
+                &raw mut out,
+                core::ptr::null_mut(),
+            )
+        };
+        (hr, out)
+    }
+
     /// `CreateVertexBuffer`, asserting success.
     ///
     /// # Panics

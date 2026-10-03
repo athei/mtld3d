@@ -1090,6 +1090,16 @@ impl CubeTexture<'_> {
         }
     }
 
+    /// `UnlockRect` of one cube face and mip level, returning the hr.
+    ///
+    /// For a lock taken through another object that maps the same
+    /// subresource, such as the face's own surface.
+    #[must_use]
+    pub fn unlock_rect(&self, face: u32, level: u32) -> i32 {
+        // SAFETY: live cube texture; face and level are forwarded as given.
+        unsafe { (self.vtbl().unlock_rect)(self.ptr, face, level) }
+    }
+
     /// Get a parent-backed face surface.
     ///
     /// # Panics
@@ -1309,6 +1319,17 @@ impl Surface<'_> {
         // SAFETY: vtable thunk; `self.ptr` is live and `&mut out` is writable.
         let hr = unsafe { (self.vtbl().get_dc)(self.ptr, &raw mut out) };
         (hr, out)
+    }
+
+    /// `ReleaseDC` on this surface with the `HDC` another surface's `GetDC` returned.
+    ///
+    /// Returns the hr. The guard keeps its DC: a refused call leaves it held
+    /// for its own surface's `ReleaseDC`.
+    #[must_use]
+    pub fn release_dc_of(&self, dc: &SurfaceDc<'_>) -> i32 {
+        // SAFETY: vtable thunk; `self.ptr` is live and the handle is one a
+        // live guard holds, passed through for the implementation to check.
+        unsafe { (self.vtbl().release_dc)(self.ptr, dc.hdc) }
     }
 
     /// `GetDC`, asserting success and returning a guard over the memory DC.
