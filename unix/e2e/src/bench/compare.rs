@@ -1078,7 +1078,7 @@ pub fn compare(
         }
         notes.push(format!(
             "{bench} skipped: only the {ran} leg's build could read that shader cache (a cache \
-             format one of the builds does not read), so there is nothing to pair"
+             format or schema one of the builds does not read), so there is nothing to pair"
         ));
     }
     // The notes many benchmarks share, collected so that each prints once:
@@ -1151,10 +1151,12 @@ pub fn compare(
 
 /// Whether `bench` measures a real shader cache, going by its files in `rounds`.
 ///
-/// Its files carry [`CORPUS_META`]. The host emitter and the cold-start
-/// benchmark skip a cache whose format their build does not read and write
-/// no file for it, so a cache that a format change between the two builds
-/// makes readable to one leg only leaves its benchmark in that leg alone.
+/// Its files carry [`CORPUS_META`]. The host emitter skips a cache of
+/// another format than its leg's build reads, and the cold-start benchmark
+/// one of another format or schema than its leg's layer writes; neither
+/// writes a file for it, so a cache that such a change between the two
+/// builds makes readable to one leg only leaves its benchmark in that leg
+/// alone.
 fn cache_corpus(bench: &str, rounds: &[BTreeMap<String, Loaded>]) -> bool {
     let mut files = rounds
         .iter()
