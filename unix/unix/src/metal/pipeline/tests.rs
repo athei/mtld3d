@@ -6,7 +6,7 @@
 use mtld3d_core::{
     convert::{
         ResolvedAttrs, decl_type_to_metal_format, ff_vs_layout_from_elements, fvf_to_elements,
-        resolve_attrs_for_ff,
+        resolve_attrs_for_ff, rhw_passthrough,
     },
     dxso::{
         LinkInputs, SemanticSet, VariantKey, emit_ps_ff_named, emit_ps_programmable_named,
@@ -66,7 +66,8 @@ fn ff_blend_pipeline_builds(
     states[D3DRS_INDEXEDVERTEXBLENDENABLE as usize] = u32::from(indexed);
     let ff = FfState::new();
     let layout = ff_vs_layout_from_elements(elements, true);
-    let vs_key = ff.build_vs_key(&states, layout, 0);
+    let passthrough = rhw_passthrough(elements);
+    let vs_key = ff.build_vs_key(&states, layout, 0, passthrough);
     assert!(vs_key.vertex_blend_count > 0 && vs_key.declared_indices());
     let vs_msl = emit_vs_ff_named(&vs_key, "blend_probe_vs");
     let ps_msl = emit_ps_ff_named(
@@ -74,7 +75,7 @@ fn ff_blend_pipeline_builds(
         VariantKey::default(),
         "blend_probe_ps",
     );
-    let resolved = resolve_attrs_for_ff(elements, &layout.passthrough);
+    let resolved = resolve_attrs_for_ff(elements, &passthrough);
     pipeline_builds(
         device,
         ("blend_probe_vs", &vs_msl),
@@ -248,7 +249,12 @@ fn a_pretransformed_layout_builds_a_pipeline_with_each_sm3_input() {
         element(144, D3DDECLTYPE_D3DCOLOR, D3DDECLUSAGE_COLOR),
     ];
     let layout = ff_vs_layout_from_elements(&elements, true);
-    let vs_key = FfState::new().build_vs_key(&render_state_defaults(), layout, 0);
+    let vs_key = FfState::new().build_vs_key(
+        &render_state_defaults(),
+        layout,
+        0,
+        rhw_passthrough(&elements),
+    );
     let vs_msl = emit_vs_ff_named(&vs_key, "passthrough_vs");
     let resolved = resolve_attrs_for_ff(&elements, &vs_key.passthrough);
     let outputs = SemanticSet::passthrough_outputs(&vs_key.passthrough);

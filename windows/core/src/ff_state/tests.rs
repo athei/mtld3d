@@ -250,9 +250,8 @@ fn spheremap_texgen_mode_reaches_the_vs_key() {
         tex_coord_count: 1,
         tex_coord_dims: [0; 8],
         declared_weights_count: 0,
-        passthrough: [0; 8],
     };
-    let key = ff.build_vs_key(&rs(), layout, 0b0000_0001);
+    let key = ff.build_vs_key(&rs(), layout, 0b0000_0001, [0; 8]);
     assert_eq!(key.tci_modes[0], 4);
     assert_eq!(key.tci_coord_indices[0], 1);
 }
@@ -290,10 +289,9 @@ fn tci_indices_preserved_past_colorop_disable_terminator() {
         tex_coord_count: 3,
         tex_coord_dims: [0; 8],
         declared_weights_count: 0,
-        passthrough: [0; 8],
     };
     // bound_texture_mask = stages 0/1/2 all have textures bound.
-    let key = ff.build_vs_key(&rs(), layout, 0b0000_0111);
+    let key = ff.build_vs_key(&rs(), layout, 0b0000_0111, [0; 8]);
 
     // D3D9 spec default for `D3DTSS_TEXCOORDINDEX` is the stage index.
     // The fix preserves that for stages past the FF PS chain
@@ -327,7 +325,6 @@ fn tex_coord_count_covers_routed_and_generated_stages_past_colorop_disable() {
         tex_coord_count: 1,
         tex_coord_dims: [2, 0, 0, 0, 0, 0, 0, 0],
         declared_weights_count: 0,
-        passthrough: [0; 8],
     };
     let count = |tci: &[(usize, u32)], layout: FfVsLayout| {
         let mut ff = FfState::new();
@@ -339,7 +336,8 @@ fn tex_coord_count_covers_routed_and_generated_stages_past_colorop_disable() {
             D3DTOP_DISABLE,
             "stage 1 keeps its default DISABLE"
         );
-        ff.build_vs_key(&rs(), layout, 0b0000_0011).tex_coord_count
+        ff.build_vs_key(&rs(), layout, 0b0000_0011, [0; 8])
+            .tex_coord_count
     };
     let plain = one_set(FfVsLayoutFlags::empty());
     assert_eq!(
@@ -398,7 +396,6 @@ fn normalize_normals_flag_follows_every_eye_normal_reader() {
         tex_coord_count: 1,
         tex_coord_dims: [2, 0, 0, 0, 0, 0, 0, 0],
         declared_weights_count: 0,
-        passthrough: [0; 8],
     };
     let normal = layout(FfVsLayoutFlags::HAS_NORMAL);
     let flag = |lighting: u32, tci: u32, layout: FfVsLayout| {
@@ -407,7 +404,8 @@ fn normalize_normals_flag_follows_every_eye_normal_reader() {
         let mut states = rs();
         states[D3DRS_LIGHTING as usize] = lighting;
         states[D3DRS_NORMALIZENORMALS as usize] = 1;
-        ff.build_vs_key(&states, layout, 0b1).normalize_normals()
+        ff.build_vs_key(&states, layout, 0b1, [0; 8])
+            .normalize_normals()
     };
     assert!(flag(1, 0, normal), "lit");
     assert!(!flag(0, 0, normal), "unlit passthru reads no normal");
@@ -433,29 +431,28 @@ fn local_viewer_flag_canonicalizes_on_lighting_and_specular() {
         tex_coord_count: 0,
         tex_coord_dims: [0; 8],
         declared_weights_count: 0,
-        passthrough: [0; 8],
     };
 
     // RS defaults: LIGHTING=1, LOCALVIEWER=1, SPECULARENABLE=0 — the
     // bit stays clear while no specular term reads V.
     let mut states = rs();
-    let key = ff.build_vs_key(&states, layout, 0);
+    let key = ff.build_vs_key(&states, layout, 0, [0; 8]);
     assert!(!key.local_viewer(), "no specular → no LOCAL_VIEWER bit");
 
     // Specular on + default LOCALVIEWER=1 → set.
     states[D3DRS_SPECULARENABLE as usize] = 1;
-    let key = ff.build_vs_key(&states, layout, 0);
+    let key = ff.build_vs_key(&states, layout, 0, [0; 8]);
     assert!(key.local_viewer(), "specular + RS default → set");
 
     // Explicit LOCALVIEWER=0 → infinite viewer.
     states[D3DRS_LOCALVIEWER as usize] = 0;
-    let key = ff.build_vs_key(&states, layout, 0);
+    let key = ff.build_vs_key(&states, layout, 0, [0; 8]);
     assert!(!key.local_viewer(), "RS off → infinite viewer");
 
     // Lighting off clears it even with specular + localviewer on.
     states[D3DRS_LOCALVIEWER as usize] = 1;
     states[D3DRS_LIGHTING as usize] = 0;
-    let key = ff.build_vs_key(&states, layout, 0);
+    let key = ff.build_vs_key(&states, layout, 0, [0; 8]);
     assert!(!key.local_viewer(), "unlit → no LOCAL_VIEWER bit");
 }
 
@@ -621,7 +618,6 @@ fn resolve_vertex_blend_count_normal_mode() {
         tex_coord_count: 0,
         tex_coord_dims: [0; 8],
         declared_weights_count: 3,
-        passthrough: [0; 8],
     };
     // D3DVBF_1WEIGHTS → 2 matrices; sequential mode.
     assert_eq!(
@@ -652,7 +648,6 @@ fn resolve_vertex_blend_count_indexed_only() {
         tex_coord_count: 0,
         tex_coord_dims: [0; 8],
         declared_weights_count: 0,
-        passthrough: [0; 8],
     };
     // D3DVBF_0WEIGHTS + INDEXED → 1 matrix (single-bone indexed).
     assert_eq!(
@@ -1194,7 +1189,6 @@ fn resolve_vertex_blend_count_decl_mismatch_falls_back() {
         tex_coord_count: 0,
         tex_coord_dims: [0; 8],
         declared_weights_count: 0,
-        passthrough: [0; 8],
     };
     // Game asks for blending but decl has no BLENDWEIGHT → 0.
     assert_eq!(
@@ -1262,9 +1256,8 @@ fn lit_vs_key(state: &FfState) -> super::FfVsKey {
         tex_coord_count: 0,
         tex_coord_dims: [0; 8],
         declared_weights_count: 0,
-        passthrough: [0; 8],
     };
-    state.build_vs_key(&rs, layout, 0)
+    state.build_vs_key(&rs, layout, 0, [0; 8])
 }
 
 #[test]
@@ -1880,9 +1873,9 @@ fn range_fog_keys_only_computed_vertex_fog() {
             states[D3DRS_FOGTABLEMODE as usize] = table;
             let mut layout = FfVsLayout::default();
             layout.flags.set(FfVsLayoutFlags::HAS_RHW, rhw);
-            let ordinary = ff.build_vs_key(&states, layout, 0);
+            let ordinary = ff.build_vs_key(&states, layout, 0, [0; 8]);
             states[D3DRS_RANGEFOGENABLE as usize] = 1;
-            let mut range = ff.build_vs_key(&states, layout, 0);
+            let mut range = ff.build_vs_key(&states, layout, 0, [0; 8]);
             let active = mode != 0 && enabled != 0 && table == 0 && !rhw;
             assert_eq!(range.flags.contains(FfVsFlags::RANGE_FOG), active);
             range.flags.remove(FfVsFlags::RANGE_FOG);
@@ -2276,7 +2269,6 @@ fn vs_sources(state: &FfState) -> Vec<(super::FfVsKey, u16)> {
         tex_coord_count: 1,
         tex_coord_dims: [2, 0, 0, 0, 0, 0, 0, 0],
         declared_weights_count: 0,
-        passthrough: [0; 8],
     };
     let blended = FfVsLayout {
         flags: FfVsLayoutFlags::HAS_NORMAL | FfVsLayoutFlags::DECLARED_INDICES,
@@ -2293,7 +2285,7 @@ fn vs_sources(state: &FfState) -> Vec<(super::FfVsKey, u16)> {
     [(unlit, plain), (lit, plain), (blend, blended)]
         .iter()
         .map(|(states, layout)| {
-            let key = state.build_vs_key(states, *layout, 0b1);
+            let key = state.build_vs_key(states, *layout, 0b1, [0; 8]);
             let rows = state.ff_vs_row_count(&key);
             (key, rows)
         })

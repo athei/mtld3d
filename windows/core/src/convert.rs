@@ -1148,12 +1148,10 @@ pub struct FfVsLayout {
     /// BLENDWEIGHT element is declared. Drives whether the FF VS emit needs
     /// the blending input attribute (slot 12).
     pub declared_weights_count: u8,
-    /// The elements a pre-transformed layout passes to a `ps_3_0` by semantic.
-    ///
-    /// `FfVsKey::passthrough`, built by [`rhw_passthrough`]; empty unless the
-    /// layout has a POSITIONT element.
-    pub passthrough: [u8; MAX_LINKED_INPUTS],
 }
+
+// Small enough to pass and copy by value (CONVENTIONS, the 16-byte rule).
+const _: () = assert!(core::mem::size_of::<FfVsLayout>() <= 16);
 
 bitflags::bitflags! {
     /// Boolean predicates for `FfVsLayout`.
@@ -1280,17 +1278,11 @@ pub fn ff_vs_layout_from_elements(elements: &[D3DVERTEXELEMENT9], uses_decl: boo
         }
     }
     let tex_coord_count = checked_tex_coord_count(max_texcoord_index);
-    let passthrough = if flags.contains(FfVsLayoutFlags::HAS_RHW) {
-        rhw_passthrough(elements)
-    } else {
-        [0; MAX_LINKED_INPUTS]
-    };
     FfVsLayout {
         flags,
         tex_coord_count,
         tex_coord_dims,
         declared_weights_count,
-        passthrough,
     }
 }
 
@@ -1298,14 +1290,21 @@ pub fn ff_vs_layout_from_elements(elements: &[D3DVERTEXELEMENT9], uses_decl: boo
 ///
 /// The `FfVsKey::passthrough` list (`dxso::decl_passthrough_code` gives
 /// its shape): each element whose semantic passes through, in declaration
-/// order, once per semantic. An element `resolve_attrs` drops (a stream past
-/// the slot table, a type with no Metal format) is left out too, so the FF
-/// VS never declares an attribute the descriptor lacks. Past
+/// order, once per semantic, and empty for a declaration without an
+/// in-range POSITIONT element. An element `resolve_attrs` drops (a stream
+/// past the slot table, a type with no Metal format) is left out too, so the
+/// FF VS never declares an attribute the descriptor lacks. Past
 /// [`MAX_LINKED_INPUTS`] entries, which is what the varying budget leaves
 /// beside the fixed-function members, the rest read zero, warned once.
 #[must_use]
 pub fn rhw_passthrough(elements: &[D3DVERTEXELEMENT9]) -> [u8; MAX_LINKED_INPUTS] {
     let mut passthrough = [0; MAX_LINKED_INPUTS];
+    let pretransformed = elements
+        .iter()
+        .any(|e| e.usage == D3DDECLUSAGE_POSITIONT && u32::from(e.stream) < MAX_STREAMS);
+    if !pretransformed {
+        return passthrough;
+    }
     let mut len = 0;
     for e in elements {
         if u32::from(e.stream) >= MAX_STREAMS
@@ -1360,15 +1359,17 @@ pub fn vertex_decl_has_rhw(elements: &[D3DVERTEXELEMENT9]) -> bool {
 /// Same as [`resolve_attrs_for_vs`] but uses the FF VS's attribute convention.
 ///
 /// See `crate::dxso::ff_attr_index_for_semantic`. The FF VS has no `dcl_*`
-/// declarations — its input layout is fixed, but for the elements a
-/// pre-transformed layout passes through: `passthrough` is
-/// `FfVsLayout::passthrough`, and its entry `k` reads attribute
+/// declarations, so its input layout is fixed, but for the elements a
+/// pre-transformed layout passes through: `passthrough` is the
+/// declaration's [`rhw_passthrough`] list, and its entry `k` reads attribute
 /// `FF_PASSTHROUGH_ATTR_BASE + k` instead of a fixed-function one.
 ///
 /// A `D3DCOLOR` `BLENDINDICES` element is fetched as four unnormalized bytes
 /// in memory order, the order `D3DCOLORtoUBYTE4` gives a programmable shader,
 /// so each lane reaches the FF VS as its byte value rather than a normalized
-/// and swizzled colour channel.
+/// and swizzled colour channel. One a pre-transformed layout passes through
+/// keeps the normalized colour fetch its declared type names, as a `vs_3_0`
+/// input does, since the pixel shader reads it as data, not as an index.
 #[must_use]
 pub fn resolve_attrs_for_ff(
     elements: &[D3DVERTEXELEMENT9],
@@ -1436,6 +1437,8 @@ pub struct PackedVertexDecl {
     /// Lets the draw path pick the streams to snapshot without walking the
     /// elements per draw. Streams past the slot table contribute no bit.
     pub stream_mask: u16,
+    /// [`rhw_passthrough`] of the elements, built once here rather than on every layout rebuild.
+    pub passthrough: [u8; MAX_LINKED_INPUTS],
 }
 
 /// Validate + pack the raw element slice a game passes to `CreateVertexDeclaration`.
@@ -1454,10 +1457,12 @@ pub fn pack_vertex_decl(elements: &[D3DVERTEXELEMENT9]) -> Option<PackedVertexDe
         .iter()
         .filter(|e| u32::from(e.stream) < MAX_STREAMS)
         .fold(0u16, |m, e| m | (1 << e.stream));
+    let passthrough = rhw_passthrough(&packed[..end_pos]);
     Some(PackedVertexDecl {
         elements_with_end: packed,
         hash,
         stream_mask,
+        passthrough,
     })
 }
 

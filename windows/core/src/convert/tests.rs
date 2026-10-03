@@ -1302,7 +1302,7 @@ fn passthrough_code(usage: u8, usage_index: u8) -> u8 {
 #[test]
 fn a_pretransformed_layout_passes_its_other_semantics_through_in_declaration_order() {
     let elements = pretransformed_monster();
-    let layout = ff_vs_layout_from_elements(&elements, true);
+    let passthrough = rhw_passthrough(&elements);
     let expected = [
         passthrough_code(D3DDECLUSAGE_BLENDWEIGHT, 0),
         passthrough_code(D3DDECLUSAGE_BLENDINDICES, 0),
@@ -1313,12 +1313,19 @@ fn a_pretransformed_layout_passes_its_other_semantics_through_in_declaration_ord
         passthrough_code(D3DDECLUSAGE_DEPTH, 0),
         0,
     ];
-    assert_eq!(layout.passthrough, expected);
+    assert_eq!(passthrough, expected);
+    assert_eq!(
+        pack_vertex_decl(&[&elements[..], &[end()]].concat())
+            .expect("pack")
+            .passthrough,
+        expected,
+        "the packed declaration carries the same list"
+    );
 
     // Entry k reads attribute 15 + k; the rest keep the FF convention, and
     // nothing lands on the FF normal or blend slots the pre-transformed
     // stage never declares.
-    let resolved = resolve_attrs_for_ff(&elements, &layout.passthrough);
+    let resolved = resolve_attrs_for_ff(&elements, &passthrough);
     let attr_of = |offset: u32| {
         resolved
             .attrs
@@ -1353,9 +1360,9 @@ fn a_pretransformed_layout_passes_its_other_semantics_through_in_declaration_ord
 fn an_untransformed_layout_passes_nothing_through() {
     let mut elements = pretransformed_monster();
     elements[0].usage = D3DDECLUSAGE_POSITION;
-    let layout = ff_vs_layout_from_elements(&elements, true);
-    assert_eq!(layout.passthrough, NO_PASSTHROUGH);
-    let resolved = resolve_attrs_for_ff(&elements, &layout.passthrough);
+    let passthrough = rhw_passthrough(&elements);
+    assert_eq!(passthrough, NO_PASSTHROUGH);
+    let resolved = resolve_attrs_for_ff(&elements, &passthrough);
     assert!(resolved.attrs.iter().all(|a| a.attr_index < 15));
 }
 
@@ -1378,9 +1385,8 @@ fn a_pretransformed_passthrough_skips_dropped_elements_repeats_and_overflow() {
         ));
     }
     elements.push(element(32, D3DDECLTYPE_FLOAT4, D3DDECLUSAGE_COLOR, 2));
-    let layout = ff_vs_layout_from_elements(&elements, true);
     let expected: Vec<u8> = (0..8)
         .map(|index| passthrough_code(D3DDECLUSAGE_COLOR, 2 + index))
         .collect();
-    assert_eq!(layout.passthrough[..], expected[..]);
+    assert_eq!(rhw_passthrough(&elements)[..], expected[..]);
 }

@@ -586,7 +586,7 @@ impl FfPsKey {
 ///
 /// Returns the `[[attribute(N)]]` index that a vertex element with the given
 /// `(usage, usage_index)` lands on in the FF VS. `None` means the FF VS does
-/// not consume this semantic — callers should skip the element, unless a
+/// not consume this semantic, and callers skip the element unless a
 /// pre-transformed layout passes it through (`FF_PASSTHROUGH_ATTR_BASE`).
 ///
 /// This is the single source of truth for the FF input layout: the vertex

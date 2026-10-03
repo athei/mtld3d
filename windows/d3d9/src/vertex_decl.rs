@@ -9,7 +9,7 @@
 
 use core::ffi::c_void;
 
-use mtld3d_core::convert::pack_vertex_decl;
+use mtld3d_core::{convert::pack_vertex_decl, dxso::MAX_LINKED_INPUTS};
 use mtld3d_shared::InPtr;
 use mtld3d_types::{D3DVERTEXELEMENT9, Guid, IDirect3DVertexDeclaration9Vtbl};
 
@@ -46,6 +46,10 @@ pub struct VertexDeclInner {
     hash: u64,
     /// Bit `s` set: some element lives on stream `s`.
     stream_mask: u16,
+    /// The elements a pre-transformed draw passes to the pixel stage by semantic.
+    ///
+    /// `convert::rhw_passthrough`, empty for a declaration without POSITIONT.
+    passthrough: [u8; MAX_LINKED_INPUTS],
     /// The FVF `SetFVF` built this declaration for, 0 for one the game created.
     fvf: u32,
 }
@@ -68,6 +72,11 @@ impl VertexDeclInner {
     /// Bit `s` set: some element lives on stream `s`.
     pub const fn stream_mask(&self) -> u16 {
         self.stream_mask
+    }
+
+    /// The elements a pre-transformed draw passes to the pixel stage by semantic.
+    pub const fn passthrough(&self) -> [u8; MAX_LINKED_INPUTS] {
+        self.passthrough
     }
 
     /// The FVF this declaration stands for, which `GetFVF` reports while it is bound.
@@ -98,6 +107,7 @@ impl Direct3DVertexDeclaration9 {
             elements_with_end: packed.elements_with_end,
             hash: packed.hash,
             stream_mask: packed.stream_mask,
+            passthrough: packed.passthrough,
             fvf: info.fvf,
         }));
         Some(Self {

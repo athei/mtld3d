@@ -39,7 +39,7 @@ use crate::{
     convert::FfVsLayout,
     dxso::{
         FF_VS_PALETTE_BASE_ROW, FfPsKey, FfStage, FfStageFlags, FfStageResult, FfVsFlags, FfVsKey,
-        MAX_VERTEX_BLEND_MATRIX_INDEX, VariantFlags, VariantKey,
+        MAX_LINKED_INPUTS, MAX_VERTEX_BLEND_MATRIX_INDEX, VariantFlags, VariantKey,
     },
     scratch::ScratchArena,
 };
@@ -1193,6 +1193,7 @@ impl FfState {
         render_states: &[u32; RENDER_STATE_COUNT],
         layout: FfVsLayout,
         bound_texture_mask: u8,
+        passthrough: [u8; MAX_LINKED_INPUTS],
     ) -> FfVsKey {
         // D3D9 spec: XYZRHW bypasses per-vertex lighting regardless of
         // D3DRS_LIGHTING. Encode that here so `emit_vs` doesn't gate on the
@@ -1376,7 +1377,11 @@ impl FfState {
             } else {
                 crate::vs_draw::clip_plane_count(render_states)
             },
-            passthrough: layout.passthrough,
+            passthrough: if layout.has_rhw() {
+                passthrough
+            } else {
+                [0; MAX_LINKED_INPUTS]
+            },
         }
     }
 
