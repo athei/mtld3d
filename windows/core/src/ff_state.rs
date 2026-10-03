@@ -1407,7 +1407,8 @@ impl FfState {
             stage.alpha_arg1 = to_u8(D3DTSS_ALPHAARG1);
             stage.alpha_arg2 = to_u8(D3DTSS_ALPHAARG2);
             // `D3DTSS_TEXCOORDINDEX` is now consumed VS-side via
-            // `FfVsKey::tci` (one entry per stage). The PS samples `Varyings.texcoord[stage]` 1:1.
+            // `FfVsKey::tci` (one entry per stage). The PS samples
+            // `Varyings.texcoord[stage]` 1:1.
             stage.flags.set(
                 FfStageFlags::HAS_TEXTURE,
                 (bound_texture_mask & (1 << i)) != 0,

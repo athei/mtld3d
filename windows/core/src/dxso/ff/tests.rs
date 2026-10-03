@@ -3831,3 +3831,21 @@ fn an_untransformed_key_passes_nothing_through_and_keeps_its_normal() {
     let ps = emit_ps_ff(&default_ps_key(), VariantKey::default());
     assert!(!ps.contains("normal0"), "{ps}");
 }
+
+/// `tci_entry` clamps a mode past the nibble and a set past 7 to values the emitter treats alike.
+///
+/// Mode 0x14 and set 9 read as mode 15 and set 7; an undefined mode emits
+/// the same passthru MSL whichever undefined value it carries.
+#[test]
+fn tci_entry_clamps_without_changing_the_emitted_shader() {
+    assert_eq!(tci_entry(0x14, 9), tci_entry(15, 7));
+    let msl = |mode| {
+        let mut vs = default_vs_key();
+        vs.tex_coord_count = 1;
+        vs.input_tex_coord_count = 1;
+        vs.tex_coord_dims[0] = 2;
+        vs.tci[0] = tci_entry(mode, 0);
+        emit_vs_ff(&vs)
+    };
+    assert_eq!(msl(5), msl(0x14));
+}

@@ -440,8 +440,8 @@ pub enum FfStageResult {
 ///
 /// Note: D3D9's `D3DTSS_TEXCOORDINDEX` controls *both* the VS (TCI mode +
 /// input coord-set selection) and the PS (which varying to sample from).
-/// Both concerns are handled on the VS side
-/// (`FfVsKey::tci`, one entry per stage) so the VS emits the correct coord for each stage into
+/// Both concerns are handled on the VS side (`FfVsKey::tci`, one entry per
+/// stage) so the VS emits the correct coord for each stage into
 /// `Varyings.texcoord[stage]`. The PS then samples stage `N` using
 /// `Varyings.texcoord[N]` — no per-stage indirection needed here.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
