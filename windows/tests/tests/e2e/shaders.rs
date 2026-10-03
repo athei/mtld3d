@@ -3015,9 +3015,9 @@ fn a_pretransformed_draw_feeds_sm3_inputs_from_the_declaration_by_semantic() {
         .collect();
     cases.extend([
         (D3DDECLUSAGE_COLOR, 0, PASSTHROUGH_DIFFUSE),
-        // Neither is in the declaration.
-        (D3DDECLUSAGE_COLOR, 2, 0xFF00_0000),
-        (D3DDECLUSAGE_TEXCOORD, 1, 0xFF00_0000),
+        // Neither is in the declaration: every lane, alpha included, reads zero.
+        (D3DDECLUSAGE_COLOR, 2, 0x0000_0000),
+        (D3DDECLUSAGE_TEXCOORD, 1, 0x0000_0000),
     ]);
     for (usage, index, expected) in cases {
         let ps = h.create_pixel_shader(&ps3_echo(usage, index));
