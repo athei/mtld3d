@@ -5354,17 +5354,21 @@ impl FrameEncoder {
     ///
     /// The `VariantKey::linked_input_mask` of a draw pairing them: zero for a
     /// pixel shader with no extra input and for a vertex shader with no extra
-    /// output, fixed-function ones included.
+    /// output. A fixed-function vertex shader outputs extras only for a
+    /// pre-transformed layout, the declaration elements it passes through.
     pub fn linked_input_mask(&self, ps_id: ProgramId, vs: VsSourceView<'_>) -> u8 {
-        let VsSourceView::Programmable(vs) = vs else {
+        let Some(inputs) = self.prog_link_inputs.get(&ps_id) else {
             return 0;
         };
-        match (
-            self.prog_link_inputs.get(&ps_id),
-            self.prog_link_outputs.get(&vs.vs_id),
-        ) {
-            (Some(inputs), Some(outputs)) => inputs.mask_against(outputs),
-            _ => 0,
+        match vs {
+            VsSourceView::Programmable(vs) => self
+                .prog_link_outputs
+                .get(&vs.vs_id)
+                .map_or(0, |outputs| inputs.mask_against(outputs)),
+            VsSourceView::FixedFunction(fixed) if fixed.key.passthrough[0] != 0 => {
+                inputs.mask_against(&SemanticSet::passthrough_outputs(&fixed.key.passthrough))
+            }
+            VsSourceView::FixedFunction(_) => 0,
         }
     }
 

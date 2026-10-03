@@ -301,6 +301,7 @@ fn complete_snapshot_borrows_canonical_leaves_and_reconstructs_only_native_roots
                 vertex_blend_count: 2,
                 declared_weights_count: 1,
                 clip_plane_count: 0,
+                passthrough: [0; 8],
             },
             max_row_count: 30,
 

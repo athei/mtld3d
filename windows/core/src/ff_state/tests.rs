@@ -250,6 +250,7 @@ fn spheremap_texgen_mode_reaches_the_vs_key() {
         tex_coord_count: 1,
         tex_coord_dims: [0; 8],
         declared_weights_count: 0,
+        passthrough: [0; 8],
     };
     let key = ff.build_vs_key(&rs(), layout, 0b0000_0001);
     assert_eq!(key.tci_modes[0], 4);
@@ -289,6 +290,7 @@ fn tci_indices_preserved_past_colorop_disable_terminator() {
         tex_coord_count: 3,
         tex_coord_dims: [0; 8],
         declared_weights_count: 0,
+        passthrough: [0; 8],
     };
     // bound_texture_mask = stages 0/1/2 all have textures bound.
     let key = ff.build_vs_key(&rs(), layout, 0b0000_0111);
@@ -325,6 +327,7 @@ fn tex_coord_count_covers_routed_and_generated_stages_past_colorop_disable() {
         tex_coord_count: 1,
         tex_coord_dims: [2, 0, 0, 0, 0, 0, 0, 0],
         declared_weights_count: 0,
+        passthrough: [0; 8],
     };
     let count = |tci: &[(usize, u32)], layout: FfVsLayout| {
         let mut ff = FfState::new();
@@ -395,6 +398,7 @@ fn normalize_normals_flag_follows_every_eye_normal_reader() {
         tex_coord_count: 1,
         tex_coord_dims: [2, 0, 0, 0, 0, 0, 0, 0],
         declared_weights_count: 0,
+        passthrough: [0; 8],
     };
     let normal = layout(FfVsLayoutFlags::HAS_NORMAL);
     let flag = |lighting: u32, tci: u32, layout: FfVsLayout| {
@@ -429,6 +433,7 @@ fn local_viewer_flag_canonicalizes_on_lighting_and_specular() {
         tex_coord_count: 0,
         tex_coord_dims: [0; 8],
         declared_weights_count: 0,
+        passthrough: [0; 8],
     };
 
     // RS defaults: LIGHTING=1, LOCALVIEWER=1, SPECULARENABLE=0 — the
@@ -616,6 +621,7 @@ fn resolve_vertex_blend_count_normal_mode() {
         tex_coord_count: 0,
         tex_coord_dims: [0; 8],
         declared_weights_count: 3,
+        passthrough: [0; 8],
     };
     // D3DVBF_1WEIGHTS → 2 matrices; sequential mode.
     assert_eq!(
@@ -646,6 +652,7 @@ fn resolve_vertex_blend_count_indexed_only() {
         tex_coord_count: 0,
         tex_coord_dims: [0; 8],
         declared_weights_count: 0,
+        passthrough: [0; 8],
     };
     // D3DVBF_0WEIGHTS + INDEXED → 1 matrix (single-bone indexed).
     assert_eq!(
@@ -914,6 +921,7 @@ fn make_vs_key(flags: super::FfVsFlags, fog_mode: u8) -> super::FfVsKey {
         vertex_blend_count: 0,
         declared_weights_count: 0,
         clip_plane_count: 0,
+        passthrough: [0; 8],
     }
 }
 
@@ -1186,6 +1194,7 @@ fn resolve_vertex_blend_count_decl_mismatch_falls_back() {
         tex_coord_count: 0,
         tex_coord_dims: [0; 8],
         declared_weights_count: 0,
+        passthrough: [0; 8],
     };
     // Game asks for blending but decl has no BLENDWEIGHT → 0.
     assert_eq!(
@@ -1253,6 +1262,7 @@ fn lit_vs_key(state: &FfState) -> super::FfVsKey {
         tex_coord_count: 0,
         tex_coord_dims: [0; 8],
         declared_weights_count: 0,
+        passthrough: [0; 8],
     };
     state.build_vs_key(&rs, layout, 0)
 }
@@ -2266,6 +2276,7 @@ fn vs_sources(state: &FfState) -> Vec<(super::FfVsKey, u16)> {
         tex_coord_count: 1,
         tex_coord_dims: [2, 0, 0, 0, 0, 0, 0, 0],
         declared_weights_count: 0,
+        passthrough: [0; 8],
     };
     let blended = FfVsLayout {
         flags: FfVsLayoutFlags::HAS_NORMAL | FfVsLayoutFlags::DECLARED_INDICES,

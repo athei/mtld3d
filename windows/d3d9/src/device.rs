@@ -11764,7 +11764,7 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
             // D3D9 runs the FF pre-transformed path regardless, even when a
             // VS is still bound — so the attrs must resolve for the FF VS too.
             let resolved = if bound_vertex_shader.is_null() || layout.has_rhw() {
-                resolve_attrs_for_ff(&elements)
+                resolve_attrs_for_ff(&elements, &layout.passthrough)
             } else {
                 // SAFETY: non-null check passed; refcount holds it live.
                 let vs_obj = unsafe { &*bound_vertex_shader };
@@ -11778,7 +11778,7 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
             let layout = convert::ff_vs_layout_from_elements(elements, fvf == 0);
             // See the FVF arm: POSITIONT bypasses a bound VS.
             let resolved = if bound_vertex_shader.is_null() || layout.has_rhw() {
-                resolve_attrs_for_ff(elements)
+                resolve_attrs_for_ff(elements, &layout.passthrough)
             } else {
                 // SAFETY: see above.
                 let vs_obj = unsafe { &*bound_vertex_shader };

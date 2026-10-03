@@ -58,7 +58,7 @@ use std::{
 
 use mtld3d_shared::{
     MetalHandle, VertexAttrDesc,
-    mtl::{PixelFormat, VertexFormat, VertexStepFunction},
+    mtl::{PixelFormat, VERTEX_ATTRIBUTE_SLOTS, VertexFormat, VertexStepFunction},
 };
 use mtld3d_types::MAX_STREAMS;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -334,7 +334,13 @@ mod source;
 /// fetches a `D3DCOLOR` `BLENDINDICES` element of a fixed-function draw as
 /// unnormalized bytes, changing the vertex descriptor of those pipeline
 /// recipes.
-pub const SHADER_CACHE_SCHEMA_VERSION: u32 = 79;
+///
+/// `80` passes a pre-transformed declaration's elements through to a
+/// `ps_3_0` by semantic: `FfVsKey::passthrough` joins the fixed-function
+/// key, the pre-transformed FF VS reads those elements from attributes 15 and
+/// up and declares the extra members they feed, and its pipeline recipes
+/// carry those attributes.
+pub const SHADER_CACHE_SCHEMA_VERSION: u32 = 80;
 
 /// Source-derived identity of MSL emission, independent of persistent DXSO and shader keys.
 pub const SHADER_EMITTER_VERSION: u64 = include!(concat!(env!("OUT_DIR"), "/emitter_version.rs"));
@@ -705,7 +711,7 @@ impl PipelineRecipe {
             };
         }
         let attr_count = usize::from(reader.u8()?);
-        if attr_count > MAX_STREAMS as usize {
+        if attr_count > VERTEX_ATTRIBUTE_SLOTS as usize {
             return None;
         }
         let mut vertex_attrs = Vec::with_capacity(attr_count);
@@ -766,7 +772,7 @@ impl PipelineRecipe {
                 .iter()
                 .all(|layout| layout.stride != 0 || *layout == StreamLayout::UNUSED)
             && self.vertex_attrs.iter().all(|attr| {
-                attr.attr_index < MAX_STREAMS
+                attr.attr_index < VERTEX_ATTRIBUTE_SLOTS
                     && attr.buffer_index < MAX_STREAMS
                     && attr.format != VertexFormat::Invalid
                     && self.snapshot.stream_layouts[attr.buffer_index as usize].is_used()

@@ -7,7 +7,8 @@
 //!
 //! - Vertex attributes at `[[attribute(N)]]` with N matching
 //!   `fvf_to_vertex_attrs` (0=position, 1=normal, 2=diffuse, 3=specular,
-//!   4..11=texcoord0..7).
+//!   4..11=texcoord0..7), and from 15 up the declaration elements a
+//!   pre-transformed draw passes through to the pixel stage by semantic.
 //! - Varyings struct: `position` first, then `texcoord0..7`, then
 //!   `color0..1` (texcoord-before-color workaround for a Metal
 //!   shader-compiler crash).
@@ -27,7 +28,9 @@
 
 use std::fmt::Write;
 
-use mtld3d_shared::mtl::{PS_LOD_BIAS_SLOT, VS_DRAW_SLOT, VS_FLOAT_CONST_SLOT, VS_POS_FIXUP_SLOT};
+use mtld3d_shared::mtl::{
+    PS_LOD_BIAS_SLOT, VERTEX_ATTRIBUTE_SLOTS, VS_DRAW_SLOT, VS_FLOAT_CONST_SLOT, VS_POS_FIXUP_SLOT,
+};
 use mtld3d_types::{
     D3DCMP_ALWAYS, D3DCMP_EQUAL, D3DCMP_GREATER, D3DCMP_GREATEREQUAL, D3DCMP_LESS,
     D3DCMP_LESSEQUAL, D3DCMP_NEVER, D3DCMP_NOTEQUAL, D3DDECLUSAGE_BLENDINDICES,
@@ -42,8 +45,14 @@ use mtld3d_types::{
     D3DTOP_MODULATEINVCOLOR_ADDALPHA, D3DTOP_SELECTARG1, D3DTOP_SELECTARG2, D3DTOP_SUBTRACT,
 };
 
-use super::emit::{
-    VariantFlags, VariantKey, fog_blend_active, write_fog_blend, write_point_sprite_prologue,
+use super::{
+    emit::{
+        VariantFlags, VariantKey, fog_blend_active, write_fog_blend, write_point_sprite_prologue,
+    },
+    link::{
+        MAX_LINKED_INPUTS, Semantic, passthrough_extras, write_extra_members,
+        write_passthrough_inputs, write_passthrough_outputs,
+    },
 };
 
 /// First FF VS constant row of the world-matrix palette.
@@ -65,6 +74,17 @@ pub const FF_VS_PALETTE_BASE_ROW: u16 = 95;
 /// palette from the cap never asks for a matrix the layout has no rows for.
 /// The emitted FF VS clamps a blend index to it.
 pub const MAX_VERTEX_BLEND_MATRIX_INDEX: u32 = 39;
+
+/// Vertex attribute of the first declaration element a pre-transformed draw passes through.
+///
+/// Entry `k` of `FfVsKey::passthrough` reads the attribute `k` slots above
+/// this one, past every fixed-function attribute `ff_attr_index_for_semantic`
+/// hands out.
+pub const FF_PASSTHROUGH_ATTR_BASE: u16 = 15;
+
+const _: () = assert!(
+    FF_PASSTHROUGH_ATTR_BASE as usize + MAX_LINKED_INPUTS <= VERTEX_ATTRIBUTE_SLOTS as usize
+);
 
 // The FF emitter stores D3D9 texture-op / texture-arg / compare-func codes in
 // `u8` cache-key fields and matches on them; the canonical `mtld3d_types`
@@ -256,6 +276,12 @@ pub struct FfVsKey {
     /// the world-space position; always 0 on an RHW layout, which D3D9 never
     /// clips against user planes.
     pub clip_plane_count: u8,
+    /// The declaration elements a pre-transformed draw passes to the pixel stage by semantic.
+    ///
+    /// The list `link::decl_passthrough_code` describes: a semantic code per
+    /// entry, zero past the end, entry `k` read from attribute
+    /// [`FF_PASSTHROUGH_ATTR_BASE`] `+ k`. Empty on an untransformed layout.
+    pub passthrough: [u8; MAX_LINKED_INPUTS],
     /// Initialized padding in the canonical capture record.
     pub reserved: u8,
 }
@@ -281,6 +307,7 @@ impl core::hash::Hash for FfVsKey {
         core::hash::Hash::hash(&self.vertex_blend_count, state);
         core::hash::Hash::hash(&self.declared_weights_count, state);
         core::hash::Hash::hash(&self.clip_plane_count, state);
+        core::hash::Hash::hash(&self.passthrough, state);
     }
 }
 
@@ -559,7 +586,8 @@ impl FfPsKey {
 ///
 /// Returns the `[[attribute(N)]]` index that a vertex element with the given
 /// `(usage, usage_index)` lands on in the FF VS. `None` means the FF VS does
-/// not consume this semantic — callers should skip the element.
+/// not consume this semantic — callers should skip the element, unless a
+/// pre-transformed layout passes it through (`FF_PASSTHROUGH_ATTR_BASE`).
 ///
 /// This is the single source of truth for the FF input layout: the vertex
 /// descriptor built by the pipeline and the `struct VertexIn` emitted here
@@ -599,7 +627,12 @@ pub fn emit_vs_ff_named(vs_key: &FfVsKey, entry: &str) -> String {
     out.push_str("#include <metal_stdlib>\n");
     out.push_str("using namespace metal;\n\n");
     emit_vertex_in(&mut out, vs_key);
-    emit_varyings(&mut out, false, vs_key.clip_plane_count);
+    emit_varyings(
+        &mut out,
+        false,
+        vs_key.clip_plane_count,
+        &passthrough_extras(vs_key.passthrough),
+    );
     out.push_str(super::emit::POS_FIXUP_MSL);
     out.push_str(crate::vs_draw::VS_DRAW_MSL);
     if reads_eye_normal(vs_key) && vs_key.vertex_blend_count == 0 {
@@ -653,6 +686,7 @@ pub fn emit_ps_ff_named(ps_key: &FfPsKey, variant: VariantKey, entry: &str) -> S
         &mut out,
         variant.flags.contains(VariantFlags::FLAT_SHADE),
         0,
+        &[],
     );
     if variant.flags.contains(VariantFlags::SRGB_WRITE) {
         super::emit::emit_srgb_write_helper(&mut out);
@@ -670,7 +704,10 @@ fn emit_vertex_in(out: &mut String, vs: &FfVsKey) {
     // Position: XYZ path is float3-padded (Metal zero-fills w), XYZRHW path
     // needs all four lanes (screen_x, screen_y, z, rhw).
     out.push_str("    float4 v0 [[attribute(0)]];\n");
-    if vs.has_normal() {
+    // A pre-transformed vertex is neither lit, texgen'd nor blended, so its
+    // normal and blend inputs have no reader; a `ps_3_0` reads them through
+    // the passthrough inputs below instead.
+    if vs.has_normal() && !vs.has_rhw() {
         out.push_str("    float4 v1 [[attribute(1)]];\n");
     }
     if vs.has_color0() {
@@ -685,12 +722,12 @@ fn emit_vertex_in(out: &mut String, vs: &FfVsKey) {
     // Vertex blending inputs. Only declared when the resolved blend mode
     // will use them — keeps the MTLVertexDescriptor and VertexIn in lock-
     // step with what the game actually wired up.
-    if vs.vertex_blend_count > 0 && vs.declared_weights_count > 0 {
+    if vs.vertex_blend_count > 0 && vs.declared_weights_count > 0 && !vs.has_rhw() {
         out.push_str("    float4 blend_weight [[attribute(12)]];\n");
     }
     // Read as floats whatever the declared type, which Metal converts every
     // vertex format into; `emit_vertex_blend` rounds each lane to an index.
-    if vs.vertex_blend_count > 0 && vs.declared_indices() {
+    if vs.vertex_blend_count > 0 && vs.declared_indices() && !vs.has_rhw() {
         out.push_str("    float4 blend_indices [[attribute(13)]];\n");
     }
     // Per-vertex point size (`D3DFVF_PSIZE`), a FLOAT1 the descriptor
@@ -698,6 +735,7 @@ fn emit_vertex_in(out: &mut String, vs: &FfVsKey) {
     if vs.has_psize() {
         out.push_str("    float4 psize [[attribute(14)]];\n");
     }
+    write_passthrough_inputs(out, vs.passthrough, FF_PASSTHROUGH_ATTR_BASE);
     out.push_str("};\n\n");
 }
 
@@ -736,7 +774,7 @@ fn masked_input_rhs(vs: &FfVsKey, stage: usize, src: u32) -> String {
     }
 }
 
-fn emit_varyings(out: &mut String, flat: bool, clip_planes: u8) {
+fn emit_varyings(out: &mut String, flat: bool, clip_planes: u8, extras: &[Semantic]) {
     out.push_str("struct Varyings {\n");
     // Must match `dxso::emit::emit_varyings` byte-for-byte — see the
     // invariance comment there. Analog of an `Invariant` decoration on
@@ -771,6 +809,10 @@ fn emit_varyings(out: &mut String, flat: bool, clip_planes: u8) {
     // oPts / dcl_psize must link to an FF PS, and vice versa, so the
     // layout has to stay identical.
     out.push_str("    float point_size [[point_size]];\n");
+    // The extra semantics a pre-transformed draw passes through, one member
+    // each, named as `dxso::emit::emit_varyings` names them; the FF PS reads
+    // none and declares none.
+    write_extra_members(out, extras);
     // VS-only: see `dxso::emit::emit_varyings`.
     if clip_planes > 0 {
         let _ = writeln!(
@@ -1095,6 +1137,12 @@ fn emit_vs(out: &mut String, vs: &FfVsKey, entry: &str) {
         } else {
             out.push_str("    out.fog = float4(1.0);\n");
         }
+        // Every other element a `ps_3_0` reads by semantic, straight from the
+        // declaration. A `FOG0` element replaces the fog varying only when
+        // the specular alpha is not the vertex fog factor: under fog mode 4
+        // the FF PS reads the factor there, and the key cannot tell whether
+        // a `ps_3_0`, which owns its fog, is bound instead.
+        write_passthrough_outputs(out, vs.passthrough, vs.fog_mode != 4);
         // NDC depth for the table-fog Z source (see the Varyings decl). The
         // clip-space round trip (`z*w / w`) keeps the FP rounding shape the
         // rasterizer's own depth uses.

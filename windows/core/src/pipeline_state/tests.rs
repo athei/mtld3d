@@ -17,7 +17,9 @@ use mtld3d_types::{
 };
 
 use super::*;
-use crate::convert::{fvf_to_elements, hash_elements, resolve_attrs_for_ff};
+use crate::convert::{
+    ff_vs_layout_from_elements, fvf_to_elements, hash_elements, resolve_attrs_for_ff,
+};
 
 /// A position-shaped attribute: register 0, stream 0, offset 0, three floats.
 const FLOAT3_AT_0: VertexAttrDesc = VertexAttrDesc {
@@ -587,7 +589,8 @@ fn blend_on_keys_every_factor_difference() {
 fn key_for_decl(elements: &[D3DVERTEXELEMENT9], vdecl_hash: u64) -> PipelineKey {
     let mut s = base();
     s.vdecl_hash = vdecl_hash;
-    key_from_snapshot(&s, &resolve_attrs_for_ff(elements).attrs)
+    let passthrough = ff_vs_layout_from_elements(elements, true).passthrough;
+    key_from_snapshot(&s, &resolve_attrs_for_ff(elements, &passthrough).attrs)
 }
 
 const fn element(offset: u16, type_: u8, usage: u8) -> D3DVERTEXELEMENT9 {

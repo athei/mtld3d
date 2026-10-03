@@ -1376,6 +1376,7 @@ impl FfState {
             } else {
                 crate::vs_draw::clip_plane_count(render_states)
             },
+            passthrough: layout.passthrough,
         }
     }
 

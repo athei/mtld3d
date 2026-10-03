@@ -63,6 +63,7 @@ fn fixed_vs(fog_mode: u8) -> FixedVsSource {
             vertex_blend_count: 0,
             declared_weights_count: 0,
             clip_plane_count: 0,
+            passthrough: [0; 8],
         },
         max_row_count: 8,
         reserved: [0; 6],

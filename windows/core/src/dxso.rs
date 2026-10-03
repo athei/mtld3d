@@ -28,14 +28,14 @@ pub use emit::{
     emit_vs_programmable, emit_vs_programmable_named,
 };
 pub use ff::{
-    FF_VS_PALETTE_BASE_ROW, FfPsKey, FfStage, FfStageFlags, FfStageResult, FfVsFlags, FfVsKey,
-    MAX_VERTEX_BLEND_MATRIX_INDEX, emit_ps_ff, emit_ps_ff_named, emit_vs_ff, emit_vs_ff_named,
-    ff_attr_index_for_semantic,
+    FF_PASSTHROUGH_ATTR_BASE, FF_VS_PALETTE_BASE_ROW, FfPsKey, FfStage, FfStageFlags,
+    FfStageResult, FfVsFlags, FfVsKey, MAX_VERTEX_BLEND_MATRIX_INDEX, emit_ps_ff, emit_ps_ff_named,
+    emit_vs_ff, emit_vs_ff_named, ff_attr_index_for_semantic,
 };
 pub use ir::{
     CmpFunc, DeclUsage, Declaration, DxsoError, DxsoProgram, RegKind, ShaderType, TextureType,
 };
-pub use link::{LinkInputs, MAX_LINKED_INPUTS, SemanticSet};
+pub use link::{LinkInputs, MAX_LINKED_INPUTS, SemanticSet, decl_passthrough_code};
 pub use parser::{operand_token_count, parse};
 
 #[cfg(test)]

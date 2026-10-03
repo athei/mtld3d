@@ -5,16 +5,20 @@
 
 use mtld3d_shared::mtl::{PS_LOD_BIAS_SLOT, VS_POS_FIXUP_SLOT};
 use mtld3d_types::{
-    D3DCMP_ALWAYS, D3DCMP_GREATER, D3DFOG_LINEAR, D3DMCS_COLOR1, D3DMCS_COLOR2, D3DMCS_MATERIAL,
-    D3DTA_ALPHAREPLICATE, D3DTA_CURRENT, D3DTA_DIFFUSE, D3DTA_SPECULAR, D3DTA_TEXTURE,
-    D3DTOP_DISABLE, D3DTOP_MODULATE, D3DTOP_SELECTARG1,
+    D3DCMP_ALWAYS, D3DCMP_GREATER, D3DDECLUSAGE_BINORMAL, D3DDECLUSAGE_FOG, D3DDECLUSAGE_NORMAL,
+    D3DFOG_LINEAR, D3DMCS_COLOR1, D3DMCS_COLOR2, D3DMCS_MATERIAL, D3DTA_ALPHAREPLICATE,
+    D3DTA_CURRENT, D3DTA_DIFFUSE, D3DTA_SPECULAR, D3DTA_TEXTURE, D3DTOP_DISABLE, D3DTOP_MODULATE,
+    D3DTOP_SELECTARG1,
 };
 
 use super::{
     FfPsKey, FfStage, FfStageFlags, FfVsFlags, FfVsKey, MAX_VERTEX_BLEND_MATRIX_INDEX, emit_ps_ff,
     emit_vs_ff,
 };
-use crate::dxso::emit::{VariantFlags, VariantKey};
+use crate::dxso::{
+    decl_passthrough_code,
+    emit::{VariantFlags, VariantKey},
+};
 
 /// D3D enum constant at the key's narrow width.
 fn narrow(v: u32) -> u8 {
@@ -56,6 +60,7 @@ fn default_vs_key() -> FfVsKey {
         vertex_blend_count: 0,
         declared_weights_count: 0,
         clip_plane_count: 0,
+        passthrough: [0; 8],
     }
 }
 
@@ -3763,4 +3768,67 @@ fn modulate_inv_color_add_alpha_constant_values_leave_shader_identity_unchanged(
         assert_eq!(key, changed);
         assert_eq!(source, emit_ps_ff(&changed, VariantKey::default()));
     }
+}
+
+/// A pre-transformed key passing NORMAL0, FOG0 and BINORMAL0 through, with the FF normal flag set.
+fn rhw_passthrough_key() -> FfVsKey {
+    let mut vs = default_vs_key();
+    vs.flags.set(FfVsFlags::HAS_RHW, true);
+    vs.flags.set(FfVsFlags::HAS_NORMAL, true);
+    let code = |usage| decl_passthrough_code(usage, 0).expect("semantic passes through");
+    vs.passthrough[..3].copy_from_slice(&[
+        code(D3DDECLUSAGE_NORMAL),
+        code(D3DDECLUSAGE_FOG),
+        code(D3DDECLUSAGE_BINORMAL),
+    ]);
+    vs
+}
+
+#[test]
+fn rhw_passes_declaration_elements_through_by_semantic() {
+    let msl = emit_vs_ff(&rhw_passthrough_key());
+    for line in [
+        "float4 p0 [[attribute(15)]];",
+        "float4 p1 [[attribute(16)]];",
+        "float4 p2 [[attribute(17)]];",
+        "    float4 normal0;\n",
+        "    float4 binormal0;\n",
+        "out.normal0 = in.p0;",
+        "out.fog = in.p1;",
+        "out.binormal0 = in.p2;",
+    ] {
+        assert!(msl.contains(line), "{line:?} missing from\n{msl}");
+    }
+    // The pre-transformed stage never reads the FF normal slot, and the
+    // descriptor carries the element at its passthrough attribute instead.
+    assert!(!msl.contains("[[attribute(1)]]"), "{msl}");
+    // Fog is a member every struct declares, not an extra one.
+    assert!(!msl.contains("float4 fog0;"), "{msl}");
+}
+
+#[test]
+fn rhw_specular_alpha_fog_keeps_the_fog_varying() {
+    let mut vs = rhw_passthrough_key();
+    vs.flags.set(FfVsFlags::HAS_COLOR1, true);
+    vs.fog_mode = 4;
+    let msl = emit_vs_ff(&vs);
+    assert!(
+        msl.contains("out.fog = float4(in.v3.w, 0.0, 0.0, 0.0);"),
+        "{msl}"
+    );
+    assert!(!msl.contains("out.fog = in.p1;"), "{msl}");
+    assert!(msl.contains("out.normal0 = in.p0;"), "{msl}");
+}
+
+#[test]
+fn an_untransformed_key_passes_nothing_through_and_keeps_its_normal() {
+    let mut vs = default_vs_key();
+    vs.flags.set(FfVsFlags::HAS_NORMAL, true);
+    let msl = emit_vs_ff(&vs);
+    assert!(msl.contains("float4 v1 [[attribute(1)]];"), "{msl}");
+    assert!(!msl.contains("in.p0"), "{msl}");
+    assert!(!msl.contains("normal0"), "{msl}");
+    // The FF pixel stage declares no extra member whatever the vertex stage outputs.
+    let ps = emit_ps_ff(&default_ps_key(), VariantKey::default());
+    assert!(!ps.contains("normal0"), "{ps}");
 }

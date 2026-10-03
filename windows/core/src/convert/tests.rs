@@ -7,8 +7,16 @@
 //! `ColorFill` pattern splat. A wrong mapping here reaches the
 //! screen as wrong pixels, not a crash.
 
+use mtld3d_types::{
+    D3DDECLTYPE_UNUSED, D3DDECLUSAGE_BINORMAL, D3DDECLUSAGE_DEPTH, D3DDECLUSAGE_FOG,
+    D3DDECLUSAGE_TANGENT,
+};
+
 use super::*;
 use crate::dxso::DeclUsage;
+
+/// The passthrough list of an untransformed layout, which passes nothing through.
+const NO_PASSTHROUGH: [u8; MAX_LINKED_INPUTS] = [0; MAX_LINKED_INPUTS];
 
 fn u16_indices(bytes: &[u8]) -> Vec<u16> {
     bytes
@@ -650,7 +658,7 @@ fn resolve_attrs_for_ff_matches_ff_convention() {
     // POSITION → attr(0), TEXCOORD0 → attr(4). Must agree with
     // `crate::dxso::ff_attr_index_for_semantic`.
     let elems = [pos3(), tex0(12)];
-    let resolved = resolve_attrs_for_ff(&elems);
+    let resolved = resolve_attrs_for_ff(&elems, &NO_PASSTHROUGH);
     assert_eq!(resolved.attrs.len(), 2);
     assert_eq!(resolved.attrs[0].attr_index, 0);
     assert_eq!(resolved.attrs[1].attr_index, 4);
@@ -673,7 +681,7 @@ fn resolve_attrs_for_ff_fetches_d3dcolor_blend_indices_as_bytes() {
             .find(|a| a.attr_index == attr)
             .map(|a| a.format)
     };
-    let ff = resolve_attrs_for_ff(&elements);
+    let ff = resolve_attrs_for_ff(&elements, &NO_PASSTHROUGH);
     assert_eq!(format_of(&ff, 13), Some(VertexFormat::UChar4), "indices");
     assert_eq!(format_of(&ff, 12), Some(VertexFormat::Float2), "weights");
     assert_eq!(
@@ -746,7 +754,7 @@ fn resolve_attrs_keeps_each_stream_separate() {
     assert_eq!(resolved.extents[1], 0);
 
     // The FF path maps streams the same way.
-    let resolved = resolve_attrs_for_ff(&elems);
+    let resolved = resolve_attrs_for_ff(&elems, &NO_PASSTHROUGH);
     assert_eq!(resolved.attrs.len(), 3);
     assert_eq!(resolved.attrs[1].buffer_index, 1);
     assert_eq!(resolved.used_streams, 0b11);
@@ -765,7 +773,7 @@ fn resolve_attrs_drops_streams_past_the_slot_table() {
             usage_index: 0,
         },
     ];
-    let resolved = resolve_attrs_for_ff(&elems);
+    let resolved = resolve_attrs_for_ff(&elems, &NO_PASSTHROUGH);
     assert_eq!(resolved.attrs.len(), 1);
     assert_eq!(resolved.used_streams, 0b1);
     let layout = ff_vs_layout_from_elements(&elems, true);
@@ -1257,4 +1265,122 @@ fn colorfill_a2b10g10r10_exchanges_only_red_and_blue() {
         d3dcolor_fill_pixel_bytes(0xdead_beef, D3DFMT_A2B10G10R10).unwrap(),
         ((3_u32 << 30) | (959 << 20) | (762 << 10) | 0x02b6).to_le_bytes()
     );
+}
+
+fn element(offset: u16, type_: u8, usage: u8, usage_index: u8) -> D3DVERTEXELEMENT9 {
+    D3DVERTEXELEMENT9 {
+        stream: 0,
+        offset,
+        type_,
+        method: 0,
+        usage,
+        usage_index,
+    }
+}
+
+/// A pre-transformed declaration carrying every semantic a `ps_3_0` can read beside the FF set.
+fn pretransformed_monster() -> [D3DVERTEXELEMENT9; 11] {
+    [
+        element(0, D3DDECLTYPE_FLOAT4, D3DDECLUSAGE_POSITIONT, 0),
+        element(16, D3DDECLTYPE_FLOAT4, D3DDECLUSAGE_BLENDWEIGHT, 0),
+        element(32, D3DDECLTYPE_FLOAT4, D3DDECLUSAGE_BLENDINDICES, 0),
+        element(48, D3DDECLTYPE_FLOAT4, D3DDECLUSAGE_NORMAL, 0),
+        element(64, D3DDECLTYPE_FLOAT4, D3DDECLUSAGE_FOG, 0),
+        element(80, D3DDECLTYPE_FLOAT4, D3DDECLUSAGE_TEXCOORD, 0),
+        element(96, D3DDECLTYPE_FLOAT4, D3DDECLUSAGE_TANGENT, 0),
+        element(112, D3DDECLTYPE_FLOAT4, D3DDECLUSAGE_BINORMAL, 0),
+        element(128, D3DDECLTYPE_FLOAT4, D3DDECLUSAGE_DEPTH, 0),
+        element(144, D3DDECLTYPE_D3DCOLOR, D3DDECLUSAGE_COLOR, 0),
+        element(148, D3DDECLTYPE_D3DCOLOR, D3DDECLUSAGE_COLOR, 1),
+    ]
+}
+
+fn passthrough_code(usage: u8, usage_index: u8) -> u8 {
+    decl_passthrough_code(usage, usage_index).expect("semantic passes through")
+}
+
+#[test]
+fn a_pretransformed_layout_passes_its_other_semantics_through_in_declaration_order() {
+    let elements = pretransformed_monster();
+    let layout = ff_vs_layout_from_elements(&elements, true);
+    let expected = [
+        passthrough_code(D3DDECLUSAGE_BLENDWEIGHT, 0),
+        passthrough_code(D3DDECLUSAGE_BLENDINDICES, 0),
+        passthrough_code(D3DDECLUSAGE_NORMAL, 0),
+        passthrough_code(D3DDECLUSAGE_FOG, 0),
+        passthrough_code(D3DDECLUSAGE_TANGENT, 0),
+        passthrough_code(D3DDECLUSAGE_BINORMAL, 0),
+        passthrough_code(D3DDECLUSAGE_DEPTH, 0),
+        0,
+    ];
+    assert_eq!(layout.passthrough, expected);
+
+    // Entry k reads attribute 15 + k; the rest keep the FF convention, and
+    // nothing lands on the FF normal or blend slots the pre-transformed
+    // stage never declares.
+    let resolved = resolve_attrs_for_ff(&elements, &layout.passthrough);
+    let attr_of = |offset: u32| {
+        resolved
+            .attrs
+            .iter()
+            .find(|a| a.offset == offset)
+            .map(|a| (a.attr_index, a.format))
+    };
+    assert_eq!(attr_of(0), Some((0, VertexFormat::Float4)), "POSITIONT");
+    for (k, offset) in [16, 32, 48, 64, 96, 112, 128].into_iter().enumerate() {
+        let attr = 15 + u32::try_from(k).expect("slot fits u32");
+        assert_eq!(
+            attr_of(offset),
+            Some((attr, VertexFormat::Float4)),
+            "entry {k}"
+        );
+    }
+    assert_eq!(attr_of(80), Some((4, VertexFormat::Float4)), "TEXCOORD0");
+    assert_eq!(
+        attr_of(144),
+        Some((2, VertexFormat::UChar4NormalizedBgra)),
+        "COLOR0"
+    );
+    assert_eq!(
+        attr_of(148),
+        Some((3, VertexFormat::UChar4NormalizedBgra)),
+        "COLOR1"
+    );
+    assert_eq!(resolved.attrs.len(), elements.len());
+}
+
+#[test]
+fn an_untransformed_layout_passes_nothing_through() {
+    let mut elements = pretransformed_monster();
+    elements[0].usage = D3DDECLUSAGE_POSITION;
+    let layout = ff_vs_layout_from_elements(&elements, true);
+    assert_eq!(layout.passthrough, NO_PASSTHROUGH);
+    let resolved = resolve_attrs_for_ff(&elements, &layout.passthrough);
+    assert!(resolved.attrs.iter().all(|a| a.attr_index < 15));
+}
+
+#[test]
+fn a_pretransformed_passthrough_skips_dropped_elements_repeats_and_overflow() {
+    let mut elements = vec![element(0, D3DDECLTYPE_FLOAT4, D3DDECLUSAGE_POSITIONT, 0)];
+    // An element on a stream past the table and one with no Metal format
+    // never reach the descriptor, so they never pass through either.
+    let mut far = element(16, D3DDECLTYPE_FLOAT4, D3DDECLUSAGE_NORMAL, 0);
+    far.stream = 16;
+    elements.push(far);
+    elements.push(element(16, D3DDECLTYPE_UNUSED, D3DDECLUSAGE_TANGENT, 0));
+    // Ten distinct semantics and one repeat: the first eight pass through.
+    for index in 0..10 {
+        elements.push(element(
+            32,
+            D3DDECLTYPE_FLOAT4,
+            D3DDECLUSAGE_COLOR,
+            2 + index,
+        ));
+    }
+    elements.push(element(32, D3DDECLTYPE_FLOAT4, D3DDECLUSAGE_COLOR, 2));
+    let layout = ff_vs_layout_from_elements(&elements, true);
+    let expected: Vec<u8> = (0..8)
+        .map(|index| passthrough_code(D3DDECLUSAGE_COLOR, 2 + index))
+        .collect();
+    assert_eq!(layout.passthrough[..], expected[..]);
 }

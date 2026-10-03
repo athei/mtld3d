@@ -39,7 +39,10 @@ use mtld3d_types::{
 };
 use xxhash_rust::xxh3::Xxh3;
 
-use crate::dxso::{DeclUsage, ff_attr_index_for_semantic};
+use crate::dxso::{
+    DeclUsage, FF_PASSTHROUGH_ATTR_BASE, MAX_LINKED_INPUTS, decl_passthrough_code,
+    ff_attr_index_for_semantic,
+};
 
 /// `(usage, usage_index) → input register index` pulled from a parsed VS's `dcl_*` declarations.
 ///
@@ -1145,6 +1148,11 @@ pub struct FfVsLayout {
     /// BLENDWEIGHT element is declared. Drives whether the FF VS emit needs
     /// the blending input attribute (slot 12).
     pub declared_weights_count: u8,
+    /// The elements a pre-transformed layout passes to a `ps_3_0` by semantic.
+    ///
+    /// `FfVsKey::passthrough`, built by [`rhw_passthrough`]; empty unless the
+    /// layout has a POSITIONT element.
+    pub passthrough: [u8; MAX_LINKED_INPUTS],
 }
 
 bitflags::bitflags! {
@@ -1272,12 +1280,56 @@ pub fn ff_vs_layout_from_elements(elements: &[D3DVERTEXELEMENT9], uses_decl: boo
         }
     }
     let tex_coord_count = checked_tex_coord_count(max_texcoord_index);
+    let passthrough = if flags.contains(FfVsLayoutFlags::HAS_RHW) {
+        rhw_passthrough(elements)
+    } else {
+        [0; MAX_LINKED_INPUTS]
+    };
     FfVsLayout {
         flags,
         tex_coord_count,
         tex_coord_dims,
         declared_weights_count,
+        passthrough,
     }
+}
+
+/// The elements a pre-transformed declaration passes to the pixel stage by semantic.
+///
+/// The `FfVsKey::passthrough` list (`dxso::decl_passthrough_code` gives
+/// its shape): each element whose semantic passes through, in declaration
+/// order, once per semantic. An element `resolve_attrs` drops (a stream past
+/// the slot table, a type with no Metal format) is left out too, so the FF
+/// VS never declares an attribute the descriptor lacks. Past
+/// [`MAX_LINKED_INPUTS`] entries, which is what the varying budget leaves
+/// beside the fixed-function members, the rest read zero, warned once.
+#[must_use]
+pub fn rhw_passthrough(elements: &[D3DVERTEXELEMENT9]) -> [u8; MAX_LINKED_INPUTS] {
+    let mut passthrough = [0; MAX_LINKED_INPUTS];
+    let mut len = 0;
+    for e in elements {
+        if u32::from(e.stream) >= MAX_STREAMS
+            || decl_type_to_metal_format(e.type_).0 == VertexFormat::Invalid
+        {
+            continue;
+        }
+        let Some(code) = decl_passthrough_code(e.usage, e.usage_index) else {
+            continue;
+        };
+        if passthrough[..len].contains(&code) {
+            continue;
+        }
+        if len == MAX_LINKED_INPUTS {
+            mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+                "FF vertex decl: pre-transformed layout passes more than {MAX_LINKED_INPUTS} \
+                 semantics to the pixel stage → the rest read zero"
+            );
+            break;
+        }
+        passthrough[len] = code;
+        len += 1;
+    }
+    passthrough
 }
 
 /// Whether a declaration contains an in-range pre-transformed position.
@@ -1308,16 +1360,30 @@ pub fn vertex_decl_has_rhw(elements: &[D3DVERTEXELEMENT9]) -> bool {
 /// Same as [`resolve_attrs_for_vs`] but uses the FF VS's attribute convention.
 ///
 /// See `crate::dxso::ff_attr_index_for_semantic`. The FF VS has no `dcl_*`
-/// declarations — its input layout is fixed.
+/// declarations — its input layout is fixed, but for the elements a
+/// pre-transformed layout passes through: `passthrough` is
+/// `FfVsLayout::passthrough`, and its entry `k` reads attribute
+/// `FF_PASSTHROUGH_ATTR_BASE + k` instead of a fixed-function one.
 ///
 /// A `D3DCOLOR` `BLENDINDICES` element is fetched as four unnormalized bytes
 /// in memory order, the order `D3DCOLORtoUBYTE4` gives a programmable shader,
 /// so each lane reaches the FF VS as its byte value rather than a normalized
 /// and swizzled colour channel.
 #[must_use]
-pub fn resolve_attrs_for_ff(elements: &[D3DVERTEXELEMENT9]) -> ResolvedAttrs {
+pub fn resolve_attrs_for_ff(
+    elements: &[D3DVERTEXELEMENT9],
+    passthrough: &[u8; MAX_LINKED_INPUTS],
+) -> ResolvedAttrs {
     let blend_indices = ff_attr_index_for_semantic(D3DDECLUSAGE_BLENDINDICES, 0).map(u32::from);
     let mut resolved = resolve_attrs(elements, "FF", |e| {
+        if passthrough[0] != 0
+            && let Some(code) = decl_passthrough_code(e.usage, e.usage_index)
+            && let Some((attr, _)) = (FF_PASSTHROUGH_ATTR_BASE..)
+                .zip(passthrough)
+                .find(|(_, entry)| **entry == code)
+        {
+            return Some(attr);
+        }
         let reg = ff_attr_index_for_semantic(e.usage, e.usage_index);
         if reg.is_none() {
             mtld3d_shared::log_once_warn_by!(

@@ -876,6 +876,7 @@ fn vs_key(shape: &VsShape) -> FfVsKey {
         vertex_blend_count: 0,
         declared_weights_count: 0,
         clip_plane_count: 0,
+        passthrough: [0; 8],
     };
     for dims in &mut key.tex_coord_dims[..usize::from(sets)] {
         *dims = 2;

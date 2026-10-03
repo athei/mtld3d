@@ -1,7 +1,15 @@
 //! Unit tests for semantic linkage between SM3 vertex and pixel shaders.
 
+use mtld3d_types::{
+    D3DDECLUSAGE_BLENDWEIGHT, D3DDECLUSAGE_COLOR, D3DDECLUSAGE_DEPTH, D3DDECLUSAGE_FOG,
+    D3DDECLUSAGE_NORMAL, D3DDECLUSAGE_POSITION, D3DDECLUSAGE_POSITIONT, D3DDECLUSAGE_PSIZE,
+    D3DDECLUSAGE_SAMPLE, D3DDECLUSAGE_TANGENT, D3DDECLUSAGE_TEXCOORD,
+};
+
 use super::{
-    LinkInputs, MAX_LINKED_INPUTS, PsInputs, Semantic, SemanticSet, VsOutputs, write_extra_members,
+    LinkInputs, MAX_LINKED_INPUTS, PsInputs, Semantic, SemanticSet, VsOutputs,
+    decl_passthrough_code, passthrough_extras, write_extra_members, write_passthrough_inputs,
+    write_passthrough_outputs,
 };
 use crate::dxso::{
     ir::{DeclUsage, DstMods, DstOperand, RegKind, Register, WriteMask},
@@ -306,4 +314,126 @@ fn a_pixel_shader_below_sm3_keeps_its_structural_colour_inputs() {
     let plan = PsInputs::build(&ps, 0);
     assert_eq!(plan.reads()[&1], "in.color1");
     assert!(LinkInputs::ps_inputs(&ps).is_empty());
+}
+
+/// The passthrough list of `codes`, zero-filled past the end.
+fn passthrough_of(codes: &[u8]) -> [u8; MAX_LINKED_INPUTS] {
+    let mut list = [0; MAX_LINKED_INPUTS];
+    list[..codes.len()].copy_from_slice(codes);
+    list
+}
+
+fn code(usage: u32, index: u32) -> u8 {
+    let usage = u8::try_from(usage).expect("usage fits u8");
+    let index = u8::try_from(index).expect("index fits u8");
+    decl_passthrough_code(usage, index).expect("semantic passes through")
+}
+
+#[test]
+fn a_pretransformed_layout_passes_through_what_the_ff_stage_does_not_write() {
+    // The fixed-function stage writes these itself.
+    for (usage, index) in [
+        (D3DDECLUSAGE_POSITION, 0),
+        (D3DDECLUSAGE_POSITIONT, 0),
+        (D3DDECLUSAGE_PSIZE, 0),
+        (D3DDECLUSAGE_TEXCOORD, 0),
+        (D3DDECLUSAGE_TEXCOORD, 7),
+        (D3DDECLUSAGE_COLOR, 0),
+        (D3DDECLUSAGE_COLOR, 1),
+    ] {
+        assert_eq!(
+            decl_passthrough_code(usage, index),
+            None,
+            "usage {usage} index {index}"
+        );
+    }
+    // Everything else a `ps_3_0` can declare reaches it by semantic.
+    for (usage, index) in [
+        (D3DDECLUSAGE_POSITION, 1),
+        (D3DDECLUSAGE_FOG, 0),
+        (D3DDECLUSAGE_NORMAL, 0),
+        (D3DDECLUSAGE_BLENDWEIGHT, 0),
+        (D3DDECLUSAGE_TANGENT, 3),
+        (D3DDECLUSAGE_COLOR, 2),
+        (D3DDECLUSAGE_DEPTH, 0),
+        (D3DDECLUSAGE_SAMPLE, 15),
+        (D3DDECLUSAGE_POSITIONT, 1),
+    ] {
+        assert!(
+            decl_passthrough_code(usage, index).is_some(),
+            "usage {usage} index {index}"
+        );
+    }
+    // A usage outside D3DDECLUSAGE never does.
+    assert_eq!(decl_passthrough_code(D3DDECLUSAGE_SAMPLE + 1, 0), None);
+}
+
+#[test]
+fn a_pretransformed_vertex_stage_writes_each_entry_into_its_member() {
+    let list = passthrough_of(&[
+        code(NORMAL, 0),
+        code(FOG, 0),
+        code(TANGENT, 0),
+        code(POSITION, 1),
+    ]);
+    let mut inputs = String::new();
+    write_passthrough_inputs(&mut inputs, list, 15);
+    for (k, attr) in [(0, 15), (1, 16), (2, 17), (3, 18)] {
+        assert!(
+            inputs.contains(&format!("float4 p{k} [[attribute({attr})]];")),
+            "{inputs}"
+        );
+    }
+    assert!(!inputs.contains("p4"), "{inputs}");
+
+    let mut outputs = String::new();
+    write_passthrough_outputs(&mut outputs, list, true);
+    for line in [
+        "out.normal0 = in.p0;",
+        "out.fog = in.p1;",
+        "out.tangent0 = in.p2;",
+        "out.position1 = in.p3;",
+    ] {
+        assert!(outputs.contains(line), "{line} missing from\n{outputs}");
+    }
+    // Under the specular-alpha fog factor the fog member stays the factor.
+    let mut factor = String::new();
+    write_passthrough_outputs(&mut factor, list, false);
+    assert!(!factor.contains("out.fog"), "{factor}");
+    assert!(factor.contains("out.normal0 = in.p0;"), "{factor}");
+
+    // Only the extras get members of their own; fog and the secondary
+    // position ride the members every `Varyings` declares.
+    let members: Vec<_> = passthrough_extras(list)
+        .iter()
+        .map(|s| s.member())
+        .collect();
+    assert_eq!(members, ["normal0", "tangent0"]);
+    let outputs = SemanticSet::passthrough_outputs(&list);
+    assert!(outputs.contains(Semantic::new(DeclUsage::Normal, 0)));
+    assert!(outputs.contains(Semantic::new(DeclUsage::Tangent, 0)));
+    assert!(!outputs.contains(Semantic::new(DeclUsage::Fog, 0)));
+}
+
+#[test]
+fn a_pixel_shader_links_the_extras_a_pretransformed_layout_passes_through() {
+    let ps = program(
+        PS3_HEADER,
+        &[
+            dcl(TANGENT, 0, INPUT, 0, 0xF),
+            dcl(NORMAL, 0, INPUT, 1, 0xF),
+            dcl(COLOR, 2, INPUT, 2, 0xF),
+        ],
+    );
+    let inputs = LinkInputs::ps_inputs(&ps);
+    let list = passthrough_of(&[code(NORMAL, 0), code(FOG, 0), code(TANGENT, 0)]);
+    let mask = inputs.mask_against(&SemanticSet::passthrough_outputs(&list));
+    // TANGENT0 and NORMAL0 link; COLOR2 is not in the declaration.
+    assert_eq!(mask, 0b011);
+    let plan = PsInputs::build(&ps, mask);
+    assert_eq!(plan.reads()[&0], "in.tangent0");
+    assert_eq!(plan.reads()[&1], "in.normal0");
+    assert_eq!(plan.reads()[&2], "float4(0.0)");
+    let untransformed = SemanticSet::passthrough_outputs(&[0; MAX_LINKED_INPUTS]);
+    assert_eq!(inputs.mask_against(&untransformed), 0);
 }
