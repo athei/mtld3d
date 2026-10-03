@@ -143,7 +143,12 @@ pub fn supports_sampler_mirror_clamp(device: &ProtocolObject<dyn MTLDevice>) -> 
 /// implementing less than one, so a feature it is known to reject is gated on
 /// its name instead.
 fn is_paravirtual(device: &ProtocolObject<dyn MTLDevice>) -> bool {
-    device.name().to_string().contains("Paravirtual")
+    is_paravirtual_name(&device.name().to_string())
+}
+
+/// True when a Metal device name is the paravirtualized device's.
+fn is_paravirtual_name(name: &str) -> bool {
+    name.contains("Paravirtual")
 }
 
 /// True when a copy out of a resolve target has to wait for the resolve's command buffer.
@@ -155,6 +160,21 @@ fn is_paravirtual(device: &ProtocolObject<dyn MTLDevice>) -> bool {
 /// complete first on it. Metal offers no query for the fault, so the
 /// device's name is the whole predicate.
 fn resolve_needs_retire(device: &ProtocolObject<dyn MTLDevice>) -> bool {
+    is_paravirtual(device)
+}
+
+/// True when a refused texture or view create on the device is worth asking for again.
+///
+/// Every real GPU refuses a valid descriptor only when it is out of memory,
+/// and asking again at once gets the same answer. The paravirtualized device
+/// refuses one now and then while several threads create and release
+/// textures, with its kernel logging the new object's id as one that already
+/// exists; requests on other threads succeed within the same second, so the
+/// refusal is not a lasting state of the device. Metal offers no query for
+/// the fault, so the device's name is the whole predicate. The name also
+/// matches the Apple-silicon virtual device of a VM, which has not shown the
+/// fault and gains only the retry's bounded wait on a create it refuses.
+pub fn refuses_creates_transiently(device: &ProtocolObject<dyn MTLDevice>) -> bool {
     is_paravirtual(device)
 }
 

@@ -291,7 +291,7 @@ fn create_output(
     };
     desc.setStorageMode(MTLStorageMode::Private);
     desc.setUsage(usage);
-    let Some(texture) = device.newTextureWithDescriptor(&desc) else {
+    let Some(texture) = super::texture::new_texture(device, &desc, "mtld3d-upscale-output") else {
         mtld3d_shared::log_once_warn!(target: LOG_TARGET,
             "upscale: Private output allocation failed for {}x{} {:?} usage {:?}; present shader stretches instead",
             dst.width(), dst.height(), dst.pixelFormat(), usage);
@@ -382,6 +382,11 @@ fn encode_with(
     let Some(slot) = scaler_in(&mut cache, device, key) else {
         return false;
     };
+    // `prepare` may create the output texture under `scalers`, here and in
+    // `can_scale`; a retried refusal (paravirtual only) holds the lock for up
+    // to 255 ms, stalling the presenter's other `scalers` takers,
+    // `retire_evicted` on the submit thread and device teardown that long at
+    // most. The create takes no other lock, so nothing deadlocks.
     let Some(output) = slot.prepare(device, src, dst) else {
         return false;
     };
@@ -505,6 +510,8 @@ pub fn can_scale(
     if !supported(device) {
         return false;
     }
+    // `prepare` may create the output under `scalers`; see `encode_with` for how
+    // long a retried refusal can hold it.
     let Ok(mut cache) = cache.scalers.lock() else {
         mtld3d_shared::log_once_warn!(target: LOG_TARGET,
             "upscale: scaler cache lock poisoned during preflight; present shader stretches instead");
@@ -792,6 +799,16 @@ pub fn scratch_target(
         format,
     };
     let handle = {
+        // The create runs under `scratch`, so on the device whose refusals are
+        // retried (`texture::retry_refused_create`, paravirtual only) a refused
+        // one holds it for up to 255 ms. The lock's takers are the presenter
+        // thread (`present_frame` through the upscaled present routes, and
+        // `retire_evicted`), the submit thread (`encode_frame`'s
+        // `retire_evicted`), the application's API thread (a read-back's
+        // `encode_readback_resolve`, under `GetRenderTargetData`, `LockRect` or
+        // `GetDC`) and device teardown (`retire`); each stalls that long at
+        // most. Nothing else is locked inside the create, so the hold cannot
+        // deadlock.
         let mut scratch = cache.scratch.lock().ok()?;
         scratch_in(&mut scratch, key, || {
             super::texture::create_upscale_target(device, width, height, format)

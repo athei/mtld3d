@@ -9,7 +9,7 @@
 use mtld3d_shared::mtl::PresentDebugFlags;
 use objc2_metal::MTLDevice;
 
-use super::{DeviceCaps, create_command_queue, default_device_info};
+use super::{DeviceCaps, create_command_queue, default_device_info, is_paravirtual_name};
 use crate::metal::handle::{IntoRetained, ReleaseRetain};
 
 /// Retires the presenter and drops the retains of one `DeviceCaps`, as the destroy thunk does.
@@ -79,4 +79,18 @@ fn create_command_queue_hands_out_the_pinned_device() {
     assert_eq!(device.registryID(), registry_id);
     drop(device);
     release(&third);
+}
+
+#[test]
+fn only_the_paravirtual_device_name_takes_the_paravirtual_answers() {
+    assert!(is_paravirtual_name("Apple Paravirtual device"));
+    for real in [
+        "Apple M1",
+        "Apple M4 Max",
+        "AMD Radeon Pro 5500M",
+        "Intel(R) UHD Graphics 630",
+        "Intel(R) Iris(TM) Plus Graphics",
+    ] {
+        assert!(!is_paravirtual_name(real), "{real} is a real GPU");
+    }
 }

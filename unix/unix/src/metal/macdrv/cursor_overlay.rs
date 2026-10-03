@@ -113,7 +113,7 @@ use super::{
     attachment::{self, Attachment},
     run_on_main_thread_async,
 };
-use crate::metal::{command, device::cpu_written_texture_storage, present};
+use crate::metal::{command, device::cpu_written_texture_storage, present, texture};
 
 /// Log sub-target of the software cursor.
 ///
@@ -1125,7 +1125,10 @@ impl Overlay {
         unsafe { descriptor.setHeight(sprite.height as usize) };
         descriptor.setUsage(MTLTextureUsage::RenderTarget);
         descriptor.setStorageMode(cpu_written_texture_storage(&device));
-        let Some(output) = device.newTextureWithDescriptor(&descriptor) else {
+        // On the main thread: a refused create there waits for up to a quarter
+        // of a second, on the paravirtual device alone
+        // (`texture::retry_refused_create`).
+        let Some(output) = texture::new_texture(&device, &descriptor, "mtld3d-cursor-image") else {
             mtld3d_shared::log_once_warn!(target: LOG_TARGET, "cursor: offscreen output allocation failed");
             return None;
         };
@@ -1518,7 +1521,9 @@ fn upload_sprite_texture(
     unsafe { desc.setHeight(sprite.height as usize) };
     desc.setUsage(MTLTextureUsage::ShaderRead);
     desc.setStorageMode(cpu_written_texture_storage(device));
-    let Some(texture) = device.newTextureWithDescriptor(&desc) else {
+    // On the main thread: a refused create there waits for up to a quarter of
+    // a second, on the paravirtual device alone (`texture::retry_refused_create`).
+    let Some(texture) = texture::new_texture(device, &desc, "mtld3d-cursor-sprite") else {
         mtld3d_shared::log_once_warn!(target: LOG_TARGET, "cursor: sprite texture allocation failed");
         return None;
     };

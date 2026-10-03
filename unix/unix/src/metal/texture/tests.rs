@@ -1,3 +1,5 @@
+use std::{cell::Cell, time::Duration};
+
 use mtld3d_shared::{
     MetalHandle,
     mtl::PixelFormat,
@@ -14,7 +16,8 @@ use objc2_metal::{
 };
 
 use super::{
-    TRANSPARENT_BLACK, clear_new_color_textures, is_resolvable_color_format, mtl_pixel_format,
+    REFUSED_CREATE_BACKOFF, TRANSPARENT_BLACK, clear_new_color_textures,
+    is_resolvable_color_format, mtl_pixel_format, retry_refused_create, retry_with_backoff,
     wire_pixel_format,
 };
 
@@ -488,4 +491,101 @@ fn identity_roles_do_not_create_sampling_views() {
     for handle in views.owned_handles() {
         super::destroy_texture(handle.raw());
     }
+}
+
+#[test]
+fn a_final_refusal_is_not_retried() {
+    let calls = Cell::new(0_u32);
+    let mut waits = Vec::new();
+    let outcome = retry_with_backoff(
+        false,
+        &REFUSED_CREATE_BACKOFF,
+        || {
+            calls.set(calls.get() + 1);
+            Some(())
+        },
+        |delay| waits.push(delay),
+    );
+    assert!(outcome.value.is_none());
+    assert_eq!(outcome.attempts, 0);
+    assert_eq!(outcome.waited, Duration::ZERO);
+    assert_eq!(
+        calls.get(),
+        0,
+        "a device whose refusals are final is not asked again"
+    );
+    assert!(waits.is_empty(), "nor waited on");
+}
+
+#[test]
+fn a_transient_refusal_is_retried_until_the_create_succeeds() {
+    let calls = Cell::new(0_u32);
+    let mut waits = Vec::new();
+    let outcome = retry_with_backoff(
+        true,
+        &REFUSED_CREATE_BACKOFF,
+        || {
+            calls.set(calls.get() + 1);
+            (calls.get() == 3).then_some(7_u32)
+        },
+        |delay| waits.push(delay),
+    );
+    assert_eq!(outcome.value, Some(7));
+    assert_eq!(outcome.attempts, 3);
+    assert_eq!(calls.get(), 3, "no attempt after the one that succeeded");
+    assert_eq!(
+        waits,
+        REFUSED_CREATE_BACKOFF[..3],
+        "each attempt follows its own wait"
+    );
+    assert_eq!(outcome.waited, Duration::from_millis(1 + 2 + 4));
+}
+
+#[test]
+fn a_refusal_that_outlasts_the_schedule_fails_after_every_wait() {
+    let calls = Cell::new(0_u32);
+    let mut waits = Vec::new();
+    let outcome = retry_with_backoff(
+        true,
+        &REFUSED_CREATE_BACKOFF,
+        || {
+            calls.set(calls.get() + 1);
+            None::<()>
+        },
+        |delay| waits.push(delay),
+    );
+    assert!(outcome.value.is_none());
+    assert_eq!(outcome.attempts, 8);
+    assert_eq!(calls.get(), 8);
+    assert_eq!(waits, REFUSED_CREATE_BACKOFF);
+    assert_eq!(
+        outcome.waited,
+        Duration::from_millis(255),
+        "a quarter of a second at most"
+    );
+}
+
+#[test]
+fn the_refused_create_backoff_doubles_from_a_millisecond() {
+    assert_eq!(REFUSED_CREATE_BACKOFF[0], Duration::from_millis(1));
+    for pair in REFUSED_CREATE_BACKOFF.windows(2) {
+        assert_eq!(pair[1], pair[0] * 2);
+    }
+}
+
+#[test]
+fn a_real_gpu_fails_a_refused_create_without_asking_again() {
+    let device = MTLCreateSystemDefaultDevice().expect("a Metal device for the retry gate");
+    if crate::metal::device::refuses_creates_transiently(&device) {
+        // A VM's device takes the retries; the device tests pin the gate by
+        // name, so this one has nothing to show there.
+        return;
+    }
+    let calls = Cell::new(0_u32);
+    let created = retry_refused_create(&device, "mtld3d-test", "texture", || {
+        calls.set(calls.get() + 1);
+        Some(())
+    });
+    assert!(created.is_none(), "the refusal stands on a real GPU");
+    assert_eq!(calls.get(), 0, "and the create is not asked for again");
 }

@@ -153,7 +153,7 @@ fn make_black_texture(
     desc.setUsage(MTLTextureUsage::ShaderRead);
     desc.setStorageMode(cpu_written_texture_storage(device));
 
-    let Some(texture) = device.newTextureWithDescriptor(&desc) else {
+    let Some(texture) = super::texture::new_texture(device, &desc, "mtld3d-null-black") else {
         mtld3d_shared::log_once_warn!(
             target: LOG_TARGET,
             "null texture: the 1x1 black {texture_type:?} texture could not be created; \

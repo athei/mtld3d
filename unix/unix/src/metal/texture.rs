@@ -1,3 +1,8 @@
+use std::{
+    sync::atomic::{AtomicU64, Ordering},
+    time::Duration,
+};
+
 use mtld3d_core::depth_stencil_state::{DepthStencilDescription, StencilFaceDescription};
 use mtld3d_shared::{
     MetalHandle, TextureCreateDesc,
@@ -33,6 +38,22 @@ use crate::metal::{
 /// what they do.
 static LIVE_TEXTURES: std::sync::LazyLock<std::sync::Mutex<rustc_hash::FxHashSet<u64>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(rustc_hash::FxHashSet::default()));
+
+/// The waits before each new attempt at a create the device refused.
+///
+/// Doubling from a millisecond, a quarter of a second in all. Only a device
+/// whose refusals are transient retries (see [`retry_refused_create`]); a
+/// refusal that outlasts the schedule fails the create as it would have.
+const REFUSED_CREATE_BACKOFF: [Duration; 8] = [
+    Duration::from_millis(1),
+    Duration::from_millis(2),
+    Duration::from_millis(4),
+    Duration::from_millis(8),
+    Duration::from_millis(16),
+    Duration::from_millis(32),
+    Duration::from_millis(64),
+    Duration::from_millis(128),
+];
 
 /// Hand a texture's retain to a raw handle, recording it as live.
 ///
@@ -158,17 +179,21 @@ fn srgb_twin_view_native(
     label: &str,
 ) -> Option<Retained<ProtocolObject<dyn MTLTexture>>> {
     let srgb_format = format.srgb_twin()?;
-    // SAFETY: objc2 typed binding; `texture` is live and the ranges match
-    // the descriptor it was created with.
-    let view = unsafe {
-        texture.newTextureViewWithPixelFormat_textureType_levels_slices_swizzle(
-            mtl_pixel_format(srgb_format),
-            texture.textureType(),
-            objc2_foundation::NSRange::new(0, levels),
-            objc2_foundation::NSRange::new(0, slices),
-            swizzle,
-        )
+    let create = || {
+        // SAFETY: objc2 typed binding; `texture` is live and the ranges match
+        // the descriptor it was created with.
+        unsafe {
+            texture.newTextureViewWithPixelFormat_textureType_levels_slices_swizzle(
+                mtl_pixel_format(srgb_format),
+                texture.textureType(),
+                objc2_foundation::NSRange::new(0, levels),
+                objc2_foundation::NSRange::new(0, slices),
+                swizzle,
+            )
+        }
     };
+    let view =
+        create().or_else(|| retry_refused_create(&texture.device(), label, "sRGB view", &create));
     let Some(view) = view else {
         if log::log_enabled!(target: "mtld3d::unix::command", log::Level::Debug) {
             let device = texture.device();
@@ -418,7 +443,7 @@ pub fn create_depth_texture(
     // Depth textures must be in private storage on Apple Silicon
     desc.setStorageMode(objc2_metal::MTLStorageMode::Private);
 
-    let texture = device.newTextureWithDescriptor(&desc)?;
+    let texture = new_texture(&device, &desc, "mtld3d-depth")?;
     let label = objc2_foundation::NSString::from_str("mtld3d-depth");
     texture.setLabel(Some(&label));
     // SAFETY: `Retained::into_raw` transfers the retain; `MetalHandle::new`
@@ -518,7 +543,7 @@ fn create_color_texture(
     desc.setUsage(texture_usage(device, true, true));
     desc.setStorageMode(MTLStorageMode::Private);
 
-    let Some(texture) = device.newTextureWithDescriptor(&desc) else {
+    let Some(texture) = new_texture(device, &desc, label) else {
         log_texture_refused(device, &desc, pixel_format, label);
         return None;
     };
@@ -556,6 +581,135 @@ fn log_texture_refused(
         device.hasUnifiedMemory(),
         device.registryID(),
     );
+}
+
+/// Create a texture from `desc`, asking again when the device's refusal can lift.
+///
+/// A create that succeeds the first time costs what the bare call does; only
+/// a nil reaches [`retry_refused_create`]. Every `newTextureWithDescriptor:`
+/// in this crate goes through here.
+pub fn new_texture(
+    device: &ProtocolObject<dyn MTLDevice>,
+    desc: &MTLTextureDescriptor,
+    label: &str,
+) -> Option<Retained<ProtocolObject<dyn MTLTexture>>> {
+    let create = || device.newTextureWithDescriptor(desc);
+    create().or_else(|| retry_refused_create(device, label, "texture", create))
+}
+
+/// Ask again for a texture or view `device` refused, when its refusals are transient.
+///
+/// Returns `None` at once on a device whose refusals are final, which is
+/// every real GPU (`device::refuses_creates_transiently`). On the
+/// paravirtualized one it waits out [`REFUSED_CREATE_BACKOFF`] between
+/// attempts and returns the first object created, or `None` once the schedule
+/// is spent, so the caller's failure path runs as it would have.
+///
+/// The wait blocks the thread that asked: the API thread inside a `Reset` or
+/// a `Create*` call, the encoder or submit thread for a texture, view or
+/// scratch target it creates, or the main thread for a cursor sprite. That is
+/// a quarter of a second at most, on a device that only a CI runner exposes,
+/// against a create that otherwise fails and takes the resource or the device
+/// with it. A caller that holds a lock across the create holds it that long
+/// too, and says so where it does.
+///
+/// Every outcome logs. The first retry in the process warns once; each
+/// recovered create logs its retry number, which is also how many times the
+/// device refused it, the time it waited and how many creates the process has
+/// recovered so far; a create still refused after the last attempt warns,
+/// with its refusal count, before the caller reports the failure.
+#[cold]
+pub fn retry_refused_create<T>(
+    device: &ProtocolObject<dyn MTLDevice>,
+    label: &str,
+    what: &str,
+    create: impl FnMut() -> Option<T>,
+) -> Option<T> {
+    /// Creates this process got on a retry after a refusal.
+    ///
+    /// A static because the resource is process-wide: the one `MTLDevice`
+    /// and its driver, whose refusals land on whichever device asked.
+    static RECOVERED: AtomicU64 = AtomicU64::new(0);
+
+    let transient = super::device::refuses_creates_transiently(device);
+    if transient {
+        mtld3d_shared::log_once_warn!(
+            target: crate::LOG_TARGET,
+            "{label}: '{}' refused a {what}; asking again for up to {} ms, since this \
+             device's refusals have been transient",
+            device.name(),
+            REFUSED_CREATE_BACKOFF.iter().sum::<Duration>().as_millis(),
+        );
+    }
+    let outcome = retry_with_backoff(
+        transient,
+        &REFUSED_CREATE_BACKOFF,
+        create,
+        std::thread::sleep,
+    );
+    if outcome.attempts == 0 {
+        return None;
+    }
+    if outcome.value.is_some() {
+        let recovered = RECOVERED.fetch_add(1, Ordering::Relaxed) + 1;
+        log::info!(
+            target: crate::LOG_TARGET,
+            "{label}: {what} created on retry {} ({} refused before it) after {} ms; \
+             {recovered} refused creates recovered in this process",
+            outcome.attempts,
+            outcome.attempts,
+            outcome.waited.as_millis(),
+        );
+    } else {
+        log::warn!(
+            target: crate::LOG_TARGET,
+            "{label}: {what} still refused after {} retries ({} refused in all) over {} ms",
+            outcome.attempts,
+            outcome.attempts + 1,
+            outcome.waited.as_millis(),
+        );
+    }
+    outcome.value
+}
+
+/// What [`retry_with_backoff`] got, and what it cost.
+struct RetryOutcome<T> {
+    /// The first object created, or `None` when every attempt was refused.
+    value: Option<T>,
+    /// The attempts made, 0 when the refusal was final and nothing was retried.
+    attempts: u32,
+    /// The total time waited before those attempts.
+    waited: Duration,
+}
+
+/// Call `create` again after each wait in `backoff`, until it returns an object.
+///
+/// `transient` false makes no attempt and no wait. `wait` is the sleep, which
+/// the tests replace.
+fn retry_with_backoff<T>(
+    transient: bool,
+    backoff: &[Duration],
+    mut create: impl FnMut() -> Option<T>,
+    mut wait: impl FnMut(Duration),
+) -> RetryOutcome<T> {
+    let mut outcome = RetryOutcome {
+        value: None,
+        attempts: 0,
+        waited: Duration::ZERO,
+    };
+    if !transient {
+        return outcome;
+    }
+    for &delay in backoff {
+        wait(delay);
+        outcome.waited += delay;
+        outcome.attempts += 1;
+        outcome.value = create();
+        if outcome.value.is_some() {
+            break;
+        }
+    }
+    outcome
 }
 
 /// Creates the multisampled companion of a single-sample render target.
@@ -609,7 +763,7 @@ pub fn create_msaa_companion(
     desc.setUsage(texture_usage(&device, true, true));
     desc.setStorageMode(MTLStorageMode::Private);
 
-    let Some(texture) = device.newTextureWithDescriptor(&desc) else {
+    let Some(texture) = new_texture(&device, &desc, label) else {
         log_texture_refused(&device, &desc, pixel_format, label);
         return None;
     };
@@ -834,7 +988,7 @@ pub fn create_texture(
         tex_desc.setStorageMode(mtl_storage_mode(desc.storage_mode));
     }
 
-    let texture = device.newTextureWithDescriptor(&tex_desc)?;
+    let texture = new_texture(device, &tex_desc, "mtld3d-tex")?;
 
     // Label the handle the PE side will see — surfaces the mtld3d TextureId
     // alongside the MTLTexture in Xcode frame captures, which is the
@@ -956,17 +1110,21 @@ fn required_sample_view(
     } else {
         1
     };
-    // SAFETY: the retained source supplies its own level and slice extents;
-    // the compatible format and channel mapping are its creation descriptor's.
-    let view = unsafe {
-        texture.newTextureViewWithPixelFormat_textureType_levels_slices_swizzle(
-            mtl_pixel_format(format),
-            texture.textureType(),
-            objc2_foundation::NSRange::new(0, texture.mipmapLevelCount()),
-            objc2_foundation::NSRange::new(0, slices),
-            swizzle,
-        )
+    let create = || {
+        // SAFETY: the retained source supplies its own level and slice extents;
+        // the compatible format and channel mapping are its creation descriptor's.
+        unsafe {
+            texture.newTextureViewWithPixelFormat_textureType_levels_slices_swizzle(
+                mtl_pixel_format(format),
+                texture.textureType(),
+                objc2_foundation::NSRange::new(0, texture.mipmapLevelCount()),
+                objc2_foundation::NSRange::new(0, slices),
+                swizzle,
+            )
+        }
     };
+    let view = create()
+        .or_else(|| retry_refused_create(&texture.device(), label, "sampling view", &create));
     let Some(view) = view else {
         mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
             "{label}: Metal declined the required {format:?} sampling view; texture creation failed");
@@ -1030,20 +1188,23 @@ pub fn create_texture_slice_view(
 ) -> Option<MetalHandle<MTLTextureKind>> {
     let texture = texture_handle.into_retained()?;
     let levels = texture.mipmapLevelCount();
-    // SAFETY: objc2 typed binding; `texture` is retained for the call, the
-    // format is the base texture's own, and the level range covers exactly the
-    // levels it declares.
-    let view = unsafe {
-        texture.newTextureViewWithPixelFormat_textureType_levels_slices(
-            texture.pixelFormat(),
-            MTLTextureType::Type2D,
-            objc2_foundation::NSRange::new(0, levels),
-            objc2_foundation::NSRange::new(slice as usize, 1),
-        )
-    }?;
-    let label = objc2_foundation::NSString::from_str(&format!(
-        "mtld3d-sliceview-{texture_handle:#x}-{slice}"
-    ));
+    let create = || {
+        // SAFETY: objc2 typed binding; `texture` is retained for the call, the
+        // format is the base texture's own, and the level range covers exactly the
+        // levels it declares.
+        unsafe {
+            texture.newTextureViewWithPixelFormat_textureType_levels_slices(
+                texture.pixelFormat(),
+                MTLTextureType::Type2D,
+                objc2_foundation::NSRange::new(0, levels),
+                objc2_foundation::NSRange::new(slice as usize, 1),
+            )
+        }
+    };
+    let label = format!("mtld3d-sliceview-{texture_handle:#x}-{slice}");
+    let view = create()
+        .or_else(|| retry_refused_create(&texture.device(), &label, "slice view", &create))?;
+    let label = objc2_foundation::NSString::from_str(&label);
     view.setLabel(Some(&label));
     // SAFETY: `Retained::into_raw` hands over the view's only retain, which
     // the typed handle carries to the PE side.

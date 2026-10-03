@@ -3708,16 +3708,26 @@ fn encode_readback_resolve(
     let source = if level == 0 && slice == 0 {
         src
     } else {
-        // SAFETY: objc2 typed binding; `src` is retained for the call, the
-        // format is its own, and the ranges name one level and one slice it
-        // holds (the caller's `level` / `slice` were validated on the PE side
-        // against the resource they came from).
-        let Some(level_view) = (unsafe {
-            src.newTextureViewWithPixelFormat_textureType_levels_slices(
-                mtl_format,
-                MTLTextureType::Type2D,
-                NSRange::new(level as usize, 1),
-                NSRange::new(slice as usize, 1),
+        let create = || {
+            // SAFETY: objc2 typed binding; `src` is retained for the call, the
+            // format is its own, and the ranges name one level and one slice it
+            // holds (the caller's `level` / `slice` were validated on the PE side
+            // against the resource they came from).
+            unsafe {
+                src.newTextureViewWithPixelFormat_textureType_levels_slices(
+                    mtl_format,
+                    MTLTextureType::Type2D,
+                    NSRange::new(level as usize, 1),
+                    NSRange::new(slice as usize, 1),
+                )
+            }
+        };
+        let Some(level_view) = create().or_else(|| {
+            super::texture::retry_refused_create(
+                &src.device(),
+                "mtld3d-readback-resolve",
+                "level view",
+                create,
             )
         }) else {
             mtld3d_shared::log_once_warn!(
