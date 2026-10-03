@@ -2796,7 +2796,8 @@ fn systemmem_lock_rect(
     // pBits at the RAW, unclamped origin `top*pitch + left*bpp` — the XP
     // accept-invalid behaviour. An out-of-bounds or negative rect yields a
     // pointer outside the allocation that the caller is not expected to
-    // dereference; we compute it by integer arithmetic (no UB pointer `add`). A
+    // dereference; we compute it by wrapping integer arithmetic (no UB pointer
+    // `add`, and no overflow on a 32-bit pointer for a far-off rect). A
     // NULL rect locks the whole surface (origin 0,0). (DEFAULT offscreen-plain
     // surfaces are texture-backed and validate strictly in `texture_lock_rect`.)
     // SAFETY: `rect` is the *const D3DRECT delivered by LockRect; null → None.
@@ -2815,11 +2816,16 @@ fn systemmem_lock_rect(
         let bb = fmt.block_bytes();
         let pitch = full_w.div_ceil(bw).saturating_mul(bb);
         // Origin steps in whole blocks: block row `top / bh`, block column `left / bw`.
-        let offset = top.div_euclid(to_i(bh)) * to_i(pitch) + left.div_euclid(to_i(bw)) * to_i(bb);
+        let offset = top
+            .div_euclid(to_i(bh))
+            .wrapping_mul(to_i(pitch))
+            .wrapping_add(left.div_euclid(to_i(bw)).wrapping_mul(to_i(bb)));
         (pitch, offset)
     } else {
         let pitch = mtld3d_core::format::linear_row_pitch(full_w, bpp);
-        let offset = top * to_i(pitch) + left * to_i(bpp);
+        let offset = top
+            .wrapping_mul(to_i(pitch))
+            .wrapping_add(left.wrapping_mul(to_i(bpp)));
         (pitch, offset)
     };
     let Some(page) = inner.system_memory.as_mut() else {
@@ -2896,7 +2902,9 @@ fn lockable_rt_lock_rect(
     let (left, top) = unsafe { ValueIn::<D3DRECT>::read_opt(rect) }
         .map_or((0, 0), |r| (r.x1 as isize, r.y1 as isize));
     let to_i = |v: u32| isize::try_from(v).unwrap_or(isize::MAX);
-    let offset = top * to_i(pitch) + left * to_i(bpp);
+    let offset = top
+        .wrapping_mul(to_i(pitch))
+        .wrapping_add(left.wrapping_mul(to_i(bpp)));
     let Some(page) = inner.system_memory.as_mut() else {
         let _ = inner.try_end_lock();
         return D3DERR_INVALIDCALL;

@@ -61,7 +61,7 @@ pub fn create_backbuffer(
     // A degenerate backbuffer size, e.g. resolved from the off-screen monitor
     // geometry the conformance suite probes, fails CreateBackbuffer
     // gracefully instead of aborting the process.
-    if !extent_is_creatable("create_backbuffer", width, height) {
+    if !extent_is_creatable("create_backbuffer", width, height, 1) {
         return None;
     }
     let Some(device) = device_handle.into_retained() else {
@@ -391,7 +391,7 @@ pub fn create_depth_texture(
 ) -> Option<MetalHandle<MTLTextureKind>> {
     // The implicit depth surface follows the back buffer's size, so a `Reset`
     // retried at a size the back buffer was refused at asks for it too.
-    if !extent_is_creatable("create_depth_texture", width, height) {
+    if !extent_is_creatable("create_depth_texture", width, height, 1) {
         return None;
     }
     let device = device_handle.into_retained()?;
@@ -500,8 +500,11 @@ fn create_color_texture(
     width: u32,
     height: u32,
     pixel_format: PixelFormat,
-    label: &str,
+    label: &'static str,
 ) -> Option<Retained<ProtocolObject<dyn MTLTexture>>> {
+    if !extent_is_creatable(label, width, height, 1) {
+        return None;
+    }
     // SAFETY: objc2 typed binding; class-method constructor on
     // `MTLTextureDescriptor` returns a freshly autoreleased descriptor.
     let desc = unsafe {
@@ -579,9 +582,9 @@ pub fn create_msaa_companion(
     height: u32,
     pixel_format: PixelFormat,
     sample_count: u32,
-    label: &str,
+    label: &'static str,
 ) -> Option<(MetalHandle<MTLTextureKind>, u64)> {
-    if sample_count <= 1 {
+    if sample_count <= 1 || !extent_is_creatable(label, width, height, 1) {
         return None;
     }
     let Some(device) = device_handle.into_retained() else {
@@ -727,8 +730,10 @@ pub fn create_textures(
         } else {
             *slot = TextureViews::EMPTY;
             any_failed = true;
-            log::error!(
+            // Logged once per texture: the encoder asks again on a later use.
+            mtld3d_shared::log_once_warn_by!(
                 target: crate::LOG_TARGET,
+                key: desc.tex_id,
                 "failed to create texture tex_id={:#x}",
                 desc.tex_id
             );
@@ -760,6 +765,14 @@ pub fn create_texture(
     device: &ProtocolObject<dyn MTLDevice>,
     desc: &TextureCreateDesc,
 ) -> Option<TextureViews> {
+    let depth = if desc.flags.contains(TextureCreateFlags::TYPE_3D) {
+        desc.depth
+    } else {
+        1
+    };
+    if !extent_is_creatable("create_texture", desc.width, desc.height, depth) {
+        return None;
+    }
     let mtl_format = mtl_pixel_format(desc.pixel_format);
     let is_depth = is_depth_pixel_format(desc.pixel_format);
 
@@ -1225,23 +1238,34 @@ const fn mtl_storage_mode(wire: StorageMode) -> MTLStorageMode {
     }
 }
 
-/// Whether Metal can create a 2D texture of `width` x `height`, logging the refusal at `site`.
+/// Whether Metal can create a texture of this extent, logging the refusal at `site`.
 ///
 /// Metal raises an `NSException`, which aborts the process, for a zero or
 /// over-large texture dimension, so a creator rejects such a request
-/// before it reaches `newTextureWithDescriptor`. `MAX_TEXTURE_DIM` is the
-/// Metal 2D limit on the supported GPUs.
-fn extent_is_creatable(site: &str, width: u32, height: u32) -> bool {
-    use mtld3d_core::caps::MAX_TEXTURE_DIM;
-    if width == 0 || height == 0 || width > MAX_TEXTURE_DIM || height > MAX_TEXTURE_DIM {
-        log::error!(
+/// before it reaches `newTextureWithDescriptor`. `depth` is 1 for every
+/// texture but a 3D one, which Metal holds to a smaller limit on each axis.
+fn extent_is_creatable(site: &'static str, width: u32, height: u32, depth: u32) -> bool {
+    use mtld3d_core::caps::{texture_extent_fits, volume_extent_fits};
+    let fits = if depth == 1 {
+        texture_extent_fits(width, height)
+    } else {
+        volume_extent_fits(width, height, depth)
+    };
+    if !fits {
+        // The encoder asks again for a texture whose creation failed, so the
+        // refusal is logged once per site and extent. The key only merges log
+        // lines: the site is a `'static` string, whose address is stable.
+        let key = (site.as_ptr() as u64).rotate_left(40)
+            ^ u64::from(depth).rotate_left(24)
+            ^ (u64::from(height) << 32)
+            ^ u64::from(width);
+        mtld3d_shared::log_once_warn_by!(
             target: crate::LOG_TARGET,
-            "{site}: {width}x{height} is outside the 1..={MAX_TEXTURE_DIM} Metal accepts per \
-             dimension; refused",
+            key: key,
+            "{site}: {width}x{height}x{depth} is past the extent the device reports; refused",
         );
-        return false;
     }
-    true
+    fits
 }
 
 #[cfg(test)]

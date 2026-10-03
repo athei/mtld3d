@@ -18,8 +18,8 @@ use mtld3d_types::{
 };
 
 use super::{
-    FF_TEXTURE_STAGES, apply_advertise_all, fill_default, texture_op_unimplemented,
-    unimplemented_texture_op,
+    FF_TEXTURE_STAGES, MAX_TEXTURE_DIM, apply_advertise_all, fill_default, texture_extent_fits,
+    texture_op_unimplemented, unimplemented_texture_op, volume_extent_fits,
 };
 use crate::dxso::{FfPsKey, FfStage, FfStageFlags, VariantKey, emit_ps_ff};
 
@@ -738,6 +738,44 @@ fn advertise_all_is_superset_of_default() {
             default_bits & advertised_bits,
             default_bits,
             "{name}: advertised mask dropped a default bit"
+        );
+    }
+}
+
+#[test]
+fn texture_extent_fits_the_reported_limit_on_both_axes() {
+    assert!(texture_extent_fits(1, 1));
+    assert!(texture_extent_fits(MAX_TEXTURE_DIM, MAX_TEXTURE_DIM));
+    for (width, height) in [
+        (0, 1),
+        (1, 0),
+        (MAX_TEXTURE_DIM + 1, 1),
+        (1, MAX_TEXTURE_DIM + 1),
+        (u32::MAX, u32::MAX),
+    ] {
+        assert!(!texture_extent_fits(width, height), "{width}x{height}");
+    }
+}
+
+#[test]
+fn volume_extent_fits_the_3d_limit_unless_one_slice_deep() {
+    let limit = mtld3d_types::MAX_VOLUME_EXTENT;
+    assert!(volume_extent_fits(limit, limit, limit));
+    assert!(
+        volume_extent_fits(MAX_TEXTURE_DIM, 4, 1),
+        "one slice takes the 2D limit"
+    );
+    assert!(!volume_extent_fits(MAX_TEXTURE_DIM + 1, 4, 1));
+    for extent in [
+        [limit + 1, 4, 4],
+        [4, limit + 1, 4],
+        [4, 4, limit + 1],
+        [0, 4, 4],
+        [4, 4, 0],
+    ] {
+        assert!(
+            !volume_extent_fits(extent[0], extent[1], extent[2]),
+            "{extent:?}"
         );
     }
 }

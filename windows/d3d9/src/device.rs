@@ -98,7 +98,7 @@ use mtld3d_types::{
 };
 
 use super::{
-    D3D_OK, D3DERR_INVALIDCALL, E_FAIL, E_NOTIMPL, LOG_TARGET,
+    D3D_OK, D3DERR_INVALIDCALL, D3DERR_NOTAVAILABLE, E_FAIL, E_NOTIMPL, LOG_TARGET,
     bound_buffers::BoundBuffers,
     bound_rt::{BoundRt, RENDER_TARGET_SLOTS},
     com_ref::{Bound, CachedComPtr},
@@ -3880,7 +3880,12 @@ extern "system" fn device_add_ref(this: *mut c_void) -> u32 {
 
 extern "system" fn device_release(this: *mut c_void) -> u32 {
     let _api = device_api_lock(this);
-    let _timer = device_timer(this, DeviceSubCategory::Misc);
+    // A stray Release of a device an earlier final Release tore down is the
+    // no-op the refcount guard below makes it, and is not timed: the timer
+    // reads the device's counters, which went with it.
+    // SAFETY: vtable thunk; `this` is *mut Direct3DDevice9 per IDirect3DDevice9 ABI.
+    let live = unsafe { InPtr::<Direct3DDevice9>::opt(this) }.is_some_and(|obj| obj.refcount != 0);
+    let _timer = live.then(|| device_timer(this, DeviceSubCategory::Misc));
     // SAFETY: D3D9 Release — same contract as AddRef above; null `this` is UB
     // per spec.
     // SAFETY: IDirect3DDevice9 IUnknown thunk; D3D9 ABI guarantees `this` is *mut Direct3DDevice9.
@@ -4335,6 +4340,13 @@ extern "system" fn device_create_additional_swap_chain(
 ) -> i32 {
     let _api = device_api_lock(this);
     let _timer = device_timer(this, DeviceSubCategory::Misc);
+    // Nowhere to hand the chain to: refused before it is made, since a chain
+    // nobody holds would keep its device reference for good.
+    if swap_chain.is_null() {
+        mtld3d_shared::log_once_warn!(target: LOG_TARGET,
+            "reject CreateAdditionalSwapChain(ppSwapChain = NULL) → INVALIDCALL");
+        return D3DERR_INVALIDCALL;
+    }
     null_out(swap_chain);
     // SAFETY: vtable in/out-param; `present_params` is *mut D3DPRESENT_PARAMETERS
     // per the IDirect3DDevice9 ABI — read for the request, written back with the
@@ -5412,6 +5424,23 @@ fn create_texture_path(info: &TextureCreateArgs) -> i32 {
         return D3DERR_INVALIDCALL;
     }
 
+    // Past the extent the device reports, a texture Metal backs is refused:
+    // Metal itself aborts the process on a descriptor past its own limit. A
+    // system-memory or scratch texture has no Metal texture until it is bound
+    // for sampling, and creates at any extent.
+    if !mtld3d_core::pool::is_cpu_only(pool) && !caps::texture_extent_fits(width, height) {
+        let entry_point = if offscreen_plain {
+            "CreateOffscreenPlainSurface"
+        } else {
+            "CreateTexture"
+        };
+        mtld3d_shared::log_once_warn_by!(target: LOG_TARGET, key: u64::from(offscreen_plain),
+            "reject {entry_point}({width}x{height}, pool={pool}) → NOTAVAILABLE (past the {} \
+             texel extent the device reports)", caps::MAX_TEXTURE_DIM);
+        null_out(texture);
+        return D3DERR_NOTAVAILABLE;
+    }
+
     // Offscreen plain surfaces must be lockable. A GPU-only depth texture
     // cannot provide the staging that this internal surface path requires.
     if is_depth_fmt && offscreen_plain {
@@ -6028,6 +6057,15 @@ extern "system" fn device_create_volume_texture(
         null_out(texture);
         return D3DERR_INVALIDCALL;
     }
+    // A volume more than one slice deep is a 3D Metal texture, held to
+    // `MaxVolumeExtent` on every axis; Metal aborts the process past its limit.
+    if !mtld3d_core::pool::is_cpu_only(pool) && !caps::volume_extent_fits(width, height, depth) {
+        mtld3d_shared::log_once_warn!(target: LOG_TARGET,
+            "reject CreateVolumeTexture({width}x{height}x{depth}, pool={pool}) → NOTAVAILABLE \
+             (past the extent the device reports)");
+        null_out(texture);
+        return D3DERR_NOTAVAILABLE;
+    }
     // A per-level 3D mip chain. Each level's box is the block-aware 2D slice
     // size (`compute_mip_size`, correct for DXT/ATI as well as plain formats)
     // times the level's depth; `LockBox` hands the game a pointer into the
@@ -6209,6 +6247,16 @@ extern "system" fn device_create_cube_texture(
     if usage & D3DUSAGE_AUTOGENMIPMAP != 0 && !matches!(pool, D3DPOOL_DEFAULT | D3DPOOL_MANAGED) {
         null_out(texture);
         return D3DERR_INVALIDCALL;
+    }
+    // Same extent rule as `CreateTexture`: a face past the reported extent is
+    // refused in the pools Metal backs, before six faces of staging are made.
+    if !mtld3d_core::pool::is_cpu_only(pool) && !caps::texture_extent_fits(edge_length, edge_length)
+    {
+        mtld3d_shared::log_once_warn!(target: LOG_TARGET,
+            "reject CreateCubeTexture(edge={edge_length}, pool={pool}) → NOTAVAILABLE (past the \
+             {} texel extent the device reports)", caps::MAX_TEXTURE_DIM);
+        null_out(texture);
+        return D3DERR_NOTAVAILABLE;
     }
     // Zero stays zero: it marks a compressed layout, and a face upload counts
     // block rows and block offsets only while the marker survives creation.

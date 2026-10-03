@@ -1051,16 +1051,31 @@ fn emit_draw_view(
             continue;
         }
         let handle = stage_texture_handles[stage_u32 as usize];
+        let bit = 1u16 << stage_u32;
         if handle == 0 {
+            // A texture whose Metal texture could not be made. The fragment
+            // function still declares the slot, typed by the bound texture,
+            // and Metal requires every declared slot to be bound, so it reads
+            // the shared black texture of that type.
             mtld3d_shared::log_once_warn_by!(target: crate::LOG_TARGET,
                 key: b.texture_id.raw(),
-                "draw: stage {stage_u32} bound to {:?} but its texture handle is 0 — bind \
-                 skipped, an unbound declared sampler reads opaque black",
+                "draw: stage {stage_u32} bound to {:?} but its texture handle is 0; sampled \
+                 as opaque black",
                 b.texture_id
             );
+            let slot = u16::try_from(stage_u32).expect("sampler stage is below STAGE_COUNT");
+            let kind = null_texture_kind(bound_sampler_type(variant, slot));
+            if enc
+                .last_bound()
+                .fragment_texture_changed(stage_u32, null_texture_tex_sentinel(kind as u64))
+            {
+                enc.emit_command(Command::set_fragment_null_texture(kind, stage_u32));
+            }
+            enc.last_bound()
+                .fragment_sampler_changed(stage_u32, NULL_TEXTURE_SAMPLER_SENTINEL);
+            bound_mask |= bit;
             continue;
         }
-        let bit = 1u16 << stage_u32;
         bound_mask |= bit;
         let is_compare = (depth_mask & bit) != 0 && (fetch_mask & bit) == 0;
         let is_fetch = (fetch_mask & bit) != 0;

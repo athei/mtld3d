@@ -264,6 +264,12 @@ is in [`CONFORMANCE.md`](../unix/conformance/CONFORMANCE.md#kept-divergences).
   depth stencil on the implicit surface, as a successful one does, where
   the reference implementations leave both unbound; what D3D9 itself
   leaves there is not observable. No knob.
+- A texture whose Metal allocation is refused at an extent within the
+  reported limits still creates: its Metal texture is made on the encoder
+  thread after `CreateTexture`, `CreateCubeTexture` or `CreateVolumeTexture`
+  has returned `D3D_OK`, so the refusal is logged and the texture samples as
+  opaque black, where D3D9 answers the create with an out-of-memory error.
+  No knob.
 - `D3DRS_MULTISAMPLEANTIALIAS = FALSE` is ignored. No knob.
 - The adapter mode list leaves out every display size win32u cannot scale
   the monitor to in its 16-bit ratio, on every Wine, and a fullscreen request

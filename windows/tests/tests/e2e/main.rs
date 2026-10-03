@@ -34,6 +34,7 @@ mod draw;
 mod dxt_volume;
 mod dynamic_depth;
 mod expand16;
+mod failure_exits;
 mod float_filter;
 mod format_query;
 mod implicit_surface;
