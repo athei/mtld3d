@@ -35,7 +35,11 @@ pub struct NullTextures {
     texture_2d: u64,
     texture_cube: u64,
     texture_3d: u64,
-    depth_2d: u64,
+    /// `None` when the depth fallback could not be made or cleared.
+    ///
+    /// Only that fallback is lost: a `Depth2D` request then takes the 2D
+    /// colour texture, the binding a depth slot got before it existed.
+    depth_2d: Option<u64>,
     sampler: u64,
 }
 
@@ -47,7 +51,10 @@ impl NullTextures {
             NullTextureKind::Texture2D => self.texture_2d,
             NullTextureKind::TextureCube => self.texture_cube,
             NullTextureKind::Texture3D => self.texture_3d,
-            NullTextureKind::Depth2D => self.depth_2d,
+            NullTextureKind::Depth2D => match self.depth_2d {
+                Some(depth) => depth,
+                None => self.texture_2d,
+            },
         }
     }
 
@@ -101,7 +108,9 @@ fn create(device: &ProtocolObject<dyn MTLDevice>) -> Option<NullTextures> {
     let texture_2d = make_black_texture(device, MTLTextureType::Type2D, 1)?;
     let texture_cube = make_black_texture(device, MTLTextureType::TypeCube, 6)?;
     let texture_3d = make_black_texture(device, MTLTextureType::Type3D, 1)?;
-    let depth_2d = make_zero_depth_texture(device)?;
+    // The depth fallback is optional: a device that cannot make or clear it
+    // keeps the colour fallbacks and the default sampler.
+    let depth_2d = make_zero_depth_texture(device);
 
     let sampler_desc = MTLSamplerDescriptor::new();
     let Some(sampler) = device.newSamplerStateWithDescriptor(&sampler_desc) else {
@@ -116,7 +125,7 @@ fn create(device: &ProtocolObject<dyn MTLDevice>) -> Option<NullTextures> {
         texture_2d: Retained::into_raw(texture_2d) as u64,
         texture_cube: Retained::into_raw(texture_cube) as u64,
         texture_3d: Retained::into_raw(texture_3d) as u64,
-        depth_2d: Retained::into_raw(depth_2d) as u64,
+        depth_2d: depth_2d.map(|depth| Retained::into_raw(depth) as u64),
         sampler: Retained::into_raw(sampler) as u64,
     })
 }
@@ -199,8 +208,8 @@ fn make_zero_depth_texture(
     let Some(texture) = device.newTextureWithDescriptor(&desc) else {
         mtld3d_shared::log_once_warn!(
             target: LOG_TARGET,
-            "null texture: the 1x1 depth texture could not be created; unbound declared \
-             samplers stay unbound"
+            "null texture: the 1x1 depth texture could not be created; a depth slot whose \
+             texture is missing binds the 2D black texture instead"
         );
         return None;
     };
@@ -233,8 +242,8 @@ fn make_zero_depth_texture(
     if cleared.is_none() {
         mtld3d_shared::log_once_warn!(
             target: LOG_TARGET,
-            "null texture: the 1x1 depth texture could not be cleared; unbound declared \
-             samplers stay unbound"
+            "null texture: the 1x1 depth texture could not be cleared; a depth slot whose \
+             texture is missing binds the 2D black texture instead"
         );
         return None;
     }
