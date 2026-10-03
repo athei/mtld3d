@@ -56,9 +56,8 @@ impl ReplayPacket {
     /// Execute one command while its borrowed record and genuine runtime owners remain live.
     ///
     /// # Safety
-    /// The consumer must not release the frame's lease, or clear, replace or release the
-    /// storage it decodes snapshots into, while any snapshot, encoder state or submitted
-    /// command can still reference them.
+    /// The consumer must not release the frame's lease while a decoded snapshot token,
+    /// encoder state or submitted command can still reference it.
     /// Retained tokens may escape the callback only while that same frame lease remains live.
     ///
     /// # Errors

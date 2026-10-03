@@ -319,7 +319,7 @@ impl FrameRecorder {
                     size,
                 },
             ),
-            op @ (Op::RegisterProgram(_) | Op::SetSnapshot(_)) => {
+            op @ Op::RegisterProgram(_) => {
                 self.rejected_ops.push(op);
                 self.finish_record(Err(WireError::InvalidValue))
             }

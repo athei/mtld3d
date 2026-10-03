@@ -27,15 +27,15 @@ fn store<T>(scratch: &mut ScratchArena, value: T) -> std::ptr::NonNull<T> {
     std::ptr::NonNull::new(ptr).expect("arena allocation is non-null")
 }
 
-fn decode_snapshot(
-    decoder: &mut DrawReader,
+fn decode_snapshot<'d>(
+    decoder: &'d mut DrawReader,
     reader: &mut WireReader<'_>,
-    scratch: &mut ScratchArena,
-) -> Result<crate::draw_data::CurrentSnapshotPtr, WireError> {
+) -> Result<&'d CurrentSnapshot, WireError> {
     let length = u32::try_from(reader.remaining_len()).map_err(|_| WireError::TooLarge)?;
     let payload = reader.bytes(length)?;
     // SAFETY: each fixture retains its typed canonical records and referenced byte ranges.
-    unsafe { decoder.decode_snapshot(payload, scratch) }
+    unsafe { decoder.decode_snapshot(payload)? };
+    Ok(decoder.snapshot())
 }
 
 fn encode_snapshot<'a>(arena: &'a mut ScratchArena, delta: &SnapshotDelta<'_>) -> &'a [u8] {
@@ -147,48 +147,43 @@ fn partial_deltas_preserve_structural_referents_and_clear_only_changed_bytes() {
     let mut clearing_arena = ScratchArena::new();
     let clearing_bytes = encode_snapshot(&mut clearing_arena, &clearing);
     assert_eq!(clearing_bytes.len(), 24);
-    let mut scratch = ScratchArena::new();
-    // SAFETY: both command arenas, uniforms and native scratch outlive decoded tokens.
+    // SAFETY: both command arenas and uniforms outlive decoded tokens.
     let mut decoder = unsafe { DrawReader::new() };
     // SAFETY: fixture command storage and referenced uniform bytes stay immutable and live.
     let mut first_reader = unsafe { WireReader::new_trusted(initial_bytes) };
-    let first = decode_snapshot(&mut decoder, &mut first_reader, &mut scratch).unwrap();
+    let first = decode_snapshot(&mut decoder, &mut first_reader).unwrap();
+    let first_vs = vs_address(first.vs.unwrap().as_ref());
+    assert_eq!(first.ps_constants.unwrap().as_raw(), uniform.as_raw());
     // SAFETY: the clearing command remains live through all decoded token uses.
     let mut second_reader = unsafe { WireReader::new_trusted(clearing_bytes) };
-    let second = decode_snapshot(&mut decoder, &mut second_reader, &mut scratch).unwrap();
-    // SAFETY: scratch retains the two initialized snapshots for both borrows.
-    let first = unsafe { &*first.as_ptr() };
-    // SAFETY: scratch retains this initialized snapshot through all assertions.
-    let second = unsafe { &*second.as_ptr() };
+    let second = decode_snapshot(&mut decoder, &mut second_reader).unwrap();
     assert!(std::ptr::eq(
-        vs_address(first.vs.unwrap().as_ref()),
+        first_vs,
         vs_address(second.vs.unwrap().as_ref())
     ));
-    assert_eq!(first.ps_constants.unwrap().as_raw(), uniform.as_raw());
     assert!(second.ps_constants.is_none());
     assert_eq!(second.alpha_ref_bytes.unwrap().as_raw(), uniform.as_raw());
 }
 
 #[test]
 fn invalid_delta_mask_poisoning_prevents_partial_replay() {
-    let mut scratch = ScratchArena::new();
     // SAFETY: no record in this test contains a borrowed address.
     let mut decoder = unsafe { DrawReader::new() };
     // SAFETY: this invalid scalar-only fixture borrows no external data.
     let mut invalid = unsafe { WireReader::new_trusted(&[0, 0, 2, 0, 0, 0, 0, 0]) };
     assert!(matches!(
-        decode_snapshot(&mut decoder, &mut invalid, &mut scratch),
+        decode_snapshot(&mut decoder, &mut invalid),
         Err(WireError::InvalidValue)
     ));
     // SAFETY: empty bytes contain no referents.
     let mut empty = unsafe { WireReader::new_trusted(&[]) };
     assert!(matches!(
-        decode_snapshot(&mut decoder, &mut empty, &mut scratch),
+        decode_snapshot(&mut decoder, &mut empty),
         Err(WireError::InvalidValue)
     ));
     decoder.clear();
     assert!(matches!(
-        decode_snapshot(&mut decoder, &mut empty, &mut scratch),
+        decode_snapshot(&mut decoder, &mut empty),
         Err(WireError::Truncated)
     ));
 }
@@ -403,28 +398,17 @@ fn complete_snapshot_borrows_canonical_leaves_and_reconstructs_only_native_roots
     let payload = encode_snapshot(&mut first, &full);
     assert!(payload.len() <= super::SNAPSHOT_DELTA_MAX_BYTES);
     for length in 0..payload.len() {
-        let mut truncated_scratch = ScratchArena::new();
         // SAFETY: any complete ranges in this prefix name the live immutable bytes above.
         let mut truncated_decoder = unsafe { DrawReader::new() };
         // SAFETY: the encoded borrowed uniform range stays initialized through this decode.
         let mut truncated = unsafe { WireReader::new_trusted(&payload[..length]) };
-        assert!(
-            decode_snapshot(
-                &mut truncated_decoder,
-                &mut truncated,
-                &mut truncated_scratch
-            )
-            .is_err()
-        );
+        assert!(decode_snapshot(&mut truncated_decoder, &mut truncated).is_err());
     }
-    let mut native = ScratchArena::new();
     // SAFETY: the only wire addresses name bytes above, alive through all decoded-token uses.
     let mut record = unsafe { WireReader::new_trusted(payload) };
-    // SAFETY: native and bytes remain allocated and immutable throughout the returned token's life.
+    // SAFETY: the bytes remain allocated and immutable throughout the returned token's life.
     let mut decoder = unsafe { DrawReader::new() };
-    let restored = decode_snapshot(&mut decoder, &mut record, &mut native).unwrap();
-    // SAFETY: native retains the decoded snapshot through the second encoding.
-    let restored = unsafe { &*restored.as_ptr() };
+    let restored = decode_snapshot(&mut decoder, &mut record).unwrap();
     assert_ne!(
         vs_address(restored.vs.unwrap().as_ref()),
         vs_address(snapshot.vs.unwrap().as_ref())
@@ -462,14 +446,11 @@ fn complete_snapshot_borrows_canonical_leaves_and_reconstructs_only_native_roots
     assert_eq!(payload.as_ptr() as usize % 16, 8);
     assert_eq!(second_payload.as_ptr() as usize % 16, 0);
     assert_eq!(payload, second_payload);
-    let mut second_native = ScratchArena::new();
     // SAFETY: both source arenas retain all referenced bytes and records throughout the decode.
     let mut second_decoder = unsafe { DrawReader::new() };
     // SAFETY: the second arena retains the complete typed snapshot after an eight-byte command.
-    let second_snapshot =
-        unsafe { second_decoder.decode_snapshot(second_payload, &mut second_native) }.unwrap();
-    // SAFETY: second_native retains the initialized root through the following token reads.
-    let second_snapshot = unsafe { &*second_snapshot.as_ptr() };
+    unsafe { second_decoder.decode_snapshot(second_payload) }.unwrap();
+    let second_snapshot = second_decoder.snapshot();
     assert_eq!(
         second_snapshot
             .stage_bindings
@@ -623,7 +604,6 @@ fn packed_stage_and_attribute_arrays_decode_empty_and_publish_only_when_complete
     };
     let mut slab = ScratchArena::new();
     let payload = encode_snapshot(&mut slab, &delta);
-    let mut scratch = ScratchArena::new();
     // SAFETY: this fixture contains only scalar stage fields, no borrowed byte ranges.
     let mut decoder = unsafe { DrawReader::new() };
     assert!(
@@ -631,14 +611,19 @@ fn packed_stage_and_attribute_arrays_decode_empty_and_publish_only_when_complete
             &mut decoder,
             // SAFETY: this truncated command still borrows the retained fixture arena.
             &mut unsafe { WireReader::new_trusted(&payload[..payload.len() - 1]) },
-            &mut scratch,
         )
         .is_err()
     );
     assert!(decoder.current.stage_bindings.is_none());
     decoder.clear();
     // SAFETY: slab retains this initialized immutable canonical payload through every token use.
-    let first = unsafe { decoder.decode_snapshot(payload, &mut scratch) }.unwrap();
+    unsafe { decoder.decode_snapshot(payload) }.unwrap();
+    let first_stages = decoder.snapshot().stage_bindings.as_ref().unwrap();
+    assert_eq!(first_stages.iter().count(), 2);
+    for ((_, actual), expected) in first_stages.iter().zip(&stages) {
+        assert_eq!(actual.texture_id, expected.texture_id);
+        assert_eq!(actual.sampler_state, expected.sampler_state);
+    }
 
     let empty = SnapshotDelta {
         stages: Some((0, &[])),
@@ -654,17 +639,7 @@ fn packed_stage_and_attribute_arrays_decode_empty_and_publish_only_when_complete
     let empty_payload = encode_snapshot(&mut empty_slab, &empty);
     // SAFETY: empty_slab retains the initialized command through all decoded token uses.
     let mut empty_reader = unsafe { WireReader::new_trusted(empty_payload) };
-    let second = decode_snapshot(&mut decoder, &mut empty_reader, &mut scratch).unwrap();
-    // SAFETY: scratch remains live and unchanged; subsequent allocations cannot move its chunks.
-    let first = unsafe { &*first.as_ptr() };
-    // SAFETY: same arena lifetime covers the second snapshot and its empty arrays.
-    let second = unsafe { &*second.as_ptr() };
-    let first_stages = first.stage_bindings.as_ref().unwrap();
-    assert_eq!(first_stages.iter().count(), 2);
-    for ((_, actual), expected) in first_stages.iter().zip(&stages) {
-        assert_eq!(actual.texture_id, expected.texture_id);
-        assert_eq!(actual.sampler_state, expected.sampler_state);
-    }
+    let second = decode_snapshot(&mut decoder, &mut empty_reader).unwrap();
     assert_eq!(second.stage_bindings.as_ref().unwrap().iter().count(), 0);
     assert!(second.attrs.as_ref().unwrap().as_slice().is_empty());
 }
@@ -697,12 +672,11 @@ fn canonical_pixel_source_rejects_invalid_bool_before_borrowing() {
         let mut copied = AlignedPayload([0; 80]);
         copied.0.copy_from_slice(payload);
         copied.0[offset] = invalid;
-        let mut native = ScratchArena::new();
         // SAFETY: the aligned fixture remains initialized and immutable through decoding.
         let mut reader = unsafe { WireReader::new_trusted(&copied.0) };
-        // SAFETY: both fixture and native arena remain live through all decoded token uses.
+        // SAFETY: the fixture remains live through all decoded token uses.
         let mut decoder = unsafe { DrawReader::new() };
-        assert!(decode_snapshot(&mut decoder, &mut reader, &mut native).is_err());
+        assert!(decode_snapshot(&mut decoder, &mut reader).is_err());
     }
 }
 
@@ -820,13 +794,11 @@ fn programmable_sources_borrow_canonical_fields_without_reconstruction() {
         },
     );
     assert_eq!(payload.len(), 56);
-    let mut native = ScratchArena::new();
     // SAFETY: source arena and canonical payload remain immutable through all token uses.
     let mut decoder = unsafe { DrawReader::new() };
     // SAFETY: encode_snapshot constructed these typed records in the retained arena.
-    let snapshot = unsafe { decoder.decode_snapshot(payload, &mut native) }.unwrap();
-    // SAFETY: native retains the initialized immutable root through these assertions.
-    let snapshot = unsafe { &*snapshot.as_ptr() };
+    unsafe { decoder.decode_snapshot(payload) }.unwrap();
+    let snapshot = decoder.snapshot();
     let vs_token = snapshot.vs.unwrap();
     let ps_token = snapshot.ps.unwrap();
     let VsSourceView::Programmable(vs) = vs_token.as_ref() else {
