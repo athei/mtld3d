@@ -5,7 +5,11 @@
 //! call only safe methods and assert on the returned `HRESULT`s / pixels.
 
 use core::{cell::Cell, ffi::c_void};
-use std::sync::{Condvar, Mutex, PoisonError, RwLock};
+use std::{
+    fs::{File, OpenOptions, TryLockError},
+    path::PathBuf,
+    sync::{Condvar, Mutex, PoisonError, RwLock},
+};
 
 use mtld3d_types::{
     D3DADAPTER_IDENTIFIER9, D3DCAPS9, D3DCLEAR_TARGET, D3DCREATE_HARDWARE_VERTEXPROCESSING,
@@ -50,7 +54,7 @@ pub const UNWRITTEN: u32 = 0xDEAD_BEEF;
 /// The environment variable the layer reads its configuration overrides from.
 const CONFIG_VAR: &str = "MTLD3D_CONFIG";
 
-/// The display mode of the wineserver session, held by one harness at a time.
+/// The display mode, held by one harness of the machine at a time.
 ///
 /// A fullscreen device sets a mode the whole session sees, so two of them
 /// live at once would each read the other's, and a test that reads the
@@ -64,27 +68,106 @@ const CONFIG_VAR: &str = "MTLD3D_CONFIG";
 /// holding the mode per test at a time: a second one on the same thread
 /// would wait for the first forever.
 ///
-/// A flag under a mutex plus a condvar rather than a held `MutexGuard`,
-/// because the holder is a harness field and a guard there would put a
-/// significant drop into every test's `Harness`.
-static MODESET_HELD: Mutex<bool> = Mutex::new(false);
+/// The mode is not this process's alone, nor its wineserver's: every Wine
+/// process of the macOS session reads and sets the same one, including the
+/// test processes of another checkout's isolated run under a wineserver of
+/// their own. So the harness that holds it here also holds the exclusive lock
+/// of [`lock_machine_display_mode`], taken after this process's turn and given
+/// back with it, which makes the take one per machine rather than one per
+/// process while this process's other threads wait on the condvar as before.
+/// It is a static because the resource is machine-wide: the open lock file is
+/// the hold, and no single harness outlives the others to own it.
+///
+/// The open lock file under a mutex plus a condvar rather than a held
+/// `MutexGuard`, because the holder is a harness field and a guard there
+/// would put a significant drop into every test's `Harness`.
+static MODESET_HELD: Mutex<Option<File>> = Mutex::new(None);
 static MODESET_RELEASED: Condvar = Condvar::new();
 
-/// Take the session's display mode, waiting for the harness that holds it.
+/// The directory of the machine-wide display-mode lock, relative to the user's home.
+const MODESET_LOCK_DIR: &str = r"Library\Caches\mtld3d";
+/// The lock file's name in [`MODESET_LOCK_DIR`].
+const MODESET_LOCK_FILE: &str = "e2e-display-mode.lock";
+
+/// Take the session's display mode, waiting for the harness or process that holds it.
+///
+/// The machine-wide lock is taken under the mutex, so this process asks for
+/// it on one thread at a time and never holds it twice.
 fn take_display_mode() {
     let mut held = MODESET_HELD.lock().unwrap_or_else(PoisonError::into_inner);
-    while *held {
+    while held.is_some() {
         held = MODESET_RELEASED
             .wait(held)
             .unwrap_or_else(PoisonError::into_inner);
     }
-    *held = true;
+    *held = Some(lock_machine_display_mode());
 }
 
 /// Give the session's display mode back and wake one harness waiting for it.
+///
+/// Closing the lock file releases the machine-wide lock.
 fn release_display_mode() {
-    *MODESET_HELD.lock().unwrap_or_else(PoisonError::into_inner) = false;
+    let lock = MODESET_HELD
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .take();
+    drop(lock);
     MODESET_RELEASED.notify_one();
+}
+
+/// Lock the machine-wide display-mode file exclusively, waiting for the process that holds it.
+///
+/// The file sits in the user's cache directory, which every test process of
+/// the user reaches at the same path whatever its prefix, so test processes
+/// of all checkouts and both architectures meet on it. `LockFileEx` is the
+/// lock: Wine's server mirrors it as a POSIX record lock on the host file, so
+/// it excludes the processes of another wineserver too, and waits for them by
+/// retrying. It ends with the handle: when the harness gives the mode back,
+/// and when the process exits or is killed, since the wineserver closes a dead
+/// process's handles and the kernel drops a dead server's locks. A wait for
+/// another process names the file on stderr, where a kept log of a slow test
+/// shows it.
+///
+/// # Panics
+///
+/// Panics when Wine names no home directory or the file cannot be opened or
+/// locked, since a test that cannot take the mode cannot trust what it reads.
+fn lock_machine_display_mode() -> File {
+    let home = std::env::var("WINEHOMEDIR").expect("Wine names the home directory in WINEHOMEDIR");
+    // Wine gives the directory as an NT path, `\??\` and then a drive or its
+    // `unix` namespace, and its own shell32 opens files under it the same
+    // way, through the Win32 spelling of that prefix, `\\?\`.
+    let home = home
+        .strip_prefix(r"\??\")
+        .unwrap_or_else(|| panic!("WINEHOMEDIR is not an NT path: {home}"));
+    let dir = PathBuf::from(format!(r"\\?\{home}")).join(MODESET_LOCK_DIR);
+    std::fs::create_dir_all(&dir).unwrap_or_else(|e| {
+        panic!(
+            "create the display-mode lock's directory {}: {e}",
+            dir.display()
+        )
+    });
+    let path = dir.join(MODESET_LOCK_FILE);
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .unwrap_or_else(|e| panic!("open the display-mode lock {}: {e}", path.display()));
+    match file.try_lock() {
+        Ok(()) => {}
+        Err(TryLockError::WouldBlock) => {
+            eprintln!(
+                "[e2e] display mode held by another process; waiting on {}",
+                path.display()
+            );
+            file.lock()
+                .unwrap_or_else(|e| panic!("lock the display mode {}: {e}", path.display()));
+        }
+        Err(TryLockError::Error(e)) => panic!("lock the display mode {}: {e}", path.display()),
+    }
+    file
 }
 
 bitflags::bitflags! {

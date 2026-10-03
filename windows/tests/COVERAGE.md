@@ -26,11 +26,22 @@ interface it returns, and the harness appends the entries to `MTLD3D_CONFIG`
 for that one call under a lock and takes them out again, so no other
 harness, before or after, on any thread, sees them. That keeps the
 option-gated behaviour in the ordinary `make test` run rather than behind a
-command a reader has to be told about. And a fullscreen device holds the
-wineserver session's display mode, which every process in the session sees,
-so a harness that goes fullscreen (created that way or `Reset` into it)
-holds a lock in `harness.rs` until it is windowed again or dropped, and
-fullscreen tests run one at a time while windowed ones run beside them.
+command a reader has to be told about. And a fullscreen device sets the
+display mode, which every Wine process of the macOS session sees whatever
+its wineserver or prefix, another checkout's `ISOLATED=1` run included. So
+the display mode is taken in `harness.rs` by a harness created fullscreen,
+by a fullscreen `Reset` through `Harness::reset_params`, and by
+`Harness::hold_display_mode`, which a test calls before it first reads the
+mode, the screen size or a geometry derived from them without having gone
+fullscreen; the harness keeps it, through a windowed `Reset` too, until it
+is dropped. The take is a lock in the process and, inside it, an exclusive
+lock on `~/Library/Caches/mtld3d/e2e-display-mode.lock`, so tests that
+change or read the mode run one at a time across every test process on the
+machine while the others run beside them. A new test that changes or reads
+the display mode goes through one of those three, never through a device
+or a `ChangeDisplaySettings` call of its own. The file lock ends with its
+handle, so a test process that panics, crashes or is killed gives it up as
+it exits, and a test waiting for another process's turn says so on stderr.
 Thirteen options are gated this way today:
 `shader.asyncCompile` in `async_compile.rs` (the rest of the suite runs it
 off), `buffer.ignoreLockBounds` in `buffers.rs`, `depth.aliasSameSize` in
