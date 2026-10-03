@@ -4572,8 +4572,7 @@ extern "system" fn device_reset(this: *mut c_void, present_params: *mut c_void) 
         // so adopt the new auto-DS format before it runs.
         dev.depth_stencil_format = new_depth_format;
         if let Err(hr) = reset_recreate_resources(dev, &pp) {
-            dev.flags.insert(DeviceFlags::NOT_RESET);
-            return hr;
+            return fail_reset(dev, hr);
         }
     } else {
         // Skip flush + destroy + recreate + setDrawableSize entirely. The game
@@ -4587,8 +4586,7 @@ extern "system" fn device_reset(this: *mut c_void, present_params: *mut c_void) 
         // EnableAutoDepthStencil flag can flip without a resize (a no-op when
         // it is unchanged, so the fast path stays fast).
         if let Err(hr) = reconcile_implicit_depth(dev, new_depth_format) {
-            dev.flags.insert(DeviceFlags::NOT_RESET);
-            return hr;
+            return fail_reset(dev, hr);
         }
         // Deliver every op queued since the last Present before the reseed
         // below replaces `current_frame`. The queue holds work whose
@@ -4663,19 +4661,34 @@ extern "system" fn device_reset(this: *mut c_void, present_params: *mut c_void) 
 /// fail, so a rejected one still leaves every binding released and every
 /// state at its default: render target 0 on the back buffer, the depth
 /// stencil on the implicit surface, no recording and no open scene. The
-/// frame in flight is delivered and replaced first, as a same-size `Reset`
-/// does, so the attachments it records follow the defaults as well; without
-/// that, a draw after the rejection would be built for the back buffer while
-/// its pass still carried the targets the application had bound. The device
-/// then reports `D3DERR_DEVICENOTRESET` until a `Reset` succeeds.
+/// frame in flight is delivered first, as a same-size `Reset` does, and
+/// [`fail_reset`] replaces it, so the attachments it records follow the
+/// defaults as well; without that, a draw after the rejection would be built
+/// for the back buffer while its pass still carried the targets the
+/// application had bound.
 fn reject_reset(dev: &mut DeviceInner) -> i32 {
-    dev.flags.insert(DeviceFlags::NOT_RESET);
     if let Err(hr) = dev.flush_current_frame_blocking() {
+        dev.flags.insert(DeviceFlags::NOT_RESET);
         return hr;
     }
+    fail_reset(dev, D3DERR_INVALIDCALL)
+}
+
+/// End a failed `Reset` on a fresh frame with the state defaults, answering `hr`.
+///
+/// The frame in flight was already delivered by the caller. Past the point
+/// where `Reset` destroyed the implicit back buffer or depth texture, the
+/// frame that delivery left behind and the saved render-target and depth
+/// bindings still name the destroyed textures, so the frame is dropped
+/// unsent rather than delivered and the defaults clear the saved bindings.
+/// The fresh frame names whatever the failed recreate left, NULL where it
+/// made nothing. The device reports `D3DERR_DEVICENOTRESET` until a `Reset`
+/// succeeds.
+fn fail_reset(dev: &mut DeviceInner, hr: i32) -> i32 {
+    dev.flags.insert(DeviceFlags::NOT_RESET);
     dev.reseed_current_frame();
     dev.reset_to_defaults();
-    D3DERR_INVALIDCALL
+    hr
 }
 
 /// Resolve geometry after the window transition, undoing a rejected fullscreen exit.
@@ -4901,7 +4914,10 @@ fn reset_recreate_resources(
                 "Reset: depth_stencil_format {} has no Metal mapping — device unusable",
                 dev.depth_stencil_format
             );
+            // No implicit depth surface exists now, and the format says so,
+            // as `reconcile_implicit_depth` leaves it on the same failure.
             dev.set_depth_stencil_handle(MetalHandle::NULL);
+            dev.depth_stencil_format = 0;
             return Err(D3DERR_INVALIDCALL);
         };
         // Render space, matching the colour attachment exactly — Metal
@@ -4918,6 +4934,7 @@ fn reset_recreate_resources(
         if status != 0 || ds_params.texture_handle.is_null() {
             error!(target: LOG_TARGET, "Reset: CreateDepthTexture failed (0x{status:08X}) — device unusable");
             dev.set_depth_stencil_handle(MetalHandle::NULL);
+            dev.depth_stencil_format = 0;
             return Err(D3DERR_INVALIDCALL);
         }
         dev.set_depth_stencil_handle(ds_params.texture_handle);
