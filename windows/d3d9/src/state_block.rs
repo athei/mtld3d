@@ -229,11 +229,12 @@ impl RecordingStateBlock {
                     value,
                     fetch4,
                 } => {
-                    if *type_ == mtld3d_types::D3DSAMP_MIPMAPLODBIAS
+                    // Like the POINTSIZE components, a refresh keeps the op's
+                    // membership: only a recorded GET4/GET1 carries the latch.
+                    if let Some(latch) = fetch4
                         && (*sampler as usize) < STAGE_COUNT
                     {
-                        *fetch4 =
-                            Some(dev.stage_bindings().fetch4().enabled() & (1 << *sampler) != 0);
+                        *latch = dev.stage_bindings().fetch4().enabled() & (1 << *sampler) != 0;
                     }
                     *value = crate::device::vertex_sampler_slot(*sampler).map_or_else(
                         || {

@@ -438,6 +438,23 @@ Complete native AMD behavior for these mixed sequences has not been measured.
 The local sequence tests define this policy; Wine's AMD visual branch covers
 only enable, disable and VERTEX-state-block restoration.
 
+## Fetch4 state-block membership
+
+The Fetch4 latch that `D3DSAMP_MIPMAPLODBIAS` GET4 and GET1 commands set and
+clear is a hidden component of the sampler state, beside the raw DWORD that
+`GetSamplerState` returns. ALL and PIXEL state blocks capture and restore the
+latch of every pixel sampler with the raw value; VERTEX blocks restore
+neither. Recorded blocks follow the A2M rule: a recorded GET4 or GET1 carries
+the latch, which a Capture refreshes from the device, while a recorded numeric
+bias carries none, and a Capture cannot add it. Reset clears the latch.
+
+This is a compatibility policy. Wine has no Fetch4. DXVK captures only the raw
+DWORD and decodes it again on Apply, so a block captured while a numeric bias
+follows GET4 does not restore the latch there. mtld3d restores the latch the
+block saw, for the same reason as the A2M latch: the result does not depend on
+which bias write came last. Native AMD behavior for these sequences has not
+been measured; `samplers.rs` defines the policy.
+
 ## Dynamic depth texture coverage
 
 Wine's resource-access test creates a DEFAULT-pool, `D3DUSAGE_DYNAMIC` depth
