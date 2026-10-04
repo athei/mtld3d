@@ -421,7 +421,7 @@ pub struct PipelineKey {
     /// `SEPARATE_ALPHA_BLEND` stays clear: the alpha factors and operation
     /// below already carry its effect.
     flags: PipelineRsFlags,
-    /// `HAS_DEPTH`, `HAS_STENCIL` and `HAS_COLOR_OUTPUT`, plus `COLOR_HAS_ALPHA` under MRT blending.
+    /// `HAS_DEPTH`, `HAS_STENCIL`, `HAS_COLOR_OUTPUT`, and `COLOR_HAS_ALPHA` under MRT blending.
     ///
     /// Without an extra target blending, `COLOR_HAS_ALPHA` reaches Metal only
     /// through target 0's destination-alpha factors, which the key then holds

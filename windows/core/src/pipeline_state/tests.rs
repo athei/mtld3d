@@ -406,7 +406,12 @@ fn params_match_key_on_default_snapshot() {
             p.extra[0].src_blend_alpha,
             p.extra[0].dst_blend_alpha,
         ),
-        (k.src_blend, k.dst_blend, k.src_blend_alpha, k.dst_blend_alpha)
+        (
+            k.src_blend,
+            k.dst_blend,
+            k.src_blend_alpha,
+            k.dst_blend_alpha
+        )
     );
     assert_eq!(p.src_blend, k.src_blend, "an A8 target 0 clamps nothing");
 }
@@ -450,8 +455,18 @@ fn an_extra_target_keeps_factors_its_alpha_sees_apart() {
     for (b, c) in &pairs {
         let (pb, pc) = (params_of(b), params_of(c));
         assert_eq!(
-            (pb.src_blend, pb.dst_blend, pb.src_blend_alpha, pb.dst_blend_alpha),
-            (pc.src_blend, pc.dst_blend, pc.src_blend_alpha, pc.dst_blend_alpha),
+            (
+                pb.src_blend,
+                pb.dst_blend,
+                pb.src_blend_alpha,
+                pb.dst_blend_alpha
+            ),
+            (
+                pc.src_blend,
+                pc.dst_blend,
+                pc.src_blend_alpha,
+                pc.dst_blend_alpha
+            ),
             "target 0 sees the two alike"
         );
         assert_ne!(
