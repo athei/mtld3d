@@ -960,3 +960,72 @@ jobs:
           print("b5g6r5 texture: \(d.makeTexture(descriptor: desc) != nil)")
           EOF
           swift "$RUNNER_TEMP/packed.swift" || echo "packed 16-bit create failed with exit $?"
+
+  # Diagnostic for #1016 and #707, dispatch only (probe_only=true): the
+  # multisample stress probe in .github/probe/msaa_stress.swift, plain Metal
+  # with no Wine and no mtld3d, on eight Intel VMs and one of each Apple
+  # image. The probe exits 0 whatever the device does; its PROBE-SUMMARY
+  # lines carry the verdict, and the artifact keeps its output, the host
+  # fingerprint and the GPU part of the system log.
+  probe-msaa:
+    if: github.event_name == 'workflow_dispatch' && inputs.probe_only
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-26, macos-15, macos-15-intel]
+        rep: [1]
+        include:
+          - { runner: macos-15-intel, rep: 2 }
+          - { runner: macos-15-intel, rep: 3 }
+          - { runner: macos-15-intel, rep: 4 }
+          - { runner: macos-15-intel, rep: 5 }
+          - { runner: macos-15-intel, rep: 6 }
+          - { runner: macos-15-intel, rep: 7 }
+          - { runner: macos-15-intel, rep: 8 }
+    name: probe-msaa (${{ matrix.runner }}, ${{ matrix.rep }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - name: Host fingerprint
+        run: |
+          out="$RUNNER_TEMP/probe-msaa"
+          mkdir -p "$out"
+          {
+            date -u
+            sw_vers
+            uname -a
+            sysctl machdep.cpu.brand_string machdep.cpu.family machdep.cpu.model machdep.cpu.extmodel machdep.cpu.stepping machdep.cpu.microcode_version machdep.cpu.core_count machdep.cpu.thread_count hw.model hw.memsize hw.cpufrequency kern.hv_vmm_present kern.boottime 2>&1
+            system_profiler SPHardwareDataType SPDisplaysDataType 2>&1 | grep -v -i -E 'serial|uuid|udid|provisioning'
+            echo "== ioreg IOAccelerator"
+            ioreg -l -w0 -r -c IOAccelerator 2>&1 | grep -v -i -E 'serial|uuid' | head -300
+            echo "== ioreg paravirt"
+            ioreg -l -w0 2>&1 | grep -i -E 'paravirt|AGDC|gpu-|vendor-id|device-id|model' | grep -v -i -E 'serial|uuid' | head -200
+          } > "$out/fingerprint.txt" 2>&1
+          cat "$out/fingerprint.txt"
+      - name: MSAA stress probe
+        run: |
+          out="$RUNNER_TEMP/probe-msaa"
+          start=$(date +%s)
+          echo "probe_start_epoch=$start" > "$out/window.txt"
+          xcrun swiftc -O -o "$RUNNER_TEMP/msaa_probe" .github/probe/msaa_stress.swift
+          # 210 s of loops, a 30 s create/release storm, 210 s of loops.
+          "$RUNNER_TEMP/msaa_probe" 210 30 > "$out/probe.log" 2>&1
+          echo "probe exit $?" | tee -a "$out/probe.log"
+          echo "probe_end_epoch=$(date +%s)" >> "$out/window.txt"
+          grep -E '^PROBE-(SUMMARY|DONE|ERROR)|^PROBE .*(BAD|CB-ERROR|device)' "$out/probe.log" | cut -c1-600
+      - name: System log
+        if: ${{ !cancelled() }}
+        run: |
+          out="$RUNNER_TEMP/probe-msaa"
+          sudo -n /usr/bin/log show --last 20m --style compact --timezone UTC --info --debug \
+            --predicate 'process == "kernel" OR subsystem CONTAINS[c] "GPU" OR subsystem CONTAINS[c] "IOAccel" OR subsystem CONTAINS[c] "AppleParavirt" OR senderImagePath CONTAINS[c] "AppleParavirt" OR senderImagePath CONTAINS[c] "IOAccel"' \
+            > "$out/system.log" 2> "$out/system.stderr" || echo "log show exit $?"
+          grep -c 'Object already exists' "$out/system.log" | sed 's/^/addObject collisions: /'
+          grep -E 'GPU hang|Fault on channel|kIOAccel|GPURestart' "$out/system.log" | head -20
+      - uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() }}
+        with:
+          name: probe-msaa-${{ matrix.runner }}-${{ matrix.rep }}
+          path: ${{ runner.temp }}/probe-msaa
+          retention-days: 14
