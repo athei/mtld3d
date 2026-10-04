@@ -26,7 +26,7 @@ use mtld3d_types::{
 };
 
 /// Edge of the standalone render targets, small enough to keep the readback cheap.
-const RT_SIZE: u32 = 64;
+pub const RT_SIZE: u32 = 64;
 /// [`RT_SIZE`] as the vertex positions state it.
 const RT_SIZE_F: f32 = 64.0;
 
@@ -976,11 +976,11 @@ fn resz_into(h: &Harness, rt: &Surface<'_>, ds: &Surface<'_>, intz: &Texture<'_>
     );
 }
 
-/// Sample `intz` over the whole of `rt` and read the middle pixel back.
+/// Sample `intz` over the whole of `rt`, which must be `RT_SIZE` square, and read the middle back.
 ///
 /// An INTZ texture answers a fixed-function fetch with the raw stored depth
 /// broadcast to every channel, so the quad reads back as the depth value.
-fn sample_intz(h: &Harness, rt: &Surface<'_>, intz: &Texture<'_>) -> u32 {
+pub fn sample_intz(h: &Harness, rt: &Surface<'_>, intz: &Texture<'_>) -> u32 {
     h.select_texture_stage(0);
     assert_eq!(h.set_render_target(0, rt), 0, "SetRenderTarget(sample)");
     assert_eq!(
@@ -1249,6 +1249,7 @@ fn resz_resolves_the_implicit_multisampled_depth_surface() {
     let h = harness(D3DMULTISAMPLE_4_SAMPLES, Some(D3DFMT_D24S8));
     let (width, height) = h.dims();
     let (width_f, height_f) = back_buffer_extent(&h);
+    // Not primed: an INTZ the RESZ never reaches reads 0, which the check already rejects.
     let intz = h.create_texture(
         width,
         height,

@@ -2232,9 +2232,6 @@ impl FrameEncoder {
         // frame's own slot allocator and buffer.
         self.visibility.resume_open_spans(self.current_submit_seq);
         mtld3d_shared::crumb!("phase:BfPassRst");
-        // Keep the seen-rt sets when the previous submit was a mid-frame flush
-        // (the D3D9 frame did not end there); `finalize_submit` consumes the
-        // flag by the time this reads it.
         // The frame's default depth attachment is created at the rasterized
         // back-buffer size so it matches the colour one exactly, and `Clear`
         // measures the viewport against that.
@@ -2264,6 +2261,9 @@ impl FrameEncoder {
                 PixelFormat::Depth32Float
             },
         );
+        // Keep the seen-rt sets when the previous submit was a mid-frame flush
+        // (the D3D9 frame did not end there); `finalize_submit` consumes the
+        // flag by the time this reads it.
         self.pass_state
             .reset_frame(&mtld3d_core::passes::FrameReset {
                 backbuffer: frame.backbuffer_handle(),
