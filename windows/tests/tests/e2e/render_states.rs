@@ -16,7 +16,7 @@ use mtld3d_types::{
     D3DRS_SRGBWRITEENABLE, D3DRS_STENCILENABLE, D3DRS_STENCILFUNC, D3DRS_STENCILMASK,
     D3DRS_STENCILPASS, D3DRS_STENCILREF, D3DRS_ZENABLE, D3DRS_ZFUNC, D3DRS_ZWRITEENABLE,
     D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_MAGFILTER, D3DSAMP_MINFILTER, D3DSTENCILOP_KEEP,
-    D3DSTENCILOP_REPLACE, D3DTADDRESS_CLAMP, D3DTEXF_POINT, D3DUSAGE_RENDERTARGET,
+    D3DSTENCILOP_REPLACE, D3DTADDRESS_CLAMP, D3DTEXF_POINT, D3DUSAGE_RENDERTARGET, D3DVIEWPORT9,
     render_state_defaults,
 };
 
@@ -921,6 +921,50 @@ fn depth_bias_is_an_absolute_offset_at_every_depth() {
             "z0={z0}: a bias over the gap brings the quad in front"
         );
     }
+}
+
+#[test]
+fn depth_bias_applies_under_an_inverted_viewport_depth_range() {
+    // `SetViewport` accepts `MinZ > MaxZ`, which maps a vertex's z backwards
+    // into the depth buffer. `D3DRS_DEPTHBIAS` is still added to the depth
+    // the fragment lands on: with the range 1..0 a quad at z 0.25 stores 0.75,
+    // and one at z 0.25 minus a gap lands a gap behind it, at 0.75 + gap.
+    let h = Harness::with_depth();
+    arm_diffuse(&h);
+    let gap = 1.0_f32 / 4096.0;
+    let inverted = D3DVIEWPORT9 {
+        x: 0,
+        y: 0,
+        width: 640,
+        height: 480,
+        min_z: 1.0,
+        max_z: 0.0,
+    };
+    let wins = |bias: f32| {
+        h.render_once(BLACK, |d| {
+            assert_eq!(d.clear(D3DCLEAR_ZBUFFER, 0, 1.0, 0), 0, "depth clear");
+            assert_eq!(d.set_viewport(&inverted), 0, "inverted viewport");
+            assert_eq!(d.set_render_state(D3DRS_ZENABLE, 1), 0);
+            assert_eq!(d.set_render_state(D3DRS_ZWRITEENABLE, 1), 0);
+            assert_eq!(d.set_render_state(D3DRS_ZFUNC, D3DCMP_LESS), 0);
+            assert_eq!(d.set_render_state(D3DRS_DEPTHBIAS, 0), 0);
+            assert_eq!(
+                d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad_at_depth(GREEN, 0.25)),
+                0,
+                "stored depth"
+            );
+            assert_eq!(d.set_render_state(D3DRS_DEPTHBIAS, bias.to_bits()), 0);
+            assert_eq!(
+                d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad_at_depth(RED, 0.25 - gap)),
+                0,
+                "biased quad"
+            );
+            assert_eq!(d.set_render_state(D3DRS_DEPTHBIAS, 0), 0);
+        });
+        h.read_pixel(320, 240) == RED
+    };
+    assert!(!wins(-0.75 * gap), "a bias under the gap leaves the quad behind");
+    assert!(wins(-1.5 * gap), "a bias over the gap brings the quad in front");
 }
 
 #[test]
