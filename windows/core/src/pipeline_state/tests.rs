@@ -470,12 +470,34 @@ fn an_extra_target_keeps_factors_its_alpha_sees_apart() {
             "target 0 sees the two alike"
         );
         assert_ne!(
-            blend_fields(&params_of(b)),
-            blend_fields(&params_of(c)),
+            extra_factors(&pb),
+            extra_factors(&pc),
             "target 1 sees them apart"
         );
         assert_ne!(key_of(b), key_of(c));
     }
+
+    // The other way round: the same DESTALPHA source factor over an X8 and
+    // an A8 target 0, each beside an A8 target 1. Target 1 blends alike,
+    // target 0 does not, so the two must not share a key either.
+    let mut a8 = with_rt1();
+    a8.rs.src_blend = narrow(D3DBLEND_DESTALPHA);
+    let mut x8 = a8.clone();
+    x8.attach.remove(PipelineAttachFlags::COLOR_HAS_ALPHA);
+    let (pa, px) = (params_of(&a8), params_of(&x8));
+    assert_eq!(extra_factors(&pa), extra_factors(&px), "target 1 sees them alike");
+    assert_ne!(pa.src_blend, px.src_blend, "target 0 sees them apart");
+    assert_ne!(key_of(&a8), key_of(&x8));
+}
+
+/// Render target 1's `(src, dst, src_alpha, dst_alpha)` in a native description.
+fn extra_factors(p: &PipelineDescription<'_>) -> (BlendFactor, BlendFactor, BlendFactor, BlendFactor) {
+    (
+        p.extra[0].src_blend,
+        p.extra[0].dst_blend,
+        p.extra[0].src_blend_alpha,
+        p.extra[0].dst_blend_alpha,
+    )
 }
 
 #[test]
