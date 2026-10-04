@@ -89,14 +89,16 @@ bitflags::bitflags! {
         /// fragment function declares a depth output against no depth
         /// attachment. Folded into the PS cache key.
         const NO_DEPTH_ATTACHMENT = 1 << 4;
-        /// A sampler slot this draw binds carries a non-zero `D3DSAMP_MIPMAPLODBIAS`.
+        /// A sampler slot this draw binds carries a LOD bias or an explicit-LOD clamp.
         ///
-        /// Metal samplers have no LOD bias, so it is applied at the sample
-        /// site: the PS takes the per-slot bias table on
-        /// `PS_LOD_BIAS_SLOT` and every implicit-LOD sample passes
-        /// `bias(...)`. A draw with no biased slot compiles the unchanged
-        /// shader and binds nothing, so the common case costs nothing.
-        /// Folded into the PS cache key.
+        /// Metal samplers have no LOD bias, and ignore their LOD clamps for a
+        /// sample at an explicit level, so both are applied at the sample
+        /// site: the PS takes the per-slot LOD table on `PS_LOD_BIAS_SLOT`,
+        /// every implicit-LOD sample passes `bias(...)`, and every sample at
+        /// an explicit level clamps it by the slot's row
+        /// (`sampler_state::explicit_lod_row`). A draw with neither compiles
+        /// the unchanged shader and binds nothing, so the common case costs
+        /// nothing. Folded into the PS cache key.
         const LOD_BIAS = 1 << 5;
         /// The bound colour target is rasterized below the resolution D3D9 reports.
         ///
@@ -1009,6 +1011,24 @@ pub fn declared_ps_samplers(ps: &DxsoProgram) -> BTreeMap<u16, TextureType> {
         }
     }
     samplers
+}
+
+/// Sampler slots a `texldl` names, bit `i` for `s<i>`.
+///
+/// Metal ignores a sampler's LOD clamps for a sample at an explicit level, so
+/// these are the slots whose stage state the shader applies itself (through
+/// the `lod_bias` rows `.z` and `.w`). The encoder keys the table on them, so a
+/// stage clamp the shader cannot observe mints no variant. Subroutine bodies
+/// count, since the emitter inlines them.
+#[must_use]
+pub fn explicit_lod_samplers(ps: &DxsoProgram) -> u16 {
+    ps.instructions
+        .iter()
+        .chain(ps.subroutines.values().flatten())
+        .filter(|inst| inst.opcode == Opcode::TexLdL)
+        .filter_map(|inst| inst.srcs.get(1))
+        .filter(|sampler| sampler.reg.index < 16)
+        .fold(0, |mask, sampler| mask | (1u16 << sampler.reg.index))
 }
 
 /// The texture kind sampler slot `idx` reads, taken from the live bindings.
@@ -2056,10 +2076,21 @@ fn translate_instruction(
             sample_with_result_swizzle(ctx, sampler, &coord, None, instruction_bias.as_deref())
         }
         // SM3 texldl — sample with explicit LOD in coord.w.
-        // `s.sample(samp, coord, level(lod))` is the MSL form.
+        // `s.sample(samp, coord, level(lod))` is the MSL form. Under the LOD
+        // table the level counts from the texture's LOD, carries the game's
+        // bias, and is clamped by the stage's finest level, all in the slot's
+        // row because Metal applies no sampler clamp to an explicit level.
         Opcode::TexLdL => {
             let sampler = &inst.srcs[1];
-            let suffix = format!(", level(({coord}).w)", coord = srcs[0]);
+            let idx = sampler.reg.index;
+            let suffix = if ctx.has_lod_bias() {
+                format!(
+                    ", level(max(({coord}).w + lod_bias[{idx}].z, lod_bias[{idx}].w))",
+                    coord = srcs[0]
+                )
+            } else {
+                format!(", level(({coord}).w)", coord = srcs[0])
+            };
             sample_with_result_swizzle(ctx, sampler, &srcs[0], Some(&suffix), None)
         }
         // SM3 texldd — sample with explicit gradients in srcs[2]/srcs[3].
@@ -3188,8 +3219,9 @@ fn sample_or_compare(
         // was already folded into `coord_expr` by the texldp caller. Pin
         // `level(0)` for the same no-mip / discard-derivative
         // reason as the compare path; texldl/texldd override via their suffix.
+        let default_level = pinned_depth_level(ctx, sampler_idx);
         let lod_suffix = if suffix_str.is_empty() {
-            ", level(0)"
+            default_level.as_str()
         } else {
             suffix_str
         };
@@ -3212,8 +3244,9 @@ fn sample_or_compare(
         // Force `level(0)` to pin the mip and eliminate the
         // discard-driven derivative dependency. `texldl` / `texldd`
         // already pass their own suffix and override this default.
+        let default_level = pinned_depth_level(ctx, sampler_idx);
         let lod_suffix = if suffix_str.is_empty() {
-            ", level(0)"
+            default_level.as_str()
         } else {
             suffix_str
         };
@@ -3221,10 +3254,9 @@ fn sample_or_compare(
             "float4(s{sampler_idx}.sample_compare(samp{sampler_idx}, ({coord_expr}).xy, saturate(({coord_expr}).z){lod_suffix}))"
         )
     } else {
-        // `D3DSAMP_MIPMAPLODBIAS` shifts the mip the hardware selects, so it
-        // applies to implicit-LOD samples only. An explicit `level(...)`
-        // supplies the LOD outright (D3D9 leaves it unbiased) and MSL accepts
-        // exactly one LOD option per call, so a suffixed sample keeps its own;
+        // `D3DSAMP_MIPMAPLODBIAS` shifts the mip the hardware selects. MSL
+        // accepts exactly one LOD option per call, so a suffixed sample keeps
+        // its own: `texldl` carries the bias in its level expression and
         // `texldd` folds the shift into its gradients at the call site.
         let bias = if suffix_str.is_empty() {
             match (instruction_bias, ctx.has_lod_bias()) {
@@ -3249,6 +3281,20 @@ fn sample_or_compare(
 /// D3D9 applies this swizzle after lookup and before destination saturation and
 /// masking. `translate_instruction` passes this expression to `store_dst`, so
 /// those later operations retain their required order.
+/// The `level(...)` suffix of a depth sample that names no level of its own.
+///
+/// Depth samples pin a level instead of computing one (see
+/// [`sample_or_compare`]). D3D9 samples the stage's finest level there, the
+/// slot row's `.w` under the LOD table, which is below 0 for a slot with no
+/// clamp.
+fn pinned_depth_level(ctx: &EmitContext, sampler_idx: u16) -> String {
+    if ctx.has_lod_bias() {
+        format!(", level(max(lod_bias[{sampler_idx}].w, 0.0))")
+    } else {
+        ", level(0)".to_string()
+    }
+}
+
 fn sample_with_result_swizzle(
     ctx: &EmitContext,
     sampler: &SrcOperand,

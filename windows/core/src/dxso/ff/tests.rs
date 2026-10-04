@@ -2762,6 +2762,19 @@ fn lod_bias_variant_biases_the_fixed_function_sample() {
         biased.contains("s0.sample(samp0, in.texcoord0.xy, bias(lod_bias[0].x))"),
         "stage 0 samples with its own slot's bias:\n{biased}"
     );
+
+    let depth = emit_ps_ff(
+        &ps,
+        VariantKey {
+            depth_sampler_mask: 1,
+            flags: VariantFlags::LOD_BIAS,
+            ..VariantKey::default()
+        },
+    );
+    assert!(
+        depth.contains("level(max(lod_bias[0].w, 0.0))"),
+        "a depth stage samples its finest level from the table:\n{depth}"
+    );
 }
 
 #[test]

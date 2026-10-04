@@ -730,6 +730,21 @@ const PS_SAMPLE_TEXTURE_BIASED: [u32; 21] = [
     0x0000_FFFF,                                        // end
 ];
 
+/// `ps_3_0` sampling at the explicit LOD in `c0.x` through `texldl`.
+///
+/// As [`PS_SAMPLE_TEXTURE_BIASED`], with `texldl` reading `.w` as the level.
+#[rustfmt::skip]
+const PS_SAMPLE_TEXTURE_LOD: [u32; 21] = [
+    0xFFFF_0300,                                        // ps_3_0
+    0x0200_001F, 0x9000_0000, 0xA00F_0800,              // dcl_2d s0
+    0x0200_001F, 0x8000_0005, 0x900F_0000,              // dcl_texcoord0 v0
+    0x0200_0001, 0x800F_0001, 0x90E4_0000,              // mov r1, v0
+    0x0200_0001, 0x8008_0001, 0xA000_0000,              // mov r1.w, c0.x
+    0x0300_005F, 0x800F_0000, 0x80E4_0001, 0xA0E4_0800, // texldl r0, r1, s0
+    0x0200_0001, 0x800F_0800, 0x80E4_0000,              // mov oC0, r0
+    0x0000_FFFF,                                        // end
+];
+
 /// Base dimension of the mip-tinted texture, and the pixel span it is drawn at.
 const MIP_TEX_DIM: u32 = 64;
 
@@ -1280,6 +1295,192 @@ fn texldb_adds_instruction_and_sampler_biases() {
     assert_eq!(h.clear_pixel_shader(), 0, "SetPixelShader(null)");
 }
 
+/// Draw the mip-tinted quad through [`PS_SAMPLE_TEXTURE_LOD`] at `lod` and read it back.
+fn sample_at_explicit_lod(h: &Harness, lod: f32) -> u32 {
+    assert_eq!(
+        h.set_pixel_shader_constant_f(0, &[lod, 0.0, 0.0, 0.0]),
+        0,
+        "explicit LOD {lod}"
+    );
+    let quad = texel_to_pixel_quad();
+    h.render_once(BLACK, |d| {
+        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad), 0);
+    });
+    h.read_pixel(MIP_TEX_DIM / 2, MIP_TEX_DIM / 2)
+}
+
+/// Bind [`PS_SAMPLE_TEXTURE_LOD`] over the armed mip-tinted stage.
+fn arm_explicit_lod_shader(h: &Harness) {
+    let ps = h.create_pixel_shader(&PS_SAMPLE_TEXTURE_LOD);
+    assert_eq!(h.set_pixel_shader(&ps), 0, "SetPixelShader");
+}
+
+#[test]
+fn texldl_takes_max_mip_level_as_its_finest_level() {
+    // `D3DSAMP_MAXMIPLEVEL` is the finest level any sample of the stage may
+    // read, and it clamps an explicit LOD rather than shifting it. A Metal
+    // sampler's LOD clamp does not reach a sample at an explicit level.
+    let h = Harness::new();
+    let tex = mip_tinted_texture(&h);
+    arm_mip_tinted(&h, &tex);
+    arm_explicit_lod_shader(&h);
+
+    assert_eq!(
+        sample_at_explicit_lod(&h, 1.0),
+        MIP_TINTS[1],
+        "texldl samples the level it names"
+    );
+    assert_eq!(h.set_sampler_state(0, D3DSAMP_MAXMIPLEVEL, 3), 0);
+    assert_eq!(
+        sample_at_explicit_lod(&h, 1.0),
+        MIP_TINTS[3],
+        "MAXMIPLEVEL 3 clamps an explicit LOD of 1"
+    );
+    assert_eq!(
+        sample_at_explicit_lod(&h, 4.0),
+        MIP_TINTS[4],
+        "a coarser explicit LOD is kept, not shifted"
+    );
+    assert_eq!(h.clear_pixel_shader(), 0, "SetPixelShader(null)");
+}
+
+#[test]
+fn texldl_counts_its_lod_from_the_texture_lod() {
+    // `SetLOD` makes a level the texture's most detailed one, so an explicit
+    // LOD counts from it; `MAXMIPLEVEL` still clamps the result.
+    use mtld3d_types::D3DPOOL_MANAGED;
+
+    let h = Harness::new();
+    let tex = mip_tinted_texture_in(&h, D3DPOOL_MANAGED);
+    arm_mip_tinted(&h, &tex);
+    arm_explicit_lod_shader(&h);
+
+    assert_eq!(tex.set_lod(2), 0, "SetLOD(2) returns the previous LOD");
+    assert_eq!(
+        sample_at_explicit_lod(&h, 0.0),
+        MIP_TINTS[2],
+        "LOD 0 reads the texture's most detailed level"
+    );
+    assert_eq!(
+        sample_at_explicit_lod(&h, 1.0),
+        MIP_TINTS[3],
+        "LOD 1 reads the level below it"
+    );
+    assert_eq!(h.set_sampler_state(0, D3DSAMP_MAXMIPLEVEL, 4), 0);
+    assert_eq!(
+        sample_at_explicit_lod(&h, 1.0),
+        MIP_TINTS[4],
+        "MAXMIPLEVEL 4 clamps level 3"
+    );
+    assert_eq!(
+        sample_at_explicit_lod(&h, 3.0),
+        MIP_TINTS[5],
+        "level 5 is past the clamp"
+    );
+    assert_eq!(tex.set_lod(0), 2, "SetLOD(0) restores the base level");
+    assert_eq!(h.clear_pixel_shader(), 0, "SetPixelShader(null)");
+}
+
+#[test]
+fn texldl_adds_the_sampler_lod_bias() {
+    // `D3DSAMP_MIPMAPLODBIAS` shifts an explicit LOD as it does a computed one.
+    let h = Harness::new();
+    let tex = mip_tinted_texture(&h);
+    arm_mip_tinted(&h, &tex);
+    arm_explicit_lod_shader(&h);
+
+    for (bias, lod, level) in [(1.0_f32, 1.0, 2), (-1.0, 3.0, 2), (2.0, 0.0, 2)] {
+        assert_eq!(
+            h.set_sampler_state(0, D3DSAMP_MIPMAPLODBIAS, bias.to_bits()),
+            0
+        );
+        assert_eq!(
+            sample_at_explicit_lod(&h, lod),
+            MIP_TINTS[level],
+            "bias {bias} on LOD {lod}"
+        );
+    }
+    assert_eq!(h.set_sampler_state(0, D3DSAMP_MIPMAPLODBIAS, 0), 0);
+    assert_eq!(h.clear_pixel_shader(), 0, "SetPixelShader(null)");
+}
+
+#[test]
+fn texldl_takes_the_game_bias_and_not_the_render_scale_compensation() {
+    // `render.lodBias` corrects a LOD the sampler computes on the reduced
+    // render grid. An explicit LOD names a level outright, so it keeps the
+    // game's bias and takes none of the compensation.
+    let h = Harness::with_config("render.scale=0.5");
+    let tex = mip_tinted_texture(&h);
+    arm_mip_tinted(&h, &tex);
+    arm_explicit_lod_shader(&h);
+
+    assert_eq!(
+        sample_at_explicit_lod(&h, 1.0),
+        MIP_TINTS[1],
+        "the scale's compensation leaves an explicit LOD alone"
+    );
+    assert_eq!(
+        h.set_sampler_state(0, D3DSAMP_MIPMAPLODBIAS, 1.0_f32.to_bits()),
+        0
+    );
+    assert_eq!(
+        sample_at_explicit_lod(&h, 1.0),
+        MIP_TINTS[2],
+        "the game's +1 bias still lands"
+    );
+    assert_eq!(h.clear_pixel_shader(), 0, "SetPixelShader(null)");
+}
+
+/// [`texel_to_pixel_quad`] shrunk to `size` backbuffer pixels square.
+///
+/// `MIP_TEX_DIM` texels map onto `size` pixels on both axes, so the implicit
+/// LOD is log2(`MIP_TEX_DIM` / `size`).
+fn minified_quad(size: u32) -> [TexturedVertex; 6] {
+    let scale = f32::from(u16::try_from(size).expect("size fits u16"))
+        / f32::from(u16::try_from(MIP_TEX_DIM).expect("mip texture dim fits u16"));
+    texel_to_pixel_quad().map(|v| TexturedVertex {
+        x: (v.x + 1.0).mul_add(scale, -1.0),
+        y: (v.y - 1.0).mul_add(scale, 1.0),
+        ..v
+    })
+}
+
+#[test]
+fn without_mipmapping_the_texture_lod_is_the_only_level() {
+    // With `D3DSAMP_MIPFILTER` NONE D3D9 samples the texture's most detailed
+    // level whatever the footprint or the shader's LOD: a minified draw does
+    // not reach a coarser level, and neither does `texldl`.
+    use mtld3d_types::D3DPOOL_MANAGED;
+    const SIZE: u32 = 8;
+
+    let h = Harness::new();
+    let tex = mip_tinted_texture_in(&h, D3DPOOL_MANAGED);
+    arm_mip_tinted(&h, &tex);
+    assert_eq!(h.set_sampler_state(0, D3DSAMP_MIPFILTER, D3DTEXF_NONE), 0);
+    assert_eq!(tex.set_lod(2), 0, "SetLOD(2) returns the previous LOD");
+
+    let quad = minified_quad(SIZE);
+    h.render_once(BLACK, |d| {
+        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad), 0);
+    });
+    assert_eq!(
+        h.read_pixel(SIZE / 2, SIZE / 2),
+        MIP_TINTS[2],
+        "a draw minified to level 3 samples the LOD level"
+    );
+
+    arm_explicit_lod_shader(&h);
+    for lod in [0.0, 4.0] {
+        assert_eq!(
+            sample_at_explicit_lod(&h, lod),
+            MIP_TINTS[2],
+            "texldl at LOD {lod} samples the LOD level"
+        );
+    }
+    assert_eq!(tex.set_lod(0), 2, "SetLOD(0) restores the base level");
+    assert_eq!(h.clear_pixel_shader(), 0, "SetPixelShader(null)");
+}
+
 /// Position, diffuse and one four-component texture coordinate.
 ///
 /// The FVF is `D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1 |
@@ -1376,5 +1577,88 @@ fn projected_shadow_map_lookup_divides_the_reference_by_w() {
         h.read_pixel(480, 240),
         0x0000_0000,
         "reference 0.75 after the divide fails against 0.5",
+    );
+}
+
+/// A shadow-map stage samples the level `D3DSAMP_MAXMIPLEVEL` names.
+///
+/// A depth sample pins its level, since a shadow map's derivatives are not
+/// reliable, and Metal applies no sampler clamp to a pinned level, so the
+/// stage's finest level reaches the sample in the shader. The two-level D24S8
+/// texture holds depth 0.25 in level 0 and 0.75 in level 1, and the reference
+/// 0.5 fails against the first and passes against the second.
+#[test]
+fn shadow_map_lookup_samples_the_max_mip_level() {
+    use mtld3d_types::{
+        D3DFMT_D24S8, D3DPOOL_DEFAULT, D3DRS_LIGHTING, D3DRS_ZENABLE, D3DTS_TEXTURE0,
+        D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_COUNT4, D3DTTFF_PROJECTED, D3DUSAGE_DYNAMIC,
+    };
+    const TEXCOORDSIZE4_0: u32 = 2 << 16;
+    const IDENTITY: [f32; 16] = [
+        1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+    ];
+    let h = Harness::new();
+    let depth = h.create_texture(4, 4, 2, D3DUSAGE_DYNAMIC, D3DFMT_D24S8, D3DPOOL_DEFAULT);
+    depth
+        .lock_rect(0, 0)
+        .write_u32_rect(4, 4, &[0x4000_0000; 16]);
+    depth
+        .lock_rect(1, 0)
+        .write_u32_rect(2, 2, &[0xC000_0000; 4]);
+    assert_eq!(h.set_render_state(D3DRS_ZENABLE, 0), 0);
+    assert_eq!(h.set_render_state(D3DRS_LIGHTING, 0), 0);
+    assert_eq!(
+        h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1 | TEXCOORDSIZE4_0),
+        0
+    );
+    h.select_texture_stage(0);
+    assert_eq!(h.set_texture(0, &depth), 0);
+    for (state, value) in [
+        (D3DSAMP_MINFILTER, D3DTEXF_POINT),
+        (D3DSAMP_MAGFILTER, D3DTEXF_POINT),
+        (D3DSAMP_MIPFILTER, D3DTEXF_POINT),
+    ] {
+        assert_eq!(h.set_sampler_state(0, state, value), 0);
+    }
+    assert_eq!(h.set_transform(D3DTS_TEXTURE0, &IDENTITY), 0);
+    assert_eq!(
+        h.set_texture_stage_state(
+            0,
+            D3DTSS_TEXTURETRANSFORMFLAGS,
+            D3DTTFF_COUNT4 | D3DTTFF_PROJECTED
+        ),
+        0
+    );
+    let v = |x, y| ProjectiveVertex {
+        x,
+        y,
+        z: 0.5,
+        color: 0xFFFF_FFFF,
+        coord: [0.5, 0.5, 0.5, 1.0],
+    };
+    let quad = [
+        v(-1.0, 1.0),
+        v(1.0, 1.0),
+        v(-1.0, -1.0),
+        v(1.0, 1.0),
+        v(1.0, -1.0),
+        v(-1.0, -1.0),
+    ];
+    let sample = || {
+        h.render_once(YELLOW, |d| {
+            assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad), 0);
+        });
+        h.read_pixel(320, 240)
+    };
+    assert_pixel_eq(
+        sample(),
+        0x0000_0000,
+        "level 0 holds 0.25, which the reference 0.5 fails against",
+    );
+    assert_eq!(h.set_sampler_state(0, D3DSAMP_MAXMIPLEVEL, 1), 0);
+    assert_pixel_eq(
+        sample(),
+        0xFFFF_FFFF,
+        "MAXMIPLEVEL 1 samples level 1, which holds 0.75",
     );
 }

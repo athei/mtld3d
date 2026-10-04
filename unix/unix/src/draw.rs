@@ -435,14 +435,22 @@ fn emit_draw_view(
     // sampler and per-slot bias bind below is confined to this mask: a stage
     // the game bound a texture to that the shader never samples has no
     // argument in the emitted function, so binding it only adds encoder work.
-    let ps_sampled_mask = match ps {
+    //
+    // The explicit-level slots are the ones whose stage clamp the shader has
+    // to apply itself, since Metal ignores sampler LOD clamps at an explicit
+    // level: the `texldl` samplers of a programmable shader and every depth
+    // slot, whose samples pin a level.
+    let (ps_sampled_mask, texldl_mask) = match ps {
         PsSourceView::Programmable(ProgrammablePsSource { ps_id, .. }) => {
-            enc.ps_declared_samplers(*ps_id).mask()
+            let decls = enc.ps_declared_samplers(*ps_id);
+            (decls.mask(), decls.explicit_lod_mask())
         }
         PsSourceView::FixedFunction(FixedPsSource {
             sampled_stage_mask, ..
-        }) => *sampled_stage_mask,
+        }) => (*sampled_stage_mask, 0),
     };
+    let lod_table_mask = ps_sampled_mask & !variant.fetch4_mask;
+    let explicit_lod_mask = (texldl_mask | variant.depth_sampler_mask) & lod_table_mask;
     // `D3DSAMP_MIPMAPLODBIAS` has no Metal sampler equivalent, so the bias
     // reaches the GPU as a fragment uniform the sample sites read. Resolving
     // it here keeps every draw that leaves the state at its zero default on
@@ -459,10 +467,14 @@ fn emit_draw_view(
     } else {
         0.0
     };
+    // An explicit level takes the game's bias in its row, never the scale
+    // term, which compensates a LOD computed on the reduced grid.
     let mut lod_bias = [0.0f32; mtld3d_core::sampler_state::LOD_BIAS_SLOTS];
+    let mut explicit_lod: Option<[[f32; 2]; mtld3d_core::sampler_state::LOD_BIAS_SLOTS]> = None;
     let mut any_lod_bias = false;
     for (stage_u32, b) in stage_bindings {
-        if (ps_sampled_mask & !variant.fetch4_mask) & (1u16 << stage_u32) == 0 {
+        let bit = 1u16 << stage_u32;
+        if lod_table_mask & bit == 0 {
             continue;
         }
         let bias = mtld3d_core::sampler_state::lod_bias(&b.sampler_state) + scale_bias;
@@ -470,7 +482,14 @@ fn emit_draw_view(
             lod_bias[stage_u32 as usize] = bias;
             any_lod_bias = true;
         }
+        if explicit_lod_mask & bit != 0
+            && let Some(row) = mtld3d_core::sampler_state::explicit_lod_row(&b.sampler_state)
+        {
+            explicit_lod.get_or_insert(mtld3d_core::sampler_state::EXPLICIT_LOD_OPEN_ROWS)
+                [stage_u32 as usize] = row;
+        }
     }
+    let any_lod_table = any_lod_bias || explicit_lod.is_some();
     // `D3DRS_SRGBWRITEENABLE` picks the pass's colour attachment views, so it
     // has to reach the pass state before anything this draw emits opens a
     // pass. A change ends the current one, since the views are frozen at
@@ -520,8 +539,8 @@ fn emit_draw_view(
             !snap.depth_stencil.contains(DepthStencilFlags::HAS_DEPTH),
         );
     }
-    // Both emitters honour the bias, so the flag rides on the shared PS key.
-    ps_variant.flags.set(VariantFlags::LOD_BIAS, any_lod_bias);
+    // Both emitters honour the table, so the flag rides on the shared PS key.
+    ps_variant.flags.set(VariantFlags::LOD_BIAS, any_lod_table);
     // `vPos` is the rasterized pixel coordinate. Into a target rasterized
     // below the resolution D3D9 reports, a shader that declares the register
     // reads it through the `PsDraw` uniform so it stays in the reported space;
@@ -1301,10 +1320,17 @@ fn emit_draw_view(
         let (p, n) = bump_env_slice.as_raw();
         enc.emit_command(Command::set_fragment_bytes_at(p, n, 12));
     }
-    // Per-slot LOD bias. Bound only for a draw whose shader declares the
-    // uniform; the binding then persists on the encoder, so a later biased
-    // draw carrying the same table skips the re-bind.
-    if any_lod_bias && let Some(ptr) = enc.alloc_lod_bias_if_changed(&lod_bias) {
+    // Per-slot LOD table. Bound only for a draw whose shader declares the
+    // uniform; the binding then persists on the encoder, so a later draw
+    // carrying the same table skips the re-bind.
+    if any_lod_table
+        && let Some(ptr) = enc.alloc_lod_bias_if_changed(
+            &lod_bias,
+            explicit_lod
+                .as_ref()
+                .unwrap_or(&mtld3d_core::sampler_state::EXPLICIT_LOD_OPEN_ROWS),
+        )
+    {
         enc.emit_command(Command::set_fragment_bytes_at(
             ptr,
             u32::try_from(mtld3d_core::sampler_state::LOD_BIAS_BYTES)

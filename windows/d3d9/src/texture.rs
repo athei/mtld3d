@@ -3884,8 +3884,9 @@ extern "system" fn texture_set_lod(this: *mut c_void, lod: u32) -> u32 {
         return prev;
     }
     ti.lod = lod;
-    // The draw snapshot folds the LOD into the sampler state of each stage the
-    // texture is bound to, and recaptures the stages only when STAGES is dirty.
+    // The draw snapshot carries the LOD in the sampler-state copy of each stage
+    // the texture is bound to, and recaptures the stages only when STAGES is
+    // dirty.
     // A texture on no device, or not bound on its own device, has no capture to
     // refresh: the next SetTexture that binds it marks STAGES itself.
     let device_inner = ti.device_inner;

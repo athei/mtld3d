@@ -1778,10 +1778,21 @@ fn emit_ps(out: &mut String, ps: &FfPsKey, variant: VariantKey, entry: &str) {
     if fog_blend_active(variant) {
         out.push_str(",\n    constant float4 *fog_data [[buffer(13)]]");
     }
-    // Per-slot `D3DSAMP_MIPMAPLODBIAS`. Metal samplers carry no LOD bias, so
-    // the cascade's sample sites apply it; declared only for the biased
-    // variant, so an unbiased scene keeps the shader it had.
+    // Per-slot `D3DSAMP_MIPMAPLODBIAS` and explicit-level clamp. Metal
+    // samplers carry no LOD bias and ignore their clamps at an explicit
+    // level, so the cascade's sample sites apply both; declared only for the
+    // variant that needs it, so a plain scene keeps the shader it had.
     let lod_bias = variant.flags.contains(VariantFlags::LOD_BIAS);
+    // Depth samples pin a level rather than compute one: the stage's finest
+    // level, the row's `.w` under the table (below 0 for a slot with no
+    // clamp).
+    let depth_level = |i: usize| {
+        if lod_bias {
+            format!("level(max(lod_bias[{i}].w, 0.0))")
+        } else {
+            "level(0)".to_string()
+        }
+    };
     if lod_bias {
         let _ = write!(
             out,
@@ -1902,9 +1913,10 @@ fn emit_ps(out: &mut String, ps: &FfPsKey, variant: VariantKey, entry: &str) {
                 } else {
                     ""
                 };
+                let level = depth_level(i);
                 let _ = writeln!(
                     out,
-                    "    float4 t{i} = float4(s{i}.sample(samp{i}, {uv}, level(0)){fill});"
+                    "    float4 t{i} = float4(s{i}.sample(samp{i}, {uv}, {level}){fill});"
                 );
             } else if (variant.depth_sampler_mask & (1u16 << i)) != 0 {
                 // D3DTTFF_PROJECTED divides the reference depth by `.w` along
@@ -1920,9 +1932,10 @@ fn emit_ps(out: &mut String, ps: &FfPsKey, variant: VariantKey, entry: &str) {
                 } else {
                     format!("in.texcoord{i}")
                 };
+                let level = depth_level(i);
                 let _ = writeln!(
                     out,
-                    "    float4 t{i} = float4(s{i}.sample_compare(samp{i}, {coord}.xy, saturate({coord}.z), level(0)));",
+                    "    float4 t{i} = float4(s{i}.sample_compare(samp{i}, {coord}.xy, saturate({coord}.z), {level}));",
                 );
             } else {
                 // D3DTTFF_PROJECTED: divide the coordinate by `.w` before
@@ -1945,8 +1958,8 @@ fn emit_ps(out: &mut String, ps: &FfPsKey, variant: VariantKey, entry: &str) {
                     format!("in.texcoord{i}.{sw}")
                 };
                 // The bias applies to this implicit-LOD sample only: the
-                // depth branches above pin `level(0)`, which supplies the
-                // level outright.
+                // depth branches above pin a level, which supplies it
+                // outright.
                 let bias = if lod_bias {
                     format!(", bias(lod_bias[{i}].x)")
                 } else {
