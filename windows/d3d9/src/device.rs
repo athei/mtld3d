@@ -1021,17 +1021,21 @@ impl DeviceInner {
 
     pub fn set_viewport(&mut self, v: D3DVIEWPORT9) {
         self.viewport = v;
-        // The depth range forwarded to the encoder is
-        // `convert::viewport_depth_range`: a degenerate forward range widens
-        // to a thousandth and an inverted one passes through. `self.viewport`
-        // keeps the raw values so GetViewport round-trips unchanged.
+        // D3D9 viewport z-range fixup: the far plane forwarded to the encoder
+        // is clamped to at least `min_z + 0.001` so a degenerate (`min_z ==
+        // max_z`) or inverted (`max_z < min_z`) range collapses to a tiny
+        // forward range instead of mapping every fragment to a single depth.
+        // `self.viewport` keeps the raw values so GetViewport round-trips
+        // unchanged. Ordinary `[min_z, max_z]` ranges (`max_z >= min_z + 0.001`)
+        // are left untouched.
         // The rect stays in the game's coordinate space all the way to the
         // encoder: `PassState` converts it to render resolution against
         // whichever target is bound when it becomes a Metal command. Keeping it
         // logical here is also what holds the fixed-function XYZRHW row in the
         // game's screen space.
         let (x, y, width, height) = (v.x, v.y, v.width, v.height);
-        let (min_z, max_z) = mtld3d_core::convert::viewport_depth_range(v.min_z, v.max_z);
+        let min_z = v.min_z;
+        let max_z = v.max_z.max(v.min_z + 0.001);
         self.push_control(crate::device::SetViewportOp {
             x,
             y,

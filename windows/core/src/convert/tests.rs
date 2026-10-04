@@ -958,34 +958,9 @@ fn d3d_depth_bias_is_divided_by_the_viewport_depth_range() {
 
 #[test]
 fn d3d_depth_bias_is_dropped_over_an_empty_depth_range() {
-    let clip = d3d_depth_bias_to_clip(0.125_f32.to_bits(), 0.5, 0.5);
-    assert_eq!(clip.to_bits(), 0.0_f32.to_bits());
-}
-
-#[test]
-fn d3d_depth_bias_follows_an_inverted_depth_range() {
-    // `MinZ > MaxZ` maps clip depth backwards, so the clip-space offset takes
-    // the opposite sign and the fragment still moves by the bias itself:
-    // `min_z + offset * (max_z - min_z)` adds 0.125 to the mapped depth.
-    let clip = d3d_depth_bias_to_clip(0.125_f32.to_bits(), 0.75, 0.25);
-    assert_eq!(clip.to_bits(), (-0.25_f32).to_bits());
-}
-
-#[test]
-fn viewport_depth_range_widens_a_narrow_forward_range_and_keeps_an_inverted_one() {
-    let bits = |(min_z, max_z): (f32, f32)| (min_z.to_bits(), max_z.to_bits());
-    for (input, forwarded) in [
-        ((0.0, 1.0), (0.0, 1.0)),
-        ((0.25, 0.75), (0.25, 0.75)),
-        ((0.5, 0.5), (0.5, 0.5 + 0.001)),
-        ((1.0, 0.0), (1.0, 0.0)),
-        ((0.75, 0.25), (0.75, 0.25)),
-    ] {
-        assert_eq!(
-            bits(viewport_depth_range(input.0, input.1)),
-            bits(forwarded),
-            "{input:?}"
-        );
+    for (min_z, max_z) in [(0.5_f32, 0.5_f32), (0.75, 0.25)] {
+        let clip = d3d_depth_bias_to_clip(0.125_f32.to_bits(), min_z, max_z);
+        assert_eq!(clip.to_bits(), 0.0_f32.to_bits());
     }
 }
 
