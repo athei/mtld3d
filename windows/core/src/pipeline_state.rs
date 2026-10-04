@@ -22,7 +22,9 @@ use mtld3d_types::{
 };
 
 use crate::{
-    convert::{d3d_to_metal_blend_op, d3d_to_metal_blend_rt, d3d_to_metal_write_mask},
+    convert::{
+        d3d_to_metal_blend, d3d_to_metal_blend_op, d3d_to_metal_blend_rt, d3d_to_metal_write_mask,
+    },
     ids::VertexAttrsHash,
 };
 
@@ -382,9 +384,10 @@ impl PipelineSnapshot {
     /// Whether the bound colour RT's D3D format carries a real alpha channel.
     ///
     /// Feeds [`d3d_to_metal_blend_rt`] so destination-alpha blend factors
-    /// clamp on alpha-less targets (X8R8G8B8). Its effect flows into both the
-    /// key and the wire params via the remapped factors, so no extra key field
-    /// is needed to keep X8 and A8 pipelines distinct.
+    /// clamp on alpha-less targets (X8R8G8B8). The key holds its effect through
+    /// target 0's remapped factors, or holds the bit itself when an extra
+    /// target blends (see [`key_from_snapshot`]), so X8 and A8 pipelines key
+    /// apart.
     #[inline]
     #[must_use]
     pub const fn color_has_alpha(&self) -> bool {
@@ -402,10 +405,11 @@ impl PipelineSnapshot {
 ///
 /// In memory only: the persisted pipeline recipe stores the
 /// [`PipelineSnapshot`] and prewarm derives the key again, so the fields
-/// below can be normalised without a cache schema change. Every field is the
-/// value Metal sees, so two snapshots Metal cannot tell apart share one key:
-/// no blend, mask or colour format without a colour output, and the factors
-/// of a `MIN` or `MAX` equation, which Metal ignores, read as `ONE`.
+/// below can be normalised without a cache schema change. Two snapshots that
+/// build the same Metal pipeline share one key: no blend, mask or colour
+/// format without a colour output, and the factors of a `MIN` or `MAX`
+/// equation, which Metal ignores, read as `ONE`. Every attachment's blend
+/// factors are a function of the key.
 #[derive(Debug, PartialEq, Eq, Hash)]
 pub struct PipelineKey {
     vs_fn: MetalHandle<MTLFunctionKind>,
@@ -417,10 +421,12 @@ pub struct PipelineKey {
     /// `SEPARATE_ALPHA_BLEND` stays clear: the alpha factors and operation
     /// below already carry its effect.
     flags: PipelineRsFlags,
-    /// `HAS_DEPTH`, `HAS_STENCIL` and `HAS_COLOR_OUTPUT`.
+    /// `HAS_DEPTH`, `HAS_STENCIL` and `HAS_COLOR_OUTPUT`, plus `COLOR_HAS_ALPHA` under MRT blending.
     ///
-    /// `COLOR_HAS_ALPHA` stays clear: it reaches Metal only through the
-    /// destination-alpha factors, which the key holds after the clamp.
+    /// Without an extra target blending, `COLOR_HAS_ALPHA` reaches Metal only
+    /// through target 0's destination-alpha factors, which the key then holds
+    /// after the clamp, so it stays clear. See [`key_from_snapshot`] for the
+    /// MRT case.
     attach: PipelineAttachFlags,
     src_blend: BlendFactor,
     dst_blend: BlendFactor,
@@ -432,10 +438,11 @@ pub struct PipelineKey {
     color_format: PixelFormat,
     /// Render targets 1..3: presence, format, effective write mask, alpha clamp.
     ///
-    /// The alpha bit stands in for the per-target blend factors: they differ
-    /// from target 0's only through the destination-alpha clamp, which is a
-    /// pure function of this bit, so keying the bit keys the factors. It is
-    /// zero while blending is off, when no factor reaches Metal.
+    /// The alpha bit stands in for the per-target blend factors: each target
+    /// clamps the shared unclamped factors by its own bit, and the key holds
+    /// the unclamped factors whenever an extra target blends, so keying the
+    /// bit keys the factors. It is zero while blending is off, when no factor
+    /// reaches Metal.
     extra_present_mask: u8,
     extra_has_alpha_mask: u8,
     extra_formats: [PixelFormat; 3],
@@ -518,6 +525,20 @@ pub fn vertex_layouts_from_snapshot(s: &PipelineSnapshot) -> Vec<VertexBufferLay
 pub fn key_from_snapshot(s: &PipelineSnapshot, vertex_attrs: &[VertexAttrDesc]) -> PipelineKey {
     let blend = effective_blend(s);
     let color = s.has_color_output();
+    // With an extra target blending, the factors are keyed before target 0's
+    // destination-alpha clamp, with `COLOR_HAS_ALPHA` beside them: each
+    // target clamps them by its own alpha bit, and target 0's clamped
+    // factors alone would let two snapshots that differ only in a factor
+    // target 0 clamps away share a key while an extra target sees them apart.
+    // Without one, the clamped factors are the whole effect of the bit.
+    let mrt_blend = blend.enable && s.extra.present_mask != 0;
+    let factor = |d3d: u32| {
+        if mrt_blend {
+            d3d_to_metal_blend(d3d)
+        } else {
+            d3d_to_metal_blend_rt(d3d, s.color_has_alpha())
+        }
+    };
     let mut flags = PipelineRsFlags::empty();
     flags.set(PipelineRsFlags::BLEND_ENABLE, blend.enable);
     flags.set(
@@ -530,12 +551,16 @@ pub fn key_from_snapshot(s: &PipelineSnapshot, vertex_attrs: &[VertexAttrDesc]) 
         vertex_attrs_hash: VertexAttrsHash::from_attrs(vertex_attrs),
         stream_layouts: s.stream_layouts,
         flags,
-        attach: s.attach.difference(PipelineAttachFlags::COLOR_HAS_ALPHA),
-        src_blend: d3d_to_metal_blend_rt(blend.src, s.color_has_alpha()),
-        dst_blend: d3d_to_metal_blend_rt(blend.dst, s.color_has_alpha()),
+        attach: if mrt_blend {
+            s.attach
+        } else {
+            s.attach.difference(PipelineAttachFlags::COLOR_HAS_ALPHA)
+        },
+        src_blend: factor(blend.src),
+        dst_blend: factor(blend.dst),
         blend_op: d3d_to_metal_blend_op(blend.op),
-        src_blend_alpha: d3d_to_metal_blend_rt(blend.src_alpha, s.color_has_alpha()),
-        dst_blend_alpha: d3d_to_metal_blend_rt(blend.dst_alpha, s.color_has_alpha()),
+        src_blend_alpha: factor(blend.src_alpha),
+        dst_blend_alpha: factor(blend.dst_alpha),
         blend_op_alpha: d3d_to_metal_blend_op(blend.op_alpha),
         // Without a colour output neither reaches Metal.
         color_write_mask: if color {

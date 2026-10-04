@@ -572,12 +572,11 @@ pub struct DeviceInner {
     rs_warn_fired: [u64; RENDER_STATE_COUNT.div_ceil(64)],
     ff_state: FfState,
     vs_draw: mtld3d_core::vs_draw::VsDrawState,
-    /// Scissor rect set by `SetScissorRect`.
-    ///
-    /// The encoder thread reads this each draw and emits a Metal
-    /// `setScissorRect` command gated on `D3DRS_SCISSORTESTENABLE`.
-    /// `(0, 0, 0, 0)` means "unset — use viewport".
     /// `SetScissorRect`'s rect as the game wrote it, which `GetScissorRect` hands back.
+    ///
+    /// The render-state snapshot narrows it to the region it lets through,
+    /// which the encoder emits as `setScissorRect` while
+    /// `D3DRS_SCISSORTESTENABLE` is on.
     scissor_rect: D3DRECT,
     /// Viewport set by `SetViewport`.
     ///

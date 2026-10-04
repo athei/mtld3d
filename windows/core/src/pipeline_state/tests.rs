@@ -389,6 +389,78 @@ fn params_match_key_on_default_snapshot() {
         assert_eq!(p.extra[i].format, k.extra_formats[i]);
         assert_eq!(p.extra[i].write_mask, k.extra_write_masks[i]);
     }
+
+    // With an extra target blending, the key holds the factors before any
+    // clamp, which is what an alpha-bearing extra target blends with, and it
+    // keeps target 0's alpha bit beside them.
+    let mut s = with_rt1();
+    s.rs.src_blend = narrow(D3DBLEND_DESTALPHA);
+    s.rs.dst_blend = narrow(D3DBLEND_INVDESTALPHA);
+    let k = key_of(&s);
+    let p = params_of(&s);
+    assert_eq!(p.attach, k.attach);
+    assert_eq!(
+        (
+            p.extra[0].src_blend,
+            p.extra[0].dst_blend,
+            p.extra[0].src_blend_alpha,
+            p.extra[0].dst_blend_alpha,
+        ),
+        (k.src_blend, k.dst_blend, k.src_blend_alpha, k.dst_blend_alpha)
+    );
+    assert_eq!(p.src_blend, k.src_blend, "an A8 target 0 clamps nothing");
+}
+
+#[test]
+fn an_extra_target_keeps_factors_its_alpha_sees_apart() {
+    // Target 0 is X8, so its destination-alpha factors clamp to ONE / ZERO;
+    // target 1 is A8 and blends with them as written. Snapshots that differ
+    // only in a factor target 0 clamps away build different pipelines for
+    // target 1, so they must not share a key.
+    let x8_rt0 = |f: fn(&mut PipelineSnapshot)| {
+        let mut s = with_rt1();
+        s.attach.remove(PipelineAttachFlags::COLOR_HAS_ALPHA);
+        f(&mut s);
+        s
+    };
+    let pairs = [
+        (
+            x8_rt0(|s| s.rs.src_blend = narrow(D3DBLEND_DESTALPHA)),
+            x8_rt0(|s| s.rs.src_blend = narrow(D3DBLEND_ONE)),
+        ),
+        (
+            x8_rt0(|s| s.rs.dst_blend = narrow(D3DBLEND_INVDESTALPHA)),
+            x8_rt0(|s| s.rs.dst_blend = narrow(D3DBLEND_ZERO)),
+        ),
+        (
+            x8_rt0(|s| {
+                s.rs.src_blend = narrow(D3DBLEND_ONE);
+                s.rs.dst_blend = narrow(D3DBLEND_ZERO);
+                s.rs.flags.insert(PipelineRsFlags::SEPARATE_ALPHA_BLEND);
+                s.rs.src_blend_alpha = narrow(D3DBLEND_DESTALPHA);
+                s.rs.dst_blend_alpha = narrow(D3DBLEND_ZERO);
+                s.rs.blend_op_alpha = narrow(D3DBLENDOP_ADD);
+            }),
+            x8_rt0(|s| {
+                s.rs.src_blend = narrow(D3DBLEND_ONE);
+                s.rs.dst_blend = narrow(D3DBLEND_ZERO);
+            }),
+        ),
+    ];
+    for (b, c) in &pairs {
+        let (pb, pc) = (params_of(b), params_of(c));
+        assert_eq!(
+            (pb.src_blend, pb.dst_blend, pb.src_blend_alpha, pb.dst_blend_alpha),
+            (pc.src_blend, pc.dst_blend, pc.src_blend_alpha, pc.dst_blend_alpha),
+            "target 0 sees the two alike"
+        );
+        assert_ne!(
+            blend_fields(&params_of(b)),
+            blend_fields(&params_of(c)),
+            "target 1 sees them apart"
+        );
+        assert_ne!(key_of(b), key_of(c));
+    }
 }
 
 #[test]
