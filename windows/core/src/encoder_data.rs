@@ -469,6 +469,10 @@ pub struct SetViewportOp {
 
 pub struct SetVertexSamplerOp {
     pub slot: u8,
+    /// The vertex sampler's `D3DSAMP_*` states, indexed by state.
+    ///
+    /// Index [`crate::sampler_state::TEXTURE_LOD_SLOT`] is always 0: a vertex
+    /// sample names its level, so no texture LOD reaches a vertex row.
     pub state: [u32; SAMPLER_STATE_COUNT],
 }
 

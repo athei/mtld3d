@@ -3193,8 +3193,8 @@ fn bump_lum_exprs(stage: u16) -> (String, String) {
 ///
 /// `suffix` is the trailing `, level(...)` (texldl) or `, gradientNN(...)`
 /// (texldd) text; `instruction_bias` is the `texldb` coordinate `.w`.
-/// `sample_compare` accepts the explicit-LOD suffixes unchanged, while depth
-/// textures have no mip chain and ignore the instruction bias.
+/// `sample_compare` accepts the explicit-LOD suffixes unchanged; depth
+/// samples ignore the instruction bias and pin the stage's finest level.
 fn sample_or_compare(
     ctx: &EmitContext,
     sampler_idx: u16,
@@ -3216,9 +3216,10 @@ fn sample_or_compare(
         // INTZ/DF24/DF16 read normalized depth through `.sample()` instead of
         // a shadow comparison. INTZ broadcasts it; DF formats fill GBA as 0,0,1.
         // The projective `.q` divide, if any,
-        // was already folded into `coord_expr` by the texldp caller. Pin
-        // `level(0)` for the same no-mip / discard-derivative
-        // reason as the compare path; texldl/texldd override via their suffix.
+        // was already folded into `coord_expr` by the texldp caller. Pin the
+        // stage's finest level (`pinned_depth_level`) for the same
+        // discard-derivative reason as the compare path; texldl/texldd
+        // override via their suffix.
         let default_level = pinned_depth_level(ctx, sampler_idx);
         let lod_suffix = if suffix_str.is_empty() {
             default_level.as_str()
@@ -3241,9 +3242,10 @@ fn sample_or_compare(
         // gradients in a 2×2 quad where a neighbour ran
         // `discard_fragment` are *undefined* per the Metal spec —
         // exactly the case for alpha-cut foliage shadow receivers.
-        // Force `level(0)` to pin the mip and eliminate the
-        // discard-driven derivative dependency. `texldl` / `texldd`
-        // already pass their own suffix and override this default.
+        // Pin the stage's finest level (`pinned_depth_level`, level 0
+        // unless the stage clamps) to eliminate the discard-driven
+        // derivative dependency. `texldl` / `texldd` already pass their own
+        // suffix and override this default.
         let default_level = pinned_depth_level(ctx, sampler_idx);
         let lod_suffix = if suffix_str.is_empty() {
             default_level.as_str()
@@ -3276,11 +3278,6 @@ fn sample_or_compare(
     }
 }
 
-/// Sample a programmable SM2+ texture and apply the sampler operand's result swizzle.
-///
-/// D3D9 applies this swizzle after lookup and before destination saturation and
-/// masking. `translate_instruction` passes this expression to `store_dst`, so
-/// those later operations retain their required order.
 /// The `level(...)` suffix of a depth sample that names no level of its own.
 ///
 /// Depth samples pin a level instead of computing one (see
@@ -3295,6 +3292,11 @@ fn pinned_depth_level(ctx: &EmitContext, sampler_idx: u16) -> String {
     }
 }
 
+/// Sample a programmable SM2+ texture and apply the sampler operand's result swizzle.
+///
+/// D3D9 applies this swizzle after lookup and before destination saturation and
+/// masking. `translate_instruction` passes this expression to `store_dst`, so
+/// those later operations retain their required order.
 fn sample_with_result_swizzle(
     ctx: &EmitContext,
     sampler: &SrcOperand,

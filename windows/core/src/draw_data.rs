@@ -319,6 +319,11 @@ pub enum IndexSource {
 #[repr(C, align(8))]
 pub struct StageBinding {
     pub texture_id: crate::ids::TextureId,
+    /// The stage's `D3DSAMP_*` states, indexed by state.
+    ///
+    /// Index [`crate::sampler_state::TEXTURE_LOD_SLOT`], which names no
+    /// sampler state, carries the bound texture's `SetLOD`, which the sampler
+    /// translation and the explicit-LOD rows read on the encoder thread.
     pub sampler_state: [u32; SAMPLER_STATE_COUNT],
 }
 

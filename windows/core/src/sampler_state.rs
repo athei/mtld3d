@@ -252,6 +252,13 @@ impl SamplerSnapshot {
     /// point and the shader reads exact stored depths, which is what position
     /// reconstruction wants anyway. Comparison samplers are left as
     /// configured: linear there is hardware PCF, which Apple GPUs do support.
+    ///
+    /// Mipmapping goes off with the filters, so a stage with a non-zero
+    /// [`Self::max_mip_level`] becomes a pinned sampler
+    /// (`lodMinClamp = lodMaxClamp` = that level, see
+    /// [`description_from_snapshot`]), and a raw-depth `texldl` at a coarser
+    /// LOD is held at that level, while one with no finest level reads level 0
+    /// whatever its LOD.
     pub const fn force_point_filter(&mut self) {
         self.min_filter = TEXF_POINT;
         self.mag_filter = TEXF_POINT;
