@@ -4,12 +4,12 @@
 //! the cache key, which is what makes a silently dropped sampler state
 //! impossible: a new field that never reaches the key fails here. The rest pins
 //! the packed key layout by bit position, the 1:1 filter mapping (no implicit
-//! promote), and that `description_from_snapshot` agrees with the key it was given.
+//! promote, the filters no sampler offers reading as LINEAR), and that `description_from_snapshot` agrees with the key it was given.
 
-use mtld3d_shared::mtl::MinMagFilter;
+use mtld3d_shared::mtl::{MinMagFilter, MipFilter};
 use mtld3d_types::{
-    D3DTADDRESS_CLAMP, D3DTADDRESS_WRAP, D3DTEXF_ANISOTROPIC, D3DTEXF_GAUSSIANQUAD, D3DTEXF_LINEAR,
-    D3DTEXF_NONE,
+    D3DTADDRESS_CLAMP, D3DTADDRESS_WRAP, D3DTEXF_ANISOTROPIC, D3DTEXF_CONVOLUTIONMONO,
+    D3DTEXF_GAUSSIANQUAD, D3DTEXF_LINEAR, D3DTEXF_NONE, D3DTEXF_PYRAMIDALQUAD,
 };
 
 use super::*;
@@ -296,7 +296,7 @@ fn in_space_states_keep_their_key_layout() {
     ss[D3DSAMP_SRGBTEXTURE as usize] = 1;
     assert_eq!(
         key_from_snapshot(&snapshot_from_state(&ss, false)).raw(),
-        0x142_1013_3223,
+        0x142_1013_3222,
         "anisotropic min, linear mag and mip, clamped, sRGB, white border"
     );
 }
@@ -329,68 +329,96 @@ fn max_anisotropy_needs_an_anisotropic_filter() {
 }
 
 #[test]
-fn an_in_space_filter_the_translator_skips_still_reaches_its_fallback() {
-    // `D3DTEXF_GAUSSIANQUAD` is a D3D9 filter the Metal translation has no
-    // arm for. It is inside the space, so it keeps reaching that translator's
-    // own logged fallback instead of being substituted here.
-    let mut ss = linear_state();
-    ss[D3DSAMP_MINFILTER as usize] = D3DTEXF_GAUSSIANQUAD;
-    let s = snapshot_from_state(&ss, false);
-    assert_eq!(u32::from(s.min_filter), D3DTEXF_GAUSSIANQUAD);
-    let p = description_from_snapshot(&s, key_from_snapshot(&s));
-    assert_eq!(p.min_filter, MinMagFilter::Nearest);
+fn filters_without_a_sampler_filter_read_as_linear() {
+    // The quad filters and CONVOLUTIONMONO name filtering no sampler offers;
+    // they filter linearly, as ANISOTROPIC does apart from its anisotropy.
+    for filter in [
+        D3DTEXF_ANISOTROPIC,
+        D3DTEXF_PYRAMIDALQUAD,
+        D3DTEXF_GAUSSIANQUAD,
+        D3DTEXF_CONVOLUTIONMONO,
+    ] {
+        let mut ss = sampler_state_defaults();
+        ss[D3DSAMP_MINFILTER as usize] = filter;
+        ss[D3DSAMP_MAGFILTER as usize] = filter;
+        ss[D3DSAMP_MIPFILTER as usize] = filter;
+        let s = snapshot_from_state(&ss, false);
+        assert_eq!(u32::from(s.min_filter), D3DTEXF_LINEAR, "min {filter}");
+        assert_eq!(u32::from(s.mag_filter), D3DTEXF_LINEAR, "mag {filter}");
+        assert_eq!(u32::from(s.mip_filter), D3DTEXF_LINEAR, "mip {filter}");
+        let p = description_from_snapshot(&s, key_from_snapshot(&s));
+        assert_eq!(p.min_filter, MinMagFilter::Linear, "min {filter}");
+        assert_eq!(p.mag_filter, MinMagFilter::Linear, "mag {filter}");
+        assert_eq!(p.mip_filter, MipFilter::Linear, "mip {filter}");
+    }
 }
 
 #[test]
-fn out_of_space_states_read_the_d3d9_default() {
-    // `SetSamplerState` takes a DWORD. 0x12 and 0x13 sit above the four bits
-    // the key packs, so the low nibble used to name LINEAR and CLAMP while
-    // the translation took its unmapped arm.
-    let mut ss = linear_state();
-    ss[D3DSAMP_MINFILTER as usize] = 0x12;
+fn a_min_or_mag_filter_of_none_samples_as_point() {
+    // NONE turns mipmapping off but names no min or mag filter; it samples
+    // as POINT and keys as POINT, while the mip filter keeps it.
+    let mut ss = sampler_state_defaults();
+    ss[D3DSAMP_MINFILTER as usize] = D3DTEXF_NONE;
+    ss[D3DSAMP_MAGFILTER as usize] = D3DTEXF_NONE;
+    let s = snapshot_from_state(&ss, false);
+    assert_eq!(u32::from(s.min_filter), D3DTEXF_POINT);
+    assert_eq!(u32::from(s.mag_filter), D3DTEXF_POINT);
+    assert_eq!(u32::from(s.mip_filter), D3DTEXF_NONE);
+    assert_eq!(
+        key_from_snapshot(&s),
+        key_from_snapshot(&snapshot_from_state(&sampler_state_defaults(), false))
+    );
+}
+
+#[test]
+fn out_of_space_states_read_their_d3d9_reading() {
+    // `SetSamplerState` takes a DWORD. A filter no `D3DTEXF_*` names is above
+    // LINEAR and filters linearly; an address mode no `D3DTADDRESS_*` names
+    // reads the default WRAP. 0x11 and 0x13 sit above the four bits the key
+    // packs, so their low nibbles name POINT and CLAMP.
+    let mut ss = sampler_state_defaults();
+    ss[D3DSAMP_MINFILTER as usize] = 0x11;
     ss[D3DSAMP_MAGFILTER as usize] = 0x1_0000;
     ss[D3DSAMP_MIPFILTER as usize] = 9;
     ss[D3DSAMP_ADDRESSU as usize] = 0x13;
     ss[D3DSAMP_ADDRESSV as usize] = 0;
     ss[D3DSAMP_ADDRESSW as usize] = 6;
     let s = snapshot_from_state(&ss, false);
-    assert_eq!(u32::from(s.min_filter), D3DTEXF_POINT, "MINFILTER default");
-    assert_eq!(u32::from(s.mag_filter), D3DTEXF_POINT, "MAGFILTER default");
-    assert_eq!(u32::from(s.mip_filter), D3DTEXF_NONE, "MIPFILTER default");
+    assert_eq!(u32::from(s.min_filter), D3DTEXF_LINEAR, "MINFILTER");
+    assert_eq!(u32::from(s.mag_filter), D3DTEXF_LINEAR, "MAGFILTER");
+    assert_eq!(u32::from(s.mip_filter), D3DTEXF_LINEAR, "MIPFILTER");
     assert_eq!(u32::from(s.address_u), D3DTADDRESS_WRAP, "ADDRESSU default");
     assert_eq!(u32::from(s.address_v), D3DTADDRESS_WRAP, "ADDRESSV default");
     assert_eq!(u32::from(s.address_w), D3DTADDRESS_WRAP, "ADDRESSW default");
 
-    // The defaults the substitution reads are the spec ones.
+    // The default the address substitution reads is the spec one.
     let defaults = sampler_state_defaults();
-    assert_eq!(defaults[D3DSAMP_MINFILTER as usize], D3DTEXF_POINT);
-    assert_eq!(defaults[D3DSAMP_MIPFILTER as usize], D3DTEXF_NONE);
     assert_eq!(defaults[D3DSAMP_ADDRESSU as usize], D3DTADDRESS_WRAP);
 }
 
 #[test]
-fn out_of_space_states_key_as_the_default_they_read() {
+fn out_of_space_states_key_as_what_they_read() {
     // The bug: a state above bit 3 keyed as its low nibble while the params
     // translated the whole DWORD, so whichever of the two states reached the
     // cache first decided what the other one drew with.
     let mut ss = linear_state();
-    ss[D3DSAMP_MINFILTER as usize] = 0x12;
+    ss[D3DSAMP_MINFILTER as usize] = 0x11;
     ss[D3DSAMP_ADDRESSU as usize] = 0x13;
     let wide = key_from_snapshot(&snapshot_from_state(&ss, false));
 
     let mut narrow_ss = linear_state();
-    narrow_ss[D3DSAMP_MINFILTER as usize] = D3DTEXF_POINT;
+    narrow_ss[D3DSAMP_MINFILTER as usize] = D3DTEXF_LINEAR;
     narrow_ss[D3DSAMP_ADDRESSU as usize] = D3DTADDRESS_WRAP;
     let narrow = key_from_snapshot(&snapshot_from_state(&narrow_ss, false));
-    assert_eq!(wide, narrow, "the substituted defaults key as themselves");
+    assert_eq!(wide, narrow, "the substituted readings key as themselves");
 
     let mut aliased = linear_state();
-    aliased[D3DSAMP_MINFILTER as usize] = D3DTEXF_LINEAR;
+    aliased[D3DSAMP_MINFILTER as usize] = D3DTEXF_POINT;
     aliased[D3DSAMP_ADDRESSU as usize] = D3DTADDRESS_CLAMP;
     assert_ne!(
         wide,
         key_from_snapshot(&snapshot_from_state(&aliased, false)),
-        "0x12 must not share the LINEAR sampler's key"
+        "0x11 must not share the POINT sampler's key"
     );
 }
 

@@ -9,8 +9,8 @@ use mtld3d_types::{
     D3DRS_SRCBLEND, D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_BORDERCOLOR, D3DSAMP_MAGFILTER,
     D3DSAMP_MAXANISOTROPY, D3DSAMP_MAXMIPLEVEL, D3DSAMP_MINFILTER, D3DSAMP_MIPFILTER,
     D3DSAMP_MIPMAPLODBIAS, D3DSAMP_SRGBTEXTURE, D3DTA_TEXTURE, D3DTADDRESS_BORDER,
-    D3DTADDRESS_CLAMP, D3DTADDRESS_WRAP, D3DTEXF_ANISOTROPIC, D3DTEXF_LINEAR, D3DTEXF_NONE,
-    D3DTEXF_POINT, D3DTOP_SELECTARG1, D3DTSS_ALPHAARG1, D3DTSS_ALPHAOP,
+    D3DTADDRESS_CLAMP, D3DTADDRESS_WRAP, D3DTEXF_ANISOTROPIC, D3DTEXF_GAUSSIANQUAD, D3DTEXF_LINEAR,
+    D3DTEXF_NONE, D3DTEXF_POINT, D3DTEXF_PYRAMIDALQUAD, D3DTOP_SELECTARG1, D3DTSS_ALPHAARG1, D3DTSS_ALPHAOP,
 };
 
 const BLACK: u32 = 0xFF00_0000;
@@ -462,9 +462,9 @@ fn point_and_linear_filtering_differ() {
 
 /// A `D3DSAMP_MINFILTER` DWORD wider than the four bits the sampler key packs.
 ///
-/// Its low nibble is `D3DTEXF_LINEAR`, so before the snapshot narrowed the
-/// state the key named LINEAR while the translation took its unmapped arm.
-const WIDE_FILTER: u32 = 0x12;
+/// Its low nibble is `D3DTEXF_POINT`, so a key that kept only the nibble would
+/// hand this state the POINT sampler while the translation reads LINEAR.
+const WIDE_FILTER: u32 = 0x11;
 
 /// A `D3DSAMP_ADDRESSU` DWORD wider than those four bits.
 ///
@@ -472,28 +472,29 @@ const WIDE_FILTER: u32 = 0x12;
 const WIDE_ADDRESS: u32 = 0x13;
 
 #[test]
-fn a_filter_above_the_key_width_reads_the_d3d9_default() {
+fn a_filter_above_the_key_width_samples_as_linear() {
     // `SetSamplerState` takes a DWORD and stores it, so the filter states are
-    // game input. A value no `D3DTEXF_*` names reads as the D3D9 default,
-    // POINT, however many samplers the device has already built: the state
+    // game input. Every value above `D3DTEXF_LINEAR`, named or not, filters
+    // linearly, however many samplers the device has already built: the state
     // that shares its low nibble must not hand over its sampler.
     let h = Harness::new();
     let tex = rgbw_2x2(&h);
     let quad = uv_quad(1.0);
 
-    arm_texture(&h, &tex, D3DTADDRESS_CLAMP, D3DTEXF_POINT);
-    h.render_once(BLACK, |d| {
-        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad), 0);
-    });
-    let point = h.read_pixel(320, 240); // dead centre — texel boundary
-
-    // Build the LINEAR sampler first. Its key is what a filter of 0x12 used
-    // to compute, so this is the draw whose object the next one would reuse.
     arm_texture(&h, &tex, D3DTADDRESS_CLAMP, D3DTEXF_LINEAR);
     h.render_once(BLACK, |d| {
         assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad), 0);
     });
-    let linear = h.read_pixel(320, 240);
+    let linear = h.read_pixel(320, 240); // dead centre, a texel boundary
+
+    // Build the POINT sampler last. Its key is what a filter of 0x11 would
+    // compute from the low nibble, so this is the object the next draw would
+    // reuse.
+    arm_texture(&h, &tex, D3DTADDRESS_CLAMP, D3DTEXF_POINT);
+    h.render_once(BLACK, |d| {
+        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad), 0);
+    });
+    let point = h.read_pixel(320, 240);
     assert_ne!(point, linear, "POINT and LINEAR must differ here");
 
     arm_texture(&h, &tex, D3DTADDRESS_CLAMP, WIDE_FILTER);
@@ -513,8 +514,46 @@ fn a_filter_above_the_key_width_reads_the_d3d9_default() {
 
     assert_eq!(
         h.read_pixel(320, 240),
-        point,
-        "a filter outside D3DTEXF_* samples as the default POINT"
+        linear,
+        "a filter above D3DTEXF_LINEAR samples as LINEAR"
+    );
+}
+
+#[test]
+fn quad_filters_sample_as_linear() {
+    // The pyramidal and Gaussian quad filters have no Metal sampler; like
+    // every filter above LINEAR they filter linearly, for the min and mag
+    // filters and for the mip filter.
+    let h = Harness::new();
+    {
+        let tex = rgbw_2x2(&h);
+        let quad = uv_quad(1.0);
+        let draw = |filter: u32| {
+            arm_texture(&h, &tex, D3DTADDRESS_CLAMP, filter);
+            h.render_once(BLACK, |d| {
+                assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad), 0);
+            });
+            h.read_pixel(320, 240) // dead centre, a texel boundary
+        };
+        let linear = draw(D3DTEXF_LINEAR);
+        assert_ne!(draw(D3DTEXF_POINT), linear, "POINT and LINEAR must differ here");
+        assert_eq!(draw(D3DTEXF_PYRAMIDALQUAD), linear, "PYRAMIDALQUAD min and mag filter");
+        assert_eq!(draw(D3DTEXF_GAUSSIANQUAD), linear, "GAUSSIANQUAD min and mag filter");
+    }
+
+    // A mip filter that filters selects levels: MAXMIPLEVEL 3 moves the
+    // sample to level 3, where an unmipmapped sampler would read level 0.
+    let tex = mip_tinted_texture(&h);
+    arm_mip_tinted(&h, &tex);
+    assert_eq!(
+        h.set_sampler_state(0, D3DSAMP_MIPFILTER, D3DTEXF_GAUSSIANQUAD),
+        0,
+        "SetSamplerState(MIPFILTER)"
+    );
+    assert_eq!(
+        sample_at_max_mip_level(&h, 3),
+        MIP_TINTS[3],
+        "a GAUSSIANQUAD mip filter mipmaps like LINEAR"
     );
 }
 
