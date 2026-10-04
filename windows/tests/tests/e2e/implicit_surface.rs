@@ -688,15 +688,15 @@ fn a_reset_whose_back_buffer_is_refused_leaves_no_destroyed_texture_bound() {
     );
 }
 
-/// A `Reset` whose new depth format has no Metal mapping leaves no destroyed depth bound.
+/// A `Reset` whose new depth format is no depth format leaves no destroyed depth bound.
 ///
-/// The `Reset` destroys the implicit depth texture before it finds the new
-/// `AutoDepthStencilFormat` unusable, and fails, on a same-size request and
-/// on one that also resizes the back buffer. Either way no depth surface is
-/// reported, a `Clear` recorded before the next `Reset` reaches the GPU with
-/// that `Reset`'s flush and must not find the destroyed depth texture, which
-/// the depth surface bound by hand named, and the next `Reset` restores the
-/// depth surface so the device draws depth-tested again.
+/// The `Reset` refuses the `AutoDepthStencilFormat` before it touches the
+/// implicit surfaces, on a same-size request and on one that also resizes
+/// the back buffer, so the implicit depth surface is still the one reported,
+/// as after any rejected `Reset`. A `Clear` recorded before the next `Reset`
+/// reaches the GPU with that `Reset`'s flush against a depth texture that
+/// still exists, and the next `Reset` keeps the depth surface so the device
+/// draws depth-tested again.
 #[test]
 fn a_reset_with_an_unusable_depth_format_leaves_no_destroyed_depth_bound() {
     let h = Harness::with_depth();
@@ -728,10 +728,10 @@ fn a_reset_with_an_unusable_depth_format_leaves_no_destroyed_depth_bound() {
         assert_eq!(h.test_cooperative_level(), D3DERR_DEVICENOTRESET);
         let (hr, depth) = h.depth_stencil_surface_hr();
         assert_eq!(
-            hr, D3DERR_NOTFOUND,
-            "{case}: no depth surface after the failure"
+            hr, D3D_OK,
+            "{case}: the implicit depth surface outlives the refused Reset"
         );
-        assert!(depth.is_none());
+        assert!(depth.is_some());
         assert_eq!(
             h.clear(D3DCLEAR_TARGET, RED, 1.0, 0),
             D3D_OK,
