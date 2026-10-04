@@ -8429,13 +8429,14 @@ extern "system" fn device_stretch_rect(
 
     // A cross-format 1:1 copy into an offscreen-plain destination has no GPU
     // path: the render-quad conversion needs a render-target destination, and
-    // the 1:1 blit can't convert. Do it on the CPU — decode each source pixel
+    // the 1:1 blit can't convert. Do it on the CPU: decode each source pixel
     // and re-encode into the destination texture's staging, then upload that
     // staging so a later sample (or same-format StretchRect out of it) and a
     // later LockRect both see the converted pixels. Do NOT push the render-quad
-    // op — it would bind a non-render-target
-    // texture as a colour attachment. `WoW` never hits offscreen→offscreen
-    // cross-format, so this path is conformance-only.
+    // op, which would bind a non-render-target texture as a colour attachment.
+    // This serves the offscreen pairs of two storages, the YUV decodes, and an
+    // X source into its A counterpart, whose padding the converter reads as
+    // alpha one.
     if cross_format
         && !scaling
         && dst_info
