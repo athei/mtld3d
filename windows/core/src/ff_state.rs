@@ -1412,12 +1412,27 @@ impl FfState {
         render_states: &[u32; RENDER_STATE_COUNT],
         bound_texture_mask: u8,
     ) -> FfPsKey {
-        let mut stages = [FfStage::default(); 8];
+        // The cascade ends at the first `D3DTOP_DISABLE` colour operation,
+        // narrowed as `build_vs_key` narrows it so both keys end the chain at
+        // one stage. Nothing reads that stage past its operation, or any
+        // stage after it, or their projected bits, so every such stage keys
+        // as a bare `DISABLE` and its bit stays clear: a game's leftover
+        // state on stages the draw never reaches forks no pixel shader.
+        let disabled = FfStage {
+            color_op: u8::try_from(D3DTOP_DISABLE).expect("D3DTOP_DISABLE fits u8"),
+            ..FfStage::default()
+        };
+        let mut stages = [disabled; 8];
+        let mut active_stages = stages.len();
         for (i, stage) in stages.iter_mut().enumerate() {
             let s = &self.texture_stage_states[i];
             let index = u8::try_from(i).expect("stage index ≤ 7 fits u8");
             let to_u8 = |ty: u32| stage_enum_value(s, index, ty);
             stage.color_op = to_u8(D3DTSS_COLOROP);
+            if u32::from(stage.color_op) == D3DTOP_DISABLE {
+                active_stages = i;
+                break;
+            }
             stage.color_arg1 = to_u8(D3DTSS_COLORARG1);
             stage.color_arg2 = to_u8(D3DTSS_COLORARG2);
             stage.alpha_op = to_u8(D3DTSS_ALPHAOP);
@@ -1436,10 +1451,11 @@ impl FfState {
                 FfStageResult::Current
             });
         }
+        let active_mask = u8::try_from((1u16 << active_stages) - 1).expect("eight stages fit u8");
         FfPsKey {
             stages,
             specular_add: render_states[D3DRS_SPECULARENABLE as usize] != 0,
-            tt_projected_mask: self.tt_projected_mask(),
+            tt_projected_mask: self.tt_projected_mask() & active_mask,
         }
     }
 

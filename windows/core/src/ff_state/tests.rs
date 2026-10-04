@@ -2992,3 +2992,103 @@ fn texture_stage_state_indices_clamp_into_the_table() {
         );
     }
 }
+
+/// State on a stage past the first `D3DTOP_DISABLE` leaves the pixel key.
+///
+/// The operations, arguments, result register, bound texture and projected
+/// flag of stages the cascade never reaches key nothing, so two devices that
+/// differ only there build equal keys, with the cascade ending where the VS
+/// key ends it.
+#[test]
+fn ps_key_ignores_stages_past_the_first_disable() {
+    use mtld3d_types::{
+        D3DTA_TEMP, D3DTOP_ADD, D3DTOP_SELECTARG1, D3DTSS_ALPHAARG1, D3DTSS_COLORARG1,
+        D3DTSS_RESULTARG, D3DTTFF_COUNT3, D3DTTFF_PROJECTED,
+    };
+    let leftover = |ff: &mut FfState, stage: usize| {
+        for (ty, value) in [
+            (D3DTSS_COLOROP, D3DTOP_ADD),
+            (D3DTSS_COLORARG1, D3DTA_TEXTURE),
+            (D3DTSS_ALPHAOP, D3DTOP_SELECTARG1),
+            (D3DTSS_ALPHAARG1, D3DTA_TEXTURE),
+            (D3DTSS_RESULTARG, D3DTA_TEMP),
+            (
+                D3DTSS_TEXTURETRANSFORMFLAGS,
+                D3DTTFF_COUNT3 | D3DTTFF_PROJECTED,
+            ),
+        ] {
+            ff.set_texture_stage_state(stage, ty as usize, value);
+        }
+    };
+    // Stage 1 keeps its default DISABLE, so stages 1..8 are past the cascade.
+    let mut plain = FfState::new();
+    plain.set_texture_stage_state(0, D3DTSS_COLOROP as usize, D3DTOP_MODULATE);
+    let mut stale = FfState::new();
+    stale.set_texture_stage_state(0, D3DTSS_COLOROP as usize, D3DTOP_MODULATE);
+    // Stage 1's own arguments and flags, and the whole of stage 2.
+    stale.set_texture_stage_state(1, D3DTSS_COLORARG1 as usize, D3DTA_TEXTURE);
+    stale.set_texture_stage_state(
+        1,
+        D3DTSS_TEXTURETRANSFORMFLAGS as usize,
+        D3DTTFF_COUNT3 | D3DTTFF_PROJECTED,
+    );
+    leftover(&mut stale, 2);
+    assert_eq!(
+        plain.build_ps_key(&rs(), 0b001),
+        stale.build_ps_key(&rs(), 0b111),
+        "stages 1.. past stage 1's DISABLE"
+    );
+}
+
+/// The same state before the first `D3DTOP_DISABLE` keys a different pixel shader.
+#[test]
+fn ps_key_keeps_stages_before_the_first_disable() {
+    use mtld3d_types::{D3DTOP_ADD, D3DTTFF_COUNT3, D3DTTFF_PROJECTED};
+    let mut plain = FfState::new();
+    plain.set_texture_stage_state(0, D3DTSS_COLOROP as usize, D3DTOP_MODULATE);
+    let mut changed = FfState::new();
+    changed.set_texture_stage_state(0, D3DTSS_COLOROP as usize, D3DTOP_ADD);
+    assert_ne!(
+        plain.build_ps_key(&rs(), 0b1),
+        changed.build_ps_key(&rs(), 0b1),
+        "stage 0's operation"
+    );
+    let mut projected = FfState::new();
+    projected.set_texture_stage_state(0, D3DTSS_COLOROP as usize, D3DTOP_MODULATE);
+    projected.set_texture_stage_state(
+        0,
+        D3DTSS_TEXTURETRANSFORMFLAGS as usize,
+        D3DTTFF_COUNT3 | D3DTTFF_PROJECTED,
+    );
+    let key = projected.build_ps_key(&rs(), 0b1);
+    assert_eq!(key.tt_projected_mask, 0b1, "stage 0's projected bit");
+    assert_ne!(plain.build_ps_key(&rs(), 0b1), key);
+    assert_ne!(
+        plain.build_ps_key(&rs(), 0b0),
+        plain.build_ps_key(&rs(), 0b1),
+        "stage 0's bound texture"
+    );
+}
+
+/// A `D3DTOP_DISABLE` on stage 0 ends the cascade before any stage, which keys nothing past it.
+#[test]
+fn ps_key_with_stage_zero_disabled_keys_no_stage_state() {
+    use mtld3d_types::{
+        D3DTOP_ADD, D3DTOP_DISABLE, D3DTSS_COLORARG1, D3DTTFF_COUNT2, D3DTTFF_PROJECTED,
+    };
+    let mut plain = FfState::new();
+    plain.set_texture_stage_state(0, D3DTSS_COLOROP as usize, D3DTOP_DISABLE);
+    let mut stale = FfState::new();
+    stale.set_texture_stage_state(0, D3DTSS_COLOROP as usize, D3DTOP_DISABLE);
+    stale.set_texture_stage_state(0, D3DTSS_COLORARG1 as usize, D3DTA_TEXTURE);
+    stale.set_texture_stage_state(
+        0,
+        D3DTSS_TEXTURETRANSFORMFLAGS as usize,
+        D3DTTFF_COUNT2 | D3DTTFF_PROJECTED,
+    );
+    stale.set_texture_stage_state(1, D3DTSS_COLOROP as usize, D3DTOP_ADD);
+    let key = stale.build_ps_key(&rs(), 0b11);
+    assert_eq!(plain.build_ps_key(&rs(), 0), key);
+    assert_eq!(key.tt_projected_mask, 0);
+    assert_eq!(key.sampled_stage_mask(), 0);
+}
