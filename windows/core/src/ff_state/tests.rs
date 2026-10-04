@@ -317,9 +317,9 @@ fn tci_indices_preserved_past_colorop_disable_terminator() {
 /// stream lacks does not.
 #[test]
 fn tex_coord_count_covers_routed_and_generated_stages_past_colorop_disable() {
-    use mtld3d_types::D3DTOP_DISABLE;
-    const CAMERASPACEPOSITION: u32 = 2 << 16;
-    const CAMERASPACENORMAL: u32 = 1 << 16;
+    use mtld3d_types::{
+        D3DTOP_DISABLE, D3DTSS_TCI_CAMERASPACENORMAL, D3DTSS_TCI_CAMERASPACEPOSITION,
+    };
     let one_set = |flags| FfVsLayout {
         flags,
         tex_coord_count: 1,
@@ -353,18 +353,18 @@ fn tex_coord_count_covers_routed_and_generated_stages_past_colorop_disable() {
         "stage 1 routed to an absent set"
     );
     assert_eq!(
-        count(&[(2, CAMERASPACEPOSITION | 5)], plain),
+        count(&[(2, D3DTSS_TCI_CAMERASPACEPOSITION | 5)], plain),
         3,
         "position texgen needs no set"
     );
     assert_eq!(
-        count(&[(1, CAMERASPACENORMAL | 1)], plain),
+        count(&[(1, D3DTSS_TCI_CAMERASPACENORMAL | 1)], plain),
         2,
         "normal texgen without a normal generates from a zero normal"
     );
     assert_eq!(
         count(
-            &[(1, CAMERASPACENORMAL | 1)],
+            &[(1, D3DTSS_TCI_CAMERASPACENORMAL | 1)],
             one_set(FfVsLayoutFlags::HAS_NORMAL)
         ),
         2,
@@ -372,11 +372,11 @@ fn tex_coord_count_covers_routed_and_generated_stages_past_colorop_disable() {
     );
     let rhw = one_set(FfVsLayoutFlags::HAS_RHW);
     assert_eq!(
-        count(&[(1, CAMERASPACEPOSITION | 1)], rhw),
+        count(&[(1, D3DTSS_TCI_CAMERASPACEPOSITION | 1)], rhw),
         1,
         "pre-transformed texgen passes an absent set through"
     );
-    assert_eq!(count(&[(1, CAMERASPACEPOSITION)], rhw), 2);
+    assert_eq!(count(&[(1, D3DTSS_TCI_CAMERASPACEPOSITION)], rhw), 2);
 }
 
 /// `D3DRS_NORMALIZENORMALS` reaches the key for every draw that reads the eye normal.
@@ -386,11 +386,11 @@ fn tex_coord_count_covers_routed_and_generated_stages_past_colorop_disable() {
 /// normal, keeps the bit clear so the render state does not fork its shader.
 #[test]
 fn normalize_normals_flag_follows_every_eye_normal_reader() {
-    use mtld3d_types::{D3DRS_LIGHTING, D3DRS_NORMALIZENORMALS};
-    const CAMERASPACENORMAL: u32 = 1 << 16;
-    const CAMERASPACEREFLECTIONVECTOR: u32 = 3 << 16;
-    const SPHEREMAP: u32 = 4 << 16;
-    const CAMERASPACEPOSITION: u32 = 2 << 16;
+    use mtld3d_types::{
+        D3DRS_LIGHTING, D3DRS_NORMALIZENORMALS, D3DTSS_TCI_CAMERASPACENORMAL,
+        D3DTSS_TCI_CAMERASPACEPOSITION, D3DTSS_TCI_CAMERASPACEREFLECTIONVECTOR,
+        D3DTSS_TCI_SPHEREMAP,
+    };
     let layout = |flags| FfVsLayout {
         flags,
         tex_coord_count: 1,
@@ -409,15 +409,22 @@ fn normalize_normals_flag_follows_every_eye_normal_reader() {
     };
     assert!(flag(1, 0, normal), "lit");
     assert!(!flag(0, 0, normal), "unlit passthru reads no normal");
-    for tci in [CAMERASPACENORMAL, CAMERASPACEREFLECTIONVECTOR, SPHEREMAP] {
+    for tci in [
+        D3DTSS_TCI_CAMERASPACENORMAL,
+        D3DTSS_TCI_CAMERASPACEREFLECTIONVECTOR,
+        D3DTSS_TCI_SPHEREMAP,
+    ] {
         assert!(
             flag(0, tci, normal),
             "unlit texgen {tci:#x} reads the normal"
         );
     }
-    assert!(!flag(0, CAMERASPACEPOSITION, normal), "position texgen");
     assert!(
-        !flag(0, SPHEREMAP, layout(FfVsLayoutFlags::empty())),
+        !flag(0, D3DTSS_TCI_CAMERASPACEPOSITION, normal),
+        "position texgen"
+    );
+    assert!(
+        !flag(0, D3DTSS_TCI_SPHEREMAP, layout(FfVsLayoutFlags::empty())),
         "no vertex normal"
     );
 }

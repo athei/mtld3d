@@ -17,8 +17,9 @@ use mtld3d_types::{
     D3DTA_DIFFUSE, D3DTA_SPECULAR, D3DTA_TEXTURE, D3DTADDRESS_CLAMP, D3DTADDRESS_WRAP,
     D3DTEXF_POINT, D3DTOP_DISABLE, D3DTOP_MODULATE, D3DTOP_SELECTARG1, D3DTS_PROJECTION,
     D3DTS_TEXTURE0, D3DTS_VIEW, D3DTS_WORLD, D3DTSS_ALPHAARG1, D3DTSS_ALPHAOP, D3DTSS_COLORARG1,
-    D3DTSS_COLORARG2, D3DTSS_COLOROP, D3DTSS_TEXCOORDINDEX, D3DTSS_TEXTURETRANSFORMFLAGS,
-    D3DTTFF_COUNT2, D3DTTFF_COUNT3, D3DVBF_1WEIGHTS, D3DVECTOR,
+    D3DTSS_COLORARG2, D3DTSS_COLOROP, D3DTSS_TCI_CAMERASPACENORMAL, D3DTSS_TCI_CAMERASPACEPOSITION,
+    D3DTSS_TCI_CAMERASPACEREFLECTIONVECTOR, D3DTSS_TCI_SPHEREMAP, D3DTSS_TEXCOORDINDEX,
+    D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_COUNT2, D3DTTFF_COUNT3, D3DVBF_1WEIGHTS, D3DVECTOR,
 };
 
 #[rustfmt::skip]
@@ -844,11 +845,6 @@ fn sparse_light_indices_round_trip() {
     );
 }
 
-/// `D3DTSS_TCI_CAMERASPACEPOSITION`.
-///
-/// The texgen mode occupies bits 16..23 of `D3DTSS_TEXCOORDINDEX`.
-const TCI_CAMERASPACEPOSITION: u32 = 2 << 16;
-
 /// Grey level of the lit rows' ambient plus emissive sum, as a channel value.
 const TEXGEN_AMBIENT_LEVEL: u32 = 0x80;
 /// The same with the directional light's full N.L diffuse term added.
@@ -933,7 +929,7 @@ fn arm_eye_position_texgen(h: &Harness) -> Texture<'_> {
         (D3DTSS_COLORARG2, D3DTA_DIFFUSE),
         (D3DTSS_ALPHAOP, D3DTOP_SELECTARG1),
         (D3DTSS_ALPHAARG1, D3DTA_TEXTURE),
-        (D3DTSS_TEXCOORDINDEX, TCI_CAMERASPACEPOSITION),
+        (D3DTSS_TEXCOORDINDEX, D3DTSS_TCI_CAMERASPACEPOSITION),
     ] {
         assert_eq!(
             h.set_texture_stage_state(0, state, value),
@@ -1026,9 +1022,6 @@ fn texgen_cameraspaceposition_unlit() {
     assert_eye_position_texgen(&h, TEXGEN_UNLIT_LEVEL, "unlit, no normal");
 }
 
-/// `D3DTSS_TCI_SPHEREMAP`, in the same byte of `D3DTSS_TEXCOORDINDEX`.
-const TCI_SPHEREMAP: u32 = 4 << 16;
-
 /// The colour of texel (`col`, `row`) of the 4x4 sphere-map texture.
 ///
 /// Red encodes the column and green the row in steps of 0x55, so a probe
@@ -1063,7 +1056,7 @@ fn arm_sphere_map<'h>(h: &'h Harness, view: &[f32; 16], projection: &[f32; 16]) 
         (D3DTSS_COLORARG1, D3DTA_TEXTURE),
         (D3DTSS_ALPHAOP, D3DTOP_SELECTARG1),
         (D3DTSS_ALPHAARG1, D3DTA_TEXTURE),
-        (D3DTSS_TEXCOORDINDEX, TCI_SPHEREMAP),
+        (D3DTSS_TEXCOORDINDEX, D3DTSS_TCI_SPHEREMAP),
     ] {
         assert_eq!(
             h.set_texture_stage_state(0, state, value),
@@ -1252,11 +1245,6 @@ fn texgen_spheremap_without_normal_maps_the_view_direction() {
     }
 }
 
-/// `D3DTSS_TCI_CAMERASPACENORMAL`, in the same byte of `D3DTSS_TEXCOORDINDEX`.
-const TCI_CAMERASPACENORMAL: u32 = 1 << 16;
-/// `D3DTSS_TCI_CAMERASPACEREFLECTIONVECTOR`, in the same byte.
-const TCI_CAMERASPACEREFLECTIONVECTOR: u32 = 3 << 16;
-
 /// One solid colour per cube face, in `D3DCUBEMAP_FACES` order: +X, -X, +Y, -Y, +Z, -Z.
 ///
 /// None of them is the grey the cube texgen tests clear to.
@@ -1399,7 +1387,7 @@ fn texgen_cube_reflection_vector_selects_the_mirror_face() {
     // the four quads show +Z, -X, +Y and +Z. The negated vector would show
     // -Z, +X, -Y and -Z.
     let h = Harness::new();
-    let _cube = arm_cube_texgen(&h, TCI_CAMERASPACEREFLECTIONVECTOR);
+    let _cube = arm_cube_texgen(&h, D3DTSS_TCI_CAMERASPACEREFLECTIONVECTOR);
     assert_cube_texgen_faces(&h, [4, 1, 2, 4], "reflection vector");
 }
 
@@ -1408,7 +1396,7 @@ fn texgen_cube_camera_space_normal_selects_the_face_the_normal_names() {
     // The same cube and quads addressed by the normal itself show +X, -Z, -Z
     // and -Y, which pins the face layout apart from the reflection.
     let h = Harness::new();
-    let _cube = arm_cube_texgen(&h, TCI_CAMERASPACENORMAL);
+    let _cube = arm_cube_texgen(&h, D3DTSS_TCI_CAMERASPACENORMAL);
     assert_cube_texgen_faces(&h, [0, 5, 5, 3], "camera-space normal");
 }
 
@@ -1421,7 +1409,7 @@ fn texgen_cube_camera_space_normal_selects_the_face_the_normal_names() {
 #[test]
 fn texgen_cube_camera_space_normal_uses_the_normal_matrix_under_a_scaled_world() {
     let h = Harness::new();
-    let _cube = arm_cube_texgen(&h, TCI_CAMERASPACENORMAL);
+    let _cube = arm_cube_texgen(&h, D3DTSS_TCI_CAMERASPACENORMAL);
     let mut world = IDENTITY;
     world[10] = 4.0;
     assert_eq!(h.set_transform(D3DTS_WORLD, &world), 0, "world");
@@ -1437,7 +1425,7 @@ fn texgen_cube_camera_space_normal_uses_the_normal_matrix_under_a_scaled_world()
 #[test]
 fn texgen_cube_reflection_vector_renormalizes_only_under_normalizenormals() {
     let h = Harness::new();
-    let _cube = arm_cube_texgen(&h, TCI_CAMERASPACEREFLECTIONVECTOR);
+    let _cube = arm_cube_texgen(&h, D3DTSS_TCI_CAMERASPACEREFLECTIONVECTOR);
     for lighting in [0, 1] {
         assert_eq!(h.set_render_state(D3DRS_LIGHTING, lighting), 0);
         for (normalize, faces) in [(0, [0, 5, 5, 3]), (1, [4, 1, 2, 4])] {
@@ -2154,7 +2142,7 @@ fn ff_vs_writes_a_pixel_shader_stage_past_the_first_disabled_stage() {
     }
 
     assert_eq!(
-        h.set_texture_stage_state(1, D3DTSS_TEXCOORDINDEX, TCI_CAMERASPACEPOSITION),
+        h.set_texture_stage_state(1, D3DTSS_TEXCOORDINDEX, D3DTSS_TCI_CAMERASPACEPOSITION),
         0
     );
     h.render_once(BLUE, |d| {
