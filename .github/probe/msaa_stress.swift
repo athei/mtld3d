@@ -124,6 +124,15 @@ let size = 128
 let rowBytes = size * 4
 let stencilClear: UInt32 = 0x4b
 
+/// A create or encoder request the device refused; the iteration is
+/// abandoned and counted, never a crash.
+struct Refused: Error { let what: String }
+
+func need<T>(_ value: T?, _ what: String) throws -> T {
+    guard let value else { throw Refused(what: what) }
+    return value
+}
+
 struct Params {
     var color: SIMD4<Float>
     var depth: Float
@@ -149,9 +158,9 @@ func draw(_ enc: MTLRenderCommandEncoder, color: SIMD4<Float>, depth: Float, sha
     enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
 }
 
-func readback(_ cb: MTLCommandBuffer, _ tex: MTLTexture) -> MTLBuffer {
-    let buf = device.makeBuffer(length: rowBytes * size, options: .storageModeManaged)!
-    let blit = cb.makeBlitCommandEncoder()!
+func readback(_ cb: MTLCommandBuffer, _ tex: MTLTexture) throws -> MTLBuffer {
+    let buf = try need(device.makeBuffer(length: rowBytes * size, options: .storageModeManaged), "readback buffer")
+    let blit = try need(cb.makeBlitCommandEncoder(), "readback blit encoder")
     blit.copy(from: tex, sourceSlice: 0, sourceLevel: 0, sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
               sourceSize: MTLSize(width: size, height: size, depth: 1), to: buf,
               destinationOffset: 0, destinationBytesPerRow: rowBytes, destinationBytesPerImage: rowBytes * size)
@@ -180,19 +189,21 @@ final class Counters {
     var maxCbSeconds = 0.0
 }
 
-func encodeIteration(_ cb: MTLCommandBuffer, index: Int) -> Iteration? {
+func encodeIteration(_ cb: MTLCommandBuffer, index: Int) throws -> Iteration {
     let rt: MTLTextureUsage = [.renderTarget]
     let readable: MTLTextureUsage = [.renderTarget, .shaderRead, .pixelFormatView]
-    guard let aMs = texture(.bgra8Unorm, samples: 4, usage: rt),
-          let aOut = texture(.bgra8Unorm, samples: 1, usage: rt),
-          let eMs = texture(.bgra8Unorm, samples: 4, usage: rt),
-          let eOut = texture(.bgra8Unorm, samples: 1, usage: rt),
-          let bMs = texture(.bgra8Unorm, samples: 4, usage: rt),
-          let bOut = texture(.bgra8Unorm, samples: 1, usage: rt),
-          let bDepth = texture(.depth32Float_stencil8, samples: 4, usage: readable),
-          let other = texture(.bgra8Unorm, samples: 1, usage: rt),
-          let cCopy = texture(.depth32Float_stencil8, samples: 4, usage: readable)
-    else { return nil }
+    let aMs = try need(texture(.bgra8Unorm, samples: 4, usage: rt), "A 4x colour")
+    let aOut = try need(texture(.bgra8Unorm, samples: 1, usage: rt), "A resolve")
+    let eMs = try need(texture(.bgra8Unorm, samples: 4, usage: rt), "E 4x colour")
+    let eOut = try need(texture(.bgra8Unorm, samples: 1, usage: rt), "E resolve")
+    let bMs = try need(texture(.bgra8Unorm, samples: 4, usage: rt), "B 4x colour")
+    let bOut = try need(texture(.bgra8Unorm, samples: 1, usage: rt), "B resolve")
+    let bDepth = try need(texture(.depth32Float_stencil8, samples: 4, usage: readable), "B 4x depth")
+    let other = try need(texture(.bgra8Unorm, samples: 1, usage: rt), "B other target")
+    let cCopy = try need(texture(.depth32Float_stencil8, samples: 4, usage: readable), "C 4x copy")
+    let cDepth = try need(device.makeBuffer(length: size * size * 4, options: .storageModeManaged), "C depth buffer")
+    let cStencil = try need(device.makeBuffer(length: size * size * 4, options: .storageModeManaged), "C stencil buffer")
+    let stencilView = try need(cCopy.makeTextureView(pixelFormat: .x32_stencil8), "C stencil view")
     let keepStencil = index % 2 == 0
 
     // A: clear to white, resolve by the store action.
@@ -202,7 +213,7 @@ func encodeIteration(_ cb: MTLCommandBuffer, index: Int) -> Iteration? {
     rp.colorAttachments[0].loadAction = .clear
     rp.colorAttachments[0].clearColor = MTLClearColor(red: 1, green: 1, blue: 1, alpha: 1)
     rp.colorAttachments[0].storeAction = .multisampleResolve
-    cb.makeRenderCommandEncoder(descriptor: rp)!.endEncoding()
+    try need(cb.makeRenderCommandEncoder(descriptor: rp), "render encoder").endEncoding()
 
     // E: black clear, opaque red edge triangle, resolve.
     rp = MTLRenderPassDescriptor()
@@ -211,7 +222,7 @@ func encodeIteration(_ cb: MTLCommandBuffer, index: Int) -> Iteration? {
     rp.colorAttachments[0].loadAction = .clear
     rp.colorAttachments[0].clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 1)
     rp.colorAttachments[0].storeAction = .multisampleResolve
-    var enc = cb.makeRenderCommandEncoder(descriptor: rp)!
+    var enc = try need(cb.makeRenderCommandEncoder(descriptor: rp), "render encoder")
     enc.setRenderPipelineState(colourPipeline)
     draw(enc, color: SIMD4(1, 0, 0, 1), depth: 0.5, shape: 1)
     enc.endEncoding()
@@ -230,22 +241,19 @@ func encodeIteration(_ cb: MTLCommandBuffer, index: Int) -> Iteration? {
     rp.stencilAttachment.loadAction = .clear
     rp.stencilAttachment.clearStencil = stencilClear
     rp.stencilAttachment.storeAction = keepStencil ? .store : .dontCare
-    enc = cb.makeRenderCommandEncoder(descriptor: rp)!
+    enc = try need(cb.makeRenderCommandEncoder(descriptor: rp), "render encoder")
     enc.setRenderPipelineState(depthPipeline)
     enc.setDepthStencilState(depthState)
     draw(enc, color: SIMD4(1, 1, 1, 1), depth: 0.2, shape: 0)
     enc.endEncoding()
 
     // C: the RESZ transfer, from the attachment pass 1 stored.
-    let blit = cb.makeBlitCommandEncoder()!
+    let blit = try need(cb.makeBlitCommandEncoder(), "blit encoder")
     blit.copy(from: bDepth, sourceSlice: 0, sourceLevel: 0, sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
               sourceSize: MTLSize(width: size, height: size, depth: 1), to: cCopy,
               destinationSlice: 0, destinationLevel: 0, destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0))
     blit.endEncoding()
-    guard let stencilView = cCopy.makeTextureView(pixelFormat: .x32_stencil8) else { return nil }
-    let cDepth = device.makeBuffer(length: size * size * 4, options: .storageModeManaged)!
-    let cStencil = device.makeBuffer(length: size * size * 4, options: .storageModeManaged)!
-    let compute = cb.makeComputeCommandEncoder()!
+    let compute = try need(cb.makeComputeCommandEncoder(), "compute encoder")
     compute.setComputePipelineState(computePipeline)
     compute.setTexture(cCopy, index: 0)
     compute.setTexture(stencilView, index: 1)
@@ -254,7 +262,7 @@ func encodeIteration(_ cb: MTLCommandBuffer, index: Int) -> Iteration? {
     compute.dispatchThreadgroups(MTLSize(width: size / 8, height: size / 8, depth: 1),
                                  threadsPerThreadgroup: MTLSize(width: 8, height: 8, depth: 1))
     compute.endEncoding()
-    let sync = cb.makeBlitCommandEncoder()!
+    let sync = try need(cb.makeBlitCommandEncoder(), "sync encoder")
     sync.synchronize(resource: cDepth)
     sync.synchronize(resource: cStencil)
     sync.endEncoding()
@@ -265,7 +273,7 @@ func encodeIteration(_ cb: MTLCommandBuffer, index: Int) -> Iteration? {
     rp.colorAttachments[0].loadAction = .clear
     rp.colorAttachments[0].clearColor = MTLClearColor(red: 1, green: 0, blue: 0, alpha: 1)
     rp.colorAttachments[0].storeAction = .store
-    cb.makeRenderCommandEncoder(descriptor: rp)!.endEncoding()
+    try need(cb.makeRenderCommandEncoder(descriptor: rp), "render encoder").endEncoding()
 
     // B pass 3: reload, far blue draw that fails the depth test, resolve.
     rp = MTLRenderPassDescriptor()
@@ -279,13 +287,13 @@ func encodeIteration(_ cb: MTLCommandBuffer, index: Int) -> Iteration? {
     rp.stencilAttachment.texture = bDepth
     rp.stencilAttachment.loadAction = keepStencil ? .load : .dontCare
     rp.stencilAttachment.storeAction = .dontCare
-    enc = cb.makeRenderCommandEncoder(descriptor: rp)!
+    enc = try need(cb.makeRenderCommandEncoder(descriptor: rp), "render encoder")
     enc.setRenderPipelineState(depthPipeline)
     enc.setDepthStencilState(depthState)
     draw(enc, color: SIMD4(0, 0, 1, 1), depth: 0.8, shape: 0)
     enc.endEncoding()
 
-    return Iteration(a: readback(cb, aOut), e: readback(cb, eOut), b: readback(cb, bOut),
+    return Iteration(a: try readback(cb, aOut), e: try readback(cb, eOut), b: try readback(cb, bOut),
                      cDepth: cDepth, cStencil: cStencil, keepStencil: keepStencil)
 }
 
@@ -368,9 +376,15 @@ func msaaPhase(_ name: String, seconds: Double) {
                 return
             }
             cb.label = "probe-\(name)-\(c.iterations)"
-            guard let it = encodeIteration(cb, index: c.iterations) else {
+            let it: Iteration
+            do {
+                it = try encodeIteration(cb, index: c.iterations)
+            } catch {
+                // The command buffer may hold encoded work; it is dropped
+                // uncommitted, and the iteration does not count.
                 c.createNil += 1
-                if c.createNil <= 5 { say("phase=\(name) iteration=\(c.iterations) a texture, view or buffer create returned nil") }
+                touch()
+                if c.createNil <= 5 { say("phase=\(name) iteration=\(c.iterations) refused: \((error as? Refused)?.what ?? "\(error)")") }
                 return
             }
             let t0 = Date()

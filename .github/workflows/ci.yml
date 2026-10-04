@@ -989,6 +989,9 @@ jobs:
       - uses: actions/checkout@v5
       - name: Host fingerprint
         run: |
+          # Keys that do not exist on one architecture (machdep.cpu.* on
+          # arm64) are reported, not fatal.
+          set +e
           out="$RUNNER_TEMP/probe-msaa"
           mkdir -p "$out"
           {
@@ -1003,17 +1006,24 @@ jobs:
             ioreg -l -w0 2>&1 | grep -i -E 'paravirt|AGDC|gpu-|vendor-id|device-id|model' | grep -v -i -E 'serial|uuid' | head -200
           } > "$out/fingerprint.txt" 2>&1
           cat "$out/fingerprint.txt"
+          exit 0
       - name: MSAA stress probe
         run: |
           out="$RUNNER_TEMP/probe-msaa"
           start=$(date +%s)
           echo "probe_start_epoch=$start" > "$out/window.txt"
           xcrun swiftc -O -o "$RUNNER_TEMP/msaa_probe" .github/probe/msaa_stress.swift
-          # 210 s of loops, a 30 s create/release storm, 210 s of loops.
+          # 210 s of loops, a 30 s create/release storm, 210 s of loops. The
+          # probe exits 0 whatever the device does, so a non-zero status here
+          # means the probe itself broke; the step still reports it.
+          set +e
           "$RUNNER_TEMP/msaa_probe" 210 30 > "$out/probe.log" 2>&1
-          echo "probe exit $?" | tee -a "$out/probe.log"
+          status=$?
+          set -e
+          echo "probe exit $status" | tee -a "$out/probe.log"
           echo "probe_end_epoch=$(date +%s)" >> "$out/window.txt"
-          grep -E '^PROBE-(SUMMARY|DONE|ERROR)|^PROBE .*(BAD|CB-ERROR|device)' "$out/probe.log" | cut -c1-600
+          grep -E '^PROBE-(SUMMARY|DONE|ERROR)|^PROBE .*(BAD|CB-ERROR|device|refused)' "$out/probe.log" | cut -c1-600
+          exit "$status"
       - name: System log
         if: ${{ !cancelled() }}
         run: |
