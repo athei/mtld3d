@@ -141,12 +141,13 @@ pub fn resolve_sample_count(
 
 /// Whether `format` may be the auto depth-stencil of a swap chain at `(type, quality)`.
 ///
-/// The answers a title probes before it asks for one: `format` has to be a
-/// depth format the device serves, and the multisample request has to be
-/// one `CheckDeviceMultiSampleType` accepts for the depth format itself,
-/// not only for the back buffer, since the two attachments share one sample
-/// count. The readable FOURCC depth formats therefore stay single-sampled.
-/// `CreateDevice` and `Reset` refuse any other auto depth-stencil.
+/// `format` has to be a depth format the device serves, which takes in the
+/// two lockable formats the answers do not offer, and the multisample request
+/// has to be one `CheckDeviceMultiSampleType` accepts for the depth format
+/// itself, not only for the back buffer, since the two attachments share one
+/// sample count. The readable FOURCC and the lockable depth formats therefore
+/// stay single-sampled. `CreateDevice` and `Reset` refuse any other auto
+/// depth-stencil.
 #[must_use]
 pub fn auto_depth_stencil_accepts(
     format: u32,

@@ -106,10 +106,6 @@ unless its entry says otherwise.
 
 - Point polygon fill: Metal has no point-fill mode, so the state is warned
   once and drawn solid.
-- The lockable depth formats `D16_LOCKABLE` and `D32F_LOCKABLE`: nothing
-  serves a `LockRect` of a depth surface, so every depth query answers
-  `D3DERR_NOTAVAILABLE` for both and every depth create (a depth-stencil
-  surface or texture, an auto depth-stencil) refuses them.
 - Dynamic depth textures outside DEFAULT-pool 2D D16, D24X8 and D24S8,
   including dynamic depth attachments, remain unavailable. Depth textures
   have no vertex sampling. Automatic mip-generation requests use the
@@ -287,6 +283,11 @@ is in [`CONFORMANCE.md`](../unix/conformance/CONFORMANCE.md#kept-divergences).
   surface in every pool a plain surface takes, while every format query answers `D3DERR_NOTAVAILABLE` for it, and its
   lock reports the BC4 block pitch rather than the pitch D3D9 reports for
   the format. No knob.
+- `D16_LOCKABLE` and `D32F_LOCKABLE` create as the auto depth-stencil and
+  as a depth-stencil texture, on a 32-bit float depth, while every depth
+  query answers `D3DERR_NOTAVAILABLE` for them: a `LockRect` of the depth
+  surface fails, warned once. A standalone depth-stencil surface in either
+  format is refused, as before. No knob.
 - `CreateDevice` and `Reset` accept any back-buffer format and present a
   BGRA8 back buffer for every one but A8R8G8B8 and X8R8G8B8, which
   `GetDesc` then reports as X8R8G8B8, where D3D9 refuses a format outside

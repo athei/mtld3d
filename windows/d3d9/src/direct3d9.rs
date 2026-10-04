@@ -449,17 +449,18 @@ pub fn map_for_device(
     mtld3d_core::format::map_d3d_format_device(format, native_packed16_supported(expand_packed16))
 }
 
-/// Depth-stencil formats: the ones the device serves.
+/// Depth-stencil formats: the ones the capability answers offer.
 ///
-/// Read from the one depth mapping every create path reads
-/// (`format::map_d3d_depth_format`), so a depth format the answers offer is
-/// exactly one the creates accept. It includes the FOURCC sampleable-depth
-/// formats (`INTZ` / `DF24` / `DF16`), created with `USAGE_DEPTHSTENCIL`,
-/// bound as the depth target during a caster pass and sampled as a depth
-/// texture in the receiver pass, and `D24FS8`. The mapping leaves out
-/// `D15S1`, `D24X4S4` and the two lockable formats.
+/// Read from `format::is_advertised_depth_format`, so a depth format the
+/// answers offer is one every create accepts. It includes the FOURCC
+/// sampleable-depth formats (`INTZ` / `DF24` / `DF16`), created with
+/// `USAGE_DEPTHSTENCIL`, bound as the depth target during a caster pass and
+/// sampled as a depth texture in the receiver pass, and `D24FS8`. It leaves
+/// out `D15S1` and `D24X4S4`, which nothing creates, and the two lockable
+/// formats, which the auto depth-stencil and a depth-stencil texture still
+/// take without the `LockRect` the format promises.
 pub const fn is_depth_stencil_format(fmt: u32) -> bool {
-    mtld3d_core::format::is_depth_format(fmt)
+    mtld3d_core::format::is_advertised_depth_format(fmt)
 }
 
 /// Subset of depth-stencil formats that carry a stencil plane.

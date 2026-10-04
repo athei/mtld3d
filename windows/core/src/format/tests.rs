@@ -30,7 +30,7 @@ use super::{
     D3DUSAGE_RENDERTARGET, D3DUSAGE_RTPATCHES, D3DUSAGE_SOFTWAREPROCESSING, PixelFormat,
     RenderScale, StandaloneSurfaceKind, Swizzle, block_row_pitch, compute_mip_count,
     compute_mip_size, compute_volume_mip_count, depth_format_bytes_per_pixel, format_name,
-    is_back_buffer_format, is_depth_format, is_mapped_color_format, is_volume_texture_format,
+    is_advertised_depth_format, is_back_buffer_format, is_depth_format, is_mapped_color_format, is_volume_texture_format,
     linear_mip_size, linear_row_pitch, map_d3d_depth_format, map_d3d_format, resolve_mip_levels,
     standalone_surface_bytes, surface_bytes, usage_allowed_for_rtype,
 };
@@ -82,12 +82,14 @@ const COLOUR_FORMATS: [u32; 37] = [
 
 #[test]
 fn depth_only_formats_promote_to_depth32float() {
-    // Apple Silicon has no Depth24Unorm: D24X8, D32 and D16 all share
-    // Depth32Float.
+    // Apple Silicon has no Depth24Unorm: D24X8, D32, D16 and the lockable
+    // variants all share Depth32Float.
     for fmt in [
+        D3DFMT_D16_LOCKABLE,
         D3DFMT_D32,
         D3DFMT_D24X8,
         D3DFMT_D16,
+        D3DFMT_D32F_LOCKABLE,
         // FOURCC sampleable-depth, minus INTZ (it carries a stencil
         // plane, tested with the stencil-bearing family below).
         D3DFMT_DF24,
@@ -117,19 +119,39 @@ fn stencil_bearing_formats_promote_to_depth32float_stencil8() {
 /// The depth formats the device does not serve have no mapping.
 ///
 /// `D15S1` and `D24X4S4` carry a stencil narrower than any Metal format's,
-/// and the two lockable formats a CPU lock of the depth surface, so every
-/// depth answer refuses them and every depth create reads that refusal from
-/// here.
+/// so every depth answer and every depth create refuses them.
 #[test]
 fn unserved_depth_formats_return_none() {
-    for fmt in [
-        D3DFMT_D15S1,
-        D3DFMT_D24X4S4,
-        D3DFMT_D16_LOCKABLE,
-        D3DFMT_D32F_LOCKABLE,
-    ] {
+    for fmt in [D3DFMT_D15S1, D3DFMT_D24X4S4] {
         assert_eq!(map_d3d_depth_format(fmt), None, "format {fmt}");
         assert!(!is_depth_format(fmt), "format {fmt}");
+        assert!(!is_advertised_depth_format(fmt), "format {fmt}");
+    }
+}
+
+/// The lockable depth formats are created but not advertised.
+///
+/// Their depth is served on `Depth32Float`, so a create that names one
+/// gets a working depth buffer, while every query refuses them because no
+/// `LockRect` of a depth surface is served. Every other mapped depth format
+/// is advertised.
+#[test]
+fn lockable_depth_formats_are_created_but_not_advertised() {
+    for fmt in [D3DFMT_D16_LOCKABLE, D3DFMT_D32F_LOCKABLE] {
+        assert!(is_depth_format(fmt), "format {fmt}");
+        assert!(!is_advertised_depth_format(fmt), "format {fmt}");
+    }
+    for fmt in [
+        D3DFMT_D16,
+        D3DFMT_D24X8,
+        D3DFMT_D24S8,
+        D3DFMT_D24FS8,
+        D3DFMT_D32,
+        D3DFMT_DF16,
+        D3DFMT_DF24,
+        D3DFMT_INTZ,
+    ] {
+        assert!(is_advertised_depth_format(fmt), "format {fmt}");
     }
 }
 
@@ -685,10 +707,12 @@ fn only_the_single_precision_floats_depend_on_device_filtering() {
 fn depth_size_table_covers_the_depth_mapping() {
     for fmt in [
         D3DFMT_D16,
+        D3DFMT_D16_LOCKABLE,
         D3DFMT_D24X8,
         D3DFMT_D24S8,
         D3DFMT_D24FS8,
         D3DFMT_D32,
+        D3DFMT_D32F_LOCKABLE,
         D3DFMT_DF16,
         D3DFMT_DF24,
         D3DFMT_INTZ,

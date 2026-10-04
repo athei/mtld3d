@@ -111,12 +111,20 @@ const fn succeeded(hr: i32) -> bool {
 /// an offscreen plain while every query for it answers no: the layer keeps the
 /// create for a title that makes one without probing, and does not advertise
 /// a format whose lock pitch is the BC4 block pitch rather than the one D3D9
-/// reports. The planar YUV pair is advertised as a plain surface but exists
-/// in `D3DPOOL_DEFAULT` only, which a query, having no pool, cannot say.
-/// Both are in `docs/STATUS.md`.
+/// reports. `D16_LOCKABLE` and `D32F_LOCKABLE` create single-sampled as the
+/// auto depth-stencil and as a depth-stencil texture while no depth query
+/// offers them: their depth is served, the depth-surface `LockRect` they
+/// promise is not. The planar YUV pair is advertised as a plain surface but
+/// exists in `D3DPOOL_DEFAULT` only, which a query, having no pool, cannot
+/// say. All three are in `docs/STATUS.md`.
 fn kept_divergence(shape: &str, format: u32) -> bool {
     match format {
         D3DFMT_ATI1 => shape.starts_with("texture") || shape.starts_with("offscreen"),
+        D3DFMT_D16_LOCKABLE | D3DFMT_D32F_LOCKABLE => {
+            shape == "texture usage=DEPTHSTENCIL DEFAULT"
+                || shape == "CreateDevice auto depth, 0 samples"
+                || shape == "Reset auto depth, 0 samples"
+        }
         D3DFMT_YV12 | D3DFMT_NV12 => shape == "offscreen SYSTEMMEM",
         _ => false,
     }
@@ -522,20 +530,13 @@ fn reset_auto_depth_agrees_with_the_depth_answers() {
     sweep.assert_agrees("Reset auto depth-stencil against the depth answers");
 }
 
-/// The formats no depth answer offers are refused by every depth create.
+/// The two depth formats no device serves are refused by every depth answer and create.
 ///
-/// `D15S1` and `D24X4S4` have no counterpart on any device, and the two
-/// lockable formats promise a `LockRect` on the depth surface that the layer
-/// does not serve, so all four stay unadvertised and uncreatable.
+/// `D15S1` and `D24X4S4` carry a stencil narrower than any Metal format's.
 #[test]
 fn unserved_depth_formats_are_refused_everywhere() {
     let h = Harness::new();
-    for format in [
-        D3DFMT_D15S1,
-        D3DFMT_D24X4S4,
-        D3DFMT_D16_LOCKABLE,
-        D3DFMT_D32F_LOCKABLE,
-    ] {
+    for format in [D3DFMT_D15S1, D3DFMT_D24X4S4] {
         let name = format_name(format);
         assert!(!is_depth(&h, format), "{name} is advertised");
         assert!(
@@ -562,6 +563,80 @@ fn unserved_depth_formats_are_refused_everywhere() {
         let mut plain = auto_depth_params(D3DFMT_D24S8, D3DMULTISAMPLE_NONE);
         plain.device_window = h.hwnd();
         assert_eq!(h.reset_params(&mut plain), D3D_OK, "recovering Reset");
+    }
+}
+
+/// The lockable depth formats serve depth where they create, and refuse the lock.
+///
+/// No depth query offers `D16_LOCKABLE` or `D32F_LOCKABLE`, and a standalone
+/// depth-stencil surface refuses them, but an auto depth-stencil and a
+/// depth-stencil texture take either one, for a title that names one without
+/// probing. The auto depth-stencil depth-tests a farther quad away behind a
+/// nearer one, and a `LockRect` of the depth surface, the one thing the
+/// format promises beyond depth, fails cleanly on both surfaces.
+#[test]
+fn lockable_depth_formats_serve_depth_without_the_lock() {
+    for format in [D3DFMT_D16_LOCKABLE, D3DFMT_D32F_LOCKABLE] {
+        let name = format_name(format);
+        let h = Harness::create(&HarnessConfig {
+            depth_format: Some(format),
+            ..HarnessConfig::default()
+        });
+        assert!(!is_depth(&h, format), "{name} is advertised");
+        assert!(
+            !succeeded(h.check_depth_stencil_match(DISPLAY, D3DFMT_X8R8G8B8, format)),
+            "{name} matches a render target"
+        );
+        let (hr, standalone) =
+            h.create_depth_stencil_surface_ms_hr((64, 64), format, (D3DMULTISAMPLE_NONE, 0));
+        assert_eq!(hr, D3DERR_INVALIDCALL, "{name} standalone depth surface");
+        assert!(standalone.is_none());
+
+        assert_eq!(h.set_render_state(D3DRS_LIGHTING, 0), D3D_OK);
+        assert_eq!(h.clear_texture(0), D3D_OK);
+        h.select_diffuse_stage(0);
+        assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE), D3D_OK);
+        assert_eq!(h.set_render_state(D3DRS_ZENABLE, 1), D3D_OK);
+        assert_eq!(h.set_render_state(D3DRS_ZWRITEENABLE, 1), D3D_OK);
+        assert_eq!(h.set_render_state(D3DRS_ZFUNC, D3DCMP_LESS), D3D_OK);
+        h.render_once(BLACK, |d| {
+            assert_eq!(
+                d.clear(D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, BLACK, 1.0, 0),
+                D3D_OK
+            );
+            assert_eq!(
+                d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad(GREEN, 0.25)),
+                D3D_OK
+            );
+            assert_eq!(
+                d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad(RED, 0.75)),
+                D3D_OK
+            );
+        });
+        assert_eq!(
+            h.read_pixel(320, 240),
+            GREEN,
+            "{name}: the auto depth-stencil keeps the nearer quad"
+        );
+
+        let depth = h
+            .depth_stencil_surface()
+            .expect("the auto depth-stencil surface");
+        let (hr, _) = depth.lock_rect_probe(0);
+        assert_eq!(hr, D3DERR_INVALIDCALL, "{name}: auto depth LockRect");
+        drop(depth);
+
+        let (hr, out) =
+            h.try_create_texture(64, 64, 1, D3DUSAGE_DEPTHSTENCIL, format, D3DPOOL_DEFAULT);
+        assert_eq!(hr, D3D_OK, "{name} depth-stencil texture");
+        let texture = Texture::from_raw(out);
+        let (hr, _) = texture.lock_rect_probe(0, 0);
+        assert_eq!(hr, D3DERR_INVALIDCALL, "{name}: depth texture LockRect");
+        let (hr, _) = texture.surface_level(0).lock_rect_probe(0);
+        assert_eq!(hr, D3DERR_INVALIDCALL, "{name}: depth texture level LockRect");
+        drop(texture);
+        let (hr, _) = h.try_create_texture(64, 64, 1, 0, format, D3DPOOL_DEFAULT);
+        assert_eq!(hr, D3DERR_INVALIDCALL, "{name} plain depth texture");
     }
 }
 
