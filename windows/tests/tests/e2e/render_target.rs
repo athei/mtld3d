@@ -887,8 +887,9 @@ fn stretch_rect_from_an_x_render_target_into_its_a_counterpart_writes_opaque_alp
 ///
 /// A frame copies its back buffer into a render-target texture of the same
 /// size and samples it afterwards. The back buffer's padding holds the fill's
-/// zero alpha, and the copy still reads alpha one. The fill is uniform, so the
-/// probes hold under `render.scale`, where the copy resamples.
+/// zero alpha, and the copy still reads alpha one. A render target of the
+/// back buffer's size scales with it under `render.scale`, so the copy stays
+/// 1:1 there too.
 #[test]
 fn stretch_rect_from_the_x8r8g8b8_back_buffer_into_an_a8r8g8b8_texture_writes_opaque_alpha() {
     const SIZE: (u32, u32) = (640, 480);

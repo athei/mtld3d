@@ -8414,12 +8414,13 @@ extern "system" fn device_stretch_rect(
     flush_dirty_mips_for_gpu_write(&obj, &[src_surf, dst_surf]);
     // A same-size copy that converts also needs the render-quad path (the 1:1
     // blit can't convert): a cross-Metal-format pair, or a source without
-    // alpha into a destination with alpha sharing its storage, whose alpha the
-    // quad forces to one while it samples (`BlitDecode::OpaqueAlpha` for an X
-    // source; a widened source already stores alpha one). `check_stretch_rect_formats` guaranteed a
-    // cross-format destination is a render target or an offscreen-plain surface
-    // (cross-format RT/texture/offscreen → RT, plus the offscreen→offscreen
-    // case handled on the CPU just below).
+    // alpha into a destination with alpha sharing its storage, whose alpha
+    // the quad forces to one while it samples (`BlitDecode::OpaqueAlpha` for
+    // an X source; a widened source already stores alpha one).
+    // `check_stretch_rect_formats` guaranteed a cross-format destination is a
+    // render target or an offscreen-plain surface (cross-format
+    // RT/texture/offscreen → RT, plus the offscreen→offscreen case handled on
+    // the CPU just below).
     // Device-aware mapping: it must agree with the Metal formats the textures
     // were actually created with (e.g. a packed 16-bit pair that is
     // BGRA8-backed on this device is NOT cross-format).
