@@ -18,7 +18,7 @@ use mtld3d_shared::{
 };
 use mtld3d_types::{
     D3DBLEND_BOTHINVSRCALPHA, D3DBLEND_BOTHSRCALPHA, D3DBLEND_INVSRCALPHA, D3DBLEND_ONE,
-    D3DBLEND_SRCALPHA, D3DBLEND_ZERO, D3DBLENDOP_ADD, MAX_STREAMS,
+    D3DBLEND_SRCALPHA, D3DBLEND_ZERO, D3DBLENDOP_ADD, D3DBLENDOP_MAX, D3DBLENDOP_MIN, MAX_STREAMS,
 };
 
 use crate::{
@@ -399,25 +399,37 @@ impl PipelineSnapshot {
 /// struct as a whole. Keeping fields private makes the per-field invariant
 /// test (below) the sole contract between this module and every D3D9 state
 /// that influences pipeline identity.
+///
+/// In memory only: the persisted pipeline recipe stores the
+/// [`PipelineSnapshot`] and prewarm derives the key again, so the fields
+/// below can be normalised without a cache schema change. Every field is the
+/// value Metal sees, so two snapshots Metal cannot tell apart share one key:
+/// no blend, mask or colour format without a colour output, and the factors
+/// of a `MIN` or `MAX` equation, which Metal ignores, read as `ONE`.
 #[derive(Debug, PartialEq, Eq, Hash)]
 pub struct PipelineKey {
     vs_fn: MetalHandle<MTLFunctionKind>,
     ps_fn: MetalHandle<MTLFunctionKind>,
     vertex_attrs_hash: VertexAttrsHash,
     stream_layouts: [StreamLayout; MAX_STREAMS as usize],
-    blend_enable: u32,
+    /// `BLEND_ENABLE` and `ALPHA_TO_COVERAGE` as the pipeline applies them.
+    ///
+    /// `SEPARATE_ALPHA_BLEND` stays clear: the alpha factors and operation
+    /// below already carry its effect.
+    flags: PipelineRsFlags,
+    /// `HAS_DEPTH`, `HAS_STENCIL` and `HAS_COLOR_OUTPUT`.
+    ///
+    /// `COLOR_HAS_ALPHA` stays clear: it reaches Metal only through the
+    /// destination-alpha factors, which the key holds after the clamp.
+    attach: PipelineAttachFlags,
     src_blend: BlendFactor,
     dst_blend: BlendFactor,
     blend_op: BlendOperation,
     src_blend_alpha: BlendFactor,
     dst_blend_alpha: BlendFactor,
     blend_op_alpha: BlendOperation,
-    separate_alpha_blend_enable: u32,
     color_write_mask: ColorWriteMask,
-    has_depth: u32,
-    has_stencil: u32,
     color_format: PixelFormat,
-    has_color_output: u32,
     /// Render targets 1..3: presence, format, effective write mask, alpha clamp.
     ///
     /// The alpha bit stands in for the per-target blend factors: they differ
@@ -429,7 +441,6 @@ pub struct PipelineKey {
     extra_formats: [PixelFormat; 3],
     extra_write_masks: [ColorWriteMask; 3],
     sample_count: u8,
-    alpha_to_coverage: bool,
 }
 
 /// Per-draw thunk-params builder input.
@@ -505,29 +516,42 @@ pub fn vertex_layouts_from_snapshot(s: &PipelineSnapshot) -> Vec<VertexBufferLay
 /// canonicalization stay off the per-draw path.
 #[must_use]
 pub fn key_from_snapshot(s: &PipelineSnapshot, vertex_attrs: &[VertexAttrDesc]) -> PipelineKey {
-    let blend = effective_blend(&s.rs);
+    let blend = effective_blend(s);
+    let color = s.has_color_output();
+    let mut flags = PipelineRsFlags::empty();
+    flags.set(PipelineRsFlags::BLEND_ENABLE, blend.enable);
+    flags.set(
+        PipelineRsFlags::ALPHA_TO_COVERAGE,
+        s.rs.alpha_to_coverage(s.sample_count),
+    );
     PipelineKey {
         vs_fn: s.vs_fn,
         ps_fn: s.ps_fn,
         vertex_attrs_hash: VertexAttrsHash::from_attrs(vertex_attrs),
         stream_layouts: s.stream_layouts,
-        blend_enable: u32::from(s.rs.blend_enable()),
+        flags,
+        attach: s.attach.difference(PipelineAttachFlags::COLOR_HAS_ALPHA),
         src_blend: d3d_to_metal_blend_rt(blend.src, s.color_has_alpha()),
         dst_blend: d3d_to_metal_blend_rt(blend.dst, s.color_has_alpha()),
         blend_op: d3d_to_metal_blend_op(blend.op),
         src_blend_alpha: d3d_to_metal_blend_rt(blend.src_alpha, s.color_has_alpha()),
         dst_blend_alpha: d3d_to_metal_blend_rt(blend.dst_alpha, s.color_has_alpha()),
         blend_op_alpha: d3d_to_metal_blend_op(blend.op_alpha),
-        separate_alpha_blend_enable: u32::from(blend.separate_alpha),
-        color_write_mask: d3d_to_metal_write_mask(u32::from(s.rs.color_write_mask)),
-        has_depth: u32::from(s.has_depth()),
-        has_stencil: u32::from(s.has_stencil()),
-        color_format: s.color_format,
-        has_color_output: u32::from(s.has_color_output()),
+        // Without a colour output neither reaches Metal.
+        color_write_mask: if color {
+            d3d_to_metal_write_mask(u32::from(s.rs.color_write_mask))
+        } else {
+            ColorWriteMask::empty()
+        },
+        color_format: if color {
+            s.color_format
+        } else {
+            ExtraColorAttachments::NONE.formats[0]
+        },
         extra_present_mask: s.extra.present_mask,
         // Absent slots drop their alpha bit so the key stays canonical, and
         // so do all slots while blending is off.
-        extra_has_alpha_mask: if s.rs.blend_enable() {
+        extra_has_alpha_mask: if blend.enable {
             s.extra.has_alpha_mask & s.extra.present_mask
         } else {
             0
@@ -535,7 +559,6 @@ pub fn key_from_snapshot(s: &PipelineSnapshot, vertex_attrs: &[VertexAttrDesc]) 
         extra_formats: core::array::from_fn(|i| s.extra_format(i)),
         extra_write_masks: core::array::from_fn(|i| s.extra_write_mask(i)),
         sample_count: s.sample_count.max(1),
-        alpha_to_coverage: s.rs.alpha_to_coverage(s.sample_count),
     }
 }
 
@@ -574,9 +597,9 @@ pub struct PipelineDescription<'a> {
 #[must_use]
 pub fn description_from_snapshot<'a>(inputs: &PipelineBuildInputs<'a>) -> PipelineDescription<'a> {
     let s = inputs.snapshot;
-    let blend = effective_blend(&s.rs);
+    let blend = effective_blend(s);
     let mut flags = PipelineRsFlags::empty();
-    flags.set(PipelineRsFlags::BLEND_ENABLE, s.rs.blend_enable());
+    flags.set(PipelineRsFlags::BLEND_ENABLE, blend.enable);
     flags.set(PipelineRsFlags::SEPARATE_ALPHA_BLEND, blend.separate_alpha);
     flags.set(
         PipelineRsFlags::ALPHA_TO_COVERAGE,
@@ -619,29 +642,38 @@ pub fn description_from_snapshot<'a>(inputs: &PipelineBuildInputs<'a>) -> Pipeli
 /// Built only by [`effective_blend`], which both the key and the wire params
 /// read, so the two cannot drift.
 struct EffectiveBlend {
+    /// `D3DRS_ALPHABLENDENABLE`, cleared when the pipeline has no colour output.
+    enable: bool,
     src: u32,
     dst: u32,
     op: u32,
     src_alpha: u32,
     dst_alpha: u32,
     op_alpha: u32,
-    /// `D3DRS_SEPARATEALPHABLENDENABLE`, cleared while blending is off.
+    /// `D3DRS_SEPARATEALPHABLENDENABLE`, cleared while it changes nothing.
+    ///
+    /// Clear while blending is off and whenever the alpha equation it selects
+    /// equals the colour one.
     separate_alpha: bool,
 }
 
 /// Resolve the blend state that reaches Metal.
 ///
 /// Metal ignores the factors and operations of an attachment whose blending
-/// is off, so with `D3DRS_ALPHABLENDENABLE` clear they collapse to src
-/// `ONE`, dst `ZERO`, op `ADD` with separate alpha off, and draws that differ
-/// only in stale blend states share a pipeline. With blending on, the alpha
-/// factors and operation take effect only when
-/// `D3DRS_SEPARATEALPHABLENDENABLE` is TRUE (D3D9 spec); otherwise the RGB
-/// values apply to alpha too. A `BOTH*` source factor sets the destination
-/// factor of its own equation as well, see [`both_src_alpha`].
-fn effective_blend(rs: &PipelineRsBits) -> EffectiveBlend {
-    if !rs.blend_enable() {
+/// is off, so with `D3DRS_ALPHABLENDENABLE` clear, or no colour output to
+/// blend into, they collapse to src `ONE`, dst `ZERO`, op `ADD` with separate
+/// alpha off, and draws that differ only in stale blend states share a
+/// pipeline. With blending on, the alpha factors and operation take effect
+/// only when `D3DRS_SEPARATEALPHABLENDENABLE` is TRUE (D3D9 spec); otherwise
+/// the RGB values apply to alpha too. A `BOTH*` source factor sets the
+/// destination factor of its own equation as well, see [`both_src_alpha`],
+/// and a `MIN` or `MAX` equation reads its factors as `ONE`, see
+/// [`min_max_factors`].
+fn effective_blend(s: &PipelineSnapshot) -> EffectiveBlend {
+    let rs = &s.rs;
+    if !rs.blend_enable() || !s.has_color_output() {
         return EffectiveBlend {
+            enable: false,
             src: D3DBLEND_ONE,
             dst: D3DBLEND_ZERO,
             op: D3DBLENDOP_ADD,
@@ -651,19 +683,21 @@ fn effective_blend(rs: &PipelineRsBits) -> EffectiveBlend {
             separate_alpha: false,
         };
     }
-    let (src, dst) = both_src_alpha(u32::from(rs.src_blend), u32::from(rs.dst_blend));
-    let op = u32::from(rs.blend_op);
-    let separate_alpha = rs.separate_alpha_blend_enable();
-    let (src_alpha, dst_alpha, op_alpha) = if separate_alpha {
-        let (src_alpha, dst_alpha) = both_src_alpha(
-            u32::from(rs.src_blend_alpha),
-            u32::from(rs.dst_blend_alpha),
-        );
-        (src_alpha, dst_alpha, u32::from(rs.blend_op_alpha))
+    let equation = |src: u8, dst: u8, op: u8| {
+        let (src, dst) = both_src_alpha(u32::from(src), u32::from(dst));
+        let op = u32::from(op);
+        let (src, dst) = min_max_factors(src, dst, op);
+        (src, dst, op)
+    };
+    let (src, dst, op) = equation(rs.src_blend, rs.dst_blend, rs.blend_op);
+    let (src_alpha, dst_alpha, op_alpha) = if rs.separate_alpha_blend_enable() {
+        equation(rs.src_blend_alpha, rs.dst_blend_alpha, rs.blend_op_alpha)
     } else {
         (src, dst, op)
     };
+    let separate_alpha = (src_alpha, dst_alpha, op_alpha) != (src, dst, op);
     EffectiveBlend {
+        enable: true,
         src,
         dst,
         op,
@@ -685,6 +719,18 @@ const fn both_src_alpha(src: u32, dst: u32) -> (u32, u32) {
     match src {
         D3DBLEND_BOTHSRCALPHA => (D3DBLEND_SRCALPHA, D3DBLEND_INVSRCALPHA),
         D3DBLEND_BOTHINVSRCALPHA => (D3DBLEND_INVSRCALPHA, D3DBLEND_SRCALPHA),
+        _ => (src, dst),
+    }
+}
+
+/// The factors of one blend equation, read as `ONE` under `D3DBLENDOP_MIN` or `MAX`.
+///
+/// Both operations combine the unweighted source and destination (D3D9
+/// spec), and Metal ignores the factors of a `Min` or `Max` equation as
+/// well, so any pair is the same pipeline.
+const fn min_max_factors(src: u32, dst: u32, op: u32) -> (u32, u32) {
+    match op {
+        D3DBLENDOP_MIN | D3DBLENDOP_MAX => (D3DBLEND_ONE, D3DBLEND_ONE),
         _ => (src, dst),
     }
 }

@@ -5,13 +5,15 @@
 //! normalisation and the wire format: an absent extra target drops out of the key, an extra target
 //! the shader never writes gets an empty write mask while target 0 keeps its render-state mask,
 //! destination-alpha factors clamp on an alpha-less target, and the wire params match the key.
-//! Blend factors left over while blending is off, and declarations that resolve to the same
-//! vertex attributes, collapse onto one key.
+//! Blend factors left over while blending is off, blend states without a colour output, the
+//! factors of a min or max equation, a separate alpha equation equal to the colour one, and
+//! declarations that resolve to the same vertex attributes, collapse onto one key.
 
 use mtld3d_shared::mtl::VertexFormat;
 use mtld3d_types::{
     D3DBLEND_BOTHINVSRCALPHA, D3DBLEND_BOTHSRCALPHA, D3DBLEND_DESTALPHA, D3DBLEND_INVDESTALPHA, D3DBLEND_INVSRCALPHA, D3DBLEND_ONE,
-    D3DBLEND_SRCALPHA, D3DBLEND_ZERO, D3DBLENDOP_ADD, D3DBLENDOP_REVSUBTRACT, D3DDECLTYPE_FLOAT2,
+    D3DBLEND_SRCALPHA, D3DBLEND_ZERO, D3DBLENDOP_ADD, D3DBLENDOP_MAX, D3DBLENDOP_MIN,
+    D3DBLENDOP_REVSUBTRACT, D3DDECLTYPE_FLOAT2,
     D3DDECLTYPE_FLOAT3, D3DDECLUSAGE_NORMAL, D3DDECLUSAGE_POSITION, D3DDECLUSAGE_TEXCOORD,
     D3DFVF_TEX1, D3DFVF_XYZ, D3DVERTEXELEMENT9,
 };
@@ -373,23 +375,15 @@ fn params_match_key_on_default_snapshot() {
     assert_eq!(p.dst_blend_alpha, k.dst_blend_alpha);
     assert_eq!(p.blend_op_alpha, k.blend_op_alpha);
     assert_eq!(
-        u32::from(p.flags.contains(PipelineRsFlags::SEPARATE_ALPHA_BLEND)),
-        k.separate_alpha_blend_enable
+        p.flags.difference(PipelineRsFlags::SEPARATE_ALPHA_BLEND),
+        k.flags
     );
     assert_eq!(p.color_write_mask, k.color_write_mask);
     assert_eq!(
-        u32::from(p.attach.contains(PipelineAttachFlags::HAS_DEPTH)),
-        k.has_depth
-    );
-    assert_eq!(
-        u32::from(p.attach.contains(PipelineAttachFlags::HAS_STENCIL)),
-        k.has_stencil
+        p.attach.difference(PipelineAttachFlags::COLOR_HAS_ALPHA),
+        k.attach
     );
     assert_eq!(p.color_format, k.color_format);
-    assert_eq!(
-        u32::from(p.attach.contains(PipelineAttachFlags::HAS_COLOR_OUTPUT)),
-        k.has_color_output
-    );
     assert_eq!(p.extra_present_mask, k.extra_present_mask);
     for i in 0..3 {
         assert_eq!(p.extra[i].format, k.extra_formats[i]);
@@ -435,12 +429,14 @@ fn alpha_to_coverage_keys_only_multisampled_pipelines_and_reaches_wire() {
             });
             assert_eq!(
                 params.flags.contains(PipelineRsFlags::ALPHA_TO_COVERAGE),
-                key.alpha_to_coverage
+                key.flags.contains(PipelineRsFlags::ALPHA_TO_COVERAGE)
             );
         }
         on.attach.remove(PipelineAttachFlags::HAS_COLOR_OUTPUT);
         assert!(
-            key_of(&on).alpha_to_coverage,
+            key_of(&on)
+                .flags
+                .contains(PipelineRsFlags::ALPHA_TO_COVERAGE),
             "depth-only sibling keeps coverage"
         );
     }
@@ -624,6 +620,73 @@ fn both_src_alpha_source_factors_override_the_destination_factor() {
     pair.rs.src_blend = narrow(D3DBLEND_SRCALPHA);
     pair.rs.dst_blend = narrow(D3DBLEND_INVSRCALPHA);
     assert_eq!(key_of(&both), key_of(&pair));
+}
+
+#[test]
+fn a_pipeline_without_colour_output_ignores_blend_mask_and_format() {
+    // With no colour attachment nothing blends, nothing is masked and no
+    // colour format is declared, so the states that only shape colour do
+    // not split the depth-only pipeline.
+    let no_color = |f: fn(&mut PipelineSnapshot)| {
+        let mut s = base();
+        f(&mut s);
+        s.remove_color_output();
+        (key_of(&s), blend_fields(&params_of(&s)))
+    };
+    let plain = no_color(|_| {});
+    assert_eq!(plain, no_color(|s| s.rs.flags.remove(PipelineRsFlags::BLEND_ENABLE)));
+    assert_eq!(plain, no_color(|s| s.rs.src_blend = narrow(D3DBLEND_ONE)));
+    assert_eq!(plain, no_color(|s| s.rs.color_write_mask = 0x1));
+    assert_eq!(plain, no_color(|s| s.color_format = PixelFormat::Rgba16Float));
+    assert_eq!(
+        plain,
+        no_color(|s| s.attach.remove(PipelineAttachFlags::COLOR_HAS_ALPHA))
+    );
+    // Depth and the sample count still decide the pipeline.
+    assert_ne!(plain, no_color(|s| s.attach.insert(PipelineAttachFlags::HAS_STENCIL)));
+    assert_ne!(plain, no_color(|s| s.sample_count = 4));
+}
+
+#[test]
+fn min_and_max_equations_ignore_their_factors() {
+    // `D3DBLENDOP_MIN` and `MAX` combine the unweighted source and
+    // destination, and Metal ignores the factors of a min or max equation,
+    // so draws that differ only in those factors are one pipeline.
+    for op in [D3DBLENDOP_MIN, D3DBLENDOP_MAX] {
+        let with = |src: u32, dst: u32| {
+            let mut s = base();
+            s.rs.blend_op = narrow(op);
+            s.rs.src_blend = narrow(src);
+            s.rs.dst_blend = narrow(dst);
+            s
+        };
+        let a = with(D3DBLEND_SRCALPHA, D3DBLEND_INVSRCALPHA);
+        let b = with(D3DBLEND_ZERO, D3DBLEND_DESTALPHA);
+        assert_eq!(key_of(&a), key_of(&b));
+        let p = params_of(&a);
+        assert_eq!((p.src_blend, p.dst_blend), (BlendFactor::One, BlendFactor::One));
+    }
+    // An additive equation still keys its factors.
+    let mut add = base();
+    add.rs.src_blend = narrow(D3DBLEND_ZERO);
+    assert_ne!(key_of(&add), key_of(&base()));
+}
+
+#[test]
+fn separate_alpha_that_repeats_the_colour_equation_changes_nothing() {
+    // SEPARATEALPHABLENDENABLE with an alpha trio equal to the colour one is
+    // the same blend as without it.
+    let mut plain = base();
+    plain.rs.src_blend_alpha = plain.rs.src_blend;
+    plain.rs.dst_blend_alpha = plain.rs.dst_blend;
+    plain.rs.blend_op_alpha = plain.rs.blend_op;
+    let mut separate = plain.clone();
+    separate.rs.flags.insert(PipelineRsFlags::SEPARATE_ALPHA_BLEND);
+    assert_eq!(key_of(&plain), key_of(&separate));
+    assert_eq!(
+        blend_fields(&params_of(&plain)),
+        blend_fields(&params_of(&separate))
+    );
 }
 
 /// Key of `base()` for `elements`, resolved under the fixed-function convention.
