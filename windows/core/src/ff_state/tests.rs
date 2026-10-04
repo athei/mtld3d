@@ -359,8 +359,8 @@ fn tex_coord_count_covers_routed_and_generated_stages_past_colorop_disable() {
     );
     assert_eq!(
         count(&[(1, CAMERASPACENORMAL | 1)], plain),
-        1,
-        "normal texgen without a normal passes an absent set through"
+        2,
+        "normal texgen without a normal generates from a zero normal"
     );
     assert_eq!(
         count(
@@ -1194,15 +1194,87 @@ fn resolve_vertex_blend_count_decl_mismatch_falls_back() {
         super::resolve_vertex_blend_count(1, layout_no_blend, false),
         0
     );
-    // Game enables INDEXED but decl has no BLENDINDICES → 0.
-    let layout_weights_only = FfVsLayout {
-        declared_weights_count: 2,
-        ..layout_no_blend
-    };
+    // D3DVBF_0WEIGHTS without indexed blending → 0.
     assert_eq!(
-        super::resolve_vertex_blend_count(2, layout_weights_only, true),
+        super::resolve_vertex_blend_count(256, layout_no_blend, false),
         0
     );
+}
+
+/// `D3DRS_INDEXEDVERTEXBLENDENABLE` without a BLENDINDICES element blends sequentially.
+///
+/// The weighted modes read the matrices from 0 up, as with indexed blending
+/// off, rather than dropping blending for the single world matrix; the key
+/// carries no indexed flag the emitter would read absent indices through.
+#[test]
+fn indexed_blending_without_indices_blends_the_sequential_matrices() {
+    use mtld3d_types::{D3DRS_INDEXEDVERTEXBLENDENABLE, D3DRS_VERTEXBLEND, D3DVBF_2WEIGHTS};
+
+    use crate::dxso::FfVsFlags;
+    let weights_only = FfVsLayout {
+        flags: FfVsLayoutFlags::empty(),
+        tex_coord_count: 0,
+        tex_coord_dims: [0; 8],
+        declared_weights_count: 2,
+    };
+    let mut states = rs();
+    states[D3DRS_VERTEXBLEND as usize] = D3DVBF_2WEIGHTS;
+    states[D3DRS_INDEXEDVERTEXBLENDENABLE as usize] = 1;
+    let key = FfState::new().build_vs_key(&states, weights_only, 0, [0; 8]);
+    assert_eq!(
+        key.vertex_blend_count, 3,
+        "two weights and the implicit third"
+    );
+    assert!(!key.flags.contains(FfVsFlags::VERTEX_BLEND_INDEXED));
+
+    let with_indices = FfVsLayout {
+        flags: FfVsLayoutFlags::DECLARED_INDICES,
+        ..weights_only
+    };
+    let key = FfState::new().build_vs_key(&states, with_indices, 0, [0; 8]);
+    assert_eq!(key.vertex_blend_count, 3);
+    assert!(key.flags.contains(FfVsFlags::VERTEX_BLEND_INDEXED));
+}
+
+/// A light whose `D3DLIGHT9::Type` is none of POINT, SPOT and DIRECTIONAL lights nothing.
+///
+/// `SetLight` keeps it and `GetLight` reports it back, enabled or not, at a
+/// fast-path index and past the eight slots alike, but the key gets no
+/// active slot for it and the light section packs nothing.
+#[test]
+fn a_light_of_no_valid_type_contributes_nothing() {
+    use mtld3d_types::{D3DCOLORVALUE, D3DLIGHT9, D3DRS_LIGHTING};
+    let white = D3DCOLORVALUE {
+        r: 1.0,
+        g: 1.0,
+        b: 1.0,
+        a: 1.0,
+    };
+    let light = D3DLIGHT9 {
+        type_: 4,
+        diffuse: white,
+        range: 100.0,
+        attenuation0: 1.0,
+        ..D3DLIGHT9::default()
+    };
+    let mut state = FfState::new();
+    for index in [0, 9] {
+        state.set_light_at(index, &light);
+        state.set_light_enabled_at(index, true);
+        assert_eq!(state.get_light_at(index).map(|l| l.type_), Some(4));
+        assert!(state.is_light_enabled_at(index));
+    }
+    let mut states = rs();
+    states[D3DRS_LIGHTING as usize] = 1;
+    let layout = FfVsLayout {
+        flags: FfVsLayoutFlags::HAS_NORMAL,
+        tex_coord_count: 0,
+        tex_coord_dims: [0; 8],
+        declared_weights_count: 0,
+    };
+    let key = state.build_vs_key(&states, layout, 0, [0; 8]);
+    assert_eq!(key.light_active_mask, 0);
+    assert_eq!(FfState::lights_section_rows(&key), 0);
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -1399,6 +1471,12 @@ fn contiguous_index0_light_packing_is_byte_identical() {
                 b: 0.75,
                 a: 1.0,
             },
+            specular: D3DCOLORVALUE {
+                r: 0.0,
+                g: 0.0,
+                b: 0.0,
+                a: 0.5,
+            },
             position: D3DVECTOR {
                 x: 4.0,
                 y: 5.0,
@@ -1423,8 +1501,9 @@ fn contiguous_index0_light_packing_is_byte_identical() {
     let data = unsafe { read_section_rows(ptr, 6) };
     // Position row: world == eye under identity view; POINT type-w = 1.
     assert_row_eq(data[0], [4.0, 5.0, 6.0, 1.0], "position row");
-    // Diffuse color row (row base+2).
-    assert_row_eq(data[2], [0.25, 0.5, 0.75, 1.0], "diffuse row");
+    // Diffuse colour row (row base+2), carrying the specular alpha in .w:
+    // the specular sum reads it there, and the diffuse alpha is dead.
+    assert_row_eq(data[2], [0.25, 0.5, 0.75, 0.5], "diffuse row");
     // Attenuation row (row base+4): a0, a1, a2, range.
     assert_row_eq(data[4], [1.0, 0.1, 0.01, 100.0], "attenuation row");
 }

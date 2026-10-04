@@ -1190,13 +1190,8 @@ bitflags::bitflags! {
         /// Drives whether the FF VS emit needs the indexed-palette input
         /// attribute (slot 13).
         const DECLARED_INDICES = 1 << 4;
-        /// The vertex format came from `SetVertexDeclaration`, not `SetFVF`.
-        ///
-        /// A COLORVERTEX material source pointing at a vertex colour the
-        /// declaration omits reads 0 (FVF instead falls back to the material).
-        const USES_VERTEX_DECL = 1 << 5;
         /// Vertex declaration has a PSIZE element (per-vertex point size).
-        const HAS_PSIZE = 1 << 6;
+        const HAS_PSIZE = 1 << 5;
     }
 }
 
@@ -1205,11 +1200,6 @@ impl FfVsLayout {
     #[must_use]
     pub const fn has_normal(&self) -> bool {
         self.flags.contains(FfVsLayoutFlags::HAS_NORMAL)
-    }
-    #[inline]
-    #[must_use]
-    pub const fn uses_vertex_decl(&self) -> bool {
-        self.flags.contains(FfVsLayoutFlags::USES_VERTEX_DECL)
     }
     #[inline]
     #[must_use]
@@ -1245,9 +1235,8 @@ impl FfVsLayout {
 /// Panics if `tex_coord_count` exceeds the `u8` range (clamped to ≤8 by the
 /// loop, so unreachable).
 #[must_use]
-pub fn ff_vs_layout_from_elements(elements: &[D3DVERTEXELEMENT9], uses_decl: bool) -> FfVsLayout {
+pub fn ff_vs_layout_from_elements(elements: &[D3DVERTEXELEMENT9]) -> FfVsLayout {
     let mut flags = FfVsLayoutFlags::empty();
-    flags.set(FfVsLayoutFlags::USES_VERTEX_DECL, uses_decl);
     let mut max_texcoord_index: Option<u8> = None;
     let mut tex_coord_dims = [0u8; 8];
     let mut declared_weights_count = 0u8;

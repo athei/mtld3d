@@ -17,8 +17,8 @@ use std::collections::BTreeMap;
 
 use bitflags::bitflags;
 use mtld3d_types::{
-    D3DCOLORVALUE, D3DLIGHT_DIRECTIONAL, D3DLIGHT_SPOT, D3DLIGHT9, D3DMATERIAL9, D3DMATRIX,
-    D3DRS_ALPHAFUNC, D3DRS_ALPHAREF, D3DRS_ALPHATESTENABLE, D3DRS_AMBIENT,
+    D3DCOLORVALUE, D3DLIGHT_DIRECTIONAL, D3DLIGHT_POINT, D3DLIGHT_SPOT, D3DLIGHT9, D3DMATERIAL9,
+    D3DMATRIX, D3DRS_ALPHAFUNC, D3DRS_ALPHAREF, D3DRS_ALPHATESTENABLE, D3DRS_AMBIENT,
     D3DRS_AMBIENTMATERIALSOURCE, D3DRS_COLORVERTEX, D3DRS_DEPTHBIAS, D3DRS_DIFFUSEMATERIALSOURCE,
     D3DRS_EMISSIVEMATERIALSOURCE, D3DRS_FOGCOLOR, D3DRS_FOGDENSITY, D3DRS_FOGENABLE, D3DRS_FOGEND,
     D3DRS_FOGSTART, D3DRS_FOGTABLEMODE, D3DRS_FOGVERTEXMODE, D3DRS_INDEXEDVERTEXBLENDENABLE,
@@ -171,7 +171,7 @@ pub struct FfState {
     ///
     /// D3D9 caps `MaxActiveLights` at 8, so `u8` covers every slot.
     light_enabled: u8,
-    /// Bit `i` set iff `SetLight(i, &light)` was called with `light.Type != 0`.
+    /// Bit `i` set iff `SetLight(i, &light)` was called with a POINT, SPOT or DIRECTIONAL type.
     ///
     /// Updated incrementally by `set_light`. `light_active_mask()` = this
     /// AND `light_enabled` — the FF VS reads constants only for slots that
@@ -181,7 +181,7 @@ pub struct FfState {
     ///
     /// I.e. `SetLight(i, ..)` or `LightEnable(i, ..)` has been called at least
     /// once. Distinct from `light_set_mask` (which gates the FF lighting
-    /// contribution on a non-zero type): a defined light may have type 0.
+    /// contribution on a valid type): a defined light may have type 0.
     /// `GetLight`/`GetLightEnable` return `INVALIDCALL` for an undefined slot,
     /// per the D3D9 get-before-set contract.
     light_defined_mask: u8,
@@ -202,7 +202,7 @@ pub struct FfState {
     /// `MaxActiveLights` (8) caps only how many lights simultaneously contribute
     /// to a draw, not the addressable index range. Slots `0..8` live in the
     /// `lights` array with their masks, the fast path; higher indices live
-    /// here. An enabled overflow light with a non-zero type feeds FF lighting:
+    /// here. An enabled overflow light of a valid type feeds FF lighting:
     /// [`Self::resolve_active_lights`] packs it after the active fast-path
     /// slots, up to [`MAX_ACTIVE_LIGHTS`], so its writes mark the LIGHTS
     /// section like a fast-path write. [`FfStateSnapshot`] captures them with
@@ -501,7 +501,7 @@ impl FfState {
         self.lights[index] = *light;
         let bit = 1u8 << index;
         self.light_defined_mask |= bit;
-        if light.type_ != 0 {
+        if light_type_contributes(light.type_) {
             self.light_set_mask |= bit;
         } else {
             self.light_set_mask &= !bit;
@@ -521,7 +521,7 @@ impl FfState {
 
     /// Bit `i` set iff slot `i` contributes constants to the FF VS.
     ///
-    /// I.e. has a non-zero D3DLIGHT9 type AND is enabled via `LightEnable`.
+    /// I.e. has a POINT, SPOT or DIRECTIONAL type AND is enabled via `LightEnable`.
     /// Source of truth for `FfVsKey::light_active_mask` and the inline
     /// `max_const_row` derivation in [`Self::ff_vs_row_count`].
     #[inline]
@@ -539,7 +539,7 @@ impl FfState {
     /// `0..8` (bit set in `light_set_mask & light_enabled`) first, then the
     /// sparse `overflow_lights` (indices ≥ 8, already ascending in the
     /// `BTreeMap`) — and truncate to [`MAX_ACTIVE_LIGHTS`]. An overflow entry
-    /// contributes only when enabled and carrying a non-zero light type,
+    /// contributes only when enabled and carrying a POINT, SPOT or DIRECTIONAL type,
     /// mirroring the `light_set_mask & light_enabled` gate the fast path uses.
     ///
     /// For the common contiguous layout (lights at 0,1,2,…) the result is
@@ -571,7 +571,7 @@ impl FfState {
             if out.len == MAX_ACTIVE_LIGHTS as usize {
                 return out;
             }
-            if slot.enabled && slot.light.type_ != 0 {
+            if slot.enabled && light_type_contributes(slot.light.type_) {
                 out.lights[out.len] = ActiveLight {
                     light: slot.light,
                     ty: slot.light.type_,
@@ -1306,7 +1306,10 @@ impl FfState {
             "FfState::build_vs_key clamp violated: tex_coord_count={tex_coord_count}"
         );
 
-        let vertex_blend_indexed = render_states[D3DRS_INDEXEDVERTEXBLENDENABLE as usize] != 0;
+        // Indexed blending needs the indices it is named for: without a
+        // BLENDINDICES element the draw blends the sequential matrices.
+        let vertex_blend_indexed = render_states[D3DRS_INDEXEDVERTEXBLENDENABLE as usize] != 0
+            && layout.declared_indices();
         let vertex_blend_count = resolve_vertex_blend_count(
             render_states[D3DRS_VERTEXBLEND as usize],
             layout,
@@ -1920,11 +1923,13 @@ impl FfState {
                 (0.0, 0.0)
             };
             dst[base + 1].write([dir[0], dir[1], dir[2], light.falloff.max(1e-6)]);
-            dst[base + 2].write(colorvalue_to_rgba(&light.diffuse));
-            // Light-color alpha lanes are dead in the lighting math (the
-            // accumulated alpha is overwritten by the material diffuse
-            // alpha), so the ambient and specular rows donate .w to the
-            // spot params.
+            // The diffuse and ambient alphas are dead in the lighting math
+            // (the lit alpha is the material diffuse alpha), so the diffuse
+            // row carries the specular alpha the specular sum reads, and the
+            // ambient and specular rows donate .w to the spot params.
+            let spec = colorvalue_to_rgba(&light.specular);
+            let diffuse = colorvalue_to_rgba(&light.diffuse);
+            dst[base + 2].write([diffuse[0], diffuse[1], diffuse[2], spec[3]]);
             let amb = colorvalue_to_rgba(&light.ambient);
             dst[base + 3].write([amb[0], amb[1], amb[2], spot_offset]);
             dst[base + 4].write([
@@ -1933,7 +1938,6 @@ impl FfState {
                 light.attenuation2,
                 light.range,
             ]);
-            let spec = colorvalue_to_rgba(&light.specular);
             dst[base + 5].write([spec[0], spec[1], spec[2], spot_scale]);
         }
     }
@@ -2240,7 +2244,6 @@ fn build_vs_flags(
     let mut flags = FfVsFlags::empty();
     flags.set(FfVsFlags::HAS_NORMAL, layout.has_normal());
     flags.set(FfVsFlags::HAS_COLOR0, layout.has_color0());
-    flags.set(FfVsFlags::USES_VERTEX_DECL, layout.uses_vertex_decl());
     flags.set(FfVsFlags::HAS_COLOR1, layout.has_color1());
     flags.set(FfVsFlags::LIGHTING_ENABLED, lighting_enabled);
     flags.set(FfVsFlags::HAS_RHW, layout.has_rhw());
@@ -2276,20 +2279,17 @@ fn build_vs_flags(
 
 /// Whether the FF VS writes a coordinate other than zero for a stage with this TCI.
 ///
-/// `mode` and `set` are the two halves of an `FfVsKey::tci` entry.
-/// CAMERASPACEPOSITION and SPHEREMAP always generate one;
-/// CAMERASPACENORMAL and CAMERASPACEREFLECTIONVECTOR generate one from a
-/// vertex normal and otherwise pass the set through, as passthru and the
-/// undefined modes do. A pre-transformed layout generates nothing and
-/// passes every mode through.
+/// `mode` and `set` are the two halves of an `FfVsKey::tci` entry. The four
+/// texgen modes always generate one, from a zero normal where the vertex has
+/// none; passthru and the undefined modes pass the set through. A
+/// pre-transformed layout generates nothing and passes every mode through.
 fn stage_has_coordinate(mode: u8, set: u8, layout: FfVsLayout) -> bool {
     let routes_a_streamed_set = set.min(7) < layout.tex_coord_count;
     if layout.has_rhw() {
         return routes_a_streamed_set;
     }
     match mode {
-        2 | 4 => true,
-        1 | 3 => layout.has_normal() || routes_a_streamed_set,
+        1..=4 => true,
         _ => routes_a_streamed_set,
     }
 }
@@ -2479,22 +2479,17 @@ fn resolve_vertex_blend_count(mode: u32, layout: FfVsLayout, indexed: bool) -> u
     // Sequential mode (mode = 1..=3) needs at least one explicit weight in
     // the decl; the implicit last weight comes from `1 - sum(explicit)`.
     // Indexed mode for D3DVBF_0WEIGHTS doesn't need BLENDWEIGHT but does
-    // need BLENDINDICES.
+    // need BLENDINDICES. `indexed` already requires a BLENDINDICES element,
+    // so a declaration without one blends the weighted modes sequentially.
     if mode != 256 && layout.declared_weights_count == 0 {
         mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
             "FF vertex blend: D3DRS_VERTEXBLEND non-zero but vertex decl has no BLENDWEIGHT element → falling back to single-world-matrix"
         );
         return 0;
     }
-    if indexed && !layout.declared_indices() {
-        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
-            "FF vertex blend: D3DRS_INDEXEDVERTEXBLENDENABLE=TRUE but vertex decl has no BLENDINDICES element → falling back to single-world-matrix"
-        );
-        return 0;
-    }
     if mode == 256 && !indexed {
         mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
-            "FF vertex blend: D3DVBF_0WEIGHTS requires D3DRS_INDEXEDVERTEXBLENDENABLE=TRUE → falling back to single-world-matrix"
+            "FF vertex blend: D3DVBF_0WEIGHTS needs D3DRS_INDEXEDVERTEXBLENDENABLE=TRUE and a BLENDINDICES element → falling back to single-world-matrix"
         );
         return 0;
     }
@@ -2684,6 +2679,15 @@ fn capture_lights(state: &FfState) -> Vec<CapturedLight> {
             enabled: slot.enabled,
         });
     fast.chain(overflow).collect()
+}
+
+/// Whether a light of this `D3DLIGHT9::Type` contributes to fixed-function lighting.
+///
+/// `SetLight` stores any type and `GetLight` reports it back, but only
+/// POINT, SPOT and DIRECTIONAL light a vertex; zero and every value past
+/// DIRECTIONAL add nothing, even while the light is enabled.
+const fn light_type_contributes(ty: u32) -> bool {
+    D3DLIGHT_POINT <= ty && ty <= D3DLIGHT_DIRECTIONAL
 }
 
 fn d3dcolor_to_rgba(c: u32) -> [f32; 4] {

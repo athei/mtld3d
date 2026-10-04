@@ -190,12 +190,56 @@ fn emits_one_directional_light() {
     );
     assert!(!msl.contains("n = normalize(n)"), "{msl}");
     assert!(msl.contains("ndotl"), "{msl}");
-    assert!(msl.contains("saturate(diffuseAccum)"), "{msl}");
+    assert!(msl.contains("saturate(float4(diffuseAccum.rgb, "), "{msl}");
     // Per-light ambient contribution must be modulated by material ambient —
     // without it, saturate clips highlight detail into flat softness.
     assert!(msl.contains("atten * (vs_c["), "{msl}");
-    // Alpha preserved from material diffuse after saturate.
-    assert!(msl.contains("lit.a = "), "{msl}");
+    // The alpha is the material diffuse alpha, clamped with the colour.
+    assert!(
+        msl.contains("out.color0 = saturate(float4(diffuseAccum.rgb, in.v2.a));"),
+        "{msl}"
+    );
+}
+
+/// The lit diffuse alpha is clamped to [0, 1] like the colour it travels with.
+///
+/// A material diffuse alpha outside the range reached the pixel stage as it
+/// was, where a modulate read it unclamped.
+#[test]
+fn lit_diffuse_alpha_is_clamped() {
+    let mut vs = default_vs_key();
+    vs.flags.set(FfVsFlags::HAS_NORMAL, true);
+    vs.flags.set(FfVsFlags::LIGHTING_ENABLED, true);
+    vs.flags.set(FfVsFlags::HAS_COLOR0, false);
+    vs.light_active_mask = 1;
+    vs.light_directional_mask = 1;
+    let msl = emit_vs_ff(&vs);
+    assert!(
+        msl.contains("out.color0 = saturate(float4(diffuseAccum.rgb, vs_c[10].a));"),
+        "{msl}"
+    );
+    assert!(!msl.contains("lit.a"), "{msl}");
+}
+
+/// The specular term needs a positive N.H as well as a positive N.L.
+///
+/// With a material power of zero, `pow(0, 0)` is one, so a gate on N.L
+/// alone lit the side of a surface turned away from the viewer.
+#[test]
+fn specular_term_is_gated_on_a_positive_half_angle() {
+    let mut vs = default_vs_key();
+    vs.flags.set(FfVsFlags::HAS_NORMAL, true);
+    vs.flags.set(FfVsFlags::LIGHTING_ENABLED, true);
+    vs.flags.set(FfVsFlags::SPECULAR_ENABLE, true);
+    vs.light_active_mask = 1;
+    vs.light_directional_mask = 1;
+    let msl = emit_vs_ff(&vs);
+    assert!(
+        msl.contains(
+            "float specFactor = (ndotl > 0.0 && ndoth > 0.0) ? pow(ndoth, mat_power) : 0.0;"
+        ),
+        "{msl}"
+    );
 }
 
 /// A lit draw with specular lighting off passes the vertex specular colour through to `color1`.
@@ -235,10 +279,14 @@ fn specular_enabled_emits_blinn_phong_pow() {
     vs.flags.set(FfVsFlags::SPECULAR_ENABLE, true);
     let msl = emit_pair_for_tests(&vs, &default_ps_key(), VariantKey::default());
     assert!(msl.contains("pow(ndoth, mat_power)"), "{msl}");
+    // The specular colour keeps its alpha: the sum of the lights' specular
+    // terms, alpha included, weighted by the material specular source.
+    assert!(msl.contains("float4 specAccum = float4(0.0);"), "{msl}");
     assert!(
-        msl.contains("out.color1 = float4(saturate(specAccum), 0.0);"),
+        msl.contains("out.color1 = saturate(specAccum * vs_c[12]);"),
         "{msl}"
     );
+    assert!(!msl.contains("saturate(specAccum), 0.0"), "{msl}");
 }
 
 #[test]
@@ -254,7 +302,7 @@ fn specular_term_reads_light_specular_row() {
     vs.light_directional_mask = 1;
     let msl = emit_pair_for_tests(&vs, &default_ps_key(), VariantKey::default());
     assert!(
-        msl.contains("specAccum += atten * specFactor * (vs_c[20].rgb"),
+        msl.contains("specAccum += atten * specFactor * float4(vs_c[20].rgb, vs_c[17].w);"),
         "{msl}"
     );
 }
@@ -393,10 +441,10 @@ fn the_eye_space_position_is_declared_only_where_it_is_read() {
                         "lighting={lighting} normal={normal} specular={specular} local_viewer={local_viewer} light={light_active}/{directional}/{spot} tci={tci} blend={blend}\n{msl}"
                     );
 
-                    // Mode 3 without a vertex normal falls back to passthru,
-                    // which reads no eye-space position; mode 4 reads one
-                    // either way.
-                    let texgen_reads = tci == 2 || tci == 4 || (tci == 3 && normal);
+                    // Modes 3 and 4 reflect the eye direction, about a zero
+                    // normal where the vertex has none, so both read the
+                    // eye-space position either way.
+                    let texgen_reads = matches!(tci, 2..=4);
                     let light_vector_reads = lighting && light_active != 0 && directional == 0;
                     // The specular view vector is read by the half-angle
                     // inside the per-light block, so it needs an active slot
@@ -422,7 +470,7 @@ fn the_eye_space_position_is_declared_only_where_it_is_read() {
                     assert_eq!(msl.contains("float4(posEye, 0.0)"), tci == 2, "{case}");
                     assert_eq!(
                         msl.contains("normalize(posEye)"),
-                        tci == 4 || (tci == 3 && normal),
+                        tci == 3 || tci == 4,
                         "{case}"
                     );
                     assert_eq!(msl.contains("posEye"), reads, "{case}");
@@ -485,8 +533,8 @@ fn the_eye_space_normal_is_declared_only_where_it_is_read() {
                         "lighting={lighting} normal={normal} specular={specular} local_viewer={local_viewer} normalize={normalize_normals} light={light_active}/{directional}/{spot} tci={tci} blend={blend}\n{msl}"
                     );
 
-                    // Both texgen modes fall back to a normal-less arm that
-                    // reads nothing, and the lighting terms live inside the
+                    // Every texgen mode has a normal-less arm that reads a
+                    // zero normal in place of `n`, and the lighting terms live inside the
                     // per-light block, so an enabled lighting branch with no
                     // active slot reads nothing either.
                     let texgen_reads = normal && matches!(tci, 1 | 3 | 4);
@@ -519,8 +567,8 @@ fn the_eye_space_normal_is_declared_only_where_it_is_read() {
                     assert_eq!(tokens > 0, reads, "{case}");
                     // The terms that must not move with the declaration: the
                     // renormalization rides with it whenever NORMALIZENORMALS
-                    // is set, lit or not, blended or not, and the sphere
-                    // map's normal-less reflection does not.
+                    // is set, lit or not, blended or not, and the
+                    // normal-less texgen arms do not.
                     assert_eq!(
                         msl.contains("    n = normalize(n);"),
                         reads && normalize_normals,
@@ -528,7 +576,13 @@ fn the_eye_space_normal_is_declared_only_where_it_is_read() {
                     );
                     assert_eq!(
                         msl.contains("float3 R_tci = E_tci;"),
-                        tci == 4 && !normal,
+                        (tci == 3 || tci == 4) && !normal,
+                        "{case}"
+                    );
+                    // Passthru reads the zero-dimension set as zero too.
+                    assert_eq!(
+                        msl.contains("float4 raw0 = float4(0.0);"),
+                        tci == 0 || (tci == 1 && !normal),
                         "{case}"
                     );
                     assert!(!msl.contains("n_texgen"), "{case}");
@@ -2064,23 +2118,28 @@ fn texgen_reads_the_lighting_normal_lit_or_unlit() {
     }
 }
 
+/// CAMERASPACENORMAL and CAMERASPACEREFLECTIONVECTOR generate from a zero normal without one.
+///
+/// The vertex's own coordinate set is not read: the normal is zero, so the
+/// camera-space normal is (0, 0, 0) and the reflection vector is the unit
+/// eye-to-vertex direction, as the sphere map already reads it.
 #[test]
-fn tci_cameraspacenormal_without_normal_falls_back() {
-    // TCI_CAMERASPACENORMAL=1 needs a vertex normal. Without one we must
-    // silently fall back to passthru (and warn).
-    let mut vs = default_vs_key();
-    vs.tex_coord_count = 1;
-    vs.input_tex_coord_count = 1;
-    vs.tci[0] = tci_entry(1, 0);
-    vs.tex_coord_dims[0] = 2; // coord-set 0 is FLOAT2
-    // has_normal = false in default key.
-    let ps = default_ps_key();
-    let msl = emit_pair_for_tests(&vs, &ps, VariantKey::default());
-    assert!(
-        msl.contains("float4 raw0 = float4(in.v4.xy, 0.0, 0.0);"),
-        "{msl}"
-    );
-    assert!(msl.contains("out.texcoord0 = raw0;"), "{msl}");
+fn normal_less_texgen_reads_a_zero_normal() {
+    for (mode, raw) in [
+        (1, "float4 raw0 = float4(0.0);"),
+        (3, "float3 R_tci = E_tci;"),
+    ] {
+        let mut vs = default_vs_key();
+        vs.tex_coord_count = 1;
+        vs.input_tex_coord_count = 1;
+        vs.tci[0] = tci_entry(mode, 0);
+        vs.tex_coord_dims[0] = 2;
+        // has_normal = false in default key.
+        let msl = emit_pair_for_tests(&vs, &default_ps_key(), VariantKey::default());
+        assert!(msl.contains(raw), "mode {mode}\n{msl}");
+        assert!(!msl.contains("in.v4"), "mode {mode}\n{msl}");
+        assert!(msl.contains("out.texcoord0 = raw0;"), "mode {mode}\n{msl}");
+    }
 }
 
 #[test]
@@ -2235,13 +2294,12 @@ fn eye_space_locals_are_declared_once_for_every_lighting_normal_and_tci_mix() {
 
                     let pos_eye_decls = msl.matches("float3 posEye =").count();
                     let normal_decls = msl.matches("float3 n =").count();
-                    // A normal-less CAMERASPACEREFLECTIONVECTOR stage falls
-                    // back to passthru and reads no eye-space position, so
-                    // the pre-scan does not hoist one for it.
-                    let wants_pos_eye = lighting || mode == 2 || mode == 4 || (mode == 3 && normal);
-                    // A normal-less texgen stage falls back to passthru or,
-                    // for SPHEREMAP, reflects about no normal, so it reads no
-                    // eye normal.
+                    // A normal-less CAMERASPACEREFLECTIONVECTOR stage
+                    // reflects about a zero normal, which still reads the
+                    // eye-space position.
+                    let wants_pos_eye = lighting || matches!(mode, 2..=4);
+                    // A normal-less texgen stage generates from a zero
+                    // normal, so it reads no eye normal.
                     let wants_normal = normal && (lighting || matches!(mode, 1 | 3 | 4));
                     assert_eq!(pos_eye_decls, usize::from(wants_pos_eye), "{case}");
                     assert_eq!(normal_decls, usize::from(wants_normal), "{case}");
@@ -2259,15 +2317,21 @@ fn eye_space_locals_are_declared_once_for_every_lighting_normal_and_tci_mix() {
                     let raw = match mode {
                         1 if normal => "float4 raw0 = float4(n, 0.0);",
                         2 => "float4 raw0 = float4(posEye, 0.0);",
-                        3 if normal => "raw0 = float4(R_tci, 0.0);",
+                        3 => "raw0 = float4(R_tci, 0.0);",
                         4 => "raw0 = float4(R_tci.xy / m_tci + 0.5, 0.0, 0.0);",
                         _ => "float4 raw0 = float4(0.0);",
                     };
                     assert!(msl.contains(raw), "{case}");
                     // The reflection vector reflects the view direction about
-                    // the vertex normal in both modes that read it.
-                    if mode == 3 && normal {
-                        assert!(msl.contains("float3 R_tci = reflect(E_tci, n);"), "{case}");
+                    // the vertex normal, and about a zero normal when the
+                    // vertex has none.
+                    if mode == 3 {
+                        let reflection = if normal {
+                            "float3 R_tci = reflect(E_tci, n);"
+                        } else {
+                            "float3 R_tci = E_tci;"
+                        };
+                        assert!(msl.contains(reflection), "{case}");
                     }
                     // The sphere map reflects about the vertex normal, and
                     // about a zero normal when the vertex has none.
