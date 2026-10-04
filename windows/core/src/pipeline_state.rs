@@ -16,7 +16,10 @@ use mtld3d_shared::{
     mtl::{BlendFactor, BlendOperation, ColorWriteMask, PixelFormat, VertexStepFunction},
     mtl_handle::MTLFunctionKind,
 };
-use mtld3d_types::{D3DBLEND_ONE, D3DBLEND_ZERO, D3DBLENDOP_ADD, MAX_STREAMS};
+use mtld3d_types::{
+    D3DBLEND_BOTHINVSRCALPHA, D3DBLEND_BOTHSRCALPHA, D3DBLEND_INVSRCALPHA, D3DBLEND_ONE,
+    D3DBLEND_SRCALPHA, D3DBLEND_ZERO, D3DBLENDOP_ADD, MAX_STREAMS,
+};
 
 use crate::{
     convert::{d3d_to_metal_blend_op, d3d_to_metal_blend_rt, d3d_to_metal_write_mask},
@@ -634,7 +637,8 @@ struct EffectiveBlend {
 /// only in stale blend states share a pipeline. With blending on, the alpha
 /// factors and operation take effect only when
 /// `D3DRS_SEPARATEALPHABLENDENABLE` is TRUE (D3D9 spec); otherwise the RGB
-/// values apply to alpha too.
+/// values apply to alpha too. A `BOTH*` source factor sets the destination
+/// factor of its own equation as well, see [`both_src_alpha`].
 fn effective_blend(rs: &PipelineRsBits) -> EffectiveBlend {
     if !rs.blend_enable() {
         return EffectiveBlend {
@@ -647,18 +651,15 @@ fn effective_blend(rs: &PipelineRsBits) -> EffectiveBlend {
             separate_alpha: false,
         };
     }
-    let (src, dst, op) = (
-        u32::from(rs.src_blend),
-        u32::from(rs.dst_blend),
-        u32::from(rs.blend_op),
-    );
+    let (src, dst) = both_src_alpha(u32::from(rs.src_blend), u32::from(rs.dst_blend));
+    let op = u32::from(rs.blend_op);
     let separate_alpha = rs.separate_alpha_blend_enable();
     let (src_alpha, dst_alpha, op_alpha) = if separate_alpha {
-        (
+        let (src_alpha, dst_alpha) = both_src_alpha(
             u32::from(rs.src_blend_alpha),
             u32::from(rs.dst_blend_alpha),
-            u32::from(rs.blend_op_alpha),
-        )
+        );
+        (src_alpha, dst_alpha, u32::from(rs.blend_op_alpha))
     } else {
         (src, dst, op)
     };
@@ -670,6 +671,21 @@ fn effective_blend(rs: &PipelineRsBits) -> EffectiveBlend {
         dst_alpha,
         op_alpha,
         separate_alpha,
+    }
+}
+
+/// Resolve the `D3DBLEND_BOTH*` source factors into the pair they stand for.
+///
+/// `D3DBLEND_BOTHSRCALPHA` as a source factor means source `SRCALPHA` and
+/// destination `INVSRCALPHA`, and `D3DBLEND_BOTHINVSRCALPHA` the reverse; the
+/// destination state is overridden either way (D3D9 spec). Any other pair
+/// passes through. A `BOTH*` value written as the destination factor is left
+/// to [`crate::convert::d3d_to_metal_blend`], which reads it as its source half.
+const fn both_src_alpha(src: u32, dst: u32) -> (u32, u32) {
+    match src {
+        D3DBLEND_BOTHSRCALPHA => (D3DBLEND_SRCALPHA, D3DBLEND_INVSRCALPHA),
+        D3DBLEND_BOTHINVSRCALPHA => (D3DBLEND_INVSRCALPHA, D3DBLEND_SRCALPHA),
+        _ => (src, dst),
     }
 }
 

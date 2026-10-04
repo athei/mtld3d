@@ -8,8 +8,8 @@ use mtld3d_shared::{
     },
 };
 use mtld3d_types::{
-    D3DBLEND_BLENDFACTOR, D3DBLEND_DESTALPHA, D3DBLEND_DESTCOLOR, D3DBLEND_INVBLENDFACTOR,
-    D3DBLEND_INVDESTALPHA, D3DBLEND_INVDESTCOLOR, D3DBLEND_INVSRCALPHA, D3DBLEND_INVSRCCOLOR,
+    D3DBLEND_BLENDFACTOR, D3DBLEND_BOTHINVSRCALPHA, D3DBLEND_BOTHSRCALPHA, D3DBLEND_DESTALPHA,
+    D3DBLEND_DESTCOLOR, D3DBLEND_INVBLENDFACTOR, D3DBLEND_INVDESTALPHA, D3DBLEND_INVDESTCOLOR, D3DBLEND_INVSRCALPHA, D3DBLEND_INVSRCCOLOR,
     D3DBLEND_ONE, D3DBLEND_SRCALPHA, D3DBLEND_SRCALPHASAT, D3DBLEND_SRCCOLOR, D3DBLEND_ZERO,
     D3DBLENDOP_ADD, D3DBLENDOP_MAX, D3DBLENDOP_MIN, D3DBLENDOP_REVSUBTRACT, D3DBLENDOP_SUBTRACT,
     D3DCMP_ALWAYS, D3DCMP_EQUAL, D3DCMP_GREATER, D3DCMP_GREATEREQUAL, D3DCMP_LESS,
@@ -388,6 +388,11 @@ pub fn d3d_to_metal_blend(d3d_blend: u32) -> BlendFactor {
         D3DBLEND_DESTCOLOR => BlendFactor::DestinationColor,
         D3DBLEND_INVDESTCOLOR => BlendFactor::OneMinusDestinationColor,
         D3DBLEND_SRCALPHASAT => BlendFactor::SourceAlphaSaturated,
+        // Source-only shorthands; `pipeline_state` resolves them as a source
+        // factor. Written as a destination factor, each reads as its source
+        // half, which is what the drivers that accept it there do.
+        D3DBLEND_BOTHSRCALPHA => BlendFactor::SourceAlpha,
+        D3DBLEND_BOTHINVSRCALPHA => BlendFactor::OneMinusSourceAlpha,
         D3DBLEND_BLENDFACTOR => BlendFactor::BlendColor,
         D3DBLEND_INVBLENDFACTOR => BlendFactor::OneMinusBlendColor,
         other => {

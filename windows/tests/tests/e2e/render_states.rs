@@ -7,7 +7,7 @@ use mtld3d_tests::{
     assert_pixel_approx,
 };
 use mtld3d_types::{
-    D3DBLEND_INVSRCALPHA, D3DBLEND_ONE, D3DBLEND_SRCALPHA, D3DBLENDOP_ADD, D3DCLEAR_STENCIL,
+    D3DBLEND_BOTHINVSRCALPHA, D3DBLEND_BOTHSRCALPHA, D3DBLEND_INVSRCALPHA, D3DBLEND_ZERO, D3DBLEND_ONE, D3DBLEND_SRCALPHA, D3DBLENDOP_ADD, D3DCLEAR_STENCIL,
     D3DCLEAR_TARGET, D3DCLEAR_ZBUFFER, D3DCMP_ALWAYS, D3DCMP_EQUAL, D3DCMP_LESS, D3DCMP_LESSEQUAL,
     D3DCULL_CCW, D3DCULL_CW, D3DCULL_NONE, D3DFILL_SOLID, D3DFILL_WIREFRAME, D3DFMT_A8R8G8B8,
     D3DFVF_DIFFUSE, D3DFVF_TEX1, D3DFVF_XYZ, D3DPOOL_DEFAULT, D3DPT_TRIANGLELIST, D3DRECT,
@@ -281,6 +281,38 @@ fn additive_blend_accumulates() {
     );
     assert!(px.g > 240, "green saturated, got {px:?}");
     assert!(px.b < 20, "blue stays 0, got {px:?}");
+}
+
+#[test]
+fn both_src_alpha_source_factors_override_the_destination_factor() {
+    // `D3DBLEND_BOTHSRCALPHA` as the source factor blends SRCALPHA over
+    // INVSRCALPHA and `D3DBLEND_BOTHINVSRCALPHA` the reverse, whatever
+    // `D3DRS_DESTBLEND` holds. Green at a quarter alpha over opaque blue.
+    let h = Harness::new();
+    arm_diffuse(&h);
+    assert_eq!(h.set_render_state(D3DRS_ALPHABLENDENABLE, 1), 0);
+    assert_eq!(h.set_render_state(D3DRS_DESTBLEND, D3DBLEND_ZERO), 0);
+    let quad = fill_quad(0x4000_FF00);
+    for (src, green, blue) in [
+        (D3DBLEND_BOTHSRCALPHA, 0x40, 0xBF),
+        (D3DBLEND_BOTHINVSRCALPHA, 0xBF, 0x40),
+    ] {
+        assert_eq!(h.set_render_state(D3DRS_SRCBLEND, src), 0);
+        h.render_once(BLUE, |d| {
+            assert_eq!(
+                d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad),
+                0,
+                "blend draw"
+            );
+        });
+        // Colour only: the destination alpha the blend leaves is not under test.
+        assert_pixel_approx(
+            h.read_pixel(320, 240) | 0xFF00_0000,
+            0xFF00_0000 | (green << 8) | blue,
+            2,
+            &format!("SRCBLEND {src}"),
+        );
+    }
 }
 
 #[test]

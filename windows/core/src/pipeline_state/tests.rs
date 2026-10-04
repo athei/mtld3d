@@ -10,7 +10,7 @@
 
 use mtld3d_shared::mtl::VertexFormat;
 use mtld3d_types::{
-    D3DBLEND_DESTALPHA, D3DBLEND_INVDESTALPHA, D3DBLEND_INVSRCALPHA, D3DBLEND_ONE,
+    D3DBLEND_BOTHINVSRCALPHA, D3DBLEND_BOTHSRCALPHA, D3DBLEND_DESTALPHA, D3DBLEND_INVDESTALPHA, D3DBLEND_INVSRCALPHA, D3DBLEND_ONE,
     D3DBLEND_SRCALPHA, D3DBLEND_ZERO, D3DBLENDOP_ADD, D3DBLENDOP_REVSUBTRACT, D3DDECLTYPE_FLOAT2,
     D3DDECLTYPE_FLOAT3, D3DDECLUSAGE_NORMAL, D3DDECLUSAGE_POSITION, D3DDECLUSAGE_TEXCOORD,
     D3DFVF_TEX1, D3DFVF_XYZ, D3DVERTEXELEMENT9,
@@ -581,6 +581,49 @@ fn blend_on_keys_every_factor_difference() {
         blend_fields(&params_of(&dest_alpha)),
         blend_fields(&params_of(&dest_alpha_rt1_no_alpha))
     );
+}
+
+#[test]
+fn both_src_alpha_source_factors_override_the_destination_factor() {
+    // `BOTHSRCALPHA` as the source factor means SRCALPHA / INVSRCALPHA and
+    // `BOTHINVSRCALPHA` the reverse, whatever the destination state holds, in
+    // the colour equation and, under separate alpha, in the alpha one.
+    let resolve = |src: u32, src_alpha: u32| {
+        let mut s = base();
+        s.rs.src_blend = narrow(src);
+        s.rs.dst_blend = narrow(D3DBLEND_ZERO);
+        s.rs.flags.insert(PipelineRsFlags::SEPARATE_ALPHA_BLEND);
+        s.rs.src_blend_alpha = narrow(src_alpha);
+        s.rs.dst_blend_alpha = narrow(D3DBLEND_ONE);
+        let p = params_of(&s);
+        (p.src_blend, p.dst_blend, p.src_blend_alpha, p.dst_blend_alpha)
+    };
+    assert_eq!(
+        resolve(D3DBLEND_BOTHSRCALPHA, D3DBLEND_BOTHINVSRCALPHA),
+        (
+            BlendFactor::SourceAlpha,
+            BlendFactor::OneMinusSourceAlpha,
+            BlendFactor::OneMinusSourceAlpha,
+            BlendFactor::SourceAlpha,
+        )
+    );
+    assert_eq!(
+        resolve(D3DBLEND_BOTHINVSRCALPHA, D3DBLEND_BOTHSRCALPHA),
+        (
+            BlendFactor::OneMinusSourceAlpha,
+            BlendFactor::SourceAlpha,
+            BlendFactor::SourceAlpha,
+            BlendFactor::OneMinusSourceAlpha,
+        )
+    );
+    // The shorthand and the pair it stands for are one pipeline.
+    let mut both = base();
+    both.rs.src_blend = narrow(D3DBLEND_BOTHSRCALPHA);
+    both.rs.dst_blend = narrow(D3DBLEND_ZERO);
+    let mut pair = base();
+    pair.rs.src_blend = narrow(D3DBLEND_SRCALPHA);
+    pair.rs.dst_blend = narrow(D3DBLEND_INVSRCALPHA);
+    assert_eq!(key_of(&both), key_of(&pair));
 }
 
 /// Key of `base()` for `elements`, resolved under the fixed-function convention.
