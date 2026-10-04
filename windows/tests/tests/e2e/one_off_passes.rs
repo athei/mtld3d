@@ -6,14 +6,18 @@
 //! pass writes, and that the depth attachment the device had bound (its mip
 //! level and its sample count) is the one the next draw tests against.
 
-use mtld3d_tests::{Harness, HarnessConfig, PosColorVertex, Rgba8, RhwVertex, Surface};
+use mtld3d_tests::{
+    Harness, HarnessConfig, PosColorVertex, Reading, Rgba8, RhwVertex, Surface, assert_or_reread,
+};
 use mtld3d_types::{
     D3D_OK, D3DCLEAR_TARGET, D3DCLEAR_ZBUFFER, D3DCMP_LESSEQUAL, D3DFMT_A8R8G8B8, D3DFMT_D24S8,
     D3DFMT_INTZ, D3DFMT_X8R8G8B8, D3DFVF_DIFFUSE, D3DFVF_XYZ, D3DFVF_XYZRHW, D3DLOCK_READONLY,
     D3DMULTISAMPLE_4_SAMPLES, D3DPOOL_DEFAULT, D3DPOOL_SYSTEMMEM, D3DPT_TRIANGLELIST,
-    D3DRS_LIGHTING, D3DRS_ZENABLE, D3DRS_ZFUNC, D3DRS_ZWRITEENABLE, D3DTEXF_LINEAR, D3DTEXF_NONE,
-    D3DUSAGE_DEPTHSTENCIL,
+    D3DRS_LIGHTING, D3DRS_POINTSIZE, D3DRS_ZENABLE, D3DRS_ZFUNC, D3DRS_ZWRITEENABLE,
+    D3DTEXF_LINEAR, D3DTEXF_NONE, D3DUSAGE_DEPTHSTENCIL,
 };
+
+use super::msaa::{RT_SIZE, sample_intz};
 
 const RED: u32 = 0xFFFF_0000;
 const GREEN: u32 = 0xFF00_FF00;
@@ -138,6 +142,79 @@ fn resolved_pixel(h: &Harness, source: &Surface<'_>, x: u32, y: u32) -> u32 {
         "StretchRect resolve"
     );
     surface_pixel(h, &plain, x, y)
+}
+
+/// The depth the probe's INTZ is cleared to before the RESZ, so a RESZ that never ran reads it.
+const PROBE_PRIMER: f32 = 0.5;
+
+/// Which depth sample zero of the bound 4x surface holds at the centre, as a RESZ reads it.
+///
+/// For the failure report of the multisampled `ColorFill` test, after its
+/// colour readings. A fresh INTZ is bound as depth and cleared to
+/// [`PROBE_PRIMER`], the surface goes back, a RESZ copies its sample zero
+/// into the INTZ, and the INTZ is sampled back at its centre. The text gives
+/// the read and names the value of the test's scene, or the primer, that its
+/// eight-bit depth matches. A step that fails panics with its own message.
+fn depth_probe(h: &Harness) -> String {
+    let depth = h.depth_stencil_surface().expect("a depth surface is bound");
+    let (hr, desc) = depth.desc();
+    assert_eq!(hr, D3D_OK, "GetDesc on the depth surface");
+    let intz = h.create_texture(
+        desc.width,
+        desc.height,
+        1,
+        D3DUSAGE_DEPTHSTENCIL,
+        D3DFMT_INTZ,
+        D3DPOOL_DEFAULT,
+    );
+    // Primed through a target of the INTZ's own size: binding a smaller one
+    // would cut the clear's viewport to that size and miss the centre.
+    let prime_rt = h.create_render_target(desc.width, desc.height, D3DFMT_A8R8G8B8);
+    let colour = h.render_target(0);
+    assert_eq!(
+        h.set_render_target(0, &prime_rt),
+        D3D_OK,
+        "bind the priming target"
+    );
+    assert_eq!(
+        h.set_depth_stencil_surface(&intz.surface_level(0)),
+        D3D_OK,
+        "bind the INTZ as depth"
+    );
+    assert_eq!(
+        h.clear(D3DCLEAR_ZBUFFER, 0, PROBE_PRIMER, 0),
+        D3D_OK,
+        "clear the INTZ to the primer"
+    );
+    assert_eq!(
+        h.set_render_target(0, &colour),
+        D3D_OK,
+        "rebind the render target"
+    );
+    assert_eq!(
+        h.set_depth_stencil_surface(&depth),
+        D3D_OK,
+        "rebind the depth surface"
+    );
+    assert_eq!(h.set_texture(0, &intz), D3D_OK, "bind the RESZ destination");
+    assert_eq!(
+        h.set_render_state(D3DRS_POINTSIZE, 0x7fa0_5000),
+        D3D_OK,
+        "the RESZ magic value"
+    );
+    let sample_rt = h.create_render_target(RT_SIZE, RT_SIZE, D3DFMT_A8R8G8B8);
+    let read = Rgba8::from_pixel(sample_intz(h, &sample_rt, &intz));
+    let value = f32::from(read.r) / 255.0;
+    let matched = [
+        (0.2, "the near draw's 0.2"),
+        (1.0, "the clear's 1.0"),
+        (0.8, "the far draw's 0.8"),
+        (PROBE_PRIMER, "the primer: the RESZ did not run"),
+    ]
+    .into_iter()
+    .find(|(depth, _)| (value - depth).abs() <= 2.0 / 255.0)
+    .map_or("none of 1.0, 0.2 and 0.8", |(_, name)| name);
+    format!("sample zero at the centre reads {read:?} (depth {value:.3}), {matched}")
 }
 
 /// A far draw must lose against level 1 of a depth texture across `interrupt`.
@@ -301,11 +378,41 @@ fn color_fill_leaves_a_multisampled_depth_attachment_bound() {
     );
     assert_eq!(h.end_scene(), D3D_OK, "EndScene");
 
+    // A wrong centre is read twice more and the depth attachment probed
+    // before the test fails, so the report names the stage that lost the
+    // draws. A right one returns before any of that runs.
     let (width, height) = h.dims();
-    let center = Rgba8::from_pixel(resolved_pixel(&h, &h.back_buffer(0), width / 2, height / 2));
-    assert!(
-        center.r > 200 && center.g > 200,
-        "the far blue draw fails the depth test the near white one wrote, got {center:?}"
+    let at = (width / 2, height / 2);
+    let backbuffer = h.back_buffer(0);
+    let (hr, desc) = backbuffer.desc();
+    assert_eq!(hr, D3D_OK, "GetDesc on the back buffer");
+    let plain = h.create_render_target(desc.width, desc.height, D3DFMT_X8R8G8B8);
+    let read = || surface_pixel(&h, &plain, at.0, at.1);
+    let resolve_and_read = || {
+        assert_eq!(
+            h.stretch_rect(&backbuffer, &plain, D3DTEXF_NONE),
+            D3D_OK,
+            "StretchRect resolve"
+        );
+        read()
+    };
+    let reading = |pixel: u32| {
+        let center = Rgba8::from_pixel(pixel);
+        Reading::described(format!("{center:?}"), center.r > 200 && center.g > 200)
+    };
+    assert_or_reread(
+        &h,
+        "the far blue draw fails the depth test the near white one wrote",
+        "white at the centre",
+        &reading(resolve_and_read()),
+        || reading(read()),
+        || {
+            let center = Rgba8::from_pixel(resolve_and_read());
+            Reading::described(
+                format!("{center:?}\n  depth probe: {}", depth_probe(&h)),
+                center.r > 200 && center.g > 200,
+            )
+        },
     );
     assert_eq!(h.set_render_state(D3DRS_ZENABLE, 0), D3D_OK);
 }
