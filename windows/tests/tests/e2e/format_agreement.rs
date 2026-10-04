@@ -704,11 +704,22 @@ fn a_multisampled_swap_chain_depth_tests_through_df16_and_df24() {
                 D3D_OK
             );
         });
+        // A multisampled back buffer is read through a resolve into a
+        // single-sampled target, which `read_pixel` reads as render target 0.
+        let back_buffer = h.render_target(0);
+        let resolve = h.create_render_target(640, 480, D3DFMT_X8R8G8B8);
+        assert_eq!(
+            h.stretch_rect(&back_buffer, &resolve, D3DTEXF_NONE),
+            D3D_OK,
+            "{name}: resolve"
+        );
+        assert_eq!(h.set_render_target(0, &resolve), D3D_OK);
         assert_eq!(
             h.read_pixel(320, 240),
             GREEN,
             "{name}: the multisampled auto depth-stencil keeps the nearer quad"
         );
+        assert_eq!(h.set_render_target(0, &back_buffer), D3D_OK);
     }
 }
 
