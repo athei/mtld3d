@@ -1230,9 +1230,9 @@ fn emit_vs(out: &mut String, vs: &FfVsKey, entry: &str) {
     // emitting one matmul produces a different FP-rounding shape than
     // any programmable shader. Plain MSL `dot()` — Apple Silicon has
     // hardware dot-product. Cross-shader bit-invariance is not the
-    // goal (the implicit decal depth bias in
-    // `windows/d3d9/src/draw.rs` handles z-fight from genuinely
-    // different per-pipeline transforms); `[[position, invariant]]` +
+    // goal: z parity between different shaders is not guaranteed, and the
+    // only depth bias is the one the application's render states set;
+    // `[[position, invariant]]` +
     // `setPreserveInvariance(true)` + `setMathMode(Safe)` on the VS
     // compile keep clip-position bit-stable WITHIN a shader for
     // reflection-style same-shader-twice scenarios.

@@ -3756,8 +3756,7 @@ fn dp4_emits_plain_dot() {
     // dot-product; let the compiler use it. Cross-shader bit-invariance
     // is not the goal here — per-pipeline matrix bytes genuinely differ
     // between FF and programmable paths, so no emit-shape trick can
-    // bridge it. The implicit decal depth bias in
-    // `windows/d3d9/src/draw.rs` handles the actual symptom.
+    // bridge it, and the only depth bias is the application's own.
     //
     // vs_2_0 { dcl_position v0; dp4 r0.x, v0, c0; mov oPos, r0; }
     let bc = vec![

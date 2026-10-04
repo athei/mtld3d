@@ -1852,9 +1852,9 @@ fn translate_instruction(
         // Plain MSL `dot()` — Apple Silicon has hardware dot-product;
         // let the compiler use it. Cross-shader bit-invariance is not
         // achievable in general (per-shader matrices and vertex inputs
-        // genuinely differ between FF and programmable paths), so the
-        // implicit decal depth bias in `windows/d3d9/src/draw.rs`
-        // handles the visible symptom. `[[position, invariant]]` +
+        // genuinely differ between FF and programmable paths), so z
+        // parity between different shaders is not guaranteed and the only
+        // depth bias is the application's own. `[[position, invariant]]` +
         // `setPreserveInvariance(true)` + `setMathMode(Safe)` on VS
         // remain in place as cheap defense — they keep clip-position
         // bit-stable WITHIN a single shader across frames, which
