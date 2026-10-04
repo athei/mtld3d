@@ -139,7 +139,7 @@ pub fn resolve_sample_count(
     }
 }
 
-/// Whether `format` may be the auto depth-stencil of a swap chain multisampled as `(type, quality)`.
+/// Whether `format` may be the auto depth-stencil of a swap chain at `(type, quality)`.
 ///
 /// The answers a title probes before it asks for one: `format` has to be a
 /// depth format the device serves, and the multisample request has to be
