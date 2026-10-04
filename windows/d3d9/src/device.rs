@@ -4672,6 +4672,25 @@ extern "system" fn device_reset(this: *mut c_void, present_params: *mut c_void) 
         );
         return reject_reset(dev);
     };
+    // The auto depth-stencil format answers to the same depth and multisample
+    // rules as at `CreateDevice`, also before the window or the mode moves.
+    if pp.enable_auto_depth_stencil != 0
+        && pp.auto_depth_stencil_format != 0
+        && !mtld3d_core::multisample::auto_depth_stencil_accepts(
+            pp.auto_depth_stencil_format,
+            pp.multi_sample_type,
+            pp.multi_sample_quality,
+            crate::direct3d9::device_caps_flags(),
+        )
+    {
+        warn!(
+            target: LOG_TARGET,
+            "reject Reset: AutoDepthStencilFormat {} at MultiSampleType {} is no depth-stencil \
+             the device offers",
+            pp.auto_depth_stencil_format, pp.multi_sample_type,
+        );
+        return reject_reset(dev);
+    }
     let target_window = if pp.device_window == 0 {
         dev.window()
     } else {
@@ -5972,8 +5991,9 @@ fn create_depth_texture_path(info: &DepthTextureCreateInfo) -> i32 {
         texture,
     } = *info;
 
-    // Lockable and legacy depth mappings do not imply a plain-texture
-    // capability: their CPU lock contracts are not implemented here.
+    // The lockable depth formats create as a depth-stencil texture, with no
+    // `LockRect` of its levels, and not as a plain one: a plain depth texture
+    // is a sampling resource the format queries would have to offer.
     if usage & D3DUSAGE_DEPTHSTENCIL == 0 && !is_depth_stencil_format(format) {
         mtld3d_shared::log_once_warn_by!(target: LOG_TARGET, key: u64::from(format),
             "reject CreateTexture plain depth format={format} → INVALIDCALL (unsupported format)");

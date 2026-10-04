@@ -206,10 +206,16 @@ pub const fn format_name(d3d_format: u32) -> &'static str {
 ///
 /// Apple Silicon has no native 24-bit depth format, so the entire D24
 /// family promotes to `Depth32Float`. Stencil-bearing variants share
-/// `Depth32FloatStencil8` — INTZ included: it is the sampleable twin of
-/// D24S8 and carries its stencil plane. DF24/DF16 are depth-only fetch
-/// formats and promote to plain `Depth32Float`.
-/// Returns `None` for non-depth or unknown formats.
+/// `Depth32FloatStencil8`, INTZ included: it is the sampleable twin of
+/// D24S8 and carries its stencil plane. D24FS8 is a float depth with an
+/// eight-bit stencil, which that format is exactly. DF24/DF16 are depth-only
+/// fetch formats and promote to plain `Depth32Float`, as do the two lockable
+/// formats, whose depth the device serves although it serves no `LockRect`
+/// of it (see [`is_advertised_depth_format`]).
+///
+/// This is the set every depth create reads. `None` for non-depth and
+/// unknown formats, and for `D15S1` and `D24X4S4`, whose one- and four-bit
+/// stencil no Metal format has.
 ///
 /// Used by both `CreateDepthStencilSurface` (standalone depth surface) and
 /// `CreateTexture` with `D3DUSAGE_DEPTHSTENCIL` (sampleable shadow map),
@@ -224,9 +230,7 @@ pub const fn map_d3d_depth_format(d3d_format: u32) -> Option<PixelFormat> {
         // the same buffer it later samples raw depth from, and a
         // stencil-less mapping silently no-ops every one of those writes
         // and gates. DF24/DF16 are depth-only fetch formats and stay so.
-        D3DFMT_D15S1 | D3DFMT_D24S8 | D3DFMT_D24X4S4 | D3DFMT_D24FS8 | D3DFMT_INTZ => {
-            Some(PixelFormat::Depth32FloatStencil8)
-        }
+        D3DFMT_D24S8 | D3DFMT_D24FS8 | D3DFMT_INTZ => Some(PixelFormat::Depth32FloatStencil8),
         _ => None,
     }
 }
@@ -235,6 +239,18 @@ pub const fn map_d3d_depth_format(d3d_format: u32) -> Option<PixelFormat> {
 #[must_use]
 pub const fn is_depth_format(d3d_format: u32) -> bool {
     map_d3d_depth_format(d3d_format).is_some()
+}
+
+/// True for the depth formats the capability answers offer.
+///
+/// Every format [`map_d3d_depth_format`] maps except the two lockable ones:
+/// a lockable depth format promises a `LockRect` of the depth surface, which
+/// the layer has no CPU copy for, so no query offers it. The creates keep
+/// taking both, for a title that asks for one without probing and needs the
+/// depth test rather than the lock.
+#[must_use]
+pub const fn is_advertised_depth_format(d3d_format: u32) -> bool {
+    is_depth_format(d3d_format) && !matches!(d3d_format, D3DFMT_D16_LOCKABLE | D3DFMT_D32F_LOCKABLE)
 }
 
 /// True for the FOURCC "readable raw depth" formats (`INTZ`/`DF24`/`DF16`).
@@ -396,6 +412,25 @@ pub fn map_d3d_format_device(d3d_format: u32, native_packed16: bool) -> Option<F
         }
     }
     map_d3d_format(d3d_format)
+}
+
+/// The formats D3D9 specifies a device swap chain's back buffer in.
+///
+/// A8R8G8B8, X8R8G8B8, A1R5G5B5, X1R5G5B5 and R5G6B5, plus A2R10G10B10 in
+/// fullscreen only, which no driver offered as a windowed back buffer.
+/// `CheckDeviceType` offers nothing outside this set whatever the device
+/// renders into, so a title that probes for its back buffer lands on one of
+/// them. The device's own answer is narrower still: it also has to render
+/// into the format and present it to the display format.
+#[must_use]
+pub const fn is_back_buffer_format(d3d_format: u32, windowed: bool) -> bool {
+    match d3d_format {
+        D3DFMT_A8R8G8B8 | D3DFMT_X8R8G8B8 | D3DFMT_A1R5G5B5 | D3DFMT_X1R5G5B5 | D3DFMT_R5G6B5 => {
+            true
+        }
+        D3DFMT_A2R10G10B10 => !windowed,
+        _ => false,
+    }
 }
 
 /// Colour formats the Metal backend renders into, as a pure format family.
@@ -1172,9 +1207,9 @@ pub fn surface_bytes(width: u32, height: u32, d3d_format: u32) -> u64 {
 #[must_use]
 pub const fn depth_format_bytes_per_pixel(d3d_format: u32) -> Option<u32> {
     match d3d_format {
-        D3DFMT_D16 | D3DFMT_D16_LOCKABLE | D3DFMT_D15S1 | D3DFMT_DF16 => Some(2),
-        D3DFMT_D32 | D3DFMT_D32F_LOCKABLE | D3DFMT_D24X8 | D3DFMT_D24S8 | D3DFMT_D24X4S4
-        | D3DFMT_D24FS8 | D3DFMT_DF24 | D3DFMT_INTZ => Some(4),
+        D3DFMT_D16 | D3DFMT_D16_LOCKABLE | D3DFMT_DF16 => Some(2),
+        D3DFMT_D32 | D3DFMT_D32F_LOCKABLE | D3DFMT_D24X8 | D3DFMT_D24S8 | D3DFMT_D24FS8
+        | D3DFMT_DF24 | D3DFMT_INTZ => Some(4),
         _ => None,
     }
 }

@@ -8,9 +8,9 @@
 
 use mtld3d_shared::mtl::DeviceCapsFlags;
 use mtld3d_types::{
-    D3DFMT_D16_LOCKABLE, D3DFMT_D32F_LOCKABLE, D3DFMT_DF16, D3DFMT_DF24, D3DFMT_DXT1, D3DFMT_DXT2,
-    D3DFMT_DXT3, D3DFMT_DXT4, D3DFMT_DXT5, D3DFMT_INTZ, D3DMULTISAMPLE_16_SAMPLES,
-    D3DMULTISAMPLE_NONE, D3DMULTISAMPLE_NONMASKABLE,
+    D3DFMT_D16_LOCKABLE, D3DFMT_D32F_LOCKABLE, D3DFMT_DXT1, D3DFMT_DXT2, D3DFMT_DXT3, D3DFMT_DXT4,
+    D3DFMT_DXT5, D3DFMT_INTZ, D3DMULTISAMPLE_16_SAMPLES, D3DMULTISAMPLE_NONE,
+    D3DMULTISAMPLE_NONMASKABLE,
 };
 
 /// Why a `(multi_sample_type, quality)` pair cannot be served.
@@ -65,10 +65,13 @@ pub const fn sample_count_of(
 
 /// Whether a D3D9 surface format may be multisampled at all.
 ///
-/// Block-compressed formats have no render-target path, and the lockable and
-/// FOURCC readable-depth formats exist precisely so their samples can be read
-/// back one by one, which a multisampled surface cannot offer. D3D9 answers
-/// `D3DERR_NOTAVAILABLE` for each of them at any count above one.
+/// Block-compressed formats have no render-target path, the lockable depth
+/// formats exist so their depth can be read back one value at a time, which a
+/// multisampled surface cannot offer, and `INTZ` is the sampleable twin of
+/// D24S8 a title binds as a texture. D3D9 answers `D3DERR_NOTAVAILABLE` for
+/// each of them at any count above one. `DF16` and `DF24` stay multisampled
+/// where the device multisamples: a multisampled surface is never sampled, and
+/// as a depth attachment either is a plain `Depth32Float`.
 #[must_use]
 pub const fn format_allows_multisample(format: u32) -> bool {
     !matches!(
@@ -76,8 +79,6 @@ pub const fn format_allows_multisample(format: u32) -> bool {
         D3DFMT_D16_LOCKABLE
             | D3DFMT_D32F_LOCKABLE
             | D3DFMT_INTZ
-            | D3DFMT_DF24
-            | D3DFMT_DF16
             | D3DFMT_DXT1
             | D3DFMT_DXT2
             | D3DFMT_DXT3
@@ -137,6 +138,26 @@ pub fn resolve_sample_count(
     } else {
         Err(MultiSampleReject::Unavailable)
     }
+}
+
+/// Whether `format` may be the auto depth-stencil of a swap chain at `(type, quality)`.
+///
+/// `format` has to be a depth format the device serves, which takes in the
+/// two lockable formats the answers do not offer, and the multisample request
+/// has to be one `CheckDeviceMultiSampleType` accepts for the depth format
+/// itself, not only for the back buffer, since the two attachments share one
+/// sample count. `INTZ` and the lockable depth formats therefore stay
+/// single-sampled. `CreateDevice` and `Reset` refuse any other auto
+/// depth-stencil.
+#[must_use]
+pub fn auto_depth_stencil_accepts(
+    format: u32,
+    multi_sample_type: u32,
+    quality: u32,
+    caps: DeviceCapsFlags,
+) -> bool {
+    crate::format::is_depth_format(format)
+        && resolve_sample_count(multi_sample_type, quality, format, caps).is_ok()
 }
 
 /// Number of `D3DMULTISAMPLE_NONMASKABLE` quality levels this device offers.

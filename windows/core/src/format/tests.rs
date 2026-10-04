@@ -30,9 +30,10 @@ use super::{
     D3DUSAGE_RENDERTARGET, D3DUSAGE_RTPATCHES, D3DUSAGE_SOFTWAREPROCESSING, PixelFormat,
     RenderScale, StandaloneSurfaceKind, Swizzle, block_row_pitch, compute_mip_count,
     compute_mip_size, compute_volume_mip_count, depth_format_bytes_per_pixel, format_name,
-    is_depth_format, is_mapped_color_format, is_volume_texture_format, linear_mip_size,
-    linear_row_pitch, map_d3d_depth_format, map_d3d_format, resolve_mip_levels,
-    standalone_surface_bytes, surface_bytes, usage_allowed_for_rtype,
+    is_advertised_depth_format, is_back_buffer_format, is_depth_format, is_mapped_color_format,
+    is_volume_texture_format, linear_mip_size, linear_row_pitch, map_d3d_depth_format,
+    map_d3d_format, resolve_mip_levels, standalone_surface_bytes, surface_bytes,
+    usage_allowed_for_rtype,
 };
 
 /// Every mapped colour format, in `format_name` order.
@@ -82,8 +83,8 @@ const COLOUR_FORMATS: [u32; 37] = [
 
 #[test]
 fn depth_only_formats_promote_to_depth32float() {
-    // Apple Silicon has no Depth24Unorm — D24X8, D32, D16, and the
-    // lockable variants all share Depth32Float.
+    // Apple Silicon has no Depth24Unorm: D24X8, D32, D16 and the lockable
+    // variants all share Depth32Float.
     for fmt in [
         D3DFMT_D16_LOCKABLE,
         D3DFMT_D32,
@@ -107,18 +108,51 @@ fn depth_only_formats_promote_to_depth32float() {
 fn stencil_bearing_formats_promote_to_depth32float_stencil8() {
     // INTZ belongs here: it is the sampleable twin of D24S8 and carries
     // its stencil plane.
-    for fmt in [
-        D3DFMT_D15S1,
-        D3DFMT_D24S8,
-        D3DFMT_D24X4S4,
-        D3DFMT_D24FS8,
-        D3DFMT_INTZ,
-    ] {
+    for fmt in [D3DFMT_D24S8, D3DFMT_D24FS8, D3DFMT_INTZ] {
         assert_eq!(
             map_d3d_depth_format(fmt),
             Some(PixelFormat::Depth32FloatStencil8),
             "format {fmt} should map to Depth32FloatStencil8"
         );
+    }
+}
+
+/// The depth formats the device does not serve have no mapping.
+///
+/// `D15S1` and `D24X4S4` carry a stencil narrower than any Metal format's,
+/// so every depth answer and every depth create refuses them.
+#[test]
+fn unserved_depth_formats_return_none() {
+    for fmt in [D3DFMT_D15S1, D3DFMT_D24X4S4] {
+        assert_eq!(map_d3d_depth_format(fmt), None, "format {fmt}");
+        assert!(!is_depth_format(fmt), "format {fmt}");
+        assert!(!is_advertised_depth_format(fmt), "format {fmt}");
+    }
+}
+
+/// The lockable depth formats are created but not advertised.
+///
+/// Their depth is served on `Depth32Float`, so a create that names one
+/// gets a working depth buffer, while every query refuses them because no
+/// `LockRect` of a depth surface is served. Every other mapped depth format
+/// is advertised.
+#[test]
+fn lockable_depth_formats_are_created_but_not_advertised() {
+    for fmt in [D3DFMT_D16_LOCKABLE, D3DFMT_D32F_LOCKABLE] {
+        assert!(is_depth_format(fmt), "format {fmt}");
+        assert!(!is_advertised_depth_format(fmt), "format {fmt}");
+    }
+    for fmt in [
+        D3DFMT_D16,
+        D3DFMT_D24X8,
+        D3DFMT_D24S8,
+        D3DFMT_D24FS8,
+        D3DFMT_D32,
+        D3DFMT_DF16,
+        D3DFMT_DF24,
+        D3DFMT_INTZ,
+    ] {
+        assert!(is_advertised_depth_format(fmt), "format {fmt}");
     }
 }
 
@@ -675,10 +709,8 @@ fn depth_size_table_covers_the_depth_mapping() {
     for fmt in [
         D3DFMT_D16,
         D3DFMT_D16_LOCKABLE,
-        D3DFMT_D15S1,
         D3DFMT_D24X8,
         D3DFMT_D24S8,
-        D3DFMT_D24X4S4,
         D3DFMT_D24FS8,
         D3DFMT_D32,
         D3DFMT_D32F_LOCKABLE,
@@ -1473,4 +1505,50 @@ fn legacy_bump_map_queries_answer_no_for_every_format() {
             true
         ));
     }
+}
+
+/// The back-buffer set is the six formats D3D9 specifies, A2R10G10B10 in fullscreen alone.
+///
+/// Formats a device renders into but no swap chain is specified in (the
+/// float and wide-channel families, the reversed-channel 8-bit pair) stay
+/// out in both modes.
+#[test]
+fn back_buffer_formats_are_the_d3d9_set() {
+    for windowed in [true, false] {
+        for format in [
+            D3DFMT_A8R8G8B8,
+            D3DFMT_X8R8G8B8,
+            mtld3d_types::D3DFMT_A1R5G5B5,
+            mtld3d_types::D3DFMT_X1R5G5B5,
+            D3DFMT_R5G6B5,
+        ] {
+            assert!(
+                is_back_buffer_format(format, windowed),
+                "{format} windowed={windowed}"
+            );
+        }
+        for format in [
+            D3DFMT_A8B8G8R8,
+            D3DFMT_X8B8G8R8,
+            D3DFMT_A16B16G16R16,
+            D3DFMT_A16B16G16R16F,
+            D3DFMT_A32B32G32R32F,
+            D3DFMT_G16R16,
+            D3DFMT_R32F,
+            0,
+        ] {
+            assert!(
+                !is_back_buffer_format(format, windowed),
+                "{format} windowed={windowed}"
+            );
+        }
+    }
+    assert!(is_back_buffer_format(
+        mtld3d_types::D3DFMT_A2R10G10B10,
+        false
+    ));
+    assert!(!is_back_buffer_format(
+        mtld3d_types::D3DFMT_A2R10G10B10,
+        true
+    ));
 }

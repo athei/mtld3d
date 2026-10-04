@@ -143,7 +143,7 @@ pub enum PixelFormat {
     Depth32Float = 252,
     /// Combined 32-bit float depth + 8-bit stencil.
     ///
-    /// D3D9 D24S8 / D24FS8 / D24X4S4 / D15S1 promote here.
+    /// D3D9 D24S8 / D24FS8 / INTZ promote here.
     Depth32FloatStencil8 = 260,
 }
 

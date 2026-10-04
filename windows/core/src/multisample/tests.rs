@@ -1,8 +1,9 @@
 use mtld3d_shared::mtl::DeviceCapsFlags;
 use mtld3d_types::{
-    D3DFMT_A8R8G8B8, D3DFMT_D24S8, D3DFMT_DXT1, D3DFMT_INTZ, D3DMULTISAMPLE_2_SAMPLES,
-    D3DMULTISAMPLE_4_SAMPLES, D3DMULTISAMPLE_8_SAMPLES, D3DMULTISAMPLE_NONE,
-    D3DMULTISAMPLE_NONMASKABLE,
+    D3DFMT_A8R8G8B8, D3DFMT_D15S1, D3DFMT_D16_LOCKABLE, D3DFMT_D24FS8, D3DFMT_D24S8,
+    D3DFMT_D32F_LOCKABLE, D3DFMT_DF16, D3DFMT_DF24, D3DFMT_DXT1, D3DFMT_INTZ,
+    D3DMULTISAMPLE_2_SAMPLES, D3DMULTISAMPLE_4_SAMPLES, D3DMULTISAMPLE_8_SAMPLES,
+    D3DMULTISAMPLE_NONE, D3DMULTISAMPLE_NONMASKABLE,
 };
 
 use super::*;
@@ -230,4 +231,76 @@ fn a2m_is_independent_of_numeric_point_size_and_atoc() {
         assert_eq!(numeric_point_size(control), None);
     }
     assert_eq!(numeric_point_size(8.0f32.to_bits()), Some(8.0f32.to_bits()));
+}
+
+/// An auto depth-stencil takes a served depth format at a count its format multisamples at.
+///
+/// Single-sampled, every served depth format is accepted, `INTZ`, `DF16` and
+/// the lockable ones included, and nothing else is. Multisampled, the format
+/// has to pass the multisample answer of its own, which `INTZ` and the
+/// lockable formats do not, so a swap chain that multisamples its back buffer
+/// cannot carry one; `DF16` passes it like any plain depth format.
+#[test]
+fn auto_depth_stencil_needs_a_served_format_its_samples_allow() {
+    for format in [
+        D3DFMT_D24S8,
+        D3DFMT_D24FS8,
+        D3DFMT_INTZ,
+        D3DFMT_DF16,
+        D3DFMT_D16_LOCKABLE,
+    ] {
+        assert!(
+            auto_depth_stencil_accepts(format, D3DMULTISAMPLE_NONE, 0, caps_4x()),
+            "format {format:#x} single-sampled"
+        );
+    }
+    for format in [D3DFMT_D15S1, D3DFMT_A8R8G8B8, 0] {
+        assert!(
+            !auto_depth_stencil_accepts(format, D3DMULTISAMPLE_NONE, 0, caps_4x()),
+            "format {format:#x} is no served depth format"
+        );
+    }
+    assert!(auto_depth_stencil_accepts(
+        D3DFMT_D24S8,
+        D3DMULTISAMPLE_4_SAMPLES,
+        0,
+        caps_4x()
+    ));
+    assert!(!auto_depth_stencil_accepts(
+        D3DFMT_D24S8,
+        D3DMULTISAMPLE_8_SAMPLES,
+        0,
+        caps_4x()
+    ));
+    for format in [D3DFMT_INTZ, D3DFMT_D16_LOCKABLE] {
+        assert!(
+            !auto_depth_stencil_accepts(format, D3DMULTISAMPLE_4_SAMPLES, 0, caps_4x()),
+            "format {format:#x} multisampled"
+        );
+    }
+    assert!(auto_depth_stencil_accepts(
+        D3DFMT_DF16,
+        D3DMULTISAMPLE_4_SAMPLES,
+        0,
+        caps_4x()
+    ));
+}
+
+/// `DF16` and `DF24` multisample like any depth format; `INTZ` and the lockable ones do not.
+#[test]
+fn only_intz_and_the_lockable_depth_formats_refuse_multisampling() {
+    for format in [D3DFMT_DF16, D3DFMT_DF24, D3DFMT_D24S8] {
+        assert_eq!(
+            resolve_sample_count(D3DMULTISAMPLE_4_SAMPLES, 0, format, caps_4x()),
+            Ok(4),
+            "format {format:#x}"
+        );
+    }
+    for format in [D3DFMT_INTZ, D3DFMT_D16_LOCKABLE, D3DFMT_D32F_LOCKABLE] {
+        assert_eq!(
+            resolve_sample_count(D3DMULTISAMPLE_4_SAMPLES, 0, format, caps_4x()),
+            Err(MultiSampleReject::Unavailable),
+            "format {format:#x}"
+        );
+    }
 }

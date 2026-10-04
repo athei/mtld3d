@@ -3352,6 +3352,65 @@ impl Harness {
         }
     }
 
+    /// `IDirect3D9::CheckDepthStencilMatch`.
+    pub fn check_depth_stencil_match(
+        &self,
+        adapter_format: u32,
+        render_target_format: u32,
+        depth_stencil_format: u32,
+    ) -> i32 {
+        // SAFETY: vtable thunk; `self.d3d9` is live.
+        unsafe {
+            (self.factory_vtbl().check_depth_stencil_match)(
+                self.d3d9,
+                0,
+                D3DDEVTYPE_HAL,
+                adapter_format,
+                render_target_format,
+                depth_stencil_format,
+            )
+        }
+    }
+
+    /// `IDirect3D9::CreateDevice` on this factory, into a hidden window of its own.
+    ///
+    /// For the creation answers themselves: `pp` goes to the call as given,
+    /// with its device window replaced by the new window, and is read back
+    /// resolved. A device the call creates is released at once, and the
+    /// window is destroyed after it. Returns the `HRESULT`.
+    ///
+    /// # Panics
+    /// Panics if the back-buffer size does not fit a window's `i32` extent.
+    pub fn create_device_hr(&self, pp: &mut D3DPRESENT_PARAMETERS) -> i32 {
+        let width = i32::try_from(pp.back_buffer_width.max(1)).expect("width fits i32");
+        let height = i32::try_from(pp.back_buffer_height.max(1)).expect("height fits i32");
+        let hwnd =
+            win32::create_styled_window(width, height, false, &win32::WindowStyle::Borderless);
+        pp.device_window = hwnd;
+        let mut device: *mut c_void = core::ptr::null_mut();
+        // SAFETY: vtable thunk; `self.d3d9` is live, `pp` and `device` are
+        // writable for the call and a null focus window is permitted.
+        let hr = unsafe {
+            (self.factory_vtbl().create_device)(
+                self.d3d9,
+                0,
+                D3DDEVTYPE_HAL,
+                core::ptr::null_mut(),
+                D3DCREATE_HARDWARE_VERTEXPROCESSING,
+                core::ptr::from_mut(pp).cast::<c_void>(),
+                &raw mut device,
+            )
+        };
+        if !device.is_null() {
+            // SAFETY: `device` is the live IDirect3DDevice9 the call above returned.
+            let vtbl = unsafe { deref_vtbl::<IDirect3DDevice9Vtbl>(device) };
+            // SAFETY: vtable thunk; `device` is live and released exactly once.
+            unsafe { (vtbl.release)(device) };
+        }
+        win32::destroy_window(hwnd);
+        hr
+    }
+
     /// `IDirect3D9::CheckDeviceFormatConversion`.
     pub fn check_device_format_conversion(&self, source: u32, target: u32) -> i32 {
         // SAFETY: vtable thunk; `self.d3d9` is live.

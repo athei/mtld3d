@@ -222,6 +222,9 @@ unless its entry says otherwise.
   `RegisterSoftwareDevice`; the default Metal device is the only adapter.
 - Legacy remnants: N-patch and RT-patch tessellation, vertex tweening,
   palettized textures. Accepted or rejected per spec, non-functional.
+- The depth formats `D15S1` and `D24X4S4`, whose one- and four-bit stencil no
+  Metal format has: answered `D3DERR_NOTAVAILABLE` and refused by every
+  create, as the reference implementations do.
 
 ## Kept divergences
 
@@ -276,6 +279,21 @@ is in [`CONFORMANCE.md`](../unix/conformance/CONFORMANCE.md#kept-divergences).
 - A `D3DSAMP_BORDERCOLOR` other than transparent black, opaque black or
   opaque white reads as opaque black under `D3DTADDRESS_BORDER`; D3D9
   returns the colour the game set. No knob.
+- `ATI1` creates as a 2D texture in every pool and as an offscreen plain
+  surface in every pool a plain surface takes, while every format query
+  answers `D3DERR_NOTAVAILABLE` for it, and its lock reports the BC4 block
+  pitch rather than the pitch D3D9 reports for the format. No knob.
+- `D16_LOCKABLE` and `D32F_LOCKABLE` create as the auto depth-stencil and as
+  a depth-stencil texture, on a 32-bit float depth, while every depth query
+  answers `D3DERR_NOTAVAILABLE` for them: a `LockRect` of the depth surface
+  fails, warned once. They are single-sampled; a multisampled swap chain
+  refuses them, as `CheckDeviceMultiSampleType` does. A standalone
+  depth-stencil surface in either format is refused, as before. No knob.
+- `CreateDevice` and `Reset` accept any back-buffer format and present a
+  BGRA8 back buffer for every one but A8R8G8B8 and X8R8G8B8, which
+  `GetDesc` then reports as X8R8G8B8, where D3D9 refuses a format outside
+  its back-buffer set and keeps a 16-bit one. `CheckDeviceType` offers that
+  set only. No knob.
 - The adapter mode list leaves out every display size win32u cannot scale
   the monitor to in its 16-bit ratio, on every Wine, and a fullscreen request
   for one follows the window instead of setting the mode. The list describes

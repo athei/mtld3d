@@ -2269,6 +2269,15 @@ extern "system" fn surface_lock_rect(
                 .flags
                 .contains(SurfaceFlags::OWNS_PARENT_TEXTURE)
         {
+            if tex.is_depth_format() {
+                mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+                    "IDirect3DSurface9::LockRect on a level of a depth texture (a lockable \
+                     depth format included: no CPU copy of depth is kept) → INVALIDCALL");
+            } else {
+                mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+                    "IDirect3DSurface9::LockRect on a level of a non-dynamic D3DPOOL_DEFAULT \
+                     texture → INVALIDCALL");
+            }
             return D3DERR_INVALIDCALL;
         }
         mtld3d_shared::crumb!(
@@ -2337,7 +2346,8 @@ extern "system" fn surface_lock_rect(
         return systemmem_lock_rect(&obj, locked_rect, rect);
     }
     mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
-        "stub IDirect3DSurface9::LockRect on standalone non-color surface → INVALIDCALL"
+        "IDirect3DSurface9::LockRect on a depth-stencil surface (a lockable depth format \
+         included: no CPU copy of depth is kept) → INVALIDCALL"
     );
     D3DERR_INVALIDCALL
 }
