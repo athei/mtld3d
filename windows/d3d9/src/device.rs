@@ -1021,10 +1021,10 @@ impl DeviceInner {
 
     pub fn set_viewport(&mut self, v: D3DVIEWPORT9) {
         self.viewport = v;
-        // D3D9 viewport z-range fixup: the far plane forwarded to the encoder
-        // is clamped to at least `min_z + 0.001` so a degenerate (`min_z ==
-        // max_z`) or inverted (`max_z < min_z`) range collapses to a tiny
-        // forward range instead of mapping every fragment to a single depth.
+        // D3D9 itself collapses a degenerate (`min_z == max_z`) or inverted
+        // (`max_z < min_z`) range to `min_z .. min_z + 0.001`, so the far
+        // plane forwarded to the encoder is clamped to at least
+        // `min_z + 0.001`; an inverted range is not honoured on purpose.
         // `self.viewport` keeps the raw values so GetViewport round-trips
         // unchanged. Ordinary `[min_z, max_z]` ranges (`max_z >= min_z + 0.001`)
         // are left untouched.
