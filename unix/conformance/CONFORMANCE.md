@@ -328,6 +328,20 @@ record. A knob, where one makes sense, is named with its default.
   count to the pass's attachments with no per-draw override.
   `D3DPRASTERCAPS_MULTISAMPLE_TOGGLE` is not advertised, which is how D3D9
   says the toggle is unavailable, and the first write is logged. No knob.
+- **A `D3DSAMP_BORDERCOLOR` other than the three Metal presets reads as
+  opaque black.** Under `D3DTADDRESS_BORDER` D3D9 returns the colour the game
+  set, and the reference implementations pass it to their samplers. A Metal
+  sampler takes only transparent black, opaque black or opaque white
+  (`MTLSamplerBorderColor`), so those three map exactly and every other
+  colour takes opaque black, logged once per colour. Returning an arbitrary
+  colour would take a coordinate test and a select around every sample of a
+  stage that addresses by border, carried in each shader as a variant bit and
+  a per-stage colour uniform, while the common use, a shadow map whose
+  outside reads as lit or as shadowed, needs white or black. Wine's suite
+  sets a non-preset border colour only on a cube texture, where the border is
+  never read, so no site observes it. No knob: the behaviour a knob would
+  restore needs a shader path the layer does not have, so there is nothing
+  to trade.
 - **The adapter mode list leaves out the display sizes win32u cannot scale
   the monitor to.** After a mode-set, win32u recomputes the monitor's scale
   as `dpi * physical / size` on each axis, reduces it by the greatest common
