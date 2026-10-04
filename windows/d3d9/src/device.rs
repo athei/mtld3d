@@ -8413,9 +8413,10 @@ extern "system" fn device_stretch_rect(
     // uploads are work this call will use.
     flush_dirty_mips_for_gpu_write(&obj, &[src_surf, dst_surf]);
     // A same-size copy that converts also needs the render-quad path (the 1:1
-    // blit can't convert): a cross-Metal-format pair, or an X source into its
-    // A counterpart, whose alpha the quad forces to one while it samples
-    // (`BlitDecode::OpaqueAlpha`). `check_stretch_rect_formats` guaranteed a
+    // blit can't convert): a cross-Metal-format pair, or a source without
+    // alpha into a destination with alpha sharing its storage, whose alpha the
+    // quad forces to one while it samples (`BlitDecode::OpaqueAlpha` for an X
+    // source; a widened source already stores alpha one). `check_stretch_rect_formats` guaranteed a
     // cross-format destination is a render target or an offscreen-plain surface
     // (cross-format RT/texture/offscreen → RT, plus the offscreen→offscreen
     // case handled on the CPU just below).
@@ -8434,9 +8435,9 @@ extern "system" fn device_stretch_rect(
     // staging so a later sample (or same-format StretchRect out of it) and a
     // later LockRect both see the converted pixels. Do NOT push the render-quad
     // op, which would bind a non-render-target texture as a colour attachment.
-    // This serves the offscreen pairs of two storages, the YUV decodes, and an
-    // X source into its A counterpart, whose padding the converter reads as
-    // alpha one.
+    // This serves the offscreen pairs of two storages, the YUV decodes, and a
+    // source without alpha into a destination with alpha, whose padding the
+    // converter reads as alpha one.
     if cross_format
         && !scaling
         && dst_info
@@ -8646,20 +8647,25 @@ fn flush_dirty_mips_for_gpu_write(
 ///
 /// Compares the *Metal* pixel formats, not the D3D codes: distinct D3D
 /// formats can share a single Metal format (e.g. A8R8G8B8 + X8R8G8B8 are both
-/// `Bgra8Unorm`). A shared storage does not make every pair a byte copy,
-/// though. An X source into its A counterpart would hand the padding bits to
-/// the destination as alpha where D3D9 writes alpha one
-/// (`exposes_padding_as_alpha`), so that pair converts; the A into X
-/// direction stays a byte copy, since every reader of an X surface ignores
-/// the alpha it carries. A packed YUV endpoint lays its bytes out in an order
-/// no other format shares (`reinterprets_packed_yuv`), so such a pair
-/// converts or is refused like a pair of two storages.
+/// `Bgra8Unorm`, and on a device without the packed 16-bit formats A1R5G5B5
+/// and A4R4G4B4 are too). A shared storage does not make every pair a byte
+/// copy, though. A source without alpha into a destination with alpha would
+/// hand the source's padding to the destination as alpha where D3D9 writes
+/// alpha one (`exposes_padding_as_alpha`, judged on the mappings this device
+/// created), so that pair converts; the other direction stays a byte copy,
+/// since every reader of a destination without alpha ignores the alpha it
+/// carries. A packed YUV endpoint lays its bytes out in an order no other
+/// format shares (`reinterprets_packed_yuv`), so such a pair converts or is
+/// refused like a pair of two storages.
 fn copies_bytes(src: &StretchSurfaceInfo, dst: &StretchSurfaceInfo, expand_packed16: bool) -> bool {
-    let metal = |format: u32| {
-        crate::direct3d9::map_for_device(format, expand_packed16).map(|m| m.metal_pixel_format())
-    };
-    metal(src.format) == metal(dst.format)
-        && !mtld3d_core::stretch_rect::exposes_padding_as_alpha(src.format, dst.format)
+    let src_map = crate::direct3d9::map_for_device(src.format, expand_packed16);
+    let dst_map = crate::direct3d9::map_for_device(dst.format, expand_packed16);
+    let exposes_padding = matches!(
+        (&src_map, &dst_map),
+        (Some(s), Some(d)) if mtld3d_core::stretch_rect::exposes_padding_as_alpha(s, d)
+    );
+    src_map.map(|m| m.metal_pixel_format()) == dst_map.map(|m| m.metal_pixel_format())
+        && !exposes_padding
         && !mtld3d_core::stretch_rect::reinterprets_packed_yuv(src.format, dst.format)
 }
 

@@ -314,3 +314,7 @@ is in [`CONFORMANCE.md`](../unix/conformance/CONFORMANCE.md#kept-divergences).
   and appears once the build lands; D3D9 draws every call in its frame.
   Building inline stalls the frame for the length of a Metal compile.
   `shader.asyncCompile`, on by default.
+- `GetRenderTargetData` from an X render target into a system-memory
+  surface of its A counterpart (X8R8G8B8 into A8R8G8B8, X8B8G8R8 into
+  A8B8G8R8, X1R5G5B5 into A1R5G5B5) copies the X padding into the alpha,
+  where D3D9 reads it as one. No knob.

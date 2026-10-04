@@ -7,11 +7,13 @@
 //! function runs.
 
 use mtld3d_types::{
-    D3DFMT_A1R5G5B5, D3DFMT_A8B8G8R8, D3DFMT_A8R8G8B8, D3DFMT_NV12, D3DFMT_UYVY, D3DFMT_X1R5G5B5,
-    D3DFMT_X8B8G8R8, D3DFMT_X8R8G8B8, D3DFMT_YUY2, D3DFMT_YV12,
+    D3DFMT_NV12, D3DFMT_UYVY, D3DFMT_X1R5G5B5, D3DFMT_X8B8G8R8, D3DFMT_X8R8G8B8, D3DFMT_YUY2,
+    D3DFMT_YV12,
 };
 
-use crate::{pixel_convert::can_convert, planar_yuv::planar_yuv_layout_from_pitch};
+use crate::{
+    format::FormatMapping, pixel_convert::can_convert, planar_yuv::planar_yuv_layout_from_pitch,
+};
 
 /// Parsed source / destination region for a `StretchRect`.
 ///
@@ -235,7 +237,7 @@ pub enum BlitDecode {
     Yv12 = 3,
     /// `D3DFMT_NV12`: luma rows, one interleaved U, V plane, backed by one R8 texture.
     Nv12 = 4,
-    /// An X format: sample as-is, alpha one, since its padding bits are no alpha.
+    /// An X format: sample as-is, alpha one, since its padding bits carry no alpha.
     OpaqueAlpha = 5,
 }
 
@@ -267,21 +269,18 @@ pub const fn blit_decode(d3d_format: u32) -> BlitDecode {
     }
 }
 
-/// Whether a copy of the bytes would hand an X source's padding to the destination as alpha.
+/// Whether a copy of the bytes would hand a source's padding to the destination as alpha.
 ///
-/// Each X format shares its storage with its A counterpart, and its padding
-/// bits are undefined: D3D9 reads an X surface's alpha as one, so a copy into
-/// the A counterpart has to write alpha one rather than whatever the padding
-/// holds. The other direction is a byte copy, since every reader of an X
-/// surface already ignores the alpha an A source leaves in it.
+/// Takes the mappings the two textures were created with on this device. A
+/// source without alpha whose storage still has an alpha lane (an X format,
+/// or a format widened to BGRA8) leaves undefined padding or a forced value
+/// in it, and D3D9 reads such a surface's alpha as one, so a destination that
+/// does carry alpha has to receive alpha one rather than those bits. The other
+/// direction is a byte copy, since every reader of a destination without alpha
+/// already ignores the alpha an A source leaves in it.
 #[must_use]
-pub const fn exposes_padding_as_alpha(src_format: u32, dst_format: u32) -> bool {
-    matches!(
-        (src_format, dst_format),
-        (D3DFMT_X8R8G8B8, D3DFMT_A8R8G8B8)
-            | (D3DFMT_X8B8G8R8, D3DFMT_A8B8G8R8)
-            | (D3DFMT_X1R5G5B5, D3DFMT_A1R5G5B5)
-    )
+pub const fn exposes_padding_as_alpha(src: &FormatMapping, dst: &FormatMapping) -> bool {
+    !src.has_alpha() && dst.has_alpha()
 }
 
 /// Whether `d3d_format` is one of the two packed 4:2:2 YUV formats.

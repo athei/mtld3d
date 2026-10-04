@@ -55,7 +55,7 @@ use crate::{
 /// the colour. The PE side chooses a POINT or LINEAR sampler from the D3D9
 /// filter. Its `float4` uniform carries the source mip level in `.x` and the
 /// source decode in `.y`: an X-format source returns alpha one, since its
-/// padding bits are no alpha, and a packed YUV source (`YUY2` / `UYVY`,
+/// padding bits carry no alpha, and a packed YUV source (`YUY2` / `UYVY`,
 /// backed by an RG8 texture) is fetched per macropixel and converted to RGB,
 /// unfiltered. A planar YUV source (`YV12` / `NV12`) is one R8 texture as
 /// wide as the lock pitch that holds the luma rows and then the chroma
@@ -100,7 +100,7 @@ fragment float4 mtld3d_blit_ps(
     // src_level.x is the source mip level (the sampler's point mip filter
     // makes the explicit level exact); src_level.y is the source decode,
     // 0 = sample as-is, 1 = YUY2, 2 = UYVY, 3 = YV12, 4 = NV12, 5 = sample
-    // as-is with alpha one (an X format, whose padding bits are no alpha).
+    // as-is with alpha one (an X format, whose padding bits carry no alpha).
     // The numbering is owned by mtld3d_core::stretch_rect::BlitDecode.
     // src_level.zw is the source's logical extent, which only the planar
     // decodes read.

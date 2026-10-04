@@ -787,9 +787,10 @@ fn read_back(h: &Harness, surface: &Surface<'_>, size: (u32, u32), format: u32) 
 ///
 /// The X byte is padding that D3D9 reads as alpha one, so a copy into the A
 /// format writes alpha one whatever the padding holds; the fill here leaves
-/// its zero alpha in it. Checked 1:1 into a render target, scaled into part
-/// of one (the rest keeping its own fill), and 1:1 into a render-target
-/// texture level, in both 8-bit channel orders. Each word is read in its own
+/// its zero alpha in it. Checked 1:1 into a render target with the point and
+/// the linear filter, scaled into part of one (the rest keeping its own
+/// fill), and 1:1 into a render-target texture level, in both 8-bit channel
+/// orders. Each word is read in its own
 /// format's order, so red is `0xFFFF0000` in A8R8G8B8 and `0xFF0000FF` in
 /// A8B8G8R8.
 #[test]
@@ -820,6 +821,19 @@ fn stretch_rect_from_an_x_render_target_into_its_a_counterpart_writes_opaque_alp
             assert_eq!(
                 word, opaque_red,
                 "1:1 {x_format:#x} -> {a_format:#x}, pixel {i}"
+            );
+        }
+
+        let linear = h.create_render_target(SIZE.0, SIZE.1, a_format);
+        assert_eq!(
+            h.stretch_rect(&src, &linear, D3DTEXF_LINEAR),
+            D3D_OK,
+            "1:1 linear {x_format:#x} -> {a_format:#x}"
+        );
+        for (i, &word) in read_back(&h, &linear, SIZE, a_format).iter().enumerate() {
+            assert_eq!(
+                word, opaque_red,
+                "1:1 linear {x_format:#x} -> {a_format:#x}, pixel {i}"
             );
         }
 
@@ -869,18 +883,86 @@ fn stretch_rect_from_an_x_render_target_into_its_a_counterpart_writes_opaque_alp
     }
 }
 
-/// `StretchRect` between X and A offscreen plains of one storage writes alpha one.
+/// `StretchRect` from the X8R8G8B8 back buffer into an A8R8G8B8 texture writes alpha one.
 ///
-/// An offscreen-plain destination cannot be rendered into, so the X into A
-/// pair is converted on the CPU, and the conversion reads the padding as alpha
-/// one: X8R8G8B8 into A8R8G8B8 and X1R5G5B5 into A1R5G5B5, each source locked
-/// with its padding clear.
+/// A frame copies its back buffer into a render-target texture of the same
+/// size and samples it afterwards. The back buffer's padding holds the fill's
+/// zero alpha, and the copy still reads alpha one. The fill is uniform, so the
+/// probes hold under `render.scale`, where the copy resamples.
 #[test]
-fn stretch_rect_from_an_x_offscreen_plain_into_its_a_counterpart_writes_opaque_alpha() {
+fn stretch_rect_from_the_x8r8g8b8_back_buffer_into_an_a8r8g8b8_texture_writes_opaque_alpha() {
+    const SIZE: (u32, u32) = (640, 480);
+    let h = Harness::new();
+    let back_buffer = h.render_target(0);
+    assert_eq!(h.color_fill_hr(&back_buffer, 0x00FF_0000), D3D_OK, "fill");
+    let texture = h.create_texture(
+        SIZE.0,
+        SIZE.1,
+        1,
+        D3DUSAGE_RENDERTARGET,
+        D3DFMT_A8R8G8B8,
+        D3DPOOL_DEFAULT,
+    );
+    let level = texture.surface_level(0);
+    assert_eq!(
+        h.stretch_rect(&back_buffer, &level, D3DTEXF_NONE),
+        D3D_OK,
+        "back buffer -> A8R8G8B8 texture level"
+    );
+    let words = read_back(&h, &level, SIZE, D3DFMT_A8R8G8B8);
+    for (x, y) in [(0, 0), (320, 240), (639, 479)] {
+        assert_eq!(words[y * SIZE.0 as usize + x], RED, "pixel ({x}, {y})");
+    }
+}
+
+/// `StretchRect` from an X8R8G8B8 render target into an A16B16G16R16F one writes alpha one.
+///
+/// The two storages differ, so the copy converts through the render quad, and
+/// the X byte's zero still reads as alpha one in the half-float destination.
+#[test]
+fn stretch_rect_from_an_x8r8g8b8_render_target_into_a16b16g16r16f_writes_opaque_alpha() {
+    let h = Harness::new();
+    let src = h.create_render_target(16, 16, D3DFMT_X8R8G8B8);
+    assert_eq!(h.color_fill_hr(&src, 0x00FF_0000), D3D_OK, "fill");
+    let dst = h.create_render_target(16, 16, D3DFMT_A16B16G16R16F);
+    assert_eq!(
+        h.stretch_rect(&src, &dst, D3DTEXF_NONE),
+        D3D_OK,
+        "X8R8G8B8 -> A16B16G16R16F"
+    );
+    let sysmem = h.create_offscreen_plain_surface(16, 16, D3DFMT_A16B16G16R16F, D3DPOOL_SYSTEMMEM);
+    assert_eq!(
+        h.get_render_target_data_hr(&dst, &sysmem),
+        D3D_OK,
+        "read-back"
+    );
+    let locked = sysmem.lock_rect(D3DLOCK_READONLY);
+    let pitch = usize::try_from(locked.pitch()).expect("positive pitch") / 2;
+    let halves = locked.as_u16(pitch * 16);
+    for (x, y) in [(0usize, 0usize), (8, 8), (15, 15)] {
+        let texel = y * pitch + x * 4;
+        let lanes = [0, 1, 2, 3].map(|lane| f16_to_f32(halves[texel + lane]).to_bits());
+        assert_eq!(
+            lanes,
+            [1.0f32, 0.0, 0.0, 1.0].map(f32::to_bits),
+            "texel ({x}, {y}) as R, G, B, A"
+        );
+    }
+}
+
+/// `StretchRect` from an X offscreen plain into one with alpha writes alpha one.
+///
+/// An offscreen-plain destination cannot be rendered into, so the pair is
+/// converted on the CPU, and the conversion reads the padding as alpha one:
+/// X8R8G8B8 into A8R8G8B8, X1R5G5B5 into A1R5G5B5, and X8R8G8B8 into
+/// A1R5G5B5 and A4R4G4B4, each source locked with its padding clear.
+#[test]
+fn stretch_rect_from_an_x_offscreen_plain_into_one_with_alpha_writes_opaque_alpha() {
     const SIDE: usize = 4;
     // Red with the top bit, the X1R5G5B5 padding, clear, and the same red opaque.
     const X1_RED: u16 = 0x7C00;
     const A1_OPAQUE_RED: u16 = 0xFC00;
+    const A4_OPAQUE_RED: u16 = 0xFF00;
     let h = Harness::new();
 
     let x8 = h.create_offscreen_plain_surface(4, 4, D3DFMT_X8R8G8B8, D3DPOOL_DEFAULT);
@@ -907,29 +989,48 @@ fn stretch_rect_from_an_x_offscreen_plain_into_its_a_counterpart_writes_opaque_a
         }
     }
 
-    let x1 = h.create_offscreen_plain_surface(4, 4, D3DFMT_X1R5G5B5, D3DPOOL_DEFAULT);
-    let a1 = h.create_offscreen_plain_surface(4, 4, D3DFMT_A1R5G5B5, D3DPOOL_DEFAULT);
-    let rows = |value: u16| -> Vec<u8> {
-        core::iter::repeat_n(value.to_le_bytes(), SIDE * SIDE)
-            .flatten()
-            .collect()
+    // Each source is red with its padding clear. X8R8G8B8 shares its storage
+    // with A1R5G5B5 and A4R4G4B4 on a device that widens the packed 16-bit
+    // formats (`make test INTEL=1`), where a byte copy would hand the padding
+    // over; on a device with them the pair is two storages either way.
+    let fill = |format: u32| -> Vec<u8> {
+        if format == D3DFMT_X1R5G5B5 {
+            core::iter::repeat_n(X1_RED.to_le_bytes(), SIDE * SIDE)
+                .flatten()
+                .collect()
+        } else {
+            core::iter::repeat_n(0x00FF_0000u32.to_le_bytes(), SIDE * SIDE)
+                .flatten()
+                .collect()
+        }
     };
-    x1.lock_rect(0).write_u8_rect(SIDE * 2, SIDE, &rows(X1_RED));
-    a1.lock_rect(0).write_u8_rect(SIDE * 2, SIDE, &rows(0));
-    assert_eq!(
-        h.stretch_rect(&x1, &a1, D3DTEXF_NONE),
-        D3D_OK,
-        "X1R5G5B5 -> A1R5G5B5"
-    );
-    let locked = a1.lock_rect(D3DLOCK_READONLY);
-    let pitch = usize::try_from(locked.pitch()).expect("positive pitch") / 2;
-    let texels = locked.as_u16(pitch * SIDE);
-    for y in 0..SIDE {
+    for (src_format, dst_format, opaque_red) in [
+        (D3DFMT_X1R5G5B5, D3DFMT_A1R5G5B5, A1_OPAQUE_RED),
+        (D3DFMT_X8R8G8B8, D3DFMT_A1R5G5B5, A1_OPAQUE_RED),
+        (D3DFMT_X8R8G8B8, D3DFMT_A4R4G4B4, A4_OPAQUE_RED),
+    ] {
+        let src = h.create_offscreen_plain_surface(4, 4, src_format, D3DPOOL_DEFAULT);
+        let dst = h.create_offscreen_plain_surface(4, 4, dst_format, D3DPOOL_DEFAULT);
+        let src_bytes = fill(src_format);
+        src.lock_rect(0)
+            .write_u8_rect(src_bytes.len() / SIDE, SIDE, &src_bytes);
+        dst.lock_rect(0)
+            .write_u8_rect(SIDE * 2, SIDE, &[0; SIDE * SIDE * 2]);
         assert_eq!(
-            &texels[y * pitch..y * pitch + SIDE],
-            &[A1_OPAQUE_RED; SIDE],
-            "A1R5G5B5 row {y}"
+            h.stretch_rect(&src, &dst, D3DTEXF_NONE),
+            D3D_OK,
+            "{src_format:#x} -> {dst_format:#x}"
         );
+        let locked = dst.lock_rect(D3DLOCK_READONLY);
+        let pitch = usize::try_from(locked.pitch()).expect("positive pitch") / 2;
+        let texels = locked.as_u16(pitch * SIDE);
+        for y in 0..SIDE {
+            assert_eq!(
+                &texels[y * pitch..y * pitch + SIDE],
+                &[opaque_red; SIDE],
+                "{src_format:#x} -> {dst_format:#x} row {y}"
+            );
+        }
     }
 }
 
