@@ -569,6 +569,64 @@ fn scissor_clips_draw() {
     assert_eq!(h.read_pixel(480, 360), BLACK, "outside scissor stays black");
 }
 
+/// Draw a full-target red quad under the scissor `rect`, on black.
+fn draw_scissored(h: &Harness, rect: D3DRECT) {
+    h.render_once(BLACK, |d| {
+        assert_eq!(d.set_scissor_rect(&rect), 0, "SetScissorRect");
+        assert_eq!(d.set_render_state(D3DRS_SCISSORTESTENABLE, 1), 0);
+        assert_eq!(
+            d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &fill_quad(RED)),
+            0,
+            "scissored draw"
+        );
+        assert_eq!(d.set_render_state(D3DRS_SCISSORTESTENABLE, 0), 0);
+    });
+}
+
+#[test]
+fn a_scissor_reaching_past_the_top_left_corner_keeps_its_far_edges() {
+    // The rect is stored as written and only its part on the target lets
+    // pixels through: (0, 0)-(160, 120) here, not a rect widened by the
+    // distance its near edges stick out.
+    let h = Harness::new();
+    arm_diffuse(&h);
+    let rect = D3DRECT {
+        x1: -160,
+        y1: -120,
+        x2: 160,
+        y2: 120,
+    };
+    draw_scissored(&h, rect);
+    let got = h.scissor_rect();
+    assert_eq!(
+        (got.x1, got.y1, got.x2, got.y2),
+        (-160, -120, 160, 120),
+        "GetScissorRect hands the rect back as written"
+    );
+    assert_eq!(h.read_pixel(100, 80), RED, "inside the scissor");
+    assert_eq!(h.read_pixel(240, 80), BLACK, "right of the far edge");
+    assert_eq!(h.read_pixel(100, 180), BLACK, "below the far edge");
+}
+
+#[test]
+fn an_unbounded_scissor_rect_scissors_nothing_away() {
+    // `SetScissorRect` takes any RECT, so an edge far past any target is a
+    // valid way to say "everything".
+    let h = Harness::new();
+    arm_diffuse(&h);
+    draw_scissored(
+        &h,
+        D3DRECT {
+            x1: 0,
+            y1: 0,
+            x2: i32::MAX,
+            y2: i32::MAX,
+        },
+    );
+    assert_eq!(h.read_pixel(10, 10), RED, "top left");
+    assert_eq!(h.read_pixel(630, 470), RED, "bottom right");
+}
+
 #[test]
 fn cull_mode_discriminates_winding() {
     let h = Harness::new();

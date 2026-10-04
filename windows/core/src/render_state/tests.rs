@@ -185,3 +185,52 @@ fn unconsumed_render_states_are_the_known_gaps() {
         );
     }
 }
+
+const fn rect(x1: i32, y1: i32, x2: i32, y2: i32) -> D3DRECT {
+    D3DRECT { x1, y1, x2, y2 }
+}
+
+#[test]
+fn scissor_region_clamps_the_near_edges_and_keeps_the_far_ones() {
+    // A rect reaching past the top-left corner lets through only what lies on
+    // the target: its far edges stay where the game put them.
+    assert_eq!(scissor_region(rect(-160, -20, 160, 240)), (0, 0, 160, 240));
+    assert_eq!(scissor_snapshot_rect(rect(-160, -20, 160, 240)), [0, 0, 160, 240]);
+    assert_eq!(scissor_snapshot_rect(rect(10, 20, 110, 70)), [10, 20, 100, 50]);
+}
+
+#[test]
+fn scissor_region_of_an_empty_or_inverted_rect_is_empty() {
+    for r in [
+        rect(50, 50, 50, 90),
+        rect(50, 50, 90, 50),
+        rect(90, 90, 50, 50),
+        rect(-30, -30, -10, -10),
+    ] {
+        let [_, _, width, height] = scissor_snapshot_rect(r);
+        assert_eq!(width * height, 0, "{:?}", scissor_region(r));
+    }
+}
+
+#[test]
+fn scissor_snapshot_rect_saturates_an_unbounded_rect() {
+    assert_eq!(
+        scissor_snapshot_rect(rect(0, 0, i32::MAX, i32::MAX)),
+        [0, 0, u16::MAX, u16::MAX]
+    );
+    assert_eq!(
+        scissor_snapshot_rect(rect(i32::MIN, i32::MIN, i32::MAX, i32::MAX)),
+        [0, 0, u16::MAX, u16::MAX]
+    );
+    assert_eq!(
+        scissor_snapshot_rect(rect(70_000, 0, 80_000, 10)),
+        [u16::MAX, 0, 0, 10]
+    );
+}
+
+#[test]
+fn full_target_scissor_covers_the_target() {
+    let r = full_target_scissor(640, 480);
+    assert_eq!(scissor_region(r), (0, 0, 640, 480));
+    assert_eq!(scissor_region(full_target_scissor(u32::MAX, 1)).2, i32::MAX);
+}

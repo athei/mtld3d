@@ -38,7 +38,7 @@ use mtld3d_types::{
     D3DRS_STENCILFUNC, D3DRS_STENCILMASK, D3DRS_STENCILPASS, D3DRS_STENCILREF,
     D3DRS_STENCILWRITEMASK, D3DRS_STENCILZFAIL, D3DRS_TEXTUREFACTOR, D3DRS_TWEENFACTOR,
     D3DRS_TWOSIDEDSTENCILMODE, D3DRS_VERTEXBLEND, D3DRS_ZENABLE, D3DRS_ZFUNC, D3DRS_ZWRITEENABLE,
-    D3DSTENCILOP_DECR, D3DSTENCILOP_KEEP, RENDER_STATE_COUNT,
+    D3DRECT, D3DSTENCILOP_DECR, D3DSTENCILOP_KEEP, RENDER_STATE_COUNT,
 };
 
 /// The D3D9 enum bounds at the byte width the snapshots carry.
@@ -425,6 +425,58 @@ fn enum_value_outside(rs: &[u32; RENDER_STATE_COUNT], state: u32) -> u8 {
             );
             byte
         }
+    }
+}
+
+/// The scissor rect D3D9 gives a target of `width` x `height`: the whole target.
+///
+/// What `CreateDevice`, `Reset` and `SetRenderTarget` on slot 0 leave behind.
+#[must_use]
+pub const fn full_target_scissor(width: u32, height: u32) -> D3DRECT {
+    D3DRECT {
+        x1: 0,
+        y1: 0,
+        x2: saturating_i32(width),
+        y2: saturating_i32(height),
+    }
+}
+
+/// The half-open `(x1, y1, x2, y2)` region a scissor rect lets through.
+///
+/// `SetScissorRect` takes any `RECT` and `GetScissorRect` hands it back as
+/// written, so the stored rect can reach past the target's top-left corner or
+/// be inverted. Its left and top edges clamp at zero, and a right or bottom
+/// edge short of the clamped left or top leaves an empty region, which lets
+/// nothing through.
+#[must_use]
+pub const fn scissor_region(rect: D3DRECT) -> (i32, i32, i32, i32) {
+    let x1 = if rect.x1 > 0 { rect.x1 } else { 0 };
+    let y1 = if rect.y1 > 0 { rect.y1 } else { 0 };
+    let x2 = if rect.x2 > x1 { rect.x2 } else { x1 };
+    let y2 = if rect.y2 > y1 { rect.y2 } else { y1 };
+    (x1, y1, x2, y2)
+}
+
+/// The scissor rect as the render-state snapshot carries it: `[x, y, width, height]` in `u16`.
+///
+/// [`scissor_region`] with every edge saturated at `u16::MAX`. No target is
+/// larger than 16384 texels on a side and the encoder clamps the rect to the
+/// attachment, so the saturation changes nothing a draw can see, while a
+/// game's "unbounded" rect (an edge at `i32::MAX`) still narrows.
+#[must_use]
+pub fn scissor_snapshot_rect(rect: D3DRECT) -> [u16; 4] {
+    let (x1, y1, x2, y2) = scissor_region(rect);
+    let edge = |v: i32| u16::try_from(v).unwrap_or(u16::MAX);
+    let (x1, y1, x2, y2) = (edge(x1), edge(y1), edge(x2), edge(y2));
+    [x1, y1, x2 - x1, y2 - y1]
+}
+
+/// `value` as an `i32`, saturated at `i32::MAX`.
+const fn saturating_i32(value: u32) -> i32 {
+    if value > i32::MAX.cast_unsigned() {
+        i32::MAX
+    } else {
+        value.cast_signed()
     }
 }
 

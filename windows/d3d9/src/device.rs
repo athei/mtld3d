@@ -70,7 +70,7 @@ use mtld3d_types::{
     D3D_MAX_SIMULTANEOUS_RENDERTARGETS, D3DCAPS9, D3DCLEAR_STENCIL, D3DCLEAR_TARGET,
     D3DCLEAR_ZBUFFER, D3DDEVICE_CREATION_PARAMETERS, D3DDISPLAYMODE,
     D3DERR_UNSUPPORTEDTEXTUREFILTER, D3DFMT_ATI1, D3DFMT_INDEX16, D3DFMT_INDEX32, D3DFMT_UYVY,
-    D3DFMT_YUY2, D3DGAMMARAMP, D3DLIGHT9, D3DMATERIAL9, D3DMATRIX, D3DPOOL_DEFAULT,
+    D3DFMT_YUY2, D3DGAMMARAMP, D3DLIGHT9, D3DMATERIAL9, D3DMATRIX, D3DPOOL_DEFAULT, D3DRECT,
     D3DPOOL_MANAGED, D3DPOOL_SCRATCH, D3DPOOL_SYSTEMMEM, D3DPRESENT_INTERVAL_DEFAULT,
     D3DPRESENT_INTERVAL_FOUR, D3DPRESENT_INTERVAL_IMMEDIATE, D3DPRESENT_INTERVAL_ONE,
     D3DPRESENT_INTERVAL_THREE, D3DPRESENT_INTERVAL_TWO, D3DPRESENT_PARAMETERS,
@@ -577,7 +577,8 @@ pub struct DeviceInner {
     /// The encoder thread reads this each draw and emits a Metal
     /// `setScissorRect` command gated on `D3DRS_SCISSORTESTENABLE`.
     /// `(0, 0, 0, 0)` means "unset — use viewport".
-    scissor_rect: [u32; 4],
+    /// `SetScissorRect`'s rect as the game wrote it, which `GetScissorRect` hands back.
+    scissor_rect: D3DRECT,
     /// Viewport set by `SetViewport`.
     ///
     /// Served back by `GetViewport`. Width/height also flow to the encoder so
@@ -1006,11 +1007,11 @@ impl DeviceInner {
         }
     }
 
-    pub const fn scissor_rect(&self) -> [u32; 4] {
+    pub const fn scissor_rect(&self) -> D3DRECT {
         self.scissor_rect
     }
 
-    pub const fn set_scissor_rect(&mut self, r: [u32; 4]) {
+    pub const fn set_scissor_rect(&mut self, r: D3DRECT) {
         self.scissor_rect = r;
     }
 
@@ -2806,7 +2807,8 @@ impl DeviceInner {
         // Reset abandons any open scene; a following EndScene must fail.
         self.flags.remove(DeviceFlags::IN_SCENE);
         // Scissor defaults to the full target, like the viewport reseed below.
-        self.scissor_rect = [0, 0, self.backbuffer_width, self.backbuffer_height];
+        self.scissor_rect =
+            mtld3d_core::render_state::full_target_scissor(self.backbuffer_width, self.backbuffer_height);
 
         // Viewport reseed mirrors `set_viewport` — push the op so the
         // encoder's pass-state picks up the default before the first
@@ -3104,7 +3106,7 @@ impl DeviceInner {
                 min_z: 0.0,
                 max_z: 1.0,
             });
-            self.scissor_rect = [0, 0, new_width, new_height];
+            self.scissor_rect = mtld3d_core::render_state::full_target_scissor(new_width, new_height);
         }
     }
 
@@ -3352,7 +3354,10 @@ impl Direct3DDevice9 {
             vs_draw: mtld3d_core::vs_draw::VsDrawState::new(),
             // D3D9 default scissor rect covers the full backbuffer; like the
             // viewport, SetRenderTarget and Reset re-cover the new target.
-            scissor_rect: [0, 0, info.backbuffer_width, info.backbuffer_height],
+            scissor_rect: mtld3d_core::render_state::full_target_scissor(
+                info.backbuffer_width,
+                info.backbuffer_height,
+            ),
             viewport,
             clip_planes: [[0.0; 4]; CLIP_PLANE_SLOTS],
             cursor: CursorState::new(
@@ -9421,7 +9426,10 @@ extern "system" fn device_set_render_target(
     });
     // D3D9 likewise resets the scissor rect to the new RT's full dimensions,
     // overriding any rect set before the switch.
-    dev.set_scissor_rect([0, 0, desc.width, desc.height]);
+    dev.set_scissor_rect(mtld3d_core::render_state::full_target_scissor(
+        desc.width,
+        desc.height,
+    ));
     // RT swap: depth/stencil resolution may change; new RT might also
     // already be bound as a texture on some stage (sampling-from-RT). RS
     // carries the reset scissor; VS_CONST is internalized into `set_viewport`.
@@ -9870,17 +9878,10 @@ extern "system" fn device_clear(
     // Clear also honours D3DRS_SCISSORTESTENABLE: when on, every cleared
     // region is additionally clipped to the (non-degenerate) device scissor
     // rect. Resolved on the API thread; the encoder then clips ∩ viewport.
-    // `scissor_rect()` is stored as [x, y, width, height]; convert to the
-    // half-open `(x1, y1, x2, y2)` the rect intersectors expect.
-    let s = dev.scissor_rect(); // [x, y, width, height]
-    let scissor_on =
-        dev.render_state(D3DRS_SCISSORTESTENABLE as usize) != 0 && s[2] > 0 && s[3] > 0;
-    let scissor = (
-        s[0].cast_signed(),
-        s[1].cast_signed(),
-        s[0].saturating_add(s[2]).cast_signed(),
-        s[1].saturating_add(s[3]).cast_signed(),
-    );
+    let scissor = mtld3d_core::render_state::scissor_region(dev.scissor_rect());
+    let scissor_on = dev.render_state(D3DRS_SCISSORTESTENABLE as usize) != 0
+        && scissor.2 > scissor.0
+        && scissor.3 > scissor.1;
 
     // D3D9 Clear's pRects/Count semantics, shared by every plane:
     //  - pRects == NULL  → clear the whole target (Count ignored). With the
@@ -11034,39 +11035,34 @@ extern "system" fn device_get_current_texture_palette(
 }
 
 extern "system" fn device_set_scissor_rect(this: *mut c_void, rect: *const c_void) -> i32 {
-    use mtld3d_types::D3DRECT;
     let _api = device_api_lock(this);
     let _timer = bind_timer(this, BindSubCategory::ViewScissor);
     // SAFETY: vtable in-param; `rect` is *const D3DRECT per ABI.
     let Some(r) = (unsafe { ValueIn::<D3DRECT>::read_opt(rect) }) else {
         return D3DERR_INVALIDCALL;
     };
-    let rect_x = r.x1.max(0).cast_unsigned();
-    let rect_y = r.y1.max(0).cast_unsigned();
-    let rect_w = (r.x2 - r.x1).max(0).cast_unsigned();
-    let rect_h = (r.y2 - r.y1).max(0).cast_unsigned();
     // SAFETY: vtable thunk; `this` is *mut Direct3DDevice9 per IDirect3DDevice9 ABI.
     let Some(obj) = (unsafe { InPtrMut::<Direct3DDevice9>::opt(this) }) else {
         return D3DERR_INVALIDCALL;
     };
     let dev = obj.inner();
     if let Some(rec) = dev.recording_state_block_mut() {
-        rec.record(StateOp::ScissorRect([rect_x, rect_y, rect_w, rect_h]));
+        rec.record(StateOp::ScissorRect(r));
         return D3D_OK;
     }
     if dev.frame_dump.active {
         dev.frame_dump_event(&format!(
-            "SetScissorRect [{rect_x},{rect_y},{rect_w},{rect_h}]"
+            "SetScissorRect ({},{})-({},{})",
+            r.x1, r.y1, r.x2, r.y2
         ));
     }
-    dev.set_scissor_rect([rect_x, rect_y, rect_w, rect_h]);
+    dev.set_scissor_rect(r);
     // scissor_rect is the only piece of RenderStateSnapshot affected.
     dev.mark_snapshot_dirty(SnapshotDirty::RS);
     D3D_OK
 }
 
 extern "system" fn device_get_scissor_rect(this: *mut c_void, rect: *mut c_void) -> i32 {
-    use mtld3d_types::D3DRECT;
     let _api = device_api_lock(this);
     let _timer = bind_timer(this, BindSubCategory::ViewScissor);
     if rect.is_null() {
@@ -11077,17 +11073,12 @@ extern "system" fn device_get_scissor_rect(this: *mut c_void, rect: *mut c_void)
         return D3DERR_INVALIDCALL;
     };
     let dev = obj.inner();
-    let [x, y, w, h] = dev.scissor_rect();
+    let scissor = dev.scissor_rect();
     // SAFETY: `rect` is non-null (checked above) and per the D3D9 ABI
     // points to a writable `RECT` (alias for `D3DRECT`) owned by the
     // caller.
     unsafe {
-        *rect.cast::<D3DRECT>() = D3DRECT {
-            x1: x.cast_signed(),
-            y1: y.cast_signed(),
-            x2: (x + w).cast_signed(),
-            y2: (y + h).cast_signed(),
-        };
+        *rect.cast::<D3DRECT>() = scissor;
     }
     D3D_OK
 }
@@ -12131,14 +12122,9 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
             rs[D3DRS_SCISSORTESTENABLE as usize] != 0,
         );
 
-        let sr = dev.scissor_rect();
-        // D3D9 caps scissor coords at MaxTextureWidth/Height (16384) — fits u16.
-        let scissor_rect = [
-            u16::try_from(sr[0]).expect("D3D9 scissor x ≤ 16384"),
-            u16::try_from(sr[1]).expect("D3D9 scissor y ≤ 16384"),
-            u16::try_from(sr[2]).expect("D3D9 scissor w ≤ 16384"),
-            u16::try_from(sr[3]).expect("D3D9 scissor h ≤ 16384"),
-        ];
+        // `SetScissorRect` stores any RECT; the snapshot carries the region
+        // it lets through, saturated to `u16`.
+        let scissor_rect = mtld3d_core::render_state::scissor_snapshot_rect(dev.scissor_rect());
 
         // `D3DRS_MULTISAMPLEMASK` only means anything against a maskable
         // multisampled target, and which target is bound is API-thread
