@@ -457,17 +457,15 @@ pub fn d3d_to_metal_blend_op(d3d_op: u32) -> BlendOperation {
 ///
 /// That sum happens ahead of the viewport's depth mapping, which would scale
 /// it by `max_z - min_z`, so the value is divided by that range here. An
-/// inverted range (`MinZ > MaxZ`, which `SetViewport` accepts) divides by a
-/// negative range, so the fragment still moves by the bias in the direction
-/// D3D9 asked for. An empty range maps every fragment to one depth, where no
-/// offset can order them, and returns zero.
+/// empty or inverted range maps every fragment to one depth, where no offset
+/// can order them, and returns zero.
 ///
 /// `D3DRS_SLOPESCALEDEPTHBIAS` is not part of this: Metal applies the slope
 /// term unscaled, so it stays on `setDepthBias`.
 #[must_use]
 pub fn d3d_depth_bias_to_clip(raw_d3d: u32, min_z: f32, max_z: f32) -> f32 {
     let range = max_z - min_z;
-    if range != 0.0 && range.is_finite() {
+    if range > 0.0 {
         f32::from_bits(raw_d3d) / range
     } else {
         0.0
