@@ -12,7 +12,7 @@ use mtld3d_types::{
     D3DCULL_CCW, D3DCULL_CW, D3DCULL_NONE, D3DFILL_SOLID, D3DFILL_WIREFRAME, D3DFMT_A8R8G8B8,
     D3DFVF_DIFFUSE, D3DFVF_TEX1, D3DFVF_XYZ, D3DPOOL_DEFAULT, D3DPT_TRIANGLELIST, D3DRECT,
     D3DRS_ALPHABLENDENABLE, D3DRS_BLENDOP, D3DRS_COLORWRITEENABLE, D3DRS_CULLMODE, D3DRS_DEPTHBIAS,
-    D3DRS_DESTBLEND, D3DRS_FILLMODE, D3DRS_LIGHTING, D3DRS_SCISSORTESTENABLE, D3DRS_SRCBLEND,
+    D3DRS_DESTBLEND, D3DRS_FILLMODE, D3DRS_LIGHTING, D3DRS_SCISSORTESTENABLE, D3DRS_SLOPESCALEDEPTHBIAS, D3DRS_SRCBLEND,
     D3DRS_SRGBWRITEENABLE, D3DRS_STENCILENABLE, D3DRS_STENCILFUNC, D3DRS_STENCILMASK,
     D3DRS_STENCILPASS, D3DRS_STENCILREF, D3DRS_ZENABLE, D3DRS_ZFUNC, D3DRS_ZWRITEENABLE,
     D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_MAGFILTER, D3DSAMP_MINFILTER, D3DSTENCILOP_KEEP,
@@ -921,6 +921,60 @@ fn depth_bias_is_an_absolute_offset_at_every_depth() {
             "z0={z0}: a bias over the gap brings the quad in front"
         );
     }
+}
+
+#[test]
+fn slope_scaled_depth_bias_is_measured_in_reported_pixels() {
+    // `D3DRS_SLOPESCALEDEPTHBIAS` scales the depth slope per pixel of the size
+    // D3D9 reports, whatever grid the target is rasterized on. A red quad
+    // whose depth rises by `gap / 64` per pixel crosses the flat green quad at
+    // 0.5 one `gap` behind it at the centre column, so a slope factor of -51.2
+    // (an offset of 0.8 gap) leaves the crossing 12.8 pixels left of the
+    // probe and -80 (1.25 gap) moves it 16 pixels right of it. A factor
+    // applied per render pixel at `render.scale = 0.75` would offset by 4/3
+    // as much, putting the first crossing 4.3 pixels right of the probe.
+    let h = Harness::with_depth();
+    arm_diffuse(&h);
+    let gap = 1.0_f32 / 4096.0;
+    let slope = gap / 64.0;
+    let z0 = 0.5_f32;
+    let left = z0 + gap - slope * 320.5;
+    let right = left + slope * 640.0;
+    let v = |x: f32, y: f32, z: f32| PosColorVertex { x, y, z, color: RED };
+    let sloped = [
+        v(-1.0, 1.0, left),
+        v(1.0, 1.0, right),
+        v(-1.0, -1.0, left),
+        v(1.0, 1.0, right),
+        v(1.0, -1.0, right),
+        v(-1.0, -1.0, left),
+    ];
+    let wins = |factor: f32| {
+        h.render_once(BLACK, |d| {
+            assert_eq!(d.clear(D3DCLEAR_ZBUFFER, 0, 1.0, 0), 0, "depth clear");
+            assert_eq!(d.set_render_state(D3DRS_ZENABLE, 1), 0);
+            assert_eq!(d.set_render_state(D3DRS_ZWRITEENABLE, 1), 0);
+            assert_eq!(d.set_render_state(D3DRS_ZFUNC, D3DCMP_LESS), 0);
+            assert_eq!(
+                d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad_at_depth(GREEN, z0)),
+                0,
+                "stored depth"
+            );
+            assert_eq!(
+                d.set_render_state(D3DRS_SLOPESCALEDEPTHBIAS, factor.to_bits()),
+                0
+            );
+            assert_eq!(
+                d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &sloped),
+                0,
+                "sloped quad"
+            );
+            assert_eq!(d.set_render_state(D3DRS_SLOPESCALEDEPTHBIAS, 0), 0);
+        });
+        h.read_pixel(320, 240) == RED
+    };
+    assert!(!wins(-51.2), "an offset under the gap leaves the quad behind");
+    assert!(wins(-80.0), "an offset over the gap brings the quad in front");
 }
 
 #[test]

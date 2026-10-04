@@ -475,6 +475,19 @@ pub fn d3d_depth_bias_to_clip(raw_d3d: u32, min_z: f32, max_z: f32) -> f32 {
     }
 }
 
+/// Convert D3D9's raw `D3DRS_SLOPESCALEDEPTHBIAS` into the slope factor Metal's `setDepthBias` takes.
+///
+/// D3D9 multiplies the factor by the depth slope per pixel of the size it
+/// reports. On a target `render.scale` rasterizes smaller, Metal measures the
+/// slope per render pixel, which is the reported slope divided by the
+/// scale, so the factor is multiplied by the scale (render pixels per
+/// reported pixel) to leave the offset D3D9 asked for. `scale_factor` is
+/// exactly `1.0` at the identity, so the default path is unchanged.
+#[must_use]
+pub fn d3d_slope_scale_to_metal(raw_d3d: u32, scale_factor: f32) -> f32 {
+    f32::from_bits(raw_d3d) * scale_factor
+}
+
 /// D3DCULL_* → Metal cull mode.
 pub fn d3d_to_metal_cull(d3d_cull: u32) -> CullMode {
     match d3d_cull {
