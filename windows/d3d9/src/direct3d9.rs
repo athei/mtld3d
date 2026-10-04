@@ -786,7 +786,7 @@ pub fn float32_filtering_supported(deny: bool) -> bool {
         mtld3d_shared::log_once_info!(
             target: LOG_TARGET,
             "32-bit float filtering unavailable (forced={deny}): R32F/G32R32F/A32B32G32R32F \
-             answer NOTAVAILABLE for D3DUSAGE_QUERY_FILTER"
+             answer NOTAVAILABLE for D3DUSAGE_QUERY_FILTER and are sampled point-filtered"
         );
     }
     supported

@@ -1292,6 +1292,21 @@ impl DeviceInner {
         self.vertex_textures[slot].raw()
     }
 
+    /// Whether this device samples `texture` unfiltered whatever its stage's filters say.
+    ///
+    /// Only the single-precision float formats qualify, and only on a device
+    /// without 32-bit float filtering, which answers `D3DUSAGE_QUERY_FILTER`
+    /// with no for them. The format test runs first, so the device's answer is
+    /// read only for those three formats.
+    fn samples_unfiltered(&self, texture: &crate::texture::Direct3DTexture9) -> bool {
+        !mtld3d_core::format::supports_usage_query(
+            texture.d3d_format(),
+            D3DUSAGE_QUERY_FILTER,
+            false,
+            true,
+        ) && !crate::direct3d9::float32_filtering_supported(self.config().deny_float32_filtering)
+    }
+
     /// Store one vertex-slot sampler state and mirror the row to the encoder.
     pub fn set_vertex_sampler_slot_state(&mut self, slot: usize, type_: usize, value: u32) {
         self.vertex_sampler_states[slot][type_] = value;
@@ -1299,8 +1314,18 @@ impl DeviceInner {
     }
 
     /// Mirror vertex sampler `slot`'s whole state row to the encoder.
+    ///
+    /// The row carries the filters the bound texture can take: a texture this
+    /// device cannot filter is point-sampled, so the row is pushed again when
+    /// a bind starts or ends that.
     fn push_vertex_sampler_row(&mut self, slot: usize) {
-        let state = self.vertex_sampler_states[slot];
+        let mut state = self.vertex_sampler_states[slot];
+        if self.vertex_textures[slot]
+            .as_ref()
+            .is_some_and(|texture| self.samples_unfiltered(texture))
+        {
+            mtld3d_core::sampler_state::sample_unfiltered(&mut state);
+        }
         self.push_control(crate::device::SetVertexSamplerOp {
             slot: u8::try_from(slot).expect("validated attachment or vertex sampler slot"),
             state,
@@ -1318,6 +1343,9 @@ impl DeviceInner {
         slot: usize,
         tex: *mut crate::texture::Direct3DTexture9,
     ) {
+        let was_unfiltered = self.vertex_textures[slot]
+            .as_ref()
+            .is_some_and(|texture| self.samples_unfiltered(texture));
         // SAFETY: `tex` is null or a live IDirect3DTexture9 supplied by the
         // calling D3D9 vtable thunk; AddRef/Release valid for our lifetime.
         self.vertex_textures[slot] = unsafe { CachedComPtr::adopt(tex) };
@@ -1357,6 +1385,12 @@ impl DeviceInner {
             slot: u8::try_from(slot).expect("validated attachment or vertex sampler slot"),
             id,
         });
+        let unfiltered = self.vertex_textures[slot]
+            .as_ref()
+            .is_some_and(|texture| self.samples_unfiltered(texture));
+        if was_unfiltered || unfiltered {
+            self.push_vertex_sampler_row(slot);
+        }
     }
 
     pub const fn stage_bindings(&self) -> &StageBindings {
@@ -12771,6 +12805,9 @@ fn snapshot_stage_bindings(
             bound_texture_mask |= 1u8 << stage;
         }
         let mut sampler_state = dev.stage_bindings().sampler_states(stage);
+        if dev.samples_unfiltered(tex) {
+            mtld3d_core::sampler_state::sample_unfiltered(&mut sampler_state);
+        }
         // Lazy texture upload: flush any per-mip `dirty` flags before
         // capturing TextureInfo. Operations pushed by `schedule_upload`
         // precede the Draw operation on the encoder thread, so the

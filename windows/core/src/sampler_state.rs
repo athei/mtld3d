@@ -7,11 +7,13 @@
 //! different key, so the pipeline-style silent-drop bug (state classified
 //! Consumed but value never reaches the sampler) is unrepresentable.
 //!
-//! Translation is 1:1 with no implicit promotes. Promoting
+//! Translation adds no implicit promotes. Promoting
 //! `MIPFILTER NONE → LINEAR` or `MINFILTER LINEAR → ANISOTROPIC` would layer
 //! aniso onto box-filter-generated mip chains on textures the game intended
-//! to be sampled bilinearly, producing distance shimmer that the 1:1 mapping
-//! does not.
+//! to be sampled bilinearly, producing distance shimmer that D3D9 does not.
+//! The filters D3D9 names beyond what a sampler offers (the quad filters,
+//! `D3DTEXF_CONVOLUTIONMONO`) read as LINEAR, and a min or mag filter of
+//! NONE as POINT.
 
 use std::fmt;
 
@@ -20,8 +22,8 @@ use mtld3d_types::{
     D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_ADDRESSW, D3DSAMP_BORDERCOLOR, D3DSAMP_DMAPOFFSET,
     D3DSAMP_ELEMENTINDEX, D3DSAMP_MAGFILTER, D3DSAMP_MAXANISOTROPY, D3DSAMP_MAXMIPLEVEL,
     D3DSAMP_MINFILTER, D3DSAMP_MIPFILTER, D3DSAMP_MIPMAPLODBIAS, D3DSAMP_SRGBTEXTURE,
-    D3DTADDRESS_MIRRORONCE, D3DTADDRESS_WRAP, D3DTEXF_CONVOLUTIONMONO, D3DTEXF_NONE, D3DTEXF_POINT,
-    SAMPLER_STATE_COUNT, sampler_state_defaults,
+    D3DTADDRESS_MIRRORONCE, D3DTADDRESS_WRAP, D3DTEXF_ANISOTROPIC, D3DTEXF_LINEAR, D3DTEXF_NONE,
+    D3DTEXF_POINT, SAMPLER_STATE_COUNT, sampler_state_defaults,
 };
 
 use crate::{
@@ -66,17 +68,17 @@ const LOD_BIAS_LIMIT: f32 = 32.0;
 /// The D3D9 sampler enum bounds at the byte width the snapshot carries.
 ///
 /// Narrow copies of the ABI constants, each pinned to its `mtld3d-types`
-/// definition by the asserts below, so [`enum_value`] can name a bound in `u8`
-/// without a truncating cast.
-const TEXF_LAST: u8 = 8;
+/// definition by the asserts below, so [`filter_value`] and [`address_value`]
+/// can name a bound in `u8` without a truncating cast.
 const TEXF_NONE: u8 = 0;
 const TEXF_POINT: u8 = 1;
+const TEXF_LINEAR: u8 = 2;
 const TADDRESS_FIRST: u8 = 1;
 const TADDRESS_LAST: u8 = 5;
 
 const _: () = assert!(TEXF_NONE as u32 == D3DTEXF_NONE);
 const _: () = assert!(TEXF_POINT as u32 == D3DTEXF_POINT);
-const _: () = assert!(TEXF_LAST as u32 == D3DTEXF_CONVOLUTIONMONO);
+const _: () = assert!(TEXF_LINEAR as u32 == D3DTEXF_LINEAR);
 const _: () = assert!(TADDRESS_FIRST as u32 == D3DTADDRESS_WRAP);
 const _: () = assert!(TADDRESS_LAST as u32 == D3DTADDRESS_MIRRORONCE);
 const _: () = assert!(MAX_ANISOTROPY <= u8::MAX as u32);
@@ -177,17 +179,18 @@ pub const fn samp_classify(type_: u32) -> SampClass {
 
 /// Input view of the D3DSAMP state that participates in pipeline/cache decisions.
 ///
-/// [`snapshot_from_state`] narrows each state once on the way in: the enum
-/// ones to their D3D9 value space, the numeric ones to the range the sampler
-/// accepts. `key_from_snapshot` packs exactly the bytes `description_from_snapshot`
+/// [`snapshot_from_state`] narrows each state once on the way in: the filters
+/// to the point and linear filtering a sampler applies, the address modes to
+/// their D3D9 value space, the numeric ones to the range the sampler accepts.
+/// `key_from_snapshot` packs exactly the bytes `description_from_snapshot`
 /// translates, so a state can never be keyed as one thing and built as
 /// another, and the key's four-bit fields are exact without a mask.
 pub struct SamplerSnapshot {
-    /// `D3DSAMP_MINFILTER`, inside the `D3DTEXF_*` space.
+    /// `D3DSAMP_MINFILTER`, `D3DTEXF_POINT` or `D3DTEXF_LINEAR`.
     pub min_filter: u8,
-    /// `D3DSAMP_MAGFILTER`, inside the `D3DTEXF_*` space.
+    /// `D3DSAMP_MAGFILTER`, `D3DTEXF_POINT` or `D3DTEXF_LINEAR`.
     pub mag_filter: u8,
-    /// `D3DSAMP_MIPFILTER`, inside the `D3DTEXF_*` space.
+    /// `D3DSAMP_MIPFILTER`, `D3DTEXF_NONE`, `D3DTEXF_POINT` or `D3DTEXF_LINEAR`.
     pub mip_filter: u8,
     /// `D3DSAMP_ADDRESSU`, inside the `D3DTADDRESS_*` space.
     pub address_u: u8,
@@ -195,7 +198,10 @@ pub struct SamplerSnapshot {
     pub address_v: u8,
     /// `D3DSAMP_ADDRESSW`, inside the `D3DTADDRESS_*` space.
     pub address_w: u8,
-    /// `D3DSAMP_MAXANISOTROPY`, limited to the ceiling the caps advertise.
+    /// `D3DSAMP_MAXANISOTROPY` as the sampler applies it.
+    ///
+    /// Limited to the ceiling the caps advertise, and 1 unless one of the
+    /// stage's filters is `D3DTEXF_ANISOTROPIC`.
     pub max_anisotropy: u8,
     /// `D3DSAMP_MAXMIPLEVEL`, limited to the deepest level a D3D9 texture has.
     ///
@@ -228,6 +234,22 @@ impl SamplerSnapshot {
         self.mag_filter = TEXF_POINT;
         self.mip_filter = TEXF_NONE;
         self.max_anisotropy = 1;
+    }
+}
+
+/// Turn a stage's filtering into point sampling, for a texture the device cannot filter.
+///
+/// The single-precision float formats filter only on a device with 32-bit
+/// float filtering; elsewhere `CheckDeviceFormat(D3DUSAGE_QUERY_FILTER)`
+/// answers no for them and Metal does not filter them. The min and mag
+/// filters read POINT, and a mip filter other than NONE reads POINT too, which
+/// keeps the level selection and blends no texels. The PE side applies it to
+/// the stored state on its way to the draw, as it folds a texture's LOD.
+pub const fn sample_unfiltered(ss: &mut [u32; SAMPLER_STATE_COUNT]) {
+    ss[D3DSAMP_MINFILTER as usize] = D3DTEXF_POINT;
+    ss[D3DSAMP_MAGFILTER as usize] = D3DTEXF_POINT;
+    if ss[D3DSAMP_MIPFILTER as usize] != D3DTEXF_NONE {
+        ss[D3DSAMP_MIPFILTER as usize] = D3DTEXF_POINT;
     }
 }
 
@@ -385,45 +407,62 @@ pub fn snapshot_from_state(ss: &[u32; SAMPLER_STATE_COUNT], is_compare: bool) ->
     flags.set(SamplerFlags::IS_COMPARE, is_compare);
     flags.set(SamplerFlags::SRGB_TEXTURE, srgb_texture_enabled(ss));
     SamplerSnapshot {
-        min_filter: enum_value(ss, D3DSAMP_MINFILTER),
-        mag_filter: enum_value(ss, D3DSAMP_MAGFILTER),
-        mip_filter: enum_value(ss, D3DSAMP_MIPFILTER),
-        address_u: enum_value(ss, D3DSAMP_ADDRESSU),
-        address_v: enum_value(ss, D3DSAMP_ADDRESSV),
-        address_w: enum_value(ss, D3DSAMP_ADDRESSW),
-        max_anisotropy: clamped_max_anisotropy(ss[D3DSAMP_MAXANISOTROPY as usize]),
+        min_filter: filter_value(ss, D3DSAMP_MINFILTER, TEXF_POINT),
+        mag_filter: filter_value(ss, D3DSAMP_MAGFILTER, TEXF_POINT),
+        mip_filter: filter_value(ss, D3DSAMP_MIPFILTER, TEXF_NONE),
+        address_u: address_value(ss, D3DSAMP_ADDRESSU),
+        address_v: address_value(ss, D3DSAMP_ADDRESSV),
+        address_w: address_value(ss, D3DSAMP_ADDRESSW),
+        max_anisotropy: effective_max_anisotropy(ss),
         max_mip_level: clamped_max_mip_level(ss[D3DSAMP_MAXMIPLEVEL as usize]),
         border_color: ss[D3DSAMP_BORDERCOLOR as usize],
         flags,
     }
 }
 
-/// An enum-valued D3DSAMP state, narrowed to the byte a snapshot carries.
+/// A filter state, narrowed to the filtering a sampler applies.
+///
+/// A sampler filters by point or linearly, and a mip filter may also turn
+/// mipmapping off. `SetSamplerState` stores whatever DWORD the game passed,
+/// so the value is clamped into `floor..=LINEAR`: a min or mag filter of
+/// `D3DTEXF_NONE` (`floor` POINT) samples as POINT, and every value above
+/// LINEAR filters linearly. That covers `D3DTEXF_ANISOTROPIC`, whose
+/// anisotropy [`effective_max_anisotropy`] reads from the raw state, the two
+/// quad filters and `D3DTEXF_CONVOLUTIONMONO`, which no sampler offers, and
+/// any DWORD no `D3DTEXF_*` names. Each value read as another filter than it
+/// names surfaces once.
+fn filter_value(ss: &[u32; SAMPLER_STATE_COUNT], state: u32, floor: u8) -> u8 {
+    let value = ss[state as usize];
+    if value == D3DTEXF_ANISOTROPIC {
+        return TEXF_LINEAR;
+    }
+    let read = if value < u32::from(floor) {
+        floor
+    } else if value > u32::from(TEXF_LINEAR) {
+        TEXF_LINEAR
+    } else {
+        // Exact: the branches above leave POINT..=LINEAR or NONE.
+        return value.to_le_bytes()[0];
+    };
+    mtld3d_shared::log_once_warn_by!(
+        target: crate::LOG_TARGET,
+        key: (u64::from(state) << 32) | u64::from(value),
+        "D3DSAMP_{state} = {value:#x} has no sampler filter of its own → reading D3DTEXF {read}"
+    );
+    read
+}
+
+/// An address-mode state, narrowed to the byte a snapshot carries.
 ///
 /// `SetSamplerState` stores whatever DWORD the game passed, so these are game
-/// input. A value outside the state's D3D9 enum space reads as that state's
-/// default from `sampler_state_defaults`, which is what a driver settles on
-/// for an enum it does not recognise, and surfaces once. Values the space
-/// names but `convert` does not map (`D3DTEXF_NONE` on a min/mag filter, the
-/// quad filters) still reach that translator's own logged fallback arm, so
-/// every in-space value produces exactly what it did before.
-fn enum_value(ss: &[u32; SAMPLER_STATE_COUNT], state: u32) -> u8 {
+/// input. A value outside the `D3DTADDRESS_*` space reads as the D3D9 default
+/// WRAP from `sampler_state_defaults`, which is what a driver settles on for
+/// a mode it does not recognise, and surfaces once.
+fn address_value(ss: &[u32; SAMPLER_STATE_COUNT], state: u32) -> u8 {
     let value = ss[state as usize];
-    // Exact for every value the spaces below accept: both fit in a byte.
+    // Exact for every value the space accepts: it fits in a byte.
     let byte = value.to_le_bytes()[0];
-    let (first, last) = match state {
-        D3DSAMP_MINFILTER | D3DSAMP_MAGFILTER | D3DSAMP_MIPFILTER => (TEXF_NONE, TEXF_LAST),
-        D3DSAMP_ADDRESSU | D3DSAMP_ADDRESSV | D3DSAMP_ADDRESSW => (TADDRESS_FIRST, TADDRESS_LAST),
-        other => {
-            mtld3d_shared::log_once_warn_by!(
-                target: crate::LOG_TARGET,
-                key: u64::from(other),
-                "D3DSAMP_{other} narrowed as an enum but carries no enum space → low byte {byte:#x}"
-            );
-            return byte;
-        }
-    };
-    if u32::from(byte) == value && first <= byte && byte <= last {
+    if u32::from(byte) == value && (TADDRESS_FIRST..=TADDRESS_LAST).contains(&byte) {
         return byte;
     }
     // Exact: no sampler-state default is wider than a byte.
@@ -431,7 +470,7 @@ fn enum_value(ss: &[u32; SAMPLER_STATE_COUNT], state: u32) -> u8 {
     mtld3d_shared::log_once_warn_by!(
         target: crate::LOG_TARGET,
         key: u64::from(state),
-        "D3DSAMP_{state} = {value:#x} outside its {first}..={last} value space → reading the D3D9 default {default:#x}"
+        "D3DSAMP_{state} = {value:#x} outside its {TADDRESS_FIRST}..={TADDRESS_LAST} value space → reading the D3D9 default {default:#x}"
     );
     default
 }
@@ -464,6 +503,25 @@ const fn clamped_max_mip_level(level: u32) -> u8 {
     } else {
         // Exact: the branch above leaves nothing wider than a byte.
         level.to_le_bytes()[0]
+    }
+}
+
+/// `D3DSAMP_MAXANISOTROPY` as the stage's filters apply it.
+///
+/// D3D9 filters anisotropically only through `D3DTEXF_ANISOTROPIC`, so a stage
+/// whose min, mag and mip filters all name another filter samples
+/// isotropically whatever `D3DSAMP_MAXANISOTROPY` holds, and reads 1 here.
+/// Any of the three naming it turns anisotropy on, the min filter being the
+/// one that decides a minified sample and the mag filter the one the caps
+/// also advertise.
+fn effective_max_anisotropy(ss: &[u32; SAMPLER_STATE_COUNT]) -> u8 {
+    let anisotropic = [D3DSAMP_MINFILTER, D3DSAMP_MAGFILTER, D3DSAMP_MIPFILTER]
+        .iter()
+        .any(|&state| ss[state as usize] == D3DTEXF_ANISOTROPIC);
+    if anisotropic {
+        clamped_max_anisotropy(ss[D3DSAMP_MAXANISOTROPY as usize])
+    } else {
+        1
     }
 }
 

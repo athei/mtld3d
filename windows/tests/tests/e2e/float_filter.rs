@@ -6,13 +6,14 @@
 //! an engine probes for runs on Apple Silicon too, instead of only on the rare
 //! Intel-hardware run.
 
-use mtld3d_tests::Harness;
+use mtld3d_tests::{Harness, Rgba8, TexturedVertex};
 use mtld3d_types::{
     D3D_OK, D3DERR_NOTAVAILABLE, D3DFMT_A8R8G8B8, D3DFMT_A16B16G16R16, D3DFMT_A16B16G16R16F,
     D3DFMT_A32B32G32R32F, D3DFMT_G16R16F, D3DFMT_G32R32F, D3DFMT_R16F, D3DFMT_R32F,
-    D3DFMT_X8R8G8B8, D3DPOOL_MANAGED, D3DRTYPE_SURFACE, D3DRTYPE_TEXTURE, D3DSAMP_MAGFILTER,
-    D3DSAMP_MINFILTER, D3DSAMP_MIPFILTER, D3DTEXF_LINEAR, D3DTEXF_NONE, D3DTEXF_POINT,
-    D3DUSAGE_QUERY_FILTER, D3DUSAGE_RENDERTARGET, E_FAIL,
+    D3DFMT_X8R8G8B8, D3DFVF_DIFFUSE, D3DFVF_TEX1, D3DFVF_XYZ, D3DPOOL_MANAGED, D3DPT_TRIANGLELIST,
+    D3DRTYPE_SURFACE, D3DRTYPE_TEXTURE, D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_MAGFILTER,
+    D3DSAMP_MINFILTER, D3DSAMP_MIPFILTER, D3DTADDRESS_CLAMP, D3DTEXF_LINEAR, D3DTEXF_NONE,
+    D3DTEXF_POINT, D3DUSAGE_QUERY_FILTER, D3DUSAGE_RENDERTARGET, E_FAIL,
 };
 
 /// The formats `supports32BitFloatFiltering` covers.
@@ -218,5 +219,90 @@ fn validate_device_rejects_filtering_an_unfilterable_texture() {
         h.clear_texture(0),
         D3D_OK,
         "unbind before the textures drop"
+    );
+}
+
+/// Draw a 2x1 R32F texture holding 0.0 and 1.0 across the target with linear filters.
+///
+/// Returns the red channel at x = 240 of 640, three eighths across, a quarter
+/// of a texel past the first texel's centre: a filtered sample blends a
+/// quarter of the second texel in (about 0x40), an unfiltered one reads the
+/// first texel's 0x00. Both are flat over several pixels, so the reading holds
+/// under `render.scale`.
+fn red_between_the_texels(h: &Harness) -> u8 {
+    const W: u32 = 0xFFFF_FFFF;
+    let tex = h.create_texture(2, 1, 1, 0, D3DFMT_R32F, D3DPOOL_MANAGED);
+    tex.lock_rect(0, 0)
+        .write_u32(&[0.0f32.to_bits(), 1.0f32.to_bits()]);
+    assert_eq!(h.set_texture(0, &tex), D3D_OK, "SetTexture(R32F)");
+    h.select_texture_stage(0);
+    set_filters(h, D3DTEXF_LINEAR, D3DTEXF_LINEAR, D3DTEXF_NONE);
+    for state in [D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV] {
+        assert_eq!(
+            h.set_sampler_state(0, state, D3DTADDRESS_CLAMP),
+            D3D_OK,
+            "sampler address"
+        );
+    }
+    assert_eq!(
+        h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1),
+        D3D_OK,
+        "SetFVF"
+    );
+    let corner = |x: f32, y: f32, u: f32, v: f32| TexturedVertex {
+        x,
+        y,
+        z: 0.5,
+        color: W,
+        u,
+        v,
+    };
+    let quad = [
+        corner(-1.0, 1.0, 0.0, 0.0),
+        corner(1.0, 1.0, 1.0, 0.0),
+        corner(-1.0, -1.0, 0.0, 1.0),
+        corner(1.0, 1.0, 1.0, 0.0),
+        corner(1.0, -1.0, 1.0, 1.0),
+        corner(-1.0, -1.0, 0.0, 1.0),
+    ];
+    h.render_once(0xFF00_0000, |d| {
+        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad), 0);
+    });
+    let red = Rgba8::from_pixel(h.read_pixel(240, 240)).r;
+    assert_eq!(
+        h.clear_texture(0),
+        D3D_OK,
+        "unbind before the texture drops"
+    );
+    red
+}
+
+#[test]
+fn an_unfilterable_float_texture_samples_unfiltered() {
+    // A device without 32-bit float filtering samples R32F unfiltered whatever
+    // the stage's filters ask for, which is the answer its caps give.
+    let h = Harness::with_config(DENY_FLOAT32_FILTERING);
+    let red = red_between_the_texels(&h);
+    assert!(
+        red < 0x10,
+        "LINEAR on R32F without float filtering reads the nearest texel, got red {red:#04x}"
+    );
+    drop(h);
+
+    // The same draw on a device that filters the format blends the texels.
+    let h = Harness::new();
+    if h.check_device_format(
+        D3DFMT_X8R8G8B8,
+        D3DUSAGE_QUERY_FILTER,
+        D3DRTYPE_TEXTURE,
+        D3DFMT_R32F,
+    ) != D3D_OK
+    {
+        return;
+    }
+    let red = red_between_the_texels(&h);
+    assert!(
+        (0x30..=0x50).contains(&red),
+        "LINEAR on a filterable R32F blends the two texels, got red {red:#04x}"
     );
 }

@@ -273,6 +273,9 @@ is in [`CONFORMANCE.md`](../unix/conformance/CONFORMANCE.md#kept-divergences).
   opaque black, where D3D9 answers the create with an out-of-memory error.
   No knob.
 - `D3DRS_MULTISAMPLEANTIALIAS = FALSE` is ignored. No knob.
+- A `D3DSAMP_BORDERCOLOR` other than transparent black, opaque black or
+  opaque white reads as opaque black under `D3DTADDRESS_BORDER`; D3D9
+  returns the colour the game set. No knob.
 - The adapter mode list leaves out every display size win32u cannot scale
   the monitor to in its 16-bit ratio, on every Wine, and a fullscreen request
   for one follows the window instead of setting the mode. The list describes
