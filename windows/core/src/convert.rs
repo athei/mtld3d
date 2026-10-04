@@ -382,18 +382,16 @@ pub fn d3d_to_metal_blend(d3d_blend: u32) -> BlendFactor {
         D3DBLEND_ONE => BlendFactor::One,
         D3DBLEND_SRCCOLOR => BlendFactor::SourceColor,
         D3DBLEND_INVSRCCOLOR => BlendFactor::OneMinusSourceColor,
-        D3DBLEND_SRCALPHA => BlendFactor::SourceAlpha,
-        D3DBLEND_INVSRCALPHA => BlendFactor::OneMinusSourceAlpha,
+        // The `BOTH*` shorthands are source-only; `pipeline_state` resolves
+        // them as a source factor. Written as a destination factor, each
+        // reads as its source half.
+        D3DBLEND_SRCALPHA | D3DBLEND_BOTHSRCALPHA => BlendFactor::SourceAlpha,
+        D3DBLEND_INVSRCALPHA | D3DBLEND_BOTHINVSRCALPHA => BlendFactor::OneMinusSourceAlpha,
         D3DBLEND_DESTALPHA => BlendFactor::DestinationAlpha,
         D3DBLEND_INVDESTALPHA => BlendFactor::OneMinusDestinationAlpha,
         D3DBLEND_DESTCOLOR => BlendFactor::DestinationColor,
         D3DBLEND_INVDESTCOLOR => BlendFactor::OneMinusDestinationColor,
         D3DBLEND_SRCALPHASAT => BlendFactor::SourceAlphaSaturated,
-        // Source-only shorthands; `pipeline_state` resolves them as a source
-        // factor. Written as a destination factor, each reads as its source
-        // half, which is what the drivers that accept it there do.
-        D3DBLEND_BOTHSRCALPHA => BlendFactor::SourceAlpha,
-        D3DBLEND_BOTHINVSRCALPHA => BlendFactor::OneMinusSourceAlpha,
         D3DBLEND_BLENDFACTOR => BlendFactor::BlendColor,
         D3DBLEND_INVBLENDFACTOR => BlendFactor::OneMinusBlendColor,
         other => {
