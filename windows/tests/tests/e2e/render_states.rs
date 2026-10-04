@@ -7,17 +7,18 @@ use mtld3d_tests::{
     assert_pixel_approx,
 };
 use mtld3d_types::{
-    D3DBLEND_BOTHINVSRCALPHA, D3DBLEND_BOTHSRCALPHA, D3DBLEND_INVSRCALPHA, D3DBLEND_ZERO, D3DBLEND_ONE, D3DBLEND_SRCALPHA, D3DBLENDOP_ADD, D3DCLEAR_STENCIL,
-    D3DCLEAR_TARGET, D3DCLEAR_ZBUFFER, D3DCMP_ALWAYS, D3DCMP_EQUAL, D3DCMP_LESS, D3DCMP_LESSEQUAL,
-    D3DCULL_CCW, D3DCULL_CW, D3DCULL_NONE, D3DFILL_SOLID, D3DFILL_WIREFRAME, D3DFMT_A8R8G8B8,
-    D3DFVF_DIFFUSE, D3DFVF_TEX1, D3DFVF_XYZ, D3DPOOL_DEFAULT, D3DPT_TRIANGLELIST, D3DRECT,
-    D3DRS_ALPHABLENDENABLE, D3DRS_BLENDOP, D3DRS_COLORWRITEENABLE, D3DRS_CULLMODE, D3DRS_DEPTHBIAS,
-    D3DRS_DESTBLEND, D3DRS_FILLMODE, D3DRS_LIGHTING, D3DRS_SCISSORTESTENABLE, D3DRS_SLOPESCALEDEPTHBIAS, D3DRS_SRCBLEND,
-    D3DRS_SRGBWRITEENABLE, D3DRS_STENCILENABLE, D3DRS_STENCILFUNC, D3DRS_STENCILMASK,
-    D3DRS_STENCILPASS, D3DRS_STENCILREF, D3DRS_ZENABLE, D3DRS_ZFUNC, D3DRS_ZWRITEENABLE,
-    D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_MAGFILTER, D3DSAMP_MINFILTER, D3DSTENCILOP_KEEP,
-    D3DSTENCILOP_REPLACE, D3DTADDRESS_CLAMP, D3DTEXF_POINT, D3DUSAGE_RENDERTARGET, D3DVIEWPORT9,
-    render_state_defaults,
+    D3DBLEND_BOTHINVSRCALPHA, D3DBLEND_BOTHSRCALPHA, D3DBLEND_INVSRCALPHA, D3DBLEND_ONE,
+    D3DBLEND_SRCALPHA, D3DBLEND_ZERO, D3DBLENDOP_ADD, D3DCLEAR_STENCIL, D3DCLEAR_TARGET,
+    D3DCLEAR_ZBUFFER, D3DCMP_ALWAYS, D3DCMP_EQUAL, D3DCMP_LESS, D3DCMP_LESSEQUAL, D3DCULL_CCW,
+    D3DCULL_CW, D3DCULL_NONE, D3DFILL_SOLID, D3DFILL_WIREFRAME, D3DFMT_A8R8G8B8, D3DFVF_DIFFUSE,
+    D3DFVF_TEX1, D3DFVF_XYZ, D3DPOOL_DEFAULT, D3DPT_TRIANGLELIST, D3DRECT, D3DRS_ALPHABLENDENABLE,
+    D3DRS_BLENDOP, D3DRS_COLORWRITEENABLE, D3DRS_CULLMODE, D3DRS_DEPTHBIAS, D3DRS_DESTBLEND,
+    D3DRS_FILLMODE, D3DRS_LIGHTING, D3DRS_SCISSORTESTENABLE, D3DRS_SLOPESCALEDEPTHBIAS,
+    D3DRS_SRCBLEND, D3DRS_SRGBWRITEENABLE, D3DRS_STENCILENABLE, D3DRS_STENCILFUNC,
+    D3DRS_STENCILMASK, D3DRS_STENCILPASS, D3DRS_STENCILREF, D3DRS_ZENABLE, D3DRS_ZFUNC,
+    D3DRS_ZWRITEENABLE, D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_MAGFILTER, D3DSAMP_MINFILTER,
+    D3DSTENCILOP_KEEP, D3DSTENCILOP_REPLACE, D3DTADDRESS_CLAMP, D3DTEXF_POINT,
+    D3DUSAGE_RENDERTARGET, D3DVIEWPORT9, render_state_defaults,
 };
 
 const BLACK: u32 = 0xFF00_0000;
@@ -940,7 +941,12 @@ fn slope_scaled_depth_bias_is_measured_in_reported_pixels() {
     let z0 = 0.5_f32;
     let left = z0 + gap - slope * 320.5;
     let right = left + slope * 640.0;
-    let v = |x: f32, y: f32, z: f32| PosColorVertex { x, y, z, color: RED };
+    let v = |x: f32, y: f32, z: f32| PosColorVertex {
+        x,
+        y,
+        z,
+        color: RED,
+    };
     let sloped = [
         v(-1.0, 1.0, left),
         v(1.0, 1.0, right),
@@ -973,8 +979,14 @@ fn slope_scaled_depth_bias_is_measured_in_reported_pixels() {
         });
         h.read_pixel(320, 240) == RED
     };
-    assert!(!wins(-51.2), "an offset under the gap leaves the quad behind");
-    assert!(wins(-80.0), "an offset over the gap brings the quad in front");
+    assert!(
+        !wins(-51.2),
+        "an offset under the gap leaves the quad behind"
+    );
+    assert!(
+        wins(-80.0),
+        "an offset over the gap brings the quad in front"
+    );
 }
 
 #[test]
@@ -1017,8 +1029,14 @@ fn depth_bias_applies_under_an_inverted_viewport_depth_range() {
         });
         h.read_pixel(320, 240) == RED
     };
-    assert!(!wins(-0.75 * gap), "a bias under the gap leaves the quad behind");
-    assert!(wins(-1.5 * gap), "a bias over the gap brings the quad in front");
+    assert!(
+        !wins(-0.75 * gap),
+        "a bias under the gap leaves the quad behind"
+    );
+    assert!(
+        wins(-1.5 * gap),
+        "a bias over the gap brings the quad in front"
+    );
 }
 
 #[test]

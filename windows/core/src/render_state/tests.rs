@@ -195,8 +195,14 @@ fn scissor_region_clamps_the_near_edges_and_keeps_the_far_ones() {
     // A rect reaching past the top-left corner lets through only what lies on
     // the target: its far edges stay where the game put them.
     assert_eq!(scissor_region(rect(-160, -20, 160, 240)), (0, 0, 160, 240));
-    assert_eq!(scissor_snapshot_rect(rect(-160, -20, 160, 240)), [0, 0, 160, 240]);
-    assert_eq!(scissor_snapshot_rect(rect(10, 20, 110, 70)), [10, 20, 100, 50]);
+    assert_eq!(
+        scissor_snapshot_rect(rect(-160, -20, 160, 240)),
+        [0, 0, 160, 240]
+    );
+    assert_eq!(
+        scissor_snapshot_rect(rect(10, 20, 110, 70)),
+        [10, 20, 100, 50]
+    );
 }
 
 #[test]

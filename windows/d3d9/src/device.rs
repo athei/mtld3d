@@ -70,11 +70,11 @@ use mtld3d_types::{
     D3D_MAX_SIMULTANEOUS_RENDERTARGETS, D3DCAPS9, D3DCLEAR_STENCIL, D3DCLEAR_TARGET,
     D3DCLEAR_ZBUFFER, D3DDEVICE_CREATION_PARAMETERS, D3DDISPLAYMODE,
     D3DERR_UNSUPPORTEDTEXTUREFILTER, D3DFMT_ATI1, D3DFMT_INDEX16, D3DFMT_INDEX32, D3DFMT_UYVY,
-    D3DFMT_YUY2, D3DGAMMARAMP, D3DLIGHT9, D3DMATERIAL9, D3DMATRIX, D3DPOOL_DEFAULT, D3DRECT,
+    D3DFMT_YUY2, D3DGAMMARAMP, D3DLIGHT9, D3DMATERIAL9, D3DMATRIX, D3DPOOL_DEFAULT,
     D3DPOOL_MANAGED, D3DPOOL_SCRATCH, D3DPOOL_SYSTEMMEM, D3DPRESENT_INTERVAL_DEFAULT,
     D3DPRESENT_INTERVAL_FOUR, D3DPRESENT_INTERVAL_IMMEDIATE, D3DPRESENT_INTERVAL_ONE,
     D3DPRESENT_INTERVAL_THREE, D3DPRESENT_INTERVAL_TWO, D3DPRESENT_PARAMETERS,
-    D3DPRESENTFLAG_LOCKABLE_BACKBUFFER, D3DPT_TRIANGLEFAN, D3DPT_TRIANGLELIST,
+    D3DPRESENTFLAG_LOCKABLE_BACKBUFFER, D3DPT_TRIANGLEFAN, D3DPT_TRIANGLELIST, D3DRECT,
     D3DRS_ALPHABLENDENABLE, D3DRS_ALPHAFUNC, D3DRS_ALPHAREF, D3DRS_ALPHATESTENABLE, D3DRS_AMBIENT,
     D3DRS_AMBIENTMATERIALSOURCE, D3DRS_BLENDFACTOR, D3DRS_BLENDOP, D3DRS_BLENDOPALPHA,
     D3DRS_CLIPPING, D3DRS_CLIPPLANEENABLE, D3DRS_COLORVERTEX, D3DRS_COLORWRITEENABLE,
@@ -2807,8 +2807,10 @@ impl DeviceInner {
         // Reset abandons any open scene; a following EndScene must fail.
         self.flags.remove(DeviceFlags::IN_SCENE);
         // Scissor defaults to the full target, like the viewport reseed below.
-        self.scissor_rect =
-            mtld3d_core::render_state::full_target_scissor(self.backbuffer_width, self.backbuffer_height);
+        self.scissor_rect = mtld3d_core::render_state::full_target_scissor(
+            self.backbuffer_width,
+            self.backbuffer_height,
+        );
 
         // Viewport reseed mirrors `set_viewport` — push the op so the
         // encoder's pass-state picks up the default before the first
@@ -3106,7 +3108,8 @@ impl DeviceInner {
                 min_z: 0.0,
                 max_z: 1.0,
             });
-            self.scissor_rect = mtld3d_core::render_state::full_target_scissor(new_width, new_height);
+            self.scissor_rect =
+                mtld3d_core::render_state::full_target_scissor(new_width, new_height);
         }
     }
 

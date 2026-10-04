@@ -11,11 +11,11 @@
 
 use mtld3d_shared::mtl::VertexFormat;
 use mtld3d_types::{
-    D3DBLEND_BOTHINVSRCALPHA, D3DBLEND_BOTHSRCALPHA, D3DBLEND_DESTALPHA, D3DBLEND_INVDESTALPHA, D3DBLEND_INVSRCALPHA, D3DBLEND_ONE,
-    D3DBLEND_SRCALPHA, D3DBLEND_ZERO, D3DBLENDOP_ADD, D3DBLENDOP_MAX, D3DBLENDOP_MIN,
-    D3DBLENDOP_REVSUBTRACT, D3DDECLTYPE_FLOAT2,
-    D3DDECLTYPE_FLOAT3, D3DDECLUSAGE_NORMAL, D3DDECLUSAGE_POSITION, D3DDECLUSAGE_TEXCOORD,
-    D3DFVF_TEX1, D3DFVF_XYZ, D3DVERTEXELEMENT9,
+    D3DBLEND_BOTHINVSRCALPHA, D3DBLEND_BOTHSRCALPHA, D3DBLEND_DESTALPHA, D3DBLEND_INVDESTALPHA,
+    D3DBLEND_INVSRCALPHA, D3DBLEND_ONE, D3DBLEND_SRCALPHA, D3DBLEND_ZERO, D3DBLENDOP_ADD,
+    D3DBLENDOP_MAX, D3DBLENDOP_MIN, D3DBLENDOP_REVSUBTRACT, D3DDECLTYPE_FLOAT2, D3DDECLTYPE_FLOAT3,
+    D3DDECLUSAGE_NORMAL, D3DDECLUSAGE_POSITION, D3DDECLUSAGE_TEXCOORD, D3DFVF_TEX1, D3DFVF_XYZ,
+    D3DVERTEXELEMENT9,
 };
 
 use super::*;
@@ -592,7 +592,12 @@ fn both_src_alpha_source_factors_override_the_destination_factor() {
         s.rs.src_blend_alpha = narrow(src_alpha);
         s.rs.dst_blend_alpha = narrow(D3DBLEND_ONE);
         let p = params_of(&s);
-        (p.src_blend, p.dst_blend, p.src_blend_alpha, p.dst_blend_alpha)
+        (
+            p.src_blend,
+            p.dst_blend,
+            p.src_blend_alpha,
+            p.dst_blend_alpha,
+        )
     };
     assert_eq!(
         resolve(D3DBLEND_BOTHSRCALPHA, D3DBLEND_BOTHINVSRCALPHA),
@@ -634,16 +639,25 @@ fn a_pipeline_without_colour_output_ignores_blend_mask_and_format() {
         (key_of(&s), blend_fields(&params_of(&s)))
     };
     let plain = no_color(|_| {});
-    assert_eq!(plain, no_color(|s| s.rs.flags.remove(PipelineRsFlags::BLEND_ENABLE)));
+    assert_eq!(
+        plain,
+        no_color(|s| s.rs.flags.remove(PipelineRsFlags::BLEND_ENABLE))
+    );
     assert_eq!(plain, no_color(|s| s.rs.src_blend = narrow(D3DBLEND_ONE)));
     assert_eq!(plain, no_color(|s| s.rs.color_write_mask = 0x1));
-    assert_eq!(plain, no_color(|s| s.color_format = PixelFormat::Rgba16Float));
+    assert_eq!(
+        plain,
+        no_color(|s| s.color_format = PixelFormat::Rgba16Float)
+    );
     assert_eq!(
         plain,
         no_color(|s| s.attach.remove(PipelineAttachFlags::COLOR_HAS_ALPHA))
     );
     // Depth and the sample count still decide the pipeline.
-    assert_ne!(plain, no_color(|s| s.attach.insert(PipelineAttachFlags::HAS_STENCIL)));
+    assert_ne!(
+        plain,
+        no_color(|s| s.attach.insert(PipelineAttachFlags::HAS_STENCIL))
+    );
     assert_ne!(plain, no_color(|s| s.sample_count = 4));
 }
 
@@ -664,7 +678,10 @@ fn min_and_max_equations_ignore_their_factors() {
         let b = with(D3DBLEND_ZERO, D3DBLEND_DESTALPHA);
         assert_eq!(key_of(&a), key_of(&b));
         let p = params_of(&a);
-        assert_eq!((p.src_blend, p.dst_blend), (BlendFactor::One, BlendFactor::One));
+        assert_eq!(
+            (p.src_blend, p.dst_blend),
+            (BlendFactor::One, BlendFactor::One)
+        );
     }
     // An additive equation still keys its factors.
     let mut add = base();
@@ -681,7 +698,10 @@ fn separate_alpha_that_repeats_the_colour_equation_changes_nothing() {
     plain.rs.dst_blend_alpha = plain.rs.dst_blend;
     plain.rs.blend_op_alpha = plain.rs.blend_op;
     let mut separate = plain.clone();
-    separate.rs.flags.insert(PipelineRsFlags::SEPARATE_ALPHA_BLEND);
+    separate
+        .rs
+        .flags
+        .insert(PipelineRsFlags::SEPARATE_ALPHA_BLEND);
     assert_eq!(key_of(&plain), key_of(&separate));
     assert_eq!(
         blend_fields(&params_of(&plain)),

@@ -26,8 +26,8 @@ use mtld3d_core::{
 };
 use mtld3d_shared::{InPtr, VtableThis};
 use mtld3d_types::{
-    D3DLIGHT9, D3DMATERIAL9, D3DMATRIX, D3DRECT, D3DVIEWPORT9, Guid, IDirect3DStateBlock9Vtbl, MAX_STREAMS,
-    RENDER_STATE_COUNT, SAMPLER_STATE_COUNT, StateBlockType,
+    D3DLIGHT9, D3DMATERIAL9, D3DMATRIX, D3DRECT, D3DVIEWPORT9, Guid, IDirect3DStateBlock9Vtbl,
+    MAX_STREAMS, RENDER_STATE_COUNT, SAMPLER_STATE_COUNT, StateBlockType,
 };
 
 use super::{
