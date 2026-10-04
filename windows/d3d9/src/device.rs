@@ -4672,6 +4672,25 @@ extern "system" fn device_reset(this: *mut c_void, present_params: *mut c_void) 
         );
         return reject_reset(dev);
     };
+    // The auto depth-stencil format answers to the same depth and multisample
+    // rules as at `CreateDevice`, also before the window or the mode moves.
+    if pp.enable_auto_depth_stencil != 0
+        && pp.auto_depth_stencil_format != 0
+        && !mtld3d_core::multisample::auto_depth_stencil_accepts(
+            pp.auto_depth_stencil_format,
+            pp.multi_sample_type,
+            pp.multi_sample_quality,
+            crate::direct3d9::device_caps_flags(),
+        )
+    {
+        warn!(
+            target: LOG_TARGET,
+            "reject Reset: AutoDepthStencilFormat {} at MultiSampleType {} is no depth-stencil \
+             the device offers",
+            pp.auto_depth_stencil_format, pp.multi_sample_type,
+        );
+        return reject_reset(dev);
+    }
     let target_window = if pp.device_window == 0 {
         dev.window()
     } else {

@@ -1472,6 +1472,26 @@ extern "system" fn d3d9_create_device(
         );
         return D3DERR_INVALIDCALL;
     }
+    // An auto depth-stencil the depth answers refuse is refused here too,
+    // before the window or the display mode moves. A format of 0 keeps
+    // standing for no depth-stencil.
+    if pp.enable_auto_depth_stencil != 0
+        && pp.auto_depth_stencil_format != 0
+        && !multisample::auto_depth_stencil_accepts(
+            pp.auto_depth_stencil_format,
+            pp.multi_sample_type,
+            pp.multi_sample_quality,
+            device_caps_flags(),
+        )
+    {
+        warn!(
+            target: LOG_TARGET,
+            "reject CreateDevice: AutoDepthStencilFormat {} at MultiSampleType {} is no \
+             depth-stencil the device offers",
+            pp.auto_depth_stencil_format, pp.multi_sample_type,
+        );
+        return D3DERR_INVALIDCALL;
+    }
 
     // Create Metal device + command queue
     let gate = present_gate_unix_path(cfg);
