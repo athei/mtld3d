@@ -745,7 +745,7 @@ impl FfState {
     /// `SetLight` for any D3D9 light index.
     ///
     /// Slots `0..8` take the fast path; higher indices land in
-    /// `overflow_lights`, which [`Self::resolve_active_lights`] packs after
+    /// `overflow_lights`, which `resolve_active_lights` packs after
     /// them. A type outside POINT, SPOT and DIRECTIONAL is stored for
     /// `GetLight` and lights nothing, warned once per type.
     #[inline]
