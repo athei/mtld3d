@@ -30,9 +30,10 @@ use super::{
     D3DUSAGE_RENDERTARGET, D3DUSAGE_RTPATCHES, D3DUSAGE_SOFTWAREPROCESSING, PixelFormat,
     RenderScale, StandaloneSurfaceKind, Swizzle, block_row_pitch, compute_mip_count,
     compute_mip_size, compute_volume_mip_count, depth_format_bytes_per_pixel, format_name,
-    is_advertised_depth_format, is_back_buffer_format, is_depth_format, is_mapped_color_format, is_volume_texture_format,
-    linear_mip_size, linear_row_pitch, map_d3d_depth_format, map_d3d_format, resolve_mip_levels,
-    standalone_surface_bytes, surface_bytes, usage_allowed_for_rtype,
+    is_advertised_depth_format, is_back_buffer_format, is_depth_format, is_mapped_color_format,
+    is_volume_texture_format, linear_mip_size, linear_row_pitch, map_d3d_depth_format,
+    map_d3d_format, resolve_mip_levels, standalone_surface_bytes, surface_bytes,
+    usage_allowed_for_rtype,
 };
 
 /// Every mapped colour format, in `format_name` order.

@@ -633,7 +633,10 @@ fn lockable_depth_formats_serve_depth_without_the_lock() {
         let (hr, _) = texture.lock_rect_probe(0, 0);
         assert_eq!(hr, D3DERR_INVALIDCALL, "{name}: depth texture LockRect");
         let (hr, _) = texture.surface_level(0).lock_rect_probe(0);
-        assert_eq!(hr, D3DERR_INVALIDCALL, "{name}: depth texture level LockRect");
+        assert_eq!(
+            hr, D3DERR_INVALIDCALL,
+            "{name}: depth texture level LockRect"
+        );
         drop(texture);
         let (hr, _) = h.try_create_texture(64, 64, 1, 0, format, D3DPOOL_DEFAULT);
         assert_eq!(hr, D3DERR_INVALIDCALL, "{name} plain depth texture");

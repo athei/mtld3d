@@ -250,8 +250,7 @@ pub const fn is_depth_format(d3d_format: u32) -> bool {
 /// depth test rather than the lock.
 #[must_use]
 pub const fn is_advertised_depth_format(d3d_format: u32) -> bool {
-    is_depth_format(d3d_format)
-        && !matches!(d3d_format, D3DFMT_D16_LOCKABLE | D3DFMT_D32F_LOCKABLE)
+    is_depth_format(d3d_format) && !matches!(d3d_format, D3DFMT_D16_LOCKABLE | D3DFMT_D32F_LOCKABLE)
 }
 
 /// True for the FOURCC "readable raw depth" formats (`INTZ`/`DF24`/`DF16`).
