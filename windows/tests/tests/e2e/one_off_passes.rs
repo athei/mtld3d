@@ -152,9 +152,9 @@ const PROBE_PRIMER: f32 = 0.5;
 /// For the failure report of the multisampled `ColorFill` test, after its
 /// colour readings. A fresh INTZ is bound as depth and cleared to
 /// [`PROBE_PRIMER`], the surface goes back, a RESZ copies its sample zero
-/// into the INTZ, and the INTZ is sampled back at its centre. The text names
-/// the value of the test's scene that the eight-bit read matches, or none of
-/// them. A step that fails panics with its own message.
+/// into the INTZ, and the INTZ is sampled back at its centre. The text gives
+/// the read and names the value of the test's scene, or the primer, that its
+/// eight-bit depth matches. A step that fails panics with its own message.
 fn depth_probe(h: &Harness) -> String {
     let depth = h.depth_stencil_surface().expect("a depth surface is bound");
     let (hr, desc) = depth.desc();
@@ -167,12 +167,14 @@ fn depth_probe(h: &Harness) -> String {
         D3DFMT_INTZ,
         D3DPOOL_DEFAULT,
     );
-    let sample_rt = h.create_render_target(RT_SIZE, RT_SIZE, D3DFMT_A8R8G8B8);
+    // Primed through a target of the INTZ's own size: binding a smaller one
+    // would cut the clear's viewport to that size and miss the centre.
+    let prime_rt = h.create_render_target(desc.width, desc.height, D3DFMT_A8R8G8B8);
     let colour = h.render_target(0);
     assert_eq!(
-        h.set_render_target(0, &sample_rt),
+        h.set_render_target(0, &prime_rt),
         D3D_OK,
-        "bind the sampling target"
+        "bind the priming target"
     );
     assert_eq!(
         h.set_depth_stencil_surface(&intz.surface_level(0)),
@@ -200,8 +202,9 @@ fn depth_probe(h: &Harness) -> String {
         D3D_OK,
         "the RESZ magic value"
     );
-    let read = Rgba8::from_pixel(sample_intz(h, &sample_rt, &intz)).r;
-    let value = f32::from(read) / 255.0;
+    let sample_rt = h.create_render_target(RT_SIZE, RT_SIZE, D3DFMT_A8R8G8B8);
+    let read = Rgba8::from_pixel(sample_intz(h, &sample_rt, &intz));
+    let value = f32::from(read.r) / 255.0;
     let matched = [
         (0.2, "the near draw's 0.2"),
         (1.0, "the clear's 1.0"),
@@ -211,7 +214,7 @@ fn depth_probe(h: &Harness) -> String {
     .into_iter()
     .find(|(depth, _)| (value - depth).abs() <= 2.0 / 255.0)
     .map_or("none of 1.0, 0.2 and 0.8", |(_, name)| name);
-    format!("sample zero at the centre reads {read} of 255 (depth {value:.3}), {matched}")
+    format!("sample zero at the centre reads {read:?} (depth {value:.3}), {matched}")
 }
 
 /// A far draw must lose against level 1 of a depth texture across `interrupt`.
