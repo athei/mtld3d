@@ -355,7 +355,6 @@ pub const D3DFMT_D24X4S4: u32 = 79;
 pub const D3DFMT_D16: u32 = 80;
 pub const D3DFMT_D32F_LOCKABLE: u32 = 82;
 pub const D3DFMT_D24FS8: u32 = 83;
-/// The D3D9Ex lockable 32-bit integer depth format.
 pub const D3DFMT_D32_LOCKABLE: u32 = 84;
 
 // ── D3D9 FOURCC sampleable-depth formats ──
