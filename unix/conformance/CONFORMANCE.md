@@ -324,6 +324,32 @@ record. A knob, where one makes sense, is named with its default.
   ours alone: Wine checks no 3D limit and DXVK checks no size, but Metal
   aborts the process on a 3D descriptor past it. No site observes the
   deferred refusal. No knob.
+- **`ATI1` creates where no query offers it.** `CreateTexture` makes a 2D
+  `ATI1` texture in every pool and `CreateOffscreenPlainSurface` a plain
+  surface in every pool it takes, backed by BC4, while `CheckDeviceFormat` answers
+  `D3DERR_NOTAVAILABLE` for the format on every resource type. The lock of
+  such a level reports the BC4 block pitch, eight bytes per four-texel block
+  row, where D3D9 drivers report the format as if it held a byte per texel
+  and the application works the block layout out itself. Advertising the
+  format would move titles that probe for it, Half-Life 2 and Team Fortress
+  2 among them, onto a path no tested title runs; refusing the create would
+  end a title that makes one without probing. Reporting the D3D9 pitch would
+  need staging sized to that pitch and lock offsets in it rather than in the
+  block layout the upload reads, on every lock path. Wine's
+  `test_surface_blocks` accepts a create of an extension format the queries
+  refuse (`may_succeed`), so no site observes the split. No knob: either
+  side of it is a behaviour change for a title, not a trade.
+- **`CreateDevice` and `Reset` substitute a BGRA8 back buffer for any
+  format.** The layer presents one drawable format, so a back buffer asked
+  for in R5G6B5, A1R5G5B5, X1R5G5B5, A2R10G10B10, a float or any other
+  format is created BGRA8, warned once, and reports X8R8G8B8 from
+  `GetDesc`; A8R8G8B8 and X8R8G8B8 keep their own. D3D9 refuses a format
+  outside its back-buffer set (DXVK answers `D3DERR_INVALIDCALL`), and a
+  16-bit back buffer would need a conversion pass on every present.
+  `CheckDeviceType` answers only formats inside that set, the 16-bit ones
+  where the device renders into them as `test_display_formats` requires, so
+  a title that probes lands on a standard format; one that skips the probe
+  keeps a device rather than losing it. No knob.
 - **`D3DRS_MULTISAMPLEANTIALIAS = FALSE` is ignored.** Metal ties the sample
   count to the pass's attachments with no per-draw override.
   `D3DPRASTERCAPS_MULTISAMPLE_TOGGLE` is not advertised, which is how D3D9

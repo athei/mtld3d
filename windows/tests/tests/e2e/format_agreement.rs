@@ -108,8 +108,8 @@ const fn succeeded(hr: i32) -> bool {
 
 /// Whether a disagreement is one of the kept divergences, which the sweeps skip.
 ///
-/// `ATI1` creates as a 2D texture and an offscreen plain in the pools the
-/// device backs while every query for it answers no: the layer keeps the
+/// `ATI1` creates as a 2D texture, with any usage but a target one, and as
+/// an offscreen plain while every query for it answers no: the layer keeps the
 /// create for a title that makes one without probing, and does not advertise
 /// a format whose lock pitch is the BC4 block pitch rather than the one D3D9
 /// reports. The planar YUV pair is advertised as a plain surface but exists
@@ -117,7 +117,7 @@ const fn succeeded(hr: i32) -> bool {
 /// Both are in `docs/STATUS.md`.
 fn kept_divergence(shape: &str, format: u32) -> bool {
     match format {
-        D3DFMT_ATI1 => shape.starts_with("texture usage=0") || shape.starts_with("offscreen"),
+        D3DFMT_ATI1 => shape.starts_with("texture") || shape.starts_with("offscreen"),
         D3DFMT_YV12 | D3DFMT_NV12 => shape == "offscreen SYSTEMMEM",
         _ => false,
     }
