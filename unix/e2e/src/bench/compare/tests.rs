@@ -65,6 +65,47 @@ fn a_tail_percentile_has_the_wider_floor() {
 }
 
 #[test]
+fn a_per_call_setter_time_has_the_placement_floor() {
+    // A ratio past 1.5 regresses and one under 0.5 improves: 30 % is inside
+    // what moving the code alone does to these rows, 60 % is not.
+    let spec = "ns lower time";
+    let row = "ns_per_call.set_render_state";
+    let base = [10.0; 5];
+    for (cand, expected) in [
+        (13.0, Verdict::Neutral),
+        (15.0, Verdict::Neutral),
+        (15.5, Verdict::Regression),
+        (16.0, Verdict::Regression),
+        (5.0, Verdict::Neutral),
+        (4.5, Verdict::Improvement),
+    ] {
+        assert_eq!(verdict_of(row, spec, &base, &[cand; 5]), expected, "{cand}");
+    }
+    // The floor follows the prefix: another time in ns keeps the 3 % one.
+    assert_eq!(
+        verdict_of("lock.static.p50", spec, &base, &[13.0; 5]),
+        Verdict::Regression
+    );
+}
+
+#[test]
+fn a_per_call_draw_time_has_its_own_narrower_floor() {
+    // A ratio past 1.15 regresses and one under 0.85 improves.
+    let spec = "ns lower time";
+    let row = "ns_per_call.draw_clean";
+    let base = [10.0; 5];
+    for (cand, expected) in [
+        (11.5, Verdict::Neutral),
+        (12.0, Verdict::Regression),
+        (13.0, Verdict::Regression),
+        (8.5, Verdict::Neutral),
+        (8.0, Verdict::Improvement),
+    ] {
+        assert_eq!(verdict_of(row, spec, &base, &[cand; 5]), expected, "{cand}");
+    }
+}
+
+#[test]
 fn a_regression_needs_four_pairs_in_five_worse() {
     let base = [100.0; 5];
     let four = [106.0, 106.0, 106.0, 106.0, 99.0];

@@ -336,6 +336,19 @@ levels are filled one after another, so a drain that misses one level's
 interval lands in the next level's, and only the last level's can leave
 the row.
 
+The per-call rows of `api_call_cost` (`ns_per_call.*`) time single calls of
+8 to 85 ns, and they move with where the linker places the layer's
+functions as well as with what the functions do: single setter rows have
+moved by 30 to 50 % in runs whose change did not touch the call. A
+comparison therefore fails a setter row only past 50 %, and a smaller
+change to the cost of a call is for the frame benchmarks to show. The draw
+rows (`ns_per_call.draw_*`) move far less and fail past 15 %. An A/A run
+(`BASE=HEAD`) builds one commit twice with the same code placement, so it
+does not reproduce this; it has still moved single setter rows by about
+30 % (`5f274cd66021`, `aad71d015386`), for a reason not established (data
+placement is a candidate). `RATIO_FLOOR_PER_CALL` in
+`unix/e2e/src/bench/compare.rs` gives the measurements.
+
 `make bench-host` is the one benchmark that needs no Wine: it times DXSO
 parsing and MSL emission on this machine over two synthetic corpora and any
 shader cache `BENCH_CORPUS` names, and writes its metrics into the `host`
