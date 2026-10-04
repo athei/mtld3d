@@ -973,11 +973,20 @@ fn d3d_depth_bias_follows_an_inverted_depth_range() {
 
 #[test]
 fn viewport_depth_range_widens_a_narrow_forward_range_and_keeps_an_inverted_one() {
-    assert_eq!(viewport_depth_range(0.0, 1.0), (0.0, 1.0));
-    assert_eq!(viewport_depth_range(0.25, 0.75), (0.25, 0.75));
-    assert_eq!(viewport_depth_range(0.5, 0.5), (0.5, 0.5 + 0.001));
-    assert_eq!(viewport_depth_range(1.0, 0.0), (1.0, 0.0));
-    assert_eq!(viewport_depth_range(0.75, 0.25), (0.75, 0.25));
+    let bits = |(min_z, max_z): (f32, f32)| (min_z.to_bits(), max_z.to_bits());
+    for (input, forwarded) in [
+        ((0.0, 1.0), (0.0, 1.0)),
+        ((0.25, 0.75), (0.25, 0.75)),
+        ((0.5, 0.5), (0.5, 0.5 + 0.001)),
+        ((1.0, 0.0), (1.0, 0.0)),
+        ((0.75, 0.25), (0.75, 0.25)),
+    ] {
+        assert_eq!(
+            bits(viewport_depth_range(input.0, input.1)),
+            bits(forwarded),
+            "{input:?}"
+        );
+    }
 }
 
 #[test]
