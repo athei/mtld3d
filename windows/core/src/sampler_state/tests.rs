@@ -172,7 +172,7 @@ fn lod_bias_active_ignores_both_zeroes() {
 fn lod_bias_bytes_carry_the_bias_and_its_exponent() {
     let mut biases = [0.0_f32; LOD_BIAS_SLOTS];
     biases[3] = 2.0;
-    let bytes = build_lod_bias_bytes(&biases);
+    let bytes = build_lod_bias_bytes(&biases, &EXPLICIT_LOD_OPEN_ROWS);
     assert_eq!(bytes.len(), LOD_BIAS_BYTES);
 
     let row = |slot: usize, lane: usize| {
@@ -189,6 +189,153 @@ fn lod_bias_bytes_carry_the_bias_and_its_exponent() {
     // An unbiased slot must leave the sample unshifted: bias 0, scale 1.
     assert_eq!(row(0, 0).to_bits(), 0.0_f32.to_bits());
     assert_eq!(row(0, 1).to_bits(), 1.0_f32.to_bits());
+    // An open explicit row leaves an explicit level where the shader put it.
+    assert_eq!(row(0, 2).to_bits(), 0.0_f32.to_bits());
+    assert_eq!(row(0, 3).to_bits(), (-f32::MAX).to_bits());
+}
+
+#[test]
+fn lod_table_bytes_carry_the_explicit_rows() {
+    let mut explicit = EXPLICIT_LOD_OPEN_ROWS;
+    explicit[5] = [1.5, 2.0];
+    let bytes = build_lod_bias_bytes(&[0.0; LOD_BIAS_SLOTS], &explicit);
+    let lane = |slot: usize, lane: usize| {
+        let base = slot * 16 + lane * 4;
+        f32::from_le_bytes([
+            bytes[base],
+            bytes[base + 1],
+            bytes[base + 2],
+            bytes[base + 3],
+        ])
+    };
+    assert_eq!(lane(5, 2).to_bits(), 1.5_f32.to_bits(), "offset lane");
+    assert_eq!(lane(5, 3).to_bits(), 2.0_f32.to_bits(), "floor lane");
+}
+
+#[test]
+fn lod_bias_table_cache_rebuilds_for_a_new_explicit_row() {
+    let mut cache = LodBiasTableCache::new();
+    let biases = [0.0_f32; LOD_BIAS_SLOTS];
+    let mut explicit = EXPLICIT_LOD_OPEN_ROWS;
+    assert!(cache.update(&biases, &explicit));
+    explicit[1] = [0.0, 2.0];
+    assert!(cache.update(&biases, &explicit), "a new clamp rebuilds");
+    assert_eq!(cache.bytes(), &build_lod_bias_bytes(&biases, &explicit));
+    assert!(!cache.update(&biases, &explicit));
+}
+
+/// [`linear_state`] with `D3DSAMP_MAXMIPLEVEL`, the texture LOD and the mip filter set.
+fn lod_state(max_mip_level: u32, lod: u32, mip_filter: u32) -> [u32; SAMPLER_STATE_COUNT] {
+    let mut ss = linear_state();
+    ss[D3DSAMP_MAXMIPLEVEL as usize] = max_mip_level;
+    ss[TEXTURE_LOD_SLOT] = lod;
+    ss[D3DSAMP_MIPFILTER as usize] = mip_filter;
+    ss
+}
+
+#[test]
+fn the_finest_level_is_the_coarser_of_max_mip_level_and_the_lod() {
+    let level = |ss| snapshot_from_state(&ss, false).max_mip_level;
+    assert_eq!(level(lod_state(0, 0, D3DTEXF_LINEAR)), 0);
+    assert_eq!(level(lod_state(2, 0, D3DTEXF_LINEAR)), 2);
+    assert_eq!(level(lod_state(1, 3, D3DTEXF_POINT)), 3);
+    assert_eq!(level(lod_state(3, 1, D3DTEXF_POINT)), 3);
+    assert_eq!(level(lod_state(40, 0, D3DTEXF_POINT)), MAX_MIP_LEVEL);
+    assert_eq!(level(lod_state(0, 40, D3DTEXF_POINT)), MAX_MIP_LEVEL);
+}
+
+#[test]
+fn without_mipmapping_only_the_lod_selects_a_level() {
+    let s = snapshot_from_state(&lod_state(3, 0, D3DTEXF_NONE), false);
+    assert_eq!(
+        s.max_mip_level, 0,
+        "MAXMIPLEVEL is ignored without mipmapping"
+    );
+    let p = description_from_snapshot(&s, key_from_snapshot(&s));
+    assert_eq!(p.mip_filter, MipFilter::NotMipmapped);
+    assert_eq!(p.lod_min_clamp.to_bits(), 0.0_f32.to_bits());
+
+    let s = snapshot_from_state(&lod_state(0, 2, D3DTEXF_NONE), false);
+    assert_eq!(s.max_mip_level, 2);
+    let p = description_from_snapshot(&s, key_from_snapshot(&s));
+    assert_eq!(
+        p.mip_filter,
+        MipFilter::Nearest,
+        "a sampler without mipmapping would read level 0"
+    );
+    assert_eq!(p.lod_min_clamp.to_bits(), 2.0_f32.to_bits());
+    assert_eq!(
+        p.lod_max_clamp.to_bits(),
+        2.0_f32.to_bits(),
+        "a minified sample must not reach a coarser level"
+    );
+}
+
+#[test]
+fn a_pinned_level_keys_apart_from_a_clamped_one() {
+    let pinned = key_from_snapshot(&snapshot_from_state(&lod_state(0, 2, D3DTEXF_NONE), false));
+    let clamped = key_from_snapshot(&snapshot_from_state(&lod_state(2, 0, D3DTEXF_POINT), false));
+    assert_ne!(pinned, clamped);
+}
+
+#[test]
+fn the_texture_lod_slot_keys_only_through_the_level_it_selects() {
+    let key = |ss| key_from_snapshot(&snapshot_from_state(&ss, false));
+    assert_eq!(
+        key(lod_state(2, 1, D3DTEXF_LINEAR)),
+        key(lod_state(2, 0, D3DTEXF_LINEAR)),
+        "a LOD finer than MAXMIPLEVEL selects the same sampler"
+    );
+}
+
+#[test]
+fn explicit_rows_offset_by_the_lod_and_clamp_by_the_finest_level() {
+    let row = |ss| explicit_lod_row(&ss);
+    assert_eq!(
+        row(lod_state(0, 0, D3DTEXF_LINEAR)),
+        None,
+        "nothing to apply"
+    );
+    assert_eq!(
+        row(lod_state(2, 0, D3DTEXF_LINEAR)),
+        Some([0.0, 2.0]),
+        "MAXMIPLEVEL clamps"
+    );
+    assert_eq!(
+        row(lod_state(0, 2, D3DTEXF_POINT)),
+        Some([2.0, 2.0]),
+        "the LOD is a base level the explicit LOD counts from"
+    );
+    assert_eq!(row(lod_state(3, 1, D3DTEXF_POINT)), Some([1.0, 3.0]));
+}
+
+#[test]
+fn explicit_rows_carry_the_game_bias() {
+    let mut ss = lod_state(0, 0, D3DTEXF_LINEAR);
+    ss[D3DSAMP_MIPMAPLODBIAS as usize] = 1.0_f32.to_bits();
+    assert_eq!(explicit_lod_row(&ss), Some([1.0, -f32::MAX]));
+    ss[TEXTURE_LOD_SLOT] = 1;
+    assert_eq!(explicit_lod_row(&ss), Some([2.0, 1.0]));
+    ss[D3DSAMP_MIPMAPLODBIAS as usize] = mtld3d_types::FETCH4_ENABLE;
+    assert_eq!(
+        explicit_lod_row(&ss),
+        Some([1.0, 1.0]),
+        "a Fetch4 command is no bias"
+    );
+}
+
+#[test]
+fn explicit_rows_without_mipmapping_pin_the_lod_level() {
+    assert_eq!(explicit_lod_row(&lod_state(3, 0, D3DTEXF_NONE)), None);
+    let mut ss = lod_state(3, 2, D3DTEXF_NONE);
+    ss[D3DSAMP_MIPMAPLODBIAS as usize] = 1.0_f32.to_bits();
+    let [offset, floor] = explicit_lod_row(&ss).expect("a pinned level");
+    assert_eq!(floor.to_bits(), 2.0_f32.to_bits());
+    assert_eq!(
+        (100.0 + offset).max(floor).to_bits(),
+        floor.to_bits(),
+        "no explicit LOD the shader asks for leaves the level"
+    );
 }
 
 #[test]
@@ -197,37 +344,55 @@ fn lod_bias_table_cache_rebuilds_only_for_new_input_bits() {
     let mut biases = [0.0_f32; LOD_BIAS_SLOTS];
     biases[3] = -0.75;
 
-    assert!(cache.update(&biases), "first table is built");
-    assert_eq!(cache.bytes(), &build_lod_bias_bytes(&biases));
-    assert!(!cache.update(&biases), "identical inputs reuse the table");
+    assert!(
+        cache.update(&biases, &EXPLICIT_LOD_OPEN_ROWS),
+        "first table is built"
+    );
+    assert_eq!(
+        cache.bytes(),
+        &build_lod_bias_bytes(&biases, &EXPLICIT_LOD_OPEN_ROWS)
+    );
+    assert!(
+        !cache.update(&biases, &EXPLICIT_LOD_OPEN_ROWS),
+        "identical inputs reuse the table"
+    );
 
     biases[3] = 0.0;
     biases[7] = -0.75;
     assert!(
-        cache.update(&biases),
+        cache.update(&biases, &EXPLICIT_LOD_OPEN_ROWS),
         "a sampled-slot transition rebuilds the effective table"
     );
-    assert_eq!(cache.bytes(), &build_lod_bias_bytes(&biases));
+    assert_eq!(
+        cache.bytes(),
+        &build_lod_bias_bytes(&biases, &EXPLICIT_LOD_OPEN_ROWS)
+    );
 }
 
 #[test]
 fn lod_bias_table_cache_keys_signed_zero_and_nan_by_bits() {
     let mut cache = LodBiasTableCache::new();
     let mut biases = [0.0_f32; LOD_BIAS_SLOTS];
-    assert!(cache.update(&biases));
+    assert!(cache.update(&biases, &EXPLICIT_LOD_OPEN_ROWS));
 
     biases[2] = -0.0;
-    assert!(cache.update(&biases), "signed zero changes the bias lane");
-    assert!(!cache.update(&biases));
+    assert!(
+        cache.update(&biases, &EXPLICIT_LOD_OPEN_ROWS),
+        "signed zero changes the bias lane"
+    );
+    assert!(!cache.update(&biases, &EXPLICIT_LOD_OPEN_ROWS));
 
     biases[2] = f32::from_bits(0x7FC0_0001);
     assert!(
-        cache.update(&biases),
+        cache.update(&biases, &EXPLICIT_LOD_OPEN_ROWS),
         "NaN input payload participates in identity"
     );
-    assert!(!cache.update(&biases));
+    assert!(!cache.update(&biases, &EXPLICIT_LOD_OPEN_ROWS));
     biases[2] = f32::from_bits(0x7FC0_0002);
-    assert!(cache.update(&biases), "a different NaN payload rebuilds");
+    assert!(
+        cache.update(&biases, &EXPLICIT_LOD_OPEN_ROWS),
+        "a different NaN payload rebuilds"
+    );
 }
 
 #[test]
@@ -237,14 +402,14 @@ fn lod_bias_table_cache_is_independent_of_pass_bindings() {
     let mut biases = [0.0_f32; LOD_BIAS_SLOTS];
     biases[0] = -0.75;
 
-    assert!(table.update(&biases));
+    assert!(table.update(&biases, &EXPLICIT_LOD_OPEN_ROWS));
     assert!(bound.ps_lod_bias_changed(table.bytes()));
-    assert!(!table.update(&biases));
+    assert!(!table.update(&biases, &EXPLICIT_LOD_OPEN_ROWS));
     assert!(!bound.ps_lod_bias_changed(table.bytes()));
 
     bound.reset();
     assert!(
-        !table.update(&biases),
+        !table.update(&biases, &EXPLICIT_LOD_OPEN_ROWS),
         "a new pass reuses the derived table"
     );
     assert!(

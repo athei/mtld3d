@@ -7040,8 +7040,8 @@ pub struct LastBoundCache {
     blend_color: u32,
     /// The `setDepthBias` pair.
     ///
-    /// Only `D3DRS_SLOPESCALEDEPTHBIAS` (or the implicit decal slope) is
-    /// non-zero in practice: the constant `D3DRS_DEPTHBIAS` term reaches the
+    /// Only the application's `D3DRS_SLOPESCALEDEPTHBIAS` is non-zero in
+    /// practice: the constant `D3DRS_DEPTHBIAS` term reaches the
     /// vertex shader through `pos_fixup` instead. Stored as raw bits so the
     /// comparison is exact (no NaN ambiguity) and the slot has a
     /// definite "not yet bound" sentinel — `(0, 0)` matches Metal's

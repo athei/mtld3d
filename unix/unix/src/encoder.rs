@@ -670,6 +670,7 @@ bitflags::bitflags! {
 #[derive(Clone, Copy, Default)]
 pub struct PsSamplerDecls {
     mask: u16,
+    explicit_lod_mask: u16,
 }
 
 /// One vertex-sampler slot's binding, mirrored from the device.
@@ -703,6 +704,7 @@ impl PsSamplerDecls {
             }
             decls.mask |= 1u16 << slot;
         }
+        decls.explicit_lod_mask = mtld3d_core::dxso::explicit_lod_samplers(program) & decls.mask;
         decls
     }
 
@@ -720,6 +722,15 @@ impl PsSamplerDecls {
     #[must_use]
     pub const fn mask(self) -> u16 {
         self.mask
+    }
+
+    /// Declared slots the shader samples at an explicit level (`texldl`).
+    ///
+    /// Metal ignores sampler LOD clamps there, so the stage's clamp reaches
+    /// these samples through the LOD table only.
+    #[must_use]
+    pub const fn explicit_lod_mask(self) -> u16 {
+        self.explicit_lod_mask
     }
 }
 
@@ -5194,13 +5205,14 @@ impl FrameEncoder {
         &mut self.last_bound
     }
 
-    /// Allocate the effective LOD-bias table when this pass needs its binding.
+    /// Allocate the effective LOD table when this pass needs its binding.
     #[must_use]
     pub fn alloc_lod_bias_if_changed(
         &mut self,
         biases: &[f32; sampler_state::LOD_BIAS_SLOTS],
+        explicit: &[[f32; 2]; sampler_state::LOD_BIAS_SLOTS],
     ) -> Option<u64> {
-        let _ = self.lod_bias_table.update(biases);
+        let _ = self.lod_bias_table.update(biases, explicit);
         if self
             .last_bound
             .ps_lod_bias_changed(self.lod_bias_table.bytes())

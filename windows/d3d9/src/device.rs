@@ -51,6 +51,7 @@ use mtld3d_core::{
     readback::{ReadbackDestination, ReadbackReject, ReadbackSource},
     render_scale::TargetExtent,
     render_state::{RsClass, rs_classify},
+    sampler_state::TEXTURE_LOD_SLOT,
     shader_constants::{int_bool_rows, window_in_range},
     snapshot::SnapshotSection,
     streams::validate_stream_freq,
@@ -89,12 +90,11 @@ use mtld3d_types::{
     D3DRS_SEPARATEALPHABLENDENABLE, D3DRS_SHADEMODE, D3DRS_SLOPESCALEDEPTHBIAS,
     D3DRS_SPECULARENABLE, D3DRS_SPECULARMATERIALSOURCE, D3DRS_SRCBLEND, D3DRS_SRCBLENDALPHA,
     D3DRS_SRGBWRITEENABLE, D3DRS_STENCILREF, D3DRS_TEXTUREFACTOR, D3DRS_VERTEXBLEND,
-    D3DRTYPE_CUBETEXTURE, D3DSAMP_MAXMIPLEVEL, D3DSAMP_MIPFILTER, D3DTEXF_LINEAR, D3DTEXF_NONE,
-    D3DTEXF_POINT, D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_DMAP,
-    D3DUSAGE_DONOTCLIP, D3DUSAGE_DYNAMIC, D3DUSAGE_NONSECURE, D3DUSAGE_NPATCHES, D3DUSAGE_POINTS,
-    D3DUSAGE_QUERY_FILTER, D3DUSAGE_RENDERTARGET, D3DUSAGE_RTPATCHES, D3DUSAGE_SOFTWAREPROCESSING,
-    D3DUSAGE_WRITEONLY, D3DVIEWPORT9, Guid, IDirect3DDevice9Vtbl, RENDER_STATE_COUNT,
-    SAMPLER_STATE_COUNT, render_state_defaults,
+    D3DRTYPE_CUBETEXTURE, D3DTEXF_LINEAR, D3DTEXF_NONE, D3DTEXF_POINT, D3DUSAGE_AUTOGENMIPMAP,
+    D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_DMAP, D3DUSAGE_DONOTCLIP, D3DUSAGE_DYNAMIC, D3DUSAGE_NONSECURE,
+    D3DUSAGE_NPATCHES, D3DUSAGE_POINTS, D3DUSAGE_QUERY_FILTER, D3DUSAGE_RENDERTARGET,
+    D3DUSAGE_RTPATCHES, D3DUSAGE_SOFTWAREPROCESSING, D3DUSAGE_WRITEONLY, D3DVIEWPORT9, Guid,
+    IDirect3DDevice9Vtbl, RENDER_STATE_COUNT, SAMPLER_STATE_COUNT, render_state_defaults,
 };
 
 use super::{
@@ -1320,6 +1320,9 @@ impl DeviceInner {
     /// a bind starts or ends that.
     fn push_vertex_sampler_row(&mut self, slot: usize) {
         let mut state = self.vertex_sampler_states[slot];
+        // A vertex sample names its level, so no texture LOD reaches it, and
+        // the slot that would carry one may hold a game's write of state 0.
+        state[TEXTURE_LOD_SLOT] = 0;
         if self.vertex_textures[slot]
             .as_ref()
             .is_some_and(|texture| self.samples_unfiltered(texture))
@@ -12832,24 +12835,10 @@ fn snapshot_stage_bindings(
         crate::texture::rehydrate_for_device(tex, dev);
         crate::texture::flush_dirty_mips(tex.inner_mut(), dev);
         tex.inner_mut().note_gpu_use();
-        // A texture's SetLOD raises the effective most-detailed mip. LOD == 0
-        // (the common case) is a no-op in both branches.
-        let lod = tex.inner().lod();
-        if sampler_state[D3DSAMP_MIPFILTER as usize] == D3DTEXF_NONE {
-            // mip-OFF: the effective level is the texture LOD alone (MAXMIPLEVEL
-            // does not apply). Metal samples level 0 for a non-mipmapped sampler
-            // and ignores lodMinClamp, so promote to POINT with MAXMIPLEVEL = LOD
-            // — the clamp then pins sampling to the LOD level.
-            if lod > 0 {
-                sampler_state[D3DSAMP_MIPFILTER as usize] = D3DTEXF_POINT;
-                sampler_state[D3DSAMP_MAXMIPLEVEL as usize] = lod;
-            }
-        } else {
-            // mip-ON: the sampler clamps to max(MAXMIPLEVEL, LOD); fold the LOD
-            // into MAXMIPLEVEL so the cached sampler's lodMinClamp honours it.
-            let max_mip = sampler_state[D3DSAMP_MAXMIPLEVEL as usize];
-            sampler_state[D3DSAMP_MAXMIPLEVEL as usize] = max_mip.max(lod);
-        }
+        // A texture's SetLOD is its most detailed level. The sampler
+        // translation and the explicit-LOD rows read it from the copy's spare
+        // slot; LOD 0 (the common case) leaves both as the state alone.
+        sampler_state[TEXTURE_LOD_SLOT] = tex.inner().lod();
         packed[out_idx].write(StageBinding {
             texture_id: tex.texture_id(),
             sampler_state,

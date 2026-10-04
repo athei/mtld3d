@@ -3756,8 +3756,7 @@ fn dp4_emits_plain_dot() {
     // dot-product; let the compiler use it. Cross-shader bit-invariance
     // is not the goal here — per-pipeline matrix bytes genuinely differ
     // between FF and programmable paths, so no emit-shape trick can
-    // bridge it. The implicit decal depth bias in
-    // `windows/d3d9/src/draw.rs` handles the actual symptom.
+    // bridge it, and the only depth bias is the application's own.
     //
     // vs_2_0 { dcl_position v0; dp4 r0.x, v0, c0; mov oPos, r0; }
     let bc = vec![
@@ -5358,20 +5357,97 @@ fn lod_bias_variant_biases_an_implicit_lod_sample() {
 }
 
 #[test]
-fn lod_bias_variant_leaves_an_explicit_lod_sample_alone() {
-    // D3D9 applies the sampler bias to the LOD the hardware computes, and
-    // `texldl` supplies its own; MSL also takes one LOD option per sample.
+fn lod_table_variant_offsets_and_clamps_an_explicit_lod_sample() {
+    // Metal ignores sampler LOD clamps at an explicit level, so `texldl`
+    // reads the stage's row: the texture LOD and the game bias shift the
+    // level, the finest level clamps it. MSL takes one LOD option per sample,
+    // so it carries no `bias()` as well.
     let ps = parse(&ps3_sampling_program(OP_TEXLDL, &[])).expect("PS3 parse");
+    let plain = emit_ps_programmable(&ps, VariantKey::default()).expect("emit PS3");
+    assert!(
+        plain.contains("level((in.texcoord0).w)"),
+        "without the table texldl keeps its own LOD:\n{plain}"
+    );
     let biased = emit_ps_programmable(&ps, lod_bias_variant()).expect("emit PS3");
     assert!(
-        biased.contains("level("),
-        "texldl keeps its explicit LOD:\n{biased}"
+        biased.contains("level(max((in.texcoord0).w + lod_bias[0].z, lod_bias[0].w))"),
+        "texldl offsets and clamps through its slot's row:\n{biased}"
     );
     assert!(
         !biased.contains("bias("),
         "texldl must not also carry a bias:\n{biased}"
     );
     metal_compile_or_fail(&biased);
+}
+
+#[test]
+fn lod_table_variant_clamps_a_depth_sample_level() {
+    let ps = parse(&ps3_sampling_program(OP_TEX, &[])).expect("PS3 parse");
+    for fetch in [0, 1] {
+        let variant = VariantKey {
+            depth_sampler_mask: 1,
+            depth_fetch_mask: fetch,
+            flags: VariantFlags::LOD_BIAS,
+            ..VariantKey::default()
+        };
+        let msl = emit_ps_programmable(&ps, variant).expect("emit depth");
+        assert!(
+            msl.contains(", level(max(lod_bias[0].w, 0.0))"),
+            "a depth sample with no level of its own samples the finest level:\n{msl}"
+        );
+        metal_compile_or_fail(&msl);
+    }
+}
+
+#[test]
+fn explicit_lod_samplers_name_the_texldl_slots() {
+    let texldl = parse(&ps3_sampling_program(OP_TEXLDL, &[])).expect("PS3 parse");
+    assert_eq!(super::explicit_lod_samplers(&texldl), 1);
+    let texld = parse(&ps3_sampling_program(OP_TEX, &[])).expect("PS3 parse");
+    assert_eq!(super::explicit_lod_samplers(&texld), 0);
+}
+
+#[test]
+fn ff_depth_samples_under_the_lod_table_compile_under_metal() {
+    // The fixed-function depth and raw-depth stages pin the table's finest
+    // level, and the cascade must still compile with the table declared.
+    use mtld3d_types::D3DTA_TEXTURE;
+
+    use crate::dxso::{FfPsKey, FfStage, FfStageFlags, emit_ps_ff};
+    let mut stages = [FfStage {
+        color_op: narrow(D3DTOP_DISABLE),
+        ..FfStage::default()
+    }; 8];
+    stages[0] = FfStage {
+        color_op: narrow(D3DTOP_SELECTARG1),
+        color_arg1: narrow(D3DTA_TEXTURE),
+        alpha_op: narrow(D3DTOP_SELECTARG1),
+        alpha_arg1: narrow(D3DTA_TEXTURE),
+        flags: FfStageFlags::HAS_TEXTURE,
+        ..FfStage::default()
+    };
+    let ps_key = FfPsKey {
+        stages,
+        specular_add: false,
+        tt_projected_mask: 0,
+    };
+    for (fetch, red) in [(0, 0), (1, 0), (1, 1)] {
+        let msl = emit_ps_ff(
+            &ps_key,
+            VariantKey {
+                depth_sampler_mask: 1,
+                depth_fetch_mask: fetch,
+                raw_depth_red_mask: red,
+                flags: VariantFlags::LOD_BIAS,
+                ..VariantKey::default()
+            },
+        );
+        assert!(
+            msl.contains("level(max(lod_bias[0].w, 0.0))"),
+            "the depth stage pins the table's finest level:\n{msl}"
+        );
+        metal_compile_or_fail(&msl);
+    }
 }
 
 #[test]
