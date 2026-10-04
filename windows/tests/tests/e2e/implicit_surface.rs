@@ -731,7 +731,10 @@ fn a_reset_with_an_unusable_depth_format_leaves_no_destroyed_depth_bound() {
             hr, D3D_OK,
             "{case}: the implicit depth surface outlives the refused Reset"
         );
+        // The reference `GetDepthStencilSurface` handed out would hold the
+        // next `Reset` off, so it goes before that `Reset`.
         assert!(depth.is_some());
+        drop(depth);
         assert_eq!(
             h.clear(D3DCLEAR_TARGET, RED, 1.0, 0),
             D3D_OK,
