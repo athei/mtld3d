@@ -1613,7 +1613,11 @@ impl Metrics {
     /// - `_bytes`, a peak size: `perf.<key>` in bytes, `bytes`, the largest.
     /// - `_count`, a count gauge: `perf.<key>` in counts, the largest; `exact`
     ///   for a cache size (`cache_*_count`) when the frames are
-    ///   [`FrameWork::Fixed`], `noisy` otherwise.
+    ///   [`FrameWork::Fixed`], `info` for a retention queue's peak depth
+    ///   (`*_retention_peak_count`), which counts the entries of every frame
+    ///   still in flight at the window's worst frame, `noisy` otherwise. A
+    ///   change in the bytes a queue holds stays judged, past the 4 MiB
+    ///   floor, through its peak bytes (`_bytes`).
     /// - `_total`, a window's count: `perf.<key less _total>_pf`, the
     ///   windows' totals over their frames to three places, in bytes for a
     ///   `_bytes_total` and in counts otherwise. A count the API calls fix
@@ -2072,8 +2076,11 @@ fn perf_rule(key: &str, work: &FrameWork) -> Option<PerfRule> {
         return rule(own(), Fold::Max, PerfUnit::Bytes, 0, Class::Bytes);
     }
     if key.ends_with("_count") {
+        // A retention peak counts the entries of every frame still in flight.
         let class = if fixed && key.starts_with("cache_") {
             Class::Exact
+        } else if key.ends_with("_retention_peak_count") {
+            Class::Info
         } else {
             Class::Noisy
         };
