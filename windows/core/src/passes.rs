@@ -1417,7 +1417,7 @@ bitflags::bitflags! {
         const DEPTH_SAMPLEABLE = 1 << 1;
         /// Set when the bound depth attachment's D3D format carries a stencil plane.
         ///
-        /// D24S8 / D24FS8 / D15S1 / D24X4S4 all map to the combined Metal
+        /// D24S8 / D24FS8 / INTZ all map to the combined Metal
         /// `Depth32Float_Stencil8` texture. The clear-quad pipelines must declare
         /// the matching depth/stencil attachment formats or Metal's
         /// pipeline-vs-render-pass validation rejects them (undefined behaviour /

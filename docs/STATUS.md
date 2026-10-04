@@ -106,6 +106,10 @@ unless its entry says otherwise.
 
 - Point polygon fill: Metal has no point-fill mode, so the state is warned
   once and drawn solid.
+- The lockable depth formats `D16_LOCKABLE` and `D32F_LOCKABLE`: nothing
+  serves a `LockRect` of a depth surface, so every depth query answers
+  `D3DERR_NOTAVAILABLE` for both and every depth create (a depth-stencil
+  surface or texture, an auto depth-stencil) refuses them.
 - Dynamic depth textures outside DEFAULT-pool 2D D16, D24X8 and D24S8,
   including dynamic depth attachments, remain unavailable. Depth textures
   have no vertex sampling. Automatic mip-generation requests use the
@@ -222,6 +226,9 @@ unless its entry says otherwise.
   `RegisterSoftwareDevice`; the default Metal device is the only adapter.
 - Legacy remnants: N-patch and RT-patch tessellation, vertex tweening,
   palettized textures. Accepted or rejected per spec, non-functional.
+- The depth formats `D15S1` and `D24X4S4`, whose one- and four-bit stencil no
+  Metal format has: answered `D3DERR_NOTAVAILABLE` and refused by every
+  create, as the reference implementations do.
 
 ## Kept divergences
 

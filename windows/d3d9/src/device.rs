@@ -5972,14 +5972,6 @@ fn create_depth_texture_path(info: &DepthTextureCreateInfo) -> i32 {
         texture,
     } = *info;
 
-    // Lockable and legacy depth mappings do not imply a plain-texture
-    // capability: their CPU lock contracts are not implemented here.
-    if usage & D3DUSAGE_DEPTHSTENCIL == 0 && !is_depth_stencil_format(format) {
-        mtld3d_shared::log_once_warn_by!(target: LOG_TARGET, key: u64::from(format),
-            "reject CreateTexture plain depth format={format} → INVALIDCALL (unsupported format)");
-        null_out(texture);
-        return D3DERR_INVALIDCALL;
-    }
     if pool != D3DPOOL_DEFAULT {
         mtld3d_shared::log_once_warn_by!(
             target: crate::LOG_TARGET,

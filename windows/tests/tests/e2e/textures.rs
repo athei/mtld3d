@@ -6067,7 +6067,6 @@ fn plain_depth_textures_preserve_the_gpu_only_resource_contract() {
     for format in [
         mtld3d_types::D3DFMT_D16_LOCKABLE,
         mtld3d_types::D3DFMT_D32F_LOCKABLE,
-        mtld3d_types::D3DFMT_D24FS8,
     ] {
         assert_eq!(
             h.check_device_format(D3DFMT_X8R8G8B8, 0, mtld3d_types::D3DRTYPE_TEXTURE, format),
@@ -6082,6 +6081,7 @@ fn plain_depth_textures_preserve_the_gpu_only_resource_contract() {
         mtld3d_types::D3DFMT_D24X8,
         mtld3d_types::D3DFMT_D24S8,
         mtld3d_types::D3DFMT_D32,
+        mtld3d_types::D3DFMT_D24FS8,
         D3DFMT_INTZ,
     ] {
         assert_eq!(

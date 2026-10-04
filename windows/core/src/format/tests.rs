@@ -82,14 +82,12 @@ const COLOUR_FORMATS: [u32; 37] = [
 
 #[test]
 fn depth_only_formats_promote_to_depth32float() {
-    // Apple Silicon has no Depth24Unorm — D24X8, D32, D16, and the
-    // lockable variants all share Depth32Float.
+    // Apple Silicon has no Depth24Unorm: D24X8, D32 and D16 all share
+    // Depth32Float.
     for fmt in [
-        D3DFMT_D16_LOCKABLE,
         D3DFMT_D32,
         D3DFMT_D24X8,
         D3DFMT_D16,
-        D3DFMT_D32F_LOCKABLE,
         // FOURCC sampleable-depth, minus INTZ (it carries a stencil
         // plane, tested with the stencil-bearing family below).
         D3DFMT_DF24,
@@ -107,18 +105,31 @@ fn depth_only_formats_promote_to_depth32float() {
 fn stencil_bearing_formats_promote_to_depth32float_stencil8() {
     // INTZ belongs here: it is the sampleable twin of D24S8 and carries
     // its stencil plane.
-    for fmt in [
-        D3DFMT_D15S1,
-        D3DFMT_D24S8,
-        D3DFMT_D24X4S4,
-        D3DFMT_D24FS8,
-        D3DFMT_INTZ,
-    ] {
+    for fmt in [D3DFMT_D24S8, D3DFMT_D24FS8, D3DFMT_INTZ] {
         assert_eq!(
             map_d3d_depth_format(fmt),
             Some(PixelFormat::Depth32FloatStencil8),
             "format {fmt} should map to Depth32FloatStencil8"
         );
+    }
+}
+
+/// The depth formats the device does not serve have no mapping.
+///
+/// `D15S1` and `D24X4S4` carry a stencil narrower than any Metal format's,
+/// and the two lockable formats a CPU lock of the depth surface, so every
+/// depth answer refuses them and every depth create reads that refusal from
+/// here.
+#[test]
+fn unserved_depth_formats_return_none() {
+    for fmt in [
+        D3DFMT_D15S1,
+        D3DFMT_D24X4S4,
+        D3DFMT_D16_LOCKABLE,
+        D3DFMT_D32F_LOCKABLE,
+    ] {
+        assert_eq!(map_d3d_depth_format(fmt), None, "format {fmt}");
+        assert!(!is_depth_format(fmt), "format {fmt}");
     }
 }
 
@@ -674,14 +685,10 @@ fn only_the_single_precision_floats_depend_on_device_filtering() {
 fn depth_size_table_covers_the_depth_mapping() {
     for fmt in [
         D3DFMT_D16,
-        D3DFMT_D16_LOCKABLE,
-        D3DFMT_D15S1,
         D3DFMT_D24X8,
         D3DFMT_D24S8,
-        D3DFMT_D24X4S4,
         D3DFMT_D24FS8,
         D3DFMT_D32,
-        D3DFMT_D32F_LOCKABLE,
         D3DFMT_DF16,
         D3DFMT_DF24,
         D3DFMT_INTZ,

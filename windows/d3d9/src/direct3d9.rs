@@ -30,15 +30,14 @@ use mtld3d_shared::{
 };
 use mtld3d_types::{
     D3DADAPTER_IDENTIFIER9, D3DCAPS9, D3DDEVTYPE_HAL, D3DDISPLAYMODE, D3DFMT_A8B8G8R8,
-    D3DFMT_A8R8G8B8, D3DFMT_ATI1, D3DFMT_D16, D3DFMT_D24S8, D3DFMT_D24X8, D3DFMT_D32, D3DFMT_DF16,
-    D3DFMT_DF24, D3DFMT_DXT1, D3DFMT_DXT2, D3DFMT_DXT3, D3DFMT_DXT4, D3DFMT_DXT5, D3DFMT_INTZ,
-    D3DFMT_R5G6B5, D3DFMT_R8G8B8, D3DFMT_RESZ, D3DFMT_UYVY, D3DFMT_X8B8G8R8, D3DFMT_X8R8G8B8,
-    D3DFMT_YUY2, D3DMULTISAMPLE_NONE, D3DMULTISAMPLE_NONMASKABLE, D3DOK_NOAUTOGEN,
-    D3DPRESENT_PARAMETERS, D3DRTYPE_CUBETEXTURE, D3DRTYPE_SURFACE, D3DRTYPE_TEXTURE,
-    D3DRTYPE_VOLUME, D3DRTYPE_VOLUMETEXTURE, D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_DEPTHSTENCIL,
-    D3DUSAGE_DYNAMIC, D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING, D3DUSAGE_QUERY_SRGBREAD,
-    D3DUSAGE_QUERY_SRGBWRITE, D3DUSAGE_QUERY_VERTEXTEXTURE, D3DUSAGE_RENDERTARGET, Guid,
-    IDirect3D9Vtbl,
+    D3DFMT_A8R8G8B8, D3DFMT_ATI1, D3DFMT_DF16, D3DFMT_DF24, D3DFMT_DXT1, D3DFMT_DXT2, D3DFMT_DXT3,
+    D3DFMT_DXT4, D3DFMT_DXT5, D3DFMT_R5G6B5, D3DFMT_R8G8B8, D3DFMT_RESZ, D3DFMT_UYVY,
+    D3DFMT_X8B8G8R8, D3DFMT_X8R8G8B8, D3DFMT_YUY2, D3DMULTISAMPLE_NONE, D3DMULTISAMPLE_NONMASKABLE,
+    D3DOK_NOAUTOGEN, D3DPRESENT_PARAMETERS, D3DRTYPE_CUBETEXTURE, D3DRTYPE_INDEXBUFFER,
+    D3DRTYPE_SURFACE, D3DRTYPE_TEXTURE, D3DRTYPE_VERTEXBUFFER, D3DRTYPE_VOLUME,
+    D3DRTYPE_VOLUMETEXTURE, D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_DYNAMIC,
+    D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING, D3DUSAGE_QUERY_SRGBREAD, D3DUSAGE_QUERY_SRGBWRITE,
+    D3DUSAGE_QUERY_VERTEXTEXTURE, D3DUSAGE_RENDERTARGET, Guid, IDirect3D9Vtbl,
 };
 
 use super::{
@@ -450,24 +449,17 @@ pub fn map_for_device(
     mtld3d_core::format::map_d3d_format_device(format, native_packed16_supported(expand_packed16))
 }
 
-/// Depth-stencil formats.
+/// Depth-stencil formats: the ones the device serves.
 ///
-/// Includes the FOURCC sampleable-depth formats (`INTZ` / `DF24` / `DF16`)
-/// — created with `USAGE_DEPTHSTENCIL`, bound as the depth target during a
-/// caster pass and sampled as a depth texture in the receiver pass. Apple
-/// Silicon promotes all of them to `Depth32Float` (see
-/// `format::map_d3d_depth_format`).
+/// Read from the one depth mapping every create path reads
+/// (`format::map_d3d_depth_format`), so a depth format the answers offer is
+/// exactly one the creates accept. It includes the FOURCC sampleable-depth
+/// formats (`INTZ` / `DF24` / `DF16`), created with `USAGE_DEPTHSTENCIL`,
+/// bound as the depth target during a caster pass and sampled as a depth
+/// texture in the receiver pass, and `D24FS8`. The mapping leaves out
+/// `D15S1`, `D24X4S4` and the two lockable formats.
 pub const fn is_depth_stencil_format(fmt: u32) -> bool {
-    matches!(
-        fmt,
-        D3DFMT_D16
-            | D3DFMT_D24S8
-            | D3DFMT_D24X8
-            | D3DFMT_D32
-            | D3DFMT_INTZ
-            | D3DFMT_DF24
-            | D3DFMT_DF16
-    )
+    mtld3d_core::format::is_depth_format(fmt)
 }
 
 /// Subset of depth-stencil formats that carry a stencil plane.
@@ -482,7 +474,7 @@ pub const fn depth_format_has_stencil(fmt: u32) -> bool {
     // depth/stencil attachment formats desync from the bound depth texture — a
     // Metal validation failure, and heap-corrupting undefined behaviour with
     // the layer off. Deriving from the same mapping keeps them in lockstep:
-    // D15S1 and D24X4S4 are combined formats too, not just D24S8/D24FS8.
+    // D24FS8 and INTZ are combined formats too, not just D24S8.
     matches!(
         mtld3d_core::format::map_d3d_depth_format(fmt),
         Some(mtld3d_shared::mtl::PixelFormat::Depth32FloatStencil8)
