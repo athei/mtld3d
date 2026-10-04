@@ -224,10 +224,12 @@ fn validate_device_rejects_filtering_an_unfilterable_texture() {
 
 /// Draw a 2x1 R32F texture holding 0.0 and 1.0 across the target with linear filters.
 ///
-/// Returns the red channel at the target's centre, where the two texels meet:
-/// a filtered sample blends them to about 0x80, an unfiltered one reads 0x00
-/// or 0xFF.
-fn red_at_the_texel_boundary(h: &Harness) -> u8 {
+/// Returns the red channel at x = 240 of 640, three eighths across, a quarter
+/// of a texel past the first texel's centre: a filtered sample blends a
+/// quarter of the second texel in (about 0x40), an unfiltered one reads the
+/// first texel's 0x00. Both are flat over several pixels, so the reading holds
+/// under `render.scale`.
+fn red_between_the_texels(h: &Harness) -> u8 {
     const W: u32 = 0xFFFF_FFFF;
     let tex = h.create_texture(2, 1, 1, 0, D3DFMT_R32F, D3DPOOL_MANAGED);
     tex.lock_rect(0, 0)
@@ -266,7 +268,7 @@ fn red_at_the_texel_boundary(h: &Harness) -> u8 {
     h.render_once(0xFF00_0000, |d| {
         assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad), 0);
     });
-    let red = Rgba8::from_pixel(h.read_pixel(320, 240)).r;
+    let red = Rgba8::from_pixel(h.read_pixel(240, 240)).r;
     assert_eq!(
         h.clear_texture(0),
         D3D_OK,
@@ -280,10 +282,10 @@ fn an_unfilterable_float_texture_samples_unfiltered() {
     // A device without 32-bit float filtering samples R32F unfiltered whatever
     // the stage's filters ask for, which is the answer its caps give.
     let h = Harness::with_config(DENY_FLOAT32_FILTERING);
-    let red = red_at_the_texel_boundary(&h);
+    let red = red_between_the_texels(&h);
     assert!(
-        !(0x10..=0xEF).contains(&red),
-        "LINEAR on R32F without float filtering reads one texel, got red {red:#04x}"
+        red < 0x10,
+        "LINEAR on R32F without float filtering reads the nearest texel, got red {red:#04x}"
     );
     drop(h);
 
@@ -298,9 +300,9 @@ fn an_unfilterable_float_texture_samples_unfiltered() {
     {
         return;
     }
-    let red = red_at_the_texel_boundary(&h);
+    let red = red_between_the_texels(&h);
     assert!(
-        (0x60..=0xA0).contains(&red),
+        (0x30..=0x50).contains(&red),
         "LINEAR on a filterable R32F blends the two texels, got red {red:#04x}"
     );
 }

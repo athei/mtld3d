@@ -455,6 +455,7 @@ fn forcing_point_keeps_the_filters_in_space() {
         "the forced filters pack into the low three nibbles"
     );
 }
+
 #[test]
 fn sampling_unfiltered_keeps_mip_selection_and_blends_nothing() {
     let mut ss = anisotropic_state();

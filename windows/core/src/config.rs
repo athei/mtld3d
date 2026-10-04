@@ -75,7 +75,8 @@ pub struct Mtld3dConfig {
     /// Combined with the device's own `MTLDevice.supports32BitFloatFiltering`
     /// answer, so `true` makes `CheckDeviceFormat(D3DUSAGE_QUERY_FILTER)`
     /// report NOTAVAILABLE for R32F / G32R32F / A32B32G32R32F on any
-    /// device, and `false` leaves the device's answer alone; it never
+    /// device and point-sample those formats whatever a stage's filters
+    /// say, and `false` leaves the device's answer alone; it never
     /// claims filtering the device lacks. Exists so the Intel/AMD path
     /// can be exercised on a device that does filter them. Default:
     /// `false`. File key: `intel.denyFloat32Filtering`.
