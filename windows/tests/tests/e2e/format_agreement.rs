@@ -13,7 +13,7 @@ use mtld3d_tests::{CubeTexture, Harness, HarnessConfig, PosColorVertex, Texture,
 use mtld3d_types::{
     D3D_OK, D3DCLEAR_STENCIL, D3DCLEAR_TARGET, D3DCLEAR_ZBUFFER, D3DCMP_EQUAL, D3DCMP_LESS,
     D3DERR_INVALIDCALL, D3DFMT_A1R5G5B5, D3DFMT_A2R10G10B10, D3DFMT_A8R8G8B8, D3DFMT_ATI1,
-    D3DFMT_ATOC, D3DFMT_D15S1, D3DFMT_D16, D3DFMT_D16_LOCKABLE, D3DFMT_D24FS8, D3DFMT_D24S8,
+    D3DFMT_ATOC, D3DFMT_D15S1, D3DFMT_D16_LOCKABLE, D3DFMT_D24FS8, D3DFMT_D24S8,
     D3DFMT_D24X4S4, D3DFMT_D32F_LOCKABLE, D3DFMT_DF16, D3DFMT_DF24, D3DFMT_DXT1, D3DFMT_DXT2,
     D3DFMT_DXT3, D3DFMT_DXT4, D3DFMT_DXT5, D3DFMT_INDEX16, D3DFMT_INDEX32, D3DFMT_INTZ,
     D3DFMT_NV12, D3DFMT_R5G6B5, D3DFMT_RESZ, D3DFMT_UYVY, D3DFMT_VERTEXDATA, D3DFMT_X1R5G5B5,
@@ -587,6 +587,7 @@ fn quad(color: u32, z: f32) -> [PosColorVertex; 6] {
 /// apart. The depth plane gates a nearer quad in and a farther one out.
 #[test]
 fn d24fs8_serves_depth_and_an_eight_bit_stencil() {
+    const STORED: u32 = 0xC3;
     let probe = Harness::factory_only();
     assert!(
         check(
@@ -613,7 +614,6 @@ fn d24fs8_serves_depth_and_an_eight_bit_stencil() {
     );
     drop(probe);
 
-    const STORED: u32 = 0xC3;
     let h = Harness::create(&HarnessConfig {
         depth_format: Some(D3DFMT_D24FS8),
         ..HarnessConfig::default()
