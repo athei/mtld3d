@@ -210,6 +210,20 @@ the ARM64X build. All three build the production profile, and `bench-ab` and
 [`CONTRIBUTING.md`](../CONTRIBUTING.md#benchmarks) explains how to run them
 and how to read the results.
 
+Two of the `perf.*` rows are `info`, reported and never judged:
+`perf.tex_retention_peak_count` and `perf.vbib_retention_peak_count`, the
+deepest the texture-upload and the VB/IB retention queues got in the window.
+The layer samples each depth at its frame summary, after the frame's own
+entries have joined the queue and before the GPU has retired the frames ahead
+of it, so the peak counts the entries of every frame still in flight at the
+window's worst frame. That is a timing figure in steps of one frame's entries:
+`texture_streaming` adds about 19 a frame, and one build reads 76, 95, 113 or
+134 from run to run as 4 to 7 of its short frames are in flight. A change in
+what a queue holds still reaches the gate through the rows beside them,
+`perf.tex_staging_retained_bytes` and `perf.vbib_retained_bytes`, which are
+judged as `bytes` with their 4 MiB floor, and through each benchmark's memory
+growth.
+
 ## Release bundle
 
 `make bundle` builds the production profile and packs two archives into
