@@ -963,26 +963,21 @@ jobs:
 
   # Diagnostic for #1016 and #707, dispatch only (probe_only=true): the
   # multisample stress probe in .github/probe/msaa_stress.swift, plain Metal
-  # with no Wine and no mtld3d, on eight Intel VMs and one of each Apple
-  # image. The probe exits 0 whatever the device does; its PROBE-SUMMARY
-  # lines carry the verdict, and the artifact keeps its output, the host
-  # fingerprint and the GPU part of the system log.
+  # with no Wine and no mtld3d, on twelve Intel VMs, three per mode: fresh
+  # (the first run's shape), fresh1x (the same create churn, single-sampled),
+  # reuse (multisampled, no creates in the loop) and paced (fresh at ten
+  # iterations a second). The probe exits 0 whatever the device does; its
+  # PROBE-SUMMARY lines carry the verdict, and the artifact keeps its output,
+  # the host fingerprint and the GPU part of the system log.
   probe-msaa:
     if: github.event_name == 'workflow_dispatch' && inputs.probe_only
     strategy:
       fail-fast: false
       matrix:
-        runner: [macos-26, macos-15, macos-15-intel]
-        rep: [1]
-        include:
-          - { runner: macos-15-intel, rep: 2 }
-          - { runner: macos-15-intel, rep: 3 }
-          - { runner: macos-15-intel, rep: 4 }
-          - { runner: macos-15-intel, rep: 5 }
-          - { runner: macos-15-intel, rep: 6 }
-          - { runner: macos-15-intel, rep: 7 }
-          - { runner: macos-15-intel, rep: 8 }
-    name: probe-msaa (${{ matrix.runner }}, ${{ matrix.rep }})
+        runner: [macos-15-intel]
+        mode: [fresh, fresh1x, reuse, paced]
+        rep: [1, 2, 3]
+    name: probe-msaa (${{ matrix.runner }}, ${{ matrix.mode }}, ${{ matrix.rep }})
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 20
     steps:
@@ -1017,7 +1012,7 @@ jobs:
           # probe exits 0 whatever the device does, so a non-zero status here
           # means the probe itself broke; the step still reports it.
           set +e
-          "$RUNNER_TEMP/msaa_probe" 210 30 > "$out/probe.log" 2>&1
+          "$RUNNER_TEMP/msaa_probe" 210 30 ${{ matrix.mode }} > "$out/probe.log" 2>&1
           status=$?
           set -e
           echo "probe exit $status" | tee -a "$out/probe.log"
@@ -1036,6 +1031,6 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: ${{ !cancelled() }}
         with:
-          name: probe-msaa-${{ matrix.runner }}-${{ matrix.rep }}
+          name: probe-msaa-${{ matrix.runner }}-${{ matrix.mode }}-${{ matrix.rep }}
           path: ${{ runner.temp }}/probe-msaa
           retention-days: 14

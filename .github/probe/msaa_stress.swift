@@ -11,8 +11,13 @@
 //      ones discard it.
 //   C  the RESZ transfer: blit the 4x depth-stencil into a second 4x texture,
 //      read sample zero of depth and stencil in compute.
-// Every iteration builds fresh textures, encodes A, E, B and C into one
-// command buffer, waits, and checks every value read back.
+// Every iteration encodes A, E, B and C into one command buffer, waits, and
+// checks every value read back. The mode (third argument) says where the
+// objects come from: fresh builds them every iteration, fresh1x does the same
+// with every multisampled texture single-sampled, reuse builds one set and
+// keeps it, and paced is fresh at no more than ten iterations a second.
+//
+// Usage: msaa_probe [msaa seconds] [storm seconds] [fresh|fresh1x|reuse|paced]
 //
 // Phases: msaa1 (time-boxed loops), storm (threads creating and releasing
 // textures and sRGB views, which on the Intel image provokes the kernel's
@@ -30,6 +35,16 @@ setvbuf(stdout, nil, _IOLBF, 0)
 let args = CommandLine.arguments
 let msaaSeconds = args.count > 1 ? Double(args[1]) ?? 210 : 210
 let stormSeconds = args.count > 2 ? Double(args[2]) ?? 30 : 30
+/// fresh: every iteration creates its textures, views and buffers.
+/// reuse: one set is created and kept, so no object is created in the loop.
+/// fresh1x: as fresh, with every multisampled texture single-sampled.
+/// paced: as fresh, at no more than ten iterations a second.
+let mode = args.count > 3 ? args[3] : "fresh"
+guard ["fresh", "reuse", "fresh1x", "paced"].contains(mode) else {
+    print("PROBE-ERROR unknown mode \(mode)")
+    exit(2)
+}
+let msaaSamples = mode == "fresh1x" ? 1 : 4
 let started = Date()
 
 func now() -> String { String(format: "%.1f", Date().timeIntervalSince(started)) }
@@ -44,6 +59,7 @@ guard let queue = device.makeCommandQueue() else {
     exit(2)
 }
 
+say("mode=\(mode) samples=\(msaaSamples)")
 say("device name=\(device.name) registryID=\(device.registryID) unified=\(device.hasUnifiedMemory) lowPower=\(device.isLowPower) headless=\(device.isHeadless) removable=\(device.isRemovable) location=\(device.location.rawValue) locationNumber=\(device.locationNumber) peerGroupID=\(device.peerGroupID) peerIndex=\(device.peerIndex) peerCount=\(device.peerCount)")
 say("device maxTransferRate=\(device.maxTransferRate) workingSet=\(device.recommendedMaxWorkingSetSize) maxBuffer=\(device.maxBufferLength) maxThreadgroupMemory=\(device.maxThreadgroupMemoryLength) maxThreadsPerThreadgroup=\(device.maxThreadsPerThreadgroup.width)x\(device.maxThreadsPerThreadgroup.height)x\(device.maxThreadsPerThreadgroup.depth)")
 say("device d24s8=\(device.isDepth24Stencil8PixelFormatSupported) rog=\(device.areRasterOrderGroupsSupported) bc=\(device.supportsBCTextureCompression) rwTier=\(device.readWriteTextureSupport.rawValue) argTier=\(device.argumentBuffersSupport.rawValue) float32Filter=\(device.supports32BitFloatFiltering) msaa32=\(device.supports32BitMSAA) raytracing=\(device.supportsRaytracing) sparseTile=\(device.sparseTileSizeInBytes) mac2=\(device.supportsFamily(.mac2)) metal3=\(device.supportsFamily(.metal3)) apple7=\(device.supportsFamily(.apple7))")
@@ -66,6 +82,16 @@ vertex VOut vs(uint vid [[vertex_id]], constant Params &p [[buffer(0)]]) {
     return o;
 }
 fragment float4 fs(VOut in [[stage_in]]) { return in.color; }
+kernel void read_single(depth2d<float, access::read> d [[texture(0)]],
+                        texture2d<uint, access::read> s [[texture(1)]],
+                        device float *out_depth [[buffer(0)]],
+                        device uint *out_stencil [[buffer(1)]],
+                        uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= d.get_width() || gid.y >= d.get_height()) return;
+    uint i = gid.y * d.get_width() + gid.x;
+    out_depth[i] = d.read(gid);
+    out_stencil[i] = s.read(gid).r;
+}
 kernel void read_sample_zero(depth2d_ms<float, access::read> d [[texture(0)]],
                              texture2d_ms<uint, access::read> s [[texture(1)]],
                              device float *out_depth [[buffer(0)]],
@@ -91,7 +117,7 @@ func renderPipeline(depth: Bool) -> MTLRenderPipelineState {
     d.vertexFunction = library.makeFunction(name: "vs")
     d.fragmentFunction = library.makeFunction(name: "fs")
     d.colorAttachments[0].pixelFormat = .bgra8Unorm
-    d.rasterSampleCount = 4
+    d.rasterSampleCount = msaaSamples
     if depth {
         d.depthAttachmentPixelFormat = .depth32Float_stencil8
         d.stencilAttachmentPixelFormat = .depth32Float_stencil8
@@ -108,7 +134,7 @@ let colourPipeline = renderPipeline(depth: false)
 let depthPipeline = renderPipeline(depth: true)
 let computePipeline: MTLComputePipelineState
 do {
-    computePipeline = try device.makeComputePipelineState(function: library.makeFunction(name: "read_sample_zero")!)
+    computePipeline = try device.makeComputePipelineState(function: library.makeFunction(name: msaaSamples > 1 ? "read_sample_zero" : "read_single")!)
 } catch {
     print("PROBE-ERROR compute: \(error)")
     exit(2)
@@ -140,6 +166,16 @@ struct Params {
     var pad: SIMD2<UInt32> = .zero
 }
 
+/// The objects `reuse` keeps across iterations, by role.
+var kept: [String: AnyObject] = [:]
+
+func keep<T: AnyObject>(_ role: String, _ make: () -> T?) -> T? {
+    if mode == "reuse", let object = kept[role] as? T { return object }
+    let object = make()
+    if mode == "reuse", let object { kept[role] = object }
+    return object
+}
+
 func texture(_ format: MTLPixelFormat, samples: Int, usage: MTLTextureUsage) -> MTLTexture? {
     let d = MTLTextureDescriptor()
     d.textureType = samples > 1 ? .type2DMultisample : .type2D
@@ -158,8 +194,8 @@ func draw(_ enc: MTLRenderCommandEncoder, color: SIMD4<Float>, depth: Float, sha
     enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
 }
 
-func readback(_ cb: MTLCommandBuffer, _ tex: MTLTexture) throws -> MTLBuffer {
-    let buf = try need(device.makeBuffer(length: rowBytes * size, options: .storageModeManaged), "readback buffer")
+func readback(_ cb: MTLCommandBuffer, _ tex: MTLTexture, _ role: String) throws -> MTLBuffer {
+    let buf = try need(keep("readback " + role) { device.makeBuffer(length: rowBytes * size, options: .storageModeManaged) }, "readback buffer")
     let blit = try need(cb.makeBlitCommandEncoder(), "readback blit encoder")
     blit.copy(from: tex, sourceSlice: 0, sourceLevel: 0, sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
               sourceSize: MTLSize(width: size, height: size, depth: 1), to: buf,
@@ -192,36 +228,36 @@ final class Counters {
 func encodeIteration(_ cb: MTLCommandBuffer, index: Int) throws -> Iteration {
     let rt: MTLTextureUsage = [.renderTarget]
     let readable: MTLTextureUsage = [.renderTarget, .shaderRead, .pixelFormatView]
-    let aMs = try need(texture(.bgra8Unorm, samples: 4, usage: rt), "A 4x colour")
-    let aOut = try need(texture(.bgra8Unorm, samples: 1, usage: rt), "A resolve")
-    let eMs = try need(texture(.bgra8Unorm, samples: 4, usage: rt), "E 4x colour")
-    let eOut = try need(texture(.bgra8Unorm, samples: 1, usage: rt), "E resolve")
-    let bMs = try need(texture(.bgra8Unorm, samples: 4, usage: rt), "B 4x colour")
-    let bOut = try need(texture(.bgra8Unorm, samples: 1, usage: rt), "B resolve")
-    let bDepth = try need(texture(.depth32Float_stencil8, samples: 4, usage: readable), "B 4x depth")
-    let other = try need(texture(.bgra8Unorm, samples: 1, usage: rt), "B other target")
-    let cCopy = try need(texture(.depth32Float_stencil8, samples: 4, usage: readable), "C 4x copy")
-    let cDepth = try need(device.makeBuffer(length: size * size * 4, options: .storageModeManaged), "C depth buffer")
-    let cStencil = try need(device.makeBuffer(length: size * size * 4, options: .storageModeManaged), "C stencil buffer")
-    let stencilView = try need(cCopy.makeTextureView(pixelFormat: .x32_stencil8), "C stencil view")
+    let aMs = try need(keep("A 4x colour") { texture(.bgra8Unorm, samples: msaaSamples, usage: rt) }, "A 4x colour")
+    let aOut = try need(keep("A resolve") { texture(.bgra8Unorm, samples: 1, usage: rt) }, "A resolve")
+    let eMs = try need(keep("E 4x colour") { texture(.bgra8Unorm, samples: msaaSamples, usage: rt) }, "E 4x colour")
+    let eOut = try need(keep("E resolve") { texture(.bgra8Unorm, samples: 1, usage: rt) }, "E resolve")
+    let bMs = try need(keep("B 4x colour") { texture(.bgra8Unorm, samples: msaaSamples, usage: rt) }, "B 4x colour")
+    let bOut = try need(keep("B resolve") { texture(.bgra8Unorm, samples: 1, usage: rt) }, "B resolve")
+    let bDepth = try need(keep("B 4x depth") { texture(.depth32Float_stencil8, samples: msaaSamples, usage: readable) }, "B 4x depth")
+    let other = try need(keep("B other target") { texture(.bgra8Unorm, samples: 1, usage: rt) }, "B other target")
+    let cCopy = try need(keep("C 4x copy") { texture(.depth32Float_stencil8, samples: msaaSamples, usage: readable) }, "C 4x copy")
+    let cDepth = try need(keep("C depth buffer") { device.makeBuffer(length: size * size * 4, options: .storageModeManaged) }, "C depth buffer")
+    let cStencil = try need(keep("C stencil buffer") { device.makeBuffer(length: size * size * 4, options: .storageModeManaged) }, "C stencil buffer")
+    let stencilView = try need(keep("C stencil view") { cCopy.makeTextureView(pixelFormat: .x32_stencil8) }, "C stencil view")
     let keepStencil = index % 2 == 0
 
     // A: clear to white, resolve by the store action.
     var rp = MTLRenderPassDescriptor()
     rp.colorAttachments[0].texture = aMs
-    rp.colorAttachments[0].resolveTexture = aOut
+    if msaaSamples > 1 { rp.colorAttachments[0].resolveTexture = aOut }
     rp.colorAttachments[0].loadAction = .clear
     rp.colorAttachments[0].clearColor = MTLClearColor(red: 1, green: 1, blue: 1, alpha: 1)
-    rp.colorAttachments[0].storeAction = .multisampleResolve
+    rp.colorAttachments[0].storeAction = msaaSamples > 1 ? .multisampleResolve : .store
     try need(cb.makeRenderCommandEncoder(descriptor: rp), "render encoder").endEncoding()
 
     // E: black clear, opaque red edge triangle, resolve.
     rp = MTLRenderPassDescriptor()
     rp.colorAttachments[0].texture = eMs
-    rp.colorAttachments[0].resolveTexture = eOut
+    if msaaSamples > 1 { rp.colorAttachments[0].resolveTexture = eOut }
     rp.colorAttachments[0].loadAction = .clear
     rp.colorAttachments[0].clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 1)
-    rp.colorAttachments[0].storeAction = .multisampleResolve
+    rp.colorAttachments[0].storeAction = msaaSamples > 1 ? .multisampleResolve : .store
     var enc = try need(cb.makeRenderCommandEncoder(descriptor: rp), "render encoder")
     enc.setRenderPipelineState(colourPipeline)
     draw(enc, color: SIMD4(1, 0, 0, 1), depth: 0.5, shape: 1)
@@ -278,9 +314,9 @@ func encodeIteration(_ cb: MTLCommandBuffer, index: Int) throws -> Iteration {
     // B pass 3: reload, far blue draw that fails the depth test, resolve.
     rp = MTLRenderPassDescriptor()
     rp.colorAttachments[0].texture = bMs
-    rp.colorAttachments[0].resolveTexture = bOut
+    if msaaSamples > 1 { rp.colorAttachments[0].resolveTexture = bOut }
     rp.colorAttachments[0].loadAction = .load
-    rp.colorAttachments[0].storeAction = .storeAndMultisampleResolve
+    rp.colorAttachments[0].storeAction = msaaSamples > 1 ? .storeAndMultisampleResolve : .store
     rp.depthAttachment.texture = bDepth
     rp.depthAttachment.loadAction = .load
     rp.depthAttachment.storeAction = .dontCare
@@ -293,7 +329,9 @@ func encodeIteration(_ cb: MTLCommandBuffer, index: Int) throws -> Iteration {
     draw(enc, color: SIMD4(0, 0, 1, 1), depth: 0.8, shape: 0)
     enc.endEncoding()
 
-    return Iteration(a: try readback(cb, aOut), e: try readback(cb, eOut), b: try readback(cb, bOut),
+    let single = msaaSamples == 1
+    return Iteration(a: try readback(cb, single ? aMs : aOut, "A"), e: try readback(cb, single ? eMs : eOut, "E"),
+                     b: try readback(cb, single ? bMs : bOut, "B"),
                      cDepth: cDepth, cStencil: cStencil, keepStencil: keepStencil)
 }
 
@@ -319,7 +357,7 @@ func check(_ it: Iteration) -> [(String, String)] {
     for y in stride(from: 4, to: size - 4, by: 8) {
         let row = Array(e[(y * size)..<(y * size + size)])
         if row[0] != 0xffff_0000 || row[size - 1] != 0xff00_0000 { eBad = true; break }
-        if !row.contains(where: { $0 != 0xffff_0000 && $0 != 0xff00_0000 && ($0 >> 24) == 0xff }) { eBad = true; break }
+        if msaaSamples > 1 && !row.contains(where: { $0 != 0xffff_0000 && $0 != 0xff00_0000 && ($0 >> 24) == 0xff }) { eBad = true; break }
     }
     if eBad { wrong.append(("E", describe(e))) }
 
@@ -414,6 +452,7 @@ func msaaPhase(_ name: String, seconds: Double) {
                 }
             }
             c.iterations += 1
+            if mode == "paced" { Thread.sleep(forTimeInterval: 0.1) }
             if Date().timeIntervalSince(lastReport) >= 30 {
                 lastReport = Date()
                 say("progress phase=\(name) iterations=\(c.iterations) bad=\(c.bad) cbErrors=\(c.cbErrors) maxCbSeconds=\(String(format: "%.2f", c.maxCbSeconds))")
@@ -423,7 +462,7 @@ func msaaPhase(_ name: String, seconds: Double) {
     }
     let wall = String(format: "%.1f", Date().timeIntervalSince(phaseStart))
     let first = ["A", "E", "B", "C"].map { "first\($0)=\(c.firstBad[$0].map { "[\($0)]" } ?? "none")" }.joined(separator: " ")
-    let line = "PROBE-SUMMARY phase=\(name) result=\(stoppedForHang ? "hung" : (c.cbErrors > 0 || c.bad.values.contains { $0 > 0 } ? "faults" : "clean")) iterations=\(c.iterations) wallSeconds=\(wall) badA=\(c.bad["A"]!) badE=\(c.bad["E"]!) badB=\(c.bad["B"]!) badC=\(c.bad["C"]!) cbErrors=\(c.cbErrors) createNil=\(c.createNil) maxCbSeconds=\(String(format: "%.2f", c.maxCbSeconds)) firstError=[\(c.firstError.isEmpty ? "none" : c.firstError)] \(first)"
+    let line = "PROBE-SUMMARY mode=\(mode) phase=\(name) result=\(stoppedForHang ? "hung" : (c.cbErrors > 0 || c.bad.values.contains { $0 > 0 } ? "faults" : "clean")) iterations=\(c.iterations) wallSeconds=\(wall) badA=\(c.bad["A"]!) badE=\(c.bad["E"]!) badB=\(c.bad["B"]!) badC=\(c.bad["C"]!) cbErrors=\(c.cbErrors) createNil=\(c.createNil) maxCbSeconds=\(String(format: "%.2f", c.maxCbSeconds)) firstError=[\(c.firstError.isEmpty ? "none" : c.firstError)] \(first)"
     print(line)
     summaries.append(line)
 }
