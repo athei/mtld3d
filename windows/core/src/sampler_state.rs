@@ -23,8 +23,7 @@ use mtld3d_types::{
     D3DSAMP_ELEMENTINDEX, D3DSAMP_MAGFILTER, D3DSAMP_MAXANISOTROPY, D3DSAMP_MAXMIPLEVEL,
     D3DSAMP_MINFILTER, D3DSAMP_MIPFILTER, D3DSAMP_MIPMAPLODBIAS, D3DSAMP_SRGBTEXTURE,
     D3DTADDRESS_MIRRORONCE, D3DTADDRESS_WRAP, D3DTEXF_ANISOTROPIC, D3DTEXF_LINEAR, D3DTEXF_NONE,
-    D3DTEXF_POINT,
-    SAMPLER_STATE_COUNT, sampler_state_defaults,
+    D3DTEXF_POINT, SAMPLER_STATE_COUNT, sampler_state_defaults,
 };
 
 use crate::{
@@ -182,7 +181,8 @@ pub const fn samp_classify(type_: u32) -> SampClass {
 ///
 /// [`snapshot_from_state`] narrows each state once on the way in: the filters
 /// to the point and linear filtering a sampler applies, the address modes to
-/// their D3D9 value space, the numeric ones to the range the sampler accepts. `key_from_snapshot` packs exactly the bytes `description_from_snapshot`
+/// their D3D9 value space, the numeric ones to the range the sampler accepts.
+/// `key_from_snapshot` packs exactly the bytes `description_from_snapshot`
 /// translates, so a state can never be keyed as one thing and built as
 /// another, and the key's four-bit fields are exact without a mask.
 pub struct SamplerSnapshot {
@@ -234,6 +234,22 @@ impl SamplerSnapshot {
         self.mag_filter = TEXF_POINT;
         self.mip_filter = TEXF_NONE;
         self.max_anisotropy = 1;
+    }
+}
+
+/// Turn a stage's filtering into point sampling, for a texture the device cannot filter.
+///
+/// The single-precision float formats filter only on a device with 32-bit
+/// float filtering; elsewhere `CheckDeviceFormat(D3DUSAGE_QUERY_FILTER)`
+/// answers no for them and Metal does not filter them. The min and mag
+/// filters read POINT, and a mip filter other than NONE reads POINT too, which
+/// keeps the level selection and blends no texels. The PE side applies it to
+/// the stored state on its way to the draw, as it folds a texture's LOD.
+pub const fn sample_unfiltered(ss: &mut [u32; SAMPLER_STATE_COUNT]) {
+    ss[D3DSAMP_MINFILTER as usize] = D3DTEXF_POINT;
+    ss[D3DSAMP_MAGFILTER as usize] = D3DTEXF_POINT;
+    if ss[D3DSAMP_MIPFILTER as usize] != D3DTEXF_NONE {
+        ss[D3DSAMP_MIPFILTER as usize] = D3DTEXF_POINT;
     }
 }
 

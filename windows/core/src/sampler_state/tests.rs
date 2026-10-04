@@ -3,8 +3,9 @@
 //! The per-field sweep asserts that mutating any `SamplerSnapshot` field changes
 //! the cache key, which is what makes a silently dropped sampler state
 //! impossible: a new field that never reaches the key fails here. The rest pins
-//! the packed key layout by bit position, the 1:1 filter mapping (no implicit
-//! promote, the filters no sampler offers reading as LINEAR), and that `description_from_snapshot` agrees with the key it was given.
+//! the packed key layout by bit position, the filter mapping (no implicit
+//! promote, the filters no sampler offers reading as LINEAR), and that
+//! `description_from_snapshot` agrees with the key it was given.
 
 use mtld3d_shared::mtl::{MinMagFilter, MipFilter};
 use mtld3d_types::{
@@ -314,7 +315,10 @@ fn max_anisotropy_needs_an_anisotropic_filter() {
         key_from_snapshot(&base()),
         "MAXANISOTROPY without an anisotropic filter shares the isotropic key"
     );
-    assert_eq!(description_from_snapshot(&s, key_from_snapshot(&s)).max_anisotropy, 1);
+    assert_eq!(
+        description_from_snapshot(&s, key_from_snapshot(&s)).max_anisotropy,
+        1
+    );
 
     for state in [D3DSAMP_MINFILTER, D3DSAMP_MAGFILTER, D3DSAMP_MIPFILTER] {
         let mut aniso = ss;
@@ -451,6 +455,30 @@ fn forcing_point_keeps_the_filters_in_space() {
         "the forced filters pack into the low three nibbles"
     );
 }
+#[test]
+fn sampling_unfiltered_keeps_mip_selection_and_blends_nothing() {
+    let mut ss = anisotropic_state();
+    ss[D3DSAMP_MAXANISOTROPY as usize] = MAX_ANISOTROPY;
+    sample_unfiltered(&mut ss);
+    let s = snapshot_from_state(&ss, false);
+    assert_eq!(u32::from(s.min_filter), D3DTEXF_POINT, "min");
+    assert_eq!(u32::from(s.mag_filter), D3DTEXF_POINT, "mag");
+    assert_eq!(
+        u32::from(s.mip_filter),
+        D3DTEXF_POINT,
+        "a blending mip filter points"
+    );
+    assert_eq!(s.max_anisotropy, 1, "no filter is anisotropic any more");
+
+    let mut ss = linear_state();
+    ss[D3DSAMP_MIPFILTER as usize] = D3DTEXF_NONE;
+    sample_unfiltered(&mut ss);
+    assert_eq!(
+        ss[D3DSAMP_MIPFILTER as usize], D3DTEXF_NONE,
+        "mipmapping stays off"
+    );
+}
+
 #[test]
 fn fetch4_commands_are_not_lod_biases() {
     let mut states = mtld3d_types::sampler_state_defaults();

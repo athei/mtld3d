@@ -10,7 +10,8 @@ use mtld3d_types::{
     D3DSAMP_MAXANISOTROPY, D3DSAMP_MAXMIPLEVEL, D3DSAMP_MINFILTER, D3DSAMP_MIPFILTER,
     D3DSAMP_MIPMAPLODBIAS, D3DSAMP_SRGBTEXTURE, D3DTA_TEXTURE, D3DTADDRESS_BORDER,
     D3DTADDRESS_CLAMP, D3DTADDRESS_WRAP, D3DTEXF_ANISOTROPIC, D3DTEXF_GAUSSIANQUAD, D3DTEXF_LINEAR,
-    D3DTEXF_NONE, D3DTEXF_POINT, D3DTEXF_PYRAMIDALQUAD, D3DTOP_SELECTARG1, D3DTSS_ALPHAARG1, D3DTSS_ALPHAOP,
+    D3DTEXF_NONE, D3DTEXF_POINT, D3DTEXF_PYRAMIDALQUAD, D3DTOP_SELECTARG1, D3DTSS_ALPHAARG1,
+    D3DTSS_ALPHAOP,
 };
 
 const BLACK: u32 = 0xFF00_0000;
@@ -536,9 +537,21 @@ fn quad_filters_sample_as_linear() {
             h.read_pixel(320, 240) // dead centre, a texel boundary
         };
         let linear = draw(D3DTEXF_LINEAR);
-        assert_ne!(draw(D3DTEXF_POINT), linear, "POINT and LINEAR must differ here");
-        assert_eq!(draw(D3DTEXF_PYRAMIDALQUAD), linear, "PYRAMIDALQUAD min and mag filter");
-        assert_eq!(draw(D3DTEXF_GAUSSIANQUAD), linear, "GAUSSIANQUAD min and mag filter");
+        assert_ne!(
+            draw(D3DTEXF_POINT),
+            linear,
+            "POINT and LINEAR must differ here"
+        );
+        assert_eq!(
+            draw(D3DTEXF_PYRAMIDALQUAD),
+            linear,
+            "PYRAMIDALQUAD min and mag filter"
+        );
+        assert_eq!(
+            draw(D3DTEXF_GAUSSIANQUAD),
+            linear,
+            "GAUSSIANQUAD min and mag filter"
+        );
     }
 
     // A mip filter that filters selects levels: MAXMIPLEVEL 3 moves the
