@@ -36,6 +36,7 @@ mod dynamic_depth;
 mod expand16;
 mod failure_exits;
 mod float_filter;
+mod format_agreement;
 mod format_query;
 mod implicit_surface;
 mod lock_lifetime;
