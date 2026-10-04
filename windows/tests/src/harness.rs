@@ -3378,6 +3378,9 @@ impl Harness {
     /// with its device window replaced by the new window, and is read back
     /// resolved. A device the call creates is released at once, and the
     /// window is destroyed after it. Returns the `HRESULT`.
+    ///
+    /// # Panics
+    /// Panics if the back-buffer size does not fit a window's `i32` extent.
     pub fn create_device_hr(&self, pp: &mut D3DPRESENT_PARAMETERS) -> i32 {
         let width = i32::try_from(pp.back_buffer_width.max(1)).expect("width fits i32");
         let height = i32::try_from(pp.back_buffer_height.max(1)).expect("height fits i32");
@@ -3399,9 +3402,10 @@ impl Harness {
             )
         };
         if !device.is_null() {
-            // SAFETY: vtable thunk; `device` is the live device the call above
-            // returned, released exactly once.
-            unsafe { (deref_vtbl::<IDirect3DDevice9Vtbl>(device).release)(device) };
+            // SAFETY: `device` is the live IDirect3DDevice9 the call above returned.
+            let vtbl = unsafe { deref_vtbl::<IDirect3DDevice9Vtbl>(device) };
+            // SAFETY: vtable thunk; `device` is live and released exactly once.
+            unsafe { (vtbl.release)(device) };
         }
         win32::destroy_window(hwnd);
         hr
