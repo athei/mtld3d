@@ -474,7 +474,7 @@ pub fn d3d_depth_bias_to_clip(raw_d3d: u32, min_z: f32, max_z: f32) -> f32 {
     }
 }
 
-/// Convert D3D9's raw `D3DRS_SLOPESCALEDEPTHBIAS` into the slope factor Metal's `setDepthBias` takes.
+/// Convert D3D9's raw `D3DRS_SLOPESCALEDEPTHBIAS` into the slope factor Metal's depth bias takes.
 ///
 /// D3D9 multiplies the factor by the depth slope per pixel of the size it
 /// reports. On a target `render.scale` rasterizes smaller, Metal measures the
