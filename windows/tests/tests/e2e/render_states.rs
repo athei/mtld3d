@@ -1059,8 +1059,14 @@ fn depth_bias_applies_under_an_inverted_viewport_depth_range() {
         });
         h.read_pixel(320, 240) == RED
     };
-    assert!(!wins(-0.75 * gap), "a bias under the gap leaves the quad behind");
-    assert!(wins(-1.5 * gap), "a bias over the gap brings the quad in front");
+    assert!(
+        !wins(-0.75 * gap),
+        "a bias under the gap leaves the quad behind"
+    );
+    assert!(
+        wins(-1.5 * gap),
+        "a bias over the gap brings the quad in front"
+    );
 }
 
 #[test]
