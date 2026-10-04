@@ -962,6 +962,12 @@ extern "system" fn d3d9_check_device_format(
     if adapter_format == 0 {
         return D3DERR_INVALIDCALL;
     }
+    // Vertex and index buffers carry no format a query could weigh, so a
+    // buffer resource type is rejected as a malformed call rather than
+    // answered unavailable, with or without a usage.
+    if matches!(rtype, D3DRTYPE_VERTEXBUFFER | D3DRTYPE_INDEXBUFFER) {
+        return D3DERR_INVALIDCALL;
+    }
     if adapter != 0 || dev_type != D3DDEVTYPE_HAL || !is_display_format(adapter_format) {
         warn!(
             target: LOG_TARGET,
