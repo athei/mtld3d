@@ -1305,6 +1305,11 @@ impl FfState {
             tex_coord_count <= 8,
             "FfState::build_vs_key clamp violated: tex_coord_count={tex_coord_count}"
         );
+        // A stage at or past `tex_coord_count` writes a zero coordinate
+        // whatever its TCI and transform flags, so they leave the key: a
+        // stale flag on a stage the draw does not reach forks no shader.
+        tci[usize::from(tex_coord_count)..].fill(0);
+        tt_flags[usize::from(tex_coord_count)..].fill(0);
 
         // Indexed blending needs the indices it is named for: without a
         // BLENDINDICES element the draw blends the sequential matrices.
@@ -1350,20 +1355,28 @@ impl FfState {
             light_active_mask,
             light_directional_mask,
             light_spot_mask,
-            diffuse_source: clamp_material_source(
-                render_states[D3DRS_DIFFUSEMATERIALSOURCE as usize],
+            diffuse_source: material_source(
+                render_states,
+                flags,
+                D3DRS_DIFFUSEMATERIALSOURCE,
                 "DIFFUSEMATERIALSOURCE",
             ),
-            ambient_source: clamp_material_source(
-                render_states[D3DRS_AMBIENTMATERIALSOURCE as usize],
+            ambient_source: material_source(
+                render_states,
+                flags,
+                D3DRS_AMBIENTMATERIALSOURCE,
                 "AMBIENTMATERIALSOURCE",
             ),
-            specular_source: clamp_material_source(
-                render_states[D3DRS_SPECULARMATERIALSOURCE as usize],
+            specular_source: material_source(
+                render_states,
+                flags,
+                D3DRS_SPECULARMATERIALSOURCE,
                 "SPECULARMATERIALSOURCE",
             ),
-            emissive_source: clamp_material_source(
-                render_states[D3DRS_EMISSIVEMATERIALSOURCE as usize],
+            emissive_source: material_source(
+                render_states,
+                flags,
+                D3DRS_EMISSIVEMATERIALSOURCE,
                 "EMISSIVEMATERIALSOURCE",
             ),
             fog_mode,
@@ -2247,13 +2260,15 @@ fn build_vs_flags(
     flags.set(FfVsFlags::HAS_COLOR1, layout.has_color1());
     flags.set(FfVsFlags::LIGHTING_ENABLED, lighting_enabled);
     flags.set(FfVsFlags::HAS_RHW, layout.has_rhw());
+    // Canonicalized: only the lit branch reads either, so an unlit draw
+    // keys neither and toggling them between unlit draws forks no variant.
     flags.set(
         FfVsFlags::COLOR_VERTEX,
-        render_states[D3DRS_COLORVERTEX as usize] != 0,
+        lighting_enabled && render_states[D3DRS_COLORVERTEX as usize] != 0,
     );
     flags.set(
         FfVsFlags::SPECULAR_ENABLE,
-        render_states[D3DRS_SPECULARENABLE as usize] != 0,
+        lighting_enabled && render_states[D3DRS_SPECULARENABLE as usize] != 0,
     );
     // Canonicalized: the emitter only computes V when lighting + specular
     // are both on, so the bit stays clear otherwise and toggling
@@ -2352,6 +2367,24 @@ fn stage_enum_value_outside(
         "FF: stage {stage} D3DTSS_{ty} = {value:#x} outside its value space → reading the D3D9 default {default:#x}"
     );
     default.to_le_bytes()[0]
+}
+
+/// The key's material source for `state`, `MCS_MATERIAL` wherever no vertex colour can apply.
+///
+/// The emitter reads a source only on a lit draw under `D3DRS_COLORVERTEX`,
+/// and takes the material constant otherwise, so every other draw keys the
+/// material and the render state forks no variant there.
+fn material_source(
+    render_states: &[u32; RENDER_STATE_COUNT],
+    flags: FfVsFlags,
+    state: u32,
+    which: &str,
+) -> u8 {
+    if flags.contains(FfVsFlags::COLOR_VERTEX) {
+        clamp_material_source(render_states[state as usize], which)
+    } else {
+        0
+    }
 }
 
 /// Clamp a raw D3DRS_*MATERIALSOURCE value into the [0..2] range.

@@ -1277,6 +1277,46 @@ fn a_light_of_no_valid_type_contributes_nothing() {
     assert_eq!(FfState::lights_section_rows(&key), 0);
 }
 
+/// Lit-only render states leave an unlit key, and unreached stages leave every key.
+///
+/// `D3DRS_SPECULARENABLE`, `D3DRS_COLORVERTEX` and the four material
+/// sources fork no unlit shader, and the TCI and texture-transform flags of
+/// a stage at or past the key's coordinate count fork none at all.
+#[test]
+fn unread_vs_state_leaves_the_key() {
+    use mtld3d_types::{
+        D3DMCS_COLOR2, D3DRS_COLORVERTEX, D3DRS_DIFFUSEMATERIALSOURCE, D3DRS_LIGHTING,
+        D3DRS_SPECULARENABLE, D3DTTFF_COUNT2,
+    };
+    let layout = FfVsLayout {
+        flags: FfVsLayoutFlags::HAS_NORMAL,
+        tex_coord_count: 1,
+        tex_coord_dims: [2, 0, 0, 0, 0, 0, 0, 0],
+        declared_weights_count: 0,
+    };
+    let mut unlit_default = rs();
+    unlit_default[D3DRS_LIGHTING as usize] = 0;
+    let base = FfState::new().build_vs_key(&unlit_default, layout, 0b1, [0; 8]);
+    assert_eq!(base.tex_coord_count, 1);
+
+    let mut unlit = unlit_default;
+    unlit[D3DRS_SPECULARENABLE as usize] = 1;
+    unlit[D3DRS_COLORVERTEX as usize] = 0;
+    unlit[D3DRS_DIFFUSEMATERIALSOURCE as usize] = D3DMCS_COLOR2;
+    let mut stale = FfState::new();
+    stale.set_texture_stage_state(1, D3DTSS_TEXTURETRANSFORMFLAGS as usize, D3DTTFF_COUNT2);
+    stale.set_texture_stage_state(5, D3DTSS_TEXCOORDINDEX as usize, 3);
+    assert_eq!(stale.build_vs_key(&unlit, layout, 0b1, [0; 8]), base);
+
+    // Lit, the same states are read and key their shader.
+    let mut lit = unlit;
+    lit[D3DRS_LIGHTING as usize] = 1;
+    assert_ne!(
+        FfState::new().build_vs_key(&lit, layout, 0b1, [0; 8]),
+        FfState::new().build_vs_key(&rs(), layout, 0b1, [0; 8])
+    );
+}
+
 // ─────────────────────────────────────────────────────────────────────
 // Sparse-light compaction + eye-space packing.
 // ─────────────────────────────────────────────────────────────────────
