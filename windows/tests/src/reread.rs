@@ -123,9 +123,9 @@ pub fn assert_or_reread_and_probe(
 ///
 /// For a test whose colour read-back went wrong after a depth-tested pass: it
 /// says whether the depth attachment holds what the pass wrote. A fresh INTZ
-/// texture is cleared to a primer depth, the surface is bound again, and a
-/// RESZ (`D3DRS_POINTSIZE` set to the RESZ code with the INTZ at stage 0)
-/// copies sample zero into the INTZ; the INTZ is then drawn over a
+/// texture is bound as depth and cleared to a primer depth, the surface goes
+/// back in its place, and a RESZ (`D3DRS_POINTSIZE` set to the RESZ code with
+/// the INTZ at stage 0) copies sample zero into the INTZ; the INTZ is then drawn over a
 /// single-sampled target with fixed-function sampling, which returns the
 /// stored depth in every colour channel, and `at` is read back. `cleared` is
 /// the depth the pass cleared to and `drawn` the depth its draw wrote at
@@ -237,8 +237,7 @@ fn sample_zero_read(h: &Harness, at: (u32, u32)) -> Result<u32, String> {
         "clear the INTZ to the primer",
     )?;
     succeeded(h.set_render_target(0, &colour), "rebind the render target")?;
-    // Bound again by name: the implicit surface rides the frame's defaults,
-    // and an explicit bind is the one that hands its size to the RESZ.
+    // Priming bound the INTZ as depth; the surface under test goes back.
     succeeded(
         h.set_depth_stencil_surface(&depth),
         "rebind the depth surface",

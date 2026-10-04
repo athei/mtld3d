@@ -879,7 +879,9 @@ pub struct FrameEncoder {
     backbuffer_height: u32,
     /// Size and pixel format of the bound depth attachment.
     ///
-    /// Read by `depth_snapshot_for_sampling` to size its copy.
+    /// Seeded from the frame's default attachment at `begin_frame` and set by
+    /// every `BindDepth` op. Read by the RESZ resolve to match its destination
+    /// and by `depth_snapshot_for_sampling` to size its copy.
     depth_attachment_desc: (u32, u32, mtld3d_shared::mtl::PixelFormat),
     /// Bumped by every depth-writing draw and every depth clear.
     ///
@@ -2233,6 +2235,35 @@ impl FrameEncoder {
         // Keep the seen-rt sets when the previous submit was a mid-frame flush
         // (the D3D9 frame did not end there); `finalize_submit` consumes the
         // flag by the time this reads it.
+        // The frame's default depth attachment is created at the rasterized
+        // back-buffer size so it matches the colour one exactly, and `Clear`
+        // measures the viewport against that.
+        let depth_size = if frame.depth_texture().is_null() {
+            (0, 0)
+        } else {
+            (
+                frame
+                    .render_scale()
+                    .dimension(frame.header().backbuffer_width),
+                frame
+                    .render_scale()
+                    .dimension(frame.header().backbuffer_height),
+            )
+        };
+        let depth_has_stencil = frame.flags().contains(FrameDataFlags::DEPTH_HAS_STENCIL);
+        // The default attachment arrives with the frame, not through a
+        // `BindDepth` op, so its descriptor is set here; a bind later in the
+        // frame replaces both. Without it a RESZ of the implicit surface
+        // would measure a descriptor left at zero or by an earlier bind.
+        self.set_depth_attachment_desc(
+            depth_size.0,
+            depth_size.1,
+            if depth_has_stencil {
+                PixelFormat::Depth32FloatStencil8
+            } else {
+                PixelFormat::Depth32Float
+            },
+        );
         self.pass_state
             .reset_frame(&mtld3d_core::passes::FrameReset {
                 backbuffer: frame.backbuffer_handle(),
@@ -2247,22 +2278,8 @@ impl FrameEncoder {
                 backbuffer_format: frame.backbuffer_format(),
                 backbuffer_contents: frame.backbuffer_contents(),
                 depth_texture: frame.depth_texture(),
-                // The frame's default depth attachment is created at the
-                // rasterized back-buffer size so it matches the colour one
-                // exactly, and `Clear` measures the viewport against that.
-                depth_size: if frame.depth_texture().is_null() {
-                    (0, 0)
-                } else {
-                    (
-                        frame
-                            .render_scale()
-                            .dimension(frame.header().backbuffer_width),
-                        frame
-                            .render_scale()
-                            .dimension(frame.header().backbuffer_height),
-                    )
-                },
-                depth_has_stencil: frame.flags().contains(FrameDataFlags::DEPTH_HAS_STENCIL),
+                depth_size,
+                depth_has_stencil,
                 render_scale: frame.render_scale(),
                 continues_frame: self.prev_submit_no_present,
             });

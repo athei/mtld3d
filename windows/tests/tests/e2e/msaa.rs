@@ -1241,6 +1241,67 @@ fn resz_reads_a_depth_clear_with_no_draw_before_it() {
     assert_eq!(h.clear_texture(0), 0, "clear the sampler bind");
 }
 
+#[test]
+fn resz_resolves_the_implicit_multisampled_depth_surface() {
+    // The device's own 4x depth-stencil, never named by
+    // SetDepthStencilSurface: the RESZ still resolves it, as it does an
+    // explicitly bound surface.
+    let h = harness(D3DMULTISAMPLE_4_SAMPLES, Some(D3DFMT_D24S8));
+    let (width, height) = h.dims();
+    let (width_f, height_f) = back_buffer_extent(&h);
+    let intz = h.create_texture(
+        width,
+        height,
+        1,
+        D3DUSAGE_DEPTHSTENCIL,
+        D3DFMT_INTZ,
+        D3DPOOL_DEFAULT,
+    );
+    let ss_rt = h.create_render_target(RT_SIZE, RT_SIZE, D3DFMT_A8R8G8B8);
+
+    arm(&h);
+    assert_eq!(h.set_render_state(D3DRS_ZENABLE, 1), 0, "depth test on");
+    assert_eq!(h.set_render_state(D3DRS_ZWRITEENABLE, 1), 0, "depth writes");
+    assert_eq!(
+        h.set_render_state(D3DRS_ZFUNC, D3DCMP_ALWAYS),
+        0,
+        "depth func"
+    );
+    assert!(h.pump(), "WM_QUIT before render");
+    assert_eq!(h.begin_scene(), 0, "BeginScene");
+    assert_eq!(
+        h.clear(D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, BLACK, 1.0, 0),
+        0,
+        "clear colour + depth"
+    );
+    // Twice the back buffer's extent, so its lower-left half covers every sample.
+    assert_eq!(
+        h.draw_primitive_up(
+            D3DPT_TRIANGLELIST,
+            1,
+            &diagonal(width_f * 2.0, height_f * 2.0, RESZ_DEPTH, WHITE)
+        ),
+        0,
+        "depth-writing draw",
+    );
+    assert_eq!(h.end_scene(), 0, "EndScene");
+    assert_eq!(h.set_texture(0, &intz), 0, "bind the RESZ destination");
+    assert_eq!(
+        h.set_render_state(D3DRS_POINTSIZE, 0x7fa0_5000),
+        0,
+        "the RESZ magic value"
+    );
+
+    // RESZ_DEPTH is 0.25, which an 8-bit channel reads as 64.
+    let pixel = Rgba8::from_pixel(sample_intz(&h, &ss_rt, &intz));
+    assert!(
+        pixel.r.abs_diff(64) <= 2,
+        "the INTZ holds the implicit surface's sample zero: {pixel:?}"
+    );
+
+    assert_eq!(h.clear_texture(0), 0, "clear the sampler bind");
+}
+
 // ── StretchRect from a multisampled depth surface ──
 
 #[test]
