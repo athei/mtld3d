@@ -26,15 +26,20 @@ use std::collections::BTreeSet;
 use mtld3d_tests::{Harness, spawn_scoped};
 
 /// How many threads create and release an interface, one after another.
-const THREADS: usize = 32;
+const THREADS: usize = 64;
 
 /// The most distinct interface addresses the threads may see between them.
 ///
 /// Leaked allocators give every thread a new address, `THREADS` in all. The
-/// returned ones settle on two addresses that alternate, one per allocator in
-/// the pool, since the logging thread every interface starts takes and returns
-/// one too; a few more appear while the pool fills and when a slab changes,
-/// five in all over 32 threads and over 64.
+/// returned ones keep to a few addresses however many threads run: two that
+/// alternate, one per allocator in the pool, since the logging thread every
+/// interface starts takes and returns one too, and a few more while the pool
+/// fills and when a slab changes. In one of the two allocators the interface
+/// can also cycle through four neighbouring slots of a slab. Whether it does
+/// is incidental: a change of a few bytes in the length of `MTLD3D_CONFIG`
+/// or of the environment turns it on or off, so the count is anywhere from 4
+/// to 9, and the same over 32 threads as over 128. A quarter of `THREADS`
+/// sits well above that and well below a leak.
 const MAX_DISTINCT_ADDRESSES: usize = THREADS / 4;
 
 #[test]
