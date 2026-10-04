@@ -6,7 +6,10 @@
 //! pass writes, and that the depth attachment the device had bound (its mip
 //! level and its sample count) is the one the next draw tests against.
 
-use mtld3d_tests::{Harness, HarnessConfig, PosColorVertex, Rgba8, RhwVertex, Surface};
+use mtld3d_tests::{
+    Harness, HarnessConfig, PosColorVertex, Reading, Rgba8, RhwVertex, Surface,
+    assert_or_reread_and_probe, multisampled_depth_sample_zero,
+};
 use mtld3d_types::{
     D3D_OK, D3DCLEAR_TARGET, D3DCLEAR_ZBUFFER, D3DCMP_LESSEQUAL, D3DFMT_A8R8G8B8, D3DFMT_D24S8,
     D3DFMT_INTZ, D3DFMT_X8R8G8B8, D3DFVF_DIFFUSE, D3DFVF_XYZ, D3DFVF_XYZRHW, D3DLOCK_READONLY,
@@ -301,11 +304,36 @@ fn color_fill_leaves_a_multisampled_depth_attachment_bound() {
     );
     assert_eq!(h.end_scene(), D3D_OK, "EndScene");
 
+    // A wrong centre is read twice more and the depth attachment probed
+    // before the test fails, so the report names the stage that lost the
+    // draws. A right one returns before any of that runs.
     let (width, height) = h.dims();
-    let center = Rgba8::from_pixel(resolved_pixel(&h, &h.back_buffer(0), width / 2, height / 2));
-    assert!(
-        center.r > 200 && center.g > 200,
-        "the far blue draw fails the depth test the near white one wrote, got {center:?}"
+    let at = (width / 2, height / 2);
+    let backbuffer = h.back_buffer(0);
+    let (hr, desc) = backbuffer.desc();
+    assert_eq!(hr, D3D_OK, "GetDesc on the back buffer");
+    let plain = h.create_render_target(desc.width, desc.height, D3DFMT_X8R8G8B8);
+    let read = || surface_pixel(&h, &plain, at.0, at.1);
+    let resolve_and_read = || {
+        assert_eq!(
+            h.stretch_rect(&backbuffer, &plain, D3DTEXF_NONE),
+            D3D_OK,
+            "StretchRect resolve"
+        );
+        read()
+    };
+    let reading = |pixel: u32| {
+        let center = Rgba8::from_pixel(pixel);
+        Reading::described(format!("{center:?}"), center.r > 200 && center.g > 200)
+    };
+    assert_or_reread_and_probe(
+        &h,
+        "the far blue draw fails the depth test the near white one wrote",
+        "white at the centre",
+        &reading(resolve_and_read()),
+        || reading(read()),
+        || reading(resolve_and_read()),
+        || multisampled_depth_sample_zero(&h, at, 1.0, 0.2),
     );
     assert_eq!(h.set_render_state(D3DRS_ZENABLE, 0), D3D_OK);
 }
