@@ -12,6 +12,9 @@
 //! writes each texel its own value. Two cube faces of one texture are disjoint whatever
 //! their rects say, so the face pair is pinned alongside the mip pair.
 //!
+//! An X source selects the opaque-alpha decode, and only an X source into its A
+//! counterpart is a pair whose byte copy would hand the padding bits over as alpha.
+//!
 //! The packed-YUV cases pin the source decode: which `BlitDecode` a format selects and
 //! the discriminants the fragment shader matches on, the fixed-point `yuv_to_rgb8`
 //! against reference samples in both the full-range and reduced-range conventions, and
@@ -211,16 +214,59 @@ fn identical_same_surface_rects_are_a_no_op() {
 fn blit_decode_follows_the_source_format() {
     assert!(matches!(blit_decode(D3DFMT_YUY2), BlitDecode::Yuy2));
     assert!(matches!(blit_decode(D3DFMT_UYVY), BlitDecode::Uyvy));
-    assert!(matches!(
-        blit_decode(mtld3d_types::D3DFMT_X8R8G8B8),
-        BlitDecode::None
-    ));
+    for format in [
+        D3DFMT_A8R8G8B8,
+        D3DFMT_A8B8G8R8,
+        D3DFMT_A1R5G5B5,
+        mtld3d_types::D3DFMT_R5G6B5,
+    ] {
+        assert!(
+            matches!(blit_decode(format), BlitDecode::None),
+            "{format:#x}"
+        );
+    }
+    // An X format's padding bits are no alpha, so the quad forces it to one.
+    for format in [D3DFMT_X8R8G8B8, D3DFMT_X8B8G8R8, D3DFMT_X1R5G5B5] {
+        assert!(
+            matches!(blit_decode(format), BlitDecode::OpaqueAlpha),
+            "{format:#x}"
+        );
+    }
     // The uniform values are the discriminants the MSL matches on.
     assert_eq!(BlitDecode::None.uniform().to_bits(), 0.0f32.to_bits());
     assert_eq!(BlitDecode::Yuy2.uniform().to_bits(), 1.0f32.to_bits());
     assert_eq!(BlitDecode::Uyvy.uniform().to_bits(), 2.0f32.to_bits());
+    assert_eq!(
+        BlitDecode::OpaqueAlpha.uniform().to_bits(),
+        5.0f32.to_bits()
+    );
     assert!(is_packed_yuv(D3DFMT_YUY2) && is_packed_yuv(D3DFMT_UYVY));
     assert!(!is_packed_yuv(mtld3d_types::D3DFMT_R5G6B5));
+}
+
+#[test]
+fn only_an_x_source_into_its_a_counterpart_exposes_padding_as_alpha() {
+    use mtld3d_types::D3DFMT_R5G6B5;
+    for (src, dst) in [
+        (D3DFMT_X8R8G8B8, D3DFMT_A8R8G8B8),
+        (D3DFMT_X8B8G8R8, D3DFMT_A8B8G8R8),
+        (D3DFMT_X1R5G5B5, D3DFMT_A1R5G5B5),
+    ] {
+        assert!(exposes_padding_as_alpha(src, dst), "{src:#x} -> {dst:#x}");
+    }
+    // The A into X direction, a format into itself, and a pair of two
+    // storages are not judged here.
+    for (src, dst) in [
+        (D3DFMT_A8R8G8B8, D3DFMT_X8R8G8B8),
+        (D3DFMT_A8B8G8R8, D3DFMT_X8B8G8R8),
+        (D3DFMT_A1R5G5B5, D3DFMT_X1R5G5B5),
+        (D3DFMT_X8R8G8B8, D3DFMT_X8R8G8B8),
+        (D3DFMT_A8R8G8B8, D3DFMT_A8R8G8B8),
+        (D3DFMT_X8R8G8B8, D3DFMT_A8B8G8R8),
+        (D3DFMT_X1R5G5B5, D3DFMT_R5G6B5),
+    ] {
+        assert!(!exposes_padding_as_alpha(src, dst), "{src:#x} -> {dst:#x}");
+    }
 }
 
 #[test]

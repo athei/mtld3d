@@ -54,13 +54,14 @@ use crate::{
 /// texture slot 0) with the bound sampler (slot 0) at `texcoord` and returns
 /// the colour. The PE side chooses a POINT or LINEAR sampler from the D3D9
 /// filter. Its `float4` uniform carries the source mip level in `.x` and the
-/// source decode in `.y`: a packed YUV source (`YUY2` / `UYVY`, backed by an
-/// RG8 texture) is fetched per macropixel and converted to RGB, unfiltered.
-/// A planar YUV source (`YV12` / `NV12`) is one R8 texture as wide as the lock
-/// pitch that holds the luma rows and then the chroma planes, so its logical
-/// extent differs from the texture's and rides in `.zw`. Luma goes through the
-/// bound sampler, clamped to the luma plane; chroma is read unfiltered from
-/// the sample the texel's 2x2 block shares.
+/// source decode in `.y`: an X-format source returns alpha one, since its
+/// padding bits are no alpha, and a packed YUV source (`YUY2` / `UYVY`,
+/// backed by an RG8 texture) is fetched per macropixel and converted to RGB,
+/// unfiltered. A planar YUV source (`YV12` / `NV12`) is one R8 texture as
+/// wide as the lock pitch that holds the luma rows and then the chroma
+/// planes, so its logical extent differs from the texture's and rides in
+/// `.zw`. Luma goes through the bound sampler, clamped to the luma plane;
+/// chroma is read unfiltered from the sample the texel's 2x2 block shares.
 const BLIT_MSL: &str = r"
 #include <metal_stdlib>
 using namespace metal;
@@ -98,12 +99,17 @@ fragment float4 mtld3d_blit_ps(
 ) {
     // src_level.x is the source mip level (the sampler's point mip filter
     // makes the explicit level exact); src_level.y is the source decode,
-    // 0 = sample as-is, 1 = YUY2, 2 = UYVY, 3 = YV12, 4 = NV12. The numbering
-    // is owned by mtld3d_core::stretch_rect::BlitDecode. src_level.zw is the
-    // source's logical extent, which only the planar decodes read.
+    // 0 = sample as-is, 1 = YUY2, 2 = UYVY, 3 = YV12, 4 = NV12, 5 = sample
+    // as-is with alpha one (an X format, whose padding bits are no alpha).
+    // The numbering is owned by mtld3d_core::stretch_rect::BlitDecode.
+    // src_level.zw is the source's logical extent, which only the planar
+    // decodes read.
     uint decode = uint(src_level.y);
     if (decode == 0u) {
         return src.sample(samp, in.texcoord, level(src_level.x));
+    }
+    if (decode == 5u) {
+        return float4(src.sample(samp, in.texcoord, level(src_level.x)).rgb, 1.0);
     }
     float y;
     float u;

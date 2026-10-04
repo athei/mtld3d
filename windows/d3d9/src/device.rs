@@ -8412,8 +8412,10 @@ extern "system" fn device_stretch_rect(
     // Past every gate that can reject the call, so the endpoints' pending
     // uploads are work this call will use.
     flush_dirty_mips_for_gpu_write(&obj, &[src_surf, dst_surf]);
-    // A cross-Metal-format same-size copy also needs the render-quad path (the
-    // 1:1 blit can't convert). `check_stretch_rect_formats` guaranteed a
+    // A same-size copy that converts also needs the render-quad path (the 1:1
+    // blit can't convert): a cross-Metal-format pair, or an X source into its
+    // A counterpart, whose alpha the quad forces to one while it samples
+    // (`BlitDecode::OpaqueAlpha`). `check_stretch_rect_formats` guaranteed a
     // cross-format destination is a render target or an offscreen-plain surface
     // (cross-format RT/texture/offscreen → RT, plus the offscreen→offscreen
     // case handled on the CPU just below).
@@ -8643,18 +8645,20 @@ fn flush_dirty_mips_for_gpu_write(
 ///
 /// Compares the *Metal* pixel formats, not the D3D codes: distinct D3D
 /// formats can share a single Metal format (e.g. A8R8G8B8 + X8R8G8B8 are both
-/// `Bgra8Unorm`, only the alpha-channel meaning differs, which doesn't matter
-/// for a byte-level blit). `WoW` composites a X8R8G8B8 source onto an
-/// A8R8G8B8 destination at login, so rejecting an alpha-only difference would
-/// wrongly fail a valid blit. A shared storage does not make every pair a
-/// byte copy, though: a packed YUV endpoint lays its bytes out in an order no
-/// other format shares (`reinterprets_packed_yuv`), so such a pair converts
-/// or is refused like a pair of two storages.
+/// `Bgra8Unorm`). A shared storage does not make every pair a byte copy,
+/// though. An X source into its A counterpart would hand the padding bits to
+/// the destination as alpha where D3D9 writes alpha one
+/// (`exposes_padding_as_alpha`), so that pair converts; the A into X
+/// direction stays a byte copy, since every reader of an X surface ignores
+/// the alpha it carries. A packed YUV endpoint lays its bytes out in an order
+/// no other format shares (`reinterprets_packed_yuv`), so such a pair
+/// converts or is refused like a pair of two storages.
 fn copies_bytes(src: &StretchSurfaceInfo, dst: &StretchSurfaceInfo, expand_packed16: bool) -> bool {
     let metal = |format: u32| {
         crate::direct3d9::map_for_device(format, expand_packed16).map(|m| m.metal_pixel_format())
     };
     metal(src.format) == metal(dst.format)
+        && !mtld3d_core::stretch_rect::exposes_padding_as_alpha(src.format, dst.format)
         && !mtld3d_core::stretch_rect::reinterprets_packed_yuv(src.format, dst.format)
 }
 

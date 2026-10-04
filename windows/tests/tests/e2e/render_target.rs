@@ -11,16 +11,17 @@ use mtld3d_types::{
     D3DCMP_ALWAYS, D3DCMP_LESS, D3DCMP_LESSEQUAL, D3DERR_INVALIDCALL, D3DERR_NOTFOUND,
     D3DFMT_A1R5G5B5, D3DFMT_A4R4G4B4, D3DFMT_A8, D3DFMT_A8B8G8R8, D3DFMT_A8R8G8B8,
     D3DFMT_A16B16G16R16F, D3DFMT_A32B32G32R32F, D3DFMT_D24S8, D3DFMT_INTZ, D3DFMT_L8, D3DFMT_NV12,
-    D3DFMT_R5G6B5, D3DFMT_R8G8B8, D3DFMT_UYVY, D3DFMT_X1R5G5B5, D3DFMT_X8R8G8B8, D3DFMT_YUY2,
-    D3DFMT_YV12, D3DFVF_DIFFUSE, D3DFVF_TEX1, D3DFVF_XYZ, D3DFVF_XYZRHW, D3DLOCK_DISCARD,
-    D3DLOCK_NOOVERWRITE, D3DLOCK_READONLY, D3DPOOL_DEFAULT, D3DPOOL_MANAGED, D3DPOOL_SCRATCH,
-    D3DPOOL_SYSTEMMEM, D3DPT_TRIANGLELIST, D3DRECT, D3DRS_ALPHABLENDENABLE, D3DRS_DESTBLEND,
-    D3DRS_LIGHTING, D3DRS_SRCBLEND, D3DRS_ZENABLE, D3DRS_ZFUNC, D3DRS_ZWRITEENABLE,
-    D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_MAGFILTER, D3DSAMP_MAXMIPLEVEL, D3DSAMP_MINFILTER,
-    D3DSAMP_MIPFILTER, D3DTA_DIFFUSE, D3DTA_TEXTURE, D3DTADDRESS_CLAMP, D3DTEXF_LINEAR,
-    D3DTEXF_NONE, D3DTEXF_POINT, D3DTOP_MODULATE, D3DTOP_SELECTARG1, D3DTSS_ALPHAARG1,
-    D3DTSS_ALPHAOP, D3DTSS_COLORARG1, D3DTSS_COLORARG2, D3DTSS_COLOROP, D3DUSAGE_AUTOGENMIPMAP,
-    D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_RENDERTARGET, D3DVIEWPORT9, IID_IDIRECT3DSWAPCHAIN9,
+    D3DFMT_R5G6B5, D3DFMT_R8G8B8, D3DFMT_UYVY, D3DFMT_X1R5G5B5, D3DFMT_X8B8G8R8, D3DFMT_X8R8G8B8,
+    D3DFMT_YUY2, D3DFMT_YV12, D3DFVF_DIFFUSE, D3DFVF_TEX1, D3DFVF_XYZ, D3DFVF_XYZRHW,
+    D3DLOCK_DISCARD, D3DLOCK_NOOVERWRITE, D3DLOCK_READONLY, D3DPOOL_DEFAULT, D3DPOOL_MANAGED,
+    D3DPOOL_SCRATCH, D3DPOOL_SYSTEMMEM, D3DPT_TRIANGLELIST, D3DRECT, D3DRS_ALPHABLENDENABLE,
+    D3DRS_DESTBLEND, D3DRS_LIGHTING, D3DRS_SRCBLEND, D3DRS_ZENABLE, D3DRS_ZFUNC,
+    D3DRS_ZWRITEENABLE, D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_MAGFILTER, D3DSAMP_MAXMIPLEVEL,
+    D3DSAMP_MINFILTER, D3DSAMP_MIPFILTER, D3DTA_DIFFUSE, D3DTA_TEXTURE, D3DTADDRESS_CLAMP,
+    D3DTEXF_LINEAR, D3DTEXF_NONE, D3DTEXF_POINT, D3DTOP_MODULATE, D3DTOP_SELECTARG1,
+    D3DTSS_ALPHAARG1, D3DTSS_ALPHAOP, D3DTSS_COLORARG1, D3DTSS_COLORARG2, D3DTSS_COLOROP,
+    D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_RENDERTARGET, D3DVIEWPORT9,
+    IID_IDIRECT3DSWAPCHAIN9,
 };
 
 const RED: u32 = 0xFFFF_0000;
@@ -780,6 +781,191 @@ fn read_back(h: &Harness, surface: &Surface<'_>, size: (u32, u32), format: u32) 
     (0..size.1 as usize)
         .flat_map(|y| words[y * pitch..][..size.0 as usize].iter().copied())
         .collect()
+}
+
+/// `StretchRect` from an X render target into its A counterpart writes alpha one.
+///
+/// The X byte is padding that D3D9 reads as alpha one, so a copy into the A
+/// format writes alpha one whatever the padding holds; the fill here leaves
+/// its zero alpha in it. Checked 1:1 into a render target, scaled into part
+/// of one (the rest keeping its own fill), and 1:1 into a render-target
+/// texture level, in both 8-bit channel orders. Each word is read in its own
+/// format's order, so red is `0xFFFF0000` in A8R8G8B8 and `0xFF0000FF` in
+/// A8B8G8R8.
+#[test]
+fn stretch_rect_from_an_x_render_target_into_its_a_counterpart_writes_opaque_alpha() {
+    const SIZE: (u32, u32) = (16, 16);
+    let h = Harness::new();
+    for (x_format, a_format, opaque_red) in [
+        (D3DFMT_X8R8G8B8, D3DFMT_A8R8G8B8, RED),
+        (D3DFMT_X8B8G8R8, D3DFMT_A8B8G8R8, 0xFF00_00FF),
+    ] {
+        let src = h.create_render_target(SIZE.0, SIZE.1, x_format);
+        assert_eq!(
+            h.color_fill_hr(&src, 0x00FF_0000),
+            D3D_OK,
+            "fill {x_format:#x}"
+        );
+
+        let one_to_one = h.create_render_target(SIZE.0, SIZE.1, a_format);
+        assert_eq!(
+            h.stretch_rect(&src, &one_to_one, D3DTEXF_NONE),
+            D3D_OK,
+            "1:1 {x_format:#x} -> {a_format:#x}"
+        );
+        for (i, &word) in read_back(&h, &one_to_one, SIZE, a_format)
+            .iter()
+            .enumerate()
+        {
+            assert_eq!(
+                word, opaque_red,
+                "1:1 {x_format:#x} -> {a_format:#x}, pixel {i}"
+            );
+        }
+
+        let scaled = h.create_render_target(SIZE.0, SIZE.1, a_format);
+        assert_eq!(
+            h.color_fill_hr(&scaled, GREEN),
+            D3D_OK,
+            "seed {a_format:#x}"
+        );
+        assert_eq!(
+            h.stretch_rect_rects(&src, (0, 0, 16, 16), &scaled, (0, 0, 8, 8), D3DTEXF_POINT),
+            D3D_OK,
+            "scaled {x_format:#x} -> {a_format:#x}"
+        );
+        let words = read_back(&h, &scaled, SIZE, a_format);
+        for y in 0..SIZE.1 as usize {
+            for x in 0..SIZE.0 as usize {
+                let expected = if x < 8 && y < 8 { opaque_red } else { GREEN };
+                assert_eq!(
+                    words[y * SIZE.0 as usize + x],
+                    expected,
+                    "scaled {x_format:#x} -> {a_format:#x}, pixel ({x}, {y})"
+                );
+            }
+        }
+
+        let texture = h.create_texture(
+            SIZE.0,
+            SIZE.1,
+            1,
+            D3DUSAGE_RENDERTARGET,
+            a_format,
+            D3DPOOL_DEFAULT,
+        );
+        let level = texture.surface_level(0);
+        assert_eq!(
+            h.stretch_rect(&src, &level, D3DTEXF_NONE),
+            D3D_OK,
+            "1:1 {x_format:#x} -> {a_format:#x} texture level"
+        );
+        for (i, &word) in read_back(&h, &level, SIZE, a_format).iter().enumerate() {
+            assert_eq!(
+                word, opaque_red,
+                "1:1 {x_format:#x} -> {a_format:#x} texture level, pixel {i}"
+            );
+        }
+    }
+}
+
+/// `StretchRect` between X and A offscreen plains of one storage writes alpha one.
+///
+/// An offscreen-plain destination cannot be rendered into, so the X into A
+/// pair is converted on the CPU, and the conversion reads the padding as alpha
+/// one: X8R8G8B8 into A8R8G8B8 and X1R5G5B5 into A1R5G5B5, each source locked
+/// with its padding clear.
+#[test]
+fn stretch_rect_from_an_x_offscreen_plain_into_its_a_counterpart_writes_opaque_alpha() {
+    const SIDE: usize = 4;
+    // Red with the top bit, the X1R5G5B5 padding, clear, and the same red opaque.
+    const X1_RED: u16 = 0x7C00;
+    const A1_OPAQUE_RED: u16 = 0xFC00;
+    let h = Harness::new();
+
+    let x8 = h.create_offscreen_plain_surface(4, 4, D3DFMT_X8R8G8B8, D3DPOOL_DEFAULT);
+    let a8 = h.create_offscreen_plain_surface(4, 4, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT);
+    x8.lock_rect(0)
+        .write_u32_rect(SIDE, SIDE, &[0x00FF_0000; SIDE * SIDE]);
+    a8.lock_rect(0)
+        .write_u32_rect(SIDE, SIDE, &[GREEN; SIDE * SIDE]);
+    assert_eq!(
+        h.stretch_rect(&x8, &a8, D3DTEXF_NONE),
+        D3D_OK,
+        "X8R8G8B8 -> A8R8G8B8"
+    );
+    {
+        let locked = a8.lock_rect(D3DLOCK_READONLY);
+        let pitch = usize::try_from(locked.pitch()).expect("positive pitch") / 4;
+        let words = locked.as_u32(pitch * SIDE);
+        for y in 0..SIDE {
+            assert_eq!(
+                &words[y * pitch..y * pitch + SIDE],
+                &[RED; SIDE],
+                "A8R8G8B8 row {y}"
+            );
+        }
+    }
+
+    let x1 = h.create_offscreen_plain_surface(4, 4, D3DFMT_X1R5G5B5, D3DPOOL_DEFAULT);
+    let a1 = h.create_offscreen_plain_surface(4, 4, D3DFMT_A1R5G5B5, D3DPOOL_DEFAULT);
+    let rows = |value: u16| -> Vec<u8> {
+        core::iter::repeat_n(value.to_le_bytes(), SIDE * SIDE)
+            .flatten()
+            .collect()
+    };
+    x1.lock_rect(0).write_u8_rect(SIDE * 2, SIDE, &rows(X1_RED));
+    a1.lock_rect(0).write_u8_rect(SIDE * 2, SIDE, &rows(0));
+    assert_eq!(
+        h.stretch_rect(&x1, &a1, D3DTEXF_NONE),
+        D3D_OK,
+        "X1R5G5B5 -> A1R5G5B5"
+    );
+    let locked = a1.lock_rect(D3DLOCK_READONLY);
+    let pitch = usize::try_from(locked.pitch()).expect("positive pitch") / 2;
+    let texels = locked.as_u16(pitch * SIDE);
+    for y in 0..SIDE {
+        assert_eq!(
+            &texels[y * pitch..y * pitch + SIDE],
+            &[A1_OPAQUE_RED; SIDE],
+            "A1R5G5B5 row {y}"
+        );
+    }
+}
+
+/// `StretchRect` from an A render target into its X counterpart keeps the colour.
+///
+/// The X destination ignores alpha, so the copy only has to carry the colour
+/// channels, which it does 1:1 and scaled.
+#[test]
+fn stretch_rect_from_an_a_render_target_into_its_x_counterpart_keeps_the_colour() {
+    const SIZE: (u32, u32) = (16, 16);
+    let h = Harness::new();
+    let src = h.create_render_target(SIZE.0, SIZE.1, D3DFMT_A8R8G8B8);
+    assert_eq!(h.color_fill_hr(&src, 0x80FF_0000), D3D_OK, "fill A8R8G8B8");
+    let one_to_one = h.create_render_target(SIZE.0, SIZE.1, D3DFMT_X8R8G8B8);
+    assert_eq!(
+        h.stretch_rect(&src, &one_to_one, D3DTEXF_NONE),
+        D3D_OK,
+        "1:1"
+    );
+    for (i, &word) in read_back(&h, &one_to_one, SIZE, D3DFMT_X8R8G8B8)
+        .iter()
+        .enumerate()
+    {
+        assert_eq!(word & 0x00FF_FFFF, 0x00FF_0000, "1:1 pixel {i}");
+    }
+    let scaled = h.create_render_target(SIZE.0, SIZE.1, D3DFMT_X8R8G8B8);
+    assert_eq!(
+        h.stretch_rect_rects(&src, (0, 0, 16, 16), &scaled, (0, 0, 8, 8), D3DTEXF_POINT),
+        D3D_OK,
+        "scaled"
+    );
+    assert_eq!(
+        read_back(&h, &scaled, SIZE, D3DFMT_X8R8G8B8)[0] & 0x00FF_FFFF,
+        0x00FF_0000,
+        "scaled pixel (0, 0)"
+    );
 }
 
 /// `StretchRect` refuses a rect that leaves its surface instead of clamping it.
