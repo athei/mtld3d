@@ -2829,7 +2829,9 @@ fn walk_ff_writes(light_indices: &[u32], mut rng: u64) {
         D3DTS_PROJECTION,
         D3DTS_TEXTURE0 + 1,
     ];
-    const LIGHT_TYPES: [u32; 5] = [0, 1, 2, 3, 4];
+    // Zero and 4 store a light that lights nothing; the valid types come
+    // three times so the walk still spends time past the eight active lights.
+    const LIGHT_TYPES: [u32; 11] = [0, 1, 2, 3, 1, 2, 3, 1, 2, 3, 4];
     let mut next = |bound: usize| {
         rng = rng
             .wrapping_mul(6_364_136_223_846_793_005)
@@ -2881,7 +2883,10 @@ fn walk_ff_writes(light_indices: &[u32], mut rng: u64) {
             .iter()
             .filter(|&&index| {
                 state.is_light_enabled_at(index)
-                    && state.get_light_at(index).is_some_and(|l| l.type_ != 0)
+                    && state.get_light_at(index).is_some_and(|l| {
+                        (mtld3d_types::D3DLIGHT_POINT..=mtld3d_types::D3DLIGHT_DIRECTIONAL)
+                            .contains(&l.type_)
+                    })
             })
             .count();
         if enabled > super::MAX_ACTIVE_LIGHTS as usize {

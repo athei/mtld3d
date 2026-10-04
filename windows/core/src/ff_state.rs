@@ -744,10 +744,15 @@ impl FfState {
 
     /// `SetLight` for any D3D9 light index.
     ///
-    /// Slots `0..8` take the fast path and feed FF lighting; higher indices
-    /// land in `overflow_lights` for `GetLight` round-trip only.
+    /// Slots `0..8` take the fast path; higher indices land in
+    /// `overflow_lights`, which [`Self::resolve_active_lights`] packs after
+    /// them. A type outside POINT, SPOT and DIRECTIONAL is stored for
+    /// `GetLight` and lights nothing, warned once per type.
     #[inline]
     pub fn set_light_at(&mut self, index: u32, light: &D3DLIGHT9) {
+        if !light_type_contributes(light.type_) {
+            warn_light_type_lights_nothing(light.type_);
+        }
         if index < 8 {
             self.set_light(index as usize, light);
         } else {
@@ -2815,6 +2820,17 @@ const fn texture_op_warn_bit(slot: usize, op: u32) -> Option<u64> {
         return None;
     };
     Some(1u64 << (base + op))
+}
+
+/// Warn once per type that a light of a type outside POINT, SPOT and DIRECTIONAL lights nothing.
+#[cold]
+#[inline(never)]
+fn warn_light_type_lights_nothing(ty: u32) {
+    mtld3d_shared::log_once_warn_by!(
+        target: crate::LOG_TARGET,
+        key: u64::from(ty),
+        "SetLight: D3DLIGHT9 type {ty} is none of POINT, SPOT and DIRECTIONAL → stored, lights nothing"
+    );
 }
 
 /// Warn once per state that `SetTransform` dropped a `D3DTS_*` index nothing honours.

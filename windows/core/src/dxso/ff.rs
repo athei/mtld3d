@@ -117,23 +117,26 @@ bitflags::bitflags! {
         /// maps `(screen_x, screen_y)` through the viewport dimensions into
         /// clip space.
         const HAS_RHW = 1 << 4;
-        /// `D3DRS_COLORVERTEX` — gates the material-source override.
+        /// `D3DRS_COLORVERTEX`, which gates the material-source override.
         ///
         /// When clear, the resolver ignores `*_source` and always reads
-        /// from the material constant.
+        /// from the material constant. Canonicalized at key build: only set
+        /// on a lit draw, the one branch that reads it.
         const COLOR_VERTEX = 1 << 5;
         /// `D3DRS_SPECULARENABLE`.
         ///
         /// Gates per-light Blinn-Phong specular emission into `color1`; when
         /// clear, a lit `color1` is the vertex specular colour, or zero
-        /// without one.
+        /// without one. Canonicalized at key build: only set on a lit draw,
+        /// since the unlit `color1` is the vertex specular colour either way.
         const SPECULAR_ENABLE = 1 << 6;
         /// `D3DRS_INDEXEDVERTEXBLENDENABLE`: the world-matrix index source.
         ///
         /// When set, per-vertex BLENDINDICES select world matrices from
         /// `world_palette[idx[i]]`; when clear, sequential matrices
-        /// `world_palette[0..count]` are used. Indexed mode also requires
-        /// `DECLARED_INDICES` to be set.
+        /// `world_palette[0..count]` are used. Only set when the declaration
+        /// carries BLENDINDICES (`DECLARED_INDICES`): without them the
+        /// render state blends the sequential matrices.
         const VERTEX_BLEND_INDEXED = 1 << 7;
         /// Vertex declaration has a BLENDINDICES element.
         ///
@@ -202,7 +205,8 @@ pub struct FfVsKey {
     pub tex_coord_count: u8,
     /// Bit `i` set iff slot `i`'s `D3DLIGHT9` contributes to FF VS shading.
     ///
-    /// I.e. it has non-zero `Type` AND is enabled via `LightEnable(i, TRUE)`.
+    /// I.e. its `Type` is POINT, SPOT or DIRECTIONAL AND it is enabled via
+    /// `LightEnable(i, TRUE)`.
     /// The emitter needs only per-slot activity plus the type masks below, so
     /// the light type is carried as bitmasks rather than a per-slot array.
     pub light_active_mask: u8,
@@ -217,21 +221,25 @@ pub struct FfVsKey {
     pub light_spot_mask: u8,
     /// `D3DRS_DIFFUSEMATERIALSOURCE` (0 = `MCS_MATERIAL`, 1 = `MCS_COLOR1`, 2 = `MCS_COLOR2`).
     ///
-    /// Routed through `resolve_mat` at the diffuse modulation site.
+    /// Routed through `resolve_mat` at the diffuse modulation site. This and
+    /// the other three sources are canonicalized at key build to
+    /// `MCS_MATERIAL` unless `COLOR_VERTEX` is set, the only case that reads
+    /// them.
     pub diffuse_source: u8,
     /// `D3DRS_AMBIENTMATERIALSOURCE`.
     ///
-    /// Routed through `resolve_mat` at the ambient accumulation site.
+    /// Routed through `resolve_mat` at the ambient accumulation site;
+    /// canonicalized as `diffuse_source` is.
     pub ambient_source: u8,
     /// `D3DRS_SPECULARMATERIALSOURCE`.
     ///
-    /// Routed through `resolve_mat` at the specular modulation site in the
-    /// light loop.
+    /// Routed through `resolve_mat` to weight the specular sum after the
+    /// light loop; canonicalized as `diffuse_source` is.
     pub specular_source: u8,
     /// `D3DRS_EMISSIVEMATERIALSOURCE`.
     ///
     /// Routed through `resolve_mat` at the initial `diffuseAccum` emissive
-    /// term.
+    /// term; canonicalized as `diffuse_source` is.
     pub emissive_source: u8,
     /// Vertex fog mode, resolved from the fog render states and `HAS_RHW`.
     ///
@@ -249,7 +257,9 @@ pub struct FfVsKey {
     /// 4 = SPHEREMAP; higher values are undefined and fall back to passthru
     /// with a one-shot warn), the low nibble the input coordinate set
     /// (0..7), the two halves the D3D9 value itself carries. Read them with
-    /// [`FfVsKey::tci_mode`] and [`FfVsKey::tci_set`].
+    /// [`FfVsKey::tci_mode`] and [`FfVsKey::tci_set`]. Canonicalized at key
+    /// build: zero for every stage at or past `tex_coord_count`, which the
+    /// shader writes as a zero coordinate whatever its TCI.
     pub tci: [u8; 8],
     /// The declaration elements a pre-transformed draw passes to the pixel stage by semantic.
     ///
@@ -265,6 +275,9 @@ pub struct FfVsKey {
     /// rule before the per-stage texture matrix multiply.
     pub tex_coord_dims: [u8; 8],
     /// Per-stage texture-transform flags packed: low 3 bits = count, bit 4 = `D3DTTFF_PROJECTED`.
+    ///
+    /// Canonicalized at key build: zero for every stage at or past
+    /// `tex_coord_count`, as `tci` is.
     pub tt_flags: [u8; 8],
     /// Number of world matrices blended per vertex. `0` disables blending.
     ///
