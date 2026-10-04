@@ -8,7 +8,8 @@
 
 use mtld3d_shared::mtl::MinMagFilter;
 use mtld3d_types::{
-    D3DTADDRESS_CLAMP, D3DTADDRESS_WRAP, D3DTEXF_GAUSSIANQUAD, D3DTEXF_LINEAR, D3DTEXF_NONE,
+    D3DTADDRESS_CLAMP, D3DTADDRESS_WRAP, D3DTEXF_ANISOTROPIC, D3DTEXF_GAUSSIANQUAD, D3DTEXF_LINEAR,
+    D3DTEXF_NONE,
 };
 
 use super::*;
@@ -251,9 +252,16 @@ fn lod_bias_table_cache_is_independent_of_pass_bindings() {
     );
 }
 
+/// [`linear_state`] with an anisotropic min filter.
+fn anisotropic_state() -> [u32; SAMPLER_STATE_COUNT] {
+    let mut ss = linear_state();
+    ss[D3DSAMP_MINFILTER as usize] = D3DTEXF_ANISOTROPIC;
+    ss
+}
+
 #[test]
 fn anisotropy_clamps_to_the_advertised_ceiling() {
-    let mut ss = linear_state();
+    let mut ss = anisotropic_state();
     ss[D3DSAMP_MAXANISOTROPY as usize] = 64;
     let s = snapshot_from_state(&ss, false);
     let p = description_from_snapshot(&s, key_from_snapshot(&s));
@@ -279,7 +287,7 @@ fn in_space_states_keep_their_key_layout() {
         "defaults, depth-bound"
     );
 
-    let mut ss = linear_state();
+    let mut ss = anisotropic_state();
     ss[D3DSAMP_ADDRESSU as usize] = D3DTADDRESS_CLAMP;
     ss[D3DSAMP_ADDRESSV as usize] = D3DTADDRESS_CLAMP;
     ss[D3DSAMP_MAXANISOTROPY as usize] = MAX_ANISOTROPY;
@@ -288,9 +296,36 @@ fn in_space_states_keep_their_key_layout() {
     ss[D3DSAMP_SRGBTEXTURE as usize] = 1;
     assert_eq!(
         key_from_snapshot(&snapshot_from_state(&ss, false)).raw(),
-        0x142_1013_3222,
-        "trilinear, clamped, anisotropic, sRGB, white border"
+        0x142_1013_3223,
+        "anisotropic min, linear mag and mip, clamped, sRGB, white border"
     );
+}
+
+#[test]
+fn max_anisotropy_needs_an_anisotropic_filter() {
+    // MAXANISOTROPY alone leaves a LINEAR stage isotropic, so it reads the
+    // default 1 and keys as the isotropic sampler it builds.
+    let mut ss = linear_state();
+    ss[D3DSAMP_MAXANISOTROPY as usize] = MAX_ANISOTROPY;
+    let s = snapshot_from_state(&ss, false);
+    assert_eq!(s.max_anisotropy, 1, "LINEAR filters sample isotropically");
+    assert_eq!(
+        key_from_snapshot(&s),
+        key_from_snapshot(&base()),
+        "MAXANISOTROPY without an anisotropic filter shares the isotropic key"
+    );
+    assert_eq!(description_from_snapshot(&s, key_from_snapshot(&s)).max_anisotropy, 1);
+
+    for state in [D3DSAMP_MINFILTER, D3DSAMP_MAGFILTER, D3DSAMP_MIPFILTER] {
+        let mut aniso = ss;
+        aniso[state as usize] = D3DTEXF_ANISOTROPIC;
+        let s = snapshot_from_state(&aniso, false);
+        assert_eq!(
+            u32::from(s.max_anisotropy),
+            MAX_ANISOTROPY,
+            "an ANISOTROPIC D3DSAMP_{state} turns anisotropy on"
+        );
+    }
 }
 
 #[test]
@@ -365,7 +400,7 @@ fn anisotropy_is_limited_before_the_key() {
     // maxanisotropy 5 and 0x105 shared a key and 5 was served whichever
     // sampler arrived first.
     let key_for = |value: u32| {
-        let mut ss = linear_state();
+        let mut ss = anisotropic_state();
         ss[D3DSAMP_MAXANISOTROPY as usize] = value;
         key_from_snapshot(&snapshot_from_state(&ss, false))
     };

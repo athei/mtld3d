@@ -20,7 +20,8 @@ use mtld3d_types::{
     D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_ADDRESSW, D3DSAMP_BORDERCOLOR, D3DSAMP_DMAPOFFSET,
     D3DSAMP_ELEMENTINDEX, D3DSAMP_MAGFILTER, D3DSAMP_MAXANISOTROPY, D3DSAMP_MAXMIPLEVEL,
     D3DSAMP_MINFILTER, D3DSAMP_MIPFILTER, D3DSAMP_MIPMAPLODBIAS, D3DSAMP_SRGBTEXTURE,
-    D3DTADDRESS_MIRRORONCE, D3DTADDRESS_WRAP, D3DTEXF_CONVOLUTIONMONO, D3DTEXF_NONE, D3DTEXF_POINT,
+    D3DTADDRESS_MIRRORONCE, D3DTADDRESS_WRAP, D3DTEXF_ANISOTROPIC, D3DTEXF_CONVOLUTIONMONO,
+    D3DTEXF_NONE, D3DTEXF_POINT,
     SAMPLER_STATE_COUNT, sampler_state_defaults,
 };
 
@@ -195,7 +196,10 @@ pub struct SamplerSnapshot {
     pub address_v: u8,
     /// `D3DSAMP_ADDRESSW`, inside the `D3DTADDRESS_*` space.
     pub address_w: u8,
-    /// `D3DSAMP_MAXANISOTROPY`, limited to the ceiling the caps advertise.
+    /// `D3DSAMP_MAXANISOTROPY` as the sampler applies it.
+    ///
+    /// Limited to the ceiling the caps advertise, and 1 unless one of the
+    /// stage's filters is `D3DTEXF_ANISOTROPIC`.
     pub max_anisotropy: u8,
     /// `D3DSAMP_MAXMIPLEVEL`, limited to the deepest level a D3D9 texture has.
     ///
@@ -391,7 +395,7 @@ pub fn snapshot_from_state(ss: &[u32; SAMPLER_STATE_COUNT], is_compare: bool) ->
         address_u: enum_value(ss, D3DSAMP_ADDRESSU),
         address_v: enum_value(ss, D3DSAMP_ADDRESSV),
         address_w: enum_value(ss, D3DSAMP_ADDRESSW),
-        max_anisotropy: clamped_max_anisotropy(ss[D3DSAMP_MAXANISOTROPY as usize]),
+        max_anisotropy: effective_max_anisotropy(ss),
         max_mip_level: clamped_max_mip_level(ss[D3DSAMP_MAXMIPLEVEL as usize]),
         border_color: ss[D3DSAMP_BORDERCOLOR as usize],
         flags,
@@ -464,6 +468,25 @@ const fn clamped_max_mip_level(level: u32) -> u8 {
     } else {
         // Exact: the branch above leaves nothing wider than a byte.
         level.to_le_bytes()[0]
+    }
+}
+
+/// `D3DSAMP_MAXANISOTROPY` as the stage's filters apply it.
+///
+/// D3D9 filters anisotropically only through `D3DTEXF_ANISOTROPIC`, so a stage
+/// whose min, mag and mip filters all name another filter samples
+/// isotropically whatever `D3DSAMP_MAXANISOTROPY` holds, and reads 1 here.
+/// Any of the three naming it turns anisotropy on, the min filter being the
+/// one that decides a minified sample and the mag filter the one the caps
+/// also advertise.
+fn effective_max_anisotropy(ss: &[u32; SAMPLER_STATE_COUNT]) -> u8 {
+    let anisotropic = [D3DSAMP_MINFILTER, D3DSAMP_MAGFILTER, D3DSAMP_MIPFILTER]
+        .iter()
+        .any(|&state| ss[state as usize] == D3DTEXF_ANISOTROPIC);
+    if anisotropic {
+        clamped_max_anisotropy(ss[D3DSAMP_MAXANISOTROPY as usize])
+    } else {
+        1
     }
 }
 

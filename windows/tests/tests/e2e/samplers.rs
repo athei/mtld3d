@@ -9,8 +9,8 @@ use mtld3d_types::{
     D3DRS_SRCBLEND, D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_BORDERCOLOR, D3DSAMP_MAGFILTER,
     D3DSAMP_MAXANISOTROPY, D3DSAMP_MAXMIPLEVEL, D3DSAMP_MINFILTER, D3DSAMP_MIPFILTER,
     D3DSAMP_MIPMAPLODBIAS, D3DSAMP_SRGBTEXTURE, D3DTA_TEXTURE, D3DTADDRESS_BORDER,
-    D3DTADDRESS_CLAMP, D3DTADDRESS_WRAP, D3DTEXF_LINEAR, D3DTEXF_NONE, D3DTEXF_POINT,
-    D3DTOP_SELECTARG1, D3DTSS_ALPHAARG1, D3DTSS_ALPHAOP,
+    D3DTADDRESS_CLAMP, D3DTADDRESS_WRAP, D3DTEXF_ANISOTROPIC, D3DTEXF_LINEAR, D3DTEXF_NONE,
+    D3DTEXF_POINT, D3DTOP_SELECTARG1, D3DTSS_ALPHAARG1, D3DTSS_ALPHAOP,
 };
 
 const BLACK: u32 = 0xFF00_0000;
@@ -841,6 +841,62 @@ fn out_of_range_max_mip_level_samples_the_smallest_level() {
         sample_at_max_mip_level(&h, 0x0001_0000),
         MIP_TINTS[MIP_TINTS.len() - 1],
         "an out-of-range MAXMIPLEVEL samples the smallest level"
+    );
+}
+
+/// [`texel_to_pixel_quad`] squeezed to `width` backbuffer pixels across.
+///
+/// The quad keeps one texel per pixel down and maps `MIP_TEX_DIM` texels onto
+/// `width` pixels across, so its footprint is anisotropic: an isotropic sample
+/// takes the level of the longer axis, log2(`MIP_TEX_DIM` / `width`).
+fn squeezed_quad(width: u32) -> [TexturedVertex; 6] {
+    let scale = f32::from(u16::try_from(width).expect("width fits u16"))
+        / f32::from(u16::try_from(MIP_TEX_DIM).expect("mip texture dim fits u16"));
+    texel_to_pixel_quad().map(|v| TexturedVertex {
+        x: (v.x + 1.0).mul_add(scale, -1.0),
+        ..v
+    })
+}
+
+#[test]
+fn max_anisotropy_needs_an_anisotropic_filter() {
+    // D3D9 filters anisotropically only through D3DTEXF_ANISOTROPIC: a stage
+    // whose filters are LINEAR samples isotropically whatever MAXANISOTROPY
+    // holds. 64 texels over 8 pixels across and 64 down is an 8:1 footprint,
+    // where the isotropic level is 3 and an anisotropic sample reads finer.
+    const WIDTH: u32 = 8;
+    let h = Harness::new();
+    let tex = mip_tinted_texture(&h);
+    arm_mip_tinted(&h, &tex);
+    let quad = squeezed_quad(WIDTH);
+    let draw = |min: u32, mag: u32| {
+        for (state, value) in [
+            (D3DSAMP_MINFILTER, min),
+            (D3DSAMP_MAGFILTER, mag),
+            (D3DSAMP_MAXANISOTROPY, 16),
+        ] {
+            assert_eq!(h.set_sampler_state(0, state, value), 0, "sampler {state}");
+        }
+        h.render_once(BLACK, |d| {
+            assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad), 0);
+        });
+        h.read_pixel(WIDTH / 2, MIP_TEX_DIM / 2)
+    };
+
+    assert_eq!(
+        draw(D3DTEXF_LINEAR, D3DTEXF_LINEAR),
+        MIP_TINTS[3],
+        "LINEAR filters with MAXANISOTROPY 16 sample the isotropic level"
+    );
+    assert_ne!(
+        draw(D3DTEXF_ANISOTROPIC, D3DTEXF_LINEAR),
+        MIP_TINTS[3],
+        "an ANISOTROPIC min filter reads finer than the isotropic level"
+    );
+    assert_ne!(
+        draw(D3DTEXF_LINEAR, D3DTEXF_ANISOTROPIC),
+        MIP_TINTS[3],
+        "an ANISOTROPIC mag filter turns anisotropy on as well"
     );
 }
 
