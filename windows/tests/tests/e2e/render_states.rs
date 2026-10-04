@@ -7,17 +7,18 @@ use mtld3d_tests::{
     assert_pixel_approx,
 };
 use mtld3d_types::{
-    D3DBLEND_INVSRCALPHA, D3DBLEND_ONE, D3DBLEND_SRCALPHA, D3DBLENDOP_ADD, D3DCLEAR_STENCIL,
-    D3DCLEAR_TARGET, D3DCLEAR_ZBUFFER, D3DCMP_ALWAYS, D3DCMP_EQUAL, D3DCMP_LESS, D3DCMP_LESSEQUAL,
-    D3DCULL_CCW, D3DCULL_CW, D3DCULL_NONE, D3DFILL_SOLID, D3DFILL_WIREFRAME, D3DFMT_A8R8G8B8,
-    D3DFVF_DIFFUSE, D3DFVF_TEX1, D3DFVF_XYZ, D3DPOOL_DEFAULT, D3DPT_TRIANGLELIST, D3DRECT,
-    D3DRS_ALPHABLENDENABLE, D3DRS_BLENDOP, D3DRS_COLORWRITEENABLE, D3DRS_CULLMODE, D3DRS_DEPTHBIAS,
-    D3DRS_DESTBLEND, D3DRS_FILLMODE, D3DRS_LIGHTING, D3DRS_SCISSORTESTENABLE, D3DRS_SRCBLEND,
-    D3DRS_SRGBWRITEENABLE, D3DRS_STENCILENABLE, D3DRS_STENCILFUNC, D3DRS_STENCILMASK,
-    D3DRS_STENCILPASS, D3DRS_STENCILREF, D3DRS_ZENABLE, D3DRS_ZFUNC, D3DRS_ZWRITEENABLE,
-    D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_MAGFILTER, D3DSAMP_MINFILTER, D3DSTENCILOP_KEEP,
-    D3DSTENCILOP_REPLACE, D3DTADDRESS_CLAMP, D3DTEXF_POINT, D3DUSAGE_RENDERTARGET,
-    render_state_defaults,
+    D3DBLEND_BOTHINVSRCALPHA, D3DBLEND_BOTHSRCALPHA, D3DBLEND_INVSRCALPHA, D3DBLEND_ONE,
+    D3DBLEND_SRCALPHA, D3DBLEND_ZERO, D3DBLENDOP_ADD, D3DCLEAR_STENCIL, D3DCLEAR_TARGET,
+    D3DCLEAR_ZBUFFER, D3DCMP_ALWAYS, D3DCMP_EQUAL, D3DCMP_LESS, D3DCMP_LESSEQUAL, D3DCULL_CCW,
+    D3DCULL_CW, D3DCULL_NONE, D3DFILL_SOLID, D3DFILL_WIREFRAME, D3DFMT_A8R8G8B8, D3DFVF_DIFFUSE,
+    D3DFVF_TEX1, D3DFVF_XYZ, D3DPOOL_DEFAULT, D3DPT_TRIANGLELIST, D3DRECT, D3DRS_ALPHABLENDENABLE,
+    D3DRS_BLENDOP, D3DRS_COLORWRITEENABLE, D3DRS_CULLMODE, D3DRS_DEPTHBIAS, D3DRS_DESTBLEND,
+    D3DRS_FILLMODE, D3DRS_LIGHTING, D3DRS_SCISSORTESTENABLE, D3DRS_SLOPESCALEDEPTHBIAS,
+    D3DRS_SRCBLEND, D3DRS_SRGBWRITEENABLE, D3DRS_STENCILENABLE, D3DRS_STENCILFUNC,
+    D3DRS_STENCILMASK, D3DRS_STENCILPASS, D3DRS_STENCILREF, D3DRS_ZENABLE, D3DRS_ZFUNC,
+    D3DRS_ZWRITEENABLE, D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_MAGFILTER, D3DSAMP_MINFILTER,
+    D3DSTENCILOP_KEEP, D3DSTENCILOP_REPLACE, D3DTADDRESS_CLAMP, D3DTEXF_POINT,
+    D3DUSAGE_RENDERTARGET, render_state_defaults,
 };
 
 const BLACK: u32 = 0xFF00_0000;
@@ -284,6 +285,38 @@ fn additive_blend_accumulates() {
 }
 
 #[test]
+fn both_src_alpha_source_factors_override_the_destination_factor() {
+    // `D3DBLEND_BOTHSRCALPHA` as the source factor blends SRCALPHA over
+    // INVSRCALPHA and `D3DBLEND_BOTHINVSRCALPHA` the reverse, whatever
+    // `D3DRS_DESTBLEND` holds. Green at a quarter alpha over opaque blue.
+    let h = Harness::new();
+    arm_diffuse(&h);
+    assert_eq!(h.set_render_state(D3DRS_ALPHABLENDENABLE, 1), 0);
+    assert_eq!(h.set_render_state(D3DRS_DESTBLEND, D3DBLEND_ZERO), 0);
+    let quad = fill_quad(0x4000_FF00);
+    for (src, green, blue) in [
+        (D3DBLEND_BOTHSRCALPHA, 0x40, 0xBF),
+        (D3DBLEND_BOTHINVSRCALPHA, 0xBF, 0x40),
+    ] {
+        assert_eq!(h.set_render_state(D3DRS_SRCBLEND, src), 0);
+        h.render_once(BLUE, |d| {
+            assert_eq!(
+                d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad),
+                0,
+                "blend draw"
+            );
+        });
+        // Colour only: the destination alpha the blend leaves is not under test.
+        assert_pixel_approx(
+            h.read_pixel(320, 240) | 0xFF00_0000,
+            0xFF00_0000 | (green << 8) | blue,
+            2,
+            &format!("SRCBLEND {src}"),
+        );
+    }
+}
+
+#[test]
 fn blend_factor_restored_to_the_default_mid_pass_takes_effect() {
     // `D3DRS_BLENDFACTOR` is per-encoder state, so a second draw in the
     // same pass that sets it back to opaque white must blend at full
@@ -535,6 +568,96 @@ fn scissor_clips_draw() {
 
     assert_eq!(h.read_pixel(160, 120), 0xFFFF_0000, "inside scissor is red");
     assert_eq!(h.read_pixel(480, 360), BLACK, "outside scissor stays black");
+}
+
+/// Draw a full-target red quad under the scissor `rect`, on black.
+fn draw_scissored(h: &Harness, rect: D3DRECT) {
+    h.render_once(BLACK, |d| {
+        assert_eq!(d.set_scissor_rect(&rect), 0, "SetScissorRect");
+        assert_eq!(d.set_render_state(D3DRS_SCISSORTESTENABLE, 1), 0);
+        assert_eq!(
+            d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &fill_quad(RED)),
+            0,
+            "scissored draw"
+        );
+        assert_eq!(d.set_render_state(D3DRS_SCISSORTESTENABLE, 0), 0);
+    });
+}
+
+#[test]
+fn a_scissor_reaching_past_the_top_left_corner_keeps_its_far_edges() {
+    // The rect is stored as written and only its part on the target lets
+    // pixels through: (0, 0)-(160, 120) here, not a rect widened by the
+    // distance its near edges stick out.
+    let h = Harness::new();
+    arm_diffuse(&h);
+    let rect = D3DRECT {
+        x1: -160,
+        y1: -120,
+        x2: 160,
+        y2: 120,
+    };
+    draw_scissored(&h, rect);
+    let got = h.scissor_rect();
+    assert_eq!(
+        (got.x1, got.y1, got.x2, got.y2),
+        (-160, -120, 160, 120),
+        "GetScissorRect hands the rect back as written"
+    );
+    assert_eq!(h.read_pixel(100, 80), RED, "inside the scissor");
+    assert_eq!(h.read_pixel(240, 80), BLACK, "right of the far edge");
+    assert_eq!(h.read_pixel(100, 180), BLACK, "below the far edge");
+}
+
+#[test]
+fn an_unbounded_scissor_rect_scissors_nothing_away() {
+    // `SetScissorRect` takes any RECT, so an edge far past any target is a
+    // valid way to say "everything".
+    let h = Harness::new();
+    arm_diffuse(&h);
+    draw_scissored(
+        &h,
+        D3DRECT {
+            x1: 0,
+            y1: 0,
+            x2: i32::MAX,
+            y2: i32::MAX,
+        },
+    );
+    assert_eq!(h.read_pixel(10, 10), RED, "top left");
+    assert_eq!(h.read_pixel(630, 470), RED, "bottom right");
+}
+
+#[test]
+fn an_empty_scissor_rect_lets_nothing_through() {
+    // With the test on, a rect of no area (or an inverted one) scissors
+    // every pixel away, for a draw and for a `Clear` alike.
+    let h = Harness::new();
+    arm_diffuse(&h);
+    for rect in [
+        D3DRECT {
+            x1: 100,
+            y1: 100,
+            x2: 100,
+            y2: 300,
+        },
+        D3DRECT {
+            x1: 300,
+            y1: 300,
+            x2: 100,
+            y2: 100,
+        },
+    ] {
+        draw_scissored(&h, rect);
+        assert_eq!(h.read_pixel(200, 200), BLACK, "the draw is scissored away");
+        h.render_once(BLACK, |d| {
+            assert_eq!(d.set_scissor_rect(&rect), 0, "SetScissorRect");
+            assert_eq!(d.set_render_state(D3DRS_SCISSORTESTENABLE, 1), 0);
+            assert_eq!(d.clear_target(GREEN), 0, "scissored clear");
+            assert_eq!(d.set_render_state(D3DRS_SCISSORTESTENABLE, 0), 0);
+        });
+        assert_eq!(h.read_pixel(200, 200), BLACK, "the clear is scissored away");
+    }
 }
 
 #[test]
@@ -799,6 +922,71 @@ fn depth_bias_is_an_absolute_offset_at_every_depth() {
             "z0={z0}: a bias over the gap brings the quad in front"
         );
     }
+}
+
+#[test]
+fn slope_scaled_depth_bias_is_measured_in_reported_pixels() {
+    // `D3DRS_SLOPESCALEDEPTHBIAS` scales the depth slope per pixel of the size
+    // D3D9 reports, whatever grid the target is rasterized on. A red quad
+    // whose depth rises by `gap / 64` per pixel crosses the flat green quad at
+    // 0.5 one `gap` behind it at the centre column, so a slope factor of -51.2
+    // (an offset of 0.8 gap) leaves the crossing 12.8 pixels left of the
+    // probe and -80 (1.25 gap) moves it 16 pixels right of it. A factor
+    // applied per render pixel at `render.scale = 0.75` would offset by 4/3
+    // as much, putting the first crossing 4.3 pixels right of the probe.
+    let h = Harness::with_depth();
+    arm_diffuse(&h);
+    let gap = 1.0_f32 / 4096.0;
+    let slope = gap / 64.0;
+    let z0 = 0.5_f32;
+    let left = z0 + gap - slope * 320.5;
+    let right = left + slope * 640.0;
+    let v = |x: f32, y: f32, z: f32| PosColorVertex {
+        x,
+        y,
+        z,
+        color: RED,
+    };
+    let sloped = [
+        v(-1.0, 1.0, left),
+        v(1.0, 1.0, right),
+        v(-1.0, -1.0, left),
+        v(1.0, 1.0, right),
+        v(1.0, -1.0, right),
+        v(-1.0, -1.0, left),
+    ];
+    let wins = |factor: f32| {
+        h.render_once(BLACK, |d| {
+            assert_eq!(d.clear(D3DCLEAR_ZBUFFER, 0, 1.0, 0), 0, "depth clear");
+            assert_eq!(d.set_render_state(D3DRS_ZENABLE, 1), 0);
+            assert_eq!(d.set_render_state(D3DRS_ZWRITEENABLE, 1), 0);
+            assert_eq!(d.set_render_state(D3DRS_ZFUNC, D3DCMP_LESS), 0);
+            assert_eq!(
+                d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad_at_depth(GREEN, z0)),
+                0,
+                "stored depth"
+            );
+            assert_eq!(
+                d.set_render_state(D3DRS_SLOPESCALEDEPTHBIAS, factor.to_bits()),
+                0
+            );
+            assert_eq!(
+                d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &sloped),
+                0,
+                "sloped quad"
+            );
+            assert_eq!(d.set_render_state(D3DRS_SLOPESCALEDEPTHBIAS, 0), 0);
+        });
+        h.read_pixel(320, 240) == RED
+    };
+    assert!(
+        !wins(-51.2),
+        "an offset under the gap leaves the quad behind"
+    );
+    assert!(
+        wins(-80.0),
+        "an offset over the gap brings the quad in front"
+    );
 }
 
 #[test]

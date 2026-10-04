@@ -965,6 +965,24 @@ fn d3d_depth_bias_is_dropped_over_an_empty_depth_range() {
 }
 
 #[test]
+fn d3d_slope_scale_follows_the_render_scale() {
+    // At the identity the factor reaches Metal as the game wrote it; on a
+    // target rasterized at 3/4 size each render pixel spans 4/3 of a reported
+    // one, so Metal's per-pixel slope is 4/3 larger and the factor shrinks
+    // by 3/4 to keep the offset.
+    for raw in [0.0_f32, -0.0, 2.0, -1.5] {
+        assert_eq!(
+            d3d_slope_scale_to_metal(raw.to_bits(), 1.0).to_bits(),
+            raw.to_bits()
+        );
+    }
+    assert_eq!(
+        d3d_slope_scale_to_metal(2.0_f32.to_bits(), 0.75).to_bits(),
+        1.5_f32.to_bits()
+    );
+}
+
+#[test]
 fn d3d_to_metal_blend_op_table() {
     assert_eq!(d3d_to_metal_blend_op(1), BlendOperation::Add);
     assert_eq!(d3d_to_metal_blend_op(2), BlendOperation::Subtract);

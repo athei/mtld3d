@@ -26,8 +26,8 @@ use mtld3d_core::{
 };
 use mtld3d_shared::{InPtr, VtableThis};
 use mtld3d_types::{
-    D3DLIGHT9, D3DMATERIAL9, D3DMATRIX, D3DVIEWPORT9, Guid, IDirect3DStateBlock9Vtbl, MAX_STREAMS,
-    RENDER_STATE_COUNT, SAMPLER_STATE_COUNT, StateBlockType,
+    D3DLIGHT9, D3DMATERIAL9, D3DMATRIX, D3DRECT, D3DVIEWPORT9, Guid, IDirect3DStateBlock9Vtbl,
+    MAX_STREAMS, RENDER_STATE_COUNT, SAMPLER_STATE_COUNT, StateBlockType,
 };
 
 use super::{
@@ -98,7 +98,7 @@ pub enum StateOp {
         enable: bool,
     },
     Viewport(D3DVIEWPORT9),
-    ScissorRect([u32; 4]),
+    ScissorRect(D3DRECT),
     ClipPlane {
         index: u32,
         plane: [f32; 4],
@@ -625,7 +625,7 @@ struct StateSnapshot {
     bound_textures: [CachedComPtr<Direct3DTexture9, Captured>; STAGE_COUNT],
     bound_vertex_textures: [CachedComPtr<Direct3DTexture9, Captured>; 4],
     viewport: D3DVIEWPORT9,
-    scissor_rect: [u32; 4],
+    scissor_rect: D3DRECT,
     bound_vertex_shader: CachedComPtr<Direct3DVertexShader9, Captured>,
     bound_pixel_shader: CachedComPtr<Direct3DPixelShader9, Captured>,
     /// Vertex declaration + index buffer round-trip like the bound shaders.

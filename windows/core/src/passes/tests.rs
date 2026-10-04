@@ -876,15 +876,16 @@ fn emit_scissor_disabled_falls_back_to_viewport() {
 }
 
 #[test]
-fn emit_scissor_zero_rect_falls_back_to_viewport() {
+fn emit_scissor_empty_rect_lets_nothing_through() {
+    // The device seeds the scissor with the whole target, so an empty rect
+    // under the test is one the game set, and it lets no pixel through.
     let mut s = fresh();
     s.set_viewport(0, 0, 640, 480, 0.0, 1.0);
-    // SetScissorRect was never called (scissor_rect = [0; 4]) but the
-    // game turned the test on anyway → fall back to viewport so Metal
-    // doesn't clip to an empty rect.
     s.emit_scissor(true, [0, 0, 0, 0]);
+    s.emit_scissor(true, [100, 50, 0, 30]);
     let cmds = s.passes()[0].commands();
-    assert_eq!(unpack_scissor(&cmds[1]), (0, 0, 640, 480));
+    assert_eq!(unpack_scissor(&cmds[1]), (0, 0, 0, 0));
+    assert_eq!(unpack_scissor(&cmds[2]), (100, 50, 0, 30));
 }
 
 #[test]

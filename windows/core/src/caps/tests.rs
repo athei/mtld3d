@@ -193,7 +193,7 @@ fn filter_caps_matches_implementation() {
 
 #[test]
 fn blend_caps_matches_implementation() {
-    // The contiguous D3DBLEND_ZERO..SRCALPHASAT range plus BLENDFACTOR,
+    // The contiguous D3DBLEND_ZERO..BOTHINVSRCALPHA range plus BLENDFACTOR,
     // which is exactly what `convert::d3d_to_metal_blend` maps.
     let expected = BlendCaps::ZERO
         | BlendCaps::ONE
@@ -206,6 +206,8 @@ fn blend_caps_matches_implementation() {
         | BlendCaps::DESTCOLOR
         | BlendCaps::INVDESTCOLOR
         | BlendCaps::SRCALPHASAT
+        | BlendCaps::BOTHSRCALPHA
+        | BlendCaps::BOTHINVSRCALPHA
         | BlendCaps::BLENDFACTOR;
     assert_eq!(filled().src_blend_caps, expected.bits());
     assert_eq!(filled().dest_blend_caps, expected.bits());

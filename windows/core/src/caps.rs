@@ -202,9 +202,10 @@ const RASTER_DEFAULT: RasterCaps = RasterCaps::DITHER
 /// Blend factors, for both the colour and the alpha blend equation.
 ///
 /// Every `D3DBLEND_*` value `convert::d3d_to_metal_blend` maps, which is the
-/// contiguous `ZERO..SRCALPHASAT` range plus `BLENDFACTOR`. The `BOTH*` factors
-/// are DX7-era shorthand D3D9 no longer honours, and the dual-source `*2`
-/// factors need a second pixel-shader output.
+/// contiguous `ZERO..BOTHINVSRCALPHA` range plus `BLENDFACTOR`. The `BOTH*`
+/// shorthands resolve to their `SRCALPHA` / `INVSRCALPHA` pair in
+/// `pipeline_state`. The dual-source `*2` factors need a second pixel-shader
+/// output, and D3D9 advertises them on the reference rasterizer only.
 const BLEND_DEFAULT: BlendCaps = BlendCaps::ZERO
     .union(BlendCaps::ONE)
     .union(BlendCaps::SRCCOLOR)
@@ -216,6 +217,8 @@ const BLEND_DEFAULT: BlendCaps = BlendCaps::ZERO
     .union(BlendCaps::DESTCOLOR)
     .union(BlendCaps::INVDESTCOLOR)
     .union(BlendCaps::SRCALPHASAT)
+    .union(BlendCaps::BOTHSRCALPHA)
+    .union(BlendCaps::BOTHINVSRCALPHA)
     .union(BlendCaps::BLENDFACTOR);
 
 /// Shading caps.

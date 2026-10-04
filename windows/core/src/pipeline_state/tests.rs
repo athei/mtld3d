@@ -5,15 +5,17 @@
 //! normalisation and the wire format: an absent extra target drops out of the key, an extra target
 //! the shader never writes gets an empty write mask while target 0 keeps its render-state mask,
 //! destination-alpha factors clamp on an alpha-less target, and the wire params match the key.
-//! Blend factors left over while blending is off, and declarations that resolve to the same
-//! vertex attributes, collapse onto one key.
+//! Blend factors left over while blending is off, blend states without a colour output, the
+//! factors of a min or max equation, a separate alpha equation equal to the colour one, and
+//! declarations that resolve to the same vertex attributes, collapse onto one key.
 
 use mtld3d_shared::mtl::VertexFormat;
 use mtld3d_types::{
-    D3DBLEND_DESTALPHA, D3DBLEND_INVDESTALPHA, D3DBLEND_INVSRCALPHA, D3DBLEND_ONE,
-    D3DBLEND_SRCALPHA, D3DBLEND_ZERO, D3DBLENDOP_ADD, D3DBLENDOP_REVSUBTRACT, D3DDECLTYPE_FLOAT2,
-    D3DDECLTYPE_FLOAT3, D3DDECLUSAGE_NORMAL, D3DDECLUSAGE_POSITION, D3DDECLUSAGE_TEXCOORD,
-    D3DFVF_TEX1, D3DFVF_XYZ, D3DVERTEXELEMENT9,
+    D3DBLEND_BOTHINVSRCALPHA, D3DBLEND_BOTHSRCALPHA, D3DBLEND_DESTALPHA, D3DBLEND_INVDESTALPHA,
+    D3DBLEND_INVSRCALPHA, D3DBLEND_ONE, D3DBLEND_SRCALPHA, D3DBLEND_ZERO, D3DBLENDOP_ADD,
+    D3DBLENDOP_MAX, D3DBLENDOP_MIN, D3DBLENDOP_REVSUBTRACT, D3DDECLTYPE_FLOAT2, D3DDECLTYPE_FLOAT3,
+    D3DDECLUSAGE_NORMAL, D3DDECLUSAGE_POSITION, D3DDECLUSAGE_TEXCOORD, D3DFVF_TEX1, D3DFVF_XYZ,
+    D3DVERTEXELEMENT9,
 };
 
 use super::*;
@@ -373,28 +375,135 @@ fn params_match_key_on_default_snapshot() {
     assert_eq!(p.dst_blend_alpha, k.dst_blend_alpha);
     assert_eq!(p.blend_op_alpha, k.blend_op_alpha);
     assert_eq!(
-        u32::from(p.flags.contains(PipelineRsFlags::SEPARATE_ALPHA_BLEND)),
-        k.separate_alpha_blend_enable
+        p.flags.difference(PipelineRsFlags::SEPARATE_ALPHA_BLEND),
+        k.flags
     );
     assert_eq!(p.color_write_mask, k.color_write_mask);
     assert_eq!(
-        u32::from(p.attach.contains(PipelineAttachFlags::HAS_DEPTH)),
-        k.has_depth
-    );
-    assert_eq!(
-        u32::from(p.attach.contains(PipelineAttachFlags::HAS_STENCIL)),
-        k.has_stencil
+        p.attach.difference(PipelineAttachFlags::COLOR_HAS_ALPHA),
+        k.attach
     );
     assert_eq!(p.color_format, k.color_format);
-    assert_eq!(
-        u32::from(p.attach.contains(PipelineAttachFlags::HAS_COLOR_OUTPUT)),
-        k.has_color_output
-    );
     assert_eq!(p.extra_present_mask, k.extra_present_mask);
     for i in 0..3 {
         assert_eq!(p.extra[i].format, k.extra_formats[i]);
         assert_eq!(p.extra[i].write_mask, k.extra_write_masks[i]);
     }
+
+    // With an extra target blending, the key holds the factors before any
+    // clamp, which is what an alpha-bearing extra target blends with, and it
+    // keeps target 0's alpha bit beside them.
+    let mut s = with_rt1();
+    s.rs.src_blend = narrow(D3DBLEND_DESTALPHA);
+    s.rs.dst_blend = narrow(D3DBLEND_INVDESTALPHA);
+    let k = key_of(&s);
+    let p = params_of(&s);
+    assert_eq!(p.attach, k.attach);
+    assert_eq!(
+        (
+            p.extra[0].src_blend,
+            p.extra[0].dst_blend,
+            p.extra[0].src_blend_alpha,
+            p.extra[0].dst_blend_alpha,
+        ),
+        (
+            k.src_blend,
+            k.dst_blend,
+            k.src_blend_alpha,
+            k.dst_blend_alpha
+        )
+    );
+    assert_eq!(p.src_blend, k.src_blend, "an A8 target 0 clamps nothing");
+}
+
+#[test]
+fn an_extra_target_keeps_factors_its_alpha_sees_apart() {
+    // Target 0 is X8, so its destination-alpha factors clamp to ONE / ZERO;
+    // target 1 is A8 and blends with them as written. Snapshots that differ
+    // only in a factor target 0 clamps away build different pipelines for
+    // target 1, so they must not share a key.
+    let x8_rt0 = |f: fn(&mut PipelineSnapshot)| {
+        let mut s = with_rt1();
+        s.attach.remove(PipelineAttachFlags::COLOR_HAS_ALPHA);
+        f(&mut s);
+        s
+    };
+    let pairs = [
+        (
+            x8_rt0(|s| s.rs.src_blend = narrow(D3DBLEND_DESTALPHA)),
+            x8_rt0(|s| s.rs.src_blend = narrow(D3DBLEND_ONE)),
+        ),
+        (
+            x8_rt0(|s| s.rs.dst_blend = narrow(D3DBLEND_INVDESTALPHA)),
+            x8_rt0(|s| s.rs.dst_blend = narrow(D3DBLEND_ZERO)),
+        ),
+        (
+            x8_rt0(|s| {
+                s.rs.src_blend = narrow(D3DBLEND_ONE);
+                s.rs.dst_blend = narrow(D3DBLEND_ZERO);
+                s.rs.flags.insert(PipelineRsFlags::SEPARATE_ALPHA_BLEND);
+                s.rs.src_blend_alpha = narrow(D3DBLEND_DESTALPHA);
+                s.rs.dst_blend_alpha = narrow(D3DBLEND_ZERO);
+                s.rs.blend_op_alpha = narrow(D3DBLENDOP_ADD);
+            }),
+            x8_rt0(|s| {
+                s.rs.src_blend = narrow(D3DBLEND_ONE);
+                s.rs.dst_blend = narrow(D3DBLEND_ZERO);
+            }),
+        ),
+    ];
+    for (b, c) in &pairs {
+        let (pb, pc) = (params_of(b), params_of(c));
+        assert_eq!(
+            (
+                pb.src_blend,
+                pb.dst_blend,
+                pb.src_blend_alpha,
+                pb.dst_blend_alpha
+            ),
+            (
+                pc.src_blend,
+                pc.dst_blend,
+                pc.src_blend_alpha,
+                pc.dst_blend_alpha
+            ),
+            "target 0 sees the two alike"
+        );
+        assert_ne!(
+            extra_factors(&pb),
+            extra_factors(&pc),
+            "target 1 sees them apart"
+        );
+        assert_ne!(key_of(b), key_of(c));
+    }
+
+    // The other way round: the same DESTALPHA source factor over an X8 and
+    // an A8 target 0, each beside an A8 target 1. Target 1 blends alike,
+    // target 0 does not, so the two must not share a key either.
+    let mut a8 = with_rt1();
+    a8.rs.src_blend = narrow(D3DBLEND_DESTALPHA);
+    let mut x8 = a8.clone();
+    x8.attach.remove(PipelineAttachFlags::COLOR_HAS_ALPHA);
+    let (pa, px) = (params_of(&a8), params_of(&x8));
+    assert_eq!(
+        extra_factors(&pa),
+        extra_factors(&px),
+        "target 1 sees them alike"
+    );
+    assert_ne!(pa.src_blend, px.src_blend, "target 0 sees them apart");
+    assert_ne!(key_of(&a8), key_of(&x8));
+}
+
+/// Render target 1's `(src, dst, src_alpha, dst_alpha)` in a native description.
+fn extra_factors(
+    p: &PipelineDescription<'_>,
+) -> (BlendFactor, BlendFactor, BlendFactor, BlendFactor) {
+    (
+        p.extra[0].src_blend,
+        p.extra[0].dst_blend,
+        p.extra[0].src_blend_alpha,
+        p.extra[0].dst_blend_alpha,
+    )
 }
 
 #[test]
@@ -435,12 +544,14 @@ fn alpha_to_coverage_keys_only_multisampled_pipelines_and_reaches_wire() {
             });
             assert_eq!(
                 params.flags.contains(PipelineRsFlags::ALPHA_TO_COVERAGE),
-                key.alpha_to_coverage
+                key.flags.contains(PipelineRsFlags::ALPHA_TO_COVERAGE)
             );
         }
         on.attach.remove(PipelineAttachFlags::HAS_COLOR_OUTPUT);
         assert!(
-            key_of(&on).alpha_to_coverage,
+            key_of(&on)
+                .flags
+                .contains(PipelineRsFlags::ALPHA_TO_COVERAGE),
             "depth-only sibling keeps coverage"
         );
     }
@@ -580,6 +691,136 @@ fn blend_on_keys_every_factor_difference() {
     assert_ne!(
         blend_fields(&params_of(&dest_alpha)),
         blend_fields(&params_of(&dest_alpha_rt1_no_alpha))
+    );
+}
+
+#[test]
+fn both_src_alpha_source_factors_override_the_destination_factor() {
+    // `BOTHSRCALPHA` as the source factor means SRCALPHA / INVSRCALPHA and
+    // `BOTHINVSRCALPHA` the reverse, whatever the destination state holds, in
+    // the colour equation and, under separate alpha, in the alpha one.
+    let resolve = |src: u32, src_alpha: u32| {
+        let mut s = base();
+        s.rs.src_blend = narrow(src);
+        s.rs.dst_blend = narrow(D3DBLEND_ZERO);
+        s.rs.flags.insert(PipelineRsFlags::SEPARATE_ALPHA_BLEND);
+        s.rs.src_blend_alpha = narrow(src_alpha);
+        s.rs.dst_blend_alpha = narrow(D3DBLEND_ONE);
+        let p = params_of(&s);
+        (
+            p.src_blend,
+            p.dst_blend,
+            p.src_blend_alpha,
+            p.dst_blend_alpha,
+        )
+    };
+    assert_eq!(
+        resolve(D3DBLEND_BOTHSRCALPHA, D3DBLEND_BOTHINVSRCALPHA),
+        (
+            BlendFactor::SourceAlpha,
+            BlendFactor::OneMinusSourceAlpha,
+            BlendFactor::OneMinusSourceAlpha,
+            BlendFactor::SourceAlpha,
+        )
+    );
+    assert_eq!(
+        resolve(D3DBLEND_BOTHINVSRCALPHA, D3DBLEND_BOTHSRCALPHA),
+        (
+            BlendFactor::OneMinusSourceAlpha,
+            BlendFactor::SourceAlpha,
+            BlendFactor::SourceAlpha,
+            BlendFactor::OneMinusSourceAlpha,
+        )
+    );
+    // The shorthand and the pair it stands for are one pipeline.
+    let mut both = base();
+    both.rs.src_blend = narrow(D3DBLEND_BOTHSRCALPHA);
+    both.rs.dst_blend = narrow(D3DBLEND_ZERO);
+    let mut pair = base();
+    pair.rs.src_blend = narrow(D3DBLEND_SRCALPHA);
+    pair.rs.dst_blend = narrow(D3DBLEND_INVSRCALPHA);
+    assert_eq!(key_of(&both), key_of(&pair));
+}
+
+#[test]
+fn a_pipeline_without_colour_output_ignores_blend_mask_and_format() {
+    // With no colour attachment nothing blends, nothing is masked and no
+    // colour format is declared, so the states that only shape colour do
+    // not split the depth-only pipeline.
+    let no_color = |f: fn(&mut PipelineSnapshot)| {
+        let mut s = base();
+        f(&mut s);
+        s.remove_color_output();
+        (key_of(&s), blend_fields(&params_of(&s)))
+    };
+    let plain = no_color(|_| {});
+    assert_eq!(
+        plain,
+        no_color(|s| s.rs.flags.remove(PipelineRsFlags::BLEND_ENABLE))
+    );
+    assert_eq!(plain, no_color(|s| s.rs.src_blend = narrow(D3DBLEND_ONE)));
+    assert_eq!(plain, no_color(|s| s.rs.color_write_mask = 0x1));
+    assert_eq!(
+        plain,
+        no_color(|s| s.color_format = PixelFormat::Rgba16Float)
+    );
+    assert_eq!(
+        plain,
+        no_color(|s| s.attach.remove(PipelineAttachFlags::COLOR_HAS_ALPHA))
+    );
+    // Depth and the sample count still decide the pipeline.
+    assert_ne!(
+        plain,
+        no_color(|s| s.attach.insert(PipelineAttachFlags::HAS_STENCIL))
+    );
+    assert_ne!(plain, no_color(|s| s.sample_count = 4));
+}
+
+#[test]
+fn min_and_max_equations_ignore_their_factors() {
+    // `D3DBLENDOP_MIN` and `MAX` combine the unweighted source and
+    // destination, and Metal ignores the factors of a min or max equation,
+    // so draws that differ only in those factors are one pipeline.
+    for op in [D3DBLENDOP_MIN, D3DBLENDOP_MAX] {
+        let with = |src: u32, dst: u32| {
+            let mut s = base();
+            s.rs.blend_op = narrow(op);
+            s.rs.src_blend = narrow(src);
+            s.rs.dst_blend = narrow(dst);
+            s
+        };
+        let a = with(D3DBLEND_SRCALPHA, D3DBLEND_INVSRCALPHA);
+        let b = with(D3DBLEND_ZERO, D3DBLEND_DESTALPHA);
+        assert_eq!(key_of(&a), key_of(&b));
+        let p = params_of(&a);
+        assert_eq!(
+            (p.src_blend, p.dst_blend),
+            (BlendFactor::One, BlendFactor::One)
+        );
+    }
+    // An additive equation still keys its factors.
+    let mut add = base();
+    add.rs.src_blend = narrow(D3DBLEND_ZERO);
+    assert_ne!(key_of(&add), key_of(&base()));
+}
+
+#[test]
+fn separate_alpha_that_repeats_the_colour_equation_changes_nothing() {
+    // SEPARATEALPHABLENDENABLE with an alpha trio equal to the colour one is
+    // the same blend as without it.
+    let mut plain = base();
+    plain.rs.src_blend_alpha = plain.rs.src_blend;
+    plain.rs.dst_blend_alpha = plain.rs.dst_blend;
+    plain.rs.blend_op_alpha = plain.rs.blend_op;
+    let mut separate = plain.clone();
+    separate
+        .rs
+        .flags
+        .insert(PipelineRsFlags::SEPARATE_ALPHA_BLEND);
+    assert_eq!(key_of(&plain), key_of(&separate));
+    assert_eq!(
+        blend_fields(&params_of(&plain)),
+        blend_fields(&params_of(&separate))
     );
 }
 

@@ -8,7 +8,9 @@
 use log::{Level, log_enabled};
 use mtld3d_core::{
     async_compile::{ClearPlanes, DeferredState, JobTicket, LibrarySlot, Resolution},
-    convert::{d3d_depth_bias_to_clip, d3d_to_metal_cull, d3d_to_metal_fill},
+    convert::{
+        d3d_depth_bias_to_clip, d3d_slope_scale_to_metal, d3d_to_metal_cull, d3d_to_metal_fill,
+    },
     depth_stencil_state::STENCIL_MASK_BITS,
     dirty_range::{indexed_vb_range_lower_bound, nonindexed_vb_range},
     draw_data::{FixedPsSource, FixedVsSource, ProgrammablePsSource, ProgrammableVsSource},
@@ -882,10 +884,13 @@ fn emit_draw_view(
     // `pos_fixup` (emitted below): Metal's own constant bias scales with the
     // depth's exponent on a float depth buffer, D3D9's does not. Only the
     // slope term, which Metal applies unscaled, stays on `setDepthBias`,
-    // routed through `LastBoundCache` so it re-binds only when it changes.
+    // routed through `LastBoundCache` so it re-binds only when it changes;
+    // Metal measures its slope per render pixel, so it follows the target's
+    // render scale.
     let (min_z, max_z) = enc.viewport_depth_range();
     let depth_bias = d3d_depth_bias_to_clip(render_state.depth_bias, min_z, max_z);
-    let slope_scale = f32::from_bits(render_state.slope_scale_depth_bias);
+    let render_scale = enc.target_scale().factor();
+    let slope_scale = d3d_slope_scale_to_metal(render_state.slope_scale_depth_bias, render_scale);
     if enc.last_bound().depth_bias_changed(0.0, slope_scale) {
         enc.emit_command(Command::set_depth_bias(0.0, slope_scale));
     }
@@ -1236,7 +1241,7 @@ fn emit_draw_view(
         1.0 / to_f(vp_w.max(1)),
         -1.0 / to_f(vp_h.max(1)),
         f32::from(u8::from(depth_clamp_z)),
-        enc.target_scale().factor(),
+        render_scale,
         depth_bias,
     ];
     // SAFETY: `[f32; 5]` is POD with no padding; reinterpreting the array as
