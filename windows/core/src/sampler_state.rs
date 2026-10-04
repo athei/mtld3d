@@ -223,7 +223,7 @@ pub struct SamplerSnapshot {
     /// Limited to the ceiling the caps advertise, and 1 unless one of the
     /// stage's filters is `D3DTEXF_ANISOTROPIC`.
     pub max_anisotropy: u8,
-    /// The most detailed level the stage may sample, limited to the deepest level a D3D9 texture has.
+    /// The most detailed level the stage may sample, at most the deepest level of a D3D9 texture.
     ///
     /// With mipmapping on it is `D3DSAMP_MAXMIPLEVEL` (D3D9's name for the
     /// *finest* level the sampler may select) or the texture's `SetLOD`,
