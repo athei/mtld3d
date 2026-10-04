@@ -25,10 +25,11 @@ use mtld3d_types::{
     D3DDISPLAYMODE, D3DERR_DEVICENOTRESET, D3DERR_INVALIDCALL, D3DERR_NOTAVAILABLE,
     D3DERR_NOTFOUND, D3DFILL_SOLID, D3DFMT_A2R10G10B10, D3DFMT_A8B8G8R8, D3DFMT_A8R8G8B8,
     D3DFMT_A16B16G16R16, D3DFMT_A16B16G16R16F, D3DFMT_A32B32G32R32F, D3DFMT_ATI1, D3DFMT_D24S8,
-    D3DFMT_DF24, D3DFMT_DXT1, D3DFMT_G16R16, D3DFMT_G16R16F, D3DFMT_G32R32F, D3DFMT_INDEX16,
+    D3DFMT_DF16, D3DFMT_DF24, D3DFMT_DXT1, D3DFMT_G16R16, D3DFMT_G16R16F, D3DFMT_G32R32F, D3DFMT_INDEX16,
     D3DFMT_L8, D3DFMT_NV12, D3DFMT_R5G6B5, D3DFMT_R8G8B8, D3DFMT_R16F, D3DFMT_R32F, D3DFMT_UYVY,
     D3DFMT_X8B8G8R8, D3DFMT_X8R8G8B8, D3DFMT_YUY2, D3DFMT_YV12, D3DFVF_DIFFUSE, D3DFVF_TEX1,
-    D3DFVF_XYZ, D3DGAMMARAMP, D3DLOCK_READONLY, D3DOK_NOAUTOGEN, D3DPOOL_DEFAULT, D3DPOOL_MANAGED,
+    D3DFVF_XYZ, D3DGAMMARAMP, D3DLOCK_READONLY, D3DMULTISAMPLE_2_SAMPLES, D3DMULTISAMPLE_4_SAMPLES,
+    D3DMULTISAMPLE_8_SAMPLES, D3DOK_NOAUTOGEN, D3DPOOL_DEFAULT, D3DPOOL_MANAGED,
     D3DPOOL_SCRATCH, D3DPOOL_SYSTEMMEM, D3DPRESENT_INTERVAL_FOUR, D3DPRESENT_INTERVAL_IMMEDIATE,
     D3DPRESENT_INTERVAL_ONE, D3DPRESENT_INTERVAL_THREE, D3DPRESENT_INTERVAL_TWO,
     D3DPRESENT_PARAMETERS, D3DPT_TRIANGLELIST, D3DRS_COLORWRITEENABLE, D3DRS_FILLMODE,
@@ -4188,6 +4189,47 @@ fn each_direct3d9_resolves_its_own_configuration() {
         D3DERR_NOTAVAILABLE,
         "the first interface kept its configuration"
     );
+}
+
+#[test]
+fn hidden_df_formats_answer_no_to_every_multisample_count() {
+    // `caps.dfFormats = false` hides DF16 and DF24 from the format and
+    // depth-stencil-match answers, and the multisample answer hides them at
+    // every count above one too, while the interface that advertises them
+    // multisamples them where the device multisamples at all.
+    let hidden = Harness::factory_only_with_config("caps.dfFormats=false");
+    let advertised = Harness::factory_only_with_config("caps.dfFormats=true");
+    let device_multisamples = |samples| {
+        advertised
+            .check_device_multi_sample_type(D3DFMT_X8R8G8B8, 1, samples)
+            .0
+            == D3D_OK
+    };
+    for format in [D3DFMT_DF16, D3DFMT_DF24] {
+        assert_eq!(
+            hidden.check_depth_stencil_match(D3DFMT_X8R8G8B8, D3DFMT_X8R8G8B8, format),
+            D3DERR_NOTAVAILABLE,
+            "hidden {format:#x} depth-stencil match"
+        );
+        for samples in [
+            D3DMULTISAMPLE_2_SAMPLES,
+            D3DMULTISAMPLE_4_SAMPLES,
+            D3DMULTISAMPLE_8_SAMPLES,
+        ] {
+            assert_eq!(
+                hidden.check_device_multi_sample_type(format, 1, samples).0,
+                D3DERR_NOTAVAILABLE,
+                "hidden {format:#x} at {samples} samples"
+            );
+            if device_multisamples(samples) {
+                assert_eq!(
+                    advertised.check_device_multi_sample_type(format, 1, samples).0,
+                    D3D_OK,
+                    "advertised {format:#x} at {samples} samples"
+                );
+            }
+        }
+    }
 }
 
 #[test]

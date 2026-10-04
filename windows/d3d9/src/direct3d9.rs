@@ -1167,6 +1167,15 @@ extern "system" fn d3d9_check_device_multi_sample_type(
         );
         return D3DERR_INVALIDCALL;
     }
+    // Mirror the CheckDeviceFormat gate: hidden DF fourccs stay hidden here,
+    // at every count the single-sampled `D3DMULTISAMPLE_NONE` answer aside,
+    // which any format gets.
+    if matches!(surface_format, D3DFMT_DF24 | D3DFMT_DF16)
+        && !d3d.config().df_formats
+        && multi_sample_type != D3DMULTISAMPLE_NONE
+    {
+        return D3DERR_NOTAVAILABLE;
+    }
     let caps = device_caps_flags();
     // A format the device cannot render into at all cannot be multisampled
     // either, whatever count is asked for.
