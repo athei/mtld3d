@@ -908,8 +908,13 @@ extern "system" fn d3d9_check_device_type(
     // engine picks X8R8G8B8 the way hardware without 16-bit render targets
     // made it. `CreateDevice` stays lenient and substitutes the BGRA8 layer
     // format for a 16-bit request (`warn_unsupported_backbuffer_format`).
+    // Only a D3D9 back-buffer format is offered at all, so a title probing for
+    // its back buffer lands on one even where the device would render into a
+    // wider format; `CreateDevice` and `Reset` substitute BGRA8 for any
+    // format they are handed (`warn_unsupported_backbuffer_format`).
     let expand_packed16 = d3d.config().expand_packed16;
-    let presentable = is_render_target_format_on_device(effective_bb, expand_packed16)
+    let presentable = mtld3d_core::format::is_back_buffer_format(effective_bb, windowed != 0)
+        && is_render_target_format_on_device(effective_bb, expand_packed16)
         && if windowed != 0 {
             is_format_conversion_supported(effective_bb, adapter_format, expand_packed16)
         } else {
@@ -1878,16 +1883,19 @@ fn spawn_native_encoder(
 /// `CAMetalLayer.pixelFormat` and the backbuffer are hardcoded to `BGRA8Unorm` on the unix side.
 ///
 /// That matches `D3DFMT_A8R8G8B8` / `D3DFMT_X8R8G8B8` byte-for-byte, which is
-/// all `WoW` requests. Windowed `CheckDeviceType` advertises the 16-bit and
-/// float backbuffer formats too (it answers with the `StretchRect` conversion
-/// predicate, as the runtime requires), and such a request is substituted by
-/// decision rather than plumbed: a real 16-bit backbuffer would need a
-/// conversion pass on every present, and a float one would need the whole
-/// present path to carry a format (a second drawable format, a present
-/// pipeline per format, and format-derived read-back pitches). Games that
-/// render HDR internally do it in their own off-screen float targets and
-/// tone-map into an 8-bit backbuffer, so nothing has needed it. Warn once so a
-/// game that asked shows up.
+/// all `WoW` requests. `CheckDeviceType` advertises the 16-bit back-buffer
+/// formats the device renders into too (it answers with the `StretchRect`
+/// conversion predicate, as the runtime requires), and offers no format
+/// outside the D3D9 back-buffer set. Any other request, a 16-bit one or a
+/// format no query offers, is substituted by decision rather than plumbed or
+/// refused: a real 16-bit backbuffer would need a conversion pass on every
+/// present, and a float one would need the whole present path to carry a
+/// format (a second drawable format, a present pipeline per format, and
+/// format-derived read-back pitches), while refusing would end a title that
+/// creates its device without probing. Games that render HDR internally do it
+/// in their own off-screen float targets and tone-map into an 8-bit
+/// backbuffer, so nothing has needed it. Warn once so a game that asked shows
+/// up.
 pub fn warn_unsupported_backbuffer_format(format: u32) {
     if !matches!(format, D3DFMT_A8R8G8B8 | D3DFMT_X8R8G8B8) {
         mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,

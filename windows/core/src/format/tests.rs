@@ -30,8 +30,8 @@ use super::{
     D3DUSAGE_RENDERTARGET, D3DUSAGE_RTPATCHES, D3DUSAGE_SOFTWAREPROCESSING, PixelFormat,
     RenderScale, StandaloneSurfaceKind, Swizzle, block_row_pitch, compute_mip_count,
     compute_mip_size, compute_volume_mip_count, depth_format_bytes_per_pixel, format_name,
-    is_depth_format, is_mapped_color_format, is_volume_texture_format, linear_mip_size,
-    linear_row_pitch, map_d3d_depth_format, map_d3d_format, resolve_mip_levels,
+    is_back_buffer_format, is_depth_format, is_mapped_color_format, is_volume_texture_format,
+    linear_mip_size, linear_row_pitch, map_d3d_depth_format, map_d3d_format, resolve_mip_levels,
     standalone_surface_bytes, surface_bytes, usage_allowed_for_rtype,
 };
 
@@ -1480,4 +1480,50 @@ fn legacy_bump_map_queries_answer_no_for_every_format() {
             true
         ));
     }
+}
+
+/// The back-buffer set is the six formats D3D9 specifies, A2R10G10B10 in fullscreen alone.
+///
+/// Formats a device renders into but no swap chain is specified in (the
+/// float and wide-channel families, the reversed-channel 8-bit pair) stay
+/// out in both modes.
+#[test]
+fn back_buffer_formats_are_the_d3d9_set() {
+    for windowed in [true, false] {
+        for format in [
+            D3DFMT_A8R8G8B8,
+            D3DFMT_X8R8G8B8,
+            mtld3d_types::D3DFMT_A1R5G5B5,
+            mtld3d_types::D3DFMT_X1R5G5B5,
+            D3DFMT_R5G6B5,
+        ] {
+            assert!(
+                is_back_buffer_format(format, windowed),
+                "{format} windowed={windowed}"
+            );
+        }
+        for format in [
+            D3DFMT_A8B8G8R8,
+            D3DFMT_X8B8G8R8,
+            D3DFMT_A16B16G16R16,
+            D3DFMT_A16B16G16R16F,
+            D3DFMT_A32B32G32R32F,
+            D3DFMT_G16R16,
+            D3DFMT_R32F,
+            0,
+        ] {
+            assert!(
+                !is_back_buffer_format(format, windowed),
+                "{format} windowed={windowed}"
+            );
+        }
+    }
+    assert!(is_back_buffer_format(
+        mtld3d_types::D3DFMT_A2R10G10B10,
+        false
+    ));
+    assert!(!is_back_buffer_format(
+        mtld3d_types::D3DFMT_A2R10G10B10,
+        true
+    ));
 }

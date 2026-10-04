@@ -404,6 +404,25 @@ pub fn map_d3d_format_device(d3d_format: u32, native_packed16: bool) -> Option<F
     map_d3d_format(d3d_format)
 }
 
+/// The formats D3D9 specifies a device swap chain's back buffer in.
+///
+/// A8R8G8B8, X8R8G8B8, A1R5G5B5, X1R5G5B5 and R5G6B5, plus A2R10G10B10 in
+/// fullscreen only, which no driver offered as a windowed back buffer.
+/// `CheckDeviceType` offers nothing outside this set whatever the device
+/// renders into, so a title that probes for its back buffer lands on one of
+/// them. The device's own answer is narrower still: it also has to render
+/// into the format and present it to the display format.
+#[must_use]
+pub const fn is_back_buffer_format(d3d_format: u32, windowed: bool) -> bool {
+    match d3d_format {
+        D3DFMT_A8R8G8B8 | D3DFMT_X8R8G8B8 | D3DFMT_A1R5G5B5 | D3DFMT_X1R5G5B5 | D3DFMT_R5G6B5 => {
+            true
+        }
+        D3DFMT_A2R10G10B10 => !windowed,
+        _ => false,
+    }
+}
+
 /// Colour formats the Metal backend renders into, as a pure format family.
 ///
 /// `A4R4G4B4` and `X1R5G5B5` are excluded on every device: their mapping
