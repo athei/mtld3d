@@ -13,8 +13,8 @@ use mtld3d_tests::{CubeTexture, Harness, HarnessConfig, PosColorVertex, Texture,
 use mtld3d_types::{
     D3D_OK, D3DCLEAR_STENCIL, D3DCLEAR_TARGET, D3DCLEAR_ZBUFFER, D3DCMP_EQUAL, D3DCMP_LESS,
     D3DERR_INVALIDCALL, D3DFMT_A1R5G5B5, D3DFMT_A2R10G10B10, D3DFMT_A8R8G8B8, D3DFMT_ATI1,
-    D3DFMT_ATOC, D3DFMT_D15S1, D3DFMT_D16_LOCKABLE, D3DFMT_D24FS8, D3DFMT_D24S8, D3DFMT_D24X4S4,
-    D3DFMT_D32F_LOCKABLE, D3DFMT_DF16, D3DFMT_DF24, D3DFMT_DXT1, D3DFMT_DXT2, D3DFMT_DXT3,
+    D3DFMT_ATOC, D3DFMT_D15S1, D3DFMT_D16, D3DFMT_D16_LOCKABLE, D3DFMT_D24FS8, D3DFMT_D24S8, D3DFMT_D24X4S4,
+    D3DFMT_D24X8, D3DFMT_D32, D3DFMT_D32_LOCKABLE, D3DFMT_D32F_LOCKABLE, D3DFMT_DF16, D3DFMT_DF24, D3DFMT_DXT1, D3DFMT_DXT2, D3DFMT_DXT3,
     D3DFMT_DXT4, D3DFMT_DXT5, D3DFMT_INDEX16, D3DFMT_INDEX32, D3DFMT_INTZ, D3DFMT_NV12,
     D3DFMT_R5G6B5, D3DFMT_RESZ, D3DFMT_UYVY, D3DFMT_VERTEXDATA, D3DFMT_X1R5G5B5, D3DFMT_X8R8G8B8,
     D3DFMT_YUY2, D3DFMT_YV12, D3DFVF_DIFFUSE, D3DFVF_XYZ, D3DMULTISAMPLE_2_SAMPLES,
@@ -131,12 +131,17 @@ fn kept_divergence(shape: &str, format: u32) -> bool {
 }
 
 /// The disagreements one sweep found.
-#[derive(Default)]
 struct Sweep {
     mismatches: Vec<String>,
 }
 
 impl Sweep {
+    const fn new() -> Self {
+        Self {
+            mismatches: Vec::new(),
+        }
+    }
+
     /// Record one create against the answer that speaks for it.
     fn compare(&mut self, shape: &str, format: u32, advertised: bool, create_hr: i32) {
         if advertised != succeeded(create_hr) && !kept_divergence(shape, format) {
@@ -205,7 +210,7 @@ fn volume_hr(h: &Harness, usage: u32, format: u32, pool: u32) -> i32 {
 #[test]
 fn texture_creates_agree_with_the_texture_query() {
     let h = Harness::new();
-    let mut sweep = Sweep::default();
+    let mut sweep = Sweep::new();
     for format in candidate_formats() {
         let plain = check(&h, 0, D3DRTYPE_TEXTURE, format);
         let depth = is_depth(&h, format);
@@ -244,7 +249,7 @@ fn texture_creates_agree_with_the_texture_query() {
 #[test]
 fn cube_and_volume_creates_agree_with_their_queries() {
     let h = Harness::new();
-    let mut sweep = Sweep::default();
+    let mut sweep = Sweep::new();
     for format in candidate_formats() {
         let cube = check(&h, 0, D3DRTYPE_CUBETEXTURE, format);
         let volume = check(&h, 0, D3DRTYPE_VOLUMETEXTURE, format);
@@ -293,7 +298,7 @@ fn cube_and_volume_creates_agree_with_their_queries() {
 #[test]
 fn surface_creates_agree_with_the_surface_query() {
     let h = Harness::new();
-    let mut sweep = Sweep::default();
+    let mut sweep = Sweep::new();
     for format in candidate_formats() {
         let plain = check(&h, 0, D3DRTYPE_SURFACE, format);
         for (pool, name) in [
@@ -332,7 +337,7 @@ fn surface_creates_agree_with_the_surface_query() {
 #[test]
 fn multisampled_surface_creates_agree_with_the_multisample_query() {
     let h = Harness::new();
-    let mut sweep = Sweep::default();
+    let mut sweep = Sweep::new();
     for format in candidate_formats() {
         let rt = check(&h, D3DUSAGE_RENDERTARGET, D3DRTYPE_SURFACE, format);
         let ds = check(&h, D3DUSAGE_DEPTHSTENCIL, D3DRTYPE_SURFACE, format);
@@ -429,30 +434,30 @@ const fn auto_depth_params(format: u32, samples: u32) -> D3DPRESENT_PARAMETERS {
 /// The formats the auto depth-stencil sweeps walk.
 ///
 /// Every numbered depth format, the vendor depth formats, a colour format
-/// and an unknown code: one device per format, so the list stays short.
-const AUTO_DEPTH_FORMATS: [u32; 15] = [
-    70,
-    71,
-    72,
-    73,
-    74,
-    75,
-    76,
-    77,
-    78,
-    79,
-    80,
-    81,
-    82,
-    83,
+/// and five codes no D3D9 format uses: one device per format, so the list
+/// stays short. The unknown codes are deliberate, the gaps D3D9 leaves
+/// between its depth formats and one far outside any range.
+const AUTO_DEPTH_FORMATS: [u32; 19] = [
+    D3DFMT_D16_LOCKABLE,
+    D3DFMT_D32,
+    D3DFMT_D15S1,
+    D3DFMT_D24S8,
+    D3DFMT_D24X8,
+    D3DFMT_D24X4S4,
+    D3DFMT_D16,
+    D3DFMT_D32F_LOCKABLE,
+    D3DFMT_D24FS8,
+    D3DFMT_D32_LOCKABLE,
     D3DFMT_INTZ,
+    D3DFMT_DF16,
+    D3DFMT_DF24,
+    D3DFMT_A8R8G8B8,
+    72,
+    74,
+    76,
+    78,
+    0x00FF_00FF,
 ];
-
-fn auto_depth_candidates() -> impl Iterator<Item = u32> {
-    AUTO_DEPTH_FORMATS
-        .into_iter()
-        .chain([D3DFMT_DF16, D3DFMT_DF24, D3DFMT_A8R8G8B8, 0x00FF_00FF])
-}
 
 /// Whether the depth answers accept `format` as the auto depth-stencil of an X8R8G8B8 back buffer.
 fn auto_depth_advertised(h: &Harness, format: u32, samples: u32) -> bool {
@@ -465,8 +470,8 @@ fn auto_depth_advertised(h: &Harness, format: u32, samples: u32) -> bool {
 ///
 /// Single-sampled for every candidate, and at four samples for every one the
 /// device multisamples an X8R8G8B8 back buffer at, so a depth format the
-/// multisample query refuses (the readable FOURCC ones) is refused there
-/// too.
+/// multisample query refuses (`INTZ` and the lockable ones) is refused there
+/// too, and one it accepts (`DF16` and `DF24` among them) is created.
 #[test]
 fn create_device_auto_depth_agrees_with_the_depth_answers() {
     let h = Harness::factory_only();
@@ -474,8 +479,8 @@ fn create_device_auto_depth_agrees_with_the_depth_answers() {
         h.check_device_multi_sample_type(D3DFMT_X8R8G8B8, 1, D3DMULTISAMPLE_4_SAMPLES)
             .0,
     );
-    let mut sweep = Sweep::default();
-    for format in auto_depth_candidates() {
+    let mut sweep = Sweep::new();
+    for format in AUTO_DEPTH_FORMATS {
         for samples in [D3DMULTISAMPLE_NONE, D3DMULTISAMPLE_4_SAMPLES] {
             if samples != D3DMULTISAMPLE_NONE && !multisample {
                 continue;
@@ -503,8 +508,8 @@ fn reset_auto_depth_agrees_with_the_depth_answers() {
         h.check_device_multi_sample_type(D3DFMT_X8R8G8B8, 1, D3DMULTISAMPLE_4_SAMPLES)
             .0,
     );
-    let mut sweep = Sweep::default();
-    for format in auto_depth_candidates() {
+    let mut sweep = Sweep::new();
+    for format in AUTO_DEPTH_FORMATS {
         for samples in [D3DMULTISAMPLE_NONE, D3DMULTISAMPLE_4_SAMPLES] {
             if samples != D3DMULTISAMPLE_NONE && !multisample {
                 continue;
@@ -640,6 +645,69 @@ fn lockable_depth_formats_serve_depth_without_the_lock() {
         drop(texture);
         let (hr, _) = h.try_create_texture(64, 64, 1, 0, format, D3DPOOL_DEFAULT);
         assert_eq!(hr, D3DERR_INVALIDCALL, "{name} plain depth texture");
+    }
+}
+
+/// A 4x swap chain takes DF16 and DF24 as its auto depth-stencil and depth-tests through it.
+///
+/// The multisample query accepts both formats, so the auto depth-stencil of
+/// a multisampled swap chain may be either. As an attachment it is never
+/// sampled, so it is a plain multisampled depth: a nearer quad stays in
+/// front of a farther one drawn after it.
+#[test]
+fn a_multisampled_swap_chain_depth_tests_through_df16_and_df24() {
+    let probe = Harness::factory_only();
+    if !succeeded(
+        probe
+            .check_device_multi_sample_type(D3DFMT_X8R8G8B8, 1, D3DMULTISAMPLE_4_SAMPLES)
+            .0,
+    ) {
+        return;
+    }
+    for format in [D3DFMT_DF16, D3DFMT_DF24] {
+        assert_eq!(
+            probe
+                .check_device_multi_sample_type(format, 1, D3DMULTISAMPLE_4_SAMPLES)
+                .0,
+            D3D_OK,
+            "{} at four samples",
+            format_name(format)
+        );
+    }
+    drop(probe);
+    for format in [D3DFMT_DF16, D3DFMT_DF24] {
+        let name = format_name(format);
+        let h = Harness::create(&HarnessConfig {
+            depth_format: Some(format),
+            multi_sample_type: D3DMULTISAMPLE_4_SAMPLES,
+            ..HarnessConfig::default()
+        });
+        assert_eq!(h.set_render_state(D3DRS_LIGHTING, 0), D3D_OK);
+        assert_eq!(h.clear_texture(0), D3D_OK);
+        h.select_diffuse_stage(0);
+        assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE), D3D_OK);
+        assert_eq!(h.set_render_state(D3DRS_ZENABLE, 1), D3D_OK);
+        assert_eq!(h.set_render_state(D3DRS_ZWRITEENABLE, 1), D3D_OK);
+        assert_eq!(h.set_render_state(D3DRS_ZFUNC, D3DCMP_LESS), D3D_OK);
+        h.render_once(BLACK, |d| {
+            assert_eq!(
+                d.clear(D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, BLACK, 1.0, 0),
+                D3D_OK
+            );
+            assert_eq!(
+                d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad(GREEN, 0.25)),
+                D3D_OK
+            );
+            assert_eq!(
+                d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad(RED, 0.75)),
+                D3D_OK
+            );
+        });
+        assert_eq!(
+            h.read_pixel(320, 240),
+            GREEN,
+            "{name}: the multisampled auto depth-stencil keeps the nearer quad"
+        );
     }
 }
 

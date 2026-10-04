@@ -2269,10 +2269,15 @@ extern "system" fn surface_lock_rect(
                 .flags
                 .contains(SurfaceFlags::OWNS_PARENT_TEXTURE)
         {
-            mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
-                "IDirect3DSurface9::LockRect on a level of a non-dynamic D3DPOOL_DEFAULT \
-                 texture (a depth-stencil texture included, lockable depth format or not) → \
-                 INVALIDCALL");
+            if tex.is_depth_format() {
+                mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+                    "IDirect3DSurface9::LockRect on a level of a depth texture (a lockable \
+                     depth format included: no CPU copy of depth is kept) → INVALIDCALL");
+            } else {
+                mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+                    "IDirect3DSurface9::LockRect on a level of a non-dynamic D3DPOOL_DEFAULT \
+                     texture → INVALIDCALL");
+            }
             return D3DERR_INVALIDCALL;
         }
         mtld3d_shared::crumb!(

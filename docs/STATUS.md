@@ -280,14 +280,15 @@ is in [`CONFORMANCE.md`](../unix/conformance/CONFORMANCE.md#kept-divergences).
   opaque white reads as opaque black under `D3DTADDRESS_BORDER`; D3D9
   returns the colour the game set. No knob.
 - `ATI1` creates as a 2D texture in every pool and as an offscreen plain
-  surface in every pool a plain surface takes, while every format query answers `D3DERR_NOTAVAILABLE` for it, and its
-  lock reports the BC4 block pitch rather than the pitch D3D9 reports for
-  the format. No knob.
-- `D16_LOCKABLE` and `D32F_LOCKABLE` create as the auto depth-stencil and
-  as a depth-stencil texture, on a 32-bit float depth, while every depth
-  query answers `D3DERR_NOTAVAILABLE` for them: a `LockRect` of the depth
-  surface fails, warned once. A standalone depth-stencil surface in either
-  format is refused, as before. No knob.
+  surface in every pool a plain surface takes, while every format query
+  answers `D3DERR_NOTAVAILABLE` for it, and its lock reports the BC4 block
+  pitch rather than the pitch D3D9 reports for the format. No knob.
+- `D16_LOCKABLE` and `D32F_LOCKABLE` create as the auto depth-stencil and as
+  a depth-stencil texture, on a 32-bit float depth, while every depth query
+  answers `D3DERR_NOTAVAILABLE` for them: a `LockRect` of the depth surface
+  fails, warned once. They are single-sampled; a multisampled swap chain
+  refuses them, as `CheckDeviceMultiSampleType` does. A standalone
+  depth-stencil surface in either format is refused, as before. No knob.
 - `CreateDevice` and `Reset` accept any back-buffer format and present a
   BGRA8 back buffer for every one but A8R8G8B8 and X8R8G8B8, which
   `GetDesc` then reports as X8R8G8B8, where D3D9 refuses a format outside

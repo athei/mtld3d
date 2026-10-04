@@ -907,12 +907,11 @@ extern "system" fn d3d9_check_device_type(
     // the device-restricted answer: where the packed 16-bit formats are
     // expansion-backed, a 16-bit back buffer is refused here as well, and an
     // engine picks X8R8G8B8 the way hardware without 16-bit render targets
-    // made it. `CreateDevice` stays lenient and substitutes the BGRA8 layer
-    // format for a 16-bit request (`warn_unsupported_backbuffer_format`).
-    // Only a D3D9 back-buffer format is offered at all, so a title probing for
-    // its back buffer lands on one even where the device would render into a
-    // wider format; `CreateDevice` and `Reset` substitute BGRA8 for any
-    // format they are handed (`warn_unsupported_backbuffer_format`).
+    // made it. Only a D3D9 back-buffer format is offered at all, so a title
+    // probing for its back buffer lands on one even where the device would
+    // render into a wider format. `CreateDevice` and `Reset` stay lenient and
+    // substitute the BGRA8 layer format for any format they are handed
+    // (`warn_unsupported_backbuffer_format`).
     let expand_packed16 = d3d.config().expand_packed16;
     let presentable = mtld3d_core::format::is_back_buffer_format(effective_bb, windowed != 0)
         && is_render_target_format_on_device(effective_bb, expand_packed16)
