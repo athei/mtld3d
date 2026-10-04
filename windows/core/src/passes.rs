@@ -4921,13 +4921,14 @@ impl PassState {
     ///
     /// Exposed so the encoder wrapper can dedup against the *resolved*
     /// rect — when scissor test is disabled, the rect falls back to the
-    /// current viewport, which can change mid-pass.
+    /// current viewport, which can change mid-pass. With the test on, an
+    /// empty rect stays empty and the draw writes no pixel.
     ///
     /// `rect` arrives in the game's coordinate space and comes back in the
     /// bound texture's, so the dedup upstream compares post-conversion rects.
     #[must_use]
     pub fn resolved_scissor_rect(&self, test_enable: bool, rect: [u32; 4]) -> (u32, u32, u32, u32) {
-        if test_enable && rect[2] != 0 && rect[3] != 0 {
+        if test_enable {
             self.target_extent()
                 .rect(rect[0], rect[1], rect[2], rect[3])
         } else {

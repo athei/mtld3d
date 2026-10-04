@@ -628,6 +628,38 @@ fn an_unbounded_scissor_rect_scissors_nothing_away() {
 }
 
 #[test]
+fn an_empty_scissor_rect_lets_nothing_through() {
+    // With the test on, a rect of no area (or an inverted one) scissors
+    // every pixel away, for a draw and for a `Clear` alike.
+    let h = Harness::new();
+    arm_diffuse(&h);
+    for rect in [
+        D3DRECT {
+            x1: 100,
+            y1: 100,
+            x2: 100,
+            y2: 300,
+        },
+        D3DRECT {
+            x1: 300,
+            y1: 300,
+            x2: 100,
+            y2: 100,
+        },
+    ] {
+        draw_scissored(&h, rect);
+        assert_eq!(h.read_pixel(200, 200), BLACK, "the draw is scissored away");
+        h.render_once(BLACK, |d| {
+            assert_eq!(d.set_scissor_rect(&rect), 0, "SetScissorRect");
+            assert_eq!(d.set_render_state(D3DRS_SCISSORTESTENABLE, 1), 0);
+            assert_eq!(d.clear_target(GREEN), 0, "scissored clear");
+            assert_eq!(d.set_render_state(D3DRS_SCISSORTESTENABLE, 0), 0);
+        });
+        assert_eq!(h.read_pixel(200, 200), BLACK, "the clear is scissored away");
+    }
+}
+
+#[test]
 fn cull_mode_discriminates_winding() {
     let h = Harness::new();
     arm_diffuse(&h);

@@ -9876,12 +9876,11 @@ extern "system" fn device_clear(
     }
 
     // Clear also honours D3DRS_SCISSORTESTENABLE: when on, every cleared
-    // region is additionally clipped to the (non-degenerate) device scissor
-    // rect. Resolved on the API thread; the encoder then clips ∩ viewport.
+    // region is additionally clipped to the device scissor rect, and an empty
+    // scissor clears nothing. Resolved on the API thread; the encoder then
+    // clips ∩ viewport.
+    let scissor_on = dev.render_state(D3DRS_SCISSORTESTENABLE as usize) != 0;
     let scissor = mtld3d_core::render_state::scissor_region(dev.scissor_rect());
-    let scissor_on = dev.render_state(D3DRS_SCISSORTESTENABLE as usize) != 0
-        && scissor.2 > scissor.0
-        && scissor.3 > scissor.1;
 
     // D3D9 Clear's pRects/Count semantics, shared by every plane:
     //  - pRects == NULL  → clear the whole target (Count ignored). With the
@@ -9891,7 +9890,14 @@ extern "system" fn device_clear(
     // `None` is the whole target; `Some` is an explicit list, already clipped
     // to the scissor and possibly empty.
     let regions: Option<Vec<(i32, i32, i32, i32)>> = if rects.is_null() {
-        scissor_on.then(|| vec![scissor])
+        scissor_on.then(|| {
+            let (x1, y1, x2, y2) = scissor;
+            if x2 > x1 && y2 > y1 {
+                vec![scissor]
+            } else {
+                Vec::new()
+            }
+        })
     } else {
         let mut list = if count > 0 {
             clear_target_rects(count, rects)
