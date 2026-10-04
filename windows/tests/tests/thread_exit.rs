@@ -39,8 +39,8 @@ const THREADS: usize = 64;
 /// does is incidental: a change of a few bytes in the length of
 /// `MTLD3D_CONFIG` or of the environment turns it on or off, so on i686 the
 /// count is anywhere from 4 to 9, and the same over 32 threads as over 128;
-/// on x86_64 it was 4 with and without the Intel keys. A quarter of `THREADS`
-/// sits well above that and well below a leak.
+/// on `x86_64` it was 4 with and without the Intel keys. A quarter of
+/// `THREADS` sits well above that and well below a leak.
 const MAX_DISTINCT_ADDRESSES: usize = THREADS / 4;
 
 #[test]
