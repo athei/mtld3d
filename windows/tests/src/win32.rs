@@ -87,6 +87,9 @@ unsafe extern "system" {
         counters: *mut ProcessMemoryCounters,
         size: u32,
     ) -> i32;
+    fn VirtualAlloc(address: *mut c_void, size: usize, kind: u32, protect: u32) -> *mut c_void;
+    fn VirtualProtect(address: *mut c_void, size: usize, protect: u32, old: *mut u32) -> i32;
+    fn VirtualFree(address: *mut c_void, size: usize, kind: u32) -> i32;
 }
 
 #[link(name = "gdi32")]
@@ -103,6 +106,17 @@ const MEM_COMMIT: u32 = 0x1000;
 const MEM_RESERVE: u32 = 0x2000;
 /// `MEM_FREE`: the region belongs to no allocation.
 const MEM_FREE: u32 = 0x1_0000;
+/// `MEM_RELEASE`: `VirtualFree` gives back the whole reservation.
+const MEM_RELEASE: u32 = 0x8000;
+/// `PAGE_NOACCESS`: any access to the page faults.
+const PAGE_NOACCESS: u32 = 0x01;
+/// `PAGE_READWRITE`.
+const PAGE_READWRITE: u32 = 0x04;
+/// Span of the readable part and of the guard of a [`GuardedSlice`].
+///
+/// 16 KiB, so the guard starts on a page boundary whether the host maps 4 KiB
+/// or 16 KiB pages.
+const GUARD_SPAN: usize = 16 * 1024;
 
 static FAILURE_EXIT_HOOK: Once = Once::new();
 
@@ -136,6 +150,85 @@ pub fn install_failure_exit_hook() {
             unsafe { TerminateProcess(process, TEST_FAILURE_EXIT_CODE) };
         }));
     });
+}
+
+/// A copy of a slice that ends where a no-access page begins.
+///
+/// Reading one byte past the copy faults, so a test can pin that a call reads
+/// no more of an application's array than the API promises it may.
+pub struct GuardedSlice<T: Copy> {
+    base: *mut c_void,
+    data: *const T,
+    len: usize,
+}
+
+impl<T: Copy> GuardedSlice<T> {
+    /// Copy `items` so that their last byte is the last readable one.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `items` exceed 16 KiB, are not a multiple of `T`'s alignment
+    /// long, or the allocation or protection change fails.
+    #[must_use]
+    pub fn new(items: &[T]) -> Self {
+        let bytes = size_of_val(items);
+        assert!(bytes <= GUARD_SPAN, "a guarded slice holds at most 16 KiB");
+        assert!(
+            bytes.is_multiple_of(align_of::<T>()),
+            "the copy ends on the guard, so its start keeps T's alignment"
+        );
+        // SAFETY: kernel32 export; a fresh reservation of two spans, committed
+        // read-write, at an address the system picks.
+        let base = unsafe {
+            VirtualAlloc(
+                core::ptr::null_mut(),
+                2 * GUARD_SPAN,
+                MEM_COMMIT | MEM_RESERVE,
+                PAGE_READWRITE,
+            )
+        };
+        assert!(!base.is_null(), "VirtualAlloc of a guarded slice failed");
+        // SAFETY: the guard span lies inside the reservation just made.
+        let guard = unsafe { base.cast::<u8>().add(GUARD_SPAN) };
+        let mut old = 0;
+        // SAFETY: kernel32 export; the second span of the reservation above.
+        let ok = unsafe {
+            VirtualProtect(
+                guard.cast::<c_void>(),
+                GUARD_SPAN,
+                PAGE_NOACCESS,
+                &raw mut old,
+            )
+        };
+        assert!(ok != 0, "VirtualProtect of the guard span failed");
+        // SAFETY: `bytes <= GUARD_SPAN`, so the copy starts inside the first span.
+        let data = unsafe { guard.sub(bytes) }.cast::<T>();
+        // SAFETY: `data` addresses `bytes` writable bytes, aligned for `T`
+        // (the reservation is page-aligned and `bytes` a multiple of the
+        // alignment), disjoint from `items`.
+        unsafe { core::ptr::copy_nonoverlapping(items.as_ptr(), data, items.len()) };
+        Self {
+            base,
+            data,
+            len: items.len(),
+        }
+    }
+
+    /// The copy, ending at the guard.
+    #[must_use]
+    pub const fn as_slice(&self) -> &[T] {
+        // SAFETY: `new` wrote `len` initialized items at `data`, which stay
+        // mapped read-write until `drop` releases the reservation.
+        unsafe { core::slice::from_raw_parts(self.data, self.len) }
+    }
+}
+
+impl<T: Copy> Drop for GuardedSlice<T> {
+    fn drop(&mut self) {
+        // SAFETY: kernel32 export; `base` is the reservation `new` made, released once.
+        let ok = unsafe { VirtualFree(self.base, 0, MEM_RELEASE) };
+        assert!(ok != 0, "VirtualFree of a guarded slice failed");
+    }
 }
 
 /// This process's address space by region state, and its peak working set, in bytes.

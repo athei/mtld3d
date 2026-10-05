@@ -5,12 +5,13 @@
 //! (count, step rate, and the non-indexed exemption), and state-block capture
 //! of stream bindings and frequencies.
 
-use mtld3d_tests::{DrawIndexedUpParams, Harness, PosVertex};
+use mtld3d_tests::{DrawIndexedUpParams, GuardedSlice, Harness, PosVertex, assert_pixel_approx};
 use mtld3d_types::{
     D3D_OK, D3DDECL_END_STREAM, D3DDECLTYPE_D3DCOLOR, D3DDECLTYPE_FLOAT3, D3DDECLTYPE_UNUSED,
     D3DDECLUSAGE_COLOR, D3DDECLUSAGE_POSITION, D3DDECLUSAGE_TEXCOORD, D3DERR_INVALIDCALL,
-    D3DFMT_INDEX16, D3DPOOL_DEFAULT, D3DPT_TRIANGLELIST, D3DSBT_ALL, D3DSTREAMSOURCE_INDEXEDDATA,
-    D3DSTREAMSOURCE_INSTANCEDATA, D3DUSAGE_DYNAMIC, D3DUSAGE_WRITEONLY, D3DVERTEXELEMENT9,
+    D3DFMT_INDEX16, D3DPOOL_DEFAULT, D3DPT_TRIANGLEFAN, D3DPT_TRIANGLELIST, D3DSBT_ALL,
+    D3DSTREAMSOURCE_INDEXEDDATA, D3DSTREAMSOURCE_INSTANCEDATA, D3DUSAGE_DYNAMIC,
+    D3DUSAGE_WRITEONLY, D3DVERTEXELEMENT9, D3DVIEWPORT9,
 };
 
 const RED: u32 = 0xFFFF_0000;
@@ -18,8 +19,6 @@ const GREEN: u32 = 0xFF00_FF00;
 const BLUE: u32 = 0xFF00_00FF;
 
 /// `vs_2_0`: `dcl_position v0; dcl_texcoord v2; mov oPos, v0; mov oD0, v2;`
-///
-/// The crossing attribute supplies the visible color, so merely declaring it is insufficient.
 const VS_POS_COLOR_TEXCOORD: [u32; 14] = [
     0xFFFE_0200,
     (31) | (2 << 24),
@@ -162,6 +161,16 @@ const fn centered_triangle() -> [PosVertex; 3] {
     ]
 }
 
+/// A position and a colour, 16 bytes, the stride the short-stride tests bind.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct PackedVertex {
+    x: f32,
+    y: f32,
+    z: f32,
+    color: u32,
+}
+
 /// A declaration split across two streams reaches a programmable VS intact.
 ///
 /// Position comes from stream 0, the diffuse colour from stream 1 (a
@@ -273,15 +282,6 @@ fn sparse_declared_streams_preserve_missing_binding_behavior() {
 /// read every vertex past the first from the wrong offset.
 #[test]
 fn stride_below_an_unconsumed_decl_tail_still_fetches_vertices() {
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    struct PackedVertex {
-        x: f32,
-        y: f32,
-        z: f32,
-        color: u32,
-    }
-
     // POSITION @0 and COLOR @12 are consumed by VS_POS_COLOR; the TEXCOORD0
     // FLOAT3 tail at 16..28 is not, and the bound buffer does not carry it.
     let elements = [
@@ -340,47 +340,22 @@ fn stride_below_an_unconsumed_decl_tail_still_fetches_vertices() {
 
 /// Crossing attributes render from dynamic and released static backing, offsets and UP data.
 ///
-/// The shader reads color at byte 28 while position steps every 16 bytes. Prefix
-/// vertices, a nonzero stream offset and start/base indices keep the addressing honest.
-/// A fourth vertex supplies the last crossing color; UP capture must retain it too.
+/// The shader reads color at byte 28 while position steps every 16 bytes, so
+/// each vertex shows the next one's colour field. Prefix vertices, a nonzero
+/// stream offset and start/base indices keep the addressing honest: the
+/// vertex before the drawn ones carries red, which a crossing binding that
+/// dropped the stream offset would read. A UP draw supplies only its own
+/// vertices, so the last one's crossing colour reads zero.
 #[test]
 fn stride_below_a_consumed_attribute_still_places_the_triangle() {
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    struct PackedVertex {
-        x: f32,
-        y: f32,
-        z: f32,
-        color: u32,
-    }
-    let elements = [
-        element(0, D3DDECLTYPE_FLOAT3, D3DDECLUSAGE_POSITION),
-        D3DVERTEXELEMENT9 {
-            stream: 0,
-            offset: 28,
-            type_: D3DDECLTYPE_D3DCOLOR,
-            method: 0,
-            usage: D3DDECLUSAGE_TEXCOORD,
-            usage_index: 0,
-        },
-        end(),
-    ];
     let h = Harness::new();
-    let decl = h.create_vertex_declaration(&elements);
+    let decl = h.create_vertex_declaration(&crossing_color_elements());
     let vs = h.create_vertex_shader(&VS_POS_COLOR_TEXCOORD);
     let ps = h.create_pixel_shader(&PS_DIFFUSE);
     assert_eq!(h.set_vertex_declaration(&decl), 0);
     assert_eq!(h.set_vertex_shader(&vs), 0);
     assert_eq!(h.set_pixel_shader(&ps), 0);
-    let mut packed: Vec<PackedVertex> = centered_triangle()
-        .iter()
-        .map(|p| PackedVertex {
-            x: p.x,
-            y: p.y,
-            z: p.z,
-            color: GREEN,
-        })
-        .collect();
+    let mut packed = packed_triangle(GREEN).to_vec();
     packed.push(PackedVertex {
         x: 5.0,
         y: 5.0,
@@ -399,6 +374,7 @@ fn stride_below_a_consumed_attribute_still_places_the_triangle() {
             2
         ];
         with_prefix.extend_from_slice(&packed);
+        with_prefix[2].color = RED;
         let vb = h.create_vertex_buffer(stride * 6, usage, 0, D3DPOOL_DEFAULT);
         vb.lock(0, 0, 0).write(with_prefix.as_slice());
         assert_eq!(h.set_stream_source(0, &vb, stride, stride), D3D_OK);
@@ -429,12 +405,9 @@ fn stride_below_a_consumed_attribute_still_places_the_triangle() {
         );
     }
     h.render_once(BLUE, |d| {
-        assert_eq!(
-            d.draw_primitive_up(D3DPT_TRIANGLELIST, 1, packed.as_slice()),
-            0
-        );
+        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &packed[..3]), 0);
     });
-    assert_eq!(h.read_pixel(320, 280), GREEN, "UP last crossing color");
+    assert_last_crossing_color_reads_zero(&h, "UP");
     let mut indexed = vec![
         PackedVertex {
             x: 5.0,
@@ -444,7 +417,7 @@ fn stride_below_a_consumed_attribute_still_places_the_triangle() {
         };
         2
     ];
-    indexed.extend_from_slice(&packed);
+    indexed.extend_from_slice(&packed[..3]);
     h.render_once(BLUE, |d| {
         assert_eq!(
             d.draw_indexed_primitive_up(
@@ -461,26 +434,36 @@ fn stride_below_a_consumed_attribute_still_places_the_triangle() {
             0
         );
     });
-    assert_eq!(
-        h.read_pixel(320, 280),
-        GREEN,
-        "indexed UP crossing tail and nonzero minimum"
-    );
+    assert_last_crossing_color_reads_zero(&h, "indexed UP with a nonzero minimum");
     let mut large = Vec::new();
     for _ in 0..90 {
         large.extend_from_slice(&packed[..3]);
     }
-    large.push(packed[3]);
     h.render_once(BLUE, |d| {
         assert_eq!(
             d.draw_primitive_up(D3DPT_TRIANGLELIST, 90, large.as_slice()),
             0
         );
     });
-    assert_eq!(
-        h.read_pixel(320, 280),
+    assert_last_crossing_color_reads_zero(&h, "oversized UP through the upload ring");
+}
+
+/// Read a centred triangle near its first and its last vertex.
+///
+/// The first vertex's crossing colour is green; the last one's lies past the
+/// vertices a UP draw supplies and reads zero, which shows as black.
+fn assert_last_crossing_color_reads_zero(h: &Harness, context: &str) {
+    assert_pixel_approx(
+        h.read_pixel(320, 130) | 0xFF00_0000,
         GREEN,
-        "oversized UP crossing color through the upload ring"
+        0x30,
+        &format!("{context}: near the first vertex"),
+    );
+    assert_pixel_approx(
+        h.read_pixel(170, 355) | 0xFF00_0000,
+        0xFF00_0000,
+        0x30,
+        &format!("{context}: near the last vertex"),
     );
 }
 
@@ -562,7 +545,7 @@ fn crossing_instance_stream_keeps_its_divisor_and_constant_step() {
     let colors = h.create_vertex_buffer(24, D3DUSAGE_WRITEONLY, 0, D3DPOOL_DEFAULT);
     colors
         .lock(0, 0, 0)
-        .write(&[BLUE, BLUE, BLUE, BLUE, GREEN, GREEN]);
+        .write(&[BLUE, BLUE, BLUE, BLUE, RED, GREEN]);
     assert_eq!(h.set_stream_source(0, &pos, 0, 12), 0);
     assert_eq!(h.set_stream_source(1, &colors, 0, 4), 0);
     assert_eq!(
@@ -572,7 +555,9 @@ fn crossing_instance_stream_keeps_its_divisor_and_constant_step() {
     let ib = h.create_index_buffer(6, D3DUSAGE_WRITEONLY, D3DFMT_INDEX16, D3DPOOL_DEFAULT);
     ib.lock(0, 0, 0).write(&[0u16, 1, 2]);
     assert_eq!(h.set_indices(&ib), 0);
-    for rate in [2, 0] {
+    // Three instances at one place, the last on top: at divisor 2 it reads
+    // element 1, a Constant stream element 0.
+    for (rate, expected) in [(2, GREEN), (0, RED)] {
         assert_eq!(
             h.set_stream_source_freq(1, D3DSTREAMSOURCE_INSTANCEDATA | rate),
             0
@@ -586,11 +571,187 @@ fn crossing_instance_stream_keeps_its_divisor_and_constant_step() {
             });
             assert_eq!(
                 h.read_pixel(320, 280),
-                GREEN,
+                expected,
                 "crossing instance color with rate {rate}"
             );
         }
     }
+}
+
+/// The position at byte 0 and a colour read at byte 28 of a 16-byte vertex.
+const fn crossing_color_elements() -> [D3DVERTEXELEMENT9; 3] {
+    [
+        element(0, D3DDECLTYPE_FLOAT3, D3DDECLUSAGE_POSITION),
+        D3DVERTEXELEMENT9 {
+            stream: 0,
+            offset: 28,
+            type_: D3DDECLTYPE_D3DCOLOR,
+            method: 0,
+            usage: D3DDECLUSAGE_TEXCOORD,
+            usage_index: 0,
+        },
+        end(),
+    ]
+}
+
+/// The centred triangle with every colour field set to `color`.
+fn packed_triangle(color: u32) -> [PackedVertex; 3] {
+    centered_triangle().map(|p| PackedVertex {
+        x: p.x,
+        y: p.y,
+        z: p.z,
+        color,
+    })
+}
+
+/// Each UP draw reads no byte past the vertices it supplies.
+///
+/// D3D9 promises `count * stride` readable bytes behind the pointer, and the
+/// vertices here end where a no-access page begins. The last vertex's
+/// crossing colour lies past them, so it reads zero instead of faulting, for
+/// `DrawPrimitiveUP` as a list and as a fan and for `DrawIndexedPrimitiveUP`.
+#[test]
+fn up_draws_read_no_vertex_past_the_ones_they_supply() {
+    let h = Harness::new();
+    let decl = h.create_vertex_declaration(&crossing_color_elements());
+    let vs = h.create_vertex_shader(&VS_POS_COLOR_TEXCOORD);
+    let ps = h.create_pixel_shader(&PS_DIFFUSE);
+    assert_eq!(h.set_vertex_declaration(&decl), 0);
+    assert_eq!(h.set_vertex_shader(&vs), 0);
+    assert_eq!(h.set_pixel_shader(&ps), 0);
+    let guarded = GuardedSlice::new(&packed_triangle(GREEN));
+    for prim in [D3DPT_TRIANGLELIST, D3DPT_TRIANGLEFAN] {
+        h.render_once(BLUE, |d| {
+            assert_eq!(d.draw_primitive_up(prim, 1, guarded.as_slice()), 0);
+        });
+        assert_last_crossing_color_reads_zero(&h, &format!("DrawPrimitiveUP type {prim}"));
+    }
+    h.render_once(BLUE, |d| {
+        assert_eq!(
+            d.draw_indexed_primitive_up(
+                &DrawIndexedUpParams {
+                    prim: D3DPT_TRIANGLELIST,
+                    min_vertex_index: 0,
+                    num_vertices: 3,
+                    prim_count: 1,
+                    index_format: D3DFMT_INDEX16,
+                },
+                &[0u16, 1, 2],
+                guarded.as_slice()
+            ),
+            0
+        );
+    });
+    assert_last_crossing_color_reads_zero(&h, "DrawIndexedPrimitiveUP");
+}
+
+/// A later `Lock` in the frame leaves an indexed crossing draw its vertices.
+///
+/// The draw reads a `Staged` buffer through an index buffer, so it records
+/// its read range as reaching the end of the buffer. The crossing colour
+/// widens a finite range but must leave that one alone: a range cut to the
+/// crossing tail (the first 16 bytes) would miss the `Lock` of bytes 16 to 64
+/// that follows, which then reaches the earlier draw.
+#[test]
+fn a_staged_indexed_crossing_draw_keeps_its_vertices_from_a_later_lock() {
+    let h = Harness::new();
+    let decl = h.create_vertex_declaration(&crossing_color_elements());
+    let vs = h.create_vertex_shader(&VS_POS_COLOR_TEXCOORD);
+    let ps = h.create_pixel_shader(&PS_DIFFUSE);
+    assert_eq!(h.set_vertex_declaration(&decl), 0);
+    assert_eq!(h.set_vertex_shader(&vs), 0);
+    assert_eq!(h.set_pixel_shader(&ps), 0);
+    let stride = stride_of::<PackedVertex>();
+    let mut vertices = packed_triangle(GREEN).to_vec();
+    vertices.push(PackedVertex {
+        x: 5.0,
+        y: 5.0,
+        z: 0.0,
+        color: GREEN,
+    });
+    let vb = h.create_vertex_buffer(stride * 4, D3DUSAGE_WRITEONLY, 0, D3DPOOL_DEFAULT);
+    vb.lock(0, 0, 0).write(vertices.as_slice());
+    let ib = h.create_index_buffer(6, D3DUSAGE_WRITEONLY, D3DFMT_INDEX16, D3DPOOL_DEFAULT);
+    ib.lock(0, 0, 0).write(&[0u16, 1, 2]);
+    assert_eq!(h.set_stream_source(0, &vb, 0, stride), D3D_OK);
+    assert_eq!(h.set_indices(&ib), 0);
+    h.render_once(BLUE, |d| {
+        let viewport = |x| D3DVIEWPORT9 {
+            x,
+            y: 0,
+            width: 200,
+            height: 480,
+            min_z: 0.0,
+            max_z: 1.0,
+        };
+        assert_eq!(d.set_viewport(&viewport(0)), D3D_OK);
+        assert_eq!(
+            d.draw_indexed_primitive(D3DPT_TRIANGLELIST, 0, 0, 3, 0, 1),
+            0
+        );
+        for vertex in &mut vertices[1..] {
+            vertex.color = RED;
+        }
+        vb.lock(stride, 3 * stride, 0).write(&vertices[1..]);
+        assert_eq!(d.set_viewport(&viewport(220)), D3D_OK);
+        assert_eq!(
+            d.draw_indexed_primitive(D3DPT_TRIANGLELIST, 0, 0, 3, 0, 1),
+            0
+        );
+    });
+    assert_eq!(
+        h.read_pixel(100, 280),
+        GREEN,
+        "the earlier draw keeps the colours it was drawn with"
+    );
+    assert_eq!(
+        h.read_pixel(320, 280),
+        RED,
+        "the refill reaches the later draw"
+    );
+}
+
+/// A stream offset off a four-byte boundary still draws when nothing crosses.
+///
+/// Neither `SetStreamSource` nor the draw rejects such an offset, and only
+/// the extra binding of an attribute past its stride is held to Metal's
+/// alignment.
+#[test]
+fn a_stream_offset_off_a_four_byte_boundary_still_draws() {
+    let h = Harness::new();
+    let decl = h.create_vertex_declaration(&[
+        element(0, D3DDECLTYPE_FLOAT3, D3DDECLUSAGE_POSITION),
+        D3DVERTEXELEMENT9 {
+            stream: 0,
+            offset: 12,
+            type_: D3DDECLTYPE_D3DCOLOR,
+            method: 0,
+            usage: D3DDECLUSAGE_COLOR,
+            usage_index: 0,
+        },
+        end(),
+    ]);
+    let vs = h.create_vertex_shader(&VS_POS_COLOR);
+    let ps = h.create_pixel_shader(&PS_DIFFUSE);
+    assert_eq!(h.set_vertex_declaration(&decl), 0);
+    assert_eq!(h.set_vertex_shader(&vs), 0);
+    assert_eq!(h.set_pixel_shader(&ps), 0);
+    let stride = stride_of::<PackedVertex>();
+    let mut bytes = vec![0u8; 2];
+    for vertex in packed_triangle(GREEN) {
+        bytes.extend_from_slice(&vertex.x.to_le_bytes());
+        bytes.extend_from_slice(&vertex.y.to_le_bytes());
+        bytes.extend_from_slice(&vertex.z.to_le_bytes());
+        bytes.extend_from_slice(&vertex.color.to_le_bytes());
+    }
+    let length = u32::try_from(bytes.len()).expect("a small buffer");
+    let vb = h.create_vertex_buffer(length, D3DUSAGE_WRITEONLY, 0, D3DPOOL_DEFAULT);
+    vb.lock(0, 0, 0).write(bytes.as_slice());
+    assert_eq!(h.set_stream_source(0, &vb, 2, stride), D3D_OK);
+    h.render_once(BLUE, |d| {
+        assert_eq!(d.draw_primitive(D3DPT_TRIANGLELIST, 0, 1), 0);
+    });
+    assert_eq!(h.read_pixel(320, 280), GREEN, "drawn from offset 2");
 }
 
 /// A zero stride feeds every vertex the element at the stream offset.
