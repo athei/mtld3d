@@ -12,6 +12,16 @@
 //! configuration carries, which is how `make bench BENCH_CONFIG=...` tries
 //! other options against the same frames.
 //!
+//! The warm-up draws the base workload alone, for at least
+//! [`WARM_UP_FRAMES`] and until a readback of the back buffer shows its
+//! draws. With the cache off the base shaders are new too. When no earlier
+//! benchmark in the process has built them and Metal's own compiler cache
+//! does not hold them, their builds take tens of milliseconds, longer than
+//! the fixed warm-up and the measured frames together, and a layer that
+//! leaves draws out while their builds are in flight would then run the
+//! measured frames without the base draws, which a game whose scene has
+//! been on screen for a while never does.
+//!
 //! The measured frames are the `MEASURED_FRAMES` that introduce shaders.
 //! Base frames follow until [`IDLE_TAIL`] has passed without a new shader
 //! and a `PERF=1` build has written one whole summary window inside the span
@@ -59,6 +69,10 @@ const CELLS_PER_ROW: u32 = TARGET_EDGE / CELL_EDGE;
 /// Draws of the base program each frame, so a frame without a new shader is not empty.
 const BASE_DRAWS: u32 = 50;
 const WARM_UP_FRAMES: u32 = 30;
+/// The longest the warm-up waits for the base draws to show before the run fails.
+const WARM_UP_LIMIT: Duration = Duration::from_secs(10);
+/// The colour every frame clears the back buffer to, as `0x00RRGGBB`.
+const CLEAR_RGB: u32 = 0x0020_3040;
 const MEASURED_FRAMES: u32 = 200;
 /// Time without a new shader before the run ends.
 const IDLE_TAIL: Duration = Duration::from_secs(2);
@@ -117,12 +131,24 @@ fn stutter(name: &str, per_frame: u32, offscreen: u32) {
         ..HarnessConfig::default()
     });
     let mut bench = Stutter::new(&h);
-    for _ in 0..WARM_UP_FRAMES {
+    let warming = TscClock::now();
+    let mut warm_up_frames = 0;
+    let mut base_shown = false;
+    while warm_up_frames < WARM_UP_FRAMES || !base_shown {
         assert!(h.pump(), "WM_QUIT during warm-up");
         bench.base_frame();
         ok(h.end_scene(), "EndScene");
+        if !base_shown {
+            base_shown = bench.base_shown();
+            assert!(
+                base_shown || TscClock::since(warming) < WARM_UP_LIMIT,
+                "the base draws never showed in {WARM_UP_LIMIT:?} of warm-up"
+            );
+        }
         ok(h.present(), "Present");
+        warm_up_frames += 1;
     }
+    let warm_up = TscClock::since(warming);
 
     let log = LayerLog::find(since);
     let warm = MemorySample::now();
@@ -175,7 +201,8 @@ fn stutter(name: &str, per_frame: u32, offscreen: u32) {
         "shape: back buffer {WIDTH}x{HEIGHT}, {BASE_DRAWS} base draws per frame, \
          shaderCache.enable=false\n\
          new pixel shaders per frame: {per_frame} on the back buffer{offscreen}\n\
-         warm-up: {WARM_UP_FRAMES} frames without new shaders\n\
+         warm-up: {warm_up_frames} frames without new shaders in {warm_up:.2?}, at least \
+         {WARM_UP_FRAMES} and until the base draws showed\n\
          measured: {frames} frames in {elapsed:.2?}, {shaders} new shaders; then \
          {settle_frames} settle frames, {span:.2?} in all\n\
          frame time (Present to Present): {row}\n\
@@ -251,6 +278,18 @@ fn stutter(name: &str, per_frame: u32, offscreen: u32) {
         Class::Info,
     );
     metrics.metric("span.ms", Value::Ms(span), Direction::Lower, Class::Info);
+    metrics.metric(
+        "warmup.frames",
+        Value::Count(u64::from(warm_up_frames)),
+        Direction::Lower,
+        Class::Info,
+    );
+    metrics.metric(
+        "warmup.ms",
+        Value::Ms(warm_up),
+        Direction::Lower,
+        Class::Info,
+    );
     metrics.metric(
         "verify.frames",
         Value::Count(u64::from(verified.attempts)),
@@ -373,7 +412,12 @@ impl<'h> Stutter<'h> {
         let h = self.h;
         ok(h.begin_scene(), "BeginScene");
         ok(
-            h.clear(D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, 0xFF20_3040, 1.0, 0),
+            h.clear(
+                D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER,
+                0xFF00_0000 | CLEAR_RGB,
+                1.0,
+                0,
+            ),
             "clear",
         );
         ok(h.set_pixel_shader(&self.base_ps), "base PS");
@@ -401,6 +445,30 @@ impl<'h> Stutter<'h> {
             }
             ok(h.set_render_target(0, &self.back_buffer), "back buffer");
         }
+    }
+
+    /// Whether a readback of the back buffer shows anything but the clear colour.
+    ///
+    /// Called between a warm-up frame's base draws and its `Present`, when
+    /// only those draws can have changed a pixel.
+    fn base_shown(&self) -> bool {
+        let h = self.h;
+        let sysmem =
+            h.create_offscreen_plain_surface(WIDTH, HEIGHT, D3DFMT_X8R8G8B8, D3DPOOL_SYSTEMMEM);
+        ok(
+            h.get_render_target_data_hr(&self.back_buffer, &sysmem),
+            "back buffer readback",
+        );
+        let locked = sysmem.lock_rect(D3DLOCK_READONLY);
+        let pitch = usize::try_from(locked.pitch()).expect("positive pitch") / 4;
+        let width = usize::try_from(WIDTH).expect("width fits usize");
+        let rows = usize::try_from(HEIGHT).expect("height fits usize");
+        let pixels = locked.as_u32(pitch * rows);
+        pixels.chunks(pitch).any(|row| {
+            row[..width]
+                .iter()
+                .any(|&pixel| pixel & 0x00FF_FFFF != CLEAR_RGB)
+        })
     }
 
     /// Draw every new shader into its cleared probe cell until each cell shows it.
