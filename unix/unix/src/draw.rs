@@ -1801,7 +1801,9 @@ fn emit_draw_view(
 /// wider than its stride, or an advanced offset Metal refuses): `layouts`
 /// then step each crossing stream by its extent, as a draw did before
 /// crossing attributes had bindings, and the draw fetches wrong data rather
-/// than none; its streams bind at the offsets the application set.
+/// than none; its streams bind at the offsets the application set. A draw
+/// whose streams only sit off a four-byte boundary has no crossing attribute
+/// and never takes that path.
 #[cold]
 #[inline(never)]
 fn crossing_fetch(
@@ -1847,7 +1849,8 @@ fn crossing_fetch(
         Err(error) => {
             mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
                 "vertex attribute past its stream stride has no binding of its own ({error:?}): \
-                 layout widened to the consumed extent, the draw fetches wrong data");
+                 layout widened to the consumed extent, the draw fetches wrong data, and a \
+                 stream offset off a four-byte boundary binds as set and draws nothing");
             enc.keep_crossing_fetch(fetch);
             // The stride a draw had before crossing attributes had bindings;
             // a UP draw here still reads past its payload's last vertex, as

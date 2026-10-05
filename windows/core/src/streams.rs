@@ -335,9 +335,11 @@ pub fn advanced_binding_offset(base: u32, advance: u32, len: u64) -> Result<u32,
 /// other draw never builds one. Holds the remapped attributes and layouts the
 /// pipeline is built from and, per Metal slot, the stream and byte advance
 /// the draw binds there (at [`slot_binding_offset`]). Every attribute read
-/// from a shifted stream sits its stream's shift further into its slot, so
-/// it may end up to 3 bytes past the stride, which Metal fetches as
-/// addressed. It remembers what it was built from, so the next draw over the
+/// from a shifted stream sits its stream's shift further into its slot, at a
+/// descriptor offset that is not a multiple of 4 and possibly ending up to 3
+/// bytes past the stride. This relies on Metal fetching such an attribute as
+/// addressed, which Apple-silicon GPUs do; Intel and AMD GPUs are unverified.
+/// It remembers what it was built from, so the next draw over the
 /// same declaration record, layouts and shifts reuses it (see
 /// [`Self::reuse_or_rebuild`]).
 pub struct CrossingFetch {
@@ -432,7 +434,10 @@ impl CrossingFetch {
     /// Remap `attrs` over `layouts` into this fetch and move them by `shifts`.
     ///
     /// Which attributes cross is decided on the application's offsets; the
-    /// shift then moves every attribute its slot's stream feeds.
+    /// shift then moves every attribute its slot's stream feeds, to an offset
+    /// that is not a multiple of 4 and may end up to 3 bytes past the stride.
+    /// Metal fetches both as addressed on Apple-silicon GPUs; Intel and AMD
+    /// GPUs are unverified.
     ///
     /// # Panics
     ///
