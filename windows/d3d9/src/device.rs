@@ -12051,10 +12051,7 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
         let decl_ptr = dev.vertex_decl();
         let (resolved, vdecl_hash, ff_vs_layout) = if decl_ptr.is_null() {
             let (elements, _fvf_stride) = fvf_to_elements(fvf);
-            // With no declaration bound `fvf` is 0, since the FVF is the bound
-            // declaration's, so the layout reads an omitted COLORVERTEX source
-            // as 0, as a declaration does.
-            let layout = convert::ff_vs_layout_from_elements(&elements, fvf == 0);
+            let layout = convert::ff_vs_layout_from_elements(&elements);
             // Pre-transformed (POSITIONT/XYZRHW) layouts bypass a bound VS —
             // D3D9 runs the FF pre-transformed path regardless, even when a
             // VS is still bound — so the attrs must resolve for the FF VS too.
@@ -12070,7 +12067,7 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
             // SAFETY: non-null check passed; refcount holds it live.
             let decl = unsafe { &*decl_ptr };
             let elements = decl.inner().elements();
-            let layout = convert::ff_vs_layout_from_elements(elements, fvf == 0);
+            let layout = convert::ff_vs_layout_from_elements(elements);
             // See the FVF arm: POSITIONT bypasses a bound VS.
             let resolved = if bound_vertex_shader.is_null() || layout.has_rhw() {
                 resolve_attrs_for_ff(elements, &decl.inner().passthrough())

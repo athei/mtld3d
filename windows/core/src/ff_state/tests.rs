@@ -317,9 +317,9 @@ fn tci_indices_preserved_past_colorop_disable_terminator() {
 /// stream lacks does not.
 #[test]
 fn tex_coord_count_covers_routed_and_generated_stages_past_colorop_disable() {
-    use mtld3d_types::D3DTOP_DISABLE;
-    const CAMERASPACEPOSITION: u32 = 2 << 16;
-    const CAMERASPACENORMAL: u32 = 1 << 16;
+    use mtld3d_types::{
+        D3DTOP_DISABLE, D3DTSS_TCI_CAMERASPACENORMAL, D3DTSS_TCI_CAMERASPACEPOSITION,
+    };
     let one_set = |flags| FfVsLayout {
         flags,
         tex_coord_count: 1,
@@ -353,18 +353,18 @@ fn tex_coord_count_covers_routed_and_generated_stages_past_colorop_disable() {
         "stage 1 routed to an absent set"
     );
     assert_eq!(
-        count(&[(2, CAMERASPACEPOSITION | 5)], plain),
+        count(&[(2, D3DTSS_TCI_CAMERASPACEPOSITION | 5)], plain),
         3,
         "position texgen needs no set"
     );
     assert_eq!(
-        count(&[(1, CAMERASPACENORMAL | 1)], plain),
-        1,
-        "normal texgen without a normal passes an absent set through"
+        count(&[(1, D3DTSS_TCI_CAMERASPACENORMAL | 1)], plain),
+        2,
+        "normal texgen without a normal generates from a zero normal"
     );
     assert_eq!(
         count(
-            &[(1, CAMERASPACENORMAL | 1)],
+            &[(1, D3DTSS_TCI_CAMERASPACENORMAL | 1)],
             one_set(FfVsLayoutFlags::HAS_NORMAL)
         ),
         2,
@@ -372,11 +372,11 @@ fn tex_coord_count_covers_routed_and_generated_stages_past_colorop_disable() {
     );
     let rhw = one_set(FfVsLayoutFlags::HAS_RHW);
     assert_eq!(
-        count(&[(1, CAMERASPACEPOSITION | 1)], rhw),
+        count(&[(1, D3DTSS_TCI_CAMERASPACEPOSITION | 1)], rhw),
         1,
         "pre-transformed texgen passes an absent set through"
     );
-    assert_eq!(count(&[(1, CAMERASPACEPOSITION)], rhw), 2);
+    assert_eq!(count(&[(1, D3DTSS_TCI_CAMERASPACEPOSITION)], rhw), 2);
 }
 
 /// `D3DRS_NORMALIZENORMALS` reaches the key for every draw that reads the eye normal.
@@ -386,11 +386,11 @@ fn tex_coord_count_covers_routed_and_generated_stages_past_colorop_disable() {
 /// normal, keeps the bit clear so the render state does not fork its shader.
 #[test]
 fn normalize_normals_flag_follows_every_eye_normal_reader() {
-    use mtld3d_types::{D3DRS_LIGHTING, D3DRS_NORMALIZENORMALS};
-    const CAMERASPACENORMAL: u32 = 1 << 16;
-    const CAMERASPACEREFLECTIONVECTOR: u32 = 3 << 16;
-    const SPHEREMAP: u32 = 4 << 16;
-    const CAMERASPACEPOSITION: u32 = 2 << 16;
+    use mtld3d_types::{
+        D3DRS_LIGHTING, D3DRS_NORMALIZENORMALS, D3DTSS_TCI_CAMERASPACENORMAL,
+        D3DTSS_TCI_CAMERASPACEPOSITION, D3DTSS_TCI_CAMERASPACEREFLECTIONVECTOR,
+        D3DTSS_TCI_SPHEREMAP,
+    };
     let layout = |flags| FfVsLayout {
         flags,
         tex_coord_count: 1,
@@ -409,15 +409,22 @@ fn normalize_normals_flag_follows_every_eye_normal_reader() {
     };
     assert!(flag(1, 0, normal), "lit");
     assert!(!flag(0, 0, normal), "unlit passthru reads no normal");
-    for tci in [CAMERASPACENORMAL, CAMERASPACEREFLECTIONVECTOR, SPHEREMAP] {
+    for tci in [
+        D3DTSS_TCI_CAMERASPACENORMAL,
+        D3DTSS_TCI_CAMERASPACEREFLECTIONVECTOR,
+        D3DTSS_TCI_SPHEREMAP,
+    ] {
         assert!(
             flag(0, tci, normal),
             "unlit texgen {tci:#x} reads the normal"
         );
     }
-    assert!(!flag(0, CAMERASPACEPOSITION, normal), "position texgen");
     assert!(
-        !flag(0, SPHEREMAP, layout(FfVsLayoutFlags::empty())),
+        !flag(0, D3DTSS_TCI_CAMERASPACEPOSITION, normal),
+        "position texgen"
+    );
+    assert!(
+        !flag(0, D3DTSS_TCI_SPHEREMAP, layout(FfVsLayoutFlags::empty())),
         "no vertex normal"
     );
 }
@@ -1194,14 +1201,126 @@ fn resolve_vertex_blend_count_decl_mismatch_falls_back() {
         super::resolve_vertex_blend_count(1, layout_no_blend, false),
         0
     );
-    // Game enables INDEXED but decl has no BLENDINDICES → 0.
-    let layout_weights_only = FfVsLayout {
-        declared_weights_count: 2,
-        ..layout_no_blend
-    };
+    // D3DVBF_0WEIGHTS without indexed blending → 0.
     assert_eq!(
-        super::resolve_vertex_blend_count(2, layout_weights_only, true),
+        super::resolve_vertex_blend_count(256, layout_no_blend, false),
         0
+    );
+}
+
+/// `D3DRS_INDEXEDVERTEXBLENDENABLE` without a BLENDINDICES element blends sequentially.
+///
+/// The weighted modes read the matrices from 0 up, as with indexed blending
+/// off, rather than dropping blending for the single world matrix; the key
+/// carries no indexed flag the emitter would read absent indices through.
+#[test]
+fn indexed_blending_without_indices_blends_the_sequential_matrices() {
+    use mtld3d_types::{D3DRS_INDEXEDVERTEXBLENDENABLE, D3DRS_VERTEXBLEND, D3DVBF_2WEIGHTS};
+
+    use crate::dxso::FfVsFlags;
+    let weights_only = FfVsLayout {
+        flags: FfVsLayoutFlags::empty(),
+        tex_coord_count: 0,
+        tex_coord_dims: [0; 8],
+        declared_weights_count: 2,
+    };
+    let mut states = rs();
+    states[D3DRS_VERTEXBLEND as usize] = D3DVBF_2WEIGHTS;
+    states[D3DRS_INDEXEDVERTEXBLENDENABLE as usize] = 1;
+    let key = FfState::new().build_vs_key(&states, weights_only, 0, [0; 8]);
+    assert_eq!(
+        key.vertex_blend_count, 3,
+        "two weights and the implicit third"
+    );
+    assert!(!key.flags.contains(FfVsFlags::VERTEX_BLEND_INDEXED));
+
+    let with_indices = FfVsLayout {
+        flags: FfVsLayoutFlags::DECLARED_INDICES,
+        ..weights_only
+    };
+    let key = FfState::new().build_vs_key(&states, with_indices, 0, [0; 8]);
+    assert_eq!(key.vertex_blend_count, 3);
+    assert!(key.flags.contains(FfVsFlags::VERTEX_BLEND_INDEXED));
+}
+
+/// A light whose `D3DLIGHT9::Type` is none of POINT, SPOT and DIRECTIONAL lights nothing.
+///
+/// `SetLight` keeps it and `GetLight` reports it back, enabled or not, at a
+/// fast-path index and past the eight slots alike, but the key gets no
+/// active slot for it and the light section packs nothing.
+#[test]
+fn a_light_of_no_valid_type_contributes_nothing() {
+    use mtld3d_types::{D3DCOLORVALUE, D3DLIGHT9, D3DRS_LIGHTING};
+    let white = D3DCOLORVALUE {
+        r: 1.0,
+        g: 1.0,
+        b: 1.0,
+        a: 1.0,
+    };
+    let light = D3DLIGHT9 {
+        type_: 4,
+        diffuse: white,
+        range: 100.0,
+        attenuation0: 1.0,
+        ..D3DLIGHT9::default()
+    };
+    let mut state = FfState::new();
+    for index in [0, 9] {
+        state.set_light_at(index, &light);
+        state.set_light_enabled_at(index, true);
+        assert_eq!(state.get_light_at(index).map(|l| l.type_), Some(4));
+        assert!(state.is_light_enabled_at(index));
+    }
+    let mut states = rs();
+    states[D3DRS_LIGHTING as usize] = 1;
+    let layout = FfVsLayout {
+        flags: FfVsLayoutFlags::HAS_NORMAL,
+        tex_coord_count: 0,
+        tex_coord_dims: [0; 8],
+        declared_weights_count: 0,
+    };
+    let key = state.build_vs_key(&states, layout, 0, [0; 8]);
+    assert_eq!(key.light_active_mask, 0);
+    assert_eq!(FfState::lights_section_rows(&key), 0);
+}
+
+/// Lit-only render states leave an unlit key, and unreached stages leave every key.
+///
+/// `D3DRS_SPECULARENABLE`, `D3DRS_COLORVERTEX` and the four material
+/// sources fork no unlit shader, and the TCI and texture-transform flags of
+/// a stage at or past the key's coordinate count fork none at all.
+#[test]
+fn unread_vs_state_leaves_the_key() {
+    use mtld3d_types::{
+        D3DMCS_COLOR2, D3DRS_COLORVERTEX, D3DRS_DIFFUSEMATERIALSOURCE, D3DRS_LIGHTING,
+        D3DRS_SPECULARENABLE, D3DTTFF_COUNT2,
+    };
+    let layout = FfVsLayout {
+        flags: FfVsLayoutFlags::HAS_NORMAL,
+        tex_coord_count: 1,
+        tex_coord_dims: [2, 0, 0, 0, 0, 0, 0, 0],
+        declared_weights_count: 0,
+    };
+    let mut unlit_default = rs();
+    unlit_default[D3DRS_LIGHTING as usize] = 0;
+    let base = FfState::new().build_vs_key(&unlit_default, layout, 0b1, [0; 8]);
+    assert_eq!(base.tex_coord_count, 1);
+
+    let mut unlit = unlit_default;
+    unlit[D3DRS_SPECULARENABLE as usize] = 1;
+    unlit[D3DRS_COLORVERTEX as usize] = 0;
+    unlit[D3DRS_DIFFUSEMATERIALSOURCE as usize] = D3DMCS_COLOR2;
+    let mut stale = FfState::new();
+    stale.set_texture_stage_state(1, D3DTSS_TEXTURETRANSFORMFLAGS as usize, D3DTTFF_COUNT2);
+    stale.set_texture_stage_state(5, D3DTSS_TEXCOORDINDEX as usize, 3);
+    assert_eq!(stale.build_vs_key(&unlit, layout, 0b1, [0; 8]), base);
+
+    // Lit, the same states are read and key their shader.
+    let mut lit = unlit;
+    lit[D3DRS_LIGHTING as usize] = 1;
+    assert_ne!(
+        FfState::new().build_vs_key(&lit, layout, 0b1, [0; 8]),
+        FfState::new().build_vs_key(&rs(), layout, 0b1, [0; 8])
     );
 }
 
@@ -1399,6 +1518,12 @@ fn contiguous_index0_light_packing_is_byte_identical() {
                 b: 0.75,
                 a: 1.0,
             },
+            specular: D3DCOLORVALUE {
+                r: 0.0,
+                g: 0.0,
+                b: 0.0,
+                a: 0.5,
+            },
             position: D3DVECTOR {
                 x: 4.0,
                 y: 5.0,
@@ -1423,8 +1548,9 @@ fn contiguous_index0_light_packing_is_byte_identical() {
     let data = unsafe { read_section_rows(ptr, 6) };
     // Position row: world == eye under identity view; POINT type-w = 1.
     assert_row_eq(data[0], [4.0, 5.0, 6.0, 1.0], "position row");
-    // Diffuse color row (row base+2).
-    assert_row_eq(data[2], [0.25, 0.5, 0.75, 1.0], "diffuse row");
+    // Diffuse colour row (row base+2), carrying the specular alpha in .w:
+    // the specular sum reads it there, and the diffuse alpha is dead.
+    assert_row_eq(data[2], [0.25, 0.5, 0.75, 0.5], "diffuse row");
     // Attenuation row (row base+4): a0, a1, a2, range.
     assert_row_eq(data[4], [1.0, 0.1, 0.01, 100.0], "attenuation row");
 }
@@ -2703,7 +2829,9 @@ fn walk_ff_writes(light_indices: &[u32], mut rng: u64) {
         D3DTS_PROJECTION,
         D3DTS_TEXTURE0 + 1,
     ];
-    const LIGHT_TYPES: [u32; 5] = [0, 1, 2, 3, 4];
+    // Zero and 4 store a light that lights nothing; the valid types come
+    // three times so the walk still spends time past the eight active lights.
+    const LIGHT_TYPES: [u32; 11] = [0, 1, 2, 3, 1, 2, 3, 1, 2, 3, 4];
     let mut next = |bound: usize| {
         rng = rng
             .wrapping_mul(6_364_136_223_846_793_005)
@@ -2755,7 +2883,10 @@ fn walk_ff_writes(light_indices: &[u32], mut rng: u64) {
             .iter()
             .filter(|&&index| {
                 state.is_light_enabled_at(index)
-                    && state.get_light_at(index).is_some_and(|l| l.type_ != 0)
+                    && state.get_light_at(index).is_some_and(|l| {
+                        (mtld3d_types::D3DLIGHT_POINT..=mtld3d_types::D3DLIGHT_DIRECTIONAL)
+                            .contains(&l.type_)
+                    })
             })
             .count();
         if enabled > super::MAX_ACTIVE_LIGHTS as usize {
@@ -2872,4 +3003,104 @@ fn texture_stage_state_indices_clamp_into_the_table() {
             "{stage}/{ty}"
         );
     }
+}
+
+/// State on a stage past the first `D3DTOP_DISABLE` leaves the pixel key.
+///
+/// The operations, arguments, result register, bound texture and projected
+/// flag of stages the cascade never reaches key nothing, so two devices that
+/// differ only there build equal keys, with the cascade ending where the VS
+/// key ends it.
+#[test]
+fn ps_key_ignores_stages_past_the_first_disable() {
+    use mtld3d_types::{
+        D3DTA_TEMP, D3DTOP_ADD, D3DTOP_SELECTARG1, D3DTSS_ALPHAARG1, D3DTSS_COLORARG1,
+        D3DTSS_RESULTARG, D3DTTFF_COUNT3, D3DTTFF_PROJECTED,
+    };
+    let leftover = |ff: &mut FfState, stage: usize| {
+        for (ty, value) in [
+            (D3DTSS_COLOROP, D3DTOP_ADD),
+            (D3DTSS_COLORARG1, D3DTA_TEXTURE),
+            (D3DTSS_ALPHAOP, D3DTOP_SELECTARG1),
+            (D3DTSS_ALPHAARG1, D3DTA_TEXTURE),
+            (D3DTSS_RESULTARG, D3DTA_TEMP),
+            (
+                D3DTSS_TEXTURETRANSFORMFLAGS,
+                D3DTTFF_COUNT3 | D3DTTFF_PROJECTED,
+            ),
+        ] {
+            ff.set_texture_stage_state(stage, ty as usize, value);
+        }
+    };
+    // Stage 1 keeps its default DISABLE, so stages 1..8 are past the cascade.
+    let mut plain = FfState::new();
+    plain.set_texture_stage_state(0, D3DTSS_COLOROP as usize, D3DTOP_MODULATE);
+    let mut stale = FfState::new();
+    stale.set_texture_stage_state(0, D3DTSS_COLOROP as usize, D3DTOP_MODULATE);
+    // Stage 1's own arguments and flags, and the whole of stage 2.
+    stale.set_texture_stage_state(1, D3DTSS_COLORARG1 as usize, D3DTA_TEXTURE);
+    stale.set_texture_stage_state(
+        1,
+        D3DTSS_TEXTURETRANSFORMFLAGS as usize,
+        D3DTTFF_COUNT3 | D3DTTFF_PROJECTED,
+    );
+    leftover(&mut stale, 2);
+    assert_eq!(
+        plain.build_ps_key(&rs(), 0b001),
+        stale.build_ps_key(&rs(), 0b111),
+        "stages 1.. past stage 1's DISABLE"
+    );
+}
+
+/// The same state before the first `D3DTOP_DISABLE` keys a different pixel shader.
+#[test]
+fn ps_key_keeps_stages_before_the_first_disable() {
+    use mtld3d_types::{D3DTOP_ADD, D3DTTFF_COUNT3, D3DTTFF_PROJECTED};
+    let mut plain = FfState::new();
+    plain.set_texture_stage_state(0, D3DTSS_COLOROP as usize, D3DTOP_MODULATE);
+    let mut changed = FfState::new();
+    changed.set_texture_stage_state(0, D3DTSS_COLOROP as usize, D3DTOP_ADD);
+    assert_ne!(
+        plain.build_ps_key(&rs(), 0b1),
+        changed.build_ps_key(&rs(), 0b1),
+        "stage 0's operation"
+    );
+    let mut projected = FfState::new();
+    projected.set_texture_stage_state(0, D3DTSS_COLOROP as usize, D3DTOP_MODULATE);
+    projected.set_texture_stage_state(
+        0,
+        D3DTSS_TEXTURETRANSFORMFLAGS as usize,
+        D3DTTFF_COUNT3 | D3DTTFF_PROJECTED,
+    );
+    let key = projected.build_ps_key(&rs(), 0b1);
+    assert_eq!(key.tt_projected_mask, 0b1, "stage 0's projected bit");
+    assert_ne!(plain.build_ps_key(&rs(), 0b1), key);
+    assert_ne!(
+        plain.build_ps_key(&rs(), 0b0),
+        plain.build_ps_key(&rs(), 0b1),
+        "stage 0's bound texture"
+    );
+}
+
+/// A `D3DTOP_DISABLE` on stage 0 ends the cascade before any stage, which keys nothing past it.
+#[test]
+fn ps_key_with_stage_zero_disabled_keys_no_stage_state() {
+    use mtld3d_types::{
+        D3DTOP_ADD, D3DTOP_DISABLE, D3DTSS_COLORARG1, D3DTTFF_COUNT2, D3DTTFF_PROJECTED,
+    };
+    let mut plain = FfState::new();
+    plain.set_texture_stage_state(0, D3DTSS_COLOROP as usize, D3DTOP_DISABLE);
+    let mut stale = FfState::new();
+    stale.set_texture_stage_state(0, D3DTSS_COLOROP as usize, D3DTOP_DISABLE);
+    stale.set_texture_stage_state(0, D3DTSS_COLORARG1 as usize, D3DTA_TEXTURE);
+    stale.set_texture_stage_state(
+        0,
+        D3DTSS_TEXTURETRANSFORMFLAGS as usize,
+        D3DTTFF_COUNT2 | D3DTTFF_PROJECTED,
+    );
+    stale.set_texture_stage_state(1, D3DTSS_COLOROP as usize, D3DTOP_ADD);
+    let key = stale.build_ps_key(&rs(), 0b11);
+    assert_eq!(plain.build_ps_key(&rs(), 0), key);
+    assert_eq!(key.tt_projected_mask, 0);
+    assert_eq!(key.sampled_stage_mask(), 0);
 }

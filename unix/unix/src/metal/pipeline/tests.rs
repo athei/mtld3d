@@ -65,7 +65,7 @@ fn ff_blend_pipeline_builds(
     states[D3DRS_VERTEXBLEND as usize] = D3DVBF_1WEIGHTS;
     states[D3DRS_INDEXEDVERTEXBLENDENABLE as usize] = u32::from(indexed);
     let ff = FfState::new();
-    let layout = ff_vs_layout_from_elements(elements, true);
+    let layout = ff_vs_layout_from_elements(elements);
     let passthrough = rhw_passthrough(elements);
     let vs_key = ff.build_vs_key(&states, layout, 0, passthrough);
     assert!(vs_key.vertex_blend_count > 0 && vs_key.declared_indices());
@@ -248,7 +248,7 @@ fn a_pretransformed_layout_builds_a_pipeline_with_each_sm3_input() {
         element(128, D3DDECLTYPE_FLOAT4, D3DDECLUSAGE_DEPTH),
         element(144, D3DDECLTYPE_D3DCOLOR, D3DDECLUSAGE_COLOR),
     ];
-    let layout = ff_vs_layout_from_elements(&elements, true);
+    let layout = ff_vs_layout_from_elements(&elements);
     let vs_key = FfState::new().build_vs_key(
         &render_state_defaults(),
         layout,

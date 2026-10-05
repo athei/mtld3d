@@ -117,23 +117,26 @@ bitflags::bitflags! {
         /// maps `(screen_x, screen_y)` through the viewport dimensions into
         /// clip space.
         const HAS_RHW = 1 << 4;
-        /// `D3DRS_COLORVERTEX` — gates the material-source override.
+        /// `D3DRS_COLORVERTEX`, which gates the material-source override.
         ///
         /// When clear, the resolver ignores `*_source` and always reads
-        /// from the material constant.
+        /// from the material constant. Canonicalized at key build: only set
+        /// on a lit draw, the one branch that reads it.
         const COLOR_VERTEX = 1 << 5;
         /// `D3DRS_SPECULARENABLE`.
         ///
         /// Gates per-light Blinn-Phong specular emission into `color1`; when
         /// clear, a lit `color1` is the vertex specular colour, or zero
-        /// without one.
+        /// without one. Canonicalized at key build: only set on a lit draw,
+        /// since the unlit `color1` is the vertex specular colour either way.
         const SPECULAR_ENABLE = 1 << 6;
         /// `D3DRS_INDEXEDVERTEXBLENDENABLE`: the world-matrix index source.
         ///
         /// When set, per-vertex BLENDINDICES select world matrices from
         /// `world_palette[idx[i]]`; when clear, sequential matrices
-        /// `world_palette[0..count]` are used. Indexed mode also requires
-        /// `DECLARED_INDICES` to be set.
+        /// `world_palette[0..count]` are used. Only set when the declaration
+        /// carries BLENDINDICES (`DECLARED_INDICES`): without them the
+        /// render state blends the sequential matrices.
         const VERTEX_BLEND_INDEXED = 1 << 7;
         /// Vertex declaration has a BLENDINDICES element.
         ///
@@ -150,12 +153,10 @@ bitflags::bitflags! {
         // Bit 10 was DIFFUSE_DECLARED_UNBOUND: a COLOR0 on a stream nothing
         // feeds now reaches the shader as zeros through the stream's
         // constant layout, so the plain HAS_COLOR0 path covers it.
-        /// The vertex format came from `SetVertexDeclaration`, not `SetFVF`.
-        ///
-        /// A COLORVERTEX material source pointing at a vertex colour the
-        /// declaration omits reads 0, whereas FVF falls back to the material
-        /// colour.
-        const USES_VERTEX_DECL = 1 << 11;
+        // Bit 11 was USES_VERTEX_DECL: a COLORVERTEX material source naming
+        // a colour the vertex format omits takes the material colour under a
+        // declaration as under an FVF, so the source of the format no longer
+        // reaches the shader.
         /// `D3DRS_NORMALIZENORMALS` is enabled.
         ///
         /// The FF VS then renormalizes the eye-space normal that lighting and
@@ -204,7 +205,8 @@ pub struct FfVsKey {
     pub tex_coord_count: u8,
     /// Bit `i` set iff slot `i`'s `D3DLIGHT9` contributes to FF VS shading.
     ///
-    /// I.e. it has non-zero `Type` AND is enabled via `LightEnable(i, TRUE)`.
+    /// I.e. its `Type` is POINT, SPOT or DIRECTIONAL AND it is enabled via
+    /// `LightEnable(i, TRUE)`.
     /// The emitter needs only per-slot activity plus the type masks below, so
     /// the light type is carried as bitmasks rather than a per-slot array.
     pub light_active_mask: u8,
@@ -219,21 +221,25 @@ pub struct FfVsKey {
     pub light_spot_mask: u8,
     /// `D3DRS_DIFFUSEMATERIALSOURCE` (0 = `MCS_MATERIAL`, 1 = `MCS_COLOR1`, 2 = `MCS_COLOR2`).
     ///
-    /// Routed through `resolve_mat` at the diffuse modulation site.
+    /// Routed through `resolve_mat` at the diffuse modulation site. This and
+    /// the other three sources are canonicalized at key build to
+    /// `MCS_MATERIAL` unless `COLOR_VERTEX` is set, the only case that reads
+    /// them.
     pub diffuse_source: u8,
     /// `D3DRS_AMBIENTMATERIALSOURCE`.
     ///
-    /// Routed through `resolve_mat` at the ambient accumulation site.
+    /// Routed through `resolve_mat` at the ambient accumulation site;
+    /// canonicalized as `diffuse_source` is.
     pub ambient_source: u8,
     /// `D3DRS_SPECULARMATERIALSOURCE`.
     ///
-    /// Routed through `resolve_mat` at the specular modulation site in the
-    /// light loop.
+    /// Routed through `resolve_mat` to weight the specular sum after the
+    /// light loop; canonicalized as `diffuse_source` is.
     pub specular_source: u8,
     /// `D3DRS_EMISSIVEMATERIALSOURCE`.
     ///
     /// Routed through `resolve_mat` at the initial `diffuseAccum` emissive
-    /// term.
+    /// term; canonicalized as `diffuse_source` is.
     pub emissive_source: u8,
     /// Vertex fog mode, resolved from the fog render states and `HAS_RHW`.
     ///
@@ -251,7 +257,9 @@ pub struct FfVsKey {
     /// 4 = SPHEREMAP; higher values are undefined and fall back to passthru
     /// with a one-shot warn), the low nibble the input coordinate set
     /// (0..7), the two halves the D3D9 value itself carries. Read them with
-    /// [`FfVsKey::tci_mode`] and [`FfVsKey::tci_set`].
+    /// [`FfVsKey::tci_mode`] and [`FfVsKey::tci_set`]. Canonicalized at key
+    /// build: zero for every stage at or past `tex_coord_count`, which the
+    /// shader writes as a zero coordinate whatever its TCI.
     pub tci: [u8; 8],
     /// The declaration elements a pre-transformed draw passes to the pixel stage by semantic.
     ///
@@ -267,6 +275,9 @@ pub struct FfVsKey {
     /// rule before the per-stage texture matrix multiply.
     pub tex_coord_dims: [u8; 8],
     /// Per-stage texture-transform flags packed: low 3 bits = count, bit 4 = `D3DTTFF_PROJECTED`.
+    ///
+    /// Canonicalized at key build: zero for every stage at or past
+    /// `tex_coord_count`, as `tci` is.
     pub tt_flags: [u8; 8],
     /// Number of world matrices blended per vertex. `0` disables blending.
     ///
@@ -323,11 +334,6 @@ impl FfVsKey {
     #[must_use]
     pub const fn has_color1(&self) -> bool {
         self.flags.contains(FfVsFlags::HAS_COLOR1)
-    }
-    #[inline]
-    #[must_use]
-    pub const fn uses_vertex_decl(&self) -> bool {
-        self.flags.contains(FfVsFlags::USES_VERTEX_DECL)
     }
     #[inline]
     #[must_use]
@@ -1023,7 +1029,7 @@ fn emit_vertex_blend(out: &mut String, vs: &FfVsKey, needs_normal: bool) {
 //   [15..62]  per-light × 8 slots, 6 float4s each (light i at base 15+i*6):
 //     +0  position.xyz, light_type (.w; 0 = disabled)
 //     +1  direction.xyz (eye space, normalized), spot falloff (.w)
-//     +2  diffuse RGBA
+//     +2  diffuse.rgb, specular alpha (.w)
 //     +3  ambient.rgb, spot_offset (.w)
 //     +4  attenuation0/1/2 (.xyz), range (.w)
 //     +5  specular.rgb, spot_scale (.w)
@@ -1209,15 +1215,11 @@ fn emit_vs(out: &mut String, vs: &FfVsKey, entry: &str) {
         && vs.has_normal()
         && vs.specular_enable()
         && vs.light_active_mask != 0;
-    // The eye-space position: texgen reads it for CAMERASPACEPOSITION and
-    // SPHEREMAP always and for CAMERASPACEREFLECTIONVECTOR only with a
-    // vertex normal, since without one that mode falls back to passthru.
-    // Lighting reads it for the vertex-to-light vector of a POINT or SPOT
-    // slot and for the local-viewer `V`.
-    let texgen_reads_pos_eye = (0..active).any(|stage| {
-        let m = vs.tci_mode(stage);
-        m == 2 || m == 4 || (m == 3 && vs.has_normal())
-    });
+    // The eye-space position: texgen reads it for CAMERASPACEPOSITION,
+    // CAMERASPACEREFLECTIONVECTOR and SPHEREMAP. Lighting reads it for the
+    // vertex-to-light vector of a POINT or SPOT slot and for the
+    // local-viewer `V`.
+    let texgen_reads_pos_eye = (0..active).any(|stage| matches!(vs.tci_mode(stage), 2..=4));
     let lit_reads_pos_eye = (vs.lighting_enabled()
         && (vs.light_active_mask & !vs.light_directional_mask) != 0)
         || (lit_specular && vs.local_viewer());
@@ -1332,7 +1334,6 @@ fn emit_vs(out: &mut String, vs: &FfVsKey, entry: &str) {
         mat_flags.set(MatColorFlags::COLOR_VERTEX, vs.color_vertex());
         mat_flags.set(MatColorFlags::HAS_COLOR0, vs.has_color0());
         mat_flags.set(MatColorFlags::HAS_COLOR1, vs.has_color1());
-        mat_flags.set(MatColorFlags::USES_DECL, vs.uses_vertex_decl());
         let mat_diffuse = resolve_mat(vs.diffuse_source, 10, mat_flags);
         let mat_ambient = resolve_mat(vs.ambient_source, 11, mat_flags);
         let mat_specular = resolve_mat(vs.specular_source, 12, mat_flags);
@@ -1369,7 +1370,7 @@ fn emit_vs(out: &mut String, vs: &FfVsKey, entry: &str) {
             "    float4 diffuseAccum = {mat_emissive} + vs_c[9] * {mat_ambient};"
         );
         if vs.specular_enable() {
-            out.push_str("    float3 specAccum = float3(0.0);\n");
+            out.push_str("    float4 specAccum = float4(0.0);\n");
         }
         // Walk active light slots via the bitmask (1 bit per slot, MSB→LSB
         // order is irrelevant since each iteration emits an independent
@@ -1454,28 +1455,36 @@ fn emit_vs(out: &mut String, vs: &FfVsKey, entry: &str) {
             );
             if has_n && vs.specular_enable() {
                 // Blinn-Phong specular: H = normalize(L + V), NdotH = max(0, n·H),
-                // specFactor = NdotH^power (zero when ndotl <= 0). Weighted by
-                // lightSpecular × matSpecular per the D3D9 lighting equation;
-                // rgb only — FF lighting defines no specular alpha.
+                // specFactor = NdotH^power, zero when either N·L or N·H is not
+                // positive: a power of zero would otherwise raise a zero N·H
+                // to one and light a surface turned away from the viewer. The light's
+                // specular colour is the RGB of its specular row and the alpha
+                // its diffuse row carries in `.w`; the material specular weights
+                // the sum after the loop, all four channels.
                 out.push_str("        float3 H = normalize(L + V);\n");
                 out.push_str("        float ndoth = max(0.0, dot(n, H));\n");
                 out.push_str(
-                    "        float specFactor = (ndotl > 0.0) ? pow(ndoth, mat_power) : 0.0;\n",
+                    "        float specFactor = (ndotl > 0.0 && ndoth > 0.0) ? pow(ndoth, mat_power) : 0.0;\n",
                 );
                 let _ = writeln!(
                     out,
-                    "        specAccum += atten * specFactor * (vs_c[{s}].rgb * {mat_specular}.rgb);",
-                    s = base + 5
+                    "        specAccum += atten * specFactor * float4(vs_c[{s}].rgb, vs_c[{d}].w);",
+                    s = base + 5,
+                    d = base + 2
                 );
             }
             let _ = writeln!(out, "    }}");
         }
-        // Saturate and preserve material-diffuse alpha on color0.
-        out.push_str("    float4 lit = saturate(diffuseAccum);\n");
-        let _ = writeln!(out, "    lit.a = {mat_diffuse}.a;");
-        out.push_str("    out.color0 = lit;\n");
+        // The lit alpha is the material diffuse alpha, clamped like the colour.
+        let _ = writeln!(
+            out,
+            "    out.color0 = saturate(float4(diffuseAccum.rgb, {mat_diffuse}.a));"
+        );
         if vs.specular_enable() {
-            out.push_str("    out.color1 = float4(saturate(specAccum), 0.0);\n");
+            let _ = writeln!(
+                out,
+                "    out.color1 = saturate(specAccum * {mat_specular});"
+            );
         } else if vs.has_color1() {
             // With specular lighting off, oD1 is the vertex specular colour,
             // as on the unlit path.
@@ -1523,33 +1532,36 @@ fn emit_vs(out: &mut String, vs: &FfVsKey, entry: &str) {
                 n = input_dim(vs, src);
                 let _ = writeln!(out, "    float4 raw{i} = {};", masked_input_rhs(vs, i, src));
             }
-            1 if vs.has_normal() => {
+            1 => {
+                // A vertex without a normal reads a zero normal.
                 n = 3;
-                let _ = writeln!(out, "    float4 raw{i} = float4(n, 0.0);");
+                if vs.has_normal() {
+                    let _ = writeln!(out, "    float4 raw{i} = float4(n, 0.0);");
+                } else {
+                    let _ = writeln!(out, "    float4 raw{i} = float4(0.0);");
+                }
             }
             2 => {
                 n = 3;
                 let _ = writeln!(out, "    float4 raw{i} = float4(posEye, 0.0);");
             }
-            3 if vs.has_normal() => {
+            3 => {
                 // D3D9 defines R = 2 (E.N) N - E with E the unit vector from
                 // the vertex to the eye. `posEye` is the vertex in camera
                 // space, so `E_tci` = normalize(posEye) points the other way
-                // and R = E_tci - 2 (E_tci.N) N = reflect(E_tci, N).
+                // and R = E_tci - 2 (E_tci.N) N = reflect(E_tci, N). A vertex
+                // without a normal reads a zero normal, which leaves R = E.
                 n = 3;
                 let _ = writeln!(out, "    float4 raw{i};");
                 let _ = writeln!(out, "    {{");
                 out.push_str("        float3 E_tci = normalize(posEye);\n");
-                out.push_str("        float3 R_tci = reflect(E_tci, n);\n");
+                if vs.has_normal() {
+                    out.push_str("        float3 R_tci = reflect(E_tci, n);\n");
+                } else {
+                    out.push_str("        float3 R_tci = E_tci;\n");
+                }
                 let _ = writeln!(out, "        raw{i} = float4(R_tci, 0.0);");
                 let _ = writeln!(out, "    }}");
-            }
-            1 | 3 => {
-                mtld3d_shared::log_once_warn!(target: super::LOG_TARGET,
-                    "dxso FF: TCI mode {mode} needs a vertex normal but none declared → passthru"
-                );
-                n = input_dim(vs, src);
-                let _ = writeln!(out, "    float4 raw{i} = {};", masked_input_rhs(vs, i, src));
             }
             4 => {
                 // Sphere map of the reflection vector R = reflect(E, N), with
@@ -1706,11 +1718,6 @@ bitflags::bitflags! {
         const HAS_COLOR0 = 1 << 1;
         /// The vertex carries a `COLOR1` (specular) channel.
         const HAS_COLOR1 = 1 << 2;
-        /// The draw uses a vertex declaration (not a legacy FVF).
-        ///
-        /// An absent colour reads 0 rather than falling back to the material
-        /// constant.
-        const USES_DECL = 1 << 3;
     }
 }
 
@@ -1718,7 +1725,10 @@ bitflags::bitflags! {
 ///
 /// The field (0 = `MCS_MATERIAL`, 1 = `MCS_COLOR1`, 2 = `MCS_COLOR2`) selects
 /// the expression that feeds the FF lighting math. When `D3DRS_COLORVERTEX` is
-/// false, the override is ignored and the material constant is always used.
+/// false, the override is ignored and the material constant is always used,
+/// and so it is when the vertex format, a declaration or an FVF alike, carries
+/// no colour of the kind the field names. A colour the declaration names on a
+/// stream nothing feeds is carried, and reads zero.
 fn resolve_mat(source: u8, mat_slot: u32, flags: MatColorFlags) -> String {
     if flags.contains(MatColorFlags::COLOR_VERTEX) {
         if source == 1 && flags.contains(MatColorFlags::HAS_COLOR0) {
@@ -1726,12 +1736,6 @@ fn resolve_mat(source: u8, mat_slot: u32, flags: MatColorFlags) -> String {
         }
         if source == 2 && flags.contains(MatColorFlags::HAS_COLOR1) {
             return "in.v3".to_string();
-        }
-        if (source == 1 || source == 2) && flags.contains(MatColorFlags::USES_DECL) {
-            // A vertex declaration that omits the requested COLOR reads 0 — only
-            // the legacy FVF path falls back to the material colour for an
-            // absent vertex colour source.
-            return "float4(0.0)".to_string();
         }
         if source > 2 {
             mtld3d_shared::log_once_warn!(target: super::LOG_TARGET, "dxso FF: unknown material source {source} → MCS_MATERIAL");

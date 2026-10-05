@@ -35,6 +35,7 @@ mod dxt_volume;
 mod dynamic_depth;
 mod expand16;
 mod failure_exits;
+mod ff_vertex_pipeline;
 mod float_filter;
 mod format_agreement;
 mod format_query;
