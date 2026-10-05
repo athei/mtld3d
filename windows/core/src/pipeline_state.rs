@@ -244,10 +244,11 @@ pub struct PipelineSnapshot {
     /// Declaration identity: the FVF code, or the declaration's element hash.
     ///
     /// A draw that binds a stream offset off a four-byte boundary carries
-    /// the hash with its offsets' remainders folded in. Not keyed: the key hashes the resolved attribute list instead, since
-    /// the vertex descriptor is built from it and `stream_layouts` alone, so
-    /// two declarations that resolve alike share a pipeline. The resolve
-    /// memo, the persisted recipe and the build diagnostics read it.
+    /// the hash with its offsets' remainders folded in. Not keyed: the key
+    /// hashes the resolved attribute list instead, since the vertex
+    /// descriptor is built from it and `stream_layouts` alone, so two
+    /// declarations that resolve alike share a pipeline. The resolve memo,
+    /// the persisted recipe and the build diagnostics read it.
     pub vdecl_hash: u64,
     /// Vertex buffer layout per Metal vertex buffer slot.
     ///
