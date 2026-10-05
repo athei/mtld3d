@@ -1709,6 +1709,67 @@ fn vertex_texldl_without_mipmapping_samples_the_texture_lod() {
     disarm_vertex_fetch(&h);
 }
 
+#[test]
+fn two_vertex_texldl_shaders_in_one_frame_each_run_their_own_function() {
+    // Two different `texldl` vertex shaders under a vertex sampler state that
+    // moves the level (a +1 bias) each compile their own function keyed for
+    // the vertex LOD table. Drawn back to back in one frame, the second draw
+    // must run the second shader: it reads its LOD from `c1.x`, the first
+    // from `c0.x`, so each half of the target shows a different level.
+    use mtld3d_tests::PosVertex;
+    use mtld3d_types::D3DVERTEXTEXTURESAMPLER0;
+
+    let h = Harness::new();
+    let tex = mip_tinted_texture(&h);
+    arm_vertex_fetch_at_lod(&h, &tex);
+    assert_eq!(
+        h.set_sampler_state(
+            D3DVERTEXTEXTURESAMPLER0,
+            D3DSAMP_MIPMAPLODBIAS,
+            1.0_f32.to_bits()
+        ),
+        0
+    );
+    let mut from_c1 = VS_FETCH_AT_LOD;
+    // `mov r1.w, c0.x` becomes `mov r1.w, c1.x`.
+    from_c1[24] = 0xA000_0001;
+    let first = h.create_vertex_shader(&VS_FETCH_AT_LOD);
+    let second = h.create_vertex_shader(&from_c1);
+    assert_eq!(
+        h.set_vertex_shader_constant_f(0, &[0.0, 0.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0]),
+        0,
+        "c0.x = 0, c1.x = 2"
+    );
+    let triangle = |dx: f32| {
+        centered_triangle().map(|v| PosVertex {
+            x: v.x.mul_add(0.5, dx),
+            ..v
+        })
+    };
+    let (left, right) = (triangle(-0.5), triangle(0.5));
+    h.render_once(BLACK, |d| {
+        assert_eq!(d.set_vertex_shader(&first), 0, "first VS");
+        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &left), 0);
+        assert_eq!(d.set_vertex_shader(&second), 0, "second VS");
+        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &right), 0);
+    });
+    assert_eq!(
+        h.read_pixel(160, 260),
+        MIP_TINTS[1],
+        "the first shader: LOD 0 plus the bias"
+    );
+    assert_eq!(
+        h.read_pixel(480, 260),
+        MIP_TINTS[3],
+        "the second shader: LOD 2 plus the bias"
+    );
+    assert_eq!(
+        h.set_sampler_state(D3DVERTEXTEXTURESAMPLER0, D3DSAMP_MIPMAPLODBIAS, 0),
+        0
+    );
+    disarm_vertex_fetch(&h);
+}
+
 /// Position, diffuse and one four-component texture coordinate.
 ///
 /// The FVF is `D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1 |
