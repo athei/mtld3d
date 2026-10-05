@@ -124,6 +124,41 @@ fn premultiplied_blend_reads_unmodified_texture_alpha_for_both_channels() {
 }
 
 #[test]
+fn implicit_texture_alpha_blend_without_a_texture_selects_arg2() {
+    use mtld3d_types::{D3DTA_TFACTOR, D3DTOP_BLENDTEXTUREALPHA};
+
+    // No argument names the texture, so the stage keeps its operation and
+    // reads the missing texture's alpha as zero: the result is arg2, for the
+    // colour and the alpha operation alike.
+    let mut ps = default_ps_key();
+    ps.stages[0] = FfStage {
+        color_op: narrow(D3DTOP_BLENDTEXTUREALPHA),
+        color_arg1: narrow(D3DTA_DIFFUSE),
+        color_arg2: narrow(D3DTA_TFACTOR),
+        alpha_op: narrow(D3DTOP_BLENDTEXTUREALPHA),
+        alpha_arg1: narrow(D3DTA_DIFFUSE),
+        alpha_arg2: narrow(D3DTA_TFACTOR),
+        flags: FfStageFlags::empty(),
+    };
+    assert_eq!(ps.sampled_stage_mask(), 0);
+    let missing = emit_ps_ff(&ps, VariantKey::default());
+    assert!(!missing.contains("[[texture(0)]]"), "{missing}");
+    assert!(
+        missing.contains("current = float4((ps_c[0]).rgb, (ps_c[0]).a);"),
+        "{missing}"
+    );
+    assert!(!missing.contains("current.a"), "{missing}");
+
+    // With a texture bound the same stage weighs by the sampled alpha.
+    ps.stages[0].flags.insert(FfStageFlags::HAS_TEXTURE);
+    let bound = emit_ps_ff(&ps, VariantKey::default());
+    assert!(
+        bound.contains("(in.color0 * t0.a + ps_c[0] * (1.0 - t0.a))"),
+        "{bound}"
+    );
+}
+
+#[test]
 fn emits_two_step_wv_then_proj() {
     let vs = default_vs_key();
     let ps = default_ps_key();

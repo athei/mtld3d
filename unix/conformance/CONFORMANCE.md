@@ -600,8 +600,10 @@ argument modifiers and saturation before a following texture stage.
 An implicit-only missing texture uses zero alpha, following the native
 observation recorded in DXVK commit `0b49a39896f25896b83ed01c0609393dfc3bb85c`.
 This is a reference choice, not a new native measurement: Wine's D3D9 GL
-dummy texture uses alpha one. Existing explicit-unbound-argument handling
-and ordinary `BLENDTEXTUREALPHA` behavior remain unchanged.
+dummy texture uses alpha one. The ordinary `BLENDTEXTUREALPHA` follows the
+same rule, so with no texture bound and no argument naming it the stage
+yields its second argument, for colour and alpha alike; wined3d yields the
+first. Existing explicit-unbound-argument handling remains unchanged.
 
 ## What the baseline records — and where classes live
 

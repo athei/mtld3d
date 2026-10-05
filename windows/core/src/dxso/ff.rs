@@ -2208,12 +2208,13 @@ fn apply_op(op: u8, a: &str, b: &str, stage: usize, has_texture: bool) -> String
             format!("({a} * in.color0.a + {b} * (1.0 - in.color0.a))")
         }
         D3DTOP_BLENDTEXTUREALPHA => {
-            let tex = if has_texture {
-                format!("t{stage}")
+            if has_texture {
+                format!("({a} * t{stage}.a + {b} * (1.0 - t{stage}.a))")
             } else {
-                "current".to_string()
-            };
-            format!("({a} * {tex}.a + {b} * (1.0 - {tex}.a))")
+                // Implicit-only missing textures use zero alpha, as in the
+                // premultiplied arm below, so the blend selects arg2.
+                b.to_string()
+            }
         }
         D3DTOP_BLENDTEXTUREALPHAPM => {
             if has_texture {
