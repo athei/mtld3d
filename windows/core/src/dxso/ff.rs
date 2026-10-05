@@ -1994,8 +1994,9 @@ fn emit_ps(out: &mut String, ps: &FfPsKey, variant: VariantKey, entry: &str) {
     }
 
     // End-of-cascade specular add: oD1 joins the cascade result after the
-    // last stage and before fog, rgb only (alpha untouched), clamped like
-    // every cascade op.
+    // last stage and before fog, rgb only (alpha untouched). The sum is
+    // clamped to [0, 1] before fog blends it, as the fixed-function colour
+    // sum is.
     if ps.specular_add {
         out.push_str("    current = float4(saturate(current.rgb + in.color1.rgb), current.a);\n");
     }
