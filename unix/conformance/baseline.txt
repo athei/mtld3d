@@ -30,6 +30,8 @@
   device.c:4298 count=2
   device.c:4302 count=2
   device.c:4319 count=2
+  device.c:4328 count=1
+  device.c:4329 count=1
   device.c:4340 count=2
   device.c:4420 count=1
   device.c:4424 count=2
@@ -131,6 +133,8 @@
   device.c:4298 count=2
   device.c:4302 count=2
   device.c:4319 count=2
+  device.c:4328 count=1
+  device.c:4329 count=1
   device.c:4340 count=2
   device.c:4420 count=1
   device.c:4424 count=2
