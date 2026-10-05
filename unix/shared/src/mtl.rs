@@ -560,6 +560,31 @@ pub enum VertexFormat {
     Float4 = 31,
 }
 
+impl VertexFormat {
+    /// Bytes one element of this format occupies in a vertex buffer; 0 for `Invalid`.
+    #[must_use]
+    pub const fn byte_size(self) -> u32 {
+        match self {
+            Self::Invalid => 0,
+            Self::UChar4
+            | Self::UChar4Normalized
+            | Self::UChar4NormalizedBgra
+            | Self::Short2
+            | Self::UShort2Normalized
+            | Self::Short2Normalized
+            | Self::Half2
+            | Self::Float => 4,
+            Self::Short4
+            | Self::UShort4Normalized
+            | Self::Short4Normalized
+            | Self::Half4
+            | Self::Float2 => 8,
+            Self::Float3 => 12,
+            Self::Float4 => 16,
+        }
+    }
+}
+
 /// `MTLVertexStepFunction` wire encoding for one vertex buffer layout.
 ///
 /// Discriminants match the native Metal enum. `Constant` is the layout of a

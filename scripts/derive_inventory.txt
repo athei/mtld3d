@@ -242,6 +242,8 @@ windows/tests/src/vertex.rs SpecularVertex Clone,Copy
 windows/tests/src/vertex.rs TexturedVertex Clone,Copy
 windows/tests/src/vertex.rs Vertex Clone,Copy
 windows/tests/src/win32.rs Rect Clone,Copy,PartialEq,Eq,Debug
+windows/tests/tests/e2e/bench_crossing.rs NarrowVertex Clone,Copy
+windows/tests/tests/e2e/bench_crossing.rs WideVertex Clone,Copy
 windows/tests/tests/e2e/draw.rs PaddedVertex Clone,Copy
 windows/tests/tests/e2e/points.rs PsizeVertex Clone,Copy
 windows/tests/tests/e2e/streams.rs PackedVertex Clone,Copy

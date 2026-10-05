@@ -754,6 +754,13 @@ pub struct FrameEncoder {
     last_bound: LastBoundCache,
     /// Derived LOD-bias uniform, keyed independently of per-pass bindings.
     lod_bias_table: sampler_state::LodBiasTableCache,
+    /// The fetch of the last draw with an attribute past its stream's stride.
+    ///
+    /// Lent to each such draw and handed back after it, so the storage is
+    /// allocated once, a draw over the same declaration record and layouts
+    /// reuses the fetch, and every other draw's frame carries only the
+    /// empty slot.
+    crossing_fetch: Option<Box<mtld3d_core::streams::CrossingFetch>>,
     /// Immutable VS/PS snapshots, valid only within their owning frame and encoder.
     vs_bound_constants: SnapshotBytesCache<ScratchSlice>,
     ps_bound_constants: SnapshotBytesCache<ScratchSlice>,
@@ -1576,6 +1583,7 @@ impl FrameEncoder {
             },
             last_bound: LastBoundCache::new(),
             lod_bias_table: sampler_state::LodBiasTableCache::new(),
+            crossing_fetch: None,
             vs_bound_constants: SnapshotBytesCache::new(),
             ps_bound_constants: SnapshotBytesCache::new(),
             scratch: ScratchArena::new(),
@@ -2206,6 +2214,10 @@ impl FrameEncoder {
         // The library memo names source records by address, and this
         // packet's records may sit where the previous packet's did.
         self.libraries.begin_packet();
+        // So does the crossing fetch, which remembers the record it was built from.
+        if let Some(fetch) = &mut self.crossing_fetch {
+            fetch.forget_source();
+        }
         self.frame_blit_commands.clear();
         self.flags.remove(FrameEncoderFlags::BLIT_CMDS_NEED_ENCODER);
         self.dump_draw = None;
@@ -5208,6 +5220,18 @@ impl FrameEncoder {
     /// hasn't changed since the previous draw in the current pass.
     pub const fn last_bound(&mut self) -> &mut LastBoundCache {
         &mut self.last_bound
+    }
+
+    /// Borrow the last crossing draw's fetch, `None` the first time.
+    pub const fn take_crossing_fetch(
+        &mut self,
+    ) -> Option<Box<mtld3d_core::streams::CrossingFetch>> {
+        self.crossing_fetch.take()
+    }
+
+    /// Hand a crossing draw's fetch back for the next such draw.
+    pub fn keep_crossing_fetch(&mut self, fetch: Box<mtld3d_core::streams::CrossingFetch>) {
+        self.crossing_fetch = Some(fetch);
     }
 
     /// Allocate the effective LOD table when this pass needs its binding.

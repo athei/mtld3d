@@ -916,10 +916,14 @@ impl<'a> VertexView<'a> {
 }
 
 /// Vertex layouts derived directly from borrowed command stream records.
+///
+/// Sets in `crossing` the streams an attribute crosses (see
+/// [`crate::draw_data::stream_layouts_with`]).
 #[must_use]
 pub fn stream_layouts_view(
     source: &VertexView<'_>,
     attrs: &crate::draw_data::AttrSnapshot,
+    crossing: &mut u16,
 ) -> [crate::pipeline_state::StreamLayout; mtld3d_types::MAX_STREAMS as usize] {
     use mtld3d_shared::mtl::VertexStepFunction;
 
@@ -927,21 +931,25 @@ pub fn stream_layouts_view(
         pipeline_state::StreamLayout,
         streams::{bound_stream_layout, layout_stride},
     };
-    crate::draw_data::stream_layouts_with(attrs, |stream, extent| match source.feed(stream) {
-        StreamViewFeed::Inline { stride } => StreamLayout {
-            stride: layout_stride(stride, extent),
-            step: VertexStepFunction::PerVertex,
-            step_rate: 1,
+    crate::draw_data::stream_layouts_with(
+        attrs,
+        |stream, extent| match source.feed(stream) {
+            StreamViewFeed::Inline { stride } => StreamLayout {
+                stride: layout_stride(stride, extent),
+                step: VertexStepFunction::PerVertex,
+                step_rate: 1,
+            },
+            StreamViewFeed::Buffer(record) => {
+                bound_stream_layout(record.stride, extent, record.frequency)
+            }
+            StreamViewFeed::Null => StreamLayout {
+                stride: extent,
+                step: VertexStepFunction::Constant,
+                step_rate: 0,
+            },
         },
-        StreamViewFeed::Buffer(record) => {
-            bound_stream_layout(record.stride, extent, record.frequency)
-        }
-        StreamViewFeed::Null => StreamLayout {
-            stride: extent,
-            step: VertexStepFunction::Constant,
-            step_rate: 0,
-        },
-    })
+        crossing,
+    )
 }
 
 #[cfg(test)]

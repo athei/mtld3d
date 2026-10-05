@@ -7025,7 +7025,8 @@ pub struct LastBoundCache {
     ps_draw: Vec<u8>,
     /// Vertex stream slots 0..16 — bound `MTLBuffer` handle, byte offset, backing generation.
     ///
-    /// Indexed by D3D9 stream, which is the Metal vertex buffer slot.
+    /// Indexed by Metal vertex buffer slot: D3D9 stream `n` binds at slot `n`,
+    /// and a crossing attribute at a slot of its own (`streams::CrossingFetch`).
     /// `(0, _, _)` is the unset sentinel (Metal buffer handles are never
     /// zero). The generation is the backing allocation's identity behind the
     /// handle: a handle is a raw object address, and an address reused by a
