@@ -7,12 +7,23 @@ on:
     # comment above that job for why the matrix does not run a second time.
     tags: ['v*']
   pull_request:
+  # The Intel image's legs, which pull requests do not run (see the comment
+  # above the build job), every night against main.
+  schedule:
+    - cron: '17 3 * * *'
   # So a branch can be run through the whole matrix before it has a PR, or
-  # only through the runner probe at the bottom.
+  # only through the Intel legs, or only through the runner probe at the
+  # bottom.
   workflow_dispatch:
     inputs:
       probe_only:
         description: Run only the probe-metal job.
+        type: boolean
+        default: false
+      intel_only:
+        description: >-
+          Run only the build and the Intel image's e2e and conformance legs,
+          as the nightly run does.
         type: boolean
         default: false
       record_intel_baseline:
@@ -52,8 +63,10 @@ concurrency:
   # PR updates share a group so a new head cancels the superseded run. Main
   # uses one group per run: cancel-in-progress=false alone still lets a new
   # pending run replace an older pending run. Keep every main result for
-  # comparison across commits. Probe-only dispatches have their own group.
-  group: ci-${{ github.ref }}-${{ inputs.probe_only && 'probe' || 'full' }}-${{ github.ref == 'refs/heads/main' && github.run_id || 'shared' }}
+  # comparison across commits; the nightly runs on main too, so it gets one
+  # group per run as well. Probe-only and Intel-only dispatches have groups of
+  # their own.
+  group: ci-${{ github.ref }}-${{ inputs.probe_only && 'probe' || inputs.intel_only && 'intel' || 'full' }}-${{ github.ref == 'refs/heads/main' && github.run_id || 'shared' }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 # Everything a run depends on that is not in the tree is pinned here, so a green
@@ -86,10 +99,21 @@ jobs:
   # arches, both unix `.so` builds, the e2e test binaries, and the e2e and
   # conformance runners for both host arches. Primes the caches the check job
   # restores too.
+  #
+  # It also decides, once for both test matrices, which images they run on.
+  # A pull request runs the two arm64 images and gates on them. The Intel
+  # image's paravirtual GPU hangs, and reads multisampled results wrong, on
+  # its own often enough that a pull request could not get a green Intel leg
+  # in several attempts, so its legs run every night on main (the `schedule`
+  # trigger) and on a dispatch with `intel_only`, which run that image alone,
+  # and a release waits for a green one (CONTRIBUTING.md, "Cutting a
+  # release"). A push to main and any other dispatch run all three images.
   build:
     if: ${{ !inputs.probe_only && !startsWith(github.ref, 'refs/tags/v') }}
     runs-on: macos-26
     timeout-minutes: 20
+    outputs:
+      runners: ${{ (github.event_name == 'schedule' || inputs.intel_only) && '["macos-15-intel"]' || github.event_name == 'pull_request' && '["macos-26","macos-15"]' || '["macos-26","macos-15","macos-15-intel"]' }}
     steps:
       - uses: actions/checkout@v5
         with:
@@ -117,8 +141,10 @@ jobs:
   # scripts, so snmalloc-sys (and zstd-sys, for the e2e test crate and the
   # disk-cache doc run) need the xwin headers and the archiver, and
   # windows/shim's build script reads Wine's libwinecrt0.a.
+  # The nightly and Intel-only runs are about the Intel legs alone, so they
+  # leave this job out.
   check:
-    if: ${{ !inputs.probe_only && !startsWith(github.ref, 'refs/tags/v') }}
+    if: ${{ !inputs.probe_only && !inputs.intel_only && github.event_name != 'schedule' && !startsWith(github.ref, 'refs/tags/v') }}
     runs-on: macos-26
     timeout-minutes: 20
     steps:
@@ -171,7 +197,9 @@ jobs:
   # one a real Intel/AMD Mac's driver denies and this paravirtual device does
   # not, so the forced key is what makes the image stand in for the hardware.
   # On an Apple-family image the forced answers are a local tool (`make test
-  # INTEL=1`) and do not run here. Every image gates.
+  # INTEL=1`) and do not run here. Every image that runs gates its run; which
+  # images run on which event is decided by the build job (see the comment
+  # above it).
   #
   # One more leg runs the whole suite at `render.scale = 0.75`: the back
   # buffer rasterized smaller than the resolution D3D9 reports and resolved
@@ -186,8 +214,10 @@ jobs:
   # axis carries one empty value (the identity run) so the `include` entry,
   # whose scale differs, becomes its own combination: an include whose keys
   # all fit an existing combination is folded into it instead, and that
-  # would turn the macos-26/i686 identity leg into the scaled one. The job
-  # name is spelled out so the empty value does not show in it.
+  # would turn the macos-26/i686 identity leg into the scaled one. The
+  # include is there only when macos-26 is among the runners, so a run of the
+  # Intel image alone does not grow a macos-26 leg. The job name is spelled
+  # out so the empty value does not show in it.
   # A green leg takes two to four minutes, four Wine processes included. The
   # budget is a multiple of that, not of the worst case the runner's watchdog
   # can produce: a process that faults and leaves Wine's debugger holding the
@@ -202,13 +232,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [macos-26, macos-15, macos-15-intel]
+        runner: ${{ fromJSON(needs.build.outputs.runners) }}
         arch: [i686, x86_64]
         scale: [""]
-        include:
-          - runner: macos-26
-            arch: i686
-            scale: "0.75"
+        include: ${{ fromJSON(contains(fromJSON(needs.build.outputs.runners), 'macos-26') && '[{"runner":"macos-26","arch":"i686","scale":"0.75"}]' || '[]') }}
     steps:
       - uses: actions/checkout@v5
       - uses: ./.github/actions/runner
@@ -233,7 +260,20 @@ jobs:
       # directory keeps the ten newest of each kind, so a leg that restarts
       # more than ten processes hands back its last ten; a runner fault
       # persists, so those carry it.
-      - run: make test-e2e-${{ matrix.arch }} STAGE="$STAGE" JOBS=1 TIMEOUT=120 FAIL_FAST=0 INTEL=${{ matrix.runner == 'macos-15-intel' && '1' || '' }} SCALE="${{ matrix.scale }}" FILTER="$E2E_FILTER" LOG_DIR="$LOG_DIR"
+      # A leg the driver reports a GPU hang on ends with the runner's
+      # `e2e: GPU HANG in <binary>` line and exit code 3, which make turns
+      # into its own 2, so the step keeps the runner's stdout and looks for
+      # that line. When it is there the step raises a `GPU hang` error
+      # annotation, the marker rerun-gpu-hangs.yml reads (see the conformance
+      # step below for why the answer is a fresh machine).
+      - run: |
+          set -o pipefail
+          if ! make test-e2e-${{ matrix.arch }} STAGE="$STAGE" JOBS=1 TIMEOUT=120 FAIL_FAST=0 INTEL=${{ matrix.runner == 'macos-15-intel' && '1' || '' }} SCALE="${{ matrix.scale }}" FILTER="$E2E_FILTER" LOG_DIR="$LOG_DIR" | tee "$RUNNER_TEMP/e2e-stdout.txt"; then
+            if grep -q '^e2e: GPU HANG in ' "$RUNNER_TEMP/e2e-stdout.txt"; then
+              echo "::error title=GPU hang::this runner's GPU hung and stays hung for the rest of the job, so the leg was cut short and has no verdict. A run whose every failed job says this is re-run once on fresh machines by rerun-gpu-hangs.yml; past that, re-run the failed jobs by hand: gh run rerun ${{ github.run_id }} --failed"
+            fi
+            exit 1
+          fi
         env:
           E2E_FILTER: ${{ inputs.e2e_filter }}
           RUST_LOG: ${{ inputs.e2e_log }}
@@ -320,8 +360,9 @@ jobs:
   # leg for the same reason.
   # The `variant` axis carries one empty value (the native run) so the
   # `include` entry becomes its own combination rather than being folded into
-  # the macos-26/i686 native leg; the job name is spelled out so the empty
-  # value does not show in it.
+  # the macos-26/i686 native leg, and the include is there only when macos-26
+  # is among the runners, as for the e2e legs; the job name is spelled out so
+  # the empty value does not show in it.
   # A green leg takes four to six minutes; the longest single subtest on the
   # Intel image stays under four, which is what the per-subtest budget below
   # is sized against. A `conformance_repeat` dispatch runs one subtest twenty
@@ -334,13 +375,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [macos-26, macos-15, macos-15-intel]
+        runner: ${{ fromJSON(needs.build.outputs.runners) }}
         arch: [i686, x86_64]
         variant: [""]
-        include:
-          - runner: macos-26
-            arch: i686
-            variant: scale
+        include: ${{ fromJSON(contains(fromJSON(needs.build.outputs.runners), 'macos-26') && '[{"runner":"macos-26","arch":"i686","variant":"scale"}]' || '[]') }}
     steps:
       - uses: actions/checkout@v5
       - uses: ./.github/actions/runner
@@ -357,23 +395,28 @@ jobs:
       # stays that way for the rest of the machine's life (a second attempt
       # on the same runner hung again, in the next subtest's fresh process).
       # The runner reads that line as it arrives, stops the subtest and ends
-      # the leg, so the hang costs seconds rather than the subtest's budget;
-      # what is left for this step is to say what the failure means. A
-      # regression never looks like that, and the machine will not recover,
+      # the leg with its `conformance: GPU HANG in <leg>/<subtest>` line and
+      # exit code 3, so the hang costs seconds rather than the subtest's
+      # budget; what is left for this step is to say what the failure means.
+      # A regression never looks like that, and the machine will not recover,
       # so the answer is a re-run of the failed jobs, which lands on a fresh
-      # runner, not another attempt here.
+      # runner, not another attempt here. make turns the 3 into its own 2, so
+      # the step keeps the runner's stdout and looks for that line, and when
+      # it is there raises the `GPU hang` error annotation that
+      # rerun-gpu-hangs.yml reads to do that re-run once.
       # A `conformance_repeat` dispatch runs one subtest that many times in
       # place of the gate, on every job, and leaves the reading to the
       # artifact: each run's raw output ends with how the process ended, and
       # the layer's debug log sits beside it.
       - run: |
+          set -o pipefail
           if [ -n "$CONFORMANCE_REPEAT" ]; then
             make conformance-isolate ONLY="$CONFORMANCE_ONLY" ARCH=${{ matrix.arch }} REPEAT="$CONFORMANCE_REPEAT" VARIANT=${{ matrix.runner == 'macos-15-intel' && 'intel' || matrix.variant || 'native' }} LOG=debug STAGE="$STAGE"
             exit
           fi
-          if ! make conformance-${{ matrix.runner == 'macos-15-intel' && (inputs.record_intel_baseline && 'baseline-intel-' || 'intel-') || (matrix.variant && format('{0}-', matrix.variant)) || '' }}${{ matrix.arch }} STAGE="$STAGE"; then
-            if grep -lq kIOAccelCommandBufferCallbackErrorHang "$MTLD3D_CONFORMANCE_RAW_DIR"/*.log 2>/dev/null; then
-              echo "::error::this runner's GPU hung and stays hung for the rest of the job, so the leg was cut short; not a regression when the other conformance jobs are green. Re-run the failed jobs to get a fresh machine: gh run rerun ${{ github.run_id }} --failed"
+          if ! make conformance-${{ matrix.runner == 'macos-15-intel' && (inputs.record_intel_baseline && 'baseline-intel-' || 'intel-') || (matrix.variant && format('{0}-', matrix.variant)) || '' }}${{ matrix.arch }} STAGE="$STAGE" | tee "$RUNNER_TEMP/conformance-stdout.txt"; then
+            if grep -q '^conformance: GPU HANG in ' "$RUNNER_TEMP/conformance-stdout.txt"; then
+              echo "::error title=GPU hang::this runner's GPU hung and stays hung for the rest of the job, so the leg was cut short and has no verdict; not a regression when the other conformance jobs are green. A run whose every failed job says this is re-run once on fresh machines by rerun-gpu-hangs.yml; past that, re-run the failed jobs by hand: gh run rerun ${{ github.run_id }} --failed"
             fi
             exit 1
           fi
@@ -513,9 +556,10 @@ jobs:
   # and the one texture format the Mac2 family lacks. Run it before adding a
   # runner label to the matrices, since an image without a Metal device
   # cannot run the e2e or conformance legs at all, and the newest arm64 image
-  # is in the list as the reference every other row is read against.
+  # is in the list as the reference every other row is read against. An
+  # `intel_only` dispatch leaves it out.
   probe-metal:
-    if: github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'workflow_dispatch' && !inputs.intel_only
     strategy:
       fail-fast: false
       matrix:

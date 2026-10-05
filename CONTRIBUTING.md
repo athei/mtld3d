@@ -161,7 +161,8 @@ verdict, even under `FAIL_FAST=0` or when the process itself exits cleanly.
 The runner watches stderr while the process runs, checks the layer log before
 it can launch another process, and keeps both accounts of the initiating
 process. Assertions after that report are not measurements of the source: the
-later results may reflect the hosted GPU's failed state.
+later results may reflect the hosted GPU's failed state. CI re-runs such a leg
+on a fresh machine; "Pull requests" below says when.
 
 When every test is accounted for but the process ends abnormally, the runner
 keeps its full captured stdout, stderr and exit status together in
@@ -584,19 +585,35 @@ as steps of one job. Production bundles are built by the release job only.
 Every run on `main` has its own concurrency group so pending runs survive
 later pushes and every commit keeps its CI result. PR updates cancel the
 superseded run. The test machines carry no toolchain: they install the stage
-(`STAGE=<dir>`) and run the end-to-end and conformance suites on three
+(`STAGE=<dir>`) and run the end-to-end and conformance suites on up to three
 images: the newest macOS on arm64, the oldest macOS mtld3d supports on arm64,
 and the Intel image, whose device has no unified memory and none of the
-packed 16-bit formats, so it runs the Intel/AMD code paths for real. One
-more end-to-end leg, and one more conformance leg, run their suite at
-`render.scale = 0.75`, the evidence that the coordinates the tests assert on
-stay in the space D3D9 reports when the frame is rasterized smaller; a test
-that needs single-pixel resolution asks `render_scale_is_identity()` and pins
-its exact shape at the identity rather than failing that leg, and the
-conformance sites that cannot (a probe on a colour boundary) are classified
-under "The scaled leg" in `unix/conformance/CONFORMANCE.md`. Every image gates. The Intel image reads the conformance baseline's `@mac2` entries,
-which only it can record: dispatch the workflow with `record_intel_baseline`
-and commit the `@mac2` sections from the `baseline-mac2-<arch>` artifacts
+packed 16-bit formats, so it runs the Intel/AMD code paths for real. A pull
+request runs the two arm64 images, and every leg it runs gates it. The Intel
+image's paravirtual GPU hangs and reads multisampled results wrong by itself,
+with no Wine and no mtld3d involved, often enough that a pull request could
+not count on a green Intel leg, so its legs run every night on `main` and on
+a dispatch with `intel_only`, which run that image alone; a push to `main`
+and any other dispatch run all three images. An Intel failure in the nightly
+run that is not a GPU hang comes from the commits since the last green one:
+a regression, or a `@mac2` conformance pin left stale by a pull request that
+fixed a site and updated only the Apple entries, which is re-recorded rather
+than read as a regression (`unix/conformance/CONFORMANCE.md` has the
+procedure). So a pull request that moves conformance counts, edits
+`baseline.txt`, or touches an Intel code path (the `intel.*` keys, Managed
+memory, the packed 16-bit formats) dispatches the workflow with `intel_only`
+on its branch before it merges. A release waits for a green Intel run (see
+"Cutting a release"). One more end-to-end leg, and one more conformance leg,
+run their suite at `render.scale = 0.75`, the evidence that the coordinates
+the tests assert on stay in the space D3D9 reports when the frame is
+rasterized smaller; a test that needs single-pixel resolution asks
+`render_scale_is_identity()` and pins its exact shape at the identity rather
+than failing that leg, and the conformance sites that cannot (a probe on a
+colour boundary) are classified under "The scaled leg" in
+`unix/conformance/CONFORMANCE.md`. The Intel image reads the conformance
+baseline's `@mac2` entries, which only it can record: dispatch the workflow
+with `record_intel_baseline` (and `intel_only`, to run nothing else) and
+commit the `@mac2` sections from the `baseline-mac2-<arch>` artifacts
 (`unix/conformance/CONFORMANCE.md` has the procedure). A conformance subtest
 that dies on one image now and then is caught by dispatching with
 `conformance_repeat=<n>`, which runs it that many times on every image and
@@ -613,6 +630,16 @@ run the Intel paths without the hardware.
 The end-to-end legs run one test at a time in CI on purpose (`JOBS=1`, against
 a local default of four), because parallel device creation aborts on a runner.
 A flake there is not fixed by re-enabling parallelism.
+
+A leg a GPU hang cut short (the runner's exit code 3, under "Reading a test
+run") has no verdict, and a hosted machine whose GPU hung stays hung, so the
+e2e and conformance steps mark such a leg with an error annotation titled
+`GPU hang`. When a run fails and every job that did not succeed carries that
+annotation, `.github/workflows/rerun-gpu-hangs.yml` re-runs the failed jobs
+once, which puts them on fresh machines; it leaves a pull request's run alone
+once a newer push has replaced it. A second hang, or a hang beside any other
+failure, is for a person to read, and the failed jobs are re-run by hand
+with `gh run rerun <run-id> --failed`.
 
 ## What sends a pull request back
 
@@ -675,7 +702,12 @@ LOG_DIR=$PWD/.codex/evidence/bench-release/<version>`, which archives the runs
 and the report there. A regression it reports is fixed before the tag or named
 in the notes.
 
-Land that commit, wait for its run on `main` to go green, then push the tag. The
+Land that commit and wait for its run on `main` to go green. The latest Intel
+run on `main` has to be green too: that is the commit's own push run, which
+carries the Intel legs, unless a nightly or an `intel_only` dispatch ran
+after it. Pull requests do not run the Intel image, so that run is the only
+Intel verdict the release has, and a run whose Intel legs show nothing but
+GPU hangs is re-run until it gives one. Then push the tag. The
 release job refuses a tag whose version disagrees with either workspace, and
 refuses one whose commit has no green run on `main`; a tag pushed while that run
 is still going is waited on rather than rejected. It builds the bundle itself,
