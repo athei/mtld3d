@@ -1577,8 +1577,9 @@ fn emit_draw_view(
                     )),
                 };
                 if let Some((range_off, range_size)) = read_range {
-                    // The last element's crossing attribute reads past its stride.
-                    let range_size = if crossing & (1 << b.stream) == 0 {
+                    // A crossing stream's last element reads past its stride;
+                    // on a stream that does not cross this adds nothing.
+                    let range_size = if fetch.is_none() {
                         range_size
                     } else {
                         crossing_read_size(
