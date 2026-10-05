@@ -684,8 +684,7 @@ for f in $(1); do \
 	esac ; \
 	if [ -n "$$hits" ]; then echo "production-assert-gate: $$f imports the C assertion handler $$hits: a C or C++ object was built without NDEBUG" >&2; exit 1; fi ; \
 	if LC_ALL=C grep -a -q -F 'assert fail: {} in {} on {} ' $$f; then echo "production-assert-gate: $$f carries snmalloc's assertion message: snmalloc was built without NDEBUG" >&2; exit 1; fi ; \
-done ; \
-echo "production-assert-gate: no C or C++ assertion path in $(1)"
+done
 endef
 PRODUCTION_ASSERT_CHECK = $(if $(filter production,$(PROFILE)),$(call PRODUCTION_ASSERT_GATE,$(1)))
 
@@ -734,8 +733,7 @@ printf '%s\n' "$$funcs" | while read -r rva size name; do \
 			printf '%s\n' "$$code" | grep -E "(call[a-z]*|j[a-z]+)[[:space:]]+$$target" >&2 ; exit 1 ;; \
 		esac ; \
 	done ; \
-done || exit 1 ; \
-echo "mem-routine-gate: $$(printf '%s\n' "$$funcs" | wc -l | tr -d ' ') functions of the memory routines in $$dll, none branches to one of the four"
+done || exit 1
 endef
 
 mem-routine-gate:
