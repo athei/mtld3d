@@ -1509,7 +1509,11 @@ const VS_FETCH_AT_LOD: [u32; 36] = [
 fn arm_vertex_fetch_at_lod(h: &Harness, tex: &Texture<'_>) {
     use mtld3d_types::D3DVERTEXTEXTURESAMPLER0;
 
-    assert_eq!(h.set_texture(D3DVERTEXTEXTURESAMPLER0, tex), 0, "SetTexture(257)");
+    assert_eq!(
+        h.set_texture(D3DVERTEXTEXTURESAMPLER0, tex),
+        0,
+        "SetTexture(257)"
+    );
     for (state, value) in [
         (D3DSAMP_MINFILTER, D3DTEXF_POINT),
         (D3DSAMP_MAGFILTER, D3DTEXF_POINT),
@@ -1517,7 +1521,10 @@ fn arm_vertex_fetch_at_lod(h: &Harness, tex: &Texture<'_>) {
         (D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP),
         (D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP),
     ] {
-        assert_eq!(h.set_sampler_state(D3DVERTEXTEXTURESAMPLER0, state, value), 0);
+        assert_eq!(
+            h.set_sampler_state(D3DVERTEXTEXTURESAMPLER0, state, value),
+            0
+        );
     }
     let vs = h.create_vertex_shader(&VS_FETCH_AT_LOD);
     let ps = h.create_pixel_shader(&PS_COLOR_PASSTHROUGH);

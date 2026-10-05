@@ -720,7 +720,10 @@ fn a_vertex_slot_takes_the_row_of_its_lod_bias_and_finest_level() {
     let mut table = VertexLodTable::new();
     table.set_slot(2, &lod_state(3, 1, D3DTEXF_POINT));
     assert_eq!(table.mask(), 0b0100);
-    assert_eq!(vertex_row(&table, 2), [1.0_f32.to_bits(), 3.0_f32.to_bits()]);
+    assert_eq!(
+        vertex_row(&table, 2),
+        [1.0_f32.to_bits(), 3.0_f32.to_bits()]
+    );
 
     let mut biased = lod_state(0, 0, D3DTEXF_LINEAR);
     biased[D3DSAMP_MIPMAPLODBIAS as usize] = (-1.0_f32).to_bits();
@@ -732,7 +735,11 @@ fn a_vertex_slot_takes_the_row_of_its_lod_bias_and_finest_level() {
     );
 
     table.set_slot(2, &lod_state(0, 0, D3DTEXF_POINT));
-    assert_eq!(table.mask(), 0b0001, "a slot back at its defaults needs no row");
+    assert_eq!(
+        table.mask(),
+        0b0001,
+        "a slot back at its defaults needs no row"
+    );
     assert_eq!(vertex_row(&table, 2), EXPLICIT_LOD_OPEN.map(f32::to_bits));
 }
 
