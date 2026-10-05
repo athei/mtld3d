@@ -1747,12 +1747,17 @@ fn two_vertex_texldl_shaders_in_one_frame_each_run_their_own_function() {
         })
     };
     let (left, right) = (triangle(-0.5), triangle(0.5));
-    h.render_once(BLACK, |d| {
-        assert_eq!(d.set_vertex_shader(&first), 0, "first VS");
-        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &left), 0);
-        assert_eq!(d.set_vertex_shader(&second), 0, "second VS");
-        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &right), 0);
-    });
+    // The first frame builds both functions; the second draws both from
+    // libraries that are already built, the path that answers a draw from
+    // the previous draw's.
+    for _ in 0..2 {
+        h.render_once(BLACK, |d| {
+            assert_eq!(d.set_vertex_shader(&first), 0, "first VS");
+            assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &left), 0);
+            assert_eq!(d.set_vertex_shader(&second), 0, "second VS");
+            assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &right), 0);
+        });
+    }
     assert_eq!(
         h.read_pixel(160, 260),
         MIP_TINTS[1],
