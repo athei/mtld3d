@@ -858,9 +858,11 @@ fn an_unaligned_stream_offset_reaches_fixed_function_and_a_second_stream() {
 /// Draws over one declaration at offsets 0, 2, 0 and 3 keep pipelines of their own.
 ///
 /// The offset's remainder moves the attributes, which the declaration and
-/// the stream layouts do not show, so each draw of the frame must still get
-/// the pipeline for its own remainder: the aligned draw after the unaligned
-/// one would otherwise read its colour two bytes late.
+/// the stream layouts do not show, so each draw must still get the pipeline
+/// for its own remainder: the unaligned draw after an aligned one would
+/// otherwise read its vertices with the aligned draw's attribute offsets.
+/// The frame is drawn twice, so the second one finds every pipeline built
+/// and answers from the encoder's memo of recent pipelines.
 #[test]
 fn draws_at_alternating_stream_offsets_keep_pipelines_of_their_own() {
     let h = Harness::new();
@@ -882,27 +884,29 @@ fn draws_at_alternating_stream_offsets_keep_pipelines_of_their_own() {
             )
         })
         .collect();
-    h.render_once(BLUE, |d| {
-        for (column, (vb, &offset)) in (0u32..).zip(buffers.iter().zip(&offsets)) {
-            let viewport = D3DVIEWPORT9 {
-                x: column * 160,
-                y: 0,
-                width: 160,
-                height: 480,
-                min_z: 0.0,
-                max_z: 1.0,
-            };
-            assert_eq!(d.set_viewport(&viewport), D3D_OK);
-            assert_eq!(d.set_stream_source(0, vb, offset, stride), D3D_OK);
-            assert_eq!(d.draw_primitive(D3DPT_TRIANGLELIST, 0, 1), 0);
+    for frame in 0..2 {
+        h.render_once(BLUE, |d| {
+            for (column, (vb, &offset)) in (0u32..).zip(buffers.iter().zip(&offsets)) {
+                let viewport = D3DVIEWPORT9 {
+                    x: column * 160,
+                    y: 0,
+                    width: 160,
+                    height: 480,
+                    min_z: 0.0,
+                    max_z: 1.0,
+                };
+                assert_eq!(d.set_viewport(&viewport), D3D_OK);
+                assert_eq!(d.set_stream_source(0, vb, offset, stride), D3D_OK);
+                assert_eq!(d.draw_primitive(D3DPT_TRIANGLELIST, 0, 1), 0);
+            }
+        });
+        for (column, offset) in (0u32..).zip(offsets) {
+            assert_eq!(
+                h.read_pixel(column * 160 + 80, 280),
+                GREEN,
+                "frame {frame}, draw {column} from offset {offset}"
+            );
         }
-    });
-    for (column, offset) in (0u32..).zip(offsets) {
-        assert_eq!(
-            h.read_pixel(column * 160 + 80, 280),
-            GREEN,
-            "draw {column} from offset {offset}"
-        );
     }
 }
 
