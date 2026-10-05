@@ -47,9 +47,15 @@ at all, and a site that fails only under the variant is expected to trace to
 one of the two caps keys. The `@mac2` entries are recorded by CI, whose
 Intel image is the one Mac2 machine the project runs on: dispatch the
 workflow with `record_intel_baseline` (and `intel_only`, so only the Intel
-legs run) and copy the `@mac2` sections out of
-the `baseline-mac2-<arch>` artifacts (`make conformance-baseline` on an Apple
-Silicon machine leaves them untouched, the merge being leg-scoped).
+legs run) and copy the `@mac2` sections out of the `baseline-mac2-<arch>`
+artifacts (`make conformance-baseline` on an Apple Silicon machine leaves
+them untouched, the merge being leg-scoped). Pull requests do not run the
+Intel image, so a change that fixes a site updates the Apple entries and
+leaves the site's `@mac2` pin above the new count; the next nightly Intel run
+then fails on a stale baseline, not a regression. The fix is that same
+dispatch, `record_intel_baseline` with `intel_only`, best made on the pull
+request's branch before it merges so the `@mac2` sections land with it, or
+on `main` once the nightly shows the stale pin.
 
 ### The arm64-runtime legs
 

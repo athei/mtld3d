@@ -595,12 +595,18 @@ with no Wine and no mtld3d involved, often enough that a pull request could
 not count on a green Intel leg, so its legs run every night on `main` and on
 a dispatch with `intel_only`, which run that image alone; a push to `main`
 and any other dispatch run all three images. An Intel failure in the nightly
-run that is not a GPU hang is a regression of the commits since the last
-green one, and a release waits for a green Intel run (see "Cutting a
-release"). One more end-to-end leg, and one more conformance leg, run their
-suite at `render.scale = 0.75`, the evidence that the coordinates the tests
-assert on stay in the space D3D9 reports when the frame is rasterized
-smaller; a test that needs single-pixel resolution asks
+run that is not a GPU hang comes from the commits since the last green one:
+a regression, or a `@mac2` conformance pin left stale by a pull request that
+fixed a site and updated only the Apple entries, which is re-recorded rather
+than read as a regression (`unix/conformance/CONFORMANCE.md` has the
+procedure). So a pull request that moves conformance counts, edits
+`baseline.txt`, or touches an Intel code path (the `intel.*` keys, Managed
+memory, the packed 16-bit formats) dispatches the workflow with `intel_only`
+on its branch before it merges. A release waits for a green Intel run (see
+"Cutting a release"). One more end-to-end leg, and one more conformance leg,
+run their suite at `render.scale = 0.75`, the evidence that the coordinates
+the tests assert on stay in the space D3D9 reports when the frame is
+rasterized smaller; a test that needs single-pixel resolution asks
 `render_scale_is_identity()` and pins its exact shape at the identity rather
 than failing that leg, and the conformance sites that cannot (a probe on a
 colour boundary) are classified under "The scaled leg" in

@@ -43,13 +43,13 @@ jobs:
           BRANCH: ${{ github.event.workflow_run.head_branch }}
         run: |
           failed=$(gh api --paginate "repos/$GH_REPO/actions/runs/$RUN_ID/attempts/1/jobs?per_page=100" \
-            --jq '.jobs[] | select(.conclusion != "success" and .conclusion != "skipped" and .conclusion != "neutral") | "\(.id) \(.name)"')
+            --jq '.jobs[] | select(.conclusion != "success" and .conclusion != "skipped" and .conclusion != "neutral") | "\(.check_run_url) \(.name)"')
           if [ -z "$failed" ]; then
             echo "run $RUN_ID failed with no failed job; nothing to re-run"
             exit 0
           fi
-          while read -r id name; do
-            hung=$(gh api --paginate "repos/$GH_REPO/check-runs/$id/annotations?per_page=100" \
+          while read -r url name; do
+            hung=$(gh api --paginate "$url/annotations?per_page=100" \
               --jq '.[] | select(.title == "GPU hang") | .title')
             if [ -z "$hung" ]; then
               echo "$name did not end with a GPU hang, so run $RUN_ID is not re-run"
