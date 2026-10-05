@@ -7001,6 +7001,11 @@ pub struct LastBoundCache {
     /// changes, so the per-draw cost is a length-then-memcmp against
     /// `vs_draw::VS_DRAW_BYTES`.
     vs_draw: Vec<u8>,
+    /// VS LOD slot: the per-vertex-sampler explicit-LOD rows.
+    ///
+    /// Set only for a draw whose vertex shader samples a slot that needs its
+    /// row; `sampler_state::VS_LOD_BYTES`.
+    vs_lod: Vec<u8>,
     /// PS slot 14 — alpha-test reference float, when alpha test is enabled.
     ps_alpha_ref: Vec<u8>,
     /// PS slot 13 — fog colour vec4, when fog is enabled.
@@ -7064,6 +7069,7 @@ impl LastBoundCache {
             triangle_fill_mode: TriangleFillMode::Fill,
             vs_pos_fixup: Vec::new(),
             vs_draw: Vec::new(),
+            vs_lod: Vec::new(),
             ps_alpha_ref: Vec::new(),
             ps_fog_color: Vec::new(),
             ps_bump_env: Vec::new(),
@@ -7094,6 +7100,7 @@ impl LastBoundCache {
         self.triangle_fill_mode = TriangleFillMode::Fill;
         self.vs_pos_fixup.clear();
         self.vs_draw.clear();
+        self.vs_lod.clear();
         self.ps_alpha_ref.clear();
         self.ps_fog_color.clear();
         self.ps_bump_env.clear();
@@ -7296,6 +7303,12 @@ impl LastBoundCache {
     #[inline]
     pub fn vs_draw_changed(&mut self, bytes: &[u8]) -> bool {
         update_inline_bytes(&mut self.vs_draw, bytes)
+    }
+
+    /// Record the vertex LOD table; true when it differs from the last bound.
+    #[inline]
+    pub fn vs_lod_changed(&mut self, bytes: &[u8]) -> bool {
+        update_inline_bytes(&mut self.vs_lod, bytes)
     }
 
     #[inline]

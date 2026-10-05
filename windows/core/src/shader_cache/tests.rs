@@ -855,6 +855,7 @@ fn programmable_entry(kind: CachedKind) -> CacheEntry {
             VsSamplerKinds {
                 volume_mask: 1,
                 cube_mask: 2,
+                lod_table: true,
             },
         )
     } else {
@@ -996,11 +997,11 @@ fn malformed_source_and_wrong_identity_are_rejected() {
     assert!(CacheEntry::decode(CachedKind::Sm3Ps, entry.key, &body).is_none());
     assert!(CacheEntry::decode(CachedKind::FfVs, entry.key, &body).is_none());
     // Header + presence + VS specialization + DXSO count cannot be torn.
-    for length in 0..26 {
+    for length in 0..27 {
         assert!(CacheEntry::decode(entry.kind, entry.key, &body[..length]).is_none());
     }
     // A forged token count cannot allocate past the encoded body.
-    body[14..18].copy_from_slice(&u32::MAX.to_le_bytes());
+    body[15..19].copy_from_slice(&u32::MAX.to_le_bytes());
     assert!(CacheEntry::decode(entry.kind, entry.key, &body).is_none());
 }
 
@@ -1012,8 +1013,8 @@ fn regeneration_failure_preserves_dxso_for_retry() {
     let mut body = Vec::new();
     entry.emitter_version ^= 1;
     entry.encode(&mut body);
-    body[14..18].copy_from_slice(&3u32.to_le_bytes());
-    body.splice(22..22, 0x0000_DEADu32.to_le_bytes());
+    body[15..19].copy_from_slice(&3u32.to_le_bytes());
+    body.splice(23..23, 0x0000_DEADu32.to_le_bytes());
     let key = vs_source_disk_key_programmable(
         crate::ids::ProgramId::from_tokens(&tokens),
         0xA55A,
@@ -1021,6 +1022,7 @@ fn regeneration_failure_preserves_dxso_for_retry() {
         crate::dxso::VsSamplerKinds {
             volume_mask: 1,
             cube_mask: 2,
+            lod_table: true,
         },
     );
     let entry = CacheEntry::decode(entry.kind, key, &body).expect("framed DXSO source");

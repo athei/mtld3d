@@ -341,7 +341,11 @@ mod source;
 /// one `tci` byte per stage, the pre-transformed FF VS reads those elements
 /// from attributes 15 and up and declares the extra members they feed, and
 /// its pipeline recipes carry those attributes.
-pub const SHADER_CACHE_SCHEMA_VERSION: u32 = 80;
+///
+/// `81` adds `VsSamplerKinds::lod_table`, which moves every programmable VS
+/// key hash: a vertex `texldl` on a slot with a texture LOD, a LOD bias or a
+/// finest level reads its row of the vertex LOD table.
+pub const SHADER_CACHE_SCHEMA_VERSION: u32 = 81;
 
 /// Source-derived identity of MSL emission, independent of persistent DXSO and shader keys.
 pub const SHADER_EMITTER_VERSION: u64 = include!(concat!(env!("OUT_DIR"), "/emitter_version.rs"));
@@ -351,8 +355,9 @@ pub const SHADER_EMITTER_VERSION: u64 = include!(concat!(env!("OUT_DIR"), "/emit
 /// Separate from [`SHADER_CACHE_SCHEMA_VERSION`] so a translation change can
 /// invalidate shader and pipeline identities without pretending the binary
 /// framing changed.
-/// Version 20 extends the serialized pixel-specialization recipe.
-pub const CACHE_FORMAT_VERSION: u32 = 20;
+/// Version 20 extends the serialized pixel-specialization recipe; version 21
+/// the vertex one, by the `lod_table` byte.
+pub const CACHE_FORMAT_VERSION: u32 = 21;
 
 /// File magic.
 ///

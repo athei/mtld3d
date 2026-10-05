@@ -27,7 +27,9 @@ const fn programmable_vs(id: u64) -> ProgrammableVsSource {
         sampler_kinds: VsSamplerKinds {
             volume_mask: 0,
             cube_mask: 0,
+            lod_table: false,
         },
+        reserved: [0; 7],
     }
 }
 

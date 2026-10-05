@@ -102,3 +102,49 @@ fn a_missing_depth_texture_falls_back_to_the_depth_kind() {
         "a slot past the masks"
     );
 }
+
+#[test]
+fn a_lod_table_source_keys_apart_and_keeps_every_other_field() {
+    let source = ProgrammableVsSource {
+        vs_id: ProgramId::from_tokens(&[0xFFFE_0300, 0xFFFF]),
+        max_const_used: 12,
+        provided_input_mask: 0x3,
+        flags: ShaderSourceFlags::RELATIVE | ShaderSourceFlags::INTEGER,
+        clip_plane_count: 2,
+        sampler_kinds: crate::dxso::VsSamplerKinds {
+            volume_mask: 0b0010,
+            cube_mask: 0b0100,
+            lod_table: false,
+        },
+        reserved: [0; 7],
+    };
+    let tabled = source.with_lod_table();
+    assert!(tabled.sampler_kinds.lod_table);
+    assert_eq!(
+        (
+            tabled.vs_id,
+            tabled.max_const_used,
+            tabled.provided_input_mask,
+            tabled.flags.bits(),
+            tabled.clip_plane_count,
+            tabled.sampler_kinds.volume_mask,
+            tabled.sampler_kinds.cube_mask,
+            tabled.reserved,
+        ),
+        (
+            source.vs_id,
+            source.max_const_used,
+            source.provided_input_mask,
+            source.flags.bits(),
+            source.clip_plane_count,
+            source.sampler_kinds.volume_mask,
+            source.sampler_kinds.cube_mask,
+            source.reserved,
+        )
+    );
+    assert_ne!(
+        VsSourceView::Programmable(&tabled).disk_key(),
+        VsSourceView::Programmable(&source).disk_key(),
+        "a shader reading the table is a library of its own"
+    );
+}

@@ -1317,12 +1317,14 @@ impl DeviceInner {
     ///
     /// The row carries the filters the bound texture can take: a texture this
     /// device cannot filter is point-sampled, so the row is pushed again when
-    /// a bind starts or ends that.
+    /// a bind starts or ends that. It also carries the bound texture's
+    /// `SetLOD`, the level a vertex `texldl` counts from, so a bind that
+    /// changes it and a `SetLOD` on the bound texture push it again too.
     fn push_vertex_sampler_row(&mut self, slot: usize) {
         let mut state = self.vertex_sampler_states[slot];
-        // A vertex sample names its level, so no texture LOD reaches it, and
-        // the slot that would carry one may hold a game's write of state 0.
-        state[TEXTURE_LOD_SLOT] = 0;
+        // The spare slot 0 may hold a game's write of state 0; the copy
+        // carries the texture LOD there instead.
+        state[TEXTURE_LOD_SLOT] = self.vertex_texture_lod(slot);
         if self.vertex_textures[slot]
             .as_ref()
             .is_some_and(|texture| self.samples_unfiltered(texture))
@@ -1349,6 +1351,7 @@ impl DeviceInner {
         let was_unfiltered = self.vertex_textures[slot]
             .as_ref()
             .is_some_and(|texture| self.samples_unfiltered(texture));
+        let was_lod = self.vertex_texture_lod(slot);
         // SAFETY: `tex` is null or a live IDirect3DTexture9 supplied by the
         // calling D3D9 vtable thunk; AddRef/Release valid for our lifetime.
         self.vertex_textures[slot] = unsafe { CachedComPtr::adopt(tex) };
@@ -1391,8 +1394,26 @@ impl DeviceInner {
         let unfiltered = self.vertex_textures[slot]
             .as_ref()
             .is_some_and(|texture| self.samples_unfiltered(texture));
-        if was_unfiltered || unfiltered {
+        if was_unfiltered || unfiltered || was_lod != self.vertex_texture_lod(slot) {
             self.push_vertex_sampler_row(slot);
+        }
+    }
+
+    /// The `SetLOD` of the texture bound at vertex slot `slot`, 0 for an empty slot.
+    fn vertex_texture_lod(&self, slot: usize) -> u32 {
+        self.vertex_textures[slot]
+            .as_ref()
+            .map_or(0, |texture| texture.inner().lod())
+    }
+
+    /// Push the vertex sampler row of every vertex slot `tex` is bound to.
+    ///
+    /// For a `SetLOD` on `tex`: the rows carry the bound texture's LOD.
+    pub fn refresh_vertex_texture_lod(&mut self, tex: *const crate::texture::Direct3DTexture9) {
+        for slot in 0..self.vertex_textures.len() {
+            if core::ptr::eq(self.vertex_textures[slot].raw(), tex) {
+                self.push_vertex_sampler_row(slot);
+            }
         }
     }
 
@@ -12311,6 +12332,7 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
 
                     clip_plane_count: mtld3d_core::vs_draw::clip_plane_count(rs),
                     sampler_kinds: dev.vertex_texture_kinds(),
+                    reserved: [0; 7],
 
                     flags: (if vs_obj.uses_rel_const() {
                         mtld3d_core::draw_data::ShaderSourceFlags::RELATIVE

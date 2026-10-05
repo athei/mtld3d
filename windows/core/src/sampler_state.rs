@@ -67,6 +67,15 @@ pub const EXPLICIT_LOD_OPEN: [f32; 2] = [0.0, -f32::MAX];
 /// A whole table of [`EXPLICIT_LOD_OPEN`] rows, for a draw no stage of which needs one.
 pub const EXPLICIT_LOD_OPEN_ROWS: [[f32; 2]; LOD_BIAS_SLOTS] = [EXPLICIT_LOD_OPEN; LOD_BIAS_SLOTS];
 
+/// Vertex sampler slots the vertex LOD uniform carries, one `float2` row each.
+///
+/// The four `D3DVERTEXTEXTURESAMPLER0..3` slots a `vs_3_0` samples as
+/// `s0`..`s3`.
+pub const VS_LOD_SLOTS: usize = 4;
+
+/// Byte length of the vertex LOD uniform.
+pub const VS_LOD_BYTES: usize = VS_LOD_SLOTS * 8;
+
 /// Fine-mip clamp `D3DSAMP_MAXMIPLEVEL` is limited to on decode.
 ///
 /// D3D9 leaves the state a full DWORD, but the largest surface the API allows
@@ -332,6 +341,77 @@ impl LodBiasTableCache {
 }
 
 impl Default for LodBiasTableCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// The vertex samplers' explicit-LOD rows, kept as the vertex LOD uniform's bytes.
+///
+/// Every vertex sample names its level (`texldl`), and Metal applies no
+/// sampler LOD clamp to an explicit level, so each slot's [`explicit_lod_row`]
+/// reaches the vertex function through this uniform. The encoder updates a
+/// slot when its sampler state arrives, which is far rarer than a draw, so a
+/// draw reads [`Self::mask`] to decide whether its shader needs the table and
+/// binds [`Self::bytes`] as they stand.
+pub struct VertexLodTable {
+    /// Bit `i` set when slot `i`'s row is not [`EXPLICIT_LOD_OPEN`].
+    mask: u8,
+    bytes: [u8; VS_LOD_BYTES],
+}
+
+impl VertexLodTable {
+    #[must_use]
+    pub fn new() -> Self {
+        let mut table = Self {
+            mask: 0,
+            bytes: [0; VS_LOD_BYTES],
+        };
+        for slot in 0..VS_LOD_SLOTS {
+            table.write_row(slot, EXPLICIT_LOD_OPEN);
+        }
+        table
+    }
+
+    /// Record vertex slot `slot`'s sampler state, the texture LOD included.
+    ///
+    /// Slots at or past [`VS_LOD_SLOTS`] are ignored (D3D9 defines four).
+    pub fn set_slot(&mut self, slot: usize, ss: &[u32; SAMPLER_STATE_COUNT]) {
+        if slot >= VS_LOD_SLOTS {
+            return;
+        }
+        let bit = 1u8 << slot;
+        let row = explicit_lod_row(ss);
+        if row.is_some() {
+            self.mask |= bit;
+        } else {
+            self.mask &= !bit;
+        }
+        self.write_row(slot, row.unwrap_or(EXPLICIT_LOD_OPEN));
+    }
+
+    /// Bit `i` set when vertex slot `i` needs its row.
+    ///
+    /// A sample at such a slot lands elsewhere than the level its shader names.
+    #[must_use]
+    pub const fn mask(&self) -> u8 {
+        self.mask
+    }
+
+    /// The uniform's bytes: row `i` is `(offset, floor)` for vertex slot `i`.
+    #[must_use]
+    pub const fn bytes(&self) -> &[u8; VS_LOD_BYTES] {
+        &self.bytes
+    }
+
+    fn write_row(&mut self, slot: usize, [offset, floor]: [f32; 2]) {
+        let base = slot * 8;
+        self.bytes[base..base + 4].copy_from_slice(&offset.to_le_bytes());
+        self.bytes[base + 4..base + 8].copy_from_slice(&floor.to_le_bytes());
+    }
+}
+
+impl Default for VertexLodTable {
     fn default() -> Self {
         Self::new()
     }

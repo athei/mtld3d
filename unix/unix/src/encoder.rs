@@ -1081,6 +1081,8 @@ pub struct FrameEncoder {
     /// declares samplers for. Kept off the per-draw snapshot: vertex
     /// textures change orders of magnitude less often than draws.
     vertex_tex_bindings: [VertexTexBinding; mtld3d_core::passes::VERTEX_SAMPLER_SLOTS],
+    /// The vertex slots' explicit-LOD rows, derived from `vertex_tex_bindings` as states arrive.
+    vertex_lod_table: sampler_state::VertexLodTable,
     /// Lazy `MTLBuffer` wrappers for bound VBs / IBs, keyed by their process-unique `BufferId`.
     ///
     /// One entry per live backing; on Lock-rename the API thread pushes
@@ -1636,6 +1638,7 @@ impl FrameEncoder {
             sampler_cache: FxHashMap::default(),
             sampler_resolve_memo: core::array::from_fn(|_| None),
             vertex_tex_bindings: core::array::from_fn(|_| VertexTexBinding::default()),
+            vertex_lod_table: sampler_state::VertexLodTable::new(),
             buffer_cache: FxHashMap::default(),
             pending_resource_retention: VecDeque::new(),
             fan_index_buffer: FanIndexBuffer::EMPTY,
@@ -5417,12 +5420,32 @@ impl FrameEncoder {
     }
 
     /// Update one mirrored vertex sampler state (`SetSamplerState` on 257..=260).
-    pub const fn set_vertex_sampler_binding(
-        &mut self,
-        slot: usize,
-        state: [u32; SAMPLER_STATE_COUNT],
-    ) {
+    ///
+    /// The state carries the bound texture's LOD in
+    /// `sampler_state::TEXTURE_LOD_SLOT`, and the slot's row of the vertex LOD
+    /// table follows it here rather than per draw.
+    pub fn set_vertex_sampler_binding(&mut self, slot: usize, state: [u32; SAMPLER_STATE_COUNT]) {
+        self.vertex_lod_table.set_slot(slot, &state);
         self.vertex_tex_bindings[slot].sampler_state = state;
+    }
+
+    /// Bit `i` set when vertex slot `i`'s `texldl` needs its row of the vertex LOD table.
+    #[must_use]
+    pub const fn vertex_lod_mask(&self) -> u8 {
+        self.vertex_lod_table.mask()
+    }
+
+    /// The vertex LOD table, when this pass does not already have it bound.
+    #[must_use]
+    pub fn alloc_vs_lod_if_changed(&mut self) -> Option<u64> {
+        if self
+            .last_bound
+            .vs_lod_changed(self.vertex_lod_table.bytes())
+        {
+            Some(self.scratch.alloc(self.vertex_lod_table.bytes()))
+        } else {
+            None
+        }
     }
 
     /// One mirrored vertex slot: `(texture id, sampler state)` by value.

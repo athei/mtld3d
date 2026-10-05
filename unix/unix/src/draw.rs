@@ -33,7 +33,7 @@ use mtld3d_shared::{
     mtl::{
         IndexType, PS_BOOL_CONST_SLOT, PS_DRAW_SLOT, PS_INT_CONST_SLOT, PS_LOD_BIAS_SLOT,
         PrimitiveType, SET_BYTES_MAX, VS_BOOL_CONST_SLOT, VS_DRAW_SLOT, VS_FLOAT_CONST_SLOT,
-        VS_INT_CONST_SLOT, VS_POS_FIXUP_SLOT, VertexStepFunction,
+        VS_INT_CONST_SLOT, VS_LOD_SLOT, VS_POS_FIXUP_SLOT, VertexStepFunction,
     },
     mtl_handle::MTLFunctionKind,
 };
@@ -369,6 +369,25 @@ fn emit_draw_view(
         .as_ref()
         .expect("emit_draw: vs not populated")
         .as_ref();
+    // Every vertex sample names its level, and Metal applies no sampler LOD
+    // clamp to an explicit level, so a vertex slot whose state moves that
+    // level (a texture LOD, a LOD bias, a finest level) reaches the shader
+    // through the vertex LOD table. The VS key carries the table only for a
+    // shader whose `texldl` samples such a slot; a draw with no such slot
+    // reads one encoder field here and keeps its library.
+    let vs_lod_source;
+    let vertex_lod_mask = u16::from(enc.vertex_lod_mask());
+    let vs = match vs {
+        VsSourceView::Programmable(source)
+            if vertex_lod_mask != 0
+                && enc.ps_declared_samplers(source.vs_id).explicit_lod_mask() & vertex_lod_mask
+                    != 0 =>
+        {
+            vs_lod_source = source.with_lod_table();
+            VsSourceView::Programmable(&vs_lod_source)
+        }
+        other => other,
+    };
     let ps: PsSourceView<'_> = snap
         .ps
         .as_ref()
@@ -1179,6 +1198,18 @@ fn emit_draw_view(
         ..
     }) = vs
     {
+        // The table persists on the encoder, so a later draw of the pass
+        // carrying the same rows skips the re-bind.
+        if sampler_kinds.lod_table
+            && let Some(ptr) = enc.alloc_vs_lod_if_changed()
+        {
+            enc.emit_command(Command::set_vertex_bytes_at(
+                ptr,
+                u32::try_from(mtld3d_core::sampler_state::VS_LOD_BYTES)
+                    .expect("the vertex LOD table fits u32"),
+                VS_LOD_SLOT,
+            ));
+        }
         let decls = enc.ps_declared_samplers(*vs_id);
         let mut mask = decls.unbound(0) & 0xF;
         while mask != 0 {

@@ -3886,15 +3886,18 @@ extern "system" fn texture_set_lod(this: *mut c_void, lod: u32) -> u32 {
     ti.lod = lod;
     // The draw snapshot carries the LOD in the sampler-state copy of each stage
     // the texture is bound to, and recaptures the stages only when STAGES is
-    // dirty.
+    // dirty. A vertex sampler's row carries it the same way, pushed to the
+    // encoder for each vertex slot the texture is bound to.
     // A texture on no device, or not bound on its own device, has no capture to
-    // refresh: the next SetTexture that binds it marks STAGES itself.
+    // refresh: the next SetTexture that binds it marks STAGES or pushes the row
+    // itself.
     let device_inner = ti.device_inner;
     if device_inner != 0 {
         let dev = DeviceInner::from_ptr(device_inner);
         if dev.stage_bindings().binds(this.cast()) {
             dev.mark_snapshot_dirty(SnapshotDirty::STAGES);
         }
+        dev.refresh_vertex_texture_lod(this.cast());
     }
     prev
 }
