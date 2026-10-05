@@ -10,12 +10,16 @@
 //!   median ratio above `1 + max(T, 3 sigma)`, sigma being 1.4826 times the
 //!   MAD of the finite ratios, with at least 80 % of the pairs worse. `T` is
 //!   8 % for a tail percentile (a name with `p99`), which moves more between
-//!   runs, and 3 % otherwise. An improvement is the mirror image. A `time`
-//!   metric's median difference must also exceed five steps of the
-//!   resolution its value is printed with ([`time_step`]), since a value of
-//!   a few steps moves by tens of percent when it crosses one. A metric
-//!   whose base median is zero has no ratio and is judged by its median
-//!   difference against a small absolute floor instead.
+//!   runs, 50 % for the API-cost benchmark's per-call setter times
+//!   (`ns_per_call.*`), which move with where the linker places a function
+//!   ([`RATIO_FLOOR_PER_CALL`]), 15 % for its draw times
+//!   (`ns_per_call.draw_*`, [`RATIO_FLOOR_PER_CALL_DRAW`]), and 3 %
+//!   otherwise. An improvement is the mirror image. A `time` metric's median
+//!   difference must also exceed five steps of the resolution its value is
+//!   printed with ([`time_step`]), since a value of a few steps moves by tens
+//!   of percent when it crosses one. A metric whose base median is zero has
+//!   no ratio and is judged by its median difference against a small absolute
+//!   floor instead.
 //! - `bytes`: the same with `T` at 3 % whatever the name, and the median
 //!   difference must also exceed 4 MiB, since a few percent of a small
 //!   footprint is allocator noise.
@@ -79,6 +83,44 @@ const RATIO_FLOOR: f64 = 0.03;
 
 /// The noise floor of a ratio-judged tail percentile, which moves more from run to run.
 const RATIO_FLOOR_TAIL: f64 = 0.08;
+
+/// The noise floor of a setter's per-call time in the API-cost benchmark ([`PER_CALL_PREFIX`]).
+///
+/// Those rows time a setter, or a buffer's lock and unlock, of 8 to 35 ns,
+/// and they move with where the linker places the functions, not only with
+/// what the functions do. Growing the first function of `.text` by 1024
+/// bytes, which moves every later function by 1024 bytes with its machine
+/// code unchanged and its alignment kept, moved `set_render_state_same` by
+/// 26 % (sigma 1.7 %) and three other rows by 8 to 18 % in either
+/// direction. A 208-byte shift moved three rows by 6 to 7 %, and aligning
+/// every function to 64 bytes did not settle them: under that alignment the
+/// same 1024-byte shift moved seven rows by 8 to 15 %. Single rows have
+/// moved by 30 to 50 % in runs whose change did not touch the call:
+/// `set_transform_world` +34.3 % (`a40180c8467b-vs-ab410d5a732f`),
+/// `set_render_state` +32.4 and +41.4 % (two runs of
+/// `1abbd7e4182b-vs-877983247ff2`) and `set_ps_constant_i_1` +50.9 and
+/// +37.0 % (two runs of `1abbd7e4182b-vs-24a54cf43498`). So a change
+/// elsewhere in the image fails rows whose code it did not touch. At 50 %
+/// nearly all of those shifts pass, the largest still fails, and so does a
+/// call that took on work of the order of its own cost; a smaller change to
+/// the API thread's cost is for the frame benchmarks to show. The floor is
+/// a ratio, so an improvement has to halve the time.
+const RATIO_FLOOR_PER_CALL: f64 = 0.5;
+
+/// The noise floor of a draw's per-call time in the API-cost benchmark ([`PER_CALL_DRAW_PREFIX`]).
+///
+/// Those rows time a draw, alone or with the state change paired with it,
+/// of 30 to 85 ns, and placement moves them far less than the setters:
+/// across every kept `bench-ab` report, apart from the runs whose change
+/// made draws about twice as fast, no draw row moved by more than 6 %. So
+/// they keep a floor that fails a draw that costs a sixth more.
+const RATIO_FLOOR_PER_CALL_DRAW: f64 = 0.15;
+
+/// The prefix of the API-cost benchmark's per-call times, each one call (or pair) in nanoseconds.
+const PER_CALL_PREFIX: &str = "ns_per_call.";
+
+/// The prefix of the API-cost benchmark's draw times, which [`PER_CALL_PREFIX`] also covers.
+const PER_CALL_DRAW_PREFIX: &str = "ns_per_call.draw_";
 
 /// How many estimated standard deviations a median has to clear.
 const SIGMA_FACTOR: f64 = 3.0;
@@ -1473,7 +1515,12 @@ pub fn judge(name: &str, definition: &Metric, base: &[f64], cand: &[f64], accept
             } else {
                 0.0
             };
-            let floor = if name.contains("p99") && definition.class != Class::Bytes {
+            let time = definition.class == Class::Time;
+            let floor = if time && name.starts_with(PER_CALL_DRAW_PREFIX) {
+                RATIO_FLOOR_PER_CALL_DRAW
+            } else if time && name.starts_with(PER_CALL_PREFIX) {
+                RATIO_FLOOR_PER_CALL
+            } else if name.contains("p99") && definition.class != Class::Bytes {
                 RATIO_FLOOR_TAIL
             } else {
                 RATIO_FLOOR
