@@ -183,11 +183,16 @@ fn stream_layouts_mark_the_streams_whose_stride_is_short_of_the_extent() {
     // SAFETY: both locals outlive the token, which is only read below.
     let snapshot = unsafe { AttrSnapshot::new(NonNull::from(&attrs[0]), NonNull::from(&header)) };
     let strides = [16, 0, 16];
-    let (layouts, crossing) = stream_layouts_with(&snapshot, |stream, extent| StreamLayout {
-        stride: layout_stride(strides[stream as usize], extent),
-        step: VertexStepFunction::PerVertex,
-        step_rate: 1,
-    });
+    let mut crossing = 0;
+    let layouts = stream_layouts_with(
+        &snapshot,
+        |stream, extent| StreamLayout {
+            stride: layout_stride(strides[stream as usize], extent),
+            step: VertexStepFunction::PerVertex,
+            step_rate: 1,
+        },
+        &mut crossing,
+    );
     // Stream 0 steps 16 bytes under a 32-byte extent; stream 1's zero stride
     // steps by its extent and stream 2's stride covers its extent.
     assert_eq!(crossing, 0b001);

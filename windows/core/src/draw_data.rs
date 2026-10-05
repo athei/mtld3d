@@ -218,44 +218,47 @@ pub fn stream_layouts(
     source: &VertexSource,
     attrs: &AttrSnapshot,
 ) -> [StreamLayout; MAX_STREAMS as usize] {
-    stream_layouts_with(attrs, |stream, extent| match source.feed(stream) {
-        StreamFeed::Inline { stride } => StreamLayout {
-            stride: layout_stride(stride, extent),
-            step: VertexStepFunction::PerVertex,
-            step_rate: 1,
+    stream_layouts_with(
+        attrs,
+        |stream, extent| match source.feed(stream) {
+            StreamFeed::Inline { stride } => StreamLayout {
+                stride: layout_stride(stride, extent),
+                step: VertexStepFunction::PerVertex,
+                step_rate: 1,
+            },
+            StreamFeed::Buffer(b) => bound_stream_layout(b.stride, extent, b.freq),
+            StreamFeed::Null => StreamLayout {
+                stride: extent,
+                step: VertexStepFunction::Constant,
+                step_rate: 0,
+            },
         },
-        StreamFeed::Buffer(b) => bound_stream_layout(b.stride, extent, b.freq),
-        StreamFeed::Null => StreamLayout {
-            stride: extent,
-            step: VertexStepFunction::Constant,
-            step_rate: 0,
-        },
-    })
-    .0
+        &mut 0,
+    )
 }
 
 /// Compute declaration layouts while borrowing stream fields from their capture owner.
 ///
-/// Also returns the streams whose layout steps by less than the extent of the
-/// elements the shader consumes on them, bit `n` for stream `n`: the draw
-/// fetches those through a [`crate::streams::CrossingFetch`].
+/// Also sets in `crossing` the streams whose layout steps by less than the
+/// extent of the elements the shader consumes on them, bit `n` for stream
+/// `n`: the draw fetches those through a [`crate::streams::CrossingFetch`].
 #[must_use]
 pub fn stream_layouts_with(
     attrs: &AttrSnapshot,
     mut layout: impl FnMut(u32, u32) -> StreamLayout,
-) -> ([StreamLayout; MAX_STREAMS as usize], u16) {
+    crossing: &mut u16,
+) -> [StreamLayout; MAX_STREAMS as usize] {
     let mut layouts = [StreamLayout::UNUSED; MAX_STREAMS as usize];
-    let mut crossing = 0u16;
     let mut used = attrs.used_streams();
     while used != 0 {
         let stream = used.trailing_zeros();
         used &= used - 1;
         let extent = attrs.extents()[stream as usize];
         let stream_layout = layout(stream, extent);
-        crossing |= u16::from(stream_layout.stride < extent) << stream;
+        *crossing |= u16::from(stream_layout.stride < extent) << stream;
         layouts[stream as usize] = stream_layout;
     }
-    (layouts, crossing)
+    layouts
 }
 
 /// Where the index data comes from (or whether the draw is non-indexed).

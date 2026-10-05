@@ -813,7 +813,8 @@ fn emit_draw_view(
     // step function from the binding (a zero stride is one constant element,
     // the rest step per the stream's `SetStreamSourceFreq`), a constant zero
     // feed where nothing is bound. Part of the pipeline identity.
-    let (mut layouts, crossing) = stream_layouts_view(vertex_source, &attrs);
+    let mut crossing = 0;
+    let mut layouts = stream_layouts_view(vertex_source, &attrs, &mut crossing);
     // An attribute that ends past its stream's stride is fetched through a
     // binding of its own (`CrossingFetch`); every other draw takes the
     // declaration's attributes and the stream layouts as they are.
@@ -822,9 +823,6 @@ fn emit_draw_view(
     } else {
         crossing_fetch(enc, vertex_source, &attrs, &mut layouts, crossing)
     };
-    let attrs_ref = fetch
-        .as_ref()
-        .map_or(attrs.as_slice(), |fetch| fetch.attrs());
     enc.maybe_emit_draw_trace(
         shaders,
         metal_prim,
@@ -835,6 +833,9 @@ fn emit_draw_view(
     drop(t_resolve);
 
     let t_pipeline = CycleAddTimer::start(enc.op_sub_cycles_ptr(OpSub::Pipeline));
+    let attrs_ref = fetch
+        .as_ref()
+        .map_or(attrs.as_slice(), |fetch| fetch.attrs());
     // Instances of an indexed draw: stream 0's frequency count, but only when
     // a stream this draw reads is per-instance; non-indexed draws never
     // instance (D3D9 ignores the frequency state for them).
@@ -866,7 +867,7 @@ fn emit_draw_view(
         vs_fn: vs_handles.func,
         ps_fn: ps_handles.func,
         vdecl_hash,
-        stream_layouts: fetch.as_ref().map_or(layouts, |fetch| *fetch.layouts()),
+        stream_layouts: layouts,
         color_format,
         attach,
         rs: render_state.pipeline_rs,
@@ -874,6 +875,9 @@ fn emit_draw_view(
         ps_color_out_mask,
         sample_count: enc.current_color_sample_count(),
     };
+    if let Some(fetch) = &fetch {
+        pipeline_snapshot.stream_layouts = *fetch.layouts();
+    }
     if rt0_drop {
         pipeline_snapshot.remove_color_output();
     }
