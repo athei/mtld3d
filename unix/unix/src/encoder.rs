@@ -690,11 +690,13 @@ impl Default for VertexTexBinding {
 }
 
 impl PsSamplerDecls {
-    /// Collect the declared samplers from a parsed program (empty for a VS).
+    /// Collect the declared samplers from a parsed program, pixel or vertex.
     ///
     /// Uses `declared_ps_samplers`, the same source the emitter builds the
     /// fragment-function signature from, so the bind side cannot drift from it.
-    /// Stages at or past `STAGE_COUNT` are ignored (a D3D9 PS declares s0..s15).
+    /// It reads every `dcl_<dim> sN`, so a `vs_3_0` reports its vertex fetch
+    /// slots s0..s3 here too. Stages at or past `STAGE_COUNT` are ignored (a
+    /// D3D9 PS declares s0..s15).
     fn from_program(program: &DxsoProgram) -> Self {
         let mut decls = Self::default();
         for &slot in declared_ps_samplers(program).keys() {

@@ -1037,15 +1037,17 @@ pub fn declared_ps_samplers(ps: &DxsoProgram) -> BTreeMap<u16, TextureType> {
 /// Sampler slots a `texldl` names, bit `i` for `s<i>`.
 ///
 /// Metal ignores a sampler's LOD clamps for a sample at an explicit level, so
-/// these are the slots whose stage state the shader applies itself (through
-/// the `lod_bias` rows `.z` and `.w`). The encoder keys the table on them, so a
-/// stage clamp the shader cannot observe mints no variant. Subroutine bodies
-/// count, since the emitter inlines them.
+/// these are the slots whose stage state the shader applies itself: through
+/// the pixel `lod_bias` rows `.z` and `.w`, or for a `vs_3_0` the vertex
+/// `vs_lod` rows (`VsSamplerKinds::lod_table`). The encoder keys either table
+/// on them, so a stage clamp the shader cannot observe mints no variant.
+/// Subroutine bodies count, since the emitter inlines them.
 #[must_use]
-pub fn explicit_lod_samplers(ps: &DxsoProgram) -> u16 {
-    ps.instructions
+pub fn explicit_lod_samplers(program: &DxsoProgram) -> u16 {
+    program
+        .instructions
         .iter()
-        .chain(ps.subroutines.values().flatten())
+        .chain(program.subroutines.values().flatten())
         .filter(|inst| inst.opcode == Opcode::TexLdL)
         .filter_map(|inst| inst.srcs.get(1))
         .filter(|sampler| sampler.reg.index < 16)

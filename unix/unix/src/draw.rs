@@ -52,7 +52,7 @@ static VS_DRAW_DEFAULT: std::sync::LazyLock<[u8; VS_DRAW_BYTES]> = std::sync::La
     )
 });
 
-use super::encoder::{FrameEncoder, STAGE_COUNT, StageLibHandles};
+use super::encoder::{FrameEncoder, PsSamplerDecls, STAGE_COUNT, StageLibHandles};
 
 /// Sub-target for the per-`(VS, PS, state)` diagnostic from the depth-bias site below.
 ///
@@ -364,24 +364,32 @@ fn emit_draw_view(
         .as_ref()
         .expect("emit_draw: stage_bindings not populated");
     let attrs = snap.attrs.expect("emit_draw: attrs not populated");
-    let vs: VsSourceView<'_> = snap
+    // The snapshot's own VS record. Its address is the record's identity in
+    // the library memo, which `vs` below may not keep.
+    let vs_snapshot: VsSourceView<'_> = snap
         .vs
         .as_ref()
         .expect("emit_draw: vs not populated")
         .as_ref();
+    // The samplers a programmable VS declares, read once for the key below
+    // and for the vertex texture binds.
+    let vs_decls = match vs_snapshot {
+        VsSourceView::Programmable(ProgrammableVsSource { vs_id, .. }) => {
+            enc.ps_declared_samplers(*vs_id)
+        }
+        VsSourceView::FixedFunction(_) => PsSamplerDecls::default(),
+    };
     // Every vertex sample names its level, and Metal applies no sampler LOD
     // clamp to an explicit level, so a vertex slot whose state moves that
     // level (a texture LOD, a LOD bias, a finest level) reaches the shader
     // through the vertex LOD table. The VS key carries the table only for a
     // shader whose `texldl` samples such a slot; a draw with no such slot
-    // reads one encoder field here and keeps its library.
+    // keeps its library. The keyed copy is a local, so the memo lookup
+    // names the snapshot record alongside it.
     let vs_lod_source;
-    let vertex_lod_mask = u16::from(enc.vertex_lod_mask());
-    let vs = match vs {
+    let vs = match vs_snapshot {
         VsSourceView::Programmable(source)
-            if vertex_lod_mask != 0
-                && enc.ps_declared_samplers(source.vs_id).explicit_lod_mask() & vertex_lod_mask
-                    != 0 =>
+            if vs_decls.explicit_lod_mask() & u16::from(enc.vertex_lod_mask()) != 0 =>
         {
             vs_lod_source = source.with_lod_table();
             VsSourceView::Programmable(&vs_lod_source)
@@ -773,7 +781,7 @@ fn emit_draw_view(
     //    installs finished builds before probing again and queues both
     //    stages before deciding whether to wait, defer or skip the draw.
     let t_lookup = CycleAddTimer::start(enc.op_sub_detail_ptr(OpSubDetail::RLookup));
-    let libraries = enc.lookup_libraries(vs, ps, ps_variant);
+    let libraries = enc.lookup_libraries(vs, vs_snapshot, ps, ps_variant);
     let Some((vs_handles, ps_handles)) = libraries.or_else(|| {
         resolve_libraries_slow(
             enc,
@@ -1192,12 +1200,7 @@ fn emit_draw_view(
     // `SetSamplerState` on `D3DVERTEXTEXTURESAMPLER0..3` and live on the
     // encoder rather than the per-draw snapshot; a declared slot the game
     // never bound gets the shared black fallback, as on the fragment side.
-    if let VsSourceView::Programmable(ProgrammableVsSource {
-        vs_id,
-        sampler_kinds,
-        ..
-    }) = vs
-    {
+    if let VsSourceView::Programmable(ProgrammableVsSource { sampler_kinds, .. }) = vs {
         // The table persists on the encoder, so a later draw of the pass
         // carrying the same rows skips the re-bind.
         if sampler_kinds.lod_table
@@ -1210,8 +1213,7 @@ fn emit_draw_view(
                 VS_LOD_SLOT,
             ));
         }
-        let decls = enc.ps_declared_samplers(*vs_id);
-        let mut mask = decls.unbound(0) & 0xF;
+        let mut mask = vs_decls.unbound(0) & 0xF;
         while mask != 0 {
             let slot = mask.trailing_zeros();
             mask &= mask - 1;

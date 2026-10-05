@@ -71,7 +71,7 @@ pub const EXPLICIT_LOD_OPEN_ROWS: [[f32; 2]; LOD_BIAS_SLOTS] = [EXPLICIT_LOD_OPE
 ///
 /// The four `D3DVERTEXTEXTURESAMPLER0..3` slots a `vs_3_0` samples as
 /// `s0`..`s3`.
-pub const VS_LOD_SLOTS: usize = 4;
+pub const VS_LOD_SLOTS: usize = crate::passes::VERTEX_SAMPLER_SLOTS;
 
 /// Byte length of the vertex LOD uniform.
 pub const VS_LOD_BYTES: usize = VS_LOD_SLOTS * 8;
