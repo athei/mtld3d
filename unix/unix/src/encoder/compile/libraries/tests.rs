@@ -146,7 +146,12 @@ fn a_rebound_shader_probes_the_index_for_its_own_record() {
     for (vs, expected) in [(&first_vs, 10), (&second_vs, 30), (&first_vs, 10)] {
         assert_eq!(
             libraries
-                .lookup_ready(VsSourceView::Programmable(vs), VsSourceView::Programmable(vs), ps_view, variant(0))
+                .lookup_ready(
+                    VsSourceView::Programmable(vs),
+                    VsSourceView::Programmable(vs),
+                    ps_view,
+                    variant(0)
+                )
                 .map(raw_pair),
             Some((expected, 20)),
             "each bound shader answers with its own library"
@@ -176,7 +181,9 @@ fn a_changed_variant_probes_the_pixel_index() {
     let vs_view = VsSourceView::Programmable(&vs);
     for (key, expected) in [(variant(0), 20), (variant(4), 40), (variant(0), 20)] {
         assert_eq!(
-            libraries.lookup_ready(vs_view, vs_view, ps_view, key).map(raw_pair),
+            libraries
+                .lookup_ready(vs_view, vs_view, ps_view, key)
+                .map(raw_pair),
             Some((10, expected)),
             "the pixel library follows the draw's variant on an unchanged record"
         );
@@ -253,7 +260,12 @@ fn a_recycled_record_address_misses_after_the_packet_boundary() {
     let address = vs_record(VsSourceView::Programmable(&vs));
     assert_eq!(
         libraries
-            .lookup_ready(VsSourceView::Programmable(&vs), VsSourceView::Programmable(&vs), ps_view, variant(0))
+            .lookup_ready(
+                VsSourceView::Programmable(&vs),
+                VsSourceView::Programmable(&vs),
+                ps_view,
+                variant(0)
+            )
             .map(raw_pair),
         Some((10, 20))
     );
@@ -284,9 +296,19 @@ fn a_recycled_record_without_the_packet_boundary_trips_the_memo_check() {
     let mut vs = programmable_vs(1);
     built_pair(&mut libraries, &vs, &ps);
     let ps_view = PsSourceView::Programmable(&ps);
-    let _ = libraries.lookup_ready(VsSourceView::Programmable(&vs), VsSourceView::Programmable(&vs), ps_view, variant(0));
+    let _ = libraries.lookup_ready(
+        VsSourceView::Programmable(&vs),
+        VsSourceView::Programmable(&vs),
+        ps_view,
+        variant(0),
+    );
     vs.vs_id = ProgramId::from_shader_reply(9);
-    let _ = libraries.lookup_ready(VsSourceView::Programmable(&vs), VsSourceView::Programmable(&vs), ps_view, variant(0));
+    let _ = libraries.lookup_ready(
+        VsSourceView::Programmable(&vs),
+        VsSourceView::Programmable(&vs),
+        ps_view,
+        variant(0),
+    );
 }
 
 #[test]
@@ -352,7 +374,12 @@ fn fixed_function_records_are_tagged_and_keyed_by_content() {
     for (source, expected) in [(&vs, 80), (&fogged, 82), (&vs, 80)] {
         assert_eq!(
             libraries
-                .lookup_ready(VsSourceView::FixedFunction(source), VsSourceView::FixedFunction(source), ps_view, variant(0))
+                .lookup_ready(
+                    VsSourceView::FixedFunction(source),
+                    VsSourceView::FixedFunction(source),
+                    ps_view,
+                    variant(0)
+                )
                 .map(raw_pair),
             Some((expected, 90))
         );
@@ -360,7 +387,12 @@ fn fixed_function_records_are_tagged_and_keyed_by_content() {
     let specular = fixed_ps(true);
     assert_eq!(
         libraries
-            .lookup_ready(view, view, PsSourceView::FixedFunction(&specular), variant(0))
+            .lookup_ready(
+                view,
+                view,
+                PsSourceView::FixedFunction(&specular),
+                variant(0)
+            )
             .map(|_| ()),
         None,
         "an unbuilt fixed-function pixel key goes to the slow path"

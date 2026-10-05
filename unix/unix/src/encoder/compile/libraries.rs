@@ -321,7 +321,8 @@ fn vs_record(source: VsSourceView<'_>) -> usize {
 /// the snapshot record's address does, and bit 1 (free, the records being
 /// 8-aligned) tells the two keys of one record apart.
 fn vs_memo_identity(vs: VsSourceView<'_>, snapshot: VsSourceView<'_>) -> usize {
-    let lod_table = matches!(vs, VsSourceView::Programmable(value) if value.sampler_kinds.lod_table);
+    let lod_table =
+        matches!(vs, VsSourceView::Programmable(value) if value.sampler_kinds.lod_table);
     vs_record(snapshot) | (usize::from(lod_table) << 1)
 }
 
