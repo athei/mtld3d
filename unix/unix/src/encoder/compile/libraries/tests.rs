@@ -27,7 +27,9 @@ const fn programmable_vs(id: u64) -> ProgrammableVsSource {
         sampler_kinds: VsSamplerKinds {
             volume_mask: 0,
             cube_mask: 0,
+            lod_table: false,
         },
+        reserved: [0; 7],
     }
 }
 
@@ -118,14 +120,14 @@ fn repeated_records_answer_from_the_memo() {
         "recording leaves the memo empty"
     );
     let first = libraries
-        .lookup_ready(vs_view, ps_view, variant(0))
+        .lookup_ready(vs_view, vs_view, ps_view, variant(0))
         .map(raw_pair);
     assert_eq!(first, Some((10, 20)));
     assert_eq!(libraries.memo.vs_record, vs_record(vs_view));
     assert_eq!(libraries.memo.ps_record, ps_record(ps_view));
     assert_eq!(
         libraries
-            .lookup_ready(vs_view, ps_view, variant(0))
+            .lookup_ready(vs_view, vs_view, ps_view, variant(0))
             .map(raw_pair),
         first,
         "a draw naming the same records gets the same libraries"
@@ -144,7 +146,12 @@ fn a_rebound_shader_probes_the_index_for_its_own_record() {
     for (vs, expected) in [(&first_vs, 10), (&second_vs, 30), (&first_vs, 10)] {
         assert_eq!(
             libraries
-                .lookup_ready(VsSourceView::Programmable(vs), ps_view, variant(0))
+                .lookup_ready(
+                    VsSourceView::Programmable(vs),
+                    VsSourceView::Programmable(vs),
+                    ps_view,
+                    variant(0)
+                )
                 .map(raw_pair),
             Some((expected, 20)),
             "each bound shader answers with its own library"
@@ -156,7 +163,7 @@ fn a_rebound_shader_probes_the_index_for_its_own_record() {
     let view = VsSourceView::Programmable(&resent);
     assert_eq!(
         libraries
-            .lookup_ready(view, ps_view, variant(0))
+            .lookup_ready(view, view, ps_view, variant(0))
             .map(raw_pair),
         Some((10, 20))
     );
@@ -174,7 +181,9 @@ fn a_changed_variant_probes_the_pixel_index() {
     let vs_view = VsSourceView::Programmable(&vs);
     for (key, expected) in [(variant(0), 20), (variant(4), 40), (variant(0), 20)] {
         assert_eq!(
-            libraries.lookup_ready(vs_view, ps_view, key).map(raw_pair),
+            libraries
+                .lookup_ready(vs_view, vs_view, ps_view, key)
+                .map(raw_pair),
             Some((10, expected)),
             "the pixel library follows the draw's variant on an unchanged record"
         );
@@ -185,7 +194,7 @@ fn a_changed_variant_probes_the_pixel_index() {
     };
     assert_eq!(
         libraries
-            .lookup_ready(vs_view, ps_view, flagged)
+            .lookup_ready(vs_view, vs_view, ps_view, flagged)
             .map(|_| ()),
         None,
         "a variant that was never built is no memo hit"
@@ -204,7 +213,7 @@ fn a_rebuild_or_an_adopted_library_replaces_the_memoised_handles() {
     );
     assert_eq!(
         libraries
-            .lookup_ready(vs_view, ps_view, variant(0))
+            .lookup_ready(vs_view, vs_view, ps_view, variant(0))
             .map(raw_pair),
         Some((10, 20))
     );
@@ -216,7 +225,7 @@ fn a_rebuild_or_an_adopted_library_replaces_the_memoised_handles() {
     );
     assert_eq!(
         libraries
-            .lookup_ready(vs_view, ps_view, variant(0))
+            .lookup_ready(vs_view, vs_view, ps_view, variant(0))
             .map(raw_pair),
         Some((50, 20))
     );
@@ -224,7 +233,7 @@ fn a_rebuild_or_an_adopted_library_replaces_the_memoised_handles() {
     libraries.record_ps(ps_view, variant(0), Some(handles(60)));
     assert_eq!(
         libraries
-            .lookup_ready(vs_view, ps_view, variant(0))
+            .lookup_ready(vs_view, vs_view, ps_view, variant(0))
             .map(raw_pair),
         Some((50, 60))
     );
@@ -232,7 +241,7 @@ fn a_rebuild_or_an_adopted_library_replaces_the_memoised_handles() {
     libraries.record_programmable_ps(ps.ps_id, variant(0), None);
     assert_eq!(
         libraries
-            .lookup_ready(vs_view, ps_view, variant(0))
+            .lookup_ready(vs_view, vs_view, ps_view, variant(0))
             .map(|_| ()),
         None
     );
@@ -251,7 +260,12 @@ fn a_recycled_record_address_misses_after_the_packet_boundary() {
     let address = vs_record(VsSourceView::Programmable(&vs));
     assert_eq!(
         libraries
-            .lookup_ready(VsSourceView::Programmable(&vs), ps_view, variant(0))
+            .lookup_ready(
+                VsSourceView::Programmable(&vs),
+                VsSourceView::Programmable(&vs),
+                ps_view,
+                variant(0)
+            )
             .map(raw_pair),
         Some((10, 20))
     );
@@ -266,7 +280,7 @@ fn a_recycled_record_address_misses_after_the_packet_boundary() {
     );
     assert_eq!(
         libraries
-            .lookup_ready(view, ps_view, variant(0))
+            .lookup_ready(view, view, ps_view, variant(0))
             .map(raw_pair),
         Some((70, 20)),
         "the recycled address answers for the record now stored there"
@@ -282,9 +296,19 @@ fn a_recycled_record_without_the_packet_boundary_trips_the_memo_check() {
     let mut vs = programmable_vs(1);
     built_pair(&mut libraries, &vs, &ps);
     let ps_view = PsSourceView::Programmable(&ps);
-    let _ = libraries.lookup_ready(VsSourceView::Programmable(&vs), ps_view, variant(0));
+    let _ = libraries.lookup_ready(
+        VsSourceView::Programmable(&vs),
+        VsSourceView::Programmable(&vs),
+        ps_view,
+        variant(0),
+    );
     vs.vs_id = ProgramId::from_shader_reply(9);
-    let _ = libraries.lookup_ready(VsSourceView::Programmable(&vs), ps_view, variant(0));
+    let _ = libraries.lookup_ready(
+        VsSourceView::Programmable(&vs),
+        VsSourceView::Programmable(&vs),
+        ps_view,
+        variant(0),
+    );
 }
 
 #[test]
@@ -301,7 +325,7 @@ fn a_device_reset_forgets_the_memo_and_the_failures() {
     );
     assert_eq!(
         libraries
-            .lookup_ready(vs_view, ps_view, variant(0))
+            .lookup_ready(vs_view, vs_view, ps_view, variant(0))
             .map(raw_pair),
         Some((10, 20))
     );
@@ -315,7 +339,7 @@ fn a_device_reset_forgets_the_memo_and_the_failures() {
     );
     assert_eq!(
         libraries
-            .lookup_ready(vs_view, ps_view, variant(0))
+            .lookup_ready(vs_view, vs_view, ps_view, variant(0))
             .map(raw_pair),
         Some((10, 20)),
         "built libraries survive the reset"
@@ -324,7 +348,7 @@ fn a_device_reset_forgets_the_memo_and_the_failures() {
     assert_eq!((libraries.memo.vs_record, libraries.memo.ps_record), (0, 0));
     assert_eq!(
         libraries
-            .lookup_ready(vs_view, ps_view, variant(0))
+            .lookup_ready(vs_view, vs_view, ps_view, variant(0))
             .map(|_| ()),
         None
     );
@@ -350,7 +374,12 @@ fn fixed_function_records_are_tagged_and_keyed_by_content() {
     for (source, expected) in [(&vs, 80), (&fogged, 82), (&vs, 80)] {
         assert_eq!(
             libraries
-                .lookup_ready(VsSourceView::FixedFunction(source), ps_view, variant(0))
+                .lookup_ready(
+                    VsSourceView::FixedFunction(source),
+                    VsSourceView::FixedFunction(source),
+                    ps_view,
+                    variant(0)
+                )
                 .map(raw_pair),
             Some((expected, 90))
         );
@@ -358,7 +387,12 @@ fn fixed_function_records_are_tagged_and_keyed_by_content() {
     let specular = fixed_ps(true);
     assert_eq!(
         libraries
-            .lookup_ready(view, PsSourceView::FixedFunction(&specular), variant(0))
+            .lookup_ready(
+                view,
+                view,
+                PsSourceView::FixedFunction(&specular),
+                variant(0)
+            )
             .map(|_| ()),
         None,
         "an unbuilt fixed-function pixel key goes to the slow path"
@@ -452,4 +486,63 @@ fn every_variant_field_reaches_the_compared_words() {
     assert!(memo.holds_ps(8, &changed[14]));
     assert!(!memo.holds_ps(8, &base));
     assert!(!memo.holds_ps(16, &changed[14]));
+}
+
+#[test]
+fn lod_table_copies_at_one_address_answer_for_their_own_snapshot_records() {
+    // A draw keyed for the vertex LOD table passes a copy of its snapshot
+    // record that lives in the same local slot for every such draw, so the
+    // memo identity must come from the snapshot record, and must tell the
+    // record's two keys apart.
+    let mut libraries = StageLibraries::default();
+    let first = programmable_vs(1);
+    let second = programmable_vs(3);
+    let ps = programmable_ps(2);
+    let ps_view = PsSourceView::Programmable(&ps);
+    libraries.record_ps(ps_view, variant(0), Some(handles(20)));
+    libraries.record_vs(
+        VsSourceView::Programmable(&first.with_lod_table()),
+        Some(handles(10)),
+    );
+    libraries.record_vs(
+        VsSourceView::Programmable(&second.with_lod_table()),
+        Some(handles(30)),
+    );
+    libraries.record_vs(VsSourceView::Programmable(&first), Some(handles(50)));
+
+    let mut slot = first.with_lod_table();
+    let answer = |libraries: &mut StageLibraries, keyed: &ProgrammableVsSource, record| {
+        libraries
+            .lookup_ready(
+                VsSourceView::Programmable(keyed),
+                VsSourceView::Programmable(record),
+                ps_view,
+                variant(0),
+            )
+            .map(raw_pair)
+    };
+    assert_eq!(answer(&mut libraries, &slot, &first), Some((10, 20)));
+    slot = second.with_lod_table();
+    assert_eq!(
+        answer(&mut libraries, &slot, &second),
+        Some((30, 20)),
+        "the second shader's copy at the first one's address gets its own library"
+    );
+    assert_eq!(answer(&mut libraries, &first, &first), Some((50, 20)));
+    slot = first.with_lod_table();
+    assert_eq!(
+        answer(&mut libraries, &slot, &first),
+        Some((10, 20)),
+        "one record keyed with and without the table is two memo identities"
+    );
+    assert_ne!(
+        vs_memo_identity(
+            VsSourceView::Programmable(&slot),
+            VsSourceView::Programmable(&first)
+        ),
+        vs_memo_identity(
+            VsSourceView::Programmable(&first),
+            VsSourceView::Programmable(&first)
+        )
+    );
 }

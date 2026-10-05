@@ -54,8 +54,12 @@ pub(super) fn write_vs(
 ) -> Result<(), WireError> {
     match source {
         VsSourceView::Programmable(value) => {
+            if value.reserved != [0; 7] {
+                return Err(WireError::InvalidValue);
+            }
             header(writer, SourceKind::Programmable)?;
-            // SAFETY: the canonical programmable layout contains only initialized scalar fields.
+            // SAFETY: the canonical programmable layout has initialized explicit padding only,
+            // and its one bool was written as a bool.
             unsafe { capture(value, writer) }
         }
         VsSourceView::FixedFunction(value) => {
@@ -129,12 +133,16 @@ pub(super) fn read_vs(reader: &mut SnapshotReader<'_>) -> Result<VsSourcePtr, Wi
         // above run before the typed borrow. Size and alignment remain checked in every build.
         VsSourceView::FixedFunction(unsafe { borrow::<FixedVsSource>(bytes) })
     } else {
-        let bytes = super::read_aligned_bytes(reader, 16, 8)?;
+        let bytes = super::read_aligned_bytes(reader, 24, 8)?;
         #[cfg(debug_assertions)]
-        if crate::draw_data::ShaderSourceFlags::from_bits(bytes[12]).is_none() {
+        if crate::draw_data::ShaderSourceFlags::from_bits(bytes[12]).is_none()
+            || bytes[16] > 1
+            || bytes[17..].iter().any(|&b| b != 0)
+        {
             return Err(WireError::InvalidValue);
         }
-        // SAFETY: all fields are integers or validated flags in the pinned canonical layout.
+        // SAFETY: the paired typed producer initialized the bool and flags; debug validation
+        // occurs before this reference, and size/alignment are checked in every build.
         VsSourceView::Programmable(unsafe { borrow::<ProgrammableVsSource>(bytes) })
     };
     // SAFETY: trusted reader retains the initialized immutable command arena through all token uses.
@@ -189,7 +197,7 @@ packed_fields!(crate::dxso::FfVsKey;
 packed_fields!(crate::dxso::FfStage;
     color_op:1, color_arg1:1, color_arg2:1, alpha_op:1, alpha_arg1:1, alpha_arg2:1, flags:1);
 packed_fields!(crate::dxso::FfPsKey; stages:56, specular_add:1, tt_projected_mask:1);
-packed_fields!(crate::dxso::VsSamplerKinds; volume_mask:1, cube_mask:1);
+packed_fields!(crate::dxso::VsSamplerKinds; volume_mask:1, cube_mask:1, lod_table:1);
 packed_fields!(crate::dxso::VariantKey;
     alpha_func:1, fog_mode:1, fog_table_mode:1, linked_input_mask:1, depth_sampler_mask:2,
     depth_fetch_mask:2, fetch4_mask:2, fetch4_alpha_mask:2, raw_depth_red_mask:2,
@@ -201,13 +209,13 @@ const _: () = {
 
     use crate::dxso::{FfPsKey, FfStage, FfVsKey, VsSamplerKinds};
     assert!(size_of::<SourceHeader>() == 8);
-    assert!(size_of::<VsSamplerKinds>() == 2);
+    assert!(size_of::<VsSamplerKinds>() == 3);
     assert!(size_of::<FfVsKey>() == 48);
     assert!(offset_of!(FfVsKey, reserved) == 47);
     assert!(size_of::<FfStage>() == 7);
     assert!(size_of::<FfPsKey>() == 58);
     assert!(offset_of!(FfPsKey, specular_add) == 56);
-    assert!(size_of::<ProgrammableVsSource>() == 16);
+    assert!(size_of::<ProgrammableVsSource>() == 24);
     assert!(align_of::<ProgrammableVsSource>() == 8);
     assert!(offset_of!(ProgrammableVsSource, vs_id) == 0);
     assert!(offset_of!(ProgrammableVsSource, max_const_used) == 8);
@@ -215,6 +223,7 @@ const _: () = {
     assert!(offset_of!(ProgrammableVsSource, flags) == 12);
     assert!(offset_of!(ProgrammableVsSource, clip_plane_count) == 13);
     assert!(offset_of!(ProgrammableVsSource, sampler_kinds) == 14);
+    assert!(offset_of!(ProgrammableVsSource, reserved) == 17);
     assert!(size_of::<ProgrammablePsSource>() == 16);
     assert!(align_of::<ProgrammablePsSource>() == 8);
     assert!(offset_of!(ProgrammablePsSource, ps_id) == 0);

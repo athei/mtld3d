@@ -9,7 +9,7 @@
 
 use mtld3d_shared::mtl::{
     PS_BOOL_CONST_SLOT, PS_DRAW_SLOT, PS_INT_CONST_SLOT, PS_LOD_BIAS_SLOT, VS_FLOAT_CONST_SLOT,
-    VS_INT_CONST_SLOT, VS_POS_FIXUP_SLOT,
+    VS_INT_CONST_SLOT, VS_LOD_SLOT, VS_POS_FIXUP_SLOT,
 };
 use mtld3d_types::{
     D3DFOG_LINEAR, D3DTA_DIFFUSE, D3DTA_SPECULAR, D3DTOP_DISABLE, D3DTOP_SELECTARG1,
@@ -5686,7 +5686,7 @@ fn vertex_fetch_slot_bound_to_a_volume_texture_types_the_argument_3d() {
     let vs = parse(&vertex_fetch_shader(0x9000_0000)).expect("vs_3_0 parse");
     let kinds = VsSamplerKinds {
         volume_mask: 0b0001,
-        cube_mask: 0,
+        ..VsSamplerKinds::default()
     };
     let msl = emit_vs_programmable_named(&vs, "vtf_vs", u16::MAX, 0, kinds).expect("emit");
     assert!(
@@ -5724,8 +5724,8 @@ fn vertex_fetch_slot_bound_to_a_2d_texture_types_the_argument_2d() {
 fn vertex_fetch_slot_bound_to_a_cube_texture_types_the_argument_cube() {
     let vs = parse(&vertex_fetch_shader(0x9000_0000)).expect("vs_3_0 parse");
     let kinds = VsSamplerKinds {
-        volume_mask: 0,
         cube_mask: 0b0001,
+        ..VsSamplerKinds::default()
     };
     let msl = emit_vs_programmable_named(&vs, "vtf_vs", u16::MAX, 0, kinds).expect("emit");
     assert!(
@@ -5737,6 +5737,62 @@ fn vertex_fetch_slot_bound_to_a_cube_texture_types_the_argument_cube() {
         "a cube binding samples with a three-component coord:\n{msl}"
     );
     metal_compile_or_fail(&msl);
+}
+
+#[test]
+fn vertex_texldl_reads_its_row_of_the_lod_table_only_under_the_table() {
+    // Metal ignores sampler LOD clamps at an explicit level and has no
+    // sampler bias, so under the table the level a vertex `texldl` names
+    // counts from the texture LOD plus the bias, and is clamped by the slot's
+    // finest level. Without it the shader is unchanged and declares no table.
+    let vs = parse(&vertex_fetch_shader(0x9000_0000)).expect("vs_3_0 parse");
+    let plain = emit_vs_programmable_named(&vs, "vtf_vs", u16::MAX, 0, VsSamplerKinds::default())
+        .expect("emit");
+    assert!(
+        !plain.contains("vs_lod"),
+        "no table without the key bit:\n{plain}"
+    );
+    let kinds = VsSamplerKinds {
+        lod_table: true,
+        ..VsSamplerKinds::default()
+    };
+    let msl = emit_vs_programmable_named(&vs, "vtf_vs", u16::MAX, 0, kinds).expect("emit");
+    assert!(
+        msl.contains(&format!(
+            "constant float2 *vs_lod [[buffer({VS_LOD_SLOT})]]"
+        )),
+        "the table is a vertex argument:\n{msl}"
+    );
+    assert!(
+        msl.contains(
+            "s0.sample(samp0, (vs_c[0]).xy, level(max((vs_c[0]).w + vs_lod[0].x, vs_lod[0].y)))"
+        ),
+        "texldl offsets and clamps its level by the slot's row:\n{msl}"
+    );
+    metal_compile_or_fail(&msl);
+}
+
+#[test]
+fn a_vertex_shader_without_samplers_declares_no_lod_table() {
+    // The key bit only follows a `texldl` slot, but a shader with no sampler
+    // has no row to read, so the emitter leaves the argument out regardless.
+    let vs = parse(&[
+        VS3_HEADER,
+        opcode_token(OP_DCL, 2),
+        dcl_usage_token(DCL_POSITION, 0),
+        dst_token(TYPE_INPUT, 0, 0xF, false),
+        opcode_token(OP_MOV, 2),
+        dst_token(TYPE_RASTOUT, 0, 0xF, false),
+        src_token(TYPE_INPUT, 0, SWIZ_IDENTITY, 0),
+        END_TOKEN,
+    ])
+    .expect("vs_3_0 parse");
+    let kinds = VsSamplerKinds {
+        lod_table: true,
+        ..VsSamplerKinds::default()
+    };
+    let msl = emit_vs_programmable_named(&vs, "plain_vs", u16::MAX, 0, kinds).expect("emit");
+    assert!(!msl.contains("vs_lod"), "no sampler, no table:\n{msl}");
 }
 
 #[test]
@@ -5770,8 +5826,8 @@ fn vertex_sampler_kinds_reads_one_slot_at_a_time() {
     assert_eq!(
         kinds,
         VsSamplerKinds {
-            volume_mask: 0,
-            cube_mask: 0b1000
+            cube_mask: 0b1000,
+            ..VsSamplerKinds::default()
         }
     );
 }

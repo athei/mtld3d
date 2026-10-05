@@ -126,6 +126,7 @@ fn partial_deltas_preserve_structural_referents_and_clear_only_changed_bytes() {
 
         flags: crate::draw_data::ShaderSourceFlags::RELATIVE
             | crate::draw_data::ShaderSourceFlags::BOOLEAN,
+        reserved: [0; 7],
     });
     let uniform = captured(&[1, 2, 3, 4]);
     let mut initial_bindings = [None; 10];
@@ -773,7 +774,9 @@ fn programmable_sources_borrow_canonical_fields_without_reconstruction() {
         sampler_kinds: crate::dxso::VsSamplerKinds {
             volume_mask: 2,
             cube_mask: 4,
+            lod_table: true,
         },
+        reserved: [0; 7],
     });
     let pixel = PsSource::Programmable(ProgrammablePsSource {
         ps_id: ProgramId::from_tokens(&[3, 4]),
@@ -793,7 +796,7 @@ fn programmable_sources_borrow_canonical_fields_without_reconstruction() {
             ..SnapshotDelta::default()
         },
     );
-    assert_eq!(payload.len(), 56);
+    assert_eq!(payload.len(), 64);
     // SAFETY: source arena and canonical payload remain immutable through all token uses.
     let mut decoder = unsafe { DrawReader::new() };
     // SAFETY: encode_snapshot constructed these typed records in the retained arena.
@@ -818,8 +821,12 @@ fn programmable_sources_borrow_canonical_fields_without_reconstruction() {
     );
     assert!(vs.uses_rel_const() && vs.uses_int_const() && vs.uses_bool_const());
     assert_eq!(
-        (vs.sampler_kinds.volume_mask, vs.sampler_kinds.cube_mask),
-        (2, 4)
+        (
+            vs.sampler_kinds.volume_mask,
+            vs.sampler_kinds.cube_mask,
+            vs.sampler_kinds.lod_table
+        ),
+        (2, 4, true)
     );
     assert_eq!(ps.ps_id, ProgramId::from_tokens(&[3, 4]));
     assert_eq!((ps.max_const_used, ps.color_out_mask), (127, 11));
@@ -830,6 +837,6 @@ fn programmable_sources_borrow_canonical_fields_without_reconstruction() {
     );
     assert_eq!(
         std::ptr::from_ref(ps).cast::<u8>(),
-        payload.as_ptr().wrapping_add(40)
+        payload.as_ptr().wrapping_add(48)
     );
 }

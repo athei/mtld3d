@@ -613,6 +613,15 @@ pub const VS_FLOAT_CONST_SLOT: u32 = 30;
 /// `mtld3d_core::vs_draw` and read by both vertex-shader emitters.
 pub const VS_DRAW_SLOT: u32 = 27;
 
+/// Vertex-stage buffer slot of the per-sampler LOD table (`vs_lod`).
+///
+/// One `float2` row per vertex sampler slot, `(offset, floor)`: a `texldl`
+/// samples `level(max(lod + offset, floor))`, which carries the texture's
+/// `SetLOD`, `D3DSAMP_MIPMAPLODBIAS` and the finest level the slot may
+/// sample, since Metal applies no sampler LOD clamp to an explicit level.
+/// Bound only for a draw whose vertex shader samples a slot that needs it.
+pub const VS_LOD_SLOT: u32 = 25;
+
 /// Metal's `setVertexBytes`/`setFragmentBytes` payload cap in bytes.
 ///
 /// A larger inline payload (a `DrawPrimitiveUP` vertex stream past ~200
@@ -673,6 +682,7 @@ const _: () = {
     assert!(VS_INT_CONST_SLOT >= VERTEX_STREAM_SLOTS);
     assert!(VS_BOOL_CONST_SLOT >= VERTEX_STREAM_SLOTS);
     assert!(VS_FLOAT_CONST_SLOT >= VERTEX_STREAM_SLOTS);
+    assert!(VS_LOD_SLOT >= VERTEX_STREAM_SLOTS);
     assert!(VS_FLOAT_CONST_SLOT <= 30);
 };
 

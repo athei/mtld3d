@@ -26,7 +26,7 @@ use std::{
 
 use mtld3d_shared::mtl::{
     PS_BOOL_CONST_SLOT, PS_DRAW_SLOT, PS_INT_CONST_SLOT, PS_LOD_BIAS_SLOT, VS_BOOL_CONST_SLOT,
-    VS_DRAW_SLOT, VS_FLOAT_CONST_SLOT, VS_INT_CONST_SLOT, VS_POS_FIXUP_SLOT,
+    VS_DRAW_SLOT, VS_FLOAT_CONST_SLOT, VS_INT_CONST_SLOT, VS_LOD_SLOT, VS_POS_FIXUP_SLOT,
 };
 
 use super::{
@@ -282,6 +282,17 @@ pub struct VsSamplerKinds {
     pub volume_mask: u8,
     /// Bit `i` set ⇒ vertex slot `i` binds a cube texture.
     pub cube_mask: u8,
+    /// A slot the shader samples carries a texture LOD, a LOD bias or a finest level.
+    ///
+    /// Metal ignores a sampler's LOD clamps for a sample at an explicit level
+    /// and has no sampler bias, so every `texldl` then reads its slot's row of
+    /// the vertex LOD table on `VS_LOD_SLOT`
+    /// (`sampler_state::VertexLodTable`) and samples
+    /// `level(max(lod + offset, floor))`. The encoder derives it from the
+    /// draw's vertex sampler states and the shader's `texldl` slots; the API
+    /// sends false. A draw without it compiles the unchanged shader and binds
+    /// nothing. Part of the VS library and disk keys.
+    pub lod_table: bool,
 }
 
 impl VsSamplerKinds {
@@ -722,6 +733,15 @@ fn emit_vs_function(
             ",\n    {tex_ty} s{idx} [[texture({idx})]],\n    sampler samp{idx} [[sampler({idx})]]"
         );
     }
+    // The per-slot `(offset, floor)` rows every `texldl` applies to the level
+    // it names (see `VsSamplerKinds::lod_table`).
+    let lod_table = key.sampler_kinds.lod_table && !samplers.is_empty();
+    if lod_table {
+        let _ = write!(
+            out,
+            ",\n    constant float2 *vs_lod [[buffer({VS_LOD_SLOT})]]"
+        );
+    }
     w(out, "\n) {\n");
     // Temporaries start at zero, so a register read before any write (a
     // partly written output alpha, say) yields 0 rather than whatever the
@@ -823,6 +843,7 @@ fn emit_vs_function(
         vs_output_map: outputs.map(VsOutputs::targets),
         subroutines: subs,
         vs_provided_mask: provided_mask,
+        lod_table,
     });
     for inst in &vs.instructions {
         translate_instruction(out, inst, &ctx)?;
@@ -1016,15 +1037,17 @@ pub fn declared_ps_samplers(ps: &DxsoProgram) -> BTreeMap<u16, TextureType> {
 /// Sampler slots a `texldl` names, bit `i` for `s<i>`.
 ///
 /// Metal ignores a sampler's LOD clamps for a sample at an explicit level, so
-/// these are the slots whose stage state the shader applies itself (through
-/// the `lod_bias` rows `.z` and `.w`). The encoder keys the table on them, so a
-/// stage clamp the shader cannot observe mints no variant. Subroutine bodies
-/// count, since the emitter inlines them.
+/// these are the slots whose stage state the shader applies itself: through
+/// the pixel `lod_bias` rows `.z` and `.w`, or for a `vs_3_0` the vertex
+/// `vs_lod` rows (`VsSamplerKinds::lod_table`). The encoder keys either table
+/// on them, so a stage clamp the shader cannot observe mints no variant.
+/// Subroutine bodies count, since the emitter inlines them.
 #[must_use]
-pub fn explicit_lod_samplers(ps: &DxsoProgram) -> u16 {
-    ps.instructions
+pub fn explicit_lod_samplers(program: &DxsoProgram) -> u16 {
+    program
+        .instructions
         .iter()
-        .chain(ps.subroutines.values().flatten())
+        .chain(program.subroutines.values().flatten())
         .filter(|inst| inst.opcode == Opcode::TexLdL)
         .filter_map(|inst| inst.srcs.get(1))
         .filter(|sampler| sampler.reg.index < 16)
@@ -1567,6 +1590,12 @@ bitflags::bitflags! {
         /// Set → the register is `floor(position.xy * vpos_scale.xy)` and the
         /// `ps_draw` argument exists to read. Clear → the identity form.
         const PS_VPOS_SCALE = 1 << 5;
+        /// VS only: the per-slot `vs_lod` uniform is declared and readable.
+        ///
+        /// Set → a `texldl` samples `level(max(lod + vs_lod[N].x, vs_lod[N].y))`.
+        /// Clear → it samples the level it names, and no `vs_lod` argument
+        /// exists to read.
+        const VS_LOD_TABLE = 1 << 6;
     }
 }
 
@@ -1706,12 +1735,18 @@ struct VsInit<'a> {
     vs_output_map: Option<&'a BTreeMap<(RegKind, u16), String>>,
     subroutines: Option<&'a std::collections::BTreeMap<u32, Vec<Instruction>>>,
     vs_provided_mask: u16,
+    /// The `vs_lod` table is declared, so `texldl` reads its slot's row.
+    lod_table: bool,
 }
 
 impl<'a> EmitContext<'a> {
     const fn vs(init: &VsInit<'a>) -> Self {
         Self {
-            flags: EmitContextFlags::IS_VERTEX,
+            flags: if init.lod_table {
+                EmitContextFlags::IS_VERTEX.union(EmitContextFlags::VS_LOD_TABLE)
+            } else {
+                EmitContextFlags::IS_VERTEX
+            },
             shader_major: init.major,
             shader_minor: init.minor,
             ps_input_map: None,
@@ -1766,12 +1801,17 @@ impl<'a> EmitContext<'a> {
 
     /// Whether sample sites may read the per-slot LOD-bias uniform.
     ///
-    /// False for every vertex shader: `vs_3_0` allows only `texldl`, whose
-    /// explicit LOD carries no bias, so no vertex function declares the
-    /// argument.
+    /// False for every vertex shader, whose `texldl` reads the vertex LOD
+    /// table instead (see [`Self::has_vs_lod_table`]).
     #[inline]
     const fn has_lod_bias(&self) -> bool {
         self.flags.contains(EmitContextFlags::PS_LOD_BIAS)
+    }
+
+    /// Whether a vertex `texldl` may read the per-slot `vs_lod` uniform.
+    #[inline]
+    const fn has_vs_lod_table(&self) -> bool {
+        self.flags.contains(EmitContextFlags::VS_LOD_TABLE)
     }
 
     /// Whether VS input register `v{reg}` is backed by the vertex declaration.
@@ -2077,15 +2117,21 @@ fn translate_instruction(
         }
         // SM3 texldl — sample with explicit LOD in coord.w.
         // `s.sample(samp, coord, level(lod))` is the MSL form. Under the LOD
-        // table the level counts from the texture's LOD, carries the game's
-        // bias, and is clamped by the stage's finest level, all in the slot's
-        // row because Metal applies no sampler clamp to an explicit level.
+        // table (the pixel `lod_bias` or the vertex `vs_lod`) the level counts
+        // from the texture's LOD, carries the game's bias, and is clamped by
+        // the stage's finest level, all in the slot's row because Metal
+        // applies no sampler clamp to an explicit level.
         Opcode::TexLdL => {
             let sampler = &inst.srcs[1];
             let idx = sampler.reg.index;
             let suffix = if ctx.has_lod_bias() {
                 format!(
                     ", level(max(({coord}).w + lod_bias[{idx}].z, lod_bias[{idx}].w))",
+                    coord = srcs[0]
+                )
+            } else if ctx.has_vs_lod_table() {
+                format!(
+                    ", level(max(({coord}).w + vs_lod[{idx}].x, vs_lod[{idx}].y))",
                     coord = srcs[0]
                 )
             } else {

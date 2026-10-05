@@ -651,10 +651,11 @@ impl FrameEncoder {
     pub fn lookup_libraries(
         &mut self,
         vs: VsSourceView<'_>,
+        vs_snapshot: VsSourceView<'_>,
         ps: PsSourceView<'_>,
         variant: VariantKey,
     ) -> Option<(StageLibHandles, StageLibHandles)> {
-        self.libraries.lookup_ready(vs, ps, variant)
+        self.libraries.lookup_ready(vs, vs_snapshot, ps, variant)
     }
 
     /// Resolve the VS library for a draw.

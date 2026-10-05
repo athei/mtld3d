@@ -295,7 +295,8 @@ fields_codec!(VariantKey {
 
 fields_codec!(VsSamplerKinds {
     volume_mask,
-    cube_mask
+    cube_mask,
+    lod_table
 });
 
 fields_codec!(StencilFaceState {

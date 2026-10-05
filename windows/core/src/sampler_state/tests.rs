@@ -691,3 +691,86 @@ fn every_translated_sampler_state_is_consumed() {
         );
     }
 }
+
+/// Row `slot` of a vertex LOD table's bytes, as `(offset, floor)` bits.
+fn vertex_row(table: &VertexLodTable, slot: usize) -> [u32; 2] {
+    let lane = |at: usize| {
+        let bytes = table.bytes();
+        u32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]])
+    };
+    [lane(slot * 8), lane(slot * 8 + 4)]
+}
+
+#[test]
+fn a_new_vertex_lod_table_leaves_every_level_where_the_shader_names_it() {
+    let table = VertexLodTable::new();
+    assert_eq!(table.mask(), 0);
+    assert_eq!(table.bytes().len(), VS_LOD_BYTES);
+    for slot in 0..VS_LOD_SLOTS {
+        assert_eq!(
+            vertex_row(&table, slot),
+            EXPLICIT_LOD_OPEN.map(f32::to_bits),
+            "slot {slot} is open"
+        );
+    }
+}
+
+#[test]
+fn a_vertex_slot_takes_the_row_of_its_lod_bias_and_finest_level() {
+    let mut table = VertexLodTable::new();
+    table.set_slot(2, &lod_state(3, 1, D3DTEXF_POINT));
+    assert_eq!(table.mask(), 0b0100);
+    assert_eq!(
+        vertex_row(&table, 2),
+        [1.0_f32.to_bits(), 3.0_f32.to_bits()]
+    );
+
+    let mut biased = lod_state(0, 0, D3DTEXF_LINEAR);
+    biased[D3DSAMP_MIPMAPLODBIAS as usize] = (-1.0_f32).to_bits();
+    table.set_slot(0, &biased);
+    assert_eq!(table.mask(), 0b0101);
+    assert_eq!(
+        vertex_row(&table, 0),
+        [(-1.0_f32).to_bits(), (-f32::MAX).to_bits()]
+    );
+
+    table.set_slot(2, &lod_state(0, 0, D3DTEXF_POINT));
+    assert_eq!(
+        table.mask(),
+        0b0001,
+        "a slot back at its defaults needs no row"
+    );
+    assert_eq!(vertex_row(&table, 2), EXPLICIT_LOD_OPEN.map(f32::to_bits));
+}
+
+#[test]
+fn a_vertex_slot_without_mipmapping_pins_the_texture_lod() {
+    let mut table = VertexLodTable::new();
+    table.set_slot(1, &lod_state(3, 2, D3DTEXF_NONE));
+    assert_eq!(table.mask(), 0b0010);
+    assert_eq!(
+        vertex_row(&table, 1),
+        [(-f32::MAX).to_bits(), 2.0_f32.to_bits()]
+    );
+}
+
+#[test]
+fn a_vertex_lod_table_ignores_slots_past_the_four_vertex_samplers() {
+    let mut table = VertexLodTable::new();
+    table.set_slot(VS_LOD_SLOTS, &lod_state(3, 1, D3DTEXF_POINT));
+    assert_eq!(table.mask(), 0);
+    assert_eq!(table.bytes(), VertexLodTable::new().bytes());
+}
+
+#[test]
+fn the_last_bound_cache_rebinds_the_vertex_lod_table_once_per_pass_and_change() {
+    let mut bound = LastBoundCache::new();
+    let mut table = VertexLodTable::new();
+    table.set_slot(0, &lod_state(2, 0, D3DTEXF_POINT));
+    assert!(bound.vs_lod_changed(table.bytes()));
+    assert!(!bound.vs_lod_changed(table.bytes()));
+    table.set_slot(0, &lod_state(3, 0, D3DTEXF_POINT));
+    assert!(bound.vs_lod_changed(table.bytes()), "a new row rebinds");
+    bound.reset();
+    assert!(bound.vs_lod_changed(table.bytes()), "a new pass rebinds");
+}

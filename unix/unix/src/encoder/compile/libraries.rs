@@ -59,14 +59,20 @@ impl StageLibraries {
     /// A stage whose source record and variant are the ones the previous
     /// call answered for takes the memoised handles; any other goes to its
     /// index and, when built, replaces the memo's slot.
+    ///
+    /// `vs_snapshot` is the snapshot's own VS record, whose address
+    /// identifies the source in the memo. `vs` is that record, or a copy of
+    /// it the draw keyed for the vertex LOD table, which lives wherever the
+    /// draw put it; see [`vs_memo_identity`].
     #[inline]
     pub fn lookup_ready(
         &mut self,
         vs: VsSourceView<'_>,
+        vs_snapshot: VsSourceView<'_>,
         ps: PsSourceView<'_>,
         variant: VariantKey,
     ) -> Option<(StageLibHandles, StageLibHandles)> {
-        let vs_record = vs_record(vs);
+        let vs_record = vs_memo_identity(vs, vs_snapshot);
         let vs_handles = if self.memo.vs_record == vs_record {
             self.debug_assert_memo_vs(vs);
             self.memo.vs
@@ -306,6 +312,18 @@ fn vs_record(source: VsSourceView<'_>) -> usize {
         VsSourceView::Programmable(value) => core::ptr::from_ref(value).addr(),
         VsSourceView::FixedFunction(value) => core::ptr::from_ref(value).addr() | 1,
     }
+}
+
+/// The memo identity of a draw's VS source: the snapshot record, tagged for the vertex LOD table.
+///
+/// `vs` is `snapshot` itself or its copy with `VsSamplerKinds::lod_table`
+/// set. The copy is a local of the draw, so its address names no shader;
+/// the snapshot record's address does, and bit 1 (free, the records being
+/// 8-aligned) tells the two keys of one record apart.
+fn vs_memo_identity(vs: VsSourceView<'_>, snapshot: VsSourceView<'_>) -> usize {
+    let lod_table =
+        matches!(vs, VsSourceView::Programmable(value) if value.sampler_kinds.lod_table);
+    vs_record(snapshot) | (usize::from(lod_table) << 1)
 }
 
 /// The identity of a PS source record, tagged like [`vs_record`].
