@@ -6,7 +6,9 @@
 //! rate, and the saturating byte range an instanced draw reads from a per-instance stream.
 //! A flag with a zero count is the corner case: accepted, one instance, a `Constant` layout.
 //! The attributes that end past a short stride: their remap onto bindings of their own,
-//! the advanced offsets Metal accepts, and the bytes such a draw reads.
+//! the advanced offsets Metal accepts, and the bytes such a draw reads. A stream offset
+//! off a four-byte boundary: the binding rounded down, the remainder moved into the
+//! attributes of that stream alone, and the pipeline identity that carries it.
 
 use super::*;
 
@@ -221,12 +223,13 @@ fn unsupported_width_alignment_and_slot_pressure_fail_explicitly() {
         remap_crossing_attributes(&mut wide, &mut layouts).err(),
         Some(VertexFetchError::AttributeWiderThanStride)
     );
-    // The advanced offset is the stream offset plus the attribute's.
+    // The advanced offset is the stream offset rounded down plus the attribute's.
     assert_eq!(
         advanced_binding_offset(0, 6, 64),
         Err(VertexFetchError::UnalignedOffset)
     );
-    assert_eq!(advanced_binding_offset(2, 6, 64), Ok(8));
+    assert_eq!(advanced_binding_offset(2, 8, 64), Ok(8));
+    assert_eq!(advanced_binding_offset(7, 8, 64), Ok(12));
     assert_eq!(
         advanced_binding_offset(60, 4, 64),
         Err(VertexFetchError::OutsideBuffer)
@@ -277,7 +280,7 @@ fn crossing_fetch_lists_each_slot_of_a_stream_with_its_advance() {
     let mut layouts = [StreamLayout::UNUSED; 16];
     layouts[0] = bound_stream_layout(16, 32, 1);
     layouts[1] = bound_stream_layout(4, 4, 1);
-    let fetch = CrossingFetch::new(&attrs, &layouts).expect("one crossing attribute");
+    let fetch = CrossingFetch::new(&attrs, &layouts, 0).expect("one crossing attribute");
     assert_eq!(fetch.slots_of(0).collect::<Vec<_>>(), [(0, 0), (2, 28)]);
     assert_eq!(fetch.slots_of(1).collect::<Vec<_>>(), [(1, 0)]);
     assert_eq!(fetch.attrs().len(), 3);
@@ -297,7 +300,7 @@ fn a_stream_whose_attributes_all_cross_binds_only_advanced_slots() {
     let mut layouts = [StreamLayout::UNUSED; 16];
     layouts[0] = bound_stream_layout(4, 8, 1);
     layouts[1] = bound_stream_layout(12, 12, 1);
-    let fetch = CrossingFetch::new(&attrs, &layouts).expect("one crossing attribute");
+    let fetch = CrossingFetch::new(&attrs, &layouts, 0).expect("one crossing attribute");
     // Slot 0 is released by stream 0 and taken back by its crossing attribute.
     assert_eq!(fetch.slots_of(0).collect::<Vec<_>>(), [(0, 4)]);
     assert_eq!(fetch.slots_of(1).collect::<Vec<_>>(), [(1, 0)]);
@@ -340,17 +343,29 @@ fn equal_remapped_layouts_place_the_attributes_alike() {
 fn only_an_advanced_binding_is_held_to_metals_offset_rules() {
     let attrs = [
         attr(0, 0, VertexFormat::Float3),
-        attr(0, 18, VertexFormat::UChar4NormalizedBgra),
+        attr(0, 20, VertexFormat::UChar4NormalizedBgra),
     ];
     let mut layouts = [StreamLayout::UNUSED; 16];
-    layouts[0] = bound_stream_layout(16, 22, 1);
-    let fetch = CrossingFetch::new(&attrs, &layouts).expect("one crossing attribute");
-    // Stream offset 2: the stream's own binding stays at 2, unchecked, and the
-    // advanced one lands on 20.
+    layouts[0] = bound_stream_layout(16, 24, 1);
+    let fetch = CrossingFetch::new(&attrs, &layouts, 0).expect("one crossing attribute");
+    // Stream offset 2: the advanced binding lands on 20, the stream offset
+    // rounded down plus the attribute's.
     assert_eq!(fetch.check_advanced_offsets(1, |_| Some((2, 4096))), Ok(()));
-    // Stream offset 0 leaves the advanced binding at 18.
+    // An advanced binding past the buffer's end is refused.
     assert_eq!(
-        fetch.check_advanced_offsets(1, |_| Some((0, 4096))),
+        fetch.check_advanced_offsets(1, |_| Some((2, 20))),
+        Err(VertexFetchError::OutsideBuffer)
+    );
+    // An attribute offset off four bytes, which no declaration carries, leaves
+    // the advanced binding unaligned whatever the stream offset.
+    let odd = [
+        attr(0, 0, VertexFormat::Float3),
+        attr(0, 18, VertexFormat::UChar4NormalizedBgra),
+    ];
+    layouts[0] = bound_stream_layout(16, 22, 1);
+    let fetch = CrossingFetch::new(&odd, &layouts, 0).expect("one crossing attribute");
+    assert_eq!(
+        fetch.check_advanced_offsets(1, |_| Some((2, 4096))),
         Err(VertexFetchError::UnalignedOffset)
     );
     // A stream fed nothing is skipped.
@@ -368,16 +383,131 @@ fn a_fetch_is_reused_for_its_record_and_layouts_until_it_forgets_them() {
     let mut wide = short;
     wide[0] = bound_stream_layout(20, 32, 1);
     let mut fetch = CrossingFetch::empty();
-    assert_eq!(fetch.reuse_or_rebuild(0x1000, &attrs, &short), Ok(()));
+    assert_eq!(fetch.reuse_or_rebuild(0x1000, &attrs, &short, 0), Ok(()));
     assert_eq!(fetch.slots_of(0).collect::<Vec<_>>(), [(0, 0), (1, 28)]);
     // The same record and layouts reuse what was built, whatever the list says.
-    assert_eq!(fetch.reuse_or_rebuild(0x1000, &attrs[..1], &short), Ok(()));
+    assert_eq!(
+        fetch.reuse_or_rebuild(0x1000, &attrs[..1], &short, 0),
+        Ok(())
+    );
     assert_eq!(fetch.attrs().len(), 2);
     // Another stride builds again.
-    assert_eq!(fetch.reuse_or_rebuild(0x1000, &attrs, &wide), Ok(()));
+    assert_eq!(fetch.reuse_or_rebuild(0x1000, &attrs, &wide, 0), Ok(()));
     assert_eq!(fetch.layouts()[1].stride, 20);
+    // Another stream shift builds again.
+    assert_eq!(fetch.reuse_or_rebuild(0x1000, &attrs, &wide, 2), Ok(()));
+    assert_eq!(fetch.attrs()[0].offset, 2);
+    assert_eq!(fetch.reuse_or_rebuild(0x1000, &attrs, &wide, 0), Ok(()));
+    assert_eq!(fetch.attrs()[0].offset, 0);
     // After the packet ends, the same address names another record.
     fetch.forget_source();
-    assert_eq!(fetch.reuse_or_rebuild(0x1000, &attrs[..1], &wide), Ok(()));
+    assert_eq!(
+        fetch.reuse_or_rebuild(0x1000, &attrs[..1], &wide, 0),
+        Ok(())
+    );
     assert_eq!(fetch.attrs().len(), 1);
+}
+
+#[test]
+fn stream_shifts_pack_two_bits_per_stream() {
+    assert_eq!(stream_shifts([(0, 0), (1, 4), (2, 64)].into_iter()), 0);
+    assert_eq!(stream_shifts([(0, 2)].into_iter()), 2);
+    assert_eq!(
+        stream_shifts([(1, 7), (15, 1)].into_iter()),
+        (3 << 2) | (1 << 30)
+    );
+    assert_eq!(offset_shift(6), 2);
+    assert_eq!(offset_shift(8), 0);
+}
+
+#[test]
+fn a_slot_binds_the_stream_offset_rounded_down_plus_its_advance() {
+    assert_eq!(slot_binding_offset(0, 0), 0);
+    assert_eq!(slot_binding_offset(2, 0), 0);
+    assert_eq!(slot_binding_offset(7, 0), 4);
+    assert_eq!(slot_binding_offset(6, 28), 32);
+    assert_eq!(slot_binding_offset(8, 12), 20);
+}
+
+#[test]
+fn a_shifted_stream_moves_its_attributes_by_its_remainder() {
+    let attrs = [
+        attr(0, 0, VertexFormat::Float3),
+        attr(0, 12, VertexFormat::UChar4NormalizedBgra),
+    ];
+    let mut layouts = [StreamLayout::UNUSED; 16];
+    layouts[0] = bound_stream_layout(16, 16, 1);
+    for (offset, shift) in [(1, 1), (2, 2), (3, 3), (6, 2)] {
+        let shifts = stream_shifts([(0, offset)].into_iter());
+        let fetch = CrossingFetch::new(&attrs, &layouts, shifts).expect("nothing crosses");
+        // Nothing crosses: one binding at the stream's own slot, no advance.
+        assert_eq!(fetch.slots_of(0).collect::<Vec<_>>(), [(0, 0)]);
+        assert_eq!(fetch.attrs()[0].offset, shift);
+        assert_eq!(fetch.attrs()[1].offset, 12 + shift);
+        assert_eq!(fetch.attrs()[1].buffer_index, 0);
+        assert_eq!(fetch.layouts(), &layouts);
+        // Vertex `i`'s colour: the rounded-down binding plus the moved
+        // attribute offset is where D3D9 addresses it.
+        assert_eq!(
+            slot_binding_offset(offset, 0) + fetch.attrs()[1].offset,
+            offset + 12
+        );
+    }
+}
+
+#[test]
+fn a_shift_moves_only_the_attributes_its_stream_feeds() {
+    let attrs = [
+        attr(0, 0, VertexFormat::Float3),
+        attr(1, 0, VertexFormat::UChar4NormalizedBgra),
+    ];
+    let mut layouts = [StreamLayout::UNUSED; 16];
+    layouts[0] = bound_stream_layout(12, 12, 1);
+    layouts[1] = bound_stream_layout(4, 4, 1);
+    let shifts = stream_shifts([(0, 0), (1, 3)].into_iter());
+    let fetch = CrossingFetch::new(&attrs, &layouts, shifts).expect("nothing crosses");
+    assert_eq!(fetch.attrs()[0].offset, 0);
+    assert_eq!(fetch.attrs()[1].offset, 3);
+}
+
+#[test]
+fn a_crossing_attribute_of_a_shifted_stream_keeps_the_remainder_in_its_slot() {
+    let attrs = [
+        attr(0, 0, VertexFormat::Float3),
+        attr(0, 28, VertexFormat::UChar4NormalizedBgra),
+    ];
+    let mut layouts = [StreamLayout::UNUSED; 16];
+    layouts[0] = bound_stream_layout(16, 32, 1);
+    let shifts = stream_shifts([(0, 2)].into_iter());
+    let fetch = CrossingFetch::new(&attrs, &layouts, shifts).expect("one crossing attribute");
+    assert_eq!(fetch.slots_of(0).collect::<Vec<_>>(), [(0, 0), (1, 28)]);
+    assert_eq!(fetch.attrs()[0].offset, 2);
+    assert_eq!(fetch.attrs()[1].buffer_index, 1);
+    assert_eq!(fetch.attrs()[1].offset, 2);
+    // The advanced binding is aligned, and with the moved offset reads byte
+    // 2 + 28 of the buffer for vertex 0.
+    assert_eq!(fetch.check_advanced_offsets(1, |_| Some((2, 4096))), Ok(()));
+    assert_eq!(slot_binding_offset(2, 28) + fetch.attrs()[1].offset, 30);
+}
+
+#[test]
+fn only_a_shifted_fetch_changes_the_snapshot_identity() {
+    let attrs = [attr(0, 0, VertexFormat::Float3)];
+    let mut layouts = [StreamLayout::UNUSED; 16];
+    layouts[0] = bound_stream_layout(12, 12, 1);
+    let hash = 0x1234_5678_9abc_def0;
+    let plain = CrossingFetch::new(&attrs, &layouts, 0).expect("fits");
+    assert_eq!(plain.snapshot_vdecl_hash(hash), hash);
+    let identities: Vec<u64> = [1, 2, 3, 2 << 2]
+        .into_iter()
+        .map(|shifts| {
+            CrossingFetch::new(&attrs, &layouts, shifts)
+                .expect("fits")
+                .snapshot_vdecl_hash(hash)
+        })
+        .collect();
+    for (i, identity) in identities.iter().enumerate() {
+        assert_ne!(*identity, hash);
+        assert!(!identities[..i].contains(identity));
+    }
 }

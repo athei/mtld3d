@@ -30,7 +30,7 @@ use mtld3d_core::{
     pipeline_state::{ExtraColorAttachments, PipelineAttachFlags, PipelineSnapshot, StreamLayout},
     streams::{
         CrossingFetch, crossing_read_size, instance_count, instanced_stream_read_bytes,
-        is_instance_data,
+        is_instance_data, offset_shift, slot_binding_offset, stream_shifts,
     },
     vs_draw::{MAX_CLIP_PLANES, VS_DRAW_BYTES, VsDrawState},
 };
@@ -814,11 +814,14 @@ fn emit_draw_view(
     // the rest step per the stream's `SetStreamSourceFreq`), a constant zero
     // feed where nothing is bound. Part of the pipeline identity.
     let mut crossing = 0;
-    let mut layouts = stream_layouts_view(vertex_source, &attrs, &mut crossing);
+    let mut offsets = 0;
+    let mut layouts = stream_layouts_view(vertex_source, &attrs, &mut crossing, &mut offsets);
     // An attribute that ends past its stream's stride is fetched through a
-    // binding of its own (`CrossingFetch`); every other draw takes the
-    // declaration's attributes and the stream layouts as they are.
-    let fetch = if crossing == 0 {
+    // binding of its own, and a stream offset off a four-byte boundary binds
+    // rounded down with its remainder in the attribute offsets
+    // (`CrossingFetch`); every other draw takes the declaration's attributes
+    // and the stream layouts as they are.
+    let fetch = if crossing == 0 && offset_shift(offsets) == 0 {
         None
     } else {
         crossing_fetch(enc, vertex_source, &attrs, &mut layouts, crossing)
@@ -877,6 +880,7 @@ fn emit_draw_view(
     };
     if let Some(fetch) = &fetch {
         pipeline_snapshot.stream_layouts = *fetch.layouts();
+        pipeline_snapshot.vdecl_hash = fetch.snapshot_vdecl_hash(vdecl_hash);
     }
     if rt0_drop {
         pipeline_snapshot.remove_color_output();
@@ -1790,13 +1794,16 @@ fn emit_draw_view(
     }
 }
 
-/// The vertex fetch of a draw whose `crossing` streams carry an attribute past their stride.
+/// The vertex fetch of a draw with a crossing attribute or a stream offset off four bytes.
 ///
+/// `crossing` names the streams that carry an attribute past their stride.
 /// `None` when a crossing attribute cannot take a binding of its own (one
 /// wider than its stride, or an advanced offset Metal refuses): `layouts`
 /// then step each crossing stream by its extent, as a draw did before
 /// crossing attributes had bindings, and the draw fetches wrong data rather
-/// than none.
+/// than none; its streams bind at the offsets the application set. A draw
+/// whose streams only sit off a four-byte boundary has no crossing attribute
+/// and never takes that path.
 #[cold]
 #[inline(never)]
 fn crossing_fetch(
@@ -1813,23 +1820,37 @@ fn crossing_fetch(
         (_, VertexFeed::Buffer(record)) => Some((record.offset, record.length)),
         _ => None,
     };
+    let shifts = stream_shifts(
+        vertex_source
+            .bindings()
+            .filter(|b| attrs.used_streams() & (1 << b.stream) != 0)
+            .map(|b| (b.stream, b.offset)),
+    );
     let mut fetch = enc
         .take_crossing_fetch()
         .unwrap_or_else(|| Box::new(CrossingFetch::empty()));
     let record = core::ptr::from_ref(attrs.header()).addr();
     let checked = fetch
-        .reuse_or_rebuild(record, attrs.as_slice(), layouts)
+        .reuse_or_rebuild(record, attrs.as_slice(), layouts, shifts)
         .and_then(|()| fetch.check_advanced_offsets(crossing, stream));
     match checked {
         Ok(()) => {
-            mtld3d_shared::log_once_info!(target: crate::LOG_TARGET,
-                "vertex attribute ends past its stream stride: fetched through a binding of its own");
+            if crossing != 0 {
+                mtld3d_shared::log_once_info!(target: crate::LOG_TARGET,
+                    "vertex attribute ends past its stream stride: fetched through a binding of its own");
+            }
+            if shifts != 0 {
+                mtld3d_shared::log_once_info!(target: crate::LOG_TARGET,
+                    "stream offset off a four-byte boundary: bound at the multiple of 4 below it, \
+                     the remainder added to its attribute offsets");
+            }
             Some(fetch)
         }
         Err(error) => {
             mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
                 "vertex attribute past its stream stride has no binding of its own ({error:?}): \
-                 layout widened to the consumed extent, the draw fetches wrong data");
+                 layout widened to the consumed extent, the draw fetches wrong data, and a \
+                 stream offset off a four-byte boundary binds as set and draws nothing");
             enc.keep_crossing_fetch(fetch);
             // The stride a draw had before crossing attributes had bindings;
             // a UP draw here still reads past its payload's last vertex, as
@@ -1863,9 +1884,11 @@ fn bind_crossing_inline(enc: &mut FrameEncoder, fetch: &CrossingFetch, address: 
     }
 }
 
-/// Bind a crossing draw's vertex buffer `b` at every slot that reads its stream.
+/// Bind a fetch's vertex buffer `b` at every slot that reads its stream.
 ///
-/// [`crossing_fetch`] checked each advanced offset against the buffer.
+/// Each slot binds the stream offset rounded down to a multiple of 4 plus
+/// its advance; [`crossing_fetch`] checked each advanced offset against the
+/// buffer.
 fn bind_crossing_stream(
     enc: &mut FrameEncoder,
     fetch: &CrossingFetch,
@@ -1873,7 +1896,7 @@ fn bind_crossing_stream(
     buffer_handle: u64,
 ) {
     for (slot, advance) in fetch.slots_of(b.stream) {
-        let offset = b.offset + advance;
+        let offset = slot_binding_offset(b.offset, advance);
         let bind =
             enc.last_bound()
                 .vertex_buffer_changed(slot, buffer_handle, offset, b.generation);
