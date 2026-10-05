@@ -918,12 +918,16 @@ impl<'a> VertexView<'a> {
 /// Vertex layouts derived directly from borrowed command stream records.
 ///
 /// Sets in `crossing` the streams an attribute crosses (see
-/// [`crate::draw_data::stream_layouts_with`]).
+/// [`crate::draw_data::stream_layouts_with`]), and ORs into `offsets` the
+/// offset of every stream read from a vertex buffer, so a nonzero
+/// [`crate::streams::offset_shift`] of it says one of them is off a
+/// four-byte boundary.
 #[must_use]
 pub fn stream_layouts_view(
     source: &VertexView<'_>,
     attrs: &crate::draw_data::AttrSnapshot,
     crossing: &mut u16,
+    offsets: &mut u32,
 ) -> [crate::pipeline_state::StreamLayout; mtld3d_types::MAX_STREAMS as usize] {
     use mtld3d_shared::mtl::VertexStepFunction;
 
@@ -940,6 +944,7 @@ pub fn stream_layouts_view(
                 step_rate: 1,
             },
             StreamViewFeed::Buffer(record) => {
+                *offsets |= record.offset;
                 bound_stream_layout(record.stride, extent, record.frequency)
             }
             StreamViewFeed::Null => StreamLayout {

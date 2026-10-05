@@ -12,6 +12,7 @@ use mtld3d_shared::{
     mtl::{VertexFormat, VertexStepFunction},
 };
 use mtld3d_types::{D3DSTREAMSOURCE_INDEXEDDATA, D3DSTREAMSOURCE_INSTANCEDATA, MAX_STREAMS};
+use xxhash_rust::xxh3::xxh3_64_with_seed;
 
 use crate::pipeline_state::StreamLayout;
 
@@ -267,18 +268,54 @@ pub fn remap_crossing_attributes(
     Ok(bindings)
 }
 
+/// The part of a stream offset below a multiple of 4, which a fetch moves into its attributes.
+///
+/// Metal ignores the low two bits of a vertex buffer offset bound for a
+/// vertex descriptor, so a stream bound at such an offset binds at the
+/// multiple of 4 below it and each of its attributes reads this many bytes
+/// further on.
+#[inline]
+#[must_use]
+pub const fn offset_shift(offset: u32) -> u32 {
+    offset & 3
+}
+
+/// Per-stream [`offset_shift`]s of a draw, two bits per stream, stream `n` at bit `2 * n`.
+///
+/// `streams` yields each stream the draw reads from a vertex buffer with
+/// that stream's offset. Zero when every offset is a multiple of 4.
+#[must_use]
+pub fn stream_shifts(streams: impl Iterator<Item = (u8, u32)>) -> u32 {
+    streams.fold(0, |shifts, (stream, offset)| {
+        shifts | (offset_shift(offset) << (2 * u32::from(stream)))
+    })
+}
+
+/// The offset a slot binds: the stream offset rounded down to a multiple of 4, plus `advance`.
+///
+/// `advance` is a crossing attribute's offset, 0 on a stream's own slot.
+/// Wraps on overflow; [`advanced_binding_offset`] checks the offsets that
+/// can overflow before a draw binds them.
+#[inline]
+#[must_use]
+pub const fn slot_binding_offset(stream_offset: u32, advance: u32) -> u32 {
+    (stream_offset & !3).wrapping_add(advance)
+}
+
 /// The byte offset of an advanced binding, checked against what Metal accepts.
 ///
 /// `base` is the stream's own offset into a buffer of `len` bytes and
-/// `advance` the crossing attribute's offset. Metal takes a vertex buffer
-/// offset that is a multiple of 4 and inside the buffer. Only an advanced
-/// binding is checked: a stream's own offset binds as the application set it.
+/// `advance` the crossing attribute's offset; the binding starts at
+/// [`slot_binding_offset`]. Metal takes a vertex buffer offset that is a
+/// multiple of 4 and inside the buffer. The stream's rounded-down offset is
+/// one, and so is every declaration element offset, so only a binding past
+/// the buffer's end or an `advance` off a four-byte boundary is refused.
 ///
 /// # Errors
 ///
 /// [`VertexFetchError::UnalignedOffset`] or [`VertexFetchError::OutsideBuffer`].
 pub fn advanced_binding_offset(base: u32, advance: u32, len: u64) -> Result<u32, VertexFetchError> {
-    let offset = base
+    let offset = (base & !3)
         .checked_add(advance)
         .ok_or(VertexFetchError::OutsideBuffer)?;
     if !offset.is_multiple_of(4) {
@@ -290,14 +327,19 @@ pub fn advanced_binding_offset(base: u32, advance: u32, len: u64) -> Result<u32,
     Ok(offset)
 }
 
-/// The vertex fetch of a draw with an attribute that ends past its stream's stride.
+/// The vertex fetch of a draw that cannot bind each stream once at its own offset.
 ///
-/// Built for such a draw from the resolved attributes and the stream layouts;
-/// a draw whose attributes all fit never builds one. Holds the remapped
-/// attributes and layouts the pipeline is built from and, per Metal slot, the
-/// stream and byte advance the draw binds there. It remembers what it was
-/// built from, so the next draw over the same declaration record and layouts
-/// reuses it (see [`Self::reuse_or_rebuild`]).
+/// Built for a draw with an attribute that ends past its stream's stride, or
+/// with a stream offset off a four-byte boundary, from the resolved
+/// attributes, the stream layouts and the per-stream [`stream_shifts`]; any
+/// other draw never builds one. Holds the remapped attributes and layouts the
+/// pipeline is built from and, per Metal slot, the stream and byte advance
+/// the draw binds there (at [`slot_binding_offset`]). Every attribute read
+/// from a shifted stream sits its stream's shift further into its slot, so
+/// it may end up to 3 bytes past the stride, which Metal fetches as
+/// addressed. It remembers what it was built from, so the next draw over the
+/// same declaration record, layouts and shifts reuses it (see
+/// [`Self::reuse_or_rebuild`]).
 pub struct CrossingFetch {
     attrs: [VertexAttrDesc; MAX_STREAMS as usize],
     attr_count: u8,
@@ -305,8 +347,10 @@ pub struct CrossingFetch {
     bindings: [VertexFetchBinding; MAX_STREAMS as usize],
     /// Bit `n` set: Metal slot `n` is read by the remapped pipeline.
     used_slots: u16,
-    /// The declaration record's address and the stream layouts this was built from.
-    source: Option<(usize, [StreamLayout; MAX_STREAMS as usize])>,
+    /// The [`stream_shifts`] the attributes were moved by.
+    shifts: u32,
+    /// The declaration record's address, stream layouts and shifts this was built from.
+    source: Option<(usize, [StreamLayout; MAX_STREAMS as usize], u32)>,
 }
 
 impl CrossingFetch {
@@ -328,11 +372,12 @@ impl CrossingFetch {
                 offset: 0,
             }),
             used_slots: 0,
+            shifts: 0,
             source: None,
         }
     }
 
-    /// Remap `attrs` over `layouts` (see [`remap_crossing_attributes`]).
+    /// Remap `attrs` over `layouts` and move them by `shifts` (see [`remap_crossing_attributes`]).
     ///
     /// # Errors
     ///
@@ -340,13 +385,14 @@ impl CrossingFetch {
     pub fn new(
         attrs: &[VertexAttrDesc],
         layouts: &[StreamLayout; MAX_STREAMS as usize],
+        shifts: u32,
     ) -> Result<Self, VertexFetchError> {
         let mut fetch = Self::empty();
-        fetch.rebuild(attrs, layouts)?;
+        fetch.rebuild(attrs, layouts, shifts)?;
         Ok(fetch)
     }
 
-    /// Reuse this fetch if it was built from `record` and `layouts`, otherwise build it again.
+    /// Reuse this fetch if it was built from `record`, `layouts` and `shifts`, else rebuild it.
     ///
     /// `record` is the address of the declaration record the attributes
     /// came from, which names one immutable list while a packet replays;
@@ -361,17 +407,20 @@ impl CrossingFetch {
         record: usize,
         attrs: &[VertexAttrDesc],
         layouts: &[StreamLayout; MAX_STREAMS as usize],
+        shifts: u32,
     ) -> Result<(), VertexFetchError> {
         if self
             .source
             .as_ref()
-            .is_some_and(|(built, built_layouts)| *built == record && built_layouts == layouts)
+            .is_some_and(|(built, built_layouts, built_shifts)| {
+                *built == record && built_layouts == layouts && *built_shifts == shifts
+            })
         {
             return Ok(());
         }
         self.source = None;
-        self.rebuild(attrs, layouts)?;
-        self.source = Some((record, *layouts));
+        self.rebuild(attrs, layouts, shifts)?;
+        self.source = Some((record, *layouts, shifts));
         Ok(())
     }
 
@@ -380,7 +429,10 @@ impl CrossingFetch {
         self.source = None;
     }
 
-    /// Remap `attrs` over `layouts` into this fetch.
+    /// Remap `attrs` over `layouts` into this fetch and move them by `shifts`.
+    ///
+    /// Which attributes cross is decided on the application's offsets; the
+    /// shift then moves every attribute its slot's stream feeds.
     ///
     /// # Panics
     ///
@@ -389,6 +441,7 @@ impl CrossingFetch {
         &mut self,
         attrs: &[VertexAttrDesc],
         layouts: &[StreamLayout; MAX_STREAMS as usize],
+        shifts: u32,
     ) -> Result<(), VertexFetchError> {
         let Some(prefix) = self.attrs.get_mut(..attrs.len()) else {
             return Err(VertexFetchError::NoFreeSlot);
@@ -396,7 +449,12 @@ impl CrossingFetch {
         prefix.copy_from_slice(attrs);
         self.attr_count = u8::try_from(attrs.len()).expect("at most 16 attributes");
         self.layouts = *layouts;
+        self.shifts = shifts;
         self.bindings = remap_crossing_attributes(prefix, &mut self.layouts)?;
+        for attr in prefix.iter_mut() {
+            let stream = self.bindings[attr.buffer_index as usize].stream;
+            attr.offset += (shifts >> (2 * u32::from(stream))) & 3;
+        }
         self.used_slots = (0..MAX_STREAMS)
             .filter(|&slot| self.layouts[slot as usize].is_used())
             .fold(0u16, |mask, slot| mask | (1 << slot));
@@ -415,13 +473,27 @@ impl CrossingFetch {
         &self.layouts
     }
 
+    /// The `vdecl_hash` a pipeline snapshot of this fetch carries.
+    ///
+    /// The pipeline memo compares snapshots without the attribute list, and
+    /// the shifts move attribute offsets that neither the declaration nor
+    /// the layouts name, so a shifted fetch folds them into the declaration
+    /// identity. Without shifts it is `vdecl_hash` unchanged.
+    #[must_use]
+    pub fn snapshot_vdecl_hash(&self, vdecl_hash: u64) -> u64 {
+        if self.shifts == 0 {
+            return vdecl_hash;
+        }
+        xxh3_64_with_seed(&self.shifts.to_le_bytes(), vdecl_hash)
+    }
+
     /// Check every advanced binding of the `crossing` streams against what Metal accepts.
     ///
     /// `stream` gives a crossing stream's own offset and its buffer's length,
     /// `None` for a stream fed nothing (which steps by its extent and never
     /// crosses). Only a binding advanced past the stream offset is checked: a
-    /// stream's own binding binds the offset the application set, as every
-    /// other draw's does.
+    /// stream's own binding binds its offset rounded down to a multiple of 4,
+    /// as every other draw's does when the offset is one.
     ///
     /// # Errors
     ///

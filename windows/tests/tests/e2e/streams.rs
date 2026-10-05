@@ -5,13 +5,16 @@
 //! (count, step rate, and the non-indexed exemption), and state-block capture
 //! of stream bindings and frequencies.
 
-use mtld3d_tests::{DrawIndexedUpParams, GuardedSlice, Harness, PosVertex, assert_pixel_approx};
+use mtld3d_tests::{
+    DrawIndexedUpParams, GuardedSlice, Harness, PosVertex, VertexBuffer, assert_pixel_approx,
+};
 use mtld3d_types::{
     D3D_OK, D3DDECL_END_STREAM, D3DDECLTYPE_D3DCOLOR, D3DDECLTYPE_FLOAT3, D3DDECLTYPE_UNUSED,
     D3DDECLUSAGE_COLOR, D3DDECLUSAGE_POSITION, D3DDECLUSAGE_TEXCOORD, D3DERR_INVALIDCALL,
-    D3DFMT_INDEX16, D3DPOOL_DEFAULT, D3DPT_TRIANGLEFAN, D3DPT_TRIANGLELIST, D3DSBT_ALL,
-    D3DSTREAMSOURCE_INDEXEDDATA, D3DSTREAMSOURCE_INSTANCEDATA, D3DUSAGE_DYNAMIC,
-    D3DUSAGE_WRITEONLY, D3DVERTEXELEMENT9, D3DVIEWPORT9,
+    D3DFMT_INDEX16, D3DFVF_DIFFUSE, D3DFVF_XYZ, D3DPOOL_DEFAULT, D3DPT_TRIANGLEFAN,
+    D3DPT_TRIANGLELIST, D3DRS_LIGHTING, D3DSBT_ALL, D3DSTREAMSOURCE_INDEXEDDATA,
+    D3DSTREAMSOURCE_INSTANCEDATA, D3DUSAGE_DYNAMIC, D3DUSAGE_WRITEONLY, D3DVERTEXELEMENT9,
+    D3DVIEWPORT9,
 };
 
 const RED: u32 = 0xFFFF_0000;
@@ -709,6 +712,237 @@ fn a_staged_indexed_crossing_draw_keeps_its_vertices_from_a_later_lock() {
         RED,
         "the refill reaches the later draw"
     );
+}
+
+/// A position at byte 0 and a colour at byte 12 of a 16-byte vertex.
+const fn position_color_elements() -> [D3DVERTEXELEMENT9; 3] {
+    [
+        element(0, D3DDECLTYPE_FLOAT3, D3DDECLUSAGE_POSITION),
+        D3DVERTEXELEMENT9 {
+            stream: 0,
+            offset: 12,
+            type_: D3DDECLTYPE_D3DCOLOR,
+            method: 0,
+            usage: D3DDECLUSAGE_COLOR,
+            usage_index: 0,
+        },
+        end(),
+    ]
+}
+
+/// `pad` zero bytes, `vertices` packed as 16-byte vertices, and one zero vertex.
+fn padded_vertex_bytes(pad: u32, vertices: &[PackedVertex]) -> Vec<u8> {
+    let mut bytes = vec![0u8; pad as usize];
+    for vertex in vertices {
+        bytes.extend_from_slice(&vertex.x.to_le_bytes());
+        bytes.extend_from_slice(&vertex.y.to_le_bytes());
+        bytes.extend_from_slice(&vertex.z.to_le_bytes());
+        bytes.extend_from_slice(&vertex.color.to_le_bytes());
+    }
+    bytes.extend_from_slice(&[0u8; 16]);
+    bytes
+}
+
+/// A vertex buffer of `usage` holding `bytes`.
+fn filled_vertex_buffer<'h>(h: &'h Harness, usage: u32, bytes: &[u8]) -> VertexBuffer<'h> {
+    let length = u32::try_from(bytes.len()).expect("a small buffer");
+    let vb = h.create_vertex_buffer(length, usage, 0, D3DPOOL_DEFAULT);
+    vb.lock(0, 0, 0).write(bytes);
+    vb
+}
+
+/// A stream offset off a four-byte boundary still draws, with its own bytes.
+///
+/// D3D9 puts no alignment rule on `OffsetInBytes`, and the device reports
+/// `D3DDEVCAPS2_STREAMOFFSET`. Each offset of 1, 2, 3 and 6 is drawn from a
+/// static `WRITEONLY` and from a `DYNAMIC` buffer, by `DrawPrimitive` and by
+/// `DrawIndexedPrimitive`. A fetch from the offset rounded down reads the
+/// positions shifted by up to three bytes, which draws nothing, and the
+/// colour from the wrong bytes, which is not exactly green.
+#[test]
+fn a_stream_offset_off_a_four_byte_boundary_still_draws() {
+    let h = Harness::new();
+    let decl = h.create_vertex_declaration(&position_color_elements());
+    let vs = h.create_vertex_shader(&VS_POS_COLOR);
+    let ps = h.create_pixel_shader(&PS_DIFFUSE);
+    assert_eq!(h.set_vertex_declaration(&decl), 0);
+    assert_eq!(h.set_vertex_shader(&vs), 0);
+    assert_eq!(h.set_pixel_shader(&ps), 0);
+    let ib = h.create_index_buffer(6, D3DUSAGE_WRITEONLY, D3DFMT_INDEX16, D3DPOOL_DEFAULT);
+    ib.lock(0, 0, 0).write(&[0u16, 1, 2]);
+    assert_eq!(h.set_indices(&ib), 0);
+    let stride = stride_of::<PackedVertex>();
+    for usage in [D3DUSAGE_WRITEONLY, D3DUSAGE_DYNAMIC | D3DUSAGE_WRITEONLY] {
+        for offset in [1, 2, 3, 6] {
+            let bytes = padded_vertex_bytes(offset, &packed_triangle(GREEN));
+            let vb = filled_vertex_buffer(&h, usage, &bytes);
+            assert_eq!(h.set_stream_source(0, &vb, offset, stride), D3D_OK);
+            h.render_once(BLUE, |d| {
+                assert_eq!(d.draw_primitive(D3DPT_TRIANGLELIST, 0, 1), 0);
+            });
+            assert_eq!(
+                h.read_pixel(320, 280),
+                GREEN,
+                "DrawPrimitive from offset {offset}, usage {usage:#x}"
+            );
+            h.render_once(BLUE, |d| {
+                assert_eq!(
+                    d.draw_indexed_primitive(D3DPT_TRIANGLELIST, 0, 0, 3, 0, 1),
+                    0
+                );
+            });
+            assert_eq!(
+                h.read_pixel(320, 280),
+                GREEN,
+                "DrawIndexedPrimitive from offset {offset}, usage {usage:#x}"
+            );
+        }
+    }
+}
+
+/// An unaligned stream offset reaches the fixed-function path and a second stream.
+///
+/// An FVF draw (position and diffuse colour, lighting off) from stream offset
+/// 2, and a declaration whose colour comes from stream 1, a 4-byte stride,
+/// at offsets 1, 2 and 3 beside a position stream at offset 0. A colour
+/// stream fetched from its offset rounded down reads the zero padding into
+/// one vertex and draws a darker green.
+#[test]
+fn an_unaligned_stream_offset_reaches_fixed_function_and_a_second_stream() {
+    let h = Harness::new();
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE), 0);
+    assert_eq!(h.set_render_state(D3DRS_LIGHTING, 0), 0);
+    let bytes = padded_vertex_bytes(2, &packed_triangle(GREEN));
+    let vb = filled_vertex_buffer(&h, D3DUSAGE_WRITEONLY, &bytes);
+    assert_eq!(
+        h.set_stream_source(0, &vb, 2, stride_of::<PackedVertex>()),
+        D3D_OK
+    );
+    h.render_once(BLUE, |d| {
+        assert_eq!(d.draw_primitive(D3DPT_TRIANGLELIST, 0, 1), 0);
+    });
+    assert_eq!(h.read_pixel(320, 280), GREEN, "FVF draw from offset 2");
+
+    let h = Harness::new();
+    let decl = h.create_vertex_declaration(&pos_stream0_color_stream1());
+    let vs = h.create_vertex_shader(&VS_POS_COLOR);
+    let ps = h.create_pixel_shader(&PS_DIFFUSE);
+    assert_eq!(h.set_vertex_declaration(&decl), 0);
+    assert_eq!(h.set_vertex_shader(&vs), 0);
+    assert_eq!(h.set_pixel_shader(&ps), 0);
+    let positions = h.create_vertex_buffer(36, D3DUSAGE_WRITEONLY, 0, D3DPOOL_DEFAULT);
+    positions.lock(0, 0, 0).write(&centered_triangle());
+    assert_eq!(
+        h.set_stream_source(0, &positions, 0, stride_of::<PosVertex>()),
+        D3D_OK
+    );
+    for offset in [1u32, 2, 3] {
+        let mut bytes = vec![0u8; offset as usize];
+        for _ in 0..3 {
+            bytes.extend_from_slice(&GREEN.to_le_bytes());
+        }
+        bytes.extend_from_slice(&[0u8; 4]);
+        let colors = filled_vertex_buffer(&h, D3DUSAGE_WRITEONLY, &bytes);
+        assert_eq!(h.set_stream_source(1, &colors, offset, 4), D3D_OK);
+        h.render_once(BLUE, |d| {
+            assert_eq!(d.draw_primitive(D3DPT_TRIANGLELIST, 0, 1), 0);
+        });
+        assert_eq!(
+            h.read_pixel(320, 280),
+            GREEN,
+            "colour stream 1 from offset {offset}"
+        );
+    }
+}
+
+/// Draws over one declaration at offsets 0, 2, 0 and 3 keep pipelines of their own.
+///
+/// The offset's remainder moves the attributes, which the declaration and
+/// the stream layouts do not show, so each draw of the frame must still get
+/// the pipeline for its own remainder: the aligned draw after the unaligned
+/// one would otherwise read its colour two bytes late.
+#[test]
+fn draws_at_alternating_stream_offsets_keep_pipelines_of_their_own() {
+    let h = Harness::new();
+    let decl = h.create_vertex_declaration(&position_color_elements());
+    let vs = h.create_vertex_shader(&VS_POS_COLOR);
+    let ps = h.create_pixel_shader(&PS_DIFFUSE);
+    assert_eq!(h.set_vertex_declaration(&decl), 0);
+    assert_eq!(h.set_vertex_shader(&vs), 0);
+    assert_eq!(h.set_pixel_shader(&ps), 0);
+    let stride = stride_of::<PackedVertex>();
+    let offsets = [0u32, 2, 0, 3];
+    let buffers: Vec<_> = offsets
+        .iter()
+        .map(|&offset| {
+            filled_vertex_buffer(
+                &h,
+                D3DUSAGE_WRITEONLY,
+                &padded_vertex_bytes(offset, &packed_triangle(GREEN)),
+            )
+        })
+        .collect();
+    h.render_once(BLUE, |d| {
+        for (column, (vb, &offset)) in (0u32..).zip(buffers.iter().zip(&offsets)) {
+            let viewport = D3DVIEWPORT9 {
+                x: column * 160,
+                y: 0,
+                width: 160,
+                height: 480,
+                min_z: 0.0,
+                max_z: 1.0,
+            };
+            assert_eq!(d.set_viewport(&viewport), D3D_OK);
+            assert_eq!(d.set_stream_source(0, vb, offset, stride), D3D_OK);
+            assert_eq!(d.draw_primitive(D3DPT_TRIANGLELIST, 0, 1), 0);
+        }
+    });
+    for (column, offset) in (0u32..).zip(offsets) {
+        assert_eq!(
+            h.read_pixel(column * 160 + 80, 280),
+            GREEN,
+            "draw {column} from offset {offset}"
+        );
+    }
+}
+
+/// A crossing attribute of a stream bound off a four-byte boundary reads its vertex.
+///
+/// The colour at byte 28 of a 16-byte vertex lies in the next vertex, and the
+/// stream starts at offset 2, so its binding of its own starts there too:
+/// every vertex reads the next one's green colour field.
+#[test]
+fn a_crossing_attribute_from_an_unaligned_stream_offset_reads_the_next_vertex() {
+    let h = Harness::new();
+    let decl = h.create_vertex_declaration(&crossing_color_elements());
+    let vs = h.create_vertex_shader(&VS_POS_COLOR_TEXCOORD);
+    let ps = h.create_pixel_shader(&PS_DIFFUSE);
+    assert_eq!(h.set_vertex_declaration(&decl), 0);
+    assert_eq!(h.set_vertex_shader(&vs), 0);
+    assert_eq!(h.set_pixel_shader(&ps), 0);
+    let mut vertices = packed_triangle(GREEN).to_vec();
+    vertices.push(PackedVertex {
+        x: 5.0,
+        y: 5.0,
+        z: 0.0,
+        color: GREEN,
+    });
+    let bytes = padded_vertex_bytes(2, &vertices);
+    for usage in [D3DUSAGE_WRITEONLY, D3DUSAGE_DYNAMIC | D3DUSAGE_WRITEONLY] {
+        let vb = filled_vertex_buffer(&h, usage, &bytes);
+        assert_eq!(
+            h.set_stream_source(0, &vb, 2, stride_of::<PackedVertex>()),
+            D3D_OK
+        );
+        h.render_once(BLUE, |d| {
+            assert_eq!(d.draw_primitive(D3DPT_TRIANGLELIST, 0, 1), 0);
+        });
+        assert_eq!(
+            h.read_pixel(320, 280),
+            GREEN,
+            "crossing colour from offset 2, usage {usage:#x}"
+        );
+    }
 }
 
 /// A zero stride feeds every vertex the element at the stream offset.

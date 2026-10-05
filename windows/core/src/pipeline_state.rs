@@ -231,16 +231,20 @@ impl PipelineRsBits {
 /// identical key, so the memo can return the cached handle directly. The
 /// key is a pure function of the snapshot and the attribute list, and the
 /// list is a function of the declaration (`vdecl_hash`), the vertex shader
-/// it was resolved against, whose identity `vs_fn` carries, and, for a draw
+/// it was resolved against, whose identity `vs_fn` carries, for a draw
 /// with an attribute past its stream's stride, the `stream_layouts` that
-/// placed it (`streams::remap_crossing_attributes`).
+/// placed it (`streams::remap_crossing_attributes`), and, for a draw with a
+/// stream offset off a four-byte boundary, the remainders that moved its
+/// attributes, which such a draw folds into `vdecl_hash`
+/// (`streams::CrossingFetch::snapshot_vdecl_hash`).
 #[derive(Clone)]
 pub struct PipelineSnapshot {
     pub vs_fn: MetalHandle<MTLFunctionKind>,
     pub ps_fn: MetalHandle<MTLFunctionKind>,
     /// Declaration identity: the FVF code, or the declaration's element hash.
     ///
-    /// Not keyed: the key hashes the resolved attribute list instead, since
+    /// A draw that binds a stream offset off a four-byte boundary carries
+    /// the hash with its offsets' remainders folded in. Not keyed: the key hashes the resolved attribute list instead, since
     /// the vertex descriptor is built from it and `stream_layouts` alone, so
     /// two declarations that resolve alike share a pipeline. The resolve
     /// memo, the persisted recipe and the build diagnostics read it.
