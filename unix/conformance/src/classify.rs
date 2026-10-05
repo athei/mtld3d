@@ -32,17 +32,20 @@ pub enum Classification {
     /// runner's repeat mode (`--repeat`) before tagging it — this tolerance
     /// masks real regressions at the exact site.
     Flaky,
-    /// The pinned count is a cross-environment maximum, not an exact value.
+    /// The pinned count is a maximum, not an exact value.
     ///
-    /// The site's count legitimately differs between environments the same
-    /// baseline serves — a CI runner's virtual display accepts the mode
+    /// Either the site's count legitimately differs between environments the
+    /// same baseline serves (a CI runner's virtual display accepts the mode
     /// changes this machine's macdrv rejects, so the desktop-mode sites read
-    /// zero there, and the fetch4 counts wobble with the attached display.
-    /// Reading *below* the pin is tolerated (it does not force a re-record,
-    /// which would just flutter back up as a false regression on the next
-    /// environment); reading *above* it gates like any regression. The site
-    /// keeps its rationale prose in the cluster text — this tag only adds
-    /// the tolerance, it does not describe the divergence's nature.
+    /// zero there, and the fetch4 counts wobble with the attached display),
+    /// or it flaps below the pin on one environment and only a read above
+    /// the pin would mean something (a focus-timing site whose loop can fail
+    /// in at most as many iterations as it has). Reading *below* the pin is
+    /// tolerated (it does not force a re-record, which would just flutter
+    /// back up as a false regression on the next environment or run);
+    /// reading *above* it gates like any regression. The site keeps its
+    /// rationale prose in the cluster text: this tag only adds the
+    /// tolerance, it does not describe the divergence's nature.
     Ceiling,
     /// Newly appeared; a human has not yet triaged it.
     Untriaged,
