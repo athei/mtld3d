@@ -356,3 +356,28 @@ fn only_an_advanced_binding_is_held_to_metals_offset_rules() {
     // A stream fed nothing is skipped.
     assert_eq!(fetch.check_advanced_offsets(1, |_| None), Ok(()));
 }
+
+#[test]
+fn a_fetch_is_reused_for_its_record_and_layouts_until_it_forgets_them() {
+    let attrs = [
+        attr(0, 0, VertexFormat::Float3),
+        attr(0, 28, VertexFormat::UChar4NormalizedBgra),
+    ];
+    let mut short = [StreamLayout::UNUSED; 16];
+    short[0] = bound_stream_layout(16, 32, 1);
+    let mut wide = short;
+    wide[0] = bound_stream_layout(20, 32, 1);
+    let mut fetch = CrossingFetch::empty();
+    assert_eq!(fetch.reuse_or_rebuild(0x1000, &attrs, &short), Ok(()));
+    assert_eq!(fetch.slots_of(0).collect::<Vec<_>>(), [(0, 0), (1, 28)]);
+    // The same record and layouts reuse what was built, whatever the list says.
+    assert_eq!(fetch.reuse_or_rebuild(0x1000, &attrs[..1], &short), Ok(()));
+    assert_eq!(fetch.attrs().len(), 2);
+    // Another stride builds again.
+    assert_eq!(fetch.reuse_or_rebuild(0x1000, &attrs, &wide), Ok(()));
+    assert_eq!(fetch.layouts()[1].stride, 20);
+    // After the packet ends, the same address names another record.
+    fetch.forget_source();
+    assert_eq!(fetch.reuse_or_rebuild(0x1000, &attrs[..1], &wide), Ok(()));
+    assert_eq!(fetch.attrs().len(), 1);
+}

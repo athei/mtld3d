@@ -292,10 +292,12 @@ pub fn advanced_binding_offset(base: u32, advance: u32, len: u64) -> Result<u32,
 
 /// The vertex fetch of a draw with an attribute that ends past its stream's stride.
 ///
-/// Built once per such draw from the resolved attributes and the stream
-/// layouts; a draw whose attributes all fit never builds one. Holds the
-/// remapped attributes and layouts the pipeline is built from and, per Metal
-/// slot, the stream and byte advance the draw binds there.
+/// Built for such a draw from the resolved attributes and the stream layouts;
+/// a draw whose attributes all fit never builds one. Holds the remapped
+/// attributes and layouts the pipeline is built from and, per Metal slot, the
+/// stream and byte advance the draw binds there. It remembers what it was
+/// built from, so the next draw over the same declaration record and layouts
+/// reuses it (see [`Self::reuse_or_rebuild`]).
 pub struct CrossingFetch {
     attrs: [VertexAttrDesc; MAX_STREAMS as usize],
     attr_count: u8,
@@ -303,45 +305,102 @@ pub struct CrossingFetch {
     bindings: [VertexFetchBinding; MAX_STREAMS as usize],
     /// Bit `n` set: Metal slot `n` is read by the remapped pipeline.
     used_slots: u16,
+    /// The declaration record's address and the stream layouts this was built from.
+    source: Option<(usize, [StreamLayout; MAX_STREAMS as usize])>,
 }
 
 impl CrossingFetch {
-    /// Remap `attrs` over `layouts` (see [`remap_crossing_attributes`]).
-    ///
-    /// # Errors
-    ///
-    /// The draw cannot be fetched this way; see [`remap_crossing_attributes`].
-    ///
-    /// # Panics
-    ///
-    /// Never: the attribute count it narrows to `u8` is at most 16, checked first.
-    pub fn new(
-        attrs: &[VertexAttrDesc],
-        layouts: &[StreamLayout; MAX_STREAMS as usize],
-    ) -> Result<Self, VertexFetchError> {
+    /// A fetch that reads nothing and remembers no source.
+    #[must_use]
+    pub fn empty() -> Self {
         const UNSET: VertexAttrDesc = VertexAttrDesc {
             attr_index: 0,
             buffer_index: 0,
             offset: 0,
             format: VertexFormat::Invalid,
         };
-        let mut remapped = [UNSET; MAX_STREAMS as usize];
-        let Some(prefix) = remapped.get_mut(..attrs.len()) else {
+        Self {
+            attrs: [UNSET; MAX_STREAMS as usize],
+            attr_count: 0,
+            layouts: [StreamLayout::UNUSED; MAX_STREAMS as usize],
+            bindings: std::array::from_fn(|_| VertexFetchBinding {
+                stream: 0,
+                offset: 0,
+            }),
+            used_slots: 0,
+            source: None,
+        }
+    }
+
+    /// Remap `attrs` over `layouts` (see [`remap_crossing_attributes`]).
+    ///
+    /// # Errors
+    ///
+    /// The draw cannot be fetched this way; see [`remap_crossing_attributes`].
+    pub fn new(
+        attrs: &[VertexAttrDesc],
+        layouts: &[StreamLayout; MAX_STREAMS as usize],
+    ) -> Result<Self, VertexFetchError> {
+        let mut fetch = Self::empty();
+        fetch.rebuild(attrs, layouts)?;
+        Ok(fetch)
+    }
+
+    /// Reuse this fetch if it was built from `record` and `layouts`, otherwise build it again.
+    ///
+    /// `record` is the address of the declaration record the attributes
+    /// came from, which names one immutable list while a packet replays;
+    /// [`Self::forget_source`] runs before the next packet, whose records
+    /// may sit at the same addresses.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::new`]; the fetch then remembers no source.
+    pub fn reuse_or_rebuild(
+        &mut self,
+        record: usize,
+        attrs: &[VertexAttrDesc],
+        layouts: &[StreamLayout; MAX_STREAMS as usize],
+    ) -> Result<(), VertexFetchError> {
+        if self
+            .source
+            .as_ref()
+            .is_some_and(|(built, built_layouts)| *built == record && built_layouts == layouts)
+        {
+            return Ok(());
+        }
+        self.source = None;
+        self.rebuild(attrs, layouts)?;
+        self.source = Some((record, *layouts));
+        Ok(())
+    }
+
+    /// Forget what this fetch was built from, so the next draw builds it again.
+    pub const fn forget_source(&mut self) {
+        self.source = None;
+    }
+
+    /// Remap `attrs` over `layouts` into this fetch.
+    ///
+    /// # Panics
+    ///
+    /// Never: the attribute count it narrows to `u8` is at most 16, checked first.
+    fn rebuild(
+        &mut self,
+        attrs: &[VertexAttrDesc],
+        layouts: &[StreamLayout; MAX_STREAMS as usize],
+    ) -> Result<(), VertexFetchError> {
+        let Some(prefix) = self.attrs.get_mut(..attrs.len()) else {
             return Err(VertexFetchError::NoFreeSlot);
         };
         prefix.copy_from_slice(attrs);
-        let mut remapped_layouts = *layouts;
-        let bindings = remap_crossing_attributes(prefix, &mut remapped_layouts)?;
-        let used_slots = (0..MAX_STREAMS)
-            .filter(|&slot| remapped_layouts[slot as usize].is_used())
+        self.attr_count = u8::try_from(attrs.len()).expect("at most 16 attributes");
+        self.layouts = *layouts;
+        self.bindings = remap_crossing_attributes(prefix, &mut self.layouts)?;
+        self.used_slots = (0..MAX_STREAMS)
+            .filter(|&slot| self.layouts[slot as usize].is_used())
             .fold(0u16, |mask, slot| mask | (1 << slot));
-        Ok(Self {
-            attrs: remapped,
-            attr_count: u8::try_from(attrs.len()).expect("at most 16 attributes"),
-            layouts: remapped_layouts,
-            bindings,
-            used_slots,
-        })
+        Ok(())
     }
 
     /// The remapped attributes the pipeline is built from.
