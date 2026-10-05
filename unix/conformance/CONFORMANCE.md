@@ -465,15 +465,15 @@ record. A knob, where one makes sense, is named with its default.
   `D3DRS_SPECULARENABLE` on, the interpolated specular colour joins the
   cascade result after the last texture stage, RGB only, and the sum is
   clamped to [0, 1] before fog blends it with the fog colour. wined3d
-  (`specular * specular_enable + ret`) and DXVK (`current.rgb +=
-  specular.rgb`) both fog the unclamped sum, so a fogged pixel whose
-  diffuse and specular add past one comes out brighter there; without fog
-  the render target's clamp makes the two agree on a normalized target. The
-  clamp is the fixed-function colour-sum stage of the hardware D3D9's
-  fixed-function pipeline ran on, which OpenGL's fixed pipeline specifies
-  the same way (the colour sum is clamped to [0, 1] before fog), and World of
-  Warcraft draws fogged scenes through this path with the add switched on,
-  so the reference behaviour is not adopted on reference agreement alone.
+  (`ffp_varying_specular * specular_enable + ret`) and DXVK
+  (`state.current.xyz += in_Color1.xyz;`) both fog the unclamped sum, so a
+  fogged pixel whose diffuse and specular add past one comes out brighter
+  there; without fog the render target's clamp makes the two agree on a
+  normalized target. The clamp follows the colour-sum stage of
+  fixed-function hardware, which OpenGL's fixed pipeline specifies as
+  clamped to [0, 1] before fog, and World of Warcraft draws fogged scenes
+  through this path with the add switched on, so the reference behaviour is
+  not adopted on reference agreement alone.
   What Windows draws is not measured, and no site observes it: Wine's suite
   turns the specular add on only in tests that leave fog off. Reopen on a game
   that shows fogged highlights brighter or darker than on Windows. No knob:
