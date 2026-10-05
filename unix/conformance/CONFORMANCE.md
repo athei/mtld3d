@@ -670,15 +670,21 @@ hard-to-fix or low-value defect is still `real`):
   macdrv window-manager timing). Count changes in either direction never gate.
   Tag reactively — only once a flutter actually trips the gate — and pin the
   HIGHER observed count so a flutter back up is not a false regression.
-- **`ceiling`** — the pinned count is a cross-environment MAXIMUM, not an exact
-  value: the same baseline serves environments where the site legitimately
-  reads lower (a CI runner's virtual display accepts the mode changes this
-  machine's macdrv rejects, so the desktop-mode sites read zero there; the
-  fetch4 counts wobble with the attached display). Reading below the pin is
-  tolerated and does not demand a re-record; reading above it gates like any
-  regression. The tag adds only that tolerance — the divergence's nature stays
-  in the cluster prose, and like `flaky` it is assigned reactively, from a
-  measured cross-environment delta, never speculatively.
+- **`ceiling`**: the pinned count is a MAXIMUM, not an exact value, in two
+  cases. First, the same baseline serves environments where the site
+  legitimately reads lower (a CI runner's virtual display accepts the mode
+  changes this machine's macdrv rejects, so the desktop-mode sites read zero
+  there; the fetch4 counts wobble with the attached display). Second, the
+  site's count flaps below the pin on one environment, and only a read above
+  the pin would mean something (test_wndproc 4319, and 4302/4328/4329).
+  Reading below the pin is tolerated and does not demand a re-record; reading
+  above it gates like any regression. The tag adds only that tolerance; the
+  divergence's nature stays in the cluster prose. Like `flaky` it is assigned
+  reactively, from a measured cross-environment delta or after the flap
+  tripped the gate, never speculatively. For a flapping site, choose
+  `ceiling` over `flaky` when a count above the highest observed one would
+  be a real failure (for instance every iteration of a loop failing), and
+  `flaky` only when the count carries no meaning in either direction.
 - **`crash`** — a site attributed to a crash/abort path.
 - **`untriaged`** — an explicit placeholder for a site a human has not yet
   triaged. Normally untriaged means *absent from this document* (the sync test
@@ -715,9 +721,12 @@ Audit provenance: every cluster below was re-derived on 2026-07-20 from the
 Wine test source, the raw actual-vs-expected failure messages
 (`MTLD3D_CONFORMANCE_RAW_DIR`), and the implementation — independently
 re-checked before retagging. Current classifications, counted from the
-`Sites:` tokens below on 2026-09-30: 0 `real`, 120 `expected`, 1 `caps`,
-22 `ceiling`, 3 `flaky`, 0 `untriaged`, 146 unique sites in all.
+`Sites:` tokens below on 2026-10-05: 0 `real`, 119 `expected`, 1 `caps`,
+25 `ceiling`, 3 `flaky`, 0 `untriaged`, 148 unique sites in all.
 The audit recorded all 24 Apple-family subtest-legs `crash=0`.
+(2026-10-05: test_wndproc 4302 moved from `expected` to `ceiling`, and
+4328/4329 joined it, pinned at one on the `i686` and `i686+intel` device
+legs; the cluster says why.)
 (2026-09-30: the adapter mode table stopped leaving out sizes more than 15 %
 from the desktop's aspect, which made 640x480 a settable mode on the Intel CI
 image: its display runs 3840x2160 and user32 lists 640x480 for it, so a
@@ -902,8 +911,9 @@ none today.
 Empty. No failing site is classified `real` on any leg.
 
 Every other failing site is a recorded decision (`expected`), a capability we
-do not advertise (`caps`), a pin that reads zero on other hardware
-(`ceiling`), or a known flap (`flaky`), each with its rationale in the
+do not advertise (`caps`), a pin above the usual read, because the site
+reads lower on other hardware or flaps below it here (`ceiling`), or a known
+flap (`flaky`), each with its rationale in the
 per-cluster section below.
 
 The `device` subtest used to die silently inside test_volume_get_container
@@ -924,7 +934,8 @@ baseline.
 ### device.c/test_wndproc
 Sites: 4207=expected 4212=expected 4214=expected 4219=expected
 Sites: 4223=expected 4248=expected 4257=expected 4293=expected
-Sites: 4298=expected 4302=expected 4319=ceiling 4340=expected 4420=expected
+Sites: 4298=expected 4302=ceiling 4319=ceiling 4328=ceiling 4329=ceiling
+Sites: 4340=expected 4420=expected
 Sites: 4424=expected 4432=expected 4487=expected 4525=expected 4545=expected
 Sites: 4572=expected 4161=ceiling 4231=ceiling 4551=expected 4475=flaky
 Sites: 4480=flaky
@@ -957,6 +968,28 @@ remain unknown. `ceiling` retains the pin of two while tolerating lower
 message-observation counts; unlike `flaky`, it still rejects counts above
 the pin. This changes no focus or activation behavior and does not establish
 that the message contract is fixed.
+
+4302, 4328 and 4329 move together now and then on i686: in one iteration
+4302 passes, and 4328/4329, the desktop mode read back after the hidden
+device window loses focus, fail, so the device reads `4302 2 -> 1`,
+`4328 0 -> 1` and `4329 0 -> 1`. That happened on 2026-09-13 and again on
+2026-10-04, the second time with no other Wine session on the machine, in
+one of about a hundred local i686 device runs between 2026-10-01 and
+2026-10-05. None of the 985 i686 device legs CI ran between 2026-09-21 and
+2026-10-05 showed it, and neither local run kept a raw capture. The reading
+the counts allow, which is conjecture: a deactivation that macdrv delivers
+late restores the registry mode before 4302 reads it, the app is then
+inactive when the test's `Reset` sets the device's mode again, and the
+second `SetForegroundWindow(GetDesktopWindow())` changes no activation, so
+no `WM_ACTIVATEAPP(FALSE)` arrives to restore it. 4302 stays the decision
+recorded above; `ceiling` keeps its pin of two and tolerates one. 4328 and
+4329 are pinned at one on the two i686 device legs recorded on this machine
+(`i686`, and `i686+intel`, which carries the native leg's pins);
+`i686+scale` is recorded on CI, where they read zero, and a first read there
+or on any other leg is a new site. A read of two, both iterations failing to
+restore the registry mode on focus loss, still fails the gate. A re-record
+on a run where they read zero drops the 4328/4329 pins from both legs, and
+they must be put back by hand.
 
 4257/4298/4424/4487 are the kept device-loss divergence, not an unwritten
 stub: no exclusive mode is ever taken, so nothing is ever lost, and

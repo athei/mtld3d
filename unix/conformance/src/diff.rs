@@ -7,9 +7,10 @@
 //! improvements keeps baseline.txt in lockstep with reality; a tolerated
 //! improvement would silently widen the budget a later regression can hide
 //! in. The two tolerance classes are `flaky` (count not load-bearing, either
-//! direction) and `ceiling` (the pin is a cross-environment maximum; only
-//! upward movement gates). Persisted untriaged sites are reported but do not
-//! fail the gate (the triage sync test owns that).
+//! direction) and `ceiling` (the pin is a maximum, across environments or
+//! across the flaps of one; only upward movement gates). Persisted
+//! untriaged sites are reported but do not fail the gate (the triage sync
+//! test owns that).
 
 use std::{
     collections::{BTreeMap, BTreeSet},

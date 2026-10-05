@@ -509,8 +509,8 @@ The rules that are easy to get wrong:
 - A classification records the nature of a divergence, never its difficulty or
   how much a game cares. A hard-to-fix real defect is still real.
 - Re-record the baseline in the same change as the fix that moves the counts, and
-  check the diff: a re-record drops flaky-pinned sites that happened to read zero
-  in that run.
+  check the diff: a re-record drops flaky- or ceiling-pinned sites that happened
+  to read zero in that run.
 - Derive the reason for a failing site from the upstream test source and from the
   raw actual-versus-expected values, which `MTLD3D_CONFORMANCE_RAW_DIR=<dir>`
   keeps. A site name is not a description of what the test exercises.
