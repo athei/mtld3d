@@ -13,7 +13,6 @@ the reason for each one.
 | Team Fortress 2 | Plays, 64-bit, D3D9 renderer (launched without `-vulkan`) |
 | Grand Theft Auto IV | Plays, `gta-iv` profile |
 | Call of Duty: Modern Warfare 2 | Plays, 64-bit |
-| XCOM: Enemy Within | Tactical play confirmed with an earlier short-stride build, NVIDIA spoof and color overrides; revised buffer bindings still need game testing |
 | Halo 2 | Renders, `halo2` profile |
 | 3DMark05 | Runs end to end |
 | Unigine Tropics | Runs |

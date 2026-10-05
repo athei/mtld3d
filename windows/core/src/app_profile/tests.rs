@@ -239,28 +239,3 @@ fn a_builtin_profile_is_found_by_name_alone() {
         "an executable name is not a profile name"
     );
 }
-
-#[test]
-fn xcom_profile_spoofs_the_adapter_without_changing_color_defaults() {
-    let resource = blob(&[
-        ("CompanyName", "Firaxis Games"),
-        ("ProductName", "XCOM: Enemy Within"),
-        ("OriginalFilename", "XComGame.exe"),
-    ]);
-    let id = AppIdentity::new("XComEW.exe".to_owned(), Some(&resource));
-    let profile = lookup(&id).expect("XCOM profile");
-    assert_eq!(profile.name(), "xcom-ew");
-    assert_eq!(profile.settings(), "adapter.spoof=nvidia");
-    let cfg = parse(Some(profile), "", None);
-    assert_eq!(cfg.adapter_spoof, AdapterSpoof::Nvidia);
-    let defaults = parse(None, "", None);
-    assert_eq!(cfg.hdr_enable, defaults.hdr_enable);
-    assert_eq!(cfg.color_space, defaults.color_space);
-    assert!(lookup(&AppIdentity::new("XComEW.exe".to_owned(), None)).is_none());
-    let wrong = blob(&[
-        ("CompanyName", "Other"),
-        ("ProductName", "XCOM: Enemy Within"),
-        ("OriginalFilename", "XComGame.exe"),
-    ]);
-    assert!(lookup(&AppIdentity::new("XComEW.exe".to_owned(), Some(&wrong))).is_none());
-}

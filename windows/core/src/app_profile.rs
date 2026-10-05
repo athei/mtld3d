@@ -85,17 +85,6 @@ static PROFILES: &[AppProfile] = &[
         original_filename: None,
         settings: "query.flushImmediate=true;query.eventImmediate=true",
     },
-    // XCOM: Enemy Within. Its version resource names XComGame.exe.
-    // NVIDIA identity was used with the color preferences in confirmed tactical tests.
-    // HDR and color-space choices remain preferences, not profile requirements.
-    AppProfile {
-        name: "xcom-ew",
-        exe: "XComEW.exe",
-        company: Some("Firaxis Games"),
-        product: Some("XCOM: Enemy Within"),
-        original_filename: Some("XComGame.exe"),
-        settings: "adapter.spoof=nvidia",
-    },
 ];
 
 /// One built-in profile: what it matches, and the options it sets.
