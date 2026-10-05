@@ -29,8 +29,8 @@ use mtld3d_core::{
     perf::{CycleAddTimer, OpSub, OpSubDetail},
     pipeline_state::{ExtraColorAttachments, PipelineAttachFlags, PipelineSnapshot, StreamLayout},
     streams::{
-        CrossingFetch, VertexFetchError, advanced_binding_offset, crossing_read_size,
-        instance_count, instanced_stream_read_bytes, is_instance_data,
+        CrossingFetch, crossing_read_size, instance_count, instanced_stream_read_bytes,
+        is_instance_data,
     },
     vs_draw::{MAX_CLIP_PLANES, VS_DRAW_BYTES, VsDrawState},
 };
@@ -1797,8 +1797,18 @@ fn crossing_fetch(
     layouts: &mut [StreamLayout; mtld3d_types::MAX_STREAMS as usize],
     crossing: u16,
 ) -> Option<CrossingFetch> {
-    let fetch = CrossingFetch::new(attrs.as_slice(), layouts)
-        .and_then(|fetch| check_advanced_offsets(vertex_source, &fetch, crossing).map(|()| fetch));
+    let stream = |stream| match (vertex_source, vertex_source.feed(stream)) {
+        (VertexView::Up { record, .. }, VertexFeed::Inline { .. }) => {
+            Some((0, u64::from(record.size)))
+        }
+        (_, VertexFeed::Buffer(record)) => Some((record.offset, record.length)),
+        _ => None,
+    };
+    let fetch = CrossingFetch::new(attrs.as_slice(), layouts).and_then(|fetch| {
+        fetch
+            .check_advanced_offsets(crossing, stream)
+            .map(|()| fetch)
+    });
     match fetch {
         Ok(fetch) => {
             mtld3d_shared::log_once_info!(target: crate::LOG_TARGET,
@@ -1818,32 +1828,6 @@ fn crossing_fetch(
             None
         }
     }
-}
-
-/// Check every advanced binding of `fetch` against its stream's offset and buffer length.
-fn check_advanced_offsets(
-    vertex_source: &VertexView<'_>,
-    fetch: &CrossingFetch,
-    crossing: u16,
-) -> Result<(), VertexFetchError> {
-    let mut streams = crossing;
-    while streams != 0 {
-        let stream = streams.trailing_zeros();
-        streams &= streams - 1;
-        let (base, len) = match (vertex_source, vertex_source.feed(stream)) {
-            (VertexView::Up { record, .. }, VertexFeed::Inline { .. }) => {
-                (0, u64::from(record.size))
-            }
-            (_, VertexFeed::Buffer(record)) => (record.offset, record.length),
-            // A stream fed nothing steps by its extent and never crosses.
-            _ => continue,
-        };
-        let stream = u8::try_from(stream).expect("stream index below 16");
-        for (_, advance) in fetch.slots_of(stream).filter(|&(_, advance)| advance != 0) {
-            advanced_binding_offset(base, advance, len)?;
-        }
-    }
-    Ok(())
 }
 
 /// Bind a crossing draw's inline (UP) vertices at every slot that reads stream 0.

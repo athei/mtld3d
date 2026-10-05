@@ -335,3 +335,24 @@ fn equal_remapped_layouts_place_the_attributes_alike() {
         }
     }
 }
+
+#[test]
+fn only_an_advanced_binding_is_held_to_metals_offset_rules() {
+    let attrs = [
+        attr(0, 0, VertexFormat::Float3),
+        attr(0, 18, VertexFormat::UChar4NormalizedBgra),
+    ];
+    let mut layouts = [StreamLayout::UNUSED; 16];
+    layouts[0] = bound_stream_layout(16, 22, 1);
+    let fetch = CrossingFetch::new(&attrs, &layouts).expect("one crossing attribute");
+    // Stream offset 2: the stream's own binding stays at 2, unchecked, and the
+    // advanced one lands on 20.
+    assert_eq!(fetch.check_advanced_offsets(1, |_| Some((2, 4096))), Ok(()));
+    // Stream offset 0 leaves the advanced binding at 18.
+    assert_eq!(
+        fetch.check_advanced_offsets(1, |_| Some((0, 4096))),
+        Err(VertexFetchError::UnalignedOffset)
+    );
+    // A stream fed nothing is skipped.
+    assert_eq!(fetch.check_advanced_offsets(1, |_| None), Ok(()));
+}

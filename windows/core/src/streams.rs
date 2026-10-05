@@ -356,6 +356,41 @@ impl CrossingFetch {
         &self.layouts
     }
 
+    /// Check every advanced binding of the `crossing` streams against what Metal accepts.
+    ///
+    /// `stream` gives a crossing stream's own offset and its buffer's length,
+    /// `None` for a stream fed nothing (which steps by its extent and never
+    /// crosses). Only a binding advanced past the stream offset is checked: a
+    /// stream's own binding binds the offset the application set, as every
+    /// other draw's does.
+    ///
+    /// # Errors
+    ///
+    /// The first advanced offset [`advanced_binding_offset`] refuses.
+    ///
+    /// # Panics
+    ///
+    /// Never: a stream index from a 16-bit mask fits `u8`.
+    pub fn check_advanced_offsets(
+        &self,
+        crossing: u16,
+        stream: impl Fn(u32) -> Option<(u32, u64)>,
+    ) -> Result<(), VertexFetchError> {
+        let mut streams = crossing;
+        while streams != 0 {
+            let index = streams.trailing_zeros();
+            streams &= streams - 1;
+            let Some((base, len)) = stream(index) else {
+                continue;
+            };
+            let index = u8::try_from(index).expect("a stream index below 16");
+            for (_, advance) in self.slots_of(index).filter(|&(_, advance)| advance != 0) {
+                advanced_binding_offset(base, advance, len)?;
+            }
+        }
+        Ok(())
+    }
+
     /// The Metal slots that read `stream`, each with its byte advance past the stream offset.
     pub fn slots_of(&self, stream: u8) -> impl Iterator<Item = (u32, u32)> + '_ {
         let mut used = self.used_slots;

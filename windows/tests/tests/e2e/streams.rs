@@ -19,7 +19,7 @@ const GREEN: u32 = 0xFF00_FF00;
 const BLUE: u32 = 0xFF00_00FF;
 
 /// `vs_2_0`: `dcl_position v0; dcl_texcoord v2; mov oPos, v0; mov oD0, v2;`
-const VS_POS_COLOR_TEXCOORD: [u32; 14] = [
+pub const VS_POS_COLOR_TEXCOORD: [u32; 14] = [
     0xFFFE_0200,
     (31) | (2 << 24),
     0x0000_0000,
@@ -77,7 +77,7 @@ const VS_INSTANCED: [u32; 15] = [
 ];
 
 /// `ps_2_0`: `dcl v0; mov oC0, v0;`
-const PS_DIFFUSE: [u32; 8] = [
+pub const PS_DIFFUSE: [u32; 8] = [
     0xFFFF_0200,
     (31) | (2 << 24),
     0x0000_0000,
@@ -579,7 +579,7 @@ fn crossing_instance_stream_keeps_its_divisor_and_constant_step() {
 }
 
 /// The position at byte 0 and a colour read at byte 28 of a 16-byte vertex.
-const fn crossing_color_elements() -> [D3DVERTEXELEMENT9; 3] {
+pub const fn crossing_color_elements() -> [D3DVERTEXELEMENT9; 3] {
     [
         element(0, D3DDECLTYPE_FLOAT3, D3DDECLUSAGE_POSITION),
         D3DVERTEXELEMENT9 {
@@ -709,49 +709,6 @@ fn a_staged_indexed_crossing_draw_keeps_its_vertices_from_a_later_lock() {
         RED,
         "the refill reaches the later draw"
     );
-}
-
-/// A stream offset off a four-byte boundary still draws when nothing crosses.
-///
-/// Neither `SetStreamSource` nor the draw rejects such an offset, and only
-/// the extra binding of an attribute past its stride is held to Metal's
-/// alignment.
-#[test]
-fn a_stream_offset_off_a_four_byte_boundary_still_draws() {
-    let h = Harness::new();
-    let decl = h.create_vertex_declaration(&[
-        element(0, D3DDECLTYPE_FLOAT3, D3DDECLUSAGE_POSITION),
-        D3DVERTEXELEMENT9 {
-            stream: 0,
-            offset: 12,
-            type_: D3DDECLTYPE_D3DCOLOR,
-            method: 0,
-            usage: D3DDECLUSAGE_COLOR,
-            usage_index: 0,
-        },
-        end(),
-    ]);
-    let vs = h.create_vertex_shader(&VS_POS_COLOR);
-    let ps = h.create_pixel_shader(&PS_DIFFUSE);
-    assert_eq!(h.set_vertex_declaration(&decl), 0);
-    assert_eq!(h.set_vertex_shader(&vs), 0);
-    assert_eq!(h.set_pixel_shader(&ps), 0);
-    let stride = stride_of::<PackedVertex>();
-    let mut bytes = vec![0u8; 2];
-    for vertex in packed_triangle(GREEN) {
-        bytes.extend_from_slice(&vertex.x.to_le_bytes());
-        bytes.extend_from_slice(&vertex.y.to_le_bytes());
-        bytes.extend_from_slice(&vertex.z.to_le_bytes());
-        bytes.extend_from_slice(&vertex.color.to_le_bytes());
-    }
-    let length = u32::try_from(bytes.len()).expect("a small buffer");
-    let vb = h.create_vertex_buffer(length, D3DUSAGE_WRITEONLY, 0, D3DPOOL_DEFAULT);
-    vb.lock(0, 0, 0).write(bytes.as_slice());
-    assert_eq!(h.set_stream_source(0, &vb, 2, stride), D3D_OK);
-    h.render_once(BLUE, |d| {
-        assert_eq!(d.draw_primitive(D3DPT_TRIANGLELIST, 0, 1), 0);
-    });
-    assert_eq!(h.read_pixel(320, 280), GREEN, "drawn from offset 2");
 }
 
 /// A zero stride feeds every vertex the element at the stream offset.
