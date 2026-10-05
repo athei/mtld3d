@@ -461,6 +461,23 @@ record. A knob, where one makes sense, is named with its default.
   conformance site is known to observe it. No knob: an application reading
   such a surface asked for the colour, and a knob would only add a second
   read-back path to keep in step.
+- **The fixed-function specular add clamps before fog.** With
+  `D3DRS_SPECULARENABLE` on, the interpolated specular colour joins the
+  cascade result after the last texture stage, RGB only, and the sum is
+  clamped to [0, 1] before fog blends it with the fog colour. wined3d
+  (`ffp_varying_specular * specular_enable + ret`) and DXVK
+  (`state.current.xyz += in_Color1.xyz;`) both fog the unclamped sum, so a
+  fogged pixel whose diffuse and specular add past one comes out brighter
+  there; without fog the render target's clamp makes the two agree on a
+  normalized target. The clamp follows the colour-sum stage of
+  fixed-function hardware, which OpenGL's fixed pipeline specifies as
+  clamped to [0, 1] before fog, and World of Warcraft draws fogged scenes
+  through this path with the add switched on, so the reference behaviour is
+  not adopted on reference agreement alone.
+  What Windows draws is not measured, and no site observes it: Wine's suite
+  turns the specular add on only in tests that leave fog off. Reopen on a game
+  that shows fogged highlights brighter or darker than on Windows. No knob:
+  the alternative is a different shader, not a trade.
 
 ## Range-fog coverage
 
@@ -600,8 +617,10 @@ argument modifiers and saturation before a following texture stage.
 An implicit-only missing texture uses zero alpha, following the native
 observation recorded in DXVK commit `0b49a39896f25896b83ed01c0609393dfc3bb85c`.
 This is a reference choice, not a new native measurement: Wine's D3D9 GL
-dummy texture uses alpha one. Existing explicit-unbound-argument handling
-and ordinary `BLENDTEXTUREALPHA` behavior remain unchanged.
+dummy texture uses alpha one. The ordinary `BLENDTEXTUREALPHA` follows the
+same rule, so with no texture bound and no argument naming it the stage
+yields its second argument, for colour and alpha alike; wined3d yields the
+first. Existing explicit-unbound-argument handling remains unchanged.
 
 ## What the baseline records — and where classes live
 

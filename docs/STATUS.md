@@ -142,6 +142,12 @@ unless its entry says otherwise.
   NONE, where the fixed-function pixel stage reads its fog factor.
 - Timestamp, timestamp frequency, timestamp disjoint and other niche query
   types: capability probes and creation report `D3DERR_NOTAVAILABLE`.
+- The fixed-function texture operations `D3DTOP_PREMODULATE`,
+  `D3DTOP_MULTIPLYADD` and `D3DTOP_LERP`: absent from `TextureOpCaps`, and a
+  stage that names one is warned once and runs as `D3DTOP_SELECTARG1`.
+  `D3DTSS_COLORARG0` and `D3DTSS_ALPHAARG0`, which only the last two read,
+  are stored and reported back, and warned once when written away from
+  their default.
 - Fixed-function bump-environment mapping: `D3DTOP_BUMPENVMAP` and
   `D3DTOP_BUMPENVMAPLUMINANCE` are absent from `TextureOpCaps`, and
   `D3DUSAGE_QUERY_LEGACYBUMPMAP` answers `D3DERR_NOTAVAILABLE` for every
@@ -314,6 +320,9 @@ is in [`CONFORMANCE.md`](../unix/conformance/CONFORMANCE.md#kept-divergences).
   and appears once the build lands; D3D9 draws every call in its frame.
   Building inline stalls the frame for the length of a Metal compile.
   `shader.asyncCompile`, on by default.
+- The fixed-function specular add clamps its sum to [0, 1] before fog
+  blends it, where both reference implementations fog the unclamped sum. No
+  knob.
 - `GetRenderTargetData` from an X render target into a system-memory
   surface of its A counterpart (X8R8G8B8 into A8R8G8B8, X8B8G8R8 into
   A8B8G8R8, X1R5G5B5 into A1R5G5B5) copies the X padding into the alpha,
