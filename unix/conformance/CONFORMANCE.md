@@ -46,7 +46,8 @@ answer, `intel.managedMemory` and `intel.linearAlign256`, must move no count
 at all, and a site that fails only under the variant is expected to trace to
 one of the two caps keys. The `@mac2` entries are recorded by CI, whose
 Intel image is the one Mac2 machine the project runs on: dispatch the
-workflow with `record_intel_baseline` and copy the `@mac2` sections out of
+workflow with `record_intel_baseline` (and `intel_only`, so only the Intel
+legs run) and copy the `@mac2` sections out of
 the `baseline-mac2-<arch>` artifacts (`make conformance-baseline` on an Apple
 Silicon machine leaves them untouched, the merge being leg-scoped).
 
@@ -87,8 +88,10 @@ drops afterwards) stops the subtest at once and ends the leg: exit code 3, no
 verdict, no baseline write. Every count after that line is a read off a GPU
 that runs nothing, and waiting out the subtest's budget would only make the
 same non-verdict cost minutes. On the Intel CI image the paravirtual GPU stays
-hung for the rest of the machine's life, so the later subtests would hang too
-and the job names the re-run of the failed jobs, which lands on a fresh runner.
+hung for the rest of the machine's life, so the later subtests would hang too.
+The job marks the leg with a `GPU hang` annotation, and the answer is a re-run
+of the failed jobs, which lands them on fresh runners; CI does that once by
+itself (`CONTRIBUTING.md`, "Pull requests", says when).
 A hang on a real GPU is worth a look on its own (a shader that hangs the GPU is
 a bug), but the leg has to run again for its counts either way.
 
