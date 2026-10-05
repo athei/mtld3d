@@ -208,7 +208,6 @@ windows/core/src/shader_compile_stats.rs CompileBucket Clone,Copy,Debug,PartialE
 windows/core/src/shader_compile_stats.rs Snapshot Clone,Copy,Debug,PartialEq,Eq
 windows/core/src/shader_key.rs CachedKind Clone,Copy,Debug,PartialEq,Eq,Hash
 windows/core/src/staging_coverage.rs CoverageState Debug,Clone,Copy,PartialEq,Eq
-windows/core/src/streams.rs VertexFetchBinding Clone,Copy
 windows/core/src/stretch_rect.rs RejectReason Clone,Copy,Debug,PartialEq,Eq
 windows/core/src/stretch_rect.rs StretchRegion Clone,Copy,Debug,PartialEq,Eq
 windows/core/src/texture_flags.rs TextureFlags Clone,Copy,Debug,Default,PartialEq,Eq
@@ -245,7 +244,6 @@ windows/tests/src/vertex.rs Vertex Clone,Copy
 windows/tests/src/win32.rs Rect Clone,Copy,PartialEq,Eq,Debug
 windows/tests/tests/e2e/draw.rs PaddedVertex Clone,Copy
 windows/tests/tests/e2e/points.rs PsizeVertex Clone,Copy
-windows/tests/tests/e2e/streams.rs PackedVertex Clone,Copy
 windows/tests/tests/e2e/streams.rs PackedVertex Clone,Copy
 windows/tests/tests/e2e/texture_stages.rs PaddedVertex Clone,Copy
 windows/tests/tests/e2e/texture_stages.rs PosNormalTexVertex Clone,Copy

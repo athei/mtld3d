@@ -230,8 +230,10 @@ impl PipelineRsBits {
 /// D3D→Metal translations + the cache probe), and equality implies an
 /// identical key, so the memo can return the cached handle directly. The
 /// key is a pure function of the snapshot and the attribute list, and the
-/// list is a function of the declaration (`vdecl_hash`) and the vertex
-/// shader it was resolved against, whose identity `vs_fn` carries.
+/// list is a function of the declaration (`vdecl_hash`), the vertex shader
+/// it was resolved against, whose identity `vs_fn` carries, and, for a draw
+/// with an attribute past its stream's stride, the `stream_layouts` that
+/// placed it (`streams::remap_crossing_attributes`).
 #[derive(Clone)]
 pub struct PipelineSnapshot {
     pub vs_fn: MetalHandle<MTLFunctionKind>,
@@ -243,9 +245,11 @@ pub struct PipelineSnapshot {
     /// two declarations that resolve alike share a pipeline. The resolve
     /// memo, the persisted recipe and the build diagnostics read it.
     pub vdecl_hash: u64,
-    /// Vertex buffer layout per D3D9 stream, indexed by stream.
+    /// Vertex buffer layout per Metal vertex buffer slot.
     ///
-    /// Canonical: a stream the draw does not read is
+    /// Slot `n` is D3D9 stream `n`, except the slots a draw with an attribute
+    /// past its stream's stride gives that attribute
+    /// (`streams::CrossingFetch`). Canonical: a stream the draw does not read is
     /// [`StreamLayout::UNUSED`], so two draws that differ only in streams
     /// neither reads share a pipeline.
     pub stream_layouts: [StreamLayout; MAX_STREAMS as usize],

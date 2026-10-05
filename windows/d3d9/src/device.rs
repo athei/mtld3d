@@ -775,6 +775,13 @@ pub struct DeviceInner {
     /// and folded into a programmable `VsSource` so a shader reading an
     /// unprovided input compiles a distinct, zero-filled variant.
     cached_vs_provided_mask: u16,
+    /// Stream 0's consumed extent from the most recent `VDECL` rebuild.
+    ///
+    /// Sizes a `Draw*PrimitiveUP` vertex copy: when it is past the draw's
+    /// stride, the last vertex's crossing attribute reads past the vertices
+    /// the application supplied, which the copy zero-fills. Same lifecycle as
+    /// `cached_ff_vs_layout`; the UP draws read it after their snapshot.
+    cached_stream0_extent: u32,
 }
 
 /// Per-RS-index dirty mask.
@@ -3422,6 +3429,7 @@ impl Direct3DDevice9 {
             cached_bound_texture_mask: 0,
             cached_ff_vs_layout: FfVsLayout::default(),
             cached_vs_provided_mask: u16::MAX,
+            cached_stream0_extent: 0,
         }));
         Self {
             vtbl: &raw const DIRECT3D_DEVICE9_VTBL,
@@ -11804,48 +11812,6 @@ fn snapshot_bound_index_source(dev: &DeviceInner, start_index: u32) -> Option<In
     })
 }
 
-/// Resolve the declaration against the shader the draw actually runs.
-///
-/// Shared by snapshot capture and inline sizing, including pre-transformed vertices
-/// that bypass a bound programmable shader.
-fn resolve_draw_declaration(dev: &DeviceInner) -> (convert::ResolvedAttrs, u64, FfVsLayout) {
-    let bound_vertex_shader = dev.shader_bindings().vertex_shader();
-    let fvf = dev.fvf();
-    let decl_ptr = dev.vertex_decl();
-    if decl_ptr.is_null() {
-        let (elements, _fvf_stride) = fvf_to_elements(fvf);
-        let layout = convert::ff_vs_layout_from_elements(&elements);
-        // Pre-transformed (POSITIONT/XYZRHW) layouts bypass a bound VS —
-        // D3D9 runs the FF pre-transformed path regardless, even when a
-        // VS is still bound — so the attrs must resolve for the FF VS too.
-        let resolved = if bound_vertex_shader.is_null() || layout.has_rhw() {
-            resolve_attrs_for_ff(&elements, &[0; MAX_LINKED_INPUTS])
-        } else {
-            // SAFETY: the API lock guards this draw; the device binding retains
-            // the non-null shader until the declaration has been resolved.
-            let vs_obj = unsafe { &*bound_vertex_shader };
-            resolve_attrs_for_vs(&elements, vs_obj.input_semantics())
-        };
-        (resolved, u64::from(fvf), layout)
-    } else {
-        // SAFETY: the API lock guards this draw; the device binding retains
-        // the non-null declaration while its elements are borrowed.
-        let decl = unsafe { &*decl_ptr };
-        let elements = decl.inner().elements();
-        let layout = convert::ff_vs_layout_from_elements(elements);
-        // See the FVF arm: POSITIONT bypasses a bound VS.
-        let resolved = if bound_vertex_shader.is_null() || layout.has_rhw() {
-            resolve_attrs_for_ff(elements, &decl.inner().passthrough())
-        } else {
-            // SAFETY: the API lock guards this draw; the device binding retains
-            // the non-null shader until the declaration has been resolved.
-            let vs_obj = unsafe { &*bound_vertex_shader };
-            resolve_attrs_for_vs(elements, vs_obj.input_semantics())
-        };
-        (resolved, decl.inner().hash(), layout)
-    }
-}
-
 /// Copy `len` bytes of a `Draw*PrimitiveUP` vertex stream out of the user pointer.
 ///
 /// The bytes travel to the encoder inside the draw op, so they are copied
@@ -11864,6 +11830,50 @@ unsafe fn copy_up_vertices(
     let source = unsafe { core::slice::from_raw_parts(vertex_data.cast::<u8>(), len) };
     // SAFETY: current_frame retains immutable scratch through native submit replay.
     unsafe { arena_alloc_bytes(dev.current_frame.scratch_mut(), source) }
+}
+
+/// Copy a UP vertex stream whose last crossing attribute ends past its vertices.
+///
+/// The `count * stride` bytes D3D9 promises behind `vertex_data` are copied
+/// and zero-filled up to that attribute's end, `(count - 1) * stride +
+/// extent`, which is what the attribute then reads. Returns the copy and its
+/// size, or `None` when the size does not fit `u32`, which no vertex count a
+/// draw can carry reaches. Only a draw whose stream-0 extent is past its
+/// stride calls this; every other UP draw copies with [`copy_up_vertices`].
+///
+/// # Safety
+///
+/// `vertex_data` must be readable for `count * stride` bytes for the
+/// duration of the call, which the D3D9 ABI makes the caller's contract.
+#[cold]
+#[inline(never)]
+unsafe fn copy_up_crossing_vertices(
+    dev: &mut DeviceInner,
+    vertex_data: *const c_void,
+    count: u32,
+    stride: u32,
+) -> Option<(ScratchSlice, u32)> {
+    let extent = dev.cached_stream0_extent;
+    let Some(size) = mtld3d_core::streams::inline_vertex_span(count, stride, extent) else {
+        mtld3d_shared::log_once_warn!(
+            target: LOG_TARGET,
+            "Draw*PrimitiveUP: {count} vertices of stride {stride} with a crossing attribute \
+             ending at {extent} need more than 4 GiB → INVALIDCALL"
+        );
+        return None;
+    };
+    let supplied = count as usize * stride as usize;
+    // SAFETY: the caller guarantees `count * stride` readable bytes at `vertex_data`.
+    let source = unsafe { core::slice::from_raw_parts(vertex_data.cast::<u8>(), supplied) };
+    // SAFETY: current_frame retains immutable scratch through native submit replay.
+    let copy = unsafe {
+        mtld3d_core::draw_data::arena_alloc_zero_padded(
+            dev.current_frame.scratch_mut(),
+            source,
+            size as usize,
+        )
+    };
+    Some((copy, size))
 }
 
 extern "system" fn device_draw_primitive_up(
@@ -11898,19 +11908,6 @@ extern "system" fn device_draw_primitive_up(
         if vertex_data.is_null() {
             return D3DERR_INVALIDCALL;
         }
-        let Some(count) = primitive_count.checked_add(2) else {
-            return D3DERR_INVALIDCALL;
-        };
-        let extent = resolve_draw_declaration(dev).0.extents[0];
-        let Some(fan_bytes) =
-            mtld3d_core::streams::inline_vertex_span(count, vertex_stride, extent)
-        else {
-            return D3DERR_INVALIDCALL;
-        };
-        let fan_bytes = fan_bytes as usize;
-        // SAFETY: per the D3D9 ABI the caller guarantees `(primitive_count + 2)`
-        // vertices, including their consumed declaration extent, are readable from `vertex_data`.
-        let vertex_copy = unsafe { copy_up_vertices(dev, vertex_data, fan_bytes) };
         // The encoder's shared 16-bit pattern is relative to the fan's first
         // vertex, which the inline stream starts at, so it covers every fan a
         // 16-bit index can address; anything longer gets a generated list.
@@ -11929,6 +11926,27 @@ extern "system" fn device_draw_primitive_up(
         let snap = CycleAddTimer::start(draw_snapshot_ptr(perf_ptr));
         emit_snapshot_deltas(&obj);
         drop(snap);
+        // After the snapshot, which resolves the declaration the copy is sized by.
+        let (vertex_copy, fan_size) = if dev.cached_stream0_extent <= vertex_stride {
+            let fan_bytes = (primitive_count as usize + 2) * vertex_stride as usize;
+            // SAFETY: per the D3D9 ABI the caller guarantees `(primitive_count + 2)`
+            // vertices of `vertex_stride` bytes are readable from `vertex_data`.
+            let vertex_copy = unsafe { copy_up_vertices(dev, vertex_data, fan_bytes) };
+            (
+                vertex_copy,
+                u32::try_from(fan_bytes).expect("triangle-fan UP size fits u32"),
+            )
+        } else {
+            let fan_vertices = primitive_count.saturating_add(2);
+            // SAFETY: per the D3D9 ABI the caller guarantees the fan's vertices
+            // of `vertex_stride` bytes are readable; the copy reads no more.
+            let copy =
+                unsafe { copy_up_crossing_vertices(dev, vertex_data, fan_vertices, vertex_stride) };
+            let Some(copy) = copy else {
+                return D3DERR_INVALIDCALL;
+            };
+            copy
+        };
         let _push = CycleAddTimer::start(draw_push_op_ptr(perf_ptr));
         let metal_prim =
             d3d_to_metal_primitive(D3DPT_TRIANGLELIST).expect("triangle list is supported");
@@ -11936,7 +11954,7 @@ extern "system" fn device_draw_primitive_up(
             metal_prim,
             vertex_source: VertexSource::Up {
                 bytes: vertex_copy,
-                size: u32::try_from(fan_bytes).expect("triangle-fan UP size fits u32"),
+                size: fan_size,
                 stride: vertex_stride,
             },
             index_source,
@@ -11960,25 +11978,33 @@ extern "system" fn device_draw_primitive_up(
     let perf_ptr = DeviceInner::perf_ptr_of(obj.inner);
     let snap = CycleAddTimer::start(draw_snapshot_ptr(perf_ptr));
 
-    let extent = resolve_draw_declaration(dev).0.extents[0];
-    let Some(data_size) =
-        mtld3d_core::streams::inline_vertex_span(vtx_count, vertex_stride, extent)
-    else {
-        return D3DERR_INVALIDCALL;
-    };
-    let data_size = data_size as usize;
-    // SAFETY: `vertex_data` covers `data_size` bytes per the caller's stride
-    // and consumed declaration extent contract.
-    let vertex_copy = unsafe { copy_up_vertices(dev, vertex_data, data_size) };
-
     emit_snapshot_deltas(&obj);
+    // After the snapshot, which resolves the declaration the copy is sized by.
+    let (vertex_copy, data_size) = if dev.cached_stream0_extent <= vertex_stride {
+        let data_size = (vtx_count * vertex_stride) as usize;
+        // SAFETY: `vertex_data` covers `data_size` bytes per the caller's stride
+        // contract.
+        let vertex_copy = unsafe { copy_up_vertices(dev, vertex_data, data_size) };
+        (
+            vertex_copy,
+            u32::try_from(data_size).expect("DrawPrimitiveUP data size fits u32"),
+        )
+    } else {
+        // SAFETY: per the D3D9 ABI `vertex_data` covers `vtx_count` vertices of
+        // `vertex_stride` bytes; the copy reads no more.
+        let copy = unsafe { copy_up_crossing_vertices(dev, vertex_data, vtx_count, vertex_stride) };
+        let Some(copy) = copy else {
+            return D3DERR_INVALIDCALL;
+        };
+        copy
+    };
     drop(snap);
     let _push = CycleAddTimer::start(draw_push_op_ptr(perf_ptr));
     dev.record_draw(&DrawOp {
         metal_prim,
         vertex_source: VertexSource::Up {
             bytes: vertex_copy,
-            size: u32::try_from(data_size).expect("DrawPrimitiveUP data size fits u32"),
+            size: data_size,
             stride: vertex_stride,
         },
         index_source: IndexSource::None {
@@ -12124,8 +12150,40 @@ fn emit_snapshot_deltas(obj: &Direct3DDevice9) {
             section_perf_ptr,
             SnapshotSection::Vdecl,
         ));
-        let (resolved, vdecl_hash, ff_vs_layout) = resolve_draw_declaration(dev);
+        let bound_vertex_shader = dev.shader_bindings().vertex_shader();
+        let fvf = dev.fvf();
+        let decl_ptr = dev.vertex_decl();
+        let (resolved, vdecl_hash, ff_vs_layout) = if decl_ptr.is_null() {
+            let (elements, _fvf_stride) = fvf_to_elements(fvf);
+            let layout = convert::ff_vs_layout_from_elements(&elements);
+            // Pre-transformed (POSITIONT/XYZRHW) layouts bypass a bound VS —
+            // D3D9 runs the FF pre-transformed path regardless, even when a
+            // VS is still bound — so the attrs must resolve for the FF VS too.
+            let resolved = if bound_vertex_shader.is_null() || layout.has_rhw() {
+                resolve_attrs_for_ff(&elements, &[0; MAX_LINKED_INPUTS])
+            } else {
+                // SAFETY: non-null check passed; refcount holds it live.
+                let vs_obj = unsafe { &*bound_vertex_shader };
+                resolve_attrs_for_vs(&elements, vs_obj.input_semantics())
+            };
+            (resolved, u64::from(fvf), layout)
+        } else {
+            // SAFETY: non-null check passed; refcount holds it live.
+            let decl = unsafe { &*decl_ptr };
+            let elements = decl.inner().elements();
+            let layout = convert::ff_vs_layout_from_elements(elements);
+            // See the FVF arm: POSITIONT bypasses a bound VS.
+            let resolved = if bound_vertex_shader.is_null() || layout.has_rhw() {
+                resolve_attrs_for_ff(elements, &decl.inner().passthrough())
+            } else {
+                // SAFETY: see above.
+                let vs_obj = unsafe { &*bound_vertex_shader };
+                resolve_attrs_for_vs(elements, vs_obj.input_semantics())
+            };
+            (resolved, decl.inner().hash(), layout)
+        };
         dev.cached_ff_vs_layout = ff_vs_layout;
+        dev.cached_stream0_extent = resolved.extents[0];
         // Which VS input registers the declaration backs — folded into a
         // programmable VsSource so a shader reading an unprovided input gets a
         // distinct zero-filled variant. For the FF
@@ -12978,19 +13036,8 @@ extern "system" fn device_draw_indexed_primitive_up(
     // absolute (base vertex 0), so copy `[0, min_vertex_index + num_vertices)`
     // straight from the user pointer; vertices below `min_vertex_index` are
     // uploaded but unreferenced.
-    let Some(vtx_upload) = min_vertex_index.checked_add(num_vertices) else {
-        return D3DERR_INVALIDCALL;
-    };
-    let extent = resolve_draw_declaration(dev).0.extents[0];
-    let Some(vtx_bytes) =
-        mtld3d_core::streams::inline_vertex_span(vtx_upload, vertex_stride, extent)
-    else {
-        return D3DERR_INVALIDCALL;
-    };
-    let vtx_bytes = vtx_bytes as usize;
-    // SAFETY: per the D3D9 ABI `vertex_data` covers at least
-    // the indexed vertices including the last consumed attribute.
-    let vertex_copy = unsafe { copy_up_vertices(dev, vertex_data, vtx_bytes) };
+    let vtx_upload = min_vertex_index as usize + num_vertices as usize;
+    let vtx_bytes = vtx_upload * vertex_stride as usize;
 
     // Build the index stream. Triangle fan has no Metal primitive, so the
     // inline indices are gathered into a triangle list (fan vertices
@@ -13035,12 +13082,31 @@ extern "system" fn device_draw_indexed_primitive_up(
     let snap = CycleAddTimer::start(draw_snapshot_ptr(perf_ptr));
     emit_snapshot_deltas(&obj);
     drop(snap);
+    // After the snapshot, which resolves the declaration the copy is sized by.
+    let (vertex_copy, vtx_size) = if dev.cached_stream0_extent <= vertex_stride {
+        // SAFETY: per the D3D9 ABI `vertex_data` covers at least
+        // `(min_vertex_index + num_vertices) * vertex_stride` bytes.
+        let vertex_copy = unsafe { copy_up_vertices(dev, vertex_data, vtx_bytes) };
+        (
+            vertex_copy,
+            u32::try_from(vtx_bytes).expect("DrawIndexedPrimitiveUP vertex size fits u32"),
+        )
+    } else {
+        let count = min_vertex_index.saturating_add(num_vertices);
+        // SAFETY: per the D3D9 ABI `vertex_data` covers `min_vertex_index +
+        // num_vertices` vertices of `vertex_stride` bytes; the copy reads no more.
+        let copy = unsafe { copy_up_crossing_vertices(dev, vertex_data, count, vertex_stride) };
+        let Some(copy) = copy else {
+            return D3DERR_INVALIDCALL;
+        };
+        copy
+    };
     let _push = CycleAddTimer::start(draw_push_op_ptr(perf_ptr));
     dev.record_draw(&DrawOp {
         metal_prim,
         vertex_source: VertexSource::Up {
             bytes: vertex_copy,
-            size: u32::try_from(vtx_bytes).expect("DrawIndexedPrimitiveUP vertex size fits u32"),
+            size: vtx_size,
             stride: vertex_stride,
         },
         index_source,

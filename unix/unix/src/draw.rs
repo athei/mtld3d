@@ -13,10 +13,13 @@ use mtld3d_core::{
     },
     depth_stencil_state::STENCIL_MASK_BITS,
     dirty_range::{indexed_vb_range_lower_bound, nonindexed_vb_range},
-    draw_data::{FixedPsSource, FixedVsSource, ProgrammablePsSource, ProgrammableVsSource},
+    draw_data::{
+        AttrSnapshot, FixedPsSource, FixedVsSource, ProgrammablePsSource, ProgrammableVsSource,
+    },
     dxso::{VariantFlags, VariantKey, bound_sampler_type},
     encoder_draw::draw_record::{
-        DrawView, IndexView, StreamViewFeed as VertexFeed, VertexView, stream_layouts_view,
+        DrawView, IndexView, StreamRecord, StreamViewFeed as VertexFeed, VertexView,
+        stream_layouts_view,
     },
     ids::BufferId,
     passes::{
@@ -24,9 +27,10 @@ use mtld3d_core::{
         null_texture_tex_sentinel, sampler_cache_key,
     },
     perf::{CycleAddTimer, OpSub, OpSubDetail},
-    pipeline_state::{ExtraColorAttachments, PipelineAttachFlags, PipelineSnapshot},
+    pipeline_state::{ExtraColorAttachments, PipelineAttachFlags, PipelineSnapshot, StreamLayout},
     streams::{
-        instance_count, instanced_stream_read_bytes, is_instance_data, remap_crossing_attributes,
+        CrossingFetch, VertexFetchError, advanced_binding_offset, crossing_read_size,
+        instance_count, instanced_stream_read_bytes, is_instance_data,
     },
     vs_draw::{MAX_CLIP_PLANES, VS_DRAW_BYTES, VsDrawState},
 };
@@ -809,37 +813,18 @@ fn emit_draw_view(
     // step function from the binding (a zero stride is one constant element,
     // the rest step per the stream's `SetStreamSourceFreq`), a constant zero
     // feed where nothing is bound. Part of the pipeline identity.
-    let original_layouts = stream_layouts_view(vertex_source, &attrs);
-    let mut layouts = original_layouts;
-    // Keep ordinary descriptors borrowed; crossing metadata uses fixed stack storage.
-    let mut mapped_attrs = [VertexAttrDesc {
-        attr_index: 0,
-        buffer_index: 0,
-        offset: 0,
-        format: mtld3d_shared::mtl::VertexFormat::Invalid,
-    }; mtld3d_types::MAX_STREAMS as usize];
-    let crossing = attrs.as_slice().iter().any(|a| {
-        attrs.extents()[a.buffer_index as usize] > original_layouts[a.buffer_index as usize].stride
-    });
-    let mut bindings = std::array::from_fn(|i| mtld3d_core::streams::VertexFetchBinding {
-        stream: u32::try_from(i).expect("stream index fits u32"),
-        offset: 0,
-    });
-    let attrs_ref = if crossing {
-        let remapped = &mut mapped_attrs[..attrs.as_slice().len()];
-        remapped.copy_from_slice(attrs.as_slice());
-        bindings = match remap_crossing_attributes(remapped, &mut layouts) {
-            Ok(bindings) => bindings,
-            Err(error) => {
-                mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
-                    "draw dropped: unsupported crossing vertex attribute: {error:?}");
-                return;
-            }
-        };
-        &*remapped
+    let (mut layouts, crossing) = stream_layouts_view(vertex_source, &attrs);
+    // An attribute that ends past its stream's stride is fetched through a
+    // binding of its own (`CrossingFetch`); every other draw takes the
+    // declaration's attributes and the stream layouts as they are.
+    let fetch = if crossing == 0 {
+        None
     } else {
-        attrs.as_slice()
+        crossing_fetch(vertex_source, &attrs, &mut layouts, crossing)
     };
+    let attrs_ref = fetch
+        .as_ref()
+        .map_or(attrs.as_slice(), CrossingFetch::attrs);
     enc.maybe_emit_draw_trace(
         shaders,
         metal_prim,
@@ -881,7 +866,7 @@ fn emit_draw_view(
         vs_fn: vs_handles.func,
         ps_fn: ps_handles.func,
         vdecl_hash,
-        stream_layouts: layouts,
+        stream_layouts: fetch.as_ref().map_or(layouts, |f| *f.layouts()),
         color_format,
         attach,
         rs: render_state.pipeline_rs,
@@ -1449,34 +1434,21 @@ fn emit_draw_view(
             if usize::try_from(size).is_ok_and(|size| size > SET_BYTES_MAX) {
                 enc.bump_up_vertex_oversized();
             }
-            for (slot, binding) in (0u32..).zip(bindings.iter()) {
-                if !layouts[slot as usize].is_used() || binding.stream != 0 {
-                    continue;
-                }
-                let Some(length) = size
-                    .checked_sub(binding.offset)
-                    .filter(|length| *length > 0)
-                else {
-                    mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
-                        "draw dropped: inline vertex binding offset exceeds the payload");
-                    return;
-                };
-                enc.emit_command(Command::set_vertex_bytes(
-                    scratch_ptr + u64::from(binding.offset),
-                    length,
-                    slot,
-                ));
-                enc.last_bound().invalidate_vertex_buffer_slot(slot);
+            if let Some(fetch) = &fetch {
+                bind_crossing_inline(enc, fetch, scratch_ptr, size);
+            } else {
+                enc.emit_command(Command::set_vertex_bytes(scratch_ptr, size, 0));
             }
             // Inline slot-0 bind clobbers the real Metal vertex-buffer
             // binding; drop the cached bound-VB so the next bound draw
             // re-emits its `setVertexBuffer` instead of reading these bytes.
+            // A crossing draw's inline slots forget their own bindings.
             enc.last_bound().invalidate_vertex_buffer();
         }
         VertexView::Bound { .. } => {
             for b in vertex_source.bindings() {
                 let slot = u32::from(b.stream);
-                let layout = original_layouts[b.stream as usize];
+                let layout = layouts[b.stream as usize];
                 if !layout.is_used() {
                     // Bound but not read by the declaration's consumed
                     // attributes: nothing to bind.
@@ -1498,40 +1470,30 @@ fn emit_draw_view(
                     );
                     return;
                 }
-                let Some(buffer_len) = enc.vbib_buffer_length(BufferId::from_raw(b.buffer)) else {
-                    mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
-                        "draw dropped: vertex buffer capacity is unavailable after wrapping");
-                    return;
-                };
-                for (metal_slot, binding) in (0u32..).zip(bindings.iter()) {
-                    if !layouts[metal_slot as usize].is_used() || binding.stream != slot {
-                        continue;
-                    }
-                    let Some(offset) = b
-                        .offset
-                        .checked_add(binding.offset)
-                        .filter(|offset| offset % 4 == 0 && u64::from(*offset) < buffer_len)
-                    else {
-                        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
-                            "draw dropped: vertex buffer binding is unaligned or outside the buffer");
-                        return;
-                    };
+                if let Some(fetch) = &fetch {
+                    bind_crossing_stream(enc, fetch, b, buffer_handle);
+                } else {
                     let bind = enc.last_bound().vertex_buffer_changed(
-                        metal_slot,
+                        slot,
                         buffer_handle,
-                        offset,
+                        b.offset,
                         b.generation,
                     );
                     if bind == VertexBufferBind::ReusedHandle {
-                        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
-                            "vertex buffer handle {buffer_handle:#x} reused within a pass: rebinding");
+                        // The dedup would have kept the wrapper this address used
+                        // to name bound; that wrapper was destroyed inside this
+                        // pass, which the retention schedule is meant to rule out.
+                        mtld3d_shared::log_once_warn!(
+                            target: crate::LOG_TARGET,
+                            "vertex buffer handle {buffer_handle:#x} reused within a pass for \
+                             buffer {:#x} generation {}: rebinding instead of deduplicating",
+                            b.buffer,
+                            b.generation
+                        );
                     }
-                    if bind != VertexBufferBind::Same {
-                        enc.emit_command(Command::set_vertex_buffer(
-                            buffer_handle,
-                            offset,
-                            metal_slot,
-                        ));
+                    let vb_emitted = bind != VertexBufferBind::Same;
+                    if vb_emitted {
+                        enc.emit_command(Command::set_vertex_buffer(buffer_handle, b.offset, slot));
                     }
                 }
                 // Only a staged buffer takes staging uploads, so only its
@@ -1550,7 +1512,7 @@ fn emit_draw_view(
                 // reads one element per `step_rate` instances. All may
                 // over-cover but never under-cover; overflow falls back to the
                 // whole tail. `None` = the draw reads nothing → record nothing.
-                let logical_len = u32::try_from(buffer_len).unwrap_or(u32::MAX);
+                let logical_len = u32::try_from(b.length).unwrap_or(u32::MAX);
                 let read_range = match (layout.step, index_source) {
                     (
                         VertexStepFunction::PerVertex,
@@ -1615,14 +1577,17 @@ fn emit_draw_view(
                     )),
                 };
                 if let Some((range_off, range_size)) = read_range {
-                    // Crossing attributes extend the last packed element's read.
-                    let tail = attrs.extents()[b.stream as usize].saturating_sub(layout.stride);
-                    enc.note_buffer_draw_range(
-                        b.buffer,
-                        range_off,
-                        range_size.saturating_add(tail),
-                        logical_len,
-                    );
+                    // The last element's crossing attribute reads past its stride.
+                    let range_size = if crossing & (1 << b.stream) == 0 {
+                        range_size
+                    } else {
+                        crossing_read_size(
+                            range_size,
+                            attrs.extents()[b.stream as usize],
+                            layout.stride,
+                        )
+                    };
+                    enc.note_buffer_draw_range(b.buffer, range_off, range_size, logical_len);
                 }
             }
         }
@@ -1815,4 +1780,114 @@ fn emit_draw_view(
         variant.alpha_func,
         u32::from(render_state.cull_mode),
     );
+}
+
+/// The vertex fetch of a draw whose `crossing` streams carry an attribute past their stride.
+///
+/// `None` when a crossing attribute cannot take a binding of its own (one
+/// wider than its stride, or an advanced offset Metal refuses): `layouts`
+/// then step each crossing stream by its extent, as a draw did before
+/// crossing attributes had bindings, and the draw fetches wrong data rather
+/// than none.
+#[cold]
+#[inline(never)]
+fn crossing_fetch(
+    vertex_source: &VertexView<'_>,
+    attrs: &AttrSnapshot,
+    layouts: &mut [StreamLayout; mtld3d_types::MAX_STREAMS as usize],
+    crossing: u16,
+) -> Option<CrossingFetch> {
+    let fetch = CrossingFetch::new(attrs.as_slice(), layouts)
+        .and_then(|fetch| check_advanced_offsets(vertex_source, &fetch, crossing).map(|()| fetch));
+    match fetch {
+        Ok(fetch) => {
+            mtld3d_shared::log_once_info!(target: crate::LOG_TARGET,
+                "vertex attribute ends past its stream stride: fetched through a binding of its own");
+            Some(fetch)
+        }
+        Err(error) => {
+            mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+                "vertex attribute past its stream stride has no binding of its own ({error:?}): \
+                 layout widened to the consumed extent, the draw fetches wrong data");
+            let mut streams = crossing;
+            while streams != 0 {
+                let stream = streams.trailing_zeros() as usize;
+                streams &= streams - 1;
+                layouts[stream].stride = attrs.extents()[stream];
+            }
+            None
+        }
+    }
+}
+
+/// Check every advanced binding of `fetch` against its stream's offset and buffer length.
+fn check_advanced_offsets(
+    vertex_source: &VertexView<'_>,
+    fetch: &CrossingFetch,
+    crossing: u16,
+) -> Result<(), VertexFetchError> {
+    let mut streams = crossing;
+    while streams != 0 {
+        let stream = streams.trailing_zeros();
+        streams &= streams - 1;
+        let (base, len) = match (vertex_source, vertex_source.feed(stream)) {
+            (VertexView::Up { record, .. }, VertexFeed::Inline { .. }) => {
+                (0, u64::from(record.size))
+            }
+            (_, VertexFeed::Buffer(record)) => (record.offset, record.length),
+            // A stream fed nothing steps by its extent and never crosses.
+            _ => continue,
+        };
+        let stream = u8::try_from(stream).expect("stream index below 16");
+        for (_, advance) in fetch.slots_of(stream).filter(|&(_, advance)| advance != 0) {
+            advanced_binding_offset(base, advance, len)?;
+        }
+    }
+    Ok(())
+}
+
+/// Bind a crossing draw's inline (UP) vertices at every slot that reads stream 0.
+///
+/// The payload carries `size` bytes, zero-filled past the vertices the
+/// application supplied up to the last crossing attribute's end.
+fn bind_crossing_inline(enc: &mut FrameEncoder, fetch: &CrossingFetch, address: u64, size: u32) {
+    for (slot, advance) in fetch.slots_of(0) {
+        enc.emit_command(Command::set_vertex_bytes(
+            address + u64::from(advance),
+            size - advance,
+            slot,
+        ));
+        enc.last_bound().invalidate_vertex_buffer_slot(slot);
+    }
+}
+
+/// Bind a crossing draw's vertex buffer `b` at every slot that reads its stream.
+///
+/// [`crossing_fetch`] checked each advanced offset against the buffer.
+fn bind_crossing_stream(
+    enc: &mut FrameEncoder,
+    fetch: &CrossingFetch,
+    b: &StreamRecord,
+    buffer_handle: u64,
+) {
+    for (slot, advance) in fetch.slots_of(b.stream) {
+        let offset = b.offset + advance;
+        let bind =
+            enc.last_bound()
+                .vertex_buffer_changed(slot, buffer_handle, offset, b.generation);
+        if bind == VertexBufferBind::ReusedHandle {
+            // As on the ordinary bind: the retention schedule is meant to rule
+            // out a wrapper destroyed inside the pass that binds its address.
+            mtld3d_shared::log_once_warn!(
+                target: crate::LOG_TARGET,
+                "vertex buffer handle {buffer_handle:#x} reused within a pass for \
+                 buffer {:#x} generation {}: rebinding instead of deduplicating",
+                b.buffer,
+                b.generation
+            );
+        }
+        if bind != VertexBufferBind::Same {
+            enc.emit_command(Command::set_vertex_buffer(buffer_handle, offset, slot));
+        }
+    }
 }

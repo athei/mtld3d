@@ -896,35 +896,36 @@ pub fn vertex_count(d3d_type: u32, primitive_count: u32) -> u32 {
 /// blends), and FF color inputs would need a compensating `.zyxw`
 /// swizzle.
 pub fn decl_type_to_metal_format(ty: u8) -> (VertexFormat, u32) {
-    match ty {
-        D3DDECLTYPE_FLOAT1 => (VertexFormat::Float, 4),
-        D3DDECLTYPE_FLOAT2 => (VertexFormat::Float2, 8),
-        D3DDECLTYPE_FLOAT3 => (VertexFormat::Float3, 12),
-        D3DDECLTYPE_FLOAT4 => (VertexFormat::Float4, 16),
-        D3DDECLTYPE_D3DCOLOR => (VertexFormat::UChar4NormalizedBgra, 4),
-        D3DDECLTYPE_UBYTE4 => (VertexFormat::UChar4, 4),
-        D3DDECLTYPE_SHORT2 => (VertexFormat::Short2, 4),
-        D3DDECLTYPE_SHORT4 => (VertexFormat::Short4, 8),
-        D3DDECLTYPE_UBYTE4N => (VertexFormat::UChar4Normalized, 4),
-        D3DDECLTYPE_SHORT2N => (VertexFormat::Short2Normalized, 4),
-        D3DDECLTYPE_SHORT4N => (VertexFormat::Short4Normalized, 8),
-        D3DDECLTYPE_USHORT2N => (VertexFormat::UShort2Normalized, 4),
-        D3DDECLTYPE_USHORT4N => (VertexFormat::UShort4Normalized, 8),
-        D3DDECLTYPE_FLOAT16_2 => (VertexFormat::Half2, 4),
-        D3DDECLTYPE_FLOAT16_4 => (VertexFormat::Half4, 8),
-        // Packed 10-10-10 formats have no direct Metal equivalent — mark
+    let format = match ty {
+        D3DDECLTYPE_FLOAT1 => VertexFormat::Float,
+        D3DDECLTYPE_FLOAT2 => VertexFormat::Float2,
+        D3DDECLTYPE_FLOAT3 => VertexFormat::Float3,
+        D3DDECLTYPE_FLOAT4 => VertexFormat::Float4,
+        D3DDECLTYPE_D3DCOLOR => VertexFormat::UChar4NormalizedBgra,
+        D3DDECLTYPE_UBYTE4 => VertexFormat::UChar4,
+        D3DDECLTYPE_SHORT2 => VertexFormat::Short2,
+        D3DDECLTYPE_SHORT4 => VertexFormat::Short4,
+        D3DDECLTYPE_UBYTE4N => VertexFormat::UChar4Normalized,
+        D3DDECLTYPE_SHORT2N => VertexFormat::Short2Normalized,
+        D3DDECLTYPE_SHORT4N => VertexFormat::Short4Normalized,
+        D3DDECLTYPE_USHORT2N => VertexFormat::UShort2Normalized,
+        D3DDECLTYPE_USHORT4N => VertexFormat::UShort4Normalized,
+        D3DDECLTYPE_FLOAT16_2 => VertexFormat::Half2,
+        D3DDECLTYPE_FLOAT16_4 => VertexFormat::Half4,
+        // Packed 10-10-10 formats have no direct Metal equivalent: mark
         // invalid and log at the caller. Uncommon in SM2 content.
         D3DDECLTYPE_UDEC3 | D3DDECLTYPE_DEC3N => {
-            mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET, "D3DDECLTYPE UDEC3/DEC3N has no Metal format — element dropped");
-            (VertexFormat::Invalid, 0)
+            mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET, "D3DDECLTYPE UDEC3/DEC3N has no Metal format, element dropped");
+            VertexFormat::Invalid
         }
         other => {
             mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
-                "D3DDECLTYPE {other} unhandled — element dropped (no Metal format)"
+                "D3DDECLTYPE {other} unhandled, element dropped (no Metal format)"
             );
-            (VertexFormat::Invalid, 0)
+            VertexFormat::Invalid
         }
-    }
+    };
+    (format, format.byte_size())
 }
 
 /// Convert an FVF bitmask into an equivalent `D3DVERTEXELEMENT9[]` sequence.

@@ -916,11 +916,17 @@ impl<'a> VertexView<'a> {
 }
 
 /// Vertex layouts derived directly from borrowed command stream records.
+///
+/// With the mask of the streams an attribute crosses (see
+/// [`crate::draw_data::stream_layouts_with`]).
 #[must_use]
 pub fn stream_layouts_view(
     source: &VertexView<'_>,
     attrs: &crate::draw_data::AttrSnapshot,
-) -> [crate::pipeline_state::StreamLayout; mtld3d_types::MAX_STREAMS as usize] {
+) -> (
+    [crate::pipeline_state::StreamLayout; mtld3d_types::MAX_STREAMS as usize],
+    u16,
+) {
     use mtld3d_shared::mtl::VertexStepFunction;
 
     use crate::{

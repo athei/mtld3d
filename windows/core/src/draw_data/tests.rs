@@ -148,3 +148,50 @@ fn a_lod_table_source_keys_apart_and_keeps_every_other_field() {
         "a shader reading the table is a library of its own"
     );
 }
+
+#[test]
+fn a_zero_padded_copy_keeps_the_bytes_and_zeroes_the_tail() {
+    let mut arena = ScratchArena::new();
+    // Dirty the region first: a reused arena chunk carries stale bytes.
+    // SAFETY: nothing reads the token after the arena is cleared.
+    let _dirty = unsafe { arena_alloc_bytes(&mut arena, &[0xAA; 64]) };
+    arena.clear();
+    // SAFETY: the arena outlives the token, read before the arena drops.
+    let copy = unsafe { arena_alloc_zero_padded(&mut arena, &[1, 2, 3, 4, 5, 6], 12) };
+    assert_eq!(copy.as_slice(), [1, 2, 3, 4, 5, 6, 0, 0, 0, 0, 0, 0]);
+}
+
+#[test]
+fn stream_layouts_mark_the_streams_whose_stride_is_short_of_the_extent() {
+    let attrs = [VertexAttrDesc {
+        attr_index: 0,
+        buffer_index: 0,
+        offset: 0,
+        format: mtld3d_shared::mtl::VertexFormat::Float4,
+    }];
+    let mut extents = [0; 16];
+    extents[0] = 32;
+    extents[1] = 16;
+    extents[2] = 12;
+    let header = DeclarationHeader {
+        vdecl_hash: 0,
+        extents,
+        count: 1,
+        used_streams: 0b111,
+        reserved: 0,
+    };
+    // SAFETY: both locals outlive the token, which is only read below.
+    let snapshot = unsafe { AttrSnapshot::new(NonNull::from(&attrs[0]), NonNull::from(&header)) };
+    let strides = [16, 0, 16];
+    let (layouts, crossing) = stream_layouts_with(&snapshot, |stream, extent| StreamLayout {
+        stride: layout_stride(strides[stream as usize], extent),
+        step: VertexStepFunction::PerVertex,
+        step_rate: 1,
+    });
+    // Stream 0 steps 16 bytes under a 32-byte extent; stream 1's zero stride
+    // steps by its extent and stream 2's stride covers its extent.
+    assert_eq!(crossing, 0b001);
+    assert_eq!(layouts[0].stride, 16);
+    assert_eq!(layouts[1].stride, 16);
+    assert!(!layouts[3].is_used());
+}

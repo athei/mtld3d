@@ -231,22 +231,31 @@ pub fn stream_layouts(
             step_rate: 0,
         },
     })
+    .0
 }
 
 /// Compute declaration layouts while borrowing stream fields from their capture owner.
+///
+/// Also returns the streams whose layout steps by less than the extent of the
+/// elements the shader consumes on them, bit `n` for stream `n`: the draw
+/// fetches those through a [`crate::streams::CrossingFetch`].
 #[must_use]
 pub fn stream_layouts_with(
     attrs: &AttrSnapshot,
     mut layout: impl FnMut(u32, u32) -> StreamLayout,
-) -> [StreamLayout; MAX_STREAMS as usize] {
+) -> ([StreamLayout; MAX_STREAMS as usize], u16) {
     let mut layouts = [StreamLayout::UNUSED; MAX_STREAMS as usize];
+    let mut crossing = 0u16;
     let mut used = attrs.used_streams();
     while used != 0 {
         let stream = used.trailing_zeros();
         used &= used - 1;
-        layouts[stream as usize] = layout(stream, attrs.extents()[stream as usize]);
+        let extent = attrs.extents()[stream as usize];
+        let stream_layout = layout(stream, extent);
+        crossing |= u16::from(stream_layout.stride < extent) << stream;
+        layouts[stream as usize] = stream_layout;
     }
-    layouts
+    (layouts, crossing)
 }
 
 /// Where the index data comes from (or whether the draw is non-indexed).
@@ -987,6 +996,39 @@ pub unsafe fn arena_alloc_bytes(scratch: &mut ScratchArena, bytes: &[u8]) -> Scr
     let ptr = scratch.alloc(bytes);
     let len = u32::try_from(bytes.len()).expect("constants slice fits u32");
     let nn = NonNull::new(ptr as *mut u8).expect("ScratchArena::alloc returned non-null");
+    ScratchSlice { ptr: nn, len }
+}
+
+/// Copy `bytes` into the arena followed by zeros up to `len` bytes.
+///
+/// The copy of a UP vertex stream whose last crossing attribute ends past the
+/// vertices the application supplied: D3D9 promises only `count * stride`
+/// readable bytes behind its pointer, and the attribute reads zero past them.
+///
+/// # Panics
+///
+/// Panics if `len` is below `bytes.len()` or 0, or exceeds `u32::MAX`.
+///
+/// # Safety
+///
+/// As [`arena_alloc_bytes`].
+pub unsafe fn arena_alloc_zero_padded(
+    scratch: &mut ScratchArena,
+    bytes: &[u8],
+    len: usize,
+) -> ScratchSlice {
+    let padding = len
+        .checked_sub(bytes.len())
+        .expect("the padded length covers the copied bytes");
+    let ptr = scratch.alloc_uninit_slice::<u8>(len);
+    // SAFETY: the arena reserved `len` bytes at `ptr`, disjoint from `bytes`.
+    unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len()) };
+    // SAFETY: `bytes.len() + padding == len` stays inside the reservation.
+    let tail = unsafe { ptr.add(bytes.len()) };
+    // SAFETY: `tail` addresses `padding` reserved bytes.
+    unsafe { tail.write_bytes(0, padding) };
+    let len = u32::try_from(len).expect("UP vertex payload fits u32");
+    let nn = NonNull::new(ptr).expect("ScratchArena reservation is non-null");
     ScratchSlice { ptr: nn, len }
 }
 

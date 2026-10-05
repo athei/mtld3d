@@ -145,10 +145,13 @@ pub const fn instanced_stream_read_bytes(
     }
 }
 
-/// The Metal layout stride before crossing attributes receive separate bindings.
+/// The stride a stream's vertex buffer layout steps by.
 ///
-/// A zero stride feeds one constant element. A nonzero stride is preserved;
-/// [`remap_crossing_attributes`] moves offsets that do not fit into buffer bindings.
+/// The application's stride, or the extent of the declaration elements the
+/// shader consumes on the stream when that stride is 0: the inline (UP) path
+/// has no other span, and [`bound_stream_layout`] pairs it with a `Constant`
+/// step. A stride shorter than the extent stays as it is; the draw fetches the
+/// attributes that end past it through a [`CrossingFetch`].
 #[must_use]
 pub const fn layout_stride(app_stride: u32, extent: u32) -> u32 {
     if app_stride == 0 {
@@ -158,56 +161,67 @@ pub const fn layout_stride(app_stride: u32, extent: u32) -> u32 {
 }
 
 /// Source stream and byte advance of a Metal vertex buffer binding.
-///
-/// Copy because the eight-byte value initializes and indexes a fixed per-draw array.
-#[derive(Clone, Copy)]
 pub struct VertexFetchBinding {
-    pub stream: u32,
+    pub stream: u8,
     pub offset: u32,
 }
 
-/// Why a crossing attribute cannot use a second Metal buffer binding.
+/// Why a crossing attribute cannot use a binding of its own.
 #[derive(Debug, PartialEq, Eq)]
 pub enum VertexFetchError {
     StreamOutOfRange,
     AttributeWiderThanStride,
     UnalignedOffset,
+    OutsideBuffer,
     NoFreeSlot,
 }
 
 /// Remap crossing attributes to spare bindings without changing the vertex step.
 ///
-/// Reserve all slots with ordinary attributes first, then assign each crossing
-/// attribute an otherwise unused slot. Streams with only crossing attributes release
-/// their original slot. The sixteen stream slots suffice for at most sixteen attributes
-/// and cannot collide with uniforms. Bindings name original streams; layouts retain
-/// their step function and instance rate. No vertex data or CPU backing is read here.
+/// An attribute crosses when it ends past its stream's stride. It moves to a
+/// slot of its own at offset 0, with the stream's layout and a binding of the
+/// same stream advanced by the attribute's offset, so vertex `i` reads
+/// `base + i * stride + offset` as D3D9 addresses it. A stream keeps its own
+/// slot while one of its attributes fits; when none does, its first crossing
+/// attribute takes that slot. Every other crossing attribute takes the lowest
+/// slot no stream the declaration reads owns. A draw carries at most 16
+/// attributes (the declaration record's cap) and each stream it reads has one
+/// of them, so the 16 stream slots never run out and never reach the uniform
+/// slots above them.
+///
+/// The placement is a function of the attributes and the remapped layouts
+/// alone: a stream's own slot holds its stride whenever it is used, and that
+/// stride decides which of its attributes cross. The pipeline memo, which
+/// compares snapshots without the attribute list, relies on it.
 ///
 /// # Errors
 ///
-/// An attribute wider than its stride, an unaligned advanced offset, or too many
-/// attributes for the stream table. Discard outputs on error and log the unsupported draw.
+/// An attribute wider than its stride, which no binding can fetch, a stream
+/// index past the table, or more attributes than slots. The outputs are
+/// unspecified on error.
 ///
 /// # Panics
 ///
-/// The internal stream-index conversion is asserted to fit in `u32`.
+/// Never: the stream and slot indices it narrows to `u8` are below 16.
 pub fn remap_crossing_attributes(
     attrs: &mut [VertexAttrDesc],
     layouts: &mut [StreamLayout; MAX_STREAMS as usize],
 ) -> Result<[VertexFetchBinding; MAX_STREAMS as usize], VertexFetchError> {
     let original = *layouts;
     let mut bindings = std::array::from_fn(|i| VertexFetchBinding {
-        stream: u32::try_from(i).expect("stream index fits u32"),
+        stream: u8::try_from(i).expect("stream index fits u8"),
         offset: 0,
     });
     let mut reserved = 0u16;
+    let mut read = 0u16;
     for attr in attrs.iter() {
         let index =
             usize::try_from(attr.buffer_index).map_err(|_| VertexFetchError::StreamOutOfRange)?;
         let Some(layout) = original.get(index) else {
             return Err(VertexFetchError::StreamOutOfRange);
         };
-        let width = vertex_format_bytes(attr.format);
+        read |= 1 << index;
+        let width = attr.format.byte_size();
         if width > layout.stride {
             return Err(VertexFetchError::AttributeWiderThanStride);
         }
@@ -217,8 +231,6 @@ pub fn remap_crossing_attributes(
             .is_some_and(|end| end <= layout.stride)
         {
             reserved |= 1 << index;
-        } else if attr.offset % 4 != 0 {
-            return Err(VertexFetchError::UnalignedOffset);
         }
     }
     for (index, layout) in layouts.iter_mut().enumerate() {
@@ -227,23 +239,26 @@ pub fn remap_crossing_attributes(
         }
     }
     for attr in attrs.iter_mut() {
-        let index =
-            usize::try_from(attr.buffer_index).map_err(|_| VertexFetchError::StreamOutOfRange)?;
+        let index = attr.buffer_index as usize;
         if attr
             .offset
-            .checked_add(vertex_format_bytes(attr.format))
+            .checked_add(attr.format.byte_size())
             .is_some_and(|end| end <= original[index].stride)
         {
             continue;
         }
-        let slot = (!reserved).trailing_zeros();
+        let slot = if reserved & (1 << index) == 0 {
+            attr.buffer_index
+        } else {
+            (!(reserved | read)).trailing_zeros()
+        };
         if slot >= MAX_STREAMS {
             return Err(VertexFetchError::NoFreeSlot);
         }
         reserved |= 1 << slot;
         layouts[slot as usize] = original[index];
         bindings[slot as usize] = VertexFetchBinding {
-            stream: attr.buffer_index,
+            stream: u8::try_from(attr.buffer_index).expect("stream index checked above"),
             offset: attr.offset,
         };
         attr.buffer_index = slot;
@@ -252,10 +267,116 @@ pub fn remap_crossing_attributes(
     Ok(bindings)
 }
 
+/// The byte offset of an advanced binding, checked against what Metal accepts.
+///
+/// `base` is the stream's own offset into a buffer of `len` bytes and
+/// `advance` the crossing attribute's offset. Metal takes a vertex buffer
+/// offset that is a multiple of 4 and inside the buffer. Only an advanced
+/// binding is checked: a stream's own offset binds as the application set it.
+///
+/// # Errors
+///
+/// [`VertexFetchError::UnalignedOffset`] or [`VertexFetchError::OutsideBuffer`].
+pub fn advanced_binding_offset(base: u32, advance: u32, len: u64) -> Result<u32, VertexFetchError> {
+    let offset = base
+        .checked_add(advance)
+        .ok_or(VertexFetchError::OutsideBuffer)?;
+    if !offset.is_multiple_of(4) {
+        return Err(VertexFetchError::UnalignedOffset);
+    }
+    if u64::from(offset) >= len {
+        return Err(VertexFetchError::OutsideBuffer);
+    }
+    Ok(offset)
+}
+
+/// The vertex fetch of a draw with an attribute that ends past its stream's stride.
+///
+/// Built once per such draw from the resolved attributes and the stream
+/// layouts; a draw whose attributes all fit never builds one. Holds the
+/// remapped attributes and layouts the pipeline is built from and, per Metal
+/// slot, the stream and byte advance the draw binds there.
+pub struct CrossingFetch {
+    attrs: [VertexAttrDesc; MAX_STREAMS as usize],
+    attr_count: u8,
+    layouts: [StreamLayout; MAX_STREAMS as usize],
+    bindings: [VertexFetchBinding; MAX_STREAMS as usize],
+    /// Bit `n` set: Metal slot `n` is read by the remapped pipeline.
+    used_slots: u16,
+}
+
+impl CrossingFetch {
+    /// Remap `attrs` over `layouts` (see [`remap_crossing_attributes`]).
+    ///
+    /// # Errors
+    ///
+    /// The draw cannot be fetched this way; see [`remap_crossing_attributes`].
+    ///
+    /// # Panics
+    ///
+    /// Never: the attribute count it narrows to `u8` is at most 16, checked first.
+    pub fn new(
+        attrs: &[VertexAttrDesc],
+        layouts: &[StreamLayout; MAX_STREAMS as usize],
+    ) -> Result<Self, VertexFetchError> {
+        const UNSET: VertexAttrDesc = VertexAttrDesc {
+            attr_index: 0,
+            buffer_index: 0,
+            offset: 0,
+            format: VertexFormat::Invalid,
+        };
+        let mut remapped = [UNSET; MAX_STREAMS as usize];
+        let Some(prefix) = remapped.get_mut(..attrs.len()) else {
+            return Err(VertexFetchError::NoFreeSlot);
+        };
+        prefix.copy_from_slice(attrs);
+        let mut remapped_layouts = *layouts;
+        let bindings = remap_crossing_attributes(prefix, &mut remapped_layouts)?;
+        let used_slots = (0..MAX_STREAMS)
+            .filter(|&slot| remapped_layouts[slot as usize].is_used())
+            .fold(0u16, |mask, slot| mask | (1 << slot));
+        Ok(Self {
+            attrs: remapped,
+            attr_count: u8::try_from(attrs.len()).expect("at most 16 attributes"),
+            layouts: remapped_layouts,
+            bindings,
+            used_slots,
+        })
+    }
+
+    /// The remapped attributes the pipeline is built from.
+    #[must_use]
+    pub fn attrs(&self) -> &[VertexAttrDesc] {
+        &self.attrs[..usize::from(self.attr_count)]
+    }
+
+    /// The remapped vertex buffer layouts, indexed by Metal slot.
+    #[must_use]
+    pub const fn layouts(&self) -> &[StreamLayout; MAX_STREAMS as usize] {
+        &self.layouts
+    }
+
+    /// The Metal slots that read `stream`, each with its byte advance past the stream offset.
+    pub fn slots_of(&self, stream: u8) -> impl Iterator<Item = (u32, u32)> + '_ {
+        let mut used = self.used_slots;
+        std::iter::from_fn(move || {
+            while used != 0 {
+                let slot = used.trailing_zeros();
+                used &= used - 1;
+                let binding = &self.bindings[slot as usize];
+                if binding.stream == stream {
+                    return Some((slot, binding.offset));
+                }
+            }
+            None
+        })
+    }
+}
+
 /// Bytes required by an inline stream, including its last crossing attribute.
 ///
-/// Keep the packed span where larger; checked arithmetic rejects impossible payloads
-/// before the API borrows the user pointer.
+/// `(count - 1) * stride + extent` when that is past `count * stride`, else
+/// `count * stride`. `None` on overflow.
 #[must_use]
 pub const fn inline_vertex_span(count: u32, stride: u32, extent: u32) -> Option<u32> {
     if count == 0 {
@@ -271,6 +392,19 @@ pub const fn inline_vertex_span(count: u32, stride: u32, extent: u32) -> Option<
         return None;
     };
     Some(if end > packed { end } else { packed })
+}
+
+/// The read-range size a crossing stream's draw records for rename-at-overlap.
+///
+/// `size` is the span of the packed elements, 0 meaning "to the end of the
+/// buffer". A finite span grows by what the last element's crossing attribute
+/// reads past its stride; the end-of-buffer marker already covers it.
+#[must_use]
+pub const fn crossing_read_size(size: u32, extent: u32, stride: u32) -> u32 {
+    if size == 0 {
+        return 0;
+    }
+    size.saturating_add(extent.saturating_sub(stride))
 }
 
 /// The vertex buffer layout of a stream with a vertex buffer bound.
@@ -297,28 +431,6 @@ pub const fn bound_stream_layout(app_stride: u32, extent: u32, freq: u32) -> Str
         stride: layout_stride(app_stride, extent),
         step,
         step_rate,
-    }
-}
-
-/// Storage width of the Metal vertex formats the declaration resolver emits.
-const fn vertex_format_bytes(format: VertexFormat) -> u32 {
-    match format {
-        VertexFormat::Invalid => 0,
-        VertexFormat::UChar4
-        | VertexFormat::UChar4Normalized
-        | VertexFormat::UChar4NormalizedBgra
-        | VertexFormat::Short2
-        | VertexFormat::UShort2Normalized
-        | VertexFormat::Short2Normalized
-        | VertexFormat::Half2
-        | VertexFormat::Float => 4,
-        VertexFormat::Short4
-        | VertexFormat::UShort4Normalized
-        | VertexFormat::Short4Normalized
-        | VertexFormat::Half4
-        | VertexFormat::Float2 => 8,
-        VertexFormat::Float3 => 12,
-        VertexFormat::Float4 => 16,
     }
 }
 

@@ -5962,15 +5962,6 @@ impl FrameEncoder {
         (handle.raw(), false)
     }
 
-    /// Capacity of the GPU buffer a vertex or index binding names.
-    ///
-    /// Staged buffers keep their logical device length after releasing CPU backing;
-    /// direct wrappers retain their page-padded length. Call after ensuring the handle.
-    #[must_use]
-    pub fn vbib_buffer_length(&self, id: BufferId) -> Option<u64> {
-        self.buffer_cache.get(&id).map(|state| state.length)
-    }
-
     /// Copy a `Staged` VB/IB's device buffer into caller-owned PE memory.
     ///
     /// The device buffer is `StorageModePrivate` at an address Metal chose,
