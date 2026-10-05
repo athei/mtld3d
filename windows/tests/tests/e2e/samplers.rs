@@ -14,6 +14,8 @@ use mtld3d_types::{
     D3DTSS_ALPHAOP,
 };
 
+use super::shaders::{PS_COLOR_PASSTHROUGH, centered_triangle};
+
 const BLACK: u32 = 0xFF00_0000;
 const YELLOW: u32 = 0xFFFF_FF00;
 
@@ -1479,6 +1481,225 @@ fn without_mipmapping_the_texture_lod_is_the_only_level() {
     }
     assert_eq!(tex.set_lod(0), 2, "SetLOD(0) restores the base level");
     assert_eq!(h.clear_pixel_shader(), 0, "SetPixelShader(null)");
+}
+
+/// `vs_3_0` fetching the mip-tinted texture at the explicit LOD in `c0.x`.
+///
+/// `dcl_position v0; dcl_2d s0; dcl_position o0; dcl_color0 o1;
+/// def c4, 0.5, 0.5, 0, 0; mov r1, c4; mov r1.w, c0.x; texldl r0, r1, s0;
+/// mov o0, v0; mov o1, r0;` The fetched texel becomes the vertex colour.
+#[rustfmt::skip]
+const VS_FETCH_AT_LOD: [u32; 36] = [
+    0xFFFE_0300,                                        // vs_3_0
+    0x0200_001F, 0x8000_0000, 0x900F_0000,              // dcl_position v0
+    0x0200_001F, 0x9000_0000, 0xA00F_0800,              // dcl_2d s0
+    0x0200_001F, 0x8000_0000, 0xE00F_0000,              // dcl_position o0
+    0x0200_001F, 0x8000_000A, 0xE00F_0001,              // dcl_color0 o1
+    0x0500_0051, 0xA00F_0004,                           // def c4,
+    0x3F00_0000, 0x3F00_0000, 0x0000_0000, 0x0000_0000, //   0.5, 0.5, 0, 0
+    0x0200_0001, 0x800F_0001, 0xA0E4_0004,              // mov r1, c4
+    0x0200_0001, 0x8008_0001, 0xA000_0000,              // mov r1.w, c0.x
+    0x0300_005F, 0x800F_0000, 0x80E4_0001, 0xA0E4_0800, // texldl r0, r1, s0
+    0x0200_0001, 0xE00F_0000, 0x90E4_0000,              // mov o0, v0
+    0x0200_0001, 0xE00F_0001, 0x80E4_0000,              // mov o1, r0
+    0x0000_FFFF,                                        // end
+];
+
+/// Bind `tex` to vertex sampler 0 with point filtering on every level, under [`VS_FETCH_AT_LOD`].
+fn arm_vertex_fetch_at_lod(h: &Harness, tex: &Texture<'_>) {
+    use mtld3d_types::D3DVERTEXTEXTURESAMPLER0;
+
+    assert_eq!(h.set_texture(D3DVERTEXTEXTURESAMPLER0, tex), 0, "SetTexture(257)");
+    for (state, value) in [
+        (D3DSAMP_MINFILTER, D3DTEXF_POINT),
+        (D3DSAMP_MAGFILTER, D3DTEXF_POINT),
+        (D3DSAMP_MIPFILTER, D3DTEXF_POINT),
+        (D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP),
+        (D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP),
+    ] {
+        assert_eq!(h.set_sampler_state(D3DVERTEXTEXTURESAMPLER0, state, value), 0);
+    }
+    let vs = h.create_vertex_shader(&VS_FETCH_AT_LOD);
+    let ps = h.create_pixel_shader(&PS_COLOR_PASSTHROUGH);
+    assert_eq!(h.set_vertex_shader(&vs), 0, "SetVertexShader");
+    assert_eq!(h.set_pixel_shader(&ps), 0, "SetPixelShader");
+    assert_eq!(h.set_fvf(D3DFVF_XYZ), 0, "SetFVF");
+}
+
+/// Draw a triangle whose colour [`VS_FETCH_AT_LOD`] fetches at `lod`, and read it back.
+fn vertex_fetch_at_lod(h: &Harness, lod: f32) -> u32 {
+    assert_eq!(
+        h.set_vertex_shader_constant_f(0, &[lod, 0.0, 0.0, 0.0]),
+        0,
+        "explicit LOD {lod}"
+    );
+    let tri = centered_triangle();
+    h.render_once(BLACK, |d| {
+        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &tri), 0);
+    });
+    h.read_pixel(320, 280)
+}
+
+/// Undo [`arm_vertex_fetch_at_lod`]'s bindings.
+fn disarm_vertex_fetch(h: &Harness) {
+    assert_eq!(h.clear_vertex_shader(), 0, "SetVertexShader(null)");
+    assert_eq!(h.clear_pixel_shader(), 0, "SetPixelShader(null)");
+    assert_eq!(
+        h.clear_texture(mtld3d_types::D3DVERTEXTEXTURESAMPLER0),
+        0,
+        "SetTexture(257, null)"
+    );
+}
+
+#[test]
+fn vertex_texldl_takes_max_mip_level_as_its_finest_level() {
+    // A vertex sampler's `D3DSAMP_MAXMIPLEVEL` clamps the level a vertex
+    // `texldl` names, as a pixel sampler's does.
+    use mtld3d_types::D3DVERTEXTEXTURESAMPLER0;
+
+    let h = Harness::new();
+    let tex = mip_tinted_texture(&h);
+    arm_vertex_fetch_at_lod(&h, &tex);
+
+    assert_eq!(
+        vertex_fetch_at_lod(&h, 1.0),
+        MIP_TINTS[1],
+        "texldl samples the level it names"
+    );
+    assert_eq!(
+        h.set_sampler_state(D3DVERTEXTEXTURESAMPLER0, D3DSAMP_MAXMIPLEVEL, 3),
+        0
+    );
+    assert_eq!(
+        vertex_fetch_at_lod(&h, 1.0),
+        MIP_TINTS[3],
+        "MAXMIPLEVEL 3 clamps an explicit LOD of 1"
+    );
+    assert_eq!(
+        vertex_fetch_at_lod(&h, 4.0),
+        MIP_TINTS[4],
+        "a coarser explicit LOD is kept, not shifted"
+    );
+    disarm_vertex_fetch(&h);
+}
+
+#[test]
+fn vertex_texldl_counts_its_lod_from_the_texture_lod() {
+    // `SetLOD` on a texture bound to a vertex sampler makes that level the
+    // most detailed one, whether it was set before the bind or after it, and
+    // binding a texture without a LOD drops it again.
+    use mtld3d_types::{D3DPOOL_MANAGED, D3DVERTEXTEXTURESAMPLER0};
+
+    let h = Harness::new();
+    let tex = mip_tinted_texture_in(&h, D3DPOOL_MANAGED);
+    assert_eq!(tex.set_lod(2), 0, "SetLOD(2) returns the previous LOD");
+    arm_vertex_fetch_at_lod(&h, &tex);
+
+    assert_eq!(
+        vertex_fetch_at_lod(&h, 0.0),
+        MIP_TINTS[2],
+        "LOD 0 reads the texture's most detailed level"
+    );
+    assert_eq!(
+        vertex_fetch_at_lod(&h, 1.0),
+        MIP_TINTS[3],
+        "LOD 1 reads the level below it"
+    );
+    assert_eq!(tex.set_lod(1), 2, "SetLOD(1) on the bound texture");
+    assert_eq!(
+        vertex_fetch_at_lod(&h, 1.0),
+        MIP_TINTS[2],
+        "a SetLOD after the bind reaches the next draw"
+    );
+    assert_eq!(
+        h.set_sampler_state(D3DVERTEXTEXTURESAMPLER0, D3DSAMP_MAXMIPLEVEL, 4),
+        0
+    );
+    assert_eq!(
+        vertex_fetch_at_lod(&h, 1.0),
+        MIP_TINTS[4],
+        "MAXMIPLEVEL 4 clamps level 2"
+    );
+    assert_eq!(
+        h.set_sampler_state(D3DVERTEXTEXTURESAMPLER0, D3DSAMP_MAXMIPLEVEL, 0),
+        0
+    );
+
+    let plain = mip_tinted_texture(&h);
+    assert_eq!(
+        h.set_texture(D3DVERTEXTEXTURESAMPLER0, &plain),
+        0,
+        "bind a texture without a LOD"
+    );
+    assert_eq!(
+        vertex_fetch_at_lod(&h, 1.0),
+        MIP_TINTS[1],
+        "the new texture counts from its level 0"
+    );
+    assert_eq!(tex.set_lod(0), 1, "SetLOD(0) restores the base level");
+    disarm_vertex_fetch(&h);
+}
+
+#[test]
+fn vertex_texldl_adds_the_sampler_lod_bias() {
+    // `D3DSAMP_MIPMAPLODBIAS` on a vertex sampler shifts the level a vertex
+    // `texldl` names.
+    use mtld3d_types::D3DVERTEXTEXTURESAMPLER0;
+
+    let h = Harness::new();
+    let tex = mip_tinted_texture(&h);
+    arm_vertex_fetch_at_lod(&h, &tex);
+
+    for (bias, lod, level) in [(1.0_f32, 1.0, 2), (-1.0, 3.0, 2), (2.0, 0.0, 2)] {
+        assert_eq!(
+            h.set_sampler_state(
+                D3DVERTEXTEXTURESAMPLER0,
+                D3DSAMP_MIPMAPLODBIAS,
+                bias.to_bits()
+            ),
+            0
+        );
+        assert_eq!(
+            vertex_fetch_at_lod(&h, lod),
+            MIP_TINTS[level],
+            "bias {bias} on LOD {lod}"
+        );
+    }
+    assert_eq!(
+        h.set_sampler_state(D3DVERTEXTEXTURESAMPLER0, D3DSAMP_MIPMAPLODBIAS, 0),
+        0
+    );
+    assert_eq!(
+        vertex_fetch_at_lod(&h, 1.0),
+        MIP_TINTS[1],
+        "no bias leaves the level where texldl put it"
+    );
+    disarm_vertex_fetch(&h);
+}
+
+#[test]
+fn vertex_texldl_without_mipmapping_samples_the_texture_lod() {
+    // With the vertex sampler's `D3DSAMP_MIPFILTER` NONE, D3D9 samples the
+    // texture's most detailed level whatever LOD the shader names.
+    use mtld3d_types::{D3DPOOL_MANAGED, D3DVERTEXTEXTURESAMPLER0};
+
+    let h = Harness::new();
+    let tex = mip_tinted_texture_in(&h, D3DPOOL_MANAGED);
+    arm_vertex_fetch_at_lod(&h, &tex);
+    assert_eq!(
+        h.set_sampler_state(D3DVERTEXTEXTURESAMPLER0, D3DSAMP_MIPFILTER, D3DTEXF_NONE),
+        0
+    );
+    assert_eq!(tex.set_lod(2), 0, "SetLOD(2) returns the previous LOD");
+    for lod in [0.0, 4.0] {
+        assert_eq!(
+            vertex_fetch_at_lod(&h, lod),
+            MIP_TINTS[2],
+            "texldl at LOD {lod} samples the LOD level"
+        );
+    }
+    assert_eq!(tex.set_lod(0), 2, "SetLOD(0) restores the base level");
+    disarm_vertex_fetch(&h);
 }
 
 /// Position, diffuse and one four-component texture coordinate.
