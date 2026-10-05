@@ -1831,6 +1831,9 @@ fn crossing_fetch(
                 "vertex attribute past its stream stride has no binding of its own ({error:?}): \
                  layout widened to the consumed extent, the draw fetches wrong data");
             enc.keep_crossing_fetch(fetch);
+            // The stride a draw had before crossing attributes had bindings;
+            // a UP draw here still reads past its payload's last vertex, as
+            // it did then.
             let mut streams = crossing;
             while streams != 0 {
                 let stream = streams.trailing_zeros() as usize;
@@ -1845,7 +1848,10 @@ fn crossing_fetch(
 /// Bind a crossing draw's inline (UP) vertices at every slot that reads stream 0.
 ///
 /// The payload carries `size` bytes, zero-filled past the vertices the
-/// application supplied up to the last crossing attribute's end.
+/// application supplied up to the last crossing attribute's end. A payload
+/// past the inline-bytes limit is copied into the upload ring once per slot
+/// that reads stream 0, a cost kept on this rare path rather than sharing
+/// one upload between the slots.
 fn bind_crossing_inline(enc: &mut FrameEncoder, fetch: &CrossingFetch, address: u64, size: u32) {
     for (slot, advance) in fetch.slots_of(0) {
         enc.emit_command(Command::set_vertex_bytes(
