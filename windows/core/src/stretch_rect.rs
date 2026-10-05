@@ -6,9 +6,14 @@
 //! decode selector, and the CPU twins of the YUV decodes the blit fragment
 //! function runs.
 
-use mtld3d_types::{D3DFMT_NV12, D3DFMT_UYVY, D3DFMT_YUY2, D3DFMT_YV12};
+use mtld3d_types::{
+    D3DFMT_NV12, D3DFMT_UYVY, D3DFMT_X1R5G5B5, D3DFMT_X8B8G8R8, D3DFMT_X8R8G8B8, D3DFMT_YUY2,
+    D3DFMT_YV12,
+};
 
-use crate::{pixel_convert::can_convert, planar_yuv::planar_yuv_layout_from_pitch};
+use crate::{
+    format::FormatMapping, pixel_convert::can_convert, planar_yuv::planar_yuv_layout_from_pitch,
+};
 
 /// Parsed source / destination region for a `StretchRect`.
 ///
@@ -217,8 +222,9 @@ pub const fn planar_stretch_route(
 /// pipeline per destination format serves every source format: mode 0 samples
 /// the source as-is, the packed modes fetch the 4:2:2 macropixel and the
 /// planar modes the luma texel and its 4:2:0 chroma sample, and all four YUV
-/// modes convert to RGB. The discriminants are the uniform's values; the MSL
-/// in `unix/unix/src/metal/blit.rs` matches on them.
+/// modes convert to RGB. The opaque-alpha mode samples as-is and replaces the
+/// alpha with one. The discriminants are the uniform's values; the MSL in
+/// `unix/unix/src/metal/blit.rs` matches on them.
 #[repr(u32)]
 pub enum BlitDecode {
     /// Sample the source texture as-is (any RGB format).
@@ -231,6 +237,8 @@ pub enum BlitDecode {
     Yv12 = 3,
     /// `D3DFMT_NV12`: luma rows, one interleaved U, V plane, backed by one R8 texture.
     Nv12 = 4,
+    /// An X format: sample as-is, alpha one, since its padding bits carry no alpha.
+    OpaqueAlpha = 5,
 }
 
 impl BlitDecode {
@@ -243,6 +251,7 @@ impl BlitDecode {
             Self::Uyvy => 2.0,
             Self::Yv12 => 3.0,
             Self::Nv12 => 4.0,
+            Self::OpaqueAlpha => 5.0,
         }
     }
 }
@@ -255,8 +264,23 @@ pub const fn blit_decode(d3d_format: u32) -> BlitDecode {
         D3DFMT_UYVY => BlitDecode::Uyvy,
         D3DFMT_YV12 => BlitDecode::Yv12,
         D3DFMT_NV12 => BlitDecode::Nv12,
+        D3DFMT_X8R8G8B8 | D3DFMT_X8B8G8R8 | D3DFMT_X1R5G5B5 => BlitDecode::OpaqueAlpha,
         _ => BlitDecode::None,
     }
+}
+
+/// Whether a copy of the bytes would hand a source's padding to the destination as alpha.
+///
+/// Takes the mappings the two textures were created with on this device. A
+/// source without alpha whose storage still has an alpha lane (an X format,
+/// or a format widened to BGRA8) leaves undefined padding or a forced value
+/// in it, and D3D9 reads such a surface's alpha as one, so a destination that
+/// does carry alpha has to receive alpha one rather than those bits. The other
+/// direction is a byte copy, since every reader of a destination without alpha
+/// already ignores the alpha an A source leaves in it.
+#[must_use]
+pub const fn exposes_padding_as_alpha(src: &FormatMapping, dst: &FormatMapping) -> bool {
+    !src.has_alpha() && dst.has_alpha()
 }
 
 /// Whether `d3d_format` is one of the two packed 4:2:2 YUV formats.

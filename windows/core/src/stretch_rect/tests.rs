@@ -12,6 +12,10 @@
 //! writes each texel its own value. Two cube faces of one texture are disjoint whatever
 //! their rects say, so the face pair is pinned alongside the mip pair.
 //!
+//! An X source selects the opaque-alpha decode, and only a source without alpha into a
+//! destination with alpha is a pair whose byte copy would hand the padding over as alpha,
+//! on a device with the packed 16-bit formats and on one that widens them.
+//!
 //! The packed-YUV cases pin the source decode: which `BlitDecode` a format selects and
 //! the discriminants the fragment shader matches on, the fixed-point `yuv_to_rgb8`
 //! against reference samples in both the full-range and reduced-range conventions, and
@@ -25,6 +29,8 @@
 //! from `NV12` with a sample whose U and V differ, the pitch-relative chroma addressing
 //! on a surface whose pitch is wider than its width, and the route a planar endpoint
 //! takes through `StretchRect`.
+
+use mtld3d_types::{D3DFMT_A1R5G5B5, D3DFMT_A8B8G8R8, D3DFMT_A8R8G8B8};
 
 use super::*;
 
@@ -211,21 +217,80 @@ fn identical_same_surface_rects_are_a_no_op() {
 fn blit_decode_follows_the_source_format() {
     assert!(matches!(blit_decode(D3DFMT_YUY2), BlitDecode::Yuy2));
     assert!(matches!(blit_decode(D3DFMT_UYVY), BlitDecode::Uyvy));
-    assert!(matches!(
-        blit_decode(mtld3d_types::D3DFMT_X8R8G8B8),
-        BlitDecode::None
-    ));
+    for format in [
+        D3DFMT_A8R8G8B8,
+        D3DFMT_A8B8G8R8,
+        D3DFMT_A1R5G5B5,
+        mtld3d_types::D3DFMT_R5G6B5,
+    ] {
+        assert!(
+            matches!(blit_decode(format), BlitDecode::None),
+            "{format:#x}"
+        );
+    }
+    // An X format's padding bits are no alpha, so the quad forces it to one.
+    for format in [D3DFMT_X8R8G8B8, D3DFMT_X8B8G8R8, D3DFMT_X1R5G5B5] {
+        assert!(
+            matches!(blit_decode(format), BlitDecode::OpaqueAlpha),
+            "{format:#x}"
+        );
+    }
     // The uniform values are the discriminants the MSL matches on.
     assert_eq!(BlitDecode::None.uniform().to_bits(), 0.0f32.to_bits());
     assert_eq!(BlitDecode::Yuy2.uniform().to_bits(), 1.0f32.to_bits());
     assert_eq!(BlitDecode::Uyvy.uniform().to_bits(), 2.0f32.to_bits());
+    assert_eq!(
+        BlitDecode::OpaqueAlpha.uniform().to_bits(),
+        5.0f32.to_bits()
+    );
     assert!(is_packed_yuv(D3DFMT_YUY2) && is_packed_yuv(D3DFMT_UYVY));
     assert!(!is_packed_yuv(mtld3d_types::D3DFMT_R5G6B5));
 }
 
 #[test]
+fn only_a_source_without_alpha_into_one_with_alpha_exposes_padding() {
+    use mtld3d_types::{D3DFMT_A4R4G4B4, D3DFMT_R5G6B5};
+
+    use crate::format::map_d3d_format_device;
+    let exposes = |src: u32, dst: u32, native_packed16: bool| {
+        let map = |format| map_d3d_format_device(format, native_packed16).expect("mapped");
+        exposes_padding_as_alpha(&map(src), &map(dst))
+    };
+    for native_packed16 in [true, false] {
+        for (src, dst) in [
+            (D3DFMT_X8R8G8B8, D3DFMT_A8R8G8B8),
+            (D3DFMT_X8B8G8R8, D3DFMT_A8B8G8R8),
+            (D3DFMT_X1R5G5B5, D3DFMT_A1R5G5B5),
+            (D3DFMT_X8R8G8B8, D3DFMT_A1R5G5B5),
+            (D3DFMT_X8R8G8B8, D3DFMT_A4R4G4B4),
+        ] {
+            assert!(
+                exposes(src, dst, native_packed16),
+                "{src:#x} -> {dst:#x}, native_packed16={native_packed16}"
+            );
+        }
+        // The A into X direction, a format into itself, and a pair whose ends
+        // both carry alpha or both lack it are byte copies as far as alpha goes.
+        for (src, dst) in [
+            (D3DFMT_A8R8G8B8, D3DFMT_X8R8G8B8),
+            (D3DFMT_A8B8G8R8, D3DFMT_X8B8G8R8),
+            (D3DFMT_A1R5G5B5, D3DFMT_X1R5G5B5),
+            (D3DFMT_X8R8G8B8, D3DFMT_X8R8G8B8),
+            (D3DFMT_A8R8G8B8, D3DFMT_A8R8G8B8),
+            (D3DFMT_A8R8G8B8, D3DFMT_A1R5G5B5),
+            (D3DFMT_X1R5G5B5, D3DFMT_R5G6B5),
+        ] {
+            assert!(
+                !exposes(src, dst, native_packed16),
+                "{src:#x} -> {dst:#x}, native_packed16={native_packed16}"
+            );
+        }
+    }
+}
+
+#[test]
 fn a_packed_yuv_byte_copy_needs_both_ends_in_one_format() {
-    use mtld3d_types::{D3DFMT_A8L8, D3DFMT_A8R8G8B8, D3DFMT_X8R8G8B8};
+    use mtld3d_types::D3DFMT_A8L8;
     // The two packed formats order luma and chroma differently, and A8L8
     // shares their storage without being YUV at all.
     for (src, dst) in [

@@ -447,6 +447,20 @@ record. A knob, where one makes sense, is named with its default.
   such as a screenshot, sees the frame as drawn, skipped draws included. The
   runner pins the knob off, so no site observes it. Knob:
   `shader.asyncCompile`, default `true`.
+- **`GetRenderTargetData` from an X render target into its A counterpart
+  copies the padding as alpha.** An X8R8G8B8 render target read into an
+  A8R8G8B8 system-memory surface (and X8B8G8R8 into A8B8G8R8, X1R5G5B5 into
+  A1R5G5B5) is accepted, and the read-back copies the bytes, so the
+  destination's alpha holds whatever the source's padding holds where D3D9
+  reads an X surface's alpha as one. The colour channels are exact. A
+  read-back is one blit of the bytes into the destination's memory, and
+  forcing alpha would add a render pass into a scratch texture or a CPU pass
+  over every pixel of every read-back, the path an application takes for
+  each screenshot and the end-to-end harness for every pixel it checks.
+  `StretchRect` from an X surface into an A one does write alpha one. No
+  conformance site is known to observe it. No knob: an application reading
+  such a surface asked for the colour, and a knob would only add a second
+  read-back path to keep in step.
 
 ## Range-fog coverage
 
