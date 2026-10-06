@@ -1,4 +1,4 @@
-//! Ctrl+Shift+F12 hotkey poll: one press arms the frame dump and the Metal GPU capture.
+//! Ctrl+Shift+F7 hotkey poll: one press arms the frame dump and the Metal GPU capture.
 //!
 //! Both diagnostics cover the same [`FrameDump::FRAMES`] consecutive frames
 //! (see `device::frame_dump`): the dump logs the D3D9-level events a GPU
@@ -10,12 +10,12 @@
 //! unix-side `start_capture` handler logs a warn and returns, and the dump
 //! still runs.
 //!
-//! The chord and what counts as a press are `mtld3d_core::capture_chord`'s:
-//! F12 going down while Control and Shift are held and Alt is not. A bare
-//! F12 is Steam's screenshot key and a common game bind, and Shift+F12
-//! opens the Metal HUD's configuration panel on macOS 27. Polling cost is
-//! one `GetAsyncKeyState` syscall per `Present()` (~100 ns), plus up to
-//! three for the modifiers on the present where F12 goes down.
+//! The chord, its key codes and what counts as a press are
+//! `mtld3d_core::capture_chord`'s: F7 going down while Control and Shift are
+//! held and Alt is not, a chord neither Steam's screenshot key (F12) nor the
+//! Metal HUD's menu keys take. Polling cost is one `GetAsyncKeyState` syscall
+//! per `Present()` (~100 ns), plus up to three for the modifiers on the
+//! present where F7 goes down.
 //!
 //! Flow: `device_present` → `poll()` → on a chord press sets
 //! `CAPTURE_REQUESTED`; the same `Present` takes it through
@@ -29,12 +29,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use mtld3d_core::capture_chord::{self, Modifier};
-
-const VK_SHIFT: i32 = 0x10;
-const VK_CONTROL: i32 = 0x11;
-const VK_MENU: i32 = 0x12;
-const VK_F12: i32 = 0x7B;
+use mtld3d_core::capture_chord::{self, CAPTURE_KEY};
 
 /// A chord press not yet taken by a `Present`.
 ///
@@ -56,24 +51,19 @@ fn key_down(vkey: i32) -> bool {
     unsafe { GetAsyncKeyState(vkey) }.cast_unsigned() & 0x8000 != 0
 }
 
-/// Poll the chord once per present, firing when F12 goes down with Control and Shift held.
+/// Poll the chord once per present, firing when F7 goes down with Control and Shift held.
 ///
-/// Idempotent across frames where F12 is held down.
+/// Idempotent across frames where F7 is held down.
 pub fn poll() {
-    /// F12's state at the previous poll, by any device.
+    /// The capture key's state at the previous poll, by any device.
     ///
     /// The resource is process-wide: the keyboard `GetAsyncKeyState` reads is
     /// one for every device, so one latch turns one press into one request.
-    static F12_DOWN_LAST: AtomicBool = AtomicBool::new(false);
-    let down = key_down(VK_F12);
-    let was_down = F12_DOWN_LAST.swap(down, Ordering::Relaxed);
-    let pressed = capture_chord::chord_pressed(was_down, down, |modifier| {
-        key_down(match modifier {
-            Modifier::Control => VK_CONTROL,
-            Modifier::Shift => VK_SHIFT,
-            Modifier::Alt => VK_MENU,
-        })
-    });
+    static CAPTURE_KEY_DOWN_LAST: AtomicBool = AtomicBool::new(false);
+    let down = key_down(CAPTURE_KEY);
+    let was_down = CAPTURE_KEY_DOWN_LAST.swap(down, Ordering::Relaxed);
+    let pressed =
+        capture_chord::chord_pressed(was_down, down, |modifier| key_down(modifier.virtual_key()));
     if pressed {
         CAPTURE_REQUESTED.store(true, Ordering::Release);
     }
