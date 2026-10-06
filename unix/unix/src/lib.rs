@@ -8,6 +8,7 @@ mod draw;
 mod encoder;
 mod encoder_service;
 mod handlers;
+mod hud_state;
 mod log_file;
 mod main_thread_checker;
 mod metal;

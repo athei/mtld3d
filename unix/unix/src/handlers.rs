@@ -308,6 +308,7 @@ pub extern "C" fn attach_metal_layer_handler(args: *mut c_void) -> i32 {
             if params.display_sync_enabled != 0 { "on" } else { "off" },
             params.max_fps
         );
+        crate::hud_state::report_attached();
         STATUS_SUCCESS
     } else {
         params.view_handle = MetalHandle::NULL;

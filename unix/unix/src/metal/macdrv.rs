@@ -2550,6 +2550,7 @@ fn configure_metal_layer_inner(
     // Present re-syncs this before every `nextDrawable`; the push here is
     // so the first frame does not have to.
     sync_drawable_size(&layer);
+    crate::hud_state::show_row(&layer);
     //
     // Confirm the install. `colorspace` is the label the SDR/HDR
     // applier picked at install time — distinguishes "screen profile
