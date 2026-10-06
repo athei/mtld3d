@@ -292,6 +292,31 @@ fn crossing_fetch_lists_each_slot_of_a_stream_with_its_advance() {
 }
 
 #[test]
+fn a_fetch_keeps_the_stream_layouts_it_was_built_from() {
+    let attrs = [
+        attr(0, 0, VertexFormat::Float3),
+        attr(0, 28, VertexFormat::UChar4NormalizedBgra),
+        attr(1, 0, VertexFormat::Float),
+    ];
+    let mut layouts = [StreamLayout::UNUSED; 16];
+    layouts[0] = bound_stream_layout(16, 32, 1);
+    layouts[1] = bound_stream_layout(4, 4, 1);
+    let mut fetch = CrossingFetch::empty();
+    assert_eq!(fetch.reuse_or_rebuild(0x1000, &attrs, &layouts, 0), Ok(()));
+    // Slot 2 holds the crossing attribute; stream 2 is read by nothing.
+    assert!(fetch.layouts()[2].is_used());
+    assert_eq!(fetch.stream_layouts(), &layouts);
+    // A reuse keeps them, and a rebuild over other layouts replaces them.
+    assert_eq!(fetch.reuse_or_rebuild(0x1000, &attrs, &layouts, 0), Ok(()));
+    assert_eq!(fetch.stream_layouts(), &layouts);
+    let mut wide = layouts;
+    wide[0] = bound_stream_layout(20, 32, 1);
+    assert_eq!(fetch.reuse_or_rebuild(0x1000, &attrs, &wide, 0), Ok(()));
+    assert_eq!(fetch.stream_layouts(), &wide);
+    assert!(!fetch.stream_layouts()[2].is_used());
+}
+
+#[test]
 fn a_stream_whose_attributes_all_cross_binds_only_advanced_slots() {
     let attrs = [
         attr(1, 0, VertexFormat::Float3),

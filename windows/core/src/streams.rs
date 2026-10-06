@@ -351,8 +351,10 @@ pub struct CrossingFetch {
     used_slots: u16,
     /// The [`stream_shifts`] the attributes were moved by.
     shifts: u32,
-    /// The declaration record's address, stream layouts and shifts this was built from.
-    source: Option<(usize, [StreamLayout; MAX_STREAMS as usize], u32)>,
+    /// The stream layouts this was built from, indexed by D3D9 stream.
+    stream_layouts: [StreamLayout; MAX_STREAMS as usize],
+    /// The declaration record's address and shifts this was built from.
+    source: Option<(usize, u32)>,
 }
 
 impl CrossingFetch {
@@ -375,6 +377,7 @@ impl CrossingFetch {
             }),
             used_slots: 0,
             shifts: 0,
+            stream_layouts: [StreamLayout::UNUSED; MAX_STREAMS as usize],
             source: None,
         }
     }
@@ -413,16 +416,14 @@ impl CrossingFetch {
     ) -> Result<(), VertexFetchError> {
         if self
             .source
-            .as_ref()
-            .is_some_and(|(built, built_layouts, built_shifts)| {
-                *built == record && built_layouts == layouts && *built_shifts == shifts
-            })
+            .is_some_and(|(built, built_shifts)| built == record && built_shifts == shifts)
+            && self.stream_layouts == *layouts
         {
             return Ok(());
         }
         self.source = None;
         self.rebuild(attrs, layouts, shifts)?;
-        self.source = Some((record, *layouts, shifts));
+        self.source = Some((record, shifts));
         Ok(())
     }
 
@@ -453,6 +454,7 @@ impl CrossingFetch {
         };
         prefix.copy_from_slice(attrs);
         self.attr_count = u8::try_from(attrs.len()).expect("at most 16 attributes");
+        self.stream_layouts = *layouts;
         self.layouts = *layouts;
         self.shifts = shifts;
         self.bindings = remap_crossing_attributes(prefix, &mut self.layouts)?;
@@ -476,6 +478,16 @@ impl CrossingFetch {
     #[must_use]
     pub const fn layouts(&self) -> &[StreamLayout; MAX_STREAMS as usize] {
         &self.layouts
+    }
+
+    /// The stream layouts this fetch was built from, indexed by D3D9 stream.
+    ///
+    /// What a draw binds and records per stream reads these, since
+    /// [`Self::layouts`] gives a slot no stream reads the layout of the
+    /// crossing attribute it holds.
+    #[must_use]
+    pub const fn stream_layouts(&self) -> &[StreamLayout; MAX_STREAMS as usize] {
+        &self.stream_layouts
     }
 
     /// The `vdecl_hash` a pipeline snapshot of this fetch carries.
