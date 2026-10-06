@@ -283,6 +283,19 @@ pub const fn exposes_padding_as_alpha(src: &FormatMapping, dst: &FormatMapping) 
     !src.has_alpha() && dst.has_alpha()
 }
 
+/// Whether the render quad into `rect` writes every pixel of a destination level of `size`.
+///
+/// Both are in the destination texture's own space. The quad is drawn under
+/// a viewport and a scissor equal to `rect`, with no blending and every
+/// colour channel enabled, and its one triangle covers the whole viewport,
+/// so it writes every sample of every pixel inside `rect`. A rect that starts
+/// at the origin and spans the level therefore leaves nothing of the previous
+/// contents for its pass to load.
+#[must_use]
+pub const fn quad_covers_destination(rect: StretchRegion, size: (u32, u32)) -> bool {
+    rect.x == 0 && rect.y == 0 && rect.w == size.0 && rect.h == size.1
+}
+
 /// Whether `d3d_format` is one of the two packed 4:2:2 YUV formats.
 #[must_use]
 pub const fn is_packed_yuv(d3d_format: u32) -> bool {

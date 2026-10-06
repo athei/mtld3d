@@ -16,6 +16,10 @@
 //! destination with alpha is a pair whose byte copy would hand the padding over as alpha,
 //! on a device with the packed 16-bit formats and on one that widens them.
 //!
+//! The render quad covers its destination only when the rect starts at the origin and
+//! spans the level on both axes; a shorter rect, one moved off the origin and a level of
+//! another size each leave pixels the pass has to load.
+//!
 //! The packed-YUV cases pin the source decode: which `BlitDecode` a format selects and
 //! the discriminants the fragment shader matches on, the fixed-point `yuv_to_rgb8`
 //! against reference samples in both the full-range and reduced-range conventions, and
@@ -286,6 +290,37 @@ fn only_a_source_without_alpha_into_one_with_alpha_exposes_padding() {
             );
         }
     }
+}
+
+#[test]
+fn only_a_rect_spanning_the_whole_level_covers_the_destination() {
+    let rect = |x, y, w, h| StretchRegion { x, y, w, h };
+    // The 1:1 copy of a back buffer into a texture of its size, and a level
+    // of one pixel.
+    assert!(quad_covers_destination(rect(0, 0, 1280, 720), (1280, 720)));
+    assert!(quad_covers_destination(rect(0, 0, 1, 1), (1, 1)));
+    // A rect short of the level on either axis leaves pixels to keep.
+    assert!(!quad_covers_destination(rect(0, 0, 1279, 720), (1280, 720)));
+    assert!(!quad_covers_destination(rect(0, 0, 1280, 719), (1280, 720)));
+    assert!(!quad_covers_destination(rect(0, 0, 640, 360), (1280, 720)));
+    // A rect of the level's size moved off the origin leaves a row or a
+    // column unwritten.
+    assert!(!quad_covers_destination(rect(1, 0, 1280, 720), (1280, 720)));
+    assert!(!quad_covers_destination(rect(0, 1, 1280, 720), (1280, 720)));
+    assert!(!quad_covers_destination(
+        rect(640, 360, 640, 360),
+        (1280, 720)
+    ));
+    // A level of another size than the rect, smaller or larger.
+    assert!(!quad_covers_destination(
+        rect(0, 0, 1280, 720),
+        (1920, 1080)
+    ));
+    assert!(!quad_covers_destination(
+        rect(0, 0, 1280, 720),
+        (1280, 1024)
+    ));
+    assert!(!quad_covers_destination(rect(0, 0, 1280, 720), (640, 720)));
 }
 
 #[test]
