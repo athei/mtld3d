@@ -40,6 +40,7 @@ pub mod encoder_packet;
 pub mod encoder_records;
 pub mod encoder_reply;
 pub mod encoder_value;
+pub mod extended;
 pub mod fetch4;
 pub mod ff_state;
 pub mod format;

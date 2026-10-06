@@ -244,3 +244,104 @@ fn an_unmarked_frame_hands_on_nothing() {
     assert_eq!(carried_capture_marks((false, false), true), (false, false));
     assert_eq!(carried_capture_marks((false, false), false), (false, false));
 }
+
+fn present_params(swap_effect: u32, back_buffer_count: u32) -> mtld3d_types::D3DPRESENT_PARAMETERS {
+    mtld3d_types::D3DPRESENT_PARAMETERS {
+        back_buffer_width: 640,
+        back_buffer_height: 480,
+        back_buffer_format: 0,
+        back_buffer_count,
+        multi_sample_type: 0,
+        multi_sample_quality: 0,
+        swap_effect,
+        device_window: 0,
+        windowed: 1,
+        enable_auto_depth_stencil: 0,
+        auto_depth_stencil_format: 0,
+        flags: 0,
+        full_screen_refresh_rate_in_hz: 0,
+        presentation_interval: 0,
+    }
+}
+
+#[test]
+fn a_plain_device_takes_three_swap_effects_and_three_back_buffers() {
+    use mtld3d_types::{
+        D3DSWAPEFFECT_COPY, D3DSWAPEFFECT_DISCARD, D3DSWAPEFFECT_FLIP, D3DSWAPEFFECT_FLIPEX,
+        D3DSWAPEFFECT_OVERLAY,
+    };
+
+    use super::present_params_are_valid;
+    assert!(!present_params_are_valid(&present_params(0, 1), false));
+    for effect in [
+        D3DSWAPEFFECT_DISCARD,
+        D3DSWAPEFFECT_FLIP,
+        D3DSWAPEFFECT_COPY,
+    ] {
+        assert!(present_params_are_valid(&present_params(effect, 1), false));
+    }
+    for effect in [D3DSWAPEFFECT_OVERLAY, D3DSWAPEFFECT_FLIPEX] {
+        assert!(!present_params_are_valid(&present_params(effect, 1), false));
+    }
+    assert!(present_params_are_valid(
+        &present_params(D3DSWAPEFFECT_DISCARD, 3),
+        false
+    ));
+    assert!(!present_params_are_valid(
+        &present_params(D3DSWAPEFFECT_DISCARD, 4),
+        false
+    ));
+    assert!(present_params_are_valid(
+        &present_params(D3DSWAPEFFECT_COPY, 0),
+        false
+    ));
+    assert!(!present_params_are_valid(
+        &present_params(D3DSWAPEFFECT_COPY, 2),
+        false
+    ));
+}
+
+#[test]
+fn an_extended_device_adds_overlay_flipex_and_thirty_back_buffers() {
+    use mtld3d_types::{
+        D3DSWAPEFFECT_COPY, D3DSWAPEFFECT_DISCARD, D3DSWAPEFFECT_FLIP, D3DSWAPEFFECT_FLIPEX,
+        D3DSWAPEFFECT_OVERLAY,
+    };
+
+    use super::present_params_are_valid;
+    assert!(!present_params_are_valid(&present_params(0, 1), true));
+    for effect in [
+        D3DSWAPEFFECT_DISCARD,
+        D3DSWAPEFFECT_FLIP,
+        D3DSWAPEFFECT_COPY,
+        D3DSWAPEFFECT_OVERLAY,
+        D3DSWAPEFFECT_FLIPEX,
+    ] {
+        assert!(present_params_are_valid(&present_params(effect, 1), true));
+    }
+    assert!(!present_params_are_valid(
+        &present_params(D3DSWAPEFFECT_FLIPEX + 1, 1),
+        true
+    ));
+    assert!(present_params_are_valid(
+        &present_params(D3DSWAPEFFECT_FLIP, 30),
+        true
+    ));
+    assert!(!present_params_are_valid(
+        &present_params(D3DSWAPEFFECT_FLIP, 31),
+        true
+    ));
+    assert!(!present_params_are_valid(
+        &present_params(D3DSWAPEFFECT_COPY, 2),
+        true
+    ));
+}
+
+#[test]
+fn an_interval_that_names_no_interval_is_refused() {
+    use super::present_params_are_valid;
+    let mut pp = present_params(mtld3d_types::D3DSWAPEFFECT_DISCARD, 1);
+    pp.presentation_interval = 5;
+    assert!(!present_params_are_valid(&pp, false));
+    assert!(!present_params_are_valid(&pp, true));
+}

@@ -5,8 +5,10 @@
 //! on top of it; the user's `present.maxFps` rides the same ceiling.
 
 use mtld3d_types::{
-    D3DPRESENT_INTERVAL_DEFAULT, D3DPRESENT_INTERVAL_FOUR, D3DPRESENT_INTERVAL_IMMEDIATE,
-    D3DPRESENT_INTERVAL_ONE, D3DPRESENT_INTERVAL_THREE, D3DPRESENT_INTERVAL_TWO,
+    D3DPRESENT_BACK_BUFFERS_MAX, D3DPRESENT_BACK_BUFFERS_MAX_EX, D3DPRESENT_INTERVAL_DEFAULT,
+    D3DPRESENT_INTERVAL_FOUR, D3DPRESENT_INTERVAL_IMMEDIATE, D3DPRESENT_INTERVAL_ONE,
+    D3DPRESENT_INTERVAL_THREE, D3DPRESENT_INTERVAL_TWO, D3DPRESENT_PARAMETERS, D3DSWAPEFFECT_COPY,
+    D3DSWAPEFFECT_DISCARD, D3DSWAPEFFECT_FLIPEX,
 };
 
 /// Result of mapping a `D3DPRESENT_INTERVAL_*` to the vsync request.
@@ -38,6 +40,42 @@ impl DisplaySync {
 pub struct LayerPacing {
     pub display_sync: bool,
     pub max_fps: u32,
+}
+
+/// Validate the swap-effect, back-buffer-count and presentation-interval fields.
+///
+/// The `CreateDevice` and `Reset` contract; `false` is the call's
+/// `D3DERR_INVALIDCALL`. A plain device takes the swap effects DISCARD, FLIP
+/// and COPY and up to [`D3DPRESENT_BACK_BUFFERS_MAX`] back buffers; an
+/// extended device also takes OVERLAY and FLIPEX and up to
+/// [`D3DPRESENT_BACK_BUFFERS_MAX_EX`]. On both, swap effect 0 is refused,
+/// COPY allows one back buffer (a requested 0 resolves to 1), and the
+/// interval is one of DEFAULT, ONE, TWO, THREE, FOUR and IMMEDIATE.
+#[must_use]
+pub const fn present_params_are_valid(pp: &D3DPRESENT_PARAMETERS, extended: bool) -> bool {
+    let (highest_swap_effect, max_back_buffers) = if extended {
+        (D3DSWAPEFFECT_FLIPEX, D3DPRESENT_BACK_BUFFERS_MAX_EX)
+    } else {
+        (D3DSWAPEFFECT_COPY, D3DPRESENT_BACK_BUFFERS_MAX)
+    };
+    if pp.swap_effect < D3DSWAPEFFECT_DISCARD || pp.swap_effect > highest_swap_effect {
+        return false;
+    }
+    if pp.swap_effect == D3DSWAPEFFECT_COPY && pp.back_buffer_count > 1 {
+        return false;
+    }
+    if pp.back_buffer_count > max_back_buffers {
+        return false;
+    }
+    matches!(
+        pp.presentation_interval,
+        D3DPRESENT_INTERVAL_DEFAULT
+            | D3DPRESENT_INTERVAL_ONE
+            | D3DPRESENT_INTERVAL_TWO
+            | D3DPRESENT_INTERVAL_THREE
+            | D3DPRESENT_INTERVAL_FOUR
+            | D3DPRESENT_INTERVAL_IMMEDIATE
+    )
 }
 
 #[must_use]

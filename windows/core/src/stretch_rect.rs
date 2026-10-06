@@ -119,6 +119,24 @@ impl RejectReason {
     }
 }
 
+/// Whether an extended device accepts a `StretchRect` between surfaces of no eligible class.
+///
+/// A plain device copies only into a render target, or between two default-pool
+/// offscreen plains. An extended device also copies between any two
+/// default-pool surfaces, a texture level that is no render target included,
+/// as long as the call is a plain copy: no rects at all (a rect covering the
+/// whole surface does not count), one format, one size. `src` and `dst` are
+/// each surface's `(format, width, height)`.
+#[must_use]
+pub fn extended_whole_surface_copy(
+    extended: bool,
+    rects_given: bool,
+    src: (u32, u32, u32),
+    dst: (u32, u32, u32),
+) -> bool {
+    extended && !rects_given && src == dst
+}
+
 /// How a `StretchRect` whose two endpoints are one Metal texture is carried out.
 ///
 /// D3D9 performs a copy between two rectangles of the same surface; only an
