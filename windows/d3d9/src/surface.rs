@@ -853,6 +853,20 @@ impl Direct3DSurface9 {
         self.inner().standalone_pool
     }
 
+    /// `D3DUSAGE_*` flags `GetDesc` reports for this surface.
+    ///
+    /// A texture-level surface reports its parent texture's usage, a
+    /// standalone surface the usage it was created with.
+    pub fn d3d_usage(&self) -> u32 {
+        let parent = self.parent_texture();
+        if parent.is_null() {
+            return self.inner().standalone_usage;
+        }
+        // SAFETY: `parent` is non-null (checked above) and a surface keeps a
+        // reference on its parent texture for its whole lifetime.
+        unsafe { &*parent }.d3d_usage()
+    }
+
     /// D3D9 format of this surface when bound as a depth attachment (D3DFMT_*).
     ///
     /// Texture-backed depth surfaces report the parent texture's format;

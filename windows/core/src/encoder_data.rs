@@ -199,6 +199,39 @@ pub struct StretchSurfaceInfo {
     pub sample_count: u8,
 }
 
+impl StretchSurfaceInfo {
+    /// Name the surface class `StretchRect` eligibility is judged on, for a rejection line.
+    ///
+    /// A standalone colour surface is the back buffer or a `CreateRenderTarget`
+    /// surface. Both report `D3DUSAGE_RENDERTARGET`, so the name does not tell
+    /// them apart.
+    #[must_use]
+    pub const fn class_name(&self) -> &'static str {
+        match self.kind {
+            StretchKind::DepthStencil(_) => "depth-stencil surface",
+            StretchKind::Backbuffer(_) => "standalone render target",
+            StretchKind::Texture(_) => {
+                if self
+                    .flags
+                    .contains(StretchSurfaceFlags::IS_OFFSCREEN_PLAIN_DEFAULT)
+                {
+                    "offscreen-plain surface"
+                } else if self.flags.contains(StretchSurfaceFlags::IS_RENDER_TARGET) {
+                    if self.slice.is_some() {
+                        "render-target cube face"
+                    } else {
+                        "render-target texture level"
+                    }
+                } else if self.slice.is_some() {
+                    "cube face"
+                } else {
+                    "texture level"
+                }
+            }
+        }
+    }
+}
+
 /// Render target 0 as the encoder binds it.
 ///
 /// A parameter bag rather than eight positional arguments. `logical_size` is
@@ -1626,3 +1659,6 @@ pub const fn capture_op<T>(value: T) -> T {
 pub fn capture_op<T>(value: T) -> Box<T> {
     Box::new(value)
 }
+
+#[cfg(test)]
+mod tests;

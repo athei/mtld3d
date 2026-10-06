@@ -5197,10 +5197,14 @@ impl PassState {
     /// `DontCare` load stored undefined contents anyway).
     ///
     /// If the side-map is missing an entry for a non-clear-quad `SetPSO`
-    /// inside a candidate pass, abort the strip for that pass (single
-    /// `log_once` warning) — means a zero-mask draw skipped the
-    /// dual-build path in `FrameEncoder::get_or_create_pipeline`, which
-    /// would be a correctness bug elsewhere.
+    /// inside a candidate pass, the strip is skipped for that pass (one
+    /// `log_once_info!` line per process). A miss is expected: the no-colour
+    /// twin builds asynchronously and nothing waits for it, so passes drawn
+    /// with a freshly built pipeline find no entry until the twin lands, and
+    /// a pipeline whose twin failed or that queues none never has one. The
+    /// pass keeps its colour attachment, its store actions and its
+    /// with-colour pipelines, so it renders as it would without Rule H; the
+    /// only cost is that pass's colour load and store bandwidth.
     ///
     /// Must run after `finalize_store_actions`, whose store decisions the
     /// clear-quad check reads, and after `strip_dead_color_in_clear_only_passes`
@@ -5262,8 +5266,8 @@ impl PassState {
                     || alt.contains_key(&c.param_b)
             });
             if !all_resolvable {
-                mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
-                    "strip_color_from_no_color_draw_passes: side-map miss → keeping color attachment");
+                mtld3d_shared::log_once_info!(target: crate::LOG_TARGET,
+                    "strip_color_from_no_color_draw_passes: a pipeline has no no-colour twin mapped → pass keeps its colour attachment");
                 continue;
             }
             // The mask-0 draws write no colour, so dropping the attachment

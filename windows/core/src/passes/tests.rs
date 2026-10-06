@@ -2873,10 +2873,10 @@ fn rule_h_skipped_for_clear_only_pass() {
 #[test]
 fn rule_h_aborts_strip_on_missing_alt_handle() {
     // A zero-mask draw bound PSO_WITH but the side-map is empty
-    // (would mean the FrameEncoder skipped the dual-build path —
-    // an upstream bug). The rule must keep the color attachment
-    // intact rather than bind a with-color pipeline against a
-    // depth-only render pass descriptor.
+    // (its no-colour twin is still building, or was never queued).
+    // The rule must keep the color attachment intact rather than
+    // bind a with-color pipeline against a depth-only render pass
+    // descriptor.
     let mut s = fresh();
     s.note_draw_color_write_mask(0);
     s.emit_command(set_pso(PSO_WITH));
@@ -2909,7 +2909,7 @@ fn rule_h_strips_color_with_self_mapped_depth_clear_quad() {
     // zero-mask caster SetPSO + draws. The depth clear-quad
     // pipeline is built `has_color: false` and self-maps in
     // `no_color_pipeline_alt` (encoder.rs); Rule H must strip
-    // color cleanly without firing the side-map-miss warn.
+    // color cleanly without taking the side-map-miss path.
 
     let mut s = fresh();
     for _ in 0..3 {

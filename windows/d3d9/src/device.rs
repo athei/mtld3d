@@ -8375,9 +8375,24 @@ extern "system" fn device_stretch_rect(
             .contains(StretchSurfaceFlags::IS_OFFSCREEN_PLAIN_DEFAULT)
     };
     if !dst_eligible || !src_eligible {
+        // One line per process, naming the first pair rejected here; the
+        // arguments are formatted only when it fires.
+        // SAFETY: `src` is the live IDirect3DSurface9 the game passed to this call.
+        let src_surface = unsafe { InPtr::<Direct3DSurface9>::opt(src) };
+        // SAFETY: `dst` is the live IDirect3DSurface9 the game passed to this call.
+        let dst_surface = unsafe { InPtr::<Direct3DSurface9>::opt(dst) };
         mtld3d_shared::log_once_warn!(
             target: crate::LOG_TARGET,
-            "reject StretchRect: ineligible src/dst surface class → INVALIDCALL"
+            "reject StretchRect: ineligible src/dst surface class (src={} usage=0x{:x} {} 0x{:x}, \
+             dst={} usage=0x{:x} {} 0x{:x}) → INVALIDCALL",
+            src_info.class_name(),
+            src_surface.map_or(0, |surf| surf.d3d_usage()),
+            mtld3d_core::format::format_name(src_info.format),
+            src_info.format,
+            dst_info.class_name(),
+            dst_surface.map_or(0, |surf| surf.d3d_usage()),
+            mtld3d_core::format::format_name(dst_info.format),
+            dst_info.format
         );
         return D3DERR_INVALIDCALL;
     }
