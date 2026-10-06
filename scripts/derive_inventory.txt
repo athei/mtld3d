@@ -233,6 +233,7 @@ windows/d3d9/src/surface.rs ImplicitKind Clone,Copy,PartialEq,Eq
 windows/d3d9/src/surface.rs SurfaceFlags Clone,Copy,Debug,Default,PartialEq,Eq
 windows/d3d9/src/surface.rs SurfaceMultiSample Clone,Copy,PartialEq,Eq
 windows/d3d9/src/vertex_shader.rs VsConstUsage Clone,Copy,Debug,Default,PartialEq,Eq
+windows/tests/src/harness.rs Factory Clone,Copy,PartialEq,Eq
 windows/tests/src/harness.rs HarnessState Clone,Copy
 windows/tests/src/pixel.rs Rgba8 Clone,Copy,PartialEq,Eq,Debug
 windows/tests/src/vertex.rs LitVertex Clone,Copy

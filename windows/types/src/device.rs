@@ -307,6 +307,8 @@ pub const D3DFMT_YV12: u32 = 0x3231_5659;
 pub const D3DFMT_NV12: u32 = 0x3231_564E;
 /// `MAKEFOURCC('A','T','I','1')` — ATI1N / BC4 single-channel block format.
 pub const D3DFMT_ATI1: u32 = 0x3149_5441;
+/// `MAKEFOURCC('A','T','I','2')`: ATI2N / BC5 two-channel block format, which no create takes.
+pub const D3DFMT_ATI2: u32 = 0x3249_5441;
 
 // ── D3D9 sampler state types ──
 

@@ -8,12 +8,13 @@
 use core::{ffi::c_void, marker::PhantomData};
 
 use mtld3d_types::{
-    D3D_OK, D3DBOX, D3DINDEXBUFFER_DESC, D3DLOCKED_BOX, D3DLOCKED_RECT, D3DPRESENT_PARAMETERS,
-    D3DSURFACE_DESC, D3DVERTEXBUFFER_DESC, D3DVOLUME_DESC, Guid, IDirect3DCubeTexture9Vtbl,
-    IDirect3DIndexBuffer9Vtbl, IDirect3DPixelShader9Vtbl, IDirect3DQuery9Vtbl,
-    IDirect3DStateBlock9Vtbl, IDirect3DSurface9Vtbl, IDirect3DSwapChain9Vtbl,
-    IDirect3DTexture9Vtbl, IDirect3DVertexBuffer9Vtbl, IDirect3DVertexDeclaration9Vtbl,
-    IDirect3DVertexShader9Vtbl, IDirect3DVolume9Vtbl, IDirect3DVolumeTexture9Vtbl,
+    D3D_OK, D3DBOX, D3DDISPLAYMODEEX, D3DINDEXBUFFER_DESC, D3DLOCKED_BOX, D3DLOCKED_RECT,
+    D3DPRESENT_PARAMETERS, D3DPRESENTSTATS, D3DSURFACE_DESC, D3DVERTEXBUFFER_DESC, D3DVOLUME_DESC,
+    Guid, IDirect3DCubeTexture9Vtbl, IDirect3DIndexBuffer9Vtbl, IDirect3DPixelShader9Vtbl,
+    IDirect3DQuery9Vtbl, IDirect3DStateBlock9Vtbl, IDirect3DSurface9Vtbl,
+    IDirect3DSwapChain9ExVtbl, IDirect3DSwapChain9Vtbl, IDirect3DTexture9Vtbl,
+    IDirect3DVertexBuffer9Vtbl, IDirect3DVertexDeclaration9Vtbl, IDirect3DVertexShader9Vtbl,
+    IDirect3DVolume9Vtbl, IDirect3DVolumeTexture9Vtbl,
 };
 
 use crate::{
@@ -140,6 +141,76 @@ impl SwapChain<'_> {
     pub fn front_buffer_data_null_this(&self, dst: &Surface<'_>) -> i32 {
         // SAFETY: the thunk accepts null this as a rejected API call; dst is live.
         unsafe { (self.vtbl().get_front_buffer_data)(core::ptr::null_mut(), dst.as_ptr()) }
+    }
+
+    /// `QueryInterface` for `iid`: the hr and whether it handed back this swap chain.
+    ///
+    /// The reference a successful query takes is released again.
+    #[must_use]
+    pub fn query_interface(&self, iid: &Guid) -> (i32, bool) {
+        let mut out: *mut c_void = core::ptr::null_mut();
+        // SAFETY: live swapchain; `iid` and `out` are valid for the call.
+        let hr = unsafe { (self.vtbl().query_interface)(self.ptr, iid, &raw mut out) };
+        if out.is_null() {
+            return (hr, false);
+        }
+        let same = out == self.ptr;
+        // SAFETY: releases the reference the query handed out; the wrapper's own keeps it live.
+        unsafe { (self.vtbl().release)(out) };
+        (hr, same)
+    }
+
+    fn ex_vtbl(&self) -> &'static IDirect3DSwapChain9ExVtbl {
+        // SAFETY: an extended device's swap chain carries the extended vtable.
+        unsafe { deref_vtbl::<IDirect3DSwapChain9ExVtbl>(self.ptr) }
+    }
+
+    /// `IDirect3DSwapChain9Ex::GetLastPresentCount`: hr and the count written.
+    #[must_use]
+    pub fn last_present_count(&self) -> (i32, u32) {
+        let mut count = u32::MAX;
+        // SAFETY: extended vtable thunk; `count` is writable.
+        let hr = unsafe { (self.ex_vtbl().get_last_present_count)(self.ptr, &raw mut count) };
+        (hr, count)
+    }
+
+    /// `IDirect3DSwapChain9Ex::GetPresentStats`: hr and the statistics written.
+    #[must_use]
+    pub fn present_stats(&self) -> (i32, D3DPRESENTSTATS) {
+        let mut stats = D3DPRESENTSTATS {
+            present_count: u32::MAX,
+            present_refresh_count: u32::MAX,
+            sync_refresh_count: u32::MAX,
+            pad0: u32::MAX,
+            sync_qpc_time: [u32::MAX; 2],
+            sync_gpu_time: [u32::MAX; 2],
+        };
+        // SAFETY: extended vtable thunk; `stats` is writable.
+        let hr = unsafe { (self.ex_vtbl().get_present_stats)(self.ptr, &raw mut stats) };
+        (hr, stats)
+    }
+
+    /// `IDirect3DSwapChain9Ex::GetDisplayModeEx` with `mode.Size = size`.
+    #[must_use]
+    pub fn display_mode_ex(&self, size: u32) -> (i32, D3DDISPLAYMODEEX, u32) {
+        let mut mode = D3DDISPLAYMODEEX {
+            size,
+            width: 0,
+            height: 0,
+            refresh_rate: 0,
+            format: 0,
+            scan_line_ordering: 0,
+        };
+        let mut rotation = 0u32;
+        // SAFETY: extended vtable thunk; `mode` and `rotation` are writable.
+        let hr = unsafe {
+            (self.ex_vtbl().get_display_mode_ex)(
+                self.ptr,
+                (&raw mut mode).cast::<c_void>(),
+                &raw mut rotation,
+            )
+        };
+        (hr, mode, rotation)
     }
 }
 
@@ -2112,6 +2183,19 @@ pub struct LockedRect<'a> {
 }
 
 impl LockedRect<'_> {
+    /// Copy the first `len` bytes of the mapped span out.
+    ///
+    /// # Panics
+    /// The caller must ensure `len` bytes fit within the locked region.
+    #[must_use]
+    pub fn read_bytes(&self, len: usize) -> Vec<u8> {
+        let mut out = vec![0u8; len];
+        // SAFETY: `bits` maps at least `len` bytes of the locked region (caller's
+        // contract) and `out` holds `len` bytes.
+        unsafe { core::ptr::copy_nonoverlapping(self.bits.cast::<u8>(), out.as_mut_ptr(), len) };
+        out
+    }
+
     /// Row pitch in bytes.
     #[must_use]
     pub const fn pitch(&self) -> i32 {

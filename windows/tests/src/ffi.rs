@@ -13,4 +13,5 @@ use core::ffi::c_void;
 #[cfg_attr(target_arch = "x86_64", link(name = "d3d9", kind = "raw-dylib"))]
 unsafe extern "system" {
     pub fn Direct3DCreate9(sdk_version: u32) -> *mut c_void;
+    pub fn Direct3DCreate9Ex(sdk_version: u32, out: *mut *mut c_void) -> i32;
 }
