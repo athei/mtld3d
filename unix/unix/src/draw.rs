@@ -809,36 +809,76 @@ fn emit_draw_view(
         variant: ps_variant,
     };
     enc.maybe_log_pass_shader(shaders, stage_bindings);
+    // Carry the bound RT's D3D "has alpha" bit so destination-alpha blend
+    // factors clamp on alpha-less targets (X8R8G8B8 shares `Bgra8Unorm` with
+    // A8R8G8B8, so the color format alone can't distinguish them).
+    let mut attach = target_planes | PipelineAttachFlags::HAS_COLOR_OUTPUT;
+    attach.set(
+        PipelineAttachFlags::COLOR_HAS_ALPHA,
+        enc.current_color_rt_has_alpha(),
+    );
     // One vertex buffer layout per stream the declaration reads: stride and
     // step function from the binding (a zero stride is one constant element,
     // the rest step per the stream's `SetStreamSourceFreq`), a constant zero
-    // feed where nothing is bound. Part of the pipeline identity.
+    // feed where nothing is bound. Part of the pipeline identity, so they are
+    // written into the snapshot itself rather than copied into it.
     let mut crossing = 0;
     let mut offsets = 0;
-    let mut layouts = stream_layouts_view(vertex_source, &attrs, &mut crossing, &mut offsets);
+    let mut pipeline_snapshot = PipelineSnapshot {
+        vs_fn: vs_handles.func,
+        ps_fn: ps_handles.func,
+        vdecl_hash: attrs.vdecl_hash(),
+        stream_layouts: [StreamLayout::UNUSED; mtld3d_types::MAX_STREAMS as usize],
+        color_format: enc.current_color_format(),
+        attach,
+        rs: render_state.pipeline_rs,
+        extra: extra_attachments,
+        ps_color_out_mask,
+        sample_count: enc.current_color_sample_count(),
+    };
+    stream_layouts_view(
+        &mut pipeline_snapshot.stream_layouts,
+        vertex_source,
+        &attrs,
+        &mut crossing,
+        &mut offsets,
+    );
     // An attribute that ends past its stream's stride is fetched through a
     // binding of its own, and a stream offset off a four-byte boundary binds
     // rounded down with its remainder in the attribute offsets
-    // (`CrossingFetch`); every other draw takes the declaration's attributes
-    // and the stream layouts as they are.
+    // (`CrossingFetch`), which writes the snapshot's layouts and declaration
+    // identity; every other draw takes the declaration's attributes and the
+    // stream layouts as they are.
     let fetch = if crossing == 0 && offset_shift(offsets) == 0 {
         None
     } else {
-        crossing_fetch(enc, vertex_source, &attrs, &mut layouts, crossing)
+        crossing_fetch(
+            enc,
+            vertex_source,
+            &attrs,
+            &mut pipeline_snapshot.stream_layouts,
+            &mut pipeline_snapshot.vdecl_hash,
+            crossing,
+        )
     };
+    let attrs_ref = fetch
+        .as_ref()
+        .map_or(attrs.as_slice(), |fetch| fetch.attrs());
     enc.maybe_emit_draw_trace(
         shaders,
         metal_prim,
         vertex_source,
         index_source,
-        layouts[0].stride,
+        fetch
+            .as_ref()
+            .map_or(&pipeline_snapshot.stream_layouts, |fetch| {
+                fetch.stream_layouts()
+            })[0]
+            .stride,
     );
     drop(t_resolve);
 
     let t_pipeline = CycleAddTimer::start(enc.op_sub_cycles_ptr(OpSub::Pipeline));
-    let attrs_ref = fetch
-        .as_ref()
-        .map_or(attrs.as_slice(), |fetch| fetch.attrs());
     // Instances of an indexed draw: stream 0's frequency count, but only when
     // a stream this draw reads is per-instance; non-indexed draws never
     // instance (D3D9 ignores the frequency state for them).
@@ -851,37 +891,11 @@ fn emit_draw_view(
             instance_count(*stream0_freq, any_instanced)
         }
     };
-    let vdecl_hash = attrs.vdecl_hash();
     let alpha_ref_bytes = alpha_ref_slice.as_slice();
     let fog_color_bytes = fog_color_slice.as_slice();
     let bump_env_bytes = bump_env_slice.as_slice();
 
     // 3. Pipeline + depth state + cull.
-    let color_format = enc.current_color_format();
-    let mut attach = target_planes | PipelineAttachFlags::HAS_COLOR_OUTPUT;
-    // Carry the bound RT's D3D "has alpha" bit so destination-alpha blend
-    // factors clamp on alpha-less targets (X8R8G8B8 shares `Bgra8Unorm` with
-    // A8R8G8B8, so the color format alone can't distinguish them).
-    attach.set(
-        PipelineAttachFlags::COLOR_HAS_ALPHA,
-        enc.current_color_rt_has_alpha(),
-    );
-    let mut pipeline_snapshot = PipelineSnapshot {
-        vs_fn: vs_handles.func,
-        ps_fn: ps_handles.func,
-        vdecl_hash,
-        stream_layouts: layouts,
-        color_format,
-        attach,
-        rs: render_state.pipeline_rs,
-        extra: extra_attachments,
-        ps_color_out_mask,
-        sample_count: enc.current_color_sample_count(),
-    };
-    if let Some(fetch) = &fetch {
-        pipeline_snapshot.stream_layouts = *fetch.layouts();
-        pipeline_snapshot.vdecl_hash = fetch.snapshot_vdecl_hash(vdecl_hash);
-    }
     if rt0_drop {
         pipeline_snapshot.remove_color_output();
     }
@@ -1435,6 +1449,13 @@ fn emit_draw_view(
     //    MTLBuffer lazily — the cache hits after the first draw post-rename
     //    and churns only when the game renames.
     let t_vbib = CycleAddTimer::start(enc.op_sub_detail_ptr(OpSubDetail::BVbib));
+    // The layouts per D3D9 stream, which a fetch keeps: the snapshot then
+    // holds them per Metal slot.
+    let layouts = fetch
+        .as_ref()
+        .map_or(&pipeline_snapshot.stream_layouts, |fetch| {
+            fetch.stream_layouts()
+        });
     match vertex_source {
         VertexView::Up { record, .. } => {
             let scratch_ptr = record.address;
@@ -1797,6 +1818,10 @@ fn emit_draw_view(
 /// The vertex fetch of a draw with a crossing attribute or a stream offset off four bytes.
 ///
 /// `crossing` names the streams that carry an attribute past their stride.
+/// `layouts` (built per D3D9 stream) and `vdecl_hash` are the draw's
+/// pipeline snapshot fields: a fetch replaces them with its layouts per Metal
+/// slot and its declaration identity, and keeps the per-stream layouts
+/// ([`CrossingFetch::stream_layouts`]).
 /// `None` when a crossing attribute cannot take a binding of its own (one
 /// wider than its stride, or an advanced offset Metal refuses): `layouts`
 /// then step each crossing stream by its extent, as a draw did before
@@ -1811,6 +1836,7 @@ fn crossing_fetch(
     vertex_source: &VertexView<'_>,
     attrs: &AttrSnapshot,
     layouts: &mut [StreamLayout; mtld3d_types::MAX_STREAMS as usize],
+    vdecl_hash: &mut u64,
     crossing: u16,
 ) -> Option<Box<CrossingFetch>> {
     let stream = |stream| match (vertex_source, vertex_source.feed(stream)) {
@@ -1844,6 +1870,8 @@ fn crossing_fetch(
                     "stream offset off a four-byte boundary: bound at the multiple of 4 below it, \
                      the remainder added to its attribute offsets");
             }
+            *layouts = *fetch.layouts();
+            *vdecl_hash = fetch.snapshot_vdecl_hash(*vdecl_hash);
             Some(fetch)
         }
         Err(error) => {

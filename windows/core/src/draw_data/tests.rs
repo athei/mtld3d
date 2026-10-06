@@ -184,7 +184,9 @@ fn stream_layouts_mark_the_streams_whose_stride_is_short_of_the_extent() {
     let snapshot = unsafe { AttrSnapshot::new(NonNull::from(&attrs[0]), NonNull::from(&header)) };
     let strides = [16, 0, 16];
     let mut crossing = 0;
-    let layouts = stream_layouts_with(
+    let mut layouts = [StreamLayout::UNUSED; 16];
+    stream_layouts_with(
+        &mut layouts,
         &snapshot,
         |stream, extent| StreamLayout {
             stride: layout_stride(strides[stream as usize], extent),
