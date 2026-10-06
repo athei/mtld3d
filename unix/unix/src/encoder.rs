@@ -8985,7 +8985,7 @@ fn encoder_thread_main(
     }
 }
 
-/// Run one frame inside the F12 GPU-capture bracket when it carries the marks.
+/// Run one frame inside the Ctrl+Shift+F12 GPU-capture bracket when it carries the marks.
 ///
 /// The capture must wrap the actual native submission, which `Async`
 /// runs on the submit thread, and the present buffer the presenter commits

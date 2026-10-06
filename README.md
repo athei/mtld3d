@@ -115,8 +115,12 @@ profiles and the reason for each setting they make.
 Every process writes `mtld3d-logs/<exe>-<pid>.log` next to the executable,
 never to the standard streams. `RUST_LOG` filters it: unset, everything logs
 at `info`, and `RUST_LOG=mtld3d=warn` quiets the whole project. The log
-targets, the levels and the F12 frame capture are described in
-[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#logging).
+targets, the levels and the Ctrl+Shift+F12 frame capture are described in
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#logging). The capture hotkey is
+a chord because a bare F12 is Steam's default screenshot key and Shift+F12
+opens the Metal HUD's configuration panel on macOS 27. It takes the Control
+key, not Command, and holding Command blocks it, since Wine's Mac driver
+reports Command as Alt.
 
 [`docs/GAMES.md`](docs/GAMES.md) lists the games tested so far and
 [how to report one](docs/GAMES.md#reporting-a-game) that fails. Each release

@@ -1,13 +1,13 @@
 //! Check a benchmark's declared frame against a frame a game dumped, to calibrate the scene.
 //!
-//! F12 in a game makes the layer log a few consecutive frames draw by draw
-//! (`[dump]` lines at info level: the frame's start and end, every bind,
-//! clear and copy, and one line per draw naming its render target, depth
-//! surface, shaders and textures). A benchmark that stands for that game
-//! writes the frame it builds as `shape` lines in its metrics file, one per
-//! pass. `bench-shape` reads the last complete dumped frame, splits it into
-//! passes along the main lines of the layer's own splits, and prints the two
-//! side by side.
+//! Ctrl+Shift+F12 in a game makes the layer log a few consecutive frames
+//! draw by draw (`[dump]` lines at info level: the frame's start and end,
+//! every bind, clear and copy, and one line per draw naming its render
+//! target, depth surface, shaders and textures). A benchmark that stands
+//! for that game writes the frame it builds as `shape` lines in its metrics
+//! file, one per pass. `bench-shape` reads the last complete dumped frame,
+//! splits it into passes along the main lines of the layer's own splits,
+//! and prints the two side by side.
 //!
 //! The splits modelled: a draw whose render target 0 or depth surface
 //! differs from the draw before it, and the first draw after a
@@ -427,8 +427,8 @@ pub fn parse_game_log(log: &str) -> Result<GameFrame, String> {
     let count = frames.len();
     let Some((body, end)) = frames.pop() else {
         return Err(
-            "no complete [dump] frame (a frame start followed by its frame end); press F12 in \
-             the game to dump one"
+            "no complete [dump] frame (a frame start followed by its frame end); press \
+             Ctrl+Shift+F12 in the game to dump one"
                 .to_owned(),
         );
     };

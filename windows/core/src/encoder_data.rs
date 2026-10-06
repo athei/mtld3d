@@ -969,14 +969,14 @@ bitflags::bitflags! {
         /// texture safe to read from the subsequent readback-blit command
         /// buffer.
         const NO_PRESENT = 1 << 1;
-        /// First frame of an F12 run: start the Metal GPU capture before it.
+        /// First frame of a Ctrl+Shift+F12 run: start the Metal GPU capture before it.
         ///
         /// Set by `frame_dump_present` on the frame it arms. The encoder
         /// drains the submit thread, starts the capture and runs every frame
         /// synchronously until `GPU_CAPTURE_STOP` so each `SubmitFrame`
         /// thunk falls inside the bracket.
         const GPU_CAPTURE_START = 1 << 2;
-        /// Last frame of an F12 run: stop the Metal GPU capture after it.
+        /// Last frame of a Ctrl+Shift+F12 run: stop the Metal GPU capture after it.
         ///
         /// A frame swap that does not present moves this bit onto the
         /// continuation, so the capture ends with the piece the closing

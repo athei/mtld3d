@@ -756,7 +756,7 @@ pub struct DeviceInner {
     snapshot_dirty: SnapshotDirty,
     /// Owned keys retained only for subsequent API-side dirty-state builders and dumps.
     snapshot_cache: ApiSnapshotCache,
-    /// The F12 draw-state dump, see `frame_dump`.
+    /// The Ctrl+Shift+F12 draw-state dump, see `frame_dump`.
     frame_dump: frame_dump::FrameDump,
     /// Cached `bound_texture_mask` from the most recent `STAGES` rebuild.
     ///
@@ -1744,10 +1744,10 @@ impl DeviceInner {
         if let Some(change) = self.pending_gamma.take() {
             frame.set_apply_gamma(Some(change));
         }
-        // An F12 run ends with the frame the closing `Present` submits. A
-        // mid-frame flush sends the marked frame out early, so its stop mark
-        // moves onto the continuation; the start mark stays with the first
-        // piece, and the encoder keeps capturing until it sees the stop.
+        // A Ctrl+Shift+F12 run ends with the frame the closing `Present`
+        // submits. A mid-frame flush sends the marked frame out early, so its
+        // stop mark moves onto the continuation; the start mark stays with the
+        // first piece, and the encoder keeps capturing until it sees the stop.
         if no_present {
             let carried = frame.take_carried_capture_marks(true);
             self.current_frame.mark_gpu_capture(carried);
@@ -2968,11 +2968,12 @@ impl DeviceInner {
     /// the retired textures; the caller decides which bindings the fresh
     /// frame gets back.
     pub fn reseed_current_frame(&mut self) {
-        // The replaced frame is dropped rather than submitted, so an F12 run
-        // in progress hands its marks to the fresh one: without that the
-        // encoder never sees the run's stop and the capture ends only with
-        // the process. Every reseed follows a flush, which already sent the
-        // start out with the piece it submitted, so this is the stop.
+        // The replaced frame is dropped rather than submitted, so a
+        // Ctrl+Shift+F12 run in progress hands its marks to the fresh one:
+        // without that the encoder never sees the run's stop and the capture
+        // ends only with the process. Every reseed follows a flush, which
+        // already sent the start out with the piece it submitted, so this is
+        // the stop.
         let carried = self.current_frame.take_carried_capture_marks(false);
         self.current_frame = self.fresh_frame();
         self.current_frame.mark_gpu_capture(carried);
