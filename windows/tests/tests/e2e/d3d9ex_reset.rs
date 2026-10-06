@@ -302,6 +302,41 @@ fn a_held_back_buffer_and_depth_surface_keep_the_old_surfaces_across_an_extended
 }
 
 #[test]
+fn a_window_resize_keeps_the_viewport_depth_range_on_an_extended_device_alone() {
+    for (factory, depth_range) in [
+        (Factory::Extended, (0.25f32, 0.75f32)),
+        (Factory::Plain, (0.0, 1.0)),
+    ] {
+        let h = Harness::create(&HarnessConfig {
+            factory,
+            ..HarnessConfig::default()
+        });
+        let viewport = D3DVIEWPORT9 {
+            x: 0,
+            y: 0,
+            width: 640,
+            height: 480,
+            min_z: 0.25,
+            max_z: 0.75,
+        };
+        assert_eq!(h.set_viewport(&viewport), D3D_OK);
+        mtld3d_tests::set_window_pos(h.hwnd(), 0, 0, 400, 300);
+        assert!(h.pump(), "WM_QUIT after the resize");
+        let after = h.viewport();
+        assert_eq!(
+            (after.width, after.height),
+            (400, 300),
+            "the viewport follows the window"
+        );
+        assert_eq!(
+            (after.min_z.to_bits(), after.max_z.to_bits()),
+            (depth_range.0.to_bits(), depth_range.1.to_bits()),
+            "the depth range after the resize"
+        );
+    }
+}
+
+#[test]
 fn an_open_scene_survives_an_extended_reset() {
     let h = extended(false);
     assert_eq!(h.begin_scene(), D3D_OK);

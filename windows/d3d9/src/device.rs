@@ -3213,13 +3213,20 @@ impl DeviceInner {
             .as_ref()
             .is_none_or(|(binding, _)| matches!(binding, RtBinding::Backbuffer { .. }));
         if back_buffer_made && rt0_is_back_buffer {
+            // An extended device keeps the viewport's depth range, as its
+            // `Reset` does; a plain one returns it to the default range.
+            let (min_z, max_z) = if self.is_extended() {
+                (self.viewport.min_z, self.viewport.max_z)
+            } else {
+                (0.0, 1.0)
+            };
             self.set_viewport(D3DVIEWPORT9 {
                 x: 0,
                 y: 0,
                 width: new_width,
                 height: new_height,
-                min_z: 0.0,
-                max_z: 1.0,
+                min_z,
+                max_z,
             });
             self.scissor_rect =
                 mtld3d_core::render_state::full_target_scissor(new_width, new_height);

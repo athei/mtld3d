@@ -342,9 +342,21 @@ fn the_extended_surface_creates_take_only_the_restriction_usages() {
         (D3DERR_INVALIDCALL, true),
         "even the implied usage"
     );
-    let (hr, _) =
+    let (hr, restricted) =
         h.create_render_target_ex((16, 16), D3DFMT_A8R8G8B8, none, D3DUSAGE_RESTRICTED_CONTENT);
     assert_eq!(hr, D3D_OK, "restricted content");
+    let (hr, desc) = restricted.expect("a surface").desc();
+    assert_eq!(hr, D3D_OK);
+    assert_eq!(
+        desc.usage,
+        D3DUSAGE_RENDERTARGET | D3DUSAGE_RESTRICTED_CONTENT,
+        "GetDesc reports the extended usage"
+    );
+    assert_eq!(
+        h.create_depth_stencil_surface_ex_slot(D3DUSAGE_DEPTHSTENCIL),
+        (D3DERR_INVALIDCALL, true),
+        "a refused usage leaves the out slot as it was"
+    );
     let (hr, _) = h.create_render_target_ex(
         (16, 16),
         D3DFMT_A8R8G8B8,

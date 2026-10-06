@@ -385,6 +385,36 @@ impl Harness {
         (hr, (!out.is_null()).then(|| Surface::from_raw(out)))
     }
 
+    /// `CreateDepthStencilSurfaceEx` with an out slot that starts on a sentinel.
+    ///
+    /// Returns the hr and whether a failing call left the slot as it was; a
+    /// surface a successful call hands out is released.
+    #[must_use]
+    pub fn create_depth_stencil_surface_ex_slot(&self, usage: u32) -> (i32, bool) {
+        let sentinel = core::ptr::without_provenance_mut::<c_void>(0xdead_beef);
+        let mut out = sentinel;
+        // SAFETY: extended vtable thunk; `out` is writable.
+        let hr = unsafe {
+            (self.dev_ex_vtbl().create_depth_stencil_surface_ex)(
+                self.device,
+                64,
+                64,
+                mtld3d_types::D3DFMT_D24S8,
+                0,
+                0,
+                1,
+                &raw mut out,
+                core::ptr::null_mut(),
+                usage,
+            )
+        };
+        if hr == 0 {
+            drop(Surface::from_raw(out));
+            return (hr, false);
+        }
+        (hr, out == sentinel)
+    }
+
     // ── pSharedHandle on the base creates ──
 
     /// `CreateTexture` with a `pSharedHandle`, returning the hr and the texture.

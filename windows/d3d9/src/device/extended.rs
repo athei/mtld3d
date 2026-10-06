@@ -22,7 +22,7 @@ use mtld3d_types::{
 use super::{
     D3D_OK, D3DERR_INVALIDCALL, Direct3DDevice9, LOG_TARGET, device_api_lock,
     device_create_depth_stencil_surface, device_create_offscreen_plain_surface,
-    device_create_render_target, device_timer, null_out, present_impl, reset_impl,
+    device_create_render_target, device_timer, present_impl, reset_impl,
 };
 
 /// `SetConvolutionMonoKernel`: the device offers no convolution filter, so the call is invalid.
@@ -218,6 +218,8 @@ pub extern "system" fn check_device_state(this: *mut c_void, _window: *mut c_voi
 }
 
 /// `CreateRenderTargetEx`: `CreateRenderTarget` with an extended usage.
+///
+/// A usage it refuses leaves the out slot as the caller passed it.
 pub extern "system" fn create_render_target_ex(
     this: *mut c_void,
     width: u32,
@@ -232,10 +234,9 @@ pub extern "system" fn create_render_target_ex(
 ) -> i32 {
     let _api = device_api_lock(this);
     if !usage_accepted(usage, shared_handle, "CreateRenderTargetEx") {
-        null_out(surface);
         return D3DERR_INVALIDCALL;
     }
-    device_create_render_target(
+    let hr = device_create_render_target(
         this,
         width,
         height,
@@ -245,7 +246,8 @@ pub extern "system" fn create_render_target_ex(
         lockable,
         surface,
         shared_handle,
-    )
+    );
+    report_usage(hr, surface, usage)
 }
 
 /// `CreateOffscreenPlainSurfaceEx`: `CreateOffscreenPlainSurface` with an extended usage.
@@ -261,10 +263,18 @@ pub extern "system" fn create_offscreen_plain_surface_ex(
 ) -> i32 {
     let _api = device_api_lock(this);
     if !usage_accepted(usage, shared_handle, "CreateOffscreenPlainSurfaceEx") {
-        null_out(surface);
         return D3DERR_INVALIDCALL;
     }
-    device_create_offscreen_plain_surface(this, width, height, format, pool, surface, shared_handle)
+    let hr = device_create_offscreen_plain_surface(
+        this,
+        width,
+        height,
+        format,
+        pool,
+        surface,
+        shared_handle,
+    );
+    report_usage(hr, surface, usage)
 }
 
 /// `CreateDepthStencilSurfaceEx`: `CreateDepthStencilSurface` with an extended usage.
@@ -282,10 +292,9 @@ pub extern "system" fn create_depth_stencil_surface_ex(
 ) -> i32 {
     let _api = device_api_lock(this);
     if !usage_accepted(usage, shared_handle, "CreateDepthStencilSurfaceEx") {
-        null_out(surface);
         return D3DERR_INVALIDCALL;
     }
-    device_create_depth_stencil_surface(
+    let hr = device_create_depth_stencil_surface(
         this,
         width,
         height,
@@ -295,7 +304,8 @@ pub extern "system" fn create_depth_stencil_surface_ex(
         discard,
         surface,
         shared_handle,
-    )
+    );
+    report_usage(hr, surface, usage)
 }
 
 /// `ResetEx`: `Reset` with a display mode, which must agree with the present parameters.
@@ -356,6 +366,28 @@ pub extern "system" fn get_display_mode_ex(
     // SAFETY: vtable out-params; `mode` and `rotation` are null or writable per
     // the IDirect3DDevice9Ex ABI.
     unsafe { crate::direct3d9::write_display_mode_ex(mode, rotation, &current) }
+}
+
+/// Add an extended create's usage to the surface it made, passing its `hr` through.
+///
+/// `GetDesc` reports the usage the extended create was given, on top of the
+/// one the base create implies.
+fn report_usage(hr: i32, surface: *mut *mut c_void, usage: u32) -> i32 {
+    if hr != D3D_OK || usage == 0 {
+        return hr;
+    }
+    // SAFETY: the create succeeded, so `surface` is the caller's writable out
+    // slot and holds the surface it handed out.
+    let Some(created) =
+        (unsafe { mtld3d_shared::ValueIn::<*mut c_void>::read_opt(surface.cast()) })
+    else {
+        return hr;
+    };
+    if !created.is_null() {
+        // SAFETY: `created` is the live surface the create just handed out.
+        unsafe { crate::surface::add_reported_usage(created, usage) };
+    }
+    hr
 }
 
 /// Whether an extended surface create's `usage` is one it accepts, warned once otherwise.

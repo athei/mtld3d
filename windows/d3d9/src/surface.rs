@@ -1793,6 +1793,27 @@ pub unsafe fn finalize_implicit_surface(ptr: u64) {
     unsafe { finalize_surface(surf) };
 }
 
+/// Add usage bits an extended create carries to what the surface at `ptr` reports.
+///
+/// A standalone surface keeps its own usage; an offscreen plain backed by a
+/// texture of its own reports that texture's.
+///
+/// # Safety
+/// `ptr` is a live surface wrapper a create just handed out.
+pub unsafe fn add_reported_usage(ptr: *mut c_void, usage: u32) {
+    // SAFETY: the caller's contract: a live surface wrapper, its inner live.
+    let inner = unsafe { &mut *(*ptr.cast::<Direct3DSurface9>()).inner };
+    if inner.parent_texture.is_null() {
+        inner.standalone_usage |= usage;
+    } else if inner.flags.contains(SurfaceFlags::OWNS_PARENT_TEXTURE) {
+        // SAFETY: an owned parent texture is live for as long as the surface.
+        unsafe { (*inner.parent_texture).inner_mut() }.add_reported_usage(usage);
+    } else {
+        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+            "add_reported_usage: a texture level reports its texture's usage; {usage:#x} not added");
+    }
+}
+
 /// Whether the application holds a public reference to the cached implicit surface at `ptr`.
 ///
 /// # Safety

@@ -539,6 +539,14 @@ impl TextureInner {
         self.d3d_usage
     }
 
+    /// Add usage bits an extended create carries to what this texture reports.
+    ///
+    /// The extended surface creates take content and sharing restrictions
+    /// that change nothing here; `GetDesc` reports them all the same.
+    pub const fn add_reported_usage(&mut self, usage: u32) {
+        self.d3d_usage |= usage;
+    }
+
     /// D3DFMT_* the texture was created with.
     ///
     /// The format the application declared, which is what a byte-layout
