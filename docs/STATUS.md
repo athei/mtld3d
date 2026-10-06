@@ -104,8 +104,9 @@ divergences from D3D9 it keeps on purpose. The tested games are in
   extended device refuses `D3DPOOL_MANAGED`, takes a `pSharedHandle` on a
   single-level system-memory texture or offscreen plain surface as user
   memory, reports `WHQLLevel` 1 and a `GetAvailableTextureMem` that does not
-  shrink, and takes the FLIPEX and OVERLAY swap effects and up to 30 back
-  buffers. Its `Reset` and `ResetEx` keep the device state, the default-pool
+  shrink, and accepts the FLIPEX and OVERLAY swap effects and up to 30 back
+  buffers: they pass validation, and the device presents through one back
+  buffer as it does for the other swap effects. Its `Reset` and `ResetEx` keep the device state, the default-pool
   resources and an open scene, rebind only the targets and the viewport
   extent, leave a back buffer or depth surface the application holds on the
   old surface, and change nothing when they refuse a request. `StretchRect`
@@ -193,7 +194,8 @@ unless its entry says otherwise.
 - D3D9Ex shared resources: a `pSharedHandle` on a default-pool create of an
   extended device answers `D3DERR_NOTAVAILABLE`, and `Caps2` leaves
   `CANSHARERESOURCE` off. The `D3DFMT_D32_LOCKABLE` and `D3DFMT_S8_LOCKABLE`
-  depth formats are refused on extended devices as on plain ones.
+  depth formats are refused on extended devices as on plain ones, as DXVK
+  refuses both on every device.
 - SM3 relative addressing of anything but the float constants: an input
   read through the loop counter (`v[aL]` in `ps_3_0` and `vs_3_0`) and a
   `vs_3_0` output written through it (`o[aL]`). A shader that writes
@@ -347,6 +349,12 @@ is in [`CONFORMANCE.md`](../unix/conformance/CONFORMANCE.md#kept-divergences).
   mode `CreateDeviceEx` and `ResetEx` take is checked against the back
   buffer but not used: a fullscreen device sets the mode its back buffer
   names. No knob.
+- A windowed device on a maximized window gets a back buffer of the
+  window's client rect, not the size it asked for, on either kind of
+  device: the window manager sizes a maximized window, as it does a
+  fullscreen one. Wine's tests make every window maximized, so the
+  `device.c/test_scissor_size` sites and 26 of the `d3d9ex.c` sites
+  read the window's size. No knob.
 - `GetRenderTargetData` from an X render target into a system-memory
   surface of its A counterpart (X8R8G8B8 into A8R8G8B8, X8B8G8R8 into
   A8B8G8R8, X1R5G5B5 into A1R5G5B5) copies the X padding into the alpha,

@@ -522,6 +522,18 @@ record. A knob, where one makes sense, is named with its default.
   disagrees with the request as D3D9Ex does, and both then set the mode the
   back buffer names, as `CreateDevice` and `Reset` do, so the mode's refresh
   rate and scanline ordering go unused. No knob.
+- **A maximized window's back buffer follows its client rect.** A windowed
+  device, plain or extended, on a `WS_MAXIMIZE` window gets a back buffer of
+  the window's client rect rather than the size it asked for: the window
+  manager sizes a maximized window, as it does a fullscreen one, and a back
+  buffer of another size would be scaled into it at every present. Wine's
+  tests create every window maximized, so a test that asks for a smaller back
+  buffer reads the window's size, and a probe at a fixed coordinate reads
+  another part of the frame. `device.c/test_scissor_size` carries the plain
+  sites, and 26 `d3d9ex.c` sites come from the same rule: `test_user_memory`
+  872, the ten of `test_reset`, the ten of `test_reset_ex`,
+  `test_backbuffer_resize` 3925/3926 and the three of `test_sysmem_draw`. No
+  knob.
 
 ## Range-fog coverage
 
@@ -788,10 +800,12 @@ re-checked before retagging. Current classifications, counted from the
 25 `ceiling`, 3 `flaky`, 0 `untriaged`, 215 unique sites in all.
 The audit recorded all 24 Apple-family subtest-legs `crash=0`.
 (2026-10-07: with D3D9Ex implemented the `d3d9ex` subtest creates its
-extended devices and runs every test, adding the same 67 sites, 66
-`expected` and 1 `caps`, on each of the six Apple-family legs, each stable
-over 20 runs per architecture with no crash. Its `@mac2` legs are recorded
-by the Intel dispatch.)
+extended devices and runs every test, adding the same 64 sites, 63
+`expected` and 1 `caps`, on each of the six Apple-family legs. The site set
+held over 20 isolated runs per architecture with no crash; that repeat ran on
+the native legs only, not the `+intel` caps legs. The `@mac2` `d3d9ex`
+sections are not recorded yet: they stay empty until the Intel CI dispatch
+records them.)
 (2026-10-05: test_wndproc 4302 moved from `expected` to `ceiling`, and
 4328/4329 joined it, pinned at one on the `i686` and `i686+intel` device
 legs; the cluster says why.)
@@ -1611,14 +1625,17 @@ blend (`0xdf0020` for `0xff0000`) in both the declaration and the FVF form
 
 `Direct3DCreate9Ex` hands out an extended interface, so every test of the
 subtest creates its extended device and runs to the end with no crash on
-both architectures. Three causes carry most of the sites. Every window
-`create_window` makes is `WS_MAXIMIZE`, and a maximized window's back buffer
-follows its client rect (the rule `device.c/test_scissor_size` explains), so
-a test that asked for a smaller back buffer reads the window's size, and a
-pixel probe at a fixed coordinate reads another part of the frame. The
-user-memory copy and the absence of occlusion status are kept divergences
-(see "Kept divergences"). The window and focus sites are the same decisions
-the `device.c` clusters record.
+both architectures. Three causes carry most of the sites, each a kept
+divergence (see "Kept divergences"). Every window `create_window` makes is
+`WS_MAXIMIZE`, and a maximized window's back buffer follows its client rect
+(the rule `device.c/test_scissor_size` explains), so a test that asked for a
+smaller back buffer reads the window's size, and a pixel probe at a fixed
+coordinate reads another part of the frame; 26 sites come from it. The
+user-memory copy and the absence of occlusion status are the other two. The
+window and focus sites are the same decisions the `device.c` clusters record.
+Leaving fullscreen follows the device's kind as the reference does: an
+extended device leaves the window at the fullscreen rect and gives it back
+the style it had, visibility included, so `test_window_style` passes.
 
 ### d3d9ex.c/test_user_memory
 Sites: 775=expected 806=expected 819=expected 842=expected 843=expected
@@ -1661,7 +1678,10 @@ Sites: 2039=expected 2046=expected 2049=expected 2051=expected 2153=expected
 Each expects `S_PRESENT_OCCLUDED` from `CheckDeviceState` or a present while
 another window is in front, where the device answers `D3D_OK`: no exclusive
 mode is taken and an occluded present costs nothing, so no occlusion status
-is reported. The `TestCooperativeLevel` and `Reset` assertions pass.
+is reported. 2039, 2046 and 2153 accept `D3D_OK` as a `broken()` answer, and
+`D3D_OK` is what the device gives, but `broken()` only holds on Windows, so a
+run under Wine counts it; 2049 and 2051 accept no `D3D_OK` at all. The
+`TestCooperativeLevel` and `Reset` assertions pass.
 
 ### d3d9ex.c/test_wndproc
 Sites: 2908=expected 2913=expected 2915=expected 2920=expected 2924=expected
@@ -1683,18 +1703,6 @@ Sites: 3421=expected 3425=expected 3432=expected
 As `device.c/test_wndproc_windowed`: 3349 and 3425 expect the focus window
 subclassed in fullscreen, and the other six the device window's procedure
 unchanged, which the cursor subclass changes on purpose.
-
-### d3d9ex.c/test_window_style
-Sites: 3555=expected 3560=expected 3579=expected
-
-An extended device's fullscreen leaves the device window's style alone and
-keeps the window at the monitor's rect after a windowed `Reset`, where a
-plain device's restyles the window and gives its rect back. One fullscreen
-path serves both kinds of device, the plain one `device.c/test_window_style`
-holds, and the extended differences are past the reference ceiling chosen
-for D3D9Ex (#789): 3555 reads the rect the window had before fullscreen, and
-3560 and 3579 read `WS_VISIBLE` on a window created hidden, which the
-fullscreen session showed.
 
 ### d3d9ex.c/test_backbuffer_resize
 Sites: 3925=expected 3926=expected
