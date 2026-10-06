@@ -64,6 +64,8 @@ use strum::EnumCount;
 #[cfg(perf_tracking)]
 use super::page_box::{PageBoxVolume, pagebox_volume};
 #[cfg(perf_tracking)]
+use super::page_box_pool::{PageBoxPool, PoolTraffic};
+#[cfg(perf_tracking)]
 use super::passes::{ColorLoad, DepthLoad};
 use super::{passes::Pass, snapshot::SnapshotSection};
 
@@ -1071,6 +1073,32 @@ struct FrameCounters {
     texture_pool_misses: u32,
     /// 1 when the frame ran its timers ([`FRAME_SAMPLE_PERIOD`]), 0 when it did not.
     timed: u32,
+    /// Padded bytes of the `PageBox`es `d3d9.dll` allocated since the previous drain.
+    ///
+    /// The `PageBox` counters are statics of each binary that links this
+    /// crate, so the encoder's summary in `mtld3d.so` reads only its own
+    /// runtime's; the game's allocations count in `d3d9.dll`'s and reach
+    /// the summary through these fields. Zero on a device's first drain,
+    /// which has no baseline.
+    pagebox_alloc_bytes: u64,
+    /// Padded bytes of the `PageBox`es `d3d9.dll` freed since the previous drain.
+    pagebox_free_bytes: u64,
+    /// Padded bytes behind `pool_recycled`.
+    pool_recycled_bytes: u64,
+    /// Padded bytes parked in `d3d9.dll`'s page-box pool at the drain, both lanes.
+    pool_parked_bytes: u64,
+    /// `PageBox` allocations `d3d9.dll` made since the previous drain, as `pagebox_alloc_bytes`.
+    pagebox_allocs: u32,
+    /// `PageBox` frees `d3d9.dll` made since the previous drain.
+    pagebox_frees: u32,
+    /// Subset of `pagebox_allocs` that missed snmalloc's per-thread cache.
+    pagebox_uncached_allocs: u32,
+    /// Retired VB/IB boxes `d3d9.dll`'s pool parked since the previous drain.
+    ///
+    /// Guest-owned backings retire on the API thread and park in the PE
+    /// pool; the encoder's own pool counts its parks in
+    /// `EncoderFrameCounters::pagebox_pool_recycled`.
+    pool_recycled: u32,
 }
 
 #[cfg(perf_tracking)]
@@ -1085,6 +1113,14 @@ impl FrameCounters {
     const fn new() -> Self {
         Self {
             timed: 0,
+            pagebox_alloc_bytes: 0,
+            pagebox_free_bytes: 0,
+            pool_recycled_bytes: 0,
+            pool_parked_bytes: 0,
+            pagebox_allocs: 0,
+            pagebox_frees: 0,
+            pagebox_uncached_allocs: 0,
+            pool_recycled: 0,
             texture_pool_hits: 0,
             texture_pool_misses: 0,
             reset_epoch: 0,
@@ -1186,8 +1222,9 @@ impl FrameTiming {
 
 /// Encoder-bumped per-frame counters that flow into the sample.
 ///
-/// Reset each `begin_frame` via `Default` (one move replaces the
-/// per-field zeroing). Running totals and the `per_pair_stats` map stay
+/// Reset each `begin_frame` by one move (`next_frame`), except what the
+/// submit thread and the barriers fold, which a sample clears once it has
+/// taken it. Running totals and the `per_pair_stats` map stay
 /// on `EncoderPerfState` because they persist across frames / are
 /// non-`Copy`.
 #[cfg(perf_tracking)]
@@ -1297,14 +1334,20 @@ struct EncoderFrameCounters {
     submit_cycles: u64,
     /// Presenter-thread `nextDrawable` (GPU + compositor) wait.
     ///
-    /// Measured on the unix side for the last present that completed and
-    /// folded back when the next payload returns. Lagged one present.
+    /// Measured on the unix side for the presents committed since the
+    /// previous present-bearing submission and folded back when the next
+    /// payload returns. Lagged one present. Each wait reaches one
+    /// submission, so the waits of a sample's submissions add; sticky like
+    /// `submit_exec_cycles`.
     drawable_wait_cycles: u64,
     /// Submit-thread total for `execute_submit`, folded back on payload return.
     ///
     /// Command-walk + the wait for the previous present + commit, incl.
     /// `present_wait_cycles`. `submit_exec - present_wait` is the
-    /// encode+commit CPU.
+    /// encode+commit CPU. Every submission folded before a sample adds to
+    /// it, and it is sticky like `snapshots`: a blocking flush drains the
+    /// previous async submission before its own `begin_frame`, and that
+    /// submission still reaches the flush's sample.
     submit_exec_cycles: u64,
     /// Encoder backpressure stall.
     ///
@@ -1317,13 +1360,14 @@ struct EncoderFrameCounters {
     /// The display's cadence seen from the submit thread: a present-bearing
     /// submit holds its render buffer until the present before it has a
     /// drawable and commits. Measured on the unix side, folded back with the
-    /// payload, lagged ≤1 frame under async; part of `submit_exec_cycles`.
+    /// payload, lagged ≤1 frame under async; part of `submit_exec_cycles`,
+    /// and added and sticky the same way.
     present_wait_cycles: u64,
     /// Submit-thread encode of the frame-leading blits, a child of `Encode+commit`.
     ///
-    /// Folded back and overwritten per returning payload like
-    /// `submit_exec_cycles`, so a frame's children and their parent always
-    /// come from the same submission.
+    /// Added per returning payload and sticky like `submit_exec_cycles`,
+    /// so a sample's children and their parent always come from the same
+    /// submissions.
     submit_blits_cycles: u64,
     /// Submit-thread replay of every pass descriptor, upload and draw; as `submit_blits_cycles`.
     submit_passes_cycles: u64,
@@ -1408,6 +1452,41 @@ impl EncoderFrameCounters {
             pagebox_pool_recycled_bytes: 0,
         }
     }
+
+    /// A fresh frame's counters, keeping what was folded since the last sample.
+    ///
+    /// Submissions return, and barriers run, between one sample and the
+    /// next `begin_frame`, so a per-frame reset of what they fold would
+    /// lose it: the submit thread's timings, the snapshots and the GPU time.
+    const fn next_frame(&self) -> Self {
+        Self {
+            drawable_wait_cycles: self.drawable_wait_cycles,
+            submit_exec_cycles: self.submit_exec_cycles,
+            present_wait_cycles: self.present_wait_cycles,
+            submit_blits_cycles: self.submit_blits_cycles,
+            submit_passes_cycles: self.submit_passes_cycles,
+            submit_commit_cycles: self.submit_commit_cycles,
+            gpu_cycles: self.gpu_cycles,
+            gpu_buffers: self.gpu_buffers,
+            snapshots: self.snapshots,
+            slot_waits: self.slot_waits,
+            ..Self::new()
+        }
+    }
+
+    /// Zero what [`Self::next_frame`] keeps, once a sample has taken it.
+    const fn clear_folded(&mut self) {
+        self.drawable_wait_cycles = 0;
+        self.submit_exec_cycles = 0;
+        self.present_wait_cycles = 0;
+        self.submit_blits_cycles = 0;
+        self.submit_passes_cycles = 0;
+        self.submit_commit_cycles = 0;
+        self.gpu_cycles = [0; CommandBufferRole::COUNT];
+        self.gpu_buffers = [0; CommandBufferRole::COUNT];
+        self.snapshots = 0;
+        self.slot_waits = 0;
+    }
 }
 
 /// Per-frame API-thread counters owned by [`ApiPerfStorage`].
@@ -1464,6 +1543,14 @@ pub struct ApiPerfState {
     /// and twice [`FRAME_SAMPLE_PERIOD`] less two, so a frame is timed one
     /// time in [`FRAME_SAMPLE_PERIOD`] on average and never on a fixed beat.
     untimed_frames: u8,
+    /// This runtime's cumulative `PageBox` and pool counters at the previous drain.
+    ///
+    /// `None` until the first drain, which has no baseline and carries zero.
+    pagebox_baseline: Option<(PageBoxVolume, PoolTraffic)>,
+    /// TSC at which this device last logged its runtime's `pagebox-pool cumulative` line.
+    ///
+    /// 0 before the first line.
+    pool_logged_tsc: u64,
 }
 
 #[cfg(perf_tracking)]
@@ -1494,6 +1581,8 @@ impl ApiPerfState {
             section_sample_state: 0x9e37_79b9,
             frame_sample_state: seed | 1,
             untimed_frames: 0,
+            pagebox_baseline: None,
+            pool_logged_tsc: 0,
         }
     }
 
@@ -1852,6 +1941,62 @@ impl ApiPerfState {
         self.counters.texture_pool_hits = self.counters.texture_pool_hits.saturating_add(hits);
         self.counters.texture_pool_misses =
             self.counters.texture_pool_misses.saturating_add(misses);
+    }
+
+    /// Carry this runtime's `PageBox` and pool traffic since the previous drain in the payload.
+    ///
+    /// Runs on the API thread after [`Self::drain_into_payload`], reading
+    /// the counters of the binary it is linked into and `pool`, the pool the
+    /// game's renames and staging recycle through; the encoder's summary
+    /// reports them beside its own runtime's. The encoder logs only its own
+    /// pool's cumulative line, so this logs `pool`'s on the summary's cadence.
+    /// `tsc_hz` is the device's published calibration, so the API thread
+    /// never pays the calibration sleep: no line is logged until it is
+    /// `Some`. Does nothing while the perf target is off.
+    pub fn drain_pagebox_traffic(
+        &mut self,
+        payload: &mut FramePerfPayload,
+        pool: &PageBoxPool,
+        tsc_hz: Option<u64>,
+    ) {
+        if !perf_enabled() {
+            return;
+        }
+        self.carry_pagebox_traffic(payload, pagebox_volume(), pool.buffer_traffic());
+        let Some(hz) = tsc_hz else {
+            return;
+        };
+        let now = rdtsc();
+        if self.pool_logged_tsc == 0
+            || now.saturating_sub(self.pool_logged_tsc) >= hz.saturating_mul(SUMMARY_INTERVAL_SECS)
+        {
+            pool.log_diagnostics("d3d9");
+            self.pool_logged_tsc = now;
+        }
+    }
+
+    /// Write the delta of two cumulative snapshots into the payload, keeping `volume` and `pool`.
+    fn carry_pagebox_traffic(
+        &mut self,
+        payload: &mut FramePerfPayload,
+        volume: PageBoxVolume,
+        pool: PoolTraffic,
+    ) {
+        let counters = &mut payload.counters;
+        counters.pool_parked_bytes = pool.parked_bytes;
+        if let Some((prev_volume, prev_pool)) = &self.pagebox_baseline {
+            let frame = volume.delta(prev_volume);
+            let count = |n: u64| u32::try_from(n).unwrap_or(u32::MAX);
+            counters.pagebox_allocs = count(frame.allocs);
+            counters.pagebox_alloc_bytes = frame.alloc_bytes;
+            counters.pagebox_frees = count(frame.frees);
+            counters.pagebox_free_bytes = frame.free_bytes;
+            counters.pagebox_uncached_allocs = count(frame.uncached_allocs);
+            counters.pool_recycled = count(pool.recycled.saturating_sub(prev_pool.recycled));
+            counters.pool_recycled_bytes =
+                pool.recycled_bytes.saturating_sub(prev_pool.recycled_bytes);
+        }
+        self.pagebox_baseline = Some((volume, pool));
     }
 
     /// Drain this frame's API-thread counters into the outgoing payload, then zero self.
@@ -2232,9 +2377,10 @@ pub struct EncoderPerfState {
     timing: FrameTiming,
     /// Encoder-bumped per-frame counters (see [`EncoderFrameCounters`]).
     ///
-    /// Reset wholesale each `begin_frame`; `drawable_wait` / `submit_exec`
-    /// are folded back from the submit thread *after* that reset (so a
-    /// frame with nothing returned yet reports 0 rather than stale data).
+    /// Reset each `begin_frame` but for what the submit thread folds back
+    /// (`drawable_wait`, `submit_exec` and its split, the GPU time, the
+    /// snapshots), which accumulates until a sample takes it and clears it,
+    /// whenever the submission returned.
     enc: EncoderFrameCounters,
 
     per_pair_stats: FxHashMap<(u32, u32, PairShaderId, PairShaderId), PerPairStats>,
@@ -2319,34 +2465,19 @@ impl EncoderPerfState {
 
     /// Seed per-frame encoder counters from the incoming payload.
     ///
-    /// Resets every per-frame encoder-side counter. Live totals
+    /// Resets every per-frame encoder-side counter but what the submit
+    /// thread folded back since the last sample. Live totals
     /// (`vbib_retained_bytes`, `tex_staging_retained_bytes`) persist.
     pub fn begin_frame(&mut self, payload: &FramePerfPayload) {
         // Seed the API-thread counters + payload timing wholesale.
         self.counters = payload.counters;
         self.timing = payload.timing;
         self.frame_timed = self.counters.timed != 0;
-        // Reset every encoder-bumped per-frame counter in one move.
-        // `drawable_wait_cycles` / `submit_exec_cycles` live in `enc` and are
-        // folded back from the submit thread when a payload returns (after
-        // this reset, in `drain_returned_payloads`); zeroing them here means a
-        // frame with nothing returned yet reports 0 rather than stale data.
-        // `snapshots` is the one counter that carries over: it is bumped by
-        // the barriers between the last summary and this reset.
-        let snapshots = self.enc.snapshots;
-        let slot_waits = self.enc.slot_waits;
-        let gpu_cycles = self.enc.gpu_cycles;
-        let gpu_buffers = self.enc.gpu_buffers;
-        self.enc = EncoderFrameCounters::default();
-        self.enc.snapshots = snapshots;
-        self.enc.slot_waits = slot_waits;
-        self.enc.gpu_cycles = gpu_cycles;
-        self.enc.gpu_buffers = gpu_buffers;
-        let gpu = core::mem::take(&mut self.submit_nanos.gpu);
-        self.submit_nanos = deferred::SubmitNanos {
-            gpu,
-            ..deferred::SubmitNanos::default()
-        };
+        // A submission can return between the last sample and this reset: a
+        // blocking flush drains the async submit before its own frame
+        // begins. What it folded stays for this frame's sample, which clears
+        // it; `submit_nanos` is taken by the sample the same way.
+        self.enc = self.enc.next_frame();
         self.per_pair_stats.clear();
     }
 
@@ -2478,42 +2609,49 @@ impl EncoderPerfState {
         &raw mut self.enc.submit_cycles
     }
 
-    pub fn set_submit_wait_nanos(&mut self, drawable: u64, present: u64) {
+    /// Fold one submission's waits: both add to what the sample holds.
+    ///
+    /// The drawable wait is what the presenter committed since the previous
+    /// present-bearing submission, so no wait reaches two submissions.
+    pub fn add_submit_wait_nanos(&mut self, drawable: u64, present: u64) {
         if self.clocked.is_some() {
-            self.submit_nanos.drawable = drawable;
-            self.submit_nanos.present = present;
+            self.submit_nanos.drawable = self.submit_nanos.drawable.saturating_add(drawable);
+            self.submit_nanos.present = self.submit_nanos.present.saturating_add(present);
         } else {
-            self.set_drawable_wait_cycles(ns_to_cycles(drawable));
-            self.set_present_wait_cycles(ns_to_cycles(present));
+            self.enc.drawable_wait_cycles = self
+                .enc
+                .drawable_wait_cycles
+                .saturating_add(ns_to_cycles(drawable));
+            self.enc.present_wait_cycles = self
+                .enc
+                .present_wait_cycles
+                .saturating_add(ns_to_cycles(present));
         }
-    }
-
-    pub const fn set_drawable_wait_cycles(&mut self, cycles: u64) {
-        self.enc.drawable_wait_cycles = cycles;
     }
 
     pub const fn add_submit_stall_cycles(&mut self, cycles: u64) {
         self.enc.submit_stall_cycles = self.enc.submit_stall_cycles.saturating_add(cycles);
     }
 
-    pub const fn set_present_wait_cycles(&mut self, cycles: u64) {
-        self.enc.present_wait_cycles = cycles;
-    }
-
-    /// Fold one `SubmitFrame`: its execute and encode split overwrite, its GPU time adds.
+    /// Fold one `SubmitFrame`: its execute, its encode split and its GPU time all add.
     ///
     /// `submit_exec_cycles` is the caller's own measure of the thunk, taken
-    /// on whichever thread ran it; setting it here with the children keeps
-    /// `Encode+commit` and its split from the same submission, whether that
-    /// was an async payload or a synchronous submit behind a barrier. The
-    /// unix side measures nanoseconds, since its counter is not ours, so its
+    /// on whichever thread ran it; adding it here with the children keeps
+    /// `Encode+commit` and its split from the same submissions, whether
+    /// those were async payloads or a synchronous submit behind a barrier,
+    /// and a sample that two submissions fold into reports both. The unix
+    /// side measures nanoseconds, since its counter is not ours, so its
     /// values convert into our cycles here.
     pub fn fold_submit_timings(&mut self, timings: &SubmitTimings, submit_exec_cycles: u64) {
-        self.enc.submit_exec_cycles = submit_exec_cycles;
+        self.enc.submit_exec_cycles = self
+            .enc
+            .submit_exec_cycles
+            .saturating_add(submit_exec_cycles);
         if self.clocked.is_some() {
-            self.submit_nanos.blits = timings.leading_blits_ns;
-            self.submit_nanos.passes = timings.passes_ns;
-            self.submit_nanos.commit = timings.commit_ns;
+            let nanos = &mut self.submit_nanos;
+            nanos.blits = nanos.blits.saturating_add(timings.leading_blits_ns);
+            nanos.passes = nanos.passes.saturating_add(timings.passes_ns);
+            nanos.commit = nanos.commit.saturating_add(timings.commit_ns);
             for ((ns, buffers), busy) in self
                 .submit_nanos
                 .gpu
@@ -2526,9 +2664,16 @@ impl EncoderPerfState {
             }
             return;
         }
-        self.enc.submit_blits_cycles = ns_to_cycles(timings.leading_blits_ns);
-        self.enc.submit_passes_cycles = ns_to_cycles(timings.passes_ns);
-        self.enc.submit_commit_cycles = ns_to_cycles(timings.commit_ns);
+        let enc = &mut self.enc;
+        enc.submit_blits_cycles = enc
+            .submit_blits_cycles
+            .saturating_add(ns_to_cycles(timings.leading_blits_ns));
+        enc.submit_passes_cycles = enc
+            .submit_passes_cycles
+            .saturating_add(ns_to_cycles(timings.passes_ns));
+        enc.submit_commit_cycles = enc
+            .submit_commit_cycles
+            .saturating_add(ns_to_cycles(timings.commit_ns));
         let sums = self
             .enc
             .gpu_cycles
@@ -2612,6 +2757,12 @@ impl EncoderPerfState {
         self.tex_staging_retained_bytes = self.tex_staging_retained_bytes.saturating_sub(bytes);
     }
 
+    /// Bytes of blit-source staging the encoder's queue holds, the `blit source staging` gauge.
+    #[must_use]
+    pub const fn tex_staging_retained_bytes(&self) -> usize {
+        self.tex_staging_retained_bytes
+    }
+
     pub const fn bump_texture_destroy(&mut self) {
         self.enc.texture_destroys = self.enc.texture_destroys.saturating_add(1);
     }
@@ -2679,42 +2830,18 @@ impl EncoderPerfState {
         entry.cull_mode = cull_mode;
     }
 
-    /// Accumulate this frame into the rolling 2-second window.
-    ///
-    /// Once the window has spanned `SUMMARY_INTERVAL_SECS`, emit the
-    /// averaged `info!` summary on `mtld3d::perf`. The per-pass breakdown,
-    /// the `present_texture=…` audit line, and the per-RT pair dump are
-    /// emitted on the separate `mtld3d::d3d9::passes=trace` switch — they
-    /// are pass / workload shape, not perf metrics.
+    /// Build this frame's sample and clear what the submit thread folded into it.
     ///
     /// # Panics
     ///
-    /// Panics if pass / command counts exceed `u32::MAX`. Unreachable —
-    /// real frames cap at a few thousand passes.
-    pub fn log_frame_summary(
+    /// Panics if pass / command counts exceed `u32::MAX`.
+    fn take_sample(
         &mut self,
         caches: &CacheSizes,
         passes: &[Pass],
-        ctx: &FrameSummaryContext,
         submit_status: i32,
         cmd_vec_realloc_bytes: u64,
-        task_faults: Option<TaskFaults>,
-    ) {
-        // `mtld3d::perf=debug` gates both the averaged summary and the
-        // per-call ApiTimer / CycleSet / CycleAdd cycle accounting —
-        // both read from the latched `perf_enabled()` flag so this
-        // per-frame check is a single Relaxed load. The pass /
-        // present-texture / per-pair detail is gated independently on
-        // `mtld3d::d3d9::passes=trace` via the cached
-        // `pair_stats_enabled` flag.
-        let want_stats = perf_enabled();
-        let want_passes = pair_stats_enabled();
-        if !want_stats && !want_passes {
-            return;
-        }
-        let set_pipeline = CommandType::SetRenderPipelineState as u32;
-        let set_frag_tex = CommandType::SetFragmentTexture as u32;
-
+    ) -> FrameSample {
         let mut total_draws: u32 = 0;
         let mut total_commands: u32 = 0;
         for p in passes {
@@ -2740,9 +2867,11 @@ impl EncoderPerfState {
         let outside_d3d9 = self.timing.frame_total_cycles.saturating_sub(api_total);
         let api_work_cyc = api_total.saturating_sub(self.timing.present_block_cycles);
 
-        // Per-frame PageBox allocator traffic: delta of the process-wide
+        // Per-frame PageBox allocator traffic: delta of this runtime's
         // cumulative counters against the previous frame's snapshot. The
-        // first sampled frame has no baseline and reports zero.
+        // first sampled frame has no baseline and reports zero. What
+        // `d3d9.dll` counted rides in `counters`, and the window keeps it
+        // apart.
         let pagebox = pagebox_volume();
         let pagebox_frame = if self.prev_pagebox_volume.is_zero() {
             PageBoxVolume::new()
@@ -2784,11 +2913,49 @@ impl EncoderPerfState {
             enc_cyc: enc_cycles,
             submit_status,
         };
-        // Sampled: the barriers that bump them run before the next reset.
-        self.enc.snapshots = 0;
-        self.enc.slot_waits = 0;
-        self.enc.gpu_cycles = [0; CommandBufferRole::COUNT];
-        self.enc.gpu_buffers = [0; CommandBufferRole::COUNT];
+        // Sampled: what the submit thread and the barriers fold lands before
+        // the next reset, so only the sample clears it.
+        self.enc.clear_folded();
+        sample
+    }
+
+    /// Accumulate this frame into the rolling 2-second window.
+    ///
+    /// Once the window has spanned `SUMMARY_INTERVAL_SECS`, emit the
+    /// averaged `info!` summary on `mtld3d::perf`. The per-pass breakdown,
+    /// the `present_texture=…` audit line, and the per-RT pair dump are
+    /// emitted on the separate `mtld3d::d3d9::passes=trace` switch; they
+    /// are pass / workload shape, not perf metrics.
+    ///
+    /// # Panics
+    ///
+    /// Panics if pass / command counts exceed `u32::MAX`. Unreachable:
+    /// real frames cap at a few thousand passes.
+    pub fn log_frame_summary(
+        &mut self,
+        caches: &CacheSizes,
+        passes: &[Pass],
+        ctx: &FrameSummaryContext,
+        submit_status: i32,
+        cmd_vec_realloc_bytes: u64,
+        task_faults: Option<TaskFaults>,
+    ) {
+        // `mtld3d::perf=debug` gates both the averaged summary and the
+        // per-call ApiTimer / CycleSet / CycleAdd cycle accounting;
+        // both read from the latched `perf_enabled()` flag so this
+        // per-frame check is a single Relaxed load. The pass /
+        // present-texture / per-pair detail is gated independently on
+        // `mtld3d::d3d9::passes=trace` via the cached
+        // `pair_stats_enabled` flag.
+        let want_stats = perf_enabled();
+        let want_passes = pair_stats_enabled();
+        if !want_stats && !want_passes {
+            return;
+        }
+        let set_pipeline = CommandType::SetRenderPipelineState as u32;
+        let set_frag_tex = CommandType::SetFragmentTexture as u32;
+
+        let sample = self.take_sample(caches, passes, submit_status, cmd_vec_realloc_bytes);
         if let Some(clocked) = &mut self.clocked {
             clocked.push(deferred::PendingSample {
                 sample,
@@ -2973,7 +3140,7 @@ impl EncoderPerfState {
     #[inline]
     pub const fn begin_frame(&mut self, _payload: &FramePerfPayload) {}
     #[inline]
-    pub const fn set_submit_wait_nanos(&mut self, _drawable: u64, _present: u64) {}
+    pub const fn add_submit_wait_nanos(&mut self, _drawable: u64, _present: u64) {}
     #[inline]
     pub const fn finish_deferred(&mut self) {}
 
@@ -3012,11 +3179,7 @@ impl EncoderPerfState {
         core::ptr::null_mut()
     }
     #[inline]
-    pub const fn set_drawable_wait_cycles(&mut self, _cycles: u64) {}
-    #[inline]
     pub const fn add_submit_stall_cycles(&mut self, _cycles: u64) {}
-    #[inline]
-    pub const fn set_present_wait_cycles(&mut self, _cycles: u64) {}
     #[inline]
     pub const fn fold_submit_timings(&mut self, _timings: &SubmitTimings, _submit_exec: u64) {}
     #[inline]
@@ -3123,11 +3286,12 @@ struct FrameSample {
     /// allocations are excluded, and in-place growth still counts the old
     /// capacity. A warmed pool drives this to zero for stable workloads.
     cmd_vec_realloc_bytes: u64,
-    /// This frame's `PageBox` allocations reaching the global allocator.
+    /// This frame's `PageBox` allocations reaching this runtime's global allocator.
     ///
-    /// Delta of the cumulative `page_box.rs` counters between two
-    /// consecutive `log_frame_summary` calls. Includes every producer on
-    /// every thread, not just the Lock-rename path.
+    /// Delta of the cumulative `page_box.rs` counters of the binary the
+    /// summary runs in between two consecutive `log_frame_summary` calls.
+    /// Includes every producer on every thread of that runtime; the delta
+    /// `d3d9.dll` carried is in `counters`.
     pagebox_allocs: u64,
     pagebox_alloc_bytes: u64,
     /// This frame's `PageBox` frees returning to the global allocator.
@@ -3138,7 +3302,7 @@ struct FrameSample {
     /// Each one costs a commit on the way in and a decommit on the way
     /// out; see `page_box::bypasses_local_cache`.
     pagebox_uncached_allocs: u64,
-    /// Padded bytes parked in the recycle pool at frame end (from `CacheSizes`).
+    /// Padded bytes parked in the encoder's recycle pool at frame end (from `CacheSizes`).
     pagebox_pool_bytes: u64,
 
     // ── Derived this frame from the counters above ──
@@ -3431,6 +3595,23 @@ struct PerfWindow {
     pagebox_pool_recycled_bytes: Stat,
     /// Parked pool bytes at frame end: averaged over frames, plus peak.
     pagebox_pool_bytes: Stat,
+    /// `d3d9.dll`'s twins of the eight `pagebox` stats above, carried in the payload.
+    ///
+    /// Kept apart so the `perf-kv` keys of the encoder's runtime keep their
+    /// meaning and these get keys of their own (`pe_pagebox_*`); the grid
+    /// rows show the two runtimes together.
+    pe_pagebox_allocs: Stat,
+    pe_pagebox_alloc_bytes: Stat,
+    pe_pagebox_frees: Stat,
+    pe_pagebox_free_bytes: Stat,
+    pe_pagebox_uncached_allocs: Stat,
+    pe_pagebox_pool_recycled: Stat,
+    pe_pagebox_pool_recycled_bytes: Stat,
+    pe_pagebox_pool_bytes: Stat,
+    /// Both runtimes' uncached allocations per frame, for the grid's peak.
+    pagebox_uncached_both: Stat,
+    /// Both runtimes' parked pool bytes per frame, for the grid's average and peak.
+    pagebox_pool_bytes_both: Stat,
     /// Peak only: `device_sub_by[Frame] − present_block`, the non-stall Frame sub-bucket.
     ///
     /// Present body, `Clear`, `Begin/EndScene`, `ColorFill`.
@@ -3673,6 +3854,24 @@ impl PerfWindow {
         self.pagebox_pool_recycled_bytes
             .add(s.enc.pagebox_pool_recycled_bytes);
         self.pagebox_pool_bytes.add(s.pagebox_pool_bytes);
+        let pe = &s.counters;
+        self.pe_pagebox_allocs.add(u64::from(pe.pagebox_allocs));
+        self.pe_pagebox_alloc_bytes.add(pe.pagebox_alloc_bytes);
+        self.pe_pagebox_frees.add(u64::from(pe.pagebox_frees));
+        self.pe_pagebox_free_bytes.add(pe.pagebox_free_bytes);
+        self.pe_pagebox_uncached_allocs
+            .add(u64::from(pe.pagebox_uncached_allocs));
+        self.pe_pagebox_pool_recycled
+            .add(u64::from(pe.pool_recycled));
+        self.pe_pagebox_pool_recycled_bytes
+            .add(pe.pool_recycled_bytes);
+        self.pe_pagebox_pool_bytes.add(pe.pool_parked_bytes);
+        self.pagebox_uncached_both.add(
+            s.pagebox_uncached_allocs
+                .saturating_add(u64::from(pe.pagebox_uncached_allocs)),
+        );
+        self.pagebox_pool_bytes_both
+            .add(s.pagebox_pool_bytes.saturating_add(pe.pool_parked_bytes));
 
         // Derived peaks (no window sum): each is a per-frame quantity, so
         // peak-of-difference ≠ difference-of-peaks — compute per frame.
@@ -5587,20 +5786,22 @@ impl<'a> Summary<'a> {
         } else {
             0.0
         };
-        let recycled_kb = u64_to_f64_exact(w.pagebox_pool_recycled_bytes.sum) / 1024.0;
+        // Both runtimes' pools: the encoder's own and the one `d3d9.dll`
+        // retires guest backings into.
+        let recycled = w.pagebox_pool_recycled.sum + w.pe_pagebox_pool_recycled.sum;
+        let recycled_bytes =
+            w.pagebox_pool_recycled_bytes.sum + w.pe_pagebox_pool_recycled_bytes.sum;
+        let recycled_kb = u64_to_f64_exact(recycled_bytes) / 1024.0;
         let (recycled_fmt, _) = format_kb_pair(recycled_kb, recycled_kb);
         self.res_row(
             out,
             "pool",
             &format!("hit={pool_hits} miss={pool_misses} ({pool_hit_pct:.1}%)"),
-            Some(&format!(
-                "recycled={r}  {recycled_fmt}",
-                r = w.pagebox_pool_recycled.sum,
-            )),
-            "API pops a warm same-size PageBox; encoder parks retired ones (memory.pageboxPoolCapMB, 0 = off)",
+            Some(&format!("recycled={recycled}  {recycled_fmt}")),
+            "API pops a warm same-size PageBox; both runtimes park retired ones (memory.pageboxPoolCapMB, 0 = off)",
         );
-        let parked_avg_kb = u64_to_f64_exact(w.pagebox_pool_bytes.sum) / f / 1024.0;
-        let parked_peak_kb = u64_to_f64_exact(w.pagebox_pool_bytes.max) / 1024.0;
+        let parked_avg_kb = u64_to_f64_exact(w.pagebox_pool_bytes_both.sum) / f / 1024.0;
+        let parked_peak_kb = u64_to_f64_exact(w.pagebox_pool_bytes_both.max) / 1024.0;
         let (parked_avg_fmt, parked_peak_fmt) = format_kb_pair(parked_avg_kb, parked_peak_kb);
         self.res_row(
             out,
@@ -6080,15 +6281,20 @@ impl<'a> Summary<'a> {
         // PageBox traffic that actually reached the global allocator this
         // window. Fresh pages fault on first touch under Wine, so a large
         // steady-state number here is the churn signal this row exists for.
-        let pb_alloc_kb = u64_to_f64_exact(w.pagebox_alloc_bytes.sum) / 1024.0;
-        let pb_free_kb = u64_to_f64_exact(w.pagebox_free_bytes.sum) / 1024.0;
+        // Both runtimes: the encoder's own and what `d3d9.dll` carried.
+        let pb_allocs = w.pagebox_allocs.sum + w.pe_pagebox_allocs.sum;
+        let pb_frees = w.pagebox_frees.sum + w.pe_pagebox_frees.sum;
+        let pb_alloc_kb =
+            u64_to_f64_exact(w.pagebox_alloc_bytes.sum + w.pe_pagebox_alloc_bytes.sum) / 1024.0;
+        let pb_free_kb =
+            u64_to_f64_exact(w.pagebox_free_bytes.sum + w.pe_pagebox_free_bytes.sum) / 1024.0;
         let (pb_alloc_fmt, pb_free_fmt) = format_kb_pair(pb_alloc_kb, pb_free_kb);
         self.res_row(
             out,
             "pagebox",
-            &format!("alloc={a}  {pb_alloc_fmt}", a = w.pagebox_allocs.sum),
-            Some(&format!("free={fr}  {pb_free_fmt}", fr = w.pagebox_frees.sum)),
-            "window totals of PageBox allocs/frees reaching the global allocator (fresh pages fault on first touch)",
+            &format!("alloc={pb_allocs}  {pb_alloc_fmt}"),
+            Some(&format!("free={pb_frees}  {pb_free_fmt}")),
+            "window totals of PageBox allocs/frees reaching either runtime's allocator (fresh pages fault on first touch)",
         );
         // The subset snmalloc cannot cache: over 1 MiB rounds up to a
         // chunk at or past its 2 MiB per-thread budget, so each of these
@@ -6096,9 +6302,9 @@ impl<'a> Summary<'a> {
         // out. Pool hits never reach the allocator, so what is left here
         // comes from the unpooled producers (texture staging, surface
         // locks, blit padding).
-        let uncached = w.pagebox_uncached_allocs.sum;
-        let uncached_pct = if w.pagebox_allocs.sum > 0 {
-            u64_to_f64_exact(uncached) / u64_to_f64_exact(w.pagebox_allocs.sum) * 100.0
+        let uncached = w.pagebox_uncached_allocs.sum + w.pe_pagebox_uncached_allocs.sum;
+        let uncached_pct = if pb_allocs > 0 {
+            u64_to_f64_exact(uncached) / u64_to_f64_exact(pb_allocs) * 100.0
         } else {
             0.0
         };
@@ -6106,7 +6312,7 @@ impl<'a> Summary<'a> {
             out,
             "  uncached",
             &format!("{uncached} ({uncached_pct:.1}%)"),
-            Some(&format!("peak {p}/frame", p = w.pagebox_uncached_allocs.max)),
+            Some(&format!("peak {p}/frame", p = w.pagebox_uncached_both.max)),
             "allocs over 1 MiB: past snmalloc's per-thread budget, so commit in / decommit out every time",
         );
         // Process-wide fault delta, sampled once per window via the
@@ -6464,6 +6670,12 @@ fn render_kv(w: &PerfWindow, c: &PerfWindow, caches: &CacheSizes, window_secs: f
         c.pagebox_pool_recycled_bytes.sum,
     );
     kv.bytes("pagebox_pool_parked", c.pagebox_pool_bytes.max);
+    kv.total("pe_pagebox_pool_recycled", c.pe_pagebox_pool_recycled.sum);
+    kv.total(
+        "pe_pagebox_pool_recycled_bytes",
+        c.pe_pagebox_pool_recycled_bytes.sum,
+    );
+    kv.bytes("pe_pagebox_pool_parked", c.pe_pagebox_pool_bytes.max);
 
     // Resources (textures).
     kv.total("tex_rename", c.texture_renames.sum);
@@ -6535,6 +6747,11 @@ fn render_kv(w: &PerfWindow, c: &PerfWindow, caches: &CacheSizes, window_secs: f
     kv.total("pagebox_free", c.pagebox_frees.sum);
     kv.total("pagebox_free_bytes", c.pagebox_free_bytes.sum);
     kv.total("pagebox_uncached", c.pagebox_uncached_allocs.sum);
+    kv.total("pe_pagebox_alloc", c.pe_pagebox_allocs.sum);
+    kv.total("pe_pagebox_alloc_bytes", c.pe_pagebox_alloc_bytes.sum);
+    kv.total("pe_pagebox_free", c.pe_pagebox_frees.sum);
+    kv.total("pe_pagebox_free_bytes", c.pe_pagebox_free_bytes.sum);
+    kv.total("pe_pagebox_uncached", c.pe_pagebox_uncached_allocs.sum);
     if let Some(faults) = &c.faults_window {
         kv.total("faults_minor", faults.minor);
         kv.total("faults_major", faults.major);
@@ -6565,7 +6782,7 @@ const _: () = {
 
 #[cfg(perf_tracking)]
 const _: () = {
-    assert!(size_of::<FrameCounters>() == 928);
+    assert!(size_of::<FrameCounters>() == 976);
     assert!(align_of::<FrameCounters>() == 8);
     assert!(core::mem::offset_of!(FrameCounters, reset_epoch) == 0);
     assert!(core::mem::offset_of!(FrameCounters, inverse_view) == 8);
@@ -6616,14 +6833,22 @@ const _: () = {
     assert!(core::mem::offset_of!(FrameCounters, texture_pool_hits) == 916);
     assert!(core::mem::offset_of!(FrameCounters, texture_pool_misses) == 920);
     assert!(core::mem::offset_of!(FrameCounters, timed) == 924);
+    assert!(core::mem::offset_of!(FrameCounters, pagebox_alloc_bytes) == 928);
+    assert!(core::mem::offset_of!(FrameCounters, pagebox_free_bytes) == 936);
+    assert!(core::mem::offset_of!(FrameCounters, pool_recycled_bytes) == 944);
+    assert!(core::mem::offset_of!(FrameCounters, pool_parked_bytes) == 952);
+    assert!(core::mem::offset_of!(FrameCounters, pagebox_allocs) == 960);
+    assert!(core::mem::offset_of!(FrameCounters, pagebox_frees) == 964);
+    assert!(core::mem::offset_of!(FrameCounters, pagebox_uncached_allocs) == 968);
+    assert!(core::mem::offset_of!(FrameCounters, pool_recycled) == 972);
     assert!(size_of::<FrameTiming>() == 32);
     assert!(align_of::<FrameTiming>() == 8);
     assert!(core::mem::offset_of!(FrameTiming, present_block_cycles) == 0);
     assert!(core::mem::offset_of!(FrameTiming, frame_total_cycles) == 8);
     assert!(core::mem::offset_of!(FrameTiming, op_vec_capacity_bytes) == 16);
     assert!(core::mem::offset_of!(FrameTiming, op_vec_realloc_bytes) == 24);
-    assert!(size_of::<FramePerfPayload>() == 960);
+    assert!(size_of::<FramePerfPayload>() == 1008);
     assert!(align_of::<FramePerfPayload>() == 8);
     assert!(core::mem::offset_of!(FramePerfPayload, counters) == 0);
-    assert!(core::mem::offset_of!(FramePerfPayload, timing) == 928);
+    assert!(core::mem::offset_of!(FramePerfPayload, timing) == 976);
 };

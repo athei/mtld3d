@@ -58,6 +58,11 @@ impl SourceClock {
         Arc::as_ptr(&self.clock) as u64
     }
 
+    /// The calibrated frequency once the worker has published it; `None` while pending or failed.
+    pub(super) fn hz(&self) -> Option<u64> {
+        self.clock.get().ok().flatten()
+    }
+
     /// Wait for the calibration worker to end, then let its handle go.
     ///
     /// Polls `is_finished` rather than calling `JoinHandle::join`: Wine can

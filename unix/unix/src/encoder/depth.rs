@@ -138,8 +138,8 @@ impl FrameEncoder {
         if !ordered {
             self.flags.insert(FrameEncoderFlags::BLIT_CMDS_NEED_ENCODER);
         }
-        self.current_blit_retention
-            .push(PageBoxRead::new(std::sync::Arc::clone(
+        self.blit_retention
+            .hold(PageBoxRead::new(std::sync::Arc::clone(
                 job.staging().backing(),
             )));
         self.perf.bump_texture_blit_upload();

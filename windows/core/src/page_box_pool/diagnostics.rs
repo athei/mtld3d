@@ -20,6 +20,8 @@ pub enum Recycle {
 pub struct Diagnostics {
     acquire: [u64; 4],
     recycle: [u64; 4],
+    /// Padded bytes behind the `Parked` recycles.
+    parked_bytes: u64,
     oversize_bytes: u64,
     largest_oversize: usize,
 }
@@ -30,6 +32,7 @@ impl Diagnostics {
         Self {
             acquire: [0; 4],
             recycle: [0; 4],
+            parked_bytes: 0,
             oversize_bytes: 0,
             largest_oversize: 0,
         }
@@ -44,9 +47,18 @@ impl Diagnostics {
         *count = count.saturating_add(1);
     }
 
-    pub const fn recycle(&mut self, outcome: Recycle) {
+    pub const fn recycle(&mut self, outcome: Recycle, padded_len: usize) {
+        if matches!(outcome, Recycle::Parked) {
+            self.parked_bytes = self.parked_bytes.saturating_add(padded_len as u64);
+        }
         let count = &mut self.recycle[outcome as usize];
         *count = count.saturating_add(1);
+    }
+
+    /// The boxes this lane parked and their padded bytes, both since the pool was made.
+    #[must_use]
+    pub const fn parked(&self) -> (u64, u64) {
+        (self.recycle[Recycle::Parked as usize], self.parked_bytes)
     }
 
     #[must_use]
