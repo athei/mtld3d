@@ -47,19 +47,3 @@ pub const E_OUTOFMEMORY: i32 = 0x8007_000e_u32.cast_signed();
 
 /// `D3DERR_DEVICELOST`: native device work failed and rendering cannot continue.
 pub const D3DERR_DEVICELOST: i32 = 0x8876_0868_u32.cast_signed();
-
-/// `D3DERR_DEVICEREMOVED`: the adapter was removed. `MAKE_D3DHRESULT(2160)`.
-pub const D3DERR_DEVICEREMOVED: i32 = 0x8876_0870_u32.cast_signed();
-
-/// `D3DERR_DEVICEHUNG`: the device stopped responding. `MAKE_D3DHRESULT(2164)`.
-pub const D3DERR_DEVICEHUNG: i32 = 0x8876_0874_u32.cast_signed();
-
-/// `S_PRESENT_MODE_CHANGED`, a success code an extended present can answer with.
-///
-/// It says the display mode changed under the device. `MAKE_D3DSTATUS(2167)`.
-pub const S_PRESENT_MODE_CHANGED: i32 = 0x0876_0877;
-
-/// `S_PRESENT_OCCLUDED`, a success code an extended present can answer with.
-///
-/// It says the window is covered and the frame was not shown. `MAKE_D3DSTATUS(2168)`.
-pub const S_PRESENT_OCCLUDED: i32 = 0x0876_0878;

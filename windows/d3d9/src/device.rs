@@ -3118,7 +3118,16 @@ impl DeviceInner {
     /// Give the window back. No-op unless the device is fullscreen.
     pub fn leave_fullscreen(&mut self, reason: &mtld3d_core::fullscreen_log::LeaveReason) {
         if let Some(saved) = self.fullscreen.take() {
-            crate::fullscreen::leave(&saved, reason);
+            crate::fullscreen::leave(&saved, self.leave_kind(), reason);
+        }
+    }
+
+    /// How leaving fullscreen puts this device's window back.
+    pub const fn leave_kind(&self) -> crate::fullscreen::LeaveKind {
+        if self.is_extended() {
+            crate::fullscreen::LeaveKind::Extended
+        } else {
+            crate::fullscreen::LeaveKind::Plain
         }
     }
 
@@ -3319,6 +3328,12 @@ impl DeviceInner {
         }
         true
     }
+}
+
+/// The implicit surfaces an extended device's `Reset` finds the application holding.
+struct HeldImplicitSurfaces {
+    back_buffer: Option<crate::surface::HeldSurface>,
+    depth: Option<crate::surface::HeldSurface>,
 }
 
 // ── IDirect3DDevice9 COM object ──
@@ -3824,6 +3839,53 @@ impl DeviceInner {
         self.implicit_swapchain as *mut crate::swapchain::Direct3DSwapChain9
     }
 
+    /// Capture the implicit surfaces the application holds, for an extended device's `Reset`.
+    ///
+    /// Empty on a plain device, whose `Reset` refuses while the application
+    /// holds either. Taken before the `Reset` adopts its new back-buffer size,
+    /// multisample configuration or auto depth-stencil format, so each
+    /// capture describes the surface the application holds.
+    fn hold_implicit_surfaces(&self) -> HeldImplicitSurfaces {
+        if !self.is_extended() {
+            return HeldImplicitSurfaces {
+                back_buffer: None,
+                depth: None,
+            };
+        }
+        HeldImplicitSurfaces {
+            // SAFETY: the field is 0 or the device's live cached implicit surface.
+            back_buffer: unsafe {
+                crate::surface::hold_implicit_surface(self.implicit_render_target)
+            },
+            // SAFETY: as above.
+            depth: unsafe { crate::surface::hold_implicit_surface(self.implicit_depth_stencil) },
+        }
+    }
+
+    /// Detach the held implicit surfaces `held` names, for an extended device's `Reset`.
+    ///
+    /// Each becomes a standalone surface that keeps the textures it names,
+    /// and the device forgets both the surface and its own handles to those
+    /// textures, so nothing it destroys or recreates afterwards reaches them
+    /// and the next `GetBackBuffer` or `GetDepthStencilSurface` hands out a
+    /// new object.
+    fn detach_held_implicit_surfaces(&mut self, held: HeldImplicitSurfaces) {
+        if let Some(back_buffer) = held.back_buffer {
+            // SAFETY: captured from the live, held cached back buffer, which
+            // the device forgets together with its handles just below.
+            unsafe { crate::surface::detach_implicit_surface(&back_buffer) };
+            self.implicit_render_target = 0;
+            self.set_backbuffer_handle(MetalHandle::NULL, MetalHandle::NULL);
+            self.set_backbuffer_msaa_handle(MetalHandle::NULL, MetalHandle::NULL);
+        }
+        if let Some(depth) = held.depth {
+            // SAFETY: as above, for the cached depth surface.
+            unsafe { crate::surface::detach_implicit_surface(&depth) };
+            self.implicit_depth_stencil = 0;
+            self.set_depth_stencil_handle(MetalHandle::NULL);
+        }
+    }
+
     /// Get-or-create the device-owned implicit render target == backbuffer surface.
     ///
     /// Cached as a `u64`. `GetRenderTarget(0)`, `GetBackBuffer(0)` and
@@ -3831,47 +3893,6 @@ impl DeviceInner {
     /// object (the `pRenderTarget == pBackBuffer` identity the suite
     /// checks). Its container is the implicit swapchain. Created at
     /// refcount 0.
-    /// Whether an implicit surface of this device is referenced by the application.
-    pub fn holds_implicit_surfaces(&self) -> bool {
-        // SAFETY: each field is 0 or the device's live cached implicit surface.
-        let back_buffer =
-            unsafe { crate::surface::implicit_surface_is_held(self.implicit_render_target) };
-        // SAFETY: as above.
-        let depth =
-            unsafe { crate::surface::implicit_surface_is_held(self.implicit_depth_stencil) };
-        back_buffer || depth
-    }
-
-    /// Detach the implicit surfaces the application holds, for an extended device's `Reset`.
-    ///
-    /// Each held one becomes a standalone surface that keeps the texture it
-    /// names, and the device forgets it, so the next `GetBackBuffer` or
-    /// `GetDepthStencilSurface` hands out a new object. Returns whether the
-    /// back buffer and the depth surface were detached; the caller must not
-    /// destroy a detached surface's textures. A plain device detaches nothing:
-    /// its `Reset` refuses while the application holds either.
-    fn detach_held_implicit_surfaces(&mut self) -> (bool, bool) {
-        if !self.is_extended() {
-            return (false, false);
-        }
-        let mut detached = (false, false);
-        // SAFETY: the field is 0 or the device's live cached implicit surface.
-        if unsafe { crate::surface::implicit_surface_is_held(self.implicit_render_target) } {
-            // SAFETY: a live, held cached implicit surface, forgotten just below.
-            unsafe { crate::surface::detach_implicit_surface(self.implicit_render_target) };
-            self.implicit_render_target = 0;
-            detached.0 = true;
-        }
-        // SAFETY: as above.
-        if unsafe { crate::surface::implicit_surface_is_held(self.implicit_depth_stencil) } {
-            // SAFETY: as above.
-            unsafe { crate::surface::detach_implicit_surface(self.implicit_depth_stencil) };
-            self.implicit_depth_stencil = 0;
-            detached.1 = !self.depth_stencil_handle.is_null();
-        }
-        detached
-    }
-
     pub fn get_or_create_implicit_render_target(
         &mut self,
     ) -> *mut crate::surface::Direct3DSurface9 {
@@ -3943,19 +3964,6 @@ impl DeviceInner {
 
 // ── IUnknown implementation (IDirect3DDevice9) ──
 
-/// Hold the device's API lock for the thunk; a no-op unless the app asked for `MULTITHREADED`.
-///
-/// Every `IDirect3DDevice9` entry point binds this as its first statement,
-/// ahead of its `ApiTimer`, so the timer's drop runs under the lock and a
-/// wait for the lock counts as API time, which is what the app pays. The
-/// shell is leaked at teardown and its inner is not, so a refcount of zero
-/// means there is no inner to read: a `Release` past zero, like a null
-/// `this`, gets the no-op guard. A texture reaches the lock through the
-/// pointer it carries instead ([`crate::com_ref::ComChild::enter_api_lock`]),
-/// because a managed one can be called while the device is in its final
-/// `Release` or gone. The unflagged fast path is a null test, a refcount
-/// load, one pointer chase and a discriminant test.
-#[inline]
 /// Whether the device a child resource records as its `DeviceInner` is extended.
 ///
 /// # Safety
@@ -4074,6 +4082,19 @@ fn copy_user_memory(
     }
 }
 
+/// Hold the device's API lock for the thunk; a no-op unless the app asked for `MULTITHREADED`.
+///
+/// Every `IDirect3DDevice9` entry point binds this as its first statement,
+/// ahead of its `ApiTimer`, so the timer's drop runs under the lock and a
+/// wait for the lock counts as API time, which is what the app pays. The
+/// shell is leaked at teardown and its inner is not, so a refcount of zero
+/// means there is no inner to read: a `Release` past zero, like a null
+/// `this`, gets the no-op guard. A texture reaches the lock through the
+/// pointer it carries instead ([`crate::com_ref::ComChild::enter_api_lock`]),
+/// because a managed one can be called while the device is in its final
+/// `Release` or gone. The unflagged fast path is a null test, a refcount
+/// load, one pointer chase and a discriminant test.
+#[inline]
 pub fn device_api_lock(this: *mut c_void) -> ApiGuard {
     // SAFETY: vtable thunk; `this` is *mut Direct3DDevice9 per IDirect3DDevice9 ABI.
     let Some(obj) = (unsafe { InPtr::<Direct3DDevice9>::opt(this) }) else {
@@ -4616,8 +4637,9 @@ extern "system" fn device_test_cooperative_level(this: *mut c_void) -> i32 {
     {
         return hr;
     }
-    // A rejected `Reset` on an extended device leaves it as it was, so there
-    // only a back buffer the layer could not rebuild reports DEVICENOTRESET.
+    // An extended device is never left owing a `Reset` by a rejected one, so
+    // on it DEVICENOTRESET only reports a back buffer the layer could not
+    // rebuild.
     let not_reset = object.is_some_and(|obj| obj.inner().needs_reset());
     if not_reset {
         mtld3d_types::D3DERR_DEVICENOTRESET
@@ -5067,6 +5089,9 @@ fn reset_impl(this: *mut c_void, present_params: *mut c_void) -> i32 {
     pp_in.back_buffer_count = pp.back_buffer_count;
     pp_in.back_buffer_format = pp.back_buffer_format;
 
+    // Captured before the configuration below changes what the held
+    // surfaces resolve to.
+    let held = dev.hold_implicit_surfaces();
     let multi_sample_changed = new_sample_count != dev.backbuffer_sample_count;
     dev.set_backbuffer_multi_sample(
         pp.multi_sample_type,
@@ -5083,7 +5108,8 @@ fn reset_impl(this: *mut c_void, present_params: *mut c_void) -> i32 {
         || pp.back_buffer_height != dev.backbuffer_height
         || multi_sample_changed
         || dev.backbuffer_handle.is_null()
-        || (extended && dev.holds_implicit_surfaces());
+        || held.back_buffer.is_some()
+        || held.depth.is_some();
     // Reset adopts the present params' auto depth-stencil configuration: an
     // enabled flag (re)creates the implicit depth-stencil at the given format,
     // a disabled flag drops it. This is independent of a resize, so resolve the
@@ -5117,7 +5143,7 @@ fn reset_impl(this: *mut c_void, present_params: *mut c_void) -> i32 {
         // reset_recreate_resources rebuilds the depth from depth_stencil_format,
         // so adopt the new auto-DS format before it runs.
         dev.depth_stencil_format = new_depth_format;
-        if let Err(hr) = reset_recreate_resources(dev, &pp) {
+        if let Err(hr) = reset_recreate_resources(dev, &pp, held) {
             log_failed_reset(
                 recovering,
                 old_size,
@@ -5273,11 +5299,13 @@ fn log_failed_reset(
     );
 }
 
-/// Fail a well-formed `Reset` with the device state at its defaults.
+/// Answer a rejected `Reset`: on a plain device, with the device state at its defaults.
 ///
-/// D3D9 resets the device state before it checks what can make a `Reset`
-/// fail, so a rejected one still releases every binding and returns every
-/// state to its default, leaving what a successful `Reset` leaves: render
+/// An extended device answers `D3DERR_INVALIDCALL` and changes nothing: it
+/// keeps its state, bindings, scene and frame, and owes no `Reset`. On a
+/// plain device D3D9 resets the device state before it checks what can make a
+/// `Reset` fail, so a rejected one still releases every binding and returns
+/// every state to its default, leaving what a successful `Reset` leaves: render
 /// target 0 on the back buffer, the depth stencil on the implicit surface,
 /// no recording and no open scene. The frame in flight is delivered first,
 /// as a same-size `Reset` does, and [`fail_reset`] replaces it, so the
@@ -5336,7 +5364,7 @@ fn resolve_reset_window_mode(
         && (pp.back_buffer_width == 0 || pp.back_buffer_height == 0)
         && let Some(saved) = dev.fullscreen.as_ref()
     {
-        let accepted = crate::fullscreen::try_leave(saved, || {
+        let accepted = crate::fullscreen::try_leave(saved, dev.leave_kind(), || {
             crate::direct3d9::resolve_backbuffer_dims(target as u64, pp);
             pp.back_buffer_width != 0 && pp.back_buffer_height != 0
         });
@@ -5455,6 +5483,7 @@ fn retarget_device_window(
 fn reset_recreate_resources(
     dev: &mut DeviceInner,
     pp: &mtld3d_types::D3DPRESENT_PARAMETERS,
+    held: HeldImplicitSurfaces,
 ) -> Result<(), i32> {
     // 1. Drain any ops the API thread queued onto current_frame after the
     //    last Present — same pattern as device_release. The encoder's
@@ -5468,20 +5497,15 @@ fn reset_recreate_resources(
     //    retention queue, which is where every other texture's handle-keyed
     //    records are pruned. A held implicit surface of an extended device
     //    takes its textures over instead, and they stay.
-    let (kept_back_buffer, kept_depth) = dev.detach_held_implicit_surfaces();
-    let old_back_buffer = [
+    dev.detach_held_implicit_surfaces(held);
+    let old_handles: [u64; 5] = [
         dev.backbuffer_handle.raw(),
         dev.backbuffer_srgb_handle.raw(),
         dev.backbuffer_msaa_handle.raw(),
         dev.backbuffer_msaa_srgb_handle.raw(),
+        dev.depth_stencil_handle.raw(),
     ];
-    let live: Vec<u64> = old_back_buffer
-        .iter()
-        .copied()
-        .filter(|_| !kept_back_buffer)
-        .chain(core::iter::once(dev.depth_stencil_handle.raw()).filter(|_| !kept_depth))
-        .filter(|&h| h != 0)
-        .collect();
+    let live: Vec<u64> = old_handles.iter().copied().filter(|&h| h != 0).collect();
     dev.encoder_reset(&live)?;
     if !live.is_empty() {
         let mut destroy = mtld3d_shared::DestroyResourcesBulkParams {
@@ -5493,9 +5517,6 @@ fn reset_recreate_resources(
         };
         unix_call(&mut destroy);
     }
-    // The detached surfaces own the old textures now; the device's fields
-    // are overwritten by the recreate below, or nulled on its failure.
-
     // 3. Adopt the new dimensions. Done before CreateBackbuffer so the
     //    new textures are sized correctly and downstream readers
     //    (viewport defaults, GetBackBuffer, fresh_frame) all see the

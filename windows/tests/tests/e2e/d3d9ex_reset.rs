@@ -11,12 +11,18 @@
 //! size and contents, with the device as its container. A rejected `Reset`
 //! or `ResetEx` changes nothing and leaves no `Reset` owed, and `ResetEx`
 //! names a display mode of the back buffer's size exactly when fullscreen.
+//! Leaving fullscreen leaves the window where fullscreen put it and gives it
+//! back the style, visibility included, it had before.
 
-use mtld3d_tests::{Factory, Harness, HarnessConfig, Texture, TexturedVertex, assert_pixel_eq};
+use mtld3d_tests::{
+    Factory, Harness, HarnessConfig, Texture, TexturedVertex, WS_VISIBLE, WindowStyle,
+    assert_pixel_eq, enumerate_display_sizes,
+};
 use mtld3d_types::{
-    D3D_OK, D3DDISPLAYMODEEX, D3DERR_INVALIDCALL, D3DERR_NOTFOUND, D3DFMT_A8R8G8B8, D3DFMT_D24S8,
-    D3DFMT_X8R8G8B8, D3DFVF_DIFFUSE, D3DFVF_TEX1, D3DFVF_XYZ, D3DLOCK_READONLY, D3DPOOL_DEFAULT,
-    D3DPOOL_SYSTEMMEM, D3DPT_TRIANGLELIST, D3DRECT, D3DRS_LIGHTING, D3DSAMP_MAGFILTER,
+    D3D_OK, D3DDISPLAYMODEEX, D3DDISPLAYMODEEX_SIZE, D3DERR_INVALIDCALL, D3DERR_NOTFOUND,
+    D3DFMT_A8R8G8B8, D3DFMT_D16, D3DFMT_D24S8, D3DFMT_X8R8G8B8, D3DFVF_DIFFUSE, D3DFVF_TEX1,
+    D3DFVF_XYZ, D3DLOCK_READONLY, D3DMULTISAMPLE_4_SAMPLES, D3DPOOL_DEFAULT, D3DPOOL_SYSTEMMEM,
+    D3DPRESENT_PARAMETERS, D3DPT_TRIANGLELIST, D3DRECT, D3DRS_LIGHTING, D3DSAMP_MAGFILTER,
     D3DSAMP_MINFILTER, D3DSBT_ALL, D3DTEXF_POINT, D3DUSAGE_RENDERTARGET, D3DVIEWPORT9,
     E_NOINTERFACE, IID_IDIRECT3DDEVICE9, IID_IDIRECT3DSWAPCHAIN9,
 };
@@ -349,29 +355,47 @@ fn an_open_scene_survives_an_extended_reset() {
 #[test]
 fn an_extended_reset_unbinds_targets_one_to_three_and_restores_the_depth_surface() {
     let h = extended(true);
-    let extra = h.create_render_target(64, 64, D3DFMT_A8R8G8B8);
-    assert_eq!(h.set_render_target(1, &extra), D3D_OK);
+    let extras = [1, 2, 3].map(|_| h.create_render_target(64, 64, D3DFMT_A8R8G8B8));
+    for (slot, extra) in (1..).zip(&extras) {
+        assert_eq!(
+            h.set_render_target(slot, extra),
+            D3D_OK,
+            "bind render target {slot}"
+        );
+    }
     let own = h.create_render_target(64, 64, D3DFMT_A8R8G8B8);
     assert_eq!(h.set_render_target(0, &own), D3D_OK);
-    assert_eq!(h.clear_depth_stencil_surface(), D3D_OK);
+    let own_depth = h.create_depth_stencil_surface(64, 64, D3DFMT_D24S8);
+    assert_eq!(h.set_depth_stencil_surface(&own_depth), D3D_OK);
 
     assert_eq!(h.reset(320, 240), D3D_OK);
-    let (hr, slot1) = h.render_target_hr(1);
-    assert_eq!(
-        (hr, slot1.is_none()),
-        (D3DERR_NOTFOUND, true),
-        "render target 1 is unbound"
-    );
+    for slot in 1..4 {
+        let (hr, bound) = h.render_target_hr(slot);
+        assert_eq!(
+            (hr, bound.is_none()),
+            (D3DERR_NOTFOUND, true),
+            "render target {slot} is unbound"
+        );
+    }
     assert_eq!(
         h.render_target(0).as_ptr(),
         h.back_buffer(0).as_ptr(),
         "render target 0 is the back buffer"
     );
     let (hr, depth) = h.depth_stencil_surface_hr();
+    assert_eq!(hr, D3D_OK);
+    let depth = depth.expect("the implicit depth surface is bound");
+    assert_ne!(
+        depth.as_ptr(),
+        own_depth.as_ptr(),
+        "not the application's own"
+    );
+    let (hr, desc) = depth.desc();
+    assert_eq!(hr, D3D_OK);
     assert_eq!(
-        (hr, depth.is_some()),
-        (D3D_OK, true),
-        "the implicit depth surface is bound"
+        (desc.format, desc.width, desc.height),
+        (D3DFMT_D24S8, 320, 240),
+        "the auto depth-stencil at the new size"
     );
     drop(depth);
 
@@ -387,6 +411,63 @@ fn an_extended_reset_unbinds_targets_one_to_three_and_restores_the_depth_surface
     );
 }
 
+/// Hold the implicit depth surface across a `ResetEx` that `change` makes; check what it reports.
+fn assert_held_depth_keeps_its_own_desc(
+    what: &str,
+    change: impl FnOnce(&mut D3DPRESENT_PARAMETERS),
+) {
+    let h = extended(true);
+    let (hr, held) = h.depth_stencil_surface_hr();
+    assert_eq!(hr, D3D_OK);
+    let held = held.expect("the implicit depth surface");
+    let mut pp = h.windowed_present_params(320, 240);
+    change(&mut pp);
+    assert_eq!(h.reset_ex(&mut pp, None), D3D_OK, "ResetEx to {what}");
+    let (hr, desc) = held.desc();
+    assert_eq!(hr, D3D_OK);
+    assert_eq!(
+        (desc.format, desc.multi_sample_type, desc.width, desc.height),
+        (D3DFMT_D24S8, 0, 640, 480),
+        "the held depth surface after a Reset to {what}"
+    );
+    let (hr, container, _) = held.get_container(&IID_IDIRECT3DDEVICE9);
+    assert_eq!(
+        (hr, container),
+        (D3D_OK, h.device()),
+        "its container is the device"
+    );
+}
+
+#[test]
+fn a_held_depth_surface_keeps_its_own_format_samples_and_size_across_an_extended_reset() {
+    assert_held_depth_keeps_its_own_desc("another auto depth-stencil format", |pp| {
+        pp.auto_depth_stencil_format = D3DFMT_D16;
+    });
+    assert_held_depth_keeps_its_own_desc("multisampling", |pp| {
+        pp.multi_sample_type = D3DMULTISAMPLE_4_SAMPLES;
+    });
+    assert_held_depth_keeps_its_own_desc("no auto depth-stencil", |pp| {
+        pp.enable_auto_depth_stencil = 0;
+        pp.auto_depth_stencil_format = 0;
+    });
+}
+
+#[test]
+fn a_recording_state_block_survives_an_extended_reset() {
+    let h = extended(false);
+    assert_eq!(h.begin_state_block(), D3D_OK);
+    assert_eq!(h.reset(320, 240), D3D_OK);
+    assert_eq!(h.set_render_state(D3DRS_LIGHTING, 0), D3D_OK);
+    let block = h.end_state_block();
+    assert_eq!(h.set_render_state(D3DRS_LIGHTING, 1), D3D_OK);
+    assert_eq!(block.apply(), D3D_OK);
+    assert_eq!(
+        h.render_state(D3DRS_LIGHTING),
+        0,
+        "the block recorded across the Reset"
+    );
+}
+
 #[test]
 fn reset_ex_names_a_mode_exactly_when_fullscreen_and_a_refusal_changes_nothing() {
     let h = extended(false);
@@ -394,7 +475,7 @@ fn reset_ex_names_a_mode_exactly_when_fullscreen_and_a_refusal_changes_nothing()
     assert_eq!(h.begin_scene(), D3D_OK);
     let (width, height) = h.dims();
     let mode = D3DDISPLAYMODEEX {
-        size: 24,
+        size: D3DDISPLAYMODEEX_SIZE,
         width,
         height,
         refresh_rate: 0,
@@ -473,4 +554,44 @@ fn a_rejected_extended_reset_leaves_the_device_working_and_its_state_untouched()
     );
     assert_eq!(h.end_scene(), D3D_OK, "and the open scene");
     assert_pixel_eq(sample_center(&h, &texture), RED, "the device draws on");
+}
+
+#[test]
+fn leaving_fullscreen_keeps_the_window_where_it_is_and_gives_back_its_visibility() {
+    if !enumerate_display_sizes().contains(&(640, 480)) {
+        return;
+    }
+    let h = Harness::create(&HarnessConfig {
+        factory: Factory::Extended,
+        window_style: WindowStyle::Framed,
+        ..HarnessConfig::default()
+    });
+    // Held before the first read of the window's geometry, so no other test's
+    // mode-set falls between the reads this test compares.
+    h.hold_display_mode();
+    let windowed_style = h.window_style();
+    assert_eq!(windowed_style & WS_VISIBLE, 0, "starts hidden");
+
+    let mut pp = h.windowed_present_params(640, 480);
+    pp.windowed = 0;
+    pp.device_window = h.hwnd();
+    assert_eq!(h.reset_params(&mut pp), D3D_OK, "fullscreen Reset");
+    let fullscreen_rect = h.window_rect();
+    assert_ne!(
+        h.window_style() & WS_VISIBLE,
+        0,
+        "fullscreen shows the window"
+    );
+
+    assert_eq!(h.reset(640, 480), D3D_OK, "windowed Reset");
+    assert_eq!(
+        h.window_rect(),
+        fullscreen_rect,
+        "the window keeps the fullscreen rect"
+    );
+    assert_eq!(
+        h.window_style(),
+        windowed_style,
+        "the window gets its own style back, hidden as it was"
+    );
 }

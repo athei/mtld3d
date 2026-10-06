@@ -13,5 +13,18 @@ use core::ffi::c_void;
 #[cfg_attr(target_arch = "x86_64", link(name = "d3d9", kind = "raw-dylib"))]
 unsafe extern "system" {
     pub fn Direct3DCreate9(sdk_version: u32) -> *mut c_void;
-    pub fn Direct3DCreate9Ex(sdk_version: u32, out: *mut *mut c_void) -> i32;
+}
+
+/// `Direct3DCreate9Ex`, resolved by name from the loaded `d3d9.dll`; `None` without the export.
+pub fn direct3d_create9_ex() -> Option<unsafe extern "system" fn(u32, *mut *mut c_void) -> i32> {
+    let address = crate::win32::d3d9_export(c"Direct3DCreate9Ex");
+    if address.is_null() {
+        return None;
+    }
+    // SAFETY: the export has the documented `Direct3DCreate9Ex` signature.
+    Some(unsafe {
+        core::mem::transmute::<*mut c_void, unsafe extern "system" fn(u32, *mut *mut c_void) -> i32>(
+            address,
+        )
+    })
 }

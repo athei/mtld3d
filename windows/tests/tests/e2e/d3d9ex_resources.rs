@@ -22,12 +22,12 @@ use mtld3d_tests::{
 };
 use mtld3d_types::{
     D3D_OK, D3DERR_INVALIDCALL, D3DERR_NOTAVAILABLE, D3DFMT_A8R8G8B8, D3DFMT_ATI2, D3DFMT_D24S8,
-    D3DFMT_DXT1, D3DFMT_INDEX16, D3DFMT_L8, D3DFMT_X8R8G8B8, D3DFVF_DIFFUSE, D3DFVF_TEX1,
-    D3DFVF_XYZ, D3DLOCK_READONLY, D3DPOOL_DEFAULT, D3DPOOL_MANAGED, D3DPOOL_SCRATCH,
-    D3DPOOL_SYSTEMMEM, D3DPT_TRIANGLELIST, D3DRS_LIGHTING, D3DSAMP_MAGFILTER, D3DSAMP_MINFILTER,
-    D3DSWAPEFFECT_FLIPEX, D3DTEXF_NONE, D3DTEXF_POINT, D3DUSAGE_DEPTHSTENCIL,
-    D3DUSAGE_RENDERTARGET, D3DUSAGE_RESTRICT_SHARED_RESOURCE, D3DUSAGE_RESTRICTED_CONTENT,
-    E_NOTIMPL,
+    D3DFMT_D32_LOCKABLE, D3DFMT_DXT1, D3DFMT_INDEX16, D3DFMT_L8, D3DFMT_S8_LOCKABLE,
+    D3DFMT_X8R8G8B8, D3DFVF_DIFFUSE, D3DFVF_TEX1, D3DFVF_XYZ, D3DLOCK_READONLY, D3DPOOL_DEFAULT,
+    D3DPOOL_MANAGED, D3DPOOL_SCRATCH, D3DPOOL_SYSTEMMEM, D3DPT_TRIANGLELIST, D3DRS_LIGHTING,
+    D3DSAMP_MAGFILTER, D3DSAMP_MINFILTER, D3DSWAPEFFECT_FLIPEX, D3DTEXF_NONE, D3DTEXF_POINT,
+    D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_RENDERTARGET, D3DUSAGE_RESTRICT_SHARED_RESOURCE,
+    D3DUSAGE_RESTRICTED_CONTENT, E_NOTIMPL,
 };
 
 const RED: u32 = 0xFFFF_0000;
@@ -143,7 +143,7 @@ fn user_memory_seeds_a_system_memory_texture_once_at_its_pitch() {
         &SharedHandle::to(&mut data),
     );
     assert_eq!(hr, D3D_OK, "an L8 texture over user memory");
-    let texture = Texture::from_raw(texture);
+    let texture = texture.expect("a texture");
     ramp.fill(0);
     let (pitch, rows) = locked_rows(&texture.surface_level(0), 33, 33);
     assert!(pitch >= 33, "the lock pitch holds a row");
@@ -183,7 +183,7 @@ fn user_memory_seeds_a_system_memory_offscreen_plain_surface() {
         &SharedHandle::to(&mut data),
     );
     assert_eq!(hr, D3D_OK, "CreateOffscreenPlainSurface over user memory");
-    let plain = Surface::from_raw(plain);
+    let plain = plain.expect("a surface");
     let (_, rows) = locked_rows(&plain, 64, 4);
     let bytes: Vec<u8> = texels.iter().flat_map(|t| t.to_le_bytes()).collect();
     for (y, row) in rows.iter().enumerate() {
@@ -217,7 +217,7 @@ fn user_memory_outside_its_one_shape_is_refused() {
         let (hr, texture) =
             h.try_create_texture_shared(size, levels, D3DFMT_A8R8G8B8, pool, handle);
         assert_eq!(
-            (hr, texture.is_null()),
+            (hr, texture.is_none()),
             (D3DERR_INVALIDCALL, true),
             "{what}"
         );
@@ -257,9 +257,10 @@ fn a_plain_device_refuses_every_shared_handle_with_e_notimpl() {
     let mut slot: *mut c_void = core::ptr::null_mut();
     let handle = &SharedHandle::to(&mut slot);
     for pool in [D3DPOOL_DEFAULT, D3DPOOL_SYSTEMMEM] {
+        let (hr, texture) = h.try_create_texture_shared((16, 16), 1, D3DFMT_A8R8G8B8, pool, handle);
         assert_eq!(
-            h.try_create_texture_shared((16, 16), 1, D3DFMT_A8R8G8B8, pool, handle),
-            (E_NOTIMPL, core::ptr::null_mut()),
+            (hr, texture.is_none()),
+            (E_NOTIMPL, true),
             "texture, pool {pool}"
         );
         assert_eq!(
@@ -304,26 +305,30 @@ fn a_shared_default_pool_resource_is_not_available_on_an_extended_device() {
     let mut slot: *mut c_void = core::ptr::null_mut();
     let handle = &SharedHandle::to(&mut slot);
     let results = [
-        h.try_create_texture_shared((16, 16), 1, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT, handle),
-        h.try_create_cube_texture_shared(16, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT, handle),
-        h.try_create_volume_texture_shared([4, 4, 4], D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT, handle),
-        h.try_create_vertex_buffer_shared(16, D3DPOOL_DEFAULT, handle),
-        h.try_create_index_buffer_shared(16, D3DPOOL_DEFAULT, handle),
-        h.try_create_render_target_shared((16, 16), D3DFMT_A8R8G8B8, handle),
-        h.try_create_depth_stencil_surface_shared((16, 16), D3DFMT_D24S8, handle),
+        h.try_create_texture_shared((16, 16), 1, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT, handle)
+            .0,
+        h.try_create_cube_texture_shared(16, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT, handle)
+            .0,
+        h.try_create_volume_texture_shared([4, 4, 4], D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT, handle)
+            .0,
+        h.try_create_vertex_buffer_shared(16, D3DPOOL_DEFAULT, handle)
+            .0,
+        h.try_create_index_buffer_shared(16, D3DPOOL_DEFAULT, handle)
+            .0,
+        h.try_create_render_target_shared((16, 16), D3DFMT_A8R8G8B8, handle)
+            .0,
+        h.try_create_depth_stencil_surface_shared((16, 16), D3DFMT_D24S8, handle)
+            .0,
         h.try_create_offscreen_plain_surface_shared(
             (16, 16),
             D3DFMT_A8R8G8B8,
             D3DPOOL_DEFAULT,
             handle,
-        ),
+        )
+        .0,
     ];
-    for (index, (hr, object)) in results.into_iter().enumerate() {
-        assert_eq!(
-            (hr, object.is_null()),
-            (D3DERR_NOTAVAILABLE, true),
-            "create {index}"
-        );
+    for (index, hr) in results.into_iter().enumerate() {
+        assert_eq!(hr, D3DERR_NOTAVAILABLE, "create {index}");
     }
 }
 
@@ -384,23 +389,25 @@ fn the_extended_surface_creates_take_only_the_restriction_usages() {
 }
 
 #[test]
-fn texture_memory_does_not_shrink_on_an_extended_device() {
-    let h = extended();
-    let before = h.available_texture_mem();
-    let target = h.create_texture(
-        1024,
-        1024,
-        1,
-        D3DUSAGE_RENDERTARGET,
-        D3DFMT_X8R8G8B8,
-        D3DPOOL_DEFAULT,
-    );
-    assert_eq!(
-        h.available_texture_mem(),
-        before,
-        "an extended device pages its default pool"
-    );
-    drop(target);
+fn texture_memory_shrinks_on_a_plain_device_and_not_on_an_extended_one() {
+    for (h, shrinks) in [(extended(), false), (Harness::new(), true)] {
+        let before = h.available_texture_mem();
+        let target = h.create_texture(
+            1024,
+            1024,
+            1,
+            D3DUSAGE_RENDERTARGET,
+            D3DFMT_X8R8G8B8,
+            D3DPOOL_DEFAULT,
+        );
+        let after = h.available_texture_mem();
+        assert_eq!(
+            after < before,
+            shrinks,
+            "{before} before the target, {after} after it"
+        );
+        drop(target);
+    }
 }
 
 #[test]
@@ -472,11 +479,25 @@ fn system_memory_uploads_reach_a_default_dxt_texture_and_a_cube_face() {
     let plain = h.create_offscreen_plain_surface(8, 8, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM);
     plain.lock_rect(0).write_u32_rect(8, 8, &[BLUE; 64]);
     let cube = h.create_cube_texture_owned(8, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT);
+    let face = cube.surface(2, 0);
     assert_eq!(
-        h.update_surface_hr(&plain, &cube.surface(2, 0)),
+        h.update_surface_hr(&plain, &face),
         D3D_OK,
         "UpdateSurface into a cube face"
     );
+    let target = h.create_render_target(8, 8, D3DFMT_A8R8G8B8);
+    assert_eq!(
+        h.stretch_rect(&face, &target, D3DTEXF_NONE),
+        D3D_OK,
+        "copy the face out"
+    );
+    let readback = h.create_offscreen_plain_surface(8, 8, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM);
+    assert_eq!(h.get_render_target_data_hr(&target, &readback), D3D_OK);
+    let lock = readback.lock_rect(D3DLOCK_READONLY);
+    let first = lock.read_bytes(4);
+    drop(lock);
+    let pixel = u32::from_le_bytes(first.try_into().expect("four bytes"));
+    assert_pixel_eq(pixel, BLUE, "the cube face holds the uploaded texels");
 }
 
 #[test]
@@ -537,10 +558,41 @@ fn set_priority_takes_the_default_pool_on_an_extended_device() {
 }
 
 #[test]
-fn ati2_is_no_offscreen_plain_surface_on_an_extended_device() {
+fn ati2_is_no_offscreen_plain_surface_on_either_kind_of_device() {
+    for h in [extended(), Harness::new()] {
+        assert_eq!(
+            h.create_offscreen_plain_surface_hr(16, 16, D3DFMT_ATI2, D3DPOOL_DEFAULT),
+            D3DERR_INVALIDCALL
+        );
+    }
+}
+
+#[test]
+fn the_extended_lockable_depth_formats_are_refused_on_an_extended_device() {
     let h = extended();
-    assert_eq!(
-        h.create_offscreen_plain_surface_hr(16, 16, D3DFMT_ATI2, D3DPOOL_DEFAULT),
-        D3DERR_INVALIDCALL
-    );
+    for format in [D3DFMT_D32_LOCKABLE, D3DFMT_S8_LOCKABLE] {
+        let (hr, texture) =
+            h.try_create_texture(16, 16, 1, D3DUSAGE_DEPTHSTENCIL, format, D3DPOOL_DEFAULT);
+        assert_eq!(
+            (hr, texture.is_null()),
+            (D3DERR_INVALIDCALL, true),
+            "texture {format}"
+        );
+        let (hr, surface) =
+            h.try_create_depth_stencil_surface_shared((16, 16), format, &SharedHandle::NONE);
+        assert_eq!(
+            (hr, surface.is_none()),
+            (D3DERR_INVALIDCALL, true),
+            "surface {format}"
+        );
+        let (width, height) = h.dims();
+        let mut pp = h.windowed_present_params(width, height);
+        pp.enable_auto_depth_stencil = 1;
+        pp.auto_depth_stencil_format = format;
+        assert_eq!(
+            h.reset_ex(&mut pp, None),
+            D3DERR_INVALIDCALL,
+            "auto depth {format}"
+        );
+    }
 }

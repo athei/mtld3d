@@ -13,7 +13,10 @@ use mtld3d_types::{
 };
 
 use super::{Harness, HarnessConfig};
-use crate::{resource::Surface, vtbl::deref_vtbl};
+use crate::{
+    resource::{CubeTexture, IndexBuffer, Surface, Texture, VertexBuffer, VolumeTexture},
+    vtbl::deref_vtbl,
+};
 
 /// A create's `pSharedHandle` argument: none, or a slot the call reads.
 ///
@@ -55,7 +58,11 @@ pub const fn display_mode_ex(size: u32) -> D3DDISPLAYMODEEX {
 }
 
 /// `CreateDeviceEx` on adapter 0 with a null focus window and no display mode.
-pub fn create_device_ex(
+///
+/// # Safety
+/// `d3d9` is a live interface `Direct3DCreate9Ex` made and `device` is a
+/// writable out slot.
+pub unsafe fn create_device_ex(
     d3d9: *mut c_void,
     behavior_flags: u32,
     pp: &mut D3DPRESENT_PARAMETERS,
@@ -455,7 +462,7 @@ impl Harness {
         format: u32,
         pool: u32,
         shared_handle: &SharedHandle<'_>,
-    ) -> (i32, *mut c_void) {
+    ) -> (i32, Option<Texture<'_>>) {
         let mut out: *mut c_void = core::ptr::null_mut();
         // SAFETY: vtable thunk; `out` is writable and the handle null or live.
         let hr = unsafe {
@@ -471,7 +478,7 @@ impl Harness {
                 shared_handle.ptr,
             )
         };
-        (hr, out)
+        (hr, (!out.is_null()).then(|| Texture::from_raw(out)))
     }
 
     /// `CreateCubeTexture` with a `pSharedHandle`.
@@ -482,7 +489,7 @@ impl Harness {
         format: u32,
         pool: u32,
         shared_handle: &SharedHandle<'_>,
-    ) -> (i32, *mut c_void) {
+    ) -> (i32, Option<CubeTexture<'_>>) {
         let mut out: *mut c_void = core::ptr::null_mut();
         // SAFETY: vtable thunk; `out` is writable and the handle null or live.
         let hr = unsafe {
@@ -497,7 +504,7 @@ impl Harness {
                 shared_handle.ptr,
             )
         };
-        (hr, out)
+        (hr, (!out.is_null()).then(|| CubeTexture::from_raw(out)))
     }
 
     /// `CreateVolumeTexture` with a `pSharedHandle`.
@@ -508,7 +515,7 @@ impl Harness {
         format: u32,
         pool: u32,
         shared_handle: &SharedHandle<'_>,
-    ) -> (i32, *mut c_void) {
+    ) -> (i32, Option<VolumeTexture<'_>>) {
         let mut out: *mut c_void = core::ptr::null_mut();
         // SAFETY: vtable thunk; `out` is writable and the handle null or live.
         let hr = unsafe {
@@ -525,7 +532,7 @@ impl Harness {
                 shared_handle.ptr,
             )
         };
-        (hr, out)
+        (hr, (!out.is_null()).then(|| VolumeTexture::from_raw(out)))
     }
 
     /// `CreateVertexBuffer` with a `pSharedHandle`.
@@ -535,7 +542,7 @@ impl Harness {
         length: u32,
         pool: u32,
         shared_handle: &SharedHandle<'_>,
-    ) -> (i32, *mut c_void) {
+    ) -> (i32, Option<VertexBuffer<'_>>) {
         let mut out: *mut c_void = core::ptr::null_mut();
         // SAFETY: vtable thunk; `out` is writable and the handle null or live.
         let hr = unsafe {
@@ -549,7 +556,7 @@ impl Harness {
                 shared_handle.ptr,
             )
         };
-        (hr, out)
+        (hr, (!out.is_null()).then(|| VertexBuffer::from_raw(out)))
     }
 
     /// `CreateIndexBuffer` (16-bit indices) with a `pSharedHandle`.
@@ -559,7 +566,7 @@ impl Harness {
         length: u32,
         pool: u32,
         shared_handle: &SharedHandle<'_>,
-    ) -> (i32, *mut c_void) {
+    ) -> (i32, Option<IndexBuffer<'_>>) {
         let mut out: *mut c_void = core::ptr::null_mut();
         // SAFETY: vtable thunk; `out` is writable and the handle null or live.
         let hr = unsafe {
@@ -573,7 +580,7 @@ impl Harness {
                 shared_handle.ptr,
             )
         };
-        (hr, out)
+        (hr, (!out.is_null()).then(|| IndexBuffer::from_raw(out)))
     }
 
     /// `CreateRenderTarget` with a `pSharedHandle`.
@@ -583,7 +590,7 @@ impl Harness {
         size: (u32, u32),
         format: u32,
         shared_handle: &SharedHandle<'_>,
-    ) -> (i32, *mut c_void) {
+    ) -> (i32, Option<Surface<'_>>) {
         let mut out: *mut c_void = core::ptr::null_mut();
         // SAFETY: vtable thunk; `out` is writable and the handle null or live.
         let hr = unsafe {
@@ -599,7 +606,7 @@ impl Harness {
                 shared_handle.ptr,
             )
         };
-        (hr, out)
+        (hr, (!out.is_null()).then(|| Surface::from_raw(out)))
     }
 
     /// `CreateDepthStencilSurface` with a `pSharedHandle`.
@@ -609,7 +616,7 @@ impl Harness {
         size: (u32, u32),
         format: u32,
         shared_handle: &SharedHandle<'_>,
-    ) -> (i32, *mut c_void) {
+    ) -> (i32, Option<Surface<'_>>) {
         let mut out: *mut c_void = core::ptr::null_mut();
         // SAFETY: vtable thunk; `out` is writable and the handle null or live.
         let hr = unsafe {
@@ -625,7 +632,7 @@ impl Harness {
                 shared_handle.ptr,
             )
         };
-        (hr, out)
+        (hr, (!out.is_null()).then(|| Surface::from_raw(out)))
     }
 
     /// `CreateOffscreenPlainSurface` with a `pSharedHandle`.
@@ -636,7 +643,7 @@ impl Harness {
         format: u32,
         pool: u32,
         shared_handle: &SharedHandle<'_>,
-    ) -> (i32, *mut c_void) {
+    ) -> (i32, Option<Surface<'_>>) {
         let mut out: *mut c_void = core::ptr::null_mut();
         // SAFETY: vtable thunk; `out` is writable and the handle null or live.
         let hr = unsafe {
@@ -650,6 +657,6 @@ impl Harness {
                 shared_handle.ptr,
             )
         };
-        (hr, out)
+        (hr, (!out.is_null()).then(|| Surface::from_raw(out)))
     }
 }

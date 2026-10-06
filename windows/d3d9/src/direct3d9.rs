@@ -30,16 +30,17 @@ use mtld3d_shared::{
 };
 use mtld3d_types::{
     D3DADAPTER_IDENTIFIER9, D3DCAPS9, D3DDEVTYPE_HAL, D3DDISPLAYMODE, D3DDISPLAYMODEEX,
-    D3DDISPLAYMODEFILTER, D3DDISPLAYROTATION_IDENTITY, D3DFMT_A8B8G8R8, D3DFMT_A8R8G8B8,
-    D3DFMT_ATI1, D3DFMT_DF16, D3DFMT_DF24, D3DFMT_DXT1, D3DFMT_DXT2, D3DFMT_DXT3, D3DFMT_DXT4,
-    D3DFMT_DXT5, D3DFMT_R5G6B5, D3DFMT_R8G8B8, D3DFMT_RESZ, D3DFMT_UYVY, D3DFMT_X8B8G8R8,
-    D3DFMT_X8R8G8B8, D3DFMT_YUY2, D3DMULTISAMPLE_NONE, D3DMULTISAMPLE_NONMASKABLE, D3DOK_NOAUTOGEN,
-    D3DPRESENT_PARAMETERS, D3DRTYPE_CUBETEXTURE, D3DRTYPE_INDEXBUFFER, D3DRTYPE_SURFACE,
-    D3DRTYPE_TEXTURE, D3DRTYPE_VERTEXBUFFER, D3DRTYPE_VOLUME, D3DRTYPE_VOLUMETEXTURE,
-    D3DSCANLINEORDERING_INTERLACED, D3DSCANLINEORDERING_PROGRESSIVE, D3DUSAGE_AUTOGENMIPMAP,
-    D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_DYNAMIC, D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING,
-    D3DUSAGE_QUERY_SRGBREAD, D3DUSAGE_QUERY_SRGBWRITE, D3DUSAGE_QUERY_VERTEXTEXTURE,
-    D3DUSAGE_RENDERTARGET, Guid, IDirect3D9ExVtbl, IDirect3D9Vtbl, LUID,
+    D3DDISPLAYMODEEX_SIZE, D3DDISPLAYMODEFILTER, D3DDISPLAYROTATION_IDENTITY, D3DFMT_A8B8G8R8,
+    D3DFMT_A8R8G8B8, D3DFMT_ATI1, D3DFMT_DF16, D3DFMT_DF24, D3DFMT_DXT1, D3DFMT_DXT2, D3DFMT_DXT3,
+    D3DFMT_DXT4, D3DFMT_DXT5, D3DFMT_R5G6B5, D3DFMT_R8G8B8, D3DFMT_RESZ, D3DFMT_UYVY,
+    D3DFMT_X8B8G8R8, D3DFMT_X8R8G8B8, D3DFMT_YUY2, D3DMULTISAMPLE_NONE, D3DMULTISAMPLE_NONMASKABLE,
+    D3DOK_NOAUTOGEN, D3DPRESENT_PARAMETERS, D3DRTYPE_CUBETEXTURE, D3DRTYPE_INDEXBUFFER,
+    D3DRTYPE_SURFACE, D3DRTYPE_TEXTURE, D3DRTYPE_VERTEXBUFFER, D3DRTYPE_VOLUME,
+    D3DRTYPE_VOLUMETEXTURE, D3DSCANLINEORDERING_INTERLACED, D3DSCANLINEORDERING_PROGRESSIVE,
+    D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_DYNAMIC,
+    D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING, D3DUSAGE_QUERY_SRGBREAD, D3DUSAGE_QUERY_SRGBWRITE,
+    D3DUSAGE_QUERY_VERTEXTEXTURE, D3DUSAGE_RENDERTARGET, Guid, IDirect3D9ExVtbl, IDirect3D9Vtbl,
+    LUID,
 };
 
 use super::{
@@ -77,10 +78,6 @@ const ADAPTER_FORMATS: &[u32] = &[D3DFMT_X8R8G8B8, D3DFMT_R5G6B5];
 /// games whose video-menu dropdowns are D3D9-driven vs Win32-driven (Wine's
 /// `EnumDisplaySettings` → macdrv → `CGDisplayCopyAllDisplayModes`).
 const DISPLAY_TRACE_TARGET: &str = "mtld3d::d3d9::display";
-
-/// `size_of::<D3DDISPLAYMODEEX>()`, the `Size` an extended display-mode call requires.
-const DISPLAY_MODE_EX_SIZE: u32 = 24;
-const _: () = assert!(core::mem::size_of::<D3DDISPLAYMODEEX>() == DISPLAY_MODE_EX_SIZE as usize);
 
 /// The GDI name of the primary display, the one adapter 0 drives.
 const PRIMARY_DISPLAY_NAME: &str = "\\\\.\\DISPLAY1";
@@ -266,7 +263,8 @@ pub fn fullscreen_mode_request(pp: &D3DPRESENT_PARAMETERS) -> Option<ModeRequest
 /// A plain interface hands out the same table: its base slots are the
 /// `IDirect3D9` contract, and a caller that never queried `IID_IDirect3D9Ex`
 /// has no reason to reach past them. An extended entry point called through a
-/// plain interface answers as it does on an extended one.
+/// plain interface still runs; `CreateDeviceEx` there makes a plain device,
+/// since the device takes its kind from the interface that creates it.
 static DIRECT3D9_VTBL: IDirect3D9ExVtbl = IDirect3D9ExVtbl {
     base: IDirect3D9Vtbl {
         query_interface: d3d9_query_interface,
@@ -293,14 +291,6 @@ static DIRECT3D9_VTBL: IDirect3D9ExVtbl = IDirect3D9ExVtbl {
     create_device_ex: d3d9_create_device_ex,
     get_adapter_luid: d3d9_get_adapter_luid,
 };
-
-/// The adapter's LUID as `(LowPart, HighPart)`, read once for the process.
-///
-/// A machine fact latched once and immutable after: the LUID the display
-/// driver gives the primary display's adapter, or, where the driver hands
-/// none back, one the system allocates for the process, which stays the same
-/// for every later call.
-static ADAPTER_LUID: LazyLock<(u32, i32)> = LazyLock::new(read_adapter_luid);
 
 // ── IDirect3D9 COM object ──
 
@@ -672,7 +662,7 @@ extern "system" fn d3d9_get_adapter_identifier(
     // GDI-style display-device name for adapter 0. D3D9 reports the adapter's
     // GDI name here; the conformance suite (and real apps enumerating adapters)
     // require it to be non-empty.
-    let device_name = b"\\\\.\\DISPLAY1\0";
+    let device_name = PRIMARY_DISPLAY_NAME.as_bytes();
     id.device_name[..device_name.len()].copy_from_slice(device_name);
 
     let info = device_info();
@@ -1009,6 +999,13 @@ extern "system" fn d3d9_get_adapter_display_mode_ex(
 }
 
 extern "system" fn d3d9_get_adapter_luid(_this: *mut c_void, adapter: u32, luid: *mut LUID) -> i32 {
+    /// The adapter's LUID as `(LowPart, HighPart)`, read once for the process.
+    ///
+    /// A machine fact latched once and immutable after: the LUID the display
+    /// driver gives the primary display's adapter, or, where the driver hands
+    /// none back, one the system allocates for the process, which stays the
+    /// same for every later call.
+    static ADAPTER_LUID: LazyLock<(u32, i32)> = LazyLock::new(read_adapter_luid);
     if adapter != 0 || luid.is_null() {
         mtld3d_shared::log_once_warn!(
             target: LOG_TARGET,
@@ -1035,7 +1032,7 @@ extern "system" fn d3d9_get_adapter_luid(_this: *mut c_void, adapter: u32, luid:
 /// `mode` as an extended display mode: progressive, its size field filled in.
 const fn display_mode_ex(mode: &D3DDISPLAYMODE) -> D3DDISPLAYMODEEX {
     D3DDISPLAYMODEEX {
-        size: DISPLAY_MODE_EX_SIZE,
+        size: D3DDISPLAYMODEEX_SIZE,
         width: mode.width,
         height: mode.height,
         refresh_rate: mode.refresh_rate,
@@ -1066,10 +1063,10 @@ pub unsafe fn write_display_mode_ex(
         );
         return D3DERR_INVALIDCALL;
     };
-    if out.size != DISPLAY_MODE_EX_SIZE {
+    if out.size != D3DDISPLAYMODEEX_SIZE {
         mtld3d_shared::log_once_warn!(
             target: LOG_TARGET,
-            "reject GetDisplayModeEx: D3DDISPLAYMODEEX.Size {} is not {DISPLAY_MODE_EX_SIZE} → \
+            "reject GetDisplayModeEx: D3DDISPLAYMODEEX.Size {} is not {D3DDISPLAYMODEEX_SIZE} → \
              INVALIDCALL",
             out.size
         );
@@ -2380,9 +2377,12 @@ fn resolve_render_scale(
 /// device leaves the game's window stripped of its decoration and pinned over
 /// the monitor.
 fn restore_from_fullscreen(saved: Option<&crate::fullscreen::SavedWindow>) {
+    // A create that fails puts the window back where it was, whatever kind of
+    // device it was creating: nothing it did should outlive it.
     if let Some(saved) = saved {
         crate::fullscreen::leave(
             saved,
+            crate::fullscreen::LeaveKind::Plain,
             &mtld3d_core::fullscreen_log::LeaveReason::FailedCreate,
         );
     }

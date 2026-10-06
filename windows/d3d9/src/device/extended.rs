@@ -324,6 +324,10 @@ pub extern "system" fn reset_ex(
     // SAFETY: vtable in-param; `present_params` is null or a readable
     // `D3DPRESENT_PARAMETERS` per the IDirect3DDevice9Ex ABI.
     let Some(pp) = (unsafe { InPtr::<D3DPRESENT_PARAMETERS>::opt(present_params) }) else {
+        mtld3d_shared::log_once_warn!(
+            target: LOG_TARGET,
+            "reject ResetEx: null present parameters → INVALIDCALL"
+        );
         return D3DERR_INVALIDCALL;
     };
     // SAFETY: vtable in-param; `mode` is null or a readable `D3DDISPLAYMODEEX`

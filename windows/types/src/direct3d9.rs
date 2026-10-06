@@ -330,7 +330,10 @@ pub struct D3DDISPLAYMODEEX {
     pub scan_line_ordering: u32,
 }
 
-const _: () = assert!(core::mem::size_of::<D3DDISPLAYMODEEX>() == 24);
+/// `size_of::<D3DDISPLAYMODEEX>()`, the `Size` every extended display-mode call requires.
+pub const D3DDISPLAYMODEEX_SIZE: u32 = 24;
+
+const _: () = assert!(core::mem::size_of::<D3DDISPLAYMODEEX>() == D3DDISPLAYMODEEX_SIZE as usize);
 
 /// `D3DDISPLAYMODEFILTER`: the format and scanline ordering a mode enumeration keeps.
 #[repr(C)]

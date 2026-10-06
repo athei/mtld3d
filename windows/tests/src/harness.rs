@@ -22,7 +22,7 @@ use mtld3d_types::{
 
 use crate::{
     check::expect_ok,
-    ffi::{Direct3DCreate9, Direct3DCreate9Ex},
+    ffi::{Direct3DCreate9, direct3d_create9_ex},
     resource::{
         CubeTexture, IndexBuffer, PixelShader, Query, StateBlock, Surface, SwapChain, Texture,
         VertexBuffer, VertexDeclaration, VertexShader, VolumeTexture,
@@ -426,7 +426,7 @@ pub struct Harness {
     config_entries: String,
 }
 
-/// `Direct3DCreate9` under the environment lock.
+/// The factory export `factory` names, called under the environment lock.
 ///
 /// Shared for the suite-wide configuration; exclusive, with `entries`
 /// appended to `MTLD3D_CONFIG` for the duration of the call and the variable
@@ -470,15 +470,16 @@ fn create_factory(entries: &str, factory: Factory) -> *mut c_void {
 /// Call the factory export `factory` names; the caller holds the environment lock.
 ///
 /// # Panics
-/// Panics if `Direct3DCreate9Ex` fails.
+/// Panics if `d3d9.dll` does not export `Direct3DCreate9Ex` or it fails.
 fn call_factory(factory: Factory) -> *mut c_void {
     if factory == Factory::Plain {
         // SAFETY: Win32-style factory entrypoint with no preconditions.
         return unsafe { Direct3DCreate9(D3DSDK_VERSION) };
     }
+    let create_ex = direct3d_create9_ex().expect("d3d9.dll exports Direct3DCreate9Ex");
     let mut out: *mut c_void = core::ptr::null_mut();
     // SAFETY: factory entrypoint with a writable out slot.
-    let hr = unsafe { Direct3DCreate9Ex(D3DSDK_VERSION, &raw mut out) };
+    let hr = unsafe { create_ex(D3DSDK_VERSION, &raw mut out) };
     assert_eq!(hr, 0, "Direct3DCreate9Ex failed: 0x{hr:08X}");
     out
 }
@@ -621,7 +622,11 @@ impl Harness {
         let mut pp = present_params(cfg, hwnd);
         let mut device: *mut c_void = core::ptr::null_mut();
         let hr = if cfg.factory == Factory::ExtendedDeviceEx {
-            extended::create_device_ex(d3d9, cfg.behavior_flags, &mut pp, &raw mut device)
+            // SAFETY: `d3d9` came from `Direct3DCreate9Ex` and `device` is a
+            // writable local.
+            unsafe {
+                extended::create_device_ex(d3d9, cfg.behavior_flags, &mut pp, &raw mut device)
+            }
         } else {
             // SAFETY: D3D9 factory vtable thunk; `d3d9` is live, `&mut pp` and
             // `&mut device` are writable, focus window null is permitted.

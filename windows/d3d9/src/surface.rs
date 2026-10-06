@@ -1817,13 +1817,47 @@ pub unsafe fn add_reported_usage(ptr: *mut c_void, usage: u32) {
     }
 }
 
-/// Whether the application holds a public reference to the cached implicit surface at `ptr`.
+/// What a held implicit surface is before a `Reset` changes the swap chain under it.
+///
+/// Its extent, format, scale and multisample configuration resolve from the
+/// device, which a `Reset` updates before it recreates the textures, so they
+/// are read while they still describe the surface the application holds.
+pub struct HeldSurface {
+    ptr: u64,
+    width: u32,
+    height: u32,
+    format: u32,
+    render_scale: RenderScale,
+    multi_sample: SurfaceMultiSample,
+}
+
+/// Capture the cached implicit surface at `ptr` if the application holds it.
+///
+/// `None` for no surface, one only the device references, and a surface
+/// that is not implicit.
 ///
 /// # Safety
 /// `ptr` is `0` or the device's live cached implicit surface.
-pub unsafe fn implicit_surface_is_held(ptr: u64) -> bool {
+pub unsafe fn hold_implicit_surface(ptr: u64) -> Option<HeldSurface> {
     // SAFETY: the caller's contract: `0` or a live surface wrapper.
-    unsafe { (ptr as *const Direct3DSurface9).as_ref() }.is_some_and(|surf| surf.refcount != 0)
+    let surf = unsafe { (ptr as *const Direct3DSurface9).as_ref() }?;
+    let inner = surf.inner();
+    if surf.refcount == 0 || inner.implicit_kind == ImplicitKind::None {
+        return None;
+    }
+    if inner.device_inner.is_null() {
+        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+            "hold_implicit_surface: an implicit surface without a device is not detached");
+        return None;
+    }
+    Some(HeldSurface {
+        ptr,
+        width: inner.live_width(),
+        height: inner.live_height(),
+        format: inner.live_format(),
+        render_scale: inner.live_render_scale(),
+        multi_sample: inner.live_multi_sample(),
+    })
 }
 
 /// Turn a held implicit surface into a standalone one that keeps the textures it names.
@@ -1832,35 +1866,28 @@ pub unsafe fn implicit_surface_is_held(ptr: u64) -> bool {
 /// depth-stencil while the application may still hold the surfaces of the old
 /// ones. `D3D9Ex` leaves such a reference naming the old surface, at the old
 /// size and no longer part of the swap chain. The surface takes over the
-/// textures it has resolved from the device until now, which the `Reset` then
-/// leaves alone, and becomes a standalone default-pool target: its container
-/// is the device, and its final release retires the textures as any
-/// standalone target's does. The device's reference the implicit surface
-/// took on its first public reference is the one a standalone surface gives
-/// back on its last, so the counts stay balanced.
+/// textures it has resolved from the device until now, which the device then
+/// forgets, and becomes a standalone default-pool target described by
+/// `held`, captured before the `Reset` changed anything: its container is the
+/// device, and its final release retires the textures as any standalone
+/// target's does. The device's reference the implicit surface took on its
+/// first public reference is the one a standalone surface gives back on its
+/// last, so the counts stay balanced.
 ///
 /// # Safety
-/// `ptr` is the device's live cached implicit surface, held by the
-/// application, and the device forgets it as its cached surface right after.
-pub unsafe fn detach_implicit_surface(ptr: u64) {
-    let surf = ptr as *mut Direct3DSurface9;
+/// `held` was captured from the device's live cached implicit surface, still
+/// held by the application, and the device forgets it as its cached surface
+/// and drops its own handles to the textures right after.
+pub unsafe fn detach_implicit_surface(held: &HeldSurface) {
+    let surf = held.ptr as *mut Direct3DSurface9;
     // SAFETY: the caller's contract: a live cached implicit surface wrapper.
     let inner_ptr = unsafe { (*surf).inner };
     // SAFETY: `inner_ptr` is its live `SurfaceInner`; access is exclusive
     // under the device's `Reset`.
     let inner = unsafe { &mut *inner_ptr };
     let kind = inner.implicit_kind;
-    if kind == ImplicitKind::None || inner.device_inner.is_null() {
-        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
-            "detach_implicit_surface: not a device's implicit surface; left as it is");
-        return;
-    }
-    let width = inner.live_width();
-    let height = inner.live_height();
-    let format = inner.live_format();
-    let render_scale = inner.live_render_scale();
-    let multi_sample = inner.live_multi_sample();
-    // SAFETY: `device_inner` is the live owning device during its `Reset`.
+    // SAFETY: `hold_implicit_surface` checked the device pointer, and the
+    // device is live during its `Reset`.
     let device = unsafe { &*inner.device_inner };
     let standalone_kind = if kind == ImplicitKind::Backbuffer {
         inner.metal_color_handle = device.backbuffer_handle();
@@ -1872,20 +1899,20 @@ pub unsafe fn detach_implicit_surface(ptr: u64) {
         inner.metal_depth_handle = device.depth_stencil_handle();
         mtld3d_core::format::StandaloneSurfaceKind::DepthStencil
     };
-    inner.standalone_width = width;
-    inner.standalone_height = height;
-    inner.standalone_format = format;
-    inner.standalone_render_scale = render_scale;
+    inner.standalone_width = held.width;
+    inner.standalone_height = held.height;
+    inner.standalone_format = held.format;
+    inner.standalone_render_scale = held.render_scale;
     inner.standalone_pool = D3DPOOL_DEFAULT;
+    inner.multi_sample = held.multi_sample;
     device.register_standalone_surface(
-        width,
-        height,
-        format,
-        u32::from(multi_sample.sample_count),
+        held.width,
+        held.height,
+        held.format,
+        u32::from(held.multi_sample.sample_count),
         standalone_kind,
-        render_scale,
+        held.render_scale,
     );
-    inner.multi_sample = multi_sample;
     inner.container = device.device_wrapper() as u64;
     inner.implicit_kind = ImplicitKind::None;
 }

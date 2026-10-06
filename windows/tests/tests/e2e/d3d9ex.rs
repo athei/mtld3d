@@ -14,16 +14,14 @@ use core::ffi::{c_char, c_void};
 
 use mtld3d_tests::{Factory, Harness, HarnessConfig, assert_pixel_eq};
 use mtld3d_types::{
-    D3D_OK, D3DDISPLAYMODE, D3DDISPLAYMODEFILTER, D3DDISPLAYROTATION_IDENTITY, D3DERR_INVALIDCALL,
-    D3DFMT_A8R8G8B8, D3DFMT_R5G6B5, D3DFMT_X8R8G8B8, D3DPRESENT_DONOTWAIT,
-    D3DPRESENT_FORCEIMMEDIATE, D3DSCANLINEORDERING_INTERLACED, D3DSCANLINEORDERING_PROGRESSIVE,
-    D3DSCANLINEORDERING_UNKNOWN, D3DSDK_VERSION, E_NOINTERFACE, IDirect3D9Vtbl, IID_IDIRECT3D9,
-    IID_IDIRECT3D9EX, IID_IDIRECT3DDEVICE9, IID_IDIRECT3DDEVICE9EX, IID_IDIRECT3DSWAPCHAIN9,
+    D3D_OK, D3DDISPLAYMODE, D3DDISPLAYMODEEX_SIZE, D3DDISPLAYMODEFILTER,
+    D3DDISPLAYROTATION_IDENTITY, D3DERR_INVALIDCALL, D3DFMT_A8R8G8B8, D3DFMT_R5G6B5,
+    D3DFMT_X8R8G8B8, D3DPRESENT_DONOTWAIT, D3DPRESENT_FORCEIMMEDIATE,
+    D3DSCANLINEORDERING_INTERLACED, D3DSCANLINEORDERING_PROGRESSIVE, D3DSCANLINEORDERING_UNKNOWN,
+    D3DSDK_VERSION, E_NOINTERFACE, IDirect3D9Vtbl, IID_IDIRECT3D9, IID_IDIRECT3D9EX,
+    IID_IDIRECT3DDEVICE9, IID_IDIRECT3DDEVICE9EX, IID_IDIRECT3DSWAPCHAIN9,
     IID_IDIRECT3DSWAPCHAIN9EX,
 };
-
-/// `size_of::<D3DDISPLAYMODEEX>()`, the `Size` the extended mode calls require.
-const MODE_EX_SIZE: u32 = 24;
 
 #[link(name = "kernel32")]
 unsafe extern "system" {
@@ -197,6 +195,7 @@ fn the_adapter_luid_is_nonzero_and_the_same_for_every_interface() {
 #[test]
 fn the_extended_mode_list_is_the_base_list_progressive() {
     let h = Harness::factory_only_extended();
+    h.hold_display_mode();
     for format in [D3DFMT_X8R8G8B8, D3DFMT_R5G6B5] {
         let count = h.adapter_mode_count(format);
         for ordering in [D3DSCANLINEORDERING_UNKNOWN, D3DSCANLINEORDERING_PROGRESSIVE] {
@@ -221,7 +220,10 @@ fn the_extended_mode_list_is_the_base_list_progressive() {
                     (base.width, base.height, base.refresh_rate, base.format),
                     "mode {index} matches the base list"
                 );
-                assert_eq!(mode.size, MODE_EX_SIZE, "the size field is filled in");
+                assert_eq!(
+                    mode.size, D3DDISPLAYMODEEX_SIZE,
+                    "the size field is filled in"
+                );
                 assert_eq!(mode.scan_line_ordering, D3DSCANLINEORDERING_PROGRESSIVE);
             }
             assert_eq!(
@@ -253,6 +255,7 @@ fn the_extended_mode_list_is_the_base_list_progressive() {
 #[test]
 fn display_mode_ex_checks_the_size_and_reports_the_identity_rotation() {
     let h = extended(Factory::Extended);
+    h.hold_display_mode();
     let mut adapter = D3DDISPLAYMODE {
         width: 0,
         height: 0,
@@ -260,7 +263,7 @@ fn display_mode_ex_checks_the_size_and_reports_the_identity_rotation() {
         format: 0,
     };
     assert_eq!(h.adapter_display_mode(&mut adapter), D3D_OK);
-    let (hr, mode, rotation) = h.adapter_display_mode_ex(MODE_EX_SIZE);
+    let (hr, mode, rotation) = h.adapter_display_mode_ex(D3DDISPLAYMODEEX_SIZE);
     assert_eq!(hr, D3D_OK, "GetAdapterDisplayModeEx");
     assert_eq!(
         (mode.width, mode.height, mode.format),
@@ -282,7 +285,7 @@ fn display_mode_ex_checks_the_size_and_reports_the_identity_rotation() {
         format: 0,
     };
     assert_eq!(h.display_mode(&mut device), D3D_OK);
-    let (hr, mode, rotation) = h.device_display_mode_ex(0, MODE_EX_SIZE);
+    let (hr, mode, rotation) = h.device_display_mode_ex(0, D3DDISPLAYMODEEX_SIZE);
     assert_eq!(hr, D3D_OK, "device GetDisplayModeEx");
     assert_eq!(
         (mode.width, mode.height, mode.refresh_rate, mode.format),
@@ -301,13 +304,13 @@ fn display_mode_ex_checks_the_size_and_reports_the_identity_rotation() {
         "device, wrong size"
     );
     assert_eq!(
-        h.device_display_mode_ex(1, MODE_EX_SIZE).0,
+        h.device_display_mode_ex(1, D3DDISPLAYMODEEX_SIZE).0,
         D3DERR_INVALIDCALL,
         "no second swap chain"
     );
 
     let chain = h.implicit_swapchain();
-    let (hr, mode, rotation) = chain.display_mode_ex(MODE_EX_SIZE);
+    let (hr, mode, rotation) = chain.display_mode_ex(D3DDISPLAYMODEEX_SIZE);
     assert_eq!(hr, D3D_OK, "swap chain GetDisplayModeEx");
     assert_eq!((mode.width, mode.height), (device.width, device.height));
     assert_eq!(rotation, D3DDISPLAYROTATION_IDENTITY);
