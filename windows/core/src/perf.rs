@@ -2655,6 +2655,12 @@ impl EncoderPerfState {
         self.tex_staging_retained_bytes = self.tex_staging_retained_bytes.saturating_sub(bytes);
     }
 
+    /// Bytes of blit-source staging the encoder's queue holds, the `blit source staging` gauge.
+    #[must_use]
+    pub const fn tex_staging_retained_bytes(&self) -> usize {
+        self.tex_staging_retained_bytes
+    }
+
     pub const fn bump_texture_destroy(&mut self) {
         self.enc.texture_destroys = self.enc.texture_destroys.saturating_add(1);
     }

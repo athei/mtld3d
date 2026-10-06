@@ -108,6 +108,7 @@ const DRAW_TRACE_TARGET: &str = "mtld3d::d3d9::draw";
 pub const STAGE_COUNT: usize = 16;
 const CONSTANT_ROWS: usize = 256;
 
+mod blit_retention;
 mod compile;
 mod depth;
 
@@ -374,38 +375,6 @@ fn drain_source_scratch(
 pub struct TextureGpuState {
     pub views: TextureViews,
     pub mip_staging_buffers: Vec<MipStagingBuffer>,
-}
-
-/// Frame-lifetime retention for blit-source PE-heap staging.
-///
-/// Each entry keeps one staging read alive from blit-encode time
-/// through GPU retirement of the owning command buffer, keyed by the
-/// frame's `submit_seq`. Drained FIFO in `begin_frame` once the seq is ≤
-/// `coherent_seq`.
-struct PendingBlitRead {
-    submit_seq: u64,
-    read: PageBoxRead,
-}
-
-impl PendingBlitRead {
-    const fn new(submit_seq: u64, read: PageBoxRead) -> Self {
-        Self { submit_seq, read }
-    }
-
-    /// Strong-count probe used by the reclaim loop's debug checks.
-    ///
-    /// Includes the guard's owning reference to the backing allocation.
-    fn strong_count(&self) -> usize {
-        Arc::strong_count(self.read.backing())
-    }
-
-    /// Byte length of the retained staging Box.
-    ///
-    /// Used by the reclaim loop to decrement `tex_staging_retained_bytes`
-    /// by the exact amount the matching submit-time push added.
-    fn byte_len(&self) -> usize {
-        self.read.backing().len()
-    }
 }
 
 /// Inputs every slice of one texture upload's passes shares.
@@ -827,19 +796,14 @@ pub struct FrameEncoder {
     /// group so the trace node and the `[dump] draw N` line name each other.
     /// `None` outside a dump; cleared in `begin_frame`.
     dump_draw: Option<u32>,
-    /// Read guards for staging referenced by blits emitted this frame.
+    /// Read guards for staging the frame's blits read, then queued per submitted frame.
     ///
-    /// Moved into `pending_blit_retention` at submit time with the frame's
-    /// `submit_seq`; drained from `pending_blit_retention` in `begin_frame`
-    /// once `coherent_seq` catches up.
-    current_blit_retention: Vec<PageBoxRead>,
-    /// Prior frames' staging read guards, keyed by `submit_seq`.
-    ///
-    /// Entries drop when their seq is ≤ the latest `coherent_seq`.
-    pending_blit_retention: VecDeque<PendingBlitRead>,
+    /// Queued at submit time with the frame's `submit_seq`; released in
+    /// `begin_frame` once `coherent_seq` catches up.
+    blit_retention: blit_retention::BlitRetention,
     /// Pointer to the shared `coherent_seq` atomic, established by the device creation context.
     ///
-    /// Read on the encoder thread to drain `pending_blit_retention`. 0
+    /// Read on the encoder thread to release the queued `blit_retention` reads. 0
     /// means "not yet seeded" — the very first frame has no retention to
     /// drain.
     coherent_seq_ptr: u64,
@@ -1393,7 +1357,7 @@ impl RetainedPages {
 /// 3. Encoder-side texture-staging mid-frame cache swap
 ///    (`get_or_create_staging_buffer`): `Buffer` + handle,
 ///    `page_box = None`. The staging `Box` is kept alive via
-///    `pending_blit_retention` (Arc clones).
+///    `blit_retention` (Arc clones).
 /// 4. Visibility-buffer pool over-cap eviction (`submit` path, via
 ///    `VisibilityQueryState::retire_current_buffer`): `Buffer` +
 ///    handle + `page_box`, `seq = release_seq` of the evicted buffer.
@@ -1600,8 +1564,7 @@ impl FrameEncoder {
             clock,
             prev_submit_no_present: false,
             dump_draw: None,
-            current_blit_retention: Vec::new(),
-            pending_blit_retention: VecDeque::new(),
+            blit_retention: blit_retention::BlitRetention::default(),
             coherent_seq_ptr: context.coherent_seq_ptr,
             failed_seq_ptr: context.failed_submit_seq_ptr,
             upload_coherent_seq_ptr: context.upload_coherent_seq_ptr,
@@ -2394,7 +2357,7 @@ impl FrameEncoder {
             scratch_oversized_blocks: payload.scratch.oversized_chunk_count(),
             scratch_bytes: payload.scratch.capacity_bytes(),
             cmd_vec_capacity_bytes: PassState::cmd_vec_capacity_bytes(&payload.passes),
-            pending_blit_retention_depth: self.pending_blit_retention.len(),
+            pending_blit_retention_depth: self.blit_retention.queued(),
             pending_resource_retention_depth: self.pending_resource_retention.len(),
             pagebox_pool_bytes: self.pagebox_pool.pooled_bytes() as u64,
         }
@@ -6573,7 +6536,7 @@ impl FrameEncoder {
         }
     }
 
-    /// Drain `pending_blit_retention` entries whose `submit_seq` has been retired by the GPU.
+    /// Release the queued blit-source reads whose `submit_seq` the GPU has retired.
     ///
     /// A recovery job may still read these pages again after the emitted read
     /// retires, so its guard is independent of this queue.
@@ -6585,21 +6548,7 @@ impl FrameEncoder {
         // pointer the device shares with the encoder. The Arc outlives
         // every frame referencing it, so the read is well-defined.
         let coh = unsafe { SharedCounter::new(self.coherent_seq_ptr) }.load(Ordering::Acquire);
-        while let Some(front) = self.pending_blit_retention.front() {
-            if front.submit_seq > coh {
-                break;
-            }
-            // Release this emitted read; a replayable job retains its own guard.
-            let entry = self
-                .pending_blit_retention
-                .pop_front()
-                .expect("checked front");
-            self.perf.bump_tex_staging_retained_sub(entry.byte_len());
-            debug_assert!(
-                entry.strong_count() >= 1,
-                "pending blit Arc already orphaned"
-            );
-        }
+        self.blit_retention.reclaim(&mut self.perf, coh);
     }
 
     /// Lazily wrap a PE-heap staging Box in a Shared `MTLBuffer`.
@@ -7174,12 +7123,12 @@ impl FrameEncoder {
         // Retain the staging Box for the GPU's view of this frame —
         // even on the padded path the source bytes were just copied
         // out, but keeping the read guard is conservative and uniform.
-        // `pending_blit_retention` releases this read once
+        // `blit_retention` releases this read once
         // `coherent_seq >= submit_seq`; the caller's own guard in
         // `pending_texture_uploads` outlives it by however long the
         // upload takes to be acknowledged.
-        self.current_blit_retention
-            .push(PageBoxRead::new(Arc::clone(job.staging().backing())));
+        self.blit_retention
+            .hold(PageBoxRead::new(Arc::clone(job.staging().backing())));
         true
     }
 
@@ -7270,8 +7219,8 @@ impl FrameEncoder {
             .push(BlitCommand::copy_buffer_to_texture(&info));
         self.flags.insert(FrameEncoderFlags::BLIT_CMDS_NEED_ENCODER);
         self.perf.bump_texture_blit_upload();
-        self.current_blit_retention
-            .push(PageBoxRead::new(Arc::clone(job.staging().backing())));
+        self.blit_retention
+            .hold(PageBoxRead::new(Arc::clone(job.staging().backing())));
         true
     }
 
@@ -7430,8 +7379,8 @@ impl FrameEncoder {
         self.perf.bump_texture_expand_upload();
         // The pass reads the staging at command-buffer execution time, long
         // after this returns; hold the Box for the GPU's view of the frame.
-        self.current_blit_retention
-            .push(PageBoxRead::new(Arc::clone(job.staging().backing())));
+        self.blit_retention
+            .hold(PageBoxRead::new(Arc::clone(job.staging().backing())));
         true
     }
 
@@ -8275,8 +8224,7 @@ impl FrameEncoder {
         //    pointer.
         mtld3d_shared::crumb!("phase:SdBack");
         drop(held);
-        self.pending_blit_retention.clear();
-        self.current_blit_retention.clear();
+        self.blit_retention.release_all(&mut self.perf);
 
         // 5. Clear the cache HashMaps so any stray frame message that
         //    races us (defensive; shouldn't happen) sees empty caches.
@@ -8322,8 +8270,7 @@ impl FrameEncoder {
         destroy_resources_bulk(DestroyKind::Buffer, &buffers);
         destroy_resources_bulk(DestroyKind::Texture, &textures);
         drop(held);
-        self.pending_blit_retention.clear();
-        self.current_blit_retention.clear();
+        self.blit_retention.release_all(&mut self.perf);
         // A failed library or pipeline build gets one more attempt per Reset
         // that reaches this cleanup (one at unchanged dimensions does not):
         // a rejected source or descriptor fails again at the cost of one
@@ -8357,7 +8304,7 @@ impl FrameEncoder {
     /// boundary, and the next `begin_frame` reopens it against the fresh
     /// buffer, so the drain takes the buffers and leaves the open set. Does
     /// NOT touch the
-    /// `pending_blit_retention` / `current_blit_retention` guards (those must
+    /// `blit_retention` guards (those must
     /// outlive the bulk destroy of the staging `MTLBuffers` that wrap them
     /// via `bytesNoCopy`). Caller drops the returned `HeldBackings` after
     /// `destroy_resources_bulk`.
@@ -9463,7 +9410,7 @@ fn finalize_submit(
 
     // Retention bookkeeping is keyed by `submit_seq` and only needs the
     // staging Arcs to stay alive until `coherent_seq` catches up — moving
-    // them from `current_blit_retention` into `pending_blit_retention`
+    // them from the current frame's `blit_retention` into its queue
     // keeps them alive regardless of which thread later runs the blits, so
     // this is safe to do here before handing the payload off.
     retire_visibility_buffer(enc, frame.header().submit_seq);
@@ -9844,14 +9791,10 @@ fn retire_visibility_buffer(enc: &mut FrameEncoder, submit_seq: u64) {
 /// Keyed by the frame's `submit_seq`. They're released when `coherent_seq`
 /// reaches `submit_seq` — checked next `begin_frame`. Called from
 /// `finalize_submit`, before submission: the move into
-/// `pending_blit_retention` keeps the reads alive across the blit
+/// `blit_retention` keeps the reads alive across the blit
 /// encode + commit path, whichever thread runs it.
 fn retire_blit_reads(enc: &mut FrameEncoder, submit_seq: u64) {
-    for read in enc.current_blit_retention.drain(..) {
-        enc.perf.bump_tex_staging_retained_add(read.backing().len());
-        enc.pending_blit_retention
-            .push_back(PendingBlitRead::new(submit_seq, read));
-    }
+    enc.blit_retention.queue(&mut enc.perf, submit_seq);
 }
 
 /// Zero the full backing of a `PageBox`.
