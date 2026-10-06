@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use mtld3d_shared::encoder_wire::{FrameSlab, WireReader};
 
-use super::{GuestPageDescriptor, GuestPageLease};
+use super::{GuestPageDescriptor, GuestPageLease, LeaseOnlyPages};
 use crate::{
     encoder_value::WireValue,
     page_box::{PAGE_SIZE, PageBox, PageBoxRead},
@@ -228,4 +228,57 @@ fn an_unacknowledged_lease_never_offers_its_pages() {
     drop(lease.into_slot());
     assert_eq!(pages.staging_bytes(), 0);
     assert!(pages.acquire_staging(PAGE_SIZE).is_none());
+}
+
+fn lease_only_bytes(leases: &[&GuestPageLease]) -> u64 {
+    let mut tally = LeaseOnlyPages::default();
+    for lease in leases {
+        tally.add(lease);
+    }
+    tally.bytes()
+}
+
+/// Staging a texture still holds is the texture's; once it lets go, the leases' alone.
+///
+/// Two uploads of one level share its allocation, which counts once, and a
+/// lease whose read native acquisition already released still keeps it.
+#[test]
+fn lease_only_pages_count_staging_the_texture_let_go_of_once() {
+    let texture = Arc::new(PageBox::new_uninit(3 * PAGE_SIZE));
+    let mut first = GuestPageLease::for_read(PageBoxRead::new(Arc::clone(&texture)));
+    let second = GuestPageLease::for_read(PageBoxRead::new(Arc::clone(&texture)));
+    let other = Arc::new(PageBox::new_uninit(PAGE_SIZE));
+    let unrelated = GuestPageLease::for_read(PageBoxRead::new(Arc::clone(&other)));
+    assert_eq!(
+        lease_only_bytes(&[&first, &second, &unrelated]),
+        0,
+        "the textures still hold both allocations"
+    );
+
+    drop(texture);
+    assert_eq!(
+        lease_only_bytes(&[&first, &second, &unrelated]),
+        3 * PAGE_SIZE as u64,
+        "the released staging counts once for its two leases"
+    );
+    assert_eq!(
+        lease_only_bytes(&[&first]),
+        0,
+        "a tally that misses one of the leases cannot claim the allocation"
+    );
+
+    // SAFETY: the lease retains the original read and all cells, with exactly one adoption.
+    let native = unsafe { first.descriptor().adopt_read() }.expect("native read");
+    assert!(!first.maintain(), "the native read still holds the pages");
+    assert_eq!(
+        lease_only_bytes(&[&first, &second, &unrelated]),
+        3 * PAGE_SIZE as u64,
+        "a lease whose read was released after acquisition still keeps the pages"
+    );
+    drop(native);
+    drop(other);
+    assert_eq!(
+        lease_only_bytes(&[&first, &second, &unrelated]),
+        4 * PAGE_SIZE as u64
+    );
 }

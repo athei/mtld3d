@@ -2318,6 +2318,32 @@ pub struct CacheSizes {
     /// disabled. Distinct from `vbib_retained_bytes` (awaiting GPU
     /// retire): parked boxes are already retired and waiting for reuse.
     pub pagebox_pool_bytes: u64,
+    /// Memory gauges read once per window, when the summary is about to emit.
+    ///
+    /// `None` on every other frame, and on the rare emitting frame whose
+    /// window closed between the encoder's due check and the emit check;
+    /// the grid then prints `n/a` and the kv line leaves the keys out.
+    pub memory: Option<MemoryGauges>,
+}
+
+/// Point-in-time memory gauges the encoder reads at the summary.
+///
+/// Each costs a system or Metal query or a walk of the texture cache, so
+/// the encoder reads them only for a window about to emit.
+pub struct MemoryGauges {
+    /// The process's physical footprint in bytes (`ri_phys_footprint`).
+    ///
+    /// The task ledger figure the Metal HUD's app memory and Activity
+    /// Monitor's memory column show, for the whole process: Wine, the
+    /// game and both runtimes of this layer.
+    pub process_footprint: u64,
+    /// Bytes the `MTLDevice` reports as allocated (`currentAllocatedSize`).
+    pub metal_allocated: u64,
+    /// Padded staging bytes under the encoder's cached per-level `bytesNoCopy` wrappers.
+    ///
+    /// Each wrapper keeps its guest pages alive, so this is staging the PE
+    /// side cannot free while the wrapper stays cached.
+    pub staging_wrapped: u64,
 }
 
 /// Absolute process-wide page-fault counts sampled at window close.
@@ -5939,6 +5965,17 @@ impl<'a> Summary<'a> {
             Some(&format!("peak {tex_peak_fmt}")),
             "encoder: blit source staging Arcs (separate from VB/IB retention; MTLTexture handles in destroys)",
         );
+        self.res_row(
+            out,
+            "wrapped",
+            &self
+                .caches
+                .memory
+                .as_ref()
+                .map_or_else(|| "n/a".to_owned(), |m| format_bytes(m.staging_wrapped)),
+            None,
+            "encoder: staging under cached per-level bytesNoCopy wrappers at the summary (pins its guest pages)",
+        );
         // AddDirtyRect probe: does the game declare a changed sub-region we
         // could use to shrink the whole-mip preserve into a dirty-rect
         // snapshot upload? `partial` counts rects narrower than the mip;
@@ -6332,7 +6369,29 @@ impl<'a> Summary<'a> {
             Some(&format!("{minflt_per_frame:.1} min/frame")),
             "process-wide getrusage delta this window (all threads); zero-fill faults on fresh pages land here",
         );
+        let memory = self.caches.memory.as_ref();
+        self.res_row(
+            out,
+            "footprint",
+            &memory.map_or_else(|| "n/a".to_owned(), |m| format_bytes(m.process_footprint)),
+            None,
+            "process phys_footprint at the summary, the Metal HUD's app memory (Wine and the game included)",
+        );
+        self.res_row(
+            out,
+            "metal alloc",
+            &memory.map_or_else(|| "n/a".to_owned(), |m| format_bytes(m.metal_allocated)),
+            None,
+            "MTLDevice currentAllocatedSize at the summary (every Metal allocation of the process)",
+        );
     }
+}
+
+/// A byte gauge in the grid's KB/MB form.
+#[cfg(perf_tracking)]
+fn format_bytes(bytes: u64) -> String {
+    let kb = mtld3d_shared::tsc::u64_to_f64_exact(bytes) / 1024.0;
+    format_kb_pair(kb, kb).0
 }
 
 /// Builder for the `perf-kv v1` line logged after each summary grid.
@@ -6692,6 +6751,9 @@ fn render_kv(w: &PerfWindow, c: &PerfWindow, caches: &CacheSizes, window_secs: f
     kv.total("tex_destroy", c.texture_destroys.sum);
     kv.count("tex_retention_peak", c.pending_blit_retention_depth.max);
     kv.bytes("tex_staging_retained", c.tex_staging_retained_bytes.max);
+    if let Some(memory) = &caches.memory {
+        kv.bytes("tex_staging_wrapped", memory.staging_wrapped);
+    }
     kv.total("tex_dirtyrect_calls", c.texture_add_dirty_calls.sum);
     kv.total("tex_dirtyrect_partial", c.texture_add_dirty_partial.sum);
 
@@ -6703,6 +6765,9 @@ fn render_kv(w: &PerfWindow, c: &PerfWindow, caches: &CacheSizes, window_secs: f
     kv.count("cache_programs", widen(caches.programs));
     kv.count("cache_libs", widen(caches.libs));
     kv.count("cache_depth_states", widen(caches.depth_states));
+    if let Some(memory) = &caches.memory {
+        kv.bytes("metal_allocated", memory.metal_allocated);
+    }
 
     // Commands / passes and the per-draw slow paths.
     kv.total("passes", c.passes.sum);
@@ -6755,6 +6820,9 @@ fn render_kv(w: &PerfWindow, c: &PerfWindow, caches: &CacheSizes, window_secs: f
     if let Some(faults) = &c.faults_window {
         kv.total("faults_minor", faults.minor);
         kv.total("faults_major", faults.major);
+    }
+    if let Some(memory) = &caches.memory {
+        kv.bytes("process_footprint", memory.process_footprint);
     }
     kv
 }

@@ -20,9 +20,9 @@ use objc2_metal::{
 };
 
 use super::{
-    BufferGpuState, DepthSnapshot, DestroyKind, StageLibHandles, StretchScratch, WarmCache,
-    cached_buffer_handles, destroy_resources_bulk, drain_source_scratch, take_released_buffer,
-    take_source_scratch,
+    BufferGpuState, DepthSnapshot, DestroyKind, MipStagingBuffer, StageLibHandles, StretchScratch,
+    TextureGpuState, WarmCache, cached_buffer_handles, destroy_resources_bulk,
+    drain_source_scratch, staging_wrapped_bytes, take_released_buffer, take_source_scratch,
 };
 
 struct NativeObjects {
@@ -477,4 +477,48 @@ fn shutdown_collects_staged_device_buffers_and_direct_wrappers() {
     let mut handles = cached_buffer_handles(&cache);
     handles.sort_unstable();
     assert_eq!(handles, [0xC200, 0xD100]);
+}
+
+/// A cached level wrapper over `length` staging bytes, or an empty slot for a null `handle`.
+fn wrapper(handle: u64, length: u64) -> MipStagingBuffer {
+    MipStagingBuffer {
+        handle: buffer(handle),
+        backing_ptr: handle << 16,
+        length,
+        keepalive: None,
+    }
+}
+
+/// A cached texture whose level slots are `levels`.
+fn wrapped_texture(levels: Vec<MipStagingBuffer>) -> TextureGpuState {
+    TextureGpuState {
+        views: mtld3d_shared::texture_views::TextureViews::EMPTY,
+        mip_staging_buffers: levels,
+    }
+}
+
+/// The wrapper gauge sums every populated level slot of every cached texture.
+///
+/// An empty slot (a level never uploaded, or one whose wrapper was parked)
+/// adds nothing, whatever length it last recorded.
+#[test]
+fn the_wrapper_gauge_counts_populated_level_slots_only() {
+    let mut cache = rustc_hash::FxHashMap::default();
+    assert_eq!(staging_wrapped_bytes(&cache), 0);
+    cache.insert(
+        mtld3d_core::ids::TextureId::from_raw(1),
+        wrapped_texture(vec![
+            wrapper(0x10, 64 << 10),
+            wrapper(0x11, 16 << 10),
+            wrapper(0, 32 << 10),
+        ]),
+    );
+    cache.insert(
+        mtld3d_core::ids::TextureId::from_raw(2),
+        wrapped_texture(vec![wrapper(0, 16 << 10), wrapper(0x20, 1 << 20)]),
+    );
+    assert_eq!(
+        staging_wrapped_bytes(&cache),
+        (64 << 10) + (16 << 10) + (1 << 20)
+    );
 }

@@ -35,8 +35,8 @@ use mtld3d_core::{
         StoreAction as PassStoreAction, UploadPassTarget,
     },
     perf::{
-        CacheSizes, EncoderPerfState, FrameSummaryContext, OpSub, OpSubDetail, PairShaderId,
-        PairStatsSample,
+        CacheSizes, EncoderPerfState, FrameSummaryContext, MemoryGauges, OpSub, OpSubDetail,
+        PairShaderId, PairStatsSample,
         compilation::{Identity as CompileIdentity, Kind as CompileKind},
         perf_enabled,
     },
@@ -370,6 +370,16 @@ fn drain_source_scratch(
         .map(|(_, snapshot)| snapshot.handle)
         .chain(stretch_scratch.drain().map(|(_, scratch)| scratch.handle))
         .collect()
+}
+
+/// Padded staging bytes under every cached per-level wrapper of `texture_cache`.
+fn staging_wrapped_bytes(texture_cache: &FxHashMap<TextureId, TextureGpuState>) -> u64 {
+    texture_cache
+        .values()
+        .flat_map(|state| &state.mip_staging_buffers)
+        .filter(|slot| !slot.handle.is_null())
+        .map(|slot| slot.length)
+        .sum()
 }
 
 pub struct TextureGpuState {
@@ -2320,11 +2330,13 @@ impl FrameEncoder {
     /// the payload is recycled only afterwards — reproducing the
     /// pre-split ordering exactly.
     fn log_perf_summary(&mut self, payload: &FramePayload, ctx: &FrameSummaryContext, status: i32) {
-        let caches = self.cache_sizes(payload);
-        let cmd_vec_realloc_bytes = self.pass_state.take_cmd_vec_realloc_bytes();
-        // One getrusage call per 2 s window, only when the summary is
+        // The once-per-window reads (getrusage, the footprint, the Metal
+        // allocated size, the wrapper walk) run only when the summary is
         // both enabled and about to emit; every other frame passes None.
-        let task_faults = (perf_enabled() && self.perf.window_due()).then(|| {
+        let due = perf_enabled() && self.perf.window_due();
+        let caches = self.cache_sizes(payload, due.then(|| self.memory_gauges()));
+        let cmd_vec_realloc_bytes = self.pass_state.take_cmd_vec_realloc_bytes();
+        let task_faults = due.then(|| {
             #[cfg(perf_tracking)]
             self.pagebox_pool.log_diagnostics("encoder");
             crate::handlers::task_faults()
@@ -2344,8 +2356,9 @@ impl FrameEncoder {
     /// Walks every cache `HashMap` exactly once; cheap even at debug
     /// log levels because `HashMap::len()` is O(1). The submitted payload owns
     /// this frame's passes and filled scratch arena; the live encoder already
-    /// holds the clean state for the next frame.
-    fn cache_sizes(&self, payload: &FramePayload) -> CacheSizes {
+    /// holds the clean state for the next frame. `memory` is the
+    /// once-per-window [`Self::memory_gauges`] read, `None` on other frames.
+    fn cache_sizes(&self, payload: &FramePayload, memory: Option<MemoryGauges>) -> CacheSizes {
         CacheSizes {
             textures: self.texture_cache.len(),
             pipelines: self.pipeline_cache.len(),
@@ -2360,6 +2373,19 @@ impl FrameEncoder {
             pending_blit_retention_depth: self.blit_retention.queued(),
             pending_resource_retention_depth: self.pending_resource_retention.len(),
             pagebox_pool_bytes: self.pagebox_pool.pooled_bytes() as u64,
+            memory,
+        }
+    }
+
+    /// The process footprint, the device's allocated size and the cached wrappers' bytes.
+    ///
+    /// Two system queries and a walk of every cached texture's level slots, so
+    /// it runs once per summary window, never per frame.
+    fn memory_gauges(&self) -> MemoryGauges {
+        MemoryGauges {
+            process_footprint: crate::handlers::process_footprint(),
+            metal_allocated: u64::try_from(self.device.currentAllocatedSize()).unwrap_or(u64::MAX),
+            staging_wrapped: staging_wrapped_bytes(&self.texture_cache),
         }
     }
 

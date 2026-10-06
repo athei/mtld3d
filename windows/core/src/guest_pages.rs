@@ -13,6 +13,7 @@ use mtld3d_shared::{
     InPtr,
     encoder_wire::{LeaseCompletion, WireError, WireReader, WireWriter},
 };
+use rustc_hash::FxHashMap;
 
 use crate::{
     encoder_value::WireValue,
@@ -134,6 +135,43 @@ impl GuestPageLease {
         self.cells.acquired().publish();
         self.cells.completion().publish();
         self.read = None;
+    }
+}
+
+/// Padded bytes of the allocations only page leases keep, tallied lease by lease.
+///
+/// A lease keeps its allocation through its owner and, until native acquisition, through its
+/// read as well. An allocation whose strong count is no more than the references the tallied
+/// leases hold on it has no other PE holder: the texture let go of that staging and only the
+/// leases, waiting on native code, keep it. Leases of one allocation share its owner `Arc`, so
+/// they are grouped by its address and each allocation counts once.
+#[derive(Default)]
+pub struct LeaseOnlyPages {
+    allocations: FxHashMap<usize, LeasedAllocation>,
+}
+
+impl LeaseOnlyPages {
+    /// Count the references `lease` holds on its allocation.
+    pub fn add(&mut self, lease: &GuestPageLease) {
+        let refs = 1 + usize::from(lease.read.is_some());
+        self.allocations
+            .entry(Arc::as_ptr(&lease.owner).addr())
+            .or_insert_with(|| LeasedAllocation {
+                padded: lease.owner.len() as u64,
+                lease_refs: 0,
+                strong: Arc::strong_count(&lease.owner),
+            })
+            .lease_refs += refs;
+    }
+
+    /// Padded bytes of every tallied allocation no holder but the leases keeps.
+    #[must_use]
+    pub fn bytes(&self) -> u64 {
+        self.allocations
+            .values()
+            .filter(|allocation| allocation.lease_refs >= allocation.strong)
+            .map(|allocation| allocation.padded)
+            .sum()
     }
 }
 
@@ -296,6 +334,15 @@ impl WireValue for GuestPageDescriptor {
         value.validate()?;
         Ok(value)
     }
+}
+
+/// One allocation's share of [`LeaseOnlyPages`].
+struct LeasedAllocation {
+    padded: u64,
+    /// The references the tallied leases hold: each owner, and each read not yet released.
+    lease_refs: usize,
+    /// The owner `Arc`'s strong count when the allocation was first tallied.
+    strong: usize,
 }
 
 fn valid_range(address: u64, length: u64, alignment: usize) -> bool {
