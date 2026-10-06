@@ -6374,6 +6374,7 @@ fn apply_submit_rules(s: &mut PassState) {
     s.strip_dead_color_in_clear_only_passes();
     s.cull_dead_clear_only_passes();
     s.merge_adjacent_identical_passes();
+    s.discard_covered_color_loads();
 }
 
 #[test]
@@ -10588,4 +10589,222 @@ fn rule_h_strips_a_pass_whose_placeholders_were_resolved() {
         "every bind swapped to the sibling: {:?}",
         bound_pipelines(pass)
     );
+}
+
+/// Bind `target` alone at `size` the way the `StretchRect` render quad does, and draw over it all.
+///
+/// No depth attachment, a viewport over the whole target, and the pass for
+/// the quad opened through `open_pass_for_covering_draw`, then closed.
+fn covering_copy(s: &mut PassState, target: MetalHandle<MTLTextureKind>, size: (u32, u32)) {
+    s.set_color_render_target(target, size.0, size.1, RT_FORMAT, RenderScale::IDENTITY);
+    s.set_depth_stencil_attachment(MetalHandle::NULL, (0, 0), false, false);
+    s.set_viewport(0, 0, size.0, size.1, 0.0, 1.0);
+    s.open_pass_for_covering_draw();
+    s.note_color_read_back(target);
+    s.emit_command(dummy_draw());
+    s.end_current_pass("stretch_blit_scaled");
+}
+
+#[test]
+fn rule_k_discards_the_load_of_a_pass_its_first_draw_covers() {
+    let target = tex(0x3000);
+    let mut s = fresh();
+    covering_copy(&mut s, target, (1280, 720));
+    // The pass opens like any other on a game render target, and every rule
+    // before Rule K sees that load.
+    assert_eq!(s.passes()[0].color_load(), ColorLoad::Load);
+
+    apply_submit_rules(&mut s);
+
+    // Rule A's correction would put a sampled target's discard back; the
+    // copy marked the target read, and the discard still stands, since no
+    // pixel of the result comes from the load.
+    assert_eq!(s.passes().len(), 1);
+    assert_eq!(s.passes()[0].color_texture(), target);
+    assert_eq!(s.passes()[0].color_load(), ColorLoad::DontCare);
+    assert_eq!(s.passes()[0].color_store(), StoreAction::Store);
+}
+
+#[test]
+fn rule_k_leaves_a_pass_that_was_opened_the_ordinary_way() {
+    // The same pass opened through `ensure_pass_open`, as a copy into part
+    // of the target is, keeps its load.
+    let target = tex(0x3000);
+    let mut s = fresh();
+    s.set_color_render_target(target, 1280, 720, RT_FORMAT, RenderScale::IDENTITY);
+    s.set_depth_stencil_attachment(MetalHandle::NULL, (0, 0), false, false);
+    s.set_viewport(0, 0, 640, 360, 0.0, 1.0);
+    s.ensure_pass_open();
+    s.emit_command(dummy_draw());
+    s.end_current_pass("stretch_blit_scaled");
+
+    apply_submit_rules(&mut s);
+
+    assert_eq!(s.passes()[0].color_load(), ColorLoad::Load);
+}
+
+#[test]
+fn rule_k_leaves_a_pass_that_was_already_open_with_draws() {
+    // A copy into the target already bound without depth joins the open
+    // pass, whose load serves the draws it holds before the quad.
+    let target = tex(0x3000);
+    let mut s = fresh();
+    s.set_color_render_target(target, 1280, 720, RT_FORMAT, RenderScale::IDENTITY);
+    s.set_depth_stencil_attachment(MetalHandle::NULL, (0, 0), false, false);
+    s.set_viewport(0, 0, 1280, 720, 0.0, 1.0);
+    s.emit_command(dummy_draw());
+    s.open_pass_for_covering_draw();
+    s.emit_command(dummy_draw());
+    s.end_current_pass("stretch_blit_scaled");
+
+    apply_submit_rules(&mut s);
+
+    assert_eq!(s.passes().len(), 1);
+    assert_eq!(s.passes()[0].color_load(), ColorLoad::Load);
+}
+
+#[test]
+fn rule_k_keeps_a_pending_clear_the_covered_pass_opens_with() {
+    let target = tex(0x3000);
+    let mut s = fresh();
+    s.set_color_render_target(target, 1280, 720, RT_FORMAT, RenderScale::IDENTITY);
+    s.set_depth_stencil_attachment(MetalHandle::NULL, (0, 0), false, false);
+    s.set_viewport(0, 0, 1280, 720, 0.0, 1.0);
+    s.clear_color(1, 2, 3, 4);
+    s.open_pass_for_covering_draw();
+    s.emit_command(dummy_draw());
+    s.end_current_pass("stretch_blit_scaled");
+
+    apply_submit_rules(&mut s);
+
+    let cleared = ColorLoad::Clear {
+        r: 1,
+        g: 2,
+        b: 3,
+        a: 4,
+    };
+    assert_eq!(s.passes()[0].color_load(), cleared);
+}
+
+#[test]
+fn rule_k_keeps_a_clear_rule_e_folds_into_the_covered_pass() {
+    // A clear of the target, a detour through another target, then the
+    // covering copy: Rule E finds the copy's pass loading and folds the
+    // clear into it, as it did before Rule K existed.
+    let target = tex(0x3000);
+    let mut s = fresh();
+    s.set_color_render_target(target, 1280, 720, RT_FORMAT, RenderScale::IDENTITY);
+    s.set_depth_stencil_attachment(MetalHandle::NULL, (0, 0), false, false);
+    s.clear_color(1, 2, 3, 4);
+    s.set_color_render_target(tex(0x3100), 1280, 720, RT_FORMAT, RenderScale::IDENTITY);
+    covering_copy(&mut s, target, (1280, 720));
+    assert_eq!(s.passes().len(), 2, "the clear-only pass and the copy");
+
+    apply_submit_rules(&mut s);
+
+    assert_eq!(s.passes().len(), 1, "the clear folds into the copy's pass");
+    assert_eq!(s.passes()[0].color_texture(), target);
+    assert!(matches!(
+        s.passes()[0].color_load(),
+        ColorLoad::Clear { .. }
+    ));
+}
+
+#[test]
+fn rule_k_leaves_a_covered_pass_rule_j_joins_onto_the_one_before() {
+    // A pass drawn into the target alone, then the covering copy into it on
+    // the same attachments: Rule J joins the copy onto that pass, whose own
+    // load serves its draws, so the joined pass keeps loading.
+    let target = tex(0x3000);
+    let mut s = fresh();
+    s.set_color_render_target(target, 1280, 720, RT_FORMAT, RenderScale::IDENTITY);
+    s.set_depth_stencil_attachment(MetalHandle::NULL, (0, 0), false, false);
+    s.set_viewport(0, 0, 1280, 720, 0.0, 1.0);
+    s.emit_command(dummy_draw());
+    s.end_current_pass("test");
+    covering_copy(&mut s, target, (1280, 720));
+    assert_eq!(s.passes().len(), 2);
+
+    apply_submit_rules(&mut s);
+
+    assert_eq!(s.passes().len(), 1, "the copy joins the pass before it");
+    assert_eq!(s.passes()[0].color_load(), ColorLoad::Load);
+}
+
+#[test]
+fn rule_k_discards_the_load_of_a_covered_multisampled_target() {
+    // The quad writes every sample of each pixel it covers, so the companion
+    // the pass attaches has nothing to load either.
+    let target = tex(0x3000);
+    let companion = tex(0x3001);
+    let mut s = fresh();
+    s.set_color_render_target(target, 1280, 720, RT_FORMAT, RenderScale::IDENTITY);
+    s.set_color_msaa(companion, MetalHandle::NULL, 4);
+    s.set_depth_stencil_attachment(MetalHandle::NULL, (0, 0), false, false);
+    s.set_viewport(0, 0, 1280, 720, 0.0, 1.0);
+    s.open_pass_for_covering_draw();
+    s.emit_command(dummy_draw());
+    s.end_current_pass("stretch_blit_scaled");
+
+    apply_submit_rules(&mut s);
+
+    let pass = &s.passes()[0];
+    assert_eq!(pass.color_attachment_texture(), companion);
+    assert_eq!(pass.color_load(), ColorLoad::DontCare);
+}
+
+#[test]
+fn rule_k_keeps_the_discard_when_rule_j_joins_later_draws_onto_the_covered_pass() {
+    // The copy into a texture the game then draws into, on the same
+    // attachments: Rule J joins the draws onto the copy's pass, whose quad
+    // still runs first, so the joined pass keeps the discard.
+    let target = tex(0x3000);
+    let mut s = fresh();
+    covering_copy(&mut s, target, (1280, 720));
+    s.emit_command(dummy_draw());
+    s.emit_command(dummy_draw());
+    s.end_current_pass("test");
+    assert_eq!(s.passes().len(), 2);
+    assert_eq!(s.passes()[1].color_load(), ColorLoad::Load);
+
+    apply_submit_rules(&mut s);
+
+    assert_eq!(s.passes().len(), 1, "the draws join the copy's pass");
+    let pass = &s.passes()[0];
+    assert_eq!(pass.color_texture(), target);
+    assert_eq!(
+        pass.commands().iter().filter(|c| c.is_draw()).count(),
+        3,
+        "the quad and the two draws"
+    );
+    assert_eq!(pass.color_load(), ColorLoad::DontCare);
+    assert_eq!(pass.color_store(), StoreAction::Store);
+}
+
+#[test]
+fn rule_k_leaves_a_pass_with_another_colour_target_beside_render_target_0() {
+    // The quad writes render target 0 alone, so an extra target bound beside
+    // it would keep whatever it held only through its load.
+    let target = tex(0x3000);
+    let mut s = fresh();
+    s.set_color_render_target(
+        target,
+        BB_SIZE.0,
+        BB_SIZE.1,
+        RT_FORMAT,
+        RenderScale::IDENTITY,
+    );
+    s.set_extra_color_render_target(1, Some(slot(tex(0x3100), BB_SIZE)));
+    s.set_depth_stencil_attachment(MetalHandle::NULL, (0, 0), false, false);
+    s.set_viewport(0, 0, BB_SIZE.0, BB_SIZE.1, 0.0, 1.0);
+    s.open_pass_for_covering_draw();
+    s.emit_command(dummy_draw());
+    s.end_current_pass("test");
+    assert!(s.passes()[0].extra_color()[0].is_bound());
+
+    apply_submit_rules(&mut s);
+
+    let pass = &s.passes()[0];
+    assert_eq!(pass.color_load(), ColorLoad::Load);
+    assert_eq!(pass.extra_color()[0].load(), ColorLoad::Load);
 }

@@ -284,6 +284,19 @@ const ENABLE_SKIP_DEAD_DRAWS: bool = true;
 /// join does not model.
 const ENABLE_MERGE_ADJACENT_PASSES: bool = true;
 
+/// Compile-time gate for Rule K (`DontCare` under a first draw that covers render target 0).
+///
+/// A pass opened through [`PassState::open_pass_for_covering_draw`] starts
+/// with a draw its caller knows writes every pixel and sample of render target
+/// 0, the `StretchRect` render quad over a whole destination level, so
+/// nothing the pass would load survives that draw. The pass still opens with
+/// `Load`, and every other rule reasons over that `Load` as before; once they
+/// have run, a covered pass that still loads discards instead. Not a
+/// divergence: the load it removes is one no pixel of the result reads. Flip
+/// to `false` if a covering caller turns out to leave part of the attachment
+/// unwritten.
+const ENABLE_COVERED_COLOR_DONTCARE: bool = true;
+
 /// The blend factor, as a `D3DCOLOR`, that a fresh Metal render encoder blends with.
 ///
 /// A fresh encoder blends with (0, 0, 0, 0), not with D3D9's default opaque
@@ -918,17 +931,10 @@ pub struct Pass {
     ///
     /// See [`PassDepthFlags`] for the bits.
     depth_flags: PassDepthFlags,
-    /// Latched `true` as soon as any draw arrives at the pass with `D3DRS_COLORWRITEENABLE != 0`.
+    /// What the pass's draws did with render target 0.
     ///
-    /// Default `false` at pass-open. When the pass closes with this still
-    /// `false` AND at least one real (non-clear-quad) draw was emitted,
-    /// Rule H (`strip_color_from_no_color_draw_passes`) strips the color
-    /// attachment and rewrites the pass's `SetRenderPipelineState`
-    /// commands to bind the matching no-color pipeline variant —
-    /// eliminating Apple's "Unused Texture" warning on cascade caster
-    /// passes where every draw runs with color writes masked off but
-    /// the bound pipeline still declares a color output.
-    color_writes_observed: bool,
+    /// See [`PassColorFlags`] for the bits.
+    color_flags: PassColorFlags,
     /// `[start, end)` command-index ranges of color clear-quad blocks emitted into this pass.
     ///
     /// Recorded by `PassState::open_color_clear_quad_block` /
@@ -1099,7 +1105,9 @@ impl Pass {
         self.depth_flags |=
             next.depth_flags & (PassDepthFlags::USED | PassDepthFlags::STENCIL_WRITTEN);
         self.has_counting_visibility |= next.has_counting_visibility;
-        self.color_writes_observed |= next.color_writes_observed;
+        // Whether this pass's first draw covers render target 0 stays this
+        // pass's own: the joined draws run after it.
+        self.color_flags |= next.color_flags & PassColorFlags::WRITES_OBSERVED;
     }
     /// The per-pass half of [`PassState::resolve_pending_pipelines`].
     fn resolve_pending_pipelines(
@@ -1320,7 +1328,7 @@ impl Pass {
 
     #[must_use]
     pub const fn color_writes_observed(&self) -> bool {
-        self.color_writes_observed
+        self.color_flags.contains(PassColorFlags::WRITES_OBSERVED)
     }
 
     #[must_use]
@@ -1484,6 +1492,30 @@ bitflags::bitflags! {
         const USED = 1 << 2;
         /// A draw or clear-quad in the pass can write the stencil plane.
         const STENCIL_WRITTEN = 1 << 3;
+    }
+}
+
+bitflags::bitflags! {
+    /// What the draws of a pass did with its render target 0.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    struct PassColorFlags: u8 {
+        /// A draw arrived at the pass with `D3DRS_COLORWRITEENABLE != 0`.
+        ///
+        /// Clear when the pass opens. When the pass closes with this still
+        /// clear AND at least one real (non-clear-quad) draw was emitted,
+        /// Rule H (`strip_color_from_no_color_draw_passes`) strips the color
+        /// attachment and rewrites the pass's `SetRenderPipelineState`
+        /// commands to bind the matching no-color pipeline variant,
+        /// eliminating Apple's "Unused Texture" warning on cascade caster
+        /// passes where every draw runs with color writes masked off but the
+        /// bound pipeline still declares a color output.
+        const WRITES_OBSERVED = 1 << 0;
+        /// The first draw of the pass writes every pixel and sample of render target 0.
+        ///
+        /// Set by [`PassState::open_pass_for_covering_draw`] on the pass it
+        /// opens, and read by Rule K. A pass joined onto another by Rule J
+        /// leaves it behind, since its draws then follow the other pass's.
+        const FIRST_DRAW_COVERS = 1 << 1;
     }
 }
 
@@ -3209,7 +3241,7 @@ impl PassState {
         if mask != 0
             && let Some(pass) = self.passes.last_mut()
         {
-            pass.color_writes_observed = true;
+            pass.color_flags.insert(PassColorFlags::WRITES_OBSERVED);
         }
     }
 
@@ -3495,8 +3527,41 @@ impl PassState {
     /// opening a pass is the out-of-line `open_pass`.
     #[inline]
     pub fn ensure_pass_open(&mut self) {
-        if self.current_pass_closed || self.passes.is_empty() {
+        if self.opens_pass() {
             self.open_pass();
+        }
+    }
+
+    /// Whether the next command opens a pass rather than joining the open one.
+    #[inline]
+    const fn opens_pass(&self) -> bool {
+        self.current_pass_closed || self.passes.is_empty()
+    }
+
+    /// Ensure a pass is live for a draw that writes every pixel and sample of render target 0.
+    ///
+    /// The caller vouches for the draw, which has to be the next one the pass
+    /// records. Only a pass this call opens is marked
+    /// `PassColorFlags::FIRST_DRAW_COVERS`: a pass already open has draws
+    /// of its own, and its load serves them. Nor is a pass with other colour
+    /// targets beside render target 0, which the draw does not write. The pass
+    /// opens with the load action any other opening gives it; Rule K
+    /// ([`Self::discard_covered_color_loads`]) acts on the mark once the other
+    /// rules have run.
+    pub fn open_pass_for_covering_draw(&mut self) {
+        let opens = self.opens_pass();
+        self.ensure_pass_open();
+        if opens
+            && let Some(pass) = self.passes.last_mut()
+            && !pass.color_texture.is_null()
+            && !pass.extra_color.iter().any(PassColorAttachment::is_bound)
+        {
+            debug_assert_eq!(
+                pass.viewport,
+                (0, 0, pass.color_size.0, pass.color_size.1),
+                "a draw that covers render target 0 runs under a viewport that covers it"
+            );
+            pass.color_flags.insert(PassColorFlags::FIRST_DRAW_COVERS);
         }
     }
 
@@ -3755,7 +3820,7 @@ impl PassState {
             leading_blits,
             has_counting_visibility: false,
             depth_flags: self.pass_depth_flags(),
-            color_writes_observed: false,
+            color_flags: PassColorFlags::empty(),
             color_clear_quad_ranges: Vec::new(),
             extra_color,
         };
@@ -3910,7 +3975,7 @@ impl PassState {
             depth_flags: PassDepthFlags::empty(),
             // The quad writes colour, so Rule H must not strip the attachment
             // it renders into.
-            color_writes_observed: true,
+            color_flags: PassColorFlags::WRITES_OBSERVED,
             color_clear_quad_ranges: Vec::new(),
             extra_color: [PassColorAttachment::NONE; 3],
         };
@@ -4109,7 +4174,7 @@ impl PassState {
             leading_blits: core::mem::take(&mut self.pending_leading_blits),
             has_counting_visibility: false,
             depth_flags: self.pass_depth_flags(),
-            color_writes_observed: false,
+            color_flags: PassColorFlags::empty(),
             color_clear_quad_ranges: Vec::new(),
             extra_color: core::array::from_fn(|_| PassColorAttachment::NONE),
         });
@@ -5150,7 +5215,7 @@ impl PassState {
             return;
         }
         for pass in &mut self.passes {
-            if pass.color_writes_observed
+            if pass.color_flags.contains(PassColorFlags::WRITES_OBSERVED)
                 || pass.color_texture.is_null()
                 || pass.depth_texture.is_null()
                 // Without the colour attachment the depth attachment alone
@@ -5342,8 +5407,9 @@ impl PassState {
     ///
     /// Only adjacent passes join, walked front to back so a run of them
     /// becomes one pass. The upload prefix is left alone: it is submitted in a
-    /// command buffer of its own. Runs last, after Rule F has taken out the
-    /// empty passes that would otherwise separate two joinable ones.
+    /// command buffer of its own. Runs after Rule F has taken out the empty
+    /// passes that would otherwise separate two joinable ones, and before
+    /// Rule K, so a pass that loads can still join the one before it.
     pub fn merge_adjacent_identical_passes(&mut self) {
         if !ENABLE_MERGE_ADJACENT_PASSES {
             return;
@@ -5382,6 +5448,38 @@ impl PassState {
             }
         }
         self.passes.truncate(write + 1);
+    }
+
+    /// Rule K: discard the load of render target 0 under a first draw that covers it.
+    ///
+    /// Acts on the passes [`Self::open_pass_for_covering_draw`] marked whose
+    /// render target 0 still loads. A `Clear` Rule E folded into such a pass
+    /// stays, since a clear load costs no more than a discard, and a pass
+    /// Rule J joined onto the one before it is no longer one of them. Runs
+    /// after every other rule, which therefore all reasoned over the `Load`:
+    /// a covered pass that discarded from the start would stop Rule E from
+    /// folding a clear into it and Rule J from joining it onto the pass before,
+    /// and Rule A's correction would put the load back whenever anything
+    /// samples the attachment, though no pixel of the result reads it.
+    pub fn discard_covered_color_loads(&mut self) {
+        if !ENABLE_COVERED_COLOR_DONTCARE {
+            return;
+        }
+        for pass in &mut self.passes {
+            if pass.color_flags.contains(PassColorFlags::FIRST_DRAW_COVERS)
+                && !pass.color_texture.is_null()
+                && matches!(pass.color_load, ColorLoad::Load)
+            {
+                pass.color_load = ColorLoad::DontCare;
+                if log_enabled!(target: TRACE_TARGET, Level::Trace) {
+                    trace!(
+                        target: TRACE_TARGET,
+                        "pass-load color={:#x} Load → DontCare (its first draw covers it)",
+                        pass.color_texture,
+                    );
+                }
+            }
+        }
     }
 
     /// Rule I: drop clear-only passes whose every cleared target is overwritten before a read.

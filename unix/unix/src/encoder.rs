@@ -4357,13 +4357,18 @@ impl FrameEncoder {
     /// packed YUV formats, which it converts to RGB while sampling); `filter`
     /// is the D3D9 `D3DTEXF_*` value (POINT / LINEAR).
     ///
-    /// The destination pass opens with `loadAction = Load` (or `DontCare` when
-    /// the dst rect covers the whole attachment — both correct, the quad
-    /// overwrites exactly the scissor rect) so content outside the dst rect is
-    /// preserved. The prior render-target / depth / viewport binding is saved
-    /// and restored around the pass, so a `StretchRect` mid-frame doesn't
-    /// perturb the device's current RT. `note_color_read_back` marks the dst as
-    /// read, so the store-action rules treat its content as live.
+    /// The destination pass opens with `loadAction = Load`, so content outside
+    /// the dst rect is preserved. When the dst rect covers the whole
+    /// destination level, the quad is the pass's first draw and writes every
+    /// pixel and sample of it, so the pass is opened through
+    /// `open_pass_for_covering_draw` and its load becomes `DontCare` (Rule K).
+    /// A pass that is already open on the destination keeps its load, which
+    /// serves the draws it holds.
+    ///
+    /// The prior render-target / depth / viewport binding is saved and
+    /// restored around the pass, so a `StretchRect` mid-frame doesn't perturb
+    /// the device's current RT. `note_color_read_back` marks the dst as read,
+    /// so the store-action rules treat its content as live.
     pub fn stretch_blit_scaled(
         &mut self,
         src: &BlitSide,
@@ -4511,7 +4516,11 @@ impl FrameEncoder {
             "blit-quad pipeline format must equal the pass's attachment format"
         );
         let passes_before = self.pass_state.passes().len();
-        self.pass_state.ensure_pass_open();
+        if mtld3d_core::stretch_rect::quad_covers_destination(dst_rect, dst_dims) {
+            self.pass_state.open_pass_for_covering_draw();
+        } else {
+            self.pass_state.ensure_pass_open();
+        }
         self.reset_last_bound_if_pass_opened(passes_before);
         // The destination's content survives the readback that drives the
         // conformance check (and any real `GetRenderTargetData`).
@@ -9700,8 +9709,11 @@ fn trailing_blit_descriptor(trailing_blits: &[BlitCommand]) -> PassDescriptor {
 /// to the no-color variant so Metal's RP-format validation stays happy.
 /// Rule F drops clear-only passes that nothing observes; must run after
 /// Rule G so the cull picks up the strip. Rule J joins each remaining pass
-/// into the one before it when both bind the same attachments; it runs last
-/// so the passes Rule F dropped no longer separate two it can join.
+/// into the one before it when both bind the same attachments; it runs after
+/// Rule F so the passes Rule F dropped no longer separate two it can join.
+/// Rule K runs last: a pass whose first draw covers render target 0 and that
+/// still loads it discards instead, after every other rule has seen the
+/// `Load` it opened with.
 fn apply_pass_rules(enc: &mut FrameEncoder, frame_continues: bool) {
     enc.pass_state.drop_overwritten_clear_only_passes();
     enc.pass_state.coalesce_clear_only_passes();
@@ -9712,6 +9724,7 @@ fn apply_pass_rules(enc: &mut FrameEncoder, frame_continues: bool) {
         .strip_color_from_no_color_draw_passes(&enc.no_color_pipeline_alt);
     enc.pass_state.cull_dead_clear_only_passes();
     enc.pass_state.merge_adjacent_identical_passes();
+    enc.pass_state.discard_covered_color_loads();
 }
 
 /// Per-frame cascade summary probe.
