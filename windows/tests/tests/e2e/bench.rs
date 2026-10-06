@@ -213,6 +213,15 @@ pub const MIN_P99_SAMPLES: usize = 50;
 /// Edge of every pattern texture, in texels.
 const TEXTURE_EDGE: u32 = 64;
 
+/// The `perf-kv` keys of the retention queues' bytes, which [`perf_rule`] records as `info`.
+///
+/// Each holds the entries of every frame still in flight at the window's
+/// worst frame, so it moves in whole frames of intake with the GPU's
+/// timing ([`Metrics::perf`] says what that leaves unjudged). Named one by
+/// one, so a footprint gauge added later with the same suffix stays
+/// `bytes`.
+const RETAINED_BYTES_KEYS: [&str; 2] = ["vbib_retained_bytes", "tex_staging_retained_bytes"];
+
 /// The shader model of a programmable material.
 pub enum Model {
     /// `vs_2_0` with `ps_2_0`.
@@ -1610,14 +1619,25 @@ impl Metrics {
     ///   weighted by the event's count where the line carries it
     ///   (`comp_async_latency_avg_ms` by `comp_async_installs_total`) and by
     ///   frames otherwise.
-    /// - `_bytes`, a peak size: `perf.<key>` in bytes, `bytes`, the largest.
+    /// - `_bytes`, a peak size: `perf.<key>` in bytes, the largest; `bytes`,
+    ///   but `info` for the two retention queues' bytes
+    ///   ([`RETAINED_BYTES_KEYS`]), which hold the entries of every frame
+    ///   still in flight at the window's worst frame, so one more frame in
+    ///   flight moves them by a whole frame's intake. A change that keeps a
+    ///   queue's entries up to a frame or so longer than the frames in
+    ///   flight reaches no judged row: it reads the same as the GPU running
+    ///   three frames behind instead of four. What stays judged is what
+    ///   enters a queue: for VB/IB, the bytes renamed per frame
+    ///   (`vbib_rename_bytes_total`, `noisy`) and the retention cap's counts
+    ///   (`vbib_ret_cap_*_total`, `noisy`, which on a zero base need more
+    ///   than two a frame); for textures, the uploads per frame
+    ///   (`tex_uploads_total`, `exact` over [`FrameWork::Fixed`] frames),
+    ///   with no cap on that queue.
     /// - `_count`, a count gauge: `perf.<key>` in counts, the largest; `exact`
     ///   for a cache size (`cache_*_count`) when the frames are
     ///   [`FrameWork::Fixed`], `info` for a retention queue's peak depth
-    ///   (`*_retention_peak_count`), which counts the entries of every frame
-    ///   still in flight at the window's worst frame, `noisy` otherwise. A
-    ///   change in the bytes a queue holds stays judged, past the 4 MiB
-    ///   floor, through its peak bytes (`_bytes`).
+    ///   (`*_retention_peak_count`), which moves with the frames in flight
+    ///   as its bytes do, `noisy` otherwise.
     /// - `_total`, a window's count: `perf.<key less _total>_pf`, the
     ///   windows' totals over their frames to three places, in bytes for a
     ///   `_bytes_total` and in counts otherwise. A count the API calls fix
@@ -2073,7 +2093,12 @@ fn perf_rule(key: &str, work: &FrameWork) -> Option<PerfRule> {
         return rule(own(), Fold::FrameMean(set), PerfUnit::Ms, 4, Class::Time);
     }
     if key.ends_with("_bytes") {
-        return rule(own(), Fold::Max, PerfUnit::Bytes, 0, Class::Bytes);
+        let class = if RETAINED_BYTES_KEYS.contains(&key) {
+            Class::Info
+        } else {
+            Class::Bytes
+        };
+        return rule(own(), Fold::Max, PerfUnit::Bytes, 0, class);
     }
     if key.ends_with("_count") {
         // A retention peak counts the entries of every frame still in flight.
