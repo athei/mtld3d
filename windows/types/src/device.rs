@@ -215,6 +215,12 @@ pub const D3DUSAGE_QUERY_VERTEXTEXTURE: u32 = 0x0010_0000;
 pub const D3DUSAGE_QUERY_WRAPANDMIP: u32 = 0x0020_0000;
 pub const D3DUSAGE_NONSECURE: u32 = 0x0080_0000;
 pub const D3DUSAGE_DMAP: u32 = 0x0000_4000;
+/// `D3DUSAGE_RESTRICTED_CONTENT`, an extended-device usage for protected content.
+pub const D3DUSAGE_RESTRICTED_CONTENT: u32 = 0x0000_0800;
+/// `D3DUSAGE_RESTRICT_SHARED_RESOURCE_DRIVER`, an extended-device usage for a shared resource.
+pub const D3DUSAGE_RESTRICT_SHARED_RESOURCE_DRIVER: u32 = 0x0000_1000;
+/// `D3DUSAGE_RESTRICT_SHARED_RESOURCE`, an extended-device usage for a shared resource.
+pub const D3DUSAGE_RESTRICT_SHARED_RESOURCE: u32 = 0x0000_2000;
 
 // ── D3D9 resource pools (`D3DPOOL`, the `Pool` arg of the Create*
 // methods) ──
@@ -356,6 +362,7 @@ pub const D3DFMT_D16: u32 = 80;
 pub const D3DFMT_D32F_LOCKABLE: u32 = 82;
 pub const D3DFMT_D24FS8: u32 = 83;
 pub const D3DFMT_D32_LOCKABLE: u32 = 84;
+pub const D3DFMT_S8_LOCKABLE: u32 = 85;
 
 // ── D3D9 FOURCC sampleable-depth formats ──
 //
@@ -873,6 +880,17 @@ pub const D3DPRESENT_INTERVAL_THREE: u32 = 0x0000_0004;
 pub const D3DPRESENT_INTERVAL_FOUR: u32 = 0x0000_0008;
 pub const D3DPRESENT_INTERVAL_IMMEDIATE: u32 = 0x8000_0000;
 
+// D3DPRESENT_* flags of `PresentEx` and `IDirect3DSwapChain9::Present`.
+pub const D3DPRESENT_DONOTWAIT: u32 = 0x0000_0001;
+pub const D3DPRESENT_LINEAR_CONTENT: u32 = 0x0000_0002;
+pub const D3DPRESENT_DONOTFLIP: u32 = 0x0000_0004;
+pub const D3DPRESENT_FLIPRESTART: u32 = 0x0000_0008;
+pub const D3DPRESENT_VIDEO_RESTRICT_TO_MONITOR: u32 = 0x0000_0010;
+pub const D3DPRESENT_UPDATEOVERLAYONLY: u32 = 0x0000_0020;
+pub const D3DPRESENT_HIDEOVERLAY: u32 = 0x0000_0040;
+pub const D3DPRESENT_UPDATECOLORKEY: u32 = 0x0000_0080;
+pub const D3DPRESENT_FORCEIMMEDIATE: u32 = 0x0000_0100;
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct D3DPRESENT_PARAMETERS {
@@ -1148,6 +1166,92 @@ pub struct IDirect3DDevice9Vtbl {
     pub delete_patch: unsafe extern "system" fn(*mut c_void, u32) -> i32,
     pub create_query: unsafe extern "system" fn(*mut c_void, u32, *mut *mut c_void) -> i32,
 }
+
+// ── IDirect3DDevice9Ex vtable ──
+
+/// The `IDirect3DDevice9Ex` vtable: the `IDirect3DDevice9` slots, then the fifteen extended ones.
+///
+/// The base table is embedded, so a pointer to this table is a valid pointer
+/// to its `IDirect3DDevice9Vtbl` and the base slots have one definition.
+#[repr(C)]
+pub struct IDirect3DDevice9ExVtbl {
+    pub base: IDirect3DDevice9Vtbl,
+    pub set_convolution_mono_kernel:
+        unsafe extern "system" fn(*mut c_void, u32, u32, *mut f32, *mut f32) -> i32,
+    pub compose_rects: unsafe extern "system" fn(
+        *mut c_void,
+        *mut c_void,
+        *mut c_void,
+        *mut c_void,
+        u32,
+        *mut c_void,
+        u32,
+        i32,
+        i32,
+    ) -> i32,
+    pub present_ex: unsafe extern "system" fn(
+        *mut c_void,
+        *const c_void,
+        *const c_void,
+        *mut c_void,
+        *const c_void,
+        u32,
+    ) -> i32,
+    pub get_gpu_thread_priority: unsafe extern "system" fn(*mut c_void, *mut i32) -> i32,
+    pub set_gpu_thread_priority: unsafe extern "system" fn(*mut c_void, i32) -> i32,
+    pub wait_for_vblank: unsafe extern "system" fn(*mut c_void, u32) -> i32,
+    pub check_resource_residency:
+        unsafe extern "system" fn(*mut c_void, *mut *mut c_void, u32) -> i32,
+    pub set_maximum_frame_latency: unsafe extern "system" fn(*mut c_void, u32) -> i32,
+    pub get_maximum_frame_latency: unsafe extern "system" fn(*mut c_void, *mut u32) -> i32,
+    pub check_device_state: unsafe extern "system" fn(*mut c_void, *mut c_void) -> i32,
+    pub create_render_target_ex: unsafe extern "system" fn(
+        *mut c_void,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        i32,
+        *mut *mut c_void,
+        *mut c_void,
+        u32,
+    ) -> i32,
+    pub create_offscreen_plain_surface_ex: unsafe extern "system" fn(
+        *mut c_void,
+        u32,
+        u32,
+        u32,
+        u32,
+        *mut *mut c_void,
+        *mut c_void,
+        u32,
+    ) -> i32,
+    pub create_depth_stencil_surface_ex: unsafe extern "system" fn(
+        *mut c_void,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        i32,
+        *mut *mut c_void,
+        *mut c_void,
+        u32,
+    ) -> i32,
+    pub reset_ex: unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void) -> i32,
+    pub get_display_mode_ex:
+        unsafe extern "system" fn(*mut c_void, u32, *mut c_void, *mut u32) -> i32,
+}
+
+const VTBL_SLOT: usize = core::mem::size_of::<usize>();
+const _: () = assert!(core::mem::size_of::<IDirect3DDevice9Vtbl>() == 119 * VTBL_SLOT);
+const _: () = assert!(
+    core::mem::offset_of!(IDirect3DDevice9ExVtbl, set_convolution_mono_kernel) == 119 * VTBL_SLOT
+);
+const _: () = assert!(core::mem::offset_of!(IDirect3DDevice9ExVtbl, present_ex) == 121 * VTBL_SLOT);
+const _: () = assert!(core::mem::offset_of!(IDirect3DDevice9ExVtbl, reset_ex) == 132 * VTBL_SLOT);
+const _: () = assert!(core::mem::size_of::<IDirect3DDevice9ExVtbl>() == 134 * VTBL_SLOT);
 
 // ── D3DDISPLAYMODE ──
 
@@ -1517,6 +1621,42 @@ pub struct IDirect3DSwapChain9Vtbl {
     pub get_device: unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> i32,
     pub get_present_parameters: unsafe extern "system" fn(*mut c_void, *mut c_void) -> i32,
 }
+
+/// The `IDirect3DSwapChain9Ex` vtable.
+///
+/// The `IDirect3DSwapChain9` slots, embedded, then the three extended ones.
+#[repr(C)]
+pub struct IDirect3DSwapChain9ExVtbl {
+    pub base: IDirect3DSwapChain9Vtbl,
+    pub get_last_present_count: unsafe extern "system" fn(*mut c_void, *mut u32) -> i32,
+    pub get_present_stats: unsafe extern "system" fn(*mut c_void, *mut D3DPRESENTSTATS) -> i32,
+    pub get_display_mode_ex: unsafe extern "system" fn(*mut c_void, *mut c_void, *mut u32) -> i32,
+}
+
+const _: () = assert!(core::mem::size_of::<IDirect3DSwapChain9Vtbl>() == 10 * VTBL_SLOT);
+const _: () = assert!(
+    core::mem::offset_of!(IDirect3DSwapChain9ExVtbl, get_last_present_count) == 10 * VTBL_SLOT
+);
+const _: () = assert!(core::mem::size_of::<IDirect3DSwapChain9ExVtbl>() == 13 * VTBL_SLOT);
+
+/// `D3DPRESENTSTATS`, what `IDirect3DSwapChain9Ex::GetPresentStats` fills.
+///
+/// The two Win32 `LARGE_INTEGER` times are `[u32; 2]` halves (`LowPart`,
+/// `HighPart`) after an explicit pad: the ABI places them at offset 16 on both
+/// architectures, but a 32-bit caller's struct may sit only 4-aligned on its
+/// stack, so the fields carry 4-byte alignment and the padding is spelled out.
+#[repr(C)]
+pub struct D3DPRESENTSTATS {
+    pub present_count: u32,
+    pub present_refresh_count: u32,
+    pub sync_refresh_count: u32,
+    pub pad0: u32,
+    pub sync_qpc_time: [u32; 2],
+    pub sync_gpu_time: [u32; 2],
+}
+
+const _: () = assert!(core::mem::size_of::<D3DPRESENTSTATS>() == 32);
+const _: () = assert!(core::mem::offset_of!(D3DPRESENTSTATS, sync_qpc_time) == 16);
 
 // ── D3D9 query constants ──
 

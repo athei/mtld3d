@@ -280,6 +280,7 @@ windows/types/src/device.rs D3DPRESENT_PARAMETERS Clone,Copy
 windows/types/src/device.rs D3DRECT Clone,Copy,Default
 windows/types/src/device.rs D3DVIEWPORT9 Clone,Copy
 windows/types/src/device.rs StateBlockType Clone,Copy,PartialEq,Eq,Debug
+windows/types/src/direct3d9.rs D3DDISPLAYMODEFILTER Clone,Copy
 windows/types/src/direct3d9.rs Guid Clone,Copy,PartialEq,Eq,Hash
 windows/types/src/ff.rs D3DCOLORVALUE Clone,Copy,Default
 windows/types/src/ff.rs D3DLIGHT9 Clone,Copy
