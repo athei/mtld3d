@@ -3,6 +3,7 @@ use core::ffi::c_void;
 use log::trace;
 use mtld3d_core::{
     api_lock::ApiGuard,
+    held_pages::{HeldPages, PageHolder},
     page_box::PageBox,
     perf::SurfaceSubCategory,
     render_scale::RenderScale,
@@ -606,7 +607,7 @@ impl Direct3DSurface9 {
             metal_msaa_srgb_handle: MetalHandle::NULL,
             multi_sample: SurfaceMultiSample::NONE,
             readback: None,
-            system_memory: Some(backing),
+            system_memory: Some(HeldPages::new(backing, PageHolder::Surface)),
             flags: SurfaceFlags::empty(),
             private_data: PrivateDataStore::default(),
             dc_lock: DcLockState::default(),
@@ -638,7 +639,8 @@ impl Direct3DSurface9 {
         // freshly created by `new_color_target` (refcount 1); access is
         // exclusive: D3D9 objects are single-threaded, or serialised by the
         // device `ApiLock` under `D3DCREATE_MULTITHREADED`.
-        unsafe { &mut *self.inner }.system_memory = Some(backing);
+        unsafe { &mut *self.inner }.system_memory =
+            Some(HeldPages::new(backing, PageHolder::Surface));
     }
 
     fn inner(&self) -> &SurfaceInner {
@@ -1208,14 +1210,14 @@ struct SurfaceInner {
     /// Allocated on the `LockRect` readback path (backbuffer), dropped on
     /// `UnlockRect`. Persists across the Lock so the game can read the returned
     /// pointer.
-    readback: Option<PageBox>,
+    readback: Option<HeldPages>,
     /// Backing store for a `D3DPOOL_SYSTEMMEM` offscreen plain surface.
     ///
     /// From `CreateOffscreenPlainSurface`. Allocated full-size at creation;
     /// `GetRenderTargetData`/`GetFrontBufferData` blit a render target's pixels
     /// into it, and `LockRect` hands back a pointer into it. `None` for every
     /// GPU-backed surface kind.
-    system_memory: Option<PageBox>,
+    system_memory: Option<HeldPages>,
     /// GUID-keyed application private data (`Set/Get/FreePrivateData`).
     ///
     /// Any stored `IUnknown` is released when this `SurfaceInner` drops.
@@ -2674,7 +2676,7 @@ fn backbuffer_read_into_lock(
     let out = unsafe { &mut *locked_rect };
     out.pitch = bytes_per_row.cast_signed();
     out.bits = page.as_mut_ptr().cast::<c_void>();
-    inner.readback = Some(page);
+    inner.readback = Some(HeldPages::new(page, PageHolder::Surface));
     D3D_OK
 }
 
@@ -2745,7 +2747,7 @@ fn readback_full_backbuffer(inner: &mut SurfaceInner) -> Option<(u32, u32, u32)>
             "back-buffer GetDC: BlitTextureToBuffer failed status={status:#x} → INVALIDCALL");
         return None;
     }
-    inner.readback = Some(page);
+    inner.readback = Some(HeldPages::new(page, PageHolder::Surface));
     Some((w, h, bytes_per_row))
 }
 

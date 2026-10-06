@@ -608,6 +608,7 @@ Every crate logs via `log` + `env_logger`. All targets sit under `mtld3d::*` and
 | `mtld3d::d3d9::sampler`   | sampler-state translation (trace)                                        |
 | `mtld3d::d3d9::caster`    | one row per unique shadow-caster pipeline state (trace)                  |
 | `mtld3d::d3d9::decal`     | the depth bias applied per (VS, PS) pair and depth state (trace)         |
+| `mtld3d::d3d9::mem_watch` | address-space watch: threshold warnings (warn), breakdown (debug)        |
 | `mtld3d::dxso`            | DXSO to MSL emitter (`trace` dumps the MSL)                              |
 | `mtld3d::perf`            | 2-second averaged performance summary (`PERF=1` builds only)             |
 | `mtld3d::shim`            | Wine unix-call PE shim DLL                                               |
@@ -626,6 +627,20 @@ object. This identifies the framework actually mapped in that process,
 including an image in the dyld shared cache. Missing path or UUID information
 is explicit. The record uses the same startup backlog and process log as the
 build stamp; the allocating loader query never runs from a signal handler.
+
+### The address-space watch
+
+A 32-bit build of `d3d9.dll` walks its address space with `VirtualQuery` every 600 presents (`windows/d3d9/src/device/mem_watch.rs`), after `Present`'s stall timer has stopped, so the walk is not charged to the present block. The free figure is the sum of the free regions the walk visits, each trimmed to the 64 KiB allocation granularity (a reservation can only start on a granule boundary, so a sliver smaller than a granule counts nothing), next to the largest of them, so the largest block never exceeds it. It is not `GlobalMemoryStatusEx`'s `ullAvailVirtual`: Wine computes that as the total minus the process working set, and on macOS the working set is the resident size of the whole process, the 64-bit host side included, so it falls with resident growth while the 32-bit space stays free. The crash lines (`FATAL` and `fault outside d3d9.dll`) carry the same two figures as `free_mib` and `largest_free_mib`. A 64-bit build skips the walk and the thresholds, since its space cannot run out and Wine takes 9 to 19 ms to walk it, and keeps the breakdown below.
+
+Two latches watch the samples, one on the free total (1536, 1024, 768, 512, 256 and 128 MiB) and one on the largest free block (512, 256 and 128 MiB), so a fragmented space with plenty free in total still warns before a large allocation fails. A sample below a threshold it had not crossed before logs one warning per latch naming the lowest threshold crossed, with the page-box breakdown below, and then one `address space map:` line: region counts by owner (image, mapped file, private commit, private reserve) and the largest used regions and holes. Each threshold is reported once per process. The first sample only arms the latches: a process already below some thresholds then, such as one without large-address-aware and its 2 GiB, logs one info line saying so and reports only the lower ones. The warnings log at warn on `mtld3d::d3d9::mem_watch`, so they show by default.
+
+`RUST_LOG=mtld3d::d3d9::mem_watch=debug` adds a line every second sample (about ten seconds), without the rest of the layer's debug output. With illustrative figures:
+
+```
+address space: 1836 MiB free, largest free block 1182 MiB, walked 2310 regions in 1730 us; mtld3d holds 4998 textures with 715 MiB of mip data; page boxes 1042 MiB: texture staging 640, surfaces 24, vertex/index backing 3, encoder leases 2, pool parked 126, other 247; texture staging split default static 520 / default dynamic 70 / other 50, 295 MiB before page rounding; vertex/index backing split writeonly static 0 / dynamic 3 / other 0; locks on static default textures 0
+```
+
+The walk's region count and duration, in microseconds of the PE side's calibrated counter, say what the sample costs in that process. Every page-box figure is padded bytes on the PE side, the 16 KiB multiples `PageBox` allocates in the 32-bit space, so the named holders and `other` add up to the total (`mtld3d_core::address_space::PageBoxHolders`). Texture staging is what the device's live textures hold, every level not yet dropped and every cube face level, split by pool and usage; "before page rounding" is the same staging at the lengths the levels asked for, and the gap between the two is the rounding a chain of small levels costs. Surfaces are the backing of system-memory and scratch offscreen plain surfaces, the staging of lockable render targets and the page a back-buffer `LockRect` or `GetDC` holds; encoder leases are the renamed vertex/index backings and upload snapshots the PE side keeps until the encoder acknowledges its last read (both `mtld3d_core::held_pages`). Vertex/index backing is the CPU copy of live buffers, split by the class that decides whether it can be released (`mtld3d_core::buffer_backing`). Pool parked is what the recycle pool keeps for reuse. `other` is everything else: upload leases of texture staging the texture itself let go of, read-back pages of a call in progress, and any holder not counted yet. Pages the native encoder allocates for itself (padded repack staging, depth read-backs, evicted visibility buffers) live outside the 32-bit space and are in none of these figures.
 
 ### Command-buffer completion and encoder errors
 
