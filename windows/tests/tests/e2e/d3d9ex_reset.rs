@@ -6,7 +6,9 @@
 //! and references to default-pool resources, implicit surfaces and state
 //! blocks do not block it. Render target 0 returns to the back buffer, 1 to 3
 //! are unbound, the depth stencil returns to the implicit surface or to none,
-//! and the viewport and scissor cover the new back buffer. A rejected `Reset`
+//! and the viewport and scissor cover the new back buffer. A back buffer or
+//! depth surface the application holds across it keeps the old surface, its
+//! size and contents, with the device as its container. A rejected `Reset`
 //! or `ResetEx` changes nothing and leaves no `Reset` owed, and `ResetEx`
 //! names a display mode of the back buffer's size exactly when fullscreen.
 
@@ -16,6 +18,7 @@ use mtld3d_types::{
     D3DFMT_X8R8G8B8, D3DFVF_DIFFUSE, D3DFVF_TEX1, D3DFVF_XYZ, D3DLOCK_READONLY, D3DPOOL_DEFAULT,
     D3DPOOL_SYSTEMMEM, D3DPT_TRIANGLELIST, D3DRECT, D3DRS_LIGHTING, D3DSAMP_MAGFILTER,
     D3DSAMP_MINFILTER, D3DSBT_ALL, D3DTEXF_POINT, D3DUSAGE_RENDERTARGET, D3DVIEWPORT9,
+    E_NOINTERFACE, IID_IDIRECT3DDEVICE9, IID_IDIRECT3DSWAPCHAIN9,
 };
 
 const RED: u32 = 0xFFFF_0000;
@@ -217,16 +220,85 @@ fn references_to_default_resources_implicit_surfaces_and_state_blocks_do_not_blo
         "nothing the application holds blocks it"
     );
     assert_eq!(h.test_cooperative_level(), D3D_OK);
-    let (hr, desc) = back_buffer.desc();
-    assert_eq!(hr, D3D_OK);
-    assert_eq!(
-        (desc.width, desc.height),
-        (400, 300),
-        "a held back buffer follows the new one"
-    );
     drop((block, plain, depth, back_buffer));
     h.render_once(BLUE, |_| {});
     assert_pixel_eq(h.read_pixel(200, 150), BLUE, "the device draws after it");
+}
+
+#[test]
+fn a_held_back_buffer_and_depth_surface_keep_the_old_surfaces_across_an_extended_reset() {
+    let h = extended(true);
+    assert_eq!(h.clear_target(RED), D3D_OK);
+    let old_back_buffer = h.back_buffer(0);
+    let (hr, old_depth) = h.depth_stencil_surface_hr();
+    assert_eq!(hr, D3D_OK);
+    let old_depth = old_depth.expect("the implicit depth surface");
+    let (hr, chain, _) = old_back_buffer.get_container(&IID_IDIRECT3DSWAPCHAIN9);
+    assert_eq!(
+        (hr, chain.is_null()),
+        (D3D_OK, false),
+        "the swap chain's back buffer"
+    );
+
+    assert_eq!(h.reset(400, 300), D3D_OK);
+
+    let (hr, desc) = old_back_buffer.desc();
+    assert_eq!(hr, D3D_OK);
+    assert_eq!(
+        (desc.width, desc.height),
+        (640, 480),
+        "the held back buffer keeps its size"
+    );
+    let (hr, desc) = old_depth.desc();
+    assert_eq!(hr, D3D_OK);
+    assert_eq!(
+        (desc.width, desc.height),
+        (640, 480),
+        "so does the held depth surface"
+    );
+    assert_eq!(
+        old_back_buffer.get_container(&IID_IDIRECT3DSWAPCHAIN9).0,
+        E_NOINTERFACE,
+        "it is no longer the swap chain's"
+    );
+    let (hr, container, _) = old_back_buffer.get_container(&IID_IDIRECT3DDEVICE9);
+    assert_eq!(
+        (hr, container),
+        (D3D_OK, h.device()),
+        "its container is the device"
+    );
+
+    let readback = h.create_offscreen_plain_surface(640, 480, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM);
+    assert_eq!(
+        h.get_render_target_data_hr(&old_back_buffer, &readback),
+        D3D_OK
+    );
+    let lock = readback.lock_rect(D3DLOCK_READONLY);
+    let first = lock.read_bytes(4);
+    drop(lock);
+    let pixel = u32::from_le_bytes(first.try_into().expect("four bytes"));
+    assert_pixel_eq(
+        pixel,
+        RED,
+        "the held back buffer keeps what was drawn into it",
+    );
+
+    let new_back_buffer = h.back_buffer(0);
+    assert_ne!(
+        new_back_buffer.as_ptr(),
+        old_back_buffer.as_ptr(),
+        "a new back buffer object"
+    );
+    let (hr, desc) = new_back_buffer.desc();
+    assert_eq!(hr, D3D_OK);
+    assert_eq!((desc.width, desc.height), (400, 300), "at the new size");
+    drop((new_back_buffer, old_back_buffer, old_depth));
+    h.render_once(BLUE, |_| {});
+    assert_pixel_eq(
+        h.read_pixel(200, 150),
+        BLUE,
+        "the device draws into the new one",
+    );
 }
 
 #[test]

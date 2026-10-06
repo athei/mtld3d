@@ -1793,6 +1793,79 @@ pub unsafe fn finalize_implicit_surface(ptr: u64) {
     unsafe { finalize_surface(surf) };
 }
 
+/// Whether the application holds a public reference to the cached implicit surface at `ptr`.
+///
+/// # Safety
+/// `ptr` is `0` or the device's live cached implicit surface.
+pub unsafe fn implicit_surface_is_held(ptr: u64) -> bool {
+    // SAFETY: the caller's contract: `0` or a live surface wrapper.
+    unsafe { (ptr as *const Direct3DSurface9).as_ref() }.is_some_and(|surf| surf.refcount != 0)
+}
+
+/// Turn a held implicit surface into a standalone one that keeps the textures it names.
+///
+/// An extended device's `Reset` makes a new back buffer and auto
+/// depth-stencil while the application may still hold the surfaces of the old
+/// ones. D3D9Ex leaves such a reference naming the old surface, at the old
+/// size and no longer part of the swap chain. The surface takes over the
+/// textures it has resolved from the device until now, which the `Reset` then
+/// leaves alone, and becomes a standalone default-pool target: its container
+/// is the device, and its final release retires the textures as any
+/// standalone target's does. The device's reference the implicit surface
+/// took on its first public reference is the one a standalone surface gives
+/// back on its last, so the counts stay balanced.
+///
+/// # Safety
+/// `ptr` is the device's live cached implicit surface, held by the
+/// application, and the device forgets it as its cached surface right after.
+pub unsafe fn detach_implicit_surface(ptr: u64) {
+    let surf = ptr as *mut Direct3DSurface9;
+    // SAFETY: the caller's contract: a live cached implicit surface wrapper.
+    let inner_ptr = unsafe { (*surf).inner };
+    // SAFETY: `inner_ptr` is its live `SurfaceInner`; access is exclusive
+    // under the device's `Reset`.
+    let inner = unsafe { &mut *inner_ptr };
+    let kind = inner.implicit_kind;
+    if kind == ImplicitKind::None || inner.device_inner.is_null() {
+        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+            "detach_implicit_surface: not a device's implicit surface; left as it is");
+        return;
+    }
+    let width = inner.live_width();
+    let height = inner.live_height();
+    let format = inner.live_format();
+    let render_scale = inner.live_render_scale();
+    let multi_sample = inner.live_multi_sample();
+    // SAFETY: `device_inner` is the live owning device during its `Reset`.
+    let device = unsafe { &*inner.device_inner };
+    let standalone_kind = if kind == ImplicitKind::Backbuffer {
+        inner.metal_color_handle = device.backbuffer_handle();
+        inner.metal_color_srgb_handle = device.backbuffer_srgb_handle();
+        inner.metal_msaa_handle = device.backbuffer_msaa_handle();
+        inner.metal_msaa_srgb_handle = device.backbuffer_msaa_srgb_handle();
+        mtld3d_core::format::StandaloneSurfaceKind::ColorTarget
+    } else {
+        inner.metal_depth_handle = device.depth_stencil_handle();
+        mtld3d_core::format::StandaloneSurfaceKind::DepthStencil
+    };
+    inner.standalone_width = width;
+    inner.standalone_height = height;
+    inner.standalone_format = format;
+    inner.standalone_render_scale = render_scale;
+    inner.standalone_pool = D3DPOOL_DEFAULT;
+    device.register_standalone_surface(
+        width,
+        height,
+        format,
+        u32::from(multi_sample.sample_count),
+        standalone_kind,
+        render_scale,
+    );
+    inner.multi_sample = multi_sample;
+    inner.container = device.device_wrapper() as u64;
+    inner.implicit_kind = ImplicitKind::None;
+}
+
 /// Finalize a container-cached sub-resource surface at its container's teardown.
 ///
 /// Mirrors [`finalize_implicit_surface`]: clear the ownership marker first so

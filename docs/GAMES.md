@@ -27,6 +27,12 @@ the reason for each one.
 | Unigine Tropics | Runs |
 | Gunmetal | Starts and benchmarks |
 
+Half-Life 2 and Team Fortress 2 create their device through
+`Direct3DCreate9Ex` when it succeeds and then rely on D3D9Ex behaviour,
+default-pool resources that survive `Reset` among it; `-nod3d9ex` on the
+command line keeps them on plain D3D9. Every other game in the table that
+was checked creates a plain device.
+
 ## Reporting a game
 
 A game that fails or renders wrongly is tracked as a

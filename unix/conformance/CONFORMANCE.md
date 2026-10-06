@@ -478,6 +478,47 @@ record. A knob, where one makes sense, is named with its default.
   turns the specular add on only in tests that leave fog off. Reopen on a game
   that shows fogged highlights brighter or darker than on Windows. No knob:
   the alternative is a different shader, not a trade.
+- **An extended device copies user memory once.** A `pSharedHandle` on a
+  single-level system-memory texture or offscreen plain surface names the
+  application's pixels, and D3D9Ex makes that memory the surface's own:
+  `LockRect` hands back the application's pointer at its packed pitch, and a
+  later write to the memory is a write to the surface. Here the pixels are
+  copied into the level once at creation and the level keeps the layer's
+  staging, so a lock maps the copy at the 4-byte-aligned pitch every other
+  system-memory level has. Wrapping the application's memory would give one
+  kind of level two backings, one of them owned by the application and freed
+  whenever it likes, on every path that reads a system-memory level
+  (`UpdateTexture`, `UpdateSurface`, `GetRenderTargetData`, `GetDC`). The
+  one title known to pass user memory, Source on its extended path, fills a
+  texture this way, uploads it with `UpdateTexture` and lets it go, which a
+  copy serves. The `d3d9ex.c/test_user_memory` cluster carries the sites. No
+  knob.
+- **No occlusion or mode-change status on an extended device.** D3D9Ex
+  answers `PresentEx`, `CheckDeviceState` and `TestCooperativeLevel` with
+  `S_PRESENT_OCCLUDED` while another device holds the display exclusively or
+  the window is covered, and with `S_PRESENT_MODE_CHANGED` after a mode
+  change. No exclusive mode is ever taken here (the device-loss decision),
+  and a present into a covered window already skips the drawable without
+  costing the application anything, so there is no state to report. The
+  failure latch the layer keeps is still reported. No knob.
+- **The maximum frame latency is stored, not enforced.**
+  `SetMaximumFrameLatency` takes 0 to 30 and `GetMaximumFrameLatency` reports
+  what it stored, 3 until then. The frames the application can run ahead are
+  bounded by the encoder and submit queues, whose depth is fixed; holding
+  the application back further for a lower latency would cost the overlap
+  those queues buy. A value below 3 is logged once. No knob.
+- **`D3DPRESENT_*` flags are logged, not honoured.** `D3DPRESENT_DONOTWAIT`
+  asks a present to fail with `D3DERR_WASSTILLDRAWING` rather than wait for
+  the queue, and `D3DPRESENT_FORCEIMMEDIATE` to present without waiting for
+  the display; both present here as a flagless present would. The overlay
+  flags have no overlay to act on. Each flag is logged once. No knob.
+- **`GetDisplayModeEx` reports the identity rotation, and the extended mode
+  argument is not used.** The display is never rotated by the layer, so the
+  identity is what a game can act on. `CreateDeviceEx` and `ResetEx` take a
+  `D3DDISPLAYMODEEX` naming the fullscreen mode; `ResetEx` refuses one that
+  disagrees with the request as D3D9Ex does, and both then set the mode the
+  back buffer names, as `CreateDevice` and `Reset` do, so the mode's refresh
+  rate and scanline ordering go unused. No knob.
 
 ## Range-fog coverage
 

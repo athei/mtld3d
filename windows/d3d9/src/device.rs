@@ -3824,6 +3824,47 @@ impl DeviceInner {
     /// object (the `pRenderTarget == pBackBuffer` identity the suite
     /// checks). Its container is the implicit swapchain. Created at
     /// refcount 0.
+    /// Whether an implicit surface of this device is referenced by the application.
+    pub fn holds_implicit_surfaces(&self) -> bool {
+        // SAFETY: each field is 0 or the device's live cached implicit surface.
+        let back_buffer =
+            unsafe { crate::surface::implicit_surface_is_held(self.implicit_render_target) };
+        // SAFETY: as above.
+        let depth =
+            unsafe { crate::surface::implicit_surface_is_held(self.implicit_depth_stencil) };
+        back_buffer || depth
+    }
+
+    /// Detach the implicit surfaces the application holds, for an extended device's `Reset`.
+    ///
+    /// Each held one becomes a standalone surface that keeps the texture it
+    /// names, and the device forgets it, so the next `GetBackBuffer` or
+    /// `GetDepthStencilSurface` hands out a new object. Returns whether the
+    /// back buffer and the depth surface were detached; the caller must not
+    /// destroy a detached surface's textures. A plain device detaches nothing:
+    /// its `Reset` refuses while the application holds either.
+    fn detach_held_implicit_surfaces(&mut self) -> (bool, bool) {
+        if !self.is_extended() {
+            return (false, false);
+        }
+        let mut detached = (false, false);
+        // SAFETY: the field is 0 or the device's live cached implicit surface.
+        if unsafe { crate::surface::implicit_surface_is_held(self.implicit_render_target) } {
+            // SAFETY: a live, held cached implicit surface, forgotten just below.
+            unsafe { crate::surface::detach_implicit_surface(self.implicit_render_target) };
+            self.implicit_render_target = 0;
+            detached.0 = true;
+        }
+        // SAFETY: as above.
+        if unsafe { crate::surface::implicit_surface_is_held(self.implicit_depth_stencil) } {
+            // SAFETY: as above.
+            unsafe { crate::surface::detach_implicit_surface(self.implicit_depth_stencil) };
+            self.implicit_depth_stencil = 0;
+            detached.1 = !self.depth_stencil_handle.is_null();
+        }
+        detached
+    }
+
     pub fn get_or_create_implicit_render_target(
         &mut self,
     ) -> *mut crate::surface::Direct3DSurface9 {
@@ -5028,10 +5069,14 @@ fn reset_impl(this: *mut c_void, present_params: *mut c_void) -> i32 {
     // A back buffer an earlier `Reset` failed to create takes the recreate
     // path at any size: the dimensions that `Reset` adopted are not a back
     // buffer that exists.
+    // An extended device's `Reset` with an implicit surface the application
+    // still holds makes the swap chain new textures at any size: the held
+    // surface keeps the old ones (`detach_held_implicit_surfaces`).
     let resized = pp.back_buffer_width != dev.backbuffer_width
         || pp.back_buffer_height != dev.backbuffer_height
         || multi_sample_changed
-        || dev.backbuffer_handle.is_null();
+        || dev.backbuffer_handle.is_null()
+        || (extended && dev.holds_implicit_surfaces());
     // Reset adopts the present params' auto depth-stencil configuration: an
     // enabled flag (re)creates the implicit depth-stencil at the given format,
     // a disabled flag drops it. This is independent of a resize, so resolve the
@@ -5414,15 +5459,22 @@ fn reset_recreate_resources(
     //    two handles cross the PE/Unix boundary in one call. The encoder is
     //    handed the same list: these five leave without passing through the
     //    retention queue, which is where every other texture's handle-keyed
-    //    records are pruned.
-    let old_handles: [u64; 5] = [
+    //    records are pruned. A held implicit surface of an extended device
+    //    takes its textures over instead, and they stay.
+    let (kept_back_buffer, kept_depth) = dev.detach_held_implicit_surfaces();
+    let old_back_buffer = [
         dev.backbuffer_handle.raw(),
         dev.backbuffer_srgb_handle.raw(),
         dev.backbuffer_msaa_handle.raw(),
         dev.backbuffer_msaa_srgb_handle.raw(),
-        dev.depth_stencil_handle.raw(),
     ];
-    let live: Vec<u64> = old_handles.iter().copied().filter(|&h| h != 0).collect();
+    let live: Vec<u64> = old_back_buffer
+        .iter()
+        .copied()
+        .filter(|_| !kept_back_buffer)
+        .chain(core::iter::once(dev.depth_stencil_handle.raw()).filter(|_| !kept_depth))
+        .filter(|&h| h != 0)
+        .collect();
     dev.encoder_reset(&live)?;
     if !live.is_empty() {
         let mut destroy = mtld3d_shared::DestroyResourcesBulkParams {
@@ -5434,6 +5486,8 @@ fn reset_recreate_resources(
         };
         unix_call(&mut destroy);
     }
+    // The detached surfaces own the old textures now; the device's fields
+    // are overwritten by the recreate below, or nulled on its failure.
 
     // 3. Adopt the new dimensions. Done before CreateBackbuffer so the
     //    new textures are sized correctly and downstream readers
