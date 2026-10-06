@@ -32,8 +32,8 @@
 //! (see `shape`).
 //!
 //! `bench-shape` is the odd one out: it checks a benchmark's declared frame
-//! against a frame a game dumped with F12, by hand, to calibrate a scene
-//! (see `dump`). It runs nothing and judges no build.
+//! against a frame a game dumped with Ctrl+Shift+F12, by hand, to calibrate
+//! a scene (see `dump`). It runs nothing and judges no build.
 //!
 //! Exit code 0 when nothing regressed, 1 when something did (a pass shape
 //! that changed included), and 2 when the run or the analysis could not be

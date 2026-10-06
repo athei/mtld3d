@@ -18,6 +18,7 @@ pub mod buffer_backing;
 pub mod buffer_rename;
 pub mod build_index;
 pub mod caps;
+pub mod capture_chord;
 pub mod config;
 pub mod convert;
 pub mod cursor;
