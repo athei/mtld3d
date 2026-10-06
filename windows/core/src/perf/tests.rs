@@ -116,12 +116,13 @@ fn snapshots_survive_begin_frame_until_sampled() {
     assert_eq!(state.enc.op_cycles, 0, "every other counter was reset");
 }
 
-/// A submission's encode split replaces the last one's, and its GPU time adds to what came before.
+/// Every submission folded before a sample adds its execute, its split and its GPU time.
 ///
-/// The GPU sums also outlive the per-frame reset, like the snapshots: a
-/// report folded between a summary and the next frame still counts.
+/// All of it outlives the per-frame reset, like the snapshots: a report
+/// folded between a summary and the next frame still counts, and the
+/// sample that takes it clears it.
 #[test]
-fn submit_timings_fold_split_replaces_and_gpu_time_adds() {
+fn submit_timings_fold_adds_and_survives_until_sampled() {
     let frame = CommandBufferRole::Frame as usize;
     let upload = CommandBufferRole::Upload as usize;
     let present = CommandBufferRole::Present as usize;
@@ -141,9 +142,11 @@ fn submit_timings_fold_split_replaces_and_gpu_time_adds() {
     let mut state = EncoderPerfState::new();
     state.fold_submit_timings(&first, 7_000);
     state.fold_submit_timings(&second, 8_000);
-    assert_eq!(state.enc.submit_blits_cycles, 0, "the later split replaces");
-    assert_eq!(state.enc.submit_passes_cycles, ns_to_cycles(5_000));
-    assert_eq!(state.enc.submit_commit_cycles, 0);
+    assert_eq!(state.enc.submit_exec_cycles, 15_000, "the executes add");
+    assert_eq!(state.enc.submit_blits_cycles, ns_to_cycles(1_000));
+    let passes = ns_to_cycles(2_000) + ns_to_cycles(5_000);
+    assert_eq!(state.enc.submit_passes_cycles, passes, "the splits add");
+    assert_eq!(state.enc.submit_commit_cycles, ns_to_cycles(3_000));
     let frame_cycles = ns_to_cycles(4_000_000) + ns_to_cycles(6_000_000);
     assert_eq!(state.enc.gpu_cycles[frame], frame_cycles, "GPU time adds");
     assert_eq!(state.enc.gpu_cycles[upload], 0);
@@ -156,7 +159,95 @@ fn submit_timings_fold_split_replaces_and_gpu_time_adds() {
         "sticky across the reset"
     );
     assert_eq!(state.enc.gpu_buffers, [2, 0, 2]);
-    assert_eq!(state.enc.submit_passes_cycles, 0, "the split is per frame");
+    assert_eq!(
+        state.enc.submit_passes_cycles, passes,
+        "and so is the split"
+    );
+    assert_eq!(state.enc.submit_exec_cycles, 15_000);
+
+    let sampled = state.take_sample(&sample_caches(), &[], 0, 0);
+    assert_eq!(sampled.enc.submit_passes_cycles, passes);
+    assert_eq!(sampled.enc.gpu_buffers, [2, 0, 2]);
+    assert_eq!(state.enc.submit_exec_cycles, 0, "the sample clears it");
+    assert_eq!(state.enc.submit_passes_cycles, 0);
+    assert_eq!(state.enc.gpu_buffers, [0; CommandBufferRole::COUNT]);
+}
+
+/// Both waits add over a sample's submissions.
+///
+/// Two present-bearing submissions returning in one frame each report the
+/// drawable waits committed before them, so neither wait may be dropped.
+#[test]
+fn submit_waits_add_over_a_samples_submissions() {
+    let mut state = EncoderPerfState::new();
+    state.add_submit_wait_nanos(3_000_000, 1_000_000);
+    state.add_submit_wait_nanos(2_000_000, 2_000_000);
+    assert_eq!(
+        state.enc.drawable_wait_cycles,
+        ns_to_cycles(3_000_000) + ns_to_cycles(2_000_000)
+    );
+    assert_eq!(
+        state.enc.present_wait_cycles,
+        ns_to_cycles(1_000_000) + ns_to_cycles(2_000_000)
+    );
+}
+
+/// The submit thread's timings reach the window when a blocking flush drains them.
+///
+/// The order a game that flushes every frame produces: an async present,
+/// the flush's barrier draining that present's submission before the
+/// flush's own frame begins, the flush's synchronous submit, then the next
+/// async present. The present's passes land in the flush's sample with the
+/// flush's own, and the next frame reports nothing twice.
+#[test]
+fn a_drained_present_submission_reaches_the_flush_sample() {
+    let timed = || {
+        let mut payload = FramePerfPayload::new();
+        payload.counters.timed = 1;
+        payload
+    };
+    let caches = sample_caches();
+    let mut state = EncoderPerfState::new();
+    let mut window = PerfWindow::new();
+
+    // The async present: its submission returns after its own summary.
+    state.begin_frame(&timed());
+    window.accumulate(&state.take_sample(&caches, &[], 0, 0));
+
+    // The flush: the barrier drains the present's submission first.
+    let mut present = SubmitTimings::new();
+    present.passes_ns = 2_000_000;
+    present.commit_ns = 100_000;
+    state.add_submit_wait_nanos(4_000_000, 500_000);
+    state.fold_submit_timings(&present, 3_000_000);
+    state.begin_frame(&timed());
+    let mut flush = SubmitTimings::new();
+    flush.passes_ns = 100_000;
+    state.add_submit_wait_nanos(0, 0);
+    state.fold_submit_timings(&flush, 200_000);
+    let flushed = state.take_sample(&caches, &[], 0, 0);
+    window.accumulate(&flushed);
+
+    // The next async present, with nothing returned yet.
+    state.begin_frame(&timed());
+    let next = state.take_sample(&caches, &[], 0, 0);
+    window.accumulate(&next);
+
+    let passes = ns_to_cycles(2_000_000) + ns_to_cycles(100_000);
+    assert_eq!(flushed.enc.submit_passes_cycles, passes);
+    assert_eq!(
+        window.submit_passes.sum, passes,
+        "the present's passes reach the window"
+    );
+    assert_eq!(window.submit_exec.sum, 3_200_000);
+    assert_eq!(window.submit_commit.sum, ns_to_cycles(100_000));
+    assert_eq!(window.present_wait.sum, ns_to_cycles(500_000));
+    assert_eq!(window.drawable_wait.sum, ns_to_cycles(4_000_000));
+    assert_eq!(
+        next.enc.submit_passes_cycles, 0,
+        "nothing is reported twice"
+    );
+    assert_eq!(next.enc.submit_exec_cycles, 0);
 }
 
 /// The encode children and their residual partition `Encode+commit` on every frame.
@@ -181,13 +272,12 @@ fn perf_window_submit_children_leave_a_residual() {
     assert_eq!(w.gpu[CommandBufferRole::Frame as usize].sum, 700);
 }
 
-/// A synchronous submit behind a barrier reports its own execute with its own split.
+/// A synchronous submit behind a barrier adds to the async submission the barrier drained.
 ///
-/// The async payload folded first carries a larger execute and a different
-/// split; the barrier's submit replaces both, so `Encode+commit` and its
-/// children describe one submission and the residual is that submission's.
+/// Parent and children add together, so `Encode+commit` and its children
+/// describe the same two submissions and the residual is theirs.
 #[test]
-fn barrier_submit_keeps_parent_and_children_together() {
+fn barrier_submit_adds_parent_and_children_together() {
     let mut async_timings = SubmitTimings::new();
     async_timings.leading_blits_ns = 4_000;
     async_timings.passes_ns = 9_000;
@@ -198,20 +288,20 @@ fn barrier_submit_keeps_parent_and_children_together() {
     let mut state = EncoderPerfState::new();
     state.fold_submit_timings(&async_timings, 900_000);
     state.fold_submit_timings(&sync_timings, 300_000);
-    assert_eq!(
-        state.enc.submit_exec_cycles, 300_000,
-        "the barrier's own execute"
-    );
-    assert_eq!(state.enc.submit_blits_cycles, 0);
-    assert_eq!(state.enc.submit_passes_cycles, ns_to_cycles(1_000));
-    assert_eq!(state.enc.submit_commit_cycles, 0);
+    assert_eq!(state.enc.submit_exec_cycles, 1_200_000, "both executes");
+    let blits = ns_to_cycles(4_000);
+    let passes = ns_to_cycles(9_000) + ns_to_cycles(1_000);
+    let commit = ns_to_cycles(2_000);
+    assert_eq!(state.enc.submit_blits_cycles, blits);
+    assert_eq!(state.enc.submit_passes_cycles, passes);
+    assert_eq!(state.enc.submit_commit_cycles, commit);
 
     let mut w = PerfWindow::new();
     let mut s = sample(0, 0);
     s.enc = state.enc;
     w.accumulate(&s);
-    assert_eq!(w.submit_exec.sum, 300_000);
-    assert_eq!(w.submit_resid.max, 300_000 - ns_to_cycles(1_000));
+    assert_eq!(w.submit_exec.sum, 1_200_000);
+    assert_eq!(w.submit_resid.max, 1_200_000 - blits - passes - commit);
 }
 
 /// Upload outcome totals partition successful renames and survive only their reporting window.

@@ -2471,7 +2471,7 @@ impl FrameEncoder {
     fn fold_submit_outcome(&mut self, outcome: &SubmitOutcome, submit_exec_tsc: u64) {
         self.last_submit_status = outcome.status;
         self.perf
-            .set_submit_wait_nanos(outcome.drawable_wait_ns, outcome.present_wait_ns);
+            .add_submit_wait_nanos(outcome.drawable_wait_ns, outcome.present_wait_ns);
         if outcome.snapshot.contains(SnapshotFlags::TAKEN) {
             self.perf.bump_snapshot();
         }

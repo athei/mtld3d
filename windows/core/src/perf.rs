@@ -1186,8 +1186,9 @@ impl FrameTiming {
 
 /// Encoder-bumped per-frame counters that flow into the sample.
 ///
-/// Reset each `begin_frame` via `Default` (one move replaces the
-/// per-field zeroing). Running totals and the `per_pair_stats` map stay
+/// Reset each `begin_frame` by one move (`next_frame`), except what the
+/// submit thread and the barriers fold, which a sample clears once it has
+/// taken it. Running totals and the `per_pair_stats` map stay
 /// on `EncoderPerfState` because they persist across frames / are
 /// non-`Copy`.
 #[cfg(perf_tracking)]
@@ -1297,14 +1298,20 @@ struct EncoderFrameCounters {
     submit_cycles: u64,
     /// Presenter-thread `nextDrawable` (GPU + compositor) wait.
     ///
-    /// Measured on the unix side for the last present that completed and
-    /// folded back when the next payload returns. Lagged one present.
+    /// Measured on the unix side for the presents committed since the
+    /// previous present-bearing submission and folded back when the next
+    /// payload returns. Lagged one present. Each wait reaches one
+    /// submission, so the waits of a sample's submissions add; sticky like
+    /// `submit_exec_cycles`.
     drawable_wait_cycles: u64,
     /// Submit-thread total for `execute_submit`, folded back on payload return.
     ///
     /// Command-walk + the wait for the previous present + commit, incl.
     /// `present_wait_cycles`. `submit_exec - present_wait` is the
-    /// encode+commit CPU.
+    /// encode+commit CPU. Every submission folded before a sample adds to
+    /// it, and it is sticky like `snapshots`: a blocking flush drains the
+    /// previous async submission before its own `begin_frame`, and that
+    /// submission still reaches the flush's sample.
     submit_exec_cycles: u64,
     /// Encoder backpressure stall.
     ///
@@ -1317,13 +1324,14 @@ struct EncoderFrameCounters {
     /// The display's cadence seen from the submit thread: a present-bearing
     /// submit holds its render buffer until the present before it has a
     /// drawable and commits. Measured on the unix side, folded back with the
-    /// payload, lagged ≤1 frame under async; part of `submit_exec_cycles`.
+    /// payload, lagged ≤1 frame under async; part of `submit_exec_cycles`,
+    /// and added and sticky the same way.
     present_wait_cycles: u64,
     /// Submit-thread encode of the frame-leading blits, a child of `Encode+commit`.
     ///
-    /// Folded back and overwritten per returning payload like
-    /// `submit_exec_cycles`, so a frame's children and their parent always
-    /// come from the same submission.
+    /// Added per returning payload and sticky like `submit_exec_cycles`,
+    /// so a sample's children and their parent always come from the same
+    /// submissions.
     submit_blits_cycles: u64,
     /// Submit-thread replay of every pass descriptor, upload and draw; as `submit_blits_cycles`.
     submit_passes_cycles: u64,
@@ -1407,6 +1415,41 @@ impl EncoderFrameCounters {
             pagebox_pool_recycled: 0,
             pagebox_pool_recycled_bytes: 0,
         }
+    }
+
+    /// A fresh frame's counters, keeping what was folded since the last sample.
+    ///
+    /// Submissions return, and barriers run, between one sample and the
+    /// next `begin_frame`, so a per-frame reset of what they fold would
+    /// lose it: the submit thread's timings, the snapshots and the GPU time.
+    const fn next_frame(&self) -> Self {
+        Self {
+            drawable_wait_cycles: self.drawable_wait_cycles,
+            submit_exec_cycles: self.submit_exec_cycles,
+            present_wait_cycles: self.present_wait_cycles,
+            submit_blits_cycles: self.submit_blits_cycles,
+            submit_passes_cycles: self.submit_passes_cycles,
+            submit_commit_cycles: self.submit_commit_cycles,
+            gpu_cycles: self.gpu_cycles,
+            gpu_buffers: self.gpu_buffers,
+            snapshots: self.snapshots,
+            slot_waits: self.slot_waits,
+            ..Self::new()
+        }
+    }
+
+    /// Zero what [`Self::next_frame`] keeps, once a sample has taken it.
+    const fn clear_folded(&mut self) {
+        self.drawable_wait_cycles = 0;
+        self.submit_exec_cycles = 0;
+        self.present_wait_cycles = 0;
+        self.submit_blits_cycles = 0;
+        self.submit_passes_cycles = 0;
+        self.submit_commit_cycles = 0;
+        self.gpu_cycles = [0; CommandBufferRole::COUNT];
+        self.gpu_buffers = [0; CommandBufferRole::COUNT];
+        self.snapshots = 0;
+        self.slot_waits = 0;
     }
 }
 
@@ -2232,9 +2275,10 @@ pub struct EncoderPerfState {
     timing: FrameTiming,
     /// Encoder-bumped per-frame counters (see [`EncoderFrameCounters`]).
     ///
-    /// Reset wholesale each `begin_frame`; `drawable_wait` / `submit_exec`
-    /// are folded back from the submit thread *after* that reset (so a
-    /// frame with nothing returned yet reports 0 rather than stale data).
+    /// Reset each `begin_frame` but for what the submit thread folds back
+    /// (`drawable_wait`, `submit_exec` and its split, the GPU time, the
+    /// snapshots), which accumulates until a sample takes it and clears it,
+    /// whenever the submission returned.
     enc: EncoderFrameCounters,
 
     per_pair_stats: FxHashMap<(u32, u32, PairShaderId, PairShaderId), PerPairStats>,
@@ -2319,34 +2363,19 @@ impl EncoderPerfState {
 
     /// Seed per-frame encoder counters from the incoming payload.
     ///
-    /// Resets every per-frame encoder-side counter. Live totals
+    /// Resets every per-frame encoder-side counter but what the submit
+    /// thread folded back since the last sample. Live totals
     /// (`vbib_retained_bytes`, `tex_staging_retained_bytes`) persist.
     pub fn begin_frame(&mut self, payload: &FramePerfPayload) {
         // Seed the API-thread counters + payload timing wholesale.
         self.counters = payload.counters;
         self.timing = payload.timing;
         self.frame_timed = self.counters.timed != 0;
-        // Reset every encoder-bumped per-frame counter in one move.
-        // `drawable_wait_cycles` / `submit_exec_cycles` live in `enc` and are
-        // folded back from the submit thread when a payload returns (after
-        // this reset, in `drain_returned_payloads`); zeroing them here means a
-        // frame with nothing returned yet reports 0 rather than stale data.
-        // `snapshots` is the one counter that carries over: it is bumped by
-        // the barriers between the last summary and this reset.
-        let snapshots = self.enc.snapshots;
-        let slot_waits = self.enc.slot_waits;
-        let gpu_cycles = self.enc.gpu_cycles;
-        let gpu_buffers = self.enc.gpu_buffers;
-        self.enc = EncoderFrameCounters::default();
-        self.enc.snapshots = snapshots;
-        self.enc.slot_waits = slot_waits;
-        self.enc.gpu_cycles = gpu_cycles;
-        self.enc.gpu_buffers = gpu_buffers;
-        let gpu = core::mem::take(&mut self.submit_nanos.gpu);
-        self.submit_nanos = deferred::SubmitNanos {
-            gpu,
-            ..deferred::SubmitNanos::default()
-        };
+        // A submission can return between the last sample and this reset: a
+        // blocking flush drains the async submit before its own frame
+        // begins. What it folded stays for this frame's sample, which clears
+        // it; `submit_nanos` is taken by the sample the same way.
+        self.enc = self.enc.next_frame();
         self.per_pair_stats.clear();
     }
 
@@ -2478,42 +2507,49 @@ impl EncoderPerfState {
         &raw mut self.enc.submit_cycles
     }
 
-    pub fn set_submit_wait_nanos(&mut self, drawable: u64, present: u64) {
+    /// Fold one submission's waits: both add to what the sample holds.
+    ///
+    /// The drawable wait is what the presenter committed since the previous
+    /// present-bearing submission, so no wait reaches two submissions.
+    pub fn add_submit_wait_nanos(&mut self, drawable: u64, present: u64) {
         if self.clocked.is_some() {
-            self.submit_nanos.drawable = drawable;
-            self.submit_nanos.present = present;
+            self.submit_nanos.drawable = self.submit_nanos.drawable.saturating_add(drawable);
+            self.submit_nanos.present = self.submit_nanos.present.saturating_add(present);
         } else {
-            self.set_drawable_wait_cycles(ns_to_cycles(drawable));
-            self.set_present_wait_cycles(ns_to_cycles(present));
+            self.enc.drawable_wait_cycles = self
+                .enc
+                .drawable_wait_cycles
+                .saturating_add(ns_to_cycles(drawable));
+            self.enc.present_wait_cycles = self
+                .enc
+                .present_wait_cycles
+                .saturating_add(ns_to_cycles(present));
         }
-    }
-
-    pub const fn set_drawable_wait_cycles(&mut self, cycles: u64) {
-        self.enc.drawable_wait_cycles = cycles;
     }
 
     pub const fn add_submit_stall_cycles(&mut self, cycles: u64) {
         self.enc.submit_stall_cycles = self.enc.submit_stall_cycles.saturating_add(cycles);
     }
 
-    pub const fn set_present_wait_cycles(&mut self, cycles: u64) {
-        self.enc.present_wait_cycles = cycles;
-    }
-
-    /// Fold one `SubmitFrame`: its execute and encode split overwrite, its GPU time adds.
+    /// Fold one `SubmitFrame`: its execute, its encode split and its GPU time all add.
     ///
     /// `submit_exec_cycles` is the caller's own measure of the thunk, taken
-    /// on whichever thread ran it; setting it here with the children keeps
-    /// `Encode+commit` and its split from the same submission, whether that
-    /// was an async payload or a synchronous submit behind a barrier. The
-    /// unix side measures nanoseconds, since its counter is not ours, so its
+    /// on whichever thread ran it; adding it here with the children keeps
+    /// `Encode+commit` and its split from the same submissions, whether
+    /// those were async payloads or a synchronous submit behind a barrier,
+    /// and a sample that two submissions fold into reports both. The unix
+    /// side measures nanoseconds, since its counter is not ours, so its
     /// values convert into our cycles here.
     pub fn fold_submit_timings(&mut self, timings: &SubmitTimings, submit_exec_cycles: u64) {
-        self.enc.submit_exec_cycles = submit_exec_cycles;
+        self.enc.submit_exec_cycles = self
+            .enc
+            .submit_exec_cycles
+            .saturating_add(submit_exec_cycles);
         if self.clocked.is_some() {
-            self.submit_nanos.blits = timings.leading_blits_ns;
-            self.submit_nanos.passes = timings.passes_ns;
-            self.submit_nanos.commit = timings.commit_ns;
+            let nanos = &mut self.submit_nanos;
+            nanos.blits = nanos.blits.saturating_add(timings.leading_blits_ns);
+            nanos.passes = nanos.passes.saturating_add(timings.passes_ns);
+            nanos.commit = nanos.commit.saturating_add(timings.commit_ns);
             for ((ns, buffers), busy) in self
                 .submit_nanos
                 .gpu
@@ -2526,9 +2562,16 @@ impl EncoderPerfState {
             }
             return;
         }
-        self.enc.submit_blits_cycles = ns_to_cycles(timings.leading_blits_ns);
-        self.enc.submit_passes_cycles = ns_to_cycles(timings.passes_ns);
-        self.enc.submit_commit_cycles = ns_to_cycles(timings.commit_ns);
+        let enc = &mut self.enc;
+        enc.submit_blits_cycles = enc
+            .submit_blits_cycles
+            .saturating_add(ns_to_cycles(timings.leading_blits_ns));
+        enc.submit_passes_cycles = enc
+            .submit_passes_cycles
+            .saturating_add(ns_to_cycles(timings.passes_ns));
+        enc.submit_commit_cycles = enc
+            .submit_commit_cycles
+            .saturating_add(ns_to_cycles(timings.commit_ns));
         let sums = self
             .enc
             .gpu_cycles
@@ -2679,42 +2722,18 @@ impl EncoderPerfState {
         entry.cull_mode = cull_mode;
     }
 
-    /// Accumulate this frame into the rolling 2-second window.
-    ///
-    /// Once the window has spanned `SUMMARY_INTERVAL_SECS`, emit the
-    /// averaged `info!` summary on `mtld3d::perf`. The per-pass breakdown,
-    /// the `present_texture=…` audit line, and the per-RT pair dump are
-    /// emitted on the separate `mtld3d::d3d9::passes=trace` switch — they
-    /// are pass / workload shape, not perf metrics.
+    /// Build this frame's sample and clear what the submit thread folded into it.
     ///
     /// # Panics
     ///
-    /// Panics if pass / command counts exceed `u32::MAX`. Unreachable —
-    /// real frames cap at a few thousand passes.
-    pub fn log_frame_summary(
+    /// Panics if pass / command counts exceed `u32::MAX`.
+    fn take_sample(
         &mut self,
         caches: &CacheSizes,
         passes: &[Pass],
-        ctx: &FrameSummaryContext,
         submit_status: i32,
         cmd_vec_realloc_bytes: u64,
-        task_faults: Option<TaskFaults>,
-    ) {
-        // `mtld3d::perf=debug` gates both the averaged summary and the
-        // per-call ApiTimer / CycleSet / CycleAdd cycle accounting —
-        // both read from the latched `perf_enabled()` flag so this
-        // per-frame check is a single Relaxed load. The pass /
-        // present-texture / per-pair detail is gated independently on
-        // `mtld3d::d3d9::passes=trace` via the cached
-        // `pair_stats_enabled` flag.
-        let want_stats = perf_enabled();
-        let want_passes = pair_stats_enabled();
-        if !want_stats && !want_passes {
-            return;
-        }
-        let set_pipeline = CommandType::SetRenderPipelineState as u32;
-        let set_frag_tex = CommandType::SetFragmentTexture as u32;
-
+    ) -> FrameSample {
         let mut total_draws: u32 = 0;
         let mut total_commands: u32 = 0;
         for p in passes {
@@ -2784,11 +2803,49 @@ impl EncoderPerfState {
             enc_cyc: enc_cycles,
             submit_status,
         };
-        // Sampled: the barriers that bump them run before the next reset.
-        self.enc.snapshots = 0;
-        self.enc.slot_waits = 0;
-        self.enc.gpu_cycles = [0; CommandBufferRole::COUNT];
-        self.enc.gpu_buffers = [0; CommandBufferRole::COUNT];
+        // Sampled: what the submit thread and the barriers fold lands before
+        // the next reset, so only the sample clears it.
+        self.enc.clear_folded();
+        sample
+    }
+
+    /// Accumulate this frame into the rolling 2-second window.
+    ///
+    /// Once the window has spanned `SUMMARY_INTERVAL_SECS`, emit the
+    /// averaged `info!` summary on `mtld3d::perf`. The per-pass breakdown,
+    /// the `present_texture=…` audit line, and the per-RT pair dump are
+    /// emitted on the separate `mtld3d::d3d9::passes=trace` switch; they
+    /// are pass / workload shape, not perf metrics.
+    ///
+    /// # Panics
+    ///
+    /// Panics if pass / command counts exceed `u32::MAX`. Unreachable:
+    /// real frames cap at a few thousand passes.
+    pub fn log_frame_summary(
+        &mut self,
+        caches: &CacheSizes,
+        passes: &[Pass],
+        ctx: &FrameSummaryContext,
+        submit_status: i32,
+        cmd_vec_realloc_bytes: u64,
+        task_faults: Option<TaskFaults>,
+    ) {
+        // `mtld3d::perf=debug` gates both the averaged summary and the
+        // per-call ApiTimer / CycleSet / CycleAdd cycle accounting;
+        // both read from the latched `perf_enabled()` flag so this
+        // per-frame check is a single Relaxed load. The pass /
+        // present-texture / per-pair detail is gated independently on
+        // `mtld3d::d3d9::passes=trace` via the cached
+        // `pair_stats_enabled` flag.
+        let want_stats = perf_enabled();
+        let want_passes = pair_stats_enabled();
+        if !want_stats && !want_passes {
+            return;
+        }
+        let set_pipeline = CommandType::SetRenderPipelineState as u32;
+        let set_frag_tex = CommandType::SetFragmentTexture as u32;
+
+        let sample = self.take_sample(caches, passes, submit_status, cmd_vec_realloc_bytes);
         if let Some(clocked) = &mut self.clocked {
             clocked.push(deferred::PendingSample {
                 sample,
@@ -2973,7 +3030,7 @@ impl EncoderPerfState {
     #[inline]
     pub const fn begin_frame(&mut self, _payload: &FramePerfPayload) {}
     #[inline]
-    pub const fn set_submit_wait_nanos(&mut self, _drawable: u64, _present: u64) {}
+    pub const fn add_submit_wait_nanos(&mut self, _drawable: u64, _present: u64) {}
     #[inline]
     pub const fn finish_deferred(&mut self) {}
 
@@ -3012,11 +3069,7 @@ impl EncoderPerfState {
         core::ptr::null_mut()
     }
     #[inline]
-    pub const fn set_drawable_wait_cycles(&mut self, _cycles: u64) {}
-    #[inline]
     pub const fn add_submit_stall_cycles(&mut self, _cycles: u64) {}
-    #[inline]
-    pub const fn set_present_wait_cycles(&mut self, _cycles: u64) {}
     #[inline]
     pub const fn fold_submit_timings(&mut self, _timings: &SubmitTimings, _submit_exec: u64) {}
     #[inline]

@@ -143,8 +143,11 @@ struct Inner {
     presented_seq: u64,
     flags: PresenterFlags,
     slots: [Option<Slot>; SNAPSHOT_SLOTS],
-    /// The last present's `nextDrawable` wait, handed back to the next submit.
-    last_drawable_wait_ns: u64,
+    /// The `nextDrawable` waits of the presents committed since the last push.
+    ///
+    /// Each push takes the sum, so every wait reaches exactly one submit's
+    /// outcome, however the presents and the pushes interleave.
+    unreported_drawable_wait_ns: u64,
     /// The gate file `debug.presentGateFile` named, `None` = no gate.
     gate: Option<PathBuf>,
 }
@@ -249,6 +252,13 @@ enum SlotChoice {
     Busy(usize),
 }
 
+impl Inner {
+    /// Keep a committed present's `nextDrawable` wait for the next push to report.
+    const fn note_drawable_wait(&mut self, ns: u64) {
+        self.unreported_drawable_wait_ns = self.unreported_drawable_wait_ns.saturating_add(ns);
+    }
+}
+
 impl PresentState {
     fn lock(&self) -> MutexGuard<'_, Inner> {
         self.inner.lock().unwrap_or_else(PoisonError::into_inner)
@@ -284,7 +294,7 @@ impl PresentState {
                 presented_seq: 0,
                 flags: PresenterFlags::empty(),
                 slots: [const { None }; SNAPSHOT_SLOTS],
-                last_drawable_wait_ns: 0,
+                unreported_drawable_wait_ns: 0,
                 gate,
             }),
             submit_cv: Condvar::new(),
@@ -505,23 +515,26 @@ pub fn wait_for_present_idle(record: &DeviceRecord) {
     );
 }
 
-/// Hand a frame's presentation to the presenter; returns the last drawable wait.
+/// Hand a frame's presentation to the presenter; returns the drawable waits not yet reported.
 ///
-/// The wait is the previous present's, which is what the perf grid reports
-/// for the submit that hands the next one over.
+/// Those are the waits of the presents committed since the previous push,
+/// which is what the perf grid reports for the submit that hands the next
+/// one over. Taking them here reports each wait once.
 pub fn push(state: &PresentState, packet: PresentPacket) -> u64 {
     let mut inner = state.lock();
+    let waits = core::mem::take(&mut inner.unreported_drawable_wait_ns);
     if inner.flags.contains(PresenterFlags::STOP) {
         mtld3d_shared::log_once_warn!(
             target: LOG_TARGET,
             "presenter: a frame was pushed after the queue's presenter stopped; it is not presented",
         );
         drop_packet(&mut inner, packet);
-        return inner.last_drawable_wait_ns;
+        return waits;
     }
     inner.pending.push_back(packet);
+    drop(inner);
     state.presenter_cv.notify_one();
-    inner.last_drawable_wait_ns
+    waits
 }
 
 /// Make the pending present and this submit's render work compatible.
@@ -888,7 +901,7 @@ fn present_frame(record: &Arc<DeviceRecord>, queue: &ProtocolObject<dyn MTLComma
     let packet = inner.pending.pop_front();
     inner.committed_present_seq = inner.committed_present_seq.max(seq);
     inner.presented_seq = seq;
-    inner.last_drawable_wait_ns = drawable_wait_ns;
+    inner.note_drawable_wait(drawable_wait_ns);
     drop(inner);
     state.submit_cv.notify_all();
     drop(packet);
