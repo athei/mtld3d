@@ -1,4 +1,4 @@
-//! Ctrl+Shift+F7 hotkey poll: one press arms the frame dump and the Metal GPU capture.
+//! Ctrl+Shift+P hotkey poll: one press arms the frame dump and the Metal GPU capture.
 //!
 //! Both diagnostics cover the same [`FrameDump::FRAMES`] consecutive frames
 //! (see `device::frame_dump`): the dump logs the D3D9-level events a GPU
@@ -11,11 +11,11 @@
 //! still runs.
 //!
 //! The chord, its key codes and what counts as a press are
-//! `mtld3d_core::capture_chord`'s: F7 going down while Control and Shift are
-//! held and Alt is not, a chord neither Steam's screenshot key (F12) nor the
-//! Metal HUD's menu keys take. Polling cost is one `GetAsyncKeyState` syscall
-//! per `Present()` (~100 ns), plus up to three for the modifiers on the
-//! present where F7 goes down.
+//! `mtld3d_core::capture_chord`'s: P going down while Control and Shift are
+//! held and Alt is not, a chord that neither Steam, the Metal HUD nor macOS
+//! takes. Polling cost is one `GetAsyncKeyState` syscall per `Present()`
+//! (~100 ns), plus up to three for the modifiers on the present where P goes
+//! down.
 //!
 //! Flow: `device_present` → `poll()` → on a chord press sets
 //! `CAPTURE_REQUESTED`; the same `Present` takes it through
@@ -51,9 +51,9 @@ fn key_down(vkey: i32) -> bool {
     unsafe { GetAsyncKeyState(vkey) }.cast_unsigned() & 0x8000 != 0
 }
 
-/// Poll the chord once per present, firing when F7 goes down with Control and Shift held.
+/// Poll the chord once per present, firing when P goes down with Control and Shift held.
 ///
-/// Idempotent across frames where F7 is held down.
+/// Idempotent across frames where P is held down.
 pub fn poll() {
     /// The capture key's state at the previous poll, by any device.
     ///

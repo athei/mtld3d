@@ -756,7 +756,7 @@ pub struct DeviceInner {
     snapshot_dirty: SnapshotDirty,
     /// Owned keys retained only for subsequent API-side dirty-state builders and dumps.
     snapshot_cache: ApiSnapshotCache,
-    /// The Ctrl+Shift+F7 draw-state dump, see `frame_dump`.
+    /// The Ctrl+Shift+P draw-state dump, see `frame_dump`.
     frame_dump: frame_dump::FrameDump,
     /// Cached `bound_texture_mask` from the most recent `STAGES` rebuild.
     ///
@@ -1744,7 +1744,7 @@ impl DeviceInner {
         if let Some(change) = self.pending_gamma.take() {
             frame.set_apply_gamma(Some(change));
         }
-        // A Ctrl+Shift+F7 run ends with the frame the closing `Present`
+        // A Ctrl+Shift+P run ends with the frame the closing `Present`
         // submits. A mid-frame flush sends the marked frame out early, so its
         // stop mark moves onto the continuation; the start mark stays with the
         // first piece, and the encoder keeps capturing until it sees the stop.
@@ -2969,7 +2969,7 @@ impl DeviceInner {
     /// frame gets back.
     pub fn reseed_current_frame(&mut self) {
         // The replaced frame is dropped rather than submitted, so a
-        // Ctrl+Shift+F7 run in progress hands its marks to the fresh one:
+        // Ctrl+Shift+P run in progress hands its marks to the fresh one:
         // without that the encoder never sees the run's stop and the capture
         // ends only with the process. Every reseed follows a flush, which
         // already sent the start out with the piece it submitted, so this is

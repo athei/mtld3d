@@ -29,7 +29,7 @@ pub struct CompareConfig {
 /// A parsed `bench-shape` invocation.
 #[derive(Debug)]
 pub struct ShapeConfig {
-    /// `--game-log`: a layer log holding at least one complete Ctrl+Shift+F7 frame dump.
+    /// `--game-log`: a layer log holding at least one complete Ctrl+Shift+P frame dump.
     pub game_log: PathBuf,
     /// `--metrics`: the benchmark's `bench-<name>.metrics`, whose `shape` lines are compared.
     pub metrics: PathBuf,

@@ -18,7 +18,7 @@ const FALLBACK_PATH: &str = "/tmp/mtld3d_capture.gputrace";
 /// Apple gates this on `MTL_CAPTURE_ENABLED=1` at process launch; when
 /// the env is unset `startCaptureWithDescriptor` returns an error which
 /// we surface as a single warn (doesn't repeat per attempt at this site,
-/// but the user-visible action, the Ctrl+Shift+F7 hotkey, already
+/// but the user-visible action, the Ctrl+Shift+P hotkey, already
 /// self-rate-limits to one press).
 pub fn start_capture(device_handle: MetalHandle<MTLDeviceKind>) {
     // SAFETY: `sharedCaptureManager` is an always-live process-wide singleton

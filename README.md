@@ -115,14 +115,15 @@ profiles and the reason for each setting they make.
 Every process writes `mtld3d-logs/<exe>-<pid>.log` next to the executable,
 never to the standard streams. `RUST_LOG` filters it: unset, everything logs
 at `info`, and `RUST_LOG=mtld3d=warn` quiets the whole project. The log
-targets, the levels and the Ctrl+Shift+F7 frame capture are described in
+targets, the levels and the Ctrl+Shift+P frame capture are described in
 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#logging). The capture hotkey
-avoids the keys other programs take before the game sees them: a bare F12 is
-Steam's default screenshot key, and the Metal HUD's menu takes Shift+F8 to
-Shift+F12 and Ctrl+Shift+F9 to Ctrl+Shift+F12. It takes the Control key, not
-Command, and holding Command blocks it, since Wine's Mac driver reports
-Command as Alt. On a MacBook keyboard F7 needs Fn unless "Use F1, F2, etc.
-keys as standard function keys" is on.
+is a letter chord because no Ctrl+Shift function-key chord is free: a bare
+F12 is Steam's default screenshot key, the Metal HUD's menu takes Shift+F8 to
+Shift+F12 and Ctrl+Shift+F9 to Ctrl+Shift+F12, and macOS takes its Ctrl+F1 to
+Ctrl+F8 keyboard-navigation shortcuts even with Shift held, all before the
+game sees the key. P sits at the same place on the common layouts (QWERTY,
+QWERTZ and AZERTY). The chord takes the Control key, not Command, and holding
+Command blocks it, since Wine's Mac driver reports Command as Alt.
 
 [`docs/GAMES.md`](docs/GAMES.md) lists the games tested so far and
 [how to report one](docs/GAMES.md#reporting-a-game) that fails. Each release

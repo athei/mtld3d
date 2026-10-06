@@ -111,7 +111,7 @@ pub enum CommandType {
     SetFragmentBuffer = 24,
     /// `encoder.pushDebugGroup("draw N")`
     ///
-    /// Emitted only while the Ctrl+Shift+F7 frame dump runs, around the
+    /// Emitted only while the Ctrl+Shift+P frame dump runs, around the
     /// Metal draw of dumped draw `param_a`, so the `[dump] draw N` log line
     /// and the draw's node in a GPU trace name each other. Costs nothing
     /// when no dump is armed.

@@ -1,6 +1,6 @@
 //! Check a benchmark's declared frame against a frame a game dumped, to calibrate the scene.
 //!
-//! Ctrl+Shift+F7 in a game makes the layer log a few consecutive frames
+//! Ctrl+Shift+P in a game makes the layer log a few consecutive frames
 //! draw by draw (`[dump]` lines at info level: the frame's start and end,
 //! every bind, clear and copy, and one line per draw naming its render
 //! target, depth surface, shaders and textures). A benchmark that stands
@@ -428,7 +428,7 @@ pub fn parse_game_log(log: &str) -> Result<GameFrame, String> {
     let Some((body, end)) = frames.pop() else {
         return Err(
             "no complete [dump] frame (a frame start followed by its frame end); press \
-             Ctrl+Shift+F7 in the game to dump one"
+             Ctrl+Shift+P in the game to dump one"
                 .to_owned(),
         );
     };
