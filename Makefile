@@ -1979,7 +1979,7 @@ bench-compare:
 
 # `make bench-shape GAME_LOG=<layer log> BENCH_METRICS=<bench-<name>.metrics>`
 # calibrates a benchmark's scene against a game: it reads the last complete
-# frame the game dumped with Ctrl+Shift+F7 into passes and prints them beside the
+# frame the game dumped with Ctrl+Shift+P into passes and prints them beside the
 # benchmark's `shape` lines, flagging draw counts off by more than 10 %,
 # fixed-function shares off by more than 10 points, textures per draw off by
 # more than 1.0, and a different pass count. Where the `shape` lines carry a
@@ -1991,7 +1991,7 @@ bench-compare:
 # It runs nothing under Wine and judges no build; it is run by hand.
 bench-shape:
 	test -n '$(GAME_LOG)' -a -n '$(BENCH_METRICS)' || \
-		{ echo "make bench-shape needs GAME_LOG=<a layer log with a Ctrl+Shift+F7 dump> and BENCH_METRICS=<a bench-<name>.metrics>" >&2; exit 2; }
+		{ echo "make bench-shape needs GAME_LOG=<a layer log with a Ctrl+Shift+P dump> and BENCH_METRICS=<a bench-<name>.metrics>" >&2; exit 2; }
 	cd $(E2E_RUNNER_DIR) && $(E2E_RUNNER) bench-shape --game-log '$(abspath $(GAME_LOG))' \
 		--metrics '$(abspath $(BENCH_METRICS))'
 

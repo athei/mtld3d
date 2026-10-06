@@ -35,7 +35,7 @@ the [tracker](https://github.com/athei/mtld3d/issues); reports are welcome.
 Name the game, its version and whether it is 32-bit or 64-bit, the mtld3d
 release and the Wine or CrossOver version, and attach the log from
 `mtld3d-logs` next to the game's executable. A report of wrong rendering is
-easiest to act on with a Ctrl+Shift+F7 capture taken at the moment it
+easiest to act on with a Ctrl+Shift+P capture taken at the moment it
 shows
-([`ARCHITECTURE.md`](ARCHITECTURE.md#ctrlshiftf7-three-frame-dump-and-gpu-capture)
+([`ARCHITECTURE.md`](ARCHITECTURE.md#ctrlshiftp-three-frame-dump-and-gpu-capture)
 says how).

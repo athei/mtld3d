@@ -1,10 +1,13 @@
-//! The Ctrl+Shift+F7 chord that arms the three-frame dump and the Metal GPU capture.
+//! The Ctrl+Shift+P chord that arms the three-frame dump and the Metal GPU capture.
 //!
-//! The chord stays clear of the keys other programs take before Wine sees
-//! them: a bare F12 is Steam's default screenshot key, and the Metal
-//! performance HUD's menu takes Shift+F8 to Shift+F12 and Ctrl+Shift+F9 to
-//! Ctrl+Shift+F12. The trigger is F7 with Control and Shift held and Alt up.
-//! It is fixed: no configuration key and no environment variable moves it.
+//! The chord is on a letter because no Ctrl+Shift function-key chord is free:
+//! a bare F12 is Steam's default screenshot key, the Metal performance HUD's
+//! menu takes Shift+F8 to Shift+F12 and Ctrl+Shift+F9 to Ctrl+Shift+F12, and
+//! macOS takes its Ctrl+F1 to Ctrl+F8 keyboard-navigation shortcuts even with
+//! Shift held. P sits at the same place on QWERTY, QWERTZ and AZERTY, so its
+//! virtual-key code does not move with the layout. The trigger is P with
+//! Control and Shift held and Alt up. It is fixed: no configuration key and
+//! no environment variable moves it.
 //!
 //! The keys are sampled once per `Present`, so a press is read from two
 //! consecutive samples. The chord fires when the capture key is up at one
@@ -23,8 +26,8 @@
 //! The modifiers are read only on the sample where the key goes down, so the
 //! steady-state cost is the one key read.
 
-/// The capture key, F7, as a Win32 virtual-key code (`VK_F7`).
-pub const CAPTURE_KEY: i32 = 0x76;
+/// The capture key, P, as a Win32 virtual-key code (`VK_P`, the letter's ASCII code).
+pub const CAPTURE_KEY: i32 = 0x50;
 
 /// A modifier key the chord reads.
 pub enum Modifier {

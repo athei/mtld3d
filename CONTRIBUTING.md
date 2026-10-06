@@ -392,7 +392,7 @@ fails the run like a changed exact metric unless `ACCEPT` names `shape` or
 `shape:<bench>`.
 
 `make bench-shape GAME_LOG=<layer log> BENCH_METRICS=<bench-<name>.metrics>`
-checks a benchmark's scene against a frame a game dumped with Ctrl+Shift+F7:
+checks a benchmark's scene against a frame a game dumped with Ctrl+Shift+P:
 the pass count, and per pass the draw count, the fixed-function share and the
 textures per draw, with render-target sizes shown relative to each side's
 back buffer. Each pass is also compared on its state mix, which a benchmark

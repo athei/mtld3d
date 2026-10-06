@@ -1660,7 +1660,7 @@ fn emit_draw_view(
     if matches!(index_source, IndexView::Generated { .. }) {
         enc.bump_fan_generated();
     }
-    // While the Ctrl+Shift+F7 dump runs, the Metal draw sits in a `draw N`
+    // While the Ctrl+Shift+P dump runs, the Metal draw sits in a `draw N`
     // debug group so the trace node and the `[dump] draw N` line name each
     // other.
     if let Some(index) = dump_draw {
