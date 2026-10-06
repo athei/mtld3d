@@ -65,8 +65,10 @@ fn direct3d_create9_ex_resolves_and_creates_an_extended_interface() {
     let hr = unsafe { create_ex(D3DSDK_VERSION, &raw mut out) };
     assert_eq!(hr, D3D_OK, "Direct3DCreate9Ex creates an interface");
     assert!(!out.is_null(), "the out slot holds the interface");
-    // SAFETY: `out` is a live interface whose first field is its vtable.
-    let vtbl = unsafe { &**out.cast::<*const IDirect3D9Vtbl>() };
+    // SAFETY: `out` is a live interface whose first field is its vtable pointer.
+    let vtbl_ptr = unsafe { *out.cast::<*const IDirect3D9Vtbl>() };
+    // SAFETY: the vtable is a static the interface points to for its lifetime.
+    let vtbl = unsafe { &*vtbl_ptr };
     let mut ex: *mut c_void = core::ptr::null_mut();
     // SAFETY: base vtable thunk on the live interface with a writable slot.
     let hr = unsafe { (vtbl.query_interface)(out, &IID_IDIRECT3D9EX, &raw mut ex) };

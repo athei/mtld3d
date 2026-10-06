@@ -1801,8 +1801,11 @@ pub unsafe fn finalize_implicit_surface(ptr: u64) {
 /// # Safety
 /// `ptr` is a live surface wrapper a create just handed out.
 pub unsafe fn add_reported_usage(ptr: *mut c_void, usage: u32) {
-    // SAFETY: the caller's contract: a live surface wrapper, its inner live.
-    let inner = unsafe { &mut *(*ptr.cast::<Direct3DSurface9>()).inner };
+    // SAFETY: the caller's contract: a live surface wrapper.
+    let inner_ptr = unsafe { (*ptr.cast::<Direct3DSurface9>()).inner };
+    // SAFETY: a live wrapper's `inner` is its live `SurfaceInner`, borrowed
+    // exclusively under the device's API lock for the create.
+    let inner = unsafe { &mut *inner_ptr };
     if inner.parent_texture.is_null() {
         inner.standalone_usage |= usage;
     } else if inner.flags.contains(SurfaceFlags::OWNS_PARENT_TEXTURE) {
@@ -1827,7 +1830,7 @@ pub unsafe fn implicit_surface_is_held(ptr: u64) -> bool {
 ///
 /// An extended device's `Reset` makes a new back buffer and auto
 /// depth-stencil while the application may still hold the surfaces of the old
-/// ones. D3D9Ex leaves such a reference naming the old surface, at the old
+/// ones. `D3D9Ex` leaves such a reference naming the old surface, at the old
 /// size and no longer part of the swap chain. The surface takes over the
 /// textures it has resolved from the device until now, which the `Reset` then
 /// leaves alone, and becomes a standalone default-pool target: its container

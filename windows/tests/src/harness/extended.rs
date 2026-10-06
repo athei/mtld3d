@@ -5,7 +5,7 @@
 //! [`Factory::ExtendedDeviceEx`](super::Factory::ExtendedDeviceEx); the
 //! tests that call them create one first.
 
-use core::ffi::c_void;
+use core::{ffi::c_void, marker::PhantomData};
 
 use mtld3d_types::{
     D3DDEVTYPE_HAL, D3DDISPLAYMODEEX, D3DDISPLAYMODEFILTER, D3DPRESENT_PARAMETERS,
@@ -14,6 +14,32 @@ use mtld3d_types::{
 
 use super::{Harness, HarnessConfig};
 use crate::{resource::Surface, vtbl::deref_vtbl};
+
+/// A create's `pSharedHandle` argument: none, or a slot the call reads.
+///
+/// An extended device reads a slot holding a pointer to the level's pixels
+/// as user memory, and a slot holding null as a request to share. The slot
+/// is borrowed for as long as the argument exists.
+pub struct SharedHandle<'a> {
+    ptr: *mut c_void,
+    slot: PhantomData<&'a mut *mut c_void>,
+}
+
+impl<'a> SharedHandle<'a> {
+    /// No `pSharedHandle`: the null argument every base create takes.
+    pub const NONE: SharedHandle<'static> = SharedHandle {
+        ptr: core::ptr::null_mut(),
+        slot: PhantomData,
+    };
+
+    /// A `pSharedHandle` naming `slot`: user memory when it holds a pointer, sharing when null.
+    pub const fn to<T>(slot: &'a mut *mut T) -> Self {
+        Self {
+            ptr: core::ptr::from_mut(slot).cast::<c_void>(),
+            slot: PhantomData,
+        }
+    }
+}
 
 /// A `D3DDISPLAYMODEEX` with every field zero but `size`.
 #[must_use]
@@ -308,7 +334,7 @@ impl Harness {
         &self,
         size: (u32, u32),
         format: u32,
-        shared_handle: *mut c_void,
+        shared_handle: &SharedHandle<'_>,
         usage: u32,
     ) -> (i32, Option<Surface<'_>>) {
         let mut out: *mut c_void = core::ptr::null_mut();
@@ -323,7 +349,7 @@ impl Harness {
                 0,
                 0,
                 &raw mut out,
-                shared_handle,
+                shared_handle.ptr,
                 usage,
             )
         };
@@ -337,7 +363,7 @@ impl Harness {
         size: (u32, u32),
         format: u32,
         pool: u32,
-        shared_handle: *mut c_void,
+        shared_handle: &SharedHandle<'_>,
         usage: u32,
     ) -> (i32, Option<Surface<'_>>) {
         let mut out: *mut c_void = core::ptr::null_mut();
@@ -350,7 +376,7 @@ impl Harness {
                 format,
                 pool,
                 &raw mut out,
-                shared_handle,
+                shared_handle.ptr,
                 usage,
             )
         };
@@ -363,7 +389,7 @@ impl Harness {
         &self,
         size: (u32, u32),
         format: u32,
-        shared_handle: *mut c_void,
+        shared_handle: &SharedHandle<'_>,
         usage: u32,
     ) -> (i32, Option<Surface<'_>>) {
         let mut out: *mut c_void = core::ptr::null_mut();
@@ -378,7 +404,7 @@ impl Harness {
                 0,
                 0,
                 &raw mut out,
-                shared_handle,
+                shared_handle.ptr,
                 usage,
             )
         };
@@ -428,7 +454,7 @@ impl Harness {
         levels: u32,
         format: u32,
         pool: u32,
-        shared_handle: *mut c_void,
+        shared_handle: &SharedHandle<'_>,
     ) -> (i32, *mut c_void) {
         let mut out: *mut c_void = core::ptr::null_mut();
         // SAFETY: vtable thunk; `out` is writable and the handle null or live.
@@ -442,7 +468,7 @@ impl Harness {
                 format,
                 pool,
                 &raw mut out,
-                shared_handle,
+                shared_handle.ptr,
             )
         };
         (hr, out)
@@ -455,7 +481,7 @@ impl Harness {
         edge: u32,
         format: u32,
         pool: u32,
-        shared_handle: *mut c_void,
+        shared_handle: &SharedHandle<'_>,
     ) -> (i32, *mut c_void) {
         let mut out: *mut c_void = core::ptr::null_mut();
         // SAFETY: vtable thunk; `out` is writable and the handle null or live.
@@ -468,7 +494,7 @@ impl Harness {
                 format,
                 pool,
                 &raw mut out,
-                shared_handle,
+                shared_handle.ptr,
             )
         };
         (hr, out)
@@ -481,7 +507,7 @@ impl Harness {
         extent: [u32; 3],
         format: u32,
         pool: u32,
-        shared_handle: *mut c_void,
+        shared_handle: &SharedHandle<'_>,
     ) -> (i32, *mut c_void) {
         let mut out: *mut c_void = core::ptr::null_mut();
         // SAFETY: vtable thunk; `out` is writable and the handle null or live.
@@ -496,7 +522,7 @@ impl Harness {
                 format,
                 pool,
                 &raw mut out,
-                shared_handle,
+                shared_handle.ptr,
             )
         };
         (hr, out)
@@ -508,7 +534,7 @@ impl Harness {
         &self,
         length: u32,
         pool: u32,
-        shared_handle: *mut c_void,
+        shared_handle: &SharedHandle<'_>,
     ) -> (i32, *mut c_void) {
         let mut out: *mut c_void = core::ptr::null_mut();
         // SAFETY: vtable thunk; `out` is writable and the handle null or live.
@@ -520,7 +546,7 @@ impl Harness {
                 0,
                 pool,
                 &raw mut out,
-                shared_handle,
+                shared_handle.ptr,
             )
         };
         (hr, out)
@@ -532,7 +558,7 @@ impl Harness {
         &self,
         length: u32,
         pool: u32,
-        shared_handle: *mut c_void,
+        shared_handle: &SharedHandle<'_>,
     ) -> (i32, *mut c_void) {
         let mut out: *mut c_void = core::ptr::null_mut();
         // SAFETY: vtable thunk; `out` is writable and the handle null or live.
@@ -544,7 +570,7 @@ impl Harness {
                 mtld3d_types::D3DFMT_INDEX16,
                 pool,
                 &raw mut out,
-                shared_handle,
+                shared_handle.ptr,
             )
         };
         (hr, out)
@@ -556,7 +582,7 @@ impl Harness {
         &self,
         size: (u32, u32),
         format: u32,
-        shared_handle: *mut c_void,
+        shared_handle: &SharedHandle<'_>,
     ) -> (i32, *mut c_void) {
         let mut out: *mut c_void = core::ptr::null_mut();
         // SAFETY: vtable thunk; `out` is writable and the handle null or live.
@@ -570,7 +596,7 @@ impl Harness {
                 0,
                 0,
                 &raw mut out,
-                shared_handle,
+                shared_handle.ptr,
             )
         };
         (hr, out)
@@ -582,7 +608,7 @@ impl Harness {
         &self,
         size: (u32, u32),
         format: u32,
-        shared_handle: *mut c_void,
+        shared_handle: &SharedHandle<'_>,
     ) -> (i32, *mut c_void) {
         let mut out: *mut c_void = core::ptr::null_mut();
         // SAFETY: vtable thunk; `out` is writable and the handle null or live.
@@ -596,7 +622,7 @@ impl Harness {
                 0,
                 0,
                 &raw mut out,
-                shared_handle,
+                shared_handle.ptr,
             )
         };
         (hr, out)
@@ -609,7 +635,7 @@ impl Harness {
         size: (u32, u32),
         format: u32,
         pool: u32,
-        shared_handle: *mut c_void,
+        shared_handle: &SharedHandle<'_>,
     ) -> (i32, *mut c_void) {
         let mut out: *mut c_void = core::ptr::null_mut();
         // SAFETY: vtable thunk; `out` is writable and the handle null or live.
@@ -621,23 +647,9 @@ impl Harness {
                 format,
                 pool,
                 &raw mut out,
-                shared_handle,
+                shared_handle.ptr,
             )
         };
         (hr, out)
-    }
-
-    /// Release an object a `try_create_*_shared` call handed out; a null pointer is skipped.
-    ///
-    /// Returns the count after the release, 0 for a null pointer.
-    pub fn release_created(&self, object: *mut c_void) -> u32 {
-        if object.is_null() {
-            return 0;
-        }
-        // SAFETY: every D3D9 object starts with an IUnknown vtable; the caller
-        // releases the reference the create handed it.
-        let unknown = unsafe { deref_vtbl::<mtld3d_types::IDirect3D9Vtbl>(object) };
-        // SAFETY: IUnknown::Release on the caller's reference.
-        unsafe { (unknown.release)(object) }
     }
 }

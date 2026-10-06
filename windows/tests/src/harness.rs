@@ -32,7 +32,7 @@ use crate::{
 };
 
 mod cursor_bitmap;
-mod extended;
+pub mod extended;
 
 /// The process environment, which every `Direct3DCreate9` reads.
 ///

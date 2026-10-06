@@ -17,8 +17,8 @@
 use core::ffi::c_void;
 
 use mtld3d_tests::{
-    Factory, Harness, HarnessConfig, Surface, Texture, TexturedVertex, assert_pixel_approx,
-    assert_pixel_eq,
+    CubeTexture, Factory, Harness, HarnessConfig, IndexBuffer, SharedHandle, Surface, Texture,
+    TexturedVertex, VertexBuffer, assert_pixel_approx, assert_pixel_eq,
 };
 use mtld3d_types::{
     D3D_OK, D3DERR_INVALIDCALL, D3DERR_NOTAVAILABLE, D3DFMT_A8R8G8B8, D3DFMT_ATI2, D3DFMT_D24S8,
@@ -38,16 +38,6 @@ fn extended() -> Harness {
         factory: Factory::Extended,
         ..HarnessConfig::default()
     })
-}
-
-/// A pointer to `memory`'s data pointer, the shape a user-memory `pSharedHandle` takes.
-fn handle_to<T>(memory: &mut *mut T) -> *mut c_void {
-    core::ptr::from_mut(memory).cast::<c_void>()
-}
-
-/// A non-null `pSharedHandle` naming a null handle, as a caller asking to share does.
-fn share_handle(slot: &mut *mut c_void) -> *mut c_void {
-    core::ptr::from_mut(slot).cast::<c_void>()
 }
 
 /// Draw `texture` over the whole back buffer and read its centre.
@@ -111,20 +101,28 @@ fn an_extended_device_refuses_the_managed_pool_for_every_kind() {
     for (h, expected) in [(&ex, D3DERR_INVALIDCALL), (&plain, D3D_OK)] {
         let (hr, texture) = h.try_create_texture(16, 16, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED);
         assert_eq!(hr, expected, "texture");
-        h.release_created(texture);
+        if !texture.is_null() {
+            drop(Texture::from_raw(texture));
+        }
         let (hr, cube) = h.try_create_cube_texture(16, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED);
         assert_eq!(hr, expected, "cube texture");
-        h.release_created(cube);
+        if !cube.is_null() {
+            drop(CubeTexture::from_raw(cube));
+        }
         let (hr, volume) =
             h.try_create_volume_texture([8, 8, 4], 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED);
         assert_eq!(hr, expected, "volume texture");
         drop(volume);
         let (hr, vb) = h.try_create_vertex_buffer(64, 0, 0, D3DPOOL_MANAGED);
         assert_eq!(hr, expected, "vertex buffer");
-        h.release_created(vb);
+        if !vb.is_null() {
+            drop(VertexBuffer::from_raw(vb));
+        }
         let (hr, ib) = h.try_create_index_buffer(64, 0, D3DFMT_INDEX16, D3DPOOL_MANAGED);
         assert_eq!(hr, expected, "index buffer");
-        h.release_created(ib);
+        if !ib.is_null() {
+            drop(IndexBuffer::from_raw(ib));
+        }
     }
 }
 
@@ -142,7 +140,7 @@ fn user_memory_seeds_a_system_memory_texture_once_at_its_pitch() {
         1,
         D3DFMT_L8,
         D3DPOOL_SYSTEMMEM,
-        handle_to(&mut data),
+        &SharedHandle::to(&mut data),
     );
     assert_eq!(hr, D3D_OK, "an L8 texture over user memory");
     let texture = Texture::from_raw(texture);
@@ -182,7 +180,7 @@ fn user_memory_seeds_a_system_memory_offscreen_plain_surface() {
         (16, 4),
         D3DFMT_A8R8G8B8,
         D3DPOOL_SYSTEMMEM,
-        handle_to(&mut data),
+        &SharedHandle::to(&mut data),
     );
     assert_eq!(hr, D3D_OK, "CreateOffscreenPlainSurface over user memory");
     let plain = Surface::from_raw(plain);
@@ -196,7 +194,7 @@ fn user_memory_seeds_a_system_memory_offscreen_plain_surface() {
         (16, 4),
         D3DFMT_A8R8G8B8,
         D3DPOOL_SYSTEMMEM,
-        handle_to(&mut data),
+        &SharedHandle::to(&mut data),
         0,
     );
     assert_eq!(hr, D3D_OK, "CreateOffscreenPlainSurfaceEx over user memory");
@@ -209,7 +207,7 @@ fn user_memory_outside_its_one_shape_is_refused() {
     let h = extended();
     let mut backing = vec![0u32; 128 * 128];
     let mut data = backing.as_mut_ptr();
-    let handle = handle_to(&mut data);
+    let handle = &SharedHandle::to(&mut data);
     for (size, levels, pool, what) in [
         ((128, 128), 0, D3DPOOL_SYSTEMMEM, "a full chain"),
         ((1, 1), 0, D3DPOOL_SYSTEMMEM, "a full chain of one level"),
@@ -257,7 +255,7 @@ fn user_memory_outside_its_one_shape_is_refused() {
 fn a_plain_device_refuses_every_shared_handle_with_e_notimpl() {
     let h = Harness::new();
     let mut slot: *mut c_void = core::ptr::null_mut();
-    let handle = share_handle(&mut slot);
+    let handle = &SharedHandle::to(&mut slot);
     for pool in [D3DPOOL_DEFAULT, D3DPOOL_SYSTEMMEM] {
         assert_eq!(
             h.try_create_texture_shared((16, 16), 1, D3DFMT_A8R8G8B8, pool, handle),
@@ -304,7 +302,7 @@ fn a_plain_device_refuses_every_shared_handle_with_e_notimpl() {
 fn a_shared_default_pool_resource_is_not_available_on_an_extended_device() {
     let h = extended();
     let mut slot: *mut c_void = core::ptr::null_mut();
-    let handle = share_handle(&mut slot);
+    let handle = &SharedHandle::to(&mut slot);
     let results = [
         h.try_create_texture_shared((16, 16), 1, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT, handle),
         h.try_create_cube_texture_shared(16, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT, handle),
@@ -332,7 +330,7 @@ fn a_shared_default_pool_resource_is_not_available_on_an_extended_device() {
 #[test]
 fn the_extended_surface_creates_take_only_the_restriction_usages() {
     let h = extended();
-    let none = core::ptr::null_mut();
+    let none = &SharedHandle::NONE;
     let (hr, rt) = h.create_render_target_ex((16, 16), D3DFMT_A8R8G8B8, none, 0);
     assert_eq!((hr, rt.is_some()), (D3D_OK, true), "CreateRenderTargetEx");
     let (hr, rt) =
