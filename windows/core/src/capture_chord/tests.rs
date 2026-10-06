@@ -1,133 +1,133 @@
-//! Unit tests for the Ctrl+Shift+F12 capture chord.
+//! Unit tests for the Ctrl+Shift+F7 capture chord.
 //!
 //! Each test drives `chord_pressed` through a run of per-present samples the
-//! way the d3d9 poll does, carrying F12's state from one sample to the next,
-//! and checks which samples fire. The chords that must not fire are the ones
-//! another program or the system owns (F12, Shift+F12) and the near misses
-//! (Ctrl+F12, Ctrl+Alt+Shift+F12).
+//! way the d3d9 poll does: a sample is the set of virtual keys held, the
+//! capture key and the modifiers are read from it by the codes the module
+//! names, and the capture key's state is carried from one sample to the next.
+//! The codes are restated here from the Win32 headers so a test fails if the
+//! module's codes move. The chords that must not fire are the near misses
+//! (F7, Shift+F7, Ctrl+F7, Ctrl+Alt+Shift+F7, Ctrl+Shift+F8) and the keys
+//! another program takes before Wine sees them (F12, the Metal HUD's
+//! Shift+F8 to Shift+F12 and Ctrl+Shift+F9 to Ctrl+Shift+F12).
 
-use super::{Modifier, chord_pressed};
+use super::{CAPTURE_KEY, Modifier, chord_pressed};
 
-const CONTROL: u8 = 1 << 0;
-const SHIFT: u8 = 1 << 1;
-const ALT: u8 = 1 << 2;
+const VK_SHIFT: i32 = 0x10;
+const VK_CONTROL: i32 = 0x11;
+const VK_MENU: i32 = 0x12;
+const VK_F7: i32 = 0x76;
+const VK_F8: i32 = 0x77;
+const VK_F12: i32 = 0x7B;
 
-/// One per-present sample: whether F12 is down, and the modifiers held.
-struct Sample {
-    f12: bool,
-    modifiers: u8,
-}
-
-const fn up(modifiers: u8) -> Sample {
-    Sample {
-        f12: false,
-        modifiers,
-    }
-}
-
-const fn down(modifiers: u8) -> Sample {
-    Sample {
-        f12: true,
-        modifiers,
-    }
-}
-
-const fn bit(modifier: &Modifier) -> u8 {
-    match modifier {
-        Modifier::Control => CONTROL,
-        Modifier::Shift => SHIFT,
-        Modifier::Alt => ALT,
-    }
-}
-
-/// Run the samples in order from a released F12; return which of them fired.
-fn fired(samples: &[Sample]) -> Vec<bool> {
-    let mut f12_was_down = false;
+/// Run the samples in order from released keys; return which of them fired.
+fn fired(samples: &[&[i32]]) -> Vec<bool> {
+    let mut key_was_down = false;
     samples
         .iter()
-        .map(|sample| {
-            let fires = chord_pressed(f12_was_down, sample.f12, |modifier| {
-                sample.modifiers & bit(&modifier) != 0
+        .map(|held| {
+            let key_down = held.contains(&CAPTURE_KEY);
+            let fires = chord_pressed(key_was_down, key_down, |modifier| {
+                held.contains(&modifier.virtual_key())
             });
-            f12_was_down = sample.f12;
+            key_was_down = key_down;
             fires
         })
         .collect()
 }
 
-#[test]
-fn plain_f12_does_not_fire() {
-    assert_eq!(fired(&[up(0), down(0), up(0)]), [false, false, false]);
+/// Press and release `key` with `modifiers` held throughout; return which samples fired.
+fn press(modifiers: &[i32], key: i32) -> Vec<bool> {
+    let mut down = modifiers.to_vec();
+    down.push(key);
+    fired(&[modifiers, &down, modifiers])
 }
 
 #[test]
-fn shift_f12_does_not_fire() {
+fn ctrl_shift_f7_fires_once_per_press() {
+    let chord = [VK_CONTROL, VK_SHIFT];
+    let down = [VK_CONTROL, VK_SHIFT, VK_F7];
     assert_eq!(
-        fired(&[up(SHIFT), down(SHIFT), up(SHIFT)]),
-        [false, false, false]
-    );
-}
-
-#[test]
-fn ctrl_f12_does_not_fire() {
-    assert_eq!(
-        fired(&[up(CONTROL), down(CONTROL), up(CONTROL)]),
-        [false, false, false]
-    );
-}
-
-#[test]
-fn ctrl_alt_shift_f12_does_not_fire() {
-    let all = CONTROL | SHIFT | ALT;
-    assert_eq!(fired(&[up(all), down(all), up(all)]), [false, false, false]);
-}
-
-#[test]
-fn ctrl_shift_f12_fires_once_per_press() {
-    let chord = CONTROL | SHIFT;
-    assert_eq!(
-        fired(&[up(chord), down(chord), up(chord), down(chord), up(0)]),
+        fired(&[&chord, &down, &chord, &down, &[]]),
         [false, true, false, true, false]
     );
 }
 
 #[test]
+fn plain_f7_does_not_fire() {
+    assert_eq!(press(&[], VK_F7), [false, false, false]);
+}
+
+#[test]
+fn shift_f7_does_not_fire() {
+    assert_eq!(press(&[VK_SHIFT], VK_F7), [false, false, false]);
+}
+
+#[test]
+fn ctrl_f7_does_not_fire() {
+    assert_eq!(press(&[VK_CONTROL], VK_F7), [false, false, false]);
+}
+
+#[test]
+fn ctrl_alt_shift_f7_does_not_fire() {
+    assert_eq!(
+        press(&[VK_CONTROL, VK_MENU, VK_SHIFT], VK_F7),
+        [false, false, false]
+    );
+}
+
+#[test]
+fn ctrl_shift_f12_does_not_fire() {
+    assert_eq!(
+        press(&[VK_CONTROL, VK_SHIFT], VK_F12),
+        [false, false, false]
+    );
+}
+
+#[test]
+fn plain_f12_does_not_fire() {
+    assert_eq!(press(&[], VK_F12), [false, false, false]);
+}
+
+#[test]
+fn metal_hud_keys_do_not_fire() {
+    for key in VK_F8..=VK_F12 {
+        assert_eq!(press(&[VK_SHIFT], key), [false, false, false]);
+        assert_eq!(press(&[VK_CONTROL, VK_SHIFT], key), [false, false, false]);
+    }
+}
+
+#[test]
 fn keys_going_down_between_the_same_two_presents_fire() {
-    assert_eq!(fired(&[up(0), down(CONTROL | SHIFT)]), [false, true]);
+    assert_eq!(fired(&[&[], &[VK_CONTROL, VK_SHIFT, VK_F7]]), [false, true]);
 }
 
 #[test]
 fn held_chord_does_not_repeat() {
-    let chord = CONTROL | SHIFT;
+    let chord = [VK_CONTROL, VK_SHIFT];
+    let down = [VK_CONTROL, VK_SHIFT, VK_F7];
     assert_eq!(
-        fired(&[
-            up(chord),
-            down(chord),
-            down(chord),
-            down(chord),
-            down(chord)
-        ]),
+        fired(&[&chord, &down, &down, &down, &down]),
         [false, true, false, false, false]
     );
 }
 
 #[test]
-fn modifiers_pressed_after_f12_do_not_fire() {
+fn modifiers_pressed_after_the_key_do_not_fire() {
     assert_eq!(
         fired(&[
-            up(0),
-            down(0),
-            down(CONTROL),
-            down(CONTROL | SHIFT),
-            down(CONTROL | SHIFT)
+            &[],
+            &[VK_F7],
+            &[VK_F7, VK_CONTROL],
+            &[VK_F7, VK_CONTROL, VK_SHIFT],
+            &[VK_F7, VK_CONTROL, VK_SHIFT]
         ]),
         [false, false, false, false, false]
     );
 }
 
 #[test]
-fn modifiers_are_read_only_when_f12_goes_down() {
-    let unread = |_: Modifier| -> bool { panic!("a modifier was read without an F12 press") };
+fn modifiers_are_read_only_when_the_key_goes_down() {
+    let unread = |_: Modifier| -> bool { panic!("a modifier was read without a key press") };
     assert!(!chord_pressed(false, false, unread));
     assert!(!chord_pressed(true, true, unread));
     assert!(!chord_pressed(true, false, unread));

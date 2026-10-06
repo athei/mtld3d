@@ -1,4 +1,4 @@
-//! Per-draw D3D9 state dump for a short run of frames, armed by Ctrl+Shift+F12.
+//! Per-draw D3D9 state dump for a short run of frames, armed by Ctrl+Shift+F7.
 //!
 //! The silent-write audit reports the states a game sets that we never
 //! read; it cannot tell whether a consumed state produced the pass the game
@@ -7,7 +7,7 @@
 //! clear, copy, query and draw with the states that decide pass shape
 //! (depth, stencil, blend, cull, colour mask, alpha test, bias), the bound
 //! shaders and the bound textures. It logs at info level, so a play session
-//! needs no environment change: press Ctrl+Shift+F12 (see `crate::capture`),
+//! needs no environment change: press Ctrl+Shift+F7 (see `crate::capture`),
 //! read the log.
 //!
 //! The same press captures the same frames into a Metal GPU trace, which
@@ -93,7 +93,7 @@ impl FrameDump {
         frames_remaining: 0,
     };
 
-    /// Consecutive frames one Ctrl+Shift+F12 press dumps and captures.
+    /// Consecutive frames one Ctrl+Shift+F7 press dumps and captures.
     pub const FRAMES: u32 = 3;
 }
 
