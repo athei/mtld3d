@@ -13,6 +13,15 @@ the reason for each one.
 | Team Fortress 2 | Plays, 64-bit, D3D9 renderer (launched without `-vulkan`) |
 | Grand Theft Auto IV | Plays, `gta-iv` profile |
 | Call of Duty: Modern Warfare 2 | Plays, 64-bit |
+| Assassin's Creed II | Plays, with EaglePatch |
+| Age of Empires II: HD Edition | Plays |
+| Kane & Lynch: Dead Men | Plays |
+| LEGO Indiana Jones 2: The Adventure Continues | Plays |
+| League of Legends 4.20 | Plays |
+| Need for Speed: Underground 2 | Plays, with the Widescreen Fix, ExtraOptions and XtendedInput |
+| Need for Speed: Most Wanted (2005) | Plays, with the Widescreen Fix and ExtraOptions |
+| Need for Speed: Carbon | Plays, with the Widescreen Fix |
+| Halo: Combat Evolved (PC, 2003) | Plays, launched with `WINE_LARGE_ADDRESS_AWARE=0` |
 | Halo 2 | Renders, `halo2` profile |
 | 3DMark05 | Runs end to end |
 | Unigine Tropics | Runs |
