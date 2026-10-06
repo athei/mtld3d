@@ -1290,6 +1290,14 @@ struct EncoderFrameCounters {
     /// letting the frame-head blit rewrite what the earlier draw reads.
     /// The texture analogue of `vbib_mid_pass_reorders`.
     texture_gpu_renames: u32,
+    /// Per-frame count of per-level staging `bytesNoCopy` wrappers created.
+    staging_wrapper_creates: u32,
+    /// Per-frame count of per-level staging wrappers queued for their destroy.
+    ///
+    /// At a backing change, at an upload that releases its level's staging,
+    /// and at the texture's destroy; the destroy itself follows once the GPU
+    /// retires the submission.
+    staging_wrapper_retires: u32,
     /// Total TSC cycles the encoder spent replaying this frame's op list.
     op_cycles: u64,
     /// Per-[`OpSub`] decomposition of `op_cycles`.
@@ -1427,6 +1435,8 @@ impl EncoderFrameCounters {
             texture_blit_padded_uploads: 0,
             texture_expand_uploads: 0,
             texture_gpu_renames: 0,
+            staging_wrapper_creates: 0,
+            staging_wrapper_retires: 0,
             op_cycles: 0,
             op_sub_cycles: [0; OpSub::COUNT],
             op_sub_detail: [0; OpSubDetail::COUNT],
@@ -2832,6 +2842,16 @@ impl EncoderPerfState {
         self.enc.texture_gpu_renames = self.enc.texture_gpu_renames.saturating_add(1);
     }
 
+    /// Count one per-level staging wrapper created.
+    pub const fn bump_staging_wrapper_create(&mut self) {
+        self.enc.staging_wrapper_creates = self.enc.staging_wrapper_creates.saturating_add(1);
+    }
+
+    /// Count one per-level staging wrapper queued for its destroy.
+    pub const fn bump_staging_wrapper_retire(&mut self) {
+        self.enc.staging_wrapper_retires = self.enc.staging_wrapper_retires.saturating_add(1);
+    }
+
     /// Accumulate one draw's stats.
     ///
     /// Gated on `mtld3d::d3d9::passes=trace` via the cached
@@ -3239,6 +3259,10 @@ impl EncoderPerfState {
     #[inline]
     pub const fn bump_texture_gpu_rename(&mut self) {}
     #[inline]
+    pub const fn bump_staging_wrapper_create(&mut self) {}
+    #[inline]
+    pub const fn bump_staging_wrapper_retire(&mut self) {}
+    #[inline]
     pub const fn bump_pair_stats(&mut self, _sample: PairStatsSample) {}
     #[inline]
     pub const fn log_frame_summary(
@@ -3590,6 +3614,8 @@ struct PerfWindow {
     texture_blit_padded_uploads: Stat,
     texture_expand_uploads: Stat,
     texture_gpu_renames: Stat,
+    staging_wrapper_creates: Stat,
+    staging_wrapper_retires: Stat,
     pending_blit_retention_depth: Stat,
     tex_staging_retained_bytes: Stat,
     /// Bytes memcpy'd by `Pass::commands` Vec doublings.
@@ -3864,6 +3890,10 @@ impl PerfWindow {
             .add(u64::from(s.enc.texture_expand_uploads));
         self.texture_gpu_renames
             .add(u64::from(s.enc.texture_gpu_renames));
+        self.staging_wrapper_creates
+            .add(u64::from(s.enc.staging_wrapper_creates));
+        self.staging_wrapper_retires
+            .add(u64::from(s.enc.staging_wrapper_retires));
         self.pending_blit_retention_depth
             .add(s.pending_blit_retention_depth as u64);
         self.tex_staging_retained_bytes
@@ -5955,7 +5985,7 @@ impl<'a> Summary<'a> {
             "destroys",
             &format!("{dx}", dx = w.texture_destroys.sum),
             None,
-            "encoder: MTLTexture freed + texture-staging MTLBuffer wrappers freed (rename + padded + texture release)",
+            "encoder: MTLTexture freed + texture-staging MTLBuffer wrappers freed (rename + padded + staging release + texture release)",
         );
         let (tex_avg_fmt, tex_peak_fmt) = format_kb_pair(tex_ret_kb, tex_ret_peak_kb);
         self.res_row(
@@ -5975,6 +6005,20 @@ impl<'a> Summary<'a> {
                 .map_or_else(|| "n/a".to_owned(), |m| format_bytes(m.staging_wrapped)),
             None,
             "encoder: staging under cached per-level bytesNoCopy wrappers at the summary (pins its guest pages)",
+        );
+        self.res_row(
+            out,
+            "  churn",
+            &format!(
+                "new={c} retired={r}",
+                c = w.staging_wrapper_creates.sum,
+                r = w.staging_wrapper_retires.sum,
+            ),
+            Some(&format!(
+                "peak/frame new={pk}",
+                pk = w.staging_wrapper_creates.max,
+            )),
+            "encoder: wrappers created, and queued for destroy (backing change, staging release, texture release)",
         );
         // AddDirtyRect probe: does the game declare a changed sub-region we
         // could use to shrink the whole-mip preserve into a dirty-rect
@@ -6754,6 +6798,8 @@ fn render_kv(w: &PerfWindow, c: &PerfWindow, caches: &CacheSizes, window_secs: f
     if let Some(memory) = &caches.memory {
         kv.bytes("tex_staging_wrapped", memory.staging_wrapped);
     }
+    kv.total("tex_wrapper_create", c.staging_wrapper_creates.sum);
+    kv.total("tex_wrapper_retire", c.staging_wrapper_retires.sum);
     kv.total("tex_dirtyrect_calls", c.texture_add_dirty_calls.sum);
     kv.total("tex_dirtyrect_partial", c.texture_add_dirty_partial.sum);
 

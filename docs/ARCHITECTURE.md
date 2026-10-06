@@ -280,6 +280,22 @@ box, and a texture detached from its device drops its staging instead of
 parking it. The textures `pool` row of the `PERF=1` summary counts the lane's
 hits and misses.
 
+The encoder keeps one cached `bytesNoCopy` wrapper per staging level, so the
+uploads of a level reuse one `MTLBuffer`. The wrapper's keepalive is the native
+owner of the pages, adopted from the upload lease that first delivered them,
+and that lease cannot complete while the wrapper is cached, so the PE side
+keeps the pages too. The encoder therefore retires the wrapper behind the
+current submission in three cases: the level's backing changed, the texture
+was destroyed, or an emitted upload carries the answer on which the PE side
+releases the level's staging. In the last case the pages are freed or parked
+once the GPU retires that upload, not when the texture is destroyed. The PE
+side applies the answer at the next `Present` and only when no newer upload
+of the level overtook it, so a level rewritten every frame keeps its staging.
+The emptied slot remembers the backing's address and length, and when the
+next upload wraps that same backing again its wrapper is kept through later
+answers: one extra wrapper per backing, not one per upload. A kept wrapper
+still retires at a backing change or at the texture's destroy.
+
 Page allocation is infallible: a box the allocator refuses ends the process,
 because past creation there is nothing to give back that the retention cap and
 the pool have not already bounded. The one exception is the system-memory copy
@@ -909,6 +925,7 @@ in its row, and every family carries the suffixes its row names.
 | `tex_rename_total`, `tex_discard_total`, `tex_preserve_cpu_total`, `tex_in_place_total`, `tex_reorder_total`, `tex_destroy_total` | Texture `rename`, `discards`, `preserve`, `in-place`, `reorder`, `destroys`. |
 | `tex_uploads_total`, `tex_uploads_<x>_total` | Texture `uploads` and their paths: `raw`, `padded`, `pass`. |
 | `tex_retention_peak_count`, `tex_staging_retained_bytes` | Texture `retention`: peak depth and peak bytes. |
+| `tex_wrapper_create_total`, `tex_wrapper_retire_total` | Texture `churn`: per-level staging wrappers created, and queued for their destroy (at a backing change, an upload that releases its level's staging, or the texture's release). |
 | `tex_staging_wrapped_bytes` | Texture `wrapped`: the padded staging under the encoder's cached per-level `bytesNoCopy` wrappers, sampled at the summary. A cached wrapper keeps its upload lease, and so the guest pages, alive on the PE side. |
 | `tex_dirtyrect_calls_total`, `tex_dirtyrect_partial_total` | `dirtyrect` calls and the partial ones. |
 | `cache_<x>_count` | `Caches` at the summary: `textures`, `pipelines`, `samplers`, `programs`, `libs`, `depth_states`. |
