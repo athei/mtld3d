@@ -332,8 +332,8 @@ is in [`CONFORMANCE.md`](../unix/conformance/CONFORMANCE.md#kept-divergences).
   knob.
 - An extended device copies a create's user memory into the level once:
   `LockRect` then maps the layer's own copy at a 4-byte-aligned pitch, not
-  the application's memory at its packed pitch, and a later write to that
-  memory reaches nothing. No knob.
+  the application's memory at its packed pitch, and a later write to either
+  side does not reach the other. No knob.
 - An extended device's present and state checks never answer
   `S_PRESENT_OCCLUDED` or `S_PRESENT_MODE_CHANGED`: no exclusive mode is
   taken, and a present into a covered window already skips the drawable.
