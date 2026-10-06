@@ -11,6 +11,7 @@
 /// logs to `"mtld3d::perf"`.
 const LOG_TARGET: &str = "mtld3d::d3d9";
 
+pub mod address_space;
 pub mod api_lock;
 pub mod app_profile;
 pub mod async_compile;
@@ -51,6 +52,7 @@ pub mod guest_completions;
 pub mod guest_mem;
 pub mod guest_pages;
 pub mod guest_queries;
+pub mod held_pages;
 pub mod ids;
 pub mod level_authority;
 pub mod multisample;

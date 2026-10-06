@@ -460,6 +460,17 @@ pub fn default_static_lock_count() -> u32 {
     DEFAULT_STATIC_LOCKS.load(Ordering::Relaxed)
 }
 
+/// The staging bytes one texture holds, as requested and as page boxes hold them.
+///
+/// Each level is its own page box, rounded up to a 16 KiB page, so a chain
+/// of small levels holds several times the bytes its levels ask for.
+pub struct StagingBytes {
+    /// The levels' own lengths.
+    pub requested: u64,
+    /// The page-rounded lengths, the bytes the address space gives up.
+    pub padded: u64,
+}
+
 /// The page every dropped staging level points at.
 ///
 /// One shared page instead of a per-level allocation: the slot has to hold
@@ -537,14 +548,28 @@ impl TextureInner {
         self.d3d_format
     }
 
-    /// Bytes of staging this texture still holds in the 32-bit address space.
-    pub fn resident_staging_bytes(&self) -> u64 {
-        self.staging
+    /// Staging this texture still holds in the 32-bit address space.
+    ///
+    /// Every level not yet dropped, and every cube face level, which is
+    /// never dropped. A level shares the one placeholder page once dropped,
+    /// so it holds nothing of its own.
+    pub fn resident_staging(&self) -> StagingBytes {
+        let levels = self
+            .staging
             .iter()
             .enumerate()
             .filter(|(level, _)| self.dropped_staging & (1u32 << level) == 0)
-            .map(|(_, b)| b.logical_len() as u64)
-            .sum()
+            .map(|(_, b)| b);
+        let faces = self.cube.iter().flat_map(|cube| cube.staging.iter());
+        let mut bytes = StagingBytes {
+            requested: 0,
+            padded: 0,
+        };
+        for page in levels.chain(faces) {
+            bytes.requested += page.logical_len() as u64;
+            bytes.padded += page.len() as u64;
+        }
+        bytes
     }
 
     /// Claim `(face, level)` for the GPU: its Metal texture holds pixels staging does not.

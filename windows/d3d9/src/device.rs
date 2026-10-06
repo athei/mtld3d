@@ -2106,12 +2106,14 @@ impl DeviceInner {
         // The block we measure belongs to the frame that will next be
         // observed by the encoder — the one we just swapped in. The
         // `CycleSetTimer` writes into that frame's `present_block_cycles`
-        // when it drops at end of scope.
-        let _stall = CycleSetTimer::start(self.current_frame.perf_mut().present_block_cycles_ptr());
+        // when it drops.
+        let stall = CycleSetTimer::start(self.current_frame.perf_mut().present_block_cycles_ptr());
         if let Err(hr) = self.encoder.send_frame(frame) {
             return hr;
         }
         self.frame_dump_present(crate::capture::take_request(), seq);
+        drop(stall);
+        // Outside the stall, so the address-space walk is not charged to it.
         self.mem_watch_present();
         mtld3d_types::D3D_OK
     }

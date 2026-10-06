@@ -40,6 +40,7 @@ use core::{
     sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering},
 };
 
+use mtld3d_core::address_space::FreeSpace;
 use mtld3d_shared::crumb;
 
 // NTSTATUS codes the handler filters on.
@@ -83,14 +84,27 @@ struct MemoryBasicInformation {
 
 const MEM_FREE: u32 = 0x1_0000;
 
-/// The largest free region of the address space in MiB.
+/// Free address space of this process: the sum of the usable free regions and the largest.
 ///
-/// Free space that no single allocation can use is what fails a DLL load
-/// or a game's streaming block long before the total runs out, so this is
-/// the number to read next to `avail_virtual_mib`. Walks every region
-/// once (a few thousand `VirtualQuery` calls).
-pub fn largest_free_region_mib() -> u64 {
-    let mut largest = 0usize;
+/// The free figure the address-space watch and the crash lines report. It is
+/// not `GlobalMemoryStatusEx`'s `ullAvailVirtual`, which Wine computes as the
+/// total minus the process working set (see `mtld3d_core::address_space`).
+/// Free space that no single allocation can use is what fails a DLL load or a
+/// game's streaming block long before the total runs out, so both come from
+/// the same walk. Allocation-free, so the exception handler can call it.
+pub fn free_space() -> FreeSpace {
+    let mut space = FreeSpace::new();
+    walk_regions(|addr, info| {
+        space.add_region(info.state == MEM_FREE, addr as u64, info.region_size as u64);
+    });
+    space
+}
+
+/// Visit every region of the address space in address order, with its base address.
+///
+/// One `VirtualQuery` per region (a few thousand calls), stopping where the
+/// query fails or the address would wrap.
+fn walk_regions(mut visit: impl FnMut(usize, &MemoryBasicInformation)) {
     let mut addr = 0usize;
     loop {
         let mut info = MemoryBasicInformation {
@@ -113,15 +127,12 @@ pub fn largest_free_region_mib() -> u64 {
         if got == 0 || info.region_size == 0 {
             break;
         }
-        if info.state == MEM_FREE {
-            largest = largest.max(info.region_size);
-        }
+        visit(addr, &info);
         let Some(next) = addr.checked_add(info.region_size) else {
             break;
         };
         addr = next;
     }
-    (largest as u64) >> 20
 }
 
 const MEM_COMMIT: u32 = 0x1000;
@@ -131,39 +142,13 @@ const MEM_MAPPED: u32 = 0x4_0000;
 
 /// A summary of the address space: region counts by state and the largest regions.
 ///
-/// One line of text for the log, built when the largest free block has
-/// collapsed, so the log names who owns the space (image, mapped file,
-/// private commit, private reserve) and where the biggest holes are.
+/// One line of text for the log, built when the free space crosses one of
+/// the watch's thresholds, so the log names who owns the space (image,
+/// mapped file, private commit, private reserve) and where the biggest holes
+/// are.
 pub fn address_space_map() -> String {
     let mut regions: Vec<(usize, usize, u32, u32)> = Vec::new();
-    let mut addr = 0usize;
-    loop {
-        let mut info = MemoryBasicInformation {
-            base_address: core::ptr::null_mut(),
-            allocation_base: core::ptr::null_mut(),
-            allocation_protect: 0,
-            region_size: 0,
-            state: 0,
-            protect: 0,
-            kind: 0,
-        };
-        // SAFETY: kernel32 export filling a struct of the size passed.
-        let got = unsafe {
-            VirtualQuery(
-                addr as *const c_void,
-                &raw mut info,
-                size_of::<MemoryBasicInformation>(),
-            )
-        };
-        if got == 0 || info.region_size == 0 {
-            break;
-        }
-        regions.push((addr, info.region_size, info.state, info.kind));
-        let Some(next) = addr.checked_add(info.region_size) else {
-            break;
-        };
-        addr = next;
-    }
+    walk_regions(|addr, info| regions.push((addr, info.region_size, info.state, info.kind)));
     let mut free = 0usize;
     let mut committed = 0usize;
     let mut reserved = 0usize;
@@ -232,41 +217,6 @@ pub fn address_space_map() -> String {
     out
 }
 
-/// `MEMORYSTATUSEX`; only the virtual-address-space fields are read.
-#[repr(C)]
-struct MemoryStatusEx {
-    length: u32,
-    memory_load: u32,
-    total_phys: u64,
-    avail_phys: u64,
-    total_page_file: u64,
-    avail_page_file: u64,
-    total_virtual: u64,
-    avail_virtual: u64,
-    avail_extended_virtual: u64,
-}
-
-/// Free virtual address space of this process in MiB, if the query works.
-///
-/// The number that matters for a 32-bit game: when it reaches zero,
-/// allocations fail and the game follows a garbage pointer soon after.
-pub fn avail_virtual_mib() -> Option<u64> {
-    let mut status = MemoryStatusEx {
-        length: u32::try_from(size_of::<MemoryStatusEx>()).expect("64-byte struct"),
-        memory_load: 0,
-        total_phys: 0,
-        avail_phys: 0,
-        total_page_file: 0,
-        avail_page_file: 0,
-        total_virtual: 0,
-        avail_virtual: 0,
-        avail_extended_virtual: 0,
-    };
-    // SAFETY: kernel32 export filling the struct whose `length` names its size.
-    let ok = unsafe { GlobalMemoryStatusEx(&raw mut status) };
-    (ok != 0).then_some(status.avail_virtual >> 20)
-}
-
 #[repr(C)]
 struct ExceptionRecord {
     code: u32,
@@ -290,7 +240,6 @@ unsafe extern "system" {
     fn RtlRemoveVectoredExceptionHandler(handle: *mut c_void) -> u32;
     pub fn GetModuleHandleExA(flags: u32, module_name: *const u8, out: *mut *mut c_void) -> i32;
     fn GetModuleFileNameA(module: *mut c_void, filename: *mut u8, size: u32) -> u32;
-    fn GlobalMemoryStatusEx(buffer: *mut MemoryStatusEx) -> i32;
     fn VirtualQuery(
         address: *const c_void,
         buffer: *mut MemoryBasicInformation,
@@ -464,20 +413,19 @@ fn report_foreign_fault(code: u32, addr: *mut c_void) {
         push(&mut buf, &mut pos, b" base=");
         push_hex(&mut buf, &mut pos, module as usize as u64);
     }
-    push_avail_virtual(&mut buf, &mut pos);
+    push_free_space(&mut buf, &mut pos);
     push(&mut buf, &mut pos, b"\n");
     write_stderr(&buf[..pos]);
     crumb::dump_recent(16);
 }
 
-/// Append the address-space state so a crash line carries it.
-fn push_avail_virtual(buf: &mut [u8], pos: &mut usize) {
-    if let Some(mib) = avail_virtual_mib() {
-        push(buf, pos, b" avail_virtual_mib=");
-        push_hex(buf, pos, mib);
-    }
+/// Append the free address space so a crash line carries it.
+fn push_free_space(buf: &mut [u8], pos: &mut usize) {
+    let space = free_space();
+    push(buf, pos, b" free_mib=");
+    push_hex(buf, pos, space.total_mib());
     push(buf, pos, b" largest_free_mib=");
-    push_hex(buf, pos, largest_free_region_mib());
+    push_hex(buf, pos, space.largest_mib());
 }
 
 fn fault_in_our_dll(addr: *mut c_void) -> bool {
@@ -502,13 +450,13 @@ fn fault_in_our_dll(addr: *mut c_void) -> bool {
 }
 
 fn emit_fatal(code: u32, addr: *mut c_void) {
-    let mut buf = [0u8; 128];
+    let mut buf = [0u8; 160];
     let mut pos = 0;
     push(&mut buf, &mut pos, b"[mtld3d::d3d9] FATAL: code=");
     push_hex(&mut buf, &mut pos, u64::from(code));
     push(&mut buf, &mut pos, b" addr=");
     push_hex(&mut buf, &mut pos, addr as usize as u64);
-    push_avail_virtual(&mut buf, &mut pos);
+    push_free_space(&mut buf, &mut pos);
     push(&mut buf, &mut pos, b"\n");
     write_stderr(&buf[..pos]);
 }

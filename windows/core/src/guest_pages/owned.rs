@@ -13,6 +13,7 @@ use super::valid_range;
 use crate::page_box::PAGE_SIZE;
 use crate::{
     guest_completions::{CompletionPool, CompletionSlot},
+    held_pages::{HeldPages, PageHolder},
     page_box::PageBox,
     page_box_pool::PageBoxPool,
 };
@@ -22,7 +23,8 @@ use crate::{
 /// Moving this owner never moves the allocation or the pooled completion cell. Unlike shared
 /// staging leases, it publishes no pointer into its `PageBox` metadata and needs no metadata Arc.
 pub struct GuestOwnedPageLease {
-    owner: PageBox,
+    /// The pages, charged to the encoder-lease gauge while the lease holds them.
+    owner: HeldPages,
     slot: CompletionSlot,
     recycle_pool: Option<&'static PageBoxPool>,
 }
@@ -35,7 +37,7 @@ impl GuestOwnedPageLease {
         recycle_pool: Option<&'static PageBoxPool>,
     ) -> Self {
         Self {
-            owner,
+            owner: HeldPages::new(owner, PageHolder::EncoderLease),
             slot: pool.allocate(false),
             recycle_pool,
         }
@@ -71,7 +73,7 @@ impl GuestOwnedPageLease {
     pub fn into_slot(self) -> CompletionSlot {
         assert!(self.completed(), "retirement completion consumed");
         if let Some(pool) = self.recycle_pool {
-            drop(pool.recycle(self.owner));
+            drop(pool.recycle(self.owner.into_page()));
         }
         self.slot
     }
