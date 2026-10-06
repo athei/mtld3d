@@ -2326,7 +2326,7 @@ impl FrameEncoder {
         // both enabled and about to emit; every other frame passes None.
         let task_faults = (perf_enabled() && self.perf.window_due()).then(|| {
             #[cfg(perf_tracking)]
-            self.pagebox_pool.log_diagnostics();
+            self.pagebox_pool.log_diagnostics("encoder");
             crate::handlers::task_faults()
         });
         self.perf.log_frame_summary(

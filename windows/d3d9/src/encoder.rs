@@ -97,6 +97,15 @@ pub struct EncoderThread {
 }
 
 impl EncoderThread {
+    /// This device's calibrated TSC frequency, `None` until its background worker published it.
+    ///
+    /// For API-thread perf code that needs a time in cycles without paying
+    /// the calibration sleep itself.
+    #[cfg(perf_tracking)]
+    pub fn source_clock_hz(&self) -> Option<u64> {
+        self.source_clock.hz()
+    }
+
     pub fn spawn(
         device: MetalHandle<MTLDeviceKind>,
         record_handle: DeviceRecordHandle,

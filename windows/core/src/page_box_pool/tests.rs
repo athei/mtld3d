@@ -141,6 +141,28 @@ fn diagnostics_partition_acquire_and_recycle_outcomes() {
     );
 }
 
+/// The perf summary's traffic counts the VB/IB lane's parks and both lanes' parked bytes.
+#[cfg(perf_tracking)]
+#[test]
+fn buffer_traffic_counts_buffer_parks_and_all_parked_bytes() {
+    let pool = PageBoxPool::new(usize::MAX);
+    assert!(pool.recycle(PageBox::new_uninit(PAGE_SIZE)).is_none());
+    assert!(pool.recycle(PageBox::new_uninit(2 * PAGE_SIZE)).is_none());
+    assert!(pool.recycle_staging(Arc::new(PageBox::new_uninit(PAGE_SIZE))));
+    let _ = pool.acquire(PAGE_SIZE).expect("hit");
+    let traffic = pool.buffer_traffic();
+    assert_eq!(
+        traffic.recycled, 2,
+        "staging parks are not the buffer lane's"
+    );
+    assert_eq!(traffic.recycled_bytes, 3 * PAGE_SIZE as u64);
+    assert_eq!(
+        traffic.parked_bytes,
+        3 * PAGE_SIZE as u64,
+        "what is parked now, both lanes"
+    );
+}
+
 #[cfg(perf_tracking)]
 #[test]
 fn diagnostics_keep_concurrent_acquire_totals() {

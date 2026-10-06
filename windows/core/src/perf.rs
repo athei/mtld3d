@@ -64,6 +64,8 @@ use strum::EnumCount;
 #[cfg(perf_tracking)]
 use super::page_box::{PageBoxVolume, pagebox_volume};
 #[cfg(perf_tracking)]
+use super::page_box_pool::{PageBoxPool, PoolTraffic};
+#[cfg(perf_tracking)]
 use super::passes::{ColorLoad, DepthLoad};
 use super::{passes::Pass, snapshot::SnapshotSection};
 
@@ -1071,6 +1073,32 @@ struct FrameCounters {
     texture_pool_misses: u32,
     /// 1 when the frame ran its timers ([`FRAME_SAMPLE_PERIOD`]), 0 when it did not.
     timed: u32,
+    /// Padded bytes of the `PageBox`es `d3d9.dll` allocated since the previous drain.
+    ///
+    /// The `PageBox` counters are statics of each binary that links this
+    /// crate, so the encoder's summary in `mtld3d.so` reads only its own
+    /// runtime's; the game's allocations count in `d3d9.dll`'s and reach
+    /// the summary through these fields. Zero on a device's first drain,
+    /// which has no baseline.
+    pagebox_alloc_bytes: u64,
+    /// Padded bytes of the `PageBox`es `d3d9.dll` freed since the previous drain.
+    pagebox_free_bytes: u64,
+    /// Padded bytes behind `pool_recycled`.
+    pool_recycled_bytes: u64,
+    /// Padded bytes parked in `d3d9.dll`'s page-box pool at the drain, both lanes.
+    pool_parked_bytes: u64,
+    /// `PageBox` allocations `d3d9.dll` made since the previous drain, as `pagebox_alloc_bytes`.
+    pagebox_allocs: u32,
+    /// `PageBox` frees `d3d9.dll` made since the previous drain.
+    pagebox_frees: u32,
+    /// Subset of `pagebox_allocs` that missed snmalloc's per-thread cache.
+    pagebox_uncached_allocs: u32,
+    /// Retired VB/IB boxes `d3d9.dll`'s pool parked since the previous drain.
+    ///
+    /// Guest-owned backings retire on the API thread and park in the PE
+    /// pool; the encoder's own pool counts its parks in
+    /// `EncoderFrameCounters::pagebox_pool_recycled`.
+    pool_recycled: u32,
 }
 
 #[cfg(perf_tracking)]
@@ -1085,6 +1113,14 @@ impl FrameCounters {
     const fn new() -> Self {
         Self {
             timed: 0,
+            pagebox_alloc_bytes: 0,
+            pagebox_free_bytes: 0,
+            pool_recycled_bytes: 0,
+            pool_parked_bytes: 0,
+            pagebox_allocs: 0,
+            pagebox_frees: 0,
+            pagebox_uncached_allocs: 0,
+            pool_recycled: 0,
             texture_pool_hits: 0,
             texture_pool_misses: 0,
             reset_epoch: 0,
@@ -1507,6 +1543,14 @@ pub struct ApiPerfState {
     /// and twice [`FRAME_SAMPLE_PERIOD`] less two, so a frame is timed one
     /// time in [`FRAME_SAMPLE_PERIOD`] on average and never on a fixed beat.
     untimed_frames: u8,
+    /// This runtime's cumulative `PageBox` and pool counters at the previous drain.
+    ///
+    /// `None` until the first drain, which has no baseline and carries zero.
+    pagebox_baseline: Option<(PageBoxVolume, PoolTraffic)>,
+    /// TSC at which this device last logged its runtime's `pagebox-pool cumulative` line.
+    ///
+    /// 0 before the first line.
+    pool_logged_tsc: u64,
 }
 
 #[cfg(perf_tracking)]
@@ -1537,6 +1581,8 @@ impl ApiPerfState {
             section_sample_state: 0x9e37_79b9,
             frame_sample_state: seed | 1,
             untimed_frames: 0,
+            pagebox_baseline: None,
+            pool_logged_tsc: 0,
         }
     }
 
@@ -1895,6 +1941,62 @@ impl ApiPerfState {
         self.counters.texture_pool_hits = self.counters.texture_pool_hits.saturating_add(hits);
         self.counters.texture_pool_misses =
             self.counters.texture_pool_misses.saturating_add(misses);
+    }
+
+    /// Carry this runtime's `PageBox` and pool traffic since the previous drain in the payload.
+    ///
+    /// Runs on the API thread after [`Self::drain_into_payload`], reading
+    /// the counters of the binary it is linked into and `pool`, the pool the
+    /// game's renames and staging recycle through; the encoder's summary
+    /// reports them beside its own runtime's. The encoder logs only its own
+    /// pool's cumulative line, so this logs `pool`'s on the summary's cadence.
+    /// `tsc_hz` is the device's published calibration, so the API thread
+    /// never pays the calibration sleep: no line is logged until it is
+    /// `Some`. Does nothing while the perf target is off.
+    pub fn drain_pagebox_traffic(
+        &mut self,
+        payload: &mut FramePerfPayload,
+        pool: &PageBoxPool,
+        tsc_hz: Option<u64>,
+    ) {
+        if !perf_enabled() {
+            return;
+        }
+        self.carry_pagebox_traffic(payload, pagebox_volume(), pool.buffer_traffic());
+        let Some(hz) = tsc_hz else {
+            return;
+        };
+        let now = rdtsc();
+        if self.pool_logged_tsc == 0
+            || now.saturating_sub(self.pool_logged_tsc) >= hz.saturating_mul(SUMMARY_INTERVAL_SECS)
+        {
+            pool.log_diagnostics("d3d9");
+            self.pool_logged_tsc = now;
+        }
+    }
+
+    /// Write the delta of two cumulative snapshots into the payload, keeping `volume` and `pool`.
+    fn carry_pagebox_traffic(
+        &mut self,
+        payload: &mut FramePerfPayload,
+        volume: PageBoxVolume,
+        pool: PoolTraffic,
+    ) {
+        let counters = &mut payload.counters;
+        counters.pool_parked_bytes = pool.parked_bytes;
+        if let Some((prev_volume, prev_pool)) = &self.pagebox_baseline {
+            let frame = volume.delta(prev_volume);
+            let count = |n: u64| u32::try_from(n).unwrap_or(u32::MAX);
+            counters.pagebox_allocs = count(frame.allocs);
+            counters.pagebox_alloc_bytes = frame.alloc_bytes;
+            counters.pagebox_frees = count(frame.frees);
+            counters.pagebox_free_bytes = frame.free_bytes;
+            counters.pagebox_uncached_allocs = count(frame.uncached_allocs);
+            counters.pool_recycled = count(pool.recycled.saturating_sub(prev_pool.recycled));
+            counters.pool_recycled_bytes =
+                pool.recycled_bytes.saturating_sub(prev_pool.recycled_bytes);
+        }
+        self.pagebox_baseline = Some((volume, pool));
     }
 
     /// Drain this frame's API-thread counters into the outgoing payload, then zero self.
@@ -2765,9 +2867,11 @@ impl EncoderPerfState {
         let outside_d3d9 = self.timing.frame_total_cycles.saturating_sub(api_total);
         let api_work_cyc = api_total.saturating_sub(self.timing.present_block_cycles);
 
-        // Per-frame PageBox allocator traffic: delta of the process-wide
+        // Per-frame PageBox allocator traffic: delta of this runtime's
         // cumulative counters against the previous frame's snapshot. The
-        // first sampled frame has no baseline and reports zero.
+        // first sampled frame has no baseline and reports zero. What
+        // `d3d9.dll` counted rides in `counters`, and the window keeps it
+        // apart.
         let pagebox = pagebox_volume();
         let pagebox_frame = if self.prev_pagebox_volume.is_zero() {
             PageBoxVolume::new()
@@ -3182,11 +3286,12 @@ struct FrameSample {
     /// allocations are excluded, and in-place growth still counts the old
     /// capacity. A warmed pool drives this to zero for stable workloads.
     cmd_vec_realloc_bytes: u64,
-    /// This frame's `PageBox` allocations reaching the global allocator.
+    /// This frame's `PageBox` allocations reaching this runtime's global allocator.
     ///
-    /// Delta of the cumulative `page_box.rs` counters between two
-    /// consecutive `log_frame_summary` calls. Includes every producer on
-    /// every thread, not just the Lock-rename path.
+    /// Delta of the cumulative `page_box.rs` counters of the binary the
+    /// summary runs in between two consecutive `log_frame_summary` calls.
+    /// Includes every producer on every thread of that runtime; the delta
+    /// `d3d9.dll` carried is in `counters`.
     pagebox_allocs: u64,
     pagebox_alloc_bytes: u64,
     /// This frame's `PageBox` frees returning to the global allocator.
@@ -3197,7 +3302,7 @@ struct FrameSample {
     /// Each one costs a commit on the way in and a decommit on the way
     /// out; see `page_box::bypasses_local_cache`.
     pagebox_uncached_allocs: u64,
-    /// Padded bytes parked in the recycle pool at frame end (from `CacheSizes`).
+    /// Padded bytes parked in the encoder's recycle pool at frame end (from `CacheSizes`).
     pagebox_pool_bytes: u64,
 
     // ── Derived this frame from the counters above ──
@@ -3490,6 +3595,23 @@ struct PerfWindow {
     pagebox_pool_recycled_bytes: Stat,
     /// Parked pool bytes at frame end: averaged over frames, plus peak.
     pagebox_pool_bytes: Stat,
+    /// `d3d9.dll`'s twins of the eight `pagebox` stats above, carried in the payload.
+    ///
+    /// Kept apart so the `perf-kv` keys of the encoder's runtime keep their
+    /// meaning and these get keys of their own (`pe_pagebox_*`); the grid
+    /// rows show the two runtimes together.
+    pe_pagebox_allocs: Stat,
+    pe_pagebox_alloc_bytes: Stat,
+    pe_pagebox_frees: Stat,
+    pe_pagebox_free_bytes: Stat,
+    pe_pagebox_uncached_allocs: Stat,
+    pe_pagebox_pool_recycled: Stat,
+    pe_pagebox_pool_recycled_bytes: Stat,
+    pe_pagebox_pool_bytes: Stat,
+    /// Both runtimes' uncached allocations per frame, for the grid's peak.
+    pagebox_uncached_both: Stat,
+    /// Both runtimes' parked pool bytes per frame, for the grid's average and peak.
+    pagebox_pool_bytes_both: Stat,
     /// Peak only: `device_sub_by[Frame] − present_block`, the non-stall Frame sub-bucket.
     ///
     /// Present body, `Clear`, `Begin/EndScene`, `ColorFill`.
@@ -3732,6 +3854,24 @@ impl PerfWindow {
         self.pagebox_pool_recycled_bytes
             .add(s.enc.pagebox_pool_recycled_bytes);
         self.pagebox_pool_bytes.add(s.pagebox_pool_bytes);
+        let pe = &s.counters;
+        self.pe_pagebox_allocs.add(u64::from(pe.pagebox_allocs));
+        self.pe_pagebox_alloc_bytes.add(pe.pagebox_alloc_bytes);
+        self.pe_pagebox_frees.add(u64::from(pe.pagebox_frees));
+        self.pe_pagebox_free_bytes.add(pe.pagebox_free_bytes);
+        self.pe_pagebox_uncached_allocs
+            .add(u64::from(pe.pagebox_uncached_allocs));
+        self.pe_pagebox_pool_recycled
+            .add(u64::from(pe.pool_recycled));
+        self.pe_pagebox_pool_recycled_bytes
+            .add(pe.pool_recycled_bytes);
+        self.pe_pagebox_pool_bytes.add(pe.pool_parked_bytes);
+        self.pagebox_uncached_both.add(
+            s.pagebox_uncached_allocs
+                .saturating_add(u64::from(pe.pagebox_uncached_allocs)),
+        );
+        self.pagebox_pool_bytes_both
+            .add(s.pagebox_pool_bytes.saturating_add(pe.pool_parked_bytes));
 
         // Derived peaks (no window sum): each is a per-frame quantity, so
         // peak-of-difference ≠ difference-of-peaks — compute per frame.
@@ -5646,20 +5786,22 @@ impl<'a> Summary<'a> {
         } else {
             0.0
         };
-        let recycled_kb = u64_to_f64_exact(w.pagebox_pool_recycled_bytes.sum) / 1024.0;
+        // Both runtimes' pools: the encoder's own and the one `d3d9.dll`
+        // retires guest backings into.
+        let recycled = w.pagebox_pool_recycled.sum + w.pe_pagebox_pool_recycled.sum;
+        let recycled_bytes =
+            w.pagebox_pool_recycled_bytes.sum + w.pe_pagebox_pool_recycled_bytes.sum;
+        let recycled_kb = u64_to_f64_exact(recycled_bytes) / 1024.0;
         let (recycled_fmt, _) = format_kb_pair(recycled_kb, recycled_kb);
         self.res_row(
             out,
             "pool",
             &format!("hit={pool_hits} miss={pool_misses} ({pool_hit_pct:.1}%)"),
-            Some(&format!(
-                "recycled={r}  {recycled_fmt}",
-                r = w.pagebox_pool_recycled.sum,
-            )),
-            "API pops a warm same-size PageBox; encoder parks retired ones (memory.pageboxPoolCapMB, 0 = off)",
+            Some(&format!("recycled={recycled}  {recycled_fmt}")),
+            "API pops a warm same-size PageBox; both runtimes park retired ones (memory.pageboxPoolCapMB, 0 = off)",
         );
-        let parked_avg_kb = u64_to_f64_exact(w.pagebox_pool_bytes.sum) / f / 1024.0;
-        let parked_peak_kb = u64_to_f64_exact(w.pagebox_pool_bytes.max) / 1024.0;
+        let parked_avg_kb = u64_to_f64_exact(w.pagebox_pool_bytes_both.sum) / f / 1024.0;
+        let parked_peak_kb = u64_to_f64_exact(w.pagebox_pool_bytes_both.max) / 1024.0;
         let (parked_avg_fmt, parked_peak_fmt) = format_kb_pair(parked_avg_kb, parked_peak_kb);
         self.res_row(
             out,
@@ -6139,15 +6281,20 @@ impl<'a> Summary<'a> {
         // PageBox traffic that actually reached the global allocator this
         // window. Fresh pages fault on first touch under Wine, so a large
         // steady-state number here is the churn signal this row exists for.
-        let pb_alloc_kb = u64_to_f64_exact(w.pagebox_alloc_bytes.sum) / 1024.0;
-        let pb_free_kb = u64_to_f64_exact(w.pagebox_free_bytes.sum) / 1024.0;
+        // Both runtimes: the encoder's own and what `d3d9.dll` carried.
+        let pb_allocs = w.pagebox_allocs.sum + w.pe_pagebox_allocs.sum;
+        let pb_frees = w.pagebox_frees.sum + w.pe_pagebox_frees.sum;
+        let pb_alloc_kb =
+            u64_to_f64_exact(w.pagebox_alloc_bytes.sum + w.pe_pagebox_alloc_bytes.sum) / 1024.0;
+        let pb_free_kb =
+            u64_to_f64_exact(w.pagebox_free_bytes.sum + w.pe_pagebox_free_bytes.sum) / 1024.0;
         let (pb_alloc_fmt, pb_free_fmt) = format_kb_pair(pb_alloc_kb, pb_free_kb);
         self.res_row(
             out,
             "pagebox",
-            &format!("alloc={a}  {pb_alloc_fmt}", a = w.pagebox_allocs.sum),
-            Some(&format!("free={fr}  {pb_free_fmt}", fr = w.pagebox_frees.sum)),
-            "window totals of PageBox allocs/frees reaching the global allocator (fresh pages fault on first touch)",
+            &format!("alloc={pb_allocs}  {pb_alloc_fmt}"),
+            Some(&format!("free={pb_frees}  {pb_free_fmt}")),
+            "window totals of PageBox allocs/frees reaching either runtime's allocator (fresh pages fault on first touch)",
         );
         // The subset snmalloc cannot cache: over 1 MiB rounds up to a
         // chunk at or past its 2 MiB per-thread budget, so each of these
@@ -6155,9 +6302,9 @@ impl<'a> Summary<'a> {
         // out. Pool hits never reach the allocator, so what is left here
         // comes from the unpooled producers (texture staging, surface
         // locks, blit padding).
-        let uncached = w.pagebox_uncached_allocs.sum;
-        let uncached_pct = if w.pagebox_allocs.sum > 0 {
-            u64_to_f64_exact(uncached) / u64_to_f64_exact(w.pagebox_allocs.sum) * 100.0
+        let uncached = w.pagebox_uncached_allocs.sum + w.pe_pagebox_uncached_allocs.sum;
+        let uncached_pct = if pb_allocs > 0 {
+            u64_to_f64_exact(uncached) / u64_to_f64_exact(pb_allocs) * 100.0
         } else {
             0.0
         };
@@ -6165,7 +6312,7 @@ impl<'a> Summary<'a> {
             out,
             "  uncached",
             &format!("{uncached} ({uncached_pct:.1}%)"),
-            Some(&format!("peak {p}/frame", p = w.pagebox_uncached_allocs.max)),
+            Some(&format!("peak {p}/frame", p = w.pagebox_uncached_both.max)),
             "allocs over 1 MiB: past snmalloc's per-thread budget, so commit in / decommit out every time",
         );
         // Process-wide fault delta, sampled once per window via the
@@ -6523,6 +6670,12 @@ fn render_kv(w: &PerfWindow, c: &PerfWindow, caches: &CacheSizes, window_secs: f
         c.pagebox_pool_recycled_bytes.sum,
     );
     kv.bytes("pagebox_pool_parked", c.pagebox_pool_bytes.max);
+    kv.total("pe_pagebox_pool_recycled", c.pe_pagebox_pool_recycled.sum);
+    kv.total(
+        "pe_pagebox_pool_recycled_bytes",
+        c.pe_pagebox_pool_recycled_bytes.sum,
+    );
+    kv.bytes("pe_pagebox_pool_parked", c.pe_pagebox_pool_bytes.max);
 
     // Resources (textures).
     kv.total("tex_rename", c.texture_renames.sum);
@@ -6594,6 +6747,11 @@ fn render_kv(w: &PerfWindow, c: &PerfWindow, caches: &CacheSizes, window_secs: f
     kv.total("pagebox_free", c.pagebox_frees.sum);
     kv.total("pagebox_free_bytes", c.pagebox_free_bytes.sum);
     kv.total("pagebox_uncached", c.pagebox_uncached_allocs.sum);
+    kv.total("pe_pagebox_alloc", c.pe_pagebox_allocs.sum);
+    kv.total("pe_pagebox_alloc_bytes", c.pe_pagebox_alloc_bytes.sum);
+    kv.total("pe_pagebox_free", c.pe_pagebox_frees.sum);
+    kv.total("pe_pagebox_free_bytes", c.pe_pagebox_free_bytes.sum);
+    kv.total("pe_pagebox_uncached", c.pe_pagebox_uncached_allocs.sum);
     if let Some(faults) = &c.faults_window {
         kv.total("faults_minor", faults.minor);
         kv.total("faults_major", faults.major);
@@ -6624,7 +6782,7 @@ const _: () = {
 
 #[cfg(perf_tracking)]
 const _: () = {
-    assert!(size_of::<FrameCounters>() == 928);
+    assert!(size_of::<FrameCounters>() == 976);
     assert!(align_of::<FrameCounters>() == 8);
     assert!(core::mem::offset_of!(FrameCounters, reset_epoch) == 0);
     assert!(core::mem::offset_of!(FrameCounters, inverse_view) == 8);
@@ -6675,14 +6833,22 @@ const _: () = {
     assert!(core::mem::offset_of!(FrameCounters, texture_pool_hits) == 916);
     assert!(core::mem::offset_of!(FrameCounters, texture_pool_misses) == 920);
     assert!(core::mem::offset_of!(FrameCounters, timed) == 924);
+    assert!(core::mem::offset_of!(FrameCounters, pagebox_alloc_bytes) == 928);
+    assert!(core::mem::offset_of!(FrameCounters, pagebox_free_bytes) == 936);
+    assert!(core::mem::offset_of!(FrameCounters, pool_recycled_bytes) == 944);
+    assert!(core::mem::offset_of!(FrameCounters, pool_parked_bytes) == 952);
+    assert!(core::mem::offset_of!(FrameCounters, pagebox_allocs) == 960);
+    assert!(core::mem::offset_of!(FrameCounters, pagebox_frees) == 964);
+    assert!(core::mem::offset_of!(FrameCounters, pagebox_uncached_allocs) == 968);
+    assert!(core::mem::offset_of!(FrameCounters, pool_recycled) == 972);
     assert!(size_of::<FrameTiming>() == 32);
     assert!(align_of::<FrameTiming>() == 8);
     assert!(core::mem::offset_of!(FrameTiming, present_block_cycles) == 0);
     assert!(core::mem::offset_of!(FrameTiming, frame_total_cycles) == 8);
     assert!(core::mem::offset_of!(FrameTiming, op_vec_capacity_bytes) == 16);
     assert!(core::mem::offset_of!(FrameTiming, op_vec_realloc_bytes) == 24);
-    assert!(size_of::<FramePerfPayload>() == 960);
+    assert!(size_of::<FramePerfPayload>() == 1008);
     assert!(align_of::<FramePerfPayload>() == 8);
     assert!(core::mem::offset_of!(FramePerfPayload, counters) == 0);
-    assert!(core::mem::offset_of!(FramePerfPayload, timing) == 928);
+    assert!(core::mem::offset_of!(FramePerfPayload, timing) == 976);
 };

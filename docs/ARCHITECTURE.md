@@ -883,7 +883,7 @@ in its row, and every family carries the suffixes its row names.
 | `vbib_reorder_total`, `vbib_full_skip_total`, `vbib_full_skip_bytes_total`, `vbib_gpu_copy_total`, `vbib_gpu_copy_bytes_total`, `vbib_alloc_fail_total` | `reorder`, `full skip`, `GPU copy`, `allocfail`. |
 | `vbib_destroy_total`, `vbib_ret_cap_drain_total`, `vbib_ret_cap_submit_total` | VB/IB `destroys` and `ret cap`. |
 | `vbib_retention_peak_count`, `vbib_retained_bytes` | VB/IB `retention`: peak depth and peak bytes. |
-| `vbib_pool_hit_total`, `vbib_pool_miss_total`, `pagebox_pool_recycled_total`, `pagebox_pool_recycled_bytes_total`, `pagebox_pool_parked_bytes` | `pool` and `parked` (peak). |
+| `vbib_pool_hit_total`, `vbib_pool_miss_total`, `pagebox_pool_recycled_total`, `pagebox_pool_recycled_bytes_total`, `pagebox_pool_parked_bytes` | `pool` and `parked` (peak); the recycles and parked bytes are the encoder's own pool's. |
 | `tex_rename_total`, `tex_discard_total`, `tex_preserve_cpu_total`, `tex_in_place_total`, `tex_reorder_total`, `tex_destroy_total` | Texture `rename`, `discards`, `preserve`, `in-place`, `reorder`, `destroys`. |
 | `tex_uploads_total`, `tex_uploads_<x>_total` | Texture `uploads` and their paths: `raw`, `padded`, `pass`. |
 | `tex_retention_peak_count`, `tex_staging_retained_bytes` | Texture `retention`: peak depth and peak bytes. |
@@ -896,6 +896,7 @@ in its row, and every family carries the suffixes its row names.
 | `scratch_small_peak_count`, `scratch_oversized_peak_count`, `scratch_bytes` | `scratch`: peak blocks and peak bytes. |
 | `op_vec_capacity_bytes`, `op_vec_realloc_bytes_total`, `cmd_vec_capacity_bytes`, `cmd_vec_realloc_bytes_total` | `op_vec` and `cmd_vec`: peak `size` and window `realloc` bytes. |
 | `pagebox_alloc_total`, `pagebox_alloc_bytes_total`, `pagebox_free_total`, `pagebox_free_bytes_total`, `pagebox_uncached_total` | `pagebox` and `uncached`. |
+| `pe_pagebox_alloc_total`, `pe_pagebox_alloc_bytes_total`, `pe_pagebox_free_total`, `pe_pagebox_free_bytes_total`, `pe_pagebox_uncached_total`, `pe_pagebox_pool_recycled_total`, `pe_pagebox_pool_recycled_bytes_total`, `pe_pagebox_pool_parked_bytes` | `d3d9.dll`'s share of `pagebox`, `uncached`, the pool's `recycled` and `parked` (peak), carried in the frame payload. The grid adds it to the encoder runtime's, which the `pagebox_*` keys hold alone. |
 | `faults_minor_total`, `faults_major_total` | `faults`; absent when nothing was sampled. |
 | `comp_<x>_ms`, `_peak_ms`, `comp_<x>_calls_total`, `comp_<x>_failed_total` | The `Compilation` rows: `vs_miss`, `ps_miss`, `emit_vs`, `emit_ps`, `shader_setup`, `metal_library`, `function_lookup`, `shader_cache_persist`, `pso_primary`, `pso_sibling`, `pso_setup`, `pso_build`, `pso_cache_persist`, `depth_state`; and `resolve_remainder`, `pipeline_remainder` with `_ms` and `_peak_ms` only, since they are computed rather than counted. Written in every window, idle or not. |
 | `comp_async_skipped_draws_total`, `comp_async_pending_peak_count`, `comp_async_installs_total`, `comp_async_latency_avg_ms`, `comp_async_latency_peak_ms` | The first `async:` row: skipped draws, most builds in flight, installs, and the average and longest enqueue-to-install latency. |
@@ -903,10 +904,26 @@ in its row, and every family carries the suffixes its row names.
 
 ### Buffer recycle-pool diagnostics
 
-`PERF=1` and `RUST_LOG=mtld3d::perf=info` emit a `pagebox-pool cumulative`
-line with the existing two-second performance summary. These totals cover the
-process-wide pool, including all devices, and survive device resets. Multiple
-devices can therefore report overlapping totals; do not add their reports.
+`PERF=1` and `RUST_LOG=mtld3d::perf=info` emit `pagebox-pool cumulative`
+lines on the two-second cadence of the performance summary, one per pool, each
+ending in the runtime that owns it. `runtime=d3d9` is the process-wide pool in
+`d3d9.dll` that the game's VB/IB renames and texture staging recycle through,
+logged by each device's API thread; `runtime=encoder` is the encoder's own pool
+in `mtld3d.so`, one per device, which parks the encoder's native boxes. These
+totals survive device resets. Several devices log the one `d3d9` pool's totals
+each, so their reports overlap; do not add them.
+
+The grid reads both runtimes. The `PageBox` counters and the `d3d9.dll` pool
+are statics of the binary that links them, so the API thread carries
+`d3d9.dll`'s side in the frame payload (`FrameCounters`): the `PageBox`
+allocations, frees and uncached allocations since its previous drain, the
+VB/IB lane's parks and their bytes, and the bytes parked at the drain. The
+window keeps them apart from the encoder's own: the grid's `pagebox`,
+`uncached`, pool `recycled` and `parked` rows show the two together, while
+the `perf-kv` line keeps the encoder's runtime on the `pagebox_*` keys and
+gives `d3d9.dll`'s the `pe_pagebox_*` keys. Every device reads the
+process-wide counters against its own baseline, so two devices' rows overlap
+there too.
 
 Subtract consecutive lines to isolate a gameplay interval. Acquire attempts are
 `hit + empty + oversize + disabled`; the enabled hit rate is

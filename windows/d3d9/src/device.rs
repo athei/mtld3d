@@ -1757,6 +1757,17 @@ impl DeviceInner {
         let op_vec_realloc_bytes = frame.take_op_vec_realloc_bytes();
         self.perf_mut()
             .drain_into_payload(frame.perf_mut(), !no_present);
+        // The summary runs in `mtld3d.so`, whose `PageBox` counters and pool
+        // are not this binary's, so this runtime's traffic rides the payload.
+        #[cfg(perf_tracking)]
+        {
+            let hz = self.encoder.source_clock_hz();
+            self.perf_mut().drain_pagebox_traffic(
+                frame.perf_mut(),
+                &crate::page_box_pool::PAGEBOX_POOL,
+                hz,
+            );
+        }
         frame
             .perf_mut()
             .set_op_vec_metrics(op_vec_capacity_bytes, op_vec_realloc_bytes);
