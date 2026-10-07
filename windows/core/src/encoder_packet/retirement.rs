@@ -12,6 +12,7 @@
 use crate::{
     encoder_packet::{FramePacket, FrameRecorder, PacketLease},
     guest_completions::{CompletionDrain, CompletionPool, CompletionSlot, REPLAY_COMPLETION_TOKEN},
+    guest_pages::LeaseOnlyPages,
     scratch::ScratchArena,
 };
 
@@ -120,6 +121,18 @@ impl PacketRetirement {
         self.leases.recycle_retired(pool);
         self.leases.entries.clear();
         self.leases.aliases.clear();
+    }
+
+    /// Tally every page lease this device still retains, handed over to the registry or not.
+    pub fn tally_page_leases(&self, tally: &mut LeaseOnlyPages) {
+        for lease in self.pending.iter().flat_map(|packet| &packet.pages) {
+            tally.add(lease);
+        }
+        for lease in self.leases.entries.iter().flatten() {
+            if let PacketLease::Page(lease) = lease {
+                tally.add(lease);
+            }
+        }
     }
 
     /// Leak every owner native code might still reach, after native destruction failed.

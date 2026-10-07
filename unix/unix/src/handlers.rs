@@ -432,6 +432,29 @@ pub fn task_faults() -> mtld3d_core::perf::TaskFaults {
     }
 }
 
+/// The process's physical footprint in bytes, 0 when the kernel refuses the query.
+///
+/// `ri_phys_footprint` of `proc_pid_rusage`, the task ledger figure that
+/// `TASK_VM_INFO`'s `phys_footprint` also reports and the Metal HUD shows
+/// as app memory: resident and compressed private memory plus the driver and
+/// GPU allocations charged to the process.
+pub fn process_footprint() -> u64 {
+    // SAFETY: rusage_info_v2 is plain data initialized before the kernel fills it.
+    let mut info: libc::rusage_info_v2 = unsafe { core::mem::zeroed() };
+    let Ok(pid) = libc::c_int::try_from(std::process::id()) else {
+        return 0;
+    };
+    // SAFETY: info is a live writable rusage_info_v2 and RUSAGE_INFO_V2 names its layout.
+    let rc = unsafe {
+        libc::proc_pid_rusage(
+            pid,
+            libc::RUSAGE_INFO_V2,
+            (&raw mut info).cast::<libc::rusage_info_t>(),
+        )
+    };
+    if rc == 0 { info.ri_phys_footprint } else { 0 }
+}
+
 pub extern "C" fn destroy_command_queue_handler(args: *mut c_void) -> i32 {
     // SAFETY: unix-call handler params; PE side passes *const DestroyCommandQueueParams.
     let Some(params) = (unsafe { InPtr::<DestroyCommandQueueParams>::opt(args.cast()) }) else {

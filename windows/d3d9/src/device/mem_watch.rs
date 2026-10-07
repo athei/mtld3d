@@ -11,10 +11,12 @@
 //! how close the process was and who owned the space.
 //!
 //! The page boxes are reported by holder (texture staging, surfaces,
-//! vertex/index backing, encoder leases, the recycle pool) with the rest as
-//! `other`, and the texture staging and vertex/index backing are split again
-//! by the class that decides whether the copy can be released at all, so the
-//! line names which holder keeps the space rather than leaving it to a guess.
+//! vertex/index backing, encoder leases, upload leases, the recycle pool)
+//! with the rest as `other`, and the texture staging and vertex/index backing
+//! are split again by the class that decides whether the copy can be released
+//! at all, so the line names which holder keeps the space rather than leaving
+//! it to a guess. Beside them goes what `d3d9.dll`'s heap has committed, page
+//! boxes included, which bounds everything else the image allocates.
 //!
 //! The periodic breakdown logs at debug on its own target, so
 //! `RUST_LOG=mtld3d::d3d9::mem_watch=debug` turns it on without the rest of
@@ -144,14 +146,15 @@ impl DeviceInner {
         fp
     }
 
-    /// The live page boxes split by holder, with this device's textures as the staging holder.
-    fn page_box_holders(textures: &TextureFootprint) -> PageBoxHolders {
+    /// The live page boxes split by holder, with this device's textures and leases as holders.
+    fn page_box_holders(&self, textures: &TextureFootprint) -> PageBoxHolders {
         PageBoxHolders {
             total: mtld3d_core::page_box::live_bytes(),
             texture_staging: textures.staging(),
             surfaces: mtld3d_core::held_pages::live_surface_bytes(),
             vertex_index_backing: mtld3d_core::buffer_backing::live_backing_bytes().total(),
             encoder_leases: mtld3d_core::held_pages::live_encoder_lease_bytes(),
+            upload_leases: self.encoder.upload_lease_bytes(),
             pool_parked: crate::page_box_pool::PAGEBOX_POOL.pooled_bytes() as u64,
         }
     }
@@ -202,12 +205,13 @@ impl DeviceInner {
         debug!(
             target: LOG_TARGET,
             "address space: {space}; mtld3d holds {} textures with {} MiB of mip data; {}; \
-             texture staging split default static {} / default dynamic {} / other {}, \
+             d3d9.dll heap {} MiB committed; texture staging split default static {} / default dynamic {} / other {}, \
              {} MiB before page rounding; vertex/index backing split writeonly static {} / \
              dynamic {} / other {}; locks on static default textures {}",
             fp.count,
             fp.mip_bytes >> 20,
-            Self::page_box_holders(&fp),
+            self.page_box_holders(&fp),
+            heap_committed_bytes() >> 20,
             fp.staging_default_static >> 20,
             fp.staging_default_dynamic >> 20,
             fp.staging_other >> 20,
@@ -247,10 +251,11 @@ impl DeviceInner {
                         target: LOG_TARGET,
                         "address space: {what} {value} MiB (below {threshold} MiB); {free} MiB \
                          free, largest free block {largest} MiB; mtld3d holds {} textures with \
-                         {} MiB of mip data; {}",
+                         {} MiB of mip data; {}; d3d9.dll heap {} MiB committed",
                         fp.count,
                         fp.mip_bytes >> 20,
-                        Self::page_box_holders(&fp)
+                        self.page_box_holders(&fp),
+                        heap_committed_bytes() >> 20
                     );
                 }
             }
@@ -259,6 +264,16 @@ impl DeviceInner {
             warn!(target: LOG_TARGET, "address space map: {}", address_space_map());
         }
     }
+}
+
+/// Bytes `d3d9.dll`'s snmalloc holds committed, its page boxes included.
+///
+/// snmalloc's backend counts the chunks it has committed and handed to its
+/// allocators, two atomic loads: every heap block of this image, the page
+/// boxes, and what the per-thread caches keep for reuse. It is not the
+/// image's share of the address space, which reserves ahead of commit.
+fn heap_committed_bytes() -> u64 {
+    snmalloc_rs::SnMalloc::memory_stats().current_memory_usage as u64
 }
 
 /// Step `latch` over `thresholds` with this sample's `value_mib`, once per process.

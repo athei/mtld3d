@@ -169,10 +169,9 @@ pub fn cycles_to_micros(cycles: u64, hz: u64) -> u64 {
 ///
 /// Every figure is padded bytes (`PageBox::len`) held on the side that owns
 /// the 32-bit address space, the unit and the side `total` counts, so
-/// `other` is what none of the named holders accounts for: upload leases of
-/// texture staging the texture itself let go of, read-back pages of a call
-/// in progress, and any holder not counted yet. Pages the native encoder
-/// allocates live outside the 32-bit space and are in none of these.
+/// `other` is what none of the named holders accounts for: read-back pages
+/// of a call in progress, and any holder not counted yet. Pages the native
+/// encoder allocates live outside the 32-bit space and are in none of these.
 pub struct PageBoxHolders {
     /// Every live page box (`page_box::live_bytes`).
     pub total: u64,
@@ -187,6 +186,12 @@ pub struct PageBoxHolders {
     /// Kept until the encoder acknowledges its last use, which follows the
     /// GPU retiring the frame that read them.
     pub encoder_leases: u64,
+    /// Texture staging only upload leases still keep, after the texture let go of it.
+    ///
+    /// Kept until native code drops its last owner of the pages (the upload
+    /// read, a cached wrapper) and the PE side sees the acknowledgment.
+    /// Staging a texture still holds counts as texture staging, not here.
+    pub upload_leases: u64,
     /// Retired boxes parked in the recycle pool for reuse.
     pub pool_parked: u64,
 }
@@ -200,6 +205,7 @@ impl PageBoxHolders {
                 .saturating_add(self.surfaces)
                 .saturating_add(self.vertex_index_backing)
                 .saturating_add(self.encoder_leases)
+                .saturating_add(self.upload_leases)
                 .saturating_add(self.pool_parked),
         )
     }
@@ -211,12 +217,13 @@ impl fmt::Display for PageBoxHolders {
         write!(
             f,
             "page boxes {} MiB: texture staging {}, surfaces {}, vertex/index backing {}, \
-             encoder leases {}, pool parked {}, other {}",
+             encoder leases {}, upload leases {}, pool parked {}, other {}",
             self.total >> 20,
             self.texture_staging >> 20,
             self.surfaces >> 20,
             self.vertex_index_backing >> 20,
             self.encoder_leases >> 20,
+            self.upload_leases >> 20,
             self.pool_parked >> 20,
             self.other() >> 20
         )

@@ -280,6 +280,22 @@ box, and a texture detached from its device drops its staging instead of
 parking it. The textures `pool` row of the `PERF=1` summary counts the lane's
 hits and misses.
 
+The encoder keeps one cached `bytesNoCopy` wrapper per staging level, so the
+uploads of a level reuse one `MTLBuffer`. The wrapper's keepalive is the native
+owner of the pages, adopted from the upload lease that first delivered them,
+and that lease cannot complete while the wrapper is cached, so the PE side
+keeps the pages too. The encoder therefore retires the wrapper behind the
+current submission in three cases: the level's backing changed, the texture
+was destroyed, or an emitted upload carries the answer on which the PE side
+releases the level's staging. In the last case the pages are freed or parked
+once the GPU retires that upload, not when the texture is destroyed. The PE
+side applies the answer at the next `Present` and only when no newer upload
+of the level overtook it, so a level rewritten every frame keeps its staging.
+The emptied slot remembers the backing's address and length, and when the
+next upload wraps that same backing again its wrapper is kept through later
+answers: one extra wrapper per backing, not one per upload. A kept wrapper
+still retires at a backing change or at the texture's destroy.
+
 Page allocation is infallible: a box the allocator refuses ends the process,
 because past creation there is nothing to give back that the retention cap and
 the pool have not already bounded. The one exception is the system-memory copy
@@ -637,10 +653,10 @@ Two latches watch the samples, one on the free total (1536, 1024, 768, 512, 256 
 `RUST_LOG=mtld3d::d3d9::mem_watch=debug` adds a line every second sample (about ten seconds), without the rest of the layer's debug output. With illustrative figures:
 
 ```
-address space: 1836 MiB free, largest free block 1182 MiB, walked 2310 regions in 1730 us; mtld3d holds 4998 textures with 715 MiB of mip data; page boxes 1042 MiB: texture staging 640, surfaces 24, vertex/index backing 3, encoder leases 2, pool parked 126, other 247; texture staging split default static 520 / default dynamic 70 / other 50, 295 MiB before page rounding; vertex/index backing split writeonly static 0 / dynamic 3 / other 0; locks on static default textures 0
+address space: 1836 MiB free, largest free block 1182 MiB, walked 2310 regions in 1730 us; mtld3d holds 4998 textures with 715 MiB of mip data; page boxes 1042 MiB: texture staging 640, surfaces 24, vertex/index backing 3, encoder leases 2, upload leases 240, pool parked 126, other 7; d3d9.dll heap 1110 MiB committed; texture staging split default static 520 / default dynamic 70 / other 50, 295 MiB before page rounding; vertex/index backing split writeonly static 0 / dynamic 3 / other 0; locks on static default textures 0
 ```
 
-The walk's region count and duration, in microseconds of the PE side's calibrated counter, say what the sample costs in that process. Every page-box figure is padded bytes on the PE side, the 16 KiB multiples `PageBox` allocates in the 32-bit space, so the named holders and `other` add up to the total (`mtld3d_core::address_space::PageBoxHolders`). Texture staging is what the device's live textures hold, every level not yet dropped and every cube face level, split by pool and usage; "before page rounding" is the same staging at the lengths the levels asked for, and the gap between the two is the rounding a chain of small levels costs. Surfaces are the backing of system-memory and scratch offscreen plain surfaces, the staging of lockable render targets and the page a back-buffer `LockRect` or `GetDC` holds; encoder leases are the renamed vertex/index backings and upload snapshots the PE side keeps until the encoder acknowledges its last read (both `mtld3d_core::held_pages`). Vertex/index backing is the CPU copy of live buffers, split by the class that decides whether it can be released (`mtld3d_core::buffer_backing`). Pool parked is what the recycle pool keeps for reuse. `other` is everything else: upload leases of texture staging the texture itself let go of, read-back pages of a call in progress, and any holder not counted yet. Pages the native encoder allocates for itself (padded repack staging, depth read-backs, evicted visibility buffers) live outside the 32-bit space and are in none of these figures.
+The walk's region count and duration, in microseconds of the PE side's calibrated counter, say what the sample costs in that process. Every page-box figure is padded bytes on the PE side, the 16 KiB multiples `PageBox` allocates in the 32-bit space, so the named holders and `other` add up to the total (`mtld3d_core::address_space::PageBoxHolders`). Texture staging is what the device's live textures hold, every level not yet dropped and every cube face level, split by pool and usage; "before page rounding" is the same staging at the lengths the levels asked for, and the gap between the two is the rounding a chain of small levels costs. Surfaces are the backing of system-memory and scratch offscreen plain surfaces, the staging of lockable render targets and the page a back-buffer `LockRect` or `GetDC` holds; encoder leases are the renamed vertex/index backings and upload snapshots the PE side keeps until the encoder acknowledges its last read (both `mtld3d_core::held_pages`). Vertex/index backing is the CPU copy of live buffers, split by the class that decides whether it can be released (`mtld3d_core::buffer_backing`). Upload leases are texture staging the texture itself let go of and only the device's upload leases still keep, because native code holds an owner of the pages (the upload's read, the encoder's cached wrapper of the level) whose acknowledgment has not arrived; the sample walks the device's retained leases and counts an allocation only when every reference to it is a lease's (`mtld3d_core::guest_pages::LeaseOnlyPages`), so staging a texture still holds stays under texture staging. Pool parked is what the recycle pool keeps for reuse. `other` is everything else: read-back pages of a call in progress, and any holder not counted yet. Pages the native encoder allocates for itself (padded repack staging, depth read-backs, evicted visibility buffers) live outside the 32-bit space and are in none of these figures. The heap figure is what `d3d9.dll`'s snmalloc has committed and handed to its allocators, two atomic loads: the page boxes, every other heap block of the image, and what its per-thread caches keep for reuse, so the part above the page-box total is the image's other allocations. The threshold warnings carry the same holder clause and heap figure.
 
 ### Command-buffer completion and encoder errors
 
@@ -860,7 +876,7 @@ the value aggregates:
 | `_avg_ms` | Milliseconds per occurrence of the event the key names, the window's total over its count; 0 with none. |
 | `_peak_ms` | Milliseconds on the window's worst single frame for that timer (for `comp_*` rows, its worst submission; for `comp_async_latency`, its longest install). |
 | `_total` | The window total of a count: calls, draws, passes, uploads, renames, builds, faults. Never averaged, per the rule above; a consumer divides by `frames` for a rate. |
-| `_bytes` | A size gauge, the window's peak. |
+| `_bytes` | A size gauge: the window's peak, or a sample at the summary where the key's row says so. |
 | `_count` | A count gauge: the window's peak where the key says `peak`, otherwise sampled at the summary (the cache sizes). |
 
 Compatibility: keys are only ever added. A key whose meaning, unit or
@@ -868,11 +884,14 @@ aggregation changes gets a new name and the old one goes away rather than
 changing under a tool that compares builds across it. The `v1` tag changes only
 when the line's own format does (the separators, the value syntax, the header).
 A consumer ignores keys it does not know and treats a missing key as not
-measured. Three keys can be missing: `vbib_gpu_copy_total` is left out when one
-of its inputs saturated, where the grid prints `saturated`, and
+measured. Six keys can be missing: `vbib_gpu_copy_total` is left out when one
+of its inputs saturated, where the grid prints `saturated`;
 `faults_minor_total` and `faults_major_total` are left out of a window that
 sampled no faults (the first window, which has no baseline, or one closed
-before a sample arrived), where the grid prints 0.
+before a sample arrived), where the grid prints 0; and the three memory
+gauges, `process_footprint_bytes`, `metal_allocated_bytes` and
+`tex_staging_wrapped_bytes`, are left out of a window closed before their
+sample arrived, where the grid prints `n/a`.
 
 Every key, with the grid row it mirrors. A `<x>` stands for each name listed
 in its row, and every family carries the suffixes its row names.
@@ -906,8 +925,11 @@ in its row, and every family carries the suffixes its row names.
 | `tex_rename_total`, `tex_discard_total`, `tex_preserve_cpu_total`, `tex_in_place_total`, `tex_reorder_total`, `tex_destroy_total` | Texture `rename`, `discards`, `preserve`, `in-place`, `reorder`, `destroys`. |
 | `tex_uploads_total`, `tex_uploads_<x>_total` | Texture `uploads` and their paths: `raw`, `padded`, `pass`. |
 | `tex_retention_peak_count`, `tex_staging_retained_bytes` | Texture `retention`: peak depth and peak bytes. |
+| `tex_wrapper_create_total`, `tex_wrapper_retire_total` | Texture `churn`: per-level staging wrappers created, and queued for their destroy (at a backing change, an upload that releases its level's staging, or the texture's release). |
+| `tex_staging_wrapped_bytes` | Texture `wrapped`: the padded staging under the encoder's cached per-level `bytesNoCopy` wrappers, sampled at the summary. A cached wrapper keeps its upload lease, and so the guest pages, alive on the PE side. |
 | `tex_dirtyrect_calls_total`, `tex_dirtyrect_partial_total` | `dirtyrect` calls and the partial ones. |
 | `cache_<x>_count` | `Caches` at the summary: `textures`, `pipelines`, `samplers`, `programs`, `libs`, `depth_states`. |
+| `metal_allocated_bytes` | `metal alloc`: the `MTLDevice`'s `currentAllocatedSize`, sampled at the summary. The device is the process's one device, so it counts every Metal allocation of the process, not this layer's alone. |
 | `passes_total`, `commands_total`, `draws_total`, `pipeline_memo_hits_total`, `pipeline_memo_calls_total`, `fan_generated_total`, `up_indexed_total`, `up_oversized_total` | `Commands / passes`. |
 | `draw_unpinned_total` | No summary row: draws whose draw path ran off its pinned stack page offset (`unix/unix/src/stack_page.rs`), 0 unless the pin broke. |
 | `keys_<x>_calls_total`, `keys_<x>_skips_total` | `Keys gating`: `set_texture`, `set_render_state`, `set_tex_stage_state`, `set_fvf`, `set_vertex_decl`, `set_vertex_shader`, `set_pixel_shader`, `set_vs_const`, `set_ps_const`. |
@@ -917,6 +939,7 @@ in its row, and every family carries the suffixes its row names.
 | `pagebox_alloc_total`, `pagebox_alloc_bytes_total`, `pagebox_free_total`, `pagebox_free_bytes_total`, `pagebox_uncached_total` | `pagebox` and `uncached`. |
 | `pe_pagebox_alloc_total`, `pe_pagebox_alloc_bytes_total`, `pe_pagebox_free_total`, `pe_pagebox_free_bytes_total`, `pe_pagebox_uncached_total`, `pe_pagebox_pool_recycled_total`, `pe_pagebox_pool_recycled_bytes_total`, `pe_pagebox_pool_parked_bytes` | `d3d9.dll`'s share of `pagebox`, `uncached`, the pool's `recycled` and `parked` (peak), carried in the frame payload. The grid adds it to the encoder runtime's, which the `pagebox_*` keys hold alone. |
 | `faults_minor_total`, `faults_major_total` | `faults`; absent when nothing was sampled. |
+| `process_footprint_bytes` | `footprint`: the process's physical footprint (`ri_phys_footprint` of `proc_pid_rusage`, the ledger value `TASK_VM_INFO` reports as `phys_footprint`), sampled at the summary. It is what the Metal HUD shows as app memory and covers the whole process: Wine, the game and both runtimes of this layer. |
 | `comp_<x>_ms`, `_peak_ms`, `comp_<x>_calls_total`, `comp_<x>_failed_total` | The `Compilation` rows: `vs_miss`, `ps_miss`, `emit_vs`, `emit_ps`, `shader_setup`, `metal_library`, `function_lookup`, `shader_cache_persist`, `pso_primary`, `pso_sibling`, `pso_setup`, `pso_build`, `pso_cache_persist`, `depth_state`; and `resolve_remainder`, `pipeline_remainder` with `_ms` and `_peak_ms` only, since they are computed rather than counted. Written in every window, idle or not. |
 | `comp_async_skipped_draws_total`, `comp_async_pending_peak_count`, `comp_async_installs_total`, `comp_async_latency_avg_ms`, `comp_async_latency_peak_ms` | The first `async:` row: skipped draws, most builds in flight, installs, and the average and longest enqueue-to-install latency. |
 | `comp_async_deferred_draws_total`, `comp_async_urgent_waits_total`, `comp_async_urgent_wait_ms`, `comp_async_stolen_total`, `comp_async_misses_total`, `comp_async_miss_ms` | The second `async:` row: deferred draws, urgent waits and their time, stolen jobs, misses and the encoder time they cost. Unlike that row, which prints the wait as a window total and the miss cost per miss, both `_ms` keys are per-frame averages. |

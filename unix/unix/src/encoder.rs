@@ -35,8 +35,8 @@ use mtld3d_core::{
         StoreAction as PassStoreAction, UploadPassTarget,
     },
     perf::{
-        CacheSizes, EncoderPerfState, FrameSummaryContext, OpSub, OpSubDetail, PairShaderId,
-        PairStatsSample,
+        CacheSizes, EncoderPerfState, FrameSummaryContext, MemoryGauges, OpSub, OpSubDetail,
+        PairShaderId, PairStatsSample,
         compilation::{Identity as CompileIdentity, Kind as CompileKind},
         perf_enabled,
     },
@@ -250,13 +250,48 @@ fn decline_texture_upload(job: &UploadView<'_>, reason: &str) {
 /// without our own clone the `MTLBuffer` would wrap freed pages
 /// between "queue for destroy" and the eventual bulk-destroy after
 /// GPU retire. The clone moves into the matching
-/// `PendingResourceRetention.staging_arc` when the slot is parked.
+/// `PendingResourceRetention.staging_arc` when the slot is parked: at a
+/// backing change, at the emitted upload whose answer releases the
+/// level's staging on the PE side, and at the texture's destroy. Until
+/// then the clone also keeps the upload lease that delivered it, and with
+/// it the PE pages, from completing.
+///
+/// A slot a release answer emptied keeps `backing_ptr` and `length` with a
+/// null `handle`. When the next upload wraps that same backing again, the
+/// PE side evidently kept it (a newer upload overtook the answer, as for a
+/// level rewritten every frame), so the new wrapper is marked
+/// `kept_after_release` and later release answers leave it cached: one
+/// extra wrapper per backing, not one per upload.
 #[derive(Clone, Default)]
 pub struct MipStagingBuffer {
     pub handle: MetalHandle<MTLBufferKind>,
     pub backing_ptr: u64,
     pub length: u64,
     pub keepalive: Option<Arc<PageBox>>,
+    /// A release answer already retired a wrapper over this backing, and it came back.
+    pub kept_after_release: bool,
+}
+
+impl MipStagingBuffer {
+    /// A fresh wrapper over `backing_ptr`/`length`, replacing what `prior` held in the slot.
+    const fn created(
+        handle: MetalHandle<MTLBufferKind>,
+        backing_ptr: u64,
+        length: u64,
+        keepalive: Arc<PageBox>,
+        prior: &Self,
+    ) -> Self {
+        Self {
+            handle,
+            backing_ptr,
+            length,
+            keepalive: Some(keepalive),
+            kept_after_release: prior.handle.is_null()
+                && prior.backing_ptr != 0
+                && prior.backing_ptr == backing_ptr
+                && prior.length == length,
+        }
+    }
 }
 
 /// A device-shared `AtomicU64` counter reached across the encoder boundary by its raw address.
@@ -370,6 +405,60 @@ fn drain_source_scratch(
         .map(|(_, snapshot)| snapshot.handle)
         .chain(stretch_scratch.drain().map(|(_, scratch)| scratch.handle))
         .collect()
+}
+
+/// Take the cached wrapper of one staging slot, leaving the slot empty.
+///
+/// `None` when the texture is not cached, the slot is out of range, or no
+/// wrapper was created for it. The caller parks what it gets behind the
+/// submission that may still read it.
+fn take_staging_wrapper(
+    texture_cache: &mut FxHashMap<TextureId, TextureGpuState>,
+    texture_id: TextureId,
+    index: usize,
+) -> Option<MipStagingBuffer> {
+    let slot = texture_cache
+        .get_mut(&texture_id)?
+        .mip_staging_buffers
+        .get_mut(index)?;
+    if slot.handle.is_null() {
+        return None;
+    }
+    Some(core::mem::take(slot))
+}
+
+/// Take a slot's wrapper on an emitted upload that releases the level's staging.
+///
+/// `None`, leaving the slot alone, when there is no wrapper or it is one a
+/// release already retired once over the same backing. The emptied slot
+/// keeps the backing's address and length so [`MipStagingBuffer::created`]
+/// can tell when that backing comes back.
+fn take_released_staging_wrapper(
+    texture_cache: &mut FxHashMap<TextureId, TextureGpuState>,
+    texture_id: TextureId,
+    index: usize,
+) -> Option<MipStagingBuffer> {
+    let slot = texture_cache
+        .get_mut(&texture_id)?
+        .mip_staging_buffers
+        .get_mut(index)?;
+    if slot.handle.is_null() || slot.kept_after_release {
+        return None;
+    }
+    let taken = core::mem::take(slot);
+    slot.backing_ptr = taken.backing_ptr;
+    slot.length = taken.length;
+    Some(taken)
+}
+
+/// Padded staging bytes under every cached per-level wrapper of `texture_cache`.
+fn staging_wrapped_bytes(texture_cache: &FxHashMap<TextureId, TextureGpuState>) -> u64 {
+    texture_cache
+        .values()
+        .flat_map(|state| &state.mip_staging_buffers)
+        .filter(|slot| !slot.handle.is_null())
+        .map(|slot| slot.length)
+        .sum()
 }
 
 pub struct TextureGpuState {
@@ -1354,10 +1443,11 @@ impl RetainedPages {
 ///    (`ensure_vbib_mtl_buffer_impl`): `Buffer` + handle, `page_box = None`.
 ///    The new backing is live in the replacement cache entry; the old
 ///    backing was queued separately at Lock-rename time.
-/// 3. Encoder-side texture-staging mid-frame cache swap
-///    (`get_or_create_staging_buffer`): `Buffer` + handle,
-///    `page_box = None`. The staging `Box` is kept alive via
-///    `blit_retention` (Arc clones).
+/// 3. Encoder-side texture-staging wrapper retirement
+///    (`park_staging_wrapper`), at a mid-frame backing swap in
+///    `get_or_create_staging_buffer` and at an emitted upload that
+///    releases its level's staging: `Buffer` + handle, `page_box = None`,
+///    the slot's keepalive in `staging_arc`.
 /// 4. Visibility-buffer pool over-cap eviction (`submit` path, via
 ///    `VisibilityQueryState::retire_current_buffer`): `Buffer` +
 ///    handle + `page_box`, `seq = release_seq` of the evicted buffer.
@@ -2320,11 +2410,13 @@ impl FrameEncoder {
     /// the payload is recycled only afterwards — reproducing the
     /// pre-split ordering exactly.
     fn log_perf_summary(&mut self, payload: &FramePayload, ctx: &FrameSummaryContext, status: i32) {
-        let caches = self.cache_sizes(payload);
-        let cmd_vec_realloc_bytes = self.pass_state.take_cmd_vec_realloc_bytes();
-        // One getrusage call per 2 s window, only when the summary is
+        // The once-per-window reads (getrusage, the footprint, the Metal
+        // allocated size, the wrapper walk) run only when the summary is
         // both enabled and about to emit; every other frame passes None.
-        let task_faults = (perf_enabled() && self.perf.window_due()).then(|| {
+        let due = perf_enabled() && self.perf.window_due();
+        let caches = self.cache_sizes(payload, due.then(|| self.memory_gauges()));
+        let cmd_vec_realloc_bytes = self.pass_state.take_cmd_vec_realloc_bytes();
+        let task_faults = due.then(|| {
             #[cfg(perf_tracking)]
             self.pagebox_pool.log_diagnostics("encoder");
             crate::handlers::task_faults()
@@ -2344,8 +2436,9 @@ impl FrameEncoder {
     /// Walks every cache `HashMap` exactly once; cheap even at debug
     /// log levels because `HashMap::len()` is O(1). The submitted payload owns
     /// this frame's passes and filled scratch arena; the live encoder already
-    /// holds the clean state for the next frame.
-    fn cache_sizes(&self, payload: &FramePayload) -> CacheSizes {
+    /// holds the clean state for the next frame. `memory` is the
+    /// once-per-window [`Self::memory_gauges`] read, `None` on other frames.
+    fn cache_sizes(&self, payload: &FramePayload, memory: Option<MemoryGauges>) -> CacheSizes {
         CacheSizes {
             textures: self.texture_cache.len(),
             pipelines: self.pipeline_cache.len(),
@@ -2360,6 +2453,19 @@ impl FrameEncoder {
             pending_blit_retention_depth: self.blit_retention.queued(),
             pending_resource_retention_depth: self.pending_resource_retention.len(),
             pagebox_pool_bytes: self.pagebox_pool.pooled_bytes() as u64,
+            memory,
+        }
+    }
+
+    /// The process footprint, the device's allocated size and the cached wrappers' bytes.
+    ///
+    /// Two system queries and a walk of every cached texture's level slots, so
+    /// it runs once per summary window, never per frame.
+    fn memory_gauges(&self) -> MemoryGauges {
+        MemoryGauges {
+            process_footprint: crate::handlers::process_footprint(),
+            metal_allocated: u64::try_from(self.device.currentAllocatedSize()).unwrap_or(u64::MAX),
+            staging_wrapped: staging_wrapped_bytes(&self.texture_cache),
         }
     }
 
@@ -6566,7 +6672,9 @@ impl FrameEncoder {
     /// describe the Box; the cached wrapper is reused until the backing
     /// changes (e.g. the texture's DISCARD/default-contended paths replace
     /// the Arc with a fresh Box), at which point the old wrapper is
-    /// destroyed and a fresh one created.
+    /// destroyed and a fresh one created. An emitted upload that lets the
+    /// PE side release the level's staging retires the wrapper too
+    /// (`emit_texture_upload`), so the cache never pins released pages.
     fn get_or_create_staging_buffer(
         &mut self,
         texture_id: TextureId,
@@ -6610,24 +6718,8 @@ impl FrameEncoder {
         // synchronous destroy would free it under them. The stale
         // slot's `keepalive` Arc travels with the retention entry so
         // the wrapper outlives the backing it was wrapping.
-        if !slot_handle.is_null() {
-            let current_seq = self.current_submit_seq;
-            let stale = {
-                let state = self
-                    .texture_cache
-                    .get_mut(&texture_id)
-                    .expect("texture_id present — checked above");
-                core::mem::take(&mut state.mip_staging_buffers[level])
-            };
-            self.pending_resource_retention
-                .push_back(PendingResourceRetention {
-                    kind: DestroyKind::Buffer,
-                    handle: stale.handle.raw(),
-                    page_box: None,
-                    staging_arc: stale.keepalive,
-                    seq: current_seq,
-                    from_texture: true,
-                });
+        if let Some(stale) = take_staging_wrapper(&mut self.texture_cache, texture_id, level) {
+            self.park_staging_wrapper(stale);
         }
         let desc = BufferCreateDesc {
             backing_ptr,
@@ -6657,13 +6749,29 @@ impl FrameEncoder {
             state.mip_staging_buffers[level] = MipStagingBuffer::default();
             return 0;
         }
-        state.mip_staging_buffers[level] = MipStagingBuffer {
-            handle,
-            backing_ptr,
-            length,
-            keepalive: Some(Arc::clone(keepalive)),
-        };
+        let slot = &mut state.mip_staging_buffers[level];
+        *slot = MipStagingBuffer::created(handle, backing_ptr, length, Arc::clone(keepalive), slot);
+        self.perf.bump_staging_wrapper_create();
         handle.raw()
+    }
+
+    /// Queue a staging wrapper's destroy behind the current submission, keepalive included.
+    ///
+    /// Blits and upload passes emitted earlier in this frame name the
+    /// wrapper, so it is destroyed only once both counters pass this
+    /// submission, and its `keepalive` drops after the destroy, never under
+    /// a wrapper Metal still holds.
+    fn park_staging_wrapper(&mut self, wrapper: MipStagingBuffer) {
+        self.perf.bump_staging_wrapper_retire();
+        self.pending_resource_retention
+            .push_back(PendingResourceRetention {
+                kind: DestroyKind::Buffer,
+                handle: wrapper.handle.raw(),
+                page_box: None,
+                staging_arc: wrapper.keepalive,
+                seq: self.current_submit_seq,
+                from_texture: true,
+            });
     }
 
     /// Execute borrowed upload fields, retaining owned recovery state after emission.
@@ -6781,6 +6889,20 @@ impl FrameEncoder {
             // budget goes back, and a level that was holding its staging for
             // this answer may let it go.
             job.redirty().note_emitted(job.emitted_answer());
+            if job.release_staging() {
+                // The PE side drops the level's staging on this answer, and
+                // a cached wrapper would keep its pages through the upload
+                // lease until the texture is destroyed. A level the PE side
+                // keeps after all gets one fresh wrapper at its next upload,
+                // which later answers leave cached.
+                if let Some(wrapper) = take_released_staging_wrapper(
+                    &mut self.texture_cache,
+                    job.info().texture_id(),
+                    job.staging_index(),
+                ) {
+                    self.park_staging_wrapper(wrapper);
+                }
+            }
         } else {
             decline_texture_upload(job, "the blit path emitted nothing");
         }
@@ -8004,15 +8126,7 @@ impl FrameEncoder {
             // the page-backing it wraps via `bytesNoCopy`.
             for s in state.mip_staging_buffers {
                 if !s.handle.is_null() {
-                    self.pending_resource_retention
-                        .push_back(PendingResourceRetention {
-                            kind: DestroyKind::Buffer,
-                            handle: s.handle.raw(),
-                            page_box: None,
-                            staging_arc: s.keepalive,
-                            seq,
-                            from_texture: true,
-                        });
+                    self.park_staging_wrapper(s);
                 }
             }
             self.retire_texture_views(&state.views, MetalHandle::NULL);

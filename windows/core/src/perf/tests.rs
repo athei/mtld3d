@@ -675,8 +675,10 @@ fn summary_golden_layout() {
         "  padded    0                                                   encoder: blit; source repacked on the CPU into a transient buffer (alloc + memcpy + extra unix_call)\n",
         "  pass      0                                                   encoder: render pass; staging read by a fragment function (16-bit widening, sub-alignment pitch)\n",
         "reorder     1                                                   encoder: MTLTexture rename-at-overlap (upload hit a texture sampled earlier this frame)\n",
-        "destroys    1                                                   encoder: MTLTexture freed + texture-staging MTLBuffer wrappers freed (rename + padded + texture release)\n",
+        "destroys    1                                                   encoder: MTLTexture freed + texture-staging MTLBuffer wrappers freed (rename + padded + staging release + texture release)\n",
         "retention   depth= 0.0  0 KB avg    peak 0 KB                   encoder: blit source staging Arcs (separate from VB/IB retention; MTLTexture handles in destroys)\n",
+        "wrapped     4.0 MB                                              encoder: staging under cached per-level bytesNoCopy wrappers at the summary (pins its guest pages)\n",
+        "  churn     new=3 retired=2         peak/frame new=3            encoder: wrappers created, and queued for destroy (backing change, staging release, texture release)\n",
         "dirtyrect   4                       3 partial, 25% mip          API: AddDirtyRect calls; partial = sub-region narrower than mip (feeds dirty-rect snapshot upload decision)\n",
         "\n",
         "Caches (live sizes at summary emit)\n",
@@ -732,7 +734,9 @@ fn summary_golden_layout() {
         "  realloc   192 KB avg              peak 192 KB                 Vec<Command> potential growth copies on emit_command (excludes initial allocations)\n",
         "pagebox     alloc=17  4.8 MB        free=15  4.6 MB             window totals of PageBox allocs/frees reaching either runtime's allocator (fresh pages fault on first touch)\n",
         "  uncached  1 (5.9%)                peak 1/frame                allocs over 1 MiB: past snmalloc's per-thread budget, so commit in / decommit out every time\n",
-        "faults      minflt=4200  majflt=3   4200.0 min/frame            process-wide getrusage delta this window (all threads); zero-fill faults on fresh pages land here",
+        "faults      minflt=4200  majflt=3   4200.0 min/frame            process-wide getrusage delta this window (all threads); zero-fill faults on fresh pages land here\n",
+        "footprint   3072.0 MB                                           process phys_footprint at the summary, the Metal HUD's app memory (Wine and the game included)\n",
+        "metal alloc 1536.0 MB                                           MTLDevice currentAllocatedSize at the summary (every Metal allocation of the process)",
     );
     assert_eq!(got, want, "perf summary drifted — diff above");
 }
@@ -864,9 +868,12 @@ fn kv_golden_line() {
         " tex_in_place_total=0 tex_uploads_total=2 tex_uploads_raw_total=2",
         " tex_uploads_padded_total=0 tex_uploads_pass_total=0 tex_reorder_total=1",
         " tex_destroy_total=1 tex_retention_peak_count=0 tex_staging_retained_bytes=0",
+        " tex_staging_wrapped_bytes=4194304 tex_wrapper_create_total=3",
+        " tex_wrapper_retire_total=2",
         " tex_dirtyrect_calls_total=4 tex_dirtyrect_partial_total=3",
         " cache_textures_count=48 cache_pipelines_count=12 cache_samplers_count=6",
         " cache_programs_count=8 cache_libs_count=8 cache_depth_states_count=4",
+        " metal_allocated_bytes=1610612736",
         " passes_total=4 commands_total=140 draws_total=100 pipeline_memo_hits_total=97",
         " pipeline_memo_calls_total=100 fan_generated_total=0 draw_unpinned_total=0",
         " up_indexed_total=3 up_oversized_total=2 keys_set_texture_calls_total=0",
@@ -888,8 +895,45 @@ fn kv_golden_line() {
         " pe_pagebox_alloc_total=0 pe_pagebox_alloc_bytes_total=0 pe_pagebox_free_total=0",
         " pe_pagebox_free_bytes_total=0 pe_pagebox_uncached_total=0",
         " faults_minor_total=4200 faults_major_total=3",
+        " process_footprint_bytes=3221225472",
     );
     assert_eq!(got, want, "perf-kv line drifted");
+}
+
+/// A window closed before its memory sample prints `n/a` in the three rows and has no keys.
+///
+/// The grid and the line are otherwise the goldens above, cell for cell: the
+/// `n/a` cells keep the comment column, and nothing else moves.
+#[test]
+fn an_unsampled_window_prints_n_a_and_leaves_the_memory_keys_out() {
+    let w = sample_window();
+    let unsampled = CacheSizes {
+        memory: None,
+        ..sample_caches()
+    };
+    let grid = Summary::render_with_ansi(&w, &unsampled, 2.01, false);
+    let mut want = Summary::render_with_ansi(&w, &sample_caches(), 2.01, false);
+    for (sampled, missing) in [
+        ("\nwrapped     4.0 MB    ", "\nwrapped     n/a       "),
+        ("\nfootprint   3072.0 MB ", "\nfootprint   n/a       "),
+        ("\nmetal alloc 1536.0 MB ", "\nmetal alloc n/a       "),
+    ] {
+        assert!(want.contains(sampled), "the sampled grid has {sampled:?}");
+        want = want.replace(sampled, missing);
+    }
+    assert_eq!(grid, want, "only the three memory cells change");
+
+    let kv = render_kv(&w, &w, &unsampled, 2.01).finish();
+    let mut want = render_kv(&w, &w, &sample_caches(), 2.01).finish();
+    for key in [
+        " tex_staging_wrapped_bytes=4194304",
+        " metal_allocated_bytes=1610612736",
+        " process_footprint_bytes=3221225472",
+    ] {
+        assert!(want.contains(key), "the sampled line has {key:?}");
+        want = want.replace(key, "");
+    }
+    assert_eq!(kv, want, "only the three memory keys are left out");
 }
 
 /// Over two unequal frames, `_ms` averages, `_peak_ms` takes the worst frame and `_total` sums.
@@ -1253,6 +1297,8 @@ fn sample_window() -> PerfWindow {
             texture_blit_padded_uploads: 0,
             texture_expand_uploads: 0,
             texture_gpu_renames: 1,
+            staging_wrapper_creates: 3,
+            staging_wrapper_retires: 2,
             op_cycles: 1_400_000,
             // Decompose op_cyc 1.40M into the nine phases (six draw phases sum
             // 1.35M + three non-draw phases sum 0.03M = 1.38M) so the golden
@@ -1365,6 +1411,11 @@ const fn sample_caches() -> CacheSizes {
         pending_blit_retention_depth: 0,
         pending_resource_retention_depth: 1,
         pagebox_pool_bytes: 1_048_576,
+        memory: Some(MemoryGauges {
+            process_footprint: 3 << 30,
+            metal_allocated: 3 << 29,
+            staging_wrapped: 4 << 20,
+        }),
     }
 }
 

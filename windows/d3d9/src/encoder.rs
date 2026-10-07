@@ -208,6 +208,16 @@ impl EncoderThread {
         mtld3d_core::encoder_failure::record_failure(&self.failure, status, cause)
     }
 
+    /// Padded bytes of the texture staging only this device's upload leases still keep.
+    ///
+    /// Walks every retained page lease under the retirement lock, so it is
+    /// for the address-space watch's samples, not for a frame.
+    pub fn upload_lease_bytes(&self) -> u64 {
+        let mut tally = mtld3d_core::guest_pages::LeaseOnlyPages::default();
+        self.lock_retirement().tally_page_leases(&mut tally);
+        tally.bytes()
+    }
+
     fn lock_retirement(&self) -> MutexGuard<'_, PacketRetirement> {
         self.retirement
             .lock()
