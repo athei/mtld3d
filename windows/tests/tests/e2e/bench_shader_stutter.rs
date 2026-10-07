@@ -181,8 +181,7 @@ fn stutter(name: &str, per_frame: u32, offscreen: u32) {
 
     let stats = clock.stats();
     let work = clock.work_stats();
-    let limit = stats.p50 * 2;
-    let spikes = clock.over(limit);
+    let (spikes, limit) = clock.spikes();
     let shaders = bench.shaders.len();
     let drawn = shaders - verified.missing;
     let settled = settle.stats();
@@ -207,7 +206,7 @@ fn stutter(name: &str, per_frame: u32, offscreen: u32) {
          {settle_frames} settle frames, {span:.2?} in all\n\
          frame time (Present to Present): {row}\n\
          API work (Present return to Present call): {work}\n\
-         frames over 2x the median ({limit:.3} ms): {spikes}\n\
+         frames over 2x the median and 1 ms ({limit:.3} ms): {spikes}\n\
          settle frame time (Present to Present): {settle_row}\n\
          extra time per new shader (measured frames less as many at the settle median): \
          {extra_ms:.3} ms\n\

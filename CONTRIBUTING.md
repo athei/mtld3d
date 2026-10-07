@@ -349,6 +349,18 @@ does not reproduce this; it has still moved single setter rows by about
 placement is a candidate). `RATIO_FLOOR_PER_CALL` in
 `unix/e2e/src/bench/compare.rs` gives the measurements.
 
+An exact count a change moved on purpose fails every comparison against a
+base from before that change, so such a run names it in `ACCEPT`, and only
+that run: the next change to the count fails again. Against v0.11.0 or an
+older base, `cold_start`'s `prewarm.shaders` reads 98 in the base and 92 in
+the candidate. Since #1050 an unlit fixed-function draw no longer keys
+`D3DRS_SPECULARENABLE` into its vertex shader (`build_vs_flags` in
+`windows/core/src/ff_state.rs`), and the benchmark's 24 fixed-function
+combinations toggle specular on 12 unlit ones, so six pairs of them share
+one shader. Nothing goes unprepared: both legs pre-warm 196 pipelines with
+none failed or skipped, and every shader the candidate's cache holds is
+pre-warmed. Such a run takes `ACCEPT=prewarm.shaders`.
+
 `make bench-host` is the one benchmark that needs no Wine: it times DXSO
 parsing and MSL emission on this machine over two synthetic corpora and any
 shader cache `BENCH_CORPUS` names, and writes its metrics into the `host`

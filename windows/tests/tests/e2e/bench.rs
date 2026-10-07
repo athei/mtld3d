@@ -207,6 +207,17 @@ pub const SAMPLE_FLOOR: Duration = Duration::from_micros(5);
 /// median of a few ticks from turning every third-tick call into one.
 pub const SPIKE_FLOOR: Duration = Duration::from_micros(50);
 
+/// The least time a single frame takes to count as a spike, whatever the median.
+///
+/// The frame benchmarks present without waiting for the display, so a frame
+/// that leaves its shader compiles to another thread has a median of tens of
+/// microseconds, and twice that is a preempted thread or a timer, not a
+/// stall anyone sees. A pipeline compile on the API thread takes
+/// milliseconds (one new shader a frame put the frame median at 11 ms on
+/// the v0.11.0 layer), so 1 ms still counts every frame that waited for
+/// one, and it is 6 % of a 60 Hz frame.
+pub const FRAME_SPIKE_FLOOR: Duration = Duration::from_millis(1);
+
 /// The fewest samples whose p99 a comparison reads as a time rather than as context.
 pub const MIN_P99_SAMPLES: usize = 50;
 
@@ -372,9 +383,22 @@ impl FrameClock {
         FrameStats::of(&self.work)
     }
 
-    /// How many timed frames took longer than `limit`.
-    pub fn over(&self, limit: Duration) -> usize {
-        self.times.iter().filter(|&&time| time > limit).count()
+    /// Timed frames slower than twice the median and than [`FRAME_SPIKE_FLOOR`], and that limit.
+    ///
+    /// # Panics
+    /// Panics if no frame was timed.
+    pub fn spikes(&self) -> (usize, Duration) {
+        Self::spikes_of(&self.times)
+    }
+
+    /// The frames of `times` over twice their median and [`FRAME_SPIKE_FLOOR`], and that limit.
+    ///
+    /// # Panics
+    /// Panics if `times` is empty.
+    pub fn spikes_of(times: &[Duration]) -> (usize, Duration) {
+        let limit = (FrameStats::of(times).p50 * 2).max(FRAME_SPIKE_FLOOR);
+        let count = times.iter().filter(|&&time| time > limit).count();
+        (count, limit)
     }
 }
 
