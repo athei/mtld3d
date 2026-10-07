@@ -796,8 +796,8 @@ Audit provenance: every cluster below was re-derived on 2026-07-20 from the
 Wine test source, the raw actual-vs-expected failure messages
 (`MTLD3D_CONFORMANCE_RAW_DIR`), and the implementation — independently
 re-checked before retagging. Current classifications, counted from the
-`Sites:` tokens below on 2026-10-07: 0 `real`, 185 `expected`, 2 `caps`,
-25 `ceiling`, 3 `flaky`, 0 `untriaged`, 215 unique sites in all.
+`Sites:` tokens below on 2026-10-07: 0 `real`, 182 `expected`, 2 `caps`,
+25 `ceiling`, 3 `flaky`, 0 `untriaged`, 212 unique sites in all.
 The audit recorded all 24 Apple-family subtest-legs `crash=0`.
 (2026-10-07: with D3D9Ex implemented the `d3d9ex` subtest creates its
 extended devices and runs every test, adding the same 64 sites, 63

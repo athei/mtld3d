@@ -168,9 +168,6 @@
   d3d9ex.c:3421 count=1
   d3d9ex.c:3425 count=1
   d3d9ex.c:3432 count=1
-  d3d9ex.c:3555 count=2
-  d3d9ex.c:3560 count=1
-  d3d9ex.c:3579 count=1
   d3d9ex.c:3925 count=1
   d3d9ex.c:3926 count=1
   d3d9ex.c:4585 count=1
@@ -338,9 +335,6 @@
   d3d9ex.c:3421 count=1
   d3d9ex.c:3425 count=1
   d3d9ex.c:3432 count=1
-  d3d9ex.c:3555 count=2
-  d3d9ex.c:3560 count=1
-  d3d9ex.c:3579 count=1
   d3d9ex.c:3925 count=1
   d3d9ex.c:3926 count=1
   d3d9ex.c:4585 count=1
@@ -597,9 +591,6 @@
   d3d9ex.c:3421 count=1
   d3d9ex.c:3425 count=1
   d3d9ex.c:3432 count=1
-  d3d9ex.c:3555 count=2
-  d3d9ex.c:3560 count=1
-  d3d9ex.c:3579 count=1
   d3d9ex.c:3925 count=1
   d3d9ex.c:3926 count=1
   d3d9ex.c:4585 count=1
@@ -763,9 +754,6 @@
   d3d9ex.c:3421 count=1
   d3d9ex.c:3425 count=1
   d3d9ex.c:3432 count=1
-  d3d9ex.c:3555 count=2
-  d3d9ex.c:3560 count=1
-  d3d9ex.c:3579 count=1
   d3d9ex.c:3925 count=1
   d3d9ex.c:3926 count=1
   d3d9ex.c:4585 count=1
@@ -929,9 +917,6 @@
   d3d9ex.c:3421 count=1
   d3d9ex.c:3425 count=1
   d3d9ex.c:3432 count=1
-  d3d9ex.c:3555 count=2
-  d3d9ex.c:3560 count=1
-  d3d9ex.c:3579 count=1
   d3d9ex.c:3925 count=1
   d3d9ex.c:3926 count=1
   d3d9ex.c:4585 count=1
@@ -1185,9 +1170,6 @@
   d3d9ex.c:3421 count=1
   d3d9ex.c:3425 count=1
   d3d9ex.c:3432 count=1
-  d3d9ex.c:3555 count=2
-  d3d9ex.c:3560 count=1
-  d3d9ex.c:3579 count=1
   d3d9ex.c:3925 count=1
   d3d9ex.c:3926 count=1
   d3d9ex.c:4585 count=1
