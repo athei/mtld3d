@@ -15,7 +15,7 @@
 //! back the style, visibility included, it had before.
 
 use mtld3d_tests::{
-    Factory, Harness, HarnessConfig, Texture, TexturedVertex, WS_VISIBLE, WindowStyle,
+    Factory, Harness, HarnessConfig, Rect, Texture, TexturedVertex, WS_VISIBLE, WindowStyle,
     assert_pixel_eq, enumerate_display_sizes,
 };
 use mtld3d_types::{
@@ -198,9 +198,8 @@ fn default_pool_resources_keep_their_contents_across_an_extended_reset() {
         D3D_OK
     );
     let lock = readback.lock_rect(D3DLOCK_READONLY);
-    let first = lock.read_bytes(4);
+    let pixel = lock.as_u32(1)[0];
     drop(lock);
-    let pixel = u32::from_le_bytes(first.try_into().expect("four bytes"));
     assert_pixel_eq(pixel, RED, "the render-target texture keeps its fill");
     assert_pixel_eq(
         sample_center(&h, &sampled),
@@ -280,9 +279,8 @@ fn a_held_back_buffer_and_depth_surface_keep_the_old_surfaces_across_an_extended
         D3D_OK
     );
     let lock = readback.lock_rect(D3DLOCK_READONLY);
-    let first = lock.read_bytes(4);
+    let pixel = lock.as_u32(1)[0];
     drop(lock);
-    let pixel = u32::from_le_bytes(first.try_into().expect("four bytes"));
     assert_pixel_eq(
         pixel,
         RED,
@@ -439,13 +437,21 @@ fn assert_held_depth_keeps_its_own_desc(
 }
 
 #[test]
-fn a_held_depth_surface_keeps_its_own_format_samples_and_size_across_an_extended_reset() {
+fn a_held_depth_surface_keeps_its_own_format_across_an_extended_reset_to_another() {
     assert_held_depth_keeps_its_own_desc("another auto depth-stencil format", |pp| {
         pp.auto_depth_stencil_format = D3DFMT_D16;
     });
+}
+
+#[test]
+fn a_held_depth_surface_keeps_its_own_samples_across_an_extended_reset_to_multisampling() {
     assert_held_depth_keeps_its_own_desc("multisampling", |pp| {
         pp.multi_sample_type = D3DMULTISAMPLE_4_SAMPLES;
     });
+}
+
+#[test]
+fn a_held_depth_surface_keeps_its_own_desc_across_an_extended_reset_without_auto_depth() {
     assert_held_depth_keeps_its_own_desc("no auto depth-stencil", |pp| {
         pp.enable_auto_depth_stencil = 0;
         pp.auto_depth_stencil_format = 0;
@@ -556,19 +562,31 @@ fn a_rejected_extended_reset_leaves_the_device_working_and_its_state_untouched()
     assert_pixel_eq(sample_center(&h, &texture), RED, "the device draws on");
 }
 
-#[test]
-fn leaving_fullscreen_keeps_the_window_where_it_is_and_gives_back_its_visibility() {
+/// The window's rect and style around a fullscreen `Reset` and back on a hidden framed window.
+struct FullscreenRoundTrip {
+    windowed_rect: Rect,
+    windowed_style: u32,
+    fullscreen_rect: Rect,
+    left_rect: Rect,
+    left_style: u32,
+}
+
+/// Take a hidden framed window fullscreen through `Reset` and back on a device from `factory`.
+///
+/// `None` when the display lists no 640x480 mode to take.
+fn fullscreen_round_trip(factory: Factory) -> Option<FullscreenRoundTrip> {
     if !enumerate_display_sizes().contains(&(640, 480)) {
-        return;
+        return None;
     }
     let h = Harness::create(&HarnessConfig {
-        factory: Factory::Extended,
+        factory,
         window_style: WindowStyle::Framed,
         ..HarnessConfig::default()
     });
     // Held before the first read of the window's geometry, so no other test's
     // mode-set falls between the reads this test compares.
     h.hold_display_mode();
+    let windowed_rect = h.window_rect();
     let windowed_style = h.window_style();
     assert_eq!(windowed_style & WS_VISIBLE, 0, "starts hidden");
 
@@ -584,14 +602,35 @@ fn leaving_fullscreen_keeps_the_window_where_it_is_and_gives_back_its_visibility
     );
 
     assert_eq!(h.reset(640, 480), D3D_OK, "windowed Reset");
-    assert_eq!(
-        h.window_rect(),
-        fullscreen_rect,
-        "the window keeps the fullscreen rect"
-    );
-    assert_eq!(
-        h.window_style(),
+    Some(FullscreenRoundTrip {
+        windowed_rect,
         windowed_style,
-        "the window gets its own style back, hidden as it was"
+        fullscreen_rect,
+        left_rect: h.window_rect(),
+        left_style: h.window_style(),
+    })
+}
+
+#[test]
+fn leaving_fullscreen_keeps_the_window_where_it_is_and_gives_back_its_visibility() {
+    let Some(trip) = fullscreen_round_trip(Factory::Extended) else {
+        return;
+    };
+    assert_eq!(
+        (trip.left_rect, trip.left_style),
+        (trip.fullscreen_rect, trip.windowed_style),
+        "the window keeps the fullscreen rect and gets its own style back, hidden as it was"
+    );
+}
+
+#[test]
+fn leaving_fullscreen_on_a_plain_device_restores_the_rect_and_keeps_the_window_shown() {
+    let Some(trip) = fullscreen_round_trip(Factory::Plain) else {
+        return;
+    };
+    assert_eq!(
+        (trip.left_rect, trip.left_style),
+        (trip.windowed_rect, trip.windowed_style | WS_VISIBLE),
+        "the window gets its old rect and style back, still shown"
     );
 }

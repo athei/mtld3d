@@ -12,7 +12,7 @@ use mtld3d_types::{
     IDirect3D9ExVtbl, IDirect3DDevice9ExVtbl, LUID,
 };
 
-use super::{Harness, HarnessConfig};
+use super::{Factory, Harness, HarnessConfig};
 use crate::{
     resource::{CubeTexture, IndexBuffer, Surface, Texture, VertexBuffer, VolumeTexture},
     vtbl::deref_vtbl,
@@ -36,7 +36,12 @@ impl<'a> SharedHandle<'a> {
     };
 
     /// A `pSharedHandle` naming `slot`: user memory when it holds a pointer, sharing when null.
-    pub const fn to<T>(slot: &'a mut *mut T) -> Self {
+    ///
+    /// # Safety
+    /// A non-null pointer in `slot` addresses memory the create may read for
+    /// its whole level, packed at the format's row size, and stays valid
+    /// until the create returns.
+    pub const unsafe fn to<T>(slot: &'a mut *mut T) -> Self {
         Self {
             ptr: core::ptr::from_mut(slot).cast::<c_void>(),
             slot: PhantomData,
@@ -86,13 +91,37 @@ pub unsafe fn create_device_ex(
 }
 
 impl Harness {
+    /// The interface's `IDirect3D9Ex` table.
+    ///
+    /// # Panics
+    /// Panics on a harness made by `Direct3DCreate9`, whose interface promises
+    /// only the base table.
     fn factory_ex_vtbl(&self) -> &'static IDirect3D9ExVtbl {
-        // SAFETY: an extended harness's interface carries the extended vtable.
+        assert!(
+            self.factory != Factory::Plain,
+            "the extended calls need an extended harness"
+        );
+        // SAFETY: checked above: the interface came from `Direct3DCreate9Ex`,
+        // which hands out an `IDirect3D9Ex`.
         unsafe { deref_vtbl::<IDirect3D9ExVtbl>(self.d3d9) }
     }
 
+    /// The device's `IDirect3DDevice9Ex` table.
+    ///
+    /// # Panics
+    /// Panics on a harness made by `Direct3DCreate9`, whose device promises
+    /// only the base table, and on one with no device.
     fn dev_ex_vtbl(&self) -> &'static IDirect3DDevice9ExVtbl {
-        // SAFETY: an extended harness's device carries the extended vtable.
+        assert!(
+            self.factory != Factory::Plain,
+            "the extended calls need an extended harness"
+        );
+        assert!(
+            !self.device.is_null(),
+            "the extended device calls need a device"
+        );
+        // SAFETY: checked above: the device was created on an interface from
+        // `Direct3DCreate9Ex`, so it is an `IDirect3DDevice9Ex`.
         unsafe { deref_vtbl::<IDirect3DDevice9ExVtbl>(self.device) }
     }
 

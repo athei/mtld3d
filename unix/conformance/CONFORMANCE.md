@@ -526,8 +526,10 @@ record. A knob, where one makes sense, is named with its default.
   device, plain or extended, on a `WS_MAXIMIZE` window gets a back buffer of
   the window's client rect rather than the size it asked for: the window
   manager sizes a maximized window, as it does a fullscreen one, and a back
-  buffer of another size would be scaled into it at every present. Wine's
-  tests create every window maximized, so a test that asks for a smaller back
+  buffer of another size would be scaled into it at every present. Every
+  window the `d3d9ex.c` helper `create_window` makes is maximized, as are the
+  windows of a few `device.c` tests such as `test_scissor_size` (the
+  `device.c` helper is not), so in those tests a request for a smaller back
   buffer reads the window's size, and a probe at a fixed coordinate reads
   another part of the frame. `device.c/test_scissor_size` carries the plain
   sites, and 26 `d3d9ex.c` sites come from the same rule: `test_user_memory`
@@ -1087,15 +1089,19 @@ latches it until one succeeds. Listed under Deliberately not implemented
 in `docs/STATUS.md`.
 
 4551 is `expected`, and follows from the same no-modeset decision as the
-message sites above. It reads a `WINDOWPOS` the test's wndproc only captures
-once the expected-message walk reaches the fifth entry of
-`mode_change_messages_hidden`, and the walk stops one entry earlier, on the
-`WM_SIZE` the device window never receives: a fullscreen mode-change `Reset`
-resizes the back buffer, not the window, which already covers the monitor
-and keeps covering it, so its client rect is unchanged and user32 sends no
-`WM_SIZE`. 4525/4545 record that stall directly (both raw failures read
-`Expected message 0x5`), which leaves the capture zeroed and the assertion
-comparing against a null HWND. Reaching it needs a real mode-set, so the
+message sites above. Both mode-change `Reset`s expect the device window to be
+moved: `mode_change_messages` and `mode_change_messages_hidden` each start
+with a `WM_WINDOWPOSCHANGING` for it, and 4525 and 4545 read `Expected
+message 0x46`, the walk stopped on that first entry. A fullscreen
+mode-change `Reset` resizes the back buffer, not the window, which already
+covers the monitor and keeps covering it, so the device window gets no
+position message at all. 4551 reads the `WINDOWPOS` the test's wndproc
+captures only when the walk reaches the fifth entry of
+`mode_change_messages_hidden`, the second `WM_WINDOWPOSCHANGING`; with the
+walk stopped on the first entry the capture stays zeroed and the assertion
+compares against a null HWND. `d3d9ex.c` 3203 and 3209 are the same two
+reads in the extended copy of the test. Reaching the capture needs the
+`Reset` to move the window, which here only a real mode-set would do, so the
 line moves only with that decision.
 
 4475/4480 are flaky macdrv window-message timing sites;

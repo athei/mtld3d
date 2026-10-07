@@ -86,7 +86,7 @@ fn locked_rows(surface: &Surface<'_>, row_bytes: usize, rows: usize) -> (i32, Ve
     let lock = surface.lock_rect(D3DLOCK_READONLY);
     let pitch = lock.pitch();
     let stride = usize::try_from(pitch).expect("positive pitch");
-    let bytes = lock.read_bytes((rows - 1) * stride + row_bytes);
+    let bytes = lock.as_u8((rows - 1) * stride + row_bytes).to_vec();
     drop(lock);
     let rows = (0..rows)
         .map(|row| bytes[row * stride..row * stride + row_bytes].to_vec())
@@ -135,13 +135,10 @@ fn user_memory_seeds_a_system_memory_texture_once_at_its_pitch() {
         .map(|i| u8::try_from(i % 33 * 255 / 32).expect("a ramp byte"))
         .collect();
     let mut data = ramp.as_mut_ptr();
-    let (hr, texture) = h.try_create_texture_shared(
-        (33, 33),
-        1,
-        D3DFMT_L8,
-        D3DPOOL_SYSTEMMEM,
-        &SharedHandle::to(&mut data),
-    );
+    // SAFETY: `data` points at `ramp`, a whole 33x33 L8 level, alive across the create.
+    let handle = unsafe { SharedHandle::to(&mut data) };
+    let (hr, texture) =
+        h.try_create_texture_shared((33, 33), 1, D3DFMT_L8, D3DPOOL_SYSTEMMEM, &handle);
     assert_eq!(hr, D3D_OK, "an L8 texture over user memory");
     let texture = texture.expect("a texture");
     ramp.fill(0);
@@ -176,11 +173,14 @@ fn user_memory_seeds_a_system_memory_offscreen_plain_surface() {
     let h = extended();
     let mut texels: Vec<u32> = (0..16u32 * 4).map(|i| 0xFF00_0000 | i).collect();
     let mut data = texels.as_mut_ptr();
+    // SAFETY: `data` points at `texels`, a whole 16x4 A8R8G8B8 surface, alive
+    // across both creates.
+    let handle = unsafe { SharedHandle::to(&mut data) };
     let (hr, plain) = h.try_create_offscreen_plain_surface_shared(
         (16, 4),
         D3DFMT_A8R8G8B8,
         D3DPOOL_SYSTEMMEM,
-        &SharedHandle::to(&mut data),
+        &handle,
     );
     assert_eq!(hr, D3D_OK, "CreateOffscreenPlainSurface over user memory");
     let plain = plain.expect("a surface");
@@ -194,7 +194,7 @@ fn user_memory_seeds_a_system_memory_offscreen_plain_surface() {
         (16, 4),
         D3DFMT_A8R8G8B8,
         D3DPOOL_SYSTEMMEM,
-        &SharedHandle::to(&mut data),
+        &handle,
         0,
     );
     assert_eq!(hr, D3D_OK, "CreateOffscreenPlainSurfaceEx over user memory");
@@ -207,7 +207,9 @@ fn user_memory_outside_its_one_shape_is_refused() {
     let h = extended();
     let mut backing = vec![0u32; 128 * 128];
     let mut data = backing.as_mut_ptr();
-    let handle = &SharedHandle::to(&mut data);
+    // SAFETY: `data` points at `backing`, a 128x128 A8R8G8B8 level, the
+    // largest any create below asks for, alive across all of them.
+    let handle = &unsafe { SharedHandle::to(&mut data) };
     for (size, levels, pool, what) in [
         ((128, 128), 0, D3DPOOL_SYSTEMMEM, "a full chain"),
         ((1, 1), 0, D3DPOOL_SYSTEMMEM, "a full chain of one level"),
@@ -251,84 +253,66 @@ fn user_memory_outside_its_one_shape_is_refused() {
     );
 }
 
+/// A create's answer reduced to its hr and whether it handed out no object.
+fn refusal<T>((hr, object): (i32, Option<T>)) -> (i32, bool) {
+    (hr, object.is_none())
+}
+
+/// Every shared-handle create on `h` in `pool`, each reduced by [`refusal`].
+fn shared_creates(h: &Harness, pool: u32, handle: &SharedHandle<'_>) -> [(i32, bool); 6] {
+    [
+        refusal(h.try_create_texture_shared((16, 16), 1, D3DFMT_A8R8G8B8, pool, handle)),
+        refusal(h.try_create_cube_texture_shared(16, D3DFMT_A8R8G8B8, pool, handle)),
+        refusal(h.try_create_volume_texture_shared([4, 4, 4], D3DFMT_A8R8G8B8, pool, handle)),
+        refusal(h.try_create_vertex_buffer_shared(16, pool, handle)),
+        refusal(h.try_create_index_buffer_shared(16, pool, handle)),
+        refusal(h.try_create_offscreen_plain_surface_shared(
+            (16, 16),
+            D3DFMT_A8R8G8B8,
+            pool,
+            handle,
+        )),
+    ]
+}
+
+/// The two shared-handle creates that take no pool, each reduced by [`refusal`].
+fn shared_target_creates(h: &Harness, handle: &SharedHandle<'_>) -> [(i32, bool); 2] {
+    [
+        refusal(h.try_create_render_target_shared((16, 16), D3DFMT_A8R8G8B8, handle)),
+        refusal(h.try_create_depth_stencil_surface_shared((16, 16), D3DFMT_D24S8, handle)),
+    ]
+}
+
 #[test]
 fn a_plain_device_refuses_every_shared_handle_with_e_notimpl() {
     let h = Harness::new();
     let mut slot: *mut c_void = core::ptr::null_mut();
-    let handle = &SharedHandle::to(&mut slot);
+    // SAFETY: the slot holds null, a request to share, so nothing is read through it.
+    let handle = &unsafe { SharedHandle::to(&mut slot) };
     for pool in [D3DPOOL_DEFAULT, D3DPOOL_SYSTEMMEM] {
-        let (hr, texture) = h.try_create_texture_shared((16, 16), 1, D3DFMT_A8R8G8B8, pool, handle);
-        assert_eq!(
-            (hr, texture.is_none()),
-            (E_NOTIMPL, true),
-            "texture, pool {pool}"
-        );
-        assert_eq!(
-            h.try_create_cube_texture_shared(16, D3DFMT_A8R8G8B8, pool, handle)
-                .0,
-            E_NOTIMPL
-        );
-        assert_eq!(
-            h.try_create_volume_texture_shared([4, 4, 4], D3DFMT_A8R8G8B8, pool, handle)
-                .0,
-            E_NOTIMPL
-        );
-        assert_eq!(
-            h.try_create_vertex_buffer_shared(16, pool, handle).0,
-            E_NOTIMPL
-        );
-        assert_eq!(
-            h.try_create_index_buffer_shared(16, pool, handle).0,
-            E_NOTIMPL
-        );
-        assert_eq!(
-            h.try_create_offscreen_plain_surface_shared((16, 16), D3DFMT_A8R8G8B8, pool, handle)
-                .0,
-            E_NOTIMPL
-        );
+        for (index, answer) in shared_creates(&h, pool, handle).into_iter().enumerate() {
+            assert_eq!(answer, (E_NOTIMPL, true), "create {index}, pool {pool}");
+        }
     }
-    assert_eq!(
-        h.try_create_render_target_shared((16, 16), D3DFMT_A8R8G8B8, handle)
-            .0,
-        E_NOTIMPL
-    );
-    assert_eq!(
-        h.try_create_depth_stencil_surface_shared((16, 16), D3DFMT_D24S8, handle)
-            .0,
-        E_NOTIMPL
-    );
+    for (index, answer) in shared_target_creates(&h, handle).into_iter().enumerate() {
+        assert_eq!(answer, (E_NOTIMPL, true), "target create {index}");
+    }
 }
 
 #[test]
 fn a_shared_default_pool_resource_is_not_available_on_an_extended_device() {
     let h = extended();
     let mut slot: *mut c_void = core::ptr::null_mut();
-    let handle = &SharedHandle::to(&mut slot);
-    let results = [
-        h.try_create_texture_shared((16, 16), 1, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT, handle)
-            .0,
-        h.try_create_cube_texture_shared(16, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT, handle)
-            .0,
-        h.try_create_volume_texture_shared([4, 4, 4], D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT, handle)
-            .0,
-        h.try_create_vertex_buffer_shared(16, D3DPOOL_DEFAULT, handle)
-            .0,
-        h.try_create_index_buffer_shared(16, D3DPOOL_DEFAULT, handle)
-            .0,
-        h.try_create_render_target_shared((16, 16), D3DFMT_A8R8G8B8, handle)
-            .0,
-        h.try_create_depth_stencil_surface_shared((16, 16), D3DFMT_D24S8, handle)
-            .0,
-        h.try_create_offscreen_plain_surface_shared(
-            (16, 16),
-            D3DFMT_A8R8G8B8,
-            D3DPOOL_DEFAULT,
-            handle,
-        )
-        .0,
-    ];
-    for (index, hr) in results.into_iter().enumerate() {
-        assert_eq!(hr, D3DERR_NOTAVAILABLE, "create {index}");
+    // SAFETY: the slot holds null, a request to share, so nothing is read through it.
+    let handle = &unsafe { SharedHandle::to(&mut slot) };
+    for (index, answer) in shared_creates(&h, D3DPOOL_DEFAULT, handle)
+        .into_iter()
+        .enumerate()
+    {
+        assert_eq!(answer, (D3DERR_NOTAVAILABLE, true), "create {index}");
+    }
+    for (index, answer) in shared_target_creates(&h, handle).into_iter().enumerate() {
+        assert_eq!(answer, (D3DERR_NOTAVAILABLE, true), "target create {index}");
     }
 }
 
@@ -494,10 +478,16 @@ fn system_memory_uploads_reach_a_default_dxt_texture_and_a_cube_face() {
     let readback = h.create_offscreen_plain_surface(8, 8, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM);
     assert_eq!(h.get_render_target_data_hr(&target, &readback), D3D_OK);
     let lock = readback.lock_rect(D3DLOCK_READONLY);
-    let first = lock.read_bytes(4);
+    let stride = usize::try_from(lock.pitch()).expect("positive pitch") / 4;
+    let texels = lock.as_u32(7 * stride + 8).to_vec();
     drop(lock);
-    let pixel = u32::from_le_bytes(first.try_into().expect("four bytes"));
-    assert_pixel_eq(pixel, BLUE, "the cube face holds the uploaded texels");
+    for (x, y) in [(0, 0), (7, 0), (0, 7), (7, 7), (4, 4)] {
+        assert_pixel_eq(
+            texels[y * stride + x],
+            BLUE,
+            &format!("the cube face holds the uploaded texel at ({x}, {y})"),
+        );
+    }
 }
 
 #[test]

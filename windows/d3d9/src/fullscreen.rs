@@ -1117,7 +1117,8 @@ fn restore_window(saved: &SavedWindow, kind: LeaveKind) -> WindowPlacement {
     }
 
     // An extended device gives the window back the visibility it had before
-    // fullscreen showed it; a plain device leaves it shown.
+    // fullscreen showed it; a plain device keeps the visibility the window
+    // has now.
     let visible = match kind {
         LeaveKind::Extended => saved.style,
         LeaveKind::Plain => style,

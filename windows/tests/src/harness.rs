@@ -424,6 +424,8 @@ pub struct Harness {
     multi_sample_type: u32,
     /// The entries the interface was created with on top of the suite-wide configuration.
     config_entries: String,
+    /// The factory export the interface came from: whether it and its device are extended.
+    factory: Factory,
 }
 
 /// The factory export `factory` names, called under the environment lock.
@@ -578,6 +580,7 @@ impl Harness {
             present_flags: 0,
             multi_sample_type: 0,
             config_entries: entries.to_owned(),
+            factory,
         }
     }
 
@@ -660,6 +663,7 @@ impl Harness {
             present_flags: cfg.present_flags,
             multi_sample_type: cfg.multi_sample_type,
             config_entries: cfg.config_entries.to_owned(),
+            factory: cfg.factory,
         }
     }
 

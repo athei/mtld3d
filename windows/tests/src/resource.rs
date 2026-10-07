@@ -2183,19 +2183,6 @@ pub struct LockedRect<'a> {
 }
 
 impl LockedRect<'_> {
-    /// Copy the first `len` bytes of the mapped span out.
-    ///
-    /// # Panics
-    /// The caller must ensure `len` bytes fit within the locked region.
-    #[must_use]
-    pub fn read_bytes(&self, len: usize) -> Vec<u8> {
-        let mut out = vec![0u8; len];
-        // SAFETY: `bits` maps at least `len` bytes of the locked region (caller's
-        // contract) and `out` holds `len` bytes.
-        unsafe { core::ptr::copy_nonoverlapping(self.bits.cast::<u8>(), out.as_mut_ptr(), len) };
-        out
-    }
-
     /// Row pitch in bytes.
     #[must_use]
     pub const fn pitch(&self) -> i32 {
