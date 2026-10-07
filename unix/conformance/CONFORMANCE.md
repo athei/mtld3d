@@ -805,9 +805,9 @@ The audit recorded all 24 Apple-family subtest-legs `crash=0`.
 extended devices and runs every test, adding the same 64 sites, 63
 `expected` and 1 `caps`, on each of the six Apple-family legs. The site set
 held over 20 isolated runs per architecture with no crash; that repeat ran on
-the native legs only, not the `+intel` caps legs. The `@mac2` `d3d9ex`
-sections are not recorded yet: they stay empty until the Intel CI dispatch
-records them.)
+the native legs only, not the `+intel` caps legs. The Intel CI dispatch on
+the branch recorded both `@mac2` `d3d9ex` legs with the same 64 sites at the
+same counts, so none of them is `@mac2`-only.)
 (2026-10-05: test_wndproc 4302 moved from `expected` to `ceiling`, and
 4328/4329 joined it, pinned at one on the `i686` and `i686+intel` device
 legs; the cluster says why.)

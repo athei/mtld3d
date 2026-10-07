@@ -14,7 +14,7 @@ use mtld3d_types::{
     IDirect3DQuery9Vtbl, IDirect3DStateBlock9Vtbl, IDirect3DSurface9Vtbl,
     IDirect3DSwapChain9ExVtbl, IDirect3DSwapChain9Vtbl, IDirect3DTexture9Vtbl,
     IDirect3DVertexBuffer9Vtbl, IDirect3DVertexDeclaration9Vtbl, IDirect3DVertexShader9Vtbl,
-    IDirect3DVolume9Vtbl, IDirect3DVolumeTexture9Vtbl,
+    IDirect3DVolume9Vtbl, IDirect3DVolumeTexture9Vtbl, IID_IDIRECT3DSWAPCHAIN9EX,
 };
 
 use crate::{
@@ -160,8 +160,19 @@ impl SwapChain<'_> {
         (hr, same)
     }
 
+    /// The swap chain's `IDirect3DSwapChain9Ex` table.
+    ///
+    /// # Panics
+    /// Panics unless the swap chain answers `IID_IDirect3DSwapChain9Ex` as
+    /// itself, which only an extended device's swap chain does.
     fn ex_vtbl(&self) -> &'static IDirect3DSwapChain9ExVtbl {
-        // SAFETY: an extended device's swap chain carries the extended vtable.
+        assert_eq!(
+            self.query_interface(&IID_IDIRECT3DSWAPCHAIN9EX),
+            (D3D_OK, true),
+            "the extended swap chain calls need an extended swap chain"
+        );
+        // SAFETY: checked above: the object answers `IID_IDirect3DSwapChain9Ex`
+        // as itself, so its vtable is the extended one.
         unsafe { deref_vtbl::<IDirect3DSwapChain9ExVtbl>(self.ptr) }
     }
 
