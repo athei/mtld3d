@@ -8,7 +8,7 @@ use core::{cell::Cell, ffi::c_void};
 use std::{
     fs::{File, OpenOptions, TryLockError},
     path::PathBuf,
-    sync::{Condvar, Mutex, PoisonError, RwLock},
+    sync::{self, Mutex, MutexGuard, PoisonError, RwLock},
     time::{Duration, Instant},
 };
 
@@ -76,18 +76,20 @@ const CONFIG_VAR: &str = "MTLD3D_CONFIG";
 /// their own. So the harness that holds it here also holds the exclusive lock
 /// of [`lock_machine_display_mode`], taken after this process's turn and given
 /// back with it, which makes the take one per machine rather than one per
-/// process while this process's other threads wait on the condvar as before.
-/// It is a static because the resource is machine-wide: the open lock file is
-/// the hold, and no single harness outlives the others to own it.
+/// process. It is a static because the resource is machine-wide: the open
+/// lock file is the hold, and no single harness outlives the others to own
+/// it.
 ///
-/// The hold under a mutex plus a condvar rather than a held `MutexGuard`,
+/// The hold is a field under the mutex rather than a held `MutexGuard`,
 /// because the holder is a harness field and a guard there would put a
-/// significant drop into every test's `Harness`.
+/// significant drop into every test's `Harness`. A thread waiting for its
+/// turn never blocks on the mutex or on the file lock: it owns the window of
+/// its harness, so it answers the messages sent to it between looks
+/// ([`MODESET_POLL`]).
 static MODESET: Mutex<ModeSet> = Mutex::new(ModeSet {
     lock: None,
     released: None,
 });
-static MODESET_RELEASED: Condvar = Condvar::new();
 
 /// Whether a harness of this process holds the display mode, and when it was last given back.
 struct ModeSet {
@@ -99,14 +101,26 @@ struct ModeSet {
 
 /// How long a process waits after giving the display mode back before it asks again.
 ///
-/// Wine retries a lock another wineserver holds every 100 ms, while the
-/// process that just gave it back would ask again within the same
-/// millisecond, so without a pause one process would keep the mode for its
-/// whole run of display-mode tests and another run's tests would wait for
-/// all of them. A pause longer than one retry lets a waiting process in
-/// first, so concurrent runs alternate test by test. Uncontended, it costs
-/// one pause per back-to-back take.
+/// A process waiting for the mode asks again every [`MODESET_POLL`], and one
+/// whose harness takes the machine-wide lock through Wine's blocking wait
+/// every 100 ms, which is how often Wine retries a lock another wineserver
+/// holds. The process that just gave the mode back would ask again within
+/// the same millisecond, so without a pause one process would keep the mode
+/// for its whole run of display-mode tests and another run's tests would
+/// wait for all of them. A pause longer than either interval lets a waiting
+/// process in first, so concurrent runs alternate test by test.
+/// Uncontended, it costs one pause per back-to-back take.
 const MODESET_HANDOFF_PAUSE: Duration = Duration::from_millis(150);
+
+/// How long a thread waiting for the display mode waits for a sent message before it looks again.
+///
+/// A mode change sends `WM_DISPLAYCHANGE` to every top-level window of the
+/// wineserver and waits up to two seconds for each to answer, and the thread
+/// waiting for its turn owns a window when its test asks for the mode after
+/// creating its device. So it waits on its message queue, answering what other
+/// threads send it, and looks at the mode after each message and at least
+/// this often. Each look is one `try_lock`, of the mutex or of the file.
+const MODESET_POLL: Duration = Duration::from_millis(10);
 
 /// The directory of the machine-wide display-mode lock, relative to the user's home.
 const MODESET_LOCK_DIR: &str = r"Library\Caches\mtld3d";
@@ -116,31 +130,46 @@ const MODESET_LOCK_FILE: &str = "e2e-display-mode.lock";
 /// Take the session's display mode, waiting for the harness or process that holds it.
 ///
 /// The machine-wide lock is taken under the mutex, so this process asks for
-/// it on one thread at a time and never holds it twice. A panic between this
-/// take and the harness that owns it ends the process through the failure
-/// hook every harness installs first, and the exit gives the lock back.
+/// it on one thread at a time and never holds it twice. Every wait here
+/// answers the messages other threads send to this thread's windows. A panic
+/// between this take and the harness that owns it ends the process through
+/// the failure hook every harness installs first, and the exit gives the lock
+/// back.
 fn take_display_mode() {
-    let mut mode = MODESET.lock().unwrap_or_else(PoisonError::into_inner);
-    while mode.lock.is_some() {
-        mode = MODESET_RELEASED
-            .wait(mode)
-            .unwrap_or_else(PoisonError::into_inner);
-    }
+    let mut mode = wait_for_this_process_turn();
     if let Some(released) = mode.released {
-        std::thread::sleep(MODESET_HANDOFF_PAUSE.saturating_sub(released.elapsed()));
+        win32::answer_sent_messages_for(MODESET_HANDOFF_PAUSE.saturating_sub(released.elapsed()));
     }
     mode.lock = Some(lock_machine_display_mode());
 }
 
-/// Give the session's display mode back and wake one harness waiting for it.
+/// This process's display-mode record, once no other thread uses it and no harness holds the mode.
+///
+/// Looks with `try_lock` and waits between looks answering sent messages,
+/// so a thread that owns a window never sits in the mutex while another
+/// thread of the process waits for the machine-wide lock under it.
+fn wait_for_this_process_turn() -> MutexGuard<'static, ModeSet> {
+    loop {
+        let mode = match MODESET.try_lock() {
+            Ok(mode) => Some(mode),
+            Err(sync::TryLockError::Poisoned(poisoned)) => Some(poisoned.into_inner()),
+            Err(sync::TryLockError::WouldBlock) => None,
+        };
+        if let Some(mode) = mode.filter(|mode| mode.lock.is_none()) {
+            return mode;
+        }
+        win32::wait_answering_sent_messages(MODESET_POLL);
+    }
+}
+
+/// Give the session's display mode back.
 ///
 /// Dropping the lock file closes it, which releases the machine-wide lock.
+/// The threads waiting for the mode see it free at their next look.
 fn release_display_mode() {
     let mut mode = MODESET.lock().unwrap_or_else(PoisonError::into_inner);
     mode.lock = None;
     mode.released = Some(Instant::now());
-    drop(mode);
-    MODESET_RELEASED.notify_one();
 }
 
 /// Lock the machine-wide display-mode file exclusively, waiting for the process that holds it.
@@ -149,13 +178,15 @@ fn release_display_mode() {
 /// the user reaches at the same path whatever its prefix, so test processes
 /// of all checkouts and both architectures meet on it. `LockFileEx` is the
 /// lock: Wine's server mirrors it as a POSIX record lock on the host file, so
-/// it excludes the processes of another wineserver too, and waits for them by
-/// retrying. It ends with the handle: when the harness gives the mode back,
-/// and when the process exits or is killed, since the wineserver closes a dead
-/// process's handles and the kernel drops a dead server's locks. A wait for
-/// another process is announced on stderr, which the runner keeps only for a
-/// process that ends with tests unaccounted for, so a timed-out test's kept
-/// stderr says whether it was waiting for the mode.
+/// it excludes the processes of another wineserver too. It ends with the
+/// handle: when the harness gives the mode back, and when the process exits
+/// or is killed, since the wineserver closes a dead process's handles and the
+/// kernel drops a dead server's locks. The wait for another process tries the
+/// lock every [`MODESET_POLL`] and answers sent messages between tries,
+/// since Wine's own blocking wait answers none. A wait for another process is
+/// announced on stderr, which the runner keeps only for a process that ends
+/// with tests unaccounted for, so a timed-out test's kept stderr says whether
+/// it was waiting for the mode.
 ///
 /// # Panics
 ///
@@ -184,19 +215,23 @@ fn lock_machine_display_mode() -> File {
         .truncate(false)
         .open(&path)
         .unwrap_or_else(|e| panic!("open the display-mode lock {}: {e}", path.display()));
-    match file.try_lock() {
-        Ok(()) => {}
-        Err(TryLockError::WouldBlock) => {
-            eprintln!(
-                "[e2e] display mode held by another process; waiting on {}",
-                path.display()
-            );
-            file.lock()
-                .unwrap_or_else(|e| panic!("lock the display mode {}: {e}", path.display()));
+    let mut announced = false;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return file,
+            Err(TryLockError::WouldBlock) => {
+                if !announced {
+                    eprintln!(
+                        "[e2e] display mode held by another process; waiting on {}",
+                        path.display()
+                    );
+                    announced = true;
+                }
+                win32::wait_answering_sent_messages(MODESET_POLL);
+            }
+            Err(TryLockError::Error(e)) => panic!("lock the display mode {}: {e}", path.display()),
         }
-        Err(TryLockError::Error(e)) => panic!("lock the display mode {}: {e}", path.display()),
     }
-    file
 }
 
 bitflags::bitflags! {
