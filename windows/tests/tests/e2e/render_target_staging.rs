@@ -4,15 +4,17 @@
 //! path reads the level back from the GPU first, so what the CPU sees is what
 //! the passes drew. The residency check reads the address-space watch's debug
 //! line in a process of its own; the rest read pixels through `LockRect`,
-//! `GetDC`, `GetRenderTargetData` and a sampling draw.
+//! `GetDC`, `GetRenderTargetData` and a sampling draw. A level a pass draws
+//! into again is read back again at the next CPU read, unless it holds a CPU
+//! write no upload has carried yet.
 
-use mtld3d_tests::{Harness, Texture};
+use mtld3d_tests::{Harness, Surface, Texture};
 use mtld3d_types::{
-    D3D_OK, D3DFMT_A8R8G8B8, D3DFVF_DIFFUSE, D3DFVF_TEX1, D3DFVF_XYZ, D3DLOCK_READONLY,
-    D3DPOOL_DEFAULT, D3DPOOL_SYSTEMMEM, D3DPT_TRIANGLELIST, D3DRECT, D3DRS_LIGHTING,
-    D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_MAGFILTER, D3DSAMP_MINFILTER, D3DTA_TEXTURE,
-    D3DTADDRESS_CLAMP, D3DTEXF_POINT, D3DTOP_SELECTARG1, D3DTSS_ALPHAARG1, D3DTSS_ALPHAOP,
-    D3DTSS_COLORARG1, D3DTSS_COLOROP, D3DUSAGE_RENDERTARGET,
+    D3D_OK, D3DERR_INVALIDCALL, D3DFMT_A8R8G8B8, D3DFVF_DIFFUSE, D3DFVF_TEX1, D3DFVF_XYZ,
+    D3DLOCK_READONLY, D3DPOOL_DEFAULT, D3DPOOL_SYSTEMMEM, D3DPT_TRIANGLELIST, D3DRECT,
+    D3DRS_LIGHTING, D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_MAGFILTER, D3DSAMP_MINFILTER,
+    D3DTA_TEXTURE, D3DTADDRESS_CLAMP, D3DTEXF_POINT, D3DTOP_SELECTARG1, D3DTSS_ALPHAARG1,
+    D3DTSS_ALPHAOP, D3DTSS_COLORARG1, D3DTSS_COLOROP, D3DUSAGE_RENDERTARGET,
 };
 
 use super::{
@@ -251,6 +253,103 @@ fn get_dc_on_a_drawn_render_target_texture_reads_the_drawn_pixels() {
     assert_eq!(
         pixels[0], GREEN,
         "the target still holds the draw after ReleaseDC"
+    );
+}
+
+/// A second `LockRect` after more draws returns the new pixels.
+///
+/// The first lock leaves the level with staging of its own; the draws after
+/// it write the Metal texture alone, so the second lock reads the level back
+/// again rather than handing out what the first one read.
+#[test]
+fn a_lock_after_more_draws_reads_the_new_pixels() {
+    let h = Harness::new();
+    let back = h.render_target(0);
+    let target = create_target(&h, SIZE, SIZE);
+    let level = target.surface_level(0);
+    for color in [GREEN, RED, GREEN] {
+        draw_into(&h, &level, &back, color);
+        let texels = locked_texels(&target, SIZE, SIZE);
+        assert_eq!(
+            texels[(SIZE * SIZE / 2 + SIZE / 2) as usize],
+            color,
+            "the lock after the {color:#010x} draw reads it"
+        );
+    }
+}
+
+/// A lock after an `UpdateSurface` with no draw between them reads the update.
+///
+/// The update lands in the staging and uploads at the next bind, so the
+/// level's Metal texture still holds the draw from before it. The lock reads
+/// the staging, which holds the newer pixels, rather than reading the older
+/// ones back over them. The bind after it uploads the update as it would have.
+#[test]
+fn a_lock_after_update_surface_before_any_draw_reads_the_update() {
+    let h = Harness::new();
+    let back = h.render_target(0);
+    let target = create_target(&h, SIZE, SIZE);
+    let level = target.surface_level(0);
+    draw_into(&h, &level, &back, RED);
+    assert_eq!(
+        locked_texels(&target, SIZE, SIZE)[0],
+        RED,
+        "the lock before the update reads the draw"
+    );
+
+    let source = h.create_offscreen_plain_surface(SIZE, SIZE, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM);
+    source
+        .lock_rect(0)
+        .write_u32(&[GREEN; (SIZE * SIZE) as usize]);
+    let whole = D3DRECT {
+        x1: 0,
+        y1: 0,
+        x2: SIZE.cast_signed(),
+        y2: SIZE.cast_signed(),
+    };
+    assert_eq!(
+        h.update_surface_region_hr(&source, &whole, &level, (0, 0)),
+        D3D_OK,
+        "UpdateSurface of the whole level"
+    );
+    let texels = locked_texels(&target, SIZE, SIZE);
+    assert!(
+        texels.iter().all(|&texel| texel == GREEN),
+        "the lock after the update reads the update"
+    );
+
+    sample_to_back_buffer(&h, &target);
+    let (width, height) = h.dims();
+    assert_eq!(
+        h.read_pixel(width / 2, height / 2),
+        GREEN,
+        "the bind after the lock uploads the update"
+    );
+}
+
+/// `LockRect` on a render-target texture level's surface is refused, as D3D9 refuses it.
+///
+/// Only the texture's own `LockRect` maps such a level, a kept divergence;
+/// the surface's entry point keeps D3D9's answer.
+#[test]
+fn a_render_target_texture_level_surface_refuses_lock_rect() {
+    let h = Harness::new();
+    let target = create_target(&h, SIZE, SIZE);
+    let (hr, _) = target.surface_level(0).lock_rect_probe(D3DLOCK_READONLY);
+    assert_eq!(
+        hr, D3DERR_INVALIDCALL,
+        "LockRect on the level's surface is refused"
+    );
+}
+
+/// Bind `target` as render target 0, fill it with `color` by a draw, and restore `back`.
+fn draw_into(h: &Harness, target: &Surface<'_>, back: &Surface<'_>, color: u32) {
+    assert_eq!(h.set_render_target(0, target), D3D_OK, "bind the target");
+    draw_fill(h, color);
+    assert_eq!(
+        h.set_render_target(0, back),
+        D3D_OK,
+        "restore the back buffer"
     );
 }
 

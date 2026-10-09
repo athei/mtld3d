@@ -220,8 +220,9 @@ record. A knob, where one makes sense, is named with its default.
   level's staging, released once its upload retires, is re-created, and a
   partial lock after that release leaves the pixels outside its rect out of
   step with the GPU copy (warned once per texture). A render-target texture
-  holds no staging until a CPU path first needs a level, and that first use
-  reads the level back from the GPU. No knob.
+  holds no staging until a CPU path first needs a level, and every lock of a
+  level reads it back from the GPU first, unless the level holds a CPU write
+  no upload has carried yet. No knob.
 - **`GetData(D3DGETDATA_FLUSH)` can answer a pending occlusion query at once**
   instead of waiting for the GPU. Off by default. This saves API-thread time
   only for a title verified to use the poll as a submission throttle, without

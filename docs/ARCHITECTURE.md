@@ -284,7 +284,10 @@ A default-pool render-target texture keeps no staging at rest: its levels are
 released at creation and claimed for the GPU, and the first CPU path that needs
 a level (a `LockRect`, a `GetDC`, a CPU copy into or out of it) reads it back
 into fresh pages, which the level then keeps (`staging_lazy_class` in
-`windows/core/src/texture_staging.rs`).
+`windows/core/src/texture_staging.rs`). The passes that draw into a render
+target write only its Metal texture, so every later CPU read of a level (a
+`LockRect`, a `GetDC`) reads it back again, unless the level holds a CPU write
+no upload has carried yet, whose staging is the newer copy.
 
 The encoder keeps one cached `bytesNoCopy` wrapper per staging level, so the
 uploads of a level reuse one `MTLBuffer`. The wrapper's keepalive is the native

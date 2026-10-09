@@ -590,6 +590,38 @@ impl TextureInner {
         self.level_authority.gpu_wrote(face, level);
     }
 
+    /// Claim a render-target subresource for the GPU ahead of a CPU read of it.
+    ///
+    /// The passes that draw into a render target write its Metal texture and
+    /// never its staging, and nothing records which pass drew which target, so
+    /// every CPU read of one reads it back. A subresource holding a CPU write no
+    /// upload has carried yet keeps its staging as the answer: that copy is the
+    /// newer one, and a read back would put the pixels from before the write
+    /// over it.
+    fn claim_render_target_for_cpu_read(&mut self, face: u32, level: usize) {
+        if self.d3d_usage & mtld3d_types::D3DUSAGE_RENDERTARGET == 0
+            || self.cpu_write_pending(face, level)
+        {
+            return;
+        }
+        self.level_authority.gpu_wrote(face, level);
+    }
+
+    /// Whether `(face, level)` holds a CPU write its next upload has not carried yet.
+    fn cpu_write_pending(&self, face: u32, level: usize) -> bool {
+        if level >= u32::BITS as usize {
+            return false;
+        }
+        let bit = 1u32 << level;
+        self.cube
+            .as_deref()
+            .map_or(self.dirty_mask & bit != 0, |cube| {
+                cube.dirty_masks
+                    .get(face as usize)
+                    .is_some_and(|mask| mask & bit != 0)
+            })
+    }
+
     /// Prepare a subresource's staging before a map or CPU write.
     ///
     /// Every path that gives the staging that role goes through here first: a
@@ -962,6 +994,7 @@ impl TextureInner {
     /// to a face. A successful read clears the GPU claim without marking the
     /// staging dirty, while a failed required read leaves GPU authority for retry.
     pub fn materialize_subresource_for_cpu_read(&mut self, face: u32, level: usize) -> bool {
+        self.claim_render_target_for_cpu_read(face, level);
         self.move_subresource_to_staging(face, level, false)
             && (self.cube.is_some() || self.ensure_staging_for_lock(level, 0))
     }
@@ -4538,7 +4571,9 @@ extern "system" fn texture_lock_rect(
     // rename the box (a preserve then copies the fresh bytes). A surviving
     // `D3DLOCK_DISCARD` is a whole-level one and promises a whole-level
     // overwrite, so it skips the stall and the claim goes with it: the staging
-    // this Lock hands out is what the level holds next.
+    // this Lock hands out is what the level holds next. A render-target level
+    // is the GPU's after any pass, so it is claimed here first.
+    ti.claim_render_target_for_cpu_read(0, level_u);
     if !ti.move_subresource_to_staging(0, level_u, flags & D3DLOCK_DISCARD != 0) {
         return D3DERR_INVALIDCALL;
     }
