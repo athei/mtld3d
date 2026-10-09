@@ -653,7 +653,7 @@ fn a_mode_set_outcome_names_what_was_set_and_what_it_replaced() {
     );
     assert_eq!(
         ModeSetOutcome::Refused(HD_60).to_string(),
-        "display mode 1280x720@60Hz refused, the window covers the monitor instead"
+        "display mode 1280x720@60Hz refused"
     );
     assert_eq!(ModeSetOutcome::NoMode.to_string(), "no display mode set");
 }

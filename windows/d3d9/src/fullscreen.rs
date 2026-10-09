@@ -61,12 +61,13 @@
 //! secondary monitor is covered by the wrong rect. Matching the window's
 //! current monitor is a follow-up.
 
-use core::{ffi::c_void, fmt};
+use core::ffi::c_void;
 use std::sync::{LazyLock, Mutex};
 
 use log::{Level, debug, info, log, warn};
 use mtld3d_core::{
     display_mode::{ModeRequest, ModeSetOutcome, RegistryRestore, mode_set_attempts},
+    fullscreen_log::{LeaveReason, RectLabel, SessionMode, WindowPlacement},
     fullscreen_resize::REASSERTS_LOGGED_AT_INFO,
 };
 use rustc_hash::FxHashMap;
@@ -625,6 +626,11 @@ impl Rect {
     pub const fn height(&self) -> i32 {
         self.bottom.saturating_sub(self.top)
     }
+
+    /// The rect as a log line names it.
+    const fn label(&self) -> RectLabel {
+        RectLabel::new(self.left, self.top, self.right, self.bottom)
+    }
 }
 
 // ── Re-entrancy latch ──
@@ -728,26 +734,6 @@ impl SavedWindow {
     /// The window this state was captured from.
     pub const fn window(&self) -> *mut c_void {
         self.hwnd
-    }
-}
-
-/// Why a fullscreen session ends, as the line [`leave`] writes names it.
-pub enum LeaveReason {
-    /// A windowed `Reset`.
-    WindowedReset,
-    /// The device's final release.
-    Release,
-    /// A fullscreen `CreateDevice` that failed after taking the window over.
-    FailedCreate,
-}
-
-impl fmt::Display for LeaveReason {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::WindowedReset => "windowed Reset",
-            Self::Release => "device release",
-            Self::FailedCreate => "failed CreateDevice",
-        })
     }
 }
 
@@ -860,13 +846,16 @@ pub fn reactivate(saved: &mut SavedWindow) {
 /// `WM_ACTIVATEAPP FALSE`. The window stays where it is: native D3D9 neither
 /// minimises it nor loses the device, and [`reactivate`] re-covers the
 /// monitor when the app comes back.
-pub fn deactivate(saved: &SavedWindow) {
+///
+/// It takes the window rather than the session: the restore broadcasts
+/// `WM_DISPLAYCHANGE` synchronously, which can re-enter the subclass and
+/// borrow the device mutably, so no borrow of the device may span it.
+pub fn deactivate(hwnd: *mut c_void) {
     let restore = restore_registry_mode();
     log!(
         target: LOG_TARGET,
         if restore.failed() { Level::Warn } else { Level::Info },
-        "app deactivated, fullscreen window {:p} left in place: {restore}",
-        saved.hwnd,
+        "app deactivated, fullscreen window {hwnd:p} left in place: {restore}",
     );
 }
 
@@ -895,14 +884,14 @@ pub fn reassert_cover(saved: &mut SavedWindow, incoming: (u32, u32)) {
     let monitor = (rect.width().cast_unsigned(), rect.height().cast_unsigned());
     let action = saved.guard.decide(incoming, monitor);
     let reasserts = saved.guard.reasserts();
-    let (hwnd, mode) = (saved.hwnd, SessionMode(saved.mode));
+    let (hwnd, mode) = (saved.hwnd, SessionMode::new(saved.mode));
     match action {
         ExternalResizeAction::Covered => {
             debug!(
                 target: LOG_TARGET,
                 "external resize of fullscreen window {hwnd:p} to {}x{} covers the monitor rect \
                  {}; left as it is",
-                incoming.0, incoming.1, RectLabel(rect),
+                incoming.0, incoming.1, rect.label(),
             );
         }
         ExternalResizeAction::Reassert => {
@@ -919,7 +908,7 @@ pub fn reassert_cover(saved: &mut SavedWindow, incoming: (u32, u32)) {
                 level,
                 "external resize of fullscreen window {hwnd:p} to {}x{} against the monitor rect \
                  {} ({mode}); re-assert {reasserts} of this session: {placement}{}",
-                incoming.0, incoming.1, RectLabel(rect),
+                incoming.0, incoming.1, rect.label(),
                 if reasserts == REASSERTS_LOGGED_AT_INFO {
                     "; later re-asserts of this session log at debug"
                 } else {
@@ -934,7 +923,7 @@ pub fn reassert_cover(saved: &mut SavedWindow, incoming: (u32, u32)) {
                  against the monitor rect {} ({mode}) after {reasserts} re-assert(s) this \
                  session; leaving it, the back buffer keeps its size and present scales the \
                  frame",
-                incoming.0, incoming.1, RectLabel(rect),
+                incoming.0, incoming.1, rect.label(),
             );
         }
     }
@@ -994,7 +983,7 @@ fn apply_fullscreen_window(hwnd: *mut c_void, saved: &SavedWindow) -> WindowPlac
         "fullscreen window {}x{} at ({}, {}), style {style:#010x}/{exstyle:#010x}",
         rect.width(), rect.height(), rect.left, rect.top,
     );
-    WindowPlacement::Placed(rect)
+    WindowPlacement::Placed(rect.label())
 }
 
 /// Leave fullscreen provisionally, restoring its current state if `accept` rejects it.
@@ -1023,22 +1012,19 @@ pub fn try_leave(saved: &SavedWindow, accept: impl FnOnce() -> bool) -> bool {
     // Covers the display-change broadcasts as well as both window moves:
     // the provisional geometry must never trigger a device auto-resize.
     let _driving = DrivingGuard::new(saved.hwnd);
-    leave(saved, &LeaveReason::WindowedReset);
+    leave(saved, &LeaveReason::ProvisionalWindowedReset);
     if accept() {
         return true;
     }
     let result = change_display_settings(Some(&mut mode), CDS_FULLSCREEN);
-    if result == DISP_CHANGE_SUCCESSFUL {
-        info!(
-            target: LOG_TARGET,
-            "windowed Reset rejected, fullscreen kept on window {:p}: display mode {}x{} and \
-             the window put back",
-            saved.hwnd, mode.pels_width, mode.pels_height,
-        );
+    // A window with no snapshot was the app's or was already destroyed, and
+    // is left as it is.
+    let untouched = if saved.manage_window {
+        WindowPlacement::Gone
     } else {
-        warn!(target: LOG_TARGET, "failed to restore the display after a rejected Reset (ret={result})");
-    }
-    if let Some(rect) = rect {
+        WindowPlacement::AppOwned
+    };
+    let placement = rect.map_or(untouched, |rect| {
         set_window_long(saved.hwnd, GWL_STYLE, style);
         set_window_long(saved.hwnd, GWL_EXSTYLE, exstyle);
         set_window_pos(
@@ -1046,6 +1032,23 @@ pub fn try_leave(saved: &SavedWindow, accept: impl FnOnce() -> bool) -> bool {
             core::ptr::null_mut(),
             rect,
             SWP_FRAMECHANGED | SWP_NOACTIVATE | SWP_NOZORDER,
+        );
+        WindowPlacement::Placed(rect.label())
+    });
+    let (width, height) = (mode.pels_width, mode.pels_height);
+    if result == DISP_CHANGE_SUCCESSFUL {
+        info!(
+            target: LOG_TARGET,
+            "windowed Reset rejected, fullscreen kept on window {:p}: display mode \
+             {width}x{height} put back; {placement}",
+            saved.hwnd,
+        );
+    } else {
+        warn!(
+            target: LOG_TARGET,
+            "windowed Reset rejected, fullscreen kept on window {:p}: putting display mode \
+             {width}x{height} back failed (ret={result}); {placement}",
+            saved.hwnd,
         );
     }
     false
@@ -1122,60 +1125,6 @@ fn restore_window(saved: &SavedWindow) -> WindowPlacement {
     if unknown_rect {
         WindowPlacement::Unmoved
     } else {
-        WindowPlacement::Placed(saved.rect)
-    }
-}
-
-/// Where a fullscreen transition put the device window, as its log line names it.
-enum WindowPlacement {
-    /// The window was moved to this rect.
-    Placed(Rect),
-    /// The monitor rect could not be read, so the window was not moved.
-    NoMonitor,
-    /// `D3DCREATE_NOWINDOWCHANGES`: the window is the app's and was not touched.
-    AppOwned,
-    /// The window no longer exists.
-    Gone,
-    /// The pre-fullscreen rect was never read, so the window stayed where it is.
-    Unmoved,
-}
-
-impl fmt::Display for WindowPlacement {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Placed(rect) => write!(f, "window {}", RectLabel(*rect)),
-            Self::NoMonitor => f.write_str("window not moved, the monitor rect is unreadable"),
-            Self::AppOwned => f.write_str("window left to the app (D3DCREATE_NOWINDOWCHANGES)"),
-            Self::Gone => f.write_str("window already destroyed"),
-            Self::Unmoved => f.write_str("window not moved, its windowed rect was never read"),
-        }
-    }
-}
-
-/// A rect as a log line names it: `1728x1117 at (0, 0)`.
-struct RectLabel(Rect);
-
-impl fmt::Display for RectLabel {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "{}x{} at ({}, {})",
-            self.0.width(),
-            self.0.height(),
-            self.0.left,
-            self.0.top
-        )
-    }
-}
-
-/// The display mode a fullscreen session holds, as a log line names it.
-struct SessionMode(Option<ModeRequest>);
-
-impl fmt::Display for SessionMode {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self.0 {
-            Some(mode) => write!(f, "session display mode {mode}"),
-            None => f.write_str("no session display mode"),
-        }
+        WindowPlacement::Placed(saved.rect.label())
     }
 }

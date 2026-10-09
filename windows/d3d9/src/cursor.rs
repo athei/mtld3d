@@ -1561,13 +1561,17 @@ extern "system" fn cursor_wnd_proc(hwnd: *mut c_void, msg: u32, wp: usize, lp: i
         // pump (see `WM_APP_REACTIVATE_FULLSCREEN`). `WM_ACTIVATEAPP` reaches
         // every top-level window of the thread, so the subclassed device
         // window sees it even when the focus window was the active one.
+        // The deactivation takes the window, not the device: its restore
+        // broadcasts `WM_DISPLAYCHANGE` synchronously, which can re-enter
+        // this procedure and borrow the device mutably.
         // SAFETY: see WM_SETCURSOR branch — `dev_ptr` is live for the
         // lifetime of the subclass.
-        let is_fullscreen = unsafe { (*dev_ptr).fullscreen_window().is_some() };
-        if is_fullscreen && wp == 0 {
-            // SAFETY: see WM_SETCURSOR branch.
-            unsafe { (*dev_ptr).deactivate_fullscreen() };
-        } else if is_fullscreen {
+        let fullscreen = unsafe { (*dev_ptr).fullscreen_window() };
+        if let Some(window) = fullscreen
+            && wp == 0
+        {
+            crate::fullscreen::deactivate(window);
+        } else if fullscreen.is_some() {
             debug!(
                 target: LOG_TARGET,
                 "wndproc WM_ACTIVATEAPP TRUE on a fullscreen device; re-assert posted tid={}",

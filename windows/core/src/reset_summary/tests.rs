@@ -4,14 +4,17 @@
 //! windowed/fullscreen switch, so these pin every field it names: the old and
 //! new sizes, the format by name (and by code when it has none), the buffer
 //! count, the window mode with its refresh rate, the swap effect, the
-//! interval, the auto depth-stencil and the outcome the device supplies.
+//! interval, the auto depth-stencil and the outcome the device supplies. The
+//! comparison that picks a success's level is pinned too: a windowed drag
+//! step that repeats what the device holds changes nothing, while a vsync
+//! toggle, a window-mode switch and a new fullscreen mode do.
 
 use mtld3d_types::{
     D3DFMT_D24S8, D3DFMT_X8R8G8B8, D3DPRESENT_INTERVAL_IMMEDIATE, D3DPRESENT_INTERVAL_ONE,
     D3DPRESENT_PARAMETERS, D3DSWAPEFFECT_DISCARD, D3DSWAPEFFECT_FLIP,
 };
 
-use super::ResetSummary;
+use super::{ResetSummary, changes_presentation};
 
 const fn params(windowed: bool) -> D3DPRESENT_PARAMETERS {
     D3DPRESENT_PARAMETERS {
@@ -116,4 +119,68 @@ fn values_the_line_has_no_name_for_print_their_codes() {
         line.ends_with(": rejected (D3DERR_INVALIDCALL): invalid present params"),
         "{line}"
     );
+}
+
+#[test]
+fn a_reset_that_repeats_the_stored_params_changes_nothing() {
+    let pp = params(true);
+    assert!(!changes_presentation(&pp, &pp));
+}
+
+#[test]
+fn a_windowed_size_alone_is_no_change() {
+    // The device follows the client area on `WM_SIZE`; a game that resets
+    // on each drag step may still name the size it last passed.
+    let previous = params(true);
+    let mut next = params(true);
+    next.back_buffer_width = 1440;
+    next.back_buffer_height = 900;
+    assert!(!changes_presentation(&previous, &next));
+}
+
+#[test]
+fn a_vsync_toggle_alone_is_a_change() {
+    let previous = params(true);
+    let mut next = params(true);
+    next.presentation_interval = D3DPRESENT_INTERVAL_IMMEDIATE;
+    assert!(changes_presentation(&previous, &next));
+}
+
+#[test]
+fn a_window_mode_switch_is_a_change() {
+    assert!(changes_presentation(&params(true), &params(false)));
+    assert!(changes_presentation(&params(false), &params(true)));
+}
+
+#[test]
+fn a_new_fullscreen_mode_or_refresh_rate_is_a_change() {
+    let previous = params(false);
+    let mut resized = params(false);
+    resized.back_buffer_width = 1920;
+    resized.back_buffer_height = 1080;
+    assert!(changes_presentation(&previous, &resized));
+    let mut faster = params(false);
+    faster.full_screen_refresh_rate_in_hz = 120;
+    assert!(changes_presentation(&previous, &faster));
+}
+
+#[test]
+fn every_other_field_counts() {
+    let previous = params(true);
+    let edits: [fn(&mut D3DPRESENT_PARAMETERS); 9] = [
+        |pp| pp.back_buffer_format = 21,
+        |pp| pp.back_buffer_count = 2,
+        |pp| pp.multi_sample_type = 4,
+        |pp| pp.multi_sample_quality = 1,
+        |pp| pp.swap_effect = D3DSWAPEFFECT_FLIP,
+        |pp| pp.device_window = 0x1234,
+        |pp| pp.enable_auto_depth_stencil = 0,
+        |pp| pp.auto_depth_stencil_format = 80,
+        |pp| pp.flags = 1,
+    ];
+    for edit in edits {
+        let mut next = params(true);
+        edit(&mut next);
+        assert!(changes_presentation(&previous, &next));
+    }
 }

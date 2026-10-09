@@ -84,10 +84,7 @@ impl fmt::Display for ModeSetOutcome {
                 }
                 write!(f, " (was {}x{})", was.0, was.1)
             }
-            Self::Refused(mode) => write!(
-                f,
-                "display mode {mode} refused, the window covers the monitor instead"
-            ),
+            Self::Refused(mode) => write!(f, "display mode {mode} refused"),
         }
     }
 }

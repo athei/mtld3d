@@ -1,11 +1,15 @@
 //! The log line one `Reset` writes.
 //!
-//! A `Reset` is rare: a resolution change, a windowed/fullscreen switch, a
-//! device recovered after a loss. Each call therefore logs one line, at info
-//! when it succeeds and at warn when it does not, naming the back buffer it
-//! leaves and everything the present parameters asked for, so a log at the
-//! default level explains a mode change without `RUST_LOG=debug`. The device
-//! decides the outcome; this module only renders it.
+//! Each `Reset` that reaches validation logs one line naming the back buffer
+//! it leaves and everything the present parameters asked for, so a log at the
+//! default level explains a resolution change, a windowed/fullscreen switch
+//! or a vsync toggle without `RUST_LOG=debug`. Not every `Reset` is such a
+//! change: some games call it on every step of a window drag, after the
+//! device already followed the client area, and others retry a failing one
+//! every frame. A success therefore logs at info only when
+//! [`changes_presentation`] says it changed something, or when it recovers
+//! the device, and the device picks the level of a failure. The device
+//! decides the outcome; this module renders it and makes that comparison.
 
 use core::fmt;
 
@@ -16,6 +20,39 @@ use mtld3d_types::{
 };
 
 use crate::format::format_name;
+
+/// `true` when a `Reset` adopting `next` changes what `previous` presented with.
+///
+/// `previous` is what the last `Reset` or `CreateDevice` stored, kept current
+/// by the device's resize on `WM_SIZE`; `next` is what this `Reset` stores,
+/// resolved the same way. A windowed back-buffer size is left out: the
+/// device follows the client area on its own and stores the size it took,
+/// so a game that calls `Reset` on every step of a window drag repeats the
+/// size the device holds already, and the device reports a real resize
+/// itself. Every other field counts, a presentation interval alone included,
+/// since a vsync toggle reaches the device only through a `Reset`.
+#[must_use]
+pub const fn changes_presentation(
+    previous: &D3DPRESENT_PARAMETERS,
+    next: &D3DPRESENT_PARAMETERS,
+) -> bool {
+    let fullscreen_mode_changed = next.windowed == 0
+        && (previous.back_buffer_width != next.back_buffer_width
+            || previous.back_buffer_height != next.back_buffer_height
+            || previous.full_screen_refresh_rate_in_hz != next.full_screen_refresh_rate_in_hz);
+    fullscreen_mode_changed
+        || previous.windowed != next.windowed
+        || previous.back_buffer_format != next.back_buffer_format
+        || previous.back_buffer_count != next.back_buffer_count
+        || previous.multi_sample_type != next.multi_sample_type
+        || previous.multi_sample_quality != next.multi_sample_quality
+        || previous.swap_effect != next.swap_effect
+        || previous.device_window != next.device_window
+        || previous.enable_auto_depth_stencil != next.enable_auto_depth_stencil
+        || previous.auto_depth_stencil_format != next.auto_depth_stencil_format
+        || previous.flags != next.flags
+        || previous.presentation_interval != next.presentation_interval
+}
 
 /// One `Reset` call, rendered as its log line.
 ///

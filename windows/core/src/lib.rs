@@ -44,6 +44,7 @@ pub mod fetch4;
 pub mod ff_state;
 pub mod format;
 pub mod format_probe;
+pub mod fullscreen_log;
 pub mod fullscreen_resize;
 pub mod gamma;
 pub mod gpu_caps;
