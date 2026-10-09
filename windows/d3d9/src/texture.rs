@@ -18,7 +18,7 @@ use mtld3d_core::{
     texture_flags::TextureFlags,
     texture_staging::{
         LockAction, MipShape, PreserveKind, StagingWrite, decide_lock_action, decide_staging_write,
-        honoured_lock_flags, is_in_flight, staging_droppable_class,
+        honoured_lock_flags, is_in_flight, staging_droppable_class, staging_lazy_class,
     },
 };
 use mtld3d_shared::{
@@ -590,6 +590,38 @@ impl TextureInner {
         self.level_authority.gpu_wrote(face, level);
     }
 
+    /// Claim a render-target subresource for the GPU ahead of a CPU read of it.
+    ///
+    /// The passes that draw into a render target write its Metal texture and
+    /// never its staging, and nothing records which pass drew which target, so
+    /// every CPU read of one reads it back. A subresource holding a CPU write no
+    /// upload has carried yet keeps its staging as the answer: that copy is the
+    /// newer one, and a read back would put the pixels from before the write
+    /// over it.
+    fn claim_render_target_for_cpu_read(&mut self, face: u32, level: usize) {
+        if self.d3d_usage & mtld3d_types::D3DUSAGE_RENDERTARGET == 0
+            || self.cpu_write_pending(face, level)
+        {
+            return;
+        }
+        self.level_authority.gpu_wrote(face, level);
+    }
+
+    /// Whether `(face, level)` holds a CPU write its next upload has not carried yet.
+    fn cpu_write_pending(&self, face: u32, level: usize) -> bool {
+        if level >= u32::BITS as usize {
+            return false;
+        }
+        let bit = 1u32 << level;
+        self.cube
+            .as_deref()
+            .map_or(self.dirty_mask & bit != 0, |cube| {
+                cube.dirty_masks
+                    .get(face as usize)
+                    .is_some_and(|mask| mask & bit != 0)
+            })
+    }
+
     /// Prepare a subresource's staging before a map or CPU write.
     ///
     /// Every path that gives the staging that role goes through here first: a
@@ -698,9 +730,11 @@ impl TextureInner {
     /// A default-pool texture without `D3DUSAGE_DYNAMIC` cannot be locked
     /// in D3D9, and the runtime keeps no system-memory copy of it: the GPU
     /// holds the only bytes. Keeping ours doubles the footprint of every
-    /// streamed texture inside a 32-bit game. Render targets, depth
-    /// textures, cubes and volumes keep theirs (their copies serve other
-    /// paths); so do the lockable pools. A level a `LockRect` or a `GetDC`
+    /// streamed texture inside a 32-bit game. Depth textures, cubes and
+    /// volumes keep theirs (their copies serve other paths); so do the
+    /// lockable pools. A render target never releases a level here: its
+    /// levels start released instead and keep the staging their first CPU
+    /// use gives them ([`staging_lazy_class`]). A level a `LockRect` or a `GetDC`
     /// holds keeps its staging either way: both hand out a pointer into those
     /// pages that stays live until the map is released. So does a level in
     /// `kept_staging`, which the game writes in part after a release.
@@ -831,6 +865,18 @@ impl TextureInner {
         );
     }
 
+    /// Give released `level` zeroed staging, the contents of a level nothing has written.
+    fn ensure_zeroed_staging(&mut self, level: usize) {
+        if self.dropped_staging & (1u32 << level) == 0 {
+            return;
+        }
+        self.ensure_staging(level);
+        Arc::get_mut(&mut self.staging[level])
+            .expect("re-created staging is unique")
+            .as_mut_slice()
+            .fill(0);
+    }
+
     /// Re-materialise `level`'s released staging for a `LockRect`.
     ///
     /// D3D9 hands a lock the level's current contents, and a released level
@@ -948,6 +994,7 @@ impl TextureInner {
     /// to a face. A successful read clears the GPU claim without marking the
     /// staging dirty, while a failed required read leaves GPU authority for retry.
     pub fn materialize_subresource_for_cpu_read(&mut self, face: u32, level: usize) -> bool {
+        self.claim_render_target_for_cpu_read(face, level);
         self.move_subresource_to_staging(face, level, false)
             && (self.cube.is_some() || self.ensure_staging_for_lock(level, 0))
     }
@@ -3450,6 +3497,16 @@ fn build_texture_inner(info: TextureCreateInfo) -> *mut TextureInner {
             boxed.drop_staging(level);
         }
     }
+    // A render-target texture's pixels are the GPU's from the first pass that
+    // draws into it, so its staging starts released and claimed for the GPU:
+    // the first CPU use of a level reads it back into fresh pages
+    // (`move_subresource_to_staging`), and the level keeps them from then on.
+    if staging_lazy_class(boxed.d3d_pool, boxed.d3d_usage, boxed.flags, boxed.depth) {
+        for level in 0..boxed.staging.len() {
+            boxed.drop_staging(level);
+            boxed.mark_subresource_gpu_authoritative(0, level);
+        }
+    }
     let inner = Box::into_raw(boxed);
     DeviceInner::from_ptr(dev_ptr).register_texture(inner);
     inner
@@ -4037,7 +4094,13 @@ extern "system" fn texture_generate_mip_sub_levels(this: *mut c_void) {
     // chain this call asks for, so pushing another op here would generate it
     // a second time.
     let upload_regenerates = ti.dirty_mask & 1 != 0 && !ti.is_cpu_only();
-    flush_dirty_mips(ti, dev);
+    // A render target's pending level-0 write goes out between application
+    // passes, and its ordered upload regenerates the chain behind it.
+    if ti.d3d_usage & mtld3d_types::D3DUSAGE_RENDERTARGET != 0 {
+        flush_converted_mips(ti, dev);
+    } else {
+        flush_dirty_mips(ti, dev);
+    }
     ti.note_gpu_use();
     if upload_regenerates {
         return;
@@ -4185,13 +4248,22 @@ fn materialize_subresource_from_gpu(ti: &mut TextureInner, face: u32, level: usi
     };
     if handle == 0 {
         // No Metal texture was ever made for this texture, so no GPU
-        // operation reached it: the encoder drops a `StretchRect` or a
-        // `ColorFill` into a missing texture. The claim that operation left
-        // names pixels that do not exist, and the staging is the level's only
-        // copy, which the caller keeps as the answer.
-        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
-            "texture {texture_id:#x}: no Metal texture behind the GPU write of face {face} \
-             level {level}; the staging keeps the level's pixels");
+        // operation reached it. A render-target texture nothing has drawn
+        // into yet is one (the encoder makes its texture at the first use):
+        // its levels start released, so it answers as a level nothing wrote,
+        // zeros. Otherwise the claim came from a `StretchRect` or a
+        // `ColorFill` the encoder dropped for a missing texture, it names
+        // pixels that do not exist, and the staging is the level's only copy,
+        // which the caller keeps as the answer.
+        if ti.cube.is_none() && ti.dropped_staging & (1u32 << level) != 0 {
+            mtld3d_shared::log_once_trace_by!(target: TEX_TRACE_TARGET, key: texture_id.raw(),
+                "texture {texture_id:#x}: level {level} read before any GPU use; it reads as zeros");
+            ti.ensure_zeroed_staging(level);
+        } else {
+            mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+                "texture {texture_id:#x}: no Metal texture behind the GPU write of face {face} \
+                 level {level}; the staging keeps the level's pixels");
+        }
         return true;
     }
     // A cube keeps its faces in the sidecar and never releases one; every other
@@ -4509,7 +4581,9 @@ extern "system" fn texture_lock_rect(
     // rename the box (a preserve then copies the fresh bytes). A surviving
     // `D3DLOCK_DISCARD` is a whole-level one and promises a whole-level
     // overwrite, so it skips the stall and the claim goes with it: the staging
-    // this Lock hands out is what the level holds next.
+    // this Lock hands out is what the level holds next. A render-target level
+    // is the GPU's after any pass, so it is claimed here first.
+    ti.claim_render_target_for_cpu_read(0, level_u);
     if !ti.move_subresource_to_staging(0, level_u, flags & D3DLOCK_DISCARD != 0) {
         return D3DERR_INVALIDCALL;
     }
@@ -4621,12 +4695,13 @@ extern "system" fn texture_unlock_rect(this: *mut c_void, level: u32) -> i32 {
     if managed_no_dirty && ti.was_uploaded[level_u] {
         return D3D_OK;
     }
-    // Lazy upload: flag the mip dirty and return. Bind-time
-    // `flush_dirty_mips` dispatches the actual upload via
-    // `schedule_upload` — Unlock is now a single byte write, the
-    // Box+Arc+Vec work happens at first bind after this Unlock. A writing
-    // Lock publishes the rect it named and nothing more; the initial upload a
-    // READONLY first lock triggers carries the whole mip.
+    // Lazy upload: flag the mip dirty. Bind-time `flush_dirty_mips`
+    // dispatches the actual upload via `schedule_upload`, so Unlock is a
+    // single byte write and the Box+Arc+Vec work happens at the first bind
+    // after it; a render-target texture publishes at the end of this call
+    // instead (`publish_render_target_write`). A writing Lock publishes the
+    // rect it named and nothing more; the initial upload a READONLY first lock
+    // triggers carries the whole mip.
     match lock_rect {
         Some(rect) if !read_only && !managed_no_dirty => ti.mark_written_region(level_u, rect),
         _ => ti.mark_mip_dirty(level_u),
@@ -4652,6 +4727,7 @@ extern "system" fn texture_unlock_rect(this: *mut c_void, level: u32) -> i32 {
         // (textures hold a refcount on the device via their COM ABI).
         let dev = unsafe { &mut *(device_inner_ptr as *mut DeviceInner) };
         dev.mark_snapshot_dirty_all();
+        publish_render_target_write(ti, dev);
     }
     0 // S_OK
 }
@@ -4935,7 +5011,7 @@ fn schedule_upload_with_order<const ORDERED: bool>(
     });
 }
 
-fn schedule_cube_upload(
+fn schedule_cube_upload<const ORDERED: bool>(
     ti: &mut TextureInner,
     dev: &mut DeviceInner,
     face: u32,
@@ -4990,7 +5066,17 @@ fn schedule_cube_upload(
         release_staging: false,
         upload_generation: 0,
     };
-    dev.push_control(crate::device::UploadTextureOp { job });
+    if ORDERED {
+        // The ordered placement rides the flags only the mip-carrying form
+        // has; the chain, if any, is regenerated by the caller's own op.
+        dev.push_control(crate::device::UploadTextureAndMipsOp {
+            job,
+            texture_id,
+            flags: crate::device::UploadTextureOpFlags::ORDERED,
+        });
+    } else {
+        dev.push_control(crate::device::UploadTextureOp { job });
+    }
 }
 
 /// Re-mark a subresource whose upload the encoder emitted nothing for.
@@ -5260,10 +5346,27 @@ pub fn flush_dirty_mips(ti: &mut TextureInner, dev: &mut DeviceInner) {
     flush_dirty_mips_slow::<false>(ti, dev);
 }
 
-/// Publish a CPU `StretchRect` conversion after earlier ordered texture writes.
+/// Publish a CPU write of a texture in application order, after the passes before it.
+///
+/// A CPU `StretchRect` conversion and a write into a render-target texture
+/// take this path; every other write waits for the level's next bind.
 pub fn flush_converted_mips(ti: &mut TextureInner, dev: &mut DeviceInner) {
     if ti.dirty_mask != 0 {
         flush_dirty_mips_slow::<true>(ti, dev);
+    }
+}
+
+/// Upload a CPU write into a render-target texture now, in the order of the passes around it.
+///
+/// Passes draw into a render target without looking at the uploads it owes,
+/// so an upload left for the level's next sampling bind would land at the head
+/// of that later frame, over every pass drawn into the target since the write.
+/// Published in application order now, the write sits after the passes before
+/// it and under the passes after it, as D3D9 orders them. Any other texture
+/// keeps the upload for its next bind.
+pub fn publish_render_target_write(ti: &mut TextureInner, dev: &mut DeviceInner) {
+    if ti.d3d_usage & mtld3d_types::D3DUSAGE_RENDERTARGET != 0 {
+        flush_converted_mips(ti, dev);
     }
 }
 
@@ -5305,13 +5408,15 @@ fn flush_dirty_mips_slow<const ORDERED: bool>(ti: &mut TextureInner, dev: &mut D
                     .unwrap_or_else(|| {
                         DirtyRect::full(ti.mip_widths[level_u], ti.mip_heights[level_u])
                     });
-                schedule_cube_upload(ti, dev, face, level, rect);
+                schedule_cube_upload::<ORDERED>(ti, dev, face, level, rect);
                 regenerate_mipmaps |= ti.autogen_mipmap() && level == 0;
                 dirty_count += 1;
             }
         }
         let texture_id = ti.texture_id;
-        if regenerate_mipmaps {
+        if regenerate_mipmaps && ORDERED {
+            dev.push_control(crate::device::GenerateMipmapsOrderedOp { old_id: texture_id });
+        } else if regenerate_mipmaps {
             dev.push_control(crate::device::GenerateMipmapsOp { texture_id });
         }
         mtld3d_shared::log_once_trace_by!(

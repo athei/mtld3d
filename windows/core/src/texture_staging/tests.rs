@@ -10,7 +10,8 @@
 //! block-row pitch runs past the end. The `staging_droppable_class` cases walk the pool, usage
 //! and shape combinations, since every class outside the one that releases is a level whose only
 //! copy of some byte is the staging. The `decide_staging_write` cases walk every combination of
-//! the write facts and pin the frame rule on its own.
+//! the write facts and pin the frame rule on its own. The `staging_lazy_class` cases pin that
+//! only a default-pool 2D render-target texture starts without staging.
 
 use std::sync::Arc;
 
@@ -1066,6 +1067,77 @@ fn multi_slice_depth_is_never_droppable() {
     assert!(!staging_droppable_class(
         D3DPOOL_DEFAULT,
         NO_USAGE,
+        TextureFlags::empty(),
+        4
+    ));
+}
+
+// ── staging_lazy_class ──
+
+/// A default-pool render-target texture starts without staging.
+#[test]
+fn default_pool_render_target_texture_starts_without_staging() {
+    assert!(staging_lazy_class(
+        D3DPOOL_DEFAULT,
+        D3DUSAGE_RENDERTARGET,
+        TextureFlags::empty(),
+        1
+    ));
+    assert!(staging_lazy_class(
+        D3DPOOL_DEFAULT,
+        D3DUSAGE_RENDERTARGET | mtld3d_types::D3DUSAGE_AUTOGENMIPMAP,
+        TextureFlags::AUTOGEN_MIPMAP,
+        1
+    ));
+}
+
+/// A texture the GPU never draws into, or one created outside the default pool, keeps its staging.
+#[test]
+fn only_render_target_usage_in_the_default_pool_starts_without_staging() {
+    for usage in [NO_USAGE, D3DUSAGE_DYNAMIC, D3DUSAGE_DEPTHSTENCIL] {
+        assert!(
+            !staging_lazy_class(D3DPOOL_DEFAULT, usage, TextureFlags::empty(), 1),
+            "usage {usage:#x}"
+        );
+    }
+    for usage in [
+        D3DUSAGE_RENDERTARGET | D3DUSAGE_DYNAMIC,
+        D3DUSAGE_RENDERTARGET | D3DUSAGE_DEPTHSTENCIL,
+    ] {
+        assert!(
+            !staging_lazy_class(D3DPOOL_DEFAULT, usage, TextureFlags::empty(), 1),
+            "usage {usage:#x}"
+        );
+    }
+    for pool in [
+        D3DPOOL_MANAGED,
+        D3DPOOL_SYSTEMMEM,
+        mtld3d_types::D3DPOOL_SCRATCH,
+    ] {
+        assert!(
+            !staging_lazy_class(pool, D3DUSAGE_RENDERTARGET, TextureFlags::empty(), 1),
+            "pool {pool}"
+        );
+    }
+}
+
+/// Cubes, volumes, offscreen plains and depth formats keep their staging whatever the usage.
+#[test]
+fn render_target_shapes_with_staging_of_their_own_keep_it() {
+    for flag in [
+        TextureFlags::CUBE,
+        TextureFlags::VOLUME_TEXTURE,
+        TextureFlags::OFFSCREEN_PLAIN,
+        TextureFlags::DEPTH_FORMAT,
+    ] {
+        assert!(
+            !staging_lazy_class(D3DPOOL_DEFAULT, D3DUSAGE_RENDERTARGET, flag, 1),
+            "flags {flag:?}"
+        );
+    }
+    assert!(!staging_lazy_class(
+        D3DPOOL_DEFAULT,
+        D3DUSAGE_RENDERTARGET,
         TextureFlags::empty(),
         4
     ));

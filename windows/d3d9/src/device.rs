@@ -7818,15 +7818,17 @@ extern "system" fn device_create_depth_stencil_surface(
     D3D_OK
 }
 
-/// Force the next draw to re-walk stage bindings after a staging write to `tex`.
+/// Publish a staging write to `tex`: at the next draw's re-walk, or now for a render target.
 ///
 /// Bind-time `flush_dirty_mips` only runs while the API thread rebuilds a
 /// dirty snapshot, so a write that lands in a texture's staging between two
 /// draws over otherwise-clean state has to dirty the snapshot itself or its
 /// upload is never scheduled and the next draw samples the old texels. The
 /// mark is deliberately coarse and does not ask whether the texture is bound:
-/// a redundant snapshot re-emit dedups at the encoder.
-fn schedule_staging_upload_at_next_bind(tex: &crate::texture::Direct3DTexture9) {
+/// a redundant snapshot re-emit dedups at the encoder. A render-target texture
+/// uploads now instead, in application order
+/// (`crate::texture::publish_render_target_write`).
+fn publish_staging_write(tex: &mut crate::texture::Direct3DTexture9) {
     let device_inner_ptr = tex.inner().device_inner();
     if device_inner_ptr != 0 {
         // SAFETY: live `DeviceInner*` recorded at the texture's create; the
@@ -7834,6 +7836,7 @@ fn schedule_staging_upload_at_next_bind(tex: &crate::texture::Direct3DTexture9) 
         // refcount via their COM ABI).
         let dev = unsafe { &mut *(device_inner_ptr as *mut DeviceInner) };
         dev.mark_snapshot_dirty_all();
+        crate::texture::publish_render_target_write(tex.inner_mut(), dev);
     }
 }
 
@@ -7843,8 +7846,8 @@ fn schedule_staging_upload_at_next_bind(tex: &crate::texture::Direct3DTexture9) 
 /// `dst_parent` are distinct, live `Direct3DTexture9` pointers; `copy` runs the
 /// per-mip staging copies once pool and format are validated. Validates source
 /// `D3DPOOL_SYSTEMMEM`, destination `D3DPOOL_DEFAULT`, and a format pair that is
-/// either identical or one the CPU converter covers, then schedules the upload
-/// at the next bind.
+/// either identical or one the CPU converter covers, then publishes the write
+/// ([`publish_staging_write`]).
 fn copy_systemmem_to_default(
     dst_parent: *mut crate::texture::Direct3DTexture9,
     src_parent: *mut crate::texture::Direct3DTexture9,
@@ -7877,9 +7880,8 @@ fn copy_systemmem_to_default(
     let src_inner = unsafe { &*core::ptr::from_ref(src_tex.inner()) };
     let hr = copy(dst_tex.inner_mut(), src_inner);
     // A copy that failed partway has still written the levels before the one
-    // that failed, and those owe their upload like any other: the re-walk is
-    // what flushes them at the next draw.
-    schedule_staging_upload_at_next_bind(dst_tex);
+    // that failed, and those owe their upload like any other.
+    publish_staging_write(dst_tex);
     hr
 }
 
@@ -8047,7 +8049,7 @@ extern "system" fn device_update_surface(
             );
             return D3DERR_INVALIDCALL;
         }
-        schedule_staging_upload_at_next_bind(tex);
+        publish_staging_write(tex);
         return D3D_OK;
     }
     // A render-target surface or the back buffer: a colour surface with no
@@ -10131,6 +10133,15 @@ extern "system" fn device_set_render_target(
     // SAFETY: `surf` is the live surface validated above.
     let surface_ref = unsafe { &*surf };
     let parent = surface_ref.parent_texture();
+    // A texture level bound as a target takes any CPU write it still owes
+    // ahead of the passes about to draw into it.
+    if !parent.is_null() {
+        // SAFETY: `parent` is non-null (checked) and points to a live
+        // `Direct3DTexture9` whose refcount keeps it alive while the surface
+        // is; it is a distinct allocation from the device.
+        let texture = unsafe { &mut *parent };
+        crate::texture::publish_render_target_write(texture.inner_mut(), dev);
+    }
     let standalone_color = surface_ref.metal_color_handle();
     // What the bound resource is rasterized at, asked of the resource itself:
     // the surface for a standalone or implicit target, the parent texture for

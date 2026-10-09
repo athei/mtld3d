@@ -3803,8 +3803,11 @@ extern "system" fn surface_release_dc(this: *mut c_void, hdc: *mut c_void) -> i3
         // Mirrors the tail of a texture's `UnlockRect`.
         if !inner.device_inner.is_null() {
             // SAFETY: `device_inner` was stamped at `Self::new` from a live
-            // `DeviceInner`, which outlives every surface it owns.
-            unsafe { (*inner.device_inner).mark_snapshot_dirty_all() };
+            // `DeviceInner`, which outlives every surface it owns, and is a
+            // distinct allocation from the texture borrowed above.
+            let dev = unsafe { &mut *inner.device_inner };
+            dev.mark_snapshot_dirty_all();
+            crate::texture::publish_render_target_write(texture, dev);
         }
     }
     teardown_gdi_dc(held);
