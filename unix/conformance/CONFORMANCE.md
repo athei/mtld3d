@@ -508,27 +508,27 @@ record. A knob, where one makes sense, is named with its default.
   copy serves. Writes through the surface, a `GetDC` included, do not reach
   the application's memory either. The `d3d9ex.c/test_user_memory` and
   `d3d9ex.c/test_user_memory_getdc` clusters carry the sites. No knob.
-- **No occlusion or mode-change status on an extended device.** D3D9Ex
-  answers `PresentEx` and `CheckDeviceState` with `S_PRESENT_OCCLUDED` while another device holds the display exclusively or
-  the window is covered, and with `S_PRESENT_MODE_CHANGED` after a mode
-  change. No exclusive mode is ever taken here (the device-loss decision),
-  and a present into a covered window already skips the drawable without
-  costing the application anything, so there is no state to report. The
-  failure latch the layer keeps (`docs/STATUS.md`, device loss) is still
-  reported, in the answers D3D9Ex documents: `TestCooperativeLevel` answers
-  `D3D_OK` on an extended device whatever the latch holds, as the extended
-  runtime does; `Present`, `PresentEx`, the swap chain's `Present`,
-  `CheckDeviceState`, `Reset` and `ResetEx` return the latched code, with
-  `E_OUTOFMEMORY` reported as `D3DERR_OUTOFVIDEOMEMORY`, since `PresentEx`
-  and `CheckDeviceState` document the latter and not the former, and
-  neither reset clears it. The latch stands for a frame the layer failed to
-  encode or submit, which no `Reset` repairs, and it stays one model for
-  both kinds of device: an extended device keeps the code a plain one
-  reports, `D3DERR_DEVICELOST`, which `CheckDeviceState` documents as a
-  lost device, and `D3DERR_DEVICEREMOVED`, which would send a D3D9Ex
-  application to a new device, is not used. No site observes the latch; Wine's suite
-  never fails a frame. The `d3d9ex.c/test_lost_device` cluster and
-  `d3d9ex.c/test_wndproc` 2957 carry the occlusion sites. No knob.
+- **No occlusion or mode-change status on an extended device.** D3D9Ex answers
+  `PresentEx` and `CheckDeviceState` with `S_PRESENT_OCCLUDED` while another
+  device holds the display exclusively or the window is covered, and with
+  `S_PRESENT_MODE_CHANGED` after a mode change. No exclusive mode is ever
+  taken here (the device-loss decision), and a present into a covered window
+  already skips the drawable without costing the application anything, so
+  there is no state to report. The failure latch the layer keeps
+  (`docs/STATUS.md`, device loss) is still reported, in the answers D3D9Ex
+  documents: `TestCooperativeLevel` answers `D3D_OK` on an extended device
+  whatever the latch holds, as the extended runtime does; `Present`,
+  `PresentEx`, the swap chain's `Present`, `CheckDeviceState`, `Reset` and
+  `ResetEx` return the latched code, with `E_OUTOFMEMORY` reported as
+  `D3DERR_OUTOFVIDEOMEMORY`, since `PresentEx` and `CheckDeviceState` document
+  the latter and not the former, and neither reset clears it. The latch stands
+  for a frame the layer failed to encode or submit, which no `Reset` repairs,
+  and it stays one model for both kinds of device: an extended device keeps
+  the code a plain one reports, `D3DERR_DEVICELOST`, which `CheckDeviceState`
+  documents as a lost device, and `D3DERR_DEVICEREMOVED`, which would send a
+  D3D9Ex application to a new device, is not used. No site observes the latch;
+  Wine's suite never fails a frame. The `d3d9ex.c/test_lost_device` cluster
+  and `d3d9ex.c/test_wndproc` 2957 carry the occlusion sites. No knob.
 - **The maximum frame latency is stored, not enforced.**
   `SetMaximumFrameLatency` takes 0 to 30 and `GetMaximumFrameLatency` reports
   what it stored, 3 until then. The frames the application can run ahead are

@@ -85,8 +85,11 @@ pub const fn refused_on_extended(pool: u32, extended: bool) -> bool {
 /// The priority orders what a memory manager evicts first. On a plain device
 /// that is the runtime's managed pool. An extended device lets the driver
 /// page its default-pool resources instead, so there the default pool takes
-/// the priority, and a managed resource it made through `D3DPOOL_MANAGED_EX`
-/// keeps it at zero. Every other pair keeps the priority at zero.
+/// the priority. Callers ask with the device's kind for a default-pool
+/// resource alone and with `extended` false otherwise, so a managed
+/// resource, which an extended device makes through `D3DPOOL_MANAGED_EX`,
+/// stores its priority on either kind of device. Every other pair keeps the
+/// priority at zero.
 #[must_use]
 pub const fn priority_settable(pool: u32, extended: bool) -> bool {
     if extended {

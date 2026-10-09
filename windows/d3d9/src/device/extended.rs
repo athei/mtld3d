@@ -10,7 +10,7 @@
 use core::ffi::c_void;
 
 use mtld3d_core::{
-    extended::{ex_create_usage_valid, extended_state_code, frame_latency},
+    extended::{ex_create_usage_valid, frame_latency},
     perf::DeviceSubCategory,
 };
 use mtld3d_shared::{InPtr, InPtrMut, OutPtr};
@@ -218,7 +218,7 @@ pub extern "system" fn check_device_state(this: *mut c_void, _window: *mut c_voi
     );
     match obj.inner().encoder_status() {
         Ok(()) => D3D_OK,
-        Err(hr) => extended_state_code(hr),
+        Err(hr) => obj.inner().state_code(hr),
     }
 }
 

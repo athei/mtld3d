@@ -186,16 +186,17 @@ pub const fn frame_latency(requested: u32) -> Option<u32> {
     }
 }
 
-/// What an extended device's presents, resets and `CheckDeviceState` answer for `hr`.
+/// What a device's presents, resets and `CheckDeviceState` answer for `hr`.
 ///
-/// `PresentEx` and `CheckDeviceState` do not document `E_OUTOFMEMORY`, the
-/// code a frame whose commands could not be recorded latches; both document
-/// `D3DERR_OUTOFVIDEOMEMORY` for a device out of the memory it renders from,
-/// which is what every one of these calls reports instead, so one failure
-/// answers with one code. Every other code passes through.
+/// On an extended device, `PresentEx` and `CheckDeviceState` do not document
+/// `E_OUTOFMEMORY`, the code a frame whose commands could not be recorded
+/// latches; both document `D3DERR_OUTOFVIDEOMEMORY` for a device out of the
+/// memory it renders from, which is what every one of these calls reports
+/// instead, so one failure answers with one code. A plain device reports
+/// `hr` as it is, and every other code passes through on either kind.
 #[must_use]
-pub const fn extended_state_code(hr: i32) -> i32 {
-    if hr == E_OUTOFMEMORY {
+pub const fn state_code(hr: i32, extended: bool) -> i32 {
+    if extended && hr == E_OUTOFMEMORY {
         D3DERR_OUTOFVIDEOMEMORY
     } else {
         hr

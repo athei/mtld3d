@@ -248,10 +248,21 @@ fn an_extended_device_reports_the_whole_texture_budget() {
 #[test]
 fn an_extended_state_reports_out_of_memory_as_out_of_video_memory() {
     assert_eq!(
-        extended_state_code(E_OUTOFMEMORY),
+        state_code(E_OUTOFMEMORY, true),
         D3DERR_OUTOFVIDEOMEMORY,
         "the code PresentEx and CheckDeviceState document"
     );
-    assert_eq!(extended_state_code(D3DERR_DEVICELOST), D3DERR_DEVICELOST);
-    assert_eq!(extended_state_code(D3D_OK), D3D_OK);
+    assert_eq!(state_code(D3DERR_DEVICELOST, true), D3DERR_DEVICELOST);
+    assert_eq!(state_code(D3D_OK, true), D3D_OK);
+}
+
+#[test]
+fn a_plain_state_reports_every_code_as_it_is() {
+    assert_eq!(
+        state_code(E_OUTOFMEMORY, false),
+        E_OUTOFMEMORY,
+        "a plain device keeps the code it latched"
+    );
+    assert_eq!(state_code(D3DERR_DEVICELOST, false), D3DERR_DEVICELOST);
+    assert_eq!(state_code(D3D_OK, false), D3D_OK);
 }

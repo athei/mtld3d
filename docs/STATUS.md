@@ -252,11 +252,11 @@ unless its entry says otherwise.
   it. A `Reset` the layer could not complete, which leaves a plain device
   answering `D3DERR_DEVICENOTRESET` from `TestCooperativeLevel`, shows on an
   extended device only as that code from `Present`, `PresentEx` and the swap
-  chain's `Present`; `CheckDeviceState` does not report it. `D3DERR_DEVICEREMOVED`,
-  which tells a D3D9Ex application to create a new device, is not used: one
-  latch serves both kinds of device, and an extended device keeps the code
-  a plain one reports, `D3DERR_DEVICELOST`, which `CheckDeviceState`
-  documents as a lost device.
+  chain's `Present`; `CheckDeviceState` does not report it.
+  `D3DERR_DEVICEREMOVED`, which tells a D3D9Ex application to create a new
+  device, is not used: one latch serves both kinds of device, and an
+  extended device keeps the code a plain one reports, `D3DERR_DEVICELOST`,
+  which `CheckDeviceState` documents as a lost device.
 - Software paths: no reference rasterizer, no software vertex processing, no
   `RegisterSoftwareDevice`; the default Metal device is the only adapter.
 - Legacy remnants: N-patch and RT-patch tessellation, vertex tweening,

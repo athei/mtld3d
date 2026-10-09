@@ -3746,16 +3746,9 @@ impl DeviceInner {
 
     /// The code this device reports for a call that produced `hr`.
     ///
-    /// An extended device reports `E_OUTOFMEMORY`, which none of its present,
-    /// reset and state calls document, as `D3DERR_OUTOFVIDEOMEMORY`, so one
-    /// failure answers with one code from every one of them; a plain device
-    /// reports `hr` as it is.
+    /// [`mtld3d_core::extended::state_code`] for this kind of device.
     pub const fn state_code(&self, hr: i32) -> i32 {
-        if self.is_extended() {
-            mtld3d_core::extended::extended_state_code(hr)
-        } else {
-            hr
-        }
+        mtld3d_core::extended::state_code(hr, self.is_extended())
     }
 
     /// The frame latency `GetMaximumFrameLatency` reports.
