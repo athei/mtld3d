@@ -113,7 +113,8 @@ gate that compiles the perf telemetry and its tests. It goes into `target/perf`
 of each workspace rather than into the default target directory, since every
 crate whose build script reads the setting rebuilds whenever it changes. The
 first `make check` in a checkout builds it from scratch, which takes a few
-minutes. The Makefile says which legs it runs beside `clippy-perf`.
+minutes and about 5.6 GB of disk (3.3 GB under `windows`, 2.3 GB under
+`unix`). The Makefile says which legs it runs beside `clippy-perf`.
 
 The test legs run with Apple's Metal validation layer on and the Metal HUD
 off; the Makefile says why beside `MTL_HUD_ENABLED`. Setting

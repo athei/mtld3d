@@ -34,12 +34,13 @@ Two commands, both green before you commit:
 - `make check` is `cargo fmt --check`, clippy with `nursery` and `pedantic`,
   `make audit`, the Makefile's own tests (`test-isolation` and
   `test-e2e-discovery`), and `make doc`. It also runs the native and i686
-  clippy legs and the host-native unit tests once more on a `PERF=1` build
-  (`clippy-perf` and `test-unit-perf`), since no other gate compiles the perf
-  telemetry or the tests behind `cfg(perf_tracking)`. Only the check legs deny
-  warnings, so a plain `cargo clippy` in an editor reports without failing.
-  Each audit finding names the section of `docs/CONVENTIONS.md` behind it;
-  read that section rather than pattern-matching your way past the grep.
+  clippy legs again, and the host-native unit tests that `make test` runs, on
+  a `PERF=1` build (`clippy-perf` and `test-unit-perf`), since no other gate
+  compiles the perf telemetry or the tests behind `cfg(perf_tracking)`. Only
+  the check legs deny warnings, so a plain `cargo clippy` in an editor reports
+  without failing. Each audit finding names the section of
+  `docs/CONVENTIONS.md` behind it; read that section rather than
+  pattern-matching your way past the grep.
 - `make test` is the host-native unit tests plus the end-to-end suite under
   Wine, one leg per PE architecture. Conformance is not part of it, on purpose:
   many of its checks fail by design, so it gates on a regression against a
