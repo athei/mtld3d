@@ -437,7 +437,8 @@ TAG          ?= $(shell git describe --tags --exact-match 2>/dev/null)
 #
 # The arch suffix is the target's own spelling, i686 / x86_64 for PE and
 # x64 / arm64 for the unix `.so`, matching the OUT_* variables above. A `-perf`
-# suffix runs the legs it names again on a PERF=1 build: `clippy-perf`.
+# suffix runs the legs it names again on a PERF=1 build: `clippy-perf`,
+# `test-unit-perf`.
 #
 # Every target here is phony: the recipes write into cargo's target dirs and the
 # Wine install, never into a file named after the target.
