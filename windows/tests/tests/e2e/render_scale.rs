@@ -1154,25 +1154,65 @@ fn get_dc_drawing_into_a_back_buffer_sized_render_target_texture_reaches_it() {
     }
 }
 
+/// A full-chain render-target texture at the back-buffer size draws into and reads its levels.
+///
+/// The texture reports the chain of the reported size, ten levels for
+/// 640x480, while the texture that rasterizes at the scale may hold one level
+/// fewer (480x360 holds nine). Level 0 is cleared red through a bind and the
+/// last level, one texel, filled green; each reads back what it was given.
+#[test]
+fn a_full_chain_target_at_the_backbuffer_size_draws_and_reads_its_levels() {
+    let h = Harness::new();
+    let (width, height) = h.dims();
+    let back = h.render_target(0);
+    let target = h.create_texture(
+        width,
+        height,
+        0,
+        D3DUSAGE_RENDERTARGET,
+        D3DFMT_A8R8G8B8,
+        D3DPOOL_DEFAULT,
+    );
+    let levels = target.level_count();
+    let full_chain = 32 - width.max(height).leading_zeros();
+    assert_eq!(levels, full_chain, "the reported size's whole chain");
+    let level0 = target.surface_level(0);
+    assert_eq!(h.set_render_target(0, &level0), D3D_OK, "bind level 0");
+    assert_eq!(h.clear_target(RED), D3D_OK, "clear level 0 red");
+    assert_eq!(
+        h.set_render_target(0, &back),
+        D3D_OK,
+        "restore the back buffer"
+    );
+    let last = target.surface_level(levels - 1);
+    let (hr, desc) = last.desc();
+    assert_eq!(hr, D3D_OK, "GetDesc on the last level");
+    assert_eq!(h.color_fill_hr(&last, GREEN), D3D_OK, "fill the last level");
+    let pixels = read_back(&h, &level0, (width, height), D3DFMT_A8R8G8B8);
+    assert_eq!(
+        pixels[(height / 2 * width + width / 2) as usize],
+        RED,
+        "level 0 holds the clear"
+    );
+    let pixels = read_back(&h, &last, (desc.width, desc.height), D3DFMT_A8R8G8B8);
+    assert_eq!(pixels[0], GREEN, "the last level holds the fill");
+}
+
 /// An autogen render-target texture at the back-buffer size regenerates its chain from a write.
 ///
 /// The chain is seeded red by a draw into level 0, an `UpdateSurface` writes
 /// level 0 green, and a sample pinned to level 4 reads green: the chain follows
-/// the resampled write rather than the level 0 from before it. Pins an 800x600
-/// frame at `render.scale=0.75`, so the scaled write runs on every leg, and
-/// because the 600x450 texture that rasterizes has as many levels as the
-/// reported size; a scale whose base has fewer, such as 640x480 at 0.75, has
-/// no Metal level for the reported chain's last one.
+/// the resampled write rather than the level 0 from before it. Pins
+/// `render.scale=0.75` so the scaled write runs on every leg; at the default
+/// 640x480 the chain it reports is a level longer than the 480x360 texture
+/// that rasterizes can hold.
 #[test]
 fn an_autogen_back_buffer_sized_render_target_texture_regenerates_from_a_write() {
-    let config = "render.scale=0.75";
-    let (width, height) = (800, 600);
     let h = Harness::create(&HarnessConfig {
-        width,
-        height,
-        config_entries: config,
+        config_entries: "render.scale=0.75",
         ..HarnessConfig::default()
     });
+    let (width, height) = h.dims();
     let back = h.render_target(0);
     let target = h.create_texture(
         width,
