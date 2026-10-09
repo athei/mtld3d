@@ -6,7 +6,7 @@
 //! a mode request is retried. The Win32 calls live in the d3d9 crate; this
 //! module only decides.
 
-use core::cmp::Reverse;
+use core::{cmp::Reverse, fmt};
 
 #[cfg(test)]
 mod tests;
@@ -19,6 +19,122 @@ pub struct ModeRequest {
     pub width: u32,
     pub height: u32,
     pub refresh_hz: u32,
+}
+
+impl fmt::Display for ModeRequest {
+    /// `1280x720@60Hz`, or `1280x720` for a request that takes any refresh rate.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}x{}", self.width, self.height)?;
+        if self.refresh_hz != 0 {
+            write!(f, "@{}Hz", self.refresh_hz)?;
+        }
+        Ok(())
+    }
+}
+
+/// What one mode-set did, as a fullscreen transition's log line names it.
+pub enum ModeSetOutcome {
+    /// No settable mode was asked for, so none was set.
+    ///
+    /// A fullscreen request whose size is no display mode follows the window
+    /// instead, and a session that set no mode has none to re-assert.
+    NoMode,
+    /// The requested size was the current mode already, so nothing was set.
+    AlreadyCurrent(ModeRequest),
+    /// User32 set `set` for `requested`, replacing a mode of size `was`.
+    ///
+    /// `set` is `requested` without its refresh rate when user32 refused the
+    /// rate and took the retry without it ([`mode_set_attempts`]).
+    Changed {
+        requested: ModeRequest,
+        set: ModeRequest,
+        was: (u32, u32),
+    },
+    /// User32 refused every attempt at `requested`.
+    Refused(ModeRequest),
+}
+
+impl ModeSetOutcome {
+    /// The mode the session holds after this outcome, `None` when it set none.
+    ///
+    /// It is the request, not the attempt that succeeded, so a re-assert
+    /// asks for the rate the game asked for again.
+    #[must_use]
+    pub const fn mode_in_place(&self) -> Option<ModeRequest> {
+        match *self {
+            Self::AlreadyCurrent(requested) | Self::Changed { requested, .. } => Some(requested),
+            Self::NoMode | Self::Refused(_) => None,
+        }
+    }
+}
+
+impl fmt::Display for ModeSetOutcome {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NoMode => f.write_str("no display mode set"),
+            Self::AlreadyCurrent(mode) => write!(f, "display mode {mode} already current"),
+            Self::Changed {
+                requested,
+                set,
+                was,
+            } => {
+                write!(f, "display mode {set} set")?;
+                if set != requested {
+                    write!(f, " for a {requested} request")?;
+                }
+                write!(f, " (was {}x{})", was.0, was.1)
+            }
+            Self::Refused(mode) => write!(f, "display mode {mode} refused"),
+        }
+    }
+}
+
+/// What putting the registry display mode back did, as a log line names it.
+pub enum RegistryRestore {
+    /// The current or the registry mode could not be read, so nothing changed.
+    Unreadable,
+    /// The registry mode, of this size, was the current mode already.
+    AlreadyCurrent((u32, u32)),
+    /// The registry mode of size `registry` replaced the mode of size `was`.
+    Restored {
+        registry: (u32, u32),
+        was: (u32, u32),
+    },
+    /// `ChangeDisplaySettingsW` answered `ret` putting `registry` back over `was`.
+    Failed {
+        registry: (u32, u32),
+        was: (u32, u32),
+        ret: i32,
+    },
+}
+
+impl RegistryRestore {
+    /// `true` when the restore was attempted and user32 refused it.
+    #[must_use]
+    pub const fn failed(&self) -> bool {
+        matches!(self, Self::Failed { .. })
+    }
+}
+
+impl fmt::Display for RegistryRestore {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unreadable => f.write_str("display mode unreadable, left as it is"),
+            Self::AlreadyCurrent((w, h)) => {
+                write!(f, "registry display mode {w}x{h} already current")
+            }
+            Self::Restored { registry, was } => write!(
+                f,
+                "registry display mode {}x{} restored (was {}x{})",
+                registry.0, registry.1, was.0, was.1
+            ),
+            Self::Failed { registry, was, ret } => write!(
+                f,
+                "restoring the registry display mode {}x{} over {}x{} failed (ret={ret})",
+                registry.0, registry.1, was.0, was.1
+            ),
+        }
+    }
 }
 
 /// The mode-set attempts for one request, in order.

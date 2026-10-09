@@ -613,7 +613,7 @@ Every crate logs via `log` + `env_logger`. All targets sit under `mtld3d::*` and
 |---------------------------|--------------------------------------------------------------------------|
 | `mtld3d::d3d9`            | `windows/d3d9/` + `windows/core/` (everything except `dxso` and `perf`)  |
 | `mtld3d::d3d9::cursor`    | hardware cursor (HCURSOR) lifecycle, bitmap cache, wndproc               |
-| `mtld3d::d3d9::display`   | fullscreen mode-set and restore, display-mode enumeration probes (trace) |
+| `mtld3d::d3d9::display`   | fullscreen transitions and mode-sets (info), mode enumeration (trace)    |
 | `mtld3d::d3d9::passes`    | pass-break and pass-open probes, per-pass and per-RT shape rows (trace)  |
 | `mtld3d::d3d9::state`     | every RS/TSS/SAMP write the game makes (trace)                           |
 | `mtld3d::d3d9::cascade`   | shadow-map cascade summary per frame, caster writes vs samples (trace)   |
@@ -643,6 +643,16 @@ object. This identifies the framework actually mapped in that process,
 including an image in the dyld shared cache. Missing path or UUID information
 is explicit. The record uses the same startup backlog and process log as the
 build stamp; the allocating loader query never runs from a signal handler.
+
+### Reset and fullscreen transitions
+
+A resolution change or an alt-tab is diagnosable from a log at the default level. Each `Reset` that reaches validation (a null argument and an encoder that has already failed return before it) writes one line on `mtld3d::d3d9`, naming the old and new back-buffer size, the format, the buffer count, windowed or fullscreen with the refresh rate, the swap effect, the presentation interval, the auto depth-stencil format and the outcome, with the reason for a rejection (`mtld3d_core::reset_summary`). A success logs at info when it changed something the device presents with (a resize, a windowed/fullscreen switch, a new fullscreen mode or refresh rate, or any other present parameter, a presentation interval alone included) or when it recovered a device that was waiting for a `Reset`; otherwise it logs at debug, which covers games that call `Reset` on every step of a window drag after the device already followed the client area. A rejection or failure logs at warn the first time and at debug while the device keeps waiting for a successful `Reset`, since games retry a failing one every frame. With illustrative figures:
+
+```
+IDirect3DDevice9::Reset 1728x1117 -> 1280x720 X8R8G8B8, 1 back buffer, fullscreen at 60 Hz, swap effect DISCARD, interval ONE, auto depth-stencil D24S8: ok, back buffer recreated
+```
+
+`mtld3d::d3d9::display` writes one info line for each fullscreen transition: entering fullscreen, staying fullscreen across a `Reset`, leaving it (with the reason: a windowed `Reset`, the device's release or a failed `CreateDevice`; a windowed `Reset` that asks for the client area leaves provisionally and logs a second line if it puts fullscreen back), the app losing focus (`WM_ACTIVATEAPP` with FALSE, which puts the registry display mode back) and regaining it (the mode set again and the monitor re-covered). Each line names the display mode requested and what user32 did with it, or the registry mode restored, and the window rect the window was given. An external resize of a fullscreen window that the device answers by re-covering the monitor logs the incoming size, the monitor rect, the session's display mode and the session's re-assert count; the re-asserts are bounded by the guard's budget between refills, and after 16 in one session the rest log at debug. When the guard gives up, its one warning carries the same figures. A covered window, which needs no answer, logs at debug. None of these lines repeat per frame.
 
 ### The address-space watch
 

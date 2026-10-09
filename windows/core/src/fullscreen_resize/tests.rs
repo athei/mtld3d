@@ -9,7 +9,8 @@
 //! against a rect a pixel larger than the monitor as well as an exact one.
 
 use super::{
-    COVER_SLACK, ExternalResizeAction, ExternalResizeGuard, REASSERT_BUDGET, covers_monitor,
+    COVER_SLACK, ExternalResizeAction, ExternalResizeGuard, REASSERT_BUDGET,
+    REASSERTS_LOGGED_AT_INFO, covers_monitor,
 };
 
 const MONITOR: (u32, u32) = (3456, 2234);
@@ -117,4 +118,38 @@ fn reset_refills_the_budget() {
         g.decide((100, 100), MONITOR),
         ExternalResizeAction::Reassert
     );
+}
+
+#[test]
+fn the_session_count_keeps_every_reassert_across_refills() {
+    let mut g = ExternalResizeGuard::new();
+    assert_eq!(g.reasserts(), 0);
+    assert_eq!(
+        g.decide((1280, 697), MONITOR),
+        ExternalResizeAction::Reassert
+    );
+    // A repeat of the same size is suppressed, and spends nothing.
+    assert_eq!(
+        g.decide((1280, 697), MONITOR),
+        ExternalResizeAction::Suppressed
+    );
+    assert_eq!(g.reasserts(), 1);
+    // A covering window and a game-driven reset both refill the budget, and
+    // neither clears the count the log line reports.
+    assert_eq!(g.decide(MONITOR, MONITOR), ExternalResizeAction::Covered);
+    assert_eq!(
+        g.decide((1280, 697), MONITOR),
+        ExternalResizeAction::Reassert
+    );
+    g.reset();
+    assert_eq!(
+        g.decide((1280, 697), MONITOR),
+        ExternalResizeAction::Reassert
+    );
+    assert_eq!(g.reasserts(), 3);
+}
+
+#[test]
+fn the_info_lines_cover_two_budgets() {
+    assert_eq!(REASSERTS_LOGGED_AT_INFO, 2 * u32::from(REASSERT_BUDGET));
 }

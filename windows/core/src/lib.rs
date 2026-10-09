@@ -44,6 +44,7 @@ pub mod fetch4;
 pub mod ff_state;
 pub mod format;
 pub mod format_probe;
+pub mod fullscreen_log;
 pub mod fullscreen_resize;
 pub mod gamma;
 pub mod gpu_caps;
@@ -72,6 +73,7 @@ pub mod query_fence;
 pub mod readback;
 pub mod render_scale;
 pub mod render_state;
+pub mod reset_summary;
 pub mod sampler_state;
 pub mod scratch;
 #[cfg(feature = "disk-cache")]

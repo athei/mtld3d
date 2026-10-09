@@ -41,6 +41,16 @@ pub enum ExternalResizeAction {
 /// every fullscreen Reset.
 const REASSERT_BUDGET: u8 = 8;
 
+/// How many re-asserts of one fullscreen session its log line reports at info.
+///
+/// Each re-assert is one line, and the budget bounds them between refills.
+/// A refill comes from a game-driven Reset, a re-activation, or a window seen
+/// covering the monitor, and only the last can repeat without the user doing
+/// anything: a window manager that alternates a covering size with a smaller
+/// one would refill the budget forever. Two budgets' worth is enough to show
+/// that fight in a default log, and the lines after it go to debug.
+pub const REASSERTS_LOGGED_AT_INFO: u32 = 16;
+
 /// Pixels a window may exceed the monitor by and still count as covering it.
 ///
 /// A window rect makes a round trip through the window manager's own
@@ -78,6 +88,8 @@ pub struct ExternalResizeGuard {
     /// (the window manager clamped it back); re-asserting again would loop.
     last_reasserted: Option<(u32, u32)>,
     budget: u8,
+    /// Re-asserts issued since the session began, refills included.
+    reasserts: u32,
 }
 
 impl Default for ExternalResizeGuard {
@@ -92,10 +104,22 @@ impl ExternalResizeGuard {
         Self {
             last_reasserted: None,
             budget: REASSERT_BUDGET,
+            reasserts: 0,
         }
     }
 
+    /// Re-asserts issued since the session began, across every refill.
+    ///
+    /// A refill restores the budget but not this count, so a log line can
+    /// say how long the session has been fighting the window manager.
+    #[must_use]
+    pub const fn reasserts(&self) -> u32 {
+        self.reasserts
+    }
+
     /// Refill the budget for a fresh game-driven fullscreen transition.
+    ///
+    /// The session's re-assert count is kept: it is what the log reports.
     pub const fn reset(&mut self) {
         self.last_reasserted = None;
         self.budget = REASSERT_BUDGET;
@@ -115,6 +139,7 @@ impl ExternalResizeGuard {
         }
         self.last_reasserted = Some(incoming);
         self.budget -= 1;
+        self.reasserts = self.reasserts.saturating_add(1);
         ExternalResizeAction::Reassert
     }
 }
