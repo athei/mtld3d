@@ -2363,7 +2363,7 @@ pub struct MemoryGauges {
     /// The whole process's `malloc`, not this layer's: Wine's unix side and
     /// every system framework allocate there, and so do the Objective-C and
     /// Metal objects the frameworks create for this layer, its pipelines and
-    /// libraries among them. The footprint less this is mapped memory:
+    /// libraries among them. The footprint less this is mostly mapped memory:
     /// [`Self::unix_heap`] (snmalloc maps its own memory), the translator,
     /// Wine's virtual memory and the driver's.
     pub malloc_in_use: u64,
