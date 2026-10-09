@@ -266,6 +266,7 @@ pub extern "C" fn create_command_queue_handler(args: *mut c_void) -> i32 {
             "created Metal device + command queue (unified_memory={}, min_linear_texture_align={})",
             caps.unified_memory, caps.min_linear_texture_align,
         );
+        metal::log_metal_tools();
         STATUS_SUCCESS
     } else {
         error!(target: LOG_TARGET, "failed to create Metal device/command queue");

@@ -875,6 +875,7 @@ fn kv_golden_line() {
         " tex_dirtyrect_calls_total=4 tex_dirtyrect_partial_total=3",
         " cache_textures_count=48 cache_pipelines_count=12 cache_samplers_count=6",
         " cache_programs_count=8 cache_libs_count=8 cache_depth_states_count=4",
+        " metal_capture_layer_count=0",
         " metal_allocated_bytes=1610612736",
         " passes_total=4 commands_total=140 draws_total=100 pipeline_memo_hits_total=97",
         " pipeline_memo_calls_total=100 fan_generated_total=0 draw_unpinned_total=0",
@@ -941,6 +942,38 @@ fn an_unsampled_window_prints_n_a_and_leaves_the_memory_keys_out() {
         want = want.replace(key, "");
     }
     assert_eq!(kv, want, "only the five memory keys are left out");
+}
+
+/// A window measured under Metal's capture layer says so in the grid's header and on the line.
+///
+/// Everything else is the goldens above: one line follows the header, and
+/// the flag key reads 1 where it otherwise reads 0.
+#[test]
+fn a_capture_layer_window_says_so_in_the_header_and_the_kv_line() {
+    let w = sample_window();
+    let captured = CacheSizes {
+        capture_layer: true,
+        ..sample_caches()
+    };
+    let grid = Summary::render_with_ansi(&w, &captured, 2.01, false);
+    let plain = Summary::render_with_ansi(&w, &sample_caches(), 2.01, false);
+    let note =
+        "Metal capture layer loaded (MTL_CAPTURE_ENABLED): submit and GPU rows include its cost\n";
+    let header_end = plain.find('\n').expect("the grid has a header line") + 1;
+    let mut want = plain.clone();
+    want.insert_str(header_end, note);
+    assert_eq!(grid, want, "one line after the header, nothing else");
+    assert!(
+        !plain.contains("capture layer"),
+        "a window without it has no such line"
+    );
+
+    let kv = render_kv(&w, &w, &captured, 2.01).finish();
+    let want = render_kv(&w, &w, &sample_caches(), 2.01).finish().replace(
+        " metal_capture_layer_count=0",
+        " metal_capture_layer_count=1",
+    );
+    assert_eq!(kv, want, "only the flag key changes");
 }
 
 /// Over two unequal frames, `_ms` averages, `_peak_ms` takes the worst frame and `_total` sums.
@@ -1425,6 +1458,7 @@ const fn sample_caches() -> CacheSizes {
             malloc_in_use: 512 << 20,
             staging_wrapped: 4 << 20,
         }),
+        capture_layer: false,
     }
 }
 

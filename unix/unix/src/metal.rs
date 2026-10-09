@@ -24,7 +24,7 @@ mod upscale;
 
 pub use blit::ensure_blit_pipeline;
 pub use buffer::{create_buffers, destroy_buffer};
-pub use capture::{start_capture, stop_capture};
+pub use capture::{capture_layer_loaded, log_metal_tools, start_capture, stop_capture};
 pub use clear_quad::ensure_clear_quad_pipeline;
 pub use command::{BlitArgs, blit_texture_to_buffer, submit_frame, wait_for_gpu_retire};
 pub use device::{create_command_queue, default_device_info, destroy_command_queue};

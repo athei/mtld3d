@@ -2334,6 +2334,12 @@ pub struct CacheSizes {
     /// window closed between the encoder's due check and the emit check;
     /// the grid then prints `n/a` and the kv line leaves the keys out.
     pub memory: Option<MemoryGauges>,
+    /// Whether Metal's capture layer was loaded when the encoder started.
+    ///
+    /// The layer sits under every Metal call, so a window measured with it
+    /// is not comparable with one measured without it; the grid's header
+    /// and the `perf-kv` line both say which.
+    pub capture_layer: bool,
 }
 
 /// Point-in-time memory gauges the encoder reads at the summary.
@@ -4678,6 +4684,12 @@ impl<'a> Summary<'a> {
             timed = self.w.frames,
             label = bn.label(),
         );
+        if self.caches.capture_layer {
+            let _ = writeln!(
+                out,
+                "Metal capture layer loaded (MTL_CAPTURE_ENABLED): submit and GPU rows include its cost"
+            );
+        }
         if let (Some(first), Some(last)) =
             (self.c.inverse_epochs.first(), self.c.inverse_epochs.last())
         {
@@ -6843,6 +6855,7 @@ fn render_kv(w: &PerfWindow, c: &PerfWindow, caches: &CacheSizes, window_secs: f
     kv.count("cache_programs", widen(caches.programs));
     kv.count("cache_libs", widen(caches.libs));
     kv.count("cache_depth_states", widen(caches.depth_states));
+    kv.count("metal_capture_layer", u64::from(caches.capture_layer));
     if let Some(memory) = &caches.memory {
         kv.bytes("metal_allocated", memory.metal_allocated);
     }

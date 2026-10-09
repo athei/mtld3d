@@ -1565,11 +1565,14 @@ conformance-isolate: install-windows-$(ARCH) install-unix-$(SDK_UNIX_ARCH)
 # checks cost the encoder more than the frame does; PROD=0 measures `release`
 # instead, and each report states the profile and whether debug assertions
 # were on. The Metal validation layer and HUD are off: both cost frame time
-# and neither is under test. The configuration is the suite's without the
-# Main Thread Checker, then BENCH_CONFIG='key=value;key=value', appended last
-# the way SCALE is, so its entries win over the ones before it (the stutter
-# benchmark's own `shaderCache.enable=false` still wins over them). PERF=1
-# builds the layer with its perf summary. Each benchmark writes
+# and neither is under test. MTL_CAPTURE_ENABLED is unset for the same
+# reason, here and in `bench-ab` and `bench-variants`: Metal's capture layer
+# sits under every Metal call (docs/ARCHITECTURE.md gives its measured cost
+# beside the Ctrl+Shift+P capture). The configuration is the suite's
+# without the Main Thread Checker, then BENCH_CONFIG='key=value;key=value',
+# appended last the way SCALE is, so its entries win over the ones before it
+# (the stutter benchmark's own `shaderCache.enable=false` still wins over
+# them). PERF=1 builds the layer with its perf summary. Each benchmark writes
 # `bench-<name>.txt` into LOG_DIR (default `.codex/evidence/bench`), beside
 # the layer's log that a PERF=1 build's summary rows are copied from, and
 # `bench-<name>.metrics` next to it, the same numbers plus the build's
@@ -1668,7 +1671,7 @@ bench: $(if $(BENCH_LEG),$(call arm64_builds,$(BENCH_LEG)),install-windows-$(ARC
 	mkdir -p '$(BENCH_DIR)' && rm -f '$(BENCH_DIR)'/bench-*.txt '$(BENCH_DIR)'/bench-*.metrics
 	$(call bench_stage_corpus,$(BENCH_DIR))
 	$(BENCH_SUITE_ASSIGN); \
-	$(if $(BENCH_LEG),$(ARM64_BENCH_SUITE_COPY) && )cd $(E2E_RUNNER_DIR) && $(if $(BENCH_LEG),WINEPREFIX='$(call arm64_prefix,$(BENCH_LEG))' )MTLD3D_CONFIG='$(MTLD3D_CONF_BENCH)' WINEDEBUG= MTL_DEBUG_LAYER=0 MTL_HUD_ENABLED=0 \
+	$(if $(BENCH_LEG),$(ARM64_BENCH_SUITE_COPY) && )cd $(E2E_RUNNER_DIR) && unset MTL_CAPTURE_ENABLED && $(if $(BENCH_LEG),WINEPREFIX='$(call arm64_prefix,$(BENCH_LEG))' )MTLD3D_CONFIG='$(MTLD3D_CONF_BENCH)' WINEDEBUG= MTL_DEBUG_LAYER=0 MTL_HUD_ENABLED=0 \
 		RUST_LOG=info __CX_UNIX_RUST_LOG=info \
 		$(E2E_RUNNER) --wine $(if $(BENCH_LEG),'$(call arm64_sdk,$(BENCH_LEG))/bin/wine',$(WINE)) --jobs 1 --timeout $(BENCH_TIMEOUT) --ignored \
 		$(if $(FILTER),--filter '$(FILTER)') --log-dir '$(BENCH_DIR)' -- $$suite$(if $(BENCH_LEG),; $(call ARM64_LEG_STOP,$(BENCH_LEG)))
@@ -1878,7 +1881,7 @@ bench-ab:
 	$(if $(BENCH_CORPUS),$(call bench_stage_corpus,$(BENCH_AB_OUT)))
 	$(BENCH_STOP_SERVERS); trap stop_servers EXIT; \
 	$(BENCH_SUITE_ASSIGN); \
-	$(if $(BENCH_LEG),$(ARM64_BENCH_SUITE_COPY) && )cd $(E2E_RUNNER_DIR) && WINEDEBUG= MTL_DEBUG_LAYER=0 MTL_HUD_ENABLED=0 \
+	$(if $(BENCH_LEG),$(ARM64_BENCH_SUITE_COPY) && )cd $(E2E_RUNNER_DIR) && unset MTL_CAPTURE_ENABLED && WINEDEBUG= MTL_DEBUG_LAYER=0 MTL_HUD_ENABLED=0 \
 		$(E2E_RUNNER) bench-ab --out '$(BENCH_AB_OUT)' --runs $(RUNS) --timeout $(BENCH_TIMEOUT) \
 		--wait-idle $(BENCH_WAIT_IDLE) \
 		--base-wine '$(call bench_tree,$(BENCH_BASE_ISO))/sdk/bin/wine' \
@@ -1965,7 +1968,7 @@ bench-variants:
 	$(BENCH_VARIANTS_STOP); trap stop_servers EXIT; \
 	$(BENCH_SUITE_ASSIGN); \
 	$(ARM64_BENCH_SUITE_COPY) && \
-	cd $(E2E_RUNNER_DIR) && export WINEDEBUG= MTL_DEBUG_LAYER=0 MTL_HUD_ENABLED=0 && \
+	cd $(E2E_RUNNER_DIR) && unset MTL_CAPTURE_ENABLED && export WINEDEBUG= MTL_DEBUG_LAYER=0 MTL_HUD_ENABLED=0 && \
 	$(call bench_variant_pair,$(BENCH_VARIANTS_OUT)/$(BENCH_VARIANTS_ARCH)-sdk-vs-arm64,$(ISOLATED_ROOT),$(call arm64_root,$(BENCH_VARIANTS_ARCH)),sdk,arm64,$(BENCH_VARIANTS_ARCH),$(BENCH_VARIANTS_ARCH)); \
 	status=$$?; \
 	$(if $(BENCH_VARIANTS_EC),$(call bench_variant_pair,$(BENCH_VARIANTS_OUT)/x86_64-vs-arm64x,$(call arm64_root,x86_64),$(call arm64_root,arm64x),arm64,arm64,x86_64,arm64x); \
