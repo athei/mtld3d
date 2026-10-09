@@ -1045,7 +1045,13 @@ small for any pixel of it to be interior: those read the blend the resolve
 leaves, and the tell is a channel at one eighth or seven eighths of the
 neighbour (`0x20`, `0xdf`) or within a step of it (`0x04`, `0xfb`). A site
 of that shape is `expected`: the space separation is the design, and a probe
-on a boundary has no exact answer under a resample. A site whose values do
+on a boundary has no exact answer under a resample. A CPU write into a scaled
+target (an `UpdateSurface` into a render-target surface or the back buffer, or
+any CPU write into a level of a render-target texture) converts its rect the
+same way and resamples only the rows inside it, so a render texel the rect's
+reported edge cuts takes the written colour or keeps the old one whole: the
+written edge moves by under half a render texel, and a probe on it is the same
+boundary case. A site whose values do
 not fit that mechanism is `real`, exactly as on any other leg; the legs carry
 none today.
 

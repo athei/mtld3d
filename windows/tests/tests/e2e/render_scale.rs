@@ -1013,10 +1013,11 @@ fn a_write_into_a_back_buffer_sized_render_target_texture_reaches_it() {
 ///
 /// A whole-level lock seeds the level blue first, so the resample of the
 /// smaller red rect after it reads rows staged where the blue ones were. The
-/// probes one reported pixel inside each edge of the rect read back through
-/// the rect's outermost rasterized texels, at 0.5, 0.67 and 0.75 as at the
-/// identity, so they hold red only if the resample took nothing from beyond
-/// the rect's own rows.
+/// rect's edges are multiples of 100, which every scale converts exactly, and
+/// the probes in its second and second-to-last rows and columns read back
+/// through its outermost rasterized texels and nothing beyond them, at 0.5,
+/// 0.67 and 0.75 as at the identity, so they hold red only if the resample
+/// took nothing from beyond the rect's own rows.
 #[test]
 fn a_partial_lock_of_a_back_buffer_sized_render_target_texture_writes_only_its_rect() {
     let h = Harness::new();
@@ -1031,7 +1032,7 @@ fn a_partial_lock_of_a_back_buffer_sized_render_target_texture_writes_only_its_r
             &vec![BLUE; (width * height) as usize],
         );
     }
-    let (x1, y1, x2, y2) = (128u32, 96u32, 512u32, 384u32);
+    let (x1, y1, x2, y2) = (100u32, 100u32, 500u32, 400u32);
     {
         let rect = [
             x1.cast_signed(),
