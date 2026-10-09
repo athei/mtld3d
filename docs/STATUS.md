@@ -147,13 +147,13 @@ unless its entry says otherwise.
   `CreateDevice` and `Reset` do, for the kind of device it is called on, and
   its object carries its own present parameters, but its `GetBackBuffer`
   hands back a surface object of its own over the device's back-buffer
-  texture and its `Present` presents the device frame into the device window,
-  warned once. There is no back buffer or window per chain, so a title that renders
-  a second view through one sees it alias the first. Within any one swap
-  chain, the implicit one included, every back-buffer index hands back the
-  same surface object over one texture, so a `StretchRect` that stretches
-  between two of them is refused as a stretch inside one surface (see the
-  kept divergences below).
+  texture and its `Present` presents the device frame into the device
+  window, warned once. There is no back buffer or window per chain, so a
+  title that renders a second view through one sees it alias the first.
+  Within any one swap chain, the implicit one included, every back-buffer
+  index hands back the same surface object over one texture, so a
+  `StretchRect` that stretches between two of them is refused as a stretch
+  inside one surface (see the kept divergences below).
 - `Present` arguments: a source rect, a destination rect, a destination
   window override and a dirty region are accepted on
   `IDirect3DDevice9::Present` and `IDirect3DSwapChain9::Present` and ignored,
