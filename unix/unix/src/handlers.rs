@@ -455,6 +455,26 @@ pub fn process_footprint() -> u64 {
     if rc == 0 { info.ri_phys_footprint } else { 0 }
 }
 
+/// Bytes in use in every `malloc` zone of the process.
+///
+/// `malloc_zone_statistics` with a null zone sums every registered zone, so
+/// this is the whole process's `malloc`: Wine's unix side, the system
+/// frameworks and the Objective-C and Metal objects they allocate for this
+/// layer. It takes each zone's lock in turn: 10 to 25 microseconds with about
+/// 100 MB in use on the `x86_64` Wine, about 160 microseconds on the first call,
+/// so it is read once per summary window.
+pub fn malloc_in_use() -> u64 {
+    let mut stats = libc::malloc_statistics_t {
+        blocks_in_use: 0,
+        size_in_use: 0,
+        max_size_in_use: 0,
+        size_allocated: 0,
+    };
+    // SAFETY: a null zone asks libmalloc to sum every zone into stats, a live writable struct.
+    unsafe { libc::malloc_zone_statistics(core::ptr::null_mut(), &raw mut stats) };
+    u64::try_from(stats.size_in_use).unwrap_or(u64::MAX)
+}
+
 pub extern "C" fn destroy_command_queue_handler(args: *mut c_void) -> i32 {
     // SAFETY: unix-call handler params; PE side passes *const DestroyCommandQueueParams.
     let Some(params) = (unsafe { InPtr::<DestroyCommandQueueParams>::opt(args.cast()) }) else {

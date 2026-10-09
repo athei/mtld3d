@@ -736,6 +736,8 @@ fn summary_golden_layout() {
         "  uncached  1 (5.9%)                peak 1/frame                allocs over 1 MiB: past snmalloc's per-thread budget, so commit in / decommit out every time\n",
         "faults      minflt=4200  majflt=3   4200.0 min/frame            process-wide getrusage delta this window (all threads); zero-fill faults on fresh pages land here\n",
         "footprint   3072.0 MB                                           process phys_footprint at the summary, the Metal HUD's app memory (Wine and the game included)\n",
+        "unix heap   96.0 MB                                             mtld3d.so's snmalloc committed at the summary (its Rust heap; framework malloc not included)\n",
+        "malloc      512.0 MB                                            whole-process malloc in use at the summary (Wine's unix side and the frameworks, Metal's objects included)\n",
         "metal alloc 1536.0 MB                                           MTLDevice currentAllocatedSize at the summary (every Metal allocation of the process)",
     );
     assert_eq!(got, want, "perf summary drifted — diff above");
@@ -895,12 +897,13 @@ fn kv_golden_line() {
         " pe_pagebox_alloc_total=0 pe_pagebox_alloc_bytes_total=0 pe_pagebox_free_total=0",
         " pe_pagebox_free_bytes_total=0 pe_pagebox_uncached_total=0",
         " faults_minor_total=4200 faults_major_total=3",
-        " process_footprint_bytes=3221225472",
+        " process_footprint_bytes=3221225472 unix_heap_bytes=100663296",
+        " malloc_in_use_bytes=536870912",
     );
     assert_eq!(got, want, "perf-kv line drifted");
 }
 
-/// A window closed before its memory sample prints `n/a` in the three rows and has no keys.
+/// A window closed before its memory sample prints `n/a` in the five rows and has no keys.
 ///
 /// The grid and the line are otherwise the goldens above, cell for cell: the
 /// `n/a` cells keep the comment column, and nothing else moves.
@@ -916,12 +919,14 @@ fn an_unsampled_window_prints_n_a_and_leaves_the_memory_keys_out() {
     for (sampled, missing) in [
         ("\nwrapped     4.0 MB    ", "\nwrapped     n/a       "),
         ("\nfootprint   3072.0 MB ", "\nfootprint   n/a       "),
+        ("\nunix heap   96.0 MB   ", "\nunix heap   n/a       "),
+        ("\nmalloc      512.0 MB  ", "\nmalloc      n/a       "),
         ("\nmetal alloc 1536.0 MB ", "\nmetal alloc n/a       "),
     ] {
         assert!(want.contains(sampled), "the sampled grid has {sampled:?}");
         want = want.replace(sampled, missing);
     }
-    assert_eq!(grid, want, "only the three memory cells change");
+    assert_eq!(grid, want, "only the five memory cells change");
 
     let kv = render_kv(&w, &w, &unsampled, 2.01).finish();
     let mut want = render_kv(&w, &w, &sample_caches(), 2.01).finish();
@@ -929,11 +934,13 @@ fn an_unsampled_window_prints_n_a_and_leaves_the_memory_keys_out() {
         " tex_staging_wrapped_bytes=4194304",
         " metal_allocated_bytes=1610612736",
         " process_footprint_bytes=3221225472",
+        " unix_heap_bytes=100663296",
+        " malloc_in_use_bytes=536870912",
     ] {
         assert!(want.contains(key), "the sampled line has {key:?}");
         want = want.replace(key, "");
     }
-    assert_eq!(kv, want, "only the three memory keys are left out");
+    assert_eq!(kv, want, "only the five memory keys are left out");
 }
 
 /// Over two unequal frames, `_ms` averages, `_peak_ms` takes the worst frame and `_total` sums.
@@ -1414,6 +1421,8 @@ const fn sample_caches() -> CacheSizes {
         memory: Some(MemoryGauges {
             process_footprint: 3 << 30,
             metal_allocated: 3 << 29,
+            unix_heap: 96 << 20,
+            malloc_in_use: 512 << 20,
             staging_wrapped: 4 << 20,
         }),
     }

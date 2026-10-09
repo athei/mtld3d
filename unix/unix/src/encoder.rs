@@ -2410,9 +2410,10 @@ impl FrameEncoder {
     /// the payload is recycled only afterwards — reproducing the
     /// pre-split ordering exactly.
     fn log_perf_summary(&mut self, payload: &FramePayload, ctx: &FrameSummaryContext, status: i32) {
-        // The once-per-window reads (getrusage, the footprint, the Metal
-        // allocated size, the wrapper walk) run only when the summary is
-        // both enabled and about to emit; every other frame passes None.
+        // The once-per-window reads (getrusage, the footprint, the process's
+        // malloc, snmalloc's committed bytes, the Metal allocated size, the
+        // wrapper walk) run only when the summary is both enabled and about
+        // to emit; every other frame passes None.
         let due = perf_enabled() && self.perf.window_due();
         let caches = self.cache_sizes(payload, due.then(|| self.memory_gauges()));
         let cmd_vec_realloc_bytes = self.pass_state.take_cmd_vec_realloc_bytes();
@@ -2457,14 +2458,18 @@ impl FrameEncoder {
         }
     }
 
-    /// The process footprint, the device's allocated size and the cached wrappers' bytes.
+    /// The footprint, the process's `malloc`, our heap, the device's size and the wrappers' bytes.
     ///
-    /// Two system queries and a walk of every cached texture's level slots, so
-    /// it runs once per summary window, never per frame.
+    /// Three system queries (the `malloc` one takes every zone's lock),
+    /// snmalloc's two atomic loads and a walk of every cached texture's level
+    /// slots, so it runs once per summary window, never per frame.
     fn memory_gauges(&self) -> MemoryGauges {
         MemoryGauges {
             process_footprint: crate::handlers::process_footprint(),
             metal_allocated: u64::try_from(self.device.currentAllocatedSize()).unwrap_or(u64::MAX),
+            unix_heap: u64::try_from(snmalloc_rs::SnMalloc::memory_stats().current_memory_usage)
+                .unwrap_or(u64::MAX),
+            malloc_in_use: crate::handlers::malloc_in_use(),
             staging_wrapped: staging_wrapped_bytes(&self.texture_cache),
         }
     }
