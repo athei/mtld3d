@@ -2410,9 +2410,10 @@ impl FrameEncoder {
     /// the payload is recycled only afterwards — reproducing the
     /// pre-split ordering exactly.
     fn log_perf_summary(&mut self, payload: &FramePayload, ctx: &FrameSummaryContext, status: i32) {
-        // The once-per-window reads (getrusage, the footprint, the Metal
-        // allocated size, the wrapper walk) run only when the summary is
-        // both enabled and about to emit; every other frame passes None.
+        // The once-per-window reads (getrusage, the footprint, the process's
+        // malloc, snmalloc's committed bytes, the Metal allocated size, the
+        // wrapper walk) run only when the summary is both enabled and about
+        // to emit; every other frame passes None.
         let due = perf_enabled() && self.perf.window_due();
         let caches = self.cache_sizes(payload, due.then(|| self.memory_gauges()));
         let cmd_vec_realloc_bytes = self.pass_state.take_cmd_vec_realloc_bytes();

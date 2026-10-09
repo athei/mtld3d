@@ -2338,8 +2338,9 @@ pub struct CacheSizes {
 
 /// Point-in-time memory gauges the encoder reads at the summary.
 ///
-/// Each costs a system or Metal query or a walk of the texture cache, so
-/// the encoder reads them only for a window about to emit.
+/// Together they cost system and Metal queries, a walk of every zone of
+/// `malloc` and of the texture cache, and two atomic loads, so the encoder
+/// reads them only for a window about to emit.
 pub struct MemoryGauges {
     /// The process's physical footprint in bytes (`ri_phys_footprint`).
     ///
@@ -2362,8 +2363,9 @@ pub struct MemoryGauges {
     /// The whole process's `malloc`, not this layer's: Wine's unix side and
     /// every system framework allocate there, and so do the Objective-C and
     /// Metal objects the frameworks create for this layer, its pipelines and
-    /// libraries among them. The footprint less this is mostly mapped memory:
-    /// the translator, Wine's virtual memory and the driver's.
+    /// libraries among them. The footprint less this is mapped memory:
+    /// [`Self::unix_heap`] (snmalloc maps its own memory), the translator,
+    /// Wine's virtual memory and the driver's.
     pub malloc_in_use: u64,
     /// Padded staging bytes under the encoder's cached per-level `bytesNoCopy` wrappers.
     ///

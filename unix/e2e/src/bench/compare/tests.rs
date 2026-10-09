@@ -688,7 +688,7 @@ fn memory_gauges_the_candidate_drops_from_every_round_are_incomplete_not_removed
     // so a candidate that stops writing the gauges altogether reads as
     // incomplete and the run still passes, as it does for the fault counts.
     let fixture = Fixture::new("memory-gone");
-    let gauges: [(&str, f64, &str); 3] = [
+    let gauges: [(&str, f64, &str); 5] = [
         (
             "perf.process_footprint_bytes",
             965_382_944.0,
@@ -703,6 +703,12 @@ fn memory_gauges_the_candidate_drops_from_every_round_are_incomplete_not_removed
             "perf.tex_staging_wrapped_bytes",
             308_789_248.0,
             "bytes lower bytes",
+        ),
+        ("perf.unix_heap_bytes", 100_663_296.0, "bytes lower info"),
+        (
+            "perf.malloc_in_use_bytes",
+            536_870_912.0,
+            "bytes lower info",
         ),
     ];
     for round in 0..3 {
@@ -726,7 +732,7 @@ fn memory_gauges_the_candidate_drops_from_every_round_are_incomplete_not_removed
         );
     }
     let summary = comparison.summary();
-    assert!(summary.contains("3 incomplete"), "{summary}");
+    assert!(summary.contains("5 incomplete"), "{summary}");
     assert!(summary.contains("0 removed"), "{summary}");
 }
 

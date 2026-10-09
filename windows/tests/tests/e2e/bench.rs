@@ -1673,9 +1673,9 @@ impl Metrics {
     ///   (`tex_uploads_total`, `exact` over [`FrameWork::Fixed`] frames),
     ///   with no cap on that queue. The process footprint, the process's
     ///   `malloc`, the Metal device's allocated size and the native
-    ///   runtime's heap ([`PROCESS_BYTES_KEYS`]) are `info` too: they count the whole
-    ///   process, or every device of it, and what earlier benchmarks of the
-    ///   round left in it.
+    ///   runtime's heap ([`PROCESS_BYTES_KEYS`]) are `info` too: they
+    ///   count the whole process, or every device of it, and what earlier
+    ///   benchmarks of the round left in it.
     /// - `_count`, a count gauge: `perf.<key>` in counts, the largest; `exact`
     ///   for a cache size (`cache_*_count`) when the frames are
     ///   [`FrameWork::Fixed`], `info` for a retention queue's peak depth

@@ -460,11 +460,16 @@ pub fn process_footprint() -> u64 {
 /// `malloc_zone_statistics` with a null zone sums every registered zone, so
 /// this is the whole process's `malloc`: Wine's unix side, the system
 /// frameworks and the Objective-C and Metal objects they allocate for this
-/// layer. It takes each zone's lock in turn, a few microseconds to tens of
-/// microseconds, so it is read once per summary window.
+/// layer. It takes each zone's lock in turn: 10 to 25 microseconds with about
+/// 100 MB in use on an x86_64 Wine, about 160 on the first call, so it is
+/// read once per summary window.
 pub fn malloc_in_use() -> u64 {
-    // SAFETY: malloc_statistics_t is plain data initialized before libmalloc fills it.
-    let mut stats: libc::malloc_statistics_t = unsafe { core::mem::zeroed() };
+    let mut stats = libc::malloc_statistics_t {
+        blocks_in_use: 0,
+        size_in_use: 0,
+        max_size_in_use: 0,
+        size_allocated: 0,
+    };
     // SAFETY: a null zone asks libmalloc to sum every zone into stats, a live writable struct.
     unsafe { libc::malloc_zone_statistics(core::ptr::null_mut(), &raw mut stats) };
     u64::try_from(stats.size_in_use).unwrap_or(u64::MAX)
