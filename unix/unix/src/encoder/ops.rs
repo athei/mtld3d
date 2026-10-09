@@ -336,9 +336,11 @@ fn execute_control(
         }
         EncoderOpcode::UpdateColorRegion => {
             let r = borrow::<records::UpdateColorRegionRecord>(payload)?;
+            let color_handle = surface_handle(enc, &r.identity)?;
             enc.update_color_region(
+                color_handle,
                 &ColorRegionUpdate {
-                    color_handle: r.handle,
+                    level: r.level,
                     format: pixel_format(r.format)?,
                     origin: (r.origin_x, r.origin_y),
                     extent: (r.width, r.height),

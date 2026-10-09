@@ -1093,7 +1093,12 @@ fn update_texture_into_a_back_buffer_sized_render_target_texture_writes_mip_leve
         D3D_OK,
         "UpdateTexture of both levels"
     );
-    let level0 = read_back(&h, &target.surface_level(0), (width, height), D3DFMT_A8R8G8B8);
+    let level0 = read_back(
+        &h,
+        &target.surface_level(0),
+        (width, height),
+        D3DFMT_A8R8G8B8,
+    );
     assert_eq!(
         level0[(height / 2 * width + width / 2) as usize],
         GREEN,
@@ -1126,7 +1131,11 @@ fn get_dc_drawing_into_a_back_buffer_sized_render_target_texture_reaches_it() {
     let (width, height) = h.dims();
     let target = backbuffer_sized_target(&h, 1);
     let level = target.surface_level(0);
-    assert_eq!(h.color_fill_hr(&level, BLUE), D3D_OK, "seed the whole level");
+    assert_eq!(
+        h.color_fill_hr(&level, BLUE),
+        D3D_OK,
+        "seed the whole level"
+    );
     let dc = level.dc();
     dc.fill_block(BLOCK.cast_signed(), RED_COLORREF);
     assert_eq!(dc.release(), D3D_OK, "ReleaseDC");

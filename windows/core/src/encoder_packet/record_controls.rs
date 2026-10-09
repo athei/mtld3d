@@ -738,7 +738,7 @@ capture_control!(
             scratch,
             tag,
             UpdateColorRegionRecord {
-                handle: v.target.color_handle,
+                identity: identity(&v.kind),
                 bytes: span(v.bytes),
                 format: v.target.format as u32,
                 origin_x: v.target.origin.0,
@@ -751,7 +751,7 @@ capture_control!(
                 texture_height: v.target.texture.1,
                 scale: v.target.scale.percent(),
                 stride: v.target.bytes_per_row,
-                reserved: 0
+                level: v.target.level
             }
         );
     }

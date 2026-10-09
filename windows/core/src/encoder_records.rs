@@ -233,7 +233,7 @@ record!(UploadColorRecord {
     reserved: u32
 });
 record!(UpdateColorRegionRecord {
-    handle: u64,
+    identity: SurfaceIdentityRecord,
     bytes: ByteSpan,
     format: u32,
     origin_x: u32,
@@ -246,7 +246,7 @@ record!(UpdateColorRegionRecord {
     texture_height: u32,
     scale: u32,
     stride: u32,
-    reserved: u32
+    level: u32
 });
 record!(ResampledTargetRecord {
     handle: u64,

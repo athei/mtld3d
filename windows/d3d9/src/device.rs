@@ -8284,8 +8284,9 @@ fn update_surface_into_color_target(
     // SAFETY: the captured token moves directly into this frame's operation.
     let bytes = unsafe { dev.capture_frame_bytes(&rows) };
     dev.push_control(UpdateColorRegionOp {
+        kind: StretchKind::Backbuffer(dst_surf.metal_color_handle()),
         target: mtld3d_core::encoder_data::ColorRegionUpdate {
-            color_handle: dst_surf.metal_color_handle().raw(),
+            level: 0,
             format: dst_mapping.metal_pixel_format(),
             origin,
             extent: (region.w, region.h),

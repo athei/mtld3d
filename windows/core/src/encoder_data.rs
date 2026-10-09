@@ -309,24 +309,27 @@ pub struct ResampledUpload {
     pub sample_count: u8,
 }
 
-/// One `UpdateSurface` region into a colour surface no texture backs, resolved on the API thread.
+/// One region of rows into a colour surface or texture level, resolved on the API thread.
 ///
-/// The destination is a render-target surface or the back buffer. Built by
-/// `device_update_surface`, where the surface's extent and scale are
-/// reachable, and run by `update_color_region` on the encoder thread, in API
-/// order among the application's passes.
+/// The destination is a render-target surface or the back buffer, written by
+/// `UpdateSurface` (`device_update_surface`), or a level of a render-target
+/// texture `render.scale` shrinks, written by any CPU path into its staging
+/// (`texture::schedule_resampled_upload`). Both builders run where the
+/// destination's extent and scale are reachable; `update_color_region` runs it
+/// on the encoder thread, in API order among the application's passes, after
+/// resolving the destination's `MTLTexture` from the op's kind.
 pub struct ColorRegionUpdate {
-    /// Destination colour `MTLTexture`.
-    pub color_handle: u64,
+    /// Mip level of the destination; 0 for a surface.
+    pub level: u32,
     /// Metal format of the destination, which the rows are already encoded in.
     pub format: PixelFormat,
     /// Where the region's top-left texel lands, in the coordinates D3D9 reports.
     pub origin: (u32, u32),
     /// Extent of the region, which is the extent the rows describe.
     pub extent: (u32, u32),
-    /// Extent of the destination as D3D9 reports it.
+    /// Extent of the destination level as D3D9 reports it.
     pub logical: (u32, u32),
-    /// Extent Metal allocated for the destination, at or below `logical`.
+    /// Extent Metal allocated for the destination level, at or below `logical`.
     pub texture: (u32, u32),
     /// The scale that relates `texture` to `logical`.
     pub scale: RenderScale,
@@ -671,6 +674,7 @@ pub struct UploadResampledOp {
 }
 
 pub struct UpdateColorRegionOp {
+    pub kind: StretchKind,
     pub target: ColorRegionUpdate,
     pub bytes: ScratchSlice,
 }

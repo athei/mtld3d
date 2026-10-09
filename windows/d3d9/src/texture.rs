@@ -7,6 +7,7 @@ use std::sync::{
 use mtld3d_core::{
     api_lock::{ApiGuard, ApiLock},
     dirty_rect::{DirtyRect, clip_copy_region},
+    encoder_data::{ColorRegionUpdate, StretchKind},
     format::block_row_pitch,
     ids::TextureId,
     level_authority::{LevelAuthorityMask, WritePlan},
@@ -4935,6 +4936,12 @@ fn schedule_upload_with_order<const ORDERED: bool>(
         );
         return;
     }
+    // A const-generic test: the bind-time instantiation keeps its code as it
+    // was, and the ordered one pays this compare at the identity scale.
+    if ORDERED && !ti.render_scale.is_identity() {
+        schedule_resampled_upload(ti, dev, level, rect);
+        return;
+    }
     // Volume (3D) textures upload `(depth >> level)` slices; 2D textures are
     // `depth == 1` (the encoder then keeps the untouched single-slice path).
     // `slice_pitch` is the box slice stride — `row_pitch * ceil(mip_h /
@@ -5009,6 +5016,91 @@ fn schedule_upload_with_order<const ORDERED: bool>(
             flags
         },
     });
+}
+
+/// Upload a written rect of a level `render.scale` shrinks, resampled into its Metal level.
+///
+/// The staging holds the rect at the extent D3D9 reports and the level's
+/// Metal texture is smaller, so no buffer copy can carry it. Its rows go to
+/// the encoder as a colour region update instead, which stages them at their
+/// own extent and resamples them into the rect's rasterized counterpart, in
+/// application order. Only the rect goes: the texels around it stay as the GPU
+/// holds them rather than taking a resample down and back up.
+///
+/// Only a 2D render-target texture created at the reported back-buffer size
+/// is scaled, and every CPU write into one publishes in order
+/// ([`publish_render_target_write`]), so the ordered upload path is the one
+/// that comes here. The GPU never reads the staging for this upload, so the
+/// level's in-flight stamp stays as it was.
+fn schedule_resampled_upload(
+    ti: &mut TextureInner,
+    dev: &mut DeviceInner,
+    level: u32,
+    rect: DirtyRect,
+) {
+    let level_u = level as usize;
+    let texture_id = ti.texture_id;
+    let bpp = ti.bytes_per_pixel as usize;
+    let pitch = ti.mip_bytes_per_row(level_u) as usize;
+    let row_bytes = rect.w as usize * bpp;
+    let staging = ti.staging[level_u].as_slice();
+    let mut rows = Vec::with_capacity(row_bytes * rect.h as usize);
+    for row in rect.y as usize..(rect.y + rect.h) as usize {
+        let start = row * pitch + rect.x as usize * bpp;
+        let Some(src) = staging.get(start..start + row_bytes) else {
+            rows.clear();
+            break;
+        };
+        rows.extend_from_slice(src);
+    }
+    if rows.is_empty() {
+        mtld3d_shared::log_once_warn_by!(
+            target: crate::LOG_TARGET,
+            key: texture_id.raw(),
+            "texture {:#x}: level {level} rect {},{} {}x{} has no rows to resample into its \
+             scaled texture ({bpp} bytes per texel); the write is not uploaded",
+            texture_id.raw(),
+            rect.x,
+            rect.y,
+            rect.w,
+            rect.h
+        );
+        return;
+    }
+    let logical = (ti.mip_width(level_u), ti.mip_height(level_u));
+    let texture =
+        TargetExtent::mip_level(ti.render_scale, logical, ti.render_extent(), level).texture();
+    mtld3d_shared::log_once_trace_by!(
+        target: TEX_TRACE_TARGET,
+        key: (texture_id.raw() << 8) | (level_u as u64 & 0xff),
+        "tex {texture_id:#x} mip {level} resampled upload {},{} {}x{} into {}x{}",
+        rect.x,
+        rect.y,
+        rect.w,
+        rect.h,
+        texture.0,
+        texture.1
+    );
+    // SAFETY: the captured token moves directly into this frame's operation.
+    let bytes = unsafe { dev.capture_frame_bytes(&rows) };
+    dev.push_control(crate::device::UpdateColorRegionOp {
+        kind: StretchKind::Texture(ti.texture_info()),
+        target: ColorRegionUpdate {
+            level,
+            format: ti.metal_pixel_format,
+            origin: (rect.x, rect.y),
+            extent: (rect.w, rect.h),
+            logical,
+            texture,
+            scale: ti.render_scale,
+            bytes_per_row: u32::try_from(row_bytes).expect("a level row fits u32"),
+        },
+        bytes,
+    });
+    ti.was_uploaded[level_u] = true;
+    if ti.autogen_mipmap() && level == 0 {
+        dev.push_control(crate::device::GenerateMipmapsOrderedOp { old_id: texture_id });
+    }
 }
 
 fn schedule_cube_upload<const ORDERED: bool>(
