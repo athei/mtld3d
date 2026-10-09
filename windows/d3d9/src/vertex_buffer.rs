@@ -115,12 +115,13 @@ pub struct VertexBufferInner {
     /// blocker until this and the public refcount are both zero
     /// (`ComChild::state_block_refs_mut`).
     state_block_refs: u32,
-    /// App-set managed-resource priority, round-tripped by `GetPriority` / `SetPriority`.
+    /// App-set resource priority, round-tripped by `GetPriority` / `SetPriority`.
     ///
-    /// D3D9 only honours priority for `D3DPOOL_MANAGED` buffers (it drives
-    /// the resource manager's eviction order); for every other pool both
-    /// accessors are fixed at `0`. Metal has no eviction-order hint, so
-    /// this is app-visible state only and never acted upon.
+    /// D3D9 honours priority for the pool a memory manager pages, which
+    /// orders its evictions: `D3DPOOL_MANAGED` on a plain device and
+    /// `D3DPOOL_DEFAULT` on an extended one. For every other pool both
+    /// accessors are fixed at `0`. Metal has no eviction-order hint, so this
+    /// is app-visible state only and never acted upon.
     priority: u32,
 }
 
@@ -580,10 +581,11 @@ extern "system" fn vb_free_private_data(this: *mut c_void, guid: *const Guid) ->
     obj.inner_mut().private_data.free(&guid)
 }
 
-// Priority is honoured only for `D3DPOOL_MANAGED` resources (D3D9 manager
-// eviction order). For every other pool both accessors are fixed at `0`.
-// Metal has no eviction-order hint, so the value is stored and round-tripped
-// but never acted upon.
+// Priority is honoured for the pool a device's memory manager pages:
+// `D3DPOOL_MANAGED` on a plain device, `D3DPOOL_DEFAULT` on an extended one.
+// For every other pool both accessors are fixed at `0`. Metal has no
+// eviction-order hint, so the value is stored and round-tripped but never
+// acted upon.
 extern "system" fn vb_set_priority(this: *mut c_void, priority: u32) -> u32 {
     let _api = crate::com_ref::com_api_lock::<Direct3DVertexBuffer9>(this);
     let _timer = vb_timer(this);
@@ -592,7 +594,11 @@ extern "system" fn vb_set_priority(this: *mut c_void, priority: u32) -> u32 {
         return 0;
     };
     let inner = obj.inner_mut();
-    if inner.pool != mtld3d_types::D3DPOOL_MANAGED {
+    let extended = inner.pool == mtld3d_types::D3DPOOL_DEFAULT
+        // SAFETY: a default-pool buffer forwards a reference to its device,
+        // so `device_inner` is null or that live device.
+        && unsafe { crate::device::device_inner_is_extended(inner.device_inner as u64) };
+    if !mtld3d_core::pool::priority_settable(inner.pool, extended) {
         return 0;
     }
     core::mem::replace(&mut inner.priority, priority)

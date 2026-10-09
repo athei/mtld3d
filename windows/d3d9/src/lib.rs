@@ -50,7 +50,7 @@ use mtld3d_shared::{InitLoggerParams, identity};
 // `use super::{D3D_OK, …}` path stays valid.
 use mtld3d_types::{
     D3D_OK, D3DERR_INVALIDCALL, D3DERR_NOTAVAILABLE, D3DERR_NOTFOUND, E_FAIL, E_NOINTERFACE,
-    E_NOTIMPL, S_FALSE,
+    S_FALSE,
 };
 
 use crate::{
@@ -204,6 +204,31 @@ pub fn pin_image() {
 #[unsafe(export_name = "Direct3DCreate9")]
 #[must_use]
 pub extern "system" fn direct3d_create9(_sdk_version: u32) -> *mut c_void {
+    create_interface(false).cast::<c_void>()
+}
+
+/// `Direct3DCreate9Ex`: an `IDirect3D9Ex`, the factory of extended devices.
+///
+/// The interface is the one `Direct3DCreate9` makes with its extended flag
+/// set: it answers `IID_IDirect3D9Ex`, and every device it creates, through
+/// `CreateDeviceEx` or plain `CreateDevice`, is an extended device. A null
+/// out slot is `D3DERR_INVALIDCALL` and creates nothing.
+#[unsafe(export_name = "Direct3DCreate9Ex")]
+pub extern "system" fn direct3d_create9_ex(_sdk_version: u32, out: *mut *mut c_void) -> i32 {
+    if out.is_null() {
+        mtld3d_shared::log_once_warn!(
+            target: LOG_TARGET,
+            "reject Direct3DCreate9Ex: null out slot → INVALIDCALL"
+        );
+        return D3DERR_INVALIDCALL;
+    }
+    write_out(out, create_interface(true).cast::<c_void>());
+    log::info!(target: LOG_TARGET, "Direct3DCreate9Ex: extended interface created");
+    D3D_OK
+}
+
+/// Create the interface both factory exports hand out, `extended` for `Direct3DCreate9Ex`.
+fn create_interface(extended: bool) -> *mut Direct3D9 {
     // Resolves `mtld3d.conf` for this interface and logs the option set. The
     // log location it names reaches the unix side before the logging thread
     // starts, so every line queued since `DllMain` lands in the file; a later
@@ -218,33 +243,7 @@ pub extern "system" fn direct3d_create9(_sdk_version: u32) -> *mut c_void {
     // recently sizes it.
     page_box_pool::PAGEBOX_POOL
         .set_cap(usize::try_from(cfg.pagebox_pool_cap_bytes).unwrap_or(usize::MAX));
-    Box::into_raw(Box::new(Direct3D9::new(Arc::new(cfg)))).cast::<c_void>()
-}
-
-/// `Direct3DCreate9Ex`: exported, and answers `D3DERR_NOTAVAILABLE`.
-///
-/// `D3D9Ex` is not implemented, so this never hands back an `IDirect3D9Ex`. The
-/// export exists because a title can fail on the symbol's absence alone: a
-/// compatibility checker resolves the name to decide whether the installed
-/// runtime is the Vista-era one and refuses to start the game when the lookup
-/// comes back null, without ever calling what it found. A resolvable entry
-/// point that reports the feature as unavailable answers that question
-/// truthfully, where a missing one reads as a broken `d3d9.dll`.
-///
-/// Nothing is created here, so unlike `Direct3DCreate9` this resolves no
-/// configuration and does not hold the logging thread. The out slot is cleared
-/// so no caller reads an uninitialised pointer after a failed create.
-#[unsafe(export_name = "Direct3DCreate9Ex")]
-pub extern "system" fn direct3d_create9_ex(_sdk_version: u32, out: *mut *mut c_void) -> i32 {
-    mtld3d_shared::log_once_warn!(
-        target: LOG_TARGET,
-        "Direct3DCreate9Ex → NOTAVAILABLE (D3D9Ex is not implemented)"
-    );
-    if out.is_null() {
-        return D3DERR_INVALIDCALL;
-    }
-    null_out(out);
-    D3DERR_NOTAVAILABLE
+    Box::into_raw(Box::new(Direct3D9::new(Arc::new(cfg), extended)))
 }
 
 #[unsafe(export_name = "Direct3DShaderValidatorCreate9")]
@@ -366,6 +365,16 @@ fn null_out(out: *mut *mut c_void) {
         // `*mut c_void` slot owned by the caller.
         unsafe { *out = core::ptr::null_mut() };
     }
+}
+
+/// Write a COM `**out` parameter, the success counterpart of [`null_out`].
+///
+/// A private helper so the exported entry point that calls it stays a safe
+/// function; `out` is null or a writable slot per the COM ABI.
+fn write_out(out: *mut *mut c_void, value: *mut c_void) {
+    // SAFETY: per the COM ABI `out` is null, which `write_opt` skips, or a
+    // writable `*mut c_void` slot owned by the caller.
+    unsafe { mtld3d_shared::OutPtr::write_opt(out, value) };
 }
 
 /// `DLL_PROCESS_ATTACH` body.

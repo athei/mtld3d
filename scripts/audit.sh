@@ -59,6 +59,7 @@ PE_JOIN_EXEMPT='^windows/tests/|/tests(\.rs$|/)'
 # cursor window procedure is the one exception, by name: it runs on the window
 # thread, which a thunk holding the lock sends synchronous messages to.
 API_LOCK_FILES='windows/d3d9/src/device.rs
+windows/d3d9/src/device/extended.rs
 windows/d3d9/src/cursor.rs
 windows/d3d9/src/texture.rs
 windows/d3d9/src/surface.rs

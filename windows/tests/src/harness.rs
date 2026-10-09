@@ -22,7 +22,7 @@ use mtld3d_types::{
 
 use crate::{
     check::expect_ok,
-    ffi::Direct3DCreate9,
+    ffi::{Direct3DCreate9, direct3d_create9_ex},
     resource::{
         CubeTexture, IndexBuffer, PixelShader, Query, StateBlock, Surface, SwapChain, Texture,
         VertexBuffer, VertexDeclaration, VertexShader, VolumeTexture,
@@ -32,6 +32,7 @@ use crate::{
 };
 
 mod cursor_bitmap;
+pub mod extended;
 
 /// The process environment, which every `Direct3DCreate9` reads.
 ///
@@ -211,6 +212,17 @@ bitflags::bitflags! {
     }
 }
 
+/// Which factory export a [`Harness`] creates its interface with, and how it creates the device.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Factory {
+    /// `Direct3DCreate9`, then `CreateDevice`.
+    Plain,
+    /// `Direct3DCreate9Ex`, then the base `CreateDevice`, which still makes an extended device.
+    Extended,
+    /// `Direct3DCreate9Ex`, then `CreateDeviceEx` with no display mode.
+    ExtendedDeviceEx,
+}
+
 /// How a [`Harness`] device is created.
 pub struct HarnessConfig {
     pub width: u32,
@@ -255,6 +267,8 @@ pub struct HarnessConfig {
     /// display; a benchmark that times frames asks for
     /// `D3DPRESENT_INTERVAL_IMMEDIATE` so the refresh rate does not bound them.
     pub presentation_interval: u32,
+    /// The factory export and device create; [`Factory::Plain`] by default.
+    pub factory: Factory,
 }
 
 impl Default for HarnessConfig {
@@ -274,6 +288,7 @@ impl Default for HarnessConfig {
             multi_sample_quality: 0,
             device_window: 0,
             presentation_interval: 0,
+            factory: Factory::Plain,
         }
     }
 }
@@ -409,9 +424,11 @@ pub struct Harness {
     multi_sample_type: u32,
     /// The entries the interface was created with on top of the suite-wide configuration.
     config_entries: String,
+    /// The factory export the interface came from: whether it and its device are extended.
+    factory: Factory,
 }
 
-/// `Direct3DCreate9` under the environment lock.
+/// The factory export `factory` names, called under the environment lock.
 ///
 /// Shared for the suite-wide configuration; exclusive, with `entries`
 /// appended to `MTLD3D_CONFIG` for the duration of the call and the variable
@@ -423,12 +440,11 @@ pub struct Harness {
 ///
 /// # Panics
 /// Panics if the factory cannot be created.
-fn create_factory(entries: &str) -> *mut c_void {
+fn create_factory(entries: &str, factory: Factory) -> *mut c_void {
     crate::in_flight::announce();
     let d3d9 = if entries.is_empty() {
         let _shared = ENVIRONMENT.read().unwrap_or_else(PoisonError::into_inner);
-        // SAFETY: Win32-style factory entrypoint with no preconditions.
-        unsafe { Direct3DCreate9(D3DSDK_VERSION) }
+        call_factory(factory)
     } else {
         let exclusive = ENVIRONMENT.write().unwrap_or_else(PoisonError::into_inner);
         let previous = std::env::var(CONFIG_VAR).ok();
@@ -439,8 +455,7 @@ fn create_factory(entries: &str) -> *mut c_void {
         // other reader, the environment block a child spawn copies, takes the
         // shared lock across the spawn in `run_child`.
         unsafe { std::env::set_var(CONFIG_VAR, merged) };
-        // SAFETY: Win32-style factory entrypoint with no preconditions.
-        let d3d9 = unsafe { Direct3DCreate9(D3DSDK_VERSION) };
+        let d3d9 = call_factory(factory);
         match previous {
             // SAFETY: as above, still under the exclusive lock.
             Some(value) => unsafe { std::env::set_var(CONFIG_VAR, value) },
@@ -450,8 +465,25 @@ fn create_factory(entries: &str) -> *mut c_void {
         drop(exclusive);
         d3d9
     };
-    assert!(!d3d9.is_null(), "Direct3DCreate9 returned null");
+    assert!(!d3d9.is_null(), "the factory export returned null");
     d3d9
+}
+
+/// Call the factory export `factory` names; the caller holds the environment lock.
+///
+/// # Panics
+/// Panics if `d3d9.dll` does not export `Direct3DCreate9Ex` or it fails.
+fn call_factory(factory: Factory) -> *mut c_void {
+    if factory == Factory::Plain {
+        // SAFETY: Win32-style factory entrypoint with no preconditions.
+        return unsafe { Direct3DCreate9(D3DSDK_VERSION) };
+    }
+    let create_ex = direct3d_create9_ex().expect("d3d9.dll exports Direct3DCreate9Ex");
+    let mut out: *mut c_void = core::ptr::null_mut();
+    // SAFETY: factory entrypoint with a writable out slot.
+    let hr = unsafe { create_ex(D3DSDK_VERSION, &raw mut out) };
+    assert_eq!(hr, 0, "Direct3DCreate9Ex failed: 0x{hr:08X}");
+    out
 }
 
 impl Harness {
@@ -520,8 +552,21 @@ impl Harness {
     /// Panics if the factory cannot be created.
     #[must_use]
     pub fn factory_only_with_config(entries: &str) -> Self {
+        Self::factory_only_from(entries, Factory::Plain)
+    }
+
+    /// A factory only, made by `Direct3DCreate9Ex`: an `IDirect3D9Ex` and no device.
+    ///
+    /// # Panics
+    /// Panics if `Direct3DCreate9Ex` fails.
+    #[must_use]
+    pub fn factory_only_extended() -> Self {
+        Self::factory_only_from("", Factory::Extended)
+    }
+
+    fn factory_only_from(entries: &str, factory: Factory) -> Self {
         win32::install_failure_exit_hook();
-        let d3d9 = create_factory(entries);
+        let d3d9 = create_factory(entries, factory);
         Self {
             d3d9,
             device: core::ptr::null_mut(),
@@ -535,6 +580,7 @@ impl Harness {
             present_flags: 0,
             multi_sample_type: 0,
             config_entries: entries.to_owned(),
+            factory,
         }
     }
 
@@ -560,7 +606,7 @@ impl Harness {
     #[must_use]
     pub fn create(cfg: &HarnessConfig) -> Self {
         win32::install_failure_exit_hook();
-        let d3d9 = create_factory(cfg.config_entries);
+        let d3d9 = create_factory(cfg.config_entries, cfg.factory);
         let mut state = HarnessState::empty();
         if cfg.windowed == 0 {
             take_display_mode();
@@ -578,20 +624,28 @@ impl Harness {
 
         let mut pp = present_params(cfg, hwnd);
         let mut device: *mut c_void = core::ptr::null_mut();
-        // SAFETY: D3D9 factory vtable thunk; `d3d9` is live, `&mut pp` and
-        // `&mut device` are writable, focus window null is permitted.
-        let vtbl = unsafe { deref_vtbl::<IDirect3D9Vtbl>(d3d9) };
-        // SAFETY: D3D9 vtable thunk; all pointers above are valid for the call.
-        let hr = unsafe {
-            (vtbl.create_device)(
-                d3d9,
-                0,
-                D3DDEVTYPE_HAL,
-                core::ptr::null_mut(),
-                cfg.behavior_flags,
-                (&raw mut pp).cast::<c_void>(),
-                &raw mut device,
-            )
+        let hr = if cfg.factory == Factory::ExtendedDeviceEx {
+            // SAFETY: `d3d9` came from `Direct3DCreate9Ex` and `device` is a
+            // writable local.
+            unsafe {
+                extended::create_device_ex(d3d9, cfg.behavior_flags, &mut pp, &raw mut device)
+            }
+        } else {
+            // SAFETY: D3D9 factory vtable thunk; `d3d9` is live, `&mut pp` and
+            // `&mut device` are writable, focus window null is permitted.
+            let vtbl = unsafe { deref_vtbl::<IDirect3D9Vtbl>(d3d9) };
+            // SAFETY: D3D9 vtable thunk; all pointers above are valid for the call.
+            unsafe {
+                (vtbl.create_device)(
+                    d3d9,
+                    0,
+                    D3DDEVTYPE_HAL,
+                    core::ptr::null_mut(),
+                    cfg.behavior_flags,
+                    (&raw mut pp).cast::<c_void>(),
+                    &raw mut device,
+                )
+            }
         };
         assert_eq!(hr, 0, "CreateDevice failed: 0x{hr:08X}");
         assert!(!device.is_null(), "CreateDevice returned null device");
@@ -609,6 +663,7 @@ impl Harness {
             present_flags: cfg.present_flags,
             multi_sample_type: cfg.multi_sample_type,
             config_entries: cfg.config_entries.to_owned(),
+            factory: cfg.factory,
         }
     }
 

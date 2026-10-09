@@ -71,3 +71,15 @@ fn the_session_mode_names_the_mode_or_its_absence() {
         "no session display mode"
     );
 }
+
+#[test]
+fn an_extended_leave_says_the_window_kept_its_rect_and_which_visibility_it_got_back() {
+    assert_eq!(
+        WindowPlacement::KeptFullscreen { shown: true }.to_string(),
+        "window kept at its fullscreen rect, shown as before fullscreen"
+    );
+    assert_eq!(
+        WindowPlacement::KeptFullscreen { shown: false }.to_string(),
+        "window kept at its fullscreen rect, hidden again as before fullscreen"
+    );
+}

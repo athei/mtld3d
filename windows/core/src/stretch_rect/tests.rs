@@ -610,3 +610,23 @@ fn a_planar_endpoint_routes_by_destination_class() {
         PlanarStretch::NotPlanar
     );
 }
+
+#[test]
+fn an_extended_device_copies_between_whole_default_surfaces_alone() {
+    let surface = (21, 64, 64);
+    assert!(extended_whole_surface_copy(true, false, surface, surface));
+    assert!(!extended_whole_surface_copy(false, false, surface, surface));
+    assert!(!extended_whole_surface_copy(true, true, surface, surface));
+    assert!(!extended_whole_surface_copy(
+        true,
+        false,
+        surface,
+        (22, 64, 64)
+    ));
+    assert!(!extended_whole_surface_copy(
+        true,
+        false,
+        surface,
+        (21, 64, 32)
+    ));
+}

@@ -478,6 +478,64 @@ record. A knob, where one makes sense, is named with its default.
   turns the specular add on only in tests that leave fog off. Reopen on a game
   that shows fogged highlights brighter or darker than on Windows. No knob:
   the alternative is a different shader, not a trade.
+- **An extended device copies user memory once.** A `pSharedHandle` on a
+  single-level system-memory texture or offscreen plain surface names the
+  application's pixels, and D3D9Ex makes that memory the surface's own:
+  `LockRect` hands back the application's pointer at its packed pitch, and a
+  later write to the memory is a write to the surface. Here the pixels are
+  copied into the level once at creation and the level keeps the layer's
+  staging, so a lock maps the copy at the 4-byte-aligned pitch every other
+  system-memory level has. Wrapping the application's memory would give one
+  kind of level two backings, one of them owned by the application and freed
+  whenever it likes, on every path that reads a system-memory level
+  (`UpdateTexture`, `UpdateSurface`, `GetRenderTargetData`, `GetDC`). The
+  one title known to pass user memory, Source on its extended path, fills a
+  texture this way, uploads it with `UpdateTexture` and lets it go, which a
+  copy serves. Writes through the surface, a `GetDC` included, do not reach
+  the application's memory either. The `d3d9ex.c/test_user_memory` and
+  `d3d9ex.c/test_user_memory_getdc` clusters carry the sites. No knob.
+- **No occlusion or mode-change status on an extended device.** D3D9Ex
+  answers `PresentEx`, `CheckDeviceState` and `TestCooperativeLevel` with
+  `S_PRESENT_OCCLUDED` while another device holds the display exclusively or
+  the window is covered, and with `S_PRESENT_MODE_CHANGED` after a mode
+  change. No exclusive mode is ever taken here (the device-loss decision),
+  and a present into a covered window already skips the drawable without
+  costing the application anything, so there is no state to report. The
+  failure latch the layer keeps is still reported. The
+  `d3d9ex.c/test_lost_device` cluster and `d3d9ex.c/test_wndproc` 2957 carry
+  the sites. No knob.
+- **The maximum frame latency is stored, not enforced.**
+  `SetMaximumFrameLatency` takes 0 to 30 and `GetMaximumFrameLatency` reports
+  what it stored, 3 until then. The frames the application can run ahead are
+  bounded by the encoder and submit queues, whose depth is fixed; holding
+  the application back further for a lower latency would cost the overlap
+  those queues buy. A value below 3 is logged once. No knob.
+- **`D3DPRESENT_*` flags are logged, not honoured.** `D3DPRESENT_DONOTWAIT`
+  asks a present to fail with `D3DERR_WASSTILLDRAWING` rather than wait for
+  the queue, and `D3DPRESENT_FORCEIMMEDIATE` to present without waiting for
+  the display; both present here as a flagless present would. The overlay
+  flags have no overlay to act on. Each flag is logged once. No knob.
+- **`GetDisplayModeEx` reports the identity rotation, and the extended mode
+  argument is not used.** The display is never rotated by the layer, so the
+  identity is what a game can act on. `CreateDeviceEx` and `ResetEx` take a
+  `D3DDISPLAYMODEEX` naming the fullscreen mode; `ResetEx` refuses one that
+  disagrees with the request as D3D9Ex does, and both then set the mode the
+  back buffer names, as `CreateDevice` and `Reset` do, so the mode's refresh
+  rate and scanline ordering go unused. No knob.
+- **A maximized window's back buffer follows its client rect.** A windowed
+  device, plain or extended, on a `WS_MAXIMIZE` window gets a back buffer of
+  the window's client rect rather than the size it asked for: the window
+  manager sizes a maximized window, as it does a fullscreen one, and a back
+  buffer of another size would be scaled into it at every present. Every
+  window the `d3d9ex.c` helper `create_window` makes is maximized, as are the
+  windows of a few `device.c` tests such as `test_scissor_size` (the
+  `device.c` helper is not), so in those tests a request for a smaller back
+  buffer reads the window's size, and a probe at a fixed coordinate reads
+  another part of the frame. `device.c/test_scissor_size` carries the plain
+  sites, and 26 `d3d9ex.c` sites come from the same rule: `test_user_memory`
+  872, the ten of `test_reset`, the ten of `test_reset_ex`,
+  `test_backbuffer_resize` 3925/3926 and the three of `test_sysmem_draw`. No
+  knob.
 
 ## Range-fog coverage
 
@@ -740,9 +798,16 @@ Audit provenance: every cluster below was re-derived on 2026-07-20 from the
 Wine test source, the raw actual-vs-expected failure messages
 (`MTLD3D_CONFORMANCE_RAW_DIR`), and the implementation — independently
 re-checked before retagging. Current classifications, counted from the
-`Sites:` tokens below on 2026-10-05: 0 `real`, 119 `expected`, 1 `caps`,
-25 `ceiling`, 3 `flaky`, 0 `untriaged`, 148 unique sites in all.
+`Sites:` tokens below on 2026-10-07: 0 `real`, 182 `expected`, 2 `caps`,
+25 `ceiling`, 3 `flaky`, 0 `untriaged`, 212 unique sites in all.
 The audit recorded all 24 Apple-family subtest-legs `crash=0`.
+(2026-10-07: with D3D9Ex implemented the `d3d9ex` subtest creates its
+extended devices and runs every test, adding the same 64 sites, 63
+`expected` and 1 `caps`, on each of the six Apple-family legs. The site set
+held over 20 isolated runs per architecture with no crash; that repeat ran on
+the native legs only, not the `+intel` caps legs. The Intel CI dispatch on
+the branch recorded both `@mac2` `d3d9ex` legs with the same 64 sites at the
+same counts, so none of them is `@mac2`-only.)
 (2026-10-05: test_wndproc 4302 moved from `expected` to `ceiling`, and
 4328/4329 joined it, pinned at one on the `i686` and `i686+intel` device
 legs; the cluster says why.)
@@ -1024,15 +1089,19 @@ latches it until one succeeds. Listed under Deliberately not implemented
 in `docs/STATUS.md`.
 
 4551 is `expected`, and follows from the same no-modeset decision as the
-message sites above. It reads a `WINDOWPOS` the test's wndproc only captures
-once the expected-message walk reaches the fifth entry of
-`mode_change_messages_hidden`, and the walk stops one entry earlier, on the
-`WM_SIZE` the device window never receives: a fullscreen mode-change `Reset`
-resizes the back buffer, not the window, which already covers the monitor
-and keeps covering it, so its client rect is unchanged and user32 sends no
-`WM_SIZE`. 4525/4545 record that stall directly (both raw failures read
-`Expected message 0x5`), which leaves the capture zeroed and the assertion
-comparing against a null HWND. Reaching it needs a real mode-set, so the
+message sites above. Both mode-change `Reset`s expect the device window to be
+moved: `mode_change_messages` and `mode_change_messages_hidden` each start
+with a `WM_WINDOWPOSCHANGING` for it, and 4525 and 4545 read `Expected
+message 0x46`, the walk stopped on that first entry. A fullscreen
+mode-change `Reset` resizes the back buffer, not the window, which already
+covers the monitor and keeps covering it, so the device window gets no
+position message at all. 4551 reads the `WINDOWPOS` the test's wndproc
+captures only when the walk reaches the fifth entry of
+`mode_change_messages_hidden`, the second `WM_WINDOWPOSCHANGING`; with the
+walk stopped on the first entry the capture stays zeroed and the assertion
+compares against a null HWND. `d3d9ex.c` 3203 and 3209 are the same two
+reads in the extended copy of the test. Reaching the capture needs the
+`Reset` to move the window, which here only a real mode-set would do, so the
 line moves only with that decision.
 
 4475/4480 are flaky macdrv window-message timing sites;
@@ -1560,14 +1629,118 @@ blend (`0xdf0020` for `0xff0000`) in both the declaration and the FVF form
 
 ### d3d9ex.c clusters
 
-No sites. `Direct3DCreate9Ex` is exported and answers `D3DERR_NOTAVAILABLE`,
-so START_TEST resolves it and proceeds instead of taking the
-`win_skip("Failed to get address of Direct3DCreate9Ex")` that counted as a
-failure under Wine (formerly site 5184, classified expected). Every test then
-fails to create its Ex device and skips, which is not a failure, so the suite
-reports none. D3D9Ex itself is not implemented yet; only the entry point
-resolves. It is wanted once a title needs it, so a site landing here later is
-not `expected`; `docs/STATUS.md` says what an extended device changes.
+`Direct3DCreate9Ex` hands out an extended interface, so every test of the
+subtest creates its extended device and runs to the end with no crash on
+both architectures. Three causes carry most of the sites, each a kept
+divergence (see "Kept divergences"). Every window `create_window` makes is
+`WS_MAXIMIZE`, and a maximized window's back buffer follows its client rect
+(the rule `device.c/test_scissor_size` explains), so a test that asked for a
+smaller back buffer reads the window's size, and a pixel probe at a fixed
+coordinate reads another part of the frame; 26 sites come from it. The
+user-memory copy and the absence of occlusion status are the other two. The
+window and focus sites are the same decisions the `device.c` clusters record.
+Leaving fullscreen follows the device's kind as the reference does: an
+extended device leaves the window at the fullscreen rect and gives it back
+the style it had, visibility included, so `test_window_style` passes.
+
+### d3d9ex.c/test_user_memory
+Sites: 775=expected 806=expected 819=expected 842=expected 843=expected
+Sites: 872=expected
+
+775, 806, 819 and 843 expect `LockRect` to hand back the application's own
+pointer, and 842 the packed pitch (33 for an L8 row 33 texels wide; ours is
+36): the user memory is copied into the level, which keeps the layer's
+staging. 872 reads the drawn ramp at (320, 240) of the maximized window's
+back buffer, which is a tenth of the way across rather than the middle, and
+reads 0x171717 where the middle reads 0x7f7f7f; the end-to-end suite reads
+the middle of the same draw on a 640x480 back buffer.
+
+### d3d9ex.c/test_reset
+Sites: 1098=expected 1105=expected 1106=expected 1114=expected 1115=expected
+Sites: 1145=expected 1152=expected 1153=expected 1162=expected 1163=expected
+
+The scissor rect, the viewport and the swap chain's back buffer after a
+windowed `Reset` to 400x300 and to 500x400 read the maximized window's client
+rect. The state the extended `Reset` keeps (render states, the viewport's
+depth range, the bindings) and the fullscreen sizes pass.
+
+### d3d9ex.c/test_reset_ex
+Sites: 1677=expected 1684=expected 1685=expected 1693=expected 1694=expected
+Sites: 1726=expected 1733=expected 1734=expected 1743=expected 1744=expected
+
+The `ResetEx` counterparts of the `test_reset` sites: the windowed requests
+read the maximized window's client rect. The mode checks pass.
+
+### d3d9ex.c/test_user_memory_getdc
+Sites: 1990=expected 1996=expected 1997=expected
+
+1990 expects the DIB a `GetDC` maps to be the application's user memory, and
+1996/1997 expect what GDI draws through it to land there: the user memory is
+copied once, so neither side reaches the other.
+
+### d3d9ex.c/test_lost_device
+Sites: 2039=expected 2046=expected 2049=expected 2051=expected 2153=expected
+
+Each expects `S_PRESENT_OCCLUDED` from `CheckDeviceState` or a present while
+another window is in front, where the device answers `D3D_OK`: no exclusive
+mode is taken and an occluded present costs nothing, so no occlusion status
+is reported. 2039, 2046 and 2153 accept `D3D_OK` as a `broken()` answer, and
+`D3D_OK` is what the device gives, but `broken()` only holds on Windows, so a
+run under Wine counts it; 2049 and 2051 accept no `D3D_OK` at all. The
+`TestCooperativeLevel` and `Reset` assertions pass.
+
+### d3d9ex.c/test_wndproc
+Sites: 2908=expected 2913=expected 2915=expected 2920=expected 2924=expected
+Sites: 2949=expected 2957=expected 3007=expected 3036=expected 3107=expected
+Sites: 3183=expected 3203=expected 3209=expected 3230=expected
+
+The extended copy of `device.c/test_wndproc`, and the same decisions: no
+activation or mode message generation (2908, 2949, 3007, 3036, 3183, 3203),
+no focus or foreground change (2913, 2915), the cursor subclass on the device
+window rather than a subclass of the focus window (2920, 2924, 3230), no
+focus-window minimize (3107), and a `WINDOWPOS` the message walk never
+reaches (3209, as `device.c` 4551). 2957 expects `S_PRESENT_OCCLUDED` from
+`CheckDeviceState` after the focus loss, the occlusion decision above.
+
+### d3d9ex.c/test_wndproc_windowed
+Sites: 3331=expected 3345=expected 3349=expected 3356=expected 3399=expected
+Sites: 3421=expected 3425=expected 3432=expected
+
+As `device.c/test_wndproc_windowed`: 3349 and 3425 expect the focus window
+subclassed in fullscreen, and the other six the device window's procedure
+unchanged, which the cursor subclass changes on purpose.
+
+### d3d9ex.c/test_backbuffer_resize
+Sites: 3925=expected 3926=expected
+
+The back buffer held across `Reset` keeps its old size, as it should; the
+size it had was the maximized window's rather than the 640x480 requested.
+The detach itself passes: the held surface's container is the device and a
+new back buffer object is handed out.
+
+### d3d9ex.c/test_resource_access
+Sites: 4585=caps
+
+The volume loop creates an ATI2 volume in the scratch pool without asking
+`CheckDeviceFormat` first, where the 2D and cube loops and `device.c`'s copy
+of this loop skip ATI2 when the device does not offer it. The device offers
+no ATI2 resource, and a FOURCC the driver does not know has no size the
+runtime could allocate, scratch pool included, so `D3DERR_INVALIDCALL` is
+the answer of a device without the format.
+
+### d3d9ex.c/test_sysmem_draw
+Sites: 4779=expected 4804=expected 4842=expected
+
+Each draws a gradient over the whole back buffer and probes (320, 240),
+expecting its middle; on the maximized window's back buffer that point sits
+near the green corner (0x04e318). The draws from system-memory buffers
+themselves are correct.
+
+### d3d9ex.c/test_pinned_buffers
+Sites: 4956=expected 4961=expected
+
+As `device.c/test_pinned_buffers`: a `D3DLOCK_DISCARD` re-lock renames the
+buffer rather than handing back the pinned pointer with its contents.
 
 ### Wide-format offscreen conversion
 

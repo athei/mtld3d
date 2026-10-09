@@ -18,6 +18,7 @@ pub use mtld3d_core::encoder_data::{
     UploadTextureOpFlags,
 };
 
+mod extended;
 mod frame_dump;
 mod mem_watch;
 use mtld3d_core::{
@@ -51,7 +52,10 @@ use mtld3d_core::{
     readback::{ReadbackDestination, ReadbackReject, ReadbackSource},
     render_scale::TargetExtent,
     render_state::{RsClass, rs_classify},
-    reset_summary::{ResetSummary, changes_presentation},
+    reset_summary::{
+        ResetDone, ResetFailed, ResetFailureEffect, ResetMethod, ResetSummary,
+        changes_presentation, failure_warns, success_logs_at_info,
+    },
     sampler_state::TEXTURE_LOD_SLOT,
     shader_constants::{int_bool_rows, window_in_range},
     snapshot::SnapshotSection,
@@ -73,9 +77,7 @@ use mtld3d_types::{
     D3DCLEAR_ZBUFFER, D3DDEVICE_CREATION_PARAMETERS, D3DDISPLAYMODE,
     D3DERR_UNSUPPORTEDTEXTUREFILTER, D3DFMT_ATI1, D3DFMT_INDEX16, D3DFMT_INDEX32, D3DFMT_UYVY,
     D3DFMT_YUY2, D3DGAMMARAMP, D3DLIGHT9, D3DMATERIAL9, D3DMATRIX, D3DPOOL_DEFAULT,
-    D3DPOOL_MANAGED, D3DPOOL_SCRATCH, D3DPOOL_SYSTEMMEM, D3DPRESENT_INTERVAL_DEFAULT,
-    D3DPRESENT_INTERVAL_FOUR, D3DPRESENT_INTERVAL_IMMEDIATE, D3DPRESENT_INTERVAL_ONE,
-    D3DPRESENT_INTERVAL_THREE, D3DPRESENT_INTERVAL_TWO, D3DPRESENT_PARAMETERS,
+    D3DPOOL_MANAGED, D3DPOOL_SCRATCH, D3DPOOL_SYSTEMMEM, D3DPRESENT_PARAMETERS,
     D3DPRESENTFLAG_LOCKABLE_BACKBUFFER, D3DPT_TRIANGLEFAN, D3DPT_TRIANGLELIST, D3DRECT,
     D3DRS_ALPHABLENDENABLE, D3DRS_ALPHAFUNC, D3DRS_ALPHAREF, D3DRS_ALPHATESTENABLE, D3DRS_AMBIENT,
     D3DRS_AMBIENTMATERIALSOURCE, D3DRS_BLENDFACTOR, D3DRS_BLENDOP, D3DRS_BLENDOPALPHA,
@@ -95,11 +97,12 @@ use mtld3d_types::{
     D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_DMAP, D3DUSAGE_DONOTCLIP, D3DUSAGE_DYNAMIC, D3DUSAGE_NONSECURE,
     D3DUSAGE_NPATCHES, D3DUSAGE_POINTS, D3DUSAGE_QUERY_FILTER, D3DUSAGE_RENDERTARGET,
     D3DUSAGE_RTPATCHES, D3DUSAGE_SOFTWAREPROCESSING, D3DUSAGE_WRITEONLY, D3DVIEWPORT9, Guid,
-    IDirect3DDevice9Vtbl, RENDER_STATE_COUNT, SAMPLER_STATE_COUNT, render_state_defaults,
+    IDirect3DDevice9ExVtbl, IDirect3DDevice9Vtbl, RENDER_STATE_COUNT, SAMPLER_STATE_COUNT,
+    render_state_defaults,
 };
 
 use super::{
-    D3D_OK, D3DERR_INVALIDCALL, D3DERR_NOTAVAILABLE, E_FAIL, E_NOTIMPL, LOG_TARGET,
+    D3D_OK, D3DERR_INVALIDCALL, D3DERR_NOTAVAILABLE, E_FAIL, LOG_TARGET,
     bound_buffers::BoundBuffers,
     bound_rt::{BoundRt, RENDER_TARGET_SLOTS},
     com_ref::{Bound, CachedComPtr},
@@ -150,129 +153,147 @@ const TEX_TRACE_TARGET: &str = "mtld3d::d3d9::tex";
 /// d3d9 logger. Mirrored as `encoder.rs::DEPTH_TRACE_TARGET`.
 const DEPTH_TRACE_TARGET: &str = "mtld3d::d3d9::depth";
 
-/// The interface the `Reset` log line names: this device is the plain one.
-const RESET_INTERFACE: &str = "IDirect3DDevice9";
-
-static DIRECT3D_DEVICE9_VTBL: IDirect3DDevice9Vtbl = IDirect3DDevice9Vtbl {
-    query_interface: device_query_interface,
-    add_ref: device_add_ref,
-    release: device_release,
-    test_cooperative_level: device_test_cooperative_level,
-    get_available_texture_mem: device_get_available_texture_mem,
-    evict_managed_resources: device_evict_managed_resources,
-    get_direct3d: device_get_direct3d,
-    get_device_caps: device_get_device_caps,
-    get_display_mode: device_get_display_mode,
-    get_creation_parameters: device_get_creation_parameters,
-    set_cursor_properties: cursor::device_set_cursor_properties,
-    set_cursor_position: cursor::device_set_cursor_position,
-    show_cursor: cursor::device_show_cursor,
-    create_additional_swap_chain: device_create_additional_swap_chain,
-    get_swap_chain: device_get_swap_chain,
-    get_number_of_swap_chains: device_get_number_of_swap_chains,
-    reset: device_reset,
-    present: device_present,
-    get_back_buffer: device_get_back_buffer,
-    get_raster_status: device_get_raster_status,
-    set_dialog_box_mode: device_set_dialog_box_mode,
-    set_gamma_ramp: device_set_gamma_ramp,
-    get_gamma_ramp: device_get_gamma_ramp,
-    create_texture: device_create_texture,
-    create_volume_texture: device_create_volume_texture,
-    create_cube_texture: device_create_cube_texture,
-    create_vertex_buffer: device_create_vertex_buffer,
-    create_index_buffer: device_create_index_buffer,
-    create_render_target: device_create_render_target,
-    create_depth_stencil_surface: device_create_depth_stencil_surface,
-    update_surface: device_update_surface,
-    update_texture: device_update_texture,
-    get_render_target_data: device_get_render_target_data,
-    get_front_buffer_data: device_get_front_buffer_data,
-    stretch_rect: device_stretch_rect,
-    color_fill: device_color_fill,
-    create_offscreen_plain_surface: device_create_offscreen_plain_surface,
-    set_render_target: device_set_render_target,
-    get_render_target: device_get_render_target,
-    set_depth_stencil_surface: device_set_depth_stencil_surface,
-    get_depth_stencil_surface: device_get_depth_stencil_surface,
-    begin_scene: device_begin_scene,
-    end_scene: device_end_scene,
-    clear: device_clear,
-    set_transform: device_set_transform,
-    get_transform: device_get_transform,
-    multiply_transform: device_multiply_transform,
-    set_viewport: device_set_viewport,
-    get_viewport: device_get_viewport,
-    set_material: device_set_material,
-    get_material: device_get_material,
-    set_light: device_set_light,
-    get_light: device_get_light,
-    light_enable: device_light_enable,
-    get_light_enable: device_get_light_enable,
-    set_clip_plane: device_set_clip_plane,
-    get_clip_plane: device_get_clip_plane,
-    set_render_state: device_set_render_state,
-    get_render_state: device_get_render_state,
-    create_state_block: device_create_state_block,
-    begin_state_block: device_begin_state_block,
-    end_state_block: device_end_state_block,
-    set_clip_status: device_set_clip_status,
-    get_clip_status: device_get_clip_status,
-    get_texture: device_get_texture,
-    set_texture: device_set_texture,
-    get_texture_stage_state: device_get_texture_stage_state,
-    set_texture_stage_state: device_set_texture_stage_state,
-    get_sampler_state: device_get_sampler_state,
-    set_sampler_state: device_set_sampler_state,
-    validate_device: device_validate_device,
-    set_palette_entries: device_set_palette_entries,
-    get_palette_entries: device_get_palette_entries,
-    set_current_texture_palette: device_set_current_texture_palette,
-    get_current_texture_palette: device_get_current_texture_palette,
-    set_scissor_rect: device_set_scissor_rect,
-    get_scissor_rect: device_get_scissor_rect,
-    set_software_vertex_processing: device_set_software_vertex_processing,
-    get_software_vertex_processing: device_get_software_vertex_processing,
-    set_npatch_mode: device_set_npatch_mode,
-    get_npatch_mode: device_get_npatch_mode,
-    draw_primitive: device_draw_primitive,
-    draw_indexed_primitive: device_draw_indexed_primitive,
-    draw_primitive_up: device_draw_primitive_up,
-    draw_indexed_primitive_up: device_draw_indexed_primitive_up,
-    process_vertices: device_process_vertices,
-    create_vertex_declaration: device_create_vertex_declaration,
-    set_vertex_declaration: device_set_vertex_declaration,
-    get_vertex_declaration: device_get_vertex_declaration,
-    set_fvf: device_set_fvf,
-    get_fvf: device_get_fvf,
-    create_vertex_shader: device_create_vertex_shader,
-    set_vertex_shader: device_set_vertex_shader,
-    get_vertex_shader: device_get_vertex_shader,
-    set_vertex_shader_constant_f: device_set_vertex_shader_constant_f,
-    get_vertex_shader_constant_f: device_get_vertex_shader_constant_f,
-    set_vertex_shader_constant_i: device_set_vertex_shader_constant_i,
-    get_vertex_shader_constant_i: device_get_vertex_shader_constant_i,
-    set_vertex_shader_constant_b: device_set_vertex_shader_constant_b,
-    get_vertex_shader_constant_b: device_get_vertex_shader_constant_b,
-    set_stream_source: device_set_stream_source,
-    get_stream_source: device_get_stream_source,
-    set_stream_source_freq: device_set_stream_source_freq,
-    get_stream_source_freq: device_get_stream_source_freq,
-    set_indices: device_set_indices,
-    get_indices: device_get_indices,
-    create_pixel_shader: device_create_pixel_shader,
-    set_pixel_shader: device_set_pixel_shader,
-    get_pixel_shader: device_get_pixel_shader,
-    set_pixel_shader_constant_f: device_set_pixel_shader_constant_f,
-    get_pixel_shader_constant_f: device_get_pixel_shader_constant_f,
-    set_pixel_shader_constant_i: device_set_pixel_shader_constant_i,
-    get_pixel_shader_constant_i: device_get_pixel_shader_constant_i,
-    set_pixel_shader_constant_b: device_set_pixel_shader_constant_b,
-    get_pixel_shader_constant_b: device_get_pixel_shader_constant_b,
-    draw_rect_patch: device_draw_rect_patch,
-    draw_tri_patch: device_draw_tri_patch,
-    delete_patch: device_delete_patch,
-    create_query: device_create_query,
+/// The vtable every device carries, extended or not.
+///
+/// A plain device answers `E_NOINTERFACE` for `IID_IDirect3DDevice9Ex`, so a
+/// caller that follows COM never reaches past the base slots on one.
+static DIRECT3D_DEVICE9_VTBL: IDirect3DDevice9ExVtbl = IDirect3DDevice9ExVtbl {
+    base: IDirect3DDevice9Vtbl {
+        query_interface: device_query_interface,
+        add_ref: device_add_ref,
+        release: device_release,
+        test_cooperative_level: device_test_cooperative_level,
+        get_available_texture_mem: device_get_available_texture_mem,
+        evict_managed_resources: device_evict_managed_resources,
+        get_direct3d: device_get_direct3d,
+        get_device_caps: device_get_device_caps,
+        get_display_mode: device_get_display_mode,
+        get_creation_parameters: device_get_creation_parameters,
+        set_cursor_properties: cursor::device_set_cursor_properties,
+        set_cursor_position: cursor::device_set_cursor_position,
+        show_cursor: cursor::device_show_cursor,
+        create_additional_swap_chain: device_create_additional_swap_chain,
+        get_swap_chain: device_get_swap_chain,
+        get_number_of_swap_chains: device_get_number_of_swap_chains,
+        reset: device_reset,
+        present: device_present,
+        get_back_buffer: device_get_back_buffer,
+        get_raster_status: device_get_raster_status,
+        set_dialog_box_mode: device_set_dialog_box_mode,
+        set_gamma_ramp: device_set_gamma_ramp,
+        get_gamma_ramp: device_get_gamma_ramp,
+        create_texture: device_create_texture,
+        create_volume_texture: device_create_volume_texture,
+        create_cube_texture: device_create_cube_texture,
+        create_vertex_buffer: device_create_vertex_buffer,
+        create_index_buffer: device_create_index_buffer,
+        create_render_target: device_create_render_target,
+        create_depth_stencil_surface: device_create_depth_stencil_surface,
+        update_surface: device_update_surface,
+        update_texture: device_update_texture,
+        get_render_target_data: device_get_render_target_data,
+        get_front_buffer_data: device_get_front_buffer_data,
+        stretch_rect: device_stretch_rect,
+        color_fill: device_color_fill,
+        create_offscreen_plain_surface: device_create_offscreen_plain_surface,
+        set_render_target: device_set_render_target,
+        get_render_target: device_get_render_target,
+        set_depth_stencil_surface: device_set_depth_stencil_surface,
+        get_depth_stencil_surface: device_get_depth_stencil_surface,
+        begin_scene: device_begin_scene,
+        end_scene: device_end_scene,
+        clear: device_clear,
+        set_transform: device_set_transform,
+        get_transform: device_get_transform,
+        multiply_transform: device_multiply_transform,
+        set_viewport: device_set_viewport,
+        get_viewport: device_get_viewport,
+        set_material: device_set_material,
+        get_material: device_get_material,
+        set_light: device_set_light,
+        get_light: device_get_light,
+        light_enable: device_light_enable,
+        get_light_enable: device_get_light_enable,
+        set_clip_plane: device_set_clip_plane,
+        get_clip_plane: device_get_clip_plane,
+        set_render_state: device_set_render_state,
+        get_render_state: device_get_render_state,
+        create_state_block: device_create_state_block,
+        begin_state_block: device_begin_state_block,
+        end_state_block: device_end_state_block,
+        set_clip_status: device_set_clip_status,
+        get_clip_status: device_get_clip_status,
+        get_texture: device_get_texture,
+        set_texture: device_set_texture,
+        get_texture_stage_state: device_get_texture_stage_state,
+        set_texture_stage_state: device_set_texture_stage_state,
+        get_sampler_state: device_get_sampler_state,
+        set_sampler_state: device_set_sampler_state,
+        validate_device: device_validate_device,
+        set_palette_entries: device_set_palette_entries,
+        get_palette_entries: device_get_palette_entries,
+        set_current_texture_palette: device_set_current_texture_palette,
+        get_current_texture_palette: device_get_current_texture_palette,
+        set_scissor_rect: device_set_scissor_rect,
+        get_scissor_rect: device_get_scissor_rect,
+        set_software_vertex_processing: device_set_software_vertex_processing,
+        get_software_vertex_processing: device_get_software_vertex_processing,
+        set_npatch_mode: device_set_npatch_mode,
+        get_npatch_mode: device_get_npatch_mode,
+        draw_primitive: device_draw_primitive,
+        draw_indexed_primitive: device_draw_indexed_primitive,
+        draw_primitive_up: device_draw_primitive_up,
+        draw_indexed_primitive_up: device_draw_indexed_primitive_up,
+        process_vertices: device_process_vertices,
+        create_vertex_declaration: device_create_vertex_declaration,
+        set_vertex_declaration: device_set_vertex_declaration,
+        get_vertex_declaration: device_get_vertex_declaration,
+        set_fvf: device_set_fvf,
+        get_fvf: device_get_fvf,
+        create_vertex_shader: device_create_vertex_shader,
+        set_vertex_shader: device_set_vertex_shader,
+        get_vertex_shader: device_get_vertex_shader,
+        set_vertex_shader_constant_f: device_set_vertex_shader_constant_f,
+        get_vertex_shader_constant_f: device_get_vertex_shader_constant_f,
+        set_vertex_shader_constant_i: device_set_vertex_shader_constant_i,
+        get_vertex_shader_constant_i: device_get_vertex_shader_constant_i,
+        set_vertex_shader_constant_b: device_set_vertex_shader_constant_b,
+        get_vertex_shader_constant_b: device_get_vertex_shader_constant_b,
+        set_stream_source: device_set_stream_source,
+        get_stream_source: device_get_stream_source,
+        set_stream_source_freq: device_set_stream_source_freq,
+        get_stream_source_freq: device_get_stream_source_freq,
+        set_indices: device_set_indices,
+        get_indices: device_get_indices,
+        create_pixel_shader: device_create_pixel_shader,
+        set_pixel_shader: device_set_pixel_shader,
+        get_pixel_shader: device_get_pixel_shader,
+        set_pixel_shader_constant_f: device_set_pixel_shader_constant_f,
+        get_pixel_shader_constant_f: device_get_pixel_shader_constant_f,
+        set_pixel_shader_constant_i: device_set_pixel_shader_constant_i,
+        get_pixel_shader_constant_i: device_get_pixel_shader_constant_i,
+        set_pixel_shader_constant_b: device_set_pixel_shader_constant_b,
+        get_pixel_shader_constant_b: device_get_pixel_shader_constant_b,
+        draw_rect_patch: device_draw_rect_patch,
+        draw_tri_patch: device_draw_tri_patch,
+        delete_patch: device_delete_patch,
+        create_query: device_create_query,
+    },
+    set_convolution_mono_kernel: extended::set_convolution_mono_kernel,
+    compose_rects: extended::compose_rects,
+    present_ex: extended::present_ex,
+    get_gpu_thread_priority: extended::get_gpu_thread_priority,
+    set_gpu_thread_priority: extended::set_gpu_thread_priority,
+    wait_for_vblank: extended::wait_for_vblank,
+    check_resource_residency: extended::check_resource_residency,
+    set_maximum_frame_latency: extended::set_maximum_frame_latency,
+    get_maximum_frame_latency: extended::get_maximum_frame_latency,
+    check_device_state: extended::check_device_state,
+    create_render_target_ex: extended::create_render_target_ex,
+    create_offscreen_plain_surface_ex: extended::create_offscreen_plain_surface_ex,
+    create_depth_stencil_surface_ex: extended::create_depth_stencil_surface_ex,
+    reset_ex: extended::reset_ex,
+    get_display_mode_ex: extended::get_display_mode_ex,
 };
 
 /// Number of user-clip-plane storage slots: `D3DCAPS9::MaxUserClipPlanes`.
@@ -320,6 +341,21 @@ bitflags::bitflags! {
         const RELEASING = 1 << 3;
         /// Independent coverage request controlled only by A2M1/A2M0.
         const A2M_ENABLED = 1 << 4;
+        /// Created by an interface `Direct3DCreate9Ex` made: a `D3D9Ex` device.
+        ///
+        /// Seeded at creation and never cleared, `reset_to_defaults` included.
+        /// It refuses `D3DPOOL_MANAGED`, reads a system-memory `pSharedHandle`
+        /// as user memory, keeps its state and its default-pool resources
+        /// across `Reset`, and answers `IID_IDirect3DDevice9Ex`.
+        const EXTENDED = 1 << 5;
+        /// Set on an extended device once a failed `Reset` has warned, until one succeeds.
+        ///
+        /// A plain device's rejected or failed `Reset` leaves it waiting for
+        /// another (`NOT_RESET`), which is what keeps a game's per-frame
+        /// retries at debug. An extended device's rejected `Reset` changes
+        /// nothing and owes nothing, so this is what quiets its retries; the
+        /// next success clears it and says so at info.
+        const RESET_FAILURE_LOGGED = 1 << 6;
     }
 }
 
@@ -533,6 +569,11 @@ pub struct DeviceInner {
     /// device's own bind slots never count. `Reset` fails with
     /// `D3DERR_INVALIDCALL` while it is non-zero, as D3D9 requires.
     outstanding_reset_blockers: AtomicU32,
+    /// What `SetMaximumFrameLatency` last stored, which `GetMaximumFrameLatency` reports.
+    ///
+    /// Reported, not enforced: the encoder's own queue depth bounds how far
+    /// the application runs ahead of the GPU.
+    max_frame_latency: u32,
     /// Monotonic submit seq.
     ///
     /// Each `present()` bumps this before stamping it onto the outgoing
@@ -2797,28 +2838,7 @@ impl DeviceInner {
     /// flow into the next frame via `fresh_frame`, but the viewport push
     /// here references the new dimensions.
     pub fn reset_to_defaults(&mut self) {
-        // An autogen texture bound as a render target regenerates its mip
-        // chain when it stops being one, as `SetRenderTarget` does on the way
-        // off it; queued ahead of the teardown that may release it.
-        let autogen = core::mem::replace(&mut self.cur_autogen_rt_ids, [None; RENDER_TARGET_SLOTS]);
-        for old_id in autogen.into_iter().flatten() {
-            self.push_control(crate::device::GenerateMipmapsOrderedOp { old_id });
-        }
-        self.bound_rt.teardown();
-        // Reset reverts the colour target to the implicit backbuffer and the
-        // depth/stencil to the implicit auto-depth default, and unbinds render
-        // targets 1..3. The encoder's frame reset already drops them; the
-        // explicit unbind covers the frame in flight.
-        self.last_color_rt_binding = None;
-        for slot in 1..RENDER_TARGET_SLOTS {
-            if self.last_extra_rt_bindings[slot - 1].take().is_some() {
-                self.push_control(crate::device::UnbindExtraColorOp {
-                    slot: u8::try_from(slot).expect("validated extra color slot"),
-                });
-            }
-        }
-        self.last_depth_binding = None;
-        self.flags.remove(DeviceFlags::DEPTH_EXPLICITLY_UNBOUND);
+        self.reset_targets_to_implicit();
         self.bound_buffers.teardown();
         self.stage_bindings
             .reset_to_defaults(&[mtld3d_types::sampler_state_defaults(); STAGE_COUNT]);
@@ -2872,6 +2892,59 @@ impl DeviceInner {
         };
         self.set_viewport(viewport);
         // Wipe any cached snapshot — every input was just reset.
+        self.snapshot_dirty = SnapshotDirty::all();
+    }
+
+    /// Return the targets to the implicit surfaces, as every `Reset` does.
+    ///
+    /// Render target 0 goes back to the back buffer, 1 to 3 are unbound, and
+    /// the depth stencil goes back to the implicit surface, or to none on a
+    /// swap chain without one. A plain device's `Reset` then wipes the rest of
+    /// its state; an extended device's keeps it.
+    fn reset_targets_to_implicit(&mut self) {
+        // An autogen texture bound as a render target regenerates its mip
+        // chain when it stops being one, as `SetRenderTarget` does on the way
+        // off it; queued ahead of the teardown that may release it.
+        let autogen = core::mem::replace(&mut self.cur_autogen_rt_ids, [None; RENDER_TARGET_SLOTS]);
+        for old_id in autogen.into_iter().flatten() {
+            self.push_control(crate::device::GenerateMipmapsOrderedOp { old_id });
+        }
+        self.bound_rt.teardown();
+        // The encoder's frame reset already drops render targets 1..3; the
+        // explicit unbind covers the frame in flight.
+        self.last_color_rt_binding = None;
+        for slot in 1..RENDER_TARGET_SLOTS {
+            if self.last_extra_rt_bindings[slot - 1].take().is_some() {
+                self.push_control(crate::device::UnbindExtraColorOp {
+                    slot: u8::try_from(slot).expect("validated extra color slot"),
+                });
+            }
+        }
+        self.last_depth_binding = None;
+        self.flags.remove(DeviceFlags::DEPTH_EXPLICITLY_UNBOUND);
+    }
+
+    /// What an extended device's `Reset` changes: its targets and the viewport's extent.
+    ///
+    /// The targets return to the implicit surfaces as on a plain device. The
+    /// viewport and the scissor rect cover the new back buffer, and the
+    /// viewport keeps its depth range. Render states, bindings, shaders, an
+    /// open scene and a recording state block all survive.
+    fn rebind_after_extended_reset(&mut self) {
+        self.reset_targets_to_implicit();
+        let viewport = D3DVIEWPORT9 {
+            x: 0,
+            y: 0,
+            width: self.backbuffer_width,
+            height: self.backbuffer_height,
+            min_z: self.viewport.min_z,
+            max_z: self.viewport.max_z,
+        };
+        self.set_viewport(viewport);
+        self.scissor_rect = mtld3d_core::render_state::full_target_scissor(
+            self.backbuffer_width,
+            self.backbuffer_height,
+        );
         self.snapshot_dirty = SnapshotDirty::all();
     }
 
@@ -3053,7 +3126,16 @@ impl DeviceInner {
     /// Give the window back. No-op unless the device is fullscreen.
     pub fn leave_fullscreen(&mut self, reason: &mtld3d_core::fullscreen_log::LeaveReason) {
         if let Some(saved) = self.fullscreen.take() {
-            crate::fullscreen::leave(&saved, reason);
+            crate::fullscreen::leave(&saved, self.leave_kind(), reason);
+        }
+    }
+
+    /// How leaving fullscreen puts this device's window back.
+    pub const fn leave_kind(&self) -> crate::fullscreen::LeaveKind {
+        if self.is_extended() {
+            crate::fullscreen::LeaveKind::Extended
+        } else {
+            crate::fullscreen::LeaveKind::Plain
         }
     }
 
@@ -3148,13 +3230,20 @@ impl DeviceInner {
             .as_ref()
             .is_none_or(|(binding, _)| matches!(binding, RtBinding::Backbuffer { .. }));
         if back_buffer_made && rt0_is_back_buffer {
+            // An extended device keeps the viewport's depth range, as its
+            // `Reset` does; a plain one returns it to the default range.
+            let (min_z, max_z) = if self.is_extended() {
+                (self.viewport.min_z, self.viewport.max_z)
+            } else {
+                (0.0, 1.0)
+            };
             self.set_viewport(D3DVIEWPORT9 {
                 x: 0,
                 y: 0,
                 width: new_width,
                 height: new_height,
-                min_z: 0.0,
-                max_z: 1.0,
+                min_z,
+                max_z,
             });
             self.scissor_rect =
                 mtld3d_core::render_state::full_target_scissor(new_width, new_height);
@@ -3249,6 +3338,12 @@ impl DeviceInner {
     }
 }
 
+/// The implicit surfaces an extended device's `Reset` finds the application holding.
+struct HeldImplicitSurfaces {
+    back_buffer: Option<crate::surface::HeldSurface>,
+    depth: Option<crate::surface::HeldSurface>,
+}
+
 // ── IDirect3DDevice9 COM object ──
 
 /// Parameters for `Direct3DDevice9::new`.
@@ -3322,6 +3417,8 @@ pub struct DeviceCreateInfo {
     pub fullscreen: Option<crate::fullscreen::SavedWindow>,
     /// The configuration of the creating `IDirect3D9`.
     pub config: Arc<Mtld3dConfig>,
+    /// The flags the device starts with: `DeviceFlags::EXTENDED` for an extended device.
+    pub initial_flags: DeviceFlags,
 }
 
 #[repr(C)]
@@ -3364,7 +3461,8 @@ impl Direct3DDevice9 {
             backbuffer_sample_count: info.backbuffer_sample_count,
             depth_stencil_handle: info.depth_stencil_handle,
             depth_stencil_format: info.depth_stencil_format,
-            flags: DeviceFlags::empty(),
+            flags: info.initial_flags,
+            max_frame_latency: mtld3d_core::extended::DEFAULT_FRAME_LATENCY,
             backbuffer_width: info.backbuffer_width,
             backbuffer_height: info.backbuffer_height,
             render_scale: info.render_scale,
@@ -3450,7 +3548,7 @@ impl Direct3DDevice9 {
             cached_stream0_extent: 0,
         }));
         Self {
-            vtbl: &raw const DIRECT3D_DEVICE9_VTBL,
+            vtbl: &raw const DIRECT3D_DEVICE9_VTBL.base,
             refcount: 1,
             inner,
         }
@@ -3637,6 +3735,21 @@ impl DeviceInner {
         self.flags.contains(DeviceFlags::NOT_RESET)
     }
 
+    /// `true` for a device an interface `Direct3DCreate9Ex` made created.
+    pub const fn is_extended(&self) -> bool {
+        self.flags.contains(DeviceFlags::EXTENDED)
+    }
+
+    /// The frame latency `GetMaximumFrameLatency` reports.
+    pub const fn max_frame_latency(&self) -> u32 {
+        self.max_frame_latency
+    }
+
+    /// Store the frame latency `SetMaximumFrameLatency` validated.
+    pub const fn set_max_frame_latency(&mut self, latency: u32) {
+        self.max_frame_latency = latency;
+    }
+
     /// `true` when the device is fullscreen.
     ///
     /// `CreateAdditionalSwapChain` is rejected in that mode.
@@ -3734,6 +3847,53 @@ impl DeviceInner {
         self.implicit_swapchain as *mut crate::swapchain::Direct3DSwapChain9
     }
 
+    /// Capture the implicit surfaces the application holds, for an extended device's `Reset`.
+    ///
+    /// Empty on a plain device, whose `Reset` refuses while the application
+    /// holds either. Taken before the `Reset` adopts its new back-buffer size,
+    /// multisample configuration or auto depth-stencil format, so each
+    /// capture describes the surface the application holds.
+    fn hold_implicit_surfaces(&self) -> HeldImplicitSurfaces {
+        if !self.is_extended() {
+            return HeldImplicitSurfaces {
+                back_buffer: None,
+                depth: None,
+            };
+        }
+        HeldImplicitSurfaces {
+            // SAFETY: the field is 0 or the device's live cached implicit surface.
+            back_buffer: unsafe {
+                crate::surface::hold_implicit_surface(self.implicit_render_target)
+            },
+            // SAFETY: as above.
+            depth: unsafe { crate::surface::hold_implicit_surface(self.implicit_depth_stencil) },
+        }
+    }
+
+    /// Detach the held implicit surfaces `held` names, for an extended device's `Reset`.
+    ///
+    /// Each becomes a standalone surface that keeps the textures it names,
+    /// and the device forgets both the surface and its own handles to those
+    /// textures, so nothing it destroys or recreates afterwards reaches them
+    /// and the next `GetBackBuffer` or `GetDepthStencilSurface` hands out a
+    /// new object.
+    fn detach_held_implicit_surfaces(&mut self, held: HeldImplicitSurfaces) {
+        if let Some(back_buffer) = held.back_buffer {
+            // SAFETY: captured from the live, held cached back buffer, which
+            // the device forgets together with its handles just below.
+            unsafe { crate::surface::detach_implicit_surface(&back_buffer) };
+            self.implicit_render_target = 0;
+            self.set_backbuffer_handle(MetalHandle::NULL, MetalHandle::NULL);
+            self.set_backbuffer_msaa_handle(MetalHandle::NULL, MetalHandle::NULL);
+        }
+        if let Some(depth) = held.depth {
+            // SAFETY: as above, for the cached depth surface.
+            unsafe { crate::surface::detach_implicit_surface(&depth) };
+            self.implicit_depth_stencil = 0;
+            self.set_depth_stencil_handle(MetalHandle::NULL);
+        }
+    }
+
     /// Get-or-create the device-owned implicit render target == backbuffer surface.
     ///
     /// Cached as a `u64`. `GetRenderTarget(0)`, `GetBackBuffer(0)` and
@@ -3811,6 +3971,124 @@ impl DeviceInner {
 // be released before the operation runs.
 
 // ── IUnknown implementation (IDirect3DDevice9) ──
+
+/// Whether the device a child resource records as its `DeviceInner` is extended.
+///
+/// # Safety
+/// `device_inner` is 0 or the address of a live `DeviceInner`.
+pub unsafe fn device_inner_is_extended(device_inner: u64) -> bool {
+    // SAFETY: the caller's contract: 0 or a live `DeviceInner`.
+    unsafe { (device_inner as *const DeviceInner).as_ref() }.is_some_and(DeviceInner::is_extended)
+}
+
+/// Whether the device behind a vtable `this` is extended; `false` for a null `this`.
+pub fn device_is_extended(this: *mut c_void) -> bool {
+    // SAFETY: vtable thunk argument; `this` is null or *mut Direct3DDevice9 per
+    // the IDirect3DDevice9 ABI.
+    unsafe { InPtr::<Direct3DDevice9>::opt(this) }.is_some_and(|obj| obj.inner().is_extended())
+}
+
+/// Apply the `pSharedHandle` rules to a create, `Err` with the refusal's code.
+///
+/// `Ok(Some)` is the application's pointer to the level's packed pixels, which
+/// only an extended device's single-level system-memory texture or offscreen
+/// plain surface reads; `Ok(None)` proceeds as before. A pointer to a null
+/// pointer is accepted as user memory with nothing in it, warned once.
+fn shared_handle_gate(
+    this: *mut c_void,
+    kind: &mtld3d_core::extended::CreateKind,
+    pool: u32,
+    shared_handle: *mut c_void,
+    entry_point: &str,
+) -> Result<Option<NonNull<u8>>, i32> {
+    use mtld3d_core::extended::{SharedHandleVerdict, shared_handle_verdict};
+    let extended = device_is_extended(this);
+    match shared_handle_verdict(kind, pool, !shared_handle.is_null(), extended) {
+        SharedHandleVerdict::Proceed => Ok(None),
+        SharedHandleVerdict::UserMemory => {
+            // SAFETY: an extended device's user-memory contract: `shared_handle`
+            // is non-null (the verdict says so) and points to the application's
+            // pixel pointer.
+            let memory =
+                unsafe { ValueIn::<*mut c_void>::read_opt(shared_handle.cast_const().cast()) };
+            let memory = memory.and_then(|memory| NonNull::new(memory.cast::<u8>()));
+            if memory.is_none() {
+                mtld3d_shared::log_once_warn!(target: LOG_TARGET,
+                    "{entry_point}: user memory names a null pointer; the level starts \
+                     uninitialised");
+            }
+            Ok(memory)
+        }
+        SharedHandleVerdict::Refuse(refusal) => {
+            mtld3d_shared::log_once_warn_by!(
+                target: LOG_TARGET,
+                key: (create_kind_key(kind) << 48)
+                    | (u64::from(pool) << 32)
+                    | u64::from(refusal.hresult().cast_unsigned()),
+                "reject {entry_point}(pool={pool}) with a pSharedHandle → {:#010x}: {}",
+                refusal.hresult(),
+                refusal.reason()
+            );
+            Err(refusal.hresult())
+        }
+    }
+}
+
+/// Whether an extended device refuses `pool` for a create, warned once per kind.
+fn managed_pool_refused(
+    this: *mut c_void,
+    kind: &mtld3d_core::extended::CreateKind,
+    pool: u32,
+    entry_point: &str,
+) -> bool {
+    let refused = mtld3d_core::pool::refused_on_extended(pool, device_is_extended(this));
+    if refused {
+        mtld3d_shared::log_once_warn_by!(
+            target: LOG_TARGET,
+            key: create_kind_key(kind),
+            "reject {entry_point}(D3DPOOL_MANAGED) on an extended device → INVALIDCALL"
+        );
+    }
+    refused
+}
+
+/// A distinct log-latch key per create kind.
+const fn create_kind_key(kind: &mtld3d_core::extended::CreateKind) -> u64 {
+    use mtld3d_core::extended::CreateKind;
+    match kind {
+        CreateKind::Texture { .. } => 0,
+        CreateKind::CubeTexture => 1,
+        CreateKind::VolumeTexture => 2,
+        CreateKind::VertexBuffer => 3,
+        CreateKind::IndexBuffer => 4,
+        CreateKind::RenderTarget => 5,
+        CreateKind::DepthStencil => 6,
+        CreateKind::OffscreenPlain => 7,
+    }
+}
+
+/// Copy an extended create's user memory into the level that backs it.
+///
+/// `rows` is the level's packed extent and `pitch` the row pitch of `level`.
+/// A level too small for the rows is left as it was, warned once.
+fn copy_user_memory(
+    memory: NonNull<u8>,
+    rows: &mtld3d_core::extended::PackedRows,
+    level: &mut [u8],
+    pitch: usize,
+) {
+    // SAFETY: an extended device's user-memory contract: the application's
+    // pointer covers the level's tightly packed rows, which `rows` sizes from
+    // the create's own extent and format, and it stays valid for the create.
+    let src =
+        unsafe { core::slice::from_raw_parts(memory.as_ptr().cast_const(), rows.total_bytes()) };
+    if !mtld3d_core::extended::copy_packed_rows(src, rows, level, pitch) {
+        mtld3d_shared::log_once_warn!(target: LOG_TARGET,
+            "user memory: {} rows of {} bytes do not fit a level of pitch {pitch} and {} bytes; \
+             the level starts uninitialised",
+            rows.rows, rows.row_bytes, level.len());
+    }
+}
 
 /// Hold the device's API lock for the thunk; a no-op unless the app asked for `MULTITHREADED`.
 ///
@@ -4007,6 +4285,18 @@ extern "system" fn device_query_interface(
 ) -> i32 {
     let _api = device_api_lock(this);
     let _timer = device_timer(this, DeviceSubCategory::Misc);
+    let accepted: &[Guid] = if device_is_extended(this) {
+        &[
+            mtld3d_types::IID_IUNKNOWN,
+            mtld3d_types::IID_IDIRECT3DDEVICE9,
+            mtld3d_types::IID_IDIRECT3DDEVICE9EX,
+        ]
+    } else {
+        &[
+            mtld3d_types::IID_IUNKNOWN,
+            mtld3d_types::IID_IDIRECT3DDEVICE9,
+        ]
+    };
     // SAFETY: vtable thunk; `this`, `riid` and `ppv` are the caller's per the
     // IUnknown::QueryInterface ABI.
     unsafe {
@@ -4014,10 +4304,7 @@ extern "system" fn device_query_interface(
             this,
             riid,
             ppv,
-            &[
-                mtld3d_types::IID_IUNKNOWN,
-                mtld3d_types::IID_IDIRECT3DDEVICE9,
-            ],
+            accepted,
             device_add_ref,
             "IDirect3DDevice9",
         )
@@ -4358,6 +4645,9 @@ extern "system" fn device_test_cooperative_level(this: *mut c_void) -> i32 {
     {
         return hr;
     }
+    // An extended device is never left owing a `Reset` by a rejected one, so
+    // on it DEVICENOTRESET only reports a back buffer the layer could not
+    // rebuild.
     let not_reset = object.is_some_and(|obj| obj.inner().needs_reset());
     if not_reset {
         mtld3d_types::D3DERR_DEVICENOTRESET
@@ -4392,8 +4682,9 @@ extern "system" fn device_get_available_texture_mem(this: *mut c_void) -> u32 {
         cap => VRAM_BUDGET.min(cap),
     };
     let used = dev.vram_bytes_used.load(Ordering::Acquire);
-    let available =
-        u32::try_from(budget.saturating_sub(used).min(u64::from(u32::MAX))).unwrap_or(u32::MAX);
+    // An extended device pages its default-pool memory, so its figure does
+    // not shrink as the application allocates.
+    let available = mtld3d_core::extended::available_texture_mem(budget, used, dev.is_extended());
     // Games size their texture budgets from this call or from DXGI; the
     // one-time line tells which path a title took when its settings menu
     // shows a surprising video-memory figure.
@@ -4636,6 +4927,49 @@ extern "system" fn device_get_number_of_swap_chains(this: *mut c_void) -> u32 {
 extern "system" fn device_reset(this: *mut c_void, present_params: *mut c_void) -> i32 {
     let _api = device_api_lock(this);
     let _timer = device_timer(this, DeviceSubCategory::Misc);
+    reset_impl(this, present_params, ResetCall::Reset)
+}
+
+/// Which entry point a `Reset` came through.
+#[derive(Clone, Copy)]
+pub enum ResetCall {
+    /// The base `Reset` slot, on either kind of device.
+    Reset,
+    /// `ResetEx`, with the size of the display mode it named, if any.
+    ResetEx { mode: Option<(u32, u32)> },
+}
+
+/// What every line one `Reset` writes shares.
+struct ResetLog {
+    /// `IDirect3DDevice9` on a plain device, `IDirect3DDevice9Ex` on an extended one.
+    interface: &'static str,
+    method: ResetMethod,
+    /// The back-buffer size before the call.
+    old_size: (u32, u32),
+    /// The device was waiting for a successful `Reset` when the call came.
+    recovering: bool,
+}
+
+impl ResetLog {
+    /// The line for this call with `pp` as resolved so far and its `outcome`.
+    const fn summary<'a, O: core::fmt::Display>(
+        &self,
+        pp: &'a mtld3d_types::D3DPRESENT_PARAMETERS,
+        outcome: O,
+    ) -> ResetSummary<'a, O> {
+        ResetSummary::new(self.interface, self.old_size, pp, outcome).via(self.method)
+    }
+}
+
+/// The body `Reset` and `ResetEx` share; the caller holds the API lock.
+///
+/// A plain device's `Reset` refuses while the application references a
+/// default-pool resource or an implicit surface, returns every state to its
+/// default, and leaves a rejected or failed device requiring another `Reset`.
+/// An extended device's skips the reference check, keeps its state, its
+/// default-pool resources and an open scene, rebinds only its targets and the
+/// viewport extent, and answers a rejected request without changing anything.
+fn reset_impl(this: *mut c_void, present_params: *mut c_void, call: ResetCall) -> i32 {
     // SAFETY: vtable in/out-param; per the D3D9 ABI `present_params` points to a
     // readable+writable `D3DPRESENT_PARAMETERS` owned by the caller — Reset
     // resolves and reports the effective geometry back through it.
@@ -4649,15 +4983,56 @@ extern "system" fn device_reset(this: *mut c_void, present_params: *mut c_void) 
         return D3DERR_INVALIDCALL;
     };
     let dev = obj.inner();
-    if let Err(hr) = dev.encoder_status() {
-        return hr;
-    }
     // What the line a Reset writes compares against, and whether the device
     // already waits for a successful Reset: a game retries a failing one
     // every frame, and a success then is a recovery.
-    let old_size = (dev.backbuffer_width, dev.backbuffer_height);
+    let log = ResetLog {
+        interface: if dev.is_extended() {
+            "IDirect3DDevice9Ex"
+        } else {
+            "IDirect3DDevice9"
+        },
+        method: match call {
+            ResetCall::Reset => ResetMethod::Reset,
+            ResetCall::ResetEx { .. } => ResetMethod::ResetEx,
+        },
+        old_size: (dev.backbuffer_width, dev.backbuffer_height),
+        recovering: dev.needs_reset(),
+    };
     let previous = *dev.present_params();
-    let recovering = dev.needs_reset();
+    // `ResetEx` names a display mode exactly when it asks for fullscreen, of
+    // the back buffer's size; one that disagrees is refused before anything
+    // else is looked at.
+    if let ResetCall::ResetEx { mode } = call
+        && !mtld3d_core::extended::reset_ex_mode_valid(
+            pp_in.windowed != 0,
+            mode,
+            (pp_in.back_buffer_width, pp_in.back_buffer_height),
+        )
+    {
+        let pp = *pp_in;
+        let reason = match mode {
+            Some((width, height)) if pp.windowed != 0 => {
+                format!("a windowed request names display mode {width}x{height}")
+            }
+            Some((width, height)) => format!(
+                "display mode {width}x{height} is not the back buffer's {}x{}",
+                pp.back_buffer_width, pp.back_buffer_height
+            ),
+            None => String::from("a fullscreen request names no display mode"),
+        };
+        log_failed_reset(
+            dev,
+            &log,
+            &pp,
+            format_args!("rejected, {reason}"),
+            ResetFailureEffect::Unchanged,
+        );
+        return D3DERR_INVALIDCALL;
+    }
+    if let Err(hr) = dev.encoder_status() {
+        return hr;
+    }
 
     // Resolve the request on a local copy. A windowed Reset may pass zero
     // dimensions ("use the device window's client rect") and
@@ -4667,14 +5042,16 @@ extern "system" fn device_reset(this: *mut c_void, present_params: *mut c_void) 
     // Reject invalid swap-effect / back-buffer-count / presentation-interval
     // before touching any device state, so a rejected Reset leaves the device
     // intact and resettable.
-    if !present_params_are_valid(&pp) {
+    let extended = dev.is_extended();
+    if !mtld3d_core::present::present_params_are_valid(&pp, extended) {
         log_failed_reset(
-            recovering,
-            old_size,
+            dev,
+            &log,
             &pp,
             format_args!(
                 "rejected, the swap effect, back buffer count or presentation interval is invalid"
             ),
+            ResetFailureEffect::Unchanged,
         );
         return D3DERR_INVALIDCALL;
     }
@@ -4682,18 +5059,22 @@ extern "system" fn device_reset(this: *mut c_void, present_params: *mut c_void) 
     // recording whether or not it goes on to succeed, before it looks for
     // outstanding references: the recording dies with the state it was
     // recording against. Every rejection from here on goes through
-    // `reject_reset`, which restores the state defaults as well.
-    dev.recording_state_block = None;
+    // `reject_reset`, which restores the state defaults as well. An extended
+    // device keeps the recording, as it keeps the state it records against.
+    if !extended {
+        dev.recording_state_block = None;
+    }
     // A fullscreen request must still be well-formed even though its size is
     // not used: the D3D9 "zero means the client area" rule is windowed-only,
     // so zero dimensions here are a malformed request. Checked before the
     // window moves, so a rejected Reset leaves the window as it was.
     if pp.windowed == 0 && (pp.back_buffer_width == 0 || pp.back_buffer_height == 0) {
         log_failed_reset(
-            recovering,
-            old_size,
+            dev,
+            &log,
             &pp,
             format_args!("rejected, a fullscreen request may not carry zero dimensions"),
+            ResetFailureEffect::Unchanged,
         );
         return reject_reset(dev);
     }
@@ -4703,16 +5084,19 @@ extern "system" fn device_reset(this: *mut c_void, present_params: *mut c_void) 
     // block that holds such a resource keeps it outstanding too, since the
     // resource lives as long as the block; the device's bindings do not count,
     // so they need not be released before the count is read.
+    // An extended device keeps its default-pool resources and implicit
+    // surfaces alive across `Reset`, so nothing it holds blocks one.
     let blockers = dev.outstanding_reset_blockers.load(Ordering::Acquire);
-    if blockers != 0 {
+    if blockers != 0 && !extended {
         log_failed_reset(
-            recovering,
-            old_size,
+            dev,
+            &log,
             &pp,
             format_args!(
                 "rejected, {blockers} D3DPOOL_DEFAULT resource(s) or implicit surface(s) still \
                  referenced"
             ),
+            ResetFailureEffect::Unchanged,
         );
         return reject_reset(dev);
     }
@@ -4731,13 +5115,14 @@ extern "system" fn device_reset(this: *mut c_void, present_params: *mut c_void) 
     )
     .map(|count| u8::try_from(count).expect("sample count ≤ 16 fits u8")) else {
         log_failed_reset(
-            recovering,
-            old_size,
+            dev,
+            &log,
             &pp,
             format_args!(
                 "rejected, the multisample type and quality are not available on this back-buffer \
                  format"
             ),
+            ResetFailureEffect::Unchanged,
         );
         return reject_reset(dev);
     };
@@ -4753,13 +5138,14 @@ extern "system" fn device_reset(this: *mut c_void, present_params: *mut c_void) 
         )
     {
         log_failed_reset(
-            recovering,
-            old_size,
+            dev,
+            &log,
             &pp,
             format_args!(
                 "rejected, the auto depth-stencil format at this multisample type is no \
                  depth-stencil the device offers"
             ),
+            ResetFailureEffect::Unchanged,
         );
         return reject_reset(dev);
     }
@@ -4771,10 +5157,11 @@ extern "system" fn device_reset(this: *mut c_void, present_params: *mut c_void) 
     let retargeted = target_window != dev.window();
     if !resolve_reset_window_mode(dev, target_window, &mut pp) {
         log_failed_reset(
-            recovering,
-            old_size,
+            dev,
+            &log,
             &pp,
             format_args!("rejected, no usable windowed client area"),
+            ResetFailureEffect::Unchanged,
         );
         return reject_reset(dev);
     }
@@ -4788,6 +5175,10 @@ extern "system" fn device_reset(this: *mut c_void, present_params: *mut c_void) 
     pp_in.back_buffer_count = pp.back_buffer_count;
     pp_in.back_buffer_format = pp.back_buffer_format;
 
+    // Captured before the configuration below changes what the held
+    // surfaces resolve to.
+    let held = dev.hold_implicit_surfaces();
+    let detached = (held.back_buffer.is_some(), held.depth.is_some());
     let multi_sample_changed = new_sample_count != dev.backbuffer_sample_count;
     dev.set_backbuffer_multi_sample(
         pp.multi_sample_type,
@@ -4797,10 +5188,16 @@ extern "system" fn device_reset(this: *mut c_void, present_params: *mut c_void) 
     // A back buffer an earlier `Reset` failed to create takes the recreate
     // path at any size: the dimensions that `Reset` adopted are not a back
     // buffer that exists.
-    let resized = pp.back_buffer_width != dev.backbuffer_width
+    // An extended device's `Reset` with an implicit surface the application
+    // still holds makes the swap chain new textures at any size: the held
+    // surface keeps the old ones (`detach_held_implicit_surfaces`).
+    // Only the first four are a change in what the device presents with,
+    // which the line's level keys on; a held surface alone is not.
+    let recreated_for_a_change = pp.back_buffer_width != dev.backbuffer_width
         || pp.back_buffer_height != dev.backbuffer_height
         || multi_sample_changed
         || dev.backbuffer_handle.is_null();
+    let resized = recreated_for_a_change || held.back_buffer.is_some() || held.depth.is_some();
     // Reset adopts the present params' auto depth-stencil configuration: an
     // enabled flag (re)creates the implicit depth-stencil at the given format,
     // a disabled flag drops it. This is independent of a resize, so resolve the
@@ -4821,10 +5218,11 @@ extern "system" fn device_reset(this: *mut c_void, present_params: *mut c_void) 
         dev.pending_pacing = None;
         if let Err(hr) = retarget_device_window(dev, &pp, target_window) {
             log_failed_reset(
-                recovering,
-                old_size,
+                dev,
+                &log,
                 &pp,
                 format_args!("failed retargeting the device window ({hr:#010x})"),
+                ResetFailureEffect::Unstated,
             );
             return hr;
         }
@@ -4834,12 +5232,13 @@ extern "system" fn device_reset(this: *mut c_void, present_params: *mut c_void) 
         // reset_recreate_resources rebuilds the depth from depth_stencil_format,
         // so adopt the new auto-DS format before it runs.
         dev.depth_stencil_format = new_depth_format;
-        if let Err(hr) = reset_recreate_resources(dev, &pp) {
+        if let Err(hr) = reset_recreate_resources(dev, &pp, held) {
             log_failed_reset(
-                recovering,
-                old_size,
+                dev,
+                &log,
                 &pp,
                 format_args!("failed recreating the back buffer ({hr:#010x})"),
+                ResetFailureEffect::StateKeptResetOwed,
             );
             return fail_reset(dev, hr);
         }
@@ -4856,10 +5255,11 @@ extern "system" fn device_reset(this: *mut c_void, present_params: *mut c_void) 
         // it is unchanged, so the fast path stays fast).
         if let Err(hr) = reconcile_implicit_depth(dev, new_depth_format) {
             log_failed_reset(
-                recovering,
-                old_size,
+                dev,
+                &log,
                 &pp,
                 format_args!("failed recreating the auto depth-stencil ({hr:#010x})"),
+                ResetFailureEffect::StateKeptResetOwed,
             );
             return fail_reset(dev, hr);
         }
@@ -4875,10 +5275,11 @@ extern "system" fn device_reset(this: *mut c_void, present_params: *mut c_void) 
         // `reset_recreate_resources`.
         if let Err(hr) = dev.flush_current_frame_blocking() {
             log_failed_reset(
-                recovering,
-                old_size,
+                dev,
+                &log,
                 &pp,
                 format_args!("failed delivering the pending frame ({hr:#010x})"),
+                ResetFailureEffect::Unstated,
             );
             return hr;
         }
@@ -4913,8 +5314,13 @@ extern "system" fn device_reset(this: *mut c_void, present_params: *mut c_void) 
     }
 
     // 8. Reset device state to D3D9 defaults. Cursor + silent-write
-    //    warn latches survive (per-spec / process-lifetime telemetry).
-    dev.reset_to_defaults();
+    //    warn latches survive (per-spec / process-lifetime telemetry). An
+    //    extended device keeps its state and rebinds only its targets.
+    if extended {
+        dev.rebind_after_extended_reset();
+    } else {
+        dev.reset_to_defaults();
+    }
     dev.flags.remove(DeviceFlags::NOT_RESET);
 
     // 9. On the existing attachment, defer the PresentationInterval change
@@ -4928,68 +5334,81 @@ extern "system" fn device_reset(this: *mut c_void, present_params: *mut c_void) 
         dev.queue_pacing_change(resolve_layer_pacing(&pp, &dev.config));
     }
 
-    // Info only for a Reset that changed what the device presents with, or
-    // that recovered it. A game may call Reset on every step of a window
-    // drag after `apply_auto_resize` already followed the client area, and
-    // those same-size calls stay at debug.
-    let level = if resized || recovering || changes_presentation(&previous, &stored) {
+    // Info only for a Reset that changed what the device presents with, that
+    // recovered it, or that ends an extended device's run of failed Resets
+    // (`success_logs_at_info`). A game may call Reset on every step of a
+    // window drag after `apply_auto_resize` already followed the client area,
+    // and those same-size calls stay at debug, held surfaces or not.
+    let mut done = ResetDone::empty();
+    done.set(ResetDone::RESIZED, resized);
+    done.set(ResetDone::RECOVERED, log.recovering);
+    done.set(ResetDone::EXTENDED, extended);
+    done.set(ResetDone::BACK_BUFFER_DETACHED, detached.0);
+    done.set(ResetDone::DEPTH_DETACHED, detached.1);
+    // A device that was waiting for this Reset says it recovered; one that
+    // owed nothing, an extended device past a rejection, says the run ended.
+    done.set(
+        ResetDone::FAILURES_ENDED,
+        !log.recovering && dev.flags.contains(DeviceFlags::RESET_FAILURE_LOGGED),
+    );
+    dev.flags.remove(DeviceFlags::RESET_FAILURE_LOGGED);
+    let changed = recreated_for_a_change || changes_presentation(&previous, &stored);
+    let level = if success_logs_at_info(changed, done) {
         log::Level::Info
     } else {
         log::Level::Debug
     };
-    log::log!(
-        target: LOG_TARGET,
-        level,
-        "{}",
-        ResetSummary::new(
-            RESET_INTERFACE,
-            old_size,
-            &pp,
-            format_args!(
-                "ok, {}{}",
-                if resized {
-                    "back buffer recreated"
-                } else {
-                    "same size, back buffer kept"
-                },
-                if recovering { ", device recovered" } else { "" },
-            ),
-        ),
-    );
+    log::log!(target: LOG_TARGET, level, "{}", log.summary(&pp, done));
     D3D_OK
 }
 
 /// Log a `Reset` that did not complete, with the request as far as it was resolved.
 ///
 /// At warn for the first failure since the device last reset successfully,
-/// and at debug while `recovering`: a game retries a failing `Reset` every
-/// frame, and the first line already said why it fails. A rejection of
-/// malformed present parameters leaves the device as it was, so it warns
-/// each time unless an earlier failure is still pending.
+/// and at debug after it: a game retries a failing `Reset` every frame, and
+/// the first line already said why it fails. A plain device is past its
+/// first failure while it waits for a successful `Reset`; a rejection of
+/// malformed present parameters leaves it as it was, so that one warns each
+/// time unless an earlier failure is still pending. An extended device owes
+/// no `Reset` after a rejection, so it marks its first warning instead and
+/// keeps later rejections at debug, but a failure that leaves it needing a
+/// `Reset` warns regardless (`failure_warns`). Its line ends with `effect`,
+/// what the failure left behind.
 fn log_failed_reset(
-    recovering: bool,
-    old_size: (u32, u32),
+    dev: &mut DeviceInner,
+    log: &ResetLog,
     pp: &mtld3d_types::D3DPRESENT_PARAMETERS,
-    outcome: core::fmt::Arguments<'_>,
+    reason: core::fmt::Arguments<'_>,
+    effect: ResetFailureEffect,
 ) {
-    let level = if recovering {
-        log::Level::Debug
-    } else {
+    let extended = dev.is_extended();
+    let failure_logged = dev.flags.contains(DeviceFlags::RESET_FAILURE_LOGGED);
+    let level = if failure_warns(log.recovering, failure_logged, &effect) {
         log::Level::Warn
+    } else {
+        log::Level::Debug
+    };
+    let effect = if extended {
+        dev.flags.insert(DeviceFlags::RESET_FAILURE_LOGGED);
+        effect
+    } else {
+        ResetFailureEffect::Unstated
     };
     log::log!(
         target: LOG_TARGET,
         level,
         "{}",
-        ResetSummary::new(RESET_INTERFACE, old_size, pp, outcome),
+        log.summary(pp, ResetFailed::new(reason, effect)),
     );
 }
 
-/// Fail a well-formed `Reset` with the device state at its defaults.
+/// Answer a rejected `Reset`: on a plain device, with the device state at its defaults.
 ///
-/// D3D9 resets the device state before it checks what can make a `Reset`
-/// fail, so a rejected one still releases every binding and returns every
-/// state to its default, leaving what a successful `Reset` leaves: render
+/// An extended device answers `D3DERR_INVALIDCALL` and changes nothing: it
+/// keeps its state, bindings, scene and frame, and owes no `Reset`. On a
+/// plain device D3D9 resets the device state before it checks what can make a
+/// `Reset` fail, so a rejected one still releases every binding and returns
+/// every state to its default, leaving what a successful `Reset` leaves: render
 /// target 0 on the back buffer, the depth stencil on the implicit surface,
 /// no recording and no open scene. The frame in flight is delivered first,
 /// as a same-size `Reset` does, and [`fail_reset`] replaces it, so the
@@ -4997,6 +5416,12 @@ fn log_failed_reset(
 /// after the rejection would be built for the back buffer while its pass
 /// still carried the targets the application had bound.
 fn reject_reset(dev: &mut DeviceInner) -> i32 {
+    // An extended device answers a rejected `Reset` without touching its
+    // state: it keeps its bindings, its scene and its frame, and needs no
+    // further `Reset`.
+    if dev.is_extended() {
+        return D3DERR_INVALIDCALL;
+    }
     if let Err(hr) = dev.flush_current_frame_blocking() {
         dev.flags.insert(DeviceFlags::NOT_RESET);
         return hr;
@@ -5004,7 +5429,7 @@ fn reject_reset(dev: &mut DeviceInner) -> i32 {
     fail_reset(dev, D3DERR_INVALIDCALL)
 }
 
-/// End a failed `Reset` on a fresh frame with the state defaults, answering `hr`.
+/// End a failed `Reset` on a fresh frame, answering `hr`.
 ///
 /// The frame in flight was already delivered by the caller, unless the
 /// encoder had already failed, which this then leaves latched. Past the point
@@ -5018,7 +5443,13 @@ fn reject_reset(dev: &mut DeviceInner) -> i32 {
 fn fail_reset(dev: &mut DeviceInner, hr: i32) -> i32 {
     dev.flags.insert(DeviceFlags::NOT_RESET);
     dev.reseed_current_frame();
-    dev.reset_to_defaults();
+    // An extended device keeps its state here too; its targets return to the
+    // implicit surfaces, which name whatever the failed recreate left.
+    if dev.is_extended() {
+        dev.rebind_after_extended_reset();
+    } else {
+        dev.reset_to_defaults();
+    }
     hr
 }
 
@@ -5036,7 +5467,7 @@ fn resolve_reset_window_mode(
         && (pp.back_buffer_width == 0 || pp.back_buffer_height == 0)
         && let Some(saved) = dev.fullscreen.as_ref()
     {
-        let accepted = crate::fullscreen::try_leave(saved, || {
+        let accepted = crate::fullscreen::try_leave(saved, dev.leave_kind(), || {
             crate::direct3d9::resolve_backbuffer_dims(target as u64, pp);
             pp.back_buffer_width != 0 && pp.back_buffer_height != 0
         });
@@ -5155,6 +5586,7 @@ fn retarget_device_window(
 fn reset_recreate_resources(
     dev: &mut DeviceInner,
     pp: &mtld3d_types::D3DPRESENT_PARAMETERS,
+    held: HeldImplicitSurfaces,
 ) -> Result<(), i32> {
     // 1. Drain any ops the API thread queued onto current_frame after the
     //    last Present — same pattern as device_release. The encoder's
@@ -5166,7 +5598,9 @@ fn reset_recreate_resources(
     //    two handles cross the PE/Unix boundary in one call. The encoder is
     //    handed the same list: these five leave without passing through the
     //    retention queue, which is where every other texture's handle-keyed
-    //    records are pruned.
+    //    records are pruned. A held implicit surface of an extended device
+    //    takes its textures over instead, and they stay.
+    dev.detach_held_implicit_surfaces(held);
     let old_handles: [u64; 5] = [
         dev.backbuffer_handle.raw(),
         dev.backbuffer_srgb_handle.raw(),
@@ -5186,7 +5620,6 @@ fn reset_recreate_resources(
         };
         unix_call(&mut destroy);
     }
-
     // 3. Adopt the new dimensions. Done before CreateBackbuffer so the
     //    new textures are sized correctly and downstream readers
     //    (viewport defaults, GetBackBuffer, fresh_frame) all see the
@@ -5355,12 +5788,34 @@ extern "system" fn device_present(
 ) -> i32 {
     let _api = device_api_lock(this);
     let _timer = device_timer(this, DeviceSubCategory::Frame);
+    present_impl(
+        this,
+        src_rect,
+        dst_rect,
+        dst_window_override,
+        dirty_region,
+        0,
+    )
+}
+
+/// The body `Present` and `PresentEx` share; the caller holds the API lock.
+///
+/// Every argument but `this` is accepted and ignored, each warned once.
+fn present_impl(
+    this: *mut c_void,
+    src_rect: *const c_void,
+    dst_rect: *const c_void,
+    dst_window_override: *mut c_void,
+    dirty_region: *const c_void,
+    flags: u32,
+) -> i32 {
     warn_ignored_present_arguments(
         src_rect,
         dst_rect,
         !dst_window_override.is_null(),
         dirty_region,
     );
+    warn_ignored_present_flags(flags);
     // SAFETY: vtable thunk; `this` is *mut Direct3DDevice9 per IDirect3DDevice9 ABI.
     let Some(obj) = (unsafe { InPtrMut::<Direct3DDevice9>::opt(this) }) else {
         return D3DERR_INVALIDCALL;
@@ -5372,6 +5827,23 @@ extern "system" fn device_present(
 
     mtld3d_shared::crumb!("d3d9:present");
     dev.present()
+}
+
+/// Warn once for each `D3DPRESENT_*` flag bit a present carries, none of which is honoured.
+///
+/// The frame presents as it would without the flag: `DONOTWAIT` still waits,
+/// `FORCEIMMEDIATE` still follows the presentation interval, and the overlay
+/// bits have no overlay to act on. Shared by `PresentEx` and
+/// `IDirect3DSwapChain9::Present`.
+pub fn warn_ignored_present_flags(flags: u32) {
+    for bit in mtld3d_core::extended::present_flag_bits(flags) {
+        mtld3d_shared::log_once_warn_by!(
+            target: LOG_TARGET,
+            key: u64::from(bit),
+            "Present: {} ({bit:#x}) is not honoured; the frame presents as it would without it",
+            mtld3d_core::extended::present_flag_name(bit)
+        );
+    }
 }
 
 /// Warn once for each optional `Present` argument, none of which is honoured.
@@ -5695,12 +6167,23 @@ fn create_texture_path(info: &TextureCreateArgs) -> i32 {
         null_out(texture);
         return D3DERR_INVALIDCALL;
     }
-    // Shared resource handles are a D3D9Ex-only feature: a plain device rejects a
-    // non-NULL pSharedHandle with E_NOTIMPL. WoW always
-    // passes NULL on its plain device, so this never fires in-game.
-    if !shared_handle.is_null() {
+    // A plain device refuses a non-null pSharedHandle with E_NOTIMPL; an
+    // extended one reads it as user memory or a shared resource.
+    let kind = if offscreen_plain {
+        mtld3d_core::extended::CreateKind::OffscreenPlain
+    } else {
+        mtld3d_core::extended::CreateKind::Texture { levels }
+    };
+    let user_memory = match shared_handle_gate(this, &kind, pool, shared_handle, "CreateTexture") {
+        Ok(memory) => memory,
+        Err(hr) => {
+            null_out(texture);
+            return hr;
+        }
+    };
+    if managed_pool_refused(this, &kind, pool, "CreateTexture") {
         null_out(texture);
-        return E_NOTIMPL;
+        return D3DERR_INVALIDCALL;
     }
     // D3DUSAGE_WRITEONLY is a vertex/index-buffer-only flag; on a texture it is
     // INVALIDCALL.
@@ -5962,6 +6445,18 @@ fn create_texture_path(info: &TextureCreateArgs) -> i32 {
     };
     if out_of_memory {
         return refuse_unallocatable_staging("CreateTexture", texture);
+    }
+    // An extended device's single-level system-memory texture starts with the
+    // application's pixels, packed row after row, copied into the level once.
+    if let Some(memory) = user_memory {
+        let rows = mtld3d_core::extended::PackedRows::of_level(
+            width,
+            height,
+            fmt.bytes_per_pixel(),
+            (fmt.block_width(), fmt.block_height(), fmt.block_bytes()),
+        );
+        let pitch = usize::try_from(mip_bytes_per_row[0]).expect("a row pitch fits usize");
+        copy_user_memory(memory, &rows, staging[0].as_mut_slice(), pitch);
     }
 
     obj.inner()
@@ -6333,11 +6828,26 @@ extern "system" fn device_create_volume_texture(
         null_out(texture);
         return D3DERR_INVALIDCALL;
     }
-    // Shared resource handles are a D3D9Ex-only feature — a plain device rejects a
-    // non-NULL pSharedHandle with E_NOTIMPL.
-    if !shared_handle.is_null() {
+    // A plain device refuses a non-null pSharedHandle with E_NOTIMPL; an
+    // extended one reads it as a shared resource, which it does not create.
+    if let Err(hr) = shared_handle_gate(
+        this,
+        &mtld3d_core::extended::CreateKind::VolumeTexture,
+        pool,
+        shared_handle,
+        "CreateVolumeTexture",
+    ) {
         null_out(texture);
-        return E_NOTIMPL;
+        return hr;
+    }
+    if managed_pool_refused(
+        this,
+        &mtld3d_core::extended::CreateKind::VolumeTexture,
+        pool,
+        "CreateVolumeTexture",
+    ) {
+        null_out(texture);
+        return D3DERR_INVALIDCALL;
     }
     // SAFETY: vtable thunk; `this` is *mut Direct3DDevice9 per IDirect3DDevice9 ABI.
     let Some(obj) = (unsafe { InPtr::<Direct3DDevice9>::opt(this) }) else {
@@ -6506,11 +7016,26 @@ extern "system" fn device_create_cube_texture(
         null_out(texture);
         return D3DERR_INVALIDCALL;
     }
-    // Shared resource handles are a D3D9Ex-only feature — a plain device rejects a
-    // non-NULL pSharedHandle with E_NOTIMPL.
-    if !shared_handle.is_null() {
+    // A plain device refuses a non-null pSharedHandle with E_NOTIMPL; an
+    // extended one reads it as a shared resource, which it does not create.
+    if let Err(hr) = shared_handle_gate(
+        this,
+        &mtld3d_core::extended::CreateKind::CubeTexture,
+        pool,
+        shared_handle,
+        "CreateCubeTexture",
+    ) {
         null_out(texture);
-        return E_NOTIMPL;
+        return hr;
+    }
+    if managed_pool_refused(
+        this,
+        &mtld3d_core::extended::CreateKind::CubeTexture,
+        pool,
+        "CreateCubeTexture",
+    ) {
+        null_out(texture);
+        return D3DERR_INVALIDCALL;
     }
     // D3DUSAGE_WRITEONLY is a vertex/index-buffer-only flag; on a cube texture it
     // is INVALIDCALL.
@@ -6706,11 +7231,26 @@ extern "system" fn device_create_vertex_buffer(
         null_out(vb);
         return D3DERR_INVALIDCALL;
     }
-    // Shared resource handles are a D3D9Ex-only feature — a plain device rejects a
-    // non-NULL pSharedHandle with E_NOTIMPL.
-    if !shared_handle.is_null() {
+    // A plain device refuses a non-null pSharedHandle with E_NOTIMPL; an
+    // extended one reads it as a shared resource, which it does not create.
+    if let Err(hr) = shared_handle_gate(
+        this,
+        &mtld3d_core::extended::CreateKind::VertexBuffer,
+        pool,
+        shared_handle,
+        "CreateVertexBuffer",
+    ) {
         null_out(vb);
-        return E_NOTIMPL;
+        return hr;
+    }
+    if managed_pool_refused(
+        this,
+        &mtld3d_core::extended::CreateKind::VertexBuffer,
+        pool,
+        "CreateVertexBuffer",
+    ) {
+        null_out(vb);
+        return D3DERR_INVALIDCALL;
     }
     // SAFETY: vtable thunk; `this` is *mut Direct3DDevice9 per IDirect3DDevice9 ABI.
     let Some(obj) = (unsafe { InPtr::<Direct3DDevice9>::opt(this) }) else {
@@ -6780,11 +7320,26 @@ extern "system" fn device_create_index_buffer(
         null_out(ib);
         return D3DERR_INVALIDCALL;
     }
-    // Shared resource handles are a D3D9Ex-only feature — a plain device rejects a
-    // non-NULL pSharedHandle with E_NOTIMPL.
-    if !shared_handle.is_null() {
+    // A plain device refuses a non-null pSharedHandle with E_NOTIMPL; an
+    // extended one reads it as a shared resource, which it does not create.
+    if let Err(hr) = shared_handle_gate(
+        this,
+        &mtld3d_core::extended::CreateKind::IndexBuffer,
+        pool,
+        shared_handle,
+        "CreateIndexBuffer",
+    ) {
         null_out(ib);
-        return E_NOTIMPL;
+        return hr;
+    }
+    if managed_pool_refused(
+        this,
+        &mtld3d_core::extended::CreateKind::IndexBuffer,
+        pool,
+        "CreateIndexBuffer",
+    ) {
+        null_out(ib);
+        return D3DERR_INVALIDCALL;
     }
     // D3DFMT_INDEX16 = 101, D3DFMT_INDEX32 = 102 are the only legal index
     // formats; the draw path selects `MTLIndexType` from the stored format, so
@@ -7043,11 +7598,17 @@ extern "system" fn device_create_render_target(
         null_out(surface);
         return D3DERR_INVALIDCALL;
     }
-    // Shared resource handles are a D3D9Ex-only feature — a plain device rejects a
-    // non-NULL pSharedHandle with E_NOTIMPL.
-    if !shared_handle.is_null() {
+    // A plain device refuses a non-null pSharedHandle with E_NOTIMPL; an
+    // extended one reads it as a shared resource, which it does not create.
+    if let Err(hr) = shared_handle_gate(
+        this,
+        &mtld3d_core::extended::CreateKind::RenderTarget,
+        D3DPOOL_DEFAULT,
+        shared_handle,
+        "CreateRenderTarget",
+    ) {
         null_out(surface);
-        return E_NOTIMPL;
+        return hr;
     }
     let multi_sample = match resolve_surface_multi_sample(
         multi_sample,
@@ -7153,11 +7714,17 @@ extern "system" fn device_create_depth_stencil_surface(
         null_out(surface);
         return D3DERR_INVALIDCALL;
     }
-    // Shared resource handles are a D3D9Ex-only feature — a plain device rejects a
-    // non-NULL pSharedHandle with E_NOTIMPL.
-    if !shared_handle.is_null() {
+    // A plain device refuses a non-null pSharedHandle with E_NOTIMPL; an
+    // extended one reads it as a shared resource, which it does not create.
+    if let Err(hr) = shared_handle_gate(
+        this,
+        &mtld3d_core::extended::CreateKind::DepthStencil,
+        D3DPOOL_DEFAULT,
+        shared_handle,
+        "CreateDepthStencilSurface",
+    ) {
         null_out(surface);
-        return E_NOTIMPL;
+        return hr;
     }
     if !is_depth_stencil_format(format) {
         warn!(
@@ -8466,7 +9033,16 @@ extern "system" fn device_stretch_rect(
             .flags
             .contains(StretchSurfaceFlags::IS_OFFSCREEN_PLAIN_DEFAULT)
     };
-    if !dst_eligible || !src_eligible {
+    // An extended device also copies between two default-pool surfaces of
+    // no eligible class, a texture level that is no render target included,
+    // when the call is a whole-surface copy of one format and size.
+    let extended_copy = mtld3d_core::stretch_rect::extended_whole_surface_copy(
+        dev.is_extended(),
+        !src_rect.is_null() || !dst_rect.is_null(),
+        (src_info.format, src_info.width, src_info.height),
+        (dst_info.format, dst_info.width, dst_info.height),
+    );
+    if (!dst_eligible || !src_eligible) && !extended_copy {
         // One line per process, naming the first pair rejected here; the
         // arguments are formatted only when it fires.
         // SAFETY: `src` is the live IDirect3DSurface9 the game passed to this call.
@@ -9265,12 +9841,22 @@ extern "system" fn device_create_offscreen_plain_surface(
         null_out(surface);
         return D3DERR_INVALIDCALL;
     }
-    // Shared resource handles are a D3D9Ex-only feature — a plain device rejects a
-    // non-NULL pSharedHandle with E_NOTIMPL.
-    if !shared_handle.is_null() {
-        null_out(surface);
-        return E_NOTIMPL;
-    }
+    // A plain device refuses a non-null pSharedHandle with E_NOTIMPL; an
+    // extended one reads it as user memory for a system-memory surface and as
+    // a shared resource, which it does not create, in the default pool.
+    let user_memory = match shared_handle_gate(
+        this,
+        &mtld3d_core::extended::CreateKind::OffscreenPlain,
+        pool,
+        shared_handle,
+        "CreateOffscreenPlainSurface",
+    ) {
+        Ok(memory) => memory,
+        Err(hr) => {
+            null_out(surface);
+            return hr;
+        }
+    };
     // SAFETY: vtable thunk; `this` is *mut Direct3DDevice9 per IDirect3DDevice9 ABI.
     let Some(obj) = (unsafe { InPtr::<Direct3DDevice9>::opt(this) }) else {
         null_out(surface);
@@ -9367,9 +9953,25 @@ extern "system" fn device_create_offscreen_plain_surface(
         (linear_row_pitch(width, bpp) as usize).saturating_mul(height as usize)
     };
     // The surface's bytes are the one allocation of the create that may fail.
-    let Some(backing) = PageBox::try_new_uninit(bytes) else {
+    let Some(mut backing) = PageBox::try_new_uninit(bytes) else {
         return refuse_unallocatable_staging("CreateOffscreenPlainSurface", surface);
     };
+    // An extended device's system-memory surface starts with the
+    // application's packed pixels, copied once at the lock pitch.
+    if let Some(memory) = user_memory {
+        let rows = mtld3d_core::extended::PackedRows::of_level(
+            width,
+            height,
+            bpp,
+            (fmt.block_width(), fmt.block_height(), fmt.block_bytes()),
+        );
+        let pitch = if bpp == 0 {
+            rows.row_bytes
+        } else {
+            linear_row_pitch(width, bpp) as usize
+        };
+        copy_user_memory(memory, &rows, backing.as_mut_slice(), pitch);
+    }
     let surf =
         Direct3DSurface9::new_system_memory(obj.inner_ptr(), width, height, format, pool, backing);
     let surf_ptr = Box::into_raw(Box::new(surf));
@@ -15033,45 +15635,6 @@ fn warn_unused_usage_and_pool_once(kind: &str, usage: u32, pool: u32) {
 // `back_buffer_format` already warns at d3d9_create_device. Warn on
 // every other non-default field so the next mismatched present-time
 // expectation surfaces on first device creation / reset.
-
-/// Validate the swap-effect / back-buffer-count / presentation-interval fields.
-///
-/// Checked on a present-parameters block per the D3D9 `CreateDevice`/`Reset`
-/// contract. `false` ⇒ the call must return `D3DERR_INVALIDCALL`.
-///
-/// - Swap effect must be DISCARD(1)/FLIP(2)/COPY(3); `0` and the `D3D9Ex` effects
-///   (OVERLAY/FLIPEX/…) are rejected.
-/// - COPY allows at most one back buffer.
-/// - At most 3 back buffers (a requested 0 resolves to 1).
-/// - Presentation interval must be DEFAULT/ONE/TWO/THREE/FOUR/IMMEDIATE.
-pub const fn present_params_are_valid(pp: &mtld3d_types::D3DPRESENT_PARAMETERS) -> bool {
-    const SWAPEFFECT_DISCARD: u32 = 1;
-    const SWAPEFFECT_FLIP: u32 = 2;
-    const SWAPEFFECT_COPY: u32 = 3;
-    const MAX_BACK_BUFFERS: u32 = 3;
-
-    if !matches!(
-        pp.swap_effect,
-        SWAPEFFECT_DISCARD | SWAPEFFECT_FLIP | SWAPEFFECT_COPY
-    ) {
-        return false;
-    }
-    if pp.swap_effect == SWAPEFFECT_COPY && pp.back_buffer_count > 1 {
-        return false;
-    }
-    if pp.back_buffer_count > MAX_BACK_BUFFERS {
-        return false;
-    }
-    matches!(
-        pp.presentation_interval,
-        D3DPRESENT_INTERVAL_DEFAULT
-            | D3DPRESENT_INTERVAL_ONE
-            | D3DPRESENT_INTERVAL_TWO
-            | D3DPRESENT_INTERVAL_THREE
-            | D3DPRESENT_INTERVAL_FOUR
-            | D3DPRESENT_INTERVAL_IMMEDIATE
-    )
-}
 
 pub fn warn_present_params_fields_once(pp: &mtld3d_types::D3DPRESENT_PARAMETERS) {
     if pp.back_buffer_count > 1 {

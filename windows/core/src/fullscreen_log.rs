@@ -82,6 +82,11 @@ pub enum WindowPlacement {
     Gone,
     /// The pre-fullscreen rect was never read, so the window stayed where it is.
     Unmoved,
+    /// An extended device's leave: the window stays at its fullscreen rect.
+    ///
+    /// `shown` is the visibility it was given back, the one it had before
+    /// fullscreen showed it.
+    KeptFullscreen { shown: bool },
 }
 
 impl fmt::Display for WindowPlacement {
@@ -92,6 +97,12 @@ impl fmt::Display for WindowPlacement {
             Self::AppOwned => f.write_str("window left to the app (D3DCREATE_NOWINDOWCHANGES)"),
             Self::Gone => f.write_str("window already destroyed"),
             Self::Unmoved => f.write_str("window not moved, its windowed rect was never read"),
+            Self::KeptFullscreen { shown: true } => {
+                f.write_str("window kept at its fullscreen rect, shown as before fullscreen")
+            }
+            Self::KeptFullscreen { shown: false } => {
+                f.write_str("window kept at its fullscreen rect, hidden again as before fullscreen")
+            }
         }
     }
 }

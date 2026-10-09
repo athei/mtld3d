@@ -403,12 +403,13 @@ pub struct TextureInner {
     /// (`rehydrate_for_device`), so a device ref would pin the old device alive
     /// and break that handoff — they do not forward.
     d3d_pool: u32,
-    /// App-set managed-resource priority, round-tripped by `GetPriority` / `SetPriority`.
+    /// App-set resource priority, round-tripped by `GetPriority` / `SetPriority`.
     ///
-    /// D3D9 only honours priority for `D3DPOOL_MANAGED` resources (it drives
-    /// the resource manager's eviction order); for every other pool both
-    /// accessors are fixed at `0`. Metal has no eviction-order hint, so this is
-    /// app-visible state only and never acted upon.
+    /// D3D9 honours priority for the pool a memory manager pages, which
+    /// orders its evictions: `D3DPOOL_MANAGED` on a plain device and
+    /// `D3DPOOL_DEFAULT` on an extended one. For every other pool both
+    /// accessors are fixed at `0`. Metal has no eviction-order hint, so this
+    /// is app-visible state only and never acted upon.
     priority: u32,
     /// Per-resource `LockRect` / `GetDC` mutual-exclusion state.
     ///
@@ -536,6 +537,14 @@ impl TextureInner {
     /// D3DUSAGE_* the texture was created with.
     pub const fn d3d_usage(&self) -> u32 {
         self.d3d_usage
+    }
+
+    /// Add usage bits an extended create carries to what this texture reports.
+    ///
+    /// The extended surface creates take content and sharing restrictions
+    /// that change nothing here; `GetDesc` reports them all the same.
+    pub const fn add_reported_usage(&mut self, usage: u32) {
+        self.d3d_usage |= usage;
     }
 
     /// D3DFMT_* the texture was created with.
@@ -3839,10 +3848,11 @@ extern "system" fn texture_free_private_data(this: *mut c_void, guid: *const Gui
     obj.inner_mut().private_data.free(&guid)
 }
 
-// Priority is honoured only for `D3DPOOL_MANAGED` resources (D3D9 manager
-// eviction order). For every other pool both accessors are fixed at `0`.
-// Metal has no eviction-order hint, so the value is stored and round-tripped
-// but never acted upon.
+// Priority is honoured for the pool a device's memory manager pages:
+// `D3DPOOL_MANAGED` on a plain device, `D3DPOOL_DEFAULT` on an extended one.
+// For every other pool both accessors are fixed at `0`. Metal has no
+// eviction-order hint, so the value is stored and round-tripped but never
+// acted upon.
 extern "system" fn texture_set_priority(this: *mut c_void, priority: u32) -> u32 {
     let _api = crate::com_ref::com_api_lock::<Direct3DTexture9>(this);
     let _timer = tex_timer(this);
@@ -3851,7 +3861,12 @@ extern "system" fn texture_set_priority(this: *mut c_void, priority: u32) -> u32
         return 0;
     };
     let ti = obj.inner_mut();
-    if ti.d3d_pool != mtld3d_types::D3DPOOL_MANAGED {
+    // A default-pool texture holds a reference on its device, which is live.
+    let extended = ti.d3d_pool == mtld3d_types::D3DPOOL_DEFAULT
+        // SAFETY: a default-pool texture forwards a reference to its device,
+        // so `device_inner` is 0 or that live device.
+        && unsafe { crate::device::device_inner_is_extended(ti.device_inner()) };
+    if !mtld3d_core::pool::priority_settable(ti.d3d_pool, extended) {
         return 0;
     }
     core::mem::replace(&mut ti.priority, priority)

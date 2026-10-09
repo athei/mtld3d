@@ -74,6 +74,7 @@ unsafe extern "system" {
 #[link(name = "kernel32")]
 unsafe extern "system" {
     fn GetModuleHandleA(name: *const c_char) -> usize;
+    fn GetProcAddress(module: usize, name: *const c_char) -> *mut c_void;
     fn GetCurrentProcess() -> *mut c_void;
     fn TerminateProcess(process: *mut c_void, exit_code: u32) -> i32;
     fn GetLastError() -> u32;
@@ -1013,4 +1014,19 @@ fn peek_quit(remove: u32) -> bool {
     // SAFETY: Win32 thunk; `msg` is a valid &mut MSG, and hwnd 0 with a
     // `WM_QUIT`-only filter peeks the thread queue's quit message alone.
     unsafe { PeekMessageA(&raw mut msg, 0, WM_QUIT, WM_QUIT, remove) != 0 }
+}
+
+/// The address the loaded `d3d9.dll` exports under `name`, or null when it exports none.
+///
+/// Resolving by name keeps an export the image lacks a test failure: a
+/// `raw-dylib` import of it would stop the whole binary from loading.
+#[must_use]
+pub fn d3d9_export(name: &core::ffi::CStr) -> *mut c_void {
+    // SAFETY: kernel32 export with a NUL-terminated module name.
+    let module = unsafe { GetModuleHandleA(c"d3d9.dll".as_ptr()) };
+    if module == 0 {
+        return core::ptr::null_mut();
+    }
+    // SAFETY: kernel32 export; `module` is a loaded module and `name` is NUL-terminated.
+    unsafe { GetProcAddress(module, name.as_ptr()) }
 }

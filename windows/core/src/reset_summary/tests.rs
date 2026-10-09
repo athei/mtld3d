@@ -11,10 +11,14 @@
 
 use mtld3d_types::{
     D3DFMT_D24S8, D3DFMT_X8R8G8B8, D3DPRESENT_INTERVAL_IMMEDIATE, D3DPRESENT_INTERVAL_ONE,
-    D3DPRESENT_PARAMETERS, D3DSWAPEFFECT_DISCARD, D3DSWAPEFFECT_FLIP,
+    D3DPRESENT_PARAMETERS, D3DSWAPEFFECT_DISCARD, D3DSWAPEFFECT_FLIP, D3DSWAPEFFECT_FLIPEX,
+    D3DSWAPEFFECT_OVERLAY,
 };
 
-use super::{ResetSummary, changes_presentation};
+use super::{
+    ResetDone, ResetFailed, ResetFailureEffect, ResetMethod, ResetSummary, changes_presentation,
+    failure_warns, success_logs_at_info,
+};
 
 const fn params(windowed: bool) -> D3DPRESENT_PARAMETERS {
     D3DPRESENT_PARAMETERS {
@@ -103,7 +107,7 @@ fn several_buffers_multisample_and_other_effects_are_named() {
 fn values_the_line_has_no_name_for_print_their_codes() {
     let mut pp = params(false);
     pp.back_buffer_format = 0x1234;
-    pp.swap_effect = 5;
+    pp.swap_effect = 6;
     pp.presentation_interval = 0x10;
     pp.auto_depth_stencil_format = 0;
     let outcome = format_args!(
@@ -112,7 +116,7 @@ fn values_the_line_has_no_name_for_print_their_codes() {
     );
     let line = ResetSummary::new("IDirect3DDevice9", (1280, 720), &pp, outcome).to_string();
     assert!(line.contains(" format 4660, "), "{line}");
-    assert!(line.contains("swap effect 5,"), "{line}");
+    assert!(line.contains("swap effect 6,"), "{line}");
     assert!(line.contains("interval 0x10,"), "{line}");
     assert!(line.contains("auto depth-stencil UNKNOWN:"), "{line}");
     assert!(
@@ -183,4 +187,143 @@ fn every_other_field_counts() {
         edit(&mut next);
         assert!(changes_presentation(&previous, &next));
     }
+}
+
+#[test]
+fn a_plain_success_names_only_the_back_buffer_and_a_recovery() {
+    assert_eq!(ResetDone::RESIZED.to_string(), "ok, back buffer recreated");
+    assert_eq!(
+        ResetDone::empty().to_string(),
+        "ok, same size, back buffer kept"
+    );
+    assert_eq!(
+        (ResetDone::RESIZED | ResetDone::RECOVERED).to_string(),
+        "ok, back buffer recreated, device recovered"
+    );
+}
+
+#[test]
+fn an_extended_success_says_what_it_kept_detached_and_rebound() {
+    assert_eq!(
+        ResetDone::EXTENDED.to_string(),
+        "ok, state and default-pool resources kept, same size, back buffer kept, targets \
+         rebound to the swap chain"
+    );
+    assert_eq!(
+        (ResetDone::EXTENDED
+            | ResetDone::RESIZED
+            | ResetDone::BACK_BUFFER_DETACHED
+            | ResetDone::DEPTH_DETACHED)
+            .to_string(),
+        "ok, state and default-pool resources kept, back buffer recreated, the held back buffer \
+         and depth surface detached, targets rebound to the swap chain"
+    );
+    assert_eq!(
+        (ResetDone::EXTENDED | ResetDone::RESIZED | ResetDone::DEPTH_DETACHED).to_string(),
+        "ok, state and default-pool resources kept, back buffer recreated, the held depth \
+         surface detached, targets rebound to the swap chain"
+    );
+    assert_eq!(
+        (ResetDone::EXTENDED | ResetDone::FAILURES_ENDED).to_string(),
+        "ok, state and default-pool resources kept, same size, back buffer kept, targets \
+         rebound to the swap chain, ending a run of failed Resets"
+    );
+}
+
+#[test]
+fn a_failure_says_what_an_extended_device_kept_and_nothing_more_on_a_plain_one() {
+    let reason = format_args!("rejected, no usable windowed client area");
+    assert_eq!(
+        ResetFailed::new(reason, ResetFailureEffect::Unstated).to_string(),
+        "rejected, no usable windowed client area"
+    );
+    assert_eq!(
+        ResetFailed::new(reason, ResetFailureEffect::Unchanged).to_string(),
+        "rejected, no usable windowed client area; the extended device is unchanged"
+    );
+    assert_eq!(
+        ResetFailed::new(
+            format_args!("failed recreating the back buffer (0x88760870)"),
+            ResetFailureEffect::StateKeptResetOwed
+        )
+        .to_string(),
+        "failed recreating the back buffer (0x88760870); the extended device keeps its state and \
+         needs another Reset"
+    );
+}
+
+#[test]
+fn a_reset_ex_line_names_the_method_it_came_through() {
+    let pp = params(false);
+    let line = ResetSummary::new("IDirect3DDevice9Ex", (1280, 720), &pp, "ok")
+        .via(ResetMethod::ResetEx)
+        .to_string();
+    assert!(
+        line.starts_with("IDirect3DDevice9Ex::ResetEx 1280x720 -> "),
+        "{line}"
+    );
+}
+
+#[test]
+fn the_extended_swap_effects_are_named() {
+    let mut pp = params(true);
+    for (effect, name) in [
+        (D3DSWAPEFFECT_FLIPEX, "FLIPEX"),
+        (D3DSWAPEFFECT_OVERLAY, "OVERLAY"),
+    ] {
+        pp.swap_effect = effect;
+        let line = ResetSummary::new("IDirect3DDevice9Ex", (1280, 720), &pp, "ok").to_string();
+        assert!(line.contains(&format!(", swap effect {name},")), "{line}");
+    }
+}
+
+#[test]
+fn a_recreate_forced_only_by_a_held_surface_stays_at_debug() {
+    let held_only = ResetDone::EXTENDED | ResetDone::RESIZED | ResetDone::BACK_BUFFER_DETACHED;
+    assert!(
+        !success_logs_at_info(false, held_only),
+        "a drag step with a held surface"
+    );
+    assert!(success_logs_at_info(true, held_only), "a real change");
+    assert!(
+        success_logs_at_info(false, ResetDone::RECOVERED),
+        "a recovery"
+    );
+    assert!(
+        success_logs_at_info(false, ResetDone::EXTENDED | ResetDone::FAILURES_ENDED),
+        "the end of a run of failures"
+    );
+    assert!(
+        !success_logs_at_info(false, ResetDone::empty()),
+        "nothing changed"
+    );
+}
+
+#[test]
+fn a_failure_that_leaves_a_reset_owed_warns_after_quieted_rejections() {
+    use ResetFailureEffect::{StateKeptResetOwed, Unchanged, Unstated};
+    assert!(
+        failure_warns(false, false, &Unchanged),
+        "the first rejection"
+    );
+    assert!(
+        !failure_warns(false, true, &Unchanged),
+        "a repeated rejection"
+    );
+    assert!(
+        failure_warns(false, true, &StateKeptResetOwed),
+        "owing a Reset after rejections"
+    );
+    assert!(
+        !failure_warns(true, true, &StateKeptResetOwed),
+        "already owing one"
+    );
+    assert!(
+        failure_warns(false, false, &Unstated),
+        "a plain device's first failure"
+    );
+    assert!(
+        !failure_warns(true, false, &Unstated),
+        "a plain device's retry"
+    );
 }

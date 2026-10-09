@@ -23,21 +23,24 @@ use mtld3d_core::{
 use mtld3d_shared::{
     AttachMetalLayerParams, CreateBackbufferParams, CreateCommandQueueParams,
     CreateDepthTextureParams, DestroyCommandQueueParams, GetDeviceInfoParams, InPtr, InPtrMut,
-    MetalHandle, OutPtr, VtableThis,
+    MetalHandle, OutPtr, ValueIn, VtableThis,
     mtl::{DeviceCapsFlags, PresentDebugFlags},
     mtl_handle::{MTLDeviceKind, MTLTextureKind, NSViewKind},
     record_handle::DeviceRecordHandle,
 };
 use mtld3d_types::{
-    D3DADAPTER_IDENTIFIER9, D3DCAPS9, D3DDEVTYPE_HAL, D3DDISPLAYMODE, D3DFMT_A8B8G8R8,
+    D3DADAPTER_IDENTIFIER9, D3DCAPS9, D3DDEVTYPE_HAL, D3DDISPLAYMODE, D3DDISPLAYMODEEX,
+    D3DDISPLAYMODEEX_SIZE, D3DDISPLAYMODEFILTER, D3DDISPLAYROTATION_IDENTITY, D3DFMT_A8B8G8R8,
     D3DFMT_A8R8G8B8, D3DFMT_ATI1, D3DFMT_DF16, D3DFMT_DF24, D3DFMT_DXT1, D3DFMT_DXT2, D3DFMT_DXT3,
     D3DFMT_DXT4, D3DFMT_DXT5, D3DFMT_R5G6B5, D3DFMT_R8G8B8, D3DFMT_RESZ, D3DFMT_UYVY,
     D3DFMT_X8B8G8R8, D3DFMT_X8R8G8B8, D3DFMT_YUY2, D3DMULTISAMPLE_NONE, D3DMULTISAMPLE_NONMASKABLE,
     D3DOK_NOAUTOGEN, D3DPRESENT_PARAMETERS, D3DRTYPE_CUBETEXTURE, D3DRTYPE_INDEXBUFFER,
     D3DRTYPE_SURFACE, D3DRTYPE_TEXTURE, D3DRTYPE_VERTEXBUFFER, D3DRTYPE_VOLUME,
-    D3DRTYPE_VOLUMETEXTURE, D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_DYNAMIC,
+    D3DRTYPE_VOLUMETEXTURE, D3DSCANLINEORDERING_INTERLACED, D3DSCANLINEORDERING_PROGRESSIVE,
+    D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_DYNAMIC,
     D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING, D3DUSAGE_QUERY_SRGBREAD, D3DUSAGE_QUERY_SRGBWRITE,
-    D3DUSAGE_QUERY_VERTEXTEXTURE, D3DUSAGE_RENDERTARGET, Guid, IDirect3D9Vtbl,
+    D3DUSAGE_QUERY_VERTEXTEXTURE, D3DUSAGE_RENDERTARGET, Guid, IDirect3D9ExVtbl, IDirect3D9Vtbl,
+    LUID,
 };
 
 use super::{
@@ -45,6 +48,7 @@ use super::{
     device::Direct3DDevice9,
     encoder::{EncoderThread, FrameData, FrameInit},
     fullscreen::Rect,
+    null_out,
     stage_bindings::STAGE_COUNT,
     unix_call::unix_call,
 };
@@ -74,6 +78,9 @@ const ADAPTER_FORMATS: &[u32] = &[D3DFMT_X8R8G8B8, D3DFMT_R5G6B5];
 /// games whose video-menu dropdowns are D3D9-driven vs Win32-driven (Wine's
 /// `EnumDisplaySettings` → macdrv → `CGDisplayCopyAllDisplayModes`).
 const DISPLAY_TRACE_TARGET: &str = "mtld3d::d3d9::display";
+
+/// The GDI name of the primary display, the one adapter 0 drives.
+const PRIMARY_DISPLAY_NAME: &str = "\\\\.\\DISPLAY1";
 
 /// The adapter display-mode format (`D3DFMT_*`) — the format `GetAdapterDisplayMode` reports.
 ///
@@ -251,24 +258,38 @@ pub fn fullscreen_mode_request(pp: &D3DPRESENT_PARAMETERS) -> Option<ModeRequest
     })
 }
 
-static DIRECT3D9_VTBL: IDirect3D9Vtbl = IDirect3D9Vtbl {
-    query_interface: d3d9_query_interface,
-    add_ref: d3d9_add_ref,
-    release: d3d9_release,
-    register_software_device: d3d9_register_software_device,
-    get_adapter_count: d3d9_get_adapter_count,
-    get_adapter_identifier: d3d9_get_adapter_identifier,
-    get_adapter_mode_count: d3d9_get_adapter_mode_count,
-    enum_adapter_modes: d3d9_enum_adapter_modes,
-    get_adapter_display_mode: d3d9_get_adapter_display_mode,
-    check_device_type: d3d9_check_device_type,
-    check_device_format: d3d9_check_device_format,
-    check_device_multi_sample_type: d3d9_check_device_multi_sample_type,
-    check_depth_stencil_match: d3d9_check_depth_stencil_match,
-    check_device_format_conversion: d3d9_check_device_format_conversion,
-    get_device_caps: d3d9_get_device_caps,
-    get_adapter_monitor: d3d9_get_adapter_monitor,
-    create_device: d3d9_create_device,
+/// The vtable every interface carries, extended or not.
+///
+/// A plain interface hands out the same table: its base slots are the
+/// `IDirect3D9` contract, and a caller that never queried `IID_IDirect3D9Ex`
+/// has no reason to reach past them. An extended entry point called through a
+/// plain interface still runs; `CreateDeviceEx` there makes a plain device,
+/// since the device takes its kind from the interface that creates it.
+static DIRECT3D9_VTBL: IDirect3D9ExVtbl = IDirect3D9ExVtbl {
+    base: IDirect3D9Vtbl {
+        query_interface: d3d9_query_interface,
+        add_ref: d3d9_add_ref,
+        release: d3d9_release,
+        register_software_device: d3d9_register_software_device,
+        get_adapter_count: d3d9_get_adapter_count,
+        get_adapter_identifier: d3d9_get_adapter_identifier,
+        get_adapter_mode_count: d3d9_get_adapter_mode_count,
+        enum_adapter_modes: d3d9_enum_adapter_modes,
+        get_adapter_display_mode: d3d9_get_adapter_display_mode,
+        check_device_type: d3d9_check_device_type,
+        check_device_format: d3d9_check_device_format,
+        check_device_multi_sample_type: d3d9_check_device_multi_sample_type,
+        check_depth_stencil_match: d3d9_check_depth_stencil_match,
+        check_device_format_conversion: d3d9_check_device_format_conversion,
+        get_device_caps: d3d9_get_device_caps,
+        get_adapter_monitor: d3d9_get_adapter_monitor,
+        create_device: d3d9_create_device,
+    },
+    get_adapter_mode_count_ex: d3d9_get_adapter_mode_count_ex,
+    enum_adapter_modes_ex: d3d9_enum_adapter_modes_ex,
+    get_adapter_display_mode_ex: d3d9_get_adapter_display_mode_ex,
+    create_device_ex: d3d9_create_device_ex,
+    get_adapter_luid: d3d9_get_adapter_luid,
 };
 
 // ── IDirect3D9 COM object ──
@@ -288,6 +309,10 @@ pub struct Direct3D9 {
 /// before a device's.
 pub struct Direct3D9Inner {
     config: Arc<Mtld3dConfig>,
+    /// Made by `Direct3DCreate9Ex`: the interface answers `IID_IDirect3D9Ex`.
+    ///
+    /// Every device it creates is extended, whichever create made it.
+    extended: bool,
 }
 
 impl Drop for Direct3D9Inner {
@@ -299,12 +324,17 @@ impl Drop for Direct3D9Inner {
 }
 
 impl Direct3D9 {
-    pub fn new(config: Arc<Mtld3dConfig>) -> Self {
+    pub fn new(config: Arc<Mtld3dConfig>, extended: bool) -> Self {
         Self {
-            vtbl: &raw const DIRECT3D9_VTBL,
+            vtbl: &raw const DIRECT3D9_VTBL.base,
             refcount: AtomicU32::new(1),
-            inner: Box::new(Direct3D9Inner { config }),
+            inner: Box::new(Direct3D9Inner { config, extended }),
         }
+    }
+
+    /// Whether `Direct3DCreate9Ex` made this interface.
+    pub const fn is_extended(&self) -> bool {
+        self.inner.extended
     }
 
     /// Take one more reference; the count after it.
@@ -535,17 +565,21 @@ extern "system" fn d3d9_query_interface(
     riid: *const Guid,
     ppv: *mut *mut c_void,
 ) -> i32 {
+    // SAFETY: vtable thunk; `this` is *mut Direct3D9 per the IDirect3D9 ABI.
+    let extended = unsafe { InPtr::<Direct3D9>::opt(this) }.is_some_and(|d3d| d3d.is_extended());
+    let accepted: &[Guid] = if extended {
+        &[
+            mtld3d_types::IID_IUNKNOWN,
+            mtld3d_types::IID_IDIRECT3D9,
+            mtld3d_types::IID_IDIRECT3D9EX,
+        ]
+    } else {
+        &[mtld3d_types::IID_IUNKNOWN, mtld3d_types::IID_IDIRECT3D9]
+    };
     // SAFETY: vtable thunk; `this`, `riid` and `ppv` are the caller's per the
     // IUnknown::QueryInterface ABI.
     unsafe {
-        crate::com_ref::com_query_interface(
-            this,
-            riid,
-            ppv,
-            &[mtld3d_types::IID_IUNKNOWN, mtld3d_types::IID_IDIRECT3D9],
-            d3d9_add_ref,
-            "IDirect3D9",
-        )
+        crate::com_ref::com_query_interface(this, riid, ppv, accepted, d3d9_add_ref, "IDirect3D9")
     }
 }
 
@@ -621,11 +655,14 @@ extern "system" fn d3d9_get_adapter_identifier(
 
     id.driver[..7].copy_from_slice(b"mtld3d\0");
     id.vendor_id = 0x106B; // Apple
+    // An extended interface reports level 1 without consulting the driver, as
+    // D3D9Ex does; a plain one reports 0.
+    id.whql_level = u32::from(d3d.is_extended());
 
     // GDI-style display-device name for adapter 0. D3D9 reports the adapter's
     // GDI name here; the conformance suite (and real apps enumerating adapters)
     // require it to be non-empty.
-    let device_name = b"\\\\.\\DISPLAY1\0";
+    let device_name = PRIMARY_DISPLAY_NAME.as_bytes();
     id.device_name[..device_name.len()].copy_from_slice(device_name);
 
     let info = device_info();
@@ -870,6 +907,223 @@ extern "system" fn d3d9_get_adapter_display_mode(
         current.width, current.height, current.refresh_rate, current.format
     );
     D3D_OK
+}
+
+/// The modes an extended enumeration keeps under `filter`, `None` for a filter that keeps none.
+///
+/// Every listed mode is progressive, so a filter asking for interlaced modes
+/// keeps none, as does a format the adapter lists no mode in.
+fn filtered_modes(filter: &D3DDISPLAYMODEFILTER) -> Option<impl Iterator<Item = &D3DDISPLAYMODE>> {
+    if filter.scan_line_ordering == D3DSCANLINEORDERING_INTERLACED
+        || !is_display_format(filter.format)
+    {
+        return None;
+    }
+    let format = filter.format;
+    Some(
+        ADAPTER_MODES
+            .served
+            .iter()
+            .filter(move |m| m.format == format),
+    )
+}
+
+extern "system" fn d3d9_get_adapter_mode_count_ex(
+    _this: *mut c_void,
+    adapter: u32,
+    filter: *const D3DDISPLAYMODEFILTER,
+) -> u32 {
+    // SAFETY: vtable in-param; `filter` is null or a readable
+    // `D3DDISPLAYMODEFILTER` per the IDirect3D9Ex ABI.
+    let filter = unsafe { ValueIn::<D3DDISPLAYMODEFILTER>::read_opt(filter.cast()) };
+    let Some(modes) = filter
+        .as_ref()
+        .filter(|_| adapter == 0)
+        .and_then(filtered_modes)
+    else {
+        mtld3d_shared::log_once_warn!(
+            target: LOG_TARGET,
+            "GetAdapterModeCountEx(adapter={adapter}): no filter, another adapter, an interlaced \
+             filter or a format with no modes → 0"
+        );
+        return 0;
+    };
+    u32::try_from(modes.count()).expect("ADAPTER_MODES is a small static table")
+}
+
+extern "system" fn d3d9_enum_adapter_modes_ex(
+    _this: *mut c_void,
+    adapter: u32,
+    filter: *const D3DDISPLAYMODEFILTER,
+    mode_index: u32,
+    mode: *mut D3DDISPLAYMODEEX,
+) -> i32 {
+    // SAFETY: vtable in-param; `filter` is null or a readable
+    // `D3DDISPLAYMODEFILTER` per the IDirect3D9Ex ABI.
+    let filter = unsafe { ValueIn::<D3DDISPLAYMODEFILTER>::read_opt(filter.cast()) };
+    let entry = filter
+        .as_ref()
+        .filter(|_| adapter == 0)
+        .and_then(filtered_modes)
+        .and_then(|mut modes| modes.nth(usize::try_from(mode_index).ok()?));
+    let Some(entry) = entry.filter(|_| !mode.is_null()) else {
+        mtld3d_shared::log_once_warn!(
+            target: LOG_TARGET,
+            "reject EnumAdapterModesEx(adapter={adapter}, mode={mode_index}): no filter or out \
+             slot, another adapter, an interlaced filter, or past the list → INVALIDCALL"
+        );
+        return D3DERR_INVALIDCALL;
+    };
+    // SAFETY: vtable out-param; `mode` is non-null (checked) and points to a
+    // writable `D3DDISPLAYMODEEX` per the IDirect3D9Ex ABI.
+    unsafe { OutPtr::write_opt(mode, display_mode_ex(entry)) };
+    D3D_OK
+}
+
+extern "system" fn d3d9_get_adapter_display_mode_ex(
+    _this: *mut c_void,
+    adapter: u32,
+    mode: *mut D3DDISPLAYMODEEX,
+    rotation: *mut u32,
+) -> i32 {
+    if adapter != 0 {
+        mtld3d_shared::log_once_warn!(
+            target: LOG_TARGET,
+            "reject GetAdapterDisplayModeEx(adapter={adapter}) → INVALIDCALL"
+        );
+        return D3DERR_INVALIDCALL;
+    }
+    // SAFETY: vtable out-params; `mode` and `rotation` are null or writable
+    // per the IDirect3D9Ex ABI.
+    unsafe { write_display_mode_ex(mode.cast(), rotation, &current_adapter_display_mode()) }
+}
+
+extern "system" fn d3d9_get_adapter_luid(_this: *mut c_void, adapter: u32, luid: *mut LUID) -> i32 {
+    /// The adapter's LUID as `(LowPart, HighPart)`, read once for the process.
+    ///
+    /// A machine fact latched once and immutable after: the LUID the display
+    /// driver gives the primary display's adapter, or, where the driver hands
+    /// none back, one the system allocates for the process, which stays the
+    /// same for every later call.
+    static ADAPTER_LUID: LazyLock<(u32, i32)> = LazyLock::new(read_adapter_luid);
+    if adapter != 0 || luid.is_null() {
+        mtld3d_shared::log_once_warn!(
+            target: LOG_TARGET,
+            "reject GetAdapterLUID(adapter={adapter}): another adapter or a null out slot → \
+             INVALIDCALL"
+        );
+        return D3DERR_INVALIDCALL;
+    }
+    let (low_part, high_part) = *ADAPTER_LUID;
+    // SAFETY: vtable out-param; `luid` is non-null (checked) and points to a
+    // writable `LUID` per the IDirect3D9Ex ABI.
+    unsafe {
+        OutPtr::write_opt(
+            luid,
+            LUID {
+                low_part,
+                high_part,
+            },
+        );
+    };
+    D3D_OK
+}
+
+/// `mode` as an extended display mode: progressive, its size field filled in.
+const fn display_mode_ex(mode: &D3DDISPLAYMODE) -> D3DDISPLAYMODEEX {
+    D3DDISPLAYMODEEX {
+        size: D3DDISPLAYMODEEX_SIZE,
+        width: mode.width,
+        height: mode.height,
+        refresh_rate: mode.refresh_rate,
+        format: mode.format,
+        scan_line_ordering: D3DSCANLINEORDERING_PROGRESSIVE,
+    }
+}
+
+/// Answer a `GetDisplayModeEx`-shaped call with `current` and the identity rotation.
+///
+/// Shared by the adapter, the device and the swap chain. The caller sets the
+/// mode's `size` field; a null mode or one whose size is not this layout's is
+/// `D3DERR_INVALIDCALL`. A null rotation is allowed and left alone.
+///
+/// # Safety
+/// `mode` is null or points to a writable `D3DDISPLAYMODEEX`, and `rotation`
+/// is null or points to a writable `D3DDISPLAYROTATION`.
+pub unsafe fn write_display_mode_ex(
+    mode: *mut c_void,
+    rotation: *mut u32,
+    current: &D3DDISPLAYMODE,
+) -> i32 {
+    // SAFETY: the caller's contract: `mode` is null or a writable `D3DDISPLAYMODEEX`.
+    let Some(mut out) = (unsafe { InPtrMut::<D3DDISPLAYMODEEX>::opt(mode) }) else {
+        mtld3d_shared::log_once_warn!(
+            target: LOG_TARGET,
+            "reject GetDisplayModeEx: null mode → INVALIDCALL"
+        );
+        return D3DERR_INVALIDCALL;
+    };
+    if out.size != D3DDISPLAYMODEEX_SIZE {
+        mtld3d_shared::log_once_warn!(
+            target: LOG_TARGET,
+            "reject GetDisplayModeEx: D3DDISPLAYMODEEX.Size {} is not {D3DDISPLAYMODEEX_SIZE} → \
+             INVALIDCALL",
+            out.size
+        );
+        return D3DERR_INVALIDCALL;
+    }
+    *out = display_mode_ex(current);
+    // SAFETY: the caller's contract: `rotation` is null or a writable
+    // `D3DDISPLAYROTATION`, which `write_opt` skips when null.
+    unsafe { OutPtr::write_opt(rotation, D3DDISPLAYROTATION_IDENTITY) };
+    D3D_OK
+}
+
+/// Read the adapter LUID the driver reports, or allocate one when it reports none.
+fn read_adapter_luid() -> (u32, i32) {
+    let mut open = D3dkmtOpenAdapterFromGdiDisplayName {
+        device_name: [0; 32],
+        adapter: 0,
+        adapter_luid: LUID {
+            low_part: 0,
+            high_part: 0,
+        },
+        vid_pn_source_id: 0,
+    };
+    for (slot, unit) in open
+        .device_name
+        .iter_mut()
+        .zip(PRIMARY_DISPLAY_NAME.encode_utf16())
+    {
+        *slot = unit;
+    }
+    // SAFETY: gdi32 export; `open` is a live, initialised struct of the
+    // documented layout whose name is NUL-terminated (the array is zeroed past it).
+    let status = unsafe { D3DKMTOpenAdapterFromGdiDisplayName(&raw mut open) };
+    if status == 0 {
+        let close = D3dkmtCloseAdapter {
+            adapter: open.adapter,
+        };
+        // SAFETY: gdi32 export; `close` names the adapter handle just opened.
+        unsafe { D3DKMTCloseAdapter(&raw const close) };
+        if open.adapter_luid.low_part != 0 || open.adapter_luid.high_part != 0 {
+            return (open.adapter_luid.low_part, open.adapter_luid.high_part);
+        }
+    }
+    let mut allocated = LUID {
+        low_part: 0,
+        high_part: 0,
+    };
+    // SAFETY: advapi32 export; `allocated` is a writable `LUID`.
+    let ok = unsafe { AllocateLocallyUniqueId(&raw mut allocated) };
+    mtld3d_shared::log_once_info!(
+        target: LOG_TARGET,
+        "GetAdapterLUID: the display driver reports no LUID for {PRIMARY_DISPLAY_NAME} \
+         (status {status:#x}); the adapter is named by a LUID allocated for the process \
+         (allocated={})",
+        ok != 0
+    );
+    (allocated.low_part, allocated.high_part)
 }
 
 extern "system" fn d3d9_check_device_type(
@@ -1295,6 +1549,32 @@ unsafe extern "system" {
     fn GetClientRect(hwnd: *mut c_void, rect: *mut Rect) -> i32;
 }
 
+#[link(name = "gdi32")]
+unsafe extern "system" {
+    fn D3DKMTOpenAdapterFromGdiDisplayName(desc: *mut D3dkmtOpenAdapterFromGdiDisplayName) -> u32;
+    fn D3DKMTCloseAdapter(desc: *const D3dkmtCloseAdapter) -> u32;
+}
+
+#[link(name = "advapi32")]
+unsafe extern "system" {
+    fn AllocateLocallyUniqueId(luid: *mut LUID) -> i32;
+}
+
+/// Win32 `D3DKMT_OPENADAPTERFROMGDIDISPLAYNAME`: a GDI display name in, its adapter out.
+#[repr(C)]
+struct D3dkmtOpenAdapterFromGdiDisplayName {
+    device_name: [u16; 32],
+    adapter: u32,
+    adapter_luid: LUID,
+    vid_pn_source_id: u32,
+}
+
+/// Win32 `D3DKMT_CLOSEADAPTER`: the adapter handle an open handed out.
+#[repr(C)]
+struct D3dkmtCloseAdapter {
+    adapter: u32,
+}
+
 /// Client-area pixel dimensions of `hwnd`, or `None` when the call fails or the rect is empty.
 ///
 /// The single `GetClientRect` boundary is concentrated here so the call site
@@ -1458,6 +1738,89 @@ extern "system" fn d3d9_create_device(
     present_params: *mut c_void,
     device: *mut *mut c_void,
 ) -> i32 {
+    create_device_impl(&CreateDeviceArgs {
+        this,
+        adapter,
+        dev_type,
+        focus_window,
+        behavior_flags,
+        present_params,
+        device,
+    })
+}
+
+/// `IDirect3D9Ex::CreateDeviceEx`: `CreateDevice` with a fullscreen display mode.
+///
+/// The mode is not used: a fullscreen device sets the mode its back buffer
+/// names, so the two only disagree for a malformed request, which is logged
+/// once and created from the present parameters as `CreateDevice` would.
+extern "system" fn d3d9_create_device_ex(
+    this: *mut c_void,
+    adapter: u32,
+    dev_type: u32,
+    focus_window: *mut c_void,
+    behavior_flags: u32,
+    present_params: *mut c_void,
+    mode: *mut D3DDISPLAYMODEEX,
+    device: *mut *mut c_void,
+) -> i32 {
+    null_out(device);
+    // SAFETY: vtable in-param; `present_params` is null or a readable
+    // `D3DPRESENT_PARAMETERS` per the IDirect3D9Ex ABI.
+    let windowed_and_size =
+        unsafe { InPtr::<D3DPRESENT_PARAMETERS>::opt(present_params) }.map(|pp| {
+            (
+                pp.windowed != 0,
+                (pp.back_buffer_width, pp.back_buffer_height),
+            )
+        });
+    // SAFETY: vtable in-param; `mode` is null or a readable `D3DDISPLAYMODEEX`
+    // per the IDirect3D9Ex ABI.
+    let mode_size = unsafe { InPtr::<D3DDISPLAYMODEEX>::opt(mode.cast()) }
+        .map(|mode| (mode.width, mode.height));
+    if let Some((windowed, size)) = windowed_and_size
+        && !mtld3d_core::extended::reset_ex_mode_valid(windowed, mode_size, size)
+    {
+        mtld3d_shared::log_once_info!(
+            target: LOG_TARGET,
+            "CreateDeviceEx: display mode {mode_size:?} disagrees with the present parameters \
+             (windowed={windowed}, back buffer {size:?}); the device follows the present \
+             parameters"
+        );
+    }
+    create_device_impl(&CreateDeviceArgs {
+        this,
+        adapter,
+        dev_type,
+        focus_window,
+        behavior_flags,
+        present_params,
+        device,
+    })
+}
+
+/// The arguments `CreateDevice` and `CreateDeviceEx` share.
+struct CreateDeviceArgs {
+    this: *mut c_void,
+    adapter: u32,
+    dev_type: u32,
+    focus_window: *mut c_void,
+    behavior_flags: u32,
+    present_params: *mut c_void,
+    device: *mut *mut c_void,
+}
+
+/// The body both device creates share; the device is extended when the interface is.
+fn create_device_impl(args: &CreateDeviceArgs) -> i32 {
+    let &CreateDeviceArgs {
+        this,
+        adapter,
+        dev_type,
+        focus_window,
+        behavior_flags,
+        present_params,
+        device,
+    } = args;
     if !crate::USED.swap(true, Ordering::Relaxed) {
         crate::pin_image();
     }
@@ -1482,9 +1845,10 @@ extern "system" fn d3d9_create_device(
     // flows uniformly to the layer, backbuffer, and depth/stencil creates.
     let mut pp = *pp_in;
 
+    let extended = d3d.is_extended();
     // Reject invalid swap-effect / back-buffer-count / presentation-interval
     // combinations up front, before any Metal resource is created.
-    if !crate::device::present_params_are_valid(&pp) {
+    if !mtld3d_core::present::present_params_are_valid(&pp, extended) {
         warn!(
             target: LOG_TARGET,
             "reject CreateDevice — invalid present params (swap_effect={}, bb_count={}, interval={:#x})",
@@ -1782,6 +2146,11 @@ extern "system" fn d3d9_create_device(
         display_sinks,
         fullscreen,
         config: Arc::clone(cfg),
+        initial_flags: if extended {
+            crate::device::DeviceFlags::EXTENDED
+        } else {
+            crate::device::DeviceFlags::empty()
+        },
     });
 
     // Install the cursor wndproc subclass. Must happen after `DeviceInner` is
@@ -1815,7 +2184,7 @@ extern "system" fn d3d9_create_device(
             "CreateDevice: D3DCREATE_MULTITHREADED, device entry points serialised"
         );
     }
-    info!(target: LOG_TARGET, "CreateDevice succeeded");
+    info!(target: LOG_TARGET, "CreateDevice succeeded (extended={extended})");
     D3D_OK
 }
 
@@ -2008,9 +2377,12 @@ fn resolve_render_scale(
 /// device leaves the game's window stripped of its decoration and pinned over
 /// the monitor.
 fn restore_from_fullscreen(saved: Option<&crate::fullscreen::SavedWindow>) {
+    // A create that fails puts the window back where it was, whatever kind of
+    // device it was creating: nothing it did should outlive it.
     if let Some(saved) = saved {
         crate::fullscreen::leave(
             saved,
+            crate::fullscreen::LeaveKind::Plain,
             &mtld3d_core::fullscreen_log::LeaveReason::FailedCreate,
         );
     }

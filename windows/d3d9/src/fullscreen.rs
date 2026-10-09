@@ -513,6 +513,7 @@ const SWP_NOMOVE: u32 = 0x0002;
 const SWP_NOZORDER: u32 = 0x0004;
 const SWP_NOACTIVATE: u32 = 0x0010;
 const SWP_SHOWWINDOW: u32 = 0x0040;
+const SWP_HIDEWINDOW: u32 = 0x0080;
 const SWP_FRAMECHANGED: u32 = 0x0020;
 
 const MONITOR_DEFAULTTOPRIMARY: u32 = 0x0000_0001;
@@ -986,13 +987,25 @@ fn apply_fullscreen_window(hwnd: *mut c_void, saved: &SavedWindow) -> WindowPlac
     WindowPlacement::Placed(rect.label())
 }
 
+/// How leaving fullscreen puts the window back, which the kind of device decides.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum LeaveKind {
+    /// A plain device: the pre-fullscreen rect, with the visibility the window has now.
+    Plain,
+    /// An extended device: the window stays where fullscreen put it and gets its saved visibility.
+    ///
+    /// `D3D9Ex` restores the window's style when it leaves fullscreen,
+    /// visibility included, and leaves its position and size alone.
+    Extended,
+}
+
 /// Leave fullscreen provisionally, restoring its current state if `accept` rejects it.
 ///
 /// Client-area validation must see the restored window. Keep the original
 /// session intact for a retry, and roll back to the actual display mode and
 /// window state, which the application may have changed while fullscreen.
 /// A failed snapshot rejects the transition before anything moves.
-pub fn try_leave(saved: &SavedWindow, accept: impl FnOnce() -> bool) -> bool {
+pub fn try_leave(saved: &SavedWindow, kind: LeaveKind, accept: impl FnOnce() -> bool) -> bool {
     let mut mode = empty_devmode();
     if !enum_display_settings(ENUM_CURRENT_SETTINGS, &mut mode) {
         warn!(target: LOG_TARGET, "cannot snapshot the display mode for a windowed Reset");
@@ -1012,7 +1025,7 @@ pub fn try_leave(saved: &SavedWindow, accept: impl FnOnce() -> bool) -> bool {
     // Covers the display-change broadcasts as well as both window moves:
     // the provisional geometry must never trigger a device auto-resize.
     let _driving = DrivingGuard::new(saved.hwnd);
-    leave(saved, &LeaveReason::ProvisionalWindowedReset);
+    leave(saved, kind, &LeaveReason::ProvisionalWindowedReset);
     if accept() {
         return true;
     }
@@ -1054,16 +1067,16 @@ pub fn try_leave(saved: &SavedWindow, accept: impl FnOnce() -> bool) -> bool {
     false
 }
 
-/// Restore the display mode and the window state captured by [`enter`].
+/// Restore the display mode and the window state captured by [`enter`], as `kind` says.
 ///
 /// One line names `reason`, the registry restore and where the window went.
-pub fn leave(saved: &SavedWindow, reason: &LeaveReason) {
+pub fn leave(saved: &SavedWindow, kind: LeaveKind, reason: &LeaveReason) {
     // Leaving fullscreen (windowed `Reset` or device destruction) puts the
     // registry display mode back first, matching native D3D9's order (mode
     // restore, then window restore), so the saved rect lands in the space it
     // was captured in. No-op when the mode is already the desktop's.
     let restore = restore_registry_mode();
-    let placement = restore_window(saved);
+    let placement = restore_window(saved, kind);
     log!(
         target: LOG_TARGET,
         if restore.failed() { Level::Warn } else { Level::Info },
@@ -1072,8 +1085,8 @@ pub fn leave(saved: &SavedWindow, reason: &LeaveReason) {
     );
 }
 
-/// Put the window back as [`enter`] found it, saying where it went.
-fn restore_window(saved: &SavedWindow) -> WindowPlacement {
+/// Put the window back as [`enter`] found it and `kind` says, saying where it went.
+fn restore_window(saved: &SavedWindow, kind: LeaveKind) -> WindowPlacement {
     if window_changes_suppressed(saved) {
         return WindowPlacement::AppOwned;
     }
@@ -1103,15 +1116,24 @@ fn restore_window(saved: &SavedWindow) -> WindowPlacement {
         set_window_long(hwnd, GWL_EXSTYLE, saved.exstyle);
     }
 
-    let show = if style & WS_VISIBLE == 0 {
-        0
-    } else {
-        SWP_SHOWWINDOW
+    // An extended device gives the window back the visibility it had before
+    // fullscreen showed it; a plain device keeps the visibility the window
+    // has now.
+    let visible = match kind {
+        LeaveKind::Extended => saved.style,
+        LeaveKind::Plain => style,
+    } & WS_VISIBLE
+        != 0;
+    let show = match (kind, visible) {
+        (_, true) => SWP_SHOWWINDOW,
+        (LeaveKind::Extended, false) => SWP_HIDEWINDOW,
+        (LeaveKind::Plain, false) => 0,
     };
-    // A window whose rect we never managed to read stays where it is rather
-    // than being teleported to a zero rect at the desktop origin.
+    // An extended device leaves the window where fullscreen put it. A window
+    // whose rect we never managed to read stays where it is too, rather than
+    // being teleported to a zero rect at the desktop origin.
     let unknown_rect = saved.rect.width() == 0 || saved.rect.height() == 0;
-    let geometry = if unknown_rect {
+    let geometry = if kind == LeaveKind::Extended || unknown_rect {
         SWP_NOMOVE | SWP_NOSIZE
     } else {
         0
@@ -1122,9 +1144,9 @@ fn restore_window(saved: &SavedWindow) -> WindowPlacement {
         saved.rect,
         SWP_FRAMECHANGED | SWP_NOACTIVATE | SWP_NOZORDER | show | geometry,
     );
-    if unknown_rect {
-        WindowPlacement::Unmoved
-    } else {
-        WindowPlacement::Placed(saved.rect.label())
+    match kind {
+        LeaveKind::Extended => WindowPlacement::KeptFullscreen { shown: visible },
+        LeaveKind::Plain if unknown_rect => WindowPlacement::Unmoved,
+        LeaveKind::Plain => WindowPlacement::Placed(saved.rect.label()),
     }
 }

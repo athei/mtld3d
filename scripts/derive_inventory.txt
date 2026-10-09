@@ -199,6 +199,8 @@ windows/core/src/present.rs DisplaySync Clone,Copy,Debug,PartialEq,Eq
 windows/core/src/present.rs LayerPacing Clone,Copy,Debug,PartialEq,Eq
 windows/core/src/readback.rs ReadbackReject Clone,Copy,Debug,PartialEq,Eq
 windows/core/src/render_scale.rs RenderScale Debug,Clone,Copy,PartialEq,Eq
+windows/core/src/reset_summary.rs ResetDone Clone,Copy,PartialEq,Eq
+windows/core/src/reset_summary.rs ResetMethod Clone,Copy
 windows/core/src/sampler_state.rs SamplerFlags Clone,Copy,Debug,Default,PartialEq,Eq
 windows/core/src/sampler_state.rs SamplerKey Clone,Copy,PartialEq,Eq,Hash,Debug
 windows/core/src/shader_cache.rs CacheEntry Clone,Debug,PartialEq,Eq
@@ -222,9 +224,11 @@ windows/core/src/visibility.rs QueryStatus Clone,Copy,Debug,PartialEq,Eq
 windows/d3d9/src/cursor.rs CursorFlags Clone,Copy,Debug,Default,PartialEq,Eq
 windows/d3d9/src/device.rs DepthTextureCreateInfo Clone,Copy
 windows/d3d9/src/device.rs DeviceFlags Clone,Copy,Debug,Default,PartialEq,Eq
+windows/d3d9/src/device.rs ResetCall Clone,Copy
 windows/d3d9/src/device.rs SnapshotDirty Clone,Copy,Debug,PartialEq,Eq
 windows/d3d9/src/device.rs TextureCreateArgs Clone,Copy
 windows/d3d9/src/fullscreen.rs DisplayModeInfo Clone,Copy
+windows/d3d9/src/fullscreen.rs LeaveKind Clone,Copy,PartialEq,Eq
 windows/d3d9/src/fullscreen.rs Rect Clone,Copy
 windows/d3d9/src/pixel_shader.rs PsUsage Clone,Copy,Debug,Default,PartialEq,Eq
 windows/d3d9/src/stage_bindings.rs TextureSwapDelta Clone,Copy,Debug,Default,PartialEq,Eq
@@ -233,6 +237,7 @@ windows/d3d9/src/surface.rs ImplicitKind Clone,Copy,PartialEq,Eq
 windows/d3d9/src/surface.rs SurfaceFlags Clone,Copy,Debug,Default,PartialEq,Eq
 windows/d3d9/src/surface.rs SurfaceMultiSample Clone,Copy,PartialEq,Eq
 windows/d3d9/src/vertex_shader.rs VsConstUsage Clone,Copy,Debug,Default,PartialEq,Eq
+windows/tests/src/harness.rs Factory Clone,Copy,PartialEq,Eq
 windows/tests/src/harness.rs HarnessState Clone,Copy
 windows/tests/src/pixel.rs Rgba8 Clone,Copy,PartialEq,Eq,Debug
 windows/tests/src/vertex.rs LitVertex Clone,Copy
@@ -280,6 +285,7 @@ windows/types/src/device.rs D3DPRESENT_PARAMETERS Clone,Copy
 windows/types/src/device.rs D3DRECT Clone,Copy,Default
 windows/types/src/device.rs D3DVIEWPORT9 Clone,Copy
 windows/types/src/device.rs StateBlockType Clone,Copy,PartialEq,Eq,Debug
+windows/types/src/direct3d9.rs D3DDISPLAYMODEFILTER Clone,Copy
 windows/types/src/direct3d9.rs Guid Clone,Copy,PartialEq,Eq,Hash
 windows/types/src/ff.rs D3DCOLORVALUE Clone,Copy,Default
 windows/types/src/ff.rs D3DLIGHT9 Clone,Copy

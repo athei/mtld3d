@@ -1793,6 +1793,130 @@ pub unsafe fn finalize_implicit_surface(ptr: u64) {
     unsafe { finalize_surface(surf) };
 }
 
+/// Add usage bits an extended create carries to what the surface at `ptr` reports.
+///
+/// A standalone surface keeps its own usage; an offscreen plain backed by a
+/// texture of its own reports that texture's.
+///
+/// # Safety
+/// `ptr` is a live surface wrapper a create just handed out.
+pub unsafe fn add_reported_usage(ptr: *mut c_void, usage: u32) {
+    // SAFETY: the caller's contract: a live surface wrapper.
+    let inner_ptr = unsafe { (*ptr.cast::<Direct3DSurface9>()).inner };
+    // SAFETY: a live wrapper's `inner` is its live `SurfaceInner`, borrowed
+    // exclusively under the device's API lock for the create.
+    let inner = unsafe { &mut *inner_ptr };
+    if inner.parent_texture.is_null() {
+        inner.standalone_usage |= usage;
+    } else if inner.flags.contains(SurfaceFlags::OWNS_PARENT_TEXTURE) {
+        // SAFETY: an owned parent texture is live for as long as the surface.
+        unsafe { (*inner.parent_texture).inner_mut() }.add_reported_usage(usage);
+    } else {
+        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+            "add_reported_usage: a texture level reports its texture's usage; {usage:#x} not added");
+    }
+}
+
+/// What a held implicit surface is before a `Reset` changes the swap chain under it.
+///
+/// Its extent, format, scale and multisample configuration resolve from the
+/// device, which a `Reset` updates before it recreates the textures, so they
+/// are read while they still describe the surface the application holds.
+pub struct HeldSurface {
+    ptr: u64,
+    width: u32,
+    height: u32,
+    format: u32,
+    render_scale: RenderScale,
+    multi_sample: SurfaceMultiSample,
+}
+
+/// Capture the cached implicit surface at `ptr` if the application holds it.
+///
+/// `None` for no surface, one only the device references, and a surface
+/// that is not implicit.
+///
+/// # Safety
+/// `ptr` is `0` or the device's live cached implicit surface.
+pub unsafe fn hold_implicit_surface(ptr: u64) -> Option<HeldSurface> {
+    // SAFETY: the caller's contract: `0` or a live surface wrapper.
+    let surf = unsafe { (ptr as *const Direct3DSurface9).as_ref() }?;
+    let inner = surf.inner();
+    if surf.refcount == 0 || inner.implicit_kind == ImplicitKind::None {
+        return None;
+    }
+    if inner.device_inner.is_null() {
+        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+            "hold_implicit_surface: an implicit surface without a device is not detached");
+        return None;
+    }
+    Some(HeldSurface {
+        ptr,
+        width: inner.live_width(),
+        height: inner.live_height(),
+        format: inner.live_format(),
+        render_scale: inner.live_render_scale(),
+        multi_sample: inner.live_multi_sample(),
+    })
+}
+
+/// Turn a held implicit surface into a standalone one that keeps the textures it names.
+///
+/// An extended device's `Reset` makes a new back buffer and auto
+/// depth-stencil while the application may still hold the surfaces of the old
+/// ones. `D3D9Ex` leaves such a reference naming the old surface, at the old
+/// size and no longer part of the swap chain. The surface takes over the
+/// textures it has resolved from the device until now, which the device then
+/// forgets, and becomes a standalone default-pool target described by
+/// `held`, captured before the `Reset` changed anything: its container is the
+/// device, and its final release retires the textures as any standalone
+/// target's does. The device's reference the implicit surface took on its
+/// first public reference is the one a standalone surface gives back on its
+/// last, so the counts stay balanced.
+///
+/// # Safety
+/// `held` was captured from the device's live cached implicit surface, still
+/// held by the application, and the device forgets it as its cached surface
+/// and drops its own handles to the textures right after.
+pub unsafe fn detach_implicit_surface(held: &HeldSurface) {
+    let surf = held.ptr as *mut Direct3DSurface9;
+    // SAFETY: the caller's contract: a live cached implicit surface wrapper.
+    let inner_ptr = unsafe { (*surf).inner };
+    // SAFETY: `inner_ptr` is its live `SurfaceInner`; access is exclusive
+    // under the device's `Reset`.
+    let inner = unsafe { &mut *inner_ptr };
+    let kind = inner.implicit_kind;
+    // SAFETY: `hold_implicit_surface` checked the device pointer, and the
+    // device is live during its `Reset`.
+    let device = unsafe { &*inner.device_inner };
+    let standalone_kind = if kind == ImplicitKind::Backbuffer {
+        inner.metal_color_handle = device.backbuffer_handle();
+        inner.metal_color_srgb_handle = device.backbuffer_srgb_handle();
+        inner.metal_msaa_handle = device.backbuffer_msaa_handle();
+        inner.metal_msaa_srgb_handle = device.backbuffer_msaa_srgb_handle();
+        mtld3d_core::format::StandaloneSurfaceKind::ColorTarget
+    } else {
+        inner.metal_depth_handle = device.depth_stencil_handle();
+        mtld3d_core::format::StandaloneSurfaceKind::DepthStencil
+    };
+    inner.standalone_width = held.width;
+    inner.standalone_height = held.height;
+    inner.standalone_format = held.format;
+    inner.standalone_render_scale = held.render_scale;
+    inner.standalone_pool = D3DPOOL_DEFAULT;
+    inner.multi_sample = held.multi_sample;
+    device.register_standalone_surface(
+        held.width,
+        held.height,
+        held.format,
+        u32::from(held.multi_sample.sample_count),
+        standalone_kind,
+        held.render_scale,
+    );
+    inner.container = device.device_wrapper() as u64;
+    inner.implicit_kind = ImplicitKind::None;
+}
+
 /// Finalize a container-cached sub-resource surface at its container's teardown.
 ///
 /// Mirrors [`finalize_implicit_surface`]: clear the ownership marker first so

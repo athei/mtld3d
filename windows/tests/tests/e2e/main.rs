@@ -29,6 +29,8 @@ mod bench_wow112;
 mod buffers;
 mod clip_planes;
 mod d3d9ex;
+mod d3d9ex_reset;
+mod d3d9ex_resources;
 mod d3dperf;
 mod device;
 mod draw;

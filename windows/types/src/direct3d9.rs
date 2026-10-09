@@ -29,6 +29,30 @@ pub const D3DSWAPEFFECT_FLIP: u32 = 2;
 /// `D3DSWAPEFFECT_COPY`, a `D3DPRESENT_PARAMETERS::SwapEffect` value.
 pub const D3DSWAPEFFECT_COPY: u32 = 3;
 
+/// `D3DSWAPEFFECT_OVERLAY`, a swap effect only an extended device accepts.
+pub const D3DSWAPEFFECT_OVERLAY: u32 = 4;
+
+/// `D3DSWAPEFFECT_FLIPEX`, the highest swap effect an extended device accepts.
+pub const D3DSWAPEFFECT_FLIPEX: u32 = 5;
+
+/// `D3DPRESENT_BACK_BUFFERS_MAX`, the back-buffer limit of a plain device.
+pub const D3DPRESENT_BACK_BUFFERS_MAX: u32 = 3;
+
+/// `D3DPRESENT_BACK_BUFFERS_MAX_EX`, the back-buffer limit of an extended device.
+pub const D3DPRESENT_BACK_BUFFERS_MAX_EX: u32 = 30;
+
+/// `D3DSCANLINEORDERING_UNKNOWN`, a `D3DDISPLAYMODEFILTER` that asks for any ordering.
+pub const D3DSCANLINEORDERING_UNKNOWN: u32 = 0;
+
+/// `D3DSCANLINEORDERING_PROGRESSIVE`, the ordering of every mode the adapter lists.
+pub const D3DSCANLINEORDERING_PROGRESSIVE: u32 = 1;
+
+/// `D3DSCANLINEORDERING_INTERLACED`, an ordering no listed mode has.
+pub const D3DSCANLINEORDERING_INTERLACED: u32 = 2;
+
+/// `D3DDISPLAYROTATION_IDENTITY`, the rotation `GetDisplayModeEx` reports.
+pub const D3DDISPLAYROTATION_IDENTITY: u32 = 1;
+
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Guid {
@@ -52,6 +76,30 @@ pub const IID_IDIRECT3D9: Guid = Guid {
     data2: 0x64D4,
     data3: 0x426D,
     data4: [0xAE, 0x8D, 0xAD, 0x01, 0x47, 0xF4, 0x27, 0x5C],
+};
+
+/// `IID_IDirect3D9Ex`: `{02177241-69FC-400C-8FF1-93A44DF6861D}`.
+pub const IID_IDIRECT3D9EX: Guid = Guid {
+    data1: 0x0217_7241,
+    data2: 0x69FC,
+    data3: 0x400C,
+    data4: [0x8F, 0xF1, 0x93, 0xA4, 0x4D, 0xF6, 0x86, 0x1D],
+};
+
+/// `IID_IDirect3DDevice9Ex`: `{B18B10CE-2649-405A-870F-95F777D4313A}`.
+pub const IID_IDIRECT3DDEVICE9EX: Guid = Guid {
+    data1: 0xB18B_10CE,
+    data2: 0x2649,
+    data3: 0x405A,
+    data4: [0x87, 0x0F, 0x95, 0xF7, 0x77, 0xD4, 0x31, 0x3A],
+};
+
+/// `IID_IDirect3DSwapChain9Ex`: `{91886CAF-1C3D-4D2E-A0AB-3E4C7D8D3303}`.
+pub const IID_IDIRECT3DSWAPCHAIN9EX: Guid = Guid {
+    data1: 0x9188_6CAF,
+    data2: 0x1C3D,
+    data3: 0x4D2E,
+    data4: [0xA0, 0xAB, 0x3E, 0x4C, 0x7D, 0x8D, 0x33, 0x03],
 };
 
 /// `IID_IDirect3DDevice9` — `{D0223B96-BF7A-43FD-92BD-A43B0D82B9EB}`.
@@ -226,6 +274,86 @@ pub struct IDirect3D9Vtbl {
         *mut *mut c_void,
     ) -> i32,
 }
+
+// ── IDirect3D9Ex vtable ──
+
+/// The `IDirect3D9Ex` vtable: the `IDirect3D9` slots, then the five extended ones.
+///
+/// The base table is embedded rather than repeated, so a pointer to an
+/// `IDirect3D9ExVtbl` is a valid pointer to its `IDirect3D9Vtbl` and the
+/// base slots have one definition.
+#[repr(C)]
+pub struct IDirect3D9ExVtbl {
+    pub base: IDirect3D9Vtbl,
+    pub get_adapter_mode_count_ex:
+        unsafe extern "system" fn(*mut c_void, u32, *const D3DDISPLAYMODEFILTER) -> u32,
+    pub enum_adapter_modes_ex: unsafe extern "system" fn(
+        *mut c_void,
+        u32,
+        *const D3DDISPLAYMODEFILTER,
+        u32,
+        *mut D3DDISPLAYMODEEX,
+    ) -> i32,
+    pub get_adapter_display_mode_ex:
+        unsafe extern "system" fn(*mut c_void, u32, *mut D3DDISPLAYMODEEX, *mut u32) -> i32,
+    pub create_device_ex: unsafe extern "system" fn(
+        *mut c_void,
+        u32,
+        u32,
+        *mut c_void,
+        u32,
+        *mut c_void,
+        *mut D3DDISPLAYMODEEX,
+        *mut *mut c_void,
+    ) -> i32,
+    pub get_adapter_luid: unsafe extern "system" fn(*mut c_void, u32, *mut LUID) -> i32,
+}
+
+const VTBL_SLOT: usize = core::mem::size_of::<usize>();
+const _: () = assert!(core::mem::size_of::<IDirect3D9Vtbl>() == 17 * VTBL_SLOT);
+const _: () =
+    assert!(core::mem::offset_of!(IDirect3D9ExVtbl, get_adapter_mode_count_ex) == 17 * VTBL_SLOT);
+const _: () = assert!(core::mem::offset_of!(IDirect3D9ExVtbl, create_device_ex) == 20 * VTBL_SLOT);
+const _: () = assert!(core::mem::size_of::<IDirect3D9ExVtbl>() == 22 * VTBL_SLOT);
+
+/// `D3DDISPLAYMODEEX`: a display mode with its scanline ordering and a size the caller fills.
+///
+/// `size` must equal `size_of::<D3DDISPLAYMODEEX>()` on the calls that read
+/// it, which is how a caller built against a later layout is refused.
+#[repr(C)]
+pub struct D3DDISPLAYMODEEX {
+    pub size: u32,
+    pub width: u32,
+    pub height: u32,
+    pub refresh_rate: u32,
+    pub format: u32,
+    pub scan_line_ordering: u32,
+}
+
+/// `size_of::<D3DDISPLAYMODEEX>()`, the `Size` every extended display-mode call requires.
+pub const D3DDISPLAYMODEEX_SIZE: u32 = 24;
+
+const _: () = assert!(core::mem::size_of::<D3DDISPLAYMODEEX>() == D3DDISPLAYMODEEX_SIZE as usize);
+
+/// `D3DDISPLAYMODEFILTER`: the format and scanline ordering a mode enumeration keeps.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct D3DDISPLAYMODEFILTER {
+    pub size: u32,
+    pub format: u32,
+    pub scan_line_ordering: u32,
+}
+
+const _: () = assert!(core::mem::size_of::<D3DDISPLAYMODEFILTER>() == 12);
+
+/// Win32 `LUID`, the locally unique identifier `GetAdapterLUID` names the adapter by.
+#[repr(C)]
+pub struct LUID {
+    pub low_part: u32,
+    pub high_part: i32,
+}
+
+const _: () = assert!(core::mem::size_of::<LUID>() == 8);
 
 #[repr(C)]
 pub struct D3DADAPTER_IDENTIFIER9 {
