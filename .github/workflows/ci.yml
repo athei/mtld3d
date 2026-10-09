@@ -181,9 +181,15 @@ jobs:
       - name: clippy-native
         if: ${{ !cancelled() }}
         run: make clippy-native
+      - name: clippy-perf
+        if: ${{ !cancelled() }}
+        run: make clippy-perf
       - name: test-unit
         if: ${{ !cancelled() }}
         run: make test-unit
+      - name: test-unit-perf
+        if: ${{ !cancelled() }}
+        run: make test-unit-perf
 
   # The end-to-end suite: the staged test binaries, run by the pinned Wine
   # against a Metal device, one leg per image and PE arch.

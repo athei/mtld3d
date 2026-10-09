@@ -456,7 +456,7 @@ TAG          ?= $(shell git describe --tags --exact-match 2>/dev/null)
 	conformance-baseline-scale-i686 conformance-baseline-scale-x86_64 \
 	conformance-baseline-intel-i686 conformance-baseline-intel-x86_64 \
 	conformance-isolate fmt fmt-check clippy clippy-pe-i686 clippy-pe-x86_64 clippy-pe-arm64x \
-	clippy-native audit test-isolation test-e2e-discovery doc doc-windows doc-unix check clean upgrade \
+	clippy-native clippy-perf test-unit-perf audit test-isolation test-e2e-discovery doc doc-windows doc-unix check clean upgrade \
 	upgrade-incompat setup setup-rust setup-nextest setup-dev setup-xwin \
 	setup-rosetta \
 	xwin-dir fetch
@@ -2087,6 +2087,29 @@ clippy-native:
 	cd windows && cargo +$(RUST_STABLE) clippy -p mtld3d-core --features mtld3d-core/disk-cache --target $(UNIX_NATIVE_TARGET) --all-targets $(DENY_WARNINGS)
 	cd unix && cargo +$(RUST_STABLE) clippy --all-targets $(DENY_WARNINGS)
 
+# The legs above and `test-unit` build without `cfg(perf_tracking)`, so the code
+# a PERF=1 build adds (the perf telemetry in mtld3d-core, mtld3d-d3d9,
+# mtld3d-shared and mtld3d-unix) and the tests gated on it would otherwise be
+# compiled by nothing until a benchmark builds them. These two run the same legs
+# again with MTLD3D_PERF=1, which the build scripts of those four crates read:
+# `clippy-perf` the native leg and the i686 PE one (mtld3d-d3d9's perf code
+# builds only for a PE target, and none of it differs by PE arch),
+# `test-unit-perf` the host unit tests. `make check` runs both.
+#
+# Each workspace builds them into its `target/perf` (a relative
+# CARGO_TARGET_DIR resolves against the recipe's `cd`), not into the default
+# target directory. A crate whose build script reads MTLD3D_PERF rebuilds, with
+# everything that depends on it, whenever the value changes, and a target
+# directory keeps one build of each crate, so sharing it would rebuild both
+# workspaces twice on every `make check` and once more on the `make test` after
+# it. `PERF=` on the nested make overrides a PERF given to this one and keeps the
+# `==> PERF=1` line out of a passing gate.
+clippy-perf:
+	MTLD3D_PERF=1 CARGO_TARGET_DIR=target/perf $(MAKE) PERF= clippy-native clippy-pe-i686
+
+test-unit-perf:
+	MTLD3D_PERF=1 CARGO_TARGET_DIR=target/perf $(MAKE) PERF= test-unit
+
 # The conventions clippy can't express: doc-comment shape, the Clone/Copy derive
 # inventory, and the handful of patterns that are banned or confined to a known
 # set of files. See docs/CONVENTIONS.md § Mechanical audit.
@@ -2120,16 +2143,19 @@ doc-unix:
 	cd unix && cargo +$(RUST_STABLE) doc --no-deps $(DENY_WARNINGS)
 
 # One command to run before every commit: formatting, the full clippy sweep, the
-# conventions audit, the Makefile regressions, and the doc build. fmt-check first
-# (fast, fails early on drift); clippy reuses the target above; audit and the
-# Makefile regressions are fast; doc stays last. Each leg is also its own target,
-# so CI runs them as parallel jobs instead of this sequence.
+# PERF=1 clippy legs and unit tests, the conventions audit, the Makefile
+# regressions, and the doc build. fmt-check first (fast, fails early on drift);
+# clippy reuses the targets above; audit and the Makefile regressions are fast;
+# doc stays last. Each leg is also its own target, so CI's check job runs each
+# as a step of its own instead of this sequence.
 check:
 	$(MAKE) fmt-check
 	$(MAKE) clippy
+	$(MAKE) clippy-perf
 	$(MAKE) audit
 	$(MAKE) test-isolation
 	$(MAKE) test-e2e-discovery
+	$(MAKE) test-unit-perf
 	$(MAKE) doc
 
 clean:
