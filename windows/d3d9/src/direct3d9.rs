@@ -2009,7 +2009,7 @@ fn resolve_render_scale(
 /// the monitor.
 fn restore_from_fullscreen(saved: Option<&crate::fullscreen::SavedWindow>) {
     if let Some(saved) = saved {
-        crate::fullscreen::leave(saved);
+        crate::fullscreen::leave(saved, &crate::fullscreen::LeaveReason::FailedCreate);
     }
 }
 

@@ -1565,7 +1565,8 @@ extern "system" fn cursor_wnd_proc(hwnd: *mut c_void, msg: u32, wp: usize, lp: i
         // lifetime of the subclass.
         let is_fullscreen = unsafe { (*dev_ptr).fullscreen_window().is_some() };
         if is_fullscreen && wp == 0 {
-            crate::fullscreen::restore_registry_mode();
+            // SAFETY: see WM_SETCURSOR branch.
+            unsafe { (*dev_ptr).deactivate_fullscreen() };
         } else if is_fullscreen {
             debug!(
                 target: LOG_TARGET,

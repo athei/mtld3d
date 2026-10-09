@@ -1,7 +1,7 @@
 use super::{
-    MAX_SERVED_SIZES, ModeRequest, STANDARD_SIZES, drop_unscalable_sizes, fills_display, gcd,
-    mode_set_attempts, monitor_ratio_fits, physical_extent, pixels, select_mode_sizes,
-    served_mode_indices, served_mode_sizes,
+    MAX_SERVED_SIZES, ModeRequest, ModeSetOutcome, RegistryRestore, STANDARD_SIZES,
+    drop_unscalable_sizes, fills_display, gcd, mode_set_attempts, monitor_ratio_fits,
+    physical_extent, pixels, select_mode_sizes, served_mode_indices, served_mode_sizes,
 };
 
 const MBP: (u32, u32) = (3456, 2234);
@@ -606,4 +606,106 @@ fn an_empty_settable_list_drops_nothing() {
     let mut settable = Vec::new();
     assert!(drop_unscalable_sizes(&mut settable, MBP, 96).is_empty());
     assert!(settable.is_empty());
+}
+
+const HD_60: ModeRequest = ModeRequest {
+    width: 1280,
+    height: 720,
+    refresh_hz: 60,
+};
+
+#[test]
+fn a_mode_request_renders_its_rate_only_when_it_names_one() {
+    assert_eq!(HD_60.to_string(), "1280x720@60Hz");
+    let any_rate = ModeRequest {
+        refresh_hz: 0,
+        ..HD_60
+    };
+    assert_eq!(any_rate.to_string(), "1280x720");
+}
+
+#[test]
+fn a_mode_set_outcome_names_what_was_set_and_what_it_replaced() {
+    let changed = ModeSetOutcome::Changed {
+        requested: HD_60,
+        set: HD_60,
+        was: (1728, 1117),
+    };
+    assert_eq!(
+        changed.to_string(),
+        "display mode 1280x720@60Hz set (was 1728x1117)"
+    );
+    let rate_dropped = ModeSetOutcome::Changed {
+        requested: HD_60,
+        set: ModeRequest {
+            refresh_hz: 0,
+            ..HD_60
+        },
+        was: (1728, 1117),
+    };
+    assert_eq!(
+        rate_dropped.to_string(),
+        "display mode 1280x720 set for a 1280x720@60Hz request (was 1728x1117)"
+    );
+    assert_eq!(
+        ModeSetOutcome::AlreadyCurrent(HD_60).to_string(),
+        "display mode 1280x720@60Hz already current"
+    );
+    assert_eq!(
+        ModeSetOutcome::Refused(HD_60).to_string(),
+        "display mode 1280x720@60Hz refused, the window covers the monitor instead"
+    );
+    assert_eq!(ModeSetOutcome::NoMode.to_string(), "no display mode set");
+}
+
+#[test]
+fn only_a_mode_that_took_stays_in_place_and_it_is_the_request() {
+    let rate_dropped = ModeSetOutcome::Changed {
+        requested: HD_60,
+        set: ModeRequest {
+            refresh_hz: 0,
+            ..HD_60
+        },
+        was: (1728, 1117),
+    };
+    assert_eq!(rate_dropped.mode_in_place(), Some(HD_60));
+    assert_eq!(
+        ModeSetOutcome::AlreadyCurrent(HD_60).mode_in_place(),
+        Some(HD_60)
+    );
+    assert_eq!(ModeSetOutcome::Refused(HD_60).mode_in_place(), None);
+    assert_eq!(ModeSetOutcome::NoMode.mode_in_place(), None);
+}
+
+#[test]
+fn a_registry_restore_names_both_modes_and_a_failure_code() {
+    let restored = RegistryRestore::Restored {
+        registry: (1728, 1117),
+        was: (1280, 720),
+    };
+    assert_eq!(
+        restored.to_string(),
+        "registry display mode 1728x1117 restored (was 1280x720)"
+    );
+    assert!(!restored.failed());
+    let current = RegistryRestore::AlreadyCurrent((1728, 1117));
+    assert_eq!(
+        current.to_string(),
+        "registry display mode 1728x1117 already current"
+    );
+    assert!(!current.failed());
+    let failed = RegistryRestore::Failed {
+        registry: (1728, 1117),
+        was: (1280, 720),
+        ret: -1,
+    };
+    assert_eq!(
+        failed.to_string(),
+        "restoring the registry display mode 1728x1117 over 1280x720 failed (ret=-1)"
+    );
+    assert!(failed.failed());
+    assert_eq!(
+        RegistryRestore::Unreadable.to_string(),
+        "display mode unreadable, left as it is"
+    );
 }

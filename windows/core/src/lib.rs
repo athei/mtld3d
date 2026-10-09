@@ -72,6 +72,7 @@ pub mod query_fence;
 pub mod readback;
 pub mod render_scale;
 pub mod render_state;
+pub mod reset_summary;
 pub mod sampler_state;
 pub mod scratch;
 #[cfg(feature = "disk-cache")]
