@@ -546,7 +546,9 @@ record. A knob, where one makes sense, is named with its default.
   `D3DERR_INVALIDCALL` as a stretch inside one surface, where D3D9 copies it.
   A chain of real buffers would cost a texture per index and a rotation at
   every `Present` that no tested game needs: they draw into the current back
-  buffer and present it. No conformance site is known to observe it. No knob.
+  buffer and present it. `visual.c/test_flip` 22053 and 22064 observe it:
+  that test creates three back buffers and reads the shared backing rather
+  than a rotating chain (see its cluster below). No knob.
 
 ## Range-fog coverage
 
@@ -1495,6 +1497,8 @@ Reporting the requested `A8R8G8B8` format lets the helper read pixels. Sites
 and the Intel/AMD `@mac2` runners. Their baseline pins have been removed. Sites
 22053 and 22064 return actual colours from the shared backing rather than a
 rotating chain, so only their by-design remainder is classified `expected`.
+That shared backing is the kept divergence "Every back-buffer index of a swap
+chain is one surface" above.
 
 ### visual.c/test_max_index16
 Sites: 24133=expected 24135=expected
