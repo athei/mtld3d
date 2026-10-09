@@ -6,7 +6,9 @@
 //! line in a process of its own; the rest read pixels through `LockRect`,
 //! `GetDC`, `GetRenderTargetData` and a sampling draw. A level a pass draws
 //! into again is read back again at the next CPU read, unless it holds a CPU
-//! write no upload has carried yet.
+//! write no upload has carried yet. A CPU write into such a texture lands
+//! between the passes before it and the passes after it, whether or not the
+//! level is bound as a target when it is written.
 
 use mtld3d_tests::{Harness, Surface, Texture};
 use mtld3d_types::{
@@ -14,7 +16,7 @@ use mtld3d_types::{
     D3DLOCK_READONLY, D3DPOOL_DEFAULT, D3DPOOL_SYSTEMMEM, D3DPT_TRIANGLELIST, D3DRECT,
     D3DRS_LIGHTING, D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_MAGFILTER, D3DSAMP_MINFILTER,
     D3DTA_TEXTURE, D3DTADDRESS_CLAMP, D3DTEXF_POINT, D3DTOP_SELECTARG1, D3DTSS_ALPHAARG1,
-    D3DTSS_ALPHAOP, D3DTSS_COLORARG1, D3DTSS_COLOROP, D3DUSAGE_RENDERTARGET,
+    D3DTSS_ALPHAOP, D3DTSS_COLORARG1, D3DTSS_COLOROP, D3DUSAGE_RENDERTARGET, D3DVIEWPORT9,
 };
 
 use super::{
@@ -25,8 +27,11 @@ use super::{
 const RED: u32 = 0xFFFF_0000;
 const GREEN: u32 = 0xFF00_FF00;
 const BLACK: u32 = 0xFF00_0000;
+const BLUE: u32 = 0xFF00_00FF;
 /// Green as GDI's `COLORREF` (`0x00BBGGRR`) reports it.
 const GREEN_COLORREF: u32 = 0x0000_FF00;
+/// Red as GDI's `COLORREF` reports it.
+const RED_COLORREF: u32 = 0x0000_00FF;
 
 /// The side of the small targets the pixel checks use.
 const SIZE: u32 = 64;
@@ -274,6 +279,161 @@ fn a_lock_after_more_draws_reads_the_new_pixels() {
             texels[(SIZE * SIZE / 2 + SIZE / 2) as usize],
             color,
             "the lock after the {color:#010x} draw reads it"
+        );
+    }
+}
+
+/// `GetDC` after more draws reads the new pixels, as a lock does.
+#[test]
+fn get_dc_after_more_draws_reads_the_new_pixels() {
+    let h = Harness::new();
+    let back = h.render_target(0);
+    let target = create_target(&h, SIZE, SIZE);
+    let level = target.surface_level(0);
+    for (color, colorref) in [(GREEN, GREEN_COLORREF), (RED, RED_COLORREF)] {
+        draw_into(&h, &level, &back, color);
+        let dc = level.dc();
+        assert_eq!(
+            dc.get_pixel(32, 32),
+            colorref,
+            "the DC after the {color:#010x} draw reads it"
+        );
+        assert_eq!(dc.release(), D3D_OK, "ReleaseDC");
+    }
+}
+
+/// A cube render-target face's `GetDC` after a draw reads the drawn pixels.
+#[test]
+fn get_dc_on_a_drawn_render_target_cube_face_reads_the_drawn_pixels() {
+    const FACE: u32 = 2;
+    let h = Harness::new();
+    let back = h.render_target(0);
+    let cube = h.create_cube_texture_owned(
+        SIZE,
+        1,
+        D3DUSAGE_RENDERTARGET,
+        D3DFMT_A8R8G8B8,
+        D3DPOOL_DEFAULT,
+    );
+    let face = cube.surface(FACE, 0);
+    for (color, colorref) in [(GREEN, GREEN_COLORREF), (RED, RED_COLORREF)] {
+        draw_into(&h, &face, &back, color);
+        let dc = face.dc();
+        assert_eq!(
+            dc.get_pixel(32, 32),
+            colorref,
+            "the face's DC after the {color:#010x} draw reads it"
+        );
+        assert_eq!(dc.release(), D3D_OK, "ReleaseDC");
+    }
+}
+
+/// An `UpdateSurface` into a target and the draw that follows it land in that order.
+///
+/// The update covers the whole level and a draw then covers its bottom-right
+/// quarter. Read back before and after a bind samples the target, the
+/// quarter holds the draw and the rest the update: the bind uploads nothing
+/// the update did not already place under the draw.
+#[test]
+fn an_update_surface_then_a_draw_into_the_target_keep_their_order() {
+    let h = Harness::new();
+    let back = h.render_target(0);
+    let target = create_target(&h, SIZE, SIZE);
+    let level = target.surface_level(0);
+    draw_into(&h, &level, &back, RED);
+    let source = h.create_offscreen_plain_surface(SIZE, SIZE, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM);
+    source
+        .lock_rect(0)
+        .write_u32(&[GREEN; (SIZE * SIZE) as usize]);
+    let whole = D3DRECT {
+        x1: 0,
+        y1: 0,
+        x2: SIZE.cast_signed(),
+        y2: SIZE.cast_signed(),
+    };
+    assert_eq!(
+        h.update_surface_region_hr(&source, &whole, &level, (0, 0)),
+        D3D_OK,
+        "UpdateSurface of the whole level"
+    );
+    draw_quarter(&h, &level, &back, BLUE);
+    assert_update_under_draw(&h, &target, &level, GREEN, BLUE);
+}
+
+/// A write into a level bound as the render target lands under the draws after it.
+///
+/// The level stays bound across a draw, a whole-level `LockRect` write and a
+/// draw over its bottom-right quarter.
+#[test]
+fn a_lock_write_into_a_bound_target_lands_under_the_draws_after_it() {
+    let h = Harness::new();
+    let back = h.render_target(0);
+    let target = create_target(&h, SIZE, SIZE);
+    let level = target.surface_level(0);
+    assert_eq!(h.set_render_target(0, &level), D3D_OK, "bind the target");
+    draw_fill(&h, RED);
+    {
+        let mut locked = target.lock_rect(0, 0);
+        let pitch = locked.pitch().cast_unsigned() / 4;
+        locked.write_u32(&vec![GREEN; (pitch * SIZE) as usize]);
+    }
+    draw_quarter(&h, &level, &back, BLUE);
+    assert_update_under_draw(&h, &target, &level, GREEN, BLUE);
+}
+
+/// Draw `color` over the bottom-right quarter of `target`, then restore `back`.
+fn draw_quarter(h: &Harness, target: &Surface<'_>, back: &Surface<'_>, color: u32) {
+    assert_eq!(h.set_render_target(0, target), D3D_OK, "bind the target");
+    let half = SIZE / 2;
+    assert_eq!(
+        h.set_viewport(&D3DVIEWPORT9 {
+            x: half,
+            y: half,
+            width: half,
+            height: half,
+            min_z: 0.0,
+            max_z: 1.0,
+        }),
+        D3D_OK,
+        "the bottom-right quarter's viewport"
+    );
+    draw_fill(h, color);
+    assert_eq!(
+        h.set_render_target(0, back),
+        D3D_OK,
+        "restore the back buffer"
+    );
+}
+
+/// Read `level` back before and after a bind samples it.
+///
+/// The bottom-right quarter holds `drawn` and the rest `written`. The frame
+/// the draw went into is presented first.
+fn assert_update_under_draw(
+    h: &Harness,
+    target: &Texture<'_>,
+    level: &Surface<'_>,
+    written: u32,
+    drawn: u32,
+) {
+    // The draw's frame goes out first, so a write still owed an upload could
+    // only land in a later frame, after the draw.
+    assert_eq!(h.present(), D3D_OK, "submit the draw's frame");
+    for when in ["before", "after"] {
+        if when == "after" {
+            sample_to_back_buffer(h, target);
+        }
+        let pixels = read_back(h, level, (SIZE, SIZE), D3DFMT_A8R8G8B8);
+        let at = |x: u32, y: u32| pixels[(y * SIZE + x) as usize];
+        assert_eq!(
+            at(8, 8),
+            written,
+            "{when} the sampling bind: the write outside the draw"
+        );
+        assert_eq!(
+            at(56, 56),
+            drawn,
+            "{when} the sampling bind: the draw over the write"
         );
     }
 }

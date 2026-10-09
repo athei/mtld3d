@@ -287,7 +287,12 @@ into fresh pages, which the level then keeps (`staging_lazy_class` in
 `windows/core/src/texture_staging.rs`). The passes that draw into a render
 target write only its Metal texture, so every later CPU read of a level (a
 `LockRect`, a `GetDC`) reads it back again, unless the level holds a CPU write
-no upload has carried yet, whose staging is the newer copy.
+no upload has carried yet, whose staging is the newer copy. A CPU write into a
+render-target texture (an `UnlockRect`, a `ReleaseDC`, an `UpdateSurface` or
+`UpdateTexture`) does not wait for the level's next sampling bind, which would
+put it at the head of a later frame and over every pass drawn into the target
+since: it uploads at once in application order (`publish_render_target_write`),
+and `SetRenderTarget` publishes any write a texture level it binds still owes.
 
 The encoder keeps one cached `bytesNoCopy` wrapper per staging level, so the
 uploads of a level reuse one `MTLBuffer`. The wrapper's keepalive is the native

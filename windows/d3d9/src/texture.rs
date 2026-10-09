@@ -4716,6 +4716,7 @@ extern "system" fn texture_unlock_rect(this: *mut c_void, level: u32) -> i32 {
         // (textures hold a refcount on the device via their COM ABI).
         let dev = unsafe { &mut *(device_inner_ptr as *mut DeviceInner) };
         dev.mark_snapshot_dirty_all();
+        publish_render_target_write(ti, dev);
     }
     0 // S_OK
 }
@@ -5324,10 +5325,27 @@ pub fn flush_dirty_mips(ti: &mut TextureInner, dev: &mut DeviceInner) {
     flush_dirty_mips_slow::<false>(ti, dev);
 }
 
-/// Publish a CPU `StretchRect` conversion after earlier ordered texture writes.
+/// Publish a CPU write of a texture in application order, after the passes before it.
+///
+/// A CPU `StretchRect` conversion and a write into a render-target texture
+/// take this path; every other write waits for the level's next bind.
 pub fn flush_converted_mips(ti: &mut TextureInner, dev: &mut DeviceInner) {
     if ti.dirty_mask != 0 {
         flush_dirty_mips_slow::<true>(ti, dev);
+    }
+}
+
+/// Upload a CPU write into a render-target texture now, in the order of the passes around it.
+///
+/// Passes draw into a render target without looking at the uploads it owes,
+/// so an upload left for the level's next sampling bind would land at the head
+/// of that later frame, over every pass drawn into the target since the write.
+/// Published in application order now, the write sits after the passes before
+/// it and under the passes after it, as D3D9 orders them. Any other texture
+/// keeps the upload for its next bind.
+pub fn publish_render_target_write(ti: &mut TextureInner, dev: &mut DeviceInner) {
+    if ti.d3d_usage & mtld3d_types::D3DUSAGE_RENDERTARGET != 0 {
+        flush_converted_mips(ti, dev);
     }
 }
 
