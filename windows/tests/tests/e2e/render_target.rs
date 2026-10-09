@@ -768,7 +768,7 @@ fn stretch_rect_accepts_one_to_one_same_format() {
 }
 
 /// Read a colour surface back as `0xAARRGGBB` words through `GetRenderTargetData`.
-fn read_back(h: &Harness, surface: &Surface<'_>, size: (u32, u32), format: u32) -> Vec<u32> {
+pub fn read_back(h: &Harness, surface: &Surface<'_>, size: (u32, u32), format: u32) -> Vec<u32> {
     let sysmem = h.create_offscreen_plain_surface(size.0, size.1, format, D3DPOOL_SYSTEMMEM);
     assert_eq!(
         h.get_render_target_data_hr(surface, &sysmem),
@@ -2159,7 +2159,7 @@ fn color_fill_of_a_render_target_texture_level_outlasts_a_pending_cpu_write() {
 }
 
 /// A quad over the whole backbuffer with UVs spanning the unit square.
-const fn textured_fullscreen_quad() -> [TexturedVertex; 6] {
+pub const fn textured_fullscreen_quad() -> [TexturedVertex; 6] {
     [
         TexturedVertex {
             x: -1.0,
@@ -4356,7 +4356,7 @@ fn surface_colors(h: &Harness, surface: &mtld3d_tests::Surface<'_>) -> Vec<u32> 
 }
 
 /// Draw a full-target triangle in `color` through the diffuse channel.
-fn draw_fill(h: &Harness, color: u32) {
+pub fn draw_fill(h: &Harness, color: u32) {
     // Lighting defaults on and would replace the diffuse with black.
     assert_eq!(h.set_render_state(D3DRS_LIGHTING, 0), 0, "lighting off");
     assert_eq!(h.clear_texture(0), 0, "no texture for the fill draw");

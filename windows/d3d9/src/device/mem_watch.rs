@@ -90,13 +90,17 @@ struct TextureFootprint {
     mip_bytes: u64,
     staging_requested: u64,
     staging_default_static: u64,
+    staging_render_target: u64,
     staging_default_dynamic: u64,
     staging_other: u64,
 }
 
 impl TextureFootprint {
     const fn staging(&self) -> u64 {
-        self.staging_default_static + self.staging_default_dynamic + self.staging_other
+        self.staging_default_static
+            + self.staging_render_target
+            + self.staging_default_dynamic
+            + self.staging_other
     }
 }
 
@@ -110,7 +114,8 @@ impl DeviceInner {
     /// Count, total mip bytes, and resident staging bytes of every live texture.
     ///
     /// The staging split names who still holds a system copy: default-pool
-    /// static (droppable after upload), default-pool dynamic, and the
+    /// static (droppable after upload), default-pool render targets (staging
+    /// only for a level a CPU path has used), default-pool dynamic, and the
     /// lockable pools.
     fn live_texture_footprint(&self) -> TextureFootprint {
         let live = self
@@ -122,6 +127,7 @@ impl DeviceInner {
             mip_bytes: 0,
             staging_requested: 0,
             staging_default_static: 0,
+            staging_render_target: 0,
             staging_default_dynamic: 0,
             staging_other: 0,
         };
@@ -132,14 +138,15 @@ impl DeviceInner {
             fp.mip_bytes += ti.allocated_bytes();
             let resident = ti.resident_staging();
             fp.staging_requested += resident.requested;
-            if ti.d3d_pool() == mtld3d_types::D3DPOOL_DEFAULT {
-                if ti.d3d_usage() & mtld3d_types::D3DUSAGE_DYNAMIC == 0 {
-                    fp.staging_default_static += resident.padded;
-                } else {
-                    fp.staging_default_dynamic += resident.padded;
-                }
-            } else {
+            let usage = ti.d3d_usage();
+            if ti.d3d_pool() != mtld3d_types::D3DPOOL_DEFAULT {
                 fp.staging_other += resident.padded;
+            } else if usage & mtld3d_types::D3DUSAGE_DYNAMIC != 0 {
+                fp.staging_default_dynamic += resident.padded;
+            } else if usage & mtld3d_types::D3DUSAGE_RENDERTARGET != 0 {
+                fp.staging_render_target += resident.padded;
+            } else {
+                fp.staging_default_static += resident.padded;
             }
         }
         drop(live);
@@ -205,14 +212,16 @@ impl DeviceInner {
         debug!(
             target: LOG_TARGET,
             "address space: {space}; mtld3d holds {} textures with {} MiB of mip data; {}; \
-             d3d9.dll heap {} MiB committed; texture staging split default static {} / default dynamic {} / other {}, \
-             {} MiB before page rounding; vertex/index backing split writeonly static {} / \
-             dynamic {} / other {}; locks on static default textures {}",
+             d3d9.dll heap {} MiB committed; texture staging split default static {} / \
+             render target {} / default dynamic {} / other {}, {} MiB before page rounding; \
+             vertex/index backing split writeonly static {} / dynamic {} / other {}; \
+             locks on static default textures {}",
             fp.count,
             fp.mip_bytes >> 20,
             self.page_box_holders(&fp),
             heap_committed_bytes() >> 20,
             fp.staging_default_static >> 20,
+            fp.staging_render_target >> 20,
             fp.staging_default_dynamic >> 20,
             fp.staging_other >> 20,
             fp.staging_requested >> 20,

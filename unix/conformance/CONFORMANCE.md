@@ -219,7 +219,9 @@ record. A knob, where one makes sense, is named with its default.
   a texture would otherwise lose every upload. The cost is system memory: the
   level's staging, released once its upload retires, is re-created, and a
   partial lock after that release leaves the pixels outside its rect out of
-  step with the GPU copy (warned once per texture). No knob.
+  step with the GPU copy (warned once per texture). A render-target texture
+  holds no staging until a CPU path first needs a level, and that first use
+  reads the level back from the GPU. No knob.
 - **`GetData(D3DGETDATA_FLUSH)` can answer a pending occlusion query at once**
   instead of waiting for the GPU. Off by default. This saves API-thread time
   only for a title verified to use the poll as a submission throttle, without

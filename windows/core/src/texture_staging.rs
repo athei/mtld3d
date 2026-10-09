@@ -328,7 +328,9 @@ pub const fn released_level_write_needs_readback(whole_level: bool, was_uploaded
 /// Every other class keeps its staging, each for a reason of its own. The
 /// lockable pools, `D3DUSAGE_DYNAMIC` and an offscreen-plain surface all hand
 /// the game a pointer back into it. Render targets and depth textures are
-/// written by the GPU, so no upload of ours ever makes the staging redundant.
+/// written by the GPU, so no upload of ours ever makes the staging redundant;
+/// a render-target texture starts without staging instead
+/// ([`staging_lazy_class`]).
 /// Cubes and volumes are written and uploaded a whole level at a time by paths
 /// that expect the level to be there, and a re-created level is sized as a
 /// single 2D slice, which is short of a volume's box. `depth` does not identify
@@ -343,6 +345,33 @@ pub const fn staging_droppable_class(
 ) -> bool {
     pool == D3DPOOL_DEFAULT
         && usage & (D3DUSAGE_DYNAMIC | D3DUSAGE_RENDERTARGET | D3DUSAGE_DEPTHSTENCIL) == 0
+        && !flags.intersects(
+            TextureFlags::CUBE
+                .union(TextureFlags::OFFSCREEN_PLAIN)
+                .union(TextureFlags::DEPTH_FORMAT)
+                .union(TextureFlags::VOLUME_TEXTURE),
+        )
+        && depth <= 1
+}
+
+/// Whether a texture's levels start with no staging and get it at their first CPU use.
+///
+/// A default-pool render-target texture is drawn by the GPU, and D3D9 keeps
+/// no system-memory copy of it: its pixels reach the CPU through a read back.
+/// Until a CPU path needs a level (a map, a device context, a CPU copy into
+/// or out of it), the staging would only hold bytes the GPU's copy has
+/// already replaced, so the level starts released and claimed for the GPU,
+/// and its first CPU use reads the pixels back into fresh pages. A level
+/// keeps those pages once it has them.
+///
+/// A dynamic usage, a depth format, a cube, a volume and an offscreen-plain
+/// surface keep the staging they are created with, for the reasons
+/// [`staging_droppable_class`] gives.
+#[must_use]
+pub const fn staging_lazy_class(pool: u32, usage: u32, flags: TextureFlags, depth: u32) -> bool {
+    pool == D3DPOOL_DEFAULT
+        && usage & D3DUSAGE_RENDERTARGET != 0
+        && usage & (D3DUSAGE_DYNAMIC | D3DUSAGE_DEPTHSTENCIL) == 0
         && !flags.intersects(
             TextureFlags::CUBE
                 .union(TextureFlags::OFFSCREEN_PLAIN)

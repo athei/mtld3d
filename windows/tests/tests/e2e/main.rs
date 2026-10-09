@@ -59,6 +59,7 @@ mod range_fog;
 mod render_scale;
 mod render_states;
 mod render_target;
+mod render_target_staging;
 mod resource_misc;
 mod same_size_reset;
 mod samplers;

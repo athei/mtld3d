@@ -18,7 +18,7 @@ use mtld3d_core::{
     texture_flags::TextureFlags,
     texture_staging::{
         LockAction, MipShape, PreserveKind, StagingWrite, decide_lock_action, decide_staging_write,
-        honoured_lock_flags, is_in_flight, staging_droppable_class,
+        honoured_lock_flags, is_in_flight, staging_droppable_class, staging_lazy_class,
     },
 };
 use mtld3d_shared::{
@@ -698,9 +698,11 @@ impl TextureInner {
     /// A default-pool texture without `D3DUSAGE_DYNAMIC` cannot be locked
     /// in D3D9, and the runtime keeps no system-memory copy of it: the GPU
     /// holds the only bytes. Keeping ours doubles the footprint of every
-    /// streamed texture inside a 32-bit game. Render targets, depth
-    /// textures, cubes and volumes keep theirs (their copies serve other
-    /// paths); so do the lockable pools. A level a `LockRect` or a `GetDC`
+    /// streamed texture inside a 32-bit game. Depth textures, cubes and
+    /// volumes keep theirs (their copies serve other paths); so do the
+    /// lockable pools. A render target never releases a level here: its
+    /// levels start released instead and keep the staging their first CPU
+    /// use gives them ([`staging_lazy_class`]). A level a `LockRect` or a `GetDC`
     /// holds keeps its staging either way: both hand out a pointer into those
     /// pages that stays live until the map is released. So does a level in
     /// `kept_staging`, which the game writes in part after a release.
@@ -829,6 +831,18 @@ impl TextureInner {
             "texture {:#x}: staging re-created for level {level} after a write",
             self.texture_id.raw()
         );
+    }
+
+    /// Give released `level` zeroed staging, the contents of a level nothing has written.
+    fn ensure_zeroed_staging(&mut self, level: usize) {
+        if self.dropped_staging & (1u32 << level) == 0 {
+            return;
+        }
+        self.ensure_staging(level);
+        Arc::get_mut(&mut self.staging[level])
+            .expect("re-created staging is unique")
+            .as_mut_slice()
+            .fill(0);
     }
 
     /// Re-materialise `level`'s released staging for a `LockRect`.
@@ -3450,6 +3464,16 @@ fn build_texture_inner(info: TextureCreateInfo) -> *mut TextureInner {
             boxed.drop_staging(level);
         }
     }
+    // A render-target texture's pixels are the GPU's from the first pass that
+    // draws into it, so its staging starts released and claimed for the GPU:
+    // the first CPU use of a level reads it back into fresh pages
+    // (`move_subresource_to_staging`), and the level keeps them from then on.
+    if staging_lazy_class(boxed.d3d_pool, boxed.d3d_usage, boxed.flags, boxed.depth) {
+        for level in 0..boxed.staging.len() {
+            boxed.drop_staging(level);
+            boxed.mark_subresource_gpu_authoritative(0, level);
+        }
+    }
     let inner = Box::into_raw(boxed);
     DeviceInner::from_ptr(dev_ptr).register_texture(inner);
     inner
@@ -4188,10 +4212,15 @@ fn materialize_subresource_from_gpu(ti: &mut TextureInner, face: u32, level: usi
         // operation reached it: the encoder drops a `StretchRect` or a
         // `ColorFill` into a missing texture. The claim that operation left
         // names pixels that do not exist, and the staging is the level's only
-        // copy, which the caller keeps as the answer.
+        // copy, which the caller keeps as the answer. A level released before
+        // anything wrote it has no copy at all, so it answers as a level
+        // nothing wrote: zeros.
         mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
             "texture {texture_id:#x}: no Metal texture behind the GPU write of face {face} \
              level {level}; the staging keeps the level's pixels");
+        if ti.cube.is_none() {
+            ti.ensure_zeroed_staging(level);
+        }
         return true;
     }
     // A cube keeps its faces in the sidecar and never releases one; every other
