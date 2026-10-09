@@ -92,6 +92,7 @@ use super::{
     draw::{self, PsKey, ScratchSlice, ShaderRef},
 };
 use crate::metal::{
+    capture_layer_loaded,
     handle::IntoRetained,
     submission::{FrameSubmission, RetirementCounter, SubmissionOutcome, SubmitDescription},
 };
@@ -715,6 +716,11 @@ bitflags::bitflags! {
         /// (`FrameEncoder::skip_pending_draw`); without it every such draw
         /// is kept, and its submission waits for its build.
         const ASYNC_COMPILE = 1 << 4;
+        /// Metal's capture layer was loaded when the encoder started (`MTL_CAPTURE_ENABLED=1`).
+        ///
+        /// The layer sits under every Metal call, so each perf window says
+        /// whether its submit and GPU rows were measured with it.
+        const CAPTURE_LAYER = 1 << 5;
     }
 }
 
@@ -1621,6 +1627,7 @@ impl FrameEncoder {
                 flags.insert(FrameEncoderFlags::ASYNC_COMPILE);
             }
         }
+        flags.set(FrameEncoderFlags::CAPTURE_LAYER, capture_layer_loaded());
         Ok(Self {
             cache_path,
             compile_threads,
@@ -2455,6 +2462,7 @@ impl FrameEncoder {
             pending_resource_retention_depth: self.pending_resource_retention.len(),
             pagebox_pool_bytes: self.pagebox_pool.pooled_bytes() as u64,
             memory,
+            capture_layer: self.flags.contains(FrameEncoderFlags::CAPTURE_LAYER),
         }
     }
 

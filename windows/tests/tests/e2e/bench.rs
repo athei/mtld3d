@@ -248,6 +248,14 @@ const PROCESS_BYTES_KEYS: [&str; 4] = [
     "malloc_in_use_bytes",
 ];
 
+/// The `perf-kv` flag of Metal's capture layer, which [`perf_rule`] records as `exact`.
+///
+/// The layer sits under every Metal call, so a leg measured with it and one
+/// without it measure different things; `make bench` and `make bench-ab`
+/// clear `MTL_CAPTURE_ENABLED`, and a run that bypasses them with it set in
+/// one leg only fails on this row.
+const CAPTURE_LAYER_KEY: &str = "metal_capture_layer_count";
+
 /// The shader model of a programmable material.
 pub enum Model {
     /// `vs_2_0` with `ps_2_0`.
@@ -1680,7 +1688,8 @@ impl Metrics {
     ///   for a cache size (`cache_*_count`) when the frames are
     ///   [`FrameWork::Fixed`], `info` for a retention queue's peak depth
     ///   (`*_retention_peak_count`), which moves with the frames in flight
-    ///   as its bytes do, `noisy` otherwise.
+    ///   as its bytes do, `exact` for the capture layer's flag
+    ///   ([`CAPTURE_LAYER_KEY`]) on any frames, `noisy` otherwise.
     /// - `_total`, a window's count: `perf.<key less _total>_pf`, the
     ///   windows' totals over their frames to three places, in bytes for a
     ///   `_bytes_total` and in counts otherwise. A count the API calls fix
@@ -2142,6 +2151,9 @@ fn perf_rule(key: &str, work: &FrameWork) -> Option<PerfRule> {
             Class::Bytes
         };
         return rule(own(), Fold::Max, PerfUnit::Bytes, 0, class);
+    }
+    if key == CAPTURE_LAYER_KEY {
+        return rule(own(), Fold::Max, PerfUnit::Count, 0, Class::Exact);
     }
     if key.ends_with("_count") {
         // A retention peak counts the entries of every frame still in flight.
