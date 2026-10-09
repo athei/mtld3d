@@ -436,6 +436,60 @@ jobs:
           CONFORMANCE_REPEAT: ${{ inputs.conformance_repeat }}
           CONFORMANCE_ONLY: ${{ inputs.conformance_only }}
 
+      # The system log of the job's span, into the raw directory so the raw
+      # artifact below carries it. A subtest can hang with its process
+      # waiting on a main-thread request that never finished, after AppKit
+      # swallowed an Objective-C exception on the main thread; the sample
+      # the runner takes shows the wait, and the system log is where AppKit
+      # reports a swallowed exception, if it logs it there and does not
+      # redact it. Every error and fault of the `wine` processes, and any of
+      # their lines that names an exception, is kept beside the kernel and
+      # GPU lines the e2e step collects, so a hung leg and a GPU fault both
+      # carry their account. The span is the job budget plus five minutes of
+      # context; like the e2e step, it runs whatever the outcome and its own
+      # failure fails nothing. Reading 25 minutes takes 74 to 81 s on the
+      # Intel image, so a repeat run's 65 minutes gets five minutes rather
+      # than two: `log show` reads forward, and a cut would lose the end of
+      # the span, where a hang is. A d3d9ex run takes under a minute and a
+      # half there, so twenty of them with one hanging for its 600 s budget
+      # take about 40 minutes, and these five still fit the repeat job's 60.
+      - name: Collect conformance system log
+        if: always()
+        continue-on-error: true
+        timeout-minutes: ${{ inputs.conformance_repeat && 5 || 2 }}
+        run: |
+          output="$RUNNER_TEMP/conformance-raw/system"
+          mkdir -p "$output"
+          interval_end=$(date +%s)
+          interval_start=$((interval_end - SPAN_MINUTES * 60))
+          predicate='process == "kernel" OR process == "WindowServer" OR subsystem CONTAINS[c] "GPU" OR subsystem CONTAINS[c] "IOAccel" OR subsystem CONTAINS[c] "IOSurface" OR subsystem CONTAINS[c] "AppleParavirt" OR senderImagePath CONTAINS[c] "GPU" OR senderImagePath CONTAINS[c] "IOAccel" OR senderImagePath CONTAINS[c] "IOSurface" OR senderImagePath CONTAINS[c] "AppleParavirt" OR (process == "wine" AND (messageType == error OR messageType == fault OR eventMessage CONTAINS[c] "exception"))'
+          {
+            printf 'interval_start_epoch=%s\n' "$interval_start"
+            printf 'interval_end_epoch=%s\n' "$interval_end"
+            printf 'timezone=UTC\n'
+            printf 'predicate=%s\n' "$predicate"
+            printf 'state=started\n'
+          } > "$output/collection-status.txt"
+          set +e
+          sudo -n /usr/bin/log show \
+            --start "@$interval_start" \
+            --end "@$interval_end" \
+            --style compact \
+            --timezone UTC \
+            --info \
+            --debug \
+            --predicate "$predicate" \
+            > "$output/system.log" \
+            2> "$output/collection.stderr"
+          collector_status=$?
+          {
+            printf 'exit_code=%s\n' "$collector_status"
+            printf 'state=completed\n'
+          } >> "$output/collection-status.txt"
+          exit "$collector_status"
+        env:
+          SPAN_MINUTES: ${{ inputs.conformance_repeat && 65 || 25 }}
+
       # `always()`, because a diverging run is exactly the one whose output is
       # worth reading, and the job reports failure whenever it diverges.
       - uses: actions/upload-artifact@v4

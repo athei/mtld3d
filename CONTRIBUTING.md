@@ -656,8 +656,11 @@ commit the `@mac2` sections from the `baseline-mac2-<arch>` artifacts
 that dies on one image now and then is caught by dispatching with
 `conformance_repeat=<n>`, which runs it that many times on every image and
 uploads each run's raw output, ending in how the process ended, with the
-layer's debug log beside it. Run `make conformance`
-locally when your change touches the render or shader-emission path. The
+layer's debug log beside it. Every conformance job's raw artifact, repeat or
+not, also carries the system log of the job's span, which is where AppKit
+reports an exception it swallowed, if it logs it there unredacted. Run
+`make conformance` locally when your change touches the render or
+shader-emission path. The
 manual
 `probe-metal` job is how an image is checked before it is added, and it runs
 under the forced Intel answers, because its device filters 32-bit floats
