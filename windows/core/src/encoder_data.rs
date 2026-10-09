@@ -286,8 +286,8 @@ pub struct BlitSide {
 ///
 /// `GetDC` and `LockRect` hand their bytes out at the extent D3D9 reports, so
 /// under a `render.scale` below 100% the page the caller wrote is larger than
-/// the texture it belongs in. Serves the back buffer's `ReleaseDC` and a
-/// lockable render target's `UnlockRect`. Built by `surface.rs` on the API
+/// the texture it belongs in. Serves the back buffer's `ReleaseDC` and
+/// `UnlockRect` write-back. Built by `surface.rs` on the API
 /// thread, which is where the device's scale and the surface's extent are both
 /// reachable.
 pub struct ResampledUpload {
@@ -312,10 +312,12 @@ pub struct ResampledUpload {
 /// One region of rows into a colour surface or texture level, resolved on the API thread.
 ///
 /// The destination is a render-target surface or the back buffer, written by
-/// `UpdateSurface` (`device_update_surface`), or a level of a render-target
-/// texture `render.scale` shrinks, written by any CPU path into its staging
-/// (`texture::schedule_resampled_upload`). Both builders run where the
-/// destination's extent and scale are reachable; `update_color_region` runs it
+/// `UpdateSurface` (`device_update_surface`); a lockable render target,
+/// written whole at its `UnlockRect` or `ReleaseDC` (`lockable_rt_upload`); or
+/// a level of a render-target texture `render.scale` shrinks, written by any
+/// CPU path into its staging (`texture::schedule_resampled_upload`). Each
+/// builder runs where the destination's extent and scale are reachable;
+/// `update_color_region` runs it
 /// on the encoder thread, in API order among the application's passes, after
 /// resolving the destination's `MTLTexture` from the op's kind.
 pub struct ColorRegionUpdate {

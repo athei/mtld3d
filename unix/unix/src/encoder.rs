@@ -7751,9 +7751,8 @@ impl FrameEncoder {
     /// Upload `rows` into the standalone colour `MTLTexture` `color_handle`.
     ///
     /// `rows` is `src_stride * height` bytes of the source's own rows; this is
-    /// the `UnlockRect` half of a lockable render target (`CreateRenderTarget`
-    /// with `Lockable == TRUE`), whose staging carries the row pitch every
-    /// host-visible surface store uses. Copies the rows into a fresh
+    /// the write-back of the back buffer's `GetDC` or `LockRect` page, whose
+    /// rows carry the row pitch every host-visible surface store uses. Copies the rows into a fresh
     /// page-aligned `PageBox` (padding each row up to
     /// `min_linear_texture_align` if the source stride is below it), wraps
     /// that in a transient `MTLBuffer`, appends a `CopyBufferToTexture` to the
@@ -8010,8 +8009,8 @@ impl FrameEncoder {
     /// Upload `rows` at their own extent, then resample them into a smaller colour texture.
     ///
     /// The resizing counterpart of [`Self::upload_bytes_to_color_handle`], for
-    /// the back buffer's `ReleaseDC` write-back and a lockable render target's
-    /// `UnlockRect` under a `render.scale` below 100%. The rows land in a
+    /// the back buffer's `ReleaseDC` and `UnlockRect` write-back under a
+    /// `render.scale` below 100%. The rows land in a
     /// scratch texture at the extent they describe,
     /// which the blit-quad pipeline then samples across the destination with a
     /// linear filter, the same resample a scaling `StretchRect` runs. The

@@ -313,7 +313,11 @@ the colour region update an `UpdateSurface` into a scaled render-target surface
 sends (`schedule_resampled_upload` in `windows/d3d9/src/texture.rs`): the rows
 land in a scratch at their own extent and the blit quad resamples them into the
 rect's rasterized counterpart, leaving the texels around it as the GPU holds
-them.
+them. A lockable render-target surface's `UnlockRect` and `ReleaseDC` send the
+same region update over the whole surface (`lockable_rt_upload` in
+`windows/d3d9/src/surface.rs`), at any scale, so a write after a
+`D3DLOCK_DISCARD` lock, which reads nothing back first, still lands after the
+draws before it and under the draws after it.
 
 The encoder keeps one cached `bytesNoCopy` wrapper per staging level, so the
 uploads of a level reuse one `MTLBuffer`. The wrapper's keepalive is the native
