@@ -2529,6 +2529,107 @@ fn stretch_rect_rejects_a_render_target_into_an_offscreen_plain() {
     );
 }
 
+#[test]
+fn stretch_rect_follows_the_surface_class_matrix_on_a_plain_device() {
+    // The D3D9 surface-class matrix for default-pool colour surfaces, with
+    // and without a stretch: every class copies into a render target (a
+    // standalone one, a render-target texture level or cube face), an
+    // offscreen plain only into another offscreen plain or a render target,
+    // and nothing into an ordinary texture level or cube face. A plain device
+    // refuses the whole-surface copy between two texture levels of one format
+    // and size that an extended device accepts. A surface is never paired with
+    // itself here: that is a copy inside one surface, pinned on its own.
+    let h = Harness::new();
+    let texture = h.create_texture(64, 64, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT);
+    let texture_twin = h.create_texture(64, 64, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT);
+    let rt_texture = h.create_texture(
+        64,
+        64,
+        1,
+        D3DUSAGE_RENDERTARGET,
+        D3DFMT_A8R8G8B8,
+        D3DPOOL_DEFAULT,
+    );
+    let cube = h.create_cube_texture_owned(64, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT);
+    let rt_cube = h.create_cube_texture_owned(
+        64,
+        1,
+        D3DUSAGE_RENDERTARGET,
+        D3DFMT_A8R8G8B8,
+        D3DPOOL_DEFAULT,
+    );
+    let level = texture.surface_level(0);
+    let level_twin = texture_twin.surface_level(0);
+    let rt_level = rt_texture.surface_level(0);
+    let face = cube.surface(1, 0);
+    let rt_face = rt_cube.surface(1, 0);
+    let standalone = h.create_render_target(64, 64, D3DFMT_A8R8G8B8);
+    let back_buffer = h.render_target(0);
+    let plain = h.create_offscreen_plain_surface(64, 64, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT);
+    let plain_twin = h.create_offscreen_plain_surface(64, 64, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT);
+    let small_plain = h.create_offscreen_plain_surface(32, 32, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT);
+
+    // Each source with what D3D9 answers for it into an offscreen plain.
+    let sources = [
+        (&level, "a texture level", D3DERR_INVALIDCALL),
+        (&face, "a cube face", D3DERR_INVALIDCALL),
+        (
+            &rt_level,
+            "a render-target texture level",
+            D3DERR_INVALIDCALL,
+        ),
+        (&rt_face, "a render-target cube face", D3DERR_INVALIDCALL),
+        (
+            &standalone,
+            "a standalone render target",
+            D3DERR_INVALIDCALL,
+        ),
+        (&back_buffer, "the back buffer", D3DERR_INVALIDCALL),
+        (&plain, "an offscreen plain", D3D_OK),
+    ];
+    for (source, what, into_plain) in sources {
+        for (destination, into) in [
+            (&rt_level, "a render-target texture level"),
+            (&rt_face, "a render-target cube face"),
+            (&standalone, "a standalone render target"),
+        ] {
+            if core::ptr::eq(source, destination) {
+                continue;
+            }
+            assert_eq!(
+                h.stretch_rect(source, destination, D3DTEXF_NONE),
+                D3D_OK,
+                "StretchRect from {what} into {into}",
+            );
+        }
+        for (destination, into) in [(&level_twin, "a texture level"), (&face, "a cube face")] {
+            if core::ptr::eq(source, destination) {
+                continue;
+            }
+            assert_eq!(
+                h.stretch_rect(source, destination, D3DTEXF_NONE),
+                D3DERR_INVALIDCALL,
+                "StretchRect from {what} into {into}",
+            );
+        }
+        assert_eq!(
+            h.stretch_rect(source, &plain_twin, D3DTEXF_NONE),
+            into_plain,
+            "StretchRect from {what} into an offscreen plain",
+        );
+    }
+    assert_eq!(
+        h.stretch_rect(&level, &small_plain, D3DTEXF_LINEAR),
+        D3DERR_INVALIDCALL,
+        "a stretch from a texture level into an offscreen plain",
+    );
+    assert_eq!(
+        h.stretch_rect(&small_plain, &standalone, D3DTEXF_LINEAR),
+        D3D_OK,
+        "a stretch from an offscreen plain into a render target",
+    );
+}
+
 /// `UpdateSurface` writes into a render-target surface and into the back buffer.
 ///
 /// Neither has a texture behind it. The region lands at its destination point

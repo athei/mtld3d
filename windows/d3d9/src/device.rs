@@ -9003,12 +9003,10 @@ extern "system" fn device_stretch_rect(
         return D3D_OK;
     }
 
-    // D3D9 StretchRect eligibility: both surfaces must
-    // be D3DPOOL_DEFAULT; the destination must be a render target or a DEFAULT
-    // offscreen-plain surface (never an ordinary texture-level surface); and into
-    // an offscreen-plain destination only an offscreen-plain source is allowed
-    // (a texture source is valid only into a render target — the
-    // CAN_STRETCHRECT_FROM_TEXTURES cap we advertise).
+    // D3D9 StretchRect eligibility: both surfaces must be D3DPOOL_DEFAULT, and
+    // the surface classes must form a pair `class_reject` allows (a texture
+    // source is valid into a render target, the CAN_STRETCHRECT_FROM_TEXTURES
+    // cap we advertise).
     if src_info.pool != D3DPOOL_DEFAULT || dst_info.pool != D3DPOOL_DEFAULT {
         mtld3d_shared::log_once_warn!(
             target: crate::LOG_TARGET,
@@ -9016,51 +9014,24 @@ extern "system" fn device_stretch_rect(
         );
         return D3DERR_INVALIDCALL;
     }
-    let dst_eligible = dst_info
-        .flags
-        .contains(StretchSurfaceFlags::IS_RENDER_TARGET)
-        || dst_info
-            .flags
-            .contains(StretchSurfaceFlags::IS_OFFSCREEN_PLAIN_DEFAULT);
-    let src_eligible = if dst_info
-        .flags
-        .contains(StretchSurfaceFlags::IS_RENDER_TARGET)
-    {
-        true
-    } else {
-        // offscreen-plain destination: source must also be offscreen-plain
-        src_info
-            .flags
-            .contains(StretchSurfaceFlags::IS_OFFSCREEN_PLAIN_DEFAULT)
-    };
+    let rects_given = !src_rect.is_null() || !dst_rect.is_null();
     // An extended device also copies between two default-pool surfaces of
     // no eligible class, a texture level that is no render target included,
     // when the call is a whole-surface copy of one format and size.
     let extended_copy = mtld3d_core::stretch_rect::extended_whole_surface_copy(
         dev.is_extended(),
-        !src_rect.is_null() || !dst_rect.is_null(),
+        rects_given,
         (src_info.format, src_info.width, src_info.height),
         (dst_info.format, dst_info.width, dst_info.height),
     );
-    if (!dst_eligible || !src_eligible) && !extended_copy {
-        // One line per process, naming the first pair rejected here; the
-        // arguments are formatted only when it fires.
-        // SAFETY: `src` is the live IDirect3DSurface9 the game passed to this call.
-        let src_surface = unsafe { InPtr::<Direct3DSurface9>::opt(src) };
-        // SAFETY: `dst` is the live IDirect3DSurface9 the game passed to this call.
-        let dst_surface = unsafe { InPtr::<Direct3DSurface9>::opt(dst) };
-        mtld3d_shared::log_once_warn!(
-            target: crate::LOG_TARGET,
-            "reject StretchRect: ineligible src/dst surface class (src={} usage=0x{:x} {} 0x{:x}, \
-             dst={} usage=0x{:x} {} 0x{:x}) → INVALIDCALL",
-            src_info.class_name(),
-            src_surface.map_or(0, |surf| surf.d3d_usage()),
-            mtld3d_core::format::format_name(src_info.format),
-            src_info.format,
-            dst_info.class_name(),
-            dst_surface.map_or(0, |surf| surf.d3d_usage()),
-            mtld3d_core::format::format_name(dst_info.format),
-            dst_info.format
+    if let Some(reason) = mtld3d_core::stretch_rect::class_reject(src_info.flags, dst_info.flags)
+        && !extended_copy
+    {
+        log_class_reject(
+            reason,
+            (src, &src_info, src_rect),
+            (dst, &dst_info, dst_rect),
+            dev.is_extended(),
         );
         return D3DERR_INVALIDCALL;
     }
@@ -9214,6 +9185,62 @@ extern "system" fn device_stretch_rect(
         filter,
     });
     D3D_OK
+}
+
+/// Warn once per rule that a `StretchRect` pair broke the surface-class matrix.
+///
+/// The line names the rule, then for each endpoint its class, usage, format,
+/// level extent, mip level and the rect the call passed, and whether the
+/// device is extended, so a game log alone says which pair the application
+/// asked for and why an extended device's whole-surface copy did not take it.
+/// The arguments are formatted only when the line fires, so each rule names
+/// the first pair that broke it.
+fn log_class_reject(
+    reason: mtld3d_core::stretch_rect::RejectReason,
+    src: (*mut c_void, &StretchSurfaceInfo, *const c_void),
+    dst: (*mut c_void, &StretchSurfaceInfo, *const c_void),
+    extended: bool,
+) {
+    mtld3d_shared::log_once_warn_by!(
+        target: crate::LOG_TARGET,
+        key: reason.key(),
+        "reject StretchRect: {} (src={}, dst={}, {} device) → INVALIDCALL",
+        reason.as_str(),
+        describe_stretch_endpoint(src.0, src.1, src.2),
+        describe_stretch_endpoint(dst.0, dst.1, dst.2),
+        if extended { "extended" } else { "plain" }
+    );
+}
+
+/// One `StretchRect` endpoint for a rejection line.
+///
+/// Reads as `texture level usage=0x0 A8R8G8B8 0x15 256x256 level 0 rect
+/// whole`, the rect being the `D3DRECT` the call passed or `whole` for a null
+/// one.
+fn describe_stretch_endpoint(
+    surface: *mut c_void,
+    info: &StretchSurfaceInfo,
+    rect: *const c_void,
+) -> String {
+    use crate::surface::Direct3DSurface9;
+
+    // SAFETY: `surface` is the live IDirect3DSurface9 the game passed to this
+    // `StretchRect` call.
+    let usage = unsafe { InPtr::<Direct3DSurface9>::opt(surface) }.map_or(0, |s| s.d3d_usage());
+    // SAFETY: `rect` is the `*const D3DRECT` in-param of the same call.
+    let rect = unsafe { ValueIn::<mtld3d_types::D3DRECT>::read_opt(rect) }.map_or_else(
+        || String::from("whole"),
+        |r| format!("({}, {})-({}, {})", r.x1, r.y1, r.x2, r.y2),
+    );
+    format!(
+        "{} usage=0x{usage:x} {} 0x{:x} {}x{} level {} rect {rect}",
+        info.class_name(),
+        mtld3d_core::format::format_name(info.format),
+        info.format,
+        info.width,
+        info.height,
+        info.mip_level
+    )
 }
 
 /// Claim a `StretchRect` or `ColorFill` destination subresource for the GPU.
