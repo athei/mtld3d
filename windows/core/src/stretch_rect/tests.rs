@@ -6,6 +6,11 @@
 //! separate check keeps every `RejectReason` key distinct, which is what makes the
 //! once-per-reason warn fire once per reason rather than collapsing to a single line.
 //!
+//! `class_reject` is pinned against the D3D9 surface-class matrix: every colour class
+//! into a render target, an offscreen plain only into an offscreen plain or a render
+//! target, and nothing into an ordinary texture level or cube face, each refusal naming
+//! the rule it breaks.
+//!
 //! `same_surface_route` is pinned against the four shapes a within-one-surface copy
 //! takes: disjoint rects that the blit encoder can copy in place, overlapping rects and
 //! scaled rects that have to stage through a scratch texture, and an identical pair that
@@ -107,6 +112,9 @@ fn reject_keys_are_distinct() {
         RejectReason::PlanarDestination,
         RejectReason::EmptyRect,
         RejectReason::RectOutsideSurface,
+        RejectReason::DestinationClass,
+        RejectReason::SourceIntoOffscreenPlain,
+        RejectReason::SameSurfaceStretch,
     ]
     .iter()
     .map(|r| r.key())
@@ -115,6 +123,33 @@ fn reject_keys_are_distinct() {
     sorted.sort_unstable();
     sorted.dedup();
     assert_eq!(keys.len(), sorted.len());
+}
+
+#[test]
+fn class_reject_follows_the_d3d9_surface_class_matrix() {
+    let texture = StretchSurfaceFlags::empty();
+    let render_target = StretchSurfaceFlags::IS_RENDER_TARGET;
+    let offscreen_plain = StretchSurfaceFlags::IS_OFFSCREEN_PLAIN_DEFAULT;
+    for src in [texture, render_target, offscreen_plain] {
+        assert_eq!(
+            class_reject(src, render_target),
+            None,
+            "{src:?} into a render target"
+        );
+        assert_eq!(
+            class_reject(src, texture),
+            Some(RejectReason::DestinationClass),
+            "{src:?} into a texture level"
+        );
+    }
+    assert_eq!(class_reject(offscreen_plain, offscreen_plain), None);
+    for src in [texture, render_target] {
+        assert_eq!(
+            class_reject(src, offscreen_plain),
+            Some(RejectReason::SourceIntoOffscreenPlain),
+            "{src:?} into an offscreen plain"
+        );
+    }
 }
 
 const fn region(x: u32, y: u32, w: u32, h: u32) -> StretchRegion {

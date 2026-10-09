@@ -12,7 +12,8 @@ use mtld3d_types::{
 };
 
 use crate::{
-    format::FormatMapping, pixel_convert::can_convert, planar_yuv::planar_yuv_layout_from_pitch,
+    encoder_data::StretchSurfaceFlags, format::FormatMapping, pixel_convert::can_convert,
+    planar_yuv::planar_yuv_layout_from_pitch,
 };
 
 /// Parsed source / destination region for a `StretchRect`.
@@ -93,6 +94,12 @@ pub enum RejectReason {
     EmptyRect,
     /// A source or destination rect has an edge outside its surface.
     RectOutsideSurface,
+    /// The destination is neither a render target nor a default-pool offscreen plain.
+    DestinationClass,
+    /// An offscreen-plain destination with a source that is no offscreen plain.
+    SourceIntoOffscreenPlain,
+    /// Source and destination are one surface and the two rects differ in size.
+    SameSurfaceStretch,
 }
 
 impl RejectReason {
@@ -115,7 +122,38 @@ impl RejectReason {
             Self::PlanarDestination => "destination is a planar YUV surface (decode only)",
             Self::EmptyRect => "a source or destination rect is empty or inverted",
             Self::RectOutsideSurface => "a source or destination rect leaves its surface",
+            Self::DestinationClass => {
+                "the destination is neither a render target nor an offscreen-plain surface"
+            }
+            Self::SourceIntoOffscreenPlain => {
+                "an offscreen-plain destination takes only an offscreen-plain source"
+            }
+            Self::SameSurfaceStretch => "a stretch between two rects of one surface",
         }
+    }
+}
+
+/// The surface-class rule a colour `StretchRect` pair breaks on a plain device, if any.
+///
+/// D3D9 copies, with or without a stretch, into a render target (a standalone
+/// one, the back buffer, or a level or face of a render-target texture) from
+/// any default-pool colour surface, and into a default-pool offscreen plain
+/// only from another offscreen plain. An ordinary texture level or cube face
+/// is never a destination. `None` means the classes allow the pair; pools,
+/// formats, rects and depth-stencil pairs are judged elsewhere.
+#[must_use]
+pub const fn class_reject(
+    src: StretchSurfaceFlags,
+    dst: StretchSurfaceFlags,
+) -> Option<RejectReason> {
+    if dst.contains(StretchSurfaceFlags::IS_RENDER_TARGET) {
+        None
+    } else if !dst.contains(StretchSurfaceFlags::IS_OFFSCREEN_PLAIN_DEFAULT) {
+        Some(RejectReason::DestinationClass)
+    } else if src.contains(StretchSurfaceFlags::IS_OFFSCREEN_PLAIN_DEFAULT) {
+        None
+    } else {
+        Some(RejectReason::SourceIntoOffscreenPlain)
     }
 }
 
@@ -139,11 +177,15 @@ pub fn extended_whole_surface_copy(
 
 /// How a `StretchRect` whose two endpoints are one Metal texture is carried out.
 ///
-/// D3D9 performs a copy between two rectangles of the same surface; only an
-/// overlapping pair is undefined. Metal's blit encoder copies within a single
-/// texture as long as the two regions do not overlap, and the render quad
-/// cannot sample the texture it draws into at all, so the cases split three
-/// ways.
+/// D3D9 performs a 1:1 copy between two rectangles of the same surface and
+/// refuses a stretch there, which the API thread answers before it gets here.
+/// A size change still reaches this between two levels or two faces of one
+/// texture, between two surfaces that alias one texture (an additional swap
+/// chain's back buffer and the device's), and between two equal rects of one
+/// surface that `render.scale` rounds to two extents. Metal's blit encoder
+/// copies within a single texture as long as the two regions do not overlap,
+/// and the render quad cannot sample the texture it draws into at all, so the
+/// cases split three ways.
 #[derive(Debug, PartialEq, Eq)]
 pub enum SameSurfaceRoute {
     /// The two regions name the same texels, so the copy writes what is there.
