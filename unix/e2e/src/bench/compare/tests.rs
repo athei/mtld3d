@@ -628,7 +628,7 @@ fn an_optional_perf_key_that_comes_and_goes_is_reported_not_judged() {
 fn memory_gauges_a_candidate_window_left_out_are_reported_not_judged() {
     // A base older than the gauges has none of them, and round 1 of the
     // candidate closed its window before the memory sample arrived, so its
-    // `perf-kv` line left the four gauges out. The wrapper churn counts are
+    // `perf-kv` line left the five gauges out. The wrapper churn counts are
     // written every window and stay in every round.
     let fixture = Fixture::new("flaky-memory");
     let gauges = [
@@ -636,6 +636,7 @@ fn memory_gauges_a_candidate_window_left_out_are_reported_not_judged() {
         "perf.metal_allocated_bytes",
         "perf.tex_staging_wrapped_bytes",
         "perf.unix_heap_bytes",
+        "perf.malloc_in_use_bytes",
     ];
     for round in 0..3 {
         let common: &[(&str, f64, &str)] = &[
@@ -650,6 +651,7 @@ fn memory_gauges_a_candidate_window_left_out_are_reported_not_judged() {
                 (gauges[1], 428_654_592.0, "bytes lower info"),
                 (gauges[2], 308_789_248.0, "bytes lower bytes"),
                 (gauges[3], 100_663_296.0, "bytes lower info"),
+                (gauges[4], 536_870_912.0, "bytes lower info"),
             ]);
         }
         fixture.write("base", round, "b", &meta("v1", "AAAA"), common);
@@ -674,7 +676,7 @@ fn memory_gauges_a_candidate_window_left_out_are_reported_not_judged() {
         .expect("the row is reported");
     assert_ne!(churn.verdict, Verdict::Incomplete);
     assert!(
-        comparison.summary().contains("4 incomplete"),
+        comparison.summary().contains("5 incomplete"),
         "{}",
         comparison.summary()
     );

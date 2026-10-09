@@ -2357,6 +2357,14 @@ pub struct MemoryGauges {
     /// through `malloc`, Metal's pipelines and libraries among them, are not
     /// in it.
     pub unix_heap: u64,
+    /// Bytes in use in every `malloc` zone of the process (`malloc_zone_statistics`).
+    ///
+    /// The whole process's `malloc`, not this layer's: Wine's unix side and
+    /// every system framework allocate there, and so do the Objective-C and
+    /// Metal objects the frameworks create for this layer, its pipelines and
+    /// libraries among them. The footprint less this is mostly mapped memory:
+    /// the translator, Wine's virtual memory and the driver's.
+    pub malloc_in_use: u64,
     /// Padded staging bytes under the encoder's cached per-level `bytesNoCopy` wrappers.
     ///
     /// Each wrapper keeps its guest pages alive, so this is staging the PE
@@ -6438,6 +6446,13 @@ impl<'a> Summary<'a> {
         );
         self.res_row(
             out,
+            "malloc",
+            &memory.map_or_else(|| "n/a".to_owned(), |m| format_bytes(m.malloc_in_use)),
+            None,
+            "whole-process malloc in use at the summary (Wine's unix side and the frameworks, Metal's objects included)",
+        );
+        self.res_row(
+            out,
             "metal alloc",
             &memory.map_or_else(|| "n/a".to_owned(), |m| format_bytes(m.metal_allocated)),
             None,
@@ -6885,6 +6900,7 @@ fn render_kv(w: &PerfWindow, c: &PerfWindow, caches: &CacheSizes, window_secs: f
     if let Some(memory) = &caches.memory {
         kv.bytes("process_footprint", memory.process_footprint);
         kv.bytes("unix_heap", memory.unix_heap);
+        kv.bytes("malloc_in_use", memory.malloc_in_use);
     }
     kv
 }

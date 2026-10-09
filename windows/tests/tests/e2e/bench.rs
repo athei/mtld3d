@@ -235,16 +235,17 @@ const RETAINED_BYTES_KEYS: [&str; 2] = ["vbib_retained_bytes", "tex_staging_reta
 
 /// The `perf-kv` keys of process-wide memory, which [`perf_rule`] records as `info`.
 ///
-/// The process footprint and the Metal device's allocated size count
-/// everything the process holds, the benchmark binary, Wine and the Metal
-/// driver's own allocations among it, and the native runtime's heap is one
-/// allocator for every device of the process. All three carry what earlier
-/// benchmarks of the round left behind, so they move with the machine and
-/// the round's order rather than with the build.
-const PROCESS_BYTES_KEYS: [&str; 3] = [
+/// The process footprint, the process's `malloc` and the Metal device's
+/// allocated size count everything the process holds, the benchmark binary,
+/// Wine and the Metal driver's own allocations among it, and the native
+/// runtime's heap is one allocator for every device of the process. All four
+/// carry what earlier benchmarks of the round left behind, so they move with
+/// the machine and the round's order rather than with the build.
+const PROCESS_BYTES_KEYS: [&str; 4] = [
     "process_footprint_bytes",
     "metal_allocated_bytes",
     "unix_heap_bytes",
+    "malloc_in_use_bytes",
 ];
 
 /// The shader model of a programmable material.
@@ -1670,9 +1671,9 @@ impl Metrics {
     ///   (`vbib_ret_cap_*_total`, `noisy`, which on a zero base need more
     ///   than two a frame); for textures, the uploads per frame
     ///   (`tex_uploads_total`, `exact` over [`FrameWork::Fixed`] frames),
-    ///   with no cap on that queue. The process footprint, the Metal
-    ///   device's allocated size and the native runtime's heap
-    ///   ([`PROCESS_BYTES_KEYS`]) are `info` too: they count the whole
+    ///   with no cap on that queue. The process footprint, the process's
+    ///   `malloc`, the Metal device's allocated size and the native
+    ///   runtime's heap ([`PROCESS_BYTES_KEYS`]) are `info` too: they count the whole
     ///   process, or every device of it, and what earlier benchmarks of the
     ///   round left in it.
     /// - `_count`, a count gauge: `perf.<key>` in counts, the largest; `exact`
