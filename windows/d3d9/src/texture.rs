@@ -4094,10 +4094,9 @@ extern "system" fn texture_generate_mip_sub_levels(this: *mut c_void) {
     // chain this call asks for, so pushing another op here would generate it
     // a second time.
     let upload_regenerates = ti.dirty_mask & 1 != 0 && !ti.is_cpu_only();
-    // A render target's level 0 is written between application passes, so
-    // its chain is regenerated there too, after the passes before this call.
-    let render_target = ti.d3d_usage & mtld3d_types::D3DUSAGE_RENDERTARGET != 0;
-    if render_target {
+    // A render target's pending level-0 write goes out between application
+    // passes, and its ordered upload regenerates the chain behind it.
+    if ti.d3d_usage & mtld3d_types::D3DUSAGE_RENDERTARGET != 0 {
         flush_converted_mips(ti, dev);
     } else {
         flush_dirty_mips(ti, dev);
@@ -4106,11 +4105,7 @@ extern "system" fn texture_generate_mip_sub_levels(this: *mut c_void) {
     if upload_regenerates {
         return;
     }
-    if render_target {
-        dev.push_control(crate::device::GenerateMipmapsOrderedOp { old_id: texture_id });
-    } else {
-        dev.push_control(crate::device::GenerateMipmapsOp { texture_id });
-    }
+    dev.push_control(crate::device::GenerateMipmapsOp { texture_id });
 }
 
 // ── IDirect3DTexture9 ──
