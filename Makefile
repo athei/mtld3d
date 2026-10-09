@@ -1567,12 +1567,12 @@ conformance-isolate: install-windows-$(ARCH) install-unix-$(SDK_UNIX_ARCH)
 # were on. The Metal validation layer and HUD are off: both cost frame time
 # and neither is under test. MTL_CAPTURE_ENABLED is unset for the same
 # reason, here and in `bench-ab` and `bench-variants`: Metal's capture layer
-# sits under every Metal call, and with it the submit thread's pass replay
-# in `wow_112_busy_frame` took 2.75 to 4.03 ms a frame instead of 0.94 ms. The configuration is the suite's without the
-# Main Thread Checker, then BENCH_CONFIG='key=value;key=value', appended last
-# the way SCALE is, so its entries win over the ones before it (the stutter
-# benchmark's own `shaderCache.enable=false` still wins over them). PERF=1
-# builds the layer with its perf summary. Each benchmark writes
+# sits under every Metal call (docs/ARCHITECTURE.md gives its measured cost
+# beside the Ctrl+Shift+P capture). The configuration is the suite's
+# without the Main Thread Checker, then BENCH_CONFIG='key=value;key=value',
+# appended last the way SCALE is, so its entries win over the ones before it
+# (the stutter benchmark's own `shaderCache.enable=false` still wins over
+# them). PERF=1 builds the layer with its perf summary. Each benchmark writes
 # `bench-<name>.txt` into LOG_DIR (default `.codex/evidence/bench`), beside
 # the layer's log that a PERF=1 build's summary rows are copied from, and
 # `bench-<name>.metrics` next to it, the same numbers plus the build's

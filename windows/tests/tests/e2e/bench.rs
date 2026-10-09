@@ -251,9 +251,9 @@ const PROCESS_BYTES_KEYS: [&str; 4] = [
 /// The `perf-kv` flag of Metal's capture layer, which [`perf_rule`] records as `exact`.
 ///
 /// The layer sits under every Metal call, so a leg measured with it and one
-/// without it measure different things; `make bench` and `make bench-ab`
-/// clear `MTL_CAPTURE_ENABLED`, and a run that bypasses them with it set in
-/// one leg only fails on this row.
+/// without it measure different things. `make bench`, `make bench-ab` and
+/// `make bench-variants` unset `MTL_CAPTURE_ENABLED`; legs run in different
+/// environments some other way fail on this row.
 const CAPTURE_LAYER_KEY: &str = "metal_capture_layer_count";
 
 /// The shader model of a programmable material.

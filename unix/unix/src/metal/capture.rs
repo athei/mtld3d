@@ -73,8 +73,8 @@ pub fn start_capture(device_handle: MetalHandle<MTLDeviceKind>) {
 /// environment (or the app bundle asks for it), and only then supports a
 /// trace document as a destination, so this asks Metal rather than parsing
 /// the variable. The layer sits under every Metal call whether or not a
-/// capture runs: on `make bench`, with it the submit thread's pass replay
-/// took 2.9 to 4.3 times as long in `wow_112_busy_frame`.
+/// capture runs, so a timing taken with it loaded is not comparable with one
+/// taken without; docs/ARCHITECTURE.md gives the measured cost.
 pub fn capture_layer_loaded() -> bool {
     // SAFETY: `sharedCaptureManager` is an always-live process-wide singleton.
     let manager = unsafe { MTLCaptureManager::sharedCaptureManager() };
