@@ -130,7 +130,7 @@ fn an_extended_reset_keeps_state_and_rebinds_only_the_targets_and_the_viewport_e
     assert_eq!(h.set_stream_source(0, &vb, 0, 16), D3D_OK);
 
     assert_eq!(h.reset(400, 300), D3D_OK, "Reset with live bindings");
-    assert_eq!(h.test_cooperative_level(), D3D_OK);
+    assert_eq!(h.present_ex(0), D3D_OK, "no Reset is owed");
 
     assert_eq!(h.render_state(D3DRS_LIGHTING), 0, "render states survive");
     let after = h.viewport();
@@ -235,7 +235,7 @@ fn references_to_default_resources_implicit_surfaces_and_state_blocks_do_not_blo
         D3D_OK,
         "nothing the application holds blocks it"
     );
-    assert_eq!(h.test_cooperative_level(), D3D_OK);
+    assert_eq!(h.present_ex(0), D3D_OK, "no Reset is owed");
     drop((block, plain, depth, back_buffer));
     h.render_once(BLUE, |_| {});
     assert_pixel_eq(h.read_pixel(200, 150), BLUE, "the device draws after it");
@@ -525,9 +525,9 @@ fn reset_ex_names_a_mode_exactly_when_fullscreen_and_a_refusal_changes_nothing()
         "a mode of another size"
     );
 
-    assert_eq!(h.test_cooperative_level(), D3D_OK, "no Reset is owed");
     assert_eq!(h.render_state(D3DRS_LIGHTING), 0, "the state is untouched");
     assert_eq!(h.end_scene(), D3D_OK, "the scene is still open");
+    assert_eq!(h.present_ex(0), D3D_OK, "no Reset is owed");
     assert_eq!(
         h.reset_ex(&mut windowed, None),
         D3D_OK,
@@ -559,7 +559,6 @@ fn a_rejected_extended_reset_leaves_the_device_working_and_its_state_untouched()
         "31 back buffers"
     );
 
-    assert_eq!(h.test_cooperative_level(), D3D_OK, "no Reset is owed");
     assert_eq!(
         h.render_state(D3DRS_LIGHTING),
         0,
@@ -570,6 +569,7 @@ fn a_rejected_extended_reset_leaves_the_device_working_and_its_state_untouched()
         "so are the bindings"
     );
     assert_eq!(h.end_scene(), D3D_OK, "and the open scene");
+    assert_eq!(h.present_ex(0), D3D_OK, "no Reset is owed");
     assert_pixel_eq(sample_center(&h, &texture), RED, "the device draws on");
 }
 

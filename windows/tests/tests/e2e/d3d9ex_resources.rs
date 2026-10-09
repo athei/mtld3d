@@ -101,30 +101,67 @@ fn locked_rows(surface: &Surface<'_>, row_bytes: usize, rows: usize) -> (i32, Ve
 fn an_extended_device_refuses_the_managed_pool_for_every_kind() {
     let ex = extended();
     let plain = Harness::new();
-    for (h, expected) in [(&ex, D3DERR_INVALIDCALL), (&plain, D3D_OK)] {
-        let (hr, texture) = h.try_create_texture(16, 16, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED);
-        assert_eq!(hr, expected, "texture");
+    let cases = [
+        (&ex, D3DPOOL_MANAGED, D3DERR_INVALIDCALL),
+        (&ex, D3DPOOL_MANAGED_EX, D3D_OK),
+        (&plain, D3DPOOL_MANAGED, D3D_OK),
+        (&plain, D3DPOOL_MANAGED_EX, D3D_OK),
+    ];
+    for (h, pool, expected) in cases {
+        let case = |kind: &str| format!("{kind} in pool {pool}");
+        let (hr, texture) = h.try_create_texture(16, 16, 1, 0, D3DFMT_A8R8G8B8, pool);
+        assert_eq!(hr, expected, "{}", case("texture"));
         if !texture.is_null() {
-            drop(Texture::from_raw(texture));
+            let texture = Texture::from_raw(texture);
+            assert_eq!(
+                texture.level_desc(0).1.pool,
+                D3DPOOL_MANAGED,
+                "{}",
+                case("texture")
+            );
         }
-        let (hr, cube) = h.try_create_cube_texture(16, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED);
-        assert_eq!(hr, expected, "cube texture");
+        let (hr, cube) = h.try_create_cube_texture(16, 1, 0, D3DFMT_A8R8G8B8, pool);
+        assert_eq!(hr, expected, "{}", case("cube texture"));
         if !cube.is_null() {
-            drop(CubeTexture::from_raw(cube));
+            let cube = CubeTexture::from_raw(cube);
+            assert_eq!(
+                cube.surface(0, 0).desc().1.pool,
+                D3DPOOL_MANAGED,
+                "{}",
+                case("cube texture")
+            );
         }
-        let (hr, volume) =
-            h.try_create_volume_texture([8, 8, 4], 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED);
-        assert_eq!(hr, expected, "volume texture");
-        drop(volume);
-        let (hr, vb) = h.try_create_vertex_buffer(64, 0, 0, D3DPOOL_MANAGED);
-        assert_eq!(hr, expected, "vertex buffer");
+        let (hr, volume) = h.try_create_volume_texture([8, 8, 4], 1, 0, D3DFMT_A8R8G8B8, pool);
+        assert_eq!(hr, expected, "{}", case("volume texture"));
+        if let Some(volume) = volume {
+            assert_eq!(
+                volume.level_desc(0).1.pool,
+                D3DPOOL_MANAGED,
+                "{}",
+                case("volume texture")
+            );
+        }
+        let (hr, vb) = h.try_create_vertex_buffer(64, 0, 0, pool);
+        assert_eq!(hr, expected, "{}", case("vertex buffer"));
         if !vb.is_null() {
-            drop(VertexBuffer::from_raw(vb));
+            let vb = VertexBuffer::from_raw(vb);
+            assert_eq!(
+                vb.desc().1.pool,
+                D3DPOOL_MANAGED,
+                "{}",
+                case("vertex buffer")
+            );
         }
-        let (hr, ib) = h.try_create_index_buffer(64, 0, D3DFMT_INDEX16, D3DPOOL_MANAGED);
-        assert_eq!(hr, expected, "index buffer");
+        let (hr, ib) = h.try_create_index_buffer(64, 0, D3DFMT_INDEX16, pool);
+        assert_eq!(hr, expected, "{}", case("index buffer"));
         if !ib.is_null() {
-            drop(IndexBuffer::from_raw(ib));
+            let ib = IndexBuffer::from_raw(ib);
+            assert_eq!(
+                ib.desc().1.pool,
+                D3DPOOL_MANAGED,
+                "{}",
+                case("index buffer")
+            );
         }
     }
 }

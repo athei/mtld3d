@@ -3744,6 +3744,20 @@ impl DeviceInner {
         self.flags.contains(DeviceFlags::EXTENDED)
     }
 
+    /// The code this device reports for a call that produced `hr`.
+    ///
+    /// An extended device reports `E_OUTOFMEMORY`, which none of its present,
+    /// reset and state calls document, as `D3DERR_OUTOFVIDEOMEMORY`, so one
+    /// failure answers with one code from every one of them; a plain device
+    /// reports `hr` as it is.
+    pub const fn state_code(&self, hr: i32) -> i32 {
+        if self.is_extended() {
+            mtld3d_core::extended::extended_state_code(hr)
+        } else {
+            hr
+        }
+    }
+
     /// The frame latency `GetMaximumFrameLatency` reports.
     pub const fn max_frame_latency(&self) -> u32 {
         self.max_frame_latency
@@ -4648,8 +4662,10 @@ extern "system" fn device_test_cooperative_level(this: *mut c_void) -> i32 {
     // SAFETY: vtable thunk; `this` is *mut Direct3DDevice9 per IDirect3DDevice9 ABI.
     let object = unsafe { InPtr::<Direct3DDevice9>::opt(this) };
     // D3D9Ex answers `TestCooperativeLevel` with `D3D_OK` on an extended
-    // device, which reports its state through `CheckDeviceState` and
-    // `PresentEx` instead.
+    // device. Its failure latch reaches the application through
+    // `CheckDeviceState` and the presents; a `Reset` the layer could not
+    // complete shows only as the DEVICENOTRESET that `Present`, `PresentEx`
+    // and the swap chain's `Present` answer.
     if object.as_ref().is_some_and(|obj| obj.inner().is_extended()) {
         return D3D_OK;
     }
@@ -4948,7 +4964,17 @@ extern "system" fn device_get_number_of_swap_chains(this: *mut c_void) -> u32 {
 extern "system" fn device_reset(this: *mut c_void, present_params: *mut c_void) -> i32 {
     let _api = device_api_lock(this);
     let _timer = device_timer(this, DeviceSubCategory::Misc);
-    reset_impl(this, present_params, ResetCall::Reset)
+    let hr = reset_impl(this, present_params, ResetCall::Reset);
+    reported_state_code(this, hr)
+}
+
+/// The code the device behind `this` reports for a call that produced `hr`.
+///
+/// [`DeviceInner::state_code`] for a live device, `hr` itself otherwise.
+fn reported_state_code(this: *mut c_void, hr: i32) -> i32 {
+    // SAFETY: vtable thunk argument; `this` is null or *mut Direct3DDevice9
+    // per the IDirect3DDevice9 ABI.
+    unsafe { InPtr::<Direct3DDevice9>::opt(this) }.map_or(hr, |obj| obj.inner().state_code(hr))
 }
 
 /// Which entry point a `Reset` came through.
@@ -5847,7 +5873,8 @@ fn present_impl(
     }
 
     mtld3d_shared::crumb!("d3d9:present");
-    dev.present()
+    let hr = dev.present();
+    dev.state_code(hr)
 }
 
 /// Warn once for each `D3DPRESENT_*` flag bit a present carries, none of which is honoured.

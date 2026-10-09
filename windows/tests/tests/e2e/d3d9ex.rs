@@ -11,8 +11,9 @@
 //! extended stubs answer what a device with nothing to do there answers, and
 //! `GetPresentStats` writes the struct's own size on each architecture and
 //! nothing past it. `TestCooperativeLevel` answers `D3D_OK` on an extended
-//! device, after a failed submission too, while `PresentEx`,
-//! `CheckDeviceState` and `ResetEx` report the failure.
+//! device, after a failed submission too, while `PresentEx`, `Present`, the
+//! swap chain's `Present`, `CheckDeviceState`, `ResetEx` and `Reset` report
+//! the failure with one code.
 
 use core::ffi::{c_char, c_void};
 
@@ -429,6 +430,12 @@ fn an_extended_device_answers_test_cooperative_level_with_ok_after_a_failure() {
         D3DERR_DEVICELOST,
         "PresentEx reports it again"
     );
+    assert_eq!(h.present(), D3DERR_DEVICELOST, "so does Present");
+    assert_eq!(
+        h.present_swapchain(),
+        D3DERR_DEVICELOST,
+        "and the swap chain's Present"
+    );
     let (width, height) = h.dims();
     let mut pp = h.windowed_present_params(width, height);
     assert_eq!(
@@ -436,6 +443,8 @@ fn an_extended_device_answers_test_cooperative_level_with_ok_after_a_failure() {
         D3DERR_DEVICELOST,
         "ResetEx does not clear it"
     );
+    let mut pp = h.windowed_present_params(width, height);
+    assert_eq!(h.reset_params(&mut pp), D3DERR_DEVICELOST, "nor does Reset");
     assert_eq!(
         h.test_cooperative_level(),
         D3D_OK,

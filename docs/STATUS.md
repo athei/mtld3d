@@ -245,13 +245,18 @@ unless its entry says otherwise.
   surfaces released after the failure. There is no recovery short of
   creating a new device. An extended device keeps the same latch with the
   answers D3D9Ex documents: `TestCooperativeLevel` answers `D3D_OK` whatever
-  the latch holds, `PresentEx` and `CheckDeviceState` return the latched code,
-  with `E_OUTOFMEMORY` reported as `D3DERR_OUTOFVIDEOMEMORY`, the
-  out-of-memory code those two document, and `ResetEx` returns it without
-  clearing it. `D3DERR_DEVICEREMOVED`, which tells a D3D9Ex application to
-  create a new device, is not used: one latch serves both kinds of device,
-  and `D3DERR_DEVICELOST` is the code D3D9Ex gives for a device whose work
-  the GPU did not complete.
+  the latch holds, while `Present`, `PresentEx`, the swap chain's `Present`,
+  `CheckDeviceState`, `Reset` and `ResetEx` return the latched code, with
+  `E_OUTOFMEMORY` reported as `D3DERR_OUTOFVIDEOMEMORY`, the out-of-memory
+  code `PresentEx` and `CheckDeviceState` document, and neither reset clears
+  it. A `Reset` the layer could not complete, which leaves a plain device
+  answering `D3DERR_DEVICENOTRESET` from `TestCooperativeLevel`, shows on an
+  extended device only as that code from `Present`, `PresentEx` and the swap
+  chain's `Present`; `CheckDeviceState` does not report it. `D3DERR_DEVICEREMOVED`,
+  which tells a D3D9Ex application to create a new device, is not used: one
+  latch serves both kinds of device, and an extended device keeps the code
+  a plain one reports, `D3DERR_DEVICELOST`, which `CheckDeviceState`
+  documents as a lost device.
 - Software paths: no reference rasterizer, no software vertex processing, no
   `RegisterSoftwareDevice`; the default Metal device is the only adapter.
 - Legacy remnants: N-patch and RT-patch tessellation, vertex tweening,

@@ -70,11 +70,11 @@ pub const fn resolve(pool: u32) -> u32 {
 
 /// Whether an extended device refuses a create in `pool`.
 ///
-/// An extended device has no runtime-managed pool: it keeps its default-pool
-/// resources across `Reset`, so the copy `D3DPOOL_MANAGED` exists to restore
-/// is never needed, and every create naming that pool is
-/// `D3DERR_INVALIDCALL`. `D3DPOOL_MANAGED_EX` names the same pool and is
-/// taken. A plain device refuses nothing here.
+/// An extended device keeps its default-pool resources across `Reset`, so
+/// the copy the managed pool exists to restore is never needed, and a create
+/// that names `D3DPOOL_MANAGED` is `D3DERR_INVALIDCALL`. It still takes the
+/// managed pool under the value `D3DPOOL_MANAGED_EX`, which is not refused
+/// here. A plain device refuses nothing here.
 #[must_use]
 pub const fn refused_on_extended(pool: u32, extended: bool) -> bool {
     extended && pool == D3DPOOL_MANAGED
@@ -83,9 +83,10 @@ pub const fn refused_on_extended(pool: u32, extended: bool) -> bool {
 /// Whether `SetPriority` stores a value for a resource in `pool`.
 ///
 /// The priority orders what a memory manager evicts first. On a plain device
-/// that is the runtime's managed pool; an extended device has none and lets
-/// the driver page its default-pool resources instead, so there the default
-/// pool takes the priority. Every other pair keeps the priority at zero.
+/// that is the runtime's managed pool. An extended device lets the driver
+/// page its default-pool resources instead, so there the default pool takes
+/// the priority, and a managed resource it made through `D3DPOOL_MANAGED_EX`
+/// keeps it at zero. Every other pair keeps the priority at zero.
 #[must_use]
 pub const fn priority_settable(pool: u32, extended: bool) -> bool {
     if extended {

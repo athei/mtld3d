@@ -22,7 +22,7 @@ use mtld3d_types::{
 use super::{
     D3D_OK, D3DERR_INVALIDCALL, Direct3DDevice9, LOG_TARGET, ResetCall, device_api_lock,
     device_create_depth_stencil_surface, device_create_offscreen_plain_surface,
-    device_create_render_target, device_timer, present_impl, reset_impl,
+    device_create_render_target, device_timer, present_impl, reported_state_code, reset_impl,
 };
 
 /// `SetConvolutionMonoKernel`: the device offers no convolution filter, so the call is invalid.
@@ -64,7 +64,8 @@ pub extern "system" fn compose_rects(
 /// `PresentEx`: `Present` with flags, which are logged and not honoured.
 ///
 /// A latched `E_OUTOFMEMORY` answers as `D3DERR_OUTOFVIDEOMEMORY`, the code
-/// `PresentEx` documents for it.
+/// `PresentEx` documents for it, as it does from every present of an
+/// extended device.
 pub extern "system" fn present_ex(
     this: *mut c_void,
     src_rect: *const c_void,
@@ -75,14 +76,14 @@ pub extern "system" fn present_ex(
 ) -> i32 {
     let _api = device_api_lock(this);
     let _timer = device_timer(this, DeviceSubCategory::Frame);
-    extended_state_code(present_impl(
+    present_impl(
         this,
         src_rect,
         dst_rect,
         dst_window_override,
         dirty_region,
         flags,
-    ))
+    )
 }
 
 /// `GetGPUThreadPriority`: a stub that reports the normal priority, 0.
@@ -317,7 +318,9 @@ pub extern "system" fn create_depth_stencil_surface_ex(
 /// A fullscreen request names a mode of the back buffer's size and a
 /// windowed one names none; a disagreement is an invalid call that leaves
 /// the device as it was. The mode's refresh rate and format are not used: a
-/// fullscreen device sets the mode its back buffer names.
+/// fullscreen device sets the mode its back buffer names. A latched
+/// `E_OUTOFMEMORY` answers as `D3DERR_OUTOFVIDEOMEMORY`, as from every
+/// present.
 pub extern "system" fn reset_ex(
     this: *mut c_void,
     present_params: *mut c_void,
@@ -335,7 +338,8 @@ pub extern "system" fn reset_ex(
     // SAFETY: vtable in-param; `mode` is null or a readable `D3DDISPLAYMODEEX`
     // per the IDirect3DDevice9Ex ABI.
     let mode = unsafe { InPtr::<D3DDISPLAYMODEEX>::opt(mode) }.map(|m| (m.width, m.height));
-    reset_impl(this, present_params, ResetCall::ResetEx { mode })
+    let hr = reset_impl(this, present_params, ResetCall::ResetEx { mode });
+    reported_state_code(this, hr)
 }
 
 /// `GetDisplayModeEx`: the mode `GetDisplayMode` reports, progressive, with the identity rotation.
